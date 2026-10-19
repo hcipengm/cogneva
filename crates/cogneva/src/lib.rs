@@ -18,6 +18,7 @@ pub mod eval_table;
 pub mod eval_toolathlon;
 pub mod eval_toolathlon_local;
 pub mod governance;
+pub mod governance_acts;
 pub mod health_check;
 pub mod host_ledger;
 pub mod hot_reload;

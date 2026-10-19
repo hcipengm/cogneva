@@ -52,6 +52,13 @@ SUBCOMMANDS:
                            vacancy_until vacancy_assigner gap_task first_reading
                            entry_path updated_at source_fronts
                            Idempotent; printed counts say what happened.
+    handover <SUB>         Open, sign, apply, withdraw or list a move of a face
+                           from one unit to another. A move counts only when
+                           every required unit signed and it was applied.
+    vote <SUB>             Open, cast, withdraw, close or list a decision.
+                           Ballot rules are written at open time and never
+                           rewritten; a principle that settles the question
+                           records its basis and closes with no votes.
 
 OPTIONS:
     --database-url <url>   Override the graph's URL. Default: COGNEVA_DATABASE_URL,
@@ -68,6 +75,7 @@ pub enum Action {
     Drift { json: bool },
     Project { out: PathBuf },
     ImportFaces { from: PathBuf },
+    Act(crate::governance_acts::Act),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +89,32 @@ pub struct Request {
 ///
 /// Pure so that what a subcommand needs is testable without a database.
 pub fn parse_args(args: &[String]) -> Result<Request, String> {
+    // The two families that act on the graph rather than read it have their
+    // own grammar: one extra word and repeatable options. The endpoint flags
+    // belong to this level, so they are taken out before the delegate sees the
+    // rest.
+    if matches!(args.first().map(String::as_str), Some("handover" | "vote")) {
+        let mut rest: Vec<String> = Vec::new();
+        let mut database_url: Option<String> = None;
+        let mut redis_url: Option<String> = None;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--database-url" => {
+                    database_url = Some(iter.next().ok_or("--database-url needs a value")?.clone());
+                }
+                "--redis-url" => {
+                    redis_url = Some(iter.next().ok_or("--redis-url needs a value")?.clone());
+                }
+                other => rest.push(other.to_string()),
+            }
+        }
+        return Ok(Request {
+            action: Action::Act(crate::governance_acts::parse_args(&rest)?),
+            database_url,
+            redis_url,
+        });
+    }
     let mut database_url: Option<String> = None;
     let mut redis_url: Option<String> = None;
     let mut brief = false;
@@ -188,6 +222,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         Action::Drift { json } => drift(&*store, redis_url.as_deref(), json).await?,
         Action::Project { out } => project(&*store, redis_url.as_deref(), &out).await?,
         Action::ImportFaces { from } => import_faces(&*store, &from).await?,
+        Action::Act(act) => crate::governance_acts::run(act, &*store, Utc::now()).await?,
     }
     Ok(())
 }
@@ -434,6 +469,9 @@ pub fn parse_roster(text: &str) -> Result<Vec<RosterRow>, String> {
                     revision: 1,
                 },
                 owner_unit: field(2),
+                // A roster describes proposed ownership; the signed handover
+                // that would justify a move is a separate row.
+                bound_by_handover_id: None,
                 face_id,
                 // The file's own timestamp says when its content was written;
                 // the node's is set by the graph when it is written.

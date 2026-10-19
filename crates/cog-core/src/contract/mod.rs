@@ -17,6 +17,7 @@ pub mod event;
 pub mod evolution_admin;
 pub mod face_registry;
 pub mod fault;
+pub mod governance_acts;
 pub mod guardrail;
 pub mod hook;
 pub mod host_documents;

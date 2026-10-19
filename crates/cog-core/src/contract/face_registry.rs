@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{SFError, SFResult, Task};
+use crate::{SFError, SFResult, Task, TaskStatus};
 
 /// The workspace that holds governance nodes.
 ///
@@ -171,6 +171,11 @@ pub struct Face {
     /// `None` is legal only with a complete declaration of who will fill it and
     /// by when. An empty owner with none of that is `no_owner`, not a vacancy.
     pub owner_unit: Option<String>,
+    /// The signed handover that moved ownership here, when there was one.
+    ///
+    /// A revision above one with no such reference is an ownership move nobody
+    /// signed, which is the difference between a handover and a drift.
+    pub bound_by_handover_id: Option<String>,
     pub spec: FaceSpec,
     pub updated_at: DateTime<Utc>,
 }
@@ -184,6 +189,7 @@ impl Face {
         Some(Self {
             face_id: task.id.clone(),
             owner_unit: task.owner_unit.clone(),
+            bound_by_handover_id: task.bound_by_handover_id.clone(),
             spec: FaceSpec::from_task(task)?,
             updated_at: task.updated_at,
         })
@@ -377,6 +383,8 @@ pub struct FaceObservation<'a> {
     pub face: Option<&'a Face>,
     /// Open, executable tasks carrying this face id.
     pub open_tasks: &'a [Task],
+    /// Handovers naming this face that are fully signed and not yet applied.
+    pub signed_handovers: &'a [crate::Handover],
     pub owner_liveness: OwnerLiveness,
     pub now: DateTime<Utc>,
 }
@@ -409,6 +417,18 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
     }
     if face.vacancy_expired_at(now) {
         red.push(DriftState::VacancyExpired.as_str().to_string());
+    }
+    // An ownership move that nobody signed, and a signature nobody applied,
+    // are the same defect seen from the two ends of the handover: the row says
+    // the face changed hands and the paper that would justify it is missing on
+    // one side or stale on the other.
+    if face.revision() > 1 && face.bound_by_handover_id.is_none() {
+        red.push(DriftState::UnsignedHandover.as_str().to_string());
+    }
+    if observation.signed_handovers.iter().any(|handover| {
+        (now - handover.updated_at).num_seconds() >= crate::SIGNED_UNAPPLIED_LIMIT_SECS
+    }) {
+        red.push(DriftState::UnsignedHandover.as_str().to_string());
     }
     if let Some(owner) = face.owner_unit.as_deref() {
         // Work is misbound when it names a different unit, or when it is
@@ -514,6 +534,37 @@ pub trait GovernanceStore: Send + Sync {
     /// re-reads and decides; the store only refuses to be the one that erases
     /// the other's work.
     async fn save_face_node_if_revision(&self, task: &Task, expected: i64) -> SFResult<bool>;
+
+    /// Rows in the governance workspace of one task type.
+    ///
+    /// Handovers, decisions and votes are task rows like the faces; this is the
+    /// one read that finds them without a table of their own.
+    async fn governance_nodes(&self, task_type: &str) -> SFResult<Vec<Task>>;
+
+    /// Write one governance row unconditionally.
+    async fn save_governance_node(&self, task: &Task) -> SFResult<()>;
+
+    /// Write one governance row only while it is still in one of `expected`.
+    ///
+    /// Signatures and votes arrive from different sessions at the same time; a
+    /// last-writer-wins update would drop one of them and the row would look
+    /// like the other never happened.
+    async fn save_governance_node_if_status(
+        &self,
+        task: &Task,
+        expected: &[TaskStatus],
+    ) -> SFResult<bool>;
+
+    /// Move a face's ownership and record the handover that did it, atomically.
+    ///
+    /// Returns whether both rows moved. The face write is guarded by the
+    /// revision the caller read, so an import and a handover cannot both win.
+    async fn apply_handover(
+        &self,
+        handover: &Task,
+        face: &Task,
+        expected_revision: i64,
+    ) -> SFResult<bool>;
 }
 
 /// What an import did with one row.
@@ -621,6 +672,13 @@ pub async fn read_drift(
         .filter_map(Face::from_task)
         .collect();
     let open = store.open_face_bound_tasks().await?;
+    let handovers: Vec<crate::Handover> = store
+        .governance_nodes(crate::HANDOVER_TASK_TYPE)
+        .await?
+        .iter()
+        .filter_map(crate::Handover::from_task)
+        .filter(|handover| handover.state() == crate::HandoverState::Signed)
+        .collect();
 
     let mut by_face: std::collections::BTreeMap<&str, Vec<Task>> = Default::default();
     for task in &open {
@@ -658,10 +716,16 @@ pub async fn read_drift(
             None => OwnerLiveness::Unknown,
         };
         let open_tasks = by_face.get(face_id).map(Vec::as_slice).unwrap_or_default();
+        let signed_handovers: Vec<crate::Handover> = handovers
+            .iter()
+            .filter(|handover| handover.spec.face_id == face_id)
+            .cloned()
+            .collect();
         readings.push(observe(FaceObservation {
             face_id,
             face,
             open_tasks,
+            signed_handovers: &signed_handovers,
             owner_liveness,
             now,
         }));
@@ -695,6 +759,7 @@ mod tests {
         Face {
             face_id: "task-management".into(),
             owner_unit: owner.map(str::to_string),
+            bound_by_handover_id: None,
             spec: FaceSpec::first("任务管理", FaceKind::Face),
             updated_at: Utc::now(),
         }
@@ -716,6 +781,7 @@ mod tests {
             face_id: "task-management",
             face: Some(&face),
             open_tasks: &tasks,
+            signed_handovers: &[],
             owner_liveness: OwnerLiveness::Seen(Utc::now()),
             now: Utc::now(),
         });
@@ -730,6 +796,7 @@ mod tests {
             face_id: "task-management",
             face: Some(&face),
             open_tasks: &[],
+            signed_handovers: &[],
             owner_liveness: OwnerLiveness::Seen(Utc::now()),
             now: Utc::now(),
         });
@@ -745,6 +812,7 @@ mod tests {
             face_id: "task-management",
             face: Some(&face),
             open_tasks: &tasks,
+            signed_handovers: &[],
             owner_liveness: OwnerLiveness::Seen(Utc::now()),
             now: Utc::now(),
         });
@@ -759,6 +827,7 @@ mod tests {
             face_id: "task-management",
             face: Some(&face),
             open_tasks: &[],
+            signed_handovers: &[],
             owner_liveness: OwnerLiveness::Unknown,
             now: Utc::now(),
         });
@@ -776,6 +845,7 @@ mod tests {
             face_id: "task-management",
             face: Some(&face),
             open_tasks: &[],
+            signed_handovers: &[],
             owner_liveness: OwnerLiveness::Unknown,
             now: Utc::now(),
         });
@@ -789,6 +859,7 @@ mod tests {
             face_id: "task-management",
             face: None,
             open_tasks: &[],
+            signed_handovers: &[],
             owner_liveness: OwnerLiveness::Unknown,
             now: Utc::now(),
         });
@@ -818,5 +889,102 @@ mod tests {
         task.workspace_id = Some("default".into());
         assert!(!is_face_node(&task));
         assert!(Face::from_task(&task).is_none());
+    }
+
+    fn handover(face_id: &str, updated_at: DateTime<Utc>) -> crate::Handover {
+        crate::Handover {
+            id: "h1".into(),
+            status: TaskStatus::Scheduled,
+            spec: crate::HandoverSpec {
+                face_id: face_id.into(),
+                from_unit: Some("unit-a".into()),
+                to_unit: "unit-b".into(),
+                witness_unit: "unit-c".into(),
+                criterion_reading: None,
+                reading_at: None,
+                open_actions: Vec::new(),
+                open_task_ids: Vec::new(),
+                permissions_context: None,
+                expires_when: None,
+                signed_by: Vec::new(),
+            },
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn an_ownership_move_with_no_signed_handover_is_red() {
+        let mut face = face(Some("unit-operator"));
+        face.bound_by_handover_id = None;
+        face.spec.revision = 2;
+        let now = Utc::now();
+        let reading = observe(FaceObservation {
+            face_id: "task-management",
+            face: Some(&face),
+            open_tasks: &[],
+            signed_handovers: &[],
+            owner_liveness: OwnerLiveness::Seen(now),
+            now,
+        });
+        assert_eq!(reading.state, DriftState::UnsignedHandover);
+        assert!(reading.red_rules.contains(&"unsigned_handover".to_string()));
+    }
+
+    #[test]
+    fn a_signed_handover_left_unapplied_past_the_limit_is_red() {
+        let face = face(Some("unit-a"));
+        let now = Utc::now();
+        let stale = handover(
+            "task-management",
+            now - chrono::Duration::seconds(crate::SIGNED_UNAPPLIED_LIMIT_SECS + 1),
+        );
+        let reading = observe(FaceObservation {
+            face_id: "task-management",
+            face: Some(&face),
+            open_tasks: &[],
+            signed_handovers: &[stale],
+            owner_liveness: OwnerLiveness::Seen(now),
+            now,
+        });
+        assert!(reading.red_rules.contains(&"unsigned_handover".to_string()));
+    }
+
+    #[test]
+    fn a_handover_signed_moments_ago_is_not_red_yet() {
+        let face = face(Some("unit-a"));
+        let now = Utc::now();
+        let fresh = handover("task-management", now);
+        let reading = observe(FaceObservation {
+            face_id: "task-management",
+            face: Some(&face),
+            open_tasks: &[],
+            signed_handovers: &[fresh],
+            owner_liveness: OwnerLiveness::Seen(now),
+            now,
+        });
+        assert!(!reading.red_rules.contains(&"unsigned_handover".to_string()));
+    }
+
+    #[test]
+    fn the_handover_rule_trusts_its_slice_so_the_caller_must_filter_by_face() {
+        let face = face(Some("unit-a"));
+        let now = Utc::now();
+        let stale = handover(
+            "another-face",
+            now - chrono::Duration::seconds(crate::SIGNED_UNAPPLIED_LIMIT_SECS + 1),
+        );
+        // The rule does not re-check the face id: it is handed the rows that
+        // belong to this face. Pin that, so a caller that stops filtering is
+        // caught by a test rather than by a face turning red for its
+        // neighbour's paperwork.
+        let reading = observe(FaceObservation {
+            face_id: "task-management",
+            face: Some(&face),
+            open_tasks: &[],
+            signed_handovers: &[stale],
+            owner_liveness: OwnerLiveness::Seen(now),
+            now,
+        });
+        assert!(reading.red_rules.contains(&"unsigned_handover".to_string()));
     }
 }

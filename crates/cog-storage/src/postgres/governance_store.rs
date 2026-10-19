@@ -25,7 +25,9 @@
 use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
-use cog_core::{GovernanceStore, SFError, SFResult, Task, FACE_TASK_TYPE, GOVERNANCE_WORKSPACE};
+use cog_core::{
+    GovernanceStore, SFError, SFResult, Task, TaskStatus, FACE_TASK_TYPE, GOVERNANCE_WORKSPACE,
+};
 
 /// Face nodes, in one workspace, typed as faces.
 ///
@@ -75,6 +77,38 @@ UPDATE cog_dag_tasks \
    SET task = $3, status = $4, updated_at = NOW() \
  WHERE workspace_id = $1 AND task_id = $2 \
    AND COALESCE((task->'input'->'face'->>'revision')::bigint, 1) = $5";
+
+/// Every row of one governance task type.
+///
+/// Handovers, decisions and votes are rows like the faces, so the same read
+/// that finds faces finds them: the type is read out of the document, which
+/// every row carries, rather than from a column a deployment may not have
+/// added yet.
+const GOVERNANCE_NODES_SQL: &str = "\
+SELECT task FROM cog_dag_tasks \
+WHERE workspace_id = $1 \
+  AND task->'task_type'->>'custom' = $2 \
+ORDER BY task_id";
+
+/// Write one governance row, whatever state it is in.
+const SAVE_GOVERNANCE_NODE_SQL: &str = "\
+INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status, updated_at) \
+VALUES ($1, $2, $3, $4, NOW()) \
+ON CONFLICT (workspace_id, task_id) DO UPDATE \
+    SET task = EXCLUDED.task, status = EXCLUDED.status, updated_at = NOW()";
+
+/// Write a governance row only while it is still in one of the states the
+/// caller read.
+const SAVE_GOVERNANCE_NODE_IF_STATUS_SQL: &str = "\
+UPDATE cog_dag_tasks \
+   SET task = $3, status = $4, updated_at = NOW() \
+ WHERE workspace_id = $1 AND task_id = $2 AND status = ANY($5)";
+
+/// Move a signed handover to its applied state, but only from `scheduled`.
+const APPLY_HANDOVER_ROW_SQL: &str = "\
+UPDATE cog_dag_tasks \
+   SET task = $3, status = $4, updated_at = NOW() \
+ WHERE workspace_id = $1 AND task_id = $2 AND status = 'scheduled'";
 
 /// PostgreSQL governance store.
 #[derive(Clone)]
@@ -145,5 +179,94 @@ impl GovernanceStore for PostgresGovernanceStore {
             .await
             .map_err(|e| SFError::Database(format!("governance save face node: {e}")))?;
         Ok(result.rows_affected() == 1)
+    }
+
+    async fn governance_nodes(&self, task_type: &str) -> SFResult<Vec<Task>> {
+        let rows = sqlx::query(GOVERNANCE_NODES_SQL)
+            .bind(GOVERNANCE_WORKSPACE)
+            .bind(task_type)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("governance {task_type} nodes: {e}")))?;
+        rows_to_tasks(rows)
+    }
+
+    async fn save_governance_node(&self, task: &Task) -> SFResult<()> {
+        let value = serde_json::to_value(task).map_err(SFError::Serialization)?;
+        sqlx::query(SAVE_GOVERNANCE_NODE_SQL)
+            .bind(GOVERNANCE_WORKSPACE)
+            .bind(&task.id)
+            .bind(value)
+            .bind(task.status.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("governance save node: {e}")))?;
+        Ok(())
+    }
+
+    async fn save_governance_node_if_status(
+        &self,
+        task: &Task,
+        expected: &[TaskStatus],
+    ) -> SFResult<bool> {
+        let value = serde_json::to_value(task).map_err(SFError::Serialization)?;
+        let states: Vec<&str> = expected.iter().map(TaskStatus::as_str).collect();
+        let result = sqlx::query(SAVE_GOVERNANCE_NODE_IF_STATUS_SQL)
+            .bind(GOVERNANCE_WORKSPACE)
+            .bind(&task.id)
+            .bind(value)
+            .bind(task.status.as_str())
+            .bind(&states)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("governance save node: {e}")))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn apply_handover(
+        &self,
+        handover: &Task,
+        face: &Task,
+        expected_revision: i64,
+    ) -> SFResult<bool> {
+        let handover_value = serde_json::to_value(handover).map_err(SFError::Serialization)?;
+        let face_value = serde_json::to_value(face).map_err(SFError::Serialization)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?;
+
+        let moved_handover = sqlx::query(APPLY_HANDOVER_ROW_SQL)
+            .bind(GOVERNANCE_WORKSPACE)
+            .bind(&handover.id)
+            .bind(handover_value)
+            .bind(handover.status.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?;
+        if moved_handover.rows_affected() != 1 {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+
+        let moved_face = sqlx::query(SAVE_FACE_NODE_IF_REVISION_SQL)
+            .bind(GOVERNANCE_WORKSPACE)
+            .bind(&face.id)
+            .bind(face_value)
+            .bind(face.status.as_str())
+            .bind(expected_revision)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?;
+        if moved_face.rows_affected() != 1 {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?;
+        Ok(true)
     }
 }

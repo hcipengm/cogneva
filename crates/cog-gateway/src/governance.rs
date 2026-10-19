@@ -109,6 +109,9 @@ pub async fn import_face_handler(
     let face = cog_core::Face {
         face_id: request.face_id,
         owner_unit: request.owner_unit,
+        // An import describes ownership; the handover that would justify a
+        // move is a separate signed row and is not written here.
+        bound_by_handover_id: None,
         spec: request.spec,
         updated_at: Utc::now(),
     };
