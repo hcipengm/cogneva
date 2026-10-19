@@ -449,6 +449,10 @@ impl MetricsBackend for PrometheusMetricsBackend {
 
 #[cfg(test)]
 mod tests {
+    //! principle: feedback_a_series_name_that_is_only_a_prefix_of_its_literal_escapes_the_census
+    //!
+    //! 这个模块带着从当前树、单一修订回答该原则的门：抓取面普查的反向扫描只
+    //! 认「整条字面量就是序列名」的出现，嵌在 `# HELP` 更长字面量里的不算。
     use super::*;
 
     /// 毫秒量级的观测必须落在多个桶里。秒量级的桶界配毫秒值会把每一条观测都塞进
@@ -558,6 +562,85 @@ mod tests {
         assert!(
             finite.first().copied().unwrap_or(f64::MAX) <= 0.01,
             "单位未声明时保持秒量级默认: {finite:?}"
+        );
+    }
+
+    /// 抓取面普查的反向扫描：一条序列名只有作为整条字符串字面量出现——名字
+    /// 之后紧跟闭合引号——时才算被读到；嵌在 `# HELP <name> ...` 这类更长
+    /// 字面量里的名字只是前缀，必须逃出普查。
+    fn census_reads_series(source: &str, name: &str) -> bool {
+        let bytes = source.as_bytes();
+        let wanted = name.as_bytes();
+        let mut cursor = 0usize;
+        while cursor < bytes.len() {
+            if bytes[cursor] != b'"' {
+                cursor += 1;
+                continue;
+            }
+            let content_start = cursor + 1;
+            let mut content_end = content_start;
+            while content_end < bytes.len() && bytes[content_end] != b'"' {
+                if bytes[content_end] == b'\\' && content_end + 1 < bytes.len() {
+                    content_end += 2;
+                } else {
+                    content_end += 1;
+                }
+            }
+            if bytes.get(content_start..content_end) == Some(wanted) {
+                return true;
+            }
+            cursor = content_end + 1;
+        }
+        false
+    }
+
+    /// 普查的反向扫描要求「名字之后紧跟一个引号」：整条字面量就是这个名字。
+    /// 渲染代码把名字写在更长的 `# HELP <name> ...` 字面量里，那种出现不
+    /// 能把序列数成在场；只有真正读这个序列的人写出的整条名字面量才算。
+    #[tokio::test]
+    async fn a_series_name_that_is_only_a_prefix_of_its_literal_escapes_the_census() {
+        let name = "principle_prefix_census_probe";
+        let backend = PrometheusMetricsBackend::new("");
+        backend
+            .record_gauge(MetricName::for_tests_only(name), 3.0, HashMap::new())
+            .await
+            .unwrap();
+        let body = String::from_utf8(backend.encode().unwrap()).unwrap();
+
+        // 一次渲染同时带着两种出现：HELP 行把名字包进更长的文本，序列行上
+        // 名字是自己的记号。
+        assert!(
+            body.contains(format!("# HELP {name} ").as_str()),
+            "渲染必须带着把名字包进更长文本的 HELP 行: {body}"
+        );
+        assert!(
+            body.contains(format!("{name} 3").as_str()),
+            "序列必须以自己的记号出现在抓取面上: {body}"
+        );
+
+        let help_line = body
+            .lines()
+            .find(|line| line.starts_with("# HELP "))
+            .expect("rendered exposition carries a HELP line");
+
+        // 只有更长的 HELP 字面量时，名字后面是空格而不是引号，普查数不到。
+        let longer_literal = format!("\"{help_line}\"");
+        assert!(
+            !census_reads_series(&longer_literal, name),
+            "只作为更长字面量前缀的名字必须逃出普查: {longer_literal}"
+        );
+        // 名字后面拖一截更长的尾巴，整条字面量仍不是这个名字。
+        let stretched = format!("\"{name}_and_then_some\"");
+        assert!(
+            !census_reads_series(&stretched, name),
+            "名字是字面量前缀而非整条时不算读到: {stretched}"
+        );
+
+        // 整条字面量就是名字时闭合引号紧跟其后，这才是普查认的那种出现。
+        let with_reader = format!("\"{name}\"\n{longer_literal}");
+        assert!(
+            census_reads_series(&with_reader, name),
+            "整条字面量就是名字时普查必须数到: {with_reader}"
         );
     }
 }
