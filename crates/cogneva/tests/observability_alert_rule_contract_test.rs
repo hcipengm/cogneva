@@ -2896,10 +2896,6 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_ready_admission_held_total",
         Unread::Gap("tasks the publisher refused to dispatch because the pool's window could not pay for them, by `stream` and `reason`. A rule cannot close it: any nonzero is the admission gate holding correctly while the window is spent, and what would make a hold a fault is one that outlasts the window that justified it -- a bound nobody has declared, since the only operand for it is the window's own reset time, which the readings series beside this one carries. Its reader is a panel drawing this count beside the remaining allowance and the reset, which is a panel because the healthy state is a nonzero count for as long as the window is spent. No such panel was written in this pass"),
     ),
-    (
-        "cogneva_ready_admission_readings",
-        Unread::Gap("the admission pass's own arithmetic, by `stream` and `kind`: the bound it applied (`bounded`, written every pass), the jobs the window could pay for (`window_jobs`, written only when a bound exists), what the queue already owed, and what it admitted. This is a reading rather than a signal -- being bounded is the gate working -- so it has no threshold to fire on, and a rule over it would have to invent a level where bounded becomes wrong. Its reader is the panel above, drawn as the four cells of one pass so an idle pass cannot leave a refusal frozen; that panel is what this debt is owed to"),
-    ),
 ];
 
 /// How many `Gap` entries the census left. A new series that no face reads and
@@ -3085,7 +3081,16 @@ const UNREAD: &[(&str, Unread)] = &[
 /// `pg_pool_ceiling_unmeasured` is that reader, so the debt is paid and the
 /// number comes back down to 26 -- the entry left the table in the pass that
 /// wrote the rule, not reclassified out of it.
-const GAPS_AT_CENSUS: usize = 26;
+///
+/// It came down to 25 when `llm_pool_open_but_idle` took the `ready` cell of
+/// `cogneva_ready_admission_readings` as its workload conjunct. The entry said
+/// the cells are the gate working and need a panel rather than a threshold,
+/// which is true of each cell alone and false of the combination: work asking
+/// to go out while the window pays and nothing is served is the fault this
+/// series was minted to make readable, so one of its cells now has a rule. The
+/// panel is still owed for the rest of the arithmetic -- this entry's debt is
+/// only the part a rule can hold.
+const GAPS_AT_CENSUS: usize = 25;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
