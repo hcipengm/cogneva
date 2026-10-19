@@ -1,0 +1,13 @@
+[Unit]
+Description=Push cogneva backup packages to the offsite restic repository
+
+[Timer]
+# 比备份 CronJob 晚一小时：这一步推的是本机目录里已有的包，跑在包还没写出来
+# 的时候只会把上一次的再推一遍。错开分钟数，不和整点的备份抢磁盘。
+OnCalendar=*-*-* 02:17:00
+Persistent=true
+RandomizedDelaySec=300
+AccuracySec=60
+
+[Install]
+WantedBy=timers.target

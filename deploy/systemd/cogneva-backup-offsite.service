@@ -1,0 +1,46 @@
+[Unit]
+Description=Cogneva offsite copy of the backup packages (restic)
+Documentation=file:/opt/cogneva/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# 跑在宿主上而不是集群里：这条腿要走外网、要拿仓库口令，而「业务 Pod 零凭证」
+# 是硬约束——把 restic 塞进备份 Job 等于让一个业务 Pod 握着异地仓库的钥匙。
+# 备份 Job 只管把包写到本机目录，这一步把那个目录推到仓库里。
+ExecStart=/usr/local/lib/cogneva/backup-offsite-restic.sh
+User=root
+Group=root
+
+# 非密钥的配置（仓库地址、保留策略）走一个 0644 文件：其中没有任何秘密，
+# 而把它设成加密凭证会让「仓库地址换了」也要动一次 systemd-creds。
+EnvironmentFile=/etc/cogneva/backup-offsite.env
+
+# 密钥只经 systemd 加密凭证进入：`LoadCredentialEncrypted` 的值由宿主密钥解密，
+# 落在 $CREDENTIALS_DIRECTORY 里（tmpfs，只此进程可见），磁盘上不存在明文口令。
+# 明文文件在 install-backup-offsite.sh 里加密完即删——「加密完之后还留一份明文」
+# 会让这条约束只剩一句声明。
+LoadCredentialEncrypted=restic-password:/etc/cogneva/credentials/restic-password.cred
+LoadCredentialEncrypted=aws-access-key-id:/etc/cogneva/credentials/aws-access-key-id.cred
+LoadCredentialEncrypted=aws-secret-access-key:/etc/cogneva/credentials/aws-secret-access-key.cred
+
+# 失败要让 systemd 记下来：定时器下这一跑失败了，下一次不会补做，只有 journal
+# 和 `systemctl status` 能说清是哪一步。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cogneva-backup-offsite
+TimeoutStartSec=3h
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# ProtectSystem=strict 已经把整棵树设成只读，可写的只有下面这两个由 systemd
+# 建出来的目录：restic 的缓存，以及它自己的状态。要推的那棵备份目录因此天然
+# 是只读的——这条腿不该有改动备份包的能力。
+CacheDirectory=cogneva-backup-offsite
+StateDirectory=cogneva-backup-offsite
+
+[Install]
+WantedBy=multi-user.target

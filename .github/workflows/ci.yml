@@ -616,6 +616,11 @@ jobs:
       # parity 也绿，只是那个 Pod 从此握着平台 token。
       - name: Check credential holder surface
         run: bash deploy/scripts/check-credential-holder-surface.sh
+      # 宿主凭证面：上一节只看集群里的两个 Secret 对象。宿主上的 unit 是另一条
+      # 完全不同的路——root 跑、能读整块盘、要往外网推。把仓库口令写进单元文件的
+      # Environment= 或一个 0644 的 env 文件里，渲染期同样没有症状。
+      - name: Check host credential surface
+        run: bash deploy/scripts/check-host-credential-surface.sh
       # 空白机恢复的步骤顺序：每一步的 requires 都要由更早的一步产出，等网关的
       # 步骤之前要真有一个网关。这条在渲染期同样没有症状——步骤清单读起来是
       # 对的，坏在「第 3 步在第 2 步之前」，只有空白机上跑到一半才会发现。

@@ -133,6 +133,29 @@ sudo systemctl stop cogneva
 sudo journalctl -u cogneva -f
 ```
 
+### Offsite copy (restic)
+
+The backup CronJob writes packages to a local-path volume and, if `backup.offsiteHostPath`
+is set, to a second directory **on the same host**. Neither survives the machine. This
+unit pushes that directory to an encrypted restic repository on another machine:
+
+```bash
+sudo deploy/scripts/install-backup-offsite.sh \
+    s3:https://your-bucket.example/cogneva /root/offsite-secrets /var/lib/cogneva-offsite
+```
+
+`/root/offsite-secrets` holds the plaintext `restic-password` (and `aws-access-key-id` /
+`aws-secret-access-key` for S3-compatible backends). The installer encrypts each into
+`/etc/cogneva/credentials/*.cred` with `systemd-creds`, deletes the plaintext, and installs
+`cogneva-backup-offsite.{service,timer}`. At runtime the repository password exists only in
+`$CREDENTIALS_DIRECTORY` (a tmpfs owned by the process) — never on disk, never in the
+package, never in a Pod. `deploy/systemd/credential-holders.tsv` is the register those
+credentials must appear in; `deploy/scripts/check-host-credential-surface.sh` holds both
+sides to it (and CI runs it).
+
+The bucket key should be write-only for objects it did not create and should not carry
+`DeleteObject`: a compromised host must not be able to erase the copies that outlive it.
+
 ---
 
 ## macOS (launchd)
