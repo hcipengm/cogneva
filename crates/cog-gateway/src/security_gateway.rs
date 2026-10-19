@@ -3680,6 +3680,42 @@ fn pace_for_upstream(
     ))
 }
 
+/// 把这一拍的配速摊到观测面上。
+///
+/// 请求路与闸门读的是同一份快照，所以这几个数与任何一次判定同源；另算一遍
+/// 就会出现「账面说窗还有余量、闸门按另一种口径拦」的分裂。
+///
+/// 余量不是单独一条序列，而是这三个数在判据那侧的减法：`allowance - spent
+/// - reserve`。负数正是闸门拒的理由；「窗开着却没人通过」要读的恰是它的另一
+/// 半——余量不为负、池子又不服务。那两种形状的修法相反，所以它们必须能分开看。
+///
+/// 没有尺子（`measured_upstreams = 0`）时 allowance 与 spent 都是 0，余量落在
+/// `-reserve`；只有当预留本身也没量出来时它才是 0，而 0 属于「开着」。所以
+/// `llm_pool_paced_upstreams` 与它们同拍写，读余量的判据必须同时要求它大于 0。
+async fn publish_window_pace_gauges(state: &AppState, reading: &WindowPaceReading) {
+    let pace = reading.pool;
+    for (name, value) in [
+        (
+            cog_core::metric_names::LLM_POOL_ALLOWANCE_TOKENS,
+            pace.allowance_tokens as f64,
+        ),
+        (
+            cog_core::metric_names::LLM_POOL_SPENT_TOKENS,
+            pace.spent_tokens as f64,
+        ),
+        (
+            cog_core::metric_names::LLM_POOL_RESERVE_TOKENS,
+            pace.reserve_tokens as f64,
+        ),
+        (
+            cog_core::metric_names::LLM_POOL_PACED_UPSTREAMS,
+            pace.measured_upstreams as f64,
+        ),
+    ] {
+        record_gauge(state, name, value, &[]).await;
+    }
+}
+
 /// 逐上游各算一份，池级那份只是把它们相加得到的报表：额度不是一份，能力也不是
 /// 一份，用一家的尺子关掉另一家，就是把"没量到"读成"没有"。
 async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> WindowPaceReading {
@@ -3856,18 +3892,18 @@ async fn measure_window(
         window_secs,
         now_unix,
     };
-    let Some(end) = crate::window_pace::window_end(evidence) else {
+    let Some((end, _)) = crate::window_pace::window_boundary(evidence) else {
         return latched;
     };
     // 有已定性的撞墙行时用它围出来的和（同一处证据、少一次查询）；没有时按恢复
     // 时刻把这一窗围起来求和。上界钉在恢复时刻，所以复位之后再算还是同一个数，
     // 不会滑进新的一窗。
-    let (capacity, source) = match reading.last_quota_refusal_unix {
-        Some(_) => (reading.burned_window_tokens, "wall_row"),
+    let capacity = match reading.last_quota_refusal_unix {
+        Some(_) => reading.burned_window_tokens,
         None => {
             let since = end.saturating_sub(window_secs as i64);
             match store.burned_between(key, since, end).await {
-                Ok(capacity) => (capacity, "named_reset"),
+                Ok(capacity) => capacity,
                 Err(e) => {
                     tracing::warn!(
                         upstream = %key,
@@ -3879,7 +3915,13 @@ async fn measure_window(
             }
         }
     };
-    let measured = crate::window_pace::measured_window(evidence, capacity, latched)?;
+    let (measured, boundary) =
+        crate::window_pace::measured_window_with_boundary(evidence, capacity, latched)?;
+    // 沿用的上一次测量带着它自己那次的出处：这一拍没观测到边界，就不能把旧行的
+    // 出处改写成「这一拍看到的」。
+    let Some(boundary) = boundary else {
+        return Some(measured);
+    };
     if Some(measured) != latched {
         state
             .measured_windows
@@ -3891,7 +3933,12 @@ async fn measure_window(
             capacity_tokens: measured.capacity_tokens,
             window_secs: measured.window_secs,
             boundary_unix: measured.burned_at_unix,
-            source: source.to_string(),
+            // 边界是**哪个观测**给的，不是容量是从哪条路算出来的。
+            source: boundary.as_str().to_string(),
+            // 上游自己说的复位时刻，原样落库；它可能被上面判为不属于这次撞墙
+            // （另一个周期的残留、解析事故），那一格与 boundary_unix 不同就是在说
+            // 这件事。没说过就是 NULL——不拿边界顶上。
+            declared_reset_unix: quota_reset_unix,
         };
         if let Err(e) = store.record_window(&stored).await {
             tracing::warn!(
@@ -4160,6 +4207,7 @@ async fn refresh_pool_state(state: &AppState) {
     // 分两处算就会有一段时间里对外说"还能干"、对请求说"不许开"。
     {
         let pace = refresh_window_pace(state, &readings).await;
+        publish_window_pace_gauges(state, &pace).await;
         *state.window_pace.lock().unwrap() = pace;
     }
 

@@ -131,6 +131,26 @@ pub fn measurable_pool_size(status: &cog_core::LlmPoolStatus) -> usize {
 /// window's allowance keeps accruing while nothing serves, so a pool that is
 /// down would otherwise admit work the moment the allowance crosses one job's
 /// cost and hand the queue to a pool that cannot take it.
+///
+/// The degraded period has exactly these semantics, and they are what the
+/// readings beside the count are for:
+///
+/// - **Zero admission, not a failure.** Every task that asks is held, whatever
+///   the allowance pays for. Nothing is dropped, failed or retried into a
+///   shorter deadline: a held task stays ready and asks again on the next pass,
+///   so the cost of the outage is latency, not lost work.
+/// - **The reason is the pool, not the budget.** [`hold_reason`] labels the
+///   hold `pool_unavailable`; a reader that sees `window_exhausted` here would
+///   be sent to tune an allowance that is not the constraint.
+/// - **It has a clock.** `LlmPoolStatus::next_attempt_unix` is the earliest
+///   instant the gateway will probe again, and it travels into the admission
+///   reading as `retry_at_unix`. That is our retry cadence, not the upstream's
+///   promise (`evidenced_recovery_unix` is that), so it is when the decision is
+///   re-made, never when the window is claimed to reopen.
+///
+/// A status that was not read at all is `None` at the call site and admits
+/// everything: an unanswered read happens during a rollout and is not an
+/// outage.
 pub fn jobs_the_window_can_pay_for_status(status: &cog_core::LlmPoolStatus) -> Option<u64> {
     if status.unavailable {
         return Some(0);

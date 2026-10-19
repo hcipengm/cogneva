@@ -565,6 +565,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         window_secs: 604_800,
         boundary_unix: now - 86_400,
         source: "named_reset".to_string(),
+        declared_reset_unix: Some(now - 86_400),
     };
     store
         .record_window(&stored)
@@ -603,7 +604,10 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         capacity_tokens: 2_230_180,
         window_secs: 18_000,
         boundary_unix: now - 3_600,
-        source: "wall_row".to_string(),
+        // The upstream named no instant; the boundary is the resume after its
+        // wall, and the declared column stays NULL rather than copying it.
+        source: "last_resume".to_string(),
+        declared_reset_unix: None,
     };
     store
         .record_window(&hourly)

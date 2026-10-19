@@ -85,6 +85,17 @@ struct AdmissionBound {
     /// this field the refusal prints the window's numbers as its reason, and
     /// the reader is told to wait out a window that already pays for a job.
     unavailable: bool,
+    /// The earliest instant the gateway will probe the pool again, unix
+    /// seconds; `0` when nothing is suspect.
+    ///
+    /// This is what makes the unavailable period a **degradation with an end**
+    /// rather than a silent freeze: while the pool is unavailable every job is
+    /// held whatever the allowance pays for, the hold is not a drop (the task
+    /// stays ready and re-asks on the next pass), and this instant is the
+    /// earliest one at which the reason can change. It is our retry cadence,
+    /// not evidence about the upstreams -- `evidenced_recovery_unix` is that --
+    /// so a reader must not present it as when the window reopens.
+    retry_at_unix: i64,
 }
 
 /// DagExecutor 运行时。
@@ -382,6 +393,7 @@ impl DagExecutorRuntime {
             pace: status.pace,
             pool_size: status.pool_size,
             unavailable: status.unavailable,
+            retry_at_unix: status.next_attempt_unix,
         })
     }
 
@@ -441,6 +453,16 @@ impl DagExecutorRuntime {
             (
                 "unavailable",
                 f64::from(u8::from(bound.is_some_and(|bound| bound.unavailable))),
+            ),
+            // The degraded period's own clock, written beside the verdict that
+            // opened it: `unavailable=1` with this cell set says the hold has a
+            // time it will be re-decided, and `0` says the pool is not why the
+            // pass held -- either it is available, or no status was read at
+            // all. It is the gateway's probe cadence, not the upstream's
+            // promise, so it is not when the window reopens.
+            (
+                "retry_at_unix",
+                bound.map_or(0.0, |bound| bound.retry_at_unix as f64),
             ),
             // The traffic face: whether this pass had anything to decide. An
             // output of zero with an input of zero says nothing about how the

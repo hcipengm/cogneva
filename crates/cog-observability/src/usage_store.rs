@@ -367,11 +367,22 @@ pub struct UpstreamWindowReading {
 
 /// One upstream's window measurement, as durable state.
 ///
-/// `source` names where the boundary came from, not what kind of code wrote the
-/// row: `wall_row` is a refusal whose cause the ledger itself records,
-/// `named_reset` is the reset instant an upstream named in a refusal this
-/// process classified. The two are different observations of the same thing and
-/// a reader that sums by source can tell which one is carrying the pacing.
+/// `source` names **which observation** the boundary came from, not what kind
+/// of code wrote the row: `named_reset` is the instant an upstream named in its
+/// refusal, `last_resume` is the first successful call after the wall, which
+/// bounds the reset from above by the retry delay, and `observed_reset` is a
+/// live reading that classified the outstanding refusal as a spent cycle and
+/// named when the quota returns. A reader that sees only the instant cannot
+/// tell an exact promise from a bounded one; the three are not equally strong.
+/// Rows written before this vocabulary say `wall_row`: that spelling named the
+/// path the capacity was summed on, not the boundary, so it reads as
+/// `provenance unknown` until the next measurement rewrites the row.
+///
+/// `declared_reset_unix` is the upstream's own statement, kept verbatim. It can
+/// differ from `boundary_unix` when the named instant was rejected as belonging
+/// to another cycle, so the pair answers "what did it say" and "what did we
+/// pace from" separately. `None` means the upstream named no instant at all —
+/// it is never the boundary copied across.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredWindow {
     pub upstream: String,
@@ -379,6 +390,7 @@ pub struct StoredWindow {
     pub window_secs: u64,
     pub boundary_unix: i64,
     pub source: String,
+    pub declared_reset_unix: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -572,6 +584,12 @@ CREATE TABLE IF NOT EXISTS gateway_llm_window (
     measured_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (upstream, window_secs)
 );
+-- The instant the upstream said its quota returns, kept apart from
+-- `boundary_unix`: the boundary is what pacing anchored on, and it can be a
+-- resume bounded from above rather than anything the upstream stated. NULL is
+-- "it named no instant", which is the shape measured on 2026-10-19; filling it
+-- with the boundary would turn "nobody said" into "it said exactly this".
+ALTER TABLE gateway_llm_window ADD COLUMN IF NOT EXISTS declared_reset_unix BIGINT;
 -- Installs that predate the window length being part of the key carry a
 -- primary key on `upstream` alone, which silently forbids a second ruler.
 DO $mig$
@@ -932,20 +950,23 @@ impl LlmUsageStore {
     pub async fn record_window(&self, w: &StoredWindow) -> anyhow::Result<()> {
         sqlx::query(&format!(
             "INSERT INTO {WINDOW_TABLE}
-                 (upstream, boundary_unix, window_secs, capacity_tokens, source, measured_at)
-             VALUES ($1, $2, $3, $4, $5, NOW())
+                 (upstream, boundary_unix, window_secs, capacity_tokens, source,
+                  declared_reset_unix, measured_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW())
              ON CONFLICT (upstream, window_secs) DO UPDATE SET
-                 boundary_unix   = EXCLUDED.boundary_unix,
-                 window_secs     = EXCLUDED.window_secs,
-                 capacity_tokens = EXCLUDED.capacity_tokens,
-                 source          = EXCLUDED.source,
-                 measured_at     = NOW()"
+                 boundary_unix       = EXCLUDED.boundary_unix,
+                 window_secs         = EXCLUDED.window_secs,
+                 capacity_tokens     = EXCLUDED.capacity_tokens,
+                 source              = EXCLUDED.source,
+                 declared_reset_unix = EXCLUDED.declared_reset_unix,
+                 measured_at         = NOW()"
         ))
         .bind(&w.upstream)
         .bind(w.boundary_unix)
         .bind(w.window_secs as i64)
         .bind(w.capacity_tokens as i64)
         .bind(&w.source)
+        .bind(w.declared_reset_unix)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -963,7 +984,8 @@ impl LlmUsageStore {
         window_secs: u64,
     ) -> anyhow::Result<Option<StoredWindow>> {
         let row = sqlx::query(&format!(
-            "SELECT upstream, boundary_unix, window_secs, capacity_tokens, source
+            "SELECT upstream, boundary_unix, window_secs, capacity_tokens, source,
+                    declared_reset_unix
                FROM {WINDOW_TABLE} WHERE upstream = $1 AND window_secs = $2"
         ))
         .bind(upstream)
@@ -976,6 +998,7 @@ impl LlmUsageStore {
             window_secs: r.get::<i64, _>("window_secs").max(0) as u64,
             capacity_tokens: r.get::<i64, _>("capacity_tokens").max(0) as u64,
             source: r.get("source"),
+            declared_reset_unix: r.get("declared_reset_unix"),
         }))
     }
 

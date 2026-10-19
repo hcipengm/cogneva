@@ -154,6 +154,43 @@ pub struct WindowEvidence {
 /// the failure this module exists to prevent — spending a whole window in a
 /// day.
 pub fn window_end(evidence: WindowEvidence) -> Option<i64> {
+    window_boundary(evidence).map(|(end, _)| end)
+}
+
+/// Which observation named a window boundary.
+///
+/// Kept beside the instant because the three are not equally strong, and a
+/// reader that sees only the instant cannot tell a phase anchored on the
+/// upstream's own promise from one anchored on a resume that bounds it from
+/// above by a retry delay. A stored measurement that does not say which is a
+/// number with no provenance: it can be repeated, not audited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundarySource {
+    /// The instant an upstream named in its refusal: exact, if the refusal is
+    /// this cycle's.
+    NamedReset,
+    /// The first successful call after a wall: bounds the reset from above by
+    /// the retry delay.
+    LastResume,
+    /// The live health reading said the outstanding refusal is a spent cycle
+    /// and named when the quota returns.
+    ObservedReset,
+}
+
+impl BoundarySource {
+    /// The spelling stored in `gateway_llm_window.source`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BoundarySource::NamedReset => "named_reset",
+            BoundarySource::LastResume => "last_resume",
+            BoundarySource::ObservedReset => "observed_reset",
+        }
+    }
+}
+
+/// The boundary [`window_end`] names, with the observation it came from.
+pub fn window_boundary(evidence: WindowEvidence) -> Option<(i64, BoundarySource)> {
     if let Some(wall) = evidence.last_quota_refusal_unix {
         // The refusal says the allowance ran out; it does not say the window
         // ended there. When the upstream also names the reset instant, that
@@ -163,7 +200,7 @@ pub fn window_end(evidence: WindowEvidence) -> Option<i64> {
         // accident — so it is not used.
         if let Some(reset) = evidence.quota_reset_unix {
             if reset > wall && (reset - wall) < evidence.window_secs as i64 {
-                return Some(reset);
+                return Some((reset, BoundarySource::NamedReset));
             }
         }
         // No named instant: the latest resume is the observation that remains.
@@ -186,7 +223,7 @@ pub fn window_end(evidence: WindowEvidence) -> Option<i64> {
                 && window > 0
                 && evidence.now_unix - resumed < 2 * window
             {
-                return Some(resumed);
+                return Some((resumed, BoundarySource::LastResume));
             }
         }
         // Neither observed: the boundary is unknown, and saying otherwise is
@@ -206,7 +243,7 @@ pub fn window_end(evidence: WindowEvidence) -> Option<i64> {
                 && reset > evidence.now_unix - window_secs
                 && reset <= evidence.now_unix + window_secs
             {
-                return Some(reset);
+                return Some((reset, BoundarySource::ObservedReset));
             }
         }
     }
@@ -227,8 +264,22 @@ pub fn measured_window(
     capacity_tokens: u64,
     latched: Option<MeasuredWindow>,
 ) -> Option<MeasuredWindow> {
-    let Some(end) = window_end(evidence) else {
-        return latched;
+    measured_window_with_boundary(evidence, capacity_tokens, latched).map(|(measured, _)| measured)
+}
+
+/// [`measured_window`], also reporting which observation the boundary rests on.
+///
+/// The source is `None` exactly when the fresh observation was not usable and
+/// the earlier measurement is being carried: a carried window keeps the
+/// provenance recorded when it was measured, so a caller must not overwrite
+/// that row's source from this call.
+pub fn measured_window_with_boundary(
+    evidence: WindowEvidence,
+    capacity_tokens: u64,
+    latched: Option<MeasuredWindow>,
+) -> Option<(MeasuredWindow, Option<BoundarySource>)> {
+    let Some((end, source)) = window_boundary(evidence) else {
+        return latched.map(|measured| (measured, None));
     };
     let fresh = MeasuredWindow {
         capacity_tokens,
@@ -236,9 +287,9 @@ pub fn measured_window(
         burned_at_unix: end,
     };
     if fresh.is_usable() {
-        Some(fresh)
+        Some((fresh, Some(source)))
     } else {
-        latched
+        latched.map(|measured| (measured, None))
     }
 }
 
@@ -420,6 +471,62 @@ mod tests {
         };
         assert_eq!(window_end(evidence), None);
         assert_eq!(measured_window(evidence, 30_000_000, None), None);
+    }
+
+    #[test]
+    fn the_boundary_says_which_observation_named_it() {
+        // The instant alone cannot tell an exact promise from one bounded from
+        // above by a resume, and a stored row that reports only the instant is
+        // a number nobody can audit.
+        let named = WindowEvidence {
+            last_quota_refusal_unix: Some(2_000_000),
+            quota_reset_unix: Some(2_000_000 + 3 * DAY),
+            window_secs: (30 * DAY) as u64,
+            ..Default::default()
+        };
+        assert_eq!(
+            window_boundary(named),
+            Some((2_000_000 + 3 * DAY, BoundarySource::NamedReset))
+        );
+
+        let resumed = WindowEvidence {
+            last_quota_refusal_unix: Some(2_000_000),
+            last_resume_unix: Some(2_001_000),
+            window_secs: (30 * DAY) as u64,
+            now_unix: 2_002_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            window_boundary(resumed),
+            Some((2_001_000, BoundarySource::LastResume))
+        );
+
+        let live = WindowEvidence {
+            quota_cycle_observed: true,
+            quota_reset_unix: Some(5_000_000 + DAY),
+            window_secs: (7 * DAY) as u64,
+            now_unix: 5_000_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            window_boundary(live),
+            Some((5_000_000 + DAY, BoundarySource::ObservedReset))
+        );
+    }
+
+    #[test]
+    fn a_carried_window_keeps_the_provenance_it_was_measured_with() {
+        // Nothing was observed this pass, so the earlier measurement stands and
+        // no source may be written over the one it was stored with.
+        let earlier = month();
+        let nothing_observed = WindowEvidence {
+            window_secs: (30 * DAY) as u64,
+            ..Default::default()
+        };
+        let (measured, source) = measured_window_with_boundary(nothing_observed, 0, Some(earlier))
+            .expect("the earlier measurement still paces");
+        assert_eq!(measured, earlier);
+        assert_eq!(source, None);
     }
 
     #[test]
