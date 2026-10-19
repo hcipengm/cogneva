@@ -47,15 +47,15 @@ KubeHpaReplicasMismatch	kube_horizontalpodautoscaler_spec_max_replicas,kube_hori
 KubePdbNotEnoughHealthyPods	kube_poddisruptionbudget_status_current_healthy,kube_poddisruptionbudget_status_desired_healthy	object_absent	No PodDisruptionBudget exists; correct dormancy, the rule wakes when one is created.
 
 # --- exporter_version (14 rules): the source version does not expose it -----
-KubeJobNotCompleted	kube_job_labels	exporter_version	The exporter's label allowlist does not emit kube_job_labels; the rule picks up the label set only if that allowlist is widened.
-KubePersistentVolumeFillingUp	kube_persistentvolumeclaim_labels	exporter_version	The exporter's label allowlist does not emit kube_persistentvolumeclaim_labels; widen the allowlist or drop the label dependency.
-KubePersistentVolumeInodesFillingUp	kube_persistentvolumeclaim_labels	exporter_version	Same allowlist gap as KubePersistentVolumeFillingUp; the inode rule shares the selector.
-KubePodNotReady	kube_pod_status_reason	exporter_version	kube_pod_status_reason is not exported by this kube-state-metrics version; the rule silently loses its reason filter.
-KubeNodeEviction	kubelet_evictions	series_renamed	kubelet v1.36 removed kubelet_evictions (deprecated since 1.24); use the pod eviction counters in kube-state-metrics instead.
-KubeletClientCertificateExpiration	kubelet_certificate_manager_client_ttl_seconds	exporter_version	kubelet v1.36.4+k3s1 does not expose the certificate-manager family; certificate expiry has no witness until this is restored upstream or via a probe.
-KubeletClientCertificateRenewalErrors	kubelet_certificate_manager_client_expiration_renew_errors	exporter_version	Same missing kubelet certificate-manager family; renewal errors are silent.
-KubeletServerCertificateExpiration	kubelet_certificate_manager_server_ttl_seconds	exporter_version	Same missing kubelet certificate-manager family; serving-certificate expiry is silent.
-KubeletServerCertificateRenewalErrors	kubelet_server_expiration_renew_errors	exporter_version	Same missing kubelet certificate-manager family; serving-certificate renewal errors are silent.
+KubeJobNotCompleted	kube_job_labels	exporter_version	kube-state-metrics v2 dropped the kube_*_labels families; kube_job_info carries only allowlisted labels, which are off. The name appears only inside an unless clause, so its absence does not stop the rule from firing: it only makes the label_excluded_from_alerts opt-out inert. Restore by widening the allowlist and rewriting the clause to kube_job_info.
+KubePersistentVolumeFillingUp	kube_persistentvolumeclaim_labels	exporter_version	Same removed family as KubeJobNotCompleted, and again only inside an unless clause, so filling-volume alerts still fire; the opt-out is inert until the allowlist carries the label and the clause reads kube_persistentvolumeclaim_info.
+KubePersistentVolumeInodesFillingUp	kube_persistentvolumeclaim_labels	exporter_version	Same removed family and same unless-only position as KubePersistentVolumeFillingUp; the inode rule fires, its opt-out does not.
+KubePodNotReady	kube_pod_status_reason	error_only_state	kube_pod_status_reason is exported per reason only while a pod carries one (SchedulingGated et al.); no series means no pod is gated, and the unless clause then excludes nothing while the rule still fires on its phase/ready side.
+KubeNodeEviction	kubelet_evictions	lazy_counter	kubelet_evictions is an ALPHA counter labelled by eviction_signal, created on the first increment; no series means no eviction happened, and the rule fires as soon as one does. Not removed upstream.
+KubeletClientCertificateExpiration	kubelet_certificate_manager_client_ttl_seconds	feature_off	The certificate-manager family exists only while kubelet runs with --rotate-certificates; k3s leaves it off, so this is a config gap, not an upstream removal. Enabling rotation would expose it.
+KubeletClientCertificateRenewalErrors	kubelet_certificate_manager_client_expiration_renew_errors	feature_off	Same certificate-manager gate: emitted only with --rotate-certificates enabled.
+KubeletServerCertificateExpiration	kubelet_certificate_manager_server_ttl_seconds	feature_off	Same certificate-manager gate: emitted only with server certificate rotation enabled.
+KubeletServerCertificateRenewalErrors	kubelet_server_expiration_renew_errors	feature_off	Same certificate-manager gate: emitted only with server certificate rotation enabled.
 
 # --- collector_off (5 rules): node-exporter collectors not enabled ----------
 NodeBondingDegraded	node_bonding_active,node_bonding_slaves	collector_off	The node-exporter bond collector is not enabled; bond link degradation is unobserved.
