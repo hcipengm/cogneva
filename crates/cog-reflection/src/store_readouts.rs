@@ -429,6 +429,50 @@ mod tests {
         assert_eq!(by_readout["decision_groups"], 1.0);
     }
 
+    /// 「没有 ACTIVE」与「ACTIVE 读不出来」不是同一件事：前者是 0（还没激活过），
+    /// 后者是 -1（文件坏了）。都报 0 的话，一个坏库会被读成「有个第 0 版」。
+    #[tokio::test]
+    async fn an_unreadable_active_is_minus_one_and_a_missing_one_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PolicyStore::new(dir.path().join("policies"));
+        let engine = Arc::new(
+            MetaLearningEngine::with_durable_state(
+                Arc::new(crate::InMemoryRecorder::new()),
+                crate::DecisionStatsSnapshot::new(
+                    dir.path().join("meta_learning/decision_stats.json"),
+                ),
+            )
+            .await,
+        );
+        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let readouts = StoreReadouts::new(
+            dir.path(),
+            vec![(META_LEARNING_POLICY.to_string(), store)],
+            engine,
+            Some(metrics.clone()),
+        );
+
+        async fn active(metrics: &cog_storage::MemoryMetricsBackend) -> f64 {
+            metrics
+                .query_gauge_latest(metric_names::POLICY_STORE_READINGS.as_str())
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| labels_of(s).0 == "active_version")
+                .expect("缺少 active_version 那一格")
+                .value
+        }
+
+        readouts.publish().await;
+        assert_eq!(active(&metrics).await, 0.0);
+
+        let store_dir = dir.path().join("policies").join(META_LEARNING_POLICY);
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("ACTIVE"), "not-a-version").unwrap();
+        readouts.publish().await;
+        assert_eq!(active(&metrics).await, -1.0);
+    }
+
     /// 恢复核对：期望与实读各发布一格；对上了就把交接单消费掉。
     #[tokio::test]
     async fn check_restore_reports_both_sides_and_consumes_the_hand_over() {
