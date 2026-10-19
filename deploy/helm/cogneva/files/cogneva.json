@@ -2075,6 +2075,15 @@
           "_comment_why_less_than": "the value is 1 or 0 and the condition is '< 1', not '== 0': a rule that matches only the exact zero stops matching the moment anyone adds a third state, while 'less than 1' keeps meaning 'not proven'."
         },
         {
+          "name": "backup_restore_drill_window_has_unproven_packages",
+          "promql": "max(cogneva_backup_run_readings{readout=\"drill_window_unproven_packages\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"drill_window_unproven_packages\"}) < 1800))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The retention window holds packages no successful drill has opened: {value} is how many, counted across everything the last successful runs said they kept. This is a different question from whether the newest drill passed -- that row answers one package, and it is exactly the package the schedule always opens. The nightly run also opens the package the window has gone longest without proving, so this number falls by one a night until the window has circulated; it stays above zero for the first week after a retention window is first proven, which is the honest reading rather than a fault. It is a warning because the packages are not known to be broken, only unproven -- and unproven is what a restore finds out the hard way."
+        },
+        {
           "name": "backup_volume_package_count_disagrees_with_the_last_run",
           "promql": "abs((max(cogneva_backup_run_readings{readout=\"volume_packages\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"volume_packages\"}) < 1800))) - (max(cogneva_backup_run_readings{readout=\"kept\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"kept\"}) < 1800))))",
           "condition": {

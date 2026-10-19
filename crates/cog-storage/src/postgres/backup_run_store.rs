@@ -129,6 +129,37 @@ LEFT JOIN LATERAL ( \
     SELECT * FROM snapshot WHERE outcome = 'ok' ORDER BY started_at DESC LIMIT 1 \
 ) AS newest ON TRUE";
 
+/// How many packages in the retention window have no successful drill.
+///
+/// The window is the packages the last successful runs recorded, cut at the
+/// newest run's own `keep_target`; it is the writer's account of what it kept.
+/// The drill side takes each package's **latest** row, so a package that was
+/// proven a week ago and failed last night counts as unproven -- the question
+/// is what is proven now, not what was proven once.
+///
+/// A package with no drill row at all joins to nulls and counts too: "never
+/// opened" and "opened and failed" are one answer here, and the row the drill
+/// writes is where the difference lives.
+///
+/// `LIMIT` cannot be a bare subquery over the table being read, so the bound
+/// comes from the newest run; a null bound (no run ever succeeded) yields an
+/// empty window and a count of zero, which is the state the backup rules
+/// already speak to.
+const UNPROVEN_PACKAGES_SQL: &str = "\
+WITH kept AS ( \
+    SELECT package FROM backup_runs \
+    WHERE outcome = 'ok' AND package IS NOT NULL \
+    ORDER BY started_at DESC \
+    LIMIT coalesce((SELECT keep_target FROM backup_runs ORDER BY started_at DESC LIMIT 1), 0) \
+), latest AS ( \
+    SELECT DISTINCT ON (package) package, error FROM backup_drills \
+    WHERE package IS NOT NULL \
+    ORDER BY package, started_at DESC \
+) \
+SELECT count(*) FROM kept \
+LEFT JOIN latest USING (package) \
+WHERE latest.package IS NULL OR latest.error IS NOT NULL";
+
 /// One drill's answer, written once.
 ///
 /// The outcome is derived from the record rather than taken from a caller's
@@ -293,6 +324,17 @@ impl BackupRunStore for PostgresBackupRunStore {
             }
         };
 
+        // The window is what the writer says it kept, not what the directory
+        // holds: this reader has no directory to walk. The drill side is matched
+        // by package name, and a package whose latest drill failed counts the
+        // same as one no drill ever opened -- both leave the package unproven,
+        // and the difference between them is the drill's own row, not this
+        // count.
+        let drill_unproven_packages: i64 = sqlx::query_scalar(UNPROVEN_PACKAGES_SQL)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("count the window's unproven packages: {e}")))?;
+
         Ok(BackupAccountReading {
             running: row
                 .try_get("running")
@@ -312,6 +354,7 @@ impl BackupRunStore for PostgresBackupRunStore {
             oldest_running_at,
             oldest_running_deadline_seconds,
             newest_package,
+            drill_unproven_packages,
         })
     }
 

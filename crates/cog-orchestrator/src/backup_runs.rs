@@ -101,6 +101,10 @@ enum BackupReadout {
     OffsiteNewestAgeSeconds,
     /// Whether that second copy is the very package the drill restored: 1 or 0.
     OffsiteMatchesVolume,
+    /// How many packages in the retention window have no successful drill
+    /// behind them, counted by the store across the window rather than read off
+    /// the newest drill's row.
+    DrillWindowUnprovenPackages,
 }
 
 impl BackupReadout {
@@ -123,6 +127,7 @@ impl BackupReadout {
         BackupReadout::VolumeOldestPackageAgeSeconds,
         BackupReadout::OffsiteNewestAgeSeconds,
         BackupReadout::OffsiteMatchesVolume,
+        BackupReadout::DrillWindowUnprovenPackages,
     ];
 
     fn as_str(self) -> &'static str {
@@ -145,6 +150,7 @@ impl BackupReadout {
             BackupReadout::VolumeOldestPackageAgeSeconds => "volume_oldest_package_age_seconds",
             BackupReadout::OffsiteNewestAgeSeconds => "offsite_newest_age_seconds",
             BackupReadout::OffsiteMatchesVolume => "offsite_matches_volume",
+            BackupReadout::DrillWindowUnprovenPackages => "drill_window_unproven_packages",
         }
     }
 }
@@ -297,6 +303,15 @@ const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()
         BackupReadout::OffsiteMatchesVolume,
         ReadoutReader::Rule("backup_offsite_copy_is_not_the_latest_package"),
     ),
+    // The one drill value that is not a look at a row: the store counts the
+    // window, because the loop has no directory to walk and no history of its
+    // own. Its rule is the only one whose subject is the window rather than the
+    // last drill, and that is why it has to exist beside `drill_latest_ok` --
+    // a passing night cannot stand in for it.
+    (
+        BackupReadout::DrillWindowUnprovenPackages,
+        ReadoutReader::Rule("backup_restore_drill_window_has_unproven_packages"),
+    ),
 ];
 
 /// How old an instant is, in whole seconds, floored at zero.
@@ -393,6 +408,11 @@ fn value_of(
         BackupReadout::OffsiteMatchesVolume => drill
             .and_then(|d| d.offsite_matches_newest)
             .map(|same| if same { 1.0 } else { 0.0 }),
+        // Not read off the newest drill's row: that row answers "did the
+        // package it opened restore", and this counts the window it did not
+        // open. A green newest row and a window nobody has opened are both
+        // ordinary, and only one of them is what a restore needs.
+        BackupReadout::DrillWindowUnprovenPackages => Some(account.drill_unproven_packages as f64),
     }
 }
 

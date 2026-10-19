@@ -236,6 +236,21 @@ pub struct BackupAccountReading {
     /// backed up successfully has no age to report, and a zero would say the
     /// opposite.
     pub newest_package: Option<BackupPackageRecord>,
+    /// How many packages in the retention window have no successful drill
+    /// behind them -- their latest drill failed, or none ever ran on them.
+    ///
+    /// This is not a second reading of a drill's own verdict. A drill's row
+    /// says whether the package it opened was restorable, and the newest row
+    /// is one package; this counts the window. An installation whose nightly
+    /// drill passes every night can still be holding six packages nobody has
+    /// ever opened, and the two facts must be visible side by side rather than
+    /// one standing in for the other.
+    ///
+    /// The window is the set of packages the last successful runs said they
+    /// left, bounded by the newest run's own `keep_target`, and the drill
+    /// history is matched to it by package name. Zero means every package the
+    /// writer says it kept has been opened successfully at least once.
+    pub drill_unproven_packages: i64,
 }
 
 /// One restore drill's answer: what a package was opened up and found to hold.
