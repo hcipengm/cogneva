@@ -533,7 +533,7 @@
         },
         {
           "name": "redis_memory_near_limit",
-          "promql": "max by (pod) (cogneva_redis_memory_used_bytes{namespace=\"cogneva\"}) / on(pod) max by (pod) (kube_pod_container_resource_limits{namespace=\"cogneva\", container=\"redis\", resource=\"memory\", unit=\"byte\"})",
+          "promql": "max without (pod, container, instance) (max by (pod) (cogneva_redis_memory_used_bytes{namespace=\"cogneva\"}) / on(pod) max by (pod) (kube_pod_container_resource_limits{namespace=\"cogneva\", container=\"redis\", resource=\"memory\", unit=\"byte\"}))",
           "condition": {
             "greater_than": 0.9
           },
@@ -542,12 +542,21 @@
         },
         {
           "name": "redis_info_stale",
-          "promql": "(time() - max by (pod) (cogneva_redis_info_updated_timestamp_seconds{namespace=\"cogneva\"})) > 3 * scalar(max(cogneva_redis_info_interval_seconds{namespace=\"cogneva\"}))",
+          "promql": "(time() - max without (pod, container, instance) (cogneva_redis_info_updated_timestamp_seconds{namespace=\"cogneva\"})) > 3 * scalar(max(cogneva_redis_info_interval_seconds{namespace=\"cogneva\"}))",
           "condition": {
             "greater_than": 0.0
           },
           "severity": "warning",
           "summary": "The Redis INFO reading is {value} second(s) older than its expected refresh. The sidecar rewrites the textfile each interval; if it dies, loses the password, or the textfile directory goes away, node-exporter keeps serving the last file it got, so every cogneva_redis_* value stays at its last number and reads as healthy. This rule is the one that says the reading stopped, and it asks the reading itself how often it is supposed to move instead of writing a period into the rule. Three intervals, because one missed pass is a slow Redis and not a stopped writer"
+        },
+        {
+          "name": "redis_wal_census_stale",
+          "promql": "(time() - max without (pod, container, instance) (cogneva_redis_wal_scan_timestamp_seconds{namespace=\"cogneva\"})) > 3 * scalar(max(cogneva_redis_wal_scan_interval_seconds{namespace=\"cogneva\"}))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The Redis log census is {value} second(s) older than its expected refresh. The scan walks the keyspace once every five minutes -- far slower than the INFO pass next to it -- and publishes its own period, so this rule reads that period rather than the INFO one: a three-interval bound taken from the 30 s clock would fire every four and a half minutes on a census that is running exactly as configured. What it guards is cogneva_redis_wal_keys and cogneva_redis_wal_max_length, the only readings of how much the per-session log cap is holding back; a dead census leaves them frozen at their last numbers, which is indistinguishable from a Redis whose logs stopped growing"
         },
         {
           "name": "aof_repair_gave_up_bytes",

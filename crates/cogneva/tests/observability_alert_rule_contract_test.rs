@@ -530,6 +530,14 @@ const PRODUCED: &[(&str, &str)] = &[
         "deploy/helm/cogneva/templates/redis.yaml",
     ),
     (
+        "cogneva_redis_wal_scan_interval_seconds",
+        "deploy/helm/cogneva/templates/redis.yaml",
+    ),
+    (
+        "cogneva_redis_wal_scan_timestamp_seconds",
+        "deploy/helm/cogneva/templates/redis.yaml",
+    ),
+    (
         "cogneva_redrive_budget_losses_total",
         "crates/cog-github/src/redrive_budget.rs",
     ),
