@@ -1512,8 +1512,12 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
     out.push_str("refusal-backoff\t");
     match &table.backoff {
         Some(b) => out.push_str(&format!(
-            "attempts-per-minute={}\tunstated-wait-secs={}\trefusals={}\twaited-secs={}\n",
-            b.attempts_per_minute, b.default_wait_secs, b.refusals, b.waited_secs
+            "attempts-per-minute={}\tunstated-wait-secs={}\tattempts={}\trefusals={}\twaited-secs={}\n",
+            b.attempts_per_minute,
+            b.default_wait_secs,
+            b.attempts,
+            b.refusals,
+            b.waited_secs
         )),
         None => out.push_str(
             "unknown: this table was not produced by the eval rig, so the caller-side wait is \
@@ -3083,15 +3087,16 @@ mod tests {
         table.backoff = Some(cog_eval::backoff::BackoffReading {
             attempts_per_minute: 600,
             default_wait_secs: 1,
+            attempts: 9,
             refusals: 7,
             waited_secs: 42,
         });
         let text = render_with(&table, &[]);
         assert!(
             text.contains(
-                "refusal-backoff\tattempts-per-minute=600\tunstated-wait-secs=1\trefusals=7\twaited-secs=42\n"
+                "refusal-backoff\tattempts-per-minute=600\tunstated-wait-secs=1\tattempts=9\trefusals=7\twaited-secs=42\n"
             ),
-            "wiring must carry the bound and how often it bit:\n{text}"
+            "wiring must carry the bound, how many calls were made, and how often it bit:\n{text}"
         );
 
         table.backoff = None;

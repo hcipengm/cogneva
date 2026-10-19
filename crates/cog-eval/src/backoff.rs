@@ -45,10 +45,14 @@ pub const ATTEMPTS_PER_MINUTE: usize = 600;
 ///
 /// 只印界不印次数，「装了退避」与「退避从没生效过」在产物上同形；只印次数不印界，
 /// 读的人没法判断这个次数是撞上了多长的一次等待。
+///
+/// `attempts` 是**实际发出去的调用数**，不是界：`attempts` 与 `refusals` 一起才能
+/// 分开「池子关着所以拒绝多」与「退避把正常调用也压住了」——只看界看不出这件事。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BackoffReading {
     pub attempts_per_minute: usize,
     pub default_wait_secs: u64,
+    pub attempts: u64,
     pub refusals: u64,
     pub waited_secs: u64,
 }
@@ -66,6 +70,9 @@ pub struct RefusalBackoff {
     /// 生效过」在表上同形。
     refusals: AtomicU64,
     waited_secs: AtomicU64,
+    /// 实际发出去的调用数。与 `refusals` 同印，才能分开「池子关着」与「退避把正常
+    /// 调用压住了」。
+    attempts_total: AtomicU64,
 }
 
 impl RefusalBackoff {
@@ -83,6 +90,7 @@ impl RefusalBackoff {
             window,
             refusals: AtomicU64::new(0),
             waited_secs: AtomicU64::new(0),
+            attempts_total: AtomicU64::new(0),
         }
     }
 
@@ -131,6 +139,7 @@ impl RefusalBackoff {
         BackoffReading {
             attempts_per_minute: self.per_minute,
             default_wait_secs: DEFAULT_REFUSAL_BACKOFF.as_secs(),
+            attempts: self.attempts_total.load(Ordering::Relaxed),
             refusals,
             waited_secs,
         }
@@ -178,6 +187,7 @@ impl RefusalBackoff {
 
     fn record_attempt(&self) {
         let now = Instant::now();
+        self.attempts_total.fetch_add(1, Ordering::Relaxed);
         let mut attempts = self.attempts.lock().unwrap();
         while let Some(oldest) = attempts.front() {
             if now.duration_since(*oldest) >= self.window {
