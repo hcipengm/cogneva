@@ -544,10 +544,7 @@ mod tests {
 
     #[test]
     fn an_unknown_kind_is_refused() {
-        let line = std::iter::repeat("-")
-            .take(11)
-            .collect::<Vec<_>>()
-            .join("\t");
+        let line = ["-"; 11].join("\t");
         let text = format!("某面\tline\t{line}\n");
         assert!(parse_roster(&text).is_err());
     }

@@ -285,7 +285,7 @@ mod tests {
         let id = gap_goal_id("安全与凭证", "vacancy_expired", "2026-10-19");
         assert!(id.starts_with("face-gap-"));
         assert!(id.ends_with("-vacancy_expired-2026-10-19"));
-        assert!(id.chars().all(|c| c.is_ascii()));
+        assert!(id.is_ascii());
 
         // Names that share no ASCII characters must not share an id, or one
         // face's daily goal would suppress the other's as already submitted.

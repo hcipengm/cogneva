@@ -224,6 +224,7 @@ async fn build_test_state() -> Option<AutonomousTestState> {
         metrics_dimensions: Vec::new(),
         mcp_client: None,
         workspace_store: None,
+        governance_store: None,
         external_skill_registry: None,
         notification_dispatcher: None,
         notification_tx: broadcast::channel(16).0,
