@@ -303,6 +303,15 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
         ctx.publish_observable(Arc::new(crate::observable::TaskGraphObservable::new(
             shared_orchestrator.clone(),
         )));
+        // Face drift is a scrape-only reading over the graph and the agents'
+        // heartbeats. The handle goes up here because that is when the readers
+        // take their snapshot; `start` only attaches the dispatch loop to it.
+        if let Some(store) = ctx.consume_service::<dyn cog_core::GovernanceStore>() {
+            ctx.publish_observable(Arc::new(crate::face_drift::FaceDriftObservable::new(
+                store,
+                ctx.consume_service::<dyn cog_core::AgentRegistry>(),
+            )));
+        }
         info!("OrchestratorPlugin observable published");
 
         self.initialized = true;
@@ -975,9 +984,6 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
                     face_shutdown,
                 );
-                ctx.publish_observable(Arc::new(crate::face_drift::FaceDriftObservable::new(
-                    store, agents,
-                )));
             }
             None => info!("face drift loop not started: no GovernanceStore published"),
         }
