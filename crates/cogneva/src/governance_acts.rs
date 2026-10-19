@@ -414,6 +414,16 @@ pub async fn run(
             let expected_revision = face.revision();
             let mut spec = face.spec.clone();
             spec.revision += 1;
+            // Filling a declared vacancy ends it. The three cells name who was
+            // going to fill the seat, by when, and with which task; once
+            // somebody is in the seat they describe a search that is over. Left
+            // behind, `gap_task` keeps pointing at a closing task that may never
+            // have existed while the row looks staffed and nobody re-checks it.
+            if handover.spec.from_unit.is_none() {
+                spec.vacancy_until = None;
+                spec.vacancy_assigner = None;
+                spec.gap_task_id = None;
+            }
             face_task
                 .input
                 .as_object_mut()
@@ -1637,6 +1647,77 @@ mod tests {
             now,
         });
         assert_eq!(reading.state, cog_core::DriftState::OnTarget);
+    }
+
+    #[tokio::test]
+    async fn filling_a_vacancy_clears_the_search_that_was_looking_for_someone() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let face_id = "\u{5b89}\u{5168}\u{4e0e}\u{51ed}\u{8bc1}";
+
+        let mut spec = cog_core::FaceSpec::first(face_id, cog_core::FaceKind::Face);
+        spec.vacancy_until = Some(now + chrono::Duration::days(1));
+        spec.vacancy_assigner = Some("operator".into());
+        // A gap task that was never created: the import path checks only that
+        // the three cells are non-empty, so a name that resolves to nothing
+        // reads exactly like a real one.
+        spec.gap_task_id = Some("SEC-BASELINE".into());
+        let face = cog_core::Face {
+            face_id: face_id.to_string(),
+            owner_unit: None,
+            bound_by_handover_id: None,
+            spec,
+            updated_at: now,
+        };
+        store
+            .save_governance_node(&face.to_task(None))
+            .await
+            .unwrap();
+
+        let id = run(
+            Act::HandoverOpen {
+                face: face_id.to_string(),
+                from: None,
+                to: "b4".into(),
+                witness: "38".into(),
+                source: None,
+                criterion: None,
+                reading_at: None,
+                open_actions: Vec::new(),
+                permissions_context: None,
+                artifact: None,
+                artifact_expires_at: None,
+                expires_when: Some(now + chrono::Duration::days(1)),
+                withdraw_condition: None,
+            },
+            &store,
+            now,
+        )
+        .await
+        .map(|_| store.of_type(HANDOVER_TASK_TYPE)[0].id.clone())
+        .unwrap();
+        for unit in ["b4", "38"] {
+            run(
+                Act::HandoverSign {
+                    id: id.clone(),
+                    unit: unit.into(),
+                },
+                &store,
+                now,
+            )
+            .await
+            .unwrap();
+        }
+        run(Act::HandoverApply { id }, &store, now).await.unwrap();
+
+        let filled = cog_core::Face::from_task(&store.row(face_id)).unwrap();
+        assert_eq!(filled.owner_unit.as_deref(), Some("b4"));
+        assert!(!filled.spec.has_named_vacancy());
+        assert_eq!(filled.spec.vacancy_until, None);
+        assert_eq!(filled.spec.vacancy_assigner, None);
+        assert_eq!(filled.spec.gap_task_id, None);
+        assert!(filled.is_staffed());
+        assert!(!filled.vacancy_expired_at(now + chrono::Duration::days(2)));
     }
 
     // The seven cells include "what the new owner inherits as unfinished
