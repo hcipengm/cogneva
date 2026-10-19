@@ -339,7 +339,7 @@ Not simple conversation-history concatenation, but a **Raw → Schema → Summar
 - File-level memory (e.g. MEMORY.md) is flat text, capacity-limited, keyword-matched retrieval
 - Cogneva's memory is **structured + vectorized + graph-relational**, supporting semantic retrieval, time-range filtering, and relation-chain queries
 - The LLM automatically assigns importance scores (1–10); a periodic maintenance pass decays aged low-value memories automatically — down-weighting their importance and archiving those that fall past a floor — while re-observed facts are merged rather than duplicated
-- Multi-tenant Namespace isolation for enterprise-grade data security
+- Namespace-scoped storage: every entry carries a namespace and every read and write filters on it, so separate workloads can share one deployment without seeing each other's memory
 
 ### 🔭 Advantage 5: Full-stack observability
 
@@ -683,6 +683,13 @@ For manual compilation: `cargo build --release`. Container image: see `Dockerfil
 - `cargo test --workspace` passes across the workspace
 - **Deployed and operating in live environments**
 - **Ongoing**: full-evolution toward strong RSI
+
+**Scope and limits** — stated here rather than left to inference:
+
+- **Namespaces partition data, they are not an authorization boundary.** A namespace scopes memory and task storage; the platform does not authenticate a caller *as* a tenant and does not enforce namespace-level access control.
+- **No quota enforcement and no billing.** The `cog-quota` crate exists but is not on the serving path, and there is no metering or invoicing component.
+- **Alert delivery needs an outlet you provide.** Alert rules and the `alerts` table ship with the platform; notification channels (email, Slack, generic webhook) are empty until configured, and nothing is sent until then.
+- **Upgrade and rollback are not yet exercised end-to-end in production.** The live deployments so far were delivered by manifest apply and image rollouts; run `helm upgrade` / `helm rollback` on a staging cluster before depending on them for a production upgrade.
 
 ---
 
