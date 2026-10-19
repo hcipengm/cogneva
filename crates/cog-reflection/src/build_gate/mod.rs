@@ -253,6 +253,28 @@ const RESERVE_FILE: &str = "builds.reserve";
 /// order of time.
 const RESERVE_FRESH: Duration = Duration::from_secs(900);
 
+/// Claims on the next build that lapsed before anyone used them, as a counter
+/// carrying the `asker` that made the claim.
+///
+/// A claim past [`RESERVE_FRESH`] is dropped without a word: the work that asked
+/// loses its turn, the field goes to whoever arrives next, and the refusal it
+/// gets afterwards looks exactly like the refusal it got before the claim. That
+/// is how the mainline's 14:55 claim on 2026-10-19 left no trace beyond a log
+/// line -- the claim expired at 15:10:24 and a change verification took the
+/// field one second later. This counter is that fact as a value, so "the
+/// handover was asked for and never arrived" is countable instead of inferred.
+///
+/// Counted where the staleness is first *observed* -- by an arrival, by a walk,
+/// or by the asker coming back -- because no code runs at the expiry instant. A
+/// claim is identified by the pair it was written with (its author and its
+/// timestamp), so one stale file is counted once however many times it is read,
+/// while the same work lapsing again on a later claim is a second count.
+///
+/// Declared here rather than beside the other gate names in the contract half:
+/// nothing outside this crate reads it yet, and the project rule is that a new
+/// metric name is not a reason to make every crate rebuild.
+pub const BUILD_GATE_RESERVATION_LAPSED_TOTAL: &str = "cogneva_build_gate_reservation_lapsed_total";
+
 /// How often a waiter looks again. Builds run for minutes, so this only decides
 /// how promptly a freed slot is picked up.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -445,6 +467,8 @@ struct Counters {
     /// rather than one that grows with the walls a process happens to have hit
     /// or the works it happens to have refused.
     refused: [[u64; RefusedBy::ALL.len()]; ASKER_CELLS],
+    /// One count per asker cell: claims on the next build that lapsed unused.
+    lapsed: [u64; ASKER_CELLS],
     wait_ms_total: u64,
     wait_ms_max: u64,
     held_ms_total: u64,
@@ -830,6 +854,19 @@ fn readings(
             );
         }
     }
+    // Every cell, at zero if its work never lost a claim: a row that appears
+    // only once the counter moves would read as "this work never asked for the
+    // next build" and "this work never lost its turn" the same way, and the
+    // second is the one an operator has to notice.
+    for asker in 0..ASKER_CELLS {
+        out.push(
+            label(RawMetric::new(
+                BUILD_GATE_RESERVATION_LAPSED_TOTAL,
+                c.lapsed[asker] as f64,
+            ))
+            .with_label("asker", asker_label(asker).to_string()),
+        );
+    }
     out.extend([
         label(RawMetric::new(
             BUILD_GATE_WAIT_MS_TOTAL,
@@ -1209,6 +1246,17 @@ pub struct BuildGate {
     /// the first turn.
     walk_yields: AtomicU64,
     walk_over_reservation: AtomicU64,
+    /// Claims on the next build that were read past their freshness, one count
+    /// per asker cell, indexed by [`asker_index`]. See
+    /// [`BUILD_GATE_RESERVATION_LAPSED_TOTAL`].
+    lapsed_reservations: [AtomicU64; ASKER_CELLS],
+    /// The claim each work has already been charged for, as the timestamp it was
+    /// written with. One stale file is read by every arrival until it is
+    /// overwritten, and each read is the same lapse: this is what keeps the
+    /// counter from growing with the traffic instead of with the lapses. A work
+    /// that lapses again on a newer claim carries a newer timestamp, so it is
+    /// counted again.
+    lapsed_counted: Mutex<std::collections::HashMap<String, u64>>,
     /// How many turns in a row each work has stood down for someone else's
     /// reservation. Reset when it takes the field, so the bound counts one
     /// unbroken series of yields rather than a lifetime total that would
@@ -1280,6 +1328,8 @@ impl BuildGate {
             held_ms_max: AtomicU64::new(0),
             walk_yields: AtomicU64::new(0),
             walk_over_reservation: AtomicU64::new(0),
+            lapsed_reservations: std::array::from_fn(|_| AtomicU64::new(0)),
+            lapsed_counted: Mutex::new(std::collections::HashMap::new()),
             walk_yield_streak: Mutex::new(std::collections::HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             events_dropped: AtomicU64::new(0),
@@ -1615,9 +1665,34 @@ impl BuildGate {
         if age > RESERVE_FRESH.as_secs() {
             // A claim that is not being refreshed is a work that stopped asking:
             // honoring it would hold builds out for a waiter that is gone.
+            // Count it before dropping it: the work that asked loses this turn
+            // here, and the refusal it gets next is indistinguishable from the
+            // one it got before the claim.
+            self.note_lapsed_reservation(&what, since);
             return None;
         }
         Some((what, since))
+    }
+
+    /// Charges one lapse to the work whose claim expired unused, once per claim.
+    ///
+    /// The pair `(what, since)` is the claim's identity: the file is read by
+    /// every arrival while it is stale, and each read sees the same claim. A
+    /// newer claim carries a newer `since`, so a work that loses its turn again
+    /// is counted again. The counter is per asker cell, the same closed
+    /// vocabulary the refusal counter uses, so a call site asking under words
+    /// [`BUILD_GATE_ASKERS`] does not list lands in the unnamed cell rather than
+    /// growing the series set.
+    fn note_lapsed_reservation(&self, what: &str, since: u64) {
+        let mut counted = self
+            .lapsed_counted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if counted.get(what).copied() == Some(since) {
+            return;
+        }
+        counted.insert(what.to_string(), since);
+        self.lapsed_reservations[asker_index(what)].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Releases a claim held by `what`, which is done once its ask is answered.
@@ -1693,6 +1768,9 @@ impl BuildGate {
             acquired: self.acquired.load(Ordering::Relaxed),
             refused: std::array::from_fn(|asker| {
                 std::array::from_fn(|wall| self.refused[asker][wall].load(Ordering::Relaxed))
+            }),
+            lapsed: std::array::from_fn(|asker| {
+                self.lapsed_reservations[asker].load(Ordering::Relaxed)
             }),
             wait_ms_total: self.wait_ms_total.load(Ordering::Relaxed),
             wait_ms_max: self.wait_ms_max.load(Ordering::Relaxed),
@@ -3839,6 +3917,48 @@ unevictable 28532736
         );
     }
 
+    /// A claim that expires before anyone uses it is charged to the work that
+    /// made it, once per claim: the file stays on disk afterwards, so every
+    /// arrival reads the same lapse and none of them may count it again.
+    #[tokio::test]
+    async fn a_claim_that_lapses_unused_is_counted_once_per_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        let path = dir.path().join(RESERVE_FILE);
+        let lapsed = |gate: &BuildGate| gate.counters().lapsed[asker_index("mainline advance")];
+
+        let stale = unix_now().saturating_sub(RESERVE_FRESH.as_secs() + 60);
+        write_gate_file(&path, &format!("mainline advance\t{stale}\n")).unwrap();
+        assert!(
+            gate.reservation().is_none(),
+            "a claim nobody refreshed is not honoured"
+        );
+        assert_eq!(lapsed(&gate), 1, "the lapse is a reading of its own");
+
+        assert!(gate.reservation().is_none());
+        assert_eq!(
+            lapsed(&gate),
+            1,
+            "reading the same stale claim again is the same lapse, not a second one"
+        );
+
+        // The same work losing a *newer* claim is a second lapse: the timestamp
+        // written with the claim is what tells two of them apart.
+        let stale_again = stale.saturating_sub(1);
+        write_gate_file(&path, &format!("mainline advance\t{stale_again}\n")).unwrap();
+        assert!(gate.reservation().is_none());
+        assert_eq!(lapsed(&gate), 2);
+
+        // A fresh claim is answered, not lapsed.
+        write_gate_file(&path, &format!("mainline advance\t{}\n", unix_now())).unwrap();
+        assert!(gate.reservation().is_some());
+        assert_eq!(
+            lapsed(&gate),
+            2,
+            "a claim still inside its window has not lapsed"
+        );
+    }
+
     /// An exclusion that is turned away by a *build* claims the next one without
     /// its caller having to say so: the sweep's cycle is long and the builds it
     /// is losing to arrive back to back, so the walk after a refusal would find
@@ -4498,6 +4618,10 @@ unevictable 28532736
         expected.extend(std::iter::repeat_n(
             BUILD_GATE_REFUSED_TOTAL,
             ASKER_CELLS * RefusedBy::ALL.len(),
+        ));
+        expected.extend(std::iter::repeat_n(
+            BUILD_GATE_RESERVATION_LAPSED_TOTAL,
+            ASKER_CELLS,
         ));
         expected.extend([
             BUILD_GATE_WAIT_MS_TOTAL,

@@ -254,6 +254,18 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["dir", "role"],
         "crates/cog-core/src/contract/build_gate.rs",
     ),
+    // The handover that was asked for and never happened: a claim on the next
+    // build that passed its freshness window unused, by the work that made it.
+    // Registered here rather than drawn on a panel, because there is no
+    // threshold to draw it against -- one lapse is a lost turn, and how many
+    // lost turns make a bound that needs raising is what this series exists to
+    // let someone answer with a window rather than a guess. See the scrape
+    // census's `REGISTERED_BUT_UNREAD_AT_CENSUS` for the debt this row records.
+    (
+        "cogneva_build_gate_reservation_lapsed_total",
+        &["dir", "role", "asker"],
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
     // What each change's release build cost the host. Every reading carries the
     // change kind, because the decision these panels feed is which kind of
     // change to spend the next build on, and the outcome, because a deploy
