@@ -24,11 +24,11 @@ spec:
     spec:
       # 演练失败不重试成串：答案已经落进 backup_drills 了，下一晚自然再来。
       backoffLimit: 0
-      # 一次演练证明的是所有未证明的包（`--also-unproven`），上界是 keepCount 份：
-      # 单包恢复实测 497 s（2026-10-19，库在长），7 × 497 ≈ 58 min，旧的一小时只剩
-      # 一分半余量，`backoffLimit: 0` 下被杀就是那一晚没有第二次。取 7200。
-      # 设界的本意仍是兜住一次挂死的恢复：不设的话，Forbid 下它会挡住后面每一次。
-      activeDeadlineSeconds: 7200
+      # 一次演练开两份包：最新那份，加窗口里最久没被证明的那份（`--also-unproven`
+      # 第二趟只挑一份）。单包恢复实测 497 s（2026-10-19，库在长），两份 ≈ 17 min，
+      # 一小时留三倍余量。设界的本意是兜住一次挂死的恢复：不设的话，Forbid 下它会
+      # 挡住后面每一次。
+      activeDeadlineSeconds: 3600
       ttlSecondsAfterFinished: 86400
       template:
         metadata:

@@ -316,15 +316,14 @@ rows:
   - key: backup.drillDeadlineSeconds
     source: override
     why: >-
-      Two hours against a run that proves every unproven package, up to
-      keepCount of them. One restore measured 155 s on 2026-10-18 and 497 s on
-      2026-10-19, so seven of them come to about 58 minutes: the old hour left
-      ninety seconds and no retry behind it. The flow records each drill's own
-      elapsed time, so a derived deadline could be a multiple of the observed
-      one; nothing computes it. The deadline still exists to bound a restore
-      that hangs, not to track a normal one -- with Forbid, a stuck drill would
-      otherwise block every drill after it, and two hours is still short against
-      a daily schedule.
+      One hour against a run that opens two packages, not one: the newest, then
+      the one the window has gone longest without proving. One restore measured
+      155 s on 2026-10-18 and 497 s on 2026-10-19, so the pair comes to about 17
+      minutes and the hour keeps roughly three times the observed cost. The flow
+      records each drill's own elapsed time, so a derived deadline could be a
+      multiple of the observed one; nothing computes it. The deadline exists to
+      bound a restore that hangs, not to track a normal one -- with Forbid, a
+      stuck drill would otherwise block every drill after it.
 
   - key: backup.storage
     source: override
