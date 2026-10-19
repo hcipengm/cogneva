@@ -47,6 +47,18 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    /// A submitted row names an owner the face it serves does not have.
+    ///
+    /// Its own error name rather than plain `Conflict`: the caller has to
+    /// change the unit or the face, not retry the same request after the
+    /// other writer settles.
+    pub fn owner_mismatch(message: impl Into<String>) -> Self {
+        Self {
+            error: "owner_mismatch".into(),
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -57,6 +69,7 @@ impl IntoResponse for ApiError {
             "Forbidden" => StatusCode::FORBIDDEN,
             // 一轮 CAS 输给了别的写者：状态已经变了，重读再决定，不是这个请求本身错了。
             "Conflict" => StatusCode::CONFLICT,
+            "owner_mismatch" => StatusCode::CONFLICT,
             "TooManyRequests" => StatusCode::TOO_MANY_REQUESTS,
             "ServiceUnavailable" => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,

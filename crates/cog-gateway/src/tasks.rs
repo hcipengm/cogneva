@@ -129,6 +129,15 @@ pub struct TaskItem {
     /// to exactly that executor is a separate step.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// The face this row serves. Naming a face binds the row to that face's
+    /// owner, so the row is checked against the roster before it is queued
+    /// rather than reported as drifted after it runs.
+    #[serde(default)]
+    pub face_id: Option<String>,
+    /// The unit the submitter says will do the work. Allowed only together
+    /// with a face and only when it agrees with the face's owner.
+    #[serde(default)]
+    pub unit_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -381,6 +390,78 @@ fn estimate_goal_tokens(req: &CreateTaskRequest) -> u64 {
 ///
 /// 行本身由 [`Task::goal_row`] 一处构造：接口这条路要带客户端的 id，所以在这里合成；
 /// 一条行都不带的调用方（例如聊天入口）由分解侧补出同样的行。
+/// What a submitted row asked to be bound to, or why the two claims cannot
+/// both be true.
+///
+/// A face's owner is the answer to "who does this face's work", so a row that
+/// names a face and no unit is bound to that owner instead of being left free:
+/// a face-bound row with no owner reads as drifted from the moment it is
+/// queued. Naming both is allowed only when they agree -- accepting a mismatch
+/// here and letting the drift pass report it later is a row written with an
+/// answer the writer already knew to be wrong.
+fn binding_of(
+    item: &TaskItem,
+    face: Option<&cog_core::Face>,
+) -> Result<(Option<String>, Option<String>), String> {
+    match (item.face_id.as_deref(), item.unit_id.as_deref()) {
+        (None, None) => Ok((None, None)),
+        (None, Some(unit)) => Err(format!(
+            "task {} names unit '{unit}' but no face; ownership is checked against the face the \
+             work serves",
+            item.id
+        )),
+        (Some(face_id), _) => {
+            let Some(face) = face else {
+                return Err(format!(
+                    "task {} names face '{face_id}', which is not on the roster",
+                    item.id
+                ));
+            };
+            match (face.owner_unit.as_deref(), item.unit_id.as_deref()) {
+                (None, _) => Err(format!(
+                    "face '{face_id}' has no owner; a task cannot be bound to it until it is \
+                     staffed"
+                )),
+                (Some(owner), Some(unit)) if owner != unit => Err(format!(
+                    "task {} names unit '{unit}' but face '{face_id}' is owned by '{owner}'",
+                    item.id
+                )),
+                (Some(owner), _) => Ok((Some(face_id.to_string()), Some(owner.to_string()))),
+            }
+        }
+    }
+}
+
+/// Check every row that names a face or a unit against the roster, and fill in
+/// the owner a face-bound row would otherwise be queued without.
+async fn resolve_bindings(state: &GatewayState, items: &mut [TaskItem]) -> Result<(), ApiError> {
+    if !items
+        .iter()
+        .any(|item| item.face_id.is_some() || item.unit_id.is_some())
+    {
+        return Ok(());
+    }
+    let store = state.governance_store.as_ref().ok_or_else(|| ApiError {
+        error: "ServiceUnavailable".into(),
+        message: "no shared database is published, so a submitted task cannot be checked \
+                  against the face it names"
+            .into(),
+    })?;
+    let nodes = store.face_nodes().await?;
+    let faces: std::collections::HashMap<String, cog_core::Face> = nodes
+        .iter()
+        .filter_map(cog_core::Face::from_task)
+        .map(|face| (face.face_id.clone(), face))
+        .collect();
+    for item in items.iter_mut() {
+        let face = item.face_id.as_deref().and_then(|id| faces.get(id));
+        let (face_id, unit) = binding_of(item, face).map_err(ApiError::owner_mismatch)?;
+        item.face_id = face_id;
+        item.unit_id = unit;
+    }
+    Ok(())
+}
+
 fn submitted_tasks(req: &CreateTaskRequest, goal_id: &str) -> Vec<Task> {
     let mut rows: Vec<Task> = req
         .tasks
@@ -399,6 +480,8 @@ fn submitted_tasks(req: &CreateTaskRequest, goal_id: &str) -> Vec<Task> {
                     task.workspace_id = Some(req.workspace_id.clone());
                     task.goal_id = Some(goal_id.to_string());
                     task.agent_id = item.agent_id.clone();
+                    task.face_id = item.face_id.clone();
+                    task.owner_unit = item.unit_id.clone();
                     // Only a submission that says it is a task can carry the
                     // "no planning needed" claim. A goal is decomposed by
                     // definition; letting a verified flag on one of its rows
@@ -490,6 +573,15 @@ pub async fn create_task_handler(
         return Err(ApiError::bad_request(
             "intent_kind=task needs at least one task; a submission with no rows is a goal",
         ));
+    }
+
+    // A row that names a face or a unit is checked against the roster here,
+    // before anything is queued: the drift pass would otherwise be the first
+    // reader to notice a mismatch, and its verdict would describe work that
+    // already ran under the wrong owner.
+    let mut req = req;
+    if let Some(items) = req.tasks.as_mut() {
+        resolve_bindings(&state, items).await?;
     }
 
     // 按任务配额执法（审计 3.6）：创建前经 5 级 HierarchyManager 检查。
@@ -1209,6 +1301,8 @@ mod tests {
                 priority: 0,
                 planner: None,
                 agent_id: None,
+                face_id: None,
+                unit_id: None,
             }]),
             workspace_id: "ws".into(),
             priority: None,
@@ -1251,7 +1345,81 @@ mod tests {
                 source: Some("user_provided".into()),
             }),
             agent_id: None,
+            face_id: None,
+            unit_id: None,
         }
+    }
+
+    fn face(face_id: &str, owner: Option<&str>) -> cog_core::Face {
+        cog_core::Face {
+            face_id: face_id.into(),
+            owner_unit: owner.map(Into::into),
+            bound_by_handover_id: None,
+            spec: cog_core::FaceSpec::first(face_id, cog_core::FaceKind::Face),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// 一张面绑定的行只能落在面主手里：命名了面就继承面主，命名了别的 unit 就当场拒，
+    /// 而不是先入队、再让漂移读数过一会儿把它读红。后者等于把已经知道错的答案写进账。
+    #[test]
+    fn a_face_bound_row_takes_the_face_owner_or_is_refused_at_submission() {
+        let owned = face("task-management", Some("worker"));
+        let vacant = face("security", None);
+
+        let mut bound = task_item("t1", None);
+        bound.face_id = Some("task-management".into());
+        assert_eq!(
+            binding_of(&bound, Some(&owned)),
+            Ok((Some("task-management".into()), Some("worker".into()))),
+            "naming only the face binds the row to that face's owner"
+        );
+
+        let mut mismatched = task_item("t2", None);
+        mismatched.face_id = Some("task-management".into());
+        mismatched.unit_id = Some("6e".into());
+        let refusal = binding_of(&mismatched, Some(&owned)).unwrap_err();
+        assert!(refusal.contains("owned by 'worker'"), "{refusal}");
+
+        let mut unknown = task_item("t3", None);
+        unknown.face_id = Some("no-such-face".into());
+        assert!(binding_of(&unknown, None)
+            .unwrap_err()
+            .contains("not on the roster"));
+
+        let mut to_vacancy = task_item("t4", None);
+        to_vacancy.face_id = Some("security".into());
+        assert!(binding_of(&to_vacancy, Some(&vacant))
+            .unwrap_err()
+            .contains("has no owner"));
+
+        let mut ownerless = task_item("t5", None);
+        ownerless.unit_id = Some("worker".into());
+        assert!(binding_of(&ownerless, None)
+            .unwrap_err()
+            .contains("but no face"));
+
+        assert_eq!(binding_of(&task_item("t6", None), None), Ok((None, None)));
+    }
+
+    /// 绑定过的字段要真的落到行上；否则校验通过、提交成功，而任务图里仍是一张没有
+    /// 归属的行，下一拍又被读成漂移。
+    #[test]
+    fn a_bound_row_carries_its_face_and_owner_onto_the_task() {
+        let mut item = task_item("t1", Some(true));
+        item.face_id = Some("task-management".into());
+        item.unit_id = Some("worker".into());
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "do the thing".into(),
+            tasks: Some(vec![item]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Task,
+        };
+        let tasks = submitted_tasks(&req, "g");
+        assert_eq!(tasks[0].face_id.as_deref(), Some("task-management"));
+        assert_eq!(tasks[0].owner_unit.as_deref(), Some("worker"));
     }
 
     /// 声明为 task 且自称已验证的提交，逐行带上 `verified`：这是协调器直注分支
