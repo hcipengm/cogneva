@@ -861,6 +861,9 @@ impl ActionPlanOrchestrator {
             // 汇点的声明写在承载 `goal_id` 的那一行上——它也是下面每一条子任务的
             // `parent_task_id` 指向的那一行，读面正是从这一行取答案。
             let goal_row_id = tasks.first().map(|t| t.id.clone());
+            // Ids of the original rows in submission order; every id after
+            // these in `all_injected_ids` is a decomposed child.
+            let placeholder_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
             let mut batch = Vec::new();
             for mut original in tasks {
                 original.goal_id = Some(goal_id.clone());
@@ -909,6 +912,86 @@ impl ActionPlanOrchestrator {
                     ?status,
                     "decomposed submission held by an existing task; nothing was queued"
                 );
+            }
+            // Never leave a freshly committed non-executable placeholder
+            // without a child. add_tasks_batch skips duplicate ids, so on a
+            // re-drive / id collision the placeholder can be newly queued
+            // while every child row is held: the childless-Pending state the
+            // orphan reconciler only finds after the stall threshold. Check
+            // real DAG state (not the returned queued list): a child that
+            // was already there keeps an idempotent replay a no-op.
+            let child_ids = &all_injected_ids[placeholder_ids.len()..];
+            let mut parented: HashSet<String> = HashSet::new();
+            for child_id in child_ids {
+                if let Some(child) = dag.get_task(child_id).await {
+                    if let Some(parent) = child.parent_task_id {
+                        parented.insert(parent);
+                    }
+                }
+            }
+            let mut stranded: Vec<Task> = Vec::new();
+            for pid in &placeholder_ids {
+                if queued.contains(pid) && !parented.contains(pid) {
+                    if let Some(row) = dag.get_task(pid).await {
+                        stranded.push(row);
+                    }
+                }
+            }
+            if !stranded.is_empty() {
+                let held_children: Vec<&str> = child_ids
+                    .iter()
+                    .filter(|id| !queued.contains(id))
+                    .map(String::as_str)
+                    .collect();
+                let reason = format!(
+                    "decomposition placeholder committed without a child present in the DAG; \
+                     child rows were held as duplicates or dropped at injection [{}]",
+                    held_children.join(", ")
+                );
+                tracing::error!(
+                    goal_id = %goal_id,
+                    placeholders = ?stranded.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+                    "{reason}"
+                );
+                // add_tasks_batch never upserts, so take the Pending row out
+                // and re-add it Failed: a terminal verdict instead of a row
+                // that nothing schedules and nothing fails, plus a persistent
+                // alert that re-drives the work immediately rather than after
+                // the orphan reconciler's stall threshold.
+                let now = Utc::now();
+                let mut failed_rows = Vec::with_capacity(stranded.len());
+                let mut failed_ids = Vec::with_capacity(stranded.len());
+                for mut row in stranded {
+                    let id = row.id.clone();
+                    if dag.delete_task(&id).await.is_err() {
+                        // The row could not be replaced; leave it Pending for
+                        // the orphan reconciler instead of dropping it entirely.
+                        continue;
+                    }
+                    row.status = cog_core::TaskStatus::Failed;
+                    row.is_executable = false;
+                    row.error = Some(reason.clone());
+                    row.updated_at = now;
+                    failed_ids.push(id.clone());
+                    self.fire_decomposition_alert(
+                        cog_core::ALERT_RULE_DECOMPOSITION_ORPHANED,
+                        &goal_id,
+                        Some(id.as_str()),
+                        attempts_used,
+                        Some(&row.input),
+                        &reason,
+                    )
+                    .await;
+                    failed_rows.push(row);
+                }
+                let failed_queued = dag.add_tasks_batch(failed_rows).await?;
+                let mut answer: Vec<String> = queued
+                    .iter()
+                    .filter(|id| !failed_ids.contains(id))
+                    .cloned()
+                    .collect();
+                answer.extend(failed_queued);
+                return Ok(answer);
             }
             tracing::info!(
                 goal = %goal,
