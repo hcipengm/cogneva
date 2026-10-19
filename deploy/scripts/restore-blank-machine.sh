@@ -172,8 +172,12 @@ step_verify() {
         return 0
     fi
     local expected bundle_expected job log restored seeded
-    expected="$(read_field "$RECEIPT/package.txt" reading | sed -n 's/.*artifacts_expected=//p')"
-    bundle_expected="$(read_field "$RECEIPT/package.txt" reading | sed -n 's/.*bundle_bytes=//p')"
+    # One field ends where the next one starts: `reading` is a space-separated
+    # list, so taking everything after the key swallows every field that follows
+    # it (measured: artifacts_expected read back as "2 bundle_bytes=0" and the
+    # verify step reported a mismatch that was not there).
+    expected="$(read_field "$RECEIPT/package.txt" reading | sed -n 's/.*artifacts_expected=\([^ ]*\).*/\1/p')"
+    bundle_expected="$(read_field "$RECEIPT/package.txt" reading | sed -n 's/.*bundle_bytes=\([^ ]*\).*/\1/p')"
     job="$(read_field "$RECEIPT/restore.txt" reading | sed -n 's/^job=//p')"
     if [ -z "$job" ]; then
         echo "回执里没有恢复 Job 的名字，无法对账" >&2
