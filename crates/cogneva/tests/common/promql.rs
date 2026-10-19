@@ -6,6 +6,14 @@
 //! through `common/mod.rs` so a test that only wants this does not have to
 //! compile the harness and mocks alongside it.
 
+// Three test binaries include this module and each asks a different subset of
+// what it answers; compiled whole into each of them, the rest is dead code and
+// `clippy -D warnings` refuses the binary. Allowing it once here keeps the
+// subset each caller uses a property of the caller, which is where it is read
+// from, instead of something to re-annotate every time one of them grows a new
+// question.
+#![allow(dead_code)]
+
 use std::collections::BTreeSet;
 
 /// Aggregation operators and keywords that look like identifiers but name no
@@ -217,11 +225,6 @@ pub fn summed_spans(expr: &str) -> Vec<String> {
 }
 
 /// Series names every `sum`/`avg` aggregation in the expression reads.
-///
-/// Only the alert-rule contract test asks this question, but the module is
-/// compiled whole into every test binary that includes it, so the other two
-/// would otherwise fail the build on an unused function.
-#[allow(dead_code)]
 pub fn summed_metric_names(expr: &str) -> BTreeSet<String> {
     summed_spans(expr)
         .iter()
@@ -349,7 +352,6 @@ fn matching_paren(s: &str, open: usize) -> Option<usize> {
 ///
 /// Quoted spans and `{...}` matchers are blanked first, so a label value or a
 /// selector cannot be read as a clause.
-#[allow(dead_code)]
 pub fn kept_labels_by_clause(expr: &str) -> Vec<BTreeSet<String>> {
     let s = strip_braces(&strip_quoted(expr));
     let bytes = s.as_bytes();
@@ -1038,7 +1040,6 @@ pub fn windows_over(expr: &str, gated: &BTreeSet<String>) -> Vec<(String, u64)> 
 /// arithmetic with any spacing; a `>` instead of a `<` is not an age bound but
 /// the inverse reading (a rule that fires on the reading being stale), and is
 /// deliberately not returned.
-#[allow(dead_code)]
 pub fn companion_age_bound(expr: &str, series: &str) -> Option<u64> {
     companion_age_bound_in(&strip_braces(&strip_quoted(expr)), series)
 }
