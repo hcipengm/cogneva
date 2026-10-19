@@ -114,7 +114,7 @@ use cog_core::{
     ChangePriority, ChangeReading, ChangeReopen, ChangeSource, ChangeState, DispatchDecision,
     DispatchState, LiveRevision, LiveRevisionSource, LlmPoolStatus, LlmWindowPace, MetricsBackend,
     OrchestratorControl, OwnerLeaseBroker, PoolReading, PrincipleCheckKind, PrincipleLedgerStore,
-    PrincipleRow, SFResult, ShutdownSignal, StateBackend, Task, TaskStatus, TaskType,
+    PrincipleRow, RetireReason, SFResult, ShutdownSignal, StateBackend, Task, TaskStatus, TaskType,
 };
 
 use cog_core::contract::llm::UpstreamFailure;
@@ -1722,6 +1722,11 @@ async fn measure_pass(
         rechecked = reopened_pass.rechecked,
         reopened = reopened_pass.reopened,
         touched = reopened_pass.touched,
+        // A row whose scope left the tree is settled here rather than counted as
+        // unsettleable forever. It is its own number because it is its own
+        // outcome: the row is no longer landed, and reading it as a rechecked
+        // row would say the claim still held.
+        landed_retired = reopened_pass.retired,
         // The landed half of the same two readings the outstanding pass already
         // gives. A row that cannot be settled keeps its old `measured_at`, so
         // without these two numbers the staleness order reads the same whether a
@@ -1752,6 +1757,11 @@ struct ReopenPass {
     touched: usize,
     unsettleable: HashMap<UnsettledReason, usize>,
     held: usize,
+    /// Rows a look settled as `retired` because their scope had left the tree.
+    /// Separate from `rechecked`, which counts rows whose check answered: a
+    /// retirement is what the history answered, and a pass that retires rows is
+    /// not a pass that found their claims still holding.
+    retired: usize,
 }
 
 /// Ask the rows the account calls done whether that is still true.
@@ -1892,6 +1902,72 @@ async fn reopen_pass(
                 .why()
                 .unwrap_or("the look settled nothing and gave no reason")
                 .to_string();
+            // A scope absent from this revision is not always a check the tree
+            // cannot answer. When the history carries its deletion, the surface
+            // was moved out on purpose: the work was real and was measured here,
+            // and there is nothing left in this tree for a later look to settle.
+            // Leaving the row `landed` says the account still holds something it
+            // can no longer see, and `measured_at` never advances, so the age of
+            // that timestamp reads as neglect nobody can repair.
+            //
+            // Asked of the history rather than assumed from the absence: a scope
+            // this line never held is a misplaced check, and filing it under the
+            // same name as a deliberate move would put "the criterion is wrong"
+            // and "the surface left" behind one word.
+            //
+            // The revision recorded is where the scope exited, not the tree this
+            // pass read: the retirement is a fact about the history, and the
+            // deletion is the moment it became true. A later reader asking when
+            // the row stopped being settleable gets that answer from the row
+            // itself.
+            if reason == UnsettledReason::ScopeAbsentInRevision {
+                match tree.scope_left_at(&row.identity).await {
+                    Ok(Some(left_at)) => {
+                        let retirement = ChangeMeasurement::retired(
+                            row.identity.clone(),
+                            RetireReason::SurfaceMoved,
+                        )
+                        .at_revision(left_at.clone());
+                        match store.apply_measurement(&retirement).await {
+                            Ok(()) => {
+                                unsettled.remove(&row.identity);
+                                pass.retired += 1;
+                                warn!(
+                                    change = %row.identity,
+                                    exited_in = %left_at,
+                                    read_at = snapshot.rev(),
+                                    "change ledger: a landed row's scope has left the tree, so \
+                                     the row is retired as surface_moved; the revision it \
+                                     carries is where the scope exited, not the tree this pass \
+                                     read"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    change = %row.identity,
+                                    exited_in = %left_at,
+                                    error = %e,
+                                    "change ledger: a landed row's scope left the tree, but the \
+                                     retirement could not be written, so the row keeps its state"
+                                );
+                                unsettled.insert(
+                                    row.identity.clone(),
+                                    UnsettledCheck { why, since: now },
+                                );
+                                *pass.unsettleable.entry(reason).or_default() += 1;
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => warn!(
+                        change = %row.identity,
+                        error = %e,
+                        "change ledger: a landed row's scope is absent and the history that \
+                         would say whether it left cannot be read; the row keeps its state"
+                    ),
+                }
+            }
             // Said when the wording is new, as the outstanding pass does: the row
             // is re-asked on a timer, and a line per row per hour would bury the
             // count below rather than add to it. Unlike that pass this one is a
@@ -4326,7 +4402,7 @@ mod tests {
     struct FakeLedger {
         rows: Vec<ChangeLedgerRow>,
         written: std::sync::Mutex<Vec<DispatchState>>,
-        measured: std::sync::Mutex<Vec<ChangeIdentity>>,
+        measured: std::sync::Mutex<Vec<ChangeMeasurement>>,
         delivered: std::sync::Mutex<Vec<(ChangeIdentity, String)>>,
     }
 
@@ -4340,6 +4416,13 @@ mod tests {
         }
 
         fn measured(&self) -> Vec<ChangeIdentity> {
+            self.measurements()
+                .into_iter()
+                .map(|measurement| measurement.identity)
+                .collect()
+        }
+
+        fn measurements(&self) -> Vec<ChangeMeasurement> {
             self.measured.lock().unwrap().clone()
         }
     }
@@ -4380,10 +4463,7 @@ mod tests {
             Ok(0)
         }
         async fn apply_measurement(&self, measurement: &ChangeMeasurement) -> SFResult<()> {
-            self.measured
-                .lock()
-                .unwrap()
-                .push(measurement.identity.clone());
+            self.measured.lock().unwrap().push(measurement.clone());
             Ok(())
         }
         async fn outstanding(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
@@ -4651,7 +4731,24 @@ mod tests {
 
     /// A repository with two commits on `main`, and both hashes: a landed row
     /// can have been measured at either, and only one of them is running.
-    fn two_revision_repo() -> (tempfile::TempDir, String, String) {
+    /// Run git and insist it succeeded, so a fixture that cannot build fails at
+    /// the line that broke rather than as a mystery in the test below.
+    fn git_ok(args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .output()
+            .expect("git on the test host");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// An empty bare repository beside a work tree, both in a temporary
+    /// directory.
+    fn scratch_repo() -> (tempfile::TempDir, String, String) {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let bare = dir.path().join("bare");
         let work = dir.path().join("work");
@@ -4664,48 +4761,76 @@ mod tests {
             .to_str()
             .expect("a path this host can spell")
             .to_string();
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .output()
-                .expect("git on the test host");
-            assert!(
-                out.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        };
-        git(&["init", "-q", "--bare", "-b", "main", &bare]);
-        git(&[
+        git_ok(&["init", "-q", "--bare", "-b", "main", &bare]);
+        git_ok(&[
             "--git-dir",
             &bare,
             "config",
             "user.email",
             "tree@cogneva.invalid",
         ]);
-        git(&["--git-dir", &bare, "config", "user.name", "tree"]);
-        let commit = |text: &str| {
-            std::fs::write(std::path::Path::new(&work).join("file"), text)
-                .expect("the fixture file");
-            git(&["--git-dir", &bare, "--work-tree", &work, "add", "--all"]);
-            git(&[
-                "--git-dir",
-                &bare,
-                "--work-tree",
-                &work,
-                "commit",
-                "-q",
-                "-m",
-                "fixture",
-            ]);
-            git(&["--git-dir", &bare, "rev-parse", "HEAD"])
-                .trim()
-                .to_string()
-        };
-        let first = commit("first");
-        let second = commit("second");
+        git_ok(&["--git-dir", &bare, "config", "user.name", "tree"]);
+        (dir, bare, work)
+    }
+
+    /// Commit whatever the work tree holds and name the revision it made.
+    fn commit_all(bare: &str, work: &str, message: &str) -> String {
+        git_ok(&["--git-dir", bare, "--work-tree", work, "add", "--all"]);
+        git_ok(&[
+            "--git-dir",
+            bare,
+            "--work-tree",
+            work,
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ]);
+        git_ok(&["--git-dir", bare, "rev-parse", "HEAD"])
+            .trim()
+            .to_string()
+    }
+
+    fn two_revision_repo() -> (tempfile::TempDir, String, String) {
+        let (dir, bare, work) = scratch_repo();
+        std::fs::write(std::path::Path::new(&work).join("file"), "first")
+            .expect("the fixture file");
+        let first = commit_all(&bare, &work, "fixture");
+        std::fs::write(std::path::Path::new(&work).join("file"), "second")
+            .expect("the fixture file");
+        let second = commit_all(&bare, &work, "fixture");
         (dir, first, second)
+    }
+
+    /// A repository in which one file was present and then deleted, returning
+    /// the revision the deletion was recorded in.
+    ///
+    /// The deletion is not the tip: a surface that left is followed by a tree
+    /// that moved on, which is the shape the real account has and the one in
+    /// which "the scope is absent now" and "the commit that took it out" are
+    /// different revisions.
+    fn repo_with_a_deleted_scope() -> (tempfile::TempDir, String) {
+        let (dir, bare, work) = scratch_repo();
+        // Nested under a top-level entry that stays: a scope whose top level is
+        // gone reads as a check about another tree, and never reaches the
+        // history question this fixture is for.
+        std::fs::create_dir_all(std::path::Path::new(&work).join("crates"))
+            .expect("the fixture directory");
+        std::fs::write(std::path::Path::new(&work).join("crates/gone.rs"), "here")
+            .expect("the fixture file");
+        std::fs::write(std::path::Path::new(&work).join("crates/stays.rs"), "here")
+            .expect("the fixture file");
+        commit_all(&bare, &work, "fixture");
+        std::fs::remove_file(std::path::Path::new(&work).join("crates/gone.rs"))
+            .expect("the fixture file can be removed");
+        let exited = commit_all(&bare, &work, "remove the surface");
+        std::fs::write(
+            std::path::Path::new(&work).join("crates/stays.rs"),
+            "moved on",
+        )
+        .expect("the fixture file");
+        commit_all(&bare, &work, "move on");
+        (dir, exited)
     }
 
     /// A landed row that names the revision it was measured at.
@@ -4857,6 +4982,69 @@ mod tests {
             held.unsettleable.is_empty(),
             "a held row was not asked, so it was not counted again: {:?}",
             held.unsettleable
+        );
+    }
+
+    /// A landed row whose scope the history deleted is settled as retired, at
+    /// the revision the scope left, rather than held as unsettleable forever.
+    ///
+    /// The check cannot be answered and no later look will answer it: the
+    /// surface is gone. Held as `unsettleable`, the row keeps its `measured_at`
+    /// and sits at the head of the staleness order with an age that reads as
+    /// neglect nobody can repair. Retired, it says the thing that is true -- the
+    /// work was measured here and its surface left -- and it names the commit
+    /// that took the surface out, which is the fact a reader would otherwise
+    /// have to reconstruct from the history.
+    ///
+    /// The row below [`a_landed_row_the_tree_cannot_settle_is_counted_and_then_held`]
+    /// is the other half: a scope this line never held stays unsettleable,
+    /// because there is no deletion to name and no surface that moved.
+    #[tokio::test]
+    async fn a_landed_row_whose_scope_was_deleted_is_retired_at_the_revision_it_left() {
+        let (dir, exited) = repo_with_a_deleted_scope();
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = tree.snapshot().await.expect("the fixture is readable");
+        let store = FakeLedger {
+            rows: vec![landed_row("crates/gone.rs", Some(&exited))],
+            ..Default::default()
+        };
+        let mut unsettled = HashMap::new();
+
+        let pass = reopen_pass(&store, &tree, &snapshot, &mut unsettled, &[]).await;
+
+        assert_eq!(pass.retired, 1, "the row was settled as retired");
+        assert_eq!(
+            pass.rechecked, 0,
+            "a retirement is not a re-check: the claim did not still hold"
+        );
+        assert!(
+            pass.unsettleable.is_empty(),
+            "the row is settled, not counted as a check the tree cannot answer: {:?}",
+            pass.unsettleable
+        );
+        assert!(
+            !unsettled.contains_key(&ChangeIdentity::new("grep", "crates/gone.rs", "fn thing")),
+            "a retired row is not left waiting to be asked again"
+        );
+
+        let measurements = store.measurements();
+        assert_eq!(measurements.len(), 1, "the retirement was written back");
+        let retirement = &measurements[0];
+        assert_eq!(retirement.state, ChangeState::Retired);
+        assert_eq!(
+            retirement.retire_reason,
+            Some(RetireReason::SurfaceMoved),
+            "the reason distinguishes a surface that moved from a check that was\n             never about this tree"
+        );
+        assert_eq!(
+            retirement.measured_rev.as_deref(),
+            Some(exited.as_str()),
+            "the revision named is where the scope exited, not the tree the pass read"
+        );
+        assert_ne!(
+            retirement.measured_rev.as_deref(),
+            Some(snapshot.rev()),
+            "the deletion commit and the tree read are different revisions here, so the\n             assertion above is about the history and not about the tip"
         );
     }
 

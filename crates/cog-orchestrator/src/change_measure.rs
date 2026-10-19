@@ -517,6 +517,45 @@ impl CheckTree {
             .collect())
     }
 
+    /// The revision at which this check's scope last left the tree, when the
+    /// history under the reference carries its deletion.
+    ///
+    /// A scope absent from a revision answers two different questions and only
+    /// the history tells them apart. A scope that was deleted here is a surface
+    /// moved out on purpose: the work it carried was real, was measured, and the
+    /// thing that was measured is now gone, so the row has nowhere left to
+    /// settle and no rewording will bring it back. A scope that never appeared
+    /// in this line is a misplaced check: the criterion is about some other
+    /// tree, and retiring it would file a mistake under the same name.
+    ///
+    /// Rename detection is off, matching [`Self::changed_paths`]: a rename takes
+    /// the old name out of the tree too, and the row scoped to the old name is
+    /// exactly the row that can no longer settle.
+    ///
+    /// `None` is an answer rather than an error: a path this history never held
+    /// has no commit to name.
+    pub async fn scope_left_at(&self, identity: &ChangeIdentity) -> Result<Option<String>, String> {
+        let scope = scope_of(identity);
+        if scope.is_empty() || scope == "." {
+            return Ok(None);
+        }
+        let out = self
+            .git(&[
+                "log",
+                "-1",
+                "--format=%H",
+                "--no-renames",
+                "--diff-filter=D",
+                self.reference.as_str(),
+                "--",
+                scope,
+            ])
+            .await
+            .map_err(|e| format!("the history of {scope} cannot be read: {e}"))?;
+        let rev = out.trim();
+        Ok((!rev.is_empty()).then(|| rev.to_string()))
+    }
+
     /// The most recent `limit` commits on the reference, one record per commit:
     /// the revision, a unit separator, the body, and a record separator.
     ///
