@@ -43,6 +43,7 @@ pub mod git_identity;
 pub mod git_mirror;
 pub mod git_routing;
 pub mod github_app;
+pub mod governance;
 pub mod heartbeat_history;
 pub mod hook_forwarder;
 pub mod hooks;
@@ -276,6 +277,11 @@ pub struct GatewayState {
     /// can be delivered to connected clients.
     pub notification_tx: broadcast::Sender<cog_core::Notification>,
     /// In-memory workspace store (per-process; replace with persistent store when needed).
+    /// Faces and their readings, read through the task graph. `None` when no
+    /// shared database is published: the governance routes answer with a
+    /// failure rather than an empty roster, because an empty roster is a claim
+    /// that there are no faces.
+    pub governance_store: Option<Arc<dyn cog_core::GovernanceStore>>,
     pub workspace_store:
         Option<Arc<std::sync::RwLock<std::collections::HashMap<String, workspaces::Workspace>>>>,
     /// External skill registry (Markdown-based skills).
@@ -566,6 +572,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
     let admin_routes = Router::new()
         .route("/api/v1/tasks", post(tasks::create_task_handler))
         .route(
+            "/api/v1/governance/faces",
+            post(governance::import_face_handler),
+        )
+        .route(
             "/api/v1/tasks/{id}/schedule",
             post(tasks::schedule_task_handler),
         )
@@ -773,6 +783,8 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
 
     // Operator-level protected routes (orchestrator read / agents read / hooks read / memory read / raw_logs)
     let operator_routes = Router::new()
+        .route("/api/v1/governance/faces", get(governance::faces_handler))
+        .route("/api/v1/governance/drift", get(governance::drift_handler))
         .route("/api/v1/tasks/{id}", get(tasks::get_task_handler))
         .route("/api/v1/tasks/list", get(tasks::list_tasks_handler))
         .route("/api/v1/tasks/ready", get(tasks::get_ready_tasks_handler))

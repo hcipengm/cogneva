@@ -1504,6 +1504,9 @@ mod consumer_ack_tests {
             parent_task_id: None,
             sink_task_id: None,
             is_executable: true,
+            face_id: None,
+            owner_unit: None,
+            bound_by_handover_id: None,
         }
     }
 
@@ -1714,6 +1717,9 @@ mod consumer_ack_tests {
             parent_task_id: None,
             sink_task_id: None,
             is_executable: true,
+            face_id: None,
+            owner_unit: None,
+            bound_by_handover_id: None,
         };
         runtime
             .orchestrator()

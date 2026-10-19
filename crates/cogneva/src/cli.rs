@@ -34,12 +34,13 @@ pub enum Command {
     EvalCaseSubset,
     McpServe,
     WriteRole,
+    Governance,
     WindowsService,
 }
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 15] = [
+const SUBCOMMANDS: [(&str, Command); 16] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
@@ -55,6 +56,7 @@ const SUBCOMMANDS: [(&str, Command); 15] = [
     ("eval-case-subset", Command::EvalCaseSubset),
     ("mcp-serve", Command::McpServe),
     ("write-role", Command::WriteRole),
+    ("governance", Command::Governance),
 ];
 
 /// Flags that take effect wherever they appear in the argument list.
@@ -117,6 +119,9 @@ COMMANDS:
                            role. Exit code is the answer: 0 holds, 1 must not write,
                            2 the ask could not be made, 3 no arbiter reading, 4 no pool
                            reading
+    governance <SUB>       Read the face graph, print its verdict, write its projection,
+                           or import the roster; <SUB> is one of faces, drift,
+                           project, import-faces
 
     With no COMMAND the full application starts.
 

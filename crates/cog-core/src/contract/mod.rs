@@ -15,6 +15,7 @@ pub mod env_supersede;
 pub mod eval;
 pub mod event;
 pub mod evolution_admin;
+pub mod face_registry;
 pub mod fault;
 pub mod guardrail;
 pub mod hook;

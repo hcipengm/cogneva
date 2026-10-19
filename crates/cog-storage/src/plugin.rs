@@ -1051,6 +1051,25 @@ impl cog_core::SystemPlugin for StoragePlugin {
             warn!("No PostgreSQL pool; decision counters stay in the engine's own snapshot");
         }
 
+        // ── GovernanceStore ──
+        // Faces and their readings are task-graph rows, not a second account.
+        // The store is published only where the task table lives, for the same
+        // reason the ledgers are: a process-local copy would answer "who owns
+        // this face" from its own memory while the work it is describing runs
+        // against the shared table.
+        if let Some(pool) = self.pg_pool.clone() {
+            let store: Arc<dyn cog_core::GovernanceStore> =
+                Arc::new(crate::PostgresGovernanceStore::new(pool));
+            ctx.publish_service(store);
+            info!("StoragePlugin governance store published");
+        } else if strict_persistence {
+            return Err(cog_core::SFError::Config(
+                "No PostgreSQL pool for GovernanceStore (strict_persistence=true)".into(),
+            ));
+        } else {
+            warn!("No PostgreSQL pool; face ownership and drift are unavailable");
+        }
+
         // ── ObjectBackend (singleton for all modules) ──
         let http_client = ctx.consume_service::<dyn cog_core::HttpClient>();
         let object_backend =

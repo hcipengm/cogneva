@@ -861,6 +861,17 @@ impl ActionPlanOrchestrator {
             // 汇点的声明写在承载 `goal_id` 的那一行上——它也是下面每一条子任务的
             // `parent_task_id` 指向的那一行，读面正是从这一行取答案。
             let goal_row_id = tasks.first().map(|t| t.id.clone());
+            // A goal that names a face hands that face to the work it is
+            // decomposed into. Without this the children run outside every
+            // face's reading: the face looks idle while its remediation is
+            // running, and the pass would submit the same goal again tomorrow
+            // with no way to see that the last one went somewhere. Ownership
+            // travels with it for the same reason -- a goal submitted for one
+            // unit's work must not come back as unassigned pieces every unit
+            // may claim.
+            let goal_binding = tasks
+                .first()
+                .map(|t| (t.face_id.clone(), t.owner_unit.clone()));
             // Ids of the original rows in submission order; every id after
             // these in `all_injected_ids` is a decomposed child.
             let placeholder_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
@@ -887,6 +898,10 @@ impl ActionPlanOrchestrator {
             for at in &plan.tasks {
                 let mut task = Self::atomic_task_to_task(at);
                 task.goal_id = Some(goal_id.clone());
+                if let Some((face_id, owner_unit)) = &goal_binding {
+                    task.face_id = face_id.clone();
+                    task.owner_unit = owner_unit.clone();
+                }
                 if let Some(first_original) = all_injected_ids.first() {
                     task.parent_task_id = Some(first_original.clone());
                 }

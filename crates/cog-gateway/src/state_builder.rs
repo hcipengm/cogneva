@@ -84,6 +84,7 @@ pub async fn build_gateway_state(
     audit_stream: &Option<Arc<dyn cog_core::AuditStream>>,
     taste_intent_sink: &Option<Arc<dyn cog_core::TasteIntentSink>>,
     llm_usage_reader: &Option<Arc<dyn cog_core::LlmUsageReader>>,
+    governance_store: &Option<Arc<dyn cog_core::GovernanceStore>>,
     shutdown: &cog_core::ShutdownSignal,
 ) -> Result<Arc<crate::GatewayState>, Box<dyn std::error::Error>> {
     // Cache of the supervisor's event channel, filled by the drain task below.
@@ -154,6 +155,7 @@ pub async fn build_gateway_state(
         notification_dispatcher: notification_dispatcher.clone(),
         notification_tx: notification_tx.clone(),
         workspace_store: None,
+        governance_store: governance_store.clone(),
         external_skill_registry: external_skill_registry.clone(),
         agent_pool: agent_pool.clone(),
         event_publisher: event_publisher.clone(),

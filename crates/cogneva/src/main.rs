@@ -135,6 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 3 仲裁读不到 / 4 池读不到），所以这里显式 exit：走 `Err` 会被本函数末尾的
         // 错误路径统一折成 1，「不该写」与「这条命令失败了」就再也分不开。
         Command::WriteRole => std::process::exit(cogneva::write_role::run().await),
+        // 面图的只读面（以及一次性导入）：与 write-role 同样从应用自己的配置读两端，
+        // 因为调用方可能是没有平台令牌的宿主进程。
+        Command::Governance => cogneva::governance::run_from_args().await,
         Command::WindowsService => {
             #[cfg(windows)]
             {

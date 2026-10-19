@@ -3,6 +3,7 @@ pub mod backup_runs;
 pub mod change_ledger;
 pub mod change_measure;
 pub mod dag_executor;
+pub mod face_drift;
 pub mod observable;
 pub mod orchestrator_control_impl;
 pub mod plugin;

@@ -95,6 +95,30 @@ CREATE TABLE IF NOT EXISTS cog_dag_tasks (
 CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_status
             ON cog_dag_tasks(workspace_id, status)
 ;
+-- The face and owner a task carries, read out of the task payload by the
+-- database rather than written beside it.
+--
+-- A stored copy would be a second answer to "whose is this": every writer would
+-- have to update the column and the JSON in step, and the one that forgot would
+-- leave an index pointing at an owner the row no longer has. Generated columns
+-- cannot drift from the row they are derived from.
+--
+-- They are declared here, next to the CREATE, rather than in a migration:
+-- migrations run before this schema creates the table, so an ALTER in one would
+-- fail on a fresh install. The ALTER form below is what upgrades an existing
+-- database, and it is idempotent so every start may run it.
+ALTER TABLE cog_dag_tasks ADD COLUMN IF NOT EXISTS face_id TEXT
+            GENERATED ALWAYS AS (task->>'face_id') STORED
+;
+ALTER TABLE cog_dag_tasks ADD COLUMN IF NOT EXISTS owner_unit TEXT
+            GENERATED ALWAYS AS (task->>'owner_unit') STORED
+;
+CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_face
+            ON cog_dag_tasks(workspace_id, face_id, status)
+;
+CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_owner_unit
+            ON cog_dag_tasks(workspace_id, owner_unit, status)
+;
 CREATE TABLE IF NOT EXISTS cog_evolution_promotions (
                 id TEXT PRIMARY KEY,
                 change_id TEXT NOT NULL,

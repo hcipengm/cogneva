@@ -56,6 +56,7 @@ impl IntoResponse for ApiError {
             "BadRequest" => StatusCode::BAD_REQUEST,
             "Forbidden" => StatusCode::FORBIDDEN,
             "TooManyRequests" => StatusCode::TOO_MANY_REQUESTS,
+            "ServiceUnavailable" => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(self)).into_response()

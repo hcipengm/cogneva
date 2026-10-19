@@ -144,6 +144,28 @@ pub struct Task {
     /// 原始整体任务保留注入时设为 false，仅作为层级占位与查询用。
     #[serde(default = "default_true")]
     pub is_executable: bool,
+    /// 这道任务属于哪个面。
+    ///
+    /// 面本身也是任务图里的一行（不可执行、只做登记），所以这一列在两处都有意义：
+    /// 面节点的 `face_id` 指向自己，工作的 `face_id` 指向它服务的那一面。`None`
+    /// 表示不服务任何面——平台内部任务与旧行都落在这里，读面不得把「没填」读成
+    /// 「属于某个默认面」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_id: Option<String>,
+    /// 这道任务指定由谁执行。
+    ///
+    /// 与 `agent_id` 的区别是答的问题不同：`agent_id` 是「结果是谁交的」，
+    /// `owner_unit` 是「谁被指定来做」。带归属的任务只有该 unit 能开工与完成，
+    /// 所以它不能停在共享就绪队列里等人抢——认领必须在写入时就按这一列裁决。
+    /// 面节点上它表示面主。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_unit: Option<String>,
+    /// 这次归属是由哪张交接单签过来的。
+    ///
+    /// 没有交接单的归属变化是漂移，不是改派；留下这一条引用，读面才不必比较
+    /// 两份快照去猜谁先谁后。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_by_handover_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -541,6 +563,9 @@ impl Task {
             parent_task_id: None,
             sink_task_id: None,
             is_executable: true,
+            face_id: None,
+            owner_unit: None,
+            bound_by_handover_id: None,
         }
     }
 

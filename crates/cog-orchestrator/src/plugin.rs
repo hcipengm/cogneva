@@ -951,6 +951,37 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             None => info!("backup account loop not started: no BackupRunStore published"),
         }
 
+        // Face drift.
+        //
+        // The reading itself has no table and no loop-held state: a face is a
+        // node in the task graph and the verdict is computed from the graph and
+        // the agents' heartbeats. What this loop adds is dispatch -- a red face
+        // is submitted as a goal through the action planner, so the work to fix
+        // it travels the same path every other goal does. The scrape-only view
+        // is published beside it and computes the same reading on every scrape,
+        // which is why a stopped loop cannot keep a stale verdict looking
+        // current.
+        match ctx.consume_service::<dyn cog_core::GovernanceStore>() {
+            Some(store) => {
+                let agents = ctx.consume_service::<dyn cog_core::AgentRegistry>();
+                let face_shutdown = ctx
+                    .consume::<cog_core::ShutdownSignal>()
+                    .map(|s| (*s).clone())
+                    .unwrap_or_default();
+                crate::face_drift::spawn_face_drift_loop(
+                    store.clone(),
+                    agents.clone(),
+                    ctx.consume_service::<dyn cog_core::OrchestratorControl>(),
+                    ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
+                    face_shutdown,
+                );
+                ctx.publish_observable(Arc::new(crate::face_drift::FaceDriftObservable::new(
+                    store, agents,
+                )));
+            }
+            None => info!("face drift loop not started: no GovernanceStore published"),
+        }
+
         // SOP dispatch loop.
         //
         // Which faces to keep planned is configuration, not code: the loop runs

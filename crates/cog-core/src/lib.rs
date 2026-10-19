@@ -30,6 +30,7 @@ pub use contract::embedding::*;
 pub use contract::eval::*;
 pub use contract::event::*;
 pub use contract::evolution_admin::*;
+pub use contract::face_registry::*;
 pub use contract::fault::*;
 pub use contract::guardrail::*;
 pub use contract::hook::*;

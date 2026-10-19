@@ -58,11 +58,11 @@ pub use mem::{
 #[cfg(feature = "postgres")]
 pub use postgres::{
     HookArchiveRow, PostgresAuditRecorder, PostgresBackupRunStore, PostgresChangeLedgerStore,
-    PostgresDecisionStatsStore, PostgresHookArchive, PostgresMetricsBackend,
-    PostgresNotificationStore, PostgresObservabilityGateway, PostgresPrincipleLedgerStore,
-    PostgresRawLogIndexStore, PostgresResourceEventStore, PostgresSnapshotStore,
-    PostgresStateBackend, PostgresTasteIntentStore, PostgresUserStore, EVENTS_PAGE_SQL,
-    GAUGE_LATEST_SQL,
+    PostgresDecisionStatsStore, PostgresGovernanceStore, PostgresHookArchive,
+    PostgresMetricsBackend, PostgresNotificationStore, PostgresObservabilityGateway,
+    PostgresPrincipleLedgerStore, PostgresRawLogIndexStore, PostgresResourceEventStore,
+    PostgresSnapshotStore, PostgresStateBackend, PostgresTasteIntentStore, PostgresUserStore,
+    EVENTS_PAGE_SQL, GAUGE_LATEST_SQL,
 };
 
 #[cfg(feature = "redis")]

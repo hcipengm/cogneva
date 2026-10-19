@@ -242,6 +242,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &audit_stream,
             &taste_intent_sink,
             &llm_usage_reader,
+            &ctx.consume_service::<dyn cog_core::GovernanceStore>(),
             // 拿不到就是这套部署没有发布停机信号，那它拿到的是一个永不触发的
             // 信号，语义等同于「没有人给过它停的办法」。
             &ctx.consume::<cog_core::ShutdownSignal>()
