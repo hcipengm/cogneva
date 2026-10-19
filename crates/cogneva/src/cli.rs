@@ -108,8 +108,10 @@ COMMANDS:
     execute-change         Apply, verify, commit and build one evolution change, then exit
     backup                 Package the data plane into a backup file
     restore <package>      Restore the data plane from a backup file
-    backup-drill           Restore the newest package into a scratch database, record what it
-                           held, then drop it
+    backup-drill [--package <name>]
+                           Restore a package into a scratch database, record what it held,
+                           then drop it; --package names one in the retention window instead
+                           of the newest
     repair-aof <aof-dir>   Drop a torn tail from Redis' AOF files, then exit
     eval-table [OPTIONS]   Run the main comparison table (benchmarks x scaffolds x seeds)
                            against a pinned data root, then exit; --pins names the pins file

@@ -2835,6 +2835,12 @@ pub struct DrillConfig {
     /// 迁移目录：演练要在一个空库上把表结构建出来，用的必须是**这个镜像**里的
     /// 迁移，而不是别处的。镜像把迁移装在 `/opt/cogneva/crates/cog-storage/migrations`。
     pub migrations_dir: PathBuf,
+    /// 这一趟开哪一份包；`None` 是**最新那一份**。
+    ///
+    /// 保留窗口里的旧包只能从这里走到：包与读端不同步的问题只在它们身上出现
+    /// （旧格式的列、包里带着生成列），而每天只开最新一份时，这些包要到真正
+    /// 需要恢复的那天才第一次被打开。
+    pub package: Option<String>,
 }
 
 impl DrillConfig {
@@ -2852,8 +2858,68 @@ impl DrillConfig {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
             migrations_dir: cog_storage::migrate::migrations_dir(&app_dir),
+            package: requested_package(std::env::args().skip(1))?,
         })
     }
+}
+
+/// `backup-drill` 自己在子命令之后认的那个操作数。
+///
+/// cli 把子命令之后的一切原样留给它（与 `restore <package>` 同一形状），所以
+/// 这里不认得的写法要自己报错：一个拼错的 `--package` 会静默落回「开最新那份」，
+/// 而那一趟的结论看起来和点名开旧包的成功一模一样。
+fn requested_package(args: impl Iterator<Item = String>) -> Result<Option<String>, String> {
+    let mut args = args;
+    // 第一个词是子命令名本身。
+    let _ = args.next();
+    let mut package = None;
+    while let Some(arg) = args.next() {
+        if arg == "--package" {
+            let name = args
+                .next()
+                .ok_or_else(|| "--package 后面要跟一个包名".to_string())?;
+            package = Some(name);
+        } else {
+            return Err(format!("backup-drill 不认这个参数：{arg}"));
+        }
+    }
+    Ok(package)
+}
+
+/// 这一趟开哪一份包。
+///
+/// 默认最新那一份，与本次改动之前的行为一致；点名时接受带不带 `.tar.zst` 两种写法。
+/// 名字不在卷上就报错并列出可选的名字——演练点名开一份不存在的包，若悄悄退回最新，
+/// 「旧包也能恢复」这句话就会由一次开新包的运行来背书。
+fn choose_package(
+    packages: &[PathBuf],
+    requested: Option<&str>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let Some(want) = requested else {
+        return packages
+            .last()
+            .cloned()
+            .ok_or_else(|| "备份目录里没有任何备份包".into());
+    };
+    let want = want.strip_suffix(PACKAGE_SUFFIX).unwrap_or(want);
+    let name_of = |p: &PathBuf| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.strip_suffix(PACKAGE_SUFFIX).unwrap_or(n).to_string())
+    };
+    packages
+        .iter()
+        .find(|p| name_of(p).as_deref() == Some(want))
+        .cloned()
+        .ok_or_else(|| {
+            let available: Vec<String> = packages.iter().filter_map(name_of).collect();
+            format!(
+                "卷上没有叫 {want} 的包；现有 {} 份：{}",
+                available.len(),
+                available.join(", ")
+            )
+            .into()
+        })
 }
 
 /// 解包用的临时目录，离开作用域就删。
@@ -2983,10 +3049,8 @@ async fn drill_once(
     packages: Vec<PathBuf>,
     drill: &mut BackupDrillRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let package = packages
-        .last()
-        .cloned()
-        .ok_or_else(|| format!("{} 里没有任何备份包", cfg.backup_dir.display()))?;
+    let package = choose_package(&packages, cfg.package.as_deref())
+        .map_err(|e| format!("{}：{e}", cfg.backup_dir.display()))?;
     let name = package
         .file_name()
         .and_then(|n| n.to_str())
@@ -2999,13 +3063,20 @@ async fn drill_once(
     drill.package_bytes = std::fs::metadata(&package).ok().map(|m| m.len() as i64);
     drill.package = Some(name);
 
-    // 卷外那一份是不是**这个**包：同名、同字节数。名字相同而大小不同是复制写到
-    // 一半，名字不同是它停在了更早的那一晚——两种都是「第二份不是今晚的备份」，
+    // 卷外那一份是不是卷上**最新**那份：同名、同字节数。名字相同而大小不同是复制
+    // 写到一半，名字不同是它停在了更早的那一晚——两种都是「第二份不是今晚的备份」，
     // 但它们各自对应不同的修法，所以这里只回答「是不是同一份」，原因留给读的人。
+    //
+    // 比的是卷上最新那份，不是这一趟打开的那份：读这一列的是「卷外那份是不是最新」
+    // 的规则，点名开一份旧包时拿旧包去比，会把一条本来绿的规则判红。
     if let Some(dir) = &cfg.offsite_dir {
+        let newest_on_volume = packages.last();
         drill.offsite_matches_newest = packages_in(dir).last().map(|copy| {
-            copy.file_name() == package.file_name()
-                && std::fs::metadata(copy).ok().map(|m| m.len() as i64) == drill.package_bytes
+            newest_on_volume.is_some_and(|volume| {
+                copy.file_name() == volume.file_name()
+                    && std::fs::metadata(copy).ok().map(|m| m.len() as i64)
+                        == std::fs::metadata(volume).ok().map(|m| m.len() as i64)
+            })
         });
     }
 
@@ -3473,6 +3544,91 @@ mod tests {
         let b = package_name(Utc.with_ymd_and_hms(2026, 9, 14, 2, 0, 0).unwrap());
         assert!(a < b, "时间戳命名必须字典序可排：{a} vs {b}");
         assert!(a.starts_with(PACKAGE_PREFIX) && a.ends_with(PACKAGE_SUFFIX));
+    }
+
+    #[test]
+    fn a_drill_without_a_name_opens_the_newest_package() {
+        let packages: Vec<PathBuf> = ["2026-10-18", "2026-10-19"]
+            .iter()
+            .map(|day| {
+                PathBuf::from(format!(
+                    "/backups/{PACKAGE_PREFIX}{day}-010101{PACKAGE_SUFFIX}"
+                ))
+            })
+            .collect();
+        let chosen = choose_package(&packages, None).unwrap();
+        assert_eq!(
+            chosen, packages[1],
+            "不点名时开最新那份，行为与加这个参数之前一致"
+        );
+    }
+
+    #[test]
+    fn naming_a_package_opens_that_package() {
+        // 这一条就是这次改动本身：保留窗口里的旧包必须能被人点名打开，否则
+        // 「旧包也恢复得回去」永远只是一句没被验证过的话。
+        let packages: Vec<PathBuf> = ["2026-10-18", "2026-10-19"]
+            .iter()
+            .map(|day| {
+                PathBuf::from(format!(
+                    "/backups/{PACKAGE_PREFIX}{day}-010101{PACKAGE_SUFFIX}"
+                ))
+            })
+            .collect();
+        let oldest = packages[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let chosen = choose_package(&packages, Some(&oldest)).unwrap();
+        assert_eq!(chosen, packages[0], "点名旧包就得开旧包，不能悄悄退回最新");
+
+        // 带不带后缀都认：卷上的名字是给人抄的，抄到哪一段都该能用。
+        let bare = oldest.strip_suffix(PACKAGE_SUFFIX).unwrap();
+        let chosen = choose_package(&packages, Some(bare)).unwrap();
+        assert_eq!(chosen, packages[0]);
+    }
+
+    #[test]
+    fn naming_a_package_that_is_not_there_names_the_ones_that_are() {
+        // 静默退回最新是最坏的一种：那一趟会绿，而它证明的是另一份包。
+        let packages: Vec<PathBuf> = ["2026-10-18", "2026-10-19"]
+            .iter()
+            .map(|day| {
+                PathBuf::from(format!(
+                    "/backups/{PACKAGE_PREFIX}{day}-010101{PACKAGE_SUFFIX}"
+                ))
+            })
+            .collect();
+        let err = choose_package(&packages, Some("2026-01-01-010101"))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.is_empty());
+        assert!(
+            err.contains("2026-10-18-010101") && err.contains("2026-10-19-010101"),
+            "报错要把可选的名字列出来，否则读的人只知道点什么不对：{err}"
+        );
+
+        // 卷上一份都没有时，不点名也不能凭空虚开一份。
+        assert!(choose_package(&[], None).is_err());
+    }
+
+    #[test]
+    fn the_drill_reads_its_own_package_operand() {
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        // 调用方已经跳掉程序名，这里收到的第一个词是子命令名。
+        assert_eq!(
+            requested_package(argv(&["backup-drill"]).into_iter()),
+            Ok(None)
+        );
+        assert_eq!(
+            requested_package(argv(&["backup-drill", "--package", "p-1"]).into_iter()),
+            Ok(Some("p-1".to_string()))
+        );
+        // 拼错或多余的操作数必须报错：落回「开最新那份」会让这一趟的结论不可信。
+        assert!(requested_package(argv(&["backup-drill", "--packag", "p-1"]).into_iter()).is_err());
+        assert!(requested_package(argv(&["backup-drill", "--package"]).into_iter()).is_err());
     }
 
     #[test]
