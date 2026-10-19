@@ -3777,11 +3777,14 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
 ///   时刻，容量是对 `(恢复−窗口, 恢复]` 求和——同样是实测，只是证据来自活的读数
 ///   而不是行上的标签。
 ///
-/// 窗口的**终点**一律取上游自报的恢复时刻（`quota_reset_unix`），拿不到时才退回
-/// 撞墙那一刻——配额可以在七天的第一天就用完，撞墙只说明花光了，不说明周期到头。
-/// 两处起点因此**不完全重合**：有撞墙行时求和围着它（唯一的烧穿证据），相位围着
-/// 恢复时刻；上一窗也是提前烧穿时两者覆盖的是同一批成功行，只有上一窗一直供到
-/// 窗尾时求和会多吃进它尾巴上那一小段。这一格偏大而不是偏小——只会让允许量略宽。
+/// 窗口的**终点**取一个对边界的观测：上游自报的恢复时刻（`quota_reset_unix`），
+/// 拿不到时取撞墙之后**第一次成功**的时刻——配额可以在七天的第一天就用完，撞墙只
+/// 说明花光了，不说明周期到头，而服务恢复只发生在额度回来之后，所以首成功是从上界
+/// 逼近复位时刻的观测（误差是一个重试间隔）。两个都没有时**不猜**：边界未知，沿用
+/// 上一次量到的窗口，绝不把撞墙那一刻当下一窗的起点。
+/// 求和与相位两处起点因此**不完全重合**：有撞墙行时求和围着它（唯一的烧穿证据），
+/// 相位围着复位时刻；上一窗也是提前烧穿时两者覆盖的是同一批成功行，只有上一窗一直
+/// 供到窗尾时求和会多吃进它尾巴上那一小段。这一格偏大而不是偏小——只会让允许量略宽。
 ///
 /// 量到的东西要落库：只在内存里暂存的话，下一次滚动升级就把它清零，而配速会静默
 /// 停止——没有任何读数会说"界没了"。库里的行是这份测量的正本，进程内那张表只是
@@ -3795,13 +3798,16 @@ async fn measure_window(
     refusal_kind: Option<RefusalKind>,
 ) -> Option<crate::window_pace::MeasuredWindow> {
     let now_unix = chrono::Utc::now().timestamp();
+    // 缓存与库都以「上游 + 窗口长度」为身份：同一家可以同时有两把嵌套的尺子
+    // （5 小时与 7 天），只用上游当键会让后测到的那把覆盖先测到的那把。
+    let slot = format!("{key}\u{1f}{window_secs}");
     let cached = {
         let windows = state.measured_windows.lock().unwrap();
-        windows.get(key).copied()
+        windows.get(&slot).copied()
     };
     let latched = match cached {
         Some(measured) => Some(measured),
-        None => match store.stored_window(key).await {
+        None => match store.stored_window(key, window_secs).await {
             Ok(Some(stored)) => {
                 let measured = crate::window_pace::MeasuredWindow {
                     capacity_tokens: stored.capacity_tokens,
@@ -3811,7 +3817,7 @@ async fn measure_window(
                 if measured.is_usable() {
                     {
                         let mut windows = state.measured_windows.lock().unwrap();
-                        windows.insert(key.to_string(), measured);
+                        windows.insert(slot.clone(), measured);
                     }
                     Some(measured)
                 } else {
@@ -3844,6 +3850,7 @@ async fn measure_window(
         last_quota_refusal_unix: reading.last_quota_refusal_unix,
         quota_cycle_observed: refusal_kind == Some(RefusalKind::QuotaCycle),
         quota_reset_unix,
+        last_resume_unix: reading.last_resume_unix,
         last_ok_unix: reading.last_ok_unix,
         burned_window_tokens: reading.burned_window_tokens,
         window_secs,
@@ -3878,7 +3885,7 @@ async fn measure_window(
             .measured_windows
             .lock()
             .unwrap()
-            .insert(key.to_string(), measured);
+            .insert(slot.clone(), measured);
         let stored = cog_observability::usage_store::StoredWindow {
             upstream: key.to_string(),
             capacity_tokens: measured.capacity_tokens,

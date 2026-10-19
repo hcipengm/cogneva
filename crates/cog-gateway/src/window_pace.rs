@@ -27,12 +27,13 @@ use cog_core::LlmWindowPace;
 use serde::{Deserialize, Serialize};
 
 /// One upstream's measured capacity, and when the window it was measured in
-/// ran out.
+/// ended.
 ///
 /// `burned_at_unix` is both the end of the window that was spent and the start
-/// of the next one: an upstream refuses with "this cycle's limit is reached"
-/// only after the last token of that cycle is used, so the refusal instant is a
-/// derivation of the boundary rather than a guess at it.
+/// of the next one. It comes from an observation of the boundary — the instant
+/// the upstream names, or the first call that succeeds after the wall — never
+/// from the refusal itself: refusing says the allowance ran out, which can
+/// happen on the window's first day.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeasuredWindow {
     /// Tokens served in the window that ended at `burned_at_unix`.
@@ -104,6 +105,16 @@ pub struct WindowEvidence {
     /// the first day of a seven-day window, so the refusal marks the exhaustion
     /// and the reset marks the boundary.
     pub quota_reset_unix: Option<i64>,
+    /// Latest instant serving resumed after a spent-cycle refusal.
+    ///
+    /// The observation for upstreams that name no reset instant: a call cannot
+    /// succeed while the window is spent, so a resume bounds the instant the
+    /// quota returned from above, and like every reset it is a window start —
+    /// windows repeat from it. It is not the newest success, which may be days
+    /// old and says only where serving stopped. It may precede the most recent
+    /// refusal: the quota can be spent again without the window rolling, and
+    /// the previous cycle's resume is then what anchors the phase.
+    pub last_resume_unix: Option<i64>,
     /// When the upstream last served a call. Recorded here so the rule below
     /// can be stated against it: this instant is **not** a window boundary.
     pub last_ok_unix: Option<i64>,
@@ -120,13 +131,22 @@ pub struct WindowEvidence {
 
 /// When the window this upstream last spent ended, if anything observed it.
 ///
-/// Two observations are equally good and neither is a guess:
-/// - a ledger row the classification already names as a spent cycle, which is
-///   durable and survives restarts;
+/// Three observations can name the boundary, in order of preference:
+/// - the instant an upstream named in its refusal, which is exact;
+/// - the latest successful call that resumed serving after a wall, which bounds
+///   the instant that quota returned from above (a call cannot succeed while
+///   the window is spent); the error is the retry delay, and the instant is a
+///   window start, so the phase rolls forward from it even across later walls;
 /// - a live reading that says the outstanding refusal is a spent cycle and
 ///   names when the quota returns.
 ///
-/// The newest successful call is not one of them. It marks where serving
+/// The refusal instant is **not** one of them. It marks where the allowance ran
+/// out, which for a seven-day window can be its first day: taking it as the
+/// boundary banks the idle days before the real reset as elapsed window, and
+/// then hands out that much allowance the moment the quota returns — measured
+/// on 2026-10-19, 5.9 of 7 days were banked that way.
+///
+/// The newest successful call is not one of them either. It marks where serving
 /// stopped, which is equally true of an upstream that was throttled and of one
 /// nobody called: measured on 2026-10-17, a window whose last success was six
 /// days old reported that 84% of its capacity was still unspent a moment
@@ -141,10 +161,38 @@ pub fn window_end(evidence: WindowEvidence) -> Option<i64> {
         // stopped. A reset outside `(wall, wall + window)` cannot belong to
         // this refusal — it is a leftover from another window or a parse
         // accident — so it is not used.
-        return Some(match evidence.quota_reset_unix {
-            Some(reset) if reset > wall && (reset - wall) < evidence.window_secs as i64 => reset,
-            _ => wall,
-        });
+        if let Some(reset) = evidence.quota_reset_unix {
+            if reset > wall && (reset - wall) < evidence.window_secs as i64 {
+                return Some(reset);
+            }
+        }
+        // No named instant: the latest resume is the observation that remains.
+        // Serving resumes only once the quota is back, so a resume bounds the
+        // reset from above, within one retry delay of it, and as a window start
+        // it anchors the phase — windows repeat from it. It need not follow
+        // *this* wall: the allowance can be spent again in a later window
+        // without serving resuming since, and the previous cycle's resume is
+        // then the only boundary ever observed. Anchoring late errs toward a
+        // smaller allowance, which is the safe direction.
+        //
+        // Two cycles old is not an anchor any more: a local ruler (five hours)
+        // whose phase is fixed by the first call after a reset would have been
+        // re-anchored many times over, and keeping a stale instant would hand
+        // out a ramp on a boundary nobody observed. Past that age the caller
+        // keeps what it last measured instead.
+        if let Some(resumed) = evidence.last_resume_unix {
+            let window = evidence.window_secs as i64;
+            if resumed <= evidence.now_unix
+                && window > 0
+                && evidence.now_unix - resumed < 2 * window
+            {
+                return Some(resumed);
+            }
+        }
+        // Neither observed: the boundary is unknown, and saying otherwise is
+        // what starts the next window at the instant the allowance ran out.
+        // The caller keeps whatever measurement it already had.
+        return None;
     }
     if evidence.quota_cycle_observed {
         // Without a classified row, the live reading is the only witness to the
@@ -358,7 +406,10 @@ mod tests {
     }
 
     #[test]
-    fn a_window_opens_on_a_measured_quota_wall() {
+    fn a_refusal_alone_names_no_boundary() {
+        // The wall says the allowance ran out, not that the cycle ended. With
+        // no reset named and no success since, the boundary is unknown and the
+        // caller keeps whatever it measured before.
         let evidence = WindowEvidence {
             last_quota_refusal_unix: Some(2_000_000),
             last_ok_unix: Some(1_999_000),
@@ -367,10 +418,100 @@ mod tests {
             window_secs: (30 * DAY) as u64,
             ..Default::default()
         };
-        let measured =
-            measured_window(evidence, 30_000_000, None).expect("a refusal is a measurement");
-        assert_eq!(measured.burned_at_unix, 2_000_000);
-        assert_eq!(measured.capacity_tokens, 30_000_000);
+        assert_eq!(window_end(evidence), None);
+        assert_eq!(measured_window(evidence, 30_000_000, None), None);
+    }
+
+    #[test]
+    fn a_resume_bounds_the_reset_and_anchors_the_phase() {
+        // Serving cannot resume while the window is spent, so the first success
+        // after a wall is the only observation of the reset an upstream that
+        // names no instant leaves behind. 2026-10-19 live shape: wall at
+        // 10-19 11:06Z, real reset at 10-25 03:13Z.
+        let wall = 2_000_000;
+        let resumed = wall + 5 * DAY + 16 * 3_600;
+        let evidence = WindowEvidence {
+            last_quota_refusal_unix: Some(wall),
+            last_ok_unix: Some(resumed),
+            quota_reset_unix: None,
+            last_resume_unix: Some(resumed),
+            burned_window_tokens: 17_284_171,
+            window_secs: (7 * DAY) as u64,
+            now_unix: resumed + 3 * DAY,
+            ..Default::default()
+        };
+        assert_eq!(window_end(evidence), Some(resumed));
+        let measured = measured_window(evidence, 17_284_171, None).expect("a resume is evidence");
+        assert_eq!(measured.burned_at_unix, resumed);
+        // The new window starts empty, not with the days between exhaustion and
+        // the reset banked as elapsed time.
+        assert_eq!(measured.allowance_at(resumed), 0);
+        assert_eq!(measured.allowance_at(resumed + 7 * DAY / 2), 17_284_171 / 2);
+    }
+
+    #[test]
+    fn a_previous_cycles_resume_still_anchors_the_phase() {
+        // The quota can be spent again in the window a resume opened, and then
+        // the most recent wall has no success after it. Dropping the earlier
+        // resume would leave the boundary unobserved for a whole week, and the
+        // stored measurement would keep the wall as the window start -- the
+        // very defect. Windows repeat from the resume, so it still anchors.
+        let resumed = 2_000_000;
+        let wall = resumed + DAY; // spent on the new window's first day
+        let now = resumed + 2 * DAY;
+        let evidence = WindowEvidence {
+            last_quota_refusal_unix: Some(wall),
+            last_ok_unix: Some(wall - 3_600),
+            quota_reset_unix: None,
+            last_resume_unix: Some(resumed),
+            burned_window_tokens: 17_284_171,
+            window_secs: (7 * DAY) as u64,
+            now_unix: now,
+            ..Default::default()
+        };
+        assert_eq!(window_end(evidence), Some(resumed));
+        let measured = measured_window(evidence, 17_284_171, None).expect("a resume is evidence");
+        assert_eq!(measured.burned_at_unix, resumed);
+        assert_eq!(measured.window_start_at(now), resumed);
+        // Two days into the window the allowance is two sevenths, not the
+        // fifth the wall would have implied.
+        assert_eq!(measured.allowance_at(now), 17_284_171 * 2 / 7);
+        // And it rolls forward at the real reset rather than reopening there.
+        assert_eq!(
+            measured.window_start_at(resumed + 7 * DAY),
+            resumed + 7 * DAY
+        );
+        assert_eq!(measured.allowance_at(resumed + 7 * DAY), 0);
+    }
+
+    #[test]
+    fn a_resume_two_cycles_old_is_not_an_anchor() {
+        // The five-hour ruler restarts with the first call after each reset, so
+        // a resume from a month ago says nothing about where this window began;
+        // a ramp computed from it would be an allowance nobody observed.
+        let evidence = WindowEvidence {
+            last_quota_refusal_unix: Some(2_000_000),
+            last_resume_unix: Some(2_000_000 - 30 * DAY),
+            window_secs: (5 * 3_600) as u64,
+            now_unix: 2_000_000,
+            ..Default::default()
+        };
+        assert_eq!(window_end(evidence), None);
+    }
+
+    #[test]
+    fn a_resume_after_now_is_not_evidence() {
+        // A resume is by construction in the past; a future one is a bad
+        // reading, and anchoring the phase to it would hand out an allowance
+        // that has not been earned.
+        let evidence = WindowEvidence {
+            last_quota_refusal_unix: Some(2_000_000),
+            last_resume_unix: Some(2_000_000 + 3 * DAY),
+            window_secs: (7 * DAY) as u64,
+            now_unix: 2_000_000 + DAY,
+            ..Default::default()
+        };
+        assert_eq!(window_end(evidence), None);
     }
 
     #[test]
@@ -413,11 +554,12 @@ mod tests {
             window_secs: (30 * DAY) as u64,
             ..Default::default()
         };
-        let measured = measured_window(base, 30_000_000, None).expect("a refusal is a measurement");
         assert_eq!(
-            measured.burned_at_unix, 2_000_000,
-            "a reset beyond the window it claims to end is left over from another one"
+            window_end(base),
+            None,
+            "a reset beyond the window it claims to end is left over from another one, and the wall is not a substitute"
         );
+        assert_eq!(measured_window(base, 30_000_000, None), None);
     }
 
     #[test]
@@ -449,6 +591,7 @@ mod tests {
             last_ok_unix: None,
             quota_cycle_observed: true,
             quota_reset_unix: Some(now + DAY),
+            last_resume_unix: None,
             burned_window_tokens: 0,
             window_secs: (7 * DAY) as u64,
             now_unix: now,
@@ -495,6 +638,7 @@ mod tests {
             last_quota_refusal_unix: None,
             last_ok_unix: None,
             quota_reset_unix: None,
+            last_resume_unix: None,
             burned_window_tokens: 0,
             window_secs: (30 * DAY) as u64,
             ..Default::default()

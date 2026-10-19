@@ -348,6 +348,18 @@ pub struct UpstreamWindowReading {
     /// Instant of the most recent refusal that said the window was spent;
     /// `None` when no such refusal is on record.
     pub last_quota_refusal_unix: Option<i64>,
+    /// Latest instant serving resumed after a spent-cycle refusal, `None` when
+    /// it never has.
+    ///
+    /// This is the only observation of a reset that an upstream which names no
+    /// instant leaves behind: a call cannot succeed while the window is spent,
+    /// so the first success after a wall bounds the instant the quota returned
+    /// — the error is the retry delay, and for a pacer that re-reads every tick
+    /// that is seconds. The instant is a **window start**: windows repeat from
+    /// it, so it anchors the phase even while a later wall has no success after
+    /// it yet. The refusal itself is not that instant: a window can be spent on
+    /// its first day.
+    pub last_resume_unix: Option<i64>,
     /// What the window ending at the last classified refusal served; zero when
     /// there is no such refusal, because nothing measured it.
     pub burned_window_tokens: u64,
@@ -543,19 +555,38 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_upstreams JSONB;
 -- 可空且无默认值：非熔断行上 `NULL` 读作"不适用"，写 0 会读成"立刻可以重试"。
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS retry_after_secs BIGINT;
 CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts);
--- One row per upstream, not one per measurement: the pacer only ever acts on
--- the newest window it has an observation for, and a history of stale
--- boundaries would make "which one is in force" a question the reader has to
--- answer. The key is the upstream identity, which is what the pacing pass
--- selects by.
+-- One row per upstream **and window length**, not one per measurement: the
+-- pacer only ever acts on the newest window it has an observation for, and a
+-- history of stale boundaries would make "which one is in force" a question the
+-- reader has to answer. The window length belongs in the key because an
+-- upstream can enforce nested cycles at once — a five-hour limit and a weekly
+-- one — and both measurements are true at the same time. Keyed by upstream
+-- alone the second measurement overwrites the first, and the pacer is left
+-- with whichever limit happened to refuse last.
 CREATE TABLE IF NOT EXISTS gateway_llm_window (
-    upstream        TEXT PRIMARY KEY,
-    boundary_unix   BIGINT NOT NULL,
+    upstream        TEXT NOT NULL,
     window_secs     BIGINT NOT NULL,
+    boundary_unix   BIGINT NOT NULL,
     capacity_tokens BIGINT NOT NULL,
     source          TEXT NOT NULL,
-    measured_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    measured_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (upstream, window_secs)
 );
+-- Installs that predate the window length being part of the key carry a
+-- primary key on `upstream` alone, which silently forbids a second ruler.
+DO $mig$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'gateway_llm_window'::regclass AND contype = 'p'
+          AND pg_get_constraintdef(oid) NOT LIKE '%window_secs%'
+    ) THEN
+        ALTER TABLE gateway_llm_window DROP CONSTRAINT gateway_llm_window_pkey;
+        ALTER TABLE gateway_llm_window
+            ADD PRIMARY KEY (upstream, window_secs);
+    END IF;
+END
+$mig$;
 -- The window fold. `window_start`/`window_end` are the row's own boundary
 -- fields, not a `now()` stamped at insert: a rerun has to key and compare on
 -- the window it is recomputing, and a timestamp taken when the row happened to
@@ -780,6 +811,14 @@ impl LlmUsageStore {
     /// was measured, and the newest successful call is not a substitute for a
     /// boundary. It only says where serving stopped, which is equally true of an
     /// upstream that was throttled and of one nobody called.
+    ///
+    /// `last_resume_unix` is the reset observation for upstreams that name no
+    /// instant: serving cannot resume while a window is spent, so the first
+    /// success after each wall bounds when that quota returned. The newest of
+    /// those is the phase anchor — window starts repeat from it — and it is
+    /// still the anchor while the most recent wall has no success after it yet.
+    /// It is not the last success: that one may be days old and says nothing
+    /// about the boundary.
     pub async fn upstream_window(
         &self,
         upstream: &str,
@@ -793,10 +832,22 @@ impl LlmUsageStore {
                 WHERE upstream = $1 AND result = 'ok'
             ),
             last AS (SELECT MAX(ts) AS ts FROM ok),
-            wall AS (
-                SELECT MAX(ts) AS ts
+            walls AS (
+                SELECT ts
                   FROM {LEDGER_TABLE}
                  WHERE upstream = $1 AND refusal_kind = 'quota_cycle'
+            ),
+            wall AS (SELECT MAX(ts) AS ts FROM walls),
+            -- One resume per wall: the first success after it. The latest of
+            -- them is a window start, which is what a pacer can anchor the
+            -- phase to. Grouping by the wall rather than taking the first
+            -- success after the newest wall keeps the previous cycle's resume
+            -- available while the current wall has none.
+            resumes AS (
+                SELECT MIN(o.ts) AS ts
+                  FROM ok o, walls w
+                 WHERE o.ts > w.ts
+                 GROUP BY w.ts
             )
             SELECT
                 -- FLOOR, not a bare cast: a cast rounds to the nearest second,
@@ -807,6 +858,14 @@ impl LlmUsageStore {
                 -- which reads as a window that served nothing.
                 (SELECT FLOOR(EXTRACT(EPOCH FROM ts))::BIGINT FROM last) AS last_ok_unix,
                 (SELECT FLOOR(EXTRACT(EPOCH FROM ts))::BIGINT FROM wall) AS last_quota_refusal_unix,
+                -- The latest instant serving resumed after a wall bounds when
+                -- that window's quota returned. An upstream that names no
+                -- reset (kimi's weekly 403 names only the window's length)
+                -- leaves no other observation of it, and the wall itself is
+                -- not one: the allowance can run out on the window's first
+                -- day.
+                (SELECT FLOOR(EXTRACT(EPOCH FROM MAX(ts)))::BIGINT
+                   FROM resumes) AS last_resume_unix,
                 -- Measured around the refusal, and only around it: that row is
                 -- the one observation of the allowance running out. There is no
                 -- fallback to the last success — that instant only says where
@@ -830,6 +889,7 @@ impl LlmUsageStore {
         Ok(UpstreamWindowReading {
             last_ok_unix: row.get("last_ok_unix"),
             last_quota_refusal_unix: row.get("last_quota_refusal_unix"),
+            last_resume_unix: row.get("last_resume_unix"),
             burned_window_tokens: row.get::<i64, _>("burned_window_tokens").max(0) as u64,
         })
     }
@@ -874,7 +934,7 @@ impl LlmUsageStore {
             "INSERT INTO {WINDOW_TABLE}
                  (upstream, boundary_unix, window_secs, capacity_tokens, source, measured_at)
              VALUES ($1, $2, $3, $4, $5, NOW())
-             ON CONFLICT (upstream) DO UPDATE SET
+             ON CONFLICT (upstream, window_secs) DO UPDATE SET
                  boundary_unix   = EXCLUDED.boundary_unix,
                  window_secs     = EXCLUDED.window_secs,
                  capacity_tokens = EXCLUDED.capacity_tokens,
@@ -891,13 +951,23 @@ impl LlmUsageStore {
         Ok(())
     }
 
-    /// The window measurement last stored for one upstream.
-    pub async fn stored_window(&self, upstream: &str) -> anyhow::Result<Option<StoredWindow>> {
+    /// The window measurement last stored for one upstream and window length.
+    ///
+    /// Both parts name the row: the same upstream can enforce a five-hour and a
+    /// weekly limit at once, and each has its own measured boundary and
+    /// capacity. Asking by upstream alone would return whichever ruler was
+    /// written last.
+    pub async fn stored_window(
+        &self,
+        upstream: &str,
+        window_secs: u64,
+    ) -> anyhow::Result<Option<StoredWindow>> {
         let row = sqlx::query(&format!(
             "SELECT upstream, boundary_unix, window_secs, capacity_tokens, source
-               FROM {WINDOW_TABLE} WHERE upstream = $1"
+               FROM {WINDOW_TABLE} WHERE upstream = $1 AND window_secs = $2"
         ))
         .bind(upstream)
+        .bind(window_secs as i64)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| StoredWindow {

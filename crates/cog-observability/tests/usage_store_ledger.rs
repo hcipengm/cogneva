@@ -557,8 +557,8 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
 
     // The measurement itself needs a home that outlives the process: if it dies
     // with the gateway, the next rollout silently drops the bound and nothing in
-    // the readings says it went away. One row per upstream, overwritten when a
-    // newer window is measured.
+    // the readings says it went away. One row per upstream and window length,
+    // overwritten when a newer window of the same length is measured.
     let stored = StoredWindow {
         upstream: bounded.clone(),
         capacity_tokens: 1_050,
@@ -572,7 +572,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         .expect("store the window measurement");
     assert_eq!(
         store
-            .stored_window(&bounded)
+            .stored_window(&bounded, 604_800)
             .await
             .expect("read the measurement back"),
         Some(stored.clone()),
@@ -589,11 +589,41 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         .expect("a newer window supersedes the older one");
     assert_eq!(
         store
-            .stored_window(&bounded)
+            .stored_window(&bounded, 604_800)
             .await
             .expect("read the superseding measurement"),
-        Some(newer),
+        Some(newer.clone()),
         "the newest boundary is the one in force"
+    );
+    // A second window length is a second ruler, not an overwrite: the same
+    // upstream can enforce a five-hour and a weekly limit at once, and both
+    // measurements are true at the same time.
+    let hourly = StoredWindow {
+        upstream: bounded.clone(),
+        capacity_tokens: 2_230_180,
+        window_secs: 18_000,
+        boundary_unix: now - 3_600,
+        source: "wall_row".to_string(),
+    };
+    store
+        .record_window(&hourly)
+        .await
+        .expect("store the nested window measurement");
+    assert_eq!(
+        store
+            .stored_window(&bounded, 18_000)
+            .await
+            .expect("read the nested measurement back"),
+        Some(hourly),
+        "a five-hour ruler lives beside the weekly one"
+    );
+    assert_eq!(
+        store
+            .stored_window(&bounded, 604_800)
+            .await
+            .expect("the weekly ruler must survive the nested write"),
+        Some(newer),
+        "measuring one window length must not overwrite the other"
     );
     let rows = sqlx::query("SELECT COUNT(*) AS n FROM gateway_llm_window WHERE upstream = $1")
         .bind(&bounded)
@@ -602,8 +632,8 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         .expect("count the stored windows");
     assert_eq!(
         rows.get::<i64, _>("n"),
-        1,
-        "one row per upstream, or the pacing pass has to pick between two bounds"
+        2,
+        "one row per upstream and window length: the two rulers coexist, but a newer measurement of the same length supersedes"
     );
 
     sqlx::query("DELETE FROM gateway_llm_usage WHERE upstream = $1")
