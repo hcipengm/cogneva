@@ -4623,8 +4623,13 @@ mod tests {
                 .any(|w| w == b"pg-password"),
             "密文里不该出现包内的明文"
         );
+        // 构造解码器不读帧头，拿它当判据会永远通过；真正要问的是「解出来了吗」。
+        use std::io::Read;
+        let mut decoder = zstd::Decoder::new(std::io::Cursor::new(bytes.as_slice()))
+            .expect("zstd 解码器的构造本身不校验帧头");
+        let mut plain = Vec::new();
         assert!(
-            zstd::Decoder::new(std::io::Cursor::new(bytes.as_slice())).is_err(),
+            decoder.read_to_end(&mut plain).is_err(),
             "拿 zstd 直接解必须失败，否则「加密」只是换了个文件头"
         );
 
