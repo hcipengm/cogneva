@@ -3041,6 +3041,22 @@ impl MainlineDeployer {
             .await;
     }
 
+    /// 一轮在被拒分支之前就返回时，把还挂着的换手请求续上。
+    ///
+    /// 预留按「最后一次刷新」判新鲜（`RESERVE_FRESH`，900 秒），而刷新只写在被拒
+    /// 分支里。一轮若在更早的门返回（tag 服务还在重建索引、上游 CI 报失败），它走
+    /// 不到那里，预留就在「还在等」的途中自己过期：2026-10-19 14:55 写下的那条正好
+    /// 在 15:10:24 过期，同期 `change verification` 在 15:10:25 拿走了构建场。
+    /// 请求过期之后，等待者的下一轮仍要重新连输三轮才写得出第二条，中间那一段它
+    /// 在读数面上与「没有在等」同形。
+    ///
+    /// 只续发出去过的请求，不新发：连输不够轮次时，等待者还没有资格让别的构建让路。
+    fn renew_advance_reservation(&self, state: &MainlineState) {
+        if state.advance_deferrals >= ADVANCE_CLAIM_AFTER_DEFERRALS {
+            crate::build_gate::reserve_build_field("mainline advance");
+        }
+    }
+
     /// 连续多少轮没拿到构建槽：0 是真读数，拿到槽的那一轮写回 0。
     ///
     /// 同一个数在盘上已经有一份（`state.advance_deferrals`），但那一份只有进得了
@@ -4706,6 +4722,7 @@ impl MainlineDeployer {
                     held_secs = now - restarted_at,
                     "holding the rollout: the tag server is still rebuilding its index after a reclaim restart"
                 );
+                self.renew_advance_reservation(&state);
                 return Ok(());
             }
         }
@@ -4716,6 +4733,8 @@ impl MainlineDeployer {
         // 追上来，这条路径自己恢复。这里问的是第一次；第二次在真要派 Job 之前
         // （见 `roll_out`），中间隔着的那段构建正是它要补上的窗口。
         if self.hold_if_ci_reports_failure(&mut state, &bare).await? {
+            // 被 CI 扣住的轮同样「还在等构建场」，只是走不到下面的被拒分支。
+            self.renew_advance_reservation(&state);
             return Ok(());
         }
         if let Some(held) = state.ci_hold.take() {

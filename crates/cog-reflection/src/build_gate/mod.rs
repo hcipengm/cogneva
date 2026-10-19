@@ -257,6 +257,19 @@ const RESERVE_FRESH: Duration = Duration::from_secs(900);
 /// how promptly a freed slot is picked up.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How many turns in a row an exclusion stands down for someone else's claim on
+/// the next build before it takes the field anyway.
+///
+/// Two, because the two failure directions are not symmetric. A reservation that
+/// nothing honours is a sentence in a log: the work that asked for the next
+/// build is passed over every time a walk arrives, which is how the mainline
+/// lost the field for forty minutes on 2026-10-19. A walk that never runs
+/// starves the reading it exists to take, and it is the only thing that measures
+/// whether builds interfere with the cluster. Two turns is enough for the waiter
+/// to come round and take what it asked for, and short enough that a waiter that
+/// cannot take it does not hold the field off builds it never runs.
+const WALK_YIELD_LIMIT: u32 = 2;
+
 static GLOBAL: OnceLock<Arc<BuildGate>> = OnceLock::new();
 
 /// Installs the process-wide gate from configuration.
@@ -1065,6 +1078,46 @@ pub(crate) fn gate_actor() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// The account's event for an exclusion that met another work's reservation.
+///
+/// The ask is the walk's ("may no build start while I measure"), so the kind is
+/// the admission one and the outcome says what it got: stood down, or took the
+/// field anyway after its turns. The two are one row each, because the reading
+/// someone needs is "how often was a reservation honoured, and how often was it
+/// overruled" -- a total would not tell those apart, and a log line is gone long
+/// before anyone asks why the mainline waited forty minutes.
+fn walk_yield_event(
+    what: &str,
+    reserved_by: &str,
+    streak: u32,
+    took_the_field: bool,
+    dir: &Path,
+) -> ResourceEvent {
+    ResourceEvent {
+        kind: ResourceEventKind::AdmissionRefusal,
+        occurred_at: chrono::Utc::now(),
+        subject: "build_gate.walk".to_string(),
+        actor: gate_actor(),
+        reading: BUILD_GATE_EXCLUDED.to_string(),
+        reading_value: None,
+        from_value: Some(i64::from(streak)),
+        to_value: None,
+        outcome: if took_the_field {
+            ResourceEventOutcome::Applied
+        } else {
+            ResourceEventOutcome::Deferred
+        },
+        detail: serde_json::json!({
+            "what": what,
+            "reserved_by": reserved_by,
+            "yield_streak": streak,
+            "took_the_field": took_the_field,
+            "dir": dir.display().to_string(),
+        }),
+        count: 1,
+    }
+}
+
 /// The account's event for a bound that moved, or `None` when it did not.
 ///
 /// Stated apart from the measurement so the shape can be judged without a host:
@@ -1146,6 +1199,21 @@ pub struct BuildGate {
     wait_ms_max: AtomicU64,
     held_ms_total: AtomicU64,
     held_ms_max: AtomicU64,
+    /// Exclusions that stood down because a fresh reservation named another
+    /// work, and the ones that took the field over such a reservation anyway.
+    ///
+    /// Two counters rather than one because they answer different questions:
+    /// the first says the wait was honoured, the second says it had its turns
+    /// and was overruled. A single "walk meets reservation" count would read the
+    /// same whether the reservation ever protected anything or was ignored from
+    /// the first turn.
+    walk_yields: AtomicU64,
+    walk_over_reservation: AtomicU64,
+    /// How many turns in a row each work has stood down for someone else's
+    /// reservation. Reset when it takes the field, so the bound counts one
+    /// unbroken series of yields rather than a lifetime total that would
+    /// eventually let every walk through regardless.
+    walk_yield_streak: Mutex<std::collections::HashMap<String, u32>>,
     /// Events this process produced and has not handed to the account's
     /// consumer yet.
     ///
@@ -1210,6 +1278,9 @@ impl BuildGate {
             wait_ms_max: AtomicU64::new(0),
             held_ms_total: AtomicU64::new(0),
             held_ms_max: AtomicU64::new(0),
+            walk_yields: AtomicU64::new(0),
+            walk_over_reservation: AtomicU64::new(0),
+            walk_yield_streak: Mutex::new(std::collections::HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             events_dropped: AtomicU64::new(0),
         }
@@ -1579,6 +1650,40 @@ impl BuildGate {
         }
     }
 
+    /// One more turn stood down for someone else's reservation, and how many
+    /// turns that makes for this work in a row.
+    fn note_walk_yield(&self, what: &str) -> u32 {
+        let mut streaks = self
+            .walk_yield_streak
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let streak = streaks.entry(what.to_string()).or_insert(0);
+        *streak += 1;
+        *streak
+    }
+
+    /// This work took the field, so its run of yields is over. A bound that
+    /// counted a lifetime total instead would let every walk through the moment
+    /// it had stood down enough times, however long ago.
+    fn forget_walk_yields(&self, what: &str) {
+        let mut streaks = self
+            .walk_yield_streak
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        streaks.remove(what);
+    }
+
+    /// How many exclusions stood down for another work's reservation, and how
+    /// many took the field over one. Read by the tests and by the logs; the
+    /// account carries them as events.
+    pub fn walk_yields(&self) -> u64 {
+        self.walk_yields.load(Ordering::Relaxed)
+    }
+
+    pub fn walk_over_reservation(&self) -> u64 {
+        self.walk_over_reservation.load(Ordering::Relaxed)
+    }
+
     /// The counters as they stand, for the reading.
     fn counters(&self) -> Counters {
         Counters {
@@ -1667,6 +1772,49 @@ impl BuildGate {
         }
         match lock_claim_exclusive(&self.dir) {
             Some(file) => {
+                // A reservation says "the next build is mine". A walk does not
+                // run a build, but it does take the field the reservation is
+                // about, and taking it makes the waiting work's ask a sentence
+                // nobody acts on: on 2026-10-19 the mainline's claim on the next
+                // build was written at 14:55 and this path handed the field to a
+                // change verification walk at 15:10 anyway, because it never
+                // read the claim. Standing down is only safe with a bound --
+                // a walk that always yields is a walk that never measures --
+                // so a work gets [`WALK_YIELD_LIMIT`] turns and then the field.
+                if let Some((claimant, _)) = self.reservation() {
+                    if claimant != what {
+                        let streak = self.note_walk_yield(what);
+                        if streak <= WALK_YIELD_LIMIT {
+                            drop(file);
+                            self.walk_yields.fetch_add(1, Ordering::Relaxed);
+                            self.record_event(walk_yield_event(
+                                what, &claimant, streak, false, &self.dir,
+                            ));
+                            tracing::info!(
+                                what,
+                                reserved_by = %claimant,
+                                streak,
+                                dir = %self.dir.display(),
+                                "the next build is reserved for another work; leaving it this turn"
+                            );
+                            return Err(SFError::ResourceExhausted(format!(
+                                "the build field is reserved for {claimant}, so {what} cannot exclude builds this turn"
+                            )));
+                        }
+                        self.walk_over_reservation.fetch_add(1, Ordering::Relaxed);
+                        self.record_event(walk_yield_event(
+                            what, &claimant, streak, true, &self.dir,
+                        ));
+                        tracing::warn!(
+                            what,
+                            reserved_by = %claimant,
+                            streak,
+                            dir = %self.dir.display(),
+                            "taking the build field over a reservation that has had its turns"
+                        );
+                    }
+                }
+                self.forget_walk_yields(what);
                 record_holder(&file, what);
                 // The field is this caller's now, so its own claim on the next
                 // build has been answered and is released. Another work's is not:
@@ -2792,6 +2940,99 @@ mod tests {
         drop(running);
     }
 
+    /// An exclusion is not a build, so it never read the claim on the next
+    /// build -- and on 2026-10-19 it took the field the mainline had claimed
+    /// and held it for minutes while that work waited. It stands down now, but
+    /// only for a bounded run of turns: a walk that always yields never takes
+    /// the reading it exists for.
+    #[tokio::test]
+    async fn an_exclusion_stands_down_for_a_claim_on_the_next_build_but_only_for_its_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        gate.reserve_build_field("mainline advance");
+
+        for turn in 1..=WALK_YIELD_LIMIT {
+            let refused = gate
+                .try_acquire_exclusive("a change verification")
+                .await
+                .expect_err("the next build belongs to another work");
+            let text = refused.to_string();
+            assert!(
+                text.contains("mainline advance") && text.contains("a change verification"),
+                "a stand-down has to name who asked and who it stood down for, got: {text}"
+            );
+            assert_eq!(gate.walk_yields(), u64::from(turn));
+        }
+        assert_eq!(
+            gate.walk_over_reservation(),
+            0,
+            "the claim is honoured for as many turns as the bound allows"
+        );
+
+        let field = gate
+            .try_acquire_exclusive("a change verification")
+            .await
+            .expect("a walk that has stood down for its turns takes the field");
+        assert!(field.held());
+        assert_eq!(gate.walk_over_reservation(), 1);
+
+        let events = gate.drain_events();
+        let yields: Vec<_> = events
+            .iter()
+            .filter(|e| e.subject == "build_gate.walk")
+            .collect();
+        assert_eq!(
+            yields.len(),
+            WALK_YIELD_LIMIT as usize + 1,
+            "every turn has to leave a row in the account: {events:?}"
+        );
+        assert_eq!(yields[0].outcome, ResourceEventOutcome::Deferred);
+        assert_eq!(
+            yields.last().unwrap().outcome,
+            ResourceEventOutcome::Applied,
+            "the last row says the field was taken, not that the walk waited again"
+        );
+        assert_eq!(yields[0].detail["reserved_by"], "mainline advance");
+        assert_eq!(
+            yields.last().unwrap().detail["took_the_field"],
+            true,
+            "who the reservation named has to survive into the account: {:?}",
+            yields.last().unwrap().detail
+        );
+    }
+
+    /// The bound counts one unbroken run of stand-downs. A walk that has taken
+    /// the field starts over, and a claim the walk made for itself is not
+    /// something it stands down for -- otherwise a lifetime total would let
+    /// every walk through however recently it had yielded.
+    #[tokio::test]
+    async fn a_walks_run_of_stand_downs_starts_over_once_it_has_taken_the_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        gate.reserve_build_field("mainline advance");
+
+        for _ in 0..WALK_YIELD_LIMIT {
+            assert!(gate
+                .try_acquire_exclusive("a change verification")
+                .await
+                .is_err());
+        }
+        let field = gate
+            .try_acquire_exclusive("a change verification")
+            .await
+            .unwrap();
+        drop(field);
+
+        assert!(
+            gate.try_acquire_exclusive("a change verification")
+                .await
+                .is_err(),
+            "the run of yields starts over, so the walk stands down again"
+        );
+        assert_eq!(gate.walk_yields(), u64::from(WALK_YIELD_LIMIT) + 1);
+        assert_eq!(gate.walk_over_reservation(), 1);
+    }
+
     /// Every site in this crate that replaces the process image first takes
     /// the build field.
     ///
@@ -2809,6 +3050,14 @@ mod tests {
         for path in rust_files(&root) {
             let text = fs::read_to_string(&path).unwrap();
             for (at, _) in text.match_indices(needle) {
+                // A comment quoting the needle is not a call -- this scan's own
+                // explanation does. Counting it made the check below depend on
+                // how close the nearest real wait happened to be, so it passed
+                // on borrowed proximity until an unrelated test moved it away.
+                let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+                if text[line_start..at].trim_start().starts_with("//") {
+                    continue;
+                }
                 // Only a call: `foo.switch_and_restart()` ends with a dot or a
                 // receiver, a declaration has none and the needle would not
                 // contain `()` there anyway.
@@ -3643,6 +3892,16 @@ unevictable 28532736
         gate.reserve_build_field("mainline advance");
 
         drop(running);
+        // The sweep stands down for the advance's claim for its turns before it
+        // takes the field; what this test is about begins once it does.
+        for _ in 0..WALK_YIELD_LIMIT {
+            assert!(
+                gate.try_acquire_exclusive("a build-cache sweep")
+                    .await
+                    .is_err(),
+                "the advance claimed the next build, and the sweep has turns left"
+            );
+        }
         let sweep = gate
             .try_acquire_exclusive("a build-cache sweep")
             .await
