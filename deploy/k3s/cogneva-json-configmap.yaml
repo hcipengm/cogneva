@@ -2134,6 +2134,36 @@ data:
               "_comment_why_not_absent": "an installation with no second copy at all publishes nothing here and is reported by backup_offsite_copy_never_written; firing on absence would make this rule say the same thing a second time, in a message about a file that is not there."
             },
             {
+              "name": "backup_offsite_remote_copy_is_stale",
+              "promql": "max(cogneva_backup_run_readings{readout=\"offsite_remote_newest_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"offsite_remote_newest_age_seconds\"}) < 1800))",
+              "condition": {
+                "greater_than": 93600.0
+              },
+              "severity": "critical",
+              "summary": "The newest snapshot in the offsite repository is {value} seconds old, past the 26 hours this family allows, so the copy that leaves this machine has stopped following the backup volume. This is a different subject from backup_offsite_copy_is_stale: that rule walks a directory on this host, and a directory on this host shares the host's failure domain -- it survives a deleted claim, not a lost machine. The instant here is the one the repository reports back through `restic snapshots`, read by the host timer that pushes to it; a writer saying it uploaded is not this reading, and a repository that holds the bytes without a snapshot is exactly what a writer cannot see about itself. The bound has the family's three operands: a daily run, plus startingDeadlineSeconds, plus runDeadlineSeconds, the longest a run may take. The freshness conjunction sits on the published instant and not on the age, so a publisher that stopped leaves nothing plausible in place forever.",
+              "_comment_why_not_absent": "absence is backup_offsite_repository_is_never_observed's to report; this rule only answers how old the newest repository snapshot is, and firing on absence as well would name the same state twice with two different repairs."
+            },
+            {
+              "name": "backup_offsite_repository_key_is_old",
+              "promql": "max(cogneva_backup_run_readings{readout=\"offsite_repository_key_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"offsite_repository_key_age_seconds\"}) < 1800))",
+              "condition": {
+                "greater_than": 7776000.0
+              },
+              "severity": "warning",
+              "summary": "The offsite repository's newest encryption key was created {value} seconds ago -- 90 days is the bound this rule owns -- so the key that guards the copy has gone unrotated. The instant comes from the repository's own key list (`restic key list`), read by the host timer, and that is the only honest source: the mtime of an encrypted credential file says when a file was last re-sealed, and re-sealing is not rotating. A key that is old is not a copy that is missing; it is the window during which a leaked key would open every snapshot taken since its creation, which is the one damage rotation bounds. The rotation period itself is an operational choice; what this rule fixes is that the age is measured from the repository and that passing the bound is visible.",
+              "_comment_why_not_absent": "absence is backup_offsite_repository_is_never_observed's to report; a rule that also fired on absence would make an installation that never installed the timer look like one whose key aged out."
+            },
+            {
+              "name": "backup_offsite_repository_is_never_observed",
+              "promql": "(time() - max(kube_cronjob_created{cronjob=\"cogneva-backup-drill\"})) * max(absent(cogneva_backup_run_readings{readout=\"offsite_remote_newest_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"offsite_remote_newest_age_seconds\"}) < 1800)) or absent(cogneva_backup_run_readings{readout=\"offsite_repository_key_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"offsite_repository_key_age_seconds\"}) < 1800)))",
+              "condition": {
+                "greater_than": 93600.0
+              },
+              "severity": "warning",
+              "summary": "The drill CronJob has existed for {value} seconds, past the 26 hours this family allows, and at least one of the two repository observations -- the newest snapshot's age, the newest key's age -- has never been recorded. The two factors answer what should have happened by now and what has not -- the bound is the family's three operands: a daily run scheduled once a day, plus startingDeadlineSeconds, plus runDeadlineSeconds, the longest a run may take -- and multiplying them keeps the rule quiet on an installation whose CronJob is a minute old. No observation means no party reaches the repository: the host timer is not installed, or its observation file is not mounted where the drill reads it. The freshness conjunction on each absence makes a publisher that stopped read the same way -- its last value stops passing the window, so an absence is an absence whether it never existed or stopped being republished. Two different repairs, and both have to be told apart from a value that exists and has aged -- the age rules above speak only when there is a value, so a reading that never existed stays silent there for the same reason a stopped publisher does, which is why absence needs its own rule.",
+              "_comment_why_multiply": "the same two-factor shape as backup_offsite_copy_never_written: the object's age says what should have happened, absent() says what has not, and the product is false until the object is older than the bound."
+            },
+            {
               "name": "backup_run_over_its_own_deadline",
               "promql": "(max(cogneva_backup_run_readings{readout=\"oldest_running_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds) < 1800)) > max(cogneva_backup_run_readings{readout=\"oldest_running_deadline_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds) < 1800)))",
               "condition": {

@@ -55,6 +55,10 @@ spec:
                 # 只读：演练遍历卷外那一份，看它是不是刚装回去的这个包。
                 - name: COGNEVA_BACKUP_OFFSITE_DIR
                   value: "/offsite"
+                # 宿主定时器的观察文件：仓库里最新一份的时刻、最新一把钥匙的
+                # 创建时刻。文件不在 = 这一面没量过，账本留空列。
+                - name: COGNEVA_BACKUP_OFFSITE_STATE_DIR
+                  value: "/offsite-state"
               resources:
                 # 与备份同档：恢复是流式 COPY，常驻内存小，重活在 PG 那一侧。
                 requests:
@@ -71,6 +75,9 @@ spec:
                 - name: offsite
                   mountPath: /offsite
                   readOnly: true
+                - name: offsite-state
+                  mountPath: /offsite-state
+                  readOnly: true
           volumes:
             - name: backup
               persistentVolumeClaim:
@@ -78,4 +85,8 @@ spec:
             - name: offsite
               hostPath:
                 path: "/var/lib/cogneva-offsite"
+                type: DirectoryOrCreate
+            - name: offsite-state
+              hostPath:
+                path: "/var/lib/cogneva-backup-offsite"
                 type: DirectoryOrCreate

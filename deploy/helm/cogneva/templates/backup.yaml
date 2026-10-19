@@ -258,6 +258,13 @@ spec:
                 - name: COGNEVA_BACKUP_OFFSITE_DIR
                   value: "/offsite"
                 {{- end }}
+                {{- with .Values.backup.offsiteStateHostPath }}
+                # 宿主定时器的观察文件：仓库里最新一份的时刻、最新一把钥匙的
+                # 创建时刻。由那一跑自己读仓库写下，演练只读；文件不在 = 这一
+                # 面没量过，账本留空列，规则读作「从来没人观察过」。
+                - name: COGNEVA_BACKUP_OFFSITE_STATE_DIR
+                  value: "/offsite-state"
+                {{- end }}
               resources:
 {{ toYaml .Values.backup.drillResources | indent 16 }}
               volumeMounts:
@@ -270,12 +277,24 @@ spec:
                   mountPath: /offsite
                   readOnly: true
                 {{- end }}
+                {{- with .Values.backup.offsiteStateHostPath }}
+                # 只读：观察文件是宿主定时器写的，演练只读不写。
+                - name: offsite-state
+                  mountPath: /offsite-state
+                  readOnly: true
+                {{- end }}
           volumes:
             - name: backup
               persistentVolumeClaim:
                 claimName: cogneva-backup-pvc
             {{- with .Values.backup.offsiteHostPath }}
             - name: offsite
+              hostPath:
+                path: {{ . | quote }}
+                type: DirectoryOrCreate
+            {{- end }}
+            {{- with .Values.backup.offsiteStateHostPath }}
+            - name: offsite-state
               hostPath:
                 path: {{ . | quote }}
                 type: DirectoryOrCreate

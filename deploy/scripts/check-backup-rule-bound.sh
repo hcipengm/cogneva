@@ -73,6 +73,12 @@ BY_CONDITION = [
     "backup_restore_drill_is_stale",
     "backup_offsite_copy_never_written",
     "backup_offsite_copy_is_stale",
+    # 仓库侧的两个读者：异地副本陈旧、以及「从来没人观察过仓库」。它们判的
+    # 同样是「一天以内有没有东西落地」，界必须与上面几条同源。钥匙年龄那条
+    # （`backup_offsite_repository_key_is_old`）不在名单里是故意的：它的界是
+    # 轮换周期（90 天），与排班、宽限、运行时长都不是同一个量。
+    "backup_offsite_remote_copy_is_stale",
+    "backup_offsite_repository_is_never_observed",
     "backup_cronjob_stopped_scheduling",
     "backup_restore_drill_cronjob_stopped_scheduling",
 ]

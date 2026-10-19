@@ -101,6 +101,14 @@ enum BackupReadout {
     OffsiteNewestAgeSeconds,
     /// Whether that second copy is the very package the drill restored: 1 or 0.
     OffsiteMatchesVolume,
+    /// How long ago the offsite repository's newest snapshot was taken, as the
+    /// repository reports it to the host timer that pushes to it. Absent until
+    /// that timer has observed the repository once.
+    OffsiteRemoteNewestAgeSeconds,
+    /// How long ago the repository's newest encryption key was created -- how
+    /// long the key has gone unrotated, from the repository's own key list.
+    /// Absent until somebody observes it.
+    OffsiteRepositoryKeyAgeSeconds,
     /// How many packages in the retention window have no successful drill
     /// behind them, counted by the store across the window rather than read off
     /// the newest drill's row.
@@ -127,6 +135,8 @@ impl BackupReadout {
         BackupReadout::VolumeOldestPackageAgeSeconds,
         BackupReadout::OffsiteNewestAgeSeconds,
         BackupReadout::OffsiteMatchesVolume,
+        BackupReadout::OffsiteRemoteNewestAgeSeconds,
+        BackupReadout::OffsiteRepositoryKeyAgeSeconds,
         BackupReadout::DrillWindowUnprovenPackages,
     ];
 
@@ -150,6 +160,8 @@ impl BackupReadout {
             BackupReadout::VolumeOldestPackageAgeSeconds => "volume_oldest_package_age_seconds",
             BackupReadout::OffsiteNewestAgeSeconds => "offsite_newest_age_seconds",
             BackupReadout::OffsiteMatchesVolume => "offsite_matches_volume",
+            BackupReadout::OffsiteRemoteNewestAgeSeconds => "offsite_remote_newest_age_seconds",
+            BackupReadout::OffsiteRepositoryKeyAgeSeconds => "offsite_repository_key_age_seconds",
             BackupReadout::DrillWindowUnprovenPackages => "drill_window_unproven_packages",
         }
     }
@@ -303,6 +315,18 @@ const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()
         BackupReadout::OffsiteMatchesVolume,
         ReadoutReader::Rule("backup_offsite_copy_is_not_the_latest_package"),
     ),
+    // The repository's own answer, as opposed to the directory walk above: the
+    // walk sees a file on this machine, this sees a snapshot in the repository.
+    // Absent when nobody observes, so the never-observed shape is a separate
+    // rule reading the absence.
+    (
+        BackupReadout::OffsiteRemoteNewestAgeSeconds,
+        ReadoutReader::Rule("backup_offsite_remote_copy_is_stale"),
+    ),
+    (
+        BackupReadout::OffsiteRepositoryKeyAgeSeconds,
+        ReadoutReader::Rule("backup_offsite_repository_key_is_old"),
+    ),
     // The one drill value that is not a look at a row: the store counts the
     // window, because the loop has no directory to walk and no history of its
     // own. Its rule is the only one whose subject is the window rather than the
@@ -408,6 +432,17 @@ fn value_of(
         BackupReadout::OffsiteMatchesVolume => drill
             .and_then(|d| d.offsite_matches_newest)
             .map(|same| if same { 1.0 } else { 0.0 }),
+        // Observed by the host timer on the repository itself, not by the
+        // writer: the newest snapshot the repository reports, and when its
+        // newest key was created. Both are absent when nobody observes, which
+        // is a different fact from an observed value that has aged -- the rules
+        // ask the two questions separately, and absence must not read as zero.
+        BackupReadout::OffsiteRemoteNewestAgeSeconds => drill
+            .and_then(|d| d.offsite_remote_newest_at)
+            .map(|at| age_seconds(now, at)),
+        BackupReadout::OffsiteRepositoryKeyAgeSeconds => drill
+            .and_then(|d| d.offsite_key_created_at)
+            .map(|at| age_seconds(now, at)),
         // Not read off the newest drill's row: that row answers "did the
         // package it opened restore", and this counts the window it did not
         // open. A green newest row and a window nobody has opened are both

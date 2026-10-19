@@ -2833,6 +2833,13 @@ pub struct DrillConfig {
     /// 备份卷之外的第二个落点，与写者读同一个 env。`None` = 这个安装没有第二
     /// 个落点，演练会把这件事实记成空列；读那一面的规则由「从来没有过一份」来判。
     pub offsite_dir: Option<PathBuf>,
+    /// 宿主那一跑从 restic 仓库里观察到的时刻写在哪里（`observation.json`）。
+    ///
+    /// 这是「另有一份在别处」与「钥匙多久没换」唯一不靠自报的来源：写者说
+    /// 自己上传成功，不等于仓库里有快照；凭证文件的 mtime 是上次重封的时刻，
+    /// 重封不等于换钥匙。`None` = 这个安装没有这条观察通道，账本两列留空，
+    /// 读作「没量过」，不是「刚换过」。
+    pub offsite_state_dir: Option<PathBuf>,
     /// 迁移目录：演练要在一个空库上把表结构建出来，用的必须是**这个镜像**里的
     /// 迁移，而不是别处的。镜像把迁移装在 `/opt/cogneva/crates/cog-storage/migrations`。
     pub migrations_dir: PathBuf,
@@ -2861,6 +2868,10 @@ impl DrillConfig {
                 std::env::var("COGNEVA_BACKUP_DIR").unwrap_or_else(|_| "/backups".into()),
             ),
             offsite_dir: std::env::var("COGNEVA_BACKUP_OFFSITE_DIR")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            offsite_state_dir: std::env::var("COGNEVA_BACKUP_OFFSITE_STATE_DIR")
                 .ok()
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
@@ -3071,6 +3082,41 @@ const RUNS_DIGEST_SQL: &str = "\
 SELECT coalesce(md5(string_agg(t::text, E'\\n' ORDER BY t.run_id)), '') \
 FROM backup_runs t WHERE run_id = ANY($1)";
 
+/// 宿主定时器从 restic 仓库里观察到的两个时刻。
+///
+/// 由 `backup-offsite-restic.sh` 写出：`newest_snapshot_at` 是 `restic snapshots`
+/// 报出的最新一个快照的时刻，`key_created_at` 是 `restic key list` 里最新一把钥匙
+/// 的创建时刻。两者都可以是 `null`——仓库里还没有快照，或者一个从没 init 过的
+/// 仓库——那是「观察到了，里面没有」，与「没人观察」由文件在不在分开。
+#[derive(serde::Deserialize)]
+struct OffsiteObservation {
+    #[serde(default)]
+    newest_snapshot_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    key_created_at: Option<DateTime<Utc>>,
+}
+
+/// 读观察文件。不在就是没有观察过，不是错误；读不懂要留一条日志，因为那说明
+/// 写者与读者对形状的理解已经分叉，而这一面会因此一直读作「没量过」。
+fn read_offsite_observation(dir: &Path) -> Option<OffsiteObservation> {
+    let path = dir.join("observation.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "异地仓库的观察文件读不出来，这一面按没量过记");
+            return None;
+        }
+    };
+    match serde_json::from_str(&text) {
+        Ok(observed) => Some(observed),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "异地仓库的观察文件不是这一版认得的样子，这一面按没量过记");
+            None
+        }
+    }
+}
+
 /// 演练：把一个包装进空库，读它装成了什么。
 ///
 /// 失败不返回 `Err` 而是落进 `error`：一次演练的失败是要**被记录下来**的结果，
@@ -3089,6 +3135,8 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         oldest_package_at: None,
         offsite_newest_at: None,
         offsite_matches_newest: None,
+        offsite_remote_newest_at: None,
+        offsite_key_created_at: None,
         tables_restored: None,
         tables_expected: None,
         rows_restored: None,
@@ -3121,6 +3169,16 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .and_then(package_instant);
+    }
+
+    // 仓库侧的两个时刻：宿主那一跑把 `restic snapshots` / `restic key list` 读到的
+    // 结果写成一份观察文件，这里只读它。文件不在 = 这一面从来没有被观察过，账本
+    // 两列留空；规则从「没有读数」与「读数老了」里各读一条，两种形状分开报。
+    if let Some(dir) = &cfg.offsite_state_dir {
+        if let Some(observed) = read_offsite_observation(dir) {
+            drill.offsite_remote_newest_at = observed.newest_snapshot_at;
+            drill.offsite_key_created_at = observed.key_created_at;
+        }
     }
 
     if let Err(e) = drill_once(cfg, live, packages, &mut drill).await {
@@ -3604,7 +3662,12 @@ pub async fn run_drill_from_env() -> Result<(), Box<dyn std::error::Error>> {
         let candidates = older_than_newest(&packages);
         match least_recently_proven(&live, candidates).await? {
             Some(name) => targets.push(Some(name)),
-            None => tracing::warn!("卷上没有任何包可选，这一跑只开它能开的那一份"),
+            // 两句话分开说：卷上一份包都没有，与卷上只有最新那一份、没有第二份可开，
+            // 是两件不同的事。合成一句会让读日志的人去查卷，而卷是好的。
+            None if packages.is_empty() => {
+                tracing::warn!("卷上没有包，这一跑没有可开的")
+            }
+            None => tracing::warn!("卷上只有最新那一份，第二趟没有别的可开"),
         }
     }
 
@@ -3652,6 +3715,49 @@ mod tests {
         let b = package_name(Utc.with_ymd_and_hms(2026, 9, 14, 2, 0, 0).unwrap());
         assert!(a < b, "时间戳命名必须字典序可排：{a} vs {b}");
         assert!(a.starts_with(PACKAGE_PREFIX) && a.ends_with(PACKAGE_SUFFIX));
+    }
+
+    #[test]
+    fn the_offsite_observation_distinguishes_no_file_from_no_value() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 没有文件 = 没人观察过。账本留空列，规则读作「没量过」。
+        assert!(read_offsite_observation(dir.path()).is_none());
+
+        // 文件在、里面是两个 null = 观察过了，仓库里还没有快照/钥匙。
+        // 这与「没量过」是两种事实，读法也不同，所以解析要成功而不是退回 None。
+        std::fs::write(
+            dir.path().join("observation.json"),
+            r#"{"observed_at":"2026-10-19T02:30:00Z","newest_snapshot_at":null,"key_created_at":null}"#,
+        )
+        .unwrap();
+        let observed = read_offsite_observation(dir.path()).expect("文件在就要解析出来");
+        assert!(observed.newest_snapshot_at.is_none());
+        assert!(observed.key_created_at.is_none());
+
+        // 有值：带纳秒与偏移的 RFC3339 也要认，脚本归一失败时会原样写出来。
+        std::fs::write(
+            dir.path().join("observation.json"),
+            r#"{"newest_snapshot_at":"2026-10-19T10:30:00.123456789+08:00","key_created_at":"2026-01-02T03:04:05Z"}"#,
+        )
+        .unwrap();
+        let observed = read_offsite_observation(dir.path()).expect("文件在就要解析出来");
+        // 比到秒：解析保留纳秒（restic 写的就是纳秒），而这里要钉的是时区
+        // 归一（+08:00 → UTC）与字段落位，不是小数位的精度。
+        assert_eq!(
+            observed.newest_snapshot_at.unwrap().timestamp(),
+            Utc.with_ymd_and_hms(2026, 10, 19, 2, 30, 0)
+                .unwrap()
+                .timestamp()
+        );
+        assert_eq!(
+            observed.key_created_at.unwrap(),
+            Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap()
+        );
+
+        // 读不懂也算没量过，但现场要留日志——不在这里断言日志，只钉住返回值形状。
+        std::fs::write(dir.path().join("observation.json"), "{not json").unwrap();
+        assert!(read_offsite_observation(dir.path()).is_none());
     }
 
     #[test]

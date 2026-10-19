@@ -235,6 +235,13 @@ backup:
   # 空字符串 = 不配：两个 Job 都不挂载，于是「卷外一份都没有」由
   # `backup_offsite_copy_never_written` 报红，而不是悄悄当作已覆盖。
   offsiteHostPath: /var/lib/cogneva-offsite
+  # 异地那一跑的**观察文件**落在宿主哪里。宿主 systemd 定时器把
+  # `restic snapshots` / `restic key list` 读到的时刻写成一个文件（它的
+  # StateDirectory，即 `/var/lib/cogneva-backup-offsite`），演练只读挂载它、
+  # 把「仓库里最新一份是什么时候的、钥匙上一次换是什么时候」记进账本。
+  # 与 `offsiteHostPath` 一样是宿主路径；空字符串 = 不挂，两个年龄读数读作
+  # 「没量过」。定时器没装的时候它确实是没量过，不是零。
+  offsiteStateHostPath: /var/lib/cogneva-backup-offsite
   # 空 = 跟随集群默认 SC（与 pg/redis/qdrant 同策略，不绑厂商）。
   storageClass: ""
 

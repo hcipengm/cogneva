@@ -81,5 +81,43 @@ restic forget --tag cogneva-backup \
 # 这条故障在这一步之前不会有人发现——核到能核的那一半，比不核多一层。
 restic check
 
+# 仓库侧的观察：最新快照的时刻、最新一把钥匙的创建时刻。这两个数是「另有一份在
+# 别处」与「钥匙多久没换」唯一不靠自报的来源——上传成功不等于仓库里有快照，安装
+# 脚本跑过的时刻也不等于换过钥匙。写进 StateDirectory，由集群里那一跑读进账本；
+# 写不出来就让这一跑失败，因为「没观察」与「观察了但没有」在读数面上必须分得开。
+#
+# 时间统一归一成 UTC 再排序：restic 按本机时区写出带偏移的时间，字符串直接比大小
+# 只在偏移相同的那天成立。归一失败（不是能认的 RFC3339）就原样留着，不猜。
+STATE_DIR="${STATE_DIRECTORY:-/var/lib/cogneva-backup-offsite}"
+normalize_time() { date -u -d "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '%s' "$1"; }
+newest_field() { # $1 = JSON 文本, $2 = 字段名
+    printf '%s' "$1" | grep -oE "\"$2\":\"[^\"]+\"" | cut -d'"' -f4 \
+        | while read -r t; do normalize_time "$t"; done | sort | tail -1
+}
+
+snapshots_json="$(restic snapshots --json)" || {
+    echo "ERROR: restic snapshots --json 失败，仓库侧读数没有写成" >&2
+    exit 1
+}
+keys_json="$(restic key list --json)" || {
+    echo "ERROR: restic key list --json 失败，轮换年龄没有写成" >&2
+    exit 1
+}
+newest_snapshot="$(newest_field "$snapshots_json" time)"
+newest_key="$(newest_field "$keys_json" created)"
+
+json_or_null() { if [ -n "$1" ]; then printf '"%s"' "$1"; else printf 'null'; fi; }
+mkdir -p "$STATE_DIR"
+tmp="$STATE_DIR/.observation.json.tmp"
+cat > "$tmp" <<EOF
+{
+  "observed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "newest_snapshot_at": $(json_or_null "$newest_snapshot"),
+  "key_created_at": $(json_or_null "$newest_key")
+}
+EOF
+mv "$tmp" "$STATE_DIR/observation.json"
+say "仓库观察已落：$STATE_DIR/observation.json（最新快照 ${newest_snapshot:-无}，最新钥匙 ${newest_key:-无}）"
+
 say "完成：仓库里最新一个快照"
 restic snapshots --latest 1
