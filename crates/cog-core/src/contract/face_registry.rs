@@ -344,11 +344,39 @@ pub struct FaceDriftReading {
     /// The red rules that held, in the order the pass checked them.
     pub red_rules: Vec<String>,
     pub yellow_rules: Vec<String>,
+    /// `owner_idle` stands for several different situations, and a reader that
+    /// sees only the state cannot tell them apart. `detail` says which one in
+    /// prose; `cause` says it in one token from a closed set, because a label on
+    /// a metric may not carry the prose. A reader that gets the state alone has
+    /// to guess between "nobody has picked this up", "nobody has renewed the
+    /// heartbeat" and "this name is not a unit at all" -- three different
+    /// repairs behind one word.
+    #[serde(default)]
+    pub cause: Option<String>,
     pub detail: Option<String>,
     pub observed_at: DateTime<Utc>,
     /// The face's revision at the moment of the reading.
     pub source_revision: i64,
 }
+
+/// The closed set `cause` is drawn from.
+///
+/// Only the readings where the state alone is ambiguous carry one. A red rule
+/// names itself in `red_rules`, so a red reading has no cause to add; neither
+/// does `on_target`.
+pub const DRIFT_CAUSES: &[&str] = &[
+    // No face row carries this id, so there is nothing to observe.
+    "no_face_node",
+    // The face has an owner but no open task on it is bound to that owner.
+    "no_bound_task",
+    // The owner is a unit the registry knows, and its last heartbeat is older
+    // than the idle window.
+    "heartbeat_old",
+    // The registry answered and has no such unit.
+    "unknown_unit",
+    // The registry could not be asked, so no verdict may be printed.
+    "registry_unreadable",
+];
 
 /// What is known about the owner's liveness.
 ///
@@ -404,6 +432,7 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
             red_rules: Vec::new(),
             yellow_rules: Vec::new(),
             detail: Some("no face node carries this id".into()),
+            cause: Some("no_face_node".into()),
             observed_at: now,
             source_revision: 0,
         };
@@ -412,6 +441,7 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
     let mut red = Vec::new();
     let mut yellow = Vec::new();
     let mut detail: Option<String> = None;
+    let mut cause: Option<String> = None;
 
     if !face.is_staffed() {
         red.push(DriftState::NoOwner.as_str().to_string());
@@ -465,6 +495,7 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
         if !working {
             yellow.push(DriftState::OwnerIdle.as_str().to_string());
             detail = Some("no open task on this face is bound to its owner".into());
+            cause = Some("no_bound_task".into());
         } else if let OwnerLiveness::Seen(seen) = observation.owner_liveness {
             if (now - seen).num_seconds() >= OWNER_IDLE_AFTER_SECS {
                 yellow.push(DriftState::OwnerIdle.as_str().to_string());
@@ -472,10 +503,12 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
                     "the owner's last heartbeat is {}s old",
                     (now - seen).num_seconds()
                 ));
+                cause = Some("heartbeat_old".into());
             }
         } else if observation.owner_liveness == OwnerLiveness::Unknown {
             yellow.push(DriftState::OwnerIdle.as_str().to_string());
             detail = Some("the owner is not a unit the heartbeat registry knows".into());
+            cause = Some("unknown_unit".into());
         }
     }
 
@@ -504,6 +537,15 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
             Some("the owner registry could not be read".into())
         } else {
             detail
+        },
+        // Same precedence as `detail`: what the reader could not see outranks
+        // any cause the rules would have written about what it did see.
+        cause: if observation.owner_liveness == OwnerLiveness::Unreadable
+            && face.owner_unit.is_some()
+        {
+            Some("registry_unreadable".into())
+        } else {
+            cause
         },
         observed_at: now,
         source_revision: face.revision(),
@@ -907,6 +949,8 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("no open task"));
+        // The same three situations, as tokens a metric label can carry.
+        assert_eq!(reading.cause.as_deref(), Some("no_bound_task"));
 
         // Work, but the registry does not know the owner. This used to be
         // `on_target`: a green verdict for a name nobody could see.
@@ -925,6 +969,7 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("registry"));
+        assert_eq!(reading.cause.as_deref(), Some("unknown_unit"));
 
         // Work, and a heartbeat that is older than the idle window.
         let reading = observe(FaceObservation {
@@ -943,6 +988,54 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("heartbeat"));
+        assert_eq!(reading.cause.as_deref(), Some("heartbeat_old"));
+    }
+
+    #[test]
+    fn every_cause_comes_from_the_closed_set() {
+        // A label value that no reader has seen before is a new situation only
+        // by accident; the set is what makes "which of these fired" a question
+        // with a bounded answer.
+        let face = face(Some("unit-operator"));
+        let tasks = vec![task(Some("unit-operator"), TaskStatus::Running)];
+        let observed = [
+            (None, &[][..], OwnerLiveness::Seen(Utc::now())),
+            (None, &[][..], OwnerLiveness::Unknown),
+            (None, &[][..], OwnerLiveness::Unreadable),
+            (Some(&face), &[][..], OwnerLiveness::Seen(Utc::now())),
+            (Some(&face), &tasks[..], OwnerLiveness::Unknown),
+            (Some(&face), &tasks[..], OwnerLiveness::Unreadable),
+            (
+                Some(&face),
+                &tasks[..],
+                OwnerLiveness::Seen(
+                    Utc::now() - chrono::Duration::seconds(OWNER_IDLE_AFTER_SECS + 1),
+                ),
+            ),
+            (Some(&face), &tasks[..], OwnerLiveness::Seen(Utc::now())),
+        ];
+        for (f, open, liveness) in observed {
+            let reading = observe(FaceObservation {
+                face_id: "task-management",
+                face: f,
+                open_tasks: open,
+                signed_handovers: &[],
+                owner_liveness: liveness,
+                now: Utc::now(),
+            });
+            if let Some(cause) = reading.cause.as_deref() {
+                assert!(
+                    DRIFT_CAUSES.contains(&cause),
+                    "cause {cause} for state {} is outside the closed set",
+                    reading.state.as_str()
+                );
+            }
+            // `on_target` is the one state where nothing fired, so it is the one
+            // state that must not carry a cause.
+            if reading.state == DriftState::OnTarget {
+                assert_eq!(reading.cause, None);
+            }
+        }
     }
 
     #[test]

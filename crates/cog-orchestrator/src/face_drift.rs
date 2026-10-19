@@ -257,6 +257,13 @@ impl Observable for FaceDriftObservable {
                 RawMetric::new(FACE_DRIFT_METRIC, 1.0)
                     .with_label("face", reading.face_id)
                     .with_label("state", reading.state.as_str())
+                    // A label value has to come from a closed set, so the cause
+                    // travels as a token and not as the prose in `detail`. Where
+                    // the state alone says what happened, there is no cause and
+                    // the label says so, rather than being left off: a series
+                    // that sometimes carries a label and sometimes does not is
+                    // two shapes for one question.
+                    .with_label("cause", reading.cause.unwrap_or_else(|| "-".into()))
             })
             .collect())
     }
@@ -315,6 +322,7 @@ mod tests {
             state: DriftState::VacancyExpired,
             red_rules: vec!["vacancy_expired".into(), "no_owner".into()],
             yellow_rules: Vec::new(),
+            cause: None,
             detail: None,
             observed_at: Utc::now(),
             source_revision: 1,
