@@ -41,7 +41,8 @@ SUBCOMMANDS:
     next                   Print the one task this unit can start right now.
     claim   --task <id>    Reserve a ready task (Pending -> Scheduled).
     start   --task <id>    Begin a task and take its lease (Running).
-    heartbeat              Push the leases of this unit's Running tasks forward.
+    heartbeat              Push the leases of this unit's Running tasks forward and
+                           record the unit as alive where the face readings look.
     complete --task <id> [--result <json>]
                            Publish the task's result; the DAG completes it,
                            schedules dependents and settles the goal row.
@@ -318,6 +319,12 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         }
         Action::Heartbeat => {
             let renewed = heartbeat(&*backend, workspace, unit, endpoints.lease_secs).await?;
+            // The leases say "this unit still holds these tasks". The registry
+            // says "this unit is alive at all", which is the question the face
+            // readings ask when a face's owner has no work in flight -- without
+            // it a live worker with an empty queue is indistinguishable from a
+            // worker that has died.
+            presence(unit, workspace, &endpoints.redis_url).await?;
             println!("{renewed} leases renewed");
         }
         Action::Complete { task, result } => {
@@ -581,6 +588,42 @@ async fn next(
         ready.len(),
         owned
     );
+    Ok(())
+}
+
+/// Record that this unit is alive, under the name its faces name it by.
+///
+/// The registration is rewritten rather than renewed: the registry's TTL is
+/// shorter than any interval a person would choose between heartbeats, so a
+/// renewal can legitimately find nothing to renew, and that is not a failure of
+/// this command. Registering is idempotent and carries the fresh timestamp the
+/// reading looks at.
+async fn presence(unit: &str, workspace: &str, redis_url: &str) -> Result<(), Box<dyn Error>> {
+    if redis_url.trim().is_empty() {
+        return Err("no heartbeat store is configured: pass --redis-url or set \
+                    dag_executor.redis_url"
+            .into());
+    }
+    // The registry's own TTL is half a minute, which is shorter than the window
+    // the idle rule reads over: the record would be gone before the rule could
+    // see how long its owner had been quiet, and "quiet for ten minutes" and
+    // "never registered" would both arrive as the same missing key. Keep the
+    // record past that window and let the rule read a timestamp.
+    let registry = cog_storage::redis::RedisAgentRegistry::from_url(redis_url)
+        .await?
+        .with_ttl_seconds(cog_core::OWNER_IDLE_AFTER_SECS as u64 * 3 / 2);
+    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "external-worker".into());
+    let registration = cog_core::AgentRegistration::new(
+        unit,
+        hostname,
+        "",
+        "external-worker",
+        workspace,
+        Vec::new(),
+        cog_core::ResourceInfo::default(),
+    );
+    use cog_core::AgentRegistry as _;
+    registry.register(&registration).await?;
     Ok(())
 }
 
