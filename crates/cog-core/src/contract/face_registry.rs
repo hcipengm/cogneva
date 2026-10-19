@@ -577,16 +577,27 @@ pub trait GovernanceStore: Send + Sync {
         expected: &[TaskStatus],
     ) -> SFResult<bool>;
 
-    /// Move a face's ownership and record the handover that did it, atomically.
+    /// Move a face's ownership, record the handover that did it, and move the
+    /// work that has not started, atomically.
     ///
-    /// Returns whether both rows moved. The face write is guarded by the
-    /// revision the caller read, so an import and a handover cannot both win.
+    /// Returns how many tasks were rebound, or `None` when nothing was written.
+    /// The face write is guarded by the revision the caller read, so an import
+    /// and a handover cannot both win.
+    ///
+    /// Unstarted work follows the face: a `pending` or `scheduled` task bound
+    /// to this face and owned by the outgoing unit is reassigned to the
+    /// incoming one and stamped with the handover id. A `running` task is left
+    /// where it is -- its holder's lease is what makes it executable, and
+    /// moving the owner under a lease would give two units a claim on the same
+    /// run. Those rows read as `drifted_binding` until the run ends, which is
+    /// the truthful reading while a unit that no longer owns the face is still
+    /// executing its work.
     async fn apply_handover(
         &self,
         handover: &Task,
         face: &Task,
         expected_revision: i64,
-    ) -> SFResult<bool>;
+    ) -> SFResult<Option<usize>>;
 }
 
 /// What an import did with one row.
@@ -978,12 +989,17 @@ mod tests {
                 from_unit: Some("unit-a".into()),
                 to_unit: "unit-b".into(),
                 witness_unit: "unit-c".into(),
+                source: None,
                 criterion_reading: None,
                 reading_at: None,
                 open_actions: Vec::new(),
                 open_task_ids: Vec::new(),
                 permissions_context: None,
+                artifact_path: None,
+                artifact_expires_at: None,
                 expires_when: None,
+                withdraw_condition: None,
+                payload_sha256: None,
                 signed_by: Vec::new(),
             },
             updated_at,

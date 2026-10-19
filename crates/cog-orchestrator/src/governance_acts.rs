@@ -555,6 +555,89 @@ pub async fn settle(
     Ok(report)
 }
 
+/// The loop's name in the health registry.
+pub const DECISION_CLOSE_LOOP: &str = "governance_decision_close";
+
+/// The role one process at a time holds while writing verdicts.
+///
+/// Reading needs no arbitration, but a close is a write, and the writes are
+/// guarded by the state they read; one holder keeps the two replicas from
+/// computing the same verdict twice and counting each other as a lost race.
+pub const DECISION_CLOSE_ROLE: &str = "governance_decision_close";
+
+/// How often the closed-by-rule pass runs.
+///
+/// Thirty seconds: a ballot's deadline is a statement about when the question
+/// is answered, and a reader arriving a minute later should not have to know
+/// that a pass was due. A pass with nothing due writes nothing.
+pub const DECISION_CLOSE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Start the resident pass that writes the verdicts the rules already reached.
+///
+/// Not started is not a fault: a deployment without a shared database holds no
+/// ballots and no handovers, and the CLI reaches the same function directly.
+pub fn spawn_decision_close_loop(
+    store: std::sync::Arc<dyn cog_core::GovernanceStore>,
+    role: Option<std::sync::Arc<dyn cog_core::OwnerLeaseBroker>>,
+    shutdown: cog_core::ShutdownSignal,
+) {
+    tracing::info!(
+        interval_secs = DECISION_CLOSE_INTERVAL.as_secs(),
+        arbitrated = role.is_some(),
+        "Governance close loop enabled"
+    );
+    drop(cog_core::loop_health::spawn(
+        DECISION_CLOSE_LOOP,
+        cog_core::loop_health::Cadence::Periodic(DECISION_CLOSE_INTERVAL),
+        shutdown.clone(),
+        move |beat| {
+            let store = store.clone();
+            let role = role.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                let hold =
+                    cog_core::RoleHold::start(role, DECISION_CLOSE_ROLE, beat.clone(), &shutdown);
+                let mut ticker = tokio::time::interval(DECISION_CLOSE_INTERVAL);
+                // The first tick of an interval fires immediately; skipping it
+                // keeps startup from doing a pass before the role is settled.
+                ticker.tick().await;
+                loop {
+                    beat.beat();
+                    tokio::select! {
+                        _ = ticker.tick() => {}
+                        _ = shutdown.wait() => break,
+                    }
+                    if !hold.may_act().await {
+                        continue;
+                    }
+                    match settle(&*store, Utc::now()).await {
+                        Ok(report)
+                            if report.ballots_closed > 0
+                                || report.handovers_expired > 0
+                                || report.lost_races > 0 =>
+                        {
+                            tracing::info!(
+                                ballots_closed = report.ballots_closed,
+                                handovers_expired = report.handovers_expired,
+                                lost_races = report.lost_races,
+                                "governance close pass wrote the verdicts the rules had already \
+                                 reached"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "governance close pass could not read or write the graph; this tick \
+                             closed nothing, and the ballots stay open rather than being \
+                             reported closed"
+                        ),
+                    }
+                }
+            }
+        },
+    ));
+}
+
 /// Replace one payload key in a row, keeping whatever else the row carries.
 fn rewrite_payload<T: Serialize>(row: &mut Task, key: &str, payload: &T) {
     let object = row
@@ -749,12 +832,17 @@ mod tests {
             from_unit: Some("worker".into()),
             to_unit: "6e".into(),
             witness_unit: "8b2".into(),
+            source: None,
             criterion_reading: None,
             reading_at: None,
             open_actions: Vec::new(),
             open_task_ids: Vec::new(),
             permissions_context: None,
+            artifact_path: None,
+            artifact_expires_at: None,
             expires_when: None,
+            withdraw_condition: None,
+            payload_sha256: None,
             signed_by: vec![Signature {
                 unit: "8b2".into(),
                 at: at(0),
@@ -978,8 +1066,8 @@ mod tests {
             _handover: &Task,
             _face: &Task,
             _expected_revision: i64,
-        ) -> cog_core::SFResult<bool> {
-            Ok(false)
+        ) -> cog_core::SFResult<Option<usize>> {
+            Ok(None)
         }
     }
 
@@ -1051,12 +1139,17 @@ mod tests {
             from_unit: Some("worker".into()),
             to_unit: "6e".into(),
             witness_unit: "8b2".into(),
+            source: None,
             criterion_reading: Some("drifted_binding".into()),
             reading_at: Some(at(0)),
             open_actions: Vec::new(),
             open_task_ids: Vec::new(),
             permissions_context: None,
+            artifact_path: None,
+            artifact_expires_at: None,
             expires_when: Some(at(60)),
+            withdraw_condition: None,
+            payload_sha256: None,
             signed_by: Vec::new(),
         };
         let mut row = handover_task("h", spec, at(0));

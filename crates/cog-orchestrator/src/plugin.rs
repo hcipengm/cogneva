@@ -984,6 +984,18 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
                     face_shutdown,
                 );
+                // Deadlines close on their own schedule, faster than a drift
+                // pass: a ballot that reached its deadline is answered by the
+                // rules whether or not anybody is looking at the face.
+                let close_shutdown = ctx
+                    .consume::<cog_core::ShutdownSignal>()
+                    .map(|s| (*s).clone())
+                    .unwrap_or_default();
+                crate::governance_acts::spawn_decision_close_loop(
+                    store,
+                    ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
+                    close_shutdown,
+                );
             }
             None => info!("face drift loop not started: no GovernanceStore published"),
         }

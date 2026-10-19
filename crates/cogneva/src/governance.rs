@@ -46,9 +46,10 @@ SUBCOMMANDS:
     drift [--json]         Print the current verdict of every face. Reads the
                            workers' heartbeats too; an owner nobody can see
                            reads unread, never green.
-    project --out <dir>    Write faces.tsv and drift.tsv into <dir>, each with
-                           its generated_at and the graph's largest revision.
-                           This is the write a freshness gate reads.
+    project --out <dir>    Write faces.tsv, drift.tsv, decisions.tsv and
+                           tasks.tsv into <dir>, each with its generated_at and
+                           the graph's largest revision. This is the write a
+                           freshness gate reads.
     import-faces --from <file>
                            Put each roster row into the graph. Columns:
                            face kind owner deputy witness time_share
@@ -446,14 +447,68 @@ async fn project(
         ));
     }
 
+    // Decisions are rows like the faces, so the same projection carries them:
+    // a reader can see which questions the ledger holds, how each was settled,
+    // and -- for a backfilled one -- that its rules were not predeclared.
+    let decisions: Vec<cog_core::Decision> = store
+        .governance_nodes(cog_core::DECISION_TASK_TYPE)
+        .await?
+        .iter()
+        .filter_map(cog_core::Decision::from_task)
+        .collect();
+    let mut decisions_tsv = String::from(&stamp);
+    decisions_tsv.push_str(
+        "decision\tkind\tmode\tstate\tsubject\tresult\tresult_reason\tdeadline\tprovenance\tpredeclared\n",
+    );
+    for decision in &decisions {
+        let spec = &decision.spec;
+        decisions_tsv.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            decision.id,
+            spec.kind,
+            spec.mode.as_str(),
+            spec.state.as_str(),
+            spec.subject.replace('\t', " "),
+            spec.result_option.as_deref().unwrap_or("-"),
+            spec.result_reason
+                .as_deref()
+                .map(|reason| reason.replace('\t', " "))
+                .unwrap_or_else(|| "-".into()),
+            spec.deadline
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "-".into()),
+            spec.provenance.as_deref().unwrap_or("-"),
+            spec.predeclared,
+        ));
+    }
+
+    // The open work bound to a face. This is what makes "the owner is on it"
+    // checkable from the host without asking the database twice.
+    let open_tasks = store.open_face_bound_tasks().await?;
+    let mut tasks_tsv = String::from(&stamp);
+    tasks_tsv.push_str("task\tface\towner\tstatus\tworkspace\n");
+    for task in &open_tasks {
+        tasks_tsv.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            task.id,
+            task.face_id.as_deref().unwrap_or("-"),
+            task.owner_unit.as_deref().unwrap_or("-"),
+            task.status.as_str(),
+            task.workspace_id.as_deref().unwrap_or("-"),
+        ));
+    }
+
     std::fs::write(out.join("faces.tsv"), faces_tsv)?;
     std::fs::write(out.join("drift.tsv"), drift_tsv)?;
+    std::fs::write(out.join("decisions.tsv"), decisions_tsv)?;
+    std::fs::write(out.join("tasks.tsv"), tasks_tsv)?;
     println!(
-        "wrote {} and {} at {} (faces={}, source_revision={})",
-        out.join("faces.tsv").display(),
-        out.join("drift.tsv").display(),
+        "wrote faces.tsv, drift.tsv, decisions.tsv and tasks.tsv at {} \
+         (faces={}, decisions={}, open_tasks={}, source_revision={})",
         now.to_rfc3339(),
         faces.len(),
+        decisions.len(),
+        open_tasks.len(),
         revision
     );
     Ok(())

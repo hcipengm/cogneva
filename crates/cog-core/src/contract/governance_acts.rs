@@ -70,6 +70,11 @@ pub struct HandoverSpec {
     pub from_unit: Option<String>,
     pub to_unit: String,
     pub witness_unit: String,
+    /// Where the reading behind this move came from: a unit's report, the
+    /// owner's instruction, a drift row. Without it a reader can check the
+    /// number but not who said it.
+    #[serde(default)]
+    pub source: Option<String>,
     /// The reading the move was justified by, and when it was taken.
     pub criterion_reading: Option<String>,
     pub reading_at: Option<DateTime<Utc>>,
@@ -80,8 +85,26 @@ pub struct HandoverSpec {
     pub open_task_ids: Vec<String>,
     /// Anything the new owner needs to be told about access or permissions.
     pub permissions_context: Option<String>,
+    /// The artifact the handover hands over, and when it stops being the one
+    /// to read. A path without a lifetime is an invitation to read a stale
+    /// copy years later.
+    #[serde(default)]
+    pub artifact_path: Option<String>,
+    #[serde(default)]
+    pub artifact_expires_at: Option<DateTime<Utc>>,
     /// The conditions under which the handover is no longer valid.
     pub expires_when: Option<DateTime<Utc>>,
+    /// The conditions under which it should be withdrawn before then.
+    #[serde(default)]
+    pub withdraw_condition: Option<String>,
+    /// Digest of the payload as it stood when the first unit signed.
+    ///
+    /// Signing a row is only worth something if the row cannot change under the
+    /// signature. The digest covers everything except the signatures
+    /// themselves, so adding a second signer does not invalidate the first, but
+    /// editing the terms after one signature no longer verifies.
+    #[serde(default)]
+    pub payload_sha256: Option<String>,
     #[serde(default)]
     pub signed_by: Vec<Signature>,
 }
@@ -100,6 +123,35 @@ impl HandoverSpec {
         self.required_signers()
             .iter()
             .all(|unit| self.signed_by.iter().any(|s| s.unit == *unit))
+    }
+
+    /// The terms without the attestations: what every signature is over.
+    ///
+    /// Signatures are excluded because each one is added to a payload other
+    /// units already signed; including them would make the second signature
+    /// invalidate the first. The stored digest is excluded too, so computing it
+    /// and storing it is not a change to what was signed.
+    pub fn payload_digest(&self) -> String {
+        let mut unsigned = self.clone();
+        unsigned.signed_by.clear();
+        unsigned.payload_sha256 = None;
+        let bytes = serde_json::to_vec(&unsigned).expect("a handover spec serialises");
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Whether the payload still matches what the first signer attested to.
+    ///
+    /// A draft that has never been signed carries no digest and cannot be
+    /// checked; that is not a failure, it is the state before the first
+    /// signature.
+    pub fn signature_covers_payload(&self) -> bool {
+        match self.payload_sha256.as_deref() {
+            None => self.signed_by.is_empty(),
+            Some(expected) => expected == self.payload_digest(),
+        }
     }
 }
 
@@ -391,12 +443,17 @@ mod tests {
             from_unit: Some("worker".into()),
             to_unit: "6e".into(),
             witness_unit: "8b2".into(),
+            source: None,
             criterion_reading: None,
             reading_at: None,
             open_actions: Vec::new(),
             open_task_ids: Vec::new(),
             permissions_context: None,
+            artifact_path: None,
+            artifact_expires_at: None,
             expires_when: None,
+            withdraw_condition: None,
+            payload_sha256: None,
             signed_by: vec![Signature {
                 unit: "8b2".into(),
                 at: at(0),
@@ -414,6 +471,48 @@ mod tests {
         });
         assert!(signed.is_fully_signed());
         assert_eq!(signed.required_signers(), vec!["6e", "8b2", "worker"]);
+    }
+
+    #[test]
+    fn a_signature_stops_covering_the_payload_once_a_term_changes() {
+        let mut spec = HandoverSpec {
+            face_id: "f".into(),
+            from_unit: Some("worker".into()),
+            to_unit: "6e".into(),
+            witness_unit: "8b2".into(),
+            source: None,
+            criterion_reading: None,
+            reading_at: None,
+            open_actions: Vec::new(),
+            open_task_ids: Vec::new(),
+            permissions_context: None,
+            artifact_path: None,
+            artifact_expires_at: None,
+            expires_when: None,
+            withdraw_condition: None,
+            payload_sha256: None,
+            signed_by: Vec::new(),
+        };
+        // Before the first signature there is nothing to cover.
+        assert!(spec.signature_covers_payload());
+        spec.payload_sha256 = Some(spec.payload_digest());
+        spec.signed_by.push(Signature {
+            unit: "worker".into(),
+            at: at(0),
+        });
+        assert!(spec.signature_covers_payload());
+        // A second signature is over the same terms, not a change to them.
+        let digest = spec.payload_sha256.clone();
+        spec.signed_by.push(Signature {
+            unit: "6e".into(),
+            at: at(1),
+        });
+        assert_eq!(spec.payload_sha256, digest);
+        assert!(spec.signature_covers_payload());
+        // Editing the terms after the first signature does not re-hash; the
+        // reader must see that the row no longer matches.
+        spec.to_unit = "8e".into();
+        assert!(!spec.signature_covers_payload());
     }
 
     #[test]

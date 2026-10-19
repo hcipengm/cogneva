@@ -199,33 +199,9 @@ pub fn spawn_face_drift_loop(
                         continue;
                     }
                     let now = Utc::now();
-                    // A ballot whose deadline passed and a handover whose own
-                    // expiry passed are both findings the graph already holds;
-                    // nobody's turn has to come for them to be written. This
-                    // pass is the same function the CLI calls, so closing by
-                    // hand and closing on schedule agree by construction.
-                    match crate::governance_acts::settle(&*store, now).await {
-                        Ok(report)
-                            if report.ballots_closed > 0
-                                || report.handovers_expired > 0
-                                || report.lost_races > 0 =>
-                        {
-                            info!(
-                                ballots_closed = report.ballots_closed,
-                                handovers_expired = report.handovers_expired,
-                                lost_races = report.lost_races,
-                                "governance close pass wrote the verdicts the rules had already \
-                                 reached"
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => warn!(
-                            error = %e,
-                            "governance close pass could not read or write the graph; this \
-                             tick closed nothing, and the ballots stay open rather than \
-                             being reported closed"
-                        ),
-                    }
+                    // Closing expired ballots and handovers is a separate,
+                    // faster loop: a deadline is a promise about when the
+                    // answer lands, and it should not wait for the drift pass.
                     let readings = match cog_core::read_drift(&*store, agents.as_deref(), now).await
                     {
                         Ok(readings) => readings,

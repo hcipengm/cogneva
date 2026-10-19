@@ -26,7 +26,8 @@ use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
 use cog_core::{
-    GovernanceStore, SFError, SFResult, Task, TaskStatus, FACE_TASK_TYPE, GOVERNANCE_WORKSPACE,
+    GovernanceStore, Handover, SFError, SFResult, Task, TaskStatus, FACE_TASK_TYPE,
+    GOVERNANCE_WORKSPACE,
 };
 
 /// Face nodes, in one workspace, typed as faces.
@@ -109,6 +110,28 @@ const APPLY_HANDOVER_ROW_SQL: &str = "\
 UPDATE cog_dag_tasks \
    SET task = $3, status = $4, updated_at = NOW() \
  WHERE workspace_id = $1 AND task_id = $2 AND status = 'scheduled'";
+
+/// Hand the outgoing unit's unstarted work for one face to the incoming unit.
+///
+/// Only `pending` and `scheduled` rows move. A `running` task is executable
+/// through its holder's lease; rewriting its owner would leave the lease and
+/// the binding describing different units, so it is left to finish where it
+/// is and reads as drifted until then.
+///
+/// `agent_id` and `lease_owner` are cleared because they name the old owner's
+/// worker. Keeping them would hand the new unit a row it cannot execute (the
+/// router checks the owner) while the row claims a worker that belongs to
+/// somebody else.
+const REBIND_FACE_TASKS_SQL: &str = "\
+UPDATE cog_dag_tasks \
+   SET task = (task - 'agent_id' - 'lease_owner') || jsonb_build_object( \
+                'owner_unit', $3::text, \
+                'bound_by_handover_id', $4::text), \
+       updated_at = NOW() \
+ WHERE workspace_id <> $1 \
+   AND task ->> 'face_id' = $2 \
+   AND task ->> 'owner_unit' = $5 \
+   AND status IN ('pending', 'scheduled')";
 
 /// PostgreSQL governance store.
 #[derive(Clone)]
@@ -228,7 +251,10 @@ impl GovernanceStore for PostgresGovernanceStore {
         handover: &Task,
         face: &Task,
         expected_revision: i64,
-    ) -> SFResult<bool> {
+    ) -> SFResult<Option<usize>> {
+        let spec = Handover::from_task(handover)
+            .ok_or_else(|| SFError::Validation("the handover row carries no handover".into()))?
+            .spec;
         let handover_value = serde_json::to_value(handover).map_err(SFError::Serialization)?;
         let face_value = serde_json::to_value(face).map_err(SFError::Serialization)?;
         let mut tx = self
@@ -247,7 +273,7 @@ impl GovernanceStore for PostgresGovernanceStore {
             .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?;
         if moved_handover.rows_affected() != 1 {
             tx.rollback().await.ok();
-            return Ok(false);
+            return Ok(None);
         }
 
         let moved_face = sqlx::query(SAVE_FACE_NODE_IF_REVISION_SQL)
@@ -261,12 +287,27 @@ impl GovernanceStore for PostgresGovernanceStore {
             .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?;
         if moved_face.rows_affected() != 1 {
             tx.rollback().await.ok();
-            return Ok(false);
+            return Ok(None);
         }
+
+        // Nothing to follow when the face was vacant: no unit held its work.
+        let rebound = match spec.from_unit.as_deref() {
+            Some(from) => sqlx::query(REBIND_FACE_TASKS_SQL)
+                .bind(GOVERNANCE_WORKSPACE)
+                .bind(&spec.face_id)
+                .bind(&spec.to_unit)
+                .bind(&handover.id)
+                .bind(from)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?
+                .rows_affected() as usize,
+            None => 0,
+        };
 
         tx.commit()
             .await
             .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?;
-        Ok(true)
+        Ok(Some(rebound))
     }
 }

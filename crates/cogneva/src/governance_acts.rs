@@ -35,7 +35,12 @@ cogneva governance <handover|vote> <SUBCOMMAND> [OPTIONS]
 
 HANDOVER — moving a face from one unit to another. All three units must sign.
     open --face <face> --to <unit> --witness <unit> [--from <unit>]
-         [--criterion <text>] [--expires-when <rfc3339>]
+         [--source <text>] [--criterion <reading>] [--reading-at <rfc3339>]
+         [--artifact <path>] [--artifact-expires <rfc3339>]
+         [--expires-when <rfc3339>] [--withdraw-condition <text>]
+         Seven cells: where the reading came from, the reading and when it was
+         taken, unfinished actions, permissions, witness, the artifact and how
+         long it stays readable, when the handover dies and what withdraws it.
     sign --id <handover> --unit <unit>
     apply --id <handover>
     withdraw --id <handover> --unit <unit>
@@ -64,8 +69,13 @@ pub enum Act {
         from: Option<String>,
         to: String,
         witness: String,
+        source: Option<String>,
         criterion: Option<String>,
+        reading_at: Option<DateTime<Utc>>,
+        artifact: Option<String>,
+        artifact_expires_at: Option<DateTime<Utc>>,
         expires_when: Option<DateTime<Utc>>,
+        withdraw_condition: Option<String>,
     },
     HandoverSign {
         id: String,
@@ -167,8 +177,13 @@ pub fn parse_args(args: &[String]) -> Result<Act, String> {
             from: one("--from")?,
             to: required("--to")?,
             witness: required("--witness")?,
+            source: one("--source")?,
             criterion: one("--criterion")?,
+            reading_at: parse_time(&one("--reading-at")?)?,
+            artifact: one("--artifact")?,
+            artifact_expires_at: parse_time(&one("--artifact-expires")?)?,
             expires_when: parse_time(&one("--expires-when")?)?,
+            withdraw_condition: one("--withdraw-condition")?,
         }),
         ("handover", "sign") => Ok(Act::HandoverSign {
             id: required("--id")?,
@@ -272,20 +287,30 @@ pub async fn run(
             from,
             to,
             witness,
+            source,
             criterion,
+            reading_at,
+            artifact,
+            artifact_expires_at,
             expires_when,
+            withdraw_condition,
         } => {
             let spec = HandoverSpec {
                 face_id: face.clone(),
                 from_unit: from,
                 to_unit: to.clone(),
                 witness_unit: witness,
+                source,
                 criterion_reading: criterion,
-                reading_at: None,
+                reading_at,
                 open_actions: Vec::new(),
                 open_task_ids: Vec::new(),
                 permissions_context: None,
+                artifact_path: artifact,
+                artifact_expires_at,
                 expires_when,
+                withdraw_condition,
+                payload_sha256: None,
                 signed_by: Vec::new(),
             };
             let id = format!("handover:{}:{}:{}", face, to, now.timestamp_millis());
@@ -303,6 +328,18 @@ pub async fn run(
             if handover.spec.signed_by.iter().any(|s| s.unit == unit) {
                 println!("{}: already signed by {unit}", handover.state().as_str());
                 return Ok(());
+            }
+            // The first signature fixes the terms. A later signature over a
+            // payload that has since changed would attest to something nobody
+            // read, so refuse instead of quietly re-hashing.
+            if !handover.spec.signature_covers_payload() {
+                return Err(format!(
+                    "{id} changed after it was signed; the terms must be re-read before another signature"
+                )
+                .into());
+            }
+            if handover.spec.payload_sha256.is_none() {
+                handover.spec.payload_sha256 = Some(handover.spec.payload_digest());
             }
             let expected = task.status;
             handover.spec.signed_by.push(Signature {
@@ -342,6 +379,14 @@ pub async fn run(
                 )
                 .into());
             }
+            // Applying a row whose terms no longer match its signatures would
+            // move a face on the strength of documents the signers never saw.
+            if !handover.spec.signature_covers_payload() {
+                return Err(format!(
+                    "{id} no longer matches what its signers attested to; refusing to apply"
+                )
+                .into());
+            }
             let mut face_task =
                 find_node(store, cog_core::FACE_TASK_TYPE, &handover.spec.face_id).await?;
             let face = cog_core::Face::from_task(&face_task)
@@ -369,18 +414,18 @@ pub async fn run(
             }));
             task.updated_at = now;
 
-            if !store
+            let Some(rebound) = store
                 .apply_handover(&task, &face_task, expected_revision)
                 .await?
-            {
+            else {
                 return Err(format!(
                     "{id} could not be applied: the face moved or the handover changed"
                 )
                 .into());
-            }
+            };
             println!(
-                "applied: {} now owned by {} (revision {})",
-                handover.spec.face_id, handover.spec.to_unit, spec.revision
+                "applied: {} now owned by {} (revision {}); {} unstarted task(s) rebound",
+                handover.spec.face_id, handover.spec.to_unit, spec.revision, rebound
             );
         }
         Act::HandoverWithdraw { id, unit } => {
@@ -1037,6 +1082,16 @@ mod tests {
                 .cloned()
                 .collect()
         }
+
+        fn row(&self, id: &str) -> cog_core::Task {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|task| task.id == id)
+                .cloned()
+                .expect("the row exists")
+        }
     }
 
     #[async_trait::async_trait]
@@ -1094,11 +1149,59 @@ mod tests {
 
         async fn apply_handover(
             &self,
-            _handover: &cog_core::Task,
-            _face: &cog_core::Task,
-            _expected_revision: i64,
-        ) -> cog_core::SFResult<bool> {
-            Ok(false)
+            handover: &cog_core::Task,
+            face: &cog_core::Task,
+            expected_revision: i64,
+        ) -> cog_core::SFResult<Option<usize>> {
+            let Some(spec) = cog_core::Handover::from_task(handover).map(|h| h.spec) else {
+                return Ok(None);
+            };
+            let mut rows = self.rows.lock().unwrap();
+
+            let stored_revision = rows
+                .iter()
+                .find(|row| row.id == face.id)
+                .and_then(cog_core::Face::from_task)
+                .map(|face| face.revision());
+            if stored_revision != Some(expected_revision) {
+                return Ok(None);
+            }
+            let Some(stored_handover) = rows.iter_mut().find(|row| row.id == handover.id) else {
+                return Ok(None);
+            };
+            if stored_handover.status != cog_core::TaskStatus::Scheduled {
+                return Ok(None);
+            }
+            *stored_handover = handover.clone();
+
+            if let Some(stored_face) = rows.iter_mut().find(|row| row.id == face.id) {
+                *stored_face = face.clone();
+            }
+
+            let mut rebound = 0;
+            if let Some(from) = spec.from_unit.as_deref() {
+                for row in rows.iter_mut() {
+                    if row.id == face.id
+                        || row.face_id.as_deref() != Some(spec.face_id.as_str())
+                        || row.owner_unit.as_deref() != Some(from)
+                        || !matches!(
+                            row.status,
+                            cog_core::TaskStatus::Pending | cog_core::TaskStatus::Scheduled
+                        )
+                    {
+                        continue;
+                    }
+                    row.owner_unit = Some(spec.to_unit.clone());
+                    row.bound_by_handover_id = Some(handover.id.clone());
+                    // These name the old owner's worker; leaving them would keep
+                    // a claim the new owner cannot act on.
+                    row.agent_id = None;
+                    row.lease_owner = None;
+                    row.updated_at = handover.updated_at;
+                    rebound += 1;
+                }
+            }
+            Ok(Some(rebound))
         }
     }
 
@@ -1172,5 +1275,120 @@ mod tests {
         let error = run(act, &store, Utc::now()).await.unwrap_err();
         assert!(error.to_string().contains("vote:"), "{error}");
         assert!(store.of_type(DECISION_TASK_TYPE).is_empty());
+    }
+
+    #[tokio::test]
+    async fn applying_a_handover_moves_the_face_and_the_work_that_had_not_started() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let face_id = "\u{4efb}\u{52a1}\u{7ba1}\u{7406}";
+
+        let face = cog_core::Face {
+            face_id: face_id.to_string(),
+            owner_unit: Some("worker".into()),
+            bound_by_handover_id: None,
+            spec: cog_core::FaceSpec::first(face_id, cog_core::FaceKind::Face),
+            updated_at: now,
+        };
+        store
+            .save_governance_node(&face.to_task(None))
+            .await
+            .unwrap();
+
+        let work = |id: &str, status| {
+            let mut task = cog_core::Task::new(
+                id,
+                cog_core::TaskType::Custom("code".into()),
+                serde_json::json!({}),
+            );
+            task.status = status;
+            task.face_id = Some(face_id.to_string());
+            task.owner_unit = Some("worker".into());
+            task
+        };
+        let pending = work("work-pending", cog_core::TaskStatus::Pending);
+        store.save_governance_node(&pending).await.unwrap();
+        let mut running = work("work-running", cog_core::TaskStatus::Running);
+        running.agent_id = Some("agent-of-worker".into());
+        running.lease_owner = Some("worker-process".into());
+        store.save_governance_node(&running).await.unwrap();
+
+        run(
+            Act::HandoverOpen {
+                face: face_id.to_string(),
+                from: Some("worker".into()),
+                to: "6e".into(),
+                witness: "8b2".into(),
+                source: None,
+                criterion: None,
+                reading_at: None,
+                artifact: None,
+                artifact_expires_at: None,
+                expires_when: Some(now + chrono::Duration::days(1)),
+                withdraw_condition: None,
+            },
+            &store,
+            now,
+        )
+        .await
+        .unwrap();
+        let id = store.of_type(HANDOVER_TASK_TYPE)[0].id.clone();
+        for unit in ["worker", "6e", "8b2"] {
+            run(
+                Act::HandoverSign {
+                    id: id.clone(),
+                    unit: unit.into(),
+                },
+                &store,
+                now,
+            )
+            .await
+            .unwrap();
+        }
+        run(Act::HandoverApply { id: id.clone() }, &store, now)
+            .await
+            .unwrap();
+
+        assert_eq!(store.row(&id).status, cog_core::TaskStatus::Completed);
+        let moved = cog_core::Face::from_task(&store.row(face_id)).unwrap();
+        assert_eq!(moved.owner_unit.as_deref(), Some("6e"));
+        assert_eq!(moved.revision(), 2);
+        assert_eq!(moved.bound_by_handover_id.as_deref(), Some(id.as_str()));
+
+        // Unstarted work follows the face, and stops carrying the old owner's
+        // worker, which the new owner could not execute it with.
+        let followed = store.row("work-pending");
+        assert_eq!(followed.owner_unit.as_deref(), Some("6e"));
+        assert_eq!(followed.bound_by_handover_id.as_deref(), Some(id.as_str()));
+        assert_eq!(followed.agent_id, None);
+
+        // A run in flight is not moved under its lease.
+        let still_running = store.row("work-running");
+        assert_eq!(still_running.owner_unit.as_deref(), Some("worker"));
+        assert_eq!(still_running.lease_owner.as_deref(), Some("worker-process"));
+
+        // Until that run ends, the face is red for the right reason; after it
+        // does, the reading is green without anyone editing the ledger.
+        let in_flight = vec![followed.clone(), still_running];
+        let reading = cog_core::observe(cog_core::FaceObservation {
+            face_id,
+            face: Some(&moved),
+            open_tasks: &in_flight,
+            signed_handovers: &[],
+            owner_liveness: cog_core::OwnerLiveness::Seen(now),
+            now,
+        });
+        assert_eq!(reading.red_rules, vec!["drifted_binding".to_string()]);
+
+        let settled = vec![followed];
+        let reading = cog_core::observe(cog_core::FaceObservation {
+            face_id,
+            face: Some(&moved),
+            open_tasks: &settled,
+            signed_handovers: &[],
+            owner_liveness: cog_core::OwnerLiveness::Seen(now),
+            now,
+        });
+        assert_eq!(reading.state, cog_core::DriftState::OnTarget);
     }
 }
