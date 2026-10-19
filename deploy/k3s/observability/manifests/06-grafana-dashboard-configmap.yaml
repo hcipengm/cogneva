@@ -1957,6 +1957,36 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 48,
+          "title": "Alert Rules: Declared vs Loaded",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 216
+          },
+          "targets": [
+            {
+              "expr": "cogneva_alert_rule_count",
+              "legendFormat": "{{state}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

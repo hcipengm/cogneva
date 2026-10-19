@@ -491,6 +491,27 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          an alert a human never saw",
     ),
     (
+        "cogneva_alert_rule_count",
+        "How many rules the two sides of the loaded-rule-set check hold, \
+         labelled by `state`; the cell's value is a count. The check already \
+         raised a row when the document on disk and the process disagreed, but \
+         a row is an event: the ordinary state -- the two agreeing on a number \
+         -- had no series, so 'the rule set is fine' and 'nothing ever compared \
+         the two' were the same reading, and either question could only be \
+         answered by counting the startup log by hand. `loaded` is how many \
+         rules this process holds; `declared` is how many the configuration \
+         document defines, and it is written only when that document parsed \
+         and yielded a rule array. A document that cannot be read is not a \
+         document declaring zero rules, so the unreadable case leaves \
+         `declared` unwritten and says so in a third cell: `document_readable`, \
+         1 when the document parsed and 0 when it did not. A reader that \
+         subtracts the two sizes therefore has to hold `document_readable` at 1 \
+         -- the absence of `declared` is a reading that was not taken, not a \
+         reading of zero. The observability section is RestartRequired, so a \
+         ConfigMap replaced under a running process moves `declared` and not \
+         `loaded` until the deployment rolls",
+    ),
+    (
         "cogneva_loki_flush_total",
         "How each log-flush of the Loki background pusher ended, summed over \
          flushes and labelled by the outcome; the cell's value is how many log \

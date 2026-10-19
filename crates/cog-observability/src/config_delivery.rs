@@ -155,7 +155,13 @@ pub enum LoadedRuleSet {
     /// Neither side could be read. Nothing is concluded and no row is touched.
     Unknown(String),
     /// The process holds exactly the names the document declares.
-    Agree,
+    Agree {
+        /// How many rules the document declares. Carried on this arm too: the
+        /// published count is a reading, and the agreeing state is the one a
+        /// reader sees on an ordinary day -- an arm without the number would
+        /// leave the metric unwritten exactly when someone asks "how many".
+        declared: usize,
+    },
     /// The document declares names this process did not load, or still
     /// declares names it no longer has.
     Differs {
@@ -203,7 +209,9 @@ pub fn judge_loaded_rule_set(loaded: &[String], document: Option<&str>) -> Loade
     not_loaded.sort();
     still_loaded.sort();
     if not_loaded.is_empty() && still_loaded.is_empty() {
-        LoadedRuleSet::Agree
+        LoadedRuleSet::Agree {
+            declared: declared.len(),
+        }
     } else {
         LoadedRuleSet::Differs {
             not_loaded,
@@ -235,7 +243,7 @@ pub fn rule_set_action(verdict: &LoadedRuleSet, watch: &mut LoadedRuleSetWatch) 
         // A read that failed is not a reading that says the sets agree: leave
         // the row where it is and say why nothing was concluded.
         LoadedRuleSet::Unknown(_) => RuleSetAction::Nothing,
-        LoadedRuleSet::Agree => {
+        LoadedRuleSet::Agree { .. } => {
             watch.disagreeing = 0;
             watch.firing = false;
             // Asked for on every agreeing tick, not only after this process
@@ -304,13 +312,20 @@ pub async fn check_loaded_rule_set(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
             // An unreadable document is not an empty one; the row stays as it
-            // was and the reason is logged.
+            // was and the reason is logged. The counts are still published:
+            // `loaded` is known without the document, and the cell saying the
+            // document could not be read is the whole point of the reading on
+            // exactly this tick.
             info!(source = %source, error = %e, "loaded rule set check read nothing");
+            let verdict = LoadedRuleSet::Unknown(format!("document did not read: {e}"));
+            record_rule_counts(metrics, &verdict, loaded.len()).await;
             return;
         }
     };
     let was_firing = watch.firing;
-    match rule_set_action(&judge_loaded_rule_set(loaded, document.as_deref()), watch) {
+    let verdict = judge_loaded_rule_set(loaded, document.as_deref());
+    record_rule_counts(metrics, &verdict, loaded.len()).await;
+    match rule_set_action(&verdict, watch) {
         RuleSetAction::Fire(message) => {
             warn!(source = %source, "{}", message);
             set_row(
@@ -340,6 +355,47 @@ pub async fn check_loaded_rule_set(
             .await;
         }
         RuleSetAction::Nothing => {}
+    }
+}
+
+/// Publish the two sizes the check compares, and whether it could read the
+/// document at all.
+///
+/// One gauge rather than three names: the cells are the same question asked of
+/// three subjects, and a reader subtracting them has to see them side by side.
+/// `declared` is omitted when the document did not parse -- a count that was
+/// never taken must not be written as zero, so the unreadable case says so in
+/// `document_readable` instead of claiming the document declares no rules.
+async fn record_rule_counts(
+    metrics: Option<&Arc<dyn cog_core::MetricsBackend>>,
+    verdict: &LoadedRuleSet,
+    loaded: usize,
+) {
+    let Some(backend) = metrics else { return };
+    let declared = match verdict {
+        LoadedRuleSet::Unknown(_) => None,
+        LoadedRuleSet::Agree { declared } | LoadedRuleSet::Differs { declared, .. } => {
+            Some(*declared)
+        }
+    };
+    let mut cells = vec![
+        ("loaded", loaded as f64),
+        (
+            "document_readable",
+            if declared.is_some() { 1.0 } else { 0.0 },
+        ),
+    ];
+    if let Some(declared) = declared {
+        cells.push(("declared", declared as f64));
+    }
+    for (state, value) in cells {
+        let labels = std::collections::HashMap::from([("state".to_string(), state.to_string())]);
+        if let Err(e) = backend
+            .record_gauge(cog_core::metric_names::ALERT_RULE_COUNT, value, labels)
+            .await
+        {
+            warn!(state, error = %e, "could not record the alert rule count");
+        }
     }
 }
 
@@ -639,7 +695,7 @@ mod tests {
     #[test]
     fn a_process_on_the_documents_rule_set_raises_nothing() {
         let verdict = judge_loaded_rule_set(&loaded(&["a", "b"]), Some(&document(&["a", "b"])));
-        assert_eq!(verdict, LoadedRuleSet::Agree);
+        assert_eq!(verdict, LoadedRuleSet::Agree { declared: 2 });
         let mut watch = LoadedRuleSetWatch::default();
         assert_eq!(
             rule_set_action(&verdict, &mut watch),
@@ -734,5 +790,163 @@ mod tests {
             RuleSetAction::Nothing
         );
         assert!(watch.firing);
+    }
+
+    /// One gauge write: the series' wire name, its value, and its labels.
+    type Write = (String, f64, std::collections::HashMap<String, String>);
+
+    /// Keeps the gauge writes, so a test reads what the check published rather
+    /// than trusting that it called something.
+    #[derive(Default)]
+    struct GaugeWrites {
+        calls: std::sync::Mutex<Vec<Write>>,
+    }
+
+    impl GaugeWrites {
+        /// `(state, value)` per write, asserting each names the rule-count
+        /// series: a test that accepted any name would pass on a typo.
+        fn states(&self) -> Vec<(String, f64)> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(name, value, labels)| {
+                    assert_eq!(name, cog_core::metric_names::ALERT_RULE_COUNT.as_str());
+                    (labels.get("state").cloned().unwrap_or_default(), *value)
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::MetricsBackend for GaugeWrites {
+        async fn record_gauge(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: std::collections::HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.as_str().to_string(), value, labels));
+            Ok(())
+        }
+
+        async fn record_counter(
+            &self,
+            _name: cog_core::MetricName,
+            _value: f64,
+            _labels: std::collections::HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn record_histogram(
+            &self,
+            _name: cog_core::MetricName,
+            _value: f64,
+            _labels: std::collections::HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn query_gauge_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_gauge_latest(
+            &self,
+            _name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_counter_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_counter_totals(
+            &self,
+            _name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_histogram_totals(
+            &self,
+            _name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::HistogramTotals>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_histogram_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_metric_names(
+            &self,
+            _metric_type: cog_core::MetricType,
+        ) -> cog_core::SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn health_check(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+
+    /// The agreeing state is the one a reader meets on an ordinary day, so it
+    /// has to carry both numbers: a reading that only exists while something is
+    /// wrong would leave "how many rules are loaded" unanswerable exactly when
+    /// someone asks.
+    #[tokio::test]
+    async fn the_rule_counts_are_published_when_the_two_sides_agree() {
+        let writes = std::sync::Arc::new(GaugeWrites::default());
+        let backend: std::sync::Arc<dyn cog_core::MetricsBackend> = writes.clone();
+        let verdict = judge_loaded_rule_set(&loaded(&["a", "b"]), Some(&document(&["a", "b"])));
+        record_rule_counts(Some(&backend), &verdict, 2).await;
+        assert_eq!(
+            writes.states(),
+            vec![
+                ("loaded".to_string(), 2.0),
+                ("document_readable".to_string(), 1.0),
+                ("declared".to_string(), 2.0),
+            ]
+        );
+    }
+
+    /// A document that could not be read is not a document declaring zero
+    /// rules. The count that was never taken stays unwritten, and the cell that
+    /// says why is written on the same tick -- otherwise a reader subtracting
+    /// the two sizes would read a missing measurement as an empty rule set.
+    #[tokio::test]
+    async fn an_unreadable_document_publishes_no_declared_count() {
+        let writes = std::sync::Arc::new(GaugeWrites::default());
+        let backend: std::sync::Arc<dyn cog_core::MetricsBackend> = writes.clone();
+        let verdict = judge_loaded_rule_set(&loaded(&["a"]), None);
+        record_rule_counts(Some(&backend), &verdict, 1).await;
+        assert_eq!(
+            writes.states(),
+            vec![
+                ("loaded".to_string(), 1.0),
+                ("document_readable".to_string(), 0.0),
+            ]
+        );
     }
 }

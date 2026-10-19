@@ -407,6 +407,21 @@ metric_names! {
     // recipient list -- and deliberately does not count as delivered.
     ALERT_NOTIFICATIONS_TOTAL => "cogneva_alert_notifications_total",
 
+    // cog-observability — the two sizes the loaded-rule-set check compares,
+    // labelled by `state` (`declared|loaded|document_readable`), the cell's
+    // value being a count.
+    //
+    // The check already raised a row when the two sides disagreed, but a row is
+    // an event: the ordinary state -- a document and a process agreeing on a
+    // number -- had no series at all, so "the rule set is fine" and "nothing
+    // ever compared the two" were the same reading, and the only way to answer
+    // either was to read the startup log and count. `declared` is written only
+    // when the document parsed: a document that could not be read is not a
+    // document declaring zero rules, so `document_readable` carries that fact
+    // as its own cell and a reader comparing the two sizes has to hold it at 1
+    // rather than read a missing `declared` as the answer.
+    ALERT_RULE_COUNT => "cogneva_alert_rule_count",
+
     // cog-observability — how each log-flush of the Loki pusher ended, labelled by
     // `outcome`, the cell's value being how many log entries that batch carried.
     //

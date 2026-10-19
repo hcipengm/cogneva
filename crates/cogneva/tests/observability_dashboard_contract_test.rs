@@ -481,6 +481,18 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["slice", "node"],
         "crates/cog-observability/src/host_ledger.rs",
     ),
+    // The two sizes the loaded-rule-set check compares, so a reader can see the
+    // gap without waiting for the row it raises. The row is an event: a
+    // deployment whose rule set is fine and one that never compared the two
+    // sides at all read the same on every other series. `state` is the closed
+    // set `declared|loaded|document_readable`; `declared` is absent when the
+    // document did not parse, and the third cell is what a reader holds at 1
+    // before subtracting the other two.
+    (
+        "cogneva_alert_rule_count",
+        &["state"],
+        "crates/cog-observability/src/config_delivery.rs",
+    ),
     // What the self-discovery watcher does with each round's signals. No panel
     // draws these yet -- they are published so that "the watcher has gone quiet"
     // has a reading at all, and they are recorded here so their names and their
