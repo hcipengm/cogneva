@@ -997,7 +997,7 @@ mod tests {
         // by accident; the set is what makes "which of these fired" a question
         // with a bounded answer.
         let face = face(Some("unit-operator"));
-        let tasks = vec![task(Some("unit-operator"), TaskStatus::Running)];
+        let tasks = [task(Some("unit-operator"), TaskStatus::Running)];
         let observed = [
             (None, &[][..], OwnerLiveness::Seen(Utc::now())),
             (None, &[][..], OwnerLiveness::Unknown),
