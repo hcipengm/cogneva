@@ -339,7 +339,7 @@ Not simple conversation-history concatenation, but a **Raw → Schema → Summar
 - File-level memory (e.g. MEMORY.md) is flat text, capacity-limited, keyword-matched retrieval
 - Cogneva's memory is **structured + vectorized + graph-relational**, supporting semantic retrieval, time-range filtering, and relation-chain queries
 - The LLM automatically assigns importance scores (1–10); a periodic maintenance pass decays aged low-value memories automatically — down-weighting their importance and archiving those that fall past a floor — while re-observed facts are merged rather than duplicated
-- Namespace-scoped storage: every entry carries a namespace and every read and write filters on it, so separate workloads can share one deployment without seeing each other's memory
+- Namespace-scoped storage: every entry carries a namespace, every read and write filters on it, and the gateway derives the namespace from the caller's verified workspace claim. Callers without a workspace claim share the `default` namespace and can see each other's memory.
 
 ### 🔭 Advantage 5: Full-stack observability
 

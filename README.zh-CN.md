@@ -340,7 +340,7 @@ Cogneva：Agent 产生 Event → Hook 系统动态响应 → Skill 自适应加�
 - 文件级记忆（如 MEMORY.md）是平面文本，容量受限，检索靠关键词匹配
 - Cogneva 的记忆是**结构化 + 向量化 + 图关系**，支持语义检索、时间范围过滤、关系链查询
 - LLM 自动提取重要性评分（1-10 分），周期维护任务自动衰减陈旧的**低价值**记忆：逐轮降权、重要性跌过地板则归档；重复观察到的事实合并而非重复
-- 多租户 Namespace 隔离，企业级数据安全
+- Namespace 隔离存储：每条记忆都带 namespace，读写都按它过滤，网关从调用方已验证的 workspace claim 派生 namespace；**没有 workspace claim 的调用方共用 `default`，彼此可见**。
 
 ### 🔭 优势 5：全栈可观测性
 
@@ -679,6 +679,13 @@ cargo fmt --check
 - `cargo test --workspace` 全 workspace 通过
 - **已在环境中部署运行**
 - **持续推进**：全进化强RSI
+
+**范围与限制**——写在这里，而不是留给读者去推断：
+
+- **Namespace 是数据分区，不是授权边界。** namespace 划分记忆与任务存储，并取自调用方 token 里的 workspace claim；平台没有「租户归属与租户管理员」这一层，也没有 namespace 级的访问控制。
+- **没有配额执行，也没有计费。** `cog-quota` 这个 crate 存在，但不在服务路径上；没有计量或开票组件。
+- **告警送达需要一个你自己配的出口。** 告警规则与 `alerts` 表随平台发布；邮件、Slack、通用 webhook 等通道在配置之前是空的，配置之前什么都不会发出去。
+- **升级与回滚尚未在生产端到端跑通。** 此前的上线都是清单 apply 与镜像滚动；在把 `helm upgrade` / `helm rollback` 用于生产升级之前，请先在预发环境实跑一次。
 
 ---
 
