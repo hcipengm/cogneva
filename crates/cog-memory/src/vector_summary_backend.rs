@@ -23,6 +23,12 @@ use cog_core::{SummaryEntry, SummarySearchResult};
 /// Default collection name when none is provided.
 pub const DEFAULT_SUMMARY_COLLECTION: &str = "summaries";
 
+/// Attempts at creating the summary collection before the failure is reported.
+const CREATE_COLLECTION_ATTEMPTS: u32 = 4;
+
+/// Delay before the second attempt; doubled for each attempt after that.
+const CREATE_COLLECTION_BACKOFF_MS: u64 = 500;
+
 /// What one repair pass did.
 ///
 /// The counts are reported rather than inferred from the collection afterwards: an
@@ -127,11 +133,45 @@ impl VectorSummaryBackend {
         if *initialized {
             return Ok(());
         }
-        self.vector
-            .create_collection(&self.collection, self.embedding_dim)
-            .await?;
+        self.create_collection_with_retry().await?;
         *initialized = true;
         Ok(())
+    }
+
+    /// Create the collection, retrying a bounded number of times.
+    ///
+    /// The client's timeout is shorter than the create can take: the live
+    /// Qdrant logged the delete and the create of `summaries` six seconds
+    /// apart while the caller had already given up, and with
+    /// `strict_persistence=true` that timeout took the whole process down and
+    /// restarted it. Creating is idempotent — the backend asks
+    /// `collection_exists` first, so a repeat after a timed-out attempt finds
+    /// the collection the server did create — and the cost of being wrong in
+    /// this direction is a slower start instead of a crash loop.
+    async fn create_collection_with_retry(&self) -> SFResult<()> {
+        let mut attempt: u32 = 1;
+        loop {
+            match self
+                .vector
+                .create_collection(&self.collection, self.embedding_dim)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt >= CREATE_COLLECTION_ATTEMPTS => return Err(e),
+                Err(e) => {
+                    let delay_ms = CREATE_COLLECTION_BACKOFF_MS << (attempt - 1);
+                    tracing::warn!(
+                        collection = %self.collection,
+                        attempt,
+                        delay_ms,
+                        error = %e,
+                        "vector collection create failed; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                }
+            }
+        }
     }
 
     /// Load the persisted entries and rebuild the similarity index.
@@ -169,9 +209,7 @@ impl VectorSummaryBackend {
         };
 
         let _ = self.vector.delete_collection(&self.collection).await;
-        self.vector
-            .create_collection(&self.collection, self.embedding_dim)
-            .await?;
+        self.create_collection_with_retry().await?;
         *self.init_guard.lock().await = true;
 
         let mut rebuilt = HashMap::new();
@@ -1079,5 +1117,108 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entry.id, "good");
+    }
+
+    /// A create that times out while the server is still working it is the
+    /// one failure worth repeating: the next attempt finds the collection the
+    /// server did make, and startup continues instead of exiting.
+    struct SlowCreate {
+        inner: cog_storage::MemoryVectorBackend,
+        failures: std::sync::atomic::AtomicUsize,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SlowCreate {
+        fn failing(times: usize) -> Self {
+            Self {
+                inner: cog_storage::MemoryVectorBackend::new(),
+                failures: std::sync::atomic::AtomicUsize::new(times),
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn attempts(&self) -> usize {
+            self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl VectorBackend for SlowCreate {
+        async fn create_collection(&self, collection: &str, dimension: usize) -> SFResult<()> {
+            let seen = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if seen < self.failures.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(SFError::Validation(
+                    "qdrant create collection failed: Timeout expired".into(),
+                ));
+            }
+            self.inner.create_collection(collection, dimension).await
+        }
+        async fn delete_collection(&self, collection: &str) -> SFResult<()> {
+            self.inner.delete_collection(collection).await
+        }
+        async fn insert(
+            &self,
+            collection: &str,
+            vectors: Vec<Vec<f32>>,
+            metadata: Vec<serde_json::Value>,
+        ) -> SFResult<Vec<String>> {
+            self.inner.insert(collection, vectors, metadata).await
+        }
+        async fn insert_sparse(
+            &self,
+            collection: &str,
+            sparse: Vec<cog_core::contract::storage::SparseEmbedding>,
+            metadata: Vec<serde_json::Value>,
+        ) -> SFResult<Vec<String>> {
+            self.inner.insert_sparse(collection, sparse, metadata).await
+        }
+        async fn search(
+            &self,
+            collection: &str,
+            vector: &[f32],
+            top_k: usize,
+        ) -> SFResult<Vec<cog_core::contract::storage::VectorSearchResult>> {
+            self.inner.search(collection, vector, top_k).await
+        }
+        async fn delete(&self, collection: &str, ids: &[String]) -> SFResult<()> {
+            self.inner.delete(collection, ids).await
+        }
+        async fn collection_exists(&self, collection: &str) -> SFResult<bool> {
+            self.inner.collection_exists(collection).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_create_that_times_out_is_retried_before_startup_fails() {
+        let store = Arc::new(DurableStubStore::new());
+        store.upsert(&entry("s1")).await.unwrap();
+        let vector = Arc::new(SlowCreate::failing(2));
+        let backend = VectorSummaryBackend::new(vector.clone(), 4).with_store(store);
+
+        backend.load().await.expect("the third attempt succeeds");
+
+        assert_eq!(vector.attempts(), 3, "each failed create is retried once");
+        let hits = backend
+            .search_summary("default", &[1.0, 0.0, 0.0, 0.0], 10, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "the rebuilt index still holds the entry");
+    }
+
+    /// Retries are bounded: a collection that cannot be created at all still
+    /// reports the failure rather than starting with a silently empty index.
+    #[tokio::test]
+    async fn a_create_that_keeps_failing_gives_up_after_the_bound() {
+        let store = Arc::new(DurableStubStore::new());
+        let vector = Arc::new(SlowCreate::failing(usize::MAX));
+        let backend = VectorSummaryBackend::new(vector.clone(), 4).with_store(store);
+
+        let err = backend.load().await.expect_err("the failure is reported");
+        assert!(
+            err.to_string().contains("Timeout expired"),
+            "the last error survives the retries: {err}"
+        );
+        assert_eq!(vector.attempts() as u32, CREATE_COLLECTION_ATTEMPTS);
     }
 }
