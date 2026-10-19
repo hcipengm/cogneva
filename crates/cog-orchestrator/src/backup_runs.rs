@@ -613,7 +613,13 @@ mod tests {
         excluded: BTreeSet<String>,
     }
 
-    /// Every value one expression's `readout` selectors name.
+    /// The series the account publishes its values on. The observed-timestamp
+    /// companion next to it is part of the same family and carries the same
+    /// selectors, so a name match is a family match.
+    const ACCOUNT_SERIES: &str = "cogneva_backup_run_readings";
+
+    /// Every value one expression's `readout` selectors name, on the account's
+    /// own series.
     ///
     /// Both halves of the ledger check run on this, and neither can use a bare
     /// substring: `readout="kept"` is only the simplest form of the selector. An
@@ -622,12 +628,49 @@ mod tests {
     /// already reads it. A negation names everything except its operand, which is
     /// a different claim from selecting, so the two are reported apart.
     ///
+    /// Only the selector blocks attached to the account's series count. The
+    /// label name is not unique to this account -- the policy store publishes
+    /// its own readings under `readout` too -- and a rule about another series
+    /// is not a reader of this one, nor does its value have to appear in this
+    /// account's roster. Reading every mention in every rule made the second
+    /// flat for a rule that never selects the account.
+    ///
     /// Alternatives have to be literal names: the roster is a closed set, so
     /// enumerating costs nothing, and a selector this cannot enumerate is one it
     /// cannot check in either direction.
     fn readout_selectors(promql: &str) -> ReadoutSelectors {
         let mut selectors = ReadoutSelectors::default();
+        for block in account_selector_blocks(promql) {
+            collect_readout_selectors(block, promql, &mut selectors);
+        }
+        selectors
+    }
+
+    /// The brace blocks attached to the account's series in one expression.
+    ///
+    /// The name is followed by the rest of its identifier (`_observed_...`),
+    /// then by the selector; anything between the two means this occurrence is
+    /// not a selector and is skipped rather than read across.
+    fn account_selector_blocks(promql: &str) -> Vec<&str> {
+        let mut blocks = Vec::new();
         let mut rest = promql;
+        while let Some(at) = rest.find(ACCOUNT_SERIES) {
+            rest = &rest[at + ACCOUNT_SERIES.len()..];
+            let tail = rest.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
+            let Some(after) = tail.strip_prefix('{') else {
+                continue;
+            };
+            let Some(end) = after.find('}') else {
+                continue;
+            };
+            blocks.push(&after[..end]);
+        }
+        blocks
+    }
+
+    /// Read one selector block's `readout` selectors into `selectors`.
+    fn collect_readout_selectors(block: &str, promql: &str, selectors: &mut ReadoutSelectors) {
+        let mut rest = block;
         while let Some(at) = rest.find("readout") {
             rest = &rest[at + "readout".len()..];
             let trimmed = rest.trim_start();
@@ -672,7 +715,6 @@ mod tests {
                 }
             }
         }
-        selectors
     }
 
     /// The shipped rules whose expression names this value, by selecting it or by
@@ -797,6 +839,33 @@ mod tests {
             read > 0,
             "no rule reads the backup account at all -- either the rules moved, or the selectors \
              are spelled a way this check no longer recognises"
+        );
+    }
+
+    /// The label name is shared: a `readout` selector on another series says
+    /// nothing about this account, and its value has no reason to be published
+    /// here.
+    #[test]
+    fn a_readout_selector_on_another_series_is_not_a_reader_of_this_account() {
+        let foreign = "count(cogneva_policy_store_readings{readout=\"data_dir\"} and \
+             ((time() - cogneva_policy_store_readings_observed_timestamp_seconds\
+             {readout=\"data_dir\"}) < 1800)) > bool count(cogneva_policy_store_readings\
+             {readout=\"active_version\"})";
+        let selectors = readout_selectors(foreign);
+        assert!(
+            selectors.selected.is_empty() && selectors.excluded.is_empty(),
+            "a rule about another series was read as a reader of this account: {selectors:?}",
+            selectors = (selectors.selected, selectors.excluded)
+        );
+
+        let account = "max(cogneva_backup_run_readings{readout=\"runs_ok\"} and \
+             ((time() - cogneva_backup_run_readings_observed_timestamp_seconds\
+             {readout=\"runs_ok\"}) < 1800))";
+        let selectors = readout_selectors(account);
+        assert_eq!(
+            selectors.selected,
+            BTreeSet::from(["runs_ok".to_string()]),
+            "the account's own selector still has to be read"
         );
     }
 }
