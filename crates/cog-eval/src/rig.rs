@@ -29,6 +29,10 @@ use crate::subset::CaseSubset;
 /// 同一个变量。各写一份拼写，就会有两份能互相不一致的说法。
 pub const DATA_ROOT_ENV: &str = "COG_EVAL_DATA_ROOT";
 
+/// 跳过的原因之一：这一跑的骨干看不见图。写死成常量，因为报表与测试都要逐字比它。
+pub const SKIP_NEEDS_VISION: &str =
+    "the backbone cannot see images, so the case would be a blind guess";
+
 /// 一次实验的配置。
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -65,6 +69,13 @@ pub struct RunConfig {
     /// 与「没人看过宿主」——所以报表在闸门缺席时会明说这一次没有闸门。闸门自己的下界上界在
     /// 它自己的配置里。
     pub admission: Option<Arc<cog_core::admission::Admission>>,
+    /// 这一跑的骨干能不能看图。`false` ＝ 带图的题**不跑**，记进 `skipped`，不进分母。
+    ///
+    /// 为什么不是「照跑、算没过」：模型看不到图时，判 false 记的是「题面被摘掉了」，不是
+    /// 「模型答不对」——两者在 `resolved` 那一列同形，而前者根本不是这一行的读数。也不能
+    /// 把 base64 塞进题面顶上：那不是喂图，是把一段模型读不了的字节每一步重发一次
+    /// （2026-10-19 实测，七道带图题吃掉整张表 91.5% 的 token）。
+    pub vision: bool,
 }
 
 /// 检查点的落点与它的身份。
@@ -320,6 +331,9 @@ impl RunConfig {
             subset: None,
             checkpoint: None,
             admission: None,
+            // 默认看不见图：今天组合根上没有任何一条把题面里的图交给模型的路径，默认成
+            // `true` 就等于替一台跑不了的机器声明它能跑。
+            vision: false,
         }
     }
 
@@ -378,6 +392,16 @@ pub struct SeedScore {
     /// 恰好是这一列要分开的。
     #[serde(default)]
     pub requests_unmeasured: usize,
+    /// 没跑的题数：这一跑的骨干不具备它们要的能力。**不进分母**，也不按没过计。
+    ///
+    /// 与 `errored` 分开：出错是「本来该跑」，跳过是「本来就不该在这一臂里跑」。把跳过
+    /// 算成 0 分会让这一格的分数取决于「这台能不能看图」，那是拿一个与能力无关的环境事实
+    /// 改分数。
+    #[serde(default)]
+    pub skipped: usize,
+    /// 跳过的题与原因（case id → 为什么）。表尾与逐格两处都要能说出跳过了什么。
+    #[serde(default)]
+    pub skipped_cases: Vec<(String, String)>,
     pub duration_ms: u64,
 }
 
@@ -732,8 +756,14 @@ impl Rig {
         // 上一次跑过的例：不建环境、不调上游、不判分——它那一格已经定了，重跑只会把
         // 一个非确定的读数换成另一个。
         let mut resumed: Vec<CaseOutcome> = Vec::new();
+        // 这一跑跑不了的题：不建环境、不问上游、不进分母，但在表上点名。
+        let mut skipped: Vec<(String, String)> = Vec::new();
 
         for case in cases {
+            if case.needs_vision() && !self.config.vision {
+                skipped.push((case.id.clone(), SKIP_NEEDS_VISION.to_string()));
+                continue;
+            }
             if let Some(log) = &log {
                 if let Some(prior) = log.get(&bench.name, scaffold.name(), seed, &case.id) {
                     resumed.push(prior);
@@ -857,7 +887,9 @@ impl Rig {
         let mut score = SeedScore {
             seed,
             resolved: 0,
-            total: cases.len(),
+            // 分母是**跑得动的**那些题：跳过的题不进分母，所以这个数与 `cases.len()`
+            // 之差恰是 `skipped`，两处读得出同一件事。
+            total: cases.len() - skipped.len(),
             errored: 0,
             failures: Vec::new(),
             resumed: resumed.len(),
@@ -865,6 +897,8 @@ impl Rig {
             steps: 0,
             requests: 0,
             requests_unmeasured: 0,
+            skipped: skipped.len(),
+            skipped_cases: skipped,
             duration_ms: 0,
         };
         // 接回来的那些先记：它们和刚跑完的那些走同一套计数，所以「这格的分数是三次
@@ -1202,6 +1236,7 @@ mod tests {
                 subset: None,
                 checkpoint: None,
                 admission: None,
+                vision: false,
             },
         )
     }
@@ -1224,8 +1259,61 @@ mod tests {
                 subset: Some(subset),
                 checkpoint: None,
                 admission: None,
+                vision: false,
             },
         )
+    }
+
+    /// 带图的题在没有视觉骨干的那一臂里**不跑**：不进分母、不问模型，但要点名。
+    ///
+    /// 照跑会得到什么，2026-10-19 量过：模型看不见图，判词记的是「题面被摘掉了」，
+    /// 而 base64 塞进题面又让每一步都重发它——七道题吃掉整张表 91.5% 的 token。
+    #[tokio::test]
+    async fn a_case_that_needs_vision_is_skipped_rather_than_answered_blind() {
+        let mut with_image = cases();
+        let mut image = with_image[0].clone();
+        image.id = "img".into();
+        image.name = "img".into();
+        image
+            .metadata
+            .insert(crate::dataset::METADATA_HAS_IMAGE.into(), "true".into());
+        with_image.push(image);
+
+        let run = |vision: bool| {
+            let cases = with_image.clone();
+            async move {
+                Rig::new(
+                    Arc::new(NeverCalled),
+                    RunConfig {
+                        data_root: "/nonexistent".into(),
+                        seeds: vec![0],
+                        max_concurrency: Some(1),
+                        subset: None,
+                        checkpoint: None,
+                        admission: None,
+                        vision,
+                    },
+                )
+                .with_scaffold(Arc::new(AlwaysRight))
+                .run(&[bench_named("hle", cases, Arc::new(OkEnv))])
+                .await
+                .unwrap()
+            }
+        };
+
+        let blind = run(false).await;
+        let cell = blind.cell("always-right", "hle").unwrap();
+        let seed = &cell.per_seed[0];
+        assert_eq!(seed.skipped, 1, "带图的那一题被点名跳过");
+        assert_eq!(seed.total, 2, "跳过的题不进分母");
+        assert_eq!(seed.resolved, 2, "其余两题照跑");
+        assert_eq!(seed.skipped_cases[0].0, "img");
+        assert!(seed.skipped_cases[0].1.contains("cannot see images"));
+
+        let seeing = run(true).await;
+        let seed = &seeing.cell("always-right", "hle").unwrap().per_seed[0];
+        assert_eq!(seed.skipped, 0, "看得见图就照跑");
+        assert_eq!(seed.total, 3);
     }
 
     /// 子集跑的是子集：分母跟着子集走，不是基准的题数。
@@ -1468,6 +1556,7 @@ mod tests {
                 subset: None,
                 checkpoint: Some(cp),
                 admission: None,
+                vision: false,
             },
         )
     }
@@ -1552,6 +1641,7 @@ mod tests {
                 subset: None,
                 checkpoint: None,
                 admission,
+                vision: false,
             },
         )
         .with_scaffold(Arc::new(AlwaysRight))
@@ -1797,6 +1887,7 @@ mod tests {
                 subset: None,
                 checkpoint: Some(checkpoint_at(&path, "run-1")),
                 admission: None,
+                vision: false,
             },
         );
         rig.with_scaffold(Arc::new(AsksTwice))

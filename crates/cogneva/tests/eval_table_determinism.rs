@@ -296,7 +296,7 @@ async fn two_runs_over_one_data_root_produce_the_same_bytes() {
     assert!(
         first
             .text
-            .contains("cell\thle\tgepa\tseed=0\tresolved=2\ttotal=2\terrored=0\t"),
+            .contains("cell\thle\tgepa\tseed=0\tresolved=2\ttotal=2\tskipped=0\terrored=0\t"),
         "{}",
         first.text
     );
@@ -327,7 +327,7 @@ async fn the_platform_port_is_what_the_nql_row_runs() {
     // 诊断臂不发表体，但逐格读数在：两题都经平台端口跑通、都判过。
     assert!(
         out.text
-            .contains("cell\thle\tnql\tseed=0\tresolved=2\ttotal=2\terrored=0\t"),
+            .contains("cell\thle\tnql\tseed=0\tresolved=2\ttotal=2\tskipped=0\terrored=0\t"),
         "{}",
         out.text
     );
@@ -358,7 +358,7 @@ async fn a_missing_platform_is_an_error_not_a_zero_score() {
     // 逐格读数上要能看见是被谁挡的，名字能回到 `## wiring` 那一行。
     assert!(
         out.text.contains(
-            "cell\thle\tnql\tseed=0\tresolved=0\ttotal=2\terrored=0\tblocked=2\tblocked-by=nql\t"
+            "cell\thle\tnql\tseed=0\tresolved=0\ttotal=2\tskipped=0\terrored=0\tblocked=2\tblocked-by=nql\t"
         ),
         "{}",
         out.text
@@ -403,7 +403,7 @@ async fn a_declared_absence_blocks_only_the_row_it_names() {
     assert_eq!(out.errored, 0, "{}", out.text);
     assert!(
         out.text.contains(
-            "cell\thle\tnql\tseed=0\tresolved=0\ttotal=2\terrored=0\tblocked=2\tblocked-by=nql\t"
+            "cell\thle\tnql\tseed=0\tresolved=0\ttotal=2\tskipped=0\terrored=0\tblocked=2\tblocked-by=nql\t"
         ),
         "{}",
         out.text
@@ -411,14 +411,15 @@ async fn a_declared_absence_blocks_only_the_row_it_names() {
     // gepa 那一行不靠平台，一格一题都不许被这条声明碰到。
     assert!(
         out.text.contains(
-            "cell\thle\tgepa\tseed=0\tresolved=2\ttotal=2\terrored=0\tblocked=0\tblocked-by=-\t"
+            "cell\thle\tgepa\tseed=0\tresolved=2\ttotal=2\tskipped=0\terrored=0\tblocked=0\tblocked-by=-\t"
         ),
         "{}",
         out.text
     );
     assert!(
-        !out.text
-            .contains("cell\thle\tgepa\tseed=0\tresolved=2\ttotal=2\terrored=0\tblocked=2"),
+        !out.text.contains(
+            "cell\thle\tgepa\tseed=0\tresolved=2\ttotal=2\tskipped=0\terrored=0\tblocked=2"
+        ),
         "声明盖到了没被点名的行：{}",
         out.text
     );
@@ -448,7 +449,7 @@ async fn an_undeclared_failure_is_errored_and_the_run_wide_absence_covers_nothin
     assert_eq!(out.errored, 6, "{}", out.text);
     assert!(
         out.text.contains(
-            "cell\thle\tnql\tseed=0\tresolved=0\ttotal=2\terrored=2\tblocked=0\tblocked-by=-\t"
+            "cell\thle\tnql\tseed=0\tresolved=0\ttotal=2\tskipped=0\terrored=2\tblocked=0\tblocked-by=-\t"
         ),
         "{}",
         out.text
@@ -470,7 +471,7 @@ async fn a_subset_run_scores_the_archived_cases_and_names_the_archive() {
     // 两题的夹具里只跑一道：分母跟着存档走，不是基准的题数。
     assert!(
         out.text
-            .contains("cell\thle\tgepa\tseed=0\tresolved=1\ttotal=1\terrored=0\t"),
+            .contains("cell\thle\tgepa\tseed=0\tresolved=1\ttotal=1\tskipped=0\terrored=0\t"),
         "{}",
         out.text
     );

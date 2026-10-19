@@ -62,7 +62,7 @@ const FAILURE_SAMPLE: usize = 3;
 
 pub const USAGE: &str = "\
 usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <model>@<version>
-                          [--tools <none|platform>] [--data-root <dir>]
+                          [--tools <none|platform>] [--vision <none|native>] [--data-root <dir>]
                           [--benchmarks hle,swe-bench-pro,toolathlon]
                           [--scaffolds codeact,gepa,agentflow,nql[,<declared flow>]] [--seeds 0,1,2]
                           [--subset <file>] [--out <file>]
@@ -76,6 +76,10 @@ usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <mo
                main table is run on. `none` is a diagnostic arm only: its numbers print but
                are not table rows, because a run on a different tool face is not the same
                experiment as the rows it would sit beside.
+  --vision     whether this run's backbone can see images. Defaults to `none`: a case whose
+               question carries an image is then skipped rather than answered blind, because a
+               verdict on a question the model cannot see records the missing input, not the
+               answer. Skipped cases are counted in `skipped` and stay out of the denominator.
   --backbone   the model every scaffold drives, as name@version. The name has to be one the
                configured routing serves -- a pin that names a model nobody configured is a
                label, not a pin.
@@ -188,6 +192,40 @@ impl ToolArm {
     }
 }
 
+/// 骨干能不能看图。
+///
+/// 这是一条**能力声明**，不是旋钮：声明 `native` 却没有任何一条把题面里的图交给模型的
+/// 路径，跑出来的就是「模型对着看不见的题瞎猜」，而它在 `resolved` 那一列与「答错了」
+/// 同形。所以默认 `none`，并且它进 run 的 material——换了能力，两次跑的就不是同一件事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionArm {
+    /// 看不见图：带图的题不跑，计入 `skipped`，不进分母。
+    None,
+    /// 看得见图：带图的题照跑。
+    Native,
+}
+
+impl VisionArm {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "none" => Ok(Self::None),
+            "native" => Ok(Self::Native),
+            other => Err(format!("--vision wants `none` or `native`, got `{other}`")),
+        }
+    }
+
+    fn render(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Native => "native",
+        }
+    }
+
+    fn can_see(self) -> bool {
+        matches!(self, Self::Native)
+    }
+}
+
 /// 解析好的一次运行的参数。
 #[derive(Debug, Clone)]
 pub struct EvalTableArgs {
@@ -221,6 +259,8 @@ pub struct EvalTableArgs {
     pub admission_ceiling_unmeasured: Option<usize>,
     pub pins: PathBuf,
     pub tools: ToolArm,
+    /// 骨干能不能看图；`None` 是今天唯一能跑的那一臂。
+    pub vision: VisionArm,
     pub backbone: ModelPin,
     pub judge: ModelPin,
     pub out: Option<PathBuf>,
@@ -310,6 +350,7 @@ impl EvalTableArgs {
     pub fn parse_with(args: &[String], declared_scaffolds: &[String]) -> Result<Self, String> {
         let mut data_root = None;
         let mut tool_arm = None;
+        let mut vision_arm = None;
         let mut pins = None;
         let mut backbone = None;
         let mut judge = None;
@@ -341,6 +382,10 @@ impl EvalTableArgs {
                 }
                 "--tools" => {
                     tool_arm = Some(ToolArm::parse(next_arg(args, i, flag)?)?);
+                    i += 2;
+                }
+                "--vision" => {
+                    vision_arm = Some(VisionArm::parse(next_arg(args, i, flag)?)?);
                     i += 2;
                 }
                 "--backbone" => {
@@ -458,6 +503,7 @@ impl EvalTableArgs {
             // 工具臂默认 `platform`：那是主表要跑的那一臂。`none` 要显式写出，好让
             // 「这次跑的是一臂诊断」在命令行上就被点明，而不是默认落进去。
             tools: tool_arm.unwrap_or(ToolArm::Platform),
+            vision: vision_arm.unwrap_or(VisionArm::None),
             backbone: backbone.ok_or("--backbone <model>@<version> is required")?,
             judge: judge.ok_or("--judge <model>@<version> is required")?,
             admission_dir,
@@ -848,6 +894,7 @@ fn run_checkpoint(
         args.judge.model, args.judge.version
     ));
     material.push_str(&format!("tools\t{}\n", args.tools.render()));
+    material.push_str(&format!("vision\t{}\n", args.vision.render()));
     material.push_str(&format!("benchmarks\t{}\n", args.benchmarks.join(",")));
     material.push_str(&format!("scaffolds\t{}\n", args.scaffolds.join(",")));
     material.push_str(&format!("seeds\t{:?}\n", args.seeds));
@@ -1224,6 +1271,7 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
             subset: subset.clone(),
             checkpoint: Some(checkpoint.clone()),
             admission: admission.clone(),
+            vision: args.vision.can_see(),
         },
     );
     for scaffold in table_scaffolds(platform) {
@@ -1426,6 +1474,15 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
     out.push_str(&format!("backbone\t{}\n", args.backbone.render()));
     out.push_str(&format!("judge\t{}\n", args.judge.render()));
     out.push_str(&format!("tools\t{}\n", args.tools.render()));
+    out.push_str(&format!("vision\t{}\n", args.vision.render()));
+    // 看不见图的那一臂要说清它跳过了什么：分母是「跑得动的题」，不是「基准里的题」。
+    if !args.vision.can_see() {
+        out.push_str(
+            "vision-skip\tcases whose question carries an image are not run: the backbone \
+             cannot see them, so their verdict would record a missing input rather than the \
+             model's answer. They do not enter the denominator; `skipped` counts them.\n",
+        );
+    }
     // 诊断臂要把自己的身份写在 pins 段里，紧挨着它标注的那一行：读的人从这一行就能
     // 看出下面的数字为什么不是表行，不用去猜 `tools none` 意味着什么。
     if !args.tools.is_table_arm() {
@@ -1675,10 +1732,11 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
                 // 与这一轮跑出来的不是同一个条件。归零（没有检查点或全新一次跑）就是
                 // 这一格全是这一轮的读数。
                 out.push_str(&format!(
-                    "cell\t{col}\t{row}\tseed={}\tresolved={}\ttotal={}\terrored={}\tblocked={}\tblocked-by={}\tresumed={}\ttokens={}\tsteps={}\trequests={}\trequests-unmeasured={}\n",
+                    "cell\t{col}\t{row}\tseed={}\tresolved={}\ttotal={}\tskipped={}\terrored={}\tblocked={}\tblocked-by={}\tresumed={}\ttokens={}\tsteps={}\trequests={}\trequests-unmeasured={}\n",
                     seed.seed,
                     seed.resolved,
                     seed.total,
+                    seed.skipped,
                     errored,
                     blocked,
                     blocked_by,
@@ -1718,6 +1776,40 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
                     ));
                 }
             }
+        }
+    }
+
+    // 跳过只印个数，读的人点不出是谁：同一格 `skipped=7` 既可能是「该跳的那七道带图题」，
+    // 也可能是「数据集换了七道」。按题目 id 点出来，才能拿它跟数据集一条条对。同一道题在
+    // 两列表、三个种子里被跳，合成一行点数（`scaffolds=` / `seeds=`），因为原因只有一条。
+    let mut skipped: std::collections::BTreeMap<
+        (String, String),
+        (
+            std::collections::BTreeSet<String>,
+            std::collections::BTreeSet<u64>,
+            String,
+        ),
+    > = std::collections::BTreeMap::new();
+    for cell in &table.cells {
+        for seed in &cell.per_seed {
+            for (case, reason) in &seed.skipped_cases {
+                let entry = skipped
+                    .entry((cell.benchmark.clone(), case.clone()))
+                    .or_insert_with(|| (Default::default(), Default::default(), String::new()));
+                entry.0.insert(cell.scaffold.clone());
+                entry.1.insert(seed.seed);
+                entry.2 = reason.clone();
+            }
+        }
+    }
+    if !skipped.is_empty() {
+        out.push_str("\n## skipped\n");
+        for ((benchmark, case), (scaffolds, seeds, reason)) in &skipped {
+            out.push_str(&format!(
+                "skipped\t{benchmark}\t{case}\tscaffolds={}\tseeds={}\t{reason}\n",
+                scaffolds.len(),
+                seeds.len()
+            ));
         }
     }
 
@@ -3046,6 +3138,8 @@ mod tests {
                 steps: 0,
                 requests: 0,
                 requests_unmeasured: 0,
+                skipped: 0,
+                skipped_cases: vec![],
                 duration_ms: 0,
             }],
         };
@@ -3145,13 +3239,13 @@ mod tests {
         // 正向：被点名的三格。
         assert!(
             text.contains(
-                "cell\thle\tnql\tseed=0\tresolved=0\ttotal=40\terrored=0\tblocked=40\tblocked-by=nql\t"
+                "cell\thle\tnql\tseed=0\tresolved=0\ttotal=40\tskipped=0\terrored=0\tblocked=40\tblocked-by=nql\t"
             ),
             "{text}"
         );
         assert!(
             text.contains(
-                "cell\tswe-bench-pro\tgepa\tseed=0\tresolved=0\ttotal=40\terrored=0\tblocked=40\tblocked-by=swe-bench-pro\t"
+                "cell\tswe-bench-pro\tgepa\tseed=0\tresolved=0\ttotal=40\tskipped=0\terrored=0\tblocked=40\tblocked-by=swe-bench-pro\t"
             ),
             "{text}"
         );
@@ -3160,7 +3254,7 @@ mod tests {
         // 反向：没人点名的那一格照印 `errored`。
         assert!(
             text.contains(
-                "cell\thle\tgepa\tseed=0\tresolved=0\ttotal=40\terrored=40\tblocked=0\tblocked-by=-\t"
+                "cell\thle\tgepa\tseed=0\tresolved=0\ttotal=40\tskipped=0\terrored=40\tblocked=0\tblocked-by=-\t"
             ),
             "{text}"
         );
@@ -3186,11 +3280,43 @@ mod tests {
         let text = render_with(&table, &[]);
         assert!(
             text.contains(
-                "cell\thle\tgepa\tseed=0\tresolved=0\ttotal=40\terrored=40\tblocked=0\t\
+                "cell\thle\tgepa\tseed=0\tresolved=0\ttotal=40\tskipped=0\terrored=40\tblocked=0\t\
                  blocked-by=-\tresumed=0\ttokens=0\tsteps=0\trequests=6\trequests-unmeasured=0\n"
             ),
             "{text}"
         );
+    }
+
+    /// 跳过的题要**点名**，不能只报个数：同一个 `skipped=7` 既可能是该跳的那七道，也可能是
+    /// 数据集换了七道，只有 id 能拿回去跟语料一条条对。
+    #[test]
+    fn a_skipped_case_is_named_so_the_reader_can_check_it_against_the_dataset() {
+        let mut table = table_with_cells();
+        for scaffold in ["gepa", "nql"] {
+            let cell = table
+                .cells
+                .iter_mut()
+                .find(|c| c.benchmark == "hle" && c.scaffold == scaffold)
+                .expect("the fixture has this cell");
+            cell.per_seed[0].skipped = 1;
+            cell.per_seed[0].skipped_cases = vec![(
+                "hle-673526bb".to_string(),
+                cog_eval::rig::SKIP_NEEDS_VISION.to_string(),
+            )];
+        }
+
+        let text = render_with(&table, &[]);
+        // 两列都跳了这道题，但只有一个种子：两个数各说一件事。
+        assert!(
+            text.contains("skipped\thle\thle-673526bb\tscaffolds=2\tseeds=1\t"),
+            "{text}"
+        );
+        assert!(
+            text.contains("blind guess"),
+            "the reason travels with the id: {text}"
+        );
+        // 没跳过的格不许凭空长出这一段里的一行。
+        assert!(!text.contains("skipped\tswe-bench-pro\t"), "{text}");
     }
 
     /// 没量到请求数不并进 0：旧记录接回来的题单独数，读的人才分得清「没量」与「问了零次」。
@@ -3228,7 +3354,7 @@ mod tests {
 
         assert!(
             text.contains(
-                "cell\thle\tgepa\tseed=0\tresolved=0\ttotal=40\terrored=40\tblocked=0\tblocked-by=-\t"
+                "cell\thle\tgepa\tseed=0\tresolved=0\ttotal=40\tskipped=0\terrored=40\tblocked=0\tblocked-by=-\t"
             ),
             "{text}"
         );
@@ -3277,7 +3403,7 @@ mod tests {
         assert!(text.contains("\nerrored\t0\tblocked\t160\n"), "{text}");
         assert!(
             text.contains(
-                "cell\thle\tgepa\tseed=0\tresolved=0\ttotal=40\terrored=0\tblocked=40\tblocked-by=backbone\t"
+                "cell\thle\tgepa\tseed=0\tresolved=0\ttotal=40\tskipped=0\terrored=0\tblocked=40\tblocked-by=backbone\t"
             ),
             "{text}"
         );

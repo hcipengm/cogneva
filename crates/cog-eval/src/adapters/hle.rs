@@ -54,8 +54,11 @@ confidence: The extracted confidence score between 0 and 100 from [response]. Pu
 ///
 /// 读文本而不是读 parquet，是因为 parquet 解码器（pyarrow 那样的 ~50 MiB wheel）
 /// 刻意不进仓库；由取数脚本在取数时把同一批行、同一顺序落成一行一条。
-/// 题面的图像以 parquet 本就带的 data URL 原样带在 `input.image` 上，
-/// 所以多模态外壳不需要旁挂文件；纯文本外壳读 `metadata.has_image` 自行取舍。
+/// 题面的图像以 parquet 本就带的 data URL 原样带在 `input.image` 上，所以将来接上媒体
+/// 通道时不需要旁挂文件。**今天没有一条路径把它交给模型**：外壳拿到的 `shell_view` 连
+/// `metadata` 都没有，而骨干是纯文本的。于是带图的题由评测台在跑之前按
+/// [`crate::dataset::METADATA_HAS_IMAGE`] 摘出去（记 `skipped`、不进分母），不留一条
+/// 「把 base64 当题面发出去」的路——那条路读起来像跑过了，实际是模型在读一段看不见的字节。
 pub struct HleCaseSource;
 
 #[derive(Debug, Deserialize)]
@@ -83,7 +86,10 @@ impl HleCaseSource {
             .unwrap_or(false);
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("answer_type".into(), row.answer_type.clone());
-        metadata.insert("has_image".into(), has_image.to_string());
+        metadata.insert(
+            crate::dataset::METADATA_HAS_IMAGE.into(),
+            has_image.to_string(),
+        );
         if let Some(v) = &row.category {
             metadata.insert("category".into(), v.clone());
         }

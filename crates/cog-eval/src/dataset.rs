@@ -21,7 +21,22 @@ pub struct EvalCase {
     pub metadata: HashMap<String, String>,
 }
 
+/// 题面带图的标记。基准自己写、评测台自己读：外壳拿不到 `metadata`（`shell_view` 把它
+/// 摘掉了），所以「这一题带图」只能由评测台判断，不能指望外壳自觉。
+pub const METADATA_HAS_IMAGE: &str = "has_image";
+
 impl EvalCase {
+    /// 这一题的题面带图，看完它需要能看图的骨干。
+    ///
+    /// 判据落在基准写下的标记上，不落在题面字符串里：一段 base64 的长相与「正文里提到
+    /// 了 data:」在字符串上不好分，而基准写这一位的时候是知道答案的。
+    pub fn needs_vision(&self) -> bool {
+        self.metadata
+            .get(METADATA_HAS_IMAGE)
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    }
+
     /// 交给外壳的那一份：题面与它的身份，别的都留在外面。
     ///
     /// 答案键（`expected_output`）、期望工具（`expected_tools`）、评测台起环境与判分用的
