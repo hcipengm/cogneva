@@ -7,10 +7,14 @@
 //! 外壳是注册进来的 `Arc<dyn AgentScaffold>`，加一行只加一个注册，这里一行不改。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use cog_core::LlmClient;
+use cog_core::{
+    AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, LlmClient, Message,
+    SFResult,
+};
 use tokio::sync::Semaphore;
 
 use crate::backoff::{BackoffLlm, BackoffReading, RefusalBackoff, ATTEMPTS_PER_MINUTE};
@@ -100,6 +104,13 @@ enum CheckpointLine {
         errored: bool,
         tokens: u64,
         steps: u64,
+        /// 这一例里外壳向上游问了几次。
+        ///
+        /// `tokens` 解释不了零值：usage 帧缺失、上游换了一个、答复本来就是空的，三种
+        /// 在表上都读作 0。请求次数是另一根轴，直接回答「这一例有没有问过模型」。
+        /// 旧记录没有这一格，读回来是 `None`——那是「当时没量」，不是「问了零次」。
+        #[serde(default)]
+        requests: Option<u64>,
     },
 }
 
@@ -182,6 +193,7 @@ impl CheckpointLog {
                         errored,
                         tokens,
                         steps,
+                        requests,
                     } => {
                         done.insert(
                             (benchmark, scaffold, seed, case_id.clone()),
@@ -191,6 +203,7 @@ impl CheckpointLog {
                                 errored,
                                 tokens,
                                 steps,
+                                requests,
                             },
                         );
                     }
@@ -353,6 +366,18 @@ pub struct SeedScore {
     pub resumed: usize,
     pub tokens: u64,
     pub steps: u64,
+    /// 这一格里外壳向上游问了几次，按题累加。
+    ///
+    /// `tokens` 与 `steps` 解释不了零值：usage 帧缺失、上游换了一个、答复本来就是空的，
+    /// 三种在表上都读作 0。这两个数直接回答「这些题到底问没问过模型」。
+    #[serde(default)]
+    pub requests: u64,
+    /// 这一格里有多少题**没量到**请求次数（从旧检查点接回来的、或环境/工具面就没建起来）。
+    ///
+    /// 单独数，不并进 `requests`：并进去就把「没量」读成「问了零次」，而这两件事
+    /// 恰好是这一列要分开的。
+    #[serde(default)]
+    pub requests_unmeasured: usize,
     pub duration_ms: u64,
 }
 
@@ -733,7 +758,11 @@ impl Rig {
             };
             let permit = Ticket { slot, gate };
             let case = case.clone();
-            let llm = self.llm.clone();
+            // 每例一个自己的计数器，不读共享的那个：同一列的例子是并发跑的，
+            // 前后取全局差值会把邻例的请求算进这一例。
+            let calls = Arc::new(AtomicU64::new(0));
+            let llm: Arc<dyn LlmClient> =
+                Arc::new(CountingLlm::new(self.llm.clone(), calls.clone()));
             let env_provider = bench.env.clone();
             let toolkit = bench.tools.clone();
             let judge = bench.judge.clone();
@@ -781,7 +810,9 @@ impl Rig {
                 // 交到外壳手上的只有题面：答案键与评测台的旋钮在 `shell_view` 里就没了，
                 // 判分读的仍是**原来那一份**。
                 let solved = scaffold.solve(&case.shell_view(), &ctx).await;
-                let outcome = match solved {
+                // 走到这里之后才把次数填上：上面每一个提前 `return` 都在问模型之前，
+                // 它们的 `None`（没走到）与这里的 `Some(0)`（问了零次）不是同一件事。
+                let mut outcome = match solved {
                     Err(e) => CaseOutcome::errored(&case, format!("scaffold failed: {e}")),
                     Ok(output) => match judge.judge(&case, &env, &output).await {
                         Ok(verdict) => CaseOutcome {
@@ -790,10 +821,12 @@ impl Rig {
                             errored: false,
                             tokens: output.tokens.total_tokens as u64,
                             steps: output.trace.len() as u64,
+                            requests: None,
                         },
                         Err(e) => CaseOutcome::errored(&case, format!("judge failed: {e}")),
                     },
                 };
+                outcome.requests = Some(calls.load(Ordering::Relaxed));
                 // 判分读完之后才回收：回收早了判分就没有现场了。
                 env.teardown().await;
                 // 落的只有**判分器给出判词**的那些。「起不来环境」「上游拒了」不进检查点：
@@ -810,6 +843,7 @@ impl Rig {
                             errored: false,
                             tokens: outcome.tokens,
                             steps: outcome.steps,
+                            requests: outcome.requests,
                         };
                         if let Err(e) = log.record(&line) {
                             tracing::warn!(case = %outcome.case_id, error = %e, "cannot append to the checkpoint: this case will be re-run next time");
@@ -829,6 +863,8 @@ impl Rig {
             resumed: resumed.len(),
             tokens: 0,
             steps: 0,
+            requests: 0,
+            requests_unmeasured: 0,
             duration_ms: 0,
         };
         // 接回来的那些先记：它们和刚跑完的那些走同一套计数，所以「这格的分数是三次
@@ -861,6 +897,9 @@ struct CaseOutcome {
     errored: bool,
     tokens: u64,
     steps: u64,
+    /// 外壳向上游问了几次。`None` ＝这一例没走到问模型那一步（环境/工具面就没建起来），
+    /// 或者它是从一份没记这一格的旧检查点接回来的。
+    requests: Option<u64>,
 }
 
 /// 把一题的结果记进它那一格的计数。接回来的与刚跑完的走同一条路：两处的规则只此一份，
@@ -868,6 +907,10 @@ struct CaseOutcome {
 fn fold(score: &mut SeedScore, outcome: &CaseOutcome) {
     score.tokens += outcome.tokens;
     score.steps += outcome.steps;
+    match outcome.requests {
+        Some(n) => score.requests += n,
+        None => score.requests_unmeasured += 1,
+    }
     if outcome.errored {
         score.errored += 1;
     }
@@ -889,7 +932,60 @@ impl CaseOutcome {
             errored: true,
             tokens: 0,
             steps: 0,
+            requests: None,
         }
+    }
+}
+
+/// 数一例里外壳向上游问了几次。
+///
+/// 包在**交给这一例外壳的那份客户端**上，而不是在 rig 里前后取全局差值：同一列的例子是
+/// 并发跑的，全局差值会把邻例的请求算进这一例。判分器的调用不经过这里——它问的是另一件事，
+/// 混进来会让「这一例问过模型几次」多算一次。
+struct CountingLlm {
+    inner: Arc<dyn LlmClient>,
+    calls: Arc<AtomicU64>,
+}
+
+impl CountingLlm {
+    fn new(inner: Arc<dyn LlmClient>, calls: Arc<AtomicU64>) -> Self {
+        Self { inner, calls }
+    }
+
+    /// 数的是**发出去的请求**，不是内容：外壳自己决定问几次、带什么，这里只记次数。
+    fn counted(&self) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmClient for CountingLlm {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        options: &ChatOptions,
+    ) -> SFResult<AssistantMessageEventStream> {
+        self.counted();
+        self.inner.chat_stream(messages, options).await
+    }
+
+    async fn complete_stream(
+        &self,
+        prompt: &str,
+        options: &CompleteOptions,
+    ) -> SFResult<AssistantMessageEventStream> {
+        self.counted();
+        self.inner.complete_stream(prompt, options).await
+    }
+
+    async fn chat(&self, messages: &[Message], options: &ChatOptions) -> SFResult<ChatResponse> {
+        self.counted();
+        self.inner.chat(messages, options).await
+    }
+
+    async fn health_check(&self) -> bool {
+        // 健康检查不是「问模型」：它存在的理由就是在不打扰上游的前提下问一句「在不在」。
+        self.inner.health_check().await
     }
 }
 
@@ -1637,6 +1733,118 @@ mod tests {
         assert!(lines[1].contains("\"case_id\":\"a\""), "{text}");
     }
 
+    /// 只回答的占位上游：只用来数「问了几次」，不提供任何有内容的东西。
+    struct Answering;
+
+    #[async_trait]
+    impl LlmClient for Answering {
+        async fn chat_stream(
+            &self,
+            _m: &[Message],
+            _o: &ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!("this fixture is only called through `chat`")
+        }
+        async fn complete_stream(
+            &self,
+            _p: &str,
+            _o: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!("this fixture is only called through `chat`")
+        }
+        async fn chat(&self, _m: &[Message], _o: &ChatOptions) -> SFResult<ChatResponse> {
+            Ok(ChatResponse::default())
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// 每一例问两次模型的壳。
+    struct AsksTwice;
+
+    #[async_trait]
+    impl AgentScaffold for AsksTwice {
+        fn name(&self) -> &str {
+            "asks-twice"
+        }
+        async fn solve(&self, _c: &EvalCase, ctx: &SolveContext) -> anyhow::Result<AgentOutput> {
+            for _ in 0..2 {
+                ctx.llm.chat(&[], &ChatOptions::default()).await?;
+            }
+            Ok(AgentOutput {
+                final_answer: "ok".into(),
+                trace: vec![],
+                tokens: Default::default(),
+                finish: FinishReason::Answered,
+            })
+        }
+    }
+
+    /// 零令牌解释不了自己：这一例到底问没问过模型，得有一条直接读数。
+    /// 记的是这一例**自己**的请求数，不是整跑的差值——同一列的例子并发跑，
+    /// 差值会把邻例的请求算进来。
+    #[tokio::test]
+    async fn a_case_records_how_many_times_it_asked_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.cases.jsonl");
+        let rig = Rig::new(
+            Arc::new(Answering),
+            RunConfig {
+                data_root: "/nonexistent".into(),
+                seeds: vec![7],
+                max_concurrency: Some(4),
+                subset: None,
+                checkpoint: Some(checkpoint_at(&path, "run-1")),
+                admission: None,
+            },
+        );
+        rig.with_scaffold(Arc::new(AsksTwice))
+            .run(&[bench("hle", Arc::new(OkEnv))])
+            .await
+            .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "头一行 ＋ 两题：{text}");
+        for line in &lines[1..] {
+            let parsed: CheckpointLine = serde_json::from_str(line).unwrap();
+            match parsed {
+                CheckpointLine::Case { requests, .. } => {
+                    assert_eq!(requests, Some(2), "这一例问过两次，检查点要记下来：{line}")
+                }
+                _ => panic!("expected a case line, got {line}"),
+            }
+        }
+    }
+
+    /// 旧记录里没有这一格：读回来是「当时没量」，不是「问了零次」。
+    #[tokio::test]
+    async fn a_record_from_before_the_request_count_reads_as_unmeasured_not_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.cases.jsonl");
+        let mut text = serde_json::to_string(&CheckpointLine::Header {
+            run_id: "run-1".into(),
+        })
+        .unwrap();
+        text.push('\n');
+        // 这一行是按旧形状手写的：没有 `requests` 字段。
+        text.push_str(
+            "{\"kind\":\"case\",\"benchmark\":\"hle\",\"scaffold\":\"always-right\",\
+             \"seed\":7,\"case_id\":\"a\",\"verdict\":{\"resolved\":true,\"detail\":\"ok\"},\
+             \"errored\":false,\"tokens\":0,\"steps\":0}",
+        );
+        text.push('\n');
+        std::fs::write(&path, text).unwrap();
+
+        let log = CheckpointLog::open(&checkpoint_at(&path, "run-1")).unwrap();
+        let prior = log.get("hle", "always-right", 7, "a").unwrap();
+        assert_eq!(
+            prior.requests, None,
+            "旧记录没量过请求数，不能读成量到了 0 次"
+        );
+    }
+
     /// 崩在追加中途留下的半行：丢掉它、接着用，不是把整份记录作废。
     #[tokio::test]
     async fn a_checkpoint_cut_off_mid_line_loses_only_that_case() {
@@ -1657,6 +1865,7 @@ mod tests {
                 errored: false,
                 tokens: 0,
                 steps: 0,
+                requests: None,
             })
             .unwrap(),
         );

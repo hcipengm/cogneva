@@ -1670,7 +1670,7 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
                 // 与这一轮跑出来的不是同一个条件。归零（没有检查点或全新一次跑）就是
                 // 这一格全是这一轮的读数。
                 out.push_str(&format!(
-                    "cell\t{col}\t{row}\tseed={}\tresolved={}\ttotal={}\terrored={}\tblocked={}\tblocked-by={}\tresumed={}\ttokens={}\tsteps={}\n",
+                    "cell\t{col}\t{row}\tseed={}\tresolved={}\ttotal={}\terrored={}\tblocked={}\tblocked-by={}\tresumed={}\ttokens={}\tsteps={}\trequests={}\trequests-unmeasured={}\n",
                     seed.seed,
                     seed.resolved,
                     seed.total,
@@ -1679,7 +1679,9 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
                     blocked_by,
                     seed.resumed,
                     seed.tokens,
-                    seed.steps
+                    seed.steps,
+                    seed.requests,
+                    seed.requests_unmeasured
                 ));
             }
         }
@@ -3037,6 +3039,8 @@ mod tests {
                 resumed: 0,
                 tokens: 0,
                 steps: 0,
+                requests: 0,
+                requests_unmeasured: 0,
                 duration_ms: 0,
             }],
         };
@@ -3157,6 +3161,50 @@ mod tests {
         );
         // 尾数两个一起出，且与逐格的和对得上。
         assert!(text.contains("\nerrored\t40\tblocked\t120\n"), "{text}");
+    }
+
+    /// `tokens=0` 与 `requests=0` 是两件事：前者说上游没把用量交上来，后者说这一例
+    /// 根本没问过模型。两个数并排，零令牌才查得下去（`tokens=0 requests=6` 是前一种）。
+    #[test]
+    fn a_zero_token_cell_still_says_how_many_times_the_model_was_asked() {
+        let mut table = table_with_cells();
+        let cell = table
+            .cells
+            .iter_mut()
+            .find(|c| c.benchmark == "hle" && c.scaffold == "gepa")
+            .expect("the fixture has this cell");
+        cell.per_seed[0].tokens = 0;
+        cell.per_seed[0].steps = 0;
+        cell.per_seed[0].requests = 6;
+        cell.per_seed[0].requests_unmeasured = 0;
+
+        let text = render_with(&table, &[]);
+        assert!(
+            text.contains(
+                "cell\thle\tgepa\tseed=0\tresolved=0\ttotal=40\terrored=40\tblocked=0\t\
+                 blocked-by=-\tresumed=0\ttokens=0\tsteps=0\trequests=6\trequests-unmeasured=0\n"
+            ),
+            "{text}"
+        );
+    }
+
+    /// 没量到请求数不并进 0：旧记录接回来的题单独数，读的人才分得清「没量」与「问了零次」。
+    #[test]
+    fn an_unmeasured_request_count_is_printed_beside_zero_and_never_folded_into_it() {
+        let mut table = table_with_cells();
+        let cell = table
+            .cells
+            .iter_mut()
+            .find(|c| c.benchmark == "hle" && c.scaffold == "nql")
+            .expect("the fixture has this cell");
+        cell.per_seed[0].requests = 0;
+        cell.per_seed[0].requests_unmeasured = 40;
+
+        let text = render_with(&table, &[]);
+        assert!(
+            text.contains("tokens=0\tsteps=0\trequests=0\trequests-unmeasured=40\n"),
+            "{text}"
+        );
     }
 
     /// 整次跑那一类的声明**一个格子都不盖**。
