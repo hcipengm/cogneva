@@ -4873,8 +4873,13 @@ impl MainlineDeployer {
                 // `ADVANCE_CLAIM_AFTER_DEFERRALS`）。认领过没有也要落盘：结局里的
                 // `reserved` 是"换手请求发出去过没有"的唯一记录。
                 if state.advance_deferrals >= ADVANCE_CLAIM_AFTER_DEFERRALS {
-                    crate::build_gate::reserve_build_field("mainline advance");
-                    state.advance_wait_reserved = true;
+                    // 只有请求真的写进构建门才算数：另一个工作先认领时，这一轮
+                    // 什么都没写下来，记成「已认领」会让读数说这个等待者有一个
+                    // 它从没有过的名额（2026-10-19 16:09 实测：state 写着
+                    // reserved=true，而 builds.reserve 是 `host build`）。
+                    if crate::build_gate::reserve_build_field("mainline advance") {
+                        state.advance_wait_reserved = true;
+                    }
                 }
                 self.save_state(&state)?;
                 // 发出去的值就是刚落到盘上的那个：盘上是 3、指标上还是上一拍的 2，

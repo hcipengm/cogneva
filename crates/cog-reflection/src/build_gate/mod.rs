@@ -1082,9 +1082,10 @@ fn asker_label(index: usize) -> &'static str {
 ///
 /// The free-function half of [`BuildGate::reserve_build_field`], for a caller
 /// that reaches the gate through [`global`] rather than by holding it.
-pub fn reserve_build_field(what: &str) {
-    if let Some(gate) = global() {
-        gate.reserve_build_field(what);
+pub fn reserve_build_field(what: &str) -> bool {
+    match global() {
+        Some(gate) => gate.reserve_build_field(what),
+        None => false,
     }
 }
 
@@ -1612,9 +1613,17 @@ impl BuildGate {
     /// asked first, whose next ask then comes round on a field someone else is
     /// holding, so its claim never survives to the ask it was made for. A holder
     /// refreshing its own claim is what keeps a work that keeps losing its place.
-    pub fn reserve_build_field(&self, what: &str) {
+    /// Returns whether the next build is now this work's to take.
+    ///
+    /// A false is an answer, not a failure: the turn may belong to another work
+    /// that asked first, and the field may not be usable at all. A caller that
+    /// records "I claimed the next build" has to record this answer rather than
+    /// its own intent -- on 2026-10-19 the mainline recorded a claim on every
+    /// round after its third refusal while the file named `host build`, so the
+    /// reading said the waiting work had a turn it never had.
+    pub fn reserve_build_field(&self, what: &str) -> bool {
         if !self.installed {
-            return;
+            return false;
         }
         let since = unix_now();
         let path = self.dir.join(RESERVE_FILE);
@@ -1631,7 +1640,7 @@ impl BuildGate {
                     dir = %self.dir.display(),
                     "the next build is already claimed; leaving that turn to the work that asked first"
                 );
-                return;
+                return false;
             }
         }
         if let Err(e) = write_gate_file(&path, &format!("{what}\t{since}\n")) {
@@ -1641,7 +1650,7 @@ impl BuildGate {
                 error = %e,
                 "could not claim the next build; this work will be refused again until the host is free"
             );
-            return;
+            return false;
         }
         tracing::info!(
             what,
@@ -1650,6 +1659,7 @@ impl BuildGate {
             dir = %self.dir.display(),
             "claiming the next build: builds stand down until this work gets one"
         );
+        true
     }
 
     /// The claim on the next build, when there is a fresh one.
@@ -4041,6 +4051,33 @@ unevictable 28532736
         assert!(
             gate.reservation().is_none(),
             "answered by its own work, and released then"
+        );
+    }
+
+    /// A caller that records "I claimed the next build" has to record whether
+    /// the write happened. On 2026-10-19 the mainline recorded a claim on its
+    /// third refusal while the file named `host build`, so the reading said a
+    /// waiting work had a turn it never had.
+    #[test]
+    fn a_claim_left_to_another_work_is_not_reported_as_this_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+
+        assert!(
+            gate.reserve_build_field("mainline advance"),
+            "the first asker writes the claim and is told so"
+        );
+        assert!(
+            !gate.reserve_build_field("change verification"),
+            "another work's fresh claim stays with it, so nothing was written for this ask"
+        );
+        assert_eq!(
+            gate.reservation().map(|(what, _)| what).as_deref(),
+            Some("mainline advance")
+        );
+        assert!(
+            gate.reserve_build_field("mainline advance"),
+            "refreshing one's own claim is still a write, and still reported"
         );
     }
 
