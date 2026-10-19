@@ -82,6 +82,162 @@ mod feedback_verification_surface {
     }
 }
 
+#[cfg(test)]
+mod feedback_zero_callsite_surface {
+    /// Which layer of the pipeline a definition sits at.
+    ///
+    /// The layer decides what a zero-call reading means: an inner step with no
+    /// caller edge is a step the pipeline forgot to wire, while an entry is the
+    /// subject that can be a breakpoint -- and only the edge trace may say which
+    /// is which.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Layer {
+        /// The entry the pipeline's dispatch is meant to reach.
+        Entry,
+        /// An inner step that has to be wired in by a caller edge.
+        InnerStep,
+    }
+
+    /// A definition site: the only legal subject of a callsite claim.
+    ///
+    /// Two definitions may spell their name identically; the id is what keeps
+    /// "this definition has no caller edge" from becoming "the function with
+    /// that spelling is unused".
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct DefId(usize);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Definition {
+        id: DefId,
+        name: &'static str,
+        layer: Layer,
+    }
+
+    /// What a caller-edge trace may conclude about one definition site.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CallsiteVerdict {
+        /// The pipeline reaches the definition; the caller edge is named.
+        ReachedByPipeline { caller: &'static str },
+        /// An inner definition with no caller edge: the pipeline dropped the
+        /// step that would call it. Not an unused function -- a missing wire.
+        MissingPipelineWiring,
+        /// An entry the dispatch does not reach: the only zero that could be a
+        /// breakpoint, and the edge trace itself is what gets to name it.
+        EntryUnreached,
+    }
+
+    /// Trace caller edges keyed to definition ids -- the only reader the gate
+    /// admits for a zero-callsite claim.
+    ///
+    /// The edges are already resolved to the callee's definition site, so a
+    /// shared spelling cannot move a verdict from one definition onto the
+    /// other.
+    fn trace_caller_edges(
+        subject: &Definition,
+        edges: &[(&'static str, DefId)],
+    ) -> CallsiteVerdict {
+        match edges
+            .iter()
+            .copied()
+            .find(|(_, callee)| *callee == subject.id)
+        {
+            Some((caller, _)) => CallsiteVerdict::ReachedByPipeline { caller },
+            None => match subject.layer {
+                Layer::InnerStep => CallsiteVerdict::MissingPipelineWiring,
+                Layer::Entry => CallsiteVerdict::EntryUnreached,
+            },
+        }
+    }
+
+    /// The reading a bare-name grep produces: a count of one spelling inside
+    /// one layer's text, unable to say which definition any hit reaches.
+    #[derive(Debug, Clone, Copy)]
+    struct BareNameCount {
+        name: &'static str,
+        calls_seen: usize,
+    }
+
+    /// One call-shaped spelling as it sits in the raw text, tagged with the
+    /// layer whose scope the hit was counted inside.
+    type RawCall = (&'static str, Layer);
+
+    impl BareNameCount {
+        /// Count call-shaped hits of a spelling within one layer's scope.
+        fn count_in_layer(name: &'static str, layer: Layer, raw_calls: &[RawCall]) -> Self {
+            let calls_seen = raw_calls
+                .iter()
+                .copied()
+                .filter(|(spelling, at)| *at == layer && *spelling == name)
+                .count();
+            Self { name, calls_seen }
+        }
+
+        /// The forbidden conclusion: reading this count as a tree-wide
+        /// zero-callsite sentence about every definition sharing the spelling.
+        /// Returned so the test can show it condemns the entry the pipeline
+        /// really reaches.
+        fn condemns_as_unused(&self, subject: &Definition) -> bool {
+            self.calls_seen == 0 && subject.name == self.name
+        }
+    }
+
+    /// principle: feedback_a_zero_callsite_claim_that_counted_inner_names_has_not_traced_the_callers
+    ///
+    /// 「某函数全树零调用点」这个结论，主语必须是**具体定义点**：调用边按定义
+    /// id 追溯，零数在哪个定义上，判决就只能落在那个定义上。两个定义同名时，在内层
+    /// 函数名的文本范围内数命中，数到的零只说明「管道漏接了这一步」；把这个零按
+    /// 拼写读成全树对「这个函数」的判决，就会把真正被管线调到的入口函数判成没人用。
+    /// 本门只认按定义点追溯的调用边：入口有调用边就是被调到，内层零边是漏接线；
+    /// 裸名计数无权对任何定义下「全树无人调用」的结论。
+    #[test]
+    fn zero_hits_on_an_inner_name_must_not_sentence_the_reached_entry() {
+        // Two definitions share one spelling: the pipeline entry and an inner
+        // step the pipeline grew but never wired.
+        let entry = Definition {
+            id: DefId(0),
+            name: "process",
+            layer: Layer::Entry,
+        };
+        let inner = Definition {
+            id: DefId(1),
+            name: "process",
+            layer: Layer::InnerStep,
+        };
+
+        // Caller edges traced from the pipeline entry: the one call reaches the
+        // entry's definition id, and nothing reaches the inner step.
+        let edges: [(&'static str, DefId); 1] = [("run_pipeline", DefId(0))];
+
+        // The raw text as a grep scoped to the inner layer sees it: the
+        // pipeline's call sits outside that scope, so counting call-shaped hits
+        // of the bare name beside the inner definition finds zero.
+        let raw_calls: [RawCall; 1] = [("process", Layer::Entry)];
+        let counted_at_inner =
+            BareNameCount::count_in_layer("process", Layer::InnerStep, &raw_calls);
+        assert_eq!(counted_at_inner.calls_seen, 0);
+
+        // The failure the principle names: the zero belongs to the inner
+        // definition, but keyed to the spelling it reads as a tree-wide death
+        // sentence on the entry too. The two readings disagree on purpose...
+        assert!(counted_at_inner.condemns_as_unused(&entry));
+
+        // ...and the gate sides with the edge trace keyed to the definition
+        // site: the entry is reached, the inner zero is missing pipeline wiring
+        // rather than an unused function, and no bare-name count is a verdict
+        // about any definition.
+        assert_eq!(
+            trace_caller_edges(&entry, &edges),
+            CallsiteVerdict::ReachedByPipeline {
+                caller: "run_pipeline"
+            }
+        );
+        assert_eq!(
+            trace_caller_edges(&inner, &edges),
+            CallsiteVerdict::MissingPipelineWiring
+        );
+    }
+}
+
 use crate::PromotionGateConfig;
 use cog_core::PromotionGateKind;
 
