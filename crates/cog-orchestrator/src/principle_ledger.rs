@@ -103,6 +103,16 @@ const REFUSALS_PER_PASS: usize = 500;
 /// takes.
 const MEASUREMENTS_PER_PASS: usize = 200;
 
+/// How many human-held rows one pass may look at for the first time.
+///
+/// A lane of its own. The judgement tier sorts behind every row a pass could
+/// settle, and the debt is deeper than one pass takes, so these rows are not
+/// reachable through the batch at all -- the account held more than five hundred
+/// of them and no look had ever reached one. The bound is small enough that the
+/// debt still gets most of a pass, and large enough that the first sweep clears
+/// in hours rather than weeks.
+const HUMAN_ONLY_SWEEP_PER_PASS: usize = 50;
+
 /// How long a look that could not be settled is left before it is asked again.
 ///
 /// Held alone it would be permanent, and a permanent answer to a question about
@@ -539,10 +549,36 @@ async fn measure_pass(
         );
     }
     let declared_judgement = rescued.len();
+
+    // The human-held rows no look has reached are not in the batch either, for
+    // the same reason: the tier sorts behind the debt and the debt is deeper
+    // than one pass. Asking for them by their own query is what gives the
+    // answer "no gate is meant to exist" a first look instead of leaving it
+    // indistinguishable from a row nothing has ever seen.
+    let sweep = match store.unmeasured_judgement(HUMAN_ONLY_SWEEP_PER_PASS).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "principle ledger: the human-held rows no look has reached could not be read, \
+                 so this pass looks at none of them"
+            );
+            Vec::new()
+        }
+    };
+    let sweep: Vec<PrincipleRow> = sweep
+        .into_iter()
+        .filter(|row| {
+            !offered.contains(row.slug.as_str()) && !rescued.iter().any(|r| r.slug == row.slug)
+        })
+        .collect();
+    let swept_offered = sweep.len();
+
     // In front rather than behind: the batch is bounded, and a row appended past
     // that bound would be read and never judged -- the same silence this is
     // here to end.
     rows.splice(0..0, rescued);
+    rows.splice(0..0, sweep);
 
     // The reverse direction, before any verdict: a declaration naming a slug the
     // account has no row for is reported by name and with the file that says it.
@@ -643,6 +679,17 @@ async fn measure_pass(
         if verdict == Verdict::HumanOnly {
             human_only += 1;
             unsettled.remove(&row.slug);
+            // Stamped rather than skipped. A row a pass has looked at is not a
+            // row nothing has looked at, and leaving `measured_at` empty made
+            // those two read the same in every query. The state is left empty on
+            // purpose: "no gate is meant to exist" is not one of the three.
+            if let Err(e) = store.record_human_only(&row.slug, Some(&revision)).await {
+                warn!(
+                    slug = %row.slug,
+                    error = %e,
+                    "principle ledger: a human-held look could not be written back"
+                );
+            }
             continue;
         }
         let Some(measurement) = measurement_of(row, &verdict, &declarations, &revision) else {
@@ -704,6 +751,7 @@ async fn measure_pass(
         already_unsettled = known_unsettled,
         orphan_declarations = ?orphan_declarations,
         declared_judgement,
+        swept_offered,
         duplicate_declarations,
         revision = %revision,
         "principle ledger: judged the outstanding set against the two registries"
@@ -1281,6 +1329,16 @@ mod tests {
         /// The registry the re-open was asked about, as `slug -> file`.
         gates: std::sync::Mutex<HashMap<String, String>>,
         measured: std::sync::Mutex<Vec<PrincipleMeasurement>>,
+        /// The slugs a look settled as human-held. Kept apart from `measured`
+        /// because the whole point of this write is that it moves no state.
+        human_only: std::sync::Mutex<Vec<String>>,
+        /// Whether the batch offers the held row on its first read.
+        ///
+        /// The re-opening case needs a row the batch never offers; the
+        /// human-held case needs one a pass reads like any other. Modelling
+        /// both with one store keeps which shape a test exercises written down
+        /// where the store is built.
+        batch_offers_row: bool,
         row: std::sync::Mutex<Option<PrincipleRow>>,
     }
 
@@ -1308,10 +1366,17 @@ mod tests {
             self.measured.lock().unwrap().push(measurement.clone());
             Ok(())
         }
+        async fn record_human_only(&self, slug: &str, _: Option<&str>) -> cog_core::SFResult<()> {
+            self.human_only.lock().unwrap().push(slug.to_string());
+            Ok(())
+        }
+        async fn unmeasured_judgement(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
+            Ok(Vec::new())
+        }
         async fn outstanding(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
             use std::sync::atomic::Ordering;
             let read = self.outstanding_reads.fetch_add(1, Ordering::SeqCst) + 1;
-            if read == 1 {
+            if read == 1 && !self.batch_offers_row {
                 Ok(Vec::new())
             } else {
                 Ok(self.row.lock().unwrap().clone().into_iter().collect())
@@ -1333,8 +1398,16 @@ mod tests {
         async fn refused(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
             unimplemented!()
         }
-        async fn get(&self, _: &str) -> cog_core::SFResult<Option<PrincipleRow>> {
-            unimplemented!()
+        async fn get(&self, slug: &str) -> cog_core::SFResult<Option<PrincipleRow>> {
+            // The one row this fake holds is the one a declared slug can be asked
+            // about; every other slug is a principle the account has no row for,
+            // which is what a real store answers.
+            Ok(self
+                .row
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|row| row.slug == slug))
         }
         async fn slugs(&self) -> cog_core::SFResult<Vec<String>> {
             Ok(self
@@ -1418,6 +1491,40 @@ mod tests {
         );
     }
 
+    /// A judgement row neither registry names a gate for is settled as
+    /// human-held, and that look is written back.
+    ///
+    /// The stamp is the whole subject: without it the row a person holds and the
+    /// row nothing has ever looked at come out of every query identical, which
+    /// is the reading this account exists to be able to tell apart.
+    #[tokio::test]
+    async fn a_human_held_look_is_stamped_without_moving_the_state() {
+        let slug = "feedback_example_judgement";
+        let dir = repo_declaring("feedback_some_other_principle");
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+
+        let mut held = row(slug, Some("-"), None);
+        held.check_kind = Some(PrincipleCheckKind::Judgement);
+        let store = ReopeningStore {
+            batch_offers_row: true,
+            row: std::sync::Mutex::new(Some(held)),
+            ..Default::default()
+        };
+
+        let mut unsettled = HashMap::new();
+        measure_pass(&store, &tree, &HashSet::new(), &mut unsettled).await;
+
+        assert_eq!(
+            store.human_only.lock().unwrap().as_slice(),
+            [slug],
+            "the human-held look was not written back"
+        );
+        assert!(
+            store.measured.lock().unwrap().is_empty(),
+            "a human-held row moved a state it does not have"
+        );
+    }
+
     /// A store whose outstanding set is all debt, and whose judgement row is
     /// only reachable by slug -- which is what the real selector does: the whole
     /// judgement tier sorts behind every unsettled row, and there is always more
@@ -1451,6 +1558,12 @@ mod tests {
         ) -> cog_core::SFResult<()> {
             self.measured.lock().unwrap().push(measurement.clone());
             Ok(())
+        }
+        async fn record_human_only(&self, _: &str, _: Option<&str>) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn unmeasured_judgement(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
+            Ok(Vec::new())
         }
         async fn outstanding(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
             Ok(vec![row("feedback_debt", Some("scripts/hook.sh"), None)])

@@ -537,6 +537,38 @@ pub trait PrincipleLedgerStore: Send + Sync {
     async fn apply_principle_measurement(&self, measurement: &PrincipleMeasurement)
         -> SFResult<()>;
 
+    /// Record that a look settled the row as one a person holds, without moving
+    /// its state to one of the three.
+    ///
+    /// `None` in the state column is a reading of its own here: both registries
+    /// were read, neither names a gate, and the row's tier says no machine gate
+    /// is meant to exist. Writing `unenforced` would turn that into a debt no
+    /// amount of work can clear; writing nothing leaves the row looking exactly
+    /// like one nothing has ever looked at. That was the gap this method closes:
+    /// `measured_at` is stamped either way, and any state or platform gate an
+    /// earlier look left behind is cleared, because the answer being written is
+    /// that no gate is declared for this row now.
+    ///
+    /// A look that could not settle the row must not call this: unsettled and
+    /// human-held are different answers, and only the second one is writable.
+    async fn record_human_only(&self, slug: &str, measured_rev: Option<&str>) -> SFResult<()>;
+
+    /// The human-held rows no look has reached yet, oldest first.
+    ///
+    /// These are the `judgement` rows with an empty state and an empty
+    /// `measured_at`: a person holds them and no pass has looked since the row
+    /// was minted. They are asked for directly rather than through
+    /// [`Self::outstanding`] because that query sorts the whole tier behind the
+    /// debt, and the debt runs deeper than one pass takes -- a row nothing has
+    /// looked at would then wait behind work that is re-read every pass, which
+    /// is how a settled answer reads as "never looked at" for as long as the
+    /// account is busy.
+    ///
+    /// The bound is the caller's: the sweep is a lane of its own, and what it
+    /// costs one pass is a number a reader can point at rather than whatever is
+    /// left of the debt budget.
+    async fn unmeasured_judgement(&self, limit: usize) -> SFResult<Vec<PrincipleRow>>;
+
     /// The rows that are not `enforced`, stalest look first.
     ///
     /// `None` in `measured_at` sorts first: nothing has looked at those, which
@@ -544,9 +576,11 @@ pub trait PrincipleLedgerStore: Send + Sync {
     ///
     /// Rows of the `judgement` tier sort after all of those, whatever their
     /// `measured_at`. Their verdict is that a person holds them, which is
-    /// settled and also unwritable: no measurement is applied, so `measured_at`
-    /// stays `None` and they would otherwise return to the head of every pass
-    /// and take the whole bounded set with them.
+    /// settled but not one of the three states: the look stamps `measured_at`
+    /// and leaves the state empty ([`Self::record_human_only`]), so they no
+    /// longer return to the head as never-measured rows would. They still sort
+    /// after the rest because nothing a pass does can move them, and a pass
+    /// that spent its bound on them would never reach a row it could settle.
     async fn outstanding(&self, limit: usize) -> SFResult<Vec<PrincipleRow>>;
 
     /// Clear the measured state of the enforced rows whose recorded

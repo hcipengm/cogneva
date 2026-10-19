@@ -318,21 +318,67 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         Ok(())
     }
 
+    async fn record_human_only(&self, slug: &str, measured_rev: Option<&str>) -> SFResult<()> {
+        check_fits("slug", slug, SLUG_MAX).map_err(SFError::Validation)?;
+        if let Some(rev) = measured_rev {
+            check_fits("measured revision", rev, SHA256_MAX).map_err(SFError::Validation)?;
+        }
+        // The state is cleared rather than left alone: a row this verdict reaches
+        // may hold `enforced` from a platform gate the registry no longer names,
+        // and keeping that while stamping a fresh `measured_at` would report the
+        // old verdict as current. A row the account has never measured had no
+        // state to clear, and lands here with only the two stamps.
+        sqlx::query(RECORD_HUMAN_ONLY_SQL)
+            .bind(slug)
+            .bind(measured_rev)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("record human-only look for {slug}: {e}")))?;
+        Ok(())
+    }
+
+    async fn unmeasured_judgement(&self, limit: usize) -> SFResult<Vec<PrincipleRow>> {
+        // Oldest first: the row that has waited longest for its first look goes
+        // first, and the marker test keeps a row a retired carrier left behind
+        // out of this lane -- its marker is what the fold clears, and stamping
+        // it here would leave the row retired in everything but the query it
+        // just fell out of.
+        let rows = sqlx::query(&format!(
+            "SELECT {ROW_COLUMNS} FROM principle_ledger \
+             WHERE state IS NULL AND measured_at IS NULL \
+               AND check_kind = 'judgement' \
+               AND (host_gate IS NULL OR host_gate NOT LIKE 'retired:%') \
+             ORDER BY first_seen_at ASC, slug ASC \
+             LIMIT $1"
+        ))
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+        Self::entries(rows)
+    }
+
     async fn outstanding(&self, limit: usize) -> SFResult<Vec<PrincipleRow>> {
         // Rows nothing has looked at sort first: an unmeasured row is the least
         // known, not the freshest, and ordering it by insertion would put every
         // newly read principle ahead of one that has waited for a look.
         //
         // A row a person holds sorts after every row a pass could settle. Its
-        // verdict is the settled answer "no gate is meant to exist", and nothing
-        // a pass does can move it: no measurement is written, so `measured_at`
-        // stays null, so sorting it by `measured_at` returns it to the head of
-        // the next pass as well. Once there are more of them than one pass can
-        // take, the pass spends its whole budget on the same rows every five
-        // minutes and no other row is ever looked at again -- which reads in the
-        // log as a pass that judged 200 rows, not as a pass that stopped. They
-        // are kept in the set rather than filtered out so the line still reports
-        // how many rows a person holds.
+        // verdict is the settled answer "no gate is meant to exist", and the
+        // look stamps `measured_at` while leaving the state empty; the stamp is
+        // what keeps it out of the never-measured head. The ordering below is
+        // still needed on top of that: without it, a pass whose bound is smaller
+        // than the number of human-held rows would spend its budget re-stamping
+        // the same answers every five minutes and never reach a row it could
+        // settle. They are kept in the set rather than filtered out so the line
+        // still reports how many rows a person holds.
+        //
+        // A human-held row no pass has looked at yet is not reachable through
+        // this query at all while the debt runs deeper than one pass: the tier
+        // ordering above puts it behind all of it. That case is served by
+        // `unmeasured_judgement`, which asks for exactly those rows with its own
+        // bound; the ordering here stays as it is so a settleable row is never
+        // crowded out by a sweep that could take the whole pass.
         //
         // Retired rows leave the set, with one exception: a row whose stored host
         // value no longer carries the retire marker. That marker is what the fold
@@ -792,6 +838,11 @@ SELECT count(*) AS n FROM principle_ledger_declared WHERE folded_at IS NULL";
 /// gate and the revision, and both ride in their own columns; the prose form of
 /// the same thing is a rendered note nothing here stores, and a column holding it
 /// would be a reading with no reader.
+const RECORD_HUMAN_ONLY_SQL: &str = "\
+UPDATE principle_ledger
+SET state = NULL, platform_gate = NULL, measured_at = now(), measured_rev = $2
+WHERE slug = $1";
+
 const APPLY_MEASUREMENT_SQL: &str = "\
 INSERT INTO principle_ledger (slug, state, platform_gate, measured_at, measured_rev)
 VALUES ($1, $2, $3, now(), $4)

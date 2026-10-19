@@ -2,17 +2,23 @@
 //!
 //! The pass takes a bounded set and judges every row in it. The bound is the
 //! whole question here: a row whose verdict is "a person holds this" is settled,
-//! and writing that verdict is not something the account can hold -- no
-//! measurement is applied, so `measured_at` stays null. Ordered by `measured_at`
-//! with nulls first, such a row comes back at the head of every pass.
+//! and it cannot take one of the three states -- a look stamps `measured_at` and
+//! leaves the state empty.
 //!
-//! That is invisible while there are few of them and total once there are more
-//! than the pass can take: every pass spends its whole budget on the same rows
-//! and no other row is looked at again. It does not read as a failure. The pass
-//! line says it judged the set, and the set it judged was full.
+//! Before that stamp existed, such a row stayed null and, ordered by
+//! `measured_at` with nulls first, came back at the head of every pass. That was
+//! invisible while there were few of them and total once there were more than
+//! the pass can take: every pass spent its whole budget on the same rows and no
+//! other row was looked at again.
 //!
-//! Two directions are checked, because either one alone can be satisfied by
-//! breaking the other:
+//! Ordering the whole tier behind the debt fixed that and created the opposite
+//! silence: a human-held row nothing had looked at was behind the debt, the debt
+//! runs deeper than one pass takes, so the row was never looked at at all. That
+//! is what `unmeasured_judgement` is for -- a lane of its own with its own bound
+//! -- and what the last case here checks.
+//!
+//! Three directions are checked, because any one of them alone can be satisfied
+//! by breaking another:
 //!
 //! - A row the pass can settle is in the set even when person-held rows outnumber
 //!   the bound. This is the regression.
@@ -20,8 +26,11 @@
 //!   the pass line counts them and "a person holds this" is a reading the account
 //!   owes its reader. Filtering them out of the query would fix the first
 //!   direction by making that count read zero forever.
+//! - A person-held row nothing has looked at is offered by its own lane, and a
+//!   look moves it out of that lane while leaving it held. Without the lane the
+//!   row waits behind work that is re-read every pass, which is to say forever.
 //!
-//! Neither can be settled without a server: which order a `NULL`-heavy ordering
+//! None of these can be settled without a server: which order a `NULL`-heavy ordering
 //! produces is a property of the server, not of a reading of the rows.
 //!
 //! Ignored by default; needs `COGNEVA_TEST_DATABASE_URL` pointing at a throwaway
@@ -496,5 +505,79 @@ async fn a_retirement_reading_is_not_buried_by_the_debt_ahead_of_it() {
         "a pass with room for two must reach the row that is waiting to leave; \
          got {looked:?}"
     );
+    cleanup(&pool, &marker).await;
+}
+
+/// What the sweep lane offers this fixture, in the lane's own order.
+async fn swept(store: &PostgresPrincipleLedgerStore, marker: &str) -> Vec<String> {
+    store
+        .unmeasured_judgement(PASS_BOUND)
+        .await
+        .expect("read the sweep lane")
+        .into_iter()
+        .map(|row| row.slug)
+        .filter(|s| s.starts_with(marker))
+        .collect()
+}
+
+/// A human-held row no look has reached is offered by its own lane, and a look
+/// moves it out of that lane without moving its state.
+///
+/// The batch cannot serve these rows: the judgement tier sorts behind the debt,
+/// and the debt is deeper than one pass takes. Without the lane the row's answer
+/// ("no gate is meant to exist") waits behind work that is re-read every pass,
+/// and reads the same as a row nothing has ever seen.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_never_looked_held_row_is_offered_even_when_the_debt_fills_the_pass() {
+    let _pass = PASS.lock().await;
+    let (store, pool, marker) = store().await;
+    let held = file(&store, &marker, "held", 2, PrincipleCheckKind::Judgement).await;
+    let debt = file(&store, &marker, "debt", 3, PrincipleCheckKind::Tree).await;
+
+    // The batch is filled by debt, so the held rows are not in it -- that is the
+    // premise the lane exists for, not an accident of this fixture.
+    let batch: Vec<String> = store
+        .outstanding(2)
+        .await
+        .expect("read the outstanding set")
+        .into_iter()
+        .map(|row| row.slug)
+        .filter(|s| s.starts_with(&marker))
+        .collect();
+    assert!(
+        batch.iter().all(|s| debt.contains(s)),
+        "the fixture must fill the batch with debt, or the lane is not being tested; \
+         got {batch:?}"
+    );
+
+    let mut offered = swept(&store, &marker).await;
+    offered.sort();
+    let mut expected = held.clone();
+    expected.sort();
+    assert_eq!(
+        offered, expected,
+        "the lane offers exactly the never-looked held rows"
+    );
+
+    // A look records the answer and leaves the state empty: the row leaves the
+    // lane because it has been seen, not because it stopped being held.
+    store
+        .record_human_only(&held[0], None)
+        .await
+        .expect("record the look");
+    let offered = swept(&store, &marker).await;
+    assert_eq!(offered, vec![held[1].clone()]);
+    let row = store
+        .get(&held[0])
+        .await
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(row.state, None, "a human-held row keeps no state");
+    assert!(
+        row.measured_at.is_some(),
+        "the look is what takes it out of the lane"
+    );
+
     cleanup(&pool, &marker).await;
 }
