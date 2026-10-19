@@ -854,6 +854,11 @@ impl ClickHouseEventBuffer {
 
 #[cfg(test)]
 mod tests {
+    //! principle: feedback_lazy_series_first_increment_is_invisible
+    //!
+    //! 抓取期按需创建的计数器：序列在第一次自增时才出现、首个样本已带自增后
+    //! 的值；changes()/increase() 不得补一个值为 0 的前驱。本模块中的同名测试
+    //! 就是这条原则在树里的闸门。
     use super::*;
 
     /// `DateTime64(3)` 不能直接当 TTL 表达式（ClickHouse 报 450
@@ -930,5 +935,101 @@ mod tests {
         let handle: Option<Arc<dyn MetricsBackend>> = None;
         ClickHouseEventBuffer::record_flush(&handle, false, 7).await;
         ClickHouseEventBuffer::record_flush(&handle, true, 7).await;
+    }
+
+    /// Per-series `increase()` between two scrapes, keyed by label set.
+    ///
+    /// A series the previous scrape did not carry has no predecessor: seeding
+    /// one at zero would turn the first observation into a delta no scrape ever
+    /// witnessed. A newly seen series contributes nothing until a second sample
+    /// exists to differ against.
+    fn increases_between(
+        previous: &[cog_core::MetricSample],
+        current: &[cog_core::MetricSample],
+    ) -> Vec<(String, f64)> {
+        fn label_key(sample: &cog_core::MetricSample) -> String {
+            let mut pairs: Vec<(String, String)> = sample
+                .labels
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            pairs.sort();
+            pairs
+                .into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        let previous_values: HashMap<String, f64> =
+            previous.iter().map(|s| (label_key(s), s.value)).collect();
+        current
+            .iter()
+            .filter_map(|s| {
+                previous_values
+                    .get(&label_key(s))
+                    .map(|old| (label_key(s), s.value - old))
+            })
+            .collect()
+    }
+
+    /// 抓取期按需创建的计数器：序列在第一次自增时才出现，首个样本已带自增后
+    /// 的值；changes()/increase() 不得把“此前无序列”补成值为 0 的前驱，否则
+    /// 第一次自增会被读出一个谁也没观测到的 delta。后续自增之间的差照常可见。
+    #[tokio::test]
+    async fn a_lazy_series_first_increment_is_invisible_to_increase() {
+        const NAME: &str = "lazy_series_first_increment_probe_total";
+        let backend = crate::metrics::PrometheusMetricsBackend::new("");
+        let labels = HashMap::from([("phase".to_string(), "born".to_string())]);
+
+        // 第一次自增之前，任何面都不能提到这条序列。
+        let absent = backend.query_counter_totals(NAME).await.unwrap();
+        assert!(
+            absent.is_empty(),
+            "a scrape-time counter must not seed a series before its first increment: {absent:?}"
+        );
+        let body = String::from_utf8(backend.encode().unwrap()).unwrap();
+        assert!(
+            !body.contains(NAME),
+            "the exposition must omit a series nothing has incremented: {body}"
+        );
+
+        // 序列在第一次自增时诞生，首个样本已带自增后的值，没有零值前驱。
+        backend
+            .record_counter(
+                cog_core::MetricName::for_tests_only(NAME),
+                3.0,
+                labels.clone(),
+            )
+            .await
+            .unwrap();
+        let first = backend.query_counter_totals(NAME).await.unwrap();
+        assert_eq!(
+            first.len(),
+            1,
+            "the first increment creates exactly one series: {first:?}"
+        );
+        assert_eq!(
+            first[0].value, 3.0,
+            "the first sample must already carry the post-increment value: {first:?}"
+        );
+        assert!(
+            increases_between(&[], &first).is_empty(),
+            "the first observed sample has no predecessor to differ against: {first:?}"
+        );
+
+        // 之后的自增对真实存在的前驱样本求差，delta 照常读出。
+        backend
+            .record_counter(cog_core::MetricName::for_tests_only(NAME), 2.0, labels)
+            .await
+            .unwrap();
+        let second = backend.query_counter_totals(NAME).await.unwrap();
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert_eq!(second[0].value, 5.0, "{second:?}");
+        assert_eq!(
+            increases_between(&first, &second),
+            vec![("phase=born".to_string(), 2.0)],
+            "only an increment with a real predecessor sample is visible to increase()"
+        );
     }
 }
