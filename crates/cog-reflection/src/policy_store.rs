@@ -13,11 +13,13 @@
 //!   （"拒绝无统计显著的改动"）。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use cog_core::{SFError, SFResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 /// 策略产物的一个版本。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +71,59 @@ impl PolicyArtifact {
 #[derive(Debug, Clone)]
 pub struct PolicyStore {
     dir: PathBuf,
+}
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// 原子写：临时文件 → fsync 文件 → rename → fsync 目录。
+///
+/// 版本文件与 ACTIVE 都走这里。只 rename 不 fsync 目录时，掉电后目录项可能丢，
+/// 于是「版本文件已经落盘」只是进程视角，恢复时可能读到 ACTIVE 指向一个不存在的
+/// 版本。文件先持久化，再写 ACTIVE，顺序也不能反。
+async fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> SFResult<()> {
+    let contents = contents.as_ref();
+    let dir = path
+        .parent()
+        .ok_or_else(|| SFError::IO(format!("no parent directory for {}", path.display())))?;
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| SFError::IO(format!("create {}: {e}", dir.display())))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("policy");
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+    {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .await
+            .map_err(|e| SFError::IO(format!("open {}: {e}", tmp.display())))?;
+        file.write_all(contents)
+            .await
+            .map_err(|e| SFError::IO(format!("write {}: {e}", tmp.display())))?;
+        file.sync_all()
+            .await
+            .map_err(|e| SFError::IO(format!("fsync {}: {e}", tmp.display())))?;
+    }
+    tokio::fs::rename(&tmp, path).await.map_err(|e| {
+        SFError::IO(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        ))
+    })?;
+    let dir_file = tokio::fs::File::open(dir)
+        .await
+        .map_err(|e| SFError::IO(format!("open dir {}: {e}", dir.display())))?;
+    dir_file
+        .sync_all()
+        .await
+        .map_err(|e| SFError::IO(format!("fsync dir {}: {e}", dir.display())))?;
+    Ok(())
 }
 
 impl PolicyStore {
@@ -172,9 +227,7 @@ impl PolicyStore {
             .map_err(|e| SFError::IO(format!("create {}: {e}", dir.display())))?;
         let text = serde_json::to_string_pretty(&artifact)
             .map_err(|e| SFError::Validation(format!("serialize artifact: {e}")))?;
-        tokio::fs::write(self.version_path(name, version), text)
-            .await
-            .map_err(|e| SFError::IO(format!("write artifact v{version}: {e}")))?;
+        write_atomic(&self.version_path(name, version), text).await?;
         self.activate(name, version).await?;
         Ok(artifact)
     }
@@ -186,9 +239,7 @@ impl PolicyStore {
                 "cannot activate {name} v{version}: version does not exist"
             )));
         }
-        tokio::fs::write(self.active_path(name), version.to_string())
-            .await
-            .map_err(|e| SFError::IO(format!("write ACTIVE for {name}: {e}")))
+        write_atomic(&self.active_path(name), version.to_string()).await
     }
 
     /// 校验版本链完整性：每版 hash 必须等于 sha256(parent_hash ‖ payload)，
@@ -447,6 +498,41 @@ mod tests {
         assert_eq!(active.version, 1);
 
         assert!(store.verify_chain("meta_learning.mode").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn atomic_write_leaves_no_tmp_and_active_is_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PolicyStore::new(tmp.path());
+        store
+            .save_new_version(
+                "meta_learning.mode",
+                serde_json::json!({"margin": 0.05}),
+                "init",
+            )
+            .await
+            .unwrap();
+
+        let dir = tmp.path().join("meta_learning.mode");
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.ends_with(".tmp")),
+            "temporary file left behind: {names:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("ACTIVE")).unwrap().trim(),
+            "1"
+        );
+
+        let active = store
+            .load_active("meta_learning.mode")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.version, 1);
     }
 
     #[tokio::test]

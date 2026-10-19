@@ -352,29 +352,36 @@ pub async fn backup_postgres(
     out_dir: &Path,
 ) -> Result<PostgresReport, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(out_dir)?;
-    let tables = discover_tables(pool).await?;
+    // 逐表 COPY 只有在同一个一致性快照里才是一份数据：默认 READ COMMITTED
+    // 下每张表各看各的时刻，导出期间提交的事务会让包里的表互相矛盾。
+    // 表清单也在这条事务里取，避免发现表之后又冒出新表。
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await?;
+
+    let tables: Vec<String> = sqlx::query_scalar(DISCOVER_TABLES_SQL)
+        .fetch_all(&mut *tx)
+        .await?;
     let mut report = PostgresReport {
         tables: Vec::with_capacity(tables.len()),
         sequences: 0,
     };
 
-    let mut conn = pool.acquire().await?;
     for table in &tables {
         validate_table_name(table)?;
         let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{table}\""))
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut *tx)
             .await?;
         let path = out_dir.join(format!("public.{table}.csv"));
         // 只搬表自己存的列：生成列在这里点名会在恢复时被 Postgres 拒掉，
         // 而它的值是别的列算出来的，不搬不丢信息。
         let movable: Vec<String> = sqlx::query_scalar(MOVABLE_COLUMNS_SQL)
             .bind(table)
-            .fetch_all(&mut *conn)
+            .fetch_all(&mut *tx)
             .await?;
         let mut file = std::fs::File::create(&path)?;
-        let mut copy_out = conn
-            .copy_out_raw(&copy_to_statement(table, &movable))
-            .await?;
+        let mut copy_out = tx.copy_out_raw(&copy_to_statement(table, &movable)).await?;
         use futures::StreamExt;
         use std::io::Write;
         while let Some(chunk) = copy_out.next().await {
@@ -393,14 +400,14 @@ pub async fn backup_postgres(
         "SELECT sequencename::text FROM pg_sequences WHERE schemaname = 'public' \
          ORDER BY sequencename",
     )
-    .fetch_all(&mut *conn)
+    .fetch_all(&mut *tx)
     .await?;
     let mut sql = String::new();
     for seq in &sequences {
         validate_table_name(seq)?;
         let (last_value, is_called): (i64, bool) =
             sqlx::query_as(&format!("SELECT last_value, is_called FROM \"{seq}\""))
-                .fetch_one(&mut *conn)
+                .fetch_one(&mut *tx)
                 .await?;
         sql.push_str(&format!(
             "SELECT setval('{seq}', {last_value}, {is_called});\n"
@@ -408,6 +415,8 @@ pub async fn backup_postgres(
     }
     std::fs::write(out_dir.join("sequences.sql"), &sql)?;
     report.sequences = sequences.len();
+    // 出错时 tx 在 drop 时回滚；成功路径显式提交，把快照释放掉。
+    tx.commit().await?;
     Ok(report)
 }
 
