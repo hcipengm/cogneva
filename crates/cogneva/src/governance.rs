@@ -97,7 +97,11 @@ pub enum Action {
         face: Option<String>,
         workspace: Option<String>,
     },
-    Act(crate::governance_acts::Act),
+    // Boxed: a handover carries a spec whose text fields make it the widest
+    // variant, and every other action would pay for that width. One CLI
+    // process builds exactly one of these, so the extra allocation costs
+    // nothing a caller can observe.
+    Act(Box<crate::governance_acts::Act>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,7 +136,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
             }
         }
         return Ok(Request {
-            action: Action::Act(crate::governance_acts::parse_args(&rest)?),
+            action: Action::Act(Box::new(crate::governance_acts::parse_args(&rest)?)),
             database_url,
             redis_url,
         });
@@ -258,7 +262,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
             let workspace = workspace.unwrap_or_else(|| config.dag_executor.workspace_id.clone());
             assign(&*store, &assign_pool, &workspace, face.as_deref()).await?;
         }
-        Action::Act(act) => crate::governance_acts::run(act, &*store, Utc::now()).await?,
+        Action::Act(act) => crate::governance_acts::run(*act, &*store, Utc::now()).await?,
     }
     Ok(())
 }
