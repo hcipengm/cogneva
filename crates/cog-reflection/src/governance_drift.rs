@@ -17,10 +17,11 @@
 //! still the old one, reported as an admission error rather than as a stale
 //! ceiling.
 //!
-//! This module is that reading. Every time a bundle is assembled, the
-//! governance documents of the revision being rolled out are compared field by
-//! field against the objects the cluster is enforcing, and the number of fields
-//! that differ is published per object.
+//! This module is that reading. On every deployer cycle -- whether or not a
+//! bundle is assembled, because a cluster that is the only side moving is
+//! exactly when nobody assembles one -- the governance documents of the tracked
+//! revision are compared field by field against the objects the cluster is
+//! enforcing, and the number of fields that differ is published per object.
 //!
 //! It reports a difference and does not judge it. A ceiling the operator
 //! deliberately tuned in the cluster and a ceiling the repository raised that no
@@ -121,6 +122,16 @@ pub enum CheckFailure {
     GovernanceLiveUnreadable,
     /// The cluster answered, and the answer is not text this side will parse.
     GovernanceLiveUnparseable,
+    /// The enforced `LimitRange`s could not be read: `kubectl` did not run, or
+    /// ran and could not reach the cluster.
+    ///
+    /// A cell of its own rather than folded into [`Self::GovernanceLiveUnreadable`]
+    /// because the two live reads are two commands, and one of them failing
+    /// leaves the other working: a reader told only "the cluster side failed"
+    /// would have to guess which command to rerun.
+    GovernanceLimitRangeUnreadable,
+    /// The enforced `LimitRange`s came back as text this side will not parse.
+    GovernanceLimitRangeUnparseable,
     /// The observability stack's declared manifests could not be read from the
     /// tracked revision.
     ObservabilityDeclarationUnreadable,
@@ -136,10 +147,12 @@ impl CheckFailure {
     /// All of them are published whether or not they have happened: an absent
     /// series and a series at zero are different readings, and "this failure
     /// mode has not occurred" is the second one.
-    pub const ALL: [CheckFailure; 6] = [
+    pub const ALL: [CheckFailure; 8] = [
         CheckFailure::GovernanceDeclarationUnreadable,
         CheckFailure::GovernanceLiveUnreadable,
         CheckFailure::GovernanceLiveUnparseable,
+        CheckFailure::GovernanceLimitRangeUnreadable,
+        CheckFailure::GovernanceLimitRangeUnparseable,
         CheckFailure::ObservabilityDeclarationUnreadable,
         CheckFailure::ObservabilityLiveUnreadable,
         CheckFailure::ObservabilityLiveUnparseable,
@@ -151,6 +164,8 @@ impl CheckFailure {
             CheckFailure::GovernanceDeclarationUnreadable => "governance_declaration_unreadable",
             CheckFailure::GovernanceLiveUnreadable => "governance_live_unreadable",
             CheckFailure::GovernanceLiveUnparseable => "governance_live_unparseable",
+            CheckFailure::GovernanceLimitRangeUnreadable => "governance_limitrange_unreadable",
+            CheckFailure::GovernanceLimitRangeUnparseable => "governance_limitrange_unparseable",
             CheckFailure::ObservabilityDeclarationUnreadable => {
                 "observability_declaration_unreadable"
             }
@@ -190,17 +205,26 @@ impl GovernanceDeclaration {
     }
 }
 
-/// The governance ceilings one manifest text declares.
+/// The governance objects one manifest text declares.
 ///
-/// Only `ResourceQuota` is covered, and the reason is scope rather than
-/// convenience: its ceilings are a flat map under `spec.hard` whose field names
-/// are identities. A `LimitRange` carries `spec.limits` as a sequence, and a
-/// sequence's order is not an identity -- comparing by position would read a
-/// reordered list as drift, and folding by `type` would need a further layer
-/// expanding each type's fields, a layer no judgement has ever settled. The
-/// only field evidence this module has sits on `ResourceQuota` (the cluster's
-/// quota stopped at 17 while the repository already declares 18.5), so this is
-/// the half that gets done, and the other is not filled in by symmetry.
+/// Two kinds are covered, because the two are the two objects admission reads
+/// when it answers yes: a `ResourceQuota` bounds the namespace's sum, and a
+/// `LimitRange` bounds each container inside it. Reading only the first leaves
+/// half of "what this tree declares" uncompared, and a declaration that is
+/// never compared is the state this module exists to end.
+///
+/// `ResourceQuota` is a flat map under `spec.hard`: its keys are identities.
+/// A `LimitRange` carries `spec.limits` as a sequence, so its fields are folded
+/// by `type` and then named `<type>.<face>.<resource>` -- `limits[Container].max.cpu`.
+/// Folding by position would read a reordered list as drift, and the type is
+/// the only stable identity a limit entry has.
+///
+/// The `cogneva.io/*` annotations an object declares are part of the
+/// declaration too: they are where a number lives that has no field to live in
+/// (the runtime-pod budget, today), and a copy of the object that lost them is
+/// not the object this tree declared. Other annotations are not compared --
+/// `kubectl apply` adds its own bookkeeping, and a reading that called that
+/// drift would be red on every object it ever looked at.
 pub fn governance_declarations(
     yaml_text: &str,
     origin: &str,
@@ -208,7 +232,7 @@ pub fn governance_declarations(
     let mut out = Vec::new();
     for doc in crate::mainline_deployer::split_docs(yaml_text, origin)? {
         let kind = doc.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-        if kind != "ResourceQuota" {
+        if !matches!(kind, "ResourceQuota" | "LimitRange") {
             continue;
         }
         let name = doc
@@ -217,20 +241,31 @@ pub fn governance_declarations(
             .and_then(|n| n.as_str())
             .ok_or_else(|| SFError::Config(format!("{origin}: a {kind} has no metadata.name")))?;
         let mut fields = BTreeMap::new();
-        if let Some(hard) = doc.get("spec").and_then(|s| s.get("hard")) {
-            let map = hard.as_mapping().ok_or_else(|| {
-                SFError::Config(format!(
-                    "{origin}: {kind}/{name} declares spec.hard as something other than a mapping"
-                ))
-            })?;
-            for (k, v) in map {
-                let Some(key) = k.as_str() else { continue };
-                let Some(text) = quantity_text(v) else {
-                    continue;
-                };
-                fields.insert(key.to_string(), text);
+        match kind {
+            "ResourceQuota" => {
+                if let Some(hard) = doc.get("spec").and_then(|s| s.get("hard")) {
+                    let map = hard.as_mapping().ok_or_else(|| {
+                        SFError::Config(format!(
+                            "{origin}: {kind}/{name} declares spec.hard as something other \
+                             than a mapping"
+                        ))
+                    })?;
+                    for (k, v) in map {
+                        let Some(key) = k.as_str() else { continue };
+                        let Some(text) = quantity_text(v) else {
+                            continue;
+                        };
+                        fields.insert(key.to_string(), text);
+                    }
+                }
             }
+            _ => fold_limit_entries(
+                &mut fields,
+                doc.get("spec").and_then(|s| s.get("limits")),
+                &format!("{origin}: {kind}/{name}"),
+            )?,
         }
+        collect_declared_annotations(&mut fields, doc.get("metadata"));
         out.push(GovernanceDeclaration {
             kind: kind.to_string(),
             name: name.to_string(),
@@ -238,6 +273,70 @@ pub fn governance_declarations(
         });
     }
     Ok(out)
+}
+
+/// The field-name prefix the compared annotations carry in a field table.
+///
+/// An annotation has no path of its own inside the object the way `spec.hard`
+/// does, so the key says where it came from; the comparison reads the prefix to
+/// know that these values are the declarer's text rather than a quantity.
+pub const ANNOTATION_FIELD_PREFIX: &str = "metadata.annotations.";
+
+/// The annotations this tree declares about an object, as field-table entries.
+fn collect_declared_annotations(
+    fields: &mut BTreeMap<String, String>,
+    metadata: Option<&serde_yaml::Value>,
+) {
+    let Some(map) = metadata
+        .and_then(|m| m.get("annotations"))
+        .and_then(|a| a.as_mapping())
+    else {
+        return;
+    };
+    for (k, v) in map {
+        let Some(key) = k.as_str() else { continue };
+        if !key.starts_with("cogneva.io/") {
+            continue;
+        }
+        let Some(text) = quantity_text(v) else {
+            continue;
+        };
+        fields.insert(format!("{ANNOTATION_FIELD_PREFIX}{key}"), text);
+    }
+}
+
+/// Fold one object's `spec.limits` sequence into the field table.
+///
+/// Shared by both sides of the comparison so the two cannot fold differently:
+/// a key only one side spells differently is a drift the reader would have to
+/// go and disprove by hand.
+fn fold_limit_entries(
+    fields: &mut BTreeMap<String, String>,
+    limits: Option<&serde_yaml::Value>,
+    where_: &str,
+) -> SFResult<()> {
+    let Some(seq) = limits.and_then(|l| l.as_sequence()) else {
+        return Ok(());
+    };
+    for entry in seq {
+        let typ = entry
+            .get("type")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| SFError::Config(format!("{where_}: a limit entry has no type")))?;
+        for face in ["default", "defaultRequest", "max", "min"] {
+            let Some(map) = entry.get(face).and_then(|m| m.as_mapping()) else {
+                continue;
+            };
+            for (k, v) in map {
+                let Some(resource) = k.as_str() else { continue };
+                let Some(text) = quantity_text(v) else {
+                    continue;
+                };
+                fields.insert(format!("limits[{typ}].{face}.{resource}"), text);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A YAML scalar as the quantity was written. Numbers count too: `pods: 40`
@@ -264,17 +363,24 @@ pub(crate) fn quantity_text(value: &serde_yaml::Value) -> Option<String> {
 /// authoritative face, but a field left behind by hand in the cluster is just
 /// as much a disagreement; the reading reports it rather than deciding for the
 /// reader which side is right.
+///
+/// Annotations are compared verbatim, not by quantity. `kubectl apply` carries
+/// an annotation's text across unchanged, so two spellings of one amount there
+/// do not mean the API normalized the value -- they mean somebody wrote it
+/// again, which is exactly the state this reading is looking for.
 pub fn drifted_fields(
     declared: &BTreeMap<String, String>,
     live: &BTreeMap<String, String>,
 ) -> Vec<String> {
     let mut out = BTreeMap::new();
     for (key, d) in declared {
-        match live.get(key) {
-            Some(l) if same_quantity(d, l) => {}
-            _ => {
-                out.insert(key.clone(), ());
-            }
+        let agrees = match live.get(key) {
+            Some(l) if key.starts_with(ANNOTATION_FIELD_PREFIX) => d == l,
+            Some(l) => same_quantity(d, l),
+            None => false,
+        };
+        if !agrees {
+            out.insert(key.clone(), ());
         }
     }
     for key in live.keys() {
@@ -309,6 +415,10 @@ fn same_quantity(a: &str, b: &str) -> bool {
 pub struct QuotaUsage {
     pub hard: BTreeMap<String, String>,
     pub used: BTreeMap<String, String>,
+    /// The `cogneva.io/*` annotations the object carries, kept apart from
+    /// `hard` because admission never reads them: they declare a budget the
+    /// render-time gate does, not a ceiling the quota controller enforces.
+    pub annotations: BTreeMap<String, String>,
 }
 
 /// The output of `kubectl get resourcequota -o json` -> each object's `hard`
@@ -364,6 +474,10 @@ pub fn live_quota_usage(text: &str) -> SFResult<BTreeMap<String, QuotaUsage>> {
             QuotaUsage {
                 hard: table(item.get("spec").and_then(|s| s.get("hard"))),
                 used: table(item.get("status").and_then(|s| s.get("used"))),
+                annotations: table(item.get("metadata").and_then(|m| m.get("annotations")))
+                    .into_iter()
+                    .filter(|(key, _)| key.starts_with("cogneva.io/"))
+                    .collect(),
             },
         );
     }
@@ -371,13 +485,86 @@ pub fn live_quota_usage(text: &str) -> SFResult<BTreeMap<String, QuotaUsage>> {
 }
 
 /// The output of `kubectl get resourcequota -o json` -> each object's enforced
-/// `hard` field table, the declaration-comparison face of
-/// [`live_quota_usage`].
+/// field table, the declaration-comparison face of [`live_quota_usage`].
+///
+/// `spec.hard` and the `cogneva.io/*` annotations share one table because they
+/// share one declaration: the same object declares both, and a comparison that
+/// split them would need two keys per object for one question.
 pub fn live_quotas(text: &str) -> SFResult<BTreeMap<String, BTreeMap<String, String>>> {
     Ok(live_quota_usage(text)?
         .into_iter()
-        .map(|(object, usage)| (object, usage.hard))
+        .map(|(object, usage)| {
+            let mut fields = usage.hard;
+            for (key, value) in usage.annotations {
+                fields.insert(format!("{ANNOTATION_FIELD_PREFIX}{key}"), value);
+            }
+            (object, fields)
+        })
         .collect())
+}
+
+/// The output of `kubectl get limitrange -o json` -> each object's folded field
+/// table, the other half of the declaration comparison.
+///
+/// Folded the same way as the declared side ([`fold_limit_entries`]): by `type`,
+/// then `<type>.<face>.<resource>`. A `LimitRange` is what admission reads for
+/// one container, so leaving it out would read "the two sides agree" for every
+/// per-container ceiling in the tree while only the namespace sum was compared.
+///
+/// The same two mistakes are refused here as on the quota listing: text that is
+/// not a listing, and an item without an identity are errors, not a smaller
+/// answer. An entry without a type is an error too -- folded without one, every
+/// typeless entry would collapse into the same fields and read as agreement.
+pub fn live_limit_ranges(text: &str) -> SFResult<BTreeMap<String, BTreeMap<String, String>>> {
+    let v: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| SFError::Config(format!("limit range listing is not JSON: {e}")))?;
+    let items = v
+        .get("items")
+        .and_then(|i| i.as_array())
+        .ok_or_else(|| SFError::Config("limit range listing has no items array".into()))?;
+    let mut out = BTreeMap::new();
+    for item in items {
+        // The identity is the name; the kind defaults to the endpoint's, because
+        // an item that omits it is still a LimitRange from this listing.
+        let kind = item
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("LimitRange");
+        let Some(name) = item
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str())
+        else {
+            continue;
+        };
+        let mut fields = BTreeMap::new();
+        if let Some(seq) = item
+            .get("spec")
+            .and_then(|s| s.get("limits"))
+            .and_then(|l| l.as_array())
+        {
+            for entry in seq {
+                let typ = entry.get("type").and_then(|t| t.as_str()).ok_or_else(|| {
+                    SFError::Config(format!("limitrange/{name}: a limit entry has no type"))
+                })?;
+                for face in ["default", "defaultRequest", "max", "min"] {
+                    let Some(map) = entry.get(face).and_then(|m| m.as_object()) else {
+                        continue;
+                    };
+                    for (resource, value) in map {
+                        if let Some(text) = value.as_str() {
+                            fields.insert(
+                                format!("limits[{typ}].{face}.{resource}"),
+                                text.to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        out.insert(format!("{}/{name}", kind.to_lowercase()), fields);
+    }
+    Ok(out)
 }
 
 /// Which fields differ, per declared object, against what the cluster enforces.
@@ -579,12 +766,138 @@ mod tests {
         assert_eq!(decls[0].fields.get("pods").map(String::as_str), Some("40"));
     }
 
+    /// A `LimitRange` is folded by `type`, not by position: the sequence's order
+    /// is not an identity, so the same document with its entries reordered must
+    /// yield the same table.
     #[test]
-    fn a_limit_range_is_left_to_the_half_that_has_evidence() {
-        let text = "kind: LimitRange\nmetadata:\n  name: cogneva-limits\nspec:\n  limits:\n    - type: Container\n      max:\n        cpu: \"4\"\n";
-        assert!(governance_declarations(text, "limits.yaml")
-            .unwrap()
-            .is_empty());
+    fn a_limit_range_declares_its_fields_folded_by_type() {
+        let text = "kind: LimitRange\nmetadata:\n  name: cogneva-limits\nspec:\n  limits:\n    - type: Container\n      max:\n        cpu: \"4\"\n        memory: 6Gi\n      defaultRequest:\n        cpu: 100m\n    - type: Pod\n      max:\n        cpu: \"8\"\n";
+        let decls = governance_declarations(text, "limits.yaml").unwrap();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].object(), "limitrange/cogneva-limits");
+        assert_eq!(
+            decls[0]
+                .fields
+                .get("limits[Container].max.cpu")
+                .map(String::as_str),
+            Some("4")
+        );
+        assert_eq!(
+            decls[0]
+                .fields
+                .get("limits[Container].max.memory")
+                .map(String::as_str),
+            Some("6Gi")
+        );
+        assert_eq!(
+            decls[0]
+                .fields
+                .get("limits[Container].defaultRequest.cpu")
+                .map(String::as_str),
+            Some("100m")
+        );
+        assert_eq!(
+            decls[0]
+                .fields
+                .get("limits[Pod].max.cpu")
+                .map(String::as_str),
+            Some("8")
+        );
+
+        let reordered = "kind: LimitRange\nmetadata:\n  name: cogneva-limits\nspec:\n  limits:\n    - type: Pod\n      max:\n        cpu: \"8\"\n    - type: Container\n      max:\n        cpu: \"4\"\n        memory: 6Gi\n      defaultRequest:\n        cpu: 100m\n";
+        assert_eq!(
+            governance_declarations(reordered, "limits.yaml").unwrap()[0].fields,
+            decls[0].fields,
+            "换个顺序是同一条声明"
+        );
+    }
+
+    /// The `cogneva.io/*` annotations are part of the declaration; the
+    /// bookkeeping `kubectl apply` adds is not.
+    #[test]
+    fn the_declared_annotations_are_the_repository_own_prefix_only() {
+        let text = "kind: ResourceQuota\nmetadata:\n  name: cogneva-quota\n  annotations:\n    cogneva.io/runtime-pods-limits-memory: 3.75Gi\n    kubectl.kubernetes.io/last-applied-configuration: \"{}\"\nspec:\n  hard:\n    limits.memory: 52Gi\n";
+        let decls = governance_declarations(text, "quota.yaml").unwrap();
+        assert_eq!(
+            decls[0]
+                .fields
+                .get("metadata.annotations.cogneva.io/runtime-pods-limits-memory")
+                .map(String::as_str),
+            Some("3.75Gi")
+        );
+        assert!(
+            decls[0]
+                .fields
+                .keys()
+                .all(|k| !k.contains("last-applied-configuration")),
+            "安装面的簿记注解不是这棵树的声明：{:?}",
+            decls[0].fields
+        );
+    }
+
+    /// The two sides fold the same document identically, so a live listing that
+    /// says the same thing produces no drift -- and one field's difference stays
+    /// one field.
+    #[test]
+    fn the_live_limit_range_folds_the_same_way_as_the_declaration() {
+        let declared = governance_declarations(
+            "kind: LimitRange\nmetadata:\n  name: cogneva-limits\nspec:\n  limits:\n    - type: Container\n      max:\n        cpu: \"4\"\n      min:\n        memory: 64Mi\n",
+            "limits.yaml",
+        )
+        .unwrap()
+        .remove(0);
+        let live = live_limit_ranges(
+            r#"{"items":[{"kind":"LimitRange","metadata":{"name":"cogneva-limits"},
+                "spec":{"limits":[{"type":"Container","max":{"cpu":"4000m"},
+                "min":{"memory":"67108864"}}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            drifted_fields(
+                &declared.fields,
+                live.get("limitrange/cogneva-limits").unwrap()
+            ),
+            Vec::<String>::new(),
+            "4000m 与 4 是同一个量，67108864 与 64Mi 也是"
+        );
+
+        let drifted = live_limit_ranges(
+            r#"{"items":[{"kind":"LimitRange","metadata":{"name":"cogneva-limits"},
+                "spec":{"limits":[{"type":"Container","max":{"cpu":"6"},
+                "min":{"memory":"67108864"}}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            drifted_fields(
+                &declared.fields,
+                drifted.get("limitrange/cogneva-limits").unwrap()
+            ),
+            vec!["limits[Container].max.cpu"]
+        );
+    }
+
+    /// An annotation is the declarer's own text carried across by `apply`, so
+    /// two spellings of one amount there mean someone wrote it again -- drift.
+    #[test]
+    fn an_annotation_is_compared_verbatim_not_as_a_quantity() {
+        let declared: BTreeMap<String, String> = [(
+            "metadata.annotations.cogneva.io/runtime-pods-limits-cpu".to_string(),
+            "3000m".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let respelled: BTreeMap<String, String> = [(
+            "metadata.annotations.cogneva.io/runtime-pods-limits-cpu".to_string(),
+            "3".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            drifted_fields(&declared, &respelled),
+            vec!["metadata.annotations.cogneva.io/runtime-pods-limits-cpu"],
+            "同一个量换个写法在注解上不是同一份声明"
+        );
+        assert!(drifted_fields(&declared, &declared).is_empty());
     }
 
     #[test]
@@ -677,6 +990,8 @@ mod tests {
                 ("governance_declaration_unreadable", 0.0),
                 ("governance_live_unreadable", 1.0),
                 ("governance_live_unparseable", 0.0),
+                ("governance_limitrange_unreadable", 0.0),
+                ("governance_limitrange_unparseable", 0.0),
                 ("observability_declaration_unreadable", 0.0),
                 ("observability_live_unreadable", 0.0),
                 ("observability_live_unparseable", 0.0),

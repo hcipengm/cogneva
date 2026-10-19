@@ -5536,6 +5536,31 @@ impl MainlineDeployer {
                 return;
             }
         };
+        // The second half of the same question, from a second command: a
+        // `LimitRange` bounds each container, and a table holding only the
+        // namespace sum would call the two sides equal while every per-container
+        // ceiling in the tree could be different. Its failures get their own
+        // cells so a reader is told which command to rerun.
+        let live_ranges = match self.kubectl(&["get", "limitrange", "-o", "json"], 60).await {
+            Ok(text) => match crate::governance_drift::live_limit_ranges(&text) {
+                Ok(ranges) => ranges,
+                Err(e) => {
+                    warn!(error = %e, "governance drift: the enforced limit ranges could not be parsed");
+                    drift.record_check_failure(
+                        crate::governance_drift::CheckFailure::GovernanceLimitRangeUnparseable,
+                    );
+                    return;
+                }
+            },
+            Err(e) => {
+                warn!(error = %e, "governance drift: the enforced limit ranges could not be read");
+                drift.record_check_failure(
+                    crate::governance_drift::CheckFailure::GovernanceLimitRangeUnreadable,
+                );
+                return;
+            }
+        };
+        let live = live.into_iter().chain(live_ranges).collect();
         // The whole table is written at once, so an object this revision no
         // longer declares leaves the reading with it.
         let mut compared = BTreeMap::new();
@@ -18800,20 +18825,49 @@ exit 0
         }
     }
 
-    /// fake kubectl：resourcequota 查询回给定的 items 数组文本，其余成功。
-    fn fake_kubectl_quota(dir: &Path, items: &str) -> String {
+    /// fake kubectl：两条治理查询各回给定的 items 数组文本，其余成功。
+    fn fake_kubectl_governance(dir: &Path, items: &str, ranges: &str) -> String {
         let log = dir.join("kubectl.log");
         let script = format!(
             r#"#!/bin/sh
 echo "$@" >> '{log}'
 case "$*" in
   *"get resourcequota"*) printf '%s' '{items}' ;;
+  *"get limitrange"*) printf '%s' '{ranges}' ;;
   *) echo ok ;;
 esac
 exit 0
 "#,
             log = log.display(),
-            items = items
+            items = items,
+            ranges = ranges
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// 同 [`fake_kubectl_governance`]，集群里没有 LimitRange。
+    fn fake_kubectl_quota(dir: &Path, items: &str) -> String {
+        fake_kubectl_governance(dir, items, EMPTY_LIMIT_RANGES)
+    }
+
+    /// 同 [`fake_kubectl_governance`]，把 `get limitrange` 那一支换成调用方给的
+    /// 脚本体：两条治理读取的失败各记自己那一格，所以得能单独弄坏后一条。
+    fn fake_kubectl_limitrange_broken(dir: &Path, items: &str, body: &str) -> String {
+        let log = dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"get resourcequota"*) printf '%s' '{items}' ;;
+  *"get limitrange"*) {body} ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            items = items,
+            body = body
         );
         write_fake_bin(dir, "fake-kubectl", &script);
         dir.join("fake-kubectl").to_string_lossy().to_string()
@@ -18828,15 +18882,32 @@ exit 0
 echo "$@" >> '{log}'
 case "$*" in
   *"get resourcequota"*) {body} ;;
+  *"get limitrange"*) printf '%s' '{ranges}' ;;
   *) echo ok ;;
 esac
 exit 0
 "#,
             log = log.display(),
-            body = body
+            body = body,
+            ranges = EMPTY_LIMIT_RANGES
         );
         write_fake_bin(dir, "fake-kubectl", &script);
         dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// 集群里没有 `LimitRange` 时 `get limitrange -o json` 的回话：是一份**空的
+    /// 列表**，不是「读不到」。夹具默认就是这一格——声明侧没有 LimitRange 的用例
+    /// 靠它把「比对了、没东西可比」与「没读成」分开。
+    const EMPTY_LIMIT_RANGES: &str = r#"{"apiVersion":"v1","kind":"List","items":[]}"#;
+
+    /// 集群侧 `get limitrange -o json` 的回话：一只 `cogneva-limits`，`Container`
+    /// 类的 `max.cpu` 是调用方给的那个数。
+    fn limit_ranges_listing(max_cpu: &str) -> String {
+        format!(
+            r#"{{"apiVersion":"v1","kind":"List","items":[{{"kind":"LimitRange",
+            "metadata":{{"name":"cogneva-limits"}},
+            "spec":{{"limits":[{{"type":"Container","max":{{"cpu":"{max_cpu}"}}}}]}}}}]}}"#
+        )
     }
 
     /// 集群侧 `get resourcequota -o json` 的回话，只带一个 `limits.cpu` 字段。
@@ -18877,6 +18948,44 @@ exit 0
         real_git_stdout(work, &["rev-parse", "HEAD"]).await
     }
 
+    /// 在 `from` 之上提一个新 rev：发布集里一只 ResourceQuota 与一只 LimitRange，
+    /// 各自声明一个数，推到 bare 的 main，返回那个 rev。
+    async fn release_set_declaring_a_quota_and_a_limit_range(
+        work: &Path,
+        from: &str,
+        cpu: &str,
+        max_cpu: &str,
+    ) -> String {
+        real_git(work, &["reset", "--hard", from]).await;
+        std::fs::create_dir_all(work.join("deploy/k3s")).unwrap();
+        std::fs::write(
+            work.join("deploy/k3s/kustomization.yaml"),
+            "resources:\n  - resource-quota.yaml\n  - limits.yaml\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work.join("deploy/k3s/resource-quota.yaml"),
+            format!(
+                "apiVersion: v1\nkind: ResourceQuota\nmetadata:\n  name: cogneva-quota\n  \
+                 namespace: cogneva\nspec:\n  hard:\n    limits.cpu: \"{cpu}\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            work.join("deploy/k3s/limits.yaml"),
+            format!(
+                "apiVersion: v1\nkind: LimitRange\nmetadata:\n  name: cogneva-limits\n  \
+                 namespace: cogneva\nspec:\n  limits:\n    - type: Container\n      \
+                 max:\n        cpu: \"{max_cpu}\"\n"
+            ),
+        )
+        .unwrap();
+        real_git(work, &["add", "deploy"]).await;
+        real_git(work, &["commit", "-m", "quota and limits"]).await;
+        real_git(work, &["push", "origin", "HEAD:main"]).await;
+        real_git_stdout(work, &["rev-parse", "HEAD"]).await
+    }
+
     /// 一份 Deployment 文档里所有容器与 init 容器的 limits 之和，按 ResourceQuota
     /// 的拼法归并。
     #[test]
@@ -18906,6 +19015,7 @@ exit 0
         let usage = crate::governance_drift::QuotaUsage {
             hard: BTreeMap::from([("limits.cpu".to_string(), "23".to_string())]),
             used: BTreeMap::from([("limits.cpu".to_string(), "18500m".to_string())]),
+            annotations: BTreeMap::new(),
         };
         let old = BTreeMap::from([("limits.cpu".to_string(), 4.0)]);
         // 4 -> 4.5 核：18.5 + 0.5 = 19 <= 23，放行。
@@ -18918,6 +19028,7 @@ exit 0
         let near = crate::governance_drift::QuotaUsage {
             hard: BTreeMap::from([("limits.cpu".to_string(), "23".to_string())]),
             used: BTreeMap::from([("limits.cpu".to_string(), "22.5".to_string())]),
+            annotations: BTreeMap::new(),
         };
         let hold = admission_shortfall("resourcequota/q", &near, &old, &raised);
         assert!(hold.is_some(), "22.5 + 2 应当越过 23");
@@ -18933,12 +19044,14 @@ exit 0
         let low = crate::governance_drift::QuotaUsage {
             hard: BTreeMap::from([("limits.cpu".to_string(), "1".to_string())]),
             used: BTreeMap::from([("limits.cpu".to_string(), "5".to_string())]),
+            annotations: BTreeMap::new(),
         };
         assert!(admission_shortfall("resourcequota/q", &low, &old, &unchanged).is_none());
         // 用量读不出来：不判，放行。
         let unreadable = crate::governance_drift::QuotaUsage {
             hard: BTreeMap::from([("limits.cpu".to_string(), "23".to_string())]),
             used: BTreeMap::new(),
+            annotations: BTreeMap::new(),
         };
         let raised = BTreeMap::from([("limits.cpu".to_string(), 9.0)]);
         assert!(admission_shortfall("resourcequota/q", &unreadable, &old, &raised).is_none());
@@ -19083,6 +19196,124 @@ exit 0
                     );
                 }
             }
+        }
+    }
+
+    /// 一只 `LimitRange` 的天花板与树内声明不同，是**它自己那只对象**上的差：
+    /// 按容器的上限和命名空间总和是两个问题，后者的 0 不该把前者的差盖住。
+    #[tokio::test]
+    async fn a_limit_range_at_another_ceiling_is_drift_on_its_own_object() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+        release_set_declaring_a_quota_and_a_limit_range(&work, &rev_b, "18.5", "4").await;
+
+        let kubectl =
+            fake_kubectl_governance(root, &quota_listing("18.5"), &limit_ranges_listing("6"));
+        let drift = std::sync::Arc::new(crate::governance_drift::GovernanceDrift::new());
+        let deployer = MainlineDeployer::new(
+            test_config(root, &bare, "buildah", &kubectl),
+            test_workspaces(root, &bare),
+        )
+        .with_governance_drift(drift.clone());
+
+        deployer.compare_governance().await;
+        assert_eq!(
+            drift.drift_fields(
+                crate::governance_drift::DriftClass::Governance,
+                "limitrange/cogneva-limits"
+            ),
+            Some(1),
+            "树内 max.cpu=4、集群执行 6 是一个字段的差"
+        );
+        assert_eq!(
+            drift.drift_fields(
+                crate::governance_drift::DriftClass::Governance,
+                "resourcequota/cogneva-quota"
+            ),
+            Some(0),
+            "配额那一只是对的，差要落在错的那只对象上"
+        );
+    }
+
+    /// 集群上根本没有这只 `LimitRange`：每个声明字段都算差。空表读成「一致」正是
+    /// 这条读数最该避免的形状。
+    #[tokio::test]
+    async fn a_limit_range_the_cluster_does_not_have_is_every_declared_field() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+        release_set_declaring_a_quota_and_a_limit_range(&work, &rev_b, "18.5", "4").await;
+
+        let kubectl = fake_kubectl_quota(root, &quota_listing("18.5"));
+        let drift = std::sync::Arc::new(crate::governance_drift::GovernanceDrift::new());
+        let deployer = MainlineDeployer::new(
+            test_config(root, &bare, "buildah", &kubectl),
+            test_workspaces(root, &bare),
+        )
+        .with_governance_drift(drift.clone());
+
+        deployer.compare_governance().await;
+        assert_eq!(
+            drift.drift_fields(
+                crate::governance_drift::DriftClass::Governance,
+                "limitrange/cogneva-limits"
+            ),
+            Some(1),
+            "声明了一个字段（max.cpu）而集群上连对象都没有，这一格是 1 不是 0"
+        );
+    }
+
+    /// `get limitrange` 的两种失败各记自己那一格，且配额那两格不动：一条命令坏了
+    /// 不该读成两条都坏了，也不该落下一个只比了一半的表。
+    #[tokio::test]
+    async fn the_two_ways_the_limit_range_read_fails_are_two_cells() {
+        for (label, script_body, expected) in [
+            (
+                "kubectl 起不来",
+                "exit 1\n",
+                crate::governance_drift::CheckFailure::GovernanceLimitRangeUnreadable,
+            ),
+            (
+                "回话解析不出",
+                "printf '%s' 'not json at all'\nexit 0\n",
+                crate::governance_drift::CheckFailure::GovernanceLimitRangeUnparseable,
+            ),
+        ] {
+            let _env = ENV_LOCK.lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let (bare, work, _rev_a, rev_b) = setup_repos(root).await;
+            release_set_declaring_a_quota_and_a_limit_range(&work, &rev_b, "18.5", "4").await;
+            let kubectl = fake_kubectl_limitrange_broken(root, &quota_listing("18.5"), script_body);
+
+            let drift = std::sync::Arc::new(crate::governance_drift::GovernanceDrift::new());
+            let deployer = MainlineDeployer::new(
+                test_config(root, &bare, "buildah", &kubectl),
+                test_workspaces(root, &bare),
+            )
+            .with_governance_drift(drift.clone());
+
+            deployer.compare_governance().await;
+            assert_eq!(drift.check_failures(), 1, "{label}");
+            assert_eq!(drift.check_failures_for(expected), 1, "{label}");
+            for other in crate::governance_drift::CheckFailure::ALL {
+                if other != expected {
+                    assert_eq!(
+                        drift.check_failures_for(other),
+                        0,
+                        "{label} 串到了 {other:?}"
+                    );
+                }
+            }
+            assert!(
+                drift
+                    .objects(crate::governance_drift::DriftClass::Governance)
+                    .is_empty(),
+                "{label}：只比了一半就写下逐对象读数"
+            );
         }
     }
 
