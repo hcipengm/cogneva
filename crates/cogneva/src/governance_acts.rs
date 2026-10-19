@@ -21,10 +21,13 @@ use std::error::Error;
 use chrono::{DateTime, Utc};
 
 use cog_core::{
-    close_ballot, decision_task, handover_task, validate_ballot, validate_principle, vote_task,
     Decision, DecisionMode, DecisionSpec, DecisionState, GovernanceStore, Handover, HandoverSpec,
     HandoverState, Signature, TaskStatus, TieBreak, Vote, DECISION_TASK_TYPE, HANDOVER_TASK_TYPE,
     VOTE_TASK_TYPE,
+};
+use cog_orchestrator::governance_acts::{
+    close_ballot, decision_task, handover_task, tally, validate_ballot, validate_principle,
+    vote_id, vote_task,
 };
 
 pub const USAGE: &str = "\
@@ -492,7 +495,7 @@ pub async fn run(
             if row.spec.state != DecisionState::Open {
                 return Err(format!("{decision} is {}, not open", row.spec.state.as_str()).into());
             }
-            let id = cog_core::vote_id(&decision, &unit);
+            let id = vote_id(&decision, &unit);
             let mut vote = find_node(store, VOTE_TASK_TYPE, &id).await?;
             if vote.status == TaskStatus::Cancelled {
                 println!("{id}: already withdrawn");
@@ -572,7 +575,7 @@ pub async fn run(
                 let rows: Vec<serde_json::Value> = decisions
                     .iter()
                     .map(|decision| {
-                        let tally = cog_core::tally(
+                        let tally = tally(
                             &decision.spec,
                             &votes
                                 .iter()
@@ -601,7 +604,7 @@ pub async fn run(
                     .filter(|v| v.decision_id == decision.id)
                     .cloned()
                     .collect();
-                let tally = cog_core::tally(&decision.spec, &mine);
+                let tally = tally(&decision.spec, &mine);
                 println!(
                     "{}\t{}\t{}\t{}\t{}\t{}",
                     decision.id,
