@@ -154,6 +154,13 @@ const BUILDAH_RMI_BATCH_CHUNK: usize = 32;
 /// 所以构建那一段的墙是"cargo 的墙 + 这个数"。
 const STRIP_WALL_SECS: u64 = 60;
 
+/// 判定 Job 还在跑时，就地轮询它的间隔。
+///
+/// 这个数是"看见它退出"的延迟，不是"等它跑完"的时间：判定本身要跑几分钟，而
+/// 十五秒的粒度在十分钟的轮询节拍旁边几乎不花什么——它只换掉一个本来要等满
+/// 一轮才发生的结论。
+const JUDGEMENT_POLL_SECS: u64 = 15;
+
 /// 打镜像每一步各自的墙钟上界。步名说的是这一步在干什么，不是 buildah 的子命令
 /// 名——同一个子命令在两条路径上的墙不同（`images --json` 要列整个库，`images -q`
 /// 只问一个 tag 在不在），按子命令归并就把其中一条的墙挪到了另一条上。
@@ -2002,7 +2009,11 @@ impl MainlineDeployer {
     /// 随资产条数线性放大（每份资产一步 `copy`），而界只会越放越松，放到最后等于把
     /// 这条规则关掉。
     fn round_work_secs(&self) -> u64 {
-        self.cfg.build_timeout_secs + STRIP_WALL_SECS + Self::buildah_max_step_wall_secs()
+        // 判定那一段也要算进来（见 `await_judgement`）：一轮要么在构建、要么在等
+        // 判定，两者不叠加，所以声明取两者中更长的那个而不是求和。少算这一段，
+        // 一个等在判定上的轮在存活面上与"停了"同形。
+        (self.cfg.build_timeout_secs + STRIP_WALL_SECS + Self::buildah_max_step_wall_secs())
+            .max(self.cfg.soak_secs + self.cfg.rollout_timeout_secs)
     }
 
     /// 每一条**部署器自己的** kubectl 调用都从这里走，只在一条路上加了东西：
@@ -4369,7 +4380,7 @@ impl MainlineDeployer {
         // contract that holds.
         self.report_version_contract(&bare).await;
         let images = self.deployed_images().await?;
-        let deployed = classify_deployed(&images);
+        let mut deployed = classify_deployed(&images);
 
         // 容量回收。放在这里（四部署读数之后、所有早退之前）：它判的是 registry
         // 那张卷，与"这一轮推不推进"无关，任何一条早退都不该把它跳过——被跳过
@@ -4386,6 +4397,36 @@ impl MainlineDeployer {
         // 在飞任务收敛/终态处理。
         if let Some(inflight) = state.in_flight.clone() {
             let job = job_name(&inflight.rev);
+            // 判定者通常要跑几分钟，而下一轮在十分钟之后。只等"下一轮"等于把
+            // 「判定已经退出」到「部署器看见它退出」的这一段交给轮询节拍：
+            // 2026-10-19 实测这一段是 8 分 34 秒（Job 14:16:39Z 退出，部署器
+            // 14:25:13Z 才收敛），而同一版从拿到构建槽到 last_good 一共才 19 分钟。
+            // 判定在跑时就地等它退出，把一段本来只受节拍限制的等待收进本轮。
+            //
+            // 界的来源是判定自己声明的两段预算（soak 与单目标滚动），不是另写
+            // 一个数：正常的判定在这两段之内结束，超出的那一轮照旧回下一轮——
+            // 这里不改变"等不到怎么办"，只改变"等到了多久才被看见"。
+            if inflight.phase == Phase::Dispatched
+                && matches!(self.job_status(&job).await?, JobStatus::Running)
+            {
+                info!(
+                    rev = %rev12(&inflight.rev),
+                    job = %job,
+                    "rollout images are on the target revision; waiting for the judgement to finish"
+                );
+                let budget =
+                    Duration::from_secs(self.cfg.soak_secs + self.cfg.rollout_timeout_secs);
+                if !self
+                    .await_judgement(&job, Duration::from_secs(JUDGEMENT_POLL_SECS), budget)
+                    .await?
+                {
+                    return Ok(());
+                }
+                // 判定 Job 的职责就是把四个 Deployment 换到这一版上，它退出之前
+                // 读到的部署面是它开工前的世界。拿轮首那份读数去判 on_target，
+                // 会把一个刚滚完的 rev 判成"镜像没到位"。
+                deployed = classify_deployed(&self.deployed_images().await?);
+            }
             // 判定者的结论先取：它既是"这一版算不算收敛"的前提，也是资源读数能不能
             // 读到的前提——读数由判定进程在退出前写进终止消息，判定还在跑时那条通道
             // 还是空的（实测：镜像到位比 Job 退出早约两分半，成功那一支的读数就是
@@ -6003,6 +6044,34 @@ impl MainlineDeployer {
             .await?;
         info!(rev = %rev12(rev), name = %manifests_configmap_name(rev), "manifest bundle published");
         Ok(())
+    }
+
+    /// 判定 Job 还在跑时，就地等它退出。
+    ///
+    /// 返回它是否在界内退出：`false` 表示界用完了、Job 还在跑——调用方照旧回
+    /// 下一轮，与这个等待存在之前的行为一致。界取判定自己声明的两段预算（soak
+    /// 与单目标滚动），所以它不是一个新的阈值，只是把判定本来宣称要做的事等完。
+    ///
+    /// 等的是"退出"，不是"通过"：失败、被删、完成都由调用方按 `job_status`
+    /// 的同一套分支去判，这里不替它下结论。
+    ///
+    /// `poll` 与 `budget` 由调用方给：前者是"多勤地问"，后者是"问到多久为止"，
+    /// 两个数在这一层都没有唯一的正确值——预算来自判定自己声明的工期，而问的
+    /// 频率属于部署器的节拍。
+    async fn await_judgement(&self, job: &str, poll: Duration, budget: Duration) -> SFResult<bool> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            // 睡到界上就够，不多睡：预算比一拍还短时（测试里就是如此），
+            // 多睡的那一下等于让"界到了"这件事比界本身晚发生。
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(poll.min(remaining)).await;
+            if !matches!(self.job_status(job).await?, JobStatus::Running) {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+        }
     }
 
     async fn job_status(&self, name: &str) -> SFResult<JobStatus> {
@@ -14492,6 +14561,74 @@ exit 0
             deployer.job_status("job-missing").await.unwrap(),
             JobStatus::NotFound
         );
+    }
+
+    /// 判定还在跑的那一刻，部署器不能只是回下一轮：下一轮在十分钟之后，而
+    /// 2026-10-19 实测"Job 退出 → 部署器看见"这一段是 8 分 34 秒。这个用例钉的是
+    /// 它在本轮里问到 Job 退出为止。
+    #[tokio::test]
+    async fn a_running_judgement_is_waited_for_until_it_exits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        // 前两次回答 running，之后 complete——第三次问就是"它退出了"的那一刻。
+        // 计数写在脚本旁边，不写在进程内存里：被测代码每问一次都是新进程。
+        let script = r#"#!/bin/sh
+n=$(cat "$0.count" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$0.count"
+if [ "$n" -le 2 ]; then echo "||1"; else echo "1||"; fi
+"#;
+        write_fake_bin(&bin_dir, "fake-kubectl", script);
+        let cfg = MainlineDeployerConfig {
+            kubectl_bin: bin_dir.join("fake-kubectl").to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(&bin_dir, &bin_dir));
+        let exited = deployer
+            .await_judgement(
+                "job-running",
+                Duration::from_millis(1),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert!(exited, "第三次读到完成时必须判成退出了");
+        let asked = std::fs::read_to_string(bin_dir.join("fake-kubectl.count")).unwrap();
+        assert_eq!(asked.trim(), "3", "问到退出之前不得提前返回");
+    }
+
+    /// 界用完还在跑时必须回下一轮，而不是把这一轮永远占住：等不到的判定不能比
+    /// 等它之前更糟。
+    #[tokio::test]
+    async fn a_judgement_past_its_budget_hands_the_round_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let script = r#"#!/bin/sh
+n=$(cat "$0.count" 2>/dev/null || echo 0)
+echo "$((n + 1))" > "$0.count"
+echo "||1"
+"#;
+        write_fake_bin(&bin_dir, "fake-kubectl", script);
+        let cfg = MainlineDeployerConfig {
+            kubectl_bin: bin_dir.join("fake-kubectl").to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(&bin_dir, &bin_dir));
+        let exited = deployer
+            .await_judgement(
+                "job-running",
+                Duration::from_millis(1),
+                Duration::from_millis(30),
+            )
+            .await
+            .unwrap();
+        assert!(!exited, "界的意义就是这一刻：它没退出，就不再等");
+        let asked: u32 = std::fs::read_to_string(bin_dir.join("fake-kubectl.count"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(asked >= 2, "界内至少要问过一次以上，实际问了 {asked} 次");
     }
 
     #[tokio::test]
