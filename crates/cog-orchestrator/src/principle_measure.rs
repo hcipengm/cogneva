@@ -380,18 +380,26 @@ pub fn judge(row: &PrincipleRow, declarations: &Declarations) -> Verdict {
         return Verdict::Retired;
     }
     let platform = declarations.gate_for(&row.slug);
-    // A principle whose tier a person holds settles here unless the platform's
-    // registry names a gate for it. The host's silence is still not a finding:
-    // the tier is the record that the host side is a person's to decide, and no
-    // missing host check is a debt. The platform's registry is a different
-    // claim -- a file that says it enforces this principle -- and refusing to
-    // read it would leave a gate the tree really has unrecorded on every pass,
-    // which is the one answer this ledger exists to give. So the declaration is
-    // read first and the tier decides the rest.
+    // A principle whose tier a person holds settles here unless a registry names
+    // a gate for it. A registry's silence is still not a finding: the tier is the
+    // record that the host side is a person's to decide, and no missing host
+    // check is a debt. A registry that does name a gate is a different claim --
+    // a file that says it enforces this principle -- and refusing to read either
+    // one would leave a gate the tree really has unrecorded on every pass, which
+    // is the one answer this ledger exists to give. So both sides are read first
+    // and the tier decides the rest; the host's column goes first because it is
+    // the side that produces the readings. The tier is written down when no gate
+    // existed, and a gate that arrived afterwards is not made invalid by it.
     if row.check_kind == Some(cog_core::PrincipleCheckKind::Judgement) {
-        return match platform {
-            Some(_) => Verdict::Enforced(GateSide::Platform),
-            None => Verdict::HumanOnly,
+        let named_host = row.host_gate.as_deref().map(str::trim).filter(|host| {
+            !host.is_empty()
+                && *host != HOST_REGISTRY_READ_NO_GATE
+                && !host.starts_with(HOST_JUDGEMENT_STALE_PREFIX)
+        });
+        return match (named_host, platform) {
+            (Some(_), _) => Verdict::Enforced(GateSide::Host),
+            (None, Some(_)) => Verdict::Enforced(GateSide::Platform),
+            (None, None) => Verdict::HumanOnly,
         };
     }
     match row.host_gate.as_deref().map(str::trim) {
@@ -517,13 +525,13 @@ mod tests {
         assert_eq!(verdict.reason(), None);
     }
 
-    /// The platform's registry outranks the tier, because it is the only one of
-    /// the two that can hold a machine check for a principle a person otherwise
-    /// holds. Without this, a `judgement` row's declaration would be read on
-    /// every pass and never recorded: the row is never measured, so the account
-    /// would go on saying the platform names no gate where the tree says it
-    /// does -- and a reader asking "where would this go red" gets silence about
-    /// the one file that can answer.
+    /// The platform's registry outranks the tier: the tier says no machine holds
+    /// this principle, and a file that declares it does refutes that reading.
+    /// Without this, a `judgement` row's declaration would be read on every pass
+    /// and never recorded: the row is never measured, so the account would go on
+    /// saying the platform names no gate where the tree says it does -- and a
+    /// reader asking "where would this go red" gets silence about the one file
+    /// that can answer.
     #[test]
     fn a_judgement_row_the_platform_declares_is_enforced_by_the_platform() {
         let mut held = row("feedback_x", Some("-"));
@@ -532,6 +540,39 @@ mod tests {
         let verdict = judge(&held, &declared);
         assert_eq!(verdict, Verdict::Enforced(GateSide::Platform));
         assert_eq!(verdict.state(), Some(cog_core::PrincipleState::Enforced));
+    }
+
+    /// The host's registry outranks the tier for the same reason, and it is the
+    /// side read first everywhere else. The tier is a claim that no machine
+    /// checks this principle; a test that registers itself as its gate is a
+    /// machine that runs, and it arrived after the tier was written down. Leaving
+    /// the host side unread settles those rows as held on every pass while the
+    /// host's own projection says `enforced:host` for the same slug -- two
+    /// accounts disagreeing about one row, which is the reading this ledger
+    /// exists to produce and not one it should produce about itself.
+    #[test]
+    fn a_judgement_row_the_host_gates_is_enforced_by_the_host() {
+        let mut held = row("feedback_x", Some("test:ledger.test.sh"));
+        held.check_kind = Some(cog_core::PrincipleCheckKind::Judgement);
+        let verdict = judge(&held, &Declarations::default());
+        assert_eq!(verdict, Verdict::Enforced(GateSide::Host));
+        assert_eq!(verdict.state(), Some(cog_core::PrincipleState::Enforced));
+    }
+
+    /// The two host readings that are not gates keep the tier: a `-` is a
+    /// registry that read and found nothing, and a `stale:` value is a gate whose
+    /// memory left the tree, so it covers nothing.
+    #[test]
+    fn a_judgement_row_with_no_live_host_gate_still_settles_on_its_tier() {
+        for host in ["-", "", "stale:gone"] {
+            let mut held = row("feedback_x", Some(host));
+            held.check_kind = Some(cog_core::PrincipleCheckKind::Judgement);
+            assert_eq!(
+                judge(&held, &Declarations::default()),
+                Verdict::HumanOnly,
+                "{host:?}"
+            );
+        }
     }
 
     /// The tier is the whole reason the answer is HumanOnly: the same reading on
