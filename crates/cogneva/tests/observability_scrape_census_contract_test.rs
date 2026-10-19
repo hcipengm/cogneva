@@ -332,11 +332,17 @@ const GAPS_AT_SCRAPE_CENSUS: usize = 14;
 ///
 /// Nine on 2026-10-19: `cogneva_build_gate_reservation_lapsed_total`, the
 /// claims on the next build that expired unused. It was published because the
-/// only trace of the mainline's 14:55 claim was a log line, and it is registered
-/// rather than drawn because no threshold follows from a single lapse -- a
-/// reader of the population (how many lost turns does a window hold, and for
-/// which work) is the face still owed.
-const REGISTERED_BUT_UNREAD_AT_CENSUS: usize = 9;
+/// only trace of the mainline's 14:55 claim was a log line, and it was
+/// registered rather than drawn because no threshold follows from a single
+/// lapse -- the face owed was a reader of the population (how many lost turns
+/// does a window hold, and for which work).
+///
+/// That reader exists now: the dashboard's "Build Gate: Reservations That
+/// Expired Unused" panel draws the lapses over six hours, per asker and in
+/// total, which is the population reading. The row stays in the produced table,
+/// because a panel reading a series is exactly what that table licenses. Eight
+/// again, and the eighth is still the prose-versus-query distinction above.
+const REGISTERED_BUT_UNREAD_AT_CENSUS: usize = 8;
 
 #[test]
 fn every_series_a_build_can_render_is_on_a_face_or_has_a_verdict() {

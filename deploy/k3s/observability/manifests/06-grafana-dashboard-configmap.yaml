@@ -1987,6 +1987,45 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 49,
+          "title": "Build Gate: Reservations That Expired Unused",
+          "description": "A reservation on the next build is honoured only while it is fresh; past that window it is dropped without a word, the work that asked loses its turn, the slot goes to whoever arrives next, and the refusals it gets afterwards read exactly like the ones it got before it asked. A lapse is charged where the staleness is first read -- no code runs at the expiry instant -- once per claim, to the asker that wrote it. The series set is fixed at one row per asker and zero is published, so a work that never asked for the next build reads as zero here rather than as absent, and the rows that are missing tell you the process is not reporting at all. What this panel answers is the population over a window: how many turns were lost and who lost them. One lapse derives no threshold, so there is no alert line to draw; the rate is the reading.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 224
+          },
+          "targets": [
+            {
+              "expr": "sum by (asker) (increase(cogneva_build_gate_reservation_lapsed_total[6h]))",
+              "legendFormat": "{{asker}} lapsed (6h)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum(increase(cogneva_build_gate_reservation_lapsed_total[6h]))",
+              "legendFormat": "all askers lapsed (6h)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {
