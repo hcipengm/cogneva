@@ -1511,6 +1511,39 @@ const CI_HOLD_ENDED_EVENT: &str = "ci_hold_ended";
 /// 一个环足够回答"最近几版都怎么被放的"，又不让状态文件随历史线性长大。
 const CI_HOLD_END_KEEP: usize = 16;
 
+/// 一段"连续被构建闸拒绝、终于拿到槽"的结局。
+///
+/// `advance_deferrals` 只答"现在连输几轮"，拿到槽的那一轮写回 0——于是这一段等了
+/// 多久、为什么等、按阈值认领的名额发出去之后有没有换来槽，在清零的同一刻一起消失。
+/// 环、心跳与日志共用这一个形状。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AdvanceWaitEnd {
+    rev: String,
+    since_unix: i64,
+    ended_unix: i64,
+    deferrals: u32,
+    /// 闭集：`build_gate_busy` / `other`。
+    ///
+    /// 前一格是闸明确答了"别人占着"——容量竞争；后一格是问不出去的任何别的形状。
+    /// 两者并成一格，等于把一次正常的容量竞争读成一次故障，或者反过来：读数要能
+    /// 回答"这段等待是排队还是坏了"，所以必须分开。
+    reason: String,
+    /// 这一段等待里是否已经按阈值认领过下一个构建名额。这是"换手请求发出去了没有"
+    /// 的唯一记录——`reserve_build_field` 只写一个文件，没人记它发给了谁、有没有回音。
+    ///
+    /// 只增不减：认领过就为真，预留后来过期、或者闸的拒因从"被预留挡住"变回"槽空着
+    /// 但别人先到"，都不回退这一格。它答的是"请求发出去了没有"，不是"此刻还占着
+    /// 没有"——后者是闸自己的读数，不该在这里第二份。
+    reserved: bool,
+}
+
+/// 等槽结束这件事的读数字面量：日志、盘上状态与变更面共用同一个名字。
+const ADVANCE_WAIT_ENDED_EVENT: &str = "advance_wait_ended";
+
+/// 盘上保留多少段等槽的结局。与 [`CI_HOLD_END_KEEP`] 同尺度：这里答的是"最近几段
+/// 等待怎么结束的"，不是全量审计。
+const ADVANCE_WAIT_KEEP: usize = 16;
+
 /// 上一次问上游 CI 得到的判词，按 rev 落盘。
 ///
 /// 三支放行面里有两支长得一样（`pass` 与 `no_evidence`），区别只在事后：
@@ -1592,6 +1625,24 @@ struct MainlineState {
     /// 每次滚动都会把"已经等了多久"抹掉，而这恰恰是唯一需要它的那个数。
     #[serde(default)]
     advance_deferrals: u32,
+    /// 当前这一段等槽从哪一刻开始（unix 秒）。`None` = 当前不在等。
+    ///
+    /// `advance_deferrals` 只数轮数，答不出"等了多久"：一轮 600 秒，两轮与十轮在
+    /// 同一个计数上能差出一个数量级。起止时刻必须落盘——清零与重启都可能发生在
+    /// 这一段等待中间，而"已经等了多久"正是最容易被它们抹掉的那个数。
+    #[serde(default)]
+    advance_wait_since_unix: Option<i64>,
+    /// 当前这一段等待里最近一次被拒的理由，闭集 `build_gate_busy` / `other`。
+    /// 结束时要把它写进结局；只留 `advance_deferrals` 的话，这一段为什么等在
+    /// 清零之后没有任何载体。
+    #[serde(default)]
+    advance_wait_reason: Option<String>,
+    /// 当前这一段等待里是否已经按阈值认领过下一个构建名额。
+    #[serde(default)]
+    advance_wait_reserved: bool,
+    /// 最近的每一段等槽是怎么结束的。见 [`AdvanceWaitEnd`]。
+    #[serde(default)]
+    advance_wait_ends: Vec<AdvanceWaitEnd>,
     /// 上一次容量回收是什么时候（unix 秒，0 = 从没做过）。冷却窗挂在内存里的话，
     /// 进程重启一次就少一道闸，而重启这个进程正是它自己会做的事。
     #[serde(default)]
@@ -4779,25 +4830,83 @@ impl MainlineDeployer {
                 // 撞上一台正在构建的宿主"与"永远轮不到"分开的那个读数——`what` 只是
                 // 请求者，拒因里的持有者是门那边加的。清零放在真正拿到槽的那一刻：
                 // 这一计数量的就是"连续多少轮没拿到槽"，拿到一次的下一轮就不再是连续。
+                let reason = advance_wait_reason(&e);
                 state.advance_deferrals = state.advance_deferrals.saturating_add(1);
+                // 起点只在第一轮写：它答的是"这一段从哪一刻开始"，每轮覆盖就成了
+                // "上一轮在哪"，而这一段等了多久正是清零时要落进结局的那个数。
+                if state.advance_wait_since_unix.is_none() {
+                    state.advance_wait_since_unix = Some(chrono::Utc::now().timestamp());
+                }
+                state.advance_wait_reason = Some(reason.to_string());
+                // 连输够多轮：认领下一个名额，让正在排队的构建方都让一步。零等待
+                // 那一半没变——这一轮照旧什么都不做地回下一轮（见
+                // `ADVANCE_CLAIM_AFTER_DEFERRALS`）。认领过没有也要落盘：结局里的
+                // `reserved` 是"换手请求发出去过没有"的唯一记录。
+                if state.advance_deferrals >= ADVANCE_CLAIM_AFTER_DEFERRALS {
+                    crate::build_gate::reserve_build_field("mainline advance");
+                    state.advance_wait_reserved = true;
+                }
                 self.save_state(&state)?;
                 // 发出去的值就是刚落到盘上的那个：盘上是 3、指标上还是上一拍的 2，
                 // 会让读的人拿两格不同的数当同一件事。
                 self.record_advance_deferrals(state.advance_deferrals).await;
-                // 连输够多轮：认领下一个名额，让正在排队的构建方都让一步。零等待
-                // 那一半没变——这一轮照旧什么都不做地回下一轮（见
-                // `ADVANCE_CLAIM_AFTER_DEFERRALS`）。
-                if state.advance_deferrals >= ADVANCE_CLAIM_AFTER_DEFERRALS {
-                    crate::build_gate::reserve_build_field("mainline advance");
-                }
                 info!(
                     deferrals = state.advance_deferrals,
+                    reason = reason,
+                    reserved = state.advance_wait_reserved,
                     error = %e,
                     "host is building; deferring the advance to the next cycle"
                 );
                 return Ok(());
             }
         };
+        // 拿到槽就是这一段等待的结束。结局要在清零之前写下来：`advance_deferrals`
+        // 一归零，这一段等了多久、为什么等、认领的名额有没有换来槽，就一起没了——
+        // 这个 Pod 自己的日志随滚动消失，而滚动正是它自己会做的事。
+        //
+        // 拒因取**最近一次**被拒时记下的那一格，不是第一轮的：一段等待里闸给的理由
+        // 可以变（预留过期之后从"被预留挡住"变成"槽空着但别人先到"），结束时要答的
+        // 是"最后是被什么挡住的"。
+        if state.advance_deferrals > 0 {
+            let now_unix = chrono::Utc::now().timestamp();
+            // 旧状态文件里可能只有计数没有起点：按这一刻记 0 秒，宁可把一段等待读短，
+            // 也不凭空编一个起点。
+            let since_unix = state.advance_wait_since_unix.unwrap_or(now_unix);
+            let ended = AdvanceWaitEnd {
+                rev: bare.clone(),
+                since_unix,
+                ended_unix: now_unix,
+                deferrals: state.advance_deferrals,
+                reason: state
+                    .advance_wait_reason
+                    .clone()
+                    .unwrap_or_else(|| "other".to_string()),
+                reserved: state.advance_wait_reserved,
+            };
+            info!(
+                event = ADVANCE_WAIT_ENDED_EVENT,
+                rev = %rev12(&ended.rev),
+                since_unix = ended.since_unix,
+                ended_unix = ended.ended_unix,
+                waited_secs = ended.ended_unix - ended.since_unix,
+                deferrals = ended.deferrals,
+                reason = %ended.reason,
+                reserved = ended.reserved,
+                "took the build slot after deferring; recording how the wait ended"
+            );
+            state.advance_wait_ends.push(ended);
+            let excess = state
+                .advance_wait_ends
+                .len()
+                .saturating_sub(ADVANCE_WAIT_KEEP);
+            if excess > 0 {
+                state.advance_wait_ends.drain(..excess);
+            }
+            state.advance_wait_since_unix = None;
+            state.advance_wait_reason = None;
+            state.advance_wait_reserved = false;
+            self.save_state(&state)?;
+        }
         state.advance_deferrals = 0;
         // 拿到槽就把这一格写回 0：共享表只增不改，一段饿住结束后只剩这里能把它灭掉。
         self.record_advance_deferrals(0).await;
@@ -6402,6 +6511,18 @@ fn ci_hold_end(
     }
 }
 
+/// 把构建闸的拒绝归进闭集。
+///
+/// `ResourceExhausted` 是闸明确答了"别人占着"——排队，容量竞争；其余形状（超时、
+/// IO、编码坏了）都是"问不出去"——故障。两格并成一格，读数就把排队读成故障，或者
+/// 反过来把故障读成正常排队。
+fn advance_wait_reason(err: &SFError) -> &'static str {
+    match err {
+        SFError::ResourceExhausted(_) => "build_gate_busy",
+        _ => "other",
+    }
+}
+
 fn heartbeat_message(
     state: &MainlineState,
     bare_rev: &str,
@@ -6415,7 +6536,7 @@ fn heartbeat_message(
         .map(|f| format!("{}@{:?}", rev12(&f.rev), f.phase))
         .unwrap_or_else(|| "none".into());
     format!(
-        "bare={} upstream={} behind_revs={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={}",
+        "bare={} upstream={} behind_revs={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={} advance_waits={} last_advance_wait={}",
         rev12(bare_rev),
         upstream,
         // 落后几个 rev。`last_good_secs` 答的是"多久"，这一格答的是"几笔"——两者
@@ -6472,6 +6593,23 @@ fn heartbeat_message(
         state.failed_signatures.len(),
         state.failed_repeated,
         (state.failed_cooldown_until - now_unix).max(0),
+        // 等槽的**结局**：`advance_deferrals` 拿到槽就归零，所以它只能答"现在在不在
+        // 等"。一段等待结束之后，这两格才是"等了多久、为什么、认领的名额有没有换来槽"
+        // 的读数——日志会随滚动消失，这一行不会。
+        state.advance_wait_ends.len(),
+        state
+            .advance_wait_ends
+            .last()
+            .map(|e| {
+                format!(
+                    "{}@{}s/{}{}",
+                    rev12(&e.rev),
+                    (e.ended_unix - e.since_unix).max(0),
+                    e.reason,
+                    if e.reserved { "+reserved" } else { "" }
+                )
+            })
+            .unwrap_or_else(|| "none".into()),
     )
 }
 
@@ -8930,6 +9068,19 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
                 reasons: vec!["gitee:no_runs".into()],
             }],
             advance_deferrals: 0,
+            // 等槽结束之后 `advance_deferrals` 归零：这一段等了多久、为什么、
+            // 认领的名额有没有换来槽，只能从这两格读。
+            advance_wait_ends: vec![AdvanceWaitEnd {
+                rev: "99887766aabb".into(),
+                since_unix: 400,
+                ended_unix: 1000,
+                deferrals: 3,
+                reason: "build_gate_busy".into(),
+                reserved: true,
+            }],
+            advance_wait_since_unix: None,
+            advance_wait_reason: None,
+            advance_wait_reserved: false,
             registry_maintenance_unix: 0,
             registry_restart_unix: Some(940),
             registry_gc_owed: false,
@@ -8962,6 +9113,26 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         // 扣住结束之后 `ci_hold` 退回 none：这一版后来怎么被放的，只能从这里读。
         assert!(msg.contains("ci_hold_ends=1"), "{msg}");
         assert!(msg.contains("last_ci_hold_end=cafebabe0011@pass"), "{msg}");
+        // 等槽的结局同理：从 400 等到 1000 = 600 秒，被闸挡住、认领过名额。
+        assert!(msg.contains("advance_waits=1"), "{msg}");
+        assert!(
+            msg.contains("last_advance_wait=99887766aabb@600s/build_gate_busy+reserved"),
+            "{msg}"
+        );
+    }
+
+    /// 等槽的拒因是两格的闭集：闸答了"别人占着"是排队，别的形状是故障。
+    /// 并成一格，读数就把一次容量竞争读成一次故障（或者反过来）。
+    #[test]
+    fn an_advance_wait_reason_separates_busy_from_failure() {
+        assert_eq!(
+            advance_wait_reason(&SFError::ResourceExhausted("host is building".into())),
+            "build_gate_busy"
+        );
+        assert_eq!(
+            advance_wait_reason(&SFError::IO("gate state dir unreadable".into())),
+            "other"
+        );
     }
 
     /// 扣住的结局是三格的闭集：同一版判过、同一版没证据、上游已经换版。
@@ -9383,6 +9554,19 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
                 reasons: Vec::new(),
             }],
             advance_deferrals: 0,
+            // 同理：结局与"正在等"的三格都要能被 serde 带过去，重启一次不能把
+            // 一段等待读成"从没发生过"，也不能把它读成"还在等"。
+            advance_wait_ends: vec![AdvanceWaitEnd {
+                rev: "bb".into(),
+                since_unix: 900,
+                ended_unix: 1000,
+                deferrals: 2,
+                reason: "other".into(),
+                reserved: false,
+            }],
+            advance_wait_since_unix: Some(2000),
+            advance_wait_reason: Some("build_gate_busy".into()),
+            advance_wait_reserved: true,
             registry_maintenance_unix: 0,
             registry_restart_unix: None,
             registry_gc_owed: false,
