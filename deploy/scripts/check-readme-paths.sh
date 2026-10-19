@@ -16,6 +16,9 @@
 #     不带（`cogneva/src/bootstrap.rs`），两种都指同一处；按存在的那个算。
 #   - **只看被反引号括起来的**：反引号是「这是一个路径」的标记本身。正文里的散装
 #     词不做路径解析（`publish / subscribe` 这种斜杠不是路径分隔符）。
+#   - **占位符不算路径**：`<file>`、`*.rs`、`{name}/{version:06}.json` 说的是「这儿的
+#     文件长这样」，不是「这棵树下有这一份」。缺了这一条，文档一描述产物命名就得改
+#     说法去迁就门——门把一句正确的说明判成死指针，红的是门不是文档。
 #
 # 用法：bash deploy/scripts/check-readme-paths.sh [文件...]
 #       不给文件时判仓库根的两份 README（本门服务的正是这份对外承诺）。
@@ -39,7 +42,7 @@ for f in "${files[@]}"; do
     token="${hit#*:}"
     token="${token//\`/}"
     case "${token}" in
-      "" | *[[:space:]]* | /* | *"://"* | *'<'* | *'>'* | *'*'*) continue ;;
+      "" | *[[:space:]]* | /* | *"://"* | *'<'* | *'>'* | *'*'* | *'{'* | *'}'*) continue ;;
     esac
     case "${token}" in */*) ;; *) continue ;; esac
     case "${token##*/}" in *.*) ;; *) continue ;; esac

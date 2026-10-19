@@ -580,13 +580,23 @@ mod tests {
         // aggregate reads. The coverage term is required by the shared gate; it
         // is asserted here as well because this rule is the one that would
         // otherwise fire once per ledger pod start and claim fifteen minutes.
+        //
+        // The window can be spelled two ways and both ask the same question: a
+        // plain range selector (`[15m]`) or a subquery (`[15m:1m]`, needed once
+        // the inner selector itself is an over-time aggregate). Pinning the
+        // literal `[15m]` made this test describe a spelling rather than the
+        // window, so it reddened when the rule moved to the subquery form
+        // without the rule reading any less of the window.
+        let covers = |window: &str| {
+            promql.contains(&format!("[{window}]")) || promql.contains(&format!("[{window}:"))
+        };
         assert!(
-            promql.contains("min_over_time(") && promql.contains("[15m]"),
+            promql.contains("min_over_time(") && covers("15m"),
             "rule {HOST_SLICE_ANON_FLOOR_RULE} must read the whole window rather than a \
              single sample, got: {promql}"
         );
         assert!(
-            promql.contains("count_over_time(") && promql.contains("[30m]"),
+            promql.contains("count_over_time(") && covers("30m"),
             "rule {HOST_SLICE_ANON_FLOOR_RULE} must require the 15m window to be covered \
              rather than read whatever samples it happens to hold, got: {promql}"
         );

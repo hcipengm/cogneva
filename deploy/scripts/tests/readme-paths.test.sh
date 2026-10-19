@@ -55,6 +55,10 @@ expect runtime_dir 0 '4. 通过质量门后写入 `evolution-changes/`'
 # 散装斜杠：不是反引号括起来的，不解析。
 expect prose_slash 0 'The pipeline reads and writes files, and the ratio is read / write bound.'
 
+# 模板占位：描述产物命名的一句，花括号说明「这里是个变量」。与 `<`、`*` 同族，
+# 都不是在说某一份文件今天在树上——判红的修法会变成「把文档改糊涂」。
+expect template_placeholder 0 '产物存放在 `{name}/{version:06}.json` 加一个 `ACTIVE` 指针'
+
 # 绝对路径与 URL：容器里的路径与外部文档，不该按仓库根解析。
 expect absolute_and_url 0 '装到 `/opt/cogneva`，文档见 `https://example.com/a/b.md`。'
 
