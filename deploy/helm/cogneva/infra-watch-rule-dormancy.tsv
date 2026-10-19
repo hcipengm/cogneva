@@ -41,10 +41,12 @@
 # wave through a dead rule. Each row names the emitting path in why.
 #
 # Re-read 2026-10-19 against the live series face (24h window), app image
-# main-be5add5996d6.
+# main-be5add5996d6; re-read again at 16:11 +0800 on main-93ebcda35e7a, when the
+# chart had grown to 194 rules (194 total, 12 cannot fire, 10 absent names).
 
-# --- lazy_counter (7 rules): counters that exist only after the bad event ----
+# --- lazy_counter (8 rules): counters that exist only after the bad event ----
 landing_mirror_behind	cogneva_mirror_push_failures_total	lazy_counter	Counted only when a mirror push is refused (cog-github/src/landing.rs record_counter on the failure branch); no refusal in 24h means the counter was never created. The rule fires on the first one.
+mainline_kubectl_refused	cogneva_mainline_kubectl_refused_total	lazy_counter	Counted only when the cluster's authorization refuses one of the deployer's kubectl calls (cog-reflection/src/mainline_deployer.rs record_kubectl_refused, refusal branch only); labels are the server's own verb+resource, so the family is created by the first refusal and the rule fires on it. Emitter landed in 252fe47b, inside the running image main-93ebcda35e7a.
 mainline_delivery_preflight_refused	cogneva_mainline_preflight_refused_total	lazy_counter	Counted only when the preflight refuses a deploy (cog-reflection/src/mainline_deployer.rs); refused_total has no zero-value series until the first refusal.
 memory_backend_operation_never_succeeds	memory_operation_errors_total	lazy_counter	Counted only on a failed memory backend operation (cog-memory/src/metrics_instrumented.rs); no error in the window means no series. The rule also requires memory_operations_total, which is present on the success path.
 redrive_budget_forgotten	cogneva_redrive_budget_losses_total	lazy_counter	Read-side ledger loss is counted only when the ledger read fails (cog-github/src/landing.rs); today the read succeeds, so the {side="read"} series does not exist.
@@ -58,5 +60,9 @@ held_series_check_unreadable	cogneva_metric_held_unreadable	error_only_state	cog
 runtime_asset_content_drift	cogneva_runtime_asset_state	error_only_state	cog-reflection/src/runtime_assets.rs exports state gauges only for problem states of destinations that have one; a healthy asset is absent. The check's own timestamp is a separate series (cogneva_runtime_asset_check_seconds, present).
 runtime_asset_not_refreshed	cogneva_runtime_asset_state	error_only_state	Same gauge and same export rule; not_refreshed is absent because every checked asset matched its manifest.
 
-# --- code_not_deployed (1 rule, 4 series): newer than the running image -----
-task_router_claim_stall	cogneva_task_router_claim_hold_bound_seconds,cogneva_task_router_claim_in_flight,cogneva_task_router_claim_slots,cogneva_task_router_claim_wait_seconds	code_not_deployed	The gauges were added in 221a6c22 (2026-10-19 10:56 +0800) and the running app image is main-be5add5996d6 (10:09 +0800), which predates them. They appear on the next rollout; delete this row then.
+# task_router_claim_stall's four gauges were declared code_not_deployed on
+# 2026-10-19 morning (added in 221a6c22, running image main-be5add5996d6). The
+# rollout happened: main-93ebcda35e7a passed 252fe47b's ancestor check, and all
+# four families read back with three series each at 16:11 +0800. The rows are
+# deleted, not kept "just in case" -- a declared absence that is no longer true
+# is reported stale, and a registry of stale rows stops being a reading.
