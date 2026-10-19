@@ -59,6 +59,21 @@ def pod_spec(doc):
     return doc.get("spec", {}).get("template", {}).get("spec", {})
 
 
+def claims_in(spec):
+    """Pod 模板里出现的全部 PVC claim，不管挂在哪个路径。
+
+    备份 Job 读一个数据根时不要求路径与工作负载相同：进化卷在进化 Pod 里挂在
+    `/var/lib/cogneva-data`，在备份 Pod 里必须换个路径才能与主卷共存。判「这个根
+    进没进备份面」问的是 claim 在不在 Pod 的卷声明里，不是路径字面相等。
+    """
+    out = []
+    for volume in spec.get("volumes", []) or []:
+        claim = (volume.get("persistentVolumeClaim") or {}).get("claimName")
+        if claim:
+            out.append(claim)
+    return out
+
+
 def mounts_at(spec, mount_path):
     """把 Pod 模板里挂到 mount_path 的 claim 点出来，容器与 init 容器都算。"""
     volumes = {}
@@ -102,6 +117,7 @@ def load_profile(profile_dir, mount_path):
                             "kind": doc["kind"],
                             "name": name,
                             "mounts": mounts,
+                            "claims": claims_in(spec),
                         }
                     )
     return workloads
@@ -135,18 +151,23 @@ def main():
         workloads = load_profile(profile_dir, mount_path)
         data_roots = sorted({m["claim"] for w in workloads for m in w["mounts"]})
         backup = [w for w in workloads if w["name"] == "cogneva-backup"]
+        # 覆盖按 claim 判，不按挂载路径判：同一个 claim 在备份 Pod 里可以换个
+        # 路径（进化卷与主卷同路径会撞）。路径相同只在「备份 Pod 把数据目录
+        # 挂到了别的 claim」时才有意义，那一项仍由 extra 抓。
+        backup_claims = sorted({c for w in backup for c in w["claims"]})
         backup_roots = sorted({m["claim"] for w in backup for m in w["mounts"]})
-        missing = sorted(set(data_roots) - set(backup_roots))
+        missing = sorted(set(data_roots) - set(backup_claims))
         extra = sorted(set(backup_roots) - set(data_roots))
-        # 备份 CronJob 自己没挂到数据目录，等于这一份 profile 完全没有覆盖：
-        # data_roots 与 backup_roots 都空时也不能读成绿。
-        no_backup_mount = not backup_roots
+        # 备份 CronJob 自己没挂到任何数据根，等于这一份 profile 完全没有覆盖：
+        # data_roots 与 backup_claims 都空时也不能读成绿。
+        no_backup_mount = not backup_claims
         if missing or extra or no_backup_mount or not data_roots:
             failed = True
         result[profile] = {
             "data_mount": mount_path,
             "data_roots": data_roots,
             "backup_roots": backup_roots,
+            "backup_claims": backup_claims,
             "missing": missing,
             "extra": extra,
             "no_backup_mount": no_backup_mount,
@@ -159,7 +180,7 @@ def main():
         for profile, row in result.items():
             print(f"[{profile}] data_dir={row['data_mount']}")
             print(f"  数据根: {', '.join(row['data_roots']) or '(空)'}")
-            print(f"  备份挂载: {', '.join(row['backup_roots']) or '(空)'}")
+            print(f"  备份挂载: {', '.join(row['backup_claims']) or '(空)'}")
             if row["no_backup_mount"]:
                 print("  红: 备份 CronJob 没有挂到数据目录")
             for claim in row["missing"]:

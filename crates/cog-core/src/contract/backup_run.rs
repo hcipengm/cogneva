@@ -303,6 +303,23 @@ pub struct BackupDrillRecord {
     /// only place that rewrite would show, so a row without them would say
     /// "restorable" about data that came back different.
     pub generated_columns_recomputed: Vec<String>,
+    /// How many artifact-layer units the package's manifest promised, and how
+    /// many the drill actually read back. A unit is one policy store (versions,
+    /// head and active) or one `decision_stats.json` (groups and trials).
+    ///
+    /// Zeroes on a package written before the artifact section existed, which
+    /// keeps older packages restorable: "that format had no such section" is
+    /// not "the section was empty".
+    pub artifacts_expected: i32,
+    pub artifacts_restored: i32,
+    /// One line per unit read back, carrying the numbers themselves
+    /// (`evolution/policies/meta_learning.mode versions=1 head=1 active=1`),
+    /// not just "unpacked". A byte-count increase in the package is not
+    /// evidence that a store came back.
+    pub artifact_readings: Vec<String>,
+    /// Units the package promised but the drill could not read back, with the
+    /// reason. Any entry here fails the drill.
+    pub artifact_errors: Vec<String>,
     /// Why the drill did not prove the package restorable. Empty on a drill
     /// whose evidence agrees.
     pub error: Option<String>,
@@ -324,6 +341,8 @@ impl BackupDrillRecord {
             && self.rows_restored.is_some()
             && self.rows_restored == self.rows_expected
             && self.source_runs_matched == Some(true)
+            && self.artifacts_restored == self.artifacts_expected
+            && self.artifact_errors.is_empty()
     }
 }
 
@@ -441,6 +460,10 @@ mod tests {
             rows_expected: Some(1000),
             source_runs_matched: Some(true),
             generated_columns_recomputed: Vec::new(),
+            artifacts_expected: 0,
+            artifacts_restored: 0,
+            artifact_readings: Vec::new(),
+            artifact_errors: Vec::new(),
             error: None,
         }
     }
@@ -515,6 +538,30 @@ mod tests {
         let mut d = agreeing_drill();
         d.offsite_newest_at = None;
         d.offsite_matches_newest = None;
+        assert!(d.ok());
+
+        // Artifact stores are measured, not inferred from the package growing.
+        // A manifest that promised two stores and a drill that read one back
+        // has not proven the second one came home.
+        let mut d = agreeing_drill();
+        d.artifacts_expected = 2;
+        d.artifacts_restored = 1;
+        assert!(!d.ok(), "one artifact unit promised but not read back");
+
+        let mut d = agreeing_drill();
+        d.artifacts_expected = 1;
+        d.artifacts_restored = 1;
+        d.artifact_errors = vec!["app/policies/x: ACTIVE points at a missing version".into()];
+        assert!(
+            !d.ok(),
+            "a unit that was read back with an error is not restored"
+        );
+
+        // Old packages carry no artifact section at all. Zero promised and
+        // zero read is agreement, not a missing measurement.
+        let mut d = agreeing_drill();
+        d.artifacts_expected = 0;
+        d.artifacts_restored = 0;
         assert!(d.ok());
     }
 

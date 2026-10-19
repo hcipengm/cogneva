@@ -13,7 +13,13 @@
 //! <pkg>/pg/sequences.sql              全部序列的 setval 语句
 //! <pkg>/qdrant/<collection>.snapshot  服务端一致性快照
 //! <pkg>/objects/storage/...           cogneva-data-pvc 的 storage 子树原样
+//! <pkg>/artifacts/<root>/policies/... 每个数据根的产物级进化策略库
+//! <pkg>/artifacts/<root>/meta_learning/decision_stats.json  调参证据
 //! ```
+//!
+//! `artifacts/` 只收 `policies/` 与 `meta_learning/decision_stats.json`，不收数据根
+//! 的其余子树（工作树、数仓、原始日志）：那些要么可重建，要么体积以百 GiB 计，
+//! 且不属于「换机后必须逐字节相同」的权威面。
 //! 整包打成 `cogneva-backup-<UTC 时间戳>.tar.zst`，时间戳字典序即新旧序。
 
 use std::collections::BTreeMap;
@@ -85,6 +91,48 @@ pub struct PostgresReport {
     pub sequences: usize,
 }
 
+/// 一个策略库的打包读数：版本数、链头、当前激活版本。
+///
+/// `active_version` 与 `head_version` 分开记，因为 ACTIVE 指旧版本是合法的回滚态，
+/// 不是损坏。恢复端要判的是「ACTIVE 指向的那个版本在包里、且 hash 对得上」，不是
+/// 「ACTIVE 等于最大版本」。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PolicyStoreReport {
+    pub name: String,
+    pub versions: u64,
+    pub head_version: u64,
+    pub head_hash: String,
+    /// ACTIVE 读不出来时为 0、`active_hash` 为空，原因进 `problem`。
+    pub active_version: u64,
+    pub active_hash: String,
+    #[serde(default)]
+    pub problem: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DecisionStatsReport {
+    pub groups: u64,
+    pub trials: u64,
+    pub bytes: u64,
+}
+
+/// 一个数据根下的产物层：策略库与调参证据。
+///
+/// 身份是「根名 + 库名」，不是库名：主应用与进化 Pod 可能各有一套同名库，
+/// 它们是两份独立状态，不允许在清单里合成一条。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ArtifactRootReport {
+    pub root: String,
+    /// 备份 Pod 里看到的挂载点，只作现场记录；恢复端按 `root` 选择目标根。
+    pub data_dir: String,
+    /// `policies/` 是否存在。空目录与「从来没有过」不是同一件事。
+    pub policies_present: bool,
+    #[serde(default)]
+    pub policy_stores: Vec<PolicyStoreReport>,
+    #[serde(default)]
+    pub decision_stats: Option<DecisionStatsReport>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ObjectsReport {
     pub files: u64,
@@ -115,6 +163,10 @@ pub struct BackupManifest {
     pub qdrant: Vec<CollectionReport>,
     #[serde(default)]
     pub objects: ObjectsReport,
+    /// 每个数据根的产物层。旧包没有这一段，读出来是空表——「当年没声明」不是
+    /// 「声明为零」，演练按「没有可读的产物段」跳过，不判失败。
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactRootReport>,
 }
 
 /// 备份配置。集群 CronJob 全部由 env 注入；测试直接构造。
@@ -130,6 +182,11 @@ pub struct BackupConfig {
     pub oob_secrets_dir: PathBuf,
     /// cogneva-data-pvc 挂载根；对象子树取其下 `storage/`。
     pub data_dir: PathBuf,
+    /// 主数据根之外、也要取产物层的数据根，形如 `evolution=/var/lib/...`。
+    ///
+    /// 备份 Pod 把进化卷**只读**挂进来，并靠同节点亲和避开 RWO 跨节点 attach
+    /// 失败。名字是清单里的身份，不能重复、不能叫 `app`（主根的名字）。
+    pub extra_data_roots: Vec<(String, PathBuf)>,
     /// 保留几个包：**覆盖位**（`COGNEVA_BACKUP_KEEP`，构造时 `unwrap_or(7)`）。
     ///
     /// 7 的来历量过、不是拍的：备份卷 `cogneva-backup-pvc` 声明 10 GiB，而
@@ -186,6 +243,9 @@ impl BackupConfig {
                 std::env::var("COGNEVA_DATA_DIR")
                     .unwrap_or_else(|_| "/var/lib/cogneva-data".into()),
             ),
+            extra_data_roots: parse_extra_data_roots(
+                std::env::var("COGNEVA_BACKUP_EXTRA_DATA_ROOTS").ok(),
+            )?,
             keep_count: std::env::var("COGNEVA_BACKUP_KEEP")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -201,6 +261,46 @@ impl BackupConfig {
             namespace: std::env::var("COGNEVA_NAMESPACE").unwrap_or_else(|_| "cogneva".into()),
         })
     }
+
+    /// 主根在前、追加根在后。顺序只影响清单的书写顺序，不影响身份。
+    pub fn data_roots(&self) -> Vec<(String, PathBuf)> {
+        let mut roots = vec![("app".to_string(), self.data_dir.clone())];
+        roots.extend(self.extra_data_roots.iter().cloned());
+        roots
+    }
+}
+
+/// 解析 `name=path[,name=path]`。
+///
+/// 坏掉的条目让备份**失败**，不跳过：少一个数据根而包照样「成功」，正是换机后
+/// 才发现某一份状态从没进过包的形状。空表 = 没有追加根，是合法值。
+fn parse_extra_data_roots(
+    raw: Option<String>,
+) -> Result<Vec<(String, PathBuf)>, Box<dyn std::error::Error>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut roots: Vec<(String, PathBuf)> = Vec::new();
+    for part in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (name, path) = part
+            .split_once('=')
+            .ok_or_else(|| format!("COGNEVA_BACKUP_EXTRA_DATA_ROOTS: {part:?} 不是 name=path"))?;
+        let name = name.trim();
+        let path = path.trim();
+        if name.is_empty() || path.is_empty() {
+            return Err(
+                format!("COGNEVA_BACKUP_EXTRA_DATA_ROOTS: {part:?} 的 name 或 path 为空").into(),
+            );
+        }
+        if name == "app" {
+            return Err("COGNEVA_BACKUP_EXTRA_DATA_ROOTS: `app` 是主数据根的名字，不能重复".into());
+        }
+        if roots.iter().any(|(n, _)| n == name) {
+            return Err(format!("COGNEVA_BACKUP_EXTRA_DATA_ROOTS: 根名 {name:?} 重复").into());
+        }
+        roots.push((name.to_string(), PathBuf::from(path)));
+    }
+    Ok(roots)
 }
 
 pub fn package_name(at: chrono::DateTime<Utc>) -> String {
@@ -1130,6 +1230,7 @@ async fn run_backup_into(
         &cfg.data_dir.join("storage"),
         &staging.join("objects").join("storage"),
     )?;
+    let artifacts = collect_artifacts(cfg, staging).await?;
 
     // 实例指纹的规范来源是 Secret（装入期生成）；env 是同一值的注入副本，
     // 两边都读不到时记 unknown，manifest 仍然落盘（备份本身不失败）。
@@ -1150,7 +1251,166 @@ async fn run_backup_into(
         postgres,
         qdrant: collections,
         objects: ObjectsReport { files, bytes },
+        artifacts,
     })
+}
+
+/// 把每个数据根的产物层抄进包，并留下逐库读数。
+///
+/// 只抄 `policies/` 与 `meta_learning/decision_stats.json`。写点已经是
+/// tmp+fsync+rename，读者要么看到旧文件要么看到新文件；版本文件与 ACTIVE 之间
+/// 仍可能隔一拍，清单因此把 head 与 active 分开记，恢复端按「active 指向的版本
+/// 存在且 hash 对得上」判，不按「active 必须等于 head」。
+async fn collect_artifacts(
+    cfg: &BackupConfig,
+    staging: &Path,
+) -> Result<Vec<ArtifactRootReport>, Box<dyn std::error::Error>> {
+    let mut reports = Vec::new();
+    for (root, dir) in cfg.data_roots() {
+        reports.push(collect_artifact_root(&root, &dir, staging).await?);
+    }
+    Ok(reports)
+}
+
+async fn collect_artifact_root(
+    root: &str,
+    dir: &Path,
+    staging: &Path,
+) -> Result<ArtifactRootReport, Box<dyn std::error::Error>> {
+    let mut report = ArtifactRootReport {
+        root: root.to_string(),
+        data_dir: dir.display().to_string(),
+        ..Default::default()
+    };
+
+    let policies_src = dir.join("policies");
+    if policies_src.is_dir() {
+        report.policies_present = true;
+        let dst = staging.join("artifacts").join(root).join("policies");
+        copy_policy_tree(&policies_src, &dst)?;
+        report.policy_stores = describe_policy_stores(&policies_src).await?;
+    }
+
+    let stats_src = dir.join("meta_learning").join("decision_stats.json");
+    if stats_src.is_file() {
+        let dst = staging.join("artifacts").join(root).join("meta_learning");
+        std::fs::create_dir_all(&dst)?;
+        std::fs::copy(&stats_src, dst.join("decision_stats.json"))?;
+        let bytes = std::fs::metadata(&stats_src)?.len();
+        let text = std::fs::read_to_string(&stats_src)?;
+        let (groups, trials) = decision_stats_counts(&text)?;
+        report.decision_stats = Some(DecisionStatsReport {
+            groups,
+            trials,
+            bytes,
+        });
+    }
+
+    Ok(report)
+}
+
+/// 只抄策略库里的持久件：`ACTIVE` 与 `*.json`。`*.tmp` 是写到一半的临时文件，
+/// 打进包里既没有读者，还会让恢复端把一次崩溃的残骸当成一个版本。
+fn copy_policy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    for store in std::fs::read_dir(src)? {
+        let store = store?;
+        if !store.file_type()?.is_dir() {
+            continue;
+        }
+        let to = dst.join(store.file_name());
+        std::fs::create_dir_all(&to)?;
+        for file in std::fs::read_dir(store.path())? {
+            let file = file?;
+            if !file.file_type()?.is_file() {
+                continue;
+            }
+            let name = file.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str == "ACTIVE" || name_str.ends_with(".json") {
+                std::fs::copy(file.path(), to.join(&name))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 逐库读出「有几个版本、链头是谁、ACTIVE 是谁」。读不出来的原因进 `problem`，
+/// 让备份照样完成、把破损留在清单里；演练会拿这份声明去包里复核，破损在那一跑
+/// 变成红，而不是在这里静默丢掉。
+async fn describe_policy_stores(
+    policies_dir: &Path,
+) -> Result<Vec<PolicyStoreReport>, Box<dyn std::error::Error>> {
+    let store = cog_reflection::PolicyStore::new(policies_dir);
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(policies_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names.sort();
+
+    let mut reports = Vec::new();
+    for name in names {
+        let versions = store.list_versions(&name).await?;
+        let mut row = PolicyStoreReport {
+            name: name.clone(),
+            versions: versions.len() as u64,
+            ..Default::default()
+        };
+        match versions.last().copied() {
+            Some(head) => match store.load_version(&name, head).await? {
+                Some(artifact) => {
+                    row.head_version = head;
+                    row.head_hash = artifact.hash;
+                }
+                None => row.problem = Some(format!("链头版本 {head:06} 读不出来")),
+            },
+            None => row.problem = Some("策略库里没有任何版本文件".into()),
+        }
+        let active_path = policies_dir.join(&name).join("ACTIVE");
+        match std::fs::read_to_string(&active_path) {
+            Ok(text) => match text.trim().parse::<u64>() {
+                Ok(version) => {
+                    row.active_version = version;
+                    match store.load_version(&name, version).await? {
+                        Some(artifact) => row.active_hash = artifact.hash,
+                        None => {
+                            row.problem =
+                                Some(format!("ACTIVE 指向版本 {version:06}，但包里没有这个版本"))
+                        }
+                    }
+                }
+                Err(e) => row.problem = Some(format!("ACTIVE 不是版本号: {e}")),
+            },
+            Err(e) => row.problem = Some(format!("ACTIVE 读不出来: {e}")),
+        }
+        reports.push(row);
+    }
+    Ok(reports)
+}
+
+/// `decision_stats.json` 的形状：`{version, groups:[{category,key,counts:{"x":[attempts, successes]}}]}`。
+/// 试验数取每条计数的第一格之和；第二格是成功数，不在这里用。
+fn decision_stats_counts(text: &str) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+    let doc: serde_json::Value = serde_json::from_str(text)?;
+    let groups = doc
+        .get("groups")
+        .and_then(|g| g.as_array())
+        .ok_or("decision_stats.json 没有 groups 数组")?;
+    let mut trials = 0u64;
+    for group in groups {
+        if let Some(counts) = group.get("counts").and_then(|c| c.as_object()) {
+            for pair in counts.values() {
+                if let Some(first) = pair.as_array().and_then(|p| p.first()) {
+                    trials += first.as_u64().unwrap_or(0);
+                }
+            }
+        }
+    }
+    Ok((groups.len() as u64, trials))
 }
 
 fn now_rfc3339() -> String {
@@ -1582,6 +1842,10 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         rows_expected: None,
         source_runs_matched: None,
         generated_columns_recomputed: Vec::new(),
+        artifacts_expected: 0,
+        artifacts_restored: 0,
+        artifact_readings: Vec::new(),
+        artifact_errors: Vec::new(),
         error: None,
     };
 
@@ -1661,6 +1925,7 @@ async fn drill_once(
     // 清单说这个包里有什么，此刻盘上是事实。这一段覆盖的是 qdrant 与对象层：
     // 它们不进空库，能核的就是「清单声明的字节与文件数是不是真的在包里」。
     verify_package_against_manifest(&pkg_dir, &manifest)?;
+    verify_artifact_stores(&pkg_dir, &manifest, drill).await;
     if manifest.postgres.tables.is_empty() {
         return Err("包的清单没有声明任何表，装回去之后无论对不对都证明不了什么".into());
     }
@@ -1681,6 +1946,136 @@ async fn drill_once(
     }
     drop(tree);
     result
+}
+
+/// 从包里把产物层逐项读回来，与 manifest 的声明比。
+///
+/// 这不是「解开了」：每个策略库要回答版本数、链头版本与 hash、ACTIVE 指向哪个
+/// 版本，并且链校验通过；每个 decision_stats 要回答组数与试验数。读不回来的
+/// 单元进 `artifact_errors`，并让这一跑变红——包变大不是证据。
+async fn verify_artifact_stores(
+    pkg_dir: &Path,
+    manifest: &BackupManifest,
+    drill: &mut BackupDrillRecord,
+) {
+    for root in &manifest.artifacts {
+        let base = pkg_dir.join("artifacts").join(&root.root);
+        if root.policies_present {
+            let store = cog_reflection::PolicyStore::new(base.join("policies"));
+            for reported in &root.policy_stores {
+                drill.artifacts_expected += 1;
+                match verify_one_store(&store, &root.root, reported).await {
+                    Ok(line) => {
+                        drill.artifacts_restored += 1;
+                        drill.artifact_readings.push(line);
+                    }
+                    Err(e) => drill
+                        .artifact_errors
+                        .push(format!("{}/policies/{}: {e}", root.root, reported.name)),
+                }
+            }
+        }
+        if let Some(stats) = &root.decision_stats {
+            drill.artifacts_expected += 1;
+            let path = base.join("meta_learning").join("decision_stats.json");
+            match verify_one_stats(&path, &root.root, stats) {
+                Ok(line) => {
+                    drill.artifacts_restored += 1;
+                    drill.artifact_readings.push(line);
+                }
+                Err(e) => drill.artifact_errors.push(format!(
+                    "{}/meta_learning/decision_stats.json: {e}",
+                    root.root
+                )),
+            }
+        }
+    }
+    if !drill.artifact_errors.is_empty() && drill.error.is_none() {
+        drill.error = Some(format!(
+            "产物层读回失败 {} 项：{}",
+            drill.artifact_errors.len(),
+            drill.artifact_errors[0]
+        ));
+    }
+}
+
+async fn verify_one_store(
+    store: &cog_reflection::PolicyStore,
+    root: &str,
+    reported: &PolicyStoreReport,
+) -> Result<String, String> {
+    if let Some(problem) = &reported.problem {
+        return Err(format!("打包时已经读出问题：{problem}"));
+    }
+    let name = &reported.name;
+    let versions = store.list_versions(name).await.map_err(|e| e.to_string())?;
+    if versions.len() as u64 != reported.versions {
+        return Err(format!(
+            "包里 {} 个版本，清单声明 {}",
+            versions.len(),
+            reported.versions
+        ));
+    }
+    let head = *versions.last().ok_or("包里没有版本文件")?;
+    let head_artifact = store
+        .load_version(name, head)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("链头版本 {head:06} 读不出来"))?;
+    if head != reported.head_version || head_artifact.hash != reported.head_hash {
+        return Err(format!(
+            "链头不一致：包里 {head:06}/{}，清单 {}/{}",
+            head_artifact.hash, reported.head_version, reported.head_hash
+        ));
+    }
+    let active = store
+        .load_active(name)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "ACTIVE 指向的版本不在包里（清单说 {}）",
+                reported.active_version
+            )
+        })?;
+    if active.version != reported.active_version || active.hash != reported.active_hash {
+        return Err(format!(
+            "ACTIVE 不一致：包里 {}/{}，清单 {}/{}",
+            active.version, active.hash, reported.active_version, reported.active_hash
+        ));
+    }
+    if !store.verify_chain(name).await.map_err(|e| e.to_string())? {
+        return Err("版本链校验不通过".into());
+    }
+    Ok(format!(
+        "{root}/policies/{name} versions={} head={:06} active={:06}",
+        reported.versions, reported.head_version, reported.active_version
+    ))
+}
+
+fn verify_one_stats(
+    path: &Path,
+    root: &str,
+    reported: &DecisionStatsReport,
+) -> Result<String, String> {
+    let bytes = std::fs::metadata(path)
+        .map_err(|e| format!("读不到：{e}"))?
+        .len();
+    if bytes != reported.bytes {
+        return Err(format!("{} 字节，清单声明 {}", bytes, reported.bytes));
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("读不到：{e}"))?;
+    let (groups, trials) = decision_stats_counts(&text).map_err(|e| format!("解析失败：{e}"))?;
+    if groups != reported.groups || trials != reported.trials {
+        return Err(format!(
+            "组/试验 {groups}/{trials}，清单声明 {}/{}",
+            reported.groups, reported.trials
+        ));
+    }
+    Ok(format!(
+        "{root}/meta_learning groups={} trials={}",
+        reported.groups, reported.trials
+    ))
 }
 
 async fn restore_and_compare(
@@ -2098,6 +2493,7 @@ mod tests {
                 points: 7,
             }],
             objects: ObjectsReport { files: 1, bytes: 5 },
+            artifacts: Vec::new(),
         }
     }
 
@@ -2247,6 +2643,7 @@ mod tests {
             secrets_dir: dir.path().to_path_buf(),
             oob_secrets_dir: dir.path().to_path_buf(),
             data_dir: dir.path().to_path_buf(),
+            extra_data_roots: Vec::new(),
             keep_count: 7,
             run_deadline_seconds: DEFAULT_RUN_DEADLINE_SECONDS,
             offsite_dir: None,
@@ -2347,5 +2744,114 @@ mod tests {
         assert!(validate_table_name("evil\"; DROP TABLE x; --").is_err());
         assert!(validate_table_name("Upper").is_err());
         assert!(validate_table_name("").is_err());
+    }
+
+    #[test]
+    fn extra_data_roots_must_name_their_path_and_not_collide() {
+        assert!(parse_extra_data_roots(None).unwrap().is_empty());
+        assert!(parse_extra_data_roots(Some("  ".into()))
+            .unwrap()
+            .is_empty());
+        let roots = parse_extra_data_roots(Some(
+            "evolution=/var/lib/cogneva-evolution-data,memory=/var/lib/memory".into(),
+        ))
+        .unwrap();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].0, "evolution");
+        assert_eq!(roots[0].1, PathBuf::from("/var/lib/cogneva-evolution-data"));
+
+        // 坏条目让备份失败，不静默跳过：少一个根而包照样「成功」正是换机后
+        // 才发现某份状态从没进过包的形状。
+        assert!(parse_extra_data_roots(Some("evolution".into())).is_err());
+        assert!(parse_extra_data_roots(Some("=/var/lib/x".into())).is_err());
+        assert!(parse_extra_data_roots(Some("app=/var/lib/x".into())).is_err());
+        assert!(parse_extra_data_roots(Some("a=/x,a=/y".into())).is_err());
+    }
+
+    /// 包只收持久件：版本 JSON 与 ACTIVE，写到一半的 `.tmp` 不进包；读回的数
+    /// 要与文件一致，否则演练没有可比的对象。
+    #[tokio::test]
+    async fn artifacts_carry_versions_and_decision_stats_but_not_tmp_files() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let store = data.join("policies").join("meta_learning.mode");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(
+            store.join("000001.json"),
+            serde_json::json!({
+                "name": "meta_learning.mode",
+                "version": 1,
+                "payload": {"min_samples": 40},
+                "parent_hash": "genesis",
+                "hash": "abc",
+                "created_at": "2026-10-19T00:00:00Z",
+                "reason": "test"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(store.join("ACTIVE"), "1").unwrap();
+        std::fs::write(store.join("000002.json.tmp"), "{}").unwrap();
+        std::fs::create_dir_all(data.join("meta_learning")).unwrap();
+        std::fs::write(
+            data.join("meta_learning/decision_stats.json"),
+            serde_json::json!({"version": 1, "groups": [{"counts": {"a": [3, 2]}}]}).to_string(),
+        )
+        .unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let report = collect_artifact_root("evolution", &data, staging.path())
+            .await
+            .unwrap();
+        assert_eq!(report.root, "evolution");
+        assert!(report.policies_present);
+        assert_eq!(report.policy_stores.len(), 1);
+        let policies = &report.policy_stores[0];
+        assert_eq!(policies.versions, 1);
+        assert_eq!(policies.head_version, 1);
+        assert_eq!(policies.head_hash, "abc");
+        assert_eq!(policies.active_version, 1);
+        assert!(policies.problem.is_none());
+        let stats = report.decision_stats.as_ref().unwrap();
+        assert_eq!(stats.groups, 1);
+        assert_eq!(stats.trials, 3);
+
+        let copied = staging
+            .path()
+            .join("artifacts/evolution/policies/meta_learning.mode");
+        assert!(copied.join("000001.json").exists());
+        assert!(copied.join("ACTIVE").exists());
+        assert!(
+            !copied.join("000002.json.tmp").exists(),
+            "写到一半的临时文件不是版本"
+        );
+    }
+
+    /// 演练读回：链、head、active 都要与清单对上；删掉 ACTIVE 必须翻红，
+    /// 而不是「文件都解开了所以算恢复」。
+    #[tokio::test]
+    async fn artifact_readback_fails_when_active_disappears() {
+        let root = tempfile::tempdir().unwrap();
+        let policies = root.path().join("policies");
+        let store = cog_reflection::PolicyStore::new(&policies);
+        store
+            .save_new_version(
+                "meta_learning.mode",
+                serde_json::json!({"min_samples": 40}),
+                "t",
+            )
+            .await
+            .unwrap();
+        let report = describe_policy_stores(&policies).await.unwrap();
+        let reported = &report[0];
+        assert!(verify_one_store(&store, "evolution", reported)
+            .await
+            .is_ok());
+
+        std::fs::remove_file(policies.join("meta_learning.mode").join("ACTIVE")).unwrap();
+        let err = verify_one_store(&store, "evolution", reported)
+            .await
+            .expect_err("ACTIVE 没了不能读成恢复成功");
+        assert!(err.contains("ACTIVE"), "错误要点名缺的是 ACTIVE：{err}");
     }
 }

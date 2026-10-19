@@ -412,6 +412,10 @@ async fn pg_a_drill_row_keeps_the_columns_the_target_recomputed() {
         rows_expected: Some(1),
         source_runs_matched: Some(true),
         generated_columns_recomputed: vec!["raw_log_index.is_hot".into()],
+        artifacts_expected: 0,
+        artifacts_restored: 0,
+        artifact_readings: Vec::new(),
+        artifact_errors: Vec::new(),
         error: None,
     };
     store.record_drill(&record).await.unwrap();

@@ -34,6 +34,18 @@ spec:
             app.kubernetes.io/component: backup
         spec:
           restartPolicy: Never
+          # 进化卷是 RWO：同一块卷能被读的前提是备份 Pod 与进化 Pod 落在同一
+          # 个节点。让调度器按「进化 Pod 所在节点」钉住这一跑；卷自己有节点
+          # 亲和时两者一致，没有时这条就是唯一的约束。钉不上就等，等到 Job
+          # 超时失败——失败可见，不会静默漏掉一个数据根。
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: cogneva-evolution
+                      app.kubernetes.io/component: evolution
+                  topologyKey: kubernetes.io/hostname
           containers:
             - name: backup
               image: localhost:30500/cogneva:local
@@ -61,6 +73,10 @@ spec:
                   valueFrom:
                     fieldRef:
                       fieldPath: metadata.namespace
+                # 第二个数据根：进化 Pod 的 data_dir。名字是清单里的身份，
+                # 恢复端按「根名 + 库名」定位，不按路径合并两套同名策略库。
+                - name: COGNEVA_BACKUP_EXTRA_DATA_ROOTS
+                  value: "evolution=/var/lib/cogneva-evolution-data"
                 # 卷外那一份的落点。写者只负责复制，判「有没有、是不是今晚的」
                 # 由演练那一跑自己遍历目录——写者说自己复制了不算读数。
                 - name: COGNEVA_BACKUP_OFFSITE_DIR
@@ -76,6 +92,12 @@ spec:
                 # 对象 raw 层来源（只读：备份绝不写数据卷）。
                 - name: data
                   mountPath: /var/lib/cogneva-data
+                  readOnly: true
+                # 进化 Pod 的 data_dir：备份只读共挂。只取 policies/ 与
+                # meta_learning/decision_stats.json，工作树、数仓、日志不在这里
+                # 读——它们体积以百 GiB 计且不属于换机后必须逐字节相同的面。
+                - name: evolution-data
+                  mountPath: /var/lib/cogneva-evolution-data
                   readOnly: true
                 # 身份导出：Secret 以只读卷进 Pod，打成 apply-able manifest，
                 # 不为备份单独扩 RBAC。
@@ -96,6 +118,9 @@ spec:
             - name: data
               persistentVolumeClaim:
                 claimName: cogneva-data-pvc
+            - name: evolution-data
+              persistentVolumeClaim:
+                claimName: cogneva-evolution-data-pvc
             - name: secrets
               secret:
                 secretName: cogneva-secrets
