@@ -451,6 +451,40 @@ impl TaskExecutorRouter {
             }
         };
 
+        // The publisher does not offer an owned task to a competing-consumer
+        // stream, but a message put there by another deployment still reaches
+        // this consumer. Running it would be the exact thing ownership exists
+        // to prevent -- the owner would find the task started by whoever read
+        // the queue first, and its lease would name the wrong holder. So the
+        // message is refused and acked: the task row is untouched and stays
+        // Pending, where the owner's own claim finds it. Leaving it unacked
+        // instead would make the sweeper redeliver it every claim interval for
+        // as long as the task exists.
+        if let Some(owner) = task.owner_unit.as_deref() {
+            // Named per message rather than counted into one number: the
+            // question this answers is "which task went where", and a bare
+            // count cannot say it. Each occurrence is a publisher that has not
+            // been updated, so every one of them is worth a line.
+            tracing::warn!(
+                task_id = %task.id,
+                owner,
+                msg_id = %msg_id,
+                "ready message names an owner and was found on the shared stream; refusing to run it for anyone but that owner"
+            );
+            if let Err(e) = pipe
+                .task_backend
+                .ack(
+                    &pipe.ready_stream,
+                    &pipe.group,
+                    std::slice::from_ref(&msg_id),
+                )
+                .await
+            {
+                tracing::warn!(task_id = %task.id, msg_id = %msg_id, "Failed to ack an owned ready message: {e}");
+            }
+            return;
+        }
+
         // Notify orchestrator that task is now running.
         if let Some(ref orch) = self.orchestrator {
             if let Err(e) = orch.start_task(&task.id).await {
@@ -971,6 +1005,53 @@ mod ready_pipeline_tests {
         // 名字真的取不到时才承认取不到：不猜、不哈希、不拿别的东西顶替。
         assert_eq!(task_id_of_poison_payload(b"not-json"), None);
         assert_eq!(task_id_of_poison_payload(b"{\"other\":1}"), None);
+    }
+
+    #[tokio::test]
+    async fn an_owned_ready_message_is_refused_and_acked() {
+        // 发布侧不再把带归属的任务放进共享流，但另一代部署仍在跑旧代码时
+        // 这种消息还是会到消费者手里。执行它等于让任意读者替所有者开工，
+        // 所以这里拒执行；不 ack 会让清扫器按认领间隔一直重投同一条。
+        let backend = Arc::new(ScriptedBackend::default());
+        let pipe = test_pipe(backend.clone());
+        let router = TaskExecutorRouter::new()
+            .with_executor(Arc::new(SlowExecutor {
+                sleep_secs: 0,
+                panic_instead: false,
+            }))
+            .await;
+
+        let mut owned = test_task(60);
+        owned.owner_unit = Some("8b".into());
+        router
+            .process_ready_message(
+                &pipe,
+                "m-owned".into(),
+                &serde_json::to_vec(&owned).unwrap(),
+                &test_hold(),
+            )
+            .await;
+
+        assert!(
+            backend.published.lock().await.is_empty(),
+            "an owned task must not run here, so nothing may be published for it"
+        );
+        let acks = backend.acks.lock().await;
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].2, vec!["m-owned".to_string()]);
+        drop(acks);
+
+        // 同一份载荷去掉归属就必须照常执行：没有这一半，一个什么都不做的
+        // 路由也能让上面的断言变绿。
+        router
+            .process_ready_message(
+                &pipe,
+                "m-free".into(),
+                &serde_json::to_vec(&test_task(60)).unwrap(),
+                &test_hold(),
+            )
+            .await;
+        assert_eq!(backend.published.lock().await.len(), 1);
     }
 
     #[tokio::test]

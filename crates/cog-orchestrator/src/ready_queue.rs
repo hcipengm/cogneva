@@ -34,6 +34,19 @@ pub fn process_local_ready_stream(workspace_id: &str) -> String {
     format!("orchestrator:ready:{workspace_id}:local")
 }
 
+/// Whether this task names the unit that must run it.
+///
+/// A task with an owner is not offered to the shared queue. The queue is a
+/// competing-consumer stream: the first worker to read an entry runs it, so
+/// publishing an owned task there hands it to whoever is idle rather than to
+/// the unit that was named, and the owner only finds out afterwards. It stays
+/// `Pending` until its owner asks for it, which is the same state a task
+/// waiting on a dependency sits in -- the ready scan offers it again on every
+/// pass, so nothing has to remember that it was held.
+pub fn carries_an_owner(task: &Task) -> bool {
+    task.owner_unit.is_some()
+}
+
 /// The queue a ready task is published to. One definition, because the
 /// publisher and the consumer must answer the same question the same way.
 pub fn ready_stream_for(task: &Task, workspace_id: &str) -> String {
@@ -235,6 +248,20 @@ mod tests {
             serde_json::json!({"evolution_mode": "baseline_port"}),
         );
         assert_eq!(ready_stream_for(&ported, "ws"), ready_stream("ws"));
+    }
+
+    #[test]
+    fn a_task_naming_its_owner_is_not_offered_to_the_shared_queue() {
+        let plain = task("t5", TaskType::DagNode, serde_json::json!({}));
+        assert!(!carries_an_owner(&plain));
+
+        let mut owned = task("t6", TaskType::DagNode, serde_json::json!({}));
+        owned.owner_unit = Some("8b".into());
+        assert!(
+            carries_an_owner(&owned),
+            "an owned task on the shared queue would be run by whoever read it \
+             first, and its owner would only learn that afterwards"
+        );
     }
 
     #[test]

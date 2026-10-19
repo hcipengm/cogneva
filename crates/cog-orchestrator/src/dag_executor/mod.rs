@@ -225,7 +225,15 @@ impl DagExecutorRuntime {
 
         // Serialise and group first, changing no state.
         let mut by_stream: HashMap<String, Vec<(Task, Vec<u8>)>> = HashMap::new();
+        let mut held_for_owner = 0usize;
         for task in ready_tasks {
+            // A task that names the unit responsible for it waits for that unit
+            // to ask for it; see [`crate::ready_queue::carries_an_owner`]. It
+            // stays Pending, so it is offered again on the next pass.
+            if crate::ready_queue::carries_an_owner(&task) {
+                held_for_owner += 1;
+                continue;
+            }
             let payload = serde_json::to_vec(&task).map_err(SFError::Serialization)?;
             by_stream
                 .entry(crate::ready_queue::ready_stream_for(
@@ -234,6 +242,15 @@ impl DagExecutorRuntime {
                 ))
                 .or_default()
                 .push((task, payload));
+        }
+        if held_for_owner > 0 {
+            // Named per pass rather than counted into a metric: a task nobody
+            // ever asks for stops here, and the pass that stopped offering it
+            // is the only evidence of where it went.
+            tracing::debug!(
+                held = held_for_owner,
+                "ready tasks naming an owner are waiting for that owner to claim them"
+            );
         }
 
         // Admission is decided for both queues and written down before any
