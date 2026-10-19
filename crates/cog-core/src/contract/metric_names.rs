@@ -1359,6 +1359,23 @@ metric_names! {
     // reads `runs_running`, which is always present.
     BACKUP_RUN_READINGS => "cogneva_backup_run_readings",
 
+    // cog-reflection -- what this process loaded from the data root it runs on,
+    // one family keyed by `readout` and labelled by `data_dir` and `store`.
+    //
+    // The labels are the reading. Two processes on one volume with different
+    // `data_dir` are two stores, and a face that named only the workload would
+    // merge them into one number that describes neither; the store is named
+    // apart from its directory for the same reason, because the same directory
+    // can hold several stores and the backup package keeps them apart too.
+    //
+    // The restore pair -- `restore_expected_*` against `restore_loaded_*` -- is
+    // published once, at the start that follows a restore, and never refreshed:
+    // the policy store moves on with evolution, and republishing one side of an
+    // old comparison would turn it into two instants being compared. Both sides
+    // are published rather than a single equal/not-equal: a mismatch is only
+    // actionable if the reading says which side was what.
+    POLICY_STORE_READINGS => "cogneva_policy_store_readings",
+
     // cog-orchestrator — the resource account's event half, as the loop that
     // folds it reads it back out of the table.
     //

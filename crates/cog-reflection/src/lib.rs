@@ -89,6 +89,7 @@ pub mod sandbox;
 pub mod signal_readings;
 pub mod signal_watcher;
 pub mod squad;
+pub mod store_readouts;
 pub mod types;
 pub mod verification_budget;
 pub mod version_contract;
@@ -153,6 +154,7 @@ pub use reviewer::PeriodicReviewer;
 pub use sandbox::{enforce_sandbox_boundary, BoundaryDecision, SandboxKind, SandboxSignals};
 pub use signal_watcher::{spawn_signal_watcher_loop, SignalWatcherConfig};
 pub use squad::DefaultSquadReflection;
+pub use store_readouts::{ExpectedStore, RestoreExpectation, StoreReadouts, META_LEARNING_POLICY};
 pub use types::*;
 
 pub mod plugin;

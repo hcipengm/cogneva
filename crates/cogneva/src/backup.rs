@@ -2213,8 +2213,49 @@ async fn restore_artifacts_into(
                 )
             })?;
         restore_artifact_root(pkg_dir, root, &target, &mut readings).await?;
+        write_restore_expectation(manifest, root, &target)?;
     }
     Ok(readings)
+}
+
+/// 把「这个数据根里刚写回了什么」留在数据根里，等新进程开机时对。
+///
+/// 恢复端的成功与「新进程真的加载了这份字节」不是一件事：卷换错、`data_dir` 指到
+/// 别处、Pod 挂在另一块 PVC 上，恢复 Job 全都报成功。唯一能把两件事接起来的地方是
+/// 进程自己——而它开机时只有数据根可读，所以期望值必须写在这里。
+///
+/// 放在 `meta_learning/` 下：那一层已经被「一级子目录都要分类」的门管着，为一张
+/// 一次性单子在数据根顶层新开一格，等于让每个部署都为它写一条分类。进程核对通过
+/// 后会把它删掉，它不会进下一次的备份包（产物层只收 `policies/` 与
+/// `meta_learning/decision_stats.json`）。
+fn write_restore_expectation(
+    manifest: &BackupManifest,
+    root: &ArtifactRootReport,
+    target: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expectation = cog_reflection::RestoreExpectation {
+        version: cog_reflection::RestoreExpectation::VERSION,
+        package_created_at: manifest.created_at.clone(),
+        package_revision: manifest.revision.clone(),
+        policy_stores: root
+            .policy_stores
+            .iter()
+            .map(|store| cog_reflection::ExpectedStore {
+                name: store.name.clone(),
+                active_version: store.active_version,
+            })
+            .collect(),
+        decision_trials: root.decision_stats.as_ref().map(|stats| stats.trials),
+    };
+    // 包里这一根什么都没带：没有可对的对象，也就不该留一张空单子让进程去核对。
+    if expectation.policy_stores.is_empty() && expectation.decision_trials.is_none() {
+        return Ok(());
+    }
+    let dir = target.join("meta_learning");
+    std::fs::create_dir_all(&dir)?;
+    let path = cog_reflection::RestoreExpectation::path_in(target);
+    std::fs::write(&path, serde_json::to_vec_pretty(&expectation)?)?;
+    Ok(())
 }
 
 /// 一个数据根：先落到目标根下的临时目录，验过再换到正式位置。
@@ -3746,6 +3787,90 @@ mod tests {
                 .starts_with(".restore-")),
             "暂存目录用完要删掉"
         );
+    }
+
+    /// 写回成功与「新进程加载了这一份」不是同一件事：恢复端要把包里的版本与证据
+    /// 规模留在数据根里，新进程开机时才有可对的标准。
+    #[tokio::test]
+    async fn restore_leaves_the_new_process_something_to_check_against() {
+        let pkg = tempfile::tempdir().unwrap();
+        let source = pkg.path().join("artifacts/evolution");
+        let live = tempfile::tempdir().unwrap();
+        let data = live.path().join("data");
+        let store = cog_reflection::PolicyStore::new(data.join("policies"));
+        store
+            .save_new_version(
+                "meta_learning.mode",
+                serde_json::json!({"min_samples": 40}),
+                "t",
+            )
+            .await
+            .unwrap();
+        std::fs::create_dir_all(data.join("meta_learning")).unwrap();
+        std::fs::write(
+            data.join("meta_learning/decision_stats.json"),
+            serde_json::json!({"version": 1, "groups": [{"counts": {"a": [3, 2]}}]}).to_string(),
+        )
+        .unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let report = collect_artifact_root("evolution", &data, staging.path())
+            .await
+            .unwrap();
+        let declared_store = report.policy_stores[0].clone();
+        let declared_trials = report.decision_stats.as_ref().unwrap().trials;
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::rename(staging.path().join("artifacts/evolution"), &source).unwrap();
+        let manifest = manifest_with(vec![report]);
+
+        let target = tempfile::tempdir().unwrap();
+        restore_artifacts_into(
+            pkg.path(),
+            &manifest,
+            &[("evolution".to_string(), target.path().to_path_buf())],
+        )
+        .await
+        .unwrap();
+
+        let path = cog_reflection::RestoreExpectation::path_in(target.path());
+        let raw = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("恢复端没有留下交接单 {}：{e}", path.display()));
+        let expectation: cog_reflection::RestoreExpectation = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(expectation.package_created_at, manifest.created_at);
+        assert_eq!(expectation.package_revision, manifest.revision);
+        assert_eq!(expectation.policy_stores.len(), 1);
+        assert_eq!(expectation.policy_stores[0].name, declared_store.name);
+        assert_eq!(
+            expectation.policy_stores[0].active_version, declared_store.active_version,
+            "单子上的版本必须就是包里声明的那个，不能另算一个"
+        );
+        assert_eq!(
+            expectation.decision_trials,
+            Some(declared_trials),
+            "证据规模也要留下，否则「少了」这件事在进程侧没有标准"
+        );
+    }
+
+    /// 包里这一根什么都没带：没有可对的对象，不该留一张空单子让新进程去核对。
+    #[tokio::test]
+    async fn a_root_that_carries_nothing_leaves_no_hand_over() {
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pkg.path().join("artifacts/app")).unwrap();
+        let manifest = manifest_with(vec![ArtifactRootReport {
+            root: "app".into(),
+            data_dir: "/var/lib/cogneva".into(),
+            policies_present: false,
+            policy_stores: Vec::new(),
+            decision_stats: None,
+        }]);
+        let target = tempfile::tempdir().unwrap();
+        restore_artifacts_into(
+            pkg.path(),
+            &manifest,
+            &[("app".to_string(), target.path().to_path_buf())],
+        )
+        .await
+        .unwrap();
+        assert!(!cog_reflection::RestoreExpectation::path_in(target.path()).exists());
     }
 
     /// 演练的往返面：包里的统计写回一个空根之后，写者还得能接着往里记，且原有

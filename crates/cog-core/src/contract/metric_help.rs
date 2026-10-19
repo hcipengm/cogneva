@@ -1547,6 +1547,32 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          latest_success_age_seconds is missing until a run has ever succeeded",
     ),
     (
+        "cogneva_policy_store_readings",
+        "What a process loaded from the data root it runs on, by readout, \
+         data_dir and store. data_dir carries 1 for each (data_dir, store) the \
+         process announced — its value is the declaration that this process is \
+         here and reading this path, so a series can be told apart from another \
+         process's reading of the same store name. active_version is the version \
+         that store's ACTIVE file names, 0 when the store exists with nothing \
+         activated, and -1 when ACTIVE could not be read at all: versions start \
+         at 1, so 0 is a real state and the unreadable one has to be something \
+         else. decision_groups and decision_trials are the meta-learning \
+         engine's live aggregation — groups recorded and attempts made — which \
+         is what the recommendation and tuning paths sample, so a count of \
+         zero here is the state in which those paths never leave their \
+         defaults. restore_expected_active_version and \
+         restore_loaded_active_version (and the decision_trials pair beside \
+         them) are published once, by the start that follows a restore, from \
+         the hand-over file the restore wrote into the data root: the expected \
+         side is what the package held, the loaded side is what this process \
+         read back, and a package written into the volume but never loaded \
+         shows up as the two disagreeing. They are compared rather than \
+         collapsed into one equal/not-equal because the repair differs — a \
+         load from the wrong volume and a store that lost its ACTIVE are \
+         different failures with the same verdict. The pair is absent when no \
+         restore hand-over was found, which is the ordinary start",
+    ),
+    (
         "cogneva_worktree_index_present",
         "Whether a resident worktree's git index file exists, 1 or 0, by \
          worktree. Read with the missing-files series: 'the index remembers no \

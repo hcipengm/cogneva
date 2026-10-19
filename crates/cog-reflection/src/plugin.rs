@@ -93,6 +93,9 @@ pub struct ReflectionPlugin {
     /// 产物级进化的读侧：既提供已记录的决策结果，也提供推荐路径此刻真正
     /// 在用的参数。参数搜索拿它当基线，不自己另推一份。
     meta_learning: Option<Arc<crate::MetaLearningEngine>>,
+    /// 本进程从数据根加载了什么：`data_dir`、每个库的 ACTIVE、决策证据规模。
+    /// init 里发布一次（那才是「新进程启动」的那一刻），`start()` 挂刷新循环。
+    store_readouts: Option<Arc<crate::StoreReadouts>>,
     /// 产物级进化的写侧：保存新版本并热替换 active 指针。
     artifact_evolution: Option<Arc<crate::ArtifactEvolution>>,
     /// The shared build cache's readings, published in init and measured from
@@ -142,6 +145,7 @@ impl ReflectionPlugin {
             pool_gate: Arc::new(PoolGate::default()),
             workspaces: None,
             meta_learning: None,
+            store_readouts: None,
             artifact_evolution: None,
             build_cache: None,
             registry_footprint: None,
@@ -479,9 +483,40 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 crate::DecisionStatsSnapshot::new(&stats_path),
             )
             .await
-            .with_policy_store(policy_store.clone(), "meta_learning.mode"),
+            .with_policy_store(policy_store.clone(), crate::META_LEARNING_POLICY),
         );
         engine.meta_learning = Some(meta_learning_engine.clone());
+        // 本进程「加载了什么」的读数。策略库在 init 里已经打开、引擎已经读回快照，
+        // 所以启动的这一刻就是「新进程真加载了没有」唯一能回答的时刻：等 start()
+        // 再发布，中间那段窗口里对外说的是「没有这个进程」，而恢复端可能已经据此
+        // 判过一轮。start() 另挂一条循环刷新，那是让读数跟上策略库随后的移动。
+        let store_readouts = Arc::new(crate::StoreReadouts::new(
+            ctx.config().app.data_dir.clone(),
+            vec![(
+                crate::META_LEARNING_POLICY.to_string(),
+                policy_store.clone(),
+            )],
+            meta_learning_engine.clone(),
+            metrics_backend.clone(),
+        ));
+        store_readouts.publish().await;
+        // 恢复交接单：包里的 ACTIVE 与试验数。核对通过才消费，核不上就留着，下一次
+        // 启动仍然红。
+        match crate::RestoreExpectation::take(std::path::Path::new(&ctx.config().app.data_dir)) {
+            Some(expectation) => {
+                info!(
+                    package_created_at = %expectation.package_created_at,
+                    revision = %expectation.package_revision,
+                    "checking what this process loaded against the package a restore wrote back"
+                );
+                store_readouts.check_restore(&expectation).await;
+            }
+            None => info!(
+                "no restore hand-over in the data root: this start follows no restore, so there \
+                 is nothing to compare against a package"
+            ),
+        }
+        self.store_readouts = Some(store_readouts);
         let artifact_evolution = Arc::new(crate::ArtifactEvolution::new(policy_store));
         // 循环在 start() 挂载；这里先把两侧拿在手上。
         self.meta_learning = Some(meta_learning_engine.clone());
@@ -1532,6 +1567,23 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                      volume snapshot as its author"
                 ),
             }
+        }
+
+        // 「本进程加载了什么」的刷新循环。排在共享表挂载之后：裁决挂表之前发布的那一
+        // 轮会把卷上的旧值当成本进程的当前值，而表才是此刻的作者。
+        if let Some(readouts) = self.store_readouts.clone() {
+            let shutdown = cog_core::ShutdownSignal::new();
+            if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+                let shutdown = shutdown.clone();
+                let mut rx = broadcast_tx.0.subscribe();
+                tokio::spawn(async move {
+                    let _ = rx.recv().await;
+                    shutdown.trigger();
+                });
+            }
+            drop(crate::store_readouts::spawn_store_readouts_loop(
+                readouts, shutdown,
+            ));
         }
 
         // 产物级进化的自主触发者：拿本进程已记录的决策结果重放候选参数，

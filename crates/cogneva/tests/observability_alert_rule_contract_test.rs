@@ -513,6 +513,14 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_principle_producer_push_period_seconds",
         "crates/cog-observability/src/producer_heartbeat.rs",
     ),
+    // What a process loaded from the data root it runs on. Both halves of the
+    // restore check are on this one series because they are one reading about
+    // one moment: the package's answer and the process's, published together by
+    // the start that follows a restore.
+    (
+        "cogneva_policy_store_readings",
+        "crates/cog-reflection/src/store_readouts.rs",
+    ),
     (
         "cogneva_process_zombies",
         "crates/cog-observability/src/process_zombies.rs",
