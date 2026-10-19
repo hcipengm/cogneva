@@ -16,13 +16,12 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use cog_core::{
-    is_typed, Decision, DecisionMode, DecisionSpec, DecisionState, Handover, HandoverSpec,
-    HandoverState, Signature, Task, TaskStatus, TaskType, TieBreak, Vote, VoteSpec,
-    DECISION_INPUT_KEY, DECISION_TASK_TYPE, GOVERNANCE_WORKSPACE, HANDOVER_INPUT_KEY,
-    HANDOVER_TASK_TYPE, VOTE_INPUT_KEY, VOTE_TASK_TYPE,
+    Decision, DecisionMode, DecisionSpec, DecisionState, Handover, HandoverSpec, Task, TaskStatus,
+    TaskType, TieBreak, Vote, VoteSpec, DECISION_INPUT_KEY, DECISION_TASK_TYPE,
+    GOVERNANCE_WORKSPACE, HANDOVER_INPUT_KEY, HANDOVER_TASK_TYPE, VOTE_INPUT_KEY, VOTE_TASK_TYPE,
 };
 
 /// Build a handover row in its draft state.
@@ -450,6 +449,7 @@ fn governance_task(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use cog_core::{is_typed, HandoverState, Signature};
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_760_000_000 + secs, 0).unwrap()
