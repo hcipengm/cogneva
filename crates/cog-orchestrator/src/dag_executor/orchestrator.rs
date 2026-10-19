@@ -1008,12 +1008,18 @@ impl DagExecutor {
     /// Two-phase commit: validate all first, then commit, to avoid partial
     /// state on cycle detection.
     ///
-    /// A held id is skipped only when the row underneath it is the same piece
-    /// of work being redelivered; an id reused for different work is refused.
+    /// Inside a plan — a batch where something declares a predecessor — a
+    /// held id is skipped only when the row underneath it is the same piece of
+    /// work being redelivered; an id reused for different work is refused.
     /// Skipping it instead would queue the rest of the plan while its
     /// dependencies still name the held row, so `blocked_by: [t3]` would wait
     /// on another plan's `t3` — a predecessor that settles for reasons that
     /// have nothing to do with this plan, or never settles at all.
+    ///
+    /// Batches with no dependency edges keep the old skip: a face's task or a
+    /// single intent resubmission reuses its stable id and carries no edges to
+    /// attach to the held row, so there is nothing to corrupt, and refusing
+    /// them would stop work that is meant to be skipped.
     pub async fn add_tasks_batch(&self, tasks: Vec<Task>) -> SFResult<Vec<String>> {
         if self.fg().is_some() {
             return self.add_tasks_batch_store(tasks).await;
@@ -1022,10 +1028,11 @@ impl DagExecutor {
         // Phase 1: collect new tasks and their dependencies, skipping duplicates
         let mut validated: Vec<(String, HashSet<String>, Task)> = Vec::new();
         let mut reused: Vec<String> = Vec::new();
+        let plan_shaped = tasks.iter().any(|t| !t.blocked_by.is_empty());
         for task in tasks {
             let task_id = task.id.clone();
             if let Some(held) = inner.tasks.get(&task_id) {
-                if !same_submitted_work(held, &task) {
+                if plan_shaped && !may_be_skipped(held, &task) {
                     reused.push(reused_id_note(held, &task));
                 }
                 continue; // Idempotent skip of a redelivery
@@ -1255,9 +1262,10 @@ impl DagExecutor {
 
         let mut validated = Vec::new();
         let mut reused: Vec<String> = Vec::new();
+        let plan_shaped = tasks.iter().any(|t| !t.blocked_by.is_empty());
         for task in tasks {
             if let Some(held) = held_by_id.get(task.id.as_str()) {
-                if !same_submitted_work(held, &task) {
+                if plan_shaped && !may_be_skipped(held, &task) {
                     reused.push(reused_id_note(held, &task));
                 }
                 continue; // 幂等跳过：同一份工作的重投
@@ -3308,13 +3316,22 @@ impl DagExecutor {
 
 use async_trait::async_trait;
 
-/// Whether `held` is the same piece of work as `incoming` — a redelivery of a
-/// task already in the graph — rather than different work that reused its id.
+/// Whether `held` may stand for `incoming` when the id is already in the graph:
+/// a redelivery of the same piece of work, or a verdict row written over an id
+/// the caller already knows.
 ///
 /// Only the submission is compared. Status, attempts, lease and timestamps all
 /// move on their own after the row lands, so a replay days later still reads as
 /// the same task; what a redelivery must reproduce is what was asked for.
-fn same_submitted_work(held: &Task, incoming: &Task) -> bool {
+///
+/// A Failed or Cancelled row is a verdict, not work: the failure path
+/// re-injects the plan's own rows with that status to record why they will not
+/// run. It starts nothing and releases nothing, so a held id is the expected
+/// outcome there even though its payload is not the payload of the held row.
+fn may_be_skipped(held: &Task, incoming: &Task) -> bool {
+    if matches!(incoming.status, TaskStatus::Failed | TaskStatus::Cancelled) {
+        return true;
+    }
     held.task_type == incoming.task_type && held.input == incoming.input
 }
 
@@ -3838,12 +3855,21 @@ mod tests {
         )])
         .await
         .unwrap();
+        let mut dependent = Task::new(
+            "t5",
+            TaskType::Generator,
+            serde_json::json!({"goal": "new"}),
+        );
+        dependent.blocked_by = vec!["t1".into()];
         let err = dag
-            .add_tasks_batch(vec![Task::new(
-                "t1",
-                TaskType::Generator,
-                serde_json::json!({"goal": "new"}),
-            )])
+            .add_tasks_batch(vec![
+                Task::new(
+                    "t1",
+                    TaskType::Generator,
+                    serde_json::json!({"goal": "new"}),
+                ),
+                dependent,
+            ])
             .await
             .unwrap_err();
         assert!(
@@ -3851,6 +3877,52 @@ mod tests {
             "{err}"
         );
         assert_eq!(dag.get_all_tasks().await.len(), 1);
+        assert!(dag.get_task("t5").await.is_none());
+    }
+
+    /// 没有依赖边的批次照旧幂等跳过：一个面自己的任务、一条意图的单条重投都用稳定
+    /// id，但没有边会挂到被占的那一行上，判退会把本来要跳过的工作挡死。
+    #[tokio::test]
+    async fn an_independent_id_reuse_is_still_skipped() {
+        let dag = DagExecutor::new("ws-reuse-independent".into());
+        dag.add_tasks_batch(vec![Task::new(
+            "face:release",
+            TaskType::Generator,
+            serde_json::json!({"goal": "old text"}),
+        )])
+        .await
+        .unwrap();
+        let queued = dag
+            .add_tasks_batch(vec![Task::new(
+                "face:release",
+                TaskType::Generator,
+                serde_json::json!({"goal": "edited text"}),
+            )])
+            .await
+            .unwrap();
+        assert!(queued.is_empty(), "the held id is skipped: {queued:?}");
+    }
+
+    /// 判退本身也要落得下去：失败路径把自己的行以 Failed 重投，id 必然被占，
+    /// 而那一行不是新工作——它不启动任何东西，也不挡任何东西。
+    #[tokio::test]
+    async fn a_failed_verdict_row_is_held_rather_than_refused() {
+        let dag = DagExecutor::new("ws-verdict".into());
+        dag.add_tasks_batch(vec![Task::new(
+            "t1",
+            TaskType::Generator,
+            serde_json::json!({"goal": "old"}),
+        )])
+        .await
+        .unwrap();
+        let mut verdict = Task::new(
+            "t1",
+            TaskType::Generator,
+            serde_json::json!({"goal": "new"}),
+        );
+        verdict.status = TaskStatus::Failed;
+        let queued = dag.add_tasks_batch(vec![verdict]).await.unwrap();
+        assert!(queued.is_empty(), "the verdict is held: {queued:?}");
     }
 
     #[tokio::test]

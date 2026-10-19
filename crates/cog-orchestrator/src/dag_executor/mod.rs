@@ -810,6 +810,17 @@ impl DagExecutorRuntime {
     /// redelivered message carrying task ids already in the DAG adds nothing.
     /// There is no record of processed `message_id`s, and none is needed
     /// while the injections stay idempotent.
+    ///
+    /// A validation refusal is the exception, and it is why the failure arm
+    /// below acknowledges the message: the DAG refusing a plan is a property
+    /// of the plan's bytes, not of this attempt, so leaving the message
+    /// pending would redeliver it forever and never say why. The refusal is
+    /// logged once, with the ids it names, and the message is retired the way
+    /// one that cannot be deserialized is.
+    fn permanent_refusal(e: &cog_core::SFError) -> bool {
+        matches!(e, &cog_core::SFError::Validation(_))
+    }
+
     pub async fn run_goal_consumer(&self, shutdown: ShutdownSignal) -> SFResult<()> {
         let goal_stream = format!("goals:{}", self.config.workspace_id);
         let group = format!("dag-executor-{}", self.config.workspace_id);
@@ -916,15 +927,38 @@ impl DagExecutorRuntime {
                         Err(e) => {
                             tracing::warn!(
                                 goal_id = %goal.message_id,
+                                permanent = Self::permanent_refusal(&e),
                                 "ActionPlanner processing failed: {e}"
                             );
+                            if Self::permanent_refusal(&e) {
+                                if let Err(e) = this
+                                    .backend
+                                    .ack(&goal_stream, &group, std::slice::from_ref(&msg_id))
+                                    .await
+                                {
+                                    tracing::warn!(goal_id = %goal.message_id, msg_id = %msg_id, "Failed to ack refused goal message: {e}");
+                                }
+                            }
                             continue;
                         }
                     }
                 } else {
                     // Fallback: direct DagExecutor submission when ActionPlanner unavailable.
                     if let Err(e) = this.submit_goal(&goal.goal, goal.tasks).await {
-                        tracing::warn!(goal_id = %goal.message_id, "submit_goal failed: {e}");
+                        tracing::warn!(
+                            goal_id = %goal.message_id,
+                            permanent = Self::permanent_refusal(&e),
+                            "submit_goal failed: {e}"
+                        );
+                        if Self::permanent_refusal(&e) {
+                            if let Err(e) = this
+                                .backend
+                                .ack(&goal_stream, &group, std::slice::from_ref(&msg_id))
+                                .await
+                            {
+                                tracing::warn!(goal_id = %goal.message_id, msg_id = %msg_id, "Failed to ack refused goal message: {e}");
+                            }
+                        }
                         continue;
                     }
                 }
@@ -1906,6 +1940,63 @@ mod consumer_ack_tests {
         let _ = handle.await.unwrap();
 
         assert_eq!(acks, vec!["gid-1".to_string()]);
+    }
+
+    /// 一份被 DAG 判退的计划是**确定性**的：同样的字节下一次重投还是同样的裁决。
+    /// 留在 pending 里就是无限重投、且永远不落一句结论，所以它按毒消息处理——ack
+    /// 掉并把裁决连同那些 id 写进日志。这里的计划里 `t5` 依赖 `t1`，而 `t1` 已被
+    /// 另一份工作占着，正是生产上 t5..t9 被挂到别人行上的那个形状。
+    #[tokio::test]
+    async fn a_refused_plan_is_acked_instead_of_redelivered_forever() {
+        let backend = ScriptedBackend::default();
+        let runtime = test_runtime(backend.clone());
+        runtime
+            .orchestrator()
+            .add_tasks_batch(vec![cog_core::Task::new(
+                "t1",
+                cog_core::TaskType::Generator,
+                serde_json::json!({"goal": "another plan"}),
+            )])
+            .await
+            .unwrap();
+
+        let mut dependent = cog_core::Task::new(
+            "t5",
+            cog_core::TaskType::Generator,
+            serde_json::json!({"goal": "this plan"}),
+        );
+        dependent.blocked_by = vec!["t1".into()];
+        let goal = cog_core::GoalMessage {
+            message_id: "g-refused".into(),
+            timestamp: chrono::Utc::now(),
+            workspace_id: "ws-ack-test".into(),
+            goal_id: "goal-refused".into(),
+            goal: "plan with reused ids".into(),
+            tasks: vec![
+                cog_core::Task::new(
+                    "t1",
+                    cog_core::TaskType::Generator,
+                    serde_json::json!({"goal": "this plan"}),
+                ),
+                dependent,
+            ],
+            priority: 0,
+            source: cog_core::GoalSource::Internal,
+        };
+        backend.enqueue(
+            "goals:ws-ack-test",
+            "gid-refused",
+            serde_json::to_vec(&goal).unwrap(),
+        );
+
+        let shutdown = ShutdownSignal::new();
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(async move { runtime.run_goal_consumer(shutdown_clone).await });
+        let acks = wait_for_acks(&backend, 1).await;
+        shutdown.trigger();
+        let _ = handle.await.unwrap();
+
+        assert_eq!(acks, vec!["gid-refused".to_string()]);
     }
 }
 
