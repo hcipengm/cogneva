@@ -653,17 +653,32 @@ pub async fn append_decision_event(
     Ok(task)
 }
 
+/// What came of trying to close a decision.
+///
+/// The three outcomes are kept apart because a caller that counts them reports
+/// three different facts: a close that landed, a race it lost, and a record
+/// somebody edited. Collapsing any two into one counter makes the reading claim
+/// something it never measured, and a storage failure is none of the three --
+/// it comes back as an error and stops the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseOutcome {
+    /// The row moved and the step that explains it was written with it.
+    Closed,
+    /// The row was no longer in an expected status, so neither was written.
+    LostRace,
+    /// The recorded history does not verify, so the close was refused.
+    ChainBroken { at_seq: Option<u64>, reason: String },
+}
+
 /// Close a decision and append the step that closes it, as one write.
 ///
 /// The row and its last event are one fact. Written one after the other, a
 /// reader can find the row closed with no step explaining it, or a step
 /// claiming a close that lost its race to another writer. The store writes
-/// both or neither; `false` says the row moved under the caller and nothing
-/// was written.
+/// both or neither.
 ///
-/// A history that does not verify is an error rather than `false`: no retry is
-/// safe until somebody reads the record, because the close would vouch for an
-/// edit.
+/// A history that does not verify is refused rather than retried: until
+/// somebody reads the record, the close would vouch for an edit.
 pub async fn close_decision_with_event(
     store: &dyn crate::GovernanceStore,
     decision_id: &str,
@@ -671,16 +686,10 @@ pub async fn close_decision_with_event(
     expected: &[TaskStatus],
     detail: Option<&str>,
     now: DateTime<Utc>,
-) -> crate::SFResult<bool> {
+) -> crate::SFResult<CloseOutcome> {
     let events = decision_events(store, decision_id).await?;
     if let ChainVerdict::Broken { at_seq, reason } = verify_decision_events(&events) {
-        return Err(crate::SFError::Conflict(format!(
-            "decision {decision_id} has a broken history at seq {}: {reason}; closing it would \
-             vouch for it",
-            at_seq
-                .map(|seq| seq.to_string())
-                .unwrap_or_else(|| "?".into())
-        )));
+        return Ok(CloseOutcome::ChainBroken { at_seq, reason });
     }
     let seq = events.last().map(|event| event.spec.seq + 1).unwrap_or(0);
     let prev_hash = events
@@ -688,9 +697,14 @@ pub async fn close_decision_with_event(
         .map(|event| event.spec.hash.clone())
         .unwrap_or_default();
     let event = decision_event_task(decision_id, seq, "closed", None, detail, &prev_hash, now);
-    store
+    if store
         .save_governance_node_with_event(&event, row, expected)
-        .await
+        .await?
+    {
+        Ok(CloseOutcome::Closed)
+    } else {
+        Ok(CloseOutcome::LostRace)
+    }
 }
 
 /// Read and verify one decision's chain.

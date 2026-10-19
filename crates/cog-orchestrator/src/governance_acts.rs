@@ -549,9 +549,13 @@ pub async fn settle(
         )
         .await
         {
-            Ok(true) => report.ballots_closed += 1,
-            Ok(false) => report.lost_races += 1,
-            Err(_) => report.chains_broken += 1,
+            Ok(cog_core::CloseOutcome::Closed) => report.ballots_closed += 1,
+            Ok(cog_core::CloseOutcome::LostRace) => report.lost_races += 1,
+            Ok(cog_core::CloseOutcome::ChainBroken { .. }) => report.chains_broken += 1,
+            // A storage failure is none of the three outcomes; counting it as
+            // a broken history would report an edited record every time the
+            // database hiccuped, and hide the hiccup.
+            Err(err) => return Err(err),
         }
     }
     for task in store.governance_nodes(HANDOVER_TASK_TYPE).await? {
@@ -1179,6 +1183,32 @@ mod tests {
         assert_eq!(report.ballots_closed, 0);
         assert_eq!(report.lost_races, 1);
         assert_eq!(store.row("d").status, TaskStatus::Cancelled);
+    }
+
+    /// A record somebody edited is reported as that, and the ballot stays open.
+    /// The pass must not close it -- a close would append a step vouching for
+    /// the edited part -- and it must not read as a lost race either: nobody
+    /// else moved this row, its history is simply no longer trustworthy.
+    #[tokio::test]
+    async fn a_decision_whose_history_does_not_verify_is_counted_not_closed() {
+        let store = MemoryStore::with(vec![open_ballot_row()]);
+        let first = cog_core::append_decision_event(&store, "d", "opened", None, None, at(0))
+            .await
+            .unwrap();
+        let mut tampered = first.clone();
+        tampered.input[cog_core::DECISION_EVENT_INPUT_KEY]["detail"] =
+            serde_json::json!("a detail the row never carried");
+        store.save_governance_node(&tampered).await.unwrap();
+
+        let report = settle(&store, at(120)).await.unwrap();
+        assert_eq!(report.chains_broken, 1);
+        assert_eq!(report.ballots_closed, 0);
+        assert_eq!(report.lost_races, 0);
+        assert_eq!(
+            store.row("d").status,
+            TaskStatus::Pending,
+            "a ballot on an edited record must stay open"
+        );
     }
 
     fn handover_row(status: TaskStatus) -> Task {

@@ -22,9 +22,9 @@ use chrono::{DateTime, Utc};
 
 use cog_core::{
     append_decision_event, close_decision_with_event, verify_decision_chain, ChainVerdict,
-    Decision, DecisionMode, DecisionSpec, DecisionState, GovernanceStore, Handover, HandoverSpec,
-    HandoverState, Signature, TaskStatus, TieBreak, Vote, DECISION_TASK_TYPE, HANDOVER_TASK_TYPE,
-    VOTE_TASK_TYPE,
+    CloseOutcome, Decision, DecisionMode, DecisionSpec, DecisionState, GovernanceStore, Handover,
+    HandoverSpec, HandoverState, Signature, TaskStatus, TieBreak, Vote, DECISION_TASK_TYPE,
+    HANDOVER_TASK_TYPE, VOTE_TASK_TYPE,
 };
 use cog_orchestrator::governance_acts::{
     backfill_ballot, close_ballot, decision_task, handover_task, tally, validate_ballot,
@@ -680,10 +680,29 @@ pub async fn run(
                     .clone()
                     .unwrap_or_else(|| "no reason recorded".into())
             );
-            if !close_decision_with_event(store, &decision, &task, &[expected], Some(&detail), now)
-                .await?
+            match close_decision_with_event(
+                store,
+                &decision,
+                &task,
+                &[expected],
+                Some(&detail),
+                now,
+            )
+            .await?
             {
-                return Err(format!("{decision} changed while it was being closed").into());
+                CloseOutcome::Closed => {}
+                CloseOutcome::LostRace => {
+                    return Err(format!("{decision} changed while it was being closed").into())
+                }
+                CloseOutcome::ChainBroken { at_seq, reason } => {
+                    return Err(format!(
+                        "{decision}: broken at seq {}: {reason}",
+                        at_seq
+                            .map(|seq| seq.to_string())
+                            .unwrap_or_else(|| "?".into())
+                    )
+                    .into())
+                }
             }
             println!(
                 "{}: {} — {}",
