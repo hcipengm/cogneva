@@ -24,7 +24,7 @@ subdir	roots	class	what	why	evidence
 storage	main	authoritative	对象层（providers.storage.options.base_path）	包里的 objects 段逐文件带走并计数	crates/cogneva/src/backup.rs
 policies	main,evolution	authoritative	策略库版本文件与 ACTIVE	包里的 artifacts 段按「数据根 + 库名」逐库带走	crates/cog-reflection/src/plugin.rs
 meta_learning	main,evolution	authoritative	决策统计快照	包里的 artifacts 段带走，运行时正本是 PG 表，二者按格取大	crates/cogneva/src/backup.rs
-git-remote	evolution	authoritative	进化的 bare 仓库	包**不**带它：已推 rev 从远端重取，未推的在 lossy_surfaces 里点名；A18 的 git bundle 是补齐这一格的路	crates/bootstrap/src/main.rs
+git-remote	evolution	authoritative	进化的 bare 仓库	整仓打成 git bundle 进包（`git/evolution.bundle`，恢复时种回）；出包时打不成才退回 lossy_surfaces 点名	crates/cogneva/src/backup.rs
 raw-logs	main	discardable	原始来源归档（raw_logger.base_dir）	抽取结果已落 PG 的权威面；重抽取要从上游重抓，代价是时间不是数据	deploy/helm/cogneva/files/cogneva.json
 warehouse	main	discardable	学习数仓的 JSONL 导出（{data_dir}/warehouse）	它是 PG 与策略库的导出面，不是权威面；数据在来源与 PG 里	crates/cog-reflection/src/plugin.rs
 landing	main	discardable	落地通道的每次落地记录与工作副本	落地的结果以 git 提交与服务状态为准；这些文件是过程记录	crates/cog-github/src/landing.rs

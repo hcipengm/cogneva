@@ -82,6 +82,11 @@ spec:
                 # 恢复端按「根名 + 库名」定位，不按路径合并两套同名策略库。
                 - name: COGNEVA_BACKUP_EXTRA_DATA_ROOTS
                   value: "evolution=/var/lib/cogneva-evolution-data"
+                # 进化 bare 仓不在数据根里，是独立的一卷：已推的 rev 能从公开
+                # 远端重取，未推的不能，所以整仓打成 git bundle 进包。卷上还
+                # 没 seed 时这一格空着，manifest 的 lossy_surfaces 会点名。
+                - name: COGNEVA_BACKUP_GIT_REMOTE_DIR
+                  value: "/git-remote"
                 # 卷外那一份的落点。写者只负责复制，判「有没有、是不是今晚的」
                 # 由演练那一跑自己遍历目录——写者说自己复制了不算读数。
                 - name: COGNEVA_BACKUP_OFFSITE_DIR
@@ -103,6 +108,10 @@ spec:
                 # 读——它们体积以百 GiB 计且不属于换机后必须逐字节相同的面。
                 - name: evolution-data
                   mountPath: /var/lib/cogneva-evolution-data
+                  readOnly: true
+                # 只读：备份只从 bare 仓读对象，绝不写它。
+                - name: git-remote
+                  mountPath: /git-remote
                   readOnly: true
                 # 身份导出：Secret 以只读卷进 Pod，打成 apply-able manifest，
                 # 不为备份单独扩 RBAC。
@@ -126,6 +135,12 @@ spec:
             - name: evolution-data
               persistentVolumeClaim:
                 claimName: cogneva-evolution-data-pvc
+            # 与进化 Pod 的 volume 声明同形：pvc 模式走 claim，hostPath 模式走
+            # 宿主目录（备份 Pod 已被下面的亲和钉在进化 Pod 所在节点上）。
+            - name: git-remote
+              hostPath:
+                path: "/var/lib/cogneva-data/git-remote"
+                type: Directory
             - name: secrets
               secret:
                 secretName: cogneva-secrets

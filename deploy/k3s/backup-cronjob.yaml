@@ -83,6 +83,10 @@ spec:
                 # 定位，不把主应用与进化 Pod 的同名策略库合成一份。
                 - name: COGNEVA_BACKUP_EXTRA_DATA_ROOTS
                   value: "evolution=/var/lib/cogneva-evolution-data"
+                # 进化 bare 仓不在数据根里，是独立的一卷：已推的 rev 能从公开
+                # 远端重取，未推的不能，所以整仓打成 git bundle 进包。
+                - name: COGNEVA_BACKUP_GIT_REMOTE_DIR
+                  value: "/git-remote"
                 # 卷外那一份的落点。写者只负责复制；「有没有、是不是今晚的」
                 # 由演练那一跑自己遍历目录来判。
                 - name: COGNEVA_BACKUP_OFFSITE_DIR
@@ -106,6 +110,10 @@ spec:
                 - name: evolution-data
                   mountPath: /var/lib/cogneva-evolution-data
                   readOnly: true
+                # 只读：备份只从 bare 仓读对象，绝不写它。
+                - name: git-remote
+                  mountPath: /git-remote
+                  readOnly: true
                 # 身份导出：Secret 以只读卷进 Pod，打成 apply-able manifest，
                 # 不为备份单独扩 RBAC。
                 - name: secrets
@@ -128,6 +136,12 @@ spec:
             - name: evolution-data
               persistentVolumeClaim:
                 claimName: cogneva-evolution-data-pvc
+            # k3s-single 的 gitRemote 是宿主目录：备份 Pod 已被上面的亲和钉在
+            # 进化 Pod 所在节点上，所以看到的是同一份 bare 仓。
+            - name: git-remote
+              hostPath:
+                path: "/var/lib/cogneva-data/git-remote"
+                type: Directory
             - name: secrets
               secret:
                 secretName: cogneva-secrets

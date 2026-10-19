@@ -91,10 +91,11 @@ step_package() {
         return 0
     fi
     # 旧格式的包没有 artifacts 段，那是「当年没声明」，不是错；这里只读、不判。
-    local expected
+    local expected bundle
     expected="$(pkg_artifacts_expected)"
-    record package "$PKG sha256=$PKG_SHA artifacts_expected=$expected" package_bytes
-    echo "    包 $PKG sha256=$PKG_SHA 产物层声明 $expected 项"
+    bundle="$(pkg_bundle_bytes)"
+    record package "$PKG sha256=$PKG_SHA artifacts_expected=$expected bundle_bytes=$bundle" package_bytes
+    echo "    包 $PKG sha256=$PKG_SHA 产物层声明 $expected 项，进化 git bundle ${bundle} 字节"
 }
 
 pkg_artifacts_expected() {
@@ -114,6 +115,23 @@ for root in doc.get("artifacts") or []:
     if root.get("decision_stats"):
         n += 1
 print(n)
+'
+}
+
+# 包里的进化 bare 仓 bundle 有多少字节；0 = 这个包没带它（旧包，或出包时打包失败）。
+# 恢复那一段必须把非零的一份种回去，verify 按这个数对账。
+pkg_bundle_bytes() {
+    local entry
+    entry="$(tar --zstd -tf "$PKG" | grep -m1 '/manifest.json$' || true)"
+    if [ -z "$entry" ]; then
+        echo 0
+        return 0
+    fi
+    tar --zstd -xOf "$PKG" "$entry" | python3 -c '
+import json, sys
+doc = json.load(sys.stdin)
+bundle = doc.get("evolution_bundle") or {}
+print(int(bundle.get("bytes") or 0))
 '
 }
 
@@ -153,8 +171,9 @@ step_verify() {
         echo "    已记录：$(read_field "$RECEIPT/verify.txt" reading)"
         return 0
     fi
-    local expected job log restored
+    local expected bundle_expected job log restored seeded
     expected="$(read_field "$RECEIPT/package.txt" reading | sed -n 's/.*artifacts_expected=//p')"
+    bundle_expected="$(read_field "$RECEIPT/package.txt" reading | sed -n 's/.*bundle_bytes=//p')"
     job="$(read_field "$RECEIPT/restore.txt" reading | sed -n 's/^job=//p')"
     if [ -z "$job" ]; then
         echo "回执里没有恢复 Job 的名字，无法对账" >&2
@@ -167,12 +186,20 @@ step_verify() {
         printf '%s\n' "$log" | grep -i 'artifact' >&2 || true
         exit 1
     fi
+    # 包里有进化 bare 仓那一份，就必须在恢复 Job 里看到「已种回」——写在包里的
+    # 未推 rev 不会自己出现在 /host-git 上，而 job 成功只说明它没报错。
+    seeded="$(printf '%s\n' "$log" | grep -c '进化 bare 仓已从包里的 git bundle 种回' || true)"
+    if [ "${bundle_expected:-0}" != "0" ] && [ "$seeded" -lt 1 ]; then
+        echo "包里有 ${bundle_expected} 字节的进化 git bundle，恢复 Job 没有报告种回" >&2
+        printf '%s\n' "$log" | grep -i 'bundle' >&2 || true
+        exit 1
+    fi
     while IFS= read -r d; do
         [ -n "$d" ] || continue
         kubectl -n "$NS" rollout status "deployment/$d" --timeout=300s >/dev/null
     done < <(kubectl -n "$NS" get deploy -o name | sed 's#deployment.apps/##')
-    record verify "artifacts_restored=$restored artifacts_expected=$expected job=$job deployments=ready"
-    echo "    产物层 $restored/$expected 项，部署全部就绪"
+    record verify "artifacts_restored=$restored artifacts_expected=$expected bundle_seeded=$seeded job=$job deployments=ready"
+    echo "    产物层 $restored/$expected 项，进化 bundle 种回 $seeded 份，部署全部就绪"
 }
 
 run_step() {

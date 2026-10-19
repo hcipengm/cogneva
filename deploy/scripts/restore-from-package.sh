@@ -9,6 +9,7 @@
 # 用法：deploy/scripts/restore-from-package.sh <cogneva-backup-*.tar.zst> [命名空间]
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PKG="${1:-}"
 NS="${2:-cogneva}"
 if [ -z "$PKG" ] || [ ! -f "$PKG" ]; then
@@ -44,6 +45,8 @@ PKG_DIR="$TMP/${BASE%.tar.zst}"
 [ -f "$PKG_DIR/manifest.json" ] || { echo "包内缺少 manifest.json，不是有效备份包" >&2; exit 1; }
 echo "==> 包清单："
 cat "$PKG_DIR/manifest.json"
+# 出包那一版的源码 rev。代次判据用它，不用镜像 tag —— tag 是派生的，可以改。
+PKG_REV="$(sed -n 's/^[[:space:]]*"revision":[[:space:]]*"\([^"]*\)".*/\1/p' "$PKG_DIR/manifest.json" | head -1)"
 
 echo "==> 1/4 创建命名空间并恢复实例身份（Secret 先行，init-secrets.sh 幂等跳过）"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
@@ -160,6 +163,10 @@ kubectl -n "$NS" run "$STAGE_POD" --restart=Never --image="$IMAGE" \
       }
     }'
 kubectl -n "$NS" wait --for=condition=Ready "pod/$STAGE_POD" --timeout=180s
+# 恢复 Job 跑的就是这份镜像，所以代次比对要问它自己，而不是问 tag：tag 是派生
+# 的，可以改；二进制里 baked 的那个 rev 才是代码状态。问不到就跳过，退回显式接受。
+IMAGE_REV="$(kubectl -n "$NS" exec "$STAGE_POD" -- /opt/cogneva/cogneva --version 2>/dev/null \
+    | sed -n 's/.*(rev \(.*\))$/\1/p' | tr -d '[:space:]' || true)"
 kubectl -n "$NS" cp "$PKG" "$STAGE_POD:/backups/$BASE"
 kubectl -n "$NS" delete pod "$STAGE_POD" --wait=true
 
@@ -191,6 +198,53 @@ if kubectl -n "$NS" get pvc cogneva-evolution-data-pvc >/dev/null 2>&1; then
                   app.kubernetes.io/name: cogneva-evolution
                   app.kubernetes.io/component: evolution
               topologyKey: kubernetes.io/hostname'
+    fi
+fi
+
+# 进化 bare 仓的落点：跟着目标部署自己的声明走（pvc / hostPath 两种模式）。
+# 包里那份 bundle 由恢复 Job 种回去，且必须发生在写者重新启动之前——它此刻
+# 正被停在 0 副本上。
+GIT_ENV=""
+GIT_MOUNTS=""
+GIT_VOLUMES=""
+GIT_VOLUME_JSON="$(kubectl -n "$NS" get deployment cogneva-evolution \
+    -o jsonpath='{.spec.template.spec.volumes[?(@.name=="git-remote")]}' 2>/dev/null || true)"
+if printf '%s' "$GIT_VOLUME_JSON" | grep -q '"persistentVolumeClaim"'; then
+    GIT_VOLUMES='        - name: git-remote
+          persistentVolumeClaim:
+            claimName: cogneva-git-remote-pvc'
+elif printf '%s' "$GIT_VOLUME_JSON" | grep -q '"hostPath"'; then
+    GIT_HOST_PATH="$(printf '%s' "$GIT_VOLUME_JSON" | python3 -c \
+        'import json,sys; print(json.load(sys.stdin)["hostPath"]["path"])' 2>/dev/null || true)"
+    if [ -n "$GIT_HOST_PATH" ]; then
+        GIT_VOLUMES="        - name: git-remote
+          hostPath:
+            path: \"$GIT_HOST_PATH\""
+    fi
+fi
+if [ -n "$GIT_VOLUMES" ]; then
+    GIT_ENV='            - name: COGNEVA_RESTORE_GIT_REMOTE_DIR
+              value: "/git-remote"'
+    GIT_MOUNTS='            - name: git-remote
+              mountPath: /git-remote'
+fi
+
+# 代次：包 rev 必须被恢复镜像的 rev 包含，不是字符串相等。仓库在宿主上，所以
+# 「包含」这件事只能在这里用 git 回答；证明的两个 rev 一起交给 Job，它核对证明
+# 说的正是眼前的包与自己。包更新（或宿主上没有那段历史）时证明不出来，仍旧
+# 退回显式接受，并在下面说清楚为什么。
+ANCESTRY_ENV=""
+if [ -n "$PKG_REV" ] && [ -n "$IMAGE_REV" ] && [ "$PKG_REV" != "$IMAGE_REV" ]; then
+    if command -v git >/dev/null 2>&1 \
+        && git -C "$ROOT" cat-file -e "${IMAGE_REV}^{commit}" 2>/dev/null \
+        && git -C "$ROOT" merge-base --is-ancestor "$PKG_REV" "$IMAGE_REV" 2>/dev/null; then
+        echo "    代次：包 rev $PKG_REV 是恢复镜像 $IMAGE_REV 的祖先，按前进方向安装"
+        ANCESTRY_ENV="            - name: COGNEVA_RESTORE_ANCESTRY_PACKAGE_REV
+              value: \"$PKG_REV\"
+            - name: COGNEVA_RESTORE_ANCESTRY_SOURCE_REV
+              value: \"$IMAGE_REV\""
+    else
+        echo "    代次：证明不了包 rev $PKG_REV 是恢复镜像 $IMAGE_REV 的祖先（源码更旧或宿主上没有那段历史）；要恢复请显式设 COGNEVA_RESTORE_ACCEPT_REV_MISMATCH=1" >&2
     fi
 fi
 
@@ -232,11 +286,14 @@ $EVOLUTION_AFFINITY
             # 自己说「我知道，装吧」，而不是默认滑过去。
             - name: COGNEVA_RESTORE_ACCEPT_REV_MISMATCH
               value: "${COGNEVA_RESTORE_ACCEPT_REV_MISMATCH:-0}"
+$ANCESTRY_ENV
+$GIT_ENV
 $EVOLUTION_ENV
           volumeMounts:
             - name: data
               mountPath: /var/lib/cogneva-data
 $EVOLUTION_MOUNTS
+$GIT_MOUNTS
             - name: backup
               mountPath: /backups
               readOnly: true
@@ -245,6 +302,7 @@ $EVOLUTION_MOUNTS
           persistentVolumeClaim:
             claimName: cogneva-data-pvc
 $EVOLUTION_VOLUMES
+$GIT_VOLUMES
         - name: backup
           persistentVolumeClaim:
             claimName: cogneva-backup-pvc

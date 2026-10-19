@@ -190,6 +190,10 @@ pub struct BackupManifest {
     /// 出包时允许的跨段偏差，与 `segments` 成对出现。0 = 没声明。
     #[serde(default)]
     pub max_segment_skew_seconds: u64,
+    /// 进化 bare 仓的完整历史 bundle。`None` = 这个包没带它（旧包，或出包时仓库
+    /// 还没 seed / 打包失败），此时 `lossy_surfaces` 里必须点名这一格。
+    #[serde(default)]
+    pub evolution_bundle: Option<EvolutionBundleReport>,
 }
 
 /// 一段数据被取走的时刻。名字用段的身份（`postgres`／`qdrant`／`objects`／
@@ -198,6 +202,22 @@ pub struct BackupManifest {
 pub struct SegmentStamp {
     pub name: String,
     pub at: String,
+}
+
+/// 进化 bare 仓以 git bundle 形式进包时的读数。
+///
+/// 没有这一段（旧包，或出包时仓库还没 seed / 打包失败）＝「这个包没带」；带了就
+/// 必须能回答「带了多少、HEAD 在哪」，恢复端才能核包内实测并把它种回去。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EvolutionBundleReport {
+    /// bundle 文件字节数；恢复端按它核包内实测。
+    pub bytes: u64,
+    /// bundle 记录的 ref 数（`git bundle list-heads`，不含 HEAD 那一行）。
+    pub refs: u64,
+    /// 出包时 bare 仓 HEAD 指向的符号引用（如 `refs/heads/main`）。
+    pub head: String,
+    /// HEAD 解引用后的提交。
+    pub commit: String,
 }
 
 /// 一份有损面：命名 + 丢了什么 + 为什么可丢。
@@ -260,6 +280,13 @@ pub struct BackupConfig {
     /// `None` = 没有配置落点。这时不复制，演练侧也量不到副本，于是「备份卷之外
     /// 有没有一份」这件事会由规则报红，而不是悄悄当作已覆盖。
     pub offsite_dir: Option<PathBuf>,
+    /// 进化 bare 仓的挂载点（`gitRemote` 那一卷）。`None` = 这次部署没有进化，
+    /// 包里也就不可能有它的 bundle。
+    ///
+    /// 它不在数据根下，是一个独立的卷：`data-root-subdirs.tsv` 里 `git-remote` 这一
+    /// 行的权威面就是它。已推的 rev 能从公开远端重取，未推的不能——那些才是进化
+    /// 自己产出的状态，必须逐字进入包。
+    pub git_remote_dir: Option<PathBuf>,
     pub namespace: String,
 }
 
@@ -298,6 +325,10 @@ impl BackupConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_RUN_DEADLINE_SECONDS),
             offsite_dir: std::env::var("COGNEVA_BACKUP_OFFSITE_DIR")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            git_remote_dir: std::env::var("COGNEVA_BACKUP_GIT_REMOTE_DIR")
                 .ok()
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
@@ -1285,6 +1316,24 @@ async fn run_backup_into(
     segments.push(segment_stamp("objects"));
     let artifacts = collect_artifacts(cfg, staging, Some(&pool)).await?;
     segments.push(segment_stamp("artifacts"));
+
+    // 进化 bare 仓：它不在数据根里，是独立的一卷，所以单独打成 git bundle。
+    // 打包失败不让整次备份失败——没有 bundle 的包仍然救得回其余全部状态，而
+    // 这一格的损失会在 manifest 的 `lossy_surfaces` 里被点名。相反，成功就必须
+    // 在 manifest 里留下读数，恢复端才知道该把哪一份种回去。
+    let evolution_bundle = match bundle_evolution(
+        cfg.git_remote_dir.as_deref(),
+        &staging.join("git"),
+    ) {
+        Ok(report) => report,
+        Err(e) => {
+            tracing::warn!(error = %e, "备份：进化 bare 仓打不成 git bundle，这一格按有损面点名");
+            None
+        }
+    };
+    if evolution_bundle.is_some() {
+        segments.push(segment_stamp("git-bundle"));
+    }
     let bound = max_segment_skew();
     if let Ok((first, last, skew)) = segment_span(&segments) {
         if skew > bound as i64 {
@@ -1322,9 +1371,10 @@ async fn run_backup_into(
         artifacts,
         image: std::env::var("COGNEVA_IMAGE_REF").unwrap_or_default(),
         schema_version: current_schema_version(),
-        lossy_surfaces: lossy_surfaces(),
+        lossy_surfaces: lossy_surfaces(evolution_bundle.is_some()),
         segments,
         max_segment_skew_seconds: bound,
+        evolution_bundle,
     })
 }
 
@@ -1418,8 +1468,11 @@ fn check_segment_skew(manifest: &BackupManifest) -> Result<(), String> {
 /// 每一条都要能回答「换机后少了什么、为什么能接受」。加了新的外部依赖而这里
 /// 没有对应的行，换机后那个面就是静默消失的——所以这里是一张按依赖来源写的
 /// 闭集，不是一份事后的说明。
-fn lossy_surfaces() -> Vec<LossySurface> {
-    [
+///
+/// `bundle_present` 是包里到底有没有那份进化 bare 仓的 git bundle：带了就不该
+/// 再把它列成损失，没带才是。这一格由出包时实测决定，不由这张表自己声称。
+fn lossy_surfaces(bundle_present: bool) -> Vec<LossySurface> {
+    let mut surfaces: Vec<LossySurface> = [
         (
             "nats",
             "在途事件与 JetStream 里尚未被消费的消息",
@@ -1441,11 +1494,6 @@ fn lossy_surfaces() -> Vec<LossySurface> {
             "镜像是构建产物，不是权威面；由源码 rev 重建或从 release 重新拉取",
         ),
         (
-            "evolution-bare-repo",
-            "未推送到远端的进化 rev（若 manifest 未带 git bundle）",
-            "已推的 rev 可从远端重取；未推的部分由 A18 的 bundle 覆盖，或在此被点名为损失",
-        ),
-        (
             "pending-changes",
             "还没投递出去的已生成变更（数据根下 pending-changes/）",
             "已投递的变更以 change_ledger 与 git 上的提交为准；没投递的那次生成换机后重跑，代价是一次生成",
@@ -1457,7 +1505,112 @@ fn lossy_surfaces() -> Vec<LossySurface> {
         lost: lost.to_string(),
         acceptable_because: why.to_string(),
     })
-    .collect()
+    .collect();
+    if !bundle_present {
+        surfaces.insert(
+            4,
+            LossySurface {
+                name: "evolution-bare-repo".to_string(),
+                lost: "未推送到远端的进化 rev（这个包没有带 git bundle）".to_string(),
+                acceptable_because:
+                    "已推的 rev 可从公开远端重取；未推的那部分确实是损失——出包时仓库还没 seed \
+                     或 bundle 没打成，出包日志里有那一行告警"
+                        .to_string(),
+            },
+        );
+    }
+    surfaces
+}
+
+/// 把进化 bare 仓的完整历史打成一个 git bundle 放进 staging。
+///
+/// `None` 有三种正当来源：部署里没有进化、仓库还没 seed、仓库还没有提交。三种
+/// 都让 manifest 不带这一格，`lossy_surfaces` 会据此点名损失，恢复端也就知道
+/// 包里没有可种的东西。打包失败走 `Err`，调用方记一条告警后按「没带」处理——
+/// 没有 bundle 的包仍然救得回其余全部状态，让整晚的备份因此失败反而更糟。
+fn bundle_evolution(
+    dir: Option<&Path>,
+    out_dir: &Path,
+) -> Result<Option<EvolutionBundleReport>, Box<dyn std::error::Error>> {
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    if !dir.join("HEAD").is_file() {
+        tracing::info!(dir = %dir.display(), "进化 bare 仓还没 seed（没有 HEAD），这个包不带它");
+        return Ok(None);
+    }
+    // 空仓（init 过但还没有提交）没有可打包的历史；`rev-parse --verify HEAD` 会
+    // 非零退出，那不是错误，只是「还没有东西可带」。
+    if !git_run(dir, &["rev-parse", "--verify", "HEAD"])?
+        .status
+        .success()
+    {
+        tracing::info!(dir = %dir.display(), "进化 bare 仓还没有提交，这个包不带它");
+        return Ok(None);
+    }
+    std::fs::create_dir_all(out_dir)?;
+    let bundle = out_dir.join("evolution.bundle");
+    let partial = out_dir.join("evolution.bundle.partial");
+    let _ = std::fs::remove_file(&partial);
+    let partial_s = partial
+        .to_str()
+        .ok_or("bundle 路径不是 UTF-8，git 命令行给不出来")?;
+    let bundle_s = bundle
+        .to_str()
+        .ok_or("bundle 路径不是 UTF-8，git 命令行给不出来")?;
+
+    git_ok(dir, &["bundle", "create", partial_s, "--all"])?;
+    // 自己先验一遍：一个恢复端打不开的 bundle 比没有更坏——manifest 会说自己带了。
+    git_ok(dir, &["bundle", "verify", partial_s])?;
+    std::fs::rename(&partial, &bundle)?;
+
+    let heads = git_ok(dir, &["bundle", "list-heads", bundle_s])?;
+    let refs = heads
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter(|refname| *refname != "HEAD")
+        .count() as u64;
+    let head = git_ok(dir, &["symbolic-ref", "-q", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let commit = git_ok(dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    let bytes = std::fs::metadata(&bundle)?.len();
+    tracing::info!(
+        dir = %dir.display(),
+        bytes,
+        refs,
+        head = %head,
+        commit = %commit,
+        "进化 bare 仓已打成 git bundle"
+    );
+    Ok(Some(EvolutionBundleReport {
+        bytes,
+        refs,
+        head,
+        commit,
+    }))
+}
+
+fn git_run(dir: &Path, args: &[&str]) -> Result<std::process::Output, Box<dyn std::error::Error>> {
+    Ok(std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()?)
+}
+
+fn git_ok(dir: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    let output = git_run(dir, args)?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} 失败（{}）：{}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// 把每个数据根的产物层抄进包，并留下逐库读数。
@@ -1993,6 +2146,26 @@ fn verify_package_against_manifest(
         }
     }
 
+    // 进化 bare 仓的 bundle：清单说带了，包里就必须是那一份；字节数对不上
+    // 与「文件不在」是两种不同的坏，分开说。内容能不能打开由种子那一步用
+    // `git bundle verify` 判——那是唯一会真正消费它的地方。
+    if let Some(bundle) = &manifest.evolution_bundle {
+        let path = pkg_dir.join("git").join("evolution.bundle");
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.len() == bundle.bytes => {}
+            Ok(meta) => problems.push(format!(
+                "git: manifest declares {} byte(s) for evolution.bundle, package holds {}",
+                bundle.bytes,
+                meta.len()
+            )),
+            Err(_) => problems.push(
+                "git: manifest reports an evolution bundle but the package has no \
+                 git/evolution.bundle"
+                    .to_string(),
+            ),
+        }
+    }
+
     if problems.is_empty() {
         Ok(())
     } else {
@@ -2088,6 +2261,11 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(reading = %reading, "artifact restored");
     }
 
+    // 进化 bare 仓的未推 rev 只在这个包里有：种回去必须发生在部署器重新启动之前
+    // （恢复脚本此刻正把写者停在 0 副本上），否则它先从一个只有公开 rev 的基线
+    // 起步，而那之后没有任何读数会说少过东西。
+    seed_evolution_bundle(&pkg_dir, &manifest)?;
+
     if let Some((root, _)) = &extract_root {
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2095,14 +2273,210 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// 把包里的进化 bare 仓 bundle 种回目标卷。
+///
+/// 目标可能是空卷（空白机刚 bootstrap，进化 init 还没跑），也可能是已经由公开
+/// 远端 seed 过的仓。后者不能直接 `fetch --force`：公开 main 可能比出包那一刻
+/// 更新，把 ref 拨回去会让部署器看到一次倒退。所以逐个 ref 合：目标没有的建出来，
+/// 能快进的快进，已经分叉的原样不动并点名——包里的那份仍在包内，不会因为这一步
+/// 被抹掉。
+fn seed_evolution_bundle(
+    pkg_dir: &Path,
+    manifest: &BackupManifest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(report) = &manifest.evolution_bundle else {
+        return Ok(());
+    };
+    let bundle = pkg_dir.join("git").join("evolution.bundle");
+    let target = match std::env::var("COGNEVA_RESTORE_GIT_REMOTE_DIR") {
+        Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
+        _ => {
+            if std::env::var("COGNEVA_RESTORE_SKIP_GIT_BUNDLE").as_deref() == Ok("1") {
+                tracing::warn!(
+                    bundle_bytes = report.bytes,
+                    refs = report.refs,
+                    "包里有进化 bare 仓的 bundle，但恢复端没有落点且被显式跳过：未推的 rev 留在包里，没有种回 /host-git"
+                );
+                return Ok(());
+            }
+            return Err("包里有进化 bare 仓的 git bundle，但恢复端没有落点：\
+                 设 COGNEVA_RESTORE_GIT_REMOTE_DIR 指向 /host-git 那一卷；\
+                 确认目标不需要进化时显式设 COGNEVA_RESTORE_SKIP_GIT_BUNDLE=1"
+                .into());
+        }
+    };
+    seed_evolution_bundle_into(&bundle, report, &target)
+}
+
+/// 种子本体，落点由调用方给出：恢复入口从 env 取，测试直接给临时目录。
+fn seed_evolution_bundle_into(
+    bundle: &Path,
+    report: &EvolutionBundleReport,
+    target: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let meta = std::fs::metadata(bundle).map_err(|e| {
+        format!(
+            "包里有进化 bare 仓的 bundle 声明，但 {} 打不开：{e}",
+            bundle.display()
+        )
+    })?;
+    if meta.len() != report.bytes {
+        return Err(format!(
+            "包里的 evolution.bundle 是 {} 字节，manifest 声明 {} 字节：这一份不是出包时那一份",
+            meta.len(),
+            report.bytes
+        )
+        .into());
+    }
+
+    std::fs::create_dir_all(target)?;
+    if !target.join("HEAD").is_file() {
+        git_ok(target, &["init", "--bare", "."])?;
+    }
+    let bundle_s = bundle
+        .to_str()
+        .ok_or("bundle 路径不是 UTF-8，git 命令行给不出来")?;
+    git_ok(target, &["bundle", "verify", bundle_s])?;
+
+    // 先把对象与 ref 名一起抓进临时命名空间，再逐个决定目标 ref 动不动。
+    git_ok(
+        target,
+        &[
+            "fetch",
+            bundle_s,
+            "+refs/heads/*:refs/restore/heads/*",
+            "+refs/tags/*:refs/restore/tags/*",
+        ],
+    )?;
+    let mut created = 0usize;
+    let mut fast_forward = 0usize;
+    let mut diverged = Vec::new();
+    let heads = git_ok(target, &["bundle", "list-heads", bundle_s])?;
+    for line in heads.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(_sha) = fields.next() else { continue };
+        let Some(refname) = fields.next() else {
+            continue;
+        };
+        if refname == "HEAD" {
+            continue;
+        }
+        let (tmp, target_ref) = if let Some(name) = refname.strip_prefix("refs/heads/") {
+            (format!("refs/restore/heads/{name}"), refname.to_string())
+        } else if let Some(name) = refname.strip_prefix("refs/tags/") {
+            (format!("refs/restore/tags/{name}"), refname.to_string())
+        } else {
+            // 远端跟踪之类不属于权威面的 ref：包里带了也不种。
+            continue;
+        };
+        match merge_bundle_ref(target, &tmp, &target_ref)? {
+            BundleRefMerge::Created => created += 1,
+            BundleRefMerge::FastForwarded => fast_forward += 1,
+            BundleRefMerge::Same => {}
+            BundleRefMerge::Diverged => diverged.push(target_ref),
+        }
+    }
+    // 临时命名空间不留在目标仓里：下一轮恢复再建一份，名字不会越攒越多。
+    let leftovers = git_ok(
+        &target,
+        &["for-each-ref", "--format=%(refname)", "refs/restore/"],
+    )?;
+    for refname in leftovers.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let _ = git_run(target, &["update-ref", "-d", refname]);
+    }
+
+    // 空白卷上 `git init --bare` 的 HEAD 指向 master；包里是 main 时那个符号引用
+    // 指着不存在的 ref，部署器会把它读成「main 不见了」。只在 HEAD 悬空时改。
+    let head_ok = git_ok(target, &["symbolic-ref", "-q", "HEAD"])
+        .ok()
+        .map(|head| {
+            git_run(target, &["rev-parse", "--verify", head.trim()])
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if !head_ok
+        && !report.head.is_empty()
+        && git_run(target, &["rev-parse", "--verify", &report.head])
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    {
+        git_ok(target, &["symbolic-ref", "HEAD", &report.head])?;
+    }
+
+    tracing::info!(
+        target = %target.display(),
+        bytes = report.bytes,
+        refs = report.refs,
+        created,
+        fast_forward,
+        diverged = diverged.len(),
+        head = %report.head,
+        commit = %report.commit,
+        "进化 bare 仓已从包里的 git bundle 种回"
+    );
+    if !diverged.is_empty() {
+        tracing::warn!(
+            refs = %diverged.join(","),
+            "这些 ref 在目标仓里已有不同的历史，没有强推覆盖：包里的那份仍在包内"
+        );
+    }
+    Ok(())
+}
+
+enum BundleRefMerge {
+    Created,
+    FastForwarded,
+    Same,
+    Diverged,
+}
+
+fn merge_bundle_ref(
+    dir: &Path,
+    source: &str,
+    target: &str,
+) -> Result<BundleRefMerge, Box<dyn std::error::Error>> {
+    let source_sha = git_ok(dir, &["rev-parse", "--verify", source])?;
+    let source_sha = source_sha.trim();
+    let current = git_run(dir, &["rev-parse", "--verify", target])?;
+    if !current.status.success() {
+        git_ok(dir, &["update-ref", target, source_sha])?;
+        return Ok(BundleRefMerge::Created);
+    }
+    let current_sha = String::from_utf8_lossy(&current.stdout).trim().to_string();
+    if current_sha == source_sha {
+        return Ok(BundleRefMerge::Same);
+    }
+    let ancestor = git_run(
+        dir,
+        &["merge-base", "--is-ancestor", &current_sha, source_sha],
+    )?;
+    if ancestor.status.success() {
+        git_ok(dir, &["update-ref", target, source_sha])?;
+        return Ok(BundleRefMerge::FastForwarded);
+    }
+    // 非零里 1 = 不是祖先（分叉），其余是 git 自己出错。
+    if ancestor.status.code() == Some(1) {
+        Ok(BundleRefMerge::Diverged)
+    } else {
+        Err(format!(
+            "git merge-base --is-ancestor {current_sha} {source_sha} 失败：{}",
+            String::from_utf8_lossy(&ancestor.stderr).trim()
+        )
+        .into())
+    }
+}
+
 /// 包与本二进制是不是同一代。
 ///
 /// 三条判据，方向不同：
 /// - **数据结构只能向前**：包里的 schema 版本比本二进制新就拒绝——装回去会缺列，
 ///   而缺列在恢复日志里没有任何症状。包更旧是正常升级路径，放行并记一条。
-/// - **源码 rev 不同默认拒绝**：跨代恢复要属主显式接受
-///   （`COGNEVA_RESTORE_ACCEPT_REV_MISMATCH=1`）。空白机重装装的是公开 main，
-///   几乎必然与出包那一晚不同代，所以这条路必须能走——但要走得留一声。
+/// - **源码 rev 要包含包 rev**：不是字符串相等。空白机重装装的是公开仓库当前
+///   这一版，而包可能来自更早的一版，那正是正常的升级路径。恢复脚本在有仓库的
+///   宿主上用 `git merge-base --is-ancestor` 证明「包 rev 是本源 rev 的祖先」，
+///   并把两个 rev 一起交给这里核对。证明不了（源码比包旧、或宿主上没有历史）
+///   才拒绝，退路是人显式接受（`COGNEVA_RESTORE_ACCEPT_REV_MISMATCH=1`）。
 /// - **镜像引用不同只记不拦**：同一个 rev 可以有多个构建产物，把它当身份会拦住
 ///   合法恢复。它是排障时的对照，不是判据。
 fn check_provenance(manifest: &BackupManifest) -> Result<(), Box<dyn std::error::Error>> {
@@ -2110,7 +2484,43 @@ fn check_provenance(manifest: &BackupManifest) -> Result<(), Box<dyn std::error:
         manifest,
         env!("COGNEVA_GIT_REVISION"),
         current_schema_version(),
+        &RevAcceptance::from_env(),
     )
+}
+
+/// 跨代恢复的接受依据。
+///
+/// 两种来源必须分开记：`ancestry` 是恢复脚本在**有仓库的地方**（宿主上的源码
+/// 检出）用 `git merge-base --is-ancestor` 算出来的，绑定了包 rev 与恢复镜像的
+/// rev；`explicit` 是人明确说「我知道，装吧」。二进制在 Pod 里没有历史可查，能做
+/// 的只有核对这份证明点名的两个 rev 与眼前的包、与自己一致——这至少保证证明不是
+/// 从另一次恢复上抄来的。
+#[derive(Debug, Default)]
+struct RevAcceptance {
+    explicit: bool,
+    ancestry_package: Option<String>,
+    ancestry_source: Option<String>,
+}
+
+impl RevAcceptance {
+    fn from_env() -> Self {
+        Self {
+            explicit: std::env::var("COGNEVA_RESTORE_ACCEPT_REV_MISMATCH").as_deref() == Ok("1"),
+            ancestry_package: std::env::var("COGNEVA_RESTORE_ANCESTRY_PACKAGE_REV")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            ancestry_source: std::env::var("COGNEVA_RESTORE_ANCESTRY_SOURCE_REV")
+                .ok()
+                .filter(|v| !v.is_empty()),
+        }
+    }
+
+    /// 证明只对「它当时量的那两个 rev」有效：包 rev 必须正是 manifest 里那个，
+    /// 源 rev 必须正是本二进制自己。换成别的 rev 就退回「没有证明」。
+    fn proves_ancestry(&self, package_rev: &str, source_rev: &str) -> bool {
+        self.ancestry_package.as_deref() == Some(package_rev)
+            && self.ancestry_source.as_deref() == Some(source_rev)
+    }
 }
 
 /// 判据本体，代次由调用方给出：恢复入口给的是本二进制自己的值，测试给的是
@@ -2119,6 +2529,7 @@ fn check_provenance_against(
     manifest: &BackupManifest,
     current_rev: &str,
     current_schema: i64,
+    acceptance: &RevAcceptance,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if manifest.schema_version > 0 && current_schema > 0 {
         if manifest.schema_version > current_schema {
@@ -2141,19 +2552,32 @@ fn check_provenance_against(
     }
 
     if !manifest.revision.is_empty() && manifest.revision != current_rev {
-        if std::env::var("COGNEVA_RESTORE_ACCEPT_REV_MISMATCH").as_deref() != Ok("1") {
+        // 前进方向的恢复是常态：空白机装的是公开仓库当前这一版，而包可能来自
+        // 几天前。判据不是「rev 相等」，而是「包那一版被本源包含」——这个事实
+        // 只有仓库能回答，所以由恢复脚本在宿主上算好，二进制核对它点名的对象。
+        let ancestry = acceptance.proves_ancestry(&manifest.revision, current_rev);
+        if !ancestry && !acceptance.explicit {
             return Err(format!(
-                "包来自源码 rev {}，本二进制是 {current_rev}；跨代恢复要显式接受：\
-                 设 COGNEVA_RESTORE_ACCEPT_REV_MISMATCH=1 后重跑",
+                "包来自源码 rev {}，本二进制是 {current_rev}；跨代恢复要么由恢复脚本\
+                 证明包 rev 是本源的一个祖先（用宿主上的源码检出跑 git merge-base，\
+                 脚本会自动带上证明），要么显式接受：设 COGNEVA_RESTORE_ACCEPT_REV_MISMATCH=1 后重跑",
                 manifest.revision
             )
             .into());
         }
-        tracing::warn!(
-            package = %manifest.revision,
-            binary = current_rev,
-            "跨代恢复已被显式接受"
-        );
+        if ancestry {
+            tracing::info!(
+                package = %manifest.revision,
+                binary = current_rev,
+                "包 rev 是本二进制 rev 的祖先（恢复脚本在源码仓库里核实过），按前进方向安装"
+            );
+        } else {
+            tracing::warn!(
+                package = %manifest.revision,
+                binary = current_rev,
+                "跨代恢复已被显式接受"
+            );
+        }
     }
 
     if !manifest.image.is_empty() {
@@ -3288,12 +3712,13 @@ mod tests {
             artifacts: Vec::new(),
             image: "registry.example/cogneva:test".into(),
             schema_version: 1,
-            lossy_surfaces: lossy_surfaces(),
+            lossy_surfaces: lossy_surfaces(false),
             segments: stamps(&[
                 ("postgres", "2026-10-19T00:00:00Z"),
                 ("artifacts", "2026-10-19T00:00:10Z"),
             ]),
             max_segment_skew_seconds: 300,
+            evolution_bundle: None,
         }
     }
 
@@ -3444,6 +3869,7 @@ mod tests {
             oob_secrets_dir: dir.path().to_path_buf(),
             data_dir: dir.path().to_path_buf(),
             extra_data_roots: Vec::new(),
+            git_remote_dir: None,
             keep_count: 7,
             run_deadline_seconds: DEFAULT_RUN_DEADLINE_SECONDS,
             offsite_dir: None,
@@ -3588,6 +4014,7 @@ mod tests {
             lossy_surfaces: Vec::new(),
             segments: Vec::new(),
             max_segment_skew_seconds: 0,
+            evolution_bundle: None,
         }
     }
 
@@ -3597,7 +4024,8 @@ mod tests {
         let mut manifest = manifest_with(Vec::new());
         manifest.revision = "abc".into();
         manifest.schema_version = 43;
-        let err = check_provenance_against(&manifest, "abc", 42).expect_err("更新的 schema 不能装");
+        let err = check_provenance_against(&manifest, "abc", 42, &RevAcceptance::default())
+            .expect_err("更新的 schema 不能装");
         assert!(err.to_string().contains("schema"), "{err}");
     }
 
@@ -3607,7 +4035,7 @@ mod tests {
         let mut manifest = manifest_with(Vec::new());
         manifest.revision = "abc".into();
         manifest.schema_version = 41;
-        check_provenance_against(&manifest, "abc", 42).unwrap();
+        check_provenance_against(&manifest, "abc", 42, &RevAcceptance::default()).unwrap();
     }
 
     /// 同一个 rev 的包直接放行：这是日常恢复，不该要任何额外声明。
@@ -3616,7 +4044,7 @@ mod tests {
         let mut manifest = manifest_with(Vec::new());
         manifest.revision = "abc".into();
         manifest.schema_version = 42;
-        check_provenance_against(&manifest, "abc", 42).unwrap();
+        check_provenance_against(&manifest, "abc", 42, &RevAcceptance::default()).unwrap();
     }
 
     /// 跨代恢复默认拒绝，且错误里要说清怎么显式接受。
@@ -3625,7 +4053,8 @@ mod tests {
         let mut manifest = manifest_with(Vec::new());
         manifest.revision = "0000000-not-this-binary".into();
         manifest.schema_version = 42;
-        let err = check_provenance_against(&manifest, "abc", 42).expect_err("跨代默认要拦");
+        let err = check_provenance_against(&manifest, "abc", 42, &RevAcceptance::default())
+            .expect_err("跨代默认要拦");
         assert!(
             err.to_string()
                 .contains("COGNEVA_RESTORE_ACCEPT_REV_MISMATCH"),
@@ -3633,21 +4062,166 @@ mod tests {
         );
     }
 
+    /// 包比源码旧是正常的升级路径：脚本在宿主上证明了「包 rev 是本源的祖先」，
+    /// 二进制核对证明点名的两个 rev 就是眼前的这一对，放行，不要人再按一次开关。
+    #[test]
+    fn a_package_from_an_ancestor_revision_is_accepted_without_a_manual_accept() {
+        let mut manifest = manifest_with(Vec::new());
+        manifest.revision = "abc".into();
+        manifest.schema_version = 42;
+        let acceptance = RevAcceptance {
+            explicit: false,
+            ancestry_package: Some("abc".into()),
+            ancestry_source: Some("def".into()),
+        };
+        check_provenance_against(&manifest, "def", 42, &acceptance).unwrap();
+    }
+
+    /// 证明是从另一次恢复上抄来的（rev 与眼前的包或二进制对不上）时不算数。
+    #[test]
+    fn an_ancestry_proof_for_other_revisions_is_not_a_proof() {
+        let mut manifest = manifest_with(Vec::new());
+        manifest.revision = "abc".into();
+        manifest.schema_version = 42;
+        let stale_source = RevAcceptance {
+            explicit: false,
+            ancestry_package: Some("abc".into()),
+            ancestry_source: Some("011".into()),
+        };
+        assert!(check_provenance_against(&manifest, "def", 42, &stale_source).is_err());
+        let wrong_package = RevAcceptance {
+            explicit: false,
+            ancestry_package: Some("000".into()),
+            ancestry_source: Some("def".into()),
+        };
+        assert!(check_provenance_against(&manifest, "def", 42, &wrong_package).is_err());
+    }
+
     /// 有损面每一条都要能回答「丢了什么、为什么可丢」；只有名字的条目等于把
     /// 问题留给下一个读包的人。
     #[test]
     fn every_lossy_surface_says_what_is_lost_and_why_it_is_ok() {
-        let surfaces = lossy_surfaces();
-        assert!(!surfaces.is_empty());
-        for s in &surfaces {
-            assert!(!s.name.is_empty());
-            assert!(!s.lost.is_empty(), "{} 没写丢了什么", s.name);
-            assert!(
-                !s.acceptable_because.is_empty(),
-                "{} 没写为什么可丢",
-                s.name
-            );
+        // 两种包都要说得清：带了 bundle 就不该再把进化仓列成损失，没带才是。
+        for bundle_present in [false, true] {
+            let surfaces = lossy_surfaces(bundle_present);
+            assert!(!surfaces.is_empty());
+            for s in &surfaces {
+                assert!(!s.name.is_empty());
+                assert!(!s.lost.is_empty(), "{} 没写丢了什么", s.name);
+                assert!(
+                    !s.acceptable_because.is_empty(),
+                    "{} 没写为什么可丢",
+                    s.name
+                );
+            }
+            let named = surfaces.iter().any(|s| s.name == "evolution-bare-repo");
+            assert_eq!(named, !bundle_present, "bundle_present={bundle_present}");
         }
+    }
+
+    /// 清单说带了 bundle，包里却没有那一份：核包阶段就要停，别等种的时候才发现。
+    #[test]
+    fn a_package_that_declares_a_bundle_without_the_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest = sample_manifest();
+        manifest.evolution_bundle = Some(EvolutionBundleReport {
+            bytes: 12,
+            refs: 1,
+            head: "refs/heads/main".into(),
+            commit: "abc".into(),
+        });
+        write_package_like(&manifest, dir.path());
+        let err = verify_package_against_manifest(dir.path(), &manifest).unwrap_err();
+        assert!(err.to_string().contains("evolution.bundle"), "{err}");
+
+        std::fs::create_dir_all(dir.path().join("git")).unwrap();
+        std::fs::write(dir.path().join("git/evolution.bundle"), b"0123456789ab").unwrap();
+        verify_package_against_manifest(dir.path(), &manifest).unwrap();
+
+        // 字节数对不上同样是坏：恢复端要靠它确认「种回去的是出包那一份」。
+        std::fs::write(dir.path().join("git/evolution.bundle"), b"short").unwrap();
+        let err = verify_package_against_manifest(dir.path(), &manifest).unwrap_err();
+        assert!(err.to_string().contains("package holds 5"), "{err}");
+    }
+
+    /// 打包与种子走一遍真 git：打出来的是完整历史，种进空仓后 ref 与 HEAD 都在；
+    /// 再种一次不改变任何东西（可重入的恢复会再跑这一段）。
+    #[test]
+    fn an_evolution_bundle_round_trips_into_a_fresh_bare_repo() {
+        let src = tempfile::tempdir().unwrap();
+        let src_path = src.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(src_path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(src_path.join("a"), b"a").unwrap();
+        run(&["add", "a"]);
+        run(&["commit", "-qm", "a", "--", "a"]);
+        run(&["branch", "evolution/one"]);
+        let head_commit = run(&["rev-parse", "HEAD"]);
+
+        // 备份读到的是进化用的 bare 仓（`/git-remote` 那一卷），不是检出的工作区。
+        let bare = tempfile::tempdir().unwrap();
+        let clone = std::process::Command::new("git")
+            .args(["clone", "-q", "--bare"])
+            .arg(src_path)
+            .arg(bare.path())
+            .output()
+            .unwrap();
+        assert!(
+            clone.status.success(),
+            "git clone --bare: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+
+        let out = tempfile::tempdir().unwrap();
+        let report = bundle_evolution(Some(bare.path()), out.path())
+            .unwrap()
+            .expect("有提交的仓必须打得出 bundle");
+        assert!(report.bytes > 0);
+        assert_eq!(report.refs, 2, "main 与 evolution/one 两个 ref");
+        assert_eq!(report.head, "refs/heads/main");
+        assert_eq!(report.commit, head_commit);
+
+        let bundle = out.path().join("evolution.bundle");
+        let target = tempfile::tempdir().unwrap();
+        seed_evolution_bundle_into(&bundle, &report, target.path()).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(target.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(git(&["rev-parse", "refs/heads/main"]), head_commit);
+        assert_eq!(git(&["rev-parse", "refs/heads/evolution/one"]), head_commit);
+        assert_eq!(git(&["symbolic-ref", "HEAD"]), "refs/heads/main");
+
+        // 第二遍：同一份包再种一次，ref 与 HEAD 原样。
+        seed_evolution_bundle_into(&bundle, &report, target.path()).unwrap();
+        assert_eq!(git(&["rev-parse", "refs/heads/main"]), head_commit);
+        assert_eq!(git(&["symbolic-ref", "HEAD"]), "refs/heads/main");
     }
 
     fn manifest_with_segments(segments: Vec<SegmentStamp>, bound: u64) -> BackupManifest {
