@@ -42,9 +42,11 @@
 //! literal scan below is what makes that a claim rather than a hope: every
 //! well-formed `"cogneva_..."` literal under `crates/` must be on the
 //! denominator, in the closed set, a recording-suffix derivative of a closed
-//! set name, or one of two declared non-series. A producer that spells its name
-//! a third way lands there as an unexplained literal rather than as a series
-//! nothing checks.
+//! set name, one of two declared non-series, or named by a produced-table row
+//! whose producer lies outside `crates/` and really spells it -- the textfile
+//! collector in the chart is such a producer, and its names are born nowhere in
+//! Rust. A producer that spells its name some other way lands there as an
+//! unexplained literal rather than as a series nothing checks.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -554,6 +556,7 @@ fn every_series_name_literal_in_the_tree_is_accounted_for() {
         );
     }
 
+    let outside = names_produced_outside_crates();
     let unexplained: Vec<&str> = literals
         .iter()
         .map(String::as_str)
@@ -563,11 +566,12 @@ fn every_series_name_literal_in_the_tree_is_accounted_for() {
                 && !derived(n)
                 && !excluded.contains(n)
                 && !retired.contains(n)
+                && !outside.contains(*n)
         })
         .collect();
     assert!(
         unexplained.is_empty(),
-        "树里有这些 cogneva_ 字面量，既不是两种产出形状解析出的名字、也不在闭集里、也不是闭集名字的派生名——产出面可能换了第三种写法，那样它就整个在门的射程之外：\n{}",
+        "树里有这些 cogneva_ 字面量，既不是两种产出形状解析出的名字、也不在闭集里、也不是闭集名字的派生名、也不是产出表点名了一个真写着它的非 Rust 产出方——产出面可能换了第三种写法，那样它就整个在门的射程之外：\n{}",
         unexplained.join("\n")
     );
 }
@@ -624,6 +628,19 @@ fn rule_expressions() -> Vec<String> {
 /// comment beside an entry that quotes a name cannot add one. The table's opening line has to be there:
 /// renamed or moved, this panics rather than reading an empty face.
 fn table_names(rel: &str, opens: &str) -> BTreeSet<String> {
+    table_entries(rel, opens)
+        .into_iter()
+        .filter(|(name, _)| name.starts_with(NAME_PREFIX))
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// The entries of one produced table, in the order the table writes them.
+///
+/// The alert-rule table writes `(series, producer)` pairs across two lines, so
+/// the quoted entries pair up by position; anything else is a shape this
+/// reader does not know how to pair and it panics rather than guessing.
+fn table_entries(rel: &str, opens: &str) -> Vec<(String, String)> {
     let text = read(rel);
     let start = text
         .find(opens)
@@ -632,13 +649,60 @@ fn table_names(rel: &str, opens: &str) -> BTreeSet<String> {
         .split_once("\n];")
         .map(|(block, _)| block)
         .unwrap_or_else(|| panic!("{rel} 里那张表没有以 `];` 收尾，读不完整"));
-    table
+    let quoted: Vec<String> = table
         .lines()
         .filter_map(|line| line.trim().strip_prefix('"'))
         .filter_map(|rest| rest.strip_suffix("\","))
-        .filter(|name| name.starts_with(NAME_PREFIX))
         .map(str::to_string)
+        .collect();
+    assert!(
+        quoted.len() % 2 == 0,
+        "{rel} 里那张表的条目数是奇数（{}），没法按「序列, 产出方」成对读",
+        quoted.len()
+    );
+    quoted
+        .chunks(2)
+        .map(|pair| (pair[0].clone(), pair[1].clone()))
         .collect()
+}
+
+/// The names whose producer is not Rust.
+///
+/// A textfile collector is a third place a series is born: the chart's sidecar
+/// formats a `name value` line into a file that the node exporter serves, so
+/// nothing under `crates/` declares the name and neither producer shape can see
+/// it. The only place such a name appears in Rust is the produced-series table
+/// row that records it -- and that row is evidence of a producer only if the
+/// file it names really spells the series, which is checked here rather than
+/// taken on the table's word. A row naming a file outside `crates/` that no
+/// longer carries its name is a registration whose producer was renamed or
+/// deleted, and it has to red here because no Rust shape will ever miss it.
+///
+/// Only the alert-rule table is read: its rows are all pairs, while the
+/// dashboard table carries a reader list between the name and its producer.
+fn names_produced_outside_crates() -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for (name, source) in table_entries(ALERT_RULE_CONTRACT, ALERT_TABLE_OPENS) {
+        if source.starts_with("crates/") {
+            continue;
+        }
+        let text = read(&source);
+        assert!(
+            spells_series(&text, &name),
+            "{name} 的产出表写着它由 `{source}` 产出，可那个文件里读不到这条名字——注册还在，产出方却改了名或被删了"
+        );
+        found.insert(name);
+    }
+    found
+}
+
+/// Whether `text` writes `name` as a series literal, in any language.
+///
+/// The same reader the Rust scan uses, applied to a producer that is not Rust:
+/// what makes a spelling a spelling is the quote-delimited name, not the syntax
+/// around it.
+fn spells_series(text: &str, name: &str) -> bool {
+    series_name_literals(text).iter().any(|n| n == name)
 }
 
 /// Every series name the tree publishes, from the two shapes a producer uses.
@@ -858,6 +922,30 @@ mod tests {
             series_name_literals(&spliced),
             vec![NAME_PREFIX.to_string()],
             "a spliced name is read as the bare prefix, which no population holds"
+        );
+    }
+
+    /// A produced-table row licenses a literal only when the file it names
+    /// really writes that name.
+    ///
+    /// The row is the census's only evidence that a name born outside `crates/`
+    /// exists, so trusting it would turn the table into a place a typo -- or a
+    /// producer deleted while its row stayed -- reads as coverage. Both halves
+    /// are pinned here: the shell line that produces the series is read, and a
+    /// file where the name was renamed is not.
+    #[test]
+    fn a_non_rust_producer_licenses_only_the_name_it_actually_writes() {
+        let name = format!("{NAME_PREFIX}a_series_a_sidecar_writes");
+        let produced = format!("printf '%s %s\\n' \"{name}\" \"$(value used_memory)\"");
+        assert!(
+            spells_series(&produced, &name),
+            "a sidecar that writes the name into a textfile is a producer"
+        );
+
+        let renamed = produced.replace(&name, &format!("{name}_v2"));
+        assert!(
+            !spells_series(&renamed, &name),
+            "a row naming a file that no longer spells the series is a registration without a producer"
         );
     }
 }
