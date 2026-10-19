@@ -1005,10 +1005,26 @@ pub fn enforce_retention(dir: &Path, keep: usize) -> Vec<PathBuf> {
     deleted
 }
 
+/// 包里带着 Secret 对象（恢复时要 apply 回去），而它们只是 base64，等于明文。
+/// 于是凡是装这些字节的路径，从落盘那一刻起就只对属主可见：默认 umask 给的是
+/// 0644，宿主机上任何用户都能把整份凭证读走，事后再补加密也补不回这一次泄漏。
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn tar_package(staging: &Path, staging_name: &str, out: &Path) -> std::io::Result<()> {
     let tmp = out.with_extension("tmp");
     {
         let file = std::fs::File::create(&tmp)?;
+        // 临时名也可能从上一趟没清掉的残留来，所以不放宽成「只在新建时设」。
+        restrict_to_owner(&tmp, 0o600)?;
         let mut encoder = zstd::Encoder::new(file, 3)?;
         // zstd 默认不写内容校验和（frame header 的 `Content_Checksum_flag` 为 0），
         // 于是 `zstd -t` 只解不校，一个位数翻转的文件仍会被判通过。打开它，让
@@ -1028,6 +1044,9 @@ fn untar_package(pkg: &Path, dest: &Path) -> std::io::Result<PathBuf> {
     let decoder = zstd::Decoder::new(file)?;
     let mut archive = tar::Archive::new(decoder);
     std::fs::create_dir_all(dest)?;
+    // 解出来的树里有 Secret 清单，包内的条目权限沿用了打包时的 0644；
+    // 把根目录收成 0700，让别人连往下走的路径都没有。
+    restrict_to_owner(dest, 0o700)?;
     archive.unpack(dest)?;
     let name = pkg
         .file_name()
@@ -1126,6 +1145,9 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
         .to_string();
     let staging = cfg.backup_dir.join(&staging_name);
     std::fs::create_dir_all(&staging)?;
+    // staging 是**打包之前**的明文树，里面有 Secret 清单；一趟跑被中途杀掉时
+    // 它不会被清理，会一直躺在卷上。收成 0700 让外人连目录都进不去。
+    restrict_to_owner(&staging, 0o700)?;
 
     let run_store = open_run_store(cfg).await;
     if let Some(store) = &run_store {
@@ -1211,6 +1233,9 @@ fn copy_offsite(dir: &Path, package: &Path, keep: usize) {
     let dest = dir.join(name);
     let partial = dir.join(format!("{}.partial", name.to_string_lossy()));
     let copied = std::fs::copy(package, &partial).and_then(|bytes| {
+        // 卷外这一份离开 PVC 之后照样装着 Secret 清单：复制件也必须只对属主可见，
+        // 不能指望源文件的权限被原样带过来。
+        restrict_to_owner(&partial, 0o600)?;
         let want = std::fs::metadata(package)?.len();
         if bytes != want {
             return Err(std::io::Error::other(format!(
@@ -1305,7 +1330,11 @@ async fn run_backup_into(
             }
             Err(e) => return Err(e),
         };
-        std::fs::write(secrets_dir.join(format!("{object_name}.yaml")), yaml)?;
+        let secret_file = secrets_dir.join(format!("{object_name}.yaml"));
+        std::fs::write(&secret_file, yaml)?;
+        // 打包沿用的是这个文件的权限，所以这里定成 0600：解包出来的那份清单
+        // 也就不会对别人可读，而不是只靠外面那层目录挡着。
+        restrict_to_owner(&secret_file, 0o600)?;
         keys.extend(
             object_keys
                 .into_iter()
@@ -4186,6 +4215,64 @@ mod tests {
             b"a,b\n1,2\n"
         );
         assert!(root.join("manifest.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_package_and_its_secret_entry_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let staging = tempfile::tempdir().unwrap();
+        let secrets = staging.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let yaml = secrets.join("cogneva-secrets-oob.yaml");
+        std::fs::write(&yaml, b"apiVersion: v1\n").unwrap();
+        restrict_to_owner(&yaml, 0o600).unwrap();
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let pkg = out_dir
+            .path()
+            .join("cogneva-backup-20260914T000000Z.tar.zst");
+        tar_package(staging.path(), "cogneva-backup-20260914T000000Z", &pkg).unwrap();
+        assert_eq!(
+            mode_of(&pkg),
+            0o600,
+            "包里有 Secret 清单，产物不能对属主以外可读"
+        );
+
+        // 解包根目录是调用方给的，自己看着收不回：untar_package 负责把它收成 0700。
+        let dest = out_dir.path().join("extract");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = untar_package(&pkg, &dest).unwrap();
+        assert_eq!(mode_of(&dest), 0o700);
+        assert_eq!(
+            mode_of(&root.join("secrets/cogneva-secrets-oob.yaml")),
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_offsite_copy_is_owner_only_too() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let vol = root.path().join("vol");
+        let off = root.path().join("off");
+        std::fs::create_dir_all(&vol).unwrap();
+        let pkg = vol.join("cogneva-backup-20261019T031700Z.tar.zst");
+        std::fs::write(&pkg, vec![7u8; 32]).unwrap();
+
+        copy_offsite(&off, &pkg, 7);
+
+        let copy = off.join("cogneva-backup-20261019T031700Z.tar.zst");
+        let mode = std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "卷外那份离开 PVC 之后同样装着 Secret 清单");
+        assert!(!off
+            .join("cogneva-backup-20261019T031700Z.tar.zst.partial")
+            .exists());
     }
 
     #[test]
