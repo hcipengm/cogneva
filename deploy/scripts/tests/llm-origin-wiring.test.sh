@@ -62,11 +62,19 @@ make_root() {
   mkdir -p "${p}" "${root}/crates/cog-observability/src" "${root}/crates/cog-gateway/src"
   cp "${repo}/crates/cog-observability/src/usage_store.rs" \
      "${root}/crates/cog-observability/src/usage_store.rs"
+  # 树里那半生产者要每个闭集成员都点到名：夹具只写一个值的话，真闭集一加成员，
+  # 正向用例就会以「新成员没有生产者」红——那是夹具的缺口，不是门的判据。
   cat >"${root}/crates/cog-gateway/src/chat.rs" <<'RS'
 fn opts() -> ChatOptions {
     ChatOptions::default()
         .with_actor("web_chat")
         .with_origin(LlmOrigin::Interactive.as_str())
+}
+
+fn eval_opts() -> ChatOptions {
+    ChatOptions::default()
+        .with_actor("eval")
+        .with_origin(LlmOrigin::Eval.as_str())
 }
 RS
   case "${case}" in

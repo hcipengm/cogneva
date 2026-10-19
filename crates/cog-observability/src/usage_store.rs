@@ -87,7 +87,7 @@ pub use cog_core::LLM_ORIGIN_HEADER;
 /// Closed because it is read as counts and a reader selects rows by it: a value
 /// outside the set is not a new environment, it is a caller that did not say.
 /// [`Self::declared`] is the only way in, and [`Self::Unknown`] is deliberately
-/// outside the four -- an undeclared caller is not attributable to any
+/// outside the declared set -- an undeclared caller is not attributable to any
 /// environment, and folding it into one would credit that environment with
 /// tokens it did not burn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -100,19 +100,26 @@ pub enum LlmOrigin {
     Interactive,
     /// A sandbox executor run.
     Sandbox,
+    /// The evaluation harness driving scaffolds over a benchmark. It spends on
+    /// the same agents the pool does, but for a measurement rather than for
+    /// output, and the two cannot be told apart afterwards if they share an
+    /// origin: a reader asking what a benchmark cost would have to subtract it
+    /// from production spend by hand.
+    Eval,
     /// No usable declaration arrived. Not a place a call comes from, so it is
     /// kept out of [`Self::DECLARED`] and out of any environment's total.
     Unknown,
 }
 
 impl LlmOrigin {
-    /// The four an environment may declare, in the order the ledger reads them.
-    /// [`Self::Unknown`] is not one of them.
-    pub const DECLARED: [LlmOrigin; 4] = [
+    /// The values an environment may declare, in the order the ledger reads
+    /// them. [`Self::Unknown`] is not one of them.
+    pub const DECLARED: [LlmOrigin; 5] = [
         LlmOrigin::GatewayPool,
         LlmOrigin::ResidentWorker,
         LlmOrigin::Interactive,
         LlmOrigin::Sandbox,
+        LlmOrigin::Eval,
     ];
 
     /// The origin a caller declared, or [`Self::Unknown`] when it declared none
@@ -129,6 +136,7 @@ impl LlmOrigin {
             Some("resident_worker") => LlmOrigin::ResidentWorker,
             Some("interactive") => LlmOrigin::Interactive,
             Some("sandbox") => LlmOrigin::Sandbox,
+            Some("eval") => LlmOrigin::Eval,
             _ => LlmOrigin::Unknown,
         }
     }
@@ -139,6 +147,7 @@ impl LlmOrigin {
             LlmOrigin::ResidentWorker => "resident_worker",
             LlmOrigin::Interactive => "interactive",
             LlmOrigin::Sandbox => "sandbox",
+            LlmOrigin::Eval => "eval",
             LlmOrigin::Unknown => "unknown",
         }
     }
@@ -1298,20 +1307,26 @@ impl cog_core::LlmUsageReader for RolledUsageReader {
 mod tests {
     use super::*;
 
-    /// The four declared origins are the whole closed set, and `unknown` is not
+    /// The declared origins are the whole closed set, and `unknown` is not
     /// one of them: it reads as "this environment cannot be named", which must
     /// not be counted into any environment's total.
     #[test]
-    fn the_declared_set_is_the_four_and_unknown_is_outside_it() {
+    fn the_declared_set_is_closed_and_unknown_is_outside_it() {
         let declared: Vec<&str> = LlmOrigin::DECLARED.iter().map(|o| o.as_str()).collect();
         assert_eq!(
             declared,
-            vec!["gateway_pool", "resident_worker", "interactive", "sandbox"]
+            vec![
+                "gateway_pool",
+                "resident_worker",
+                "interactive",
+                "sandbox",
+                "eval"
+            ]
         );
         assert!(!declared.contains(&LlmOrigin::Unknown.as_str()));
     }
 
-    /// A caller that declares one of the four is read as it declared; anything
+    /// A caller that declares one of the set is read as it declared; anything
     /// else reads as `unknown` rather than being stored as free text, so a
     /// reader that groups by origin never sees a misspelling as its own series.
     #[test]
@@ -1329,6 +1344,7 @@ mod tests {
             LlmOrigin::Interactive
         );
         assert_eq!(LlmOrigin::declared(Some("sandbox")), LlmOrigin::Sandbox);
+        assert_eq!(LlmOrigin::declared(Some("eval")), LlmOrigin::Eval);
         // Whitespace is the one repair: a trimmed name still names an origin.
         assert_eq!(LlmOrigin::declared(Some("  sandbox ")), LlmOrigin::Sandbox);
         // Everything else -- absent, empty, case-wrong, or unknown -- is
@@ -1337,5 +1353,9 @@ mod tests {
         assert_eq!(LlmOrigin::declared(Some("")), LlmOrigin::Unknown);
         assert_eq!(LlmOrigin::declared(Some("Sandbox")), LlmOrigin::Unknown);
         assert_eq!(LlmOrigin::declared(Some("host")), LlmOrigin::Unknown);
+        // A caller that names a *run* where an environment is asked for is
+        // also outside the set: "eval-pod-77" was the value the evaluation job
+        // declared, and it read as nothing at all.
+        assert_eq!(LlmOrigin::declared(Some("eval-pod-77")), LlmOrigin::Unknown);
     }
 }

@@ -18,13 +18,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use cog_core::{HttpClient, LlmClient};
+use async_trait::async_trait;
+use cog_core::{
+    AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, HttpClient, LlmClient,
+    Message, SFResult, LLM_ACTOR_HEADER, LLM_ORIGIN_HEADER,
+};
 use cog_eval::adapters::{
     hle_benchmark, swe_pro_benchmark, toolathlon_benchmark, HleToolkit, SweProBackend,
     SweProToolkit, ToolathlonBackend, ToolathlonToolkit,
 };
 use cog_eval::scaffolds::{table_scaffolds, ForeignFlow, PlatformRunner};
 use cog_eval::{Benchmark, CaseSubset, Checkpoint, Rig, RunConfig, Table};
+use cog_observability::usage_store::LlmOrigin;
 use sha2::Digest;
 
 use crate::eval_platform::{
@@ -1883,12 +1888,83 @@ async fn wiring_from_config(args: &EvalTableArgs) -> Wiring {
         Ok(llm) => {
             // 骨干与裁判今天是同一个上游：判分那一路的模型选择属配置面（llm_routing
             // 单入口），不在这里再开一个。
+            //
+            // 身份在这里补齐：骨架外壳一律用 `ChatOptions::default()` 发请求，它们
+            // 不知道自己跑在评测台里，也不该知道；判分那一路自己声明了 actor，却没说
+            // 环境。账按 actor 与 origin 两列读，缺哪一列这一笔就落进 unknown——
+            // 2026-10-19 实测这一路一天 2,158 万输入 token、24 小时里 origin=unknown
+            // 的全部流量都是它。
+            let llm = EvalIdentity::wrap(llm);
             wiring.backbone = Some(llm.clone());
             wiring.judge = Some(llm);
         }
         Err(e) => tracing::warn!("no backbone provider could be built: {e}"),
     }
     wiring
+}
+
+/// 评测台这一路调用的身份：`actor=eval`、`origin=eval`。
+///
+/// 两个值都是**闭集**里的成员，所以它们不是自由注释而是读数：网关只收它认得的
+/// 名字，写错一个字母就静默落进 `unknown`，而 `unknown` 不是一个环境、也不计进
+/// 任何一家的总数（见 `LlmOrigin::Unknown`）。评测台跑 Job 时声明的是
+/// `COGNEVA_LLM_ORIGIN=eval-pod-77` 这类**运行名**——环境轴问的是「在哪跑」，
+/// 拿一个运行名回答，读数面上等于什么都没说。运行身份属于科目轴，不在这里补。
+///
+/// 调用方自己声明过的值优先：判分那一路已经说了 `actor=eval`，补的只是它没说的
+/// 环境；将来某一行要按骨架分账，也可以自己声明更细的名字。
+struct EvalIdentity {
+    inner: Arc<dyn LlmClient>,
+}
+
+impl EvalIdentity {
+    fn wrap(inner: Arc<dyn LlmClient>) -> Arc<dyn LlmClient> {
+        Arc::new(Self { inner })
+    }
+
+    fn stamped(options: &ChatOptions) -> ChatOptions {
+        let mut stamped = options.clone();
+        if !stamped.headers.contains_key(LLM_ACTOR_HEADER) {
+            stamped = stamped.with_actor(EVAL_ACTOR);
+        }
+        if !stamped.headers.contains_key(LLM_ORIGIN_HEADER) {
+            stamped = stamped.with_origin(LlmOrigin::Eval.as_str());
+        }
+        stamped
+    }
+}
+
+/// 骨架调用报出来的组件名。网关的 `actor` 是闭集，`eval` 就在里面——判分那一路
+/// 用的也是它，两半合成一个数才是「这次评测花了多少」。
+const EVAL_ACTOR: &str = "eval";
+
+#[async_trait]
+impl LlmClient for EvalIdentity {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        options: &ChatOptions,
+    ) -> SFResult<AssistantMessageEventStream> {
+        self.inner
+            .chat_stream(messages, &Self::stamped(options))
+            .await
+    }
+
+    async fn complete_stream(
+        &self,
+        prompt: &str,
+        options: &CompleteOptions,
+    ) -> SFResult<AssistantMessageEventStream> {
+        self.inner.complete_stream(prompt, options).await
+    }
+
+    async fn chat(&self, messages: &[Message], options: &ChatOptions) -> SFResult<ChatResponse> {
+        self.inner.chat(messages, &Self::stamped(options)).await
+    }
+
+    async fn health_check(&self) -> bool {
+        self.inner.health_check().await
+    }
 }
 
 /// 这一次跑的数据根在哪。
@@ -1954,6 +2030,36 @@ mod tests {
     use super::*;
     // 逐格读数要能在夹具里摆出来，才有东西可测 `## per seed` 那一段。
     use cog_eval::{Cell, SeedScore};
+
+    /// 评测台这一路的身份补齐：缺哪一列补哪一列，调用方自己声明过的值不动。
+    ///
+    /// 补的是两列不是一列——只补 actor 的话，账上仍然读不出「这些钱花在评测里」，
+    /// 因为环境轴那一格还是 unknown。
+    #[test]
+    fn the_eval_wrapper_names_itself_only_where_the_caller_did_not() {
+        let plain = EvalIdentity::stamped(&ChatOptions::default());
+        assert_eq!(
+            plain.headers.get(LLM_ACTOR_HEADER).map(String::as_str),
+            Some(EVAL_ACTOR)
+        );
+        assert_eq!(
+            plain.headers.get(LLM_ORIGIN_HEADER).map(String::as_str),
+            Some(LlmOrigin::Eval.as_str())
+        );
+
+        let named = ChatOptions::default()
+            .with_actor("web_chat")
+            .with_origin(LlmOrigin::Sandbox.as_str());
+        let stamped = EvalIdentity::stamped(&named);
+        assert_eq!(
+            stamped.headers.get(LLM_ACTOR_HEADER).map(String::as_str),
+            Some("web_chat")
+        );
+        assert_eq!(
+            stamped.headers.get(LLM_ORIGIN_HEADER).map(String::as_str),
+            Some(LlmOrigin::Sandbox.as_str())
+        );
+    }
 
     fn args(raw: &[&str]) -> Result<EvalTableArgs, String> {
         EvalTableArgs::parse(&raw.iter().map(|s| s.to_string()).collect::<Vec<_>>())

@@ -448,7 +448,7 @@ pub struct ActorUsage {
     /// `agent:<role>`, `unknown`).
     pub actor: String,
     /// Environment the calls were made from, one of the ledger's closed set:
-    /// `gateway_pool`, `resident_worker`, `interactive`, `sandbox`, or
+    /// `gateway_pool`, `resident_worker`, `interactive`, `sandbox`, `eval`, or
     /// `unknown` for a caller that declared none. A separate axis from `actor`
     /// because the same component runs in more than one environment.
     pub origin: String,

@@ -72,6 +72,7 @@ const PRODUCERS: &[(&str, &[&str])] = &[
         &["skill_extractor"],
     ),
     ("crates/cog-wiki/src/llm_maintainer.rs", &["wiki"]),
+    ("crates/cogneva/src/eval_table.rs", &["eval"]),
     (
         "crates/cogneva/tests/collaboration_self_review_test.rs",
         &["self_review:{role}"],
