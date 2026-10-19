@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 /// File-based WAL backend.
@@ -323,6 +324,29 @@ impl WalBackend for MemoryWalBackend {
 /// that is the retirement path, which is a separate change.
 pub const WAL_MAX_ENTRIES_PER_SESSION: usize = 5_000;
 
+/// How long the sweep waits between passes over the store.
+///
+/// Ten minutes, not a control period: the write path already caps every log
+/// that is still being appended to, so a pass only has work to do for logs
+/// whose session ended while over the cap, and that population changes when
+/// sessions end rather than on any clock. What the period really buys is a
+/// bounded delay between a session ending and its log giving the memory back.
+pub const WAL_CAP_SWEEP_PERIOD: Duration = Duration::from_secs(600);
+
+/// The name this loop registers under in the process's loop readings.
+pub const WAL_CAP_SWEEP_LOOP: &str = "storage_wal_cap_sweep";
+
+/// What one pass over the store did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrimOutcome {
+    /// Logs the pass brought down to the cap.
+    pub trimmed: u64,
+    /// Records those logs gave up.
+    pub released: u64,
+    /// The cap the pass applied; `None` when this backend has none.
+    pub cap: Option<usize>,
+}
+
 /// Redis-based WAL backend.
 /// Uses Redis Lists for ordered storage of WAL records per session.
 /// Each session maps to a Redis List key: `wal:{session_id}`.
@@ -384,6 +408,108 @@ impl RedisWalBackend {
     pub fn with_max_entries(mut self, max: usize) -> Self {
         self.max_entries = Some(max);
         self
+    }
+
+    /// Bring every log in the store down to the cap, including the ones
+    /// nothing will append to again.
+    ///
+    /// `append` applies the cap on the way in. That bounds a log that is still
+    /// being written and leaves every other one exactly as it was, because the
+    /// trim runs on the next append and a session that has ended never makes
+    /// one. Measured on the live deployment when the cap landed: 96 of 3,637
+    /// logs were above it, and those 96 held 925,579 of the 1,593,304 records
+    /// in the store — 58% of the records, all of them in logs the write path
+    /// would never touch again.
+    ///
+    /// The cut is the one `append` makes and costs the same: a replay whose
+    /// checkpoint predates the retained head is told so by `read_since` rather
+    /// than reading into a gap. One EVAL rather than a round trip per key, for
+    /// the same reason the census beside this store walks the keyspace that
+    /// way — the pass is a few thousand LLENs, and paying for them one at a
+    /// time costs more in latency than the walk costs in blocking.
+    pub async fn trim_over_cap(&self) -> Result<TrimOutcome, WalError> {
+        let Some(cap) = self.max_entries else {
+            return Ok(TrimOutcome::default());
+        };
+        let keep = cap.max(1);
+        let mut conn = self.client.clone();
+        let (trimmed, released): (u64, u64) = redis::cmd("EVAL")
+            .arg(
+                // The keys are the ones `append` writes under; the pass does
+                // not need to know which sessions they belong to, only how
+                // long they are, so it never decodes a record.
+                r#"
+                local cur = "0"
+                local trimmed = 0
+                local released = 0
+                local keep = tonumber(ARGV[1])
+                repeat
+                  local r = redis.call("SCAN", cur, "MATCH", "wal:*", "COUNT", 1000)
+                  cur = r[1]
+                  for i = 1, #r[2] do
+                    local key = r[2][i]
+                    local len = redis.call("LLEN", key)
+                    if len > keep then
+                      redis.call("LTRIM", key, -keep, -1)
+                      trimmed = trimmed + 1
+                      released = released + (len - keep)
+                    end
+                  end
+                until cur == "0"
+                return {trimmed, released}
+                "#,
+            )
+            .arg(0)
+            .arg(keep)
+            .query_async::<(u64, u64)>(&mut conn)
+            .await
+            .map_err(|e| WalError::Backend(format!("Redis WAL cap sweep failed: {}", e)))?;
+        Ok(TrimOutcome {
+            trimmed,
+            released,
+            cap: Some(cap),
+        })
+    }
+
+    /// Run the cap sweep on its own period until shutdown.
+    ///
+    /// Registered from here so the name in the loop readings and the name this
+    /// module declares cannot drift into two spellings of the same loop.
+    pub fn spawn(
+        self: Arc<Self>,
+        shutdown: cog_core::ShutdownSignal,
+    ) -> tokio::task::JoinHandle<()> {
+        cog_core::loop_health::spawn(
+            WAL_CAP_SWEEP_LOOP,
+            cog_core::loop_health::Cadence::Periodic(WAL_CAP_SWEEP_PERIOD),
+            shutdown.clone(),
+            move |beat| {
+                let backend = Arc::clone(&self);
+                let shutdown = shutdown.clone();
+                async move {
+                    loop {
+                        beat.beat();
+                        match backend.trim_over_cap().await {
+                            Ok(outcome) if outcome.trimmed > 0 => tracing::info!(
+                                logs = outcome.trimmed,
+                                records = outcome.released,
+                                cap = outcome.cap,
+                                "Brought agent logs that had stopped being appended to back under the cap"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "Agent log cap sweep failed"
+                            ),
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(WAL_CAP_SWEEP_PERIOD) => {}
+                            _ = shutdown.wait() => break,
+                        }
+                    }
+                }
+            },
+        )
     }
 
     fn key(session_id: &str) -> String {

@@ -14,7 +14,10 @@
 //! returned for its own number; and the next sequence keeps climbing from the
 //! newest record instead of falling back to the shortened length. A fourth test
 //! covers the explicit cut, whose point has the same shape: it is found by
-//! reading records, not by indexing the list.
+//! reading records, not by indexing the list. The last one covers the pass over
+//! the store: the cap on the write path never reaches a log whose session
+//! ended, so what brings that log down — and what it must leave alone — is a
+//! question only the store as a whole can answer.
 //!
 //! Ignored by default and needs `COGNEVA_TEST_REDIS_URL` pointing at a
 //! throwaway Redis:
@@ -25,7 +28,10 @@
 //! ```
 //!
 //! Every test writes under a session id of its own and deletes it at the end,
-//! so a run leaves the instance as it found it.
+//! so a run leaves the instance as it found it — except the pass test, whose
+//! subject is the store rather than one log: it walks every `wal:*` key and
+//! trims any it finds over the cap. That is why the instance has to be a
+//! throwaway one and not a shared test Redis.
 
 use cog_core::{WalBackend, WalEventType, WalRecord};
 use cog_storage::wal::RedisWalBackend;
@@ -118,6 +124,64 @@ async fn a_log_past_the_cap_keeps_the_newest_records_and_their_own_numbers() {
     );
 
     delete(&url, &session).await;
+}
+
+/// A log that stops being appended to is outside the write path: nothing will
+/// ever run the trim on it again, so its length is whatever it was when its
+/// session last spoke. The pass over the store is the only thing that brings
+/// such a log down, and it has to leave the ones already under the cap alone —
+/// a sweep that rewrote every key would be a write on every key every period.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_REDIS_URL pointing at a throwaway Redis"]
+async fn a_pass_brings_a_log_that_stopped_being_appended_to_under_the_cap() {
+    let url = redis_url();
+    let over = session_id();
+    let under = format!("{}-under", session_id());
+
+    // Written through an uncapped backend, which is the state a log is in
+    // before the cap exists in the writing process, or when the session ends
+    // between two appends with the list already long.
+    let uncapped = RedisWalBackend::new(&url).await.expect("open backend");
+    for seq in 0..12u64 {
+        uncapped.append(record(seq, &over)).await.expect("append");
+    }
+    for seq in 0..3u64 {
+        uncapped.append(record(seq, &under)).await.expect("append");
+    }
+
+    let capped = RedisWalBackend::new(&url)
+        .await
+        .expect("open backend")
+        .with_max_entries(CAP);
+    let outcome = capped.trim_over_cap().await.expect("trim_over_cap");
+    assert_eq!(
+        outcome.cap,
+        Some(CAP),
+        "the pass reports the cap it applied"
+    );
+    assert_eq!(outcome.trimmed, 1, "only the log over the cap was cut");
+    assert_eq!(outcome.released, 12 - CAP as u64, "it gave up the surplus");
+
+    assert_eq!(length(&url, &over).await, CAP, "the log is now at the cap");
+    assert_eq!(
+        length(&url, &under).await,
+        3,
+        "a log under the cap was not touched"
+    );
+
+    // The cut keeps the newest records, the same ones the write path keeps.
+    let kept = capped.read_since(&over, 0).await.expect("read_since");
+    let seqs: Vec<u64> = kept.iter().map(|r| r.seq).collect();
+    assert_eq!(seqs, (12 - CAP as u64..12).collect::<Vec<_>>());
+
+    // A second pass finds nothing to do: the store is already under the cap,
+    // and a pass that trimmed again would mean it never reached the state.
+    let again = capped.trim_over_cap().await.expect("trim_over_cap");
+    assert_eq!(again.trimmed, 0);
+    assert_eq!(again.released, 0);
+
+    delete(&url, &over).await;
+    delete(&url, &under).await;
 }
 
 #[tokio::test]

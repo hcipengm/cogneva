@@ -716,10 +716,20 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // The cap is the store's only bound on an agent's log: the key is
         // appended to for the agent's whole life and nothing deletes it. The
         // number and the trade it makes are stated on the constant.
-        let wal_backend: Arc<dyn cog_core::WalBackend> = Arc::new(
+        let wal_redis = Arc::new(
             crate::wal::RedisWalBackend::from_connection(redis_conn.clone())
                 .with_max_entries(crate::wal::WAL_MAX_ENTRIES_PER_SESSION),
         );
+        // The cap in the write path only reaches a log that is written again.
+        // A session that ended while over it never appends, so its whole log
+        // stays in the store for as long as the key does -- the sweep is what
+        // applies the same bound to that population.
+        let wal_shutdown = ctx
+            .consume::<cog_core::ShutdownSignal>()
+            .map(|s| (*s).clone())
+            .unwrap_or_default();
+        let _wal_sweep = Arc::clone(&wal_redis).spawn(wal_shutdown);
+        let wal_backend: Arc<dyn cog_core::WalBackend> = wal_redis;
         ctx.publish_service(wal_backend);
         info!("StoragePlugin WAL backend published");
 
