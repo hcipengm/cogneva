@@ -653,7 +653,11 @@ impl StateBackend for PostgresStateBackend {
         // disk with the caller's unit, which is the ownership check at the
         // instant of the write; the second refuses a payload that would move
         // the task to another owner, since that decision belongs to the
-        // handover transaction and not to a state transition.
+        // handover transaction and not to a state transition. Both read the
+        // owner out of the task document rather than through the generated
+        // column beside it: the row is already located by its primary key, so
+        // the check costs one JSON lookup on one row, and the guard stays valid
+        // on a database whose columns have not been added yet.
         let result = self
             .retry(|| async {
                 sqlx::query(
@@ -661,7 +665,7 @@ impl StateBackend for PostgresStateBackend {
                     UPDATE cog_dag_tasks
                     SET task = $3, status = $4, updated_at = NOW()
                     WHERE workspace_id = $1 AND task_id = $2 AND status = ANY($5)
-                      AND owner_unit = $6
+                      AND task ->> 'owner_unit' = $6
                       AND $3::jsonb ->> 'owner_unit' = $6
                     "#,
                 )

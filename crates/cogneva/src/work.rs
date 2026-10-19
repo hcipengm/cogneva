@@ -278,7 +278,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
             transition(
                 &*backend,
                 workspace,
-                &task,
+                &task.id,
                 &[TaskStatus::Pending],
                 unit,
                 |t| t.status = TaskStatus::Scheduled,
@@ -302,7 +302,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
             transition(
                 &*backend,
                 workspace,
-                &task,
+                &task.id,
                 &[TaskStatus::Pending, TaskStatus::Scheduled],
                 unit,
                 move |t| t.begin_run(unit, lease, Utc::now()),
@@ -355,7 +355,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
             transition(
                 &*backend,
                 workspace,
-                &task,
+                &task.id,
                 &[TaskStatus::Scheduled, TaskStatus::Running],
                 unit,
                 |t| {
@@ -428,7 +428,7 @@ async fn dependency_state(
 async fn transition<F>(
     backend: &dyn StateBackend,
     workspace: &str,
-    task: &Task,
+    task_id: &str,
     expected: &[TaskStatus],
     unit: &str,
     mutate: F,
@@ -436,7 +436,10 @@ async fn transition<F>(
 where
     F: FnOnce(&mut Task),
 {
-    let mut updated = task.clone();
+    let mut updated = backend
+        .dag_get_task(workspace, task_id)
+        .await?
+        .ok_or_else(|| format!("task {task_id} does not exist"))?;
     mutate(&mut updated);
     updated.updated_at = Utc::now();
     backend
