@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use cog_core::{
     BackupDrillRecord, BackupOutcome, BackupRunClosing, BackupRunOpening, BackupRunStore,
 };
@@ -181,6 +181,23 @@ pub struct BackupManifest {
     /// 的缺失不允许「默认可以接受」——有损面必须是一条条被点名过的。
     #[serde(default)]
     pub lossy_surfaces: Vec<LossySurface>,
+    /// 每一段数据被取走的时刻。包是几段在不同时刻取的东西拼起来的：PG 是一致性
+    /// 快照，对象层是逐文件拷贝，产物层是逐库读。相隔太久，包里这几段就已经不是
+    /// 「同一份数据」了——声明出来，恢复端才有一条能判红的读数。空 = 旧格式，
+    /// 当年没声明，不是「相隔 0 秒」。
+    #[serde(default)]
+    pub segments: Vec<SegmentStamp>,
+    /// 出包时允许的跨段偏差，与 `segments` 成对出现。0 = 没声明。
+    #[serde(default)]
+    pub max_segment_skew_seconds: u64,
+}
+
+/// 一段数据被取走的时刻。名字用段的身份（`postgres`／`qdrant`／`objects`／
+/// `artifacts`），不用文件路径：恢复端按段名说「是哪两段相隔太久」。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SegmentStamp {
+    pub name: String,
+    pub at: String,
 }
 
 /// 一份有损面：命名 + 丢了什么 + 为什么可丢。
@@ -1245,8 +1262,12 @@ async fn run_backup_into(
         );
     }
 
+    // 每一段取完就盖一个时刻。写在每段之后而不是统一在开头取：要量的是「这段
+    // 数据是什么时候被取走的」，不是「这一跑什么时候开始」。
+    let mut segments = Vec::new();
     let pool = PgPool::connect(&cfg.database_url).await?;
     let postgres = backup_postgres(&pool, &staging.join("pg")).await?;
+    segments.push(segment_stamp("postgres"));
 
     let qdrant = QdrantHttp::new(&cfg.qdrant_http_url);
     let qdrant_dir = staging.join("qdrant");
@@ -1255,12 +1276,29 @@ async fn run_backup_into(
     for name in qdrant.collection_names().await? {
         collections.push(qdrant.snapshot_collection(&name, &qdrant_dir).await?);
     }
+    segments.push(segment_stamp("qdrant"));
 
     let (files, bytes) = copy_tree(
         &cfg.data_dir.join("storage"),
         &staging.join("objects").join("storage"),
     )?;
+    segments.push(segment_stamp("objects"));
     let artifacts = collect_artifacts(cfg, staging).await?;
+    segments.push(segment_stamp("artifacts"));
+    let bound = max_segment_skew();
+    if let Ok((first, last, skew)) = segment_span(&segments) {
+        if skew > bound as i64 {
+            // 包照打：一份偏差超界的包仍然比没有包强（PG 那一段本身是自洽的），
+            // 而恢复端会拒绝它。这一行是给看日志的人的第一句信号。
+            tracing::warn!(
+                skew_seconds = skew,
+                bound,
+                first = %first,
+                last = %last,
+                "备份：几段数据相隔超过声明的界，恢复端会拒绝这个包"
+            );
+        }
+    }
 
     // 实例指纹的规范来源是 Secret（装入期生成）；env 是同一值的注入副本，
     // 两边都读不到时记 unknown，manifest 仍然落盘（备份本身不失败）。
@@ -1285,6 +1323,8 @@ async fn run_backup_into(
         image: std::env::var("COGNEVA_IMAGE_REF").unwrap_or_default(),
         schema_version: current_schema_version(),
         lossy_surfaces: lossy_surfaces(),
+        segments,
+        max_segment_skew_seconds: bound,
     })
 }
 
@@ -1301,6 +1341,76 @@ fn current_schema_version() -> i64 {
             0
         }
     }
+}
+
+/// 跨段偏差的默认界：五分钟。超过它，包里几段就已经不是同一份数据了。可由
+/// `COGNEVA_BACKUP_MAX_SEGMENT_SKEW_SECONDS` 覆盖——大对象层在小机器上本来就慢，
+/// 把界写死会让那类环境每一晚都产出一个恢复端拒收的包。
+const DEFAULT_MAX_SEGMENT_SKEW_SECONDS: u64 = 300;
+
+fn max_segment_skew() -> u64 {
+    std::env::var("COGNEVA_BACKUP_MAX_SEGMENT_SKEW_SECONDS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_SEGMENT_SKEW_SECONDS)
+}
+
+fn segment_stamp(name: &str) -> SegmentStamp {
+    SegmentStamp {
+        name: name.to_string(),
+        at: now_rfc3339(),
+    }
+}
+
+/// 首段、末段的段名与两者相距多少秒。段表为空时返回 None（旧格式）；时刻读不
+/// 出来时返回 Err——一条读不出来的声明等于没声明，不能当成「没有偏差」。
+fn segment_span(segments: &[SegmentStamp]) -> Result<(String, String, i64), String> {
+    let mut first: Option<(String, DateTime<Utc>)> = None;
+    let mut last: Option<(String, DateTime<Utc>)> = None;
+    for s in segments {
+        let at = DateTime::parse_from_rfc3339(&s.at)
+            .map_err(|e| format!("分段 {} 的时刻读不出来：{e}", s.name))?
+            .with_timezone(&Utc);
+        if first.as_ref().is_none_or(|(_, t)| at < *t) {
+            first = Some((s.name.clone(), at));
+        }
+        if last.as_ref().is_none_or(|(_, t)| at > *t) {
+            last = Some((s.name.clone(), at));
+        }
+    }
+    match (first, last) {
+        (Some((fname, ft)), Some((lname, lt))) => Ok((fname, lname, (lt - ft).num_seconds())),
+        _ => Err("分段表是空的".into()),
+    }
+}
+
+/// 恢复前判跨段偏差。包是几段在不同时刻取的东西拼起来的，恢复端拿包自己声明的
+/// 界去判：超过界就拒绝，而不是把不同时刻的段拼成一个「成功」。
+///
+/// 三条边界：旧包没有分段表（不判，留一条日志）；声明了分段却没声明界（拒绝——
+/// 成对的声明只出现一半，读不出该按什么判）；时刻读不出来（拒绝）。
+fn check_segment_skew(manifest: &BackupManifest) -> Result<(), String> {
+    if manifest.segments.is_empty() {
+        tracing::info!("包没有分段时刻声明（旧格式）：跨段偏差无从判");
+        return Ok(());
+    }
+    if manifest.max_segment_skew_seconds == 0 {
+        return Err("包声明了分段时刻却没有声明允许的跨段偏差".into());
+    }
+    let (first, last, skew) = segment_span(&manifest.segments)?;
+    if skew > manifest.max_segment_skew_seconds as i64 {
+        return Err(format!(
+            "包的几段数据相隔 {skew}s，超过声明的界 {}s（{first} → {last}）",
+            manifest.max_segment_skew_seconds
+        ));
+    }
+    tracing::info!(
+        skew_seconds = skew,
+        bound = manifest.max_segment_skew_seconds,
+        "跨段偏差在界内"
+    );
+    Ok(())
 }
 
 /// 这份包**没有**带走的东西。清单外的一律不许「默认可丢」。
@@ -1760,6 +1870,7 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     verify_package_against_manifest(&pkg_dir, &manifest)?;
     // 再判代次：包里的字节装得下，不代表本二进制认得它们。
     check_provenance(&manifest)?;
+    check_segment_skew(&manifest)?;
 
     let pg_dir = pkg_dir.join("pg");
     if pg_dir.exists() {
@@ -2275,6 +2386,11 @@ async fn drill_once(
     // 清单说这个包里有什么，此刻盘上是事实。这一段覆盖的是 qdrant 与对象层：
     // 它们不进空库，能核的就是「清单声明的字节与文件数是不是真的在包里」。
     verify_package_against_manifest(&pkg_dir, &manifest)?;
+    // 恢复端会拒收的包，演练不能判绿：演练要说的是「今晚这份装得回去」，而不
+    // 是「包能解开」。跨段偏差是恢复端的第一道拒绝，这里先问同一句话。
+    if let Err(e) = check_segment_skew(&manifest) {
+        return Err(format!("恢复端会拒绝这个包：{e}").into());
+    }
     verify_artifact_stores(&pkg_dir, &manifest, drill).await;
     if manifest.postgres.tables.is_empty() {
         return Err("包的清单没有声明任何表，装回去之后无论对不对都证明不了什么".into());
@@ -2847,6 +2963,11 @@ mod tests {
             image: "registry.example/cogneva:test".into(),
             schema_version: 1,
             lossy_surfaces: lossy_surfaces(),
+            segments: stamps(&[
+                ("postgres", "2026-10-19T00:00:00Z"),
+                ("artifacts", "2026-10-19T00:00:10Z"),
+            ]),
+            max_segment_skew_seconds: 300,
         }
     }
 
@@ -3139,6 +3260,8 @@ mod tests {
             image: String::new(),
             schema_version: 0,
             lossy_surfaces: Vec::new(),
+            segments: Vec::new(),
+            max_segment_skew_seconds: 0,
         }
     }
 
@@ -3199,6 +3322,72 @@ mod tests {
                 s.name
             );
         }
+    }
+
+    fn manifest_with_segments(segments: Vec<SegmentStamp>, bound: u64) -> BackupManifest {
+        let mut manifest = manifest_with(Vec::new());
+        manifest.segments = segments;
+        manifest.max_segment_skew_seconds = bound;
+        manifest
+    }
+
+    fn stamps(times: &[(&str, &str)]) -> Vec<SegmentStamp> {
+        times
+            .iter()
+            .map(|(name, at)| SegmentStamp {
+                name: name.to_string(),
+                at: at.to_string(),
+            })
+            .collect()
+    }
+
+    /// 相隔太久的几段不是「同一份数据」：恢复端要按包自己声明的界拒收。
+    #[test]
+    fn a_package_whose_segments_are_far_apart_is_refused() {
+        let manifest = manifest_with_segments(
+            stamps(&[
+                ("postgres", "2026-10-19T00:00:00Z"),
+                ("objects", "2026-10-19T00:20:00Z"),
+            ]),
+            300,
+        );
+        let err = check_segment_skew(&manifest).unwrap_err();
+        assert!(err.contains("1200"), "错误里要点出差了多少秒：{err}");
+        assert!(err.contains("postgres"), "错误里要点出是哪两段：{err}");
+        assert!(err.contains("objects"), "错误里要点出是哪两段：{err}");
+    }
+
+    #[test]
+    fn a_package_whose_segments_are_close_is_accepted() {
+        let manifest = manifest_with_segments(
+            stamps(&[
+                ("postgres", "2026-10-19T00:00:00Z"),
+                ("artifacts", "2026-10-19T00:01:30Z"),
+            ]),
+            300,
+        );
+        assert!(check_segment_skew(&manifest).is_ok());
+    }
+
+    /// 旧格式没有分段表：当年没声明，不是「相隔 0 秒」——不判，也不拦。
+    #[test]
+    fn a_package_without_segment_stamps_is_not_judged() {
+        let manifest = manifest_with_segments(Vec::new(), 0);
+        assert!(check_segment_skew(&manifest).is_ok());
+    }
+
+    /// 成对的声明只出现一半，读不出该按什么判：拒绝，不默认给一个界。
+    #[test]
+    fn a_package_that_declares_segments_without_a_bound_is_refused() {
+        let manifest = manifest_with_segments(stamps(&[("postgres", "2026-10-19T00:00:00Z")]), 0);
+        assert!(check_segment_skew(&manifest).is_err());
+    }
+
+    /// 时刻读不出来＝声明不可读，不能当成「没有偏差」放过去。
+    #[test]
+    fn a_segment_stamp_that_does_not_parse_is_refused() {
+        let manifest = manifest_with_segments(stamps(&[("postgres", "不是时刻")]), 300);
+        assert!(check_segment_skew(&manifest).is_err());
     }
 
     /// 恢复侧要真的把产物层写回去：只把包放进目录不算恢复。
