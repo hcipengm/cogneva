@@ -689,6 +689,30 @@ metric_names! {
     // threshold. An authorization denial does not heal by being retried, so the
     // rule over this counter fires on the first one.
     MAINLINE_KUBECTL_REFUSED_TOTAL => "cogneva_mainline_kubectl_refused_total",
+    // Rollouts the cluster's admission face kept from ever creating a Pod, by
+    // which wall did it: `quota`, `limitrange`, `podsecurity`, or `admission`
+    // when the wording matched none of the three.
+    //
+    // The sibling above counts the deployer's own reads being refused; this one
+    // counts the cluster refusing the delivered object. Neither is the other's
+    // substitute: a grant can be in place and the quota still full, and the
+    // refusal itself lands outside every reading the deployer publishes -- the
+    // Job is created, no Pod is, and the only trace is the Job's Failed
+    // condition, which is read here and then dies with the round. The resource
+    // account keeps a row when the process holds a gate, but that account is
+    // not scraped, so no rule can name it.
+    //
+    // The label is the wall rather than a boolean because the repair differs:
+    // a full quota is raised in its ResourceQuota, an out-of-range request is
+    // fixed in the LimitRange or in the manifest, and PodSecurity is a policy
+    // change. "admission" is recorded when the wording matched none of the
+    // known walls -- an unknown wall is still a refusal, and folding it into a
+    // known one would name the wrong repair.
+    //
+    // Measured 2026-10-19: the LimitRange wall held the evolution rollout for
+    // two and a half hours, and `mainline_rollout_never_lands` reported the
+    // stall without being able to say what was holding it.
+    MAINLINE_ROLLOUT_REFUSED_TOTAL => "cogneva_mainline_rollout_refused_total",
     // Times the deployer's guard put the overtaken question, counted whether
     // the answer was yes or no.
     //

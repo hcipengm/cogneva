@@ -644,6 +644,23 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          threshold ever mentioned it",
     ),
     (
+        "cogneva_mainline_rollout_refused_total",
+        "Times the cluster's admission face kept a rollout from creating a Pod, \
+         by the wall that did it: quota, limitrange, podsecurity, or admission \
+         when the wording matched none of the three. The sibling above counts \
+         the deployer's own reads being refused; this counts the cluster \
+         refusing the object the deployer delivered -- one can be granted while \
+         the other is full. The refusal is read from the rollout Job's Failed \
+         condition: the Job is created, no Pod is, and the sentence is the only \
+         surviving observation, so this counter is what keeps it after the round \
+         ends. The label names the repair, which differs by wall -- a quota is \
+         raised, a range is changed, a policy is a separate decision -- and an \
+         unknown wall is recorded as admission rather than folded into one of \
+         the three, because naming the wrong repair is worse than naming none. \
+         Measured 2026-10-19: the LimitRange wall held the evolution rollout for \
+         two and a half hours with nothing on any scraped surface saying why",
+    ),
+    (
         "cogneva_mainline_supersession_checks_total",
         "Times the deployer's guard put the overtaken question, counted whether \
          the answer was yes or no. Counted rather than inferred from the skips, \

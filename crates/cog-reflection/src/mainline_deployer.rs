@@ -1995,6 +1995,27 @@ impl MainlineDeployer {
             .await;
     }
 
+    /// 一次滚动被集群的准入面挡在 Pod 创建之外，按挡下它的那堵墙落一条。
+    ///
+    /// 资源账那一行（[`admission_refusal_event`]）要有 gate 的进程才写得下，而且
+    /// 不是被刮取的读数——告警看不到它。这条计数是同一件事的可刮取面，标签区分
+    /// 配额满了、LimitRange 越界、PodSecurity 策略与读不出的其它准入墙：三种已知
+    /// 墙的修法在不同的地方，压成一个布尔就把修法丢了。
+    async fn record_rollout_refused(&self, wall: &str) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("reason".to_string(), wall.to_string());
+        let _ = metrics
+            .record_counter(
+                cog_core::metric_names::MAINLINE_ROLLOUT_REFUSED_TOTAL,
+                1.0,
+                labels,
+            )
+            .await;
+    }
+
     /// 问集群「本进程这个身份有没有这个动词」，把 `kubectl auth can-i` 的
     /// yes / no 读成一个 bool。
     ///
@@ -6036,6 +6057,7 @@ impl MainlineDeployer {
             // 失败，不是集群拒绝了这份请求，记成「被拒」会把观测故障写成一条资源
             // 事实。记不下也要说：没有 gate 的进程不持有这本账。
             if let Some(wall) = admission_policy_wall(&reason) {
+                self.record_rollout_refused(wall).await;
                 let event =
                     admission_refusal_event(name, wall, &reason, crate::build_gate::gate_actor());
                 if !cog_core::contract::build_gate::record_resource_event(event) {

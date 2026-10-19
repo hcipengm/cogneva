@@ -889,6 +889,16 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_mainline_kubectl_refused_total",
         "crates/cog-reflection/src/mainline_deployer.rs",
     ),
+    // 集群的准入面把一次滚动挡在 Pod 创建之外，按挡下它的那堵墙记一条。与上面那条
+    // 互为两面：那条是部署器自己的读被拒，这条是交付出去的对象被拒——授权在、配额
+    // 满了也是同一轮里的两回事。这条的唯一观测面是 Job 的 Failed 条件（Job 建得出、
+    // Pod 建不出），读一次就随这一轮结束而消失；资源账那一行要有 gate 才写得下、
+    // 且不被刮取，告警看不到它。2026-10-19 实测：LimitRange 那堵墙把 evolution 的
+    // 滚动扣了两个半小时，`mainline_rollout_never_lands` 读到了停摆却说不清被什么扣住。
+    (
+        "cogneva_mainline_rollout_refused_total",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
     // 轮询循环每一轮的结果。循环自己的存活读数（`loop_tick_age_seconds`）在每拍开头
     // 盖章，量的是「它醒了」，量不到这一轮干了什么；而这一轮里别的读数（版本契约、
     // CI 判词、那对越权计数）全写在会失败的那一步**之前**。2026-10-08 实测：发布那

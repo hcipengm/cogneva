@@ -44,9 +44,10 @@
 # main-be5add5996d6; re-read again at 16:11 +0800 on main-93ebcda35e7a, when the
 # chart had grown to 194 rules (194 total, 12 cannot fire, 10 absent names).
 
-# --- lazy_counter (8 rules): counters that exist only after the bad event ----
+# --- lazy_counter (9 rules): counters that exist only after the bad event ----
 landing_mirror_behind	cogneva_mirror_push_failures_total	lazy_counter	Counted only when a mirror push is refused (cog-github/src/landing.rs record_counter on the failure branch); no refusal in 24h means the counter was never created. The rule fires on the first one.
 mainline_kubectl_refused	cogneva_mainline_kubectl_refused_total	lazy_counter	Counted only when the cluster's authorization refuses one of the deployer's kubectl calls (cog-reflection/src/mainline_deployer.rs record_kubectl_refused, refusal branch only); labels are the server's own verb+resource, so the family is created by the first refusal and the rule fires on it. Emitter landed in 252fe47b, inside the running image main-93ebcda35e7a.
+mainline_rollout_refused	cogneva_mainline_rollout_refused_total	lazy_counter	Counted only when the cluster's admission face keeps a rollout from creating a Pod (cog-reflection/src/mainline_deployer.rs record_rollout_refused, admission branch only); labels are the wall (quota/limitrange/podsecurity/admission), so the family is created by the first refusal and the rule fires on it. The emitter ships in the same change as this row, so the series stays absent until that build is running.
 mainline_delivery_preflight_refused	cogneva_mainline_preflight_refused_total	lazy_counter	Counted only when the preflight refuses a deploy (cog-reflection/src/mainline_deployer.rs); refused_total has no zero-value series until the first refusal.
 memory_backend_operation_never_succeeds	memory_operation_errors_total	lazy_counter	Counted only on a failed memory backend operation (cog-memory/src/metrics_instrumented.rs); no error in the window means no series. The rule also requires memory_operations_total, which is present on the success path.
 redrive_budget_forgotten	cogneva_redrive_budget_losses_total	lazy_counter	Read-side ledger loss is counted only when the ledger read fails (cog-github/src/landing.rs); today the read succeeds, so the {side="read"} series does not exist.
