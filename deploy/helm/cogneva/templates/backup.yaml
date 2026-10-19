@@ -96,6 +96,11 @@ spec:
                   valueFrom:
                     fieldRef:
                       fieldPath: metadata.namespace
+                # 出包进程跑的是哪份镜像。容器读不到自己的镜像引用（downward API
+                # 没有这个字段），只能由渲染时注入；不注入的话 manifest 里这一格
+                # 是空的，换机排障时就没有「这份字节是谁产出的」可对照。
+                - name: COGNEVA_IMAGE_REF
+                  value: {{ include "cogneva.image" . | quote }}
                 {{- if .Values.evolution.enabled }}
                 # 第二个数据根：进化 Pod 的 data_dir。名字是清单里的身份，
                 # 恢复端按「根名 + 库名」定位，不按路径合并两套同名策略库。

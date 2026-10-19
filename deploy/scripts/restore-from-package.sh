@@ -134,6 +134,14 @@ $EVOLUTION_AFFINITY
               value: "postgres://cog_user:\$(PG_PASSWORD)@postgres.$NS.svc.cluster.local:5432/cogneva"
             - name: COGNEVA_QDRANT_HTTP_URL
               value: "http://qdrant.$NS.svc.cluster.local:6333"
+            # 出包那一代的镜像引用，只作对照：同一个 rev 可以有多个构建产物，
+            # 拿它当身份会拦住合法恢复。
+            - name: COGNEVA_IMAGE_REF
+              value: "$IMAGE"
+            # 跨代恢复要显式接受。默认 0：包与二进制不是一个 rev 就停，让属主
+            # 自己说「我知道，装吧」，而不是默认滑过去。
+            - name: COGNEVA_RESTORE_ACCEPT_REV_MISMATCH
+              value: "${COGNEVA_RESTORE_ACCEPT_REV_MISMATCH:-0}"
 $EVOLUTION_ENV
           volumeMounts:
             - name: data

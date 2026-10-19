@@ -167,6 +167,31 @@ pub struct BackupManifest {
     /// 「声明为零」，演练按「没有可读的产物段」跳过，不判失败。
     #[serde(default)]
     pub artifacts: Vec<ArtifactRootReport>,
+    /// 出包进程跑的镜像引用（chart 注入的同一个值）。空 = 那个部署没注入，
+    /// 不是「没有镜像」。恢复端拿它与自己要跑的那一份比对，不比字符串相等就
+    /// 拒绝——这是唯一能把「这个包的字节是哪份代码产出的」落到读数上的字段。
+    #[serde(default)]
+    pub image: String,
+    /// 出包时这份二进制里最新的 PG 迁移号。0 = 没读出来，不是「没有迁移」。
+    /// 数据结构只能往前走：恢复端拒绝比它自己更新的包，因为那意味着包里带着
+    /// 本二进制没有的列或表。
+    #[serde(default)]
+    pub schema_version: i64,
+    /// 这份包**没有**带走的东西，逐条写清丢了什么、为什么可以丢。清单之外
+    /// 的缺失不允许「默认可以接受」——有损面必须是一条条被点名过的。
+    #[serde(default)]
+    pub lossy_surfaces: Vec<LossySurface>,
+}
+
+/// 一份有损面：命名 + 丢了什么 + 为什么可丢。
+///
+/// 三个字段都要有值，判据是「读了这一条，能不能回答『换机后少了什么、能不能
+/// 接受』」。只写名字的条目等于把问题留给下一个人。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LossySurface {
+    pub name: String,
+    pub lost: String,
+    pub acceptable_because: String,
 }
 
 /// 备份配置。集群 CronJob 全部由 env 注入；测试直接构造。
@@ -1257,7 +1282,67 @@ async fn run_backup_into(
         qdrant: collections,
         objects: ObjectsReport { files, bytes },
         artifacts,
+        image: std::env::var("COGNEVA_IMAGE_REF").unwrap_or_default(),
+        schema_version: current_schema_version(),
+        lossy_surfaces: lossy_surfaces(),
     })
+}
+
+/// 本二进制带的最新 PG 迁移号。读不出来记 0（没声明），不让备份失败：
+/// 迁移目录缺席是打包问题，应当由别处的门去红，不是让这一晚没有备份。
+fn current_schema_version() -> i64 {
+    let app_dir = std::env::var("COGNEVA_APP_DIR").unwrap_or_else(|_| "/opt/cogneva".into());
+    let dir = cog_storage::migrate::migrations_dir(&app_dir);
+    match cog_storage::migrate::discover_up_migrations(&dir, cog_storage::migrate::Driver::Postgres)
+    {
+        Ok(migrations) => migrations.iter().map(|m| m.version).max().unwrap_or(0),
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), error = %e, "迁移目录读不出来，schema_version 记 0");
+            0
+        }
+    }
+}
+
+/// 这份包**没有**带走的东西。清单外的一律不许「默认可丢」。
+///
+/// 每一条都要能回答「换机后少了什么、为什么能接受」。加了新的外部依赖而这里
+/// 没有对应的行，换机后那个面就是静默消失的——所以这里是一张按依赖来源写的
+/// 闭集，不是一份事后的说明。
+fn lossy_surfaces() -> Vec<LossySurface> {
+    [
+        (
+            "nats",
+            "在途事件与 JetStream 里尚未被消费的消息",
+            "事件是通知面，权威状态在 PG 与对象层；消费者重连后从权威状态重建",
+        ),
+        (
+            "redis",
+            "缓存、租约与去重计数",
+            "全部是可重建的派生状态；租约在重启后按既有规则重新竞争",
+        ),
+        (
+            "meilisearch",
+            "搜索索引",
+            "索引由权威数据重建，恢复后按索引任务重跑",
+        ),
+        (
+            "cluster-registry",
+            "containerd 里已拉取的镜像层",
+            "镜像是构建产物，不是权威面；由源码 rev 重建或从 release 重新拉取",
+        ),
+        (
+            "evolution-bare-repo",
+            "未推送到远端的进化 rev（若 manifest 未带 git bundle）",
+            "已推的 rev 可从远端重取；未推的部分由 A18 的 bundle 覆盖，或在此被点名为损失",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, lost, why)| LossySurface {
+        name: name.to_string(),
+        lost: lost.to_string(),
+        acceptable_because: why.to_string(),
+    })
+    .collect()
 }
 
 /// 把每个数据根的产物层抄进包，并留下逐库读数。
@@ -1673,6 +1758,8 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     );
     // 清单说这个包里有什么，此刻盘上是事实——两者对不上就停在这里。
     verify_package_against_manifest(&pkg_dir, &manifest)?;
+    // 再判代次：包里的字节装得下，不代表本二进制认得它们。
+    check_provenance(&manifest)?;
 
     let pg_dir = pkg_dir.join("pg");
     if pg_dir.exists() {
@@ -1720,6 +1807,77 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::remove_dir_all(root);
     }
     tracing::info!("restore complete");
+    Ok(())
+}
+
+/// 包与本二进制是不是同一代。
+///
+/// 三条判据，方向不同：
+/// - **数据结构只能向前**：包里的 schema 版本比本二进制新就拒绝——装回去会缺列，
+///   而缺列在恢复日志里没有任何症状。包更旧是正常升级路径，放行并记一条。
+/// - **源码 rev 不同默认拒绝**：跨代恢复要属主显式接受
+///   （`COGNEVA_RESTORE_ACCEPT_REV_MISMATCH=1`）。空白机重装装的是公开 main，
+///   几乎必然与出包那一晚不同代，所以这条路必须能走——但要走得留一声。
+/// - **镜像引用不同只记不拦**：同一个 rev 可以有多个构建产物，把它当身份会拦住
+///   合法恢复。它是排障时的对照，不是判据。
+fn check_provenance(manifest: &BackupManifest) -> Result<(), Box<dyn std::error::Error>> {
+    check_provenance_against(
+        manifest,
+        env!("COGNEVA_GIT_REVISION"),
+        current_schema_version(),
+    )
+}
+
+/// 判据本体，代次由调用方给出：恢复入口给的是本二进制自己的值，测试给的是
+/// 写死的一组——否则「读不到迁移目录」的那台机器上这条判据会悄悄退化成空跑。
+fn check_provenance_against(
+    manifest: &BackupManifest,
+    current_rev: &str,
+    current_schema: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if manifest.schema_version > 0 && current_schema > 0 {
+        if manifest.schema_version > current_schema {
+            return Err(format!(
+                "包的 schema 版本 {} 比本二进制的 {} 新：本二进制没有那些迁移，装回去会缺列。\
+                 用出包那一代的镜像恢复，或先升级引擎",
+                manifest.schema_version, current_schema
+            )
+            .into());
+        }
+        if manifest.schema_version < current_schema {
+            tracing::info!(
+                package = manifest.schema_version,
+                binary = current_schema,
+                "包是更早的 schema：按迁移往前装"
+            );
+        }
+    } else {
+        tracing::info!("包或二进制没有声明 schema 版本（旧格式），不判代次");
+    }
+
+    if !manifest.revision.is_empty() && manifest.revision != current_rev {
+        if std::env::var("COGNEVA_RESTORE_ACCEPT_REV_MISMATCH").as_deref() != Ok("1") {
+            return Err(format!(
+                "包来自源码 rev {}，本二进制是 {current_rev}；跨代恢复要显式接受：\
+                 设 COGNEVA_RESTORE_ACCEPT_REV_MISMATCH=1 后重跑",
+                manifest.revision
+            )
+            .into());
+        }
+        tracing::warn!(
+            package = %manifest.revision,
+            binary = current_rev,
+            "跨代恢复已被显式接受"
+        );
+    }
+
+    if !manifest.image.is_empty() {
+        tracing::info!(
+            package_image = %manifest.image,
+            current_image = %std::env::var("COGNEVA_IMAGE_REF").unwrap_or_default(),
+            "包的镜像引用（只作对照，不拦恢复）"
+        );
+    }
     Ok(())
 }
 
@@ -2686,6 +2844,9 @@ mod tests {
             }],
             objects: ObjectsReport { files: 1, bytes: 5 },
             artifacts: Vec::new(),
+            image: "registry.example/cogneva:test".into(),
+            schema_version: 1,
+            lossy_surfaces: lossy_surfaces(),
         }
     }
 
@@ -2975,6 +3136,68 @@ mod tests {
             qdrant: Vec::new(),
             objects: ObjectsReport::default(),
             artifacts,
+            image: String::new(),
+            schema_version: 0,
+            lossy_surfaces: Vec::new(),
+        }
+    }
+
+    /// 代次判据：包比本二进制新，装回去会缺列——必须拒绝，不是警告。
+    #[test]
+    fn a_package_from_a_newer_schema_is_refused() {
+        let mut manifest = manifest_with(Vec::new());
+        manifest.revision = "abc".into();
+        manifest.schema_version = 43;
+        let err = check_provenance_against(&manifest, "abc", 42).expect_err("更新的 schema 不能装");
+        assert!(err.to_string().contains("schema"), "{err}");
+    }
+
+    /// 包更旧是正常升级路径：迁移往前跑，不该拦。
+    #[test]
+    fn an_older_schema_package_is_a_normal_upgrade() {
+        let mut manifest = manifest_with(Vec::new());
+        manifest.revision = "abc".into();
+        manifest.schema_version = 41;
+        check_provenance_against(&manifest, "abc", 42).unwrap();
+    }
+
+    /// 同一个 rev 的包直接放行：这是日常恢复，不该要任何额外声明。
+    #[test]
+    fn a_package_from_the_same_revision_is_accepted() {
+        let mut manifest = manifest_with(Vec::new());
+        manifest.revision = "abc".into();
+        manifest.schema_version = 42;
+        check_provenance_against(&manifest, "abc", 42).unwrap();
+    }
+
+    /// 跨代恢复默认拒绝，且错误里要说清怎么显式接受。
+    #[test]
+    fn a_package_from_another_revision_needs_an_explicit_accept() {
+        let mut manifest = manifest_with(Vec::new());
+        manifest.revision = "0000000-not-this-binary".into();
+        manifest.schema_version = 42;
+        let err = check_provenance_against(&manifest, "abc", 42).expect_err("跨代默认要拦");
+        assert!(
+            err.to_string()
+                .contains("COGNEVA_RESTORE_ACCEPT_REV_MISMATCH"),
+            "错误里要点名那个开关：{err}"
+        );
+    }
+
+    /// 有损面每一条都要能回答「丢了什么、为什么可丢」；只有名字的条目等于把
+    /// 问题留给下一个读包的人。
+    #[test]
+    fn every_lossy_surface_says_what_is_lost_and_why_it_is_ok() {
+        let surfaces = lossy_surfaces();
+        assert!(!surfaces.is_empty());
+        for s in &surfaces {
+            assert!(!s.name.is_empty());
+            assert!(!s.lost.is_empty(), "{} 没写丢了什么", s.name);
+            assert!(
+                !s.acceptable_because.is_empty(),
+                "{} 没写为什么可丢",
+                s.name
+            );
         }
     }
 
