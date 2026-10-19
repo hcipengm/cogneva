@@ -47,10 +47,6 @@ KubeHpaReplicasMismatch	kube_horizontalpodautoscaler_spec_max_replicas,kube_hori
 KubePdbNotEnoughHealthyPods	kube_poddisruptionbudget_status_current_healthy,kube_poddisruptionbudget_status_desired_healthy	object_absent	No PodDisruptionBudget exists; correct dormancy, the rule wakes when one is created.
 
 # --- exporter_version (14 rules): the source version does not expose it -----
-KubeStateMetricsListErrors	kube_state_metrics_list_total	exporter_version	kube-state-metrics no longer exports its own list/watch counters (removed upstream); re-enable via the exporter's self-metrics or replace the rule.
-KubeStateMetricsWatchErrors	kube_state_metrics_watch_total	exporter_version	kube-state-metrics no longer exports watch counters in this version; same fix as KubeStateMetricsListErrors.
-KubeStateMetricsShardingMismatch	kube_state_metrics_total_shards	exporter_version	kube-state-metrics runs unsharded here and does not export shard totals; the rule only makes sense in a sharded deployment.
-KubeStateMetricsShardsMissing	kube_state_metrics_shard_ordinal,kube_state_metrics_total_shards	exporter_version	kube-state-metrics is unsharded, so neither shard ordinal nor total is exported.
 KubeJobNotCompleted	kube_job_labels	exporter_version	The exporter's label allowlist does not emit kube_job_labels; the rule picks up the label set only if that allowlist is widened.
 KubePersistentVolumeFillingUp	kube_persistentvolumeclaim_labels	exporter_version	The exporter's label allowlist does not emit kube_persistentvolumeclaim_labels; widen the allowlist or drop the label dependency.
 KubePersistentVolumeInodesFillingUp	kube_persistentvolumeclaim_labels	exporter_version	Same allowlist gap as KubePersistentVolumeFillingUp; the inode rule shares the selector.

@@ -366,6 +366,15 @@ kubeStateMetrics:
       cpu: 200m
       memory: 256Mi
 
+# KSM 自身的指标（list/watch 错误、分片数）在 8081 的 `metrics` 端口，资源指标在 8080。
+# chart 默认只抓 8080，导致 kube-state-metrics 组里 KubeStateMetricsListErrors /
+# WatchErrors / ShardingMismatch / ShardsMissing 四条规则引用的序列现网不存在。
+# 打开 selfMonitor：Service 暴露 metrics 端口、ServiceMonitor 加同名端点，与 8080
+# 共用 job 标签，规则无需改写。
+kube-state-metrics:
+  selfMonitor:
+    enabled: true
+
 # ─── prometheus-node-exporter ────────────────────────────────────
 prometheus-node-exporter:
   resources:
