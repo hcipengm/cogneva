@@ -420,6 +420,41 @@ async fn test_revise_returns_revised_text() {
     assert_eq!(revised, "revised output");
 }
 
+/// The revision step is the only one with no schema to say what it answers:
+/// the payload names the text, the critique and the suggestions, and nothing
+/// said what to do with them. A model that only rewords the text then looks
+/// exactly like one that fixed it — the loop pays for another round, or the
+/// caller is handed the text it asked to have changed.
+///
+/// The instruction must lead the request for a second reason: the payload after
+/// it differs on every call, so the instruction is the only part an upstream's
+/// prefix cache can reuse.
+#[tokio::test]
+async fn test_the_revision_step_is_told_what_to_produce() {
+    let provider = DummyProvider::new(vec!["revised output".into()]);
+    let result = SelfReviewResult::NeedRevision {
+        critique: "no rollback step".into(),
+        suggestions: vec!["add one".into()],
+        score: 0.3,
+    };
+
+    let _ = SelfReviewLoop::revise(&result, "original", "self_review", &provider)
+        .await
+        .unwrap();
+
+    let payloads = provider.payloads();
+    assert_eq!(payloads.len(), 1);
+    let request = &payloads[0];
+    assert!(
+        request.starts_with("Rewrite the original text"),
+        "the revision must be told what to produce before it is shown what to judge: {request}"
+    );
+    assert!(
+        request.contains("no rollback step"),
+        "and the instruction must not displace the finding it has to answer: {request}"
+    );
+}
+
 #[tokio::test]
 async fn test_revise_returns_original_on_pass() {
     let provider = DummyProvider::new(vec![]);

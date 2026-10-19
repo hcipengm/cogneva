@@ -324,7 +324,24 @@ impl SelfReviewLoop {
         }
         .with_actor(actor);
 
-        let response = llm.chat(&[user_msg], &options).await?;
+        // The revision is the only step with no schema to say what it answers:
+        // the payload names the text, the critique and the suggestions, but
+        // nothing says what to do with them. Asked without that sentence, a
+        // model that merely rewords the text is indistinguishable from one that
+        // fixed it — the loop then either pays for another round or accepts the
+        // text it asked to have changed.
+        //
+        // It leads the request as a system message for a second reason: the
+        // payload below differs on every call, so anything in front of it is
+        // the only part an upstream's prefix cache can reuse.
+        let instruction = Message::system(
+            "Rewrite the original text so that it answers every point in the critique and \
+             the suggestions, keeping every part the critique does not object to. Answer with \
+             the revised text only: no preamble, no markdown fences, no commentary about the \
+             change.",
+        );
+
+        let response = llm.chat(&[instruction, user_msg], &options).await?;
         // A backend that could not serve the request answers with no content and
         // the reason in `error_message`. Returning that as a revision would hand
         // the caller an empty string where the caller had a deliverable, and an
