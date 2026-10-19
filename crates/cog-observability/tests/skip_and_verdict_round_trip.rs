@@ -135,6 +135,7 @@ async fn spend(store: &LlmUsageStore, actor: &str, tokens_input: u64, tokens_out
             tokens_cached: 0,
             estimated_input: None,
             refusal_kind: None,
+            retry_after_secs: None,
             task: None,
             latency_ms: 1,
             pace: None,

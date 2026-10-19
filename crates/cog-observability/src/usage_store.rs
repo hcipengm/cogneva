@@ -257,6 +257,16 @@ pub struct LlmUsageRecord {
     /// and the two call for opposite actions. Folding both into `error` makes
     /// "we have no capacity" and "we never bought this model" one cell.
     pub refusal_kind: Option<String>,
+    /// 这次熔断拒绝让调用方等多久（秒）。
+    ///
+    /// 只有 `refused_by_circuit` 的行有：熔断在拒绝的那一刻就已经说出下一次值得
+    /// 再试的时刻，而**这个数的量级正是两种熔断的分界**——窗口翻页黑障是几十秒到
+    /// 几分钟，额度烧穿是几千秒（通常就是上游自述的 reset）。不落这一格，两种情形
+    /// 在账上都只是 `refused_by_circuit`，读者得回头去读窗口相位才能分开，而那
+    /// 份读数在事后往往已经滚过去了。
+    ///
+    /// `None` 不是 0：0 会读成「立刻可以重试」，而这行说的恰恰是「现在不能」。
+    pub retry_after_secs: Option<u64>,
     /// The unit of work this call was spent for, as the caller declared it --
     /// the same identity the caller reports its own per-run totals under.
     ///
@@ -526,6 +536,12 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_spent_tokens BIGINT;
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_reserve_tokens BIGINT;
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_window_start_unix BIGINT;
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_upstreams JSONB;
+-- 熔断拒绝让调用方等多久。加这一列而不是复用 `refusal_kind`：那一格答的是
+-- "上游为什么拒"（熔断时一个上游都没试，永远是 `NULL`），这一格答的是"熔断器
+-- 说下次几点再来"。两种拒绝在账上都叫 `refused_by_circuit`，能把它们分开的只有
+-- 这个数的**量级**——窗口翻页黑障是几十秒到几分钟，额度烧穿是几千秒。
+-- 可空且无默认值：非熔断行上 `NULL` 读作"不适用"，写 0 会读成"立刻可以重试"。
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS retry_after_secs BIGINT;
 CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts);
 -- One row per upstream, not one per measurement: the pacer only ever acts on
 -- the newest window it has an observation for, and a history of stale
@@ -657,11 +673,11 @@ impl LlmUsageStore {
             INSERT INTO gateway_llm_usage
                 (id, upstream, api_style, model, result, actor, origin,
                  tokens_input, tokens_output, tokens_cached, estimated_input,
-                 task_id, latency_ms, refusal_kind,
+                 task_id, latency_ms, refusal_kind, retry_after_secs,
                  pace_measured_upstreams, pace_allowance_tokens, pace_spent_tokens,
                  pace_reserve_tokens, pace_window_start_unix, pace_upstreams)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, $19, $20)
+                    $15, $16, $17, $18, $19, $20, $21)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -678,6 +694,7 @@ impl LlmUsageStore {
         .bind(r.task.as_deref())
         .bind(r.latency_ms as i64)
         .bind(r.refusal_kind.as_deref())
+        .bind(r.retry_after_secs.map(|v| v as i64))
         .bind(r.pace.as_ref().map(|p| p.measured_upstreams as i32))
         .bind(r.pace.as_ref().map(|p| p.allowance_tokens as i64))
         .bind(r.pace.as_ref().map(|p| p.spent_tokens as i64))

@@ -2073,6 +2073,9 @@ fn failed_attempt_usage(
         // that read the body knows it, so it is passed in rather than inferred
         // later from a status code that cannot tell them apart.
         refusal_kind: refusal_kind.map(|k| k.as_str().to_string()),
+        // 这一行没走到池级熔断：它已经指名试过一家上游，是不是"什么时候值得
+        // 再来"不是这条路径的判定，不替它编一个数。
+        retry_after_secs: None,
         // 这件工作由调用方声明，失败不会改变"这笔钱是为谁花的"。
         task: task.map(str::to_string),
         latency_ms,
@@ -2109,6 +2112,7 @@ fn pooled_refusal_usage(
     actor: &str,
     origin: &str,
     task: Option<&str>,
+    retry_after_secs: u64,
 ) -> LlmUsageRecord {
     LlmUsageRecord {
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
@@ -2126,6 +2130,11 @@ fn pooled_refusal_usage(
         // 池级拒绝时没有任何一家上游的正文可读，成因无从分类。把一个候选上游的
         // 成因抄上来会让这一行读成"那一家拒的"，而它一个都没试过。
         refusal_kind: None,
+        // 熔断器在这一刻已经说出的"下次几点再来"。它与 `refusal_kind` 不重叠：
+        // 那一格答"上游为什么拒"，熔断时一个上游都没试，永远是空的；这一格答
+        // "等多久"。同一句"被拒了"背后，窗口翻页黑障是几十秒到几分钟，额度烧穿
+        // 是几千秒，能分开它们的只有这个数的量级——而这个数只在这一行的生成点手边。
+        retry_after_secs: Some(retry_after_secs),
         // 拒绝发生在选上游之前，但"这次调用想为哪件事花钱"调用方已经说了，
         // 照记：被拒的调用正是按任务配速时最该看见的那一族。
         task: task.map(str::to_string),
@@ -2165,6 +2174,10 @@ fn paced_refusal_usage(
         // 拒绝发生在向上游发请求之前，没有正文可分类；把它记成某个上游的成因
         // 会让这一行读成"那一家拒的"。
         refusal_kind: None,
+        // 配速拒绝的"等多久"在 `pace.upstreams[*].wait_secs` 里，是逐家各自的
+        // 尺子算出来的；这一格是熔断器的那一句话，写上来会让两种拒绝的等待
+        // 混成一个数。
+        retry_after_secs: None,
         task: task.map(str::to_string),
         latency_ms: 0,
         // 这一行存在的全部理由就是这一拍的数：没有它，拒绝只剩一句"被拒了"，
@@ -2320,8 +2333,11 @@ fn pooled_refusal(
     task: Option<&str>,
 ) -> Option<(u64, u64)> {
     let verdict = state.pool_circuit_break(candidates);
-    if verdict.is_some() {
-        land_usage_record(state, pooled_refusal_usage(style, actor, origin, task));
+    if let Some((retry_after, _)) = verdict {
+        land_usage_record(
+            state,
+            pooled_refusal_usage(style, actor, origin, task, retry_after),
+        );
     }
     verdict
 }
@@ -2849,6 +2865,8 @@ async fn record_llm_tokens(
             tokens_cached: reading.cached,
             estimated_input,
             refusal_kind: None,
+            // 真实调用的一行：熔断没拒过它，没有"下次再来"可报。
+            retry_after_secs: None,
             task,
             latency_ms,
             // 真实调用的一行：配速没参与这一次的判定。
@@ -8960,7 +8978,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     /// 修上游，一个是等窗口。
     #[tokio::test]
     async fn a_pooled_refusal_is_one_ledger_row_and_is_not_an_upstream_error() {
-        let row = pooled_refusal_usage("openai", "agent:planner", "resident_worker", None);
+        let row = pooled_refusal_usage("openai", "agent:planner", "resident_worker", None, 300);
         assert_eq!(row.result, REFUSED_BY_CIRCUIT);
         assert_ne!(row.result, "ok", "记成 ok 就不进 failed_calls");
         assert_ne!(
@@ -8981,6 +8999,13 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert_eq!(row.actor, "agent:planner");
         assert_eq!(row.origin, "resident_worker");
         assert_eq!(row.api_style, "openai");
+        // 这一格是两种熔断唯一的分界线：翻页黑障几十秒、额度烧穿几千秒。留空或
+        // 写 0 都会让这一行与「立刻可以重试」同形，而它说的恰恰是「现在不能」。
+        assert_eq!(
+            row.retry_after_secs,
+            Some(300),
+            "熔断拒绝必须自带「下次几点再来」"
+        );
 
         // 落账绑在判定上，但不许改判定本身：全灭时仍返回 Some 与那两个数。
         let far = Utc::now().timestamp() + 3_600;

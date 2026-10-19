@@ -71,6 +71,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         tokens_cached: cached,
         estimated_input: estimated,
         refusal_kind: refusal_kind.map(str::to_string),
+        retry_after_secs: None,
         task: task.map(str::to_string),
         latency_ms: 12,
         pace: None,
@@ -123,7 +124,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     // not, since "this row was never priced" is not "this row was priced at 0".
     sqlx::query(
         "ALTER TABLE gateway_llm_usage DROP COLUMN tokens_cached, DROP COLUMN estimated_input, \
-         DROP COLUMN task_id, DROP COLUMN refusal_kind",
+         DROP COLUMN task_id, DROP COLUMN refusal_kind, DROP COLUMN retry_after_secs",
     )
     .execute(&pool)
     .await
@@ -134,7 +135,8 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         .expect("re-init against a table without the columns");
 
     let row = sqlx::query(
-        "SELECT tokens_input, tokens_cached, estimated_input, task_id, refusal_kind \
+        "SELECT tokens_input, tokens_cached, estimated_input, task_id, refusal_kind, \
+                retry_after_secs \
          FROM gateway_llm_usage WHERE actor = $1",
     )
     .bind(&before)
@@ -169,6 +171,12 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         "a row written before the refusal column existed has no cause to report, and \
          inventing one would make a past window read as a refusal nobody classified"
     );
+    assert_eq!(
+        row.get::<Option<i64>, _>("retry_after_secs"),
+        None,
+        "a row that predates the retry hint was never a circuit refusal, and a zero \
+         would read as 'retry now' -- the opposite of what the column says"
+    );
 
     let shape = sqlx::query(
         "SELECT is_nullable, column_default FROM information_schema.columns \
@@ -202,12 +210,35 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
             .is_none(),
         "a default here would erase the difference between unpriced and priced at it"
     );
+    let retry_shape = sqlx::query(
+        "SELECT is_nullable, column_default FROM information_schema.columns \
+         WHERE table_name = 'gateway_llm_usage' AND column_name = 'retry_after_secs'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the retry hint column must exist after the migration");
+    assert_eq!(
+        retry_shape.get::<String, _>("is_nullable"),
+        "YES",
+        "most rows are not circuit refusals; they need an absence to carry"
+    );
+    assert!(
+        retry_shape
+            .get::<Option<String>, _>("column_default")
+            .is_none(),
+        "a default would let every served call claim a retry time it never had"
+    );
 
     // And the columns the migration added are ones the writer actually fills --
     // including the estimate's own absence, which has to come back as an absence
     // rather than as the zero the reader would otherwise have to guess about.
+    let mut after_migration = record(after.clone(), 640, Some(512), Some(&task), None);
+    // Only the circuit-refusal path sets the retry hint; what this case can check
+    // is that a value set there survives the writer and the migrated table as the
+    // number the circuit stated, not as a presence flag.
+    after_migration.retry_after_secs = Some(4_312);
     store
-        .record(&record(after.clone(), 640, Some(512), Some(&task), None))
+        .record(&after_migration)
         .await
         .expect("record after the migration");
     store
@@ -215,7 +246,8 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         .await
         .expect("record a call whose path prices nothing");
     let row = sqlx::query(
-        "SELECT tokens_cached, estimated_input, task_id FROM gateway_llm_usage WHERE actor = $1",
+        "SELECT tokens_cached, estimated_input, task_id, retry_after_secs \
+         FROM gateway_llm_usage WHERE actor = $1",
     )
     .bind(&after)
     .fetch_one(&pool)
@@ -224,6 +256,11 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     assert_eq!(row.get::<i64, _>("tokens_cached"), 640);
     assert_eq!(row.get::<Option<i64>, _>("estimated_input"), Some(512));
     assert_eq!(row.get::<Option<String>, _>("task_id"), Some(task.clone()));
+    assert_eq!(
+        row.get::<Option<i64>, _>("retry_after_secs"),
+        Some(4_312),
+        "the retry hint must reach the ledger as the number the circuit stated"
+    );
     let row =
         sqlx::query("SELECT estimated_input, task_id FROM gateway_llm_usage WHERE actor = $1")
             .bind(&unpriced)
