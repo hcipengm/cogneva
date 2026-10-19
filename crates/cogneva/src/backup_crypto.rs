@@ -65,7 +65,7 @@ impl PackageKey {
         if text.trim().is_empty() {
             return None;
         }
-        if text.as_bytes().len() < 16 {
+        if text.len() < 16 {
             tracing::warn!(
                 env = KEY_ENV,
                 "备份包口令短于 16 字节：能跑，但离线爆破的成本会明显降低"
