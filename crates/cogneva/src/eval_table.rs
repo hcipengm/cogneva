@@ -12,7 +12,7 @@
 //! 输入之外的路径。可 diff 说的是**管道**在拿到同样答案之后确定，不是「上游端到端可复现」：
 //! 温度不为零的采样本来就不会两次给出同样的 token。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1459,6 +1459,13 @@ struct Readings<'a> {
     table: &'a Table,
 }
 
+/// 被跳过的用例按「表 × 原因」归并，值里装三样：哪些外壳、哪些种子、原因原文。
+///
+/// 三样收在一格里而不是拆成三张表：它们由同一个 `(benchmark, case)` 键一起产生，
+/// 拆开后读者要自己保证三张表对得上，而「对不上」与「没跳过」在报表上是同形的。
+/// 提成别名只为让调用点读得出这句话，不是新概念。
+type SkippedByReason = BTreeMap<(String, String), (BTreeSet<String>, BTreeSet<u64>, String)>;
+
 fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>) -> String {
     let Readings {
         data_root,
@@ -1782,14 +1789,7 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
     // 跳过只印个数，读的人点不出是谁：同一格 `skipped=7` 既可能是「该跳的那七道带图题」，
     // 也可能是「数据集换了七道」。按题目 id 点出来，才能拿它跟数据集一条条对。同一道题在
     // 两列表、三个种子里被跳，合成一行点数（`scaffolds=` / `seeds=`），因为原因只有一条。
-    let mut skipped: std::collections::BTreeMap<
-        (String, String),
-        (
-            std::collections::BTreeSet<String>,
-            std::collections::BTreeSet<u64>,
-            String,
-        ),
-    > = std::collections::BTreeMap::new();
+    let mut skipped = SkippedByReason::new();
     for cell in &table.cells {
         for seed in &cell.per_seed {
             for (case, reason) in &seed.skipped_cases {
