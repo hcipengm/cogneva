@@ -1834,13 +1834,45 @@ impl MainlineDeployer {
             .bare_main_rev()
             .await
             .unwrap_or_else(|e| format!("unreadable({e})"));
+        let state = self.load_state();
+        let behind = self
+            .behind_revs(state.last_good_rev.as_deref(), &bare)
+            .await;
         let summary = heartbeat_message(
-            &self.load_state(),
+            &state,
             &bare,
             &self.upstream_note(),
+            behind,
             chrono::Utc::now().timestamp(),
         );
         info!(heartbeat = %summary, "mainline deployer heartbeat");
+    }
+
+    /// bare 上比 `last_good` 多出的提交数。读不到（bare 不可读、活体版本未知、
+    /// git 数不出来）时返回 None：心跳是读数，不能因为一个数不出来就整行消失。
+    async fn behind_revs(&self, last_good: Option<&str>, bare: &str) -> Option<u64> {
+        let last_good = last_good?;
+        // 读 bare 失败时传进来的是 `unreadable(...)` 占位文本，不是 revision。
+        if bare.len() < 7 || !bare.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let range = format!("{last_good}..{bare}");
+        let out = self
+            .run_cmd(
+                "git",
+                &[
+                    "--git-dir",
+                    &self.cfg.bare_repo,
+                    "rev-list",
+                    "--count",
+                    &range,
+                ],
+                None,
+                30,
+            )
+            .await
+            .ok()?;
+        out.trim().parse().ok()
     }
 
     fn save_state(&self, state: &MainlineState) -> SFResult<()> {
@@ -6305,6 +6337,7 @@ fn heartbeat_message(
     state: &MainlineState,
     bare_rev: &str,
     upstream: &str,
+    behind_revs: Option<u64>,
     now_unix: i64,
 ) -> String {
     let in_flight = state
@@ -6313,9 +6346,15 @@ fn heartbeat_message(
         .map(|f| format!("{}@{:?}", rev12(&f.rev), f.phase))
         .unwrap_or_else(|| "none".into());
     format!(
-        "bare={} upstream={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={}",
+        "bare={} upstream={} behind_revs={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={}",
         rev12(bare_rev),
         upstream,
+        // 落后几个 rev。`last_good_secs` 答的是"多久"，这一格答的是"几笔"——两者
+        // 只在提交均匀时同向，积压时差得很远；这个数要交给 git 数（两端 sha 之间的
+        // 提交），不是一次减法，所以只能在这里算好再印。
+        behind_revs
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unknown".into()),
         state.last_good_rev.as_deref().map(rev12).unwrap_or("none"),
         // 活体有多旧。`last_good_rev` 只答"上的哪一版"，答不出"多久之前"；而落后多少
         // 分钟正是读这一行的人要判的那件事——一版刚上是这个 sha、上一版在六小时前也是
@@ -8736,7 +8775,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             ci_hold: None,
             ..Default::default()
         };
-        let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", "off", 100);
+        let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", "off", None, 100);
         assert!(msg.contains("bare=4dfd51ff1209"), "{msg}");
         assert!(msg.contains("upstream=off"), "{msg}");
         // 门禁按住与"没有新 rev"必须在这行上分开：两者都不前进。
@@ -8763,11 +8802,34 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             last_good_unix: 1_700_000_000,
             ..Default::default()
         };
-        let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", "off", 1_700_003_300);
+        let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", "off", None, 1_700_003_300);
         assert!(msg.contains("last_good_secs=3300"), "{msg}");
         // 时钟回拨不印负数：印出来会被读成「还没上线就先记了一笔」。
-        let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", "off", 1_699_999_000);
+        let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", "off", None, 1_699_999_000);
         assert!(msg.contains("last_good_secs=0"), "{msg}");
+    }
+
+    /// 落后几个 rev 与落后多久是两格读数：提交均匀时同向，积压时完全不同
+    /// （12 笔可以是一小时，也可以是两天）。数不出来时印 unknown，不印 0——
+    /// 0 在这个位置读作「已经追平」，而读不出来恰恰是不知道。
+    #[test]
+    fn heartbeat_message_says_how_many_commits_the_live_revision_is_behind() {
+        let state = MainlineState {
+            last_good_rev: Some("4dfd51ff1209abcdef".into()),
+            ..Default::default()
+        };
+        let msg = heartbeat_message(
+            &state,
+            "1f3b5b29b46cc957",
+            "up-to-date(1f3b5b29b46c)",
+            Some(12),
+            1_700_000_000,
+        );
+        assert!(msg.contains("behind_revs=12"), "{msg}");
+        let msg = heartbeat_message(&state, "1f3b5b29b46cc957", "off", Some(0), 1_700_000_000);
+        assert!(msg.contains("behind_revs=0"), "{msg}");
+        let msg = heartbeat_message(&state, "1f3b5b29b46cc957", "off", None, 1_700_000_000);
+        assert!(msg.contains("behind_revs=unknown"), "{msg}");
     }
 
     #[test]
@@ -8806,7 +8868,13 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             last_ci_verdict: None,
             last_good_unix: 0,
         };
-        let msg = heartbeat_message(&state, "aabbccddeeff0011", "up-to-date(aabbccddeeff)", 1000);
+        let msg = heartbeat_message(
+            &state,
+            "aabbccddeeff0011",
+            "up-to-date(aabbccddeeff)",
+            None,
+            1000,
+        );
         assert!(msg.contains("in_flight=aabbccddeeff@Pushed"), "{msg}");
         assert!(msg.contains("upstream=up-to-date(aabbccddeeff)"), "{msg}");
         assert!(
@@ -8873,7 +8941,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_class: FailureClass::Environment,
             ..Default::default()
         };
-        let msg = heartbeat_message(&state, "112233445566aabb", "diverged", 1000);
+        let msg = heartbeat_message(&state, "112233445566aabb", "diverged", None, 1000);
         assert!(msg.contains("upstream=diverged"), "{msg}");
         assert!(msg.contains("failed_rev=112233445566"), "{msg}");
         assert!(msg.contains("failed_class=environment"), "{msg}");
@@ -8906,6 +8974,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             &MainlineState::default(),
             "unreadable(git failed)",
             "unreachable(2)",
+            None,
             0,
         );
         assert!(msg.contains("bare=unreadable("), "{msg}");
