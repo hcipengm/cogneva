@@ -111,6 +111,17 @@ jobs:
         run: cargo test -p cog-storage --test partition_maintainer -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The decision counters are a sum the database keeps, and the one read a
+      # DB-free test cannot take is two writers counting into the same cell at
+      # once: a store that reads, adds and writes back loses an increment, while
+      # a test that writes one row and reads it back passes against exactly that
+      # store. The table also refuses successes above attempts, and that
+      # invariant lives on the server -- the file that this table replaced could
+      # not have it at all.
+      - name: Live-DB decision counters
+        run: cargo test -p cog-storage --test decision_stats_store -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The change ledger's reason column is written through one statement and
       # read through a fixed column list, and both are the kind of coupling a
       # DB-free test cannot see: a column added to the write and not the read
