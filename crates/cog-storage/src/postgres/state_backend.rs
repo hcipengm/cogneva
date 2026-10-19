@@ -637,6 +637,69 @@ impl StateBackend for PostgresStateBackend {
         }
     }
 
+    async fn dag_transition_owned_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        expected: &[cog_core::TaskStatus],
+        updated: &cog_core::Task,
+        owner: &str,
+    ) -> SFResult<()> {
+        let value = serde_json::to_value(updated)?;
+        let new_status = status_str(&updated.status);
+        let expected: Vec<&str> = expected.iter().map(status_str).collect();
+
+        // Both owner clauses are load-bearing. The first compares the row on
+        // disk with the caller's unit, which is the ownership check at the
+        // instant of the write; the second refuses a payload that would move
+        // the task to another owner, since that decision belongs to the
+        // handover transaction and not to a state transition.
+        let result = self
+            .retry(|| async {
+                sqlx::query(
+                    r#"
+                    UPDATE cog_dag_tasks
+                    SET task = $3, status = $4, updated_at = NOW()
+                    WHERE workspace_id = $1 AND task_id = $2 AND status = ANY($5)
+                      AND owner_unit = $6
+                      AND $3::jsonb ->> 'owner_unit' = $6
+                    "#,
+                )
+                .bind(workspace_id)
+                .bind(task_id)
+                .bind(value.clone())
+                .bind(new_status)
+                .bind(expected.clone())
+                .bind(owner)
+                .execute(&self.pool)
+                .await
+            })
+            .await?;
+
+        if result.rows_affected() == 1 {
+            return Ok(());
+        }
+        // The guard that failed decides what the caller should do: a row that
+        // moved to another owner and a row that moved to another state are
+        // both "re-read", but only the first one means this caller may no
+        // longer act on the task at all.
+        let current = self.dag_get_task(workspace_id, task_id).await?;
+        match current {
+            Some(t) if t.owner_unit.as_deref() != Some(owner) => Err(SFError::Conflict(format!(
+                "task {task_id} is owned by {}, not {owner}",
+                t.owner_unit.as_deref().unwrap_or("nobody")
+            ))),
+            Some(t) => Err(SFError::Conflict(format!(
+                "task {task_id} is in {:?} state, not one of the states this transition accepts",
+                t.status
+            ))),
+            None => Err(SFError::TaskFailed {
+                task_id: task_id.into(),
+                reason: "Task not found".into(),
+            }),
+        }
+    }
+
     async fn dag_remove_task(&self, workspace_id: &str, task_id: &str) -> SFResult<()> {
         self.retry(|| async {
             sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1 AND task_id = $2")

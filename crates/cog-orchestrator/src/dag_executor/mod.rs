@@ -686,6 +686,29 @@ impl DagExecutorRuntime {
     /// A message is only acked once its state transition has been applied.
     /// Every early return below leaves it pending on purpose, so the sweeper
     /// retries it — a transient failure must not silently strand a result.
+    /// Whether a result must be refused because the task it names belongs to
+    /// another unit.
+    ///
+    /// The shared ready queue no longer carries an owned task, and the
+    /// consumer refuses one that arrives anyway, so the normal executor never
+    /// produces a result for an owned task. An out-of-band worker reports
+    /// through this same stream, naming itself in `sender`; that name is
+    /// asserted rather than proved, and the check is here to stop the ordinary
+    /// mistake -- a look-alike id, a copied command, a unit that picked up the
+    /// wrong row -- from finishing someone else's work. Refusing rather than
+    /// applying keeps the row where its owner left it.
+    async fn result_names_another_owner(&self, task_id: &str, sender: &str) -> bool {
+        match self.orchestrator.get_task(task_id).await {
+            Some(task) => match task.owner_unit.as_deref() {
+                Some(owner) => owner != sender,
+                None => false,
+            },
+            // An unknown task is not this check's business: the transition
+            // below rejects it on its own terms, with its own log line.
+            None => false,
+        }
+    }
+
     async fn handle_result_message(
         &self,
         result_stream: &str,
@@ -727,8 +750,19 @@ impl DagExecutorRuntime {
 
         match msg {
             DagMessage::TaskComplete {
-                task_id, result, ..
+                task_id,
+                result,
+                sender,
+                ..
             } => {
+                if self.result_names_another_owner(&task_id, &sender).await {
+                    tracing::warn!(
+                        task_id = %task_id, sender = %sender, msg_id = %msg_id,
+                        "result message names a task owned by another unit; dropping it"
+                    );
+                    self.ack_result(result_stream, group_name, msg_id).await;
+                    return;
+                }
                 match self
                     .orchestrator
                     .complete_task(&task_id, result.clone())
@@ -768,8 +802,17 @@ impl DagExecutorRuntime {
                 error,
                 error_cause,
                 retry_after_secs,
+                sender,
                 ..
             } => {
+                if self.result_names_another_owner(&task_id, &sender).await {
+                    tracing::warn!(
+                        task_id = %task_id, sender = %sender, msg_id = %msg_id,
+                        "failure message names a task owned by another unit; dropping it"
+                    );
+                    self.ack_result(result_stream, group_name, msg_id).await;
+                    return;
+                }
                 match self
                     .orchestrator
                     .fail_task_after(&task_id, error.clone(), error_cause, retry_after_secs)

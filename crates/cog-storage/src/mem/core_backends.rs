@@ -286,6 +286,46 @@ impl StateBackend for MemoryStateBackend {
         Ok(())
     }
 
+    async fn dag_transition_owned_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        expected: &[cog_core::TaskStatus],
+        updated: &cog_core::Task,
+        owner: &str,
+    ) -> SFResult<()> {
+        let mut store = self
+            .store
+            .write()
+            .map_err(|_| SFError::Agent("lock poisoned".into()))?;
+        let tasks = store.dag_tasks.entry(workspace_id.into()).or_default();
+        let current = tasks.get(task_id).ok_or_else(|| SFError::TaskFailed {
+            task_id: task_id.into(),
+            reason: "Task not found".into(),
+        })?;
+        if current.owner_unit.as_deref() != Some(owner) {
+            return Err(SFError::Conflict(format!(
+                "task {task_id} is owned by {}, not {owner}",
+                current.owner_unit.as_deref().unwrap_or("nobody")
+            )));
+        }
+        if !expected.contains(&current.status) {
+            return Err(SFError::Conflict(format!(
+                "task {task_id} is in {:?} state, not one of the states this transition accepts",
+                current.status
+            )));
+        }
+        // 交接才改归属；一次状态迁移顺手把 owner 换掉，等于那次决定被悄悄做了。
+        if updated.owner_unit.as_deref() != Some(owner) {
+            return Err(SFError::Conflict(format!(
+                "task {task_id}: the updated row names owner {}, not {owner}",
+                updated.owner_unit.as_deref().unwrap_or("nobody")
+            )));
+        }
+        tasks.insert(task_id.into(), updated.clone());
+        Ok(())
+    }
+
     async fn dag_remove_task(&self, workspace_id: &str, task_id: &str) -> SFResult<()> {
         let mut store = self
             .store
@@ -1654,5 +1694,104 @@ impl cog_core::PromotionLedger for MemoryStateBackend {
         out.sort_by_key(|r| r.updated_at);
         out.truncate(limit);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod owned_transition_tests {
+    use super::*;
+    use cog_core::{Task, TaskStatus, TaskType};
+
+    fn owned(id: &str, owner: &str) -> Task {
+        let mut task = Task::new(id, TaskType::DagNode, serde_json::json!({}));
+        task.owner_unit = Some(owner.into());
+        task
+    }
+
+    #[tokio::test]
+    async fn a_transition_only_lands_for_the_owner_named_on_the_row() {
+        let backend = MemoryStateBackend::new();
+        backend
+            .dag_set_task("ws", "t-1", &owned("t-1", "8b"))
+            .await
+            .unwrap();
+
+        let mut updated = owned("t-1", "8b");
+        updated.status = TaskStatus::Scheduled;
+        let refused = backend
+            .dag_transition_owned_task("ws", "t-1", &[TaskStatus::Pending], &updated, "6e")
+            .await;
+        assert!(
+            matches!(refused, Err(SFError::Conflict(_))),
+            "another unit must not move a task it does not own: {refused:?}"
+        );
+        assert_eq!(
+            backend
+                .dag_get_task("ws", "t-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Pending,
+            "a refused transition must not have written anything"
+        );
+
+        backend
+            .dag_transition_owned_task("ws", "t-1", &[TaskStatus::Pending], &updated, "8b")
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .dag_get_task("ws", "t-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Scheduled
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transition_cannot_move_a_task_to_another_owner() {
+        // Ownership change is the handover's decision; a state transition that
+        // carried a different owner would be that decision made silently.
+        let backend = MemoryStateBackend::new();
+        backend
+            .dag_set_task("ws", "t-2", &owned("t-2", "8b"))
+            .await
+            .unwrap();
+        let mut updated = owned("t-2", "6e");
+        updated.status = TaskStatus::Running;
+        let refused = backend
+            .dag_transition_owned_task("ws", "t-2", &[TaskStatus::Pending], &updated, "8b")
+            .await;
+        assert!(matches!(refused, Err(SFError::Conflict(_))), "{refused:?}");
+        assert_eq!(
+            backend
+                .dag_get_task("ws", "t-2")
+                .await
+                .unwrap()
+                .unwrap()
+                .owner_unit
+                .as_deref(),
+            Some("8b")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_state_read_is_reported_as_a_conflict_not_a_failure() {
+        let backend = MemoryStateBackend::new();
+        let mut running = owned("t-3", "8b");
+        running.status = TaskStatus::Running;
+        backend.dag_set_task("ws", "t-3", &running).await.unwrap();
+        let mut updated = owned("t-3", "8b");
+        updated.status = TaskStatus::Scheduled;
+        let refused = backend
+            .dag_transition_owned_task("ws", "t-3", &[TaskStatus::Pending], &updated, "8b")
+            .await;
+        assert!(
+            matches!(refused, Err(SFError::Conflict(_))),
+            "a row that moved on is a conflict, not a failed task: {refused:?}"
+        );
     }
 }

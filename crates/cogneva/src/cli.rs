@@ -35,12 +35,13 @@ pub enum Command {
     McpServe,
     WriteRole,
     Governance,
+    Work,
     WindowsService,
 }
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 16] = [
+const SUBCOMMANDS: [(&str, Command); 17] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
@@ -57,6 +58,7 @@ const SUBCOMMANDS: [(&str, Command); 16] = [
     ("mcp-serve", Command::McpServe),
     ("write-role", Command::WriteRole),
     ("governance", Command::Governance),
+    ("work", Command::Work),
 ];
 
 /// Flags that take effect wherever they appear in the argument list.
@@ -122,6 +124,8 @@ COMMANDS:
     governance <SUB>       Read the face graph, print its verdict, write its projection,
                            or import the roster; <SUB> is one of faces, drift,
                            project, import-faces
+    work <SUB> --unit <u>  Act on the tasks the graph assigns to one unit; <SUB> is one
+                           of queue, claim, start, heartbeat, complete, fail, release
 
     With no COMMAND the full application starts.
 

@@ -600,6 +600,35 @@ pub trait StateBackend: Send + Sync {
         Err(SFError::NotImplemented("dag_transition_task".into()))
     }
 
+    /// [`Self::dag_transition_task`] with the owner as a second guard.
+    ///
+    /// The write lands only when the stored row is in one of `expected` **and**
+    /// its `owner_unit` is `owner`. The caller has already read the row and
+    /// checked that the owner is the unit it acts for; this guard is what keeps
+    /// that check true at the moment of the write. Without it a handover that
+    /// rebinds the row between the read and the write is silently overwritten
+    /// by a snapshot taken before it -- the old owner would still act on a task
+    /// that is no longer theirs, and the row would carry the old binding back.
+    ///
+    /// `updated` must itself name `owner`: a transition cannot move a task to
+    /// a different owner, because that is the handover's decision, made in its
+    /// own transaction.
+    ///
+    /// Failures are [`SFError::Conflict`] -- the row moved -- rather than
+    /// `TaskFailed`, except when the task does not exist at all.
+    async fn dag_transition_owned_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        _expected: &[crate::TaskStatus],
+        _updated: &crate::Task,
+        _owner: &str,
+    ) -> SFResult<()> {
+        let _ = workspace_id;
+        let _ = task_id;
+        Err(SFError::NotImplemented("dag_transition_owned_task".into()))
+    }
+
     /// Remove a task from the DAG state.
     async fn dag_remove_task(&self, workspace_id: &str, task_id: &str) -> SFResult<()> {
         let _ = workspace_id;

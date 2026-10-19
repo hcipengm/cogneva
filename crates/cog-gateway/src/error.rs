@@ -55,6 +55,8 @@ impl IntoResponse for ApiError {
             "NotFound" => StatusCode::NOT_FOUND,
             "BadRequest" => StatusCode::BAD_REQUEST,
             "Forbidden" => StatusCode::FORBIDDEN,
+            // 一轮 CAS 输给了别的写者：状态已经变了，重读再决定，不是这个请求本身错了。
+            "Conflict" => StatusCode::CONFLICT,
             "TooManyRequests" => StatusCode::TOO_MANY_REQUESTS,
             "ServiceUnavailable" => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -82,6 +84,10 @@ impl From<cog_core::SFError> for ApiError {
             cog_core::SFError::Aborted => ApiError {
                 error: "Conflict".into(),
                 message: "operation aborted".into(),
+            },
+            cog_core::SFError::Conflict(msg) => ApiError {
+                error: "Conflict".into(),
+                message: msg,
             },
             other => ApiError::internal(other.to_string()),
         }

@@ -57,6 +57,15 @@ pub enum SFError {
     #[error("Task execution failed: {task_id} - {reason}")]
     TaskFailed { task_id: String, reason: String },
 
+    /// A conditional write lost its guard: the row is not in the shape the
+    /// caller read. Distinct from [`Self::TaskFailed`] because nothing about
+    /// the work failed -- the caller acted on a row someone else had already
+    /// moved, and re-reading is the repair. Interface layers translate it to
+    /// 409 rather than 400 so a client can tell "try again from the new row"
+    /// apart from "this request was never valid".
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     #[error("Backpressure: channel capacity exceeded")]
     Backpressure,
 

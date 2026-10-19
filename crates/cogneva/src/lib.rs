@@ -31,6 +31,7 @@ pub mod shutdown_coordinator;
 pub mod startup_guard;
 pub mod validate_config;
 pub mod volume_walker;
+pub mod work;
 pub mod write_role;
 
 #[cfg(test)]
