@@ -76,7 +76,7 @@ Evolution does not only wait for human commands. It simultaneously receives:
 Cogneva's omni-evolution is not a single channel, but **source-level evolution + artifact-level evolution** running in parallel:
 
 - **Source-level evolution**: acts on the open-source engine framework (MIT), producing code changes against `.rs` files — new algorithms, frameworks, and data structures.
-- **Artifact-level evolution**: acts on private policy artifacts (versioned JSON meta-policies, thresholds, rules, scoring weights), hot-swapped at runtime — changing behavior without changing source code. The store is `{name}/{version:06}.json` plus an `ACTIVE` pointer under the runtime data directory; recorded decision outcomes are replayed as evidence, not hot-swapped themselves. The autonomous driver currently evolves the `meta_learning.mode` artifact; the store and hot-swap mechanism are generic.
+- **Artifact-level evolution**: acts on private policy artifacts (versioned JSON meta-policies, thresholds, rules, scoring weights), hot-swapped at runtime — changing behavior without changing source code. The store is `{name}/{version:06}.json` plus an `ACTIVE` pointer under the runtime data directory; the version directory is append-only, and rolling back moves `ACTIVE` rather than deleting a version. Recorded decision outcomes are replayed as evidence, not hot-swapped themselves. The autonomous driver currently evolves the `meta_learning.mode` artifact; the store and hot-swap mechanism are generic.
 
 #### The negative-feedback loop
 
