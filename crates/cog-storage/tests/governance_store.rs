@@ -30,8 +30,8 @@
 
 use chrono::Utc;
 use cog_core::{
-    Face, FaceKind, FaceSpec, GovernanceStore, HandoverSpec, StateBackend, Task, TaskStatus,
-    TaskType, GOVERNANCE_WORKSPACE, HANDOVER_TASK_TYPE,
+    decision_event_task, Face, FaceKind, FaceSpec, GovernanceStore, HandoverSpec, StateBackend,
+    Task, TaskStatus, TaskType, DECISION_EVENT_TASK_TYPE, GOVERNANCE_WORKSPACE, HANDOVER_TASK_TYPE,
 };
 use cog_storage::{PostgresGovernanceStore, PostgresStateBackend};
 use sqlx::PgPool;
@@ -109,6 +109,14 @@ async fn clean(pool: &PgPool, prefix: &str) {
     sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1 AND task_id LIKE $2")
         .bind(GOVERNANCE_WORKSPACE)
         .bind(format!("{prefix}%"))
+        .execute(pool)
+        .await
+        .expect("clean up");
+    // Event ids carry the decision id in the middle (`decision-event:<id>:<seq>`),
+    // so the marker is not a prefix there.
+    sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1 AND task_id LIKE $2")
+        .bind(GOVERNANCE_WORKSPACE)
+        .bind(format!("%{prefix}%"))
         .execute(pool)
         .await
         .expect("clean up");
@@ -489,6 +497,103 @@ async fn a_handover_whose_face_moved_under_it_writes_nothing() {
         handover.status,
         TaskStatus::Scheduled,
         "the handover row must not read as applied while the face did not move"
+    );
+
+    clean(&pool, &prefix).await;
+}
+
+/// A status move and the event that explains it are one write. A caller whose
+/// expected status no longer holds gets `false` and leaves nothing behind; a
+/// caller that wins leaves both rows. Written as two statements in either order
+/// the window between them reads as a legal history of a move that never
+/// happened (or a move with no history), and neither the chain check nor the
+/// row read can tell.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_status_move_and_its_event_are_written_together_or_not_at_all() {
+    let pool = PgPool::connect(&database_url())
+        .await
+        .expect("connect to the test database");
+    let backend = PostgresStateBackend::new(pool.clone());
+    backend.init_schema().await.expect("init the schema");
+    let store = PostgresGovernanceStore::new(pool.clone());
+
+    let prefix = marker();
+    let face_id = format!("{prefix}:face");
+    let decision_id = format!("{prefix}:decision");
+    let row_id = format!("{prefix}:handover");
+
+    store
+        .save_governance_node(&handover_node(
+            &row_id,
+            &face_id,
+            "8b",
+            "6e",
+            TaskStatus::Pending,
+        ))
+        .await
+        .expect("seed the row");
+    let event = decision_event_task(&decision_id, 0, "opened", None, None, "", Utc::now());
+
+    let losing_move = handover_node(&row_id, &face_id, "8b", "6e", TaskStatus::Completed);
+    assert!(
+        !store
+            .save_governance_node_with_event(&event, &losing_move, &[TaskStatus::Running])
+            .await
+            .expect("write against a status the row is not in"),
+        "a row that is not in the expected status must report the race, not write"
+    );
+
+    let rows = store
+        .governance_nodes(HANDOVER_TASK_TYPE)
+        .await
+        .expect("read the rows");
+    let row = rows
+        .iter()
+        .find(|row| row.id == row_id)
+        .expect("the row is still there");
+    assert_eq!(
+        row.status,
+        TaskStatus::Pending,
+        "a losing write must not move the row"
+    );
+    assert!(
+        store
+            .governance_nodes(DECISION_EVENT_TASK_TYPE)
+            .await
+            .expect("read the events")
+            .iter()
+            .all(|event| event.id != cog_core::decision_event_id(&decision_id, 0)),
+        "a losing write must not leave the event behind either"
+    );
+
+    let winning_move = handover_node(&row_id, &face_id, "8b", "6e", TaskStatus::Completed);
+    assert!(
+        store
+            .save_governance_node_with_event(&event, &winning_move, &[TaskStatus::Pending])
+            .await
+            .expect("write against the status the row is in"),
+        "the caller that read the current status must win"
+    );
+
+    let rows = store
+        .governance_nodes(HANDOVER_TASK_TYPE)
+        .await
+        .expect("read the rows");
+    let row = rows
+        .iter()
+        .find(|row| row.id == row_id)
+        .expect("the row is still there");
+    assert_eq!(row.status, TaskStatus::Completed, "the move must land");
+    let events = store
+        .governance_nodes(DECISION_EVENT_TASK_TYPE)
+        .await
+        .expect("read the events");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.id == cog_core::decision_event_id(&decision_id, 0)),
+        "the step that explains the move must land with it"
     );
 
     clean(&pool, &prefix).await;
