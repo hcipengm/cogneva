@@ -1,0 +1,70 @@
+# Dormancy registry for the Prometheus alert rules in this chart.
+#
+# A rule that loads is not a rule that can fire. Every rule below references at
+# least one series that does not exist on the live Prometheus, so its expression
+# cannot become true. Sleeping is not automatically a defect -- a rule watching
+# HPA objects that do not exist is correctly asleep -- but the reason has to be
+# written down where the reader can find it:
+#
+#     rule <tab> absent_series (comma separated) <tab> reason <tab> why
+#
+# reason is a closed set:
+#   object_absent     the object family is not deployed; the rule wakes with it
+#   component_absent  the component the rule watches is not deployed -- a defect,
+#                     not dormancy: what the rule protects does not exist either
+#   feature_off       the feature is not configured (no remote write, ...)
+#   collector_off     the exporter is up but this collector is not enabled
+#   exporter_version  the source binary's version does not expose the family
+#   series_renamed    upstream renamed/removed the series; the rule needs a fix
+#   known_defect      a defect that is declared, with the fix named in why
+#
+# The witness reading (`scripts/host/cogneva-alert-rule-witness-reading.sh` in
+# the private brain repo) treats an absent series without a row here as red.
+# A row whose series is back (or whose rule is gone) is reported as stale and
+# must be deleted -- the condition it describes is no longer true.
+#
+# Re-read 2026-10-19 02:20Z against Prometheus 3.14.0, kubelet v1.36.4+k3s1.
+
+# --- component_absent (9 rules): the delivery chain is not deployed ----------
+AlertmanagerFailedReload	alertmanager_config_last_reload_successful	component_absent	No Alertmanager is deployed (activeAlertmanagers=[]); this rule is the only witness that alert delivery has no home.
+AlertmanagerConfigInconsistent	alertmanager_config_hash	component_absent	No Alertmanager is deployed; the replica config drift this rule guards cannot occur yet.
+AlertmanagerClusterFailedToSendAlerts	alertmanager_notifications_failed_total,alertmanager_notifications_total	component_absent	No Alertmanager is deployed; there is no notification path to fail. Deploying Alertmanager (or a webhook relay) is the fix.
+AlertmanagerFailedToSendAlerts	alertmanager_notifications_failed_total,alertmanager_notifications_total	component_absent	No Alertmanager is deployed; same delivery gap as AlertmanagerClusterFailedToSendAlerts.
+AlertmanagerClusterFailedPeers	alertmanager_cluster_failed_peers	component_absent	No Alertmanager is deployed; the HA peer set this rule watches does not exist.
+AlertmanagerMembersInconsistent	alertmanager_cluster_members	component_absent	No Alertmanager is deployed; cluster membership cannot diverge with zero members.
+PrometheusErrorSendingAlertsToAnyAlertmanager	prometheus_notifications_errors_total,prometheus_notifications_sent_total	component_absent	Prometheus has no Alertmanager target, so the notification counters are never registered; the rule and the defect it reports are the same absence.
+PrometheusErrorSendingAlertsToSomeAlertmanagers	prometheus_notifications_errors_total,prometheus_notifications_sent_total	component_absent	Prometheus has no Alertmanager target; partial-send failures cannot be measured before any send exists.
+PrometheusNotificationQueueRunningFull	prometheus_notifications_queue_length	component_absent	The notification queue has no receiver and therefore no depth; it stays absent until Alertmanager exists.
+
+# --- feature_off (3 rules): no remote write is configured -------------------
+PrometheusRemoteStorageFailures	prometheus_remote_storage_failed_samples_total,prometheus_remote_storage_samples_failed_total,prometheus_remote_storage_samples_total,prometheus_remote_storage_succeeded_samples_total	feature_off	No remote_write is configured, so the remote-storage queue never registers its counters.
+PrometheusRemoteWriteBehind	prometheus_remote_storage_queue_highest_sent_timestamp_seconds,prometheus_remote_storage_queue_highest_timestamp_seconds	feature_off	No remote_write target exists; there is no queue head to fall behind the tip.
+PrometheusRemoteWriteDesiredShards	prometheus_remote_storage_shards_desired,prometheus_remote_storage_shards_max	feature_off	No remote_write target exists; shard sizing only runs once remote write is configured.
+
+# --- object_absent (3 rules): HPA and PDB objects do not exist --------------
+KubeHpaMaxedOut	kube_horizontalpodautoscaler_spec_max_replicas,kube_horizontalpodautoscaler_spec_min_replicas,kube_horizontalpodautoscaler_status_current_replicas	object_absent	No HorizontalPodAutoscaler exists in the cluster; correct dormancy, the rule wakes when one is created.
+KubeHpaReplicasMismatch	kube_horizontalpodautoscaler_spec_max_replicas,kube_horizontalpodautoscaler_spec_min_replicas,kube_horizontalpodautoscaler_status_current_replicas,kube_horizontalpodautoscaler_status_desired_replicas	object_absent	No HorizontalPodAutoscaler exists; the replica mismatch this rule guards cannot occur.
+KubePdbNotEnoughHealthyPods	kube_poddisruptionbudget_status_current_healthy,kube_poddisruptionbudget_status_desired_healthy	object_absent	No PodDisruptionBudget exists; correct dormancy, the rule wakes when one is created.
+
+# --- exporter_version (14 rules): the source version does not expose it -----
+KubeStateMetricsListErrors	kube_state_metrics_list_total	exporter_version	kube-state-metrics no longer exports its own list/watch counters (removed upstream); re-enable via the exporter's self-metrics or replace the rule.
+KubeStateMetricsWatchErrors	kube_state_metrics_watch_total	exporter_version	kube-state-metrics no longer exports watch counters in this version; same fix as KubeStateMetricsListErrors.
+KubeStateMetricsShardingMismatch	kube_state_metrics_total_shards	exporter_version	kube-state-metrics runs unsharded here and does not export shard totals; the rule only makes sense in a sharded deployment.
+KubeStateMetricsShardsMissing	kube_state_metrics_shard_ordinal,kube_state_metrics_total_shards	exporter_version	kube-state-metrics is unsharded, so neither shard ordinal nor total is exported.
+KubeJobNotCompleted	kube_job_labels	exporter_version	The exporter's label allowlist does not emit kube_job_labels; the rule picks up the label set only if that allowlist is widened.
+KubePersistentVolumeFillingUp	kube_persistentvolumeclaim_labels	exporter_version	The exporter's label allowlist does not emit kube_persistentvolumeclaim_labels; widen the allowlist or drop the label dependency.
+KubePersistentVolumeInodesFillingUp	kube_persistentvolumeclaim_labels	exporter_version	Same allowlist gap as KubePersistentVolumeFillingUp; the inode rule shares the selector.
+KubePodNotReady	kube_pod_status_reason	exporter_version	kube_pod_status_reason is not exported by this kube-state-metrics version; the rule silently loses its reason filter.
+KubeNodeEviction	kubelet_evictions	series_renamed	kubelet v1.36 removed kubelet_evictions (deprecated since 1.24); use the pod eviction counters in kube-state-metrics instead.
+KubeletClientCertificateExpiration	kubelet_certificate_manager_client_ttl_seconds	exporter_version	kubelet v1.36.4+k3s1 does not expose the certificate-manager family; certificate expiry has no witness until this is restored upstream or via a probe.
+KubeletClientCertificateRenewalErrors	kubelet_certificate_manager_client_expiration_renew_errors	exporter_version	Same missing kubelet certificate-manager family; renewal errors are silent.
+KubeletServerCertificateExpiration	kubelet_certificate_manager_server_ttl_seconds	exporter_version	Same missing kubelet certificate-manager family; serving-certificate expiry is silent.
+KubeletServerCertificateRenewalErrors	kubelet_server_expiration_renew_errors	exporter_version	Same missing kubelet certificate-manager family; serving-certificate renewal errors are silent.
+PrometheusSDRefreshFailure	prometheus_sd_refresh_failures_total	series_renamed	Prometheus 3 removed the aggregated SD failure counter; the per-mechanism prometheus_sd_kubernetes_failures_total is the live counterpart -- rewrite the rule.
+
+# --- collector_off (5 rules): node-exporter collectors not enabled ----------
+NodeBondingDegraded	node_bonding_active,node_bonding_slaves	collector_off	The node-exporter bond collector is not enabled; bond link degradation is unobserved.
+NodeRAIDDegraded	node_md_disks,node_md_disks_required	collector_off	The node-exporter mdadm collector is not enabled; RAID degradation is unobserved.
+NodeRAIDDiskFailure	node_md_disks	collector_off	The node-exporter mdadm collector is not enabled; a failed RAID member is unobserved.
+NodeSystemdServiceCrashlooping	node_systemd_service_restart_total	collector_off	The node-exporter systemd collector is not enabled; unit restart loops are unobserved.
+NodeSystemdServiceFailed	node_systemd_unit_state	collector_off	The node-exporter systemd collector is not enabled; a failed unit is unobserved.
