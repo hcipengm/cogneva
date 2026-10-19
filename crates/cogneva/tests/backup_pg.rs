@@ -406,6 +406,7 @@ async fn pg_a_drill_row_keeps_the_columns_the_target_recomputed() {
         oldest_package_at: Some(at),
         offsite_newest_at: None,
         offsite_matches_newest: None,
+        offsite_observed_at: None,
         offsite_remote_newest_at: None,
         offsite_key_created_at: None,
         tables_restored: Some(1),

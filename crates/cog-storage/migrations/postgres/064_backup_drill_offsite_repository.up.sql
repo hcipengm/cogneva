@@ -8,7 +8,13 @@
 -- was opened with.
 --
 -- The host systemd timer is the only party that talks to the repository, and it
--- now records two instants it reads back from there:
+-- now records three instants it reads back from there:
+--
+--   * `offsite_observed_at` -- when the host last looked. Its presence is what
+--     separates "nobody observes this installation" (NULL) from "somebody
+--     looked, and the repository held nothing to report" (a value here, with
+--     one or both of the repository times NULL). Empty repository and absent
+--     observer are different repairs.
 --
 --   * `offsite_remote_newest_at` -- `restic snapshots`: the newest snapshot the
 --     repository reports. A successful upload is not this reading; a repository
@@ -19,11 +25,12 @@
 --     rotated; the mtime of an encrypted credential file is not, because
 --     re-sealing a file is not rotating a key.
 --
--- Both NULL means no observation has ever been taken -- the timer is not
+-- All three NULL means no observation has ever been taken -- the timer is not
 -- installed, or its observation file is not mounted into this job. That must
 -- stay distinguishable from "observed and old": one means nobody is measuring,
 -- the other means the measurement says the copy stopped. The rules read them as
 -- two different shapes.
 ALTER TABLE backup_drills
+    ADD COLUMN IF NOT EXISTS offsite_observed_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS offsite_remote_newest_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS offsite_key_created_at TIMESTAMPTZ;

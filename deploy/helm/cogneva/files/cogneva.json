@@ -2144,14 +2144,23 @@
           "_comment_why_not_absent": "absence is backup_offsite_repository_is_never_observed's to report; a rule that also fired on absence would make an installation that never installed the timer look like one whose key aged out."
         },
         {
+          "name": "backup_offsite_repository_has_no_snapshot",
+          "promql": "max(cogneva_backup_run_readings{readout=\"offsite_observation_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"offsite_observation_age_seconds\"}) < 1800)) * max(absent(cogneva_backup_run_readings{readout=\"offsite_remote_newest_age_seconds\"}))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The host observer looked at the repository {value} seconds ago and the repository reports no snapshot at all. This is not an old copy: the newest-snapshot age rule above has no value to compare, so it stays silent for the same reason a stopped publisher does -- absence cannot travel through an age comparison. The observer being fresh is what makes this reading a finding rather than a missing channel; when nobody observes, backup_offsite_repository_is_never_observed reports that instead. The repair is on the upload side of the timer: the repository is reachable and holds nothing.",
+          "_comment_why_not_absent": "This rule is the absence rule for snapshots; it does not repeat the channel rule above because the two have different repairs -- install the timer versus fix the upload."
+        },
+        {
           "name": "backup_offsite_repository_is_never_observed",
-          "promql": "(time() - max(kube_cronjob_created{cronjob=\"cogneva-backup-drill\"})) * max(absent(cogneva_backup_run_readings{readout=\"offsite_remote_newest_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"offsite_remote_newest_age_seconds\"}) < 1800)) or absent(cogneva_backup_run_readings{readout=\"offsite_repository_key_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"offsite_repository_key_age_seconds\"}) < 1800)))",
+          "promql": "(time() - max(kube_cronjob_created{cronjob=\"cogneva-backup-drill\"})) * max(absent(cogneva_backup_run_readings{readout=\"offsite_observation_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds{readout=\"offsite_observation_age_seconds\"}) < 1800)))",
           "condition": {
             "greater_than": 93600.0
           },
           "severity": "warning",
-          "summary": "The drill CronJob has existed for {value} seconds, past the 26 hours this family allows, and at least one of the two repository observations -- the newest snapshot's age, the newest key's age -- has never been recorded. The two factors answer what should have happened by now and what has not -- the bound is the family's three operands: a daily run scheduled once a day, plus startingDeadlineSeconds, plus runDeadlineSeconds, the longest a run may take -- and multiplying them keeps the rule quiet on an installation whose CronJob is a minute old. No observation means no party reaches the repository: the host timer is not installed, or its observation file is not mounted where the drill reads it. The freshness conjunction on each absence makes a publisher that stopped read the same way -- its last value stops passing the window, so an absence is an absence whether it never existed or stopped being republished. Two different repairs, and both have to be told apart from a value that exists and has aged -- the age rules above speak only when there is a value, so a reading that never existed stays silent there for the same reason a stopped publisher does, which is why absence needs its own rule.",
-          "_comment_why_multiply": "the same two-factor shape as backup_offsite_copy_never_written: the object's age says what should have happened, absent() says what has not, and the product is false until the object is older than the bound."
+          "summary": "The drill CronJob has existed for {value} seconds, past the 26 hours this family allows, and no fresh observation of the offsite repository exists. The two factors answer what should have happened by now and what has not -- the bound is the family's three operands: a daily run scheduled once a day, plus startingDeadlineSeconds, plus runDeadlineSeconds, the longest a run may take -- and multiplying them keeps the rule quiet on an installation whose CronJob is a minute old. No observation means nobody reaches the repository: the host timer is not installed, its observation file is not mounted where the drill reads it, or its publisher stopped. The freshness conjunction makes a stopped publisher read like the first two, because a value that stops being republished leaves the window. This rule is about the channel, not its findings: a repository that was looked at and held no snapshot is reported by backup_offsite_repository_has_no_snapshot, and an observed snapshot that has aged is the stale rule above."
         },
         {
           "name": "backup_run_over_its_own_deadline",

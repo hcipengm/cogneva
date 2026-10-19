@@ -302,9 +302,15 @@ pub struct BackupDrillRecord {
     ///
     /// These are read off the repository (`restic snapshots`, `restic key
     /// list`), not off the writer's own account of "I just uploaded" and not off
-    /// the age of a credential file. `None` means the observation was never
-    /// taken -- the timer is not installed, or its observation file was not
-    /// mounted -- which a reader must keep apart from "observed, and old".
+    /// the age of a credential file.
+    ///
+    /// `offsite_observed_at` is when the host last looked at the repository.
+    /// It is what separates "nobody observes this installation" (no value) from
+    /// "somebody looked, and the repository held nothing to report" (a value
+    /// here, with one or both repository times `None`). An empty repository and
+    /// an absent observer are different repairs, so the record keeps them apart
+    /// instead of folding both into NULL.
+    pub offsite_observed_at: Option<DateTime<Utc>>,
     pub offsite_remote_newest_at: Option<DateTime<Utc>>,
     pub offsite_key_created_at: Option<DateTime<Utc>>,
     /// Tables the scratch database held after the copy, against the tables the
@@ -480,6 +486,7 @@ mod tests {
             oldest_package_at: Some(at),
             offsite_newest_at: Some(at),
             offsite_matches_newest: Some(true),
+            offsite_observed_at: Some(at),
             offsite_remote_newest_at: Some(at),
             offsite_key_created_at: Some(at),
             tables_restored: Some(46),
@@ -573,6 +580,15 @@ mod tests {
         // is not installed must still be able to write a drill row. The rules
         // read the absence as "nobody measures this", which is not the same
         // claim as "the copy is old".
+        let mut d = agreeing_drill();
+        d.offsite_observed_at = None;
+        d.offsite_remote_newest_at = None;
+        d.offsite_key_created_at = None;
+        assert!(d.ok());
+
+        // Observed, and the repository held nothing: a different state from
+        // "nobody looked", so the observer time stays while the two repository
+        // times are absent. It is still not a verdict about the install.
         let mut d = agreeing_drill();
         d.offsite_remote_newest_at = None;
         d.offsite_key_created_at = None;

@@ -101,6 +101,11 @@ enum BackupReadout {
     OffsiteNewestAgeSeconds,
     /// Whether that second copy is the very package the drill restored: 1 or 0.
     OffsiteMatchesVolume,
+    /// How long ago the host last looked at the offsite repository. This is
+    /// the channel's own liveness, separate from what it found: absent means
+    /// nobody observes, while a value here with the two repository ages absent
+    /// means somebody looked and the repository held nothing to report.
+    OffsiteObservationAgeSeconds,
     /// How long ago the offsite repository's newest snapshot was taken, as the
     /// repository reports it to the host timer that pushes to it. Absent until
     /// that timer has observed the repository once.
@@ -135,6 +140,7 @@ impl BackupReadout {
         BackupReadout::VolumeOldestPackageAgeSeconds,
         BackupReadout::OffsiteNewestAgeSeconds,
         BackupReadout::OffsiteMatchesVolume,
+        BackupReadout::OffsiteObservationAgeSeconds,
         BackupReadout::OffsiteRemoteNewestAgeSeconds,
         BackupReadout::OffsiteRepositoryKeyAgeSeconds,
         BackupReadout::DrillWindowUnprovenPackages,
@@ -160,6 +166,7 @@ impl BackupReadout {
             BackupReadout::VolumeOldestPackageAgeSeconds => "volume_oldest_package_age_seconds",
             BackupReadout::OffsiteNewestAgeSeconds => "offsite_newest_age_seconds",
             BackupReadout::OffsiteMatchesVolume => "offsite_matches_volume",
+            BackupReadout::OffsiteObservationAgeSeconds => "offsite_observation_age_seconds",
             BackupReadout::OffsiteRemoteNewestAgeSeconds => "offsite_remote_newest_age_seconds",
             BackupReadout::OffsiteRepositoryKeyAgeSeconds => "offsite_repository_key_age_seconds",
             BackupReadout::DrillWindowUnprovenPackages => "drill_window_unproven_packages",
@@ -320,6 +327,12 @@ const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()
     // Absent when nobody observes, so the never-observed shape is a separate
     // rule reading the absence.
     (
+        // The channel's own age: published even when the repository reported
+        // nothing, so "nobody looked" and "looked and found none" stay apart.
+        BackupReadout::OffsiteObservationAgeSeconds,
+        ReadoutReader::Rule("backup_offsite_repository_is_never_observed"),
+    ),
+    (
         BackupReadout::OffsiteRemoteNewestAgeSeconds,
         ReadoutReader::Rule("backup_offsite_remote_copy_is_stale"),
     ),
@@ -437,6 +450,9 @@ fn value_of(
         // newest key was created. Both are absent when nobody observes, which
         // is a different fact from an observed value that has aged -- the rules
         // ask the two questions separately, and absence must not read as zero.
+        BackupReadout::OffsiteObservationAgeSeconds => drill
+            .and_then(|d| d.offsite_observed_at)
+            .map(|at| age_seconds(now, at)),
         BackupReadout::OffsiteRemoteNewestAgeSeconds => drill
             .and_then(|d| d.offsite_remote_newest_at)
             .map(|at| age_seconds(now, at)),

@@ -3082,14 +3082,20 @@ const RUNS_DIGEST_SQL: &str = "\
 SELECT coalesce(md5(string_agg(t::text, E'\\n' ORDER BY t.run_id)), '') \
 FROM backup_runs t WHERE run_id = ANY($1)";
 
-/// 宿主定时器从 restic 仓库里观察到的两个时刻。
+/// 宿主定时器从 restic 仓库里观察到的东西。
 ///
-/// 由 `backup-offsite-restic.sh` 写出：`newest_snapshot_at` 是 `restic snapshots`
-/// 报出的最新一个快照的时刻，`key_created_at` 是 `restic key list` 里最新一把钥匙
-/// 的创建时刻。两者都可以是 `null`——仓库里还没有快照，或者一个从没 init 过的
-/// 仓库——那是「观察到了，里面没有」，与「没人观察」由文件在不在分开。
+/// 由 `backup-offsite-restic.sh` 写出：`observed_at` 是这一跑看仓库的时刻，
+/// `newest_snapshot_at` 是 `restic snapshots` 报出的最新一个快照的时刻，
+/// `key_created_at` 是 `restic key list` 里最新一把钥匙的创建时刻。
+///
+/// 两个仓库侧时刻都可以是 `null`——仓库里还没有快照，或者一个从没 init 过的
+/// 仓库。那是「观察到了，里面没有」；`observed_at` 存在的意义就是把它与「没人
+/// 观察」分开：后者没有这一行，前者有这一行、只是两个值是空。没有 `observed_at`
+/// 的旧文件按 mtime 补上，文件在现场就说明有人看过。
 #[derive(serde::Deserialize)]
 struct OffsiteObservation {
+    #[serde(default)]
+    observed_at: Option<DateTime<Utc>>,
     #[serde(default)]
     newest_snapshot_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -3108,8 +3114,16 @@ fn read_offsite_observation(dir: &Path) -> Option<OffsiteObservation> {
             return None;
         }
     };
-    match serde_json::from_str(&text) {
-        Ok(observed) => Some(observed),
+    match serde_json::from_str::<OffsiteObservation>(&text) {
+        Ok(mut observed) => {
+            if observed.observed_at.is_none() {
+                observed.observed_at = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(DateTime::<Utc>::from);
+            }
+            Some(observed)
+        }
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "异地仓库的观察文件不是这一版认得的样子，这一面按没量过记");
             None
@@ -3135,6 +3149,7 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         oldest_package_at: None,
         offsite_newest_at: None,
         offsite_matches_newest: None,
+        offsite_observed_at: None,
         offsite_remote_newest_at: None,
         offsite_key_created_at: None,
         tables_restored: None,
@@ -3176,6 +3191,7 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
     // 两列留空；规则从「没有读数」与「读数老了」里各读一条，两种形状分开报。
     if let Some(dir) = &cfg.offsite_state_dir {
         if let Some(observed) = read_offsite_observation(dir) {
+            drill.offsite_observed_at = observed.observed_at;
             drill.offsite_remote_newest_at = observed.newest_snapshot_at;
             drill.offsite_key_created_at = observed.key_created_at;
         }
@@ -3734,6 +3750,13 @@ mod tests {
         let observed = read_offsite_observation(dir.path()).expect("文件在就要解析出来");
         assert!(observed.newest_snapshot_at.is_none());
         assert!(observed.key_created_at.is_none());
+        // 「观察过了，里面没有」与「没人观察」靠这一列分开：后者是 None。
+        assert_eq!(
+            observed.observed_at.unwrap().timestamp(),
+            Utc.with_ymd_and_hms(2026, 10, 19, 2, 30, 0)
+                .unwrap()
+                .timestamp()
+        );
 
         // 有值：带纳秒与偏移的 RFC3339 也要认，脚本归一失败时会原样写出来。
         std::fs::write(
@@ -3742,6 +3765,9 @@ mod tests {
         )
         .unwrap();
         let observed = read_offsite_observation(dir.path()).expect("文件在就要解析出来");
+        // 旧文件没有 observed_at：文件在现场就说明有人看过，按 mtime 补上，
+        // 否则「观察过」会被读成「没人观察」。
+        assert!(observed.observed_at.is_some());
         // 比到秒：解析保留纳秒（restic 写的就是纳秒），而这里要钉的是时区
         // 归一（+08:00 → UTC）与字段落位，不是小数位的精度。
         assert_eq!(
