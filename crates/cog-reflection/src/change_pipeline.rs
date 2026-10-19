@@ -5329,6 +5329,12 @@ index 1111111..2222222 100644
     /// before the change and one is green, and the change breaks only the green
     /// one — so a gate that read the run as a whole, or the tree as a whole,
     /// would get this wrong in one direction or the other.
+    /// principle: feedback_a_re_emission_reading_must_split_by_cause_and_report_the_increment
+    ///
+    /// The reading is taken on one tree at one revision and keyed by the
+    /// failing tests' own names, never by the change id: the causes the
+    /// revision already carried are split from the ones this content
+    /// introduced, and only the introduced increment is convicted.
     #[tokio::test]
     async fn only_the_failure_the_change_introduced_is_convicted() {
         // `answer_is_42` is red, `other_is_7` is green.
