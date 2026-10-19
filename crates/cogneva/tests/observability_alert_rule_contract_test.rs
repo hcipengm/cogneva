@@ -2377,6 +2377,95 @@ fn no_shipped_rule_guards_a_store_gauge_with_a_change_count() {
     );
 }
 
+/// Complaints about a freshness bound on the policy store readouts that is no
+/// longer than the loop which republishes them.
+///
+/// The two failures are not symmetric. A bound shorter than the loop's period
+/// is failed by a healthy loop sitting between two of its own publishes; a
+/// bound at exactly the period is the same thing, because the gap the loop may
+/// leave *is* its period. Only strictly longer is safe.
+fn readout_bound_complaints(rule: &str, promql: &str, series: &str, cadence: u64) -> Vec<String> {
+    let Some(bound) = companion_age_bound(promql, series) else {
+        return Vec::new();
+    };
+    if bound > cadence {
+        return Vec::new();
+    }
+    vec![format!(
+        "{rule}: 新鲜界 {bound}s 不长于读数循环周期 {cadence}s——循环在两次发布之间的正常\
+         空档会被读成写者停了\n    {promql}"
+    )]
+}
+
+/// A rule that judges the policy store readouts has to look back further than
+/// the loop that republishes them.
+///
+/// The loop's period lives in the crate that owns the loop and the bound lives
+/// in the chart; neither number is written into this test, because a bound
+/// chosen against a constant drifts from it silently the moment either side
+/// moves — and the drift here fires on a working process, since a bound
+/// no longer than the period is satisfied by a healthy loop between two of its
+/// own publishes. The restore hand-over rules are the subject: they are the
+/// ones that must not be read as "the writer stopped" while it is merely
+/// between rounds.
+#[test]
+fn a_rule_judging_the_policy_store_readouts_waits_longer_than_their_loop() {
+    let series = cog_core::metric_names::POLICY_STORE_READINGS.as_str();
+    let cadence = cog_reflection::store_readouts::STORE_READOUTS_INTERVAL.as_secs();
+    assert!(cadence > 0, "读数循环周期为 0，下面的比较没有分母");
+
+    let mut bounded = 0usize;
+    let mut complaints: Vec<String> = Vec::new();
+    for (rule, promql) in chart_rules() {
+        if !promql.contains(series) {
+            continue;
+        }
+        if companion_age_bound(&promql, series).is_some() {
+            bounded += 1;
+        }
+        complaints.extend(readout_bound_complaints(&rule, &promql, series, cadence));
+    }
+
+    // 分母：三条恢复交接规则都读这族读数。一条都不再带年龄界时，下面的
+    // 「没有投诉」是空的；而且另一条门（读共享表 gauge 必须问写者）会先红。
+    assert!(
+        bounded >= 3,
+        "只有 {bounded} 条规则对策略库读数取了年龄界，恢复交接的三条规则像是不见了"
+    );
+    assert!(
+        complaints.is_empty(),
+        "告警规则对策略库读数取的新鲜界必须严格长于发布循环的周期，否则空档是健康的:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The gate above separates the two numbers it compares, against fabricated
+/// rules as well as the shipped ones — a gate that only ever runs over rules
+/// that pass has not been shown to reject anything.
+#[test]
+fn a_readout_bound_no_longer_than_the_loop_is_reported_and_a_longer_one_is_not() {
+    let series = "cogneva_policy_store_readings";
+    let cadence = 300u64;
+    let rule = |bound: u64| {
+        format!(
+            "max(cogneva_policy_store_readings{{readout=\"active_version\"}} and \
+             ((time() - cogneva_policy_store_readings_observed_timestamp_seconds\
+             {{readout=\"active_version\"}}) < {bound}))"
+        )
+    };
+
+    // 等于循环周期也不行：循环可以一直不写，直到周期边界。
+    assert_eq!(
+        readout_bound_complaints("r", &rule(300), series, cadence).len(),
+        1,
+        "等于循环周期的界没有被报出来"
+    );
+    assert!(
+        readout_bound_complaints("r", &rule(1800), series, cadence).is_empty(),
+        "严格长于循环周期的界被误报"
+    );
+}
+
 #[test]
 fn every_series_recorded_as_produced_is_still_published_there() {
     let root = repo_root();
