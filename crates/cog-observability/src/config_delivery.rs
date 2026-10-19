@@ -103,7 +103,16 @@ pub async fn run_config_declaration_check(
     match decide(&first, &later, &source) {
         DeliveryAction::Fire(message) => {
             warn!(source = %source, "{}", message);
-            set_row(&store, &notifier, metrics.as_ref(), true, &source, &message).await;
+            set_row(
+                &store,
+                &notifier,
+                metrics.as_ref(),
+                CONFIG_DECLARATION_RULE,
+                true,
+                &source,
+                &message,
+            )
+            .await;
         }
         DeliveryAction::Resolve => {
             info!(
@@ -111,11 +120,220 @@ pub async fn run_config_declaration_check(
                 "{}",
                 config_sections::describe_delivery(&source, &first)
             );
-            set_row(&store, &notifier, metrics.as_ref(), false, &source, "").await;
+            set_row(
+                &store,
+                &notifier,
+                metrics.as_ref(),
+                CONFIG_DECLARATION_RULE,
+                false,
+                &source,
+                "",
+            )
+            .await;
         }
         DeliveryAction::Silent(reason) => {
             info!(source = %source, "config declaration check concluded nothing: {reason}");
         }
+    }
+}
+
+/// Rule name for the loaded-rule-set self-alert. Like
+/// [`CONFIG_DECLARATION_RULE`] it stays out of the configured set: the row says
+/// the configured set in this process is not the one on disk, so a rule inside
+/// that set cannot be the one raising or resolving it.
+pub const RULES_NOT_LOADED_RULE: &str = "config_rules_not_loaded";
+
+/// What the rule set on disk and the rule set in this process say to each other.
+///
+/// The two are different readings of the same configuration: the document is
+/// re-read from the file on every check, the rules were read once when the
+/// plugin started. The observability section is `RestartRequired`, so a
+/// ConfigMap replaced under a running process changes one reading and not the
+/// other, and nothing else in the process notices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadedRuleSet {
+    /// Neither side could be read. Nothing is concluded and no row is touched.
+    Unknown(String),
+    /// The process holds exactly the names the document declares.
+    Agree,
+    /// The document declares names this process did not load, or still
+    /// declares names it no longer has.
+    Differs {
+        /// Declared on disk, absent from this process: a delivered rule that is
+        /// inert until the deployment rolls.
+        not_loaded: Vec<String>,
+        /// Held by this process, no longer declared: a rule still evaluated
+        /// after the document dropped it.
+        still_loaded: Vec<String>,
+        /// How many rules the document declares, for the message.
+        declared: usize,
+    },
+}
+
+/// Compare the names this process loaded with the ones the document declares.
+pub fn judge_loaded_rule_set(loaded: &[String], document: Option<&str>) -> LoadedRuleSet {
+    let Some(text) = document else {
+        return LoadedRuleSet::Unknown("no document at the configured path".into());
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(text) {
+        Ok(value) => value,
+        Err(e) => return LoadedRuleSet::Unknown(format!("document did not parse: {e}")),
+    };
+    let Some(rules) = parsed
+        .pointer("/observability/infra_watch/rules")
+        .and_then(|rules| rules.as_array())
+    else {
+        return LoadedRuleSet::Unknown("document declares no rule array".into());
+    };
+    let declared: Vec<&str> = rules
+        .iter()
+        .filter_map(|rule| rule.get("name").and_then(|name| name.as_str()))
+        .collect();
+    let loaded_set: std::collections::HashSet<&str> =
+        loaded.iter().map(std::string::String::as_str).collect();
+    let declared_set: std::collections::HashSet<&str> = declared.iter().copied().collect();
+    let mut not_loaded: Vec<String> = declared_set
+        .difference(&loaded_set)
+        .map(|name| (*name).to_string())
+        .collect();
+    let mut still_loaded: Vec<String> = loaded_set
+        .difference(&declared_set)
+        .map(|name| (*name).to_string())
+        .collect();
+    not_loaded.sort();
+    still_loaded.sort();
+    if not_loaded.is_empty() && still_loaded.is_empty() {
+        LoadedRuleSet::Agree
+    } else {
+        LoadedRuleSet::Differs {
+            not_loaded,
+            still_loaded,
+            declared: declared.len(),
+        }
+    }
+}
+
+/// What one check does to the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleSetAction {
+    Fire(String),
+    Resolve,
+    Nothing,
+}
+
+/// Streak carried between checks: one tick of disagreement is the document
+/// landing under a rollout that is already on its way, which needs no row.
+#[derive(Debug, Default)]
+pub struct LoadedRuleSetWatch {
+    disagreeing: u32,
+    firing: bool,
+}
+
+/// Fold one verdict into the streak and decide what to do about the row.
+pub fn rule_set_action(verdict: &LoadedRuleSet, watch: &mut LoadedRuleSetWatch) -> RuleSetAction {
+    match verdict {
+        // A read that failed is not a reading that says the sets agree: leave
+        // the row where it is and say why nothing was concluded.
+        LoadedRuleSet::Unknown(_) => RuleSetAction::Nothing,
+        LoadedRuleSet::Agree => {
+            watch.disagreeing = 0;
+            if watch.firing {
+                watch.firing = false;
+                RuleSetAction::Resolve
+            } else {
+                RuleSetAction::Nothing
+            }
+        }
+        LoadedRuleSet::Differs {
+            not_loaded,
+            still_loaded,
+            declared,
+        } => {
+            watch.disagreeing = watch.disagreeing.saturating_add(1);
+            if watch.firing || watch.disagreeing < 2 {
+                RuleSetAction::Nothing
+            } else {
+                watch.firing = true;
+                let mut message = format!(
+                    "this process loaded a rule set the configuration document does not describe: \
+                     the document declares {declared} rule(s)"
+                );
+                if !not_loaded.is_empty() {
+                    message.push_str(&format!(
+                        "; {} declared there {} not loaded ({}), so {} inert until the deployment rolls",
+                        not_loaded.len(),
+                        if not_loaded.len() == 1 { "is" } else { "are" },
+                        not_loaded.join(", "),
+                        if not_loaded.len() == 1 { "it is" } else { "they are" },
+                    ));
+                }
+                if !still_loaded.is_empty() {
+                    message.push_str(&format!(
+                        "; {} loaded here {} no longer declared ({}), still being evaluated",
+                        still_loaded.len(),
+                        if still_loaded.len() == 1 { "is" } else { "are" },
+                        still_loaded.join(", "),
+                    ));
+                }
+                message.push_str(
+                    ". The observability section is read once at startup, so replacing the \
+                     document does not load what it declares: the deployment has to roll",
+                );
+                RuleSetAction::Fire(message)
+            }
+        }
+    }
+}
+
+/// Re-read the document and compare its rule set with the one this process
+/// holds. Called once per watcher tick.
+pub async fn check_loaded_rule_set(
+    watch: &mut LoadedRuleSetWatch,
+    loaded: &[String],
+    store: &Option<Arc<PostgresAlertStore>>,
+    notifier: &Option<Arc<AlertManager>>,
+    metrics: Option<&Arc<dyn cog_core::MetricsBackend>>,
+) {
+    let path = crate::config::config_path();
+    let source = path.display().to_string();
+    let document = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            // An unreadable document is not an empty one; the row stays as it
+            // was and the reason is logged.
+            info!(source = %source, error = %e, "loaded rule set check read nothing");
+            return;
+        }
+    };
+    match rule_set_action(&judge_loaded_rule_set(loaded, document.as_deref()), watch) {
+        RuleSetAction::Fire(message) => {
+            warn!(source = %source, "{}", message);
+            set_row(
+                store,
+                notifier,
+                metrics,
+                RULES_NOT_LOADED_RULE,
+                true,
+                &source,
+                &message,
+            )
+            .await;
+        }
+        RuleSetAction::Resolve => {
+            info!(source = %source, "the loaded rule set matches the document again");
+            set_row(
+                store,
+                notifier,
+                metrics,
+                RULES_NOT_LOADED_RULE,
+                false,
+                &source,
+                "",
+            )
+            .await;
+        }
+        RuleSetAction::Nothing => {}
     }
 }
 
@@ -141,6 +359,7 @@ async fn set_row(
     store: &Option<Arc<PostgresAlertStore>>,
     notifier: &Option<Arc<AlertManager>>,
     metrics: Option<&Arc<dyn cog_core::MetricsBackend>>,
+    rule: &str,
     firing: bool,
     source: &str,
     message: &str,
@@ -149,8 +368,8 @@ async fn set_row(
         return;
     };
     let alert = NewAlert {
-        rule: CONFIG_DECLARATION_RULE.to_string(),
-        dedup_key: format!("{CONFIG_DECLARATION_RULE}:{source}"),
+        rule: rule.to_string(),
+        dedup_key: format!("{rule}:{source}"),
         severity: if firing { "warning" } else { "info" }.to_string(),
         message: message.to_string(),
         labels: serde_json::json!({ "source": source }),
@@ -166,7 +385,7 @@ async fn set_row(
                     ("message".to_string(), message.to_string()),
                 ]);
                 let events = [AlertEvent::Firing(AlertInstance {
-                    rule_name: CONFIG_DECLARATION_RULE.to_string(),
+                    rule_name: rule.to_string(),
                     labels,
                     state: AlertState::Firing,
                     severity: cog_core::AlertSeverity::Warning,
@@ -300,11 +519,13 @@ mod tests {
             .filter_map(|rule| rule.get("name").and_then(|n| n.as_str()))
             .map(str::to_string)
             .collect();
-        assert!(
-            !names.iter().any(|n| n == CONFIG_DECLARATION_RULE),
-            "{CONFIG_DECLARATION_RULE} is a configured rule: {}",
-            names.join(", ")
-        );
+        for self_alert in [CONFIG_DECLARATION_RULE, RULES_NOT_LOADED_RULE] {
+            assert!(
+                !names.iter().any(|n| n == self_alert),
+                "{self_alert} is a configured rule: {}",
+                names.join(", ")
+            );
+        }
     }
 
     /// The check judges the file it is pointed at, and tells a missing file
@@ -390,5 +611,102 @@ mod tests {
         let section = declared.get("observability").cloned().unwrap_or_default();
         serde_json::from_value::<crate::config::ObservabilityExportersConfig>(section)
             .expect("the declared observability section loads");
+    }
+
+    fn loaded(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    fn document(names: &[&str]) -> String {
+        serde_json::json!({
+            "observability": { "infra_watch": { "rules": names
+                .iter()
+                .map(|name| serde_json::json!({ "name": name }))
+                .collect::<Vec<_>>() } }
+        })
+        .to_string()
+    }
+
+    /// The ordinary case: the process holds what the document declares.
+    #[test]
+    fn a_process_on_the_documents_rule_set_raises_nothing() {
+        let verdict = judge_loaded_rule_set(&loaded(&["a", "b"]), Some(&document(&["a", "b"])));
+        assert_eq!(verdict, LoadedRuleSet::Agree);
+        let mut watch = LoadedRuleSetWatch::default();
+        assert_eq!(
+            rule_set_action(&verdict, &mut watch),
+            RuleSetAction::Nothing
+        );
+    }
+
+    /// The document was replaced under a running process: the names it added
+    /// are inert, and the row says which ones.
+    #[test]
+    fn a_rule_delivered_to_a_running_process_is_reported_by_name() {
+        let verdict = judge_loaded_rule_set(&loaded(&["a"]), Some(&document(&["a", "b"])));
+        let mut watch = LoadedRuleSetWatch::default();
+        // One tick is the document landing under a roll that is already on its
+        // way.
+        assert_eq!(
+            rule_set_action(&verdict, &mut watch),
+            RuleSetAction::Nothing
+        );
+        match rule_set_action(&verdict, &mut watch) {
+            RuleSetAction::Fire(message) => {
+                assert!(message.contains("b"), "{message}");
+                assert!(!message.contains("(a)"), "{message}");
+            }
+            other => panic!("expected a row, got {other:?}"),
+        }
+        // Stays firing across further disagreeing ticks without re-raising.
+        assert_eq!(
+            rule_set_action(&verdict, &mut watch),
+            RuleSetAction::Nothing
+        );
+    }
+
+    /// A rule the document dropped is still being evaluated here, which is the
+    /// same divergence from the other side.
+    #[test]
+    fn a_rule_still_evaluated_after_the_document_dropped_it_is_reported() {
+        let verdict = judge_loaded_rule_set(&loaded(&["a", "b"]), Some(&document(&["a"])));
+        let mut watch = LoadedRuleSetWatch::default();
+        assert_eq!(
+            rule_set_action(&verdict, &mut watch),
+            RuleSetAction::Nothing
+        );
+        match rule_set_action(&verdict, &mut watch) {
+            RuleSetAction::Fire(message) => assert!(message.contains("b"), "{message}"),
+            other => panic!("expected a row, got {other:?}"),
+        }
+    }
+
+    /// The row closes when the two readings agree again (the deployment rolled).
+    #[test]
+    fn the_row_closes_when_the_process_catches_up() {
+        let differs = judge_loaded_rule_set(&loaded(&["a"]), Some(&document(&["a", "b"])));
+        let mut watch = LoadedRuleSetWatch::default();
+        rule_set_action(&differs, &mut watch);
+        rule_set_action(&differs, &mut watch);
+        let agrees = judge_loaded_rule_set(&loaded(&["a", "b"]), Some(&document(&["a", "b"])));
+        assert_eq!(rule_set_action(&agrees, &mut watch), RuleSetAction::Resolve);
+        assert_eq!(rule_set_action(&agrees, &mut watch), RuleSetAction::Nothing);
+    }
+
+    /// A document that cannot be read is not a document that agrees: an open
+    /// row is left alone rather than closed by a failed read.
+    #[test]
+    fn an_unreadable_document_does_not_close_an_open_row() {
+        let differs = judge_loaded_rule_set(&loaded(&["a"]), Some(&document(&["a", "b"])));
+        let mut watch = LoadedRuleSetWatch::default();
+        rule_set_action(&differs, &mut watch);
+        rule_set_action(&differs, &mut watch);
+        let unknown = judge_loaded_rule_set(&loaded(&["a"]), None);
+        assert!(matches!(unknown, LoadedRuleSet::Unknown(_)));
+        assert_eq!(
+            rule_set_action(&unknown, &mut watch),
+            RuleSetAction::Nothing
+        );
+        assert!(watch.firing);
     }
 }

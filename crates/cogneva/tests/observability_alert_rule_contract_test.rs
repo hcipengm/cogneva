@@ -2502,6 +2502,7 @@ fn the_watchers_own_rule_names_are_not_configured_rule_names() {
     let own = [
         cog_observability::infra_watch::EVAL_FAILURE_RULE,
         cog_observability::config_delivery::CONFIG_DECLARATION_RULE,
+        cog_observability::config_delivery::RULES_NOT_LOADED_RULE,
         cog_reflection::observability_stack::STACK_NOT_CONVERGED_RULE,
         cog_reflection::CANARY_GATE_BLIND_RULE,
     ];

@@ -128,6 +128,13 @@ pub async fn run_infra_watch_loop(
                 // 问一次 store——空名单不是"还没跑"，是"跑完了，没有要结算的"。
                 let mut retired = config.retired_rules.is_empty();
 
+                // The rule set this process holds, read once at startup. The
+                // document on disk can be replaced at any time and this loop
+                // is the only place that can compare the two.
+                let loaded_rule_names: Vec<String> =
+                    config.rules.iter().map(|rule| rule.name.clone()).collect();
+                let mut rule_set_watch = crate::config_delivery::LoadedRuleSetWatch::default();
+
                 let mut ticker = tokio::time::interval(interval);
                 loop {
                     // Stamped once per cycle, on every cycle: a rule set that found
@@ -150,6 +157,14 @@ pub async fn run_infra_watch_loop(
                                 retired = retire_rules(&config, &outlets).await;
                             }
                             tick(&config, &outlets, &http, &mut known_firing, &mut eval_failure_firing, &mut failure_streaks).await;
+                            crate::config_delivery::check_loaded_rule_set(
+                                &mut rule_set_watch,
+                                &loaded_rule_names,
+                                &outlets.store,
+                                &outlets.notifier,
+                                outlets.metrics.as_ref(),
+                            )
+                            .await;
                         }
                     }
                 }
