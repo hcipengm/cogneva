@@ -432,14 +432,43 @@ fn binding_of(
     }
 }
 
+/// Whether this row is injected as it was submitted, and so can carry a
+/// binding through to the graph.
+///
+/// Only a verified `intent_kind=task` row is. A goal's rows, and an unverified
+/// task's rows, are hints to the planner; the rows that run are the planner's,
+/// and they know nothing about a face the submitter named.
+fn binding_carrier(item: &TaskItem, intent_kind: IntentKind) -> bool {
+    intent_kind == IntentKind::Task && item.planner.as_ref().is_some_and(|claim| claim.verified)
+}
+
 /// Check every row that names a face or a unit against the roster, and fill in
 /// the owner a face-bound row would otherwise be queued without.
-async fn resolve_bindings(state: &GatewayState, items: &mut [TaskItem]) -> Result<(), ApiError> {
+///
+/// A binding is accepted only on a row that will be injected as submitted.
+/// Every other row is a hint to the planner and comes back as a different
+/// row, so a face and owner written on it would be dropped without a word --
+/// the caller would believe it bound work to a face that never received any.
+async fn resolve_bindings(
+    state: &GatewayState,
+    items: &mut [TaskItem],
+    intent_kind: IntentKind,
+) -> Result<(), ApiError> {
     if !items
         .iter()
         .any(|item| item.face_id.is_some() || item.unit_id.is_some())
     {
         return Ok(());
+    }
+    for item in items.iter() {
+        if !binding_carrier(item, intent_kind) {
+            return Err(ApiError::bad_request(format!(
+                "task {} names a face or a unit, but a row that goes through planning is \
+                 replaced by what the planner returns; submit it as intent_kind=task with \
+                 planner.verified, or leave the binding off",
+                item.id
+            )));
+        }
     }
     let store = state.governance_store.as_ref().ok_or_else(|| ApiError {
         error: "ServiceUnavailable".into(),
@@ -580,8 +609,9 @@ pub async fn create_task_handler(
     // reader to notice a mismatch, and its verdict would describe work that
     // already ran under the wrong owner.
     let mut req = req;
+    let intent_kind = req.intent_kind;
     if let Some(items) = req.tasks.as_mut() {
-        resolve_bindings(&state, items).await?;
+        resolve_bindings(&state, items, intent_kind).await?;
     }
 
     // 按任务配额执法（审计 3.6）：创建前经 5 级 HierarchyManager 检查。
@@ -1400,6 +1430,26 @@ mod tests {
             .contains("but no face"));
 
         assert_eq!(binding_of(&task_item("t6", None), None), Ok((None, None)));
+    }
+
+    /// 走规划的行会被规划器返回的东西替换，点在上面的面与 unit 一个字都到不了图。
+    /// 接受它等于让提交者以为绑好了，而那一行从来没有存在过——所以带绑定的行只收
+    /// 「按提交原样注入」的那一种形状。
+    #[test]
+    fn a_binding_is_refused_on_a_row_the_planner_will_replace() {
+        let mut bound = task_item("t1", Some(true));
+        bound.face_id = Some("task-management".into());
+        assert!(binding_carrier(&bound, IntentKind::Task));
+        assert!(
+            !binding_carrier(&bound, IntentKind::Goal),
+            "a goal's rows are hints; the planner's rows carry no binding"
+        );
+
+        let unverified = task_item("t2", None);
+        assert!(
+            !binding_carrier(&unverified, IntentKind::Task),
+            "an unverified task still goes through planning"
+        );
     }
 
     /// 绑定过的字段要真的落到行上；否则校验通过、提交成功，而任务图里仍是一张没有
