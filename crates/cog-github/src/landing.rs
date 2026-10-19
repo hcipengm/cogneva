@@ -1889,7 +1889,13 @@ async fn redrive(
 /// in half and, worse, threw the rest away: what a subject shortened never
 /// reached the body, so it was gone from the commit. The subject is now a view
 /// of the goal, not a copy of it -- the body carries the goal in full.
-const SUBJECT_LIMIT: usize = 72;
+///
+/// The number leaves room for a title written to the producer's budget under
+/// the longest header this crate can write -- `build(cog-observability): ` is
+/// 25 characters, plus the 50 a goal's first line may occupy. A shorter cap
+/// would clip titles that followed the convention, which reads as the
+/// convention not being honoured.
+const SUBJECT_LIMIT: usize = 76;
 
 /// Commit message for a landed change: what it does, why, and the trailer the
 /// landing idempotency check reads.
@@ -3406,6 +3412,20 @@ mod tests {
             "fix(cog-github): Fix the CI failure in the landing job"
         );
         assert!(!subject_of(&msg).ends_with('…'));
+    }
+
+    /// The convention's budget has to survive the widest header the landing
+    /// writes, or a producer that obeyed it would still be shortened -- and
+    /// the shortening would read as the producer's mistake.
+    #[test]
+    fn a_title_written_to_the_convention_survives_the_longest_header() {
+        // A 48-character title, at a word boundary, as a producer would write
+        // it. The widest type and scope the landing can choose add 25.
+        let title = "Keep every sentence in a title inside the budget";
+        assert!(title.chars().count() <= 50);
+        let subject = commit_subject("build", "cog-observability", title);
+        assert_eq!(subject, format!("build(cog-observability): {title}"));
+        assert!(!subject.ends_with('…'));
     }
 
     /// The acceptance in the ticket: consecutive landings have to be
