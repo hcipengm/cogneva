@@ -1013,4 +1013,164 @@ mod tests {
         ]))
         .is_err());
     }
+
+    /// The rows a backfill writes, with no database behind them. What is under
+    /// test is the reading of the reply files and the shape of the rows, not
+    /// the SQL that carries them there.
+    struct MemoryStore {
+        rows: std::sync::Mutex<Vec<cog_core::Task>>,
+    }
+
+    impl MemoryStore {
+        fn new() -> Self {
+            Self {
+                rows: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn of_type(&self, task_type: &str) -> Vec<cog_core::Task> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|task| task.task_type == cog_core::TaskType::Custom(task_type.into()))
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::GovernanceStore for MemoryStore {
+        async fn face_nodes(&self) -> cog_core::SFResult<Vec<cog_core::Task>> {
+            Ok(Vec::new())
+        }
+
+        async fn open_face_bound_tasks(&self) -> cog_core::SFResult<Vec<cog_core::Task>> {
+            Ok(Vec::new())
+        }
+
+        async fn save_face_node(&self, _task: &cog_core::Task) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn save_face_node_if_revision(
+            &self,
+            _task: &cog_core::Task,
+            _expected: i64,
+        ) -> cog_core::SFResult<bool> {
+            Ok(false)
+        }
+
+        async fn governance_nodes(
+            &self,
+            task_type: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::Task>> {
+            Ok(self.of_type(task_type))
+        }
+
+        async fn save_governance_node(&self, task: &cog_core::Task) -> cog_core::SFResult<()> {
+            let mut rows = self.rows.lock().unwrap();
+            match rows.iter_mut().find(|row| row.id == task.id) {
+                Some(row) => *row = task.clone(),
+                None => rows.push(task.clone()),
+            }
+            Ok(())
+        }
+
+        async fn save_governance_node_if_status(
+            &self,
+            task: &cog_core::Task,
+            expected: &[cog_core::TaskStatus],
+        ) -> cog_core::SFResult<bool> {
+            let mut rows = self.rows.lock().unwrap();
+            match rows.iter_mut().find(|row| row.id == task.id) {
+                Some(row) if expected.contains(&row.status) => {
+                    *row = task.clone();
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+
+        async fn apply_handover(
+            &self,
+            _handover: &cog_core::Task,
+            _face: &cog_core::Task,
+            _expected_revision: i64,
+        ) -> cog_core::SFResult<bool> {
+            Ok(false)
+        }
+    }
+
+    fn write_replies(dir: &std::path::Path, pairs: &[(&str, &str)]) {
+        for (unit, option) in pairs {
+            std::fs::write(
+                dir.join(format!("{unit}-vote.md")),
+                format!("vote: {option}\nthe reasons, which the ledger does not count\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backfill_reads_the_reply_files_and_a_rerun_writes_the_same_row_once() {
+        let dir = tempfile::tempdir().unwrap();
+        write_replies(
+            dir.path(),
+            &[("a", "operator"), ("b", "8e"), ("c", "operator")],
+        );
+        let act = Act::VoteBackfill {
+            replies: dir.path().to_string_lossy().into_owned(),
+            subject: "who approves writes".into(),
+            kind: "who-approves-writes".into(),
+            options: vec!["operator".into(), "8e".into(), "6e".into()],
+            status_quo: "operator".into(),
+            deadline: DateTime::parse_from_rfc3339("2026-10-19T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        run(act.clone(), &store, now).await.unwrap();
+
+        let decisions = store.of_type(DECISION_TASK_TYPE);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0].id,
+            "decision:who-approves-writes:backfill:20261019T120000Z"
+        );
+        let decision = Decision::from_task(&decisions[0]).unwrap();
+        assert_eq!(decision.spec.result_option.as_deref(), Some("operator"));
+        assert_eq!(decision.spec.provenance.as_deref(), Some("backfilled"));
+
+        let votes = store.of_type(VOTE_TASK_TYPE);
+        assert_eq!(votes.len(), 3);
+        let units: Vec<&str> = votes
+            .iter()
+            .filter_map(|vote| vote.owner_unit.as_deref())
+            .collect();
+        assert_eq!(units, vec!["a", "b", "c"]);
+
+        run(act, &store, now).await.unwrap();
+        assert_eq!(store.of_type(DECISION_TASK_TYPE).len(), 1);
+        assert_eq!(store.of_type(VOTE_TASK_TYPE).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_backfill_refuses_a_file_with_no_vote_line_instead_of_guessing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a-vote.md"), "I have not decided yet\n").unwrap();
+        let act = Act::VoteBackfill {
+            replies: dir.path().to_string_lossy().into_owned(),
+            subject: "s".into(),
+            kind: "k".into(),
+            options: vec!["operator".into(), "8e".into()],
+            status_quo: "operator".into(),
+            deadline: Utc::now(),
+        };
+        let store = MemoryStore::new();
+        let error = run(act, &store, Utc::now()).await.unwrap_err();
+        assert!(error.to_string().contains("vote:"), "{error}");
+        assert!(store.of_type(DECISION_TASK_TYPE).is_empty());
+    }
 }
