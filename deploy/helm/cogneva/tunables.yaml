@@ -233,6 +233,30 @@ rows:
     source: override
     why: >-
       A textfile collector beside redis; the footprint is the process plus the file it serves, and no reading moves it.
+  - key: backends.redis.infoExporter.intervalSeconds
+    source: override
+    why: >-
+      A scraped reading only has to be newer than the scrape interval to be a
+      reading at all: 30 s matches the PodMonitor's interval, so the poller is
+      never the reason two scrapes carry the same sample. The value is published
+      as cogneva_redis_info_interval_seconds, so the staleness rule derives its
+      bound from it instead of holding a second copy that can drift.
+  - key: backends.redis.infoExporter.resources.requests.cpu
+    source: override
+    why: >-
+      A scheduling claim, not a measured draw: one redis-cli call every 30 s sits far below it and nothing reads a figure back into it.
+  - key: backends.redis.infoExporter.resources.requests.memory
+    source: override
+    why: >-
+      Small enough that a tight node still schedules the poller; the footprint is the shell plus one redis-cli process, and the limit carries it.
+  - key: backends.redis.infoExporter.resources.limits.cpu
+    source: override
+    why: >-
+      A burst bound for the poll loop; no measurement of that burst feeds back into it.
+  - key: backends.redis.infoExporter.resources.limits.memory
+    source: override
+    why: >-
+      The poller's whole working set is the INFO reply it parses; no reading moves this bound.
   - key: backends.seaweedfs.resources.requests.cpu
     source: override
     why: >-

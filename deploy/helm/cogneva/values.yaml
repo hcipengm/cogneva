@@ -803,6 +803,19 @@ backends:
         limits:
           cpu: 100m
           memory: 64Mi
+    # Polls INFO from beside the store and writes it into the textfile directory
+    # the exporter above serves. The interval is published with the reading, so
+    # the staleness bound is derived from the period the writer actually runs at
+    # rather than from a constant written next to the alert rule.
+    infoExporter:
+      intervalSeconds: 30
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
   qdrant:
     enabled: true
     image: qdrant/qdrant:v1.13.4

@@ -301,9 +301,39 @@ impl WalBackend for MemoryWalBackend {
     }
 }
 
+/// How many records one session's log may keep before the oldest are dropped.
+///
+/// The store has no other bound: `wal:{id}` is appended to for as long as an
+/// agent lives and is never deleted, so without a cap the list grows with the
+/// agent's lifetime. Measured 2026-10-19 on the live deployment: 3,592 session
+/// logs holding 1,549,847 records (733 MB against a 2 GiB container limit whose
+/// `maxmemory` is 0), with a distribution of p50=28, p90=135, p95=2,637,
+/// p99=9,145, max=35,389 records. The tail is what carries the bytes.
+///
+/// 5,000 sits above p95, so a log that is behaving like the population is never
+/// touched, while the 1% of logs past 9,000 records are cut back to about 2.4 MB
+/// each (records average 473 B). Trimming on this bound removes 28% of the
+/// records held today.
+///
+/// What it costs: a replay whose checkpoint offset predates the retained head
+/// loses the events before it. That is a stated bound rather than a silent one
+/// — `read_since` reports the gap when the requested sequence is older than the
+/// oldest record still held. Raising this number keeps more history; lowering
+/// it trades history for memory. Neither choice removes the logs themselves;
+/// that is the retirement path, which is a separate change.
+pub const WAL_MAX_ENTRIES_PER_SESSION: usize = 5_000;
+
 /// Redis-based WAL backend.
 /// Uses Redis Lists for ordered storage of WAL records per session.
 /// Each session maps to a Redis List key: `wal:{session_id}`.
+///
+/// The sequence number is the record's own `seq` field, not its position in the
+/// list. The two agreed only while nothing was ever removed from the head; the
+/// moment a trim runs they part ways, and a reader that counts positions would
+/// then replay from the wrong record — or, once `next_seq` regressed to the new
+/// length, hand out numbers that are already in use. Every read below filters
+/// on the field for that reason, and `next_seq` asks the newest record rather
+/// than the list.
 #[derive(Clone)]
 pub struct RedisWalBackend {
     client: redis::aio::ConnectionManager,
@@ -374,23 +404,21 @@ impl WalBackend for RedisWalBackend {
             .await
             .map_err(|e| WalError::Backend(format!("Redis RPUSH failed: {}", e)))?;
 
-        // Auto-trim if max_entries is configured
+        // Auto-trim if max_entries is configured. One command, not LLEN then
+        // LTRIM: Redis clamps a start before the head, so a list shorter than
+        // the cap is left untouched by `LTRIM -max -1` and the common case
+        // costs no extra round trip. A cap of zero is read as one — a log that
+        // keeps nothing cannot be replayed at all, and silently emptying the
+        // list is a worse answer than keeping the newest record.
         if let Some(max) = self.max_entries {
-            let len: usize = redis::cmd("LLEN")
+            let keep = max.max(1) as isize;
+            redis::cmd("LTRIM")
                 .arg(&key)
-                .query_async::<usize>(&mut conn)
+                .arg(-keep)
+                .arg(-1)
+                .query_async::<()>(&mut conn)
                 .await
-                .map_err(|e| WalError::Backend(format!("Redis LLEN failed: {}", e)))?;
-            if len > max {
-                let trim_start = len - max;
-                redis::cmd("LTRIM")
-                    .arg(&key)
-                    .arg(trim_start as isize)
-                    .arg(-1)
-                    .query_async::<()>(&mut conn)
-                    .await
-                    .map_err(|e| WalError::Backend(format!("Redis LTRIM failed: {}", e)))?;
-            }
+                .map_err(|e| WalError::Backend(format!("Redis LTRIM failed: {}", e)))?;
         }
 
         Ok(record.seq)
@@ -408,11 +436,26 @@ impl WalBackend for RedisWalBackend {
             .map_err(|e| WalError::Backend(format!("Redis LRANGE failed: {}", e)))?;
 
         let mut records = Vec::new();
-        for (idx, line) in items.into_iter().enumerate() {
+        for line in items {
             let record = WalRecord::decode_from_json_line(&line)?;
-            // seq 对应 list index，从 0 开始
-            if idx as u64 >= seq {
+            // The record's own sequence, not the list position: after a trim
+            // the two differ by however many records were dropped, and reading
+            // positions here would silently skip that many records ahead.
+            if record.seq >= seq {
                 records.push(record);
+            }
+        }
+        // A caller resuming from a sequence the log no longer holds has lost
+        // the records between its offset and the retained head. Saying so is
+        // the difference between a bounded gap and a silent one.
+        if let Some(first) = records.first() {
+            if first.seq > seq {
+                tracing::warn!(
+                    session_id,
+                    requested_seq = seq,
+                    retained_from_seq = first.seq,
+                    "WAL records before the retained head were trimmed; the replay starts later than asked"
+                );
             }
         }
         Ok(records)
@@ -443,26 +486,65 @@ impl WalBackend for RedisWalBackend {
     async fn truncate_before(&self, session_id: &str, seq: u64) -> Result<(), WalError> {
         let key = Self::key(session_id);
         let mut conn = self.client.clone();
-        // LTRIM keeps elements from start to stop (inclusive)
-        // We want to keep elements from seq onwards, so start = seq, stop = -1
-        redis::cmd("LTRIM")
+        // The cut point is the first record whose own sequence reaches `seq`,
+        // which is not `seq` itself unless nothing was ever trimmed. Finding it
+        // costs one full read; the alternative — treating the sequence as an
+        // index — keeps the oldest records of a trimmed log forever, because
+        // the index they sit at is below the number the caller asked to keep.
+        let items: Vec<String> = redis::cmd("LRANGE")
             .arg(&key)
-            .arg(seq as isize)
+            .arg(0)
             .arg(-1)
-            .query_async::<()>(&mut conn)
+            .query_async::<Vec<String>>(&mut conn)
             .await
-            .map_err(|e| WalError::Backend(format!("Redis LTRIM failed: {}", e)))?;
+            .map_err(|e| WalError::Backend(format!("Redis LRANGE failed: {}", e)))?;
+        let mut cut = None;
+        for (idx, line) in items.iter().enumerate() {
+            if WalRecord::decode_from_json_line(line)?.seq >= seq {
+                cut = Some(idx as isize);
+                break;
+            }
+        }
+        match cut {
+            // LTRIM keeps elements from start to stop (inclusive).
+            Some(start) => {
+                redis::cmd("LTRIM")
+                    .arg(&key)
+                    .arg(start)
+                    .arg(-1)
+                    .query_async::<()>(&mut conn)
+                    .await
+                    .map_err(|e| WalError::Backend(format!("Redis LTRIM failed: {}", e)))?;
+            }
+            // Every record held is older than the cut: the caller asked to keep
+            // nothing, so the key goes rather than staying behind empty.
+            None => {
+                redis::cmd("DEL")
+                    .arg(&key)
+                    .query_async::<()>(&mut conn)
+                    .await
+                    .map_err(|e| WalError::Backend(format!("Redis DEL failed: {}", e)))?;
+            }
+        }
         Ok(())
     }
 
     async fn next_seq(&self, session_id: &str) -> Result<u64, WalError> {
         let key = Self::key(session_id);
         let mut conn = self.client.clone();
-        let len: usize = redis::cmd("LLEN")
+        // The newest record's own sequence plus one. The list length answered
+        // this only while nothing was trimmed; after one it would hand out
+        // numbers already written, and the two records would share a position
+        // that replay filters by.
+        let last: Option<String> = redis::cmd("LINDEX")
             .arg(&key)
-            .query_async::<usize>(&mut conn)
+            .arg(-1)
+            .query_async::<Option<String>>(&mut conn)
             .await
-            .map_err(|e| WalError::Backend(format!("Redis LLEN failed: {}", e)))?;
-        Ok(len as u64)
+            .map_err(|e| WalError::Backend(format!("Redis LINDEX failed: {}", e)))?;
+        match last {
+            Some(line) => Ok(WalRecord::decode_from_json_line(&line)?.seq + 1),
+            None => Ok(0),
+        }
     }
 }

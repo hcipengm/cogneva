@@ -103,6 +103,67 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+        # Publishes what redis knows about itself and Prometheus otherwise cannot
+        # see: memory in use against the container's own limit, connected
+        # clients, and the keyspace size. redis-server has no metrics endpoint,
+        # so the same textfile directory the AOF verdict already uses is the
+        # only path a reading from inside this Pod can take to a scraper.
+        #
+        # Why not the exporter's own memory series: cAdvisor's working set counts
+        # reclaimable page cache, which on a store holding a multi-gigabyte AOF
+        # sits near the limit on a healthy instance, so it cannot say whether the
+        # cgroup is about to be OOM-killed. `used_memory` is the number redis
+        # enforces `maxmemory` against, and `maxmemory=0` is why the limit has to
+        # be read from the workload's own resources rather than from the store.
+        #
+        # Written atomically and republished every interval: a reader that finds
+        # the file stale knows the writer died, which a file rewritten in place
+        # could not say. The update timestamp travels with the values so the
+        # staleness itself is a reading rather than an assumption.
+        - name: redis-info-exporter
+          image: {{ .Values.backends.redis.image }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: redis-password
+          # Lives as long as the Pod. redis-cli is in this image already, so the
+          # poller needs no second image and no client library.
+          command:
+            - sh
+            - -c
+            - |
+              report=/report/redis-info.prom
+              props=/report/.redis-info.props
+              interval={{ .Values.backends.redis.infoExporter.intervalSeconds }}
+              value() { sed -n "s/^$1://p" "$props" | head -n 1 | tr -d '\r'; }
+              while true; do
+                if redis-cli -h 127.0.0.1 -p 6379 -a "$REDIS_PASSWORD" --no-auth-warning INFO \
+                    > "$props" 2>/dev/null && grep -q '^used_memory:' "$props"; then
+                  now=$(date +%s)
+                  db0=$(value db0)
+                  keys=${db0#*keys=}
+                  keys=${keys%%,*}
+                  {
+                    printf '%s %s\n' "cogneva_redis_memory_used_bytes" "$(value used_memory)"
+                    printf '%s %s\n' "cogneva_redis_memory_peak_bytes" "$(value used_memory_peak)"
+                    printf '%s %s\n' "cogneva_redis_memory_max_bytes" "$(value maxmemory)"
+                    printf '%s %s\n' "cogneva_redis_connected_clients" "$(value connected_clients)"
+                    printf '%s %s\n' "cogneva_redis_maxclients" "$(value maxclients)"
+                    printf '%s{db="db0"} %s\n' "cogneva_redis_db_keys" "${keys:-0}"
+                    printf '%s %s\n' "cogneva_redis_info_interval_seconds" "$interval"
+                    printf '%s %s\n' "cogneva_redis_info_updated_timestamp_seconds" "$now"
+                  } > "$report.tmp" && mv "$report.tmp" "$report"
+                fi
+                sleep "$interval"
+              done
+          resources:
+{{ toYaml .Values.backends.redis.infoExporter.resources | indent 12 }}
+          volumeMounts:
+            - name: aof-report
+              mountPath: /report
         # Serves the verdict the init container wrote. redis-server exposes no
         # metrics endpoint, so a textfile collector beside it is the only way a
         # one-shot container's reading can reach a scraper; the file lives on an
@@ -129,8 +190,9 @@ spec:
       volumes:
         - name: aof-report
           emptyDir:
-            # The whole payload is one gauge per finding class, a few hundred
-            # bytes. The bound is here so a broken writer cannot grow it.
+            # The whole payload is a gauge per finding class plus one INFO
+            # snapshot, a few hundred bytes. The bound is here so a broken
+            # writer cannot grow it.
             sizeLimit: 1Mi
   volumeClaimTemplates:
     - metadata:

@@ -713,8 +713,12 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // dead-letter queue: the concrete backend lives in this crate and the
         // consumer speaks the `WalBackend` trait from `cog-core`. It shares the
         // connection opened above, like the queue and the registry below.
+        // The cap is the store's only bound on an agent's log: the key is
+        // appended to for the agent's whole life and nothing deletes it. The
+        // number and the trade it makes are stated on the constant.
         let wal_backend: Arc<dyn cog_core::WalBackend> = Arc::new(
-            crate::wal::RedisWalBackend::from_connection(redis_conn.clone()),
+            crate::wal::RedisWalBackend::from_connection(redis_conn.clone())
+                .with_max_entries(crate::wal::WAL_MAX_ENTRIES_PER_SESSION),
         );
         ctx.publish_service(wal_backend);
         info!("StoragePlugin WAL backend published");
