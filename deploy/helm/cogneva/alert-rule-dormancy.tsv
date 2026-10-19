@@ -58,8 +58,8 @@ KubeletServerCertificateExpiration	kubelet_certificate_manager_server_ttl_second
 KubeletServerCertificateRenewalErrors	kubelet_server_expiration_renew_errors	feature_off	Same certificate-manager gate: emitted only with server certificate rotation enabled.
 
 # --- collector_off (5 rules): node-exporter collectors not enabled ----------
-NodeBondingDegraded	node_bonding_active,node_bonding_slaves	collector_off	The node-exporter bond collector is not enabled; bond link degradation is unobserved.
-NodeRAIDDegraded	node_md_disks,node_md_disks_required	collector_off	The node-exporter mdadm collector is not enabled; RAID degradation is unobserved.
-NodeRAIDDiskFailure	node_md_disks	collector_off	The node-exporter mdadm collector is not enabled; a failed RAID member is unobserved.
-NodeSystemdServiceCrashlooping	node_systemd_service_restart_total	collector_off	The node-exporter systemd collector is not enabled; unit restart loops are unobserved.
-NodeSystemdServiceFailed	node_systemd_unit_state	collector_off	The node-exporter systemd collector is not enabled; a failed unit is unobserved.
+NodeBondingDegraded	node_bonding_active,node_bonding_slaves	object_absent	The bonding collector is enabled by default in node-exporter and this host runs it -- node_scrape_collector_success{collector="bonding"} reads 0 because the host has no /proc/net/bonding at all, not because the collector is off. No bond device exists, so the family is empty; it is exported as soon as a bond is created and the rule then reads it.
+NodeRAIDDegraded	node_md_disks,node_md_disks_required	object_absent	The mdadm collector is enabled by default and reads success=1 on this host; /proc/mdstat lists the personalities but no arrays, so the family is legitimately empty. Create an array and the series appear.
+NodeRAIDDiskFailure	node_md_disks	object_absent	Same collector and same reason as NodeRAIDDegraded: mdadm runs (success=1) and exports per-disk state once an array exists; this host has none.
+NodeSystemdServiceCrashlooping	node_systemd_service_restart_total	collector_off	The systemd collector is the one opt-in collector among the three: node_scrape_collector_success has no series for it at all, and enabling it needs --collector.systemd plus the host dbus socket mounted into the pod. Turning it on can make node-exporter fail to start, so it is a deployment decision, not a flip.
+NodeSystemdServiceFailed	node_systemd_unit_state	collector_off	Same opt-in collector as NodeSystemdServiceCrashlooping; absent from node_scrape_collector_success means it was never asked to run.
