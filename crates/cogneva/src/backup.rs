@@ -1452,6 +1452,38 @@ fn copy_offsite(dir: &Path, package: &Path, keep: usize) {
     );
 }
 
+/// 把保留窗口里缺的卷外副本补上，返回补成了几份。
+///
+/// 上面那份只复制「这一跑刚打出来的包」，于是写的那一刻没落成的那份以后就没有机会
+/// 补：盘满、卷外挂载不在、或者在复制打开之前就已经写下的包。演练的
+/// `offsite_missing_packages` 会在整个保留窗口里一直读到那个缺口，而窗口一过，源也没有
+/// 了——缺口就永久留在账上，只有人能去宿主上手工补。所以每一跑都顺手把缺口补掉：
+/// 判据与演练是同一个（按名字比窗口里的包），补的就是演练会数的那几份。
+///
+/// 从新往旧补：补到一半没空间时，落下的必须是最近的那几份。补没补成看落点，不看
+/// 返回值——`copy_offsite` 把失败写成日志而不改这一跑的结局，那份日志不该被这里
+/// 读成「补好了」。
+fn backfill_offsite(volume: &Path, dir: &Path, keep: usize) -> usize {
+    let present: std::collections::HashSet<std::ffi::OsString> = packages_in(dir)
+        .into_iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_os_string()))
+        .collect();
+    let mut copied = 0;
+    for package in packages_in(volume).into_iter().rev() {
+        let Some(name) = package.file_name().map(|n| n.to_os_string()) else {
+            continue;
+        };
+        if present.contains(&name) {
+            continue;
+        }
+        copy_offsite(dir, &package, keep);
+        if dir.join(&name).exists() {
+            copied += 1;
+        }
+    }
+    copied
+}
+
 /// 真正跑一次备份并收尾：导出、写清单、打包、清 staging、裁保留。
 async fn finish_backup(
     cfg: &BackupConfig,
@@ -1469,6 +1501,14 @@ async fn finish_backup(
             let deleted = enforce_retention(&cfg.backup_dir, cfg.keep_count);
             if let Some(dir) = &cfg.offsite_dir {
                 copy_offsite(dir, &package, cfg.keep_count);
+                let backfilled = backfill_offsite(&cfg.backup_dir, dir, cfg.keep_count);
+                if backfilled > 0 {
+                    tracing::info!(
+                        dir = %dir.display(),
+                        backfilled,
+                        "offsite backfill caught up on packages written before the copy existed"
+                    );
+                }
             }
             let (kept_after, oldest_kept_at) = retained_state(&cfg.backup_dir);
             tracing::info!(
@@ -3056,6 +3096,9 @@ fn replace_dir(staged: &Path, live: &Path) -> std::io::Result<()> {
 /// 会去数有几个。
 pub const DRILL_DATABASE: &str = "cog_drill";
 
+/// 演练互斥锁的键。取自 `cog_dril` 的 ASCII，只要求集群内不与人撞车，不承担含义。
+const DRILL_LOCK_KEY: i64 = 0x636f67_5f64_7269_6c;
+
 /// 演练配置。只要库、卷与迁移目录。
 ///
 /// 不复用 [`BackupConfig`]：它要求 qdrant 端点，而演练不碰向量与对象层——那两段
@@ -3462,6 +3505,28 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
     }
     drill.finished_at = Utc::now();
     drill
+}
+
+/// 同一时刻只许一场演练。临时库名是固定的（崩溃残留因此有确定的答案），代价是两场
+/// 同时开工时后一场会把前一场的库 `DROP DATABASE` 掉——2026-10-19 实测：17:27 起的那场
+/// 被 17:35 起的另一场杀掉，记成 failed，而它的失败与包无关。这个会话级咨询锁只回答
+/// 一件事：「此刻还有人在演练吗」。拿去问库，比在部署里约定「别同时跑」可靠。
+///
+/// 返回的连接必须活到这一跑结束：锁挂在会话上，会话结束锁才释放。用一条**池外**的
+/// 独立连接而不是池里借来的：池里的会话被归还后仍活着，锁会跟着它留给下一个借用者，
+/// 而这一跑的每一条提前返回（某一份包失败就停）都不该需要记得手动释放。
+async fn claim_drill_lock(database_url: &str) -> Result<Option<sqlx::PgConnection>, sqlx::Error> {
+    use sqlx::Connection as _;
+    let mut conn = sqlx::PgConnection::connect(database_url).await?;
+    let held: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(DRILL_LOCK_KEY)
+        .fetch_one(&mut conn)
+        .await?;
+    if held {
+        Ok(Some(conn))
+    } else {
+        Ok(None)
+    }
 }
 
 /// 口令与包的实际状态对不上时，演练不能判绿。
@@ -3967,6 +4032,19 @@ pub async fn run_drill_from_env() -> Result<(), Box<dyn std::error::Error>> {
     let live = PgPool::connect(&cfg.database_url).await?;
     let store = PostgresBackupRunStore::new(live.clone());
 
+    // 这一跑要开一到两份包，中间那块库是同一个固定名字。锁必须盖住**整个循环**，
+    // 不是每一趟：两趟之间松手的那几秒足够另一场演练插进来，把下一趟的库 DROP 掉，
+    // 然后这一跑记一条与包无关的失败。拿不到锁就整场跳过——另一场做的是同一件事，
+    // 重复的那一场不算失败，job 也不该因此变红。
+    let _held = match claim_drill_lock(&cfg.database_url).await {
+        Ok(Some(conn)) => conn,
+        Ok(None) => {
+            println!("另一场演练正占着临时库（会话咨询锁没取到），这一场跳过");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+
     // 先开最新那份，再开窗口里最久没被证明的那份。顺序是判定的一部分：任何一趟
     // 失败都立刻停，于是**最后一行的结论就是这一跑的结论**——若先跑旧包、后跑最新，
     // 旧包的失败会被随后一行的绿盖住，而读数读的正是最新那一行。
@@ -4139,6 +4217,28 @@ mod tests {
             .unwrap()
             .expect("包是密文、这一跑没口令，演练必须拒绝判绿");
         assert!(reason.contains("密文"), "reason={reason}");
+    }
+
+    #[tokio::test]
+    #[ignore = "需要真库：COGNEVA_TEST_DATABASE_URL"]
+    async fn two_drills_at_once_do_not_drop_each_others_database() {
+        // 这条问的是 2026-10-19 那场互杀：两场演练同用一个固定库名，后一场的
+        // DROP DATABASE 把前一场杀掉并判 failed。锁要在库里问，不能靠部署里约定。
+        let url = std::env::var("COGNEVA_TEST_DATABASE_URL").expect("COGNEVA_TEST_DATABASE_URL");
+        use sqlx::Connection as _;
+        let first = claim_drill_lock(&url)
+            .await
+            .unwrap()
+            .expect("第一场应当拿到锁");
+        assert!(
+            claim_drill_lock(&url).await.unwrap().is_none(),
+            "第二场必须被拒绝：拿到锁它就会 DROP 掉第一场正在恢复的那个库"
+        );
+        first.close().await.unwrap();
+        assert!(
+            claim_drill_lock(&url).await.unwrap().is_some(),
+            "第一场的会话关掉之后锁必须能再取到，否则一次崩溃会让演练永远开不了工"
+        );
     }
 
     #[test]
@@ -4631,6 +4731,49 @@ mod tests {
         assert!(!off
             .join("cogneva-backup-20261019T031700Z.tar.zst.partial")
             .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_written_before_the_copy_existed_is_copied_by_the_next_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let vol = root.path().join("vol");
+        let off = root.path().join("off");
+        std::fs::create_dir_all(&vol).unwrap();
+        std::fs::create_dir_all(&off).unwrap();
+        let names = [
+            "cogneva-backup-20261017T031701Z.tar.zst",
+            "cogneva-backup-20261018T031700Z.tar.zst",
+            "cogneva-backup-20261019T031700Z.tar.zst",
+        ];
+        for (i, name) in names.iter().enumerate() {
+            std::fs::write(vol.join(name), vec![i as u8; 16]).unwrap();
+        }
+        // 卷外复制是第三天才有的事：前两份写下时它还不存在，所以一直缺着。
+        std::fs::copy(vol.join(names[2]), off.join(names[2])).unwrap();
+        assert_eq!(
+            missing_from_window(&packages_in(&vol), &packages_in(&off)),
+            2
+        );
+
+        assert_eq!(backfill_offsite(&vol, &off, 7), 2);
+        // 判据就是演练那一列：补完必须回到 0，否则这条修法只是把同样的缺口留给下一晚。
+        assert_eq!(
+            missing_from_window(&packages_in(&vol), &packages_in(&off)),
+            0,
+            "补完之后 offsite_missing_packages 必须读作 0"
+        );
+        assert_eq!(std::fs::read(off.join(names[0])).unwrap(), vec![0u8; 16]);
+        let mode = std::fs::metadata(off.join(names[0]))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "补出来的这一份同样背着 Secret 清单");
+
+        // 第二晚没有缺口，不该再复制一遍。
+        assert_eq!(backfill_offsite(&vol, &off, 7), 0);
     }
 
     #[test]
