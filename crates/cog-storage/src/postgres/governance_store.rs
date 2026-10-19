@@ -246,6 +246,50 @@ impl GovernanceStore for PostgresGovernanceStore {
         Ok(result.rows_affected() == 1)
     }
 
+    async fn save_governance_node_with_event(
+        &self,
+        event: &Task,
+        node: &Task,
+        expected: &[TaskStatus],
+    ) -> SFResult<bool> {
+        let node_value = serde_json::to_value(node).map_err(SFError::Serialization)?;
+        let event_value = serde_json::to_value(event).map_err(SFError::Serialization)?;
+        let states: Vec<&str> = expected.iter().map(TaskStatus::as_str).collect();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(format!("governance close with event: {e}")))?;
+
+        let moved = sqlx::query(SAVE_GOVERNANCE_NODE_IF_STATUS_SQL)
+            .bind(GOVERNANCE_WORKSPACE)
+            .bind(&node.id)
+            .bind(node_value)
+            .bind(node.status.as_str())
+            .bind(&states)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SFError::Database(format!("governance close with event: {e}")))?;
+        if moved.rows_affected() != 1 {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+
+        sqlx::query(SAVE_GOVERNANCE_NODE_SQL)
+            .bind(GOVERNANCE_WORKSPACE)
+            .bind(&event.id)
+            .bind(event_value)
+            .bind(event.status.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SFError::Database(format!("governance close with event: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(format!("governance close with event: {e}")))?;
+        Ok(true)
+    }
+
     async fn apply_handover(
         &self,
         handover: &Task,

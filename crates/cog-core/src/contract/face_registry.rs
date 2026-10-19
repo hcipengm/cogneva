@@ -577,6 +577,20 @@ pub trait GovernanceStore: Send + Sync {
         expected: &[TaskStatus],
     ) -> SFResult<bool>;
 
+    /// Write one governance row and one event row in a single transaction.
+    ///
+    /// The event is what makes the move reconstructable, so the two are one
+    /// fact: written separately, the row can say it closed with no step in its
+    /// history explaining it, or a step can claim a close that lost its race to
+    /// another writer. Returns whether the row was written; when it was not in
+    /// one of `expected`, the event is not written either.
+    async fn save_governance_node_with_event(
+        &self,
+        event: &Task,
+        node: &Task,
+        expected: &[TaskStatus],
+    ) -> SFResult<bool>;
+
     /// Move a face's ownership, record the handover that did it, and move the
     /// work that has not started, atomically.
     ///

@@ -653,6 +653,46 @@ pub async fn append_decision_event(
     Ok(task)
 }
 
+/// Close a decision and append the step that closes it, as one write.
+///
+/// The row and its last event are one fact. Written one after the other, a
+/// reader can find the row closed with no step explaining it, or a step
+/// claiming a close that lost its race to another writer. The store writes
+/// both or neither; `false` says the row moved under the caller and nothing
+/// was written.
+///
+/// A history that does not verify is an error rather than `false`: no retry is
+/// safe until somebody reads the record, because the close would vouch for an
+/// edit.
+pub async fn close_decision_with_event(
+    store: &dyn crate::GovernanceStore,
+    decision_id: &str,
+    row: &Task,
+    expected: &[TaskStatus],
+    detail: Option<&str>,
+    now: DateTime<Utc>,
+) -> crate::SFResult<bool> {
+    let events = decision_events(store, decision_id).await?;
+    if let ChainVerdict::Broken { at_seq, reason } = verify_decision_events(&events) {
+        return Err(crate::SFError::Conflict(format!(
+            "decision {decision_id} has a broken history at seq {}: {reason}; closing it would \
+             vouch for it",
+            at_seq
+                .map(|seq| seq.to_string())
+                .unwrap_or_else(|| "?".into())
+        )));
+    }
+    let seq = events.last().map(|event| event.spec.seq + 1).unwrap_or(0);
+    let prev_hash = events
+        .last()
+        .map(|event| event.spec.hash.clone())
+        .unwrap_or_default();
+    let event = decision_event_task(decision_id, seq, "closed", None, detail, &prev_hash, now);
+    store
+        .save_governance_node_with_event(&event, row, expected)
+        .await
+}
+
 /// Read and verify one decision's chain.
 pub async fn verify_decision_chain(
     store: &dyn crate::GovernanceStore,

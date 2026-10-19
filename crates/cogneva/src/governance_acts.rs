@@ -21,9 +21,10 @@ use std::error::Error;
 use chrono::{DateTime, Utc};
 
 use cog_core::{
-    append_decision_event, verify_decision_chain, ChainVerdict, Decision, DecisionMode,
-    DecisionSpec, DecisionState, GovernanceStore, Handover, HandoverSpec, HandoverState, Signature,
-    TaskStatus, TieBreak, Vote, DECISION_TASK_TYPE, HANDOVER_TASK_TYPE, VOTE_TASK_TYPE,
+    append_decision_event, close_decision_with_event, verify_decision_chain, ChainVerdict,
+    Decision, DecisionMode, DecisionSpec, DecisionState, GovernanceStore, Handover, HandoverSpec,
+    HandoverState, Signature, TaskStatus, TieBreak, Vote, DECISION_TASK_TYPE, HANDOVER_TASK_TYPE,
+    VOTE_TASK_TYPE,
 };
 use cog_orchestrator::governance_acts::{
     backfill_ballot, close_ballot, decision_task, handover_task, tally, validate_ballot,
@@ -668,28 +669,22 @@ pub async fn run(
                 "voters": outcome.tally.voters,
             }));
             task.updated_at = now;
-            if !store
-                .save_governance_node_if_status(&task, &[expected])
+            // The verdict and the step that records it are one write: a row
+            // that reads closed with no step for it, or a step for a close
+            // that lost its race, would each be a history nobody can rebuild.
+            let detail = format!(
+                "{}: {}",
+                row.spec.state.as_str(),
+                row.spec
+                    .result_reason
+                    .clone()
+                    .unwrap_or_else(|| "no reason recorded".into())
+            );
+            if !close_decision_with_event(store, &decision, &task, &[expected], Some(&detail), now)
                 .await?
             {
                 return Err(format!("{decision} changed while it was being closed").into());
             }
-            append_decision_event(
-                store,
-                &decision,
-                "closed",
-                None,
-                Some(&format!(
-                    "{}: {}",
-                    row.spec.state.as_str(),
-                    row.spec
-                        .result_reason
-                        .clone()
-                        .unwrap_or_else(|| "no reason recorded".into())
-                )),
-                now,
-            )
-            .await?;
             println!(
                 "{}: {} — {}",
                 decision,
@@ -1251,6 +1246,27 @@ mod tests {
             }
         }
 
+        async fn save_governance_node_with_event(
+            &self,
+            event: &cog_core::Task,
+            node: &cog_core::Task,
+            expected: &[cog_core::TaskStatus],
+        ) -> cog_core::SFResult<bool> {
+            let mut rows = self.rows.lock().unwrap();
+            let Some(slot) = rows.iter_mut().find(|row| row.id == node.id) else {
+                return Ok(false);
+            };
+            if !expected.contains(&slot.status) {
+                return Ok(false);
+            }
+            *slot = node.clone();
+            match rows.iter_mut().find(|row| row.id == event.id) {
+                Some(entry) => *entry = event.clone(),
+                None => rows.push(event.clone()),
+            }
+            Ok(true)
+        }
+
         async fn apply_handover(
             &self,
             handover: &cog_core::Task,
@@ -1456,14 +1472,15 @@ mod tests {
 
         // The edit that matters is the one made in place: the event keeps its
         // position and its link, and only its words change.
-        let mut rows = store.rows.lock().unwrap();
-        let event = rows
-            .iter_mut()
-            .find(|row| row.id.ends_with(":000001"))
-            .expect("the second event");
-        event.input[cog_core::DECISION_EVENT_INPUT_KEY]["detail"] =
-            serde_json::json!("something that was never said");
-        drop(rows);
+        {
+            let mut rows = store.rows.lock().unwrap();
+            let event = rows
+                .iter_mut()
+                .find(|row| row.id.ends_with(":000001"))
+                .expect("the second event");
+            event.input[cog_core::DECISION_EVENT_INPUT_KEY]["detail"] =
+                serde_json::json!("something that was never said");
+        }
 
         let error = run(
             Act::VoteVerify {

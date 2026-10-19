@@ -85,6 +85,15 @@ impl GovernanceStore for Roster {
         Ok(true)
     }
 
+    async fn save_governance_node_with_event(
+        &self,
+        _event: &Task,
+        _node: &Task,
+        _expected: &[TaskStatus],
+    ) -> SFResult<bool> {
+        Ok(true)
+    }
+
     async fn apply_handover(
         &self,
         _handover: &Task,

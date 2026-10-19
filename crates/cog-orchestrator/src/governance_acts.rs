@@ -526,11 +526,10 @@ pub async fn settle(
         row.updated_at = now;
         rewrite_payload(&mut row, DECISION_INPUT_KEY, &decision.spec);
 
-        // The chain is written before the row moves. Appending after would let
-        // a broken history be discovered by a pass whose close had already
-        // happened, leaving a resolved row nobody can reconstruct; appending
-        // first means a history that does not verify stops the close, and the
-        // ballot stays open where a reader can still see it.
+        // The row and its last event are one fact, so the store writes them in
+        // one transaction. A history that does not verify stops the close, and
+        // a close that lost its race writes neither the row nor a step
+        // claiming it.
         let detail = format!(
             "{}: {}",
             decision.spec.state.as_str(),
@@ -540,21 +539,19 @@ pub async fn settle(
                 .clone()
                 .unwrap_or_else(|| "no reason recorded".into())
         );
-        if cog_core::append_decision_event(store, &decision.id, "closed", None, Some(&detail), now)
-            .await
-            .is_err()
+        match cog_core::close_decision_with_event(
+            store,
+            &decision.id,
+            &row,
+            &[TaskStatus::Pending, TaskStatus::Running],
+            Some(&detail),
+            now,
+        )
+        .await
         {
-            report.chains_broken += 1;
-            continue;
-        }
-
-        if store
-            .save_governance_node_if_status(&row, &[TaskStatus::Pending, TaskStatus::Running])
-            .await?
-        {
-            report.ballots_closed += 1;
-        } else {
-            report.lost_races += 1;
+            Ok(true) => report.ballots_closed += 1,
+            Ok(false) => report.lost_races += 1,
+            Err(_) => report.chains_broken += 1,
         }
     }
     for task in store.governance_nodes(HANDOVER_TASK_TYPE).await? {
@@ -1089,6 +1086,27 @@ mod tests {
                 }
                 _ => Ok(false),
             }
+        }
+
+        async fn save_governance_node_with_event(
+            &self,
+            event: &Task,
+            node: &Task,
+            expected: &[TaskStatus],
+        ) -> cog_core::SFResult<bool> {
+            let mut rows = self.rows.lock().unwrap();
+            let Some(slot) = rows.iter_mut().find(|row| row.id == node.id) else {
+                return Ok(false);
+            };
+            if !expected.contains(&slot.status) {
+                return Ok(false);
+            }
+            *slot = node.clone();
+            match rows.iter_mut().find(|row| row.id == event.id) {
+                Some(entry) => *entry = event.clone(),
+                None => rows.push(event.clone()),
+            }
+            Ok(true)
         }
 
         async fn apply_handover(
