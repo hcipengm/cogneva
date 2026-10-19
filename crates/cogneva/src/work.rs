@@ -564,22 +564,7 @@ async fn next(
 ) -> Result<(), Box<dyn Error>> {
     let tasks = backend.dag_get_all_tasks(workspace).await?;
     let deps = dependency_state(backend, workspace).await?;
-    let mut owned = 0usize;
-    let mut ready: Vec<Task> = Vec::new();
-    for task in tasks {
-        if task.owner_unit.as_deref() != Some(unit) || !task.is_executable {
-            continue;
-        }
-        owned += 1;
-        if task.status == TaskStatus::Pending && task.is_ready(&deps) {
-            ready.push(task);
-        }
-    }
-    ready.sort_by(|a, b| {
-        b.priority
-            .cmp(&a.priority)
-            .then_with(|| a.updated_at.cmp(&b.updated_at))
-    });
+    let (ready, owned) = ready_owned(tasks, &deps, unit);
     match ready.first() {
         Some(task) if json => println!("{}", serde_json::to_string_pretty(task)?),
         Some(task) => println!("{}", task.id),
@@ -597,6 +582,31 @@ async fn next(
         owned
     );
     Ok(())
+}
+
+/// The owned tasks this unit can start now, and how many it owns at all.
+///
+/// Split out from the command so the filter is a function of the rows: the
+/// readiness check is the whole reason this subcommand exists, and a check that
+/// can only be exercised against a database is a check nobody runs.
+fn ready_owned(tasks: Vec<Task>, deps: &TaskDAG, unit: &str) -> (Vec<Task>, usize) {
+    let mut owned = 0usize;
+    let mut ready: Vec<Task> = Vec::new();
+    for task in tasks {
+        if task.owner_unit.as_deref() != Some(unit) || !task.is_executable {
+            continue;
+        }
+        owned += 1;
+        if task.status == TaskStatus::Pending && task.is_ready(deps) {
+            ready.push(task);
+        }
+    }
+    ready.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.updated_at.cmp(&b.updated_at))
+    });
+    (ready, owned)
 }
 
 /// Publish one result message on the transport the platform's executors read.
@@ -695,6 +705,60 @@ mod tests {
         assert!(parse_args(&args(&[])).is_err());
         assert!(parse_args(&args(&["queue", "--unit", ""])).is_err());
         assert!(parse_args(&args(&["queue", "--unit", "8b", "--nope"])).is_err());
+    }
+
+    fn owned(id: &str, owner: &str) -> Task {
+        let mut task = Task::new(id, cog_core::TaskType::DagNode, serde_json::json!({}));
+        task.owner_unit = Some(owner.into());
+        task
+    }
+
+    /// A task whose dependencies are not finished is the case the shared queue
+    /// used to filter out. Carry that filter here or the worker starts work the
+    /// graph is not ready to run -- and nothing in the reading would say why.
+    #[test]
+    fn a_blocked_task_is_not_offered_and_the_count_says_how_much_is_owned() {
+        let mut dag = TaskDAG::default();
+        let mut done = owned("dep-done", "8b");
+        done.status = TaskStatus::Completed;
+        let mut open = owned("dep-open", "8b");
+        open.status = TaskStatus::Running;
+        dag.tasks.insert(done.id.clone(), done);
+        dag.tasks.insert(open.id.clone(), open);
+
+        let mut ready = owned("ready", "8b");
+        ready.blocked_by = vec!["dep-done".into()];
+        ready.priority = 5;
+        let mut blocked = owned("blocked", "8b");
+        blocked.blocked_by = vec!["dep-open".into()];
+        blocked.priority = 9;
+        let mut other = owned("someone-elses", "6e");
+        other.priority = 100;
+        let mut face = owned("a-face", "8b");
+        face.is_executable = false;
+
+        let (picked, owned_count) = ready_owned(vec![ready, blocked, other, face], &dag, "8b");
+        assert_eq!(
+            picked.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["ready"],
+            "the blocked task ranks higher but cannot run yet"
+        );
+        assert_eq!(
+            owned_count, 2,
+            "the face node and another unit's task are not this unit's work"
+        );
+    }
+
+    /// Higher priority first, then the one that has been waiting longest.
+    #[test]
+    fn ready_tasks_are_offered_in_priority_order() {
+        let dag = TaskDAG::default();
+        let mut low = owned("low", "8b");
+        low.priority = 1;
+        let mut high = owned("high", "8b");
+        high.priority = 9;
+        let (picked, _) = ready_owned(vec![low, high], &dag, "8b");
+        assert_eq!(picked[0].id, "high");
     }
 
     #[test]
