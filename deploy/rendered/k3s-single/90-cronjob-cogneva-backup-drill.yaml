@@ -33,7 +33,7 @@ spec:
     spec:
       # 演练失败不重试成串：答案已经落进 backup_drills 了，下一晚自然再来。
       backoffLimit: 0
-      activeDeadlineSeconds: 3600
+      activeDeadlineSeconds: 7200
       ttlSecondsAfterFinished: 86400
       template:
         metadata:

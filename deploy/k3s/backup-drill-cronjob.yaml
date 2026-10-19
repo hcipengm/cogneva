@@ -24,9 +24,11 @@ spec:
     spec:
       # 演练失败不重试成串：答案已经落进 backup_drills 了，下一晚自然再来。
       backoffLimit: 0
-      # 恢复要灌进一整个库（2026-10-18 实测源库 962 MB），比只导出慢；不设界的话
-      # 一次挂住的演练会在 Forbid 下把后面每一次都挡掉。
-      activeDeadlineSeconds: 3600
+      # 一次演练证明的是所有未证明的包（`--also-unproven`），上界是 keepCount 份：
+      # 单包恢复实测 497 s（2026-10-19，库在长），7 × 497 ≈ 58 min，旧的一小时只剩
+      # 一分半余量，`backoffLimit: 0` 下被杀就是那一晚没有第二次。取 7200。
+      # 设界的本意仍是兜住一次挂死的恢复：不设的话，Forbid 下它会挡住后面每一次。
+      activeDeadlineSeconds: 7200
       ttlSecondsAfterFinished: 86400
       template:
         metadata:
