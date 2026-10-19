@@ -591,6 +591,15 @@ async fn next(
     Ok(())
 }
 
+/// How long a unit's presence outlives its last heartbeat.
+///
+/// The registry's own TTL is half a minute, which is shorter than the window
+/// the idle rule reads over: the record would be gone before the rule could see
+/// how long its owner had been quiet, and "quiet for ten minutes" and "never
+/// registered" would both arrive as the same missing key. Keep the record past
+/// that window and let the rule read a timestamp.
+const UNIT_PRESENCE_TTL_SECS: u64 = cog_core::OWNER_IDLE_AFTER_SECS as u64 * 3 / 2;
+
 /// Record that this unit is alive, under the name its faces name it by.
 ///
 /// The registration is rewritten rather than renewed: the registry's TTL is
@@ -604,14 +613,9 @@ async fn presence(unit: &str, workspace: &str, redis_url: &str) -> Result<(), Bo
                     dag_executor.redis_url"
             .into());
     }
-    // The registry's own TTL is half a minute, which is shorter than the window
-    // the idle rule reads over: the record would be gone before the rule could
-    // see how long its owner had been quiet, and "quiet for ten minutes" and
-    // "never registered" would both arrive as the same missing key. Keep the
-    // record past that window and let the rule read a timestamp.
     let registry = cog_storage::redis::RedisAgentRegistry::from_url(redis_url)
         .await?
-        .with_ttl_seconds(cog_core::OWNER_IDLE_AFTER_SECS as u64 * 3 / 2);
+        .with_ttl_seconds(UNIT_PRESENCE_TTL_SECS);
     let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "external-worker".into());
     let registration = cog_core::AgentRegistration::new(
         unit,
@@ -789,6 +793,20 @@ mod tests {
         assert_eq!(
             owned_count, 2,
             "the face node and another unit's task are not this unit's work"
+        );
+    }
+
+    /// The idle rule answers "how long has this owner been quiet" from a
+    /// timestamp. If the record expires sooner than the rule's window, that
+    /// question loses its answer before it can be asked and every quiet owner
+    /// reads the same as one that was never registered.
+    #[test]
+    fn a_units_presence_outlives_the_window_the_idle_rule_reads_over() {
+        assert!(
+            UNIT_PRESENCE_TTL_SECS > cog_core::OWNER_IDLE_AFTER_SECS as u64,
+            "presence TTL {UNIT_PRESENCE_TTL_SECS}s expires before the idle window \
+             ({OWNER_IDLE_AFTER_SECS}s) can be observed",
+            OWNER_IDLE_AFTER_SECS = cog_core::OWNER_IDLE_AFTER_SECS
         );
     }
 
