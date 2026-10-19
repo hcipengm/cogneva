@@ -24,6 +24,7 @@ pub use contract::backup_run::*;
 pub use contract::change_ledger::*;
 pub use contract::codec::*;
 pub use contract::context_builder::*;
+pub use contract::decision_stats::*;
 pub use contract::dlq::*;
 pub use contract::embedding::*;
 pub use contract::eval::*;

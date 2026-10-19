@@ -8,6 +8,7 @@ pub mod change_ledger;
 pub mod ci;
 pub mod codec;
 pub mod context_builder;
+pub mod decision_stats;
 pub mod dlq;
 pub mod embedding;
 pub mod env_supersede;

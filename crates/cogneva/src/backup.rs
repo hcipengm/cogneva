@@ -30,7 +30,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use cog_core::{
     BackupDrillRecord, BackupOutcome, BackupRunClosing, BackupRunOpening, BackupRunStore,
 };
-use cog_storage::PostgresBackupRunStore;
+use cog_storage::{PostgresBackupRunStore, PostgresDecisionStatsStore};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -1283,7 +1283,7 @@ async fn run_backup_into(
         &staging.join("objects").join("storage"),
     )?;
     segments.push(segment_stamp("objects"));
-    let artifacts = collect_artifacts(cfg, staging).await?;
+    let artifacts = collect_artifacts(cfg, staging, Some(&pool)).await?;
     segments.push(segment_stamp("artifacts"));
     let bound = max_segment_skew();
     if let Ok((first, last, skew)) = segment_span(&segments) {
@@ -1464,12 +1464,181 @@ fn lossy_surfaces() -> Vec<LossySurface> {
 async fn collect_artifacts(
     cfg: &BackupConfig,
     staging: &Path,
+    pool: Option<&PgPool>,
 ) -> Result<Vec<ArtifactRootReport>, Box<dyn std::error::Error>> {
     let mut reports = Vec::new();
     for (root, dir) in cfg.data_roots() {
-        reports.push(collect_artifact_root(&root, &dir, staging).await?);
+        let mut report = collect_artifact_root(&root, &dir, staging).await?;
+        // 决策统计的运行时作者是库里的表；主数据根上的那份文件只是导出面。
+        // 进包前由表重写一遍，停机期间停在卷上的旧文件才不会冒充当前证据。
+        if root == "app" {
+            if let Some(pool) = pool {
+                export_decision_stats(pool, staging, &mut report).await;
+            }
+        }
+        reports.push(report);
     }
     Ok(reports)
+}
+
+/// 用表里的行重写包内那份 `decision_stats.json`，并把读数换成本次写出的文件。
+///
+/// 卷上可能也有一份（没有库的进程写的，或者换成表之前留下的）。两边按
+/// 「同一格取较大计数」合并，而不是二选一：计数只增不减，较大的一侧就是看得更多
+/// 的那条历史，丢哪一边都等于把已经记下的证据删掉。
+///
+/// 表读不出来只告警、不判这次备份失败——同一个不对称：一份已经跑完的包不该
+/// 因为它的一个说明面读不到而被扔掉。代价写在日志里：这时包内那份是卷上的文件，
+/// 比表旧。
+async fn export_decision_stats(pool: &PgPool, staging: &Path, report: &mut ArtifactRootReport) {
+    use cog_core::DecisionStatsStore;
+
+    let store = PostgresDecisionStatsStore::new(pool.clone());
+    let cells = match store.load_all().await {
+        Ok(cells) => cells,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "备份：决策统计表读不出来，包内那份沿用卷上的文件（可能比表旧）"
+            );
+            return;
+        }
+    };
+
+    let staged = staging
+        .join("artifacts")
+        .join("app")
+        .join("meta_learning")
+        .join("decision_stats.json");
+    let file = std::fs::read_to_string(&staged).ok();
+    let from_file = file.as_deref().map(file_group_count).unwrap_or(0);
+    let Some(body) = merge_decision_stats(file.as_deref(), &cells) else {
+        // 表和卷上都没有任何一格：包里不带这份文件，清单也不记它。
+        return;
+    };
+
+    if let Some(parent) = staged.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(error = %e, path = %parent.display(), "备份：决策统计导出目录建不出来");
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(&staged, body.as_bytes()) {
+        tracing::warn!(error = %e, path = %staged.display(), "备份：决策统计导出写不进去");
+        return;
+    }
+    match decision_stats_counts(&body) {
+        Ok((groups, trials)) => {
+            report.decision_stats = Some(DecisionStatsReport {
+                groups,
+                trials,
+                bytes: body.len() as u64,
+            });
+            tracing::info!(
+                groups,
+                trials,
+                table_cells = cells.len(),
+                file_groups = from_file,
+                "备份：包内决策统计由表导出"
+            );
+        }
+        Err(e) => tracing::warn!(error = %e, "备份：导出的决策统计读不回来"),
+    }
+}
+
+/// (category, group) -> decision -> (attempts, successes)，按字符串有序：同一份
+/// 证据必须导出同一个文件，否则排障时会把「什么都没变」读成「状态变了」。
+type StatsTree = BTreeMap<String, BTreeMap<String, BTreeMap<String, (i64, i64)>>>;
+
+/// 把卷上的旧文件与表里的行合成一份导出，空则回答 `None`。
+///
+/// 两边按「同一格取较大计数」合并，而不是二选一或相加：计数只增不减，较大的
+/// 一侧就是看得更多的那条历史；相加则会在表与文件本来描述同一段历史时把它们
+/// 数两遍。任何一边解析不了的格被跳过，不让一格坏数据带走整份导出。
+fn merge_decision_stats(
+    file: Option<&str>,
+    cells: &[cog_core::DecisionStatCell],
+) -> Option<String> {
+    let mut merged: StatsTree = BTreeMap::new();
+    if let Some(text) = file {
+        if let Ok(doc) = serde_json::from_str::<serde_json::Value>(text) {
+            if let Some(groups) = doc.get("groups").and_then(|g| g.as_array()) {
+                for group in groups {
+                    let Some(category) = group.get("category").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let Some(key) = group.get("key").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let Some(counts) = group.get("counts").and_then(|c| c.as_object()) else {
+                        continue;
+                    };
+                    for (decision, pair) in counts {
+                        let Some((a, s)) = pair
+                            .as_array()
+                            .and_then(|p| Some((p.first()?.as_i64()?, p.get(1)?.as_i64()?)))
+                        else {
+                            continue;
+                        };
+                        raise_cell(&mut merged, category, key, decision, a, s);
+                    }
+                }
+            }
+        }
+    }
+    for cell in cells {
+        raise_cell(
+            &mut merged,
+            &cell.category,
+            &cell.group_key,
+            &cell.decision,
+            cell.attempts,
+            cell.successes,
+        );
+    }
+    if merged.is_empty() {
+        return None;
+    }
+    let groups: Vec<serde_json::Value> = merged
+        .iter()
+        .flat_map(|(category, by_key)| {
+            by_key.iter().map(move |(key, decisions)| {
+                let counts: serde_json::Map<String, serde_json::Value> = decisions
+                    .iter()
+                    .map(|(d, (a, s))| (d.clone(), serde_json::json!([a, s])))
+                    .collect();
+                serde_json::json!({"category": category, "key": key, "counts": counts})
+            })
+        })
+        .collect();
+    Some(serde_json::json!({"version": 1, "groups": groups}).to_string())
+}
+
+/// 文件里有几组。只用于日志里对照「表带来了几格、文件原来有几组」。
+fn file_group_count(text: &str) -> usize {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|doc| doc.get("groups").and_then(|g| g.as_array().map(Vec::len)))
+        .unwrap_or(0)
+}
+
+fn raise_cell(
+    merged: &mut StatsTree,
+    category: &str,
+    key: &str,
+    decision: &str,
+    attempts: i64,
+    successes: i64,
+) {
+    let entry = merged
+        .entry(category.to_string())
+        .or_default()
+        .entry(key.to_string())
+        .or_default()
+        .entry(decision.to_string())
+        .or_insert((attempts, successes));
+    entry.0 = entry.0.max(attempts);
+    entry.1 = entry.1.max(successes);
 }
 
 async fn collect_artifact_root(
@@ -3651,5 +3820,111 @@ mod tests {
             .await
             .expect_err("ACTIVE 没了不能读成恢复成功");
         assert!(err.contains("ACTIVE"), "错误要点名缺的是 ACTIVE：{err}");
+    }
+
+    // ------------------------------------------------------------------
+    // Decision stats exported from the table
+    // ------------------------------------------------------------------
+
+    fn table_cell(
+        category: &str,
+        key: &str,
+        decision: &str,
+        a: i64,
+        s: i64,
+    ) -> cog_core::DecisionStatCell {
+        cog_core::DecisionStatCell {
+            category: category.to_string(),
+            group_key: key.to_string(),
+            decision: decision.to_string(),
+            attempts: a,
+            successes: s,
+        }
+    }
+
+    fn exported(body: &str) -> serde_json::Value {
+        serde_json::from_str(body).expect("the export is JSON")
+    }
+
+    /// The file on the volume can be older than the table: the table is the
+    /// author, so where both describe a cell the table's count wins.
+    #[test]
+    fn the_export_takes_the_tables_count_where_the_file_is_behind() {
+        let file = r#"{"version":1,"groups":[{"category":"pge_mode","key":"bugfix","counts":{"pipeline":[3,2]}}]}"#;
+        let body = merge_decision_stats(
+            Some(file),
+            &[table_cell("pge_mode", "bugfix", "pipeline", 9, 7)],
+        )
+        .expect("a row on either side is enough to export");
+        let doc = exported(&body);
+        assert_eq!(
+            doc["groups"][0]["counts"]["pipeline"],
+            serde_json::json!([9, 7])
+        );
+        assert_eq!(decision_stats_counts(&body).unwrap(), (1, 9));
+    }
+
+    /// The other direction matters just as much: evidence the table has not
+    /// been raised to yet (recorded while the database was down) must not be
+    /// dropped by an export that only looked at the table.
+    #[test]
+    fn the_export_keeps_a_file_count_the_table_has_not_caught_up_to() {
+        let file = r#"{"version":1,"groups":[{"category":"pge_mode","key":"bugfix","counts":{"pipeline":[12,9],"roundtable":[4,1]}}]}"#;
+        let body = merge_decision_stats(
+            Some(file),
+            &[table_cell("pge_mode", "bugfix", "pipeline", 5, 4)],
+        )
+        .expect("the file alone is enough");
+        let doc = exported(&body);
+        assert_eq!(
+            doc["groups"][0]["counts"]["pipeline"],
+            serde_json::json!([12, 9])
+        );
+        assert_eq!(
+            doc["groups"][0]["counts"]["roundtable"],
+            serde_json::json!([4, 1])
+        );
+        assert_eq!(decision_stats_counts(&body).unwrap(), (1, 16));
+    }
+
+    /// A group only the table knows has to appear, and the export stays sorted
+    /// so that the same evidence always produces the same bytes.
+    #[test]
+    fn the_export_adds_groups_from_both_sides_deterministically() {
+        let file = r#"{"version":1,"groups":[{"category":"pge_mode","key":"feature","counts":{"pipeline":[2,1]}}]}"#;
+        let cells = [
+            table_cell("pge_mode", "bugfix", "pipeline", 6, 5),
+            table_cell("pge_mode", "feature", "pipeline", 1, 0),
+        ];
+        let first = merge_decision_stats(Some(file), &cells).expect("both sides have evidence");
+        let second = merge_decision_stats(Some(file), &cells).expect("same input");
+        assert_eq!(first, second, "the export must not depend on hash order");
+        let doc = exported(&first);
+        assert_eq!(doc["groups"].as_array().unwrap().len(), 2);
+        assert_eq!(decision_stats_counts(&first).unwrap(), (2, 8));
+    }
+
+    /// Nothing on either side is not an empty export: the package leaves the
+    /// file out and the manifest records no decision-stats reading, rather than
+    /// claiming a section that has nothing in it.
+    #[test]
+    fn nothing_anywhere_exports_nothing() {
+        assert!(merge_decision_stats(None, &[]).is_none());
+        assert!(merge_decision_stats(Some("not json"), &[]).is_none());
+        assert!(merge_decision_stats(Some(r#"{"version":1,"groups":[]}"#), &[]).is_none());
+    }
+
+    /// A single unreadable cell is skipped, not fatal: one bad pair must not
+    /// cost the whole export the evidence that is still readable.
+    #[test]
+    fn a_broken_cell_does_not_take_the_rest_of_the_export_with_it() {
+        let file = r#"{"version":1,"groups":[{"category":"pge_mode","key":"bugfix","counts":{"pipeline":[4,3],"broken":"nope"}}]}"#;
+        let body = merge_decision_stats(Some(file), &[]).expect("the readable cell still exports");
+        let doc = exported(&body);
+        assert_eq!(
+            doc["groups"][0]["counts"]["pipeline"],
+            serde_json::json!([4, 3])
+        );
+        assert!(doc["groups"][0]["counts"].get("broken").is_none());
     }
 }

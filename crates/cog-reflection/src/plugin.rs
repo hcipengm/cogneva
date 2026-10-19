@@ -1520,6 +1520,20 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             ),
         }
 
+        // 决策统计的运行时作者从卷上的快照换成共享表。这一步放在 start 而不是
+        // init：发布方（storage 插件）可能在 init 期间与本插件并行初始化，那时
+        // 读服务表只在运气好时能读到；start 时所有插件的 init 都已完成。挂不上
+        // 不是失败——没有库的部署仍以快照为作者，只是退回单写者。
+        if let Some(engine) = self.meta_learning.clone() {
+            match ctx.consume_service::<dyn cog_core::DecisionStatsStore>() {
+                Some(store) => engine.attach_stats_store(store).await,
+                None => info!(
+                    "no decision stats store published; the meta-learning engine keeps the \
+                     volume snapshot as its author"
+                ),
+            }
+        }
+
         // 产物级进化的自主触发者：拿本进程已记录的决策结果重放候选参数，
         // 显著更优才写新版本并热替换。与自发现信号 watcher 不同，它的副
         // 作用只落在本进程自己的策略目录里（`app.data_dir` 下的 PV），既

@@ -1030,6 +1030,27 @@ impl cog_core::SystemPlugin for StoragePlugin {
             warn!("No PostgreSQL pool; the backup account is unavailable in this deployment");
         }
 
+        // ── DecisionStatsStore ──
+        // The decision counters are the meta-learning engine's evidence, and the
+        // engine lives in another process than the one that reads them. A table
+        // is where two writers' increments add up instead of overwriting each
+        // other, and where the evidence survives a pod that is replaced -- which
+        // is the ordinary life of an evolution deployment.
+        //
+        // Unlike the accounts above, a missing pool is not a startup failure in
+        // strict mode: the engine keeps a snapshot on its own volume, and a
+        // deployment without a database can still learn, just without the
+        // concurrency the table buys. Refusing to start over that would trade a
+        // working single-writer engine for none.
+        if let Some(pool) = self.pg_pool.clone() {
+            let store: Arc<dyn cog_core::DecisionStatsStore> =
+                Arc::new(crate::PostgresDecisionStatsStore::new(pool));
+            ctx.publish_service(store);
+            info!("StoragePlugin decision stats store published");
+        } else {
+            warn!("No PostgreSQL pool; decision counters stay in the engine's own snapshot");
+        }
+
         // ── ObjectBackend (singleton for all modules) ──
         let http_client = ctx.consume_service::<dyn cog_core::HttpClient>();
         let object_backend =

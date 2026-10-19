@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 use crate::types::{DecisionStatistics, ModeDecisionRecord};
 use crate::LearningRecorder;
 use crate::{DecisionCategory, DecisionOutcome};
+use cog_core::{DecisionStatCell, DecisionStatsStore};
 use cog_core::{SFError, SFResult};
 
 use cog_core::{DecisionGroupKey, ModeRecommendation, TaskFeatures};
@@ -145,6 +146,12 @@ pub struct MetaLearningEngine {
     /// 决策聚合的耐久快照：每次记录落盘、构造时读回。None 只出现在测试构造
     /// 的引擎上——非测试构建里没有构造无快照引擎的入口。
     snapshot: Option<DecisionStatsSnapshot>,
+    /// 决策统计的共享表。挂载得晚于 `init`：发布方（storage 插件）与本插件
+    /// 可能在同一层并行初始化，`init` 期间读服务表只在运气好时能读到。`start()`
+    /// 里所有插件的 `init` 都已完成，那时再取一次，取到才挂。
+    ///
+    /// 没挂上不是失败：表不存在时，快照仍是运行时作者，只是退回单写者。
+    store: std::sync::OnceLock<Arc<dyn DecisionStatsStore>>,
 }
 
 impl std::fmt::Debug for MetaLearningEngine {
@@ -165,6 +172,7 @@ impl MetaLearningEngine {
             margin: 0.15,
             policy: None,
             snapshot: None,
+            store: std::sync::OnceLock::new(),
         }
     }
 
@@ -256,6 +264,141 @@ impl MetaLearningEngine {
         }
     }
 
+    /// Make one recorded decision durable.
+    ///
+    /// With a table attached, the increment goes to the table and the volume is
+    /// not rewritten: rewriting the whole snapshot per decision is the shape
+    /// this replaced, and the table's row is the copy that a second process can
+    /// add to. Without one -- a deployment with no database, or the window
+    /// before [`Self::attach_stats_store`] runs -- the snapshot is still the
+    /// author, exactly as before.
+    ///
+    /// A failed table write falls back to the snapshot for that decision. The
+    /// two carriers are reconciled by [`Self::attach_stats_store`] at the next
+    /// start, so the count is not lost, only late.
+    async fn write_through(
+        &self,
+        category: DecisionCategory,
+        group: &DecisionGroupKey,
+        decision: &str,
+        outcome: DecisionOutcome,
+    ) {
+        let Some(store) = self.store.get() else {
+            self.persist_state().await;
+            return;
+        };
+        let delta = DecisionStatCell {
+            category: category_spelling(category).to_string(),
+            group_key: group.as_str().to_string(),
+            decision: decision.to_string(),
+            attempts: 1,
+            successes: i64::from(outcome == DecisionOutcome::Success),
+        };
+        if let Err(e) = store.accumulate(&delta).await {
+            warn!(
+                category = ?category,
+                key = %group,
+                error = %e,
+                "decision stats: the table did not take this decision; it is kept on the volume \
+                 and will be raised onto the table at the next start"
+            );
+            self.persist_state().await;
+        }
+    }
+
+    /// Attach the shared decision-stats table and bring the two carriers into
+    /// agreement.
+    ///
+    /// The table is the runtime author once this returns; the volume snapshot
+    /// stays as the copy that survives a database that is down, and is written
+    /// only when a table write fails.
+    ///
+    /// Two directions, and both are needed. The memory this process has -- the
+    /// snapshot it read at start plus anything recorded since -- is raised onto
+    /// the table with [`hold_at_least`], which never lowers a cell: that is how
+    /// evidence recorded before the table existed reaches it, and how a
+    /// decision whose table write failed is put back. Then the table is merged
+    /// into memory, taking the larger count per cell, so the groups another
+    /// replica has recorded are visible to this one. `max` on both counters is
+    /// safe because counts only grow: neither side can be ahead in a way that
+    /// means the other measured something different.
+    ///
+    /// Every failure here is a warning, not a startup error. An engine that
+    /// refused to start over a table it could not reach would take the whole
+    /// recommendation path down with it, and the snapshot it still holds is the
+    /// same evidence a moment older.
+    ///
+    /// [`hold_at_least`]: DecisionStatsStore::hold_at_least
+    pub async fn attach_stats_store(&self, store: Arc<dyn DecisionStatsStore>) {
+        if self.store.set(store.clone()).is_err() {
+            return;
+        }
+        let loaded = match store.load_all().await {
+            Ok(cells) => cells,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "decision stats table unreadable; this process keeps the snapshot's evidence \
+                     and records future decisions into the volume alone"
+                );
+                return;
+            }
+        };
+        let (from_table, unreadable) = cells_to_map(&loaded);
+        if unreadable > 0 {
+            warn!(
+                unreadable,
+                "decision stats: rows whose category this build cannot name were left out of \
+                 the in-memory view (they stay in the table)"
+            );
+        }
+
+        let memory = self.decision_stats.read().await.clone();
+        let (memory_groups, memory_trials) = totals(&memory);
+        let mut raised = 0usize;
+        let mut failed = 0usize;
+        for ((category, group), stats) in &memory {
+            for (decision, (attempts, successes)) in &stats.counts {
+                let cell = DecisionStatCell {
+                    category: category_spelling(*category).to_string(),
+                    group_key: group.as_str().to_string(),
+                    decision: decision.clone(),
+                    attempts: i64::from(*attempts),
+                    successes: i64::from(*successes),
+                };
+                match store.hold_at_least(&cell).await {
+                    Ok(()) => raised += 1,
+                    Err(e) => {
+                        failed += 1;
+                        if failed == 1 {
+                            warn!(error = %e, "decision stats: raising the table to the volume \
+                                 failed; this process keeps counting in memory and retries on \
+                                 the next start");
+                        }
+                    }
+                }
+            }
+        }
+
+        let (table_groups, table_trials) = totals(&from_table);
+        let (merged_groups, merged_trials) = {
+            let mut guard = self.decision_stats.write().await;
+            merge_max(&mut guard, from_table);
+            totals(&guard)
+        };
+        info!(
+            memory_groups,
+            memory_trials,
+            table_groups,
+            table_trials,
+            merged_groups,
+            merged_trials,
+            raised,
+            failed,
+            "decision stats attached to the shared table; the table is now the runtime author"
+        );
+    }
+
     /// Configure the minimum samples required per mode before recommending.
     pub fn with_min_samples(mut self, n: u32) -> Self {
         self.min_samples = n;
@@ -331,7 +474,7 @@ impl MetaLearningEngine {
                 entry.1 += 1;
             }
         }
-        self.persist_state().await;
+        self.write_through(category, group, decision, outcome).await;
 
         let learning = cog_core::Learning::new(
             cog_core::LearningCategory::Insight,
@@ -513,6 +656,85 @@ impl cog_core::MetaLearning for MetaLearningEngine {
     ) -> SFResult<()> {
         MetaLearningEngine::record(self, category, group, decision, outcome).await
     }
+}
+
+/// 决策统计的内存在形态。
+type StatsMap = HashMap<(DecisionCategory, DecisionGroupKey), DecisionStatistics>;
+
+/// The spelling a category has in the table, which is also its spelling in the
+/// snapshot file. Written as a match rather than through serde so that adding a
+/// category is a compile error here: a variant that fell through to a default
+/// spelling would put one category's counts in two rows, and the test below
+/// binds this match to the serde spelling so the two cannot drift.
+fn category_spelling(category: DecisionCategory) -> &'static str {
+    match category {
+        DecisionCategory::PgeMode => "pge_mode",
+        DecisionCategory::ResetStrategy => "reset_strategy",
+        DecisionCategory::RetryPolicy => "retry_policy",
+        DecisionCategory::SelfReviewThreshold => "self_review_threshold",
+    }
+}
+
+/// Read the table's cells back into the engine's shape.
+///
+/// A category this build cannot name is counted and left out of the map rather
+/// than folded into one it does know: those are rows written by a version that
+/// had more categories, and merging them into a live one would make its counts
+/// describe decisions it never made. The rows stay in the table untouched.
+fn cells_to_map(cells: &[DecisionStatCell]) -> (StatsMap, usize) {
+    let mut map: StatsMap = HashMap::new();
+    let mut unreadable = 0usize;
+    for cell in cells {
+        let category = serde_json::from_value::<DecisionCategory>(serde_json::Value::String(
+            cell.category.clone(),
+        ));
+        let group = serde_json::from_value::<DecisionGroupKey>(serde_json::Value::String(
+            cell.group_key.clone(),
+        ));
+        let (Ok(category), Ok(group)) = (category, group) else {
+            unreadable += 1;
+            continue;
+        };
+        let stats = map.entry((category, group)).or_default();
+        let entry = stats.counts.entry(cell.decision.clone()).or_insert((0, 0));
+        entry.0 = entry
+            .0
+            .max(u32::try_from(cell.attempts).unwrap_or(u32::MAX));
+        entry.1 = entry
+            .1
+            .max(u32::try_from(cell.successes).unwrap_or(u32::MAX));
+    }
+    (map, unreadable)
+}
+
+/// Fold one map into another, keeping the larger count per cell.
+///
+/// Counts only ever grow, so the larger of two observations of the same cell is
+/// the one that saw more of the same history -- not a different measurement to
+/// be averaged. Attempts and successes are each taken by max, which cannot
+/// invert them: whoever holds the larger attempt total also holds a success
+/// total no larger than its own attempts.
+fn merge_max(into: &mut StatsMap, from: StatsMap) {
+    for ((category, group), stats) in from {
+        let target = into.entry((category, group)).or_default();
+        for (decision, (attempts, successes)) in stats.counts {
+            let entry = target.counts.entry(decision).or_insert((0, 0));
+            entry.0 = entry.0.max(attempts);
+            entry.1 = entry.1.max(successes);
+        }
+    }
+}
+
+/// How many groups and how many recorded decisions a map holds. The two
+/// numbers printed at attach time, so "the table has evidence but this process
+/// started from nothing" is visible in the log rather than inferred.
+fn totals(stats: &StatsMap) -> (usize, u64) {
+    let trials = stats
+        .values()
+        .flat_map(|s| s.counts.values())
+        .map(|(attempts, _)| u64::from(*attempts))
+        .sum();
+    (stats.len(), trials)
 }
 
 /// The decision-selection rule, as a pure function of the observations.
@@ -950,6 +1172,248 @@ mod tests {
                 .map(|(attempts, _)| attempts)
                 .sum::<u32>(),
             2
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Shared table (the port that replaces the file as runtime author)
+    // ------------------------------------------------------------------
+
+    /// A stand-in for the PostgreSQL store, with the two write verbs kept apart
+    /// so the tests can tell which one the engine used: `accumulated` holds the
+    /// increments of decisions being recorded, `held` the totals raised at
+    /// attach time. Folding them together would let a test pass with the engine
+    /// reconciling on every record, which is the shape this change removes.
+    #[derive(Default)]
+    struct FakeTable {
+        cells: tokio::sync::Mutex<Vec<DecisionStatCell>>,
+        accumulated: tokio::sync::Mutex<Vec<DecisionStatCell>>,
+        held: tokio::sync::Mutex<Vec<DecisionStatCell>>,
+        reads_fail: bool,
+        writes_fail: bool,
+    }
+
+    impl FakeTable {
+        fn new(cells: Vec<DecisionStatCell>) -> Arc<Self> {
+            Arc::new(Self {
+                cells: tokio::sync::Mutex::new(cells),
+                accumulated: tokio::sync::Mutex::new(Vec::new()),
+                held: tokio::sync::Mutex::new(Vec::new()),
+                reads_fail: false,
+                writes_fail: false,
+            })
+        }
+
+        fn whose_writes_fail() -> Arc<Self> {
+            Arc::new(Self {
+                writes_fail: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DecisionStatsStore for FakeTable {
+        async fn accumulate(&self, delta: &DecisionStatCell) -> SFResult<()> {
+            self.accumulated.lock().await.push(delta.clone());
+            if self.writes_fail {
+                return Err(SFError::Database("the table is down".into()));
+            }
+            let mut cells = self.cells.lock().await;
+            match cells.iter_mut().find(|c| {
+                c.category == delta.category
+                    && c.group_key == delta.group_key
+                    && c.decision == delta.decision
+            }) {
+                Some(cell) => {
+                    cell.attempts += delta.attempts;
+                    cell.successes += delta.successes;
+                }
+                None => cells.push(delta.clone()),
+            }
+            Ok(())
+        }
+
+        async fn hold_at_least(&self, totals: &DecisionStatCell) -> SFResult<()> {
+            self.held.lock().await.push(totals.clone());
+            if self.writes_fail {
+                return Err(SFError::Database("the table is down".into()));
+            }
+            let mut cells = self.cells.lock().await;
+            match cells.iter_mut().find(|c| {
+                c.category == totals.category
+                    && c.group_key == totals.group_key
+                    && c.decision == totals.decision
+            }) {
+                Some(cell) => {
+                    cell.attempts = cell.attempts.max(totals.attempts);
+                    cell.successes = cell.successes.max(totals.successes);
+                }
+                None => cells.push(totals.clone()),
+            }
+            Ok(())
+        }
+
+        async fn load_all(&self) -> SFResult<Vec<DecisionStatCell>> {
+            if self.reads_fail {
+                return Err(SFError::Database("the table is down".into()));
+            }
+            Ok(self.cells.lock().await.clone())
+        }
+    }
+
+    fn cell(
+        category: &str,
+        group: &str,
+        decision: &str,
+        attempts: i64,
+        successes: i64,
+    ) -> DecisionStatCell {
+        DecisionStatCell {
+            category: category.to_string(),
+            group_key: group.to_string(),
+            decision: decision.to_string(),
+            attempts,
+            successes,
+        }
+    }
+
+    /// The table's spelling is the snapshot's spelling, checked against serde
+    /// rather than trusted: a new category whose match arm drifted would put
+    /// one category's counts in two rows.
+    #[test]
+    fn every_category_spells_the_same_way_in_the_table_as_in_the_snapshot() {
+        for category in [
+            DecisionCategory::PgeMode,
+            DecisionCategory::ResetStrategy,
+            DecisionCategory::RetryPolicy,
+            DecisionCategory::SelfReviewThreshold,
+        ] {
+            let serde_spelling = serde_json::to_value(category)
+                .expect("serialize the category")
+                .as_str()
+                .expect("a unit variant serializes as a string")
+                .to_string();
+            assert_eq!(category_spelling(category), serde_spelling);
+        }
+    }
+
+    /// With a table attached, the decision's durable copy is the row -- and the
+    /// whole-file snapshot is not rewritten to carry it.
+    #[tokio::test]
+    async fn an_attached_table_takes_the_increment_and_the_file_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta_learning/decision_stats.json");
+        let engine = engine_with_snapshot(&path).await;
+        let table = FakeTable::new(Vec::new());
+        engine
+            .attach_stats_store(table.clone() as Arc<dyn DecisionStatsStore>)
+            .await;
+
+        engine
+            .record(
+                DecisionCategory::PgeMode,
+                &group("bugfix"),
+                "pipeline",
+                DecisionOutcome::Success,
+            )
+            .await
+            .unwrap();
+
+        let accumulated = table.accumulated.lock().await.clone();
+        assert_eq!(
+            accumulated,
+            vec![cell("pge_mode", "bugfix", "pipeline", 1, 1)],
+            "the recorded decision has to reach the table as one increment"
+        );
+        assert!(
+            !path.exists(),
+            "the file is not the author while a table is attached; writing it on every \
+             decision is the shape this replaced"
+        );
+    }
+
+    /// A table that is down does not lose the decision: the volume keeps it and
+    /// the next start raises it onto the table.
+    #[tokio::test]
+    async fn a_decision_the_table_refused_is_kept_on_the_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta_learning/decision_stats.json");
+        let engine = engine_with_snapshot(&path).await;
+        engine
+            .attach_stats_store(FakeTable::whose_writes_fail() as Arc<dyn DecisionStatsStore>)
+            .await;
+
+        engine
+            .record(
+                DecisionCategory::PgeMode,
+                &group("bugfix"),
+                "pipeline",
+                DecisionOutcome::Failed,
+            )
+            .await
+            .unwrap();
+
+        let text = std::fs::read_to_string(&path).expect("the decision is on the volume");
+        assert!(
+            text.contains("pipeline"),
+            "the snapshot has to carry it: {text}"
+        );
+    }
+
+    /// Attaching reconciles both directions: what the volume holds is raised
+    /// onto the table, and what the table already holds is merged back -- the
+    /// larger count wins, because counts only grow.
+    #[tokio::test]
+    async fn attaching_raises_the_table_and_takes_the_larger_counts_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta_learning/decision_stats.json");
+
+        // The volume's evidence: two recorded decisions, no table in sight.
+        let before = engine_with_snapshot(&path).await;
+        for _ in 0..2 {
+            before
+                .record(
+                    DecisionCategory::PgeMode,
+                    &group("bugfix"),
+                    "pipeline",
+                    DecisionOutcome::Success,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Another replica has counted the same cell further, and a group this
+        // process has never seen.
+        let table = FakeTable::new(vec![
+            cell("pge_mode", "bugfix", "pipeline", 7, 5),
+            cell("pge_mode", "feature", "roundtable", 3, 1),
+        ]);
+        let after = engine_with_snapshot(&path).await;
+        after
+            .attach_stats_store(table.clone() as Arc<dyn DecisionStatsStore>)
+            .await;
+
+        let held = table.held.lock().await.clone();
+        assert_eq!(
+            held,
+            vec![cell("pge_mode", "bugfix", "pipeline", 2, 2)],
+            "the volume's totals are raised onto the table, and nothing the table already \
+             holds is lowered"
+        );
+
+        let merged = after.decision_groups().await;
+        let all: Vec<(String, u32, u32)> = merged
+            .iter()
+            .flat_map(|group| group.iter().map(|(d, (a, s))| (d.clone(), *a, *s)))
+            .collect();
+        assert!(
+            all.contains(&("pipeline".to_string(), 7, 5)),
+            "the table's larger count has to win: {all:?}"
+        );
+        assert!(
+            all.contains(&("roundtable".to_string(), 3, 1)),
+            "a group only the table knows has to become visible: {all:?}"
         );
     }
 }
