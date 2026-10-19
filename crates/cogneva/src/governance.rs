@@ -272,12 +272,21 @@ async fn faces(store: &dyn GovernanceStore, brief: bool) -> Result<(), Box<dyn E
         .collect();
     let census = cog_core::census(&faces, now);
     if brief {
+        // A named vacancy and an unowned face both print `-` in the owner
+        // column. The two columns after it are what tells a reader which one
+        // this is: a deadline and the unit responsible for filling it, or two
+        // dashes meaning nobody has said anybody will.
         for face in &faces {
             println!(
-                "{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}",
                 face.face_id,
                 face.spec.kind.as_str(),
-                face.owner_unit.as_deref().unwrap_or("-")
+                face.owner_unit.as_deref().unwrap_or("-"),
+                face.spec
+                    .vacancy_until
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| "-".into()),
+                face.spec.vacancy_assigner.as_deref().unwrap_or("-"),
             );
         }
     } else {

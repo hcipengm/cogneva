@@ -411,6 +411,7 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
 
     let mut red = Vec::new();
     let mut yellow = Vec::new();
+    let mut detail: Option<String> = None;
 
     if !face.is_staffed() {
         red.push(DriftState::NoOwner.as_str().to_string());
@@ -454,12 +455,27 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
             .open_tasks
             .iter()
             .any(|task| task.owner_unit.as_deref() == Some(owner));
+        // `owner_idle` covers three different situations, and a reader that
+        // only sees the state cannot tell them apart: the owner has no work on
+        // the face, the owner's heartbeat is old, or the registry answered and
+        // does not know this name at all. The third one used to fall through
+        // to `on_target` whenever the owner held work -- a green verdict for an
+        // owner nobody can see. All three stay in the closed set, and `detail`
+        // says which one fired.
         if !working {
             yellow.push(DriftState::OwnerIdle.as_str().to_string());
+            detail = Some("no open task on this face is bound to its owner".into());
         } else if let OwnerLiveness::Seen(seen) = observation.owner_liveness {
             if (now - seen).num_seconds() >= OWNER_IDLE_AFTER_SECS {
                 yellow.push(DriftState::OwnerIdle.as_str().to_string());
+                detail = Some(format!(
+                    "the owner's last heartbeat is {}s old",
+                    (now - seen).num_seconds()
+                ));
             }
+        } else if observation.owner_liveness == OwnerLiveness::Unknown {
+            yellow.push(DriftState::OwnerIdle.as_str().to_string());
+            detail = Some("the owner is not a unit the heartbeat registry knows".into());
         }
     }
 
@@ -481,8 +497,14 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
         state,
         red_rules: red,
         yellow_rules: yellow,
-        detail: (observation.owner_liveness == OwnerLiveness::Unreadable)
-            .then(|| "the owner registry could not be read".to_string()),
+        // An unreadable registry outranks any detail the rules could write: the
+        // reason there is no verdict is the absence of a reader, not the state
+        // of the face.
+        detail: if observation.owner_liveness == OwnerLiveness::Unreadable {
+            Some("the owner registry could not be read".into())
+        } else {
+            detail
+        },
         observed_at: now,
         source_revision: face.revision(),
     }
@@ -802,6 +824,62 @@ mod tests {
         });
         assert_eq!(reading.state, DriftState::OwnerIdle);
         assert!(reading.state.is_yellow());
+    }
+
+    #[test]
+    fn an_idle_verdict_says_which_of_the_three_situations_fired() {
+        // No work on the face.
+        let face = face(Some("unit-operator"));
+        let reading = observe(FaceObservation {
+            face_id: "task-management",
+            face: Some(&face),
+            open_tasks: &[],
+            signed_handovers: &[],
+            owner_liveness: OwnerLiveness::Seen(Utc::now()),
+            now: Utc::now(),
+        });
+        assert_eq!(reading.state, DriftState::OwnerIdle);
+        assert!(reading
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no open task"));
+
+        // Work, but the registry does not know the owner. This used to be
+        // `on_target`: a green verdict for a name nobody could see.
+        let tasks = vec![task(Some("unit-operator"), TaskStatus::Running)];
+        let reading = observe(FaceObservation {
+            face_id: "task-management",
+            face: Some(&face),
+            open_tasks: &tasks,
+            signed_handovers: &[],
+            owner_liveness: OwnerLiveness::Unknown,
+            now: Utc::now(),
+        });
+        assert_eq!(reading.state, DriftState::OwnerIdle);
+        assert!(reading
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("registry"));
+
+        // Work, and a heartbeat that is older than the idle window.
+        let reading = observe(FaceObservation {
+            face_id: "task-management",
+            face: Some(&face),
+            open_tasks: &tasks,
+            signed_handovers: &[],
+            owner_liveness: OwnerLiveness::Seen(
+                Utc::now() - chrono::Duration::seconds(OWNER_IDLE_AFTER_SECS + 1),
+            ),
+            now: Utc::now(),
+        });
+        assert_eq!(reading.state, DriftState::OwnerIdle);
+        assert!(reading
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("heartbeat"));
     }
 
     #[test]
