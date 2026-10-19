@@ -119,16 +119,8 @@ pub(crate) fn task_text(case: &EvalCase) -> String {
     }
 }
 
-/// 外壳的每一次上游调用报谁的名字。
-///
-/// 外壳只由评测台构造（`cog-eval` 之外没有调用方），所以这是一个常量而不是参数。
-/// 不写它不是「中立」：网关把没声明的调用记到 `unknown`，而这一格恰好会在最该读它
-/// 的时候变成账上最大的一块——一次 225 KB 的题面 × 几百次调用，没人认领。
-const SCAFFOLD_ACTOR: &str = "eval";
-
 /// 请求参数。工具规格来自**基准**（外壳不能给自己加工具），温度来自预算
-/// （四行同值，格子之间才可比）。身份跟着一起走：外壳的调用是评测花的钱，
-/// 与 `judge`／适配器同属 `eval`，缺了它这几百次调用就只剩 `unknown`。
+/// （四行同值，格子之间才可比）。
 pub(crate) fn chat_options(ctx: &SolveContext) -> ChatOptions {
     ChatOptions {
         temperature: Some(ctx.budget.temperature),
@@ -139,7 +131,6 @@ pub(crate) fn chat_options(ctx: &SolveContext) -> ChatOptions {
         },
         ..Default::default()
     }
-    .with_actor(SCAFFOLD_ACTOR)
 }
 
 /// 答复里的正文。工具调用不算正文——把工具调用当答案交回去，判分器拿到的是

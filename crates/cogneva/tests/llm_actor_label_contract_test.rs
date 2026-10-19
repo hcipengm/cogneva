@@ -57,13 +57,6 @@ const PRODUCERS: &[(&str, &[&str])] = &[
     ("crates/cog-eval/src/adapters/hle.rs", &["eval"]),
     ("crates/cog-eval/src/judge.rs", &["eval"]),
     (
-        // The scaffolds' inner loop: every non-judge attempt the eval harness
-        // makes goes through this one helper, so this entry covers four
-        // scaffolds at once.
-        "crates/cog-eval/src/scaffolds/mod.rs",
-        &["eval"],
-    ),
-    (
         "crates/cog-extension/src/hostdocs_assist.rs",
         &["sandbox-document-organizer"],
     ),
