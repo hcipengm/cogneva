@@ -217,6 +217,11 @@ pub fn summed_spans(expr: &str) -> Vec<String> {
 }
 
 /// Series names every `sum`/`avg` aggregation in the expression reads.
+///
+/// Only the alert-rule contract test asks this question, but the module is
+/// compiled whole into every test binary that includes it, so the other two
+/// would otherwise fail the build on an unused function.
+#[allow(dead_code)]
 pub fn summed_metric_names(expr: &str) -> BTreeSet<String> {
     summed_spans(expr)
         .iter()
