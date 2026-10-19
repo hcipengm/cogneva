@@ -39,7 +39,9 @@ spec:
             - name: drill
               image: localhost:30500/cogneva:local
               imagePullPolicy: Always
-              args: ["backup-drill"]
+              # 最新那份 ＋ 窗口里最久没被成功打开过的一份；只开最新证明不了
+              # 保留窗口的其余成员。
+              args: ["backup-drill", "--also-unproven"]
               env:
                 - name: PG_PASSWORD
                   valueFrom:

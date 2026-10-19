@@ -2826,6 +2826,7 @@ pub const DRILL_DATABASE: &str = "cog_drill";
 /// 要真恢复就得有一个空白目标环境，这一趟要证明的是「包里的关系数据与它自己的账
 /// 能装回一个跑完迁移的空库」。让演练 Job 为此背上一个 qdrant 地址，是把一个能
 /// 跑的进程挡在一个它用不上的依赖后面。
+#[derive(Clone)]
 pub struct DrillConfig {
     pub database_url: String,
     pub backup_dir: PathBuf,
@@ -2841,6 +2842,11 @@ pub struct DrillConfig {
     /// （旧格式的列、包里带着生成列），而每天只开最新一份时，这些包要到真正
     /// 需要恢复的那天才第一次被打开。
     pub package: Option<String>,
+    /// 这一趟除了最新那份，还开一份**窗口里最久没有被成功打开过**的包。
+    ///
+    /// 只开最新那份证明不了保留窗口的其余成员：旧包与读端不同步的问题只在它们
+    /// 身上出现，而它们要到真正需要恢复的那天才第一次被打开。
+    pub also_unproven: bool,
 }
 
 impl DrillConfig {
@@ -2848,6 +2854,7 @@ impl DrillConfig {
         let database_url = std::env::var("COGNEVA_DATABASE_URL")
             .map_err(|_| "COGNEVA_DATABASE_URL is required for backup-drill")?;
         let app_dir = std::env::var("COGNEVA_APP_DIR").unwrap_or_else(|_| "/opt/cogneva".into());
+        let (package, also_unproven) = requested_package(std::env::args().skip(1))?;
         Ok(Self {
             database_url,
             backup_dir: PathBuf::from(
@@ -2858,7 +2865,8 @@ impl DrillConfig {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
             migrations_dir: cog_storage::migrate::migrations_dir(&app_dir),
-            package: requested_package(std::env::args().skip(1))?,
+            package,
+            also_unproven,
         })
     }
 }
@@ -2868,22 +2876,28 @@ impl DrillConfig {
 /// cli 把子命令之后的一切原样留给它（与 `restore <package>` 同一形状），所以
 /// 这里不认得的写法要自己报错：一个拼错的 `--package` 会静默落回「开最新那份」，
 /// 而那一趟的结论看起来和点名开旧包的成功一模一样。
-fn requested_package(args: impl Iterator<Item = String>) -> Result<Option<String>, String> {
+fn requested_package(args: impl Iterator<Item = String>) -> Result<(Option<String>, bool), String> {
     let mut args = args;
     // 第一个词是子命令名本身。
     let _ = args.next();
     let mut package = None;
+    let mut also_unproven = false;
     while let Some(arg) = args.next() {
         if arg == "--package" {
             let name = args
                 .next()
                 .ok_or_else(|| "--package 后面要跟一个包名".to_string())?;
             package = Some(name);
+        } else if arg == "--also-unproven" {
+            also_unproven = true;
         } else {
             return Err(format!("backup-drill 不认这个参数：{arg}"));
         }
     }
-    Ok(package)
+    if package.is_some() && also_unproven {
+        return Err("--package 与 --also-unproven 指的不是同一件事，只能用一个".into());
+    }
+    Ok((package, also_unproven))
 }
 
 /// 这一趟开哪一份包。
@@ -2920,6 +2934,62 @@ fn choose_package(
             )
             .into()
         })
+}
+
+/// 窗口里最该被打开的那一份：从没成功打开过的最先，其次上次成功最早的。
+///
+/// 按卷上的顺序（名字即时间，最老的在前）走一遍：同是「从没成功过」时先到先得，
+/// 于是最老的那份先被选中；都有历史时取上次成功最早的那份。纯函数，查询留给调用方。
+fn pick_least_recently_proven(
+    names: &[String],
+    proven_at: &BTreeMap<String, DateTime<Utc>>,
+) -> Option<String> {
+    let mut best: Option<(&String, Option<DateTime<Utc>>)> = None;
+    for name in names {
+        let last = proven_at.get(name).copied();
+        let better = match (&best, last) {
+            (None, _) => true,
+            // 已经选中一个从没成功过的：后面同类的不能顶掉它（先到＝更老）。
+            (Some((_, None)), _) => false,
+            (Some((_, Some(_))), None) => true,
+            (Some((_, Some(best_at))), Some(at)) => at < *best_at,
+        };
+        if better {
+            best = Some((name, last));
+        }
+    }
+    best.map(|(name, _)| name.clone())
+}
+
+/// 问源库：卷上这些包里，哪一份距上次成功打开最久（从没成功过者优先）。
+///
+/// 问的是 `backup_drills` 里**成功**的行——失败的行不证明任何东西。卷上的名字由
+/// 调用方自己走目录得到，不用写者声称的那组：两处的理由是一样的。
+async fn least_recently_proven(
+    live: &PgPool,
+    packages: &[PathBuf],
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let names: Vec<String> = packages
+        .iter()
+        .filter_map(|p| p.file_name())
+        .filter_map(|n| n.to_str())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let rows: Vec<(String, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT package, max(finished_at) FROM backup_drills \
+         WHERE error IS NULL AND package = ANY($1) GROUP BY package",
+    )
+    .bind(&names)
+    .fetch_all(live)
+    .await?;
+    let proven_at: BTreeMap<String, DateTime<Utc>> = rows
+        .into_iter()
+        .filter_map(|(name, at)| at.map(|at| (name, at)))
+        .collect();
+    Ok(pick_least_recently_proven(&names, &proven_at))
 }
 
 /// 两份文件是不是同一份：同名、同字节数。
@@ -3512,19 +3582,40 @@ pub async fn run_drill_from_env() -> Result<(), Box<dyn std::error::Error>> {
     install_subscriber();
     let cfg = DrillConfig::from_env()?;
     let live = PgPool::connect(&cfg.database_url).await?;
-    let drill = run_drill(&cfg, &live).await;
     let store = PostgresBackupRunStore::new(live.clone());
-    store.record_drill(&drill).await?;
-    println!(
-        "{} {}",
-        drill.drill_id,
-        if drill.ok() { "ok" } else { "failed" }
-    );
-    if let Some(error) = &drill.error {
-        return Err(format!("演练没有证明这个包可恢复：{error}").into());
+
+    // 先开最新那份，再开窗口里最久没被证明的那份。顺序是判定的一部分：任何一趟
+    // 失败都立刻停，于是**最后一行的结论就是这一跑的结论**——若先跑旧包、后跑最新，
+    // 旧包的失败会被随后一行的绿盖住，而读数读的正是最新那一行。
+    let mut targets: Vec<Option<String>> = vec![cfg.package.clone()];
+    if cfg.also_unproven {
+        let packages = packages_in(&cfg.backup_dir);
+        match least_recently_proven(&live, &packages).await? {
+            Some(name) => targets.push(Some(name)),
+            None => tracing::warn!("卷上没有任何包可选，这一跑只开它能开的那一份"),
+        }
     }
-    if !drill.ok() {
-        return Err("演练的测量没有全部对上，这一行没有留下错误文本".into());
+
+    for target in targets {
+        let run_cfg = DrillConfig {
+            package: target,
+            also_unproven: false,
+            ..cfg.clone()
+        };
+        let drill = run_drill(&run_cfg, &live).await;
+        store.record_drill(&drill).await?;
+        println!(
+            "{} {} {}",
+            drill.drill_id,
+            if drill.ok() { "ok" } else { "failed" },
+            drill.package.as_deref().unwrap_or("-")
+        );
+        if let Some(error) = &drill.error {
+            return Err(format!("演练没有证明这个包可恢复：{error}").into());
+        }
+        if !drill.ok() {
+            return Err("演练的测量没有全部对上，这一行没有留下错误文本".into());
+        }
     }
     Ok(())
 }
@@ -3620,6 +3711,37 @@ mod tests {
     }
 
     #[test]
+    fn the_second_pick_is_the_package_least_recently_proven() {
+        let names: Vec<String> = ["p1", "p2", "p3"].iter().map(|s| s.to_string()).collect();
+        let at = |day: u32| Utc.with_ymd_and_hms(2026, 10, day, 0, 0, 0).unwrap();
+
+        // 一份都没成功过：选最老的（名字即时间，p1 在前）。
+        assert_eq!(
+            pick_least_recently_proven(&names, &BTreeMap::new()),
+            Some("p1".to_string())
+        );
+
+        // p3 从没成功过，另外两份都有历史：从没成功过的优先。
+        let mut proven = BTreeMap::new();
+        proven.insert("p1".to_string(), at(19));
+        proven.insert("p2".to_string(), at(12));
+        assert_eq!(
+            pick_least_recently_proven(&names, &proven),
+            Some("p3".to_string()),
+            "从没被证明过的一份要排在「很久以前证明过」的前面"
+        );
+
+        // 三份都有历史：取上次成功最早的那份，于是窗口里的每一份轮流被打开。
+        proven.insert("p3".to_string(), at(18));
+        assert_eq!(
+            pick_least_recently_proven(&names, &proven),
+            Some("p2".to_string())
+        );
+
+        assert_eq!(pick_least_recently_proven(&[], &proven), None);
+    }
+
+    #[test]
     fn the_offsite_column_compares_name_and_size() {
         // 这一列问的是「卷外那份是不是卷上最新那份」。点名开旧包时若拿被打开的那份
         // 去比，一条本来绿的规则会被判红——比较的对象是卷上最新，不是这一趟开的那份。
@@ -3652,12 +3774,21 @@ mod tests {
         // 调用方已经跳掉程序名，这里收到的第一个词是子命令名。
         assert_eq!(
             requested_package(argv(&["backup-drill"]).into_iter()),
-            Ok(None)
+            Ok((None, false))
         );
         assert_eq!(
             requested_package(argv(&["backup-drill", "--package", "p-1"]).into_iter()),
-            Ok(Some("p-1".to_string()))
+            Ok((Some("p-1".to_string()), false))
         );
+        assert_eq!(
+            requested_package(argv(&["backup-drill", "--also-unproven"]).into_iter()),
+            Ok((None, true))
+        );
+        // 两件事不能在同一跑里同时要。
+        assert!(requested_package(
+            argv(&["backup-drill", "--package", "p-1", "--also-unproven"]).into_iter()
+        )
+        .is_err());
         // 拼错或多余的操作数必须报错：落回「开最新那份」会让这一趟的结论不可信。
         assert!(requested_package(argv(&["backup-drill", "--packag", "p-1"]).into_iter()).is_err());
         assert!(requested_package(argv(&["backup-drill", "--package"]).into_iter()).is_err());

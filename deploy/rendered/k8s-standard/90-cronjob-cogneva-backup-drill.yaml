@@ -46,7 +46,9 @@ spec:
             - name: drill
               image: localhost:30500/cogneva:local
               imagePullPolicy: Always
-              args: ["backup-drill"]
+              # 最新那份 ＋ 窗口里最久没被成功打开过的一份：只开最新证明不了保留
+              # 窗口的其余成员，而旧包与读端不同步的问题只在旧包上出现。
+              args: ["backup-drill", "--also-unproven"]
               env:
                 - name: PG_PASSWORD
                   valueFrom:
