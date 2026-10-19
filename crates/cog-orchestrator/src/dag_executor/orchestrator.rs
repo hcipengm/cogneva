@@ -1006,8 +1006,14 @@ impl DagExecutor {
 
     /// Batch add multiple tasks to the existing DAG.
     /// Two-phase commit: validate all first, then commit, to avoid partial
-    /// state on cycle detection. Existing tasks with duplicate IDs are
-    /// idempotently skipped.
+    /// state on cycle detection.
+    ///
+    /// A held id is skipped only when the row underneath it is the same piece
+    /// of work being redelivered; an id reused for different work is refused.
+    /// Skipping it instead would queue the rest of the plan while its
+    /// dependencies still name the held row, so `blocked_by: [t3]` would wait
+    /// on another plan's `t3` — a predecessor that settles for reasons that
+    /// have nothing to do with this plan, or never settles at all.
     pub async fn add_tasks_batch(&self, tasks: Vec<Task>) -> SFResult<Vec<String>> {
         if self.fg().is_some() {
             return self.add_tasks_batch_store(tasks).await;
@@ -1015,13 +1021,20 @@ impl DagExecutor {
         let mut inner = self.inner.write().await;
         // Phase 1: collect new tasks and their dependencies, skipping duplicates
         let mut validated: Vec<(String, HashSet<String>, Task)> = Vec::new();
+        let mut reused: Vec<String> = Vec::new();
         for task in tasks {
             let task_id = task.id.clone();
-            if inner.tasks.contains_key(&task_id) {
-                continue; // Idempotent skip
+            if let Some(held) = inner.tasks.get(&task_id) {
+                if !same_submitted_work(held, &task) {
+                    reused.push(reused_id_note(held, &task));
+                }
+                continue; // Idempotent skip of a redelivery
             }
             let deps: HashSet<String> = task.blocked_by.iter().cloned().collect();
             validated.push((task_id, deps, task));
+        }
+        if !reused.is_empty() {
+            return Err(reused_ids_refusal(&reused));
         }
 
         // Insert dependency edges into the combined graph (existing + new)
@@ -1237,14 +1250,23 @@ impl DagExecutor {
             .iter()
             .map(|t| (t.id.clone(), t.blocked_by.iter().cloned().collect()))
             .collect();
+        let held_by_id: HashMap<&str, &Task> =
+            existing.iter().map(|t| (t.id.as_str(), t)).collect();
 
         let mut validated = Vec::new();
+        let mut reused: Vec<String> = Vec::new();
         for task in tasks {
-            if graph.contains_key(&task.id) {
-                continue; // 幂等跳过
+            if let Some(held) = held_by_id.get(task.id.as_str()) {
+                if !same_submitted_work(held, &task) {
+                    reused.push(reused_id_note(held, &task));
+                }
+                continue; // 幂等跳过：同一份工作的重投
             }
             graph.insert(task.id.clone(), task.blocked_by.iter().cloned().collect());
             validated.push(task);
+        }
+        if !reused.is_empty() {
+            return Err(reused_ids_refusal(&reused));
         }
         if let Some(cycle) = detect_cycle_graph(&graph) {
             return Err(cog_core::SFError::Validation(format!(
@@ -3286,6 +3308,42 @@ impl DagExecutor {
 
 use async_trait::async_trait;
 
+/// Whether `held` is the same piece of work as `incoming` — a redelivery of a
+/// task already in the graph — rather than different work that reused its id.
+///
+/// Only the submission is compared. Status, attempts, lease and timestamps all
+/// move on their own after the row lands, so a replay days later still reads as
+/// the same task; what a redelivery must reproduce is what was asked for.
+fn same_submitted_work(held: &Task, incoming: &Task) -> bool {
+    held.task_type == incoming.task_type && held.input == incoming.input
+}
+
+/// One line per reused id: whose row holds it and what state that row is in.
+/// The first question a reader has is which plan this submission would have
+/// started depending on.
+fn reused_id_note(held: &Task, incoming: &Task) -> String {
+    format!(
+        "'{}' is held by goal {} ({}) while this submission belongs to goal {}",
+        incoming.id,
+        held.goal_id.as_deref().unwrap_or("unknown"),
+        held.status.as_str(),
+        incoming.goal_id.as_deref().unwrap_or("unknown"),
+    )
+}
+
+/// The refusal a batch gets when any id in it was reused for different work.
+/// The whole batch is refused rather than the offending rows skipped: the rest
+/// of the plan names those ids as predecessors, so queueing it would attach it
+/// to rows that settle for unrelated reasons — or never settle, which is how
+/// seven rows sat Pending for fifteen hours.
+fn reused_ids_refusal(reused: &[String]) -> cog_core::SFError {
+    cog_core::SFError::Validation(format!(
+        "refusing the submission: task ids reused for different work — {}. \
+         Skipping them would leave the rest of the plan waiting on the held rows",
+        reused.join("; ")
+    ))
+}
+
 /// 在依赖图（task → blocked_by 集合）上 DFS 检测环，两种模式共用。
 fn detect_cycle_graph(deps: &HashMap<String, HashSet<String>>) -> Option<Vec<String>> {
     fn dfs(
@@ -3710,6 +3768,89 @@ mod tests {
                 t
             })
             .collect()
+    }
+
+    /// 幂等的边界是「同一份工作」，不是「同一个 id」：同一任务重投（类型与输入
+    /// 逐字节相同）必须被吞掉，而拿旧 id 装新活要把整份提交判退——否则其余各行的
+    /// `blocked_by` 会挂到别人的行上。
+    #[tokio::test]
+    async fn a_redelivery_of_the_same_task_is_still_idempotent() {
+        let dag = DagExecutor::new("ws-replay".into());
+        let task = Task::new("t1", TaskType::Generator, serde_json::json!({"goal": "a"}));
+        assert_eq!(
+            dag.add_tasks_batch(vec![task.clone()]).await.unwrap(),
+            vec!["t1".to_string()]
+        );
+        let queued = dag.add_tasks_batch(vec![task]).await.unwrap();
+        assert!(queued.is_empty(), "a replay queues nothing: {queued:?}");
+        assert_eq!(dag.get_all_tasks().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_id_reused_for_different_work_refuses_the_whole_batch() {
+        let dag = DagExecutor::new("ws-reuse".into());
+        dag.add_tasks_batch(vec![Task::new(
+            "t1",
+            TaskType::Generator,
+            serde_json::json!({"goal": "old"}),
+        )])
+        .await
+        .unwrap();
+
+        let mut dependent = Task::new(
+            "t5",
+            TaskType::Generator,
+            serde_json::json!({"goal": "new"}),
+        );
+        dependent.blocked_by = vec!["t1".into()];
+        let err = dag
+            .add_tasks_batch(vec![
+                Task::new(
+                    "t1",
+                    TaskType::Generator,
+                    serde_json::json!({"goal": "new"}),
+                ),
+                dependent,
+            ])
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("reused for different work"), "{text}");
+        assert!(text.contains("'t1'"), "{text}");
+        // 整份判退：t5 也没有进图，否则它会挂到一条与它无关的前驱上。
+        assert!(dag.get_task("t5").await.is_none());
+        let held = dag.get_task("t1").await.unwrap();
+        assert_eq!(
+            held.input,
+            serde_json::json!({"goal": "old"}),
+            "the held row is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_store_path_refuses_an_id_reused_for_different_work() {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let dag = DagExecutor::new("ws-reuse-fg".into()).with_state_backend(backend);
+        dag.add_tasks_batch(vec![Task::new(
+            "t1",
+            TaskType::Generator,
+            serde_json::json!({"goal": "old"}),
+        )])
+        .await
+        .unwrap();
+        let err = dag
+            .add_tasks_batch(vec![Task::new(
+                "t1",
+                TaskType::Generator,
+                serde_json::json!({"goal": "new"}),
+            )])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("reused for different work"),
+            "{err}"
+        );
+        assert_eq!(dag.get_all_tasks().await.len(), 1);
     }
 
     #[tokio::test]
