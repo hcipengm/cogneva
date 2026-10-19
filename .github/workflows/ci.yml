@@ -97,6 +97,16 @@ jobs:
       # rather than passes when the binary is missing, so it cannot go quiet.
       - name: The generated SSH keypair is readable by ssh-keygen
         run: cargo test -p cog-gateway --lib -- --ignored
+      # The capped agent log is the first state this backend can get wrong only
+      # after the cap fires: a trim moves every list position, so a reader that
+      # indexes by position skips as many records as were dropped and a next
+      # sequence taken from the list length hands out numbers already used. Both
+      # are invisible until a log crosses the cap, which is to say in
+      # production, and the service above makes the server cost nothing here.
+      - name: Live-Redis capped agent log
+        run: cargo test -p cog-storage --test wal_redis_trim -- --ignored
+        env:
+          COGNEVA_TEST_REDIS_URL: redis://127.0.0.1:6379
       - name: Live-DB partition tests
         run: cargo test -p cog-storage --test partition_maintainer -- --ignored
         env:
