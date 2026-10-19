@@ -1,0 +1,62 @@
+# Dormancy registry for the in-process alert rules (`observability.infra_watch.rules`
+# in files/cogneva.json).
+#
+# These rules run inside the application, not in Prometheus, and they have no
+# query API: this chart file is the only source of truth for their expressions.
+# The witness reading (scripts/host/cogneva-alert-rule-witness-reading.sh in the
+# private brain repo, COGNEVA_RULE_LAYER=infra_watch) checks each rule's vector
+# selectors against the live series face and the 24h sample window, exactly as
+# it does for the Prometheus layer.
+#
+# A rule whose series do not exist cannot fire, and that looks the same as a
+# rule that found nothing wrong. Sleeping is not automatically a defect, but the
+# reason has to be written down where a reader (and the reading) can find it:
+#
+#     rule <tab> absent_series (comma separated) <tab> reason <tab> why
+#
+# reason is a closed set:
+#   object_absent     the object family is not deployed; the rule wakes with it
+#   component_absent  the component the rule watches is not deployed -- a defect
+#   feature_off       the feature is not configured
+#   collector_off     the exporter is up but this collector is not enabled
+#   exporter_version  the source binary's version does not expose the family
+#   series_renamed    upstream renamed/removed the series; the rule needs a fix
+#   known_defect      a declared defect, with the fix named in why
+#   lazy_counter      the series is created by the first bad event; no event so
+#                     far means nothing to fire on, and the rule fires the
+#                     moment one happens (absence is the good outcome)
+#   error_only_state  the gauge is exported only for problem states; a healthy
+#                     subject is absent rather than zero (absence is the good
+#                     outcome)
+#   code_not_deployed the emitting code is newer than the running image; the
+#                     series appears on the next rollout, at which point this
+#                     row is reported stale and must be deleted
+#
+# An absent series without a row here exits 1. An unknown reason code, an empty
+# why, or a missing registry exits 3. A row whose series came back is reported
+# as stale -- the condition it describes is no longer true.
+#
+# The last two codes are the ones to watch: they turn "nothing happened" into a
+# legitimate dormant rule, so a wholesale application of them would silently
+# wave through a dead rule. Each row names the emitting path in why.
+#
+# Re-read 2026-10-19 against the live series face (24h window), app image
+# main-be5add5996d6.
+
+# --- lazy_counter (7 rules): counters that exist only after the bad event ----
+landing_mirror_behind	cogneva_mirror_push_failures_total	lazy_counter	Counted only when a mirror push is refused (cog-github/src/landing.rs record_counter on the failure branch); no refusal in 24h means the counter was never created. The rule fires on the first one.
+mainline_delivery_preflight_refused	cogneva_mainline_preflight_refused_total	lazy_counter	Counted only when the preflight refuses a deploy (cog-reflection/src/mainline_deployer.rs); refused_total has no zero-value series until the first refusal.
+memory_backend_operation_never_succeeds	memory_operation_errors_total	lazy_counter	Counted only on a failed memory backend operation (cog-memory/src/metrics_instrumented.rs); no error in the window means no series. The rule also requires memory_operations_total, which is present on the success path.
+redrive_budget_forgotten	cogneva_redrive_budget_losses_total	lazy_counter	Read-side ledger loss is counted only when the ledger read fails (cog-github/src/landing.rs); today the read succeeds, so the {side="read"} series does not exist.
+redrive_charge_not_persisted	cogneva_redrive_budget_losses_total	lazy_counter	Write-side ledger loss is counted only when the ledger write fails (cog-github/src/landing.rs); today the write succeeds, so the {side="write"} series does not exist.
+registry_tag_deletion_refused	cogneva_registry_prune_failures_total	lazy_counter	Counted only when a registry prune is refused (cog-reflection/src/mainline_deployer.rs); no refusal in the window.
+trace_tier_migration_failing	cogneva_trace_tier_pass_failures_total	lazy_counter	Counted only when a trace-tier pass fails (cog-observability/src/snapshot.rs); no failure in the window.
+
+# --- error_only_state (3 rules): gauges exported only when unhealthy --------
+declared_failure_class_unrecorded	collab_classification_unreachable	error_only_state	cog-collaboration/src/observable.rs emits this gauge only on the branch where a failure class could not be recorded; healthy operation exports nothing, which the rule reads as "no problem".
+held_series_check_unreadable	cogneva_metric_held_unreadable	error_only_state	cog-gateway/src/lib.rs exports this gauge only when the held-series check cannot be read; a readable check is absent, and the rule's max() sees no series.
+runtime_asset_content_drift	cogneva_runtime_asset_state	error_only_state	cog-reflection/src/runtime_assets.rs exports state gauges only for problem states of destinations that have one; a healthy asset is absent. The check's own timestamp is a separate series (cogneva_runtime_asset_check_seconds, present).
+runtime_asset_not_refreshed	cogneva_runtime_asset_state	error_only_state	Same gauge and same export rule; not_refreshed is absent because every checked asset matched its manifest.
+
+# --- code_not_deployed (1 rule, 4 series): newer than the running image -----
+task_router_claim_stall	cogneva_task_router_claim_hold_bound_seconds,cogneva_task_router_claim_in_flight,cogneva_task_router_claim_slots,cogneva_task_router_claim_wait_seconds	code_not_deployed	The gauges were added in 221a6c22 (2026-10-19 10:56 +0800) and the running app image is main-be5add5996d6 (10:09 +0800), which predates them. They appear on the next rollout; delete this row then.
