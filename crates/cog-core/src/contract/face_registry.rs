@@ -838,6 +838,41 @@ mod tests {
     }
 
     #[test]
+    fn a_witness_who_is_the_owner_is_yellow_rather_than_a_second_signature() {
+        let mut face = face(Some("unit-operator"));
+        face.spec.witness_unit = Some("unit-operator".into());
+        let tasks = vec![task(Some("unit-operator"), TaskStatus::Running)];
+        let reading = observe(FaceObservation {
+            face_id: "task-management",
+            face: Some(&face),
+            open_tasks: &tasks,
+            signed_handovers: &[],
+            owner_liveness: OwnerLiveness::Seen(Utc::now()),
+            now: Utc::now(),
+        });
+        assert_eq!(reading.state, DriftState::WitnessIsOwner);
+        assert!(reading.state.is_yellow());
+        assert!(reading.red_rules.is_empty());
+    }
+
+    #[test]
+    fn a_deputy_who_is_the_owner_is_yellow_rather_than_a_backup() {
+        let mut face = face(Some("unit-operator"));
+        face.spec.deputy_unit = Some("unit-operator".into());
+        let tasks = vec![task(Some("unit-operator"), TaskStatus::Running)];
+        let reading = observe(FaceObservation {
+            face_id: "task-management",
+            face: Some(&face),
+            open_tasks: &tasks,
+            signed_handovers: &[],
+            owner_liveness: OwnerLiveness::Seen(Utc::now()),
+            now: Utc::now(),
+        });
+        assert_eq!(reading.state, DriftState::DeputyOverlap);
+        assert!(reading.state.is_yellow());
+    }
+
+    #[test]
     fn an_idle_verdict_says_which_of_the_three_situations_fired() {
         // No work on the face.
         let face = face(Some("unit-operator"));
