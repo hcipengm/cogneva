@@ -102,6 +102,16 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_build_gate_wait_budget_ms",
         "crates/cog-core/src/contract/build_gate.rs",
     ),
+    // The turn granted and never taken: a claim on the next build that a later
+    // arrival read past its freshness budget. It is published by the reflection
+    // process that runs the gate, not by the contract beside the other three,
+    // and it is the one reading in this family that names the work that lost
+    // the turn rather than the slot it lost -- which is why the rule that reads
+    // it is where a starved asker becomes visible at all.
+    (
+        "cogneva_build_gate_reservation_lapsed_total",
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
     // The cap family, as far as the rules read it. `unmet` is what says a pass
     // ran and could not reach the cap; the other two are the pair a stalled cap
     // is judged by -- how long the cache has been over it against how long
