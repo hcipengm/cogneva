@@ -603,14 +603,105 @@ fn matching_open(s: &str, close_at: usize, open: u8, close: u8) -> Option<usize>
     }
 }
 
+/// The `)` (or `}`) that closes the group opened at `open_at`.
+fn matching_close(s: &str, open_at: usize, open: u8, close: u8) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut j = open_at;
+    loop {
+        let b = *bytes.get(j)?;
+        if b == open {
+            depth += 1;
+        } else if b == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(j);
+            }
+        }
+        j += 1;
+    }
+}
+
+/// The aggregation word at the start of `word`, split into the operator and the
+/// `by`/`without` tail glued to it.
+///
+/// Whitespace is squeezed out before this is asked, so `max without (pod) (x)`
+/// arrives as `maxwithout(pod)(x)` and the two words are one token. Splitting
+/// them here keeps every reader of [`AGGREGATIONS`] from having to know that.
+fn split_aggregation_word(word: &str) -> Option<(&'static str, &str)> {
+    for agg in AGGREGATIONS {
+        if word == *agg {
+            return Some((agg, ""));
+        }
+        if let Some(tail) = word.strip_prefix(agg) {
+            if tail == "by" || tail == "without" {
+                return Some((agg, tail));
+            }
+        }
+    }
+    None
+}
+
+/// The `(` that opens the argument of the aggregation closed at `close_at`.
+///
+/// `((max without (a, b) (x)) and (...))[5m]` does not hand its window to a
+/// series: the bracket hangs off a parenthesized expression. This asks whether
+/// that expression is an aggregation applied to one name, which is the
+/// clock-bearing shape a duration rule takes after it is moved off the
+/// reporter's own labels.
+fn aggregation_argument_open(s: &str, close_at: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let open = matching_open(s, close_at, b'(', b')')?;
+    let mut i = open + 1;
+    while i < close_at && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let word_start = i;
+    while i < close_at && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    split_aggregation_word(&s[word_start..i])?;
+    let mut j = i;
+    while j < close_at && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    for kw in ["by", "without"] {
+        if !s[j..].starts_with(kw) {
+            continue;
+        }
+        let after = j + kw.len();
+        if after < bytes.len() && !bytes[after].is_ascii_whitespace() && bytes[after] != b'(' {
+            continue;
+        }
+        let mut k = after;
+        while k < close_at && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if bytes.get(k) == Some(&b'(') {
+            j = matching_close(s, k, b'(', b')')? + 1;
+            while j < close_at && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+        }
+        break;
+    }
+    if bytes.get(j) != Some(&b'(') {
+        return None;
+    }
+    Some(j)
+}
+
 /// The series named immediately before `at`, whether what follows is the
 /// `offset` keyword or a range selector.
 ///
 /// `a offset 1h`, `a{x="y"} offset 1h` and `a[5m] offset 1h` all read `a`; so do
 /// `a[5m]` and `a{x="y"}[5m]`, which is the same question with the bracket in
-/// the other role. An expression whose selector is parenthesized
-/// (`(a + b)[5m] offset 1h`) is not classified — this feeds a positive finding,
-/// so a shape it does not classify is a weaker gate, not a wrong one.
+/// the other role. A window hung off an aggregation's argument —
+/// `(max without (pod, instance) (a))[5m]` — also reads `a`: the aggregation
+/// drops the reporter's labels and still reads one series. Any other
+/// parenthesized selector (`(a + b)[5m] offset 1h`) is not classified — this
+/// feeds a positive finding, so a shape it does not classify is a weaker gate,
+/// not a wrong one.
 fn series_before(s: &str, at: usize) -> Option<&str> {
     let bytes = s.as_bytes();
     let skip_ws = |mut i: usize| {
@@ -625,6 +716,19 @@ fn series_before(s: &str, at: usize) -> Option<&str> {
     }
     if end > 0 && bytes[end - 1] == b'}' {
         end = skip_ws(matching_open(s, end - 1, b'{', b'}')?);
+    }
+    // `(max without (a, b) (x))[5m]` opens a window over `x`: the selector is
+    // closed by an aggregation around it, and what the window reads is the
+    // aggregation's argument. Expanding outward over that call and its clause
+    // answers the same question the bare-name read answers.
+    if end > 0 && bytes[end - 1] == b')' {
+        let open = aggregation_argument_open(s, end - 1)?;
+        let close = matching_close(s, open, b'(', b')')?;
+        let name = s[open + 1..close].trim();
+        if name.is_empty() || !name.bytes().all(token_char) {
+            return None;
+        }
+        return Some(name);
     }
     let start = s[..end]
         .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
@@ -779,17 +883,93 @@ pub fn companion_age_bound(expr: &str, series: &str) -> Option<u64> {
 fn companion_age_bound_in(stripped: &str, series: &str) -> Option<u64> {
     let companion = cog_core::observability_text::observed_timestamp_name(series);
     let compact: String = stripped.chars().filter(|c| !c.is_whitespace()).collect();
-    let needle = format!("time()-{companion}");
-    let after = compact.find(&needle)? + needle.len();
-    let rest = compact[after..]
-        .strip_prefix(')')
-        .unwrap_or(&compact[after..]);
-    let rest = rest.strip_prefix('<')?;
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
+    // Every `time() - …` in the expression is a candidate: a rule that moves
+    // the guard inside a subquery still reads the writer, it just does it in
+    // the same expression as the window instead of beside it.
+    let mut from = 0usize;
+    while let Some(rel) = compact[from..].find("time()-") {
+        let after = from + rel + "time()-".len();
+        from = after;
+        if let Some(bound) = age_bound_on(&compact, after, &companion) {
+            return Some(bound);
+        }
+    }
+    None
+}
+
+/// The `<digits>` of `<expr> < digits`, where `<expr>` is the companion either
+/// bare or wrapped in an aggregation.
+///
+/// `(time() - (max without (pod, container, instance) (c_observed)) < 1800)`
+/// puts the reduction between the clock and the companion because the guard
+/// has to answer one question for the object, not one per reporting pod — the
+/// same reason the window moved onto an aggregated subquery. The bound is the
+/// same bound, and a matcher that only knew the bare spelling would have
+/// declared the guard missing exactly when the rule got stricter.
+fn age_bound_on(compact: &str, after: usize, companion: &str) -> Option<u64> {
+    let bytes = compact.as_bytes();
+    let mut i = after;
+    let mut opened = 0usize;
+    while bytes.get(i) == Some(&b'(') {
+        i += 1;
+        opened += 1;
+    }
+    let (argument, aggregated) = match aggregation_argument_open_at(compact, i) {
+        Some(Some(open)) => (open + 1, true),
+        Some(None) => (i, false),
+        None => return None,
+    };
+    let rest = compact.get(argument..)?.strip_prefix(companion)?;
+    let mut j = compact.len() - rest.len();
+    let required = opened + usize::from(aggregated);
+    let mut closed = 0usize;
+    loop {
+        if closed >= required {
+            if let Some(after_close) = compact.get(j..).and_then(|s| s.strip_prefix('<')) {
+                let digits: String = after_close
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if !digits.is_empty() {
+                    return digits.parse().ok();
+                }
+            }
+        }
+        if bytes.get(j) != Some(&b')') || closed > required + 2 {
+            return None;
+        }
+        j += 1;
+        closed += 1;
+    }
+}
+
+/// [`aggregation_argument_open`] at arbitrary positions: `Some(Some(open))`
+/// when an aggregation starts at `i`, `Some(None)` when the text there is a
+/// plain operand, `None` when it looks like neither.
+fn aggregation_argument_open_at(s: &str, i: usize) -> Option<Option<usize>> {
+    let bytes = s.as_bytes();
+    let mut j = i;
+    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+        j += 1;
+    }
+    let word = &s[i..j];
+    if word.is_empty() {
+        return Some(None);
+    }
+    let Some((_, tail)) = split_aggregation_word(word) else {
+        return Some(None);
+    };
+    let mut k = j;
+    if !tail.is_empty() {
+        if bytes.get(k) != Some(&b'(') {
+            return None;
+        }
+        k = matching_close(s, k, b'(', b')')? + 1;
+    }
+    if bytes.get(k) != Some(&b'(') {
         return None;
     }
-    digits.parse().ok()
+    Some(Some(k))
 }
 
 /// The window of every call to `func` in `expr`, in seconds.
@@ -1835,6 +2015,29 @@ mod tests {
         );
         // A parenthesized selector names no series and is not attributed.
         assert!(windows_over("max_over_time((a + c)[30m])", &gated).is_empty());
+        // A window over an aggregation's argument reads that argument: the
+        // reduction drops the reporter's labels and the window still covers
+        // one series. Both spellings of the clause are read.
+        assert_eq!(
+            windows_over(
+                "min_over_time((max without (pod, instance) (a))[30m:1m]) > 0",
+                &gated
+            ),
+            vec![("a".to_string(), 1_800)]
+        );
+        assert_eq!(
+            windows_over("min_over_time((max by (k) (c))[1h:1m]) > 0", &gated),
+            vec![("c".to_string(), 3_600)]
+        );
+        // A parenthesized *expression* inside the aggregation is still not a
+        // series, and a plain function call is not an aggregation.
+        assert!(windows_over("min_over_time((max(a + c))[30m:1m]) > 0", &gated).is_empty());
+        // A call inside the subquery is not an aggregation, but its own range
+        // selector is still a window over the series it names.
+        assert_eq!(
+            windows_over("min_over_time((rate(a[5m]))[30m:1m]) > 0", &gated),
+            vec![("a".to_string(), 300)]
+        );
     }
 
     /// The store-gauge guard, on the shapes the shipped rules really carry: the
@@ -1959,6 +2162,20 @@ mod tests {
         assert_eq!(
             companion_age_bound("(time()-x_observed_timestamp_seconds)<1800", "x"),
             Some(1_800)
+        );
+        // The same bound with the companion reduced to one series per object:
+        // the guard has to answer once for the thing, not once per reporter,
+        // and a matcher that only knew the bare spelling would call the
+        // stricter rule unguarded.
+        let folded = "min_over_time(((min without (pod, instance) (x)) and \
+             ((time() - (max without (pod, instance) (x_observed_timestamp_seconds))) < 1800))[30m:1m]) > 1";
+        assert_eq!(companion_age_bound(folded, "x"), Some(1_800));
+        assert_eq!(
+            companion_age_bound(
+                "(time() - (max by (t) (x_observed_timestamp_seconds))) < 3600",
+                "x"
+            ),
+            Some(3_600)
         );
         // Not the inverse reading, not an unrelated series, not absent.
         assert_eq!(

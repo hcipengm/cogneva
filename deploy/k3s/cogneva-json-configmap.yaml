@@ -732,7 +732,7 @@ data:
             },
             {
               "name": "observability_stack_drift_not_repaired",
-              "promql": "(max without (pod, container, instance) (min_over_time(cogneva_observability_drift_lines[30m])) > 0) and (max without (pod, container, instance) (count_over_time(cogneva_observability_drift_lines[1h])) > max without (pod, container, instance) (count_over_time(cogneva_observability_drift_lines[30m])))",
+              "promql": "(min_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[30m:1m]) > 0) and (count_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[1h:1m]) > count_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[30m:1m]))",
               "condition": {
                 "greater_than": 0.0
               },
@@ -1048,7 +1048,7 @@ data:
             },
             {
               "name": "build_gate_not_in_force",
-              "promql": "max by (dir, role) (min_over_time(cogneva_build_gate_slots{role=\"builder\"}[5m])) and (max by (dir, role) (count_over_time(cogneva_build_gate_slots{role=\"builder\"}[10m])) > max by (dir, role) (count_over_time(cogneva_build_gate_slots{role=\"builder\"}[5m])))",
+              "promql": "(min_over_time((max by (dir, role) (cogneva_build_gate_slots{role=\"builder\"}))[5m:1m]) < 1) and (count_over_time((max by (dir, role) (cogneva_build_gate_slots{role=\"builder\"}))[10m:1m]) > count_over_time((max by (dir, role) (cogneva_build_gate_slots{role=\"builder\"}))[5m:1m]))",
               "condition": {
                 "less_than": 1.0
               },
@@ -1462,7 +1462,7 @@ data:
             },
             {
               "name": "metrics_sample_log_unpruned",
-              "promql": "((min without (pod, container, instance) (min_over_time(metrics_samples_rows[30m]) and ((time() - metrics_samples_rows_observed_timestamp_seconds) < 1800))) > 1.05 * max without (pod, container, instance) (metrics_samples_budget_rows)) and (max without (pod, container, instance) (count_over_time(metrics_samples_rows[1h])) > max without (pod, container, instance) (count_over_time(metrics_samples_rows[30m])))",
+              "promql": "((min_over_time(((min without (pod, container, instance) (metrics_samples_rows)) and ((time() - (max without (pod, container, instance) (metrics_samples_rows_observed_timestamp_seconds))) < 1800))[30m:1m]) > 1.05 * max without (pod, container, instance) (metrics_samples_budget_rows)) and (count_over_time((min without (pod, container, instance) (metrics_samples_rows))[1h:1m]) > count_over_time((min without (pod, container, instance) (metrics_samples_rows))[30m:1m])))",
               "condition": {
                 "greater_than": 0.0
               },
@@ -1606,7 +1606,7 @@ data:
             },
             {
               "name": "worktree_index_absent",
-              "promql": "(min by (worktree) (min_over_time(cogneva_worktree_index_present[30m]) and ((time() - cogneva_worktree_index_present_observed_timestamp_seconds) < 10800)) < 1) and (max by (worktree) (count_over_time(cogneva_worktree_index_present[1h])) > max by (worktree) (count_over_time(cogneva_worktree_index_present[30m])))",
+              "promql": "((min_over_time(((min by (worktree) (cogneva_worktree_index_present)) and ((time() - (max by (worktree) (cogneva_worktree_index_present_observed_timestamp_seconds))) < 10800))[30m:1m]) < 1) and (count_over_time((min by (worktree) (cogneva_worktree_index_present))[1h:1m]) > count_over_time((min by (worktree) (cogneva_worktree_index_present))[30m:1m])))",
               "condition": {
                 "less_than": 1.0
               },
@@ -1633,7 +1633,7 @@ data:
             },
             {
               "name": "metrics_retired_rows_still_arriving",
-              "promql": "(max by (table) (min_over_time(metrics_retired_rows_removed[1h]) and ((time() - metrics_retired_rows_removed_observed_timestamp_seconds) < 3600)) > 0) and (max by (table) (count_over_time(metrics_retired_rows_removed[2h])) > max by (table) (count_over_time(metrics_retired_rows_removed[1h])))",
+              "promql": "((min_over_time(((max by (table) (metrics_retired_rows_removed)) and ((time() - (max by (table) (metrics_retired_rows_removed_observed_timestamp_seconds))) < 3600))[1h:1m]) > 0) and (count_over_time((max by (table) (metrics_retired_rows_removed))[2h:1m]) > count_over_time((max by (table) (metrics_retired_rows_removed))[1h:1m])))",
               "condition": {
                 "greater_than": 0.0
               },
@@ -1732,7 +1732,7 @@ data:
             },
             {
                 "name": "baseline_port_tick_failing_every_round",
-                "promql": "(max without (pod, container, instance, job) (min_over_time(baseline_port_tick_failed[2h]) and ((time() - baseline_port_tick_failed_observed_timestamp_seconds) < 10800)) == 1) and (max without (pod, container, instance, job) (count_over_time(baseline_port_tick_failed[4h])) > max without (pod, container, instance, job) (count_over_time(baseline_port_tick_failed[2h])))",
+                "promql": "((min_over_time(((max without (pod, container, instance, job) (baseline_port_tick_failed)) and ((time() - (max without (pod, container, instance, job) (baseline_port_tick_failed_observed_timestamp_seconds))) < 10800))[2h:1m]) == 1) and (count_over_time((max without (pod, container, instance, job) (baseline_port_tick_failed))[4h:1m]) > count_over_time((max without (pod, container, instance, job) (baseline_port_tick_failed))[2h:1m])))",
                 "condition": {
                   "greater_than": 0.0
                 },
@@ -1885,7 +1885,7 @@ data:
             },
             {
               "name": "host_slice_anon_floor_unmeasured",
-              "promql": "(max by (node) (min_over_time(cogneva_host_slice_anon_bytes{slice=\"user.slice\"}[15m])) > 8589934592) and (sum by (node) (count_over_time(cogneva_host_slice_anon_bytes{slice=\"user.slice\"}[30m])) > sum by (node) (count_over_time(cogneva_host_slice_anon_bytes{slice=\"user.slice\"}[15m])))",
+              "promql": "(min_over_time((max by (node) (cogneva_host_slice_anon_bytes{slice=\"user.slice\"}))[15m:1m]) > 8589934592) and (count_over_time((max by (node) (cogneva_host_slice_anon_bytes{slice=\"user.slice\"}))[30m:1m]) > count_over_time((max by (node) (cogneva_host_slice_anon_bytes{slice=\"user.slice\"}))[15m:1m]))",
               "condition": {
                 "greater_than": 0.0
               },
@@ -1903,7 +1903,7 @@ data:
             },
             {
               "name": "host_ledger_slices_invisible",
-              "promql": "(min by (node) (min_over_time(cogneva_host_ledger_slices_readable[15m])) < 3) and (sum by (node) (count_over_time(cogneva_host_ledger_slices_readable[30m])) > sum by (node) (count_over_time(cogneva_host_ledger_slices_readable[15m])))",
+              "promql": "(min_over_time((min by (node) (cogneva_host_ledger_slices_readable))[15m:1m]) < 3) and (count_over_time((min by (node) (cogneva_host_ledger_slices_readable))[30m:1m]) > count_over_time((min by (node) (cogneva_host_ledger_slices_readable))[15m:1m]))",
               "condition": {
                 "less_than": 3.0
               },
