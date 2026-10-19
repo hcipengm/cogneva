@@ -192,9 +192,11 @@ jobs:
       # Which transitions the owner guard lets through is decided in the
       # statement that runs the write, and the answer is not visible from the
       # call sites: a check that reads status alone lets a unit move work it
-      # does not own, and the write succeeds either way.
+      # does not own, and the write succeeds either way. One thread, because
+      # each test builds the schema on the shared database first: run together
+      # they create the same types at once and the catalog refuses the second.
       - name: Live-DB task ownership guard
-        run: cargo test -p cog-storage --test task_ownership_store -- --ignored
+        run: cargo test -p cog-storage --test task_ownership_store -- --ignored --test-threads=1
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # What a single pruning statement costs, and which rows it takes. The
