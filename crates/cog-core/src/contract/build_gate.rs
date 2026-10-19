@@ -183,12 +183,13 @@ pub fn dir_identity(_dir: &Path) -> String {
 /// What a process that installed a build gate can be asked, from a crate that
 /// does not hold the gate.
 ///
-/// Three questions, and each has exactly one asker that is not the gate's own
-/// crate: the cache pass needs the gate as a slot, and the resource account
-/// needs the events the gate queued while it moved the bound or refused a
-/// build. Both come through this trait because the gate's own type cannot be
-/// named here, and `GateSlot` is what turns the first answer into the slot the
-/// pass takes.
+/// Four questions, and each has exactly one asker that is not the gate's own
+/// crate: the cache pass needs the gate as a slot, the resource account needs
+/// the events the gate queued while it moved the bound or refused a build, and
+/// a producer elsewhere in the process needs somewhere to put an event it did
+/// not decide about the host itself. All come through this trait because the
+/// gate's own type cannot be named here, and `GateSlot` is what turns the first
+/// answer into the slot the pass takes.
 #[async_trait::async_trait]
 pub trait ProcessGate: Send + Sync {
     /// Whether anything bounds builds in this process at all.
@@ -200,6 +201,14 @@ pub trait ProcessGate: Send + Sync {
 
     /// Hands this process's queued resource events to the account's consumer.
     fn drain_events(&self) -> Vec<ResourceEvent>;
+
+    /// Queues one event for that same consumer.
+    ///
+    /// The ring belongs to the process, not to the bound: its first producer is
+    /// the control law, but a wall the cluster raised against this process's
+    /// work is an event of the same account and there is only one consumer to
+    /// hand it to. Carrying it here keeps a second queue from being written.
+    fn record_event(&self, event: ResourceEvent);
 
     /// Events a full ring pushed out before a consumer took them.
     fn events_dropped(&self) -> u64;
@@ -253,6 +262,23 @@ pub fn global() -> Option<Arc<dyn ProcessGate>> {
 /// decisions about the host, so it has no events about the bound to report.
 pub fn drain_resource_events() -> Vec<ResourceEvent> {
     global().map(|gate| gate.drain_events()).unwrap_or_default()
+}
+
+/// Queues one event from anywhere in this process for that same consumer.
+///
+/// Answers whether it was queued. A process with no gate in force has no ring
+/// and no consumer either, so the answer is `false` rather than an error: the
+/// producer's decision still happened, but this process was never one that
+/// keeps the account, and the caller should say so in its own log instead of
+/// believing it was written down.
+pub fn record_resource_event(event: ResourceEvent) -> bool {
+    match global() {
+        Some(gate) => {
+            gate.record_event(event);
+            true
+        }
+        None => false,
+    }
 }
 
 /// How many events a full ring pushed out before a consumer took them.

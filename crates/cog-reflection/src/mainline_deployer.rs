@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use cog_core::contract::resource_ledger::{ResourceEvent, ResourceEventKind, ResourceEventOutcome};
 use cog_core::contract::version::VersionId;
 use cog_core::{SFError, SFResult, ShutdownSignal};
 // One owner for the media types a manifest request declares: the read side of
@@ -237,9 +238,13 @@ fn main_tag(rev: &str) -> String {
     format!("{MAIN_TAG_PREFIX}{}", rev12(rev))
 }
 
+/// 滚动 Job 名的前缀。名字里嵌 rev，所以它天然是幂等键；资源账要从名字里
+/// 反读出 rev，两处必须用同一个字面量。
+pub(crate) const MAINLINE_JOB_PREFIX: &str = "cogneva-mainline-";
+
 /// 滚动 Job 名（含 rev，天然幂等键）。
 pub fn job_name(rev: &str) -> String {
-    format!("cogneva-mainline-{}", rev12(rev))
+    format!("{MAINLINE_JOB_PREFIX}{}", rev12(rev))
 }
 
 /// `host:port` 端点拆成 (host, port)。buildah 强制 registry 端点带端口，
@@ -904,9 +909,68 @@ const ADMISSION_POLICY_DENIED_PATTERNS: &[&str] = &[
 /// 手上的原文（kubectl 的原话）里有没有准入拒绝的措辞。只用于镜像一次都还没动
 /// 时的归类——那一步除了上游原文没有别的观测面。
 pub(crate) fn is_admission_policy_denied(msg: &str) -> bool {
+    admission_policy_wall(msg).is_some()
+}
+
+/// 挡下这一次的是哪一堵墙，读不出来回答 `None`。
+///
+/// 与 [`is_admission_policy_denied`] 是同一张表的两面：那边问「是不是准入拒绝」，
+/// 这边问「哪一堵」。分出来是因为资源账要记的是**具体那一面界**——配额满了要抬
+/// 配额，LimitRange 越界要改区间，PodSecurity 要改策略，三者的处置在不同的文件里。
+/// 只写「准入拒绝」会把三种不同的修法压成一句同义反复。
+///
+/// 一种原文只归一个墙（顺序即优先级），所以读出来的墙名必落在闭集里，不会因两处
+/// 措辞同时出现而含糊。
+pub(crate) fn admission_policy_wall(msg: &str) -> Option<&'static str> {
     ADMISSION_POLICY_DENIED_PATTERNS
         .iter()
-        .any(|p| msg.contains(p))
+        .find(|p| msg.contains(*p))
+        .map(|p| match *p {
+            "exceeded quota" => "quota",
+            "usage per Container is" => "limitrange",
+            "violates PodSecurity" => "podsecurity",
+            // 这张表新增一条而这里没跟上时，宁可回答一个不带判读的类别，
+            // 也不假装成上面三者之一——资源账上的 subject 是身份，不是标签。
+            _ => "admission",
+        })
+}
+
+/// 集群侧把一次滚动 Job 挡在创建之外时，资源账的那一行。
+///
+/// 这条事件此前**没有**任何载体：`resource_events` 里 28 条准入拒绝全是构建槽自己
+/// 的墙（`mainline advance:busy`），而 2026-10-19 卡住部署器的那次是 ResourceQuota
+/// 满了、Job 的 Pod 建不出来——它只留在 `job_failure` 的 warn 日志里，随 Pod 一起死。
+/// 记账要的恰好是那一句：谁（这个进程）、何时、依哪条读数（Job 的 Failed 条件原文）、
+/// 把哪个界从几改到几（这一面没有「从/到」——界没动，是请求超过了界）、结局如何
+/// （被拒）。
+///
+/// `from_value` / `to_value` 留空是**语义**而不是缺省：准入拒绝不是界的变动，写一对
+/// 相同的数会让读者以为界动过。那一面界当时是多少，读者去 `cogneva_governance_drift_fields`
+/// 与跨层对账读数里取。
+pub(crate) fn admission_refusal_event(
+    job: &str,
+    wall: &str,
+    reason: &str,
+    actor: String,
+) -> ResourceEvent {
+    ResourceEvent {
+        kind: ResourceEventKind::AdmissionRefusal,
+        occurred_at: Utc::now(),
+        subject: format!("mainline advance:{wall}"),
+        actor,
+        reading: "kubectl:job-failed-condition".to_string(),
+        reading_value: None,
+        from_value: None,
+        to_value: None,
+        outcome: ResourceEventOutcome::Refused,
+        detail: serde_json::json!({
+            "job": job,
+            "wall": wall,
+            "reason": reason,
+            "rev": job.strip_prefix(MAINLINE_JOB_PREFIX).unwrap_or(job),
+        }),
+        count: 1,
+    }
 }
 
 /// 新副本卡在拉镜像上、整段预算里一次都没跑起来：这次失败**没有观测到版本**，
@@ -5918,6 +5982,20 @@ impl MainlineDeployer {
                 reason = %reason,
                 "rollout job's pod was never created; classified from the job's failure condition"
             );
+            // 只有准入拒绝进账：集群连不上、工具坏了、没权限这三档说的是**观察**
+            // 失败，不是集群拒绝了这份请求，记成「被拒」会把观测故障写成一条资源
+            // 事实。记不下也要说：没有 gate 的进程不持有这本账。
+            if let Some(wall) = admission_policy_wall(&reason) {
+                let event =
+                    admission_refusal_event(name, wall, &reason, crate::build_gate::gate_actor());
+                if !cog_core::contract::build_gate::record_resource_event(event) {
+                    warn!(
+                        job = %name,
+                        wall,
+                        "admission refusal was not queued for the resource account: this process has no gate and therefore no account"
+                    );
+                }
+            }
             return JobFailure {
                 class: FailureClass::Environment,
                 signature: None,
@@ -16655,6 +16733,80 @@ metadata:
         assert!(is_admission_denied(&format!(
             "{ADMISSION_DENIED_MARKER}: rollout of deployment/x did not complete within 300s"
         )));
+    }
+
+    /// 挡下来的是哪一堵墙，要逐条、按原文读出来。三堵墙的修法在不同的文件里：
+    /// 配额满抬额度、LimitRange 越界改区间、PodSecurity 改策略。把三种压成一句
+    /// 「准入拒绝」，资源账上的 subject 就退化成标签，读者仍要回去读日志原文。
+    #[test]
+    fn admission_policy_wall_names_the_closed_set_and_answers_none_for_the_rest() {
+        for (msg, wall) in [
+            (
+                "pods \"x\" is forbidden: exceeded quota: cogneva-quota, requested: \
+                 limits.memory=6Gi, used: limits.memory=49Gi, limited: limits.memory=52Gi",
+                "quota",
+            ),
+            (
+                "pods \"x\" is forbidden: [maximum cpu usage per Container is 2, but limit is 4]",
+                "limitrange",
+            ),
+            (
+                "pods \"x\" violates PodSecurity \"restricted:latest\": allowPrivilegeEscalation != false",
+                "podsecurity",
+            ),
+        ] {
+            assert_eq!(admission_policy_wall(msg), Some(wall), "{msg}");
+            assert!(is_admission_policy_denied(msg), "{msg}");
+        }
+        // 观察面坏掉的三档（连不上、工具坏、没权限）不是集群拒绝了这份请求，
+        // 墙名必须缺席——否则账上会多出一条根本不存在的资源事实。
+        for msg in [
+            "dial tcp 10.42.0.1:443: connect: connection refused",
+            "kubectl timed out after 30s",
+            "User \"x\" cannot create resource \"pods\"",
+            "",
+        ] {
+            assert_eq!(admission_policy_wall(msg), None, "{msg}");
+            assert!(!is_admission_policy_denied(msg), "{msg}");
+        }
+    }
+
+    /// 一条准入拒绝事件要能单行读全：哪一堵墙、哪个 Job、原文、结局。
+    /// 而**不能**带 from/to——界没有动，是一份请求超过了界；写一对相同的数会让
+    /// 读者以为界动过，写一对不同的数会编出一条没人执行过的改动。
+    #[test]
+    fn an_admission_refusal_event_carries_the_wall_the_job_and_no_bound_move() {
+        let reason = "pods \"cogneva-mainline-x\" is forbidden: exceeded quota: cogneva-quota, \
+                      requested: limits.memory=6Gi, used: limits.memory=49Gi";
+        let event = admission_refusal_event(
+            "cogneva-mainline-82bf1a726d5e",
+            "quota",
+            reason,
+            "cogneva-evolution-abc".to_string(),
+        );
+        assert_eq!(event.kind, ResourceEventKind::AdmissionRefusal);
+        assert_eq!(event.outcome, ResourceEventOutcome::Refused);
+        assert_eq!(event.subject, "mainline advance:quota");
+        assert_eq!(event.actor, "cogneva-evolution-abc");
+        assert_eq!(event.reading, "kubectl:job-failed-condition");
+        assert_eq!(event.from_value, None);
+        assert_eq!(event.to_value, None);
+        assert_eq!(event.reading_value, None);
+        assert_eq!(event.count, 1);
+        assert_eq!(event.detail["job"], "cogneva-mainline-82bf1a726d5e");
+        assert_eq!(event.detail["wall"], "quota");
+        assert_eq!(event.detail["rev"], "82bf1a726d5e");
+        assert_eq!(event.detail["reason"], reason);
+        // 换一堵墙只换 subject 与 detail.wall，其余形状不变：三堵墙走同一条构造，
+        // 不各写一份。
+        let other = admission_refusal_event(
+            "cogneva-mainline-82bf1a726d5e",
+            "limitrange",
+            reason,
+            "cogneva-evolution-abc".to_string(),
+        );
+        assert_eq!(other.subject, "mainline advance:limitrange");
+        assert_eq!(other.detail["wall"], "limitrange");
     }
 
     #[test]

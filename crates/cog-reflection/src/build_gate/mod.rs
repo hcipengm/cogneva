@@ -349,6 +349,10 @@ impl ProcessGate for RegisteredGate {
         BuildGate::drain_events(&self.0)
     }
 
+    fn record_event(&self, event: ResourceEvent) {
+        BuildGate::record_event(&self.0, event)
+    }
+
     fn events_dropped(&self) -> u64 {
         BuildGate::events_dropped(&self.0)
     }
@@ -1047,7 +1051,7 @@ const EVENT_RING_CAPACITY: usize = 256;
 /// In a pod `HOSTNAME` is the pod name, which is the identity a reader can find
 /// in the cluster. Without one this falls back to the host's own name, and only
 /// then to a word that says the identity is unknown rather than inventing one.
-fn gate_actor() -> String {
+pub(crate) fn gate_actor() -> String {
     std::env::var("HOSTNAME")
         .ok()
         .map(|h| h.trim().to_string())
@@ -4473,6 +4477,36 @@ unevictable 28532736
             gate.drain_events().is_empty(),
             "draining hands the events over once; a second consumer must not see the same refusal"
         );
+    }
+
+    /// 第二类生产者走同一条环：拒绝这次滚动 Job 的是集群的配额准入，不是构建槽
+    /// 的控制律，但账上的消费者只有一个。环属于**进程**，不属于界——两本账会让
+    /// 「有一条消费没在跑」这类读数分叉。
+    #[tokio::test]
+    async fn an_event_from_another_producer_reaches_the_same_consumer() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 1);
+        let registered = RegisteredGate(Arc::clone(&gate));
+        let event = ResourceEvent {
+            kind: ResourceEventKind::AdmissionRefusal,
+            occurred_at: chrono::Utc::now(),
+            subject: "mainline advance:quota".to_string(),
+            actor: "cogneva-evolution-abc".to_string(),
+            reading: "kubectl:job-failed-condition".to_string(),
+            reading_value: None,
+            from_value: None,
+            to_value: None,
+            outcome: ResourceEventOutcome::Refused,
+            detail: serde_json::json!({"wall": "quota"}),
+            count: 1,
+        };
+        ProcessGate::record_event(&registered, event.clone());
+        assert_eq!(
+            gate.drain_events(),
+            vec![event],
+            "an event handed in through the process-facing gate is the one the consumer takes"
+        );
+        assert!(gate.drain_events().is_empty());
     }
 
     /// A bound that moved carries both ends and the reading it moved on; a bound
