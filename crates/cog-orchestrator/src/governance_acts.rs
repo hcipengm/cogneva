@@ -13,7 +13,7 @@
 //! Nothing in this module is a second ledger. Every function here reads and
 //! writes the same `cog_dag_tasks` rows the rest of the platform uses.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -261,6 +261,11 @@ pub fn close_ballot(spec: &DecisionSpec, votes: &[Vote], now: DateTime<Utc>) -> 
             None,
             "tie; the predeclared rule escalates it",
         ),
+        Some(TieBreak::NotPredeclared) => base(
+            DecisionState::Unresolved,
+            None,
+            "tie; no tie rule was declared before this vote was taken",
+        ),
         None => base(
             DecisionState::Unresolved,
             None,
@@ -301,7 +306,136 @@ pub fn validate_ballot(spec: &DecisionSpec) -> Result<(), String> {
     if spec.tie_break.is_none() {
         return Err("a ballot needs a tie-break declared before the first vote".into());
     }
+    // A live ballot whose tie rule is "not predeclared" is exactly the state
+    // open() exists to refuse. Only a record reconstructed after the fact may
+    // carry it, because only that record is allowed to say the procedure was
+    // missing rather than invent one.
+    if spec.tie_break == Some(TieBreak::NotPredeclared)
+        && spec.provenance.as_deref() != Some("backfilled")
+    {
+        return Err(
+            "not_predeclared is only allowed on a backfilled record; a live ballot must \
+             declare its tie rule before the first vote"
+                .into(),
+        );
+    }
     Ok(())
+}
+
+/// A ballot reconstructed from the replies it was decided by.
+pub struct BackfilledBallot {
+    pub spec: DecisionSpec,
+    /// One `(unit, option)` per reply, sorted by unit so the write order is
+    /// the same on every run.
+    pub votes: Vec<(String, String)>,
+}
+
+/// Turn reply files into the decision row and votes they describe.
+///
+/// This function exists so a historical vote can be put into the ledger
+/// honestly. It never invents a rule: the row carries
+/// `tie_break = not_predeclared` and `predeclared = false`, because the
+/// quorum below is the number of people who happened to reply, not a quorum
+/// anybody set before the vote. A tally computed from the bytes is real; the
+/// procedure is not implied by it.
+pub fn backfill_ballot(
+    kind: &str,
+    subject: &str,
+    options: &[String],
+    status_quo: Option<String>,
+    deadline: DateTime<Utc>,
+    replies: &[(String, String)],
+) -> Result<BackfilledBallot, String> {
+    if options.len() < 2 {
+        return Err("a ballot needs at least two options".into());
+    }
+    if replies.is_empty() {
+        return Err("there are no replies to backfill from".into());
+    }
+    let status_quo =
+        status_quo.ok_or_else(|| "a backfilled ballot must name its status quo".to_string())?;
+    if !options.iter().any(|o| o == &status_quo) {
+        return Err("the status quo must be one of the options".into());
+    }
+    let mut units = BTreeSet::new();
+    let mut counts: BTreeMap<String, usize> = options.iter().map(|o| (o.clone(), 0)).collect();
+    for (unit, option) in replies {
+        if unit.trim().is_empty() {
+            return Err("a reply file names no unit".into());
+        }
+        if !units.insert(unit.clone()) {
+            return Err(format!("{unit} replied more than once"));
+        }
+        if !options.iter().any(|o| o == option) {
+            return Err(format!(
+                "{unit} chose {option}, which is not one of the options"
+            ));
+        }
+        *counts.get_mut(option).expect("option checked above") += 1;
+    }
+
+    let top = counts.values().copied().max().unwrap_or(0);
+    let leaders: Vec<&String> = counts
+        .iter()
+        .filter(|(_, count)| **count == top)
+        .map(|(option, _)| option)
+        .collect();
+    let (state, result_option, reason) = if top == 0 {
+        (
+            DecisionState::Unresolved,
+            None,
+            "no reply named one of the options".to_string(),
+        )
+    } else if leaders.len() > 1 {
+        (
+            DecisionState::Unresolved,
+            None,
+            format!(
+                "tie between {} with no tie rule declared before the vote",
+                leaders
+                    .iter()
+                    .map(|o| o.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    } else {
+        (
+            DecisionState::Resolved,
+            Some(leaders[0].clone()),
+            format!(
+                "plurality: {top} of {} replies; no quorum or tie rule was declared first",
+                replies.len()
+            ),
+        )
+    };
+
+    let mut votes = replies.to_vec();
+    votes.sort();
+    let spec = DecisionSpec {
+        kind: kind.to_string(),
+        subject: subject.to_string(),
+        options: options.to_vec(),
+        status_quo: Some(status_quo),
+        mode: DecisionMode::Ballot,
+        state,
+        // The roster and quorum are reconstructed from who replied. They are
+        // recorded so the tally can be checked later; `predeclared = false`
+        // is what stops them being read as having governed the vote.
+        eligible_units: units.into_iter().collect(),
+        quorum: replies.len() as u32,
+        tie_break: Some(TieBreak::NotPredeclared),
+        deadline: Some(deadline),
+        principle_slug: None,
+        principle_rationale: None,
+        result_option,
+        result_reason: Some(reason),
+        supersedes: None,
+        provenance: Some("backfilled".into()),
+        predeclared: false,
+    };
+    validate_ballot(&spec)?;
+    Ok(BackfilledBallot { spec, votes })
 }
 
 /// Refuse a principle decision that does not name what settled it.
@@ -502,6 +636,8 @@ mod tests {
             result_option: None,
             result_reason: None,
             supersedes: None,
+            provenance: None,
+            predeclared: false,
         }
     }
 
@@ -661,6 +797,98 @@ mod tests {
                 DecisionState::parse(state.as_str()).unwrap().status()
             );
         }
+    }
+
+    fn replies(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(unit, option)| (unit.to_string(), option.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_backfilled_ballot_counts_the_replies_it_was_given() {
+        let options = vec!["operator".into(), "8e".into(), "6e".into()];
+        let filled = backfill_ballot(
+            "who-approves-writes",
+            "who approves writes",
+            &options,
+            Some("operator".into()),
+            at(60),
+            &replies(&[
+                ("operator", "operator"),
+                ("8b2", "operator"),
+                ("8e", "operator"),
+                ("6e", "6e"),
+                ("43", "8e"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(filled.spec.state, DecisionState::Resolved);
+        assert_eq!(filled.spec.result_option.as_deref(), Some("operator"));
+        // The count is real; the rules that would have settled a tie were not
+        // written before the votes were cast, and the row says so.
+        assert_eq!(filled.spec.provenance.as_deref(), Some("backfilled"));
+        assert!(!filled.spec.predeclared);
+        assert_eq!(filled.spec.tie_break, Some(TieBreak::NotPredeclared));
+        assert_eq!(filled.spec.quorum, 5);
+        assert_eq!(
+            filled.spec.eligible_units,
+            vec!["43", "6e", "8b2", "8e", "operator"]
+        );
+        assert_eq!(filled.votes.len(), 5);
+    }
+
+    #[test]
+    fn a_backfilled_tie_is_unresolved_rather_than_settled_by_a_rule_added_later() {
+        let options = vec!["operator".into(), "8e".into(), "6e".into()];
+        let filled = backfill_ballot(
+            "k",
+            "s",
+            &options,
+            Some("operator".into()),
+            at(60),
+            &replies(&[("a", "operator"), ("b", "8e"), ("c", "6e")]),
+        )
+        .unwrap();
+        assert_eq!(filled.spec.state, DecisionState::Unresolved);
+        assert_eq!(filled.spec.result_option, None);
+        assert!(
+            filled
+                .spec
+                .result_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("tie"),
+            "{:?}",
+            filled.spec.result_reason
+        );
+    }
+
+    #[test]
+    fn a_backfill_refuses_replies_that_do_not_describe_a_ballot() {
+        let options = vec!["operator".into(), "8e".into()];
+        let call = |status_quo: Option<String>, pairs: &[(&str, &str)]| {
+            backfill_ballot("k", "s", &options, status_quo, at(60), &replies(pairs))
+        };
+        // A choice outside the options is not a vote on this question.
+        assert!(call(Some("operator".into()), &[("a", "nobody")]).is_err());
+        // One unit, two votes would double its weight.
+        assert!(call(Some("operator".into()), &[("a", "8e"), ("a", "operator")]).is_err());
+        // No replies is not a zero-vote ballot, it is a missing input.
+        assert!(call(Some("operator".into()), &[]).is_err());
+        // The status quo must be one of the options for a tie to resolve to it.
+        assert!(call(Some("nobody".into()), &[("a", "8e")]).is_err());
+        assert!(call(None, &[("a", "8e")]).is_err());
+    }
+
+    #[test]
+    fn only_a_backfilled_row_may_declare_that_no_tie_rule_was_predeclared() {
+        let mut spec = ballot();
+        spec.tie_break = Some(TieBreak::NotPredeclared);
+        assert!(validate_ballot(&spec).is_err());
+        spec.provenance = Some("backfilled".into());
+        assert!(validate_ballot(&spec).is_ok());
     }
 
     /// The rows a settle pass can see, with the same conditional write the

@@ -180,6 +180,10 @@ pub enum TieBreak {
     SecondRound,
     /// A tie is handed to a named body; until it answers the question is open.
     EscalateNamedBody,
+    /// The question was decided before this record existed and no tie rule was
+    /// written down first. The row says so instead of lending the vote a rule
+    /// it never had; only a backfilled record may carry this value.
+    NotPredeclared,
 }
 
 impl TieBreak {
@@ -188,6 +192,7 @@ impl TieBreak {
             Self::StatusQuo => "status_quo",
             Self::SecondRound => "second_round",
             Self::EscalateNamedBody => "escalate_named_body",
+            Self::NotPredeclared => "not_predeclared",
         }
     }
 
@@ -196,6 +201,7 @@ impl TieBreak {
             "status_quo" => Some(Self::StatusQuo),
             "second_round" => Some(Self::SecondRound),
             "escalate_named_body" => Some(Self::EscalateNamedBody),
+            "not_predeclared" => Some(Self::NotPredeclared),
             _ => None,
         }
     }
@@ -293,6 +299,16 @@ pub struct DecisionSpec {
     pub result_reason: Option<String>,
     /// Set on the replacement row: which decision this one supersedes.
     pub supersedes: Option<String>,
+    /// How this row came to exist: a live question, or a reconstruction of one
+    /// answered before the ledger did. A record that cannot say which is a
+    /// record a reader will mistake for having been governed at the time.
+    #[serde(default)]
+    pub provenance: Option<String>,
+    /// Whether the rules that settled it were written before the votes were
+    /// cast. False on a backfilled row: the tally is real, the procedure was
+    /// not. Nothing may read false as an endorsement.
+    #[serde(default)]
+    pub predeclared: bool,
 }
 
 /// One decision as the graph holds it.

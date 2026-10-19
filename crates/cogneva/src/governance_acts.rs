@@ -26,8 +26,8 @@ use cog_core::{
     VOTE_TASK_TYPE,
 };
 use cog_orchestrator::governance_acts::{
-    close_ballot, decision_task, handover_task, tally, validate_ballot, validate_principle,
-    vote_id, vote_task,
+    backfill_ballot, close_ballot, decision_task, handover_task, tally, validate_ballot,
+    validate_principle, vote_id, vote_task,
 };
 
 pub const USAGE: &str = "\
@@ -49,7 +49,13 @@ VOTE — a question the principles do not settle on their own.
     cast --decision <id> --unit <unit> --option <opt>
     withdraw --decision <id> --unit <unit>
     close --decision <id>
-    list [--json]";
+    list [--json]
+    backfill --replies <dir> --subject <text> --kind <kind> --option <opt> ...
+             --status-quo <opt> --deadline <rfc3339>
+         One file per unit, named <unit>-vote.md, first `vote:` line is the
+         choice. The record is marked provenance=backfilled, predeclared=false,
+         tie_break=not_predeclared: the count is real, the rules were not
+         declared before the votes were cast.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Act {
@@ -102,6 +108,17 @@ pub enum Act {
     },
     VoteList {
         json: bool,
+    },
+    /// Put a vote that predates the ledger into it, with its provenance said
+    /// out loud. The replies are the bytes that were actually cast; the rules
+    /// section the row carries is reconstructed and marked as such.
+    VoteBackfill {
+        replies: String,
+        subject: String,
+        kind: String,
+        options: Vec<String>,
+        status_quo: String,
+        deadline: DateTime<Utc>,
     },
 }
 
@@ -217,6 +234,15 @@ pub fn parse_args(args: &[String]) -> Result<Act, String> {
         }),
         ("vote", "list") => Ok(Act::VoteList {
             json: flags.iter().any(|f| f == "--json"),
+        }),
+        ("vote", "backfill") => Ok(Act::VoteBackfill {
+            replies: required("--replies")?,
+            subject: required("--subject")?,
+            kind: required("--kind")?,
+            options: many("--option"),
+            status_quo: required("--status-quo")?,
+            deadline: parse_time(&one("--deadline")?)?
+                .ok_or_else(|| "--deadline is required for a backfilled ballot".to_string())?,
         }),
         ("handover" | "vote", other) => Err(format!("unknown {family} subcommand {other}")),
         (other, _) => Err(format!("unknown governance family {other}")),
@@ -452,6 +478,8 @@ pub async fn run(
                 },
                 result_reason: None,
                 supersedes: None,
+                provenance: Some("live".into()),
+                predeclared: true,
             };
             match mode {
                 DecisionMode::Ballot => validate_ballot(&spec)?,
@@ -621,6 +649,115 @@ pub async fn run(
                 decisions.len()
             );
         }
+        Act::VoteBackfill {
+            replies,
+            subject,
+            kind,
+            options,
+            status_quo,
+            deadline,
+        } => {
+            // Each reply file is one unit's ballot: its name is the unit and
+            // its first `vote:` line is the option. Reading the bytes instead
+            // of a remembered tally is the point -- the remembered count is a
+            // second ledger that would drift the moment somebody edits a file.
+            let dir = std::path::Path::new(&replies);
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with("-vote.md"))
+                })
+                .collect();
+            entries.sort();
+            if entries.is_empty() {
+                return Err(format!("no *-vote.md files under {}", dir.display()).into());
+            }
+            let mut replies_by_unit: Vec<(String, String)> = Vec::new();
+            let mut cast_at: std::collections::BTreeMap<String, DateTime<Utc>> =
+                std::collections::BTreeMap::new();
+            for path in &entries {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or("a reply file name is not UTF-8")?;
+                let unit = name.trim_end_matches("-vote.md").to_string();
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                let option = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("vote:"))
+                    .map(str::trim)
+                    .filter(|option| !option.is_empty())
+                    .ok_or_else(|| {
+                        format!("{} has no 'vote:' line; refusing to guess", path.display())
+                    })?;
+                let at = std::fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .map(DateTime::<Utc>::from)
+                    .unwrap_or(now);
+                replies_by_unit.push((unit.clone(), option.to_string()));
+                cast_at.insert(unit, at);
+            }
+            let ballot = backfill_ballot(
+                &kind,
+                &subject,
+                &options,
+                Some(status_quo),
+                deadline,
+                &replies_by_unit,
+            )
+            .map_err(|e| -> Box<dyn Error> { e.into() })?;
+            // The id is derived from the question and the deadline, so a rerun
+            // is the same row rather than a second copy of the same vote.
+            let id = format!(
+                "decision:{}:backfill:{}",
+                kind,
+                deadline.format("%Y%m%dT%H%M%SZ")
+            );
+            if store
+                .governance_nodes(DECISION_TASK_TYPE)
+                .await?
+                .iter()
+                .any(|task| task.id == id)
+            {
+                println!("{id}: already backfilled; nothing written");
+                return Ok(());
+            }
+            let state = ballot.spec.state;
+            let task = decision_task(&id, ballot.spec.clone(), state.status(), now);
+            store.save_governance_node(&task).await?;
+            for (unit, option) in &ballot.votes {
+                let at = cast_at.get(unit).copied().unwrap_or(now);
+                store
+                    .save_governance_node(&vote_task(&id, unit, option, at))
+                    .await?;
+            }
+            let counts: Vec<String> = options
+                .iter()
+                .map(|option| {
+                    format!(
+                        "{option}={}",
+                        ballot
+                            .votes
+                            .iter()
+                            .filter(|(_, chosen)| chosen == option)
+                            .count()
+                    )
+                })
+                .collect();
+            println!(
+                "{}: {} — {} [{}] votes={} provenance=backfilled predeclared=false",
+                id,
+                state.as_str(),
+                ballot.spec.result_reason.as_deref().unwrap_or("-"),
+                counts.join(" "),
+                ballot.votes.len(),
+            );
+        }
     }
     Ok(())
 }
@@ -718,6 +855,28 @@ mod tests {
             parse_args(&args(&["vote", "list", "--json"])).unwrap(),
             Act::VoteList { json: true }
         ));
+        assert!(matches!(
+            parse_args(&args(&[
+                "vote",
+                "backfill",
+                "--replies",
+                "/tmp/replies",
+                "--subject",
+                "s",
+                "--kind",
+                "k",
+                "--option",
+                "a",
+                "--option",
+                "b",
+                "--status-quo",
+                "a",
+                "--deadline",
+                "2026-10-20T00:00:00Z"
+            ]))
+            .unwrap(),
+            Act::VoteBackfill { .. }
+        ));
     }
 
     #[test]
@@ -725,6 +884,7 @@ mod tests {
         assert!(parse_args(&args(&["handover", "open", "--face", "f"])).is_err());
         assert!(parse_args(&args(&["vote", "open", "--subject", "s"])).is_err());
         assert!(parse_args(&args(&["vote", "cast", "--decision", "d"])).is_err());
+        assert!(parse_args(&args(&["vote", "backfill", "--subject", "s"])).is_err());
         assert!(parse_args(&args(&["nonsense", "list"])).is_err());
         assert!(parse_args(&args(&["vote"])).is_err());
     }
@@ -780,6 +940,8 @@ mod tests {
             result_option: None,
             result_reason: None,
             supersedes: None,
+            provenance: None,
+            predeclared: false,
         };
         assert!(validate_ballot(&spec).is_err());
     }
@@ -829,6 +991,8 @@ mod tests {
             result_option: result,
             result_reason: None,
             supersedes: None,
+            provenance: None,
+            predeclared: false,
         };
         assert!(validate_principle(&spec).is_err());
     }
