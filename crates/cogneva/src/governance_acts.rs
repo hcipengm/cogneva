@@ -37,11 +37,14 @@ cogneva governance <handover|vote> <SUBCOMMAND> [OPTIONS]
 HANDOVER — moving a face from one unit to another. All three units must sign.
     open --face <face> --to <unit> --witness <unit> [--from <unit>]
          [--source <text>] [--criterion <reading>] [--reading-at <rfc3339>]
+         [--open-action <text>]... [--permissions-context <text>]
          [--artifact <path>] [--artifact-expires <rfc3339>]
          [--expires-when <rfc3339>] [--withdraw-condition <text>]
          Seven cells: where the reading came from, the reading and when it was
          taken, unfinished actions, permissions, witness, the artifact and how
          long it stays readable, when the handover dies and what withdraws it.
+         --open-action may repeat; each one is an obligation the new owner
+         inherits and a place the next reader will look for it.
     sign --id <handover> --unit <unit>
     apply --id <handover>
     withdraw --id <handover> --unit <unit>
@@ -76,6 +79,8 @@ pub enum Act {
         source: Option<String>,
         criterion: Option<String>,
         reading_at: Option<DateTime<Utc>>,
+        open_actions: Vec<String>,
+        permissions_context: Option<String>,
         artifact: Option<String>,
         artifact_expires_at: Option<DateTime<Utc>>,
         expires_when: Option<DateTime<Utc>>,
@@ -188,6 +193,8 @@ pub fn parse_args(args: &[String]) -> Result<Act, String> {
             source: one("--source")?,
             criterion: one("--criterion")?,
             reading_at: parse_time(&one("--reading-at")?)?,
+            open_actions: many("--open-action"),
+            permissions_context: one("--permissions-context")?,
             artifact: one("--artifact")?,
             artifact_expires_at: parse_time(&one("--artifact-expires")?)?,
             expires_when: parse_time(&one("--expires-when")?)?,
@@ -301,6 +308,8 @@ pub async fn run(
             source,
             criterion,
             reading_at,
+            open_actions,
+            permissions_context,
             artifact,
             artifact_expires_at,
             expires_when,
@@ -314,9 +323,9 @@ pub async fn run(
                 source,
                 criterion_reading: criterion,
                 reading_at,
-                open_actions: Vec::new(),
+                open_actions,
                 open_task_ids: Vec::new(),
-                permissions_context: None,
+                permissions_context,
                 artifact_path: artifact,
                 artifact_expires_at,
                 expires_when,
@@ -1558,6 +1567,8 @@ mod tests {
                 source: None,
                 criterion: None,
                 reading_at: None,
+                open_actions: Vec::new(),
+                permissions_context: None,
                 artifact: None,
                 artifact_expires_at: None,
                 expires_when: Some(now + chrono::Duration::days(1)),
@@ -1626,5 +1637,44 @@ mod tests {
             now,
         });
         assert_eq!(reading.state, cog_core::DriftState::OnTarget);
+    }
+
+    // The seven cells include "what the new owner inherits as unfinished
+    // business" and "anything they need to know about permissions". Neither
+    // had a flag, so both could only be written into a free-text field that
+    // the next reader has no reason to search.
+    #[test]
+    fn a_handover_carries_its_open_actions_and_permissions() {
+        let parsed = parse_args(&args(&[
+            "handover",
+            "open",
+            "--face",
+            "f",
+            "--to",
+            "a",
+            "--witness",
+            "b",
+            "--open-action",
+            "first",
+            "--open-action",
+            "second",
+            "--permissions-context",
+            "p",
+        ]))
+        .unwrap();
+        match parsed {
+            Act::HandoverOpen {
+                open_actions,
+                permissions_context,
+                ..
+            } => {
+                assert_eq!(
+                    open_actions,
+                    vec!["first".to_string(), "second".to_string()]
+                );
+                assert_eq!(permissions_context.as_deref(), Some("p"));
+            }
+            other => panic!("expected a handover open, got {other:?}"),
+        }
     }
 }
