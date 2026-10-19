@@ -990,6 +990,99 @@ fn chart_rules() -> Vec<(String, String)> {
         .collect()
 }
 
+/// The alert-delivery counter is written by the same notifier every rule's
+/// notification goes through. A rule that reads `delivered`, `failed` or
+/// `skipped` can therefore be kept firing by its own delivery attempt: the
+/// attempt fails, the counter moves, the rule fires again. Only
+/// `outcome="no_channel"` is written before a channel is chosen, so it is the
+/// one cell the rule's own notification cannot move.
+const ALERT_DELIVERY_COUNTER: &str = "cogneva_alert_notifications_total";
+const THE_ONLY_OUTCOME_A_RULE_MAY_READ: &str = r#"outcome="no_channel""#;
+
+/// Every complaint about one expression watching the delivery counter. Reads
+/// without a selector, selectors naming another outcome and selectors using a
+/// negative or regex matcher are all reported: each of them counts the cells
+/// the rule's own notification writes.
+fn delivery_reader_complaints(promql: &str) -> Vec<String> {
+    let mut complaints = Vec::new();
+    for (pos, _) in promql.match_indices(ALERT_DELIVERY_COUNTER) {
+        let after = &promql[pos + ALERT_DELIVERY_COUNTER.len()..];
+        let Some(open) = after.find('{') else {
+            complaints.push(format!(
+                "reads `{ALERT_DELIVERY_COUNTER}` with no selector, so every \
+                 outcome is counted, including the one its own notification writes"
+            ));
+            continue;
+        };
+        if !after[..open].trim().is_empty() {
+            complaints.push(format!(
+                "reads `{ALERT_DELIVERY_COUNTER}` without a selector on the \
+                 series itself, so every outcome is counted"
+            ));
+            continue;
+        }
+        let Some(close) = after[open..].find('}') else {
+            complaints.push(format!(
+                "selector for `{ALERT_DELIVERY_COUNTER}` is unterminated"
+            ));
+            continue;
+        };
+        let selector = &after[open + 1..open + close];
+        let outcomes: Vec<&str> = selector
+            .split(',')
+            .map(str::trim)
+            .filter(|matcher| matcher.starts_with("outcome"))
+            .collect();
+        if outcomes.as_slice() != [THE_ONLY_OUTCOME_A_RULE_MAY_READ] {
+            complaints.push(format!(
+                "reads outcomes {outcomes:?}; only `{THE_ONLY_OUTCOME_A_RULE_MAY_READ}` \
+                 cannot be moved by the rule's own notification"
+            ));
+        }
+    }
+    complaints
+}
+
+#[test]
+fn a_rule_that_watches_alert_delivery_reads_only_the_cell_its_own_delivery_cannot_move() {
+    let mut complaints: Vec<String> = Vec::new();
+    for (rule, promql) in chart_rules() {
+        for complaint in delivery_reader_complaints(&promql) {
+            complaints.push(format!("{rule}: {complaint}\n    {promql}"));
+        }
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "这些规则在监视告警投递，却读了自己通知会移动的格子；规则自己的通知走同一个\
+         通知器，一次投递失败会把它再钉回 firing:\n{}",
+        complaints.join("\n")
+    );
+}
+
+#[test]
+fn the_delivery_reader_check_separates_the_cell_a_notification_cannot_move() {
+    // The selector the check demands.
+    assert!(delivery_reader_complaints(
+        r#"sum(increase(cogneva_alert_notifications_total{outcome="no_channel"}[30m]))"#
+    )
+    .is_empty());
+
+    // Each of these reads a cell the rule's own delivery writes.
+    for bad in [
+        "sum(increase(cogneva_alert_notifications_total[30m]))",
+        r#"sum(increase(cogneva_alert_notifications_total{outcome="failed"}[30m]))"#,
+        r#"sum(increase(cogneva_alert_notifications_total{outcome=~".*"}[30m]))"#,
+        r#"sum(cogneva_alert_notifications_total{outcome!="no_channel"})"#,
+        r#"sum(cogneva_alert_notifications_total{channel="webhook"})"#,
+    ] {
+        assert!(
+            !delivery_reader_complaints(bad).is_empty(),
+            "check let through a delivery reading it must reject: {bad}"
+        );
+    }
+}
+
 /// A rule may read a name this build records, a name it *derives* from one, or
 /// a foreign series listed with its owner — nothing else, because a rule on any
 /// other name fires never. The derived half is decided by
