@@ -56,6 +56,9 @@ fn make_task(id: &str, task_type: TaskType, blocked_by: Vec<String>, workspace: 
         goal_id: None,
         parent_task_id: None,
         sink_task_id: None,
+        face_id: None,
+        owner_unit: None,
+        bound_by_handover_id: None,
         is_executable: true,
     }
 }

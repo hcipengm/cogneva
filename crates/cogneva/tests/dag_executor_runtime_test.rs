@@ -38,6 +38,9 @@ fn make_test_task(id: &str) -> Task {
         goal_id: None,
         parent_task_id: None,
         sink_task_id: None,
+        face_id: None,
+        owner_unit: None,
+        bound_by_handover_id: None,
         is_executable: true,
     }
 }
