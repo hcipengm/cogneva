@@ -2630,6 +2630,25 @@ async fn verify_artifact_stores(
             }
         }
     }
+    // 「读得出组数与试验数」证明的是包里的字节完好；它证明不了写者拿到这份字节
+    // 还能继续记决策。两件事分开判：一份读得回但写不进去的统计，换机后表现得
+    // 和「从来没记过」一样。
+    if manifest
+        .artifacts
+        .iter()
+        .any(|r| r.decision_stats.is_some())
+    {
+        drill.artifacts_expected += 1;
+        match decision_roundtrip(pkg_dir, manifest).await {
+            Ok(line) => {
+                drill.artifacts_restored += 1;
+                drill.artifact_readings.push(line);
+            }
+            Err(e) => drill
+                .artifact_errors
+                .push(format!("decision_roundtrip: {e}")),
+        }
+    }
     if !drill.artifact_errors.is_empty() && drill.error.is_none() {
         drill.error = Some(format!(
             "产物层读回失败 {} 项：{}",
@@ -2638,6 +2657,98 @@ async fn verify_artifact_stores(
         ));
     }
 }
+
+/// 决策往返：把包里的产物层写回一个空的数据根，用引擎记一条决策，再把文件读回来，
+/// 断言那条决策在里面。
+///
+/// 走的是恢复端真正用的那条写回路径（`restore_artifacts_into`），不是就地读包：
+/// 要判的是「写回去的那一份还能被写者接着用」，而不是「包里的字节解析得开」。
+/// 记进去的决策带一个固定名字，读回时按它取——其他格子的数值原样不动。
+async fn decision_roundtrip(
+    pkg_dir: &Path,
+    manifest: &BackupManifest,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use cog_core::{DecisionCategory, DecisionGroupKey, DecisionOutcome};
+
+    let scratch_root =
+        std::env::temp_dir().join(format!("cogneva-roundtrip-{}", uuid::Uuid::new_v4()));
+    let _tree = TempTree(scratch_root.clone());
+    let mut targets = Vec::new();
+    for root in &manifest.artifacts {
+        let dir = scratch_root.join(&root.root);
+        std::fs::create_dir_all(&dir)?;
+        targets.push((root.root.clone(), dir));
+    }
+    let readings = restore_artifacts_into(pkg_dir, manifest, &targets).await?;
+
+    // 取第一个真带决策统计的根：包里的统计可能只在主根上。
+    let root = manifest
+        .artifacts
+        .iter()
+        .find(|r| r.decision_stats.is_some())
+        .ok_or("包里没有任何决策统计段")?;
+    let path = scratch_root
+        .join(&root.root)
+        .join("meta_learning")
+        .join("decision_stats.json");
+    let snapshot = cog_reflection::DecisionStatsSnapshot::new(path.clone());
+    let engine = cog_reflection::MetaLearningEngine::with_durable_state(
+        std::sync::Arc::new(cog_reflection::InMemoryRecorder::default()),
+        snapshot.clone(),
+    )
+    .await;
+    let group = DecisionGroupKey::by_task_type("drill-roundtrip");
+    engine
+        .record(
+            DecisionCategory::PgeMode,
+            &group,
+            DECISION_ROUNDTRIP_DECISION,
+            DecisionOutcome::Success,
+        )
+        .await?;
+
+    let restored = snapshot
+        .load()
+        .await?
+        .ok_or_else(|| format!("写完之后 {} 读不出来", path.display()))?;
+    let cell = restored
+        .get(&(DecisionCategory::PgeMode, group.clone()))
+        .and_then(|stats| stats.counts.get(DECISION_ROUNDTRIP_DECISION))
+        .copied();
+    // 记一条新决策后，原有历史的试验数必须原样还在、且只多这一条。少了说明
+    // 引擎读到的是空表、写回的是重写过的空表——这种现象在「新决策读得回来」
+    // 的读数里完全看不出来，而它正是换机后证据归零的样子。
+    let trials: u64 = restored
+        .values()
+        .flat_map(|s| s.counts.values())
+        .map(|(attempts, _)| u64::from(*attempts))
+        .sum();
+    let declared = root.decision_stats.as_ref().map_or(0, |s| s.trials);
+    if trials != declared + 1 {
+        return Err(format!(
+            "写回后的试验数是 {trials}，包里声明 {declared} + 探针 1：原有历史没有原样留住"
+        )
+        .into());
+    }
+    match cell {
+        Some((attempts, successes)) if attempts == 1 && successes == 1 => Ok(format!(
+            "{}/meta_learning decision_roundtrip=ok group={} attempts=1 successes=1 历史试验数={declared}（写回 {} 项）",
+            root.root,
+            group.as_str(),
+            readings.len()
+        )),
+        other => Err(format!(
+            "记进去的决策读不回来：{}({:?}) = {other:?}",
+            group.as_str(),
+            DECISION_ROUNDTRIP_DECISION
+        )
+        .into()),
+    }
+}
+
+/// 往返里写进去的那个决策名。它是探针，不是产品决策：读回时按这个名字取，
+/// 名字里写清来历，免得日后有人在真实的计数里找它。
+const DECISION_ROUNDTRIP_DECISION: &str = "drill_roundtrip_probe";
 
 async fn verify_one_store(
     store: &cog_reflection::PolicyStore,
@@ -3634,6 +3745,76 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".restore-")),
             "暂存目录用完要删掉"
+        );
+    }
+
+    /// 演练的往返面：包里的统计写回一个空根之后，写者还得能接着往里记，且原有
+    /// 历史原样留着。只验「包里那份读得回」的演练，对这件事是瞎的。
+    #[tokio::test]
+    async fn decision_roundtrip_writes_back_a_tree_the_engine_keeps_using() {
+        let pkg = tempfile::tempdir().unwrap();
+        let source = pkg.path().join("artifacts/evolution");
+        let data = tempfile::tempdir().unwrap();
+        let store = cog_reflection::PolicyStore::new(data.path().join("policies"));
+        store
+            .save_new_version(
+                "meta_learning.mode",
+                serde_json::json!({"min_samples": 40}),
+                "t",
+            )
+            .await
+            .unwrap();
+        std::fs::create_dir_all(data.path().join("meta_learning")).unwrap();
+        std::fs::write(
+            data.path().join("meta_learning/decision_stats.json"),
+            serde_json::json!({
+                "version": 1,
+                "groups": [{"category": "pge_mode", "key": "bugfix", "counts": {"pipeline": [7, 5]}}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let report = collect_artifact_root("evolution", data.path(), staging.path())
+            .await
+            .unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::rename(staging.path().join("artifacts/evolution"), &source).unwrap();
+        let manifest = manifest_with(vec![report]);
+
+        let line = decision_roundtrip(pkg.path(), &manifest).await.unwrap();
+        assert!(line.contains("decision_roundtrip=ok"), "{line}");
+        assert!(
+            line.contains("历史试验数=7"),
+            "读数要带上原有的试验数，否则「原样留住」无从核对：{line}"
+        );
+    }
+
+    /// 反例：读得回但引擎不认识的统计（少了 category/key 的老形状）。按「组数与
+    /// 试验数」数得过去，可写者拿到它只能从空开始——往返必须判红。
+    #[tokio::test]
+    async fn decision_roundtrip_refuses_stats_the_engine_cannot_load() {
+        let pkg = tempfile::tempdir().unwrap();
+        let source = pkg.path().join("artifacts/evolution");
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(data.path().join("meta_learning")).unwrap();
+        std::fs::write(
+            data.path().join("meta_learning/decision_stats.json"),
+            serde_json::json!({"version": 1, "groups": [{"counts": {"a": [3, 2]}}]}).to_string(),
+        )
+        .unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let report = collect_artifact_root("evolution", data.path(), staging.path())
+            .await
+            .unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::rename(staging.path().join("artifacts/evolution"), &source).unwrap();
+        let manifest = manifest_with(vec![report]);
+
+        let err = decision_roundtrip(pkg.path(), &manifest).await.unwrap_err();
+        assert!(
+            err.to_string().contains("原有历史没有原样留住"),
+            "要把「写者读不回来」点出来：{err}"
         );
     }
 
