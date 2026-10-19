@@ -57,6 +57,12 @@ rules:
   - apiGroups: [""]
     resources: ["resourcequotas"]
     verbs: ["get", "list", "watch"]
+  # The second half of the same reading: a LimitRange bounds each container, and a
+  # table holding only the namespace sum would call the two sides equal while
+  # every per-container ceiling in the tree could be different. Read-only too.
+  - apiGroups: [""]
+    resources: ["limitranges"]
+    verbs: ["get", "list", "watch"]
   # Rollback of a change deploy: `kubectl rollout undo` resolves the previous
   # pod template through the deployment's ReplicaSets before it patches
   # anything, so the apps rule above (which covers deployments) is not enough.

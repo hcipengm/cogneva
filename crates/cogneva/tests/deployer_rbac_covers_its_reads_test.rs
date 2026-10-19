@@ -497,6 +497,7 @@ const SHORTCUTS: &[(&str, &str, &str)] = &[
     ("pod", "", "pods"),
     ("pvc", "", "persistentvolumeclaims"),
     ("resourcequota", "", "resourcequotas"),
+    ("limitrange", "", "limitranges"),
     ("event", "", "events"),
     ("secret", "", "secrets"),
     ("job", "batch", "jobs"),
