@@ -6637,11 +6637,22 @@ fn serves_the_delivered_images(doc: &serde_yaml::Value) -> bool {
         == Some(CLUSTER_REGISTRY_COMPONENT)
 }
 
-/// Rewrite every container image in a document that belongs to *this*
-/// repository to the reference this rollout delivers, and report how many
-/// actually moved — a reference already carrying exactly this rollout's image
-/// is left alone, so the count is a reading of what changed rather than of how
-/// many places were looked at.
+/// Rewrite every reference to *this* repository in a document — a container
+/// image, or a value that is nothing but the reference — to the image this
+/// rollout delivers, and report how many actually moved — a reference already
+/// carrying exactly this rollout's image is left alone, so the count is a
+/// reading of what changed rather than of how many places were looked at.
+///
+/// The whole value is the judgement, wherever it sits. A container image is not
+/// the only place a manifest names this build: the backup CronJob stamps the
+/// reference it runs as into every package it writes, because a container
+/// cannot read its own image and the artifact would otherwise carry no answer
+/// to "which build produced these bytes". Left on the floating tag, that stamp
+/// records a build the bytes were not made by — the value moves with the image
+/// it describes, so the stamp and the container always agree. A string that
+/// merely *contains* the reference is not rewritten: it is not a reference, and
+/// the profile test that walks every occurrence in the release set turns one
+/// into a failure rather than a silent half-pin.
 ///
 /// The judgement is on the value, not on a name: an image whose repository
 /// matches the rollout's is the same build, wherever it sits — a main
@@ -6689,6 +6700,10 @@ fn pin_app_image_refs(v: &mut serde_yaml::Value, repo: &str, image: &str) -> usi
             .iter_mut()
             .map(|c| pin_app_image_refs(c, repo, image))
             .sum(),
+        serde_yaml::Value::String(s) if image_repository(s) == repo && s.as_str() != image => {
+            *s = image.to_string();
+            1
+        }
         _ => 0,
     }
 }
@@ -16963,6 +16978,49 @@ spec:
         assert!(serde_yaml::to_string(&v)
             .unwrap()
             .contains("image: reg/cogneva:main-x"));
+    }
+
+    /// A value that is nothing but the reference moves with the image. The backup
+    /// CronJob stamps the reference it runs as into the packages it writes, and
+    /// pinning only `image:` left that stamp on the floating tag: the artifact
+    /// then names a build it was not made by, while the container beside it runs
+    /// the delivered one. The release-set walk in
+    /// `every_profile_points_its_manifest_dir_at_a_consumable_directory` is what
+    /// saw the two faces disagree.
+    #[test]
+    fn a_provenance_stamp_moves_with_the_image() {
+        let yaml = "\
+kind: CronJob
+metadata:
+  name: cogneva-backup
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: backup
+              image: reg/cogneva:local
+              env:
+                - name: COGNEVA_IMAGE_REF
+                  value: reg/cogneva:local
+                - name: COGNEVA_BACKUP_EXTRA_DATA_ROOTS
+                  value: evolution=/var/lib/cogneva-evolution-data
+";
+        let mut v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let repo = image_repository("reg/cogneva:main-x");
+        assert_eq!(pin_app_image_refs(&mut v, repo, "reg/cogneva:main-x"), 2);
+        let env = &v["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["env"];
+        assert_eq!(
+            env[0]["value"].as_str(),
+            Some("reg/cogneva:main-x"),
+            "the stamp has to name the image the container beside it runs"
+        );
+        assert_eq!(
+            env[1]["value"].as_str(),
+            Some("evolution=/var/lib/cogneva-evolution-data"),
+            "a value that only mentions a path is not a reference"
+        );
     }
 
     /// Anything outside the four rolled Deployments that runs this build is
