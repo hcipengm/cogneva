@@ -61,6 +61,14 @@ held_series_check_unreadable	cogneva_metric_held_unreadable	error_only_state	cog
 runtime_asset_content_drift	cogneva_runtime_asset_state	error_only_state	cog-reflection/src/runtime_assets.rs exports state gauges only for problem states of destinations that have one; a healthy asset is absent. The check's own timestamp is a separate series (cogneva_runtime_asset_check_seconds, present).
 runtime_asset_not_refreshed	cogneva_runtime_asset_state	error_only_state	Same gauge and same export rule; not_refreshed is absent because every checked asset matched its manifest.
 
+# llm_pool_open_but_idle reads the four pace operands, which are published on every
+# pool pass by publish_window_pace_gauges in cog-gateway. The rule landed in
+# 5443b0b4 (2026-10-19 23:49 CST) and the publisher in ee334e8b seven minutes
+# later; the running gateway is main-4ca01ba269ac, built before both, and the
+# live cogneva-json carries 202 rules without this one. So neither the rule nor
+# its emitters are in effect yet -- the witness reads the chart, the pod does not.
+llm_pool_open_but_idle	llm_pool_allowance_tokens,llm_pool_allowance_tokens_observed_timestamp_seconds,llm_pool_paced_upstreams,llm_pool_paced_upstreams_observed_timestamp_seconds,llm_pool_reserve_tokens,llm_pool_reserve_tokens_observed_timestamp_seconds,llm_pool_spent_tokens,llm_pool_spent_tokens_observed_timestamp_seconds	code_not_deployed	The four pace operands are published by publish_window_pace_gauges in cog-gateway (crates/cog-gateway/src/security_gateway.rs), landed in ee334e8b at 2026-10-19 23:58 CST; the rule that reads them landed in 5443b0b4 at 23:49 the same evening. The running gateway image is main-4ca01ba269ac, built before both commits, and the pod's own config does not carry this rule either (the live cogneva-json has 202 rules and this is not one of them), so nothing here is in effect yet and the reading is the chart's, not the cluster's. Each gauge is written with its own _observed_timestamp_seconds companion in the same pass, which is why all eight names are absent together rather than the values without their clocks. The next rollout of main picks up rule and publisher in one move; this row then becomes a stale declaration and must be deleted, the same way the task_router_claim_stall rows were (see the note below).
+
 # task_router_claim_stall's four gauges were declared code_not_deployed on
 # 2026-10-19 morning (added in 221a6c22, running image main-be5add5996d6). The
 # rollout happened: main-93ebcda35e7a passed 252fe47b's ancestor check, and all
