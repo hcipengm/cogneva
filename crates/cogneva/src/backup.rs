@@ -2936,6 +2936,14 @@ fn choose_package(
         })
 }
 
+/// 第二趟的候选：除最新那份以外的全部。
+///
+/// 最新那份由第一趟打开，不参加第二趟的排序：它刚写出来、当然从没成功过，若留在
+/// 候选里，「从没成功过者优先」会让第二趟每晚都挑中它，旧包一份也轮不到。
+fn older_than_newest(packages: &[PathBuf]) -> &[PathBuf] {
+    &packages[..packages.len().saturating_sub(1)]
+}
+
 /// 窗口里最该被打开的那一份：从没成功打开过的最先，其次上次成功最早的。
 ///
 /// 按卷上的顺序（名字即时间，最老的在前）走一遍：同是「从没成功过」时先到先得，
@@ -3590,7 +3598,11 @@ pub async fn run_drill_from_env() -> Result<(), Box<dyn std::error::Error>> {
     let mut targets: Vec<Option<String>> = vec![cfg.package.clone()];
     if cfg.also_unproven {
         let packages = packages_in(&cfg.backup_dir);
-        match least_recently_proven(&live, &packages).await? {
+        // 最新那份已经在第一趟里开过了，不参加第二趟的候选：否则「从没成功过」
+        // 的排序会永远先把刚写出来的那份挑出来（它当然从没成功过），第二趟每次都
+        // 空转，旧包一份也轮不到。
+        let candidates = older_than_newest(&packages);
+        match least_recently_proven(&live, candidates).await? {
             Some(name) => targets.push(Some(name)),
             None => tracing::warn!("卷上没有任何包可选，这一跑只开它能开的那一份"),
         }
@@ -3739,6 +3751,13 @@ mod tests {
         );
 
         assert_eq!(pick_least_recently_proven(&[], &proven), None);
+
+        // 第二趟的候选永远不含最新那份：它就是第一趟要开的那一份，留在候选里
+        // 会让「从没成功过」的排序每晚都先挑中它，旧包永远轮不到。
+        let paths: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
+        assert_eq!(older_than_newest(&paths), &paths[..2]);
+        assert!(older_than_newest(&paths[..1]).is_empty());
+        assert!(older_than_newest(&[]).is_empty());
     }
 
     #[test]
