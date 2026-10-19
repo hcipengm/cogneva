@@ -38,6 +38,7 @@ owner named on the task row; a task owned by another unit is refused.
 
 SUBCOMMANDS:
     queue                  List this unit's Pending, Scheduled and Running tasks.
+    next                   Print the one task this unit can start right now.
     claim   --task <id>    Reserve a ready task (Pending -> Scheduled).
     start   --task <id>    Begin a task and take its lease (Running).
     heartbeat              Push the leases of this unit's Running tasks forward.
@@ -64,6 +65,9 @@ OPTIONS:
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Queue {
+        json: bool,
+    },
+    Next {
         json: bool,
     },
     Claim {
@@ -158,6 +162,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
     let task = || task.clone().ok_or_else(|| "--task is required".to_string());
     let action = match sub {
         Some("queue") => Action::Queue { json },
+        Some("next") => Action::Next { json },
         Some("claim") => Action::Claim { task: task()? },
         Some("start") => Action::Start { task: task()? },
         Some("heartbeat") => Action::Heartbeat,
@@ -265,6 +270,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
 
     match request.action {
         Action::Queue { json } => queue(&*backend, workspace, unit, json).await?,
+        Action::Next { json } => next(&*backend, workspace, unit, json).await?,
         Action::Claim { task } => {
             let task = owned_task(&*backend, workspace, &task, unit).await?;
             let deps = dependency_state(&*backend, workspace).await?;
@@ -530,11 +536,65 @@ async fn queue(
             task.updated_at.to_rfc3339(),
         );
     }
-    println!(
+    // The census is a note about the reading, not part of it: on stdout it
+    // would make `--json` unparseable and a piped table one line longer than
+    // the header promises.
+    eprintln!(
         "# generated_at={} unit={} tasks={}",
         Utc::now().to_rfc3339(),
         unit,
         mine.len()
+    );
+    Ok(())
+}
+
+/// The one task this unit can start right now.
+///
+/// The shared queue never offers an owned task, so the readiness the publisher
+/// would have applied is this command's to apply: without it a worker would
+/// have to claim tasks one by one and learn from refusals which of them the
+/// graph is not ready to run. The count of owned tasks rides along because
+/// "nothing ready" and "nothing assigned" are different answers to "why is
+/// this unit idle", and a bare empty line gives neither.
+async fn next(
+    backend: &dyn StateBackend,
+    workspace: &str,
+    unit: &str,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let tasks = backend.dag_get_all_tasks(workspace).await?;
+    let deps = dependency_state(backend, workspace).await?;
+    let mut owned = 0usize;
+    let mut ready: Vec<Task> = Vec::new();
+    for task in tasks {
+        if task.owner_unit.as_deref() != Some(unit) || !task.is_executable {
+            continue;
+        }
+        owned += 1;
+        if task.status == TaskStatus::Pending && task.is_ready(&deps) {
+            ready.push(task);
+        }
+    }
+    ready.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.updated_at.cmp(&b.updated_at))
+    });
+    match ready.first() {
+        Some(task) if json => println!("{}", serde_json::to_string_pretty(task)?),
+        Some(task) => println!("{}", task.id),
+        None if json => println!("null"),
+        None => {}
+    }
+    // Why this unit is idle is a note beside the answer, not the answer, so it
+    // goes to stderr: stdout stays one task id (or `null`) that a caller can
+    // read without stripping anything.
+    eprintln!(
+        "# generated_at={} unit={} ready={} owned={}",
+        Utc::now().to_rfc3339(),
+        unit,
+        ready.len(),
+        owned
     );
     Ok(())
 }
@@ -551,7 +611,7 @@ async fn publish(endpoints: &Endpoints, message: DagMessage) -> Result<(), Box<d
     let stream = format!("orchestrator:results:{}", endpoints.workspace);
     let backend = transport(endpoints).await?;
     backend.publish(&stream, &payload).await?;
-    println!("# published to {stream}");
+    eprintln!("# published to {stream}");
     Ok(())
 }
 
@@ -597,6 +657,9 @@ mod tests {
         let request = parse_args(&args(&["queue", "--unit", "8b"])).unwrap();
         assert_eq!(request.unit, "8b");
         assert_eq!(request.action, Action::Queue { json: false });
+
+        let request = parse_args(&args(&["next", "--unit", "8b"])).unwrap();
+        assert_eq!(request.action, Action::Next { json: false });
 
         let request = parse_args(&args(&["claim", "--unit", "8b", "--task", "t-1"])).unwrap();
         assert_eq!(request.action, Action::Claim { task: "t-1".into() });
