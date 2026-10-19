@@ -73,6 +73,15 @@ async fn record_task_op(_state: &GatewayState, _op: &str) {
 pub struct CreateTaskRequest {
     #[serde(default)]
     pub goal_id: Option<String>,
+    /// The work to do: a short title line, then any details.
+    ///
+    /// The first line becomes the landing commit's subject, so it has to read
+    /// as a title -- one line, at most 50 characters, ending on a word
+    /// boundary, and carrying whatever tells this work apart from the changes
+    /// before it. A blank line and the details follow; the landing writes the
+    /// whole goal into the commit body verbatim. A goal submitted as one long
+    /// sentence still lands, but its header has to be shortened, and the part
+    /// that did not fit is only a scroll below rather than on the first line.
     pub goal: String,
     #[serde(default)]
     pub tasks: Option<Vec<TaskItem>>,

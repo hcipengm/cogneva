@@ -1424,15 +1424,31 @@ fn principle_literal(slug: &str) -> String {
     format!("{PRINCIPLE_DECLARATION_PREFIX}{slug}")
 }
 
+/// How many characters a goal's first line may occupy.
+///
+/// The first line is the landing header's text, and every scope the landing
+/// writes leaves room for this much inside its subject cap. A title written
+/// within the budget reaches `git log --oneline` whole; a longer one is
+/// shortened there, and a shortened title is a view a reader has to scroll
+/// past.
+const GOAL_TITLE_CHARS: usize = 50;
+
 /// What a row of the principle ledger asks for, in the words the goal path is
 /// handed.
 ///
-/// The slug, the lane its declared tier puts the missing check in, the rule's own
-/// sentence, and the violation if a gate has had to refuse work for it. The
-/// sentence is carried because a goal that names only where to look is a goal a
-/// generator cannot act on, and the rule's own words are what the gate has to
-/// answer to -- the same reason the registry intake carries the destination and
-/// not only the module.
+/// The goal is a title and then the details, because that is the shape the
+/// landing header reads: its first line becomes the commit subject and the
+/// rest becomes the body. The title is the rule's name in words, short enough
+/// to survive the header intact -- a title derived at the landing layer used
+/// to spend most of the header on the template and the shared category prefix,
+/// which left sibling rules reading alike.
+///
+/// The details carry the slug, the lane its declared tier puts the missing
+/// check in, the rule's own sentence, and the violation if a gate has had to
+/// refuse work for it. The sentence is carried because a goal that names only
+/// where to look is a goal a generator cannot act on, and the rule's own words
+/// are what the gate has to answer to -- the same reason the registry intake
+/// carries the destination and not only the module.
 ///
 /// The lane is optional and its absence is said rather than filled in. A principle
 /// whose memory declares no tier has no lane to name, and inventing one here would
@@ -1446,7 +1462,7 @@ fn principle_goal(row: &PrincipleRow, lane: Option<&str>) -> String {
         Some(lane) => format!("a check answering from {lane}, declared"),
         None => "a check the tree can be judged by, declared".to_string(),
     };
-    let mut goal = format!(
+    let mut details = format!(
         "Give the principle `{}` the gate it is owed: {owed} in the header of the test that carries \
          it.{}",
         row.slug,
@@ -1458,13 +1474,82 @@ fn principle_goal(row: &PrincipleRow, lane: Option<&str>) -> String {
         // must not run into one. Terminated here rather than in the rule's own
         // words, because a goal that added a stop to a quotation would be quoting
         // something the memory does not say.
-        if !goal.ends_with('.') {
-            goal.push('.');
+        if !details.ends_with('.') {
+            details.push('.');
         }
-        goal.push(' ');
-        goal.push_str(&violation);
+        details.push(' ');
+        details.push_str(&violation);
     }
-    goal
+    format!("{}\n\n{details}", goal_title(row))
+}
+
+/// The short first line of a principle handover: the rule's name in words.
+///
+/// The slug is the rule's name, and its words are the closest thing to a title
+/// the account holds; the category prefix is dropped because it says where the
+/// rule is kept, not what it governs, and every peer row carries it. The full
+/// slug is in the details, where an exact name belongs.
+fn goal_title(row: &PrincipleRow) -> String {
+    const ACTION: &str = "Gate: ";
+    let budget = GOAL_TITLE_CHARS.saturating_sub(ACTION.chars().count());
+    format!(
+        "{ACTION}{}",
+        clip_at_word_boundary(&slug_phrase(&row.slug), budget)
+    )
+}
+
+/// A slug as the words of the rule it names.
+fn slug_phrase(slug: &str) -> String {
+    let name = match slug.split_once('_') {
+        Some(("feedback" | "project" | "reference" | "fact", rest)) => rest,
+        _ => slug,
+    };
+    // The memory names a possessive by the character that follows its
+    // underscore, and restoring the apostrophe is what keeps a title from
+    // reading like a column name. Only shares and negatives are repaired;
+    // `_d` and `_re` would turn ordinary word endings into contractions.
+    name.replace("_s_", "'s ")
+        .replace("_t_", "'t ")
+        .replace("_s", "'s")
+        .replace("_t", "'t")
+        .replace('_', " ")
+}
+
+/// A title cut to `limit` characters at the last word boundary inside it,
+/// followed by an ellipsis.
+///
+/// The landing layer applies the same rule to a goal that ignored this one, but
+/// a producer that cuts its own title keeps the words it meant to show: the
+/// landing header has less room than the goal's first line.
+fn clip_at_word_boundary(title: &str, limit: usize) -> String {
+    let title = title.trim();
+    if title.chars().count() <= limit {
+        return title.to_string();
+    }
+    let budget = limit.saturating_sub(1);
+    let mut end = 0;
+    for (taken, (offset, ch)) in title.char_indices().enumerate() {
+        if taken == budget {
+            break;
+        }
+        end = offset + ch.len_utf8();
+    }
+    let head = &title[..end];
+    let cut = if title[end..].chars().next().is_none_or(is_title_boundary) {
+        head.trim_end()
+    } else {
+        head.rfind(is_title_boundary)
+            .map_or(head, |at| &head[..at])
+            .trim_end()
+    };
+    format!("{cut}…")
+}
+
+/// Whitespace, and the marks Chinese uses between clauses: a title in Chinese
+/// has no spaces to cut at, so a sentence mark is the only boundary a reader
+/// would recognise.
+fn is_title_boundary(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '，' | '。' | '、' | '；' | '：' | '！' | '？')
 }
 
 /// The violation as a sentence in its own right, or nothing when the account has
@@ -3895,17 +3980,80 @@ mod tests {
         // A rule nothing has refused carries no assertion: the account holds a
         // count, and a zero in it is not a statement that the rule was kept.
         assert_eq!(rows[0].assertion, None);
-        // The goal names the lane the tier puts the check in and the rule's own
-        // sentence: a goal that named only the slug would tell a generator where
-        // to look and not what is wanted there.
+        // The goal is a short title and then the details. The first line is what
+        // the landing header shows, so it has to name the rule in few words; the
+        // details name the lane the tier puts the check in and the rule's own
+        // sentence, because a goal that named only the slug would tell a
+        // generator where to look and not what is wanted there.
         assert_eq!(
             rows[0].title.as_deref(),
             Some(
-                "Give the principle `feedback_x` the gate it is owed: a check answering from this \
-                 tree at one revision, the way the platform's own tests answer, declared in the \
-                 header of the test that carries it. The rule itself: a reading must be quoted \
-                 with its construction"
+                "Gate: x\n\nGive the principle `feedback_x` the gate it is owed: a check answering \
+                 from this tree at one revision, the way the platform's own tests answer, declared \
+                 in the header of the test that carries it. The rule itself: a reading must be \
+                 quoted with its construction"
             )
+        );
+    }
+
+    /// The goal's first line is the landing header, so it is written to fit
+    /// there and to tell sibling rules apart.
+    ///
+    /// The two slugs are from the corpus and share their first 43 characters.
+    /// Under a title budget of the goal's own the tails still differ; the
+    /// collision this replaces came from the landing layer, where the header's
+    /// template and the shared category prefix left too little room for a tail.
+    #[test]
+    fn a_principle_goal_opens_with_a_title_that_fits_and_differs() {
+        let (rows, _) = principle_debt_readings(&[
+            principle_row(
+                "feedback_an_absence_claim_needs_the_reader_s_own_root",
+                Some(PrincipleCheckKind::Tree),
+                None,
+            ),
+            principle_row(
+                "feedback_an_absence_claim_needs_the_reader_that_could_answer_it",
+                Some(PrincipleCheckKind::Tree),
+                None,
+            ),
+        ]);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let titles: Vec<&str> = rows
+            .iter()
+            .map(|row| {
+                row.title
+                    .as_deref()
+                    .expect("a row carries its goal")
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        for (title, row) in titles.iter().zip(&rows) {
+            assert!(title.chars().count() <= GOAL_TITLE_CHARS, "{title}");
+            let visible = title
+                .strip_prefix("Gate: ")
+                .expect("the title names the work")
+                .trim_end_matches('…');
+            // The row is the account's reading, not the ledger row it was read
+            // off; its identity carries the slug the goal was derived from.
+            let slug = row
+                .identity
+                .literal
+                .strip_prefix(PRINCIPLE_DECLARATION_PREFIX)
+                .expect("the identity literal is the declaration");
+            let phrase = slug_phrase(slug);
+            assert!(phrase.starts_with(visible), "severed word: {title}");
+            let next = phrase[visible.len()..].chars().next();
+            assert!(
+                next.is_none_or(is_title_boundary),
+                "the cut lands on a word boundary, got {next:?}: {title}"
+            );
+        }
+        assert_ne!(
+            titles[0], titles[1],
+            "sibling rules have to be distinguishable from the first line"
         );
     }
 
@@ -3962,21 +4110,23 @@ mod tests {
         assert_eq!(
             rows[0].title.as_deref(),
             Some(
-                "Give the principle `feedback_untiered` the gate it is owed: a check the tree can \
-                 be judged by, declared in the header of the test that carries it. The rule \
-                 itself: nobody said"
+                "Gate: untiered\n\nGive the principle `feedback_untiered` the gate it is owed: a \
+                 check the tree can be judged by, declared in the header of the test that carries \
+                 it. The rule itself: nobody said"
             )
         );
         assert_eq!(rows[1].identity.literal, "principle: feedback_owed");
         // A row that arrived with no sentence still gets a goal: the rule's words
         // are carried when the reading has them, and their absence is not a reason
-        // to hand over a bare slug.
+        // to hand over a bare slug. The title comes from the slug either way, so
+        // the first line survives the landing header for a row the reading only
+        // named.
         assert_eq!(
             rows[1].title.as_deref(),
             Some(
-                "Give the principle `feedback_owed` the gate it is owed: a check answering from \
-                 the running deployment's own readings, declared in the header of the test that \
-                 carries it."
+                "Gate: owed\n\nGive the principle `feedback_owed` the gate it is owed: a check \
+                 answering from the running deployment's own readings, declared in the header of \
+                 the test that carries it."
             )
         );
         assert_eq!(
@@ -4039,10 +4189,10 @@ mod tests {
         assert_eq!(
             rows[0].title.as_deref(),
             Some(
-                "Give the principle `feedback_refused` the gate it is owed: a check answering from \
-                 the shape of the act it rules out, decided before the act, declared in the \
-                 header of the test that carries it. The rule itself: only stage your own paths. \
-                 This principle has been refused work 3 times, most recently at \
+                "Gate: refused\n\nGive the principle `feedback_refused` the gate it is owed: a \
+                 check answering from the shape of the act it rules out, decided before the act, \
+                 declared in the header of the test that carries it. The rule itself: only stage \
+                 your own paths. This principle has been refused work 3 times, most recently at \
                  2025-11-01T12:26:40+00:00, by the host gate declared as `NARROW_ADD_RE`."
             )
         );

@@ -406,12 +406,16 @@ fn alert_intent(
     max_label_chars: usize,
 ) -> (String, serde_json::Value) {
     let labels = cog_core::bound_alert_labels(&alert.labels, max_label_chars);
+    // The first line is the landing header: the rule name is the part that
+    // tells two alert-driven changes apart, so it comes first, where a
+    // shortened header still shows it.
     let goal = format!(
-        "Investigate and fix the root cause of firing alert \"{}\" \
+        "Fix alert \"{}\"\n\nInvestigate and fix the root cause of firing alert \"{}\" \
          (severity: {}): {}. Alert labels: {}. The alert fired at {} \
          and is still active. Identify the underlying defect or \
          resource condition, implement a durable fix, and explain \
          how recurrence is prevented.",
+        alert.rule,
         alert.rule,
         alert.severity,
         alert.message,
@@ -512,14 +516,18 @@ fn taste_task_id(intent: &cog_core::TasteIntent) -> String {
 /// not an instruction — because a channel that turned one person's preference
 /// into an order would be a very different system from one that weighs it.
 fn taste_intent(intent: &cog_core::TasteIntent) -> (String, serde_json::Value) {
+    // The first line is the landing header. The subject is what tells one
+    // submission from another, so it leads rather than following the sentence
+    // that explains where the submission came from.
     let goal = format!(
-        "Act on a judgement submitted from outside the pipeline about \"{}\": {}. \
-         Submitted by {} at {}. Decide whether this judgement calls for a change \
-         — to behaviour, to a decision, or to the criterion work is judged by — \
+        "Act on judgement \"{}\"\n\nAct on a judgement submitted from outside the pipeline \
+         about \"{}\": {}. Submitted by {} at {}. Decide whether this judgement calls for a \
+         change — to behaviour, to a decision, or to the criterion work is judged by — \
          and implement the change it calls for; if it calls for none, say why in \
          the change description. This is a stated judgement rather than an \
          instruction: what is being asked for is the reason behind it, and the \
          usual gates still decide whether the result is good.",
+        intent.subject,
         intent.subject,
         intent.payload.summary(),
         intent.submitted_by,
@@ -832,9 +840,11 @@ async fn tick(
         dirty = true;
         let hash = short_hash(&key);
         let sample_ids: Vec<&str> = group.iter().take(5).map(|t| t.id.as_str()).collect();
+        // The signature leads: it is what tells one recurring failure from
+        // another in a shortened header.
         let goal = format!(
-            "Investigate recurring self-evolution failure: signature \"{sig}\" \
-             occurred {} times in the last {} seconds (sample tasks: {}). \
+            "Fix recurring failure \"{sig}\"\n\nInvestigate recurring self-evolution failure: \
+             signature \"{sig}\" occurred {} times in the last {} seconds (sample tasks: {}). \
              Read the failed tasks' inputs and errors, find the shared root \
              cause, and implement a fix.",
             group.len(),
@@ -871,8 +881,8 @@ async fn tick(
             dirty = true;
             let dlq = orch.dlq_len().await.unwrap_or(0);
             let goal = format!(
-                "Investigate orchestrator queue backlog: {backlog} tasks \
-                 pending/scheduled (DLQ: {dlq}). Determine why tasks are not \
+                "Drain the queue backlog\n\nInvestigate orchestrator queue backlog: {backlog} \
+                 tasks pending/scheduled (DLQ: {dlq}). Determine why tasks are not \
                  draining and fix the bottleneck."
             );
             let outcome = submit_intent(
@@ -901,13 +911,12 @@ async fn tick(
         if due {
             dirty = true;
             let key = self_audit_task_id(now);
-            let goal = "Audit this repository for security and reliability \
-                        defects, going over: hardcoded secrets or weak default \
-                        credentials, injection surfaces (command/SQL/XSS), \
-                        unsafe dependency or configuration patterns, and \
-                        error paths that silently swallow failures. Pick the \
-                        single most critical confirmed finding and implement \
-                        its fix; list the remaining findings in the change \
+            let goal = "Audit the repository for security defects\n\nAudit this repository for \
+                        security and reliability defects, going over: hardcoded secrets or weak \
+                        default credentials, injection surfaces (command/SQL/XSS), unsafe \
+                        dependency or configuration patterns, and error paths that silently \
+                        swallow failures. Pick the single most critical confirmed finding and \
+                        implement its fix; list the remaining findings in the change \
                         description."
                 .to_string();
             let period = now.format("%Y%m%d").to_string();

@@ -1885,24 +1885,30 @@ async fn redrive(
 /// How many characters a commit subject may occupy, type and scope included.
 ///
 /// The cap exists so `git log --oneline` stays one line per change. It used to
-/// be applied to the goal text alone and by character count, which is what
-/// made consecutive principle landings read alike: the shared `feedback_`
-/// prefix filled most of the budget and the cut fell inside a word.
-const SUBJECT_LIMIT: usize = 80;
+/// be applied to the whole goal's first line with `.take(70)`, which cut words
+/// in half and, worse, threw the rest away: what a subject shortened never
+/// reached the body, so it was gone from the commit. The subject is now a view
+/// of the goal, not a copy of it -- the body carries the goal in full.
+const SUBJECT_LIMIT: usize = 72;
 
 /// Commit message for a landed change: what it does, why, and the trailer the
 /// landing idempotency check reads.
+///
+/// The goal is written into the body in full and first, always, even when the
+/// subject holds all of it. A subject is shortened by design, and anything
+/// shortened in place and not stored elsewhere is lost; keeping the whole goal
+/// one paragraph below the header is what makes the loss impossible rather
+/// than merely unlikely.
 fn commit_message(identity: &BotIdentityConfig, change: &GeneratedChange) -> String {
     let summary = goal_summary(change);
     let mut body = format!(
         "{}\n\n",
         commit_subject(commit_type(change), commit_scope(change), summary)
     );
-    // A principle's subject carries the rule in words, which is what makes two
-    // of them readable apart; the slug is the exact name, so it is written
-    // where an exact name belongs rather than left out of the commit.
-    if let Some(slug) = principle_slug(summary) {
-        body.push_str(&format!("Principle: `{slug}`\n\n"));
+    let goal = change.goal.trim();
+    if !goal.is_empty() {
+        body.push_str(goal);
+        body.push_str("\n\n");
     }
     body.push_str(&format!(
         "{}{}\n",
@@ -1945,103 +1951,18 @@ fn goal_summary(change: &GeneratedChange) -> &str {
         .unwrap_or("autonomous change")
 }
 
-/// The subject line: `type(scope): what the change does`.
+/// The subject line: `type(scope): the goal's first line`.
 ///
-/// A goal that opens by naming one principle and the gate it is owed gets a
-/// semantic subject instead of its own first line. That line names the rule by
-/// its slug, and the slug is a sentence with underscores; copying it into the
-/// header and cutting at a character count left every principle landing with
-/// the same shared prefix and a severed last word (`…and_that_lifetim`), so the
-/// only way to tell two of them apart was to open the body.
-///
-/// Everything else keeps its first line, clipped at a word boundary and marked
-/// with an ellipsis. A shortened subject has to read as shortened: a silent cut
-/// is indistinguishable from a typo, and a cut between words is what makes the
-/// remaining words readable.
+/// The first line is the goal's title by convention -- a goal that has more to
+/// say puts it on the following lines -- and a title written within the budget
+/// is what lets a reader tell consecutive landings apart without opening the
+/// body. The subject holds that title whole whenever it fits and clips it at a
+/// boundary when it does not; either way the body carries the goal in full, so
+/// the clip costs a reader a scroll, never the text.
 fn commit_subject(kind: &str, scope: &str, summary: &str) -> String {
     let prefix = format!("{kind}({scope}): ");
     let budget = SUBJECT_LIMIT.saturating_sub(prefix.chars().count());
-    let title = match principle_slug(summary) {
-        Some(slug) => principle_title(slug, budget),
-        None => clip_at_word_boundary(summary, budget),
-    };
-    format!("{prefix}{title}")
-}
-
-/// The subject's own words for a principle handover, fitted to `budget`.
-///
-/// The rule in words comes first because that is what a reader scans. When the
-/// words have to be shortened, a short handle derived from the full slug keeps
-/// the subject distinguishable: two rules can share a long beginning -- one
-/// corpus has a pair sharing the first 43 characters of its slug -- and then
-/// the readable part is the same line while the rules are not. The handle is
-/// derived rather than copied because it is not a name, only a tie-breaker;
-/// the exact slug is in the body.
-fn principle_title(slug: &str, budget: usize) -> String {
-    const OPEN: &str = "Gate the principle \"";
-    let phrase = principle_phrase(slug);
-    let whole = format!("{OPEN}{phrase}\"");
-    if whole.chars().count() <= budget {
-        return whole;
-    }
-    let tag = format!(" [{}]", slug_tag(slug));
-    // The template, the closing quote and the handle come out of the same
-    // budget as the words.
-    let room = budget.saturating_sub(OPEN.chars().count() + tag.chars().count() + 1);
-    if room < 2 {
-        // A scope wide enough to leave no room for the template is not a
-        // subject the template can be written in; shorten what there is.
-        return clip_at_word_boundary(&whole, budget);
-    }
-    let words = clip_at_word_boundary(&phrase, room);
-    format!("{OPEN}{words}\"{tag}")
-}
-
-/// A short, build-independent handle for a slug.
-///
-/// FNV-1a rather than the standard hasher: the tag is compared by people
-/// looking at two log lines, so the same slug has to produce the same tag on
-/// every machine and every build. Only 32 of the 64 bits are shown, which is
-/// enough to separate the few thousand rules a corpus holds.
-fn slug_tag(slug: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in slug.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{:08x}", hash as u32)
-}
-
-/// The slug of the principle a goal is handing a gate to, if that is the job.
-///
-/// The change-ledger's handover opens with `Give the principle \`<slug>\` the
-/// gate it is owed`. Only that shape is recognised, and the slug has to be
-/// shaped like a slug, so a goal that merely happens to quote the phrase is
-/// filed under its own words. A producer that rewords its goal falls back to
-/// the generic subject; nothing breaks, the special case just stops applying.
-fn principle_slug(goal: &str) -> Option<&str> {
-    const MARKER: &str = "Give the principle `";
-    let slug = goal.strip_prefix(MARKER)?.split_once('`')?.0;
-    let shaped = !slug.is_empty()
-        && slug
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
-    shaped.then_some(slug)
-}
-
-/// A slug as the words of the rule it names.
-///
-/// The category prefix says where the rule is kept, not what it governs, and
-/// every rule the ledger hands over carries one; spending the subject's budget
-/// on it pushes out the words that tell two rules apart. The prefix is dropped
-/// only when it is one of the memory's categories -- an unknown first word is
-/// part of the name.
-fn principle_phrase(slug: &str) -> String {
-    let name = match slug.split_once('_') {
-        Some(("feedback" | "project" | "reference" | "fact", rest)) => rest,
-        _ => slug,
-    };
-    name.replace('_', " ")
+    format!("{prefix}{}", clip_at_word_boundary(summary, budget))
 }
 
 /// A title cut to `limit` characters at the last word boundary inside it,
@@ -2067,16 +1988,27 @@ fn clip_at_word_boundary(title: &str, limit: usize) -> String {
     }
     let head = &title[..end];
     // A word that ends exactly at the budget is complete even though no
-    // whitespace follows it inside the head; cutting before it would shorten a
+    // boundary follows it inside the head; cutting before it would shorten a
     // title further than the budget requires.
-    let cut = if title[end..].chars().next().is_none_or(char::is_whitespace) {
+    let cut = if title[end..].chars().next().is_none_or(is_title_boundary) {
         head.trim_end()
     } else {
-        head.rfind(char::is_whitespace)
+        head.rfind(is_title_boundary)
             .map_or(head, |at| &head[..at])
             .trim_end()
     };
     format!("{cut}…")
+}
+
+/// What a title may be cut at.
+///
+/// Whitespace for languages that separate words with it; the full-width marks
+/// for Chinese, which does not, so a sentence mark is the only boundary a
+/// reader would recognise. ASCII punctuation is deliberately absent: a colon
+/// or a dot sits inside paths and identifiers as often as between words, and a
+/// cut there looks like a broken token rather than a shortened sentence.
+fn is_title_boundary(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '，' | '。' | '、' | '；' | '：' | '！' | '？')
 }
 
 /// The Conventional Commits type this change is filed under.
@@ -3444,106 +3376,63 @@ mod tests {
         );
     }
 
-    /// The goal the change ledger hands over when a principle is owed a gate.
-    fn principle_goal(slug: &str) -> String {
-        format!(
-            "Give the principle `{slug}` the gate it is owed: a check answering from this tree \
-             at one revision, the way the platform's own tests answer, declared in the header of \
-             the test that carries it. The rule itself: a claim needs a lifetime."
-        )
-    }
-
     fn subject_of(msg: &str) -> &str {
         msg.lines().next().unwrap_or_default()
     }
 
-    fn principle_subject(slug: &str) -> String {
+    /// Everything after the blank line that ends the header, i.e. the body as
+    /// a reader gets it when they open the commit.
+    fn body_of(msg: &str) -> &str {
+        msg.split_once("\n\n")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default()
+    }
+
+    fn landed(goal: &str) -> String {
         let mut ch = change("chg-50", "diff");
-        ch.goal = principle_goal(slug);
+        ch.goal = goal.into();
         commit_message(&BotIdentityConfig::default(), &ch)
     }
 
-    /// The words shown between the template's quotes and, when they were
-    /// shortened, the handle that follows them.
-    fn principle_parts(subject: &str) -> (&str, Option<&str>) {
-        let rest = subject
-            .strip_prefix("fix(cog-github): Gate the principle \"")
-            .expect("a principle subject uses the template");
-        match rest.rsplit_once("\" [") {
-            Some((words, tag)) => (words, Some(tag.strip_suffix(']').expect("a closed handle"))),
-            None => (rest.strip_suffix('"').expect("a closing quote"), None),
-        }
-    }
-
-    /// A principle landing's subject says what the change does and which rule
-    /// it is about. Copying the goal's own opening put the shared `feedback_`
-    /// prefix in the header and cut the rule's name mid-word, so every
-    /// principle landing looked the same in `git log --oneline`.
+    /// A goal that opens with a title short enough to fit is shown whole. The
+    /// header has room for a 50-character title under every scope the landing
+    /// writes, and a producer that follows the convention gets a subject a
+    /// reader can tell apart from its neighbours without opening the body.
     #[test]
-    fn a_principle_landing_names_the_rule_in_its_subject() {
-        let mut ch = change("chg-46", "diff");
-        ch.goal = principle_goal(
-            "feedback_a_claim_needs_a_lifetime_and_that_its_owner_keeps_renewing_it",
-        );
-
-        let msg = commit_message(&BotIdentityConfig::default(), &ch);
-        let subject = subject_of(&msg);
-
-        assert!(
-            subject.starts_with("fix(cog-github): Gate the principle \"a claim needs a lifetime"),
-            "{subject}"
-        );
-        assert!(
-            !subject.contains("feedback_"),
-            "the category prefix must not spend the subject's budget: {subject}"
-        );
-        // What shows is whole words of the rule: the character after the
-        // visible part is a space or nothing.
-        let phrase = "a claim needs a lifetime and that its owner keeps renewing it";
-        let (words, tag) = principle_parts(subject);
-        let visible = words.trim_end_matches('…');
-        assert!(phrase.starts_with(visible), "severed word: {subject}");
-        assert!(
-            phrase[visible.len()..]
-                .chars()
-                .next()
-                .is_none_or(char::is_whitespace),
-            "severed word: {subject}"
-        );
-        let tag =
-            tag.unwrap_or_else(|| panic!("a shortened rule name carries a handle: {subject}"));
-        assert!(
-            tag.len() == 8 && tag.chars().all(|c| c.is_ascii_hexdigit()),
-            "the handle is a short hex tag: {subject}"
-        );
-        assert!(
-            msg.contains(
-                "Principle: `feedback_a_claim_needs_a_lifetime_and_that_its_owner_keeps_renewing_it`"
-            ),
-            "the full slug belongs in the body: {msg}"
-        );
-    }
-
-    /// The acceptance in the ticket: consecutive principle landings have to be
-    /// distinguishable from their subjects alone. These are two slugs from the
-    /// corpus sharing their first 43 characters, so the readable part is the
-    /// same line for both; the handle is what keeps them apart.
-    #[test]
-    fn consecutive_principle_landings_have_distinct_subjects() {
-        let first = principle_subject("feedback_an_absence_claim_needs_the_reader_s_own_root");
-        let second =
-            principle_subject("feedback_an_absence_claim_needs_the_reader_that_could_answer_it");
-
+    fn a_short_title_is_the_subject_whole() {
+        let msg = landed("Fix the CI failure in the landing job");
         assert_eq!(
-            principle_parts(subject_of(&first)).0,
-            principle_parts(subject_of(&second)).0,
-            "precondition: the readable part alone cannot tell these apart"
+            subject_of(&msg),
+            "fix(cog-github): Fix the CI failure in the landing job"
         );
-        assert_ne!(
-            subject_of(&first),
-            subject_of(&second),
-            "the handle keeps two long-shared-prefix rules distinguishable"
+        assert!(!subject_of(&msg).ends_with('…'));
+    }
+
+    /// The acceptance in the ticket: consecutive landings have to be
+    /// distinguishable from their subjects alone. These two goals follow the
+    /// convention -- short titles that share most of their words, as sibling
+    /// rules do -- and the differing tail is what tells them apart, without a
+    /// handle and without opening the body.
+    #[test]
+    fn consecutive_landings_with_short_titles_have_distinct_subjects() {
+        let first = landed(
+            "Gate: an absence claim needs a reader's root\n\n\
+             Give the principle `feedback_an_absence_claim_needs_the_reader_s_own_root` \
+             the gate it is owed.",
         );
+        let second = landed(
+            "Gate: an absence claim needs a reader that answers\n\n\
+             Give the principle `feedback_an_absence_claim_needs_the_reader_that_could_answer_it` \
+             the gate it is owed.",
+        );
+
+        let (a, b) = (subject_of(&first), subject_of(&second));
+        assert!(!a.ends_with('…') && !b.ends_with('…'), "{a}\n{b}");
+        assert!(
+            a.starts_with("fix(cog-github): Gate: an absence claim needs a reader"),
+            "{a}"
+        );
+        assert_ne!(a, b, "titles that differ must land as subjects that differ");
     }
 
     /// A goal that is too long is shortened between words and says so. The
@@ -3552,10 +3441,7 @@ mod tests {
     fn a_long_goal_is_clipped_between_words_and_marked() {
         let goal = "make every sentence in this heading long enough that the subject has to be \
                     shortened somewhere in the middle";
-        let mut ch = change("chg-49", "diff");
-        ch.goal = goal.into();
-
-        let msg = commit_message(&BotIdentityConfig::default(), &ch);
+        let msg = landed(goal);
         let subject = subject_of(&msg);
 
         assert!(subject.chars().count() <= SUBJECT_LIMIT, "{subject}");
@@ -3574,9 +3460,97 @@ mod tests {
         );
         let next = goal[visible.len()..].chars().next();
         assert!(
-            next.is_none_or(char::is_whitespace),
+            next.is_none_or(is_title_boundary),
             "the cut lands on a word boundary, got {next:?}: {subject}"
         );
+    }
+
+    /// Chinese separates ideas with sentence marks rather than spaces, so a
+    /// title in Chinese that is cut to a character count runs on into the
+    /// middle of a clause. The cut has to take the last mark inside the budget
+    /// instead, and the mark is not left dangling at the end of the subject.
+    #[test]
+    fn a_chinese_goal_is_clipped_at_a_sentence_mark() {
+        let goal = "设计稿：执行机器只有本机 buildah，集群里的执行器只能跑闭集枚举，\
+                    没有选择余地，需要另想办法把渲染也挪到本机，否则设计稿里写的那条路走不通";
+        let msg = landed(goal);
+        let subject = subject_of(&msg);
+
+        assert!(subject.chars().count() <= SUBJECT_LIMIT, "{subject}");
+        let prefix = "fix(cog-github): ";
+        let visible = subject
+            .strip_prefix(prefix)
+            .expect("unexpected header")
+            .trim_end_matches('…');
+        assert!(subject.ends_with('…'), "{subject}");
+        assert!(goal.starts_with(visible), "{subject}");
+        let next = goal[visible.len()..].chars().next();
+        assert!(
+            next.is_some_and(is_title_boundary),
+            "the cut lands on a sentence mark, got {next:?}: {subject}"
+        );
+        assert!(
+            !visible
+                .chars()
+                .last()
+                .is_some_and(|c| matches!(c, '，' | '。' | '、' | '；' | '：' | '！' | '？')),
+            "the mark that was cut at is not shown itself: {subject}"
+        );
+    }
+
+    /// The goal reaches the body in full, always -- including when the subject
+    /// shows all of it. The subject is a shortened view; keeping the whole text
+    /// one paragraph below the header is what makes a shortened subject cost a
+    /// scroll instead of the text.
+    #[test]
+    fn the_full_goal_is_the_first_paragraph_of_the_body_even_when_the_subject_fits() {
+        let goal = "Fix the CI failure in the landing job";
+        let msg = landed(goal);
+        assert_eq!(
+            body_of(&msg).split_once("\n\n").map(|(p, _)| p),
+            Some(goal),
+            "{msg}"
+        );
+    }
+
+    /// What the subject shortened must still be findable: the ticket's
+    /// acceptance is that the complete text of any long goal is searchable in
+    /// the commit. The old header dropped everything past the cut, and nothing
+    /// else in the message carried it, so that text was gone for good.
+    #[test]
+    fn what_the_subject_shortens_is_still_in_the_body() {
+        let goal = "make every sentence in this heading long enough that the subject has to be \
+                    shortened somewhere in the middle";
+        let msg = landed(goal);
+
+        assert!(
+            msg.contains(goal),
+            "the body must carry the goal verbatim: {msg}"
+        );
+        // The part the subject cannot show is the part that has to survive.
+        assert!(
+            body_of(&msg).contains("shortened somewhere in the middle"),
+            "{msg}"
+        );
+    }
+
+    /// A goal written as a title followed by details keeps that shape: the
+    /// first line is the subject, and the whole text -- title, detail and all
+    /// -- is the body's first paragraph. The body is what a reader opens the
+    /// commit for; it must not be a second shortened form.
+    #[test]
+    fn a_goals_details_follow_its_title_into_the_body() {
+        let goal = "Fix the CI failure in workflow \"build\" run 7\n\n\
+                    Failed job logs:\n\
+                    - the landing job exited 101\n\
+                    - the diff check found 2 unformatted files";
+        let msg = landed(goal);
+
+        assert_eq!(
+            subject_of(&msg),
+            "fix(cog-github): Fix the CI failure in workflow \"build\" run 7"
+        );
+        assert!(body_of(&msg).starts_with(goal), "{msg}");
     }
 
     /// The eval-gate design's third acceptance: the squad's self-reported score

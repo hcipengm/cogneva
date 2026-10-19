@@ -803,9 +803,12 @@ impl ReflectionEngine {
         } else {
             format!("on {}", named_files.join(", "))
         };
+        // The first line is the landing header, so it leads with what tells one
+        // rework from another -- the module or files the refused change was
+        // about -- rather than with the sentence every rework shares.
         let goal = format!(
-            "Fix a defect the {} check reported, {}. Regenerate the change so \
-             that it applies to the current tree and passes the gate that refused \
+            "Rework the change {aim}\n\nFix a defect the {} check reported, {}. Regenerate the \
+             change so that it applies to the current tree and passes the gate that refused \
              the last attempt. Do not reconstruct the file from the verdict: read \
              the file as it is.\n\nEvidence:\n{}",
             l.rejection_cause

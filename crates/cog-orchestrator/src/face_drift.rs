@@ -84,10 +84,13 @@ pub fn gap_goal_id(face_id: &str, state: &str, day: &str) -> String {
 
 /// The text a red face is handed to the planner with.
 ///
-/// It names the face, the verdict and the rules that fired, and says what a
-/// closing look would have to show. It deliberately does not prescribe steps:
-/// the planner decomposes, and a loop that already knew the steps would be
-/// doing the planning it is supposed to delegate.
+/// The first line is the landing header, so it leads with the face: a run of
+/// remediation changes is told apart by which face it was about, and every
+/// other word would be shared by all of them. The rest names the verdict and
+/// the rules that fired, and says what a closing look would have to show. It
+/// deliberately does not prescribe steps: the planner decomposes, and a loop
+/// that already knew the steps would be doing the planning it is supposed to
+/// delegate.
 pub fn gap_goal_text(reading: &FaceDriftReading) -> String {
     let rules = reading
         .red_rules
@@ -96,9 +99,10 @@ pub fn gap_goal_text(reading: &FaceDriftReading) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "面「{}」当前读数为 {}（触发的红档规则：{}）。请按生产商用总目标找出差距并补齐，\
-         让这一面重新可读：面主明确、任务归属与面一致、缺位有承接人和截止时间。\
-         完成后必须能从上一步读数看到它从 {} 变为 on_target。",
+        "Close the gap on face \"{}\"\n\n面「{}」当前读数为 {}（触发的红档规则：{}）。\
+         请按生产商用总目标找出差距并补齐，让这一面重新可读：面主明确、任务归属与面一致、\
+         缺位有承接人和截止时间。完成后必须能从上一步读数看到它从 {} 变为 on_target。",
+        reading.face_id,
         reading.face_id,
         reading.state.as_str(),
         if rules.is_empty() { "无" } else { &rules },
