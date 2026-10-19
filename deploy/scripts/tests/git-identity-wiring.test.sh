@@ -45,8 +45,11 @@ reset_tree() {
 
 APP_DEPLOY="deploy/rendered/k3s-single/41-deployment-cogneva.yaml"
 GW_DEPLOY="deploy/rendered/k3s-single/41-deployment-cogneva-security-gateway.yaml"
-GW_ROLE="deploy/rendered/k3s-single/16-role-cogneva-security-gateway.yaml"
-MULTI_APP="deploy/rendered/k3s-multi/41-deployment-cogneva.yaml"
+EVO_DEPLOY="deploy/rendered/k3s-single/41-deployment-cogneva-evolution.yaml"
+# 多节点形态里 Secret 的写权在网关身上：SA `cogneva` 在那里只绑了 gitops-puller
+# 与 llm-admin 两个 Role，没有 secrets 写规则。所以这个形态的「宿主」是网关，
+# 摘掉基线仓库 env 必须从它身上摘——从主应用身上摘不会红，那不是这个形态的写者。
+MULTI_HOST="deploy/rendered/k3s-multi/41-deployment-cogneva-security-gateway.yaml"
 
 # 1) 真树绿，且报出的读数非空
 out="$(run_gate)" || fail "真树应当绿，实际红：${out}"
@@ -58,7 +61,7 @@ value="$(sed -n "s/.*基线仓库 '\([^']*\)'.*/\1/p" <<<"${out}")"
 [ -n "${value}" ] || fail "绿时没报出基线仓库取值：${out}"
 
 # 2) 宿主丢了基线仓库 env
-python3 - "${work}/root/${MULTI_APP}" <<'PY'
+python3 - "${work}/root/${MULTI_HOST}" <<'PY'
 import sys
 p = sys.argv[1]
 lines = open(p).read().split("\n")
@@ -121,20 +124,32 @@ out="$(run_gate)" && fail "归属声明写成非真值时应当红，实际绿�
 grep -q "'yes'" <<<"${out}" || fail "没点名那个字面量：${out}"
 
 # 6) 声明为属主的 SA 其实写不动 Secret
+# 不能直接把网关的 secrets 写规则删掉：这样写权集合会变成空集，门禁在更前面
+# 就按「判据失效」退出了，这一条比对根本轮不到。把属主声明挪到另一个不持有
+# Secret 写权的 SA 上，才能单独钉住「声明 ∩ 写权」这一次比对。
 reset_tree
-python3 - "${work}/root/${GW_ROLE}" <<'PY'
+python3 - "${work}/root/${GW_DEPLOY}" "${work}/root/${EVO_DEPLOY}" <<'PY'
 import sys
-p = sys.argv[1]
-lines = open(p).read().split("\n")
-out, drop = [], 0
-for line in lines:
-    if '- apiGroups: [""]' in line:
-        drop = 4  # 这一条规则的四行
-    if drop:
-        drop -= 1
+gw, evo = sys.argv[1], sys.argv[2]
+pair = ["            - name: COGNEVA_CREDENTIAL_LOOP_OWNER",
+        '              value: "true"']
+lines = open(gw).read().split("\n")
+out, i = [], 0
+while i < len(lines):
+    if lines[i:i + 2] == pair:
+        i += 2
         continue
-    out.append(line)
-open(p, "w").write("\n".join(out))
+    out.append(lines[i])
+    i += 1
+open(gw, "w").write("\n".join(out))
+lines = open(evo).read().split("\n")
+for i, line in enumerate(lines):
+    if line.strip() == "env:":
+        lines[i + 1:i + 1] = pair
+        break
+else:
+    raise SystemExit("副本里没有 env 块，用例失效")
+open(evo, "w").write("\n".join(lines))
 PY
 out="$(run_gate)" && fail "属主没有 Secret 写权时应当红，实际绿：${out}"
 grep -q "不在持有 Secret 写权的 SA 集合" <<<"${out}" || fail "没报出声明与授权对不上：${out}"
