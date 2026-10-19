@@ -2922,6 +2922,15 @@ fn choose_package(
         })
 }
 
+/// 两份文件是不是同一份：同名、同字节数。
+///
+/// 演练只用它回答「卷外那是不是卷上最新那份」。名字相同而大小不同是复制写到一半，
+/// 名字不同是它停在了更早的那一晚——两种都读作「不是同一份」，原因留给读的人。
+fn same_file(a: &Path, b: &Path) -> bool {
+    a.file_name() == b.file_name()
+        && std::fs::metadata(a).ok().map(|m| m.len()) == std::fs::metadata(b).ok().map(|m| m.len())
+}
+
 /// 解包用的临时目录，离开作用域就删。
 ///
 /// 包解出来是几 GB 的 CSV，失败路径上也必须清掉：演练每天跑一次，一个不清的
@@ -3070,14 +3079,10 @@ async fn drill_once(
     // 比的是卷上最新那份，不是这一趟打开的那份：读这一列的是「卷外那份是不是最新」
     // 的规则，点名开一份旧包时拿旧包去比，会把一条本来绿的规则判红。
     if let Some(dir) = &cfg.offsite_dir {
-        let newest_on_volume = packages.last();
-        drill.offsite_matches_newest = packages_in(dir).last().map(|copy| {
-            newest_on_volume.is_some_and(|volume| {
-                copy.file_name() == volume.file_name()
-                    && std::fs::metadata(copy).ok().map(|m| m.len() as i64)
-                        == std::fs::metadata(volume).ok().map(|m| m.len() as i64)
-            })
-        });
+        drill.offsite_matches_newest = packages_in(dir)
+            .last()
+            .zip(packages.last())
+            .map(|(copy, volume)| same_file(copy, volume));
     }
 
     // 解包先做：包本身坏了要在这里停，不能等到把库删了再发现。
@@ -3612,6 +3617,33 @@ mod tests {
 
         // 卷上一份都没有时，不点名也不能凭空虚开一份。
         assert!(choose_package(&[], None).is_err());
+    }
+
+    #[test]
+    fn the_offsite_column_compares_name_and_size() {
+        // 这一列问的是「卷外那份是不是卷上最新那份」。点名开旧包时若拿被打开的那份
+        // 去比，一条本来绿的规则会被判红——比较的对象是卷上最新，不是这一趟开的那份。
+        let root = std::env::temp_dir().join(format!("cogneva-offsite-{}", uuid::Uuid::new_v4()));
+        let vol = root.join("vol");
+        let off = root.join("off");
+        std::fs::create_dir_all(&vol).unwrap();
+        std::fs::create_dir_all(&off).unwrap();
+        let name = "cogneva-backup-20261019T031700Z.tar.zst";
+        std::fs::write(vol.join(name), vec![0u8; 10]).unwrap();
+        std::fs::write(off.join(name), vec![0u8; 10]).unwrap();
+        assert!(same_file(&vol.join(name), &off.join(name)));
+
+        // 同名而大小不同 = 复制写到一半。
+        std::fs::write(off.join(name), vec![0u8; 4]).unwrap();
+        assert!(!same_file(&vol.join(name), &off.join(name)));
+
+        // 名字不同 = 它停在了更早的那一晚。
+        let older = "cogneva-backup-20261018T031700Z.tar.zst";
+        std::fs::write(vol.join(older), vec![0u8; 10]).unwrap();
+        std::fs::write(off.join(older), vec![0u8; 10]).unwrap();
+        assert!(!same_file(&vol.join(older), &off.join(name)));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
