@@ -1038,7 +1038,16 @@ mainlineDeployer:
   pollIntervalSecs: 600
   soakSecs: 120
   failureCooldownSecs: 3600
-  cargoBuildJobs: 2
+  # 宿主构建闸同一时刻只放行一个构建，构建期间别的构建者全被挡住，所以这个数
+  # 直接决定"主线一轮占住宿主多久"，进而决定部署能跟到多快。
+  # 实测（2026-10-19，进化 Pod 内采样）：jobs=2 时构建里恰好 2 个 rustc 各占满
+  # 一核、合计 RSS 0.7~1.1 GiB；而该 Pod 的 CPU 上限是 8 核、内存上限 16 GiB，
+  # 两个界都远没撞到。取 6 = CPU 上限 8 减去 Pod 自身（变更验证、进化循环）要留
+  # 的 2 核；内存这一侧 0.55 GiB/进程 × 6 ≈ 3.3 GiB，不设限。
+  # 同一时段三次构建实测 1989 / 2011 / 2173 秒，改大之后看
+  # cogneva_mainline_build_seconds 是否随之下降；不降就说明瓶颈不在并行度，
+  # 不要再往上加。
+  cargoBuildJobs: 6
   # 部署器从裸仓库的哪个目录读清单（仓库内相对路径）。两种形态都能消费：目录里
   # 有 `kustomization.yaml` 就按它的 resources 列表读（发布资源集的权威顺序），
   # 否则按平铺的预渲染目录读（文件名前缀是渲染序号，字典序即渲染顺序）。目标清单

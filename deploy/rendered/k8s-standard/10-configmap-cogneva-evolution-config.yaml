@@ -105,7 +105,7 @@ data:
   COGNEVA_MAINLINE_DEPLOYER_NAMESPACE: "cogneva"
   COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS: "120"
   COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS: "3600"
-  COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS: "2"
+  COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS: "6"
   # 集群内 registry 那张卷的容量回收。声明量只有一个来源（PVC 自己的 spec），所以
   # 这里不配"卷有多大"；这里配的是判据与保留策略，占用读数取自 registry Pod 里只读
   # 走查那张卷的边车（Service 的 http 端点，端口与 registry 清单同源）。

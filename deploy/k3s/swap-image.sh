@@ -218,9 +218,12 @@ if [ "$BUILD_WEB" = 1 ]; then
   (cd web && npm run build)
 fi
 
-echo "==> 增量构建 release 二进制（CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}）"
+# 与 chart 的 mainlineDeployer.cargoBuildJobs 同一个数、同一条推导：宿主 24 核，
+# 这份构建独占一台宿主时没有别的界可撞，2 只是旧机上留下的值（实测它让一次构建
+# 跑 33 分钟，而构建期间上游就落四笔）。
+echo "==> 增量构建 release 二进制（CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-6}）"
 COGNEVA_GIT_REVISION="$GIT_REVISION" COGNEVA_VERSION_ID="$VERSION_ID" \
-  CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
+  CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}" \
   cargo build --release --bin cogneva
 strip target/release/cogneva
 
