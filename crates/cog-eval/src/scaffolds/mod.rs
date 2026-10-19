@@ -107,15 +107,48 @@ pub(crate) async fn observe_call(
 pub(crate) fn json_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
+        other => without_attachments(other).to_string(),
     }
 }
 
 /// 题面文本：外壳看到的就是它。结构化输入照样序列化成文本，外壳不解析题面。
+///
+/// **附件（data URL）不在这段文本里。** 一个基准的输入带图时，它的 base64 会被
+/// `to_string()` 原样展开成题面，而模型读不了 base64——它只是一段按字节计费的噪声，
+/// 还会被每一步重发一次。2026-10-19 实测：HLE 四十道里七道带图，这七道的行吃掉整张表
+/// 91.5% 的 token，两个种子的花费差 0.04%（确定性重放，不是在思考）。所以这里逐层
+/// 摘掉 data URL，只留一个写明字节数的占位串：位置留着，读的人看得出这题带过附件。
 pub(crate) fn task_text(case: &EvalCase) -> String {
     match &case.input {
+        serde_json::Value::String(s) if is_data_url(s) => omitted_attachment(s.len()),
         serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
+        other => without_attachments(other).to_string(),
+    }
+}
+
+/// data URL 的长度下界。短串里的 `data:` 是正文（一句话里提到这个词），不是附件。
+const DATA_URL_MIN_LEN: usize = 1024;
+
+fn is_data_url(s: &str) -> bool {
+    s.len() >= DATA_URL_MIN_LEN && s.starts_with("data:") && s.contains(";base64,")
+}
+
+fn omitted_attachment(bytes: usize) -> String {
+    format!("<attachment omitted: {bytes} bytes of base64>")
+}
+
+/// 深拷贝一份去掉附件的输入。数组也走一遍——工具结果里的图与题面里的图是同一件事。
+fn without_attachments(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), without_attachments(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_attachments).collect()),
+        Value::String(s) if is_data_url(s) => Value::String(omitted_attachment(s.len())),
+        other => other.clone(),
     }
 }
 
@@ -217,6 +250,36 @@ mod tests {
         assert!(first_code_block("没有代码").is_none());
         // 没闭合的块不算代码：半截代码执行不了，当成答案又会被判错。
         assert!(first_code_block("```python\nprint(1)").is_none());
+    }
+
+    #[test]
+    fn an_attached_image_never_becomes_prompt_text() {
+        let image = format!("data:image/png;base64,{}", "A".repeat(4096));
+        let case = EvalCase {
+            id: "c1".into(),
+            name: "c1".into(),
+            input: serde_json::json!({"question": "Is there an animal in this image?", "image": image}),
+            expected_output: None,
+            expected_tools: None,
+            tags: vec![],
+            metrics: vec![],
+            metadata: Default::default(),
+        };
+        let text = task_text(&case);
+        assert!(!text.contains("data:"), "题面里不该出现附件本身: {text}");
+        assert!(
+            text.contains("Is there an animal"),
+            "题面正文要留着: {text}"
+        );
+        // 位置留着：读的人看得出这题带过附件，而不是以为题面本来就这么短。
+        assert!(text.contains("attachment omitted"), "{text}");
+
+        // 短串里的 `data:` 是正文，不能被当成附件摘掉。
+        let plain = EvalCase {
+            input: serde_json::json!({"question": "what does data: mean here?"}),
+            ..case.clone()
+        };
+        assert!(task_text(&plain).contains("what does data: mean here?"));
     }
 
     #[test]
