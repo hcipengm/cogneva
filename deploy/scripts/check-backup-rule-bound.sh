@@ -74,6 +74,7 @@ BY_CONDITION = [
     "backup_offsite_copy_never_written",
     "backup_offsite_copy_is_stale",
     "backup_cronjob_stopped_scheduling",
+    "backup_restore_drill_cronjob_stopped_scheduling",
 ]
 # 成功那条：界写在 promql 里（`(time() - …) < 93600`），不在 condition 上。
 BY_PROMQL = "backup_success_not_recorded"
