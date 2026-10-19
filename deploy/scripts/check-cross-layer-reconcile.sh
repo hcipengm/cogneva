@@ -39,14 +39,37 @@
 # 序列、7 天窗口里没有 file 样本）⇒ 2。把「没人看」写成「一致」是这条读数最容易犯的错：
 # 一个 DaemonSet 在某个节点没起来，读出来是**没有序列**而不是 0。
 #
-# 用法：bash deploy/scripts/check-cross-layer-reconcile.sh [--record]
+# 用法：bash deploy/scripts/check-cross-layer-reconcile.sh [--record] [--converge]
 # 退出码：0 成立；1 有不成立（逐条点名层与不等式）；2 判不了（某层读不到）。
+#
+# `--converge` 把判据 4 从「报差」变成「填差」：当 live 的治理对象与树内渲染产物
+# 不一致时，把树内那一份 apply 上去，再重读一次并按重读后的结果判决。默认只读，
+# 不写集群。
+#
+# 为什么这条差由读数自己填：数值的正本已经是树（渲染产物是提交物，算式在 chart
+# values 里），live 与它不一致只说明投影没跑，动作本身由声明唯一确定；把同一件事
+# 再表述一遍，只会多一个能把读数读错的地方。
+#
+# 两个方向都收敛：live 低于树（声明改了、没人 apply）与 live 高于树（有人手工在集群上
+# 抬过）都是「live 没有兑现声明」。后者的错法不是「多给了资源」，而是下一次声明落地时
+# 没人知道该以哪一份为准——所以它同样要扶正，而不是留一条红给属主去手工追平。
+#
+# 自动 apply 的界只有一条，但它是测量的：**apply 之后仍装得下此刻的用量才 apply**。
+#   - ResourceQuota：live.status.used 每一项都不得大于树内 hard 的同名项，且留得住判据 3
+#     的余量（used + 部署器滚动 Job ≤ 树内 hard）——否则 apply 之后下一次滚动在准入被拒；
+#   - LimitRange：正在跑的每个容器都要落在树内 max/min 之内——上限调低会拒绝下一次
+#     滚动，下限调高会拒绝资源声明低于它的新 Pod；
+#   - 读不到 live 的 Pods、或本拍有任何一条判据读不到，就不动：判不了与「装得下」不是
+#     一件事，而写集群的动作只接受读得全的判据。
+# 装不下时不 apply，把不等式原样报出来（退出码 1）——那是声明本身与用量矛盾，需要
+# 改的是声明。
 #
 # `--record` 把这一拍追加成序列文件的一行（默认
 # `${XDG_STATE_HOME:-$HOME/.local/state}/cogneva/cross-layer-reconcile.tsv`）：
 #   时刻 <TAB> 结局 <TAB> used_memory <TAB> allocatable_memory <TAB> Σanon <TAB>
 #   file 7d 最小 <TAB> MemTotal        （数值一律字节，读不到记 `-`）
-# 结局取 ok / broken / unreadable。**判红与读不到也各写一行**：只在绿的时候写，
+# 结局取 ok / converged / broken / unreadable（converged：这一拍按树内声明填了判据 4
+# 的差，写过集群）。**判红与读不到也各写一行**：只在绿的时候写，
 # 序列上的空洞就同时代表「没跑」与「跑了但红了」，而这两件事要修的地方不同。
 # 有了这份序列，「昨天 14:00 的 allocatable 是多少」是读文件，不是重跑一次。
 #
@@ -66,10 +89,12 @@ NS="${COGNEVA_RECONCILE_NS:-cogneva}"
 QUOTA_NAME="${COGNEVA_RECONCILE_QUOTA:-cogneva-quota}"
 SERIES="${COGNEVA_RECONCILE_SERIES:-${XDG_STATE_HOME:-$HOME/.local/state}/cogneva/cross-layer-reconcile.tsv}"
 record=0
+converge=0
 for arg in "$@"; do
     case "$arg" in
         --record) record=1 ;;
-        *) printf 'CROSS-LAYER: 不认识的参数：%s（只有 --record）\n' "$arg" >&2; exit 2 ;;
+        --converge) converge=1 ;;
+        *) printf 'CROSS-LAYER: 不认识的参数：%s（只有 --record / --converge）\n' "$arg" >&2; exit 2 ;;
     esac
 done
 
@@ -111,6 +136,11 @@ DECLARED_DIR="${COGNEVA_RECONCILE_DECLARED:-${REPO_ROOT}/deploy/rendered/${COGNE
 # 准入面上另一只治理对象。读不到时判据 4 点名，不在这里整条退出。
 ${KUBECTL} -n "${NS}" get limitrange -o json \
     >"${work}/limitranges.json" 2>"${work}/limitranges.err" || true
+# --converge 的第二个测量输入：正在跑的 Pod。只在要写集群的那条路径上读它——
+# 只读模式不需要，而多一次集群读就是多一次可能失败的东西。
+if [ "${converge}" = 1 ]; then
+    ${KUBECTL} -n "${NS}" get pods -o json >"${work}/pods.json" 2>"${work}/pods.err" || true
+fi
 
 # ---- 物理面：Prometheus 端点 ----
 PROM_URL="${COGNEVA_PROMETHEUS_URL:-}"
@@ -151,6 +181,11 @@ prom 'rate(node_pressure_memory_stalled_seconds_total[5m]) * on (instance) group
 if [ "${record}" = 1 ]; then
     export CROSS_LAYER_RECORD_FILE="${SERIES}"
 fi
+# converge 侧要写集群：它拿到的是同一条 kubectl 入口（可能是 "sudo -n k3s kubectl"，
+# 由 python 侧按空白切开），以及命名空间。
+export CROSS_LAYER_CONVERGE="${converge}"
+export CROSS_LAYER_KUBECTL="${KUBECTL}"
+export CROSS_LAYER_NS="${NS}"
 python3 - "${work}" "${NS}/${QUOTA_NAME}" "${DECLARED_DIR}" <<'PYEOF'
 import json
 import os
@@ -280,6 +315,7 @@ try:
         evdata = json.load(f).get('data') or {}
 except (OSError, ValueError):
     evdata = None
+rollout_job = {}
 if evdata is None:
     unreadable.append("读不到 configmap/cogneva-evolution-config：判据 3 读不出部署器滚动 Job 的声明上限")
 else:
@@ -298,6 +334,7 @@ else:
         except ValueError as e:
             unreadable.append(f"判据 3 的数量解析不了：{e}")
             continue
+        rollout_job[label] = job
         if h - u < job:
             problems.append(
                 f"判据3 {label}：used {show(res, u)} + 部署器滚动 Job {show(res, job)} "
@@ -395,13 +432,14 @@ try:
 except (OSError, ValueError):
     unreadable.append("读不到 live 的 limitrange 列表：判据 4 判不了 LimitRange")
 
-for (kind, name), d in sorted(declared.items()):
-    live_obj = live_objs.get((kind, name))
+def object_diffs(kind, name, d, live_obj):
+    """一只治理对象的逐字段差，以及声明里 cogneva.io/* 注解的个数。
+
+    返回 (None, n) 表示 live 上根本没有这只对象：那是差的一种（整套声明没有 apply
+    到这集群），但它的修法与逐字段不同，单独报。
+    """
     if live_obj is None:
-        problems.append(
-            f"判据4 {kind}/{name}：树内声明有它，live 没有——这套声明没有 apply 到"
-            f"这只集群（或对象被删了）；「装得下」可能照样成立，但那不是这份声明")
-        continue
+        return None, 0
     diffs = []
     if kind == 'ResourceQuota':
         diffs += face_diff(f"{kind}/{name} spec.hard",
@@ -431,16 +469,193 @@ for (kind, name), d in sorted(declared.items()):
                          f"（这份声明没有 apply 到这只对象）")
         elif str(have_ann[k]) != str(v):
             diffs.append(f"{kind}/{name} 注解 {k}：live {have_ann[k]!r} ≠ 树内声明 {v!r}")
+    return diffs, len(want_ann)
+
+
+def report_drift(kind, name, diffs):
+    problems.append(
+        f"判据4 {kind}/{name}：live 与树内声明不一致（{len(diffs)} 处，"
+        f"第一处：{diffs[0]}）——改了声明没 apply，或有人手工改过 live；"
+        f"两种都把「声明」这张正本变成了没人兑现的纸")
+    for extra in diffs[:6]:
+        print(f"    └ {extra}")
+
+
+drift = []
+for (kind, name), d in sorted(declared.items()):
+    live_obj = live_objs.get((kind, name))
+    diffs, ann_count = object_diffs(kind, name, d, live_obj)
+    if diffs is None:
+        drift.append((kind, name, d, [f"{kind}/{name}：树内声明有它，live 没有"]))
+        continue
     if diffs:
-        problems.append(
-            f"判据4 {kind}/{name}：live 与树内声明不一致（{len(diffs)} 处，"
-            f"第一处：{diffs[0]}）——改了声明没 apply，或有人手工改过 live；"
-            f"两种都把「声明」这张正本变成了没人兑现的纸")
-        for extra in diffs[:6]:
-            print(f"    └ {extra}")
+        drift.append((kind, name, d, diffs))
     else:
         print(f"  判据4 {kind}/{name}: 与树内声明逐字段相等"
-              f"（cogneva.io/* 注解 {len(want_ann)} 个）  ✓")
+              f"（cogneva.io/* 注解 {ann_count} 个）  ✓")
+
+# ---- --converge：把判据 4 的差按树内声明填上 ----
+# 界是测量的，不是策略的：apply 之后仍装得下此刻的用量才 apply（见脚本头部）。
+# 判不了（读不到 Pod、数量解析不了）一律不动——写集群的动作只接受读得到的判据。
+CONVERGE = os.environ.get('CROSS_LAYER_CONVERGE') == '1'
+KUBECTL = __import__('shlex').split(os.environ.get('CROSS_LAYER_KUBECTL') or 'kubectl')
+NAMESPACE = os.environ.get('CROSS_LAYER_NS') or 'cogneva'
+
+
+def pod_containers(pod):
+    spec = pod.get('spec') or {}
+    return (spec.get('containers') or []) + (spec.get('initContainers') or [])
+
+
+def converge_blockers():
+    try:
+        with open(os.path.join(work, 'pods.json'), encoding='utf-8') as f:
+            pods = json.load(f).get('items', [])
+    except (OSError, ValueError) as e:
+        return [f"读不到 live 的 Pod 列表（{e}）：判不了 apply 之后装不装得下，不写集群"]
+    out = []
+    used_now = quota.get('status', {}).get('used') or {}
+    for kind, name, d, _ in drift:
+        if kind == 'ResourceQuota':
+            for res, val in sorted((d.get('spec', {}).get('hard') or {}).items()):
+                if res not in used_now:
+                    continue
+                try:
+                    u, h = qty(used_now[res]), qty(val)
+                except ValueError:
+                    out.append(f"{kind}/{name} {res}：live used {used_now[res]!r} 或树内声明 "
+                               f"{val!r} 解析不了——判不了就不写")
+                    continue
+                if u > h:
+                    out.append(f"{kind}/{name} {res}：live used {used_now[res]} 大于树内声明 "
+                               f"{val}——apply 之后新 Pod 进不来")
+                    continue
+                # 收窄天花板（live 高于树）也必须留住判据 3 的那份余量：否则这一拍把
+                # 天花板扶正，下一拍部署器的滚动 Job 就进不来，等于用一条判据换掉另一条。
+                job = rollout_job.get(res)
+                if job is not None and u + job > h:
+                    out.append(f"{kind}/{name} {res}：apply 之后 live used {used_now[res]} + "
+                               f"部署器滚动 Job 超过树内声明 {val}——下一次滚动会在准入被拒")
+        else:
+            for entry in (d.get('spec', {}).get('limits') or []):
+                if entry.get('type') != 'Container':
+                    continue
+                maxs, mins = entry.get('max') or {}, entry.get('min') or {}
+                for pod in pods:
+                    pname = (pod.get('metadata') or {}).get('name', '?')
+                    for c in pod_containers(pod):
+                        res = c.get('resources') or {}
+                        lim, req = res.get('limits') or {}, res.get('requests') or {}
+                        try:
+                            for key, val in maxs.items():
+                                if key in lim and qty(lim[key]) > qty(val):
+                                    out.append(
+                                        f"{kind}/{name} max.{key}={val}：Pod {pname}/"
+                                        f"{c.get('name')} 的 limit {lim[key]} 超过它——"
+                                        f"apply 之后它下一次滚动就进不来")
+                            for key, val in mins.items():
+                                if key in req and qty(req[key]) < qty(val):
+                                    out.append(
+                                        f"{kind}/{name} min.{key}={val}：Pod {pname}/"
+                                        f"{c.get('name')} 的 request {req[key]} 低于它——"
+                                        f"apply 之后它下一次滚动就进不来")
+                        except ValueError as e:
+                            out.append(f"{kind}/{name}：Pod {pname}/{c.get('name')} 的数量"
+                                       f"解析不了（{e}）——判不了就不写")
+    return out
+
+
+def apply_declared():
+    import subprocess
+    import tempfile
+    failed = []
+    for kind, name, d, diffs in drift:
+        fd, path = tempfile.mkstemp(prefix='governance-', suffix='.yaml')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                yaml.safe_dump(d, f, allow_unicode=True, sort_keys=False)
+            r = subprocess.run(KUBECTL + ['apply', '-f', path],
+                               capture_output=True, text=True)
+        except OSError as e:
+            failed.append(f"{kind}/{name}: 起不来 kubectl（{e}）")
+            continue
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        if r.returncode != 0:
+            failed.append(f"{kind}/{name}: kubectl apply 退出码 {r.returncode}："
+                          f"{(r.stderr or r.stdout).strip()[:300]}")
+        else:
+            print(f"  判据4 {kind}/{name}: 按树内声明 apply（{len(diffs)} 处差）")
+    return failed
+
+
+def refetch_live():
+    """apply 之后重读 live；返回 (live_objs, 错误说明或 None)。"""
+    import subprocess
+    for args, fname in ((['get', 'resourcequota', '-o', 'json'], 'quota.json'),
+                        (['get', 'limitrange', '-o', 'json'], 'limitranges.json')):
+        r = subprocess.run(KUBECTL + ['-n', NAMESPACE] + args, capture_output=True, text=True)
+        if r.returncode != 0:
+            return None, f"{' '.join(args)} 退出码 {r.returncode}：{(r.stderr or '').strip()[:300]}"
+        with open(os.path.join(work, fname), 'w', encoding='utf-8') as f:
+            f.write(r.stdout)
+    objs = {('ResourceQuota', quota['metadata']['name']): None}
+    with open(os.path.join(work, 'quota.json'), encoding='utf-8') as f:
+        objs[('ResourceQuota', quota['metadata']['name'])] = json.load(f)
+    with open(os.path.join(work, 'limitranges.json'), encoding='utf-8') as f:
+        for item in json.load(f).get('items', []):
+            objs[('LimitRange', item['metadata']['name'])] = item
+    return objs, None
+
+
+converged = []
+if drift:
+    if CONVERGE and unreadable:
+        # 这一拍有任何一处判不了，就不写集群：写集群的动作只接受读得全的判据，
+        # 半套读数下 apply 出去的值，下一拍还得靠另一套读数去解释。
+        for kind, name, d, diffs in drift:
+            report_drift(kind, name, diffs)
+        # 记在 unreadable 上：这一拍的结局就是「读不全」，而「没写集群」是它的后果；
+        # 放进 problems 不会印出来（unreadable 的分支先退出），读者就只看得到差、看不到
+        # 为什么没填。
+        unreadable.append("判据4 自动收敛未执行：本拍有读不到的判据，"
+                          "live 与树内的差留到读得全的一拍再填")
+    elif CONVERGE:
+        blockers = converge_blockers()
+        if blockers:
+            for b in blockers:
+                problems.append(f"判据4 自动收敛未执行：{b}")
+            for kind, name, d, diffs in drift:
+                report_drift(kind, name, diffs)
+        else:
+            failed = apply_declared()
+            for f in failed:
+                problems.append(f"判据4 自动收敛失败：{f}")
+            if not failed:
+                fresh, err = refetch_live()
+                if err:
+                    problems.append(f"判据4 自动收敛后重读失败：{err}")
+                else:
+                    remaining = []
+                    for kind, name, d, _ in drift:
+                        diffs, _ = object_diffs(kind, name, d, fresh.get((kind, name)))
+                        if diffs is None:
+                            remaining.append((kind, name,
+                                              [f"{kind}/{name}：apply 之后 live 仍没有它"]))
+                        elif diffs:
+                            remaining.append((kind, name, diffs))
+                    if remaining:
+                        for kind, name, diffs in remaining:
+                            report_drift(kind, name, diffs)
+                    else:
+                        converged = [f"{kind}/{name}" for kind, name, _, _ in drift]
+                        print(f"  判据4: 按树内声明收敛（{', '.join(converged)}）后逐字段相等  ✓")
+    else:
+        for kind, name, d, diffs in drift:
+            report_drift(kind, name, diffs)
 
 if unreadable:
     # 判不了也记一行：这一拍跑过了，只是没读全——不记的话，序列上的空洞会把
@@ -458,7 +673,12 @@ if problems:
         print("  - " + p)
     sys.exit(1)
 
-record('ok', observed.get('memory'), sum_mem)
+if converged:
+    # 收敛过的一拍与本来就绿的一拍不是同一件事：前者这一拍写过集群。序列里分开记，
+    # 读的人不必去翻 journal 才知道「数值是谁在什么时候改的」。
+    record('converged', observed.get('memory'), sum_mem)
+else:
+    record('ok', observed.get('memory'), sum_mem)
 print(f"CROSS-LAYER OK [{quota_id}]：三层在同一行上仍彼此装得下，"
       f"live 的治理对象与树内声明逐字段相等")
 PYEOF

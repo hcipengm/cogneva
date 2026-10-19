@@ -59,6 +59,11 @@ grep -q '^WantedBy=timers.target' "${tmr}" || fail "timer 没有 WantedBy=timers
 printf '%s\n' "${exec_line}" | grep -q -- ' --record' \
     || fail "service 的 ExecStart 没有 --record：${exec_line}"
 
+# 6b. 还必须带 --converge：判据 4 的差只有这条拍子能填。少了它，live 与树内声明
+#     不一致就只剩一条红，而红没有执行者——那正是这条读数被加进来时要消灭的形状。
+printf '%s\n' "${exec_line}" | grep -q -- ' --converge' \
+    || fail "service 的 ExecStart 没有 --converge：${exec_line}"
+
 # 7. 检查器单元与 timer：脚本可执行、读的是同一个序列、红不被包装成成功。
 chk="${unit_dir}/cogneva-cross-layer-reconcile-series-check.service"
 chkt="${unit_dir}/cogneva-cross-layer-reconcile-series-check.timer"
@@ -82,4 +87,4 @@ prod_cal="$(grep -m1 '^OnCalendar=' "${tmr}")"
 chk_cal="$(grep -m1 '^OnCalendar=' "${chkt}")"
 [ "${prod_cal}" != "${chk_cal}" ] || fail "两个 timer 的拍子相同：${prod_cal}"
 
-echo "install-cross-layer-reconcile: 8 passed"
+echo "install-cross-layer-reconcile: 9 passed"

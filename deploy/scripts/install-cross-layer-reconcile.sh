@@ -6,8 +6,10 @@
 # 没有任何一条「改了什么之后」的钩子能覆盖这几种。定时跑是唯一不需要事先猜到
 # 起因的载体。
 #
-# 它只写本机状态目录里的一行流水（序列），判红仍只进退出码与 journal。权限也只到读——
-# sudo -n 已经配好 NOPASSWD 的 kubectl，不需要常驻权限，也不需要集群内的 ServiceAccount。
+# 它写两样东西：本机状态目录里的一行流水（序列），以及——带 --converge 时——把
+# live 与树内声明不一致的治理对象按声明 apply 回去。后者带测量的界：apply 之后仍装得下
+# 此刻的用量才写（细则在门脚本头部）。除此之外全程只读；sudo -n 已经配好 NOPASSWD 的
+# kubectl，不需要常驻权限，也不需要集群内的 ServiceAccount。
 #
 # 第二个单元是序列检查器：产出停了、或者连着两拍没到，`systemctl --failed` 上要看得见。
 # 产出单元自己的退出码回答不了「我在不在跑」——它不在的时候，没有退出码可以红。
@@ -41,13 +43,15 @@ Description=Reconcile the declared, enforced and physical resource layers
 Type=oneshot
 # --record：每一拍（绿的、红的、读不到的）都往序列里落一行。判红的那一拍也是拍子，
 # 不落的话序列上的洞会同时代表「没跑」与「跑了但红了」。
-ExecStart=${reconcile} --record
+# --converge：判据 4 的差由这条拍子自己填——树内声明已经唯一决定了该 apply 什么，
+# 动作不需要第二个决定者。写集群之前先按此刻的用量验算装不装得下。
+ExecStart=${reconcile} --record --converge
 Environment=COGNEVA_RECONCILE_SERIES=${series}
-# 只读，但会去问集群与 Prometheus；让它排在任何构建后面。
+# 每半小时一拍、可能写治理对象，但仍不占多少 CPU；让它排在任何构建后面。
 Nice=10
-# 不能加 NoNewPrivileges=yes：读集群走的是「sudo -n k3s kubectl」，而这个标志让
-# sudo 直接拒绝提权——装好之后每一次运行都以退出码 2 结束，看起来像「集群读不到」。
-# 这里不给的是常驻特权：脚本本身只读，sudo 仍然只到那一条 NOPASSWD 的 kubectl。
+# 不能加 NoNewPrivileges=yes：读集群、写治理对象走的都是「sudo -n k3s kubectl」，
+# 而这个标志让 sudo 直接拒绝提权——装好之后每一次运行都以退出码 2 结束，看起来像
+# 「集群读不到」。这里不给的是常驻特权：sudo 仍然只到那一条 NOPASSWD 的 kubectl。
 TimeoutStartSec=300
 EOF
 
