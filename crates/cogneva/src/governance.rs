@@ -24,8 +24,11 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
-use cog_core::{Face, FaceImportOutcome, FaceKind, FaceSpec, GovernanceStore};
-use cog_storage::{PostgresGovernanceStore, RedisAgentRegistry};
+use cog_core::{
+    Face, FaceImportOutcome, FaceKind, FaceSpec, GovernanceStore, StateBackend, Task, TaskStatus,
+    TaskType,
+};
+use cog_storage::{PostgresGovernanceStore, PostgresStateBackend, RedisAgentRegistry};
 
 /// Columns of a roster row, in the order the file writes them.
 const ROSTER_COLUMNS: usize = 13;
@@ -59,6 +62,12 @@ SUBCOMMANDS:
                            Ballot rules are written at open time and never
                            rewritten; a principle that settles the question
                            records its basis and closes with no votes.
+    assign [--face <id>] [--workspace <id>]
+                           Give every staffed face one standing work row,
+                           owned by the face's owner and carrying its face id,
+                           so the owner's queue is that row and the reading
+                           can tell an idle face from a face nobody gave work
+                           to. Idempotent per face: an open row is kept.
 
 OPTIONS:
     --database-url <url>   Override the graph's URL. Default: COGNEVA_DATABASE_URL,
@@ -71,10 +80,22 @@ OPTIONS:
 /// What the caller asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    Faces { brief: bool },
-    Drift { json: bool },
-    Project { out: PathBuf },
-    ImportFaces { from: PathBuf },
+    Faces {
+        brief: bool,
+    },
+    Drift {
+        json: bool,
+    },
+    Project {
+        out: PathBuf,
+    },
+    ImportFaces {
+        from: PathBuf,
+    },
+    Assign {
+        face: Option<String>,
+        workspace: Option<String>,
+    },
     Act(crate::governance_acts::Act),
 }
 
@@ -121,6 +142,8 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut json = false;
     let mut out: Option<PathBuf> = None;
     let mut from: Option<PathBuf> = None;
+    let mut face: Option<String> = None;
+    let mut workspace: Option<String> = None;
 
     let mut subcommand: Option<&str> = None;
     let mut iter = args.iter();
@@ -140,6 +163,12 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
             "--from" => {
                 from = Some(PathBuf::from(iter.next().ok_or("--from needs a file")?));
             }
+            "--face" => {
+                face = Some(iter.next().ok_or("--face needs a face id")?.clone());
+            }
+            "--workspace" => {
+                workspace = Some(iter.next().ok_or("--workspace needs an id")?.clone());
+            }
             other if other.starts_with('-') => return Err(format!("unknown option {other}")),
             other => {
                 if subcommand.replace(other).is_some() {
@@ -158,6 +187,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
         Some("import-faces") => Action::ImportFaces {
             from: from.ok_or("import-faces needs --from <file>")?,
         },
+        Some("assign") => Action::Assign { face, workspace },
         Some(other) => return Err(format!("unknown governance subcommand {other}")),
         None => return Err("governance needs a subcommand".into()),
     };
@@ -215,6 +245,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
     });
 
     let pool = sqlx::PgPool::connect(&database_url).await?;
+    let assign_pool = pool.clone();
     let store: Arc<dyn GovernanceStore> = Arc::new(PostgresGovernanceStore::new(pool));
 
     match request.action {
@@ -222,6 +253,10 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         Action::Drift { json } => drift(&*store, redis_url.as_deref(), json).await?,
         Action::Project { out } => project(&*store, redis_url.as_deref(), &out).await?,
         Action::ImportFaces { from } => import_faces(&*store, &from).await?,
+        Action::Assign { face, workspace } => {
+            let workspace = workspace.unwrap_or_else(|| config.dag_executor.workspace_id.clone());
+            assign(&*store, &assign_pool, &workspace, face.as_deref()).await?;
+        }
         Action::Act(act) => crate::governance_acts::run(act, &*store, Utc::now()).await?,
     }
     Ok(())
@@ -482,6 +517,100 @@ pub fn parse_roster(text: &str) -> Result<Vec<RosterRow>, String> {
     Ok(rows)
 }
 
+/// Give staffed faces one standing work row each.
+///
+/// A face reading can only tell "idle" from "never handed any work" if there is
+/// a row to look at, and the owner's queue can only answer what it should do
+/// next if the duty is a task like every other duty. The row is executable and
+/// owned, so the shared ready queue leaves it alone and only the named unit can
+/// claim it; it is one row per face rather than one per day, because a face's
+/// duty does not expire at midnight.
+///
+/// The id is derived from the face, so running this twice keeps the open row
+/// instead of blaming somebody for not having started the second copy.
+async fn assign(
+    store: &dyn GovernanceStore,
+    pool: &sqlx::PgPool,
+    workspace: &str,
+    only: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    if workspace.trim().is_empty() {
+        return Err("no workspace to assign work in: pass --workspace or set \
+                    dag_executor.workspace_id"
+            .into());
+    }
+    let backend = PostgresStateBackend::new(pool.clone());
+    let all: Vec<Face> = store
+        .face_nodes()
+        .await?
+        .iter()
+        .filter_map(Face::from_task)
+        .collect();
+    let selected: Vec<Face> = match only {
+        Some(id) => all.into_iter().filter(|face| face.face_id == id).collect(),
+        None => all,
+    };
+    if selected.is_empty() {
+        return Err(match only {
+            Some(id) => format!("face {id} is not in the graph; import the roster first"),
+            None => "the graph holds no faces; import the roster first".to_string(),
+        }
+        .into());
+    }
+    let mut assigned = 0usize;
+    let mut kept = 0usize;
+    let mut vacant = 0usize;
+    for face in selected {
+        let Some(owner) = face.owner_unit.clone() else {
+            vacant += 1;
+            eprintln!(
+                "{}: declared vacancy; a vacancy cannot hold work until somebody owns the face",
+                face.face_id
+            );
+            continue;
+        };
+        let id = cog_orchestrator::governance_acts::face_work_id(&face.face_id);
+        if let Some(existing) = backend.dag_get_task(workspace, &id).await? {
+            if !matches!(
+                existing.status,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+            ) {
+                kept += 1;
+                continue;
+            }
+        }
+        let reading = face
+            .spec
+            .first_reading
+            .as_deref()
+            .unwrap_or("本面的判据读数");
+        let gap = face.spec.gap_task_id.as_deref().unwrap_or("-");
+        let goal = format!(
+            "以生产商用为唯一目标，保持「{}」这一面在目标态。\n\
+             本轮判据读数：{}（必须有新的读取时刻与值，只刷新 updated_at 不算）。\n\
+             缺口任务：{}。\n\
+             完成条件：读数可读、任务归属与面一致；不属于本面的工作转给该面的 owner。",
+            face.face_id, reading, gap
+        );
+        let mut task = Task::new(
+            id.clone(),
+            TaskType::DagNode,
+            serde_json::json!({
+                "goal": goal,
+                "face": face.face_id,
+                "owner_unit": owner,
+            }),
+        );
+        task.face_id = Some(face.face_id.clone());
+        task.owner_unit = Some(owner.clone());
+        task.workspace_id = Some(workspace.to_string());
+        backend.dag_set_task(workspace, &id, &task).await?;
+        assigned += 1;
+    }
+    println!("assigned {assigned}, kept {kept}, vacant {vacant} (workspace {workspace})");
+    Ok(())
+}
+
 async fn import_faces(store: &dyn GovernanceStore, from: &Path) -> Result<(), Box<dyn Error>> {
     let text = std::fs::read_to_string(from)
         .map_err(|e| format!("cannot read {}: {e}", from.display()))?;
@@ -544,6 +673,22 @@ mod tests {
                 .action,
             Action::ImportFaces {
                 from: PathBuf::from("faces.tsv")
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["assign"])).unwrap().action,
+            Action::Assign {
+                face: None,
+                workspace: None
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["assign", "--face", "通信", "--workspace", "ws"]))
+                .unwrap()
+                .action,
+            Action::Assign {
+                face: Some("通信".into()),
+                workspace: Some("ws".into())
             }
         );
     }

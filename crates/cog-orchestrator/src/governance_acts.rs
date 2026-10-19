@@ -24,6 +24,36 @@ use cog_core::{
     GOVERNANCE_WORKSPACE, HANDOVER_INPUT_KEY, HANDOVER_TASK_TYPE, VOTE_INPUT_KEY, VOTE_TASK_TYPE,
 };
 
+/// Fold a name into a segment that can travel as a task id.
+///
+/// Folding every unsafe character to a dash would not do: face ids are written
+/// in whatever language names them, and two names that differ only in
+/// characters outside `[a-z0-9_-]` would fold to one id -- one face's work
+/// would then be refused as already submitted because another face had
+/// submitted one. Each unsafe character is escaped to its code point instead,
+/// under a marker no literal character can produce, so the mapping is
+/// injective.
+pub fn task_id_segment(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_string()
+            } else {
+                format!("~{code:x}", code = c as u32)
+            }
+        })
+        .collect()
+}
+
+/// The id of the standing work row a face's owner works from.
+///
+/// One row per face, not one per day: a face's duty is continuous, and a row
+/// that expired at midnight would make every face read idle every morning
+/// until somebody re-created its work.
+pub fn face_work_id(face_id: &str) -> String {
+    format!("face-work-{}", task_id_segment(face_id))
+}
+
 /// Build a handover row in its draft state.
 pub fn handover_task(id: &str, spec: HandoverSpec, now: DateTime<Utc>) -> Task {
     governance_task(
