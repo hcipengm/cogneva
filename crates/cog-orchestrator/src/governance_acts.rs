@@ -1123,8 +1123,108 @@ mod tests {
         }
     }
 
+    /// Reads what it was given but fails every transactional write, standing
+    /// in for a database that is briefly unreachable. The pass must not turn
+    /// that failure into a verdict about the record.
+    struct FailingWriteStore {
+        inner: MemoryStore,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::GovernanceStore for FailingWriteStore {
+        async fn face_nodes(&self) -> cog_core::SFResult<Vec<Task>> {
+            cog_core::GovernanceStore::face_nodes(&self.inner).await
+        }
+
+        async fn open_face_bound_tasks(&self) -> cog_core::SFResult<Vec<Task>> {
+            cog_core::GovernanceStore::open_face_bound_tasks(&self.inner).await
+        }
+
+        async fn save_face_node(&self, task: &Task) -> cog_core::SFResult<()> {
+            cog_core::GovernanceStore::save_face_node(&self.inner, task).await
+        }
+
+        async fn save_face_node_if_revision(
+            &self,
+            task: &Task,
+            expected: i64,
+        ) -> cog_core::SFResult<bool> {
+            cog_core::GovernanceStore::save_face_node_if_revision(&self.inner, task, expected).await
+        }
+
+        async fn governance_nodes(&self, task_type: &str) -> cog_core::SFResult<Vec<Task>> {
+            cog_core::GovernanceStore::governance_nodes(&self.inner, task_type).await
+        }
+
+        async fn save_governance_node(&self, task: &Task) -> cog_core::SFResult<()> {
+            cog_core::GovernanceStore::save_governance_node(&self.inner, task).await
+        }
+
+        async fn save_governance_node_if_status(
+            &self,
+            task: &Task,
+            expected: &[TaskStatus],
+        ) -> cog_core::SFResult<bool> {
+            cog_core::GovernanceStore::save_governance_node_if_status(&self.inner, task, expected)
+                .await
+        }
+
+        async fn save_governance_node_with_event(
+            &self,
+            _event: &Task,
+            _node: &Task,
+            _expected: &[TaskStatus],
+        ) -> cog_core::SFResult<bool> {
+            Err(cog_core::SFError::Database("unreachable".into()))
+        }
+
+        async fn apply_handover(
+            &self,
+            handover: &Task,
+            face: &Task,
+            expected_revision: i64,
+        ) -> cog_core::SFResult<Option<usize>> {
+            cog_core::GovernanceStore::apply_handover(
+                &self.inner,
+                handover,
+                face,
+                expected_revision,
+            )
+            .await
+        }
+    }
+
     fn open_ballot_row() -> Task {
         decision_task("d", ballot(), TaskStatus::Pending, at(0))
+    }
+
+    #[tokio::test]
+    async fn a_storage_failure_ends_the_pass_instead_of_counting_a_broken_history() {
+        let store = FailingWriteStore {
+            inner: MemoryStore::with(vec![open_ballot_row()]),
+        };
+        let err = settle(&store, at(120))
+            .await
+            .expect_err("a write that failed must not read as a closed ballot");
+        assert!(
+            matches!(err, cog_core::SFError::Database(_)),
+            "the failure has to stay the storage's, not become a verdict: {err}"
+        );
+        assert_eq!(
+            store.inner.row("d").status,
+            TaskStatus::Pending,
+            "the row must not move when the write failed"
+        );
+        let events = cog_core::GovernanceStore::governance_nodes(
+            &store.inner,
+            cog_core::DECISION_EVENT_TASK_TYPE,
+        )
+        .await
+        .unwrap();
+        assert!(
+            events.is_empty(),
+            "a close that was never written must not leave a step explaining it"
+        );
     }
 
     #[tokio::test]
