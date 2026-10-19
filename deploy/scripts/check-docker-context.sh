@@ -109,39 +109,61 @@ def covers(sources: list[str], path: str) -> bool:
 INCLUDE = re.compile(r'include_(?:str|bytes)!\("([^"]+)"\)')
 
 
-def include_targets() -> list[tuple[Path, str]]:
+def include_targets() -> tuple[list[tuple[Path, str, str]], int, int]:
+    """返回 (外部内嵌路径, 扫过的文件数, 读到的内嵌条数)。
+
+    树外的解析结果**不跳过**：符号链接或 `../../` 越过仓库根的内嵌必然不在构建
+    上下文里，而它在这里正是最该红的一格——跳过它，门就在一个确实会坏的文件上
+    变绿，且没有任何别的门在看 include_str!。
+    """
     targets = []
+    scanned = 0
+    found = 0
     files = list(repo.glob("crates/*/src/**/*.rs")) + list(repo.glob("crates/*/build.rs"))
     for rs in files:
+        scanned += 1
         try:
             text = rs.read_text()
         except UnicodeDecodeError:
             continue
         for lineno, line in enumerate(text.splitlines(), 1):
             for rel in INCLUDE.findall(line):
+                found += 1
                 absolute = (rs.parent / rel).resolve()
+                located = f"{rs.relative_to(repo).as_posix()}:{lineno}"
                 try:
                     repo_rel = absolute.relative_to(repo).as_posix()
                 except ValueError:
-                    continue  # 树外的路径由别的门管
-                targets.append((rs, f"{rs.relative_to(repo).as_posix()}:{lineno}:{repo_rel}"))
-    return targets
+                    targets.append((rs, located, f"<树外> {absolute}"))
+                    continue
+                targets.append((rs, located, repo_rel))
+    return targets, scanned, found
 
 
 def main() -> int:
     patterns = read_dockerignore(repo / ".dockerignore")
     sources = copied_sources(repo / "Dockerfile")
+    targets, scanned, found = include_targets()
+    # 扫描面是空的不是绿的：这一门的全部意义就是替人去看编译期依赖，而它自己
+    # 什么都看不到的时候，与「看了、都合格」在退出码上同形。`crates/*/src/**/*.rs`
+    # 的布局一旦变了，这里必须红一次，让人来改门的扫法。
+    print(f"check-docker-context: scanned_files={scanned} includes={found}")
+    if scanned == 0 or found == 0:
+        print(
+            "check-docker-context: 扫描面是空的（一个文件或一条内嵌都没读到），"
+            "这不是通过——门的扫法要跟着树改：检查 crates/*/src 下是否还有源码。",
+            file=sys.stderr,
+        )
+        return 1
 
     bad = []
-    for rs, described in include_targets():
+    for rs, where, target in targets:
         crate = rs.relative_to(repo).parts[1]  # crates/<crate>/...
-        located, lineno, target = described.split(":", 2)
-        if target.startswith(f"crates/{crate}/"):
+        if target.startswith(f"crates/{crate}/") or target in ALLOWED:
             continue
-        if target in ALLOWED:
-            continue
-        where = f"{located}:{lineno}"
-        if not in_context(patterns, target):
+        if target.startswith("<树外> "):
+            bad.append(f"{where}: {target[5:]} 解析到仓库树之外，进不了构建上下文")
+        elif not in_context(patterns, target):
             bad.append(f"{where}: {target} 被 .dockerignore 排除在构建上下文之外")
         elif not covers(sources, target):
             bad.append(f"{where}: {target} 在上下文里，但 Dockerfile 没有 COPY 它")
