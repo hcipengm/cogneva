@@ -1172,7 +1172,15 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          allowance, is what held the pass: an unavailable pool answers zero \
          jobs whatever the window pays for, so window_jobs=0 with \
          unavailable=1 is an outage of the upstreams and not a spent window \
-         -- the two call for opposite repairs). window_jobs is written only \
+         -- the two call for opposite repairs), and retry_at_unix (the \
+         earliest instant the gateway will probe the pool again, 0 when \
+         nothing is suspect: with unavailable=1 it is the clock on which the \
+         degradation is re-decided, so the hold inside that period is a \
+         deferral with a next decision rather than a silent freeze -- the held \
+         tasks are not dropped, they stay ready and ask again on the next \
+         pass, and this instant is our own retry cadence, not the upstream's \
+         promise, so it must not be read as when the window reopens). \
+         window_jobs is written only \
          when bounded is \
          1: an unmeasured window is not a window that pays for zero jobs, and \
          a zero there would read as the strongest possible refusal. covered, \
@@ -1382,6 +1390,38 @@ const GAUGE_HELP: &[(&str, &str)] = &[
         "When the next pool probe is due, as a Unix timestamp",
     ),
     (
+        "llm_pool_allowance_tokens",
+        "Tokens the pace says this window has allowed by now, summed over \
+         every upstream the pace measured. It is the window's own ramp, not a \
+         rate: allowance grows linearly from the window's start toward the \
+         measured capacity. Zero when no upstream is paced, which is the same \
+         reading a pool with no ruler publishes -- llm_pool_paced_upstreams is \
+         the cell that tells the two apart, and a headroom read without it can \
+         turn 'nobody measured a window' into 'the window is spent'",
+    ),
+    (
+        "llm_pool_spent_tokens",
+        "Tokens served since the current window started, summed over the paced \
+         upstreams. Read against llm_pool_allowance_tokens: spending above the \
+         allowance is what the gate holds work back for",
+    ),
+    (
+        "llm_pool_reserve_tokens",
+        "Tokens one whole job was measured to need (the 75th percentile over \
+         the last 30 days of finished tasks), the block the gate keeps free so \
+         a job is admitted whole or not at all. It is a property of the work, \
+         not of the pool: the same number applies whichever upstream serves",
+    ),
+    (
+        "llm_pool_paced_upstreams",
+        "How many upstreams the pace measured a window for this pass. Zero is \
+         'nothing is paced' -- no ruler for any member, or the status could not \
+         be read -- and it is the cell that keeps the four token gauges honest: \
+         with no ruler they carry zeros, which read exactly like a window that \
+         is spent. Any rule over headroom has to require this to be above zero, \
+         or it will name an unmeasured pool as an idle one",
+    ),
+    (
         "cogneva_version_commits_since_release",
         "First-parent commits between the tracked main and the newest release \
          tag reachable from it. The published artifact is built from the tag, \
@@ -1581,7 +1621,16 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          its pass, which is the half a count cannot falsify. \
          newest_package_bytes is that run's package size in bytes — a backup \
          that suddenly shrinks is one that stopped capturing, and nothing else on \
-         this series moves when that happens. Absent readouts are absent facts: \
+         this series moves when that happens. \
+         credential_surface_live is how many permission violations the drill \
+         found on the credential-bearing directories it could stat — a directory \
+         whose mode is not exactly 0700, or a top-level package file whose mode \
+         is not exactly 0600, counted per entry — and the three \
+         credential_surface_violations_* readouts are that count split by \
+         surface (backup_pvc, offsite, state_dir). Zero means inspected and \
+         clean; absent means no drill row, or the drill was not given that \
+         directory, and an installation without a second copy has no offsite \
+         surface to be clean about. Absent readouts are absent facts: \
          latest_success_age_seconds is missing until a run has ever succeeded",
     ),
     (

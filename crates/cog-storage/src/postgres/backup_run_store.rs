@@ -178,9 +178,10 @@ INSERT INTO backup_drills ( \
     rows_restored, rows_expected, source_runs_matched, error, \
     generated_columns_recomputed, artifacts_expected, artifacts_restored, \
     artifact_readings, artifact_errors, offsite_observed_at, offsite_remote_newest_at, offsite_key_created_at, \
-    segment_skew_seconds, segment_skew_bound_seconds, offsite_missing_packages \
+    segment_skew_seconds, segment_skew_bound_seconds, offsite_missing_packages, \
+    credential_violations_backup_pvc, credential_violations_offsite, credential_violations_state_dir \
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28) \
+          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31) \
 ON CONFLICT (drill_id) DO NOTHING";
 
 /// The newest drill, failed or not.
@@ -195,7 +196,8 @@ SELECT drill_id, started_at, finished_at, outcome, package, package_written_at, 
        rows_restored, rows_expected, source_runs_matched, error, \
        generated_columns_recomputed, artifacts_expected, artifacts_restored, \
        artifact_readings, artifact_errors, offsite_observed_at, offsite_remote_newest_at, offsite_key_created_at, \
-       segment_skew_seconds, segment_skew_bound_seconds, offsite_missing_packages \
+       segment_skew_seconds, segment_skew_bound_seconds, offsite_missing_packages, \
+       credential_violations_backup_pvc, credential_violations_offsite, credential_violations_state_dir \
 FROM backup_drills \
 ORDER BY finished_at DESC, drill_id DESC \
 LIMIT 1";
@@ -409,6 +411,9 @@ impl BackupRunStore for PostgresBackupRunStore {
             .bind(drill.segment_skew_seconds)
             .bind(drill.segment_skew_bound_seconds)
             .bind(drill.offsite_missing_packages)
+            .bind(drill.credential_violations_backup_pvc)
+            .bind(drill.credential_violations_offsite)
+            .bind(drill.credential_violations_state_dir)
             .execute(&self.pool)
             .await
             .map_err(|e| {
@@ -507,6 +512,19 @@ impl BackupRunStore for PostgresBackupRunStore {
             offsite_missing_packages: row
                 .try_get("offsite_missing_packages")
                 .map_err(|e| SFError::Database(format!("drill offsite_missing_packages: {e}")))?,
+            credential_violations_backup_pvc: row
+                .try_get("credential_violations_backup_pvc")
+                .map_err(|e| {
+                    SFError::Database(format!("drill credential_violations_backup_pvc: {e}"))
+                })?,
+            credential_violations_offsite: row.try_get("credential_violations_offsite").map_err(
+                |e| SFError::Database(format!("drill credential_violations_offsite: {e}")),
+            )?,
+            credential_violations_state_dir: row
+                .try_get("credential_violations_state_dir")
+                .map_err(|e| {
+                    SFError::Database(format!("drill credential_violations_state_dir: {e}"))
+                })?,
             error: row
                 .try_get("error")
                 .map_err(|e| SFError::Database(format!("drill error: {e}")))?,

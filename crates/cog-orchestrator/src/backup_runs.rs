@@ -129,6 +129,19 @@ enum BackupReadout {
     /// behind them, counted by the store across the window rather than read off
     /// the newest drill's row.
     DrillWindowUnprovenPackages,
+    /// Permission violations on the credential-bearing material the drill could
+    /// see: the backup volume, the offsite copy and the host state directory.
+    /// The total is published for the face, and the three counts beside it say
+    /// which surface carries the violation -- a repair differs by location, and
+    /// the total alone cannot say where to look.
+    ///
+    /// Zero means inspected and clean. Absent means no drill ran, or the drill
+    /// was not given that directory: an installation without an offsite copy has
+    /// no offsite surface to be clean about.
+    CredentialSurfaceLive,
+    CredentialSurfaceViolationsBackupPvc,
+    CredentialSurfaceViolationsOffsite,
+    CredentialSurfaceViolationsStateDir,
 }
 
 impl BackupReadout {
@@ -158,6 +171,10 @@ impl BackupReadout {
         BackupReadout::SegmentSkewSeconds,
         BackupReadout::SegmentSkewBoundSeconds,
         BackupReadout::DrillWindowUnprovenPackages,
+        BackupReadout::CredentialSurfaceLive,
+        BackupReadout::CredentialSurfaceViolationsBackupPvc,
+        BackupReadout::CredentialSurfaceViolationsOffsite,
+        BackupReadout::CredentialSurfaceViolationsStateDir,
     ];
 
     fn as_str(self) -> &'static str {
@@ -187,6 +204,16 @@ impl BackupReadout {
             BackupReadout::SegmentSkewSeconds => "segment_skew_seconds",
             BackupReadout::SegmentSkewBoundSeconds => "segment_skew_bound_seconds",
             BackupReadout::DrillWindowUnprovenPackages => "drill_window_unproven_packages",
+            BackupReadout::CredentialSurfaceLive => "credential_surface_live",
+            BackupReadout::CredentialSurfaceViolationsBackupPvc => {
+                "credential_surface_violations_backup_pvc"
+            }
+            BackupReadout::CredentialSurfaceViolationsOffsite => {
+                "credential_surface_violations_offsite"
+            }
+            BackupReadout::CredentialSurfaceViolationsStateDir => {
+                "credential_surface_violations_state_dir"
+            }
         }
     }
 }
@@ -400,6 +427,37 @@ const READOUT_READERS: [(BackupReadout, ReadoutReader); BackupReadout::ALL.len()
         BackupReadout::DrillWindowUnprovenPackages,
         ReadoutReader::Rule("backup_restore_drill_window_has_unproven_packages"),
     ),
+    // The credential surface. One rule reads the total, because one open bit on
+    // any of the three surfaces is the same fact: material that holds the whole
+    // database is readable by an account that was never given the key. The three
+    // counts below are how a reader finds out which surface to fix; a rule each
+    // would multiply the alert without adding a fact.
+    (
+        BackupReadout::CredentialSurfaceLive,
+        ReadoutReader::Rule("credential_surface_has_open_permissions"),
+    ),
+    (
+        BackupReadout::CredentialSurfaceViolationsBackupPvc,
+        ReadoutReader::Unread {
+            why: "the per-surface split of credential_surface_live, published so the repair knows \
+                  where to look. The aggregate is what alerts: the rule for an open bit does not \
+                  change with the surface it sits on.",
+        },
+    ),
+    (
+        BackupReadout::CredentialSurfaceViolationsOffsite,
+        ReadoutReader::Unread {
+            why: "the offsite copy's share of credential_surface_live; absent when the installation \
+                  has no second copy, and the aggregate alerts for all surfaces that were inspected.",
+        },
+    ),
+    (
+        BackupReadout::CredentialSurfaceViolationsStateDir,
+        ReadoutReader::Unread {
+            why: "the host state directory's share of credential_surface_live, published for the \
+                  same reason: the aggregate alerts, the split locates.",
+        },
+    ),
 ];
 
 /// How old an instant is, in whole seconds, floored at zero.
@@ -532,6 +590,38 @@ fn value_of(
         // open. A green newest row and a window nobody has opened are both
         // ordinary, and only one of them is what a restore needs.
         BackupReadout::DrillWindowUnprovenPackages => Some(account.drill_unproven_packages as f64),
+        // The three counts are read off one drill row and each is absent on its
+        // own: a directory the drill was not given is not a clean one.
+        BackupReadout::CredentialSurfaceViolationsBackupPvc => drill
+            .and_then(|d| d.credential_violations_backup_pvc)
+            .map(f64::from),
+        BackupReadout::CredentialSurfaceViolationsOffsite => drill
+            .and_then(|d| d.credential_violations_offsite)
+            .map(f64::from),
+        BackupReadout::CredentialSurfaceViolationsStateDir => drill
+            .and_then(|d| d.credential_violations_state_dir)
+            .map(f64::from),
+        // The face's own reading: the sum over the surfaces that were actually
+        // inspected. No surface inspected is absence, not a clean zero.
+        BackupReadout::CredentialSurfaceLive => {
+            let counts: Vec<i32> = drill
+                .map(|d| {
+                    [
+                        d.credential_violations_backup_pvc,
+                        d.credential_violations_offsite,
+                        d.credential_violations_state_dir,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect()
+                })
+                .unwrap_or_default();
+            if counts.is_empty() {
+                None
+            } else {
+                Some(counts.iter().map(|count| f64::from(*count)).sum())
+            }
+        }
     }
 }
 

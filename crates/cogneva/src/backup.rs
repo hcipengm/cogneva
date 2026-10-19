@@ -955,6 +955,61 @@ pub fn packages_in(dir: &Path) -> Vec<PathBuf> {
     packages
 }
 
+/// 一个装着凭证材料的目录，有多少条权限违例。
+///
+/// 判据只有两条，都取「恰为」而不是「至少」：目录必须恰为 0700，顶层的
+/// `*.tar.zst` 必须恰为 0600。多一位组或其他人的权限，就意味着一份装着整库
+/// 内容的包能被别的账号读走——那不是修饰差异，那是没有钥匙也读得到。
+///
+/// 计数按条目数：目录本身不合记一条，每个不合的包文件各记一条。子目录不递归，
+/// 旧包里的 tar 条目不打开——这条读数量的是落盘的现场，不是包里的历史。
+///
+/// 返回 `None` 是三件不同的事：目录不存在（这个安装没有这个落点）、不是目录、
+/// 或者列不出来。三种都不该印成 0——0 说的是「看了，干净」。
+fn credential_violations_in(dir: &Path) -> Option<i32> {
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), error = %e, "凭证目录 stat 不出来，这一类按没量过记");
+            return None;
+        }
+    };
+    use std::os::unix::fs::PermissionsExt;
+    if !meta.is_dir() {
+        tracing::warn!(path = %dir.display(), "凭证目录的位置上不是目录，这一类按没量过记");
+        return None;
+    }
+
+    let mut violations = i32::from(meta.permissions().mode() & 0o777 != 0o700);
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), error = %e, "凭证目录列不出来，这一类按没量过记");
+            return None;
+        }
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name_is_package = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.ends_with(PACKAGE_SUFFIX));
+        if !name_is_package {
+            continue;
+        }
+        let Ok(file_meta) = entry.metadata() else {
+            continue;
+        };
+        if !file_meta.is_file() {
+            continue;
+        }
+        if file_meta.permissions().mode() & 0o777 != 0o600 {
+            violations += 1;
+        }
+    }
+    Some(violations)
+}
+
 /// 卷上这些包里，有多少份在卷外目录里没有同名的那一份。
 ///
 /// 「卷外那份是不是最新」只问一份文件，副本可以完全跟得上而窗口只覆盖了一半：
@@ -1020,28 +1075,91 @@ fn restrict_to_owner(_path: &Path, _mode: u32) -> std::io::Result<()> {
 }
 
 fn tar_package(staging: &Path, staging_name: &str, out: &Path) -> std::io::Result<()> {
+    let key = crate::backup_crypto::PackageKey::from_env();
+    if key.is_none() {
+        // 没口令就只能写明文包：不拦（拦的代价是当晚没有备份），但每一趟都要留痕，
+        // 否则「我们的包是密文」会变成一句没人量的口号。
+        tracing::warn!(
+            env = crate::backup_crypto::KEY_ENV,
+            "没有配置包级加密口令，这一份包以明文落盘"
+        );
+    }
+    tar_package_with_key(staging, staging_name, out, key.as_ref())
+}
+
+/// 打包主体。口令从参数进来而不是在函数里读环境变量，测试才能在不改进程环境的
+/// 前提下同时验证「有钥匙」和「没钥匙」两条路。
+fn tar_package_with_key(
+    staging: &Path,
+    staging_name: &str,
+    out: &Path,
+    key: Option<&crate::backup_crypto::PackageKey>,
+) -> std::io::Result<()> {
     let tmp = out.with_extension("tmp");
     {
         let file = std::fs::File::create(&tmp)?;
         // 临时名也可能从上一趟没清掉的残留来，所以不放宽成「只在新建时设」。
         restrict_to_owner(&tmp, 0o600)?;
-        let mut encoder = zstd::Encoder::new(file, 3)?;
-        // zstd 默认不写内容校验和（frame header 的 `Content_Checksum_flag` 为 0），
-        // 于是 `zstd -t` 只解不校，一个位数翻转的文件仍会被判通过。打开它，让
-        // 压缩帧自带的 xxhash 在校验时被真正算到——只对**这行之后**打出来的包生效，
-        // 已经落盘的旧包没有校验和，改变不了，也不该假装它们有。
-        encoder.include_checksum(true)?;
-        let mut builder = tar::Builder::new(encoder);
-        builder.append_dir_all(staging_name, staging)?;
-        let encoder = builder.into_inner()?;
-        encoder.finish()?;
+        match key {
+            Some(key) => {
+                // 链条：tar → zstd → 加密帧 → 文件。加密放在压缩之后，压缩率不受影响；
+                // 放在 zstd 之前会让密文不可压，包会大出一大截。
+                let sealing = key.seal(file)?;
+                let mut encoder = zstd::Encoder::new(sealing, 3)?;
+                encoder.include_checksum(true)?;
+                let mut builder = tar::Builder::new(encoder);
+                builder.append_dir_all(staging_name, staging)?;
+                let encoder = builder.into_inner()?;
+                let sealing = encoder.finish()?;
+                sealing.finish()?;
+            }
+            None => {
+                let mut encoder = zstd::Encoder::new(file, 3)?;
+                // zstd 默认不写内容校验和（frame header 的 `Content_Checksum_flag` 为 0），
+                // 于是 `zstd -t` 只解不校，一个位数翻转的文件仍会被判通过。打开它，让
+                // 压缩帧自带的 xxhash 在校验时被真正算到——只对**这行之后**打出来的包生效，
+                // 已经落盘的旧包没有校验和，改变不了，也不该假装它们有。
+                encoder.include_checksum(true)?;
+                let mut builder = tar::Builder::new(encoder);
+                builder.append_dir_all(staging_name, staging)?;
+                let encoder = builder.into_inner()?;
+                encoder.finish()?;
+            }
+        }
     }
     std::fs::rename(&tmp, out)
 }
 
 fn untar_package(pkg: &Path, dest: &Path) -> std::io::Result<PathBuf> {
+    let key = crate::backup_crypto::PackageKey::from_env();
+    untar_package_with_key(pkg, dest, key.as_ref())
+}
+
+/// 解包主体。新旧两种包靠文件头分辨：加密包必须有钥匙，旧包在轮换窗口里照常能解。
+/// 「分不出来就当旧包」不成立——那会把一个解密失败伪装成 zstd 损坏。
+fn untar_package_with_key(
+    pkg: &Path,
+    dest: &Path,
+    key: Option<&crate::backup_crypto::PackageKey>,
+) -> std::io::Result<PathBuf> {
+    let encrypted = crate::backup_crypto::package_is_encrypted(pkg)?;
     let file = std::fs::File::open(pkg)?;
-    let decoder = zstd::Decoder::new(file)?;
+    let reader: Box<dyn std::io::Read> = if encrypted {
+        let key = key.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} 是加密包，但没有 {}：没有口令解不开",
+                    pkg.display(),
+                    crate::backup_crypto::KEY_ENV
+                ),
+            )
+        })?;
+        Box::new(key.open(file)?)
+    } else {
+        Box::new(file)
+    };
+    let decoder = zstd::Decoder::new(reader)?;
     let mut archive = tar::Archive::new(decoder);
     std::fs::create_dir_all(dest)?;
     // 解出来的树里有 Secret 清单，包内的条目权限沿用了打包时的 0644；
@@ -1137,6 +1255,45 @@ async fn record_run(
     }
 }
 
+/// 上一次演练量到的凭证面是否已经拦得住下一份备份。
+///
+/// 这条判据是**读者侧的**：读数由演练写进账本，写者在这里读它，读到开放权限
+/// 就拒绝再往这个面上写一份新包。理由不是「演练说这份包装不回去」——那是另一
+/// 个结论——而是：一个别人读得到的目录里再落一份装着整库内容的包，等于把暴露
+/// 面继续做大。修复方式在返回的话里写清楚：收紧权限，跑一次演练让读数归零，
+/// 下一晚的备份照常。
+///
+/// `None`（没有演练行、或三列都为空）不拦：没有量过不是量到干净，但也不能拿
+/// 「没量过」当「有违例」去停掉备份——拦的依据必须是量到的数。
+fn credential_surface_refusal(drill: Option<&cog_core::BackupDrillRecord>) -> Option<String> {
+    let drill = drill?;
+    let counts = [
+        ("备份卷", drill.credential_violations_backup_pvc),
+        ("卷外副本", drill.credential_violations_offsite),
+        ("状态目录", drill.credential_violations_state_dir),
+    ];
+    let open: Vec<(&str, i32)> = counts
+        .into_iter()
+        .filter_map(|(name, count)| match count {
+            Some(count) if count > 0 => Some((name, count)),
+            _ => None,
+        })
+        .collect();
+    if open.is_empty() {
+        return None;
+    }
+    let detail = open
+        .iter()
+        .map(|(name, count)| format!("{name} {count} 条"))
+        .collect::<Vec<_>>()
+        .join("，");
+    Some(format!(
+        "凭证面有开放权限（上一次演练 {} 量到：{detail}），拒绝再写一份包：先用 0700 收紧目录、\
+         用 0600 收紧顶层 *.tar.zst，再跑一次 backup-drill 让读数归零，下一晚的备份会照常进行",
+        drill.drill_id
+    ))
+}
+
 pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&cfg.backup_dir)?;
     let now = Utc::now();
@@ -1166,6 +1323,36 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
                 "备份：这个标识已经在账上了，开工的行保持原样——同一个标识不会开两次"
             ),
             Err(e) => tracing::warn!(error = %e, "备份：开工那一行没写进去"),
+        }
+
+        // 读者侧的执行点：上一次演练量到的凭证面有开放权限，这一趟不写。
+        // 读不出来（库不可达）不拦：那一趟本来就会在开工行上失败，拿一个读不
+        // 到的读数去停备份，是把「不知道」当成了「有违例」。
+        let refusal = match store.read_latest_drill().await {
+            Ok(latest) => credential_surface_refusal(latest.as_ref()),
+            Err(e) => {
+                tracing::warn!(error = %e, "备份：上一次演练的读数读不出来，权限这一面这一趟不拦");
+                None
+            }
+        };
+        if let Some(reason) = refusal {
+            tracing::error!(run = %staging_name, reason = %reason, "备份被凭证面拦住");
+            let _ = std::fs::remove_dir_all(&staging);
+            record_run(
+                run_store.as_ref(),
+                &staging_name,
+                BackupRunClosing {
+                    outcome: BackupOutcome::Failed,
+                    finished_at: Utc::now(),
+                    package: None,
+                    bytes: None,
+                    kept_after: None,
+                    oldest_kept_at: None,
+                    error: Some(reason.clone()),
+                },
+            )
+            .await;
+            return Err(reason.into());
         }
     }
 
@@ -3204,6 +3391,9 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         offsite_observed_at: None,
         offsite_remote_newest_at: None,
         offsite_key_created_at: None,
+        credential_violations_backup_pvc: None,
+        credential_violations_offsite: None,
+        credential_violations_state_dir: None,
         tables_restored: None,
         tables_expected: None,
         rows_restored: None,
@@ -3254,6 +3444,17 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
             drill.offsite_remote_newest_at = observed.newest_snapshot_at;
             drill.offsite_key_created_at = observed.key_created_at;
         }
+    }
+
+    // 三处凭证材料的现场：包卷、卷外副本、宿主状态目录。演练是唯一以 root
+    // 同时挂着这三处的进程，所以这门由它来量；宿主定时器只看得见它自己挨着
+    // 的那一个目录。没配落点的那一类留空，读作「这个安装没有这一处」。
+    drill.credential_violations_backup_pvc = credential_violations_in(&cfg.backup_dir);
+    if let Some(dir) = &cfg.offsite_dir {
+        drill.credential_violations_offsite = credential_violations_in(dir);
+    }
+    if let Some(dir) = &cfg.offsite_state_dir {
+        drill.credential_violations_state_dir = credential_violations_in(dir);
     }
 
     if let Err(e) = drill_once(cfg, live, packages, &mut drill).await {
@@ -4196,6 +4397,91 @@ mod tests {
     }
 
     #[test]
+    fn an_open_credential_surface_stops_the_next_backup_and_a_clean_one_does_not() {
+        let at = Utc::now();
+        let mut drill = cog_core::BackupDrillRecord {
+            drill_id: "drill-20261019T145214Z".into(),
+            started_at: at,
+            finished_at: at,
+            package: Some("cogneva-backup-20261019T103951Z.tar.zst".into()),
+            package_written_at: Some(at),
+            package_bytes: Some(1),
+            segment_skew_seconds: Some(1),
+            segment_skew_bound_seconds: Some(300),
+            packages_on_volume: 1,
+            oldest_package_at: Some(at),
+            offsite_newest_at: None,
+            offsite_matches_newest: None,
+            offsite_missing_packages: None,
+            offsite_observed_at: None,
+            offsite_remote_newest_at: None,
+            offsite_key_created_at: None,
+            credential_violations_backup_pvc: Some(0),
+            credential_violations_offsite: None,
+            credential_violations_state_dir: None,
+            tables_restored: Some(1),
+            tables_expected: Some(1),
+            rows_restored: Some(1),
+            rows_expected: Some(1),
+            source_runs_matched: Some(true),
+            generated_columns_recomputed: Vec::new(),
+            artifacts_expected: 0,
+            artifacts_restored: 0,
+            artifact_readings: Vec::new(),
+            artifact_errors: Vec::new(),
+            error: None,
+        };
+
+        // 量到 0 与没量过都不拦：拦的依据必须是量到的数。
+        assert_eq!(credential_surface_refusal(Some(&drill)), None);
+        assert_eq!(credential_surface_refusal(None), None);
+
+        drill.credential_violations_backup_pvc = Some(2);
+        drill.credential_violations_state_dir = Some(1);
+        let reason = credential_surface_refusal(Some(&drill)).expect("开放权限要拦住下一份包");
+        assert!(
+            reason.contains("备份卷 2 条"),
+            "读数要说出是哪一处：{reason}"
+        );
+        assert!(
+            reason.contains("状态目录 1 条"),
+            "读数要说出是哪一处：{reason}"
+        );
+        assert!(
+            reason.contains("backup-drill"),
+            "拦住之后要给出解除的办法：{reason}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_credential_surface_counts_each_open_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("backups");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pkg = dir.join("cogneva-backup-20261018T031700Z.tar.zst");
+        std::fs::write(&pkg, b"x").unwrap();
+        std::fs::set_permissions(&pkg, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(credential_violations_in(&dir), Some(0), "0700/0600 是干净");
+
+        // 各多一位组权限：目录一条、包文件一条。
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        std::fs::set_permissions(&pkg, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(credential_violations_in(&dir), Some(2));
+
+        // 判据只看目录本身与顶层 *.tar.zst：松散文件不进计数。
+        let loose = dir.join("notes.txt");
+        std::fs::write(&loose, b"x").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(credential_violations_in(&dir), Some(2));
+
+        // 没有这个落点不是 0：那一格要说的是「有没有量」，不是「干净」。
+        assert_eq!(credential_violations_in(&root.path().join("absent")), None);
+    }
+
+    #[test]
     fn tar_round_trip_preserves_layout() {
         let staging = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(staging.path().join("pg")).unwrap();
@@ -4294,6 +4580,65 @@ mod tests {
             bytes[4] & 0x04,
             0,
             "the zstd frame must set Content_Checksum_flag"
+        );
+    }
+
+    /// 包级加密的验收：盘上的字节离开这台机器后，没有口令就只是一个不透明的文件。
+    ///
+    /// 四条一起量，缺一条都能让「加密了」徒有其名：字节里没有明文、按 zstd 解不开、
+    /// 没钥匙解包明确被拒（而不是解出垃圾）、有钥匙能逐字节还原。
+    #[test]
+    fn a_package_is_not_readable_without_the_key() {
+        use crate::backup_crypto::PackageKey;
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(staging.path().join("secrets")).unwrap();
+        let secret_yaml = b"apiVersion: v1\nkind: Secret\nstringData:\n  pg-password: hunter2\n";
+        std::fs::write(
+            staging.path().join("secrets/cogneva-secrets.yaml"),
+            secret_yaml,
+        )
+        .unwrap();
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let pkg = out_dir
+            .path()
+            .join("cogneva-backup-20260914T000000Z.tar.zst");
+        let key = PackageKey::from_passphrase(b"a passphrase kept off this machine");
+        tar_package_with_key(
+            staging.path(),
+            "cogneva-backup-20260914T000000Z",
+            &pkg,
+            Some(&key),
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(&pkg).unwrap();
+        assert!(
+            bytes.starts_with(crate::backup_crypto::MAGIC),
+            "加密包有自己的文件头"
+        );
+        assert!(
+            !bytes
+                .windows(b"pg-password".len())
+                .any(|w| w == b"pg-password"),
+            "密文里不该出现包内的明文"
+        );
+        assert!(
+            zstd::Decoder::new(std::io::Cursor::new(bytes.as_slice())).is_err(),
+            "拿 zstd 直接解必须失败，否则「加密」只是换了个文件头"
+        );
+
+        let dest = out_dir.path().join("extract");
+        let err = untar_package_with_key(&pkg, &dest, None).unwrap_err();
+        assert!(
+            err.to_string().contains(crate::backup_crypto::KEY_ENV),
+            "没钥匙要明说是缺哪一项，不能报成包损坏：{err}"
+        );
+
+        let root = untar_package_with_key(&pkg, &dest, Some(&key)).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("secrets/cogneva-secrets.yaml")).unwrap(),
+            secret_yaml
         );
     }
 

@@ -5,6 +5,7 @@
 pub mod aof_repair;
 pub mod assembly;
 pub mod backup;
+pub mod backup_crypto;
 pub mod bootstrap;
 pub mod cli;
 pub mod config_loader;

@@ -336,6 +336,22 @@ pub struct BackupDrillRecord {
     pub offsite_observed_at: Option<DateTime<Utc>>,
     pub offsite_remote_newest_at: Option<DateTime<Utc>>,
     pub offsite_key_created_at: Option<DateTime<Utc>>,
+    /// How many permission violations the drill found on each credential-bearing
+    /// directory it was given: the backup volume, the offsite copy, and the host
+    /// state directory.
+    ///
+    /// A violation is counted per entry, not per directory: a directory whose
+    /// mode is not exactly 0700, or a top-level package file whose mode is not
+    /// exactly 0600. `None` means the drill was not given that directory, which
+    /// is a fact about the installation and not a clean reading -- a zero there
+    /// would claim a surface was inspected when it was not.
+    ///
+    /// The drill is where this belongs because it is the one process that runs
+    /// as root with all three directories mounted; a host-side timer would only
+    /// ever see the one directory it happens to run next to.
+    pub credential_violations_backup_pvc: Option<i32>,
+    pub credential_violations_offsite: Option<i32>,
+    pub credential_violations_state_dir: Option<i32>,
     /// Tables the scratch database held after the copy, against the tables the
     /// package's own manifest declared.
     pub tables_restored: Option<i32>,
@@ -515,6 +531,9 @@ mod tests {
             offsite_observed_at: Some(at),
             offsite_remote_newest_at: Some(at),
             offsite_key_created_at: Some(at),
+            credential_violations_backup_pvc: Some(0),
+            credential_violations_offsite: Some(0),
+            credential_violations_state_dir: Some(0),
             tables_restored: Some(46),
             tables_expected: Some(46),
             rows_restored: Some(1000),

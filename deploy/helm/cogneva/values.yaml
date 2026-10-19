@@ -245,6 +245,16 @@ backup:
   # 与 `offsiteHostPath` 一样是宿主路径；空字符串 = 不挂，两个年龄读数读作
   # 「没量过」。定时器没装的时候它确实是没量过，不是零。
   offsiteStateHostPath: /var/lib/cogneva-backup-offsite
+  # 包级加密的口令（A7b）：写包、演练、恢复都用这一个变量名。**这个 Secret 必须
+  # 由操作者在装之前带外写进命名空间**，chart 不生成它——口令与密文同一台机器、
+  # 同一个 Secret 仓库，就不叫「不落在同一台机器上」。
+  #
+  # 空 name = 不注入：下一个包仍走明文分支（日志留一条 warn），演练与恢复照旧能读
+  # 旧的明文包。加密一旦启用，**写包与能读包的三处必须同一步上线**：加密包在演练
+  # Pod 里解不开会让当晚 outcome=failed，看起来像「这份包装不回去」。
+  packageKeySecret:
+    name: ""
+    key: package-key
   # 空 = 跟随集群默认 SC（与 pg/redis/qdrant 同策略，不绑厂商）。
   storageClass: ""
 

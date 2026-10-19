@@ -92,6 +92,15 @@ spec:
                 # 进账本那一行。分开写两个数会漂，超期判断就跟着漂。
                 - name: COGNEVA_BACKUP_RUN_DEADLINE_SECONDS
                   value: {{ .Values.backup.runDeadlineSeconds | quote }}
+                {{- with .Values.backup.packageKeySecret.name }}
+                # 包级加密的口令。Secret 由操作者带外写入：chart 生成的口令与密文
+                # 同机，那就不叫「不落在同一台机器上」。空 = 不注入，走明文分支。
+                - name: COGNEVA_BACKUP_PACKAGE_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ . | quote }}
+                      key: {{ $.Values.backup.packageKeySecret.key | quote }}
+                {{- end }}
                 - name: COGNEVA_NAMESPACE
                   valueFrom:
                     fieldRef:
@@ -253,6 +262,15 @@ spec:
                 # 是另一个数据库名，源 schema 只被读。
                 - name: COGNEVA_DATABASE_URL
                   value: "postgres://cog_user:$(PG_PASSWORD)@postgres.{{ include "cogneva.namespace" . }}.svc.cluster.local:5432/cogneva"
+                {{- with .Values.backup.packageKeySecret.name }}
+                # 读包要同一份口令：加密包在演练里解不开会让当晚 outcome=failed，
+                # 所以写包、演练、恢复三处的注入必须同一步上线。
+                - name: COGNEVA_BACKUP_PACKAGE_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ . | quote }}
+                      key: {{ $.Values.backup.packageKeySecret.key | quote }}
+                {{- end }}
                 {{- with .Values.backup.offsiteHostPath }}
                 # 只读：演练遍历卷外那一份，看它是不是刚装回去的这个包。
                 - name: COGNEVA_BACKUP_OFFSITE_DIR

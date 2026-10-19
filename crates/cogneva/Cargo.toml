@@ -72,6 +72,9 @@ rustls = { workspace = true }
 reqwest = { workspace = true, features = ["multipart"] }
 tar = "0.4"
 zstd = { workspace = true }
+# 包级加密：ChaCha20-Poly1305 与 HKDF 都用 ring 的现成实现，不自己拼密码学。
+# 版本跟着 rustls 已经拉进 Cargo.lock 的那一份走，不额外引入新的加密后端。
+ring = "0.17"
 # 评测那一列要读上游那份 `configs/mcp_servers/*.yaml`，而读它的是**发布**路径
 # （起容器里的 MCP server），不是测试——放在 dev-dependencies 里只有测试 profile 编译得过，
 # `cargo build` 会红。
