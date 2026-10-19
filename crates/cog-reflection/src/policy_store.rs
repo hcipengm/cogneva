@@ -25,7 +25,7 @@ pub struct PolicyArtifact {
     /// 策略名（如 `orchestrator.retry`、`guardrail.pii`、`meta_learning.mode`）。
     pub name: String,
     pub version: u64,
-    /// 策略参数本体（元策略/阈值/权重/规则的 protobuf 语义 message）。
+    /// 策略参数本体（元策略/阈值/权重/规则的 JSON 对象）。
     pub payload: serde_json::Value,
     /// 上一版本 hash；创世版本为 "genesis"。
     pub parent_hash: String,
