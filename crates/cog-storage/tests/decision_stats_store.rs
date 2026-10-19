@@ -148,11 +148,15 @@ async fn concurrent_increments_add_up_instead_of_each_overwriting_the_other() {
         .map(|task| {
             let store = store.clone();
             let cell = probe.won("same-group", "pipeline");
-            let wins = u32::from(task % 2 == 0);
+            // Whether this task reports *every* attempt as a success, not how
+            // many of them: the comment below counts two tasks times ten
+            // attempts, and counting the wins instead would have two tasks
+            // reporting one success each while the assertion expected twenty.
+            let wins_every_attempt = task % 2 == 0;
             tokio::spawn(async move {
-                for i in 0..10 {
+                for _ in 0..10 {
                     let delta = DecisionStatCell {
-                        successes: if i < wins { 1 } else { 0 },
+                        successes: i64::from(wins_every_attempt),
                         ..cell.clone()
                     };
                     store.accumulate(&delta).await.expect("accumulate");
