@@ -237,12 +237,15 @@ pub fn rule_set_action(verdict: &LoadedRuleSet, watch: &mut LoadedRuleSetWatch) 
         LoadedRuleSet::Unknown(_) => RuleSetAction::Nothing,
         LoadedRuleSet::Agree => {
             watch.disagreeing = 0;
-            if watch.firing {
-                watch.firing = false;
-                RuleSetAction::Resolve
-            } else {
-                RuleSetAction::Nothing
-            }
+            watch.firing = false;
+            // Asked for on every agreeing tick, not only after this process
+            // raised the row. The row is keyed by the document, so it outlives
+            // the process that opened it: a deployment that rolls in the fix
+            // replaces the process, and the one that starts has no memory of
+            // the row it inherited -- a resolve gated on this process's own
+            // `firing` would leave that row open forever. Closing an already
+            // closed row writes nothing, so the repeated ask costs one read.
+            RuleSetAction::Resolve
         }
         LoadedRuleSet::Differs {
             not_loaded,
@@ -306,6 +309,7 @@ pub async fn check_loaded_rule_set(
             return;
         }
     };
+    let was_firing = watch.firing;
     match rule_set_action(&judge_loaded_rule_set(loaded, document.as_deref()), watch) {
         RuleSetAction::Fire(message) => {
             warn!(source = %source, "{}", message);
@@ -321,7 +325,9 @@ pub async fn check_loaded_rule_set(
             .await;
         }
         RuleSetAction::Resolve => {
-            info!(source = %source, "the loaded rule set matches the document again");
+            if was_firing {
+                info!(source = %source, "the loaded rule set matches the document again");
+            }
             set_row(
                 store,
                 notifier,
@@ -627,7 +633,9 @@ mod tests {
         .to_string()
     }
 
-    /// The ordinary case: the process holds what the document declares.
+    /// The ordinary case: the process holds what the document declares, so it
+    /// raises nothing — it asks for the row to be closed, which is a no-op when
+    /// no row is open.
     #[test]
     fn a_process_on_the_documents_rule_set_raises_nothing() {
         let verdict = judge_loaded_rule_set(&loaded(&["a", "b"]), Some(&document(&["a", "b"])));
@@ -635,8 +643,24 @@ mod tests {
         let mut watch = LoadedRuleSetWatch::default();
         assert_eq!(
             rule_set_action(&verdict, &mut watch),
-            RuleSetAction::Nothing
+            RuleSetAction::Resolve
         );
+    }
+
+    /// A process that starts while the row from a previous process is open
+    /// closes it on its first agreeing tick, even though it never raised it.
+    ///
+    /// The row is keyed by the document rather than by the process, so the
+    /// deployment that rolls in the fix is not the deployment that reported the
+    /// problem: gating the close on this process's own `firing` flag would leave
+    /// the row open for as long as the document stays fixed, which is to say
+    /// forever.
+    #[test]
+    fn a_restarted_process_closes_a_row_it_did_not_raise() {
+        let agrees = judge_loaded_rule_set(&loaded(&["a", "b"]), Some(&document(&["a", "b"])));
+        let mut watch = LoadedRuleSetWatch::default();
+        assert!(!watch.firing, "a fresh process holds no row");
+        assert_eq!(rule_set_action(&agrees, &mut watch), RuleSetAction::Resolve);
     }
 
     /// The document was replaced under a running process: the names it added
@@ -690,7 +714,9 @@ mod tests {
         rule_set_action(&differs, &mut watch);
         let agrees = judge_loaded_rule_set(&loaded(&["a", "b"]), Some(&document(&["a", "b"])));
         assert_eq!(rule_set_action(&agrees, &mut watch), RuleSetAction::Resolve);
-        assert_eq!(rule_set_action(&agrees, &mut watch), RuleSetAction::Nothing);
+        // Further agreeing ticks keep asking; the store turns each into a
+        // no-op once the row is closed.
+        assert_eq!(rule_set_action(&agrees, &mut watch), RuleSetAction::Resolve);
     }
 
     /// A document that cannot be read is not a document that agrees: an open
