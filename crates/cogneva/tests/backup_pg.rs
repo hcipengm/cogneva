@@ -408,7 +408,7 @@ async fn pg_a_drill_row_keeps_the_columns_the_target_recomputed() {
         oldest_package_at: Some(at),
         offsite_newest_at: None,
         offsite_matches_newest: None,
-        offsite_missing_packages: None,
+        offsite_missing_packages: Some(3),
         offsite_observed_at: None,
         offsite_remote_newest_at: None,
         offsite_key_created_at: None,
@@ -433,4 +433,22 @@ async fn pg_a_drill_row_keeps_the_columns_the_target_recomputed() {
         "由目标重算的列必须原样回来：这一格丢了，改表达式就会被装成一次静默改写"
     );
     assert!(read.ok(), "算回来的列不进成败判决");
+
+    // 三格相邻的新列各自带回自己那个数。写成三个不同的值是有意的：绑定顺序若
+    // 与列清单错开一格，NULL 与 NULL 之间换不出声，而 12 / 300 / 3 会立刻对不上。
+    assert_eq!(
+        read.segment_skew_seconds,
+        Some(12),
+        "演练行的分段偏差没有原样回来"
+    );
+    assert_eq!(
+        read.segment_skew_bound_seconds,
+        Some(300),
+        "演练行的分段界没有原样回来"
+    );
+    assert_eq!(
+        read.offsite_missing_packages,
+        Some(3),
+        "窗口里没有卷外副本的包数没有原样回来"
+    );
 }
