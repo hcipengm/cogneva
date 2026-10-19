@@ -872,6 +872,15 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_mainline_preflight_refused_total",
         "crates/cog-reflection/src/mainline_deployer.rs",
     ),
+    // 部署器自己的 kubectl 调用被授权拒绝的次数，按服务端说出的动词和资源分开。
+    // 与上面那条互补：预检问的是「包里会 apply 的 kind」，这条接住部署器**读自己
+    // 判断依据**的那些命令（ResourceQuota、LimitRange、在跑的配额），它们不在任何
+    // 包里，也就进不了那道预检的视野。2026-10-19 那两小时半的 LimitRange 被拒正是
+    // 这一格。
+    (
+        "cogneva_mainline_kubectl_refused_total",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
     // 轮询循环每一轮的结果。循环自己的存活读数（`loop_tick_age_seconds`）在每拍开头
     // 盖章，量的是「它醒了」，量不到这一轮干了什么；而这一轮里别的读数（版本契约、
     // CI 判词、那对越权计数）全写在会失败的那一步**之前**。2026-10-08 实测：发布那

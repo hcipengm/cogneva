@@ -1938,11 +1938,61 @@ impl MainlineDeployer {
         self.cfg.build_timeout_secs + STRIP_WALL_SECS + Self::buildah_max_step_wall_secs()
     }
 
+    /// 每一条**部署器自己的** kubectl 调用都从这里走，只在一条路上加了东西：
+    /// 当集群用授权拒绝回答时，把「哪个动词、哪个资源被扣着」记成一条读数。
+    ///
+    /// 为什么不在派发前多问一次 `auth can-i`（像
+    /// [`Self::preflight_delivery_authorization`] 那样）：那道预检问的是**包里会
+    /// apply 的 kind**，而这里被拒的是部署器**读自己需要的判断依据**——命名空间
+    /// 的资源上限、`LimitRange`、在跑的配额。它们不在任何包里，也就不在那道预检
+    /// 的视野里，而且这张清单只能手写第二份，正是两边漂开的形状。
+    ///
+    /// 为什么不靠现有的读数：被拒会以 `Forbidden` 的形式穿过
+    /// [`crate::governance_drift::CheckFailure`]，而那条面按「连续六轮读不到」才响
+    /// ——2026-10-19 实测，`LimitRange` 的读被拒了两个半小时，最早的一条告警是 6
+    /// 次失败之后才亮的，成因（少了哪条 verb）一直只活在一条会随 Pod 消失的 WARN
+    /// 里。授权拒绝不是颤抖：重试一辈子也不会自己好，**第一次就该有人知道**。
+    ///
+    /// 认的是 API server 自己的措辞（`Error from server (Forbidden)` 与
+    /// `cannot <verb> resource "<name>"`），不是从参数里猜：拒绝的原文就是「哪个
+    /// 动词、哪个资源」，参数里那个词在 `apply -f <路径>` 这类形状下并不是资源名。
+    /// 读不出动词或资源时退回参数里的前两项，读数宁可粗一点也不丢这一次拒绝。
     async fn kubectl(&self, args: &[&str], timeout_secs: u64) -> SFResult<String> {
         let mut full: Vec<&str> = vec!["-n", &self.cfg.namespace];
         full.extend_from_slice(args);
-        self.run_cmd(&self.cfg.kubectl_bin, &full, None, timeout_secs)
+        match self
+            .run_cmd(&self.cfg.kubectl_bin, &full, None, timeout_secs)
             .await
+        {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                if let Some((verb, resource)) = refused_command(&e.to_string(), args) {
+                    self.record_kubectl_refused(&verb, &resource).await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// 一次被集群授权拒掉的 kubectl 调用，按被扣住的动词和资源落一条。
+    ///
+    /// 名字里带的是服务端说出的那两个词，理由同
+    /// [`Self::record_preflight_refused`]：不带标签的拒收计数点不出是哪一条授权
+    /// 被卡，读者拿到的就只剩「有东西被拒了」。
+    async fn record_kubectl_refused(&self, verb: &str, resource: &str) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("verb".to_string(), verb.to_string());
+        labels.insert("resource".to_string(), resource.to_string());
+        let _ = metrics
+            .record_counter(
+                cog_core::metric_names::MAINLINE_KUBECTL_REFUSED_TOTAL,
+                1.0,
+                labels,
+            )
+            .await;
     }
 
     /// 问集群「本进程这个身份有没有这个动词」，把 `kubectl auth can-i` 的
@@ -6512,6 +6562,41 @@ fn rbac_target(group: &str, resource: &str) -> String {
         resource.to_string()
     } else {
         format!("{resource}.{group}")
+    }
+}
+
+/// API server 拒绝一条命令时那句话的开头，逐字。认证失败（401）、连不上、超时都
+/// 不以它开头——那些是「没问到」，不是「问到了、被拒了」。
+const SERVER_FORBIDDEN: &str = "Error from server (Forbidden)";
+
+/// 从一条失败命令的输出里读出「哪个动词、哪个资源被扣着」。
+///
+/// 认服务端自己写的两个词：`cannot <verb> resource "<resource>"`。不从参数里认，
+/// 因为参数的第一项不总是动词（`auth can-i` 的 exit 1 不走这条路）、第二项也不
+/// 总是资源（`apply -f <路径>`、`rollout status <deploy>`）。读不出来时退回参数
+/// 的前两项：一条读不出名字的拒绝也比没有这条读数强，而名字粗一点只会让读者多
+/// 看一眼日志。
+pub(crate) fn refused_command(error: &str, args: &[&str]) -> Option<(String, String)> {
+    if !error.contains(SERVER_FORBIDDEN) {
+        return None;
+    }
+    if let Some(rest) = error.split("cannot ").nth(1) {
+        let verb: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
+        let resource = rest
+            .split_once("resource \"")
+            .and_then(|(_, after)| after.split_once('"'))
+            .map(|(name, _)| name.to_string());
+        if let (false, Some(resource)) = (verb.is_empty(), resource) {
+            return Some((verb, resource));
+        }
+    }
+    let mut it = args.iter().filter(|a| !a.starts_with('-'));
+    match (it.next(), it.next()) {
+        (Some(verb), Some(resource)) => Some((verb.to_string(), resource.to_string())),
+        _ => None,
     }
 }
 
@@ -20109,5 +20194,63 @@ exit 0
             );
         }
         // 一个步名走两次是允许的（库存前后各读一次），界取的是最长的一步，不看条数。
+    }
+
+    /// 一次授权拒绝读出来的是服务端说的那两个词，不是调用方传的那两个词。
+    ///
+    /// 2026-10-19 那条真实的拒绝原样抄在这里：`LimitRange` 的读被拒，而部署器
+    /// 当时没有任何读数点得出「少的是哪条 verb」。
+    #[test]
+    fn a_forbidden_read_names_the_verb_and_resource_the_server_withheld() {
+        let error = "kubectl -n cogneva get limitrange -o json failed: Error from server \
+                     (Forbidden): limitranges is forbidden: User \"system:serviceaccount:cogneva:\
+                     cogneva-evolution\" cannot list resource \"limitranges\" in API group \"\" in \
+                     the namespace \"cogneva\"";
+        assert_eq!(
+            refused_command(error, &["get", "limitrange", "-o", "json"]),
+            Some(("list".to_string(), "limitranges".to_string())),
+            "the server says list/limitranges; the caller asked for get/limitrange"
+        );
+
+        let traefik = "kubectl -n cogneva apply -f - failed: Error from server (Forbidden): \
+                       middlewares.traefik.io \"websocket-headers\" is forbidden: User \
+                       \"system:serviceaccount:cogneva:cogneva-evolution\" cannot patch resource \
+                       \"middlewares\" in API group \"traefik.io\"";
+        assert_eq!(
+            refused_command(traefik, &["apply", "-f", "-"]),
+            Some(("patch".to_string(), "middlewares".to_string())),
+            "arg parsing would have read this as apply/`-`"
+        );
+    }
+
+    /// 「没问到」不是「被拒了」：超时、连不上、认证失败都不算一次授权拒绝。
+    /// 把它们记成拒绝，会让这条读数在集群抖动时亮成「权限没了」。
+    #[test]
+    fn a_command_that_never_reached_the_server_is_not_a_refusal() {
+        for error in [
+            "kubectl -n cogneva get limitrange -o json timed out after 60s",
+            "failed to run kubectl: No such file or directory (os error 2)",
+            "kubectl -n cogneva get limitrange -o json failed: The connection to the server \
+             10.43.0.1:443 was refused",
+        ] {
+            assert_eq!(
+                refused_command(error, &["get", "limitrange"]),
+                None,
+                "{error}"
+            );
+        }
+    }
+
+    /// 认不出服务端句式时退回参数，读数粗一点也比丢掉这次拒绝强。
+    #[test]
+    fn a_refusal_that_cannot_be_parsed_falls_back_to_the_arguments() {
+        let error = "kubectl -n cogneva get resourcequota -o json failed: \
+                     Error from server (Forbidden): admission webhook \"policy.example\" denied \
+                     the request";
+        assert_eq!(
+            refused_command(error, &["get", "resourcequota", "-o", "json"]),
+            Some(("get".to_string(), "resourcequota".to_string()))
+        );
+        assert_eq!(refused_command(error, &[]), None);
     }
 }

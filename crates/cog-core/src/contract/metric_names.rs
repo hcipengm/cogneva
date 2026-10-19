@@ -657,6 +657,23 @@ metric_names! {
     // the Job at all -- the reading is the deployer's own judgement of the
     // cluster, not the cluster's rejection replayed.
     MAINLINE_PREFLIGHT_REFUSED_TOTAL => "cogneva_mainline_preflight_refused_total",
+    // Times an API server refused one of the deployer's *own* `kubectl`
+    // commands, by the verb and the resource it named in the sentence.
+    //
+    // The sibling above asks about the kinds a revision delivers, before a Job
+    // is dispatched. The deployer also reads things it does not deliver -- the
+    // namespace `ResourceQuota`, the enforced `LimitRange`s -- and a grant
+    // missing on one of those is invisible to that preflight by construction:
+    // adding them to it would be a second hand-written list of what the deployer
+    // reads, which is the shape that drifts. Counting at the one wrapper every
+    // own-command already goes through needs no list at all.
+    //
+    // Measured 2026-10-19: the LimitRange read was refused from 09:44 until the
+    // installed Role was brought up at 12:14, and the only reading that ever
+    // mentioned it was the comparison-failure meter behind a six-in-an-hour
+    // threshold. An authorization denial does not heal by being retried, so the
+    // rule over this counter fires on the first one.
+    MAINLINE_KUBECTL_REFUSED_TOTAL => "cogneva_mainline_kubectl_refused_total",
     // Times the deployer's guard put the overtaken question, counted whether
     // the answer was yes or no.
     //

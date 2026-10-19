@@ -603,6 +603,26 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          of the cluster, not the cluster's rejection replayed after the fact",
     ),
     (
+        "cogneva_mainline_kubectl_refused_total",
+        "Times an API server refused one of the deployer's own kubectl commands, \
+         by the verb and the resource the server named in its answer. The sibling \
+         above asks about the kinds a revision delivers, before a Job is \
+         dispatched; the deployer also reads what it does not deliver -- the \
+         namespace ResourceQuota, the enforced LimitRanges -- and a grant missing \
+         on one of those is invisible to that preflight by construction. Adding \
+         them to it would need a second hand-written list of what the deployer \
+         reads, which is the shape that drifts; counting at the one wrapper every \
+         own command already goes through needs no list at all. Counted only when \
+         the server words the failure as Forbidden: a timeout, an unreachable API, \
+         or a rejected credential is a command that never got an answer and must \
+         not be read as the cluster withholding a grant. One refusal is enough to \
+         fire a rule -- an authorization denial does not heal by being retried, so \
+         a threshold waiting for a run of them only measures how long nobody was \
+         told. Measured on 2026-10-19: the LimitRange read was refused for two and \
+         a half hours and only the comparison-failure meter behind a six-in-an-hour \
+         threshold ever mentioned it",
+    ),
+    (
         "cogneva_mainline_supersession_checks_total",
         "Times the deployer's guard put the overtaken question, counted whether \
          the answer was yes or no. Counted rather than inferred from the skips, \
