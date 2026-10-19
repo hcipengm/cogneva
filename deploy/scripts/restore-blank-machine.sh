@@ -20,6 +20,12 @@
 # 回执目录：$COGNEVA_RESTORE_RECEIPT（默认 ./restore-receipt）
 set -euo pipefail
 
+# 这条腿要属主手上的东西：包的字节（命令行给），包若加密还要口令（交互输入）。
+# 把它写成回执里的一个字段，是为了事后能回答「这份数据是谁给的」——没这一行，
+# 一份装好的空白机与一份装之前就存在的数据长一个样。数不随步骤变，所以每一段
+# 都带着它，断在哪一段都能看出来这条腿本来要人给东西。
+RESTORE_NEEDS_OWNER_INPUT=1
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PKG="${1:-}"
 NS="${2:-cogneva}"
@@ -34,6 +40,13 @@ if [ -z "$PKG" ] || [ ! -f "$PKG" ]; then
 fi
 command -v kubectl >/dev/null || { echo "缺少 kubectl" >&2; exit 2; }
 command -v tar >/dev/null || { echo "缺少 tar" >&2; exit 2; }
+# 口令若已经在环境里，说明它在这台宿主上是常驻的——那正是这条腿不想有的东西：
+# 只读整库的钥匙留在宿主机上，任何拿到宿主的人都有。这条腿要的是当场输入。
+# 真要走常驻凭证那条路，那是另一条腿（宿主侧的异地拉取），不该从空白机恢复里滑进来。
+if [ -n "${RESTIC_PASSWORD:-}" ]; then
+    echo "RESTIC_PASSWORD 出现在环境里：空白机恢复走交互输入，不用宿主上常驻的口令" >&2
+    exit 2
+fi
 mkdir -p "$RECEIPT"
 
 PKG_SHA="$(sha256sum "$PKG" | awk '{print $1}')"
@@ -48,11 +61,15 @@ read_field() {  # read_field <file> <key>
 }
 
 # 回执是给人读的 key=value，不是程序之间传的格式：出问题时属主会直接打开它。
-record() {  # record <step> <reading>
+record() {  # record <step> <reading> [owner_input]
     {
         echo "status=done"
         echo "at=$(now)"
         echo "package_sha256=$PKG_SHA"
+        echo "restore_needs_owner_input=$RESTORE_NEEDS_OWNER_INPUT"
+        # 这一段用掉了属主给的哪一样东西。空着＝这一段不依赖属主到场；
+        # 不是「不确定」——不确定就不该被判成 done。
+        echo "owner_input=${3:-}"
         echo "reading=$2"
     } >"$RECEIPT/$1.txt"
 }
@@ -76,7 +93,7 @@ step_package() {
     # 旧格式的包没有 artifacts 段，那是「当年没声明」，不是错；这里只读、不判。
     local expected
     expected="$(pkg_artifacts_expected)"
-    record package "$PKG sha256=$PKG_SHA artifacts_expected=$expected"
+    record package "$PKG sha256=$PKG_SHA artifacts_expected=$expected" package_bytes
     echo "    包 $PKG sha256=$PKG_SHA 产物层声明 $expected 项"
 }
 
@@ -127,7 +144,7 @@ step_restore() {
     local job
     job="cogneva-restore-blank-$(date +%s)"
     COGNEVA_RESTORE_JOB_NAME="$job" bash "$RESTORE_CMD" "$PKG" "$NS"
-    record restore "job=$job"
+    record restore "job=$job" package_bytes
     echo "    恢复 Job 完成：$job"
 }
 

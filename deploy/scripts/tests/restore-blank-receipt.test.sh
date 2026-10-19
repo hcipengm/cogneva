@@ -70,6 +70,18 @@ bash "$SCRIPT" "$TMP/good.tar.zst" >/dev/null || fail "第一遍没跑通"
 [ -s "$TMP/receipt/verify.txt" ] || fail "没有写回执"
 grep -q "artifacts_restored=2" "$TMP/receipt/verify.txt" || fail "回执里的读数不对"
 [ "$(wc -l <"$FAKE_RESTORE_CALLS")" = "1" ] || fail "恢复被调用的次数不对"
+# 属主输入项：每一段都带这个数（事后能看出这条腿本来要人给东西），
+# 用掉包字节的两段要点名是它；引擎与对账两段不依赖属主到场。
+for f in package engine restore verify; do
+    grep -qx "restore_needs_owner_input=1" "$TMP/receipt/$f.txt" \
+        || fail "$f 回执没记「这一条腿要属主输入」"
+done
+grep -qx "owner_input=package_bytes" "$TMP/receipt/package.txt" \
+    || fail "package 回执没记它用掉的是包的字节"
+grep -qx "owner_input=package_bytes" "$TMP/receipt/restore.txt" \
+    || fail "restore 回执没记它用掉的是包的字节"
+grep -qx "owner_input=" "$TMP/receipt/verify.txt" \
+    || fail "verify 回执声明了不存在的属主输入"
 
 # 2. 重跑：不重做恢复，只把已记录的段读回来。
 bash "$SCRIPT" "$TMP/good.tar.zst" >/dev/null || fail "第二遍没跑通"
@@ -89,5 +101,13 @@ printf '%s\n' "artifact restored" >"$FAKE_JOB_LOG" # 只报 1 项，包里声明
 if bash "$SCRIPT" "$TMP/good.tar.zst" >/dev/null 2>&1; then
     fail "产物层条数对不上却判成恢复完成"
 fi
+
+# 5. 口令在环境里：空白机恢复要交互输入，不从宿主常驻环境里捡。这一条与
+#    「包里解不开」不是一回事——它拦的是「钥匙已经常驻在这台机器上」。
+export COGNEVA_RESTORE_RECEIPT="$TMP/receipt3"
+if RESTIC_PASSWORD=ambient bash "$SCRIPT" "$TMP/good.tar.zst" >/dev/null 2>&1; then
+    fail "宿主环境里的口令被当成了合法输入"
+fi
+[ ! -e "$TMP/receipt3/package.txt" ] || fail "被拒之后还是写了回执"
 
 echo "blank-machine receipt OK"
