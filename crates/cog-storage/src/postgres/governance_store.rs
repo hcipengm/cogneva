@@ -13,6 +13,12 @@
 //! schema is what creates the table, and a migration that altered a table it
 //! had not created would fail on a fresh install.
 //!
+//! That also means a reader outside the application process cannot assume they
+//! exist -- the columns appear when the application's own startup step runs, and
+//! a host command reading the same database may be several revisions ahead of
+//! the deployment. The queries below therefore read the binding out of the task
+//! document, which is where it is written and is present on every row.
+//!
 //! Every read here is over rows the task system already keeps. The only thing
 //! this store adds is the shape of the question.
 
@@ -46,7 +52,7 @@ ORDER BY task_id";
 const OPEN_FACE_BOUND_SQL: &str = "\
 SELECT task FROM cog_dag_tasks \
 WHERE status IN ('pending', 'scheduled', 'running') \
-  AND face_id IS NOT NULL \
+  AND task ->> 'face_id' IS NOT NULL \
   AND workspace_id <> $1 \
   AND COALESCE((task->>'is_executable')::boolean, true) \
 ORDER BY workspace_id, task_id";
