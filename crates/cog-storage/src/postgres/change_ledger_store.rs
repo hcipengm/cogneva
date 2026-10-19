@@ -816,6 +816,37 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         )
     }
 
+    async fn retired_surface_moved(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
+        // The only read that can reach a retired row, and it exists because a
+        // retirement is about the history while the row's truth is about the
+        // tree that follows it. `outstanding` excludes `retired` on the ground
+        // that its question is answered; a scope the tree brings back makes that
+        // ground false, and no other statement would ever look again.
+        //
+        // Only `surface_moved`: a `fixture` or `superseded` retirement does not
+        // come back when a path does, and `out_of_scope` returns through its own
+        // door -- the tree being mounted is a fact about the ledger's owner, not
+        // about a commit, so re-asking it here would measure it against a tree
+        // that cannot answer for it either.
+        //
+        // Ordered by `retired_at` rather than by `measured_at`: a retirement is
+        // written once with the revision the scope exited, and a recheck that
+        // found the scope still gone writes nothing, so no timestamp on these
+        // rows advances. An order by anything else would leave a bounded caller
+        // re-reading the same head of the set.
+        Self::entries(
+            sqlx::query(&format!(
+                "SELECT {ROW_COLUMNS} FROM change_ledger \
+                 WHERE state = 'retired' AND retire_reason = 'surface_moved' \
+                 ORDER BY retired_at ASC NULLS FIRST, first_seen_at ASC \
+                 LIMIT $1"
+            ))
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await,
+        )
+    }
+
     async fn record_reopen(&self, reopen: &ChangeReopen) -> SFResult<()> {
         sqlx::query(RECORD_REOPEN_SQL)
             .bind(&reopen.identity.kind)

@@ -194,6 +194,25 @@ const MEASUREMENTS_PER_PASS: usize = 200;
 /// not fit rather than their freshness.
 const TOUCHED_PER_PASS: usize = MEASUREMENTS_PER_PASS;
 
+/// How many retired rows one pass asks whether their surface came back.
+///
+/// This bound is of a different kind from the batches above, and the difference
+/// is stated rather than blurred. Those batches rotate: the write a row's answer
+/// produces moves it to the back, so a bound is a delay. Here a row whose scope
+/// is still absent writes nothing -- deliberately, because writing a "still
+/// gone" marker every pass would touch every retired row forever and make the set
+/// never quiet -- so the same rows sit at the head of the order every pass, and a
+/// retirement set larger than this bound would ask its oldest rows forever and
+/// never reach the rest.
+///
+/// So this bound is a coverage bound and it has to be larger than the set, not a
+/// slice of it. It is set well above the set measured when this was written (58
+/// rows) so that ordinary growth stays inside it, and the pass warns when it
+/// reads a full batch, which is the only signal that the assumption has been
+/// outgrown. What that warning asks for is a rotation key in the read (a cursor
+/// persisted with the row), not a larger number here.
+const RETIRED_RECHECK_PER_PASS: usize = 500;
+
 /// How many owed rows one pass hands over.
 ///
 /// The same bound, of the same shape, as the three folds above: a pass is a
@@ -1812,6 +1831,10 @@ async fn measure_pass(
         // outcome: the row is no longer landed, and reading it as a rechecked
         // row would say the claim still held.
         landed_retired = reopened_pass.retired,
+        // The other direction, and the reason a retirement is not a verdict
+        // about the account: a surface that came back makes the row answerable
+        // again, and this is the count of rows that stopped being retired.
+        landed_restored = reopened_pass.restored,
         // The landed half of the same two readings the outstanding pass already
         // gives. A row that cannot be settled keeps its old `measured_at`, so
         // without these two numbers the staleness order reads the same whether a
@@ -1847,6 +1870,12 @@ struct ReopenPass {
     /// retirement is what the history answered, and a pass that retires rows is
     /// not a pass that found their claims still holding.
     retired: usize,
+    /// Retired rows whose scope is back in the tree and which were measured
+    /// again. The mirror image of `retired`: one count says a surface left, the
+    /// other says it came back, and a retirement that nothing could undo would
+    /// make the first count a statement about the account rather than about the
+    /// tree it was reading when it said so.
+    restored: usize,
 }
 
 /// Ask the rows the account calls done whether that is still true.
@@ -1892,6 +1921,12 @@ async fn reopen_pass(
     unsettled: &mut HashMap<ChangeIdentity, UnsettledCheck>,
     changed: &[String],
 ) -> ReopenPass {
+    // Asked before the landed sweep and independently of it: the quota below is
+    // derived from how many rows are landed and is zero when there are none, but
+    // a retired row is answerable again regardless of how many rows are left to
+    // check. Tying the two would mean an account whose only movement is a surface
+    // returning never asking about it.
+    let mut pass = restore_retired(store, tree, snapshot).await;
     let landed = match store.census().await {
         Ok(census) => census
             .iter()
@@ -1903,12 +1938,12 @@ async fn reopen_pass(
                 error = %e,
                 "change ledger: the census could not be read, so no landed row was re-asked"
             );
-            return ReopenPass::default();
+            return pass;
         }
     };
     let quota = reopen_quota(landed, CHANGE_LEDGER_PASS_INTERVAL, REOPEN_BOUND);
     if quota == 0 {
-        return ReopenPass::default();
+        return pass;
     }
     // The batch is widened by the rows already known unsettleable, the same way
     // the outstanding pass widens its own, and for the same reason: a row whose
@@ -1928,7 +1963,7 @@ async fn reopen_pass(
                 error = %e,
                 "change ledger: the landed set could not be read, so nothing was re-asked"
             );
-            return ReopenPass::default();
+            return pass;
         }
     };
 
@@ -1961,7 +1996,6 @@ async fn reopen_pass(
     }
 
     let now = Instant::now();
-    let mut pass = ReopenPass::default();
     for row in rows {
         // The same window the outstanding pass keeps, for the same reason: a row
         // whose check cannot be settled keeps its old `measured_at`, so it would
@@ -2126,6 +2160,107 @@ async fn reopen_pass(
         }
     }
     ReopenPass { touched, ..pass }
+}
+
+/// Ask the rows settled as retired because their scope left whether it is back.
+///
+/// Retirement is a fact about the history, and the history keeps moving. A
+/// surface moved out can be moved back, and the row settled at its exit revision
+/// becomes answerable again the moment the bytes return. Without this read,
+/// retirement would be the one terminal state nothing could falsify: a row would
+/// keep saying the surface is gone while the surface sits in the head of the
+/// line, and the only way to notice would be for a person to remember the
+/// retirement and go looking.
+///
+/// The question is asked in two steps and only the second one writes. Whether
+/// the scope is in the tree is a cheap look and the answer for most rows is
+/// still no; writing a "still gone" marker for those would touch every retired
+/// row on every pass and leave the set never quiet. Only a row whose scope is
+/// back is measured, and the measurement is what takes it out of the retirement
+/// set -- by the row's state changing rather than by anything this pass
+/// remembers, so a restart loses no cursor.
+///
+/// A scope that is back but whose check still cannot be settled keeps its
+/// retirement. The retirement says the surface left at a named revision and that
+/// is still true of that revision; the new question has no answer yet, and the
+/// answer, not the asking, is what moves a row.
+async fn restore_retired(
+    store: &dyn ChangeLedgerStore,
+    tree: &CheckTree,
+    snapshot: &Snapshot,
+) -> ReopenPass {
+    let mut pass = ReopenPass::default();
+    let rows = match store.retired_surface_moved(RETIRED_RECHECK_PER_PASS).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the retired set could not be read, so no retirement was                  questioned this pass"
+            );
+            return pass;
+        }
+    };
+    if rows.len() == RETIRED_RECHECK_PER_PASS {
+        warn!(
+            bound = RETIRED_RECHECK_PER_PASS,
+            "change ledger: the retired set filled the pass's read, so rows beyond it are not              being re-asked at all -- the bound is coverage here, not a slice, and it needs to              grow or the read needs a rotation key before the set does"
+        );
+    }
+    for row in rows {
+        match tree.scope_present(snapshot, &row.identity).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                warn!(
+                    change = %row.identity,
+                    error = %e,
+                    "change ledger: a retired row's scope could not be looked for in the tree,                      so the row keeps its retirement"
+                );
+                continue;
+            }
+        }
+        let outcome = tree.judge(snapshot, &row.identity).await;
+        let Some(state) = outcome.state() else {
+            warn!(
+                change = %row.identity,
+                reason = outcome.reason().map(|r| r.as_str()).unwrap_or("none"),
+                why = outcome.why().unwrap_or("the look settled nothing and gave no reason"),
+                revision = %snapshot.rev(),
+                "change ledger: a retired row's scope is back, but its check still cannot be                  settled; the row keeps its retirement, which is still true of the revision it                  names"
+            );
+            continue;
+        };
+        let measurement = match state {
+            ChangeState::Undecided => ChangeMeasurement::undecided(
+                row.identity.clone(),
+                outcome
+                    .reason()
+                    .expect("an undecided state is reached only through a reason")
+                    .as_str(),
+            )
+            .at_revision(snapshot.rev()),
+            _ => ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev()),
+        };
+        match store.apply_measurement(&measurement).await {
+            Ok(()) => {
+                pass.restored += 1;
+                warn!(
+                    change = %row.identity,
+                    state = state.as_str(),
+                    retired_measured_rev = row.measured_rev.as_deref().unwrap_or("none"),
+                    revision = snapshot.rev(),
+                    "change ledger: a retired row's scope is back in the tree, so the row is                      measured again; its retirement was true of the revision the surface left                      at, not of the tree now"
+                );
+            }
+            Err(e) => warn!(
+                change = %row.identity,
+                state = state.as_str(),
+                error = %e,
+                "change ledger: a retired row's scope is back, but the new measurement could not                  be written, so the row keeps its retirement"
+            ),
+        }
+    }
+    pass
 }
 
 /// Check the account's landed rows against the revision the workloads are
@@ -4649,6 +4784,18 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn retired_surface_moved(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
+            Ok(self
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.state == ChangeState::Retired
+                        && row.retire_reason == Some(RetireReason::SurfaceMoved)
+                })
+                .take(limit)
+                .cloned()
+                .collect())
+        }
         async fn record_reopen(&self, _reopen: &ChangeReopen) -> SFResult<()> {
             Ok(())
         }
@@ -4983,6 +5130,54 @@ mod tests {
         (dir, exited)
     }
 
+    /// A repository in which one file was present, deleted, and then put back,
+    /// with the deletion and the return separated by a commit that touched
+    /// something else.
+    ///
+    /// The gap is the shape the real account has and the one that makes the two
+    /// facts different: "the scope is absent" was true at the revision that
+    /// retired the row and is false at the tip, and neither revision is the
+    /// deletion commit. The literal is written into the restored file so the
+    /// check has something to find; a literal absent from it is the same fixture
+    /// with a predicate that does not hold.
+    fn repo_with_a_restored_scope(literal: &str) -> (tempfile::TempDir, String) {
+        let (dir, bare, work) = scratch_repo();
+        std::fs::create_dir_all(std::path::Path::new(&work).join("crates"))
+            .expect("the fixture directory");
+        std::fs::write(std::path::Path::new(&work).join("crates/gone.rs"), "here")
+            .expect("the fixture file");
+        std::fs::write(std::path::Path::new(&work).join("crates/stays.rs"), "here")
+            .expect("the fixture file");
+        commit_all(&bare, &work, "fixture");
+        std::fs::remove_file(std::path::Path::new(&work).join("crates/gone.rs"))
+            .expect("the fixture file can be removed");
+        let exited = commit_all(&bare, &work, "remove the surface");
+        std::fs::write(
+            std::path::Path::new(&work).join("crates/stays.rs"),
+            "moved on",
+        )
+        .expect("the fixture file");
+        commit_all(&bare, &work, "move on");
+        std::fs::write(
+            std::path::Path::new(&work).join("crates/gone.rs"),
+            format!("back\n{literal}\n"),
+        )
+        .expect("the fixture file");
+        commit_all(&bare, &work, "the surface returns");
+        (dir, exited)
+    }
+
+    /// A row already settled as retired because its scope left the tree.
+    fn retired_row(scope: &str, measured_rev: Option<&str>) -> ChangeLedgerRow {
+        ChangeLedgerRow {
+            state: ChangeState::Retired,
+            measured_rev: measured_rev.map(str::to_string),
+            retire_reason: Some(RetireReason::SurfaceMoved),
+            retired_at: Some(Utc.timestamp_opt(1_760_000_100, 0).unwrap()),
+            ..pending_row(scope)
+        }
+    }
+
     /// A landed row that names the revision it was measured at.
     fn landed_row(scope: &str, measured_rev: Option<&str>) -> ChangeLedgerRow {
         ChangeLedgerRow {
@@ -5195,6 +5390,117 @@ mod tests {
             retirement.measured_rev.as_deref(),
             Some(snapshot.rev()),
             "the deletion commit and the tree read are different revisions here, so the\n             assertion above is about the history and not about the tip"
+        );
+    }
+
+    /// A retired row whose scope came back is measured again.
+    ///
+    /// `landed` names the deletion commit and is true of it; the surface is not
+    /// gone from the tree. Without this read nothing in the account would ask
+    /// again -- the row is out of the outstanding set by state and out of the
+    /// landed set by state -- so the retirement would be the account's last word
+    /// about a tree that no longer matches it.
+    #[tokio::test]
+    async fn a_retired_row_whose_scope_came_back_is_measured_again() {
+        let (dir, exited) = repo_with_a_restored_scope("fn thing");
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = tree.snapshot().await.expect("the fixture is readable");
+        let store = FakeLedger {
+            rows: vec![retired_row("crates/gone.rs", Some(&exited))],
+            ..Default::default()
+        };
+        let mut unsettled = HashMap::new();
+
+        let pass = reopen_pass(&store, &tree, &snapshot, &mut unsettled, &[]).await;
+
+        assert_eq!(
+            pass.restored, 1,
+            "the retired row's scope is back, so it was measured again"
+        );
+        assert_eq!(
+            pass.retired, 0,
+            "the row is already retired; the pass that questions a retirement does not \
+             write another one"
+        );
+        let measurements = store.measurements();
+        assert_eq!(measurements.len(), 1, "the new measurement was written");
+        assert_eq!(
+            measurements[0].state,
+            ChangeState::Landed,
+            "the restored surface holds the check: {:?}",
+            measurements[0]
+        );
+        assert_eq!(
+            measurements[0].measured_rev.as_deref(),
+            Some(snapshot.rev()),
+            "the new measurement names the tree it read, not the revision the surface left at"
+        );
+        assert_ne!(
+            measurements[0].measured_rev.as_deref(),
+            Some(exited.as_str()),
+            "the two revisions are different in this fixture, so the assertion above is about \
+             the tree and not about the retirement's carried revision"
+        );
+    }
+
+    /// A retired row whose scope is still gone writes nothing.
+    ///
+    /// The read reaches every retired row every pass, so a pass that wrote
+    /// "still absent" would touch the whole set forever: the rows would never be
+    /// quiet and the write would be a fact about the pass rather than about the
+    /// tree. Silence is the answer here, and the count says the pass looked.
+    #[tokio::test]
+    async fn a_retired_row_whose_scope_is_still_gone_is_left_alone() {
+        let (dir, exited) = repo_with_a_deleted_scope();
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = tree.snapshot().await.expect("the fixture is readable");
+        let store = FakeLedger {
+            rows: vec![retired_row("crates/gone.rs", Some(&exited))],
+            ..Default::default()
+        };
+        let mut unsettled = HashMap::new();
+
+        let pass = reopen_pass(&store, &tree, &snapshot, &mut unsettled, &[]).await;
+
+        assert_eq!(pass.restored, 0, "the scope is still absent");
+        assert!(
+            store.measurements().is_empty(),
+            "nothing was settled, so nothing was written: {:?}",
+            store.measurements()
+        );
+    }
+
+    /// A restored scope whose predicate no longer holds is measured to that
+    /// answer rather than left retired.
+    ///
+    /// The question the second look asks is the ordinary one -- does the check
+    /// hold at this revision -- and its answer is whatever the judge says. The
+    /// retirement said the surface left, which is why the row is here at all;
+    /// it does not say the surface came back holding what was asked of it.
+    #[tokio::test]
+    async fn a_restored_scope_that_no_longer_holds_is_measured_to_its_new_answer() {
+        let (dir, exited) = repo_with_a_restored_scope("fn something else");
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = tree.snapshot().await.expect("the fixture is readable");
+        let store = FakeLedger {
+            rows: vec![retired_row("crates/gone.rs", Some(&exited))],
+            ..Default::default()
+        };
+        let mut unsettled = HashMap::new();
+
+        let pass = reopen_pass(&store, &tree, &snapshot, &mut unsettled, &[]).await;
+
+        assert_eq!(
+            pass.restored, 1,
+            "the scope is back, so the row was asked again"
+        );
+        let measurements = store.measurements();
+        assert_eq!(measurements.len(), 1, "the new answer was written");
+        assert_eq!(
+            measurements[0].state,
+            ChangeState::Pending,
+            "the file is back without the literal: {:?}",
+            measurements[0]
         );
     }
 

@@ -556,6 +556,31 @@ impl CheckTree {
         Ok((!rev.is_empty()).then(|| rev.to_string()))
     }
 
+    /// Whether this check's scope is in the tree at the snapshot's revision.
+    ///
+    /// The counterpart of [`Self::scope_left_at`]: retirement says a surface
+    /// left, and a surface can come back. A row retired at the exit revision
+    /// has nothing left to measure *at that revision* — the ground of its
+    /// retirement is still true — but the tree moves, and a row whose scope is
+    /// back is answerable again. This is the read that lets the reopen pass ask
+    /// that, and it asks the snapshot the pass is already measuring rather than
+    /// the history, because the question is "is it here now", not "did it ever
+    /// leave".
+    ///
+    /// An empty scope or `.` names the whole tree, which never leaves, so the
+    /// answer is `true` without a `git` call — the same shortcut the judge takes.
+    pub async fn scope_present(
+        &self,
+        snapshot: &Snapshot,
+        identity: &ChangeIdentity,
+    ) -> Result<bool, String> {
+        let scope = scope_of(identity);
+        if scope.is_empty() || scope == "." {
+            return Ok(true);
+        }
+        self.has(snapshot.rev(), scope).await
+    }
+
     /// The most recent `limit` commits on the reference, one record per commit:
     /// the revision, a unit separator, the body, and a record separator.
     ///

@@ -762,6 +762,26 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// and an upserted row would only ever answer the last of them.
     async fn record_reopen(&self, reopen: &ChangeReopen) -> SFResult<()>;
 
+    /// The rows settled as retired because their scope had left the tree,
+    /// oldest retirement first.
+    ///
+    /// A retirement is a statement about the history -- "the deletion commit
+    /// took this surface out" -- and it is true of the past, not of the tree
+    /// that follows. A revert, a branch switch, or a surface moved out and back
+    /// brings the scope into the tree again, and every read that could notice
+    /// excludes these rows by design: [`Self::landed_due`] reads `landed`, and
+    /// [`Self::outstanding`] excludes `retired` because "its question is
+    /// answered". A returned surface falsifies that ground, and without this
+    /// read nothing in the account would ever ask again -- the row would keep
+    /// saying its surface is gone while the tree holds it.
+    ///
+    /// This read is the finding only; whether the scope is actually back is a
+    /// question for the caller's tree, because that is where the answer lives.
+    /// Ordered by `retired_at` so a bounded caller sweeps the set rather than
+    /// re-asking the same head of it forever: a retirement that is still true
+    /// has no measurement to advance, so nothing else in the order moves.
+    async fn retired_surface_moved(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>>;
+
     /// Record that a commit delivered this row's change, and which commit.
     ///
     /// Written from a reader of the line, not from the landing process: the
