@@ -284,6 +284,29 @@ async fn run(cmd: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// `run` with a document on stdin: `kubectl apply -f -` reads its objects from
+/// the pipe, so nothing is written to a temporary file whose lifetime or path
+/// could become the thing that is wrong.
+async fn run_with_stdin(cmd: &str, args: &[&str], input: &str) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("无法执行 {cmd}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(input.as_bytes())
+            .await
+            .with_context(|| format!("无法把清单写给 {cmd}"))?;
+    }
+    let status = child.wait().await?;
+    if !status.success() {
+        bail!("{cmd} {:?} 退出码 {:?}", args, status.code());
+    }
+    Ok(())
+}
+
 async fn command_exists(cmd: &str) -> bool {
     Command::new(cmd)
         .arg("--version")
@@ -555,6 +578,73 @@ async fn node_io_subcommand() -> Result<()> {
     };
     let disk = cogneva_bootstrap::node_disk_io(rate, mem_total_mb);
     write_node_io_sysctl_dropin(&disk, &reading).await
+}
+
+/// `governance`: put the tree's ResourceQuota/LimitRange onto the cluster.
+///
+/// The two faces that could carry them both decline by design. The rollout loop
+/// skips governance kinds, because replaying a committed default every revision
+/// would overwrite a ceiling someone tuned. The install face applies the whole
+/// rendered directory, but only while installing — and re-running the installer
+/// on a live cluster is not something an operator does to move one number.
+///
+/// So a ceiling raised in the tree has no carrier between those moments, and the
+/// cluster keeps admitting against the old one. This command is the carrier. It
+/// reads the number from the rendered artifacts and from nowhere else: an
+/// environment override here would recreate exactly the gap it exists to close.
+///
+/// Refusing an empty selection matters. A profile whose `resourceGovernance` is
+/// disabled renders no such object, so "nothing to apply" and "applied" would
+/// otherwise print the same success while the cluster stayed untouched.
+async fn governance_subcommand() -> Result<()> {
+    let repo_root = std::env::var("COGNEVA_REPO_ROOT").unwrap_or_else(|_| ".".into());
+    let profile = match std::env::var("COGNEVA_GOVERNANCE_PROFILE") {
+        Ok(name) if !name.trim().is_empty() => name.trim().to_string(),
+        _ => {
+            // 探测而不是 `detect_profile`：后者在非 K3s 分支里会顺手建默认
+            // StorageClass，而这条命令除了 apply 什么都不该改。
+            if !probe_is_k3s().await {
+                bail!(
+                    "当前集群不是 K3s，调不出对应的渲染产物：\
+                     请用 COGNEVA_GOVERNANCE_PROFILE 指定 k3s-single / k3s-multi / k8s-standard"
+                );
+            }
+            if probe_nodes().await > 1 {
+                "k3s-multi".to_string()
+            } else {
+                "k3s-single".to_string()
+            }
+        }
+    };
+    let dir = Path::new(&repo_root).join("deploy/rendered").join(&profile);
+    let mut files: Vec<(String, String)> = Vec::new();
+    let entries = std::fs::read_dir(&dir)
+        .with_context(|| format!("渲染产物目录不存在或不可读：{}", dir.display()))?;
+    for entry in entries {
+        let path = entry?.path();
+        let is_manifest = matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("yaml") | Some("yml")
+        );
+        if is_manifest {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("读不了 {}", path.display()))?;
+            files.push((path.display().to_string(), text));
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let docs =
+        cogneva_bootstrap::governance_documents(&files).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if docs.trim().is_empty() {
+        bail!(
+            "{} 里没有 ResourceQuota/LimitRange：这个 profile 未声明治理对象\
+             （resourceGovernance.enabled=false），没有可投射的东西",
+            dir.display()
+        );
+    }
+    let objects = docs.split("---\n").filter(|d| !d.trim().is_empty()).count();
+    info!(profile = %profile, objects, "apply 渲染产物里的治理对象");
+    run_with_stdin("kubectl", &["apply", "-f", "-"], &docs).await
 }
 
 /// Report the nodes whose allocatable memory equals their capacity.
@@ -3175,7 +3265,7 @@ async fn main() -> Result<()> {
             println!("cogneva-bootstrap {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        cli::Command::Run | cli::Command::NodeIo => {}
+        cli::Command::Run | cli::Command::NodeIo | cli::Command::Governance => {}
     }
 
     tracing_subscriber::fmt()
@@ -3207,6 +3297,14 @@ async fn main() -> Result<()> {
         let assets = materialize_assets()?;
         std::env::set_var("COGNEVA_REPO_ROOT", &assets);
         info!("部署资产已从二进制内嵌内容解包 → {}", assets.display());
+    }
+
+    // `governance` reads the rendered tree and talks to the cluster; it stops
+    // here, before the install path's hardware probing, host directories and
+    // root requirement. It sits after asset unpacking so a prebuilt binary has
+    // a tree to read, and before anything that would provision one.
+    if command == cli::Command::Governance {
+        return governance_subcommand().await;
     }
 
     #[cfg(not(target_os = "linux"))]

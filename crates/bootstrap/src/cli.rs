@@ -26,6 +26,17 @@ pub enum Command {
     /// This subcommand is the same derivation and the same write, reachable
     /// without the install.
     NodeIo,
+    /// Apply the rendered ResourceQuota/LimitRange to the cluster, installing
+    /// nothing else.
+    ///
+    /// The rollout loop skips governance kinds on purpose (replaying a committed
+    /// default every revision would overwrite a ceiling someone tuned), and the
+    /// install face applies them only while installing. A ceiling raised in the
+    /// tree therefore has no carrier between installs: the cluster keeps
+    /// admitting against the old number. This command is that carrier, and it
+    /// takes the number from the rendered artifacts rather than from any
+    /// environment variable, so what lands is the tree's own copy.
+    Governance,
     Help,
     Version,
 }
@@ -43,7 +54,8 @@ Cogneva 元启动引导器
 
 用法：
     cogneva-bootstrap [选项]
-    cogneva-bootstrap node-io   只用环境变量重写宿主脏页水位，不安装任何东西
+    cogneva-bootstrap node-io     只用环境变量重写宿主脏页水位，不安装任何东西
+    cogneva-bootstrap governance  把渲染产物里的 ResourceQuota/LimitRange apply 到集群
 
 不带选项即开始安装。安装参数一律经环境变量传入，不认参数即拒绝执行：
 
@@ -52,6 +64,13 @@ Cogneva 元启动引导器
 写入只在「集群还没起」时执行，所以宿主一旦有集群，那份文件就再也不会由安装产生——代码在
 树里、文件不在盘上，两边看起来都像已经做了。这个子命令走同一个推导、同一个写入口，不需要
 装任何东西；`COGNEVA_NODE_IO_*` 五个变量在这里全部必需。
+
+`governance` 只做一件事：从 `deploy/rendered/<profile>/` 里挑出 `ResourceQuota` 与
+`LimitRange` 两份多文档清单，原样 `kubectl apply`。部署循环有意不投射这两类对象（每
+rev 重放会把有人调过的天花板覆盖回去），安装面又只在装的时候 apply 一次，所以树里
+抬高的额度在两次安装之间没有任何载体；这条子命令就是那个载体。profile 默认按当前
+集群探测，可用 `COGNEVA_GOVERNANCE_PROFILE` 指定；治理面关掉的 profile 没有可 apply
+的对象，这时它以非零退出，而不是报一个「空的成功」。
 
     COGNEVA_CN_MIRROR=1              强制国内镜像路径（0 强制海外），缺省自动探测
     COGNEVA_BOOTSTRAP_NONINTERACTIVE=1   全程不提问（无人值守）
@@ -99,6 +118,8 @@ impl Command {
             // reason the install rejects arguments it does not understand.
             Some("node-io") if args.len() == 1 => Ok(Self::NodeIo),
             Some("node-io") => Err(args[1].clone()),
+            Some("governance") if args.len() == 1 => Ok(Self::Governance),
+            Some("governance") => Err(args[1].clone()),
             Some(first) => Err(first.to_string()),
         }
     }
@@ -139,6 +160,17 @@ mod tests {
     }
 
     #[test]
+    fn governance_is_a_subcommand_with_no_operands() {
+        // Same shape as node-io: the operand it needs (which profile) is an
+        // environment variable, so a second word is refused by name rather
+        // than dropped -- a caller who wrote `governance k3s-multi` must not
+        // get a successful apply of the detected profile instead.
+        assert_eq!(parse(&["governance"]), Ok(Command::Governance));
+        assert_eq!(parse(&["governance", "k3s-multi"]), Err("k3s-multi".into()));
+        assert_eq!(parse(&["governance2"]), Err("governance2".into()));
+    }
+
+    #[test]
     fn an_unknown_argument_is_an_error_not_an_install() {
         // The shape `bootstrap.sh` hands over sits in this list: it used to
         // forward its own operands verbatim, so anything a user typed reached
@@ -167,6 +199,7 @@ mod tests {
             "COGNEVA_IMAGE_REGISTRY",
             "COGNEVA_IMAGE_URL",
             "COGNEVA_REPO_ROOT",
+            "COGNEVA_GOVERNANCE_PROFILE",
             "COGNEVA_NODE_IO_WRITE_BYTES_PER_SEC",
             "COGNEVA_NODE_IO_DEVICE",
             "COGNEVA_NODE_IO_WINDOW",

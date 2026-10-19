@@ -757,6 +757,71 @@ fn parse_kib(value: &str) -> Option<u64> {
     value.strip_suffix("Ki")?.parse().ok()
 }
 
+/// Select the governance objects out of the rendered manifests and return them
+/// as one multi-document YAML ready for `kubectl apply -f -`.
+///
+/// Resource ceilings are the operator's: the rollout loop skips these kinds on
+/// purpose, because replaying a committed default every revision would
+/// overwrite a number someone tuned. The install face applies the whole
+/// directory once, so between two installs a ceiling raised in the tree has no
+/// carrier at all — the cluster keeps admitting against the old number, and a
+/// reading that asks "does it fit" answers yes on either copy.
+///
+/// Input order is preserved (rendered files sort by name, so the same tree
+/// produces the same sequence), and an empty result is a value the caller must
+/// refuse rather than an apply of nothing: a profile with governance disabled
+/// renders no such object, and "there was nothing to apply" must not print the
+/// same success as "it was applied".
+pub fn governance_documents(files: &[(String, String)]) -> Result<String, String> {
+    let mut out = String::new();
+    for (name, text) in files {
+        for chunk in split_yaml_documents(text) {
+            if chunk.trim().is_empty() {
+                continue;
+            }
+            let value: serde_yaml::Value =
+                serde_yaml::from_str(chunk).map_err(|e| format!("{name}: 解析 YAML 失败：{e}"))?;
+            match value.get("kind").and_then(|k| k.as_str()) {
+                Some("ResourceQuota") | Some("LimitRange") => {
+                    let doc = serde_yaml::to_string(&value)
+                        .map_err(|e| format!("{name}: 重新序列化失败：{e}"))?;
+                    out.push_str(&doc);
+                    if !doc.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str("---\n");
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Split a manifest file on `---` separator lines. A separator carries nothing
+/// of its own, so an empty leading chunk (files that start with `---`) is
+/// dropped by the caller for the same reason an empty trailing one is.
+fn split_yaml_documents(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        if line.trim_end() == "---" {
+            let chunk = &text[start..offset];
+            if !chunk.trim().is_empty() {
+                out.push(chunk);
+            }
+            start = offset + line.len();
+        }
+        offset += line.len();
+    }
+    let tail = &text[start..];
+    if !tail.trim().is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1231,6 +1296,51 @@ mod tests {
         // A line in another unit is not the reading this parses; dropping it
         // must not leave a zero-valued node that reads as "holds back nothing".
         assert!(parse_node_memory_accounts("cogneva   65741456Mi   65741456Mi\n").is_empty());
+    }
+
+    /// 渲染产物里只有治理对象该进这份 apply 输入：Secret 混入是红线，工作负载、
+    /// ConfigMap 都不属于这张面。顺序按输入给（调用方先按文件名排序），所以同一
+    /// 棵树每次产出同一份字节，重复 apply 不产生无谓的 last-applied 变化。
+    #[test]
+    fn governance_documents_take_only_the_operator_owned_kinds() {
+        let files = vec![
+            (
+                "01-resourcequota.yaml".to_string(),
+                "# generated\napiVersion: v1\nkind: ResourceQuota\nmetadata:\n  name: cogneva-quota\n  annotations:\n    cogneva.io/runtime-pods-limits-cpu: \"3\"\nspec:\n  hard:\n    limits.memory: 52Gi\n".to_string(),
+            ),
+            (
+                "02-limitrange.yaml".to_string(),
+                "---\napiVersion: v1\nkind: LimitRange\nmetadata:\n  name: cogneva-limits\nspec:\n  limits:\n    - type: Container\n      default:\n        memory: 512Mi\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: not-governance\n".to_string(),
+            ),
+            (
+                "41-deployment.yaml".to_string(),
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: cogneva\n".to_string(),
+            ),
+        ];
+        let out = governance_documents(&files).unwrap();
+        let kinds: Vec<String> = out
+            .split("\n---")
+            .filter_map(|d| {
+                let v: serde_yaml::Value = serde_yaml::from_str(d).ok()?;
+                v.get("kind").and_then(|k| k.as_str()).map(str::to_string)
+            })
+            .collect();
+        assert_eq!(kinds, vec!["ResourceQuota", "LimitRange"]);
+        // 引号里的 "3" 过了序列化仍是字符串，不会变成 3：注解的值是字符串面。
+        assert!(out.contains("runtime-pods-limits-cpu"));
+        assert!(!out.contains("not-governance"));
+        assert!(!out.contains("Deployment"));
+    }
+
+    /// 没有治理对象时返回空串，不返回一份看似成功的空 apply——调用方靠这个值
+    /// 报错（profile 关掉了 governance 与「apply 过」不是同一件事）。
+    #[test]
+    fn governance_documents_are_empty_when_the_profile_declares_none() {
+        let files = vec![(
+            "10-configmap.yaml".to_string(),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\n".to_string(),
+        )];
+        assert_eq!(governance_documents(&files).unwrap(), "");
     }
 
     #[test]
