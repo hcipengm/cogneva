@@ -3464,12 +3464,47 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
     drill
 }
 
+/// 口令与包的实际状态对不上时，演练不能判绿。
+///
+/// 为什么这由演练来问：它是唯一同时拿着口令、又看得见包头的进程。写端在没拿到口令
+/// 时照写明文、只留一条 warn，于是「加密开关打开了」在部署字段里成立、在盘上不成立
+/// 的那一刻，没有任何读数会红——除非演练在这里拦一下。反过来，包已经是密文而演练
+/// 这一跑没有口令时，它同样证明不了今晚这份装得回去。
+fn encryption_effect_mismatch(keyed: bool, newest_encrypted: bool) -> Option<&'static str> {
+    match (keyed, newest_encrypted) {
+        (true, false) => Some(
+            "演练这一跑带着口令，但卷上最新那份包是明文：写端没拿到 COGNEVA_BACKUP_PACKAGE_KEY，加密没有生效",
+        ),
+        (false, true) => Some(
+            "卷上最新那份包是密文，但演练这一跑没有口令：这一份装不回去，演练证明不了今晚的备份",
+        ),
+        _ => None,
+    }
+}
+
+/// 读最新那份包的头，把「口令在不在」和「包是不是密文」对一遍。读文件这一半单独
+/// 拿出来，是因为「判断写对了」和「判断接上了」是两件事：只测纯函数的话，调用点
+/// 漏掉也照样全绿。
+fn newest_package_key_mismatch(newest: &Path, keyed: bool) -> std::io::Result<Option<String>> {
+    let encrypted = crate::backup_crypto::package_is_encrypted(newest)?;
+    Ok(encryption_effect_mismatch(keyed, encrypted)
+        .map(|reason| format!("{reason}（最新一份：{}）", newest.display())))
+}
+
 async fn drill_once(
     cfg: &DrillConfig,
     live: &PgPool,
     packages: Vec<PathBuf>,
     drill: &mut BackupDrillRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // 问的是卷上最新那份，不是这一趟打开的：轮换窗口里旧包本来就是明文，点名去开
+    // 一份旧包不能替最新那份回答「写端到底用没用口令」。
+    if let Some(newest) = packages.last() {
+        let keyed = crate::backup_crypto::PackageKey::from_env().is_some();
+        if let Some(reason) = newest_package_key_mismatch(newest, keyed)? {
+            return Err(reason.into());
+        }
+    }
     let package = choose_package(&packages, cfg.package.as_deref())
         .map_err(|e| format!("{}：{e}", cfg.backup_dir.display()))?;
     let name = package
@@ -4067,6 +4102,43 @@ mod tests {
             chosen, packages[1],
             "不点名时开最新那份，行为与加这个参数之前一致"
         );
+    }
+
+    #[test]
+    fn a_drill_that_cannot_match_the_key_to_the_package_refuses_to_judge() {
+        // 「加密开了」最容易被误报成已生效的形状：部署里配了口令，而盘上最新那份
+        // 仍是明文。写端只留一条 warn，这一跑如果照旧判绿，就没人会知道。
+        assert!(encryption_effect_mismatch(true, false).is_some());
+        // 反方向同样是「装不回去」：包是密文，而这台机器没有口令。
+        assert!(encryption_effect_mismatch(false, true).is_some());
+        // 两种对得上：都配了，或都没有——后一种是打开加密之前的老安装。
+        assert!(encryption_effect_mismatch(true, true).is_none());
+        assert!(encryption_effect_mismatch(false, false).is_none());
+
+        // 只有纯函数被调用不算数：调用点读的是**盘上那份文件的头**。这里用真的
+        // 文件走一遍，两个方向都问一次。
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.tar.zst");
+        std::fs::write(&plain, b"not an encrypted package").unwrap();
+        let reason = newest_package_key_mismatch(&plain, true)
+            .unwrap()
+            .expect("口令在、包是明文，演练必须拒绝判绿");
+        assert!(reason.contains("明文"), "reason={reason}");
+        assert!(newest_package_key_mismatch(&plain, false)
+            .unwrap()
+            .is_none());
+
+        let sealed = dir.path().join("sealed.tar.zst");
+        let mut bytes = crate::backup_crypto::MAGIC.to_vec();
+        bytes.extend_from_slice(&[0u8; 16]);
+        std::fs::write(&sealed, &bytes).unwrap();
+        assert!(newest_package_key_mismatch(&sealed, true)
+            .unwrap()
+            .is_none());
+        let reason = newest_package_key_mismatch(&sealed, false)
+            .unwrap()
+            .expect("包是密文、这一跑没口令，演练必须拒绝判绿");
+        assert!(reason.contains("密文"), "reason={reason}");
     }
 
     #[test]
