@@ -21,9 +21,9 @@ use std::error::Error;
 use chrono::{DateTime, Utc};
 
 use cog_core::{
-    Decision, DecisionMode, DecisionSpec, DecisionState, GovernanceStore, Handover, HandoverSpec,
-    HandoverState, Signature, TaskStatus, TieBreak, Vote, DECISION_TASK_TYPE, HANDOVER_TASK_TYPE,
-    VOTE_TASK_TYPE,
+    append_decision_event, verify_decision_chain, ChainVerdict, Decision, DecisionMode,
+    DecisionSpec, DecisionState, GovernanceStore, Handover, HandoverSpec, HandoverState, Signature,
+    TaskStatus, TieBreak, Vote, DECISION_TASK_TYPE, HANDOVER_TASK_TYPE, VOTE_TASK_TYPE,
 };
 use cog_orchestrator::governance_acts::{
     backfill_ballot, close_ballot, decision_task, handover_task, tally, validate_ballot,
@@ -54,6 +54,9 @@ VOTE — a question the principles do not settle on their own.
     cast --decision <id> --unit <unit> --option <opt>
     withdraw --decision <id> --unit <unit>
     close --decision <id>
+    verify --decision <id>
+         Recompute the decision's history and report whether it still verifies.
+         An event that was edited, removed or reordered exits non-zero.
     list [--json]
     backfill --replies <dir> --subject <text> --kind <kind> --option <opt> ...
              --status-quo <opt> --deadline <rfc3339>
@@ -118,6 +121,10 @@ pub enum Act {
     },
     VoteList {
         json: bool,
+    },
+    /// Recompute a decision's history and say whether it still verifies.
+    VoteVerify {
+        decision: String,
     },
     /// Put a vote that predates the ledger into it, with its provenance said
     /// out loud. The replies are the bytes that were actually cast; the rules
@@ -249,6 +256,9 @@ pub fn parse_args(args: &[String]) -> Result<Act, String> {
         }),
         ("vote", "list") => Ok(Act::VoteList {
             json: flags.iter().any(|f| f == "--json"),
+        }),
+        ("vote", "verify") => Ok(Act::VoteVerify {
+            decision: required("--decision")?,
         }),
         ("vote", "backfill") => Ok(Act::VoteBackfill {
             replies: required("--replies")?,
@@ -531,8 +541,21 @@ pub async fn run(
                 DecisionMode::Principle => validate_principle(&spec)?,
             }
             let id = format!("decision:{}:{}", kind, now.timestamp_millis());
-            let task = decision_task(&id, spec, state.status(), now);
+            let task = decision_task(&id, spec.clone(), state.status(), now);
             store.save_governance_node(&task).await?;
+            append_decision_event(
+                store,
+                &id,
+                "opened",
+                None,
+                Some(&format!(
+                    "mode={} state={}",
+                    spec.mode.as_str(),
+                    state.as_str()
+                )),
+                now,
+            )
+            .await?;
             println!("{id}");
         }
         Act::VoteCast {
@@ -559,6 +582,15 @@ pub async fn run(
             }
             let vote = vote_task(&decision, &unit, &option, now);
             store.save_governance_node(&vote).await?;
+            append_decision_event(
+                store,
+                &decision,
+                "vote_cast",
+                Some(&unit),
+                Some(&option),
+                now,
+            )
+            .await?;
             println!("{}: {unit} -> {option}", decision);
         }
         Act::VoteWithdraw { decision, unit } => {
@@ -577,6 +609,8 @@ pub async fn run(
             vote.status = TaskStatus::Cancelled;
             vote.updated_at = now;
             store.save_governance_node(&vote).await?;
+            append_decision_event(store, &decision, "vote_withdrawn", Some(&unit), None, now)
+                .await?;
             println!("{id}: withdrawn");
         }
         Act::VoteClose { decision } => {
@@ -597,6 +631,22 @@ pub async fn run(
             if outcome.state == DecisionState::Open {
                 println!("{decision}: open — {}", outcome.reason);
                 return Ok(());
+            }
+            // Read the history before writing the verdict: a chain that does
+            // not verify means somebody edited the record this close would be
+            // the latest step in, and appending would vouch for the edit.
+            match verify_decision_chain(store, &decision).await? {
+                ChainVerdict::Intact { .. } => {}
+                ChainVerdict::Broken { at_seq, reason } => {
+                    return Err(format!(
+                        "{decision} cannot be closed: its history is broken at seq {} ({reason}); \
+                         re-read the record before resolving it",
+                        at_seq
+                            .map(|seq| seq.to_string())
+                            .unwrap_or_else(|| "?".into())
+                    )
+                    .into())
+                }
             }
             row.spec.state = outcome.state;
             row.spec.result_option = outcome.option.clone();
@@ -624,6 +674,22 @@ pub async fn run(
             {
                 return Err(format!("{decision} changed while it was being closed").into());
             }
+            append_decision_event(
+                store,
+                &decision,
+                "closed",
+                None,
+                Some(&format!(
+                    "{}: {}",
+                    row.spec.state.as_str(),
+                    row.spec
+                        .result_reason
+                        .clone()
+                        .unwrap_or_else(|| "no reason recorded".into())
+                )),
+                now,
+            )
+            .await?;
             println!(
                 "{}: {} — {}",
                 decision,
@@ -693,6 +759,26 @@ pub async fn run(
                 now.to_rfc3339(),
                 decisions.len()
             );
+        }
+        Act::VoteVerify { decision } => {
+            // The chain is the only thing that says the record was not edited
+            // in place, so this arm just re-derives it and reports. A broken
+            // chain is an error exit: a caller that checks the status must see
+            // the edit, not a printed line it may not read.
+            match verify_decision_chain(store, &decision).await? {
+                ChainVerdict::Intact { events } => {
+                    println!("{decision}: intact events={events}");
+                }
+                ChainVerdict::Broken { at_seq, reason } => {
+                    return Err(format!(
+                        "{decision}: broken at seq {}: {reason}",
+                        at_seq
+                            .map(|seq| seq.to_string())
+                            .unwrap_or_else(|| "?".into())
+                    )
+                    .into())
+                }
+            }
         }
         Act::VoteBackfill {
             replies,
@@ -781,6 +867,19 @@ pub async fn run(
                     .save_governance_node(&vote_task(&id, unit, option, at))
                     .await?;
             }
+            // One step for the whole reconstruction rather than one per vote:
+            // the votes are their own rows, and this event says the row was
+            // assembled from files after the fact -- which is the fact a reader
+            // must not mistake for a ballot that ran live.
+            append_decision_event(
+                store,
+                &id,
+                "backfilled",
+                None,
+                Some(&format!("votes={} predeclared=false", ballot.votes.len())),
+                now,
+            )
+            .await?;
             let counts: Vec<String> = options
                 .iter()
                 .map(|option| {
@@ -901,6 +1000,10 @@ mod tests {
             Act::VoteList { json: true }
         ));
         assert!(matches!(
+            parse_args(&args(&["vote", "verify", "--decision", "d"])).unwrap(),
+            Act::VoteVerify { decision } if decision == "d"
+        ));
+        assert!(matches!(
             parse_args(&args(&[
                 "vote",
                 "backfill",
@@ -929,6 +1032,7 @@ mod tests {
         assert!(parse_args(&args(&["handover", "open", "--face", "f"])).is_err());
         assert!(parse_args(&args(&["vote", "open", "--subject", "s"])).is_err());
         assert!(parse_args(&args(&["vote", "cast", "--decision", "d"])).is_err());
+        assert!(parse_args(&args(&["vote", "verify"])).is_err());
         assert!(parse_args(&args(&["vote", "backfill", "--subject", "s"])).is_err());
         assert!(parse_args(&args(&["nonsense", "list"])).is_err());
         assert!(parse_args(&args(&["vote"])).is_err());
@@ -1275,6 +1379,48 @@ mod tests {
         let error = run(act, &store, Utc::now()).await.unwrap_err();
         assert!(error.to_string().contains("vote:"), "{error}");
         assert!(store.of_type(DECISION_TASK_TYPE).is_empty());
+    }
+
+    #[tokio::test]
+    async fn verifying_a_decision_passes_an_untouched_history_and_fails_an_edited_one() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        for detail in ["opened", "a vote was cast", "closed"] {
+            cog_core::append_decision_event(&store, "d", "step", None, Some(detail), now)
+                .await
+                .unwrap();
+        }
+        run(
+            Act::VoteVerify {
+                decision: "d".into(),
+            },
+            &store,
+            now,
+        )
+        .await
+        .expect("a history nobody touched verifies");
+
+        // The edit that matters is the one made in place: the event keeps its
+        // position and its link, and only its words change.
+        let mut rows = store.rows.lock().unwrap();
+        let event = rows
+            .iter_mut()
+            .find(|row| row.id.ends_with(":000001"))
+            .expect("the second event");
+        event.input[cog_core::DECISION_EVENT_INPUT_KEY]["detail"] =
+            serde_json::json!("something that was never said");
+        drop(rows);
+
+        let error = run(
+            Act::VoteVerify {
+                decision: "d".into(),
+            },
+            &store,
+            now,
+        )
+        .await
+        .expect_err("an edited event must not verify");
+        assert!(error.to_string().contains("broken at seq 1"), "{error}");
     }
 
     #[tokio::test]

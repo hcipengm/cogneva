@@ -419,6 +419,250 @@ impl Vote {
     }
 }
 
+/// The task type a decision event row carries.
+pub const DECISION_EVENT_TASK_TYPE: &str = "decision_event";
+
+/// Where a decision event keeps its payload.
+pub const DECISION_EVENT_INPUT_KEY: &str = "decision_event";
+
+/// One step in a decision's history.
+///
+/// A decision row is rewritten as the question moves -- opened, cast, closed --
+/// and the row a reader sees is the latest state, not the way it was reached.
+/// Votes are separate rows, but the state changes themselves leave nothing
+/// behind: a resolved row looks the same whether it was closed by a tally or
+/// quietly rewritten by somebody with a database client.
+///
+/// So each state change appends an event whose hash covers the event before it.
+/// The chain proves the sequence was not edited in place; it cannot prove it was
+/// not rewritten wholesale, because nothing outside this database anchors the
+/// head. That limit is the point of stating it here rather than implying the
+/// chain is stronger than it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionEventSpec {
+    pub decision_id: String,
+    /// 0-based position in this decision's chain.
+    pub seq: u64,
+    /// `opened` | `vote_cast` | `vote_withdrawn` | `closed` | `backfilled`.
+    pub kind: String,
+    /// Who did it, when the caller can say. An open run from a script has no
+    /// unit and is not given a made-up one.
+    pub actor_unit: Option<String>,
+    pub detail: Option<String>,
+    /// The previous event's hash; empty for the first event.
+    pub prev_hash: String,
+    /// What this event hashes to. It does not cover itself -- a hash cannot
+    /// contain its own value -- so it covers everything else.
+    pub hash: String,
+}
+
+/// One decision event as the graph holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionEvent {
+    pub id: String,
+    pub spec: DecisionEventSpec,
+}
+
+impl DecisionEvent {
+    pub fn from_task(task: &Task) -> Option<Self> {
+        if !is_typed(task, DECISION_EVENT_TASK_TYPE) {
+            return None;
+        }
+        Some(Self {
+            id: task.id.clone(),
+            spec: serde_json::from_value(task.input.get(DECISION_EVENT_INPUT_KEY)?.clone()).ok()?,
+        })
+    }
+}
+
+/// The bytes an event's hash is computed over.
+///
+/// Field by field with a version tag, rather than a serialised struct: a
+/// serialiser that reordered fields would change every hash in the chain
+/// without any event having changed.
+fn decision_event_payload(
+    decision_id: &str,
+    seq: u64,
+    kind: &str,
+    actor_unit: Option<&str>,
+    detail: Option<&str>,
+    prev_hash: &str,
+) -> String {
+    format!(
+        "v1\n{decision_id}\n{seq}\n{kind}\n{}\n{}\n{prev_hash}",
+        actor_unit.unwrap_or(""),
+        detail.unwrap_or("")
+    )
+}
+
+/// The hash of one event.
+pub fn decision_event_hash(
+    decision_id: &str,
+    seq: u64,
+    kind: &str,
+    actor_unit: Option<&str>,
+    detail: Option<&str>,
+    prev_hash: &str,
+) -> String {
+    blake3::hash(
+        decision_event_payload(decision_id, seq, kind, actor_unit, detail, prev_hash).as_bytes(),
+    )
+    .to_hex()
+    .to_string()
+}
+
+/// The id an event at this position carries. One id per position means a second
+/// write to the same position overwrites rather than forks the chain, which is
+/// what verification can see and report.
+pub fn decision_event_id(decision_id: &str, seq: u64) -> String {
+    format!("decision-event:{decision_id}:{seq:06}")
+}
+
+/// Build one event row.
+pub fn decision_event_task(
+    decision_id: &str,
+    seq: u64,
+    kind: &str,
+    actor_unit: Option<&str>,
+    detail: Option<&str>,
+    prev_hash: &str,
+    now: DateTime<Utc>,
+) -> Task {
+    let hash = decision_event_hash(decision_id, seq, kind, actor_unit, detail, prev_hash);
+    let spec = DecisionEventSpec {
+        decision_id: decision_id.to_string(),
+        seq,
+        kind: kind.to_string(),
+        actor_unit: actor_unit.map(str::to_string),
+        detail: detail.map(str::to_string),
+        prev_hash: prev_hash.to_string(),
+        hash,
+    };
+    let id = decision_event_id(decision_id, seq);
+    let mut task = Task::new(
+        &id,
+        TaskType::Custom(DECISION_EVENT_TASK_TYPE.into()),
+        serde_json::json!({ DECISION_EVENT_INPUT_KEY: spec }),
+    );
+    task.status = TaskStatus::Completed;
+    task.updated_at = now;
+    task
+}
+
+/// Every event of one decision, in chain order.
+pub async fn decision_events(
+    store: &dyn crate::GovernanceStore,
+    decision_id: &str,
+) -> crate::SFResult<Vec<DecisionEvent>> {
+    let mut events: Vec<DecisionEvent> = store
+        .governance_nodes(DECISION_EVENT_TASK_TYPE)
+        .await?
+        .iter()
+        .filter_map(DecisionEvent::from_task)
+        .filter(|event| event.spec.decision_id == decision_id)
+        .collect();
+    events.sort_by_key(|event| event.spec.seq);
+    Ok(events)
+}
+
+/// What verification of one chain found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainVerdict {
+    /// Every event is at the expected position, links to the one before it, and
+    /// hashes to what it says.
+    Intact {
+        events: usize,
+    },
+    Broken {
+        at_seq: Option<u64>,
+        reason: String,
+    },
+}
+
+/// Verify a chain that was already read.
+pub fn verify_decision_events(events: &[DecisionEvent]) -> ChainVerdict {
+    let mut expected_seq = 0u64;
+    let mut prev_hash = String::new();
+    for event in events {
+        if event.spec.seq != expected_seq {
+            return ChainVerdict::Broken {
+                at_seq: Some(event.spec.seq),
+                reason: format!(
+                    "seq {} where {expected_seq} was expected; an event was removed or added",
+                    event.spec.seq
+                ),
+            };
+        }
+        if event.spec.prev_hash != prev_hash {
+            return ChainVerdict::Broken {
+                at_seq: Some(event.spec.seq),
+                reason: "the event does not link to the hash of the one before it".into(),
+            };
+        }
+        let recomputed = decision_event_hash(
+            &event.spec.decision_id,
+            event.spec.seq,
+            &event.spec.kind,
+            event.spec.actor_unit.as_deref(),
+            event.spec.detail.as_deref(),
+            &event.spec.prev_hash,
+        );
+        if recomputed != event.spec.hash {
+            return ChainVerdict::Broken {
+                at_seq: Some(event.spec.seq),
+                reason: "the event's contents do not hash to the value it carries".into(),
+            };
+        }
+        prev_hash = event.spec.hash.clone();
+        expected_seq += 1;
+    }
+    ChainVerdict::Intact {
+        events: events.len(),
+    }
+}
+
+/// Append one event to a decision's chain.
+///
+/// Refuses when the chain that exists does not verify: appending to a broken
+/// history would make the new event vouch for it. A refused append writes
+/// nothing, so the break stays exactly where it was.
+pub async fn append_decision_event(
+    store: &dyn crate::GovernanceStore,
+    decision_id: &str,
+    kind: &str,
+    actor_unit: Option<&str>,
+    detail: Option<&str>,
+    now: DateTime<Utc>,
+) -> crate::SFResult<Task> {
+    let events = decision_events(store, decision_id).await?;
+    if let ChainVerdict::Broken { at_seq, reason } = verify_decision_events(&events) {
+        return Err(crate::SFError::Conflict(format!(
+            "decision {decision_id} has a broken history at seq {}: {reason}; the new event \
+             would vouch for it",
+            at_seq
+                .map(|seq| seq.to_string())
+                .unwrap_or_else(|| "?".into())
+        )));
+    }
+    let seq = events.last().map(|event| event.spec.seq + 1).unwrap_or(0);
+    let prev_hash = events
+        .last()
+        .map(|event| event.spec.hash.clone())
+        .unwrap_or_default();
+    let task = decision_event_task(decision_id, seq, kind, actor_unit, detail, &prev_hash, now);
+    store.save_governance_node(&task).await?;
+    Ok(task)
+}
+
+/// Read and verify one decision's chain.
+pub async fn verify_decision_chain(
+    store: &dyn crate::GovernanceStore,
+    decision_id: &str,
+) -> crate::SFResult<ChainVerdict> {
+    let events = decision_events(store, decision_id).await?;
+    Ok(verify_decision_events(&events))
+}
+
 /// Whether `task_type` names `expected`.
 ///
 /// Custom task types serialise as `{"custom": "<name>"}`, so a row is matched
@@ -538,5 +782,90 @@ mod tests {
                 DecisionState::parse(state.as_str()).unwrap().status()
             );
         }
+    }
+
+    fn chain_of(events: usize) -> Vec<DecisionEvent> {
+        let mut rows = Vec::new();
+        let mut prev = String::new();
+        for seq in 0..events as u64 {
+            let task = decision_event_task(
+                "d",
+                seq,
+                if seq == 0 { "opened" } else { "vote_cast" },
+                Some("8e"),
+                Some(&format!("step {seq}")),
+                &prev,
+                at(seq as i64),
+            );
+            let event = DecisionEvent::from_task(&task).expect("the row is an event");
+            prev = event.spec.hash.clone();
+            rows.push(event);
+        }
+        rows
+    }
+
+    /// The chain is only worth writing if each link covers the one before it;
+    /// otherwise a reader has a list of rows, not a history.
+    #[test]
+    fn a_chain_links_each_event_to_the_one_before_it() {
+        let events = chain_of(3);
+        for pair in events.windows(2) {
+            assert_eq!(
+                pair[1].spec.prev_hash, pair[0].spec.hash,
+                "event {} does not link to event {}",
+                pair[1].spec.seq, pair[0].spec.seq
+            );
+        }
+        assert_eq!(
+            verify_decision_events(&events),
+            ChainVerdict::Intact { events: 3 }
+        );
+    }
+
+    /// Editing an event's words after the fact leaves its hash describing a row
+    /// that no longer exists; this is the case the chain exists to catch.
+    #[test]
+    fn editing_an_event_in_place_breaks_the_chain() {
+        let mut events = chain_of(3);
+        events[1].spec.detail = Some("a different story".into());
+        match verify_decision_events(&events) {
+            ChainVerdict::Broken { at_seq, .. } => assert_eq!(at_seq, Some(1)),
+            other => panic!("edited history verified as {other:?}"),
+        }
+    }
+
+    /// Removing a step leaves a hole the next event's `prev_hash` cannot close:
+    /// the link points at a hash that is no longer in the chain.
+    #[test]
+    fn removing_an_event_breaks_the_chain() {
+        let mut events = chain_of(3);
+        events.remove(1);
+        match verify_decision_events(&events) {
+            ChainVerdict::Broken { at_seq, .. } => assert_eq!(at_seq, Some(2)),
+            other => panic!("a chain with a hole verified as {other:?}"),
+        }
+    }
+
+    /// Reordering is the same defect as removal seen from the other end: the
+    /// positions no longer run from zero without a gap.
+    #[test]
+    fn reordering_events_breaks_the_chain() {
+        let mut events = chain_of(3);
+        events.swap(0, 1);
+        assert!(matches!(
+            verify_decision_events(&events),
+            ChainVerdict::Broken { .. }
+        ));
+    }
+
+    /// An empty history verifies: a decision that was opened but never moved
+    /// has nothing to check, and saying it is broken would make every new
+    /// decision unreadable.
+    #[test]
+    fn an_empty_chain_is_intact() {
+        assert_eq!(
+            verify_decision_events(&[]),
+            ChainVerdict::Intact { events: 0 }
+        );
     }
 }

@@ -469,6 +469,13 @@ pub struct SettleReport {
     /// before that move, so writing it would state an outcome for a state that
     /// no longer exists.
     pub lost_races: usize,
+    /// Ballots the pass did not close because their history does not verify.
+    ///
+    /// A decision whose chain is broken is a decision somebody edited; closing
+    /// it would append an event vouching for the edited history, so the pass
+    /// leaves it alone and says so. The ballot stays open rather than being
+    /// resolved on the strength of a record that cannot be read.
+    pub chains_broken: usize,
 }
 
 /// Apply the rules that close things by themselves.
@@ -518,6 +525,29 @@ pub async fn settle(
         row.status = status;
         row.updated_at = now;
         rewrite_payload(&mut row, DECISION_INPUT_KEY, &decision.spec);
+
+        // The chain is written before the row moves. Appending after would let
+        // a broken history be discovered by a pass whose close had already
+        // happened, leaving a resolved row nobody can reconstruct; appending
+        // first means a history that does not verify stops the close, and the
+        // ballot stays open where a reader can still see it.
+        let detail = format!(
+            "{}: {}",
+            decision.spec.state.as_str(),
+            decision
+                .spec
+                .result_reason
+                .clone()
+                .unwrap_or_else(|| "no reason recorded".into())
+        );
+        if cog_core::append_decision_event(store, &decision.id, "closed", None, Some(&detail), now)
+            .await
+            .is_err()
+        {
+            report.chains_broken += 1;
+            continue;
+        }
+
         if store
             .save_governance_node_if_status(&row, &[TaskStatus::Pending, TaskStatus::Running])
             .await?
@@ -696,7 +726,7 @@ fn governance_task(
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use cog_core::{is_typed, HandoverState, Signature};
+    use cog_core::{is_typed, GovernanceStore, HandoverState, Signature};
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_760_000_000 + secs, 0).unwrap()
@@ -1184,6 +1214,81 @@ mod tests {
         let report = settle(&store, at(120)).await.unwrap();
         assert_eq!(report.handovers_expired, 0);
         assert_eq!(store.row("h").status, TaskStatus::Completed);
+    }
+
+    /// A close is a state change, so it leaves a step in the history. Without
+    /// one a resolved row looks the same whether a tally resolved it or
+    /// somebody rewrote the payload.
+    #[tokio::test]
+    async fn a_close_appends_a_step_to_the_decisions_history() {
+        let store = MemoryStore::with(vec![
+            open_ballot_row(),
+            vote_task("d", "a", "8e", at(0)),
+            vote_task("d", "b", "8e", at(1)),
+        ]);
+        settle(&store, at(120)).await.unwrap();
+
+        let events = cog_core::decision_events(&store, "d").await.unwrap();
+        assert_eq!(events.len(), 1, "one close, one step");
+        assert_eq!(events[0].spec.kind, "closed");
+        assert_eq!(events[0].spec.seq, 0);
+        assert_eq!(
+            cog_core::verify_decision_chain(&store, "d").await.unwrap(),
+            cog_core::ChainVerdict::Intact { events: 1 }
+        );
+    }
+
+    /// Each append takes the next position and covers the hash before it; the
+    /// chain is the sequence, not a pile of rows with timestamps.
+    #[tokio::test]
+    async fn appending_numbers_and_links_every_step() {
+        let store = MemoryStore::with(vec![open_ballot_row()]);
+        for (index, kind) in ["opened", "vote_cast", "vote_withdrawn"].iter().enumerate() {
+            let event = cog_core::append_decision_event(
+                &store,
+                "d",
+                kind,
+                Some("8e"),
+                None,
+                at(index as i64),
+            )
+            .await
+            .unwrap();
+            assert_eq!(event.id, cog_core::decision_event_id("d", index as u64));
+        }
+        let events = cog_core::decision_events(&store, "d").await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            cog_core::verify_decision_chain(&store, "d").await.unwrap(),
+            cog_core::ChainVerdict::Intact { events: 3 }
+        );
+        assert_eq!(events[2].spec.prev_hash, events[1].spec.hash);
+    }
+
+    /// A history that does not verify cannot be extended: the new step would
+    /// vouch for the edited part. The append is refused and nothing is written,
+    /// so the break stays where a reader can find it.
+    #[tokio::test]
+    async fn an_append_is_refused_when_the_history_does_not_verify() {
+        let store = MemoryStore::with(vec![open_ballot_row()]);
+        let first = cog_core::append_decision_event(&store, "d", "opened", None, None, at(0))
+            .await
+            .unwrap();
+
+        let mut tampered = first.clone();
+        tampered.input[cog_core::DECISION_EVENT_INPUT_KEY]["detail"] =
+            serde_json::json!("a detail the row never carried");
+        store.save_governance_node(&tampered).await.unwrap();
+
+        let refused =
+            cog_core::append_decision_event(&store, "d", "vote_cast", Some("8e"), None, at(1))
+                .await;
+        assert!(refused.is_err(), "a broken history must not be extended");
+        assert_eq!(
+            cog_core::decision_events(&store, "d").await.unwrap().len(),
+            1,
+            "the refused append writes nothing"
+        );
     }
 
     #[test]
