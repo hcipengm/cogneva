@@ -581,9 +581,9 @@ pub enum ChainVerdict {
 
 /// Verify a chain that was already read.
 pub fn verify_decision_events(events: &[DecisionEvent]) -> ChainVerdict {
-    let mut expected_seq = 0u64;
     let mut prev_hash = String::new();
-    for event in events {
+    for (expected_seq, event) in events.iter().enumerate() {
+        let expected_seq = expected_seq as u64;
         if event.spec.seq != expected_seq {
             return ChainVerdict::Broken {
                 at_seq: Some(event.spec.seq),
@@ -614,7 +614,6 @@ pub fn verify_decision_events(events: &[DecisionEvent]) -> ChainVerdict {
             };
         }
         prev_hash = event.spec.hash.clone();
-        expected_seq += 1;
     }
     ChainVerdict::Intact {
         events: events.len(),
