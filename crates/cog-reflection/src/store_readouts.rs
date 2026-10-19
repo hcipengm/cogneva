@@ -153,8 +153,23 @@ impl StoreReadouts {
             // 它的价值在它的缺席：一条 active_version 读数若没有同一组标签的声明，
             // 读者就分不清那是「加载了但版本读不出来」还是「另一个进程报的」。
             self.record(labels("data_dir"), 1.0).await;
-            // ACTIVE 读不出来（目录不在、文件坏了）报 -1，而不是 0：版本号从 1 起，
-            // 0 会被读成「有一个第 0 版」，-1 在任何比较里都不等于一个真版本。
+            // 指针说的是哪一版，与打开后实际拿到哪一版，分两格发布。
+            //
+            // 只有实读那一格时，「指针指着 v7 而 v7 不在」与「指针指向一份坏产物」
+            // 都只是一个 -1；有了声明那一格，前者读作 (7, -1)、后者读作 (7, -1)
+            // 之外还能靠日志分开，而「没激活过」读作 (0, 0)——坏库与空库在面上不再同形。
+            // 版本号从 1 起，所以 0 是「没有指针」这个真状态，读不出来（文件坏、
+            // 权限不对）报 -1，它在任何比较里都不等于一个真版本。
+            let declared = match store.declared_active_version(name).await {
+                Ok(Some(version)) => version as f64,
+                Ok(None) => 0.0,
+                Err(e) => {
+                    tracing::warn!(store = %name, error = %e, "policy store ACTIVE pointer unreadable");
+                    -1.0
+                }
+            };
+            self.record(labels("active_version_declared"), declared)
+                .await;
             let active = match store.load_active(name).await {
                 Ok(Some(artifact)) => artifact.version as f64,
                 Ok(None) => 0.0,
@@ -452,25 +467,46 @@ mod tests {
             Some(metrics.clone()),
         );
 
-        async fn active(metrics: &cog_storage::MemoryMetricsBackend) -> f64 {
+        async fn readout(metrics: &cog_storage::MemoryMetricsBackend, name: &str) -> f64 {
             metrics
                 .query_gauge_latest(metric_names::POLICY_STORE_READINGS.as_str())
                 .await
                 .unwrap()
                 .into_iter()
-                .find(|s| labels_of(s).0 == "active_version")
-                .expect("缺少 active_version 那一格")
+                .find(|s| labels_of(s).0 == name)
+                .unwrap_or_else(|| panic!("缺少 {name} 那一格"))
                 .value
         }
 
         readouts.publish().await;
-        assert_eq!(active(&metrics).await, 0.0);
+        assert_eq!(readout(&metrics, "active_version").await, 0.0);
+        assert_eq!(readout(&metrics, "active_version_declared").await, 0.0);
 
         let store_dir = dir.path().join("policies").join(META_LEARNING_POLICY);
         std::fs::create_dir_all(&store_dir).unwrap();
         std::fs::write(store_dir.join("ACTIVE"), "not-a-version").unwrap();
         readouts.publish().await;
-        assert_eq!(active(&metrics).await, -1.0);
+        assert_eq!(readout(&metrics, "active_version").await, -1.0);
+        assert_eq!(
+            readout(&metrics, "active_version_declared").await,
+            -1.0,
+            "指针内容坏了：声明那一格也读不出来"
+        );
+
+        // 指针点名 v7、v7 不在：两格各自说一侧。只留实读那一格时，这个库与
+        // 「指针坏了」都读作 -1，与「还没激活过」都读作 0 的旧行为下更是同形。
+        std::fs::write(store_dir.join("ACTIVE"), "7").unwrap();
+        readouts.publish().await;
+        assert_eq!(
+            readout(&metrics, "active_version_declared").await,
+            7.0,
+            "指针说的是第 7 版"
+        );
+        assert_eq!(
+            readout(&metrics, "active_version").await,
+            -1.0,
+            "实读那一格报「拿不到」，而不是报成一个空库"
+        );
     }
 
     /// 恢复核对：期望与实读各发布一格；对上了就把交接单消费掉。

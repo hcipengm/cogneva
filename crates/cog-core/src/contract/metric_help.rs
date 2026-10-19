@@ -1573,11 +1573,22 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          data_dir and store. data_dir carries 1 for each (data_dir, store) the \
          process announced — its value is the declaration that this process is \
          here and reading this path, so a series can be told apart from another \
-         process's reading of the same store name. active_version is the version \
-         that store's ACTIVE file names, 0 when the store exists with nothing \
-         activated, and -1 when ACTIVE could not be read at all: versions start \
-         at 1, so 0 is a real state and the unreadable one has to be something \
-         else. decision_groups and decision_trials are the meta-learning \
+         process's reading of the same store name. active_version_declared is \
+         what that store's ACTIVE file names, 0 when there is no ACTIVE file, \
+         and -1 when the file is there but is not a version number or cannot be \
+         read; active_version is the version the store actually opened, 0 when \
+         nothing is activated, and -1 when the pointer cannot be turned into an \
+         artifact at all -- an unreadable pointer, a version file the pointer \
+         names but which is not there, or a corrupt artifact. Versions start at \
+         1, so 0 is a real state and every failure has to be something else. \
+         The two cells are what separates an empty store from a broken one: \
+         (0, 0) is a store that was never activated, (7, -1) is a pointer \
+         naming a version that is not there, and two minus ones mean the \
+         pointer itself cannot be read. Collapsed into one cell, a store that \
+         lost a version to a prune or a partial write would read as one that \
+         never learned anything, and the process running on its default \
+         parameters would look like a process that has not evolved yet. \
+         decision_groups and decision_trials are the meta-learning \
          engine's live aggregation — groups recorded and attempts made — which \
          is what the recommendation and tuning paths sample, so a count of \
          zero here is the state in which those paths never leave their \

@@ -156,23 +156,59 @@ impl PolicyStore {
         self.policy_dir(name).join("ACTIVE")
     }
 
-    /// 读取当前激活版本（热替换后下一次读取即拿到新版本）。
-    pub async fn load_active(&self, name: &str) -> SFResult<Option<PolicyArtifact>> {
+    /// ACTIVE 文件里点名的版本，**不去打开那个版本文件**。
+    ///
+    /// 与 [`Self::load_active`] 分开是因为两者失败的成因不同：这里只回答「指针说
+    /// 的是第几版」，版本文件在不在是下一步的事。两格一起读才分得清「没激活过」
+    /// （指针为空）和「指针指着一个不存在的版本」（指针有一版、产物没有）。
+    ///
+    /// 没有 ACTIVE 文件是 `Ok(None)`；文件在但读不出来、或内容不是版本号，是 `Err`
+    /// ——文件存在却给不出一个版本，不是一个空库。
+    pub async fn declared_active_version(&self, name: &str) -> SFResult<Option<u64>> {
         let active = self.active_path(name);
-        let Ok(version_str) = tokio::fs::read_to_string(&active).await else {
-            return Ok(None);
+        let version_str = match tokio::fs::read_to_string(&active).await {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(SFError::IO(format!("read {}: {e}", active.display())));
+            }
         };
-        let version: u64 = version_str
+        let version = version_str
             .trim()
             .parse()
             .map_err(|e| SFError::Validation(format!("corrupt ACTIVE for {name}: {e}")))?;
-        self.load_version(name, version).await
+        Ok(Some(version))
     }
 
+    /// 读取当前激活版本（热替换后下一次读取即拿到新版本）。
+    ///
+    /// 「没有 ACTIVE」是 `Ok(None)`；「ACTIVE 指着一个不存在的版本」是 `Err`。
+    /// 后者曾经也报 `Ok(None)`，于是掉了一个版本文件的库与一个从没激活过的库在
+    /// 读数面上同形：进程安静地回落到默认参数，而读它的人看到的是「还没进化过」。
+    /// 指针与产物对不上是库坏了，不是库空的。
+    pub async fn load_active(&self, name: &str) -> SFResult<Option<PolicyArtifact>> {
+        let Some(version) = self.declared_active_version(name).await? else {
+            return Ok(None);
+        };
+        match self.load_version(name, version).await? {
+            Some(artifact) => Ok(Some(artifact)),
+            None => Err(SFError::Validation(format!(
+                "ACTIVE for {name} names v{version:06}, but that version file is missing"
+            ))),
+        }
+    }
+
+    /// 读一个版本文件：不存在是 `Ok(None)`，存在但读不出来是 `Err`。
+    ///
+    /// 两种「读不到」曾经都退化成 `Ok(None)`：文件被删了与文件在那儿却没有读权限，
+    /// 对一个正要拿它做恢复核对的人来说是两件事——前者是包不完整，后者是这条路
+    /// 本身坏了，而后者被读成「这个版本不在包里」时，人修的是包。
     pub async fn load_version(&self, name: &str, version: u64) -> SFResult<Option<PolicyArtifact>> {
         let path = self.version_path(name, version);
-        let Ok(text) = tokio::fs::read_to_string(&path).await else {
-            return Ok(None);
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(SFError::IO(format!("read {}: {e}", path.display()))),
         };
         let artifact: PolicyArtifact = serde_json::from_str(&text).map_err(|e| {
             SFError::Validation(format!("corrupt artifact {}: {e}", path.display()))
@@ -568,6 +604,47 @@ mod tests {
         let store = PolicyStore::new(tmp.path());
         let err = store.activate("nope", 3).await.unwrap_err();
         assert!(err.to_string().contains("does not exist"));
+    }
+
+    /// 「没有 ACTIVE」与「ACTIVE 指着一个不存在的版本」是两种库：前者是还没激活过，
+    /// 后者是坏了。都返回 `Ok(None)` 的话，后者会被读成前者，进程安静地跑在默认参数上。
+    #[tokio::test]
+    async fn an_active_pointer_to_a_missing_version_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PolicyStore::new(tmp.path());
+
+        assert!(store
+            .declared_active_version("guard.pii")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.load_active("guard.pii").await.unwrap().is_none());
+
+        let dir = tmp.path().join("guard.pii");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ACTIVE"), "7\n").unwrap();
+        assert_eq!(
+            store.declared_active_version("guard.pii").await.unwrap(),
+            Some(7),
+            "指针自己说的是哪一版要读得出来，判词才能指出缺的是哪一份"
+        );
+        let err = store.load_active("guard.pii").await.unwrap_err();
+        assert!(
+            err.to_string().contains("v000007") && err.to_string().contains("missing"),
+            "错误要点名指针上的版本：{err}"
+        );
+    }
+
+    /// 指针在、版本文件也在、但内容不是产物：这是坏库，不是空库。
+    #[tokio::test]
+    async fn a_corrupt_active_pointer_is_an_error_not_an_empty_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PolicyStore::new(tmp.path());
+        let dir = tmp.path().join("guard.pii");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ACTIVE"), "not-a-version").unwrap();
+        assert!(store.declared_active_version("guard.pii").await.is_err());
+        assert!(store.load_active("guard.pii").await.is_err());
     }
 
     #[tokio::test]
