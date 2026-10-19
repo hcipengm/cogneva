@@ -24,7 +24,20 @@ STAGE_POD="cogneva-restore-stage"
 JOB_NAME="${COGNEVA_RESTORE_JOB_NAME:-cogneva-restore-$(date +%s)}"
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# 写者缩下去之后，任何一步失败都不能悄悄把它们停在 0 副本上：那是一条「装是装完了，
+# 但服务全没起」的结局，而现场只看到脚本退出码非 0。恢复失败时**故意**不放行（半装
+# 的数据不该被拿去服务），但必须把「现在是停着的、怎么放」喊出来。
+APP_REPLICAS=()
+RESUMED=0
+cleanup() {
+    local rc=$?
+    rm -rf "$TMP"
+    if [ "$rc" -ne 0 ] && [ "${#APP_REPLICAS[@]}" -gt 0 ] && [ "$RESUMED" -ne 1 ]; then
+        echo "==> 业务部署仍是 0 副本（恢复没走完，故意不放行）。原副本数：${APP_REPLICAS[*]}" >&2
+        echo "    修好后重跑本脚本即可；要手工放行：kubectl -n $NS scale --replicas=<数> deployment/<名字>" >&2
+    fi
+}
+trap cleanup EXIT
 tar --zstd -xf "$PKG" -C "$TMP"
 # 包内顶层目录名 = 包名去掉 .tar.zst 后缀。
 PKG_DIR="$TMP/${BASE%.tar.zst}"
@@ -53,7 +66,84 @@ kubectl -n "$NS" rollout status deployment/qdrant --timeout=300s
 
 # 用运行中的业务镜像做恢复载体：集群内必然拉得到，版本与部署面一致。
 IMAGE="$(kubectl -n "$NS" get deployment cogneva -o jsonpath='{.spec.template.spec.containers[0].image}')"
-echo "==> 3/4 上传包到备份卷并跑恢复 Job（镜像 $IMAGE）"
+
+# The set is read from the cluster rather than transcribed: what the restore gives
+# back is the persistent layer, and the deployments that have to replay in-memory
+# state are the ones running an image this project publishes -- a set that grows.
+# A transcribed list keeps working when it grows and skips the new deployment in
+# silence: the restore reports success while that deployment still holds the state
+# it had before. The repository name comes from the same $IMAGE read above (digest
+# and tag stripped), so the registry prefix and the rev tag follow the live cluster
+# instead of being maintained here.
+# rollout-set: start
+IMAGE_REPO="$(printf '%s' "$IMAGE" | sed -E 's/@.*$//; s/:[^/]*$//')"
+APP_DEPLOYMENTS=()
+while IFS=$'\t' read -r name images; do
+    [ -n "$name" ] || continue
+    read -ra imgs <<<"$images"
+    for img in "${imgs[@]}"; do
+        repo="$(printf '%s' "$img" | sed -E 's/@.*$//; s/:[^/]*$//')"
+        if [ "$repo" = "$IMAGE_REPO" ]; then
+            APP_DEPLOYMENTS+=("$name")
+            break
+        fi
+    done
+done < <(kubectl -n "$NS" get deploy \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.template.spec.containers[*]}{.image}{" "}{end}{"\n"}{end}')
+if [ "${#APP_DEPLOYMENTS[@]}" -eq 0 ]; then
+    echo "No deployment runs this project's image ($IMAGE_REPO); the restore would leave every" \
+        "in-memory state unreplayed" >&2
+    exit 1
+fi
+# rollout-set: end
+
+# 写者必须先后退。恢复写的是持久层，而读同一批数据的进程此刻还在跑：写者不停，
+# 恢复回去的字节与它们手里那份内存态就没有先后关系，恢复「成功」之后它们继续按
+# 旧状态写同一张表；进化 Pod 还握着策略库所在的卷，恢复写进去的版本文件可能被它
+# 下一轮覆盖。所以先把这些部署缩到 0，等 Pod 真的没了再动数据。
+#
+# 集合只算一次：下面缩容、放行都用上面那一份，不在两处各读一遍集群（两处会漂）。
+# quiesce: start
+APP_REPLICAS=()
+quiesce_writers() {
+    local d r sel
+    for d in "${APP_DEPLOYMENTS[@]}"; do
+        r="$(kubectl -n "$NS" get deploy "$d" -o jsonpath='{.spec.replicas}')"
+        APP_REPLICAS+=("$d=${r:-1}")
+        kubectl -n "$NS" scale --replicas=0 "deployment/$d" >/dev/null
+    done
+    # 缩容是异步的：desired 变 0 时 Pod 还在正常退出，此刻开恢复会和它们抢同一块卷。
+    # 按 Deployment 自己的 selector 等 Pod 全消失；卷是 RWO，最后一个读者走了才挂得上。
+    for d in "${APP_DEPLOYMENTS[@]}"; do
+        sel="$(kubectl -n "$NS" get deploy "$d" \
+            -o jsonpath='{range $k,$v := .spec.selector.matchLabels}{$k}={$v},{end}')"
+        sel="${sel%,}"
+        if kubectl -n "$NS" get pods -l "$sel" -o name 2>/dev/null | grep -q .; then
+            kubectl -n "$NS" wait --for=delete pod -l "$sel" --timeout=300s >/dev/null
+        fi
+    done
+    # 走到这里＝每个部署的 Pod 都等没了（等超时会被 set -e 带走），所以这一行是
+    # 读数而不是声明。原副本数一并印出来：回执与日志里能对上「待会儿要放回几个」。
+    echo "    writers_running=0 originals: ${APP_REPLICAS[*]}"
+}
+resume_writers() {
+    local pair d r
+    for pair in "${APP_REPLICAS[@]}"; do
+        d="${pair%%=*}"
+        r="${pair##*=}"
+        kubectl -n "$NS" scale --replicas="$r" "deployment/$d" >/dev/null
+    done
+    # 从 0 起回来的 Pod 是新的，本身就把内存态重放了一遍，不再额外 restart。
+    for pair in "${APP_REPLICAS[@]}"; do
+        d="${pair%%=*}"
+        kubectl -n "$NS" rollout status "deployment/$d" --timeout=300s
+    done
+    RESUMED=1
+}
+# quiesce: end
+
+echo "==> 3/4 停写者、上传包到备份卷并跑恢复 Job（镜像 $IMAGE）"
+quiesce_writers
 
 # 先起一个只挂备份卷的暂存 Pod 把包 kubectl cp 进去；恢复 Job 再从卷上读。
 kubectl -n "$NS" delete pod "$STAGE_POD" --ignore-not-found --wait=true
@@ -166,40 +256,6 @@ kubectl -n "$NS" wait --for=condition=Complete "job/$JOB_NAME" --timeout=1800s |
 }
 kubectl -n "$NS" logs "job/$JOB_NAME" | tail -20
 
-echo "==> 4/4 滚动重启业务部署，让内存态对齐持久层"
-# The set is read from the cluster rather than transcribed: what the restore gives
-# back is the persistent layer, and the deployments that have to replay in-memory
-# state are the ones running an image this project publishes -- a set that grows.
-# A transcribed list keeps working when it grows and skips the new deployment in
-# silence: the restore reports success while that deployment still holds the state
-# it had before. The repository name comes from the same $IMAGE read above (digest
-# and tag stripped), so the registry prefix and the rev tag follow the live cluster
-# instead of being maintained here.
-# rollout-set: start
-IMAGE_REPO="$(printf '%s' "$IMAGE" | sed -E 's/@.*$//; s/:[^/]*$//')"
-APP_DEPLOYMENTS=()
-while IFS=$'\t' read -r name images; do
-    [ -n "$name" ] || continue
-    read -ra imgs <<<"$images"
-    for img in "${imgs[@]}"; do
-        repo="$(printf '%s' "$img" | sed -E 's/@.*$//; s/:[^/]*$//')"
-        if [ "$repo" = "$IMAGE_REPO" ]; then
-            APP_DEPLOYMENTS+=("$name")
-            break
-        fi
-    done
-done < <(kubectl -n "$NS" get deploy \
-    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.template.spec.containers[*]}{.image}{" "}{end}{"\n"}{end}')
-if [ "${#APP_DEPLOYMENTS[@]}" -eq 0 ]; then
-    echo "No deployment runs this project's image ($IMAGE_REPO); the restore would leave every" \
-        "in-memory state unreplayed" >&2
-    exit 1
-fi
-# rollout-set: end
-for d in "${APP_DEPLOYMENTS[@]}"; do
-    kubectl -n "$NS" rollout restart "deployment/$d"
-done
-for d in "${APP_DEPLOYMENTS[@]}"; do
-    kubectl -n "$NS" rollout status "deployment/$d" --timeout=300s
-done
+echo "==> 4/4 放行业务部署，让它们从持久层重放内存态"
+resume_writers
 echo "==> 恢复完成"
