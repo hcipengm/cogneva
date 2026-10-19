@@ -244,6 +244,7 @@ impl BackupConfig {
                     .unwrap_or_else(|_| "/var/lib/cogneva-data".into()),
             ),
             extra_data_roots: parse_extra_data_roots(
+                "COGNEVA_BACKUP_EXTRA_DATA_ROOTS",
                 std::env::var("COGNEVA_BACKUP_EXTRA_DATA_ROOTS").ok(),
             )?,
             keep_count: std::env::var("COGNEVA_BACKUP_KEEP")
@@ -272,9 +273,15 @@ impl BackupConfig {
 
 /// 解析 `name=path[,name=path]`。
 ///
-/// 坏掉的条目让备份**失败**，不跳过：少一个数据根而包照样「成功」，正是换机后
+/// 备份与恢复各读一个 env（`COGNEVA_BACKUP_EXTRA_DATA_ROOTS` /
+/// `COGNEVA_RESTORE_EXTRA_DATA_ROOTS`），形状同一条：恢复端面对的是一个包里已经
+/// 写下的根名，能不能给出目标路径是另一件事，所以两份表必须用同一个口径解析——
+/// 两份各写一遍解析只会在某一天分叉。`var` 只用于让错误点名是哪一份表坏了。
+///
+/// 坏掉的条目让整次运行**失败**，不跳过：少一个数据根而包照样「成功」，正是换机后
 /// 才发现某一份状态从没进过包的形状。空表 = 没有追加根，是合法值。
 fn parse_extra_data_roots(
+    var: &str,
     raw: Option<String>,
 ) -> Result<Vec<(String, PathBuf)>, Box<dyn std::error::Error>> {
     let Some(raw) = raw else {
@@ -284,19 +291,17 @@ fn parse_extra_data_roots(
     for part in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         let (name, path) = part
             .split_once('=')
-            .ok_or_else(|| format!("COGNEVA_BACKUP_EXTRA_DATA_ROOTS: {part:?} 不是 name=path"))?;
+            .ok_or_else(|| format!("{var}: {part:?} 不是 name=path"))?;
         let name = name.trim();
         let path = path.trim();
         if name.is_empty() || path.is_empty() {
-            return Err(
-                format!("COGNEVA_BACKUP_EXTRA_DATA_ROOTS: {part:?} 的 name 或 path 为空").into(),
-            );
+            return Err(format!("{var}: {part:?} 的 name 或 path 为空").into());
         }
         if name == "app" {
-            return Err("COGNEVA_BACKUP_EXTRA_DATA_ROOTS: `app` 是主数据根的名字，不能重复".into());
+            return Err(format!("{var}: `app` 是主数据根的名字，不能重复").into());
         }
         if roots.iter().any(|(n, _)| n == name) {
-            return Err(format!("COGNEVA_BACKUP_EXTRA_DATA_ROOTS: 根名 {name:?} 重复").into());
+            return Err(format!("{var}: 根名 {name:?} 重复").into());
         }
         roots.push((name.to_string(), PathBuf::from(path)));
     }
@@ -1655,21 +1660,19 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let manifest_path = pkg_dir.join("manifest.json");
-    if manifest_path.exists() {
-        let manifest: BackupManifest =
-            serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
-        tracing::info!(
-            version = %manifest.version,
-            revision = %manifest.revision,
-            instance = %manifest.instance_fingerprint,
-            created_at = %manifest.created_at,
-            "restoring package"
-        );
-        // 清单说这个包里有什么，此刻盘上是事实——两者对不上就停在这里。
-        verify_package_against_manifest(&pkg_dir, &manifest)?;
-    } else {
+    if !manifest_path.exists() {
         return Err(format!("{} missing manifest.json", pkg_dir.display()).into());
     }
+    let manifest: BackupManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+    tracing::info!(
+        version = %manifest.version,
+        revision = %manifest.revision,
+        instance = %manifest.instance_fingerprint,
+        created_at = %manifest.created_at,
+        "restoring package"
+    );
+    // 清单说这个包里有什么，此刻盘上是事实——两者对不上就停在这里。
+    verify_package_against_manifest(&pkg_dir, &manifest)?;
 
     let pg_dir = pkg_dir.join("pg");
     if pg_dir.exists() {
@@ -1706,10 +1709,199 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(files, bytes, "objects restored");
     }
 
+    // 产物层最后恢复，恢复不了就让整次恢复失败：包里的策略库与决策统计是
+    // 进化状态的权威面，缺了它们「恢复成功」只是一句结论。
+    let artifact_readings = restore_artifacts(&pkg_dir, &manifest, &data_dir).await?;
+    for reading in &artifact_readings {
+        tracing::info!(reading = %reading, "artifact restored");
+    }
+
     if let Some((root, _)) = &extract_root {
         let _ = std::fs::remove_dir_all(root);
     }
     tracing::info!("restore complete");
+    Ok(())
+}
+
+/// 把包里的产物层写回每个数据根，并在落地的字节上逐库验一遍。
+///
+/// 演练那一侧证明的是「包里的字节读得回来」；写回这一侧要回答的是「换一台机器
+/// 装得上，装上去的那一份还是完好的」。两件事不能互相代替：只备份不写回，
+/// 换机后策略库是空的、进程照样起得来；写回了不验，ACTIVE 指向一个不存在的
+/// 版本也照样能放进目录。
+///
+/// 目标根的取法与备份侧同一条：主根是 `COGNEVA_DATA_DIR`，追加根由
+/// `COGNEVA_RESTORE_EXTRA_DATA_ROOTS` 给出。包里有一个根而恢复端给不出目标路径
+/// 时**整次失败**——静默跳过就是换机后少了那份状态而回执说成功。
+async fn restore_artifacts(
+    pkg_dir: &Path,
+    manifest: &BackupManifest,
+    data_dir: &Path,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if manifest.artifacts.is_empty() {
+        // 旧格式的包没有这一段：缺段不是错，是当时没有这个段。
+        return Ok(Vec::new());
+    }
+    let mut targets: Vec<(String, PathBuf)> = vec![("app".to_string(), data_dir.to_path_buf())];
+    targets.extend(parse_extra_data_roots(
+        "COGNEVA_RESTORE_EXTRA_DATA_ROOTS",
+        std::env::var("COGNEVA_RESTORE_EXTRA_DATA_ROOTS").ok(),
+    )?);
+    restore_artifacts_into(pkg_dir, manifest, &targets).await
+}
+
+/// 目标表由调用方给出，这一半不读 env——`run_restore` 从 env 装配，测试直接给表。
+async fn restore_artifacts_into(
+    pkg_dir: &Path,
+    manifest: &BackupManifest,
+    targets: &[(String, PathBuf)],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut readings = Vec::new();
+    for root in &manifest.artifacts {
+        let target = targets
+            .iter()
+            .find(|(name, _)| name == &root.root)
+            .map(|(_, path)| path.clone())
+            .ok_or_else(|| {
+                format!(
+                    "包里有数据根 {:?}（备份时挂在 {}），恢复端没有它的目标路径；\
+                     用 COGNEVA_RESTORE_EXTRA_DATA_ROOTS 给出 name=path",
+                    root.root, root.data_dir
+                )
+            })?;
+        restore_artifact_root(pkg_dir, root, &target, &mut readings).await?;
+    }
+    Ok(readings)
+}
+
+/// 一个数据根：先落到目标根下的临时目录，验过再换到正式位置。
+///
+/// 直接往正式位置上写，会把「验不过」留在现网那一份里；先写暂存盘再换位，
+/// 坏包只会让一个 `.restore-*` 目录被删掉，正式位置仍是换位前的那一份。
+async fn restore_artifact_root(
+    pkg_dir: &Path,
+    root: &ArtifactRootReport,
+    target: &Path,
+    readings: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = pkg_dir.join("artifacts").join(&root.root);
+    std::fs::create_dir_all(target)?;
+    let scratch = target.join(format!(".restore-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&scratch)?;
+    let outcome = stage_artifact_root(&base, root, target, &scratch, readings).await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    outcome
+}
+
+async fn stage_artifact_root(
+    base: &Path,
+    root: &ArtifactRootReport,
+    target: &Path,
+    scratch: &Path,
+    readings: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if root.policies_present {
+        let src = base.join("policies");
+        if !src.is_dir() {
+            return Err(format!("{} 不在包里，但清单说这个根有策略库", src.display()).into());
+        }
+        let staged = scratch.join("policies");
+        copy_policy_tree(&src, &staged)?;
+        // 清单是一条一条写的，多出来的库没有声明就没有可比的对象——不许静默
+        // 写进去，也不许静默丢掉。两边都数，对不上就停。
+        let packaged = count_store_dirs(&src)?;
+        if packaged != root.policy_stores.len() as u64 {
+            return Err(format!(
+                "{} 里有 {packaged} 个策略库，清单只声明了 {}",
+                src.display(),
+                root.policy_stores.len()
+            )
+            .into());
+        }
+        // 验的是**将要落地的那一份**，不是包里的原件：拷贝本身就是一次可能出错
+        // 的搬运，验原件会把这一步的错误放过。
+        let store = cog_reflection::PolicyStore::new(staged.clone());
+        for reported in &root.policy_stores {
+            let line = verify_one_store(&store, &root.root, reported)
+                .await
+                .map_err(|e| format!("{}/policies/{}: {e}", root.root, reported.name))?;
+            readings.push(line);
+        }
+        sync_tree(&staged)?;
+        replace_dir(&staged, &target.join("policies"))?;
+    }
+
+    if let Some(stats) = &root.decision_stats {
+        let src = base.join("meta_learning").join("decision_stats.json");
+        let staged = scratch.join("decision_stats.json");
+        std::fs::copy(&src, &staged)?;
+        std::fs::File::open(&staged)?.sync_all()?;
+        let line = verify_one_stats(&staged, &root.root, stats)
+            .map_err(|e| format!("{}/meta_learning/decision_stats.json: {e}", root.root))?;
+        readings.push(line);
+        let dir = target.join("meta_learning");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::rename(&staged, dir.join("decision_stats.json"))?;
+        std::fs::File::open(&dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// 子目录数，口径与 `describe_policy_stores` 一致：只数名字能读成 UTF-8 的目录。
+fn count_store_dirs(policies_dir: &Path) -> std::io::Result<u64> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(policies_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && entry.file_name().to_str().is_some() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// 每个文件与目录都 sync 一遍，最后 sync 父目录。
+///
+/// 恢复完就可能断电：没有这一步，rename 成功而目录项还在页缓存里，机器起来
+/// 看到的是一个空目录——「恢复成功」变成了「什么都没恢复」。顺序是子先父后，
+/// 父目录的 sync 必须发生在子项都落盘之后才有意义。
+fn sync_tree(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            sync_tree(&entry.path())?;
+        } else {
+            std::fs::File::open(entry.path())?.sync_all()?;
+        }
+    }
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// 把一个目录换到正式位置：旧目录先挪到旁边，新目录再挪进来，挪失败就把旧的
+/// 挪回去。
+///
+/// 不做「先删旧的再 rename 新的」：那中间有一段时间正式位置是空的，此刻崩掉就
+/// 只剩下一个要人工拼的半成品。旧目录改名到 `.old-*` 之后立刻可回滚；仅当两步
+/// rename 之间断电才会留下「只有 `.old-*`、没有正式目录」的现场——恢复没有完成，
+/// 重跑一次从包里再落一份即可，原有字节还在盘上。
+fn replace_dir(staged: &Path, live: &Path) -> std::io::Result<()> {
+    let parked = live.with_file_name(format!(
+        ".{}.old-{}",
+        live.file_name().unwrap_or_default().to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let had_live = live.exists();
+    if had_live {
+        std::fs::rename(live, &parked)?;
+    }
+    if let Err(e) = std::fs::rename(staged, live) {
+        if had_live {
+            let _ = std::fs::rename(&parked, live);
+        }
+        return Err(e);
+    }
+    if had_live {
+        let _ = std::fs::remove_dir_all(&parked);
+    }
     Ok(())
 }
 
@@ -2748,13 +2940,15 @@ mod tests {
 
     #[test]
     fn extra_data_roots_must_name_their_path_and_not_collide() {
-        assert!(parse_extra_data_roots(None).unwrap().is_empty());
-        assert!(parse_extra_data_roots(Some("  ".into()))
+        let var = "COGNEVA_BACKUP_EXTRA_DATA_ROOTS";
+        assert!(parse_extra_data_roots(var, None).unwrap().is_empty());
+        assert!(parse_extra_data_roots(var, Some("  ".into()))
             .unwrap()
             .is_empty());
-        let roots = parse_extra_data_roots(Some(
-            "evolution=/var/lib/cogneva-evolution-data,memory=/var/lib/memory".into(),
-        ))
+        let roots = parse_extra_data_roots(
+            var,
+            Some("evolution=/var/lib/cogneva-evolution-data,memory=/var/lib/memory".into()),
+        )
         .unwrap();
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0].0, "evolution");
@@ -2762,10 +2956,202 @@ mod tests {
 
         // 坏条目让备份失败，不静默跳过：少一个根而包照样「成功」正是换机后
         // 才发现某份状态从没进过包的形状。
-        assert!(parse_extra_data_roots(Some("evolution".into())).is_err());
-        assert!(parse_extra_data_roots(Some("=/var/lib/x".into())).is_err());
-        assert!(parse_extra_data_roots(Some("app=/var/lib/x".into())).is_err());
-        assert!(parse_extra_data_roots(Some("a=/x,a=/y".into())).is_err());
+        assert!(parse_extra_data_roots(var, Some("evolution".into())).is_err());
+        assert!(parse_extra_data_roots(var, Some("=/var/lib/x".into())).is_err());
+        assert!(parse_extra_data_roots(var, Some("app=/var/lib/x".into())).is_err());
+        assert!(parse_extra_data_roots(var, Some("a=/x,a=/y".into())).is_err());
+    }
+
+    /// 只填本节用得到的段：其余段空着，恢复产物层不看它们。
+    fn manifest_with(artifacts: Vec<ArtifactRootReport>) -> BackupManifest {
+        BackupManifest {
+            version: "0.1.0".into(),
+            revision: "r".into(),
+            instance_fingerprint: "fp".into(),
+            namespace: "cogneva".into(),
+            created_at: "2026-10-19T00:00:00Z".into(),
+            secrets_keys: Vec::new(),
+            postgres: PostgresReport::default(),
+            qdrant: Vec::new(),
+            objects: ObjectsReport::default(),
+            artifacts,
+        }
+    }
+
+    /// 恢复侧要真的把产物层写回去：只把包放进目录不算恢复。
+    #[tokio::test]
+    async fn restore_writes_back_policies_and_decision_stats() {
+        let pkg = tempfile::tempdir().unwrap();
+        let source = pkg.path().join("artifacts/evolution");
+        let live = tempfile::tempdir().unwrap();
+        let data = live.path().join("data");
+        let store = cog_reflection::PolicyStore::new(data.join("policies"));
+        store
+            .save_new_version(
+                "meta_learning.mode",
+                serde_json::json!({"min_samples": 40}),
+                "t",
+            )
+            .await
+            .unwrap();
+        std::fs::create_dir_all(data.join("meta_learning")).unwrap();
+        std::fs::write(
+            data.join("meta_learning/decision_stats.json"),
+            serde_json::json!({"version": 1, "groups": [{"counts": {"a": [3, 2]}}]}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            data.join("policies/meta_learning.mode/000002.json.tmp"),
+            "{}",
+        )
+        .unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let report = collect_artifact_root("evolution", &data, staging.path())
+            .await
+            .unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::rename(staging.path().join("artifacts/evolution"), &source).unwrap();
+        let manifest = manifest_with(vec![report]);
+
+        // 目标根一开始是空的：写回这件事本身就是被测对象。
+        let target = tempfile::tempdir().unwrap();
+        let readings = restore_artifacts_into(
+            pkg.path(),
+            &manifest,
+            &[("evolution".to_string(), target.path().to_path_buf())],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(readings.len(), 2, "每个库一行、每份统计一行：{readings:?}");
+        let restored = cog_reflection::PolicyStore::new(target.path().join("policies"));
+        assert!(restored.verify_chain("meta_learning.mode").await.unwrap());
+        assert!(target
+            .path()
+            .join("policies/meta_learning.mode/ACTIVE")
+            .exists());
+        assert!(target
+            .path()
+            .join("meta_learning/decision_stats.json")
+            .exists());
+        assert!(
+            !target
+                .path()
+                .join("policies/meta_learning.mode/000002.json.tmp")
+                .exists(),
+            "暂存目录不能变成正式目录里的一部分"
+        );
+        assert!(
+            std::fs::read_dir(target.path()).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".restore-")),
+            "暂存目录用完要删掉"
+        );
+    }
+
+    /// 包里有清单没声明的库：不许静默写进去。没有声明就没有可比的对象，
+    /// 写进去等于让恢复端替备份端补一条它从没做过的判断。
+    #[tokio::test]
+    async fn a_store_the_manifest_does_not_declare_blocks_the_restore() {
+        let pkg = tempfile::tempdir().unwrap();
+        let source = pkg.path().join("artifacts/evolution");
+        let source_data = tempfile::tempdir().unwrap();
+        let store = cog_reflection::PolicyStore::new(source_data.path().join("policies"));
+        store
+            .save_new_version("meta_learning.mode", serde_json::json!({"n": 1}), "t")
+            .await
+            .unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let report = collect_artifact_root("evolution", source_data.path(), staging.path())
+            .await
+            .unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::rename(staging.path().join("artifacts/evolution"), &source).unwrap();
+        // 清单之后又冒出来一个库：备份端没读过它，恢复端不能替它签字。
+        std::fs::create_dir_all(source.join("policies/surprise.mode")).unwrap();
+
+        let target = tempfile::tempdir().unwrap();
+        let err = restore_artifacts_into(
+            pkg.path(),
+            &manifest_with(vec![report]),
+            &[("evolution".to_string(), target.path().to_path_buf())],
+        )
+        .await
+        .expect_err("多出来的库没有声明");
+        assert!(err.to_string().contains("策略库"), "{err}");
+    }
+
+    /// 包里的 ACTIVE 指不到版本时，恢复必须失败，且**不能**把现网那份覆盖掉。
+    #[tokio::test]
+    async fn a_broken_package_leaves_the_live_store_untouched() {
+        let pkg = tempfile::tempdir().unwrap();
+        let source = pkg.path().join("artifacts/evolution");
+        let source_data = tempfile::tempdir().unwrap();
+        let store = cog_reflection::PolicyStore::new(source_data.path().join("policies"));
+        store
+            .save_new_version("meta_learning.mode", serde_json::json!({"n": 1}), "t")
+            .await
+            .unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let report = collect_artifact_root("evolution", source_data.path(), staging.path())
+            .await
+            .unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::rename(staging.path().join("artifacts/evolution"), &source).unwrap();
+
+        // 现场：包已经解开了，但 ACTIVE 指向一个没有的版本。
+        std::fs::write(source.join("policies/meta_learning.mode/ACTIVE"), "9").unwrap();
+
+        let manifest = manifest_with(vec![report]);
+
+        let target = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(target.path().join("policies/meta_learning.mode")).unwrap();
+        std::fs::write(
+            target.path().join("policies/meta_learning.mode/ACTIVE"),
+            "keep me",
+        )
+        .unwrap();
+
+        let err = restore_artifacts_into(
+            pkg.path(),
+            &manifest,
+            &[("evolution".to_string(), target.path().to_path_buf())],
+        )
+        .await
+        .expect_err("ACTIVE 指向不存在的版本不能恢复成功");
+        assert!(
+            err.to_string().contains("ACTIVE"),
+            "要点名缺的是 ACTIVE：{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.path().join("policies/meta_learning.mode/ACTIVE"))
+                .unwrap(),
+            "keep me",
+            "验不过的包不许动现网那一份"
+        );
+    }
+
+    /// 包里有一个根、恢复端给不出目标路径：整次失败，不静默少写一个根。
+    #[tokio::test]
+    async fn a_packaged_root_without_a_target_path_fails_the_restore() {
+        let pkg = tempfile::tempdir().unwrap();
+        let manifest = manifest_with(vec![ArtifactRootReport {
+            root: "evolution".into(),
+            data_dir: "/var/lib/cogneva-evolution-data".into(),
+            policies_present: false,
+            policy_stores: Vec::new(),
+            decision_stats: None,
+        }]);
+        let err = restore_artifacts_into(
+            pkg.path(),
+            &manifest,
+            &[("app".to_string(), pkg.path().join("data"))],
+        )
+        .await
+        .expect_err("包里的根必须有目标路径");
+        assert!(err.to_string().contains("COGNEVA_RESTORE_EXTRA_DATA_ROOTS"));
     }
 
     /// 包只收持久件：版本 JSON 与 ACTIVE，写到一半的 `.tmp` 不进包；读回的数

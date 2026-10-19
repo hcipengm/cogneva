@@ -71,6 +71,37 @@ kubectl -n "$NS" wait --for=condition=Ready "pod/$STAGE_POD" --timeout=180s
 kubectl -n "$NS" cp "$PKG" "$STAGE_POD:/backups/$BASE"
 kubectl -n "$NS" delete pod "$STAGE_POD" --wait=true
 
+# 产物层写回：包里按数据根带了策略库与决策统计，恢复 Job 就必须每个根都挂得到。
+# 少挂一个根，恢复端会因为「包里有这个根、给不出目标路径」直接失败——这是有意
+# 的：静默少写一份，换机后那套进化状态就是空的，而回执说成功。
+EVOLUTION_ENV=""
+EVOLUTION_MOUNTS=""
+EVOLUTION_VOLUMES=""
+EVOLUTION_AFFINITY=""
+if kubectl -n "$NS" get pvc cogneva-evolution-data-pvc >/dev/null 2>&1; then
+    EVOLUTION_ENV='            - name: COGNEVA_RESTORE_EXTRA_DATA_ROOTS
+              value: "evolution=/var/lib/cogneva-evolution-data"'
+    EVOLUTION_MOUNTS='            - name: evolution-data
+              mountPath: /var/lib/cogneva-evolution-data'
+    EVOLUTION_VOLUMES='        - name: evolution-data
+          persistentVolumeClaim:
+            claimName: cogneva-evolution-data-pvc'
+    # 进化卷是 RWO：只有与持有它的 Pod 落在同一节点才挂得上。进化 Pod 不在场时
+    # 加这条会让 Job 永远调度不上（required 亲和找不到目标），所以只在场才钉。
+    if kubectl -n "$NS" get pods \
+        -l app.kubernetes.io/name=cogneva-evolution,app.kubernetes.io/component=evolution \
+        -o name | grep -q .; then
+        EVOLUTION_AFFINITY='      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: cogneva-evolution
+                  app.kubernetes.io/component: evolution
+              topologyKey: kubernetes.io/hostname'
+    fi
+fi
+
 kubectl -n "$NS" apply -f - <<EOF
 apiVersion: batch/v1
 kind: Job
@@ -86,6 +117,7 @@ spec:
   template:
     spec:
       restartPolicy: Never
+$EVOLUTION_AFFINITY
       containers:
         - name: restore
           image: $IMAGE
@@ -100,9 +132,11 @@ spec:
               value: "postgres://cog_user:\$(PG_PASSWORD)@postgres.$NS.svc.cluster.local:5432/cogneva"
             - name: COGNEVA_QDRANT_HTTP_URL
               value: "http://qdrant.$NS.svc.cluster.local:6333"
+$EVOLUTION_ENV
           volumeMounts:
             - name: data
               mountPath: /var/lib/cogneva-data
+$EVOLUTION_MOUNTS
             - name: backup
               mountPath: /backups
               readOnly: true
@@ -110,6 +144,7 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: cogneva-data-pvc
+$EVOLUTION_VOLUMES
         - name: backup
           persistentVolumeClaim:
             claimName: cogneva-backup-pvc
