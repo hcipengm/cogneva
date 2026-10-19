@@ -14,7 +14,7 @@
 //! Ordering the whole tier behind the debt fixed that and created the opposite
 //! silence: a human-held row nothing had looked at was behind the debt, the debt
 //! runs deeper than one pass takes, so the row was never looked at at all. That
-//! is what `unmeasured_judgement` is for -- a lane of its own with its own bound
+//! is what `unsettled_judgement` is for -- a lane of its own with its own bound
 //! -- and what the last case here checks.
 //!
 //! Three directions are checked, because any one of them alone can be satisfied
@@ -47,7 +47,10 @@
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
-use cog_core::{PrincipleCheckKind, PrincipleLedgerStore, PrincipleReading};
+use cog_core::{
+    PrincipleCheckKind, PrincipleLedgerStore, PrincipleMeasurement, PrincipleReading,
+    PrincipleState,
+};
 use cog_storage::PostgresPrincipleLedgerStore;
 
 /// One pass over one table.
@@ -565,7 +568,7 @@ async fn a_retirement_reading_is_not_buried_by_the_debt_ahead_of_it() {
 /// What the sweep lane offers this fixture, in the lane's own order.
 async fn swept(store: &PostgresPrincipleLedgerStore, marker: &str) -> Vec<String> {
     store
-        .unmeasured_judgement(PASS_BOUND)
+        .unsettled_judgement(PASS_BOUND)
         .await
         .expect("read the sweep lane")
         .into_iter()
@@ -631,6 +634,70 @@ async fn a_never_looked_held_row_is_offered_even_when_the_debt_fills_the_pass() 
     assert!(
         row.measured_at.is_some(),
         "the look is what takes it out of the lane"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
+/// A row looked at before the verdict read its host column keeps an empty state
+/// while its own reading names a gate. The batch sorts the tier behind the debt,
+/// so nothing else asks it again: the lane has to, or the row reports "no gate"
+/// for as long as its own evidence says otherwise.
+///
+/// A stamped row whose host column names no gate stays out -- its answer has not
+/// changed, and re-stamping it every pass would spend the lane on the same rows.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_stamped_held_row_whose_host_column_names_a_gate_is_asked_again() {
+    let _pass = PASS.lock().await;
+    let (store, pool, marker) = store().await;
+    let gated = format!("{marker}/gated-000");
+    let ungated = format!("{marker}/ungated-000");
+
+    let mut gated_reading = reading(&gated, PrincipleCheckKind::Judgement);
+    gated_reading.host_gate = Some("test:probe-gated.test.sh".into());
+    let ungated_reading = reading(&ungated, PrincipleCheckKind::Judgement);
+    store
+        .declare(&[gated_reading, ungated_reading])
+        .await
+        .expect("queue the readings");
+    for _ in 0..4 {
+        let fold = store
+            .fold_declarations(PASS_BOUND * 2)
+            .await
+            .expect("fold the queue");
+        if fold.folded == 0 {
+            break;
+        }
+    }
+
+    // The shape the verdict used to leave behind: both rows looked at, stamped,
+    // state empty, and one of them still naming a gate.
+    for slug in [&gated, &ungated] {
+        store
+            .record_human_only(slug, Some("probe-rev"))
+            .await
+            .expect("record the look");
+    }
+
+    let offered = swept(&store, &marker).await;
+    assert_eq!(
+        offered,
+        vec![gated.clone()],
+        "the lane asks again exactly the stamped row whose own reading names a gate"
+    );
+
+    // A verdict settles it, and the row leaves the lane because the state now
+    // answers the question its host column raised.
+    let mut measurement = PrincipleMeasurement::new(&gated, PrincipleState::Enforced);
+    measurement.platform_gate = None;
+    store
+        .apply_principle_measurement(&measurement)
+        .await
+        .expect("write the verdict");
+    assert!(
+        swept(&store, &marker).await.is_empty(),
+        "a settled row is not asked again"
     );
 
     cleanup(&pool, &marker).await;

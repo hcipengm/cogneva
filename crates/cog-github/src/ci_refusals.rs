@@ -320,7 +320,7 @@ mod tests {
         async fn record_human_only(&self, _: &str, _: Option<&str>) -> SFResult<()> {
             unimplemented!()
         }
-        async fn unmeasured_judgement(&self, _: usize) -> SFResult<Vec<PrincipleRow>> {
+        async fn unsettled_judgement(&self, _: usize) -> SFResult<Vec<PrincipleRow>> {
             unimplemented!()
         }
         async fn outstanding(&self, _: usize) -> SFResult<Vec<PrincipleRow>> {

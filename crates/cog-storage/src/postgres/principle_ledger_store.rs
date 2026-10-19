@@ -337,18 +337,31 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         Ok(())
     }
 
-    async fn unmeasured_judgement(&self, limit: usize) -> SFResult<Vec<PrincipleRow>> {
+    async fn unsettled_judgement(&self, limit: usize) -> SFResult<Vec<PrincipleRow>> {
         // Oldest first: the row that has waited longest for its first look goes
         // first, and the marker test keeps a row a retired carrier left behind
         // out of this lane -- its marker is what the fold clears, and stamping
         // it here would leave the row retired in everything but the query it
         // just fell out of.
+        //
+        // A stamped row is in this lane only when its host column names a gate:
+        // the verdict that reads that column is code, so a row looked at before
+        // that verdict existed keeps an empty state while its own evidence says
+        // a machine holds it, and nothing else asks the row again -- the batch
+        // sorts the tier behind a debt deeper than one pass. The dashed and
+        // `stale:` values are the host registry saying "no gate" and "I could
+        // not read it"; neither is evidence to settle on, and listing them here
+        // would re-stamp rows that have not changed. One look writes the verdict
+        // and the row leaves the lane.
         let rows = sqlx::query(&format!(
             "SELECT {ROW_COLUMNS} FROM principle_ledger \
-             WHERE state IS NULL AND measured_at IS NULL \
+             WHERE state IS NULL \
                AND check_kind = 'judgement' \
                AND (host_gate IS NULL OR host_gate NOT LIKE 'retired:%') \
-             ORDER BY first_seen_at ASC, slug ASC \
+               AND (measured_at IS NULL \
+                    OR (COALESCE(host_gate, '') NOT IN ('', '-') \
+                        AND host_gate NOT LIKE 'stale:%')) \
+             ORDER BY (measured_at IS NOT NULL) ASC, first_seen_at ASC, slug ASC \
              LIMIT $1"
         ))
         .bind(limit as i64)
@@ -376,7 +389,7 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         // A human-held row no pass has looked at yet is not reachable through
         // this query at all while the debt runs deeper than one pass: the tier
         // ordering above puts it behind all of it. That case is served by
-        // `unmeasured_judgement`, which asks for exactly those rows with its own
+        // `unsettled_judgement`, which asks for exactly those rows with its own
         // bound; the ordering here stays as it is so a settleable row is never
         // crowded out by a sweep that could take the whole pass.
         //

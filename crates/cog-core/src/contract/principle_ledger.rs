@@ -553,21 +553,32 @@ pub trait PrincipleLedgerStore: Send + Sync {
     /// human-held are different answers, and only the second one is writable.
     async fn record_human_only(&self, slug: &str, measured_rev: Option<&str>) -> SFResult<()>;
 
-    /// The human-held rows no look has reached yet, oldest first.
+    /// The `judgement` rows whose empty state the batch cannot revisit, oldest
+    /// look first.
     ///
-    /// These are the `judgement` rows with an empty state and an empty
-    /// `measured_at`: a person holds them and no pass has looked since the row
-    /// was minted. They are asked for directly rather than through
-    /// [`Self::outstanding`] because that query sorts the whole tier behind the
-    /// debt, and the debt runs deeper than one pass takes -- a row nothing has
-    /// looked at would then wait behind work that is re-read every pass, which
-    /// is how a settled answer reads as "never looked at" for as long as the
-    /// account is busy.
+    /// Two shapes land here. A row no pass has looked at (empty `measured_at`)
+    /// is held by a person, and the answer exists before anyone reads it. A row
+    /// that *has* been stamped lands here when its host column names a gate --
+    /// the stored evidence says a machine holds this principle while the state
+    /// says nobody settled it, and a later verdict can only be written by
+    /// looking again, which the batch will not do.
+    ///
+    /// Both are asked for directly rather than through [`Self::outstanding`]
+    /// because that query sorts the whole tier behind the debt, and the debt
+    /// runs deeper than one pass takes -- such a row would wait behind work
+    /// that is re-read every pass, which is how a settled answer reads as
+    /// "never looked at" for as long as the account is busy. A stamped row
+    /// whose host column names no gate is left out: nothing on it has changed,
+    /// and re-stamping it every pass would spend the lane on the same rows. The
+    /// platform's side needs no case here, because a declaration is read from
+    /// the registry each pass and its row is rescued before the batch is cut.
+    ///
+    /// Never-looked rows sort ahead of stamped ones.
     ///
     /// The bound is the caller's: the sweep is a lane of its own, and what it
     /// costs one pass is a number a reader can point at rather than whatever is
     /// left of the debt budget.
-    async fn unmeasured_judgement(&self, limit: usize) -> SFResult<Vec<PrincipleRow>>;
+    async fn unsettled_judgement(&self, limit: usize) -> SFResult<Vec<PrincipleRow>>;
 
     /// The rows that are not `enforced`, stalest look first.
     ///

@@ -554,14 +554,17 @@ async fn measure_pass(
     // the same reason: the tier sorts behind the debt and the debt is deeper
     // than one pass. Asking for them by their own query is what gives the
     // answer "no gate is meant to exist" a first look instead of leaving it
-    // indistinguishable from a row nothing has ever seen.
-    let sweep = match store.unmeasured_judgement(HUMAN_ONLY_SWEEP_PER_PASS).await {
+    // indistinguishable from a row nothing has ever seen. A row that was looked
+    // at before the verdict learned to read its host column arrives the same
+    // way: its stored gate is visible, the verdict it should now produce is not,
+    // and only another look writes it.
+    let sweep = match store.unsettled_judgement(HUMAN_ONLY_SWEEP_PER_PASS).await {
         Ok(rows) => rows,
         Err(e) => {
             warn!(
                 error = %e,
-                "principle ledger: the human-held rows no look has reached could not be read, \
-                 so this pass looks at none of them"
+                "principle ledger: the judgement rows their empty state has kept out of the \
+                 batch could not be read, so this pass looks at none of them"
             );
             Vec::new()
         }
@@ -1370,7 +1373,7 @@ mod tests {
             self.human_only.lock().unwrap().push(slug.to_string());
             Ok(())
         }
-        async fn unmeasured_judgement(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
+        async fn unsettled_judgement(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
             Ok(Vec::new())
         }
         async fn outstanding(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
@@ -1562,7 +1565,7 @@ mod tests {
         async fn record_human_only(&self, _: &str, _: Option<&str>) -> cog_core::SFResult<()> {
             Ok(())
         }
-        async fn unmeasured_judgement(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
+        async fn unsettled_judgement(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
             Ok(Vec::new())
         }
         async fn outstanding(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
