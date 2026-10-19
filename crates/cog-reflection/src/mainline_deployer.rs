@@ -6313,10 +6313,17 @@ fn heartbeat_message(
         .map(|f| format!("{}@{:?}", rev12(&f.rev), f.phase))
         .unwrap_or_else(|| "none".into());
     format!(
-        "bare={} upstream={} last_good={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={}",
+        "bare={} upstream={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={}",
         rev12(bare_rev),
         upstream,
         state.last_good_rev.as_deref().map(rev12).unwrap_or("none"),
+        // 活体有多旧。`last_good_rev` 只答"上的哪一版"，答不出"多久之前"；而落后多少
+        // 分钟正是读这一行的人要判的那件事——一版刚上是这个 sha、上一版在六小时前也是
+        // 这个 sha。0 是旧状态文件里没有这一格时的值，那时说"不知道"，不按月报一个数。
+        match state.last_good_unix {
+            0 => "unknown".to_string(),
+            t => (now_unix - t).max(0).to_string(),
+        },
         in_flight,
         state
             .ci_hold
@@ -8737,12 +8744,30 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         // 按住多久也是一格：没有它，"刚按住"与"按住一整天"同形。
         assert!(msg.contains("ci_hold_secs=none"), "{msg}");
         assert!(msg.contains("last_good=4dfd51ff1209"), "{msg}");
+        // 这一份状态没有落地时刻（旧文件里没这一格）：说"不知道"，不按 0 算出一个天文数字。
+        assert!(msg.contains("last_good_secs=unknown"), "{msg}");
         assert!(msg.contains("in_flight=none"), "{msg}");
         assert!(msg.contains("failed_rev=none"), "{msg}");
         assert!(msg.contains("failed_class=none"), "{msg}");
         assert!(msg.contains("failed_loci=0"), "{msg}");
         assert!(msg.contains("failed_repeated=false"), "{msg}");
         assert!(msg.contains("cooldown_remaining_secs=0"), "{msg}");
+    }
+
+    /// 活体有多旧是一格独立的读数：只写 rev 的话，「刚滚上去」与「上次滚是六小时前」
+    /// 在这一行上完全同形，而后者正是要去看构建闸为什么轮不到的那一拍。
+    #[test]
+    fn heartbeat_message_says_how_old_the_live_revision_is() {
+        let state = MainlineState {
+            last_good_rev: Some("4dfd51ff1209abcdef".into()),
+            last_good_unix: 1_700_000_000,
+            ..Default::default()
+        };
+        let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", "off", 1_700_003_300);
+        assert!(msg.contains("last_good_secs=3300"), "{msg}");
+        // 时钟回拨不印负数：印出来会被读成「还没上线就先记了一笔」。
+        let msg = heartbeat_message(&state, "4dfd51ff1209abcdef", "off", 1_699_999_000);
+        assert!(msg.contains("last_good_secs=0"), "{msg}");
     }
 
     #[test]
