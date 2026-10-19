@@ -49,6 +49,15 @@ mirror() {
     mkdir -p "${work}/root/$(dirname "${ev}")"
     cp "${repo}/${ev}" "${work}/root/${ev}"
   done < <(awk -F'\t' '$3=="api" && $6!="" {print $6}' "${repo}/${registry}")
+  # The role rows name their migration window's end in prose (`closes-when=`), and
+  # the gate holds those pointers to files that exist just like the api rows'
+  # evidence column — so they have to be staged here too, or case 1 reads the
+  # copy's lack of source as a rusted pointer.
+  while read -r ev; do
+    [ -n "${ev}" ] || continue
+    mkdir -p "${work}/root/$(dirname "${ev}")"
+    cp "${repo}/${ev}" "${work}/root/${ev}"
+  done < <(grep -o 'closes-when=[^ :]*' "${repo}/${registry}" | cut -d= -f2 | sort -u)
 }
 mirror
 
@@ -187,7 +196,7 @@ grep -q "Deployment/cogneva/.*按名读 cogneva-secrets/smtp-password" <<<"${out
 mirror
 rm -f "${work}/root/${LLM_ADMIN_BINDING}"
 out="$(run_gate)" && fail "授权没有持有者时应当红，实际绿：${out}"
-grep -q "Role/cogneva-llm-admin 授了 Secret 的 read,write，却没有 RoleBinding" <<<"${out}" \
+grep -q "Role/cogneva-llm-admin 授了 Secret 的 read，却没有 RoleBinding" <<<"${out}" \
   || fail "没报出谁也用不到的授权：${out}"
 
 # 8) Role 的动词里 patch 被去掉（三种形态都改，落到登记表那一侧）
