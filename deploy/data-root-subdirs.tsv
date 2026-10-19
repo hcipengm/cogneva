@@ -1,0 +1,33 @@
+# 数据根的一级子目录：每一个都必须在这里被标成 authoritative 或 discardable。
+#
+# 为什么需要这张表：数据根是「换机后有没有丢东西」的实际边界，而它是**谁都没列过**的
+# 一张表——新增一个子目录时，备份 Job 照旧绿、恢复演练照旧绿、包里就是少了一棵树。
+# `warehouse/` 就是这么进来的：它是学习数仓的导出面，代码里写在 `{data_dir}/warehouse`，
+# 而在它出现之前没有任何一份清单提过它。
+#
+# 正本是本文件；判据在 `deploy/scripts/check-backup-coverage.sh`。门禁的普查面是四条
+# 来源的并集，**不是**本表自己：
+#   1. `crates/**/*.rs`（`#[cfg(test)]` 之前）里由 `data_dir` / `COGNEVA_DATA_DIR`
+#      拼出来的一级路径段；
+#   2. 应用配置里以数据根开头的路径值（`base_path`、`base_dir` …）；
+#   3. 渲染清单里指向数据根的 `hostPath` / `mountPath`（`git-remote` 只在这里出现）；
+#   4. 本机真的存在某个数据根时，它的一级子目录（`--live`；CI 里没有数据根，这一条为空）。
+# 普查到而没有分类 = 红。反过来，表里有而普查没看到不算错——有些子目录只在特定部署
+# 形态或特定功能开关下才出现，那一行是给读的人留的说明。
+#
+# 列：subdir  roots  class  what  why  evidence
+#   roots   这个子目录出现在哪个数据根下：main（主数据根）/ evolution（进化数据根）
+#   class   authoritative = 丢了就不是这台机器了，必须在包里；discardable = 可以从别处重建
+#   why     authoritative 写它由谁带；discardable 写**凭什么**可以从别处重建
+#   evidence 代码 / 配置里的出处，门禁核它还在树上（指针防锈）
+subdir	roots	class	what	why	evidence
+storage	main	authoritative	对象层（providers.storage.options.base_path）	包里的 objects 段逐文件带走并计数	crates/cogneva/src/backup.rs
+policies	main,evolution	authoritative	策略库版本文件与 ACTIVE	包里的 artifacts 段按「数据根 + 库名」逐库带走	crates/cog-reflection/src/plugin.rs
+meta_learning	main,evolution	authoritative	决策统计快照	包里的 artifacts 段带走，运行时正本是 PG 表，二者按格取大	crates/cogneva/src/backup.rs
+git-remote	evolution	authoritative	进化的 bare 仓库	包**不**带它：已推 rev 从远端重取，未推的在 lossy_surfaces 里点名；A18 的 git bundle 是补齐这一格的路	crates/bootstrap/src/main.rs
+raw-logs	main	discardable	原始来源归档（raw_logger.base_dir）	抽取结果已落 PG 的权威面；重抽取要从上游重抓，代价是时间不是数据	deploy/helm/cogneva/files/cogneva.json
+warehouse	main	discardable	学习数仓的 JSONL 导出（{data_dir}/warehouse）	它是 PG 与策略库的导出面，不是权威面；数据在来源与 PG 里	crates/cog-reflection/src/plugin.rs
+landing	main	discardable	落地通道的每次落地记录与工作副本	落地的结果以 git 提交与服务状态为准；这些文件是过程记录	crates/cog-github/src/landing.rs
+git-workdir	main	discardable	落地通道的共享 git 工作副本	它是一次克隆的工作区，从远端仓库重新克隆即得	crates/cog-github/src/config.rs
+pending-changes	main	discardable	还没投递出去的已生成变更（每条一个 json）	已投递的以 change_ledger 与 git 上的提交为准；没投递的那次生成换机后重跑一遍生成，代价是一次生成而不是系统缺一块	crates/cog-github/src/pending_changes.rs
+eval	main	discardable	评测数据集（{data_dir}/eval/datasets）	`deploy/scripts/fetch-benchmark-data.sh` 可从公开来源重取	crates/cog-gateway/src/lib.rs

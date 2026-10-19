@@ -1445,6 +1445,11 @@ fn lossy_surfaces() -> Vec<LossySurface> {
             "未推送到远端的进化 rev（若 manifest 未带 git bundle）",
             "已推的 rev 可从远端重取；未推的部分由 A18 的 bundle 覆盖，或在此被点名为损失",
         ),
+        (
+            "pending-changes",
+            "还没投递出去的已生成变更（数据根下 pending-changes/）",
+            "已投递的变更以 change_ledger 与 git 上的提交为准；没投递的那次生成换机后重跑，代价是一次生成",
+        ),
     ]
     .into_iter()
     .map(|(name, lost, why)| LossySurface {

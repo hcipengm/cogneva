@@ -621,6 +621,11 @@ jobs:
       # Environment= 或一个 0644 的 env 文件里，渲染期同样没有症状。
       - name: Check host credential surface
         run: bash deploy/scripts/check-host-credential-surface.sh
+      # 备份覆盖面：每个挂到数据目录的 PVC 都要进备份 Job 的挂载面，且每个数据根的
+      # 一级子目录都要被分类过。漏一个 claim、多一棵没人提过的子树，渲染期都没有
+      # 症状——清单合法、parity 绿，换机时就是少了一整块。
+      - name: Check backup coverage
+        run: bash deploy/scripts/check-backup-coverage.sh
       # 空白机恢复的步骤顺序：每一步的 requires 都要由更早的一步产出，等网关的
       # 步骤之前要真有一个网关。这条在渲染期同样没有症状——步骤清单读起来是
       # 对的，坏在「第 3 步在第 2 步之前」，只有空白机上跑到一半才会发现。
