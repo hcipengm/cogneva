@@ -23,6 +23,10 @@
 #      「树上有读者」且「读它是 optional」——否则读者按名读一个没人建的键就起不来。
 #   5. 三种部署形态的持有面逐条相同（含权限面）：登记表不带形态维，而"只在某一个
 #      形态里多挂了一个凭证"是最容易漏看的一种——用另一个形态的清单去看永远看不见。
+#   6. 带外片的 role 写权限只能落在安全网关那个主体上：多一个能 patch 的人，等于
+#      把「代持带外凭证」复制一份，而清单上只多了一个对象名。
+#   7. 迁移窗必须写 `closes-when=<文件>:<符号>`，且那些读点全部搬走（符号都不在树
+#      上了）就红：「迁移窗」三个字是状态描述，不是判据，它不会自己到期。
 #
 # 本门**核不到**的一条路，写在登记表里而不是假装核过：进程内经 Kubernetes API 读
 # 某个键（`path = api` 的行）。渲染产物里看不到它，evidence 列给出读它的代码文件，
@@ -37,7 +41,7 @@ cd "$ROOT"
 
 command -v python3 >/dev/null || { echo "缺少依赖：python3" >&2; exit 2; }
 python3 - <<'PYEOF'
-import glob, os, sys, yaml
+import glob, os, re, sys, yaml
 
 RENDERED = "deploy/rendered"
 REGISTRY = "deploy/credential-holders.tsv"
@@ -282,6 +286,44 @@ for obj, key, path, holder, access, evidence, _ in rows:
     elif not os.path.exists(evidence):
         failures.append(f"{obj}/{key}（api）的 evidence {evidence!r} 在树上不存在：指针锈了")
 
+# 6) 带外片的 role 写权限只能落在安全网关这一个主体上。
+#    多一个能 patch 的主体，等于把「代持带外凭证」复制一份；而清单上看起来只是
+#    多了一个对象名，读清单的人不会意识到那是一个能改写上游密钥与平台 token 的人。
+GW_SA = "ServiceAccount/cogneva-security-gateway"
+for obj, key, path, holder, access, evidence, note in rows:
+    if obj == OBJS[1] and path == "role" and "write" in access and holder != GW_SA:
+        failures.append(
+            f"{holder} 对带外片 {obj}/{key} 有写权限（{access}）：写点只该在 {GW_SA}，"
+            "其余主体的写入应当经 secret_write::forward 交给网关")
+
+# 7) 迁移窗必须带可判读的关闭条件，且条件成立就红。
+#    「迁移窗」三个字是状态描述，不是判据：它不会自己到期。closes-when 把窗口的终点
+#    指到一段代码上——那些读点搬走以后，授权和登记都应该消失；门在这里报红，是因为
+#    到那时没人再读它，留着就是一条无主的凭证权限。多条 closes-when 全部成立才红：
+#    只要还有一条读点没搬走，这条授权就还在被用。
+CLOSE_RE = re.compile(r"closes-when=([^\s:]+):(\S+)")
+for obj, key, path, holder, access, evidence, note in rows:
+    if "迁移窗" not in note:
+        continue
+    conds = CLOSE_RE.findall(note)
+    where = f"{obj}/{key} 的 {holder}"
+    if not conds:
+        failures.append(
+            f"{where} 还是迁移窗，但 note 里没有 closes-when=<文件>:<符号>："
+            "没有关闭条件的窗口等于永久授权")
+        continue
+    missing = 0
+    for file, sym in conds:
+        if not os.path.exists(file):
+            failures.append(f"{where} 的关闭条件指向 {file!r}，树上没有这个文件：指针锈了")
+            continue
+        if sym not in open(file, encoding="utf-8", errors="replace").read():
+            missing += 1
+    if missing == len(conds):
+        failures.append(
+            f"{where} 的关闭条件已全部成立（{'、'.join(s for _, s in conds)} 都不在树上了）："
+            "这些读点已经搬走，删掉这条授权与这一行登记")
+
 if failures:
     print("CREDENTIAL HOLDER SURFACE FAIL：", file=sys.stderr)
     for f in failures:
@@ -290,11 +332,18 @@ if failures:
 
 per_obj = {obj: sum(1 for r in rows if r[0] == obj) for obj in OBJS}
 api_rows = sum(1 for r in rows if r[2] == "api")
+oob_roles = sorted({(r[3], r[4]) for r in rows if r[0] == OBJS[1] and r[2] == "role"})
 print(
     f"CREDENTIAL HOLDER SURFACE OK：{len(rows)} 条登记与渲染产物对齐"
     f"（{OBJS[0]} {per_obj[OBJS[0]]} 条 / {OBJS[1]} {per_obj[OBJS[1]]} 条）；"
     f"写者声明键 {sum(len(k) for k in declared.values())} 个，无一漏登记；"
     f"{len(profiles)} 种形态的持有面逐条相同（{len(observed)} 个持有者）。"
     f"其中 {api_rows} 条走 API 路径，本门核不到（只核代码指针），见登记表"
+)
+oob_role_text = "；".join(f"{h}={a}" for h, a in oob_roles) or "无"
+oob_volumes = sorted({r[3] for r in rows if r[0] == OBJS[1] and r[2] == "volume"})
+print(
+    "带外片的 role 路径读者：" + oob_role_text
+    + "；另有整对象卷挂：" + ("、".join(oob_volumes) or "无")
 )
 PYEOF
