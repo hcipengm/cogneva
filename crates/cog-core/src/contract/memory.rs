@@ -1390,6 +1390,8 @@ mod tests {
         );
     }
 
+    /// principle: feedback_merging_an_observation_must_carry_the_stored_rows_own_readings
+    ///
     /// The retrieval reading belongs to the stored row, not to the observation
     /// being folded into it. A re-extraction starts from a freshly built entry,
     /// so its counters are zero; a merge that took the observed side's values
@@ -1411,6 +1413,7 @@ mod tests {
         let from_elsewhere = entry("ns", "raw-b", "gateway");
         let merged = merge_schema_observation(&stored, &from_elsewhere);
         assert_eq!(merged.retrieval_count, 7);
+        assert_eq!(merged.last_retrieved_at, stored.last_retrieved_at);
     }
 
     /// Two sources describing one entity usually describe different facets of
