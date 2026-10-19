@@ -1415,14 +1415,17 @@ impl DagExecutor {
         Ok((retried, cancelled, dlq_pushed))
     }
 
-    async fn cancel_task_store(&self, task_id: &str) -> SFResult<Vec<String>> {
+    /// The store-mode half of [`Self::cancel_task_with_reason`]: one conditional
+    /// write on the backend, then the events for the task and everything it
+    /// cascaded to.
+    async fn cancel_task_store_with(&self, task_id: &str, reason: String) -> SFResult<Vec<String>> {
         let be = self.fg().expect("store mode");
         let cancelled = be
-            .dag_cancel_task(&self.workspace_id, task_id, "Direct cancellation".into())
+            .dag_cancel_task(&self.workspace_id, task_id, reason.clone())
             .await?;
         self.emit_event(cog_core::TaskEvent::TaskCancelled {
             task_id: task_id.into(),
-            reason: "Direct cancellation".into(),
+            reason: reason.clone(),
             timestamp: chrono::Utc::now(),
         })
         .await;
@@ -1785,6 +1788,106 @@ impl DagExecutor {
             .into_iter()
             .collect();
         tasks.into_iter().filter(|t| ids.contains(&t.id)).collect()
+    }
+
+    /// Pure classifier for Pending tasks that nothing can ever unblock.
+    ///
+    /// Readiness asks every predecessor to be `Completed`. A predecessor that
+    /// ended `Failed` or `Cancelled` will never become that, and one that is not
+    /// in the graph at all never will either — so the task behind it is Pending
+    /// for the rest of the deployment's life. Nothing is wrong with the
+    /// executor in that state: the publisher scans the row on every tick, the
+    /// readiness filter rejects it on every tick, and the row's age keeps
+    /// growing in `cogneva_task_oldest_untouched_seconds` while it reads like a
+    /// stalled queue.
+    ///
+    /// The failure and cancel paths already cancel the dependents that existed
+    /// when they ran. This covers the ones that were added afterwards — a plan
+    /// whose ids collide with rows of an earlier goal, or a dependency written
+    /// against a task that was never persisted. Returns each such task with the
+    /// predecessor that settled it and what that predecessor's state is.
+    pub fn unblockable_dependents<'a>(
+        tasks: impl IntoIterator<Item = &'a Task>,
+    ) -> Vec<(String, String, String)> {
+        let tasks: Vec<&Task> = tasks.into_iter().collect();
+        let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), *t)).collect();
+        tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Pending)
+            .filter_map(|t| {
+                let blocker =
+                    t.blocked_by
+                        .iter()
+                        .find(|dep_id| match by_id.get(dep_id.as_str()) {
+                            Some(dep) => {
+                                matches!(dep.status, TaskStatus::Failed | TaskStatus::Cancelled)
+                            }
+                            None => true,
+                        })?;
+                let state = by_id
+                    .get(blocker.as_str())
+                    .map(|dep| dep.status.as_str())
+                    .unwrap_or("missing");
+                Some((t.id.clone(), blocker.clone(), state.to_string()))
+            })
+            .collect()
+    }
+
+    /// Cancel every Pending task no earlier task can ever release.
+    ///
+    /// Cancelling is what the failure path does to the dependents that exist at
+    /// the moment it fails; this is the same outcome for the ones that appear
+    /// after it. The task never ran, so nothing is charged against a retry
+    /// budget, and the cancel cascades to its own dependents through the
+    /// ordinary cancel path, which is also what derives the goal row's terminal
+    /// state from its declared sink.
+    ///
+    /// A predecessor that is absent is not the same evidence as one that has
+    /// settled. A batch is written one row at a time, so a row whose predecessor
+    /// is later in the same batch is briefly referencing an id that is not in
+    /// the graph yet, and this sweep runs between ticks. Only a row older than
+    /// `missing_grace` may be read as "that id never existed"; a settled
+    /// predecessor needs no grace, because it cannot come back.
+    pub async fn reclaim_unblockable_dependents(
+        &self,
+        missing_grace: chrono::Duration,
+    ) -> Vec<String> {
+        let tasks = self.all_tasks_unified().await;
+        let missing_before = chrono::Utc::now() - missing_grace;
+        let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        let mut cancelled = Vec::new();
+        for (task_id, blocker, blocker_state) in Self::unblockable_dependents(tasks.iter()) {
+            if blocker_state == "missing" {
+                let old_enough = by_id
+                    .get(task_id.as_str())
+                    .is_some_and(|t| t.updated_at < missing_before);
+                if !old_enough {
+                    continue;
+                }
+            }
+            let reason = format!(
+                "Cancelled without being run: predecessor '{blocker}' is {blocker_state}, \
+                 so this task can never become ready"
+            );
+            match self.cancel_task_with_reason(&task_id, reason).await {
+                Ok(downstream) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        blocker = %blocker,
+                        blocker_state = %blocker_state,
+                        downstream = downstream.len(),
+                        "cancelled a task whose predecessor had already settled: it could never become ready"
+                    );
+                    cancelled.push(task_id);
+                }
+                Err(e) => tracing::warn!(
+                    task_id = %task_id,
+                    blocker = %blocker,
+                    "cannot cancel a task that can never become ready: {e}"
+                ),
+            }
+        }
+        cancelled
     }
 
     /// Validate that a task is a terminable orphan: Pending non-executable
@@ -2578,8 +2681,22 @@ impl DagExecutor {
     }
 
     pub async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>> {
+        self.cancel_task_with_reason(task_id, "Direct cancellation".into())
+            .await
+    }
+
+    /// [`Self::cancel_task`] with a reason that says why, not just that.
+    ///
+    /// The caller that knows more than "someone cancelled it" — the sweep that
+    /// finds a task no predecessor can ever release — has to be able to leave
+    /// that in the row: the reason is the only trace the task keeps.
+    pub async fn cancel_task_with_reason(
+        &self,
+        task_id: &str,
+        reason: String,
+    ) -> SFResult<Vec<String>> {
         if self.fg().is_some() {
-            let cancelled = self.cancel_task_store(task_id).await?;
+            let cancelled = self.cancel_task_store_with(task_id, reason).await?;
             self.on_task_terminal(task_id).await;
             for dep_id in &cancelled {
                 self.on_task_terminal(dep_id).await;
@@ -2597,12 +2714,13 @@ impl DagExecutor {
             })?;
 
         task.status = TaskStatus::Cancelled;
+        task.error = Some(reason.clone());
 
         let task_snapshot = task.clone();
         drop(inner);
         self.emit_event(cog_core::TaskEvent::TaskCancelled {
             task_id: task_id.into(),
-            reason: "Direct cancellation".into(),
+            reason: reason.clone(),
             timestamp: chrono::Utc::now(),
         })
         .await;
@@ -3960,6 +4078,171 @@ mod tests {
         let view = dag.get_task("sig-alert-store").await.unwrap();
         assert_eq!(view.status, TaskStatus::Failed);
         assert!(view.error.as_deref().unwrap().contains("empty plan"));
+    }
+
+    /// 判定只看「前驱会不会变成 Completed」这一件事：Completed 与仍在路上的
+    /// Pending 都不算，Failed、Cancelled、图里没有这个 id 都算。漏掉最后一种，
+    /// 一个指向没落盘的 id 的依赖就又变回永久 Pending。
+    #[tokio::test]
+    async fn an_unblockable_pending_task_names_the_predecessor_that_settled_it() {
+        let mut done = Task::new("done", TaskType::DagNode, serde_json::json!({}));
+        done.status = TaskStatus::Completed;
+        let mut failed = Task::new("failed", TaskType::DagNode, serde_json::json!({}));
+        failed.status = TaskStatus::Failed;
+        let mut cancelled = Task::new("cancelled", TaskType::DagNode, serde_json::json!({}));
+        cancelled.status = TaskStatus::Cancelled;
+        let pending = Task::new("pending", TaskType::DagNode, serde_json::json!({}));
+
+        let mut after_done = Task::new("after-done", TaskType::DagNode, serde_json::json!({}));
+        after_done.blocked_by = vec!["done".into()];
+        let mut after_failed = Task::new("after-failed", TaskType::DagNode, serde_json::json!({}));
+        after_failed.blocked_by = vec!["failed".into()];
+        let mut after_cancelled =
+            Task::new("after-cancelled", TaskType::DagNode, serde_json::json!({}));
+        after_cancelled.blocked_by = vec!["cancelled".into()];
+        let mut after_ghost = Task::new("after-ghost", TaskType::DagNode, serde_json::json!({}));
+        after_ghost.blocked_by = vec!["ghost".into()];
+        let mut after_pending =
+            Task::new("after-pending", TaskType::DagNode, serde_json::json!({}));
+        after_pending.blocked_by = vec!["pending".into()];
+
+        let tasks = vec![
+            done,
+            failed,
+            cancelled,
+            pending,
+            after_done,
+            after_failed,
+            after_cancelled,
+            after_ghost,
+            after_pending,
+        ];
+        let got = DagExecutor::unblockable_dependents(tasks.iter());
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "after-failed".to_string(),
+                    "failed".to_string(),
+                    "failed".to_string()
+                ),
+                (
+                    "after-cancelled".to_string(),
+                    "cancelled".to_string(),
+                    "cancelled".to_string()
+                ),
+                (
+                    "after-ghost".to_string(),
+                    "ghost".to_string(),
+                    "missing".to_string()
+                ),
+            ],
+            "only settled predecessors — and absent ones — make a task unblockable"
+        );
+    }
+
+    /// 生产标本（2026-10-18 12:19Z 的 `DSC-20261018-CB9687C9`）：一条依赖在被
+    /// 写进来之前就已经 Cancelled 的任务，清扫器若不当场收掉，它会永远停在
+    /// Pending，`oldest_untouched` 一路涨而执行器没有任何毛病。收掉时理由要点名
+    /// 前驱，并顺着级联把它的下游一起收掉。
+    #[tokio::test]
+    async fn a_task_added_after_its_predecessor_settled_is_cancelled_with_the_reason() {
+        let dag = DagExecutor::new("ws-unblockable".into());
+        dag.add_task(Task::new("pre", TaskType::DagNode, serde_json::json!({})))
+            .await
+            .unwrap();
+        dag.cancel_task("pre").await.unwrap();
+
+        let mut dep = Task::new("dep", TaskType::DagNode, serde_json::json!({}));
+        dep.blocked_by = vec!["pre".into()];
+        dag.add_task(dep).await.unwrap();
+        let mut grand = Task::new("grand", TaskType::DagNode, serde_json::json!({}));
+        grand.blocked_by = vec!["dep".into()];
+        dag.add_task(grand).await.unwrap();
+
+        assert_eq!(
+            dag.reclaim_unblockable_dependents(chrono::Duration::zero())
+                .await,
+            vec!["dep".to_string()]
+        );
+
+        let view = dag.get_task("dep").await.unwrap();
+        assert_eq!(view.status, TaskStatus::Cancelled);
+        let reason = view.error.expect("the cancellation has to say why");
+        assert!(reason.contains("'pre' is cancelled"), "{reason}");
+        assert_eq!(
+            dag.get_task("grand").await.unwrap().status,
+            TaskStatus::Cancelled,
+            "the cascade has to take the downstream rows too"
+        );
+        assert!(
+            dag.reclaim_unblockable_dependents(chrono::Duration::zero())
+                .await
+                .is_empty(),
+            "a settled row must not be reported twice"
+        );
+    }
+
+    /// 存储模式走的是 `dag_cancel_task` 那一笔条件写，reason 也必须落进去。
+    #[tokio::test]
+    async fn the_store_path_cancels_an_unblockable_dependent_with_the_reason() {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let dag = DagExecutor::new("ws-unblockable-fg".into()).with_state_backend(backend);
+        dag.add_task(Task::new("pre", TaskType::DagNode, serde_json::json!({})))
+            .await
+            .unwrap();
+        dag.cancel_task("pre").await.unwrap();
+
+        let mut dep = Task::new("dep", TaskType::DagNode, serde_json::json!({}));
+        dep.blocked_by = vec!["pre".into()];
+        dag.add_task(dep).await.unwrap();
+
+        assert_eq!(
+            dag.reclaim_unblockable_dependents(chrono::Duration::zero())
+                .await,
+            vec!["dep".to_string()]
+        );
+        let view = dag.get_task("dep").await.unwrap();
+        assert_eq!(view.status, TaskStatus::Cancelled);
+        assert!(
+            view.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("can never become ready"),
+            "{:?}",
+            view.error
+        );
+    }
+
+    /// 缺前驱需要宽限：批量是一行一行写的，同批里排在后面的前驱在被读到的那一刻
+    /// 就是「图里没有这个 id」。宽限内不动它，宽限后才按「这个 id 从未落过盘」收掉。
+    #[tokio::test]
+    async fn a_missing_predecessor_is_only_acted_on_after_the_grace() {
+        let dag = DagExecutor::new("ws-unblockable-missing".into());
+        let mut dep = Task::new("dep", TaskType::DagNode, serde_json::json!({}));
+        dep.blocked_by = vec!["later-in-the-same-batch".into()];
+        dag.add_task(dep).await.unwrap();
+
+        assert!(
+            dag.reclaim_unblockable_dependents(chrono::Duration::minutes(10))
+                .await
+                .is_empty(),
+            "a row younger than the grace may be waiting for a predecessor in its own batch"
+        );
+        assert_eq!(
+            dag.get_task("dep").await.unwrap().status,
+            TaskStatus::Pending
+        );
+
+        assert_eq!(
+            dag.reclaim_unblockable_dependents(chrono::Duration::zero())
+                .await,
+            vec!["dep".to_string()]
+        );
+        assert_eq!(
+            dag.get_task("dep").await.unwrap().status,
+            TaskStatus::Cancelled
+        );
     }
 
     /// 重试预算按失败原因发放，不按任务类型固定发。生成链在配额耗尽时报

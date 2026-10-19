@@ -186,6 +186,43 @@ fn the_scan_reads_what_it_claims_to() {
     }
 }
 
+/// The `Pending` reviser above reaches every row, but reaching is not the same
+/// as being able to move it: readiness asks every predecessor to be
+/// `Completed`, so a row behind one that ended `Failed` or `Cancelled` — or
+/// behind an id that is not in the graph — is filtered out on every tick and
+/// never leaves `Pending`. Its age grows in
+/// `cogneva_task_oldest_untouched_seconds` and reads exactly like a stalled
+/// queue. That second half of the state needs its own name here, or the table
+/// would certify a reviser that cannot terminate the rows it is credited with.
+#[test]
+fn pending_rows_a_settled_predecessor_can_never_release_have_an_owner() {
+    let root = workspace_root();
+    let definitions = source_at(
+        &root,
+        "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",
+    );
+    let production = production_source(&definitions);
+    // `defines` looks for `fn name(`; a generic function writes `fn name<`, so
+    // this check allows both rather than forcing a signature change onto the
+    // production code for the sake of the scan.
+    let defines_fn = |name: &str| {
+        production.contains(&format!("fn {name}(")) || production.contains(&format!("fn {name}<"))
+    };
+    for name in ["unblockable_dependents", "reclaim_unblockable_dependents"] {
+        assert!(
+            defines_fn(name),
+            "orchestrator.rs no longer defines {name}, so nothing revisits a Pending row \
+             whose predecessor already settled"
+        );
+    }
+    let caller = source_at(&root, "crates/cog-orchestrator/src/plugin.rs");
+    assert!(
+        calls(production_source(&caller), "reclaim_unblockable_dependents"),
+        "plugin.rs does not call reclaim_unblockable_dependents outside of tests, so the \
+         rows a settled predecessor can never release rest in Pending forever"
+    );
+}
+
 #[test]
 fn every_state_is_terminal_or_revisited() {
     let mut classified: Vec<(TaskStatus, bool)> = Vec::new();

@@ -570,6 +570,27 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                                             "re-armed tasks that reached the end of the stall window without ever starting; no attempt was charged"
                                                         );
                                                     }
+                                                    // The same pass, on the rows the stall
+                                                    // sweep above cannot reach: a Pending
+                                                    // task whose predecessor already settled
+                                                    // in Failed or Cancelled is never old
+                                                    // enough to matter yet never young
+                                                    // enough to run, so it is cancelled here
+                                                    // rather than left to age in the graph.
+                                                    let unblockable = publisher_runtime
+                                                        .orchestrator()
+                                                        .reclaim_unblockable_dependents(
+                                                            chrono::Duration::seconds(
+                                                                scheduled_task_stall_secs as i64,
+                                                            ),
+                                                        )
+                                                        .await;
+                                                    if !unblockable.is_empty() {
+                                                        tracing::warn!(
+                                                            count = unblockable.len(),
+                                                            "cancelled tasks whose predecessor had already settled; they could never become ready"
+                                                        );
+                                                    }
                                                 }
                                                 if let Err(e) =
                                                     publisher_runtime.publish_ready_tasks().await
