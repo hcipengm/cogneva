@@ -1185,4 +1185,20 @@ mod tests {
         assert_eq!(report.handovers_expired, 0);
         assert_eq!(store.row("h").status, TaskStatus::Completed);
     }
+
+    #[test]
+    fn closing_runs_on_its_own_clock_rather_than_the_drift_pass() {
+        // A deadline is a statement about when the answer lands, not about
+        // when somebody next looked at a face. Sharing the drift pass's tick
+        // would make a ballot's close time depend on that pass's read path:
+        // one failed graph read there and the deadline silently slips.
+        assert!(
+            DECISION_CLOSE_INTERVAL <= std::time::Duration::from_secs(30),
+            "the close pass runs slower than the deadline it serves"
+        );
+        assert!(
+            DECISION_CLOSE_INTERVAL < crate::face_drift::FACE_DRIFT_PASS_INTERVAL,
+            "closing was folded back into the drift pass's cadence"
+        );
+    }
 }
