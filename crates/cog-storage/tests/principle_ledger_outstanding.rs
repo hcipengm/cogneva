@@ -225,7 +225,7 @@ async fn settle(store: &PostgresPrincipleLedgerStore, slug: &str, gate: Option<&
 
 /// A gate the platform gains after a row was settled re-opens that row.
 ///
-/// A settled row is out of the outstanding set for good, and no reading moves
+/// A row a look has settled is out of the outstanding set, and no reading moves
 /// it: only a measurement writes the state. So a declaration added to a file
 /// after the row was judged would never be recorded against it, and the account
 /// would keep answering "the platform names no gate here" for a principle the
@@ -237,10 +237,12 @@ async fn a_gate_the_platform_gains_reopens_a_row_a_look_had_settled() {
     let _pass = PASS.lock().await;
     let (store, pool, marker) = store().await;
     let slug = file(&store, &marker, "settled", 1, PrincipleCheckKind::Tree).await[0].clone();
-    settle(&store, &slug, None).await;
+    // Settled with a gate recorded, because a verdict naming no gate at all is
+    // re-asked on its own (see the orphan case) and would be in the set already.
+    settle(&store, &slug, Some("crates/probe/src/the_gate.rs")).await;
 
     let mut gates = std::collections::HashMap::new();
-    gates.insert(slug.clone(), "crates/probe/src/the_gate.rs".to_string());
+    gates.insert(slug.clone(), "crates/probe/src/moved_gate.rs".to_string());
     let reopened = store
         .reopen_platform_gate_drift(&gates)
         .await
@@ -248,7 +250,7 @@ async fn a_gate_the_platform_gains_reopens_a_row_a_look_had_settled() {
     assert_eq!(
         reopened,
         vec![slug.clone()],
-        "the row's gate came from nowhere"
+        "the row's gate moved and the row was not asked again"
     );
 
     let row = store
@@ -275,6 +277,58 @@ async fn a_gate_the_platform_gains_reopens_a_row_a_look_had_settled() {
     assert!(
         looked.contains(&slug),
         "the row a pass is meant to judge is not in its set"
+    );
+    cleanup(&pool, &marker).await;
+}
+
+/// A row recorded as enforced with no gate in either registry is asked again.
+///
+/// The verdict and the two readings cannot all be right: the state says a machine
+/// holds this principle, the host's column says its registry names no gate, and
+/// the platform's column says nothing declares one. The only way there is a gate
+/// withdrawn after the look -- the host's next reading moves the column to `-`
+/// and the reconciliation compares the platform side alone, so nothing re-opens
+/// the row. It has to be asked again, and at the head of the pass: a row that was
+/// measured once sorts behind every row that never was, and the debt is deeper
+/// than one pass takes, so it would never be reached.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn an_enforced_row_with_no_gate_recorded_is_asked_again() {
+    let _pass = PASS.lock().await;
+    let (store, pool, marker) = store().await;
+    let orphaned = file(&store, &marker, "orphaned", 1, PrincipleCheckKind::Tree).await[0].clone();
+    settle(&store, &orphaned, None).await;
+
+    let looked: Vec<String> = store
+        .outstanding(PASS_BOUND)
+        .await
+        .expect("read the outstanding set")
+        .into_iter()
+        .map(|row| row.slug)
+        .filter(|s| s.starts_with(&marker))
+        .collect();
+    assert_eq!(
+        looked.first().map(String::as_str),
+        Some(orphaned.as_str()),
+        "a verdict naming a gate the readings do not must be asked again, ahead of the \
+         rows nothing has measured; got {looked:?}"
+    );
+
+    // A row settled with a gate recorded keeps its verdict: the readings and the
+    // state agree, so nothing is contradictory and nothing is re-asked.
+    let gated = file(&store, &marker, "gated", 1, PrincipleCheckKind::Tree).await[0].clone();
+    settle(&store, &gated, Some("crates/probe/src/the_gate.rs")).await;
+    let looked: Vec<String> = store
+        .outstanding(PASS_BOUND)
+        .await
+        .expect("read the outstanding set")
+        .into_iter()
+        .map(|row| row.slug)
+        .filter(|s| s.starts_with(&marker))
+        .collect();
+    assert!(
+        !looked.contains(&gated),
+        "a row whose state and readings agree must not be re-asked; got {looked:?}"
     );
     cleanup(&pool, &marker).await;
 }

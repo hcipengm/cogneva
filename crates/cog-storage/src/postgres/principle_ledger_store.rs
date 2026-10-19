@@ -399,13 +399,30 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         // was written to prevent. Retirement readings are bounded by how many
         // carriers leave the roster and they clear as the marker is folded, so
         // spending the head of the pass on them costs nothing that was waiting.
+        // A row recorded as enforced with neither registry's column naming a
+        // gate is not a settled row: the verdict says a machine holds this
+        // principle and the two readings say nothing does. That pair is only
+        // reachable when a gate was later withdrawn, and no other path re-opens
+        // it -- the reconciliation compares the platform side alone, so a host
+        // gate that disappears moves no state. Asking the row again costs one
+        // look and settles it, while leaving it out reports a gate for good. The
+        // two columns empty together is the whole test: a row settled by either
+        // side keeps that side's column, so a live verdict is never re-asked.
+        //
+        // These rows sort ahead of everything for the same reason retirement
+        // readings do: the debt runs deeper than one pass takes, and a row that
+        // was measured once sorts behind every row that was never measured. They
+        // clear as the look is written, so the head is spent on work that ends.
         let rows = sqlx::query(&format!(
             "SELECT {ROW_COLUMNS} FROM principle_ledger \
-             WHERE state IS DISTINCT FROM 'enforced' \
+             WHERE (state IS DISTINCT FROM 'enforced' \
+                    OR (COALESCE(host_gate, '-') IN ('-', '') \
+                        AND COALESCE(platform_gate, '-') IN ('-', ''))) \
                AND (state IS DISTINCT FROM 'retired' \
                     OR host_gate IS NULL \
                     OR host_gate NOT LIKE 'retired:%') \
              ORDER BY (COALESCE(host_gate, '') LIKE 'retired:%') DESC, \
+                      (state IS NOT DISTINCT FROM 'enforced') DESC, \
                       (check_kind IS NOT DISTINCT FROM 'judgement') ASC, \
                       measured_at ASC NULLS FIRST, first_seen_at ASC \
              LIMIT $1"
