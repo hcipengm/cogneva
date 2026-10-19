@@ -1382,6 +1382,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_second_ballot_from_one_unit_changes_the_vote_rather_than_counting_twice() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let spec = DecisionSpec {
+            kind: "k".into(),
+            subject: "s".into(),
+            options: vec!["a".into(), "b".into()],
+            status_quo: Some("a".into()),
+            mode: DecisionMode::Ballot,
+            state: DecisionState::Open,
+            eligible_units: vec!["u".into()],
+            quorum: 1,
+            tie_break: Some(TieBreak::StatusQuo),
+            deadline: Some(now + chrono::Duration::hours(1)),
+            principle_slug: None,
+            principle_rationale: None,
+            result_option: None,
+            result_reason: None,
+            supersedes: None,
+            provenance: None,
+            predeclared: true,
+        };
+        store
+            .save_governance_node(&decision_task("d", spec.clone(), TaskStatus::Pending, now))
+            .await
+            .unwrap();
+
+        for option in ["a", "b"] {
+            run(
+                Act::VoteCast {
+                    decision: "d".into(),
+                    unit: "u".into(),
+                    option: option.into(),
+                },
+                &store,
+                now,
+            )
+            .await
+            .unwrap();
+        }
+
+        let votes: Vec<Vote> = store
+            .of_type(VOTE_TASK_TYPE)
+            .iter()
+            .filter_map(Vote::from_task)
+            .collect();
+        assert_eq!(votes.len(), 1, "a change of mind is not a second ballot");
+        let tally = tally(&spec, &votes);
+        assert_eq!(tally.voters, vec!["u".to_string()], "one unit, one ballot");
+        assert_eq!(tally.by_option.get("b"), Some(&vec!["u".to_string()]));
+        assert_eq!(tally.by_option.get("a"), None, "the first choice is gone");
+    }
+
+    #[tokio::test]
     async fn verifying_a_decision_passes_an_untouched_history_and_fails_an_edited_one() {
         let store = MemoryStore::new();
         let now = Utc::now();
