@@ -174,7 +174,7 @@ fn every_ask_the_build_gate_refuses_lands_in_a_named_cell() {
     // (caught below) or, worse, quietly excuse nothing.
     let misdeclared: Vec<&str> = OUTSIDE_TREE_ASKS
         .iter()
-        .map(|words| *words)
+        .copied()
         .filter(|words| !named.contains(words))
         .collect();
     assert!(
