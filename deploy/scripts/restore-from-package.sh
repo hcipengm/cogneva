@@ -233,20 +233,26 @@ fi
 # 「包含」这件事只能在这里用 git 回答；证明的两个 rev 一起交给 Job，它核对证明
 # 说的正是眼前的包与自己。包更新（或宿主上没有那段历史）时证明不出来，仍旧
 # 退回显式接受，并在下面说清楚为什么。
-ANCESTRY_ENV=""
-if [ -n "$PKG_REV" ] && [ -n "$IMAGE_REV" ] && [ "$PKG_REV" != "$IMAGE_REV" ]; then
+#
+# 抽成函数是为了单独跑得动：这段唯一的产物是「交给 Job 的两条 env」，证明不出来时
+# 产物为空、只印原因。产物走 stdout、人读的话走 stderr，判据才钉得住方向——
+# 否则「向前放了、向后也放」在输出里长得一样。
+# ancestry: start
+ancestry_proof_env() { # 读 PKG_REV / IMAGE_REV / ROOT：能证明包含关系就打印 env；证明不出来返回 1
+    [ -n "$PKG_REV" ] && [ -n "$IMAGE_REV" ] && [ "$PKG_REV" != "$IMAGE_REV" ] || return 0
     if command -v git >/dev/null 2>&1 \
         && git -C "$ROOT" cat-file -e "${IMAGE_REV}^{commit}" 2>/dev/null \
         && git -C "$ROOT" merge-base --is-ancestor "$PKG_REV" "$IMAGE_REV" 2>/dev/null; then
-        echo "    代次：包 rev $PKG_REV 是恢复镜像 $IMAGE_REV 的祖先，按前进方向安装"
-        ANCESTRY_ENV="            - name: COGNEVA_RESTORE_ANCESTRY_PACKAGE_REV
-              value: \"$PKG_REV\"
-            - name: COGNEVA_RESTORE_ANCESTRY_SOURCE_REV
-              value: \"$IMAGE_REV\""
-    else
-        echo "    代次：证明不了包 rev $PKG_REV 是恢复镜像 $IMAGE_REV 的祖先（源码更旧或宿主上没有那段历史）；要恢复请显式设 COGNEVA_RESTORE_ACCEPT_REV_MISMATCH=1" >&2
+        echo "    代次：包 rev $PKG_REV 是恢复镜像 $IMAGE_REV 的祖先，按前进方向安装" >&2
+        printf '            - name: COGNEVA_RESTORE_ANCESTRY_PACKAGE_REV\n              value: "%s"\n            - name: COGNEVA_RESTORE_ANCESTRY_SOURCE_REV\n              value: "%s"\n' \
+            "$PKG_REV" "$IMAGE_REV"
+        return 0
     fi
-fi
+    echo "    代次：证明不了包 rev $PKG_REV 是恢复镜像 $IMAGE_REV 的祖先（源码更旧或宿主上没有那段历史）；要恢复请显式设 COGNEVA_RESTORE_ACCEPT_REV_MISMATCH=1" >&2
+    return 1
+}
+# ancestry: end
+ANCESTRY_ENV="$(ancestry_proof_env)" || true
 
 kubectl -n "$NS" apply -f - <<EOF
 apiVersion: batch/v1
