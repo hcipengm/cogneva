@@ -362,6 +362,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// cannot take it does not hold the field off builds it never runs.
 const WALK_YIELD_LIMIT: u32 = 2;
 
+/// How long a work's stand-down for another work's claim on the next build is
+/// remembered, in seconds.
+///
+/// The turn is asked for by works that come round on their own schedule -- the
+/// deployer looks once every ten minutes or so -- so the grievance cannot be
+/// scoped to one call: it is the work that keeps losing, not the call. An hour
+/// is longer than any of those rounds and shorter than a work that has stopped
+/// asking has any claim to a turn it no longer wants.
+const TURN_STAND_DOWN_SECS: u64 = 3600;
+
 static GLOBAL: OnceLock<Arc<BuildGate>> = OnceLock::new();
 
 /// Installs the process-wide gate from configuration.
@@ -1420,6 +1430,20 @@ pub struct BuildGate {
     /// a claim it already held. See
     /// [`BUILD_GATE_RESERVATION_RENEW_GAP_SECONDS`].
     renew_gap_seconds: [AtomicU64; ASKER_CELLS],
+    /// When each work was first told, since it last won something, that the
+    /// next build is another work's; zero when it is not standing down. Per
+    /// asker cell. The stand-down is what the takeover rule is measured
+    /// against, and it is deliberately a time rather than a count of turns:
+    /// a work that looks once every ten minutes would need hours to collect
+    /// the same number of turns that a work polling every half second collects
+    /// in a second, and the turn it is losing is the same turn.
+    turn_stand_down_since: [AtomicU64; ASKER_CELLS],
+    /// When each work was last served -- took a slot or took the field -- per
+    /// asker cell. This is the other half of the takeover rule: a work that
+    /// holds the next build and keeps being served is keeping the turn, and
+    /// that, not the freshness of its claim, is what makes another work's
+    /// stand-down unreasonable.
+    last_served: [AtomicU64; ASKER_CELLS],
     /// How many turns in a row each work has stood down for someone else's
     /// reservation. Reset when it takes the field, so the bound counts one
     /// unbroken series of yields rather than a lifetime total that would
@@ -1493,6 +1517,8 @@ impl BuildGate {
             lapsed_reservations: std::array::from_fn(|_| AtomicU64::new(0)),
             lapsed_counted: Mutex::new(std::collections::HashMap::new()),
             renew_gap_seconds: std::array::from_fn(|_| AtomicU64::new(0)),
+            turn_stand_down_since: std::array::from_fn(|_| AtomicU64::new(0)),
+            last_served: std::array::from_fn(|_| AtomicU64::new(0)),
             walk_yield_streak: Mutex::new(std::collections::HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             events_dropped: AtomicU64::new(0),
@@ -1810,13 +1836,26 @@ impl BuildGate {
         // over one, and the other work has its turn to lose.
         if let Some((holder, _)) = previous.as_ref() {
             if holder != what {
-                tracing::info!(
+                // A claim is fresh by being rewritten, not by being earned, so
+                // freshness alone cannot tell "the work that asked first is
+                // about to take its turn" from "the work that asked first has
+                // taken every turn since". The second one is not honoured: the
+                // turn moves, and this work writes its own claim over it.
+                if !self.may_take_the_turn(what, holder) {
+                    tracing::info!(
+                        what,
+                        held_by = holder,
+                        dir = %self.dir.display(),
+                        "the next build is already claimed; leaving that turn to the work that asked first"
+                    );
+                    return false;
+                }
+                tracing::warn!(
                     what,
-                    held_by = holder,
+                    reserved_by = %holder,
                     dir = %self.dir.display(),
-                    "the next build is already claimed; leaving that turn to the work that asked first"
+                    "taking the claim on the next build from a work that was served after this one first stood down"
                 );
-                return false;
             }
         }
         if let Err(e) = write_gate_file(&path, &format!("{what}\t{since}\n")) {
@@ -1944,6 +1983,48 @@ impl BuildGate {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         streaks.remove(what);
+    }
+
+    /// Records that this work was served: it took a slot or the field.
+    ///
+    /// A work that has been served has had its turn, so a stand-down that
+    /// outlives that service is no longer "the turn is not mine yet" -- it is
+    /// the same work being passed over again and again.
+    fn note_served(&self, what: &str) {
+        let cell = asker_index(what);
+        self.last_served[cell].store(unix_now(), Ordering::Relaxed);
+        self.turn_stand_down_since[cell].store(0, Ordering::Relaxed);
+    }
+
+    /// Whether a work that keeps being told "the next build is somebody else's"
+    /// may take that claim after all.
+    ///
+    /// Served, not elapsed. A claim is kept fresh by being rewritten every few
+    /// seconds, so neither its freshness nor the number of renewals can say
+    /// whether its holder is waiting its turn or taking every turn: on
+    /// 2026-10-20 the host's clippy producer rewrote its claim every twenty
+    /// seconds while it built, and the mainline deployer stood down on all
+    /// fourteen rounds and never saw a turn it was entitled to. What separates
+    /// the two is whether the holder was *served* since this work started
+    /// standing down: a holder that takes its build and claims again is holding
+    /// the turn for itself, and that is the only case this answers yes to.
+    ///
+    /// The stand-down is remembered across calls rather than within one, because
+    /// the works that lose turns here ask on their own clocks -- the deployer
+    /// gives up after a minute and comes back ten minutes later, so a rule
+    /// scoped to a single call would never see the second half of its own
+    /// grievance.
+    fn may_take_the_turn(&self, what: &str, claimant: &str) -> bool {
+        let cell = asker_index(what);
+        let now = unix_now();
+        let since = self.turn_stand_down_since[cell].load(Ordering::Relaxed);
+        if since == 0 || now.saturating_sub(since) > TURN_STAND_DOWN_SECS {
+            // First stand-down of this run, or one so old that this work cannot
+            // be said to have been asking all along. Dated afresh either way.
+            self.turn_stand_down_since[cell].store(now, Ordering::Relaxed);
+            return false;
+        }
+        self.last_served[asker_index(claimant)].load(Ordering::Relaxed) >= since
     }
 
     /// How many exclusions stood down for another work's reservation, and how
@@ -2122,6 +2203,7 @@ impl BuildGate {
                 // ask comes round.
                 self.release_reservation(what);
                 self.excluded.fetch_add(1, Ordering::Relaxed);
+                self.note_served(what);
                 Ok(self.permit(what, vec![file], HoldKind::Excluding))
             }
             None => {
@@ -2279,6 +2361,7 @@ impl BuildGate {
                 self.release_reservation(what);
                 self.waiting.fetch_sub(1, Ordering::Relaxed);
                 self.in_flight.fetch_add(1, Ordering::Relaxed);
+                self.note_served(what);
                 let total = self.acquired.fetch_add(1, Ordering::Relaxed) + 1;
                 let waited = started.elapsed();
                 let taken_at = self.slot_taken(waited);
@@ -3215,6 +3298,67 @@ mod tests {
         assert!(
             gate.try_acquire("an arrival").await.is_ok(),
             "releasing the switch releases the field"
+        );
+    }
+
+    /// A claim is kept fresh by being rewritten, so a holder that builds and
+    /// then claims again is fresh forever. On 2026-10-20 the host's clippy
+    /// producer did exactly that every twenty seconds while the mainline
+    /// deployer stood down on fourteen rounds in a row and never got the slot.
+    /// A holder that has been served since another work first stood down is
+    /// holding the turn for itself, and the turn moves.
+    #[tokio::test]
+    async fn a_claim_held_by_a_work_that_was_served_since_does_not_outlast_the_work_that_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        assert!(gate.reserve_build_field("host build"));
+
+        assert!(
+            !gate.reserve_build_field("mainline advance"),
+            "the first stand-down is the work that asked first taking its turn"
+        );
+
+        // The holder is served: it takes the slot, builds, and lets go.
+        let permit = gate.acquire("host build").await.expect("the slot is free");
+        drop(permit);
+        assert!(
+            gate.reserve_build_field("host build"),
+            "the holder renews its claim after its build"
+        );
+
+        assert!(
+            gate.reserve_build_field("mainline advance"),
+            "a holder served after this work first stood down has had its turn, so the \
+             turn is the waiting work's"
+        );
+        assert_eq!(
+            gate.reservation().map(|(holder, _)| holder),
+            Some("mainline advance".to_string()),
+            "the claim has to name the work that now owns the turn"
+        );
+    }
+
+    /// The other half: without a service to point at, standing down is not a
+    /// grievance and the claim is honoured. A rule that took over on elapsed
+    /// time alone would make a claim meaningless -- whoever asked last would
+    /// own the next build.
+    #[tokio::test]
+    async fn a_claim_is_honoured_while_its_holder_has_not_been_served_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        assert!(gate.reserve_build_field("host build"));
+
+        for round in 0..5 {
+            assert!(
+                !gate.reserve_build_field("mainline advance"),
+                "round {round}: the holder has not been served since, so the turn is not this \
+                 work's to take"
+            );
+        }
+        assert_eq!(
+            gate.reservation().map(|(holder, _)| holder),
+            Some("host build".to_string()),
+            "the claim still names the work that asked first"
         );
     }
 
