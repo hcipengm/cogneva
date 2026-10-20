@@ -1,0 +1,31 @@
+# 面表里声明的「第一条读数」，如果它本身就是一条能算出来的 PromQL，就用记录规则发布，
+# 不走宿主脚本。
+#
+# 为什么：`scripts/data/faces.tsv` 第 10 列给每一面写一条**按名字取**的读数，面读数的
+# 解析方式就是把那个名字当 PromQL 发出去。`资源管理` 欠的是 `buildgate_refused_by_what`，
+# 而它此前只活在一个宿主脚本里（`cogneva-buildgate-refused-reading.sh` 印 key=value）——
+# 名字对了、形状不对，于是面表上这一格永远是 `absent`，看起来像「这一面没在跑」。
+#
+# 为什么用记录规则而不是再写一个宿主生产者：要的东西（按 asker×墙 的窗口内增量）在
+# Prometheus 里**算得出来**，把同一份数据先从 Prometheus 查出来再用脚本发回去，多一跳、
+# 多一个会坏的地方，而且那一跳自己也要求读得通 Prometheus。谁能观测到，谁发布。
+#
+# 保留的标签就是这张读数的语义：`asker`（谁被拒）× `reason`（哪道墙）。按这两维聚合、
+# 把 pod/instance 折掉，是因为「谁被拒」问的是角色不是副本；逐 pod 的明细留在脚本那份
+# 更细的读数里（它还印 `dir`、闭集之外的标签值、结构性的零）。
+#
+# 窗口取 1 小时，与脚本默认窗口一致：同一个名字在两处算的是同一个窗口，两处结论就不会
+# 各说一套。要改窗口两处一起改。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cogneva-face-first-readings
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: cogneva-face-first-readings
+      rules:
+        - record: buildgate_refused_by_what
+          expr: sum by (asker, reason) (increase(cogneva_build_gate_refused_total[1h]))
