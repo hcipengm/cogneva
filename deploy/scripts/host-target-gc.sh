@@ -551,12 +551,12 @@ release_tier() { # tier, target
     esac
 }
 
-write_state() { # outcome, released_kb, gap_pct, targets, skipped, unreadable, unlabelled, deferred_tier, deferred_need_pct
+write_state() { # outcome, released_kb, gap_pct, targets, skipped, unreadable, unlabelled, deferred_tier, deferred_need_pct, out_of_band
     mkdir -p -- "$(dirname -- "${state_file}")"
     local tmp
     tmp="$(mktemp "${state_file}.XXXXXX")"
     cat >"${tmp}" <<EOF
-{"last_run":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","outcome":"$1","trigger_pct":${trigger_pct},"floor_pct":${floor_pct},"used_pct_before":${before_pct},"used_pct_after":${disk_pct},"released_bytes":$(( $2 * 1024 )),"gap_pct":$3,"targets":$4,"skipped":$5,"unreadable":$6,"unlabelled":$7,"deferred_tier":"$8","deferred_need_pct":${9:-null},"dry_run":${dry_run},"rev":"${script_rev}","rev_state":"${script_state}","script":"${script_sha}"}
+{"last_run":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","outcome":"$1","trigger_pct":${trigger_pct},"floor_pct":${floor_pct},"used_pct_before":${before_pct},"used_pct_after":${disk_pct},"released_bytes":$(( $2 * 1024 )),"gap_pct":$3,"targets":$4,"skipped":$5,"unreadable":$6,"unlabelled":$7,"deferred_tier":"$8","deferred_need_pct":${9:-null},"out_of_band":${10:-0},"out_of_band_scan":"${out_of_band_scan:-}","dry_run":${dry_run},"rev":"${script_rev}","rev_state":"${script_state}","script":"${script_sha}"}
 EOF
     mv -f -- "${tmp}" "${state_file}"
 }
@@ -566,14 +566,16 @@ EOF
 # stopped, which tier it held back and what that tier is waiting for, and which
 # version of this file produced the reading -- the last one is what makes any of
 # the others reviewable later.
-report() { # outcome, released_kb, covered, skipped, unreadable, unlabelled, deferred_tier, deferred_need_pct
+report() { # outcome, released_kb, covered, skipped, unreadable, unlabelled, deferred_tier, deferred_need_pct, out_of_band
     local gap=0
     [ "${disk_pct}" -gt "${floor_pct}" ] && gap=$((disk_pct - floor_pct))
-    printf 'target-gc: outcome=%s trigger=%s%% floor=%s%% before=%s%% after=%s%% released=%s gap=%s%% caches=%s skipped=%s unlabelled=%s unreadable=%s deferred_tier=%s deferred_need_pct=%s rev=%s rev_state=%s script=%s\n' \
+    local oob="${9:-0}"
+    printf 'target-gc: outcome=%s trigger=%s%% floor=%s%% before=%s%% after=%s%% released=%s gap=%s%% caches=%s skipped=%s unlabelled=%s unreadable=%s out_of_band=%s out_of_band_scan=%s deferred_tier=%s deferred_need_pct=%s rev=%s rev_state=%s script=%s\n' \
         "$1" "${trigger_pct}" "${floor_pct}" "${before_pct}" "${disk_pct}" \
-        "$(human_kb "$2")" "${gap}" "$3" "$4" "$6" "$5" "${7:-}" "${8:-}" \
+        "$(human_kb "$2")" "${gap}" "$3" "$4" "$6" "$5" "${oob}" \
+        "${out_of_band_scan:-}" "${7:-}" "${8:-}" \
         "${script_rev}" "${script_state}" "${script_sha}"
-    write_state "$1" "$2" "${gap}" "$3" "$4" "$5" "$6" "${7:-}" "${8:-}"
+    write_state "$1" "$2" "${gap}" "$3" "$4" "$5" "$6" "${7:-}" "${8:-}" "${oob}"
 }
 
 # --- run ---------------------------------------------------------------------
@@ -679,6 +681,80 @@ if [ -s "${released_dir}/unlabelled" ]; then
     [ "${unlabelled}" -le 5 ] || log "  (+$((unlabelled - 5)) more)"
 fi
 
+# The mirror of the reading above. That one names cache-like trees the
+# enumeration saw and could not judge; this one names cargo's trees that the
+# enumeration never looked at, because it only walks directories named `target`.
+# The two counts together are what "how much sits outside the candidate set"
+# means; a count of candidates alone cannot say it, and reads like a statement
+# about the whole disk.
+#
+# Both evidence files are required. The tag alone is not enough: the signature it
+# carries is the one the CACHEDIR.TAG convention publishes, so fontconfig and man
+# carry it too, and a reading that called those cargo caches would be off by a
+# category. Cargo's own layout file is what separates them.
+#
+# Reading only: nothing here widens what a run may release. Widening the set is a
+# separate decision, because the same enumeration would then reach trees this
+# script has no business deleting.
+out_of_band_file="${released_dir}/out_of_band"
+: >"${out_of_band_file}"
+# What the reading covers, carried with it. `out_of_band=0` has to mean "I
+# looked there and found none", never "I did not look there" -- so the root and
+# the reach travel with the count. The two ways a walk falls short are spelled
+# differently too: a walk that could not read some subtrees still returns
+# something (find says 1, which is what walking `/` as this user always says),
+# and a walk that aborted (find >1) returns nothing that may be read as a count.
+out_of_band_scan="${scan_root}:${scan_depth}"
+[ -z "${bound}" ] || out_of_band_scan="${bound}~bound:${scan_root}:${scan_depth}"
+if [ -n "${scan_root}" ] && [ -n "${scan_depth}" ]; then
+    tags_file="${released_dir}/out_of_band.tags"
+    find_rc=0
+    find "${scan_root}" -xdev -maxdepth "${scan_depth}" -name CACHEDIR.TAG -printf '%h\n' \
+        >"${tags_file}" 2>"${released_dir}/out_of_band.err" || find_rc=$?
+    case "${find_rc}" in
+    0) ;;
+    1)
+        out_of_band_scan="${out_of_band_scan}~partial"
+        log "the out-of-band walk under ${scan_root} could not read every subtree (some paths are unreadable to this user); the count covers what it could read"
+        ;;
+    *)
+        out_of_band_scan="${out_of_band_scan}!failed(rc=${find_rc})"
+        log "the out-of-band walk under ${scan_root} aborted (rc=${find_rc}): the count is not a reading of this filesystem$(head -1 "${released_dir}/out_of_band.err" 2>/dev/null | sed 's/^/: /')"
+        ;;
+    esac
+    if [ "${find_rc}" -le 1 ]; then
+        LC_ALL=C sort -u "${tags_file}" |
+            while IFS= read -r dir; do
+                [ -n "${dir}" ] || continue
+                [ "${dir##*/}" = target ] && continue
+                # A narrowed run reads the scope it was narrowed to: the count
+                # sits next to `caches=`, and two numbers about two different
+                # scopes in one line invite the wrong comparison.
+                if [ -n "${bound}" ]; then
+                    case "${dir}" in
+                    "${bound}" | "${bound}"/*) ;;
+                    *) continue ;;
+                    esac
+                fi
+                is_cargo_cache "${dir}" || continue
+                looks_like_cargo_cache "${dir}" || continue
+                printf '%s\t%s\n' "${dir}" \
+                    "$(human_kb "$(du -sk -- "${dir}" 2>/dev/null | cut -f1)")"
+            done >"${out_of_band_file}"
+    fi
+fi
+readonly out_of_band_scan
+out_of_band=0
+if [ -s "${out_of_band_file}" ]; then
+    out_of_band="$(wc -l <"${out_of_band_file}")"
+    log "${out_of_band} cargo cache tree(s) the candidate list never walks (it only visits directories named target), scanned under ${out_of_band_scan}:"
+    head -n 5 "${out_of_band_file}" |
+        while IFS=$'\t' read -r path size; do
+            log "  ${path}: ${size} on disk, tagged and cargo-shaped, not named target"
+        done
+    [ "${out_of_band}" -le 5 ] || log "  (+$((out_of_band - 5)) more)"
+fi
+
 if [ "${disk_pct}" -lt "${trigger_pct}" ]; then
     # A dry run is a question about what the plan would be, not about whether
     # today is the day: it answers the same way at 33% as at 80%. A real run
@@ -687,7 +763,7 @@ if [ "${disk_pct}" -lt "${trigger_pct}" ]; then
     # triggered runs report.
     if [ "${dry_run}" != 1 ]; then
         log "below trigger: ${disk_pct}% used, trigger ${trigger_pct}%"
-        report below_trigger 0 "${covered}" "${skipped}" 0 "${unlabelled}" "" ""
+        report below_trigger 0 "${covered}" "${skipped}" 0 "${unlabelled}" "" "" "${out_of_band}"
         exit 0
     fi
     log "below trigger: ${disk_pct}% used, trigger ${trigger_pct}% -- this is a dry run, so the plan below is what a run would do on the day the trigger is reached"
@@ -697,7 +773,7 @@ if [ "${covered}" -eq 0 ]; then
     log "nothing to release: ${disk_pct}% used, trigger ${trigger_pct}%, no cargo cache under ${searched} -- the cache is not what is filling this filesystem$(
         [ "${unlabelled}" -eq 0 ] || printf ', and %s tree(s) that look like caches cannot be judged at all' "${unlabelled}"
     )"
-    report floor_unreachable 0 "${#candidates[@]}" "${skipped}" 0 "${unlabelled}" "" ""
+    report floor_unreachable 0 "${#candidates[@]}" "${skipped}" 0 "${unlabelled}" "" "" "${out_of_band}"
     exit 0
 fi
 
@@ -817,4 +893,4 @@ fi
 # One site prints the reading and writes the state: two of them would be two
 # chances for a field to exist in one and not the other.
 report "${outcome}" "${released_kb}" "${covered}" "${skipped}" "${unreadable:-0}" "${unlabelled}" \
-    "${deferred_tier}" "${deferred_need_pct}"
+    "${deferred_tier}" "${deferred_need_pct}" "${out_of_band}"

@@ -376,6 +376,43 @@ grep -q 'no CACHEDIR.TAG' <<<"${out}" \
 [ -f "${work}/host/unlabelled/target/debug/deps/libstale.rlib" ] \
   || fail "无标签的树被动了；没有标签就没有证据，判定只能停在读数上"
 
+# --- 8c) cargo's trees the enumeration never walks are counted, not touched ----
+# The candidate list is "directories named target that carry the tag", and the
+# name is the part that is not evidence. Two real trees on this host sit outside
+# it purely on that account (43 GiB between them), so a run that reports only
+# `caches=` says "this is the whole disk's worth of cache" while 43 GiB of the
+# same kind of thing is absent from every reading. This names them.
+#
+# The count alone would not do it: `out_of_band=0` has to mean "I looked there
+# and found none", so the root the walk covered travels with the number, and the
+# walk covers the same scope as `caches=` -- a narrowed run reads its own scope.
+#
+# The tag is not the only witness. Its signature is the one the CACHEDIR.TAG
+# convention publishes, so fontconfig and man carry it as well; a reading that
+# counted those as cargo caches would be off by a category. The layout file is
+# what separates them, and the decoy below is that case.
+offband="${work}/host/offband"
+mkdir -p "${offband}/debug/deps"
+printf '%s\n' "${signature}" >"${offband}/CACHEDIR.TAG"
+printf '{}\n' >"${offband}/.rustc_info.json"
+printf 'same bytes\n' >"${offband}/debug/deps/liboffband.rlib"
+touch -d '10 days ago' "${offband}/debug/deps/liboffband.rlib"
+decoy="${work}/host/decoy"
+mkdir -p "${decoy}"
+printf '%s\n' "${signature}" >"${decoy}/CACHEDIR.TAG"
+out="$(run_gc COGNEVA_TARGET_GC_PROFILE_TRIGGER_PCT=100 COGNEVA_TARGET_GC_TRIGGER_PCT=100)"
+grep -q 'out_of_band=1' <<<"${out}" \
+  || fail "不带 target 名字的 cargo 树没有进读数：$(grep -o 'out_of_band=[^ ]*' <<<"${out}")"
+grep -q "${offband}" <<<"${out}" \
+  || fail "旁路的那棵树没有被点名：${out}"
+grep -q "out_of_band_scan=${work}/host~bound:" <<<"${out}" \
+  || fail "旁路读数没有带上它扫过的根；0 与「没扫过」就分不开了：$(grep -o 'out_of_band_scan=[^ ]*' <<<"${out}")"
+if grep -q "${decoy}" <<<"${out}"; then
+  fail "只有标签、不是 cargo 的目录被算成了 cargo 缓存：${out}"
+fi
+[ -f "${offband}/debug/deps/liboffband.rlib" ] \
+  || fail "旁路的树被动了；这一轮只是读，不改删除行为"
+
 # --- 9) what a run reaches, and what it may touch ----------------------------
 # Two properties that pull against each other, so they are asserted together.
 #
@@ -617,4 +654,4 @@ grep -q 'rev_state=norepo' <<<"${out}" || fail "没有说出读不出身份的�
 [ -f "${gate_tree}/debug/deps/libstale.rlib" ] \
   || fail "读不出身份的脚本删了文件"
 
-echo "PASS: 工作根不猜、锚点根之外的缓存也够得到、被收窄的运行不越界且说明了自己、低于触发线不动手但照样点名它能看到什么、四档按序升级并在地板停手、破坏性的一档等自己的水位且结局读得出推迟了谁、同一 stem 只留最新一代、释放过的树下次仍是候选、名字不够格不当候选、无标签的缓存类树只读数不动手、构建中的树按进程名与 fd 两条腿都挡住、无候选时报「缓存不是原因」、dry run 在任何水位都给计划且不删也不报别人的流量、每次运行都留下自己的读数、只有提交过的版本才动手（改过的与读不出身份的都不删）、载体是算出来的定时器且启用后回读排期"
+echo "PASS: 工作根不猜、锚点根之外的缓存也够得到、被收窄的运行不越界且说明了自己、低于触发线不动手但照样点名它能看到什么、四档按序升级并在地板停手、破坏性的一档等自己的水位且结局读得出推迟了谁、同一 stem 只留最新一代、释放过的树下次仍是候选、名字不够格不当候选、无标签的缓存类树只读数不动手、候选集之外带标签的 cargo 树被数出来并带上扫过的根且只读、只有标签不算 cargo、构建中的树按进程名与 fd 两条腿都挡住、无候选时报「缓存不是原因」、dry run 在任何水位都给计划且不删也不报别人的流量、每次运行都留下自己的读数、只有提交过的版本才动手（改过的与读不出身份的都不删）、载体是算出来的定时器且启用后回读排期"
