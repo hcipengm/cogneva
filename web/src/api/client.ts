@@ -301,3 +301,46 @@ export async function getTokenUsage(hours?: number): Promise<TokenUsage> {
   const query = hours === undefined ? '' : `?hours=${hours}`;
   return api.get<TokenUsage>(`/api/v1/observability/token-usage${query}`);
 }
+
+// ── 活跃告警（内存事件 + 耐久表合并） ──
+
+/** 一条正在 firing 的告警。 */
+export interface ActiveAlert {
+  /** 内存事件与耐久行各自的身份，只在各自的来源里唯一 */
+  id: string;
+  /** `warning`／`critical`／`info` */
+  severity: string;
+  /** 规则名（耐久行是 `rule`，内存事件是 `event_type`） */
+  event_type: string;
+  message: string;
+  agent_id: string | null;
+  task_id: string | null;
+  crew_id: string | null;
+  /** 这一条开始 firing 的时间 */
+  timestamp: string;
+  /**
+   * 生产者最后一次确认这条还在 firing 的时间。耐久行才有；内存事件没有，
+   * 因为它们是被推送进来的事件、不是被反复求值的条件。
+   */
+  last_seen_at: string | null;
+  resolved: boolean;
+  /** `supervisor`（进程内事件）或 `durable`（PostgreSQL 表） */
+  source: string;
+}
+
+/**
+ * 当前活跃告警。
+ *
+ * `durable_alerts_read` 是这次读取的结局，不能省：`false` 表示耐久那一半
+ * 读失败，此时列表只剩进程内事件——**看起来更短，不代表那些告警已经清了**。
+ * `null` 表示这个部署根本没有耐久源。
+ */
+export interface ActiveAlerts {
+  alerts: ActiveAlert[];
+  count: number;
+  durable_alerts_read: boolean | null;
+}
+
+export async function getActiveAlerts(): Promise<ActiveAlerts> {
+  return api.get<ActiveAlerts>('/api/v1/alerts/active');
+}

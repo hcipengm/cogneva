@@ -2260,14 +2260,13 @@ fn merge_active_alerts(
     in_memory: Vec<alert_store::AlertEntry>,
     durable: Vec<cog_core::PersistedAlert>,
 ) -> Vec<alert_store::AlertEntry> {
-    // The slot each rule is already listed in, so a durable row lands on its
-    // twin rather than beside it.
-    let mut slot: std::collections::HashMap<String, usize> = in_memory
-        .iter()
-        .enumerate()
-        .map(|(i, a)| (a.event_type.clone(), i))
-        .collect();
+    // An in-memory entry may absorb one durable row of the same rule: the two
+    // are one condition seen twice. It may not absorb the second one — a rule
+    // with several firing instances (one per node, one per upstream) has one
+    // row per instance, and folding them onto one slot would answer a shorter
+    // list than the table holds.
     let mut merged = in_memory;
+    let mut absorbed: Vec<bool> = vec![false; merged.len()];
     for alert in durable {
         let rule = alert.rule;
         let entry = alert_store::AlertEntry {
@@ -2283,15 +2282,22 @@ fn merge_active_alerts(
             resolved: false,
             source: "durable",
         };
-        match slot.get(&rule) {
+        let slot = (0..merged.len()).find(|&i| !absorbed[i] && merged[i].event_type == rule);
+        match slot {
             // The entry knows who the condition is about; the row cannot.
-            Some(&i) if names_its_subject(&merged[i]) => {}
+            Some(i) if names_its_subject(&merged[i]) => absorbed[i] = true,
             // It knows nothing the row does not, and only the row has a
             // sighting clock.
-            Some(&i) => merged[i] = entry,
+            Some(i) => {
+                absorbed[i] = true;
+                merged[i] = entry;
+            }
             None => {
-                slot.insert(rule, merged.len());
                 merged.push(entry);
+                // Keep the claim table the same length as the listing: a row
+                // pushed here must not be found again by a later row of the
+                // same rule.
+                absorbed.push(true);
             }
         }
     }
@@ -3693,5 +3699,43 @@ mod active_alert_merge_tests {
         let mut ids: Vec<&str> = merged.iter().map(|a| a.event_type.as_str()).collect();
         ids.sort();
         assert_eq!(ids, vec!["decomposition_orphaned", "pod_restarting_fast"]);
+    }
+
+    /// One rule can fire for several series at once — one row per node, one per
+    /// upstream. The rule name is not their identity; the dedup key is. Folding
+    /// them onto one slot answers a shorter list than the table holds, which is
+    /// exactly the reading an operator would take as "the rest cleared".
+    #[test]
+    fn two_instances_of_one_rule_are_both_listed() {
+        let mut second = durable("node_capacity_overcommitted");
+        second.dedup_key = "node_capacity_overcommitted{node=\"worker-2\"}".to_string();
+        let merged =
+            merge_active_alerts(vec![], vec![durable("node_capacity_overcommitted"), second]);
+        let mut ids: Vec<&str> = merged.iter().map(|a| a.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "node_capacity_overcommitted",
+                "node_capacity_overcommitted{node=\"worker-2\"}",
+            ]
+        );
+    }
+
+    /// An in-memory entry still absorbs its one twin, so the second instance of
+    /// that rule arrives beside it instead of replacing it.
+    #[test]
+    fn an_in_memory_twin_absorbs_one_row_and_the_next_instance_survives() {
+        let mut second = durable("llm_upstream_pool_down");
+        second.dedup_key = "llm_upstream_pool_down{upstream=\"b\"}".to_string();
+        let merged = merge_active_alerts(
+            vec![in_memory("llm_upstream_pool_down")],
+            vec![durable("llm_upstream_pool_down"), second],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].source, "supervisor");
+        assert_eq!(merged[1].source, "durable");
+        assert_eq!(merged[1].id, "llm_upstream_pool_down{upstream=\"b\"}");
     }
 }
