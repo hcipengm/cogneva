@@ -3,8 +3,8 @@
 # Change chart templates / values / profile, then re-run render-deploy.sh.
 # Source: cogneva/templates/app-config.yaml
 # 主应用统一配置文件（cogneva.json）：经 /etc/cogneva 目录挂载，env 层覆盖其上。
-# 内容取自 chart files/，.Files.Get 原样输出；文件内的双花括号占位符属于
-# 应用自身的 prompt 模板，不经过 Helm 渲染。
+# 内容取自 chart files/，文件内的双花括号占位符属于应用自身的 prompt 模板，
+# 不经过 Helm 渲染——但**命名空间必须渲染**。
 apiVersion: v1
 kind: ConfigMap
 metadata:

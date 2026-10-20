@@ -1,6 +1,29 @@
 # 主应用统一配置文件（cogneva.json）：经 /etc/cogneva 目录挂载，env 层覆盖其上。
-# 内容取自 chart files/，.Files.Get 原样输出；文件内的双花括号占位符属于
-# 应用自身的 prompt 模板，不经过 Helm 渲染。
+# 内容取自 chart files/，文件内的双花括号占位符属于应用自身的 prompt 模板，
+# 不经过 Helm 渲染——但**命名空间必须渲染**。
+{{- /*
+files/cogneva.json 里的服务地址与告警表达式写的是 `*.cogneva.svc.cluster.local`
+与 `namespace="cogneva"`：那是默认安装的命名空间，不是这台集群的名字。原样输出会让
+一份装进别的命名空间的 release 连到**另一份**安装的 redis/postgres/qdrant 上，而它
+自己的那份在同一个命名空间里空转。2026-10-20 演练装实测到的形状：主应用起来后立刻
+`Redis error: Password authentication failed`——口令是这一份的，连的却是隔壁那一份。
+两份口令碰巧相同时不会报错，会直接互相写数据。所以按 `cogneva.namespace` 替换这两类
+字面量；命名空间就是 cogneva 时替换恒等，k3s 三种 profile 的渲染产物一个字节都不变。
+注释用 Helm 注释而不写成 `#`：`#` 会原样落进渲染产物，让 `deploy/rendered/` 里三份
+已提交的清单无谓地漂移，`render-deploy.sh --check` 会因此判新鲜度失败。
+
+下面那组赋值里，**最后一行收尾必须是 `}}` 而不是 `-}}`**：`{{-` 把上游的换行剥光了
+（包括文件顶部最后一行注释行尾的换行），最后一个 `-}}` 再把 `apiVersion: v1` 之前的
+换行也剥掉，两下一挤，`# ...必须渲染**。` 就与 `apiVersion: v1` 粘成一行，apiVersion
+成了注释的一部分。2026-10-20 演练装真升级就死在这里：`error validating "": error
+validating data: apiVersion not set`——`helm template` 与 `helm lint` 都不报，只有真提交
+给 API server 才现形，而那份坏文档在肉眼看来只是少了三行。
+*/}}
+
+{{- $ns := include "cogneva.namespace" . -}}
+{{- $json := .Files.Get "files/cogneva.json" -}}
+{{- $json = replace "cogneva.svc.cluster.local" (printf "%s.svc.cluster.local" $ns) $json -}}
+{{- $json = replace `namespace=\"cogneva\"` (printf `namespace=\"%s\"` $ns) $json }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -11,7 +34,7 @@ metadata:
     app.kubernetes.io/component: config
 data:
   cogneva.json: |-
-{{ .Files.Get "files/cogneva.json" | indent 4 }}
+{{ $json | indent 4 }}
 ---
 # 外部 prompt 模板（hot_reload 捕捉 ConfigMap 交换，L0 配置晋级热更新通道）。
 apiVersion: v1

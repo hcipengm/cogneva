@@ -62,11 +62,21 @@ spec:
         - name: registry-gc
           image: {{ .Values.clusterRegistry.image }}
           imagePullPolicy: IfNotPresent
+          # 全新卷上没有 `repositories` 目录，`garbage-collect -m` 会直接报
+          # `filesystem: Path not found: /docker/registry/v2/repositories` 退出非零，
+          # 而 init 容器一旦失败整个 registry Pod 就永远停在 Init:CrashLoopBackOff，
+          # 一次全新安装（2026-10-20 演练装）里注册表就此起不来——没有任何东西可以
+          # 回收的卷，正确结论就是"没什么可回收"，不是失败。所以先看目录在不在。
           command:
-            - registry
-            - garbage-collect
-            - -m
-            - /etc/docker/registry/config.yml
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              if [ ! -d "{{ .Values.clusterRegistry.rootDir }}/docker/registry/v2/repositories" ]; then
+                echo "registry storage has no repositories directory yet; nothing to collect"
+                exit 0
+              fi
+              exec registry garbage-collect -m /etc/docker/registry/config.yml
           resources:
             {{- toYaml .Values.clusterRegistry.resources | nindent 12 }}
           volumeMounts:
