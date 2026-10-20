@@ -177,6 +177,30 @@ pub struct RuntimeStep {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
+/// What a guardrail refusal does to the run that met it.
+///
+/// A refusal is a decision, not a failure: the rule that refused the call has
+/// not moved, so the identical call cannot come out differently. Asking the
+/// model again is therefore paid for out of the same context to learn the same
+/// answer — unless the model changes the call, which is the one thing another
+/// turn can produce.
+///
+/// `Stop` takes the zero-token reading: the run ends on the first refusal and
+/// the caller re-dispatches with the refusal in hand. `OneAdjustment` pays one
+/// turn to let the model route around the rule (a different tool, different
+/// arguments) and ends the run only if it re-proposes the same call. Which one
+/// is right depends on the rule: a permission boundary is worth stopping for,
+/// a shape rule is often worth one detour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefusalPolicy {
+    /// End the run at the first refusal. No further model call is made.
+    #[default]
+    Stop,
+    /// Give the model one turn to propose a different call; a second identical
+    /// refusal ends the run.
+    OneAdjustment,
+}
+
 /// Agent execution loop with streaming LLM integration.
 /// Core design:
 /// - Streaming first: uses `llm.chat_stream()` and consumes `AssistantMessageEvent`s
@@ -188,6 +212,9 @@ pub struct AgentRuntime {
     state: RuntimeState,
     context: ContextWindow,
     tools: ToolRegistry,
+    /// What a guardrail refusal does to the run. `Stop` by default: the owner's
+    /// standing instruction is that a refused call must not buy another turn.
+    refusal_policy: RefusalPolicy,
     /// Original event channel — when no hook engine is configured events
     /// are sent here directly.  When a hook engine *is* configured events
     /// are routed through the engine first and the engine forwards here.
@@ -421,6 +448,7 @@ impl AgentRuntime {
             state: RuntimeState::Idle,
             context,
             tools: ToolRegistry::new(),
+            refusal_policy: RefusalPolicy::default(),
             event_tx,
             hook_engine: None,
             hooks: AgentHooks::default(),
@@ -517,6 +545,14 @@ impl AgentRuntime {
     /// at the model as a role that never had any. The report is the only thing
     /// standing between the two, so it names the tools and the count that
     /// survived.
+    /// Choose what a guardrail refusal does to the run. See [`RefusalPolicy`];
+    /// the default stops at the first refusal, because another turn spent on a
+    /// decision that cannot change is exactly the spend this bounds.
+    pub fn with_refusal_policy(mut self, policy: RefusalPolicy) -> Self {
+        self.refusal_policy = policy;
+        self
+    }
+
     pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
         self.tools = match self.config.skill_config.as_ref() {
             Some(skill) if !skill.tools.is_empty() => {
@@ -1351,7 +1387,10 @@ impl AgentRuntime {
                 // refused it is still there. Handing it back as an ordinary
                 // error invites the loop to retry the identical call until the
                 // iteration budget runs out, which is the most expensive way to
-                // learn nothing. Say so once, then end the run if it repeats.
+                // learn nothing. Say so once, then end the run — at the first
+                // refusal under `Stop`, at the second identical one under
+                // `OneAdjustment`, which buys exactly one turn to route around
+                // the rule.
                 let mut blocked: Option<(String, u32)> = None;
                 let result: Result<serde_json::Value, SFError> = match checked {
                     Ok(val) => Ok(val),
@@ -1378,21 +1417,29 @@ impl AgentRuntime {
                 let is_error = result.is_err();
                 let observation = match (&result, &blocked) {
                     (Ok(val), _) => val.clone(),
-                    (Err(e), Some((rule, count))) => serde_json::json!({
-                        "error": e.to_string(),
-                        "guardrail_blocked": true,
-                        "rule": rule,
-                        // The loop ends on the second identical refusal, so this
-                        // is the last chance to steer it somewhere useful.
-                        "note": if *count > 1 {
-                            "The identical call was refused again; the run is ending. \
-                             Change the call or report the rule as the blocker."
-                        } else {
-                            "A guardrail rule refused this call. Retrying the identical \
-                             call will be refused the same way; adjust the call or \
-                             report this rule as the blocker."
-                        },
-                    }),
+                    (Err(e), Some((rule, count))) => {
+                        let ends = match self.refusal_policy {
+                            RefusalPolicy::Stop => true,
+                            RefusalPolicy::OneAdjustment => *count > 1,
+                        };
+                        serde_json::json!({
+                            "error": e.to_string(),
+                            "guardrail_blocked": true,
+                            "rule": rule,
+                            "run_ending": ends,
+                            // When the run ends here, this text is the last thing
+                            // the model sees, so it has to say why rather than
+                            // invite one more attempt.
+                            "note": if ends {
+                                "A guardrail rule refused this call and the run is ending. \
+                                 Report the rule as the blocker instead of re-proposing it."
+                            } else {
+                                "A guardrail rule refused this call. The identical call \
+                                 will be refused the same way; propose a different call or \
+                                 report this rule as the blocker."
+                            },
+                        })
+                    }
                     (Err(e), None) => serde_json::json!({ "error": e.to_string() }),
                 };
 
@@ -1433,12 +1480,23 @@ impl AgentRuntime {
                 }
 
                 if let Some((rule, count)) = blocked {
-                    if count > 1 {
-                        let msg = format!(
-                            "Guardrail rule '{rule}' refused the identical call to '{}' \
-                             more than once; ending the run instead of retrying it again",
-                            tc.name
-                        );
+                    let ends = match self.refusal_policy {
+                        RefusalPolicy::Stop => true,
+                        RefusalPolicy::OneAdjustment => count > 1,
+                    };
+                    if ends {
+                        let msg = match self.refusal_policy {
+                            RefusalPolicy::Stop => format!(
+                                "Guardrail rule '{rule}' refused the call to '{}'; \
+                                 ending the run instead of paying for another turn",
+                                tc.name
+                            ),
+                            RefusalPolicy::OneAdjustment => format!(
+                                "Guardrail rule '{rule}' refused the identical call to '{}' \
+                                 more than once; ending the run instead of retrying it again",
+                                tc.name
+                            ),
+                        };
                         tracing::warn!("{msg}");
                         return Err(SFError::Agent(msg));
                     }
@@ -3651,18 +3709,15 @@ mod tests {
         }
     }
 
-    /// The spend this bounds is one refusal re-sent until the budget runs out.
-    /// A rule that refused a call has not moved by the next turn, so the
-    /// identical call cannot come out differently: the run ends on the second
-    /// refusal, with the tool body never having run and the iteration ceiling
-    /// still far away.
-    #[tokio::test]
-    async fn a_repeated_refusal_ends_the_run_instead_of_retrying() {
+    /// Drives the scenario once under one policy and reports the three numbers
+    /// that say what it cost: how the run ended, whether the tool body ran, and
+    /// how many model turns were bought.
+    async fn refusal_run(policy: RefusalPolicy) -> (String, usize, usize) {
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let config = RuntimeConfig {
             agent_id: "blocked-tool".into(),
-            role: "blocked-tool-test".into(),
+            role: format!("blocked-tool-{policy:?}"),
             max_iterations: 10,
             ..Default::default()
         };
@@ -3687,27 +3742,48 @@ mod tests {
             },
         );
 
-        let mut runtime = AgentRuntime::new(config, tx).with_tools(registry);
+        let mut runtime = AgentRuntime::new(config, tx)
+            .with_tools(registry)
+            .with_refusal_policy(policy);
         let llm = RepeatingCallLlm {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
         let err = runtime
             .run(serde_json::json!({ "task": "blocked" }), &llm)
             .await
-            .expect_err("a refusal the model keeps re-proposing must end the run");
+            .expect_err("a refusal must end the run instead of being retried");
+        (
+            err.to_string(),
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            llm.calls.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
 
+    /// The default: a refusal ends the run before another turn is bought. The
+    /// rule that refused the call has not moved, so the answer cannot either.
+    #[tokio::test]
+    async fn a_refusal_ends_the_run_before_another_turn() {
+        let (err, ran, calls) = refusal_run(RefusalPolicy::Stop).await;
         assert!(
-            err.to_string().contains("refused the identical call"),
+            err.contains("ending the run instead of paying for another turn"),
             "the end must name the refusal, not a budget: {err}"
         );
-        assert_eq!(
-            ran.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "the tool body must never run behind a refusal"
+        assert_eq!(ran, 0, "the tool body must never run behind a refusal");
+        assert_eq!(calls, 1, "one turn to propose the call, and no second");
+    }
+
+    /// The policy that buys one turn to route around the rule: still bounded,
+    /// and the identical call is what ends it rather than the iteration ceiling.
+    #[tokio::test]
+    async fn one_adjustment_spends_exactly_one_turn_on_the_refusal() {
+        let (err, ran, calls) = refusal_run(RefusalPolicy::OneAdjustment).await;
+        assert!(
+            err.contains("refused the identical call"),
+            "the end must name the repetition, not a budget: {err}"
         );
+        assert_eq!(ran, 0, "the tool body must never run behind a refusal");
         assert_eq!(
-            llm.calls.load(std::sync::atomic::Ordering::SeqCst),
-            2,
+            calls, 2,
             "one turn to propose the call, one to re-propose it, and no third"
         );
     }
