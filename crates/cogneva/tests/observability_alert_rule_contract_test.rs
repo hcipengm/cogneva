@@ -4736,12 +4736,6 @@ fn a_retired_rule_is_named_where_the_watcher_can_settle_it() {
         serde_json::from_str(&text).expect("chart config is not valid JSON");
     let watch = &value["observability"]["infra_watch"];
 
-    let live: BTreeSet<&str> = watch["rules"]
-        .as_array()
-        .expect("observability.infra_watch.rules is not an array")
-        .iter()
-        .filter_map(|rule| rule["name"].as_str())
-        .collect();
     let retired: BTreeSet<&str> = watch["retired_rules"]
         .as_array()
         .expect("observability.infra_watch.retired_rules is not an array")
@@ -4749,22 +4743,12 @@ fn a_retired_rule_is_named_where_the_watcher_can_settle_it() {
         .filter_map(|name| name.as_str())
         .collect();
 
-    let mut complaints: Vec<String> = Vec::new();
-    for name in &retired {
-        if live.contains(name) {
-            complaints.push(format!(
-                "{name} 同时出现在 rules 与 retired_rules 里——它一边被求值、一边被结算，\
-                 每拍关掉又点亮"
-            ));
-        }
-    }
-    // 这一条是本仓撤掉的那条规则：它的名字必须留在名单里，否则那行永远关不掉。
-    if !retired.contains("live_image_not_on_mainline") {
-        complaints.push(
-            "live_image_not_on_mainline 已从 rules 里删掉，却不在 retired_rules 里：\
-             它留下的 firing 行没有任何东西会去结算"
-                .to_string(),
-        );
-    }
-    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    // 「名单与 rules 不相交」那半由 `deploy/scripts/check-alert-rule-subjects.sh` 判，
+    // 这里不抄第二份。这一条判的是它判不到的那半：一条**已经**从 rules 里删掉的规则，
+    // 名字有没有被登记下来。删掉本身不留痕迹，所以只能逐条钉住这一族撤过的规则。
+    assert!(
+        retired.contains("live_image_not_on_mainline"),
+        "live_image_not_on_mainline 已从 rules 里删掉，却不在 retired_rules 里：\
+         它留下的 firing 行没有任何东西会去结算，会一直挂在「现在有什么在响」那一面上"
+    );
 }
