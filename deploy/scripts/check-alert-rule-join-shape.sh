@@ -21,22 +21,25 @@
 # 判不动的（裸选择器、without(...)、函数套函数、多个向量做算术、ignoring(...) 的
 # 键集要按指标现有标签补齐）**计数上报**，不折进「绿」里：说不清不是一致。
 #
-# 用法：bash deploy/scripts/check-alert-rule-join-shape.sh [cogneva.json 路径]
+# 用法：bash deploy/scripts/check-alert-rule-join-shape.sh [cogneva.json 路径] [清单目录]
 # 判词：rc=0 每一个判得动的比较都声明了多的一侧；rc=1 有点不出来的（逐条点名规则与
 #       运算符）；rc=3 规则读不了（看不了一眼不等于一致）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONFIG="${1:-${ROOT}/deploy/helm/cogneva/files/cogneva.json}"
+MANIFESTS="${2:-${ROOT}/deploy/k3s/observability/manifests}"
 
 command -v python3 >/dev/null || { echo "缺少依赖：python3" >&2; exit 3; }
 [ -f "${CONFIG}" ] || { echo "找不到规则文件：${CONFIG}（判词记 3：看不了，不是一致）" >&2; exit 3; }
 
-python3 - "${CONFIG}" <<'PYEOF'
+python3 - "${CONFIG}" "${MANIFESTS}" <<'PYEOF'
 import json
+import os
 import re
 import sys
 
+COMPARISON_ON = re.compile(r'(?:>=|<=|==|!=|>|<)\s*(?:bool\s+)?on\s*\(')
 AGG = re.compile(r'^(min|max|sum|count|avg|group|stddev|stdvar|topk|bottomk|quantile|count_values)\b')
 CMP = ('>=', '<=', '==', '!=', '>', '<')
 # 结合力从松到紧：or/unless < 算术 < 聚合。
@@ -249,7 +252,31 @@ def judge(promql):
     return violations, unjudged, judged, no_on
 
 
-def main(path):
+def stray_manifest_joins(manifest_dir):
+    """清单里带 on() 的比较：这条门读不到它们的结构，但也不许装作看不见。
+
+    subject 门的前身就是被这条路绕过的——规则改落在 manifest 里，chart 里那份 JSON
+    一条都没少，门却再也没看过新规则。这里不解析 YAML：只在清单正文里找「比较运算符紧接
+    on(...)」这一种形状，找到就点名文件与行号，让射程的缺口当场可见。
+    """
+    hits = []
+    if not manifest_dir or not os.path.isdir(manifest_dir):
+        return None
+    for name in sorted(os.listdir(manifest_dir)):
+        if not name.endswith(('.yaml', '.yml')):
+            continue
+        full = os.path.join(manifest_dir, name)
+        try:
+            with open(full, encoding='utf-8') as fh:
+                for no, line in enumerate(fh, 1):
+                    if COMPARISON_ON.search(line):
+                        hits.append('%s:%d' % (name, no))
+        except OSError:
+            return None
+    return hits
+
+
+def main(path, manifest_dir):
     try:
         with open(path, encoding='utf-8') as fh:
             doc = json.load(fh)
@@ -274,8 +301,20 @@ def main(path):
     print('check-alert-rule-join-shape: %d 条规则；判得动 %d 个带 on() 的比较，'
           '判不动 %d 个，违规 %d 处；另 %d 个比较不带 on()（不在本门射程内）'
           % (len(rules), judged, unjudged, bad, no_on))
+    stray = stray_manifest_joins(manifest_dir)
+    if stray is None:
+        print('check-alert-rule-join-shape: 清单目录读不了（%s）：射程有没有缺口不知道，'
+              '判词记 3' % manifest_dir)
+        return 3
+    if stray:
+        for hit in stray:
+            print('%s: 清单里有一处带 on() 的比较，本门不读清单里的结构' % hit)
+        print('check-alert-rule-join-shape: 先把它纳入射程再判绿（%d 处）' % len(stray))
+        return 1
+    print('check-alert-rule-join-shape: 射程守卫——清单里没有带 on() 的比较（%s）'
+          % (manifest_dir or '未给目录'))
     return 1 if bad else 0
 
 
-sys.exit(main(sys.argv[1]))
+sys.exit(main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None))
 PYEOF

@@ -115,4 +115,33 @@ set -e
 [ "${rc}" -eq 3 ] || fail "JSON 坏掉应 rc=3，实际 rc=${rc}：${out}"
 ok "读不了 -> rc=3，判词不留成「一致」"
 
-echo "alert-rule-join-shape: 6 组用例全绿"
+# 7. 射程守卫：清单里的规则一条都不被这条门读过。真清单里没有带 on() 的比较 -> 绿；
+#    放一份进去 -> 红并点名文件与行号。那是 subject 门的前身走过的弯路：规则改落在
+#    manifest 里，chart 那份 JSON 一条不少，门却再也没看过新规则。
+set +e
+out="$(bash "${gate}" "${config}" "${repo}/deploy/k3s/observability/manifests")"; rc=$?
+set -e
+[ "${rc}" -eq 0 ] || fail "真清单不该让这条门红，实际 rc=${rc}：${out}"
+grep -q '射程守卫' <<<"${out}" || fail "汇总里没有射程守卫那一行：${out}"
+mkdir -p "${work}/manifests"
+cat > "${work}/manifests/99-fake-rule.yaml" <<'YAML'
+spec:
+  groups:
+    - name: fake
+      rules:
+        - alert: someone_else_joins
+          expr: max by (dir, role, slot) (a_metric) > on(dir, role) max by (dir, role) (b_metric)
+YAML
+set +e
+out="$(bash "${gate}" "${config}" "${work}/manifests")"; rc=$?
+set -e
+[ "${rc}" -eq 1 ] || fail "清单里有带 on() 的比较应红，实际 rc=${rc}：${out}"
+grep -q '99-fake-rule.yaml:' <<<"${out}" || fail "射程守卫没点名文件与行号：${out}"
+set +e
+out="$(bash "${gate}" "${config}" "${work}/no-such-dir" 2>&1)"; rc=$?
+set -e
+[ "${rc}" -eq 3 ] || fail "清单目录不在应 rc=3（射程有没有缺口不知道），实际 rc=${rc}：${out}"
+grep -q '判词记 3' <<<"${out}" || fail "清单目录读不了时没说「判词记 3」：${out}"
+ok "射程守卫：清单里的连接红并点名，真清单绿，清单目录读不了记 3"
+
+echo "alert-rule-join-shape: 7 组用例全绿"
