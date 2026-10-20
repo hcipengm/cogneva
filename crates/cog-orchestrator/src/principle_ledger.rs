@@ -1703,10 +1703,13 @@ mod tests {
         );
     }
 
+    /// One gauge write: its name, its value, and the labels it carried.
+    type GaugeWrite = (String, f64, HashMap<String, String>);
+
     /// A metrics backend that keeps every gauge write, in order.
     #[derive(Default)]
     struct RecordingMetrics {
-        gauges: std::sync::Mutex<Vec<(String, f64, HashMap<String, String>)>>,
+        gauges: std::sync::Mutex<Vec<GaugeWrite>>,
     }
 
     #[async_trait::async_trait]
