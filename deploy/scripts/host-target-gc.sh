@@ -383,9 +383,15 @@ stale_files() { # target, find action...
 tier_stale() {
     if [ "${dry_run}" = 1 ]; then
         local count size
+        # -printf '%s' is bytes, and human_kb takes KiB -- the same unit every
+        # other line of this run gets from `du -sk`. Passing bytes straight
+        # through made a 3.1 GiB scratch tree print as 3.2 TiB, which reads as
+        # "this one tier is enough" on a plan that would not have moved the
+        # disk at all. The rounding up keeps a non-empty release from reading
+        # as zero.
         read -r count size < <(stale_files "$1" -printf '%s\n' 2>/dev/null |
             awk '{ n++; s += $1 } END { print n + 0, s + 0 }')
-        log "dry run would release ${count} stale file(s) under $1 ($(human_kb "${size}"))"
+        log "dry run would release ${count} stale file(s) under $1 ($(human_kb "$(( (size + 1023) / 1024 ))"))"
         return 0
     fi
     stale_files "$1" -delete 2>/dev/null || true

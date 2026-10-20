@@ -315,6 +315,24 @@ grep -q 'full rebuild of this tree' <<<"${out}" \
 [ -d "${dry_tree}/debug/incremental" ] || fail "dry run 删了增量缓存"
 [ -d "${dry_tree}/llvm-cov-target" ] || fail "dry run 删了覆盖率目录"
 
+# The size on that line is a reading, and its unit has to be the one every
+# other line of the run gets from `du -sk`: KiB. The first version summed
+# find's `%s` bytes and handed them straight to human_kb, so a 3.1 GiB scratch
+# tree printed as 3.2 TiB -- a plan that reads as "this one tier is enough"
+# on a run that would not have moved the disk at all. The fixture is one stale
+# file of exactly 2 MiB: a 12-byte file divides down to the same 0.0KiB either
+# way and would let the defect through.
+sized_root="${work}/host/sized"
+mkdir -p "${sized_root}/target/debug/deps"
+printf '%s\n' "${signature}" >"${sized_root}/target/CACHEDIR.TAG"
+head -c 2097152 /dev/zero >"${sized_root}/target/debug/deps/libbig.rlib"
+touch -d '10 days ago' "${sized_root}/target/CACHEDIR.TAG" \
+  "${sized_root}/target/debug/deps/libbig.rlib"
+out="$(run_gc COGNEVA_TARGET_GC_DISK_READER="${work}/reader-below" COGNEVA_TARGET_GC_DRY_RUN=1 \
+  COGNEVA_TARGET_GC_TRIGGER_PCT=70 COGNEVA_TARGET_GC_FLOOR_PCT=50)"
+grep -q 'stale file(s) under .*/sized/target (2.0MiB)' <<<"${out}" \
+  || fail "计划的字节数不是由字节换成 KiB 再印的：$(grep -o 'stale file(s) under .*' <<<"${out}" | tail -3)"
+
 # A dry run also reports no released bytes, and the reader here moves by 100000
 # KiB between calls so that the difference exists: the gap between two readings
 # of the whole filesystem is whatever else on the machine was writing, and a
