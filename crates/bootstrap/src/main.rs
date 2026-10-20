@@ -2829,9 +2829,7 @@ async fn deploy_via_helm(profile: Profile) -> Result<()> {
     // 交付与预渲染必须拿到**逐字相同**的入参集合，否则清理所依据的清单不是交付的
     // 那一份（镜像站覆盖差异尤其隐蔽：渲染少一个 --set，对象与清单就对不上）。
     let common = helm_common_args(&chart, &values, &overrides);
-    let mut args: Vec<String> = vec!["upgrade".into(), "--install".into()];
-    args.extend(common.iter().cloned());
-    args.push("--create-namespace".into());
+    let args = helm_upgrade_args(&common);
 
     // 交付前先渲染一遍：既给残留 env 清理提供"将交付什么"的事实——最典型的是 env
     // 从字面量改成 valueFrom 后对象上残留的 value（详见 clear_superseded_env_values）
@@ -2892,6 +2890,34 @@ fn helm_common_args(chart: &Path, values: &Path, overrides: &[(String, String)])
         out.push(format!("{key}={val}"));
     }
     out
+}
+
+/// `upgrade --install` 在公共入参之外还要带的两项，单独成函数是为了让它们能被
+/// 不带集群地断言。
+///
+/// `--force-conflicts` 不是保险位，是换轨那一刻的必需项：helm 4 用 server-side
+/// apply 交付，而在被 apply 链写过的集群上，`kubectl` 之类的 field manager 已经
+/// 持有 `spec.template.spec` 里的字段（最典型是容器 image）。SSA 遇到"同一字段
+/// 另一个 manager 持有且值不同"就 409，整个升级失败，而**服务端 dry-run 照样
+/// rc=0**——它不写字段、因而不触发冲突，所以 dry-run 在这一类失败上没有信息量
+/// （2026-10-20 实测：同一组入参 dry-run 绿、真跑 20+ 对象冲突）。
+///
+/// 2026-10-20 在隔离命名空间里把这条链完整跑过一遍：先用 `kubectl set image`
+/// 让 `kubectl-set` 持有容器 image，再跑同一条 upgrade，复现出与现网逐字相同的
+/// `Apply failed with 1 conflict: conflict with "kubectl-set" … [name="cogneva"].image`；
+/// 加上 `--force-conflicts` 重跑，rc=0、release deployed，事后 managedFields 里
+/// 只剩 helm 一个写者。
+///
+/// 夺字段所有权与"关掉 apply 部署器"是同一个决定的另一半：单写者边界已经声明
+/// 交付路径只剩 helm（见公共入参里的 `mainlineDeployer.enabled=false`），那么
+/// 升级就该把已经存在的第二写者留下的字段收回来；不收回，第一次升级永远过不去，
+/// release 就永远停在 failed。
+fn helm_upgrade_args(common: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = vec!["upgrade".into(), "--install".into()];
+    args.extend(common.iter().cloned());
+    args.push("--create-namespace".into());
+    args.push("--force-conflicts".into());
+    args
 }
 
 /// 渲染 chart（不落地）：给交付前的一致性清理提供"将交付什么"的事实。
@@ -4162,6 +4188,31 @@ mod helm_delivery_single_writer_tests {
         assert!(
             sets.contains(&"secrets.create=true"),
             "helm 投递仍要由 chart 生成安装期 Secret；实得 {args:?}"
+        );
+    }
+
+    /// 升级必须带 `--force-conflicts`：另一个 field manager 持有容器 image 时，
+    /// 不带它整次升级 409、release 停在 failed，而服务端 dry-run 仍然是绿的。
+    /// 这条断言挂着的是"单写者边界要落到字段所有权上"，不只是关掉部署器。
+    #[test]
+    fn helm_upgrade_takes_the_fields_another_manager_still_owns() {
+        let common = helm_common_args(
+            Path::new("/repo/deploy/helm/cogneva"),
+            Path::new("/repo/deploy/helm/cogneva/profiles/k3s-single.yaml"),
+            &[],
+        );
+        let args = helm_upgrade_args(&common);
+        assert_eq!(args[0], "upgrade");
+        assert_eq!(args[1], "--install");
+        assert!(
+            args.iter().any(|a| a == "--force-conflicts"),
+            "升级不带 --force-conflicts 时，另一个 manager 持有的字段会让整次升级失败；实得 {args:?}"
+        );
+        // 渲染给清理用的那一份不能带它：helm template 不认这个旗标，带上就渲染不出来，
+        // 而渲染失败会静默跳过残留 env 清理与归属补标。
+        assert!(
+            !common.iter().any(|a| a == "--force-conflicts"),
+            "公共入参同时喂给 helm template，那里不许出现 --force-conflicts"
         );
     }
 
