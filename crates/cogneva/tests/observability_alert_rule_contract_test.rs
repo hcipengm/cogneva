@@ -1121,8 +1121,110 @@ const FOREIGN: &[(&str, &str)] = &[
         "cogneva_host_credential_surface_unreadable",
         "同上（门没读成，什么也没判）。它与「判成不一致」修法相反——那一格去修适配器，这一格去修读取路径，所以是两条规则而不是一条",
     ),
+    (
+        "cogneva_backup_package_owner_uid",
+        "持久化存储面生产者 `scripts/host/cogneva-backup-package-owner-reading.sh`（私有仓），经聚合器以 `job=\"cogneva-host-readings\"` 暴露。它读的是账本 `backup_runs` 里最新一行 `outcome='ok'` 点名的那个包在卷上的属主：包是恢复唯一能读的东西，属主决定「谁能读」，而备份面此前所有判据都不读它。裸 gauge，不拿包名当标签——包名一天一条，是标签最不该长的形状",
+    ),
+    (
+        "cogneva_backup_package_age_seconds",
+        "同上（从账本的 `finished_at` 算，不读文件 mtime）。写端直接写最终文件名，卷上从第一秒起就有那个 `.tar.zst`，所以 mtime 与「写完」无关；账本的完成时刻才是。界沿用持久化面既有的 26 小时，不另拍一个数",
+    ),
+    (
+        "cogneva_backup_package_reading_state",
+        "同上（`ok`/`unreadable`/`empty` 三态互不重叠）。读不到（账本或卷问不出来）与没有包（账本没有 ok 行、或账本点名的文件不在卷上）修法相反，所以各有一条规则；聚合器那条 `host_reading_producer_up` 另管「这一拍根本没跑成」",
+    ),
     ("up", "Prometheus 采集目标存活序列"),
 ];
+
+/// A registered name that no rule reads yet, and what will judge it meanwhile.
+///
+/// The two censuses guard opposite directions -- a rule may not read a name the
+/// tables do not carry, and a name the tables carry may not go unread -- so a
+/// rule and its registration could only ever land in one commit, and only when
+/// the shared worktree happened to be free. This band is that middle state made
+/// countable: a name may sit here with no reader, and it must leave the moment
+/// a rule reads it.
+///
+/// Each entry declares its own exit, and the checks hold the marker to what the
+/// repository can see rather than to a list of who is allowed to enter. The
+/// registry half (a `Witness` name really is in the host-readings table, a
+/// non-`Witness` name really is not) lives where the table lives, because the
+/// public repository's CI cannot see it.
+enum PendingExit {
+    /// The host-readings registry names it, so the witness reading that walks
+    /// that registry -- producer on one side, consumer on the other -- is what
+    /// says whether it is really published.
+    Witness,
+    /// Not in the registry, but this build publishes the name: the closed set
+    /// is the witness, and the entry says why no rule reads it yet.
+    Unregistered(&'static str),
+    /// Neither: no registered reader and no producer in this build can judge it,
+    /// so the entry has to say what it is waiting for.
+    NoReading(&'static str),
+}
+
+/// Names registered with no rule reading them yet, each with the exit it
+/// declares. Empty today: this commit adds the shape, not an entry.
+const FOREIGN_PENDING: &[(&str, PendingExit)] = &[];
+
+/// How many names are waiting. Raising this number is how a round admits it owes
+/// one more reader; it can only fall by landing one.
+const FOREIGN_PENDING_AT_CENSUS: usize = 0;
+
+/// The ways the pending band can lie, as a pure predicate so an empty band does
+/// not make its criteria vacuous.
+///
+/// `publishes` is passed in rather than looked up so the fixtures can exercise
+/// both sides of `Unregistered` without a closed-set name that happens to be
+/// unread.
+fn pending_complaints(
+    pending: &[(&str, PendingExit)],
+    registered: &[&str],
+    read: &BTreeSet<String>,
+    publishes: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (name, exit) in pending {
+        if !seen.insert(*name) {
+            out.push(format!("{name} 在 FOREIGN_PENDING 里出现了两次"));
+        }
+        if registered.contains(name) {
+            out.push(format!(
+                "{name} 同时在 PRODUCED/FOREIGN 里：一个名字只能有一个出口"
+            ));
+        }
+        if read.contains(*name) {
+            out.push(format!(
+                "{name} 已经有规则在读：读到的名字必须升档进 PRODUCED/FOREIGN，不能停在 pending"
+            ));
+        }
+        let reason = match exit {
+            PendingExit::Witness => None,
+            PendingExit::Unregistered(reason) | PendingExit::NoReading(reason) => Some(*reason),
+        };
+        if let Some(reason) = reason {
+            // 数非空白字符，不数空白分词：这一档的理由与判据都写中文，而中文一句
+            // 话按空白切就是 1 个词——用分词数会把每一条正当的中文理由都判成占位符，
+            // 于是门只会被绕开（改写成英文短句）而不会让人把话说清。
+            if reason.chars().filter(|c| !c.is_whitespace()).count() < 6 {
+                out.push(format!(
+                    "{name} 没写清它为什么停在这里、在等什么：这一档的判据就是那句理由"
+                ));
+            }
+        }
+        match exit {
+            PendingExit::Unregistered(_) if !publishes(name) => out.push(format!(
+                "{name} 标了 Unregistered，可本仓闭集里没有它——它不是本仓发布的，改标 NoReading 并写理由，或改标 Witness"
+            )),
+            PendingExit::NoReading(_) if publishes(name) => out.push(format!(
+                "{name} 标了 NoReading，可本仓闭集在发布它——自报的出口与本仓的读法相反，改标 Unregistered"
+            )),
+            _ => {}
+        }
+    }
+    out
+}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -2821,6 +2923,114 @@ fn the_tables_hold_no_series_that_no_rule_reads() {
     );
 }
 
+/// The pending band is a registration without a reader, so its own criteria are
+/// the ones that can catch it lying: a name that two tables claim, a name that
+/// is already read, an exit marker the repository contradicts, and a band whose
+/// size nobody counted. The band is empty today, so these cases come from
+/// fixtures rather than from the table itself.
+#[test]
+fn foreign_pending_refuses_the_states_it_claims_to() {
+    let publishes = |name: &str| name == "published_here";
+
+    let cases: &[(&str, &[(&str, PendingExit)], &[&str], &[&str], usize)] = &[
+        (
+            "干净的条目",
+            &[("a_series", PendingExit::Witness)],
+            &[],
+            &[],
+            0,
+        ),
+        (
+            "同一个名字也进了真登记表",
+            &[("a_series", PendingExit::Witness)],
+            &["a_series"],
+            &[],
+            1,
+        ),
+        (
+            "已经有规则在读",
+            &[("a_series", PendingExit::Witness)],
+            &[],
+            &["a_series"],
+            1,
+        ),
+        (
+            "NoReading 没写理由",
+            &[("a_series", PendingExit::NoReading("  "))],
+            &[],
+            &[],
+            1,
+        ),
+        (
+            "Unregistered 说本仓发布，闭集里却没有",
+            &[("a_series", PendingExit::Unregistered("等那条规则落地"))],
+            &[],
+            &[],
+            1,
+        ),
+        (
+            "NoReading 说没人能判，本仓却在发布它",
+            &[("published_here", PendingExit::NoReading("等那条规则落地"))],
+            &[],
+            &[],
+            1,
+        ),
+        (
+            "重名",
+            &[
+                ("a_series", PendingExit::Witness),
+                ("a_series", PendingExit::Witness),
+            ],
+            &[],
+            &[],
+            1,
+        ),
+    ];
+
+    for (what, pending, registered, read, expected) in cases {
+        let read: BTreeSet<String> = read.iter().map(|n| (*n).to_string()).collect();
+        assert_eq!(
+            pending_complaints(pending, registered, &read, &publishes).len(),
+            *expected,
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn the_pending_band_is_counted() {
+    let registered: Vec<&str> = PRODUCED
+        .iter()
+        .map(|(n, _)| *n)
+        .chain(FOREIGN.iter().map(|(n, _)| *n))
+        .collect();
+    let read: BTreeSet<String> = shipped_rules()
+        .iter()
+        .flat_map(|(_, promql)| metric_names_in(promql))
+        .collect();
+
+    let complaints = pending_complaints(
+        FOREIGN_PENDING,
+        &registered,
+        &read,
+        &closed_set::a_series_this_build_publishes,
+    );
+    assert!(
+        complaints.is_empty(),
+        "FOREIGN_PENDING 里有条目不成立:\n{}",
+        complaints.join("\n")
+    );
+    assert_eq!(
+        FOREIGN_PENDING.len(),
+        FOREIGN_PENDING_AT_CENSUS,
+        "pending 的条数与 FOREIGN_PENDING_AT_CENSUS 不再相等（表内 {n} 笔，常数 {c}）。\
+         多一笔：那是多欠一个读者，改这个数就是承认它；少一笔：说明补上了读者，\
+         同样要把它改回来——这个数就是「还有几个名字在等读者」的账",
+        n = FOREIGN_PENDING.len(),
+        c = FOREIGN_PENDING_AT_CENSUS
+    );
+}
+
 // `enum Unread` and `unresolved_readers` live in `common/unread.rs`. The scrape
 // census gives the same three verdicts to a different population -- the names a
 // build can render, which the store never holds -- and one copy of the type is
@@ -3316,7 +3526,14 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
                 .any(|s| names.contains(&format!("{name}{s}")))
     };
 
-    let listed: BTreeSet<&str> = UNREAD.iter().map(|(n, _)| *n).collect();
+    // A pending name is a declared debt of a different kind: it is waiting for a
+    // reader, the band is counted, and it leaves the moment one lands. It is
+    // classified, so it does not also owe an UNREAD verdict.
+    let listed: BTreeSet<&str> = UNREAD
+        .iter()
+        .map(|(n, _)| *n)
+        .chain(FOREIGN_PENDING.iter().map(|(n, _)| *n))
+        .collect();
 
     let unclassified: Vec<&str> = cog_core::metric_names::ALL
         .iter()
