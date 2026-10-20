@@ -21,9 +21,12 @@
 # false positive here is exactly the expensive case the sentence above is about.
 # Two anchors do that work:
 #   - `Co-authored-by:` counts only as a trailer — at the start of a line — and
-#     only when the same line names Claude or Anthropic. A commit message that
-#     discusses the attribution rule in prose contains the phrase too, and it is
-#     not an attribution.
+#     only when the same line names Claude, Anthropic, or this platform's own
+#     self-evolution identity. A commit message that discusses the attribution
+#     rule in prose contains the phrase too, and it is not an attribution. The
+#     platform's identity is on the list because a bot name in the trailer is
+#     the same rule with a different name -- and it was live: the evolution
+#     deployer signed every self-generated commit that way until it was fixed.
 #   - `Generated with` counts only when the same line names Claude, which is what
 #     the generated-file footer does; `Generated with cargo fmt` is a description
 #     of how a file was produced, not an author.
@@ -66,7 +69,7 @@ offenders="$(
     [ -n "${sha}" ] || continue
     body="$(git log -1 --format=%B "${sha}")"
     hit="$(printf '%s\n' "${body}" \
-      | grep -nEi '^[[:space:]]*co-authored-by:.*(claude|anthropic)|^[[:space:]]*generated with.*claude|🤖|claude\.com/claude-code' \
+      | grep -nEi '^[[:space:]]*co-authored-by:.*(claude|anthropic|cogneva self-evolution|self-evolution@cogneva)|^[[:space:]]*generated with.*claude|🤖|claude\.com/claude-code' \
       | head -1)"
     [ -n "${hit}" ] || continue
     printf '%s %s:%s\n' "${sha}" "${hit%%:*}" "${hit#*:}"

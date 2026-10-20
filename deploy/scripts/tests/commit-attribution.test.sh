@@ -74,6 +74,13 @@ emoji="$(commit 'feat: add another helper
 generated="$(commit 'feat: add a third helper
 
 Generated with Claude Code (claude.com/claude-code)')"
+# The platform signing its own work. This one is not hypothetical: the evolution
+# deployer wrote exactly this trailer on every self-generated commit, and a
+# pattern that names only the vendor products would have called all of them
+# clean -- the rule is about an AI in the trailer, not about one vendor's name.
+selfsigned="$(commit 'feat(evolution): apply self-generated change x
+
+Co-Authored-By: Cogneva Self-Evolution <self-evolution@cogneva.ai>')"
 
 # expects <name> <exit-code> [range...]
 expect() {
@@ -89,8 +96,9 @@ expect() {
 expect trailer_co_authored 1 "${signoff}..${coauthored}"
 expect trailer_emoji 1 "${coauthored}..${emoji}"
 expect trailer_generated_with 1 "${emoji}..${generated}"
-# All three at once, which is what a real push reads.
-expect all_three_in_one_range 1 "${signoff}..HEAD"
+expect trailer_self_evolution 1 "${generated}..${selfsigned}"
+# All four at once, which is what a real push reads.
+expect all_four_in_one_range 1 "${signoff}..HEAD"
 
 # Same history, same bad commits, a range that stops before them. This pair is
 # the whole argument for judging a range rather than the history.
