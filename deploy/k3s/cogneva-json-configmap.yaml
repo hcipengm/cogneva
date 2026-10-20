@@ -2402,6 +2402,15 @@ data:
                 "summary": "「进程手里的规则集与 ConfigMap 声明的是不是同一份」这条读数 15 分钟里一条样点都没有：`cogneva_alert_rule_count` 带 `state=\"agrees\"` 的那一格（`readout=\"rule_loaded_vs_configmap\"`，值 1 表示同一份、0 表示不同）消失了。它断了不等于两份一致：同族的 `declared` / `loaded` / `document_readable` 三格也只是让读者自己相减，相减不出「有没有人量过」。两份规则集不一致时这条读数读 0，而**没有样点**与读 0 在告警面上是两件事，所以缺样本必须自己一条判据——把 `== 0` 写进同一条规则只会让它在没有样点时继续安静。发布者有两个：`cogneva` 与 `cogneva-evolution`，两处都消失才说明进程没了或它们都读不到挂载的那份文档。查法：`kubectl -n cogneva get configmap cogneva-json` 看文档在不在，再 `kubectl -n cogneva exec <pod> -- curl -s localhost:8080/metrics` 看这两格印没印。窗口 15 分钟，够跨过一次滚动重启。"
               },
               {
+                "name": "alert_rule_set_disagrees_with_configmap",
+                "promql": "min without (pod, container, instance, endpoint, service, namespace) (cogneva_alert_rule_count{state=\"agrees\"})",
+                "condition": {
+                  "less_than": 1.0
+                },
+                "severity": "warning",
+                "summary": "进程手里的规则集与 ConfigMap 声明的那一份对不上了：这一格读 0。0 有两个来源，规则条数不同，或者挂载的那份文档根本读不出来（同族 `document_readable` 那一格同时是 0，先用它分流）；`declared` 与 `loaded` 两格是这份判词背后的两个数。按进程留一行（`job` 是发布者，`pod` 只是抓取坐标，滚动一次就换），所以它点名的是哪个进程对不上，不是一个下一次部署就消失的 Pod。它与 `alert_rule_count_reading_stopped` 是两条：那一条管「一个样点都没有」，这一条管「有样点、值是 0」；把两件事并进同一条，缺样本时这条会安静，而缺样本恰恰是这条自己要报的情况之一。阈值小于 1 而不是等于 0：发布侧只发 1 或 0，写小于 1 让「不是 1 的任何值」都算不一致。severity 取 warning：进程仍在服务，错的是它据以判断的那份规则集，下一次部署或文档挂载修好就会自愈。"
+              },
+              {
                 "name": "acceptance_census_never_completed",
                 "promql": "max by (node) (cogneva_acceptance_present) == 0",
                 "condition": {
