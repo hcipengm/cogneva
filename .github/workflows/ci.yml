@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -59,7 +59,7 @@ jobs:
       # `cargo clippy --workspace --all-targets`, and its tests run both here. Whether the
       # action's default profile happens to carry either is not something a gate
       # that refuses changes may depend on.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -379,7 +379,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -389,7 +389,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, and it is the version that has to be bumped on purpose. Floating
+      # stable changed this gate under the tree: 1.99 added lints that no commit
+      # in review had anything to do with, and because `cargo` stops at the
+      # first crate that fails, each fix exposed the next one a run later. The
+      # same pin is used by every job here; a toolchain that is about to judge
+      # a tree should be a decision recorded in the tree.
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -573,7 +579,7 @@ jobs:
       - uses: actions/checkout@v4
       # This job runs the workspace test suite under instrumentation, so it needs
       # the formatter the same way the test job does.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: llvm-tools-preview, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -706,7 +712,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
@@ -736,7 +742,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
