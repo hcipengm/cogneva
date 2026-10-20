@@ -2384,6 +2384,24 @@ data:
                 "summary": "clippy 判词账上有读不出来的行：读了 `cogneva_clippy_verdict_unparsable_lines` 条，坏行只计数、不清零——一行坏掉不该让整份读数变成 0，但坏行意味着某一笔的判词可能根本没被读进来，于是账上的 `pending_revs=0` 不再等于「一笔都不欠」。修法在写侧：按行看那份 JSONL（`rev` / `verdict` / `written_at` 缺一个或类型不对都算坏行），把写坏的那几行修好或删掉。阈值取大于 0：这不是一个可以攒着的数，坏行留下的唯一后果是让一个红读成绿。severity 取 warning 而不是 critical：账本身还在、其余判词还读得出来，但要在下一次读账当绿之前修掉。"
               },
               {
+                "name": "clippy_verdict_readings_stopped",
+                "promql": "absent_over_time(cogneva_clippy_verdict_present[15m])",
+                "condition": {
+                  "greater_than": 0.0
+                },
+                "severity": "warning",
+                "summary": "这台宿主上的 clippy 判词读数整族 15 分钟里一条样点都没有：`cogneva_clippy_verdict_present` / `cogneva_clippy_pending_revs` / `cogneva_clippy_verdict_unparsable_lines` 三条都消失了，所以此刻没有任何东西在回答「主线这一笔过没过 clippy」。这一条与同族另外三条是分开的：那三条各自比一个值，值不在时它们**都是空的**——空集不触发，于是「没人量」在面板上与「量出来都好」长得一模一样，这正是缺席要单独占一条规则的理由。两种成因：宿主读数通道停了，或者生产者这一轮退 3（读不到输入）时按契约一条都不印。查法：先看抓取端点 `up` 里 `job` 取 `cogneva-host-readings` 的那条还在不在，再以 cogneva 用户跑 `systemctl --user list-timers cogneva-host-readings.timer` 与 `journalctl --user -u cogneva-host-readings.service`；以 root 跑会报「Unit not found」，那不是没装。窗口取 15 分钟：读数每拍都印，够跨过一次滚动重启，又短到不用「等一会儿再看」。"
+              },
+              {
+                "name": "alert_rule_count_reading_stopped",
+                "promql": "absent_over_time(cogneva_alert_rule_count{state=\"agrees\"}[15m])",
+                "condition": {
+                  "greater_than": 0.0
+                },
+                "severity": "warning",
+                "summary": "「进程手里的规则集与 ConfigMap 声明的是不是同一份」这条读数 15 分钟里一条样点都没有：`cogneva_alert_rule_count` 带 `state=\"agrees\"` 的那一格（`readout=\"rule_loaded_vs_configmap\"`，值 1 表示同一份、0 表示不同）消失了。它断了不等于两份一致：同族的 `declared` / `loaded` / `document_readable` 三格也只是让读者自己相减，相减不出「有没有人量过」。两份规则集不一致时这条读数读 0，而**没有样点**与读 0 在告警面上是两件事，所以缺样本必须自己一条判据——把 `== 0` 写进同一条规则只会让它在没有样点时继续安静。发布者有两个：`cogneva` 与 `cogneva-evolution`，两处都消失才说明进程没了或它们都读不到挂载的那份文档。查法：`kubectl -n cogneva get configmap cogneva-json` 看文档在不在，再 `kubectl -n cogneva exec <pod> -- curl -s localhost:8080/metrics` 看这两格印没印。窗口 15 分钟，够跨过一次滚动重启。"
+              },
+              {
                 "name": "acceptance_census_never_completed",
                 "promql": "max by (node) (cogneva_acceptance_present) == 0",
                 "condition": {
