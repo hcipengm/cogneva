@@ -1144,8 +1144,11 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          `state` before aggregating and never sum the whole family. \
          `state=\"configured\"` rows name one outlet each in `channel` -- the \
          kind of outlet (webhook, email, slack), never its URL or its \
-         recipients -- at 1, and `channel=\"none\"` at 0 states that no outlet \
-         exists. `state=\"verdict\"` is a single row with no `channel`, \
+         recipients -- at 1, and there is no such row when no outlet exists: \
+         a placeholder naming a channel would be read as a kind that is \
+         switched off, and put a second meaning on `channel`. Count the \
+         outlets with `count(...{state=\"configured\"})`, not by looking for a \
+         kind named after the absence. `state=\"verdict\"` is a single row with no `channel`, \
          published under the `readout` name the communication face owes, at 1 \
          when this deployment has no outlet at all and 0 when it has at least \
          one; it is written in both directions, because the per-kind rows exist \
@@ -1904,6 +1907,24 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          revision would leave a permanent row for a value that describes only \
          itself; the revision is carried by the state file's `ci_hold.rev` and \
          by the heartbeat's `ci_hold=` cell",
+    ),
+    (
+        crate::metric_names::MAINLINE_CI_CHECK_EXCLUDED_TOTAL.as_str(),
+        "Check runs that reported a failure and were left out of the CI verdict, \
+         by the workflow that produced them (`workflow` label, the path the \
+         actions API gives for the run) and by platform. A check run is excluded \
+         when its workflow is one that does not judge this tree -- GitHub's \
+         dynamic Pages workflow publishes a site rather than the revision's \
+         artifacts, so its failure says nothing about whether this revision may \
+         roll. Excluding it makes the verdict green, which erases the failure \
+         from the verdict surface entirely: without this counter, 'excluded \
+         every round' and 'never excluded anything' are the same reading. The \
+         exclusion is a claim that can go stale -- the workflow's identity \
+         changes, or a check that used to be external becomes the repo's own -- \
+         and a counter that never moves is how such a claim is found to have \
+         stopped applying. Labelled by workflow path and not by check name, \
+         because the identity is what the judgement is made on and a name can \
+         be shared with a local check that must still hold the rollout",
     ),
     (
         crate::metric_names::MAINLINE_ADVANCE_DEFERRALS.as_str(),

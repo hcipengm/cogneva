@@ -414,12 +414,13 @@ metric_names! {
     // dispatched, so on a deployment with no outlet and nothing firing, "no
     // channel is configured" is on no series at all and reads exactly like
     // "nothing needed delivering". That is the state a reader most needs to
-    // see, so it is published at start rather than when a dispatch fails: an
-    // empty outlet list keeps the family alive with the single row
-    // `channel="none"` at 0. Read any row at 1 as an outlet that exists and
-    // the `none` row at 0 as no outlet existing; the value is a fixed 1 or 0
-    // per process, so a reader takes one series instead of adding the copies
-    // every process that loads this plugin reports.
+    // see, so it is published at start rather than when a dispatch fails: the
+    // family also carries a `state="verdict"` row, at 1 when no outlet exists
+    // and 0 when one does. Read any `state="configured"` row at 1 as an outlet
+    // that exists; an empty list writes no such row at all, so no reader has to
+    // guess what a placeholder value would have meant. The value is a fixed 1
+    // or 0 per process, so a reader takes one series instead of adding the
+    // copies every process that loads this plugin reports.
     ALERT_CHANNELS_CONFIGURED => "cogneva_alert_channels_configured",
 
     // cog-observability — the two sizes the loaded-rule-set check compares,
@@ -781,6 +782,20 @@ metric_names! {
     // unactionable for lack of exactly this label. Recording it changes no
     // verdict: the gate still fails open by design.
     MAINLINE_CI_NO_VERDICT_REASON_TOTAL => "cogneva_mainline_ci_no_verdict_reason_total",
+    // Check runs that reported a failure and were left out of the verdict above,
+    // by the workflow that produced them.
+    //
+    // The verdict has one cell for "the upstreams reported green", and after an
+    // exclusion that cell also covers "one check was red and its workflow does
+    // not judge this tree". GitHub's dynamic Pages workflow is the case that
+    // forced the distinction: it publishes a site rather than the revision's
+    // artifacts, and on 2026-10-20 its failure (a missing `id-token: write`
+    // permission) held a revision whose other fifteen checks were green. The
+    // exclusion is deliberately narrow -- by workflow identity, never by check
+    // name -- and this counter is what keeps it visible: without it an
+    // exclusion that fires every round and one that no longer applies at all
+    // read the same.
+    MAINLINE_CI_CHECK_EXCLUDED_TOTAL => "cogneva_mainline_ci_check_excluded_total",
     // How long the rollout has been held by the CI gate, in seconds: 0 when it is
     // not held, the age of the current hold while it is. The state file and the
     // heartbeat line say *that* the gate is holding and which rev it holds; this

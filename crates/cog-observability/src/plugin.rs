@@ -1126,20 +1126,13 @@ async fn publish_alert_channels(
         warn!(error = %e, "could not record the alert outlet verdict");
     }
     if outlets.is_empty() {
-        let labels = HashMap::from([
-            ("state".to_string(), "configured".to_string()),
-            ("channel".to_string(), "none".to_string()),
-        ]);
-        if let Err(e) = metrics
-            .record_gauge(
-                cog_core::metric_names::ALERT_CHANNELS_CONFIGURED,
-                0.0,
-                labels,
-            )
-            .await
-        {
-            warn!(error = %e, "could not record the alert outlet reading");
-        }
+        // Nothing to list. Writing a placeholder row here (`channel="none"` at
+        // 0) would put a second meaning on the `channel` label: an outlet that
+        // exists is 1, and the placeholder would mean "no outlets" at 0, so a
+        // reader grouping by `channel` would answer "the none kind is not
+        // configured" -- which is true and useless, and says nothing about the
+        // state the row was meant to announce. The verdict row above is where
+        // that state lives, and it is written on this path too.
         return;
     }
     for outlet in outlets {
@@ -1519,7 +1512,9 @@ mod tests {
     /// A deployment with no outlet must still answer on the series: the whole
     /// point of the family is that "nobody can be told" is a value, so a
     /// backend that is handed nothing would leave the reader with the
-    /// absence this reading exists to remove.
+    /// absence this reading exists to remove. The answer is the verdict row
+    /// alone -- no configured row is written, because there is no kind to
+    /// name, and a made-up one would read as a kind that is switched off.
     /// Every row that names an outlet kind is `state="configured"`; every row
     /// that names itself a reading is `state="verdict"`. A row carrying one
     /// without the other would let a `state` selector miss it -- and since the
@@ -1548,10 +1543,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_outlet_is_a_zero_row_rather_than_no_series() {
+    async fn no_outlet_is_a_verdict_row_rather_than_no_series() {
         let backend = Arc::new(Gauges::default());
         publish_alert_channels(Some(backend.clone()), &[]).await;
-        assert_eq!(backend.outlets(), vec![("none".to_string(), 0.0)]);
+        assert_eq!(
+            backend.outlets(),
+            Vec::new(),
+            "a deployment with no outlet must name no kind at all: a placeholder \
+             row would be read as a kind that exists and is switched off"
+        );
         assert_eq!(
             backend.readouts(),
             vec![(ALERT_CHANNEL_NONE_READOUT.to_string(), 1.0)]
