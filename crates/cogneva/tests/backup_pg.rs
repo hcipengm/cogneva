@@ -304,6 +304,10 @@ async fn pg_restore_loads_a_package_that_still_carries_the_generated_column() {
 /// 镜像不认识的分区子表、有当前 DDL 之后才加的列、有导出改成点名搬迁列之前留下的
 /// 生成列。所以这个用例的输入由外部给，不自己造。
 ///
+/// 输入由外部给，前提也就由外部定：保留窗口滑过导出改动之后，窗口里最老的包
+/// 也不再带生成列，这时这个用例证明不了它要证明的事。它先读包的表头，前提不在
+/// 就报「包不对」并点明要哪个日期之前的包，而不是把结论写成「恢复漏了」。
+///
 /// ```text
 /// COGNEVA_TEST_DATABASE_URL=postgres://…/cog_restore_probe \
 /// COGNEVA_TEST_PACKAGE_PG_DIR=/tmp/pkg/pg \
@@ -320,7 +324,6 @@ async fn pg_restore_loads_a_package_written_before_the_schema_moved_on() {
 
     // 这个用例把一个完整的生产包灌进目标库，它必须独占一个库：与探针表共用
     // 一个库时，`discover_tables` 会把别的用例建的表也算进包。
-    let (_probe, url) = own_database("package").await;
     let pg_dir = std::env::var("COGNEVA_TEST_PACKAGE_PG_DIR")
         .map(std::path::PathBuf::from)
         .expect("set COGNEVA_TEST_PACKAGE_PG_DIR to the pg/ directory of an extracted package");
@@ -329,6 +332,33 @@ async fn pg_restore_loads_a_package_written_before_the_schema_moved_on() {
         .expect("set COGNEVA_TEST_PACKAGE_MANIFEST to that package's manifest.json");
     let manifest: BackupManifest =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+
+    // 这个用例要的是一份**旧包**：导出还没改成点名搬迁列，所以包里那份
+    // `raw_log_index` 的表头带着生成列 `is_hot`。保留窗口滑过去以后手上会给到
+    // 新包，这时失败必须说「包不对」，不能说「恢复漏了」——后者把人指向恢复代码，
+    // 而恢复代码根本没被这份包考到。
+    let header = std::fs::read_dir(&pg_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with("raw_log_index.csv"))
+        })
+        .find_map(|path| {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| text.lines().next().map(str::to_string))
+        })
+        .unwrap_or_default();
+    assert!(
+        header.split(',').any(|column| column.trim() == "is_hot"),
+        "这份包的 `raw_log_index` 表头里没有生成列 `is_hot`，它写于导出改成点名搬迁列之后，\
+         证明不了「旧包里由目标重算的生成列会被点名」这件事。换一份导出改动\
+         （2026-10-18 17:30Z，commit 1d41e52b）之前写下的包再跑。表头：{header}"
+    );
+
+    let (_probe, url) = own_database("package").await;
 
     // 目标库必须是**这个镜像**自己的结构，而不是备份那一刻的结构：恢复只做
     // TRUNCATE + COPY，空库的形状先由迁移与各 store 的 DDL 立出来。
