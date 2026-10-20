@@ -1909,7 +1909,10 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          looked at yet, so a value that climbs and stays up is a look that \
          stopped reaching its rows, which is what a lane too narrow to offer \
          them looks like from outside. `unenforced` is the debt, and `retired` \
-         is history rather than work: summing them answers nothing.",
+         is history rather than work: summing them answers nothing. Each cell also \
+         carries `readout=principle_ledger_<state>`, so one state can be named as a \
+         reading on its own -- a reader that takes a reading's name and prints what \
+         comes back would otherwise show four unlabelled numbers in one cell.",
     ),
 ];
 
