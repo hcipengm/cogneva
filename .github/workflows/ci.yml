@@ -687,6 +687,14 @@ jobs:
       # 「没有序列」与「没有这个标签」在读数上分不开）。
       - name: Check alert rules name their subject, not their reporter
         run: bash deploy/scripts/check-alert-rule-subjects.sh
+      # 带 on() 的向量比较里「多的一侧」：一侧在同一组连接键下会有多条序列时不写
+      # group_left/group_right，Prometheus 在**求值**时直接 422，而表达式语法合法、
+      # promtool 绿、按指标名做的检查也绿。于是规则在安宁时一直安静，一进入它要抓的
+      # 局面就自己先死掉（2026-10-20：`build_gate_slot_held_too_long` 只在两个构建槽
+      # 同时被占时失败——而那正是它存在的理由）。判据读表达式结构（两侧的 by 集对
+      # 连接键集），判不动的计数上报，不折进绿里。
+      - name: Check alert rules declare the many side of a join
+        run: bash deploy/scripts/check-alert-rule-join-shape.sh
       # 样本日志那几条 gauge 的写者身份：容量与容量判定是每个部署自己的声明，
       # 却落在共用表里、series 键就是标签集。值取成 Pod 标签时拿到的是**应用**名，
       # 同一个镜像的每个工作负载都带着它，那道「别家不许顶这一家的声明」的闸
