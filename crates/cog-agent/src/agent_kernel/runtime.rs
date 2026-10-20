@@ -3574,6 +3574,144 @@ mod tests {
         );
     }
 
+    /// Proposes the same call on every turn, the way a model does when it reads
+    /// a refusal as something to work around.
+    struct RepeatingCallLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for RepeatingCallLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (stream, producer) = cog_core::EventStream::with_capacity(4);
+            tokio::spawn(async move {
+                let mut producer = producer;
+                producer.end(cog_core::ChatResponse {
+                    content: vec![ContentBlock::tool_call(
+                        "call-blocked",
+                        "noop",
+                        serde_json::json!({}),
+                    )],
+                    api: "mock".into(),
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    response_id: None,
+                    usage: cog_core::Usage::default(),
+                    stop_reason: cog_core::StopReason::Stop,
+                    error_message: None,
+                    upstream_failure: None,
+                    retry_after_secs: None,
+                    timestamp: chrono::Utc::now(),
+                });
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::ChatResponse> {
+            unimplemented!()
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    struct DenyEverything;
+
+    #[async_trait::async_trait]
+    impl cog_core::Guardrail for DenyEverything {
+        async fn check_input(&self, _messages: &[Message]) -> cog_core::GuardResult {
+            cog_core::GuardResult::Pass
+        }
+        async fn check_output(&self, _response: &str) -> cog_core::GuardResult {
+            cog_core::GuardResult::Pass
+        }
+        async fn check_tool_call(&self, _tool: &cog_core::ToolCall) -> cog_core::GuardResult {
+            cog_core::GuardResult::Block {
+                reason: "not allowed here".into(),
+                rule: "runtime-test-rule".into(),
+            }
+        }
+    }
+
+    /// The spend this bounds is one refusal re-sent until the budget runs out.
+    /// A rule that refused a call has not moved by the next turn, so the
+    /// identical call cannot come out differently: the run ends on the second
+    /// refusal, with the tool body never having run and the iteration ceiling
+    /// still far away.
+    #[tokio::test]
+    async fn a_repeated_refusal_ends_the_run_instead_of_retrying() {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let config = RuntimeConfig {
+            agent_id: "blocked-tool".into(),
+            role: "blocked-tool-test".into(),
+            max_iterations: 10,
+            ..Default::default()
+        };
+
+        let mut registry = ToolRegistry::new();
+        registry.set_guardrail(Arc::new(DenyEverything));
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hit = ran.clone();
+        cog_core::ToolRegistry::register(
+            &registry,
+            cog_core::Tool {
+                name: "noop".into(),
+                description: "counts its own executions".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                implementation: cog_core::ToolImplementation::Native(Arc::new(move |_args| {
+                    let hit = hit.clone();
+                    Box::pin(async move {
+                        hit.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(serde_json::json!({ "ran": true }))
+                    })
+                })),
+            },
+        );
+
+        let mut runtime = AgentRuntime::new(config, tx).with_tools(registry);
+        let llm = RepeatingCallLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let err = runtime
+            .run(serde_json::json!({ "task": "blocked" }), &llm)
+            .await
+            .expect_err("a refusal the model keeps re-proposing must end the run");
+
+        assert!(
+            err.to_string().contains("refused the identical call"),
+            "the end must name the refusal, not a budget: {err}"
+        );
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the tool body must never run behind a refusal"
+        );
+        assert_eq!(
+            llm.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one turn to propose the call, one to re-propose it, and no third"
+        );
+    }
+
     /// A tool output too large for the window is archived at the return point and
     /// the marker carries the reference. Only that point holds both the full text
     /// and the budget, so a bound that did not fire here would leave the dropped
