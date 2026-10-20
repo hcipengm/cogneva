@@ -329,6 +329,16 @@ enum LintVerdict {
     /// The linter reports on this tree in a form nothing here can compare, so
     /// no finding can be shown to be the tree's own.
     Unattributable(String),
+    /// The linter exited non-zero and said nothing this stage can read: not one
+    /// diagnostic in the compiler's interchange, on a linter that always speaks
+    /// it. A run that exits non-zero under `-D warnings` always emits at least
+    /// one diagnostic, so the absence of diagnostics is the absence of a
+    /// judgement -- the command was not found, the toolchain would not start,
+    /// or the run died before the tree was read. Kept apart from
+    /// [`Self::Attributable`] because an empty set of findings from a judge that
+    /// never spoke reads exactly like a clean tree, and only one of those is a
+    /// measurement.
+    Unmeasured(String),
     /// This deployment declares no linter.
     NotDeclared,
 }
@@ -1198,6 +1208,18 @@ impl ChangePipeline {
                     new_status: EvolutionStatus::ValidationFailed,
                     tiering: Some(tiering.clone()),
                 });
+            }
+            Ok(LintVerdict::Unmeasured(evidence)) => {
+                // The stage did not get a reading of this tree, and a stage that
+                // did not read is not a change that failed it: the change stays
+                // for an attempt that can lint, rather than landing with a note
+                // that says "no diagnostics" about a run that never spoke.
+                warn!(
+                    change_id = %change.artifact_id,
+                    "The built-in linter reached no verdict; this change is not judged yet"
+                );
+                let _ = self.git_reset_hard(workdir).await;
+                return Err(SFError::IO(evidence));
             }
             Ok(LintVerdict::Attributable { line, output }) => {
                 // A change is answerable for the lints reported on a line it
@@ -2521,6 +2543,12 @@ impl ChangePipeline {
     /// it cannot parse there is a compilation error for the suite to answer
     /// for, not a linter refusing the change; reading that as `LintRefused`
     /// would retire a change for a verdict the lint criterion never made.
+    ///
+    /// A built-in linter that exits non-zero with nothing in the interchange is
+    /// not a tree with no findings, it is a tree no linter read: the command was
+    /// not found, the toolchain would not start, or the run died first. That
+    /// answers [`LintVerdict::Unmeasured`] and never a clean tree, so a host
+    /// without the linter cannot pass changes through the stage unlinted.
     async fn judge_lint(&self, workdir: &Path, change_id: &str) -> SFResult<LintVerdict> {
         let declared = match self.lint_command.as_deref() {
             Some([]) => return Ok(LintVerdict::NotDeclared),
@@ -2547,7 +2575,29 @@ impl ChangePipeline {
                 "{line}: no diagnostics on this tree"
             )));
         }
-        if declared.is_none() || cog_core::contract::reflection::has_compiler_messages(&output) {
+        if declared.is_none() {
+            // The built-in linter always speaks the interchange, and under
+            // `-D warnings` a non-zero exit always carries at least one
+            // diagnostic. So a non-zero exit with nothing in it is a command
+            // that did not run -- a missing `clippy`, a toolchain that would
+            // not start, a run killed before it read the tree. Reporting that
+            // as "no diagnostic is on a line this change wrote" would turn a
+            // tree nobody linted into a tree that linted clean, which is the
+            // one reading this stage exists to refuse.
+            if !cog_core::contract::reflection::has_compiler_messages(&output) {
+                warn!(
+                    change_id = %change_id,
+                    command = %line,
+                    "The built-in linter exited non-zero without reporting anything"
+                );
+                return Ok(LintVerdict::Unmeasured(format!(
+                    "{line} exited non-zero and reported nothing in the compiler's diagnostic \
+                     interchange, so this tree was not judged by a linter at all:\n{output}"
+                )));
+            }
+            return Ok(LintVerdict::Attributable { line, output });
+        }
+        if cog_core::contract::reflection::has_compiler_messages(&output) {
             return Ok(LintVerdict::Attributable { line, output });
         }
         warn!(
@@ -3355,6 +3405,35 @@ impl Default for MetricsConfig {
                 .unwrap(),
             LintVerdict::NotDeclared
         ));
+    }
+
+    /// A built-in linter that never read the tree is not a tree that lints
+    /// clean. The fixture is a manifest cargo refuses before it compiles
+    /// anything, so the run exits non-zero with nothing in the compiler's
+    /// diagnostic interchange -- the same shape a host without `clippy`
+    /// produces, where the empty set of findings is the absence of a
+    /// judgement rather than a verdict about the code.
+    #[tokio::test]
+    async fn a_builtin_linter_that_exits_non_zero_without_a_diagnostic_is_unmeasured() {
+        let root = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[package]\n",
+        )
+        .await
+        .unwrap();
+
+        let verdict = ChangePipeline::new(root.path(), root.path(), false)
+            .judge_lint(root.path(), "c")
+            .await
+            .unwrap();
+        match verdict {
+            LintVerdict::Unmeasured(evidence) => assert!(
+                evidence.contains("diagnostic interchange"),
+                "the note has to name what was missing rather than report a count: {evidence}"
+            ),
+            other => panic!("a linter that never read the tree is not a clean tree, got {other:?}"),
+        }
     }
 
     /// A diff that introduces one brand-new file, the shape the generator

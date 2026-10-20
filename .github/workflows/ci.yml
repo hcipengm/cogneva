@@ -578,10 +578,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # This job runs the workspace test suite under instrumentation, so it needs
-      # the formatter the same way the test job does.
+      # the formatter and the linter the same way the test job does: the
+      # pipeline's own tests run `cargo clippy --workspace --all-targets`. A job
+      # that runs those tests without the linter holds them to a host that
+      # cannot answer, and the reading it takes is of the job, not the code.
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
-          components: llvm-tools-preview, rustfmt
+          components: llvm-tools-preview, rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
