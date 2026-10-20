@@ -894,15 +894,53 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// Mark a tree safe for git, once.
+    ///
+    /// `--add` appends unconditionally, and the entry was never removed when
+    /// the tree went away: every cycle left its path in the shared global
+    /// config, which every git invocation on the host then parses. The
+    /// dubious-ownership check reads global config only (`-c` and the
+    /// `GIT_CONFIG_*` environment do not reach it), so the file is the one
+    /// place this can live -- which makes "add only when absent" plus the
+    /// removal in teardown the whole bound on its size.
     async fn register_safe_directory(&self, path: &Path) {
+        let path = path.to_str().unwrap_or("");
+        if path.is_empty() {
+            return;
+        }
+        let listed = self
+            .run_git(&["config", "--global", "--get-all", "safe.directory"], None)
+            .await
+            .unwrap_or_default();
+        if !safe_directory_missing(&listed, path) {
+            return;
+        }
+        let _ = self
+            .run_git(
+                &["config", "--global", "--add", "safe.directory", path],
+                None,
+            )
+            .await;
+    }
+
+    /// Drop the tree's entry when the tree goes away, so the global config
+    /// holds the live trees and nothing else. `--fixed-value` because git
+    /// reads the value as a regex otherwise, and a path is full of
+    /// regex metacharacters.
+    async fn forget_safe_directory(&self, path: &Path) {
+        let path = path.to_str().unwrap_or("");
+        if path.is_empty() {
+            return;
+        }
         let _ = self
             .run_git(
                 &[
                     "config",
                     "--global",
-                    "--add",
+                    "--fixed-value",
+                    "--unset-all",
                     "safe.directory",
-                    path.to_str().unwrap_or(""),
+                    path,
                 ],
                 None,
             )
@@ -917,6 +955,7 @@ impl WorkspaceManager {
         if tokio::fs::try_exists(path).await.unwrap_or(false) {
             let _ = tokio::fs::remove_dir_all(path).await;
         }
+        self.forget_safe_directory(path).await;
         let _ = self.prune().await;
     }
 
@@ -1042,6 +1081,16 @@ fn sanitize_id(id: &str) -> String {
 
 fn pid_alive(pid: u32) -> bool {
     pid != 0 && Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Whether `path` still has to be added to a safe.directory list holding
+/// `listed` (the output of `git config --global --get-all safe.directory`).
+///
+/// Pure, so the decision is testable without writing anyone's global config:
+/// the writer runs once per tree and once per process start, and a wrong
+/// answer here is a file that grows forever.
+fn safe_directory_missing(listed: &str, path: &str) -> bool {
+    !path.is_empty() && !listed.lines().any(|line| line.trim() == path)
 }
 
 /// 解析 `git worktree list --porcelain`：记录之间以空行分隔，每条以
@@ -1892,6 +1941,23 @@ mod tests {
         assert_eq!(entries[1].branch.as_deref(), Some("main"));
         assert!(entries[2].detached);
         assert!(entries[2].locked);
+    }
+
+    /// 已在列表里的路径不再追加；空路径永远不写（否则会往全局配置里塞一行空值）。
+    /// 这一格盯的是「每次建树都追加一行」那个形状：它曾让宿主的全局配置长到
+    /// 三万余行、1.5 MB，宿主上每条 git 命令都要解析。
+    #[test]
+    fn a_listed_path_is_not_added_again() {
+        let listed = "/a/bare.git\n/tmp/x/workspaces/one\n";
+        assert!(!safe_directory_missing(listed, "/tmp/x/workspaces/one"));
+        assert!(safe_directory_missing(listed, "/tmp/x/workspaces/two"));
+        assert!(safe_directory_missing("", "/tmp/x/workspaces/one"));
+        assert!(!safe_directory_missing(listed, ""));
+        // 前缀相同不等于同一条：`one` 与 `one-longer` 是两棵树。
+        assert!(safe_directory_missing(
+            listed,
+            "/tmp/x/workspaces/one-longer"
+        ));
     }
 
     #[test]

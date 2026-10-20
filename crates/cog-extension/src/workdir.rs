@@ -1087,18 +1087,55 @@ impl WorkdirRouter {
         if tokio::fs::try_exists(path).await.unwrap_or(false) {
             let _ = tokio::fs::remove_dir_all(path).await;
         }
+        self.forget_safe_directory(path).await;
         let _ = self.git_bare(&["worktree", "prune"]).await;
     }
 
+    /// Mark a tree safe for git, once.
+    ///
+    /// `--add` appends unconditionally and nothing removed the entry when the
+    /// tree went away, so the shared global config grew with every task: by
+    /// 2026-10-20 it held 30k dead paths and 1.5 MB that every git invocation
+    /// on the host parsed. The ownership check reads global config only, so
+    /// this file is where the entry must live; the bound is "add when absent"
+    /// plus the removal in teardown.
     async fn register_safe_directory(&self, path: &Path) {
+        let path = path.to_str().unwrap_or("");
+        if path.is_empty() {
+            return;
+        }
+        let listed = self
+            .run_git(&["config", "--global", "--get-all", "safe.directory"], None)
+            .await
+            .map(|out| out.lines().any(|line| line.trim() == path))
+            .unwrap_or(false);
+        if listed {
+            return;
+        }
+        let _ = self
+            .run_git(
+                &["config", "--global", "--add", "safe.directory", path],
+                None,
+            )
+            .await;
+    }
+
+    /// Drop the tree's entry when the tree goes away. `--fixed-value` because
+    /// git reads the value as a regex otherwise.
+    async fn forget_safe_directory(&self, path: &Path) {
+        let path = path.to_str().unwrap_or("");
+        if path.is_empty() {
+            return;
+        }
         let _ = self
             .run_git(
                 &[
                     "config",
                     "--global",
-                    "--add",
+                    "--fixed-value",
+                    "--unset-all",
                     "safe.directory",
-                    path.to_str().unwrap_or(""),
+                    path,
                 ],
                 None,
             )
