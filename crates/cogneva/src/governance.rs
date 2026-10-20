@@ -825,4 +825,24 @@ mod tests {
             "理由不能读成「没人在岗」：{reason}"
         );
     }
+
+    /// 与上一条同源的另一支：配了地址但连不上。两支的判词必须同时守住，
+    /// 否则只改一支的词不会红——而这两句话在读数上长得一样。
+    ///
+    /// 127.0.0.1:1 是必然被拒的地址（内核立刻回 ECONNREFUSED），所以这条不依赖
+    /// 任何外部服务，也不碰凭证。
+    #[tokio::test]
+    async fn an_unreachable_heartbeat_store_also_reads_unread_rather_than_nobody() {
+        let (registry, reason) = agent_registry(Some("redis://127.0.0.1:1/")).await;
+        assert!(registry.is_none());
+        let reason = reason.expect("连不上时必须留下理由，否则调用方只能猜");
+        assert!(
+            reason.contains("unread"),
+            "理由要自报「读成 unread」，实际是 {reason}"
+        );
+        assert!(
+            !reason.contains("nobody") && !reason.contains("no one"),
+            "理由不能读成「没人在岗」：{reason}"
+        );
+    }
 }
