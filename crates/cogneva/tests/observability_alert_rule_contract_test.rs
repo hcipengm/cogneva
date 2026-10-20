@@ -977,6 +977,12 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_memory_pull_gate_holder",
         "crates/cog-memory/src/observable.rs",
     ),
+    // 原则账的普查：四个状态格一起发，一次 pass 一写。规则读的是「这一族还在不在
+    // 发」，所以登记的是产出者而不是任何一格的值——值合法地可以是 0 行。
+    (
+        "cogneva_principle_ledger_rows",
+        "crates/cog-orchestrator/src/principle_ledger.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.
@@ -2915,6 +2921,37 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_ready_admission_held_total",
         Unread::Gap("tasks the publisher refused to dispatch because the pool's window could not pay for them, by `stream` and `reason`. A rule cannot close it: any nonzero is the admission gate holding correctly while the window is spent, and what would make a hold a fault is one that outlasts the window that justified it -- a bound nobody has declared, since the only operand for it is the window's own reset time, which the readings series beside this one carries. Its reader is a panel drawing this count beside the remaining allowance and the reset, which is a panel because the healthy state is a nonzero count for as long as the window is spent. No such panel was written in this pass"),
     ),
+    // The write-window record, published for the first time in this pass because
+    // the face that owes the reading had nowhere to get it from. Four cells, and
+    // a rule on any of them would have to say when an overlap or a self-approval
+    // is a fault: `approved` is zero whenever nobody is writing, which is the
+    // ordinary state, and one live window is not better or worse than two. The
+    // reader owed here is a panel in the change-ledger group drawing the four
+    // cells together -- deliberately not written in this pass, and filed rather
+    // than given an invented threshold. What the cells are read by today is the
+    // governance face reading on the host side, which takes `write_window_approved`
+    // as that face's first reading; that reader lives outside this repository's
+    // rules and panels, which is why it does not close this entry.
+    (
+        "cogneva_change_write_windows",
+        Unread::Gap("the write windows the account holds, counted by what the record says about each: approved, overlapping scopes, rows that are both approved and revoked, and live windows their own writer approved. A rule cannot close it: `approved` is zero whenever nobody is writing, which is the ordinary state, and neither overlap nor self-approval has a declared bound -- how many accounts may write one path at once, and whether a self-approved window is a fault or merely a record to be corrected, are policies nobody has stated. Its reader is a panel in the change-ledger group drawing the four cells together; no such panel was written in this pass"),
+    ),
+    // The outlet list, published for the first time in this pass for the same
+    // reason the write-window record was: the face that owes the reading had
+    // nowhere to get it from. The dispatch counter only moves when a batch is
+    // sent, so a deployment with no outlet and nothing firing had that state on
+    // no series at all, and "nobody can be told" read exactly like "nothing
+    // needed telling". A rule cannot close this one: a rule on `channel="none"`
+    // at 0 would have to deliver its own page through the channel it reports as
+    // absent, and a rule on a missing family would be the same false clear the
+    // observability face already refused. The reader owed here is the
+    // governance face reading on the host side, which takes this family as the
+    // communication face's first reading; that reader lives outside this
+    // repository's rules and panels, which is why it does not close this entry.
+    (
+        "cogneva_alert_channels_configured",
+        Unread::Gap("which outlets this deployment can deliver an alert through, one row per configured kind at 1, and the single row `channel=\"none\"` at 0 when there is none. The value is a constant per process, so a reader takes one series rather than adding the copies: what it answers is whether an alert can reach a person at all, which is the question the persisted alert row cannot answer -- that row is written whether or not anyone was told. It is filed rather than given a threshold because every cell is the configuration itself: 1 is the ordinary state of a deployment with an outlet and 0 the ordinary state of one without, so neither number is a condition that turns into a fault at some level. What makes a deployment without an outlet wrong is a decision about that deployment, not something this series can bound"),
+    ),
 ];
 
 /// How many `Gap` entries the census left. A new series that no face reads and
@@ -3109,7 +3146,18 @@ const UNREAD: &[(&str, Unread)] = &[
 /// series was minted to make readable, so one of its cells now has a rule. The
 /// panel is still owed for the rest of the arithmetic -- this entry's debt is
 /// only the part a rule can hold.
-const GAPS_AT_CENSUS: usize = 25;
+///
+/// It went back to 26 in the pass that gave the write-window record a series.
+/// That series exists because the face owing the reading had no producer at all
+/// -- its first reading was a name in the roster and nothing behind it -- so the
+/// pass published the four counts before it had a reader, deliberately. The
+/// reader owed is a panel in the change-ledger group; a rule would have to
+/// declare when an overlap or a self-approval is a fault, and both are policies
+/// nobody has stated. The host-side governance face reading selects
+/// `readout="write_window_approved"` today, and that reader is outside the rules
+/// and panels this census counts, which is why the entry stands rather than
+/// pointing at it.
+const GAPS_AT_CENSUS: usize = 27;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

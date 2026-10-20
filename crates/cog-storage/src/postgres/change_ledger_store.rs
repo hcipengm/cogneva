@@ -17,6 +17,7 @@ use sqlx::{PgPool, Row};
 use cog_core::{
     ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangeReading,
     ChangeReopen, ChangeSource, ChangeState, DispatchState, RetireReason, SFError, SFResult,
+    WriteWindow,
 };
 
 /// Every read returns these, in one place so no two readers can come back with
@@ -24,6 +25,15 @@ use cog_core::{
 const ROW_COLUMNS: &str = "kind, scope, literal, state, title, assertion, sources, \
                            first_seen_at, measured_at, measured_rev, delivered_rev, landed_at, \
                            unsettled_reason, retire_reason, retired_at";
+
+/// Every write-window column the reading needs, in one place so the query and
+/// the row it is read into cannot name different fields.
+///
+/// Unordered on purpose: the reduction to counts happens in the caller, which
+/// needs no order, and an `ORDER BY` here would be a promise the reading never
+/// reads.
+const WRITE_WINDOW_COLUMNS_SQL: &str = "SELECT window_id, path_scope, writer, approver, \
+     requested_at, approved_at, expires_at, revoked_at FROM write_windows";
 
 /// How wide each keyed identity part may be, taken from the columns that key
 /// them rather than from what a caller would like to write.
@@ -966,5 +976,39 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .await
             .map_err(|e| SFError::Database(format!("record dispatch state: {e}")))?;
         Ok(())
+    }
+
+    async fn write_windows(&self) -> SFResult<Option<Vec<WriteWindow>>> {
+        // Every row, whatever state it is in: the caller reduces them to a
+        // reading with one rule, and a query that applied that rule here would
+        // be a second copy of it -- and would make the revoked row, the
+        // inconsistent one and the self-approved one unreadable, which are
+        // precisely the rows the reading exists to surface.
+        //
+        // The table's absence is not caught and answered with an empty set: a
+        // deployment that has not run the migration has no windows *and* no
+        // way to say so, and turning a failed read into "nothing is approved"
+        // would trade a missing reading for a false one. The caller publishes
+        // no cell in that case, which is the reading for "not measured".
+        let rows = sqlx::query(WRITE_WINDOW_COLUMNS_SQL)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("read write windows: {e}")))?;
+        let mut windows = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let field_error =
+                |e: sqlx::Error| SFError::Database(format!("read write windows: {e}"));
+            windows.push(WriteWindow {
+                window_id: row.try_get("window_id").map_err(field_error)?,
+                path_scope: row.try_get("path_scope").map_err(field_error)?,
+                writer: row.try_get("writer").map_err(field_error)?,
+                approver: row.try_get("approver").map_err(field_error)?,
+                requested_at: row.try_get("requested_at").map_err(field_error)?,
+                approved_at: row.try_get("approved_at").map_err(field_error)?,
+                expires_at: row.try_get("expires_at").map_err(field_error)?,
+                revoked_at: row.try_get("revoked_at").map_err(field_error)?,
+            });
+        }
+        Ok(Some(windows))
     }
 }

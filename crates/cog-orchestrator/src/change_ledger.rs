@@ -107,6 +107,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
 use cog_core::{
@@ -115,6 +116,7 @@ use cog_core::{
     DispatchState, LiveRevision, LiveRevisionSource, LlmPoolStatus, LlmWindowPace, MetricsBackend,
     OrchestratorControl, OwnerLeaseBroker, PoolReading, PrincipleCheckKind, PrincipleLedgerStore,
     PrincipleRow, RetireReason, SFResult, ShutdownSignal, StateBackend, Task, TaskStatus, TaskType,
+    WriteWindow,
 };
 
 use cog_core::contract::llm::UpstreamFailure;
@@ -2824,6 +2826,27 @@ async fn dispatch_pass(
     // reader that selects by name still sees one tick.
     publish_handover_readback(metrics, &readback).await;
 
+    // The write windows are read once per pass, beside the ledger's own
+    // reading: the face that owes them has no other producer, and the pass is
+    // the only loop that runs on this account's clock. A store with no window
+    // table, and a read that failed, both publish nothing -- what the face must
+    // never see is "no window is approved" standing in for "nobody looked".
+    let windows = store.write_windows().await;
+    if let Err(e) = &windows {
+        warn!(
+            error = %e,
+            "change ledger: the write windows could not be read, so the writing face's reading \
+             is absent this pass rather than zero"
+        );
+    }
+    match write_window_reading_from(&windows, Utc::now()) {
+        Some(reading) => publish_write_windows(metrics, &reading).await,
+        None => debug!(
+            "change ledger: this store answered no write windows, so no window reading was \
+             published -- an absent cell, not a zero"
+        ),
+    }
+
     // Back to the loop, which keeps it for the next pass's empty read. Handed
     // back only when the pool was actually read: an `absent` verdict carried
     // forward would be the posture of a pass that knew nothing, which is the
@@ -2968,6 +2991,14 @@ enum DispatchReadout {
     HeldBack,
     Rearmed,
     Unmeasurable,
+    /// The size of the ledger's pending set as the ledger holds it, which is
+    /// `pending` and `unmeasurable` together: the two cells the pass splits that
+    /// set into by whether it could measure each row this tick. It is a cell of
+    /// its own rather than something a reader adds up because the sum is only
+    /// the ledger's number while both halves stay published -- and the face that
+    /// owes the reading asks for the account's own count, not for a validation
+    /// of the pass's arithmetic.
+    LedgerPending,
 }
 
 impl DispatchReadout {
@@ -2980,6 +3011,7 @@ impl DispatchReadout {
         DispatchReadout::HeldBack,
         DispatchReadout::Rearmed,
         DispatchReadout::Unmeasurable,
+        DispatchReadout::LedgerPending,
     ];
 
     fn as_str(self) -> &'static str {
@@ -2992,6 +3024,7 @@ impl DispatchReadout {
             Self::HeldBack => "held_back",
             Self::Rearmed => "rearmed",
             Self::Unmeasurable => "unmeasurable",
+            Self::LedgerPending => "change_ledger_pending",
         }
     }
 }
@@ -3030,6 +3063,7 @@ async fn publish_dispatch_rows(metrics: Option<&Arc<dyn MetricsBackend>>, state:
             DispatchReadout::HeldBack => state.held_back,
             DispatchReadout::Rearmed => state.rearmed,
             DispatchReadout::Unmeasurable => state.unmeasurable,
+            DispatchReadout::LedgerPending => state.pending + state.unmeasurable,
         };
         let mut labels = HashMap::new();
         labels.insert("readout".to_string(), readout.as_str().to_string());
@@ -3174,6 +3208,150 @@ async fn publish_dispatch_verdict(
                      face is missing a cell of it"
                 );
             }
+        }
+    }
+}
+
+/// What the account's write windows say at one instant.
+///
+/// Four counts, and not one of them is derivable from the others: `approved` is
+/// the windows that stand, `overlap` is the scopes with more than one live
+/// approved writer, `inconsistent` is the rows that contradict themselves, and
+/// `self_approved` is the open windows nobody but their writer approved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct WriteWindowReading {
+    approved: u64,
+    overlap: u64,
+    inconsistent: u64,
+    self_approved: u64,
+}
+
+/// Reduce the account's write windows to those four counts.
+///
+/// Pure, and the only implementation of the rule: the store hands back every row
+/// it holds, and which of them are approvals is decided here, so a second reader
+/// cannot answer it differently. The counting is over the rows and not over a
+/// query, because the revoked row and the self-approved row are the rows the
+/// reading exists for, and a query filtered by the approval rule would make both
+/// of them unreachable.
+fn write_window_reading(windows: &[WriteWindow], now: DateTime<Utc>) -> WriteWindowReading {
+    let mut reading = WriteWindowReading::default();
+    // One live approved writer per scope, so a scope two accounts are writing
+    // under is counted once however many rows either of them left behind.
+    let mut writers_by_scope: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for window in windows {
+        if window.inconsistent() {
+            reading.inconsistent += 1;
+        }
+        if window.self_approved(now) {
+            reading.self_approved += 1;
+        }
+        if !window.approved(now) {
+            continue;
+        }
+        reading.approved += 1;
+        writers_by_scope
+            .entry(window.path_scope.as_str())
+            .or_default()
+            .insert(window.writer.as_str());
+    }
+    reading.overlap = writers_by_scope
+        .values()
+        .filter(|writers| writers.len() > 1)
+        .count() as u64;
+    reading
+}
+
+/// What a pass may publish from the store's answer.
+///
+/// `Ok(Some(rows))` is a measurement, even when the rows are empty: a table that
+/// can be read and holds nothing says no window is approved, and that is a zero
+/// the face may show. `Ok(None)` and a failed read are both "nothing was
+/// measured", and the two are folded here rather than at the publisher because
+/// the publisher's only question is whether there is a reading -- the difference
+/// between them is a log line, and it is written where the answer arrives.
+fn write_window_reading_from(
+    answer: &SFResult<Option<Vec<WriteWindow>>>,
+    now: DateTime<Utc>,
+) -> Option<WriteWindowReading> {
+    match answer {
+        Ok(Some(windows)) => Some(write_window_reading(windows, now)),
+        Ok(None) | Err(_) => None,
+    }
+}
+
+/// The names the write-window counts are published under.
+///
+/// A closed set for the same reason the dispatch counts are one: the face that
+/// owes this reading takes a name out of the roster and asks the store for it,
+/// and a cell written under a name the roster does not hold would be a series
+/// no reader selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteWindowReadout {
+    Approved,
+    Overlap,
+    Inconsistent,
+    SelfApproved,
+}
+
+impl WriteWindowReadout {
+    const ALL: &'static [WriteWindowReadout] = &[
+        WriteWindowReadout::Approved,
+        WriteWindowReadout::Overlap,
+        WriteWindowReadout::Inconsistent,
+        WriteWindowReadout::SelfApproved,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "write_window_approved",
+            Self::Overlap => "write_window_overlap",
+            Self::Inconsistent => "write_window_inconsistent",
+            Self::SelfApproved => "write_window_self_approved",
+        }
+    }
+
+    fn count(self, reading: &WriteWindowReading) -> u64 {
+        match self {
+            Self::Approved => reading.approved,
+            Self::Overlap => reading.overlap,
+            Self::Inconsistent => reading.inconsistent,
+            Self::SelfApproved => reading.self_approved,
+        }
+    }
+}
+
+/// Publish one pass's write-window counts, every cell on every pass.
+///
+/// Every cell, so a window that lapsed stops being counted rather than standing
+/// at the last value it had while it was open -- the same reason the dispatch
+/// sheet enumerates its cells. A failure to publish is raised and not fatal:
+/// the pass already happened, and the face losing one tick is smaller than the
+/// pass stopping to keep it.
+async fn publish_write_windows(
+    metrics: Option<&Arc<dyn MetricsBackend>>,
+    reading: &WriteWindowReading,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    for readout in WriteWindowReadout::ALL {
+        let mut labels = HashMap::new();
+        labels.insert("readout".to_string(), readout.as_str().to_string());
+        if let Err(e) = metrics
+            .record_gauge(
+                metric_names::CHANGE_WRITE_WINDOWS,
+                readout.count(reading) as f64,
+                labels,
+            )
+            .await
+        {
+            warn!(
+                error = %e,
+                readout = readout.as_str(),
+                "change ledger: this pass's write-window count could not be published, so the \
+                 reading face is missing a cell this pass held"
+            );
         }
     }
 }
@@ -6777,6 +6955,11 @@ mod tests {
                 + published["held_back"],
             published["pending"]
         );
+        // The ledger's pending set as the account holds it: the rows this pass
+        // could hand over plus the ones it could not settle. Read off the two
+        // halves rather than recomputed from the rows, so the face's number and
+        // the pass's own split cannot disagree.
+        assert_eq!(published["change_ledger_pending"], 148.0);
 
         // The verdict: the whole product of the two closed sets, every pass, so
         // that the cell the previous pass held is written back to zero rather
@@ -6938,5 +7121,137 @@ mod tests {
         let mut deliveries = HashMap::new();
         deliveries.insert(dispatch_task_id(&other, 0), "ddddd".to_string());
         assert_eq!(delivered_revision(&identity, &deliveries), None);
+    }
+
+    /// A window row built from the fields the reading cares about, with the
+    /// timestamps every test here keeps the same: the window was requested an
+    /// hour ago, approved a minute ago, and expires in an hour unless the test
+    /// says otherwise.
+    fn window(writer: &str, approver: &str, scope: &str) -> WriteWindow {
+        let now = Utc.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap();
+        WriteWindow {
+            window_id: format!("{writer}:{scope}"),
+            path_scope: scope.to_string(),
+            writer: writer.to_string(),
+            approver: approver.to_string(),
+            requested_at: now - chrono::Duration::hours(1),
+            approved_at: Some(now - chrono::Duration::minutes(1)),
+            expires_at: Some(now + chrono::Duration::hours(1)),
+            revoked_at: None,
+        }
+    }
+
+    fn reading_at_noon(windows: &[WriteWindow]) -> WriteWindowReading {
+        let now = Utc.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap();
+        write_window_reading(windows, now)
+    }
+
+    #[test]
+    fn a_window_approved_by_its_writer_is_counted_apart_and_never_as_approved() {
+        // The row says it was approved and the approver is the writer. It is
+        // refused by the approval rule and still counted, because a row refused
+        // and left invisible is a row nobody goes and corrects.
+        let reading = reading_at_noon(&[window("operator", "operator", "crates/x")]);
+        assert_eq!(
+            reading.approved, 0,
+            "a self-approval cannot be what the reading counts as an approved window"
+        );
+        assert_eq!(
+            reading.self_approved, 1,
+            "the refused row has to be nameable, or the refusal happens where nobody can see it"
+        );
+    }
+
+    #[test]
+    fn a_row_that_is_both_approved_and_revoked_is_counted_rather_than_read_as_revoked() {
+        let mut row = window("worker", "operator", "crates/x");
+        row.revoked_at = Some(Utc.with_ymd_and_hms(2026, 10, 20, 11, 0, 0).unwrap());
+        let reading = reading_at_noon(&[row]);
+        assert_eq!(
+            reading.inconsistent, 1,
+            "a window that stood and was then withdrawn is neither a window that stands nor \
+             a request: it has a cell of its own so the withdrawal is not read as a request \
+             that never had an approval"
+        );
+        assert_eq!(
+            reading.approved, 0,
+            "a row revoked at all is not a window that stands"
+        );
+    }
+
+    #[test]
+    fn two_writers_on_one_scope_are_an_overlap_and_two_scopes_are_not() {
+        let one_scope = reading_at_noon(&[
+            window("worker-a", "operator", "crates/x"),
+            window("worker-b", "operator", "crates/x"),
+        ]);
+        assert_eq!(
+            one_scope.overlap, 1,
+            "two accounts writing under one scope is the overlap the face asks about, counted \
+             once for the scope and not once per row"
+        );
+        assert_eq!(one_scope.approved, 2);
+
+        let two_scopes = reading_at_noon(&[
+            window("worker-a", "operator", "crates/x"),
+            window("worker-b", "operator", "crates/y"),
+        ]);
+        assert_eq!(
+            two_scopes.overlap, 0,
+            "two windows on two scopes are two permissions, not one conflict"
+        );
+    }
+
+    #[test]
+    fn a_revoked_expired_or_unbounded_window_is_not_approved() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap();
+
+        let mut revoked = window("worker", "operator", "crates/x");
+        revoked.revoked_at = Some(now - chrono::Duration::minutes(5));
+        let mut expired = window("worker", "operator", "crates/y");
+        expired.expires_at = Some(now - chrono::Duration::minutes(5));
+        let mut unbounded = window("worker", "operator", "crates/z");
+        unbounded.expires_at = None;
+        let mut unnamed = window("worker", "", "crates/w");
+        unnamed.approver = String::new();
+        let mut unstamped = window("worker", "operator", "crates/v");
+        unstamped.approved_at = None;
+
+        let reading = reading_at_noon(&[revoked, expired, unbounded, unnamed, unstamped]);
+        assert_eq!(
+            reading.approved, 0,
+            "each row is a way a permission can look approved without being one: revoked, \
+             expired, unbounded, approved by nobody, and never approved at all"
+        );
+        assert_eq!(
+            reading.inconsistent, 1,
+            "only the revoked row carries both stamps; the other four were never withdrawn, \
+             and a cell that counted them too would not be reading the record"
+        );
+        assert_eq!(reading.self_approved, 0);
+    }
+
+    #[test]
+    fn a_table_that_can_be_read_and_holds_nothing_is_a_reading_of_zero() {
+        // Zero is a measurement -- no window is approved -- and it must not be
+        // published as an absence. The absent case is `Ok(None)` and a failed
+        // read, which produce no reading at all.
+        let now = Utc.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap();
+        let empty = write_window_reading_from(&Ok(Some(Vec::new())), now)
+            .expect("a readable empty table is a measurement, not an absent reading");
+        assert_eq!(empty, WriteWindowReading::default());
+        assert_eq!(empty.approved, 0);
+
+        assert_eq!(
+            write_window_reading_from(&Ok(None), now),
+            None,
+            "a store with no window table has not measured anything, so publishing zero would \
+             read as 'no window is approved'"
+        );
+        assert_eq!(
+            write_window_reading_from(&Err(SFError::Database("relation missing".into())), now),
+            None,
+            "a failed read is not a table that holds nothing"
+        );
     }
 }

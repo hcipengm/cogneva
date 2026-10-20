@@ -819,6 +819,23 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// Appended, never updated: one row per pass, so a reader can ask how long
     /// dispatch stood still and how often, which an upserted row could not answer.
     async fn record_dispatch_state(&self, state: &DispatchState) -> SFResult<()>;
+
+    /// Every write window the account holds, whatever state it is in.
+    ///
+    /// All of them rather than the live ones: a query filtered by "approved and
+    /// not revoked and unexpired" would make the revoked row unreachable, and
+    /// that row is the one a review of what was written under the approval
+    /// needs. The reduction to a reading is the caller's, done in one place, so
+    /// a store cannot hold a second opinion about what an approved window is.
+    ///
+    /// `None` means this store has no write windows to offer -- an
+    /// implementation that predates the table, or a deployment that has not run
+    /// the migration. An empty vector is a different answer with a different
+    /// meaning: the table is there and holds no window, so nothing is approved,
+    /// which is a measurement. A store that cannot answer must not read as one.
+    async fn write_windows(&self) -> SFResult<Option<Vec<WriteWindow>>> {
+        Ok(None)
+    }
 }
 
 /// The line a landed commit carries, followed by the id of the change it landed.
@@ -921,6 +938,88 @@ pub struct DispatchState {
     /// a pass that read no snapshot at all, both read as "nothing said", which
     /// is why rows written before this column existed also read as `None`.
     pub window_pace: Option<crate::contract::supervisor::LlmWindowPace>,
+}
+
+/// One requested window in which a named account may write to a path, and who
+/// approved it.
+///
+/// The row is a request from the moment it exists and an approved window once
+/// `approved_at` is written; the two are told apart by the fields rather than by
+/// a status column, because "approved and then revoked" is two facts and one
+/// column would have to forget the first to record the second.
+///
+/// The reader's rule, and the only one there is: a window is approved when
+/// `approved_at` is set, `revoked_at` is not, `expires_at` is in the future, and
+/// the approver is not the writer. Each of those refusals is a way the record
+/// can look like an approval without being one -- an unbounded permission, an
+/// unnamed approver, an account approving itself -- and the reading counts the
+/// live windows so that the last of them cannot hide inside the first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteWindow {
+    /// The requester's own name for the window; the row's identity.
+    pub window_id: String,
+    /// The path the window covers, as the approver wrote it.
+    pub path_scope: String,
+    /// The account that asked to write.
+    pub writer: String,
+    /// The account that approved; empty when nobody has.
+    pub approver: String,
+    pub requested_at: DateTime<Utc>,
+    /// `None` when the window was requested and never approved.
+    pub approved_at: Option<DateTime<Utc>>,
+    /// `None` when the approval states no end; such a window is not approved.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// `None` while the window stands, whatever its expiry says.
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl WriteWindow {
+    /// Whether the window is still open at `now`: stamped as approved, not
+    /// revoked, and expiring after `now`.
+    ///
+    /// The three conditions that make an approval applicable at all. Who
+    /// approved is a separate question -- see [`Self::approved`] -- and the two
+    /// are kept apart because the self-approved row is a window that is open by
+    /// the first question and refused by the second, which is exactly the row a
+    /// reader has to be able to name.
+    pub fn live(&self, now: DateTime<Utc>) -> bool {
+        self.approved_at.is_some()
+            && self.revoked_at.is_none()
+            && self.expires_at.is_some_and(|expires| expires > now)
+    }
+
+    /// Whether this row is an approval that stands at `now`: open, and approved
+    /// by somebody other than the writer.
+    ///
+    /// The rule in one place, because a second copy of it would drift from this
+    /// one the day either gained a condition, and the drift would show up as a
+    /// window counted as approved by one reader and not by the other.
+    pub fn approved(&self, now: DateTime<Utc>) -> bool {
+        self.live(now) && !self.approver.is_empty() && self.approver != self.writer
+    }
+
+    /// Whether the row is an open window its writer approved for itself.
+    ///
+    /// Refused by [`Self::approved`] already; counted separately so that a row
+    /// cannot be refused and invisible at the same time. What the reader does
+    /// with this number is a decision, and it is one the account should be able
+    /// to make because the row is there.
+    pub fn self_approved(&self, now: DateTime<Utc>) -> bool {
+        self.live(now) && !self.approver.is_empty() && self.approver == self.writer
+    }
+
+    /// Whether this row records both that the window was approved and that it
+    /// was withdrawn.
+    ///
+    /// Such a row is not a window that stands, and it is not a request either:
+    /// something was approved and then taken back. Counting it is what keeps the
+    /// withdrawal visible -- a reader that classified it as revoked and moved on
+    /// would lose the half that says an approval once existed, and the windows
+    /// that were never approved and the ones that were approved and then
+    /// withdrawn would be one number -- zero -- in every other cell.
+    pub fn inconsistent(&self) -> bool {
+        self.approved_at.is_some() && self.revoked_at.is_some()
+    }
 }
 
 /// The decision a dispatch pass reached, as a closed set.

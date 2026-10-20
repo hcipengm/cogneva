@@ -675,6 +675,20 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          whenever the two maxima come from different pods",
     ),
     (
+        "cogneva_deployer_revs_skipped_total",
+        "Revisions that landed between two deployer ticks and were overtaken by \
+         the next one, so that no tick ever aimed at them: never built, never \
+         held, never named by any reading keyed on which revision a round went \
+         for. Labelled by why (superseded_before_tick is what it carries today), \
+         so a revision that was tried and held never lands in this cell. It is \
+         the one number that separates a main that is quiet from a main that is \
+         moving faster than the deployer can aim at it: both leave the \
+         deployment unchanged, and only this counter says which one happened. \
+         Read it beside cogneva_mainline_rollout_attempts_total over the same \
+         window: attempts climbing while this stays flat is the deployer keeping \
+         up, and attempts flat while this climbs is landing outrunning the build",
+    ),
+    (
         "cogneva_mainline_ci_no_verdict_reason_total",
         "Why the deployer's CI question came back without a verdict, one count \
          per silent upstream, labelled by platform (the upstream's \
@@ -1124,6 +1138,23 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
 /// Descriptions for the gauge series. See [`COUNTER_HELP`].
 const GAUGE_HELP: &[(&str, &str)] = &[
     (
+        crate::metric_names::ALERT_CHANNELS_CONFIGURED.as_str(),
+        "Which outlets this deployment can deliver an alert through, one row per \
+         configured kind at 1, labelled by `channel` -- the kind of outlet \
+         (webhook, email, slack), never its URL or its recipients. With no \
+         outlet configured the family still carries one row, `channel=\"none\"` \
+         at 0, because the delivery counter only gains a row when a batch is \
+         actually dispatched: on a quiet deployment with nothing configured, \
+         'nobody can be told' was on no series at all and read exactly like \
+         'nothing needed telling', while the persisted alert row is written \
+         either way. Read any row at 1 as an outlet that exists and the `none` \
+         row at 0 as no outlet existing. The value is a fixed 1 or 0 per \
+         process rather than an accumulation, so a reader takes one series \
+         instead of adding the copies every process that loads this plugin \
+         reports",
+    ),
+
+    (
         crate::metric_names::PG_POOL_MAX_CONNECTIONS.as_str(),
         "The ceiling one PostgreSQL pool may hold, labelled by `pool` \
          (users, messages, config, explain) and by `source`. The plugin opens \
@@ -1546,7 +1577,11 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          dead_environment + held_back is what has to equal pending -- and the \
          equality is the reading: a pass whose counts do not add up to the set it \
          read is a pass that lost track of rows, which is how the environment- \
-         killed ones went unrecorded once. Which of held_back's two causes a pass \
+         killed ones went unrecorded once. change_ledger_pending is the size of \
+         the pending set as the ledger holds it -- pending plus unmeasurable, \
+         because a row whose check this pass could not settle has not stopped \
+         being owed -- and it is a cell rather than a sum every reader does, so \
+         the face that owes this reading takes one number off one pass. Which of held_back's two causes a pass \
          was is not in this family: a paused pass hands nothing over at all, so a \
          pass that handed something over and still has rows held back is one whose \
          own slice ran out, and the cells below say what the pool looked like \
@@ -1590,6 +1625,28 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          rather than by a label: a reader takes the two at one timestamp, which \
          is what the debt's own panel does, and neither family has to carry a \
          value that changes under its own label",
+    ),
+    (
+        "cogneva_change_write_windows",
+        "The write windows the account holds, by readout, counted on every \
+         change-ledger pass. A window is approved when it carries an approval \
+         stamp, is not revoked, expires in the future, and its approver is \
+         neither empty nor the writer itself -- a window with no expiry, an \
+         unnamed approval and a self-approval are the three ways a row can look \
+         approved without being one, and none of them counts. approved is how \
+         many windows stand now. overlap is how many path scopes have more than \
+         one live approved writer: the two windows are compared by the scope as \
+         the approver wrote it, so a prefix and the path under it read as two \
+         different scopes rather than as an overlap. inconsistent counts the \
+         windows that were approved and then withdrawn, which is a record of \
+         both things rather than a request that was never approved -- read as \
+         revoked and passed over, the approval that existed would be gone from \
+         every cell. self_approved counts the live windows \
+         whose approver is their writer, which the approval rule already refuses \
+         -- named separately so a row cannot be refused and invisible at once; \
+         the row itself stays in the table, where its id names it. A store that \
+         cannot read the table publishes none of these cells, which is not the \
+         same reading as a table that can be read and holds nothing",
     ),
     (
         "cogneva_backup_run_readings",

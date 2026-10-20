@@ -407,6 +407,21 @@ metric_names! {
     // recipient list -- and deliberately does not count as delivered.
     ALERT_NOTIFICATIONS_TOTAL => "cogneva_alert_notifications_total",
 
+    // cog-observability — which outlets this deployment can deliver an alert
+    // through, one row per configured kind at 1.
+    //
+    // The dispatch counter above only gains a row when a batch is actually
+    // dispatched, so on a deployment with no outlet and nothing firing, "no
+    // channel is configured" is on no series at all and reads exactly like
+    // "nothing needed delivering". That is the state a reader most needs to
+    // see, so it is published at start rather than when a dispatch fails: an
+    // empty outlet list keeps the family alive with the single row
+    // `channel="none"` at 0. Read any row at 1 as an outlet that exists and
+    // the `none` row at 0 as no outlet existing; the value is a fixed 1 or 0
+    // per process, so a reader takes one series instead of adding the copies
+    // every process that loads this plugin reports.
+    ALERT_CHANNELS_CONFIGURED => "cogneva_alert_channels_configured",
+
     // cog-observability — the two sizes the loaded-rule-set check compares,
     // labelled by `state` (`declared|loaded|document_readable`), the cell's
     // value being a count.
@@ -1128,6 +1143,31 @@ metric_names! {
     // reach that verdict, which is the same answer a pass that never reaches it
     // gives, and the two are told apart by reading the cell that is `1`.
     CHANGE_DISPATCH_VERDICT => "cogneva_change_dispatch_verdict",
+
+    // cog-orchestrator — the write windows the account holds, counted by what
+    // the record says about each one.
+    //
+    // A write window is the record that one named account may write to a path,
+    // under whose approval, until when. Until this family existed the record
+    // lived in prose: the name of the approver in a paragraph, with no window
+    // and nothing the running system could read, so the face that owes "how
+    // many write windows are approved right now" had no producer and its reading
+    // was absent -- and an absent reading there is the difference between "no
+    // one is writing" and "no one is keeping track".
+    //
+    // `readout` carries the four cells, and each is a count over the same rows
+    // under a different question: `approved` is the windows that stand now,
+    // `overlap` is the path scopes with more than one live approved writer,
+    // `inconsistent` is the rows that carry both an approval and a revocation,
+    // and `self_approved` is the live windows whose approver is their writer.
+    // The last two are not subsets of the first two by accident: a
+    // self-approving row is never one of `approved` (the approval rule refuses
+    // it), and a row that was approved and then withdrawn is not read as merely
+    // revoked, because that would take the approval it once had out of the
+    // reading. Written on every pass, so a window that lapses stops being
+    // counted instead of standing at its last value; nothing published is not
+    // zero -- a table that cannot be read publishes no cell at all.
+    CHANGE_WRITE_WINDOWS => "cogneva_change_write_windows",
 
     // cog-orchestrator — keeping a running task's progress resumable.
     //
