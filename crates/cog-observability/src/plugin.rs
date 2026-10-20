@@ -1074,6 +1074,17 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
     }
 }
 
+/// The phrase the governance face table uses for "an alert fired here has
+/// nowhere to go".
+///
+/// Published as a `readout` label on the family below, not as a metric name:
+/// the face table records what a reading *says*, and the reader tries that
+/// phrase both as a series name and as a `readout` value. A phrase that lives
+/// only as prose in the table resolves to nothing, and "nothing" prints the
+/// same as "not measured" — so the one state a reader most needs to see, an
+/// alert with no outlet, was the one the face could not read.
+pub const ALERT_CHANNEL_NONE_READOUT: &str = "alert_notifications_channel_none";
+
 /// Publish which outlets this deployment can deliver through, one series per
 /// configured kind at 1.
 ///
@@ -1088,8 +1099,37 @@ async fn publish_alert_channels(
     outlets: &[&str],
 ) {
     let Some(metrics) = metrics else { return };
+    // The verdict cell answers "is there anywhere to send an alert" as 1 = no
+    // outlet, and it is written on both paths. Deriving it from the per-kind
+    // rows would leave it unwritten in exactly the state it reports: the rows
+    // exist only when there is an outlet. It carries no `channel` label and
+    // the per-kind rows carry `state="configured"`, so the two kinds are told
+    // apart by `state` alone -- which the family's help says to select on.
+    // That matters because the two polarities are opposite: a bare-name sum
+    // over the family answers "yes" whether or not an outlet exists, so the
+    // distinction has to survive in the labels, not only in the prose.
+    let verdict = HashMap::from([
+        ("state".to_string(), "verdict".to_string()),
+        (
+            "readout".to_string(),
+            ALERT_CHANNEL_NONE_READOUT.to_string(),
+        ),
+    ]);
+    if let Err(e) = metrics
+        .record_gauge(
+            cog_core::metric_names::ALERT_CHANNELS_CONFIGURED,
+            if outlets.is_empty() { 1.0 } else { 0.0 },
+            verdict,
+        )
+        .await
+    {
+        warn!(error = %e, "could not record the alert outlet verdict");
+    }
     if outlets.is_empty() {
-        let labels = HashMap::from([("channel".to_string(), "none".to_string())]);
+        let labels = HashMap::from([
+            ("state".to_string(), "configured".to_string()),
+            ("channel".to_string(), "none".to_string()),
+        ]);
         if let Err(e) = metrics
             .record_gauge(
                 cog_core::metric_names::ALERT_CHANNELS_CONFIGURED,
@@ -1103,7 +1143,10 @@ async fn publish_alert_channels(
         return;
     }
     for outlet in outlets {
-        let labels = HashMap::from([("channel".to_string(), (*outlet).to_string())]);
+        let labels = HashMap::from([
+            ("state".to_string(), "configured".to_string()),
+            ("channel".to_string(), (*outlet).to_string()),
+        ]);
         if let Err(e) = metrics
             .record_gauge(
                 cog_core::metric_names::ALERT_CHANNELS_CONFIGURED,
@@ -1331,22 +1374,50 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
 mod tests {
     use super::*;
 
+    /// One gauge write: its name, its value, and the labels it carried.
+    ///
+    /// Spelled out, the tuple is a `type_complexity` lint at `-D warnings`, and
+    /// this gate runs with that: a shape this size has to be named once rather
+    /// than repeated at every field and signature.
+    type GaugeWrite = (String, f64, HashMap<String, String>);
+
     /// Holds every gauge write so a cell can read the series a scrape would.
     #[derive(Default)]
     struct Gauges {
-        calls: std::sync::Mutex<Vec<(String, f64, HashMap<String, String>)>>,
+        calls: std::sync::Mutex<Vec<GaugeWrite>>,
     }
 
     impl Gauges {
-        /// `(channel, value)` per recorded write on the outlet family.
+        /// `(channel, value)` per recorded write that names an outlet kind.
+        ///
+        /// Writes without a `channel` label are the family's verdict cell, not a
+        /// kind: folding them in would make "which outlets exist" and "is there
+        /// any outlet at all" the same list, and the two are read by different
+        /// questions.
         fn outlets(&self) -> Vec<(String, f64)> {
             self.calls
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|(name, value, labels)| {
+                .filter_map(|(name, value, labels)| {
                     assert_eq!(name, "cogneva_alert_channels_configured");
-                    (labels.get("channel").cloned().unwrap_or_default(), *value)
+                    labels
+                        .get("channel")
+                        .map(|channel| (channel.clone(), *value))
+                })
+                .collect()
+        }
+
+        /// `(readout, value)` per recorded write that names itself a reading.
+        fn readouts(&self) -> Vec<(String, f64)> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(_, value, labels)| {
+                    labels
+                        .get("readout")
+                        .map(|readout| (readout.clone(), *value))
                 })
                 .collect()
         }
@@ -1449,11 +1520,73 @@ mod tests {
     /// point of the family is that "nobody can be told" is a value, so a
     /// backend that is handed nothing would leave the reader with the
     /// absence this reading exists to remove.
+    /// Every row that names an outlet kind is `state="configured"`; every row
+    /// that names itself a reading is `state="verdict"`. A row carrying one
+    /// without the other would let a `state` selector miss it -- and since the
+    /// two kinds answer with opposite polarity, a row the selector misses gets
+    /// added to the other kind's sum.
+    fn assert_states_are_paired(calls: &[GaugeWrite]) {
+        // A loop over an empty set passes without looking at anything, and
+        // "nothing was written" is exactly the failure this check exists to
+        // catch -- a publisher that stopped writing would keep it green.
+        assert!(
+            !calls.is_empty(),
+            "no row was written, so there is nothing to pair"
+        );
+        for (_, _, labels) in calls {
+            let expected = if labels.contains_key("channel") {
+                "configured"
+            } else {
+                "verdict"
+            };
+            assert_eq!(
+                labels.get("state").map(String::as_str),
+                Some(expected),
+                "row labels {labels:?} do not pair with their kind"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn no_outlet_is_a_zero_row_rather_than_no_series() {
         let backend = Arc::new(Gauges::default());
         publish_alert_channels(Some(backend.clone()), &[]).await;
         assert_eq!(backend.outlets(), vec![("none".to_string(), 0.0)]);
+        assert_eq!(
+            backend.readouts(),
+            vec![(ALERT_CHANNEL_NONE_READOUT.to_string(), 1.0)]
+        );
+        assert_states_are_paired(&backend.calls.lock().unwrap());
+        // The verdict row carries no `channel`: its value means "no outlet at
+        // all" (1) and the per-kind rows' value means "this outlet is
+        // configured" (1). Labelling it with a channel would put both meanings
+        // on one label, and a query grouping by `channel` would add them.
+        let calls = backend.calls.lock().unwrap();
+        let verdict_row = calls
+            .iter()
+            .find(|(_, _, labels)| labels.contains_key("readout"))
+            .expect("the verdict row was not written");
+        assert!(
+            !verdict_row.2.contains_key("channel"),
+            "the verdict row must not carry a channel label: {:?}",
+            verdict_row.2
+        );
+    }
+
+    /// The verdict cell is written in both directions, and it is the direction
+    /// that matters that would otherwise be missing: the per-kind rows exist
+    /// only when there is an outlet, so a cell derived from them could never
+    /// say "there is none". A reader that only ever sees this one cell must
+    /// still be able to tell a deployment with an outlet from one without.
+    #[tokio::test]
+    async fn the_verdict_cell_answers_with_an_outlet_configured_too() {
+        let backend = Arc::new(Gauges::default());
+        publish_alert_channels(Some(backend.clone()), &["webhook"]).await;
+        assert_eq!(
+            backend.readouts(),
+            vec![(ALERT_CHANNEL_NONE_READOUT.to_string(), 0.0)]
+        );
+        assert_states_are_paired(&backend.calls.lock().unwrap());
     }
 
     /// With outlets configured the family names them, one row per kind, so the
@@ -1467,6 +1600,7 @@ mod tests {
             backend.outlets(),
             vec![("webhook".to_string(), 1.0), ("email".to_string(), 1.0)]
         );
+        assert_states_are_paired(&backend.calls.lock().unwrap());
     }
 
     /// No metrics service in the assembly is not an error to record: there is

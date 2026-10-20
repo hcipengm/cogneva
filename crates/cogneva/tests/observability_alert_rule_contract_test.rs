@@ -733,6 +733,16 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_governance_check_failures_total",
         "crates/cog-reflection/src/governance_drift.rs",
     ),
+    // The other drift loop, and the one whose verdict is about people rather
+    // than about the cluster: one series per declared face, published with the
+    // state as a label rather than as a value because the verdict is a closed
+    // set and an enum encoded as a number needs its mapping published beside it
+    // before anyone can read a 3. It is scrape-only rather than in the closed
+    // set, so the producer check cannot find it by name and needs this row.
+    (
+        "cogneva_governance_face_state",
+        "crates/cog-orchestrator/src/face_drift.rs",
+    ),
     // The observability stack's half of the same pair. Its manifests have one
     // delivery path -- the install script -- so once installed, the repository
     // and the cluster each go their own way, and the convergence loop that
@@ -2950,7 +2960,7 @@ const UNREAD: &[(&str, Unread)] = &[
     // repository's rules and panels, which is why it does not close this entry.
     (
         "cogneva_alert_channels_configured",
-        Unread::Gap("which outlets this deployment can deliver an alert through, one row per configured kind at 1, and the single row `channel=\"none\"` at 0 when there is none. The value is a constant per process, so a reader takes one series rather than adding the copies: what it answers is whether an alert can reach a person at all, which is the question the persisted alert row cannot answer -- that row is written whether or not anyone was told. It is filed rather than given a threshold because every cell is the configuration itself: 1 is the ordinary state of a deployment with an outlet and 0 the ordinary state of one without, so neither number is a condition that turns into a fault at some level. What makes a deployment without an outlet wrong is a decision about that deployment, not something this series can bound"),
+        Unread::Gap("which outlets this deployment can deliver an alert through. Two kinds of row with opposite polarity, told apart by `state`: `state=\"configured\"` rows name one outlet each in `channel` at 1, with the single row `channel=\"none\"` at 0 when there is none, and one `state=\"verdict\"` row carries no `channel` but the `readout` name the communication face owes, at 1 when there is no outlet at all and 0 when there is at least one -- written in both directions, since the configured rows exist only when there is an outlet and so could never say there is none. A reader must select one kind by `state` before aggregating; summing the family answers yes either way. Every value is a constant per process, so a reader takes one series rather than adding the copies: what it answers is whether an alert can reach a person at all, which is the question the persisted alert row cannot answer -- that row is written whether or not anyone was told. It is filed rather than given a threshold because every cell is the configuration itself: 1 is the ordinary state of a deployment with an outlet and 0 the ordinary state of one without, so neither number is a condition that turns into a fault at some level. What makes a deployment without an outlet wrong is a decision about that deployment, not something this series can bound"),
     ),
 ];
 
@@ -4255,4 +4265,74 @@ fn the_derivation_gate_separates_a_label_list_from_an_operand() {
         "cogneva_change_tier_total"
     ));
     assert!(promql::summed_metric_names("sum(max by (tier) (X_total))").contains("X_total"));
+}
+
+/// The face drift rule has to fire on every state the enum does not call quiet.
+///
+/// The verdict travels as a label value, and a rule that names the states to
+/// fire on reads a state added later as healthy: the new value matches no
+/// branch, the expression returns nothing, and the alert stays silent through
+/// exactly the drift that state was added to describe. That is the same
+/// silence a stopped publisher produces, which is why this rule names what is
+/// quiet instead -- everything that is not `on_target`, minus the yellow
+/// states.
+///
+/// Both halves are read from the code that owns them rather than copied here:
+/// the tiers come from `DriftState`, the exclusion comes out of the shipped
+/// expression. A state added to the enum without a decision fails this test in
+/// whichever direction is wrong -- fired on while it is a yellow, or quietly
+/// folded into healthy.
+#[test]
+fn the_face_drift_rule_is_quiet_on_exactly_the_states_the_enum_calls_yellow() {
+    let rules = chart_json()["observability"]["infra_watch"]["rules"]
+        .as_array()
+        .expect("observability.infra_watch.rules is not an array")
+        .clone();
+    let rule = rules
+        .iter()
+        .find(|r| r["name"] == "governance_face_not_on_target")
+        .expect("面漂移规则不见了：没有任何东西会报一个面正在漂");
+    let expression = rule["promql"].as_str().unwrap_or_default();
+
+    assert!(
+        expression.contains(r#"state!="on_target""#),
+        "面漂移规则不再以「不是 on_target」为射程，新增状态会被默认读成健康:\n{expression}"
+    );
+    let quiet = quoted_label_after(expression, r#"state!~""#).unwrap_or_else(|| {
+        panic!("面漂移规则没有点名安静的状态，三个黄档会跟着红档一起报警:\n{expression}")
+    });
+    let quiet: BTreeSet<&str> = quiet.split('|').collect();
+
+    let mut wrong: Vec<String> = Vec::new();
+    for state in cog_core::DriftState::ALL {
+        let name = state.as_str();
+        if state.is_yellow() && !quiet.contains(name) {
+            wrong.push(format!(
+                "{name} 是黄档，但不在规则点名安静的状态里——它会按红档报警"
+            ));
+        }
+        if !state.is_yellow() && quiet.contains(name) {
+            wrong.push(format!("{name} 不是黄档，却被规则当成安静的——它永远不会响"));
+        }
+    }
+    for listed in &quiet {
+        let known_yellow = match cog_core::DriftState::parse(listed) {
+            Some(state) => state.is_yellow(),
+            None => false,
+        };
+        if !known_yellow {
+            wrong.push(format!(
+                "规则点名的安静状态 {listed} 不是枚举里的黄档——这个名字没人认领"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The quoted value after a marker in a PromQL expression.
+fn quoted_label_after<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    let start = text.find(marker)? + marker.len();
+    let rest = &text[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
 }

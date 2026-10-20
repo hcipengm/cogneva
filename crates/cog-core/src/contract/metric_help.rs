@@ -1139,19 +1139,24 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
 const GAUGE_HELP: &[(&str, &str)] = &[
     (
         crate::metric_names::ALERT_CHANNELS_CONFIGURED.as_str(),
-        "Which outlets this deployment can deliver an alert through, one row per \
-         configured kind at 1, labelled by `channel` -- the kind of outlet \
-         (webhook, email, slack), never its URL or its recipients. With no \
-         outlet configured the family still carries one row, `channel=\"none\"` \
-         at 0, because the delivery counter only gains a row when a batch is \
-         actually dispatched: on a quiet deployment with nothing configured, \
-         'nobody can be told' was on no series at all and read exactly like \
-         'nothing needed telling', while the persisted alert row is written \
-         either way. Read any row at 1 as an outlet that exists and the `none` \
-         row at 0 as no outlet existing. The value is a fixed 1 or 0 per \
-         process rather than an accumulation, so a reader takes one series \
-         instead of adding the copies every process that loads this plugin \
-         reports",
+        "Which outlets this deployment can deliver an alert through. This family \
+         carries two kinds of row with opposite polarity, so select one kind by \
+         `state` before aggregating and never sum the whole family. \
+         `state=\"configured\"` rows name one outlet each in `channel` -- the \
+         kind of outlet (webhook, email, slack), never its URL or its \
+         recipients -- at 1, and `channel=\"none\"` at 0 states that no outlet \
+         exists. `state=\"verdict\"` is a single row with no `channel`, \
+         published under the `readout` name the communication face owes, at 1 \
+         when this deployment has no outlet at all and 0 when it has at least \
+         one; it is written in both directions, because the per-kind rows exist \
+         only when there is an outlet and so could never say there is none. \
+         Both kinds exist because the delivery counter only gains a row when a \
+         batch is actually dispatched: on a quiet deployment with nothing \
+         configured, 'nobody can be told' was on no series at all and read \
+         exactly like 'nothing needed telling', while the persisted alert row \
+         is written either way. Every value is a fixed 1 or 0 per process \
+         rather than an accumulation, so a reader takes one series instead of \
+         adding the copies every process that loads this plugin reports",
     ),
 
     (
@@ -1644,9 +1649,23 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          every cell. self_approved counts the live windows \
          whose approver is their writer, which the approval rule already refuses \
          -- named separately so a row cannot be refused and invisible at once; \
-         the row itself stays in the table, where its id names it. A store that \
-         cannot read the table publishes none of these cells, which is not the \
-         same reading as a table that can be read and holds nothing",
+         the row itself stays in the table, where its id names it. registered is \
+         how many rows the table holds in any state, and it is what keeps the \
+         other cells from lying by being zero: a table nothing writes to \
+         publishes approved=0 every pass, and that zero is the same words as \
+         'measured: no window stands'. Read the pair -- registered=0 says nobody \
+         has ever recorded a window, so approved=0 says nothing about whether \
+         any writes are unapproved. That reading rests on a premise, not on a \
+         measurement: rows are never deleted, so the count is of everything ever \
+         recorded and not of what happens to stand now. Nothing enforces the \
+         premise today; a delete path added later would turn registered=0 into \
+         'nothing stands at this instant' while this sentence still said what it \
+         says, which is why the premise is named here rather than assumed. \
+         registered counts rows while the other four count windows, so a reader \
+         that aggregates this family by the bare metric name is adding unlike \
+         units; select a readout. A store that cannot read the table publishes \
+         none of these cells, which is not the same reading as a table that can \
+         be read and holds nothing",
     ),
     (
         "cogneva_backup_run_readings",
