@@ -184,6 +184,10 @@ spec:
       app.kubernetes.io/component: evolution
   template:
     metadata:
+      annotations:
+        # 同主应用：这个 Pod 也挂 cogneva-json，配置内容变了它得跟着重启，否则
+        # 进程读到的仍是启动时那份。注解值取渲染后的配置文档哈希。
+        checksum/config: {{ include (print $.Template.BasePath "/app-config.yaml") . | sha256sum }}
       labels:
         app.kubernetes.io/name: cogneva-evolution
         app.kubernetes.io/component: evolution
