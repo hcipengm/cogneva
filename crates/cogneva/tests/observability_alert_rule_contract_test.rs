@@ -2940,11 +2940,26 @@ fn the_tables_hold_no_series_that_no_rule_reads() {
 /// is already read, an exit marker the repository contradicts, and a band whose
 /// size nobody counted. The band is empty today, so these cases come from
 /// fixtures rather than from the table itself.
+/// One row of the pending-band table, in the order the assertion reads it:
+/// the case name, what the band registers, the names already read by a real
+/// table, the names another table claims, and the band size it should report.
+///
+/// Named rather than written inline because the tuple is five fields deep and
+/// clippy refuses a type this complex at `-D warnings` -- which is the whole
+/// workspace's bar, not this test's.
+type PendingBandCase<'a> = (
+    &'a str,
+    &'a [(&'a str, PendingExit)],
+    &'a [&'a str],
+    &'a [&'a str],
+    usize,
+);
+
 #[test]
 fn foreign_pending_refuses_the_states_it_claims_to() {
     let publishes = |name: &str| name == "published_here";
 
-    let cases: &[(&str, &[(&str, PendingExit)], &[&str], &[&str], usize)] = &[
+    let cases: &[PendingBandCase] = &[
         (
             "干净的条目",
             &[("a_series", PendingExit::Witness)],
