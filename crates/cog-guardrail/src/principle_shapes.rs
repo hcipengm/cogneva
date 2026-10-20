@@ -202,25 +202,123 @@ pub fn principle_of(shape: &str) -> Option<&'static str> {
 ///
 /// The name is what a refusal is reported under, so a caller that blocks on this
 /// can say which rule it blocked on rather than only that it blocked. This is a
-/// net, not a proof: it reads sentence forms, and the exemptions the host applies
-/// per line (a frozen ledger merely named, a rule quoted in order to strike it)
-/// are the caller's to apply on the text before it reaches here. A pattern that
-/// will not compile is a build-time failure in the test below and can never
-/// reach a caller; were one to, it is treated as a shape that cannot fire rather
-/// than as a match, since blocking on a broken regex would refuse every call.
+/// net, not a proof: it reads sentence forms. The host's reader strips quoted
+/// spans and exempts two kinds of line before it judges a deferral, and this
+/// reader does the same -- the exemptions are part of the definition, not the
+/// caller's business, or the two readers disagree about the one table they
+/// share. A pattern that will not compile is a build-time failure in the test
+/// below and can never reach a caller; were one to, it is treated as a shape
+/// that cannot fire rather than as a match, since blocking on a broken regex
+/// would refuse every call.
 pub fn first_match(text: &str) -> Option<&'static str> {
-    if DEFERRAL_SHAPES.iter().any(|p| matches(p, text)) {
+    if deferral_match(text) {
         return Some("DEFERRAL_SHAPES");
     }
+    let named = strip_named_spans(text);
     for (name, pattern) in ALL_SHAPES {
-        if matches(pattern, text) {
+        // A literal byte run is judged as written: the host reads a command
+        // un-stripped for the trailer, and a trailer inside quotes is still a
+        // trailer in the commit it is pasted into. Every other shape reads the
+        // stripped text, which is what the host does so that a command merely
+        // named in a sentence is not refused.
+        let subject = if *name == "AI_TRAILER_RE" {
+            text
+        } else {
+            named.as_str()
+        };
+        if matches(pattern, subject) {
             return Some(name);
         }
+    }
+    // Circled numerals are judged on the original text: the owner forbade the
+    // character outright, quoting included.
+    if text.chars().any(|c| CIRCLED_CHARS.contains(&c)) {
+        return Some("CIRCLED_CHARS");
+    }
+    None
+}
+
+/// Whether a deferral shape survives the host's two per-line exemptions.
+///
+/// Judged a line at a time: a line that names a frozen ledger and a line that
+/// quotes the rule in order to strike it are not deferrals, while a line beside
+/// them is judged on its own. Whole-text matching refused exactly the messages
+/// that report this gate broken, because such a message spells the rule out.
+/// The patterns are unanchored and `[^…]` runs across newlines, so the host's
+/// line-at-a-time reading is also what keeps `等` on one line from being joined
+/// to `你` on the next.
+fn deferral_match(text: &str) -> bool {
+    strip_named_spans(text)
+        .lines()
+        .any(|line| !deferral_exempt(line) && DEFERRAL_SHAPES.iter().any(|p| matches(p, line)))
+}
+
+/// The two shapes the host judges on a finished turn: a decision handed to a
+/// person, and a circled numeral.
+///
+/// Kept apart from `first_match` because the host's finished-turn check is
+/// narrower than its tool-call check -- a reply is not a command or a path, so
+/// those shapes have nothing to read there. A caller judging a reply uses this,
+/// not `first_match`, or it would refuse a reply that merely mentions a file.
+pub fn sentence_form_match(text: &str) -> Option<&'static str> {
+    if deferral_match(text) {
+        return Some("DEFERRAL_SHAPES");
     }
     if text.chars().any(|c| CIRCLED_CHARS.contains(&c)) {
         return Some("CIRCLED_CHARS");
     }
     None
+}
+
+/// The quoting pairs a phrase is wrapped in when it is being *named* rather
+/// than used, in the order the host strips them.
+const NAMED_PAIRS: [(char, char); 6] = [
+    ('「', '」'),
+    ('『', '』'),
+    ('“', '”'),
+    ('`', '`'),
+    ('"', '"'),
+    ('\'', '\''),
+];
+
+/// `text` with the interior of every quoted span removed, the pair kept.
+///
+/// Same six pairs and the same non-greedy reading as the host's stripper: each
+/// opening mark pairs with the nearest closing one, a mark with no mate stays
+/// as it is, and the pairs are applied one after another to the text the
+/// previous pair left. Two readers that strip differently accept different
+/// documents while both cite the same table.
+pub fn strip_named_spans(text: &str) -> String {
+    let mut out = text.to_string();
+    for (open, close) in NAMED_PAIRS {
+        out = strip_pairs(&out, open, close);
+    }
+    out
+}
+
+fn strip_pairs(text: &str, open: char, close: char) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != open {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        match (i + 1..chars.len()).find(|j| chars[*j] == close) {
+            Some(j) => {
+                out.push(open);
+                out.push(close);
+                i = j + 1;
+            }
+            None => {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Whether `text` names a frozen ledger, or quotes the deferral rule to strike
@@ -295,9 +393,11 @@ fn collect_strings(value: &serde_json::Value, out: &mut Vec<String>) {
 /// to "the guardrail", which is the difference between a count that can be acted
 /// on and one that cannot.
 ///
-/// Only the tool call is judged. Input and output are text the guardrail sees
-/// before it is a commit, a command or a file, and the shapes are about those
-/// artefacts, not about a sentence that names them.
+/// A finished reply is judged by the host's own narrower rule (a decision
+/// handed to a person, a circled numeral); the shapes about commands and paths
+/// are not applied to prose, which would refuse a reply that merely names a
+/// file. Incoming messages are not judged: the host does not judge them either,
+/// and a message quoting a rule to have it fixed must reach the reader.
 pub struct PrincipleShapeGuard;
 
 #[async_trait::async_trait]
@@ -306,8 +406,26 @@ impl cog_core::Guardrail for PrincipleShapeGuard {
         cog_core::GuardResult::Pass
     }
 
-    async fn check_output(&self, _response: &str) -> cog_core::GuardResult {
-        cog_core::GuardResult::Pass
+    /// The finished-turn half of the host gate.
+    ///
+    /// The host refuses a turn whose text hands a decision to a person or uses
+    /// a circled numeral, and it refuses it at the same moment the model would
+    /// otherwise send it. A platform that only judges tool calls lets a reply
+    /// through the host would have stopped, which is the half that reads as
+    /// "the gate is ported" while the last word is unguarded. The check is
+    /// deliberately narrower than the tool-call one: a reply is not a command
+    /// or a path, so those shapes have nothing to read there.
+    async fn check_output(&self, response: &str) -> cog_core::GuardResult {
+        match sentence_form_match(response) {
+            Some(shape) => cog_core::GuardResult::Block {
+                reason: match principle_of(shape) {
+                    Some(slug) => format!("回复里带着形状表禁止的一项（{shape}，原则 {slug}）"),
+                    None => format!("回复里带着形状表禁止的一项（{shape}）"),
+                },
+                rule: format!("principle_shapes:{shape}"),
+            },
+            None => cog_core::GuardResult::Pass,
+        }
     }
 
     async fn check_tool_call(&self, tool: &cog_core::ToolCall) -> cog_core::GuardResult {
@@ -548,6 +666,49 @@ mod tests {
         );
     }
 
+    /// A phrase inside quotes is being named, not used, and a striking line is
+    /// exempt even unquoted -- both are the host's own exemptions, and the
+    /// in-process judge used to refuse what the host accepted. That is not a
+    /// harmless asymmetry: the text it refused included the reports that
+    /// explained the gate, which are the readings that get it fixed.
+    #[test]
+    fn a_named_phrase_is_not_a_use() {
+        for named in [
+            r#"原则里写着「归你定」这三个字"#,
+            r#"规则原文是 `git add -A .`，这里只是引用"#,
+            r#"“这事由你决定”是反例"#,
+        ] {
+            assert_eq!(
+                first_match(named),
+                None,
+                "a quoted phrase is named: {named}"
+            );
+        }
+        assert_eq!(
+            first_match("这条规则作废，不复述：归你定。"),
+            None,
+            "a line striking the rule is exempt even without quotes"
+        );
+    }
+
+    /// The exemption is per line and per shape, not a switch that turns the
+    /// judge off: a striking line does not cover the line beside it, and
+    /// quoting a trailer does not make it not one.
+    #[test]
+    fn the_exemptions_do_not_spread() {
+        assert_eq!(
+            first_match("这条规则作废，不复述：归你定。\n归属主定。"),
+            Some("DEFERRAL_SHAPES"),
+            "the striking exemption covers its own line only"
+        );
+        assert_eq!(
+            first_match("\"a quoted block\nCo-authored-by: someone\""),
+            Some("AI_TRAILER_RE"),
+            "the trailer is judged as written, quotes or no quotes -- stripping a \
+             multi-line quote would delete the line the anchored shape reads"
+        );
+    }
+
     /// Both sides of the owner shape, because a pattern that only narrows is a
     /// pattern that may have stopped catching anything. The nouns on the left
     /// are the wording this repository actually writes when it names the owner
@@ -624,6 +785,46 @@ mod tests {
             guard.check_tool_call(&clean).await,
             cog_core::GuardResult::Pass
         );
+    }
+
+    /// The finished-turn half, through the same entry the platform calls.
+    ///
+    /// This is the check the host runs when a reply is about to be sent, and
+    /// the one an in-process evaluator used to answer `Pass` unconditionally --
+    /// a turn that handed a decision to a person went through. The negative
+    /// cases are the host's exemptions: a reply that quotes the rule, names a
+    /// frozen ledger, or merely mentions a file path is not refused, because
+    /// the shapes about commands and paths do not apply to prose.
+    #[tokio::test]
+    async fn the_guard_judges_a_finished_reply_by_the_turns_own_shapes() {
+        use cog_core::Guardrail;
+        let guard = PrincipleShapeGuard;
+
+        for (reply, rule) in [
+            ("归属主定。", "principle_shapes:DEFERRAL_SHAPES"),
+            ("先等你了。", "principle_shapes:DEFERRAL_SHAPES"),
+            ("a ① b", "principle_shapes:CIRCLED_CHARS"),
+        ] {
+            match guard.check_output(reply).await {
+                cog_core::GuardResult::Block { rule: got, .. } => assert_eq!(got, rule),
+                other => {
+                    panic!("a finished turn carrying {reply:?} must be refused, got {other:?}")
+                }
+            }
+        }
+
+        for clean in [
+            "这条规则作废，不复述：归属主定。",
+            "原则里写着「归你定」，我照做了别的。",
+            "见 待拍板清单。",
+            "改好了 crates/cog-guardrail/src/principle_shapes.rs，git add -A 没有用。",
+        ] {
+            assert_eq!(
+                guard.check_output(clean).await,
+                cog_core::GuardResult::Pass,
+                "a reply the host accepts must pass here: {clean}"
+            );
+        }
     }
 
     /// Every shape has to fire on a real tool call, not only on a string handed
