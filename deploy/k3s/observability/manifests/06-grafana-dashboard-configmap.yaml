@@ -2291,6 +2291,37 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 56,
+          "title": "Guardrail Refusals by Role",
+          "description": "Runs a guardrail rule stopped, per role, counted by the process that ran them and summed across the pods reporting it -- these are events each process witnessed for itself, so a sum is the total, not a fact counted twice. Read beside the panel on iteration cut-offs: the two answer different questions and only one of them responds to a ceiling. A rising line says the rules are stopping turns, which is the guardrail working, not a failure; what a person watches for is the shape over time -- a line that climbs and then flattens as the work learns the rules, a line that keeps climbing at the rate of the run loop, or a line that climbs while the cut-off panel is flat, which is the case no ceiling change can fix. Since a refused run now hands its task back with the rule's own words and the task is retried once, the cost of a refusal is bounded, but a refusal that keeps recurring on the same shape of work is the reading that says a rule and the work disagree. Cumulative since the process started, so it drops to zero when a pod restarts; the rise after a restart is new refusals, not a loss.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 264
+          },
+          "targets": [
+            {
+              "expr": "sum by (role) (agent_guardrail_refused_runs)",
+              "legendFormat": "{{role}} refused",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

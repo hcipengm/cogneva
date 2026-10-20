@@ -113,6 +113,17 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["role"],
         "crates/cog-agent/src/observable.rs",
     ),
+    // The runs a guardrail rule stopped. A third sibling rather than a fourth
+    // label: this is the only one of the three that raising a ceiling cannot
+    // move, so reading it on the same line as the two above is what tells
+    // "the budget is too small" apart from "the rule keeps refusing". Per role
+    // because that is the question asked of it, and drawn per role for the same
+    // reason the two above are.
+    (
+        "agent_guardrail_refused_runs",
+        &["role"],
+        "crates/cog-agent/src/observable.rs",
+    ),
     // Pool recovery readings. Three separate series rather than one "recovers
     // at" number: which upstream said it, when we will probe again, and how long
     // the window an upstream stated is are answers of different strength, and
