@@ -162,15 +162,23 @@ const BUILD_DEMAND_CORES: f64 = 4.1;
 /// Compared against `MemAvailable` rather than `MemFree`, because the page cache
 /// this build is filling counts as available.
 const BUILD_PEAK_RSS_BYTES: u64 = 4481 * 1024 * 1024;
-/// Memory the rest of the host must keep, measured as the lowest `MemAvailable`
-/// seen over seven days of samples: the floor is what the machine has actually
-/// been down to with the cluster and the sessions on it, and a bound that spends
-/// below it is spending memory something else is using.
+/// Memory the rest of the host must keep: what the cluster and the host's own
+/// processes actually occupy, so that a bound spending below it would be
+/// spending memory something else is using.
 ///
-/// The window's minimum was 36.5 GiB and its 5th percentile 47.2 GiB, so this
-/// line sits at the observed trough: it is crossed only when the host is back
-/// where its worst moment was, not when it is merely busier than usual.
-const MEM_FLOOR_BYTES: u64 = 36 * 1024 * 1024 * 1024;
+/// The number is what the rest of the host holds while nothing is building: the
+/// cluster's working set 19.7 GiB (cogneva 17.4, monitoring 2.1, system 0.2)
+/// plus the host's own processes, about 5 GiB -- 25 GiB, and the line sits just
+/// under it. With two builds at their peak (8.75 GiB) the host still shows at
+/// least 28 GiB available, against a seven-day low of 33.7 GiB.
+///
+/// It used to be the seven-day trough of `MemAvailable` (36 GiB), and that was
+/// circular: a bound that stops spending memory is exactly what lets the host
+/// rest near its own floor, so reading the floor back off `MemAvailable` did not
+/// measure what something else was using -- it measured where this line had
+/// pushed the host. On a host whose trough landed under the line the gate then
+/// derived a ceiling of one from its own constant and never moved.
+const MEM_FLOOR_BYTES: u64 = 24 * 1024 * 1024 * 1024;
 /// Cpu stall, as a percentage, below which the host counts as having room.
 ///
 /// `cpu some avg60` over the same seven days had a median of 1.5% and a maximum
@@ -794,17 +802,14 @@ impl HostLoad {
     ///
     /// What this costs, measured on the host the constants were sampled from:
     /// `IO_CALM_PCT` is 1.0 while a single build's cold compile has driven
-    /// `io some avg10` to 30-58%. So while any build runs the host is not calm,
-    /// and the bound cannot rise; it can only rise in a gap between builds. With
-    /// a bound of one and a pipeline that keeps a build running, those gaps are
-    /// the only moments the number can move -- and the memory dimension reaches
-    /// the same place from the other side, since `MEM_FLOOR_BYTES` sits at the
-    /// observed trough of `MemAvailable` and a host resting near that trough
-    /// derives a ceiling of one on every round. Neither is a fault in the law:
-    /// both are what "rising is earned" means on a host that is actually busy.
-    /// They are written here because whoever next asks why the bound does not
-    /// move will re-derive them from the same two numbers, and the ceiling and
-    /// the bound alone do not show it.
+    /// `io some avg10` to 30-58%, so while any build runs the host is not calm
+    /// and the bound cannot rise: it rises in the gaps between builds. Those
+    /// gaps are not rare -- over seven days all three conditions held 65.5% of
+    /// the time (`io some avg60` under 1% alone accounted for 69.9%) -- so a
+    /// ceiling above the bound is reached within the hour, not never. They are
+    /// written here because whoever next asks why the bound does not move will
+    /// re-derive them from these numbers, and the ceiling and the bound alone do
+    /// not show it.
     fn is_calm(&self) -> bool {
         self.pressure.cpu_avg60 < CPU_CALM_PCT
             && self.pressure.io_avg60 < IO_CALM_PCT
@@ -1014,6 +1019,20 @@ fn readings(
 pub async fn acquire(what: &str) -> SFResult<Option<BuildPermit>> {
     match global() {
         Some(gate) => gate.acquire(what).await.map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Takes a slot, waiting for one up to `budget` rather than the configured one.
+///
+/// For a caller whose own cycle sets the horizon: the mainline polls every few
+/// seconds and reports on the wait itself, so it can afford to stand in line for
+/// a while but not for the whole configured budget -- a poll parked for half an
+/// hour stops reporting the very thing it is waiting for. `Ok(None)` and `Err`
+/// keep the meanings they have in [`acquire`].
+pub async fn acquire_within(what: &str, budget: Duration) -> SFResult<Option<BuildPermit>> {
+    match global() {
+        Some(gate) => gate.acquire_within(what, budget).await.map(Some),
         None => Ok(None),
     }
 }
