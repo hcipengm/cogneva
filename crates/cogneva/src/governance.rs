@@ -808,4 +808,21 @@ mod tests {
         let text = format!("某面\tline\t{line}\n");
         assert!(parse_roster(&text).is_err());
     }
+
+    /// 没有在岗账时的形状必须是「读不到」而不是「没人」：调用方拿 None 就说不出
+    /// 谁在岗，而说「没人」会把「账没接上」读成「十几个人都擅离职守」。
+    #[tokio::test]
+    async fn without_a_heartbeat_store_the_reason_says_unread_rather_than_nobody() {
+        let (registry, reason) = agent_registry(None).await;
+        assert!(registry.is_none());
+        let reason = reason.expect("缺在岗账时必须留下理由，否则调用方只能猜");
+        assert!(
+            reason.contains("unread"),
+            "理由要自报「读成 unread」，实际是 {reason}"
+        );
+        assert!(
+            !reason.contains("nobody") && !reason.contains("no one"),
+            "理由不能读成「没人在岗」：{reason}"
+        );
+    }
 }
