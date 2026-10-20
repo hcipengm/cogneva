@@ -1101,7 +1101,7 @@ impl ChangePipeline {
                 reason = %reason,
                 "Change refused by the deployment admission conditions"
             );
-            let _ = self.git_reset_hard(workdir).await;
+            let _ = self.git_reset_hard(workdir, &change.content).await;
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
@@ -1130,7 +1130,7 @@ impl ChangePipeline {
                 change_id = %change.artifact_id,
                 "Change writes only defaults every shipped document overrides"
             );
-            let _ = self.git_reset_hard(workdir).await;
+            let _ = self.git_reset_hard(workdir, &change.content).await;
             return Ok(ApplyResult {
                 change_id: change.artifact_id.clone(),
                 files_changed,
@@ -1153,7 +1153,7 @@ impl ChangePipeline {
                     change_id = %change.artifact_id,
                     "Change is not what this deployment's formatter produces; rolling back"
                 );
-                let _ = self.git_reset_hard(workdir).await;
+                let _ = self.git_reset_hard(workdir, &change.content).await;
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -1167,7 +1167,7 @@ impl ChangePipeline {
             }
             Err(e) => {
                 warn!(change_id = %change.artifact_id, error = %e, "the format check did not run");
-                let _ = self.git_reset_hard(workdir).await;
+                let _ = self.git_reset_hard(workdir, &change.content).await;
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -1197,7 +1197,7 @@ impl ChangePipeline {
             Ok(LintVerdict::Clean(note)) => note,
             Ok(LintVerdict::NotDeclared) => NO_LINTER_NOTE.to_string(),
             Ok(LintVerdict::Unattributable(evidence)) => {
-                let _ = self.git_reset_hard(workdir).await;
+                let _ = self.git_reset_hard(workdir, &change.content).await;
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -1218,7 +1218,7 @@ impl ChangePipeline {
                     change_id = %change.artifact_id,
                     "The built-in linter reached no verdict; this change is not judged yet"
                 );
-                let _ = self.git_reset_hard(workdir).await;
+                let _ = self.git_reset_hard(workdir, &change.content).await;
                 return Err(SFError::IO(evidence));
             }
             Ok(LintVerdict::Attributable { line, output }) => {
@@ -1244,7 +1244,7 @@ impl ChangePipeline {
                                 error = %e,
                                 "Could not read the lines this change wrote; reaching no verdict"
                             );
-                            let _ = self.git_reset_hard(workdir).await;
+                            let _ = self.git_reset_hard(workdir, &change.content).await;
                             return Err(e);
                         }
                     };
@@ -1268,7 +1268,7 @@ impl ChangePipeline {
                         })
                         .collect::<Vec<_>>()
                         .join("\n  ");
-                    let _ = self.git_reset_hard(workdir).await;
+                    let _ = self.git_reset_hard(workdir, &change.content).await;
                     return Ok(ApplyResult {
                         change_id: change.artifact_id.clone(),
                         files_changed,
@@ -1306,7 +1306,7 @@ impl ChangePipeline {
             }
             Err(e) if e.is_build_slot_refused() => {
                 warn!(change_id = %change.artifact_id, error = %e, "the linter got no build slot");
-                let _ = self.git_reset_hard(workdir).await;
+                let _ = self.git_reset_hard(workdir, &change.content).await;
                 return Err(e);
             }
             Err(e) => {
@@ -1335,12 +1335,12 @@ impl ChangePipeline {
             // sound change for the load the machine happened to be under.
             Err(e) if e.is_build_slot_refused() => {
                 warn!(change_id = %change.artifact_id, error = %e, command = %self.test_command_line(), "the test command got no build slot");
-                let _ = self.git_reset_hard(workdir).await;
+                let _ = self.git_reset_hard(workdir, &change.content).await;
                 return Err(e);
             }
             Err(e) => {
                 warn!(change_id = %change.artifact_id, error = %e, command = %self.test_command_line(), "the test command failed to execute");
-                let _ = self.git_reset_hard(workdir).await;
+                let _ = self.git_reset_hard(workdir, &change.content).await;
                 return Ok(ApplyResult {
                     change_id: change.artifact_id.clone(),
                     files_changed,
@@ -1420,7 +1420,7 @@ impl ChangePipeline {
                         error = %e,
                         "Could not read the tests this revision fails on its own; reaching no verdict"
                     );
-                    let _ = self.git_reset_hard(workdir).await;
+                    let _ = self.git_reset_hard(workdir, &change.content).await;
                     return Err(e);
                 }
             }
@@ -1432,12 +1432,12 @@ impl ChangePipeline {
                 EvolutionStatus::Active
             } else {
                 info!(change_id = %change.artifact_id, "Change tests passed; rolling back for manual review");
-                let _ = self.git_reset_hard(workdir).await;
+                let _ = self.git_reset_hard(workdir, &change.content).await;
                 EvolutionStatus::AwaitingReview
             }
         } else {
             warn!(change_id = %change.artifact_id, "Change tests failed; rolling back");
-            let _ = self.git_reset_hard(workdir).await;
+            let _ = self.git_reset_hard(workdir, &change.content).await;
             EvolutionStatus::ValidationFailed
         };
 
@@ -1875,7 +1875,23 @@ impl ChangePipeline {
     }
 
     /// Restore the working tree to HEAD.
-    async fn git_reset_hard(&self, workdir: &Path) -> SFResult<()> {
+    /// Put the worktree back the way `HEAD` has it, including the files the
+    /// change added.
+    ///
+    /// `git reset --hard` restores tracked files and nothing else. A change
+    /// that creates a file leaves it behind as untracked, so the next
+    /// `git apply` of that same change fails on it ("already exists") -- and a
+    /// change that adds a file and is rolled back could then never be applied
+    /// a second time. That is not hypothetical: it is how one change sat in
+    /// the pending queue for two days, re-tried every cycle and never judged
+    /// (2026-10-20, a new test file plus a failing suite, so the baseline read
+    /// took the change back off and could not put it on again).
+    ///
+    /// The clean is scoped to the paths this patch names. A tree-wide clean
+    /// would also delete work in progress the pipeline did not create, and the
+    /// paths come from the same parser the rest of the pipeline reads them
+    /// with, so what is removed here is exactly what was added there.
+    async fn git_reset_hard(&self, workdir: &Path, change_content: &str) -> SFResult<()> {
         let output = tokio::process::Command::new("git")
             .args(["reset", "--hard", "HEAD"])
             .current_dir(workdir)
@@ -1886,6 +1902,34 @@ impl ChangePipeline {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SFError::IO(format!("git reset failed: {}", stderr)));
+        }
+
+        let paths: Vec<String> =
+            cog_core::contract::reflection::parse_diff_affected_files(change_content)
+                .unwrap_or_default()
+                .into_iter()
+                // A path outside the worktree would make `git clean` refuse the
+                // whole command and leave every leftover in place; the pipeline
+                // has already refused such a patch, so this only keeps a
+                // malformed one from failing the reset instead.
+                .filter(|path| !path.starts_with('/') && !path.split('/').any(|part| part == ".."))
+                .collect();
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let output = tokio::process::Command::new("git")
+            .args(["clean", "-fd", "--"])
+            .args(&paths)
+            .current_dir(workdir)
+            .output()
+            .await
+            .map_err(|e| SFError::IO(format!("Failed to run git clean: {}", e)))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SFError::IO(format!(
+                "git clean of the change's own paths failed: {}",
+                stderr
+            )));
         }
         Ok(())
     }
@@ -2776,7 +2820,7 @@ impl ChangePipeline {
             }
         }
 
-        self.git_reset_hard(workdir).await?;
+        self.git_reset_hard(workdir, change_content).await?;
         let (_, baseline_output) = self.run_test_command(workdir).await?;
 
         self.git_apply(workdir, change_content).await.map_err(|e| {
@@ -3825,6 +3869,67 @@ index 1111111..2222222 100644
 
         let content = tokio::fs::read_to_string(&src_path).await.unwrap();
         assert!(content.contains("fn new()"));
+    }
+
+    /// A change that adds a file can be taken off and put back on.
+    ///
+    /// `git reset --hard` restores tracked files only, so the file the change
+    /// created stays behind as untracked and the second apply of that same
+    /// change fails on it ("already exists"). A change whose suite failed is
+    /// exactly the one the pipeline takes back off to read the baseline, so
+    /// without this a change that adds a file and fails would get no verdict at
+    /// all: retried every cycle, never judged, never retired.
+    #[tokio::test]
+    async fn a_change_that_adds_a_file_can_be_applied_again_after_a_reset() {
+        use tokio::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .await
+                .unwrap();
+        }
+        tokio::fs::create_dir_all(root.join("src")).await.unwrap();
+        tokio::fs::write(root.join("src/lib.rs"), "fn old() {}\n")
+            .await
+            .unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-m", "initial"]] {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .await
+                .unwrap();
+        }
+
+        let change = "diff --git a/src/added.rs b/src/added.rs\n\
+                      new file mode 100644\n\
+                      index 0000000..1111111\n\
+                      --- /dev/null\n\
+                      +++ b/src/added.rs\n\
+                      @@ -0,0 +1,2 @@\n\
+                      +fn added() {}\n\
+                      +fn also() {}\n";
+
+        let pipeline = ChangePipeline::new(root.to_path_buf(), root.join("changes"), true);
+        pipeline.git_apply(root, change).await.unwrap();
+        pipeline.git_reset_hard(root, change).await.unwrap();
+        assert!(
+            !root.join("src/added.rs").exists(),
+            "the file the change created must not outlive the reset"
+        );
+        pipeline
+            .git_apply(root, change)
+            .await
+            .expect("the same change must apply a second time, or it can never be judged");
     }
 
     #[test]
