@@ -3214,19 +3214,28 @@ async fn publish_dispatch_verdict(
 
 /// What the account's write windows say at one instant.
 ///
-/// Four counts, and not one of them is derivable from the others: `approved` is
+/// Five counts, and no one of them is derivable from the others: `approved` is
 /// the windows that stand, `overlap` is the scopes with more than one live
-/// approved writer, `inconsistent` is the rows that contradict themselves, and
-/// `self_approved` is the open windows nobody but their writer approved.
+/// approved writer, `inconsistent` is the windows that were approved and then
+/// withdrawn, `self_approved` is the open windows nobody but their writer
+/// approved, and `registered` is every row the table holds whichever state it is
+/// in.
+///
+/// `registered` is here so the others cannot lie by being zero. A table with no
+/// writer publishes `approved = 0` every pass, and a zero on that cell is read as
+/// "measured: no window is in force" -- the same words a system where nobody
+/// records windows at all would produce. Publishing the row count beside it makes
+/// the pair say which of the two is true without the reader needing the help text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct WriteWindowReading {
     approved: u64,
     overlap: u64,
     inconsistent: u64,
     self_approved: u64,
+    registered: u64,
 }
 
-/// Reduce the account's write windows to those four counts.
+/// Reduce the account's write windows to those five counts.
 ///
 /// Pure, and the only implementation of the rule: the store hands back every row
 /// it holds, and which of them are approvals is decided here, so a second reader
@@ -3235,7 +3244,10 @@ struct WriteWindowReading {
 /// reading exists for, and a query filtered by the approval rule would make both
 /// of them unreachable.
 fn write_window_reading(windows: &[WriteWindow], now: DateTime<Utc>) -> WriteWindowReading {
-    let mut reading = WriteWindowReading::default();
+    let mut reading = WriteWindowReading {
+        registered: windows.len() as u64,
+        ..WriteWindowReading::default()
+    };
     // One live approved writer per scope, so a scope two accounts are writing
     // under is counted once however many rows either of them left behind.
     let mut writers_by_scope: HashMap<&str, HashSet<&str>> = HashMap::new();
@@ -3292,6 +3304,7 @@ enum WriteWindowReadout {
     Overlap,
     Inconsistent,
     SelfApproved,
+    Registered,
 }
 
 impl WriteWindowReadout {
@@ -3300,6 +3313,7 @@ impl WriteWindowReadout {
         WriteWindowReadout::Overlap,
         WriteWindowReadout::Inconsistent,
         WriteWindowReadout::SelfApproved,
+        WriteWindowReadout::Registered,
     ];
 
     fn as_str(self) -> &'static str {
@@ -3308,6 +3322,7 @@ impl WriteWindowReadout {
             Self::Overlap => "write_window_overlap",
             Self::Inconsistent => "write_window_inconsistent",
             Self::SelfApproved => "write_window_self_approved",
+            Self::Registered => "write_window_registered",
         }
     }
 
@@ -3317,6 +3332,7 @@ impl WriteWindowReadout {
             Self::Overlap => reading.overlap,
             Self::Inconsistent => reading.inconsistent,
             Self::SelfApproved => reading.self_approved,
+            Self::Registered => reading.registered,
         }
     }
 }
@@ -7229,6 +7245,11 @@ mod tests {
              and a cell that counted them too would not be reading the record"
         );
         assert_eq!(reading.self_approved, 0);
+        assert_eq!(
+            reading.registered, 5,
+            "five rows were handed over, so a zero on the approval cell is a \
+             measurement of those five and not the shape of a table nobody writes"
+        );
     }
 
     #[test]
@@ -7241,6 +7262,11 @@ mod tests {
             .expect("a readable empty table is a measurement, not an absent reading");
         assert_eq!(empty, WriteWindowReading::default());
         assert_eq!(empty.approved, 0);
+        assert_eq!(
+            empty.registered, 0,
+            "a readable table with no rows is the one case where approved=0 does \
+             mean nothing was ever recorded, and registered is the cell that says so"
+        );
 
         assert_eq!(
             write_window_reading_from(&Ok(None), now),
