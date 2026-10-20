@@ -1122,6 +1122,18 @@ const FOREIGN: &[(&str, &str)] = &[
         "同上（门没读成，什么也没判）。它与「判成不一致」修法相反——那一格去修适配器，这一格去修读取路径，所以是两条规则而不是一条",
     ),
     (
+        "cogneva_mainline_behind_verdict_stalled",
+        "宿主侧生产者 `scripts/host/cogneva-mainline-behind-verdict.sh`（私有仓 brain），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出，15 分钟一拍。它判的是「现网那一版还动不动」：连续两拍现网 rev 相同、且两拍都没有构建在飞才印 1；判不了时整条序列不印，由 `_judged` 那一格说清楚。这条序列是「部署器空转」唯一的判词：等槽被拒的轮数、Job 尝试数在健康的有界滞后里都会涨（tip 一直在动，每一轮都要重新排队），回答不了这个问题",
+    ),
+    (
+        "cogneva_mainline_behind_verdict_judged",
+        "同上（这一拍判没判出来：1 判了、0 判不了；判不了时 `_stalled` 与 `state` 都不印）。为什么不拿 `_stalled` 的缺席当「判不了」：缺席有两个原因，生产者根本没跑成（聚合器的 `host_reading_producer_up`／`_unreadable` 已经按 `producer` 标签在判），与生产者跑成了却给不出答案（只有一拍历史、上一拍判不了、比较的两拍之间一直有构建在飞）。前者修生产者，后者修判据的取样，修法相反，合成一条会让其中一半的消息指错地方，所以后者要一格自己的序列",
+    ),
+    (
+        "cogneva_acceptance_age_seconds",
+        "宿主侧生产者 `scripts/host/cogneva-acceptance-census-reading.sh`（私有仓 brain，登记行 `acceptance_census`），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出。年龄由生产者自己算：快照里的 `taken_at` 是同一台机上跑完那一趟普查时写的，减它的是同一台机的钟；把 `taken_at` 当序列交给 Prometheus 再减 `time()`，减的是另一台机的钟，两边时钟源不同时，「普查停了多久」会随漂移假响或假静。这一格是 `CognevaAcceptanceCensusOld` 唯一能问的问题：判词那一族只说得清这一趟判了什么，说不清这一趟是多久以前的——而一份停在三天前的 all-ok 与一份刚跑完的 all-ok 在判词上是同一句话",
+    ),
+    (
         "cogneva_backup_package_owner_uid",
         "持久化存储面生产者 `scripts/host/cogneva-backup-package-owner-reading.sh`（私有仓），经聚合器以 `job=\"cogneva-host-readings\"` 暴露。它读的是账本 `backup_runs` 里最新一行 `outcome='ok'` 点名的那个包在卷上的属主：包是恢复唯一能读的东西，属主决定「谁能读」，而备份面此前所有判据都不读它。裸 gauge，不拿包名当标签——包名一天一条，是标签最不该长的形状",
     ),
