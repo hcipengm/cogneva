@@ -43,3 +43,4 @@
 13-scrapeconfig-host-readings.yaml deliver # 宿主侧各面读数的唯一抓取目标（一个进程一个端口，面由 scripts/data/host-readings.tsv 决定）；生产者不在集群、也不在镜像里，目标由 install.sh 给本机节点打标选出
 15-prometheusrule-host-readings.yaml deliver # 宿主读数通道自己的告警：生产者死了、生产者读不到输入、整条通道抓不到，三条分开（修法不同）
 16-recordingrules-face-first-readings.yaml deliver # 面表里「按名字取、且名字本身就是一条能算出来的 PromQL」的第一条读数，由 Prometheus 自己算出来发布（`资源管理` 的 buildgate_refused_by_what）；宿主脚本那条只留细节
+17-prometheusrule-acceptance-census.yaml deliver # 验收普查的消费者：stale>0、读数整条不见、读数停更三条分开；夹具让 Prometheus 规则引擎真跑一遍（deploy/scripts/test-acceptance-census-alert-rules.sh）

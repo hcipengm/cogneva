@@ -1,0 +1,105 @@
+# promtool 规则单测：验收普查那三条告警**真的会 firing**，不是「表达式算出来非零」。
+#
+# 为什么必须有这一层：两条结构门（subjects / join-shape）只看表达式的形状，一条把
+# `for:` 写成 `for: 15y` 或者把窗口写成 `[0m]` 的规则在它们眼里完全合法，而它永远不会
+# 亮。这里用 Prometheus 自己的规则引擎跑一遍：先造序列，再断言告警从「空」走到
+# 「pending」再走到「firing」，并且每个方向都有一格反向证据（该不亮的时候确实没亮）。
+#
+# 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh
+#       （本地没有 promtool 时它会从 apt 取一份到临时目录，取不到就退 3——看不了不是一致）
+#
+# `rule_files` 这一行由跑的人重写：promtool 只认裸的 `groups:` 文件，不认 PrometheusRule
+# 这个 CRD（`apiVersion`/`spec` 都会判成未知字段）。所以 `deploy/scripts/test-acceptance-
+# census-alert-rules.sh` 从**清单本身**把 `spec.groups` 抽到临时文件再改指过去——规则
+# 只有一份，测试读的就是它。
+rule_files:
+  - ../manifests/17-prometheusrule-acceptance-census.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 一、规格在说谎：stale 从 0 跳到 2，`for: 15m` 之前必须是空，之后必须 firing。
+  # 反向证据在同一格里：20m 时还要是空（这条规则不是「一有数就响」）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_items{verdict="stale"}'
+        values: '0x15 2x40'
+      - series: 'cogneva_acceptance_items{verdict="ok"}'
+        values: '80x60'
+      - series: 'cogneva_acceptance_age_seconds'
+        values: '30x60'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CognevaAcceptanceSpecStale
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: CognevaAcceptanceSpecStale
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: CognevaAcceptanceSpecStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              verdict: stale
+      # 同一份输入下另外两条不许响：一份 stale 读数不代表读数不见了、也不代表它停了。
+      - eval_time: 40m
+        alertname: CognevaAcceptanceCensusAbsent
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: CognevaAcceptanceCensusOld
+        exp_alerts: []
+
+  # 二、负对照：stale 一直是 0（其余判词再多也不红），这条规则全程不许响。
+  # 没有这一格，把表达式写成 `>= 0` 也能过上面那一格。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_items{verdict="stale"}'
+        values: '0x60'
+      - series: 'cogneva_acceptance_items{verdict="pending"}'
+        values: '11x60'
+      - series: 'cogneva_acceptance_items{verdict="unjudged"}'
+        values: '24x60'
+      - series: 'cogneva_acceptance_age_seconds'
+        values: '30x60'
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: CognevaAcceptanceSpecStale
+        exp_alerts: []
+
+  # 三、读数整条不见了：序列先有（前十拍，0 条 stale），然后**停了**。
+  # 最后一拍在 10m，窗口 35m ＋ for 5m ⇒ 50m 才该亮；30m 时不许亮。
+  # 这一格必须「先有后无」：一条从头到尾都没有的序列在合成世界里一开始就满足
+  # `absent_over_time`，那样测不到「停了多久才算停」。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_items{verdict="stale"}'
+        values: '0x10 _x50'
+      - series: 'cogneva_acceptance_present'
+        values: '1x10 _x50'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaAcceptanceCensusAbsent
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: CognevaAcceptanceCensusAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 四、读数还在但不更新：年龄越过 1800 秒，`for: 10m` 之后亮；越过之前不亮。
+  # 这一格是「停产的 beat 一直发最后一行」的唯一证据——另外两条对它都是哑的。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_items{verdict="stale"}'
+        values: '0x60'
+      - series: 'cogneva_acceptance_age_seconds'
+        values: '300x25 2000x35'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaAcceptanceCensusOld
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: CognevaAcceptanceCensusOld
+        exp_alerts:
+          - exp_labels:
+              severity: warning

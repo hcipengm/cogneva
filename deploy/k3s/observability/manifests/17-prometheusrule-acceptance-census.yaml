@@ -1,0 +1,70 @@
+# 验收普查（`cogneva_acceptance_items`）自己的三条告警。
+#
+# 为什么需要：这条读数生产者、读数面、夹具都有，却没有任何规则读它——普查今天变红
+# 也不会自己叫人。「四环缺一不算打通」缺的就是这一环。
+#
+# 三条**分开写**，因为三种坏的修法完全不同：
+#   一、有验收项与它自己的判据不符（规格在说谎）→ 改规格或改代码；
+#   二、读数整条不见了（生产者崩了、快照读不到）→ 修读数通道；
+#   三、读数还在但不再更新（停产的 beat 一直发最后一行）→ 修普查的刷新。
+# 前两条合成一条会栽在同一个形状上：生产者整个停掉时，`stale` 那条表达式返回空集、
+# 不响——「缺席」被读成「干净」。这个形状今天已经在别处栽过三次。
+#
+# 第三条判的是年龄，不是 `time()` 减观测时刻：那条算法只能在真 Prometheus 里验，
+# 规则单测里的 `time()` 是真实钟，夹具写不出「已经停了 40 分钟」，测试会在半小时后
+# 自己变红。年龄由生产者按自己的钟算好发布，夹具就能钉住。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cogneva-acceptance-census
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: cogneva-acceptance-census
+      rules:
+        # 一、规格与它自己的判据不符。判红只认这一种：pending / error / unjudged /
+        # no-command / live-skipped 都不是红——它们是「还没轮到」「跑不起来」「机器判不了」，
+        # 把它们算进红，红就不再是「规格在说谎」的意思了。
+        #
+        # 15 分钟＝三十拍读数。界比读数的拍距长得多，是因为它要抓的是**已经写进树里的
+        # 矛盾**，不是一次抖动；而每次判词变动都带着 `taken_at` 与两棵树的 rev，追问谁改的
+        # 有据可查。
+        - alert: CognevaAcceptanceSpecStale
+          expr: max by (verdict) (cogneva_acceptance_items{verdict="stale"}) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "有 {{ $value }} 条验收项的规格与它自己的判据不符（verdict=stale）"
+            description: "不是读数坏了，是规格说了「已落」而判据跑不过。逐条点名跑一把普查：`python3 -I scripts/gates/run-spec-acceptance.py --census --root <brain> --cwd <cogneva 树>`，看 verdict=stale 的那几行；修的是规格或它点名的代码，不是这条规则。数值是条数，不是持续时间。"
+
+        # 二、整条读数不见了。`absent_over_time` 的作用是「窗口内一条样本都没有」，
+        # 它不继承被抓序列的标签，所以身份只剩规则名——这是对的：主体是「这条读数」。
+        #
+        # 35 分钟＝刷新预算（过期门槛 900 秒）＋一趟普查上限（600 秒）＋余量。窗口比
+        # 预算长，才不会把「正在跑一趟慢的」判成不见了；短了这条规则就会在每次刷新时
+        # 自己响一下，响到最后没人看。
+        - alert: CognevaAcceptanceCensusAbsent
+          expr: absent_over_time(cogneva_acceptance_items[35m])
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "验收普查的读数整条不见了：这一面此刻没有任何判据在跑"
+            description: "生产者崩了、快照读不到、或端点抓不到。先跑 `bash scripts/host/cogneva-acceptance-census-reading.sh --prometheus`：出得来就是抓取侧的问题（看 ScrapeConfig 与 9464），出不来就是生产者（看 `host_reading_producer_unreadable` 与它旁边的日志）。"
+
+        # 三、读数还在但不再更新：快照还在、序列还在、判词还是最后一趟那份，`stale=0`
+        # 看上去一直绿。这一类只能按年龄判。
+        #
+        # 1800 秒＝过期门槛 900 ＋ 一趟普查上限 600 ＋ 余量 300。写成「生产者自己的钟算好
+        # 的年龄」而不是 `time() - 观测时刻`，理由见文件头。
+        - alert: CognevaAcceptanceCensusOld
+          expr: max (cogneva_acceptance_age_seconds) > 1800
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "验收普查最后一趟在 {{ $value | humanizeDuration }} 以前，读数不再更新"
+            description: "刷新没跑成：看 `journalctl --user -u cogneva-host-readings -n 100` 里的 `refresh=` 行——`refresh=failed` 带原因，`refresh=skipped reason=in_progress` 说明两拍在抢同一把锁。此刻看到的判词是上一趟的，不是现在。"

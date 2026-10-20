@@ -695,6 +695,12 @@ jobs:
       # 连接键集），判不动的计数上报，不折进绿里。
       - name: Check alert rules declare the many side of a join
         run: bash deploy/scripts/check-alert-rule-join-shape.sh
+      # 上面两条只看表达式的形状。`for: 15y`、`[0m]`、`> 0` 写成 `>= 0` 在它们眼里
+      # 都合法，而这些规则永远不会（或总是）亮。这一格让 Prometheus 自己的规则引擎跑
+      # 一遍夹具：验收普查的三条告警必须真的从空走到 firing，且改坏清单时夹具自己会红。
+      # promtool 由脚本从 apt 取包解到临时目录（不安装、不动系统），拿不到则退 3。
+      - name: Test acceptance census alert rules fire
+        run: bash deploy/scripts/tests/acceptance-census-alert-rules.test.sh
       # 样本日志那几条 gauge 的写者身份：容量与容量判定是每个部署自己的声明，
       # 却落在共用表里、series 键就是标签集。值取成 Pod 标签时拿到的是**应用**名，
       # 同一个镜像的每个工作负载都带着它，那道「别家不许顶这一家的声明」的闸
