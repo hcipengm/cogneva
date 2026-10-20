@@ -1668,7 +1668,21 @@ impl BuildGate {
     /// for a moved bound, and a task that polls the host for a reader that is not
     /// there is a cost this design has no reason to pay.
     async fn step(&self) {
-        if self.fixed.is_some() || !self.installed {
+        if !self.installed {
+            return;
+        }
+        // A pinned gate measures nothing, so there is no bound to derive -- but
+        // the number it enforces is still the number every other builder on the
+        // host reads, and the only place they read it is this file. A pin that
+        // wrote nothing left the file saying whatever the last derived round
+        // said: the gate admits the operator's number while a host-side builder
+        // reading the directory holds itself to the old one, which is the two
+        // facts disagreeing that this directory exists to prevent. Written by
+        // the controller only, and only when it disagrees.
+        if let Some(fixed) = self.fixed {
+            if self.is_controller() && self.persisted_bound() != Some(fixed) {
+                self.persist_bound(fixed);
+            }
             return;
         }
         {
@@ -4864,6 +4878,37 @@ unevictable 28532736
         );
         let slots = reading(&disabled, BUILD_GATE_SLOTS).await;
         assert_eq!(slots, 0.0, "an out-of-force gate publishes no slots");
+    }
+
+    /// A pinned bound is the number this gate admits, so it is also the number
+    /// the directory has to say to everyone else: the host's own client reads
+    /// the bound from a file and takes only the slot files it finds, so a pin
+    /// that never wrote either leaves that builder holding itself to the last
+    /// derived number while the gate hands out the operator's. Measured on a
+    /// deployment pinned to two slots over a directory whose file still said
+    /// one: the pod took a second slot and the host-side script kept taking one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pinned_bound_is_written_where_the_other_builders_read_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = gate(dir.path(), 3, 30);
+        // What a derived round left behind: one slot on disk, one in the file.
+        pinned.persist_bound(1);
+        assert_eq!(pinned.persisted_bound(), Some(1));
+        assert!(!dir.path().join("slot-1.lock").exists());
+
+        let slots = reading(&pinned, BUILD_GATE_SLOTS).await;
+
+        assert_eq!(slots, 3.0, "the pin is the bound the gate admits");
+        assert_eq!(
+            pinned.persisted_bound(),
+            Some(3),
+            "the bound other builders read is the bound this gate enforces"
+        );
+        assert!(
+            dir.path().join("slot-2.lock").exists(),
+            "the slots the pin admits are laid out for a builder that cannot make them"
+        );
     }
 
     /// A directory that cannot be created leaves the gate out of force rather
