@@ -1586,6 +1586,15 @@ struct CiVerdictRecord {
 struct MainlineState {
     last_good_tag: Option<String>,
     last_good_rev: Option<String>,
+    /// 上一拍解析出的 main head。它答的不是「哪一版上线了」（那是 `last_good_rev`），
+    /// 而是「部署器看过哪一版」——两次相邻的拍之间落地的中间 rev，没有任何一拍把
+    /// 它当过目标，这一格是数出它们的基线。
+    ///
+    /// `None` = 这份状态还没被拍过（新装、或文件来自这一格存在之前的版本）：第一次
+    /// 拍只立基线，不数——历史里所有 rev 都没被这一进程看过，数出来是一个没有意义
+    /// 的数。
+    #[serde(default)]
+    last_seen_rev: Option<String>,
     in_flight: Option<InFlight>,
     failed_rev: Option<String>,
     /// 环境类失败的限速窗：环境类失败本身不含版本结论，它只决定"隔多久再看一眼
@@ -1955,6 +1964,113 @@ impl MainlineDeployer {
             .await
             .ok()?;
         out.trim().parse().ok()
+    }
+
+    /// 两段 main 之间的提交数（只走第一父链：合并进来的侧枝从来不是 main 的头，
+    /// 把它们算成"被跳过"会让计数在合并上虚高）。读不出来返回 `None`。
+    async fn commits_between(&self, from: &str, to: &str) -> Option<u64> {
+        let range = format!("{from}..{to}");
+        let out = self
+            .run_cmd(
+                "git",
+                &[
+                    "--git-dir",
+                    &self.cfg.bare_repo,
+                    "rev-list",
+                    "--count",
+                    "--first-parent",
+                    &range,
+                ],
+                None,
+                30,
+            )
+            .await
+            .ok()?;
+        out.trim().parse().ok()
+    }
+
+    /// 记下这一拍看到的 main head，并数出上一拍之后「从没被任何一拍当过目标」的 rev。
+    ///
+    /// 口径：`上一拍..这一拍` 的提交数减一。区间里除当前这个以外的每个提交，都落在
+    /// 「已经落地」与「被下一个顶掉」之间，而这段时间里没有任何一拍解析到它，所以它
+    /// 既没被构建、也没被 hold，在以「这一拍追哪个 rev」为口径的读数里不存在。
+    ///
+    /// 两种不数的情况：没有上一拍（新装或旧状态文件）——历史里所有 rev 都没被这个
+    /// 进程看过，数出来没有意义，这一拍只立基线；上一拍的 head 已不在当前历史里（历史
+    /// 被改写）——区间没有意义，留一条 warn 后把基线挪到这一拍，宁可从这里重新数，
+    /// 也不拿假区间污染计数。读不出来时**不动基线**，下一拍重试同一段：折在这里的一拍
+    /// 不该把一段没数过的区间顺手抹掉。
+    async fn record_skipped_revs(&self, state: &mut MainlineState, bare: &str) {
+        let prev = match state.last_seen_rev.clone() {
+            None => {
+                state.last_seen_rev = Some(bare.to_string());
+                let _ = self.save_state(state);
+                return;
+            }
+            Some(prev) if prev == bare => return,
+            Some(prev) => prev,
+        };
+
+        let ancestor = self
+            .run_cmd(
+                "git",
+                &[
+                    "--git-dir",
+                    &self.cfg.bare_repo,
+                    "merge-base",
+                    "--is-ancestor",
+                    &prev,
+                    bare,
+                ],
+                None,
+                30,
+            )
+            .await
+            .is_ok();
+        if !ancestor {
+            warn!(
+                previous = %rev12(&prev),
+                current = %rev12(bare),
+                "the head seen last tick is not an ancestor of this one; restarting the skipped-rev count from here"
+            );
+            state.last_seen_rev = Some(bare.to_string());
+            let _ = self.save_state(state);
+            return;
+        }
+
+        let Some(commits) = self.commits_between(&prev, bare).await else {
+            warn!(
+                previous = %rev12(&prev),
+                current = %rev12(bare),
+                "could not count the revisions between the last tick and this one; retrying next tick rather than restarting the count"
+            );
+            return;
+        };
+        let skipped = commits.saturating_sub(1);
+        if skipped > 0 {
+            info!(
+                previous = %rev12(&prev),
+                current = %rev12(bare),
+                skipped,
+                "revisions landed and were superseded between ticks; no tick ever aimed at them"
+            );
+            if let Some(metrics) = &self.metrics {
+                let mut labels = std::collections::HashMap::new();
+                labels.insert(
+                    "reason".to_string(),
+                    REVS_SKIPPED_SUPERSEDED_BEFORE_TICK.to_string(),
+                );
+                let _ = metrics
+                    .record_counter(
+                        cog_core::metric_names::MAINLINE_REVS_SKIPPED_TOTAL,
+                        skipped as f64,
+                        labels,
+                    )
+                    .await;
+            }
+        }
+        state.last_seen_rev = Some(bare.to_string());
+        let _ = self.save_state(state);
     }
 
     fn save_state(&self, state: &MainlineState) -> SFResult<()> {
@@ -4473,6 +4589,10 @@ impl MainlineDeployer {
         if let Some(advanced) = self.refresh_upstream(&bare).await {
             bare = advanced;
         }
+        // 每拍都记，且排在下面所有早退之前：这一格量的是「两拍之间落了什么」，
+        // 与这一拍推不推进无关；而长期不推进的部署器恰恰是最该有人看见「又有 rev
+        // 被跳过」的那一个。挪到早退之后，被 hold 很久的部署器会把这段区间读成安静。
+        self.record_skipped_revs(&mut state, &bare).await;
         // The version contract is judged every round rather than tied to "did
         // this round advance main": a judgement that only runs on an advance
         // stays silent while main stands still, which is exactly when whether the
@@ -6704,6 +6824,10 @@ fn heartbeat_message(
 /// This loop's name in the liveness census.
 pub const MAINLINE_DEPLOYER_LOOP: &str = "mainline_deployer";
 
+/// The one `reason` value [`metric_names::MAINLINE_REVS_SKIPPED_TOTAL`] carries
+/// today.
+pub const REVS_SKIPPED_SUPERSEDED_BEFORE_TICK: &str = "superseded_before_tick";
+
 /// 构建侧后台循环入口（插件 spawn）。
 pub async fn run_mainline_loop(
     deployer: std::sync::Arc<MainlineDeployer>,
@@ -6714,11 +6838,22 @@ pub async fn run_mainline_loop(
     // gitops puller 同源处理），启动时幂等写入。临时工作树路径启动时还
     // 不存在，由分配器在创建时按需注册。
     let workdir = deployer.workdir();
+    // 幂等：这段每次启动都跑，而 `--add` 每次都追加一行。宿主全局配置里这三条
+    // 到 2026-10-20 已累积一万余份拷贝（1.5 MB），宿主上每条 git 命令都要解析它。
+    let listed = tokio::process::Command::new("git")
+        .args(["config", "--global", "--get-all", "safe.directory"])
+        .output()
+        .await
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
     for dir in [
         deployer.cfg.bare_repo.as_str(),
         deployer.workspaces.root().to_str().unwrap_or(""),
         workdir.to_str().unwrap_or(""),
     ] {
+        if dir.is_empty() || listed.lines().any(|line| line.trim() == dir) {
+            continue;
+        }
         let _ = tokio::process::Command::new("git")
             .args(["config", "--global", "--add", "safe.directory", dir])
             .output()
@@ -9132,6 +9267,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         let state = MainlineState {
             last_good_tag: None,
             last_good_rev: None,
+            last_seen_rev: None,
             in_flight: Some(InFlight {
                 rev: "aabbccddeeff0011".into(),
                 phase: Phase::Pushed,
@@ -9625,6 +9761,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         let state = MainlineState {
             last_good_tag: Some("r:5000/cogneva:main-aa".into()),
             last_good_rev: Some("aa".into()),
+            last_seen_rev: None,
             in_flight: Some(InFlight {
                 rev: "bb".into(),
                 phase: Phase::Pushed,
@@ -11114,6 +11251,126 @@ exit 0
             !kubectl_calls.contains("apply"),
             "no job dispatch expected: {kubectl_calls}"
         );
+    }
+
+    /// 每拍的第一件事：把「这一拍看到哪一版」落盘。数不数得上东西是下一格的事，
+    /// 这一格只证明接线——没接上的话，`last_seen_rev` 永远空着，下一格数出来的
+    /// 永远是从进程启动那一刻起的整段历史。
+    #[tokio::test]
+    async fn a_tick_records_the_head_it_saw() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let deployed = main_image("localhost:30500", &rev_b);
+        let kubectl = fake_kubectl(&bin_dir, &deployed);
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer =
+            MainlineDeployer::new(cfg, test_workspaces(root, &bare)).with_metrics(metrics.clone());
+        deployer.poll_once().await.unwrap();
+
+        assert_eq!(
+            deployer.load_state().last_seen_rev.as_deref(),
+            Some(rev_b.as_str()),
+            "这一拍看到的 head 要落盘：它是下一拍数被跳过 rev 的基线"
+        );
+        let counters = metrics
+            .query_counter_totals(cog_core::metric_names::MAINLINE_REVS_SKIPPED_TOTAL.as_str())
+            .await
+            .unwrap();
+        assert!(
+            counters.is_empty(),
+            "第一拍只立基线，不数历史：{counters:?}"
+        );
+    }
+
+    /// 两拍之间落了两个 rev、而部署器每拍只追当时的头：中间那个从没被任何一拍
+    /// 当过目标，既没被构建也没被 hold，日志里它不存在。这一格是它唯一的载体。
+    #[tokio::test]
+    async fn a_revision_superseded_between_ticks_is_counted_as_skipped() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let deployed = main_image("localhost:30500", &rev_a);
+        let kubectl = fake_kubectl(&bin_dir, &deployed);
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer =
+            MainlineDeployer::new(cfg, test_workspaces(root, &bare)).with_metrics(metrics.clone());
+
+        // 上一拍看到的是 A；这一拍之前又落了一个 rev C，于是 bare 从 A 走到 C，
+        // 中间的 B 没有任何一拍看过——正是被跳过的那一个。
+        //
+        // 工作树停在 A（夹具的「已部署」那一侧），新提交要接在 bare 的 B 之后：
+        // 直接把 A 推到 bare 是后退，git 会拒。
+        real_git(&work, &["fetch", "local", "main"]).await;
+        real_git(&work, &["reset", "--hard", "FETCH_HEAD"]).await;
+        std::fs::write(work.join("lib.rs"), "fn c() {}\n").unwrap();
+        real_git(&work, &["add", "."]).await;
+        real_git(&work, &["commit", "-m", "c"]).await;
+        real_git(&work, &["push", "local", "HEAD:main"]).await;
+        let rev_c = real_git_stdout(&work, &["rev-parse", "HEAD"]).await;
+        assert_ne!(rev_c, rev_b, "夹具要走一个真的新 rev");
+
+        let mut state = deployer.load_state();
+        state.last_seen_rev = Some(rev_a.clone());
+        deployer.record_skipped_revs(&mut state, &rev_c).await;
+
+        assert_eq!(
+            state.last_seen_rev.as_deref(),
+            Some(rev_c.as_str()),
+            "数过之后基线要挪到这一拍"
+        );
+        let counters = metrics
+            .query_counter_totals(cog_core::metric_names::MAINLINE_REVS_SKIPPED_TOTAL.as_str())
+            .await
+            .unwrap();
+        let sample = counters
+            .iter()
+            .find(|s| {
+                s.labels.get("reason").map(String::as_str)
+                    == Some(REVS_SKIPPED_SUPERSEDED_BEFORE_TICK)
+            })
+            .unwrap_or_else(|| panic!("没有 skipped 的计数：{counters:?}"));
+        assert_eq!(sample.value, 1.0, "A..C 之间只有一个从没被看过");
+    }
+
+    /// 基线没动（两拍之间没有新 rev）时什么都不记：同一段区间不能被数第二遍。
+    #[tokio::test]
+    async fn a_tick_that_sees_the_same_head_counts_nothing() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let deployed = main_image("localhost:30500", &rev_b);
+        let kubectl = fake_kubectl(&bin_dir, &deployed);
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer =
+            MainlineDeployer::new(cfg, test_workspaces(root, &bare)).with_metrics(metrics.clone());
+        let mut state = deployer.load_state();
+        state.last_seen_rev = Some(rev_b.clone());
+
+        deployer.record_skipped_revs(&mut state, &rev_b).await;
+        let counters = metrics
+            .query_counter_totals(cog_core::metric_names::MAINLINE_REVS_SKIPPED_TOTAL.as_str())
+            .await
+            .unwrap();
+        assert!(counters.is_empty(), "同一段区间数第二遍：{counters:?}");
     }
 
     /// 回收轮重启完 tag 服务之后按住推进：这一版滚上去的 Pod 用的是 `main-<rev>`，

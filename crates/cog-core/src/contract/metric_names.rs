@@ -723,6 +723,17 @@ metric_names! {
     // while the guard is wired, and the gap that opens when they stop climbing
     // together is the guard no longer being asked.
     MAINLINE_SUPERSESSION_CHECKS_TOTAL => "cogneva_mainline_supersession_checks_total",
+    // Revisions that landed between two deployer ticks and were superseded by
+    // the next one, so that no tick ever aimed at them: never built, never held,
+    // never named by any reading keyed on "which revision this round went for".
+    //
+    // The deployer aims each round at the head that exists at that moment. When
+    // revisions land faster than a round completes, the ones in between are
+    // invisible in exactly the way a quiet main is: the deployment keeps
+    // climbing while a share of what was pushed was never tried. The label is a
+    // closed set; `superseded_before_tick` is what it carries today, and
+    // "tried and held" is a different cell that stays out of this one.
+    MAINLINE_REVS_SKIPPED_TOTAL => "cogneva_deployer_revs_skipped_total",
     // Rounds the deployer asked the upstream platforms what CI concluded for the
     // revision it was about to roll, and what came back: `pass`, `fail` (that
     // round holds the rollout) or `no_evidence`.
