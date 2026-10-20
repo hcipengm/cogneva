@@ -6,7 +6,8 @@
 #
 # 授权范围刻意等于「本目录交付面 union」：monitors（抓取目标）、configmaps
 # （Grafana 面板与 Loki 配置）、services / statefulsets（两个日志与明细后端）、
-# ingresses（对外入口）。没有 delete：收敛面没有删除路径，缺了它等于把
+# ingresses（对外入口）、scrapeconfigs（宿主读数生产者的抓取目标）。
+# 没有 delete：收敛面没有删除路径，缺了它等于把
 # 「删掉一个对象」这件事从循环的能力面里拿掉。Role 自身命名空间有界，管不到
 # cogneva 命名空间里的任何东西。
 apiVersion: rbac.authorization.k8s.io/v1
@@ -28,7 +29,7 @@ rules:
     resources: ["ingresses"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]
   - apiGroups: ["monitoring.coreos.com"]
-    resources: ["servicemonitors", "podmonitors"]
+    resources: ["servicemonitors", "podmonitors", "scrapeconfigs", "prometheusrules"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

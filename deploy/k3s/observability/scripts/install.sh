@@ -139,7 +139,7 @@ disposition_of() {
 # "no matches for kind"，所以这几个只能在 chart 之后。按**文件内容的 kind**
 # 判，不按名单——名单会漏掉新加的那个 ServiceMonitor。
 needs_monitoring_crds() {
-    grep -qE '^[[:space:]]*kind:[[:space:]]*(ServiceMonitor|PodMonitor)[[:space:]]*$' "$1"
+    grep -qE '^[[:space:]]*kind:[[:space:]]*(ServiceMonitor|PodMonitor|ScrapeConfig|PrometheusRule)[[:space:]]*$' "$1"
 }
 
 # 该文件这一轮该不该交付：打印跳过理由，空表示交付。
@@ -228,8 +228,28 @@ deploy_manifests() {
     log_info "基础资源部署完成 ✓"
 }
 
+# ─── 宿主读数生产者的抓取目标：给本机节点打标 ──────────────────────
+# `image_wiring_yes` 的生产者是宿主侧的一个 systemd 单元，既不在集群里、也不在
+# 镜像里——它存在的理由正是「镜像滚不上去」，做进镜像就等于让它等它自己报告的
+# 那次滚动。抓取配置按节点标签选目标，而「装了那个单元的是哪台机器」只有安装器
+# 自己知道：本脚本就跑在它上面。
+#
+# 标上了而单元没装，结果是这个抓取目标 DOWN——那是对的读数（声明了、没在跑）。
+# 不标的话，目标根本不存在，与「这台机器压根不该有这个生产者」同形。
+label_host_producer() {
+    local node
+    node="$(hostname -s 2>/dev/null || true)"
+    if [ -z "${node}" ] || ! kubectl get node "${node}" >/dev/null 2>&1; then
+        log_warn "本机主机名（${node:-读不到}）不是已知节点，跳过打标；宿主读数的抓取目标将没有目标"
+        return 0
+    fi
+    kubectl label node "${node}" cogneva.io/host-producer=true --overwrite >/dev/null \
+        && log_info "已给节点 ${node} 打标 cogneva.io/host-producer=true（宿主读数的抓取目标）"
+}
+
 # ─── chart 安装之后才能应用的清单 ─────────────────────────────────
 deploy_crd_dependent_manifests() {
+    label_host_producer
     for f in "${MANIFESTS_DIR}"/*.yaml; do
         local base reason
         base="$(basename "$f")"

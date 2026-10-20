@@ -1,0 +1,52 @@
+# 宿主读数通道自己的三条告警。
+#
+# 为什么需要：把各面的生产者并到一个端点之后，`up` 只答聚合器还在不在，某一面的生产者
+# 死掉时它的序列会停在最后一次的值上，看上去仍然新鲜——这正是「落地≠生效」自己的病。
+# 生产者每拍自报的两条判活（`host_reading_producer_up`、`host_reading_producer_unreadable`）
+# 因此需要有人读，而且**必须分成两条告警**：一条是「生产者坏了」，一条是「它跑得成但输入
+# 读不到」。合成一条的话，脚本崩了与账本文件没生成会被当成同一件事，而修法完全不同。
+#
+# 第三条盯通道本身：整个单元死了，上面两条都无从触发——没有样本就没有告警，
+# 这正是「缺席不会告警」的经典形状，所以通道要单独判 `up`。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cogneva-host-readings
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: cogneva-host-readings
+      rules:
+        # 生产者死了：它在窗口内每一拍都没跑成（超时、崩溃、脚本不在）。
+        # 10 分钟＝十拍，够长到不会被一次重装或一次换机器误报。
+        - alert: CognevaHostReadingProducerDown
+          expr: host_reading_producer_up == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "宿主读数生产者 {{ $labels.producer }} 没跑成"
+            description: "它每拍都超时/崩溃；这一面的序列停在最后一次的值上，不能当当前读数用。"
+
+        # 生产者活着但读不到输入：它这一拍一条序列都没发。这不是生产者坏了，是上游
+        # （账本、集群、仓库）读不到——修的位置完全不同。
+        - alert: CognevaHostReadingProducerUnreadable
+          expr: host_reading_producer_unreadable == 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "宿主读数生产者 {{ $labels.producer }} 读不到输入"
+            description: "它跑得成，但没有发出任何序列：上游读不到，别去改生产者的代码。"
+
+        # 整条通道死了：上面两条都没有样本可判，所以这里必单独判 `up`。
+        - alert: CognevaHostReadingsEndpointDown
+          expr: up{job="cogneva-host-readings"} == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "宿主读数端点抓不到"
+            description: "所有宿主侧面读数同时停更；十环与落地≠生效会各自退化成 absent，而不是变绿。"

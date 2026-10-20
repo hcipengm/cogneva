@@ -1,0 +1,31 @@
+# 宿主侧各面读数的抓取目标：一个进程、一个端口，面由登记表
+# （`scripts/data/host-readings.tsv`）决定，不按面各开一条。
+#
+# 生产者是宿主侧的一个 systemd 单元，不在集群里、也不在镜像里：它读的正是「镜像有没有
+# 换上来」，做进镜像就等于让它等它自己报告的那次滚动。所以目标只能按**节点**发现，
+# 再用 install.sh 打的 `cogneva.io/host-producer=true` 选出那台装了生产者的机器。
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: cogneva-host-readings
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  jobName: cogneva-host-readings
+  kubernetesSDConfigs:
+    - role: Node
+  relabelings:
+    # 只有装了宿主读数生产者的节点才抓：没打标的节点上没有这个端口。
+    - action: keep
+      sourceLabels: [__meta_kubernetes_node_label_cogneva_io_host_producer]
+      regex: "true"
+    - action: replace
+      sourceLabels: [__meta_kubernetes_node_address_InternalIP]
+      targetLabel: __address__
+      regex: (.+)
+      replacement: $1:9464
+    - sourceLabels: [__meta_kubernetes_node_name]
+      targetLabel: node
+  scrapeInterval: 60s
+  scrapeTimeout: 30s

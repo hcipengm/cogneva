@@ -209,6 +209,17 @@ const BUILDAH_STEP_WALLS: &[(&str, u64)] = &[
 /// 清掉自己的那条，且已有人认领时不再覆写——构建对两个认领一样让步，覆写换不到任何东西。
 const ADVANCE_CLAIM_AFTER_DEFERRALS: u32 = 3;
 
+/// 主线在构建闸前排队等多久，秒。
+///
+/// 主线以前是「隔着门看一眼，被占就回下一轮」——它从不排队，于是「被拒了多少次」
+/// 读起来像「宿主一直在构建」，而真正发生的事是它从来没进入过队列。2026-10-20 实测：
+/// 它自称等了 1066 秒，同一时刻槽里那个持有者只持有了 268 秒。
+///
+/// 一分钟是**排队**的时长，不是**构建**的时长：一轮构建要十几分钟，等满它会把一拍
+/// 轮询整个停住，而这一拍正是发布「我还在等」的那一拍。等满一分钟还没轮到的，照旧按
+/// 被拒处理（计数、起点、认领名额都不变），下一拍重新排队。
+const ADVANCE_BUILD_WAIT: Duration = Duration::from_secs(60);
+
 /// 稳定叠层基底的 tag：`<registry>/cogneva:seed`。
 ///
 /// overlay 的基底不该是"上一个 rev 的镜像"。基于它时每张新镜像都**包含着
@@ -4999,51 +5010,56 @@ impl MainlineDeployer {
         // 构建都不做，最后那次派 Job 是读 git 与 apply 清单，两者都不是构建。
         // 罩着整段推进的话，`cogneva_build_gate_held_ms_*` 量到的就不再是"一个
         // 构建占住宿主多久"，别的构建者也在这两段里被拒、而拒因读起来像"宿主在
-        // 构建"。拿不到就什么都不做地回下一轮：这时状态还没写。
-        let build_slot = match crate::build_gate::try_acquire("mainline advance").await {
-            Ok(slot) => slot,
-            Err(e) => {
-                // 被挡住的每一轮在日志里都和上一轮一模一样：同一个请求者、同一句
-                // "host is building"。次数是这一支唯一随时间变的东西，也是把"恰好
-                // 撞上一台正在构建的宿主"与"永远轮不到"分开的那个读数——`what` 只是
-                // 请求者，拒因里的持有者是门那边加的。清零放在真正拿到槽的那一刻：
-                // 这一计数量的就是"连续多少轮没拿到槽"，拿到一次的下一轮就不再是连续。
-                let reason = advance_wait_reason(&e);
-                state.advance_deferrals = state.advance_deferrals.saturating_add(1);
-                // 起点只在第一轮写：它答的是"这一段从哪一刻开始"，每轮覆盖就成了
-                // "上一轮在哪"，而这一段等了多久正是清零时要落进结局的那个数。
-                if state.advance_wait_since_unix.is_none() {
-                    state.advance_wait_since_unix = Some(chrono::Utc::now().timestamp());
-                }
-                state.advance_wait_reason = Some(reason.to_string());
-                // 连输够多轮：认领下一个名额，让正在排队的构建方都让一步。零等待
-                // 那一半没变——这一轮照旧什么都不做地回下一轮（见
-                // `ADVANCE_CLAIM_AFTER_DEFERRALS`）。认领过没有也要落盘：结局里的
-                // `reserved` 是"换手请求发出去过没有"的唯一记录。
-                if state.advance_deferrals >= ADVANCE_CLAIM_AFTER_DEFERRALS {
-                    // 只有请求真的写进构建门才算数：另一个工作先认领时，这一轮
-                    // 什么都没写下来，记成「已认领」会让读数说这个等待者有一个
-                    // 它从没有过的名额（2026-10-19 16:09 实测：state 写着
-                    // reserved=true，而 builds.reserve 是 `host build`）。
-                    if crate::build_gate::reserve_build_field("mainline advance") {
-                        state.advance_wait_reserved = true;
-                        state.advance_wait_reserved_by = Some("refusal".to_string());
+        // 构建"。等不到就什么都不做地回下一轮：这时状态还没写。
+        //
+        // 等一小段再放弃，而不是看一眼就走：零等待的版本从不进入队列，于是同一个
+        // 构建在两轮之间插进来，它每次都正好撞上——连续几轮被拒读起来像宿主一直
+        // 忙着，实际是它从没排过队（见 [`ADVANCE_BUILD_WAIT`]）。
+        let build_slot =
+            match crate::build_gate::acquire_within("mainline advance", ADVANCE_BUILD_WAIT).await {
+                Ok(slot) => slot,
+                Err(e) => {
+                    // 被挡住的每一轮在日志里都和上一轮一模一样：同一个请求者、同一句
+                    // "host is building"。次数是这一支唯一随时间变的东西，也是把"恰好
+                    // 撞上一台正在构建的宿主"与"永远轮不到"分开的那个读数——`what` 只是
+                    // 请求者，拒因里的持有者是门那边加的。清零放在真正拿到槽的那一刻：
+                    // 这一计数量的就是"连续多少轮没拿到槽"，拿到一次的下一轮就不再是连续。
+                    let reason = advance_wait_reason(&e);
+                    state.advance_deferrals = state.advance_deferrals.saturating_add(1);
+                    // 起点只在第一轮写：它答的是"这一段从哪一刻开始"，每轮覆盖就成了
+                    // "上一轮在哪"，而这一段等了多久正是清零时要落进结局的那个数。
+                    if state.advance_wait_since_unix.is_none() {
+                        state.advance_wait_since_unix = Some(chrono::Utc::now().timestamp());
                     }
+                    state.advance_wait_reason = Some(reason.to_string());
+                    // 连输够多轮：认领下一个名额，让正在排队的构建方都让一步。零等待
+                    // 那一半没变——这一轮照旧什么都不做地回下一轮（见
+                    // `ADVANCE_CLAIM_AFTER_DEFERRALS`）。认领过没有也要落盘：结局里的
+                    // `reserved` 是"换手请求发出去过没有"的唯一记录。
+                    if state.advance_deferrals >= ADVANCE_CLAIM_AFTER_DEFERRALS {
+                        // 只有请求真的写进构建门才算数：另一个工作先认领时，这一轮
+                        // 什么都没写下来，记成「已认领」会让读数说这个等待者有一个
+                        // 它从没有过的名额（2026-10-19 16:09 实测：state 写着
+                        // reserved=true，而 builds.reserve 是 `host build`）。
+                        if crate::build_gate::reserve_build_field("mainline advance") {
+                            state.advance_wait_reserved = true;
+                            state.advance_wait_reserved_by = Some("refusal".to_string());
+                        }
+                    }
+                    self.save_state(&state)?;
+                    // 发出去的值就是刚落到盘上的那个：盘上是 3、指标上还是上一拍的 2，
+                    // 会让读的人拿两格不同的数当同一件事。
+                    self.record_advance_deferrals(state.advance_deferrals).await;
+                    info!(
+                        deferrals = state.advance_deferrals,
+                        reason = reason,
+                        reserved = state.advance_wait_reserved,
+                        error = %e,
+                        "host is building; deferring the advance to the next cycle"
+                    );
+                    return Ok(());
                 }
-                self.save_state(&state)?;
-                // 发出去的值就是刚落到盘上的那个：盘上是 3、指标上还是上一拍的 2，
-                // 会让读的人拿两格不同的数当同一件事。
-                self.record_advance_deferrals(state.advance_deferrals).await;
-                info!(
-                    deferrals = state.advance_deferrals,
-                    reason = reason,
-                    reserved = state.advance_wait_reserved,
-                    error = %e,
-                    "host is building; deferring the advance to the next cycle"
-                );
-                return Ok(());
-            }
-        };
+            };
         // 拿到槽就是这一段等待的结束。结局要在清零之前写下来：`advance_deferrals`
         // 一归零，这一段等了多久、为什么等、认领的名额有没有换来槽，就一起没了——
         // 这个 Pod 自己的日志随滚动消失，而滚动正是它自己会做的事。
@@ -7140,6 +7156,8 @@ pub fn api_resource_of(kind: &str) -> Option<(&'static str, &'static str)> {
         "Ingress" => ("networking.k8s.io", "ingresses"),
         "ServiceMonitor" => ("monitoring.coreos.com", "servicemonitors"),
         "PodMonitor" => ("monitoring.coreos.com", "podmonitors"),
+        "ScrapeConfig" => ("monitoring.coreos.com", "scrapeconfigs"),
+        "PrometheusRule" => ("monitoring.coreos.com", "prometheusrules"),
         "Middleware" => ("traefik.io", "middlewares"),
         _ => return None,
     })
@@ -11371,6 +11389,104 @@ exit 0
             .await
             .unwrap();
         assert!(counters.is_empty(), "同一段区间数第二遍：{counters:?}");
+    }
+
+    /// 读不出区间的那一拍什么都不许动：基线留在上一拍，下一拍重试同一段。
+    /// 把基线挪走就等于把这段没数过的区间永久抹掉——从此没有哪一拍会再看它，
+    /// 而读数看起来只是「那一拍没有跳过的 rev」，与真的没有逐字同形。
+    #[tokio::test]
+    async fn a_failed_interval_read_leaves_the_baseline_for_the_next_tick_to_retry() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, work, rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let deployed = main_image("localhost:30500", &rev_a);
+        let kubectl = fake_kubectl(&bin_dir, &deployed);
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+
+        // 同一段 A→C：中间的 B 没有哪一拍看过。
+        real_git(&work, &["fetch", "local", "main"]).await;
+        real_git(&work, &["reset", "--hard", "FETCH_HEAD"]).await;
+        std::fs::write(work.join("lib.rs"), "fn c() {}\n").unwrap();
+        real_git(&work, &["add", "."]).await;
+        real_git(&work, &["commit", "-m", "c"]).await;
+        real_git(&work, &["push", "local", "HEAD:main"]).await;
+        let rev_c = real_git_stdout(&work, &["rev-parse", "HEAD"]).await;
+        assert_ne!(rev_c, rev_b, "夹具要走一个真的新 rev");
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer =
+            MainlineDeployer::new(cfg, test_workspaces(root, &bare)).with_metrics(metrics.clone());
+        let mut state = deployer.load_state();
+        state.last_seen_rev = Some(rev_a.clone());
+
+        // 真的 git 先把路径定下来；假脚本只劫持 `rev-list`，其余原样交回去。
+        let real_git_path = String::from_utf8(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("command -v git")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let script = format!(
+            r#"#!/bin/sh
+for a in "$@"; do
+  if [ "$a" = "rev-list" ]; then
+    echo "fatal: simulated unreadable range" >&2
+    exit 128
+  fi
+done
+exec {real} "$@"
+"#,
+            real = real_git_path.trim()
+        );
+        write_fake_bin(&bin_dir, "git", &script);
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        deployer.record_skipped_revs(&mut state, &rev_c).await;
+        std::env::set_var("PATH", old_path);
+
+        assert_eq!(
+            state.last_seen_rev.as_deref(),
+            Some(rev_a.as_str()),
+            "读不出区间时基线不许挪：这一段还没被数过"
+        );
+        assert_eq!(
+            deployer.load_state().last_seen_rev.as_deref(),
+            None,
+            "读失败的那一拍不该把它落盘"
+        );
+        let counters = metrics
+            .query_counter_totals(cog_core::metric_names::MAINLINE_REVS_SKIPPED_TOTAL.as_str())
+            .await
+            .unwrap();
+        assert!(counters.is_empty(), "读失败不该记数：{counters:?}");
+
+        // 下一拍读得出来了：同一段从 A 数到 C，B 仍然只算一次。
+        deployer.record_skipped_revs(&mut state, &rev_c).await;
+        assert_eq!(
+            state.last_seen_rev.as_deref(),
+            Some(rev_c.as_str()),
+            "数过之后基线要挪到这一拍"
+        );
+        let counters = metrics
+            .query_counter_totals(cog_core::metric_names::MAINLINE_REVS_SKIPPED_TOTAL.as_str())
+            .await
+            .unwrap();
+        let sample = counters
+            .iter()
+            .find(|s| {
+                s.labels.get("reason").map(String::as_str)
+                    == Some(REVS_SKIPPED_SUPERSEDED_BEFORE_TICK)
+            })
+            .unwrap_or_else(|| panic!("重试那一拍没有数出来：{counters:?}"));
+        assert_eq!(sample.value, 1.0, "A..C 之间只有一个从没被看过");
     }
 
     /// 回收轮重启完 tag 服务之后按住推进：这一版滚上去的 Pod 用的是 `main-<rev>`，
