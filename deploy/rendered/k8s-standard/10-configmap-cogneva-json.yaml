@@ -2482,6 +2482,24 @@ data:
                 },
                 "severity": "warning",
                 "summary": "验收面的普查跑完了、也解析得动，却**一份规格都没覆盖**：`cogneva_acceptance_specs` 这一拍是 0，而能发出这一条就说明普查本身是完整的。0 份被覆盖的规格与「全部通过」在判词那一族上同形——九种判词一条都不印，面板一片安静，而这次安静的原因不是规格都好，是根本没有规格被读。它与两个兄弟分工：整族序列缺席是生产者没了（`acceptance_reading_stopped`），`present` 为 0 是从没跑完过一趟（`acceptance_census_never_completed`），这一条是「有跑完的普查、解析得动、覆盖零份」。生产者在一份都没跑完时根本不发这一格，所以「没有普查」不会被这条读成 0 份，缺席由前两条承担。身份维 {node} 来自抓取时按节点名打的标签：一台宿主一个生产者，覆盖几份是那台机器上的事。severity 取 warning：它说明验收面此刻没有读数可用，不说明正在跑的东西坏了。先查那台机器上规格清单为什么是空的（路径配错、清单读成空、或解析器起不来——最后一种按契约退 3 且什么都不印，归 `acceptance_reading_stopped` 管）。"
+              },
+              {
+                "name": "upgrade_path_not_on_the_release",
+                "promql": "max by (node) (helm_release_revision_vs_workload_rev{state!=\"no-release\"})",
+                "condition": {
+                  "less_than": 1.0
+                },
+                "severity": "warning",
+                "summary": "升级路径没走通：这一拍 release 与现网工作负载不是同一版，或 release 本身不是 deployed，判据值是 {value}。判的是这两个修订号，不是修订号本身：release 的修订号往前走了、状态却是 failed，说明那次 upgrade 跑失败后再没人重跑，这一版根本不在现网，而只比修订号的旧读法会把它读成已经升上去了（2026-10-20 现网就是这个形状：release 停在 revision 2 / failed，同集群的 deployment 已滚到 revision 573）。两个数各自一个 gauge，所以面板上能分开看是 release 落后还是工作负载跑到了前面。state 为 no-release 的集群走 apply 投递、本来就没有 release，按构造排掉，不归这条管。样本缺席也不归这条管：读数停了自己没有样本，由 upgrade_path_reading_stopped 报，两件事的修法不同——那边修生产者，这边重跑 upgrade 或把它回滚。"
+              },
+              {
+                "name": "upgrade_path_reading_stopped",
+                "promql": "absent_over_time(helm_release_revision_vs_workload_rev[35m])",
+                "condition": {
+                  "greater_than": 0.0
+                },
+                "severity": "warning",
+                "summary": "安装/升级/回滚面的读数停了：过去 35 分钟里一次样本都没有，能发出这条告警时 {value} 是 1。这条读数在宿主上起 helm 与 kubectl 读本机集群；它一停，release 与工作负载到底同不同版就没有任何东西在判，而面板上「没有告警」与「两边一致」同形。先看那台机器上 helm 还在不在、kubectl 还连不连得上集群：读不到时它按契约退 3 且一条序列都不印，正是为了让这一条能红。"
               }
               ]
         },

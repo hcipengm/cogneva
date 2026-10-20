@@ -1102,6 +1102,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "同上（生产者跑成了，却一条序列都没发）。它与 `up` 必须分成两条：脚本崩了与输入读不到修法不同，合成一格就指不出该改哪边",
     ),
     (
+        "helm_release_revision_vs_workload_rev",
+        "宿主生产者 `scripts/host/cogneva-upgrade-path-reading.sh`（私有仓 brain），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出。值说的是「helm release 与现网工作负载是不是同一版」：1 是同版且 release 为 deployed，0 是不是。0 里混着两种成因（修订号不同、或 release 本身不是 deployed），所以这一格只给判据，成因由 `release_revision`/`workload_rev`/`status` 三个标签分开读；`state=\"no-release\"` 是走 apply 投递、本来就没有 release 的集群，按构造不参与判定。读不到时它整条序列都不印而不是印 0——「这台上没有 release」「两边不同版」与「生产者死了」是三个不同的修法，合成一个空集会指错方向",
+    ),
+    (
         "cogneva_host_credential_surface_age_seconds",
         "宿主凭证面生产者 `scripts/host/cogneva-credential-surface-state-reading.sh`（私有仓），经聚合器以 `job=\"cogneva-host-readings\"` 暴露。它判的是归档最后一行的年龄：一个读「每拍追加一行」的归档的生产者，停更之后每一拍照样跑成、判词照样是 aligned，只有这一条会往后退",
     ),
