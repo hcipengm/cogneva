@@ -35,7 +35,8 @@ command -v python3 >/dev/null || { echo "缺少依赖：python3" >&2; exit 2; }
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
-python3 - "${config}" "${work}" <<'PYEOF'
+manifests="${repo}/deploy/k3s/observability/manifests"
+python3 - "${config}" "${work}" "${manifests}" <<'PYEOF'
 import json, sys
 src, out = sys.argv[1], sys.argv[2]
 doc = json.load(open(src, encoding='utf-8'))
@@ -45,6 +46,20 @@ by_name = {r['name']: r for r in rules}
 # 判词里那句条数由这份配置自己算出来：钉死一个字面量的话，每加一条规则这份
 # 测试就会红一次，而它红的是它自己那份抄本，不是门禁坏了。
 open(f'{out}/rule_count', 'w', encoding='utf-8').write(str(len(rules)))
+
+# manifest 侧的条数同理由树算出：写死会让「加一条 manifest 规则」红在这份抄本上
+import glob, os, yaml
+mcount = 0
+for f in sorted(glob.glob(os.path.join(sys.argv[3], '*.yaml'))):
+    # 循环变量不能叫 doc：外层那份 chart JSON 也叫 doc，被覆盖之后 dump() 读到的是
+    # 最后一份 manifest 文档，报一个与判词无关的 KeyError。
+    for mdoc in yaml.safe_load_all(open(f, encoding='utf-8')):
+        if isinstance(mdoc, dict) and mdoc.get('kind') == 'PrometheusRule':
+            for g in (mdoc.get('spec') or {}).get('groups') or []:
+                for r in g.get('rules') or []:
+                    if r.get('alert') or r.get('record'):
+                        mcount += 1
+open(f'{out}/manifest_rule_count', 'w', encoding='utf-8').write(str(mcount))
 
 def dump(name, rules):
     copy = json.loads(json.dumps(doc))
@@ -125,17 +140,18 @@ dump('prose_quoted', prose_quoted)
 dump('prose_bare', prose_bare)
 PYEOF
 
-run() { # run <config> -> 打印合并输出，回传退出码
+run() { # run <config> [manifest 目录] -> 打印合并输出，回传退出码
   local out
-  if out="$(bash "${gate}" "$1" 2>&1)"; then
+  if out="$(bash "${gate}" "$1" "${2:-${work}/no-manifests}" 2>&1)"; then
     printf '%s\n' "${out}"; return 0
   else
     printf '%s\n' "${out}"; return 1
   fi
 }
 
-# 1. 真文件必须绿，并说出它读了多少条
-out="$(run "${config}")" || fail "真规则文件被判红：${out}"
+# 1. 真文件必须绿，并说出它读了多少条。manifest 真目录一起走——这份门禁的射程是
+#    这个仓发出去的全部规则，只喂 chart 那一份就测不到后半段。
+out="$(run "${config}" "${manifests}")" || fail "真规则文件被判红：${out}"
 grep -q 'ALERT SUBJECT OK' <<<"${out}" || fail "绿的时候也要报判词：${out}"
 grep -q "规则 $(cat "${work}/rule_count") 条" <<<"${out}" || fail "没有把读到的条数报出来：${out}"
 
@@ -200,6 +216,61 @@ grep -q '摘要里点名了已停用' <<<"${out}" || fail "判词没说清是摘
 if ! out="$(run "${work}/prose_bare.json")"; then
   fail "摘要里的裸名字是正当写法，却被判红：${out}"; fi
 grep -q 'ALERT SUBJECT OK' <<<"${out}" || fail "绿的时候也要报判词：${out}"
+
+# 1b. 真文件走默认参数时必须把 manifest 侧也读进来，并报出它读了多少条。
+#     这一条钉的是「manifest 里的规则也在射程内」：只读 chart 的那一版会把
+#     deploy/k3s/observability/manifests 里那 6 条告警全部静默放过。
+out="$(bash "${gate}" "${config}")" || fail "真规则文件（含 manifest）被判红：${out}"
+grep -q "manifest 规则 $(cat "${work}/manifest_rule_count") 条" <<<"${out}" \
+  || fail "没有把 manifest 侧的条数报出来：${out}"
+
+# 8. manifest 里一条没聚合的规则 -> 红，且点名文件与规则名。
+#    身份随 Pod 走这件事与规则写在哪无关，所以 manifest 侧用同一套判词。
+mkdir -p "${work}/m-bad"
+cat >"${work}/m-bad/00-prometheusrule-test.yaml" <<'YAML'
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: test
+spec:
+  groups:
+    - name: test
+      rules:
+        - alert: TestManifestUnreduced
+          expr: cogneva_loop_role_held
+YAML
+if out="$(run "${config}" "${work}/m-bad")"; then
+  fail "manifest 里丢掉聚合的规则被判绿：${out}"; fi
+grep -q 'TestManifestUnreduced' <<<"${out}" || fail "判红却没点名那条规则：${out}"
+grep -q 'LEAF' <<<"${out}" || fail "判词要给出没收敛的那段子表达式：${out}"
+
+# 9. manifest 与 chart 同名 -> 红。同一个告警名两个来源，身份去重与冷却记账分不开它们。
+mkdir -p "${work}/m-collide"
+cat >"${work}/m-collide/00-prometheusrule-test.yaml" <<'YAML'
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: test
+spec:
+  groups:
+    - name: test
+      rules:
+        - alert: pod_oom_killed
+          expr: max(some_metric)
+YAML
+if out="$(run "${config}" "${work}/m-collide")"; then
+  fail "manifest 与 chart 同名却判绿：${out}"; fi
+grep -q '与 chart 里的规则同名' <<<"${out}" || fail "同名冲突的判词不对：${out}"
+
+# 10. 无 pod 维那六条的放行前提被抽掉 -> 红。
+#     这一条钉的是「豁免不是一次写死的放行」：抓取路径一旦从 Node 角色改成 Pod 发现，
+#     那六条立刻回到未收敛一栏，而不是继续被静默放行。
+cp -r "${manifests}" "${work}/m-premise"
+sed -i 's/role: Node/role: Pod/' "${work}/m-premise/13-scrapeconfig-host-readings.yaml"
+if out="$(run "${config}" "${work}/m-premise")"; then
+  fail "Node 角色改成 Pod 之后，那六条仍被放行：${out}"; fi
+grep -q '放行的前提没了' <<<"${out}" || fail "前提消失的判词不对：${out}"
+grep -q 'CognevaHostReadingProducerDown' <<<"${out}" || fail "前提消失时没点名具体规则：${out}"
 
 # 少了参数以外的路径不存在时，是依赖错误不是判词
 if bash "${gate}" "${work}/does-not-exist.json" >/dev/null 2>&1; then

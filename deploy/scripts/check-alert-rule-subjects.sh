@@ -24,16 +24,23 @@
 #   - 只查 pod/container，**不查 instance**：node-exporter 的 instance 是节点地址，
 #     在那族规则里它是主体而不是报信者（`node_disk_usage_*` 靠它区分节点）
 #
-# 用法：bash deploy/scripts/check-alert-rule-subjects.sh [cogneva.json 路径]
+# 射程是**这个仓发出去的每一条规则**，不是只有 chart 里那一份 JSON。判据同一套，因为
+# 身份随 Pod 走这件事与规则写在哪无关：2026-10-20 之前这份脚本只读 cogneva.json，而
+# deploy/k3s/observability/manifests/ 里两份 PrometheusRule 的规则一条都没被看过——
+# 那里正是宿主读数通道的告警（生产者 down / 读不到输入 / 端点抓不到 / 凭证面）住的地方。
+# 只看 chart 会让「新规则落在 manifest 里」成为一条静默绕过这条门禁的路。
+#
+# 用法：bash deploy/scripts/check-alert-rule-subjects.sh [cogneva.json 路径] [manifest 目录]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONFIG="${1:-${ROOT}/deploy/helm/cogneva/files/cogneva.json}"
+MANIFESTS="${2:-${ROOT}/deploy/k3s/observability/manifests}"
 [ -f "${CONFIG}" ] || { echo "找不到规则文件：${CONFIG}" >&2; exit 2; }
 
 command -v python3 >/dev/null || { echo "缺少依赖：python3" >&2; exit 2; }
-python3 - "${CONFIG}" <<'PYEOF'
-import json, re, sys
+python3 - "${CONFIG}" "${MANIFESTS}" <<'PYEOF'
+import glob, json, os, re, sys
 
 def find(o):
     if isinstance(o, dict):
@@ -318,7 +325,96 @@ def find_container(o):
             if r: return r
 
 
-def main(path):
+# 宿主读数通道的这几条告警：序列来自 ScrapeConfig 的 **Node 角色**发现——一个进程、一个
+# 端口，relabel 只挂 node/instance/job，抓取面上根本没有 pod/container 可聚合。门禁要防的
+# 「同一条告警随报信 Pod 重建而换身份」在这里不存在，所以这不是「漏聚合」，是这条抓取路径
+# 上**没有那个维**。
+#
+# 但这种豁免最容易变成盲区，所以它带前提：premise 从树上的 ScrapeConfig 读出来（见
+# scrape_jobs_without_pod），哪天这条通道改成 Pod 发现、或 relabel 开始挂 pod/container，
+# 这些名字就自动回到「未收敛」一栏，而不是继续被静默放行。
+NO_POD_REPORTER = {
+    'CognevaHostReadingProducerDown': 'host_reading_producer_up',
+    'CognevaHostReadingProducerUnreadable': 'host_reading_producer_unreadable',
+    'CognevaHostReadingsEndpointDown': 'up{job="cogneva-host-readings"}',
+    'CognevaHostCredentialSurfaceStale': 'cogneva_host_credential_surface_age_seconds',
+    'CognevaHostCredentialSurfaceCadenceUnknown': 'cogneva_host_credential_surface_period_seconds',
+    'CognevaHostCredentialSurfaceNeverRan': 'cogneva_host_credential_surface_measured',
+    'CognevaHostCredentialSurfaceDrift': 'cogneva_host_credential_surface_aligned',
+    'CognevaHostCredentialSurfaceUnreadable': 'cogneva_host_credential_surface_unreadable',
+}
+HOST_READING_JOB = 'cogneva-host-readings'
+POD_LABELS = ('pod', 'container')
+
+
+def scrape_jobs_without_pod(dir_path):
+    """从 manifest 的 ScrapeConfig 里读出：哪些抓取 job 的发现方式不带 pod。
+
+    判据是两条都在：发现角色只有 Node（`role: Pod` 或 ServiceMonitor 那类按 Pod 发现的不算），
+    且没有任何 relabel 往 pod/container 上写标签。少一条就不算——宁可让上面那六条回到红，
+    也不要拿一个读错的前提去放行。"""
+    try:
+        import yaml
+    except ImportError:
+        return set()
+    jobs = set()
+    for f in sorted(glob.glob(os.path.join(dir_path, '*.yaml'))):
+        try:
+            docs = list(yaml.safe_load_all(open(f, encoding='utf-8')))
+        except Exception:
+            continue
+        for doc in docs:
+            if not isinstance(doc, dict) or doc.get('kind') != 'ScrapeConfig':
+                continue
+            spec = doc.get('spec') or {}
+            roles = {str(c.get('role', '')).lower()
+                     for c in (spec.get('kubernetesSDConfigs') or [])}
+            if roles != {'node'}:
+                continue
+            writes_pod = False
+            for rl in (spec.get('relabelings') or []) + (spec.get('metricRelabelings') or []):
+                target = str(rl.get('targetLabel', '')) or ' '.join(rl.get('sourceLabels') or [])
+                if any(lbl in target for lbl in POD_LABELS):
+                    writes_pod = True
+                    break
+            if not writes_pod and spec.get('jobName'):
+                jobs.add(spec['jobName'])
+    return jobs
+
+
+def manifest_rules(dir_path):
+    """manifest 目录里的 (文件名, alert 或 record 名, expr)。目录不在就返回 None——
+    这份脚本要能只拿一份规则文件用（定向测试就是这么用的），不能因为旁边没有
+    集群清单就拒绝干活。返回的名字里 alert 与 record 都收：record 规则的输出
+    会被告警再读一次，它的标签集同样是「这条规则讲谁」的那一半。"""
+    if not os.path.isdir(dir_path):
+        return None, []
+    try:
+        import yaml
+    except ImportError:
+        print(f'FAIL: 要读 {dir_path} 里的 PrometheusRule，但缺 pyyaml', file=sys.stderr)
+        sys.exit(2)
+    files = sorted(glob.glob(os.path.join(dir_path, '*.yaml'))
+                   + glob.glob(os.path.join(dir_path, '*.yml')))
+    out = []
+    for f in files:
+        try:
+            docs = list(yaml.safe_load_all(open(f, encoding='utf-8')))
+        except Exception as e:
+            print(f'FAIL: 读不懂 {f}：{e}', file=sys.stderr)
+            sys.exit(2)
+        for doc in docs:
+            if not isinstance(doc, dict) or doc.get('kind') != 'PrometheusRule':
+                continue
+            for group in (doc.get('spec') or {}).get('groups') or []:
+                for rule in group.get('rules') or []:
+                    out.append((os.path.basename(f),
+                                rule.get('alert') or rule.get('record'),
+                                rule.get('expr')))
+    return files, out
+
+
+def main(path, manifests_dir):
     container = find_container(json.load(open(path, encoding='utf-8')))
     rules = container['rules'] if container else None
     if not rules:
@@ -384,10 +480,54 @@ def main(path):
         if (got is not None) != bool(want):
             problems.append(f'第二读数的控制集被改坏了：{expr} -> {got}')
 
+    # --- manifest 里的 PrometheusRule -------------------------------------------------
+    # 与 chart 同一套判词。区别只在于这里没有控制集（控制集钉的是 chart 那 18 条），
+    # 豁免表照旧按名字匹配；名字与 chart 撞车另算一条——同一个告警名两个来源，身份去重
+    # 与冷却记账都分不开它们。
+    files, m_rules = manifest_rules(manifests_dir)
+    no_pod_ok = bool(files) and HOST_READING_JOB in scrape_jobs_without_pod(manifests_dir)
+    m_unreduced = m_unpaired = 0
+    waived = set()
+    for src, name, expr in m_rules:
+        if not name:
+            problems.append(f'{src}：一条规则既没有 alert 也没有 record 名，身份无从谈起')
+            continue
+        if name in by_name:
+            problems.append(f'{src}: {name} 与 chart 里的规则同名 —— 同一个告警身份有两个来源')
+        if not expr:
+            problems.append(f'{src}: {name} 没有 expr')
+            continue
+        why = lint(expr)
+        if why:
+            m_unreduced += 1
+            if name in NO_POD_REPORTER and no_pod_ok:
+                waived.add(name)
+            elif name not in exempt:
+                problems.append(f'{src}: {name}：表达式把报信者的标签带进了身份 -- {why}')
+        paired_bad = pairing(expr)
+        if paired_bad:
+            m_unpaired += 1
+            problems.append(f'{src}: {name}：比较的两侧配不上，这条规则产不出序列 -- {paired_bad}')
+
+    names_in_manifest = {n for _, n, _ in m_rules}
+    for n in (NO_POD_REPORTER if files is not None else ()):
+        if n not in names_in_manifest:
+            problems.append(f'免聚合表里的 {n} 不在这批 manifest 规则里（豁免跟着规则一起过期）')
+        elif files is not None and not no_pod_ok and n not in exempt:
+            problems.append(
+                f'{n}：放行的前提没了 —— {HOST_READING_JOB} 不再由 Node 角色发现，'
+                f'或 relabel 开始写 pod/container；这条规则要重新聚合并删掉豁免')
+
     print(f'规则 {len(rules)} 条，未收敛 {len(unreduced)} 条'
           f'（其中豁免 {len(unreduced) - len(offenders)} 条），两侧配不上 {len(unpaired)} 条，'
           f'已停用 {len(retired)} 条，摘要点名停用名 {prose_hits} 处',
           flush=True)
+    if files is None:
+        print(f'manifest 未检查：{manifests_dir} 不存在', flush=True)
+    else:
+        print(f'manifest 规则 {len(m_rules)} 条（{len(files)} 份 PrometheusRule），'
+              f'未收敛 {m_unreduced} 条（其中无 pod 维可聚合 {len(waived)} 条），'
+              f'两侧配不上 {m_unpaired} 条', flush=True)
     if problems:
         for p in problems:
             print('FAIL: ' + p, file=sys.stderr)
@@ -395,5 +535,5 @@ def main(path):
     print('ALERT SUBJECT OK：每条规则的身份维都是它讲的那个对象')
     return 0
 
-sys.exit(main(sys.argv[1]))
+sys.exit(main(sys.argv[1], sys.argv[2]))
 PYEOF
