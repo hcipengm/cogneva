@@ -3715,7 +3715,7 @@ mod tests {
                 let mut producer = producer;
                 producer.end(cog_core::ChatResponse {
                     content: vec![ContentBlock::tool_call(
-                        &format!("call-blocked-{attempt}"),
+                        format!("call-blocked-{attempt}"),
                         "noop",
                         serde_json::json!({ "attempt": attempt }),
                     )],
