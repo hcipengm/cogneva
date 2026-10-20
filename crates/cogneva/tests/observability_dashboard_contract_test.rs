@@ -793,6 +793,40 @@ const FOREIGN: &[(&str, &str)] = &[
         "kube_persistentvolumeclaim_resource_requests_storage_bytes",
         "kube-state-metrics",
     ),
+    // The clippy verdict log lives on the host and the loop that writes it is
+    // not in a pod, so the reading is published the same way every other
+    // host-side fact is: one producer folded into the host's single scraping
+    // target. Filing these here is what keeps that honest -- a name filed as
+    // foreign stops being looked for in this workspace, and the closed-set
+    // check above refuses a foreign name this build actually publishes.
+    (
+        "cogneva_clippy_verdict_present",
+        "宿主读数生产者（scripts/host/cogneva-clippy-verdict-reading.sh，经统一宿主出口）",
+    ),
+    (
+        "cogneva_clippy_verdict_observed_timestamp_seconds",
+        "宿主读数生产者（同上）",
+    ),
+    (
+        "cogneva_clippy_verdict_unparsable_lines",
+        "宿主读数生产者（同上）",
+    ),
+    ("cogneva_clippy_pending_revs", "宿主读数生产者（同上）"),
+    (
+        "cogneva_clippy_last_green_timestamp_seconds",
+        "宿主读数生产者（同上）",
+    ),
+    // The stall judgement is made on the host from the beat's own rows, so it is
+    // foreign here for the same reason: publishing it from this workspace would
+    // mean a second producer of the same fact, and two clocks that disagree.
+    (
+        "cogneva_mainline_behind_verdict_stalled",
+        "宿主读数生产者（scripts/host/cogneva-mainline-behind-verdict.sh）",
+    ),
+    (
+        "cogneva_mainline_behind_verdict_judged",
+        "宿主读数生产者（同上）",
+    ),
 ];
 
 /// Label names a legend template asks for: every `{{...}}` in the format.

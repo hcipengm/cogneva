@@ -2156,6 +2156,141 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 53,
+          "title": "Clippy: Revisions Owed a Run",
+          "description": "What the host's clippy log says is still owed. `pending_revs` counts revisions whose latest line is not green -- red and not-yet-run are both a debt, and a green that checked only part of the workspace is filed under scope=selected, so it never fills the workspace-wide cell. `verdict_present` is 0 when the log cannot be read at all: that is 'no reading', not 'the reading says fine', and it must not be read as a green. `unparsable_lines` counts lines the reader could not parse; one damaged line does not zero the rest, but it also does not disappear. Nothing drawn here means the host's reading producer is not reporting at all -- the four states are kept apart on purpose.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 256
+          },
+          "targets": [
+            {
+              "expr": "cogneva_clippy_pending_revs",
+              "legendFormat": "{{node}} owed revisions",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_clippy_verdict_present",
+              "legendFormat": "{{node}} log present",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_clippy_verdict_unparsable_lines",
+              "legendFormat": "{{node}} unparsable lines",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 54,
+          "title": "Clippy: How Long Since",
+          "description": "Seconds since the newest green that covered the whole workspace, and seconds since the producer last appended a line. The first alone cannot tell an idle night from a red nobody fixed -- pair it with the owed-revisions panel. The second is the heartbeat: a producer that stopped leaves its last green standing, and a stopped reading and a green reading have the same shape; once this line climbs past two producer periods the reading is stale, not green.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 256
+          },
+          "targets": [
+            {
+              "expr": "time() - cogneva_clippy_last_green_timestamp_seconds{scope=\"all\"}",
+              "legendFormat": "{{node}} since a full green (scope=all)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "time() - cogneva_clippy_last_green_timestamp_seconds{scope=\"selected\"}",
+              "legendFormat": "{{node}} since a partial green (scope=selected)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "time() - cogneva_clippy_verdict_observed_timestamp_seconds",
+              "legendFormat": "{{node}} since the producer last wrote",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 55,
+          "title": "Mainline: Is the Deployment Moving?",
+          "description": "One series answers 'has the live revision stopped changing' and another answers 'did the judge get far enough to say'. `stalled` is 1 only when two consecutive beats saw the same live revision and neither had a build in flight, or when the beat itself stopped updating -- a reading that stopped is not a green reading. `judged` is 0 when the beat could not decide (only one sample, a previous sample that could not be read, or an unknown in-flight column): the `stalled` series is then absent rather than 0, because a zero would claim 'not stalled' about a question that was never answered. Both absent means the host's reading producer is not reporting at all.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 264
+          },
+          "targets": [
+            {
+              "expr": "cogneva_mainline_behind_verdict_stalled",
+              "legendFormat": "{{node}} stalled",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_mainline_behind_verdict_judged",
+              "legendFormat": "{{node}} judged",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "max": 1,
+              "min": 0,
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

@@ -42,11 +42,15 @@
 //! literal scan below is what makes that a claim rather than a hope: every
 //! well-formed `"cogneva_..."` literal under `crates/` must be on the
 //! denominator, in the closed set, a recording-suffix derivative of a closed
-//! set name, one of two declared non-series, or named by a produced-table row
+//! set name, one of two declared non-series, named by a produced-table row
 //! whose producer lies outside `crates/` and really spells it -- the textfile
 //! collector in the chart is such a producer, and its names are born nowhere in
-//! Rust. A producer that spells its name some other way lands there as an
-//! unexplained literal rather than as a series nothing checks.
+//! Rust -- or read by a face. The face leg is for the producers that run
+//! outside this repository entirely: the host readings channel publishes its
+//! series from a script, so there is no file here for a produced-table row to
+//! name, and what this tree can still say about such a name is who reads it. A
+//! producer that spells its name some other way and that nothing reads lands
+//! there as an unexplained literal rather than as a series nothing checks.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -505,7 +509,18 @@ fn a_registration_no_rule_and_no_panel_reads_is_a_counted_row() {
 /// This closes it by walking the other way: the well-formed literals are
 /// enumerated from the text with no shape assumed, and each has to be one of
 /// the two shapes, a closed set name, a derived name, a name the retirement
-/// list holds, or a declared exception.
+/// list holds, a name a face reads, or a declared exception.
+///
+/// The face leg is what a series produced on the host needs. A bash producer
+/// that runs outside this repository -- the host readings channel is the whole
+/// family -- has no file here for a produced-table row to name, so the row that
+/// pins a textfile producer cannot pin this one. The literal that survives is
+/// in the contract table that files it as foreign, and the question the census
+/// can still ask about such a name is the one it asks of every series: does
+/// anything read it. That is the same read set `a_registration_no_rule_and_no_panel_reads_is_a_counted_row`
+/// builds, and it is not a free pass -- a name no rule and no panel reads stays
+/// unexplained, and a name filed as foreign is checked against the closed set
+/// by the contract that files it.
 #[test]
 fn every_series_name_literal_in_the_tree_is_accounted_for() {
     let registry: BTreeSet<String> = cog_core::metric_names::ALL
@@ -586,6 +601,14 @@ fn every_series_name_literal_in_the_tree_is_accounted_for() {
     }
 
     let outside = names_produced_outside_crates();
+    // The names a face reads. Same two sources as the registered-but-unread
+    // count, read once from the same extractors rather than twice from two
+    // spellings of "what does a face read".
+    let mut read_by_a_face: BTreeSet<String> = rule_expressions()
+        .iter()
+        .flat_map(|expr| metric_names_in(expr))
+        .collect();
+    read_by_a_face.extend(dashboard::series());
     let unexplained: Vec<&str> = literals
         .iter()
         .map(String::as_str)
@@ -596,11 +619,12 @@ fn every_series_name_literal_in_the_tree_is_accounted_for() {
                 && !excluded.contains(n)
                 && !retired.contains(n)
                 && !outside.contains(*n)
+                && !read_by_a_face.contains(*n)
         })
         .collect();
     assert!(
         unexplained.is_empty(),
-        "树里有这些 cogneva_ 字面量，既不是两种产出形状解析出的名字、也不在闭集里、也不是闭集名字的派生名、也不是产出表点名了一个真写着它的非 Rust 产出方——产出面可能换了第三种写法，那样它就整个在门的射程之外：\n{}",
+        "树里有这些 cogneva_ 字面量，既不是两种产出形状解析出的名字、也不在闭集里、也不是闭集名字的派生名、也不是产出表点名了一个真写着它的非 Rust 产出方、也没有任何规则或面板读它——产出面可能换了第三种写法，那样它就整个在门的射程之外：\n{}",
         unexplained.join("\n")
     );
 }
