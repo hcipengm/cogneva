@@ -1535,6 +1535,15 @@ struct AdvanceWaitEnd {
     /// 但别人先到"，都不回退这一格。它答的是"请求发出去了没有"，不是"此刻还占着
     /// 没有"——后者是闸自己的读数，不该在这里第二份。
     reserved: bool,
+    /// 这一格是谁写的，闭集 `refusal` / `renewal`；没认领过就是 `None`。
+    ///
+    /// `reserved` 只答「占到过场没有」，答不出「走的是哪条路」。这两条路不是同一件事：
+    /// `refusal` 是被拒分支那一轮按阈值认领成功的，一直在写；`renewal` 是早退路径
+    /// （CI 扣住 / 索引重建）上续发的那一次，2026-10-19 之前它占到场却不在结局里留痕。
+    /// 不把来源写进结局，读的人拿 `+reserved` 分不出「这次是常规认领」还是「这条早退
+    /// 路径终于也记事了」——而后者正是那一刀要证明的东西，只靠日志对时等于每次都靠运气。
+    #[serde(default)]
+    reserved_by: Option<String>,
 }
 
 /// 等槽结束这件事的读数字面量：日志、盘上状态与变更面共用同一个名字。
@@ -1647,6 +1656,14 @@ struct MainlineState {
     /// 当前这一段等待里是否已经按阈值认领过下一个构建名额。
     #[serde(default)]
     advance_wait_reserved: bool,
+    /// `advance_wait_reserved` 是谁置上的，闭集 `refusal` / `renewal`。
+    ///
+    /// 先写者定来源、之后不再改：被拒分支既然已经按阈值认领过，早退路径上的续发就
+    /// 不是这一段等待的关键事件，来源记 `refusal` 才是这段等待的真相。
+    /// 反过来，只有「来源是 `renewal`」这一种结局能证明续发那条路真的把答案写进了
+    /// 结局——那是这一格存在的全部理由。
+    #[serde(default)]
+    advance_wait_reserved_by: Option<String>,
     /// 最近的每一段等槽是怎么结束的。见 [`AdvanceWaitEnd`]。
     #[serde(default)]
     advance_wait_ends: Vec<AdvanceWaitEnd>,
@@ -4890,6 +4907,7 @@ impl MainlineDeployer {
                     // reserved=true，而 builds.reserve 是 `host build`）。
                     if crate::build_gate::reserve_build_field("mainline advance") {
                         state.advance_wait_reserved = true;
+                        state.advance_wait_reserved_by = Some("refusal".to_string());
                     }
                 }
                 self.save_state(&state)?;
@@ -4928,6 +4946,7 @@ impl MainlineDeployer {
                     .clone()
                     .unwrap_or_else(|| "other".to_string()),
                 reserved: state.advance_wait_reserved,
+                reserved_by: state.advance_wait_reserved_by.clone(),
             };
             info!(
                 event = ADVANCE_WAIT_ENDED_EVENT,
@@ -4938,6 +4957,7 @@ impl MainlineDeployer {
                 deferrals = ended.deferrals,
                 reason = %ended.reason,
                 reserved = ended.reserved,
+                reserved_by = ended.reserved_by.as_deref().unwrap_or("-"),
                 "took the build slot after deferring; recording how the wait ended"
             );
             state.advance_wait_ends.push(ended);
@@ -4951,6 +4971,7 @@ impl MainlineDeployer {
             state.advance_wait_since_unix = None;
             state.advance_wait_reason = None;
             state.advance_wait_reserved = false;
+            state.advance_wait_reserved_by = None;
             self.save_state(&state)?;
         }
         state.advance_deferrals = 0;
@@ -6578,6 +6599,7 @@ fn advance_wait_reason(err: &SFError) -> &'static str {
 fn note_renewed_reservation(state: &mut MainlineState, claimed: bool) -> bool {
     if claimed && !state.advance_wait_reserved {
         state.advance_wait_reserved = true;
+        state.advance_wait_reserved_by = Some("renewal".to_string());
         return true;
     }
     false
@@ -6662,11 +6684,17 @@ fn heartbeat_message(
             .last()
             .map(|e| {
                 format!(
-                    "{}@{}s/{}{}",
+                    "{}@{}s/{}{}{}",
                     rev12(&e.rev),
                     (e.ended_unix - e.since_unix).max(0),
                     e.reason,
-                    if e.reserved { "+reserved" } else { "" }
+                    if e.reserved { "+reserved" } else { "" },
+                    // 来源只在认领过时才有：`+reserved/renewal` 是「早退路径写进结局」
+                    // 那一刀的证据，`+reserved/refusal` 是常规认领。
+                    match e.reserved_by.as_deref() {
+                        Some(by) if e.reserved => format!("/{by}"),
+                        _ => String::new(),
+                    }
                 )
             })
             .unwrap_or_else(|| "none".into()),
@@ -9137,10 +9165,12 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
                 deferrals: 3,
                 reason: "build_gate_busy".into(),
                 reserved: true,
+                reserved_by: None,
             }],
             advance_wait_since_unix: None,
             advance_wait_reason: None,
             advance_wait_reserved: false,
+            advance_wait_reserved_by: None,
             registry_maintenance_unix: 0,
             registry_restart_unix: Some(940),
             registry_gc_owed: false,
@@ -9624,10 +9654,12 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
                 deferrals: 2,
                 reason: "other".into(),
                 reserved: false,
+                reserved_by: None,
             }],
             advance_wait_since_unix: Some(2000),
             advance_wait_reason: Some("build_gate_busy".into()),
             advance_wait_reserved: true,
+            advance_wait_reserved_by: Some("renewal".into()),
             registry_maintenance_unix: 0,
             registry_restart_unix: None,
             registry_gc_owed: false,
@@ -9654,11 +9686,54 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         let mut state = MainlineState::default();
         assert!(note_renewed_reservation(&mut state, true));
         assert!(state.advance_wait_reserved);
+        // 来源必须落成 `renewal`：结局里的 `+reserved` 有两条来路，只有这一格分得开，
+        // 而「早退路径也能写进结局」正是这一刀要证明的东西。
+        assert_eq!(state.advance_wait_reserved_by.as_deref(), Some("renewal"));
         // 同一答案每轮都来，不能每轮落盘。
         assert!(!note_renewed_reservation(&mut state, true));
         // 一次没占到（别人先认领）不能把已经占到的擦掉。
         assert!(!note_renewed_reservation(&mut state, false));
         assert!(state.advance_wait_reserved);
+        assert_eq!(state.advance_wait_reserved_by.as_deref(), Some("renewal"));
+    }
+
+    #[test]
+    fn the_ending_says_which_path_recognized_the_claim() {
+        // 读的人拿 `+reserved` 分不出「常规认领」与「早退路径续发」；而后者只有在
+        // 续发那条路真的把答案写进结局时才会出现。不把来源印出来，确认那一刀就只能
+        // 靠日志对时——日志随 Pod 滚动消失，等于每次都靠运气。
+        let mut state = MainlineState {
+            advance_wait_ends: vec![AdvanceWaitEnd {
+                rev: "99887766aabb".into(),
+                since_unix: 400,
+                ended_unix: 1000,
+                deferrals: 3,
+                reason: "build_gate_busy".into(),
+                reserved: true,
+                reserved_by: Some("renewal".into()),
+            }],
+            ..MainlineState::default()
+        };
+        let msg = heartbeat_message(&state, "aabbccddeeff0011", "up-to-date", None, 1000);
+        assert!(
+            msg.contains("last_advance_wait=99887766aabb@600s/build_gate_busy+reserved/renewal"),
+            "{msg}"
+        );
+        // 老状态文件里没有这一格：`+reserved` 照旧，不许因此印出一个来历不明的后缀。
+        state.advance_wait_ends[0].reserved_by = None;
+        let msg = heartbeat_message(&state, "aabbccddeeff0011", "up-to-date", None, 1000);
+        assert!(
+            msg.contains("last_advance_wait=99887766aabb@600s/build_gate_busy+reserved"),
+            "{msg}"
+        );
+        // 没认领过的段不该带来源后缀。
+        state.advance_wait_ends[0].reserved = false;
+        state.advance_wait_ends[0].reserved_by = Some("renewal".into());
+        let msg = heartbeat_message(&state, "aabbccddeeff0011", "up-to-date", None, 1000);
+        assert!(
+            msg.ends_with("last_advance_wait=99887766aabb@600s/build_gate_busy"),
+            "{msg}"
+        );
     }
 
     #[test]
