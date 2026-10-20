@@ -342,6 +342,10 @@ NO_POD_REPORTER = {
     'CognevaHostCredentialSurfaceNeverRan': 'cogneva_host_credential_surface_measured',
     'CognevaHostCredentialSurfaceDrift': 'cogneva_host_credential_surface_aligned',
     'CognevaHostCredentialSurfaceUnreadable': 'cogneva_host_credential_surface_unreadable',
+    'CognevaBackupPackageOwnerWrong': 'cogneva_backup_package_owner_uid',
+    'CognevaBackupPackageUnreadable': 'cogneva_backup_package_reading_state{state="unreadable"}',
+    'CognevaBackupPackageMissing': 'cogneva_backup_package_reading_state{state="empty"}',
+    'CognevaBackupPackageStale': 'cogneva_backup_package_age_seconds',
 }
 HOST_READING_JOB = 'cogneva-host-readings'
 POD_LABELS = ('pod', 'container')

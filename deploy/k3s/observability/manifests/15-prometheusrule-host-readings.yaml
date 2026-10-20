@@ -134,3 +134,54 @@ spec:
           annotations:
             summary: "{{ $labels.source }} 侧的凭证面核对没读成，这一面当前没有判词"
             description: "门自己出错、快照建不出来、或 systemctl 探针失败。这一面判的是「宿主上哪些进程碰得到凭证」，没读成不等于没事。"
+
+    # 持久化存储面：最近一份**已完成**的备份包是谁写的。
+    #
+    # 为什么单独成组：备份面此前所有的判据都只读「跑成没跑成」与「演练多旧」，没有一条读
+    # 属主。2026-10-20 实测现网：卷根 `drwx------ root root`、最新包 `0:0`/`0600`——包在
+    # 那儿，但以应用用户（1001）的身份恢复时连 `ls` 都读不到。这不是备份失败，是恢复那天
+    # 才会暴露的失败，所以它必须有一条自己的规则。
+    - name: cogneva-backup-package
+      rules:
+        # 属主不对：包是恢复唯一能读的东西，属主决定「谁能读」。属主 0 一律算错——
+        # 平台按 1001 跑，写成 root 的包在恢复时要么读不到，要么得提权和它一起跑。
+        - alert: CognevaBackupPackageOwnerWrong
+          expr: cogneva_backup_package_owner_uid != 1001
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "最新一份已完成的备份包属主是 {{ $value }}，不是 1001"
+            description: "跑 `bash scripts/host/cogneva-backup-package-owner-reading.sh` 看包名与大小；修法是让备份写端以 1001 落盘（或写完 chown），不是在恢复端提权绕过去。"
+
+        # 读不到：账本或卷问不出来。它与「没有包」修法相反——这一格去修读取路径。
+        - alert: CognevaBackupPackageUnreadable
+          expr: cogneva_backup_package_reading_state{state="unreadable"} == 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "备份包属主这一读数读不到（账本或卷问不出来）"
+            description: "这一跑什么都没量。先看 postgres-0 能不能 `psql -c 'select 1'`，再看 PVC 的宿主路径在不在。"
+
+        # 没有包：账本里没有一份 outcome=ok 且带包名的备份，或账本点名的包在卷上不存在。
+        # 两种情况都意味着「现在没有能恢复的东西」，不是「还没轮到」。
+        - alert: CognevaBackupPackageMissing
+          expr: cogneva_backup_package_reading_state{state="empty"} == 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "没有一份已完成的备份包可以恢复"
+            description: "账本与卷对不上，或备份从没成功过。两条都先看 `bash scripts/host/cogneva-backup-package-owner-reading.sh` 印的 package= 与原因行。"
+
+        # 包太旧：界沿用持久化面既有的 26 小时（`face-reading-criteria.tsv` 里演练那条同值），
+        # 不为这条规则另拍一个数——同一个问题用同一个界，改的时候一起改。
+        - alert: CognevaBackupPackageStale
+          expr: cogneva_backup_package_age_seconds > 93600
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "最新一份已完成的备份包已经 {{ $value }} 秒（超过 26 小时）"
+            description: "备份定时器没跑、跑失败、或写完了没记账。先看 `cogneva-backup` CronJob 最近的 Job 与 `backup_runs` 最后一行。"
