@@ -687,7 +687,7 @@ For manual compilation: `cargo build --release`. Container image: see `Dockerfil
 **Scope and limits** — stated here rather than left to inference:
 
 - **Namespaces partition data, they are not an authorization boundary.** A namespace scopes memory and task storage; the platform does not authenticate a caller *as* a tenant and does not enforce namespace-level access control.
-- **No quota enforcement and no billing.** The `cog-quota` crate exists but is not on the serving path, and there is no metering or invoicing component.
+- **Neither quota enforcement nor billing reaches the request path.** The `cog-quota` crate is initialised in the application process and publishes its pre-check counter (`quota_pre_checks_total`; on 2026-10-20 both `allowed=true` and `allowed=false` read 0, i.e. no pre-check has ever run on a real request), but there is no tenant dimension and no metering or invoicing component.
 - **Alert delivery needs an outlet you provide.** Alert rules and the `alerts` table ship with the platform; notification channels (email, Slack, generic webhook) are empty until configured, and nothing is sent until then.
 - **Upgrade and rollback are not yet exercised end-to-end in production.** The live deployments so far were delivered by manifest apply and image rollouts; run `helm upgrade` / `helm rollback` on a staging cluster before depending on them for a production upgrade.
 
