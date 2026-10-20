@@ -1142,6 +1142,11 @@ impl AgentRuntime {
         // "how many turns may a refusal buy", and a model cycling through a
         // different blocked call each turn would otherwise buy one per turn.
         let mut refusals: u32 = 0;
+        // Every call a rule refused in this run, in the order it happened. The
+        // ending can name only one of them (the last), but the attempt this run
+        // hands the work back to has never seen any of them — it starts with a
+        // fresh context — so the earlier ones travel with the last one.
+        let mut refused_calls: Vec<(String, String, String)> = Vec::new();
 
         for iteration in 0..self.config.max_iterations {
             tracing::info!(agent_id = %self.config.agent_id, iteration, "AgentRuntime::run iteration start");
@@ -1412,6 +1417,7 @@ impl AgentRuntime {
                     Err(ToolRunError::Blocked { tool, reason, rule }) => {
                         refusals += 1;
                         blocked = Some((tool.clone(), reason.clone(), rule.clone(), refusals));
+                        refused_calls.push((tool.clone(), rule.clone(), reason.clone()));
                         Err(SFError::Blocked { tool, reason, rule })
                     }
                     Err(ToolRunError::Failed(e)) => Err(e),
@@ -1506,9 +1512,23 @@ impl AgentRuntime {
                         // attempt's input, and "the run ended after a second
                         // refusal" says nothing about why this call was refused —
                         // the only part the next attempt can act on.
+                        //
+                        // The calls this run refused *before* the last one ride
+                        // too: the next attempt has a fresh context, so a rule it
+                        // already met here would otherwise be news to it again.
+                        let earlier: Vec<String> = refused_calls
+                            .iter()
+                            .take(refused_calls.len().saturating_sub(1))
+                            .map(|(t, r, why)| format!("{t} (rule: {r}): {why}"))
+                            .collect();
+                        let also = if earlier.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; also refused in this run: {}", earlier.join("; "))
+                        };
                         let err = SFError::Blocked {
                             tool,
-                            reason: format!("{reason} ({note})"),
+                            reason: format!("{reason} ({note}{also})"),
                             rule,
                         };
                         tracing::warn!("{err}");
@@ -3909,6 +3929,82 @@ mod tests {
         assert_eq!(
             refused, 1.0,
             "a run that ended on a refusal must be counted against its role"
+        );
+    }
+
+    /// Refuses every call under a rule named for the turn it happened on, so a
+    /// single run can meet two different rules.
+    struct DenyEachCallWithItsOwnRule {
+        seen: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::Guardrail for DenyEachCallWithItsOwnRule {
+        async fn check_input(&self, _messages: &[Message]) -> cog_core::GuardResult {
+            cog_core::GuardResult::Pass
+        }
+        async fn check_output(&self, _response: &str) -> cog_core::GuardResult {
+            cog_core::GuardResult::Pass
+        }
+        async fn check_tool_call(&self, _tool: &cog_core::ToolCall) -> cog_core::GuardResult {
+            let n = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            cog_core::GuardResult::Block {
+                reason: "not allowed here".into(),
+                rule: format!("rule-{n}"),
+            }
+        }
+    }
+
+    /// The attempt this run hands its work back to starts with a fresh
+    /// context, so a rule refused earlier in this run would be news to it all
+    /// over again. The ending names the last refusal in its typed fields; every
+    /// earlier one travels in the reason, which is what the dispatch layer
+    /// plants into the next attempt's input.
+    #[tokio::test]
+    async fn an_earlier_refusal_travels_with_the_one_that_ended_the_run() {
+        let mut registry = ToolRegistry::new();
+        registry.set_guardrail(Arc::new(DenyEachCallWithItsOwnRule {
+            seen: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        cog_core::ToolRegistry::register(
+            &registry,
+            cog_core::Tool {
+                name: "noop".into(),
+                description: "never runs behind a refusal".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                implementation: cog_core::ToolImplementation::Native(Arc::new(|_args| {
+                    Box::pin(async move { Ok(serde_json::json!({ "ran": true })) })
+                })),
+            },
+        );
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let config = RuntimeConfig {
+            agent_id: "blocked-two-rules".into(),
+            role: "blocked-two-rules".into(),
+            max_iterations: 10,
+            ..Default::default()
+        };
+        let mut runtime = AgentRuntime::new(config, tx).with_tools(registry);
+        let llm = VaryingCallLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let err = runtime
+            .run(serde_json::json!({ "task": "blocked" }), &llm)
+            .await
+            .expect_err("two refusals end the run");
+        let text = err.to_string();
+        assert!(
+            text.contains("also refused in this run") && text.contains("rule-1"),
+            "the first rule must travel with the second: {text}"
+        );
+        let refusal = cog_core::contract::outcome::guardrail_refusal_in(&text)
+            .expect("the ending still parses as a refusal");
+        assert_eq!(
+            refusal.rule, "rule-2",
+            "the typed field must stay the rule that ended the run, with the \
+             earlier one only in the prose: {text}"
         );
     }
 
