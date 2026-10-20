@@ -161,27 +161,34 @@ def check_execstart():
 def check_live(rows):
     if not LIVE:
         return
-    seen = set()
-    for unit, kind, name, source in rows:
-        seen.add(unit)
+    # 按登记表的列位取名，不按位置解包：表从四列长到七列时，解包会抛 ValueError，
+    # 门于是打出一段 traceback 然后退出 1——看起来是红，实际没判任何一条。
+    # 每个单元只 `systemctl cat` 一次：同一单元的多条凭证共用同一份输出，
+    # 逐行去问会让一个未安装的单元印出与登记条数一样多的同一句话。
+    by_unit = {}
+    for cols in rows:
+        by_unit.setdefault(cols[0], []).append(cols)
+    for unit in sorted(by_unit):
         got = subprocess.run(["systemctl", "cat", unit], capture_output=True, text=True)
         if got.returncode != 0:
-            fail(f"--live：{unit} 没有装在宿主上（systemctl cat 失败）")
+            fail(f"--live：{unit} 没有装在宿主上（systemctl cat 失败）"
+                 f"——它名下的 {len(by_unit[unit])} 条凭证登记一条也核不了")
             continue
-        if kind == "EnvironmentFile":
-            needle = f"EnvironmentFile={source}"
-        else:
-            needle = f"{kind}={name}:{source}"
-        if needle not in got.stdout:
-            fail(f"--live：宿主上的 {unit} 里找不到 `{needle}`，与树里的单元不一致")
-        try:
-            mode = oct(os.stat(source).st_mode & 0o777)[2:].zfill(4)
-        except FileNotFoundError:
-            fail(f"--live：{source} 不存在（{unit} 起不来）")
-            continue
-        expected = next((r[4] for r in rows if r[3] == source), None)
-        if expected and mode != expected:
-            fail(f"--live：{source} 权限是 {mode}，登记表要求 {expected}")
+        for cols in by_unit[unit]:
+            kind, name, source, perms = cols[1], cols[2], cols[3], cols[4]
+            if kind == "EnvironmentFile":
+                needle = f"EnvironmentFile={source}"
+            else:
+                needle = f"{kind}={name}:{source}"
+            if needle not in got.stdout:
+                fail(f"--live：宿主上的 {unit} 里找不到 `{needle}`，与树里的单元不一致")
+            try:
+                mode = oct(os.stat(source).st_mode & 0o777)[2:].zfill(4)
+            except FileNotFoundError:
+                fail(f"--live：{source} 不存在（{unit} 起不来）")
+                continue
+            if perms and mode != perms:
+                fail(f"--live：{source} 权限是 {mode}，登记表要求 {perms}")
     installed = subprocess.run(["systemctl", "list-unit-files", "--no-legend",
                                 "cogneva-backup-offsite.timer"], capture_output=True, text=True)
     if "cogneva-backup-offsite.timer" not in installed.stdout:
@@ -218,5 +225,12 @@ def main():
           + ("；--live 已核宿主实际安装与权限" if LIVE else ""))
 
 
-main()
+try:
+    main()
+except Exception as exc:  # 门自己出错也要印成一句判词，别只留一段 traceback 让读者猜
+    import traceback
+    traceback.print_exc()
+    print(f"HOST CREDENTIAL SURFACE FAIL：门在读面时出错（{type(exc).__name__}: {exc}）"
+          "——这不是凭证面的读数，是门自己坏了", file=sys.stderr)
+    sys.exit(1)
 PYEOF

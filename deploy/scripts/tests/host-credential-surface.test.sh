@@ -14,7 +14,10 @@
 #   4. 单元里用 Environment= 写 RESTIC_PASSWORD 字面量 -> 红；
 #   5. 渲染物里出现 RESTIC_PASSWORD -> 红（业务 Pod 零凭证的边界）；
 #   6. 安装脚本加密的名字与单元要的名字对不上 -> 红；
-#   7. ExecStart 指向的脚本不在树里 -> 红（指针锈了）。
+#   7. ExecStart 指向的脚本不在树里 -> 红（指针锈了）；
+#   8. --live 且单元没装 -> 红并点名，不许崩出 traceback（登记表加列时真的崩过）；
+#   9. --live 且凭证源文件不在 -> 红并点名那个路径；
+#   10. --live 的绿路：单元与登记表一致、权限一致 -> 绿并报出 --live。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,6 +47,7 @@ mirror() {
 mirror
 
 run_gate() { bash "${gate}" "${work}/root" 2>&1; }
+run_gate_live() { bash "${gate}" "${work}/root" --live 2>&1; }
 
 # 1) 真树绿，报数是真读数
 out="$(run_gate)" || fail "真树应当绿，实际红：${out}"
@@ -89,4 +93,54 @@ sed -i 's#^ExecStart=/usr/local/lib/cogneva/backup-offsite-restic.sh#ExecStart=/
 out="$(run_gate)" && fail "ExecStart 指针锈了应当红，实际绿：${out}"
 grep -q "backup-offsite-missing.sh" <<<"${out}" || fail "红时没有点名那个指针：${out}"
 
-echo "host-credential-surface: 7 个用例全绿"
+# 8) --live：单元没装 ⇒ 红并点名，而不是一段 traceback
+#    这一格是回归：登记表从四列长到七列时，--live 按位置解包会抛 ValueError，
+#    门退出 1 但一个字也没判——看起来像红，实则崩了。判据是「有没有点名」。
+mirror
+mkdir -p "${work}/bin-none"
+printf '#!/usr/bin/env bash\nexit 1\n' > "${work}/bin-none/systemctl"
+chmod +x "${work}/bin-none/systemctl"
+out="$(PATH="${work}/bin-none:${PATH}" run_gate_live)" && fail "--live 在单元没装时应当红：${out}"
+grep -q "Traceback" <<<"${out}" && fail "--live 崩出 traceback 而不是判词：${out}"
+grep -q "没有装在宿主上" <<<"${out}" || fail "--live 红时没有点名未安装的单元：${out}"
+grep -q "timer 没有装" <<<"${out}" || fail "--live 没有判定时器缺失：${out}"
+
+# 9) --live：单元装了、但凭证源文件不在 ⇒ 红并点名那个路径（不崩）
+mirror
+mkdir -p "${work}/bin-part"
+cat > "${work}/bin-part/systemctl" <<SHIM
+#!/usr/bin/env bash
+case "\$1" in
+  cat) cat "${work}/root/deploy/systemd/\$2" ;;
+  list-unit-files) echo "cogneva-backup-offsite.timer enabled enabled" ;;
+  *) exit 1 ;;
+esac
+SHIM
+chmod +x "${work}/bin-part/systemctl"
+out="$(PATH="${work}/bin-part:${PATH}" run_gate_live)" && fail "--live 在源文件缺失时应当红：${out}"
+grep -q "Traceback" <<<"${out}" && fail "--live 崩出 traceback 而不是判词：${out}"
+grep -q "不存在" <<<"${out}" || fail "--live 没有点名缺失的凭证源：${out}"
+
+# 10) --live 的绿路：单元内容与登记表一致、源文件权限一致 ⇒ 绿并报 --live
+#     没有这一格，「--live 永远红」与「--live 判对了」同形。
+mirror
+mkdir -p "${work}/creds" "${work}/bin-ok"
+for name in restic-password.cred aws-access-key-id.cred aws-secret-access-key.cred; do
+    : > "${work}/creds/${name}"; chmod 0400 "${work}/creds/${name}"
+done
+: > "${work}/creds/backup-offsite.env"; chmod 0644 "${work}/creds/backup-offsite.env"
+sed -i "s#/etc/cogneva/credentials#${work}/creds#g; s#/etc/cogneva/backup-offsite.env#${work}/creds/backup-offsite.env#g" \
+    "${work}/root/${registry}" "${work}/root/${unit}"
+cat > "${work}/bin-ok/systemctl" <<SHIM
+#!/usr/bin/env bash
+case "\$1" in
+  cat) cat "${work}/root/deploy/systemd/\$2" ;;
+  list-unit-files) echo "cogneva-backup-offsite.timer enabled enabled" ;;
+  *) exit 1 ;;
+esac
+SHIM
+chmod +x "${work}/bin-ok/systemctl"
+out="$(PATH="${work}/bin-ok:${PATH}" run_gate_live)" || fail "--live 绿路应当通过，实际红：${out}"
+grep -q -- "--live 已核" <<<"${out}" || fail "--live 绿时没有报出已核：${out}"
+
+echo "host-credential-surface: 10 个用例全绿"
