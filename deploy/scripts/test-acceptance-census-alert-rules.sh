@@ -27,17 +27,29 @@ CASE="${ROOT}/deploy/k3s/observability/tests/17-prometheusrule-acceptance-census
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
+# 解出来的 promtool 缓存在用户缓存目录：夹具那一支会把这个脚本连跑四五次（真文件一次、
+# 每处改坏各一次），不缓存就是四五次 23MB 的下载，而这条门禁本来就慢。
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/cogneva-promtool"
 promtool="${PROMTOOL:-}"
 if [ -z "${promtool}" ]; then
     if command -v promtool >/dev/null 2>&1; then
         promtool="$(command -v promtool)"
+    elif [ -x "${cache}/usr/bin/promtool" ]; then
+        promtool="${cache}/usr/bin/promtool"
     else
         # 解包而不安装：CI 与开发机的系统状态都不该被一次测试改掉。
         if command -v apt-get >/dev/null 2>&1 && command -v dpkg-deb >/dev/null 2>&1; then
             if (cd "${work}" && apt-get download prometheus >/dev/null 2>&1); then
                 deb="$(ls "${work}"/prometheus_*.deb 2>/dev/null | head -1)"
-                if [ -n "${deb}" ] && dpkg-deb -x "${deb}" "${work}/deb" 2>/dev/null; then
-                    promtool="${work}/deb/usr/bin/promtool"
+                if [ -n "${deb}" ]; then
+                    # 直接解到缓存目录：`dpkg-deb -x` 就是 tar 解开，已存在的目录会合并。
+                    if mkdir -p "${cache}" 2>/dev/null && dpkg-deb -x "${deb}" "${cache}" 2>/dev/null &&
+                        [ -x "${cache}/usr/bin/promtool" ]; then
+                        promtool="${cache}/usr/bin/promtool"
+                    elif dpkg-deb -x "${deb}" "${work}/deb" 2>/dev/null; then
+                        # 缓存写不进去（只读家目录之类）：退回临时目录，慢但这台机器还能跑。
+                        promtool="${work}/deb/usr/bin/promtool"
+                    fi
                 fi
             fi
         fi
