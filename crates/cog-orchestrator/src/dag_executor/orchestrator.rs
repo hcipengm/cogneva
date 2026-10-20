@@ -12,6 +12,7 @@ use super::task_checkpoint::{
     self, checkpoint_task_with_timeout, CheckpointAgents, CheckpointRound, CHECKPOINT_STEP_TIMEOUT,
 };
 use super::task_phase::PhasedTask;
+use cog_core::contract::outcome::GuardrailRefusal;
 use cog_core::{DeadLetterEntry, DeadLetterQueue, RetryAttempt, SuggestedAction};
 
 /// Loop name reported through the background-loop liveness family.
@@ -1372,6 +1373,32 @@ impl DagExecutor {
             },
         )
         .await?;
+        // A refusal names one call and one rule, not a verdict on the task: the
+        // work may still be done by another route. Hand it back to the next
+        // attempt through `input`, which is the part of a task a role reads,
+        // and hand it back once — a second refusal means the rule did not move,
+        // and the ordinary failure path below then gives it no retries.
+        if let Some(refusal) = cog_core::contract::outcome::guardrail_refusal_in(&error) {
+            if !Self::carries_a_refusal(&task.input) {
+                let requeued = self
+                    .requeue_without_charge_store(
+                        task_id,
+                        &error,
+                        None,
+                        None,
+                        &[
+                            TaskStatus::Pending,
+                            TaskStatus::Scheduled,
+                            TaskStatus::Running,
+                        ],
+                        Some(&refusal),
+                    )
+                    .await?;
+                if requeued {
+                    return Ok((true, Vec::new(), false));
+                }
+            }
+        }
         // 环境付账的失败不进任务的预算账：回队列等上游回来，`retry_count`
         // 原样不动。与内存路径同一判据、同一个回投动作（界的说明见
         // [`Self::the_environment_pays`]）。
@@ -1391,6 +1418,7 @@ impl DagExecutor {
                         TaskStatus::Scheduled,
                         TaskStatus::Running,
                     ],
+                    None,
                 )
                 .await?;
             if !requeued {
@@ -1503,6 +1531,7 @@ impl DagExecutor {
                         None,
                         None,
                         &[TaskStatus::Running],
+                        None,
                     )
                     .await
                 {
@@ -1571,6 +1600,28 @@ impl DagExecutor {
         next
     }
 
+    /// Whether this task's input already carries a refusal — i.e. it has
+    /// already been re-dispatched on one. One refusal is the allowance: the
+    /// second one is the rule answering the same question again.
+    fn carries_a_refusal(input: &serde_json::Value) -> bool {
+        input.get("guardrail_refusal").is_some()
+    }
+
+    /// Plant the refusal in the part of the task the next attempt actually
+    /// reads, and clear any backoff: the next attempt is a *different*
+    /// request, so whatever the previous one was waiting for does not apply.
+    ///
+    /// `None` when the input is not an object — there is nowhere to plant it.
+    /// The caller then falls through to the ordinary failure path, which gives
+    /// a refusal no retries at all. A guessed tool or rule would be worse than
+    /// that dead end: the next attempt would be told to avoid the wrong call.
+    fn with_the_refusal_planted(mut next: Task, refusal: &GuardrailRefusal) -> Option<Task> {
+        let map = next.input.as_object_mut()?;
+        map.insert("guardrail_refusal".to_string(), refusal.payload());
+        next.retry_not_before = None;
+        Some(next)
+    }
+
     /// 把一条任务放回队列，**不记重试**。
     ///
     /// 写的条件是 `expected`：这条路上有第二个写者（被执行器完成、被别的副本的
@@ -1588,6 +1639,7 @@ impl DagExecutor {
         cause: Option<UpstreamFailure>,
         retry_after_secs: Option<u64>,
         expected: &[TaskStatus],
+        plant: Option<&GuardrailRefusal>,
     ) -> SFResult<bool> {
         let be = self.fg().expect("store mode");
         let Some(cur) = be.dag_get_task(&self.workspace_id, task_id).await? else {
@@ -1600,6 +1652,15 @@ impl DagExecutor {
             self.retry_matrix
                 .delay_with_hint(&cur.task_type, cur.retry_count, retry_after_secs);
         let next = Self::requeued_without_charge(&cur, error, cause, delay);
+        let next = match plant {
+            Some(refusal) => match Self::with_the_refusal_planted(next, refusal) {
+                Some(planted) => planted,
+                // No object to plant into: leave the row where it is and let
+                // the ordinary failure path judge it.
+                None => return Ok(false),
+            },
+            None => next,
+        };
         if let Err(e) = be
             .dag_transition_task(&self.workspace_id, task_id, expected, &next)
             .await
@@ -2500,6 +2561,41 @@ impl DagExecutor {
                 error: error.clone(),
                 timestamp: chrono::Utc::now(),
             });
+
+        // A refusal names one call and one rule, not a verdict on the task: the
+        // work may still be done by another route. Hand it back to the next
+        // attempt through `input`, which is the part of a task a role reads,
+        // and hand it back once — a second refusal means the rule did not move,
+        // and the ordinary failure path below then gives it no retries.
+        if let Some(refusal) = cog_core::contract::outcome::guardrail_refusal_in(&error) {
+            let already = inner
+                .tasks
+                .get(task_id)
+                .is_some_and(|t| Self::carries_a_refusal(&t.input));
+            if !already {
+                let now = chrono::Utc::now();
+                let task = inner.tasks.get_mut(task_id).expect("task exists");
+                let mut next = task.clone();
+                next.status = TaskStatus::Pending;
+                next.error = Some(error.clone());
+                next.error_cause = None;
+                next.clear_run();
+                next.updated_at = now;
+                if let Some(next) = Self::with_the_refusal_planted(next, &refusal) {
+                    *task = next.clone();
+                    drop(inner);
+                    self.emit_event(cog_core::TaskEvent::TaskRetried {
+                        task_id: task_id.into(),
+                        retry_count: next.retry_count,
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
+                    self.persist_task_fine_grained(&next).await;
+                    self.force_checkpoint().await;
+                    return Ok((true, Vec::new(), false));
+                }
+            }
+        }
 
         // 环境付账的失败不进任务的预算账：回队列等上游回来，`retry_count`
         // 原样不动。等待就是上游自己报的那个时长（界的说明见
@@ -4487,6 +4583,89 @@ mod tests {
         assert_eq!(view.status, TaskStatus::Failed);
         assert_eq!(view.retry_count, 0, "the budget was never spent");
         assert!(view.retry_not_before.is_none());
+    }
+
+    /// A refusal names one call and one rule, not a verdict on the work: the
+    /// task is handed back once with the rule planted where the next role
+    /// reads its request, and its budget is untouched — the task did not fail,
+    /// the call did. The second refusal is the rule answering again, and the
+    /// ordinary deterministic path ends it with no retries.
+    #[tokio::test]
+    async fn a_refusal_is_handed_back_once_with_its_rule() {
+        let dag = DagExecutor::new("ws-refusal".into());
+        let task = Task::new(
+            "t-refusal",
+            TaskType::DagNode,
+            serde_json::json!({ "goal": "ship the change" }),
+        );
+        let task_id = task.id.clone();
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+
+        let reason = cog_core::SFError::Blocked {
+            tool: "git_commit".into(),
+            reason: "this scope may not write to the shared tree".into(),
+            rule: "no-shared-tree-writes".into(),
+        }
+        .to_string();
+
+        let (retried, cancelled, _) = dag.fail_task(&task_id, reason.clone(), None).await.unwrap();
+        assert!(retried, "a refused call must not be read as a failed task");
+        assert!(cancelled.is_empty());
+        let view = dag.get_task(&task_id).await.unwrap();
+        assert_eq!(view.status, TaskStatus::Pending);
+        assert_eq!(
+            view.retry_count, 0,
+            "handing the refusal back spends no budget"
+        );
+        assert!(
+            view.retry_not_before.is_none(),
+            "the next attempt is a different request; the old wait does not apply"
+        );
+        assert_eq!(
+            view.input["goal"], "ship the change",
+            "the request itself must not be rewritten"
+        );
+        let planted = &view.input["guardrail_refusal"];
+        assert_eq!(planted["tool"], "git_commit");
+        assert_eq!(planted["rule"], "no-shared-tree-writes");
+        assert!(
+            !planted["instruction"].as_str().unwrap_or("").is_empty(),
+            "facts without an instruction tell the model what happened, not what to do"
+        );
+
+        dag.schedule_task(&task_id).await.unwrap();
+        let (retried, _, _) = dag.fail_task(&task_id, reason, None).await.unwrap();
+        assert!(!retried, "only one re-dispatch is bought");
+        let view = dag.get_task(&task_id).await.unwrap();
+        assert_eq!(view.status, TaskStatus::Failed);
+        assert_eq!(view.retry_count, 0, "the refusal never spends retry budget");
+    }
+
+    /// A marker that does not carry the rendered fields plants nothing and
+    /// buys no re-dispatch: the safe reading of "refused, details lost" is the
+    /// ordinary deterministic path, never a guessed tool name in the input.
+    #[tokio::test]
+    async fn a_refusal_without_its_fields_is_not_handed_back() {
+        let dag = DagExecutor::new("ws-refusal-opaque".into());
+        let task = Task::new("t-opaque", TaskType::DagNode, serde_json::json!({}));
+        let task_id = task.id.clone();
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+
+        let (retried, _, _) = dag
+            .fail_task(
+                &task_id,
+                "guardrail_blocked: something refused somewhere".into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!retried);
+        let view = dag.get_task(&task_id).await.unwrap();
+        assert_eq!(view.status, TaskStatus::Failed);
+        assert!(view.input.get("guardrail_refusal").is_none());
     }
 
     /// 判定要认的是声明本身，不是它在字符串里的字节位置：reason 被上层错误

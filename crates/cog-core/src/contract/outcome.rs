@@ -33,6 +33,67 @@ pub const DEGENERATE_LOOP_PREFIX: &str = "degenerate_loop";
 /// task type's ordinary retry budget and pay for the same answer again.
 pub const GUARDRAIL_BLOCKED_PREFIX: &str = "guardrail_blocked";
 
+/// A refusal as the layer that will re-dispatch the work needs it: which tool
+/// was refused, by which rule, and what the rule said.
+///
+/// The producer has this typed ([`crate::SFError::Blocked`]) and the consumer
+/// gets a string — the same gap [`UpstreamFailure::named_in`] closes for
+/// refusals that come from an upstream. Without it the dispatch layer can only
+/// decide "do not retry"; with it, the next attempt can be told what not to
+/// propose, which is the one thing that makes a re-dispatch different from a
+/// re-run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardrailRefusal {
+    pub tool: String,
+    pub rule: String,
+    pub reason: String,
+}
+
+impl GuardrailRefusal {
+    /// The payload planted in a task's input, which is the part of the task the
+    /// role actually reads. The instruction rides with the facts: a rule name on
+    /// its own tells the model what happened, not what to do about it.
+    pub fn payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tool": self.tool,
+            "rule": self.rule,
+            "reason": self.reason,
+            "instruction": "A guardrail rule refused this call on the previous attempt. \
+                            Do not propose it again: complete the work by another route, or \
+                            report the rule as the blocker.",
+        })
+    }
+}
+
+/// Recover the refusal a reason declares, in the shape
+/// [`crate::SFError::Blocked`] renders.
+///
+/// `None` when the reason declares the marker but not that shape. The caller
+/// then still treats it as a refusal — no retry — but plants no payload: a
+/// guessed tool or rule would tell the next attempt to avoid the wrong call,
+/// which is worse than telling it nothing.
+pub fn guardrail_refusal_in(reason: &str) -> Option<GuardrailRefusal> {
+    let marker = if reason.starts_with(GUARDRAIL_BLOCKED_PREFIX) {
+        0
+    } else {
+        reason.find(&format!(": {GUARDRAIL_BLOCKED_PREFIX}:"))? + 2
+    };
+    let rest = reason[marker + GUARDRAIL_BLOCKED_PREFIX.len()..].strip_prefix(": ")?;
+    let rest = rest.strip_prefix("Guardrail blocked tool '")?;
+    let (tool, rest) = rest.split_once("': ")?;
+    // Split from the right: the rule is the last field the renderer writes, and
+    // a rule's own reason may itself contain the separator prose.
+    let (body, rule) = rest.strip_suffix(')')?.rsplit_once(" (rule: ")?;
+    if tool.is_empty() || rule.is_empty() {
+        return None;
+    }
+    Some(GuardrailRefusal {
+        tool: tool.to_string(),
+        rule: rule.to_string(),
+        reason: body.to_string(),
+    })
+}
+
 /// Cause carried in-band by a generator that returned an envelope with neither
 /// content nor artifacts, and named no cause of its own.
 ///
@@ -198,6 +259,59 @@ mod tests {
             }
             .to_string()
         ));
+    }
+
+    /// The dispatch layer gets a string, so the fields it needs to re-dispatch
+    /// — which tool, which rule — have to survive the rendering. Losing them
+    /// leaves it able to say "do not retry" and nothing more, which is the
+    /// difference between re-planning and re-running.
+    #[test]
+    fn a_refusal_is_recoverable_from_the_text_the_bus_carries() {
+        let rendered = crate::SFError::Blocked {
+            tool: "git_commit".into(),
+            reason: "this scope may not write to the shared tree".into(),
+            rule: "no-shared-tree-writes".into(),
+        }
+        .to_string();
+        let parsed = guardrail_refusal_in(&rendered).expect("the rendered refusal must parse");
+        assert_eq!(parsed.tool, "git_commit");
+        assert_eq!(parsed.rule, "no-shared-tree-writes");
+        assert_eq!(parsed.reason, "this scope may not write to the shared tree");
+
+        // The wrapper shape is the common one: the error type prepends its own
+        // prose before the declaration reaches the retry decision.
+        let wrapped = format!("Agent execution error: {rendered}");
+        assert_eq!(
+            guardrail_refusal_in(&wrapped).map(|r| r.rule),
+            Some("no-shared-tree-writes".to_string())
+        );
+
+        // A reason that itself contains the separator prose must not steal the
+        // split: the rule is the last field the renderer writes.
+        let nested = crate::SFError::Blocked {
+            tool: "http_request".into(),
+            reason: "blocked by policy (rule: inner) while talking to a mirror".into(),
+            rule: "outer-rule".into(),
+        }
+        .to_string();
+        assert_eq!(
+            guardrail_refusal_in(&nested).map(|r| r.rule),
+            Some("outer-rule".to_string())
+        );
+    }
+
+    /// A marker without the rendered fields yields nothing. The caller still
+    /// treats it as a refusal, so the safe reading is "no payload", never a
+    /// guessed tool name — the next attempt would be told to avoid the wrong
+    /// call.
+    #[test]
+    fn a_refusal_without_its_fields_yields_no_payload() {
+        assert!(guardrail_refusal_in(&format!(
+            "{GUARDRAIL_BLOCKED_PREFIX}: something refused somewhere"
+        ))
+        .is_none());
+        assert!(guardrail_refusal_in("").is_none());
+        assert!(guardrail_refusal_in("nothing declared here").is_none());
     }
 
     /// An empty envelope is a defect in what the generator produced, not a
