@@ -2503,13 +2503,13 @@ data:
               }
               ,
                 {
-                  "name": "live_image_not_on_mainline",
-                  "promql": "max by (node) (image_wiring_yes)",
+                  "name": "live_image_too_old",
+                  "promql": "max by (node) (image_wiring_live_commit_age_seconds)",
                   "condition": {
-                    "less_than": 1.0
+                    "greater_than": 21600.0
                   },
                   "severity": "warning",
-                  "summary": "现网在跑的那一版不是主线那一版：判据值是 {value}，0 表示现网工作负载的镜像 tag 与主线 main 头不是同一个提交。这一格只给判据，成因要分开读——相差多少笔由 image_wiring_behind_commits 给，部署器自己以为上到哪一版由同族序列的 deployer_rev 标签给。「部署器的账落后」与「镜像真的没滚上去」处置相反：前者改部署器的记录，后者要查构建与拉取。读不到时它整条序列都不印而不是印 0，「没量到」与「已对齐」是两个结论，那一半由 live_image_reading_stopped 报。"
+                  "summary": "现网在跑的那一版是六小时以前的提交：判据值是那一版**提交到现在**的秒数（{value}）。这一格刻意不判「现网这一版不是主线尖端」——部署器按小时滚、主线又在持续提交，两者不同步是常态（2026-10-20 六小时窗实测：这一格最大 4684 秒，也就是正常滞后一个多小时），把常态判成失败会让这条告警永远在响、也就再没人看它。判的是流水线连续六小时没把任何新东西送上线。成因分三类，要分开读：主线没有绿的 rev（看 mainline_ci_verdict_failed）、部署器自己判了卡住（看 mainline_not_progressing）、构建或拉取失败。看「差几笔」用 image_wiring_behind_commits，看「部署器以为上到哪一版」用同族序列的 deployer_rev 标签。读不到时它整条序列都不印而不是印 0，那一半由 live_image_reading_stopped 报。"
                 },
                 {
                   "name": "live_image_reading_stopped",
@@ -2518,7 +2518,7 @@ data:
                     "greater_than": 0.0
                   },
                   "severity": "warning",
-                  "summary": "CI/构建/部署面的「滚没滚」读数停了：过去 35 分钟里一次样本都没有，能发出这条告警时 {value} 是 1。这条读数在宿主上从集群读工作负载镜像、从主线仓库读 main 头；它一停，「现网是不是主线那一版」就没有任何东西在判，而面板上「没有告警」与「两边一致」同形。先看那台机器上 kubectl 还连不连得上集群、主线仓库还在不在：读不到时它按契约退 3 且一条序列都不印，正是为了让这一条能红。"
+                  "summary": "CI/构建/部署面的「滚没滚」读数停了：过去 35 分钟里一次样本都没有，能发出这条告警时 {value} 是 1。这条读数在宿主上从集群读工作负载镜像、从主线仓库读 main 头；它一停，「现网那一版是多久以前提交的」就没有任何东西在判，而面板上「没有告警」与「两边一致」同形。先看那台机器上 kubectl 还连不连得上集群、主线仓库还在不在：读不到时它按契约退 3 且一条序列都不印，正是为了让这一条能红。"
                 }
               ]
         },

@@ -1110,6 +1110,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "宿主生产者 `scripts/host/cogneva-image-wiring-reading.sh`（私有仓 brain），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 印出。值说的是「现网工作负载的镜像 tag 与主线 main 头是不是同一个提交」：1 是，0 不是。这一格只给判据，成因由同族序列分开读——差几笔看 `image_wiring_behind_commits`，部署器自己以为上到哪版看 `deployer_rev` 标签。读不到时它整条序列都不印而不是印 0：「对齐了」与「没量到」处置相反，后者由 `image_wiring_reading_stopped` 那条缺席规则接住",
     ),
     (
+        "image_wiring_live_commit_age_seconds",
+        "同一个宿主生产者（`scripts/host/cogneva-image-wiring-reading.sh`，私有仓 brain），同一个 `job=\"cogneva-host-readings\"`。值说的是「现网在跑的那一版是多久以前提交的」，**起算点是提交时刻**，不是它在现网待了多久——里面同时装着流水线从提交走到上市的那段滞后。所以它判的是「流水线多久没把新东西送上线」，不是「现网多久没换」：要后者得用两次采样夹同一个 `live_rev`。拿它冒充「现网没换」会把每一条正常的构建滞后都读成故障；反过来，用「现网这一版不是主线尖端」当失败判也会永远在响（部署按小时滚、主线持续提交，两者不同步是常态）。读不到时整条序列都不印，那一半由 `image_wiring_yes` 的缺席规则接住",
+    ),
+    (
         "cogneva_host_credential_surface_age_seconds",
         "宿主凭证面生产者 `scripts/host/cogneva-credential-surface-state-reading.sh`（私有仓），经聚合器以 `job=\"cogneva-host-readings\"` 暴露。它判的是归档最后一行的年龄：一个读「每拍追加一行」的归档的生产者，停更之后每一拍照样跑成、判词照样是 aligned，只有这一条会往后退",
     ),
