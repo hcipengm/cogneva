@@ -24,6 +24,11 @@
 #      缺装时还要分两种：该单元登记表里那条 EnvironmentFile 的源路径也不在 ⇒ 这个通道
 #      从没配过，名下登记不适用（印一行读数、不判红）；源路径在而单元没了 ⇒ 失败。
 #      不分这一刀，一台没开异地副本的宿主上这条腿恒红，红久了就没人看。
+#   8. 扫描面的分母必须印出来：判词读作「宿主凭证面干净」，而真正扫过的只是本仓
+#      `deploy/systemd` 下那几个文件。`--live` 另外报出「宿主本机单元目录里还有几个
+#      带凭证指令的单元不在本仓」——只印、不判红：它们归各自所在的树判，把它们登记进
+#      公开仓的登记表等于把私有树的名字搬到公开面。目录可由 `COGNEVA_HOST_UNIT_DIRS`
+#      覆盖（测试吃注入的夹具，不吃跑测试那台机器的真机单元表）。
 #
 # 用法：bash deploy/scripts/check-host-credential-surface.sh [仓库根目录] [--live]
 #
@@ -88,10 +93,17 @@ def registry_rows():
     return rows
 
 
+# 扫面里到底有几个单元文件。判词必须把它印出来：这条门的判词读作「宿主凭证面干净」，
+# 而它真正扫过的只是本仓 deploy/systemd 下那几个文件——不印分母，绿的就成了整台宿主。
+# 2026-10-20 实测：本仓 2 个单元、宿主实装 59 个用户单元，门只覆盖其中 1 个持有凭证的。
+scanned = {"units": 0}
+
+
 def unit_directives():
     """单元里出现的凭证指令。返回 (unit, kind, name, source) 四元组表。"""
     found = []
     files = sorted(glob.glob(f"{UNIT_DIR}/*.service") + glob.glob(f"{UNIT_DIR}/*.timer"))
+    scanned["units"] = len(files)
     if not files:
         fail(f"{UNIT_DIR} 下没有单元：判据失效（空集合会让两侧互判恒真）")
         return found
@@ -248,6 +260,55 @@ def check_live(rows):
             fail("--live：cogneva-backup-offsite.timer 没有装（enabled 之前这条腿根本不会跑）")
 
 
+def report_host_scope():
+    """印出宿主实装与本仓扫面的差集。
+
+    本门只判本仓 `deploy/systemd` 里那几个单元；宿主上另外还装着用户单元、会话单元、
+    别的树的单元。它们不在判据内，但必须让读者看见这个差——否则「OK」会被读成
+    「整台宿主上没有凭证面」。不判红：那些单元的归属在其他树（私有仓），把它们登记
+    进一个公开仓的登记表，等于把私有树的名字搬到公开面。这里只给分母。
+    """
+    if not LIVE:
+        return
+    declared = {os.path.basename(p) for p in
+                glob.glob(f"{UNIT_DIR}/*.service") + glob.glob(f"{UNIT_DIR}/*.timer")}
+    # 只看「这台机器上加的」单元目录，不走 `systemctl list-unit-files`：后者会把发行版
+    # 自带的几百个 vendor 单元（app-*、dbus-* 之类）一起算进来，分母因此变成一个与凭证
+    # 面无关的大数，读数就没法读。~/.config 与 /etc/systemd/system 才是本机加的那一层。
+    # 目录可由 `COGNEVA_HOST_UNIT_DIRS`（冒号分隔）覆盖：测试必须吃注入的目录，不能吃
+    # 跑测试那台机器的真机单元表——那会让判词跟着宿主的负载与安装史翻。
+    dirs = [d for d in os.environ.get("COGNEVA_HOST_UNIT_DIRS", "").split(":") if d] or [
+        os.path.expanduser("~/.config/systemd/user"), "/etc/systemd/system"]
+    total, holders = 0, []
+    for d in dirs:
+        files = sorted(glob.glob(f"{d}/*.service") + glob.glob(f"{d}/*.timer"))
+        total += len(files)
+        for path in files:
+            unit = os.path.basename(path)
+            if unit in declared:
+                continue
+            try:
+                text = open(path, encoding="utf-8", errors="replace").read()
+            except OSError as exc:
+                notices.append(f"--live：{path} 读不到（{type(exc).__name__}）——这一格没有分母")
+                continue
+            for lineno, line in enumerate(text.splitlines(), 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                if DIRECTIVE.match(line):
+                    holders.append(f"{unit}:{lineno}")
+                    break
+    if holders:
+        shown = "、".join(holders[:8]) + ("…" if len(holders) > 8 else "")
+        notices.append(
+            f"--live：宿主本机单元 {total} 个，其中 {len(holders)} 个带凭证指令却不在本仓 "
+            f"{UNIT_DIR}（{shown}）——本门不覆盖它们，这些单元的凭证面归各自所在的树判")
+    else:
+        notices.append(
+            f"--live：宿主本机单元 {total} 个（~/.config/systemd/user 与 /etc/systemd/system），"
+            f"除本仓 {UNIT_DIR} 外没有一个带凭证指令——本门覆盖本仓 {scanned['units']} 个")
+
+
 def main():
     rows = registry_rows()
     found = unit_directives()
@@ -264,6 +325,7 @@ def main():
         fail(f"登记表里的这一行在单元里找不到：{item[0]} 的 {item[1]}={item[2]}:{item[3]}")
 
     check_live(rows)
+    report_host_scope()
 
     if failures:
         print("HOST CREDENTIAL SURFACE FAIL：", file=sys.stderr)
@@ -283,7 +345,8 @@ def main():
         print(n)
 
     encrypted = sum(1 for r in rows if r[1] == "LoadCredentialEncrypted")
-    print(f"HOST CREDENTIAL SURFACE OK：{len(rows)} 条登记与 {len({r[0] for r in rows})} 个单元对齐；"
+    print(f"HOST CREDENTIAL SURFACE OK：{len(rows)} 条登记与 {len({r[0] for r in rows})} 个单元对齐"
+          f"（扫面：{UNIT_DIR} 下 {scanned['units']} 个单元文件）；"
           f"其中加密凭证 {encrypted} 个，env 文件 {len(rows) - encrypted} 个；"
           f"渲染物与 chart 里零 RESTIC_PASSWORD"
           + ("；--live 已核宿主实际安装与权限" if LIVE else ""))

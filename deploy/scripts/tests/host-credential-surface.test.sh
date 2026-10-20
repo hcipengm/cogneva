@@ -18,7 +18,10 @@
 #   8a. --live 且单元没装、通道也从没配过 -> 不适用，绿（不判成违约）；
 #   8b. --live 且单元没装、但通道配过 -> 红并点名，不许崩出 traceback（登记表加列时真的崩过）；
 #   9. --live 且凭证源文件不在 -> 红并点名那个路径；
-#   10. --live 的绿路：单元与登记表一致、权限一致 -> 绿并报出 --live。
+#   10. --live 的绿路：单元与登记表一致、权限一致 -> 绿并报出 --live；
+#   1b. 绿的时候要报出扫描面分母（本仓扫了几个单元文件）；
+#   12. --live 点名本仓之外带凭证指令的单元，但**不**判红（它们归各自所在的树判）；
+#   13. 本仓外一个都没有时，读数要说「没有一个」，不与空差集同形。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,13 +51,23 @@ mirror() {
 mirror
 
 run_gate() { bash "${gate}" "${work}/root" 2>&1; }
-run_gate_live() { bash "${gate}" "${work}/root" --live 2>&1; }
+# `--live` 要扫「宿主本机单元目录」。测试不能吃跑测试那台机器的真机目录，否则判词跟着
+# 宿主的安装史翻；统一注入一个空夹具，需要内容的用例自己往里摆。
+mkdir -p "${work}/hostunits"
+run_gate_live() { COGNEVA_HOST_UNIT_DIRS="${work}/hostunits" bash "${gate}" "${work}/root" --live 2>&1; }
 
 # 1) 真树绿，报数是真读数
 out="$(run_gate)" || fail "真树应当绿，实际红：${out}"
 grep -q "HOST CREDENTIAL SURFACE OK" <<<"${out}" || fail "绿时没有报出判词：${out}"
 rows="$(grep -v '^#' "${repo}/${registry}" | grep -v '^unit' | grep -c .)"
 grep -qE "${rows} 条登记" <<<"${out}" || fail "绿时没报出登记条数（表里 ${rows} 行）：${out}"
+
+# 1b) 判词必须报出**扫描面**的分母
+#     绿的是「本仓 deploy/systemd 那几个文件」，不是整台宿主。不印分母，`OK` 会被读成
+#     「宿主上没有凭证面」——2026-10-20 实测本仓 2 个单元、宿主实装 59 个用户单元。
+scanned_files="$(ls "${work}"/root/deploy/systemd/*.service "${work}"/root/deploy/systemd/*.timer 2>/dev/null | wc -l)"
+grep -qE "扫面：deploy/systemd 下 ${scanned_files} 个单元文件" <<<"${out}" \
+    || fail "绿时没报出扫描面分母（应报 ${scanned_files} 个单元文件）：${out}"
 
 # 2) 单元多一条没登记的凭证
 mirror
@@ -181,4 +194,31 @@ grep -q "没有装在宿主上" <<<"${out}" && fail "--live 把「读不到」�
 grep -q "Traceback" <<<"${out}" && fail "--live 崩出 traceback 而不是判词：${out}"
 true
 
-echo "host-credential-surface: 12 个用例全绿"
+# 12) --live 必须把「本仓没覆盖的单元」印出来，且**不**判红
+#     这一格挡的是把判词读成整台宿主：本仓之外装着别的树的单元，它们不在本门判据里。
+#     只印分母与名字、不判红——它们的归属在别的树（私有仓），强行登记进公开仓的登记表
+#     等于把私有树的名字搬到公开面；判它们的那扇门在各自所在的树里。
+mirror
+rm -f "${work}/creds/backup-offsite.env" "${work}/creds"/*.cred
+: > "${work}/creds/backup-offsite.env"; chmod 0644 "${work}/creds/backup-offsite.env"
+for name in restic-password.cred aws-access-key-id.cred aws-secret-access-key.cred; do
+    : > "${work}/creds/${name}"; chmod 0400 "${work}/creds/${name}"
+done
+sed -i "s#/etc/cogneva/credentials#${work}/creds#g; s#/etc/cogneva/backup-offsite.env#${work}/creds/backup-offsite.env#g" \
+    "${work}/root/${registry}" "${work}/root/${unit}"
+printf '[Service]\nEnvironmentFile=/etc/elsewhere/other.env\n' > "${work}/hostunits/cogneva-other-tree.service"
+printf '[Service]\nExecStart=/bin/true\n' > "${work}/hostunits/cogneva-plain.service"
+out="$(PATH="${work}/bin-ok:${PATH}" run_gate_live)" || fail "本仓外的单元不该让本门判红，实际红：${out}"
+grep -q "cogneva-other-tree.service" <<<"${out}" \
+    || fail "--live 没有点名本仓外带凭证指令的单元：${out}"
+grep -q "cogneva-plain.service" <<<"${out}" \
+    && fail "--live 把没有凭证指令的单元也列进了「未覆盖的持有者」：${out}"
+rm -f "${work}/hostunits"/cogneva-other-tree.service "${work}/hostunits"/cogneva-plain.service
+
+# 13) 本仓外一个带凭证指令的单元都没有时，读数要说「没有一个」，不是一个空差集
+#     这两种形状在输出上不能同形：空差集读起来像「这一格没跑」。
+out="$(PATH="${work}/bin-ok:${PATH}" run_gate_live)" || fail "空夹具应当绿：${out}"
+grep -q "除本仓 deploy/systemd 外没有一个带凭证指令" <<<"${out}" \
+    || fail "--live 在差集为空时没有明确报出「没有一个」：${out}"
+
+echo "host-credential-surface: 15 个用例全绿"
