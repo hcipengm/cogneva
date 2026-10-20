@@ -279,6 +279,17 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["dir", "role", "asker"],
         "crates/cog-reflection/src/build_gate/mod.rs",
     ),
+    // How a walk's meeting with another work's claim on the next build ended:
+    // it stood down, or it took the field after its turns. One total would say
+    // a claim was met without saying whether it protected anything, and the
+    // log line that used to carry the difference is gone long before anyone
+    // asks. The panel draws the pair over a window, so this row is read rather
+    // than carried as debt.
+    (
+        "cogneva_build_gate_walk_yield_total",
+        &["dir", "role", "asker", "outcome"],
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
     // What each change's release build cost the host. Every reading carries the
     // change kind, because the decision these panels feed is which kind of
     // change to spend the next build on, and the outcome, because a deploy

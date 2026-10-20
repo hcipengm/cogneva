@@ -294,6 +294,49 @@ pub const BUILD_GATE_RESERVATION_LAPSED_TOTAL: &str = "cogneva_build_gate_reserv
 pub const BUILD_GATE_RESERVATION_RENEW_GAP_SECONDS: &str =
     "cogneva_build_gate_reservation_renew_gap_seconds";
 
+/// Exclusions that met another work's claim on the next build, per asker and
+/// per ending, on a fixed series set with zero included.
+///
+/// The two endings used to live only in the log and in the account's events:
+/// "was the claim honoured, and how often was it overruled" meant grepping a
+/// file that rotates. One total would not answer it either -- a reservation
+/// that nothing honoured and one that protected every turn both read as "the
+/// walk met a claim" -- so the pair is published as one series with an
+/// `outcome` label, and the stand-down rows beside the takeover rows are the
+/// reading an operator can hold against the wait the claim was written to
+/// shorten.
+pub const BUILD_GATE_WALK_YIELD_TOTAL: &str = "cogneva_build_gate_walk_yield_total";
+
+/// How an exclusion's meeting with another work's claim on the next build
+/// ended: it stood down, or it took the field after its turns.
+///
+/// A closed set indexed into the counter, for the same reason the refusal
+/// walls are one: a new ending is an entry here and a row in the reading, not
+/// a second metric name a reader has to know to add up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalkOutcome {
+    Yielded,
+    TookOver,
+}
+
+impl WalkOutcome {
+    const ALL: [WalkOutcome; 2] = [WalkOutcome::Yielded, WalkOutcome::TookOver];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            WalkOutcome::Yielded => "yielded",
+            WalkOutcome::TookOver => "took_over",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|outcome| *outcome == self)
+            .expect("every ending is in ALL")
+    }
+}
+
 /// How often a waiter looks again. Builds run for minutes, so this only decides
 /// how promptly a freed slot is picked up.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -494,6 +537,11 @@ struct Counters {
     /// a work that renews every ten minutes and a work that renews every fifteen
     /// read alike at zero -- this is the reading that separates them.
     renew_gap_seconds: [u64; ASKER_CELLS],
+    /// One count per asker cell and per ending: exclusions that stood down for
+    /// another work's claim on the next build, and the ones that took the field
+    /// over it after their turns. Indexed by [`asker_index`] and
+    /// [`WalkOutcome::index`], so the pair publishes a fixed series set.
+    walk_yield: [[u64; WalkOutcome::ALL.len()]; ASKER_CELLS],
     wait_ms_total: u64,
     wait_ms_max: u64,
     held_ms_total: u64,
@@ -906,6 +954,23 @@ fn readings(
             .with_label("asker", asker_label(asker).to_string()),
         );
     }
+    // The walk's two endings, on the same closed set: every cell and every
+    // ending, at zero if it never happened. A row that appears only once the
+    // counter moves would read "this walk never met a claim" and "this walk
+    // never stood down" the same way, and the second is the one that says a
+    // reservation was written and then ignored.
+    for asker in 0..ASKER_CELLS {
+        for outcome in WalkOutcome::ALL {
+            out.push(
+                label(RawMetric::new(
+                    BUILD_GATE_WALK_YIELD_TOTAL,
+                    c.walk_yield[asker][outcome.index()] as f64,
+                ))
+                .with_label("asker", asker_label(asker).to_string())
+                .with_label("outcome", outcome.as_str().to_string()),
+            );
+        }
+    }
     out.extend([
         label(RawMetric::new(
             BUILD_GATE_WAIT_MS_TOTAL,
@@ -1283,9 +1348,9 @@ pub struct BuildGate {
     /// the first says the wait was honoured, the second says it had its turns
     /// and was overruled. A single "walk meets reservation" count would read the
     /// same whether the reservation ever protected anything or was ignored from
-    /// the first turn.
-    walk_yields: AtomicU64,
-    walk_over_reservation: AtomicU64,
+    /// the first turn. They are two cells of one series rather than two metric
+    /// names, so a reader splits or sums them by the `outcome` label.
+    walk_yield: [[AtomicU64; WalkOutcome::ALL.len()]; ASKER_CELLS],
     /// Claims on the next build that were read past their freshness, one count
     /// per asker cell, indexed by [`asker_index`]. See
     /// [`BUILD_GATE_RESERVATION_LAPSED_TOTAL`].
@@ -1371,8 +1436,7 @@ impl BuildGate {
             wait_ms_max: AtomicU64::new(0),
             held_ms_total: AtomicU64::new(0),
             held_ms_max: AtomicU64::new(0),
-            walk_yields: AtomicU64::new(0),
-            walk_over_reservation: AtomicU64::new(0),
+            walk_yield: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             lapsed_reservations: std::array::from_fn(|_| AtomicU64::new(0)),
             lapsed_counted: Mutex::new(std::collections::HashMap::new()),
             renew_gap_seconds: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -1817,13 +1881,26 @@ impl BuildGate {
 
     /// How many exclusions stood down for another work's reservation, and how
     /// many took the field over one. Read by the tests and by the logs; the
-    /// account carries them as events.
+    /// account carries them as events, and the scrape carries them per asker
+    /// and per ending.
+    ///
+    /// The whole process, summed across asker cells: the callers asking this
+    /// question are the stand-down bound's own tests, and a per-cell answer
+    /// would make each of them restate the cell vocabulary to ask about one
+    /// work.
     pub fn walk_yields(&self) -> u64 {
-        self.walk_yields.load(Ordering::Relaxed)
+        self.walk_yield_total(WalkOutcome::Yielded)
     }
 
     pub fn walk_over_reservation(&self) -> u64 {
-        self.walk_over_reservation.load(Ordering::Relaxed)
+        self.walk_yield_total(WalkOutcome::TookOver)
+    }
+
+    fn walk_yield_total(&self, outcome: WalkOutcome) -> u64 {
+        self.walk_yield
+            .iter()
+            .map(|cells| cells[outcome.index()].load(Ordering::Relaxed))
+            .sum()
     }
 
     /// The counters as they stand, for the reading.
@@ -1841,6 +1918,11 @@ impl BuildGate {
             }),
             renew_gap_seconds: std::array::from_fn(|asker| {
                 self.renew_gap_seconds[asker].load(Ordering::Relaxed)
+            }),
+            walk_yield: std::array::from_fn(|asker| {
+                std::array::from_fn(|outcome| {
+                    self.walk_yield[asker][outcome].load(Ordering::Relaxed)
+                })
             }),
             wait_ms_total: self.wait_ms_total.load(Ordering::Relaxed),
             wait_ms_max: self.wait_ms_max.load(Ordering::Relaxed),
@@ -1934,7 +2016,8 @@ impl BuildGate {
                         let streak = self.note_walk_yield(what);
                         if streak <= WALK_YIELD_LIMIT {
                             drop(file);
-                            self.walk_yields.fetch_add(1, Ordering::Relaxed);
+                            self.walk_yield[asker_index(what)][WalkOutcome::Yielded.index()]
+                                .fetch_add(1, Ordering::Relaxed);
                             self.record_event(walk_yield_event(
                                 what, &claimant, streak, false, &self.dir,
                             ));
@@ -1949,7 +2032,8 @@ impl BuildGate {
                                 "the build field is reserved for {claimant}, so {what} cannot exclude builds this turn"
                             )));
                         }
-                        self.walk_over_reservation.fetch_add(1, Ordering::Relaxed);
+                        self.walk_yield[asker_index(what)][WalkOutcome::TookOver.index()]
+                            .fetch_add(1, Ordering::Relaxed);
                         self.record_event(walk_yield_event(
                             what, &claimant, streak, true, &self.dir,
                         ));
@@ -3179,6 +3263,66 @@ mod tests {
         );
         assert_eq!(gate.walk_yields(), u64::from(WALK_YIELD_LIMIT) + 1);
         assert_eq!(gate.walk_over_reservation(), 1);
+    }
+
+    /// The two endings of a walk are a reading of their own, against the work
+    /// that did it and not against the work that held the claim.
+    ///
+    /// The account already told them apart one event at a time; what was
+    /// missing was the population -- how often a claim protected the work that
+    /// asked, and how often it was overruled after its turns -- and that is
+    /// what a log that rotates cannot answer.
+    #[tokio::test]
+    async fn the_two_endings_of_a_walk_are_published_per_asker_and_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        gate.reserve_build_field("mainline advance");
+
+        for _ in 0..WALK_YIELD_LIMIT {
+            assert!(
+                gate.try_acquire_exclusive("change verification")
+                    .await
+                    .is_err(),
+                "the next build belongs to another work"
+            );
+        }
+        let field = gate
+            .try_acquire_exclusive("change verification")
+            .await
+            .expect("a walk that has stood down for its turns takes the field");
+        drop(field);
+
+        let published = gate.collect_metrics("D5").await.unwrap();
+        let row = |asker: &str, outcome: &str| -> Option<f64> {
+            published
+                .iter()
+                .find(|m| {
+                    m.name == BUILD_GATE_WALK_YIELD_TOTAL
+                        && m.labels.get("asker").map(String::as_str) == Some(asker)
+                        && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+                })
+                .map(|m| m.value)
+        };
+        assert_eq!(
+            row("change_verification", "yielded"),
+            Some(f64::from(WALK_YIELD_LIMIT)),
+            "every turn the walk stood down is one count under the work that did it"
+        );
+        assert_eq!(
+            row("change_verification", "took_over"),
+            Some(1.0),
+            "the field taken after the turns is the other ending, not more of the first"
+        );
+        assert_eq!(
+            row("mainline_advance", "yielded"),
+            Some(0.0),
+            "the row belongs to the walk, not to the work whose claim it met"
+        );
+        assert_eq!(
+            row("mainline_advance", "took_over"),
+            Some(0.0),
+            "a work that never took the field over a claim has no takeover to report"
+        );
     }
 
     /// Every site in this crate that replaces the process image first takes
@@ -4754,6 +4898,10 @@ unevictable 28532736
         expected.extend(std::iter::repeat_n(
             BUILD_GATE_RESERVATION_RENEW_GAP_SECONDS,
             ASKER_CELLS,
+        ));
+        expected.extend(std::iter::repeat_n(
+            BUILD_GATE_WALK_YIELD_TOTAL,
+            ASKER_CELLS * WalkOutcome::ALL.len(),
         ));
         expected.extend([
             BUILD_GATE_WAIT_MS_TOTAL,

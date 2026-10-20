@@ -2078,6 +2078,45 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 51,
+          "title": "Build Gate: Walks That Met a Reservation",
+          "description": "A reservation on the next build names the work that should get it. A walk does not run a build, but it takes the field the reservation is about, so a walk that ignores the claim makes the waiting work's ask a sentence nobody acts on. It stands down for a bounded run of turns and then takes the field anyway, and until this panel existed the difference between the two endings was a log line that had rotated away by the time anyone asked. `yielded` is the claim being honoured; `took_over` is the walk waiting its turns and going ahead, which is the row that says the wait had a limit and reached it. The series set is fixed at one row per asker and per ending with zero published, so a walk that never met a claim reads as zero rather than as absent.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 240
+          },
+          "targets": [
+            {
+              "expr": "sum by (asker, outcome) (increase(cogneva_build_gate_walk_yield_total[6h]))",
+              "legendFormat": "{{asker}} {{outcome}} (6h)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum by (outcome) (increase(cogneva_build_gate_walk_yield_total[6h]))",
+              "legendFormat": "all askers {{outcome}} (6h)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {
