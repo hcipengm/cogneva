@@ -112,6 +112,15 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_build_gate_reservation_lapsed_total",
         "crates/cog-reflection/src/build_gate/mod.rs",
     ),
+    // The same work's other half: how long it waits between rewriting the claim
+    // it already holds. Same publisher for the same reason, and the pair is the
+    // point -- the lapse counter is silent while a claim is alive, so a work
+    // that renews often enough to keep crowding everyone else out is invisible
+    // until the interval between renewals is itself a reading.
+    (
+        "cogneva_build_gate_reservation_renew_gap_seconds",
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
     // The cap family, as far as the rules read it. `unmet` is what says a pass
     // ran and could not reach the cap; the other two are the pair a stalled cap
     // is judged by -- how long the cache has been over it against how long
