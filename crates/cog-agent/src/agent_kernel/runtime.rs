@@ -9,7 +9,8 @@ use tokio::sync::mpsc;
 
 use crate::context::{truncate_to_chars, ContextWindow};
 use crate::hooks::LifecycleHookEvent;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolRegistry, ToolRunError};
+use std::collections::HashMap;
 
 /// A single ReAct iteration: Thought -> Action -> Observation.
 /// ReAct (Reasoning + Acting) is the fundamental cycle each Agent executes:
@@ -1083,6 +1084,14 @@ impl AgentRuntime {
             cog_core::contract::prompt::render_varying_half(&payload),
         ));
 
+        // Guardrail refusals, counted per identical call for this run. A refusal
+        // is a decision about the call as written: the same name and the same
+        // arguments will be refused again, so a second one is not a retry that
+        // might work, it is the loop paying full price for an answer it already
+        // has. Refusals of a *different* call are untouched -- changing the
+        // approach is exactly what the first refusal asks for.
+        let mut blocked_calls: HashMap<String, u32> = HashMap::new();
+
         for iteration in 0..self.config.max_iterations {
             tracing::info!(agent_id = %self.config.agent_id, iteration, "AgentRuntime::run iteration start");
             self.run_iterations = iteration + 1;
@@ -1332,16 +1341,59 @@ impl AgentRuntime {
                     task_id: tid.to_string(),
                     agent_id: self.config.agent_id.clone(),
                 });
-                let result = self
+                let checked = self
                     .tools
-                    .execute_scoped(&tc.name, tc.arguments.clone(), scope.as_ref())
+                    .execute_scoped_checked(&tc.name, tc.arguments.clone(), scope.as_ref())
                     .await;
+
+                // A guardrail refusal is not a tool failure. A failed tool might
+                // succeed on a retry; a refusal cannot, because the rule that
+                // refused it is still there. Handing it back as an ordinary
+                // error invites the loop to retry the identical call until the
+                // iteration budget runs out, which is the most expensive way to
+                // learn nothing. Say so once, then end the run if it repeats.
+                let mut blocked: Option<(String, u32)> = None;
+                let result: Result<serde_json::Value, SFError> = match checked {
+                    Ok(val) => Ok(val),
+                    Err(ToolRunError::Blocked { tool, reason, rule }) => {
+                        let key = format!(
+                            "{}\u{1}{}",
+                            tool,
+                            serde_json::to_string(&tc.arguments).unwrap_or_default()
+                        );
+                        let count = {
+                            let c = blocked_calls.entry(key).or_insert(0);
+                            *c += 1;
+                            *c
+                        };
+                        blocked = Some((rule.clone(), count));
+                        Err(SFError::Agent(
+                            ToolRunError::Blocked { tool, reason, rule }.message(),
+                        ))
+                    }
+                    Err(ToolRunError::Failed(e)) => Err(e),
+                };
 
                 self.state = RuntimeState::Observing;
                 let is_error = result.is_err();
-                let observation = match &result {
-                    Ok(val) => val.clone(),
-                    Err(e) => serde_json::json!({ "error": e.to_string() }),
+                let observation = match (&result, &blocked) {
+                    (Ok(val), _) => val.clone(),
+                    (Err(e), Some((rule, count))) => serde_json::json!({
+                        "error": e.to_string(),
+                        "guardrail_blocked": true,
+                        "rule": rule,
+                        // The loop ends on the second identical refusal, so this
+                        // is the last chance to steer it somewhere useful.
+                        "note": if *count > 1 {
+                            "The identical call was refused again; the run is ending. \
+                             Change the call or report the rule as the blocker."
+                        } else {
+                            "A guardrail rule refused this call. Retrying the identical \
+                             call will be refused the same way; adjust the call or \
+                             report this rule as the blocker."
+                        },
+                    }),
+                    (Err(e), None) => serde_json::json!({ "error": e.to_string() }),
                 };
 
                 observations.push(observation.clone());
@@ -1378,6 +1430,18 @@ impl AgentRuntime {
 
                 if let Some(ref after) = self.hooks.after_tool_call {
                     after(&tc.name, &tc.arguments, &result);
+                }
+
+                if let Some((rule, count)) = blocked {
+                    if count > 1 {
+                        let msg = format!(
+                            "Guardrail rule '{rule}' refused the identical call to '{}' \
+                             more than once; ending the run instead of retrying it again",
+                            tc.name
+                        );
+                        tracing::warn!("{msg}");
+                        return Err(SFError::Agent(msg));
+                    }
                 }
             }
 

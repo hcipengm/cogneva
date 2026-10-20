@@ -31,6 +31,48 @@ pub struct ToolScope {
     pub agent_id: String,
 }
 
+/// Why a tool call produced no value.
+///
+/// A guardrail refusal is kept apart from a tool failure on purpose. A refusal is
+/// a decision: the identical call cannot come out differently, so a loop that
+/// retries it is not exploring, it is paying for the same answer again — each
+/// retry a full round trip with the whole context. A tool failure may be worth
+/// another attempt. Flattening both into one error made the refusal reach the
+/// model as an ordinary tool failure, and ordinary failures are what an agent
+/// loop is built to retry.
+#[derive(Debug)]
+pub enum ToolRunError {
+    Blocked {
+        tool: String,
+        reason: String,
+        rule: String,
+    },
+    Failed(SFError),
+}
+
+impl ToolRunError {
+    /// The text this error carries when it is reported to a caller that has no
+    /// way to tell the two cases apart. Worded exactly as before the split, so
+    /// existing readers of the message (logs, traces) keep working.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Blocked { tool, reason, rule } => {
+                format!(
+                    "Guardrail blocked tool '{}': {} (rule: {})",
+                    tool, reason, rule
+                )
+            }
+            Self::Failed(e) => e.to_string(),
+        }
+    }
+}
+
+impl From<SFError> for ToolRunError {
+    fn from(e: SFError) -> Self {
+        Self::Failed(e)
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: Arc<std::sync::RwLock<HashMap<String, Tool>>>,
@@ -148,6 +190,21 @@ impl ToolRegistry {
         arguments: serde_json::Value,
         scope: Option<&ToolScope>,
     ) -> SFResult<serde_json::Value> {
+        self.execute_scoped_checked(name, arguments, scope)
+            .await
+            .map_err(|e| SFError::Agent(e.message()))
+    }
+
+    /// The same execution, with a guardrail refusal kept distinguishable from a
+    /// tool failure. Callers that decide whether to try again need the
+    /// difference; callers that only report an error keep using
+    /// [`Self::execute_scoped`], whose message is unchanged.
+    pub async fn execute_scoped_checked(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        scope: Option<&ToolScope>,
+    ) -> Result<serde_json::Value, ToolRunError> {
         let tool = self
             .tools
             .read()
@@ -166,10 +223,11 @@ impl ToolRegistry {
             match guardrail.check_tool_call(&tool_call).await {
                 cog_core::GuardResult::Pass => {}
                 cog_core::GuardResult::Block { reason, rule } => {
-                    return Err(cog_core::SFError::Agent(format!(
-                        "Guardrail blocked tool '{}': {} (rule: {})",
-                        name, reason, rule
-                    )));
+                    return Err(ToolRunError::Blocked {
+                        tool: name.to_string(),
+                        reason,
+                        rule,
+                    });
                 }
                 cog_core::GuardResult::Warn { reason, rule } => {
                     tracing::warn!(
@@ -183,7 +241,7 @@ impl ToolRegistry {
         }
 
         match &tool.implementation {
-            ToolImplementation::Native(handler) => (handler)(arguments).await,
+            ToolImplementation::Native(handler) => (handler)(arguments).await.map_err(Into::into),
             ToolImplementation::Wasm {
                 plugin_id,
                 export_name,
@@ -195,16 +253,16 @@ impl ToolRegistry {
                     match registry.fetch_by_id(plugin_id).await {
                         Ok(b) => b,
                         Err(e) => {
-                            return Err(cog_core::SFError::Agent(format!(
+                            return Err(ToolRunError::Failed(cog_core::SFError::Agent(format!(
                                 "Failed to fetch plugin '{}': {}",
                                 plugin_id, e
-                            )));
+                            ))));
                         }
                     }
                 } else {
-                    return Err(cog_core::SFError::Agent(
+                    return Err(ToolRunError::Failed(cog_core::SFError::Agent(
                         "PluginRegistry not configured for WASM tool".into(),
-                    ));
+                    )));
                 };
                 let req = SandboxRequest {
                     task_id: scope
@@ -226,10 +284,10 @@ impl ToolRegistry {
             }
             ToolImplementation::Shell(op) => {
                 if scope.is_none() && self.require_identity {
-                    return Err(cog_core::SFError::Agent(format!(
+                    return Err(ToolRunError::Failed(cog_core::SFError::Agent(format!(
                         "tool '{name}' requires task identity (require_tool_identity=true); \
                          call through prompt_for_task"
-                    )));
+                    ))));
                 }
                 let backend = self.sandbox_backend.as_ref().ok_or_else(|| {
                     cog_core::SFError::Agent("SandboxBackend not configured for shell tool".into())
@@ -244,7 +302,9 @@ impl ToolRegistry {
                                     cog_core::SFError::Validation("command required".into())
                                 })?;
                             if command.trim().is_empty() {
-                                return Err(cog_core::SFError::Validation("empty command".into()));
+                                return Err(ToolRunError::Failed(cog_core::SFError::Validation(
+                                    "empty command".into(),
+                                )));
                             }
                             SandboxPayload::Command {
                                 command: command.to_string(),
@@ -307,14 +367,14 @@ impl ToolRegistry {
                         if code == 0 {
                             Ok(serde_json::json!({ "content": stdout }))
                         } else {
-                            Err(cog_core::SFError::IO(stderr))
+                            Err(cog_core::SFError::IO(stderr).into())
                         }
                     }
                     cog_core::ShellOp::WriteFile => {
                         if code == 0 {
                             Ok(serde_json::json!({ "success": true }))
                         } else {
-                            Err(cog_core::SFError::IO(stderr))
+                            Err(cog_core::SFError::IO(stderr).into())
                         }
                     }
                 }
@@ -416,6 +476,82 @@ mod tests {
                 body: format!("{} {}", req.method, req.url).into_bytes(),
             })
         }
+    }
+
+    /// Refuses every tool call under one rule, so the refusal path can be
+    /// exercised without a real policy.
+    #[derive(Debug)]
+    struct BlockAll;
+
+    #[async_trait::async_trait]
+    impl cog_core::Guardrail for BlockAll {
+        async fn check_input(&self, _messages: &[cog_core::Message]) -> cog_core::GuardResult {
+            cog_core::GuardResult::Pass
+        }
+        async fn check_output(&self, _response: &str) -> cog_core::GuardResult {
+            cog_core::GuardResult::Pass
+        }
+        async fn check_tool_call(&self, tool: &cog_core::ToolCall) -> cog_core::GuardResult {
+            cog_core::GuardResult::Block {
+                reason: format!("{} is on the list", tool.name),
+                rule: "test-rule".into(),
+            }
+        }
+    }
+
+    /// A refusal must be readable as a refusal. Flattened into an ordinary
+    /// error it is indistinguishable from a tool that failed, and an agent
+    /// loop retries failures — the retries are what cost money for nothing.
+    #[tokio::test]
+    async fn a_guardrail_refusal_is_not_a_tool_failure() {
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hit = ran.clone();
+        let mut registry = ToolRegistry::new();
+        registry.set_guardrail(Arc::new(BlockAll));
+        cog_core::ToolRegistry::register(
+            &registry,
+            Tool {
+                name: "counted".into(),
+                description: "counts its own executions".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                implementation: ToolImplementation::Native(Arc::new(move |_args| {
+                    let hit = hit.clone();
+                    Box::pin(async move {
+                        hit.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(serde_json::json!({ "ran": true }))
+                    })
+                })),
+            },
+        );
+
+        match registry
+            .execute_scoped_checked("counted", serde_json::json!({}), None)
+            .await
+        {
+            Err(ToolRunError::Blocked { tool, rule, .. }) => {
+                assert_eq!(tool, "counted");
+                assert_eq!(rule, "test-rule");
+            }
+            other => panic!("expected a Blocked refusal, got {other:?}"),
+        }
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the tool body must not run behind a refusal"
+        );
+
+        // Callers that only report an error keep the message they had before
+        // the split, so existing log and trace readers are unaffected.
+        let flat = registry
+            .execute("counted", serde_json::json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            flat.contains("Guardrail blocked tool 'counted': counted is on the list"),
+            "unexpected message: {flat}"
+        );
+        assert!(flat.contains("test-rule"), "unexpected message: {flat}");
     }
 
     #[tokio::test]
