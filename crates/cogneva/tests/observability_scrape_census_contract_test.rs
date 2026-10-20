@@ -374,7 +374,14 @@ const GAPS_AT_SCRAPE_CENSUS: usize = 13;
 /// total, which is the population reading. The row stays in the produced table,
 /// because a panel reading a series is exactly what that table licenses. Eight
 /// again, and the eighth is still the prose-versus-query distinction above.
-const REGISTERED_BUT_UNREAD_AT_CENSUS: usize = 8;
+///
+/// Seven on 2026-10-20: `cogneva_signal_watcher_running` acquired its first
+/// reader. The outlet rule reads it to tell "nobody is listening to alerts"
+/// from "someone in the cluster is", which is the question the family was
+/// published for and the reason the dashboard comment above describes it as
+/// registered ahead of a reader. The rest of the family is still counted here;
+/// only the running flag left. The row also stays in the produced table.
+const REGISTERED_BUT_UNREAD_AT_CENSUS: usize = 7;
 
 #[test]
 fn every_series_a_build_can_render_is_on_a_face_or_has_a_verdict() {
