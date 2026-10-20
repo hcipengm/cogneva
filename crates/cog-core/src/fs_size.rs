@@ -350,24 +350,24 @@ mod tests {
         write(&root.join("debug/incremental/obj"), 30);
         write(&root.join("tmp/scratch"), 4);
 
-        let files = dir_files(&root, 2, &[]).unwrap();
+        let files = dir_files(root, 2, &[]).unwrap();
         assert_eq!(files.len(), 3);
         let per_layer: BTreeMap<String, u64> = files.iter().fold(BTreeMap::new(), |mut acc, f| {
             *acc.entry(f.layer.clone()).or_default() += f.len;
             acc
         });
-        assert_eq!(per_layer, dir_layers(&root, 2, &[]).unwrap());
+        assert_eq!(per_layer, dir_layers(root, 2, &[]).unwrap());
         assert_eq!(
             files.iter().map(|f| f.len).sum::<u64>(),
-            dir_size_bytes(&root, &[]).unwrap()
+            dir_size_bytes(root, &[]).unwrap()
         );
         for file in &files {
-            assert!(file.path.starts_with(&root), "{file:?}");
+            assert!(file.path.starts_with(root), "{file:?}");
             assert!(file.modified.is_some(), "{file:?}");
         }
         // The same exclusions and the same symlink rules as the totals.
         let exclude = vec![root.join("tmp")];
-        assert_eq!(dir_files(&root, 2, &exclude).unwrap().len(), 2);
+        assert_eq!(dir_files(root, 2, &exclude).unwrap().len(), 2);
     }
 
     /// The total is the sum of the layers: one walk answers both readings, so a
@@ -382,15 +382,15 @@ mod tests {
         write(&root.join("release/deps/lib.rlib"), 7);
         write(&root.join("CACHEDIR.TAG"), 1);
 
-        let layers = dir_layers(&root, 1, &[]).unwrap();
+        let layers = dir_layers(root, 1, &[]).unwrap();
         assert_eq!(layers.get("debug"), Some(&130));
         assert_eq!(layers.get("release"), Some(&7));
         assert_eq!(layers.get(ROOT_LAYER), Some(&1));
         assert_eq!(
-            dir_size_bytes(&root, &[]).unwrap(),
+            dir_size_bytes(root, &[]).unwrap(),
             layers.values().sum::<u64>()
         );
-        assert_eq!(dir_size_bytes(&root, &[]).unwrap(), 138);
+        assert_eq!(dir_size_bytes(root, &[]).unwrap(), 138);
     }
 
     /// The depth is what separates a profile directory's own files from the
@@ -403,15 +403,15 @@ mod tests {
         write(&root.join("debug/cogneva"), 40);
         write(&root.join("debug/incremental/obj"), 30);
 
-        let shallow = dir_layers(&root, 1, &[]).unwrap();
+        let shallow = dir_layers(root, 1, &[]).unwrap();
         assert_eq!(shallow.get("debug"), Some(&170));
 
-        let deep = dir_layers(&root, 2, &[]).unwrap();
+        let deep = dir_layers(root, 2, &[]).unwrap();
         assert_eq!(deep.get("debug/deps"), Some(&100));
         assert_eq!(deep.get("debug/incremental"), Some(&30));
         assert_eq!(deep.get("debug"), Some(&40));
         // A deeper request that the tree cannot fill stops at what exists.
-        assert_eq!(dir_layers(&root, 9, &[]).unwrap(), deep);
+        assert_eq!(dir_layers(root, 9, &[]).unwrap(), deep);
     }
 
     /// A file directly in the measured directory belongs to the directory
@@ -421,7 +421,7 @@ mod tests {
         let root = scratch("rootfile");
         let root = root.path();
         write(&root.join("CACHEDIR.TAG"), 5);
-        let layers = dir_layers(&root, 2, &[]).unwrap();
+        let layers = dir_layers(root, 2, &[]).unwrap();
         assert_eq!(layers.len(), 1);
         assert_eq!(layers.get(ROOT_LAYER), Some(&5));
     }
@@ -437,10 +437,10 @@ mod tests {
         write(&root.join("nested/b"), 900);
         let exclude = vec![root.join("nested")];
 
-        let layers = dir_layers(&root, 1, &exclude).unwrap();
+        let layers = dir_layers(root, 1, &exclude).unwrap();
         assert_eq!(layers.get("kept"), Some(&10));
         assert_eq!(layers.get("nested"), None);
-        assert_eq!(dir_size_bytes(&root, &exclude).unwrap(), 10);
+        assert_eq!(dir_size_bytes(root, &exclude).unwrap(), 10);
     }
 
     /// A symlink is not a file to measure and not a directory to walk: its
@@ -455,10 +455,10 @@ mod tests {
         write(&outside.join("big"), 4096);
         write(&root.join("real"), 3);
         std::os::unix::fs::symlink(outside.join("big"), root.join("link-to-file")).unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("link-to-dir")).unwrap();
-        std::os::unix::fs::symlink(&root, root.join("link-to-self")).unwrap();
+        std::os::unix::fs::symlink(outside, root.join("link-to-dir")).unwrap();
+        std::os::unix::fs::symlink(root, root.join("link-to-self")).unwrap();
 
-        let layers = dir_layers(&root, 1, &[]).unwrap();
+        let layers = dir_layers(root, 1, &[]).unwrap();
         assert_eq!(layers.get(ROOT_LAYER), Some(&3), "{layers:?}");
         assert_eq!(layers.len(), 1, "{layers:?}");
     }
@@ -480,7 +480,7 @@ mod tests {
         )
         .unwrap();
 
-        let files = dir_files(&root, 2, &[]).unwrap();
+        let files = dir_files(root, 2, &[]).unwrap();
         assert_eq!(files.len(), 3, "every name is reported: {files:?}");
         let counted = files.iter().find(|f| !f.alias).unwrap();
         assert_eq!(
@@ -499,8 +499,8 @@ mod tests {
         assert_eq!(alias.links, Some(2));
 
         assert_eq!(counted_bytes(&files), 105);
-        assert_eq!(dir_size_bytes(&root, &[]).unwrap(), 105);
-        let layers = dir_layers(&root, 2, &[]).unwrap();
+        assert_eq!(dir_size_bytes(root, &[]).unwrap(), 105);
+        let layers = dir_layers(root, 2, &[]).unwrap();
         assert_eq!(layers.get("debug/deps"), Some(&105));
         // The layer the other name is in still exists in the reading, holding
         // the zero bytes it has: a layer that vanishes cannot be told from one
@@ -528,7 +528,7 @@ mod tests {
             write(&closed.join("b"), 1);
             fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
             let denied = fs::read_dir(&closed).is_err();
-            let result = dir_size_bytes(&root, &[]);
+            let result = dir_size_bytes(root, &[]);
             fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).unwrap();
             if denied {
                 assert!(result.is_err(), "{result:?}");
@@ -564,7 +564,7 @@ mod tests {
         write(&old, 10);
         set_modified(&old, now - std::time::Duration::from_secs(2 * 3600));
 
-        let files = dir_files(&root, 2, &[]).unwrap();
+        let files = dir_files(root, 2, &[]).unwrap();
         let counts = recently_written_totals(&files, now_secs, 3600);
         assert_eq!(counts.get("debug/deps"), Some(&2));
         assert_eq!(
