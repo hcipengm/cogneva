@@ -138,6 +138,11 @@ struct RoleCalibration {
     /// told only the total cannot tell a role whose ceiling is too low from one
     /// whose work is simply not answering.
     exhausted_no_deliverable_runs: u64,
+    /// Runs of this role that ended because a guardrail rule refused their
+    /// calls. Kept per role because the answer an operator needs — which role
+    /// keeps meeting a rule, and whether the rule is the one that role works
+    /// under — is a question about that role, not about the process.
+    refused_runs: u64,
 }
 
 /// How an agent run ended.
@@ -159,6 +164,15 @@ pub enum RunOutcome {
     DeliveredAfterExhaustion,
     /// The iteration budget ran out before an answer was written.
     BudgetExhausted,
+    /// A guardrail rule refused a tool call and the run's refusal allowance was
+    /// spent, so the run stopped without an answer.
+    ///
+    /// Apart from the two budget endings on purpose: those say the role needed
+    /// more turns, and the cure is a larger ceiling. This one says a rule stood
+    /// in the way, and buying more turns would only buy the same refusal again.
+    /// Counted per role because the rule that refuses is usually the role's, and
+    /// a total across roles cannot say which one keeps meeting it.
+    Refused,
 }
 
 impl RunOutcome {
@@ -288,6 +302,9 @@ impl AgentObservable {
         if outcome == RunOutcome::BudgetExhausted {
             calibration.exhausted_no_deliverable_runs += 1;
         }
+        if outcome == RunOutcome::Refused {
+            calibration.refused_runs += 1;
+        }
     }
 
     /// Note that a run's iteration budget was spent, at the moment the budget is
@@ -399,6 +416,17 @@ impl Observable for AgentObservable {
                 RawMetric::new(
                     "agent_iteration_budget_exhausted_no_deliverable",
                     calibration.exhausted_no_deliverable_runs as f64,
+                )
+                .with_label("role", role),
+            );
+            // A sibling series, not a label on either of the two above: those
+            // count runs that needed more turns, this one counts runs a rule
+            // stopped, and raising a ceiling answers only the first. Reported
+            // per role because that is the question an operator asks of it.
+            metrics.push(
+                RawMetric::new(
+                    "agent_guardrail_refused_runs",
+                    calibration.refused_runs as f64,
                 )
                 .with_label("role", role),
             );
@@ -933,6 +961,39 @@ mod tests {
         );
     }
 
+    /// A run a rule stopped is counted where the per-role reader looks, and
+    /// under its own name: a role that keeps meeting a guardrail is a different
+    /// finding from one whose ceiling is too low, and the cure is different
+    /// too — raising the ceiling answers the second and only re-buys the first.
+    #[tokio::test]
+    async fn a_run_stopped_by_a_rule_is_counted_per_role_under_its_own_name() {
+        let o = AgentObservable::new();
+        o.record_run("writer", RunOutcome::Refused, 2, 3, 2);
+        o.record_run("writer", RunOutcome::Refused, 2, 3, 2);
+        o.record_run("planner", RunOutcome::Delivered, 4, 9, 3);
+        // A budget ending must not land on this series: the two are different
+        // findings and a reader that cannot separate them cannot act on either.
+        o.record_run("planner", RunOutcome::BudgetExhausted, 10, 21, 12);
+
+        let metrics = o.collect_metrics("D1").await.expect("collect_metrics");
+        let read = |role: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == "agent_guardrail_refused_runs"
+                        && m.labels.get("role").map(String::as_str) == Some(role)
+                })
+                .map(|m| m.value)
+                .unwrap_or(-1.0)
+        };
+        assert_eq!(read("writer"), 2.0);
+        assert_eq!(
+            read("planner"),
+            0.0,
+            "a role that never met a rule must read zero, not be missing"
+        );
+    }
+
     /// 这一组就是这个 observable 的全部产出。多一个名字就多一条没人读的序列，
     /// 少一个名字就是一条静默消失的读数，两种都要在这里响。
     #[tokio::test]
@@ -954,6 +1015,7 @@ mod tests {
             names,
             vec![
                 "agent_budget_exhausted_count",
+                "agent_guardrail_refused_runs",
                 "agent_iteration_budget_exhausted",
                 "agent_iteration_budget_exhausted_no_deliverable",
                 "agent_run_count",

@@ -938,6 +938,13 @@ impl AgentRuntime {
         ) else {
             return;
         };
+        // A refusal is the rule's verdict on a call, not evidence about the
+        // skill: the work may have been right and the tool simply not allowed
+        // in this scope. Scoring it would charge the skill for someone else's
+        // rule, the same way an upstream outage would.
+        if ending == crate::observable::RunOutcome::Refused {
+            return;
+        }
         let delivered = ending.delivered();
         let outcome = cog_core::SkillOutcome {
             skill_id: skill.skill_id.clone(),
@@ -1399,12 +1406,12 @@ impl AgentRuntime {
                 // buy — a different call — and the policy caps how many of
                 // those turns the run pays for: none under `Stop`, one under
                 // `OneAdjustment`.
-                let mut blocked: Option<(String, u32)> = None;
+                let mut blocked: Option<(String, String, String, u32)> = None;
                 let result: Result<serde_json::Value, SFError> = match checked {
                     Ok(val) => Ok(val),
                     Err(ToolRunError::Blocked { tool, reason, rule }) => {
                         refusals += 1;
-                        blocked = Some((rule.clone(), refusals));
+                        blocked = Some((tool.clone(), reason.clone(), rule.clone(), refusals));
                         Err(SFError::Blocked { tool, reason, rule })
                     }
                     Err(ToolRunError::Failed(e)) => Err(e),
@@ -1414,7 +1421,7 @@ impl AgentRuntime {
                 let is_error = result.is_err();
                 let observation = match (&result, &blocked) {
                     (Ok(val), _) => val.clone(),
-                    (Err(e), Some((rule, count))) => {
+                    (Err(e), Some((_tool, _reason, rule, count))) => {
                         let ends = match self.refusal_policy {
                             RefusalPolicy::Stop => true,
                             RefusalPolicy::OneAdjustment => *count > 1,
@@ -1476,13 +1483,13 @@ impl AgentRuntime {
                     after(&tc.name, &tc.arguments, &result);
                 }
 
-                if let Some((rule, count)) = blocked {
+                if let Some((tool, reason, rule, count)) = blocked {
                     let ends = match self.refusal_policy {
                         RefusalPolicy::Stop => true,
                         RefusalPolicy::OneAdjustment => count > 1,
                     };
                     if ends {
-                        let reason = match self.refusal_policy {
+                        let note = match self.refusal_policy {
                             RefusalPolicy::Stop => {
                                 "the run ended at the first refusal instead of paying for \
                                  another turn"
@@ -1494,12 +1501,22 @@ impl AgentRuntime {
                                     .to_string()
                             }
                         };
+                        // The rule's own message rides along. Whoever re-dispatches
+                        // this work reads the reason and plants it into the next
+                        // attempt's input, and "the run ended after a second
+                        // refusal" says nothing about why this call was refused —
+                        // the only part the next attempt can act on.
                         let err = SFError::Blocked {
-                            tool: tc.name.clone(),
-                            reason,
+                            tool,
+                            reason: format!("{reason} ({note})"),
                             rule,
                         };
                         tracing::warn!("{err}");
+                        // Count the ending where the per-role reader looks for it.
+                        // Ending on a refusal used to leave the run uncounted
+                        // altogether, so the runs a guardrail stopped were visible
+                        // only as scattered tool events.
+                        self.note_run_ending(crate::observable::RunOutcome::Refused, iteration);
                         return Err(err);
                     }
                 }
@@ -3839,6 +3856,12 @@ mod tests {
             err.contains("instead of paying for another turn"),
             "the end must name the refusal, not a budget: {err}"
         );
+        assert!(
+            err.contains("not allowed here"),
+            "the rule's own message must survive the ending: whoever re-dispatches \
+             this work plants it into the next attempt, and the policy prose alone \
+             does not say why the call was refused: {err}"
+        );
         assert_eq!(ran, 0, "the tool body must never run behind a refusal");
         assert_eq!(calls, 1, "one turn to propose the call, and no second");
     }
@@ -3865,6 +3888,27 @@ mod tests {
         assert_eq!(
             calls, 2,
             "one turn to propose the call, one to re-propose it, and no third"
+        );
+
+        // The ending has to land where the per-role reader looks, or the only
+        // trace of a run a rule stopped is a scattering of tool events.
+        use cog_core::Observable as _;
+        let metrics = crate::observable::global_observable()
+            .collect_metrics("")
+            .await
+            .expect("collect_metrics");
+        let refused = metrics
+            .iter()
+            .find(|m| {
+                m.name == "agent_guardrail_refused_runs"
+                    && m.labels.get("role").map(String::as_str)
+                        == Some("blocked-tool-OneAdjustment")
+            })
+            .map(|m| m.value)
+            .unwrap_or(-1.0);
+        assert_eq!(
+            refused, 1.0,
+            "a run that ended on a refusal must be counted against its role"
         );
     }
 
