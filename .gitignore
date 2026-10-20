@@ -15,3 +15,7 @@ management_plan.yaml
 # Self-evolution runtime artifacts written by tests/local runs (sandbox uses a PVC)
 evolution-changes/
 evolution-patches/
+
+# Coverage counters dropped by instrumented test runs (machine-local)
+*.profraw
+*.profdata
