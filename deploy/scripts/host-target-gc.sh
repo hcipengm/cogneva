@@ -59,12 +59,23 @@
 set -euo pipefail
 
 readonly CARGO_CACHE_TAG_SIGNATURE='Signature: 8a477f597d28d172789f06886806bc55'
-readonly TIERS='stale incremental coverage profile'
+readonly TIERS='stale generations incremental coverage profile'
 
 work_root="${COGNEVA_HOST_WORK_ROOT:-}"
 delete_under="${COGNEVA_TARGET_GC_DELETE_UNDER:-}"
 trigger_pct="${COGNEVA_TARGET_GC_TRIGGER_PCT:-70}"
 floor_pct="${COGNEVA_TARGET_GC_FLOOR_PCT:-50}"
+# The full-rebuild tier does not share the ordinary trigger. What it frees is
+# the current artifacts, so the run pays for it with a cold rebuild of every tree
+# it touches -- and the rebuild refills the disk at the rate the tree was growing
+# anyway, which makes an early firing a recurring cost rather than a one-off.
+# Gating it at its own water level separates "keep the disk off the floor" from
+# "give up the cache", and each decision gets the reading it deserves.
+profile_trigger_pct="${COGNEVA_TARGET_GC_PROFILE_TRIGGER_PCT:-85}"
+# Superseded generations: same stem, older metadata hash. Cargo writes one per
+# rebuild and never removes the previous one, so they accumulate without bound
+# while the newest one is the only generation a build can hit.
+generations_keep="${COGNEVA_TARGET_GC_GENERATIONS_KEEP:-1}"
 stale_days="${COGNEVA_TARGET_GC_STALE_DAYS:-3}"
 dry_run="${COGNEVA_TARGET_GC_DRY_RUN:-0}"
 writer_processes="${COGNEVA_TARGET_GC_WRITER_PROCESSES:-cargo rustc rustdoc cc gcc g++ clang clang++ ld lld mold as make ninja cmake}"
@@ -135,6 +146,16 @@ esac
 case "${stale_days}" in
 *[!0-9]*) die "COGNEVA_TARGET_GC_STALE_DAYS is a whole number of days, got ${stale_days}" ;;
 esac
+case "${profile_trigger_pct}" in
+*[!0-9]*) die "COGNEVA_TARGET_GC_PROFILE_TRIGGER_PCT is a percentage, got ${profile_trigger_pct}" ;;
+esac
+[ "${profile_trigger_pct}" -ge "${trigger_pct}" ] ||
+    die "the profile tier's trigger (${profile_trigger_pct}%) must sit at or above the ordinary trigger (${trigger_pct}%): the tier that costs a full rebuild is the one that needs the higher level, not a lower one"
+case "${generations_keep}" in
+*[!0-9]*) die "COGNEVA_TARGET_GC_GENERATIONS_KEEP is a whole number of generations, got ${generations_keep}" ;;
+esac
+[ "${generations_keep}" -ge 1 ] ||
+    die "COGNEVA_TARGET_GC_GENERATIONS_KEEP=${generations_keep}: keeping zero generations deletes the artifacts the next build needs, which is the full-rebuild tier wearing a cheaper name"
 
 # --- readings ----------------------------------------------------------------
 
@@ -398,6 +419,99 @@ tier_stale() {
     find "$1" -depth -type d -empty -delete 2>/dev/null || true
 }
 
+# Superseded generations: cargo names an artifact <stem>-<16 hex>, where the hex
+# is the metadata hash. A rebuild that changes anything upstream of the artifact
+# picks a new hash and writes a new file; the old one stays forever and no build
+# can hit it again. Keeping the newest `generations_keep` per stem is what makes
+# this a release rather than a rebuild: it never touches the generation a build
+# would use, only the ones it cannot.
+#
+# The newest by mtime is what a build most recently produced, and that is the
+# only ordering available without reading every fingerprint. Where it disagrees
+# with the hash a fingerprint still points at, the cost is a rebuild of that one
+# crate -- bounded, and cheaper than leaving the whole set in place.
+generation_plan() { # target -> "size<TAB>path" for the files a run would remove
+    find "$1" -maxdepth 3 -type d \( -name deps -o -name examples \) -prune -print0 2>/dev/null |
+        xargs -0 -r -I{} find {} -maxdepth 1 -type f -printf '%T@\t%s\t%p\n' 2>/dev/null |
+        LC_ALL=C awk -F'\t' -v keep="${generations_keep}" '
+            # One generation is the hash, not the file: an artifact comes with a
+            # `.d` sibling and a `.rlib` (or `.rmeta`, `.so`) of the same hash,
+            # and they are the same generation. Ranking files would keep one of
+            # them and delete the rest of what the newest generation needs --
+            # the opposite of what this tier is for.
+            {
+                n = split($3, part, "/")
+                dir = ""
+                for (i = 1; i < n; i++) dir = dir (i > 1 ? "/" : "") part[i]
+                base = part[n]
+                sub(/\.[^.\/]*$/, "", base)
+                at = 0
+                for (i = 1; i <= length(base); i++) if (substr(base, i, 1) == "-") at = i
+                if (at <= 1) next
+                stem = substr(base, 1, at - 1)
+                h = substr(base, at + 1)
+                if (length(h) != 16 || h ~ /[^0-9a-f]/) next
+                gen = dir SUBSEP stem SUBSEP h
+                key = dir SUBSEP stem
+                if (!(gen in oldest) || $1 > oldest[gen]) oldest[gen] = $1
+                genkey[gen] = key
+                files[gen, ++count[gen]] = $2 "\t" $3
+            }
+            END {
+                # The newest `keep` generations per stem are the ones the next
+                # build can still hit. Everything else in that stem is free.
+                # Equal timestamps are broken by hash so two runs over the same
+                # tree agree on which one they keep.
+                for (gen in oldest) {
+                    key = genkey[gen]
+                    t = oldest[gen]
+                    pos = 0
+                    for (i = 1; i <= held[key]; i++)
+                        if (t > score[key, i] || (t == score[key, i] && gen > who[key, i])) { pos = i; break }
+                    if (pos == 0) pos = held[key] + 1
+                    if (pos > keep) continue
+                    last = held[key] < keep ? held[key] : keep - 1
+                    for (i = last; i >= pos; i--) {
+                        score[key, i + 1] = score[key, i]
+                        who[key, i + 1] = who[key, i]
+                    }
+                    score[key, pos] = t
+                    who[key, pos] = gen
+                    if (held[key] < keep) held[key]++
+                    else { delete score[key, keep + 1]; delete who[key, keep + 1] }
+                }
+                for (gen in oldest) {
+                    key = genkey[gen]
+                    keeps = 0
+                    for (i = 1; i <= held[key]; i++) if (who[key, i] == gen) keeps = 1
+                    if (keeps) continue
+                    for (i = 1; i <= count[gen]; i++) print files[gen, i]
+                }
+            }'
+}
+
+tier_generations() {
+    local target="$1" plan count size
+    plan="$(mktemp)"
+    generation_plan "${target}" >"${plan}"
+    read -r count size < <(awk -F'\t' '{ n++; s += $1 } END { print n + 0, s + 0 }' "${plan}")
+    if [ "${count}" -eq 0 ]; then
+        rm -f -- "${plan}"
+        return 0
+    fi
+    if [ "${dry_run}" = 1 ]; then
+        log "dry run would release ${count} superseded generation file(s) under $1 ($(human_kb "$(( (size + 1023) / 1024 ))"))"
+        rm -f -- "${plan}"
+        return 0
+    fi
+    log "releasing $1: ${count} superseded generation file(s) ($(human_kb "$(( (size + 1023) / 1024 ))"))"
+    while IFS=$'\t' read -r _ path; do
+        [ -n "${path}" ] && rm -f -- "${path}"
+    done <"${plan}"
+    rm -f -- "${plan}"
+    find "$1" -depth -type d -empty -delete 2>/dev/null || true
+}
+
 tier_dirs_named() { # target, directory name
     local dir
     while IFS= read -r dir; do
@@ -429,6 +543,7 @@ tier_profile() {
 release_tier() { # tier, target
     case "$1" in
     stale) tier_stale "$2" ;;
+    generations) tier_generations "$2" ;;
     incremental) tier_dirs_named "$2" incremental ;;
     coverage) tier_dirs_named "$2" llvm-cov-target ;;
     profile) tier_profile "$2" ;;
@@ -436,28 +551,29 @@ release_tier() { # tier, target
     esac
 }
 
-write_state() { # outcome, released_kb, gap_pct, targets, skipped, unreadable, unlabelled
+write_state() { # outcome, released_kb, gap_pct, targets, skipped, unreadable, unlabelled, deferred_tier, deferred_need_pct
     mkdir -p -- "$(dirname -- "${state_file}")"
     local tmp
     tmp="$(mktemp "${state_file}.XXXXXX")"
     cat >"${tmp}" <<EOF
-{"last_run":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","outcome":"$1","trigger_pct":${trigger_pct},"floor_pct":${floor_pct},"used_pct_before":${before_pct},"used_pct_after":${disk_pct},"released_bytes":$(( $2 * 1024 )),"gap_pct":$3,"targets":$4,"skipped":$5,"unreadable":$6,"unlabelled":$7,"dry_run":${dry_run},"rev":"${script_rev}","rev_state":"${script_state}","script":"${script_sha}"}
+{"last_run":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","outcome":"$1","trigger_pct":${trigger_pct},"floor_pct":${floor_pct},"used_pct_before":${before_pct},"used_pct_after":${disk_pct},"released_bytes":$(( $2 * 1024 )),"gap_pct":$3,"targets":$4,"skipped":$5,"unreadable":$6,"unlabelled":$7,"deferred_tier":"$8","deferred_need_pct":${9:-null},"dry_run":${dry_run},"rev":"${script_rev}","rev_state":"${script_state}","script":"${script_sha}"}
 EOF
     mv -f -- "${tmp}" "${state_file}"
 }
 
 # One reading per run, whatever it decided: the quantities an operator needs are
 # how much was released, where the filesystem ended up, how far from the floor it
-# stopped, and which version of this file produced the reading -- the last one is
-# what makes any of the others reviewable later.
-report() { # outcome, released_kb, covered, skipped, unreadable, unlabelled
+# stopped, which tier it held back and what that tier is waiting for, and which
+# version of this file produced the reading -- the last one is what makes any of
+# the others reviewable later.
+report() { # outcome, released_kb, covered, skipped, unreadable, unlabelled, deferred_tier, deferred_need_pct
     local gap=0
     [ "${disk_pct}" -gt "${floor_pct}" ] && gap=$((disk_pct - floor_pct))
-    printf 'target-gc: outcome=%s trigger=%s%% floor=%s%% before=%s%% after=%s%% released=%s gap=%s%% caches=%s skipped=%s unlabelled=%s unreadable=%s rev=%s rev_state=%s script=%s\n' \
+    printf 'target-gc: outcome=%s trigger=%s%% floor=%s%% before=%s%% after=%s%% released=%s gap=%s%% caches=%s skipped=%s unlabelled=%s unreadable=%s deferred_tier=%s deferred_need_pct=%s rev=%s rev_state=%s script=%s\n' \
         "$1" "${trigger_pct}" "${floor_pct}" "${before_pct}" "${disk_pct}" \
-        "$(human_kb "$2")" "${gap}" "$3" "$4" "$6" "$5" \
+        "$(human_kb "$2")" "${gap}" "$3" "$4" "$6" "$5" "${7:-}" "${8:-}" \
         "${script_rev}" "${script_state}" "${script_sha}"
-    write_state "$1" "$2" "${gap}" "$3" "$4" "$5" "$6"
+    write_state "$1" "$2" "${gap}" "$3" "$4" "$5" "$6" "${7:-}" "${8:-}"
 }
 
 # --- run ---------------------------------------------------------------------
@@ -521,7 +637,7 @@ readonly script_rev script_state script_sha
 # the reading it prints carries the same rev_state for whoever reads the plan.
 if [ "${script_state}" != committed ] && [ "${dry_run}" != 1 ]; then
     log "the script about to delete is not the version in the commit (rev=${script_rev} rev_state=${script_state}); releasing nothing in this run"
-    report script_unverified 0 0 0 0 0
+    report script_unverified 0 0 0 0 0 "" ""
     exit 0
 fi
 
@@ -571,7 +687,7 @@ if [ "${disk_pct}" -lt "${trigger_pct}" ]; then
     # triggered runs report.
     if [ "${dry_run}" != 1 ]; then
         log "below trigger: ${disk_pct}% used, trigger ${trigger_pct}%"
-        report below_trigger 0 "${covered}" "${skipped}" 0 "${unlabelled}"
+        report below_trigger 0 "${covered}" "${skipped}" 0 "${unlabelled}" "" ""
         exit 0
     fi
     log "below trigger: ${disk_pct}% used, trigger ${trigger_pct}% -- this is a dry run, so the plan below is what a run would do on the day the trigger is reached"
@@ -581,7 +697,7 @@ if [ "${covered}" -eq 0 ]; then
     log "nothing to release: ${disk_pct}% used, trigger ${trigger_pct}%, no cargo cache under ${searched} -- the cache is not what is filling this filesystem$(
         [ "${unlabelled}" -eq 0 ] || printf ', and %s tree(s) that look like caches cannot be judged at all' "${unlabelled}"
     )"
-    report floor_unreachable 0 "${#candidates[@]}" "${skipped}" 0 "${unlabelled}"
+    report floor_unreachable 0 "${#candidates[@]}" "${skipped}" 0 "${unlabelled}" "" ""
     exit 0
 fi
 
@@ -593,7 +709,29 @@ if [ "${dry_run}" = 1 ]; then
 fi
 
 outcome="floor_unreachable"
+deferred_tier=""
+deferred_need_pct=""
 for tier in ${TIERS}; do
+    # The full-rebuild tier answers to its own water level. Withheld, it is still
+    # part of the ending: "the cheap tiers did not reach the floor" and "the cheap
+    # tiers did not reach it and the expensive one is waiting for 85%" are
+    # different findings, and a reader who sees only `gap_pct` has to guess which
+    # one happened.
+    #
+    # A real run only asks this at or above the trigger. A dry run below it is
+    # answering for the day the trigger is reached, so that is the level the
+    # question is put at -- otherwise the plan would leave out a tier that the
+    # very run it describes would have taken.
+    defer_pct="${disk_pct}"
+    if [ "${dry_run}" = 1 ] && [ "${disk_pct}" -lt "${trigger_pct}" ]; then
+        defer_pct="${trigger_pct}"
+    fi
+    if [ "${tier}" = profile ] && [ "${defer_pct}" -lt "${profile_trigger_pct}" ]; then
+        deferred_tier="profile"
+        deferred_need_pct="${profile_trigger_pct}"
+        log "deferring the ${tier} tier: ${defer_pct}% used, it needs ${profile_trigger_pct}% -- releasing it deletes the current artifacts and costs a full rebuild of every tree it touches"
+        continue
+    fi
     collect_process_views "${released_dir}/busy" "${released_dir}/unattributable"
     unreadable="$(wc -l <"${released_dir}/unattributable")"
     if [ "${unreadable}" -gt 0 ]; then
@@ -662,13 +800,21 @@ gap=0
 [ "${disk_pct}" -gt "${floor_pct}" ] && gap=$((disk_pct - floor_pct))
 
 if [ "${outcome}" = floor_unreachable ]; then
-    log "still above the trigger after every tier: the build cache is not what is filling this filesystem (gap ${gap} points)$(
-        [ "${unlabelled}" -eq 0 ] || printf ', and %s cache-like tree(s) no run can judge were never in reach' "${unlabelled}"
-    )"
+    if [ -n "${deferred_tier}" ]; then
+        # The cheap tiers ran out and the expensive one was held back on purpose:
+        # that is a different ending from "nothing on this filesystem is ours",
+        # and only this line tells them apart.
+        log "still above the floor after every tier the water level allowed: ${gap} points short, and the ${deferred_tier} tier was deferred -- it waits for ${deferred_need_pct}% and this run had ${disk_pct}%, because releasing it deletes the current artifacts and costs a full rebuild"
+    else
+        log "still above the trigger after every tier: the build cache is not what is filling this filesystem (gap ${gap} points)$(
+            [ "${unlabelled}" -eq 0 ] || printf ', and %s cache-like tree(s) no run can judge were never in reach' "${unlabelled}"
+        )"
+    fi
 fi
 if [ "${outcome}" = planned ]; then
     log "dry run: nothing was released, so this plan is what a run would do today, not what happened"
 fi
 # One site prints the reading and writes the state: two of them would be two
 # chances for a field to exist in one and not the other.
-report "${outcome}" "${released_kb}" "${covered}" "${skipped}" "${unreadable:-0}" "${unlabelled}"
+report "${outcome}" "${released_kb}" "${covered}" "${skipped}" "${unreadable:-0}" "${unlabelled}" \
+    "${deferred_tier}" "${deferred_need_pct}"

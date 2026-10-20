@@ -115,7 +115,7 @@ grep -q 'must sit above the floor' "${work}/out" \
 # days the disk is full cannot show a cache that stopped being visible -- which is
 # how one drifts out of reach while every reading says zero, and the zero is the
 # absence of a reading rather than an absence of caches.
-out="$(run_gc COGNEVA_TARGET_GC_TRIGGER_PCT=100)"
+out="$(run_gc COGNEVA_TARGET_GC_PROFILE_TRIGGER_PCT=100 COGNEVA_TARGET_GC_TRIGGER_PCT=100)"
 grep -q 'outcome=below_trigger' <<<"${out}" || fail "触发线以下没动作时没有报 below_trigger：${out}"
 [ -f "${tagged}/debug/deps/libstale.rlib" ] \
   || fail "低于触发线时仍删了文件；判定门没关住"
@@ -175,7 +175,7 @@ done
 # The reading here is the real one, and a real filesystem does not fall to 0%
 # because a fixture was deleted: the run has to walk every tier, then say the
 # floor was out of reach instead of pretending it got there.
-out="$(run_gc COGNEVA_TARGET_GC_TRIGGER_PCT=1 COGNEVA_TARGET_GC_FLOOR_PCT=0)"
+out="$(run_gc COGNEVA_TARGET_GC_PROFILE_TRIGGER_PCT=1 COGNEVA_TARGET_GC_TRIGGER_PCT=1 COGNEVA_TARGET_GC_FLOOR_PCT=0)"
 grep -q 'outcome=floor_unreachable' <<<"${out}" \
   || fail "全档跑完没够到地板时没有报 floor_unreachable：${out}"
 grep -q 'cache is not what is filling' <<<"${out}" \
@@ -191,7 +191,7 @@ grep -q 'cache is not what is filling' <<<"${out}" \
 # is one no later run can release and no rebuild repairs. The tag surviving is
 # the difference between a cache this mechanism drained over several runs and one
 # it can never touch again.
-out="$(run_gc COGNEVA_TARGET_GC_DRY_RUN=1 COGNEVA_TARGET_GC_TRIGGER_PCT=1 COGNEVA_TARGET_GC_FLOOR_PCT=0)"
+out="$(run_gc COGNEVA_TARGET_GC_DRY_RUN=1 COGNEVA_TARGET_GC_PROFILE_TRIGGER_PCT=1 COGNEVA_TARGET_GC_TRIGGER_PCT=1 COGNEVA_TARGET_GC_FLOOR_PCT=0)"
 grep -q "candidate ${tagged}:" <<<"${out}" \
   || fail "整轮释放之后这棵树不再是候选；标签没了，后面的运行就永远看不到它：${out}"
 
@@ -219,7 +219,7 @@ done
 
 # The floor is out of reach here, so every tier runs; being in use has to hold
 # across all of them, not just the cheap one.
-out="$(run_gc COGNEVA_TARGET_GC_TRIGGER_PCT=1 COGNEVA_TARGET_GC_FLOOR_PCT=0)"
+out="$(run_gc COGNEVA_TARGET_GC_PROFILE_TRIGGER_PCT=1 COGNEVA_TARGET_GC_TRIGGER_PCT=1 COGNEVA_TARGET_GC_FLOOR_PCT=0)"
 grep -q "leaving ${byname} alone: pid" <<<"${out}" \
   || fail "按进程名判的写者没有挡住清扫：${out}"
 [ -f "${byname}/debug/deps/libstale.rlib" ] \
@@ -264,7 +264,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
   sleep 0.5
 done
 [ "${held}" = 1 ] || fail "自检失败：没造出停在 Z 的 cargo，下面这条断言会永远通过"
-out="$(run_gc COGNEVA_TARGET_GC_TRIGGER_PCT=1 COGNEVA_TARGET_GC_FLOOR_PCT=0)"
+out="$(run_gc COGNEVA_TARGET_GC_PROFILE_TRIGGER_PCT=1 COGNEVA_TARGET_GC_TRIGGER_PCT=1 COGNEVA_TARGET_GC_FLOOR_PCT=0)"
 if grep -q 'a process of ours is unreadable' <<<"${out}"; then
   fail "已经结束、还没被回收的进程被当成了读不到的写者，整轮被中止：${out}"
 fi
@@ -303,6 +303,7 @@ chmod +x "${work}/reader-below"
 out="$(env COGNEVA_HOST_WORK_ROOT="$work/host" COGNEVA_TARGET_GC_DELETE_UNDER="$work/host" \
   COGNEVA_TARGET_GC_STATE="$work/state-dry.json" \
   COGNEVA_TARGET_GC_DISK_READER="${work}/reader-below" COGNEVA_TARGET_GC_DRY_RUN=1 \
+  COGNEVA_TARGET_GC_PROFILE_TRIGGER_PCT=70 \
   COGNEVA_TARGET_GC_TRIGGER_PCT=70 COGNEVA_TARGET_GC_FLOOR_PCT=50 bash "${gc_run}" 2>&1)"
 grep -q 'outcome=planned' <<<"${out}" || fail "dry run 没有报 planned：${out}"
 grep -q 'below trigger' <<<"${out}" \
@@ -365,7 +366,7 @@ grep -q 'released=0.0KiB' <<<"${out}" \
 # The one confirmed case on this host is the largest cache it has.
 new_tree unlabelled '' >/dev/null
 printf '{}\n' >"${work}/host/unlabelled/target/.rustc_info.json"
-out="$(run_gc COGNEVA_TARGET_GC_TRIGGER_PCT=100)"
+out="$(run_gc COGNEVA_TARGET_GC_PROFILE_TRIGGER_PCT=100 COGNEVA_TARGET_GC_TRIGGER_PCT=100)"
 grep -q 'unlabelled=1' <<<"${out}" \
   || fail "无标签的缓存类树没有进读数；看不到的树必须能被读出来：${out}"
 grep -q "${work}/host/unlabelled/target" <<<"${out}" \
@@ -400,7 +401,7 @@ elsewhere="${work}/reach/elsewhere/target"
 beyond="${work}/far/beyond/target"
 out="$(env COGNEVA_HOST_WORK_ROOT="$work/host" COGNEVA_TARGET_GC_DELETE_UNDER="${work}/reach" \
   COGNEVA_TARGET_GC_STATE="$work/state-bound.json" \
-  COGNEVA_TARGET_GC_TRIGGER_PCT=1 COGNEVA_TARGET_GC_FLOOR_PCT=0 bash "${gc_run}" 2>&1)"
+  COGNEVA_TARGET_GC_PROFILE_TRIGGER_PCT=1 COGNEVA_TARGET_GC_TRIGGER_PCT=1 COGNEVA_TARGET_GC_FLOOR_PCT=0 bash "${gc_run}" 2>&1)"
 grep -q "releasing ${elsewhere}: ${elsewhere}/debug (full rebuild of this tree)" <<<"${out}" \
   || fail "锚点根之外的缓存没有被当成候选；枚举仍然从一个被命名的目录出发：${out}"
 [ -d "${elsewhere}/debug" ] && fail "锚点根之外的缓存没有走到最深的一档"
@@ -470,6 +471,95 @@ for bad in "relative/root" "${work}/not-there"; do
   fi
 done
 
+# --- 10b) the expensive tier has its own water level -------------------------
+# Releasing the profile directory deletes the artifacts the next build needs, so
+# it costs a full rebuild of every tree it touches. That is a different decision
+# from "the disk is above the ordinary trigger", and it gets its own line: the
+# cheap tiers run at 70%, the destructive one waits for 85%.
+#
+# What matters as much as the withholding is the ending: a run that stopped short
+# because a tier was held back must not read like a run that ran out of things to
+# release. `gap_pct` alone cannot tell those apart, so the reading names the tier
+# and the level it is waiting for.
+defer_tree="$(new_tree defer "${signature}")"
+cat >"${work}/reader-80" <<'EOF'
+#!/usr/bin/env bash
+echo '800000 80'
+EOF
+chmod +x "${work}/reader-80"
+out="$(run_gc COGNEVA_TARGET_GC_DISK_READER="${work}/reader-80" \
+  COGNEVA_TARGET_GC_TRIGGER_PCT=70 COGNEVA_TARGET_GC_FLOOR_PCT=50)"
+grep -q 'deferring the profile tier' <<<"${out}" \
+  || fail "80% 时没有把破坏性的一档推迟：${out}"
+grep -q 'deferred_tier=profile deferred_need_pct=85' <<<"${out}" \
+  || fail "结局读不出推迟了哪一档、那一档的门槛是多少：${out}"
+grep -q 'outcome=floor_unreachable' <<<"${out}" \
+  || fail "推迟之后的结局不是 floor_unreachable：${out}"
+grep -q "was deferred" <<<"${out}" \
+  || fail "够不到地板的理由没说是被推迟了，读起来像「缓存不是原因」：${out}"
+[ -d "${defer_tree}/debug" ] \
+  || fail "80% 时仍然删了 profile 目录；破坏性的一档没有等自己的水位"
+[ -f "${defer_tree}/debug/deps/libfresh.rlib" ] \
+  || fail "推迟 profile 时连刚写过的产物都没了"
+[ -d "${defer_tree}/debug/incremental" ] && fail "便宜的那几档在推迟 profile 档时反而不跑了"
+grep -q '"deferred_tier":"profile"' <<<"$(cat "${work}/state.json")" \
+  || fail "状态文件里没有记下被推迟的那一档：$(cat "${work}/state.json")"
+grep -q '"deferred_need_pct":85' <<<"$(cat "${work}/state.json")" \
+  || fail "状态文件里没有记下那一档的门槛：$(cat "${work}/state.json")"
+
+# And above its own line it does run -- the point is a separate decision, not a
+# tier that never fires.
+defer_tree="$(new_tree defer "${signature}")"
+cat >"${work}/reader-90" <<'EOF'
+#!/usr/bin/env bash
+echo '900000 90'
+EOF
+chmod +x "${work}/reader-90"
+out="$(run_gc COGNEVA_TARGET_GC_DISK_READER="${work}/reader-90" \
+  COGNEVA_TARGET_GC_TRIGGER_PCT=70 COGNEVA_TARGET_GC_FLOOR_PCT=50)"
+grep -q 'deferred_tier= deferred_need_pct=' <<<"${out}" \
+  || fail "90% 时仍报有档位被推迟，可这一档明明跑过了：${out}"
+[ -d "${defer_tree}/debug" ] && fail "90% 时破坏性的一档没有跑；门槛设了却永远不触发等于没有这一段"
+
+# --- 10c) superseded generations are released, the newest is kept ------------
+# Cargo names an artifact <stem>-<16 hex> and, when anything upstream changes,
+# writes a new hash beside the old one instead of over it. The old file can never
+# be hit by a build again. Keeping the newest generation per stem is what makes
+# this a release rather than a rebuild: it only ever removes what the next build
+# could not use.
+gen_tree="$(new_tree gen "${signature}")"
+gen_deps="${gen_tree}/debug/deps"
+now_epoch="$(date +%s)"
+for spec in "alpha aaaaaaaaaaaaaaaa 7200" "alpha bbbbbbbbbbbbbbbb 0" \
+  "beta cccccccccccccccc 7200" "beta dddddddddddddddd 0"; do
+  set -- ${spec}
+  for ext in rlib d; do
+    printf 'artifact\n' >"${gen_deps}/lib$1-$2.${ext}"
+    touch -d "@$((now_epoch - $3))" "${gen_deps}/lib$1-$2.${ext}"
+  done
+done
+out="$(run_gc COGNEVA_TARGET_GC_DISK_READER="${work}/reader-80" \
+  COGNEVA_TARGET_GC_TRIGGER_PCT=70 COGNEVA_TARGET_GC_FLOOR_PCT=50)"
+grep -q 'superseded generation file(s)' <<<"${out}" \
+  || fail "旧代产物一档没有跑：${out}"
+[ -e "${gen_deps}/libalpha-aaaaaaaaaaaaaaaa.rlib" ] \
+  && fail "同一 stem 的旧代产物没被释放；它会一直留在盘上"
+[ -e "${gen_deps}/libalpha-aaaaaaaaaaaaaaaa.d" ] \
+  && fail "旧代产物只删了一半，依赖文件是同一代的另一半"
+[ -e "${gen_deps}/libbeta-cccccccccccccccc.rlib" ] \
+  && fail "第二个 stem 的旧代产物没被释放"
+for kept in libalpha-bbbbbbbbbbbbbbbb.rlib libbeta-dddddddddddddddd.rlib; do
+  [ -f "${gen_deps}/${kept}" ] \
+    || fail "最新的一代被删了（${kept}）；下一次构建会变成全量重编"
+done
+# Keeping zero generations deletes the artifacts the next build needs, which is
+# the destructive tier under another name and without its water level.
+if out="$(run_gc COGNEVA_TARGET_GC_GENERATIONS_KEEP=0 COGNEVA_TARGET_GC_PROFILE_TRIGGER_PCT=100 COGNEVA_TARGET_GC_TRIGGER_PCT=100)"; then
+  fail "保留零代仍然跑完了；那等于悄悄把破坏性的一档接到了便宜的梯子上"
+fi
+grep -q 'keeping zero generations deletes the artifacts' <<<"${out}" \
+  || fail "拒绝保留零代时没有说清理由：${out}"
+
 # --- 11) only the committed version of this file may delete -------------------
 # The unit runs the file straight out of the checkout, so an edit in progress is
 # the code that runs -- on the day the disk is full enough to delete. Two cases
@@ -527,4 +617,4 @@ grep -q 'rev_state=norepo' <<<"${out}" || fail "没有说出读不出身份的�
 [ -f "${gate_tree}/debug/deps/libstale.rlib" ] \
   || fail "读不出身份的脚本删了文件"
 
-echo "PASS: 工作根不猜、锚点根之外的缓存也够得到、被收窄的运行不越界且说明了自己、低于触发线不动手但照样点名它能看到什么、四档按序升级并在地板停手、释放过的树下次仍是候选、名字不够格不当候选、无标签的缓存类树只读数不动手、构建中的树按进程名与 fd 两条腿都挡住、无候选时报「缓存不是原因」、dry run 在任何水位都给计划且不删也不报别人的流量、每次运行都留下自己的读数、只有提交过的版本才动手（改过的与读不出身份的都不删）、载体是算出来的定时器且启用后回读排期"
+echo "PASS: 工作根不猜、锚点根之外的缓存也够得到、被收窄的运行不越界且说明了自己、低于触发线不动手但照样点名它能看到什么、四档按序升级并在地板停手、破坏性的一档等自己的水位且结局读得出推迟了谁、同一 stem 只留最新一代、释放过的树下次仍是候选、名字不够格不当候选、无标签的缓存类树只读数不动手、构建中的树按进程名与 fd 两条腿都挡住、无候选时报「缓存不是原因」、dry run 在任何水位都给计划且不删也不报别人的流量、每次运行都留下自己的读数、只有提交过的版本才动手（改过的与读不出身份的都不删）、载体是算出来的定时器且启用后回读排期"
