@@ -26,6 +26,9 @@
 #      不分这一刀，一台没开异地副本的宿主上这条腿恒红，红久了就没人看。
 #
 # 用法：bash deploy/scripts/check-host-credential-surface.sh [仓库根目录] [--live]
+#
+# 退出码：0 对齐；1 有失败（逐条点名）；3 读不到（`--live` 下 systemctl 跑不起来之类，
+# 或门自己出错）——3 不是 1：1 是「去改」，3 是「这一跑什么都没判」。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -61,6 +64,9 @@ failures = []
 # 不判红、但要印出来的读数：某个通道从来没配过，它名下的凭证登记不适用。与失败分开，
 # 是因为两者的修法相反——失败要人去修，不适用要人去决定「这个通道要不要开」。
 notices = []
+# 读不到：门自己问不出来（systemctl 跑不起来之类）。它既不等于「对齐」，也不等于
+# 「漂移」——两种判词都要有读数为前提，而这里的前提本身缺了。退出码 3 与读数家族同形。
+unreadable = []
 
 
 def fail(msg):
@@ -167,6 +173,22 @@ def check_execstart():
 def check_live(rows):
     if not LIVE:
         return
+    # 先证明 systemctl 这一侧问得出来，再问具体单元。没有这一步，「systemctl 坏了」与
+    # 「单元没装」逐字同形：两者都是 `systemctl cat` 非零，而修法完全相反（一个是修宿主
+    # 的 systemd/权限，一个是把单元装上）。分开之后，问不出来走 unreadable（退出 3），
+    # 不问任何一条单元——不问就判，等于把「不知道」印成「没有」。
+    try:
+        probe = subprocess.run(["systemctl", "--version"],
+                               capture_output=True, text=True)
+        probe_rc, why = probe.returncode, (probe.stderr or "").strip().splitlines()
+    except OSError as exc:
+        probe_rc, why = 1, [f"{type(exc).__name__}: {exc}"]
+    if probe_rc != 0:
+        unreadable.append(
+            "--live：systemctl 跑不起来"
+            + (f"（{why[0][:120]}）" if why else "")
+            + "——宿主安装面这一跑读不到，不是「单元没装」")
+        return
     # 按登记表的列位取名，不按位置解包：表从四列长到七列时，解包会抛 ValueError，
     # 门于是打出一段 traceback 然后退出 1——看起来是红，实际没判任何一条。
     # 每个单元只 `systemctl cat` 一次：同一单元的多条凭证共用同一份输出，
@@ -247,7 +269,15 @@ def main():
         print("HOST CREDENTIAL SURFACE FAIL：", file=sys.stderr)
         for f in failures:
             print(f"  - {f}", file=sys.stderr)
+        for u in unreadable:
+            print(f"  - 另，读不到：{u}", file=sys.stderr)
         sys.exit(1)
+
+    if unreadable:
+        print("HOST CREDENTIAL SURFACE UNREADABLE：", file=sys.stderr)
+        for u in unreadable:
+            print(f"  - {u}", file=sys.stderr)
+        sys.exit(3)
 
     for n in notices:
         print(n)
@@ -266,5 +296,7 @@ except Exception as exc:  # 门自己出错也要印成一句判词，别只留�
     traceback.print_exc()
     print(f"HOST CREDENTIAL SURFACE FAIL：门在读面时出错（{type(exc).__name__}: {exc}）"
           "——这不是凭证面的读数，是门自己坏了", file=sys.stderr)
-    sys.exit(1)
+    # 3 而不是 1：调用方按码分派时，1 的意思是「有漂移，去改」，而这里一个字的漂移都
+    # 没判出来。让「门坏了」与「面红了」共用一个码，等于把后者的处置交给前者。
+    sys.exit(3)
 PYEOF

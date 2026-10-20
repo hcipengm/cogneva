@@ -100,7 +100,9 @@ mirror
 sed -i "s#/etc/cogneva/backup-offsite.env#${work}/never/backup-offsite.env#g" \
     "${work}/root/${registry}" "${work}/root/${unit}"
 mkdir -p "${work}/bin-none"
-printf '#!/usr/bin/env bash\nexit 1\n' > "${work}/bin-none/systemctl"
+# `--version` 要答得出来：那一步证明 systemctl 这一侧问得出来（8c 的对照）。
+printf '#!/usr/bin/env bash\ncase "$1" in --version) echo "systemd 255"; exit 0;; esac\nexit 1\n' \
+    > "${work}/bin-none/systemctl"
 chmod +x "${work}/bin-none/systemctl"
 out="$(PATH="${work}/bin-none:${PATH}" run_gate_live)" || fail "--live 在通道没配过时应当绿（不适用不是失败）：${out}"
 grep -q "Traceback" <<<"${out}" && fail "--live 崩出 traceback 而不是判词：${out}"
@@ -115,7 +117,8 @@ mkdir -p "${work}/creds"
 sed -i "s#/etc/cogneva/backup-offsite.env#${work}/creds/backup-offsite.env#g" \
     "${work}/root/${registry}" "${work}/root/${unit}"
 mkdir -p "${work}/bin-none"
-printf '#!/usr/bin/env bash\nexit 1\n' > "${work}/bin-none/systemctl"
+printf '#!/usr/bin/env bash\ncase "$1" in --version) echo "systemd 255"; exit 0;; esac\nexit 1\n' \
+    > "${work}/bin-none/systemctl"
 chmod +x "${work}/bin-none/systemctl"
 out="$(PATH="${work}/bin-none:${PATH}" run_gate_live)" && fail "--live 在通道配过而单元没了时应当红：${out}"
 grep -q "Traceback" <<<"${out}" && fail "--live 崩出 traceback 而不是判词：${out}"
@@ -128,6 +131,7 @@ mkdir -p "${work}/bin-part"
 cat > "${work}/bin-part/systemctl" <<SHIM
 #!/usr/bin/env bash
 case "\$1" in
+  --version) echo "systemd 255" ;;
   cat) cat "${work}/root/deploy/systemd/\$2" ;;
   list-unit-files) echo "cogneva-backup-offsite.timer enabled enabled" ;;
   *) exit 1 ;;
@@ -151,6 +155,7 @@ sed -i "s#/etc/cogneva/credentials#${work}/creds#g; s#/etc/cogneva/backup-offsit
 cat > "${work}/bin-ok/systemctl" <<SHIM
 #!/usr/bin/env bash
 case "\$1" in
+  --version) echo "systemd 255" ;;
   cat) cat "${work}/root/deploy/systemd/\$2" ;;
   list-unit-files) echo "cogneva-backup-offsite.timer enabled enabled" ;;
   *) exit 1 ;;
@@ -160,4 +165,20 @@ chmod +x "${work}/bin-ok/systemctl"
 out="$(PATH="${work}/bin-ok:${PATH}" run_gate_live)" || fail "--live 绿路应当通过，实际红：${out}"
 grep -q -- "--live 已核" <<<"${out}" || fail "--live 绿时没有报出已核：${out}"
 
-echo "host-credential-surface: 11 个用例全绿"
+# 11) --live 的「读不到」：systemctl 自己跑不起来 ⇒ 3，且**不说**「单元没装」
+#     这一格挡的是把「不知道」印成「没有」：两者的修法相反（修 systemd／装单元），
+#     而在此以前它们逐字同形（都是 `systemctl cat` 非零）。3 与 1 也必须分开：
+#     1 是「去改」，3 是「这一跑什么都没判」。
+mirror
+mkdir -p "${work}/bin-broken"
+printf '#!/usr/bin/env bash\nexit 1\n' > "${work}/bin-broken/systemctl"
+chmod +x "${work}/bin-broken/systemctl"
+rc=0
+out="$(PATH="${work}/bin-broken:${PATH}" run_gate_live)" || rc=$?
+[ "$rc" = 3 ] || fail "--live 在 systemctl 跑不起来时应当退 3（这一跑什么都没判），实得 ${rc}：${out}"
+grep -q "读不到" <<<"${out}" || fail "--live 没有把读不到说成因：${out}"
+grep -q "没有装在宿主上" <<<"${out}" && fail "--live 把「读不到」印成了「单元没装」：${out}"
+grep -q "Traceback" <<<"${out}" && fail "--live 崩出 traceback 而不是判词：${out}"
+true
+
+echo "host-credential-surface: 12 个用例全绿"
