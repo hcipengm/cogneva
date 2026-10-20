@@ -202,10 +202,11 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     // subsiding), and a rule that reads it has to take its bound from the split
     // rates rather than guess one. That debt sits on the alert side.
 
-    // The task graph's four readings. The count is the one a person would
-    // expect to be drawn and is not; the other three are what the count cannot
-    // say -- how long the oldest piece has been waiting, whether the reader
-    // itself is still reading, and how often it failed. The module publishes
+    // The task graph's five readings. The count is the one a person would
+    // expect to be drawn and is not; the other four are what the count cannot
+    // say -- how long the oldest piece has been waiting, how many pieces have
+    // nobody behind them, whether the reader itself is still reading, and how
+    // often it failed. The module publishes
     // them together with a snapshot that survives a failed read: the age and
     // the failure count are what let a stalled reader be told apart from a
     // quiet graph, which is exactly the distinction no face currently draws.
@@ -228,6 +229,10 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     (
         "cogneva_task_graph_measure_failures_total",
         Unread::Gap("reads of the task graph that failed. It is the counter beside the last-success second above, and like it has no reader: without one, a task face shows the last known shape indefinitely and reads as healthy while the reader is down"),
+    ),
+    (
+        "cogneva_task_unowned_rows",
+        Unread::Gap("rows in a state that can still move but with no agent assigned, one series per such state. The age beside it says how long the oldest unowned row waited and reads the same for one row or a thousand, so without this count 'the graph has nobody behind it' has no size -- and no rule or panel names this series either"),
     ),
     // The total restated from the status vector above, so that a reader can
     // name the reading instead of summing label cells it does not know the
@@ -302,7 +307,14 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// reader that was imagined got written. The entry left in the same pass as the
 /// rules and the number came down with it, which is the half of the ratchet
 /// that has to work or the count only ever grows.
-const GAPS_AT_SCRAPE_CENSUS: usize = 13;
+///
+/// Fourteen, and the one that took it back up is the task graph's unowned-row
+/// count: the age beside it is the same family, and the age alone cannot say
+/// how many rows have nobody behind them. It was added to answer a question the
+/// status vector and the age both leave open, so it arrived as a new debt
+/// rather than being folded into the four already counted -- and no rule or
+/// panel names it yet.
+const GAPS_AT_SCRAPE_CENSUS: usize = 14;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.

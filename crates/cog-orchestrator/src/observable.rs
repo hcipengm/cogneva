@@ -573,6 +573,14 @@ pub const TASKS_ROWS_READOUT: &str = "tasks_rows_read";
 /// how much is waiting, this one says how long the oldest piece has been
 /// waiting, and only the second can grow while the first holds steady.
 pub const TASK_OLDEST_UNTOUCHED_METRIC: &str = "cogneva_task_oldest_untouched_seconds";
+/// Rows that can still move but have no agent assigned, one series per status.
+///
+/// The age above says how long the oldest unowned row has waited; this says how
+/// many of them there are. An age alone reads the same whether one row or a
+/// thousand are waiting, so it cannot say how much of the graph has nobody
+/// behind it -- which is the question a reader deciding whether work is being
+/// picked up at all is asking.
+pub const TASK_UNOWNED_ROWS_METRIC: &str = "cogneva_task_unowned_rows";
 /// Unix seconds of the last successful read of the task graph. The rows above
 /// are kept across a failed read, so staleness has to be its own series —
 /// otherwise a reader that stopped is indistinguishable from a graph that is
@@ -596,6 +604,7 @@ struct TaskGraphSnapshot {
     /// nobody has read yet must not publish the same zeros.
     counts: Option<Vec<(&'static str, u64)>>,
     oldest_by_agent: Vec<(String, f64)>,
+    unowned_by_status: Vec<(&'static str, u64)>,
     last_measure_seconds: u64,
     measure_failures: u64,
 }
@@ -648,6 +657,16 @@ impl TaskGraphObservable {
                     .map(|status| (status.as_str(), 0))
                     .collect();
                 let mut oldest: HashMap<String, f64> = HashMap::new();
+                // The states that can still move, named once: the age below and
+                // the unowned count both ask about exactly this set, and a
+                // second copy of it would be free to drift from this one.
+                let movable = [
+                    cog_core::TaskStatus::Pending,
+                    cog_core::TaskStatus::Scheduled,
+                    cog_core::TaskStatus::Running,
+                ];
+                let mut unowned: Vec<(&'static str, u64)> =
+                    movable.iter().map(|s| (s.as_str(), 0)).collect();
                 for task in &tasks {
                     if let Some(cell) = counts
                         .iter_mut()
@@ -658,21 +677,25 @@ impl TaskGraphObservable {
                     // Only the states that can still move count as owed work.
                     // A finished or cancelled row will not be touched again, so
                     // its age is history rather than a stall.
-                    if !matches!(
-                        task.status,
-                        cog_core::TaskStatus::Pending
-                            | cog_core::TaskStatus::Scheduled
-                            | cog_core::TaskStatus::Running
-                    ) {
+                    if !movable.contains(&task.status) {
                         continue;
+                    }
+                    let agent = task.agent_id.clone().filter(|id| !id.is_empty());
+                    // Counted before the age, because an unowned row is exactly
+                    // the one whose cell in the age reading is the shared
+                    // `unassigned` bucket: that bucket can only say how long the
+                    // oldest one waited, never how many rows are in it.
+                    if agent.is_none() {
+                        if let Some(cell) = unowned
+                            .iter_mut()
+                            .find(|(status, _)| *status == task.status.as_str())
+                        {
+                            cell.1 += 1;
+                        }
                     }
                     let age_ms = (now - task.updated_at).num_milliseconds().max(0);
                     let age = age_ms as f64 / 1000.0;
-                    let agent = task
-                        .agent_id
-                        .clone()
-                        .filter(|id| !id.is_empty())
-                        .unwrap_or_else(|| UNASSIGNED_AGENT.to_string());
+                    let agent = agent.unwrap_or_else(|| UNASSIGNED_AGENT.to_string());
                     oldest
                         .entry(agent)
                         .and_modify(|held| *held = held.max(age))
@@ -680,6 +703,7 @@ impl TaskGraphObservable {
                 }
                 snapshot.counts = Some(counts);
                 snapshot.oldest_by_agent = oldest.into_iter().collect();
+                snapshot.unowned_by_status = unowned;
                 snapshot.last_measure_seconds = now.timestamp().max(0) as u64;
             }
             Err(e) => {
@@ -734,6 +758,15 @@ impl TaskGraphObservable {
                 out.push(
                     RawMetric::new(TASK_OLDEST_UNTOUCHED_METRIC, *age)
                         .with_label("agent", agent.as_str()),
+                );
+            }
+            // Published per movable state even at zero: "no unowned work" and
+            // "nobody counted" have to be different readings, and an absent
+            // series is the second one.
+            for (status, count) in &snapshot.unowned_by_status {
+                out.push(
+                    RawMetric::new(TASK_UNOWNED_ROWS_METRIC, *count as f64)
+                        .with_label("status", *status),
                 );
             }
             out.push(RawMetric::new(
@@ -1413,6 +1446,30 @@ mod tests {
         assert!(
             (595.0..=605.0).contains(&nobody),
             "the unassigned Pending row is 600s old, got {nobody}"
+        );
+        // The age above says how long the oldest unowned row waited, not how
+        // many are waiting: one row and a thousand read alike there. The count
+        // is the other half, and only the movable states get a cell -- a
+        // completed row with no agent is finished, not unowned.
+        assert_eq!(
+            labeled(&metrics, TASK_UNOWNED_ROWS_METRIC, "status", "pending").value,
+            1.0,
+            "one Pending row has no agent"
+        );
+        for idle in ["scheduled", "running"] {
+            assert_eq!(
+                labeled(&metrics, TASK_UNOWNED_ROWS_METRIC, "status", idle).value,
+                0.0,
+                "{idle} rows are all owned, but the cell must still be there"
+            );
+        }
+        assert!(
+            metrics.iter().all(|m| m.name != TASK_UNOWNED_ROWS_METRIC
+                || matches!(
+                    m.labels.get("status").map(String::as_str),
+                    Some("pending" | "scheduled" | "running")
+                )),
+            "terminal states have no unowned bucket: those rows will not be picked up"
         );
         assert!(
             metric(&metrics, TASK_GRAPH_MEASURE_LAST_METRIC)
