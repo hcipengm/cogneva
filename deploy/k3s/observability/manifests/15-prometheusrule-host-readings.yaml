@@ -57,22 +57,42 @@ spec:
     # 判词仍是 `aligned`、输入也读得到——三条规则一条都不会亮，只有最后一行的时间
     # 在往后退。这类「停产」只能按年龄判。
     #
-    # 阈值按各自节拍推，不写裸常数：安全与凭证面两个来源，一个 30 分钟一拍
-    # （4 拍 = 7200 秒），一个 6 小时一拍（4 拍 = 86400 秒）。合成一个常数要么把
-    # 慢的那个判成永远在响，要么让快的那个消失一天也不喊。改节拍时这里跟着改。
+    # 阈值按各自节拍推，而且节拍由生产者发布、不写在这里：两个来源一个 30 分钟一拍、
+    # 一个 6 小时一拍，写一个常数要么把慢的那个判成永远在响，要么让快的那个消失一天也
+    # 不喊。周期序列缺席时这条规则对那个来源**恒哑**，所以它旁边单立了一条报缺席的规则
+    # ——与「从来没有发生过」同一种病：不许用一个默认值把两种状态压成一个。
     - name: cogneva-credential-surface
       rules:
         - alert: CognevaHostCredentialSurfaceStale
           expr: |
-            (cogneva_host_credential_surface_age_seconds{source="live"} > 7200)
-            or
-            (cogneva_host_credential_surface_age_seconds{source="host"} > 86400)
+            cogneva_host_credential_surface_age_seconds
+              > 6 * cogneva_host_credential_surface_period_seconds
           for: 15m
           labels:
             severity: warning
           annotations:
             summary: "{{ $labels.source }} 侧的凭证面核对停了，最后一条判词是 {{ $value | humanizeDuration }} 以前"
-            description: "归档最后一行仍是生前那次判词，所以判词序列看上去一直是 aligned。live 每 30 分钟一拍、连缺 4 拍（2 小时）即报；host 每 6 小时一拍、连缺 4 拍（24 小时）即报。查 `systemctl --user list-timers 'cogneva-*-credential-surface*'`。"
+            description: "归档最后一行仍是生前那次判词，所以判词序列看上去一直是 aligned。界是周期序列的 6 倍（现网约 3 小时／36 小时），周期由驱动这一拍的 timer 自己声明。查 `systemctl --user list-timers 'cogneva-*-credential-surface*'`。"
+
+        # 上一条的分母缺席时它自己不响：`aging > 6 * 周期` 在周期那条序列不存在时判不出来。
+        # 这正是「恒哑」的形状——一条规则看过去一切正常，而它根本没在判。周期读不出来的原因
+        # 通常是 timer 没装（手工跑的机器）或单元名变了，修法在上一条的界之外。
+        #
+        # 左半边是「这一面在这一拍确实有数据」（`measured == 1`），不是裸 `absent(周期)`：
+        # 这台机器上根本没有宿主读数通道时，两条序列都不存在，裸 absent 会每台这样的机器从
+        # 装上那天起恒响——而那不叫「读不出节拍」，叫「这一面不在这台机器上」。同组另外几条
+        # 对「没有这个目标」都是沉默的（`up{job=…} == 0` 在没有目标时同样为空），这一条跟它们
+        # 保持同一种沉默，只在「有判词、却算不出它多久以前」时说话。
+        - alert: CognevaHostCredentialSurfaceCadenceUnknown
+          expr: |
+            cogneva_host_credential_surface_measured == 1
+              unless on(source) cogneva_host_credential_surface_period_seconds
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.source }} 侧读不出节拍，「停了多久」这一条对它判不了"
+            description: "判停摆的界是「6 × 周期」，周期来自 timer 的声明。单位不存在、单元名变了、或 systemd-analyze 不可用时这一格缺席。查 `systemctl --user cat cogneva-*-credential-surface*.timer`。"
 
         # 上一条要「有年龄序列」才判得了：从没跑成过时生产者只发 measured=0、不发年龄，
         # 缺席不会告警。它和「停掉」修法不同——这里是归档不在或只有表头（查单元里的
@@ -86,3 +106,31 @@ spec:
           annotations:
             summary: "{{ $labels.source }} 侧的凭证面核对从没跑过"
             description: "归档不存在或只有表头：先查单元里的路径与登记表，不要先怀疑定时器。"
+
+        # 上面四条判的都是「这一拍跑了没有、跑成没有」。这一条判的是跑成的那些拍**说了什么**：
+        # 生产者把判词拆成三个互不重叠的状态（aligned / drift / unreadable），而 drift 这一格
+        # 此前在读数面上有值、没有任何人读——判词序列是给告警用的，不是给 `tail` 用的。
+        # 宿主上哪个单元伸手碰了没登记的凭证，只有这一条会喊；它的退出码进了 `--failed`，
+        # 而这里没有 systemd 收集器，`--failed` 本身到不了这一面。
+        - alert: CognevaHostCredentialSurfaceDrift
+          expr: |
+            cogneva_host_credential_surface_aligned == 0
+              and on(source) cogneva_host_credential_surface_measured == 1
+              and on(source) cogneva_host_credential_surface_unreadable == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.source }} 侧的凭证面与登记表不一致"
+            description: "门判了、判成不一致：单元里有未登记的凭证指令、登记表点名了不存在的单元、或文件权限与登记表不符。跑 `bash deploy/scripts/check-host-credential-surface.sh . --live` 看逐条点名。"
+
+        # 「没判成」与「判成了不一致」修法完全相反：读不到是快照／门／依赖的问题，不一致是
+        # 登记表与单元的问题。合成一条的话，有人会去改登记表，把一个根本没跑起来的检查改绿。
+        - alert: CognevaHostCredentialSurfaceUnreadable
+          expr: cogneva_host_credential_surface_unreadable == 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.source }} 侧的凭证面核对没读成，这一面当前没有判词"
+            description: "门自己出错、快照建不出来、或 systemctl 探针失败。这一面判的是「宿主上哪些进程碰得到凭证」，没读成不等于没事。"
