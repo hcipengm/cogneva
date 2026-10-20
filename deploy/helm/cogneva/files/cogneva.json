@@ -2353,7 +2353,7 @@
               "greater_than": 0.0
             },
             "severity": "warning",
-            "summary": "这台宿主上一份 clippy 判词账都没有：`cogneva_clippy_verdict_present` 读 0，意思是账本文件不在了、或者生产者从没在这台机器上跑过。它与「全部通过」不是一件事，也不该被读成绿——判词账是 CI 之外唯一能回答「主线这一笔过没过 clippy」的读数，而 CI 是 clippy 独占缺陷的第一道：一笔只挂 clippy 的提交照样进主线，然后再被挡在集群外，挡住它的那条判据在集群里就这一条序列。先查两处：`/var/lib/cogneva/clippy/clippy-verdict.jsonl` 在不在（不在就是生产者没跑过），在就查 `cogneva-clippy-verdict.timer` 上一次触发是什么时候、`cogneva-clippy-verdict.service` 的日志里有没有读不到仓库或 git 的错误。阈值取「读 0」而不是某个缺账数：这一格只有 0 与 1，0 就是「没人量」，没有可容忍的基线。"
+            "summary": "这台宿主上一份 clippy 判词账都没有：`cogneva_clippy_verdict_present` 读 0，意思是账本文件不在了、或者生产者从没在这台机器上跑过。它与「全部通过」不是一件事，也不该被读成绿——判词账是 CI 之外唯一能回答「主线这一笔过没过 clippy」的读数，而 CI 是 clippy 独占缺陷的第一道：一笔只挂 clippy 的提交照样进主线，然后再被挡在集群外，挡住它的那条判据在集群里就这一条序列。先查两处：`/var/lib/cogneva/clippy/clippy-verdict.jsonl` 在不在（不在就是生产者没跑过），在就查上次触发是什么时候、service 日志里有没有读不到仓库或 git 的错误——这两个都是**用户单元**（正本 `deploy/systemd/`，渲染到 `~/.config/systemd/user/`），要以 cogneva 用户跑 `systemctl --user list-timers cogneva-clippy-verdict.timer` 与 `journalctl --user -u cogneva-clippy-verdict.service`；以 root 跑 `systemctl status` 会报「Unit not found」，那不是「定时器没装」。阈值取「读 0」而不是某个缺账数：这一格只有 0 与 1，0 就是「没人量」，没有可容忍的基线。"
           },
           {
             "name": "clippy_verdict_pending_never_settles",
