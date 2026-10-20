@@ -236,10 +236,7 @@ impl EvolutionDeployer {
     }
 
     async fn git_commit(&self, workdir: &Path, change_id: &str) -> SFResult<String> {
-        let message = format!(
-            "feat(evolution): apply self-generated change {}\n\nCo-Authored-By: {} <{}>",
-            change_id, self.git_name, self.git_email
-        );
+        let message = self_evolution_commit_message(change_id);
 
         let output = tokio::process::Command::new("git")
             .args([
@@ -410,6 +407,18 @@ impl EvolutionDeployer {
     }
 }
 
+/// The message a self-generated change lands under.
+///
+/// No `Co-Authored-By:` trailer: this repository forbids AI attribution in a
+/// commit message, the author identity already says who wrote the commit, and
+/// the subject already says it was self-generated -- a trailer would repeat
+/// that in the one form the rule forbids. A trailer added here would live in
+/// the history the release tag and every clone carry, where the only repair is
+/// a rewrite, which is why the check happens at the message and not later.
+fn self_evolution_commit_message(change_id: &str) -> String {
+    format!("feat(evolution): apply self-generated change {change_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +477,25 @@ mod tests {
             Some(BuildEnding::TimedOut(Duration::from_secs(1))),
             "a build cut off at the budget is a timeout, not a failure of the change"
         );
+    }
+
+    /// The self-generated commit is the one this repository would otherwise
+    /// make about itself in a form it forbids: the trailer is invisible until
+    /// the commit is already in the history the release tag carries.
+    #[test]
+    fn a_self_generated_commit_carries_no_attribution_trailer() {
+        let message = self_evolution_commit_message("change-abc123");
+        assert!(
+            message.starts_with("feat(evolution): apply self-generated change change-abc123"),
+            "the subject has to name the change it applies: {message}"
+        );
+        let lowered = message.to_lowercase();
+        for forbidden in ["co-authored-by", "generated with", "claude", "anthropic"] {
+            assert!(
+                !lowered.contains(forbidden),
+                "a self-generated commit must not carry {forbidden:?}: {message}"
+            );
+        }
     }
 
     #[test]
