@@ -521,12 +521,15 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     // gap without waiting for the row it raises. The row is an event: a
     // deployment whose rule set is fine and one that never compared the two
     // sides at all read the same on every other series. `state` is the closed
-    // set `declared|loaded|document_readable`; `declared` is absent when the
-    // document did not parse, and the third cell is what a reader holds at 1
-    // before subtracting the other two.
+    // set `declared|loaded|document_readable|agrees`; `declared` is absent when
+    // the document did not parse, and the third cell is what a reader holds at
+    // 1 before subtracting the other two. `agrees` folds that subtraction into
+    // one cell -- the subtraction is the thing that breaks on an unreadable
+    // document -- and carries `readout` as well, which is the phrase the
+    // governance face table owes this reading under.
     (
         "cogneva_alert_rule_count",
-        &["state"],
+        &["state", "readout"],
         "crates/cog-observability/src/config_delivery.rs",
     ),
     // What the self-discovery watcher does with each round's signals. No panel

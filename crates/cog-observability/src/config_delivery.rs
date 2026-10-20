@@ -143,6 +143,16 @@ pub async fn run_config_declaration_check(
 /// that set cannot be the one raising or resolving it.
 pub const RULES_NOT_LOADED_RULE: &str = "config_rules_not_loaded";
 
+/// The phrase the governance face table uses for "the rules this process holds
+/// are the ones the ConfigMap declares".
+///
+/// It is published as a `readout` label, not as a metric name, because that is
+/// how the face reader looks an owed reading up: the face table records what a
+/// reading *says*, and the reader tries the phrase both as a series name and as
+/// a `readout` value. A phrase that only exists as prose in the table resolves
+/// to nothing, and "nothing" prints the same as "not measured".
+pub const RULE_SET_READOUT: &str = "rule_loaded_vs_configmap";
+
 /// What the rule set on disk and the rule set in this process say to each other.
 ///
 /// The two are different readings of the same configuration: the document is
@@ -358,14 +368,21 @@ pub async fn check_loaded_rule_set(
     }
 }
 
-/// Publish the two sizes the check compares, and whether it could read the
-/// document at all.
+/// Publish the two sizes the check compares, whether it could read the document
+/// at all, and whether the two sides agree.
 ///
-/// One gauge rather than three names: the cells are the same question asked of
-/// three subjects, and a reader subtracting them has to see them side by side.
+/// One gauge rather than four names: the cells are the same question asked of
+/// four subjects, and a reader subtracting them has to see them side by side.
 /// `declared` is omitted when the document did not parse -- a count that was
 /// never taken must not be written as zero, so the unreadable case says so in
 /// `document_readable` instead of claiming the document declares no rules.
+///
+/// The `agrees` cell exists because the subtraction itself fails on the tick
+/// that matters: with `declared` absent a reader cannot tell "the document says
+/// nothing" from "the document says something else". It also carries
+/// [`RULE_SET_READOUT`] as a `readout` label, which is the name the face owns
+/// this reading under; the other cells keep `state` alone so a panel can still
+/// group them without naming a phrase.
 async fn record_rule_counts(
     metrics: Option<&Arc<dyn cog_core::MetricsBackend>>,
     verdict: &LoadedRuleSet,
@@ -396,6 +413,24 @@ async fn record_rule_counts(
         {
             warn!(state, error = %e, "could not record the alert rule count");
         }
+    }
+    // A document that did not read is not an agreement: the verdict cell is 0
+    // for `Unknown` and for `Differs` alike, so a reader that only holds this
+    // one cell still never reads "fine" out of an unmeasured comparison.
+    let agrees = matches!(verdict, LoadedRuleSet::Agree { .. });
+    let labels = std::collections::HashMap::from([
+        ("state".to_string(), "agrees".to_string()),
+        ("readout".to_string(), RULE_SET_READOUT.to_string()),
+    ]);
+    if let Err(e) = backend
+        .record_gauge(
+            cog_core::metric_names::ALERT_RULE_COUNT,
+            if agrees { 1.0 } else { 0.0 },
+            labels,
+        )
+        .await
+    {
+        warn!(state = "agrees", error = %e, "could not record the loaded rule set verdict");
     }
 }
 
@@ -816,6 +851,18 @@ mod tests {
                 })
                 .collect()
         }
+
+        /// Every `readout` value written, in order. Cells without the label are
+        /// skipped: the other three are addressed by `state`, and only the
+        /// verdict cell is also owed to a face by name.
+        fn readouts(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(_, _, labels)| labels.get("readout").cloned())
+                .collect()
+        }
     }
 
     #[async_trait::async_trait]
@@ -927,8 +974,42 @@ mod tests {
                 ("loaded".to_string(), 2.0),
                 ("document_readable".to_string(), 1.0),
                 ("declared".to_string(), 2.0),
+                ("agrees".to_string(), 1.0),
             ]
         );
+    }
+
+    /// Two sides of the same size are not the same set: the names can differ
+    /// while both counts read N, so the verdict cell has to be published rather
+    /// than derived from the counts by whoever reads them.
+    #[tokio::test]
+    async fn a_disagreeing_rule_set_publishes_zero() {
+        let writes = std::sync::Arc::new(GaugeWrites::default());
+        let backend: std::sync::Arc<dyn cog_core::MetricsBackend> = writes.clone();
+        let verdict = judge_loaded_rule_set(&loaded(&["a"]), Some(&document(&["a", "b"])));
+        record_rule_counts(Some(&backend), &verdict, 1).await;
+        assert_eq!(
+            writes.states(),
+            vec![
+                ("loaded".to_string(), 1.0),
+                ("document_readable".to_string(), 1.0),
+                ("declared".to_string(), 2.0),
+                ("agrees".to_string(), 0.0),
+            ]
+        );
+    }
+
+    /// The face table names this reading by a phrase, and the reader looks a
+    /// phrase up as a `readout` value. A cell that only carries `state` is
+    /// published and unaddressable at the same time: the face prints `absent`
+    /// beside a series that is sitting right there.
+    #[tokio::test]
+    async fn the_verdict_cell_carries_the_phrase_the_face_looks_up() {
+        let writes = std::sync::Arc::new(GaugeWrites::default());
+        let backend: std::sync::Arc<dyn cog_core::MetricsBackend> = writes.clone();
+        let verdict = judge_loaded_rule_set(&loaded(&["a"]), Some(&document(&["a"])));
+        record_rule_counts(Some(&backend), &verdict, 1).await;
+        assert_eq!(writes.readouts(), vec![RULE_SET_READOUT.to_string()]);
     }
 
     /// A document that could not be read is not a document declaring zero
@@ -946,6 +1027,7 @@ mod tests {
             vec![
                 ("loaded".to_string(), 1.0),
                 ("document_readable".to_string(), 0.0),
+                ("agrees".to_string(), 0.0),
             ]
         );
     }

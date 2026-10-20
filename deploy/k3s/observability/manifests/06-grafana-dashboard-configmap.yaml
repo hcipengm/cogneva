@@ -1970,7 +1970,7 @@ data:
           },
           "targets": [
             {
-              "expr": "cogneva_alert_rule_count",
+              "expr": "cogneva_alert_rule_count{state!=\"agrees\"}",
               "legendFormat": "{{state}}",
               "datasource": {
                 "type": "prometheus",
