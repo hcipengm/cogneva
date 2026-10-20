@@ -27,6 +27,20 @@ pub enum SFError {
         retry_after_secs: Option<u64>,
     },
 
+    /// A policy refused the call. This is a decision, not a failure: the rule
+    /// that refused it is still in force, so the same call would be refused the
+    /// same way and a retry buys the same answer again. The variant exists so a
+    /// caller can tell the two apart without parsing text — the same reason
+    /// [`Self::Upstream`] exists beside [`Self::LLM`] — because the two call for
+    /// opposite responses: a failure may be worth another attempt, a refusal is
+    /// worth re-planning around or reporting as the blocker.
+    #[error("guardrail_blocked: Guardrail blocked tool '{tool}': {reason} (rule: {rule})")]
+    Blocked {
+        tool: String,
+        reason: String,
+        rule: String,
+    },
+
     #[error("Agent execution error: {0}")]
     Agent(String),
 

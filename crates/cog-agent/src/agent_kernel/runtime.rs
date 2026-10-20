@@ -10,7 +10,6 @@ use tokio::sync::mpsc;
 use crate::context::{truncate_to_chars, ContextWindow};
 use crate::hooks::LifecycleHookEvent;
 use crate::tools::{ToolRegistry, ToolRunError};
-use std::collections::HashMap;
 
 /// A single ReAct iteration: Thought -> Action -> Observation.
 /// ReAct (Reasoning + Acting) is the fundamental cycle each Agent executes:
@@ -185,19 +184,24 @@ pub struct RuntimeStep {
 /// answer — unless the model changes the call, which is the one thing another
 /// turn can produce.
 ///
-/// `Stop` takes the zero-token reading: the run ends on the first refusal and
-/// the caller re-dispatches with the refusal in hand. `OneAdjustment` pays one
-/// turn to let the model route around the rule (a different tool, different
-/// arguments) and ends the run only if it re-proposes the same call. Which one
-/// is right depends on the rule: a permission boundary is worth stopping for,
-/// a shape rule is often worth one detour.
+/// `OneAdjustment` takes the recovery reading: one turn is bought for the model
+/// to route around the rule (a different tool, different arguments), which is
+/// the only thing another turn can produce that the refusal did not already
+/// answer. `Stop` takes the zero-token reading and leaves the re-dispatch to
+/// the caller.
+///
+/// The adjustment is counted per *run*, not per call. Counting per call would
+/// let a model that keeps proposing a different blocked call — `a`, then `b`,
+/// then `c` — buy a turn each and end the run on the iteration ceiling, which
+/// is the same unbounded spend the refusal was supposed to stop. The first
+/// refusal buys the turn; the next refusal of anything ends it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RefusalPolicy {
     /// End the run at the first refusal. No further model call is made.
-    #[default]
     Stop,
-    /// Give the model one turn to propose a different call; a second identical
-    /// refusal ends the run.
+    /// Buy one turn to propose a different call; any refusal after it — the
+    /// same call or another one — ends the run.
+    #[default]
     OneAdjustment,
 }
 
@@ -212,8 +216,9 @@ pub struct AgentRuntime {
     state: RuntimeState,
     context: ContextWindow,
     tools: ToolRegistry,
-    /// What a guardrail refusal does to the run. `Stop` by default: the owner's
-    /// standing instruction is that a refused call must not buy another turn.
+    /// What a guardrail refusal does to the run. One adjustment turn by
+    /// default: the run does not pay to learn the same answer twice, but it
+    /// also does not abandon work a different call could still finish.
     refusal_policy: RefusalPolicy,
     /// Original event channel — when no hook engine is configured events
     /// are sent here directly.  When a hook engine *is* configured events
@@ -1126,7 +1131,10 @@ impl AgentRuntime {
         // might work, it is the loop paying full price for an answer it already
         // has. Refusals of a *different* call are untouched -- changing the
         // approach is exactly what the first refusal asks for.
-        let mut blocked_calls: HashMap<String, u32> = HashMap::new();
+        // Refusals are counted for the whole run, not per call: the bound is
+        // "how many turns may a refusal buy", and a model cycling through a
+        // different blocked call each turn would otherwise buy one per turn.
+        let mut refusals: u32 = 0;
 
         for iteration in 0..self.config.max_iterations {
             tracing::info!(agent_id = %self.config.agent_id, iteration, "AgentRuntime::run iteration start");
@@ -1387,28 +1395,17 @@ impl AgentRuntime {
                 // refused it is still there. Handing it back as an ordinary
                 // error invites the loop to retry the identical call until the
                 // iteration budget runs out, which is the most expensive way to
-                // learn nothing. Say so once, then end the run — at the first
-                // refusal under `Stop`, at the second identical one under
-                // `OneAdjustment`, which buys exactly one turn to route around
-                // the rule.
+                // learn nothing. The observation says what a further turn would
+                // buy — a different call — and the policy caps how many of
+                // those turns the run pays for: none under `Stop`, one under
+                // `OneAdjustment`.
                 let mut blocked: Option<(String, u32)> = None;
                 let result: Result<serde_json::Value, SFError> = match checked {
                     Ok(val) => Ok(val),
                     Err(ToolRunError::Blocked { tool, reason, rule }) => {
-                        let key = format!(
-                            "{}\u{1}{}",
-                            tool,
-                            serde_json::to_string(&tc.arguments).unwrap_or_default()
-                        );
-                        let count = {
-                            let c = blocked_calls.entry(key).or_insert(0);
-                            *c += 1;
-                            *c
-                        };
-                        blocked = Some((rule.clone(), count));
-                        Err(SFError::Agent(
-                            ToolRunError::Blocked { tool, reason, rule }.message(),
-                        ))
+                        refusals += 1;
+                        blocked = Some((rule.clone(), refusals));
+                        Err(SFError::Blocked { tool, reason, rule })
                     }
                     Err(ToolRunError::Failed(e)) => Err(e),
                 };
@@ -1485,20 +1482,25 @@ impl AgentRuntime {
                         RefusalPolicy::OneAdjustment => count > 1,
                     };
                     if ends {
-                        let msg = match self.refusal_policy {
-                            RefusalPolicy::Stop => format!(
-                                "Guardrail rule '{rule}' refused the call to '{}'; \
-                                 ending the run instead of paying for another turn",
-                                tc.name
-                            ),
-                            RefusalPolicy::OneAdjustment => format!(
-                                "Guardrail rule '{rule}' refused the identical call to '{}' \
-                                 more than once; ending the run instead of retrying it again",
-                                tc.name
-                            ),
+                        let reason = match self.refusal_policy {
+                            RefusalPolicy::Stop => {
+                                "the run ended at the first refusal instead of paying for \
+                                 another turn"
+                                    .to_string()
+                            }
+                            RefusalPolicy::OneAdjustment => {
+                                "a second refusal arrived after the one adjustment turn \
+                                 allowed, so the run ended"
+                                    .to_string()
+                            }
                         };
-                        tracing::warn!("{msg}");
-                        return Err(SFError::Agent(msg));
+                        let err = SFError::Blocked {
+                            tool: tc.name.clone(),
+                            reason,
+                            rule,
+                        };
+                        tracing::warn!("{err}");
+                        return Err(err);
                     }
                 }
             }
@@ -3691,6 +3693,68 @@ mod tests {
         }
     }
 
+    /// Proposes a *different* blocked call on every turn — `noop` with new
+    /// arguments each time. Under a per-call bound every one of these is a
+    /// first refusal, so the loop would keep buying turns until the iteration
+    /// ceiling: the same unbounded spend the refusal was supposed to stop,
+    /// reached by changing the arguments instead of repeating them.
+    struct VaryingCallLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for VaryingCallLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            let attempt = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let (stream, producer) = cog_core::EventStream::with_capacity(4);
+            tokio::spawn(async move {
+                let mut producer = producer;
+                producer.end(cog_core::ChatResponse {
+                    content: vec![ContentBlock::tool_call(
+                        &format!("call-blocked-{attempt}"),
+                        "noop",
+                        serde_json::json!({ "attempt": attempt }),
+                    )],
+                    api: "mock".into(),
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    response_id: None,
+                    usage: cog_core::Usage::default(),
+                    stop_reason: cog_core::StopReason::Stop,
+                    error_message: None,
+                    upstream_failure: None,
+                    retry_after_secs: None,
+                    timestamp: chrono::Utc::now(),
+                });
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::ChatResponse> {
+            unimplemented!()
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
     struct DenyEverything;
 
     #[async_trait::async_trait]
@@ -3709,19 +3773,9 @@ mod tests {
         }
     }
 
-    /// Drives the scenario once under one policy and reports the three numbers
-    /// that say what it cost: how the run ended, whether the tool body ran, and
-    /// how many model turns were bought.
-    async fn refusal_run(policy: RefusalPolicy) -> (String, usize, usize) {
-        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let config = RuntimeConfig {
-            agent_id: "blocked-tool".into(),
-            role: format!("blocked-tool-{policy:?}"),
-            max_iterations: 10,
-            ..Default::default()
-        };
-
+    /// A registry whose guardrail refuses everything, plus the count of times
+    /// the tool body ran — which must stay zero on every refusal path.
+    fn denied_registry() -> (ToolRegistry, Arc<std::sync::atomic::AtomicUsize>) {
         let mut registry = ToolRegistry::new();
         registry.set_guardrail(Arc::new(DenyEverything));
         let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3741,6 +3795,22 @@ mod tests {
                 })),
             },
         );
+        (registry, ran)
+    }
+
+    /// Drives the scenario once under one policy and reports the three numbers
+    /// that say what it cost: how the run ended, whether the tool body ran, and
+    /// how many model turns were bought.
+    async fn refusal_run(policy: RefusalPolicy) -> (String, usize, usize) {
+        let (registry, ran) = denied_registry();
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let config = RuntimeConfig {
+            agent_id: "blocked-tool".into(),
+            role: format!("blocked-tool-{policy:?}"),
+            max_iterations: 10,
+            ..Default::default()
+        };
 
         let mut runtime = AgentRuntime::new(config, tx)
             .with_tools(registry)
@@ -3759,32 +3829,79 @@ mod tests {
         )
     }
 
-    /// The default: a refusal ends the run before another turn is bought. The
-    /// rule that refused the call has not moved, so the answer cannot either.
+    /// The zero-token policy, kept for roles where any refusal is fatal: the
+    /// run ends before another turn is bought. The rule that refused the call
+    /// has not moved, so the answer cannot either.
     #[tokio::test]
     async fn a_refusal_ends_the_run_before_another_turn() {
         let (err, ran, calls) = refusal_run(RefusalPolicy::Stop).await;
         assert!(
-            err.contains("ending the run instead of paying for another turn"),
+            err.contains("instead of paying for another turn"),
             "the end must name the refusal, not a budget: {err}"
         );
         assert_eq!(ran, 0, "the tool body must never run behind a refusal");
         assert_eq!(calls, 1, "one turn to propose the call, and no second");
     }
 
+    /// The default is the recovering one: a refusal alone is not yet a reason
+    /// to drop the work — one turn may produce a different call — but it is a
+    /// reason not to pay for more than that.
+    #[test]
+    fn the_default_policy_buys_one_adjustment_turn() {
+        assert_eq!(RefusalPolicy::default(), RefusalPolicy::OneAdjustment);
+    }
+
     /// The policy that buys one turn to route around the rule: still bounded,
-    /// and the identical call is what ends it rather than the iteration ceiling.
+    /// and the second refusal is what ends it rather than the iteration
+    /// ceiling.
     #[tokio::test]
     async fn one_adjustment_spends_exactly_one_turn_on_the_refusal() {
         let (err, ran, calls) = refusal_run(RefusalPolicy::OneAdjustment).await;
         assert!(
-            err.contains("refused the identical call"),
+            err.contains("a second refusal arrived after the one adjustment turn"),
             "the end must name the repetition, not a budget: {err}"
         );
         assert_eq!(ran, 0, "the tool body must never run behind a refusal");
         assert_eq!(
             calls, 2,
             "one turn to propose the call, one to re-propose it, and no third"
+        );
+    }
+
+    /// The adjustment is one per run, not one per distinct call. A model that
+    /// changes the arguments to get past the bound is proposing a call that is
+    /// still refused, so each such turn buys nothing; counting per call would
+    /// let it spend the whole iteration budget one refusal at a time.
+    #[tokio::test]
+    async fn a_new_blocked_call_each_turn_does_not_renew_the_adjustment() {
+        let (registry, ran) = denied_registry();
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let config = RuntimeConfig {
+            agent_id: "blocked-tool".into(),
+            role: "blocked-tool-varying".into(),
+            max_iterations: 10,
+            ..Default::default()
+        };
+        let mut runtime = AgentRuntime::new(config, tx).with_tools(registry);
+        let llm = VaryingCallLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let err = runtime
+            .run(serde_json::json!({ "task": "blocked" }), &llm)
+            .await
+            .expect_err("a different refused call must not renew the adjustment turn");
+        assert!(
+            err.to_string()
+                .contains("a second refusal arrived after the one adjustment turn"),
+            "{err}"
+        );
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            llm.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the ceiling is two turns, not the iteration budget"
         );
     }
 

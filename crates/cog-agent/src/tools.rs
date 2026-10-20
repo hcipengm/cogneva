@@ -192,7 +192,15 @@ impl ToolRegistry {
     ) -> SFResult<serde_json::Value> {
         self.execute_scoped_checked(name, arguments, scope)
             .await
-            .map_err(|e| SFError::Agent(e.message()))
+            .map_err(|e| match e {
+                // The typed variant, not a string: callers outside this crate
+                // decide whether to re-plan or stop, and they can only do that
+                // by matching on the kind rather than on the wording.
+                ToolRunError::Blocked { tool, reason, rule } => {
+                    SFError::Blocked { tool, reason, rule }
+                }
+                ToolRunError::Failed(e) => e,
+            })
     }
 
     /// The same execution, with a guardrail refusal kept distinguishable from a

@@ -24,6 +24,15 @@ pub const TERMINAL_ENV_FAILURE_PREFIX: &str = "terminal_env_failure";
 /// repeating, or cost rising with nothing to show for it.
 pub const DEGENERATE_LOOP_PREFIX: &str = "degenerate_loop";
 
+/// Prefix carried by a policy refusal — a guardrail rule declined the call.
+///
+/// Not an environment failure and not a fault: the rule is still in force, so
+/// the identical call is refused the same way however many times it is bought.
+/// It travels in-band because the dispatch layer flattens errors to text before
+/// it decides whether to retry; a refusal outside this list would receive the
+/// task type's ordinary retry budget and pay for the same answer again.
+pub const GUARDRAIL_BLOCKED_PREFIX: &str = "guardrail_blocked";
+
 /// Cause carried in-band by a generator that returned an envelope with neither
 /// content nor artifacts, and named no cause of its own.
 ///
@@ -91,6 +100,12 @@ pub const UPSTREAM_UNAVAILABLE_PREFIX: &str = "upstream_unavailable";
 /// wins.
 pub fn is_deterministic_failure(reason: &str) -> bool {
     if declares(reason, DEGENERATE_LOOP_PREFIX) {
+        return true;
+    }
+    // A refusal is settled by the rule that made it, and a re-run does not
+    // change rules. Its budget is zero for the same reason a repeated failure's
+    // is: another attempt cannot answer differently.
+    if declares(reason, GUARDRAIL_BLOCKED_PREFIX) {
         return true;
     }
     if !declares(reason, TERMINAL_ENV_FAILURE_PREFIX) {
@@ -166,6 +181,22 @@ mod tests {
         ));
         assert!(is_deterministic_failure(
             "degenerate_loop: same failure 3 times"
+        ));
+    }
+
+    /// A guardrail refusal ends the task's retries: the rule that refused the
+    /// call is still in force, so another attempt cannot answer differently.
+    /// Without the marker the dispatch layer reads the refusal as an ordinary
+    /// failure and hands it the task type's budget.
+    #[test]
+    fn a_guardrail_refusal_keeps_no_retries() {
+        assert!(is_deterministic_failure(
+            &crate::SFError::Blocked {
+                tool: "http_request".into(),
+                reason: "not allowed here".into(),
+                rule: "no_external_io".into(),
+            }
+            .to_string()
         ));
     }
 
