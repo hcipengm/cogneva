@@ -229,6 +229,15 @@ const UNREGISTERED: &[(&str, Unread)] = &[
         "cogneva_task_graph_measure_failures_total",
         Unread::Gap("reads of the task graph that failed. It is the counter beside the last-success second above, and like it has no reader: without one, a task face shows the last known shape indefinitely and reads as healthy while the reader is down"),
     ),
+    // The total restated from the status vector above, so that a reader can
+    // name the reading instead of summing label cells it does not know the
+    // label set of. It publishes no fact of its own: both series come from the
+    // same snapshot in the same scrape, and the total is their sum. The debt,
+    // if any, belongs to the vector it copies and is counted there.
+    (
+        "cogneva_tasks_readings",
+        Unread::NotAReading("the whole-graph row count, restated from cogneva_tasks_current in the same scrape so a reader can name the reading rather than sum label cells; it carries no fact the status vector does not"),
+    ),
     // A name whose fact a face already carries, looked up rather than asserted
     // in prose.
     (

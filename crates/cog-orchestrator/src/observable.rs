@@ -555,6 +555,17 @@ impl Observable for ClaimSlotsObservable {
 
 /// Tasks in the graph right now, one series per status.
 pub const TASKS_CURRENT_METRIC: &str = "cogneva_tasks_current";
+/// The task graph's readings as named readouts, one series per readout.
+///
+/// `cogneva_tasks_current` answers "how many rows are in each state", but a
+/// reader that wants the size of the graph has to sum label cells, and a
+/// reader that names the reading it wants cannot express that sum without
+/// inventing it per reader. This rollup names the total the way every other
+/// face names a readout. It is computed from the same snapshot as the status
+/// vector: a second spelling of one measurement, not a second measurement.
+pub const TASKS_READINGS_METRIC: &str = "cogneva_tasks_readings";
+/// The readout name for the whole graph's row count.
+pub const TASKS_ROWS_READOUT: &str = "tasks_rows_read";
 /// How long the oldest task an agent still owes has gone without changing
 /// state, in seconds.
 ///
@@ -714,6 +725,11 @@ impl TaskGraphObservable {
                         .with_label("status", *status),
                 );
             }
+            let rows: f64 = counts.iter().map(|(_, count)| *count as f64).sum();
+            out.push(
+                RawMetric::new(TASKS_READINGS_METRIC, rows)
+                    .with_label("readout", TASKS_ROWS_READOUT),
+            );
             for (agent, age) in &snapshot.oldest_by_agent {
                 out.push(
                     RawMetric::new(TASK_OLDEST_UNTOUCHED_METRIC, *age)
@@ -1363,6 +1379,20 @@ mod tests {
                 0.0
             );
         }
+
+        // The named readout is the whole graph, and it is the sum of the cells
+        // above rather than a count taken somewhere else: a reader that asks
+        // for "how many rows" must not have to re-derive it from the vector.
+        assert_eq!(
+            labeled(
+                &metrics,
+                TASKS_READINGS_METRIC,
+                "readout",
+                TASKS_ROWS_READOUT
+            )
+            .value,
+            4.0
+        );
 
         // The oldest of agent-a's unfinished rows is the Pending one at 900s;
         // the Completed row is an hour old and must not win.
