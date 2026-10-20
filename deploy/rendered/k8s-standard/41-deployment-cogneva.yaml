@@ -35,7 +35,7 @@ spec:
         # 一切正常。2026-10-20 演练装实测过两个方向——升级只改 ConfigMap 时主应用
         # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。注解值取渲染后的配置
         # 文档哈希：内容变则滚动，内容不变则第二次升级一个 Pod 都不换。
-        checksum/config: dffa29ad07941c946577c47fffb605c391a6e87c642b96bd7cfd14ddb5690dd2
+        checksum/config: 5d4a4dde5a8054836495fd5d5570b9132c3e2a1d399c4152d17a1c5266a8df4f
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
