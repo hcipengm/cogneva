@@ -3058,10 +3058,21 @@ impl MainlineDeployer {
     /// 在读数面上与「没有在等」同形。
     ///
     /// 只续发出去过的请求，不新发：连输不够轮次时，等待者还没有资格让别的构建让路。
-    fn renew_advance_reservation(&self, state: &MainlineState) {
+    ///
+    /// 续到的答案要落进结局那一格：这条续发路径正是被拒分支之外的两条早退
+    /// （tag 服务重建索引、上游 CI 报失败）唯一的认领入口，它们占到了构建场却
+    /// 走不到被拒分支里那行 `advance_wait_reserved = true`。2026-10-19 19:08
+    /// 实测：一段 89 分钟的等待里 18:28 的 `builds.reserve` 写着
+    /// `mainline advance`，结局却记 `reserved=false`——读数把「占到了场」写成了
+    /// 「从没认领过」。
+    fn renew_advance_reservation(&self, state: &mut MainlineState) -> SFResult<()> {
         if state.advance_deferrals >= ADVANCE_CLAIM_AFTER_DEFERRALS {
-            crate::build_gate::reserve_build_field("mainline advance");
+            let claimed = crate::build_gate::reserve_build_field("mainline advance");
+            if note_renewed_reservation(state, claimed) {
+                self.save_state(state)?;
+            }
         }
+        Ok(())
     }
 
     /// 连续多少轮没拿到构建槽：0 是真读数，拿到槽的那一轮写回 0。
@@ -4733,7 +4744,7 @@ impl MainlineDeployer {
                     held_secs = now - restarted_at,
                     "holding the rollout: the tag server is still rebuilding its index after a reclaim restart"
                 );
-                self.renew_advance_reservation(&state);
+                self.renew_advance_reservation(&mut state)?;
                 return Ok(());
             }
         }
@@ -4745,7 +4756,7 @@ impl MainlineDeployer {
         // （见 `roll_out`），中间隔着的那段构建正是它要补上的窗口。
         if self.hold_if_ci_reports_failure(&mut state, &bare).await? {
             // 被 CI 扣住的轮同样「还在等构建场」，只是走不到下面的被拒分支。
-            self.renew_advance_reservation(&state);
+            self.renew_advance_reservation(&mut state)?;
             return Ok(());
         }
         if let Some(held) = state.ci_hold.take() {
@@ -6556,6 +6567,20 @@ fn advance_wait_reason(err: &SFError) -> &'static str {
         SFError::ResourceExhausted(_) => "build_gate_busy",
         _ => "other",
     }
+}
+
+/// 续预留拿到的答案要不要改进结局那一格；返回「这一格变了没有」。
+///
+/// `reserved` 答的是「这一段等待里，构建场有没有被这一支占到过」，不是「被拒
+/// 分支这一轮有没有占到」。续发路径（早退的两条）同样能占到场，所以答案要在
+/// 这里一起记；只让一边记，一段在 CI 扣住里结束的等待就会被写成「从没认领过」。
+/// 返回布尔是为了让调用方只在真变了的时候落盘：这一段每轮都在续，写盘一次一条。
+fn note_renewed_reservation(state: &mut MainlineState, claimed: bool) -> bool {
+    if claimed && !state.advance_wait_reserved {
+        state.advance_wait_reserved = true;
+        return true;
+    }
+    false
 }
 
 fn heartbeat_message(
@@ -9619,6 +9644,21 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         let text = serde_json::to_string(&state).unwrap();
         let back: MainlineState = serde_json::from_str(&text).unwrap();
         assert_eq!(state, back);
+    }
+
+    #[test]
+    fn a_claim_renewed_outside_the_refusal_branch_still_lands_in_the_ending() {
+        // 被 CI 扣住的轮、tag 服务重建索引的轮都在续预留，也都走不到被拒分支。
+        // 它们占到了构建场；结局那句 `reserved=false` 若只由被拒分支写，就会把
+        // 「占到了场」读成「从没认领过」（2026-10-19 19:08 实测的那一段）。
+        let mut state = MainlineState::default();
+        assert!(note_renewed_reservation(&mut state, true));
+        assert!(state.advance_wait_reserved);
+        // 同一答案每轮都来，不能每轮落盘。
+        assert!(!note_renewed_reservation(&mut state, true));
+        // 一次没占到（别人先认领）不能把已经占到的擦掉。
+        assert!(!note_renewed_reservation(&mut state, false));
+        assert!(state.advance_wait_reserved);
     }
 
     #[test]
