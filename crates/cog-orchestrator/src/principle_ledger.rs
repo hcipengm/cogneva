@@ -293,7 +293,17 @@ async fn publish_census(metrics: Option<&Arc<dyn MetricsBackend>>, census: &Prin
     cells.push(("unmeasured", census.unmeasured));
 
     for (state, count) in cells {
-        let labels = HashMap::from([("state".to_string(), state.to_string())]);
+        // Each cell also names itself a reading (`readout=principle_ledger_<state>`),
+        // and that is not decoration: the face roster names **one** reading per face
+        // and prints whatever comes back, so a bare metric name carrying four
+        // labelled series arrives there as four unlabelled numbers in one cell. The
+        // roster's reading lookup already resolves a name by this label, so the
+        // per-state reading is addressable without teaching the roster a selector.
+        let reading = ["principle_ledger_", state].concat();
+        let labels = HashMap::from([
+            ("state".to_string(), state.to_string()),
+            ("readout".to_string(), reading),
+        ]);
         if let Err(e) = metrics
             .record_gauge(metric_names::PRINCIPLE_LEDGER_ROWS, count as f64, labels)
             .await
@@ -1928,6 +1938,33 @@ mod tests {
             Some(&0.0),
             "the zero cell was skipped; without it an absent series reads as \
              'not publishing' rather than 'none right now'"
+        );
+
+        // Every cell has to be addressable by its own reading name: the roster asks
+        // for one reading and would otherwise take the first of four unlabelled
+        // numbers. A cell without it resolves to nothing, which the roster prints
+        // as `absent` -- the same word a series that was never written gets.
+        let readings: HashMap<&str, f64> = gauges
+            .iter()
+            .filter(|(name, _, _)| name == metric_names::PRINCIPLE_LEDGER_ROWS.as_str())
+            .map(|(_, value, labels)| {
+                (
+                    labels
+                        .get("readout")
+                        .map(String::as_str)
+                        .unwrap_or("<no readout>"),
+                    *value,
+                )
+            })
+            .collect();
+        assert_eq!(readings.get("principle_ledger_enforced"), Some(&232.0));
+        assert_eq!(readings.get("principle_ledger_unenforced"), Some(&1730.0));
+        assert_eq!(readings.get("principle_ledger_unmeasured"), Some(&518.0));
+        assert_eq!(readings.get("principle_ledger_retired"), Some(&0.0));
+        assert_eq!(
+            readings.len(),
+            4,
+            "a cell carried no reading name: {readings:?}"
         );
     }
 }
