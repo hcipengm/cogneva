@@ -842,12 +842,27 @@ const DIM_NONE: &str = "none";
 /// showing.
 ///
 /// Falling is immediate and rising is not: a bound above the ceiling comes down
-/// to it at once, and a bound at or below it only rises on a quiet host. That
-/// asymmetry is the whole control law; everything it moves on is the ceiling's
-/// own reading, taken again each window, so there is no second opinion about the
-/// host to disagree with the first.
+/// to it at once, and a bound at or below it climbs by one per window -- or
+/// straight to the ceiling on a calm host. Everything it moves on is the
+/// ceiling's own reading, taken again each window, so there is no second opinion
+/// about the host to disagree with the first.
+///
+/// The one-step climb is what keeps a busy host from being a host that can never
+/// recover. Requiring calm to rise at all made the queue the reason the bound
+/// could not grow: the gate is worth having exactly when something else is using
+/// the machine, and on a host where another tenant keeps the disk busy, `calm`
+/// never holds, so a bound that started at one stayed at one however much room
+/// the ceiling reported. Rising one step per window is bounded by that same
+/// ceiling -- the measurement that already charges the builds against the disk
+/// and the memory they take -- so a host with no room still reads a ceiling of
+/// one and does not grow.
 fn next_bound(bound: usize, ceiling: usize, calm: bool) -> usize {
-    if calm { ceiling } else { bound.min(ceiling) }.max(1)
+    if calm {
+        ceiling
+    } else {
+        bound.saturating_add(1).min(ceiling)
+    }
+    .max(1)
 }
 
 /// Cores this host has, and its cpu time so far as `(busy, total)`.
@@ -3858,11 +3873,12 @@ unevictable 28532736
         );
     }
 
-    /// The bound comes down at once and goes up only on a quiet host. Both
-    /// directions matter: coming down late is the host degrading, going up early
-    /// is the host degrading on the way back.
+    /// The bound comes down at once and climbs one step per window. Both
+    /// directions matter: coming down late is the host degrading, and a rise
+    /// that needs a quiet host is no rise at all on a host something else keeps
+    /// busy.
     #[test]
-    fn the_bound_falls_at_once_and_rises_only_on_a_calm_host() {
+    fn the_bound_falls_at_once_and_climbs_one_step_per_window() {
         assert_eq!(
             next_bound(4, 1, false),
             1,
@@ -3870,8 +3886,13 @@ unevictable 28532736
         );
         assert_eq!(
             next_bound(1, 4, false),
-            1,
-            "a bound below the ceiling does not rise while the host is busy"
+            2,
+            "a bound below the ceiling climbs one step while the host is busy"
+        );
+        assert_eq!(
+            next_bound(3, 2, false),
+            2,
+            "the climb stops at the ceiling even before the host is calm"
         );
         assert_eq!(
             next_bound(1, 4, true),
@@ -3883,6 +3904,21 @@ unevictable 28532736
             1,
             "there is no bound of zero: a host with no room runs one build"
         );
+    }
+
+    /// A host that never reads as calm still reaches its ceiling, in a number of
+    /// windows the ceiling bounds. The failure this pins was measured: the bound
+    /// sat at one for hours on a shared host because the queue that made the gate
+    /// matter was the same thing that kept `is_calm()` false, and writing a
+    /// larger bound by hand was undone within a window.
+    #[test]
+    fn a_host_that_is_never_calm_still_reaches_its_ceiling() {
+        let ceiling = 4;
+        let mut bound = 1;
+        for _ in 0..ceiling {
+            bound = next_bound(bound, ceiling, false);
+        }
+        assert_eq!(bound, ceiling);
     }
 
     /// A host that cannot be read is not a host to size a bound for: the
