@@ -76,6 +76,15 @@ pub const METRIC_DERIVATIONS: &[(&str, MetricDerivation)] = &[
         "cogneva_dag_stalled_scheduled_reclaimed_with_backlog_total",
         MetricDerivation::Store,
     ),
+    // Counted in the deployer's own process, from revisions it saw land and
+    // never aimed at. There is one deployer per cluster today, and if a second
+    // one ever runs, each would count the revisions its own rounds missed --
+    // their own events, not a copy of a store row -- so adding them is the
+    // total.
+    (
+        "cogneva_deployer_revs_skipped_total",
+        MetricDerivation::Process,
+    ),
     ("cogneva_event_bus_consumed_total", MetricDerivation::Store),
     ("cogneva_event_bus_dropped_total", MetricDerivation::Store),
     ("cogneva_event_bus_emitted_total", MetricDerivation::Store),

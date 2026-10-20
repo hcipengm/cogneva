@@ -2117,6 +2117,45 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 52,
+          "title": "Mainline: Revisions Superseded Between Ticks",
+          "description": "Revision that landed and was replaced before any deployer round resolved it. Each round aims at the bare repository's head as it stands at that moment; when revisions land faster than a round completes, the ones in between are never built, never held, and appear in no reading keyed on which revision a round went for -- while the deployment keeps climbing, so the gap reads exactly like a quiet main. The series carries reason=\"superseded_before_tick\": tried-and-held revisions are a different cell and are not counted here, so a row climbing here while the hold readings are quiet says landing outran the deployer rather than that revisions were bad. Zero means every revision was resolved by some round; nothing drawn means the deployer is not reporting.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 248
+          },
+          "targets": [
+            {
+              "expr": "sum by (reason) (increase(cogneva_deployer_revs_skipped_total[6h]))",
+              "legendFormat": "{{reason}} (6h)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum(increase(cogneva_deployer_revs_skipped_total[6h]))",
+              "legendFormat": "all revisions skipped (6h)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

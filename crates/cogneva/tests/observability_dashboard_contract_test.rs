@@ -290,6 +290,19 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["dir", "role", "asker", "outcome"],
         "crates/cog-reflection/src/build_gate/mod.rs",
     ),
+    // Revisions that landed between two deployer rounds and were superseded by
+    // the next one before any round resolved them. Nothing else in the tree
+    // counts them: a round aims at the head that exists when it starts, so a
+    // revision that never was a head is never built, never held, and leaves no
+    // trace of any kind. Read beside the hold readings -- a row climbing here
+    // while those are quiet says landing outran the deployer, not that the
+    // revisions were bad. The `reason` label is a closed set; today it carries
+    // `superseded_before_tick`.
+    (
+        "cogneva_deployer_revs_skipped_total",
+        &["reason"],
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
     // What each change's release build cost the host. Every reading carries the
     // change kind, because the decision these panels feed is which kind of
     // change to spend the next build on, and the outcome, because a deploy
