@@ -1064,6 +1064,18 @@ const FOREIGN: &[(&str, &str)] = &[
     ("kube_pod_status_phase", "kube-state-metrics"),
     ("node_filesystem_avail_bytes", "node-exporter"),
     ("node_filesystem_size_bytes", "node-exporter"),
+    (
+        "cogneva_clippy_verdict_present",
+        "宿主 clippy 判词生产者 `scripts/host/cogneva-clippy-verdict-reading.sh`，由主机聚合器以 `job=\"cogneva-host-readings\"` 在宿主的 9464 端口暴露。读 0 说的是账本不在（没人跑过生产者），不是「全部通过」——这一格存在就是为了让那两件事不同形",
+    ),
+    (
+        "cogneva_clippy_pending_revs",
+        "同上（「最新一行不是 green 的 rev」有几笔）。它只有在一行合法判词存在时才发：账是空的、或每一行都写坏时这一格整格缺席，而不是 0——0 在这里是「不欠账」，正是另一件事",
+    ),
+    (
+        "cogneva_clippy_verdict_unparsable_lines",
+        "同上（账上读不出来的行数）。坏行只计数不清零，所以它与 `present` 同时可用：账在不在、以及账写坏了几行，是两个事实",
+    ),
     ("up", "Prometheus 采集目标存活序列"),
 ];
 
@@ -2856,6 +2868,10 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_landing_ci_failure_inherited_total",
         Unread::Gap("landings whose red verdict was traced to the commit they were replayed onto rather than to the change, so the change was kept instead of reverted. The underlying condition -- the base branch's tip is red -- is what mainline_ci_verdict_failed reads, but this series does not carry that fact: it carries the non-action taken because of it, and that warn line names the change and the checks it passed through. A rule would have to declare how many spared landings are a fault, which is a bound on how long the branch may stay red while landings keep landing: a policy nobody stated, so the missing half is a bound rather than a reader"),
     ),
+    (
+        "cogneva_mainline_ci_check_excluded_total",
+        Unread::Gap("checks left out of the mainline's CI verdict because they belong to a workflow that does not judge this tree -- the Pages deployment, which answers whether a site can be published rather than whether this revision can roll. The per-revision fact is not this series: the state file records the excluded names and workflow paths under excluded_checks, and the release path writes an info line naming them, so what the counter adds is the count rather than the what. A rule would have to declare how many exclusions are a fault, and the bound is not a number on this series but a claim about the table: the list is meant to stay one entry long, so the fault shape is the list growing, which no rule can see from a count of exclusions alone. The assertion that would make the list's length a checked fact does not exist on this tree: nothing goes red when the list grows to a second entry, and no reading states how many exclusions are normal. That is a missing criterion, not a bound that has not arrived yet -- written as a bound it could be read as explained, and it is not"),
+    ),
     // Tool outputs cut to fit the context window, by tool. The count and its
     // character total were one debt until the fidelity panel landed: a cut is
     // expected traffic rather than a fault -- a tool a task asks to dump a large
@@ -2960,7 +2976,7 @@ const UNREAD: &[(&str, Unread)] = &[
     // repository's rules and panels, which is why it does not close this entry.
     (
         "cogneva_alert_channels_configured",
-        Unread::Gap("which outlets this deployment can deliver an alert through. Two kinds of row with opposite polarity, told apart by `state`: `state=\"configured\"` rows name one outlet each in `channel` at 1, with the single row `channel=\"none\"` at 0 when there is none, and one `state=\"verdict\"` row carries no `channel` but the `readout` name the communication face owes, at 1 when there is no outlet at all and 0 when there is at least one -- written in both directions, since the configured rows exist only when there is an outlet and so could never say there is none. A reader must select one kind by `state` before aggregating; summing the family answers yes either way. Every value is a constant per process, so a reader takes one series rather than adding the copies: what it answers is whether an alert can reach a person at all, which is the question the persisted alert row cannot answer -- that row is written whether or not anyone was told. It is filed rather than given a threshold because every cell is the configuration itself: 1 is the ordinary state of a deployment with an outlet and 0 the ordinary state of one without, so neither number is a condition that turns into a fault at some level. What makes a deployment without an outlet wrong is a decision about that deployment, not something this series can bound"),
+        Unread::Gap("which outlets this deployment can deliver an alert through. Two kinds of row with opposite polarity, told apart by `state`: `state=\"configured\"` rows name one outlet each in `channel` at 1, and no such row is written when there is no outlet -- a placeholder name would read as a kind that exists and is switched off -- and one `state=\"verdict\"` row carries no `channel` but the `readout` name the communication face owes, at 1 when there is no outlet at all and 0 when there is at least one -- written in both directions, since the configured rows exist only when there is an outlet and so could never say there is none. A reader must select one kind by `state` before aggregating; summing the family answers yes either way. Every value is a constant per process, so a reader takes one series rather than adding the copies: what it answers is whether an alert can reach a person at all, which is the question the persisted alert row cannot answer -- that row is written whether or not anyone was told. It is filed rather than given a threshold because every cell is the configuration itself: 1 is the ordinary state of a deployment with an outlet and 0 the ordinary state of one without, so neither number is a condition that turns into a fault at some level. What makes a deployment without an outlet wrong is a decision about that deployment, not something this series can bound"),
     ),
 ];
 
@@ -3167,7 +3183,7 @@ const UNREAD: &[(&str, Unread)] = &[
 /// `readout="write_window_approved"` today, and that reader is outside the rules
 /// and panels this census counts, which is why the entry stands rather than
 /// pointing at it.
-const GAPS_AT_CENSUS: usize = 27;
+const GAPS_AT_CENSUS: usize = 28;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

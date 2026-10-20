@@ -2355,7 +2355,35 @@ data:
                 "severity": "warning",
                 "_comment_why_absent": "这条规则问的就是「有没有样点」，所以缺席正是它要报的事：台账行数这一族由持有原则账 pass 的那个进程每次 pass 重写，四个状态格一起发出去。反过来不能用「行数 = 0」当故障——空账是量到的 0，一个还没收过原则的库合法地就是 0 行，把 0 判红等于把正常状态算成故障。",
                 "summary": "原则台账的普查断了：`cogneva_principle_ledger_rows` 这一族（按 `state` 分格：enforced / unenforced / retired / unmeasured）30 分钟里一条样点都没有。它断了不等于台账有问题，而是「原则被落地了多少、还剩多少没量」这件事此刻没有任何人在读：面板空着，与「台账是空的」在界面上同形，而后者是量到的 0、前者是没人量。读之前先看现网：这条序列由发布原则账普查的那一版引入，若集群里跑的镜像 tag 比它旧，规则会一直响而台账并没有停——确认镜像已带上发布者之后仍然空着，才是普查真停了，那时查持有 pass 的进程在不在、以及它自己的日志里发布普查有没有报错。"
-              }]
+              },
+              {
+                "name": "clippy_verdict_not_produced",
+                "promql": "1 - max by (node) (cogneva_clippy_verdict_present)",
+                "condition": {
+                  "greater_than": 0.0
+                },
+                "severity": "warning",
+                "summary": "这台宿主上一份 clippy 判词账都没有：`cogneva_clippy_verdict_present` 读 0，意思是账本文件不在了、或者生产者从没在这台机器上跑过。它与「全部通过」不是一件事，也不该被读成绿——判词账是 CI 之外唯一能回答「主线这一笔过没过 clippy」的读数，而 CI 是 clippy 独占缺陷的第一道：一笔只挂 clippy 的提交照样进主线，然后再被挡在集群外，挡住它的那条判据在集群里就这一条序列。先查两处：`/var/lib/cogneva/clippy/clippy-verdict.jsonl` 在不在（不在就是生产者没跑过），在就查 `cogneva-clippy-verdict.timer` 上一次触发是什么时候、`cogneva-clippy-verdict.service` 的日志里有没有读不到仓库或 git 的错误。阈值取「读 0」而不是某个缺账数：这一格只有 0 与 1，0 就是「没人量」，没有可容忍的基线。"
+              },
+              {
+                "name": "clippy_verdict_pending_never_settles",
+                "promql": "min_over_time(max by (node) (cogneva_clippy_pending_revs)[3h:1m]) and (count_over_time(max by (node) (cogneva_clippy_pending_revs)[6h:1m]) > count_over_time(max by (node) (cogneva_clippy_pending_revs)[3h:1m]))",
+                "condition": {
+                  "greater_than": 0.0
+                },
+                "severity": "warning",
+                "summary": "账上有一笔 rev 连续三个小时没有判词：`cogneva_clippy_pending_revs` 在这段时间里一次都没归零。这一格数的是「最新一行不是 green 的 rev」，所以它非零本身是常态——刚推上去那一笔要等生产者跑完才有判词；持续三小时不归零才说明生产者不是在跑、就是每趟都在中途被杀（它先写一行 pending 再跑，被杀时账上留的正是 pending，这正是它要报的事）。三小时这个界是拿生产者自己的时间表定的，不是拍的：它每趟先拿宿主构建槽（等待预算 7200 秒）、再在专用 target 里真跑一遍 clippy（十几分钟），所以「等槽 + 跑完」的合法上限就在两小时出头；低于它会把一个还在排队的正常趟次报成停摆。判它与「镜像在滚」无关：这条读的是判词账，与部署器换不换镜像没有任何关系。窗口用 `min_over_time` 而不是 `max_over_time`：中间归零过一次就说明生产者在推进，只是这一笔又红了，那是另一件事（red 不是 pending），这个表达式后面还并着一条「窗口真的被铺满」的要求：`count_over_time(…[6h]) > count_over_time(…[3h])`，即这三小时之外还有更老的采样。没有它，序列比窗口年轻时 `min_over_time` 只读到进程启动以来的那几个采样，「刚起来」与「三小时没动」会读成同一句。不该由这条规则报。"
+              },
+              {
+                "name": "clippy_verdict_ledger_damaged",
+                "promql": "max by (node) (cogneva_clippy_verdict_unparsable_lines)",
+                "condition": {
+                  "greater_than": 0.0
+                },
+                "severity": "warning",
+                "summary": "clippy 判词账上有读不出来的行：读了 `cogneva_clippy_verdict_unparsable_lines` 条，坏行只计数、不清零——一行坏掉不该让整份读数变成 0，但坏行意味着某一笔的判词可能根本没被读进来，于是账上的 `pending_revs=0` 不再等于「一笔都不欠」。修法在写侧：按行看那份 JSONL（`rev` / `verdict` / `written_at` 缺一个或类型不对都算坏行），把写坏的那几行修好或删掉。阈值取大于 0：这不是一个可以攒着的数，坏行留下的唯一后果是让一个红读成绿。severity 取 warning 而不是 critical：账本身还在、其余判词还读得出来，但要在下一次读账当绿之前修掉。"
+              }
+              ]
         },
         "trace_collector": {
           "_comment": "trace 事件按 agent 在内存缓冲直到 AgentEnd 落盘；长任务无界累积会 OOM。超过预算即分块落盘（part 后缀），预算按部署内存定。",
