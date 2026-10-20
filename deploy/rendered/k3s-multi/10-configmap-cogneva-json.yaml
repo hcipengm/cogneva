@@ -2501,6 +2501,25 @@ data:
                 "severity": "warning",
                 "summary": "安装/升级/回滚面的读数停了：过去 35 分钟里一次样本都没有，能发出这条告警时 {value} 是 1。这条读数在宿主上起 helm 与 kubectl 读本机集群；它一停，release 与工作负载到底同不同版就没有任何东西在判，而面板上「没有告警」与「两边一致」同形。先看那台机器上 helm 还在不在、kubectl 还连不连得上集群：读不到时它按契约退 3 且一条序列都不印，正是为了让这一条能红。"
               }
+              ,
+                {
+                  "name": "live_image_not_on_mainline",
+                  "promql": "max by (node) (image_wiring_yes)",
+                  "condition": {
+                    "less_than": 1.0
+                  },
+                  "severity": "warning",
+                  "summary": "现网在跑的那一版不是主线那一版：判据值是 {value}，0 表示现网工作负载的镜像 tag 与主线 main 头不是同一个提交。这一格只给判据，成因要分开读——相差多少笔由 image_wiring_behind_commits 给，部署器自己以为上到哪一版由同族序列的 deployer_rev 标签给。「部署器的账落后」与「镜像真的没滚上去」处置相反：前者改部署器的记录，后者要查构建与拉取。读不到时它整条序列都不印而不是印 0，「没量到」与「已对齐」是两个结论，那一半由 live_image_reading_stopped 报。"
+                },
+                {
+                  "name": "live_image_reading_stopped",
+                  "promql": "absent_over_time(image_wiring_yes[35m])",
+                  "condition": {
+                    "greater_than": 0.0
+                  },
+                  "severity": "warning",
+                  "summary": "CI/构建/部署面的「滚没滚」读数停了：过去 35 分钟里一次样本都没有，能发出这条告警时 {value} 是 1。这条读数在宿主上从集群读工作负载镜像、从主线仓库读 main 头；它一停，「现网是不是主线那一版」就没有任何东西在判，而面板上「没有告警」与「两边一致」同形。先看那台机器上 kubectl 还连不连得上集群、主线仓库还在不在：读不到时它按契约退 3 且一条序列都不印，正是为了让这一条能红。"
+                }
               ]
         },
         "trace_collector": {
