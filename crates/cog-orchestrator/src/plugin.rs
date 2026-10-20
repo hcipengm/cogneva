@@ -897,6 +897,10 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     // the commit this deployment builds from, one repository and
                     // one mount.
                     crate::change_measure::tree_from_environment(),
+                    // The census the loop reads is the account's headline
+                    // reading, so it goes out where the rest of the process's
+                    // numbers do rather than only into a log line.
+                    ctx.consume_service::<dyn cog_core::MetricsBackend>(),
                 );
             }
             None => info!("principle ledger loop not started: no PrincipleLedgerStore published"),

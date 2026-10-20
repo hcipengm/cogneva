@@ -1897,6 +1897,20 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          seconds is a queue working, and the same handful from yesterday is a \
          consumer that is not.",
     ),
+    (
+        crate::metric_names::PRINCIPLE_LEDGER_ROWS.as_str(),
+        "How many rows the principle account holds, by `state`: `enforced`, \
+         `unenforced`, `retired`, and `unmeasured` for the rows no look has \
+         settled. Every value of the closed set is written on every pass, zero \
+         included, so an absent series is the loop not publishing and never an \
+         account that holds none. Read `enforced` against the sum of the four \
+         for coverage -- the one question the account exists to answer -- and \
+         read `unmeasured` on its own: it is the part of the corpus nothing has \
+         looked at yet, so a value that climbs and stays up is a look that \
+         stopped reaching its rows, which is what a lane too narrow to offer \
+         them looks like from outside. `unenforced` is the debt, and `retired` \
+         is history rather than work: summing them answers nothing.",
+    ),
 ];
 
 /// The description registered for one series, if it has one.

@@ -1023,6 +1023,19 @@ metric_names! {
     // reason -- the state it describes clears itself.
     DAG_STALLED_SCHEDULED_DEFERRED_FOR_BACKLOG => "cogneva_dag_stalled_scheduled_deferred_for_backlog_total",
 
+    // cog-orchestrator — how much of the principle corpus has a gate, by the
+    // four answers a row may hold.
+    //
+    // The census was already printed every pass by the loop that maintains the
+    // account, and a line in a pod's log is a reading that dies with the pod:
+    // nothing could alert on it, and "how much of the corpus is gated" -- the
+    // one question the account exists to answer -- had no surface outside a
+    // human running a query. The label is the closed set `enforced`,
+    // `unenforced`, `retired` and `unmeasured`; every value is written on every
+    // pass, zero included, so an absent series means the loop stopped
+    // publishing rather than that this account holds none of that answer.
+    PRINCIPLE_LEDGER_ROWS => "cogneva_principle_ledger_rows",
+
     // cog-orchestrator — ready tasks the pool's window could not pay for, and
     // the counts that decision was made on.
     //

@@ -42,9 +42,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use cog_core::{
-    OwnerLeaseBroker, PrincipleCensus, PrincipleCheckKind, PrincipleCheckKindCensus,
-    PrincipleLedgerStore, PrincipleMeasurement, PrincipleOrphan, PrincipleRow, PrincipleState,
-    ShutdownSignal,
+    metric_names, MetricsBackend, OwnerLeaseBroker, PrincipleCensus, PrincipleCheckKind,
+    PrincipleCheckKindCensus, PrincipleLedgerStore, PrincipleMeasurement, PrincipleOrphan,
+    PrincipleRow, PrincipleState, ShutdownSignal,
 };
 
 use crate::change_measure::CheckTree;
@@ -147,6 +147,7 @@ pub fn spawn_principle_ledger_loop(
     role: Option<Arc<dyn OwnerLeaseBroker>>,
     shutdown: ShutdownSignal,
     tree: CheckTree,
+    metrics: Option<Arc<dyn MetricsBackend>>,
 ) {
     info!(
         interval_secs = PRINCIPLE_LEDGER_PASS_INTERVAL.as_secs(),
@@ -164,6 +165,7 @@ pub fn spawn_principle_ledger_loop(
             let role = role.clone();
             let shutdown = shutdown.clone();
             let tree = tree.clone();
+            let metrics = metrics.clone();
             async move {
                 // The role is renewed on the lease contract's own cadence rather
                 // than once per pass: a pass can be long, and a term that ran out
@@ -201,7 +203,7 @@ pub fn spawn_principle_ledger_loop(
                     // pass's measurement rather than being measured against the
                     // text the account was carrying until a moment ago.
                     let drift = fold_pass(&*store).await;
-                    read_pass(&*store).await;
+                    read_pass(&*store, metrics.as_ref()).await;
                     measure_pass(&*store, &tree, &drift, &mut unsettled).await;
                 }
             }
@@ -215,7 +217,7 @@ pub fn spawn_principle_ledger_loop(
 /// A failed read is neither raised nor retried here: in a periodic loop the next
 /// round is the retry, and repeated failure is never silent -- every round leaves
 /// a warning.
-async fn read_pass(store: &dyn PrincipleLedgerStore) {
+async fn read_pass(store: &dyn PrincipleLedgerStore, metrics: Option<&Arc<dyn MetricsBackend>>) {
     match store.outstanding(OUTSTANDING_PEEK).await {
         Ok(rows) if rows.is_empty() => {
             debug!("principle ledger read: nothing outstanding");
@@ -233,7 +235,16 @@ async fn read_pass(store: &dyn PrincipleLedgerStore) {
     // every pass and printed every pass, because a coverage that is only computed
     // when someone asks is one nobody watches.
     match store.census().await {
-        Ok(census) => info!(account = %account_summary(&census), "principle ledger census"),
+        Ok(census) => {
+            info!(account = %account_summary(&census), "principle ledger census");
+            // The same numbers printed above, published: a log line is a reading
+            // that dies with the pod, and the whole point of this account is a
+            // figure somebody can watch without asking a human to run a query.
+            // A failed write is not raised -- the next pass rewrites every cell
+            // -- but it is not silent either, because a series that stopped
+            // moving and a series nobody ever wrote look identical from outside.
+            publish_census(metrics, &census).await;
+        }
         Err(e) => warn!(error = %e, "principle ledger: the census could not be read"),
     }
 
@@ -250,6 +261,49 @@ async fn read_pass(store: &dyn PrincipleLedgerStore) {
             error = %e,
             "principle ledger: the check-kind census could not be read"
         ),
+    }
+}
+
+/// The census as one series per answer, the whole closed set written every pass.
+///
+/// `unmeasured` is written here even though it is not a value the state column
+/// may take -- those are the rows whose state is NULL, and a fifth cell is
+/// exactly what makes the four add up to the account. Writing only the three
+/// states would leave "how much of the corpus has nothing looked at" as the one
+/// number a reader has to derive by subtracting, and a derived number cannot
+/// tell a zero from a read that never happened.
+///
+/// Zeroes are written for the same reason: the alternative is a series that
+/// appears the first time a state is reached, so an operator watching a corpus
+/// that is nearly all enforced would read an unwritten cell as "no data" when it
+/// means "none right now".
+async fn publish_census(metrics: Option<&Arc<dyn MetricsBackend>>, census: &PrincipleCensus) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    let mut cells: Vec<(&'static str, u64)> = Vec::with_capacity(PrincipleState::ALL.len() + 1);
+    for state in PrincipleState::ALL {
+        let count = match state {
+            PrincipleState::Enforced => census.enforced,
+            PrincipleState::Unenforced => census.unenforced,
+            PrincipleState::Retired => census.retired,
+        };
+        cells.push((state.as_str(), count));
+    }
+    cells.push(("unmeasured", census.unmeasured));
+
+    for (state, count) in cells {
+        let labels = HashMap::from([("state".to_string(), state.to_string())]);
+        if let Err(e) = metrics
+            .record_gauge(metric_names::PRINCIPLE_LEDGER_ROWS, count as f64, labels)
+            .await
+        {
+            warn!(
+                error = %e,
+                state,
+                "principle ledger: the census could not be published"
+            );
+        }
     }
 }
 
@@ -1646,6 +1700,231 @@ mod tests {
         assert_eq!(
             measured[0].platform_gate.as_deref(),
             Some("crates/x/tests/gate_test.rs")
+        );
+    }
+
+    /// A metrics backend that keeps every gauge write, in order.
+    #[derive(Default)]
+    struct RecordingMetrics {
+        gauges: std::sync::Mutex<Vec<(String, f64, HashMap<String, String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MetricsBackend for RecordingMetrics {
+        async fn record_gauge(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            self.gauges
+                .lock()
+                .unwrap()
+                .push((name.as_str().to_string(), value, labels));
+            Ok(())
+        }
+        async fn record_counter(
+            &self,
+            _: cog_core::MetricName,
+            _: f64,
+            _: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn record_histogram(
+            &self,
+            _: cog_core::MetricName,
+            _: f64,
+            _: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn query_gauge_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_counter_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_gauge_latest(
+            &self,
+            _: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_counter_totals(
+            &self,
+            _: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_histogram_totals(
+            &self,
+            _: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::HistogramTotals>> {
+            unimplemented!()
+        }
+        async fn query_histogram_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn list_metric_names(
+            &self,
+            _: cog_core::MetricType,
+        ) -> cog_core::SFResult<Vec<String>> {
+            unimplemented!()
+        }
+        async fn health_check(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A store that answers the three reads one pass makes and holds a census
+    /// whose cells differ from each other and include a zero.
+    struct CensusStore(PrincipleCensus);
+
+    #[async_trait::async_trait]
+    impl PrincipleLedgerStore for CensusStore {
+        async fn record_readings(
+            &self,
+            _: &[cog_core::PrincipleReading],
+        ) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn declare(&self, _: &[cog_core::PrincipleReading]) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn fold_declarations(&self, _: usize) -> cog_core::SFResult<cog_core::PrincipleFold> {
+            unimplemented!()
+        }
+        async fn pending_declarations(&self) -> cog_core::SFResult<u64> {
+            unimplemented!()
+        }
+        async fn apply_principle_measurement(
+            &self,
+            _: &PrincipleMeasurement,
+        ) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn record_human_only(&self, _: &str, _: Option<&str>) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn unsettled_judgement(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
+            unimplemented!()
+        }
+        async fn outstanding(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
+            Ok(Vec::new())
+        }
+        async fn reopen_platform_gate_drift(
+            &self,
+            _: &HashMap<String, String>,
+        ) -> cog_core::SFResult<Vec<String>> {
+            unimplemented!()
+        }
+        async fn refused(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
+            unimplemented!()
+        }
+        async fn get(&self, _: &str) -> cog_core::SFResult<Option<PrincipleRow>> {
+            unimplemented!()
+        }
+        async fn slugs(&self) -> cog_core::SFResult<Vec<String>> {
+            unimplemented!()
+        }
+        async fn census(&self) -> cog_core::SFResult<PrincipleCensus> {
+            Ok(PrincipleCensus {
+                enforced: self.0.enforced,
+                unenforced: self.0.unenforced,
+                unmeasured: self.0.unmeasured,
+                retired: self.0.retired,
+            })
+        }
+        async fn check_kind_census(&self) -> cog_core::SFResult<PrincipleCheckKindCensus> {
+            Ok(PrincipleCheckKindCensus {
+                shape: 0,
+                tree: 0,
+                live: 0,
+                judgement: 0,
+                undeclared: 0,
+            })
+        }
+        async fn report_refusals(
+            &self,
+            _: &[cog_core::PrincipleRefusal],
+        ) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn fold_refusals(&self, _: usize) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn pending_refusals(&self) -> cog_core::SFResult<u64> {
+            unimplemented!()
+        }
+    }
+
+    /// The pass publishes every cell of the census, zero included, under the
+    /// closed set of labels -- and it does so from the pass itself, not from a
+    /// helper nobody calls.
+    ///
+    /// A reading that only reaches the log is a reading that dies with the pod,
+    /// and a loop that computes a census every pass while publishing none of it
+    /// looks exactly like a loop that is not running. The zero cell is the one
+    /// that catches the tempting shortcut of writing only non-zero values: with
+    /// it, a corpus where nothing has been retired republishes the same
+    /// explicit zero, and an absent series means the loop stopped.
+    #[tokio::test]
+    async fn a_pass_publishes_every_census_cell_including_the_zero() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let store = CensusStore(PrincipleCensus {
+            enforced: 232,
+            unenforced: 1730,
+            unmeasured: 518,
+            retired: 0,
+        });
+
+        read_pass(&store, Some(&(metrics.clone() as Arc<dyn MetricsBackend>))).await;
+
+        let gauges = metrics.gauges.lock().unwrap();
+        let series: HashMap<&str, f64> = gauges
+            .iter()
+            .filter(|(name, _, _)| name == metric_names::PRINCIPLE_LEDGER_ROWS.as_str())
+            .map(|(_, value, labels)| {
+                (
+                    labels
+                        .get("state")
+                        .map(String::as_str)
+                        .unwrap_or("<no label>"),
+                    *value,
+                )
+            })
+            .collect();
+        assert_eq!(
+            series.len(),
+            4,
+            "the pass published {} cells, not four: {:?}",
+            series.len(),
+            series.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(series.get("enforced"), Some(&232.0));
+        assert_eq!(series.get("unenforced"), Some(&1730.0));
+        assert_eq!(series.get("unmeasured"), Some(&518.0));
+        assert_eq!(
+            series.get("retired"),
+            Some(&0.0),
+            "the zero cell was skipped; without it an absent series reads as \
+             'not publishing' rather than 'none right now'"
         );
     }
 }
