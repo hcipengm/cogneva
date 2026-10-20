@@ -1101,7 +1101,7 @@
         },
         {
           "name": "build_gate_slot_held_too_long",
-          "promql": "max by (dir, role, slot, what) (cogneva_build_gate_holder_seconds) > on(dir, role) (2 * max by (dir, role) (cogneva_build_gate_wait_budget_ms) / 1000)",
+          "promql": "max by (dir, role, slot, what) (cogneva_build_gate_holder_seconds) > on(dir, role) group_left () (2 * max by (dir, role) (cogneva_build_gate_wait_budget_ms) / 1000)",
           "condition": {
             "greater_than": 0.0
           },
@@ -2408,6 +2408,15 @@
             },
             "severity": "warning",
             "summary": "验收面连着两趟普查都有规格判成 stale：`cogneva_acceptance_items` 上 verdict=stale 的那一条在半小时里每一拍都大于 0，而且要那半小时确实被采样铺满（拿一小时窗口的采样数大于半小时窗口的采样数来证）——不然进程刚起的那几十秒会让半个小时的断言只凭一个样点成立。单拍 stale 可能不是规格漂了——这趟普查读的是工作树此刻盘上的样子，别人正在飞的改动会被读成规格与代码对不上；所以判据取「持续」而不取「出现过」，用 `min_over_time` 让窗口里每一拍都必须大于 0。看这条之前先看 `cogneva_acceptance_dirty_files`：树在动的时候先等它静下来再看，静下来仍然连着两趟红，才是规格真的漂了。九种判词里只有 stale 进这条规则，其余八种各有自己的意思（还没轮到、跑不起来、机器判不了），并进来只会让「规格说谎」与「工具没跑」同形。severity 取 warning：它说的是验收规格与代码不一致，不是集群此刻在坏。"
+          },
+          {
+            "name": "acceptance_census_covered_no_specs",
+            "promql": "max by (node) (cogneva_acceptance_specs) == 0",
+            "condition": {
+              "equal": 0.0
+            },
+            "severity": "warning",
+            "summary": "验收面的普查跑完了、也解析得动，却**一份规格都没覆盖**：`cogneva_acceptance_specs` 这一拍是 0，而能发出这一条就说明普查本身是完整的。0 份被覆盖的规格与「全部通过」在判词那一族上同形——九种判词一条都不印，面板一片安静，而这次安静的原因不是规格都好，是根本没有规格被读。它与两个兄弟分工：整族序列缺席是生产者没了（`acceptance_reading_stopped`），`present` 为 0 是从没跑完过一趟（`acceptance_census_never_completed`），这一条是「有跑完的普查、解析得动、覆盖零份」。生产者在一份都没跑完时根本不发这一格，所以「没有普查」不会被这条读成 0 份，缺席由前两条承担。身份维 {node} 来自抓取时按节点名打的标签：一台宿主一个生产者，覆盖几份是那台机器上的事。severity 取 warning：它说明验收面此刻没有读数可用，不说明正在跑的东西坏了。先查那台机器上规格清单为什么是空的（路径配错、清单读成空、或解析器起不来——最后一种按契约退 3 且什么都不印，归 `acceptance_reading_stopped` 管）。"
           }
           ]
     },
