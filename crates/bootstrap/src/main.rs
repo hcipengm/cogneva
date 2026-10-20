@@ -2203,22 +2203,41 @@ enum Delivery {
 }
 
 /// 探测投递方式。规则按"既有管理状态优先、不中途换轨"设计：
-/// - 已有同名 helm release → helm upgrade（release 生命周期不能被 apply 接管）；
-/// - 已有**任何** cogneva 管理对象但无 release → 保持 apply（helm install 会撞
-///   已存在资源）；
+/// - 已有同名 helm release 且**最新一版是 deployed** → helm upgrade（release
+///   生命周期不能被 apply 接管）；
+/// - 已有**任何** cogneva 管理对象，但没有一条被 helm 走通的 release（不存在，
+///   或最新一版是 failed/pending/uninstalling）→ 保持 apply。release 对象的**存在**
+///   只说明有人试过 helm，不说明这台归 helm 管：2026-10-19 一次升级失败留下的
+///   failed release 至今还在，而对象一直由 apply 链在写；只看"存在"会让下一次
+///   元启动把一台好好的 apply 集群翻到 helm 路径，chart 渲染的是 `:local` 浮动签，
+///   翻转当场抹掉落地读数依赖的 `main-<rev>` tag，并立刻撞上字段所有权冲突；
 /// - 绿地 + 复用的既有集群 → helm install（release 可被 GitOps 接管，获得升级
 ///   回滚管理）；本机没有 helm 就自动装（CN 走国内镜像，见 ensure_helm），
 ///   装不上才回落 apply；
 /// - 元启动自建集群 → 预渲染清单 apply（命门链路零额外下载，最稳）。
 async fn detect_delivery(cluster_existed: bool) -> Delivery {
     let helm = command_exists("helm").await;
-    if helm && helm_release_exists().await {
-        info!("投递探测: 检测到既有 helm release cogneva → helm upgrade（保持 release 管理）");
-        return Delivery::Helm;
+    if helm {
+        match helm_release_status().await {
+            Some(status) if release_authorizes_helm(Some(&status)) => {
+                info!(
+                    "投递探测: 检测到既有 helm release cogneva（{status}）→ helm upgrade（保持 release 管理）"
+                );
+                return Delivery::Helm;
+            }
+            Some(status) => {
+                // 不在这里就地下结论：下面按对象痕迹判，但把理由说清楚，免得
+                // 读日志的人以为 helm 被漏看了。
+                warn!(
+                    "投递探测: helm release cogneva 最新一版是 {status}（不是 deployed），不作为换轨依据"
+                );
+            }
+            None => {}
+        }
     }
     if let Some(found) = existing_cogneva_objects().await {
         info!(
-            "投递探测: 已存在 cogneva 对象（{found}）且无 helm release → 保持 apply（避免资源归属冲突）"
+            "投递探测: 已存在 cogneva 对象（{found}），没有走通的 helm release → 保持 apply（避免资源归属冲突与 tag 翻转）"
         );
         return Delivery::Apply;
     }
@@ -2334,7 +2353,8 @@ fn helm_ownership_patch() -> String {
 /// - **渲染清单里的每个对象**：库里的对象也会缺标记，条件是 **release 先存在、对象
 ///   后到**——演化部署器的 `kubectl apply`、上一轮的预渲染 apply、或手敲，都在 release
 ///   之外建对象。此时 `detect_delivery` 先看 release、照旧选 helm（release 生命周期
-///   不能被 apply 接管），而 helm 4 拒绝接管任何"存在但没带三件套"的对象，升级当场
+///   不能被 apply 接管；判据是它**最新一版 deployed**，failed 的 release 不算），
+///   而 helm 4 拒绝接管任何"存在但没带三件套"的对象，升级当场
 ///   被拒、一个对象都没动。2026-10-11 实测就是这么卡住的：6 个对象（两个
 ///   NetworkPolicy、两个 host-ledger、一个 audit Service、一个 git-mirror PVC）由部署面
 ///   建出来、不带 release 标记，`helm upgrade` 直接失败。
@@ -2482,15 +2502,45 @@ async fn ensure_helm() -> bool {
 }
 
 /// 集群里是否已有同名 helm release（helm 3，release 存为集群内 Secret）。
-async fn helm_release_exists() -> bool {
+/// release 最新一版的 status（`deployed` / `failed` / `pending-*` / …），没有同名
+/// release 或读不出来时返回 `None`。
+///
+/// 用 `-o json` 而不是默认表格：`STATUS` 在表格里按空白列切，而 `UPDATED` 自带空格，
+/// 列位一旦错开就会把一列时间读成状态——判据读错列比读不到更坏，因为它照样给出
+/// 一个像样的字符串。
+async fn helm_release_status() -> Option<String> {
     let out = Command::new("helm")
-        .args(["list", "-n", "cogneva", "-q"])
+        .args(["list", "-n", "cogneva", "-o", "json"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-        .await;
-    matches!(out, Ok(o) if o.status.success()
-        && String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim() == "cogneva"))
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    release_status_from_list_json(&out.stdout)
+}
+
+/// 从 `helm list -o json` 的输出里取同名 release 的 status。拆出来是为了让夹具能拿
+/// 真实输出（2026-10-19 那次失败留下的 `"status":"failed"`）当样本，而不是自己拼一个
+/// 形状——自己写的标本只证明解析器认得自己写的那份。
+fn release_status_from_list_json(stdout: &[u8]) -> Option<String> {
+    let releases: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    releases
+        .as_array()?
+        .iter()
+        .find(|r| r.get("name").and_then(|v| v.as_str()) == Some(HELM_RELEASE_NAME))
+        .and_then(|r| r.get("status"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// 一条 release 能不能独自决定投递方式：只有**最新一版 deployed** 才算这台集群
+/// 归 helm 管。`failed` 说明上一次 helm 交付没走完，`pending-*` 说明它还没走完——
+/// 两种都不是"helm 管着这台"的证据，用它们换轨等于让一次失败替一台健康的集群选路。
+fn release_authorizes_helm(status: Option<&str>) -> bool {
+    status == Some("deployed")
 }
 
 async fn deploy_manifests(cluster_existed: bool) -> Result<()> {
@@ -4113,5 +4163,45 @@ mod helm_delivery_single_writer_tests {
             sets.contains(&"secrets.create=true"),
             "helm 投递仍要由 chart 生成安装期 Secret；实得 {args:?}"
         );
+    }
+
+    /// 换轨依据是「最新一版 deployed」，不是「release 对象存在」。这条夹具用的是
+    /// 2026-10-19 那次失败留在现网上的真实输出：一条 failed 的 release 后面站着一台
+    /// 由 apply 链正常滚动的集群；把它读成"归 helm 管"，下一次元启动就会把集群翻到
+    /// helm 路径——chart 渲染 `:local` 浮动签，抹掉落地读数依赖的 `main-<rev>` tag，
+    /// 并在 20+ 个对象的字段所有权上立刻失败。谁把这条改回"存在即 helm"，这里变红。
+    #[test]
+    fn a_failed_release_does_not_authorize_helm() {
+        let live = br#"[{"name":"cogneva","namespace":"cogneva","revision":"2",
+            "updated":"2026-10-19 18:06:13.536236263 +0800 CST","status":"failed",
+            "chart":"cogneva-0.5.8","app_version":"0.5.8"}]"#;
+        let status = release_status_from_list_json(live);
+        assert_eq!(status.as_deref(), Some("failed"), "实得 {status:?}");
+        assert!(
+            !release_authorizes_helm(status.as_deref()),
+            "failed 的 release 不能决定投递方式"
+        );
+        assert!(release_authorizes_helm(Some("deployed")));
+        for not_a_winner in [
+            None,
+            Some("pending-install"),
+            Some("pending-upgrade"),
+            Some("uninstalling"),
+        ] {
+            assert!(
+                !release_authorizes_helm(not_a_winner),
+                "{not_a_winner:?} 不该被读成 helm 管着这台集群"
+            );
+        }
+    }
+
+    /// 没有同名 release 时解析必须交回 `None`，而不是拿到数组里第一条的 status：
+    /// 同一命名空间里有别的 release 是常态，误取等于让别人的 release 替这台选路。
+    #[test]
+    fn another_release_status_is_not_this_clusters() {
+        let other = br#"[{"name":"other","status":"deployed"}]"#;
+        assert_eq!(release_status_from_list_json(other), None);
+        assert_eq!(release_status_from_list_json(b"[]"), None);
+        assert_eq!(release_status_from_list_json(b"not json"), None);
     }
 }
