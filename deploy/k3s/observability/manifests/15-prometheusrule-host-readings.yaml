@@ -50,3 +50,39 @@ spec:
           annotations:
             summary: "宿主读数端点抓不到"
             description: "所有宿主侧面读数同时停更；十环与落地≠生效会各自退化成 absent，而不是变绿。"
+
+    # 上面三条判的是「生产者这一拍跑没跑成」。有一类生产者能在上游停更之后
+    # 继续每一拍都跑成：它读的是一份「每拍追加一行」的归档，最后一行永远停在
+    # 生前那次判词上。beat 停了以后没有谁写「我停了」，于是 `producer_up` 仍是 1、
+    # 判词仍是 `aligned`、输入也读得到——三条规则一条都不会亮，只有最后一行的时间
+    # 在往后退。这类「停产」只能按年龄判。
+    #
+    # 阈值按各自节拍推，不写裸常数：安全与凭证面两个来源，一个 30 分钟一拍
+    # （4 拍 = 7200 秒），一个 6 小时一拍（4 拍 = 86400 秒）。合成一个常数要么把
+    # 慢的那个判成永远在响，要么让快的那个消失一天也不喊。改节拍时这里跟着改。
+    - name: cogneva-credential-surface
+      rules:
+        - alert: CognevaHostCredentialSurfaceStale
+          expr: |
+            (cogneva_host_credential_surface_age_seconds{source="live"} > 7200)
+            or
+            (cogneva_host_credential_surface_age_seconds{source="host"} > 86400)
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.source }} 侧的凭证面核对停了，最后一条判词是 {{ $value | humanizeDuration }} 以前"
+            description: "归档最后一行仍是生前那次判词，所以判词序列看上去一直是 aligned。live 每 30 分钟一拍、连缺 4 拍（2 小时）即报；host 每 6 小时一拍、连缺 4 拍（24 小时）即报。查 `systemctl --user list-timers 'cogneva-*-credential-surface*'`。"
+
+        # 上一条要「有年龄序列」才判得了：从没跑成过时生产者只发 measured=0、不发年龄，
+        # 缺席不会告警。它和「停掉」修法不同——这里是归档不在或只有表头（查单元里的
+        # 路径与登记表），那边是定时器停了（查 timer）。两种成因在读数面上都表现为
+        # 「没有新判词」，坍成同一个 0 就分不出该去修哪边。
+        - alert: CognevaHostCredentialSurfaceNeverRan
+          expr: cogneva_host_credential_surface_measured == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.source }} 侧的凭证面核对从没跑过"
+            description: "归档不存在或只有表头：先查单元里的路径与登记表，不要先怀疑定时器。"
