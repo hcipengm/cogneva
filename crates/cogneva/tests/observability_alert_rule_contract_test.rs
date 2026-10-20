@@ -4717,3 +4717,54 @@ fn quoted_label_after<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
     let end = rest.find('"')?;
     Some(&rest[..end])
 }
+
+/// 一条规则从 `rules` 里删掉，它已经开着的行不会自己关：watcher 只为它**现在**持有的
+/// 规则求值，被删的那条留下的行停在 `state='firing'`、`resolved_at` 空、`last_seen_at`
+/// 冻在删除那一刻。运营问「现在有什么在响」读的正是 `state='firing'` 那一面，于是它跟
+/// 一条正在持续的红读起来没有区别，只有把三个时钟并排看才分得出来。`retired_rules` 是
+/// 唯一会让那些行被结算的地方（watcher 启动时按普通解析的同一路径关掉，带通知）。
+///
+/// 2026-10-20 实测：撤掉 `live_image_not_on_mainline` 的那一版滚上现网后，那一行从
+/// 08:20:55Z 起持续 firing，`last_seen_at` 停在 08:47:04（旧 Pod 的最后一拍），新 Pod
+/// 起来之后没有任何东西再看它——名字没写进名单，它就永久挂在告警面上。
+#[test]
+fn a_retired_rule_is_named_where_the_watcher_can_settle_it() {
+    let path = repo_root().join(CHART_CONFIG);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("chart config unreadable at {}: {e}", path.display()));
+    let value: serde_json::Value =
+        serde_json::from_str(&text).expect("chart config is not valid JSON");
+    let watch = &value["observability"]["infra_watch"];
+
+    let live: BTreeSet<&str> = watch["rules"]
+        .as_array()
+        .expect("observability.infra_watch.rules is not an array")
+        .iter()
+        .filter_map(|rule| rule["name"].as_str())
+        .collect();
+    let retired: BTreeSet<&str> = watch["retired_rules"]
+        .as_array()
+        .expect("observability.infra_watch.retired_rules is not an array")
+        .iter()
+        .filter_map(|name| name.as_str())
+        .collect();
+
+    let mut complaints: Vec<String> = Vec::new();
+    for name in &retired {
+        if live.contains(name) {
+            complaints.push(format!(
+                "{name} 同时出现在 rules 与 retired_rules 里——它一边被求值、一边被结算，\
+                 每拍关掉又点亮"
+            ));
+        }
+    }
+    // 这一条是本仓撤掉的那条规则：它的名字必须留在名单里，否则那行永远关不掉。
+    if !retired.contains("live_image_not_on_mainline") {
+        complaints.push(
+            "live_image_not_on_mainline 已从 rules 里删掉，却不在 retired_rules 里：\
+             它留下的 firing 行没有任何东西会去结算"
+                .to_string(),
+        );
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
