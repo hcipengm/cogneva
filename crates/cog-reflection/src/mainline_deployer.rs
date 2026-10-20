@@ -289,6 +289,16 @@ fn split_http_base(base: &str) -> Option<(String, u16, String)> {
     ))
 }
 
+/// check run 的链接里那个工作流运行 id：
+/// `https://github.com/{owner}/{repo}/actions/runs/{id}/job/{job}`。
+///
+/// check run 本身不带工作流字段，链接是唯一能把它连回工作流身份的地方。
+fn actions_run_id(url: &str) -> Option<String> {
+    let rest = url.split_once("/actions/runs/")?.1;
+    let id: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    (!id.is_empty()).then_some(id)
+}
+
 /// 单平台 manifest 的 config blob digest（多平台 index 没有这一层）。
 fn config_digest_of(manifest: &serde_json::Value) -> Option<String> {
     manifest
@@ -1522,6 +1532,23 @@ const CI_HOLD_ENDED_EVENT: &str = "ci_hold_ended";
 /// 一个环足够回答"最近几版都怎么被放的"，又不让状态文件随历史线性长大。
 const CI_HOLD_END_KEEP: usize = 16;
 
+/// 出现在这个仓库的检查里、却**不判这棵树**的那些工作流。
+///
+/// GitHub 会为 Pages 生成一条工作流：它不在仓库的 `.github/workflows/` 里
+/// （API 给出的 `path` 是 `dynamic/...`），跑在每次推送上，发布的是 Pages 站点
+/// 而不是这个 rev 的产物。2026-10-20 实测：`87523fc6` 上其余 15 条检查全绿，
+/// 它因为仓库缺 `id-token: write` 权限、拿不到 OIDC 令牌而失败，于是整条主线被
+/// 按住——另一个产物的故障决定了这棵树能不能滚。
+///
+/// 判据是**工作流身份**（`/actions/runs/{id}` 的 `path`），不是检查名：那条检查
+/// 叫 `deploy`，而仓库里将来完全可以有自己的 `deploy`，按名字排除会把它一起
+/// 静默排掉——正是"新出现的检查默认仍然要被判到"要防的那种。名字只写进日志与
+/// 状态，不进匹配条件。
+///
+/// 解析不出身份时不排除：排除是一句"这条检查不判这棵树"的断言，拿不到身份就
+/// 断言不了，照常判失败。
+const NON_JUDGING_CHECK_WORKFLOWS: &[&str] = &["dynamic/pages/pages-build-deployment"];
+
 /// 一段"连续被构建闸拒绝、终于拿到槽"的结局。
 ///
 /// `advance_deferrals` 只答"现在连输几轮"，拿到槽的那一轮写回 0——于是这一段等了
@@ -1588,6 +1615,14 @@ struct CiVerdictRecord {
     /// 结论来自提交状态兜底（那个接口不逐条给名字），后者不等于「没有失败项」。
     #[serde(default)]
     failed_checks: Vec<String>,
+    /// 报失败、却被排除在判词之外的那几条检查，形如 `<platform>:<name>@<workflow>`。
+    ///
+    /// `failed_checks` 说「哪些红了」，这一格说「哪几条红了但没有被算进去，以及
+    /// 凭什么」。排除的凭据是工作流身份，不是检查名，所以名字后面必须带着它——
+    /// 只记名字，读的人无法把它和同名的本地检查分开。空列表的意思是这一轮没有
+    /// 排除任何检查，不是「这一格不适用」。
+    #[serde(default)]
+    excluded_checks: Vec<String>,
     /// 做出这个判词的时刻，unix 秒。
     #[serde(default)]
     decided_unix: i64,
@@ -2974,11 +3009,21 @@ impl MainlineDeployer {
         api_base: &str,
         repo: &str,
         rev: &str,
-    ) -> (Option<bool>, Option<CiNoVerdictReason>, Vec<String>) {
+    ) -> (
+        Option<bool>,
+        Option<CiNoVerdictReason>,
+        Vec<String>,
+        Vec<(String, String)>,
+    ) {
         let mut conclusions: Vec<String> = Vec::new();
         // 报失败的那几条检查的名字。日志只说「有一项」时，定位要绕到仓库外去问；
         // 名字在这一次读里就有，不带出去等于把已经拿到的东西丢掉。
         let mut failed_checks: Vec<String> = Vec::new();
+        // 报失败、但**不判这棵树**的那几条检查（见 [`NON_JUDGING_CHECK_WORKFLOWS`]）：
+        // 名字与它所属的工作流。它们不进折判据——那正是它们被排除的意思——所以
+        // 必须从这一路带出去记下来，否则"为什么这版带着一条红检查却滚了"在下游
+        // 只剩一个绿灯，谁都答不上来。
+        let mut excluded_checks: Vec<(String, String)> = Vec::new();
         let mut saw_signal = false;
         let mut pending = false;
         // 原因由这一段的形状决定（读到内容 / 读失败），没有"默认值"这种中间态：
@@ -2994,6 +3039,19 @@ impl MainlineDeployer {
                         saw_signal = true;
                         match run.get("conclusion").and_then(|c| c.as_str()) {
                             Some(c) => {
+                                if matches!(c, "failure" | "error") {
+                                    if let Some(workflow) =
+                                        self.excluded_check_workflow(api_base, repo, run).await
+                                    {
+                                        let name = run
+                                            .get("name")
+                                            .and_then(|n| n.as_str())
+                                            .filter(|n| !n.is_empty())
+                                            .unwrap_or("<unnamed>");
+                                        excluded_checks.push((name.to_string(), workflow));
+                                        continue;
+                                    }
+                                }
                                 conclusions.push(c.to_string());
                                 if matches!(c, "failure" | "error") {
                                     if let Some(name) = run.get("name").and_then(|n| n.as_str()) {
@@ -3019,7 +3077,7 @@ impl MainlineDeployer {
         if let Some(verdict) =
             cog_core::contract::ci::fold_ci_signals(saw_signal, pending, &conclusions)
         {
-            return (Some(verdict), None, failed_checks);
+            return (Some(verdict), None, failed_checks, excluded_checks);
         }
         // 只用提交状态上报 CI 的仓库（没有 check runs），与落地通道同一条兜底。
         if let Ok(status) = self
@@ -3027,8 +3085,12 @@ impl MainlineDeployer {
             .await
         {
             match status.get("state").and_then(|s| s.as_str()) {
-                Some("success") => return (Some(true), None, failed_checks),
-                Some("failure") | Some("error") => return (Some(false), None, failed_checks),
+                Some("success") => {
+                    return (Some(true), None, failed_checks, excluded_checks);
+                }
+                Some("failure") | Some("error") => {
+                    return (Some(false), None, failed_checks, excluded_checks);
+                }
                 // 接口答了、状态字段却不可判。只有 check-runs 那边本来就什么也没说时才
                 // 换成这一格：两边都没给出可判的东西，这一格比 `no_runs` 更贴近实情。
                 // 反过来说，check-runs 说的是"还在跑"时不让它覆盖——那是两种话里更准的那个。
@@ -3038,7 +3100,40 @@ impl MainlineDeployer {
                 _ => {}
             }
         }
-        (None, Some(reason), failed_checks)
+        (None, Some(reason), failed_checks, excluded_checks)
+    }
+
+    /// 这条报失败的检查属于哪个**不判这棵树**的工作流：属于就给它的 `path`，
+    /// 否则（包括解析不出身份）`None`。
+    ///
+    /// 只对报失败的检查问，且匹配表为空时一次也不问——多问一次是一个额外的
+    /// 往返，而通过的检查不影响判词。
+    ///
+    /// 身份取自 `/actions/runs/{id}`：check run 本身的字段里没有工作流，只有
+    /// 链接里的运行 id。拿不到身份就照常判失败——排除是一句"这条检查不判这棵树"
+    /// 的断言，断言不了就不能替它免责。
+    async fn excluded_check_workflow(
+        &self,
+        api_base: &str,
+        repo: &str,
+        run: &serde_json::Value,
+    ) -> Option<String> {
+        if NON_JUDGING_CHECK_WORKFLOWS.is_empty() {
+            return None;
+        }
+        let run_id = ["details_url", "html_url"]
+            .iter()
+            .filter_map(|key| run.get(*key).and_then(|v| v.as_str()))
+            .find_map(actions_run_id)?;
+        let workflow = self
+            .platform_get_json(api_base, &format!("/repos/{repo}/actions/runs/{run_id}"))
+            .await
+            .ok()?;
+        let path = workflow.get("path").and_then(|p| p.as_str())?.trim();
+        NON_JUDGING_CHECK_WORKFLOWS
+            .iter()
+            .find(|known| **known == path)
+            .map(|known| (*known).to_string())
     }
 
     /// 要滚的这个 rev 在上游各平台的 CI 结论。`Some(false)` = 至少一个平台
@@ -3058,17 +3153,23 @@ impl MainlineDeployer {
     /// **结构上**就不会回答 check-runs，于是它的沉默是每一轮都加一的常数。常数本身
     /// 没有信息，却会把另一端真实的同名原因淹掉——不带平台时，读的人只能靠
     /// 「一轮里几条」去猜是哪一条在沉默。
-    /// 要滚的这个 rev 在上游各平台的 CI 结论，连同报失败的那几条检查的名字。
+    /// 要滚的这个 rev 在上游各平台的 CI 结论，连同报失败的那几条检查的名字，
+    /// 以及报失败却被排除在判词之外的那几条（形如 `<platform>:<name>@<workflow>`）。
     ///
     /// 名字带平台前缀：同一次判据会把两端镜像仓库的检查折在一起，而两个仓库上同名的
     /// 检查是两件事。名字只在有 check runs 时才有；结论来自提交状态兜底时它是空的——
     /// 空不等于「没有失败项」，它等于「这个平台上没有可命名的检查」。
+    ///
+    /// 被排除的那几条另起一列而不是混进失败名：这一列是「上游有一条红检查，而判词
+    /// 仍然放行」的唯一凭据。它为空与「没有排除任何检查」同形，所以它每次只带本轮
+    /// 实际排掉的那几条，不做累计。
     async fn ci_verdict_with_failures(
         &self,
         rev: &str,
-    ) -> (Option<bool>, Vec<String>, Vec<String>) {
+    ) -> (Option<bool>, Vec<String>, Vec<String>, Vec<String>) {
         let mut verdicts = Vec::new();
         let mut failed: Vec<String> = Vec::new();
+        let mut excluded: Vec<String> = Vec::new();
         let mut reasons: Vec<(&'static str, CiNoVerdictReason)> = Vec::new();
         for up in &self.cfg.upstreams {
             let platform = up.platform.slug();
@@ -3084,8 +3185,13 @@ impl MainlineDeployer {
                 continue;
             };
             let repo = up.repo.trim().trim_end_matches(".git");
-            let (verdict, reason, names) = self.platform_ci_verdict(base, repo, rev).await;
+            let (verdict, reason, names, skipped) = self.platform_ci_verdict(base, repo, rev).await;
             failed.extend(names.into_iter().map(|n| format!("{platform}:{n}")));
+            for (name, workflow) in skipped {
+                self.record_ci_check_excluded_reading(platform, &workflow)
+                    .await;
+                excluded.push(format!("{platform}:{name}@{workflow}"));
+            }
             if let Some(v) = verdict {
                 verdicts.push(v);
             }
@@ -3109,7 +3215,7 @@ impl MainlineDeployer {
             .iter()
             .map(|(platform, reason)| format!("{platform}:{}", reason.label()))
             .collect();
-        (verdict, failed, reason_slugs)
+        (verdict, failed, reason_slugs, excluded)
     }
 
     /// 上游 CI 已经给出明确的失败结论就扣住这个 rev；`Ok(true)` = 扣住了。
@@ -3134,8 +3240,26 @@ impl MainlineDeployer {
         state: &mut MainlineState,
         rev: &str,
     ) -> SFResult<bool> {
-        let (verdict, failed_checks, reasons) = self.ci_verdict_with_failures(rev).await;
-        self.record_ci_verdict_in_state(state, rev, verdict, reasons, failed_checks.clone())?;
+        let (verdict, failed_checks, reasons, excluded_checks) =
+            self.ci_verdict_with_failures(rev).await;
+        self.record_ci_verdict_in_state(
+            state,
+            rev,
+            verdict,
+            reasons,
+            failed_checks.clone(),
+            excluded_checks.clone(),
+        )?;
+        if !excluded_checks.is_empty() {
+            // 放行也要说：这一版上游确实有一条红检查，只是那条不判这棵树。
+            // 不写这一行，判词面只剩一个 `pass`，而"为什么带着红检查也滚了"
+            // 要回到仓库外去问。
+            info!(
+                rev = %rev12(rev),
+                excluded_checks = %excluded_checks.join(","),
+                "checks that do not judge this tree were left out of the CI verdict"
+            );
+        }
         if verdict != Some(false) {
             self.record_ci_hold_reading(0).await;
             return Ok(false);
@@ -3256,6 +3380,7 @@ impl MainlineDeployer {
         verdict: Option<bool>,
         reasons: Vec<String>,
         failed_checks: Vec<String>,
+        excluded_checks: Vec<String>,
     ) -> SFResult<()> {
         let slug = match verdict {
             Some(true) => "pass",
@@ -3267,6 +3392,7 @@ impl MainlineDeployer {
                 && r.verdict == slug
                 && r.reasons == reasons
                 && r.failed_checks == failed_checks
+                && r.excluded_checks == excluded_checks
         });
         if unchanged {
             return Ok(());
@@ -3276,6 +3402,7 @@ impl MainlineDeployer {
             verdict: slug.to_string(),
             reasons,
             failed_checks,
+            excluded_checks,
             decided_unix: chrono::Utc::now().timestamp(),
         });
         self.save_state(state)
@@ -3314,6 +3441,33 @@ impl MainlineDeployer {
         let _ = metrics
             .record_counter(
                 cog_core::metric_names::MAINLINE_CI_VERDICT_TOTAL,
+                1.0,
+                labels,
+            )
+            .await;
+    }
+
+    /// 判词之外那条失败：上游报了一条红检查，而它所属的工作流不判这棵树。
+    ///
+    /// 排除让判词照常绿，于是"有一条红检查"这件事在判词面上完全消失——它不会
+    /// 出现在 `verdict` 的任何一格，也不会出现在 `failed_checks` 里（那几格数的是
+    /// 扣住这版的检查）。没有这一格，"排除了几次"与"从没排除过"同形；而排除本身
+    /// 是一句会过期的断言（工作流变了、身份改了），一个从没加过的计数看不出它
+    /// 还在不在起作用。
+    ///
+    /// 标签是**工作流身份**（`path`）与平台，不带检查名：名字是那条工作流的输出，
+    /// 身份才是判据。一次提问里每条被排掉的检查加一，与判词计数同一步、同样一轮
+    /// 两次提问各加一。
+    async fn record_ci_check_excluded_reading(&self, platform: &str, workflow: &str) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("platform".to_string(), platform.to_string());
+        labels.insert("workflow".to_string(), workflow.to_string());
+        let _ = metrics
+            .record_counter(
+                cog_core::metric_names::MAINLINE_CI_CHECK_EXCLUDED_TOTAL,
                 1.0,
                 labels,
             )
@@ -9393,6 +9547,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             verdict: v.into(),
             reasons: vec!["github:pending".into()],
             failed_checks: Vec::new(),
+            excluded_checks: Vec::new(),
             decided_unix: 190,
         };
 
@@ -9824,6 +9979,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
                 verdict: "fail".into(),
                 reasons: vec!["github:connect_failed".into()],
                 failed_checks: vec!["github:Test".into()],
+                excluded_checks: vec!["github:deploy@dynamic/pages/pages-build-deployment".into()],
                 decided_unix: 1234,
             }),
             last_good_unix: 1700000000,
@@ -11678,10 +11834,120 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        let (verdict, failed, _reasons) = deployer.ci_verdict_with_failures("abc123").await;
+        let (verdict, failed, _reasons, _excluded) =
+            deployer.ci_verdict_with_failures("abc123").await;
         assert_eq!(verdict, Some(false));
         // 只有报失败的那一条，且带平台前缀；成功的那条不进这一列。
         assert_eq!(failed, vec!["github:Clippy".to_string()]);
+        let _ = handle.await.unwrap();
+    }
+
+    /// check run 本身不带工作流字段，身份只能从链接里那个运行 id 追。
+    #[test]
+    fn a_check_run_link_carries_the_workflow_run_id() {
+        assert_eq!(
+            actions_run_id("https://github.com/o/r/actions/runs/39365208523/job/118440472439")
+                .as_deref(),
+            Some("39365208523")
+        );
+        assert_eq!(actions_run_id("https://github.com/o/r/checks/1"), None);
+        assert_eq!(
+            actions_run_id("https://github.com/o/r/actions/runs//job/1"),
+            None
+        );
+    }
+
+    /// 报失败、但所属工作流不判这棵树的那条检查：判词照常绿，它从失败名里消失、
+    /// 在排除名里出现并带着工作流身份。实测形状来自 `87523fc6`：`deploy` 一条红，
+    /// 其余十五条绿。
+    #[tokio::test]
+    async fn a_check_from_a_workflow_that_does_not_judge_this_tree_is_left_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(
+                r#"{"check_runs":[
+                    {"name":"deploy","conclusion":"failure","html_url":"https://github.com/o/r/actions/runs/4242/job/7"},
+                    {"name":"Clippy","conclusion":"success"}]}"#,
+            ),
+            http_200(r#"{"id":4242,"path":"dynamic/pages/pages-build-deployment"}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let (verdict, failed, _reasons, excluded) =
+            deployer.ci_verdict_with_failures("abc123").await;
+        assert_eq!(verdict, Some(true), "被排掉的那条不判这棵树，另一条是绿的");
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(
+            excluded,
+            vec!["github:deploy@dynamic/pages/pages-build-deployment".to_string()]
+        );
+
+        // 身份是从链接里的运行 id 问出来的，不是从检查名猜的。
+        let reqs = handle.await.unwrap();
+        assert!(
+            reqs[1].starts_with("GET /github/repos/owner/repo/actions/runs/4242 "),
+            "{:?}",
+            reqs[1]
+        );
+    }
+
+    /// 同一个名字、不同身份：仓库**自己**的 `deploy` 仍然要判。按名字排除会把
+    /// 它一起静默排掉，这正是这条判据要防的。
+    #[tokio::test]
+    async fn a_local_check_sharing_the_external_name_still_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(
+                r#"{"check_runs":[
+                    {"name":"deploy","conclusion":"failure","html_url":"https://github.com/o/r/actions/runs/4243/job/7"}]}"#,
+            ),
+            http_200(r#"{"id":4243,"path":".github/workflows/pages.yml"}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let (verdict, failed, _reasons, excluded) =
+            deployer.ci_verdict_with_failures("abc123").await;
+        assert_eq!(verdict, Some(false));
+        assert_eq!(failed, vec!["github:deploy".to_string()]);
+        assert!(excluded.is_empty(), "{excluded:?}");
+        let _ = handle.await.unwrap();
+    }
+
+    /// 身份问不出来就不排除：排除是一句"这条检查不判这棵树"的断言，拿不到身份
+    /// 就断言不了，照常扣住。方向在这里是保守的——与整扇门"读不到就放行"相反，
+    /// 因为它只决定一条真失败算不算数。
+    #[tokio::test]
+    async fn a_failed_check_whose_workflow_cannot_be_resolved_still_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(
+                r#"{"check_runs":[
+                    {"name":"deploy","conclusion":"failure","html_url":"https://github.com/o/r/actions/runs/4244/job/7"}]}"#,
+            ),
+            HTTP_404.to_string(),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let (verdict, failed, _reasons, excluded) =
+            deployer.ci_verdict_with_failures("abc123").await;
+        assert_eq!(verdict, Some(false));
+        assert_eq!(failed, vec!["github:deploy".to_string()]);
+        assert!(excluded.is_empty(), "{excluded:?}");
         let _ = handle.await.unwrap();
     }
 
