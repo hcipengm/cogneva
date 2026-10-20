@@ -758,6 +758,24 @@ data:
               "summary": "The {reason} comparison has failed {value} time(s) in the last 6h: the drift reading behind that reason is stale, so \"the two sides agree\" and \"nobody could look\" are indistinguishable right now. One counter carries every comparison -- the declared resource ceilings and the observability stack's delivered manifests each run on their own loop and their own schedule -- and the reason is what says which one is failing, so the count is split by it rather than summed into a number that names neither. Six failures is about an hour of consecutive rounds at either loop's own poll interval, which is past anything a single unreadable moment explains. The count is summed over every process in the namespace rather than read per process: the failures belong to the deployment's rounds, and a per-process counter goes back to zero with the process that reports it, so the alert would resolve on a rollout with the comparison just as broken on the far side"
             },
             {
+              "name": "governance_face_not_on_target",
+              "promql": "max by (face, state) (cogneva_governance_face_state{state!=\"on_target\", state!~\"owner_idle|witness_is_owner|deputy_overlap\"})",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "面 {face} 的漂移判词是 {state}。这个判词由漂移循环按面表与任务图现算：`no_owner` 是这一面没有主人、且缺位三件套不全；`vacancy_expired` 是声明过的缺位已经过期；`drifted_binding` 是未终态任务上的归属与面表不一致、或者有人替面主在跑；`unsigned_handover` 是换了主人却没有签字交接单；`unread` 是这一面根本没读到。判词以标签值的形式出现，所以规则**只点名什么是安静的**（`on_target` 与三个黄档），其余一律报警：反过来写「点名哪些状态要报」的话，明天新增一个状态，它谁都不匹配、表达式为空，报警保持沉默——与「这一族停了」在告警面上同形，而那正是这条规则要防的事。三个黄档（`owner_idle` 在岗但没活、`witness_is_owner` 见证人就是面主、`deputy_overlap` 面主兼副手）不在这里报：它们是只报不判的档，面主的阈值与升级归宿主侧的面读数，在集群里再判一次就多出第二个阈值副本。红档与 `unread` 的处置不同（后者先查存储与选主，不是去改面表），但都不安静，所以都在这条规则的射程里，靠 `state` 标签分开。直接读状态、不叠时长：非 `on_target` 的每一格都已经是结论，没有可容忍的基线，等一个时长只会让「已经漂了半小时」比「漂了」更难解释。判词回到 `on_target` 时这条规则自己熄灭；`cause` 不进 summary，因为它在同一状态内的取值不影响处置，写进报警身份只会让同一个面在不同原因之间反复换一条。"
+            },
+            {
+              "name": "governance_face_reading_stopped",
+              "promql": "absent_over_time(cogneva_governance_face_state[15m])",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "面漂移读数这一族 15 分钟里一条样点都没有：没有任何进程在说「每个面此刻是什么判词」。这条序列由漂移循环在每次抓取时现算现发，所以它消失只有两种解释——进程没了，或者它活着但读不到面表与任务图（存储不可达、没拿到选主权）。两种都不等于「每个面都健康」：没有样点时 `governance_face_not_on_target` 同样是空的，界面会安静地看起来干净，这正是缺席需要自己一条判据的理由。窗口取 15 分钟，够跨过一次滚动重启与数轮循环，又短到不必让人「等一会儿再看」。与「某个面判成 unread」区分：那是循环在跑、只是某一面读不到，处置是查那一面的数据来源；这一条是循环本身没有在发，先查发布进程在不在、有没有选主权，再看它这一轮读取报了什么错。"
+            },
+            {
               "name": "observability_stack_drift_not_repaired",
               "promql": "(min_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[30m:1m]) > 0) and (count_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[1h:1m]) > count_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[30m:1m]))",
               "condition": {
@@ -766,7 +784,7 @@ data:
               "severity": "warning",
               "summary": "On {manifest}, {value} line(s) of a delivered observability manifest have differed from the live stack at every scrape for 30m: the convergence loop compares each file against the cluster before it applies anything, and re-applies whatever differs, so a difference still standing after half an hour means the re-apply is not landing -- the cluster keeps a version of {object} the repository no longer has, and every alert rule, scrape target and dashboard that file declares is served off the stale copy instead of off the declaration. The count is the differing lines of that file's own diff, so it says how far apart the two sides are rather than merely that they disagree. The loop's own verdict says why the apply is not landing"
             },
-    
+
             {
               "name": "orphans_unreaped",
               "promql": "(min_over_time(cogneva_process_zombies[30m]) > 0) and (count_over_time(cogneva_process_zombies[1h]) > count_over_time(cogneva_process_zombies[30m]))",
@@ -1379,7 +1397,7 @@ data:
               "severity": "warning",
               "summary": "The pool is thinning without being empty: {value} upstream(s) are measured as serving while at least one other measured upstream is not. The number reported is the serving side, which is the reading a pool that loses members one at a time produces -- the pool's own down event fires only when the last one goes, and by then capacity has been zero for however long the approach took, so the approach itself had no reader. Only upstreams this gateway has measured are counted: a configured entry that has never been touched publishes no health series at all, so a pool of many where only a few have been asked reads as those few here and this rule says nothing about the rest. The count and the sum are taken over the whole fleet rather than per reporter for the same reason the series is a verdict: it is republished by every gateway pod, and a reading that kept the reporting pod would re-announce a standing thinning as a fresh alert on each rollout. Read it beside the per-upstream verdict rules, which say why a member left the serving side, and beside `llm_upstream_pool_down`, the pool's own down event, which says the serving side reached zero."
             },
-                        {
+                    {
               "name": "llm_pool_open_but_idle",
               "promql": "((max(llm_pool_allowance_tokens and ((time() - llm_pool_allowance_tokens_observed_timestamp_seconds) < 1800)) - max(llm_pool_spent_tokens and ((time() - llm_pool_spent_tokens_observed_timestamp_seconds) < 1800)) - max(llm_pool_reserve_tokens and ((time() - llm_pool_reserve_tokens_observed_timestamp_seconds) < 1800))) >= 0) and on () (max(llm_pool_paced_upstreams and ((time() - llm_pool_paced_upstreams_observed_timestamp_seconds) < 1800)) > 0) and on () (max(cogneva_ready_admission_readings{kind=\"ready\"} and ((time() - cogneva_ready_admission_readings_observed_timestamp_seconds{kind=\"ready\"}) < 1800)) > 0) and on () (sum(changes(llm_usage_readings_total{outcome=~\"read|absent|not_asked\"}[1h])) == 0)",
               "condition": {
@@ -2326,7 +2344,8 @@ data:
                 },
                 "severity": "warning",
                 "summary": "告警落了库、却没有任何出口把它送出去：这批里带了多少条事件，就记多少。`outcome=\"no_channel\"` 是投递链上唯一一格不经过通道的结局——supervisor 桥、infra_watch 与配置声明检查三处在找不到通知器时都会写它，通道标签是 `none`，所以这一格增长的意思不是「某次发送失败了」，而是「这个部署根本没有能收到告警的地方」。这条序列的存在理由就是回答「告警到底送到人手里没有」，而这一族里只有这一格能被规则安全地读：`delivered` 是健康态；`skipped` 是配了通道却没有收件人；`failed` 与 `skipped` 都会自激——规则自己的通知走同一个通知器，发送失败会把这条规则再钉回 firing。`no_channel` 没有这层循环：没有通知器时，这条规则发出的告警同样进不了任何通道，读数只是继续如实说没有人被通知，直到有人配上出口，而这正是它要报的事。阈值取大于 0 而不是某个数量：一条告警没送到人手里就是零送达，没有可容忍的基线。用 30 分钟窗口读 increase 而不是裸读累计值：进程重起把计数器归零不会让它误熄，而持续没有出口时每一轮评估都会再加一批，窗口始终不为空。它由第一个配好的通道自己熄灭：那之后每批告警都落到具体通道的 delivered/failed/skipped 格，no_channel 不再增长，窗口滑出后表达式为空。severity 取 warning 而不是 critical：这是一件配置面的事实，不是某个业务面正在出事；但它亮着的时候，别的规则即使命中也没有人收得到，所以它要人先看见自己。"
-              },
+              }
+          ,
               {
                 "name": "principle_ledger_census_stopped",
                 "promql": "absent_over_time((cogneva_principle_ledger_rows and on() ((time() - max(cogneva_principle_ledger_rows_observed_timestamp_seconds)) < 1800))[30m:1m])",
@@ -2336,8 +2355,7 @@ data:
                 "severity": "warning",
                 "_comment_why_absent": "这条规则问的就是「有没有样点」，所以缺席正是它要报的事：台账行数这一族由持有原则账 pass 的那个进程每次 pass 重写，四个状态格一起发出去。反过来不能用「行数 = 0」当故障——空账是量到的 0，一个还没收过原则的库合法地就是 0 行，把 0 判红等于把正常状态算成故障。",
                 "summary": "原则台账的普查断了：`cogneva_principle_ledger_rows` 这一族（按 `state` 分格：enforced / unenforced / retired / unmeasured）30 分钟里一条样点都没有。它断了不等于台账有问题，而是「原则被落地了多少、还剩多少没量」这件事此刻没有任何人在读：面板空着，与「台账是空的」在界面上同形，而后者是量到的 0、前者是没人量。读之前先看现网：这条序列由发布原则账普查的那一版引入，若集群里跑的镜像 tag 比它旧，规则会一直响而台账并没有停——确认镜像已带上发布者之后仍然空着，才是普查真停了，那时查持有 pass 的进程在不在、以及它自己的日志里发布普查有没有报错。"
-              }
-          ]
+              }]
         },
         "trace_collector": {
           "_comment": "trace 事件按 agent 在内存缓冲直到 AgentEnd 落盘；长任务无界累积会 OOM。超过预算即分块落盘（part 后缀），预算按部署内存定。",

@@ -223,18 +223,6 @@ const UNREGISTERED: &[(&str, Unread)] = &[
         "cogneva_task_graph_measure_failures_total",
         Unread::Gap("reads of the task graph that failed. It is the counter beside the last-success second above, and like it has no reader: without one, a task face shows the last known shape indefinitely and reads as healthy while the reader is down"),
     ),
-    // The face drift loop's verdict, one series per face. The loop reads the
-    // roster and the graph, decides whether each face still matches what was
-    // declared, and publishes that per-face state precisely so the answer does
-    // not require a person to go and look. Nothing reads it: no rule fires on a
-    // face that drifted and no panel lists the faces against their state. A
-    // threshold is derivable -- any state other than the healthy one is the
-    // finding -- so what is owed is the face that would show it, not a number
-    // invented here.
-    (
-        "cogneva_governance_face_state",
-        Unread::Gap("the drift verdict of each declared face, labelled by face. It is what the loop exists to publish and no face carries it: a drifted face is visible only to a process that reads the exposition by hand. The rule owed is the one over the non-healthy states, and the panel owed is the per-face listing that says which face and since when"),
-    ),
     // A name whose fact a face already carries, looked up rather than asserted
     // in prose.
     (
@@ -290,7 +278,16 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// drifted face and no panel lists the faces it is drifting from. The count
 /// went up rather than the series being excused because the reader is exactly
 /// what the loop was built to feed.
-const GAPS_AT_SCRAPE_CENSUS: usize = 14;
+///
+/// Thirteen, when that debt was paid: `governance_face_not_on_target` fires on
+/// every state the enum does not call quiet, and `governance_face_reading_stopped`
+/// on the family going quiet, so a drift now reaches a person without one going
+/// to the exposition. The panel half of that entry is still owed, but a rule is
+/// a face -- the census asks whether anything reads a name, not whether every
+/// reader that was imagined got written. The entry left in the same pass as the
+/// rules and the number came down with it, which is the half of the ratchet
+/// that has to work or the count only ever grows.
+const GAPS_AT_SCRAPE_CENSUS: usize = 13;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.
