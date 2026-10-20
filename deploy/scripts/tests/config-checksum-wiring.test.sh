@@ -12,8 +12,11 @@
 #   2. 删掉一条消费者的注解 → 红，点名那条工作负载；
 #   3. 注解不是 64 位小写十六进制 → 红；
 #   4. 同一形态里两条消费者的指纹不等 → 红；
-#   5. 一种形态里只剩一条消费者 → 红（下界是声明）；
-#   6. 所有产物共用一个写死的指纹 → 红（sha256 表达式被换成字面量）。
+#   5. 一种形态里消费者少于下界 → 红（下界是声明）；
+#   6. 所有产物共用一个写死的指纹 → 红（sha256 表达式被换成字面量）；
+#   7. 只给 env 配 ConfigMap 的那两条消费者（安全网关、沙箱执行器）之一删注解 → 红；
+#   8. 把指纹改回只哈希 app-config.yaml → 红（真渲染两次，只动 env 配置，
+#      指纹不变——这正是「配置改了却不滚动」那个失败形状）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +24,8 @@ repo="$(cd "${here}/../../.." && pwd)"
 gate="${repo}/deploy/scripts/check-config-checksum-wiring.sh"
 evolution_single="deploy/rendered/k3s-single/41-deployment-cogneva-evolution.yaml"
 main_single="deploy/rendered/k3s-single/41-deployment-cogneva.yaml"
+sandbox_single="deploy/rendered/k3s-single/41-deployment-cogneva-sandbox-executor.yaml"
+helper="deploy/helm/cogneva/templates/_helpers.tpl"
 pass=0
 fail=0
 ck() { # $1 名称 $2 期望 0/1 $3 命令输出 $4 退出码
@@ -40,6 +45,8 @@ mirror() {
   mkdir -p "${work}/root/deploy"
   cp -r "${repo}/deploy/rendered" "${work}/root/deploy/rendered"
   cp -r "${repo}/deploy/k3s" "${work}/root/deploy/k3s"
+  # chart 也要进副本：门禁第二段要真渲染两次，只镜像产物的话那一段没得跑。
+  cp -r "${repo}/deploy/helm" "${work}/root/deploy/helm"
 }
 run() { ROOT="${work}/root" bash "${gate}" "${work}/root" 2>&1 || true; }
 rc() { ROOT="${work}/root" bash "${gate}" "${work}/root" >/dev/null 2>&1; echo $?; }
@@ -48,7 +55,7 @@ rc() { ROOT="${work}/root" bash "${gate}" "${work}/root" >/dev/null 2>&1; echo $
 mirror
 out="$(run)"
 ck "1. 真树：绿" 0 "$out" "$(rc)"
-ck_has "1. 报出消费者条数（不是空跑）" "条读 cogneva-json 的工作负载" "$out"
+ck_has "1. 报出消费者条数（不是空跑）" "条读 chart 配置的工作负载" "$out"
 
 # 2. 删掉 evolution 的注解 → 红，点名它
 mirror
@@ -78,7 +85,7 @@ mirror
 rm -f "${work}/root/${evolution_single}"
 out="$(run)"
 ck "5. 消费者只剩一条：红" 1 "$out" "$(rc)"
-ck_has "5. 报出下界" "下界是 2" "$out"
+ck_has "5. 报出下界" "下界是 4" "$out"
 
 # 6. 所有产物共用一个写死的指纹 → 红
 mirror
@@ -90,6 +97,26 @@ find "${work}/root/deploy/rendered" "${work}/root/deploy/k3s" -name '*.yaml' -pr
 out="$(run)"
 ck "6. 写死的字面量：红" 1 "$out" "$(rc)"
 ck_has "6. 说清是全等" "写死的字面量" "$out"
+
+# 7. 只读 env 那份配置的工作负载删掉注解 → 红
+#    这一条在门禁只管 cogneva-json 时是绿的：沙箱执行器只经 envFrom 取
+#    cogneva-config，不挂任何卷，旧口径根本看不见它。
+mirror
+sed -i '/checksum\/config:/d' "${work}/root/${sandbox_single}"
+out="$(run)"
+ck "7. 只读 env 配置的那条删注解：红" 1 "$out" "$(rc)"
+ck_has "7. 点名沙箱执行器" "cogneva-sandbox-executor" "$out"
+ck_has "7. 说清它读的是哪份配置" "cogneva-config" "$out"
+
+# 8. 指纹改回只哈希卷里那份（app-config.yaml）→ 红
+#    产物里四条注解仍然齐、仍然同值，第一段全绿；红的是第二段——真渲染两次，
+#    只动 env 配置，指纹不变。这就是「配好地址、升级成功、Pod 一个没换」。
+mirror
+sed -i 's|{{- $env := include (print $.Template.BasePath "/configmap.yaml") . -}}|{{- $env := "" -}}|' \
+  "${work}/root/${helper}"
+out="$(run)"
+ck "8. 指纹不跟 env 配置变：红" 1 "$out" "$(rc)"
+ck_has "8. 说清是 env 配置没进指纹" "只改 env 那份配置" "$out"
 
 printf '\n%s\n' "通过 ${pass}，失败 ${fail}"
 [ "${fail}" -eq 0 ]

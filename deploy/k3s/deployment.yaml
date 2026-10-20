@@ -29,9 +29,10 @@ spec:
         # 配置内容变了，Pod 模板必须跟着变，否则 Deployment 不滚动：卷里的文件会被
         # kubelet 更新，进程却还按启动时读到的那份配置跑，而 `helm upgrade` 的读数
         # 一切正常。2026-10-20 演练装实测过两个方向——升级只改 ConfigMap 时主应用
-        # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。注解值取渲染后的配置
-        # 文档哈希：内容变则滚动，内容不变则第二次升级一个 Pod 都不换。
-        checksum/config: fb97424c26dd344f4417cda7bc40b3c52379ee21e4857a028cdfd9efb3c37352
+        # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。指纹同时覆盖 env 那份
+        # cogneva-config（通知/告警出口地址在那里），只哈希卷里那份会让「配好地址但
+        # 不重启」永远挂不上出口。
+        checksum/config: 76e7a52e644617246f0ed9fa7b07458a60ae5bfcfbbf21db6654d49794ca51c1
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
