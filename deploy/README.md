@@ -33,6 +33,7 @@ Kubernetes 节）。用户不需要在 K3s / 标准 K8s / Helm 之间做选择�
 |---|---|
 | `render-deploy.sh` | 用 `helm template -f profiles/<p>.yaml` 把 chart 渲染进 `rendered/<profile>/`；`--check` 做 CI 新鲜度门禁（重渲染有 diff 即红） |
 | `check-deploy-parity.sh` | chart k3s profile 渲染 vs `k3s/` 静态清单的**字段级 parity** 门禁：资源集合、每工作负载的 Pod 模板标签与容器内外全部字段、Service/NetworkPolicy/Ingress/StorageClass/Namespace/ServiceAccount/CronJob 的整份对象、治理对象与 ConfigMap 的整份 spec（安装来源标签除外）。比了多少资源、多少类由脚本自己报（资源随拓扑增减，别在文档里钉死），CI 强制 |
+| `check-config-checksum-wiring.sh` | 配置内容与 Pod 身份的接线门禁：Pod 模板引用 ConfigMap `cogneva-json` 的工作负载必须带 `checksum/config`（64 位 sha256），否则只改配置的升级不会滚动——配置换了、Pod 还是旧的，而渲染、parity、Pod 状态三面全绿。同一份产物里消费者的指纹必须相同，形态之间不能全等（全等＝表达式被换成写死的字面量）。CI 强制 |
 | `check-cross-layer-reconcile.sh` | 资源账三层对账读数：配额记账的 `used` ≤ 节点 `allocatable`；每节点 `Σanon` + 该节点 file 的 7 天最低 < `MemTotal`（并列 PSI full）；准入余量 `hard - used` 装得下部署器下一次滚动 Job 的声明上限（`used` 含运行时自建的 Pod，渲染期门禁看不见）。某层读不到报 2 而不是报绿。定时载体见 `install-cross-layer-reconcile.sh` |
 | `check-container-headroom.sh` | 容器内存余量读数：窗口内峰值 RSS 对声明上限（逐容器，默认红线 0.85），加窗口内 `OOMKilled` 终止记录。判的是**单个容器**上「实际要过的量 vs 它的上限」——集群总量全绿时它仍可以是红的。定时载体见 `install-container-headroom.sh` |
 | `init-secrets.sh` | 安装时**随机生成**内部密钥（pg/redis/内部签名）并创建 Secret；幂等不覆盖已有值；元启动 apply 前自动跑 |

@@ -657,6 +657,12 @@ jobs:
         run: bash deploy/scripts/check-deploy-parity.sh
       - name: Check rendered profiles are fresh
         run: bash deploy/scripts/render-deploy.sh --check
+      # 配置内容与 Pod 身份的接线：读 Cogneva 配置的工作负载必须带它的 sha256 指纹，
+      # 否则只改配置的那次升级不会滚动——配置换了、Pod 还是旧的，而渲染成功、
+      # parity 对齐、Pod 全 Running 三面都绿。这条注解此前没有任何门禁看着，
+      # 从 chart 与静态清单里一起删掉，上面两道都不会红。
+      - name: Check config checksum wiring
+        run: bash deploy/scripts/check-config-checksum-wiring.sh
       # git 身份自举的接线：Secret 写权的宿主必须带基线仓库 env，且全集群同值。
       # 这类缺陷在渲染期没有症状（清单合法、parity 也绿），只有这条判据盯得住。
       - name: Check git identity wiring
