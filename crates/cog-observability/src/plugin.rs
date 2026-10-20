@@ -640,6 +640,15 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         } else {
             info!(outlets = ?alert_outlets, "Alert outlets configured");
         }
+        // The log line above dies with this pod. Publish the same list as a
+        // reading so that "there is nowhere for an alert to go" survives as a
+        // value instead of as an absence, before anything else in this block
+        // can decide not to run.
+        publish_alert_channels(
+            ctx.consume_service::<dyn cog_core::MetricsBackend>(),
+            &alert_outlets,
+        )
+        .await;
 
         // ── Alert bridge: notification outlets + persistent state machine ──
         let alert_store = self.alert_store.clone();
@@ -1065,6 +1074,49 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
     }
 }
 
+/// Publish which outlets this deployment can deliver through, one series per
+/// configured kind at 1.
+///
+/// An empty list still writes one row — `channel="none"` at 0 — because the
+/// family has to exist when there is no outlet: the dispatch counter only
+/// moves when a batch is sent, so a quiet deployment with nothing configured
+/// and a quiet deployment with a working webhook are the same absence on every
+/// other series. The value is a constant per process, not an accumulation, so
+/// a reader takes one series rather than adding the copies.
+async fn publish_alert_channels(
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    outlets: &[&str],
+) {
+    let Some(metrics) = metrics else { return };
+    if outlets.is_empty() {
+        let labels = HashMap::from([("channel".to_string(), "none".to_string())]);
+        if let Err(e) = metrics
+            .record_gauge(
+                cog_core::metric_names::ALERT_CHANNELS_CONFIGURED,
+                0.0,
+                labels,
+            )
+            .await
+        {
+            warn!(error = %e, "could not record the alert outlet reading");
+        }
+        return;
+    }
+    for outlet in outlets {
+        let labels = HashMap::from([("channel".to_string(), (*outlet).to_string())]);
+        if let Err(e) = metrics
+            .record_gauge(
+                cog_core::metric_names::ALERT_CHANNELS_CONFIGURED,
+                1.0,
+                labels,
+            )
+            .await
+        {
+            warn!(channel = %outlet, error = %e, "could not record the alert outlet reading");
+        }
+    }
+}
+
 /// The dispatcher for a set of channels, or `None` when there is nothing to
 /// deliver to.
 ///
@@ -1278,6 +1330,152 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Holds every gauge write so a cell can read the series a scrape would.
+    #[derive(Default)]
+    struct Gauges {
+        calls: std::sync::Mutex<Vec<(String, f64, HashMap<String, String>)>>,
+    }
+
+    impl Gauges {
+        /// `(channel, value)` per recorded write on the outlet family.
+        fn outlets(&self) -> Vec<(String, f64)> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(name, value, labels)| {
+                    assert_eq!(name, "cogneva_alert_channels_configured");
+                    (labels.get("channel").cloned().unwrap_or_default(), *value)
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::MetricsBackend for Gauges {
+        async fn record_gauge(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.as_str().to_string(), value, labels));
+            Ok(())
+        }
+
+        async fn record_counter(
+            &self,
+            _name: cog_core::MetricName,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn record_histogram(
+            &self,
+            _name: cog_core::MetricName,
+            _value: f64,
+            _labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn query_gauge_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<Utc>,
+            _end: chrono::DateTime<Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_gauge_latest(
+            &self,
+            _name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_counter_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<Utc>,
+            _end: chrono::DateTime<Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_counter_totals(
+            &self,
+            _name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_histogram_totals(
+            &self,
+            _name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::HistogramTotals>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_histogram_range(
+            &self,
+            _name: &str,
+            _start: chrono::DateTime<Utc>,
+            _end: chrono::DateTime<Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_metric_names(
+            &self,
+            _metric_type: cog_core::MetricType,
+        ) -> cog_core::SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn health_check(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A deployment with no outlet must still answer on the series: the whole
+    /// point of the family is that "nobody can be told" is a value, so a
+    /// backend that is handed nothing would leave the reader with the
+    /// absence this reading exists to remove.
+    #[tokio::test]
+    async fn no_outlet_is_a_zero_row_rather_than_no_series() {
+        let backend = Arc::new(Gauges::default());
+        publish_alert_channels(Some(backend.clone()), &[]).await;
+        assert_eq!(backend.outlets(), vec![("none".to_string(), 0.0)]);
+    }
+
+    /// With outlets configured the family names them, one row per kind, so the
+    /// reading answers *which* path an alert can take and not only whether one
+    /// exists.
+    #[tokio::test]
+    async fn each_configured_outlet_is_its_own_row() {
+        let backend = Arc::new(Gauges::default());
+        publish_alert_channels(Some(backend.clone()), &["webhook", "email"]).await;
+        assert_eq!(
+            backend.outlets(),
+            vec![("webhook".to_string(), 1.0), ("email".to_string(), 1.0)]
+        );
+    }
+
+    /// No metrics service in the assembly is not an error to record: there is
+    /// nowhere to write, and the caller must not fail the whole start over a
+    /// reading.
+    #[tokio::test]
+    async fn a_deployment_without_a_metrics_backend_still_starts() {
+        publish_alert_channels(None, &["webhook"]).await;
+    }
 
     fn inst(rule: &str, pairs: &[(&str, &str)], state: AlertState) -> AlertInstance {
         AlertInstance {
