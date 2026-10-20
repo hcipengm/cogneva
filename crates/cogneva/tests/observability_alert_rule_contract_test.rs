@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use cog_gateway::security_gateway::{RangeReadBaseline, RANGE_READ_BASELINES};
+use serde::Deserialize;
 
 #[path = "common/closed_set.rs"]
 mod closed_set;
@@ -1088,6 +1089,34 @@ const FOREIGN: &[(&str, &str)] = &[
         "cogneva_acceptance_items",
         "同一生产者，一族按 `verdict` 标签分的计数（九种判词各一条）。只有 `stale` 意味着规格与代码不一致，其余八种是「还没轮到 / 跑不起来 / 机器判不了」——并成一条会让规格说谎与工具没跑同形",
     ),
+    (
+        "host_reading_producer_up",
+        "宿主读数聚合器 `scripts/host/cogneva-host-readings.sh`（私有仓），由它按 `scripts/data/host-readings.tsv` 逐行拉起生产者，并把每拍跑成没跑成印成这条判活序列。它只有聚合器能发：单个生产者退出码为 127 时与崩溃同形，聚合器是唯一知道「这一行没脚本」的地方",
+    ),
+    (
+        "host_reading_producer_unreadable",
+        "同上（生产者跑成了，却一条序列都没发）。它与 `up` 必须分成两条：脚本崩了与输入读不到修法不同，合成一格就指不出该改哪边",
+    ),
+    (
+        "cogneva_host_credential_surface_age_seconds",
+        "宿主凭证面生产者 `scripts/host/cogneva-credential-surface-state-reading.sh`（私有仓），经聚合器以 `job=\"cogneva-host-readings\"` 暴露。它判的是归档最后一行的年龄：一个读「每拍追加一行」的归档的生产者，停更之后每一拍照样跑成、判词照样是 aligned，只有这一条会往后退",
+    ),
+    (
+        "cogneva_host_credential_surface_measured",
+        "同上（这一面从没跑成过时只发 0、不发年龄）。缺席不会告警，所以「从没量过」必须有一条自己的序列，否则它与「量过、只是旧」在规则里是同一个空集",
+    ),
+    (
+        "cogneva_host_credential_surface_period_seconds",
+        "同上（拉起这一拍的那个 timer 声明的周期，由 `systemd-analyze calendar` 读声明而不是读瞬时状态）。判「停了多久」的界是「几倍周期」：周期写死在规则里时，有人改了调度而界不会跟着改，失败方向是静默的；两个来源一个 30 分钟、一个 6 小时，一个常数套不住两个。量不出来时整条序列不印，由 absent() 那条规则报缺席",
+    ),
+    (
+        "cogneva_host_credential_surface_aligned",
+        "同上（归档最后一条判词是不是 aligned）。三态互不重叠：drift 的形状是 measured=1、aligned=0、unreadable=0，读的人不必反推",
+    ),
+    (
+        "cogneva_host_credential_surface_unreadable",
+        "同上（门没读成，什么也没判）。它与「判成不一致」修法相反——那一格去修适配器，这一格去修读取路径，所以是两条规则而不是一条",
+    ),
     ("up", "Prometheus 采集目标存活序列"),
 ];
 
@@ -1121,6 +1150,71 @@ fn chart_rules() -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+/// The directory holding the rules this repo applies from a manifest rather
+/// than from the chart.
+const RULE_MANIFESTS_DIR: &str = "deploy/k3s/observability/manifests";
+
+/// Every rule carried by a `PrometheusRule` manifest here, name to expression,
+/// in file order.
+///
+/// The chart is not the only place this repo ships rules: `deploy/k3s/` carries
+/// its own `PrometheusRule` objects, and the cluster applies those directly. A
+/// rule there that reads a series nothing publishes never fires, and a gate
+/// that only reads the chart says nothing about it. The directory is scanned
+/// rather than listed, because a hard-coded list of manifests is the same blind
+/// spot one level down.
+///
+/// Recording rules are in reach too: "the series this reads does not exist" is
+/// the same defect whether the rule alerts on it or records it.
+fn manifest_rules() -> Vec<(String, String)> {
+    let dir = repo_root().join(RULE_MANIFESTS_DIR);
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{} unreadable: {e}", dir.display()))
+        .map(|entry| entry.expect("manifest entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext == "yaml" || ext == "yml")
+        })
+        .collect();
+    paths.sort();
+
+    let mut rules = Vec::new();
+    for path in paths {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
+        // A manifest file holds several documents, so the single-document
+        // parser rejects the file itself. A document that will not parse is a
+        // failure rather than a skip: skipping it would drop whichever rules it
+        // carried and leave the gate green on a torn file.
+        for document in serde_yaml::Deserializer::from_str(&text) {
+            let doc = serde_yaml::Value::deserialize(document).unwrap_or_else(|e| {
+                panic!("{} has a document that will not parse: {e}", path.display())
+            });
+            if doc["kind"].as_str() != Some("PrometheusRule") {
+                continue;
+            }
+            for group in doc["spec"]["groups"].as_sequence().into_iter().flatten() {
+                for rule in group["rules"].as_sequence().into_iter().flatten() {
+                    let name = rule["alert"].as_str().or_else(|| rule["record"].as_str());
+                    if let (Some(name), Some(expr)) = (name, rule["expr"].as_str()) {
+                        rules.push((name.to_string(), expr.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    rules
+}
+
+/// Every rule this repo ships: the ones the chart renders plus the ones a
+/// manifest applies directly. A check whose docstring says "this repo ships"
+/// reads this, not the chart alone.
+fn shipped_rules() -> Vec<(String, String)> {
+    let mut rules = chart_rules();
+    rules.extend(manifest_rules());
+    rules
 }
 
 /// The alert-delivery counter is written by the same notifier every rule's
@@ -1179,7 +1273,7 @@ fn delivery_reader_complaints(promql: &str) -> Vec<String> {
 #[test]
 fn a_rule_that_watches_alert_delivery_reads_only_the_cell_its_own_delivery_cannot_move() {
     let mut complaints: Vec<String> = Vec::new();
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         for complaint in delivery_reader_complaints(&promql) {
             complaints.push(format!("{rule}: {complaint}\n    {promql}"));
         }
@@ -1230,7 +1324,7 @@ fn every_series_an_alert_rule_reads_is_one_something_produces() {
     let foreign: BTreeSet<&str> = FOREIGN.iter().map(|(n, _)| *n).collect();
 
     let mut unknown: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         for name in metric_names_in(&promql) {
             if produced.contains(name.as_str())
                 || foreign.contains(name.as_str())
@@ -1278,7 +1372,7 @@ fn a_difference_read_of_a_metering_family_is_one_the_producer_declared() {
     let declared: BTreeSet<&str> = RANGE_READ_BASELINES.iter().map(|(n, _)| *n).collect();
     let mut undeclared: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut readers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         for family in difference_reads(&promql) {
             if declared.contains(family.as_str()) {
                 readers.entry(family).or_default().insert(rule.clone());
@@ -1348,7 +1442,7 @@ fn a_difference_read_of_a_metering_family_is_one_the_producer_declared() {
 #[test]
 fn no_rule_expression_has_a_known_unparseable_shape() {
     let mut complaints: Vec<String> = Vec::new();
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         for complaint in shape_complaints(&promql) {
             complaints.push(format!("{rule}: {complaint}\n    {promql}"));
         }
@@ -1387,15 +1481,14 @@ fn sums_in_flight_time(metric: &str) -> bool {
 /// missing reading: the alert fires on a number nobody can interpret, and the
 /// threshold picked for it was picked by reading the same wrong quantity.
 ///
-/// "This repo ships" is the whole of the reach. The check reads the rules the
-/// chart renders, and a rule carried by a third party in its own
-/// `PrometheusRule` object is not in its view. Nothing ships such a rule today,
-/// so there is no gap to close; but the reach is the chart's rules, not every
-/// rule the cluster runs, and the name says so.
+/// "This repo ships" is the whole of the reach: the rules the chart renders and
+/// the ones a `PrometheusRule` manifest here applies. A rule a third party
+/// carries in its own object is still not in view, so the name says the reach
+/// is this repo's rules rather than every rule the cluster runs.
 #[test]
 fn no_rule_this_repo_ships_reads_a_device_counter_as_elapsed_time() {
     let mut complaints: Vec<String> = Vec::new();
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         for metric in metric_names_in(&promql) {
             if sums_in_flight_time(&metric) {
                 complaints.push(format!("{rule} reads {metric}\n    {promql}"));
@@ -1446,7 +1539,7 @@ fn the_device_counter_gate_reports_the_counter_it_is_aimed_at() {
 #[test]
 fn no_guard_suppresses_the_fault_it_watches() {
     let mut complaints: Vec<String> = Vec::new();
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         for complaint in promql::self_suppressing_guard_complaints(&promql) {
             complaints.push(format!("{rule}: {complaint}\n    {promql}"));
         }
@@ -1475,7 +1568,7 @@ fn no_guard_suppresses_the_fault_it_watches() {
 #[test]
 fn a_rule_that_promises_a_duration_reads_a_window_not_two_samples() {
     let mut complaints: Vec<String> = Vec::new();
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         for complaint in lagged_equality_complaints(&promql) {
             complaints.push(format!("{rule}: {complaint}\n    {promql}"));
         }
@@ -1671,7 +1764,7 @@ fn a_rule_windowing_a_durable_gauge_waits_longer_than_the_writers_heartbeat() {
 
     let mut complaints: Vec<String> = Vec::new();
     let mut windowed = 0usize;
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         windowed += windows_over(&promql, &gated).len();
         complaints.extend(durable_window_complaints(&rule, &promql, &gated, heartbeat));
     }
@@ -1752,7 +1845,7 @@ fn a_window_no_longer_than_the_heartbeat_is_reported_and_a_longer_one_is_not() {
 #[test]
 fn a_rule_that_certifies_a_window_requires_the_window_to_be_covered() {
     let mut complaints: Vec<String> = Vec::new();
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         for complaint in uncovered_window_complaints(&promql) {
             complaints.push(format!("{rule}: {complaint}\n    {promql}"));
         }
@@ -1988,7 +2081,7 @@ fn a_rule_over_a_loops_outcome_waits_at_least_one_round() {
         rows.len()
     );
 
-    let rules: BTreeMap<String, String> = chart_rules().into_iter().collect();
+    let rules: BTreeMap<String, String> = shipped_rules().into_iter().collect();
     let mut complaints: Vec<String> = Vec::new();
     let mut windowed = 0usize;
     for row in &rows {
@@ -2152,7 +2245,7 @@ fn a_rule_reading_a_store_gauge_requires_its_writer() {
     let mut complaints: Vec<String> = Vec::new();
     let mut windowed = 0usize;
     let mut bare = 0usize;
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         windowed += windows_over(&promql, &gated).len();
         bare += bare_observation_reads(&promql, &gated).len();
         for complaint in unguarded_store_reading_complaints(&promql, &gated) {
@@ -2263,7 +2356,7 @@ fn a_rule_guarding_the_census_waits_longer_than_the_census_heartbeat() {
     assert!(heartbeat > 0, "普查心跳为 0，下面这条判据恒真");
 
     let mut guarded = 0usize;
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         let Some(bound) =
             companion_age_bound(&promql, cog_core::metric_names::CHANGE_FUNNEL.as_str())
         else {
@@ -2319,7 +2412,7 @@ fn a_rule_guarding_the_index_sample_waits_longer_than_its_heartbeat() {
     ];
     for metric in family {
         let mut guarded = 0usize;
-        for (rule, promql) in chart_rules() {
+        for (rule, promql) in shipped_rules() {
             let Some(bound) = companion_age_bound(&promql, metric) else {
                 continue;
             };
@@ -2395,7 +2488,7 @@ fn a_pass_outcome_rule_is_guarded_on_the_same_horizon_as_its_sibling() {
 /// Every age bound any shipped rule places on this metric's companion clock.
 fn guarded_bounds(metric: &str) -> Vec<u64> {
     let mut bounds = Vec::new();
-    for (_rule, promql) in chart_rules() {
+    for (_rule, promql) in shipped_rules() {
         if let Some(bound) = companion_age_bound(&promql, metric) {
             bounds.push(bound);
         }
@@ -2420,7 +2513,7 @@ fn no_shipped_rule_guards_a_store_gauge_with_a_change_count() {
     let gated = gated_store_gauges();
     let mut offenders: Vec<String> = Vec::new();
     let mut with_age_bound = 0usize;
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         for name in &gated {
             if !promql.contains(name.as_str()) {
                 continue;
@@ -2485,7 +2578,7 @@ fn a_rule_judging_the_policy_store_readouts_waits_longer_than_their_loop() {
 
     let mut bounded = 0usize;
     let mut complaints: Vec<String> = Vec::new();
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         if !promql.contains(series) {
             continue;
         }
@@ -2583,7 +2676,7 @@ fn every_label_value_a_rule_has_to_select_is_selected_by_one() {
     use cog_collaboration::ChangeYieldOutcome;
     use cog_github::redrive_budget::{BudgetSide, RedriveRefusal};
 
-    let rules = chart_rules();
+    let rules = shipped_rules();
     let domains: [(&str, Vec<&str>); 3] = [
         (
             cog_github::redrive_budget::REDRIVE_REFUSALS_METRIC.as_str(),
@@ -2693,7 +2786,7 @@ fn the_watchers_own_rule_names_are_not_configured_rule_names() {
         "two self-alerts share a rule name"
     );
 
-    let configured: BTreeSet<String> = chart_rules().into_iter().map(|(name, _)| name).collect();
+    let configured: BTreeSet<String> = shipped_rules().into_iter().map(|(name, _)| name).collect();
     let collision: Vec<&&str> = own
         .iter()
         .filter(|name| configured.contains(**name))
@@ -2706,7 +2799,7 @@ fn the_watchers_own_rule_names_are_not_configured_rule_names() {
 
 #[test]
 fn the_tables_hold_no_series_that_no_rule_reads() {
-    let read: BTreeSet<String> = chart_rules()
+    let read: BTreeSet<String> = shipped_rules()
         .iter()
         .flat_map(|(_, promql)| metric_names_in(promql))
         .collect();
@@ -3199,7 +3292,7 @@ const GAPS_AT_CENSUS: usize = 28;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
-    let rule_read: BTreeSet<String> = chart_rules()
+    let rule_read: BTreeSet<String> = shipped_rules()
         .iter()
         .flat_map(|(_, promql)| metric_names_in(promql))
         .collect();
@@ -3321,7 +3414,7 @@ fn every_series_the_closed_set_publishes_has_a_decided_reader() {
 /// only thing standing between a false exemption and a green run.
 #[test]
 fn an_elsewhere_entry_that_names_a_reader_no_rule_has_is_reported() {
-    let any_read: BTreeSet<String> = chart_rules()
+    let any_read: BTreeSet<String> = shipped_rules()
         .iter()
         .flat_map(|(_, promql)| metric_names_in(promql))
         .chain(dashboard::series())
@@ -3999,7 +4092,7 @@ fn a_range_aggregate_that_reads_a_filter_is_reported() {
 #[test]
 fn no_written_rule_reads_a_filter_through_a_range_aggregate() {
     let mut complaints: Vec<String> = Vec::new();
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         for complaint in filtered_range_aggregate_complaints(&promql) {
             complaints.push(format!("{rule}: {complaint}\n    {promql}"));
         }
@@ -4193,7 +4286,7 @@ fn a_set_operand_that_maps_instead_of_filtering_is_reported() {
 #[test]
 fn no_written_rule_maps_a_set_operand_instead_of_filtering_it() {
     let mut complaints: Vec<String> = Vec::new();
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         for complaint in indicator_on_a_set_operand_complaints(&promql) {
             complaints.push(format!("{rule}: {complaint}\n    {promql}"));
         }
@@ -4226,7 +4319,7 @@ fn no_written_rule_maps_a_set_operand_instead_of_filtering_it() {
 #[test]
 fn no_rule_aggregates_a_series_whose_derivation_makes_the_aggregate_wrong() {
     let mut complaints: Vec<String> = Vec::new();
-    for (rule, promql) in chart_rules() {
+    for (rule, promql) in shipped_rules() {
         for span in promql::summed_spans(&promql) {
             for name in promql::metric_names_in(&span) {
                 if !cog_core::is_registered_metric(&name) {
