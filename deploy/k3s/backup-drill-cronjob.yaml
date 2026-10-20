@@ -37,17 +37,27 @@ spec:
             app.kubernetes.io/component: backup-drill
         spec:
           restartPolicy: Never
+          # 演练与备份同一个专用非 root uid；与 chart 逐字段对齐（parity 门）。
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            runAsGroup: 1001
           # 凭证面的根目录由 kubelet 按宿主 umask 建（DirectoryOrCreate → 0755），
           # 演练会把它量成一条违例。只修一次不够，目录重建后又回到默认模式，
           # 所以每次开工前收紧。主容器为了不写卷是只读挂载，chmod 只能放在 init。
+          # 收紧之前先把属主交给主容器的 uid：0700 的目录对非属主连遍历都不给。
           initContainers:
             - name: tighten-credential-surface
               image: localhost:30500/cogneva:local
               imagePullPolicy: Always
+              securityContext:
+                runAsNonRoot: false
+                runAsUser: 0
               command:
                 - sh
                 - -c
                 - >-
+                  chown -R 1001:1001 /backups /offsite /offsite-state &&
                   chmod 0700 /backups /offsite /offsite-state
               volumeMounts:
                 - name: backup

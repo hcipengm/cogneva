@@ -3190,6 +3190,121 @@ fn requested_package(args: impl Iterator<Item = String>) -> Result<(Option<Strin
     Ok((package, also_unproven))
 }
 
+/// 卷上最新那份包的属主与「此刻读它的进程」不是同一个人，就说清是谁不对。
+///
+/// 比较的是**包的属主**与**读包的进程**，两边任一变动都会让这一格红：把 Job 换成
+/// 非 root 之后属主没跟上、或者有人以 root 往卷里补了一份包。它不是配置项——一个
+/// 可配的「期望 uid」既能配错，也能在两边一起漂走时继续绿。
+fn package_owner_violation(package: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(package).ok()?;
+    let reader = process_uid()?;
+    owner_violation(meta.uid(), reader, &package.display().to_string())
+}
+
+/// 判词本身，与文件系统和进程无关，单独可测。
+fn owner_violation(owner: u32, reader: u32, package: &str) -> Option<String> {
+    if owner == reader && reader != 0 {
+        return None;
+    }
+    Some(format!(
+        "卷上最新那份包 {package} 的属主是 uid {owner}，读它的进程是 uid {reader}：\
+         备份与演练必须跑在同一个专用非 root uid 上。uid 0 时「包只有属主可读」不是隔离，\
+         两个 uid 不同则是有人以另一个身份往卷里写了包——两种都要人来处理，不是包的问题"
+    ))
+}
+
+/// 读本进程的 uid。Linux 上是 `/proc/self/status` 的 `Uid:` 行（真实、有效、保存、
+/// 文件系统四个值，取第一个即真实 uid），不为一件事引一个依赖。
+fn process_uid() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|uid| uid.parse().ok())
+}
+
+/// 打开的这一份包，是不是它名字里那一跑写出来的。
+///
+/// 路径与字节数回答不了这件事：把一份旧包的字节复制成一个新名字，名字对、大小对、
+/// 卷上「最新那份」指向它，演练会照常 ok，而它考的是几个月前那一晚。包内
+/// `manifest.created_at` 是写出这份包的那一跑落盘前读的钟，账本里同一个 run_id 的
+/// `started_at`/`finished_at` 是那一跑的起止：包内时刻落在窗外，就说明名字与内容
+/// 不是同一跑。账本里没有这一跑（包比账本早）时不判——那是另一件事，不该在这里
+/// 借「开错包」的名义红。
+async fn package_belongs_to_its_run(
+    live: &PgPool,
+    name: &str,
+    manifest_created_at: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Ok(created_at) = DateTime::parse_from_rfc3339(manifest_created_at) else {
+        return Ok(Some(format!(
+            "包 {name} 的清单里 created_at 读不出时刻（{manifest_created_at}）：\
+             这一份是不是它名字说的那一跑写的，没有可对照的数"
+        )));
+    };
+    let created_at = created_at.with_timezone(&Utc);
+    let run_id = name.strip_suffix(PACKAGE_SUFFIX).unwrap_or(name);
+    let row: Option<(DateTime<Utc>, Option<DateTime<Utc>>)> =
+        sqlx::query_as("SELECT started_at, finished_at FROM backup_runs WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_optional(live)
+            .await?;
+    let Some((started_at, finished_at)) = row else {
+        return Ok(None);
+    };
+    let Some(finished_at) = finished_at else {
+        // 账本里这一跑还没收尾：不是这一份包的问题，收尾那一行有它自己的读者。
+        return Ok(None);
+    };
+    Ok(run_window_violation(
+        name,
+        created_at,
+        started_at,
+        finished_at,
+    ))
+}
+
+/// 包内时刻该落在这一跑的起止之间，判词单独可测。
+fn run_window_violation(
+    name: &str,
+    created_at: DateTime<Utc>,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+) -> Option<String> {
+    // 一分钟的宽容只用来吸收时钟粒度，不用来吸收「差了几天」。
+    let slack = chrono::Duration::seconds(60);
+    if created_at >= started_at - slack && created_at <= finished_at + slack {
+        return None;
+    }
+    let run_id = name.strip_suffix(PACKAGE_SUFFIX).unwrap_or(name);
+    Some(format!(
+        "包 {name} 里的时刻 {created_at} 不在账本里 {run_id} 那一跑的起止之间\
+         （{started_at} … {finished_at}）：名字与内容是两跑的东西，这份字节不是它名字说的那一份"
+    ))
+}
+
+/// 没点名时，默认那一趟必须打开卷上最新那份。
+fn default_pass_must_open_the_newest(
+    chosen: &Path,
+    packages: &[PathBuf],
+    named: bool,
+) -> Option<String> {
+    if named {
+        return None;
+    }
+    let newest = packages.last()?;
+    if chosen == newest {
+        return None;
+    }
+    Some(format!(
+        "演练默认该打开卷上最新那份 {}，实际打开的是 {}：这是选择规则的问题，不是包的问题",
+        newest.display(),
+        chosen.display()
+    ))
+}
+
 /// 这一趟开哪一份包。
 ///
 /// 默认最新那一份，与本次改动之前的行为一致；点名时接受带不带 `.tar.zst` 两种写法。
@@ -3571,9 +3686,23 @@ async fn drill_once(
         if let Some(reason) = newest_package_key_mismatch(newest, keyed)? {
             return Err(reason.into());
         }
+        // 读包的人与写包的人得是同一个专用 uid，而且不能是 root。这件事没有
+        // 别的读数：谁哪天以 root 往卷里写了一份包，下一场演练不会报「属主不对」，
+        // 而是要么读不了（报成「包坏了」），要么在 root 上照样读得动、永远沉默。
+        // 所以这里把它判成红，阈值就是「最新那份的属主 = 此刻读它的 uid」。
+        if let Some(reason) = package_owner_violation(newest) {
+            return Err(reason.into());
+        }
     }
     let package = choose_package(&packages, cfg.package.as_deref())
         .map_err(|e| format!("{}：{e}", cfg.backup_dir.display()))?;
+    // `outcome=ok` 只说明这一趟跑完了，「读到的是老包」也能 ok。没点名时的默认
+    // 那一趟必须是卷上最新那份——否则每晚的绿覆盖的不是今晚写出来的包。
+    if let Some(reason) =
+        default_pass_must_open_the_newest(&package, &packages, cfg.package.is_some())
+    {
+        return Err(reason.into());
+    }
     let name = package
         .file_name()
         .and_then(|n| n.to_str())
@@ -3584,7 +3713,8 @@ async fn drill_once(
         return Err(format!("包名 {name} 里读不出时刻，无法判断它是什么时候写的").into());
     }
     drill.package_bytes = std::fs::metadata(&package).ok().map(|m| m.len() as i64);
-    drill.package = Some(name);
+    // 留一份名字到清单解析之后：打开的那份字节要拿它跟账本里的那一跑对时。
+    drill.package = Some(name.clone());
 
     // 卷外那一份是不是卷上**最新**那份：同名、同字节数。名字相同而大小不同是复制
     // 写到一半，名字不同是它停在了更早的那一晚——两种都是「第二份不是今晚的备份」，
@@ -3612,6 +3742,11 @@ async fn drill_once(
         revision = %manifest.revision,
         "drill: package opened"
     );
+    // 名字说这是哪一晚的包，内容也得这么说。这一条不读 outcome：它问的是「开的是
+    // 不是这一份」，而一套把旧包改名当成新包的流程每一晚都会 ok。
+    if let Some(reason) = package_belongs_to_its_run(live, &name, &manifest.created_at).await? {
+        return Err(reason.into());
+    }
     // 清单说这个包里有什么，此刻盘上是事实。这一段覆盖的是 qdrant 与对象层：
     // 它们不进空库，能核的就是「清单声明的字节与文件数是不是真的在包里」。
     verify_package_against_manifest(&pkg_dir, &manifest)?;
@@ -4182,6 +4317,59 @@ mod tests {
             chosen, packages[1],
             "不点名时开最新那份，行为与加这个参数之前一致"
         );
+    }
+
+    #[test]
+    fn a_package_written_by_another_uid_is_a_failure_and_so_is_reading_it_as_root() {
+        // 同一个专用 uid：放行。
+        assert!(owner_violation(1001, 1001, "/backups/p.tar.zst").is_none());
+        // 包是 root 写的、读它的是 1001：下一场演练能读就沉默，读不了就报成「包坏了」，
+        // 两种都指不到真正该修的地方。
+        let wrong_owner = owner_violation(0, 1001, "/backups/p.tar.zst").unwrap();
+        assert!(wrong_owner.contains("uid 0"), "{wrong_owner}");
+        assert!(wrong_owner.contains("uid 1001"), "{wrong_owner}");
+        // 两边都是 root：属主对得上，但「只有属主可读」这时等于谁都能读。
+        let all_root = owner_violation(0, 0, "/backups/p.tar.zst").unwrap();
+        assert!(all_root.contains("不是隔离"), "{all_root}");
+        // 读的人是 root、包属于 1001：同样不是隔离，也不能借「属主不一致」蒙过去。
+        assert!(owner_violation(1001, 0, "/backups/p.tar.zst").is_some());
+    }
+
+    #[test]
+    fn the_package_in_hand_has_to_be_the_one_its_name_names() {
+        let started = Utc.with_ymd_and_hms(2026, 10, 20, 3, 17, 0).unwrap();
+        let finished = Utc.with_ymd_and_hms(2026, 10, 20, 3, 25, 0).unwrap();
+        let name = package_name(started);
+        // 正常：包内时刻落在那一跑里。
+        let inside = Utc.with_ymd_and_hms(2026, 10, 20, 3, 24, 0).unwrap();
+        assert!(run_window_violation(&name, inside, started, finished).is_none());
+        // 旧包的字节被复制成新名字：名字、大小、mtime 都对，内容里的钟停在几个月前。
+        let from_an_old_run = Utc.with_ymd_and_hms(2026, 7, 1, 3, 20, 0).unwrap();
+        let renamed = run_window_violation(&name, from_an_old_run, started, finished).unwrap();
+        assert!(renamed.contains("名字与内容是两跑的东西"), "{renamed}");
+        // 时钟粒度不算跑偏：起止边缘各一分钟以内仍然放行。
+        let edge = finished + chrono::Duration::seconds(30);
+        assert!(run_window_violation(&name, edge, started, finished).is_none());
+    }
+
+    #[test]
+    fn the_default_pass_has_to_open_the_newest_package() {
+        let packages: Vec<PathBuf> = ["2026-10-18", "2026-10-19"]
+            .iter()
+            .map(|day| {
+                PathBuf::from(format!(
+                    "/backups/{PACKAGE_PREFIX}{day}-010101{PACKAGE_SUFFIX}"
+                ))
+            })
+            .collect();
+        assert!(default_pass_must_open_the_newest(&packages[1], &packages, false).is_none());
+        // 默认那一趟打开了老包：这一跑仍然可能 ok，但它证明的不是今晚那份。
+        let drifted = default_pass_must_open_the_newest(&packages[0], &packages, false).unwrap();
+        assert!(drifted.contains("选择规则"), "{drifted}");
+        // 点名开老包是设计好的用法（第二趟），不判。
+        assert!(default_pass_must_open_the_newest(&packages[0], &packages, true).is_none());
+        // 卷上一份都没有时由 choose_package 报，这里不重复判。
+        assert!(default_pass_must_open_the_newest(&packages[0], &[], false).is_none());
     }
 
     #[test]

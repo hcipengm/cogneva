@@ -37,6 +37,11 @@ spec:
             app.kubernetes.io/component: backup
         spec:
           restartPolicy: Never
+          # 备份以专用非 root uid 运行；与 chart 逐字段对齐（parity 门）。
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            runAsGroup: 1001
           # 进化卷是 RWO：读它要求备份 Pod 与进化 Pod 同节点。单节点 K3s 上这条
           # 恒成立，写在这里是为了与 chart 的 k3s-single 渲染逐字段对齐——两边
           # 漂一个字段，parity 门就会红。
@@ -55,10 +60,15 @@ spec:
             - name: tighten-credential-surface
               image: localhost:30500/cogneva:local
               imagePullPolicy: Always
+              # Pod 里唯一以 root 跑的一步：先把属主交给主容器的 uid，再收紧模式。
+              securityContext:
+                runAsNonRoot: false
+                runAsUser: 0
               command:
                 - sh
                 - -c
                 - >-
+                  chown -R 1001:1001 /backups /offsite &&
                   chmod 0700 /backups /offsite
               volumeMounts:
                 - name: backup

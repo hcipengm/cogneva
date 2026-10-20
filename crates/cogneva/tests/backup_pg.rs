@@ -305,8 +305,9 @@ async fn pg_restore_loads_a_package_that_still_carries_the_generated_column() {
 /// 生成列。所以这个用例的输入由外部给，不自己造。
 ///
 /// 输入由外部给，前提也就由外部定：保留窗口滑过导出改动之后，窗口里最老的包
-/// 也不再带生成列，这时这个用例证明不了它要证明的事。它先读包的表头，前提不在
-/// 就报「包不对」并点明要哪个日期之前的包，而不是把结论写成「恢复漏了」。
+/// 也不再带生成列，这时这个用例证明不了它要证明的事。它先读包的表头；前提不在
+/// 就报 unjudged（判不了）——点明手上的包写于何时、要哪个 commit 之前的包，然后
+/// 不做任何断言。既不是「恢复漏了」，也不是「恢复对了」：没有输入就没有结论。
 ///
 /// ```text
 /// COGNEVA_TEST_DATABASE_URL=postgres://…/cog_restore_probe \
@@ -315,8 +316,10 @@ async fn pg_restore_loads_a_package_that_still_carries_the_generated_column() {
 ///   cargo test -p cogneva --test backup_pg -- --ignored --nocapture
 /// ```
 ///
-/// 这是这个二进制里唯一需要外部输入的一条：CI 的步骤按名字跳过它（没有包时它会
-/// 拒绝而不是通过），其余三条在那里跑。它是一场**手工读数**，不是 CI 的一格。
+/// 这是这个二进制里唯一需要外部输入的一条：CI 的步骤按名字跳过它，其余三条在那里
+/// 跑。它是一场**手工读数**，不是 CI 的一格。前提不在时它报 unjudged 并在 stderr
+/// 留一行（`--nocapture` 之外也能看见），所以「这次跑绿了」与「这次判过了」不是
+/// 同一句话——别把前者当前者。
 #[tokio::test]
 #[ignore = "requires COGNEVA_TEST_DATABASE_URL, COGNEVA_TEST_PACKAGE_PG_DIR and COGNEVA_TEST_PACKAGE_MANIFEST"]
 async fn pg_restore_loads_a_package_written_before_the_schema_moved_on() {
@@ -351,12 +354,30 @@ async fn pg_restore_loads_a_package_written_before_the_schema_moved_on() {
                 .and_then(|text| text.lines().next().map(str::to_string))
         })
         .unwrap_or_default();
-    assert!(
-        header.split(',').any(|column| column.trim() == "is_hot"),
-        "这份包的 `raw_log_index` 表头里没有生成列 `is_hot`，它写于导出改成点名搬迁列之后，\
-         证明不了「旧包里由目标重算的生成列会被点名」这件事。换一份导出改动\
-         （2026-10-18 17:30Z，commit 1d41e52b）之前写下的包再跑。表头：{header}"
-    );
+    if !header.split(',').any(|column| column.trim() == "is_hot") {
+        // 判不了 ≠ 判不过。输入由外部给，保留窗口按**运行次数**滚，合格包滚完以后
+        // 这条用例手上没有任何能考生成列重算的东西。判红会把人送去修恢复代码，
+        // 而那里没有可修的；判绿会把「没判过」记成「判过了」。两种都不对，
+        // 所以只报 unjudged：把理由和它从什么时候起判不了写出来，然后什么都不断言。
+        //
+        // 直接写 stderr 的句柄而不走 `eprintln!`：libtest 捕获的是 print 宏的输出，
+        // 通过的用例默认不打印它——那样这行提示会跟着绿一起消失，等于把 unjudged
+        // 藏进绿里。这条提示必须在测试**通过**时也能看见。
+        let notice = format!(
+            "unjudged: pg_restore_loads_a_package_written_before_the_schema_moved_on\n\
+             \x20 为什么判不了：手上的包写于 {created_at}，`raw_log_index` 表头没有生成列 `is_hot`；\
+             只有导出改动（commit 1d41e52b，2026-10-18 17:30Z，改成点名搬迁列）之前写下的包才带它。\n\
+             \x20 从什么时候起判不了：合格包滚出保留窗口那一刻。保留按运行次数算\
+             （keep_target 份，每次成功运行裁掉最老的一份），所以那个时点由运行史决定，日期算不出来。\n\
+             \x20 这不是恢复路径的失败，也不是能从代码里修掉的缺陷——别拿它禁行。\
+             要判这条，换一份 1d41e52b 之前写下的包。\n\
+             \x20 表头：{header}",
+            created_at = manifest.created_at,
+        );
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(format!("\n{notice}\n").as_bytes());
+        return;
+    }
 
     let (_probe, url) = own_database("package").await;
 

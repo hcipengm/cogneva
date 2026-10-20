@@ -150,9 +150,21 @@ quiesce_writers
 
 # 先起一个只挂备份卷的暂存 Pod 把包 kubectl cp 进去；恢复 Job 再从卷上读。
 kubectl -n "$NS" delete pod "$STAGE_POD" --ignore-not-found --wait=true
+# 暂存 Pod 以备份/演练同一个专用 uid 写包：kubectl cp 用容器里的 tar 解包，
+# 解出来的文件属主就是容器 uid。以 root 跑的话包会以 root 0600 落盘，下一场
+# 演练（非 root）既读不到它，又会把「属主不是自己」判红——恢复路径自己制造
+# 一次误报。init 先把目录交给这个 uid，否则 0700 的目录连写都不允许。
 kubectl -n "$NS" run "$STAGE_POD" --restart=Never --image="$IMAGE" \
     --overrides='{
       "spec": {
+        "securityContext": {"runAsNonRoot": true, "runAsUser": 1001, "runAsGroup": 1001},
+        "initContainers": [{
+          "name": "own-backups",
+          "image": "'"$IMAGE"'",
+          "command": ["/bin/sh", "-c", "chown -R 1001:1001 /backups"],
+          "securityContext": {"runAsNonRoot": false, "runAsUser": 0},
+          "volumeMounts": [{"name": "backup", "mountPath": "/backups"}]
+        }],
         "containers": [{
           "name": "'"$STAGE_POD"'",
           "image": "'"$IMAGE"'",
@@ -269,6 +281,24 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      # 恢复与备份、演练跑在同一个专用非 root uid 上。恢复读的正是备份写的包，
+      # 三处 uid 一致，「包只有属主可读」才是一句真话；恢复端若还是 root，
+      # A8 在演练那边绿了而换机这一条路照样谁都能读。
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+      # 0700 的卷目录对非属主连遍历都不给，先把属主交给主容器的 uid。
+      initContainers:
+        - name: own-backups
+          image: $IMAGE
+          command: ["/bin/sh", "-c", "chown -R 1001:1001 /backups"]
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+          volumeMounts:
+            - name: backup
+              mountPath: /backups
 $EVOLUTION_AFFINITY
       containers:
         - name: restore

@@ -42,17 +42,28 @@ spec:
             app.kubernetes.io/component: backup-drill
         spec:
           restartPolicy: Never
+          # 同备份：演练必须与备份跑在同一个专用非 root uid 上。它读的正是备份
+          # 写下的包，两个 uid 不一致时「谁能读包」就取决于属主漂到哪一边。
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            runAsGroup: 1001
           # 同备份：演练是唯一同时看得到三处凭证目录的进程，它把「不是 0700 的
           # 目录」量成违例。主容器为了不写卷是只读挂载，收紧权限放在 init 里、
-          # 用可写挂载做——只读挂载上 chmod 会直接失败。
+          # 用可写挂载做——只读挂载上 chmod 会直接失败。收紧之前先把属主交给
+          # 主容器的 uid：0700 的目录对非属主连遍历都不给。
           initContainers:
             - name: tighten-credential-surface
               image: localhost:30500/cogneva:local
               imagePullPolicy: Always
+              securityContext:
+                runAsNonRoot: false
+                runAsUser: 0
               command:
                 - sh
                 - -c
                 - >-
+                  chown -R 1001:1001 /backups /offsite /offsite-state &&
                   chmod 0700 /backups /offsite /offsite-state
               volumeMounts:
                 - name: backup

@@ -34,6 +34,13 @@ spec:
             app.kubernetes.io/component: backup
         spec:
           restartPolicy: Never
+          # 备份以专用非 root uid 运行：它以 root 跑的时候「包只有属主可读」不成立，
+          # 谁能起一个挂得上卷的 Pod 谁就能读走全部包里的明文 Secret 清单。
+          # 不用 fsGroup：local-path 的 PVC 与 /offsite 那条 hostPath 都不过 fsGroup。
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            runAsGroup: 1001
           # 进化卷是 RWO：同一块卷能被读的前提是备份 Pod 与进化 Pod 落在同一
           # 个节点。让调度器按「进化 Pod 所在节点」钉住这一跑；卷自己有节点
           # 亲和时两者一致，没有时这条就是唯一的约束。钉不上就等，等到 Job
@@ -54,10 +61,17 @@ spec:
             - name: tighten-credential-surface
               image: localhost:30500/cogneva:local
               imagePullPolicy: Always
+              # 这个 init 是 Pod 里唯一以 root 跑的一步：把两处目录交给主容器的
+              # uid 再收紧模式。chown 是递归的——卷上已有的包是早先 root 写下的，
+              # 只改目录属主的话非 root 的备份与演练读不到它们。
+              securityContext:
+                runAsNonRoot: false
+                runAsUser: 0
               command:
                 - sh
                 - -c
                 - >-
+                  chown -R 1001:1001 /backups /offsite &&
                   chmod 0700 /backups /offsite
               volumeMounts:
                 - name: backup
