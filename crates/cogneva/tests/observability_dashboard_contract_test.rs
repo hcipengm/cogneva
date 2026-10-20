@@ -124,6 +124,17 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["role"],
         "crates/cog-agent/src/observable.rs",
     ),
+    // How many task rows nobody can be handed, per status. The producer reads
+    // one fact out of the shared store, so every reporting pod carries the same
+    // numbers and the panel draws them with `max`: a sum would multiply the
+    // same row by the number of pods. It exists because the age reading alone
+    // cannot tell one unowned row from a thousand -- it reports only the oldest
+    // one's wait.
+    (
+        "cogneva_task_unowned_rows",
+        &["status"],
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
     // Pool recovery readings. Three separate series rather than one "recovers
     // at" number: which upstream said it, when we will probe again, and how long
     // the window an upstream stated is are answers of different strength, and

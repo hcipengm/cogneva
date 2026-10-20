@@ -230,10 +230,15 @@ const UNREGISTERED: &[(&str, Unread)] = &[
         "cogneva_task_graph_measure_failures_total",
         Unread::Gap("reads of the task graph that failed. It is the counter beside the last-success second above, and like it has no reader: without one, a task face shows the last known shape indefinitely and reads as healthy while the reader is down"),
     ),
-    (
-        "cogneva_task_unowned_rows",
-        Unread::Gap("rows in a state that can still move but with no agent assigned, one series per such state. The age beside it says how long the oldest unowned row waited and reads the same for one row or a thousand, so without this count 'the graph has nobody behind it' has no size -- and no rule or panel names this series either"),
-    ),
+    // A name that had a `Gap` here until a panel was written to carry it:
+    // `cogneva_task_unowned_rows`, the count of rows in a state that can still
+    // move but with nobody assigned to them. The entry is gone and
+    // `GAPS_AT_SCRAPE_CENSUS` came down by one, the same way the stream-read
+    // family left this table. What the panel settles is having a reader; it
+    // does not settle the count's bound -- a rule that watches it has to say
+    // which status it is a budget for, and only the states where a claim is
+    // possible belong on that line. That debt sits on the alert side, beside
+    // the other four task-graph readings above, none of which is drawn yet.
     // The total restated from the status vector above, so that a reader can
     // name the reading instead of summing label cells it does not know the
     // label set of. It publishes no fact of its own: both series come from the
@@ -308,13 +313,16 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// rules and the number came down with it, which is the half of the ratchet
 /// that has to work or the count only ever grows.
 ///
-/// Fourteen, and the one that took it back up is the task graph's unowned-row
+/// Fourteen, and the one that took it back up was the task graph's unowned-row
 /// count: the age beside it is the same family, and the age alone cannot say
-/// how many rows have nobody behind them. It was added to answer a question the
-/// status vector and the age both leave open, so it arrived as a new debt
-/// rather than being folded into the four already counted -- and no rule or
-/// panel names it yet.
-const GAPS_AT_SCRAPE_CENSUS: usize = 14;
+/// how many rows have nobody behind them.
+///
+/// Back to thirteen when that one was paid: a panel draws the count per status,
+/// so the name now has a reader. The debt it was raised for is not the same as
+/// the one left behind -- the four other task-graph readings still have no
+/// reader, and the count's own bound still has no rule -- but the census asks
+/// whether anything reads a name, and now something does.
+const GAPS_AT_SCRAPE_CENSUS: usize = 13;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.

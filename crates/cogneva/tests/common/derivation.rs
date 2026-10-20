@@ -202,6 +202,10 @@ pub const METRIC_DERIVATIONS: &[(&str, MetricDerivation)] = &[
     ("self_evolution_change_yield_total", MetricDerivation::Store),
     ("tier_migration_total", MetricDerivation::Store),
     ("cogneva_change_funnel", MetricDerivation::Store),
+    // Row counts read out of the shared task graph: every pod reports the same
+    // number, so an aggregate over them multiplies one fact by the number of
+    // reporters. `max` is the only aggregate that keeps the number honest.
+    ("cogneva_task_unowned_rows", MetricDerivation::Store),
     ("llm_upstream_healthy", MetricDerivation::Store),
     (
         "cogneva_evolution_learning_recurrence_at_threshold_total",

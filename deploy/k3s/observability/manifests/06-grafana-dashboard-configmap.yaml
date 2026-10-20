@@ -2322,6 +2322,37 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 57,
+          "title": "Unowned Task Rows by Status",
+          "description": "Task rows with no agent that could be handed them, counted per status straight out of the task graph -- one fact written in the shared store, which every pod reads and reports again, so the panel takes the maximum rather than the sum: summing would count one row once per reporting pod. Drawn at zero as well, because 'no row is unowned' is an answer and an absent series would not be. Read beside the age reading: the age says how long the oldest row has waited, and one row waiting a day reads exactly like a thousand, so this is the count that says whether the wait is one row or a queue. A count that grows while the age stays flat is intake arriving faster than it is claimed; a count that is flat and high under a rising age is work nobody is picking up.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 272
+          },
+          "targets": [
+            {
+              "expr": "max by (status) (cogneva_task_unowned_rows)",
+              "legendFormat": "{{status}} unowned",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {
