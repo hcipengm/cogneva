@@ -55,6 +55,21 @@ const ASKING_CALLS: [&str; 4] = [
     "reserve_build_field(\"",
 ];
 
+/// The words the works outside this tree ask under.
+///
+/// The gate has a second client on the host -- the operator repo's
+/// `scripts/host/cogneva-build.sh` -- which takes a slot through the same files
+/// rather than through this crate. Its ask is as real as any call site here and
+/// its refusals land in the same counter, so its words belong on the table; but
+/// no `.rs` file in this workspace spells them, and the orphan check below would
+/// read its cell as a label promising a work that cannot exist.
+///
+/// What this does not do: it cannot see the script, so the words here are a copy
+/// of what the script claims under. The script's own repository pins the copy --
+/// a check there reads `build_what` out of the script and fails when it is not a
+/// word this table lists -- and that check is what makes the copy stay true.
+const OUTSIDE_TREE_ASKS: [&str; 1] = ["host build"];
+
 /// The source root of every workspace crate, which is where a production call
 /// site can be.
 fn crates_root() -> PathBuf {
@@ -154,6 +169,20 @@ fn every_ask_the_build_gate_refuses_lands_in_a_named_cell() {
         unnamed_sites.join("\n")
     );
 
+    // The declaration of outside-tree asks is only worth anything if the words
+    // are on the table: a typo here would leave the real row looking orphaned
+    // (caught below) or, worse, quietly excuse nothing.
+    let misdeclared: Vec<&str> = OUTSIDE_TREE_ASKS
+        .iter()
+        .map(|words| *words)
+        .filter(|words| !named.contains(words))
+        .collect();
+    assert!(
+        misdeclared.is_empty(),
+        "这些声明为树外提问的词不在 BUILD_GATE_ASKERS 表上，声明等于没有:\n{}",
+        misdeclared.join("\n")
+    );
+
     // The other direction: a row no call site asks under is a label promising a
     // work that cannot exist, and it would sit at zero forever reading as a work
     // that simply was never refused.
@@ -161,6 +190,7 @@ fn every_ask_the_build_gate_refuses_lands_in_a_named_cell() {
         .iter()
         .map(|(words, _)| *words)
         .filter(|words| !asked.iter().any(|asked| asked == words))
+        .filter(|words| !OUTSIDE_TREE_ASKS.contains(words))
         .collect();
     assert!(
         orphans.is_empty(),

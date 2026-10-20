@@ -1145,7 +1145,7 @@ impl RefusedBy {
 /// cell, which is what it is. The table is the whole of the vocabulary, so a
 /// caller that starts asking under new words is a reader's problem and not a
 /// silent one: the unnamed cell moves.
-pub const BUILD_GATE_ASKERS: [(&str, &str); 9] = [
+pub const BUILD_GATE_ASKERS: [(&str, &str); 10] = [
     ("evolution build", "evolution_build"),
     ("baseline evaluation", "baseline_evaluation"),
     ("change verification", "change_verification"),
@@ -1155,6 +1155,11 @@ pub const BUILD_GATE_ASKERS: [(&str, &str); 9] = [
     ("registry maintenance", "registry_maintenance"),
     ("buildah store reclaim", "buildah_store_reclaim"),
     ("build-cache-reclaim", "build_cache_reclaim"),
+    // The host's own builder asks through the same files from outside this
+    // process tree; its refusals are counted here like any other work's, and
+    // without this row they were the one refusal in the reading that named no
+    // work at all.
+    ("host build", "host_build"),
 ];
 
 /// The value an ask carries when it asks under words
