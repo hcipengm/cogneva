@@ -2412,12 +2412,12 @@ data:
               },
               {
                 "name": "acceptance_items_stale_persisting",
-                "promql": "max by (node) (min_over_time(cogneva_acceptance_items{verdict=\"stale\"}[30m])) > 0",
+                "promql": "max by (node) ((min_over_time(cogneva_acceptance_items{verdict=\"stale\"}[30m]) > 0) and (count_over_time(cogneva_acceptance_items{verdict=\"stale\"}[1h]) > count_over_time(cogneva_acceptance_items{verdict=\"stale\"}[30m])))",
                 "condition": {
                   "greater_than": 0.0
                 },
                 "severity": "warning",
-                "summary": "验收面连着两趟普查都有规格判成 stale：`cogneva_acceptance_items{verdict=\"stale\"}` 在半小时里每一拍都大于 0。单拍 stale 可能不是规格漂了——这趟普查读的是工作树此刻盘上的样子，别人正在飞的改动会被读成规格与代码对不上；所以判据取「持续」而不取「出现过」，用 `min_over_time` 让窗口里每一拍都必须大于 0。看这条之前先看 `cogneva_acceptance_dirty_files`：树在动的时候先等它静下来再看，静下来仍然连着两趟红，才是规格真的漂了。九种判词里只有 stale 进这条规则，其余八种各有自己的意思（还没轮到、跑不起来、机器判不了），并进来只会让「规格说谎」与「工具没跑」同形。severity 取 warning：它说的是验收规格与代码不一致，不是集群此刻在坏。"
+                "summary": "验收面连着两趟普查都有规格判成 stale：`cogneva_acceptance_items` 上 verdict=stale 的那一条在半小时里每一拍都大于 0，而且要那半小时确实被采样铺满（拿一小时窗口的采样数大于半小时窗口的采样数来证）——不然进程刚起的那几十秒会让半个小时的断言只凭一个样点成立。单拍 stale 可能不是规格漂了——这趟普查读的是工作树此刻盘上的样子，别人正在飞的改动会被读成规格与代码对不上；所以判据取「持续」而不取「出现过」，用 `min_over_time` 让窗口里每一拍都必须大于 0。看这条之前先看 `cogneva_acceptance_dirty_files`：树在动的时候先等它静下来再看，静下来仍然连着两趟红，才是规格真的漂了。九种判词里只有 stale 进这条规则，其余八种各有自己的意思（还没轮到、跑不起来、机器判不了），并进来只会让「规格说谎」与「工具没跑」同形。severity 取 warning：它说的是验收规格与代码不一致，不是集群此刻在坏。"
               }
               ]
         },
