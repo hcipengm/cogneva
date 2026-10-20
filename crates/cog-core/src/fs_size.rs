@@ -323,11 +323,15 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("cog-fssize-{}-{}", name, std::process::id()));
-        fs::remove_dir_all(&dir).ok();
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A scratch tree that removes itself when the test ends. The first version
+    /// returned the path alone and never removed it: one `cargo test` run left
+    /// eleven trees behind, and on a host that runs the suite all day that was
+    /// thousands of directories nothing owned and nothing could name.
+    fn scratch(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("cog-fssize-{name}-"))
+            .tempdir()
+            .unwrap()
     }
 
     fn write(path: &Path, bytes: usize) {
@@ -341,6 +345,7 @@ mod tests {
     #[test]
     fn the_file_walk_totals_to_the_same_bytes_as_the_layers() {
         let root = scratch("files");
+        let root = root.path();
         write(&root.join("debug/deps/lib.rlib"), 100);
         write(&root.join("debug/incremental/obj"), 30);
         write(&root.join("tmp/scratch"), 4);
@@ -371,6 +376,7 @@ mod tests {
     #[test]
     fn the_total_is_the_sum_of_the_layers() {
         let root = scratch("total");
+        let root = root.path();
         write(&root.join("debug/deps/lib.rlib"), 100);
         write(&root.join("debug/incremental/obj"), 30);
         write(&root.join("release/deps/lib.rlib"), 7);
@@ -392,6 +398,7 @@ mod tests {
     #[test]
     fn the_depth_decides_which_layers_are_reported() {
         let root = scratch("depth");
+        let root = root.path();
         write(&root.join("debug/deps/lib.rlib"), 100);
         write(&root.join("debug/cogneva"), 40);
         write(&root.join("debug/incremental/obj"), 30);
@@ -412,6 +419,7 @@ mod tests {
     #[test]
     fn a_file_in_the_root_belongs_to_the_root_layer() {
         let root = scratch("rootfile");
+        let root = root.path();
         write(&root.join("CACHEDIR.TAG"), 5);
         let layers = dir_layers(&root, 2, &[]).unwrap();
         assert_eq!(layers.len(), 1);
@@ -424,6 +432,7 @@ mod tests {
     #[test]
     fn an_excluded_subtree_is_left_out() {
         let root = scratch("exclude");
+        let root = root.path();
         write(&root.join("kept/a"), 10);
         write(&root.join("nested/b"), 900);
         let exclude = vec![root.join("nested")];
@@ -440,7 +449,9 @@ mod tests {
     #[test]
     fn a_symlink_is_neither_counted_nor_followed() {
         let root = scratch("symlink");
+        let root = root.path();
         let outside = scratch("symlink-target");
+        let outside = outside.path();
         write(&outside.join("big"), 4096);
         write(&root.join("real"), 3);
         std::os::unix::fs::symlink(outside.join("big"), root.join("link-to-file")).unwrap();
@@ -460,6 +471,7 @@ mod tests {
     #[test]
     fn a_hardlinked_file_is_counted_once_under_its_first_name() {
         let root = scratch("hardlink");
+        let root = root.path();
         write(&root.join("debug/deps/lib.rlib"), 100);
         write(&root.join("debug/deps/other.rlib"), 5);
         fs::hard_link(
@@ -502,6 +514,7 @@ mod tests {
     #[test]
     fn a_walk_that_cannot_read_the_tree_fails() {
         let root = scratch("missing");
+        let root = root.path();
         write(&root.join("open/a"), 1);
         assert!(dir_size_bytes(&root.join("nowhere"), &[]).is_err());
 
@@ -538,6 +551,7 @@ mod tests {
     #[test]
     fn only_writes_inside_the_window_are_counted() {
         let root = scratch("recent");
+        let root = root.path();
         let now = SystemTime::now();
         let now_secs = now
             .duration_since(SystemTime::UNIX_EPOCH)

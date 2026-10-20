@@ -380,11 +380,47 @@ fn default_state_dir() -> std::path::PathBuf {
 fn default_state_dir() -> std::path::PathBuf {
     static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let d = std::env::temp_dir().join(format!("cogneva-test-state-{}", std::process::id()));
+        let temp = std::env::temp_dir();
+        clear_stale_state_dirs(&temp);
+        let d = temp.join(format!("cogneva-test-state-{}", std::process::id()));
+        // A reused pid inherits the previous run's state and fixtures with it.
+        let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::create_dir_all(&d);
         d
     })
     .clone()
+}
+
+/// Remove the per-process state directories of runs that are over.
+///
+/// Nothing removes one of these when a test process ends, so a host that runs
+/// the suite all day collects one per run. A directory untouched for a day
+/// cannot belong to a live test, so clearing those bounds the set at a day's
+/// runs without giving the tests a shared owner.
+#[cfg(test)]
+fn clear_stale_state_dirs(temp: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(temp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("cogneva-test-state-")
+        {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|written| written.elapsed().ok())
+            .map(|age| age.as_secs() > 86_400)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Persisted assess verdicts (`$COGNEVA_DATA_DIR/assess-verdicts.json`):
@@ -2340,6 +2376,35 @@ mod tests {
     use cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX;
     use cog_core::{SFError, UpstreamFailure};
     use std::sync::Mutex;
+
+    /// The state directory is per process and nothing removes it, so the next
+    /// run has to. It may only remove what is certainly not in use: a directory
+    /// from a run that ended yesterday, and never a name belonging to another
+    /// store in the same temp directory.
+    #[test]
+    fn only_a_day_old_state_dir_is_cleared() {
+        let base = tempfile::tempdir().unwrap();
+        let old = base.path().join("cogneva-test-state-100");
+        let live = base.path().join("cogneva-test-state-200");
+        let other = base.path().join("assess-verdicts-test-100-0.json");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(&other, b"{}").unwrap();
+        let yesterday = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400);
+        std::fs::File::open(&old)
+            .unwrap()
+            .set_modified(yesterday)
+            .unwrap();
+
+        clear_stale_state_dirs(base.path());
+
+        assert!(!old.exists(), "a day-old state dir has to go");
+        assert!(live.exists(), "this run's own state dir has to stay");
+        assert!(
+            other.exists(),
+            "another store's files are not ours to clear"
+        );
+    }
 
     /// The decision reads the cause the transport observed, not how the
     /// provider spelled it. A quota refusal is terminal because of its 402,
