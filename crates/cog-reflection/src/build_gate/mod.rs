@@ -791,6 +791,20 @@ impl HostLoad {
     /// whether to rise to. A ceiling the container has brought down to one stays
     /// one whichever way this goes, so consulting it here would only be a second
     /// place for the same number to be read from.
+    ///
+    /// What this costs, measured on the host the constants were sampled from:
+    /// `IO_CALM_PCT` is 1.0 while a single build's cold compile has driven
+    /// `io some avg10` to 30-58%. So while any build runs the host is not calm,
+    /// and the bound cannot rise; it can only rise in a gap between builds. With
+    /// a bound of one and a pipeline that keeps a build running, those gaps are
+    /// the only moments the number can move -- and the memory dimension reaches
+    /// the same place from the other side, since `MEM_FLOOR_BYTES` sits at the
+    /// observed trough of `MemAvailable` and a host resting near that trough
+    /// derives a ceiling of one on every round. Neither is a fault in the law:
+    /// both are what "rising is earned" means on a host that is actually busy.
+    /// They are written here because whoever next asks why the bound does not
+    /// move will re-derive them from the same two numbers, and the ceiling and
+    /// the bound alone do not show it.
     fn is_calm(&self) -> bool {
         self.pressure.cpu_avg60 < CPU_CALM_PCT
             && self.pressure.io_avg60 < IO_CALM_PCT
