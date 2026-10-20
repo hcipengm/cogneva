@@ -2026,6 +2026,58 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 50,
+          "title": "Build Gate: Reservation Renewal Interval",
+          "description": "The seconds between the claim a work held on the next build and the one it wrote over it, per asker. The lapse panel above only moves when somebody reads a claim after it expired, so a work that renews every ten minutes and still crowds every other builder out reads as zero there; this is the interval that makes that cadence visible while the claim is alive. A row approaching 900 seconds says the renewal cadence, not the build, is the margin, and a row that disappears says that work stopped asking. Zero is a work that has not rewritten a claim it already held, not one that renewed instantly. A renewal that actually crosses the line is not drawn here: the claim reads as stale, the reservation is dropped, and the lapse panel takes the count.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 232
+          },
+          "targets": [
+            {
+              "expr": "max by (asker) (cogneva_build_gate_reservation_renew_gap_seconds)",
+              "legendFormat": "{{asker}} renewal interval",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_build_gate_reservation_renew_gap_seconds)",
+              "legendFormat": "closest to the line",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 900
+                  }
+                ]
+              }
+            }
+          }
         }
       ],
       "templating": {

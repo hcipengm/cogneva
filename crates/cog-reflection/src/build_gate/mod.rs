@@ -275,6 +275,25 @@ const RESERVE_FRESH: Duration = Duration::from_secs(900);
 /// metric name is not a reason to make every crate rebuild.
 pub const BUILD_GATE_RESERVATION_LAPSED_TOTAL: &str = "cogneva_build_gate_reservation_lapsed_total";
 
+/// The seconds between the claim on the next build that a work held and the one
+/// it wrote over it, per asker, on a fixed series set with zero included.
+///
+/// The lapse counter answers "was a claim ever read after it expired", which
+/// needs somebody to look. A work that renews every ten minutes keeps its claim
+/// alive and still crowds every other builder out, and at zero lapses that is
+/// invisible. This reading is the renewal interval itself: a value approaching
+/// [`RESERVE_FRESH`] is a wake where the claim came close to lapsing, and rows
+/// climbing toward it say the renewal cadence, not the build, sets the margin.
+/// A renewal that actually crosses the line is not seen here -- the claim reads
+/// as stale, the reservation is dropped, and the lapse counter takes the count
+/// instead -- so this gauge stays below [`RESERVE_FRESH`] and the pair of
+/// readings covers the two sides of the same line.
+///
+/// Zero is "this work has not rewritten a claim it already held" rather than
+/// "it renewed instantly"; the pair with the lapse counter separates them.
+pub const BUILD_GATE_RESERVATION_RENEW_GAP_SECONDS: &str =
+    "cogneva_build_gate_reservation_renew_gap_seconds";
+
 /// How often a waiter looks again. Builds run for minutes, so this only decides
 /// how promptly a freed slot is picked up.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -469,6 +488,12 @@ struct Counters {
     refused: [[u64; RefusedBy::ALL.len()]; ASKER_CELLS],
     /// One count per asker cell: claims on the next build that lapsed unused.
     lapsed: [u64; ASKER_CELLS],
+    /// The seconds between a work's previous claim on the next build and this
+    /// one, per asker cell: zero until that work rewrites its own claim. The
+    /// lapse counter only fires when somebody reads a claim after it expired, so
+    /// a work that renews every ten minutes and a work that renews every fifteen
+    /// read alike at zero -- this is the reading that separates them.
+    renew_gap_seconds: [u64; ASKER_CELLS],
     wait_ms_total: u64,
     wait_ms_max: u64,
     held_ms_total: u64,
@@ -867,6 +892,20 @@ fn readings(
             .with_label("asker", asker_label(asker).to_string()),
         );
     }
+    // The same closed set again: a work that never rewrote a claim it held has
+    // no interval to report, and publishing nothing for it would make "my
+    // renewal runs at 890 seconds" and "this work never asked" the same absent
+    // row. Zero is the "no renewal yet" value here, and the pair with the lapse
+    // counter is what tells the two apart.
+    for asker in 0..ASKER_CELLS {
+        out.push(
+            label(RawMetric::new(
+                BUILD_GATE_RESERVATION_RENEW_GAP_SECONDS,
+                c.renew_gap_seconds[asker] as f64,
+            ))
+            .with_label("asker", asker_label(asker).to_string()),
+        );
+    }
     out.extend([
         label(RawMetric::new(
             BUILD_GATE_WAIT_MS_TOTAL,
@@ -1258,6 +1297,11 @@ pub struct BuildGate {
     /// that lapses again on a newer claim carries a newer timestamp, so it is
     /// counted again.
     lapsed_counted: Mutex<std::collections::HashMap<String, u64>>,
+    /// The seconds between each work's previous claim on the next build and the
+    /// one it just wrote, per asker cell. Zero means that work has not rewritten
+    /// a claim it already held. See
+    /// [`BUILD_GATE_RESERVATION_RENEW_GAP_SECONDS`].
+    renew_gap_seconds: [AtomicU64; ASKER_CELLS],
     /// How many turns in a row each work has stood down for someone else's
     /// reservation. Reset when it takes the field, so the bound counts one
     /// unbroken series of yields rather than a lifetime total that would
@@ -1331,6 +1375,7 @@ impl BuildGate {
             walk_over_reservation: AtomicU64::new(0),
             lapsed_reservations: std::array::from_fn(|_| AtomicU64::new(0)),
             lapsed_counted: Mutex::new(std::collections::HashMap::new()),
+            renew_gap_seconds: std::array::from_fn(|_| AtomicU64::new(0)),
             walk_yield_streak: Mutex::new(std::collections::HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             events_dropped: AtomicU64::new(0),
@@ -1627,12 +1672,12 @@ impl BuildGate {
         }
         let since = unix_now();
         let path = self.dir.join(RESERVE_FILE);
-        let previous = self.reservation().map(|(holder, _)| holder);
+        let previous = self.reservation();
         // A claim that is already here and fresh belongs to the work that asked
         // first, and it is left to it. Arrivals stand down on the claim itself
         // rather than on who left it, so this ask has nothing to gain by writing
         // over one, and the other work has its turn to lose.
-        if let Some(holder) = previous.as_deref() {
+        if let Some((holder, _)) = previous.as_ref() {
             if holder != what {
                 tracing::info!(
                     what,
@@ -1654,11 +1699,23 @@ impl BuildGate {
         }
         tracing::info!(
             what,
-            previous = previous.as_deref().unwrap_or("none"),
+            previous = previous
+                .as_ref()
+                .map(|(holder, _)| holder.as_str())
+                .unwrap_or("none"),
             fresh_secs = RESERVE_FRESH.as_secs(),
             dir = %self.dir.display(),
             "claiming the next build: builds stand down until this work gets one"
         );
+        // Reaching here means the claim just written either replaced this work's
+        // own fresh one or met an empty field; another work's claim returns
+        // above. The gap is the interval this work's renewal cadence runs at, so
+        // a cadence that crowds the line is visible while the claim is still
+        // alive, not only once it has expired and been read as stale.
+        if let Some((_, previous_since)) = previous {
+            self.renew_gap_seconds[asker_index(what)]
+                .store(since.saturating_sub(previous_since), Ordering::Relaxed);
+        }
         true
     }
 
@@ -1781,6 +1838,9 @@ impl BuildGate {
             }),
             lapsed: std::array::from_fn(|asker| {
                 self.lapsed_reservations[asker].load(Ordering::Relaxed)
+            }),
+            renew_gap_seconds: std::array::from_fn(|asker| {
+                self.renew_gap_seconds[asker].load(Ordering::Relaxed)
             }),
             wait_ms_total: self.wait_ms_total.load(Ordering::Relaxed),
             wait_ms_max: self.wait_ms_max.load(Ordering::Relaxed),
@@ -3969,6 +4029,37 @@ unevictable 28532736
         );
     }
 
+    /// The renewal interval is a reading of its own: a work that rewrites the
+    /// claim it already holds reports the seconds between the claim it wrote and
+    /// the one it wrote over. At zero lapses that interval is the only sign that
+    /// a renewal cadence is running close to the line, so it has to be measured
+    /// where the renewal happens rather than inferred later.
+    #[test]
+    fn a_renewed_claim_reports_the_seconds_since_the_claim_it_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        let path = dir.path().join(RESERVE_FILE);
+        let gap =
+            |gate: &BuildGate| gate.counters().renew_gap_seconds[asker_index("mainline advance")];
+
+        let earlier = unix_now().saturating_sub(300);
+        write_gate_file(&path, &format!("mainline advance\t{earlier}\n")).unwrap();
+        assert!(gate.reserve_build_field("mainline advance"));
+        let got = gap(&gate);
+        assert!(
+            (299..=302).contains(&got),
+            "the renewal reports the 300 seconds since the claim it replaced, got {got}"
+        );
+
+        // The interval belongs to the work that renewed, not to the field: a
+        // work that has not rewritten a claim it held reads as zero.
+        assert_eq!(
+            gate.counters().renew_gap_seconds[asker_index("change verification")],
+            0,
+            "a work that never renewed has no interval to report"
+        );
+    }
+
     /// An exclusion that is turned away by a *build* claims the next one without
     /// its caller having to say so: the sweep's cycle is long and the builds it
     /// is losing to arrive back to back, so the walk after a refusal would find
@@ -4658,6 +4749,10 @@ unevictable 28532736
         ));
         expected.extend(std::iter::repeat_n(
             BUILD_GATE_RESERVATION_LAPSED_TOTAL,
+            ASKER_CELLS,
+        ));
+        expected.extend(std::iter::repeat_n(
+            BUILD_GATE_RESERVATION_RENEW_GAP_SECONDS,
             ASKER_CELLS,
         ));
         expected.extend([

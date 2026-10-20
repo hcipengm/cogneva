@@ -266,6 +266,19 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["dir", "role", "asker"],
         "crates/cog-reflection/src/build_gate/mod.rs",
     ),
+    // The interval that same claim is renewed at, per asker: the seconds between
+    // the claim a work held and the one it wrote over it. The lapse counter only
+    // moves when somebody reads a claim after it expired, so a work that renews
+    // every ten minutes and still takes every turn reads as zero there -- and a
+    // renewal cadence running close to the freshness window is exactly the
+    // holding that never shows up as a lapse. This row is drawn against that
+    // window (the panel's red step sits at the same 900 seconds), so the debt
+    // the census tracks is not taken on here.
+    (
+        "cogneva_build_gate_reservation_renew_gap_seconds",
+        &["dir", "role", "asker"],
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
     // What each change's release build cost the host. Every reading carries the
     // change kind, because the decision these panels feed is which kind of
     // change to spend the next build on, and the outcome, because a deploy
