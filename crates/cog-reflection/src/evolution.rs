@@ -1551,3 +1551,76 @@ mod declared_prompt_matches_fallback {
         }
     }
 }
+
+#[cfg(test)]
+mod agent_default_exemption_carries_its_own_witness {
+    //! principle: feedback_an_exemption_is_also_a_blind_spot
+    //!
+    //! The parity guard above skips one key it lists: `agent:default` is skipped
+    //! with a comment claiming this crate never asks for it and that cog-prompt
+    //! owns the bootstrap prompt. That skip is an exemption, and an exemption is
+    //! by construction a blind spot: it rests on a hypothesis about an ambiguous
+    //! signal -- "this crate never requests that key" -- which the guard itself
+    //! never checks. The day a call site requests `agent:default`, the skip
+    //! silently stops meaning what its comment claims. This is the gate the
+    //! hypothesis is owed: scan this crate's own shipped source for a `get(`/
+    //! `render(` call naming the key, so the exemption can only survive while
+    //! its assumption is still true.
+
+    use std::path::{Path, PathBuf};
+
+    const EXEMPTED_KEY: &str = "agent:default";
+
+    #[test]
+    fn no_call_site_in_this_crate_requests_the_exempted_prompt_key() {
+        let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut files = Vec::new();
+        collect_rust_files(root, &mut files);
+        assert!(
+            !files.is_empty(),
+            "{} must hold the sources this witness scans",
+            root.display()
+        );
+
+        let mut hits = Vec::new();
+        for file in &files {
+            let text =
+                std::fs::read_to_string(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+            for (lineno, line) in text.lines().enumerate() {
+                if requests_exempted_key(line) {
+                    hits.push(format!("{}:{}", file.display(), lineno + 1));
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "the declared-prompt parity guard skips `{EXEMPTED_KEY}` on the claim that this crate never requests \
+             it; these call sites now do, so the exemption is a blind spot until the guard compares that key too:\n{}",
+            hits.join("\n")
+        );
+    }
+
+    fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rust_files(&path, out);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Whether one source line requests the exempted key at a prompt call site:
+    /// a quoted key whose prefix, whitespace stripped, ends in `.get(` or
+    /// `.render(`. The bare string in a key list, or an `if key == ...`
+    /// comparison, is not a request, so the skip's own declaration does not
+    /// witness against itself.
+    fn requests_exempted_key(line: &str) -> bool {
+        let needle = format!("\"{EXEMPTED_KEY}\"");
+        line.match_indices(needle.as_str()).any(|(at, _)| {
+            let before: String = line[..at].chars().filter(|c| !c.is_whitespace()).collect();
+            before.ends_with(".get(") || before.ends_with(".render(")
+        })
+    }
+}
