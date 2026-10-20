@@ -1,4 +1,5 @@
 //! 一条变更的一次执行：进程边界这一侧的交付与那一侧的回程。
+//! principle: feedback_an_escape_belongs_to_the_macro_that_interprets_it
 //!
 //! 构建槽位被宿主拒绝时，回程以 `UnavailableCause::NoBuildSlot` 过边界——这条变更没被判定过，不记成变更失败。
 //! 执行从常驻进程里搬出来之后，判定与产物都必须跨过一次进程边界，而边界两边是
@@ -1723,6 +1724,33 @@ mod tests {
         // 判词与退出码对不上：以退出码为类别，但两份证据不一致本身是坏读，不挑一个信。
         std::fs::write(&path, b"").unwrap();
         assert!(interpret(EXIT_PASSED, &path).is_err());
+    }
+
+    /// 转义属于解释它的那个宏/解析器，不属于文本本身：`format!` 吃掉
+    /// `{{`/`}}` 后交出去的是字面花括号，Rust 字面量吃掉 `\"` 后字符串里只
+    /// 剩引号本身。下一个解释器（serde_json）拿到的是纯文本，不能再看到上
+    /// 一层的转义——同一段文本不允许被解释两次。
+    #[test]
+    fn an_escape_is_consumed_by_the_macro_that_interprets_it() {
+        // `{{`/`}}` 是 format! 的语法：格式化之后只剩单层花括号，载荷里没有
+        // 任何残留的转义痕迹。
+        let rendered = format!("{{\"greeting\":\"hello, {name}\"}}", name = "world");
+        assert_eq!(rendered, "{\"greeting\":\"hello, world\"}");
+        assert!(!rendered.contains("{{"));
+
+        // `\"` 是 Rust 字面量的语法：源码里那道反斜杠从不属于字符串，交到
+        // 字符串手里时只剩引号本身。
+        let literal = "{\"k\":\"v\"}";
+        assert!(!literal.contains('\\'));
+
+        // 两层各吃各的转义之后，serde_json 拿到纯 JSON 并按字面解释：花括号
+        // 是对象结构，引号是字符串边界，没有要它再剥一层的东西。
+        let parsed: serde_json::Value = serde_json::from_str(literal).expect("literal JSON parses");
+        assert_eq!(parsed["k"], serde_json::json!("v"));
+
+        // 反向钉死归属：把上一层的转义漏给下一层（文本里真的带着双花括号）
+        // 时，serde_json 看到的不是它的语法——坏读必须报错，绝不静默重解释。
+        assert!(serde_json::from_str::<serde_json::Value>("{{\"k\":\"v\"}}").is_err());
     }
 
     #[test]
