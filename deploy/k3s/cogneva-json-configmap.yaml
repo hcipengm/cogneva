@@ -2382,6 +2382,42 @@ data:
                 },
                 "severity": "warning",
                 "summary": "clippy 判词账上有读不出来的行：读了 `cogneva_clippy_verdict_unparsable_lines` 条，坏行只计数、不清零——一行坏掉不该让整份读数变成 0，但坏行意味着某一笔的判词可能根本没被读进来，于是账上的 `pending_revs=0` 不再等于「一笔都不欠」。修法在写侧：按行看那份 JSONL（`rev` / `verdict` / `written_at` 缺一个或类型不对都算坏行），把写坏的那几行修好或删掉。阈值取大于 0：这不是一个可以攒着的数，坏行留下的唯一后果是让一个红读成绿。severity 取 warning 而不是 critical：账本身还在、其余判词还读得出来，但要在下一次读账当绿之前修掉。"
+              },
+              {
+                "name": "acceptance_census_never_completed",
+                "promql": "max by (node) (cogneva_acceptance_present) == 0",
+                "condition": {
+                  "equal": 0.0
+                },
+                "severity": "warning",
+                "summary": "验收面：普查跑得成，但**一份跑完的都没有**。`cogneva_acceptance_present` 在「从来没有一份跑完的普查」时写 0，其余时间写 1，且为 0 时这一族其余的序列一条都不印。所以它与「全部通过」在面板上同形：没有快照时判词那一族是空的，看不出是没量过还是全绿——这正是这一格要单独存在、单独告警的理由。先看生产者这一拍为什么一份都没跑完（解析器起不来时生产者会退 3 且什么都不印，那是 `acceptance_reading_stopped` 管的事；退 1 且 `present=0` 才是这一条）。阈值取等于 0 而不是「连续若干拍」：这不是会自己攒回来的数，它停在 0 的每一拍都意味着验收面此刻没有读数可用。severity 取 warning：它挡住的是「验收面有没有读数」，不说明正在跑的东西坏了。"
+              },
+              {
+                "name": "acceptance_reading_stopped",
+                "promql": "absent_over_time(cogneva_acceptance_present[15m])",
+                "condition": {
+                  "greater_than": 0.0
+                },
+                "severity": "warning",
+                "summary": "验收面的读数整族 15 分钟里一条样点都没有：没有任何东西在说「验收现在什么形状」。这一族由首机侧的普查生产者按抓取每拍现印，所以缺席只有两种解释——生产者进程没了，或者它跑起来但一条都读不出来（解析器起不来时它按契约退 3、什么也不印，正是这一种）。两种都不等于「验收全绿」，而 `acceptance_census_never_completed` 在族缺席时同样是空的，于是「没在跑」与「跑得很好」读起来一样。窗口取 15 分钟：普查本身 15 分钟一拍，这个窗口跨得过头，不会被一次滚动重启误报；刷新那一半死掉则由 `acceptance_snapshot_not_refreshed` 分开管，两条一起才没有缝。severity 取 warning，与宿主读数通道其余三条（生产者坏了、读不到、端点抓不到）同档。"
+              },
+              {
+                "name": "acceptance_snapshot_not_refreshed",
+                "promql": "time() - max by (node) (cogneva_acceptance_observed_timestamp_seconds) > 3600",
+                "condition": {
+                  "greater_than": 0.0
+                },
+                "severity": "warning",
+                "summary": "验收面的普查一小时没有出新快照。序列还在、值也不动——这正是「停在最后一次的读数」那种形状：生产者活着、每拍把同一份旧快照印出去，退出码还是 0，面板上一片安静。普查 15 分钟一拍、一趟实测约 5 分钟，所以一小时等于连错过四趟，够长到不会因为某一趟恰好卡在别人半成品上误报。与上一条分工：族整条没了是生产者死，这一条是生产者活着但刷新那一半死了（读快照那一半是毫秒级的，写快照那一半才要跑几分钟）。修法先看生产者自己拉起的刷新进程还在不在、`flock` 是否被上次那趟占住。severity 取 warning。"
+              },
+              {
+                "name": "acceptance_items_stale_persisting",
+                "promql": "max by (node) (min_over_time(cogneva_acceptance_items{verdict=\"stale\"}[30m])) > 0",
+                "condition": {
+                  "greater_than": 0.0
+                },
+                "severity": "warning",
+                "summary": "验收面连着两趟普查都有规格判成 stale：`cogneva_acceptance_items{verdict=\"stale\"}` 在半小时里每一拍都大于 0。单拍 stale 可能不是规格漂了——这趟普查读的是工作树此刻盘上的样子，别人正在飞的改动会被读成规格与代码对不上；所以判据取「持续」而不取「出现过」，用 `min_over_time` 让窗口里每一拍都必须大于 0。看这条之前先看 `cogneva_acceptance_dirty_files`：树在动的时候先等它静下来再看，静下来仍然连着两趟红，才是规格真的漂了。九种判词里只有 stale 进这条规则，其余八种各有自己的意思（还没轮到、跑不起来、机器判不了），并进来只会让「规格说谎」与「工具没跑」同形。severity 取 warning：它说的是验收规格与代码不一致，不是集群此刻在坏。"
               }
               ]
         },

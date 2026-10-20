@@ -1076,6 +1076,18 @@ const FOREIGN: &[(&str, &str)] = &[
         "cogneva_clippy_verdict_unparsable_lines",
         "同上（账上读不出来的行数）。坏行只计数不清零，所以它与 `present` 同时可用：账在不在、以及账写坏了几行，是两个事实",
     ),
+    (
+        "cogneva_acceptance_present",
+        "宿主验收面普查生产者，由主机聚合器以 `job=\"cogneva-host-readings\"` 在宿主的 9464 端口暴露。1 是有一份跑完的普查，0 是从来没有过；为 0 时这一族其余序列一条都不印，所以 0 与「缺席」要由两条规则分开读——缺席是生产者没了，0 是它跑成了却一份都没跑完",
+    ),
+    (
+        "cogneva_acceptance_observed_timestamp_seconds",
+        "同一生产者（最新一趟普查是什么时候量的）。它是「读数停在最后一次」唯一的落点：序列还在、值不动、退出码还是 0，只有拿它和 `time()` 相减才看得出刷新那一半死了",
+    ),
+    (
+        "cogneva_acceptance_items",
+        "同一生产者，一族按 `verdict` 标签分的计数（九种判词各一条）。只有 `stale` 意味着规格与代码不一致，其余八种是「还没轮到 / 跑不起来 / 机器判不了」——并成一条会让规格说谎与工具没跑同形",
+    ),
     ("up", "Prometheus 采集目标存活序列"),
 ];
 
