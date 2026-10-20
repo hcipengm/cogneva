@@ -21,6 +21,9 @@
 #      要存东西」之后最容易破——把口令顺手加进备份 Job 的 env 是最短的那条路。
 #   6. ExecStart 指向的脚本必须还在树里：指针锈了等于这条单元没有任何被维护的读点。
 #   7. `--live`：单元真的装在了宿主上、源文件的权限与登记表一致（只 stat，不读内容）。
+#      缺装时还要分两种：该单元登记表里那条 EnvironmentFile 的源路径也不在 ⇒ 这个通道
+#      从没配过，名下登记不适用（印一行读数、不判红）；源路径在而单元没了 ⇒ 失败。
+#      不分这一刀，一台没开异地副本的宿主上这条腿恒红，红久了就没人看。
 #
 # 用法：bash deploy/scripts/check-host-credential-surface.sh [仓库根目录] [--live]
 set -euo pipefail
@@ -55,6 +58,9 @@ DIRECTIVE = re.compile(
     r"^\s*(LoadCredential(?:Encrypted)?|EnvironmentFile)=(-?)([^:\s]+)(?::(\S.*))?\s*$")
 
 failures = []
+# 不判红、但要印出来的读数：某个通道从来没配过，它名下的凭证登记不适用。与失败分开，
+# 是因为两者的修法相反——失败要人去修，不适用要人去决定「这个通道要不要开」。
+notices = []
 
 
 def fail(msg):
@@ -166,13 +172,32 @@ def check_live(rows):
     # 每个单元只 `systemctl cat` 一次：同一单元的多条凭证共用同一份输出，
     # 逐行去问会让一个未安装的单元印出与登记条数一样多的同一句话。
     by_unit = {}
+    # 每个单元的「这个通道配过没有」的标记：登记表里那条 EnvironmentFile 的源路径。
+    # 安装脚本把它写在凭证之后、单元装好之后，所以它在 ⇔ 这个通道至少装过一次。
+    # 没有 EnvironmentFile 行的单元没有这个标记，缺装一律按失败判（没有更好的判法
+    # 就不许把它读成「不适用」）。
+    channel_marker = {}
     for cols in rows:
         by_unit.setdefault(cols[0], []).append(cols)
+        if cols[1] == "EnvironmentFile" and cols[0] not in channel_marker:
+            channel_marker[cols[0]] = cols[3]
     for unit in sorted(by_unit):
         got = subprocess.run(["systemctl", "cat", unit], capture_output=True, text=True)
         if got.returncode != 0:
-            fail(f"--live：{unit} 没有装在宿主上（systemctl cat 失败）"
-                 f"——它名下的 {len(by_unit[unit])} 条凭证登记一条也核不了")
+            marker = channel_marker.get(unit)
+            if marker and not os.path.exists(marker):
+                notices.append(
+                    f"--live：{unit} 未装，且 {marker} 不存在——这个通道从来没配过，"
+                    f"名下 {len(by_unit[unit])} 条登记不适用（要开这个通道就跑 "
+                    f"deploy/scripts/install-backup-offsite.sh）")
+                continue
+            if marker:
+                fail(f"--live：{unit} 没有装在宿主上，但 {marker} 还在"
+                     f"——通道配过、单元却没了（被删或被覆盖），名下 {len(by_unit[unit])} 条"
+                     f"凭证登记一条也核不了")
+            else:
+                fail(f"--live：{unit} 没有装在宿主上（systemctl cat 失败）"
+                     f"——它名下的 {len(by_unit[unit])} 条凭证登记一条也核不了")
             continue
         for cols in by_unit[unit]:
             kind, name, source, perms = cols[1], cols[2], cols[3], cols[4]
@@ -189,10 +214,16 @@ def check_live(rows):
                 continue
             if perms and mode != perms:
                 fail(f"--live：{source} 权限是 {mode}，登记表要求 {perms}")
+    # 定时器与它那个单元同一口径：通道没配过就没有「腿不会跑」这回事，只有「这条腿
+    # 要不要开」这个决定。判据用同一个标记，两处不会各说各话。
+    marker = channel_marker.get("cogneva-backup-offsite.service")
     installed = subprocess.run(["systemctl", "list-unit-files", "--no-legend",
                                 "cogneva-backup-offsite.timer"], capture_output=True, text=True)
     if "cogneva-backup-offsite.timer" not in installed.stdout:
-        fail("--live：cogneva-backup-offsite.timer 没有装（enabled 之前这条腿根本不会跑）")
+        if marker and not os.path.exists(marker):
+            notices.append("--live：cogneva-backup-offsite.timer 不适用（通道未配置）")
+        else:
+            fail("--live：cogneva-backup-offsite.timer 没有装（enabled 之前这条腿根本不会跑）")
 
 
 def main():
@@ -217,6 +248,9 @@ def main():
         for f in failures:
             print(f"  - {f}", file=sys.stderr)
         sys.exit(1)
+
+    for n in notices:
+        print(n)
 
     encrypted = sum(1 for r in rows if r[1] == "LoadCredentialEncrypted")
     print(f"HOST CREDENTIAL SURFACE OK：{len(rows)} 条登记与 {len({r[0] for r in rows})} 个单元对齐；"

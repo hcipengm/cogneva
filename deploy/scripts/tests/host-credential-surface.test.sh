@@ -15,7 +15,8 @@
 #   5. 渲染物里出现 RESTIC_PASSWORD -> 红（业务 Pod 零凭证的边界）；
 #   6. 安装脚本加密的名字与单元要的名字对不上 -> 红；
 #   7. ExecStart 指向的脚本不在树里 -> 红（指针锈了）；
-#   8. --live 且单元没装 -> 红并点名，不许崩出 traceback（登记表加列时真的崩过）；
+#   8a. --live 且单元没装、通道也从没配过 -> 不适用，绿（不判成违约）；
+#   8b. --live 且单元没装、但通道配过 -> 红并点名，不许崩出 traceback（登记表加列时真的崩过）；
 #   9. --live 且凭证源文件不在 -> 红并点名那个路径；
 #   10. --live 的绿路：单元与登记表一致、权限一致 -> 绿并报出 --live。
 set -euo pipefail
@@ -93,16 +94,32 @@ sed -i 's#^ExecStart=/usr/local/lib/cogneva/backup-offsite-restic.sh#ExecStart=/
 out="$(run_gate)" && fail "ExecStart 指针锈了应当红，实际绿：${out}"
 grep -q "backup-offsite-missing.sh" <<<"${out}" || fail "红时没有点名那个指针：${out}"
 
-# 8) --live：单元没装 ⇒ 红并点名，而不是一段 traceback
-#    这一格是回归：登记表从四列长到七列时，--live 按位置解包会抛 ValueError，
-#    门退出 1 但一个字也没判——看起来像红，实则崩了。判据是「有没有点名」。
+# 8a) --live：单元没装、通道也从没配过（标记文件不在）⇒ 不适用，绿
+#     这一格挡住的是把「没开异地副本」读成凭证面违约：装了之后恒红，红久了没人看。
 mirror
+sed -i "s#/etc/cogneva/backup-offsite.env#${work}/never/backup-offsite.env#g" \
+    "${work}/root/${registry}" "${work}/root/${unit}"
 mkdir -p "${work}/bin-none"
 printf '#!/usr/bin/env bash\nexit 1\n' > "${work}/bin-none/systemctl"
 chmod +x "${work}/bin-none/systemctl"
-out="$(PATH="${work}/bin-none:${PATH}" run_gate_live)" && fail "--live 在单元没装时应当红：${out}"
+out="$(PATH="${work}/bin-none:${PATH}" run_gate_live)" || fail "--live 在通道没配过时应当绿（不适用不是失败）：${out}"
 grep -q "Traceback" <<<"${out}" && fail "--live 崩出 traceback 而不是判词：${out}"
-grep -q "没有装在宿主上" <<<"${out}" || fail "--live 红时没有点名未安装的单元：${out}"
+grep -q "不适用" <<<"${out}" || fail "--live 没有把未配置的通道读成不适用：${out}"
+
+# 8b) --live：单元没装、但通道配过（标记文件在）⇒ 红并点名，而不是一段 traceback
+#     这一格是回归：登记表从四列长到七列时，--live 按位置解包会抛 ValueError，
+#     门退出 1 但一个字也没判——看起来像红，实则崩了。判据是「有没有点名」。
+mirror
+mkdir -p "${work}/creds"
+: > "${work}/creds/backup-offsite.env"
+sed -i "s#/etc/cogneva/backup-offsite.env#${work}/creds/backup-offsite.env#g" \
+    "${work}/root/${registry}" "${work}/root/${unit}"
+mkdir -p "${work}/bin-none"
+printf '#!/usr/bin/env bash\nexit 1\n' > "${work}/bin-none/systemctl"
+chmod +x "${work}/bin-none/systemctl"
+out="$(PATH="${work}/bin-none:${PATH}" run_gate_live)" && fail "--live 在通道配过而单元没了时应当红：${out}"
+grep -q "Traceback" <<<"${out}" && fail "--live 崩出 traceback 而不是判词：${out}"
+grep -q "通道配过、单元却没了" <<<"${out}" || fail "--live 红时没有点名配过却缺装的单元：${out}"
 grep -q "timer 没有装" <<<"${out}" || fail "--live 没有判定时器缺失：${out}"
 
 # 9) --live：单元装了、但凭证源文件不在 ⇒ 红并点名那个路径（不崩）
@@ -143,4 +160,4 @@ chmod +x "${work}/bin-ok/systemctl"
 out="$(PATH="${work}/bin-ok:${PATH}" run_gate_live)" || fail "--live 绿路应当通过，实际红：${out}"
 grep -q -- "--live 已核" <<<"${out}" || fail "--live 绿时没有报出已核：${out}"
 
-echo "host-credential-surface: 10 个用例全绿"
+echo "host-credential-surface: 11 个用例全绿"
