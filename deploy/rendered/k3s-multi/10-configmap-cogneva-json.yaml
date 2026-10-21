@@ -2512,7 +2512,7 @@ data:
                   "less_than": 1.0
                 },
                 "severity": "warning",
-                "summary": "升级路径没走通：这一拍 release 与现网工作负载不是同一版，或 release 本身不是 deployed，判据值是 {value}。判的是这两个修订号，不是修订号本身：release 的修订号往前走了、状态却是 failed，说明那次 upgrade 跑失败后再没人重跑，这一版根本不在现网，而只比修订号的旧读法会把它读成已经升上去了（2026-10-20 现网就是这个形状：release 停在 revision 2 / failed，同集群的 deployment 已滚到 revision 573）。两个数各自一个 gauge，所以面板上能分开看是 release 落后还是工作负载跑到了前面。state 为 no-release 的集群走 apply 投递、本来就没有 release，按构造排掉，不归这条管。样本缺席也不归这条管：读数停了自己没有样本，由 upgrade_path_reading_stopped 报，两件事的修法不同——那边修生产者，这边重跑 upgrade 或把它回滚。"
+                "summary": "升级路径没走通：这一拍 release 与现网工作负载不是同一版，或 release 本身不是 deployed，判据值是 {value}。判的是这两个修订号，不是修订号本身：release 的修订号往前走了、状态却是 failed，说明那次 upgrade 跑失败后再没人重跑，这一版根本不在现网，而只比修订号的旧读法会把它读成已经升上去了（2026-10-20 现网就是这个形状：release 停在 revision 2 / failed，同集群的 deployment 已滚到 revision 573）。两个数各自一个 gauge，所以面板上能分开看是 release 落后还是工作负载跑到了前面。state 为 no-release 的集群走 apply 投递、本来就没有 release，按构造排掉，不归这条管。**先看 `delivery` 标签再动手，它把两种处置相反的处境分开了**：`delivery` 取 `helm` 时说的是这台集群的 Pod 模板确实由 helm 写，那次 upgrade 失败后再没人重跑 ⇒ 重跑 upgrade 或把它回滚；`delivery` 取 `deployer` 时说的是工作负载跑着 `main-<rev>` 签、Pod 模板一直是主线部署器写的，那条 release 只是曾经试过 helm 留下的记录 ⇒ 处置是**删掉那条记录**（`helm uninstall --keep-resources` 或删它的 Secret），不是重跑 upgrade——重跑到天亮也只会再撞一次字段所有权冲突，因为两边抢的是同一批字段。判据取镜像签而不取 `app.kubernetes.io/managed-by: Helm`：chart 自己把这个标签写进了渲染产物（`.Release.Service`），经 apply 投递的对象一字不差地带着它，按它判会把一台 apply 集群读成「helm 管的集群升级失败」。样本缺席也不归这条管：读数停了自己没有样本，由 upgrade_path_reading_stopped 报，两件事的修法不同——那边修生产者，这边按上面两条处置。"
               },
               {
                 "name": "upgrade_path_reading_stopped",
