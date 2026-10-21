@@ -755,10 +755,19 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
 /// it for good, and the fold that carries it here would keep it too: the queue
 /// row is written from the declared row wholesale, so a `NULL` that reaches this
 /// statement came from a source that pushed the column and left it empty.
+/// `priority` needs both halves written out, because the two sides of the
+/// statement want opposite things from the same `NULL`. The column is `NOT NULL`
+/// and its default is `unstated`, so a **new** row has to be given that value --
+/// binding the parameter straight into `VALUES` is a `NOT NULL` violation, and it
+/// is the silent reading (the one that says nothing about the band) that trips it.
+/// An **existing** row must keep the band it holds, so the same `NULL` may not
+/// overwrite it. `COALESCE($8, 'unstated')` in `VALUES` alone would break the
+/// second half: `EXCLUDED.priority` would never be `NULL` and silence would erase
+/// a band. Hence the `SET` reads the parameter, not `EXCLUDED`.
 const RECORD_READING_SQL: &str = "\
 INSERT INTO principle_ledger (slug, lead, carrier_path, carrier_sha256, host_gate, where_red, \
 check_kind, priority)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::varchar, 'unstated'))
 ON CONFLICT (slug) DO UPDATE SET
     lead = COALESCE(EXCLUDED.lead, principle_ledger.lead),
     carrier_path = COALESCE(EXCLUDED.carrier_path, principle_ledger.carrier_path),
@@ -766,7 +775,7 @@ ON CONFLICT (slug) DO UPDATE SET
     host_gate = COALESCE(EXCLUDED.host_gate, principle_ledger.host_gate),
     where_red = COALESCE(EXCLUDED.where_red, principle_ledger.where_red),
     check_kind = EXCLUDED.check_kind,
-    priority = COALESCE(EXCLUDED.priority, principle_ledger.priority)";
+    priority = COALESCE($8::varchar, principle_ledger.priority)";
 
 /// Queue a reading, or re-queue the one already there when the reading would
 /// actually change it.
