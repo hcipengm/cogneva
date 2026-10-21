@@ -872,6 +872,14 @@ impl ActionPlanOrchestrator {
             let goal_binding = tasks
                 .first()
                 .map(|t| (t.face_id.clone(), t.owner_unit.clone()));
+            // Priority travels with the work for the same reason the ownership
+            // above does, and it is the one that decides *when* it runs: the
+            // scheduler admits highest-priority first, so a child that fell
+            // back to the default would rank behind every housekeeping row in
+            // the graph even though the submission that asked for it said
+            // otherwise. Clients state urgency on the goal they submit; the
+            // pieces we broke it into are that same work.
+            let goal_priority = tasks.first().map(|t| t.priority);
             // Ids of the original rows in submission order; every id after
             // these in `all_injected_ids` is a decomposed child.
             let placeholder_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
@@ -898,6 +906,9 @@ impl ActionPlanOrchestrator {
             for at in &plan.tasks {
                 let mut task = Self::atomic_task_to_task(at);
                 task.goal_id = Some(goal_id.clone());
+                if let Some(priority) = goal_priority {
+                    task.priority = priority;
+                }
                 if let Some((face_id, owner_unit)) = &goal_binding {
                     task.face_id = face_id.clone();
                     task.owner_unit = owner_unit.clone();
@@ -2499,6 +2510,39 @@ mod tests {
         // 声明落在子任务的回指那一行上：读面正是从这一行取答案。
         let child = dag.get_task("child-2").await.unwrap();
         assert_eq!(child.parent_task_id.as_deref(), Some("goal-row"));
+    }
+
+    /// 提交方声明的优先级要跟着分解走：分解出来的每一片都是这道目标的一部分，
+    /// 排序读的是子任务那一行，掉回默认就等于客户说了紧急、系统照样把它排到最后。
+    #[tokio::test]
+    async fn the_priority_a_client_declared_survives_decomposition() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-prio".to_string()));
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![atomic_task("child-1")]]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+
+        let mut hint = hint_task("goal-row");
+        hint.priority = 7;
+        let registry = SkillRegistry::new();
+        planner
+            .process_goal_impl("do this today", vec![hint], &registry)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dag.get_task("goal-row").await.unwrap().priority,
+            7,
+            "the submitted row keeps what the client declared"
+        );
+        assert_eq!(
+            dag.get_task("child-1").await.unwrap().priority,
+            7,
+            "a decomposed piece is the same work, so it is claimed at the same rank"
+        );
     }
 
     /// 一条行都不带的提交（只有一句话的裸目标）也必须落下承载这道目标的那一行：
