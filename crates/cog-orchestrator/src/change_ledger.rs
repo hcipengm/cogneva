@@ -124,7 +124,7 @@ use cog_core::{
 use cog_core::contract::llm::UpstreamFailure;
 use cog_core::contract::outcome::{declares, TERMINAL_ENV_FAILURE_PREFIX};
 
-use crate::change_measure::{CheckTree, Snapshot, UnsettledReason, GREP_KIND};
+use crate::change_measure::{CheckOutcome, CheckTree, Snapshot, UnsettledReason, GREP_KIND};
 use crate::principle_measure::HOST_REGISTRY_READ_NO_GATE;
 
 /// This loop's name in the process liveness registry, and the value of
@@ -2099,6 +2099,31 @@ async fn reopen_pass(
             }
         }
         let outcome = tree.judge(snapshot, &row.identity).await;
+        // A landed row whose scope the tree has lost is not a check that ran and
+        // found the literal absent: the surface the claim was measured on is
+        // gone. The judge answers an absent scope with `Absent` -- the right
+        // reading for a row still owed, where "the path is not here, so the
+        // literal is not here" is the whole answer -- but on a landed row it
+        // would reopen work that left as work still owed. This pass is the one
+        // place that can tell the two absences apart: it asks the tree whether
+        // the scope is here, and leaves a present scope's miss alone.
+        let outcome = match outcome {
+            CheckOutcome::Absent => match tree.scope_present(snapshot, &row.identity).await {
+                Ok(true) => CheckOutcome::Absent,
+                Ok(false) => CheckOutcome::Unsettled {
+                    reason: UnsettledReason::ScopeAbsentInRevision,
+                    why: format!(
+                        "this revision has no `{}`, so the check cannot be run",
+                        row.identity.scope
+                    ),
+                },
+                Err(why) => CheckOutcome::Unsettled {
+                    reason: UnsettledReason::GitFailed,
+                    why,
+                },
+            },
+            settled => settled,
+        };
         let Some(state) = outcome.state() else {
             let reason = outcome.reason().unwrap_or(UnsettledReason::GitFailed);
             let why = outcome
