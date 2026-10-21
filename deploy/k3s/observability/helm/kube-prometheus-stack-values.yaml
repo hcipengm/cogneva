@@ -384,6 +384,22 @@ prometheus-node-exporter:
     limits:
       cpu: 200m
       memory: 256Mi
+  prometheus:
+    monitor:
+      # 节点身份必须由这一面带出来。2026-10-22 实测：node-exporter 的
+      # node_filesystem_* 序列上只有 device / fstype / instance / job / mountpoint
+      # 加抓取侧那几枚标签，**没有 node**。于是凡是按节点写的规则都静默走形：
+      # `max by (node)` 把标签集收敛成空、摘要里的 {node} 原样落进行里（一行不点名的
+      # 告警），而 `unless on(node)` 左边没有 node 可匹配，永远压不住右边——磁盘过线时
+      # 照样报「kubelet 一小时没回收」。这不是规则写错，是这一面没把身份带出来。
+      # K8s 自己就有这个身份：endpoints 角色默认不挂 pod 的 nodeName，要
+      # attachMetadata.node=true 才给，再抄成 node 标签。
+      attachMetadata:
+        node: true
+      relabelings:
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
 
 # ─── prometheusOperator ──────────────────────────────────────────
 prometheusOperator:
