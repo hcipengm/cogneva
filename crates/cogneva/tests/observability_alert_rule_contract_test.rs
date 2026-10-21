@@ -1085,6 +1085,26 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     ("kube_node_status_allocatable", "kube-state-metrics"),
     (
+        "container_cpu_cfs_throttled_periods_total",
+        "cadvisor（kubelet 内置）。被 CFS 限流过多少个周期——容器「想要更多、被按住了」在内核里的原话。按 usage/limit 判会把「用满了给它的一份」读成「不够用」，而按限流比判读的是真的没拿到",
+    ),
+    (
+        "container_cpu_cfs_periods_total",
+        "cadvisor（kubelet 内置）。同一序列的分母：调度周期总数。两个计数器同源同标签，比值才是判据",
+    ),
+    (
+        "kubelet_container_log_filesystem_used_bytes",
+        "kubelet 自己的 resource metrics（经 apiserver 代理取到，所以样本上的身份标签被采集端加了 `exported_` 前缀；判据读的是 `exported_namespace`，读裸 `namespace` 会指到代理目标自己的命名空间）",
+    ),
+    (
+        "kube_pod_container_resource_requests",
+        "kube-state-metrics（调度面的分子：容器声明要多少，不是它用了多少）",
+    ),
+    (
+        "container_fs_writes_bytes_total",
+        "cadvisor（kubelet 内置）。逐容器的落盘写字节数——宿主面的利用率只说盘忙，这一条说「谁在写」",
+    ),
+    (
         "kube_node_status_capacity",
         "kube-state-metrics（与 allocatable 同源，相减即节点为非 Pod 工作留出的份额）",
     ),
