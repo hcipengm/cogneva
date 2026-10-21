@@ -68,6 +68,29 @@ async fn the_mark_lands_and_a_new_episode_clears_it() {
         .expect("the probe schema is created");
 
     let pool = schema_pool(&url, &schema).await;
+    // The table as it stood before the mark existed. Replaying the DDL against
+    // an empty schema cannot witness the ALTER that adds the column -- the
+    // CREATE already carries it -- so the shape has to be built old first.
+    sqlx::query(
+        "CREATE TABLE alerts (
+             id          TEXT PRIMARY KEY,
+             rule        TEXT        NOT NULL,
+             dedup_key   TEXT        NOT NULL UNIQUE,
+             severity    TEXT        NOT NULL,
+             state       TEXT        NOT NULL,
+             message     TEXT        NOT NULL,
+             labels      JSONB       NOT NULL DEFAULT '{}'::jsonb,
+             fired_at    TIMESTAMPTZ NOT NULL,
+             resolved_at TIMESTAMPTZ,
+             updated_at  TIMESTAMPTZ NOT NULL,
+             last_seen_at TIMESTAMPTZ,
+             acknowledged_at TIMESTAMPTZ,
+             acknowledged_by TEXT
+         )",
+    )
+    .execute(&pool)
+    .await
+    .expect("the legacy alert table is created");
     let store = PostgresAlertStore::new(pool.clone());
     store
         .init_schema()
