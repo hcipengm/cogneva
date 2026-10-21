@@ -5,8 +5,8 @@
 # 多节点每增一个节点多 200m/1Gi，生产 K8s 分支请按集群规模上调。
 # 存储额度是命名空间内全部 PVC 声明之和的上限（目录型卷不强制 requests.storage，
 # 它唯一的作用是拒绝声明总量越界的清单），必须 ≥ 本套清单自己声明的和（当前
-# 270Gi），取 300Gi 留 30Gi 头寸。单卷上限 80Gi 必须 ≥ 最大的那份声明（进化源码
-# 卷 72Gi）。渲染期门禁 check-governance-consistency.sh 按渲染产物重算并打印头寸。
+# 390Gi），取 480Gi 留 90Gi 头寸。单卷上限 200Gi 必须 ≥ 最大的那份声明（进化源码
+# 卷 192Gi）。渲染期门禁 check-governance-consistency.sh 按渲染产物重算并打印头寸。
 #
 # 本文件是 **parity 基线兼 GitOps 消费物**，不是数值的权威源：数值定义在
 # chart 的 resourceGovernance values，chart 渲染出的 spec 与这里逐字段相等
@@ -37,7 +37,7 @@ spec:
     # 部署器每轮空转。完整算式见 chart values 的 resourceGovernance 段。
     limits.memory: "52Gi"
     pods: "40"
-    requests.storage: 300Gi
+    requests.storage: 480Gi
 ---
 apiVersion: v1
 kind: LimitRange
@@ -64,6 +64,6 @@ spec:
         memory: 16Mi
     - type: PersistentVolumeClaim
       max:
-        storage: 80Gi
+        storage: 200Gi
       min:
         storage: 1Gi

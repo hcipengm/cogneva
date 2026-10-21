@@ -106,7 +106,7 @@ resourceGovernance:
     # "声明和 ≤ 本上限"这条不变式，不读注释里的散文数字）。要看当前和与头寸，
     # 跑渲染期门禁 `deploy/scripts/check-governance-consistency.sh`，它按渲染
     # 产物现算现印；每个卷声明的推导在各自字段旁，改声明时改的是那些字段。
-    requestsStorage: 300Gi
+    requestsStorage: 480Gi
   limitRange:
     defaultCpu: 500m
     defaultMemory: 512Mi
@@ -124,9 +124,9 @@ resourceGovernance:
     minCpu: 10m
     minMemory: 16Mi
     # 单个 PVC 的上限：必须 ≥ 本 chart 最大的那份卷声明（当前是进化源码卷
-    # 72Gi，实测 target/ 已 57Gi 且随构建增长）。定小了不是"更安全"——同一份
-    # 声明在安装面直接被拒，装不进来；渲染期门禁对每条声明逐个核这个上限。
-    pvcMaxStorage: 80Gi
+    # 192Gi）。定小了不是"更安全"——同一份声明在安装面直接被拒，装不进来；
+    # 渲染期门禁对每条声明逐个核这个上限。
+    pvcMaxStorage: 200Gi
     pvcMinStorage: 1Gi
 
 # 应用数据目录根（/var/lib/cogneva-data）：实例身份 identity.json、学习数仓
@@ -428,9 +428,16 @@ evolution:
     storage: 5Gi
   sandboxStorage: 20Gi
   # 源码卷：给共享 CARGO_TARGET_DIR 用的（工作树在它之外，可整棵重建而不丢
-  # 增量编译缓存）。本机实测 target/ 已 57Gi——这是全场最大的一笔，也是唯一
-  # 一笔"声明写小了会直接卡住构建"的（缓存被挤掉就每次全量重编），取 72Gi。
-  sourceStorage: 72Gi
+  # 增量编译缓存）。这是全场最大的一笔，也是唯一一笔"声明写小了会直接卡住构建"
+  # 的（缓存被挤掉就每次全量重编）。2026-10-21 按缓存自己的分层读数重定：卷里
+  # 只有 `target/`，占用 149GiB，按层是 debug/deps 84.3GB、debug/incremental
+  # 60.9GB、release/deps 10.8GB、debug/examples 2.2GB、debug/build 1.0GB，其余
+  # 各为百兆级。旧的 72Gi 来自 2026-09 的 57Gi 实测，此后随每次构建涨到现在，
+  # 而声明量在 local-path 下不被强制，涨过去之后唯一的信号是
+  # `data_volume_over_declared_size` 一直开着——所以这个数按实测峰取，不按
+  # 当年写下的值。191GiB 的峰值上限（峰×1.2）也落在它里面：上限与声明量是
+  # 一对，缓存可以长到峰值的余量，但不能长到这张卷装不下。
+  sourceStorage: 192Gi
   # 进化 Pod 的 /var/lib/cogneva-data 是另一张卷、另一个写入者，声明必须分开：
   # 同一路径两个进程，各自的卷互不相干，共用一份声明必然对其中一个说谎。
   # 实测 49Gi（几乎全是 raw-logs 的存量轨迹），取 64Gi 留头寸。推导同

@@ -557,10 +557,10 @@ rows:
   - key: evolution.sourceStorage
     source: override
     why: >-
-      Holds the shared CARGO_TARGET_DIR, measured at 57Gi and growing with every
-      build. This is the one claim whose shortfall stops builds outright (an
-      evicted cache means a full rebuild), and the cache walk already measures its
-      size; the claim does not follow it.
+      Holds the shared CARGO_TARGET_DIR, measured at 149GiB on 2026-10-21 and
+      growing with every build. This is the one claim whose shortfall stops
+      builds outright (an evicted cache means a full rebuild), and the cache walk
+      already measures its size; the claim does not follow it.
 
   - key: evolution.workspaces.cacheScanIntervalSecs
     source: override
@@ -1022,7 +1022,7 @@ rows:
     source: override
     why: >-
       The largest single PVC. It must cover the largest volume declaration (the
-      72Gi source volume), and the render-time gate checks each declaration
+      192Gi source volume), and the render-time gate checks each declaration
       against it. A derived value would be that maximum; a human keeps the two in
       step.
 
