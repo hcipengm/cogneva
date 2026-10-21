@@ -734,33 +734,33 @@ data:
               "severity": "warning",
               "summary": "Volume holds {value}x its declared size: the workload writes past the PVC's requests.storage, and nothing enforces that request, so the declared size is not a ceiling. For a directory-backed volume the excess lands on the node filesystem and the per-volume capacity the kubelet reports is the node's, not this volume's. Either the declaration is wrong for what this deployment writes, or the growth belongs somewhere else"
             },
-              {
-                "name": "volume_capacity_clamped_by_admission",
-                "promql": "max(increase(cogneva_volume_capacity_outcome_total{outcome=\"clamped\"}[1h]))",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "The loop that raises a claim's declaration computed a size the volume needs {value} time(s) in the last hour and left the request alone: the number was above what admission accepts. Two bounds are read before the patch -- the LimitRange's per-claim storage maximum and what the namespace quota has left once this claim's own request is taken back out -- and the loop writes nothing above the tighter of them. This is the one outcome that no amount of retrying repairs: the loop re-decides every round on the same two bounds, so a count that keeps rising is the loop doing its job against a ceiling that has to move. Which one to raise is in the numbers beside it: read the peak reading `cogneva_volume_capacity_bytes` against the declared reading for the same claim. A peak close to the bound means the ceiling is what is wrong for this deployment; a peak far below it means the volume itself is growing faster than the declaration policy assumed and the ceiling is the second thing to look at, not the first. The loop's own arithmetic is the peak times the same headroom the shipped declarations are sized by, so a clamped outcome always means the declared size is smaller than what this process has already written plus that headroom"
+            {
+              "name": "volume_capacity_clamped_by_admission",
+              "promql": "max(increase(cogneva_volume_capacity_outcome_total{outcome=\"clamped\"}[1h]))",
+              "condition": {
+                "greater_than": 0.0
               },
-              {
-                "name": "volume_capacity_resize_refused",
-                "promql": "max(increase(cogneva_volume_capacity_outcome_total{outcome=\"refused\"}[1h]))",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "The loop that raises a claim's declaration had {value} resize(s) refused in the last hour: the request was computed inside the admission bounds, sent, and the API server said no. The usual cause is not permission -- the executor's Role grants patch on persistentvolumeclaims -- but the StorageClass: a class with `allowVolumeExpansion: false` refuses every request to grow a bound claim, and local-path ships that way. Read the loop's own warning for the patch's stderr before changing anything: a refusal naming allowVolumeExpansion is repaired on the StorageClass, while one naming the request itself belongs in the LimitRange and should have been reported as clamped instead. A refused claim is left alone for an hour before it is tried again, so this count rises slowly and each increment is a retry that was allowed to happen, not a storm"
+              "severity": "warning",
+              "summary": "The loop that raises a claim's declaration computed a size the volume needs {value} time(s) in the last hour and left the request alone: the number was above what admission accepts. Two bounds are read before the patch -- the LimitRange's per-claim storage maximum and what the namespace quota has left once this claim's own request is taken back out -- and the loop writes nothing above the tighter of them. This is the one outcome that no amount of retrying repairs: the loop re-decides every round on the same two bounds, so a count that keeps rising is the loop doing its job against a ceiling that has to move. Which one to raise is in the numbers beside it: read the peak reading `cogneva_volume_capacity_bytes` against the declared reading for the same claim. A peak close to the bound means the ceiling is what is wrong for this deployment; a peak far below it means the volume itself is growing faster than the declaration policy assumed and the ceiling is the second thing to look at, not the first. The loop's own arithmetic is the peak times the same headroom the shipped declarations are sized by, so a clamped outcome always means the declared size is smaller than what this process has already written plus that headroom"
+            },
+            {
+              "name": "volume_capacity_resize_refused",
+              "promql": "max(increase(cogneva_volume_capacity_outcome_total{outcome=\"refused\"}[1h]))",
+              "condition": {
+                "greater_than": 0.0
               },
-              {
-                "name": "volume_capacity_expansion_never_completes",
-                "promql": "max(increase(cogneva_volume_capacity_outcome_total{outcome=\"expanding\"}[6h]))",
-                "condition": {
-                  "greater_than": 29.0
-                },
-                "severity": "warning",
-                "summary": "A claim has been asking for more than it has been given for hours: {value} rounds in the last six read the request ahead of the volume's status capacity. This is the outcome that says the declaration was raised successfully and the expansion never landed -- the request is what an alert reads (the rule that compares usage divides by requests.storage), so the shortfall disappears from every reading the moment the patch is accepted, while the filesystem underneath is still the old size. On a class with an external expander the request stays ahead of capacity until that controller acts, and thirty rounds is five hours of no controller acting. Nothing is retried on this outcome on purpose: an expansion is already in flight as far as the API is concerned, and a second patch while the first has not been carried out is refused rather than queued. The repair is on whoever owns the StorageClass -- the external resizer, or the class's volume expansion support -- and the sizes to read it against are the declared reading `cogneva_volume_capacity_bytes` and the claim's own status capacity"
+              "severity": "warning",
+              "summary": "The loop that raises a claim's declaration had {value} resize(s) refused in the last hour: the request was computed inside the admission bounds, sent, and the API server said no. The usual cause is not permission -- the executor's Role grants patch on persistentvolumeclaims -- but the StorageClass: a class with `allowVolumeExpansion: false` refuses every request to grow a bound claim, and local-path ships that way. Read the loop's own warning for the patch's stderr before changing anything: a refusal naming allowVolumeExpansion is repaired on the StorageClass, while one naming the request itself belongs in the LimitRange and should have been reported as clamped instead. A refused claim is left alone for an hour before it is tried again, so this count rises slowly and each increment is a retry that was allowed to happen, not a storm"
+            },
+            {
+              "name": "volume_capacity_expansion_never_completes",
+              "promql": "max(increase(cogneva_volume_capacity_outcome_total{outcome=\"expanding\"}[6h]))",
+              "condition": {
+                "greater_than": 29.0
               },
+              "severity": "warning",
+              "summary": "A claim has been asking for more than it has been given for hours: {value} rounds in the last six read the request ahead of the volume's status capacity. This is the outcome that says the declaration was raised successfully and the expansion never landed -- the request is what an alert reads (the rule that compares usage divides by requests.storage), so the shortfall disappears from every reading the moment the patch is accepted, while the filesystem underneath is still the old size. On a class with an external expander the request stays ahead of capacity until that controller acts, and thirty rounds is five hours of no controller acting. Nothing is retried on this outcome on purpose: an expansion is already in flight as far as the API is concerned, and a second patch while the first has not been carried out is refused rather than queued. The repair is on whoever owns the StorageClass -- the external resizer, or the class's volume expansion support -- and the sizes to read it against are the declared reading `cogneva_volume_capacity_bytes` and the claim's own status capacity"
+            },
             {
               "name": "host_build_volume_free_low",
               "promql": "min without (pod, container, instance) (cogneva_host_disk_free_bytes)",
@@ -771,13 +771,22 @@ data:
               "summary": "The filesystem the build gate's directory is on has {value} bytes free, under 30 GiB. This is the reading the bound does not divide by, and the one it has no arithmetic for: the other four dimensions answer how many builds fit in the host's cpu, memory, io and container memory, and none of them can see a volume running out of room, because one build's cost in bytes is shared with every earlier revision through the same cache. What the reading is for is attribution when a bound stops moving or a build fails with a write error: the volume is either the reason or it is not, and without this series that question is answered by hand. The build cache has its own cap derived from its measured peak, so a tree at its cap does not grow this number -- a free count that keeps falling is something else on the volume, and the host's own target garbage collector is the tiered remedy for the cache's share of it"
             },
             {
-              "name": "host_pressure_io_high",
-              "promql": "max without (pod, container, instance) (cogneva_host_pressure_avg60{resource=\"io\"})",
+              "name": "host_pressure_cpu_high",
+              "promql": "max without (pod, container, instance) (cogneva_host_pressure_avg60{resource=\"cpu\"})",
               "condition": {
                 "greater_than": 30.0
               },
               "severity": "warning",
-              "summary": "The build host shows an io stall of {value}% over the last minute, above the 30% a single build's cold compile has been measured at. This is the same reading the bound's `io` dimension divides its budget by, published on its own so the reason a bound is sitting at one is readable rather than inferred: a ceiling labelled `io` says this number was the tightest, and this series says how tight. It is also the reading that tells a host whose builds are slow from a host whose device is shared with something else -- a stall this high while no build is running is the second case, and the first thing to look at is what else on the host is writing"
+              "summary": "Tasks on the build host spent {value}% of the last minute waiting for a cpu. This is the one host reading the bound does not divide by: the `cpu` dimension asks how many cores are free, which on a host whose work is mostly runnable-queue waits answers a bigger number than the machine can honour -- a core is free and the task still waits its turn. Measured over the seven days to 2026-10-21 in one-minute steps of the same statistic (`rate(node_pressure_cpu_waiting_seconds_total[1m]) * 100`): median 1.60%, p90 10.39%, p99 28.62%, maximum 61.34%, 0.86% of the week above 30 -- so the line sits above the everyday band and inside the range this host has really reached, which is what makes it a report rather than decoration. Read it beside `cogneva_build_gate_ceiling`: a ceiling sitting at its cpu answer while this is lit says the host is oversubscribed and the bound already knows; this lit while the ceiling is set by another dimension says the bound is admitting builds into a queue it cannot see"
+            },
+            {
+              "name": "host_pressure_io_high",
+              "promql": "max without (pod, container, instance) (cogneva_host_pressure_avg60{resource=\"io\"})",
+              "condition": {
+                "greater_than": 90.0
+              },
+              "severity": "warning",
+              "summary": "The build host's device is stalled {value}% of the last minute, near total: little work makes it to the disk without waiting. The line is placed from this host's own week, measured to 2026-10-21 in one-minute steps of `rate(node_pressure_io_waiting_seconds_total[1m]) * 100`: median 0.14%, p90 51.86%, p99 86.41%, maximum 99.39%. The 30% this rule was first written with lit on 16.45% of that week -- one minute in six, and on a build host most of those minutes are its own compiles, so it would have been a permanently-on warning that taught its readers to skip it. 90 is above p99 and inside the range the host has reached, and the bound's `io` dimension is the automatic response below it: that dimension divides a 70% stall budget by this reading, so a number this high has already squeezed the ceiling to one build. What is left for a person is the case the bound cannot see: the device stalled with no build running, which is something else on the host writing, and the first thing to look at is what"
             },
             {
               "name": "host_memory_available_low",
@@ -795,7 +804,16 @@ data:
                 "greater_than": 0.9
               },
               "severity": "warning",
-              "summary": "The build host spent {value} of its cores on work over the sample, counting neither idle nor io-waiting ones. The bound's `cpu` dimension derives from the same two series, and the share is what that derivation reads: above this line the host has no core left for another build and the ceiling is the cpu's answer, one, whatever the other dimensions say. Cores blocked on the disk are excluded on purpose -- a host waiting on io reads as a busy host under load average, and that number would hold the bound down for a reason the io dimension is already charged for"
+              "summary": "The build host spent {value} of its cores on work over the gate's sample, counting neither idle nor io-waiting ones. The bound's `cpu` dimension divides by the same two series, and this is the capacity half of the cpu story: above this line there is no core left for another build, whatever the other dimensions answer. The pressure rule next to it is the other half and says something a share cannot -- whether the tasks already running are waiting their turn -- so the two differ on a host whose work is long-running and cpu-bound: it reads a high share with a low stall, which is a full machine behaving, where a high stall is a full machine starving. Measured over the seven days to 2026-10-21, the one-minute mean of `node_cpu_seconds_total` was above 90% for 4.34% of the week and above 99% for 0.33%, so this fires on ordinary heavy build windows and should be read as a capacity report rather than an incident; the gate's own sample is a 200ms window instead of a minute and reads lower on a quiet host (median 9.1%, maximum 37.7% over 200 windows while idle). Cores blocked on the disk are excluded on purpose -- a host waiting on io reads as busy under load average, and that number would hold the bound down for a reason the io dimension is already charged for"
+            },
+            {
+              "name": "host_pressure_memory_high",
+              "promql": "max without (pod, container, instance) (cogneva_host_pressure_avg60{resource=\"memory\"})",
+              "condition": {
+                "greater_than": 10.0
+              },
+              "severity": "warning",
+              "summary": "Tasks on the build host spent {value}% of the last minute stalled in memory reclaim, which is what a host does just before it starts killing things: the pages are there, the kernel is taking them back, and every allocation pays for it. `cogneva_host_memory_available_bytes` is the other half of this and answers a different question -- how much can still be handed out -- so a host can read plenty available and still stall everything on reclaim, and only this series says so. Measured over the seven days to 2026-10-21 in one-minute steps of `rate(node_pressure_memory_waiting_seconds_total[1m]) * 100`: median 0.00%, p90 0.82%, p99 5.88%, maximum 39.58%, 0.37% of the week above 10. The per-container rss rule reads limits rather than the host, and `host_memory_available_low` reads the reserve the bound keeps for the rest of the machine, so this is the one alert in the family that fires on the host paging itself rather than on a container approaching a declared bound"
             },
             {
               "name": "build_gate_host_readings_unpublished",
@@ -860,7 +878,7 @@ data:
               "severity": "warning",
               "summary": "On {manifest}, {value} line(s) of a delivered observability manifest have differed from the live stack at every scrape for 30m: the convergence loop compares each file against the cluster before it applies anything, and re-applies whatever differs, so a difference still standing after half an hour means the re-apply is not landing -- the cluster keeps a version of {object} the repository no longer has, and every alert rule, scrape target and dashboard that file declares is served off the stale copy instead of off the declaration. The count is the differing lines of that file's own diff, so it says how far apart the two sides are rather than merely that they disagree. The loop's own verdict says why the apply is not landing"
             },
-
+    
             {
               "name": "orphans_unreaped",
               "promql": "(min_over_time(cogneva_process_zombies[30m]) > 0) and (count_over_time(cogneva_process_zombies[1h]) > count_over_time(cogneva_process_zombies[30m]))",
@@ -2692,7 +2710,7 @@ data:
         "poll_interval_secs": 60,
         "schema_repair_interval_secs": 600,
         "build_gate": {
-          "_comment": "宿主级构建闸门：同一宿主同时进行的编译/打镜像条数上限；这个上限默认不是写死的数：0 表示按宿主实测导出（宿主的 cpu、内存、io 三项，加上构建所在容器的内存上限，四维各答「还装得下几条」，取最紧的一项说几就几；四维各自的答案同时发在 cogneva_build_gate_dimension_ceiling 上，最紧的那条再以 dimension 标签标在 cogneva_build_gate_ceiling 上），正数才是钉死它的覆盖位，此时读数 cogneva_build_gate_ceiling 的 dimension 标签写 override 而不是 cpu / memory / io / cgroup_memory。宿主面每一项读数都单独发布而不只发判决：忙核与总核（cogneva_host_cpu_busy_cores / _cpu_cores）、可用内存（cogneva_host_memory_available_bytes）、三条压力（cogneva_host_pressure_avg60{resource=cpu|io|memory}）、构建卷空闲字节（cogneva_host_disk_free_bytes，statvfs 现读，读不到就是没有这条序列而不是零），加四维各自的答案（cogneva_build_gate_dimension_ceiling{dimension}）。这些序列各自有已发货的规则在读；闸门读不到宿主时一条都不发，`build_gate_host_readings_unpublished` 专门报这一态——规则在而读数空，与「宿主很闲」同形，所以配对报。构建与集群同宿主，多路叠加足以把整机拖进换页，此后连应该把这件事报出来的事件循环也一起退化。闸门只装在跑构建的进程里，锁定的是 lock_dir 这一个目录：两个进程指向同一个目录（同一 dev:ino）才互相设界，指向不同目录则各自设界——读数 cogneva_build_gate_slots 的 dir 标签就是用来分辨这件事的，role 标签分辨「跑构建的进程（builder）」与「不跑构建的进程（control-plane，只发零值）」。",
+          "_comment": "宿主级构建闸门：同一宿主同时进行的编译/打镜像条数上限；这个上限默认不是写死的数：0 表示按宿主实测导出（宿主的 cpu、内存、io 三项，加上构建所在容器的内存上限，四维各答「还装得下几条」，取最紧的一项说几就几；四维各自的答案同时发在 cogneva_build_gate_dimension_ceiling 上，最紧的那条再以 dimension 标签标在 cogneva_build_gate_ceiling 上），正数才是钉死它的覆盖位，此时读数 cogneva_build_gate_ceiling 的 dimension 标签写 override 而不是 cpu / memory / io / cgroup_memory。宿主面每一项读数都单独发布而不只发判决：忙核与总核（cogneva_host_cpu_busy_cores / _cpu_cores）、可用内存（cogneva_host_memory_available_bytes）、三条压力（cogneva_host_pressure_avg60{resource=cpu|io|memory}）、构建卷空闲字节（cogneva_host_disk_free_bytes，statvfs 现读，读不到就是没有这条序列而不是零），加四维各自的答案（cogneva_build_gate_dimension_ceiling{dimension}）。每一条都有人接手，判据分两档：界除的那几条（忙核、总核、可用内存、io 压力）由界自己消费，剩下的（cpu 压力、内存压力、构建卷空闲字节）各有一条已发货的规则在读，**按格算不按名字算**——同一个名字下的 cpu/io/memory 三格是三件读数，一条规则读了其中一格不能替另外两格作数（2026-10-21 前的闭集测试按名字匹配，cpu 与内存两格因此空转了两天）。闸门读不到宿主时一条都不发，`build_gate_host_readings_unpublished` 专门报这一态——规则在而读数空，与「宿主很闲」同形，所以配对报。构建与集群同宿主，多路叠加足以把整机拖进换页，此后连应该把这件事报出来的事件循环也一起退化。闸门只装在跑构建的进程里，锁定的是 lock_dir 这一个目录：两个进程指向同一个目录（同一 dev:ino）才互相设界，指向不同目录则各自设界——读数 cogneva_build_gate_slots 的 dir 标签就是用来分辨这件事的，role 标签分辨「跑构建的进程（builder）」与「不跑构建的进程（control-plane，只发零值）」。",
           "enabled": true,
           "max_concurrent": 0,
           "wait_secs": 1800,

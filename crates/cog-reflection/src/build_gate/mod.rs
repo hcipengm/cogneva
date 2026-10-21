@@ -5714,8 +5714,9 @@ unevictable 28532736
         for (rule, series) in [
             ("host_build_volume_free_low", HOST_DISK_FREE_BYTES),
             ("host_memory_available_low", HOST_MEMORY_AVAILABLE_BYTES),
-            ("host_cpu_busy_share_high", HOST_CPU_BUSY_CORES),
+            ("host_pressure_cpu_high", HOST_PRESSURE_AVG60),
             ("host_pressure_io_high", HOST_PRESSURE_AVG60),
+            ("host_pressure_memory_high", HOST_PRESSURE_AVG60),
             ("build_gate_host_readings_unpublished", HOST_CPU_CORES),
         ] {
             let promql = find(rule);
@@ -5724,12 +5725,18 @@ unevictable 28532736
                 "rule {rule} must query {series}, got: {promql}"
             );
         }
-        // The io rule has to name which resource it is asking about; without
-        // the label it would fire on a cpu stall under the disk's name.
-        assert!(
-            find("host_pressure_io_high").contains("\"io\""),
-            "the io rule selects resource=\"io\""
-        );
+        // The pressure rules have to name which resource they are asking about;
+        // without the label each would fire on the other's stall.
+        for (rule, resource) in [
+            ("host_pressure_cpu_high", "cpu"),
+            ("host_pressure_io_high", "io"),
+            ("host_pressure_memory_high", "memory"),
+        ] {
+            assert!(
+                find(rule).contains(&format!("\"{resource}\"")),
+                "rule {rule} selects resource=\"{resource}\""
+            );
+        }
         // The pair rule has to exclude the operator's own bound: that gate
         // derives nothing, so it is not blind when it publishes no host
         // readings.
@@ -5744,33 +5751,132 @@ unevictable 28532736
         );
     }
 
-    /// Every host reading this module publishes is read by a shipped rule,
-    /// except the one the module itself consumes.
+    /// Every host reading this module publishes is consumed by one of exactly
+    /// two things: the bound divides by it, or a shipped rule reads it.
     ///
-    /// This is the closed-set half of the test above: that one fails when a rule
-    /// names a series nothing publishes, this one fails when a series is
-    /// published and nothing reads it. A series with no reader is a reading
-    /// nobody acts on -- it costs a scrape, it makes a dashboard look complete,
-    /// and it is indistinguishable from a reading whose consumer was deleted.
-    /// The per-dimension ceiling is the exception because its consumer is the
-    /// bound itself: it is the row this module reads to decide what to enforce,
-    /// and it is what the ledger entry for a move names.
+    /// This is the closed-set half of the test above, and it is written in cells
+    /// rather than in names on purpose. A name-level set is satisfied by one
+    /// rule reading one cell of a labelled series: `cogneva_host_pressure_avg60`
+    /// read once, by the io rule, used to certify all three stalls, and the cpu
+    /// and memory cells were published for two days with nothing on the other
+    /// end. What a cell is, here, is a name plus every label whose value differs
+    /// between this module's own rows (the `cpu`/`io`/`memory` of the pressure
+    /// series, not `dir` or `role`, which every rule aggregates away).
+    ///
+    /// Which readings the bound divides by is not asserted from a table: each
+    /// field is moved on its own and the answer is compared, so the list is read
+    /// off the derivation rather than restated beside it. A field the derivation
+    /// does not divide by has to be somebody's measurement, and the only
+    /// somebody in this deployment is a rule; the disk is that case and says so
+    /// in [`HostLoad::disk_free_bytes`].
+    ///
+    /// The per-dimension ceiling is exempt because its consumer is the bound
+    /// itself: it is the row this module reads to decide what to enforce, and
+    /// what the ledger entry for a move names.
     #[test]
-    fn every_host_reading_published_here_has_a_reader() {
-        let sample = HostReading {
+    fn every_host_reading_is_either_what_the_bound_divides_or_what_a_rule_reads() {
+        let baseline = || HostLoad {
+            pressure: Pressure {
+                cpu_avg10: 0.0,
+                cpu_avg60: 1.0,
+                io_avg10: 0.0,
+                io_avg60: 0.5,
+                mem_avg10: 0.0,
+                mem_avg60: 0.0,
+                mem_available_bytes: MEM_FLOOR_BYTES * 2,
+                builds_in_flight: 0,
+            },
             busy_cores: 1.0,
             cores: 24,
-            cpu_avg60: 0.0,
-            io_avg60: 0.0,
-            mem_avg60: 0.0,
-            mem_available_bytes: MEM_FLOOR_BYTES * 2,
+            budget: None,
             disk_free_bytes: Some(1 << 40),
-            dimensions: [
-                (DIM_CPU, 5.0),
-                (DIM_MEMORY, 9.0),
-                (DIM_IO, 24.0),
-                (DIM_CGROUP_MEMORY, 24.0),
-            ],
+        };
+        let base = baseline();
+        let base_ceiling = base.ceiling();
+        assert!(
+            base_ceiling.0 > 1,
+            "the baseline has to leave room in every dimension, or a field that \
+             does not move the answer would look like one that cannot: {base_ceiling:?}"
+        );
+
+        // Field, the cell it is published as (labels only where the name alone
+        // does not identify it), and whether the derivation divides by it. The
+        // two columns are not redundant: a field is in the published set by
+        // being in the sample, and an input by moving the answer.
+        type Mutation = fn(&mut HostLoad);
+        let fields: [(&str, Option<(&str, &str)>, Mutation, bool); 7] = [
+            (HOST_CPU_BUSY_CORES, None, |l| l.busy_cores = 23.0, true),
+            (HOST_CPU_CORES, None, |l| l.cores = 10, true),
+            (
+                HOST_MEMORY_AVAILABLE_BYTES,
+                None,
+                |l| l.pressure.mem_available_bytes = MEM_FLOOR_BYTES + BUILD_PEAK_RSS_BYTES * 2,
+                true,
+            ),
+            (
+                HOST_PRESSURE_AVG60,
+                Some(("resource", "io")),
+                |l| l.pressure.io_avg60 = IO_STALL_BUDGET_PCT,
+                true,
+            ),
+            (
+                HOST_PRESSURE_AVG60,
+                Some(("resource", "cpu")),
+                |l| l.pressure.cpu_avg60 = 99.0,
+                false,
+            ),
+            (
+                HOST_PRESSURE_AVG60,
+                Some(("resource", "memory")),
+                |l| l.pressure.mem_avg60 = 99.0,
+                false,
+            ),
+            (
+                HOST_DISK_FREE_BYTES,
+                None,
+                |l| l.disk_free_bytes = Some(1),
+                false,
+            ),
+        ];
+        // The divided set is keyed by cell, not by name: the pressure series
+        // divides by its io cell and by neither of the other two, and a set that
+        // said "the derivation reads cogneva_host_pressure_avg60" would excuse
+        // both unused cells -- which is the hole this test was written for.
+        let mut divided: Vec<String> = Vec::new();
+        for (name, label, mutate, is_input) in fields {
+            let mut moved = baseline();
+            mutate(&mut moved);
+            let ceiling = moved.ceiling();
+            let cell = match label {
+                Some((label, value)) => format!("{name}{{{label}=\"{value}\"}}"),
+                None => name.to_string(),
+            };
+            if is_input {
+                assert_ne!(
+                    ceiling, base_ceiling,
+                    "{cell} is published as an input of the bound, and moving it to its \
+                     extreme left the answer at {base_ceiling:?} -- the derivation stopped \
+                     reading it"
+                );
+                divided.push(cell);
+            } else {
+                assert_eq!(
+                    ceiling, base_ceiling,
+                    "{cell} is published as a reading somebody else consumes, but the \
+                     derivation divides by it: the comment saying otherwise is wrong"
+                );
+            }
+        }
+
+        let sample = HostReading {
+            busy_cores: base.busy_cores,
+            cores: base.cores,
+            cpu_avg60: base.pressure.cpu_avg60,
+            io_avg60: base.pressure.io_avg60,
+            mem_avg60: base.pressure.mem_avg60,
+            mem_available_bytes: base.pressure.mem_available_bytes,
+            disk_free_bytes: base.disk_free_bytes,
+            dimensions: base.dimensions(),
         };
         let published = host_metrics(
             Some(sample),
@@ -5779,20 +5885,65 @@ unevictable 28532736
                 role: BUILD_GATE_ROLE_BUILDER,
             },
         );
+
+        // A label is discriminating when this module's own rows disagree on its
+        // value, which is what makes it part of the cell's identity.
+        let mut values: std::collections::BTreeMap<
+            (String, String),
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
+        for metric in &published {
+            for (label, value) in &metric.labels {
+                values
+                    .entry((metric.name.clone(), label.clone()))
+                    .or_default()
+                    .insert(value.clone());
+            }
+        }
         let rules = chart_rules();
-        let read_by_a_rule = |name: &str| rules.iter().any(|(_, promql)| promql.contains(name));
+        let read_by_a_rule = |metric: &RawMetric| {
+            rules.iter().any(|(_, promql)| {
+                promql.contains(&metric.name)
+                    && metric.labels.iter().all(|(label, value)| {
+                        let differs = values
+                            .get(&(metric.name.clone(), label.clone()))
+                            .is_some_and(|set| set.len() > 1);
+                        !differs || promql.contains(&format!("{label}=\"{value}\""))
+                    })
+            })
+        };
+
+        let cell_of = |metric: &RawMetric| -> String {
+            let mut labels: Vec<String> = metric
+                .labels
+                .iter()
+                .filter(|(label, _)| values[&(metric.name.clone(), (*label).clone())].len() > 1)
+                .map(|(label, value)| format!("{label}=\"{value}\""))
+                .collect();
+            labels.sort();
+            if labels.is_empty() {
+                metric.name.clone()
+            } else {
+                format!("{}{{{}}}", metric.name, labels.join(","))
+            }
+        };
+
         let mut unread = Vec::new();
         for metric in &published {
             if metric.name == BUILD_GATE_DIMENSION_CEILING {
                 continue;
             }
-            if !read_by_a_rule(&metric.name) && !unread.contains(&metric.name) {
-                unread.push(metric.name.clone());
+            let cell = cell_of(metric);
+            if divided.contains(&cell) || read_by_a_rule(metric) {
+                continue;
+            }
+            if !unread.contains(&cell) {
+                unread.push(cell);
             }
         }
         assert!(
             unread.is_empty(),
-            "这些宿主读数没有任何已发货的规则在读（发布了却没人接手，{unread:?}）"
+            "这些宿主读数既没有被界用到、也没有任何已发货的规则在读（发布了却没人接手，{unread:?}）"
         );
     }
 
