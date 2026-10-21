@@ -18,7 +18,7 @@ pub use envelope::{
 pub use event::{
     AgentEvent, AssistantMessageEvent, ErrorSeverity, StopReason, StreamEvent, TaskEvent,
 };
-pub use inbox::InboxMessage;
+pub use inbox::{agent_inbox_stream, InboxMessage};
 pub use message::{
     drop_orphan_tool_results, enforce_tool_chain_validity, BroadcastScope, ChainRepair, Cost,
     Message, TokenUsage, ToolCall, ToolDefinition,

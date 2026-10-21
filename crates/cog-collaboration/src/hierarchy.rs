@@ -98,8 +98,13 @@ impl TopicName {
     }
 
     /// Per-Agent direct inbox (point-to-point, not broadcast).
+    ///
+    /// The name itself lives in `cog-core`, next to the message that travels on
+    /// it: the producer (the gateway address route) is not in this crate and
+    /// cannot borrow this table, so a copy here would be a second answer that
+    /// drifts silently until a command lands in a stream nobody reads.
     pub fn agent_inbox(agent_id: &str) -> String {
-        format!("orchestrator:agent:{agent_id}:inbox")
+        cog_core::agent_inbox_stream(agent_id)
     }
 
     /// Cross-Squad relay topic consumed by the DagExecutor Orchestrator.

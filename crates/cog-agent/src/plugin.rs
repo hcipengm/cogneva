@@ -397,11 +397,12 @@ impl cog_core::SystemPlugin for AgentPlugin {
                     let config = ctx.config();
                     let agent_pool = crate::AgentManagerConfig::load()?;
                     let role = agent_pool.worker_role.clone();
+                    let instance = agent_instance();
                     for i in 0..agent_pool.worker_count {
-                        let agent_id = format!("cogneva-worker-{}", i);
+                        let agent_id = format!("cogneva-worker-{instance}-{i}");
                         let registration = cog_core::AgentRegistration::new(
                             agent_id.clone(),
-                            "localhost",
+                            &instance,
                             "127.0.0.1",
                             &agent_pool.worker_role,
                             &config.dag_executor.workspace_id,
@@ -508,6 +509,30 @@ impl cog_core::SystemPlugin for AgentPlugin {
         info!("AgentPlugin shutdown");
         Ok(())
     }
+}
+
+/// The process this pool runs in, as it appears in every agent name the pool
+/// registers.
+///
+/// A worker index alone names a slot, not a process. The mainline pod and the
+/// evolution pod mount the same config and each start `worker_count` workers
+/// under the same indices, so both registered `cogneva-worker-0`: the second
+/// write overwrote the first's registry record, both joined one inbox consumer
+/// group, and a command addressed to that name was read by whichever process
+/// polled first. The roster then could not say how many workers existed, nor
+/// where any of them ran -- every one of them reported `localhost` /
+/// `127.0.0.1`. The instance is what makes a name resolve to one process.
+///
+/// Kubernetes exports the pod name as `HOSTNAME`; the evolution deployment
+/// also sets `COGNEVA_POD_NAME` explicitly. A plain host run has no instance of
+/// its own, and `local` is then the honest answer rather than a fiction of
+/// uniqueness.
+fn agent_instance() -> String {
+    std::env::var("COGNEVA_POD_NAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "local".to_string())
 }
 
 /// Classify an AgentEvent by frequency.

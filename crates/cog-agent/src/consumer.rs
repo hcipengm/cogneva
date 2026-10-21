@@ -31,7 +31,7 @@ impl AgentConsumer {
     /// Create a new consumer for the given agent ID.
     pub fn new(agent_id: impl Into<String>, backend: Arc<dyn cog_core::MessageBackend>) -> Self {
         let agent_id = agent_id.into();
-        let inbox_stream = format!("orchestrator:agent:{}:inbox", agent_id);
+        let inbox_stream = cog_core::agent_inbox_stream(&agent_id);
         Self {
             agent_id,
             backend,
@@ -136,7 +136,7 @@ impl AgentConsumer {
         message: cog_core::InboxMessage,
         backend: &dyn cog_core::MessageBackend,
     ) -> SFResult<()> {
-        let inbox_stream = format!("orchestrator:agent:{}:inbox", to_agent_id);
+        let inbox_stream = cog_core::agent_inbox_stream(to_agent_id);
         let payload = serde_json::to_vec(&message).map_err(cog_core::SFError::Serialization)?;
         backend.publish(&inbox_stream, &payload).await
     }

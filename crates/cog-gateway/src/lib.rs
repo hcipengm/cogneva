@@ -297,6 +297,19 @@ pub struct GatewayState {
     pub external_skill_registry: Option<Arc<dyn cog_core::ExternalSkillRegistry>>,
     /// Global agent pool for production multi-agent parallelism.
     pub agent_pool: Option<Arc<dyn cog_core::AgentManager>>,
+    /// The queue the agent inboxes live on, held only so an agent this process
+    /// does not own can still be addressed.
+    ///
+    /// [`Self::agent_pool`] can only answer for the agents in *this* process,
+    /// and every deployment spawns pool workers under the same names, so a
+    /// message addressed to a name the local pool does not hold is either an
+    /// agent in another pod or no one at all. The registry tells which (it is
+    /// keyed by the same name and kept alive by the agent's own heartbeat), and
+    /// this backend is what turns that answer into a delivery: the inbox stream
+    /// is shared, so the process that does own the agent is the one that reads
+    /// it. Separate from [`Self::event_publisher`] on purpose -- that one is
+    /// the semantic event face, this one is the per-agent command queue.
+    pub message_backend: Option<Arc<dyn cog_core::MessageBackend>>,
     /// Semantic event publisher — Gateway consumes this instead of the raw
     /// `MessageBackend` so that it does not depend on transport-level details.
     /// Backed by `cog-stream::MqEventPublisher` when MQ is configured.

@@ -215,6 +215,7 @@ async fn spawn_app_full(
         notification_dispatcher: None,
         notification_tx: broadcast::channel(16).0,
         agent_pool: None,
+        message_backend: None,
         event_publisher: None,
         media_backend: None,
         websocket_client: None,

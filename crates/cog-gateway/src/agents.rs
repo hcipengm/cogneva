@@ -158,28 +158,73 @@ pub async fn get_handler(
 /// The inbox subscription and the command semantics existed, but nothing in
 /// the platform ever produced a message for them, so an agent could be
 /// addressed only from inside its own process. This is the producer that
-/// closes the path: the body is the wire form of [`cog_core::InboxMessage`],
+/// closes the path: the body is the wire form of [`cog_core::InboxMessage`]
 /// and a `prompt` that names a `reply_stream` publishes its result there for
 /// the caller to read with the standard message backend.
 ///
+/// Two delivery paths, tried in that order:
+///
+/// - an agent running in *this* process, addressed directly, so the command
+///   reaches its execution path without waiting for a poll;
+/// - a name held by a process elsewhere, which this one cannot see and cannot
+///   call into. The registry is the only thing that knows it exists, and it
+///   answers with evidence of life rather than with a row that merely exists,
+///   so a name it returns belongs to a running consumer group. The command
+///   goes onto that agent's inbox stream, which is the same stream the
+///   consumer reads by construction -- the name comes from
+///   [`cog_core::agent_inbox_stream`], not from a second copy of the format.
+///
 /// Accepted, not processed: the agent's consumer owns execution, and the
 /// answer goes to `reply_stream` rather than to this response. A name that
-/// resolves to no live agent is a 404, because queueing a command for a
-/// process that will never read it is indistinguishable from losing it.
+/// resolves to no live agent anywhere is a 404, because queueing a command for
+/// a process that will never read it is indistinguishable from losing it.
 pub async fn send_message_handler(
     State(state): State<Arc<GatewayState>>,
     Path(agent_id): Path<String>,
     Json(msg): Json<cog_core::InboxMessage>,
 ) -> Response {
-    let Some(pool) = state.agent_pool.as_ref() else {
+    // Local first. A miss is not an answer -- the same name may be held by
+    // another process, which is the whole point of the registry.
+    if let Some(pool) = state.agent_pool.as_ref() {
+        match pool.get_agent(&agent_id).await {
+            Ok(Some(agent)) => {
+                return match agent.receive_message(msg).await {
+                    Ok(()) => (
+                        StatusCode::ACCEPTED,
+                        Json(serde_json::json!({
+                            "queued": true,
+                            "agent_id": agent_id,
+                            "via": "agent_pool",
+                        })),
+                    )
+                        .into_response(),
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                        .into_response(),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    let Some(registry) = state.agent_registry.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "agent_pool not configured"})),
+            Json(serde_json::json!({"error": "agent_registry not configured"})),
         )
             .into_response();
     };
-    let agent = match pool.get_agent(&agent_id).await {
-        Ok(Some(agent)) => agent,
+    match registry.get(&agent_id).await {
+        Ok(Some(_)) => {}
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -194,16 +239,43 @@ pub async fn send_message_handler(
             )
                 .into_response()
         }
+    }
+
+    // A name with a live holder but no queue to put the command on is a
+    // deployment fault, not a delivery: say so instead of answering 202 for a
+    // message that was never written anywhere.
+    let Some(backend) = state.message_backend.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "message_backend not configured"})),
+        )
+            .into_response();
     };
-    match agent.receive_message(msg).await {
+    let payload = match serde_json::to_vec(&msg) {
+        Ok(payload) => payload,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let stream = cog_core::agent_inbox_stream(&agent_id);
+    match backend.publish(&stream, &payload).await {
         Ok(()) => (
             StatusCode::ACCEPTED,
-            Json(serde_json::json!({"queued": true, "agent_id": agent_id})),
+            Json(serde_json::json!({
+                "queued": true,
+                "agent_id": agent_id,
+                "via": "inbox",
+                "stream": stream,
+            })),
         )
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({"error": e.to_string(), "stream": stream})),
         )
             .into_response(),
     }

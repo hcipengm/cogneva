@@ -154,6 +154,11 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         let _http_client: Arc<dyn cog_core::HttpClient> =
             ctx.require_service::<dyn cog_core::HttpClient>()?;
         let agent_pool = ctx.consume_service::<dyn cog_core::AgentManager>();
+        // The inbox queue, for agents this process does not own. Optional for
+        // the same reason the pool is: a gateway assembled without the stream
+        // plugin serves the same routes and answers a cross-process address
+        // with a refusal rather than pretending it was queued.
+        let message_backend = ctx.consume_service::<dyn cog_core::MessageBackend>();
         let evolution_admin: Option<Arc<dyn cog_core::EvolutionAdmin>> =
             ctx.consume_service::<dyn cog_core::EvolutionAdmin>();
         let evolution_stream =
@@ -231,6 +236,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &mcp_client,
             &external_skill_registry,
             &agent_pool,
+            &message_backend,
             &event_publisher,
             &media_backend,
             &notification_dispatcher,
