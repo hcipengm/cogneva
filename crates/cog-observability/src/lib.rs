@@ -1,6 +1,7 @@
 pub mod alert_store;
 pub mod alerts;
 pub mod analytics;
+pub mod claim_store;
 pub mod config;
 pub mod config_delivery;
 pub mod data_volume;

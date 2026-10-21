@@ -734,6 +734,49 @@ hostLedger:
   # 为了报一条读数去抢占工作负载，代价比它大。配额本身是另一件事：它现在是从这台
   # 机器的读数导出的，换一台机器要重推（见 resourceGovernance.quota）。
 
+# 卷账的全集面（claim-store DaemonSet）：每节点一个进程，走查本节点存储根下的每个
+# claim 目录，把每个目录占的字节发布成 `cogneva_data_volume_used_bytes`
+# {persistentvolumeclaim, namespace, node}——与各 Pod 自量自己挂载的那条同名同标签，
+# 因为规则按 (namespace, persistentvolumeclaim) 聚合后再除以声明量，换个名字就是另一
+# 个量、没人读。
+#
+# 为什么必须有它：能走查封自己挂载的卷的，是写那个卷的进程；数据库 / 缓存 / 向量库 /
+# 消息队列 / 对象存储 / 监控栈自己的盘写它们的都是第三方镜像，本平台没有任何进程在那些
+# Pod 里。而目录型卷（local-path）上 kubelet 报的 per-volume 用量是节点文件系统本身
+# ——实测 12 个 claim 报同一个 ~600GB，一个都不是它自己的。于是这一族卷此前既不参与
+# 「用量 ÷ 声明量」，也没有规则读得到：一张 5Gi 的卷用到 82% 也没有任何一句话。
+#
+# 它与 hostLedger 分成两个 DaemonSet：需要的权限不同（cgroup 的 memory.stat 是 0444，
+# 存储根是 0700 root），合一个 Pod 会让读 cgroup 的那一半也拿到根，还会让「存储根不存在」
+# 连带打掉 cgroup 读数。这个容器跑 uid 0 只为跨过那个 0700 的挂载点：挂载只读、
+# capabilities 全丢、根文件系统只读、不挂 SA token、不动 hostPID 与设备。
+#
+# 只在 k3s profile 打开：k8s-standard 用集群默认 SC（生产通常是 Longhorn 之类的 CSI），
+# 那里 kubelet 的 per-volume 用量是真实的，而 `/var/lib/rancher/k3s/storage` 这个目录
+# 根本不存在——开着的唯一后果是一个起不来的 DaemonSet。
+claimStore:
+  enabled: true
+  # 节点存储根：provisioner 在这里为每个 claim 建一个 `pvc-<uid>_<ns>_<claim>` 目录。
+  # 名字里的两段身份就是这个读数的全部归属来源（不查 API），所以目录名认不出来的
+  # 条目不会被猜着记到某张卷上，只计入 skipped。
+  hostPath: /var/lib/rancher/k3s/storage
+  mountPath: /host/storage
+  port: 9100
+  # 走查节奏。一次走查的成本是节点上那些卷的总量（本机 200GB 实测约 2s），所以它不
+  # 跟着抓取跑，抓取读的是上一拍的结果；`cogneva_claim_scan_age_seconds` 把「上一拍」
+  # 有多旧变成一条读数。规则 claim_scan_stale 的界是**三个这个节奏**，改这里要一起
+  # 改那条规则——界若等于节奏，健康节点在两拍之间也会亮。
+  scanIntervalSecs: 300
+  resources:
+    # 常态是每 300s 一次 readdir+stat 的走查，其余时间空转；内存按目录项规模取，
+    # 与 5G 卷的量级无关（走查不读文件内容）。
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
 # 集群内镜像仓库：GitOps L1 金丝雀镜像秒级分发通道。
 # publisher（进化 Pod）把 overlay 镜像（cogneva 基镜像 + 新二进制）push 到
 # Service:5000（集群 DNS，http）；节点 kubelet 经 NodePort 以 localhost:<nodePort>

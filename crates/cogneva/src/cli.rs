@@ -23,6 +23,7 @@ pub enum Command {
     SandboxExecutor,
     VolumeWalker,
     HostLedger,
+    ClaimStore,
     ValidateConfig,
     MainlineRollout,
     ExecuteChange,
@@ -41,11 +42,12 @@ pub enum Command {
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 17] = [
+const SUBCOMMANDS: [(&str, Command); 18] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
     ("host-ledger", Command::HostLedger),
+    ("claim-store", Command::ClaimStore),
     ("validate-config", Command::ValidateConfig),
     ("mainline-rollout", Command::MainlineRollout),
     ("execute-change", Command::ExecuteChange),
@@ -88,6 +90,7 @@ const FLAGS: [(&str, Command); 6] = [
 const READ_ONLY_SUBCOMMANDS: &[Command] = &[
     Command::ValidateConfig,
     Command::HostLedger,
+    Command::ClaimStore,
     Command::VolumeWalker,
     Command::McpServe,
 ];
@@ -103,6 +106,8 @@ COMMANDS:
     sandbox-executor       Run the sandbox executor only
     volume-walker          Walk a mounted volume and serve its footprint on /metrics
     host-ledger            Read the host's cgroup slices and serve their memory on /metrics
+    claim-store            Walk every claim directory on the node's storage root and serve
+                           their footprints on /metrics
     validate-config        Validate configuration and dependencies, then exit non-zero on errors
     mainline-rollout       Roll the mainline revision across deployments (in-cluster Job)
     execute-change         Apply, verify, commit and build one evolution change, then exit

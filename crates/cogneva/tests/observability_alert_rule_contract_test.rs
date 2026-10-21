@@ -61,6 +61,18 @@ const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
 /// can never fire.
 const PRODUCED: &[(&str, &str)] = &[
     (
+        "cogneva_claim_scan_age_seconds",
+        "crates/cog-observability/src/claim_store.rs",
+    ),
+    (
+        "cogneva_claim_scan_dirs",
+        "crates/cog-observability/src/claim_store.rs",
+    ),
+    (
+        "cogneva_claim_scan_readable",
+        "crates/cog-observability/src/claim_store.rs",
+    ),
+    (
         "cogneva_aof_repair_dropped_bytes",
         "crates/cogneva/src/aof_repair.rs",
     ),
@@ -1078,8 +1090,16 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     ("kube_node_status_condition", "kube-state-metrics"),
     (
+        "kube_persistentvolumeclaim_info",
+        "kube-state-metrics（每个 bound 的 claim 一条常量序列，带 storageclass；它是「集群现在有哪些卷」的那份清单，所以 claim 被删时它也消失——按它当全集来判「这张卷有没有用量读数」，才不会把「卷没了」读成「量不到」）",
+    ),
+    (
         "kube_persistentvolumeclaim_resource_requests_storage_bytes",
         "kube-state-metrics",
+    ),
+    (
+        "kube_persistentvolumeclaim_status_phase",
+        "kube-state-metrics（claim 自己的 phase；只挑 Bound 的，因为 Pending 的 claim 还没有目录，把它算进「没量到」会让一条规则在正常扩容期间常亮）",
     ),
     ("kube_pod_container_info", "kube-state-metrics"),
     (

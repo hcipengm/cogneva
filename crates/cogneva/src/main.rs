@@ -104,6 +104,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 宿主账本的拆解面：每节点一个只读进程，把宿主 cgroup v2 的三个 slice 各按
         // anon / file 拆开（deploy/k3s/host-ledger-daemonset.yaml 的启动命令）。
         Command::HostLedger => cogneva::host_ledger::run_from_env().await,
+        // 卷账的全集面：每节点一个进程，走查宿主存储根下的每个 claim 目录，把谁也
+        // 没挂上的卷（数据库/缓存/队列/对象存储/监控自身的盘）也纳入账
+        // （deploy/k3s/claim-store-daemonset.yaml 的启动命令）。
+        Command::ClaimStore => cogneva::claim_store::run_from_env().await,
         // 启动前配置与依赖校验（审计 Phase 2 任务 2.5）。
         Command::ValidateConfig => cogneva::validate_config::run().await,
         // 主线跟踪自动部署的滚动端：独立 Job Pod 内执行，四部署门禁滚动，

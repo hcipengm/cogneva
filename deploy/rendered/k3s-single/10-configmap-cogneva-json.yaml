@@ -745,6 +745,51 @@ data:
               "summary": "Volume holds {value}x its declared size: the workload writes past the PVC's requests.storage, and nothing enforces that request, so the declared size is not a ceiling. For a directory-backed volume the excess lands on the node filesystem and the per-volume capacity the kubelet reports is the node's, not this volume's. Either the declaration is wrong for what this deployment writes, or the growth belongs somewhere else"
             },
             {
+              "name": "claim_fill_level_high",
+              "promql": "(max by (namespace, persistentvolumeclaim) (max_over_time(cogneva_data_volume_used_bytes[30m])) / on(namespace, persistentvolumeclaim) kube_persistentvolumeclaim_resource_requests_storage_bytes) and on(namespace, persistentvolumeclaim) ((max by (namespace, persistentvolumeclaim) (max_over_time(cogneva_data_volume_used_bytes[30m])) / on(namespace, persistentvolumeclaim) kube_persistentvolumeclaim_resource_requests_storage_bytes) < 1.0)",
+              "condition": {
+                "greater_than": 0.9
+              },
+              "severity": "warning",
+              "summary": "A claim is {value} full, and the growth loop did not save it: that loop raises a declaration once the measured peak times 1.2 no longer fits, so anything above 0.90 is a claim it does not measure (no process of ours mounts it) or one whose raise was clamped or refused -- the volume_capacity_* counters say which. Read against the 30-minute maximum rather than the instant, because one build landing on a volume is not the volume filling up. Above 1.0 the over-declared rule owns the same volume and this one stays quiet, so a single volume is one alert"
+            },
+            {
+              "name": "claim_usage_unmeasured",
+              "promql": "count((kube_persistentvolumeclaim_info{storageclass=~\"local-path|cogneva-local-retain\"} and on(namespace, persistentvolumeclaim) kube_persistentvolumeclaim_status_phase{phase=\"Bound\"}) unless on(namespace, persistentvolumeclaim) max by (namespace, persistentvolumeclaim) (cogneva_data_volume_used_bytes))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "{value} bound claim(s) whose filesystem is a directory on the node have no usage reading at all: nothing walks them, so nothing compares them against their declared size, and a volume nobody measures can fill the node without a single series moving. On a local-path claim the kubelet's per-volume numbers are the node's filesystem, so they are not this reading. The scanner that covers them walks the node's storage root and publishes cogneva_claim_scan_dirs for how many it found; when that series exists and this one still fires, the claim's directory is missing or unreadable. Only local-path and local-retain classes are counted: a claim on a real CSI volume is measured by the kubelet"
+            },
+            {
+              "name": "claim_directory_without_a_claim",
+              "promql": "count(max by (namespace, persistentvolumeclaim) (cogneva_data_volume_used_bytes) unless on(namespace, persistentvolumeclaim) kube_persistentvolumeclaim_info)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "{value} measured volume(s) exist on disk with no claim behind them: a deleted PVC whose directory the reclaim policy kept, holding bytes that no object in the cluster accounts for and that nothing will ever clean up on its own. The disk is the node's, so this is space the quota does not know is spent. The label pair names the namespace and claim the directory was created for"
+            },
+            {
+              "name": "claim_scan_stale",
+              "promql": "max by (node) (cogneva_claim_scan_age_seconds)",
+              "condition": {
+                "greater_than": 900.0
+              },
+              "severity": "warning",
+              "summary": "The claim scanner on {node} last completed a walk {value}s ago, past three of its 300s cadences: the numbers it publishes are a snapshot nobody refreshed, which reads exactly like volumes that stopped growing. The age starts counting at process start, so a scanner that never completed a single walk is on this alert too rather than silent. Where the refresh is stuck, the log line beside each failed scan names the root and the error"
+            },
+            {
+              "name": "claim_scan_incomplete",
+              "promql": "max by (node) (cogneva_claim_scan_dirs - cogneva_claim_scan_readable)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The claim scanner on {node} found {value} claim director(ies) it could not walk: the directory is there and its bytes are not in the account, so those claims read as unmeasured rather than as empty. The usual cause is ownership -- the storage root is root-only and a directory inside it moved to another owner. scan_dirs and scan_readable are published together for this sum; a node with no claim directories at all reports zero of both and is not what this fires on"
+            },
+            {
               "name": "volume_capacity_clamped_by_admission",
               "promql": "max(increase(cogneva_volume_capacity_outcome_total{outcome=\"clamped\"}[1h]))",
               "condition": {

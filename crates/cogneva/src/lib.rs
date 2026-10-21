@@ -7,6 +7,7 @@ pub mod assembly;
 pub mod backup;
 pub mod backup_crypto;
 pub mod bootstrap;
+pub mod claim_store;
 pub mod cli;
 pub mod config_loader;
 pub mod config_watcher;

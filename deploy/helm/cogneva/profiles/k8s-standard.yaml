@@ -41,6 +41,13 @@ evolution:
   gitRemote:
     mode: pvc
 
+# 卷账的全集面（claim-store DaemonSet）在这个 profile 下关闭：它走查的是 K3s
+# local-path provisioner 的存储根（/var/lib/rancher/k3s/storage），标准集群里没有这个
+# 目录；而且生产集群的卷通常是真正的 CSI 卷（Longhorn 等），kubelet 报的 per-volume
+# 用量在那里是这张卷自己的，不需要宿主侧再走一遍。
+claimStore:
+  enabled: false
+
 gitops:
   kubectlBin:
     enabled: false
