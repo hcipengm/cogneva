@@ -355,6 +355,7 @@
       "prometheus_url": "http://cog-observability-prometheus.monitoring:9090",
       "poll_interval_secs": 60,
       "eval_failure_alert_after": 3,
+      "_for_seconds_comment": "每条规则可选 `for_seconds`：条件要一直成立这么久才落行。默认不写＝第一拍就落行。只有当「读数会随着产出者重启而消失」时才需要它——比如走卷的扫描器每 5 分钟重发一次、Prometheus 在最后一次抓取 5 分钟后丢掉目标序列，于是 DaemonSet 一滚，「这些 claim 没有读数」这种形状就自己出现了。窗口取「扫描间隔＋序列失效时间」再加余量。语义照抄 Prometheus 规则文件的 `for`：条件断掉或查询失败都让时钟从零再数；已经在响的行照旧每拍刷新，窗口只管新行。",
       "_retired_rules_comment": "已经停用的规则名。从 rules 里删掉一条规则不会动它已经开着的行，那些行会以「正在持续」的样子一直留在 state=firing 那一面上（resolved_at 空、last_seen_at 停在删除那一刻），会去关它的只有那条规则自己，而它已经不在了。点名在这里的，watcher 启动时按普通解析的同一路径把它们结算掉。停用的名字不能同时出现在 rules 里。",
       "retired_rules": [],
       "rules": [
@@ -506,7 +507,12 @@
     "health_check_interval_secs": 5,
     "health_check_max_retries": 6,
     "test_timeout_secs": 600,
-    "test_command": ["cargo", "test", "--workspace", "--no-fail-fast"],
+    "test_command": [
+      "cargo",
+      "test",
+      "--workspace",
+      "--no-fail-fast"
+    ],
     "build_timeout_secs": 1800,
     "poll_interval_secs": 60,
     "notify_on_success": true,

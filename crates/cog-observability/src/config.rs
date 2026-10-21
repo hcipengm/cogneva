@@ -216,6 +216,24 @@ pub struct InfraRule {
     /// Human-readable summary; `{value}` is substituted with the last
     /// observed sample value.
     pub summary: String,
+    /// How long the condition has to keep holding before a row is raised.
+    ///
+    /// One sample is evidence that something is wrong only when the reading
+    /// cannot be absent for a while on its own. Most readings here can: a
+    /// DaemonSet that walks a volume and republishes the number is a producer
+    /// that restarts, and while it restarts the series is missing -- the very
+    /// shape of "this claim has no usage reading". Without a hold time that
+    /// restart writes a row that resolves two minutes later, once per rollout,
+    /// and the account cannot tell it apart from the condition it names.
+    ///
+    /// The same field is what Prometheus's own rule files call `for`, and the
+    /// semantics are copied rather than invented: the clock starts on the first
+    /// tick the condition holds, a tick where it does not hold (or where the
+    /// query failed, because unknown is not the same as holding) clears it, and
+    /// a row already firing keeps being refreshed every tick -- the hold gates
+    /// new rows only.
+    #[serde(default)]
+    pub for_seconds: Option<u64>,
 }
 
 impl InfraWatchConfig {

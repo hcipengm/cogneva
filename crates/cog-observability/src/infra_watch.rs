@@ -27,7 +27,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tracing::{info, warn};
@@ -125,6 +125,9 @@ pub async fn run_infra_watch_loop(
                 let mut known_firing: HashSet<String> = HashSet::new();
                 let mut eval_failure_firing: HashSet<String> = HashSet::new();
                 let mut failure_streaks: HashMap<String, u32> = HashMap::new();
+                // dedup keys whose condition is holding but whose rule asks for a
+                // `for_seconds` window first: value is the first tick it held.
+                let mut holding: HashMap<String, Instant> = HashMap::new();
                 let mut adopted = false;
                 // 没有停用规则时这一趟本来就没事可做，标成已跑完，免得每拍都去
                 // 问一次 store——空名单不是"还没跑"，是"跑完了，没有要结算的"。
@@ -158,7 +161,7 @@ pub async fn run_infra_watch_loop(
                             if !retired {
                                 retired = retire_rules(&config, &outlets).await;
                             }
-                            tick(&config, &outlets, &http, &mut known_firing, &mut eval_failure_firing, &mut failure_streaks).await;
+                            tick(&config, &outlets, &http, &mut known_firing, &mut eval_failure_firing, &mut failure_streaks, &mut holding).await;
                             crate::config_delivery::check_loaded_rule_set(
                                 &mut rule_set_watch,
                                 &loaded_rule_names,
@@ -332,6 +335,7 @@ async fn tick(
     known_firing: &mut HashSet<String>,
     eval_failure_firing: &mut HashSet<String>,
     failure_streaks: &mut HashMap<String, u32>,
+    holding: &mut HashMap<String, Instant>,
 ) {
     for rule in &config.rules {
         let series = match query_prometheus(http, &config.prometheus_url, &rule.promql).await {
@@ -341,6 +345,14 @@ async fn tick(
                 // evidence is not evidence of health. No plan is built for
                 // this rule, so its previously-firing rows survive this tick
                 // untouched.
+                //
+                // It clears the rule's hold clocks for the same reason: a tick
+                // that could not read the condition is not a tick where it ceased
+                // to hold, but it is also not evidence that it went on holding.
+                // Leaving the clock running would let a rule fire on the first
+                // successful tick after an outage, crediting the gap as time the
+                // condition was observed.
+                forget_held(rule, holding);
                 warn!(rule = %rule.name, error = %e, "infra watch: rule query failed");
                 let streak = failure_streaks.entry(rule.name.clone()).or_insert(0);
                 *streak = streak.saturating_add(1);
@@ -370,16 +382,76 @@ async fn tick(
         }
 
         let plan = plan_rule(rule, &series, known_firing);
+        let now = Instant::now();
         for &i in &plan.report {
             let key = dedup_key(&rule.name, &series[i].labels);
+            if !known_firing.contains(&key) && !hold_elapsed(rule, &key, now, holding) {
+                // The condition holds, but the rule asks for it to keep
+                // holding. Nothing is written this tick: a row is a claim about
+                // what happened, and one sample of a reading that disappears on
+                // its own producer's restart does not support that claim.
+                continue;
+            }
             known_firing.insert(key.clone());
+            // The row now carries the condition; the clock that got it there has
+            // no further say and would otherwise sit in the map for as long as
+            // the alert is open.
+            holding.remove(&key);
             report_sighting(rule, &series[i], &key, outlets).await;
         }
+        // A condition that stopped holding restarts its clock: the window is
+        // about one uninterrupted stretch, not about a total across ticks.
+        forget_held_except(rule, &series, holding);
         for key in &plan.close {
             resolve(key, outlets).await;
             known_firing.remove(key);
         }
     }
+}
+
+/// Whether a rule's hold window has elapsed for a series that is not firing yet.
+///
+/// Returns true immediately for a rule without `for_seconds`, so the ordinary
+/// rule path is unchanged. The first sighting starts the clock and answers
+/// false; later ticks answer false until the window is over, then true -- and
+/// the caller drops the entry by inserting the key into `known_firing`.
+fn hold_elapsed(
+    rule: &crate::config::InfraRule,
+    key: &str,
+    now: Instant,
+    holding: &mut HashMap<String, Instant>,
+) -> bool {
+    let Some(window) = rule.for_seconds.filter(|secs| *secs > 0) else {
+        return true;
+    };
+    let first = *holding.entry(key.to_string()).or_insert(now);
+    now.saturating_duration_since(first) >= Duration::from_secs(window)
+}
+
+/// Drop one rule's hold clocks, all of them.
+fn forget_held(rule: &crate::config::InfraRule, holding: &mut HashMap<String, Instant>) {
+    let prefix = format!("{}:", rule.name);
+    holding.retain(|key, _| !key.starts_with(prefix.as_str()));
+}
+
+/// Drop this rule's hold clocks for every series that is not still satisfying
+/// its condition.
+fn forget_held_except(
+    rule: &crate::config::InfraRule,
+    series: &[SeriesSample],
+    holding: &mut HashMap<String, Instant>,
+) {
+    if holding.is_empty() {
+        return;
+    }
+    let prefix = format!("{}:", rule.name);
+    let mut still_holding: HashSet<String> = HashSet::new();
+    for sample in series {
+        if rule.condition.evaluate(sample.value) {
+            still_holding.insert(dedup_key(&rule.name, &sample.labels));
+        }
+    }
+    holding.retain(|key, _| !key.starts_with(prefix.as_str()) || still_holding.contains(key));
 }
 
 /// One evaluated series sample from a Prometheus vector result.
@@ -1527,6 +1599,7 @@ mod tests {
             condition: cog_core::AlertCondition::GreaterThan(0.0),
             severity: cog_core::AlertSeverity::Warning,
             summary: "s".to_string(),
+            for_seconds: None,
         }
     }
 
@@ -1609,6 +1682,7 @@ mod tests {
         let mut known_firing = HashSet::new();
         let mut eval_firing = HashSet::new();
         let mut streaks = HashMap::new();
+        let mut holding = HashMap::new();
         let key = format!("{EVAL_FAILURE_RULE}:rule_a");
 
         // First failure: below threshold, no self-alert.
@@ -1619,6 +1693,7 @@ mod tests {
             &mut known_firing,
             &mut eval_firing,
             &mut streaks,
+            &mut holding,
         )
         .await;
         assert!(eval_firing.is_empty());
@@ -1631,6 +1706,7 @@ mod tests {
             &mut known_firing,
             &mut eval_firing,
             &mut streaks,
+            &mut holding,
         )
         .await;
         assert!(eval_firing.contains(&key));
@@ -1645,6 +1721,7 @@ mod tests {
             &mut known_firing,
             &mut eval_firing,
             &mut streaks,
+            &mut holding,
         )
         .await;
         assert!(eval_firing.is_empty());
@@ -1717,6 +1794,7 @@ mod tests {
         let mut known_firing = HashSet::new();
         let mut eval_firing = HashSet::new();
         let mut streaks = HashMap::new();
+        let mut holding = HashMap::new();
         for _ in 0..5 {
             tick(
                 &config,
@@ -1725,10 +1803,101 @@ mod tests {
                 &mut known_firing,
                 &mut eval_firing,
                 &mut streaks,
+                &mut holding,
             )
             .await;
         }
         assert!(eval_firing.is_empty());
         assert_eq!(streaks.get("rule_a"), Some(&5));
+    }
+
+    /// 一条带 `for_seconds` 的规则，第一条样本还不算证据：它要的是「一直成立」。
+    ///
+    /// 现场：claim-store 这个 DaemonSet 每次滚动都被换掉，它一走 `cogneva_data_volume_used_bytes`
+    /// 就没有了，而「这个 claim 没有用量读数」正是缺这条序列的形状——于是每次滚动都写一行
+    /// 「12 个 claim 无人测量」，两分钟后新 Pod 扫完又自己结算。读者分不出这行和它名字所指的
+    /// 条件。窗口把「产出者刚重启」挡在行外，而产出者真停了超过窗口，行照旧落下。
+    #[test]
+    fn a_hold_window_keeps_one_sample_of_a_disappearing_reading_out_of_the_table() {
+        let mut rule = test_rule("claim_usage_unmeasured");
+        rule.for_seconds = Some(120);
+        let mut holding: HashMap<String, Instant> = HashMap::new();
+        let t0 = Instant::now();
+
+        // 第一拍：条件成立，但只成立了零秒。
+        assert!(!hold_elapsed(
+            &rule,
+            "claim_usage_unmeasured:",
+            t0,
+            &mut holding
+        ));
+        // 窗口内再看一拍，仍然只是「一直成立着」。
+        assert!(!hold_elapsed(
+            &rule,
+            "claim_usage_unmeasured:",
+            t0 + Duration::from_secs(60),
+            &mut holding
+        ));
+        // 满窗口之后才是证据。
+        assert!(hold_elapsed(
+            &rule,
+            "claim_usage_unmeasured:",
+            t0 + Duration::from_secs(121),
+            &mut holding
+        ));
+    }
+
+    /// 没有写窗口的规则行为不变：第一拍就落行（大多数读数不会自己消失）。
+    #[test]
+    fn a_rule_without_a_hold_window_raises_on_its_first_tick() {
+        let rule = test_rule("pod_restarting_fast");
+        let mut holding: HashMap<String, Instant> = HashMap::new();
+        assert!(hold_elapsed(
+            &rule,
+            "pod_restarting_fast:pod=redis-0",
+            Instant::now(),
+            &mut holding
+        ));
+        assert!(holding.is_empty());
+    }
+
+    /// 条件中断，窗口从头再数；查询失败也清零——读不到不等于一直成立。
+    #[test]
+    fn a_hold_clock_restarts_when_the_condition_drops_or_the_query_fails() {
+        let mut rule = test_rule("claim_store_node_unreported");
+        rule.for_seconds = Some(600);
+        let mut holding: HashMap<String, Instant> = HashMap::new();
+        let t0 = Instant::now();
+        let held = "claim_store_node_unreported:node=cogneva";
+        assert!(!hold_elapsed(&rule, held, t0, &mut holding));
+
+        // 这一拍里这条序列掉到阈值以下（或者干脆没了）：时钟作废。
+        let below = SeriesSample {
+            labels: BTreeMap::from([("node".to_string(), "cogneva".to_string())]),
+            value: 0.0,
+        };
+        forget_held_except(&rule, std::slice::from_ref(&below), &mut holding);
+        assert!(
+            !holding.contains_key(held),
+            "a condition that stopped holding keeps no clock"
+        );
+
+        // 再成立时从零开始：刚过原来的窗口也不算数。
+        assert!(!hold_elapsed(
+            &rule,
+            held,
+            t0 + Duration::from_secs(600),
+            &mut holding
+        ));
+        assert!(!hold_elapsed(
+            &rule,
+            held,
+            t0 + Duration::from_secs(1199),
+            &mut holding
+        ));
+
+        // 查询失败把这一条规则的所有时钟一起清掉。
+        forget_held(&rule, &mut holding);
+        assert!(holding.is_empty());
     }
 }
