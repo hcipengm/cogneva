@@ -362,6 +362,13 @@ impl EvolutionIntent {
             "baseline_port_rework" => EvolutionIntent::BaselineRework,
             "change_rework" => EvolutionIntent::ChangeRework,
             "self_evolution" => EvolutionIntent::SelfEvolution,
+            // The change ledger dispatches an owed row as a `change_ledger`
+            // task. It is the plain self-evolution form: the audit found the
+            // row and the main flow generates the change, with no narrower
+            // class naming the producer. Missing from this table, the kind
+            // fell through to `unattributed` and the funnel could not say who
+            // held 55 of its retired changes.
+            "change_ledger" => EvolutionIntent::SelfEvolution,
             _ => EvolutionIntent::Unattributed,
         }
     }
@@ -983,6 +990,11 @@ mod tests {
             (
                 "self_evolution",
                 &["crates/cog-core/src/types/task.rs"],
+                EvolutionIntent::SelfEvolution,
+            ),
+            (
+                "change_ledger",
+                &["crates/cog-orchestrator/src/change_ledger.rs"],
                 EvolutionIntent::SelfEvolution,
             ),
         ];
