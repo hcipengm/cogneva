@@ -2053,6 +2053,19 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          reading on its own -- a reader that takes a reading's name and prints what \
          comes back would otherwise show four unlabelled numbers in one cell.",
     ),
+    (
+        crate::metric_names::PRINCIPLE_REFUSALS.as_str(),
+        "How many times a gate has refused work because of one principle, by \
+         `slug`. Cumulative and monotone: the value is the account's own count, \
+         folded from the refusals the gates report, so it never falls and it \
+         carries no `_total` suffix -- `rate()` over it would measure the fold's \
+         cadence rather than the refusals. A slug with no series has never been \
+         refused; a slug that disappears had its row retired from the account, \
+         which is not the same as a count going to zero. Each series also carries \
+         `readout=principle_ledger_refusals`. The slug label is not always a \
+         principle: the gates record their own self-faults under names like \
+         `principle-gate.sh:self-fault:drill`, published as they are.",
+    ),
 ];
 
 /// The description registered for one series, if it has one.

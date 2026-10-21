@@ -1096,6 +1096,26 @@ metric_names! {
     // publishing rather than that this account holds none of that answer.
     PRINCIPLE_LEDGER_ROWS => "cogneva_principle_ledger_rows",
 
+    // cog-orchestrator — how many times a gate has refused work because of one
+    // principle, by `slug`.
+    //
+    // The account already stored this per row (`refusals`, folded from what the
+    // gates report), and nothing outside a SQL query could read it: the census
+    // beside it answers "how much of the corpus has a gate", never "which rule
+    // keeps stopping work". The value is the account's cumulative count, not a
+    // process counter, so the name carries no `_total` suffix -- `rate()` or
+    // `increase()` over a row that is only written when the fold runs would
+    // invent a rate that the fold's cadence, not the refusals, decides.
+    //
+    // A slug with no series here has never been refused, and that is the whole
+    // of what absence means: the producer writes every row the account holds
+    // with `refusals > 0`, so a slug that drops out dropped out because the
+    // account retired the row, not because the count fell. The label is a slug
+    // and a slug is not always a principle: the gates also record their own
+    // self-faults under names like `principle-gate.sh:self-fault:drill`, and
+    // they are published as they are rather than filtered here.
+    PRINCIPLE_REFUSALS => "cogneva_principle_refusals",
+
     // cog-orchestrator — ready tasks the pool's window could not pay for, and
     // the counts that decision was made on.
     //

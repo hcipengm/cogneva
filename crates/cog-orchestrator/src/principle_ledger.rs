@@ -82,6 +82,16 @@ pub const PRINCIPLE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(300);
 /// how much is outstanding" a line in the log with a reading behind it.
 const OUTSTANDING_PEEK: usize = 50;
 
+/// How many refused rows one pass publishes.
+///
+/// The selector already bounds the population to the rows the account holds
+/// with `refusals > 0`, which today number nine. The bound is deliberately
+/// larger than that rather than tuned to it: a bound below the population would
+/// truncate the reading by the ordering instead of by what the gates refused,
+/// and the total a reader adds up would then disagree with the account for a
+/// reason nothing on the surface states.
+const REFUSAL_ROWS_PER_PASS: usize = 1000;
+
 /// How many queued readings one pass folds into the account.
 ///
 /// Generous on purpose, and deliberately larger than the corpus. The intake is
@@ -249,6 +259,27 @@ async fn read_pass(store: &dyn PrincipleLedgerStore, metrics: Option<&Arc<dyn Me
         Err(e) => warn!(error = %e, "principle ledger: the census could not be read"),
     }
 
+    // What the gates refused, by the principle they refused it for. The account
+    // has counted this per row since refusals were first reported, and until now
+    // the count was only reachable by running a query: the census above answers
+    // "how much of the corpus has a gate", never "which rule keeps stopping
+    // work". Read every pass, like the census, so an absent series is a loop that
+    // stopped publishing rather than a gate that stopped refusing.
+    match store.refused(REFUSAL_ROWS_PER_PASS).await {
+        Ok(rows) if rows.is_empty() => {
+            debug!("principle ledger refusals: no principle has been refused");
+        }
+        Ok(rows) => {
+            info!(
+                rows = rows.len(),
+                refusals = rows.iter().map(|row| row.refusals).sum::<i64>(),
+                "principle ledger refusals"
+            );
+            publish_refusals(metrics, &rows).await;
+        }
+        Err(e) => warn!(error = %e, "principle ledger: the refusal counts could not be read"),
+    }
+
     // The tier census beside it, because the state census alone cannot say why a
     // row is ungated. A debt and a principle a person holds both read as
     // `unenforced` there; only this reading tells them apart, and the number work
@@ -313,6 +344,49 @@ async fn publish_census(metrics: Option<&Arc<dyn MetricsBackend>>, census: &Prin
                 error = %e,
                 state,
                 "principle ledger: the census could not be published"
+            );
+        }
+    }
+}
+
+/// One series per refused principle, the account's cumulative count as the value.
+///
+/// Only the rows the account holds with `refusals > 0` are written, and that is
+/// deliberate in the opposite direction from the census: the census writes a
+/// zero for an answer the corpus holds none of, because the four cells have to
+/// add up to the account. Here a zero is not a reading -- a slug with no series
+/// has never been refused -- and writing zeroes for the whole corpus would make
+/// the series population the corpus size rather than the number of principles a
+/// gate has actually stopped something for.
+///
+/// Each series names itself a reading (`readout=principle_ledger_refusals`), the
+/// same way the census cells do: a reader that takes one reading's name and
+/// prints what comes back would otherwise get one cell per slug with nothing to
+/// say which question they all answer.
+async fn publish_refusals(metrics: Option<&Arc<dyn MetricsBackend>>, rows: &[PrincipleRow]) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    for row in rows {
+        let labels = HashMap::from([
+            ("slug".to_string(), row.slug.clone()),
+            (
+                "readout".to_string(),
+                "principle_ledger_refusals".to_string(),
+            ),
+        ]);
+        if let Err(e) = metrics
+            .record_gauge(
+                metric_names::PRINCIPLE_REFUSALS,
+                row.refusals as f64,
+                labels,
+            )
+            .await
+        {
+            warn!(
+                error = %e,
+                slug = %row.slug,
+                "principle ledger: a refusal count could not be published"
             );
         }
     }
@@ -1808,7 +1882,11 @@ mod tests {
 
     /// A store that answers the three reads one pass makes and holds a census
     /// whose cells differ from each other and include a zero.
-    struct CensusStore(PrincipleCensus);
+    struct CensusStore {
+        census: PrincipleCensus,
+        /// What this store says the account holds with `refusals > 0`.
+        refused: Vec<(String, i64)>,
+    }
 
     #[async_trait::async_trait]
     impl PrincipleLedgerStore for CensusStore {
@@ -1849,7 +1927,26 @@ mod tests {
             unimplemented!()
         }
         async fn refused(&self, _: usize) -> cog_core::SFResult<Vec<PrincipleRow>> {
-            unimplemented!()
+            Ok(self
+                .refused
+                .iter()
+                .map(|(slug, refusals)| PrincipleRow {
+                    slug: slug.clone(),
+                    lead: None,
+                    carrier_path: None,
+                    carrier_sha256: None,
+                    host_gate: None,
+                    where_red: None,
+                    platform_gate: None,
+                    check_kind: None,
+                    state: None,
+                    refusals: *refusals,
+                    last_refused_at: None,
+                    first_seen_at: chrono::Utc::now(),
+                    measured_at: None,
+                    measured_rev: None,
+                })
+                .collect())
         }
         async fn get(&self, _: &str) -> cog_core::SFResult<Option<PrincipleRow>> {
             unimplemented!()
@@ -1859,10 +1956,10 @@ mod tests {
         }
         async fn census(&self) -> cog_core::SFResult<PrincipleCensus> {
             Ok(PrincipleCensus {
-                enforced: self.0.enforced,
-                unenforced: self.0.unenforced,
-                unmeasured: self.0.unmeasured,
-                retired: self.0.retired,
+                enforced: self.census.enforced,
+                unenforced: self.census.unenforced,
+                unmeasured: self.census.unmeasured,
+                retired: self.census.retired,
             })
         }
         async fn check_kind_census(&self) -> cog_core::SFResult<PrincipleCheckKindCensus> {
@@ -1901,12 +1998,15 @@ mod tests {
     #[tokio::test]
     async fn a_pass_publishes_every_census_cell_including_the_zero() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let store = CensusStore(PrincipleCensus {
-            enforced: 232,
-            unenforced: 1730,
-            unmeasured: 518,
-            retired: 0,
-        });
+        let store = CensusStore {
+            census: PrincipleCensus {
+                enforced: 232,
+                unenforced: 1730,
+                unmeasured: 518,
+                retired: 0,
+            },
+            refused: Vec::new(),
+        };
 
         read_pass(&store, Some(&(metrics.clone() as Arc<dyn MetricsBackend>))).await;
 
@@ -1966,6 +2066,75 @@ mod tests {
             readings.len(),
             4,
             "a cell carried no reading name: {readings:?}"
+        );
+    }
+
+    /// The refusals are published as one series per slug the account holds with
+    /// `refusals > 0`, and only for those.
+    ///
+    /// Unlike the census, no zero is written for the principles nothing has
+    /// refused: the population is the answer to "which rules keep stopping
+    /// work", and writing a zero for every row would turn it into the corpus
+    /// size. The `readout` label is asserted for the same reason its sibling
+    /// test does -- the roster resolves a reading by that label, and a family
+    /// that only carries `slug` would arrive there as N unlabelled numbers.
+    #[tokio::test]
+    async fn a_pass_publishes_one_series_per_refused_principle() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let store = CensusStore {
+            census: PrincipleCensus {
+                enforced: 1,
+                unenforced: 0,
+                unmeasured: 0,
+                retired: 0,
+            },
+            refused: vec![
+                ("feedback_numbering_and_plain_language".to_string(), 887),
+                ("principle-gate.sh:self-fault:drill".to_string(), 7),
+            ],
+        };
+
+        read_pass(&store, Some(&(metrics.clone() as Arc<dyn MetricsBackend>))).await;
+
+        let gauges = metrics.gauges.lock().unwrap();
+        let by_slug: HashMap<&str, f64> = gauges
+            .iter()
+            .filter(|(name, _, _)| name == metric_names::PRINCIPLE_REFUSALS.as_str())
+            .map(|(_, value, labels)| {
+                (
+                    labels
+                        .get("slug")
+                        .map(String::as_str)
+                        .unwrap_or("<no slug>"),
+                    *value,
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_slug.len(),
+            2,
+            "published {} series: {by_slug:?}",
+            by_slug.len()
+        );
+        assert_eq!(
+            by_slug.get("feedback_numbering_and_plain_language"),
+            Some(&887.0)
+        );
+        assert_eq!(
+            by_slug.get("principle-gate.sh:self-fault:drill"),
+            Some(&7.0)
+        );
+
+        let unlabelled = gauges
+            .iter()
+            .filter(|(name, _, _)| name == metric_names::PRINCIPLE_REFUSALS.as_str())
+            .filter(|(_, _, labels)| {
+                labels.get("readout").map(String::as_str) != Some("principle_ledger_refusals")
+            })
+            .count();
+        assert_eq!(
+            unlabelled, 0,
+            "a refusal series carried no readout label; the roster cannot name it"
         );
     }
 }

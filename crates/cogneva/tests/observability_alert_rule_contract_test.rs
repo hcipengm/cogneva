@@ -992,6 +992,11 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_principle_ledger_rows",
         "crates/cog-orchestrator/src/principle_ledger.rs",
     ),
+    // `cogneva_principle_refusals` is deliberately not here: this table registers
+    // series a shipped rule reads, and nothing reads the refusal counts yet --
+    // the bound they would be read against is a policy nobody has stated. The
+    // series is published and filed as a debt in UNREAD instead; it moves into
+    // this table on the same pass its rule lands.
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.
@@ -3334,6 +3339,20 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_alert_channels_configured",
         Unread::Gap("which outlets this deployment can deliver an alert through. Two kinds of row with opposite polarity, told apart by `state`: `state=\"configured\"` rows name one outlet each in `channel` at 1, and no such row is written when there is no outlet -- a placeholder name would read as a kind that exists and is switched off -- and one `state=\"verdict\"` row carries no `channel` but the `readout` name the communication face owes, at 1 when there is no outlet at all and 0 when there is at least one -- written in both directions, since the configured rows exist only when there is an outlet and so could never say there is none. A reader must select one kind by `state` before aggregating; summing the family answers yes either way. Every value is a constant per process, so a reader takes one series rather than adding the copies: what it answers is whether an alert can reach a person at all, which is the question the persisted alert row cannot answer -- that row is written whether or not anyone was told. It is filed rather than given a threshold because every cell is the configuration itself: 1 is the ordinary state of a deployment with an outlet and 0 the ordinary state of one without, so neither number is a condition that turns into a fault at some level. What makes a deployment without an outlet wrong is a decision about that deployment, not something this series can bound"),
     ),
+    // The account has counted refusals per principle since the gates first
+    // reported them, and the platform surface published none of it: the only
+    // reader was a host script querying the database and writing a TSV, which
+    // is a surface outside this repository's rules and panels. Publishing the
+    // count as a series is the half that closes "a rule cannot read it"; the
+    // half still owed is a declared bound, and what number of refusals is a
+    // fault is a policy nobody has stated -- a principle refused once is a gate
+    // doing its job, and the same principle refused for a week is a rule that is
+    // not being internalized. A threshold invented here would page on the
+    // policy, so the entry stays a debt until someone states it.
+    (
+        "cogneva_principle_refusals",
+        Unread::Gap("how many times a gate has refused work because of one principle, by slug. The account stored the count per row already; what was missing was a surface outside a query, and this series is that surface. What is still missing is a declared bound: one refusal is a gate doing its job, the same principle refused for a week is a rule the corpus is not internalizing, and where between those two a page belongs is a policy decision rather than a number a producer can know. The host script `scripts/host/cogneva-principle-refusal-reading.sh` reads the same fact straight from the database today, which is why the absence of a rule is not the absence of a reader -- but that reader lives outside this repository and cannot be named here as a series name"),
+    ),
 ];
 
 /// How many `Gap` entries the census left. A new series that no face reads and
@@ -3539,7 +3558,20 @@ const UNREAD: &[(&str, Unread)] = &[
 /// `readout="write_window_approved"` today, and that reader is outside the rules
 /// and panels this census counts, which is why the entry stands rather than
 /// pointing at it.
-const GAPS_AT_CENSUS: usize = 28;
+///
+/// It went to 29 in the pass that published the principle account's refusal
+/// counts by slug. The account had stored the count per row since the gates
+/// first reported refusals, and the only surface outside a query was a host
+/// script reading the database directly -- outside this repository, so it
+/// cannot be named as a reader here. The series closes that half. The half left
+/// is a bound, and none exists: a principle refused once is a gate doing its
+/// job, the same one refused for a week is a rule the corpus is not
+/// internalizing, and the number between them is a policy nobody has stated.
+/// Publishing first and filing the reader as a debt is deliberate -- the same
+/// order the write-window record used, and for the same reason: a series that
+/// waits for its threshold is a series nobody can watch while the threshold is
+/// being argued about.
+const GAPS_AT_CENSUS: usize = 29;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
