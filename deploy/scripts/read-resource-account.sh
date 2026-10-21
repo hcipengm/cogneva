@@ -64,13 +64,26 @@ if [ -n "$src" ]; then
   rows="$(cat "$src")"
 else
   echo "resource_account_source=pod:$PG_POD"
+  # 空结果有两个原因，而它们要的修法相反：查询根本没跑成（kubectl 读不到 kubeconfig、
+  # 连不上 API server、psql 拒登），和查询跑成了、表里确实没有行。只看 `rows` 这两个同形，
+  # 而「读不到」这个判词对两边都成立，于是读者会去查账，其实该修的是调用方式——
+  # 2026-10-21 实测：不带 COGNEVA_KUBECTL 时 kubectl 拿不到 kubeconfig，判词是
+  # unreadable，账其实是好的（467 行）。所以 stderr 不再扔掉，读不到时把前几行附在后面。
+  err_file="$(mktemp)"
   rows="$($KUBECTL -n "$NS" exec "$PG_POD" -- sh -c \
     'PGPASSWORD="$POSTGRES_PASSWORD" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -F "$(printf "\t")" -c "$0"' \
-    "$SQL" 2>/dev/null)"
+    "$SQL" 2>"$err_file")"
   if [ -z "$rows" ]; then
     echo "resource_account_verdict=unreadable (PG Pod 在也可能，但查询取回来是空的：读不到，不是空账)"
+    if [ -s "$err_file" ]; then
+      echo "resource_account_error=$(head -3 "$err_file" | tr '\n' ' ')"
+    else
+      echo "resource_account_error=<empty: 查询跑通了却一行都没取回>"
+    fi
+    rm -f "$err_file"
     exit 3
   fi
+  rm -f "$err_file"
 fi
 
 # 平台自己的控制律造的墙。这里是**档案**不是判据：档位只影响这一面把 subject 归到哪一栏，
