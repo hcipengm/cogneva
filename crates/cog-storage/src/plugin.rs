@@ -740,7 +740,15 @@ impl cog_core::SystemPlugin for StoragePlugin {
             .consume::<cog_core::ShutdownSignal>()
             .map(|s| (*s).clone())
             .unwrap_or_default();
-        let _wal_sweep = Arc::clone(&wal_redis).spawn(wal_shutdown);
+        let _wal_sweep = Arc::clone(&wal_redis).spawn(wal_shutdown.clone());
+        // The cap bounds a live log; nothing bounded the store. Every retired
+        // agent left its log behind and every finished squad left one per
+        // member, so the store grew with the number of sessions ever run
+        // rather than with the number alive. The retirement pass is what gives
+        // that memory back; it removes a log only when its session is gone from
+        // the registry and the log has not grown in a full pass, so a log
+        // anyone can still append to is never touched.
+        let _wal_retirement = Arc::clone(&wal_redis).spawn_retirement(wal_shutdown);
         let wal_backend: Arc<dyn cog_core::WalBackend> = wal_redis;
         ctx.publish_service(wal_backend);
         info!("StoragePlugin WAL backend published");

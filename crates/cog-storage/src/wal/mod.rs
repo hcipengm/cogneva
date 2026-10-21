@@ -347,6 +347,63 @@ pub struct TrimOutcome {
     pub cap: Option<usize>,
 }
 
+/// What one pass of the retirement sweep did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RetireOutcome {
+    /// Logs removed because no session was left to append to them.
+    pub retired: u64,
+    /// Records those logs held.
+    pub records: u64,
+}
+
+/// How many consecutive passes must agree that a log has been abandoned before
+/// it is removed.
+///
+/// One pass is not enough, and the reason is the boundary the cap sweep does
+/// not have: this pass *deletes*. A log whose session registers a moment after
+/// the log is opened looks identical, for that one instant, to a log whose
+/// session died — and the difference is the whole agent's history. Waiting for
+/// a second pass costs one sweep period and removes the race: a session that is
+/// really starting registers long before the second look, while an abandoned
+/// log has neither a registry record nor any growth in the meantime.
+pub const WAL_RETIRE_PASSES: usize = 2;
+
+/// Which of this pass's candidates may be removed, given the previous pass.
+///
+/// A candidate is confirmed only when the previous pass saw the same key at the
+/// same length. Two different facts are being checked together and neither is
+/// sufficient alone: the registry says nobody owns the name (a log opened a
+/// moment before its session registers would pass that test), and the length
+/// says nothing is being appended (a log on a session the registry never heard
+/// of, because that path does not register, would fail it). Together they
+/// describe a log with no owner and no writer.
+///
+/// Returns the keys to remove and the record this pass leaves for the next one.
+pub fn confirmed_for_retirement(
+    candidates: Vec<(String, i64)>,
+    last_seen: &std::collections::HashMap<String, i64>,
+) -> (Vec<String>, std::collections::HashMap<String, i64>) {
+    let mut current = std::collections::HashMap::with_capacity(candidates.len());
+    let mut confirmed = Vec::with_capacity(candidates.len());
+    for (key, len) in candidates {
+        // Asked of the *previous* pass, before this one overwrites it: the
+        // check is "same key, same length, twice", not "same key, twice".
+        if last_seen.get(&key) == Some(&len) {
+            confirmed.push(key.clone());
+        }
+        current.insert(key, len);
+    }
+    (confirmed, current)
+}
+
+/// The name this pass registers under in the process's loop readings.
+///
+/// A loop of its own rather than a second job inside the cap sweep: the two
+/// answer different questions (how big may a log be; does anyone still own it)
+/// and only this one removes keys, so a reader deciding whether retirement has
+/// run must be able to see it run.
+pub const WAL_RETIRE_SWEEP_LOOP: &str = "storage_wal_retire_sweep";
+
 /// Redis-based WAL backend.
 /// Uses Redis Lists for ordered storage of WAL records per session.
 /// Each session maps to a Redis List key: `wal:{session_id}`.
@@ -469,6 +526,144 @@ impl RedisWalBackend {
             released,
             cap: Some(cap),
         })
+    }
+
+    /// Logs whose session no longer holds a registration, with their length.
+    ///
+    /// A `wal:{session}` list has exactly one appender: the agent whose id is
+    /// the session. That agent's registration is renewed by its heartbeat, so a
+    /// missing registry record means the appender is gone — it retired and
+    /// deregistered, or it stopped beating and the registry retired it. No one
+    /// will append again, and no one can ask for the log back: the object that
+    /// would have replayed it no longer exists.
+    ///
+    /// The length comes back with the key so the caller can tell, without a
+    /// second round trip, whether the log grew since the last pass. Growth is
+    /// the check that does not rely on the registry: a log that is still being
+    /// written is not abandoned, whatever the registry says about its name.
+    pub async fn orphaned_logs(&self) -> Result<Vec<(String, i64)>, WalError> {
+        let mut conn = self.client.clone();
+        let keys: Vec<String> = redis::cmd("EVAL")
+            .arg(
+                // Same walk as the cap sweep, for the same reason: thousands of
+                // keys, and paying for them one round trip at a time costs more
+                // in latency than the walk costs in blocking.
+                r#"
+                local cur = "0"
+                local out = {}
+                repeat
+                  local r = redis.call("SCAN", cur, "MATCH", "wal:*", "COUNT", 1000)
+                  cur = r[1]
+                  for i = 1, #r[2] do
+                    local key = r[2][i]
+                    local session = string.sub(key, 5)
+                    if redis.call("EXISTS", "orchestrator:agents:" .. session) == 0 then
+                      out[#out + 1] = key
+                    end
+                  end
+                until cur == "0"
+                return out
+                "#,
+            )
+            .arg(0)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| WalError::Backend(format!("Redis WAL orphan scan failed: {}", e)))?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut pipe = redis::pipe();
+        for key in &keys {
+            pipe.cmd("LLEN").arg(key);
+        }
+        let lengths: Vec<i64> = pipe
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| WalError::Backend(format!("Redis WAL orphan lengths failed: {}", e)))?;
+        Ok(keys.into_iter().zip(lengths).collect())
+    }
+
+    /// Remove the given logs and report what they held.
+    pub async fn retire_logs(&self, keys: &[String]) -> Result<RetireOutcome, WalError> {
+        if keys.is_empty() {
+            return Ok(RetireOutcome::default());
+        }
+        let mut conn = self.client.clone();
+        let (retired, records): (u64, u64) = redis::cmd("EVAL")
+            .arg(
+                r#"
+                local records = 0
+                for i = 1, #KEYS do
+                  records = records + (redis.call("LLEN", KEYS[i]) or 0)
+                  redis.call("DEL", KEYS[i])
+                end
+                return {#KEYS, records}
+                "#,
+            )
+            .arg(keys.len())
+            .arg(keys)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| WalError::Backend(format!("Redis WAL retirement failed: {}", e)))?;
+        Ok(RetireOutcome { retired, records })
+    }
+
+    /// Run the retirement pass on its own period until shutdown.
+    ///
+    /// A log is removed only after [`WAL_RETIRE_PASSES`] consecutive passes
+    /// find it orphaned *at the same length*; the confirmation is held here
+    /// rather than in Redis because it describes passes of this loop, not a
+    /// property of the store, and a restarted process should re-earn it rather
+    /// than inherit a claim it cannot check.
+    pub fn spawn_retirement(
+        self: Arc<Self>,
+        shutdown: cog_core::ShutdownSignal,
+    ) -> tokio::task::JoinHandle<()> {
+        cog_core::loop_health::spawn(
+            WAL_RETIRE_SWEEP_LOOP,
+            cog_core::loop_health::Cadence::Periodic(WAL_CAP_SWEEP_PERIOD),
+            shutdown.clone(),
+            move |beat| {
+                let backend = Arc::clone(&self);
+                let shutdown = shutdown.clone();
+                async move {
+                    let mut last_seen: std::collections::HashMap<String, i64> =
+                        std::collections::HashMap::new();
+                    loop {
+                        beat.beat();
+                        match backend.orphaned_logs().await {
+                            Ok(candidates) => {
+                                let (confirmed, current) =
+                                    confirmed_for_retirement(candidates, &last_seen);
+                                if !confirmed.is_empty() {
+                                    match backend.retire_logs(&confirmed).await {
+                                        Ok(outcome) => tracing::info!(
+                                            logs = outcome.retired,
+                                            records = outcome.records,
+                                            "Removed agent logs whose session is no longer registered"
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            "Agent log retirement failed"
+                                        ),
+                                    }
+                                }
+                                last_seen = current;
+                            }
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "Agent log orphan scan failed"
+                            ),
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(WAL_CAP_SWEEP_PERIOD) => {}
+                            _ = shutdown.wait() => break,
+                        }
+                    }
+                }
+            },
+        )
     }
 
     /// Run the cap sweep on its own period until shutdown.
@@ -672,5 +867,47 @@ impl WalBackend for RedisWalBackend {
             Some(line) => Ok(WalRecord::decode_from_json_line(&line)?.seq + 1),
             None => Ok(0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn candidates(pairs: &[(&str, i64)]) -> Vec<(String, i64)> {
+        pairs.iter().map(|(k, l)| (k.to_string(), *l)).collect()
+    }
+
+    #[test]
+    fn a_log_the_registry_has_never_heard_of_is_not_enough_on_its_own() {
+        // First pass: nothing to compare against, so nothing goes. This is the
+        // pass that would otherwise delete a log opened a moment before its
+        // session registered.
+        let (confirmed, seen) =
+            confirmed_for_retirement(candidates(&[("wal:probe_a", 4)]), &HashMap::new());
+        assert!(confirmed.is_empty(), "one pass cannot confirm anything");
+        assert_eq!(seen.get("wal:probe_a"), Some(&4));
+    }
+
+    #[test]
+    fn a_log_at_the_same_length_in_two_passes_is_confirmed() {
+        let mut last = HashMap::new();
+        last.insert("wal:probe_b".to_string(), 7);
+        let (confirmed, _) = confirmed_for_retirement(candidates(&[("wal:probe_b", 7)]), &last);
+        assert_eq!(confirmed, vec!["wal:probe_b".to_string()]);
+    }
+
+    #[test]
+    fn a_log_that_grew_between_passes_is_left_alone() {
+        // The registry said the name is unowned, but the log moved. Something
+        // is appending to it, so the name it is filed under is wrong -- not the
+        // log dead. Growth is the check that does not depend on the registry
+        // telling the truth about which ids write logs.
+        let mut last = HashMap::new();
+        last.insert("wal:probe_c".to_string(), 7);
+        let (confirmed, seen) = confirmed_for_retirement(candidates(&[("wal:probe_c", 9)]), &last);
+        assert!(confirmed.is_empty(), "a growing log is not abandoned");
+        assert_eq!(seen.get("wal:probe_c"), Some(&9));
     }
 }
