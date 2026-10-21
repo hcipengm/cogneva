@@ -72,6 +72,27 @@ pub const STATE_DECLARED: &str = "declared";
 /// The highest footprint measured across the peak window.
 pub const STATE_PEAK: &str = "peak";
 
+/// What the claim's status says it was actually given.
+///
+/// Distinct from `declared` on purpose: the request is what this loop or the
+/// chart asked for, and this is what the storage side handed back. On a class
+/// that cannot carry an expansion the two never converge, and a volume whose
+/// granted size is below what it already holds has no bound at all -- the pair
+/// is what makes that readable without going to the claim object.
+pub const STATE_GRANTED: &str = "granted";
+
+/// The bound a claim was clamped by, and its size.
+pub const CEILING_METRIC: &str = "cogneva_volume_capacity_ceiling_bytes";
+
+/// Which admission object set the bound.
+pub const BOUND_LABEL: &str = "bound";
+
+/// The per-claim maximum a LimitRange declares.
+pub const BOUND_LIMIT_RANGE: &str = "limit_range";
+
+/// The room left under the namespace ResourceQuota.
+pub const BOUND_QUOTA: &str = "quota";
+
 /// The label naming what became of a claim this round.
 pub const OUTCOME_LABEL: &str = "outcome";
 
@@ -239,19 +260,63 @@ pub fn parse_claim(json: &str) -> Result<LiveClaim, String> {
     })
 }
 
+/// Which of the two admission objects set the bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    LimitRange,
+    Quota,
+}
+
+impl Bound {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Bound::LimitRange => BOUND_LIMIT_RANGE,
+            Bound::Quota => BOUND_QUOTA,
+        }
+    }
+}
+
+/// The largest request admission would accept for one claim, and which object
+/// set that number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ceiling {
+    pub bytes: u64,
+    pub bound: Bound,
+}
+
 /// The largest request admission would accept for one claim, or `None` when the
 /// cluster states no bound.
 ///
 /// Two objects bound it and both are read here: the LimitRange's per-claim
 /// maximum, and what the namespace quota has left once this claim's own current
 /// request is taken back out of the total it is already counted in.
-pub fn admission_ceiling(limit_range_max: Option<u64>, quota_free: Option<u64>) -> Option<u64> {
-    match (limit_range_max, quota_free) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
+///
+/// The tighter one is reported together with its name rather than as a bare
+/// number: "above what admission accepts" does not say which of the two objects
+/// has to move, and the operator reading a clamp had to compare the peak with
+/// the declaration to guess. The choice is already made here -- it is this
+/// function's whole job -- so it travels rather than being recomputed.
+pub fn admission_ceiling(limit_range_max: Option<u64>, quota_free: Option<u64>) -> Option<Ceiling> {
+    let out = match (limit_range_max, quota_free) {
+        (Some(a), Some(b)) if a <= b => Ceiling {
+            bytes: a,
+            bound: Bound::LimitRange,
+        },
+        (Some(_), Some(b)) => Ceiling {
+            bytes: b,
+            bound: Bound::Quota,
+        },
+        (Some(a), None) => Ceiling {
+            bytes: a,
+            bound: Bound::LimitRange,
+        },
+        (None, Some(b)) => Ceiling {
+            bytes: b,
+            bound: Bound::Quota,
+        },
+        (None, None) => return None,
+    };
+    Some(out)
 }
 
 /// The per-claim storage maximum a LimitRange declares, if it declares one.
@@ -326,6 +391,11 @@ pub fn quota_free_storage(json: &str, own_request: u64) -> Result<Option<u64>, S
 struct ClaimState {
     peak: Vec<u64>,
     declared: Option<u64>,
+    /// What the storage side has given back, as the claim's status reports it.
+    granted: Option<u64>,
+    /// The bound that stopped the last round, kept only while it is the current
+    /// conclusion: a claim that grew or reached its target has no bound to name.
+    ceiling: Option<Ceiling>,
     refused_until: Option<std::time::Instant>,
     /// What the last round concluded, so the account gets one row per change of
     /// state rather than one per tick. A claim that has been above the ceiling
@@ -339,6 +409,8 @@ impl ClaimState {
         Self {
             peak: Vec::new(),
             declared: None,
+            granted: None,
+            ceiling: None,
             refused_until: None,
             last_outcome: None,
         }
@@ -382,6 +454,8 @@ pub struct VolumeCapacityReadings {
     claims: Mutex<HashMap<String, Vec<AtomicU64>>>,
     declared: Mutex<HashMap<String, AtomicU64>>,
     peak: Mutex<HashMap<String, AtomicU64>>,
+    granted: Mutex<HashMap<String, AtomicU64>>,
+    ceiling: Mutex<HashMap<String, Ceiling>>,
 }
 
 impl VolumeCapacityReadings {
@@ -405,15 +479,34 @@ impl VolumeCapacityReadings {
 
     /// Publish the sizes the decision was read from. Zero bytes is a measured
     /// volume that is empty, so it is published as such rather than withheld.
-    pub fn observe_sizes(&self, claim: &str, declared: u64, peak: u64) {
-        self.declared
-            .lock()
-            .unwrap()
-            .insert(claim.to_string(), AtomicU64::new(declared));
-        self.peak
-            .lock()
-            .unwrap()
-            .insert(claim.to_string(), AtomicU64::new(peak));
+    pub fn observe_sizes(&self, claim: &str, declared: u64, peak: u64, granted: u64) {
+        for (table, value) in [
+            (&self.declared, declared),
+            (&self.peak, peak),
+            (&self.granted, granted),
+        ] {
+            table
+                .lock()
+                .unwrap()
+                .insert(claim.to_string(), AtomicU64::new(value));
+        }
+    }
+
+    /// Publish the bound that stopped this claim, or take it back down.
+    ///
+    /// Withheld rather than published as a zero when the claim is no longer
+    /// clamped: a zero bound is "admission allows nothing at all", which is a
+    /// different and much louder statement than "nothing is in the way".
+    pub fn observe_ceiling(&self, claim: &str, ceiling: Option<Ceiling>) {
+        let mut table = self.ceiling.lock().unwrap();
+        match ceiling {
+            Some(ceiling) => {
+                table.insert(claim.to_string(), ceiling);
+            }
+            None => {
+                table.remove(claim);
+            }
+        }
     }
 
     pub fn outcome_count(&self, claim: &str, outcome: CapacityOutcome) -> u64 {
@@ -450,7 +543,11 @@ impl Observable for VolumeCapacityReadings {
                 );
             }
             drop(counters);
-            for (state, table) in [(STATE_DECLARED, &self.declared), (STATE_PEAK, &self.peak)] {
+            for (state, table) in [
+                (STATE_DECLARED, &self.declared),
+                (STATE_PEAK, &self.peak),
+                (STATE_GRANTED, &self.granted),
+            ] {
                 let value = table
                     .lock()
                     .unwrap()
@@ -463,6 +560,13 @@ impl Observable for VolumeCapacityReadings {
                             .with_label(STATE_LABEL, state),
                     );
                 }
+            }
+            if let Some(ceiling) = self.ceiling.lock().unwrap().get(&claim).copied() {
+                out.push(
+                    RawMetric::new(CEILING_METRIC, ceiling.bytes as f64)
+                        .with_label(CLAIM_LABEL, claim.clone())
+                        .with_label(BOUND_LABEL, ceiling.bound.as_str()),
+                );
             }
         }
         Ok(out)
@@ -715,6 +819,11 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
         }
     };
     state.declared = Some(live.declared);
+    state.granted = Some(live.capacity);
+    // The bound is a conclusion about the round that just ended, so it is taken
+    // back down here and set again only if this round is clamped. A claim that
+    // stopped being clamped must not keep naming a wall it no longer stands at.
+    state.ceiling = None;
 
     // An expansion that has been asked for and not yet carried out: the request
     // is already ahead of the capacity, and a second patch while the class is
@@ -743,20 +852,22 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
 
     let ceiling = read_ceiling(&ns, live.declared).await;
     if let Some(ceiling) = ceiling {
-        if wanted > ceiling {
+        if wanted > ceiling.bytes {
             warn!(
                 claim = %target.claim,
                 wanted,
-                ceiling,
+                ceiling = ceiling.bytes,
+                bound = ceiling.bound.as_str(),
                 "volume capacity: the size this volume needs is above what admission allows"
             );
+            state.ceiling = Some(ceiling);
             return settle(
                 state,
                 target,
                 peak,
                 live.declared,
                 Some(wanted),
-                Some(ceiling),
+                Some(ceiling.bytes),
                 CapacityOutcome::Clamped,
             );
         }
@@ -795,7 +906,7 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
                 peak,
                 live.declared,
                 Some(wanted),
-                ceiling,
+                ceiling.map(|c| c.bytes),
                 CapacityOutcome::Grew,
             )
         }
@@ -809,7 +920,7 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
                 peak,
                 live.declared,
                 Some(wanted),
-                ceiling,
+                ceiling.map(|c| c.bytes),
                 CapacityOutcome::Refused,
             )
         }
@@ -819,7 +930,7 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
 /// The bound admission would enforce, read fresh each time it is needed: the
 /// quota moves as other claims are created, and a cached ceiling would let this
 /// loop write a request the namespace can no longer accept.
-async fn read_ceiling(ns: &str, own_request: u64) -> Option<u64> {
+async fn read_ceiling(ns: &str, own_request: u64) -> Option<Ceiling> {
     let limit = kubectl(&["get", "limitrange", "-n", ns, "-o", "json"], 60)
         .await
         .ok()
@@ -895,8 +1006,14 @@ pub fn spawn_volume_capacity_loop(
                         let outcome = reconcile(target, state).await;
                         if let Some(declared) = state.declared {
                             let peak = state.peak.iter().copied().max().unwrap_or(0);
-                            readings.observe_sizes(&target.claim, declared, peak);
+                            readings.observe_sizes(
+                                &target.claim,
+                                declared,
+                                peak,
+                                state.granted.unwrap_or(declared),
+                            );
                         }
+                        readings.observe_ceiling(&target.claim, state.ceiling);
                         readings.record(&target.claim, outcome);
                     }
                 }
@@ -963,10 +1080,73 @@ mod tests {
 
     #[test]
     fn the_ceiling_is_the_tighter_of_the_two_admission_bounds() {
-        assert_eq!(admission_ceiling(Some(200), Some(480)), Some(200));
-        assert_eq!(admission_ceiling(Some(200), None), Some(200));
-        assert_eq!(admission_ceiling(None, Some(480)), Some(480));
+        let tighter = |bytes, bound| Some(Ceiling { bytes, bound });
+        assert_eq!(
+            admission_ceiling(Some(200), Some(480)),
+            tighter(200, Bound::LimitRange)
+        );
+        assert_eq!(
+            admission_ceiling(Some(480), Some(200)),
+            tighter(200, Bound::Quota)
+        );
+        assert_eq!(
+            admission_ceiling(Some(200), None),
+            tighter(200, Bound::LimitRange)
+        );
+        assert_eq!(
+            admission_ceiling(None, Some(480)),
+            tighter(480, Bound::Quota)
+        );
         assert_eq!(admission_ceiling(None, None), None);
+    }
+
+    #[test]
+    fn a_bound_named_apart_from_its_size_reaches_the_reading() {
+        // The reading carries the name of the object that has to move, because
+        // "above what admission accepts" does not say which one it is. The
+        // series is withheld once the claim stops being clamped: a zero here
+        // would mean admission allows nothing, not that nothing is in the way.
+        let readings = VolumeCapacityReadings::new();
+        readings.record("cogneva-evolution-source-pvc", CapacityOutcome::Clamped);
+        readings.observe_sizes(
+            "cogneva-evolution-source-pvc",
+            192 * GIB,
+            149 * GIB,
+            72 * GIB,
+        );
+        readings.observe_ceiling(
+            "cogneva-evolution-source-pvc",
+            admission_ceiling(Some(200 * GIB), Some(90 * GIB)),
+        );
+        let metrics = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(readings.collect_metrics(""));
+        let metrics = metrics.unwrap();
+        let ceiling = metrics
+            .iter()
+            .find(|m| m.name == CEILING_METRIC)
+            .expect("a clamped claim names its bound");
+        assert_eq!(
+            ceiling.labels.get(BOUND_LABEL).map(String::as_str),
+            Some(BOUND_QUOTA)
+        );
+        assert_eq!(ceiling.value, (90 * GIB) as f64);
+
+        let granted = metrics
+            .iter()
+            .find(|m| {
+                m.name == BYTES_METRIC
+                    && m.labels.get(STATE_LABEL).map(String::as_str) == Some(STATE_GRANTED)
+            })
+            .expect("the size the storage side gave back is published");
+        assert_eq!(granted.value, (72 * GIB) as f64);
+
+        readings.observe_ceiling("cogneva-evolution-source-pvc", None);
+        let metrics = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(readings.collect_metrics(""))
+            .unwrap();
+        assert!(metrics.iter().all(|m| m.name != CEILING_METRIC));
     }
 
     #[test]

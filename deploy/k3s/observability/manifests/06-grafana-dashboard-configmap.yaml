@@ -2428,8 +2428,9 @@ data:
         },
         {
           "id": 58,
-          "title": "Volume Capacity: Declaration Against Measured Peak",
-          "description": "The two numbers the growth loop decides from, per claim, drawn side by side: the declaration in force and the highest usage ever measured against it. The loop raises a declaration once the peak no longer fits, so on a healthy volume the peak line stays below the declared one and the gap is the headroom the loop is working with. A peak that crosses its declaration is the one reading this pair exists for: either the raise was clamped by admission or refused, and the volume_capacity_* rules say which, or the volume is growing faster than the policy assumed. Neither number is derivable from the other side of the account -- the declaration is a request and the peak is a measurement -- which is why the pair is drawn rather than one ratio.",
+          "title": "Volume Capacity: Declaration, Granted and Measured Peak",
+          "description": "The three numbers the growth loop decides from, per claim, drawn side by side: the declaration in force, what the storage side gave back (`granted`, the claim status capacity), and the highest usage ever measured against them. The `ceiling` line appears only while a claim is actually clamped, and its legend names the object that set it -- `limit_range` or `quota` -- so the wall and its owner arrive together rather than being inferred. The loop raises a declaration once the peak no longer fits, so on a healthy volume the peak line stays below the declared one and the gap is the headroom the loop is working with. A granted line below the declared one is an expansion that was asked for and never handed back -- on a class that cannot carry one it stays below forever, and the volume has no real bound at all. A peak above the granted line is data already on disk past what the volume was given. Neither number is derivable from the other side of the account -- the declaration is a request, the granted size is an answer, and the peak is a measurement -- which is why they are drawn rather than reduced to one ratio.",
+
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -2441,6 +2442,22 @@ data:
             {
               "expr": "max by (namespace, persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"})",
               "legendFormat": "{{namespace}}/{{persistentvolumeclaim}} declared",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (namespace, persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"})",
+              "legendFormat": "{{namespace}}/{{persistentvolumeclaim}} granted",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (namespace, persistentvolumeclaim) (cogneva_volume_capacity_ceiling_bytes)",
+              "legendFormat": "{{namespace}}/{{persistentvolumeclaim}} ceiling ({{bound}})",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"

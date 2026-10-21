@@ -232,6 +232,15 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["namespace", "persistentvolumeclaim", "state"],
         "crates/cog-reflection/src/volume_capacity.rs",
     ),
+    // The other half of a clamped claim: which admission object set the bound
+    // and how large it is. Drawn on the same panel as the sizes above, because
+    // a peak above the declaration says a raise was refused and only this says
+    // which of the two objects has to move.
+    (
+        "cogneva_volume_capacity_ceiling_bytes",
+        &["namespace", "persistentvolumeclaim", "bound"],
+        "crates/cog-reflection/src/volume_capacity.rs",
+    ),
     // The node's layer stores, which are not volumes and so have no kubelet
     // size: one series per top-level part of each store, and the `store` label
     // because a node holds several (the kubelet's containerd and the rootful
