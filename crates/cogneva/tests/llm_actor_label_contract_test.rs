@@ -64,7 +64,6 @@ const PRODUCERS: &[(&str, &[&str])] = &[
         "crates/cog-gateway/src/chat.rs",
         &["intent_gateway", "web_chat"],
     ),
-    ("crates/cog-llm/src/origin.rs", &["agent:generator"]),
     ("crates/cog-memory/src/extractor.rs", &["memory"]),
     ("crates/cog-reflection/src/evolution.rs", &["evolution"]),
     (
@@ -120,6 +119,21 @@ enum Site {
     /// An expression the census cannot evaluate; its file has to be in
     /// `THREADED`.
     Unresolved(String),
+}
+
+/// The file's text up to its first `#[cfg(test)]` item.
+///
+/// A unit-test fixture builds a request with the actor header to exercise the
+/// reader, and it names the actor it is testing with. Counting that as a writer
+/// would put the production file into the inventory of writers on the strength
+/// of its own tests, and the inventory's question -- who stamps an actor onto a
+/// real call -- would be answered with a file that only reads the header.
+/// Integration tests under `tests/` carry no such attribute and are read whole.
+fn without_test_items(text: &str) -> &str {
+    match text.find("#[cfg(test)]") {
+        Some(at) => &text[..at],
+        None => text,
+    }
 }
 
 /// Every site in one file's text that writes an actor value.
@@ -257,7 +271,7 @@ fn census(root: &Path) -> BTreeMap<String, Vec<Site>> {
         let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
         };
-        let sites = sites_in(&text);
+        let sites = sites_in(without_test_items(&text));
         if !sites.is_empty() {
             found.insert(rel, sites);
         }
