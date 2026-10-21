@@ -807,10 +807,17 @@ claimStore:
     #
     # 代价落在读数面：这个进程一走，20 条 cogneva_data_volume_used_bytes 一起消失，
     # 直到新 Pod 走完首拍才回来（实测断了 10~45 分钟），于是 claim_usage_unmeasured
-    # 与 claim_store_node_unreported 在一天里亮着六成时间。512Mi 是实测平台期
-    # （约 190Mi）再加两倍多余量，给首拍的短暂 slab 冲高留位置。判据：usage 不再
-    # 贴顶、OOMKilled 不再出现；若它涨到贴着 512Mi，说明占用是被上限压出来的而不是
-    # 树的规模，那时要换的是走查本身而不是这个数。
+    # 与 claim_store_node_unreported 在一天里亮着六成时间。
+    #
+    # 上限要给到**走查自己那棵树装得下**，不是给进程的 rss 留余量。实测两次：
+    # 192Mi 时缓存 112~137Mi、usage 贴着顶；抬到 512Mi 后新 Pod 五分钟内缓存涨到
+    # 449Mi、usage 511Mi，**又贴着新顶**——占用不是树的规模决定的，是上限决定的，
+    # 于是 cgroup 永远接近满、任何一次 GFP_NOFS 分配都可能撞上回收不动的那一刻。
+    # 1Gi 是把「装得下」和「顶」分开的那一档：装得下时这棵树的元数据大约在 460Mi
+    # 一带停住，cgroup 留出余量就根本不需要回收，NOFS 那条路也就无从触发。
+    # 判据：usage 稳定在 60% 以下且 OOMKilled 不再出现；若缓存仍一路涨到贴着 1Gi，
+    # 说明这棵树没有固定足迹，要动的是走查本身（每次走完把自己带出来的缓存还回去），
+    # 不是这个数。
     #
     # CPU 上限按突发定，不按均值定。实测 200m 下这个容器平均只用 0.077 核，却有
     # 0.83 的 cfs 周期被限流：走查是 readdir+stat 的突发，一个 100ms 周期里的突发
@@ -823,7 +830,7 @@ claimStore:
       memory: 32Mi
     limits:
       cpu: "1"
-      memory: 512Mi
+      memory: 1Gi
 
 # 集群内镜像仓库：GitOps L1 金丝雀镜像秒级分发通道。
 # publisher（进化 Pod）把 overlay 镜像（cogneva 基镜像 + 新二进制）push 到

@@ -123,11 +123,12 @@ spec:
           # 191.2Mi 贴着顶（rss 只有 41~63Mi，另外 112~137Mi 是走查那 134 万文件
           # 带出来的页缓存），随后在 GFP_NOFS 分配上被内核 OOM 杀掉三次；它一走
           # 20 条卷用量序列一起消失，claim_usage_unmeasured 因此亮了半天的灯。
-          # 512Mi 是实测平台期加两倍多余量。
+          # 抬到 512Mi 实测缓存又涨到 449Mi、usage 511Mi 继续贴顶——占用是上限决定的，
+          # 不是树的规模决定的，所以上限要高于这棵树，让 cgroup 不必常满。
           resources:
             limits:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
             requests:
               cpu: 10m
               memory: 32Mi
