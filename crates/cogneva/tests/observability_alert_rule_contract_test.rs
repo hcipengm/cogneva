@@ -756,6 +756,14 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_volume_capacity_outcome_total",
         "crates/cog-reflection/src/volume_capacity.rs",
     ),
+    // What was asked for, what the storage granted, and the peak measured off
+    // the disk. Published as three `state` label values from the same loop, so
+    // a rule can compare the request against the answer instead of trusting
+    // that an accepted patch means the volume grew.
+    (
+        "cogneva_volume_capacity_bytes",
+        "crates/cog-reflection/src/volume_capacity.rs",
+    ),
     // The notification outlets. A delivery that fails is invisible from
     // outside this process -- the caller cannot tell "a human was paged" from
     // "the message was dropped" -- so the per-outlet outcome counters are the
