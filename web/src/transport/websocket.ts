@@ -1,4 +1,5 @@
 import type { AgentEvent, EventType } from '@/types/events';
+import type { NotificationItem } from '@/api/client';
 
 export type ConnectionStatus = 'connecting' | 'open' | 'closed' | 'error';
 
@@ -8,6 +9,12 @@ export interface WebSocketOptions {
   reconnectIntervalMs?: number;
   maxReconnectAttempts?: number;
   onEvent: (event: AgentEvent) => void;
+  /**
+   * 服务端推来的通知。它不走 `onEvent`：通知没有 `type` 字段，是另一种
+   * 信封——塞进 `normalizeAgentEvent` 会被当成不认识的事件静默丢掉，
+   * 而它恰恰是站内通信唯一的实时到达路径。
+   */
+  onNotification?: (notification: NotificationItem) => void;
   onStatusChange?: (status: ConnectionStatus) => void;
   onError?: (error: Error) => void;
 }
@@ -153,9 +160,12 @@ export class EventStreamClient {
         this.options.onEvent(event);
       }
     } else if (message.type === 'notification' && message.payload) {
-      const event = normalizeAgentEvent(message.payload, message.event_id ?? message.payload.id as string);
-      if (event) {
-        this.options.onEvent(event);
+      const notification = normalizeNotification(
+        message.payload,
+        message.event_id ?? (message.payload.id as string | undefined)
+      );
+      if (notification) {
+        this.options.onNotification?.(notification);
       }
     }
   }
@@ -203,6 +213,31 @@ export class EventStreamClient {
       this.pingTimer = null;
     }
   }
+}
+
+/**
+ * 服务端的通知信封 → 列表端点的行形状。
+ *
+ * 两种入口（列表端点、WebSocket 推送）必须拼成同一个 `NotificationItem`，
+ * 否则同一条通知在面板里会显示两遍、或者刷新一下换了样子。服务端推的是
+ * 完整的 `Notification`（多一个 `user_id`、少一层 `data`），这里把差异收在
+ * 这一个函数里。
+ */
+function normalizeNotification(
+  payload: Record<string, unknown>,
+  fallbackId: string | undefined
+): NotificationItem | null {
+  const id = (payload.id as string | undefined) ?? fallbackId;
+  if (!id) return null;
+  return {
+    id,
+    title: (payload.title as string | undefined) ?? '',
+    body: (payload.body as string | undefined) ?? '',
+    is_read: (payload.is_read as boolean | undefined) ?? false,
+    created_at:
+      (payload.created_at as string | undefined) ?? new Date().toISOString(),
+    read_at: (payload.read_at as string | undefined) ?? null,
+  };
 }
 
 function normalizeAgentEvent(

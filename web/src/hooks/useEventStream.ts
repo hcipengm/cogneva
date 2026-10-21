@@ -3,6 +3,7 @@ import { EventStreamClient } from '@/transport/websocket';
 import { MockEventStreamClient } from '@/transport/mockStream';
 import { useStreamStore } from '@/store/streamStore';
 import type { AgentEvent } from '@/types/events';
+import type { NotificationItem } from '@/api/client';
 
 export type StreamClient = EventStreamClient | MockEventStreamClient;
 
@@ -10,12 +11,16 @@ export interface UseEventStreamOptions {
   url?: string;
   channels?: string[];
   mock?: boolean;
+  /** 服务端推来的通知；调用方每次渲染换一个新函数也不会重连（走 ref） */
+  onNotification?: (notification: NotificationItem) => void;
 }
 
 export function useEventStream(options: UseEventStreamOptions = {}): {
   clientRef: React.RefObject<StreamClient | null>;
 } {
   const clientRef = useRef<StreamClient | null>(null);
+  const notificationHandler = useRef(options.onNotification);
+  notificationHandler.current = options.onNotification;
   const startMessage = useStreamStore((state) => state.startMessage);
   const appendDelta = useStreamStore((state) => state.appendDelta);
   const endMessage = useStreamStore((state) => state.endMessage);
@@ -77,6 +82,8 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
           url: options.url ?? '',
           channels: options.channels,
           onEvent: handleEvent,
+          onNotification: (notification) =>
+            notificationHandler.current?.(notification),
           onStatusChange: (status) => setConnectionStatus(status),
           onError: (error) => {
             console.error('WebSocket error:', error);

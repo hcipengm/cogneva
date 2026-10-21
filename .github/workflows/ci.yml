@@ -476,6 +476,11 @@ jobs:
       # 并要求那一屏读覆盖端点（不读就会把「这段没折叠」显示成「这期间没花销」）。
       - name: Check the token spend route has a rendered consumer
         run: bash deploy/scripts/check-web-token-panel.sh
+      # 站内通知是通信面在生产上的成品：三条路由 ＋ 一条 WebSocket 推送，缺任何一半
+      # 都不会有东西失败。这条门查的是「从入口可达、被渲染、且列表与未读数递进了
+      # 一格组件」，外加传输层不许把通知塞进 agent 事件归一化（那会静默丢每一条）。
+      - name: Check the notification routes have a rendered consumer
+        run: bash deploy/scripts/check-web-notification-panel.sh
 
   # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读
   # 覆盖端点），它结构上证明不了 `web/` 编得过：类型错、装不上的依赖、打包不进

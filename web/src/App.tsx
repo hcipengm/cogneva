@@ -5,8 +5,10 @@ import { AuthOverlay } from './overlay/AuthOverlay';
 import { LlmSetupOverlay } from './overlay/LlmSetupOverlay';
 import { TokenUsageOverlay } from './overlay/TokenUsageOverlay';
 import { ActiveAlertsOverlay } from './overlay/ActiveAlertsOverlay';
+import { NotificationsOverlay } from './overlay/NotificationsOverlay';
 import { useActiveAlerts } from './hooks/useActiveAlerts';
 import { useEventStream } from './hooks/useEventStream';
+import { useNotifications } from './hooks/useNotifications';
 import { useAuth } from './hooks/useAuth';
 import { useLlmStatus } from './hooks/useLlmStatus';
 
@@ -23,10 +25,15 @@ export default function App() {
       }/ws?token=${token}`
     : '';
 
+  // 通知中心先于事件流建：事件流的推送回调要直接落进它的列表，
+  // 顺序反过来只能缓存或轮询，两种都是「看得见但要晚一拍」。
+  const notifications = useNotifications(!USE_MOCK && isAuthenticated);
+
   const { clientRef } = useEventStream({
     mock: USE_MOCK,
     url: wsUrl,
     channels: ['agent:*', 'hooks'],
+    onNotification: notifications.receive,
   });
 
   const {
@@ -37,6 +44,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [usageOpen, setUsageOpen] = useState(false);
   const [alertsOpen, setAlertsOpen] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   // 轮询放在 App 层：面板关着的时候它的计数也在更新，否则「有人看才亮」
   // 就还是面板里的一个数。
   const {
@@ -81,6 +89,19 @@ export default function App() {
         <TokenUsageOverlay onClose={() => setUsageOpen(false)} />
       )}
 
+      {!USE_MOCK && isAuthenticated && notificationsOpen && (
+        <NotificationsOverlay
+          items={notifications.items}
+          unreadCount={notifications.unreadCount}
+          loading={notifications.loading}
+          error={notifications.error}
+          refresh={notifications.refresh}
+          markRead={notifications.markRead}
+          markAllRead={notifications.markAllRead}
+          onClose={() => setNotificationsOpen(false)}
+        />
+      )}
+
       {!USE_MOCK && isAuthenticated && alertsOpen && (
         <ActiveAlertsOverlay
           alerts={activeAlerts}
@@ -93,6 +114,25 @@ export default function App() {
 
       {!USE_MOCK && isAuthenticated && (
         <div className="absolute right-4 top-12 z-10 flex gap-2">
+          <button
+            onClick={() => setNotificationsOpen(true)}
+            className={`rounded-lg border px-3 py-1.5 text-xs backdrop-blur-sm transition ${
+              notifications.error
+                ? 'border-amber-500/60 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
+                : notifications.unreadCount > 0
+                  ? 'border-sky-500/60 bg-sky-500/10 text-sky-300 hover:bg-sky-500/20'
+                  : 'border-slate-700/60 bg-slate-900/80 text-slate-300 hover:bg-slate-800'
+            }`}
+            title={
+              notifications.error
+                ? '通知读数没读到——不是没有通知'
+                : '发给你的通知'
+            }
+          >
+            {notifications.error
+              ? '通知 ?'
+              : `通知 ${notifications.unreadCount}`}
+          </button>
           <button
             onClick={() => setUsageOpen(true)}
             className="rounded-lg border border-slate-700/60 bg-slate-900/80 px-3 py-1.5 text-xs text-slate-300 backdrop-blur-sm transition hover:bg-slate-800"

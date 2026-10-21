@@ -344,3 +344,50 @@ export interface ActiveAlerts {
 export async function getActiveAlerts(): Promise<ActiveAlerts> {
   return api.get<ActiveAlerts>('/api/v1/alerts/active');
 }
+
+// ── 通知中心（站内通信的收端） ──
+
+/** 一条通知。字段名与网关的列表端点一致，`ntype` 的值是 snake_case 字符串。 */
+export interface NotificationItem {
+  id: string;
+  title: string;
+  body: string;
+  is_read: boolean;
+  created_at: string;
+  read_at: string | null;
+}
+
+export interface NotificationPage {
+  items: NotificationItem[];
+  unread_count: number;
+  next_cursor: string | null;
+  has_more: boolean;
+}
+
+/**
+ * 当前用户的通知。
+ *
+ * 列表端点在未配置通知存储时也回 200（空列表），所以「空」在这里分不出
+ * 「没人发过」与「这个部署没接存储」——要分就看得失配的 `unread_count` 与
+ * WebSocket 推送，而不是靠列表长度猜。
+ */
+export async function listNotifications(
+  unreadOnly = false
+): Promise<NotificationPage> {
+  const query = unreadOnly ? '?unread_only=true' : '';
+  const res = await api.get<{ code: string; data: NotificationPage }>(
+    `/api/v1/notifications${query}`
+  );
+  return res.data;
+}
+
+export async function markNotificationRead(id: string): Promise<void> {
+  await api.post(
+    `/api/v1/notifications/${encodeURIComponent(id)}/read`,
+    {}
+  );
+}
+
+export async function markAllNotificationsRead(): Promise<void> {
+  await api.post('/api/v1/notifications/read-all', {});
+}
