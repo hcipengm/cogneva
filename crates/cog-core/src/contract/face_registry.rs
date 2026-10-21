@@ -671,15 +671,42 @@ pub enum FaceImportOutcome {
     },
 }
 
-/// Import one face node.
+/// Whether an import is allowed to move a face's ownership.
 ///
-/// Idempotent: the same file imported twice leaves the graph exactly as one
-/// import did. Ownership moves only while the row is at its first revision;
-/// past that the import refreshes the description and reports which revision
-/// kept its ownership.
+/// A roster is an input: it says what ownership is proposed. A handover is the
+/// only act that carries the work bound to a face with it. When the roster is
+/// imported continuously by a host clock, "the file changed" is not a decision
+/// anyone made, so that path asks for [`ImportOwnership::HandoverOnly`] and the
+/// file can refresh a description without quietly transferring a face.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportOwnership {
+    /// Move ownership while the face is still at its first revision, which is
+    /// the manual import's contract: no handover has ever touched the row.
+    FromFile,
+    /// Never move an existing face's ownership; only a handover may.
+    HandoverOnly,
+}
+
+/// Import one face node under the manual contract: the file owns the row until
+/// a handover moves it.
 pub async fn import_face(
     store: &dyn GovernanceStore,
     incoming: &Face,
+) -> SFResult<FaceImportOutcome> {
+    import_face_with(store, incoming, ImportOwnership::FromFile).await
+}
+
+/// Import one face node.
+///
+/// Idempotent: the same file imported twice leaves the graph exactly as one
+/// import did. Under [`ImportOwnership::FromFile`] ownership moves only while
+/// the row is at its first revision; past that, and always under
+/// [`ImportOwnership::HandoverOnly`], the import refreshes the description and
+/// reports which revision kept its ownership.
+pub async fn import_face_with(
+    store: &dyn GovernanceStore,
+    incoming: &Face,
+    ownership: ImportOwnership,
 ) -> SFResult<FaceImportOutcome> {
     let nodes = store.face_nodes().await?;
     let existing = nodes
@@ -701,7 +728,9 @@ pub async fn import_face(
         && current.spec.vacancy_assigner == incoming.spec.vacancy_assigner
         && current.spec.gap_task_id == incoming.spec.gap_task_id;
 
-    let mut merged = if current.revision() > 1 && !ownership_same {
+    let ownership_kept =
+        !ownership_same && (current.revision() > 1 || ownership == ImportOwnership::HandoverOnly);
+    let mut merged = if ownership_kept {
         let mut kept = current.clone();
         kept.spec.display_name = incoming.spec.display_name.clone();
         kept.spec.kind = incoming.spec.kind;
@@ -735,7 +764,7 @@ pub async fn import_face(
         )));
     }
 
-    if current.revision() > 1 && !ownership_same {
+    if ownership_kept {
         return Ok(FaceImportOutcome::OwnershipKept {
             revision: current.revision(),
         });
@@ -1132,6 +1161,7 @@ mod tests {
             spec: crate::HandoverSpec {
                 face_id: face_id.into(),
                 from_unit: Some("unit-a".into()),
+                from_absent: None,
                 to_unit: "unit-b".into(),
                 witness_unit: "unit-c".into(),
                 source: None,

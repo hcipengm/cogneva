@@ -68,6 +68,24 @@ pub struct HandoverSpec {
     pub face_id: String,
     /// Who held the face before. `None` when the face was vacant.
     pub from_unit: Option<String>,
+    /// When the outgoing owner was observed absent, for a handover that moves a
+    /// face whose owner has already left.
+    ///
+    /// A signature says the signer agreed; an owner that no longer exists can
+    /// never say that, and asking another unit to sign on its behalf would put
+    /// a name on an attestation it did not make. What replaces that signature
+    /// is not a person but a reproducible fact: the heartbeat key for
+    /// `from_unit` was gone at this time. The fact is part of the signed
+    /// payload, so every other signer attests to the same observation, and
+    /// applying it re-reads the key -- an owner that came back before the move
+    /// was applied still holds the face, and the absence the others signed no
+    /// longer holds.
+    ///
+    /// Serialised only when present: a handover that does not use this path
+    /// must keep the digest it had before the field existed, or every signature
+    /// taken under the old shape would stop verifying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_absent: Option<DateTime<Utc>>,
     pub to_unit: String,
     pub witness_unit: String,
     /// Where the reading behind this move came from: a unit's report, the
@@ -110,11 +128,21 @@ pub struct HandoverSpec {
 }
 
 impl HandoverSpec {
-    /// The three units whose signatures make a handover valid.
+    /// The three units whose signatures make a handover valid, or two when the
+    /// outgoing owner was recorded absent.
+    ///
+    /// The outgoing owner's signature is the attestation that it agreed to
+    /// leave. A unit that is gone cannot give it, and waiting for it left every
+    /// face whose owner had exited unsignable -- the one state from which no
+    /// tool in the tree could move the face. `from_absent` is what stands in
+    /// for that signature: a timestamp of an observation every other signer
+    /// covers, re-checked when the move is applied.
     pub fn required_signers(&self) -> Vec<&str> {
         let mut signers = vec![self.to_unit.as_str(), self.witness_unit.as_str()];
-        if let Some(from) = self.from_unit.as_deref() {
-            signers.push(from);
+        if self.from_absent.is_none() {
+            if let Some(from) = self.from_unit.as_deref() {
+                signers.push(from);
+            }
         }
         signers
     }
@@ -738,6 +766,7 @@ mod tests {
         let spec = HandoverSpec {
             face_id: "\u{4efb}\u{52a1}\u{7ba1}\u{7406}".into(),
             from_unit: Some("worker".into()),
+            from_absent: None,
             to_unit: "6e".into(),
             witness_unit: "8b2".into(),
             source: None,
@@ -770,11 +799,110 @@ mod tests {
         assert_eq!(signed.required_signers(), vec!["6e", "8b2", "worker"]);
     }
 
+    /// A face whose owner has left cannot be handed over on a signature that
+    /// owner will never give. The observation that it was gone stands in for
+    /// that signature, and it has to be inside the payload the other units
+    /// sign -- otherwise the two signers attest to a move whose stated reason
+    /// a later writer could rewrite.
+    #[test]
+    fn an_absent_owner_is_replaced_by_an_observation_the_signature_covers() {
+        let mut spec = HandoverSpec {
+            face_id: "\u{5b89}\u{5168}\u{4e0e}\u{51ed}\u{8bc1}".into(),
+            from_unit: Some("b4".into()),
+            from_absent: Some(at(0)),
+            to_unit: "worker".into(),
+            witness_unit: "operator".into(),
+            source: None,
+            criterion_reading: None,
+            reading_at: None,
+            open_actions: Vec::new(),
+            open_task_ids: Vec::new(),
+            permissions_context: None,
+            artifact_path: None,
+            artifact_expires_at: None,
+            expires_when: None,
+            withdraw_condition: None,
+            payload_sha256: None,
+            signed_by: Vec::new(),
+        };
+        assert_eq!(spec.required_signers(), vec!["worker", "operator"]);
+        spec.payload_sha256 = Some(spec.payload_digest());
+        spec.signed_by.push(Signature {
+            unit: "worker".into(),
+            at: at(1),
+        });
+        assert!(!spec.is_fully_signed());
+        assert!(spec.signature_covers_payload());
+        spec.signed_by.push(Signature {
+            unit: "operator".into(),
+            at: at(2),
+        });
+        assert!(spec.is_fully_signed());
+
+        // The time of the observation is a term like any other: moving it is a
+        // change to what the signers attested to.
+        let before = spec.payload_digest();
+        spec.from_absent = Some(at(3));
+        assert_ne!(spec.payload_digest(), before);
+        assert!(!spec.signature_covers_payload());
+    }
+
+    /// A handover that does not use the exit path must digest exactly as it did
+    /// before the field existed, or every signature taken under the old shape
+    /// would stop verifying the moment this code shipped.
+    #[test]
+    fn a_handover_without_an_absence_keeps_the_digest_it_had_before_the_field() {
+        let spec = HandoverSpec {
+            face_id: "f".into(),
+            from_unit: Some("worker".into()),
+            from_absent: None,
+            to_unit: "6e".into(),
+            witness_unit: "8b2".into(),
+            source: None,
+            criterion_reading: None,
+            reading_at: None,
+            open_actions: Vec::new(),
+            open_task_ids: Vec::new(),
+            permissions_context: None,
+            artifact_path: None,
+            artifact_expires_at: None,
+            expires_when: None,
+            withdraw_condition: None,
+            payload_sha256: None,
+            signed_by: Vec::new(),
+        };
+        let bytes = serde_json::to_value(&spec).unwrap();
+        assert!(
+            bytes.get("from_absent").is_none(),
+            "an unused field must not reach the serialised payload: {bytes}"
+        );
+        let old_shape = serde_json::json!({
+            "face_id": "f",
+            "from_unit": "worker",
+            "to_unit": "6e",
+            "witness_unit": "8b2",
+            "source": null,
+            "criterion_reading": null,
+            "reading_at": null,
+            "open_actions": [],
+            "open_task_ids": [],
+            "permissions_context": null,
+            "artifact_path": null,
+            "artifact_expires_at": null,
+            "expires_when": null,
+            "withdraw_condition": null,
+            "payload_sha256": null,
+            "signed_by": [],
+        });
+        assert_eq!(bytes, old_shape);
+    }
+
     #[test]
     fn a_signature_stops_covering_the_payload_once_a_term_changes() {
         let mut spec = HandoverSpec {
             face_id: "f".into(),
             from_unit: Some("worker".into()),
+            from_absent: None,
             to_unit: "6e".into(),
             witness_unit: "8b2".into(),
             source: None,

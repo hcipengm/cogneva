@@ -68,6 +68,7 @@ fn handover_node(id: &str, face_id: &str, from: &str, to: &str, status: TaskStat
     let spec = HandoverSpec {
         face_id: face_id.to_string(),
         from_unit: Some(from.to_string()),
+        from_absent: None,
         to_unit: to.to_string(),
         witness_unit: "witness".into(),
         source: None,

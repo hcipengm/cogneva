@@ -16,7 +16,8 @@
 //! row into the graph through the same import the HTTP face uses. A row whose
 //! ownership has already moved past the file's first revision keeps its
 //! ownership: the file says what ownership was proposed, the graph says what
-//! was signed.
+//! was signed. With `--keep-ownership` no existing row's ownership moves at
+//! all, which is the mode a clock-driven writer runs in.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -50,12 +51,17 @@ SUBCOMMANDS:
                            tasks.tsv into <dir>, each with its generated_at and
                            the graph's largest revision. This is the write a
                            freshness gate reads.
-    import-faces --from <file>
+    import-faces --from <file> [--keep-ownership]
                            Put each roster row into the graph. Columns:
                            face kind owner deputy witness time_share
                            vacancy_until vacancy_assigner gap_task first_reading
                            entry_path updated_at source_fronts
                            Idempotent; printed counts say what happened.
+                           --keep-ownership refreshes descriptions and never
+                           moves an existing face: the continuous writer uses
+                           it, because a clock re-reading a file is not a
+                           decision to hand a face over, and only a signed
+                           handover carries the work bound to the face.
     handover <SUB>         Open, sign, apply, withdraw or list a move of a face
                            from one unit to another. A move counts only when
                            every required unit signed and it was applied.
@@ -92,6 +98,11 @@ pub enum Action {
     },
     ImportFaces {
         from: PathBuf,
+        /// Refresh descriptions without moving any face's ownership. The
+        /// continuous writer asks for this: a clock re-reading a file is not a
+        /// decision to hand a face over, and the only act that carries the
+        /// work bound to a face is a signed handover.
+        keep_ownership: bool,
     },
     Assign {
         face: Option<String>,
@@ -145,6 +156,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut redis_url: Option<String> = None;
     let mut brief = false;
     let mut json = false;
+    let mut keep_ownership = false;
     let mut out: Option<PathBuf> = None;
     let mut from: Option<PathBuf> = None;
     let mut face: Option<String> = None;
@@ -162,6 +174,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
             }
             "--brief" => brief = true,
             "--json" => json = true,
+            "--keep-ownership" => keep_ownership = true,
             "--out" => {
                 out = Some(PathBuf::from(iter.next().ok_or("--out needs a directory")?));
             }
@@ -191,6 +204,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
         },
         Some("import-faces") => Action::ImportFaces {
             from: from.ok_or("import-faces needs --from <file>")?,
+            keep_ownership,
         },
         Some("assign") => Action::Assign { face, workspace },
         Some(other) => return Err(format!("unknown governance subcommand {other}")),
@@ -257,12 +271,34 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         Action::Faces { brief } => faces(&*store, brief).await?,
         Action::Drift { json } => drift(&*store, redis_url.as_deref(), json).await?,
         Action::Project { out } => project(&*store, redis_url.as_deref(), &out).await?,
-        Action::ImportFaces { from } => import_faces(&*store, &from).await?,
+        Action::ImportFaces {
+            from,
+            keep_ownership,
+        } => import_faces(&*store, &from, keep_ownership).await?,
         Action::Assign { face, workspace } => {
             let workspace = workspace.unwrap_or_else(|| config.dag_executor.workspace_id.clone());
             assign(&*store, &assign_pool, &workspace, face.as_deref()).await?;
         }
-        Action::Act(act) => crate::governance_acts::run(*act, &*store, Utc::now()).await?,
+        Action::Act(act) => {
+            // The heartbeat store is what an exit handover's apply step
+            // re-reads. Without it the command still works for every handover
+            // whose signatures are all human; only the one that replaced a
+            // signature with an absence has nothing to check it against.
+            let (registry, note) = agent_registry(redis_url.as_deref()).await;
+            if let Some(note) = note {
+                eprintln!("cogneva governance: {note}");
+            }
+            let probe = registry.map(RedisPresenceProbe);
+            crate::governance_acts::run_with_presence(
+                *act,
+                &*store,
+                probe
+                    .as_ref()
+                    .map(|p| p as &dyn crate::governance_acts::PresenceProbe),
+                Utc::now(),
+            )
+            .await?
+        }
     }
     Ok(())
 }
@@ -325,6 +361,28 @@ async fn faces(store: &dyn GovernanceStore, brief: bool) -> Result<(), Box<dyn E
 /// No registry is not fatal: the rules then read every staffed face as unread,
 /// which is the honest answer to "nobody can see the owner". Printing green
 /// instead would make an unreachable registry look like a healthy fleet.
+/// The registry read as a liveness question rather than a roster lookup.
+///
+/// The store's TTL codes are translated here, once: negative means the key is
+/// not there, and a key that is there means the unit is renewing it.
+struct RedisPresenceProbe(Arc<RedisAgentRegistry>);
+
+#[async_trait::async_trait]
+impl crate::governance_acts::PresenceProbe for RedisPresenceProbe {
+    async fn presence_ttl_secs(&self, unit: &str) -> Result<Option<u64>, String> {
+        match self.0.ttl_secs(unit).await {
+            Ok(-2) => Ok(None),
+            Ok(-1) => Ok(Some(u64::MAX)),
+            Ok(ttl) if ttl >= 0 => Ok(Some(ttl as u64)),
+            Ok(other) => Err(format!(
+                "the heartbeat store answered ttl {other} for {unit}, which is neither a \
+                 live nor a missing key"
+            )),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
 async fn agent_registry(url: Option<&str>) -> (Option<Arc<RedisAgentRegistry>>, Option<String>) {
     let Some(url) = url else {
         return (
@@ -688,16 +746,25 @@ async fn assign(
     Ok(())
 }
 
-async fn import_faces(store: &dyn GovernanceStore, from: &Path) -> Result<(), Box<dyn Error>> {
+async fn import_faces(
+    store: &dyn GovernanceStore,
+    from: &Path,
+    keep_ownership: bool,
+) -> Result<(), Box<dyn Error>> {
     let text = std::fs::read_to_string(from)
         .map_err(|e| format!("cannot read {}: {e}", from.display()))?;
     let rows = parse_roster(&text)?;
+    let ownership = if keep_ownership {
+        cog_core::ImportOwnership::HandoverOnly
+    } else {
+        cog_core::ImportOwnership::FromFile
+    };
     let mut inserted = 0;
     let mut updated = 0;
     let mut unchanged = 0;
     let mut kept = 0;
     for row in &rows {
-        match cog_core::import_face(store, &row.face).await? {
+        match cog_core::import_face_with(store, &row.face, ownership).await? {
             FaceImportOutcome::Inserted => inserted += 1,
             FaceImportOutcome::Updated => updated += 1,
             FaceImportOutcome::Unchanged => unchanged += 1,
@@ -749,8 +816,24 @@ mod tests {
                 .unwrap()
                 .action,
             Action::ImportFaces {
-                from: PathBuf::from("faces.tsv")
+                from: PathBuf::from("faces.tsv"),
+                keep_ownership: false,
             }
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "import-faces",
+                "--from",
+                "faces.tsv",
+                "--keep-ownership"
+            ]))
+            .unwrap()
+            .action,
+            Action::ImportFaces {
+                from: PathBuf::from("faces.tsv"),
+                keep_ownership: true,
+            },
+            "the continuous writer refreshes descriptions and never moves a face"
         );
         assert_eq!(
             parse_args(&args(&["assign"])).unwrap().action,

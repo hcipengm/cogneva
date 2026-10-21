@@ -45,6 +45,23 @@ impl RedisAgentRegistry {
             .map_err(|e| SFError::Redis(e.to_string()))?;
         Ok(Self::new(connection))
     }
+
+    /// Seconds left on one unit's presence key, with Redis' own codes: `-2`
+    /// when the key does not exist, `-1` when it exists without an expiry.
+    ///
+    /// [`AgentRegistry::get`] answers "who is registered with this name" and
+    /// collapses "no key" into `None` alongside every other reason a row could
+    /// not be read. A caller deciding whether a unit is *still* present has to
+    /// tell a missing key from a live one, and the index is no help: it keeps
+    /// retired names forever, so membership in it is a tombstone, not a
+    /// liveness reading.
+    pub async fn ttl_secs(&self, agent_id: &str) -> SFResult<i64> {
+        let key = agent_key(agent_id);
+        let mut conn = self.connection.clone();
+        conn.ttl(&key)
+            .await
+            .map_err(|e: RedisError| SFError::Redis(e.to_string()))
+    }
 }
 
 #[async_trait]

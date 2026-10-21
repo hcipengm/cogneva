@@ -1,3 +1,5 @@
+//! principle: feedback_an_error_branch_must_not_be_counted_as_a_named_outcome
+//! principle: feedback_a_deadline_should_run_on_its_own_clock
 //! Handovers, decisions and votes as rows of the task graph -- the part that
 //! acts.
 //!
@@ -861,6 +863,7 @@ mod tests {
         let spec = HandoverSpec {
             face_id: "任务管理".into(),
             from_unit: Some("worker".into()),
+            from_absent: None,
             to_unit: "6e".into(),
             witness_unit: "8b2".into(),
             source: None,
@@ -1315,6 +1318,7 @@ mod tests {
         let spec = HandoverSpec {
             face_id: "task-management".into(),
             from_unit: Some("worker".into()),
+            from_absent: None,
             to_unit: "6e".into(),
             witness_unit: "8b2".into(),
             source: None,

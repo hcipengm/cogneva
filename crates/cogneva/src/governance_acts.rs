@@ -1,3 +1,6 @@
+//! principle: feedback_a_verdict_must_ride_on_the_exit_status_not_on_a_printed_line
+//! principle: feedback_an_ownership_move_must_carry_the_work_bound_to_it
+//! principle: feedback_one_ballot_of_a_unit_is_a_derived_row_id_not_a_caller_check
 //! `cogneva governance handover|vote` — moves and questions, kept where the
 //! faces already live.
 //!
@@ -31,11 +34,34 @@ use cog_orchestrator::governance_acts::{
     validate_principle, vote_id, vote_task,
 };
 
+/// What applying an exit handover re-reads before it moves anything.
+///
+/// A handover that replaces the outgoing owner's signature with an observation
+/// of its absence is signed over the past: the other units agreed that the
+/// owner was gone when they read it. Applying is now, and the only thing that
+/// makes the substitution safe is that the owner is *still* gone -- otherwise
+/// the move takes a face from a unit that is present and never agreed. So the
+/// apply step re-reads the one fact the signature rested on, and refuses when
+/// it no longer holds rather than writing a move whose stated reason expired.
+#[async_trait::async_trait]
+pub trait PresenceProbe: Send + Sync {
+    /// Seconds left on the unit's heartbeat key, or `None` when there is no
+    /// such key.
+    ///
+    /// The presence of a key is the whole question: a unit that is renewing its
+    /// heartbeat has one, and nothing else in the tree writes that key. The
+    /// remaining seconds are carried so that the refusal can quote the reading
+    /// instead of asserting liveness.
+    async fn presence_ttl_secs(&self, unit: &str) -> Result<Option<u64>, String>;
+}
+
 pub const USAGE: &str = "\
 cogneva governance <handover|vote> <SUBCOMMAND> [OPTIONS]
 
-HANDOVER — moving a face from one unit to another. All three units must sign.
+HANDOVER — moving a face from one unit to another. All three units must sign,
+or two when the outgoing owner was recorded absent.
     open --face <face> --to <unit> --witness <unit> [--from <unit>]
+         [--from-absent-at <rfc3339>]
          [--source <text>] [--criterion <reading>] [--reading-at <rfc3339>]
          [--open-action <text>]... [--permissions-context <text>]
          [--artifact <path>] [--artifact-expires <rfc3339>]
@@ -45,6 +71,10 @@ HANDOVER — moving a face from one unit to another. All three units must sign.
          long it stays readable, when the handover dies and what withdraws it.
          --open-action may repeat; each one is an obligation the new owner
          inherits and a place the next reader will look for it.
+         --from-absent-at is for an owner that has already left: it records
+         when the owner's heartbeat key was seen gone and stands in for that
+         owner's signature, so only the incoming unit and the witness sign.
+         Apply re-reads the key and refuses if the owner is present again.
     sign --id <handover> --unit <unit>
     apply --id <handover>
     withdraw --id <handover> --unit <unit>
@@ -74,6 +104,9 @@ pub enum Act {
     HandoverOpen {
         face: String,
         from: Option<String>,
+        /// When the outgoing owner was last observed absent, for a handover
+        /// that moves a face whose owner has already left.
+        from_absent: Option<DateTime<Utc>>,
         to: String,
         witness: String,
         source: Option<String>,
@@ -185,21 +218,33 @@ pub fn parse_args(args: &[String]) -> Result<Act, String> {
     };
 
     match (family.as_str(), sub.as_str()) {
-        ("handover", "open") => Ok(Act::HandoverOpen {
-            face: required("--face")?,
-            from: one("--from")?,
-            to: required("--to")?,
-            witness: required("--witness")?,
-            source: one("--source")?,
-            criterion: one("--criterion")?,
-            reading_at: parse_time(&one("--reading-at")?)?,
-            open_actions: many("--open-action"),
-            permissions_context: one("--permissions-context")?,
-            artifact: one("--artifact")?,
-            artifact_expires_at: parse_time(&one("--artifact-expires")?)?,
-            expires_when: parse_time(&one("--expires-when")?)?,
-            withdraw_condition: one("--withdraw-condition")?,
-        }),
+        ("handover", "open") => {
+            let from = one("--from")?;
+            let from_absent = parse_time(&one("--from-absent-at")?)?;
+            if from_absent.is_some() && from.is_none() {
+                return Err(
+                    "--from-absent-at needs --from: it records an owner's absence, \
+                     and a vacant face has no owner to be absent"
+                        .into(),
+                );
+            }
+            Ok(Act::HandoverOpen {
+                face: required("--face")?,
+                from,
+                from_absent,
+                to: required("--to")?,
+                witness: required("--witness")?,
+                source: one("--source")?,
+                criterion: one("--criterion")?,
+                reading_at: parse_time(&one("--reading-at")?)?,
+                open_actions: many("--open-action"),
+                permissions_context: one("--permissions-context")?,
+                artifact: one("--artifact")?,
+                artifact_expires_at: parse_time(&one("--artifact-expires")?)?,
+                expires_when: parse_time(&one("--expires-when")?)?,
+                withdraw_condition: one("--withdraw-condition")?,
+            })
+        }
         ("handover", "sign") => Ok(Act::HandoverSign {
             id: required("--id")?,
             unit: required("--unit")?,
@@ -299,10 +344,26 @@ pub async fn run(
     store: &dyn GovernanceStore,
     now: DateTime<Utc>,
 ) -> Result<(), Box<dyn Error>> {
+    run_with_presence(act, store, None, now).await
+}
+
+/// Run one handover or vote command with the heartbeat store in hand.
+///
+/// `presence` is only consulted by an exit handover's apply step. A caller
+/// without a heartbeat store can still open, sign and withdraw any handover;
+/// what it cannot do is apply one whose signature was replaced by an absence,
+/// because the check that keeps that substitution honest has nothing to read.
+pub async fn run_with_presence(
+    act: Act,
+    store: &dyn GovernanceStore,
+    presence: Option<&dyn PresenceProbe>,
+    now: DateTime<Utc>,
+) -> Result<(), Box<dyn Error>> {
     match act {
         Act::HandoverOpen {
             face,
             from,
+            from_absent,
             to,
             witness,
             source,
@@ -315,9 +376,20 @@ pub async fn run(
             expires_when,
             withdraw_condition,
         } => {
+            // "The owner was absent" is a statement about a named owner. A
+            // vacant face has none, and the vacancy path already means exactly
+            // this without inventing a name to be absent.
+            if from_absent.is_some() && from.is_none() {
+                return Err(
+                    "--from-absent-at needs --from: it records an owner's absence, \
+                     and a vacant face has no owner to be absent"
+                        .into(),
+                );
+            }
             let spec = HandoverSpec {
                 face_id: face.clone(),
                 from_unit: from,
+                from_absent,
                 to_unit: to.clone(),
                 witness_unit: witness,
                 source,
@@ -406,6 +478,40 @@ pub async fn run(
                     "{id} no longer matches what its signers attested to; refusing to apply"
                 )
                 .into());
+            }
+            // The absence that stood in for the outgoing owner's signature was
+            // observed when the handover was opened. It has to still be true:
+            // an owner that came back is present, has not agreed to leave, and
+            // would lose the face to a signature nobody gave.
+            if let Some(observed_at) = handover.spec.from_absent {
+                let from = handover.spec.from_unit.as_deref().ok_or_else(|| {
+                    format!("{id} records an absence but names no owner it was absent")
+                })?;
+                let probe = presence.ok_or_else(|| {
+                    format!(
+                        "{id} replaces {from}'s signature with an absence reading, and no \
+                         heartbeat store is configured to confirm the owner is still gone"
+                    )
+                })?;
+                match probe.presence_ttl_secs(from).await {
+                    Ok(None) => {}
+                    Ok(Some(ttl)) => {
+                        return Err(format!(
+                            "{id} cannot be applied: {from} is present again \
+                             (heartbeat key has {ttl}s left, absence was read at {}); \
+                             the absence this handover's signatures rested on no longer holds",
+                            observed_at.to_rfc3339()
+                        )
+                        .into())
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "{id} cannot be applied: whether {from} is still absent could not \
+                             be read ({e})"
+                        )
+                        .into())
+                    }
+                }
             }
             let mut face_task =
                 find_node(store, cog_core::FACE_TASK_TYPE, &handover.spec.face_id).await?;
@@ -1583,6 +1689,7 @@ mod tests {
             Act::HandoverOpen {
                 face: face_id.to_string(),
                 from: Some("worker".into()),
+                from_absent: None,
                 to: "6e".into(),
                 witness: "8b2".into(),
                 source: None,
@@ -1660,6 +1767,290 @@ mod tests {
         assert_eq!(reading.state, cog_core::DriftState::OnTarget);
     }
 
+    /// The heartbeat store as the apply step sees it, with the one reading it
+    /// asks for fixed by the test.
+    struct FixedPresence(Result<Option<u64>, String>);
+
+    #[async_trait::async_trait]
+    impl PresenceProbe for FixedPresence {
+        async fn presence_ttl_secs(&self, _unit: &str) -> Result<Option<u64>, String> {
+            self.0.clone()
+        }
+    }
+
+    /// A face whose owner has already left. There is no unit left to sign for
+    /// it, so the two remaining signatures plus the observed absence have to be
+    /// enough -- and the work bound to the face has to follow it, or the move
+    /// only relabels the row.
+    #[tokio::test]
+    async fn an_absent_owner_is_handed_over_on_two_signatures_and_the_work_follows() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let face_id = "\u{8d44}\u{6e90}\u{7ba1}\u{7406}";
+
+        let face = cog_core::Face {
+            face_id: face_id.to_string(),
+            owner_unit: Some("c2".into()),
+            bound_by_handover_id: None,
+            spec: cog_core::FaceSpec::first(face_id, cog_core::FaceKind::Face),
+            updated_at: now,
+        };
+        store
+            .save_governance_node(&face.to_task(None))
+            .await
+            .unwrap();
+        let mut pending = cog_core::Task::new(
+            "work-pending",
+            cog_core::TaskType::Custom("code".into()),
+            serde_json::json!({}),
+        );
+        pending.status = cog_core::TaskStatus::Pending;
+        pending.face_id = Some(face_id.to_string());
+        pending.owner_unit = Some("c2".into());
+        store.save_governance_node(&pending).await.unwrap();
+        let mut running = cog_core::Task::new(
+            "work-running",
+            cog_core::TaskType::Custom("code".into()),
+            serde_json::json!({}),
+        );
+        running.status = cog_core::TaskStatus::Running;
+        running.face_id = Some(face_id.to_string());
+        running.owner_unit = Some("c2".into());
+        running.lease_owner = Some("c2-process".into());
+        store.save_governance_node(&running).await.unwrap();
+
+        let absence = now - chrono::Duration::minutes(30);
+        run(
+            Act::HandoverOpen {
+                face: face_id.to_string(),
+                from: Some("c2".into()),
+                from_absent: Some(absence),
+                to: "operator".into(),
+                witness: "worker".into(),
+                source: None,
+                criterion: Some("TTL orchestrator:agents:c2 = -2".into()),
+                reading_at: Some(absence),
+                open_actions: Vec::new(),
+                permissions_context: None,
+                artifact: None,
+                artifact_expires_at: None,
+                expires_when: Some(now + chrono::Duration::days(1)),
+                withdraw_condition: None,
+            },
+            &store,
+            now,
+        )
+        .await
+        .unwrap();
+        let id = store.of_type(HANDOVER_TASK_TYPE)[0].id.clone();
+
+        // The departed owner is not asked for a signature it can never give.
+        for unit in ["operator", "worker"] {
+            run(
+                Act::HandoverSign {
+                    id: id.clone(),
+                    unit: unit.into(),
+                },
+                &store,
+                now,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(store.row(&id).status, cog_core::TaskStatus::Scheduled);
+
+        let probe = FixedPresence(Ok(None));
+        run_with_presence(
+            Act::HandoverApply { id: id.clone() },
+            &store,
+            Some(&probe),
+            now,
+        )
+        .await
+        .unwrap();
+
+        let moved = cog_core::Face::from_task(&store.row(face_id)).unwrap();
+        assert_eq!(moved.owner_unit.as_deref(), Some("operator"));
+        assert_eq!(moved.revision(), 2);
+        assert_eq!(
+            store.row("work-pending").owner_unit.as_deref(),
+            Some("operator")
+        );
+        assert_eq!(
+            store.row("work-running").owner_unit.as_deref(),
+            Some("c2"),
+            "a run under a lease is not moved, absent owner or not"
+        );
+    }
+
+    /// The absence was read when the handover was opened; applying it is a
+    /// later moment. An owner that came back in between is present and never
+    /// agreed to leave, so the move must not land.
+    #[tokio::test]
+    async fn an_exit_handover_is_refused_when_the_owner_came_back_before_it_applied() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let face_id = "\u{8d44}\u{6e90}\u{7ba1}\u{7406}";
+        let face = cog_core::Face {
+            face_id: face_id.to_string(),
+            owner_unit: Some("c2".into()),
+            bound_by_handover_id: None,
+            spec: cog_core::FaceSpec::first(face_id, cog_core::FaceKind::Face),
+            updated_at: now,
+        };
+        store
+            .save_governance_node(&face.to_task(None))
+            .await
+            .unwrap();
+
+        run(
+            Act::HandoverOpen {
+                face: face_id.to_string(),
+                from: Some("c2".into()),
+                from_absent: Some(now - chrono::Duration::minutes(5)),
+                to: "operator".into(),
+                witness: "worker".into(),
+                source: None,
+                criterion: None,
+                reading_at: None,
+                open_actions: Vec::new(),
+                permissions_context: None,
+                artifact: None,
+                artifact_expires_at: None,
+                expires_when: Some(now + chrono::Duration::days(1)),
+                withdraw_condition: None,
+            },
+            &store,
+            now,
+        )
+        .await
+        .unwrap();
+        let id = store.of_type(HANDOVER_TASK_TYPE)[0].id.clone();
+        for unit in ["operator", "worker"] {
+            run(
+                Act::HandoverSign {
+                    id: id.clone(),
+                    unit: unit.into(),
+                },
+                &store,
+                now,
+            )
+            .await
+            .unwrap();
+        }
+
+        let probe = FixedPresence(Ok(Some(445)));
+        let err = run_with_presence(
+            Act::HandoverApply { id: id.clone() },
+            &store,
+            Some(&probe),
+            now,
+        )
+        .await
+        .expect_err("an owner that is present again still holds the face");
+        assert!(err.to_string().contains("present again"), "{err}");
+
+        // Nothing moved: the face keeps its owner and the handover is still
+        // signed-and-unapplied, which is the state a reader can act on.
+        let kept = cog_core::Face::from_task(&store.row(face_id)).unwrap();
+        assert_eq!(kept.owner_unit.as_deref(), Some("c2"));
+        assert_eq!(store.row(&id).status, cog_core::TaskStatus::Scheduled);
+    }
+
+    /// Without a heartbeat store the apply step cannot tell "still gone" from
+    /// "back"; it must refuse rather than assume the reading it cannot take.
+    #[tokio::test]
+    async fn an_exit_handover_is_not_applied_when_the_absence_cannot_be_reread() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let face_id = "f";
+        let face = cog_core::Face {
+            face_id: face_id.to_string(),
+            owner_unit: Some("c2".into()),
+            bound_by_handover_id: None,
+            spec: cog_core::FaceSpec::first(face_id, cog_core::FaceKind::Face),
+            updated_at: now,
+        };
+        store
+            .save_governance_node(&face.to_task(None))
+            .await
+            .unwrap();
+        run(
+            Act::HandoverOpen {
+                face: face_id.to_string(),
+                from: Some("c2".into()),
+                from_absent: Some(now),
+                to: "operator".into(),
+                witness: "worker".into(),
+                source: None,
+                criterion: None,
+                reading_at: None,
+                open_actions: Vec::new(),
+                permissions_context: None,
+                artifact: None,
+                artifact_expires_at: None,
+                expires_when: None,
+                withdraw_condition: None,
+            },
+            &store,
+            now,
+        )
+        .await
+        .unwrap();
+        let id = store.of_type(HANDOVER_TASK_TYPE)[0].id.clone();
+        for unit in ["operator", "worker"] {
+            run(
+                Act::HandoverSign {
+                    id: id.clone(),
+                    unit: unit.into(),
+                },
+                &store,
+                now,
+            )
+            .await
+            .unwrap();
+        }
+        let err = run_with_presence(Act::HandoverApply { id }, &store, None, now)
+            .await
+            .expect_err("an absence that cannot be re-read cannot be applied on");
+        assert!(err.to_string().contains("no heartbeat store"), "{err}");
+    }
+
+    #[test]
+    fn an_absence_needs_an_owner_it_was_absent() {
+        let parsed = parse_args(&args(&[
+            "handover",
+            "open",
+            "--face",
+            "f",
+            "--to",
+            "a",
+            "--witness",
+            "b",
+            "--from-absent-at",
+            "2026-10-21T00:00:00Z",
+        ]));
+        assert!(
+            parsed.is_err(),
+            "a vacant face has no owner whose absence could be recorded"
+        );
+        assert!(parse_args(&args(&[
+            "handover",
+            "open",
+            "--face",
+            "f",
+            "--from",
+            "b4",
+            "--from-absent-at",
+            "2026-10-21T00:00:00Z",
+            "--to",
+            "a",
+            "--witness",
+            "b",
+        ]))
+        .is_ok());
+    }
+
     // Importing the same roster row twice must be a no-op that says so. The
     // `Unchanged` outcome is what a caller uses to report "nothing moved"; if
     // the timestamp were stamped before the comparison, every import would
@@ -1683,6 +2074,55 @@ mod tests {
         let again = cog_core::import_face(&store, &face(now)).await.unwrap();
         assert_eq!(again, cog_core::FaceImportOutcome::Unchanged);
         assert_eq!(store.row("face").updated_at, before);
+    }
+
+    /// The roster is an input a clock keeps re-reading. A file change is not a
+    /// decision anyone made, and the import is the one path that does not
+    /// carry the work bound to a face -- so it must not move an owner either.
+    /// Ownership moves only through a signed handover.
+    #[tokio::test]
+    async fn a_continuous_import_refreshes_the_description_without_moving_the_owner() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let face = |owner: &str, reading: &str| {
+            let mut spec = cog_core::FaceSpec::first("f", cog_core::FaceKind::Face);
+            spec.first_reading = Some(reading.to_string());
+            cog_core::Face {
+                face_id: "f".into(),
+                owner_unit: Some(owner.into()),
+                bound_by_handover_id: None,
+                spec,
+                updated_at: now,
+            }
+        };
+
+        cog_core::import_face(&store, &face("c2", "old reading"))
+            .await
+            .unwrap();
+        let outcome = cog_core::import_face_with(
+            &store,
+            &face("operator", "new reading"),
+            cog_core::ImportOwnership::HandoverOnly,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            cog_core::FaceImportOutcome::OwnershipKept { revision: 1 },
+            "keeping the owner is reported even at revision 1, where a manual import would move it"
+        );
+        let kept = cog_core::Face::from_task(&store.row("f")).unwrap();
+        assert_eq!(
+            kept.owner_unit.as_deref(),
+            Some("c2"),
+            "a clock re-reading the file is not a handover"
+        );
+        assert_eq!(
+            kept.spec.first_reading.as_deref(),
+            Some("new reading"),
+            "the description is what the continuous import is for"
+        );
     }
 
     #[tokio::test]
@@ -1714,6 +2154,7 @@ mod tests {
             Act::HandoverOpen {
                 face: face_id.to_string(),
                 from: None,
+                from_absent: None,
                 to: "b4".into(),
                 witness: "38".into(),
                 source: None,
