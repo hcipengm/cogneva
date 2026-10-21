@@ -148,7 +148,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             ctx.consume_service::<dyn cog_core::McpClient>();
         let external_skill_registry = ctx.consume_service::<dyn cog_core::ExternalSkillRegistry>();
         let event_publisher: Option<Arc<dyn cog_core::EventPublisher>> =
-            ctx.consume_service::<dyn cog_core::EventPublisher>();
+            downstream_event_publisher(ctx);
         let websocket_client: Option<Arc<dyn cog_core::WebSocketClient>> =
             ctx.consume_service::<dyn cog_core::WebSocketClient>();
         let _http_client: Arc<dyn cog_core::HttpClient> =
@@ -419,6 +419,23 @@ impl cog_core::SystemPlugin for GatewayPlugin {
     }
 }
 
+/// The publisher the downstream consumers actually read.
+///
+/// With the event plane switched on, the supervisor re-ingest and the memory
+/// ingestor subscribe to the dedicated plane backend. The plain
+/// [`cog_core::EventPublisher`] is bound to the task-queue backend, so events
+/// published through it land on a stream nobody reads — the hook forwarder
+/// would report success and lose every event. Prefer the plane publisher
+/// whenever the stream plugin published one and fall back to the global one
+/// on deployments that serve both roles from a single backend.
+fn downstream_event_publisher(
+    ctx: &cog_core::PluginContext,
+) -> Option<Arc<dyn cog_core::EventPublisher>> {
+    ctx.consume::<cog_core::EventPlanePublisher>()
+        .map(|plane| plane.0.clone())
+        .or_else(|| ctx.consume_service::<dyn cog_core::EventPublisher>())
+}
+
 /// Static descriptor for auto-discovery.
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     name: "gateway",
@@ -446,3 +463,73 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     ],
     factory: || Box::new(GatewayPlugin::new()),
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingPublisher(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl cog_core::EventPublisher for CountingPublisher {
+        async fn publish(&self, _event: &cog_core::AgentEvent) -> cog_core::SFResult<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn an_event() -> cog_core::AgentEvent {
+        cog_core::AgentEvent::TaskStatusChange {
+            task_id: "t-1".into(),
+            status: "hook_event".into(),
+            agent_id: Some("a-1".into()),
+            crew_id: Some("c-1".into()),
+            squad_id: Some("s-1".into()),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_published_event_reaches_the_plane_the_readers_subscribe_to() {
+        let ctx = cog_core::PluginContext::new(cog_core::Config::default());
+        let plane = Arc::new(CountingPublisher(Arc::new(AtomicUsize::new(0))));
+        let global = Arc::new(CountingPublisher(Arc::new(AtomicUsize::new(0))));
+        ctx.publish(Arc::new(cog_core::EventPlanePublisher(plane.clone())));
+        let global_dyn: Arc<dyn cog_core::EventPublisher> = global.clone();
+        ctx.publish_service(global_dyn);
+
+        let chosen = downstream_event_publisher(&ctx).expect("a publisher must be chosen");
+        chosen.publish(&an_event()).await.unwrap();
+
+        assert_eq!(
+            plane.0.load(Ordering::SeqCst),
+            1,
+            "the plane is where the supervisor and the ingestor read"
+        );
+        assert_eq!(
+            global.0.load(Ordering::SeqCst),
+            0,
+            "the task-queue publisher has no reader once the plane is on"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_plane_the_global_publisher_is_used() {
+        let ctx = cog_core::PluginContext::new(cog_core::Config::default());
+        let global = Arc::new(CountingPublisher(Arc::new(AtomicUsize::new(0))));
+        let global_dyn: Arc<dyn cog_core::EventPublisher> = global.clone();
+        ctx.publish_service(global_dyn);
+
+        let chosen = downstream_event_publisher(&ctx).expect("a publisher must be chosen");
+        chosen.publish(&an_event()).await.unwrap();
+
+        assert_eq!(global.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn no_backend_means_no_publisher() {
+        let ctx = cog_core::PluginContext::new(cog_core::Config::default());
+        assert!(downstream_event_publisher(&ctx).is_none());
+    }
+}
