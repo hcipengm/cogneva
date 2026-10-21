@@ -340,8 +340,8 @@ struct UnsettledCheck {
 /// says which loop put it there.
 const DISPATCH_TASK_PREFIX: &str = "change-ledger-";
 
-/// The queue rank this loop declares for the work it submits: one below the
-/// default every other task lands on.
+/// The queue rank this loop declares for work whose documents stated no band:
+/// one below the default every other task lands on.
 ///
 /// Declared by the submitter, not derived from what kind of task it is — the
 /// scheduler reads a number and a source field that never reaches admission.
@@ -805,6 +805,28 @@ fn dispatch_rearm_limit() -> u32 {
 /// the kind the change-generation path is looked up by, and the rank the
 /// submitter declares are all decided here, and a test can state them without
 /// running a whole ledger pass.
+/// The rank a handover is submitted at: the floor, lifted by the band its
+/// documents stated.
+///
+/// The band already decides the order this loop hands rows over in, and until
+/// this function existed it stopped deciding anything at the boundary that
+/// actually settles what runs next. Every handover was filed at one flat rank,
+/// so the P0 row the pass had just taken first went into the graph indistinguishable
+/// from the two thousand rows nobody prioritised behind it and waited the same
+/// turn -- the ordering was undone one step after it was computed.
+///
+/// Lifting by the band's own rank leaves the floor's rule intact where it was
+/// measured: a row whose documents stated no band still lands one below the
+/// default. A stated band overtakes that floor because it is a claim somebody
+/// made about urgency rather than this loop's own guess -- the same reason the
+/// account keeps the band from the documents instead of deriving one. How much
+/// of the owed set carries a band is a reading in its own right
+/// (`owed_p0` .. `owed_unstated`), so a band large enough to hold the graph is
+/// visible there before it can be mistaken for the graph simply being busy.
+fn dispatch_priority(row: &ChangeLedgerRow) -> i32 {
+    DISPATCH_TASK_PRIORITY.saturating_add(i32::from(row.priority().rank()))
+}
+
 fn dispatch_task(row: &ChangeLedgerRow, generation: u32) -> Task {
     let mut task = Task::new(
         dispatch_task_id(&row.identity, generation),
@@ -825,7 +847,7 @@ fn dispatch_task(row: &ChangeLedgerRow, generation: u32) -> Task {
                 .collect::<Vec<_>>(),
         }),
     );
-    task.priority = DISPATCH_TASK_PRIORITY;
+    task.priority = dispatch_priority(row);
     task
 }
 
@@ -4179,6 +4201,49 @@ mod tests {
         assert!(task.id.starts_with(DISPATCH_TASK_PREFIX));
         assert_eq!(task.input["task_kind"], DISPATCH_TASK_KIND);
         assert_eq!(task.input["evolution_mode"], "generate_change");
+    }
+
+    /// A stated band lifts the handover by exactly the band's own rank, so the
+    /// order the pass hands rows over in survives into the graph that decides
+    /// what runs next.
+    ///
+    /// Asserted as a ladder rather than as four literals: what has to hold is
+    /// that the rank rises with the band, that the least urgent stated band is
+    /// still above every unstated row, and that a row nobody prioritised keeps
+    /// the floor the previous rule established. Pinning the numbers would pass
+    /// for a mapping that is ordered and wrong about the floor.
+    #[test]
+    fn a_stated_band_lifts_the_handover_the_way_it_orders_the_read() {
+        let with_band = |band: ChangePriority| {
+            let mut handed = row(ChangeState::Pending, Some(1_760_000_000));
+            handed.sources = vec![ChangeSource {
+                doc: "2026-10-21_doc.md".into(),
+                verdict: None,
+                priority: band,
+            }];
+            dispatch_task(&handed, 0).priority
+        };
+        let ladder: Vec<i32> = [
+            ChangePriority::Unstated,
+            ChangePriority::P3,
+            ChangePriority::P2,
+            ChangePriority::P1,
+            ChangePriority::P0,
+        ]
+        .into_iter()
+        .map(with_band)
+        .collect();
+        assert!(
+            ladder.windows(2).all(|pair| pair[0] < pair[1]),
+            "the rank must rise with the band, got {ladder:?}"
+        );
+        let default_rank =
+            Task::new("t", TaskType::Custom("x".into()), serde_json::json!({})).priority;
+        assert_eq!(ladder[0], DISPATCH_TASK_PRIORITY);
+        assert!(
+            ladder[0] < default_rank,
+            "a row nobody prioritised keeps the floor below the default ({default_rank})"
+        );
     }
 
     /// Generation 0 is the identity alone -- the id every handover carried before
