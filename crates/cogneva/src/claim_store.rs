@@ -32,6 +32,7 @@ use axum::Router;
 use cog_core::observability_text::render_raw_metrics;
 use cog_core::{Observable, ShutdownSignal};
 use cog_observability::claim_store::{self, ClaimStoreObservable, Scan};
+use cog_observability::image_store::{self, ImageStoreObservable};
 
 /// Port this mode serves on.
 pub const PORT_ENV: &str = "COGNEVA_CLAIM_STORE_PORT";
@@ -57,17 +58,27 @@ fn parse_port(raw: Option<&str>) -> Option<u16> {
 
 /// The storage root this process reads, from the environment.
 pub fn root_from_env() -> PathBuf {
-    parse_root(std::env::var(claim_store::ROOT_ENV).ok().as_deref())
+    parse_path(
+        std::env::var(claim_store::ROOT_ENV).ok().as_deref(),
+        claim_store::DEFAULT_ROOT,
+    )
 }
 
-/// Pure half of [`root_from_env`]: an unset or blank path is the deployment
-/// saying nothing, not the deployment saying the working directory -- which
-/// would walk whatever the container happens to start in and report its claim
-/// directories as the node's.
-fn parse_root(raw: Option<&str>) -> PathBuf {
+/// The image store root this process reads, from the environment.
+pub fn image_root_from_env() -> PathBuf {
+    parse_path(
+        std::env::var(image_store::ROOT_ENV).ok().as_deref(),
+        image_store::DEFAULT_ROOT,
+    )
+}
+
+/// Pure half of the two roots: an unset or blank path is the deployment saying
+/// nothing, not the deployment saying the working directory -- which would walk
+/// whatever the container happens to start in and report it as the node's.
+fn parse_path(raw: Option<&str>, fallback: &str) -> PathBuf {
     match raw.map(str::trim).filter(|value| !value.is_empty()) {
         Some(path) => PathBuf::from(path),
-        None => PathBuf::from(claim_store::DEFAULT_ROOT),
+        None => PathBuf::from(fallback),
     }
 }
 
@@ -92,15 +103,33 @@ pub fn interval_from_env() -> u64 {
 }
 
 fn parse_interval(raw: Option<&str>) -> u64 {
+    parse_cadence(
+        raw,
+        claim_store::DEFAULT_INTERVAL_SECS,
+        claim_store::MIN_INTERVAL_SECS,
+    )
+}
+
+/// Re-walk cadence of the image store, from the environment and floored.
+pub fn image_interval_from_env() -> u64 {
+    parse_cadence(
+        std::env::var(image_store::INTERVAL_ENV).ok().as_deref(),
+        image_store::DEFAULT_INTERVAL_SECS,
+        image_store::MIN_INTERVAL_SECS,
+    )
+}
+
+fn parse_cadence(raw: Option<&str>, default: u64, floor: u64) -> u64 {
     raw.map(str::trim)
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(claim_store::DEFAULT_INTERVAL_SECS)
-        .max(claim_store::MIN_INTERVAL_SECS)
+        .unwrap_or(default)
+        .max(floor)
 }
 
 #[derive(Clone)]
 struct StoreState {
     observable: Arc<ClaimStoreObservable>,
+    images: Arc<ImageStoreObservable>,
 }
 
 async fn health() -> Response {
@@ -113,13 +142,19 @@ async fn health() -> Response {
 /// The scan runs on its own cadence and this handler renders the last result, so
 /// a scrape does not pay for a walk of everything the node holds.
 async fn metrics(State(state): State<StoreState>) -> Response {
-    let body = match state.observable.collect_metrics("").await {
-        Ok(readings) => render_raw_metrics(&readings),
-        Err(e) => {
-            tracing::warn!(error = %e, "claim store readings unavailable this scrape");
-            String::new()
-        }
-    };
+    // Two walks, one endpoint: both are readings of this node's disk taken by
+    // this same privileged process, and a second listener would be a second
+    // scrape target to keep in the target list for no gain.
+    let mut readings = Vec::new();
+    match state.observable.collect_metrics("").await {
+        Ok(claims) => readings.extend(claims),
+        Err(e) => tracing::warn!(error = %e, "claim readings unavailable this scrape"),
+    }
+    match state.images.collect_metrics("").await {
+        Ok(images) => readings.extend(images),
+        Err(e) => tracing::warn!(error = %e, "image store readings unavailable this scrape"),
+    }
+    let body = render_raw_metrics(&readings);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
@@ -128,12 +163,12 @@ async fn metrics(State(state): State<StoreState>) -> Response {
 }
 
 /// Router over an already-built observable.
-pub fn router(observable: Arc<ClaimStoreObservable>) -> Router {
+pub fn router(observable: Arc<ClaimStoreObservable>, images: Arc<ImageStoreObservable>) -> Router {
     Router::new()
         .route("/health/live", get(health))
         .route("/health/ready", get(health))
         .route("/metrics", get(metrics))
-        .with_state(StoreState { observable })
+        .with_state(StoreState { observable, images })
 }
 
 /// Entry point for the `claim-store` subcommand.
@@ -148,7 +183,9 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let observable = Arc::new(ClaimStoreObservable::new(root_from_env(), node_from_env()));
+    let node = node_from_env();
+    let observable = Arc::new(ClaimStoreObservable::new(root_from_env(), node.clone()));
+    let images = Arc::new(ImageStoreObservable::new(image_root_from_env(), node));
     // One scan before the listener opens: a node whose first scrape carries no
     // claim at all is indistinguishable from a node with no claims, and the
     // process would have to be scraped for a full cadence before it said
@@ -170,17 +207,42 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         ),
     }
 
+    // The image store is walked once before the listener opens for the same
+    // reason: a first scrape with no part in it is indistinguishable from a node
+    // whose store is empty, and the walk that would tell them apart is minutes
+    // away.
+    match images.scan_blocking().await {
+        image_store::Scan::Completed(report) => tracing::info!(
+            root = %images.root().display(),
+            parts = report.parts,
+            readable = report.readable,
+            files = report.files,
+            "image store walked"
+        ),
+        image_store::Scan::RootUnreadable => tracing::error!(
+            env = image_store::ROOT_ENV,
+            root = %images.root().display(),
+            "no image store root readable; this process will serve coverage without any part"
+        ),
+    }
+
+    let shutdown = ShutdownSignal::default();
     tokio::spawn(claim_store::run_claim_store_scan(
         Arc::clone(&observable),
         interval_from_env(),
-        ShutdownSignal::default(),
+        shutdown.clone(),
+    ));
+    tokio::spawn(image_store::run_image_store_scan(
+        Arc::clone(&images),
+        image_interval_from_env(),
+        shutdown,
     ));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port_from_env()));
     tracing::info!(addr = %addr, "claim store listening");
     axum::serve(
         tokio::net::TcpListener::bind(addr).await?,
-        router(observable),
+        router(observable, images),
     )
     .await?;
     Ok(())
@@ -211,6 +273,13 @@ mod tests {
         dir
     }
 
+    fn empty_images() -> Arc<ImageStoreObservable> {
+        Arc::new(ImageStoreObservable::new(
+            scratch("no-images").join("absent"),
+            "node-a",
+        ))
+    }
+
     async fn scrape(app: Router, path: &str) -> (StatusCode, String) {
         let response = app
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -237,15 +306,13 @@ mod tests {
     /// then walk the container's own filesystem and report it as the node's.
     #[test]
     fn a_blank_root_falls_back_to_the_deployment_mount_point() {
+        let storage = claim_store::DEFAULT_ROOT;
         assert_eq!(
-            parse_root(Some("/host/storage")),
+            parse_path(Some("/host/storage"), storage),
             PathBuf::from("/host/storage")
         );
-        assert_eq!(
-            parse_root(Some("  ")),
-            PathBuf::from(claim_store::DEFAULT_ROOT)
-        );
-        assert_eq!(parse_root(None), PathBuf::from(claim_store::DEFAULT_ROOT));
+        assert_eq!(parse_path(Some("  "), storage), PathBuf::from(storage));
+        assert_eq!(parse_path(None, storage), PathBuf::from(storage));
     }
 
     /// A cadence below the floor is the floor, and an unreadable one is the
@@ -282,7 +349,7 @@ mod tests {
 
         let observable = Arc::new(ClaimStoreObservable::new(&root, "node-a"));
         observable.scan();
-        let app = router(observable);
+        let app = router(observable, empty_images());
 
         let (status, body) = scrape(app, "/metrics").await;
         assert_eq!(status, StatusCode::OK);
@@ -305,6 +372,40 @@ mod tests {
         );
     }
 
+    /// One endpoint carries both walks: the claims the node mounts and the image
+    /// store it unpacks into. Two readers of the same disk in one process, so a
+    /// node's account is complete from a single scrape target.
+    #[tokio::test]
+    async fn the_scrape_carries_the_image_store_alongside_the_claims() {
+        let root = scratch("both-faces");
+        let images_root = scratch("both-faces-images");
+        fs::create_dir_all(images_root.join("io.containerd.content.v1.content")).unwrap();
+        fs::write(
+            images_root
+                .join("io.containerd.content.v1.content")
+                .join("blob"),
+            vec![0u8; 2048],
+        )
+        .unwrap();
+
+        let observable = Arc::new(ClaimStoreObservable::new(&root, "node-a"));
+        observable.scan();
+        let images = Arc::new(ImageStoreObservable::new(&images_root, "node-a"));
+        images.scan();
+        let app = router(observable, images);
+
+        let (status, body) = scrape(app, "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        for expected in [
+            "cogneva_claim_scan_dirs{node=\"node-a\"} 0",
+            "cogneva_image_store_parts{node=\"node-a\"} 1",
+            "cogneva_image_store_readable{node=\"node-a\"} 1",
+            "io.containerd.content.v1.content",
+        ] {
+            assert!(body.contains(expected), "{expected} missing from:\n{body}");
+        }
+    }
+
     /// An unreadable root still leaves a live endpoint: the service is not taken
     /// out of the target list over a missing reading, and what it must not answer
     /// with is silence about itself -- the coverage series is there so a node the
@@ -312,7 +413,10 @@ mod tests {
     #[tokio::test]
     async fn an_unmounted_root_serves_a_live_endpoint_that_says_it_saw_nothing() {
         let missing = scratch("unmounted").join("not-a-storage-root");
-        let app = router(Arc::new(ClaimStoreObservable::new(missing, "node-a")));
+        let app = router(
+            Arc::new(ClaimStoreObservable::new(missing, "node-a")),
+            empty_images(),
+        );
         for path in ["/health/live", "/health/ready"] {
             let (status, _) = scrape(app.clone(), path).await;
             assert_eq!(status, StatusCode::OK, "{path}");

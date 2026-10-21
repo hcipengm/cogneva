@@ -10,6 +10,12 @@
 # per-volume 用量又是节点文件系统本身（实测 12 个 claim 报同一个 ~600GB），所以
 # 这一族卷此前是账上的空白：不参与「用量 ÷ 声明量」的比较，也没有任何规则读得到。
 #
+# 第二个读数是镜像库：`cogneva_image_store_bytes{part,node}`，按 containerd 根下的
+# 一级条目分片发布。镜像解出来的层不在任何卷里，kubelet 因此报不出来（它不是卷），
+# 运行时自己的镜像清单又只给压缩后的大小、且不重复计共享层——只有走查目录得到的是
+# 这台盘上真实的字节数（本机实测 60.5 GB，占根 6%）。它和卷账共用一个进程：同一份
+# 特权、同一块盘、同一个抓取端点，另起一个容器只会把同样的 root 再发一次。
+#
 # 与 host-ledger 分成两个 DaemonSet 而不是同一个 Pod 里的两个容器：两者需要的权限
 # 不同。宿主 cgroup 的 memory.stat 是 0444，非特权用户就能读；存储根是 0700 root，
 # 非 root 连列目录都做不到，所以这个容器必须跑成 uid 0。合成一个 Pod 会让读 cgroup
@@ -68,6 +74,13 @@ spec:
             # 个数一起读（见 values 里这个键上方的注解）。
             - name: COGNEVA_CLAIM_SCAN_INTERVAL_SECS
               value: "300"
+            # 镜像库是同一份账的另一格：镜像解出来的层不在任何卷里，kubelet 看不见，
+            # 而它花的正是这台节点的盘。走查它和走查存储根是同一件事——读一台机器上
+            # root 本来就读得到的目录——所以留在同一个进程里，不另起特权容器。
+            - name: COGNEVA_IMAGE_STORE_ROOT
+              value: "/host/containerd"
+            - name: COGNEVA_IMAGE_SCAN_INTERVAL_SECS
+              value: "900"
             # 节点名从 fieldRef 取 spec.nodeName，由产出方自己盖成样本上的 `node`
             # 标签：抓取方给 DaemonSet 目标打的是 instance=<PodIP>，重建即变、且与
             # 任何别处携带的节点名对不上，判词就只能写成按节点分组而无从分组。
@@ -118,12 +131,19 @@ spec:
               mountPath: "/host/storage"
               # 只读：读数不需要写权，挂成只读让「量一下」这件事不可能改到节点上的卷。
               readOnly: true
+            - name: image-store-root
+              mountPath: "/host/containerd"
+              readOnly: true
       volumes:
         - name: storage-root
           hostPath:
             path: "/var/lib/rancher/k3s/storage"
             # Directory 而不是 DirectoryOrCreate：目录不存在说明这台节点的存储布局
             # 不是我们认识的，造一个空目录只会把「配置错了」变成「干净的空账本」。
+            type: Directory
+        - name: image-store-root
+          hostPath:
+            path: "/var/lib/rancher/k3s/agent/containerd"
             type: Directory
       tolerations:
         - operator: Exists

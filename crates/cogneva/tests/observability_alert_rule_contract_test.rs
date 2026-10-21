@@ -73,6 +73,22 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-observability/src/claim_store.rs",
     ),
     (
+        "cogneva_image_store_age_seconds",
+        "crates/cog-observability/src/image_store.rs",
+    ),
+    (
+        "cogneva_image_store_bytes",
+        "crates/cog-observability/src/image_store.rs",
+    ),
+    (
+        "cogneva_image_store_parts",
+        "crates/cog-observability/src/image_store.rs",
+    ),
+    (
+        "cogneva_image_store_readable",
+        "crates/cog-observability/src/image_store.rs",
+    ),
+    (
         "cogneva_aof_repair_dropped_bytes",
         "crates/cogneva/src/aof_repair.rs",
     ),
@@ -3418,6 +3434,22 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_alert_channels_configured",
         Unread::Gap("which outlets this deployment can deliver an alert through. Two kinds of row with opposite polarity, told apart by `state`: `state=\"configured\"` rows name one outlet each in `channel` at 1, and no such row is written when there is no outlet -- a placeholder name would read as a kind that exists and is switched off -- and one `state=\"verdict\"` row carries no `channel` but the `readout` name the communication face owes, at 1 when there is no outlet at all and 0 when there is at least one -- written in both directions, since the configured rows exist only when there is an outlet and so could never say there is none. The in-app alert surface counts as an outlet: it has no address, so nothing about it can be misconfigured, and the WebUI reads the same rows the external channels would carry. A reader must select one kind by `state` before aggregating; summing the family answers yes either way. Every value is a constant per process, so a reader takes one series rather than adding the copies. It is filed rather than given a threshold because every cell is the configuration itself: 1 is the ordinary state of a deployment with an outlet and 0 the ordinary state of one without, so neither number is a condition that turns into a fault at some level. What makes a deployment without an outlet wrong is a decision about that deployment, not something this series can bound"),
     ),
+    // The change account's census by face landed with its producer and without
+    // a reader, and the reason is the same one the two entries above give: what
+    // it counts is a population, and no policy states how large an owed
+    // remainder is a fault. The reading that could be bounded on its own is
+    // `oldest_unmeasured_seconds`, and bounding it needs the same missing
+    // decision -- a change owed for a day is a queue, a change owed for a month
+    // on a face that also retired nothing is the face having stopped, and where
+    // between those two a page belongs is the face owners' call. Filing it keeps
+    // the producer's own discipline visible: every face writes every reading on
+    // every pass precisely so a face the census never reports can be told from
+    // one that finished, and that distinction is only worth the writes once
+    // something reads it.
+    (
+        "cogneva_change_block_census",
+        Unread::Gap("the change account counted by the face of the programme its declaring documents name, and by reading: `landed`, `owed`, `retired` and `oldest_unmeasured_seconds`, over a closed set of blocks that includes `none` for rows no document filed. The three counts are the whole population of a face, which is what lets a face that retired its work be told from one that finished; every face is written on every pass, including ones that owe nothing, so a head missing from the census is a head that stopped being counted rather than one with nothing to say. It has no rule because nothing in the deployment declares how much owed work on one face, or how old its longest-unmeasured row, is a fault -- the count says the population and not the state, and the one reading here with a natural direction, `oldest_unmeasured_seconds`, needs the same undecided bound. The reader owed is a panel over the census by block and reading, which states the comparison without inventing a threshold"),
+    ),
     // The account has counted refusals per principle since the gates first
     // reported them, and the platform surface published none of it: the only
     // reader was a host script querying the database and writing a TSV, which
@@ -3650,7 +3682,13 @@ const UNREAD: &[(&str, Unread)] = &[
 /// order the write-window record used, and for the same reason: a series that
 /// waits for its threshold is a series nobody can watch while the threshold is
 /// being argued about.
-const GAPS_AT_CENSUS: usize = 29;
+///
+/// It went to 30 in the pass that published the change account's census by
+/// face. Same shape as the entries above it: the producer counts a population
+/// that was always in the rows but only ever in prose, and the bound that would
+/// turn any of its cells into a fault is a policy about how much owed work is
+/// normal, which nobody has stated. The panel is the reader it owes.
+const GAPS_AT_CENSUS: usize = 30;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

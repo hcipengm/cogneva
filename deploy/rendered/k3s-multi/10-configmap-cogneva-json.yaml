@@ -808,6 +808,33 @@ data:
               "summary": "{value} measured volume(s) exist on disk with no claim behind them: a deleted PVC whose directory the reclaim policy kept, holding bytes that no object in the cluster accounts for and that nothing will ever clean up on its own. The disk is the node's, so this is space the quota does not know is spent. The label pair names the namespace and claim the directory was created for"
             },
             {
+              "name": "image_store_bytes_high",
+              "promql": "max by (node) (sum by (node) (cogneva_image_store_bytes)) / on(node) max by (node) (kube_node_status_capacity{resource=\"ephemeral_storage\",unit=\"byte\"})",
+              "condition": {
+                "greater_than": 0.2
+              },
+              "severity": "warning",
+              "summary": "The container image store on {node} holds {value} of the node's disk: unpacked image layers, container layers and containerd's own log, none of which belongs to a volume, so no claim reading and no quota sees it. The producer walks the store and sums what each top-level part holds; the kubelet cannot report it because it is not a volume, and the runtime's own image listing reports compressed sizes and nothing for layers shared between images. This node measured 0.06 of a 1.0 TB root when the bound was set, so 0.20 is the store alone accounting for a third of what the disk has spent -- read it before node_disk_usage_high (0.75) fires, because the two have opposite remedies: this one is reclaimed by image garbage collection or a shorter retention in whatever builds the images, and deleting a claim frees nothing here. Which part is growing is the label on cogneva_image_store_bytes, and a store whose parts move while the total is flat is a deploy churn rather than a leak. Nothing writes {value} back down directly: the next walk after a collection does, and the store's age beside it says whether that walk is still running"
+            },
+            {
+              "name": "image_store_scan_stale",
+              "promql": "max by (node) (cogneva_image_store_age_seconds)",
+              "condition": {
+                "greater_than": 2700.0
+              },
+              "severity": "warning",
+              "summary": "The image store walker on {node} last completed a walk {value}s ago, past three of its 900s cadences: what it publishes is a snapshot nobody refreshed, which reads exactly like a store that stopped growing. The age counts from process start before the first walk, so a walker that never completed one is on this alert rather than silent. This is also how an unreadable store shows up: a root that cannot be listed keeps the last sizes and stops refreshing the age, and the coverage series beside it (parts and readable both at zero) is a number to read, not a condition anything fires on"
+            },
+            {
+              "name": "image_store_incomplete",
+              "promql": "max by (node) (cogneva_image_store_parts - cogneva_image_store_readable)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The image store walker on {node} found {value} part(s) it could not walk: the directory is there and its bytes are not in the account, so the part keeps its last size and reads as unchanged rather than as growing. The usual causes are ownership (a store directory moved to another uid than the one the walker runs as) and a part that is a broken mount. parts and readable are published together for this sum; a root with no entries reports zero of both, which is the unreadable-root case and is on image_store_scan_stale instead"
+            },
+            {
               "name": "claim_scan_stale",
               "promql": "max by (node) (cogneva_claim_scan_age_seconds)",
               "condition": {
@@ -824,6 +851,15 @@ data:
               },
               "severity": "warning",
               "summary": "The claim scanner on {node} found {value} claim director(ies) it could not walk: the directory is there and its bytes are not in the account, so those claims read as unmeasured rather than as empty. The usual cause is ownership -- the storage root is root-only and a directory inside it moved to another owner. scan_dirs and scan_readable are published together for this sum; a node with no claim directories at all reports zero of both and is not what this fires on"
+            },
+            {
+              "name": "claim_store_node_unreported",
+              "promql": "count by (node) (kube_node_info) unless on (node) count by (node) (cogneva_claim_scan_dirs)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "{value} node(s) have no claim-store process reporting: the DaemonSet pod is missing on those nodes, so nothing walks the storage root or the image store there. This is the third cell of the account -- every rule over a scan reading goes absent with the scan, and an absent series is how every other rule in this group reports nothing wrong. The pod is a normal pod in the namespace and is subject to its pod quota, so a full quota leaves a new node silently without an account while the node itself is healthy and schedulable"
             },
             {
               "name": "volume_capacity_clamped_by_admission",
@@ -978,7 +1014,6 @@ data:
               "severity": "warning",
               "summary": "On {manifest}, {value} line(s) of a delivered observability manifest have differed from the live stack at every scrape for 30m: the convergence loop compares each file against the cluster before it applies anything, and re-applies whatever differs, so a difference still standing after half an hour means the re-apply is not landing -- the cluster keeps a version of {object} the repository no longer has, and every alert rule, scrape target and dashboard that file declares is served off the stale copy instead of off the declaration. The count is the differing lines of that file's own diff, so it says how far apart the two sides are rather than merely that they disagree. The loop's own verdict says why the apply is not landing"
             },
-    
             {
               "name": "orphans_unreaped",
               "promql": "(min_over_time(cogneva_process_zombies[30m]) > 0) and (count_over_time(cogneva_process_zombies[1h]) > count_over_time(cogneva_process_zombies[30m]))",
@@ -1591,7 +1626,7 @@ data:
               "severity": "warning",
               "summary": "The pool is thinning without being empty: {value} upstream(s) are measured as serving while at least one other measured upstream is not. The number reported is the serving side, which is the reading a pool that loses members one at a time produces -- the pool's own down event fires only when the last one goes, and by then capacity has been zero for however long the approach took, so the approach itself had no reader. Only upstreams this gateway has measured are counted: a configured entry that has never been touched publishes no health series at all, so a pool of many where only a few have been asked reads as those few here and this rule says nothing about the rest. The count and the sum are taken over the whole fleet rather than per reporter for the same reason the series is a verdict: it is republished by every gateway pod, and a reading that kept the reporting pod would re-announce a standing thinning as a fresh alert on each rollout. Read it beside the per-upstream verdict rules, which say why a member left the serving side, and beside `llm_upstream_pool_down`, the pool's own down event, which says the serving side reached zero."
             },
-                    {
+            {
               "name": "llm_pool_open_but_idle",
               "promql": "((max(llm_pool_allowance_tokens and ((time() - llm_pool_allowance_tokens_observed_timestamp_seconds) < 1800)) - max(llm_pool_spent_tokens and ((time() - llm_pool_spent_tokens_observed_timestamp_seconds) < 1800)) - max(llm_pool_reserve_tokens and ((time() - llm_pool_reserve_tokens_observed_timestamp_seconds) < 1800))) >= 0) and on () (max(llm_pool_paced_upstreams and ((time() - llm_pool_paced_upstreams_observed_timestamp_seconds) < 1800)) > 0) and on () (max(cogneva_ready_admission_readings{kind=\"ready\"} and ((time() - cogneva_ready_admission_readings_observed_timestamp_seconds{kind=\"ready\"}) < 1800)) > 0) and on () (sum(changes(llm_usage_readings_total{outcome=~\"read|absent|not_asked\"}[1h])) == 0)",
               "condition": {
@@ -2078,139 +2113,139 @@ data:
               "summary": "The mainline deployer's poll loop returned an error on {value} rounds in the last hour and not one round finished: the loop is waking on its period and doing nothing with it. Nothing else on the face says this. The loop's own liveness reading is stamped at the top of the tick, before the body runs, so it stays near the period through any run of failures; and every reading the body publishes -- the version contract, the CI verdict, the supersession pair -- is written ahead of the step that can fail, so a round that dies at the publish leaves them all advancing as if it had arrived. Measured on 2026-10-08: the publish step refused the manifest bundle on every round for two hours and a quarter, because the object had outgrown the size a client-side apply can carry, and the only trace was a warn log line that the next rollout would have deleted with the pod. The hour is the round's own declared period six times over (this deployment polls every 600s, and the longest gap between rounds the series has shown outside that known wedge is 804s), which also covers the rounds that carry a landing and spend part of their length building. The failure side has to have moved, so this cannot fire on idleness: a loop with nothing to do is a loop whose rounds finish, and a loop that has stopped moving at all moves neither cell -- the tick age is the reading that names it. The count is taken once for the fleet rather than per pod: this counter is exposed by two workloads that run in step, so the two halves are reduced before they are paired. The unless is not stylistic. The ok cell is written only when a round finishes and is never seeded, so on a deployer whose rounds have all failed since the counter began the right side is an empty vector; a plain == 0 would be empty there too and the rule would go quiet in exactly the case it exists for, while unless reads the absence as the answer. Both halves are cumulative totals the shared store holds and re-serves, so every process reads the same numbers and a deployer restart neither resets them nor bills the window twice -- measured, both deployer workloads report the same total for the sibling counters within seconds of a restart, and that total is larger than the time since the restart could have produced."
             },
             {
-                "name": "baseline_port_tick_failing_every_round",
-                "promql": "((min_over_time(((max without (pod, container, instance, job) (baseline_port_tick_failed)) and ((time() - (max without (pod, container, instance, job) (baseline_port_tick_failed_observed_timestamp_seconds))) < 10800))[2h:1m]) == 1) and (count_over_time((max without (pod, container, instance, job) (baseline_port_tick_failed))[4h:1m]) > count_over_time((max without (pod, container, instance, job) (baseline_port_tick_failed))[2h:1m])))",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "The baseline port trigger failed every round it ran in the last two hours ({value} being the most any one process reported), so in that stretch nothing was carried from this instance's promoted changes onto a new upstream release. The reading is a 0-or-1 gauge written once per round -- 1 for a round that returned an error, 0 for one that finished, and a round with nothing to port is the ordinary 0 -- so the window minimum is what says every round: the minimum is 1 only when not one sample in the window agreed. The failure itself used to be a log line that dies with the pod, and the loop's beat is stamped at the top of the tick whether or not the tick returned, so a trigger that could not reach its repository and an instance with nothing to port were the same picture on every series. Two hours is two of this loop's own rounds: the tick runs every `baseline_port.poll_interval_secs`, and the value a deployment actually runs is published on the loop's own cadence series, `cogneva_loop_period_seconds`, under the label `loop=baseline_port` -- the loop floors the interval at 60s, but the floor is not the default, and the shipped config carries no baseline_port section, so the default (3600) is what runs. The window is two rounds rather than the six its siblings use because the coverage conjunct at the end of this expression has to be satisfiable: it needs a series that predates the window, and this loop runs in a pod the deployer replaces, so a six-round window is longer than the series it reads and the rule would never fire at all. Two rounds is still deliberately longer than one, because the fault this names is the trigger being stuck rather than one round that hit a transient -- revisit the window, the freshness bound and the coverage pair together if that interval is moved far from its default. The gauge carries no labels of its own, so the reduction answers once for the fleet, and the max makes the rule fire when any one process spent the whole window failing rather than when all of them did; one instance that never ports is a fault for that instance even while the others are healthy. Two conjuncts carry the rest of the claim. The series is a store-served gauge, so the minimum is taken over the stored samples whose writer was still writing ((time() - baseline_port_tick_failed_observed_timestamp_seconds) < 10800, three rounds wide) -- without that a writer that stopped would leave its last value standing and the rule would stay lit with nothing left to clear it. And the window has to have been observed at all (the count over 4h exceeding the count over 2h), or a freshly started process would satisfy a two-hour claim with its first scrape. Read the loop's liveness reading beside this one: background_loop_stalled fires when the trigger has stopped ticking at all, while this fires when it is still ticking on its period and every tick comes back an error, and the two want different repairs."
+              "name": "baseline_port_tick_failing_every_round",
+              "promql": "((min_over_time(((max without (pod, container, instance, job) (baseline_port_tick_failed)) and ((time() - (max without (pod, container, instance, job) (baseline_port_tick_failed_observed_timestamp_seconds))) < 10800))[2h:1m]) == 1) and (count_over_time((max without (pod, container, instance, job) (baseline_port_tick_failed))[4h:1m]) > count_over_time((max without (pod, container, instance, job) (baseline_port_tick_failed))[2h:1m])))",
+              "condition": {
+                "greater_than": 0.0
               },
+              "severity": "warning",
+              "summary": "The baseline port trigger failed every round it ran in the last two hours ({value} being the most any one process reported), so in that stretch nothing was carried from this instance's promoted changes onto a new upstream release. The reading is a 0-or-1 gauge written once per round -- 1 for a round that returned an error, 0 for one that finished, and a round with nothing to port is the ordinary 0 -- so the window minimum is what says every round: the minimum is 1 only when not one sample in the window agreed. The failure itself used to be a log line that dies with the pod, and the loop's beat is stamped at the top of the tick whether or not the tick returned, so a trigger that could not reach its repository and an instance with nothing to port were the same picture on every series. Two hours is two of this loop's own rounds: the tick runs every `baseline_port.poll_interval_secs`, and the value a deployment actually runs is published on the loop's own cadence series, `cogneva_loop_period_seconds`, under the label `loop=baseline_port` -- the loop floors the interval at 60s, but the floor is not the default, and the shipped config carries no baseline_port section, so the default (3600) is what runs. The window is two rounds rather than the six its siblings use because the coverage conjunct at the end of this expression has to be satisfiable: it needs a series that predates the window, and this loop runs in a pod the deployer replaces, so a six-round window is longer than the series it reads and the rule would never fire at all. Two rounds is still deliberately longer than one, because the fault this names is the trigger being stuck rather than one round that hit a transient -- revisit the window, the freshness bound and the coverage pair together if that interval is moved far from its default. The gauge carries no labels of its own, so the reduction answers once for the fleet, and the max makes the rule fire when any one process spent the whole window failing rather than when all of them did; one instance that never ports is a fault for that instance even while the others are healthy. Two conjuncts carry the rest of the claim. The series is a store-served gauge, so the minimum is taken over the stored samples whose writer was still writing ((time() - baseline_port_tick_failed_observed_timestamp_seconds) < 10800, three rounds wide) -- without that a writer that stopped would leave its last value standing and the rule would stay lit with nothing left to clear it. And the window has to have been observed at all (the count over 4h exceeding the count over 2h), or a freshly started process would satisfy a two-hour claim with its first scrape. Read the loop's liveness reading beside this one: background_loop_stalled fires when the trigger has stopped ticking at all, while this fires when it is still ticking on its period and every tick comes back an error, and the two want different repairs."
+            },
             {
-                "name": "partition_maintenance_round_came_up_short",
-                "promql": "max without (pod, container, instance, job) (increase(cogneva_partition_maintenance_failures_total[1h])) > 0",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "A monthly partition maintenance round came up short in the last hour ({value} step(s) summed over the rounds that window holds), and the alert says which way: the cause stays in the identity rather than being collapsed into one number, because the four causes want different repairs. A refused CREATE (default_partition_missing, month_partition_missing) is a table whose window did not open, so rows for that month have nowhere to land; default_backlog_unreadable is our own count failing, which leaves whether rows are parked in DEFAULT unknown rather than known to be zero; and window_behind is that count coming back non-zero, which means rows already sit outside every open range and will keep accumulating. This is deliberately not the all-failed shape its siblings in the loop-outcome family use, and it cannot be: this counter has no healthy cell. It is stamped only when a step comes up short -- the closed set of causes is declared in the producing module, so an absent cell is a zero -- and a rule written as failed against not-failed would have nothing to pair. The honest bound is therefore one of the loop's own periods, this round running hourly with partition_maintenance_interval_secs defaulting to 3600, which asks the question a per-round reading can answer: did the round that just ran come up short. The hour is also what clears it: a shortfall stops being counted when the window it fell in passes behind us, so a one-off clears itself within one round and a round that keeps coming up short keeps this fired. Read the loop's liveness reading beside it -- background_loop_stalled fires when the round has stopped running, while this fires when it is still running and failing -- and read a refused CREATE (a schema or privilege problem in the store) apart from an unreadable count (a connection problem on our side) apart from rows parked in DEFAULT (data that has already fallen outside the window and needs moving)."
+              "name": "partition_maintenance_round_came_up_short",
+              "promql": "max without (pod, container, instance, job) (increase(cogneva_partition_maintenance_failures_total[1h])) > 0",
+              "condition": {
+                "greater_than": 0.0
               },
+              "severity": "warning",
+              "summary": "A monthly partition maintenance round came up short in the last hour ({value} step(s) summed over the rounds that window holds), and the alert says which way: the cause stays in the identity rather than being collapsed into one number, because the four causes want different repairs. A refused CREATE (default_partition_missing, month_partition_missing) is a table whose window did not open, so rows for that month have nowhere to land; default_backlog_unreadable is our own count failing, which leaves whether rows are parked in DEFAULT unknown rather than known to be zero; and window_behind is that count coming back non-zero, which means rows already sit outside every open range and will keep accumulating. This is deliberately not the all-failed shape its siblings in the loop-outcome family use, and it cannot be: this counter has no healthy cell. It is stamped only when a step comes up short -- the closed set of causes is declared in the producing module, so an absent cell is a zero -- and a rule written as failed against not-failed would have nothing to pair. The honest bound is therefore one of the loop's own periods, this round running hourly with partition_maintenance_interval_secs defaulting to 3600, which asks the question a per-round reading can answer: did the round that just ran come up short. The hour is also what clears it: a shortfall stops being counted when the window it fell in passes behind us, so a one-off clears itself within one round and a round that keeps coming up short keeps this fired. Read the loop's liveness reading beside it -- background_loop_stalled fires when the round has stopped running, while this fires when it is still running and failing -- and read a refused CREATE (a schema or privilege problem in the store) apart from an unreadable count (a connection problem on our side) apart from rows parked in DEFAULT (data that has already fallen outside the window and needs moving)."
+            },
             {
-                "name": "policy_evolution_rounds_all_failed",
-                "promql": "(max without (pod, container, instance, job) (increase(cogneva_policy_evolution_rounds_total{outcome=\"failed\"}[6h])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_policy_evolution_rounds_total{outcome!=\"failed\"}[6h])) > 0)",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "The artifact-level evolution search ran for six hours and every round it finished ended in an error ({value} being the most any single process reported). Each round lands exactly one cell of a closed set -- adopted, no_improvement, insufficient_evidence, failed -- so the failed cell rising against a flat rest is a search that is awake and doing nothing with its wakeups; the loop's beat is stamped every cycle whether or not the round produced anything, so the beat alone could never say which end was reached, and the ends used to be a log line that dies with the pod. The shape is all-failed rather than some-failed: any round that reached one of the three other ends puts a series on the right side and clears the rule, so a search that fails a round and then learns something does not page. Six hours is six of this loop's default cycles (interval_secs defaults to 3600, and the loop will not run faster than 60), and it is deliberately longer than one cycle because the fault this names is the search path being down rather than one round that hit an error -- revisit the window if that interval is moved far from its default. What this rule deliberately does not read is a flat adopted cell. A cycle that finds nothing better to adopt is the search working, and no bound is declared for how often the search ought to learn, so none is invented here: adopted rising against a rising insufficient_evidence says the search is awake with nothing to learn from, which is a different fact from a failure and wants a different repair, and the three non-failed cells are all beside this rule for a reader to take apart. The scrape labels are removed, so one series answers for the fleet rather than one per pod."
+              "name": "policy_evolution_rounds_all_failed",
+              "promql": "(max without (pod, container, instance, job) (increase(cogneva_policy_evolution_rounds_total{outcome=\"failed\"}[6h])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_policy_evolution_rounds_total{outcome!=\"failed\"}[6h])) > 0)",
+              "condition": {
+                "greater_than": 0.0
               },
+              "severity": "warning",
+              "summary": "The artifact-level evolution search ran for six hours and every round it finished ended in an error ({value} being the most any single process reported). Each round lands exactly one cell of a closed set -- adopted, no_improvement, insufficient_evidence, failed -- so the failed cell rising against a flat rest is a search that is awake and doing nothing with its wakeups; the loop's beat is stamped every cycle whether or not the round produced anything, so the beat alone could never say which end was reached, and the ends used to be a log line that dies with the pod. The shape is all-failed rather than some-failed: any round that reached one of the three other ends puts a series on the right side and clears the rule, so a search that fails a round and then learns something does not page. Six hours is six of this loop's default cycles (interval_secs defaults to 3600, and the loop will not run faster than 60), and it is deliberately longer than one cycle because the fault this names is the search path being down rather than one round that hit an error -- revisit the window if that interval is moved far from its default. What this rule deliberately does not read is a flat adopted cell. A cycle that finds nothing better to adopt is the search working, and no bound is declared for how often the search ought to learn, so none is invented here: adopted rising against a rising insufficient_evidence says the search is awake with nothing to learn from, which is a different fact from a failure and wants a different repair, and the three non-failed cells are all beside this rule for a reader to take apart. The scrape labels are removed, so one series answers for the fleet rather than one per pod."
+            },
             {
-                "name": "analytics_flush_batches_all_failed",
-                "promql": "(max without (pod, container, instance, job) (increase(cogneva_analytics_flush_total{outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_analytics_flush_total{outcome!=\"failed\"}[5m])) > 0)",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "Five minutes passed with the analytics event buffer losing batches and not one reaching ClickHouse ({value} being the most any single process reported). A failed flush is a loss rather than a retry: the flush consumes the batch, so those entries are gone and nothing sends them again, and their only other trace was a log line that dies with the pod. The cell value is how many entries the batch carried rather than a batch count, so the size of what was dropped sits in the series beside the verdict; this rule names the path being down, and it is not a bound on how many lost entries are tolerable -- none are, but a single lost batch is not what a page is for. Both triggers, the batch-size one and the interval one, go through the same flush, so one series covers the whole path, and the loop writes a cell only when there is a batch waiting: an idle buffer writes neither cell, which is why the all-failed pairing says what it means here. The shape is the loop-outcome family's: one delivered batch anywhere in the window clears the rule, so a ClickHouse that blips and recovers does not page. Five minutes is where this file's shortest window sits, and it is thirty of this loop's own rounds (the analytics buffer flushes on a 10s interval), because six of its periods would be below that floor and a shorter range is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. A deployment with no ClickHouse endpoint configured runs no flusher at all -- clickhouse.enabled defaults to false -- so this rule is silent there rather than falsely green. The scrape labels are removed, so one series answers for the fleet."
+              "name": "analytics_flush_batches_all_failed",
+              "promql": "(max without (pod, container, instance, job) (increase(cogneva_analytics_flush_total{outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_analytics_flush_total{outcome!=\"failed\"}[5m])) > 0)",
+              "condition": {
+                "greater_than": 0.0
               },
+              "severity": "warning",
+              "summary": "Five minutes passed with the analytics event buffer losing batches and not one reaching ClickHouse ({value} being the most any single process reported). A failed flush is a loss rather than a retry: the flush consumes the batch, so those entries are gone and nothing sends them again, and their only other trace was a log line that dies with the pod. The cell value is how many entries the batch carried rather than a batch count, so the size of what was dropped sits in the series beside the verdict; this rule names the path being down, and it is not a bound on how many lost entries are tolerable -- none are, but a single lost batch is not what a page is for. Both triggers, the batch-size one and the interval one, go through the same flush, so one series covers the whole path, and the loop writes a cell only when there is a batch waiting: an idle buffer writes neither cell, which is why the all-failed pairing says what it means here. The shape is the loop-outcome family's: one delivered batch anywhere in the window clears the rule, so a ClickHouse that blips and recovers does not page. Five minutes is where this file's shortest window sits, and it is thirty of this loop's own rounds (the analytics buffer flushes on a 10s interval), because six of its periods would be below that floor and a shorter range is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. A deployment with no ClickHouse endpoint configured runs no flusher at all -- clickhouse.enabled defaults to false -- so this rule is silent there rather than falsely green. The scrape labels are removed, so one series answers for the fleet."
+            },
             {
-                "name": "loki_flush_batches_all_failed",
-                "promql": "(max without (pod, container, instance, job) (increase(cogneva_loki_flush_total{outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_loki_flush_total{outcome!=\"failed\"}[5m])) > 0)",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "Five minutes passed with the Loki background pusher losing batches and not one reaching Loki ({value} being the most any single process reported). A failed push is a loss rather than a retry: the push consumes the batch, so those entries are gone and nothing sends them again, and their only other trace was a log line that dies with the pod. The cell value is how many entries the batch carried rather than a batch count, so the size of what was dropped sits in the series beside the verdict; this rule names the path being down, and it is not a bound on how many lost entries are tolerable -- none are, but a single lost batch is not what a page is for. Both triggers, the batch-size one and the interval one, go through the same push, so one series covers the whole path, and the loop writes a cell only when there is a batch waiting: an idle buffer writes neither cell, which is why the all-failed pairing says what it means here. The shape is the loop-outcome family's: one delivered batch anywhere in the window clears the rule, so a Loki that blips and recovers does not page. Five minutes is where this file's shortest window sits, and it is sixty of this loop's own rounds (the pusher flushes on a 5s interval), because six of its periods would be below that floor and a shorter range is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. A deployment with no Loki endpoint configured runs no pusher at all -- loki.enabled defaults to false -- so this rule is silent there rather than falsely green. The scrape labels are removed, so one series answers for the fleet."
+              "name": "loki_flush_batches_all_failed",
+              "promql": "(max without (pod, container, instance, job) (increase(cogneva_loki_flush_total{outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_loki_flush_total{outcome!=\"failed\"}[5m])) > 0)",
+              "condition": {
+                "greater_than": 0.0
               },
+              "severity": "warning",
+              "summary": "Five minutes passed with the Loki background pusher losing batches and not one reaching Loki ({value} being the most any single process reported). A failed push is a loss rather than a retry: the push consumes the batch, so those entries are gone and nothing sends them again, and their only other trace was a log line that dies with the pod. The cell value is how many entries the batch carried rather than a batch count, so the size of what was dropped sits in the series beside the verdict; this rule names the path being down, and it is not a bound on how many lost entries are tolerable -- none are, but a single lost batch is not what a page is for. Both triggers, the batch-size one and the interval one, go through the same push, so one series covers the whole path, and the loop writes a cell only when there is a batch waiting: an idle buffer writes neither cell, which is why the all-failed pairing says what it means here. The shape is the loop-outcome family's: one delivered batch anywhere in the window clears the rule, so a Loki that blips and recovers does not page. Five minutes is where this file's shortest window sits, and it is sixty of this loop's own rounds (the pusher flushes on a 5s interval), because six of its periods would be below that floor and a shorter range is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. A deployment with no Loki endpoint configured runs no pusher at all -- loki.enabled defaults to false -- so this rule is silent there rather than falsely green. The scrape labels are removed, so one series answers for the fleet."
+            },
             {
-                "name": "memory_schema_repair_passes_all_failed",
-                "promql": "(max without (pod, container, instance, job) (increase(cogneva_memory_schema_repair_total{outcome=\"failed\"}[1h])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_memory_schema_repair_total{outcome!=\"failed\"}[1h])) > 0)",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "The memory schema repair loop returned an error on every pass it made in the last hour ({value} being the most any single process reported), so the repair path itself is down. This is the loop that exists to make a silent loss visible -- an archived entry whose derived layer never landed is unreachable by search and nothing reports it, since the test for whether it was written is whether the derived layer is there -- so its own failure being silent was the same shape one level up. Passes land one cell of a closed set (repaired, clean, unrepairable, failed) and the beat is stamped every repair interval whether or not anything was repaired, so a pass that failed and a store with nothing to repair used to look alike on every series. The shape is all-failed rather than some-failed: a pass that ended repaired, clean or unrepairable puts a series on the right side and clears the rule, so an error that heals itself does not page. One hour is six of this loop's default passes (schema_repair_interval_secs defaults to 600), and it is deliberately longer than one pass because the fault this names is the repair path being down rather than one pass that hit a transient -- revisit the window if that interval is moved far from its default. The unrepairable cell is deliberately not the failure this rule reads: a pass that found orphans it could not type means the loop is running and the data is beyond it, and the right side here counts such a pass as a pass. That cell has its own rule, memory_schema_orphans_unrepairable, because the two want different repairs and pairing them would read a run of unrepairable rounds as a healthy loop. Read the loop's liveness reading beside this one -- background_loop_stalled fires when the loop has stopped beating, while this fires while it is beating and failing -- and note that a deployment setting schema_repair_interval_secs to 0 runs no repair loop at all, which is the declared way to turn it off rather than a fault."
+              "name": "memory_schema_repair_passes_all_failed",
+              "promql": "(max without (pod, container, instance, job) (increase(cogneva_memory_schema_repair_total{outcome=\"failed\"}[1h])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_memory_schema_repair_total{outcome!=\"failed\"}[1h])) > 0)",
+              "condition": {
+                "greater_than": 0.0
               },
+              "severity": "warning",
+              "summary": "The memory schema repair loop returned an error on every pass it made in the last hour ({value} being the most any single process reported), so the repair path itself is down. This is the loop that exists to make a silent loss visible -- an archived entry whose derived layer never landed is unreachable by search and nothing reports it, since the test for whether it was written is whether the derived layer is there -- so its own failure being silent was the same shape one level up. Passes land one cell of a closed set (repaired, clean, unrepairable, failed) and the beat is stamped every repair interval whether or not anything was repaired, so a pass that failed and a store with nothing to repair used to look alike on every series. The shape is all-failed rather than some-failed: a pass that ended repaired, clean or unrepairable puts a series on the right side and clears the rule, so an error that heals itself does not page. One hour is six of this loop's default passes (schema_repair_interval_secs defaults to 600), and it is deliberately longer than one pass because the fault this names is the repair path being down rather than one pass that hit a transient -- revisit the window if that interval is moved far from its default. The unrepairable cell is deliberately not the failure this rule reads: a pass that found orphans it could not type means the loop is running and the data is beyond it, and the right side here counts such a pass as a pass. That cell has its own rule, memory_schema_orphans_unrepairable, because the two want different repairs and pairing them would read a run of unrepairable rounds as a healthy loop. Read the loop's liveness reading beside this one -- background_loop_stalled fires when the loop has stopped beating, while this fires while it is beating and failing -- and note that a deployment setting schema_repair_interval_secs to 0 runs no repair loop at all, which is the declared way to turn it off rather than a fault."
+            },
             {
-                "name": "memory_schema_orphans_unrepairable",
-                "promql": "max without (pod, container, instance, job) (increase(cogneva_memory_schema_repair_total{outcome=\"unrepairable\"}[1h])) > 0",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "The memory schema repair loop found archived entries whose derived layer is missing and could not type a single one of them in the last hour ({value} pass(es) ended this way). This is the permanent half of the loss that loop exists to end: an entry with no derived layer is unreachable by search, and a pass that cannot type its orphans does not fix them, so the same entries re-surface on every round until a person looks. It is a separate rule from the loop's own failure on purpose. A failed pass is the repair path being down; a run of unrepairable passes is the repair path working on data it cannot classify. The first is repaired by fixing the store, the second by fixing or retiring the entries, and the all-failed shape's right side counts any non-failed cell as a pass, so a run of unrepairable rounds would have been read there as a loop that is fine. A single rise is enough here rather than a count: the condition does not clear by itself, because the entries do not change unless something is done to them, and a bound on how many rounds may pass before this is a fault would only delay the report. The window is one hour, six of this loop's default passes (schema_repair_interval_secs defaults to 600), matching the sibling rule on the same counter so both halves of this loop are read on one horizon, and it is what lets a value the store goes on serving stop counting once the condition has not been found again. Read the log line that names the entries beside this rule, and the count of archived entries with no derived layer, which is the number a repair has to move."
+              "name": "memory_schema_orphans_unrepairable",
+              "promql": "max without (pod, container, instance, job) (increase(cogneva_memory_schema_repair_total{outcome=\"unrepairable\"}[1h])) > 0",
+              "condition": {
+                "greater_than": 0.0
               },
+              "severity": "warning",
+              "summary": "The memory schema repair loop found archived entries whose derived layer is missing and could not type a single one of them in the last hour ({value} pass(es) ended this way). This is the permanent half of the loss that loop exists to end: an entry with no derived layer is unreachable by search, and a pass that cannot type its orphans does not fix them, so the same entries re-surface on every round until a person looks. It is a separate rule from the loop's own failure on purpose. A failed pass is the repair path being down; a run of unrepairable passes is the repair path working on data it cannot classify. The first is repaired by fixing the store, the second by fixing or retiring the entries, and the all-failed shape's right side counts any non-failed cell as a pass, so a run of unrepairable rounds would have been read there as a loop that is fine. A single rise is enough here rather than a count: the condition does not clear by itself, because the entries do not change unless something is done to them, and a bound on how many rounds may pass before this is a fault would only delay the report. The window is one hour, six of this loop's default passes (schema_repair_interval_secs defaults to 600), matching the sibling rule on the same counter so both halves of this loop are read on one horizon, and it is what lets a value the store goes on serving stop counting once the condition has not been found again. Read the log line that names the entries beside this rule, and the count of archived entries with no derived layer, which is the number a repair has to move."
+            },
             {
-                "name": "skill_hot_reload_passes_all_failed",
-                "promql": "(max without (pod, container, instance, job) (increase(cogneva_skill_hot_reload_total{outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_skill_hot_reload_total{outcome!=\"failed\"}[5m])) > 0)",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "The skill hot-reload loop has not managed to look at the skill directories for five minutes: every round in that window came back an error ({value} being the most any single deployment reported). This is the loop not looking at the disk at all, which is a different fact from a skill file that is broken, and the two have separate rules. Each round lands one cell of a closed set (applied, unchanged, reload_failed, failed) and the beat is stamped every poll interval whether or not anything changed, so a round that could not scan the directories and a round that scanned them and found nothing to do used to be the same picture. The shape is all-failed rather than some-failed: any round that ended applied, unchanged or reload_failed puts a series on the right side and clears the rule, so a scan that fails once and then works does not page. Five minutes is ten of this loop's own rounds (the poll interval defaults to 30s) rather than six of them, because six of its periods is three minutes and this file's rules keep a floor under that: below five minutes a range is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. Read the loop's liveness reading beside this one -- background_loop_stalled fires when the loop has stopped beating, while this fires while it is beating and the scan fails. The loop runs in every deployment that enables the skill plugin and all of them write the one store, so the reduction is taken once for the fleet rather than summed over deployments, which would report the same total once per writer."
+              "name": "skill_hot_reload_passes_all_failed",
+              "promql": "(max without (pod, container, instance, job) (increase(cogneva_skill_hot_reload_total{outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_skill_hot_reload_total{outcome!=\"failed\"}[5m])) > 0)",
+              "condition": {
+                "greater_than": 0.0
               },
+              "severity": "warning",
+              "summary": "The skill hot-reload loop has not managed to look at the skill directories for five minutes: every round in that window came back an error ({value} being the most any single deployment reported). This is the loop not looking at the disk at all, which is a different fact from a skill file that is broken, and the two have separate rules. Each round lands one cell of a closed set (applied, unchanged, reload_failed, failed) and the beat is stamped every poll interval whether or not anything changed, so a round that could not scan the directories and a round that scanned them and found nothing to do used to be the same picture. The shape is all-failed rather than some-failed: any round that ended applied, unchanged or reload_failed puts a series on the right side and clears the rule, so a scan that fails once and then works does not page. Five minutes is ten of this loop's own rounds (the poll interval defaults to 30s) rather than six of them, because six of its periods is three minutes and this file's rules keep a floor under that: below five minutes a range is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. Read the loop's liveness reading beside this one -- background_loop_stalled fires when the loop has stopped beating, while this fires while it is beating and the scan fails. The loop runs in every deployment that enables the skill plugin and all of them write the one store, so the reduction is taken once for the fleet rather than summed over deployments, which would report the same total once per writer."
+            },
             {
-                "name": "skill_reload_failing_every_scan",
-                "promql": "max without (pod, container, instance, job) (increase(cogneva_skill_hot_reload_total{outcome=\"reload_failed\"}[5m])) > 0",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "A skill was found on disk and could not be loaded in the last five minutes ({value} round(s) ended this way), so the registry kept serving the previous definition and the edit on disk never took effect -- the state this loop exists to end. The loop re-scans the directories on its poll interval (default 30s) and the broken file re-surfaces every round, so a single rise is enough and this is deliberately not a count: nothing about the file changes until somebody changes it, and a bound on how many rounds may pass before this is a fault would only delay the report. This is a separate rule from the loop's own failure on purpose. failed is the scan itself returning an error and nothing being inspected, which is the loop being blind; reload_failed is the scan working and one file being unloadable, which is the data being broken. The first is repaired by fixing the directories or their permissions, the second by fixing or removing the skill. The producing module records a round that both applied a change and failed to load another skill as applied, so a rise here is a round where nothing was applied; the broken file still re-surfaces on the next round and is counted then. Five minutes is ten of this loop's own rounds, the floor this file's rules keep under their shortest windows rather than six of its periods (see the sibling rule on the same counter for why). The loop runs in every deployment that enables the skill plugin and all write the one store, so the reduction is taken once for the fleet rather than summed, which would report the same total once per writer."
+              "name": "skill_reload_failing_every_scan",
+              "promql": "max without (pod, container, instance, job) (increase(cogneva_skill_hot_reload_total{outcome=\"reload_failed\"}[5m])) > 0",
+              "condition": {
+                "greater_than": 0.0
               },
+              "severity": "warning",
+              "summary": "A skill was found on disk and could not be loaded in the last five minutes ({value} round(s) ended this way), so the registry kept serving the previous definition and the edit on disk never took effect -- the state this loop exists to end. The loop re-scans the directories on its poll interval (default 30s) and the broken file re-surfaces every round, so a single rise is enough and this is deliberately not a count: nothing about the file changes until somebody changes it, and a bound on how many rounds may pass before this is a fault would only delay the report. This is a separate rule from the loop's own failure on purpose. failed is the scan itself returning an error and nothing being inspected, which is the loop being blind; reload_failed is the scan working and one file being unloadable, which is the data being broken. The first is repaired by fixing the directories or their permissions, the second by fixing or removing the skill. The producing module records a round that both applied a change and failed to load another skill as applied, so a rise here is a round where nothing was applied; the broken file still re-surfaces on the next round and is counted then. Five minutes is ten of this loop's own rounds, the floor this file's rules keep under their shortest windows rather than six of its periods (see the sibling rule on the same counter for why). The loop runs in every deployment that enables the skill plugin and all write the one store, so the reduction is taken once for the fleet rather than summed, which would report the same total once per writer."
+            },
             {
-                "name": "supervisor_health_pass_failing",
-                "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"health\", outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"health\", outcome!=\"failed\"}[5m])) > 0)",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "Every health pass the supervisor loop ran in the last 5m failed ({value} being the most any single deployment reported): this is the pass that finds suspect, dead and stuck agents, which is the supervisor's only reading of its own fleet's liveness. Each pass records one cell per round carrying pass and outcome, and the loop's only other reading is its own beat, which is driven by the shortest of its six intervals -- so a pass that could not run at all and a pass with nothing to do used to be the same picture, and an arm that stopped firing stayed invisible behind a beat the other five kept stamping. The shape is all-failed rather than some-failed: one pass that returned ok anywhere in the window clears the rule, so a pass that fails once and then works does not page. 5m is the smallest whole multiple of this arm's own cadence that clears the floor this file's rules keep under their windows: this arm runs every 10s, so six of its rounds is what the siblings use where that is already long enough, and here it is thirty rounds, because a range shorter than five minutes is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. The window is stated per arm because the six arms run at rates that differ by two orders of magnitude, and one window for all of them would either read the fastest arm's ordinary seconds as patience or the slowest arm's ordinary round as an outage. This is one of five such rules, one per arm that can report a failure: the autonomous arm records every pass as ok by construction, so it has no rule -- one there could never fire and would only look like a reader, and a failure inside it ends the loop attempt, which the liveness family counts instead. The scrape labels are removed and the pass label stays in the identity, so one series answers per arm rather than one per pod. The loop runs in every deployment that enables the supervisor and all of them write the one store, so the reduction is taken once for the fleet rather than summed. Read the loop's liveness reading beside this one: background_loop_stalled fires when the whole loop has stopped beating, while this fires while it is beating and this one arm fails every time it runs."
+              "name": "supervisor_health_pass_failing",
+              "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"health\", outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"health\", outcome!=\"failed\"}[5m])) > 0)",
+              "condition": {
+                "greater_than": 0.0
               },
+              "severity": "warning",
+              "summary": "Every health pass the supervisor loop ran in the last 5m failed ({value} being the most any single deployment reported): this is the pass that finds suspect, dead and stuck agents, which is the supervisor's only reading of its own fleet's liveness. Each pass records one cell per round carrying pass and outcome, and the loop's only other reading is its own beat, which is driven by the shortest of its six intervals -- so a pass that could not run at all and a pass with nothing to do used to be the same picture, and an arm that stopped firing stayed invisible behind a beat the other five kept stamping. The shape is all-failed rather than some-failed: one pass that returned ok anywhere in the window clears the rule, so a pass that fails once and then works does not page. 5m is the smallest whole multiple of this arm's own cadence that clears the floor this file's rules keep under their windows: this arm runs every 10s, so six of its rounds is what the siblings use where that is already long enough, and here it is thirty rounds, because a range shorter than five minutes is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. The window is stated per arm because the six arms run at rates that differ by two orders of magnitude, and one window for all of them would either read the fastest arm's ordinary seconds as patience or the slowest arm's ordinary round as an outage. This is one of five such rules, one per arm that can report a failure: the autonomous arm records every pass as ok by construction, so it has no rule -- one there could never fire and would only look like a reader, and a failure inside it ends the loop attempt, which the liveness family counts instead. The scrape labels are removed and the pass label stays in the identity, so one series answers per arm rather than one per pod. The loop runs in every deployment that enables the supervisor and all of them write the one store, so the reduction is taken once for the fleet rather than summed. Read the loop's liveness reading beside this one: background_loop_stalled fires when the whole loop has stopped beating, while this fires while it is beating and this one arm fails every time it runs."
+            },
             {
-                "name": "supervisor_quota_pass_failing",
-                "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"quota\", outcome=\"failed\"}[6m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"quota\", outcome!=\"failed\"}[6m])) > 0)",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "Every quota pass the supervisor loop ran in the last 6m failed ({value} being the most any single deployment reported): this is the pass that enforces the quota ceilings on running work. Each pass records one cell per round carrying pass and outcome, and the loop's only other reading is its own beat, which is driven by the shortest of its six intervals -- so a pass that could not run at all and a pass with nothing to do used to be the same picture, and an arm that stopped firing stayed invisible behind a beat the other five kept stamping. The shape is all-failed rather than some-failed: one pass that returned ok anywhere in the window clears the rule, so a pass that fails once and then works does not page. 6m is the smallest whole multiple of this arm's own cadence that clears the floor this file's rules keep under their windows: this arm runs every 60s, so six of its rounds is what the siblings use where that is already long enough, and here it is six rounds, because a range shorter than five minutes is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. The window is stated per arm because the six arms run at rates that differ by two orders of magnitude, and one window for all of them would either read the fastest arm's ordinary seconds as patience or the slowest arm's ordinary round as an outage. This is one of five such rules, one per arm that can report a failure: the autonomous arm records every pass as ok by construction, so it has no rule -- one there could never fire and would only look like a reader, and a failure inside it ends the loop attempt, which the liveness family counts instead. The scrape labels are removed and the pass label stays in the identity, so one series answers per arm rather than one per pod. The loop runs in every deployment that enables the supervisor and all of them write the one store, so the reduction is taken once for the fleet rather than summed. Read the loop's liveness reading beside this one: background_loop_stalled fires when the whole loop has stopped beating, while this fires while it is beating and this one arm fails every time it runs."
+              "name": "supervisor_quota_pass_failing",
+              "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"quota\", outcome=\"failed\"}[6m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"quota\", outcome!=\"failed\"}[6m])) > 0)",
+              "condition": {
+                "greater_than": 0.0
               },
+              "severity": "warning",
+              "summary": "Every quota pass the supervisor loop ran in the last 6m failed ({value} being the most any single deployment reported): this is the pass that enforces the quota ceilings on running work. Each pass records one cell per round carrying pass and outcome, and the loop's only other reading is its own beat, which is driven by the shortest of its six intervals -- so a pass that could not run at all and a pass with nothing to do used to be the same picture, and an arm that stopped firing stayed invisible behind a beat the other five kept stamping. The shape is all-failed rather than some-failed: one pass that returned ok anywhere in the window clears the rule, so a pass that fails once and then works does not page. 6m is the smallest whole multiple of this arm's own cadence that clears the floor this file's rules keep under their windows: this arm runs every 60s, so six of its rounds is what the siblings use where that is already long enough, and here it is six rounds, because a range shorter than five minutes is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. The window is stated per arm because the six arms run at rates that differ by two orders of magnitude, and one window for all of them would either read the fastest arm's ordinary seconds as patience or the slowest arm's ordinary round as an outage. This is one of five such rules, one per arm that can report a failure: the autonomous arm records every pass as ok by construction, so it has no rule -- one there could never fire and would only look like a reader, and a failure inside it ends the loop attempt, which the liveness family counts instead. The scrape labels are removed and the pass label stays in the identity, so one series answers per arm rather than one per pod. The loop runs in every deployment that enables the supervisor and all of them write the one store, so the reduction is taken once for the fleet rather than summed. Read the loop's liveness reading beside this one: background_loop_stalled fires when the whole loop has stopped beating, while this fires while it is beating and this one arm fails every time it runs."
+            },
             {
-                "name": "supervisor_rebalance_pass_failing",
-                "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"rebalance\", outcome=\"failed\"}[30m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"rebalance\", outcome!=\"failed\"}[30m])) > 0)",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "Every rebalance pass the supervisor loop ran in the last 30m failed ({value} being the most any single deployment reported): this is the pass that rebalances work across the fleet. Each pass records one cell per round carrying pass and outcome, and the loop's only other reading is its own beat, which is driven by the shortest of its six intervals -- so a pass that could not run at all and a pass with nothing to do used to be the same picture, and an arm that stopped firing stayed invisible behind a beat the other five kept stamping. The shape is all-failed rather than some-failed: one pass that returned ok anywhere in the window clears the rule, so a pass that fails once and then works does not page. 30m is the smallest whole multiple of this arm's own cadence that clears the floor this file's rules keep under their windows: this arm runs every 300s, so six of its rounds is what the siblings use where that is already long enough, and here it is six rounds, because a range shorter than five minutes is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. The window is stated per arm because the six arms run at rates that differ by two orders of magnitude, and one window for all of them would either read the fastest arm's ordinary seconds as patience or the slowest arm's ordinary round as an outage. This is one of five such rules, one per arm that can report a failure: the autonomous arm records every pass as ok by construction, so it has no rule -- one there could never fire and would only look like a reader, and a failure inside it ends the loop attempt, which the liveness family counts instead. The scrape labels are removed and the pass label stays in the identity, so one series answers per arm rather than one per pod. The loop runs in every deployment that enables the supervisor and all of them write the one store, so the reduction is taken once for the fleet rather than summed. Read the loop's liveness reading beside this one: background_loop_stalled fires when the whole loop has stopped beating, while this fires while it is beating and this one arm fails every time it runs."
+              "name": "supervisor_rebalance_pass_failing",
+              "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"rebalance\", outcome=\"failed\"}[30m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"rebalance\", outcome!=\"failed\"}[30m])) > 0)",
+              "condition": {
+                "greater_than": 0.0
               },
+              "severity": "warning",
+              "summary": "Every rebalance pass the supervisor loop ran in the last 30m failed ({value} being the most any single deployment reported): this is the pass that rebalances work across the fleet. Each pass records one cell per round carrying pass and outcome, and the loop's only other reading is its own beat, which is driven by the shortest of its six intervals -- so a pass that could not run at all and a pass with nothing to do used to be the same picture, and an arm that stopped firing stayed invisible behind a beat the other five kept stamping. The shape is all-failed rather than some-failed: one pass that returned ok anywhere in the window clears the rule, so a pass that fails once and then works does not page. 30m is the smallest whole multiple of this arm's own cadence that clears the floor this file's rules keep under their windows: this arm runs every 300s, so six of its rounds is what the siblings use where that is already long enough, and here it is six rounds, because a range shorter than five minutes is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. The window is stated per arm because the six arms run at rates that differ by two orders of magnitude, and one window for all of them would either read the fastest arm's ordinary seconds as patience or the slowest arm's ordinary round as an outage. This is one of five such rules, one per arm that can report a failure: the autonomous arm records every pass as ok by construction, so it has no rule -- one there could never fire and would only look like a reader, and a failure inside it ends the loop attempt, which the liveness family counts instead. The scrape labels are removed and the pass label stays in the identity, so one series answers per arm rather than one per pod. The loop runs in every deployment that enables the supervisor and all of them write the one store, so the reduction is taken once for the fleet rather than summed. Read the loop's liveness reading beside this one: background_loop_stalled fires when the whole loop has stopped beating, while this fires while it is beating and this one arm fails every time it runs."
+            },
             {
-                "name": "supervisor_event_pass_failing",
-                "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"event\", outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"event\", outcome!=\"failed\"}[5m])) > 0)",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "Every event pass the supervisor loop ran in the last 5m failed ({value} being the most any single deployment reported): this is the pass that aggregates events into the supervisor's own window. Each pass records one cell per round carrying pass and outcome, and the loop's only other reading is its own beat, which is driven by the shortest of its six intervals -- so a pass that could not run at all and a pass with nothing to do used to be the same picture, and an arm that stopped firing stayed invisible behind a beat the other five kept stamping. The shape is all-failed rather than some-failed: one pass that returned ok anywhere in the window clears the rule, so a pass that fails once and then works does not page. 5m is the smallest whole multiple of this arm's own cadence that clears the floor this file's rules keep under their windows: this arm runs every 30s, so six of its rounds is what the siblings use where that is already long enough, and here it is ten rounds, because a range shorter than five minutes is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. The window is stated per arm because the six arms run at rates that differ by two orders of magnitude, and one window for all of them would either read the fastest arm's ordinary seconds as patience or the slowest arm's ordinary round as an outage. This is one of five such rules, one per arm that can report a failure: the autonomous arm records every pass as ok by construction, so it has no rule -- one there could never fire and would only look like a reader, and a failure inside it ends the loop attempt, which the liveness family counts instead. The scrape labels are removed and the pass label stays in the identity, so one series answers per arm rather than one per pod. The loop runs in every deployment that enables the supervisor and all of them write the one store, so the reduction is taken once for the fleet rather than summed. Read the loop's liveness reading beside this one: background_loop_stalled fires when the whole loop has stopped beating, while this fires while it is beating and this one arm fails every time it runs."
+              "name": "supervisor_event_pass_failing",
+              "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"event\", outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"event\", outcome!=\"failed\"}[5m])) > 0)",
+              "condition": {
+                "greater_than": 0.0
               },
+              "severity": "warning",
+              "summary": "Every event pass the supervisor loop ran in the last 5m failed ({value} being the most any single deployment reported): this is the pass that aggregates events into the supervisor's own window. Each pass records one cell per round carrying pass and outcome, and the loop's only other reading is its own beat, which is driven by the shortest of its six intervals -- so a pass that could not run at all and a pass with nothing to do used to be the same picture, and an arm that stopped firing stayed invisible behind a beat the other five kept stamping. The shape is all-failed rather than some-failed: one pass that returned ok anywhere in the window clears the rule, so a pass that fails once and then works does not page. 5m is the smallest whole multiple of this arm's own cadence that clears the floor this file's rules keep under their windows: this arm runs every 30s, so six of its rounds is what the siblings use where that is already long enough, and here it is ten rounds, because a range shorter than five minutes is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. The window is stated per arm because the six arms run at rates that differ by two orders of magnitude, and one window for all of them would either read the fastest arm's ordinary seconds as patience or the slowest arm's ordinary round as an outage. This is one of five such rules, one per arm that can report a failure: the autonomous arm records every pass as ok by construction, so it has no rule -- one there could never fire and would only look like a reader, and a failure inside it ends the loop attempt, which the liveness family counts instead. The scrape labels are removed and the pass label stays in the identity, so one series answers per arm rather than one per pod. The loop runs in every deployment that enables the supervisor and all of them write the one store, so the reduction is taken once for the fleet rather than summed. Read the loop's liveness reading beside this one: background_loop_stalled fires when the whole loop has stopped beating, while this fires while it is beating and this one arm fails every time it runs."
+            },
             {
-                "name": "supervisor_control_plane_pass_failing",
-                "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"control_plane\", outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"control_plane\", outcome!=\"failed\"}[5m])) > 0)",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "Every control_plane pass the supervisor loop ran in the last 5m failed ({value} being the most any single deployment reported): this is the pass that reports this supervisor's status to the control plane. Each pass records one cell per round carrying pass and outcome, and the loop's only other reading is its own beat, which is driven by the shortest of its six intervals -- so a pass that could not run at all and a pass with nothing to do used to be the same picture, and an arm that stopped firing stayed invisible behind a beat the other five kept stamping. The shape is all-failed rather than some-failed: one pass that returned ok anywhere in the window clears the rule, so a pass that fails once and then works does not page. 5m is the smallest whole multiple of this arm's own cadence that clears the floor this file's rules keep under their windows: this arm runs every 30s, so six of its rounds is what the siblings use where that is already long enough, and here it is ten rounds, because a range shorter than five minutes is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. The window is stated per arm because the six arms run at rates that differ by two orders of magnitude, and one window for all of them would either read the fastest arm's ordinary seconds as patience or the slowest arm's ordinary round as an outage. This is one of five such rules, one per arm that can report a failure: the autonomous arm records every pass as ok by construction, so it has no rule -- one there could never fire and would only look like a reader, and a failure inside it ends the loop attempt, which the liveness family counts instead. The scrape labels are removed and the pass label stays in the identity, so one series answers per arm rather than one per pod. The loop runs in every deployment that enables the supervisor and all of them write the one store, so the reduction is taken once for the fleet rather than summed. Read the loop's liveness reading beside this one: background_loop_stalled fires when the whole loop has stopped beating, while this fires while it is beating and this one arm fails every time it runs. The control-plane arm writes nothing at all while no control plane is configured, since the arm then has no work, so on a deployment that never asked for one this rule is silent rather than falsely green."
+              "name": "supervisor_control_plane_pass_failing",
+              "promql": "(max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"control_plane\", outcome=\"failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_supervisor_pass_total{pass=\"control_plane\", outcome!=\"failed\"}[5m])) > 0)",
+              "condition": {
+                "greater_than": 0.0
               },
+              "severity": "warning",
+              "summary": "Every control_plane pass the supervisor loop ran in the last 5m failed ({value} being the most any single deployment reported): this is the pass that reports this supervisor's status to the control plane. Each pass records one cell per round carrying pass and outcome, and the loop's only other reading is its own beat, which is driven by the shortest of its six intervals -- so a pass that could not run at all and a pass with nothing to do used to be the same picture, and an arm that stopped firing stayed invisible behind a beat the other five kept stamping. The shape is all-failed rather than some-failed: one pass that returned ok anywhere in the window clears the rule, so a pass that fails once and then works does not page. 5m is the smallest whole multiple of this arm's own cadence that clears the floor this file's rules keep under their windows: this arm runs every 30s, so six of its rounds is what the siblings use where that is already long enough, and here it is ten rounds, because a range shorter than five minutes is built from too few samples to be told apart from where the scrapes fell at the deployment's 15s interval. The window is stated per arm because the six arms run at rates that differ by two orders of magnitude, and one window for all of them would either read the fastest arm's ordinary seconds as patience or the slowest arm's ordinary round as an outage. This is one of five such rules, one per arm that can report a failure: the autonomous arm records every pass as ok by construction, so it has no rule -- one there could never fire and would only look like a reader, and a failure inside it ends the loop attempt, which the liveness family counts instead. The scrape labels are removed and the pass label stays in the identity, so one series answers per arm rather than one per pod. The loop runs in every deployment that enables the supervisor and all of them write the one store, so the reduction is taken once for the fleet rather than summed. Read the loop's liveness reading beside this one: background_loop_stalled fires when the whole loop has stopped beating, while this fires while it is beating and this one arm fails every time it runs. The control-plane arm writes nothing at all while no control plane is configured, since the arm then has no work, so on a deployment that never asked for one this rule is silent rather than falsely green."
+            },
             {
-                "name": "memory_bus_claim_rounds_all_failed",
-                "promql": "(max without (pod, container, instance, job) (increase(memory_operations_total{operation=\"bus_claim_failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(memory_operations_total{operation=\"bus_claim\"}[5m])) > 0)",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "Every round the memory bus claim loop ran in the last 5m failed to claim ({value} being the most any single deployment reported). Each round records exactly one cell on memory_operations_total among bus_claim (a round that took work off the bus), bus_claim_held (a round the idle gate folded) and bus_claim_failed (a round whose claim errored), and the loop's only other reading is its own beat -- so a claim path that errored every round and a bus with nothing to hand out used to be the same picture, with the failure living only in a warn that dies with the pod. The shape is all-failed rather than some-failed: one round that did claim work anywhere in the window clears the rule, so an error that healed does not alert; and a dry bus (every round held, no failure) never arms the left side. Window 5m is ten rounds of the loop's own 30s cadence."
+              "name": "memory_bus_claim_rounds_all_failed",
+              "promql": "(max without (pod, container, instance, job) (increase(memory_operations_total{operation=\"bus_claim_failed\"}[5m])) > 0) unless on() (max without (pod, container, instance, job) (increase(memory_operations_total{operation=\"bus_claim\"}[5m])) > 0)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "Every round the memory bus claim loop ran in the last 5m failed to claim ({value} being the most any single deployment reported). Each round records exactly one cell on memory_operations_total among bus_claim (a round that took work off the bus), bus_claim_held (a round the idle gate folded) and bus_claim_failed (a round whose claim errored), and the loop's only other reading is its own beat -- so a claim path that errored every round and a bus with nothing to hand out used to be the same picture, with the failure living only in a warn that dies with the pod. The shape is all-failed rather than some-failed: one round that did claim work anywhere in the window clears the rule, so an error that healed does not alert; and a dry bus (every round held, no failure) never arms the left side. Window 5m is ten rounds of the loop's own 30s cadence."
             },
             {
               "name": "memory_backend_operation_never_succeeds",
@@ -2575,163 +2610,161 @@ data:
               "severity": "critical",
               "summary": "策略库的 ACTIVE 指针指向的那一版，在这台机器上打不开：`active_version` 报的是 {value}（-1）。这一格不是「还没激活过」——那是 0，一个新库的正常状态；负数意味着指针在那儿，但它背后的版本拿不到。三种情况都会让它亮：ACTIVE 文件的内容坏了、读不出来，或者指针点名的版本文件不在了。分哪一种要看 `active_version_declared` 那一格与进程日志：声明格说得出指针点名的是第几版、而实读格是 -1，就是「它指着的那个版本不存在」；两格都是 -1，是指针本身读不出来。这条与恢复核对那两条不是同一件事：那两条只在恢复后的第一次启动发一次言，而这是运行中每一拍都在问的问题——一个在恢复时核对通过的库，之后照样可能因为一次清理、一次截断、一次写没落盘而丢掉它指向的东西。它亮着的时候进程不会停：`load_active` 读不到就回落到默认参数继续做决策，其它读数照常绿，进化照常往前走，只有这一格在说「你现在用的不是你以为的那一版策略」。身份按 `(store, data_dir)` 聚：这个库坏了不该因为报信 Pod 滚动而换一条新告警；同一个库两个进程读数不同时取较小的那个，不一致本身就是这条要人看的东西。它不会自己熄灭，指针要有人改回一个存在的版本，或者删掉它让这个库回到「还没激活过」。两侧各带 1800 秒新鲜合取：读数循环 300 秒发布一次，循环停了的整条为空，那种状态归 background_loop_stalled 在自己的拍子上报——一条停了的写者不该被读成「策略库坏了」。severity 取 critical 而不是 warning：底下的库是坏的，而这个坏是静默的——它不影响进程活着，只影响它拿着哪一版策略在做决定。"
             },
-              {
-                "name": "alert_batch_reached_no_outlet",
-                "promql": "(max(increase(cogneva_alert_notifications_total{outcome=\"no_channel\"}[30m])) > 0) unless on() (max(cogneva_signal_watcher_running) == 1)",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "告警落了库、却没有任何出口把它送出去：这批里带了多少条事件，就记多少。`outcome` 那一格 `no_channel` 是投递链上唯一一格不经过通道的结局——supervisor 桥、infra_watch 与配置声明检查三处在找不到通知器时都会写它，通道标签是 `none`，所以这一格增长的意思不是「某次发送失败了」，而是「这个部署没有配人读通道」。这一半仍然是它存在的理由：`delivered` 是健康态；`skipped` 是配了通道却没有收件人；`failed` 与 `skipped` 都会自激——规则自己的通知走同一个通知器，发送失败会把这条规则再钉回 firing；`no_channel` 没有这层循环，读数只会继续如实说没有人被通知。但人读通道**不再是出口的全部**：属主 2026-10-20 接受集群内自处置之后，出口的身份是**消费者**，不是通道，所以这条规则的右边接了一条集群内那条腿——`cogneva_signal_watcher_running` 是 `cog-reflection` 把活动告警翻成 `self-signal-alert-*` 意图的那个循环，每个进程都发布它（武装者为 1、其余为 0），`max(...) == 1` 就是「这套部署里有人在接告警」。用 `unless on()` 而不写成「`and` 右边读 0」，是为了让**右侧缺席**也落在「没有出口」这一边：watcher 这一族序列不存在（镜像还旧、被删掉）时 `unless` 保留左边，与「进程在、没人武装」（读成 0）报同一句；写成 `and` 的话，序列一消失整条表达式就空，最该报的那种部署会被读成干净。它不回答的另一问是「消费者在跑却停住了」：watcher 被 LLM 池闸扣住时每轮 `held_total` 加一、`signals_total` 不涨，那是**暂停**不是没有出口——暂停期间左边增长而右边读到 1，本规则正确地不亮，判暂停要看 held 与 ticks 两个数，别把这条的红当成暂停。阈值取大于 0 而不是某个数量：一条告警没送到任何消费者手里就是零送达，没有可容忍的基线。用 30 分钟窗口读 increase 而不是裸读累计值：进程重起把计数器归零不会让它误熄，而持续没有出口时每一轮评估都会再加一批，窗口始终不为空。它由第一个接上告警的消费者自己熄灭：watcher 武装起来后 `max` 读到 1，右侧出现样点，`unless` 丢掉左边。severity 取 warning 而不是 critical：这是一件配置面的事实，不是某个业务面正在出事；但它亮着的时候，别的规则即使命中也没有人接得到，所以它要人先看见自己。"
-              }
-          ,
-              {
-                "name": "principle_ledger_census_stopped",
-                "promql": "absent_over_time((cogneva_principle_ledger_rows and on() ((time() - max(cogneva_principle_ledger_rows_observed_timestamp_seconds)) < 1800))[30m:1m])",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "_comment_why_absent": "这条规则问的就是「有没有样点」，所以缺席正是它要报的事：台账行数这一族由持有原则账 pass 的那个进程每次 pass 重写，四个状态格一起发出去。反过来不能用「行数 = 0」当故障——空账是量到的 0，一个还没收过原则的库合法地就是 0 行，把 0 判红等于把正常状态算成故障。",
-                "summary": "原则台账的普查断了：`cogneva_principle_ledger_rows` 这一族（按 `state` 分格：enforced / unenforced / retired / unmeasured）30 分钟里一条样点都没有。它断了不等于台账有问题，而是「原则被落地了多少、还剩多少没量」这件事此刻没有任何人在读：面板空着，与「台账是空的」在界面上同形，而后者是量到的 0、前者是没人量。读之前先看现网：这条序列由发布原则账普查的那一版引入，若集群里跑的镜像 tag 比它旧，规则会一直响而台账并没有停——确认镜像已带上发布者之后仍然空着，才是普查真停了，那时查持有 pass 的进程在不在、以及它自己的日志里发布普查有没有报错。"
+            {
+              "name": "alert_batch_reached_no_outlet",
+              "promql": "(max(increase(cogneva_alert_notifications_total{outcome=\"no_channel\"}[30m])) > 0) unless on() (max(cogneva_signal_watcher_running) == 1)",
+              "condition": {
+                "greater_than": 0.0
               },
-              {
-                "name": "clippy_verdict_not_produced",
-                "promql": "1 - max by (node) (cogneva_clippy_verdict_present)",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "这台宿主上一份 clippy 判词账都没有：`cogneva_clippy_verdict_present` 读 0，意思是账本文件不在了、或者生产者从没在这台机器上跑过。它与「全部通过」不是一件事，也不该被读成绿——判词账是 CI 之外唯一能回答「主线这一笔过没过 clippy」的读数，而 CI 是 clippy 独占缺陷的第一道：一笔只挂 clippy 的提交照样进主线，然后再被挡在集群外，挡住它的那条判据在集群里就这一条序列。先查两处：`/var/lib/cogneva/clippy/clippy-verdict.jsonl` 在不在（不在就是生产者没跑过），在就查上次触发是什么时候、service 日志里有没有读不到仓库或 git 的错误——这两个都是**用户单元**（正本 `deploy/systemd/`，渲染到 `~/.config/systemd/user/`），要以 cogneva 用户跑 `systemctl --user list-timers cogneva-clippy-verdict.timer` 与 `journalctl --user -u cogneva-clippy-verdict.service`；以 root 跑 `systemctl status` 会报「Unit not found」，那不是「定时器没装」。阈值取「读 0」而不是某个缺账数：这一格只有 0 与 1，0 就是「没人量」，没有可容忍的基线。"
+              "severity": "warning",
+              "summary": "告警落了库、却没有任何出口把它送出去：这批里带了多少条事件，就记多少。`outcome` 那一格 `no_channel` 是投递链上唯一一格不经过通道的结局——supervisor 桥、infra_watch 与配置声明检查三处在找不到通知器时都会写它，通道标签是 `none`，所以这一格增长的意思不是「某次发送失败了」，而是「这个部署没有配人读通道」。这一半仍然是它存在的理由：`delivered` 是健康态；`skipped` 是配了通道却没有收件人；`failed` 与 `skipped` 都会自激——规则自己的通知走同一个通知器，发送失败会把这条规则再钉回 firing；`no_channel` 没有这层循环，读数只会继续如实说没有人被通知。但人读通道**不再是出口的全部**：属主 2026-10-20 接受集群内自处置之后，出口的身份是**消费者**，不是通道，所以这条规则的右边接了一条集群内那条腿——`cogneva_signal_watcher_running` 是 `cog-reflection` 把活动告警翻成 `self-signal-alert-*` 意图的那个循环，每个进程都发布它（武装者为 1、其余为 0），`max(...) == 1` 就是「这套部署里有人在接告警」。用 `unless on()` 而不写成「`and` 右边读 0」，是为了让**右侧缺席**也落在「没有出口」这一边：watcher 这一族序列不存在（镜像还旧、被删掉）时 `unless` 保留左边，与「进程在、没人武装」（读成 0）报同一句；写成 `and` 的话，序列一消失整条表达式就空，最该报的那种部署会被读成干净。它不回答的另一问是「消费者在跑却停住了」：watcher 被 LLM 池闸扣住时每轮 `held_total` 加一、`signals_total` 不涨，那是**暂停**不是没有出口——暂停期间左边增长而右边读到 1，本规则正确地不亮，判暂停要看 held 与 ticks 两个数，别把这条的红当成暂停。阈值取大于 0 而不是某个数量：一条告警没送到任何消费者手里就是零送达，没有可容忍的基线。用 30 分钟窗口读 increase 而不是裸读累计值：进程重起把计数器归零不会让它误熄，而持续没有出口时每一轮评估都会再加一批，窗口始终不为空。它由第一个接上告警的消费者自己熄灭：watcher 武装起来后 `max` 读到 1，右侧出现样点，`unless` 丢掉左边。severity 取 warning 而不是 critical：这是一件配置面的事实，不是某个业务面正在出事；但它亮着的时候，别的规则即使命中也没有人接得到，所以它要人先看见自己。"
+            },
+            {
+              "name": "principle_ledger_census_stopped",
+              "promql": "absent_over_time((cogneva_principle_ledger_rows and on() ((time() - max(cogneva_principle_ledger_rows_observed_timestamp_seconds)) < 1800))[30m:1m])",
+              "condition": {
+                "greater_than": 0.0
               },
-              {
-                "name": "clippy_verdict_pending_never_settles",
-                "promql": "min_over_time(max by (node) (cogneva_clippy_pending_revs)[3h:1m]) and (count_over_time(max by (node) (cogneva_clippy_pending_revs)[6h:1m]) > count_over_time(max by (node) (cogneva_clippy_pending_revs)[3h:1m]))",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "账上有一笔 rev 还欠着一次绿，已经连续三个小时：`cogneva_clippy_pending_revs` 在这段时间里一次都没归零。「还欠着一次绿」可能是「刚推上去、生产者还没跑完」，也可能是「跑完了，结论是红的，而之后没有一笔再来过」——两种都要人看一眼。这一格数的是**还欠着一次绿**的 rev：最新一行是 `pending` 的，以及最新一行是 `red` 而后面还没有一笔判成绿的（更晚的一笔绿把红接过去，那笔红是结了的旧账，只留在 `red_revs` 里、不再算欠）。所以它非零本身是常态——刚推上去那一笔要等生产者跑完才有判词；持续三小时不归零才说明生产者不是在跑、就是每趟都在中途被杀（它先写一行 pending 再跑，被杀时账上留的正是 pending，这正是它要报的事）。三小时这个界是拿生产者自己的时间表定的，不是拍的：它每趟先拿宿主构建槽（等待预算 7200 秒）、再在专用 target 里真跑一遍 clippy（十几分钟），所以「等槽 + 跑完」的合法上限就在两小时出头；低于它会把一个还在排队的正常趟次报成停摆。判它与「镜像在滚」无关：这条读的是判词账，与部署器换不换镜像没有任何关系。窗口用 `min_over_time` 而不是 `max_over_time`：中间归零过一次就说明生产者在推进。红与它不冲突：一笔红只要被更晚的一笔绿接过去就不再算欠，所以「红过」本身不会让这一格赖在非零上——会让它赖住的是**最新一笔绿之后又有红的**，那正是要报的「判了，结论是红的，且之后没人再来过」。这个表达式后面还并着一条「窗口真的被铺满」的要求：`count_over_time(…[6h]) > count_over_time(…[3h])`，即这三小时之外还有更老的采样。没有它，序列比窗口年轻时 `min_over_time` 只读到进程启动以来的那几个采样，「刚起来」与「三小时没动」会读成同一句。不该由这条规则报。"
+              "severity": "warning",
+              "_comment_why_absent": "这条规则问的就是「有没有样点」，所以缺席正是它要报的事：台账行数这一族由持有原则账 pass 的那个进程每次 pass 重写，四个状态格一起发出去。反过来不能用「行数 = 0」当故障——空账是量到的 0，一个还没收过原则的库合法地就是 0 行，把 0 判红等于把正常状态算成故障。",
+              "summary": "原则台账的普查断了：`cogneva_principle_ledger_rows` 这一族（按 `state` 分格：enforced / unenforced / retired / unmeasured）30 分钟里一条样点都没有。它断了不等于台账有问题，而是「原则被落地了多少、还剩多少没量」这件事此刻没有任何人在读：面板空着，与「台账是空的」在界面上同形，而后者是量到的 0、前者是没人量。读之前先看现网：这条序列由发布原则账普查的那一版引入，若集群里跑的镜像 tag 比它旧，规则会一直响而台账并没有停——确认镜像已带上发布者之后仍然空着，才是普查真停了，那时查持有 pass 的进程在不在、以及它自己的日志里发布普查有没有报错。"
+            },
+            {
+              "name": "clippy_verdict_not_produced",
+              "promql": "1 - max by (node) (cogneva_clippy_verdict_present)",
+              "condition": {
+                "greater_than": 0.0
               },
-              {
-                "name": "clippy_verdict_ledger_damaged",
-                "promql": "max by (node) (cogneva_clippy_verdict_unparsable_lines)",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "clippy 判词账上有读不出来的行：读了 `cogneva_clippy_verdict_unparsable_lines` 条，坏行只计数、不清零——一行坏掉不该让整份读数变成 0，但坏行意味着某一笔的判词可能根本没被读进来，于是账上的 `pending_revs=0` 不再等于「一笔都不欠」。修法在写侧：按行看那份 JSONL（`rev` / `verdict` / `written_at` 缺一个或类型不对都算坏行），把写坏的那几行修好或删掉。阈值取大于 0：这不是一个可以攒着的数，坏行留下的唯一后果是让一个红读成绿。severity 取 warning 而不是 critical：账本身还在、其余判词还读得出来，但要在下一次读账当绿之前修掉。"
+              "severity": "warning",
+              "summary": "这台宿主上一份 clippy 判词账都没有：`cogneva_clippy_verdict_present` 读 0，意思是账本文件不在了、或者生产者从没在这台机器上跑过。它与「全部通过」不是一件事，也不该被读成绿——判词账是 CI 之外唯一能回答「主线这一笔过没过 clippy」的读数，而 CI 是 clippy 独占缺陷的第一道：一笔只挂 clippy 的提交照样进主线，然后再被挡在集群外，挡住它的那条判据在集群里就这一条序列。先查两处：`/var/lib/cogneva/clippy/clippy-verdict.jsonl` 在不在（不在就是生产者没跑过），在就查上次触发是什么时候、service 日志里有没有读不到仓库或 git 的错误——这两个都是**用户单元**（正本 `deploy/systemd/`，渲染到 `~/.config/systemd/user/`），要以 cogneva 用户跑 `systemctl --user list-timers cogneva-clippy-verdict.timer` 与 `journalctl --user -u cogneva-clippy-verdict.service`；以 root 跑 `systemctl status` 会报「Unit not found」，那不是「定时器没装」。阈值取「读 0」而不是某个缺账数：这一格只有 0 与 1，0 就是「没人量」，没有可容忍的基线。"
+            },
+            {
+              "name": "clippy_verdict_pending_never_settles",
+              "promql": "min_over_time(max by (node) (cogneva_clippy_pending_revs)[3h:1m]) and (count_over_time(max by (node) (cogneva_clippy_pending_revs)[6h:1m]) > count_over_time(max by (node) (cogneva_clippy_pending_revs)[3h:1m]))",
+              "condition": {
+                "greater_than": 0.0
               },
-              {
-                "name": "clippy_verdict_readings_stopped",
-                "promql": "absent_over_time(cogneva_clippy_verdict_present[15m])",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "这台宿主上的 clippy 判词读数整族 15 分钟里一条样点都没有：`cogneva_clippy_verdict_present` / `cogneva_clippy_pending_revs` / `cogneva_clippy_verdict_unparsable_lines` 三条都消失了，所以此刻没有任何东西在回答「主线这一笔过没过 clippy」。这一条与同族另外三条是分开的：那三条各自比一个值，值不在时它们**都是空的**——空集不触发，于是「没人量」在面板上与「量出来都好」长得一模一样，这正是缺席要单独占一条规则的理由。两种成因：宿主读数通道停了，或者生产者这一轮退 3（读不到输入）时按契约一条都不印。查法：先看抓取端点 `up` 里 `job` 取 `cogneva-host-readings` 的那条还在不在，再以 cogneva 用户跑 `systemctl --user list-timers cogneva-host-readings.timer` 与 `journalctl --user -u cogneva-host-readings.service`；以 root 跑会报「Unit not found」，那不是没装。窗口取 15 分钟：读数每拍都印，够跨过一次滚动重启，又短到不用「等一会儿再看」。"
+              "severity": "warning",
+              "summary": "账上有一笔 rev 还欠着一次绿，已经连续三个小时：`cogneva_clippy_pending_revs` 在这段时间里一次都没归零。「还欠着一次绿」可能是「刚推上去、生产者还没跑完」，也可能是「跑完了，结论是红的，而之后没有一笔再来过」——两种都要人看一眼。这一格数的是**还欠着一次绿**的 rev：最新一行是 `pending` 的，以及最新一行是 `red` 而后面还没有一笔判成绿的（更晚的一笔绿把红接过去，那笔红是结了的旧账，只留在 `red_revs` 里、不再算欠）。所以它非零本身是常态——刚推上去那一笔要等生产者跑完才有判词；持续三小时不归零才说明生产者不是在跑、就是每趟都在中途被杀（它先写一行 pending 再跑，被杀时账上留的正是 pending，这正是它要报的事）。三小时这个界是拿生产者自己的时间表定的，不是拍的：它每趟先拿宿主构建槽（等待预算 7200 秒）、再在专用 target 里真跑一遍 clippy（十几分钟），所以「等槽 + 跑完」的合法上限就在两小时出头；低于它会把一个还在排队的正常趟次报成停摆。判它与「镜像在滚」无关：这条读的是判词账，与部署器换不换镜像没有任何关系。窗口用 `min_over_time` 而不是 `max_over_time`：中间归零过一次就说明生产者在推进。红与它不冲突：一笔红只要被更晚的一笔绿接过去就不再算欠，所以「红过」本身不会让这一格赖在非零上——会让它赖住的是**最新一笔绿之后又有红的**，那正是要报的「判了，结论是红的，且之后没人再来过」。这个表达式后面还并着一条「窗口真的被铺满」的要求：`count_over_time(…[6h]) > count_over_time(…[3h])`，即这三小时之外还有更老的采样。没有它，序列比窗口年轻时 `min_over_time` 只读到进程启动以来的那几个采样，「刚起来」与「三小时没动」会读成同一句。不该由这条规则报。"
+            },
+            {
+              "name": "clippy_verdict_ledger_damaged",
+              "promql": "max by (node) (cogneva_clippy_verdict_unparsable_lines)",
+              "condition": {
+                "greater_than": 0.0
               },
-              {
-                "name": "alert_rule_count_reading_stopped",
-                "promql": "absent_over_time(cogneva_alert_rule_count{state=\"agrees\"}[15m])",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "「进程手里的规则集与 ConfigMap 声明的是不是同一份」这条读数 15 分钟里一条样点都没有：`cogneva_alert_rule_count` 带 `state=\"agrees\"` 的那一格（`readout=\"rule_loaded_vs_configmap\"`，值 1 表示同一份、0 表示不同）消失了。它断了不等于两份一致：同族的 `declared` / `loaded` / `document_readable` 三格也只是让读者自己相减，相减不出「有没有人量过」。两份规则集不一致时这条读数读 0，而**没有样点**与读 0 在告警面上是两件事，所以缺样本必须自己一条判据——把 `== 0` 写进同一条规则只会让它在没有样点时继续安静。发布者有两个：`cogneva` 与 `cogneva-evolution`，两处都消失才说明进程没了或它们都读不到挂载的那份文档。查法：`kubectl -n cogneva get configmap cogneva-json` 看文档在不在，再 `kubectl -n cogneva exec <pod> -- curl -s localhost:8080/metrics` 看这两格印没印。窗口 15 分钟，够跨过一次滚动重启。"
+              "severity": "warning",
+              "summary": "clippy 判词账上有读不出来的行：读了 `cogneva_clippy_verdict_unparsable_lines` 条，坏行只计数、不清零——一行坏掉不该让整份读数变成 0，但坏行意味着某一笔的判词可能根本没被读进来，于是账上的 `pending_revs=0` 不再等于「一笔都不欠」。修法在写侧：按行看那份 JSONL（`rev` / `verdict` / `written_at` 缺一个或类型不对都算坏行），把写坏的那几行修好或删掉。阈值取大于 0：这不是一个可以攒着的数，坏行留下的唯一后果是让一个红读成绿。severity 取 warning 而不是 critical：账本身还在、其余判词还读得出来，但要在下一次读账当绿之前修掉。"
+            },
+            {
+              "name": "clippy_verdict_readings_stopped",
+              "promql": "absent_over_time(cogneva_clippy_verdict_present[15m])",
+              "condition": {
+                "greater_than": 0.0
               },
-              {
-                "name": "alert_rule_set_disagrees_with_configmap",
-                "promql": "min without (pod, container, instance, endpoint, service, namespace) (cogneva_alert_rule_count{state=\"agrees\"})",
-                "condition": {
-                  "less_than": 1.0
-                },
-                "severity": "warning",
-                "summary": "进程手里的规则集与 ConfigMap 声明的那一份对不上了：这一格读 0。0 有两个来源，规则条数不同，或者挂载的那份文档根本读不出来（同族 `document_readable` 那一格同时是 0，先用它分流）；`declared` 与 `loaded` 两格是这份判词背后的两个数。按进程留一行（`job` 是发布者，`pod` 只是抓取坐标，滚动一次就换），所以它点名的是哪个进程对不上，不是一个下一次部署就消失的 Pod。它与 `alert_rule_count_reading_stopped` 是两条：那一条管「一个样点都没有」，这一条管「有样点、值是 0」；把两件事并进同一条，缺样本时这条会安静，而缺样本恰恰是这条自己要报的情况之一。阈值小于 1 而不是等于 0：发布侧只发 1 或 0，写小于 1 让「不是 1 的任何值」都算不一致。severity 取 warning：进程仍在服务，错的是它据以判断的那份规则集，下一次部署或文档挂载修好就会自愈。"
+              "severity": "warning",
+              "summary": "这台宿主上的 clippy 判词读数整族 15 分钟里一条样点都没有：`cogneva_clippy_verdict_present` / `cogneva_clippy_pending_revs` / `cogneva_clippy_verdict_unparsable_lines` 三条都消失了，所以此刻没有任何东西在回答「主线这一笔过没过 clippy」。这一条与同族另外三条是分开的：那三条各自比一个值，值不在时它们**都是空的**——空集不触发，于是「没人量」在面板上与「量出来都好」长得一模一样，这正是缺席要单独占一条规则的理由。两种成因：宿主读数通道停了，或者生产者这一轮退 3（读不到输入）时按契约一条都不印。查法：先看抓取端点 `up` 里 `job` 取 `cogneva-host-readings` 的那条还在不在，再以 cogneva 用户跑 `systemctl --user list-timers cogneva-host-readings.timer` 与 `journalctl --user -u cogneva-host-readings.service`；以 root 跑会报「Unit not found」，那不是没装。窗口取 15 分钟：读数每拍都印，够跨过一次滚动重启，又短到不用「等一会儿再看」。"
+            },
+            {
+              "name": "alert_rule_count_reading_stopped",
+              "promql": "absent_over_time(cogneva_alert_rule_count{state=\"agrees\"}[15m])",
+              "condition": {
+                "greater_than": 0.0
               },
-              {
-                "name": "acceptance_census_never_completed",
-                "promql": "max by (node) (cogneva_acceptance_present) == 0",
-                "condition": {
-                  "equal": 0.0
-                },
-                "severity": "warning",
-                "summary": "验收面：普查跑得成，但**一份跑完的都没有**。`cogneva_acceptance_present` 在「从来没有一份跑完的普查」时写 0，其余时间写 1，且为 0 时这一族其余的序列一条都不印。所以它与「全部通过」在面板上同形：没有快照时判词那一族是空的，看不出是没量过还是全绿——这正是这一格要单独存在、单独告警的理由。先看生产者这一拍为什么一份都没跑完（解析器起不来时生产者会退 3 且什么都不印，那是 `acceptance_reading_stopped` 管的事；退 1 且 `present=0` 才是这一条）。阈值取等于 0 而不是「连续若干拍」：这不是会自己攒回来的数，它停在 0 的每一拍都意味着验收面此刻没有读数可用。severity 取 warning：它挡住的是「验收面有没有读数」，不说明正在跑的东西坏了。"
+              "severity": "warning",
+              "summary": "「进程手里的规则集与 ConfigMap 声明的是不是同一份」这条读数 15 分钟里一条样点都没有：`cogneva_alert_rule_count` 带 `state=\"agrees\"` 的那一格（`readout=\"rule_loaded_vs_configmap\"`，值 1 表示同一份、0 表示不同）消失了。它断了不等于两份一致：同族的 `declared` / `loaded` / `document_readable` 三格也只是让读者自己相减，相减不出「有没有人量过」。两份规则集不一致时这条读数读 0，而**没有样点**与读 0 在告警面上是两件事，所以缺样本必须自己一条判据——把 `== 0` 写进同一条规则只会让它在没有样点时继续安静。发布者有两个：`cogneva` 与 `cogneva-evolution`，两处都消失才说明进程没了或它们都读不到挂载的那份文档。查法：`kubectl -n cogneva get configmap cogneva-json` 看文档在不在，再 `kubectl -n cogneva exec <pod> -- curl -s localhost:8080/metrics` 看这两格印没印。窗口 15 分钟，够跨过一次滚动重启。"
+            },
+            {
+              "name": "alert_rule_set_disagrees_with_configmap",
+              "promql": "min without (pod, container, instance, endpoint, service, namespace) (cogneva_alert_rule_count{state=\"agrees\"})",
+              "condition": {
+                "less_than": 1.0
               },
-              {
-                "name": "acceptance_reading_stopped",
-                "promql": "absent_over_time(cogneva_acceptance_present[15m])",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "验收面的读数整族 15 分钟里一条样点都没有：没有任何东西在说「验收现在什么形状」。这一族由首机侧的普查生产者按抓取每拍现印，所以缺席只有两种解释——生产者进程没了，或者它跑起来但一条都读不出来（解析器起不来时它按契约退 3、什么也不印，正是这一种）。两种都不等于「验收全绿」，而 `acceptance_census_never_completed` 在族缺席时同样是空的，于是「没在跑」与「跑得很好」读起来一样。窗口取 15 分钟：普查本身 15 分钟一拍，这个窗口跨得过头，不会被一次滚动重启误报；刷新那一半死掉则由 `acceptance_snapshot_not_refreshed` 分开管，两条一起才没有缝。severity 取 warning，与宿主读数通道其余三条（生产者坏了、读不到、端点抓不到）同档。"
+              "severity": "warning",
+              "summary": "进程手里的规则集与 ConfigMap 声明的那一份对不上了：这一格读 0。0 有两个来源，规则条数不同，或者挂载的那份文档根本读不出来（同族 `document_readable` 那一格同时是 0，先用它分流）；`declared` 与 `loaded` 两格是这份判词背后的两个数。按进程留一行（`job` 是发布者，`pod` 只是抓取坐标，滚动一次就换），所以它点名的是哪个进程对不上，不是一个下一次部署就消失的 Pod。它与 `alert_rule_count_reading_stopped` 是两条：那一条管「一个样点都没有」，这一条管「有样点、值是 0」；把两件事并进同一条，缺样本时这条会安静，而缺样本恰恰是这条自己要报的情况之一。阈值小于 1 而不是等于 0：发布侧只发 1 或 0，写小于 1 让「不是 1 的任何值」都算不一致。severity 取 warning：进程仍在服务，错的是它据以判断的那份规则集，下一次部署或文档挂载修好就会自愈。"
+            },
+            {
+              "name": "acceptance_census_never_completed",
+              "promql": "max by (node) (cogneva_acceptance_present) == 0",
+              "condition": {
+                "equal": 0.0
               },
-              {
-                "name": "acceptance_snapshot_not_refreshed",
-                "promql": "time() - max by (node) (cogneva_acceptance_observed_timestamp_seconds) > 3600",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "验收面的普查一小时没有出新快照。序列还在、值也不动——这正是「停在最后一次的读数」那种形状：生产者活着、每拍把同一份旧快照印出去，退出码还是 0，面板上一片安静。普查 15 分钟一拍、一趟实测约 5 分钟，所以一小时等于连错过四趟，够长到不会因为某一趟恰好卡在别人半成品上误报。与上一条分工：族整条没了是生产者死，这一条是生产者活着但刷新那一半死了（读快照那一半是毫秒级的，写快照那一半才要跑几分钟）。修法先看生产者自己拉起的刷新进程还在不在、`flock` 是否被上次那趟占住。severity 取 warning。"
+              "severity": "warning",
+              "summary": "验收面：普查跑得成，但**一份跑完的都没有**。`cogneva_acceptance_present` 在「从来没有一份跑完的普查」时写 0，其余时间写 1，且为 0 时这一族其余的序列一条都不印。所以它与「全部通过」在面板上同形：没有快照时判词那一族是空的，看不出是没量过还是全绿——这正是这一格要单独存在、单独告警的理由。先看生产者这一拍为什么一份都没跑完（解析器起不来时生产者会退 3 且什么都不印，那是 `acceptance_reading_stopped` 管的事；退 1 且 `present=0` 才是这一条）。阈值取等于 0 而不是「连续若干拍」：这不是会自己攒回来的数，它停在 0 的每一拍都意味着验收面此刻没有读数可用。severity 取 warning：它挡住的是「验收面有没有读数」，不说明正在跑的东西坏了。"
+            },
+            {
+              "name": "acceptance_reading_stopped",
+              "promql": "absent_over_time(cogneva_acceptance_present[15m])",
+              "condition": {
+                "greater_than": 0.0
               },
-              {
-                "name": "acceptance_items_stale_persisting",
-                "promql": "max by (node) ((min_over_time(cogneva_acceptance_items{verdict=\"stale\"}[30m]) > 0) and (count_over_time(cogneva_acceptance_items{verdict=\"stale\"}[1h]) > count_over_time(cogneva_acceptance_items{verdict=\"stale\"}[30m])))",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "验收面连着两趟普查都有规格判成 stale：`cogneva_acceptance_items` 上 verdict=stale 的那一条在半小时里每一拍都大于 0，而且要那半小时确实被采样铺满（拿一小时窗口的采样数大于半小时窗口的采样数来证）——不然进程刚起的那几十秒会让半个小时的断言只凭一个样点成立。单拍 stale 可能不是规格漂了——这趟普查读的是工作树此刻盘上的样子，别人正在飞的改动会被读成规格与代码对不上；所以判据取「持续」而不取「出现过」，用 `min_over_time` 让窗口里每一拍都必须大于 0。看这条之前先看 `cogneva_acceptance_dirty_files`：树在动的时候先等它静下来再看，静下来仍然连着两趟红，才是规格真的漂了。九种判词里只有 stale 进这条规则，其余八种各有自己的意思（还没轮到、跑不起来、机器判不了），并进来只会让「规格说谎」与「工具没跑」同形。severity 取 warning：它说的是验收规格与代码不一致，不是集群此刻在坏。"
+              "severity": "warning",
+              "summary": "验收面的读数整族 15 分钟里一条样点都没有：没有任何东西在说「验收现在什么形状」。这一族由首机侧的普查生产者按抓取每拍现印，所以缺席只有两种解释——生产者进程没了，或者它跑起来但一条都读不出来（解析器起不来时它按契约退 3、什么也不印，正是这一种）。两种都不等于「验收全绿」，而 `acceptance_census_never_completed` 在族缺席时同样是空的，于是「没在跑」与「跑得很好」读起来一样。窗口取 15 分钟：普查本身 15 分钟一拍，这个窗口跨得过头，不会被一次滚动重启误报；刷新那一半死掉则由 `acceptance_snapshot_not_refreshed` 分开管，两条一起才没有缝。severity 取 warning，与宿主读数通道其余三条（生产者坏了、读不到、端点抓不到）同档。"
+            },
+            {
+              "name": "acceptance_snapshot_not_refreshed",
+              "promql": "time() - max by (node) (cogneva_acceptance_observed_timestamp_seconds) > 3600",
+              "condition": {
+                "greater_than": 0.0
               },
-              {
-                "name": "acceptance_census_covered_no_specs",
-                "promql": "max by (node) (cogneva_acceptance_specs) == 0",
-                "condition": {
-                  "equal": 0.0
-                },
-                "severity": "warning",
-                "summary": "验收面的普查跑完了、也解析得动，却**一份规格都没覆盖**：`cogneva_acceptance_specs` 这一拍是 0，而能发出这一条就说明普查本身是完整的。0 份被覆盖的规格与「全部通过」在判词那一族上同形——九种判词一条都不印，面板一片安静，而这次安静的原因不是规格都好，是根本没有规格被读。它与两个兄弟分工：整族序列缺席是生产者没了（`acceptance_reading_stopped`），`present` 为 0 是从没跑完过一趟（`acceptance_census_never_completed`），这一条是「有跑完的普查、解析得动、覆盖零份」。生产者在一份都没跑完时根本不发这一格，所以「没有普查」不会被这条读成 0 份，缺席由前两条承担。身份维 {node} 来自抓取时按节点名打的标签：一台宿主一个生产者，覆盖几份是那台机器上的事。severity 取 warning：它说明验收面此刻没有读数可用，不说明正在跑的东西坏了。先查那台机器上规格清单为什么是空的（路径配错、清单读成空、或解析器起不来——最后一种按契约退 3 且什么都不印，归 `acceptance_reading_stopped` 管）。"
+              "severity": "warning",
+              "summary": "验收面的普查一小时没有出新快照。序列还在、值也不动——这正是「停在最后一次的读数」那种形状：生产者活着、每拍把同一份旧快照印出去，退出码还是 0，面板上一片安静。普查 15 分钟一拍、一趟实测约 5 分钟，所以一小时等于连错过四趟，够长到不会因为某一趟恰好卡在别人半成品上误报。与上一条分工：族整条没了是生产者死，这一条是生产者活着但刷新那一半死了（读快照那一半是毫秒级的，写快照那一半才要跑几分钟）。修法先看生产者自己拉起的刷新进程还在不在、`flock` 是否被上次那趟占住。severity 取 warning。"
+            },
+            {
+              "name": "acceptance_items_stale_persisting",
+              "promql": "max by (node) ((min_over_time(cogneva_acceptance_items{verdict=\"stale\"}[30m]) > 0) and (count_over_time(cogneva_acceptance_items{verdict=\"stale\"}[1h]) > count_over_time(cogneva_acceptance_items{verdict=\"stale\"}[30m])))",
+              "condition": {
+                "greater_than": 0.0
               },
-              {
-                "name": "upgrade_path_not_on_the_release",
-                "promql": "max by (node) (helm_release_revision_vs_workload_rev{state!=\"no-release\"})",
-                "condition": {
-                  "less_than": 1.0
-                },
-                "severity": "warning",
-                "summary": "升级路径没走通：这一拍 release 与现网工作负载不是同一版，或 release 本身不是 deployed，判据值是 {value}。判的是这两个修订号，不是修订号本身：release 的修订号往前走了、状态却是 failed，说明那次 upgrade 跑失败后再没人重跑，这一版根本不在现网，而只比修订号的旧读法会把它读成已经升上去了（2026-10-20 现网就是这个形状：release 停在 revision 2 / failed，同集群的 deployment 已滚到 revision 573）。两个数各自一个 gauge，所以面板上能分开看是 release 落后还是工作负载跑到了前面。state 为 no-release 的集群走 apply 投递、本来就没有 release，按构造排掉，不归这条管。**先看 `delivery` 标签再动手，它把两种处置相反的处境分开了**：`delivery` 取 `helm` 时说的是这台集群的 Pod 模板确实由 helm 写，那次 upgrade 失败后再没人重跑 ⇒ 重跑 upgrade 或把它回滚；`delivery` 取 `deployer` 时说的是工作负载跑着 `main-<rev>` 签、Pod 模板一直是主线部署器写的，那条 release 只是曾经试过 helm 留下的记录 ⇒ 处置是**删掉那条记录**（`helm uninstall --keep-resources` 或删它的 Secret），不是重跑 upgrade——重跑到天亮也只会再撞一次字段所有权冲突，因为两边抢的是同一批字段。判据取镜像签而不取 `app.kubernetes.io/managed-by: Helm`：chart 自己把这个标签写进了渲染产物（`.Release.Service`），经 apply 投递的对象一字不差地带着它，按它判会把一台 apply 集群读成「helm 管的集群升级失败」。样本缺席也不归这条管：读数停了自己没有样本，由 upgrade_path_reading_stopped 报，两件事的修法不同——那边修生产者，这边按上面两条处置。"
+              "severity": "warning",
+              "summary": "验收面连着两趟普查都有规格判成 stale：`cogneva_acceptance_items` 上 verdict=stale 的那一条在半小时里每一拍都大于 0，而且要那半小时确实被采样铺满（拿一小时窗口的采样数大于半小时窗口的采样数来证）——不然进程刚起的那几十秒会让半个小时的断言只凭一个样点成立。单拍 stale 可能不是规格漂了——这趟普查读的是工作树此刻盘上的样子，别人正在飞的改动会被读成规格与代码对不上；所以判据取「持续」而不取「出现过」，用 `min_over_time` 让窗口里每一拍都必须大于 0。看这条之前先看 `cogneva_acceptance_dirty_files`：树在动的时候先等它静下来再看，静下来仍然连着两趟红，才是规格真的漂了。九种判词里只有 stale 进这条规则，其余八种各有自己的意思（还没轮到、跑不起来、机器判不了），并进来只会让「规格说谎」与「工具没跑」同形。severity 取 warning：它说的是验收规格与代码不一致，不是集群此刻在坏。"
+            },
+            {
+              "name": "acceptance_census_covered_no_specs",
+              "promql": "max by (node) (cogneva_acceptance_specs) == 0",
+              "condition": {
+                "equal": 0.0
               },
-              {
-                "name": "upgrade_path_reading_stopped",
-                "promql": "absent_over_time(helm_release_revision_vs_workload_rev[35m])",
-                "condition": {
-                  "greater_than": 0.0
-                },
-                "severity": "warning",
-                "summary": "安装/升级/回滚面的读数停了：过去 35 分钟里一次样本都没有，能发出这条告警时 {value} 是 1。这条读数在宿主上起 helm 与 kubectl 读本机集群；它一停，release 与工作负载到底同不同版就没有任何东西在判，而面板上「没有告警」与「两边一致」同形。先看那台机器上 helm 还在不在、kubectl 还连不连得上集群：读不到时它按契约退 3 且一条序列都不印，正是为了让这一条能红。"
-              }
-              ,
-                {
-                  "name": "live_image_too_old",
-                  "promql": "max by (node) (image_wiring_live_commit_age_seconds)",
-                  "condition": {
-                    "greater_than": 21600.0
-                  },
-                  "severity": "warning",
-                  "summary": "现网在跑的那一版是六小时以前的提交：判据值是那一版**提交到现在**的秒数（{value}）。这一格刻意不判「现网这一版不是主线尖端」——部署器按小时滚、主线又在持续提交，两者不同步是常态（2026-10-20 六小时窗实测：这一格最大 4684 秒，也就是正常滞后一个多小时），把常态判成失败会让这条告警永远在响、也就再没人看它。判的是流水线连续六小时没把任何新东西送上线。成因分三类，要分开读：主线没有绿的 rev（看 mainline_ci_verdict_failed）、部署器自己判了卡住（看 mainline_not_progressing）、构建或拉取失败。看「差几笔」用 image_wiring_behind_commits，看「部署器以为上到哪一版」用同族序列的 deployer_rev 标签。读不到时它整条序列都不印而不是印 0，那一半由 live_image_reading_stopped 报。"
-                },
-                {
-                  "name": "live_image_reading_stopped",
-                  "promql": "absent_over_time(image_wiring_yes[35m])",
-                  "condition": {
-                    "greater_than": 0.0
-                  },
-                  "severity": "warning",
-                  "summary": "CI/构建/部署面的「滚没滚」读数停了：过去 35 分钟里一次样本都没有，能发出这条告警时 {value} 是 1。这条读数在宿主上从集群读工作负载镜像、从主线仓库读 main 头；它一停，「现网那一版是多久以前提交的」就没有任何东西在判，而面板上「没有告警」与「两边一致」同形。先看那台机器上 kubectl 还连不连得上集群、主线仓库还在不在：读不到时它按契约退 3 且一条序列都不印，正是为了让这一条能红。"
-                }
-              ]
+              "severity": "warning",
+              "summary": "验收面的普查跑完了、也解析得动，却**一份规格都没覆盖**：`cogneva_acceptance_specs` 这一拍是 0，而能发出这一条就说明普查本身是完整的。0 份被覆盖的规格与「全部通过」在判词那一族上同形——九种判词一条都不印，面板一片安静，而这次安静的原因不是规格都好，是根本没有规格被读。它与两个兄弟分工：整族序列缺席是生产者没了（`acceptance_reading_stopped`），`present` 为 0 是从没跑完过一趟（`acceptance_census_never_completed`），这一条是「有跑完的普查、解析得动、覆盖零份」。生产者在一份都没跑完时根本不发这一格，所以「没有普查」不会被这条读成 0 份，缺席由前两条承担。身份维 {node} 来自抓取时按节点名打的标签：一台宿主一个生产者，覆盖几份是那台机器上的事。severity 取 warning：它说明验收面此刻没有读数可用，不说明正在跑的东西坏了。先查那台机器上规格清单为什么是空的（路径配错、清单读成空、或解析器起不来——最后一种按契约退 3 且什么都不印，归 `acceptance_reading_stopped` 管）。"
+            },
+            {
+              "name": "upgrade_path_not_on_the_release",
+              "promql": "max by (node) (helm_release_revision_vs_workload_rev{state!=\"no-release\"})",
+              "condition": {
+                "less_than": 1.0
+              },
+              "severity": "warning",
+              "summary": "升级路径没走通：这一拍 release 与现网工作负载不是同一版，或 release 本身不是 deployed，判据值是 {value}。判的是这两个修订号，不是修订号本身：release 的修订号往前走了、状态却是 failed，说明那次 upgrade 跑失败后再没人重跑，这一版根本不在现网，而只比修订号的旧读法会把它读成已经升上去了（2026-10-20 现网就是这个形状：release 停在 revision 2 / failed，同集群的 deployment 已滚到 revision 573）。两个数各自一个 gauge，所以面板上能分开看是 release 落后还是工作负载跑到了前面。state 为 no-release 的集群走 apply 投递、本来就没有 release，按构造排掉，不归这条管。**先看 `delivery` 标签再动手，它把两种处置相反的处境分开了**：`delivery` 取 `helm` 时说的是这台集群的 Pod 模板确实由 helm 写，那次 upgrade 失败后再没人重跑 ⇒ 重跑 upgrade 或把它回滚；`delivery` 取 `deployer` 时说的是工作负载跑着 `main-<rev>` 签、Pod 模板一直是主线部署器写的，那条 release 只是曾经试过 helm 留下的记录 ⇒ 处置是**删掉那条记录**（`helm uninstall --keep-resources` 或删它的 Secret），不是重跑 upgrade——重跑到天亮也只会再撞一次字段所有权冲突，因为两边抢的是同一批字段。判据取镜像签而不取 `app.kubernetes.io/managed-by: Helm`：chart 自己把这个标签写进了渲染产物（`.Release.Service`），经 apply 投递的对象一字不差地带着它，按它判会把一台 apply 集群读成「helm 管的集群升级失败」。样本缺席也不归这条管：读数停了自己没有样本，由 upgrade_path_reading_stopped 报，两件事的修法不同——那边修生产者，这边按上面两条处置。"
+            },
+            {
+              "name": "upgrade_path_reading_stopped",
+              "promql": "absent_over_time(helm_release_revision_vs_workload_rev[35m])",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "安装/升级/回滚面的读数停了：过去 35 分钟里一次样本都没有，能发出这条告警时 {value} 是 1。这条读数在宿主上起 helm 与 kubectl 读本机集群；它一停，release 与工作负载到底同不同版就没有任何东西在判，而面板上「没有告警」与「两边一致」同形。先看那台机器上 helm 还在不在、kubectl 还连不连得上集群：读不到时它按契约退 3 且一条序列都不印，正是为了让这一条能红。"
+            },
+            {
+              "name": "live_image_too_old",
+              "promql": "max by (node) (image_wiring_live_commit_age_seconds)",
+              "condition": {
+                "greater_than": 21600.0
+              },
+              "severity": "warning",
+              "summary": "现网在跑的那一版是六小时以前的提交：判据值是那一版**提交到现在**的秒数（{value}）。这一格刻意不判「现网这一版不是主线尖端」——部署器按小时滚、主线又在持续提交，两者不同步是常态（2026-10-20 六小时窗实测：这一格最大 4684 秒，也就是正常滞后一个多小时），把常态判成失败会让这条告警永远在响、也就再没人看它。判的是流水线连续六小时没把任何新东西送上线。成因分三类，要分开读：主线没有绿的 rev（看 mainline_ci_verdict_failed）、部署器自己判了卡住（看 mainline_not_progressing）、构建或拉取失败。看「差几笔」用 image_wiring_behind_commits，看「部署器以为上到哪一版」用同族序列的 deployer_rev 标签。读不到时它整条序列都不印而不是印 0，那一半由 live_image_reading_stopped 报。"
+            },
+            {
+              "name": "live_image_reading_stopped",
+              "promql": "absent_over_time(image_wiring_yes[35m])",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "CI/构建/部署面的「滚没滚」读数停了：过去 35 分钟里一次样本都没有，能发出这条告警时 {value} 是 1。这条读数在宿主上从集群读工作负载镜像、从主线仓库读 main 头；它一停，「现网那一版是多久以前提交的」就没有任何东西在判，而面板上「没有告警」与「两边一致」同形。先看那台机器上 kubectl 还连不连得上集群、主线仓库还在不在：读不到时它按契约退 3 且一条序列都不印，正是为了让这一条能红。"
+            }
+          ]
         },
         "trace_collector": {
           "_comment": "trace 事件按 agent 在内存缓冲直到 AgentEnd 落盘；长任务无界累积会 OOM。超过预算即分块落盘（part 后缀），预算按部署内存定。",
@@ -2801,9 +2834,19 @@ data:
         "deploy_admission": {
           "_comment": "触及 deploy/** 的变更按可执行条件准入，不转人工：chart 必须能渲染且 deploy/rendered 与 chart 一致（render-deploy.sh --check），chart 与 deploy/k3s 静态清单逐字段 parity（check-deploy-parity.sh），且渲染产物描述出来的控制面必须仍然可达（check-control-plane-reachability.sh：Service 的 selector 选中工作负载、targetPort 在选中的负载里声明过、工作负载 replicas 不为 0、探针按名字指的端口在同一个容器里声明过、卷引用的 PVC/ConfigMap 存在、Ingress 后端指向存在的 Service 与端口）。三门都在应用后的树上跑，任一退出非零即拒收并点名；第三条判不了的形状（没有产物、解析失败、缺 python3-yaml）退出码 2，不当 0 读。helm 由 Pod 内挂载的宿主二进制提供；宿主没有 helm 时这一族被点名缺条件而拒收，不退回「等人批」。服务端 dry-run 目前不声明：判定身份按 Role 只在本命名空间，dry-run 覆盖不了的集群级对象会一律报未授权，把整族误杀；扩权是属主的动作。",
           "commands": [
-            ["bash", "deploy/scripts/render-deploy.sh", "--check"],
-            ["bash", "deploy/scripts/check-deploy-parity.sh"],
-            ["bash", "deploy/scripts/check-control-plane-reachability.sh"]
+            [
+              "bash",
+              "deploy/scripts/render-deploy.sh",
+              "--check"
+            ],
+            [
+              "bash",
+              "deploy/scripts/check-deploy-parity.sh"
+            ],
+            [
+              "bash",
+              "deploy/scripts/check-control-plane-reachability.sh"
+            ]
           ]
         },
         "build_timeout_secs": 3600,

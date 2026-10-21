@@ -774,6 +774,52 @@ rows:
     why: >-
       Room for one scrape's buffers. Not derived from anything.
 
+  # --- claim store (per-node account of claims and the image store) -----------
+  - key: claimStore.port
+    source: fixed
+    why: >-
+      The scrape port of the per-node account. An address; the headless Service
+      and the container port are both read from it.
+
+  - key: claimStore.resources.requests.cpu
+    source: override
+    why: >-
+      Two metadata walks per cadence and nothing in between. A derived pair would
+      read the walker's own measured cost; nothing collects it for this DaemonSet.
+
+  - key: claimStore.resources.requests.memory
+    source: override
+    why: >-
+      The walker holds one entry per claim directory and one per store part, so
+      its memory follows the number of entries rather than their bytes -- and the
+      byte counts it publishes say how many entries there are. The request itself
+      is not read back from anything.
+
+  - key: claimStore.resources.limits.cpu
+    source: override
+    why: >-
+      Room for one walk. Not derived from anything.
+
+  - key: claimStore.resources.limits.memory
+    source: override
+    why: >-
+      Room for one walk's directory entries. Not derived from anything.
+
+  - key: claimStore.scanIntervalSecs
+    source: override
+    why: >-
+      The claim walk's cadence. Measured cost is about two seconds for the 200 GB
+      this host holds, which would support a faster cadence, but the reading it
+      feeds (a volume's fill level) moves on the scale of builds. claim_scan_stale
+      is three times this number, so the two are read together.
+
+  - key: claimStore.imageScanIntervalSecs
+    source: override
+    why: >-
+      The image store walk's cadence, slower than the claim walk because the tree
+      is larger and changes on image pulls rather than on writes. image_store_scan_stale
+      is three times this number; the pair is changed together.
+
   # --- mainline deployer ------------------------------------------------------
   - key: mainlineDeployer.cargoBuildJobs
     source: override
