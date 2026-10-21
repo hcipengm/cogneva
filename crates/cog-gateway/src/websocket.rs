@@ -339,6 +339,15 @@ async fn forward_agent_event(
     socket.send(WsMessage::Text(payload.into())).await.is_ok()
 }
 
+/// 这条通知是不是发给这条连接的。
+///
+/// 通知带收件人（`user_id`），而 `notification_tx` 是广播：每个打开的连接都
+/// 会收到每一条。缺这一步，站内通知就成了把别人的通知推给所有人。空身份
+/// 的连接一条都收不到——没有身份就没有收件人可以对。
+fn addressed_to(notification: &cog_core::Notification, user_id: &str) -> bool {
+    !user_id.is_empty() && notification.user_id == user_id
+}
+
 pub async fn handle_socket(
     mut socket: WebSocket,
     state: Arc<GatewayState>,
@@ -360,7 +369,7 @@ pub async fn handle_socket(
     if let Some(ref mgr) = state.connection_manager {
         mgr.register(
             connection_id.clone(),
-            user_id,
+            user_id.clone(),
             device_id,
             platform,
             app_version,
@@ -415,6 +424,11 @@ pub async fn handle_socket(
                 }
             }
             Ok(notification) = notif_rx.recv() => {
+                // 广播通道发给每条连接，收件人写在通知里；不过滤就是把所有人
+                // 的通知群发给每个登录用户。别人的通知不算这条连接的活跃。
+                if !addressed_to(&notification, &user_id) {
+                    continue;
+                }
                 last_activity = tokio::time::Instant::now();
                 let msg = crate::websocket_protocol::ServerMessage::Notification {
                     event_id: notification.id.clone(),
@@ -488,5 +502,34 @@ pub async fn handle_socket(
 
     if let Some(ref mgr) = state.connection_manager {
         mgr.unregister(&connection_id).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::addressed_to;
+    use chrono::Utc;
+
+    fn notification_for(user_id: &str) -> cog_core::Notification {
+        cog_core::Notification {
+            id: uuid::Uuid::new_v4().to_string(),
+            user_id: user_id.to_string(),
+            ntype: cog_core::NotificationType::System,
+            title: "t".into(),
+            body: "b".into(),
+            is_read: false,
+            created_at: Utc::now(),
+            read_at: None,
+        }
+    }
+
+    #[test]
+    fn a_notification_reaches_only_its_recipient() {
+        let alice = notification_for("alice");
+        assert!(addressed_to(&alice, "alice"));
+        assert!(!addressed_to(&alice, "bob"));
+        // 身份为空的连接不在收件人名单上：它对不上任何人，也不该收到所有人。
+        assert!(!addressed_to(&alice, ""));
+        assert!(!addressed_to(&notification_for(""), "alice"));
     }
 }
