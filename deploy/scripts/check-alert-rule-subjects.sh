@@ -273,6 +273,9 @@ POD_SUBJECT = {
     'redis_restarted': 'redis 是 StatefulSet，Pod 名稳定，Pod 就是它',
     'pod_stuck_terminating': '讲的是这个 Pod 的删除侧',
     'orphans_unreaped': '讲的是这个 Pod 里没被回收的进程',
+    'container_cpu_throttled': '讲的就是这个容器被自己的 CPU 上限按住多久',
+    'container_log_near_rotation_cap': '讲的就是这个容器的日志有没有被轮转',
+    'container_disk_write_rate_high': '讲的就是这个容器在写盘（宿主面只说盘忙，不说谁在写）',
 }
 
 # 第三种：身份正是这条规则**讲的那个东西**，而且有测试把它钉住。stream_consumer_stalled
