@@ -1327,14 +1327,30 @@ mod tests {
     /// Content of a literal YAML block scalar, keyed by its `data` entry name.
     /// The block's indentation is syntax, not content, so it is stripped at the
     /// header's depth rather than guessed at.
+    ///
+    /// The header is the key plus a literal scalar indicator, and YAML states
+    /// three of them: `|`, `|-` and `|+`. They differ only in the trailing
+    /// newline the block keeps, which JSON does not read -- so all three name
+    /// the same content. Matching one spelling reads the other two as "no
+    /// block at all": the generated baseline carries whichever indicator its
+    /// renderer emits, and a hand-fix that changes the artifact is undone by
+    /// the next render, so the reader has to accept the form the generator
+    /// writes rather than the one a previous edit left behind.
     fn configmap_block_scalar(manifest: &str, key: &str) -> Option<String> {
         let header = format!("{key}: |");
         let mut lines = manifest.lines();
-        let depth = loop {
+        let (depth, strip_final_newline) = loop {
             let line = lines.next()?;
-            if line.trim() == header {
-                break line.len() - line.trim_start().len();
-            }
+            let trimmed = line.trim();
+            let Some(indicator) = trimmed.strip_prefix(&header) else {
+                continue;
+            };
+            let strip = match indicator {
+                "" | "+" => false,
+                "-" => true,
+                _ => continue,
+            };
+            break (line.len() - line.trim_start().len(), strip);
         };
         let mut block = String::new();
         for line in lines {
@@ -1348,7 +1364,39 @@ mod tests {
             block.push_str(&line[depth..]);
             block.push('\n');
         }
+        if strip_final_newline {
+            block.pop();
+        }
         Some(block)
+    }
+
+    #[test]
+    fn a_literal_block_is_read_under_every_indicator_yaml_states() {
+        let manifest = |indicator: &str| {
+            format!(
+                "apiVersion: v1\nkind: ConfigMap\ndata:\n  cogneva.json: |{indicator}\n    {{\"a\":1}}\n  other: x\n"
+            )
+        };
+        for indicator in ["", "-", "+"] {
+            let block = configmap_block_scalar(&manifest(indicator), "cogneva.json")
+                .unwrap_or_else(|| panic!("indicator |{indicator} names the same block"));
+            assert_eq!(block.trim(), "{\"a\":1}", "indicator |{indicator}");
+        }
+        // The indicator is the only thing that separates them: `-` strips the
+        // final newline, the other two keep it.
+        assert!(configmap_block_scalar(&manifest(""), "cogneva.json")
+            .unwrap()
+            .ends_with('\n'));
+        assert!(!configmap_block_scalar(&manifest("-"), "cogneva.json")
+            .unwrap()
+            .ends_with('\n'));
+        // A folded scalar is not a literal block: its line breaks are folded
+        // into spaces, so reading it as JSON would be reading a different
+        // document and failing afterwards for a reason that names JSON.
+        assert_eq!(
+            configmap_block_scalar("data:\n  cogneva.json: >\n    x\n", "cogneva.json"),
+            None
+        );
     }
 
     #[test]
