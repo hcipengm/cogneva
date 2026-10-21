@@ -548,17 +548,23 @@ async fn e2e_tier_migration_increments_prometheus_counter() {
     app.shutdown.trigger();
 }
 
-// ─── Test 6: Quota exceeded returns 429 ──────────────────────────────
+// ─── Test 6: A management call is not a token spend ──────────────────
 
+/// A user whose daily token balance reads zero can still use the management
+/// API, including the endpoint that reports that balance.
+///
+/// The quota middleware used to sit on the four management route groups and
+/// charge every request by its body length against the daily token allowance.
+/// Those calls spend no model tokens, so the balance it drove down measured
+/// nothing about the user's spend — and at zero it refused even the request
+/// that reads the balance, which is the one call an operator makes to find out
+/// why. The balance itself stays readable; nothing on this surface deducts it.
 #[tokio::test]
-async fn e2e_quota_exceeded_returns_429() {
+async fn e2e_a_management_call_is_not_refused_by_the_token_allowance() {
     let Some(app) = spawn_app(false, None).await else {
         return;
     };
 
-    // Drain the specific user's quota by directly setting the Redis key to 0.
-    // (Using pre_check to drain is unreliable because Redis DECR can produce
-    // negative values that break the u64 read-back in the manager.)
     let user_id = uuid::Uuid::new_v4().to_string();
     {
         let Some(mut conn) = open_test_redis().await else {
@@ -590,10 +596,13 @@ async fn e2e_quota_exceeded_returns_429() {
     let access = token_pair.access_token;
     let token = format!("Bearer {}", access);
 
-    let (status, _) = req_oneshot(
+    // `/api/v1/quota/remaining` is the user-scoped reading: it takes the subject
+    // from the token rather than answering for `anonymous`, which is what makes
+    // it the call an exhausted user needs to be able to make.
+    let (status, body) = req_oneshot(
         app.state.clone(),
         "GET",
-        "/api/v1/quota",
+        "/api/v1/quota/remaining",
         Body::empty(),
         Some(token),
     )
@@ -601,8 +610,12 @@ async fn e2e_quota_exceeded_returns_429() {
 
     assert_eq!(
         status,
-        StatusCode::TOO_MANY_REQUESTS,
-        "expected 429 when quota exhausted"
+        StatusCode::OK,
+        "reading one's own quota is a management call, not a token spend"
+    );
+    assert_eq!(
+        body["remaining"], 0,
+        "the balance is still reported as it is: {body}"
     );
 
     app.shutdown.trigger();

@@ -23,9 +23,14 @@
 //! than a fault. A reading with no reader is a name nobody sees, so the family
 //! stops at the decisions.
 //!
-//! The rule that reads this family is `quota_refusals_happening` in
-//! `deploy/helm/cogneva/files/cogneva.json`, registered against this file in
-//! `crates/cogneva/tests/observability_alert_rule_contract_test.rs`.
+//! No rule reads this family today, and that is the honest shape of it: the one
+//! caller that charged the manager was a middleware on the gateway's management
+//! route groups, removing it left nothing that can reach a refusal, and a rule
+//! over a family that cannot move would fire never and mean nothing when it did.
+//! The family stays published at zero — both cells, every scrape — so that the
+//! vocabulary a refusal would use already exists, and so that the day
+//! enforcement lands on a surface that actually spends tokens, the only thing
+//! missing is the reader.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -65,12 +70,11 @@ impl QuotaReadings {
         self.allowed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The check was refused. The middleware turns `allowed == false` into a 429
-    /// that carries the reason back to that one caller (`error`, `remaining`,
-    /// `estimated_tokens`), so what this counter adds is not the reason but the
-    /// aggregate: every refusal lands on the caller it refused and nowhere else,
-    /// and "how many were refused over a window" is not recoverable from any
-    /// single response.
+    /// The check was refused. A caller that refuses turns `allowed == false`
+    /// into an answer that carries the reason back to that one caller, so what
+    /// this counter adds is not the reason but the aggregate: every refusal
+    /// lands on the caller it refused and nowhere else, and "how many were
+    /// refused over a window" is not recoverable from any single response.
     pub fn record_refused(&self) {
         self.refused.fetch_add(1, Ordering::Relaxed);
     }

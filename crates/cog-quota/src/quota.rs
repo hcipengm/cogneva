@@ -144,9 +144,9 @@ impl QuotaManager {
         // requests so callers get a clear 429 instead of silent pass-through.
         let allowed = remaining > 0 && remaining >= estimated_tokens;
 
-        // Counted at the decision, which is the only place that knows it: the
-        // middleware turns the refusal into a bodyless 429, so this counter is
-        // the whole of what an operator can learn about it.
+        // Counted at the decision, which is the only place that knows it: a
+        // refusal reaches only the caller it refused, so this counter is the
+        // whole of what an operator can learn about the rate.
         if allowed {
             self.readings.record_allowed();
         } else {

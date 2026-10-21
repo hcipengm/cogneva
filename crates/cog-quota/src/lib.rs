@@ -12,15 +12,18 @@
 //!   them and nothing serves them today.
 //! - The decisions themselves, at the process metrics face:
 //!   [`observable::QuotaObservable`] publishes how many checks ran and how many
-//!   were refused, and the `quota_refusals_happening` rule reads the refusals.
+//!   were refused.
 //!
-//! In-flight enforcement has one implementation and it is not here: the axum
-//! middleware lives in `cog_gateway::quota_middleware`, and it reaches this
-//! crate's manager through [`cog_core::QuotaManager`] rather than by depending
-//! on this crate. A second copy used to live here, concrete-typed
-//! (`Arc<QuotaManager>`), which is why no contract-based consumer could call
-//! it: it was reachable only from something that already depended on this
-//! crate, and nothing does.
+//! Nothing charges this manager today, and that is deliberate. The one caller
+//! was an axum middleware on the gateway's four management route groups, which
+//! charged each request by the length of its body: those calls spend no model
+//! tokens, so the figure it deducted had nothing to do with what the platform
+//! spends for that user, and once the balance reached zero it refused the
+//! request that reads the balance. It is gone. What a user's work actually
+//! spends is in the gateway's LLM ledger, per call, and attributing that to a
+//! user needs the task → owner join this crate does not have — so the
+//! pre-check surface stays present and inert until that attribution lands,
+//! rather than enforcing a number nobody measured.
 
 pub mod agent_budget;
 pub mod billing;

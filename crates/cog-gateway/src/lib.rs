@@ -57,7 +57,6 @@ pub mod plugin;
 pub mod processes;
 pub mod prometheus_render;
 pub mod promotion_gate;
-pub mod quota_middleware;
 pub mod raw_logs;
 pub mod secret_layout;
 pub mod secret_write;
@@ -176,6 +175,14 @@ pub struct GatewayState {
     pub event_tx: broadcast::Sender<cog_core::AgentEvent>,
     pub task_event_tx: broadcast::Sender<cog_core::TaskEvent>,
     pub jwt_manager: Arc<dyn cog_core::AuthProvider>,
+    /// 单用户每日额度，只被 `/api/v1/quota*` 读，不再由任何中间件扣减。
+    ///
+    /// 管理面曾经挂过一层按请求体长度估 token 的配额中间件，扣的是这个额度：
+    /// 那条路径上的请求一个模型 token 都不花，估出来的数与平台替这个用户真正
+    /// 花掉的钱无关，而扣到 0 之后连「读自己还剩多少」都会被 429。真正的花销
+    /// 账在网关的 LLM 台账里（`gateway_llm_usage`），按用户摊到这一层需要
+    /// 「任务 → 属主」的归属，那是另一件事。所以在归属落地之前，管理面上没有
+    /// 配额执法——把这一层再挂回任何一个路由组之前，先想清楚它扣的是什么。
     pub quota_manager: Arc<dyn cog_core::QuotaManager>,
     /// 5-level quota hierarchy (user → workspace → team → org → global). When
     /// `None`, the gateway falls back to the legacy single-level
@@ -561,14 +568,6 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         }
     });
 
-    let quota_layer = from_fn({
-        let state = state.clone();
-        move |req: Request, next: Next| {
-            let manager = state.quota_manager.clone();
-            async move { crate::quota_middleware::quota_middleware(manager, req, next).await }
-        }
-    });
-
     // Admin-level protected routes (orchestrator / agents / quota-admin / hooks write)
     let admin_routes = Router::new()
         .route("/api/v1/tasks", post(tasks::create_task_handler))
@@ -775,7 +774,6 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/admin/promotion-gate",
             post(promotion_gate::set_promotion_gate_handler),
         )
-        .layer(quota_layer.clone())
         .layer(auth::middleware::require_role(
             cog_core::RoleRequirement::Admin,
         ))
@@ -953,7 +951,6 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             get(agent_heartbeats_handler),
         )
         .route("/api/v1/alerts/active", get(alerts_active_handler))
-        .layer(quota_layer.clone())
         .layer(auth::middleware::require_role(
             cog_core::RoleRequirement::Operator,
         ))
@@ -1021,7 +1018,6 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/notifications/read-all",
             post(notifications::mark_all_read_handler),
         )
-        .layer(quota_layer.clone())
         .layer(auth::middleware::require_role(
             cog_core::RoleRequirement::Viewer,
         ))
@@ -1039,7 +1035,6 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/v1/auth/device", post(auth::device_handler))
         .route("/api/v1/auth/biometric", post(auth::biometric_handler))
-        .layer(quota_layer.clone())
         .layer(session_layer.clone())
         .layer(auth_layer.clone());
 

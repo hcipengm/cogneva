@@ -65,8 +65,9 @@ const PRODUCERS: &[(&str, &[(&str, bool)])] = &[
     ("crates/cog-memory/src/observable.rs", &[("D4", true)]),
     // Declares no dimension either: the quota's counters are process-wide, the
     // same number whichever dimension is asked for. Its published set is pinned
-    // by `crates/cog-quota/tests/quota_reading_test.rs`, and the family's only
-    // reader is the `quota_refusals_happening` rule.
+    // by `crates/cog-quota/tests/quota_reading_test.rs`. Nothing reads the
+    // family at present: the layer that could produce a refusal is gone, so its
+    // cells stay at zero and a rule over them could not fire on anything.
     ("crates/cog-quota/src/observable.rs", &[]),
     (
         "crates/cog-observability/src/observable.rs",

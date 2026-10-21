@@ -971,19 +971,9 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_knowledge_retrieval_total",
         "crates/cog-core/src/contract/knowledge.rs",
     ),
-    // 配额自己的决定。它此前在指标面上完全不可见：`QuotaMetrics` 把五个 family
-    // 注册进自己建的私有 registry、唯一调用点在测试里，而中间件发出的 429 只把
-    // 理由回给那一个调用方 ⇒ 「配额在拦谁」在单个响应里拼不出来。这条读数走的不是
-    // 那条路：`cog-quota` 的 Observable 在 init 时发布，网关在 init 时取快照，
-    // `/metrics` 按 `RawMetric` 渲染 ⇒ 它随产出者消失，没有行留在 store 里
-    // （所以不进 `metric_names::ALL` 那个闭集），登记点就是这条规则。
-    (
-        "quota_pre_checks_total",
-        "crates/cog-quota/src/observable.rs",
-    ),
-    // 闸门**此刻**由哪一路掌权，与上面那条同形：五格由产出进程按 `RawMetric` 渲染，
-    // 随产出者消失，store 里没有行（所以同样不进 `metric_names::ALL` 那个闭集），
-    // 登记点就是 `memory_raw_backlog_aged_out` 的抑制子句——它读
+    // 闸门**此刻**由哪一路掌权：五格由产出进程按 `RawMetric` 渲染，随产出者消失，
+    // store 里没有行（所以不进 `metric_names::ALL` 那个闭集），登记点就是
+    // `memory_raw_backlog_aged_out` 的抑制子句——它读
     // `pull_gate_local|pull_gate_shared|pull_gate_both` 这三格，好让「闸门被任何一路
     // 按住」不再被那条规则读成「扫不动／漏」。名字取自
     // `crates/cog-memory/src/observable.rs` 的 `PULL_GATE_HOLDER_METRIC`，五个标签
