@@ -702,6 +702,27 @@ rows:
       60 attempts at 5 seconds is the five-minute startup budget. The number is
       the slowest legitimate start written down, not a derived bound.
 
+  - key: healthProbes.claimStoreStartup.periodSeconds
+    source: fixed
+    why: >-
+      The same probe contract, kept at the same period as every other startup
+      budget: the claim store's budget differs in how many attempts it allows,
+      not in how often it is asked.
+
+  - key: healthProbes.claimStoreStartup.timeoutSeconds
+    source: fixed
+    why: >-
+      The startup half of the probe contract, for the claim store's own budget.
+
+  - key: healthProbes.claimStoreStartup.failureThreshold
+    source: override
+    why: >-
+      120 attempts at 5 seconds is the ten-minute budget, twice the 3m35s start
+      measured on this host with containerd, podman and buildah roots at a 200m
+      quota. The measurement exists and was turned into a number by hand; no loop
+      re-measures start durations back into it, and the roots only grow with the
+      images pulled.
+
   # --- host document organising ----------------------------------------------
   - key: hostDocuments.approvalTtlSecs
     source: override
