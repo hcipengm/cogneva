@@ -345,6 +345,11 @@ grafana:
     - grafana-piechart-panel
 
 # ─── Node Exporter ───────────────────────────────────────────────
+# 注意：`resources` 在这个键下**不生效**。chart 91 的 node-exporter 是子 chart，
+# 容器资源只读下面那一段 `prometheus-node-exporter.resources`。2026-10-22 实测：
+# 把这里的 requests/limits 换成哨兵值（111m）重新 `helm template`，渲染出的
+# DaemonSet 里一个都没有，仍是 50m——写法在这里是历史痕迹，真正生效的数值在
+# `prometheus-node-exporter:` 段（两处目前数值相同，所以改了也看不出来）。
 nodeExporter:
   enabled: true
   resources:
@@ -356,6 +361,8 @@ nodeExporter:
       memory: 256Mi
 
 # ─── kube-state-metrics ──────────────────────────────────────────
+# 同上：`resources` 在这个键下不生效，子 chart 只读下面的
+# `kube-state-metrics.resources`（同一次实测：哨兵值渲染不出来）。
 kubeStateMetrics:
   enabled: true
   resources:
