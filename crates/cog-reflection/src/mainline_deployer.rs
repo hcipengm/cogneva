@@ -86,10 +86,35 @@ const OVERLAY_ASSET_LIST_PATH: &str = "deploy/overlay-assets.json";
 /// 这张表的用途是让「不刷新」成为一条要有人辩护的声明，而不是一次遗漏：
 /// 门禁读 Dockerfile 最终阶段的 COPY 行，凡不在资产表里、又不在
 /// [`OVERLAY_BINARY_DEST`] 上的落点，必须在这里留下理由，否则测试红。
-const OVERLAY_UNREFRESHABLE: &[(&str, &str)] = &[(
-    "/opt/cogneva/web",
-    "由镜像的 node 阶段从 web/src 构建，overlay 内没有 node 工具链，新 rev 的前端产物无法在 overlay 内生成",
-)];
+///
+/// 现在是空的：曾经唯一的一条是 `/opt/cogneva/web`（"overlay 内没有 node
+/// 工具链"）。那一条的代价是前端从此只在**全量构建**时更新，而主线只做叠层，
+/// 于是 2026-09-23 之后合进去的四个前端提交在生产上一直看不见——包括一个
+/// 告警面板。刷新的办法见 [`OVERLAY_BUILT_ASSETS`]。
+const OVERLAY_UNREFRESHABLE: &[(&str, &str)] = &[];
+
+/// 最终镜像烤了、由 overlay **构建**（而不是从检出原样拷贝）之后刷新的资产落点。
+///
+/// 与资产表分开：那张表里的每一行都是检出里现存的路径，原样拷就行；这里的前端
+/// 产物在检出里不存在，要先在构建容器里从 `web/` 编出来。门禁对这两类的态度一样：
+/// 每个落点都得有一条说得出理由的刷新路径，否则测试红。
+const OVERLAY_BUILT_ASSETS: &[&str] = &["/opt/cogneva/web"];
+
+/// 构建前端用的镜像：集群 registry 里的 node 构建器。
+///
+/// 镜像自带的 node 阶段只在**全量构建**里跑过一次，而那可能是几周前；overlay
+/// 每次只换二进制，于是镜像里的前端产物跟着基底一起冻住。这里把同一支 node
+/// 镜像放进集群 registry，overlay 就能拿它把前端从**这一版**的源码重新生成。
+/// 用构建容器而不是在部署器进程里装 node：产物和全量构建走同一条 npm 路径，
+/// 部署器镜像不用为此多背一套工具链。
+const WEB_BUILDER_REPOSITORY: &str = "cogneva/node-builder";
+const WEB_BUILDER_TAG: &str = "22-slim";
+/// npm registry 镜像，与 Dockerfile 全量构建用的同一条。
+const WEB_NPM_REGISTRY: &str = "https://registry.npmmirror.com";
+/// 前端产物在运行镜像里的落点。
+const WEB_DIST_DEST: &str = "/opt/cogneva/web";
+/// 构建容器里放源码的路径。
+const WEB_BUILD_SRC: &str = "/src/web";
 
 // ---------------------------------------------------------------------------
 // 纯函数（无 IO，单测覆盖）
@@ -102,6 +127,26 @@ pub(crate) fn rev12(rev: &str) -> &str {
     } else {
         rev
     }
+}
+
+/// 递归拷贝一棵目录树。
+///
+/// 用在这里是因为前端产物是一整棵 `dist/`（`index.html` 加按内容命名的
+/// `assets/`），而 `std::fs::copy` 只拷单个文件；少拷一层就是"界面还在、
+/// 资源 404"。
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
 }
 
 /// The repository the deployer builds into and reads back.
@@ -175,6 +220,14 @@ const BUILDAH_STEP_WALLS: &[(&str, u64)] = &[
     ("release-container", 60),
     ("copy-binary", 300),
     ("copy-asset", 300),
+    ("web-builder-from", 1800),
+    ("web-copy-src", 600),
+    ("web-build", 1800),
+    ("web-mount", 120),
+    ("web-umount", 120),
+    ("web-builder-rm", 120),
+    ("clear-web", 300),
+    ("copy-web", 300),
     ("copy-manifest", 60),
     ("check-version", 120),
     ("label-revision", 60),
@@ -426,7 +479,13 @@ fn decode_chunked(body: &[u8]) -> Option<Vec<u8>> {
 /// registry API 里本仓库的路径前缀。仓库名只此一处：tag 写入、tag 读取、容量
 /// 回收走的都是这条路径，第二个拼法会让某一条静默指向一个空仓库。
 fn repo_path(rest: &str) -> String {
-    format!("/v2/{IMAGE_REPOSITORY}/{rest}")
+    repo_path_of(IMAGE_REPOSITORY, rest)
+}
+
+/// 同一个 registry 上别的仓库的路径。构建器镜像不在主仓库里，但走同一条
+/// 客户端、同一个端点，只是仓库名不同。
+fn repo_path_of(repository: &str, rest: &str) -> String {
+    format!("/v2/{repository}/{rest}")
 }
 
 /// 响应头里取值（名字大小写不敏感）。
@@ -5771,6 +5830,12 @@ impl MainlineDeployer {
     async fn buildah_steps(&self, ctr: &str, rev: &str, new_tag: &str) -> SFResult<()> {
         // 说清楚这次滚动带不动哪些资产：不带，就意味着线上跑的是基底镜像里
         // 那一份，而"哪一份"没有别的面能看出来。
+        for dest in OVERLAY_BUILT_ASSETS {
+            info!(
+                dest = %dest,
+                "overlay rebuilds this asset from the checkout before copying it in"
+            );
+        }
         for (dest, reason) in OVERLAY_UNREFRESHABLE {
             warn!(
                 dest = %dest,
@@ -5793,6 +5858,7 @@ impl MainlineDeployer {
             )
             .await?;
         }
+        self.refresh_web_bundle(ctr).await?;
 
         // 把这次拷进去的是什么记进镜像本身，好让**跑最新代码的那一侧**——应用
         // 进程——自己判它的资产对不对得上本 rev。部署器判不了这件事：它永远是
@@ -5856,6 +5922,175 @@ impl MainlineDeployer {
         self.buildah_step("push-image", &["push", "--tls-verify=false", new_tag])
             .await?;
         info!(image = %new_tag, "mainline overlay image pushed to registry");
+        Ok(())
+    }
+
+    /// 把这一版的前端产物拷进叠层镜像。
+    ///
+    /// 基底是 `seed`——链根那张全量构建的镜像——它的 `/opt/cogneva/web` 是那次
+    /// 全量构建时编出来的，之后每轮叠层都原样继承。没有别的动作，前端就只在
+    /// 下一次全量构建时才更新，而主线从不全量构建：实测 2026-09-23 之后合入的
+    /// 四个前端提交（告警面板、通知面板、确认按钮、token 台账）在生产上一直是
+    /// 旧的，后端读数却全绿。所以这里每轮都拷；**构建**按 `web/` 的内容摘要
+    /// 缓存，源码没变就不重跑 npm。
+    async fn refresh_web_bundle(&self, ctr: &str) -> SFResult<()> {
+        let web_root = self.workdir().join("web");
+        // 检出里没有 web/ 就没什么可编的：镜像基底里那一份原样留着。这不是
+        // "刷不动"的豁免（那种落点要写进 OVERLAY_UNREFRESHABLE 并说明理由），
+        // 只是这个检出没有前端源码这一棵树。
+        if !web_root.is_dir() {
+            warn!(
+                workdir = %self.workdir().display(),
+                "the checkout has no web/ tree; the image's baked bundle is left as it is"
+            );
+            return Ok(());
+        }
+        let tree = crate::runtime_assets::digest_tree(&web_root)
+            .await
+            .map_err(|e| SFError::IO(format!("digest {}: {e}", web_root.display())))?;
+        let cache = self.web_dist_cache(&tree.digest);
+        if !cache.join("index.html").is_file() {
+            self.build_web_bundle(&web_root, &cache).await?;
+        }
+        // 基底里那一份是旧构建的产物，先清掉再拷：不清的话，旧哈希名下的文件
+        // 会一直留在镜像里，`index.html` 换了而它们还在，也没有谁会去删。
+        self.buildah_step("clear-web", &["run", ctr, "--", "rm", "-rf", WEB_DIST_DEST])
+            .await?;
+        self.buildah_step(
+            "copy-web",
+            &["copy", ctr, cache.to_str().unwrap(), WEB_DIST_DEST],
+        )
+        .await?;
+        info!(
+            digest = %tree.digest,
+            files = tree.files,
+            "overlay refreshed the web bundle from this revision's sources"
+        );
+        Ok(())
+    }
+
+    /// 前端产物的缓存位置：按 `web/` 的内容摘要分目录。
+    ///
+    /// 摘要覆盖 `web/` 下每个文件的路径与字节，所以 `package-lock.json` 也算在内：
+    /// 依赖变了同样重编。缓存落在 state 目录（PVC 上），Pod 重建后还在。
+    fn web_dist_cache(&self, digest: &str) -> PathBuf {
+        Path::new(&self.cfg.state_dir).join("web-dist").join(digest)
+    }
+
+    /// 在 node 构建容器里把 `web/dist` 编出来，落到 `cache`。
+    ///
+    /// 失败就让整次构建失败，而不是退回基底里的旧前端：一个新 rev 带着旧界面
+    /// 上线时，日志里一个字都不会有——那正是这一格原本坏掉的方式。
+    async fn build_web_bundle(&self, web_root: &Path, cache: &Path) -> SFResult<()> {
+        self.ensure_web_builder_present().await?;
+        let builder = format!(
+            "{}/{}:{}",
+            self.push_endpoint(),
+            WEB_BUILDER_REPOSITORY,
+            WEB_BUILDER_TAG
+        );
+        let ctr = self
+            .buildah_step(
+                "web-builder-from",
+                &["from", "--tls-verify=false", &builder],
+            )
+            .await?
+            .trim()
+            .to_string();
+        let result = self.build_web_bundle_in(&ctr, web_root, cache).await;
+        if let Err(e) = self.buildah_step("web-builder-rm", &["rm", &ctr]).await {
+            warn!(error = %e, "could not remove the web builder container");
+        }
+        result
+    }
+
+    async fn build_web_bundle_in(&self, ctr: &str, web_root: &Path, cache: &Path) -> SFResult<()> {
+        self.buildah_step(
+            "web-copy-src",
+            &["copy", ctr, web_root.to_str().unwrap(), WEB_BUILD_SRC],
+        )
+        .await?;
+        self.buildah_step(
+            "web-build",
+            &[
+                "run",
+                "--env",
+                &format!("NPM_CONFIG_REGISTRY={WEB_NPM_REGISTRY}"),
+                ctr,
+                "--",
+                "sh",
+                "-c",
+                "cd /src/web && npm ci --no-audit --no-fund && npm run build",
+            ],
+        )
+        .await?;
+        // 产物在构建容器自己的文件系统里；`buildah copy` 的方向是从宿主往容器，
+        // 取不出来，只能 mount 之后在宿主侧读。
+        let mount = self
+            .buildah_step("web-mount", &["mount", ctr])
+            .await?
+            .trim()
+            .to_string();
+        let copied = self.copy_mounted_web_dist(&mount, cache);
+        let umounted = self.buildah_step("web-umount", &["umount", ctr]).await;
+        copied?;
+        umounted.map(|_| ())
+    }
+
+    /// 构建器镜像不由这里拉也不由这里造：演化 Pod 在常见 CN 安装里到不了
+    /// docker.io，这面镜像是宿主上一次 `deploy/scripts/provision-web-builder-image.sh`
+    /// 推进 registry 的。所以在 buildah 之前先问一次 registry——缺了就当场带着
+    /// 缺的是哪面、该跑哪条脚本报错，而不是让 buildah 的拉取错误一轮一轮滚，
+    /// 既看不出这是安装前置条件，也盖住了真正的原因。
+    async fn ensure_web_builder_present(&self) -> SFResult<()> {
+        let path = repo_path_of(
+            WEB_BUILDER_REPOSITORY,
+            &format!("manifests/{}", WEB_BUILDER_TAG),
+        );
+        match self.registry_get(&path, MANIFEST_ACCEPTS).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(SFError::IO(format!(
+                "web builder image {}:{} is not in the registry ({e}); provision it once on \
+                 the host with deploy/scripts/provision-web-builder-image.sh",
+                WEB_BUILDER_REPOSITORY, WEB_BUILDER_TAG
+            ))),
+        }
+    }
+
+    fn copy_mounted_web_dist(&self, mount: &str, cache: &Path) -> SFResult<()> {
+        let dist = Path::new(mount)
+            .join(WEB_BUILD_SRC.trim_start_matches('/'))
+            .join("dist");
+        if !dist.join("index.html").is_file() {
+            return Err(SFError::Agent(format!(
+                "the web build produced no dist/index.html (looked in {})",
+                dist.display()
+            )));
+        }
+        let parent = cache.parent().ok_or_else(|| {
+            SFError::IO(format!(
+                "web dist cache path has no parent: {}",
+                cache.display()
+            ))
+        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| SFError::IO(format!("create {}: {e}", parent.display())))?;
+        let staged = parent.join(format!(
+            "{}.partial",
+            cache.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        if staged.exists() {
+            std::fs::remove_dir_all(&staged)
+                .map_err(|e| SFError::IO(format!("clear {}: {e}", staged.display())))?;
+        }
+        copy_tree(&dist, &staged)
+            .map_err(|e| SFError::IO(format!("copy {}: {e}", dist.display())))?;
+        if cache.exists() {
+            std::fs::remove_dir_all(cache)
+                .map_err(|e| SFError::IO(format!("clear {}: {e}", cache.display())))?;
+        }
+        std::fs::rename(&staged, cache)
+            .map_err(|e| SFError::IO(format!("rename {}: {e}", staged.display())))?;
         Ok(())
     }
 
@@ -8483,7 +8718,7 @@ mod tests {
         // 解析器自身得先站得住：run 阶段既拷二进制（来自构建产物）又拷 skills
         // （来自构建上下文），两条形态不同的 COPY 都得读到。只断言其中一条时，
         // 另一条的写法一变就是静默漏读——门禁看着全绿，其实已经瞎了。
-        for expected in [OVERLAY_BINARY_DEST, "/opt/cogneva/skills"] {
+        for expected in [OVERLAY_BINARY_DEST, "/opt/cogneva/skills", WEB_DIST_DEST] {
             assert!(
                 baked.iter().any(|d| d == expected),
                 "the Dockerfile's run stage no longer copies {expected} in a form this gate \
@@ -8501,6 +8736,7 @@ mod tests {
                 *dest != OVERLAY_BINARY_DEST
                     && !refreshed.contains(dest)
                     && !unreachable.contains(dest)
+                    && !OVERLAY_BUILT_ASSETS.contains(dest)
             })
             .collect();
         unaccounted.sort_unstable();
@@ -8509,8 +8745,77 @@ mod tests {
             unaccounted.is_empty(),
             "the image bakes runtime assets the overlay never refreshes, so the pod would \
              run the new binary beside a stale copy of them: {unaccounted:?}. Add each to \
-             deploy/overlay-assets.json, or to OVERLAY_UNREFRESHABLE with the reason it \
-             cannot be refreshed from the checkout."
+             deploy/overlay-assets.json, to OVERLAY_BUILT_ASSETS if the overlay builds it \
+             from the checkout, or to OVERLAY_UNREFRESHABLE with the reason it cannot be \
+             refreshed."
+        );
+    }
+
+    /// 「overlay 构建后刷新」的落点必须真的是镜像烤过的落点。
+    ///
+    /// 它与 `OVERLAY_UNREFRESHABLE` 的区别只有一句：那张表说"刷不了"，这张
+    /// 说"从检出的源码现编了再刷"。两张都是声明，都得对得上 Dockerfile——
+    /// 列一个镜像里根本没有的落点，等于给自己开一张空头豁免。
+    #[test]
+    fn every_built_asset_destination_is_baked_by_the_image() {
+        assert!(
+            !OVERLAY_BUILT_ASSETS.is_empty(),
+            "the built-asset list is empty; if the overlay really refreshes nothing, delete \
+             the list and this test instead of leaving a declaration with no subject"
+        );
+        let dockerfile =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Dockerfile"))
+                .expect("read workspace Dockerfile");
+        let baked = image_baked_destinations(&dockerfile);
+        for dest in OVERLAY_BUILT_ASSETS {
+            assert!(
+                baked.iter().any(|d| d == dest),
+                "OVERLAY_BUILT_ASSETS lists {dest}, which the image's run stage never bakes: \
+                 {baked:?}"
+            );
+        }
+    }
+
+    /// 构建器镜像是安装前置条件，落点是宿主脚本；脚本与这里的常量各写一份
+    /// 仓库名和 tag，改一边就静默对不上——脚本会把镜像推进 A，部署器去 B 找，
+    /// 报的是"镜像不在 registry"，看起来像没推。
+    #[test]
+    fn the_provisioning_script_pushes_the_image_the_deployer_asks_for() {
+        let script = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../deploy/scripts/provision-web-builder-image.sh"),
+        )
+        .expect("read the web builder provisioning script");
+        assert!(
+            script.contains(&format!("repository=\"{WEB_BUILDER_REPOSITORY}\"")),
+            "the provisioning script does not push to {WEB_BUILDER_REPOSITORY}"
+        );
+        assert!(
+            script.contains(&format!("tag=\"{WEB_BUILDER_TAG}\"")),
+            "the provisioning script does not push {WEB_BUILDER_TAG}"
+        );
+    }
+
+    /// 前端产物是一整棵树：`index.html` 加 `assets/` 下按内容命名的文件。
+    /// 少拷一层就是"界面还在、资源 404"。
+    #[test]
+    fn copy_tree_carries_nested_assets_with_their_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("dist");
+        std::fs::create_dir_all(from.join("assets")).unwrap();
+        std::fs::write(from.join("index.html"), "<div id=\"root\"></div>").unwrap();
+        std::fs::write(from.join("assets/index-abc123.js"), "console.log(1)").unwrap();
+
+        let to = tmp.path().join("staged");
+        copy_tree(&from, &to).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(to.join("index.html")).unwrap(),
+            "<div id=\"root\"></div>"
+        );
+        assert_eq!(
+            std::fs::read_to_string(to.join("assets/index-abc123.js")).unwrap(),
+            "console.log(1)"
         );
     }
 
