@@ -179,6 +179,16 @@ jobs:
         run: cargo test -p cog-storage --test metrics_sample_cap -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Retention is one DELETE, and the exception inside it is what keeps the
+      # table honest: read rows expire, unread rows do not, however old they are.
+      # Dropping that predicate leaves a statement that still deletes, still
+      # reports a count and still shrinks a table, so nothing about the pass
+      # looks different until an unread notification is removed before its
+      # reader sees it. Only the server can say which rows a WHERE kept.
+      - name: Live-DB notification retention
+        run: cargo test -p cog-storage --test notification_retention -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Which replica may act is decided by one statement, and the acceptance
       # for it is a question about two processes: two asks landing at once leave
       # exactly one holder, and a holder that stops renewing loses the role to
