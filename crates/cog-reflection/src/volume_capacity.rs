@@ -51,8 +51,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cog_core::claim_footprint::{self, quantity_bytes, ClaimFootprint};
 use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
-use cog_core::{SFResult, ShutdownSignal};
-use tracing::{info, warn};
+use cog_core::{ResourceEvent, ResourceEventKind, ResourceEventOutcome, SFResult, ShutdownSignal};
+use tracing::{debug, info, warn};
 
 /// What became of one claim in one round, counted per outcome.
 pub const OUTCOME_METRIC: &str = "cogneva_volume_capacity_outcome_total";
@@ -327,6 +327,11 @@ struct ClaimState {
     peak: Vec<u64>,
     declared: Option<u64>,
     refused_until: Option<std::time::Instant>,
+    /// What the last round concluded, so the account gets one row per change of
+    /// state rather than one per tick. A claim that has been above the ceiling
+    /// for a week is one fact about the deployment, not a thousand events; the
+    /// round counters already say how long it has been going on.
+    last_outcome: Option<CapacityOutcome>,
 }
 
 impl ClaimState {
@@ -335,7 +340,30 @@ impl ClaimState {
             peak: Vec::new(),
             declared: None,
             refused_until: None,
+            last_outcome: None,
         }
+    }
+
+    /// Records this round's conclusion and answers whether it is a fact worth
+    /// writing down: a bound that moved, or an ask that was turned away, and
+    /// only when that differs from what the previous round concluded. A round
+    /// that decided to do nothing is not an event -- the account records what
+    /// happened, and a row per quiet round would bury the rows that matter.
+    fn note(&mut self, outcome: CapacityOutcome) -> bool {
+        let changed = self.last_outcome != Some(outcome);
+        self.last_outcome = Some(outcome);
+        changed
+            && matches!(
+                outcome,
+                CapacityOutcome::Grew | CapacityOutcome::Clamped | CapacityOutcome::Refused
+            )
+    }
+
+    /// The same, for a conclusion that is never an event, returning it so the
+    /// round can end on one line.
+    fn quiet(&mut self, outcome: CapacityOutcome) -> CapacityOutcome {
+        let _ = self.note(outcome);
+        outcome
     }
 
     fn observe(&mut self, used: u64) -> u64 {
@@ -464,7 +492,7 @@ pub struct ClaimTarget {
 /// still a process whose volume is measured, and the one it declared is the one
 /// this loop may raise.
 pub fn targets_from_env() -> Vec<ClaimTarget> {
-    let mut mounts = match std::env::var(claim_footprint::MOUNTS_ENV) {
+    let mounts = match std::env::var(claim_footprint::MOUNTS_ENV) {
         Ok(raw) if !raw.trim().is_empty() => match claim_footprint::parse_claim_paths(&raw) {
             Ok(m) => m,
             Err(e) => {
@@ -529,6 +557,129 @@ fn namespace() -> String {
         .unwrap_or_else(|_| "cogneva".to_string())
 }
 
+/// The name this loop writes its decisions under, both as the account's
+/// `subject` prefix and in the log.
+pub const SUBJECT_PREFIX: &str = "volume_capacity.";
+
+/// The reading a decision in this loop was made on.
+pub const READING: &str = BYTES_METRIC;
+
+/// The account's row for one round, or `None` for a round that changed nothing.
+///
+/// Only three conclusions are facts about the deployment: a request that was
+/// raised, a request the admission ceiling would not let through, and a request
+/// the API refused. The other three are the absence of one -- `at_target`,
+/// `expanding` and `unmeasured` are read from the round counters, which is where
+/// a reader asking "how is this volume doing" looks anyway.
+///
+/// `to_value` is `None` on a refusal because nothing moved. Writing the size it
+/// wanted there would let a reader of the table add up a bound that was never
+/// asked for; the size it wanted and the wall it hit are in `detail`, where a
+/// reader who wants the decision rather than the state goes.
+pub fn capacity_event(
+    target: &ClaimTarget,
+    actor: &str,
+    peak: u64,
+    declared: u64,
+    wanted: Option<u64>,
+    ceiling: Option<u64>,
+    outcome: CapacityOutcome,
+) -> Option<ResourceEvent> {
+    let (kind, ended, subject) = match outcome {
+        CapacityOutcome::Grew => (
+            ResourceEventKind::BoundChange,
+            ResourceEventOutcome::Applied,
+            format!("{SUBJECT_PREFIX}{}", target.claim),
+        ),
+        CapacityOutcome::Clamped => (
+            ResourceEventKind::AdmissionRefusal,
+            ResourceEventOutcome::Refused,
+            format!("{SUBJECT_PREFIX}{}@admission_ceiling", target.claim),
+        ),
+        CapacityOutcome::Refused => (
+            ResourceEventKind::AdmissionRefusal,
+            ResourceEventOutcome::Refused,
+            format!("{SUBJECT_PREFIX}{}@api", target.claim),
+        ),
+        CapacityOutcome::AtTarget | CapacityOutcome::Expanding | CapacityOutcome::Unmeasured => {
+            return None
+        }
+    };
+    let as_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    Some(ResourceEvent {
+        kind,
+        occurred_at: chrono::Utc::now(),
+        subject,
+        actor: actor.to_string(),
+        reading: READING.to_string(),
+        reading_value: Some(peak as f64),
+        from_value: Some(as_i64(declared)),
+        to_value: wanted
+            .map(as_i64)
+            .filter(|_| outcome == CapacityOutcome::Grew),
+        outcome: ended,
+        detail: serde_json::json!({
+            "claim": target.claim,
+            "dir": target.dir.display().to_string(),
+            "peak_bytes": peak,
+            "declared_bytes": declared,
+            "wanted_bytes": wanted,
+            "ceiling_bytes": ceiling,
+            "outcome": outcome.as_str(),
+        }),
+        count: 1,
+    })
+}
+
+/// Hands one event to the resource account's carrier in this process.
+///
+/// The carrier is the build gate's ring, which only exists where a gate is in
+/// force. That is the same process that spawns this loop, so an answer of
+/// `false` is a defect rather than a configuration: the decision happened and
+/// nowhere will hold it. It is said in the log rather than dropped quietly.
+fn report(event: ResourceEvent) {
+    if !cog_core::contract::build_gate::record_resource_event(event) {
+        warn!(
+            "volume capacity: this process keeps no resource-event ring, so a decision it just \
+             made was not written to the account -- it is only in the log line beside this"
+        );
+    }
+}
+
+/// Records a round's conclusion and writes it to the account when it is one of
+/// the three that are facts. Returns the conclusion so the caller can return it.
+#[allow(clippy::too_many_arguments)]
+fn settle(
+    state: &mut ClaimState,
+    target: &ClaimTarget,
+    peak: u64,
+    declared: u64,
+    wanted: Option<u64>,
+    ceiling: Option<u64>,
+    outcome: CapacityOutcome,
+) -> CapacityOutcome {
+    if state.note(outcome) {
+        if let Some(event) = capacity_event(
+            target,
+            &crate::build_gate::gate_actor(),
+            peak,
+            declared,
+            wanted,
+            ceiling,
+            outcome,
+        ) {
+            report(event);
+        }
+    } else {
+        debug!(
+            claim = %target.claim,
+            outcome = outcome.as_str(),
+            "volume capacity: unchanged conclusion, not written to the account again"
+        );
+    }
+    outcome
+}
+
 /// One full decision for one claim.
 async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutcome {
     let footprint = ClaimFootprint::new(
@@ -540,7 +691,7 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
         tokio::task::spawn_blocking(move || footprint.measure().map(|_| footprint.value())).await;
     let used = match walked {
         Ok(Ok(Some(bytes))) => bytes,
-        Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return CapacityOutcome::Unmeasured,
+        Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return state.quiet(CapacityOutcome::Unmeasured),
     };
     let peak = state.observe(used);
 
@@ -549,14 +700,14 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
         Ok(json) => json,
         Err(e) => {
             warn!(claim = %target.claim, error = %e, "volume capacity: claim unreadable");
-            return CapacityOutcome::Unmeasured;
+            return state.quiet(CapacityOutcome::Unmeasured);
         }
     };
     let live = match parse_claim(&json) {
         Ok(live) => live,
         Err(e) => {
             warn!(claim = %target.claim, error = %e, "volume capacity: claim unparsable");
-            return CapacityOutcome::Unmeasured;
+            return state.quiet(CapacityOutcome::Unmeasured);
         }
     };
     state.declared = Some(live.declared);
@@ -565,16 +716,24 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
     // is already ahead of the capacity, and a second patch while the class is
     // still working would be refused by the API.
     if live.capacity < live.declared {
-        return CapacityOutcome::Expanding;
+        return state.quiet(CapacityOutcome::Expanding);
     }
 
     let Some(wanted) = growth_target(peak, live.declared) else {
-        return CapacityOutcome::AtTarget;
+        return state.quiet(CapacityOutcome::AtTarget);
     };
 
     if let Some(until) = state.refused_until {
         if std::time::Instant::now() < until {
-            return CapacityOutcome::Refused;
+            return settle(
+                state,
+                target,
+                peak,
+                live.declared,
+                Some(wanted),
+                None,
+                CapacityOutcome::Refused,
+            );
         }
     }
 
@@ -587,7 +746,15 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
                 ceiling,
                 "volume capacity: the size this volume needs is above what admission allows"
             );
-            return CapacityOutcome::Clamped;
+            return settle(
+                state,
+                target,
+                peak,
+                live.declared,
+                Some(wanted),
+                Some(ceiling),
+                CapacityOutcome::Clamped,
+            );
         }
     }
 
@@ -618,13 +785,29 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
                 peak,
                 "volume capacity: request raised to cover the measured peak"
             );
-            CapacityOutcome::Grew
+            settle(
+                state,
+                target,
+                peak,
+                live.declared,
+                Some(wanted),
+                ceiling,
+                CapacityOutcome::Grew,
+            )
         }
         Err(e) => {
             warn!(claim = %target.claim, wanted, error = %e, "volume capacity: patch refused");
             state.refused_until =
                 Some(std::time::Instant::now() + Duration::from_secs(REFUSAL_COOLDOWN_SECS));
-            CapacityOutcome::Refused
+            settle(
+                state,
+                target,
+                peak,
+                live.declared,
+                Some(wanted),
+                ceiling,
+                CapacityOutcome::Refused,
+            )
         }
     }
 }
@@ -823,6 +1006,117 @@ mod tests {
                 readings.outcome_count("cogneva-evolution-source-pvc", o),
                 expected
             );
+        }
+    }
+
+    fn target() -> ClaimTarget {
+        ClaimTarget {
+            claim: "cogneva-evolution-source-pvc".to_string(),
+            dir: PathBuf::from("/data"),
+            exclude: Vec::new(),
+        }
+    }
+
+    /// A raised request is a bound that moved: `from` is what the cluster held,
+    /// `to` is what it holds now, and the subject names the claim rather than a
+    /// wall, because no wall refused anything.
+    #[test]
+    fn a_raised_request_is_a_bound_change_from_the_old_declaration_to_the_new() {
+        let event = capacity_event(
+            &target(),
+            "pod-a",
+            GIB * 80,
+            GIB * 64,
+            Some(GIB * 96),
+            Some(GIB * 200),
+            CapacityOutcome::Grew,
+        )
+        .expect("a raised request is an event");
+        assert_eq!(event.kind, ResourceEventKind::BoundChange);
+        assert_eq!(event.outcome, ResourceEventOutcome::Applied);
+        assert_eq!(
+            event.subject,
+            "volume_capacity.cogneva-evolution-source-pvc"
+        );
+        assert_eq!(event.reading, READING);
+        assert_eq!(event.reading_value, Some((GIB * 80) as f64));
+        assert_eq!(event.from_value, Some((GIB * 64) as i64));
+        assert_eq!(event.to_value, Some((GIB * 96) as i64));
+        assert_eq!(event.actor, "pod-a");
+        assert_eq!(event.detail["peak_bytes"], (GIB * 80) as i64);
+    }
+
+    /// A refusal has no "after": writing the size it wanted into `to_value`
+    /// would let a reader add up a bound that was never asked for.
+    #[test]
+    fn a_clamped_round_names_the_wall_and_claims_no_move() {
+        let event = capacity_event(
+            &target(),
+            "pod-a",
+            GIB * 180,
+            GIB * 64,
+            Some(GIB * 216),
+            Some(GIB * 200),
+            CapacityOutcome::Clamped,
+        )
+        .expect("a clamp is an event");
+        assert_eq!(event.kind, ResourceEventKind::AdmissionRefusal);
+        assert_eq!(event.outcome, ResourceEventOutcome::Refused);
+        assert!(
+            event.subject.ends_with("@admission_ceiling"),
+            "the subject must name the wall that answered: {}",
+            event.subject
+        );
+        assert_eq!(event.to_value, None, "a refusal claimed a move");
+        assert_eq!(event.detail["wanted_bytes"], (GIB * 216) as i64);
+        assert_eq!(event.detail["ceiling_bytes"], (GIB * 200) as i64);
+    }
+
+    /// The three quiet conclusions are the absence of an event, and each has to
+    /// say so on its own: a test that only checked one would pass a builder
+    /// that answered `None` for the wrong reason.
+    #[test]
+    fn a_round_that_changed_nothing_writes_no_row() {
+        for outcome in [
+            CapacityOutcome::AtTarget,
+            CapacityOutcome::Expanding,
+            CapacityOutcome::Unmeasured,
+        ] {
+            assert!(
+                capacity_event(&target(), "pod-a", 1, 1, None, None, outcome).is_none(),
+                "{outcome:?} was written to the account"
+            );
+        }
+    }
+
+    /// One fact, one row: a claim that stays above the ceiling for a week is a
+    /// single event, and the round counters carry how long it has lasted.
+    #[test]
+    fn a_standing_clamp_is_written_once_and_a_new_one_after_it_clears() {
+        let mut state = ClaimState::new();
+        assert!(
+            state.note(CapacityOutcome::Clamped),
+            "the first clamp was not reported"
+        );
+        assert!(
+            !state.note(CapacityOutcome::Clamped),
+            "an unchanged clamp was reported again"
+        );
+        // It clears, then clamps again at a larger size: a second fact.
+        assert!(!state.note(CapacityOutcome::AtTarget));
+        assert!(
+            state.note(CapacityOutcome::Clamped),
+            "a clamp that cleared and came back was not reported"
+        );
+    }
+
+    /// A patch the API refused is a fact, and a quiet round after it is not.
+    #[test]
+    fn a_refusal_is_written_on_entry_and_not_on_every_round_of_the_cooldown() {
+        let mut state = ClaimState::new();
+        assert!(state.note(CapacityOutcome::Refused));
+        for _ in 0..10 {
+            assert!(!state.note(CapacityOutcome::Refused));
         }
     }
 
