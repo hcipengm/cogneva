@@ -270,7 +270,7 @@ impl ClaimStoreObservable {
         // bytes into the claim above it would report the same bytes twice.
         let mounts = cog_core::claim_footprint::current_mounts();
 
-        let mut found: BTreeMap<(String, String), PathBuf> = BTreeMap::new();
+        let mut found: BTreeMap<(String, String), Vec<PathBuf>> = BTreeMap::new();
         let mut skipped = 0usize;
         let mut vanished = 0usize;
         for entry in entries.flatten() {
@@ -291,7 +291,10 @@ impl ClaimStoreObservable {
                 skipped += 1;
                 continue;
             };
-            found.insert(key, entry.path());
+            found.entry(key).or_default().push(entry.path());
+        }
+        for dirs in found.values_mut() {
+            dirs.sort();
         }
 
         let mut store = self.store.lock().unwrap();
@@ -300,34 +303,73 @@ impl ClaimStoreObservable {
         store.claims.retain(|key, _| found.contains_key(key));
 
         let mut readable = 0usize;
-        for (key, dir) in &found {
+        for (key, dirs) in &found {
             let footprint = store
                 .claims
                 .entry(key.clone())
                 .or_insert_with(|| {
                     Arc::new(ClaimFootprint::new(
                         key.1.clone(),
-                        dir.clone(),
-                        cog_core::claim_footprint::nested_mounts_under(dir, &mounts),
+                        dirs[0].clone(),
+                        cog_core::claim_footprint::nested_mounts_under(&dirs[0], &mounts),
                     ))
                 })
                 .clone();
-            // Streamed: this node's storage root holds 525k files, and the walk
-            // that keeps one entry per file needs several times the memory this
-            // process is given. Measured here: 2.4 s and 17 MB peak for the
-            // whole root, and the total agrees with `du -sb` to the byte.
-            match footprint.measure_streaming() {
-                Ok(gone) => {
-                    readable += 1;
-                    vanished += gone;
+            // One claim name can own more than one directory on this node: a
+            // claim that was deleted while its reclaim policy kept the
+            // directory, and the claim that later came back under the same
+            // name. The series is keyed on the name -- that is what the
+            // declaration it is divided by is keyed on -- so the directories
+            // are reported together rather than the later one replacing the
+            // earlier: replacing it would leave the kept directory's bytes on
+            // the node and out of the account, which is the one shape a full
+            // disk can hide behind.
+            if dirs.len() > 1 {
+                tracing::warn!(
+                    namespace = %key.0,
+                    claim = %key.1,
+                    dirs = dirs.len(),
+                    "more than one directory on this node carries one claim name; their bytes are reported together"
+                );
+            }
+            // Streamed per directory: this node's storage root holds 525k
+            // files, and the walk that keeps one entry per file needs several
+            // times the memory this process is given. Measured here: 2.4 s and
+            // 17 MB peak for the whole root, and the total agrees with
+            // `du -sb` to the byte.
+            let mut total = 0u64;
+            let mut gone_here = 0usize;
+            let mut failure = None;
+            for dir in dirs {
+                let exclude = cog_core::claim_footprint::nested_mounts_under(dir, &mounts);
+                match cog_core::fs_size::dir_bytes_counted_once(dir, &exclude) {
+                    Ok(counted) => {
+                        total = total.saturating_add(counted.bytes);
+                        gone_here += counted.vanished;
+                    }
+                    Err(e) => {
+                        failure = Some((dir, e));
+                        break;
+                    }
                 }
-                Err(e) => tracing::warn!(
+            }
+            match failure {
+                // A partial sum is smaller than the truth and a smaller number
+                // can only silence the comparison this feeds, so a directory
+                // that could not be walked leaves the whole name at its last
+                // measurement.
+                Some((dir, e)) => tracing::warn!(
                     namespace = %key.0,
                     claim = %key.1,
                     dir = %dir.display(),
                     error = %e,
                     "claim directory not walkable; keeping the last measurement"
                 ),
+                None => {
+                    footprint.set_used_bytes(total);
+                    readable += 1;
+                    vanished += gone_here;
+                }
             }
         }
 
@@ -591,6 +633,38 @@ mod tests {
             readings.get(&("monitoring".into(), "loki-0".into())),
             Some(&2048.0),
             "a claim from another namespace lost its own name: {readings:?}"
+        );
+    }
+
+    /// One claim name can own two directories on the node: a kept directory
+    /// from a deleted claim, and the claim that came back under the same name.
+    /// Both are on the disk, so reporting the later one alone would leave the
+    /// kept directory's bytes out of the account while they still fill the
+    /// node -- the shape a full disk hides behind.
+    #[tokio::test]
+    async fn two_directories_under_one_claim_name_are_reported_together() {
+        let root = scratch("folded");
+        let kept = root.join("pvc-00000000-0000-0000-0000-000000000001_rehearsal_nats-pvc");
+        let live = root.join("pvc-00000000-0000-0000-0000-000000000002_rehearsal_nats-pvc");
+        write(&kept.join("kept"), 1024);
+        write(&live.join("live"), 2048);
+
+        let observable = observable(&root);
+        assert_eq!(
+            observable.scan(),
+            Scan::Completed(ScanReport {
+                dirs: 1,
+                readable: 1,
+                skipped: 0
+            }),
+            "one claim name is one reading, however many directories carry it"
+        );
+
+        let readings = collect_from(&observable).await;
+        assert_eq!(
+            readings.get(&("rehearsal".into(), "nats-pvc".into())),
+            Some(&3072.0),
+            "the kept directory's bytes are missing from the claim: {readings:?}"
         );
     }
 
