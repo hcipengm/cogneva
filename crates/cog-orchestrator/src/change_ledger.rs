@@ -3067,6 +3067,26 @@ enum DispatchReadout {
     OwedP2,
     OwedP3,
     OwedUnstated,
+    /// How many owed rows the account holds in each non-terminal state, from
+    /// its own census rather than from this pass's slice.
+    ///
+    /// The four states are here because the pass's own counts cannot answer for
+    /// them. `pending` and `unmeasurable` together are the pending-state rows
+    /// this pass read; a row the account holds as `undecided`, `conflict` or
+    /// `partial` is still owed work, and it appears in none of the pass's
+    /// columns. Without these cells a pass whose owed set had moved entirely
+    /// into `undecided` -- every check unsettleable, which is what a tree that
+    /// lost a directory looks like -- would publish `change_ledger_pending` at
+    /// zero while two thousand rows still asked for something: the one answer a
+    /// reader acts on, and it would be wrong.
+    ///
+    /// The two terminal states are left out because they are the definition of
+    /// not owed; a reader asking for those reads the account, where they are the
+    /// complement of these four.
+    StateConflict,
+    StatePending,
+    StatePartial,
+    StateUndecided,
 }
 
 impl DispatchReadout {
@@ -3085,6 +3105,10 @@ impl DispatchReadout {
         DispatchReadout::OwedP2,
         DispatchReadout::OwedP3,
         DispatchReadout::OwedUnstated,
+        DispatchReadout::StateConflict,
+        DispatchReadout::StatePending,
+        DispatchReadout::StatePartial,
+        DispatchReadout::StateUndecided,
     ];
 
     /// The band a count cell is about, for the five that are about one.
@@ -3098,6 +3122,22 @@ impl DispatchReadout {
             DispatchReadout::OwedP2 => Some(ChangePriority::P2),
             DispatchReadout::OwedP3 => Some(ChangePriority::P3),
             DispatchReadout::OwedUnstated => Some(ChangePriority::Unstated),
+            _ => None,
+        }
+    }
+
+    /// The state a census cell is about, for the four that are about one.
+    ///
+    /// Separate from [`Self::band`] because the two axes cross: the bands
+    /// partition the owed set and the states partition it again, and the point
+    /// of publishing both is that a reader can see the two partitions are of the
+    /// same set.
+    fn state(self) -> Option<ChangeState> {
+        match self {
+            DispatchReadout::StateConflict => Some(ChangeState::Conflict),
+            DispatchReadout::StatePending => Some(ChangeState::Pending),
+            DispatchReadout::StatePartial => Some(ChangeState::Partial),
+            DispatchReadout::StateUndecided => Some(ChangeState::Undecided),
             _ => None,
         }
     }
@@ -3118,6 +3158,10 @@ impl DispatchReadout {
             Self::OwedP2 => "owed_p2",
             Self::OwedP3 => "owed_p3",
             Self::OwedUnstated => "owed_unstated",
+            Self::StateConflict => "state_conflict",
+            Self::StatePending => "state_pending",
+            Self::StatePartial => "state_partial",
+            Self::StateUndecided => "state_undecided",
         }
     }
 }
@@ -3146,6 +3190,7 @@ async fn publish_dispatch_rows(
     metrics: Option<&Arc<dyn MetricsBackend>>,
     state: &DispatchState,
     owed: Option<&[(ChangePriority, usize)]>,
+    census: Option<&[(ChangeState, u64)]>,
 ) {
     let Some(metrics) = metrics else {
         return;
@@ -3167,18 +3212,33 @@ async fn publish_dispatch_rows(
             // last value is at least the truth as of a known earlier tick --
             // the store stamps every write, so the staleness reads.
             _ => {
-                let Some(band) = readout.band() else {
-                    continue;
-                };
-                let Some(count) = owed.and_then(|counts| {
-                    counts
-                        .iter()
-                        .find(|(found, _)| *found == band)
-                        .map(|(_, rows)| *rows)
-                }) else {
-                    continue;
-                };
-                u64::try_from(count).unwrap_or(u64::MAX)
+                // The census cells skip for the same reason the band cells do:
+                // a zero written for a count that failed is the account saying
+                // it owes nothing in a state nobody managed to read.
+                if let Some(wanted) = readout.state() {
+                    let Some(count) = census.and_then(|counts| {
+                        counts
+                            .iter()
+                            .find(|(found, _)| *found == wanted)
+                            .map(|(_, rows)| *rows)
+                    }) else {
+                        continue;
+                    };
+                    u64::try_from(count).unwrap_or(u64::MAX)
+                } else {
+                    let Some(band) = readout.band() else {
+                        continue;
+                    };
+                    let Some(count) = owed.and_then(|counts| {
+                        counts
+                            .iter()
+                            .find(|(found, _)| *found == band)
+                            .map(|(_, rows)| *rows)
+                    }) else {
+                        continue;
+                    };
+                    u64::try_from(count).unwrap_or(u64::MAX)
+                }
             }
         };
         let mut labels = HashMap::new();
@@ -3561,10 +3621,25 @@ async fn record_dispatch_state(
             None
         }
     };
+    // The account's census, read here rather than reused from the read that
+    // sized the outstanding batch: that one was taken before the pass acted, and
+    // these cells answer what the account holds as of this pass. A failed read
+    // publishes nothing for the same reason a failed band count does.
+    let census = match store.census().await {
+        Ok(counts) => Some(counts),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the account's census could not be read, so this pass publishes \
+                 no state cell"
+            );
+            None
+        }
+    };
     // Published from the same struct the row was built from, and after it: the
     // account is the record and the reading face is a view of it, so the two
     // cannot say different things about one pass.
-    publish_dispatch_rows(metrics, &state, owed.as_deref()).await;
+    publish_dispatch_rows(metrics, &state, owed.as_deref(), census.as_deref()).await;
     publish_dispatch_verdict(metrics, &state).await;
 }
 
@@ -7116,17 +7191,27 @@ mod tests {
         };
         let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
         let metrics: Arc<dyn MetricsBackend> = metrics.clone();
-        // The owed set by band, as the account's own count would answer it: the
-        // five cells add up to the ledger's pending set, which is the same
-        // population read two ways.
+        // The account's own counts, as its census and its band count would
+        // answer them. The two partitions are of the same set, and that set is
+        // larger than the pass's pending column on purpose: twelve rows are
+        // `undecided`, so a reader of the pass's own columns alone would see
+        // 148 owed and miss them.
         let owed = [
             (ChangePriority::P0, 4usize),
             (ChangePriority::P1, 2),
             (ChangePriority::P2, 0),
             (ChangePriority::P3, 1),
-            (ChangePriority::Unstated, 141),
+            (ChangePriority::Unstated, 153),
         ];
-        publish_dispatch_rows(Some(&metrics), &state, Some(&owed)).await;
+        let census = [
+            (ChangeState::Conflict, 0u64),
+            (ChangeState::Pending, 148),
+            (ChangeState::Partial, 0),
+            (ChangeState::Undecided, 12),
+            (ChangeState::Landed, 900),
+            (ChangeState::Retired, 40),
+        ];
+        publish_dispatch_rows(Some(&metrics), &state, Some(&owed), Some(&census)).await;
         publish_dispatch_verdict(Some(&metrics), &state).await;
         publish_handover_readback(Some(&metrics), &readback).await;
 
@@ -7203,10 +7288,9 @@ mod tests {
         // the pass's own split cannot disagree.
         assert_eq!(published["change_ledger_pending"], 148.0);
         // The band split, and the relation that makes it a reading rather than
-        // five numbers: the bands partition the same owed set, so they have to
-        // add up to the ledger's pending cell. A band that stopped being
-        // published, or a rank the count dropped, shows up here as a sum that
-        // no longer closes.
+        // five numbers: the bands partition the owed set, so they have to add up
+        // to the state cells' total. A band that stopped being published, or a
+        // rank the count dropped, shows up here as a sum that no longer closes.
         assert_eq!(published["owed_p0"], 4.0);
         assert_eq!(published["owed_p1"], 2.0);
         assert_eq!(
@@ -7214,15 +7298,34 @@ mod tests {
             "a band with no rows is still a cell"
         );
         assert_eq!(published["owed_p3"], 1.0);
-        assert_eq!(published["owed_unstated"], 141.0);
+        assert_eq!(published["owed_unstated"], 153.0);
+        // The census, one cell per outstanding state. The two empty states are
+        // published as zeros rather than left out: an absent cell and a state
+        // nobody counted read the same, and this is the face that has to say
+        // which one it is.
+        assert_eq!(published["state_conflict"], 0.0);
+        assert_eq!(published["state_pending"], 148.0);
+        assert_eq!(published["state_partial"], 0.0);
+        assert_eq!(published["state_undecided"], 12.0);
         assert_eq!(
             published["owed_p0"]
                 + published["owed_p1"]
                 + published["owed_p2"]
                 + published["owed_p3"]
                 + published["owed_unstated"],
-            published["change_ledger_pending"],
-            "the bands partition the owed set the ledger counts"
+            published["state_conflict"]
+                + published["state_pending"]
+                + published["state_partial"]
+                + published["state_undecided"],
+            "the bands and the states are two partitions of one owed set"
+        );
+        // The pass's pending cell and the account's `pending` state are the
+        // same population read two ways -- the rows this pass could hand over
+        // plus the ones it could not settle -- and a disagreement between them
+        // is the split losing a row.
+        assert_eq!(
+            published["change_ledger_pending"], published["state_pending"],
+            "the pass's split and the account's census count the same rows"
         );
 
         // The verdict: the whole product of the two closed sets, every pass, so
@@ -7283,16 +7386,17 @@ mod tests {
         );
     }
 
-    /// A pass that could not count the owed set publishes no band cell, rather
-    /// than publishing zeros.
+    /// A pass that could not count the account publishes no band cell and no
+    /// state cell, rather than publishing zeros.
     ///
     /// A zero is not a neutral placeholder here: `owed_p0 = 0` says the urgent
-    /// work is done, and that is the one answer a reader will act on. A skipped
-    /// cell leaves the previous tick's count standing, and every write carries
-    /// its own stamp, so "how old is this number" is readable. The pass says it
-    /// could not count in its own log line.
+    /// work is done, and `state_undecided = 0` says every check can be settled;
+    /// either is an answer a reader will act on. A skipped cell leaves the
+    /// previous tick's count standing, and every write carries its own stamp, so
+    /// "how old is this number" is readable. The pass says it could not count in
+    /// its own log line.
     #[tokio::test]
-    async fn a_pass_that_could_not_count_the_bands_publishes_no_band_cell() {
+    async fn a_pass_that_could_not_count_the_account_publishes_no_count_of_it() {
         let state = DispatchState {
             decision: DispatchDecision::Proceed,
             pool: PoolReading::Available,
@@ -7312,7 +7416,7 @@ mod tests {
             window_pace: None,
         };
         let metrics: Arc<dyn MetricsBackend> = Arc::new(cog_storage::MemoryMetricsBackend::new());
-        publish_dispatch_rows(Some(&metrics), &state, None).await;
+        publish_dispatch_rows(Some(&metrics), &state, None, None).await;
 
         let end = Utc::now() + chrono::Duration::seconds(1);
         let start = end - chrono::Duration::seconds(600);
@@ -7325,8 +7429,10 @@ mod tests {
             .filter_map(|sample| sample.labels.get("readout").cloned())
             .collect();
         assert!(
-            names.iter().all(|name| !name.starts_with("owed_")),
-            "no band cell is written when the count failed: {names:?}"
+            names
+                .iter()
+                .all(|name| !name.starts_with("owed_") && !name.starts_with("state_")),
+            "no band or census cell is written when the count failed: {names:?}"
         );
         assert!(
             names.iter().any(|name| name == "pending"),

@@ -1517,6 +1517,38 @@ data:
               }
             },
             {
+              "expr": "max(cogneva_change_dispatch_readouts{readout=\"state_pending\"})",
+              "legendFormat": "owed, pending",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_change_dispatch_readouts{readout=\"state_undecided\"})",
+              "legendFormat": "owed, undecided (check cannot settle)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_change_dispatch_readouts{readout=\"state_partial\"})",
+              "legendFormat": "owed, partial",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_change_dispatch_readouts{readout=\"state_conflict\"})",
+              "legendFormat": "owed, conflict",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
               "expr": "max(cogneva_change_dispatch_readouts{readout=\"pending\"}) - max(cogneva_change_dispatch_readouts{readout=\"submitted\"}) - max(cogneva_change_dispatch_readouts{readout=\"already\"}) - max(cogneva_change_dispatch_readouts{readout=\"failed\"}) - max(cogneva_change_dispatch_readouts{readout=\"dead_environment\"}) - max(cogneva_change_dispatch_readouts{readout=\"held_back\"})",
               "legendFormat": "unaccounted for (should be zero)",
               "datasource": {
