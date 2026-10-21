@@ -13,8 +13,14 @@
 # 也避免「存储根不存在 → Pod 起不来 → cgroup 读数一起没了」这种连带。
 #
 # uid 0 在这里是**唯一的目的**：跨越 0700 的挂载点。它拿不到写权（挂载只读、
-# capabilities 全丢、根文件系统只读、不开 privilege escalation、不挂 SA token、
-# 不碰 hostPID、不碰设备），能做的只有读这台机器上 root 本来就能读的文件。
+# 根文件系统只读、不开 privilege escalation、不挂 SA token、不碰 hostPID、不碰设备），
+# 能做的只有读这台机器上 root 本来就能读的文件。
+#
+# 但「uid 0」本身不等于「读得到」：capabilities 全丢之后没有 CAP_DAC_OVERRIDE，
+# 属主不是 root 的 0700 目录同样 EACCES——镜像层里就有这种目录（实测
+# snapshots/*/fs/home/build 属 uid 1000、0700），overlayfs 那 47 GB 因此整块读不出来，
+# 读数只剩 content 的 13 GB。所以只加回一条 CAP_DAC_READ_SEARCH：它放开读与目录搜索，
+# 不放开写；不用 DAC_OVERRIDE，那个连写也放开。
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -114,6 +120,10 @@ spec:
             capabilities:
               drop:
                 - ALL
+              # 只放开读与目录搜索：镜像层里有别的 uid 建的 0700 目录，没有这一条
+              # 整个 overlayfs 分区读不出来（见模板头部的实测）。
+              add:
+                - DAC_READ_SEARCH
           volumeMounts:
             - name: storage-root
               mountPath: "/host/storage"
