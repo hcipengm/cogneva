@@ -2761,6 +2761,24 @@
           },
           "severity": "warning",
           "summary": "CI/构建/部署面的「滚没滚」读数停了：过去 35 分钟里一次样本都没有，能发出这条告警时 {value} 是 1。这条读数在宿主上从集群读工作负载镜像、从主线仓库读 main 头；它一停，「现网那一版是多久以前提交的」就没有任何东西在判，而面板上「没有告警」与「两边一致」同形。先看那台机器上 kubectl 还连不连得上集群、主线仓库还在不在：读不到时它按契约退 3 且一条序列都不印，正是为了让这一条能红。"
+        },
+        {
+          "name": "image_store_reclaimed_by_kubelet",
+          "promql": "max by (node) (increase(kubelet_image_garbage_collected_total[6h]))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The kubelet on {node} deleted {value} image(s) in the last six hours. This is the store's reclaim action and it is the runtime's own: it runs when the disk passes the image GC high watermark (85% by default), removes only images no container references, and stops at the low watermark (80%). There is nothing for us to execute here -- what this rule is for is the account's write-back, because the walk publishes how big the store is and nothing published that its bound had been applied. Read it with image_store_bytes{node}: a store that stays flat while this fires every window is a working set that reaches the watermark, so the next pull evicts the previous one and pods pay a re-pull on every start -- the bound is below the working set, and the fix is a watermark or a disk, not a smaller store. Firing next to image_store_over_the_watermark_without_a_gc is the other shape: the disk is over the line and the kubelet is not collecting"
+        },
+        {
+          "name": "image_store_over_the_watermark_without_a_gc",
+          "promql": "(100 - 100 * max by (node) (node_filesystem_avail_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"}) / max by (node) (node_filesystem_size_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"})) > 80 unless on(node) (max by (node) (increase(kubelet_image_garbage_collected_total[1h])) > 0)",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The disk on {node} is {value}% full -- past the 80% the kubelet's image GC is supposed to fall back to -- and the kubelet has collected no image in the last hour. The native action is not running, and the readings that would normally explain a full disk are not the ones to read here: image_store_bytes may be small while the disk is full, because what the GC removes is images and what filled the disk may be a volume or a log. The line this rule draws is that the account stops assuming the runtime is reclaiming on its own schedule. Check the kubelet's own log for the image manager (an eviction that fails, a watermark set above the disk's reachable size), and treat the store as unbounded until it collects again. The bars are the kubelet's defaults: the high watermark of 85% is where it starts and 80% is where it stops, so a disk at 80% with no collection in an hour is either under a raised watermark or a collector that is not running"
         }
       ]
     },

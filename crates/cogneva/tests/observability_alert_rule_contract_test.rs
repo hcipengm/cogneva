@@ -1109,6 +1109,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "cadvisor（kubelet 内置）。同一序列的分母：调度周期总数。两个计数器同源同标签，比值才是判据",
     ),
     (
+        "kubelet_image_garbage_collected_total",
+        "kubelet 自己的镜像管理器计数器。镜像库的回收动作本来就归运行时：它过了镜像 GC 高水位（默认 85%）就删没有被容器引用的镜像，降到低水位（默认 80%）为止。资源官不执行这个动作，只把它读进账——这一条是动作的回写面，`increase(...)` 就是「这一窗里真的回收了」",
+    ),
+    (
         "kubelet_container_log_filesystem_used_bytes",
         "kubelet 自己的 resource metrics（经 apiserver 代理取到，所以样本上的身份标签被采集端加了 `exported_` 前缀；判据读的是 `exported_namespace`，读裸 `namespace` 会指到代理目标自己的命名空间）",
     ),
