@@ -547,6 +547,15 @@ data:
               "summary": "A container's last exit was OOMKilled ({value}); its footprint exceeded the limit it was given. Not scoped to one namespace, and a state rather than a rate: a container killed at its cap holds this state until a clean stop, and one that dies every couple of hours never trips a restart-rate rule. The clickhouse instance in monitoring was killed five times in one hour while this rule could not see it"
             },
             {
+              "name": "pod_failed_without_a_restart",
+              "promql": "max by (namespace, pod) (kube_pod_status_phase{phase=\"Failed\"} == 1) unless on(namespace, pod) kube_pod_owner{owner_kind=\"Job\"}",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "Pod {pod} in {namespace} is in the Failed phase. This is the half of \"what got sacrificed\" that nothing counted: the OOM rule reads a container termination reason, and a pod evicted by the kubelet -- node memory or disk pressure, the node draining, a priority preemption -- never terminates a container that way, it goes straight to Failed. The reason label that would name which of those happened is not scraped (this kube-state-metrics version publishes the phase but not the reason), so the rule reports the fact it has rather than a cause it would be guessing at; read it against the node conditions (`node_disk_pressure`, `node_disk_usage_critical`) and the process-level memory readings on the same window. Failing Job pods are excluded on purpose: a criterion Job that fails is a delivery verdict, not a pod that did not fit, and the delivery rules already carry it. The repair is to find what refused the pod and change that bound; the rule resolving is the write-back, because a pod left in Failed is counted until someone deletes it or the scheduler replaces it."
+            },
+            {
               "name": "container_memory_near_limit",
               "promql": "container_memory_rss{container!=\"\", container!=\"POD\"} / on(namespace, pod, container) (kube_pod_container_resource_limits{resource=\"memory\"} > 0)",
               "condition": {

@@ -272,6 +272,7 @@ POD_SUBJECT = {
     'container_memory_near_limit': '讲的就是这个容器',
     'redis_restarted': 'redis 是 StatefulSet，Pod 名稳定，Pod 就是它',
     'pod_stuck_terminating': '讲的是这个 Pod 的删除侧',
+    'pod_failed_without_a_restart': '讲的就是这个 Pod 进了 Failed 阶段；Pod 名是这条事实本身，聚合掉它就只剩一个数，说不出是哪个 Pod 没被替换',
     'orphans_unreaped': '讲的是这个 Pod 里没被回收的进程',
     'container_cpu_throttled': '讲的就是这个容器被自己的 CPU 上限按住多久',
     'container_log_near_rotation_cap': '讲的就是这个容器的日志有没有被轮转',
