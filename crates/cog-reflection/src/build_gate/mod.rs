@@ -5804,7 +5804,16 @@ unevictable 28532736
         // two columns are not redundant: a field is in the published set by
         // being in the sample, and an input by moving the answer.
         type Mutation = fn(&mut HostLoad);
-        let fields: [(&str, Option<(&str, &str)>, Mutation, bool); 7] = [
+        // One row of the census: the reading, the labels that tell its cells
+        // apart, the mutation that moves it, and whether the bound divides by
+        // it. Named rather than spelled inline so the array stays readable.
+        type Field = (
+            &'static str,
+            Option<(&'static str, &'static str)>,
+            Mutation,
+            bool,
+        );
+        let fields: [Field; 7] = [
             (HOST_CPU_BUSY_CORES, None, |l| l.busy_cores = 23.0, true),
             (HOST_CPU_CORES, None, |l| l.cores = 10, true),
             (
