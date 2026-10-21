@@ -557,6 +557,10 @@ fn namespace() -> String {
         .unwrap_or_else(|_| "cogneva".to_string())
 }
 
+/// This loop's name in the process liveness registry, and the value of
+/// `cogneva_loop_tick_age_seconds{loop=...}`.
+pub const LOOP: &str = "volume_capacity";
+
 /// The name this loop writes its decisions under, both as the account's
 /// `subject` prefix and in the log.
 pub const SUBJECT_PREFIX: &str = "volume_capacity.";
@@ -861,27 +865,44 @@ pub fn spawn_volume_capacity_loop(
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_INTERVAL_SECS)
         .max(MIN_INTERVAL_SECS);
-    Some(tokio::spawn(async move {
-        let mut states: HashMap<String, ClaimState> = HashMap::new();
-        let mut ticker = tokio::time::interval(Duration::from_secs(interval));
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {}
-                _ = shutdown.wait() => break,
-            }
-            for target in &targets {
-                let state = states
-                    .entry(target.claim.clone())
-                    .or_insert_with(ClaimState::new);
-                let outcome = reconcile(target, state).await;
-                if let Some(declared) = state.declared {
-                    let peak = state.peak.iter().copied().max().unwrap_or(0);
-                    readings.observe_sizes(&target.claim, declared, peak);
+    // Registered, not merely spawned: every number this loop publishes is a
+    // measurement it took, so a task that died would leave a reading that says
+    // the declaration is still fine rather than one that says nothing is being
+    // measured. The liveness has to come from outside the loop for that reason.
+    Some(cog_core::loop_health::spawn(
+        LOOP,
+        cog_core::loop_health::Cadence::Periodic(Duration::from_secs(interval)),
+        shutdown.clone(),
+        move |beat| {
+            let shutdown = shutdown.clone();
+            let readings = readings.clone();
+            let targets = targets.clone();
+            async move {
+                let mut states: HashMap<String, ClaimState> = HashMap::new();
+                let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+                loop {
+                    // One stamp per pass, whatever the pass measured: a volume
+                    // that did not grow is not a loop that stopped.
+                    beat.beat();
+                    tokio::select! {
+                        _ = ticker.tick() => {}
+                        _ = shutdown.wait() => break,
+                    }
+                    for target in &targets {
+                        let state = states
+                            .entry(target.claim.clone())
+                            .or_insert_with(ClaimState::new);
+                        let outcome = reconcile(target, state).await;
+                        if let Some(declared) = state.declared {
+                            let peak = state.peak.iter().copied().max().unwrap_or(0);
+                            readings.observe_sizes(&target.claim, declared, peak);
+                        }
+                        readings.record(&target.claim, outcome);
+                    }
                 }
-                readings.record(&target.claim, outcome);
             }
-        }
-    }))
+        },
+    ))
 }
 
 #[cfg(test)]
