@@ -42,7 +42,7 @@ use cog_core::{SFError, SFResult, ShutdownSignal};
 // path falls through to a rebuild without anything reporting a failure.
 use crate::registry_footprint::MANIFEST_ACCEPTS;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{CodePlatform, MainlineDeployerConfig, RolloutTargetConfig};
 use crate::rollout_resources::RolloutResourceReading;
@@ -480,6 +480,30 @@ fn decode_chunked(body: &[u8]) -> Option<Vec<u8>> {
 /// 回收走的都是这条路径，第二个拼法会让某一条静默指向一个空仓库。
 fn repo_path(rest: &str) -> String {
     repo_path_of(IMAGE_REPOSITORY, rest)
+}
+
+fn prune_web_dist_cache(root: &Path, keep: &str) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy() == keep {
+            continue;
+        }
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            && std::fs::remove_dir_all(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        debug!(
+            removed,
+            keep, "dropped web bundle caches from earlier revisions"
+        );
+    }
 }
 
 /// 同一个 registry 上别的仓库的路径。构建器镜像不在主仓库里，但走同一条
@@ -5966,7 +5990,18 @@ impl MainlineDeployer {
             files = tree.files,
             "overlay refreshed the web bundle from this revision's sources"
         );
+        self.prune_web_dist_cache(&tree.digest);
         Ok(())
+    }
+
+    /// 只留当前摘要那一份。缓存键是内容摘要，所以除它以外的每一份都属于一个
+    /// 已经滚过去的 rev；留着只会在 PVC 上按前端提交的次数累积，而它没有任何
+    /// 读者——重编一次的代价是几分钟，不要用它换一块只增不减的盘。
+    ///
+    /// 删失败不算错：缓存本来就可以重建，留下的目录下一轮会再被扫到一次。
+    /// 但**拷贝已经完成之后**才删，这样一轮失败永远不会把当下要用的那份删掉。
+    fn prune_web_dist_cache(&self, keep: &str) {
+        prune_web_dist_cache(&Path::new(&self.cfg.state_dir).join("web-dist"), keep);
     }
 
     /// 前端产物的缓存位置：按 `web/` 的内容摘要分目录。
@@ -8794,6 +8829,25 @@ mod tests {
             script.contains(&format!("tag=\"{WEB_BUILDER_TAG}\"")),
             "the provisioning script does not push {WEB_BUILDER_TAG}"
         );
+    }
+
+    /// 前端产物缓存只留当前摘要那一份：除它以外每一份都属于已滚过去的 rev，
+    /// 留着没有任何读者，却按前端提交次数在 PVC 上累加。
+    #[test]
+    fn only_the_current_web_bundle_cache_survives_a_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("web-dist");
+        for digest in ["aaa", "bbb", "ccc"] {
+            std::fs::create_dir_all(root.join(digest).join("assets")).unwrap();
+            std::fs::write(root.join(digest).join("index.html"), digest).unwrap();
+        }
+        prune_web_dist_cache(&root, "bbb");
+        let left: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["bbb".to_string()]);
     }
 
     /// 前端产物是一整棵树：`index.html` 加 `assets/` 下按内容命名的文件。
