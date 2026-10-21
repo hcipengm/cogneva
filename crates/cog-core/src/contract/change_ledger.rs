@@ -1153,6 +1153,10 @@ pub struct BlockCensus {
     pub landed: u64,
     /// Rows still owed.
     pub owed: u64,
+    /// Rows this face no longer asks for. Counted so the three buckets add up
+    /// to the face's population: without it a face that shrank to nothing by
+    /// retiring its work would be indistinguishable from one that finished.
+    pub retired: u64,
     /// How long the oldest owed row in this face has gone without a
     /// measurement. `None` when nothing in it is owed or every owed row has
     /// been measured: the two are different facts and neither is zero.

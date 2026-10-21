@@ -3811,7 +3811,11 @@ async fn publish_block_census(
         return;
     };
     for face in census {
-        let mut cells = vec![("landed", face.landed as f64), ("owed", face.owed as f64)];
+        let mut cells = vec![
+            ("landed", face.landed as f64),
+            ("owed", face.owed as f64),
+            ("retired", face.retired as f64),
+        ];
         // An absence is not a zero: no age says every owed row in this face has
         // been measured, which is a different fact from none of them having
         // waited. The cell is skipped rather than written as zero, and the stamp

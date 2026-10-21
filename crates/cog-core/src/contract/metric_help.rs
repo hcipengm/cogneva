@@ -1726,7 +1726,10 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          documents named, on every change-ledger pass -- block (a closed set: \
          token, resources, principles, change, persistence, communication, and \
          none for rows no document filed or whose documents name more than one \
-         face) and reading (landed, owed, or oldest_unmeasured_seconds). The \
+         face) and reading (landed, owed, retired, or \
+         oldest_unmeasured_seconds). The three counts are the whole population \
+         of the face: a face that retired its work would otherwise look exactly \
+         like one that finished. The \
          grouping answers a question the account's contents could not: how far \
          along a face is. Its rows were always there; the heading was only in \
          prose, so the answer depended on which substring search the reader \

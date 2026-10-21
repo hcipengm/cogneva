@@ -1,7 +1,7 @@
 -- Migration: 070_change_ledger_block (down)
 -- Dropping the column costs no fact the account holds: the face is a function
 -- of the citations, and the citations stay.
-DROP INDEX IF EXISTS change_ledger_owed_by_block_idx;
+DROP INDEX IF EXISTS change_ledger_by_block_idx;
 
 -- Put the band's own order back: the reads fall back to the key they had
 -- before the blocking term existed.

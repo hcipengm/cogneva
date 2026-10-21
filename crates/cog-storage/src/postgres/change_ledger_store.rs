@@ -428,12 +428,12 @@ SELECT (SELECT count(*) FROM holder) AS holders, \
 /// full of never-measured rows report no wait at all.
 const BLOCK_CENSUS_SQL: &str = "\
 SELECT block, \
-       CASE WHEN state = 'landed' THEN 'landed' ELSE 'owed' END AS state, \
+       CASE state WHEN 'landed' THEN 'landed' WHEN 'retired' THEN 'retired' \
+                  ELSE 'owed' END AS state, \
        count(*) AS n, \
        max(EXTRACT(EPOCH FROM (now() - COALESCE(measured_at, first_seen_at)))) \
          AS oldest_unmeasured_secs \
   FROM change_ledger \
- WHERE state <> 'retired' \
  GROUP BY 1, 2";
 
 /// Append one reopen: a row the account had as done whose check no longer holds.
@@ -1175,6 +1175,11 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 })
                 .map(|(_, _, n, _)| *n)
                 .sum::<i64>();
+            let retired = counted
+                .iter()
+                .filter(|(found, state, _, _)| found == block.as_str() && state == "retired")
+                .map(|(_, _, n, _)| *n)
+                .sum::<i64>();
             let oldest = counted
                 .iter()
                 .filter(|(found, state, _, _)| {
@@ -1188,6 +1193,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 block,
                 landed: landed.max(0) as u64,
                 owed: owed.max(0) as u64,
+                retired: retired.max(0) as u64,
                 oldest_unmeasured_secs: oldest.map(|secs| secs.max(0.0) as u64),
             });
         }

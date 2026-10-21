@@ -59,12 +59,12 @@ ALTER TABLE change_ledger_declared
         CHECK (block IN ('token', 'resources', 'principles', 'change',
                          'persistence', 'communication', 'none'));
 
--- The census groups the owed set by face; without this it sorts every row of
--- the account on each pass, which is the same cost the band's index avoids on
--- the reads that hand rows out.
-CREATE INDEX IF NOT EXISTS change_ledger_owed_by_block_idx
-    ON change_ledger (block)
-    WHERE state NOT IN ('landed', 'retired');
+-- The census groups every row by face -- landed, owed and retired -- so the
+-- index covers the whole table rather than the outstanding slice: without it
+-- each pass sorts the account, which is the same cost the band's index avoids
+-- on the reads that hand rows out.
+CREATE INDEX IF NOT EXISTS change_ledger_by_block_idx
+    ON change_ledger (block);
 
 -- The ordering key gains its first term: a change a commit delivered while the
 -- account still owes it is holding the line, and it goes ahead of every band.
