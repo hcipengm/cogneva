@@ -199,7 +199,14 @@ pub fn parse_args(args: &[String]) -> Result<Act, String> {
             .clone();
         opts.push((arg.clone(), value));
     }
-    let one = |name: &str| -> Result<Option<String>, String> {
+    // Every option a branch reads is recorded. Whatever is left over was not
+    // read by anyone, and the parser used to drop it silently: a misspelled
+    // `--from-absent` (for `--from-absent-at`) opened a handover whose absence
+    // was never recorded, which quietly changed the signing requirement from
+    // two units to three. A command that changes meaning on a typo must fail.
+    let used: std::cell::RefCell<Vec<&str>> = std::cell::RefCell::new(Vec::new());
+    let one = |name: &'static str| -> Result<Option<String>, String> {
+        used.borrow_mut().push(name);
         let mut found = opts.iter().filter(|(k, _)| k == name);
         let first = found.next().map(|(_, v)| v.clone());
         if found.next().is_some() {
@@ -207,17 +214,18 @@ pub fn parse_args(args: &[String]) -> Result<Act, String> {
         }
         Ok(first)
     };
-    let many = |name: &str| -> Vec<String> {
+    let many = |name: &'static str| -> Vec<String> {
+        used.borrow_mut().push(name);
         opts.iter()
             .filter(|(k, _)| k == name)
             .map(|(_, v)| v.clone())
             .collect()
     };
-    let required = |name: &str| -> Result<String, String> {
+    let required = |name: &'static str| -> Result<String, String> {
         one(name)?.ok_or_else(|| format!("{name} is required"))
     };
 
-    match (family.as_str(), sub.as_str()) {
+    let act = match (family.as_str(), sub.as_str()) {
         ("handover", "open") => {
             let from = one("--from")?;
             let from_absent = parse_time(&one("--from-absent-at")?)?;
@@ -324,7 +332,16 @@ pub fn parse_args(args: &[String]) -> Result<Act, String> {
         }),
         ("handover" | "vote", other) => Err(format!("unknown {family} subcommand {other}")),
         (other, _) => Err(format!("unknown governance family {other}")),
+    }?;
+
+    let leftover = opts
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .find(|key| !used.borrow().contains(key));
+    if let Some(key) = leftover {
+        return Err(format!("unknown option {key}"));
     }
+    Ok(act)
 }
 
 fn parse_time(raw: &Option<String>) -> Result<Option<DateTime<Utc>>, String> {
@@ -2014,6 +2031,30 @@ mod tests {
             .await
             .expect_err("an absence that cannot be re-read cannot be applied on");
         assert!(err.to_string().contains("no heartbeat store"), "{err}");
+    }
+
+    /// A misspelled option used to be accepted and dropped. The command then
+    /// ran with a meaning nobody typed -- here, an exit handover without the
+    /// absence observation the caller thought they had recorded, which turns
+    /// a two-signature handover into one the departed owner must sign.
+    #[test]
+    fn a_misspelled_option_is_refused_instead_of_being_dropped() {
+        let err = parse_args(&args(&[
+            "handover",
+            "open",
+            "--face",
+            "f",
+            "--to",
+            "a",
+            "--witness",
+            "b",
+            "--from",
+            "c2",
+            "--from-absent",
+            "2026-10-21T00:00:00Z",
+        ]))
+        .expect_err("--from-absent is not --from-absent-at");
+        assert!(err.contains("--from-absent"), "{err}");
     }
 
     #[test]
