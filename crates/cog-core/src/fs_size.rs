@@ -29,7 +29,7 @@
 //! Where the filesystem does not report a file's identity, every path stands
 //! for a file of its own, since two names cannot be told apart without it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -53,7 +53,7 @@ pub fn dir_size_bytes(dir: &Path, exclude: &[PathBuf]) -> io::Result<u64> {
 /// Identity of a file, as opposed to identity of a name: two entries with the
 /// same id are two names of one file on disk, and its bytes are on the volume
 /// once however many names it has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileId {
     pub dev: u64,
     pub ino: u64,
@@ -141,6 +141,40 @@ fn mark_aliases(files: &mut [FileEntry]) {
 /// valid prefix. The bytes are still counted; only the layer name is coarser,
 /// which is the direction a reader can see.
 ///
+/// Apparent bytes of every regular file below `dir`, the same total
+/// [`dir_size_bytes`] gives, folded as the walk goes.
+///
+/// Defined on the same traversal and with the same answers about symlinks and
+/// exclusions, because two sizes for one tree is the failure both walkers exist
+/// to prevent. What differs is what the walk is allowed to keep: this one holds
+/// only the identities of the files it has already counted, so its cost is a
+/// set of `(dev, ino)` pairs rather than an entry per file. That is the reading
+/// a tree of millions of files needs -- a container image store is one -- where
+/// materialising every file costs more than the measurement is worth and gets
+/// the process killed by its own memory limit before it answers.
+///
+/// Same number, not merely a similar one: [`dir_size_bytes`] counts one name
+/// per file, and which name counts is fixed by path order only so that two
+/// walks of an unchanged tree agree on the layer split. A total that keeps the
+/// first identity it meets reaches the same sum, because the choice of name
+/// moves bytes between layers and never in or out of the tree.
+///
+/// A file whose identity the filesystem does not report is counted under each
+/// name, the same as there.
+pub fn dir_bytes_counted_once(dir: &Path, exclude: &[PathBuf]) -> io::Result<u64> {
+    let mut seen: HashSet<FileId> = HashSet::new();
+    let mut bytes: u64 = 0;
+    walk(dir, 1, exclude, |entry| {
+        if let Some(id) = entry.id {
+            if !seen.insert(id) {
+                return;
+            }
+        }
+        bytes = bytes.saturating_add(entry.len);
+    })?;
+    Ok(bytes)
+}
+
 /// A layer whose files are all aliases of files counted elsewhere is reported
 /// with the zero bytes it holds rather than left out: the names are there, and
 /// a layer that vanishes from the reading is one a reader cannot tell from a
@@ -506,6 +540,34 @@ mod tests {
         // the zero bytes it has: a layer that vanishes cannot be told from one
         // the walk could not see.
         assert_eq!(layers.get("debug"), Some(&0));
+    }
+
+    /// The streamed total is the materialised one, hardlinks and symlinks
+    /// included: the two walkers cannot report different sizes for one tree, or
+    /// the reading a store is measured against and the reading a cache is
+    /// capped against would answer for the same bytes differently.
+    #[cfg(unix)]
+    #[test]
+    fn the_streamed_total_is_the_materialised_one() {
+        let root = scratch("streamed");
+        let root = root.path();
+        write(&root.join("content/blob"), 4096);
+        write(&root.join("snap/1/fs/blob"), 8192);
+        fs::create_dir_all(root.join("snap/2")).unwrap();
+        fs::hard_link(root.join("content/blob"), root.join("snap/2/blob")).unwrap();
+        std::os::unix::fs::symlink(root.join("content/blob"), root.join("link")).unwrap();
+
+        let materialised = dir_size_bytes(root, &[]).unwrap();
+        assert_eq!(materialised, 4096 + 8192, "the hardlink is one file");
+        assert_eq!(dir_bytes_counted_once(root, &[]).unwrap(), materialised);
+
+        // The same exclusions, so a nested mount left out of one walk is left
+        // out of both.
+        let exclude = vec![root.join("snap")];
+        assert_eq!(
+            dir_bytes_counted_once(root, &exclude).unwrap(),
+            dir_size_bytes(root, &exclude).unwrap()
+        );
     }
 
     /// A tree the walk cannot read fails rather than reporting what it managed

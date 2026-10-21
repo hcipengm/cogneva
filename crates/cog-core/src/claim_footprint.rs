@@ -310,6 +310,20 @@ impl ClaimFootprint {
         Ok(())
     }
 
+    /// The same total, measured without materialising the tree.
+    ///
+    /// For a directory whose file count is the problem: [`Self::measure`] keeps
+    /// one entry per file for the whole walk, which a container image store --
+    /// hundreds of thousands of files, nearly half of them hardlinks between
+    /// layers -- turns into more memory than such a process is given. Both read
+    /// the same traversal with the same answers about symlinks, hardlinks and
+    /// exclusions, so the number is the one a claim of the same size would get.
+    pub fn measure_streaming(&self) -> std::io::Result<()> {
+        let bytes = crate::fs_size::dir_bytes_counted_once(&self.dir, &self.exclude)?;
+        self.set_used_bytes(bytes);
+        Ok(())
+    }
+
     /// Walk on the blocking pool, so a large tree does not hold a runtime thread.
     pub async fn measure_blocking(self: &Arc<Self>) -> std::io::Result<()> {
         let this = Arc::clone(self);
