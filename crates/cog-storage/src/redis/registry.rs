@@ -62,6 +62,46 @@ impl RedisAgentRegistry {
             .await
             .map_err(|e: RedisError| SFError::Redis(e.to_string()))
     }
+
+    /// How long a record may sit without a heartbeat before its own contents
+    /// stop being evidence of life.
+    ///
+    /// The key's expiry is supposed to answer this: Redis deletes the key, and
+    /// reading `None` is the proof. That equivalence only holds for keys that
+    /// carry a TTL, and a key written by `SET` followed by `EXPIRE` is left
+    /// without one when the writer dies in between. Those records are not
+    /// hypothetical: a live cluster held 20 registrations at `TTL -1` with a
+    /// three-day-old `last_heartbeat`, and every reader listing the registry
+    /// (the agent listing route among them) reported them as live agents that
+    /// could be addressed. A caller routing work to one would be queueing for a
+    /// process that is not there, which is the one thing a liveness answer must
+    /// not say.
+    ///
+    /// Three missed beats, floored at 90s: the floor keeps the bound meaningful
+    /// for a registry configured with a very short TTL, and three beats means a
+    /// single lost heartbeat does not retire a working agent.
+    fn stale_after_secs(&self) -> i64 {
+        (self.ttl_seconds as i64).saturating_mul(3).max(90)
+    }
+
+    /// Whether the record itself says its writer has stopped beating.
+    fn is_stale(&self, reg: &AgentRegistration) -> bool {
+        let age = Utc::now().signed_duration_since(reg.last_heartbeat);
+        age.num_seconds() > self.stale_after_secs()
+    }
+
+    /// Drop a record that is no longer evidence of life: the key and its id in
+    /// the index. Best effort — the caller has already decided to report the
+    /// agent absent, and a failed cleanup must not turn that answer into an
+    /// error. The index entry goes with the key because `list` reconstructs the
+    /// roster from the index, so a surviving id there is the same dead name
+    /// arriving through the other door.
+    async fn forget(&self, agent_id: &str) {
+        let mut conn = self.connection.clone();
+        let key = agent_key(agent_id);
+        let _: Result<(), RedisError> = conn.del(&key).await;
+        let _: Result<(), RedisError> = conn.srem(REGISTRY_INDEX_KEY, agent_id).await;
+    }
 }
 
 #[async_trait]
@@ -70,12 +110,11 @@ impl AgentRegistry for RedisAgentRegistry {
         let key = agent_key(&registration.agent_id);
         let payload = serde_json::to_string(registration).map_err(SFError::Serialization)?;
         let mut conn = self.connection.clone();
+        // One command, not `SET` then `EXPIRE`: between those two a process can
+        // die and leave a record that never expires, which every reader then
+        // lists as a live agent forever. See `stale_after_secs`.
         let _: () = conn
-            .set(&key, payload)
-            .await
-            .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
-        let _: () = conn
-            .expire(&key, self.ttl_seconds as i64)
+            .set_ex(&key, payload, self.ttl_seconds)
             .await
             .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
         let _: () = conn
@@ -101,12 +140,11 @@ impl AgentRegistry for RedisAgentRegistry {
             serde_json::from_str(&raw).map_err(SFError::Serialization)?;
         reg.last_heartbeat = Utc::now();
         let payload = serde_json::to_string(&reg).map_err(SFError::Serialization)?;
+        // Atomic, for the same reason as `register`: a beat that lands on a
+        // record whose TTL was lost is exactly the moment to re-arm it, and
+        // splitting the write from the expiry reopens the window it closes.
         let _: () = conn
-            .set(&key, payload)
-            .await
-            .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
-        let _: () = conn
-            .expire(&key, self.ttl_seconds as i64)
+            .set_ex(&key, payload, self.ttl_seconds)
             .await
             .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
         Ok(())
@@ -133,12 +171,17 @@ impl AgentRegistry for RedisAgentRegistry {
             .get(&key)
             .await
             .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
-        match raw {
-            Some(s) => Ok(Some(
-                serde_json::from_str(&s).map_err(SFError::Serialization)?,
-            )),
-            None => Ok(None),
+        let Some(s) = raw else {
+            return Ok(None);
+        };
+        let reg: AgentRegistration = serde_json::from_str(&s).map_err(SFError::Serialization)?;
+        // The key exists, but existence is only as good as its TTL: a record
+        // whose writer stopped beating is absent, whatever the key says.
+        if self.is_stale(&reg) {
+            self.forget(agent_id).await;
+            return Ok(None);
         }
+        Ok(Some(reg))
     }
 
     async fn list(&self) -> SFResult<Vec<AgentRegistration>> {
@@ -149,14 +192,12 @@ impl AgentRegistry for RedisAgentRegistry {
             .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
+            // `get` already drops the ones that are not evidence of life, both
+            // the expired key and the record whose heartbeat went quiet, and it
+            // takes the index entry with them -- so this loop is one question,
+            // not two answers that could disagree.
             if let Some(reg) = AgentRegistry::get(self, &id).await? {
                 out.push(reg);
-            } else {
-                // Stale id — its key TTL expired but the index still holds it. Clean up.
-                let _: () = conn
-                    .srem(REGISTRY_INDEX_KEY, &id)
-                    .await
-                    .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
             }
         }
         Ok(out)
