@@ -919,6 +919,7 @@ async fn a_reopen_keeps_the_landed_time_the_next_measurement_clears() {
             identity: id.clone(),
             was_landed_at: Some(landed_at),
             measured_rev: "probe-rev-2".to_string(),
+            scope_present: Some(false),
         })
         .await
         .expect("record the reopen");
@@ -940,23 +941,81 @@ async fn a_reopen_keeps_the_landed_time_the_next_measurement_clears() {
         "the account cleared the landed time, which is why the record below is the only copy of it"
     );
 
-    let (recorded_at, recorded_rev): (Option<chrono::DateTime<chrono::Utc>>, String) =
-        sqlx::query_as(
-            "SELECT was_landed_at, measured_rev FROM change_reopen \
+    let (recorded_at, recorded_rev, scope_present): (
+        Option<chrono::DateTime<chrono::Utc>>,
+        String,
+        Option<bool>,
+    ) = sqlx::query_as(
+        "SELECT was_landed_at, measured_rev, scope_present FROM change_reopen \
          WHERE kind = $1 AND scope = $2 AND literal = $3",
-        )
-        .bind(&id.kind)
-        .bind(&id.scope)
-        .bind(&id.literal)
-        .fetch_one(&pool)
-        .await
-        .expect("read the reopen back");
+    )
+    .bind(&id.kind)
+    .bind(&id.scope)
+    .bind(&id.literal)
+    .fetch_one(&pool)
+    .await
+    .expect("read the reopen back");
     assert_eq!(
         recorded_at,
         Some(landed_at),
         "the record carries the time the account had stamped, not one of its own"
     );
     assert_eq!(recorded_rev, "probe-rev-2", "the revision the pass read");
+    assert_eq!(
+        scope_present,
+        Some(false),
+        "the answer the pass got -- the surface had left -- survives the write; \
+         folded into a default it would read as a criterion that stopped holding"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
+/// A reopen whose pass could not ask the tree keeps that fact as an absence.
+///
+/// The column has three readings and the third one is the reason it is nullable:
+/// `false` says the surface had left, and a git that failed says nothing about
+/// the surface at all. Stored under either answer, a failed look would be
+/// reported as a removal, and the count of claims that stopped holding inside a
+/// surface still there would be short by however many looks happened to fail.
+/// Checked by writing the reopen with `None` and reading NULL back -- not by
+/// reading the column's definition, which would pass for a default of `false`.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_reopen_that_could_not_ask_the_tree_stores_no_answer() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "unanswered");
+
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(id.clone(), ChangeState::Landed).at_revision("probe-rev-1"),
+        )
+        .await
+        .expect("measure the row as landed");
+    store
+        .record_reopen(&ChangeReopen {
+            identity: id.clone(),
+            was_landed_at: None,
+            measured_rev: "probe-rev-2".to_string(),
+            scope_present: None,
+        })
+        .await
+        .expect("record the reopen");
+
+    let scope_present: Option<bool> = sqlx::query_scalar(
+        "SELECT scope_present FROM change_reopen \
+         WHERE kind = $1 AND scope = $2 AND literal = $3",
+    )
+    .bind(&id.kind)
+    .bind(&id.scope)
+    .bind(&id.literal)
+    .fetch_one(&pool)
+    .await
+    .expect("read the reopen back");
+    assert_eq!(
+        scope_present, None,
+        "a look that failed is not the same answer as a surface that had left"
+    );
 
     cleanup(&pool, &marker).await;
 }

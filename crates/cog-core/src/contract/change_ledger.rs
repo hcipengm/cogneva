@@ -720,6 +720,21 @@ pub struct ChangeReopen {
     /// tree moves, and "this stopped being true" without a revision is a claim
     /// nothing can be re-read against.
     pub measured_rev: String,
+    /// Whether the row's scope was still in the tree this pass read.
+    ///
+    /// Two stories arrive as one reopen and a reader cannot tell them apart
+    /// afterwards: a claim stops holding because the surface it lived in was
+    /// removed (a decision took a demand off the tree), or because the criterion
+    /// stopped being true inside a surface that is still there (a regression).
+    /// The pass asks the tree this question already -- it is what decides whether
+    /// an absent scope retires the row -- and this keeps the answer.
+    ///
+    /// `None` is "the tree could not be asked", which is neither of the two:
+    /// the look failed for a reason that says nothing about the scope. Rows
+    /// recorded before the column existed read the same way, and both are
+    /// reported as unrecorded rather than folded into either answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_present: Option<bool>,
 }
 
 /// Durable storage for the change ledger.

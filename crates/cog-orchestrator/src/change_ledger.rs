@@ -2160,6 +2160,32 @@ async fn reopen_pass(
                             Ok(()) => {
                                 unsettled.remove(&row.identity);
                                 pass.retired += 1;
+                                // The row stopped holding, which is the whole of what the
+                                // reopen series records, and the retirement is how it left.
+                                // Written here rather than left to the reopen below because
+                                // this branch returns: without it the series would be
+                                // missing exactly the case its answer column exists to
+                                // describe -- a landed row whose surface left -- and a
+                                // reader would see only the reopens where the surface was
+                                // still there. A failure to record says so and does not
+                                // undo the retirement, which is the fact that matters.
+                                if let Err(e) = store
+                                    .record_reopen(&ChangeReopen {
+                                        identity: row.identity.clone(),
+                                        was_landed_at: row.landed_at,
+                                        measured_rev: snapshot.rev().to_string(),
+                                        scope_present: Some(false),
+                                    })
+                                    .await
+                                {
+                                    warn!(
+                                        change = %row.identity,
+                                        error = %e,
+                                        "change ledger: the row was retired as surface_moved but \
+                                         the reopen could not be recorded, so the account says \
+                                         the surface left without saying the row ever held"
+                                    );
+                                }
                                 warn!(
                                     change = %row.identity,
                                     exited_in = %left_at,
@@ -2224,10 +2250,21 @@ async fn reopen_pass(
             // done. This is the only place that time survives, and it has to be
             // read off the row before the write that takes it away.
             pass.reopened += 1;
+            // Asked here rather than reconstructed later, and asked of this
+            // snapshot rather than the history: the question a reader of this
+            // row has is which of two stories it tells -- a surface that was
+            // removed under a claim that held, or a claim that stopped holding
+            // where it still lives. Only this pass has the tree the row was
+            // just measured against, and the answer stops being recoverable the
+            // moment that surface comes back. A failed look leaves it
+            // unrecorded instead of guessing: `false` would file a git error as
+            // a removal.
+            let scope_present = tree.scope_present(snapshot, &row.identity).await.ok();
             let reopen = ChangeReopen {
                 identity: row.identity.clone(),
                 was_landed_at: row.landed_at,
                 measured_rev: snapshot.rev().to_string(),
+                scope_present,
             };
             if let Err(e) = store.record_reopen(&reopen).await {
                 warn!(
@@ -5473,6 +5510,7 @@ mod tests {
         written: std::sync::Mutex<Vec<DispatchState>>,
         measured: std::sync::Mutex<Vec<ChangeMeasurement>>,
         delivered: std::sync::Mutex<Vec<(ChangeIdentity, String)>>,
+        reopened: std::sync::Mutex<Vec<ChangeReopen>>,
     }
 
     impl FakeLedger {
@@ -5493,6 +5531,10 @@ mod tests {
 
         fn measurements(&self) -> Vec<ChangeMeasurement> {
             self.measured.lock().unwrap().clone()
+        }
+
+        fn reopens(&self) -> Vec<ChangeReopen> {
+            self.reopened.lock().unwrap().clone()
         }
     }
 
@@ -5593,7 +5635,8 @@ mod tests {
                 .cloned()
                 .collect())
         }
-        async fn record_reopen(&self, _reopen: &ChangeReopen) -> SFResult<()> {
+        async fn record_reopen(&self, reopen: &ChangeReopen) -> SFResult<()> {
+            self.reopened.lock().unwrap().push(reopen.clone());
             Ok(())
         }
         async fn get(&self, identity: &ChangeIdentity) -> SFResult<Option<ChangeLedgerRow>> {
@@ -6187,6 +6230,61 @@ mod tests {
             retirement.measured_rev.as_deref(),
             Some(snapshot.rev()),
             "the deletion commit and the tree read are different revisions here, so the\n             assertion above is about the history and not about the tip"
+        );
+
+        // The retirement is how the row left, and the reopen is the record that it
+        // held once. Without it the series would be missing exactly the case its
+        // answer column exists for, and a reader would see only the reopens whose
+        // surface was still there.
+        let reopens = store.reopens();
+        assert_eq!(
+            reopens.len(),
+            1,
+            "the row left `landed`, so the reopen was recorded"
+        );
+        assert_eq!(
+            reopens[0].scope_present,
+            Some(false),
+            "the surface had left, which is the answer a reader needs to tell this \
+             apart from a criterion that stopped holding where it still lives"
+        );
+    }
+
+    /// A reopen in a surface that is still there says so, and says the other way.
+    ///
+    /// The two stories behind one reopen must not arrive under one word: a
+    /// surface removed under a claim that held is a decision somebody made, and
+    /// a check that stopped holding inside a surface that is still here is a
+    /// regression. This is the second. The scope is `file` and the tree still
+    /// has it; what left is the literal the check looks for.
+    #[tokio::test]
+    async fn a_reopen_records_that_the_surface_was_still_there() {
+        let (dir, _first, _second) = two_revision_repo();
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = tree.snapshot().await.expect("the fixture is readable");
+        let store = FakeLedger {
+            rows: vec![landed_row("file", None)],
+            ..Default::default()
+        };
+        let mut unsettled = HashMap::new();
+
+        let pass = reopen_pass(&store, &tree, &snapshot, &mut unsettled, &[]).await;
+
+        assert_eq!(
+            pass.reopened, 1,
+            "the check no longer holds in a scope still here"
+        );
+        let reopens = store.reopens();
+        assert_eq!(reopens.len(), 1);
+        assert_eq!(
+            reopens[0].scope_present,
+            Some(true),
+            "the scope is in this tree, so the answer is `true` and not an absence"
+        );
+        assert_eq!(
+            reopens[0].measured_rev,
+            snapshot.rev(),
+            "the revision is the one the pass read, not the one the row last held at"
         );
     }
 

@@ -456,8 +456,8 @@ SELECT block, \
 /// one. The time is the database's own, from the column default, so no caller
 /// supplies the moment it is recorded.
 const RECORD_REOPEN_SQL: &str = "\
-INSERT INTO change_reopen (kind, scope, literal, was_landed_at, measured_rev) \
-VALUES ($1, $2, $3, $4, $5)";
+INSERT INTO change_reopen (kind, scope, literal, was_landed_at, measured_rev, scope_present) \
+VALUES ($1, $2, $3, $4, $5, $6)";
 
 /// Stamp the commit that delivered a row's change, and only while nothing has.
 ///
@@ -1016,6 +1016,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .bind(&reopen.identity.literal)
             .bind(reopen.was_landed_at)
             .bind(&reopen.measured_rev)
+            .bind(reopen.scope_present)
             .execute(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("record reopen: {e}")))?;
