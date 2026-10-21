@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS alerts (
 ;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ
 ;
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ
+;
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS acknowledged_by TEXT
+;
 CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts(state, fired_at DESC);
 "#;
 
@@ -147,6 +151,10 @@ pub struct AlertRecord {
     /// one being confirmed every tick. `None` only for rows written before the
     /// column existed, and only until their next evaluation.
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// When a person acknowledged this firing episode, and who. Cleared on the
+    /// next firing edge: an acknowledgement covers one episode.
+    pub acknowledged_at: Option<DateTime<Utc>>,
+    pub acknowledged_by: Option<String>,
 }
 
 /// PostgreSQL alert store.
@@ -223,7 +231,13 @@ impl PostgresAlertStore {
                         fired_at   = EXCLUDED.fired_at,
                         resolved_at = NULL,
                         updated_at = EXCLUDED.updated_at,
-                        last_seen_at = EXCLUDED.last_seen_at
+                        last_seen_at = EXCLUDED.last_seen_at,
+                        -- A new firing edge starts a new episode: whoever
+                        -- acknowledged the previous one did not acknowledge
+                        -- this condition at this time, and carrying the mark
+                        -- over would show a fresh alert as already handled.
+                        acknowledged_at = NULL,
+                        acknowledged_by = NULL
                     "#,
                 )
                 .bind(uuid::Uuid::new_v4().to_string())
@@ -285,6 +299,33 @@ impl PostgresAlertStore {
         }
     }
 
+    /// Record that `by` has seen the firing alert under `dedup_key`, answering
+    /// when — or `None` when there is no firing row to acknowledge.
+    ///
+    /// Guarded on `state = 'firing'`: acknowledging an episode that already
+    /// cleared would put a person's mark on the row the next firing reuses, and
+    /// that mark would then read as "someone is on this" for a condition that
+    /// person never saw. Nothing is written in that case, so a retry after a
+    /// resolution is a no-op rather than a stale write that has to be undone.
+    pub async fn acknowledge(
+        &self,
+        dedup_key: &str,
+        by: &str,
+    ) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let now = Utc::now();
+        let written = sqlx::query(
+            "UPDATE alerts SET acknowledged_at = $2, acknowledged_by = $3 \
+             WHERE dedup_key = $1 AND state = 'firing'",
+        )
+        .bind(dedup_key)
+        .bind(now)
+        .bind(by)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok((written > 0).then_some(now))
+    }
+
     /// The `dedup_key` of the row currently firing under `rule`, if any.
     ///
     /// A rule whose identity carries the event it belongs to holds one row per
@@ -310,7 +351,8 @@ impl PostgresAlertStore {
     pub async fn list_active(&self, limit: i64) -> anyhow::Result<Vec<AlertRecord>> {
         let rows = sqlx::query(
             "SELECT id, rule, dedup_key, severity, state, message, labels, \
-             fired_at, resolved_at, updated_at, last_seen_at FROM alerts \
+             fired_at, resolved_at, updated_at, last_seen_at, \
+             acknowledged_at, acknowledged_by FROM alerts \
              WHERE state = 'firing' ORDER BY fired_at DESC LIMIT $1",
         )
         .bind(limit)
@@ -323,7 +365,8 @@ impl PostgresAlertStore {
     pub async fn list_history(&self, limit: i64) -> anyhow::Result<Vec<AlertRecord>> {
         let rows = sqlx::query(
             "SELECT id, rule, dedup_key, severity, state, message, labels, \
-             fired_at, resolved_at, updated_at, last_seen_at FROM alerts \
+             fired_at, resolved_at, updated_at, last_seen_at, \
+             acknowledged_at, acknowledged_by FROM alerts \
              ORDER BY fired_at DESC LIMIT $1",
         )
         .bind(limit)
@@ -346,6 +389,8 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> AlertRecord {
         resolved_at: row.get("resolved_at"),
         updated_at: row.get("updated_at"),
         last_seen_at: row.get("last_seen_at"),
+        acknowledged_at: row.get("acknowledged_at"),
+        acknowledged_by: row.get("acknowledged_by"),
     }
 }
 
@@ -370,6 +415,8 @@ impl cog_core::ActiveAlertSource for PostgresAlertStore {
                         labels: r.labels,
                         fired_at: r.fired_at,
                         last_seen_at: r.last_seen_at,
+                        acknowledged_at: r.acknowledged_at,
+                        acknowledged_by: r.acknowledged_by,
                     })
                     .collect(),
             ),
@@ -378,6 +425,16 @@ impl cog_core::ActiveAlertSource for PostgresAlertStore {
                 None
             }
         }
+    }
+
+    async fn acknowledge_alert(
+        &self,
+        dedup_key: &str,
+        by: &str,
+    ) -> Result<Option<DateTime<Utc>>, String> {
+        self.acknowledge(dedup_key, by)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -422,6 +479,8 @@ impl cog_core::PersistentAlertSink for PostgresAlertStore {
                     labels: r.labels,
                     fired_at: r.fired_at,
                     last_seen_at: r.last_seen_at,
+                    acknowledged_at: r.acknowledged_at,
+                    acknowledged_by: r.acknowledged_by,
                 })
                 .collect(),
             Err(e) => {

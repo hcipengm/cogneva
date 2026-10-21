@@ -326,6 +326,12 @@ export interface ActiveAlert {
   resolved: boolean;
   /** `supervisor`（进程内事件）或 `durable`（PostgreSQL 表） */
   source: string;
+  /**
+   * 有人点过「确认」的时间，以及是谁。只有耐久行有；进程内事件背后没有行，
+   * 没有可以写确认的地方。告警重新 firing 时会被清掉——确认只覆盖一次发作。
+   */
+  acknowledged_at: string | null;
+  acknowledged_by: string | null;
 }
 
 /**
@@ -343,6 +349,22 @@ export interface ActiveAlerts {
 
 export async function getActiveAlerts(): Promise<ActiveAlerts> {
   return api.get<ActiveAlerts>('/api/v1/alerts/active');
+}
+
+/**
+ * 确认一条正在 firing 的告警已被人看见。
+ *
+ * `id` 是列表里给的 `dedup_key`。网关对已经清掉的那一条回 404——它不写一个
+ * 下次 firing 会复用的旧标记，所以 404 是「这条已经不用确认了」，不是重试。
+ */
+export async function acknowledgeAlert(
+  id: string,
+): Promise<{ acknowledged_at: string; acknowledged_by: string }> {
+  const res = await api.post<{
+    acknowledged_at: string;
+    acknowledged_by: string;
+  }>(`/api/v1/alerts/${encodeURIComponent(id)}/ack`, {});
+  return res;
 }
 
 // ── 通知中心（站内通信的收端） ──

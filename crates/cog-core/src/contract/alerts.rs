@@ -300,10 +300,23 @@ pub struct PersistedAlert {
     /// tick from a row whose producer stopped. `None` when the row carries no
     /// sighting yet.
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// When a person last said they had seen this firing episode, and who.
+    ///
+    /// Separate from `last_seen_at` in both meaning and author: that one is the
+    /// *producer* looking at the condition on a tick, this is a *human* looking
+    /// at the alert. A firing list without it shows a condition first raised
+    /// weeks ago exactly like one raised a minute ago, so nothing distinguishes
+    /// "nobody has looked" from "someone is on it".
+    ///
+    /// It belongs to the episode and is cleared when the alert re-fires: an
+    /// acknowledgement of a past episode says nothing about the current one.
+    pub acknowledged_at: Option<DateTime<Utc>>,
+    pub acknowledged_by: Option<String>,
 }
 
-/// Read-side handle over persisted alerts. Published by whichever plugin owns
-/// alert persistence so other crates can turn firing alerts into work.
+/// Handle over persisted alerts. Published by whichever plugin owns alert
+/// persistence so other crates can turn firing alerts into work, and so a
+/// control plane can record that a person has seen one.
 #[async_trait::async_trait]
 pub trait ActiveAlertSource: Send + Sync {
     /// Alerts currently in the `firing` state, newest first, or `None` when the
@@ -315,6 +328,24 @@ pub trait ActiveAlertSource: Send + Sync {
     /// firing". A source that answers `Some(vec![])` has looked and found
     /// nothing.
     async fn list_active_alerts(&self, limit: i64) -> Option<Vec<PersistedAlert>>;
+
+    /// Record that `by` has seen the firing alert keyed by `dedup_key`, and
+    /// answer when that was recorded.
+    ///
+    /// `Ok(None)` means there is no firing row under that key — the alert
+    /// cleared between the listing and the click, or the key was never an
+    /// alert. It is not an error, and it must not be written: acknowledging a
+    /// resolved episode would surface a stale acknowledgement on the row the
+    /// next firing reuses.
+    ///
+    /// The write lives on this handle rather than on a separate one because
+    /// acknowledgement is a fact about the same rows this handle reads, and a
+    /// second contract over one table is how the two views start disagreeing.
+    async fn acknowledge_alert(
+        &self,
+        dedup_key: &str,
+        by: &str,
+    ) -> Result<Option<DateTime<Utc>>, String>;
 }
 
 /// Rule name for alerts raised when goal decomposition ends without any

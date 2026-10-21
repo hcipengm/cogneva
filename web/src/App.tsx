@@ -51,6 +51,9 @@ export default function App() {
     alerts: activeAlerts,
     loading: alertsLoading,
     error: alertsError,
+    ackError: alertsAckError,
+    pendingAck: alertsPendingAck,
+    acknowledge: acknowledgeAlert,
     refresh: refreshAlerts,
   } = useActiveAlerts(!USE_MOCK && isAuthenticated);
   const firingCount = activeAlerts?.count ?? 0;
@@ -107,6 +110,9 @@ export default function App() {
           alerts={activeAlerts}
           loading={alertsLoading}
           error={alertsError}
+          ackError={alertsAckError}
+          pendingAck={alertsPendingAck}
+          acknowledge={acknowledgeAlert}
           refresh={refreshAlerts}
           onClose={() => setAlertsOpen(false)}
         />

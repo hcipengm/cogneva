@@ -481,6 +481,11 @@ jobs:
       # 一格组件」，外加传输层不许把通知塞进 agent 事件归一化（那会静默丢每一条）。
       - name: Check the notification routes have a rendered consumer
         run: bash deploy/scripts/check-web-notification-panel.sh
+      # 告警中心是站内通信的另一半：列表 ＋ 确认。确认的四条坏路都不出声——面板消失、
+      # 按钮接空回调、确认写了列表不读（刷新又变未确认）、重新 firing 不清旧标记
+      # （旧发作的确认盖在新一次上）。门把前端可达性与这三处服务端事实一起判。
+      - name: Check the alert list and its acknowledge have a consumer
+        run: bash deploy/scripts/check-web-alert-panel.sh
 
   # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读
   # 覆盖端点），它结构上证明不了 `web/` 编得过：类型错、装不上的依赖、打包不进

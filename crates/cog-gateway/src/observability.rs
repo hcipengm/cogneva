@@ -524,6 +524,8 @@ mod tests {
             labels: serde_json::json!({}),
             fired_at: chrono::Utc::now(),
             last_seen_at: None,
+            acknowledged_at: None,
+            acknowledged_by: None,
         }
     }
 
@@ -553,6 +555,14 @@ mod tests {
     impl ActiveAlertSource for StubSource {
         async fn list_active_alerts(&self, _limit: i64) -> Option<Vec<PersistedAlert>> {
             self.firing.clone()
+        }
+
+        async fn acknowledge_alert(
+            &self,
+            _dedup_key: &str,
+            _by: &str,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+            Err("the health verdict never acknowledges anything".into())
         }
     }
 

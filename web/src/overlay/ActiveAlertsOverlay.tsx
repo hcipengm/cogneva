@@ -22,7 +22,50 @@ function severityClass(severity: string): string {
   }
 }
 
-function Row({ alert }: { alert: ActiveAlert }) {
+function AckCell({
+  alert,
+  pending,
+  onAcknowledge,
+}: {
+  alert: ActiveAlert;
+  pending: boolean;
+  onAcknowledge: (id: string) => void;
+}) {
+  // 进程内事件背后没有行：确认没有可以写的地方，所以这一格不是「没人确认」，
+  // 是「这一条不可确认」——两者画成一样会让人以为点一下就能清掉。
+  if (alert.source !== 'durable') {
+    return <td className="py-1.5 text-right text-slate-600">不可确认</td>;
+  }
+  if (alert.acknowledged_at) {
+    return (
+      <td className="py-1.5 text-right text-slate-400">
+        <span className="text-emerald-400">{alert.acknowledged_by ?? '?'}</span>{' '}
+        {stamp(alert.acknowledged_at)}
+      </td>
+    );
+  }
+  return (
+    <td className="py-1.5 text-right">
+      <button
+        onClick={() => onAcknowledge(alert.id)}
+        disabled={pending}
+        className="rounded px-2 py-0.5 text-xs text-amber-300 transition hover:bg-slate-800 hover:text-amber-200 disabled:text-slate-500"
+      >
+        {pending ? '确认中…' : '确认'}
+      </button>
+    </td>
+  );
+}
+
+function Row({
+  alert,
+  pending,
+  onAcknowledge,
+}: {
+  alert: ActiveAlert;
+  pending: boolean;
+  onAcknowledge: (id: string) => void;
+}) {
   return (
     <tr className="border-t border-slate-800/60 align-top">
       <td className={`py-1.5 pr-3 font-medium ${severityClass(alert.severity)}`}>
@@ -34,9 +77,10 @@ function Row({ alert }: { alert: ActiveAlert }) {
       <td className="py-1.5 pr-3 text-right tabular-nums text-slate-400">
         {stamp(alert.timestamp)}
       </td>
-      <td className="py-1.5 text-right tabular-nums text-slate-400">
+      <td className="py-1.5 pr-3 text-right tabular-nums text-slate-400">
         {stamp(alert.last_seen_at)}
       </td>
+      <AckCell alert={alert} pending={pending} onAcknowledge={onAcknowledge} />
     </tr>
   );
 }
@@ -45,17 +89,26 @@ export function ActiveAlertsOverlay({
   alerts,
   loading,
   error,
+  ackError,
+  pendingAck,
+  acknowledge,
   refresh,
   onClose,
 }: {
   alerts: ActiveAlerts | null;
   loading: boolean;
   error: string | null;
+  ackError: string | null;
+  pendingAck: Record<string, true>;
+  acknowledge: (id: string) => void;
   refresh: () => void;
   onClose: () => void;
 }) {
   const rows = alerts?.alerts ?? [];
   const durableRead = alerts?.durable_alerts_read;
+  const unacknowledged = rows.filter(
+    (a) => a.source === 'durable' && !a.acknowledged_at,
+  ).length;
 
   return (
     <div className="absolute inset-0 z-50 flex items-center justify-center bg-slate-950/90 p-6 backdrop-blur-sm">
@@ -81,6 +134,10 @@ export function ActiveAlertsOverlay({
         <p className="mb-6 text-sm text-slate-400">
           进程内事件与 PostgreSQL 耐久表的合并视图，每 30 秒刷新。「最后确认」是生产者
           上一次确认这条仍在 firing 的时间；它停住而告警还挂着，说明生产者已经不看了。
+          「确认」是人看到之后留的标记，只对耐久行有——告警重新 firing 时会自动清掉。
+          {unacknowledged > 0 && (
+            <span className="text-amber-300"> 现在有 {unacknowledged} 条没人确认。</span>
+          )}
         </p>
 
         {error && (
@@ -89,6 +146,12 @@ export function ActiveAlertsOverlay({
             <div className="mt-1 text-xs text-red-300/80">
               这一格没有读数——不是「没有告警」。
             </div>
+          </div>
+        )}
+
+        {ackError && (
+          <div className="mb-4 rounded-lg bg-red-500/10 p-3 text-sm text-red-400">
+            {ackError}
           </div>
         )}
 
@@ -116,12 +179,18 @@ export function ActiveAlertsOverlay({
                 <th className="pb-2 pr-3 text-left font-medium">说明</th>
                 <th className="pb-2 pr-3 text-left font-medium">来源</th>
                 <th className="pb-2 pr-3 text-right font-medium">开始</th>
-                <th className="pb-2 text-right font-medium">最后确认</th>
+                <th className="pb-2 pr-3 text-right font-medium">最后确认</th>
+                <th className="pb-2 text-right font-medium">有人确认</th>
               </tr>
             </thead>
             <tbody>
               {rows.map((alert, i) => (
-                <Row key={`${alert.source}\u0000${alert.id}\u0000${i}`} alert={alert} />
+                <Row
+                  key={`${alert.source}\u0000${alert.id}\u0000${i}`}
+                  alert={alert}
+                  pending={Boolean(pendingAck[alert.id])}
+                  onAcknowledge={acknowledge}
+                />
               ))}
             </tbody>
           </table>

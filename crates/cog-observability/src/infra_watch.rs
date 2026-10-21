@@ -1554,6 +1554,8 @@ mod tests {
             resolved_at: None,
             updated_at: Utc::now(),
             last_seen_at: Some(Utc::now()),
+            acknowledged_at: None,
+            acknowledged_by: None,
         }
     }
 

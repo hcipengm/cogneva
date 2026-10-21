@@ -26,4 +26,9 @@ pub struct AlertEntry {
     /// rows in the persistent state machine. One list without this field would
     /// make the two kinds of evidence indistinguishable.
     pub source: &'static str,
+    /// When a person said they had seen this firing episode, and who. Both are
+    /// `None` for the process-local half: those entries are event snapshots
+    /// with no row behind them, so there is nothing a click could mark.
+    pub acknowledged_at: Option<String>,
+    pub acknowledged_by: Option<String>,
 }

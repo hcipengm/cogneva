@@ -952,6 +952,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             get(agent_heartbeats_handler),
         )
         .route("/api/v1/alerts/active", get(alerts_active_handler))
+        .route("/api/v1/alerts/{id}/ack", post(alerts_ack_handler))
         .layer(auth::middleware::require_role(
             cog_core::RoleRequirement::Operator,
         ))
@@ -2278,6 +2279,8 @@ fn merge_active_alerts(
             last_seen_at: alert.last_seen_at.map(|t| t.to_rfc3339()),
             resolved: false,
             source: "durable",
+            acknowledged_at: alert.acknowledged_at.map(|t| t.to_rfc3339()),
+            acknowledged_by: alert.acknowledged_by,
         };
         let slot = (0..merged.len()).find(|&i| !absorbed[i] && merged[i].event_type == rule);
         match slot {
@@ -2343,6 +2346,11 @@ async fn alerts_active_handler(State(state): State<Arc<GatewayState>>) -> Respon
                     last_seen_at: None,
                     resolved: alert.resolved,
                     source: "supervisor",
+                    // No row behind these: the supervisor's events are
+                    // snapshots, so there is nothing an acknowledgement could
+                    // be written to.
+                    acknowledged_at: None,
+                    acknowledged_by: None,
                 })
                 .collect::<Vec<_>>()
         })
@@ -2378,6 +2386,59 @@ async fn alerts_active_handler(State(state): State<Arc<GatewayState>>) -> Respon
         })),
     )
         .into_response()
+}
+
+/// Record that the caller has seen one firing alert.
+///
+/// The id is the `dedup_key` the listing handed out. Acknowledging is a fact
+/// about the *episode*, so the store clears the mark when the alert re-fires;
+/// this handler therefore writes nothing on a key that is not currently firing
+/// and answers 404 instead of creating a mark no listing would show.
+async fn alerts_ack_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(dedup_key): Path<String>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
+) -> Response {
+    let Some(axum::Extension(claims)) = claims else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "authentication required"})),
+        )
+            .into_response();
+    };
+    let Some(ref source) = state.active_alert_source else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "persistent alert store not configured"})),
+        )
+            .into_response();
+    };
+
+    match source.acknowledge_alert(&dedup_key, &claims.sub).await {
+        Ok(Some(at)) => (
+            StatusCode::OK,
+            Json(json!({
+                "acknowledged_at": at.to_rfc3339(),
+                "acknowledged_by": claims.sub,
+            })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "no firing alert with that id",
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, alert = %dedup_key, "acknowledging alert failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "alert store write failed"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 // ─── Snapshots List Handler ───
@@ -3542,6 +3603,8 @@ mod active_alert_merge_tests {
             labels: serde_json::json!({}),
             fired_at,
             last_seen_at: Some(chrono::Utc::now()),
+            acknowledged_at: None,
+            acknowledged_by: None,
         }
     }
 
@@ -3568,6 +3631,8 @@ mod active_alert_merge_tests {
             last_seen_at: None,
             resolved: false,
             source: "supervisor",
+            acknowledged_at: None,
+            acknowledged_by: None,
         }
     }
 
@@ -3610,6 +3675,26 @@ mod active_alert_merge_tests {
         assert_ne!(seen, merged[0].timestamp);
         let seen = chrono::DateTime::parse_from_rfc3339(seen).expect("a valid instant");
         assert!(seen > fired_at, "the sighting is newer than the edge");
+    }
+
+    /// An acknowledgement is written to the row; the listing is the only reader
+    /// it has. A merge that dropped it would take the click, answer 200, and
+    /// then show the alert as unacknowledged on the very next refresh — the
+    /// write would exist and be invisible, which is worse than not writing.
+    #[test]
+    fn a_durable_entry_carries_who_acknowledged_it_and_when() {
+        let at = chrono::Utc::now();
+        let mut row = durable("pod_oom_killed");
+        row.acknowledged_at = Some(at);
+        row.acknowledged_by = Some("alice".to_string());
+
+        let merged = merge_active_alerts(vec![], vec![row]);
+
+        assert_eq!(
+            merged[0].acknowledged_at.as_deref(),
+            Some(at.to_rfc3339().as_str())
+        );
+        assert_eq!(merged[0].acknowledged_by.as_deref(), Some("alice"));
     }
 
     /// The process-local half has no sighting clock, and says so with `None`
