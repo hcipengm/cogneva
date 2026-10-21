@@ -37,8 +37,7 @@ ALTER TABLE alerts ADD COLUMN IF NOT EXISTS acknowledged_by TEXT
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ
 ;
 CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts(state, fired_at DESC);
-CREATE INDEX IF NOT EXISTS idx_alerts_unnotified \
-    ON alerts(fired_at) WHERE state = 'firing' AND notified_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_alerts_unnotified ON alerts(fired_at) WHERE state = 'firing' AND notified_at IS NULL;
 "#;
 
 /// A new alert condition to raise (or close).

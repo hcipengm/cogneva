@@ -364,6 +364,18 @@ jobs:
         run: cargo test -p cog-observability --test skip_and_verdict_round_trip -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The alert DDL is one multi-statement string sent through the simple
+      # query protocol, so the server parses all of it and a malformed statement
+      # anywhere inside stops every statement before it from landing. That is
+      # how the notification mark was absent on a deployment whose binary wrote
+      # it: the code compiled, the DB-free tests passed, and the only witness
+      # was a warning at startup. The queue queries are server decisions too --
+      # which rows a firing row without the mark returns, and whether a new
+      # firing episode clears the mark so the next episode is announced.
+      - name: Live-DB alert schema and notification mark
+        run: cargo test -p cog-observability --test alert_schema -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A taste submission is evidence and a claimable row at once, and both
       # faces are decided by one statement each: whether a second disposition
       # rewrites the first fate, and whether a re-sent id replaces the words
