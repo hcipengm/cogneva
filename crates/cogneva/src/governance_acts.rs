@@ -2166,6 +2166,50 @@ mod tests {
         );
     }
 
+    /// A roster import carries no handover. When the file agrees with the
+    /// graph, the import must still leave the applied handover in place --
+    /// otherwise the beat that changes nothing is the beat that erases the
+    /// evidence, and every later beat keeps rewriting the row because the
+    /// binding is the difference.
+    #[tokio::test]
+    async fn an_import_that_changes_nothing_keeps_the_applied_handover() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let face = |at| cog_core::Face {
+            face_id: "f".into(),
+            owner_unit: Some("worker".into()),
+            bound_by_handover_id: None,
+            spec: cog_core::FaceSpec::first("f", cog_core::FaceKind::Face),
+            updated_at: at,
+        };
+        let mut moved = face(now);
+        moved.spec.revision = 2;
+        moved.bound_by_handover_id = Some("handover:f:worker:1".into());
+        let task = moved.to_task(None);
+        cog_core::GovernanceStore::save_face_node(&store, &task)
+            .await
+            .unwrap();
+
+        let outcome = cog_core::import_face_with(
+            &store,
+            &face(now + chrono::Duration::seconds(1)),
+            cog_core::ImportOwnership::HandoverOnly,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            cog_core::FaceImportOutcome::Unchanged,
+            "an import that agrees with the graph must write nothing"
+        );
+        let row = store.row("f");
+        assert_eq!(
+            row.bound_by_handover_id.as_deref(),
+            Some("handover:f:worker:1"),
+            "the file says nothing about handovers; that cell is the graph's"
+        );
+    }
+
     /// A description refresh rewrites the whole row. Anything the writer fails
     /// to carry back is dropped, and the handover that moved the face is the
     /// one field whose loss a reader can only report as drift: a revision

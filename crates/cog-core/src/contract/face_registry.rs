@@ -749,6 +749,16 @@ pub async fn import_face_with(
     } else {
         let mut updated = incoming.clone();
         updated.spec.revision = current.revision();
+        // A parsed file is stamped with the moment it was read, which is not
+        // a change to the face. Comparing it would make every import look like
+        // a write and reset the row on every beat.
+        updated.updated_at = current.updated_at;
+        // The roster describes proposed ownership; it never carries the signed
+        // handover that moved the face. Taking that cell from the file would
+        // erase the evidence of every applied handover whose ownership the
+        // file happens to agree with -- and then every beat rewrites the row,
+        // because the difference is the binding itself.
+        updated.bound_by_handover_id = current.bound_by_handover_id.clone();
         updated
     };
 
