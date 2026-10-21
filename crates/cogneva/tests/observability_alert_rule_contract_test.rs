@@ -1164,6 +1164,18 @@ const FOREIGN: &[(&str, &str)] = &[
     ("node_filesystem_avail_bytes", "node-exporter"),
     ("node_filesystem_size_bytes", "node-exporter"),
     (
+        "node_filesystem_files_free",
+        "node-exporter（inode 表的余量）。字节与 inode 是两条各自走到底的边界：这棵树上每一块会长的树都是小文件形态——镜像库单节点 809k 文件、构建缓存几十万个——所以 inode 先于字节耗尽，而上面两条磁盘规则只看字节，看不见这一格。取 free 而不是 avail：inode 表没有给 root 预留的份额，avail 在它上面与 free 逐值相同",
+    ),
+    (
+        "node_filesystem_files",
+        "node-exporter（同一序列的分母，inode 表的总数）。分子分母同源同标签，比值才是判据",
+    ),
+    (
+        "kube_resourcequota",
+        "kube-state-metrics（每个 ResourceQuota 一条 hard 序列、一条 used 序列，按 namespace 与 resource 成对）。它是唯一能回答「这个命名空间还装得下下一个对象吗」的读数：容器余量答的是运行中的容器离自己的上限多远，节点请求比答的是节点还排得下多少，配额到 1.0 时 API 服务器直接拒收下一个带该资源的对象，而拒收不产生事件、不产生日志，只让工作负载一直等",
+    ),
+    (
         "cogneva_clippy_verdict_present",
         "宿主 clippy 判词生产者 `scripts/host/cogneva-clippy-verdict-reading.sh`，由主机聚合器以 `job=\"cogneva-host-readings\"` 在宿主的 9464 端口暴露。读 0 说的是账本不在（没人跑过生产者），不是「全部通过」——这一格存在就是为了让那两件事不同形",
     ),

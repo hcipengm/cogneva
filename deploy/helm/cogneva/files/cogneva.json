@@ -482,6 +482,15 @@
           "summary": "kubelet reports DiskPressure; pods are being evicted The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched."
         },
         {
+          "name": "node_inodes_high",
+          "promql": "max without (pod, container) (100 * (1 - node_filesystem_files_free{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"} / node_filesystem_files{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"}))",
+          "condition": {
+            "greater_than": 85.0
+          },
+          "severity": "warning",
+          "summary": "node root filesystem inode usage above 85% (current {value}%): bytes still read comfortable while the filesystem refuses to create a file. Every tree this platform grows is a many-small-files shape -- the container image store alone held 809k files on 2026-10-21, the build caches hundreds of thousands more -- so inodes run out long before bytes do, and the two disk rules above cannot see it coming. Measured on the node on 2026-10-21: 6.97M of 62.3M inodes in use, 12%, so the bound sits far above the whole measured band. The action is to find the tree that is growing by file count rather than by byte count and prune it; the rule resolving is the writeback. The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched."
+        },
+        {
           "name": "node_memory_pressure",
           "promql": "max without (pod, container, instance) (kube_node_status_condition{condition=\"MemoryPressure\", status=\"true\"})",
           "condition": {
@@ -552,6 +561,15 @@
           },
           "severity": "warning",
           "summary": "Scheduled requests on node {node} for {resource} are {value} of what the node can allocate. This is the face the admission rules do not cover: ResourceQuota and LimitRange answer whether a new pod fits the namespace's ceiling, and container headroom answers whether a running container fits its own limit, but neither sees the node's scheduling capacity, so a node can be one request away from refusing the next pod while every quota still reads roomy. Measured over the seven days to 2026-10-21, the highest this ratio reached is 0.451 for cpu and 0.388 for memory, so 0.85 leaves the whole measured band below it and still warns before admission starts failing. Read it as requests and not as usage: a pod that asks for nothing contributes nothing to this ratio, which makes the number a floor on what is really committed, not a ceiling. The action is to lower requests or raise node capacity; the rule resolving is the writeback."
+        },
+        {
+          "name": "namespace_quota_near_ceiling",
+          "promql": "max by (namespace, resource) (kube_resourcequota{type=\"used\"} / on(namespace, resource) kube_resourcequota{type=\"hard\"})",
+          "condition": {
+            "greater_than": 0.85
+          },
+          "severity": "warning",
+          "summary": "Namespace {namespace} has spent {value} of its ResourceQuota for {resource}. A quota is the one ceiling whose breach is not slow: at 1.0 the API server refuses the next object that would carry that resource, so a PVC that cannot be created and a pod that cannot be admitted are the same silent shape -- the workload waits, nothing says why. Nothing read these numbers before, and on 2026-10-21 the cogneva namespace sat at 0.812 of requests.storage (419 of 480 GiB) and 0.816 of limits.memory while no rule named the pair. The bound sits above 0.85 so that a single ordinary object -- a 10 GiB volume is 2% of this namespace's storage ceiling -- still fits between the warning and the wall. Read it against the hard half of the same object and not against what is running: a namespace can be full of requests with nothing using them, and that is still a namespace that cannot admit the next pod. The action is to raise the quota or retire what is holding it; the rule resolving is the writeback."
         },
         {
           "name": "container_disk_write_rate_high",
