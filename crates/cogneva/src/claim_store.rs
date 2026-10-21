@@ -72,6 +72,79 @@ pub fn image_root_from_env() -> PathBuf {
     )
 }
 
+/// The stores this process walks, from the environment.
+///
+/// One node holds several layer stores: the kubelet's containerd, and the
+/// rootful build stores that image builds write into. They are the same kind of
+/// bytes -- unpacked layers on the node's filesystem that no claim boundary
+/// covers -- so they are the same reading, told apart by the `store` label.
+pub fn image_stores_from_env() -> Vec<(String, PathBuf)> {
+    parse_stores(
+        std::env::var(image_store::ROOTS_ENV).ok().as_deref(),
+        std::env::var(image_store::ROOT_ENV).ok().as_deref(),
+        image_store::DEFAULT_ROOT,
+    )
+}
+
+/// Pure half of [`image_stores_from_env`].
+///
+/// The list syntax is `name=path,name=path`. An entry without a name takes the
+/// last segment of its path as one, so a deployment that lists paths only still
+/// gets a label that means something. Blank entries are skipped rather than
+/// walked -- a trailing comma is not a store at `/`. A repeated name is kept
+/// once: two roots under one name would be one series with two writers, which is
+/// the shape this label exists to prevent.
+fn parse_stores(
+    roots: Option<&str>,
+    single: Option<&str>,
+    fallback: &str,
+) -> Vec<(String, PathBuf)> {
+    let list = roots.map(str::trim).filter(|value| !value.is_empty());
+    let Some(list) = list else {
+        return vec![(
+            image_store::DEFAULT_STORE.to_string(),
+            parse_path(single, fallback),
+        )];
+    };
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    for entry in list.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (name, path) = match entry.split_once('=') {
+            Some((name, path)) => (name.trim().to_string(), path.trim()),
+            None => (String::new(), entry),
+        };
+        if path.is_empty() {
+            continue;
+        }
+        let name = if name.is_empty() {
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(image_store::DEFAULT_STORE)
+                .to_string()
+        } else {
+            name
+        };
+        if out.iter().any(|(seen, _)| *seen == name) {
+            continue;
+        }
+        out.push((name, PathBuf::from(path)));
+    }
+    if out.is_empty() {
+        // A list that named nothing usable is the deployment saying nothing, the
+        // same as an unset variable: walking the working directory instead would
+        // report the container's own root as the node's store.
+        return vec![(
+            image_store::DEFAULT_STORE.to_string(),
+            parse_path(single, fallback),
+        )];
+    }
+    out
+}
+
 /// Pure half of the two roots: an unset or blank path is the deployment saying
 /// nothing, not the deployment saying the working directory -- which would walk
 /// whatever the container happens to start in and report it as the node's.
@@ -129,7 +202,7 @@ fn parse_cadence(raw: Option<&str>, default: u64, floor: u64) -> u64 {
 #[derive(Clone)]
 struct StoreState {
     observable: Arc<ClaimStoreObservable>,
-    images: Arc<ImageStoreObservable>,
+    images: Vec<Arc<ImageStoreObservable>>,
 }
 
 async fn health() -> Response {
@@ -150,9 +223,15 @@ async fn metrics(State(state): State<StoreState>) -> Response {
         Ok(claims) => readings.extend(claims),
         Err(e) => tracing::warn!(error = %e, "claim readings unavailable this scrape"),
     }
-    match state.images.collect_metrics("").await {
-        Ok(images) => readings.extend(images),
-        Err(e) => tracing::warn!(error = %e, "image store readings unavailable this scrape"),
+    for store in &state.images {
+        match store.collect_metrics("").await {
+            Ok(images) => readings.extend(images),
+            Err(e) => tracing::warn!(
+                store = store.name(),
+                error = %e,
+                "image store readings unavailable this scrape"
+            ),
+        }
     }
     let body = render_raw_metrics(&readings);
     Response::builder()
@@ -163,7 +242,10 @@ async fn metrics(State(state): State<StoreState>) -> Response {
 }
 
 /// Router over an already-built observable.
-pub fn router(observable: Arc<ClaimStoreObservable>, images: Arc<ImageStoreObservable>) -> Router {
+pub fn router(
+    observable: Arc<ClaimStoreObservable>,
+    images: Vec<Arc<ImageStoreObservable>>,
+) -> Router {
     Router::new()
         .route("/health/live", get(health))
         .route("/health/ready", get(health))
@@ -185,7 +267,10 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
 
     let node = node_from_env();
     let observable = Arc::new(ClaimStoreObservable::new(root_from_env(), node.clone()));
-    let images = Arc::new(ImageStoreObservable::new(image_root_from_env(), node));
+    let images: Vec<Arc<ImageStoreObservable>> = image_stores_from_env()
+        .into_iter()
+        .map(|(name, root)| Arc::new(ImageStoreObservable::new(root, node.clone(), name)))
+        .collect();
     // One scan before the listener opens: a node whose first scrape carries no
     // claim at all is indistinguishable from a node with no claims, and the
     // process would have to be scraped for a full cadence before it said
@@ -211,19 +296,23 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     // reason: a first scrape with no part in it is indistinguishable from a node
     // whose store is empty, and the walk that would tell them apart is minutes
     // away.
-    match images.scan_blocking().await {
-        image_store::Scan::Completed(report) => tracing::info!(
-            root = %images.root().display(),
-            parts = report.parts,
-            readable = report.readable,
-            files = report.files,
-            "image store walked"
-        ),
-        image_store::Scan::RootUnreadable => tracing::error!(
-            env = image_store::ROOT_ENV,
-            root = %images.root().display(),
-            "no image store root readable; this process will serve coverage without any part"
-        ),
+    for images in &images {
+        match images.scan_blocking().await {
+            image_store::Scan::Completed(report) => tracing::info!(
+                store = images.name(),
+                root = %images.root().display(),
+                parts = report.parts,
+                readable = report.readable,
+                files = report.files,
+                "image store walked"
+            ),
+            image_store::Scan::RootUnreadable => tracing::error!(
+                env = image_store::ROOTS_ENV,
+                store = images.name(),
+                root = %images.root().display(),
+                "no image store root readable; this process will serve coverage without any part"
+            ),
+        }
     }
 
     let shutdown = ShutdownSignal::default();
@@ -233,7 +322,7 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         shutdown.clone(),
     ));
     tokio::spawn(image_store::run_image_store_scan(
-        Arc::clone(&images),
+        images.iter().map(Arc::clone).collect(),
         image_interval_from_env(),
         shutdown,
     ));
@@ -273,11 +362,12 @@ mod tests {
         dir
     }
 
-    fn empty_images() -> Arc<ImageStoreObservable> {
-        Arc::new(ImageStoreObservable::new(
+    fn empty_images() -> Vec<Arc<ImageStoreObservable>> {
+        vec![Arc::new(ImageStoreObservable::new(
             scratch("no-images").join("absent"),
             "node-a",
-        ))
+            image_store::DEFAULT_STORE,
+        ))]
     }
 
     async fn scrape(app: Router, path: &str) -> (StatusCode, String) {
@@ -313,6 +403,62 @@ mod tests {
         );
         assert_eq!(parse_path(Some("  "), storage), PathBuf::from(storage));
         assert_eq!(parse_path(None, storage), PathBuf::from(storage));
+    }
+
+    /// The store list is the deployment's statement of which layer stores this
+    /// node has. A name repeated is kept once -- two roots under one label would
+    /// be one series with two writers -- and a list that names nothing usable
+    /// falls back to the single root rather than to no stores, because a node
+    /// that is told about no store would publish a store-sized gap as silence.
+    #[test]
+    fn the_store_list_parses_names_paths_and_falls_back_to_the_single_root() {
+        let single = Some("/host/containerd");
+        let fallback = image_store::DEFAULT_ROOT;
+        assert_eq!(
+            parse_stores(None, single, fallback),
+            vec![(
+                image_store::DEFAULT_STORE.to_string(),
+                PathBuf::from("/host/containerd")
+            )]
+        );
+        assert_eq!(
+            parse_stores(Some(""), single, fallback),
+            vec![(
+                image_store::DEFAULT_STORE.to_string(),
+                PathBuf::from("/host/containerd")
+            )]
+        );
+        assert_eq!(
+            parse_stores(
+                Some("containerd=/host/containerd,podman=/host/podman,buildah=/host/buildah"),
+                single,
+                fallback
+            ),
+            vec![
+                ("containerd".to_string(), PathBuf::from("/host/containerd")),
+                ("podman".to_string(), PathBuf::from("/host/podman")),
+                ("buildah".to_string(), PathBuf::from("/host/buildah")),
+            ]
+        );
+        // A path without a name takes its last segment, so a deployment that
+        // lists only paths still gets a label that means something.
+        assert_eq!(
+            parse_stores(Some("/host/podman,"), single, fallback),
+            vec![("podman".to_string(), PathBuf::from("/host/podman"))]
+        );
+        // A repeated name is kept once.
+        assert_eq!(
+            parse_stores(Some("podman=/a,podman=/b"), single, fallback),
+            vec![("podman".to_string(), PathBuf::from("/a"))]
+        );
+        // A list of nothing but separators is the deployment saying nothing.
+        assert_eq!(
+            parse_stores(Some(" , = ,"), single, fallback),
+            vec![(
+                image_store::DEFAULT_STORE.to_string(),
+                PathBuf::from("/host/containerd")
+            )]
+        );
     }
 
     /// A cadence below the floor is the floor, and an unreadable one is the
@@ -390,16 +536,20 @@ mod tests {
 
         let observable = Arc::new(ClaimStoreObservable::new(&root, "node-a"));
         observable.scan();
-        let images = Arc::new(ImageStoreObservable::new(&images_root, "node-a"));
+        let images = Arc::new(ImageStoreObservable::new(
+            &images_root,
+            "node-a",
+            image_store::DEFAULT_STORE,
+        ));
         images.scan();
-        let app = router(observable, images);
+        let app = router(observable, vec![images]);
 
         let (status, body) = scrape(app, "/metrics").await;
         assert_eq!(status, StatusCode::OK);
         for expected in [
             "cogneva_claim_scan_dirs{node=\"node-a\"} 0",
-            "cogneva_image_store_parts{node=\"node-a\"} 1",
-            "cogneva_image_store_readable{node=\"node-a\"} 1",
+            "cogneva_image_store_parts{node=\"node-a\",store=\"containerd\"} 1",
+            "cogneva_image_store_readable{node=\"node-a\",store=\"containerd\"} 1",
             "io.containerd.content.v1.content",
         ] {
             assert!(body.contains(expected), "{expected} missing from:\n{body}");

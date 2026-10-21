@@ -41,6 +41,17 @@ pub const BYTES_METRIC: &str = "cogneva_image_store_bytes";
 /// Label naming which part a sample is about.
 pub const PART_LABEL: &str = "part";
 
+/// Label naming which store a sample is about.
+///
+/// A node holds more than one layer store: the kubelet's containerd, and the
+/// rootful buildah/podman stores that the image build writes into. Their
+/// top-level entries have the same names (`overlay`, `storage`, `content`), so
+/// without this label two stores' parts would be the same series and a sum over
+/// them would be a number about neither. Every reading this module publishes
+/// carries it, including the coverage ones -- `parts` is a count of this store's
+/// entries, not of the node's.
+pub const STORE_LABEL: &str = "store";
+
 /// How many parts the last scan found.
 pub const PARTS_METRIC: &str = "cogneva_image_store_parts";
 
@@ -58,6 +69,18 @@ pub const DEFAULT_ROOT: &str = "/host/containerd";
 
 /// Environment variable naming the store root.
 pub const ROOT_ENV: &str = "COGNEVA_IMAGE_STORE_ROOT";
+
+/// Environment variable naming several stores as `name=path,name=path`.
+///
+/// The single-root variable above stays as the fallback so a deployment that
+/// names only the containerd root keeps the reading it had; this one exists
+/// because a node also spends disk on layer stores the kubelet never touches
+/// (the rootful build stores), and one reading per store is the only way a rule
+/// can tell them apart from the one kubelet also manages.
+pub const ROOTS_ENV: &str = "COGNEVA_IMAGE_STORE_ROOTS";
+
+/// Store name used when the deployment names a root without naming the store.
+pub const DEFAULT_STORE: &str = "containerd";
 
 /// Environment variable naming this node.
 pub const NODE_ENV: &str = "COGNEVA_NODE_NAME";
@@ -109,15 +132,17 @@ struct Store {
 pub struct ImageStoreObservable {
     root: PathBuf,
     node: String,
+    name: String,
     store: Mutex<Store>,
     scans: AtomicU64,
 }
 
 impl ImageStoreObservable {
-    pub fn new(root: impl Into<PathBuf>, node: impl Into<String>) -> Self {
+    pub fn new(root: impl Into<PathBuf>, node: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             root: root.into(),
             node: node.into(),
+            name: name.into(),
             store: Mutex::new(Store {
                 parts: BTreeMap::new(),
                 readable: 0,
@@ -129,6 +154,11 @@ impl ImageStoreObservable {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Which store this is, as published on the `store` label.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn node(&self) -> &str {
@@ -285,6 +315,7 @@ impl Observable for ImageStoreObservable {
             };
             out.push(
                 RawMetric::new(BYTES_METRIC, bytes as f64)
+                    .with_label(STORE_LABEL, self.name.clone())
                     .with_label(PART_LABEL, part.clone())
                     .with_label(NODE_LABEL, self.node.clone()),
             );
@@ -295,9 +326,22 @@ impl Observable for ImageStoreObservable {
         drop(store);
 
         let node = self.node.as_str();
-        out.push(RawMetric::new(PARTS_METRIC, parts).with_label(NODE_LABEL, node));
-        out.push(RawMetric::new(READABLE_METRIC, readable).with_label(NODE_LABEL, node));
-        out.push(RawMetric::new(AGE_METRIC, age).with_label(NODE_LABEL, node));
+        let store = self.name.as_str();
+        out.push(
+            RawMetric::new(PARTS_METRIC, parts)
+                .with_label(STORE_LABEL, store)
+                .with_label(NODE_LABEL, node),
+        );
+        out.push(
+            RawMetric::new(READABLE_METRIC, readable)
+                .with_label(STORE_LABEL, store)
+                .with_label(NODE_LABEL, node),
+        );
+        out.push(
+            RawMetric::new(AGE_METRIC, age)
+                .with_label(STORE_LABEL, store)
+                .with_label(NODE_LABEL, node),
+        );
         Ok(out)
     }
 
@@ -311,27 +355,39 @@ impl Observable for ImageStoreObservable {
 }
 
 /// Re-walk on a cadence, with the loop's own liveness reported beside it.
+///
+/// One loop for every store on the node rather than one per store: the loop
+/// whose liveness is reported is the node's walk, and a store that failed to be
+/// mounted simply never appears -- a second loop would report each store's own
+/// health and leave the node's coverage to be reconstructed from a set that can
+/// be empty.
 pub async fn run_image_store_scan(
-    observable: Arc<ImageStoreObservable>,
+    observables: Vec<Arc<ImageStoreObservable>>,
     interval_secs: u64,
     shutdown: ShutdownSignal,
 ) {
     let interval = Duration::from_secs(interval_secs.max(MIN_INTERVAL_SECS));
-    let loop_name = format!("{SCAN_LOOP}:{}", observable.node());
+    let Some(first) = observables.first() else {
+        return;
+    };
+    let loop_name = format!("{SCAN_LOOP}:{}", first.node());
     let _ = cog_core::loop_health::spawn(
         loop_name,
         cog_core::loop_health::Cadence::Periodic(interval),
         shutdown.clone(),
         move |beat| {
-            let observable = Arc::clone(&observable);
+            let observables = observables.clone();
             let shutdown = shutdown.clone();
             async move {
-                tracing::info!(
-                    root = %observable.root().display(),
-                    node = observable.node(),
-                    interval_secs = interval.as_secs(),
-                    "image store scan started"
-                );
+                for observable in &observables {
+                    tracing::info!(
+                        root = %observable.root().display(),
+                        store = observable.name(),
+                        node = observable.node(),
+                        interval_secs = interval.as_secs(),
+                        "image store scan started"
+                    );
+                }
                 let mut ticker = tokio::time::interval(interval);
                 loop {
                     // Stamped whether or not the walk found anything: the age is
@@ -343,14 +399,17 @@ pub async fn run_image_store_scan(
                         biased;
                         _ = shutdown.wait() => break,
                         _ = ticker.tick() => {
-                            match observable.scan_blocking().await {
-                                Scan::Completed(report) => tracing::debug!(
-                                    parts = report.parts,
-                                    readable = report.readable,
-                                    files = report.files,
-                                    "image store walked"
-                                ),
-                                Scan::RootUnreadable => {}
+                            for observable in &observables {
+                                match observable.scan_blocking().await {
+                                    Scan::Completed(report) => tracing::debug!(
+                                        store = observable.name(),
+                                        parts = report.parts,
+                                        readable = report.readable,
+                                        files = report.files,
+                                        "image store walked"
+                                    ),
+                                    Scan::RootUnreadable => {}
+                                }
                             }
                         }
                     }
@@ -367,6 +426,7 @@ mod tests {
     use std::fs;
 
     const NODE: &str = "node-a";
+    const STORE: &str = "containerd";
 
     fn scratch(name: &str) -> PathBuf {
         let dir =
@@ -415,7 +475,7 @@ mod tests {
             8192,
         );
 
-        let observable = ImageStoreObservable::new(&root, NODE);
+        let observable = ImageStoreObservable::new(&root, NODE, STORE);
         assert_eq!(
             observable.scan(),
             Scan::Completed(ScanReport {
@@ -449,7 +509,7 @@ mod tests {
     async fn a_retired_part_stops_being_reported() {
         let root = scratch("retire");
         write(&root.join("content").join("blob"), 1024);
-        let observable = ImageStoreObservable::new(&root, NODE);
+        let observable = ImageStoreObservable::new(&root, NODE, STORE);
         observable.scan();
         assert_eq!(
             value_of(&readings(&observable).await, BYTES_METRIC, Some("content")),
@@ -468,7 +528,7 @@ mod tests {
     /// from process start so a scanner that never walked is on the stale rule.
     #[tokio::test]
     async fn an_unreadable_root_publishes_coverage_and_no_size() {
-        let observable = ImageStoreObservable::new(scratch("missing").join("nope"), NODE);
+        let observable = ImageStoreObservable::new(scratch("missing").join("nope"), NODE, STORE);
         assert_eq!(observable.scan(), Scan::RootUnreadable);
         let out = readings(&observable).await;
         assert!(value_of(&out, BYTES_METRIC, None).is_none());
@@ -548,7 +608,7 @@ mod tests {
         )
         .unwrap();
 
-        let observable = ImageStoreObservable::new(&root, NODE);
+        let observable = ImageStoreObservable::new(&root, NODE, STORE);
         observable.scan();
         assert_eq!(
             value_of(&readings(&observable).await, BYTES_METRIC, Some("snap")),
@@ -562,7 +622,7 @@ mod tests {
     async fn a_plain_file_at_the_top_is_measured_by_its_own_size() {
         let root = scratch("file");
         write(&root.join("io.containerd.metadata.v1.bolt"), 2048);
-        let observable = ImageStoreObservable::new(&root, NODE);
+        let observable = ImageStoreObservable::new(&root, NODE, STORE);
         assert_eq!(
             observable.scan(),
             Scan::Completed(ScanReport {
@@ -579,5 +639,55 @@ mod tests {
             ),
             Some(2048.0)
         );
+    }
+
+    /// Two stores on one node hold entries of the same name -- `overlay` is a
+    /// top-level directory in every one of them -- so a reading that carried
+    /// only `node` and `part` would be one series for two different directories,
+    /// and whichever walk reported last would be the number. The `store` label is
+    /// what keeps them apart, and it is on the coverage readings too: `parts` is
+    /// how many entries *this* store has.
+    #[tokio::test]
+    async fn two_stores_on_one_node_are_two_series() {
+        let containerd = scratch("two-stores-a");
+        let buildah = scratch("two-stores-b");
+        write(&containerd.join("overlay").join("blob"), 1024);
+        write(&buildah.join("overlay").join("blob"), 4096);
+
+        let first = ImageStoreObservable::new(&containerd, NODE, "containerd");
+        let second = ImageStoreObservable::new(&buildah, NODE, "buildah");
+        first.scan();
+        second.scan();
+
+        let out: Vec<RawMetric> = first
+            .collect_metrics("")
+            .await
+            .unwrap()
+            .into_iter()
+            .chain(second.collect_metrics("").await.unwrap())
+            .collect();
+
+        let bytes_for = |store: &str| {
+            out.iter()
+                .find(|m| {
+                    m.name == BYTES_METRIC
+                        && m.labels.get(STORE_LABEL).map(String::as_str) == Some(store)
+                        && m.labels.get(PART_LABEL).map(String::as_str) == Some("overlay")
+                })
+                .map(|m| m.value)
+        };
+        assert_eq!(bytes_for("containerd"), Some(1024.0));
+        assert_eq!(bytes_for("buildah"), Some(4096.0));
+
+        let parts_of = |store: &str| {
+            out.iter()
+                .find(|m| {
+                    m.name == PARTS_METRIC
+                        && m.labels.get(STORE_LABEL).map(String::as_str) == Some(store)
+                })
+                .map(|m| m.value)
+        };
+        assert_eq!(parts_of("containerd"), Some(1.0));
+        assert_eq!(parts_of("buildah"), Some(1.0));
     }
 }

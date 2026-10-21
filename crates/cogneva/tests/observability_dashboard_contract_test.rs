@@ -232,26 +232,28 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["namespace", "persistentvolumeclaim", "state"],
         "crates/cog-reflection/src/volume_capacity.rs",
     ),
-    // The node's image store, which is not a volume and so has no kubelet size:
-    // one series per top-level part of the runtime root.
+    // The node's layer stores, which are not volumes and so have no kubelet
+    // size: one series per top-level part of each store, and the `store` label
+    // because a node holds several (the kubelet's containerd and the rootful
+    // build stores) whose parts are named the same.
     (
         "cogneva_image_store_bytes",
-        &["node", "part"],
+        &["node", "store", "part"],
         "crates/cog-observability/src/image_store.rs",
     ),
     (
         "cogneva_image_store_parts",
-        &["node"],
+        &["node", "store"],
         "crates/cog-observability/src/image_store.rs",
     ),
     (
         "cogneva_image_store_readable",
-        &["node"],
+        &["node", "store"],
         "crates/cog-observability/src/image_store.rs",
     ),
     (
         "cogneva_image_store_age_seconds",
-        &["node"],
+        &["node", "store"],
         "crates/cog-observability/src/image_store.rs",
     ),
     // The claim walk's coverage, the same three readings for the storage root.

@@ -2517,8 +2517,8 @@ data:
           },
           "targets": [
             {
-              "expr": "max by (node, part) (cogneva_image_store_bytes)",
-              "legendFormat": "{{part}}",
+              "expr": "max by (node, store, part) (cogneva_image_store_bytes)",
+              "legendFormat": "{{store}}/{{part}}",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"
@@ -2548,7 +2548,7 @@ data:
           },
           "targets": [
             {
-              "expr": "max by (node) (cogneva_image_store_parts - cogneva_image_store_readable)",
+              "expr": "sum by (node) (cogneva_image_store_parts) - sum by (node) (cogneva_image_store_readable)",
               "legendFormat": "{{node}} image parts not walked",
               "datasource": {
                 "type": "prometheus",

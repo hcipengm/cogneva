@@ -774,6 +774,19 @@ claimStore:
   # 走查比存储根慢一拍：这棵树大得多，而且它按镜像拉取/部署变化，不按工作负载写文件变化。
   imageStoreHostPath: /var/lib/rancher/k3s/agent/containerd
   imageStoreMountPath: /host/containerd
+  # 同一台盘上另外两个层库：镜像构建写进去的 rootful buildah/podman 存储。它们和
+  # containerd 的层是同一种字节——解开的层、不挂在任何卷上、花的是这台节点的盘——
+  # 只是各自的顶层条目标题相同（`overlay`、`storage`），所以读数带 `store` 标签分开。
+  # 本机实测 podman 54.9 GB + buildah 11.4 GB，此前两边都没有任何产出者。
+  # 条目的 hostPath 用 DirectoryOrCreate：没跑过 rootful 构建的节点本来就没有这个
+  # 目录，造一个空目录只是把「这台节点没有」变成 0 字节，不会凭空造出用量。
+  extraImageStores:
+    - name: podman
+      hostPath: /var/lib/containers
+      mountPath: /host/podman
+    - name: buildah
+      hostPath: /var/lib/cogneva-buildah
+      mountPath: /host/buildah
   # 规则 image_store_scan_stale 的界是**三个这个节奏**，改这里要一起改那条规则。
   imageScanIntervalSecs: 900
   resources:

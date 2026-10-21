@@ -835,12 +835,12 @@ data:
             },
             {
               "name": "image_store_incomplete",
-              "promql": "max by (node) (cogneva_image_store_parts - cogneva_image_store_readable)",
+              "promql": "sum by (node) (cogneva_image_store_parts) - sum by (node) (cogneva_image_store_readable)",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "The image store walker on {node} found {value} part(s) it could not walk: the directory is there and its bytes are not in the account, so the part keeps its last size and reads as unchanged rather than as growing. The usual causes are ownership (a store directory moved to another uid than the one the walker runs as) and a part that is a broken mount. parts and readable are published together for this sum; a root with no entries reports zero of both, which is the unreadable-root case and is on image_store_scan_stale instead"
+              "summary": "The image store walker on {node} found {value} part(s) it could not walk: the directory is there and its bytes are not in the account, so the part keeps its last size and reads as unchanged rather than as growing. The usual causes are ownership (a store directory moved to another uid than the one the walker runs as) and a part that is a broken mount. parts and readable are published together for this sum, and both are summed across every store on the node because each store counts its own entries; a root with no entries reports zero of both, which is the unreadable-root case and is on image_store_scan_stale instead"
             },
             {
               "name": "claim_scan_stale",

@@ -71,8 +71,14 @@ spec:
             # 镜像库是同一份账的另一格：镜像解出来的层不在任何卷里，kubelet 看不见，
             # 而它花的正是这台节点的盘。走查它和走查存储根是同一件事——读一台机器上
             # root 本来就读得到的目录——所以留在同一个进程里，不另起特权容器。
-            - name: COGNEVA_IMAGE_STORE_ROOT
-              value: "/host/containerd"
+            #
+            # 层库不止一个：镜像构建写进去的 rootful buildah/podman 存储是同一种字节，
+            # 只是不属于 kubelet，所以按 `name=mountPath` 逐个列出来，读数用 `store`
+            # 标签分开（本机另计 54.9 + 11.4 GB，此前两边都没有任何产出者）。顶层条目
+            # 标题在几个库之间重名（`overlay`、`storage`），没有这个标签两条不同目录的
+            # 读数会合成一条序列，谁后走查谁的数字就是答案。
+            - name: COGNEVA_IMAGE_STORE_ROOTS
+              value: "containerd=/host/containerd,podman=/host/podman,buildah=/host/buildah"
             - name: COGNEVA_IMAGE_SCAN_INTERVAL_SECS
               value: "900"
             # 节点名从 fieldRef 取 spec.nodeName，由产出方自己盖成样本上的 `node`
@@ -132,6 +138,12 @@ spec:
             - name: image-store-root
               mountPath: "/host/containerd"
               readOnly: true
+            - name: image-store-podman
+              mountPath: "/host/podman"
+              readOnly: true
+            - name: image-store-buildah
+              mountPath: "/host/buildah"
+              readOnly: true
       volumes:
         - name: storage-root
           hostPath:
@@ -143,5 +155,16 @@ spec:
           hostPath:
             path: "/var/lib/rancher/k3s/agent/containerd"
             type: Directory
+        # 下面这几个用 DirectoryOrCreate 而不是 Directory：它们只在跑过 rootful 镜像
+        # 构建的节点上才有，没有它的节点是「这台节点没有这个库」而不是布局不对——造一个
+        # 空目录把前者变成 0 字节，不会凭空造出用量，也不会让整个 Pod 起不来。
+        - name: image-store-podman
+          hostPath:
+            path: "/var/lib/containers"
+            type: DirectoryOrCreate
+        - name: image-store-buildah
+          hostPath:
+            path: "/var/lib/cogneva-buildah"
+            type: DirectoryOrCreate
       tolerations:
         - operator: Exists

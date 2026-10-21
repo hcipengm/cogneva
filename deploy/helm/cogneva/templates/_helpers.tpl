@@ -30,3 +30,18 @@ env 与卷里的文件是同一个失败形状——两者都只在进程启动�
 {{- $env := include (print $.Template.BasePath "/configmap.yaml") . -}}
 {{- printf "%s\n%s" $app $env | sha256sum -}}
 {{- end -}}
+
+{{/*
+层库清单，渲染成 COGNEVA_IMAGE_STORE_ROOTS 的 `name=mountPath,name=mountPath`。
+
+containerd 那一条恒在（它就是 `imageStoreMountPath`），其余来自
+`claimStore.extraImageStores`。名字是序列身份的一半：两个库用同一个名字，两条
+不同目录的读数会合成一条序列，所以 values 里的名字是按库取的，不是按位置取的。
+*/}}
+{{- define "cogneva.imageStores" -}}
+{{- $pairs := list (printf "containerd=%s" .Values.claimStore.imageStoreMountPath) -}}
+{{- range .Values.claimStore.extraImageStores -}}
+{{- $pairs = append $pairs (printf "%s=%s" .name .mountPath) -}}
+{{- end -}}
+{{- join "," $pairs -}}
+{{- end -}}
