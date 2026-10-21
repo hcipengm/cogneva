@@ -2125,6 +2125,48 @@ mod tests {
         );
     }
 
+    /// A description refresh rewrites the whole row. Anything the writer fails
+    /// to carry back is dropped, and the handover that moved the face is the
+    /// one field whose loss a reader can only report as drift: a revision
+    /// above one with no signed handover. Reusing the existing row also keeps
+    /// `created_at`, so an import is a refresh of one identity, not a new one.
+    #[tokio::test]
+    async fn a_refreshed_description_keeps_the_handover_that_moved_the_face() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let mut face = cog_core::Face {
+            face_id: "f".into(),
+            owner_unit: Some("worker".into()),
+            bound_by_handover_id: Some("handover:f:worker:1".into()),
+            spec: cog_core::FaceSpec::first("f", cog_core::FaceKind::Face),
+            updated_at: now,
+        };
+        face.spec.revision = 2;
+        let mut task = face.to_task(None);
+        task.created_at = now - chrono::Duration::days(3);
+        cog_core::GovernanceStore::save_face_node(&store, &task)
+            .await
+            .unwrap();
+
+        face.spec.display_name = "renamed".into();
+        face.updated_at = now + chrono::Duration::seconds(1);
+        cog_core::import_face(&store, &face).await.unwrap();
+
+        let row = store.row("f");
+        let after = cog_core::Face::from_task(&row).expect("the row is still a face");
+        assert_eq!(
+            after.bound_by_handover_id.as_deref(),
+            Some("handover:f:worker:1"),
+            "the import must not erase the handover that moved the face"
+        );
+        assert_eq!(after.spec.display_name, "renamed");
+        assert_eq!(
+            row.created_at,
+            now - chrono::Duration::days(3),
+            "a refreshed description is the same row, not a new one"
+        );
+    }
+
     #[tokio::test]
     async fn filling_a_vacancy_clears_the_search_that_was_looking_for_someone() {
         let store = MemoryStore::new();

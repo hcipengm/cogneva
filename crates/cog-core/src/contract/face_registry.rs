@@ -235,6 +235,11 @@ impl Face {
         task.owner_unit = self.owner_unit.clone();
         task.workspace_id = Some(GOVERNANCE_WORKSPACE.to_string());
         task.updated_at = self.updated_at;
+        // The row is saved whole, so every field this function does not write
+        // back is dropped. The handover that moved the face is one of them:
+        // losing it turns a moved face into "a revision above one with no
+        // signed handover", which a reader can only report as drift, forever.
+        task.bound_by_handover_id = self.bound_by_handover_id.clone();
         if let Some(input) = task.input.as_object_mut() {
             if let Ok(spec) = serde_json::to_value(&self.spec) {
                 input.insert(FACE_INPUT_KEY.to_string(), spec);
@@ -709,10 +714,11 @@ pub async fn import_face_with(
     ownership: ImportOwnership,
 ) -> SFResult<FaceImportOutcome> {
     let nodes = store.face_nodes().await?;
-    let existing = nodes
+    let existing_task = nodes
         .iter()
-        .filter_map(Face::from_task)
-        .find(|face| face.face_id == incoming.face_id);
+        .find(|task| is_face_node(task) && task.id == incoming.face_id)
+        .cloned();
+    let existing = existing_task.as_ref().and_then(Face::from_task);
 
     let Some(current) = existing else {
         let mut fresh = incoming.clone();
@@ -754,8 +760,11 @@ pub async fn import_face_with(
     }
     merged.updated_at = Utc::now();
 
+    // Reuse the row that is already there: the face keeps one identity across
+    // description refreshes, and a fresh task would reset `created_at` (and
+    // anything else the face's own struct does not carry) on every import.
     let wrote = store
-        .save_face_node_if_revision(&merged.to_task(None), current.revision())
+        .save_face_node_if_revision(&merged.to_task(existing_task), current.revision())
         .await?;
     if !wrote {
         return Err(SFError::Validation(format!(
