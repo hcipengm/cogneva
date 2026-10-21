@@ -1299,7 +1299,13 @@ metric_names! {
     // Five do not, and each for a reason that is not an omission: two are
     // `#[cfg(test)]` mocks, two are the development stream backend in
     // `cog-stream` (no metrics backend in that crate at all), and one is
-    // `EventAggregator::next_event`, which has no callers. Two of the arms that
+    // `EventAggregator::wait_and_drain` -- the arm the aggregator's consumer
+    // runs on since 2026-10-21, when consuming moved off the window pass. Its
+    // count is not lost: it adds into the window's totals and
+    // `Supervisor::run_event_pass` writes them once per window under this same
+    // `consumer` value, which is the cadence the handoff beside it already
+    // uses. The `next_event` arm it replaced had no callers and is gone, so the
+    // count of arms is unchanged. Two of the arms that
     // had no counter were also `while let Ok(..)` loops that read a lag as "the
     // channel closed" and exited -- a consumer that swallowed its own death.
     // Write the count as a count with a date rather than as a rule over "every

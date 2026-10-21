@@ -12,7 +12,7 @@ use crate::autonomous::{AutonomousCollaborator, AutonomousConfig, AUTONOMOUS_EVE
 pub const SUPERVISOR_LOOP: &str = "supervisor_main";
 use crate::control_plane::{ControlPlaneClient, HttpControlPlaneClient, SupervisorStatus};
 use crate::error::SupervisorResult;
-use crate::event_aggregator::EventAggregator;
+use crate::event_aggregator::{EventAggregator, EVENT_AGGREGATOR_LOOP};
 use crate::health_checker::{HealthChecker, HealthCheckerConfig};
 use crate::lifecycle_coordinator::LifecycleCoordinator;
 use crate::quota_enforcer::QuotaEnforcer;
@@ -108,7 +108,7 @@ pub struct Supervisor {
     pub respawner: Respawner,
     pub quota: QuotaEnforcer,
     pub rebalancer: TaskRebalancer,
-    pub aggregator: EventAggregator,
+    pub aggregator: Arc<EventAggregator>,
     pub lifecycle: LifecycleCoordinator,
     pub autonomous: Arc<AutonomousCollaborator>,
     agent_event_rx: broadcast::Receiver<AgentEvent>,
@@ -199,7 +199,8 @@ impl Supervisor {
         );
 
         let autonomous_rx = agent_event_rx.resubscribe();
-        let aggregator = EventAggregator::new(agent_event_rx).with_gateway(gateway.clone());
+        let aggregator =
+            Arc::new(EventAggregator::new(agent_event_rx).with_gateway(gateway.clone()));
 
         let mut autonomous_builder = AutonomousCollaborator::new(
             config.autonomous.clone(),
@@ -480,12 +481,18 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Drive a single event-aggregation pass.
+    /// Report what the aggregation loop consumed since the last pass.
+    ///
+    /// The events are taken by [`EventAggregator::wait_and_drain`], which wakes
+    /// on the channel; this pass keeps the window's cadence because it is the
+    /// half that writes. Making one pass do both is what put a ceiling on the
+    /// consumer.
     pub async fn run_event_pass(&self) -> SupervisorResult<()> {
-        let stats = self.aggregator.drain(1024).await?;
-        // 每一轮 `drain` 自立一份 stats，所以这里的数就是**这一轮**丢掉的条数，
-        // 累加进计数器正是「每丢掉一条加一」的语义。放在这里而不是 `drain` 里面，
-        // 是因为聚合器自己不带后端，而调它的这一层（supervisor）带。
+        let stats = self.aggregator.take_stats().await;
+        // 取出来的是**自上一趟报告以来**的累计，所以这里的数就是这一窗丢掉的条数，
+        // 累加进计数器正是「每丢掉一条加一」的语义。计数放在这里而不是消费环里，
+        // 是因为聚合器自己不带后端，而调它的这一层（supervisor）带；消费环每唤醒
+        // 一次就写一次计数器则是一趟一条写放大。
         if stats.dropped > 0 {
             crate::consumer_lag::record_consumer_lag(
                 &self.metrics,
@@ -600,6 +607,30 @@ impl Supervisor {
                             beat,
                         )
                         .await;
+                    }
+                }
+            },
+        );
+
+        // Spawn the aggregator's consumer, for the same reason the autonomous
+        // loop lives outside the supervised body: it is a loop of its own, and
+        // rebuilding it per attempt would leave the previous one running with
+        // nothing holding its handle. It is also why it is not driven from the
+        // supervisor's select loop — a consumer that only reads on a ticker has
+        // the ticker's throughput.
+        let aggregator_stop = supervisor_stop.clone();
+        let _aggregator_handle = cog_core::loop_health::spawn(
+            EVENT_AGGREGATOR_LOOP,
+            cog_core::loop_health::Cadence::EventDriven,
+            aggregator_stop.clone(),
+            {
+                let aggregator = Arc::clone(&self.aggregator);
+                move |beat| {
+                    let aggregator = Arc::clone(&aggregator);
+                    let stop = aggregator_stop.clone();
+                    async move {
+                        crate::event_aggregator::run_event_aggregator_loop(aggregator, stop, beat)
+                            .await;
                     }
                 }
             },
