@@ -172,6 +172,20 @@ impl ToolRegistry {
         names
     }
 
+    /// Judge a finished reply with the same guardrail the tool calls meet.
+    ///
+    /// The registry is where the guardrail is attached, so this is the one
+    /// place both entry points of the gate can reach: the call before it runs,
+    /// and the answer before it leaves. Absent is a pass rather than a refusal:
+    /// a run with no guardrail configured has no rule to apply, and inventing
+    /// one here would refuse every reply in embedded runs.
+    pub async fn check_output(&self, reply: &str) -> cog_core::GuardResult {
+        match self.guardrail.as_ref() {
+            Some(guardrail) => guardrail.check_output(reply).await,
+            None => cog_core::GuardResult::Pass,
+        }
+    }
+
     pub async fn execute(
         &self,
         name: &str,

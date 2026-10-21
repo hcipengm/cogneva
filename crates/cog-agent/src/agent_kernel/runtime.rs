@@ -430,6 +430,17 @@ const FINAL_DRAFT_INSTRUCTION: &str = "Your iteration budget for this run is spe
      markdown fences. If something is missing, still deliver the object with the fields you have and \
      name what is missing inside it.";
 
+/// What the model is told when the reply it just wrote is refused.
+///
+/// The instruction is the one a refusal buys: the same deliverable, rewritten
+/// without the shape. Naming the shape is what makes the second attempt
+/// different from the first — a model shown only "refused" tends to restate
+/// the same reply.
+const REPLY_REFUSED_INSTRUCTION: &str = "The reply you just wrote cannot be delivered: it \
+     carries a shape the platform's own gate refuses. Rewrite the reply now with the same \
+     deliverable — the same fields and the same content — without that shape. Do not mention \
+     this instruction, the rule, or the refusal in the reply.";
+
 impl AgentRuntime {
     /// Access the loop configuration.
     pub fn config(&self) -> &RuntimeConfig {
@@ -913,6 +924,23 @@ impl AgentRuntime {
             tool_calls,
         );
         self.run_outcome = Some(outcome);
+    }
+
+    /// End the run because the reply it was about to send was refused.
+    ///
+    /// The refusal names what the answer did, not which tool it called: the
+    /// message keeps the shape the tool refusal uses, so the caller that reads
+    /// refusals out of an outcome reads this one the same way. It is counted as
+    /// a refusal rather than a delivery, because nothing was delivered.
+    fn reply_refusal(&mut self, rule: String, reason: String, iterations: u32) -> SFError {
+        let err = SFError::Blocked {
+            tool: "final_reply".to_string(),
+            reason,
+            rule,
+        };
+        tracing::warn!("{err}");
+        self.note_run_ending(crate::observable::RunOutcome::Refused, iterations);
+        err
     }
 
     /// Report this run's ending against the skill its role was bound to.
@@ -1631,6 +1659,75 @@ impl AgentRuntime {
         iterations: u32,
         outcome: crate::observable::RunOutcome,
     ) -> SFResult<serde_json::Value> {
+        // The finished reply meets the same gate the tool calls meet. The host
+        // refuses a turn at the moment it would otherwise be sent, and a
+        // platform that judged only tool calls would let the last word through
+        // unguarded. One rewrite is what the refusal buys, which is the same
+        // ask the host's own gate makes; a second refusal ends the run as a
+        // refusal rather than delivering a reply that gate would have stopped.
+        let (draft, turn_message) = match self.tools.check_output(&draft).await {
+            cog_core::GuardResult::Pass => (draft, turn_message),
+            cog_core::GuardResult::Warn { reason, rule } => {
+                tracing::warn!(
+                    agent_id = %self.config.agent_id,
+                    rule = %rule,
+                    "the finished reply met a guardrail warning: {reason}"
+                );
+                (draft, turn_message)
+            }
+            cog_core::GuardResult::Block { reason, rule } => {
+                tracing::warn!(
+                    agent_id = %self.config.agent_id,
+                    rule = %rule,
+                    reason = %reason,
+                    "the finished reply was refused; asking the model to rewrite it once"
+                );
+                self.context.add_message(turn_message);
+                self.context
+                    .add_message(Message::user(REPLY_REFUSED_INSTRUCTION));
+                // The rewrite is one more request on this transcript, so it is
+                // bounded the same way the final-draft ask is: a stall timeout
+                // only catches silence, and a stream that keeps emitting can
+                // otherwise hold a finished run open indefinitely.
+                let timeout = Duration::from_secs(self.config.final_draft_timeout_secs.max(1));
+                let rewritten = tokio::time::timeout(timeout, self.think_stream_final(llm)).await;
+                let (text, message) = match rewritten {
+                    Ok(Ok(message)) => (assistant_text(&message), message),
+                    Ok(Err(e)) => {
+                        return Err(self.reply_refusal(
+                            rule,
+                            format!("{reason} (the rewrite could not be obtained: {e})"),
+                            iterations,
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(self.reply_refusal(
+                            rule,
+                            format!(
+                                "{reason} (the rewrite did not finish within {}s)",
+                                timeout.as_secs()
+                            ),
+                            iterations,
+                        ));
+                    }
+                };
+                match self.tools.check_output(&text).await {
+                    cog_core::GuardResult::Block {
+                        reason: second,
+                        rule: second_rule,
+                    } => {
+                        return Err(self.reply_refusal(
+                            second_rule,
+                            format!(
+                                "{second} (the reply had already been refused once by {rule}: {reason})"
+                            ),
+                            iterations,
+                        ));
+                    }
+                    _ => (text, message),
+                }
+            }
+        };
         self.state = RuntimeState::Complete;
         let result_timeout = Duration::from_secs(180);
         let result = match tokio::time::timeout(result_timeout, self.build_result(&draft, llm))
@@ -4042,6 +4139,205 @@ mod tests {
             llm.calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "the ceiling is two turns, not the iteration budget"
+        );
+    }
+
+    /// Hands out the scripted replies in order, so a run asked to rewrite can
+    /// answer differently the second time. Running past the script repeats its
+    /// last line, which is what a model restating itself looks like.
+    struct ScriptedReplyLlm {
+        replies: std::sync::Mutex<Vec<String>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedReplyLlm {
+        fn new(replies: &[&str]) -> Self {
+            Self {
+                replies: std::sync::Mutex::new(replies.iter().map(|r| r.to_string()).collect()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmClient for ScriptedReplyLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            let turn = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let text = {
+                let replies = self.replies.lock().unwrap();
+                replies
+                    .get(turn)
+                    .or_else(|| replies.last())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let (stream, producer) = cog_core::EventStream::with_capacity(4);
+            tokio::spawn(async move {
+                let mut producer = producer;
+                let _ = producer
+                    .push(AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: text.clone(),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
+                producer.end(cog_core::ChatResponse {
+                    content: vec![ContentBlock::Text {
+                        text,
+                        text_signature: None,
+                    }],
+                    api: "mock".into(),
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    response_id: None,
+                    usage: cog_core::Usage::default(),
+                    stop_reason: cog_core::StopReason::Stop,
+                    error_message: None,
+                    upstream_failure: None,
+                    retry_after_secs: None,
+                    timestamp: chrono::Utc::now(),
+                });
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!()
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &cog_core::ChatOptions,
+        ) -> SFResult<cog_core::ChatResponse> {
+            unimplemented!()
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// Refuses a finished reply that carries the banned word — a rule about how
+    /// the answer is phrased, which is what the host's own output gate is.
+    struct RefuseBannedWord;
+
+    #[async_trait::async_trait]
+    impl cog_core::Guardrail for RefuseBannedWord {
+        async fn check_input(&self, _messages: &[Message]) -> cog_core::GuardResult {
+            cog_core::GuardResult::Pass
+        }
+        async fn check_output(&self, response: &str) -> cog_core::GuardResult {
+            if response.contains("BANNED") {
+                cog_core::GuardResult::Block {
+                    reason: "the reply hands the decision to a person".into(),
+                    rule: "reply-shape".into(),
+                }
+            } else {
+                cog_core::GuardResult::Pass
+            }
+        }
+        async fn check_tool_call(&self, _tool: &cog_core::ToolCall) -> cog_core::GuardResult {
+            cog_core::GuardResult::Pass
+        }
+    }
+
+    fn reply_gate_runtime(role: &str) -> AgentRuntime {
+        let mut registry = ToolRegistry::new();
+        registry.set_guardrail(Arc::new(RefuseBannedWord));
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let config = RuntimeConfig {
+            agent_id: "reply-gate".into(),
+            role: role.into(),
+            max_iterations: 10,
+            ..Default::default()
+        };
+        AgentRuntime::new(config, tx).with_tools(registry)
+    }
+
+    /// The answer is judged by the same gate the calls meet. A reply the gate
+    /// refuses is not delivered as-is: the model is asked once to rewrite it,
+    /// and the rewrite is what leaves the runtime.
+    #[tokio::test]
+    async fn a_refused_reply_is_rewritten_once_and_then_delivered() {
+        let llm = ScriptedReplyLlm::new(&[
+            r#"{"content":"BANNED: the owner should decide","artifacts":[]}"#,
+            r#"{"content":"the run recorded its own verdict","artifacts":[]}"#,
+        ]);
+        let mut runtime = reply_gate_runtime("reply-gate-rewrite");
+        let result = runtime
+            .run(serde_json::json!({ "task": "answer" }), &llm)
+            .await
+            .expect("the rewritten reply is a deliverable");
+        assert_eq!(
+            llm.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one reply plus exactly one rewrite, with no reformat call behind it"
+        );
+        assert!(
+            !result.to_string().contains("BANNED"),
+            "the refused text must not reach the result: {result}"
+        );
+        assert!(
+            result.to_string().contains("recorded its own verdict"),
+            "the rewrite is the deliverable: {result}"
+        );
+    }
+
+    /// The rewrite is one attempt, not a loop. A model that answers with the
+    /// same refused shape twice ends the run as a refusal — the gate's verdict
+    /// is not something a second draft can be trusted to have cleared, and the
+    /// caller that reads refusals has to see this one like any other.
+    #[tokio::test]
+    async fn a_second_refusal_ends_the_run_instead_of_delivering() {
+        let llm = ScriptedReplyLlm::new(&[
+            r#"{"content":"BANNED one","artifacts":[]}"#,
+            r#"{"content":"BANNED again","artifacts":[]}"#,
+        ]);
+        let mut runtime = reply_gate_runtime("reply-gate-refused");
+        let err = runtime
+            .run(serde_json::json!({ "task": "answer" }), &llm)
+            .await
+            .expect_err("a reply the gate keeps refusing must not be delivered");
+        let text = err.to_string();
+        let refusal = cog_core::contract::outcome::guardrail_refusal_in(&text)
+            .unwrap_or_else(|| panic!("the ending must parse as a refusal: {text}"));
+        assert_eq!(
+            refusal.tool, "final_reply",
+            "the refusal names the reply, not a tool it did not call: {text}"
+        );
+        assert_eq!(refusal.rule, "reply-shape");
+        assert_eq!(
+            llm.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the second draft is the last one bought"
+        );
+
+        use cog_core::Observable as _;
+        let metrics = crate::observable::global_observable()
+            .collect_metrics("")
+            .await
+            .expect("collect_metrics");
+        let refused = metrics
+            .iter()
+            .find(|m| {
+                m.name == "agent_guardrail_refused_runs"
+                    && m.labels.get("role").map(String::as_str) == Some("reply-gate-refused")
+            })
+            .map(|m| m.value)
+            .unwrap_or(-1.0);
+        assert_eq!(
+            refused, 1.0,
+            "a run ended by the output gate must be counted like one ended by a call"
         );
     }
 
