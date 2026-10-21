@@ -19,15 +19,15 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use cog_core::{
-    PrincipleCensus, PrincipleCheckKind, PrincipleCheckKindCensus, PrincipleDrift, PrincipleFold,
-    PrincipleLedgerStore, PrincipleMeasurement, PrincipleReading, PrincipleRefusal, PrincipleRow,
-    PrincipleState, SFError, SFResult,
+    ChangePriority, PrincipleCensus, PrincipleCheckKind, PrincipleCheckKindCensus, PrincipleDrift,
+    PrincipleFold, PrincipleLedgerStore, PrincipleMeasurement, PrincipleReading, PrincipleRefusal,
+    PrincipleRow, PrincipleState, SFError, SFResult,
 };
 
 /// Every read returns these, in one place so no two readers can come back with
 /// differently ordered columns.
 const ROW_COLUMNS: &str = "slug, lead, carrier_path, carrier_sha256, host_gate, where_red, \
-                           platform_gate, check_kind, state, refusals, last_refused_at, \
+                           platform_gate, check_kind, priority, state, refusals, last_refused_at, \
                            first_seen_at, measured_at, measured_rev";
 
 /// How wide each keyed column may be, taken from the columns that key them
@@ -86,6 +86,7 @@ impl PostgresPrincipleLedgerStore {
                 .try_get("platform_gate")
                 .map_err(|e| format!("platform_gate: {e}"))?,
             check_kind: parse_check_kind(row)?,
+            priority: parse_priority(row)?,
             state,
             refusals: row
                 .try_get("refusals")
@@ -124,6 +125,7 @@ impl PostgresPrincipleLedgerStore {
                 .try_get("where_red")
                 .map_err(|e| format!("where_red: {e}"))?,
             check_kind: parse_check_kind(row)?,
+            priority: parse_optional_priority(row)?,
         })
     }
 
@@ -154,6 +156,7 @@ where
         .bind(&reading.host_gate)
         .bind(&reading.where_red)
         .bind(reading.check_kind.map(PrincipleCheckKind::as_str))
+        .bind(reading.priority.map(ChangePriority::as_str))
         .execute(exec)
         .await
         .map_err(|e| SFError::Database(format!("record reading for {}: {e}", reading.slug)))?;
@@ -185,6 +188,7 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
                 .bind(&reading.host_gate)
                 .bind(&reading.where_red)
                 .bind(reading.check_kind.map(PrincipleCheckKind::as_str))
+                .bind(reading.priority.map(ChangePriority::as_str))
                 .execute(&self.pool)
                 .await
                 .map_err(|e| SFError::Database(format!("declare {}: {e}", reading.slug)))?;
@@ -753,15 +757,16 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
 /// statement came from a source that pushed the column and left it empty.
 const RECORD_READING_SQL: &str = "\
 INSERT INTO principle_ledger (slug, lead, carrier_path, carrier_sha256, host_gate, where_red, \
-check_kind)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+check_kind, priority)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (slug) DO UPDATE SET
     lead = COALESCE(EXCLUDED.lead, principle_ledger.lead),
     carrier_path = COALESCE(EXCLUDED.carrier_path, principle_ledger.carrier_path),
     carrier_sha256 = COALESCE(EXCLUDED.carrier_sha256, principle_ledger.carrier_sha256),
     host_gate = COALESCE(EXCLUDED.host_gate, principle_ledger.host_gate),
     where_red = COALESCE(EXCLUDED.where_red, principle_ledger.where_red),
-    check_kind = EXCLUDED.check_kind";
+    check_kind = EXCLUDED.check_kind,
+    priority = COALESCE(EXCLUDED.priority, principle_ledger.priority)";
 
 /// Queue a reading, or re-queue the one already there when the reading would
 /// actually change it.
@@ -796,8 +801,8 @@ ON CONFLICT (slug) DO UPDATE SET
 /// unsayable in both copies of this rule.
 const DECLARE_SQL: &str = "\
 INSERT INTO principle_ledger_declared (slug, source, lead, carrier_path, carrier_sha256, host_gate, \
-where_red, check_kind)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+where_red, check_kind, priority)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (slug, source) DO UPDATE SET
     lead = COALESCE(EXCLUDED.lead, principle_ledger_declared.lead),
     carrier_path = COALESCE(EXCLUDED.carrier_path, principle_ledger_declared.carrier_path),
@@ -805,6 +810,7 @@ ON CONFLICT (slug, source) DO UPDATE SET
     host_gate = COALESCE(EXCLUDED.host_gate, principle_ledger_declared.host_gate),
     where_red = COALESCE(EXCLUDED.where_red, principle_ledger_declared.where_red),
     check_kind = EXCLUDED.check_kind,
+    priority = COALESCE(EXCLUDED.priority, principle_ledger_declared.priority),
     declared_at = now(),
     folded_at = NULL
 WHERE (COALESCE(EXCLUDED.lead, principle_ledger_declared.lead),
@@ -812,11 +818,13 @@ WHERE (COALESCE(EXCLUDED.lead, principle_ledger_declared.lead),
        COALESCE(EXCLUDED.carrier_sha256, principle_ledger_declared.carrier_sha256),
        COALESCE(EXCLUDED.host_gate, principle_ledger_declared.host_gate),
        COALESCE(EXCLUDED.where_red, principle_ledger_declared.where_red),
-       EXCLUDED.check_kind)
+       EXCLUDED.check_kind,
+       COALESCE(EXCLUDED.priority, principle_ledger_declared.priority))
   IS DISTINCT FROM
       (principle_ledger_declared.lead, principle_ledger_declared.carrier_path,
        principle_ledger_declared.carrier_sha256, principle_ledger_declared.host_gate,
-       principle_ledger_declared.where_red, principle_ledger_declared.check_kind)";
+       principle_ledger_declared.where_red, principle_ledger_declared.check_kind,
+       principle_ledger_declared.priority)";
 
 /// The readings one fold takes, oldest first.
 ///
@@ -825,7 +833,7 @@ WHERE (COALESCE(EXCLUDED.lead, principle_ledger_declared.lead),
 /// takes would follow whatever order the scan returned -- a different set on the
 /// next run, and a different one again on the other dialect.
 const FOLD_SELECT_SQL: &str = "\
-SELECT slug, source, lead, carrier_path, carrier_sha256, host_gate, where_red, check_kind
+SELECT slug, source, lead, carrier_path, carrier_sha256, host_gate, where_red, check_kind, priority
 FROM principle_ledger_declared
 WHERE folded_at IS NULL
 ORDER BY declared_at ASC, slug ASC, source ASC
@@ -1021,6 +1029,38 @@ fn parse_check_kind(row: &sqlx::postgres::PgRow) -> Result<Option<PrincipleCheck
     match raw {
         Some(text) => Ok(Some(PrincipleCheckKind::parse(&text).ok_or_else(|| {
             format!("check_kind column holds `{text}`, which is not a check kind")
+        })?)),
+        None => Ok(None),
+    }
+}
+
+/// The band a row carries.
+///
+/// The column is not nullable on the ledger and the closed set has a member for
+/// "no document said", so the only way this fails is a value outside the set --
+/// which a foreign writer, not this store, would have put there. Reading it as
+/// an error rather than folding it into `unstated` keeps a wrong word from
+/// becoming a row that reads as evidence nobody prioritised the work.
+fn parse_priority(row: &sqlx::postgres::PgRow) -> Result<ChangePriority, String> {
+    let raw: String = row
+        .try_get("priority")
+        .map_err(|e| format!("priority: {e}"))?;
+    raw.parse::<ChangePriority>()
+        .map_err(|e| format!("priority column holds `{raw}`, which is not a band: {e}"))
+}
+
+/// The band a reading carried, when it carried one.
+///
+/// `None` is silence and not `unstated`: a reading written before this column
+/// existed said nothing about urgency, and the merge is what keeps that silence
+/// from clearing a band somebody did state.
+fn parse_optional_priority(row: &sqlx::postgres::PgRow) -> Result<Option<ChangePriority>, String> {
+    let raw: Option<String> = row
+        .try_get("priority")
+        .map_err(|e| format!("priority: {e}"))?;
+    match raw {
+        Some(text) => Ok(Some(text.parse::<ChangePriority>().map_err(|e| {
+            format!("priority column holds `{text}`, which is not a band: {e}")
         })?)),
         None => Ok(None),
     }

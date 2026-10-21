@@ -117,6 +117,7 @@ fn reading(slug: &str, source: &str) -> PrincipleReading {
         host_gate: None,
         where_red: None,
         check_kind: None,
+        priority: None,
     }
 }
 

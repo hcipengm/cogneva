@@ -1485,10 +1485,11 @@ fn principle_debt_readings(rows: &[PrincipleRow]) -> (Vec<ChangeReading>, Unaime
             source: ChangeSource {
                 doc: PRINCIPLE_LEDGER_SOURCE.to_string(),
                 verdict: None,
-                // The ledger names the principle and its tier, not how urgent it
-                // is: nothing there states a band, so the reading carries the one
-                // that says so rather than a band this path invented.
-                priority: ChangePriority::Unstated,
+                // The band rides on the principle's own row: the memory that
+                // states the rule is the document that can say how urgent
+                // landing it is, and `unstated` is its word for one that says
+                // nothing -- not a band this path could have stood in for.
+                priority: row.priority,
                 // The face, by contrast, this path does know: a principle's
                 // reading is filed under principles and nowhere else.
                 block: ChangeBlock::Principles,
@@ -4876,6 +4877,7 @@ mod tests {
             where_red: None,
             platform_gate: None,
             check_kind,
+            priority: ChangePriority::Unstated,
             state: None,
             refusals: 0,
             last_refused_at: None,
@@ -5236,6 +5238,32 @@ mod tests {
         assert_eq!(rows[0].identity.literal, "principle: feedback_x");
         assert_eq!(rows[1].identity.literal, "principle: feedback_y");
         assert!(rows.iter().all(|row| row.assertion.is_some()), "{rows:?}");
+    }
+
+    /// The band rides on the source, and the two silences stay apart.
+    ///
+    /// Which band an owed rule carries is the rule's document own word, read off
+    /// the principle row; this path only carries it. A row that states nothing
+    /// files `unstated` -- not a band this path invented, and not `None`, since
+    /// the source always reaches a database. Both halves are asserted because a
+    /// path that stood in a default band would still satisfy the first one.
+    #[test]
+    fn a_rules_band_rides_on_the_source_its_document_spoke_through() {
+        let mut stated = principle_row(
+            "feedback_p0",
+            Some(PrincipleCheckKind::Shape),
+            Some("state a band"),
+        );
+        stated.priority = ChangePriority::P0;
+        let silent = principle_row(
+            "feedback_silent",
+            Some(PrincipleCheckKind::Shape),
+            Some("state nothing"),
+        );
+        let (rows, _) = principle_debt_readings(&[stated, silent]);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].source.priority, ChangePriority::P0);
+        assert_eq!(rows[1].source.priority, ChangePriority::Unstated);
     }
 
     /// Every tier of the closed set is classified, and exactly three of them are

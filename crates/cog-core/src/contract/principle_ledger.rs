@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::contract::change_ledger::ChangePriority;
 use crate::SFResult;
 
 /// What a look at the registries concluded about one principle.
@@ -223,6 +224,23 @@ pub struct PrincipleReading {
     /// already on the row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub check_kind: Option<PrincipleCheckKind>,
+    /// How urgent the memory that states this rule said landing it is.
+    ///
+    /// The same field the change ledger keeps per declaration, carried here
+    /// because for a principle the declaring document *is* the memory: nothing
+    /// else can say how much a violated rule costs, and a band this account
+    /// derived from anything it can see would be a claim dressed as a document's
+    /// word.
+    ///
+    /// Two absences that must stay apart. `None` is a reading that says nothing
+    /// about the band -- an older pusher that predates this field -- and it does
+    /// not move a band already on the row. `Some(Unstated)` is a reading that
+    /// looked and found no document stating one: it is a value, it overwrites,
+    /// and it is what makes a declared band withdrawable. Folding the two into
+    /// one would either freeze every band ever declared or let a silent pusher
+    /// erase one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<ChangePriority>,
 }
 
 /// The result of looking at both registries for one principle.
@@ -302,6 +320,13 @@ pub struct PrincipleRow {
     /// findings, and only the latter is the record that the rule is a person's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub check_kind: Option<PrincipleCheckKind>,
+    /// How urgent the memory that states the rule said landing it is.
+    ///
+    /// A member of the closed set rather than an option: the word for "no
+    /// document said" is itself a member, so a row always answers the question
+    /// and a reader never has to decide what an absent value means. It is not a
+    /// default band -- it is the band that says no document stated one.
+    pub priority: ChangePriority,
     /// `None` until a look settles it, and it stays `None` for a look that could
     /// not settle -- a row nothing has looked at and one no look could reach are
     /// the same reading here, and both are different from `unenforced`.

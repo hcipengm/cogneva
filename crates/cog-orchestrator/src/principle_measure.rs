@@ -482,6 +482,7 @@ mod tests {
             where_red: None,
             platform_gate: None,
             check_kind: None,
+            priority: cog_core::ChangePriority::Unstated,
             state: None,
             refusals: 0,
             last_refused_at: None,

@@ -140,6 +140,7 @@ fn reading(slug: &str, tier: PrincipleCheckKind) -> PrincipleReading {
         host_gate: None,
         where_red: None,
         check_kind: Some(tier),
+        priority: None,
     }
 }
 
