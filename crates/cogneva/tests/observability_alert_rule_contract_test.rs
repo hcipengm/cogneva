@@ -1110,11 +1110,7 @@ const FOREIGN: &[(&str, &str)] = &[
     ("kube_node_status_allocatable", "kube-state-metrics"),
     (
         "container_cpu_cfs_throttled_periods_total",
-        "cadvisor（kubelet 内置）。被 CFS 限流过多少个周期——容器「想要更多、被按住了」在内核里的原话。按 usage/limit 判会把「用满了给它的一份」读成「不够用」，而按限流比判读的是真的没拿到",
-    ),
-    (
-        "container_cpu_cfs_periods_total",
-        "cadvisor（kubelet 内置）。同一序列的分母：调度周期总数。两个计数器同源同标签，比值才是判据",
+        "cadvisor（kubelet 内置）。被 CFS 限流过多少个周期——容器「想要更多、被按住了」在内核里的原话。按 usage/limit 判会把「用满了给它的一份」读成「不够用」，而按限流周期判读的是真的没拿到。乘回周期长度就是墙钟时间里的份额；除它的分母（`container_cpu_cfs_periods_total`）不是墙钟而是「这个容器自己的可运行周期」，2026-10-22 实测同一批容器里 postgres 5.33 个/秒、redis 的 info-exporter 0.18 个/秒，比值跨容器不可比，所以那条分母已从本表撤下",
     ),
     (
         "kubelet_image_garbage_collected_total",
