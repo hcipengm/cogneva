@@ -651,14 +651,16 @@ impl cog_core::AgentManager for GlobalAgentManager {
         };
 
         agent.start().await;
-        let backend_id = agent_id.to_string();
+        // The consumer used to log each delivered message and ack it. That made
+        // the inbox look healthy while every command an agent received was
+        // thrown away. Hand the message to the agent's own command path
+        // instead: a handler that fails leaves it pending for redelivery.
+        let agent = std::sync::Arc::new(agent);
+        let consumer_agent = agent.clone();
         agent
             .start_consumer(move |msg| {
-                let bid = backend_id.clone();
-                async move {
-                    tracing::debug!(agent_id = %bid, "received inbox message: {:?}", msg);
-                    Ok(())
-                }
+                let agent = consumer_agent.clone();
+                async move { agent.handle_inbox(msg).await }
             })
             .await?;
 
@@ -666,7 +668,7 @@ impl cog_core::AgentManager for GlobalAgentManager {
             agent_id: agent_id.into(),
             role: role.to_string(),
             capabilities,
-            agent: std::sync::Arc::new(agent),
+            agent: agent.clone(),
             created_at: std::time::Instant::now(),
             task_id: task_id.map(str::to_string),
         };

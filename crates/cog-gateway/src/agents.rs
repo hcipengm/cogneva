@@ -153,6 +153,62 @@ pub async fn get_handler(
     }
 }
 
+/// Put one command on a named agent's inbox.
+///
+/// The inbox subscription and the command semantics existed, but nothing in
+/// the platform ever produced a message for them, so an agent could be
+/// addressed only from inside its own process. This is the producer that
+/// closes the path: the body is the wire form of [`cog_core::InboxMessage`],
+/// and a `prompt` that names a `reply_stream` publishes its result there for
+/// the caller to read with the standard message backend.
+///
+/// Accepted, not processed: the agent's consumer owns execution, and the
+/// answer goes to `reply_stream` rather than to this response. A name that
+/// resolves to no live agent is a 404, because queueing a command for a
+/// process that will never read it is indistinguishable from losing it.
+pub async fn send_message_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(agent_id): Path<String>,
+    Json(msg): Json<cog_core::InboxMessage>,
+) -> Response {
+    let Some(pool) = state.agent_pool.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "agent_pool not configured"})),
+        )
+            .into_response();
+    };
+    let agent = match pool.get_agent(&agent_id).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "no live agent under this name"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    match agent.receive_message(msg).await {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"queued": true, "agent_id": agent_id})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn list_handler(State(state): State<Arc<GatewayState>>) -> Response {
     let Some(registry) = state.agent_registry.as_ref() else {
         return (

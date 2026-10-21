@@ -613,6 +613,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/agents/{id}/heartbeat",
             post(agents::heartbeat_handler),
         )
+        .route(
+            "/api/v1/agents/{id}/messages",
+            post(agents::send_message_handler),
+        )
         .route("/api/v1/agents/{id}/kill", post(agents::kill_handler))
         .route("/api/v1/agents/{id}/restart", post(agents::restart_handler))
         .route(

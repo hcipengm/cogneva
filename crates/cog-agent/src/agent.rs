@@ -1242,6 +1242,37 @@ impl Agent {
         crate::consumer::AgentConsumer::send_message(to_agent_id, message, backend).await
     }
 
+    /// Execute one message delivered to this agent's inbox.
+    ///
+    /// The inbox subscription used to receive every message and drop it, so an
+    /// agent could be addressed but never answered. Running the command here is
+    /// what turns the subscription into a delivery channel.
+    ///
+    /// A `Prompt` that names a `reply_stream` publishes its result there, so
+    /// the sender reads the answer with the same backend API it published
+    /// with. A prompt without one still runs for its side effects: the run's
+    /// events reach the broadcast and the event plane as any other run does.
+    /// Errors propagate to the consumer, which leaves the message pending
+    /// instead of acking a run that never happened.
+    pub async fn handle_inbox(&self, msg: InboxMessage) -> SFResult<()> {
+        match msg {
+            InboxMessage::Prompt { goal, reply_stream } => {
+                let out = self.prompt(goal).await?;
+                if let Some(stream) = reply_stream {
+                    publish_inbox_reply(self.message_backend.as_ref(), &stream, &out).await?;
+                }
+                Ok(())
+            }
+            InboxMessage::Continue { instruction } => {
+                let input = serde_json::Value::String(instruction);
+                self.continue_(input).await.map(|_| ())
+            }
+            InboxMessage::Abort => self.abort().await,
+            InboxMessage::Reset => self.reset().await,
+            InboxMessage::Steering { instruction } => self.steer(instruction).await,
+        }
+    }
+
     /// Read a field from the shared `ContextBoard` for the given task.
     pub async fn read_board(&self, task_id: &str, field: &str) -> SFResult<Option<String>> {
         let backend = self
@@ -1505,6 +1536,60 @@ async fn run_agent_task(
                 let _ = result_tx.send(snap);
             }
         }
+    }
+}
+
+/// Publish an inbox prompt's result onto the stream its sender named.
+///
+/// A reply that cannot name a transport is an error rather than a silent
+/// success: the consumer treats a handler error as "leave the message
+/// pending", and a run whose answer was dropped must not be acked as done.
+async fn publish_inbox_reply(
+    backend: Option<&Arc<dyn cog_core::MessageBackend>>,
+    stream: &str,
+    result: &serde_json::Value,
+) -> SFResult<()> {
+    let backend =
+        backend.ok_or_else(|| SFError::Agent("No message backend to reply with".into()))?;
+    let payload = serde_json::to_vec(result).map_err(SFError::Serialization)?;
+    backend.publish(stream, &payload).await
+}
+
+#[cfg(test)]
+mod inbox_reply_tests {
+    use super::*;
+
+    /// The answer lands on the stream the sender named, in the shape the
+    /// sender can parse back. Before the inbox handler executed commands,
+    /// nothing ever published here.
+    #[tokio::test]
+    async fn a_prompt_reply_lands_on_the_stream_the_sender_named() {
+        let backend: Arc<dyn cog_core::MessageBackend> =
+            Arc::new(cog_stream::MemoryMessageBackend::new());
+        backend
+            .create_consumer_group("replies", "caller")
+            .await
+            .unwrap();
+        let answer = serde_json::json!({"ok": true, "text": "done"});
+
+        publish_inbox_reply(Some(&backend), "replies", &answer)
+            .await
+            .unwrap();
+
+        let mut stream = backend.subscribe("replies", "caller").await.unwrap();
+        let (_, bytes) = stream.next().await.unwrap().unwrap();
+        let read: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(read, answer);
+    }
+
+    /// No transport is an error, so the consumer leaves the command pending
+    /// instead of acking a run whose answer went nowhere.
+    #[tokio::test]
+    async fn a_reply_without_a_transport_is_an_error() {
+        let err = publish_inbox_reply(None, "replies", &serde_json::json!("x"))
+            .await
+            .expect_err("dropping the reply silently would ack a run that answered nobody");
+        assert!(err.to_string().contains("No message backend"));
     }
 }
 
