@@ -30,7 +30,10 @@
 set -uo pipefail
 
 NS="${COGNEVA_NS:-cogneva}"
-KUBECTL="${COGNEVA_KUBECTL:-kubectl}"
+# 默认入口与仓里其余读集群的脚本同一套（check-cross-layer-reconcile.sh、check-container-headroom.sh）：
+# 这台宿主上非 root 的 kubectl 读不到 /etc/rancher/k3s/k3s.yaml，于是「默认跑一次」取回空、
+# 判词读作 unreadable——账是好的，入口是坏的。别的机器用 COGNEVA_KUBECTL=kubectl 覆盖。
+KUBECTL="${COGNEVA_KUBECTL:-sudo -n k3s kubectl}"
 PG_POD="${COGNEVA_PG_POD:-postgres-0}"
 
 # 三节一张表：1TOT（总量与折叠进度）、2KIND（kind×outcome）、3SUBJ（kind×subject）。
