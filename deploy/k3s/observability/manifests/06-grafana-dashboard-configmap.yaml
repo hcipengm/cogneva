@@ -2425,6 +2425,193 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 58,
+          "title": "Volume Capacity: Declaration Against Measured Peak",
+          "description": "The two numbers the growth loop decides from, per claim, drawn side by side: the declaration in force and the highest usage ever measured against it. The loop raises a declaration once the peak no longer fits, so on a healthy volume the peak line stays below the declared one and the gap is the headroom the loop is working with. A peak that crosses its declaration is the one reading this pair exists for: either the raise was clamped by admission or refused, and the volume_capacity_* rules say which, or the volume is growing faster than the policy assumed. Neither number is derivable from the other side of the account -- the declaration is a request and the peak is a measurement -- which is why the pair is drawn rather than one ratio.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 280
+          },
+          "targets": [
+            {
+              "expr": "max by (namespace, persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"})",
+              "legendFormat": "{{namespace}}/{{persistentvolumeclaim}} declared",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (namespace, persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"peak\"})",
+              "legendFormat": "{{namespace}}/{{persistentvolumeclaim}} peak",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 59,
+          "title": "Build Gate: What Each Dimension Would Allow",
+          "description": "How many builds each of the four dimensions would allow on its own, against the ceiling the gate actually acts on. The gate takes the smallest of them, and the decision series names the winner but not the spread: a host whose dimensions sit together is one where any of them moving changes the answer, while a host whose memory line sits far below the rest is memory-bound and will stay so until memory is what changes. The gap between the two lowest lines is also the only way to read an overridden ceiling, where the decision says only override and these four still say what the host could really do.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 280
+          },
+          "targets": [
+            {
+              "expr": "cogneva_build_gate_dimension_ceiling{role=\"builder\"}",
+              "legendFormat": "{{dimension}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_build_gate_ceiling{role=\"builder\"}",
+              "legendFormat": "{{dimension}} in force",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 60,
+          "title": "Image Store: Bytes by Part",
+          "description": "What the container runtime's store holds on this node, divided by the top-level entries under its root. The layers an image unpacks into are not a volume, so kubelet reports no size for them and the runtime's own listing gives compressed sizes that do not add up to what the disk spends; this walk is the only reading that is the node's own bytes. The content part is the compressed blobs, the snapshotter parts are the unpacked layers, and the log and bolt parts are bookkeeping that grows on its own clock. A part that stops being walked keeps its last number and is counted on the coverage panel beside this one, so a flat line here is only a flat store when that panel reads zero.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 288
+          },
+          "targets": [
+            {
+              "expr": "max by (node, part) (cogneva_image_store_bytes)",
+              "legendFormat": "{{part}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 61,
+          "title": "Storage Walks: What Neither Walk Covered",
+          "description": "The two node-side walks, and the part of each population they could not read. A walk that fails keeps its last numbers, which on every other panel is the same shape as a tree that stopped growing -- these two lines are what separates them, and zero is the healthy reading on both. The image store's population is the top-level entries under the runtime root; the claim walk's is the claim directories under the storage root. Read them beside the age panel: coverage of zero with an age that keeps climbing is a walk that is not running at all.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 288
+          },
+          "targets": [
+            {
+              "expr": "max by (node) (cogneva_image_store_parts - cogneva_image_store_readable)",
+              "legendFormat": "{{node}} image parts not walked",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_claim_scan_dirs - cogneva_claim_scan_readable)",
+              "legendFormat": "claim directories not walked",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 62,
+          "title": "Storage Walks: How Old the Last One Is",
+          "description": "The age of each node-side walk's last completed pass. The bytes, the coverage and the population are all published by the same walk, so a stopped walk freezes all of them at once and every other panel keeps drawing the last thing it saw. An age that climbs past a few cadences is the one reading that says the numbers beside it are not being refreshed, which is why it is drawn next to them rather than on a host panel of its own.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 296
+          },
+          "targets": [
+            {
+              "expr": "max(cogneva_image_store_age_seconds)",
+              "legendFormat": "image store",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_claim_scan_age_seconds)",
+              "legendFormat": "claim root",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

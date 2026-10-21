@@ -215,6 +215,61 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["dir", "role", "dimension"],
         "crates/cog-core/src/contract/build_gate.rs",
     ),
+    // What each dimension would allow on its own, beside the smallest of them.
+    // The decision series names the winner and nothing about the spread, and an
+    // overridden ceiling is the case where the decision says only that: these
+    // four keep saying what the host could really do.
+    (
+        "cogneva_build_gate_dimension_ceiling",
+        &["dimension", "dir", "role"],
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
+    // The growth loop's own inputs, per claim: the declaration in force and the
+    // highest usage measured against it. Neither is derivable from the account's
+    // other side, which is why the pair is drawn rather than a ratio.
+    (
+        "cogneva_volume_capacity_bytes",
+        &["namespace", "persistentvolumeclaim", "state"],
+        "crates/cog-reflection/src/volume_capacity.rs",
+    ),
+    // The node's image store, which is not a volume and so has no kubelet size:
+    // one series per top-level part of the runtime root.
+    (
+        "cogneva_image_store_bytes",
+        &["node", "part"],
+        "crates/cog-observability/src/image_store.rs",
+    ),
+    (
+        "cogneva_image_store_parts",
+        &["node"],
+        "crates/cog-observability/src/image_store.rs",
+    ),
+    (
+        "cogneva_image_store_readable",
+        &["node"],
+        "crates/cog-observability/src/image_store.rs",
+    ),
+    (
+        "cogneva_image_store_age_seconds",
+        &["node"],
+        "crates/cog-observability/src/image_store.rs",
+    ),
+    // The claim walk's coverage, the same three readings for the storage root.
+    (
+        "cogneva_claim_scan_dirs",
+        &["node"],
+        "crates/cog-observability/src/claim_store.rs",
+    ),
+    (
+        "cogneva_claim_scan_readable",
+        &["node"],
+        "crates/cog-observability/src/claim_store.rs",
+    ),
+    (
+        "cogneva_claim_scan_age_seconds",
+        &["node"],
+        "crates/cog-observability/src/claim_store.rs",
+    ),
     (
         "cogneva_build_gate_in_flight",
         &["dir", "role"],
