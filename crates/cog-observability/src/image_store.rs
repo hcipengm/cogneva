@@ -184,6 +184,7 @@ impl ImageStoreObservable {
 
         let mut readable = 0usize;
         let mut files = 0usize;
+        let mut vanished = 0usize;
         for (name, path) in &found {
             let footprint = store
                 .parts
@@ -221,7 +222,10 @@ impl ImageStoreObservable {
             // on this node's store: 809k files, nearly half of them hardlinks
             // between overlay layers, 60.5 GB, 3.9 s and 29 MB peak.
             match footprint.measure_streaming() {
-                Ok(()) => readable += 1,
+                Ok(gone) => {
+                    readable += 1;
+                    vanished += gone;
+                }
                 Err(e) => tracing::warn!(
                     part = %name,
                     path = %path.display(),
@@ -235,6 +239,19 @@ impl ImageStoreObservable {
         store.last_scan = Instant::now();
         drop(store);
         self.scans.fetch_add(1, Ordering::Relaxed);
+
+        // The runtime creates and removes snapshots under this store as images
+        // and containers come and go, sometimes while it is being walked. Those
+        // bytes are gone rather than unseen, so the part still has a number --
+        // but the number is the store as it stood at the end of the walk, and a
+        // drop that is a removal otherwise reads the same as a failed walk.
+        if vanished > 0 {
+            tracing::warn!(
+                vanished,
+                parts = found.len(),
+                "the image store was pruned while it was walked; the totals are the store as it stood at the end"
+            );
+        }
 
         Scan::Completed(ScanReport {
             parts: found.len(),

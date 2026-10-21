@@ -272,6 +272,7 @@ impl ClaimStoreObservable {
 
         let mut found: BTreeMap<(String, String), PathBuf> = BTreeMap::new();
         let mut skipped = 0usize;
+        let mut vanished = 0usize;
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
@@ -316,7 +317,10 @@ impl ClaimStoreObservable {
             // process is given. Measured here: 2.4 s and 17 MB peak for the
             // whole root, and the total agrees with `du -sb` to the byte.
             match footprint.measure_streaming() {
-                Ok(()) => readable += 1,
+                Ok(gone) => {
+                    readable += 1;
+                    vanished += gone;
+                }
                 Err(e) => tracing::warn!(
                     namespace = %key.0,
                     claim = %key.1,
@@ -332,6 +336,18 @@ impl ClaimStoreObservable {
         store.last_scan = Instant::now();
         drop(store);
         self.scans.fetch_add(1, Ordering::Relaxed);
+
+        // A claim whose directories were removed while it was walked is still a
+        // number, but it is the tree as it stood at the end of the walk: without
+        // this line the drop it shows is indistinguishable from a walk that
+        // stopped early.
+        if vanished > 0 {
+            tracing::warn!(
+                vanished,
+                dirs = found.len(),
+                "the storage root was pruned while it was walked; the totals are the tree as it stood at the end"
+            );
+        }
 
         Scan::Completed(ScanReport {
             dirs: found.len(),

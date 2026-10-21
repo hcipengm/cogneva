@@ -161,10 +161,10 @@ fn mark_aliases(files: &mut [FileEntry]) {
 ///
 /// A file whose identity the filesystem does not report is counted under each
 /// name, the same as there.
-pub fn dir_bytes_counted_once(dir: &Path, exclude: &[PathBuf]) -> io::Result<u64> {
+pub fn dir_bytes_counted_once(dir: &Path, exclude: &[PathBuf]) -> io::Result<CountedOnce> {
     let mut seen: HashSet<FileId> = HashSet::new();
     let mut bytes: u64 = 0;
-    walk(dir, 1, exclude, |entry| {
+    let vanished = walk(dir, 1, exclude, |entry| {
         if let Some(id) = entry.id {
             if !seen.insert(id) {
                 return;
@@ -172,7 +172,25 @@ pub fn dir_bytes_counted_once(dir: &Path, exclude: &[PathBuf]) -> io::Result<u64
         }
         bytes = bytes.saturating_add(entry.len);
     })?;
-    Ok(bytes)
+    Ok(CountedOnce { bytes, vanished })
+}
+
+/// A streamed total, with the count of entries that left the tree while it was
+/// being walked.
+///
+/// The count is part of the answer rather than a diagnostic beside it: an entry
+/// that vanished is not bytes the walk failed to see -- it is bytes the tree no
+/// longer holds -- so the total is right for the tree as it stood and short of
+/// the tree as it was when the walk began. A reader comparing this number with
+/// an earlier one needs to know which of the two it got, and a walk that reports
+/// only the total cannot tell them apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CountedOnce {
+    /// Apparent bytes of the files the walk counted.
+    pub bytes: u64,
+    /// Entries removed between being listed and being read. Their bytes are in
+    /// neither this total nor on the disk.
+    pub vanished: usize,
 }
 
 /// A layer whose files are all aliases of files counted elsewhere is reported
@@ -259,18 +277,57 @@ pub fn recently_written_totals(
     totals
 }
 
+/// An I/O error that keeps its kind and names the path it happened on.
+///
+/// The caller logs one line when a tree cannot be walked, and "permission
+/// denied" without a path names neither the file nor the remedy: the reading's
+/// own account of what it could not measure is the only thing a person has.
+fn annotate(e: io::Error, path: &Path) -> io::Error {
+    io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+}
+
 /// The one traversal both readings are built from.
+///
+/// Returns how many entries were listed and then found gone: a caller that
+/// publishes a total has to be able to say the tree moved while it was read.
 fn walk(
     dir: &Path,
     depth: usize,
     exclude: &[PathBuf],
     mut on_file: impl FnMut(FileEntry),
-) -> io::Result<()> {
+) -> io::Result<usize> {
+    let mut vanished = 0usize;
     let mut pending = vec![dir.to_path_buf()];
     while let Some(current) = pending.pop() {
         // Read whole and in name order: which name of a file comes first decides
         // which layer counts its bytes, and a directory listing is not ordered.
-        let mut children = std::fs::read_dir(&current)?.collect::<io::Result<Vec<_>>>()?;
+        let listing = match std::fs::read_dir(&current) {
+            Ok(listing) => listing,
+            // Gone between being listed and being read, rather than unreadable:
+            // every directory below the root was seen in its parent's listing,
+            // and a tree written while it is walked -- a container runtime's
+            // snapshot workspace, a build cache -- removes directories under
+            // the walk. Failing the whole tree over a directory that no longer
+            // exists reports a reading of nothing, and its bytes are not hidden
+            // by leaving them out: they are gone.
+            //
+            // The root is the exception, and it is why the caller can tell a
+            // missing tree from an empty one: what was asked for has to be
+            // there.
+            Err(e) if e.kind() == io::ErrorKind::NotFound && current.as_path() != dir => {
+                vanished += 1;
+                continue;
+            }
+            Err(e) => return Err(annotate(e, &current)),
+        };
+        let mut children = Vec::new();
+        for entry in listing {
+            match entry {
+                Ok(entry) => children.push(entry),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => vanished += 1,
+                Err(e) => return Err(annotate(e, &current)),
+            }
+        }
         children.sort_by_key(|entry| entry.file_name());
         for entry in children {
             let path = entry.path();
@@ -279,7 +336,16 @@ fn walk(
             }
             // Without following links: a symlink to a directory would otherwise
             // be descended into, and one to a file counted at its target's size.
-            let meta = entry.metadata()?;
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                // The same rule for one entry: it was removed after this
+                // directory was listed.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    vanished += 1;
+                    continue;
+                }
+                Err(e) => return Err(annotate(e, &path)),
+            };
             if meta.is_dir() {
                 pending.push(path);
             } else if meta.is_file() {
@@ -301,7 +367,7 @@ fn walk(
             }
         }
     }
-    Ok(())
+    Ok(vanished)
 }
 
 /// The file a directory entry names, where the filesystem reports it.
@@ -559,14 +625,64 @@ mod tests {
 
         let materialised = dir_size_bytes(root, &[]).unwrap();
         assert_eq!(materialised, 4096 + 8192, "the hardlink is one file");
-        assert_eq!(dir_bytes_counted_once(root, &[]).unwrap(), materialised);
+        let streamed = dir_bytes_counted_once(root, &[]).unwrap();
+        assert_eq!(streamed.bytes, materialised);
+        assert_eq!(
+            streamed.vanished, 0,
+            "nothing was removed, so nothing may be reported as removed"
+        );
 
         // The same exclusions, so a nested mount left out of one walk is left
         // out of both.
         let exclude = vec![root.join("snap")];
         assert_eq!(
-            dir_bytes_counted_once(root, &exclude).unwrap(),
+            dir_bytes_counted_once(root, &exclude).unwrap().bytes,
             dir_size_bytes(root, &exclude).unwrap()
+        );
+    }
+
+    /// A tree that is pruned while it is walked is measured, not failed, and
+    /// the entries that left are reported rather than swallowed: a container
+    /// runtime removes snapshots under its store while the store is walked, and
+    /// one removed directory must not turn a 60 GB reading into none.
+    #[test]
+    fn an_entry_removed_mid_walk_is_counted_as_gone_not_as_a_failure() {
+        let root = scratch("vanish");
+        let root = root.path();
+        // Read second, because the pending stack takes the last name listed
+        // first: the callback fires while the other directory is being walked.
+        write(&root.join("aaa/file"), 20);
+        write(&root.join("zzz/file"), 10);
+
+        let mut files = 0usize;
+        let vanished = walk(root, 1, &[], |_entry| {
+            files += 1;
+            let _ = fs::remove_dir_all(root.join("aaa"));
+        })
+        .unwrap();
+
+        assert_eq!(files, 1, "the surviving directory's file is the one read");
+        assert_eq!(vanished, 1, "the removed directory is reported as gone");
+    }
+
+    /// A failed walk names where it stopped: the caller reports one line per
+    /// tree, and a line saying only "permission denied" says neither which
+    /// directory to look at nor which of several reasons to expect.
+    #[test]
+    fn a_failed_walk_names_the_path_it_stopped_at() {
+        let root = scratch("annotate");
+        let root = root.path();
+        write(&root.join("d/f"), 1);
+        let err = annotate(
+            io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+            &root.join("d"),
+        );
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let text = err.to_string();
+        assert!(text.contains("denied"), "{text}");
+        assert!(
+            text.contains(&root.join("d").display().to_string()),
+            "{text}"
         );
     }
 

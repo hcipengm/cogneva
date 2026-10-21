@@ -318,10 +318,16 @@ impl ClaimFootprint {
     /// layers -- turns into more memory than such a process is given. Both read
     /// the same traversal with the same answers about symlinks, hardlinks and
     /// exclusions, so the number is the one a claim of the same size would get.
-    pub fn measure_streaming(&self) -> std::io::Result<()> {
-        let bytes = crate::fs_size::dir_bytes_counted_once(&self.dir, &self.exclude)?;
-        self.set_used_bytes(bytes);
-        Ok(())
+    ///
+    /// Returns how many entries left the tree while it was walked, so the caller
+    /// can publish that the number is the tree as it stood rather than as it was
+    /// when the walk began. A tree that is pruned under the walk is measured
+    /// rather than failed: a runtime removing one snapshot must not turn the
+    /// whole store's reading into none.
+    pub fn measure_streaming(&self) -> std::io::Result<usize> {
+        let counted = crate::fs_size::dir_bytes_counted_once(&self.dir, &self.exclude)?;
+        self.set_used_bytes(counted.bytes);
+        Ok(counted.vanished)
     }
 
     /// Walk on the blocking pool, so a large tree does not hold a runtime thread.
