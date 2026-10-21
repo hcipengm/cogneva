@@ -116,8 +116,8 @@ spec:
             failureThreshold: 6
             periodSeconds: 10
             timeoutSeconds: 10
-          # CPU 上限按突发定，不按均值：实测平均 0.077 核却有 0.83 的 cfs 周期被
-          # 限流，走查被拉长成好几倍墙钟时间，而墙钟正是启动预算在量的东西。
+          # CPU 上限按突发定，不按均值：200m 下平均只用 0.077 核却有 0.83 的 cfs
+          # 周期被限流，首拍被拖成 3m35s；给到 1 核后首拍 34.5s（同一棵树、同一进程）。
           resources:
             limits:
               cpu: "1"
