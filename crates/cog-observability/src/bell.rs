@@ -235,10 +235,13 @@ mod tests {
         }
     }
 
+    /// One counter write as the backend saw it: name, delta, labels.
+    type CounterWrite = (String, f64, std::collections::HashMap<String, String>);
+
     /// 只记计数器写入的读数面，供断言"写失败留了一格"。
     #[derive(Default)]
     struct Counters {
-        writes: std::sync::Mutex<Vec<(String, f64, std::collections::HashMap<String, String>)>>,
+        writes: std::sync::Mutex<Vec<CounterWrite>>,
     }
 
     #[async_trait::async_trait]
