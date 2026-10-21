@@ -715,19 +715,22 @@ impl CheckTree {
                 format!("`{scope}` is not a path this tree can hold"),
             );
         }
-        // A scope that is not in the tree is not a check that found nothing: the
-        // search never happened, and its empty result says nothing about the
-        // artifact. Distinguished from a real miss on purpose -- one is a drifted
-        // path, the other is the answer.
+        // A scope the tree does not have cannot hold the literal, and this check
+        // asks that it be held: absent is the whole answer, not a look that
+        // failed. Reading it as unsettleable instead costs the row every later
+        // pass -- a path that was renamed or deleted once keeps the check
+        // unasked for as long as no revision puts that exact path back, and for a
+        // path that moved it never does.
+        //
+        // The absence-check arm below keeps its unsettled reading, and the
+        // difference is the direction a drifted declaration moves the debt. Here
+        // a path that never existed pays nothing off and the row stays visible
+        // as work still owed; read with the answer flipped, it would mark a debt
+        // paid that nothing was ever searched for.
         if scoped {
             match self.has(snapshot.rev(), scope).await {
                 Ok(true) => {}
-                Ok(false) => {
-                    return CheckOutcome::unsettled(
-                        UnsettledReason::ScopeAbsentInRevision,
-                        format!("this revision has no `{scope}`, so the check cannot be run"),
-                    )
-                }
+                Ok(false) => return CheckOutcome::Absent,
                 Err(why) => return CheckOutcome::unsettled(UnsettledReason::GitFailed, why),
             }
         }
@@ -1753,6 +1756,43 @@ mod tests {
             tree.judge(&snapshot, &identity(GREP_KIND, scope, "ProjectKind"))
                 .await,
             CheckOutcome::Landed
+        );
+    }
+
+    /// The same two kinds over a path the tree no longer has, which is where
+    /// they stop being mirrors of one another.
+    ///
+    /// A check that asks for something to be present is answered by the tree not
+    /// having the path: the literal is not there. Left unsettled instead, the row
+    /// settles only if that exact path comes back, so a path that moved leaves it
+    /// re-asked forever and the retry window resolves nothing. The demand to be gone
+    /// keeps its unsettled reading over the same path, because there the answer
+    /// would be the debt paid, and a declaration whose path merely drifted would
+    /// have collected on a search nobody ran.
+    #[tokio::test]
+    async fn a_grep_over_a_path_the_tree_lost_is_owed_and_a_gone_check_is_left_unsettled() {
+        let dir = repo(&[("crates/x/src/lib.rs", "pub struct ProjectKind;\n")]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = fixture_snapshot(&tree).await;
+        let scope = "crates/x/src/gone.rs";
+        assert_eq!(
+            tree.judge(&snapshot, &identity(GREP_KIND, scope, "ProjectKind"))
+                .await,
+            CheckOutcome::Absent,
+            "a path the tree does not have holds nothing this check asks for"
+        );
+        let demand = tree
+            .judge(&snapshot, &identity(GONE_KIND, scope, "ProjectKind"))
+            .await;
+        assert_eq!(
+            demand.reason(),
+            Some(UnsettledReason::ScopeAbsentInRevision),
+            "{demand:?}"
+        );
+        assert_eq!(
+            demand.state(),
+            None,
+            "a debt must not be paid off by a search that never ran"
         );
     }
 
