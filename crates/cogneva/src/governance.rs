@@ -746,19 +746,91 @@ async fn assign(
     Ok(())
 }
 
-async fn import_faces(
+/// What one roster import did, cell by cell.
+///
+/// The counts describe the pass, not the graph: `updated` says how many rows
+/// the file moved, and `bindings_erased` names the faces that came out of the
+/// pass with no handover where they had one going in.
+pub struct ImportSummary {
+    pub rows: usize,
+    pub inserted: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+    pub ownership_kept: usize,
+    /// Faces bound by a handover before the pass and unbound after it.
+    pub bindings_erased: Vec<String>,
+}
+
+impl ImportSummary {
+    /// The one line a caller reads to learn what was written.
+    pub fn line(&self) -> String {
+        format!(
+            "imported {} rows: inserted={} updated={} unchanged={} ownership_kept={} \
+             bindings_erased={}",
+            self.rows,
+            self.inserted,
+            self.updated,
+            self.unchanged,
+            self.ownership_kept,
+            self.bindings_erased.len()
+        )
+    }
+}
+
+/// Which faces lost the handover that bound them across one pass.
+///
+/// A roster is rewritten by a clock, so the one fact it must never carry is an
+/// erasure: a face whose binding is empty after an import reads exactly like a
+/// face no handover ever reached, and nothing left on the row tells the two
+/// apart afterwards. The import keeps the cell from the row it found, so this
+/// count is zero; reading it every pass is what makes the next regression
+/// visible at the moment it happens instead of at the next drift verdict, which
+/// can only say the binding is missing now, never that it was there before.
+fn faces_that_lost_their_binding(before: &[Face], after: &[Face]) -> Vec<String> {
+    let was_bound: std::collections::HashMap<&str, bool> = before
+        .iter()
+        .map(|face| (face.face_id.as_str(), face.bound_by_handover_id.is_some()))
+        .collect();
+    let mut lost: Vec<String> = after
+        .iter()
+        .filter(|face| face.bound_by_handover_id.is_none())
+        .filter(|face| {
+            was_bound
+                .get(face.face_id.as_str())
+                .copied()
+                .unwrap_or(false)
+        })
+        .map(|face| face.face_id.clone())
+        .collect();
+    lost.sort();
+    lost
+}
+
+/// Put one roster's rows into the graph and report what the pass did.
+///
+/// Takes the text rather than a path so the same pass can be run against a
+/// caller that already holds the bytes, and so a test can seed the graph
+/// without a file.
+pub async fn import_faces_from_roster(
     store: &dyn GovernanceStore,
-    from: &Path,
+    text: &str,
     keep_ownership: bool,
-) -> Result<(), Box<dyn Error>> {
-    let text = std::fs::read_to_string(from)
-        .map_err(|e| format!("cannot read {}: {e}", from.display()))?;
-    let rows = parse_roster(&text)?;
+) -> Result<ImportSummary, Box<dyn Error>> {
+    let rows = parse_roster(text)?;
     let ownership = if keep_ownership {
         cog_core::ImportOwnership::HandoverOnly
     } else {
         cog_core::ImportOwnership::FromFile
     };
+    // Read before and after the writes: the erasure this counts is a transition
+    // between two states of the same row, and only the pass that made it can
+    // see both ends.
+    let before: Vec<Face> = store
+        .face_nodes()
+        .await?
+        .iter()
+        .filter_map(Face::from_task)
+        .collect();
     let mut inserted = 0;
     let mut updated = 0;
     let mut unchanged = 0;
@@ -777,11 +849,43 @@ async fn import_faces(
             }
         }
     }
-    println!(
-        "imported {} rows: inserted={inserted} updated={updated} unchanged={unchanged} \
-         ownership_kept={kept}",
-        rows.len()
-    );
+    let after: Vec<Face> = store
+        .face_nodes()
+        .await?
+        .iter()
+        .filter_map(Face::from_task)
+        .collect();
+    Ok(ImportSummary {
+        rows: rows.len(),
+        inserted,
+        updated,
+        unchanged,
+        ownership_kept: kept,
+        bindings_erased: faces_that_lost_their_binding(&before, &after),
+    })
+}
+
+async fn import_faces(
+    store: &dyn GovernanceStore,
+    from: &Path,
+    keep_ownership: bool,
+) -> Result<(), Box<dyn Error>> {
+    let text = std::fs::read_to_string(from)
+        .map_err(|e| format!("cannot read {}: {e}", from.display()))?;
+    let summary = import_faces_from_roster(store, &text, keep_ownership).await?;
+    println!("{}", summary.line());
+    // The line is printed before this refusal so a reader of the log sees the
+    // count it is about; the exit code is what makes it a failure rather than a
+    // number somebody has to notice.
+    if !summary.bindings_erased.is_empty() {
+        return Err(format!(
+            "this pass erased the handover binding of {} face(s): {}; an import may refresh a \
+             description, never take away the record of who moved the face",
+            summary.bindings_erased.len(),
+            summary.bindings_erased.join(", ")
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -926,6 +1030,64 @@ mod tests {
         assert!(
             !reason.contains("nobody") && !reason.contains("no one"),
             "理由不能读成「没人在岗」：{reason}"
+        );
+    }
+
+    fn face_bound(face_id: &str, binding: Option<&str>) -> Face {
+        Face {
+            face_id: face_id.to_string(),
+            owner_unit: Some("worker".into()),
+            bound_by_handover_id: binding.map(str::to_string),
+            spec: FaceSpec::first(face_id, FaceKind::Face),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_pass_that_takes_a_binding_away_names_the_face_it_took_it_from() {
+        let before = vec![face_bound("token", Some("handover:token:1"))];
+        let after = vec![face_bound("token", None)];
+        assert_eq!(
+            faces_that_lost_their_binding(&before, &after),
+            vec!["token".to_string()],
+            "a face bound before the pass and unbound after it is the one case this reading exists for"
+        );
+    }
+
+    /// The reverse control: without it, a reading that counted every unbound
+    /// face would pass the test above and report every face that never had a
+    /// handover as having lost one.
+    #[test]
+    fn a_face_that_was_never_bound_has_not_lost_one() {
+        let before = vec![face_bound("token", None)];
+        let after = vec![face_bound("token", None)];
+        assert!(faces_that_lost_their_binding(&before, &after).is_empty());
+    }
+
+    /// The other reverse control: the binding being there on both sides is what
+    /// an ordinary import does, and it must not be counted as an erasure just
+    /// because the pass wrote the row.
+    #[test]
+    fn a_binding_that_survived_the_pass_is_not_an_erasure() {
+        let before = vec![face_bound("token", Some("handover:token:1"))];
+        let after = vec![face_bound("token", Some("handover:token:2"))];
+        assert!(faces_that_lost_their_binding(&before, &after).is_empty());
+    }
+
+    #[test]
+    fn the_summary_line_carries_the_erasure_count_a_reader_greps_for() {
+        let summary = ImportSummary {
+            rows: 17,
+            inserted: 0,
+            updated: 3,
+            unchanged: 14,
+            ownership_kept: 0,
+            bindings_erased: Vec::new(),
+        };
+        assert!(
+            summary.line().contains("bindings_erased=0"),
+            "the line has to carry the count even when it is zero: a reader that has to tell \
+             'absent' from 'zero' cannot do it from a missing cell"
         );
     }
 }
