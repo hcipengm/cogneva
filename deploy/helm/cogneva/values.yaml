@@ -793,10 +793,24 @@ claimStore:
     # 常态是每 300s 一次 readdir+stat 的走查，其余时间空转；内存按目录项规模取，
     # 与 5G 卷的量级无关（走查不读文件内容）。
     #
-    # 上限是量出来的，不是撞出来的：只走完 content 那 13 GB 时这个容器的
-    # working set 已经 87Mi；整棵 60.5 GB（809k 文件，其中 38 万是 overlay 层之间的
-    # 硬链接）按边走边加的量法在裸进程里峰值 29 MB，两者相加给到 192Mi 留出余量。
-    # 早先 128Mi 时的 OOM 不是这个量法的成本——那是给每个文件留一条记录的旧量法。
+    # 192Mi 是按**进程自己**的量给的：只走完 content 那 13 GB 时 working set
+    # 已经 87Mi，整棵 60.5 GB（809k 文件）边走边加的峰值 29 MB，相加留余量。
+    # 那个数管的是 rss，而内核 OOM 动手看的是**整个 cgroup 的占用**——含走查
+    # 自己带出来的页缓存与 slab。2026-10-22 实测：这个容器 usage 191.2Mi 贴着
+    # 192Mi 的上限（99.7%），其中 rss 只有 41~63Mi，文件缓存 112~137Mi；它走的是
+    # 存储根 525k 文件加三个镜像库 809k 文件，这些元数据页全记在它这个 cgroup 上。
+    # 结果是 10-21 18:07/18:12 与 10-22 04:10 三次 OOM：内核日志里
+    # `constraint=CONSTRAINT_MEMCG`、anon-rss 只有 75~128Mi，由 tokio-rt-worker
+    # 在 GFP_NOFS 分配时触发——这种分配不能回收同一文件系统的缓存，于是缓存明明
+    # 可回收也照样 OOM。按 rss 算的规则与按 rss 算的配额同时看不见它（当时的
+    # container_memory_near_limit 读数是 0.21）。
+    #
+    # 代价落在读数面：这个进程一走，20 条 cogneva_data_volume_used_bytes 一起消失，
+    # 直到新 Pod 走完首拍才回来（实测断了 10~45 分钟），于是 claim_usage_unmeasured
+    # 与 claim_store_node_unreported 在一天里亮着六成时间。512Mi 是实测平台期
+    # （约 190Mi）再加两倍多余量，给首拍的短暂 slab 冲高留位置。判据：usage 不再
+    # 贴顶、OOMKilled 不再出现；若它涨到贴着 512Mi，说明占用是被上限压出来的而不是
+    # 树的规模，那时要换的是走查本身而不是这个数。
     #
     # CPU 上限按突发定，不按均值定。实测 200m 下这个容器平均只用 0.077 核，却有
     # 0.83 的 cfs 周期被限流：走查是 readdir+stat 的突发，一个 100ms 周期里的突发
@@ -809,7 +823,7 @@ claimStore:
       memory: 32Mi
     limits:
       cpu: "1"
-      memory: 192Mi
+      memory: 512Mi
 
 # 集群内镜像仓库：GitOps L1 金丝雀镜像秒级分发通道。
 # publisher（进化 Pod）把 overlay 镜像（cogneva 基镜像 + 新二进制）push 到

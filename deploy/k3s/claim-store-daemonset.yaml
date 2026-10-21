@@ -118,10 +118,16 @@ spec:
             timeoutSeconds: 10
           # CPU 上限按突发定，不按均值：200m 下平均只用 0.077 核却有 0.83 的 cfs
           # 周期被限流，首拍被拖成 3m35s；给到 1 核后首拍 34.5s（同一棵树、同一进程）。
+          #
+          # 内存上限按**整个 cgroup**给，不按进程的 rss 给。192Mi 时期实测 usage
+          # 191.2Mi 贴着顶（rss 只有 41~63Mi，另外 112~137Mi 是走查那 134 万文件
+          # 带出来的页缓存），随后在 GFP_NOFS 分配上被内核 OOM 杀掉三次；它一走
+          # 20 条卷用量序列一起消失，claim_usage_unmeasured 因此亮了半天的灯。
+          # 512Mi 是实测平台期加两倍多余量。
           resources:
             limits:
               cpu: "1"
-              memory: 192Mi
+              memory: 512Mi
             requests:
               cpu: 10m
               memory: 32Mi
