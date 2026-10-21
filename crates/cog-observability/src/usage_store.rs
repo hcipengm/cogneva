@@ -1022,6 +1022,46 @@ impl LlmUsageStore {
         Ok(row.get::<i64, _>("tokens").max(0) as u64)
     }
 
+    /// Tokens the whole ledger spent from `since_unix` onwards, in total and
+    /// per actor.
+    ///
+    /// Every row counts, not only `result = 'ok'` ones, and the difference from
+    /// [`Self::spent_since`] is the question, not an oversight. Pacing asks what
+    /// an upstream *served* out of a window's quota, and there only a completed
+    /// answer was served. A spend ceiling asks what was *sent*, and tokens the
+    /// upstream answered and then dropped — a stream that died after the first
+    /// frame, a call that came back an error carrying usage — were still
+    /// produced on our account. Under a ceiling the two rows that carry no
+    /// tokens at all are the refusal rows the gateway writes, so counting them
+    /// costs nothing and excluding them would be a filter whose only effect is
+    /// to under-report money already spent.
+    ///
+    /// Refusals land as rows with zero tokens, so a caller that only ever sees
+    /// refusals reads zero rather than an error — the honest sum.
+    pub async fn spend_by_actor_since(
+        &self,
+        since_unix: i64,
+    ) -> anyhow::Result<(u64, std::collections::BTreeMap<String, u64>)> {
+        let rows = sqlx::query(&format!(
+            "SELECT actor, COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT AS tokens
+               FROM {LEDGER_TABLE}
+              WHERE ts >= to_timestamp($1::DOUBLE PRECISION)
+              GROUP BY actor
+              ORDER BY actor"
+        ))
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_actor = std::collections::BTreeMap::new();
+        let mut total = 0u64;
+        for row in &rows {
+            let tokens = row.get::<i64, _>("tokens").max(0) as u64;
+            total = total.saturating_add(tokens);
+            by_actor.insert(row.get::<String, _>("actor"), tokens);
+        }
+        Ok((total, by_actor))
+    }
+
     /// Whether a job has already put anything on the wire under this identity.
     ///
     /// This is the only question that turns "a task is running" into a reading,

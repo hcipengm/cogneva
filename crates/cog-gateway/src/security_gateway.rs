@@ -194,6 +194,11 @@ pub struct SecurityGatewayConfig {
     /// 观测导出目标（Loki / ClickHouse / Alertmanager），走 `observability`
     /// 段 + `COGNEVA_LOKI_*` 等 env 覆盖；缺省全部关闭。
     pub observability: ObservabilityExportersConfig,
+    /// 声明的每日 token 上限（`COGNEVA_LLM_DAILY_TOKEN_BUDGET` 与
+    /// `COGNEVA_LLM_DAILY_TOKEN_BUDGET_ACTORS`）。缺省为空 = 没有声明上限，
+    /// 通道行为与加这个模块之前完全一致——上限是运营者声明的一个数，不是
+    /// 平台替部署猜的一个数。
+    pub spend_budget: crate::spend_budget::SpendBudget,
 }
 
 impl SecurityGatewayConfig {
@@ -277,6 +282,7 @@ impl SecurityGatewayConfig {
             pool_check_secs: env_u64("COGNEVA_LLM_POOL_CHECK_SECS", 30).max(5),
             database_url: token("COGNEVA_DATABASE_URL"),
             redis_url: token("COGNEVA_REDIS_URL"),
+            spend_budget: crate::spend_budget::SpendBudget::from_env(),
             // 配置文件缺失即默认全关，env 覆盖在 load() 内完成。
             observability: ObservabilityExportersConfig::load().unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "观测导出配置解析失败，按全部关闭处理");
@@ -1534,6 +1540,12 @@ pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
     cog_core::metric_names::LLM_USAGE_VERDICT_MEASURED,
     cog_core::metric_names::LLM_TOOL_CALLS_VERDICT_MEASURED,
     cog_core::metric_names::LLM_TEMPERATURE_VERDICT_MEASURED,
+    // 日预算的三条：上限、今天的花费、这份读数是什么时候量到的。它们都只在池
+    // 状态发布循环里写，写的是同一拍读出来的同一件事，所以与上面那族同一处置；
+    // 读它们的告警窗口因此必须长于写者心跳。
+    cog_core::metric_names::LLM_BUDGET_TOKENS,
+    cog_core::metric_names::LLM_BUDGET_SPENT_TOKENS,
+    cog_core::metric_names::LLM_BUDGET_MEASURED_AT_UNIX,
 ];
 
 /// 一次共享写的上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
@@ -1739,6 +1751,12 @@ struct AppState {
     measured_windows: Arc<
         std::sync::Mutex<std::collections::HashMap<String, crate::window_pace::MeasuredWindow>>,
     >,
+    /// 今天为止的用量，以及它是哪一拍的读数。
+    ///
+    /// 与配速同一处置：请求路读这一格，池状态发布循环每拍重算一次。理由是同一个
+    /// ——账上的求和只在"没有新调用落库"时不变，而这正是请求路自己会打破的；每来
+    /// 一次请求查一次账，等于用一次 PG 查询换一个必然过时的数。
+    spend_budget: Arc<std::sync::Mutex<crate::spend_budget::Reading>>,
     /// Footprint of the volumes this pod alone can measure (the git mirror).
     ///
     /// For a directory-backed volume the per-volume capacity the kubelet reports
@@ -2186,6 +2204,50 @@ fn paced_refusal_usage(
     }
 }
 
+/// 日预算拒绝在台账 `result` 列上的取值。
+///
+/// 与前两个拒绝值分开，因为三者的修法各不相同，而这个区别只在这一格上：熔断说
+/// "没有上游能接"，修法是补上游或等上游；配速说"这一窗摊到此刻还不够开一件
+/// 任务"，修法是等，而且等得越久越该等；预算说"我们自己声明的钱花完了"，修法
+/// 只有三条——等下一个 UTC 零点、抬声明、或者查出是谁花的。合成一格，读数面就
+/// 只能看到"被拒了"。
+pub const REFUSED_BY_BUDGET: &str = "refused_by_budget";
+
+/// 日预算拒绝的台账落点。与另外两种拒绝同形：一个上游都没试过，零用量是实情。
+fn budget_refusal_usage(
+    style: &str,
+    actor: &str,
+    origin: &str,
+    task: Option<&str>,
+    refusal: crate::spend_budget::BudgetRefusal,
+) -> LlmUsageRecord {
+    LlmUsageRecord {
+        upstream: POOLED_REFUSAL_UNNAMED.to_string(),
+        api_style: style.to_string(),
+        model: POOLED_REFUSAL_UNNAMED.to_string(),
+        result: REFUSED_BY_BUDGET.to_string(),
+        actor: actor.to_string(),
+        origin: origin.to_string(),
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cached: 0,
+        // 判定确实用到了一次估算，但这一格记的是"这次估算配对的那份真值"，
+        // 而这次调用没有真值——写成估算值，估算与真值的差就会被一次拒绝算成
+        // 一个巨大的缺口。判定用的三个数在响应体与指标面上，不在这一列。
+        estimated_input: None,
+        refusal_kind: None,
+        // 与前两种拒绝不同，这里的等待是一个数：下一个 UTC 零点。配速的等待
+        // 逐家各不相同（所以只留在 `pace` 里），熔断的等待是探测节拍；而预算
+        // 的等待对池里每一家都一样，是这一行能给读者的、最有用的一格。
+        retry_after_secs: Some(refusal.retry_after_secs),
+        task: task.map(str::to_string),
+        latency_ms: 0,
+        // 预算不是按窗口摊出来的判定，这一格留空：写上来会让"这一笔是配速算的"
+        // 变成一句对拒绝的介绍，而它对预算一行也不成立。
+        pace: None,
+    }
+}
+
 /// 这一拍拒的是谁、按哪个数拒的：`None` 表示候选里至少有一家还没被判拦。
 ///
 /// 判定与证据出自同一遍遍历，拒与不拒出自同一个 `Option`——分成两遍算，两边
@@ -2625,6 +2687,19 @@ pub const RANGE_READ_BASELINES: &[(&str, RangeReadBaseline)] = &[
                      相除：某一侧看不见的第一个增量，在一小时窗口的和里至多值一次调用，而两条都是 warning。\
                      缓存的那些格子（kind=cached）由 `llm_cached_tokens_exceed_input` 读，它的判词是\
                      「缓存数超过输入数」这种按构造不可能的事，方向不靠第一个增量。",
+        },
+    ),
+    (
+        cog_core::metric_names::LLM_BUDGET_REFUSALS_TOTAL.as_str(),
+        RangeReadBaseline::Exempt {
+            readers: &["llm_budget_refusals_happening"],
+            reason: "格子是 (scope, actor)，actor 与 llm_calls_total 同一个理由：那是调用方给的文本，\
+                     其中两族（agent: / self_review:）的后半截是本进程枚举不出来的配置角色名，种下去只会\
+                     发布没有调用能推动的序列，所以整族按未种处理。读者因此看不见的是「这一格在这一代进程里\
+                     的第一次拒绝」：它当刻以 1 出生，而 increase 读的是相邻两笔样本之差，第一笔读出来是零。\
+                     后果有界：同一格上再拒一次就落进窗口，而这条规则本身是 warning、读的是「有没有在被拒」\
+                     而不是一个精确速率。宁可少报一次首次拒绝，也不发布一格永远不动的序列——后者读起来是\
+                     「从没拒过」，比丢一次更糟。",
         },
     ),
 ];
@@ -3716,6 +3791,124 @@ async fn publish_window_pace_gauges(state: &AppState, reading: &WindowPaceReadin
     }
 }
 
+/// 一次账本求和的等待上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
+/// 池判定就不再续期，所以等一个不响应的 PG 必须有上限。
+const BUDGET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 重算"今天为止花了多少"，以及这一拍到底量到没有。
+///
+/// 失败时沿用上一拍那份成功的读数——只要它还是今天的——而不是掉回"没量到"。理由
+/// 是两侧代价不对称：留一份一拍的旧数最多少算一拍的花费，方向是更安全的；掉回没
+/// 量到则让上限在一次瞬时抖动之后整整一拍完全不起作用，而那一拍正好是最该拦的
+/// 那一拍。跨过 UTC 零点的那一次失败例外，昨天的和不能当成今天的——那会把刚重置
+/// 的额度读成已经花完。
+async fn refresh_spend_budget(
+    state: &AppState,
+    previous: crate::spend_budget::Reading,
+) -> crate::spend_budget::Reading {
+    let now_unix = chrono::Utc::now().timestamp();
+    let Some(store) = state.pool_obs.usage.clone() else {
+        return previous.carry_forward(now_unix);
+    };
+    let day_start = crate::spend_budget::day_start_unix(now_unix);
+    let read =
+        tokio::time::timeout(BUDGET_READ_TIMEOUT, store.spend_by_actor_since(day_start)).await;
+    match read {
+        Ok(Ok((total_tokens, actor_tokens))) => crate::spend_budget::Reading {
+            snapshot: Some(crate::spend_budget::SpendSnapshot {
+                day_start_unix: day_start,
+                total_tokens,
+                actor_tokens,
+            }),
+            measured_at_unix: Some(now_unix),
+        },
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                "LLM 日预算：读不出今天的用量，这一拍沿用上一次的读数"
+            );
+            previous.carry_forward(now_unix)
+        }
+        Err(_) => {
+            tracing::warn!("LLM 日预算：读今天用量的查询超时，这一拍沿用上一次的读数");
+            previous.carry_forward(now_unix)
+        }
+    }
+}
+
+/// 日预算这一族的三条 gauge，每一拍全写。
+///
+/// 没有声明上限时也写（上限写 0）：共享表渲染的是写者留下的最后一个值，一族序列
+/// 一旦停止写入就永远停在那一拍上，而那正好是"上限被撤掉之后判据还在按旧数开火"
+/// 的形状。0 在这一族里不是一个可能的上限——解析拒绝 0——所以 0 只读作"没有声明"。
+async fn publish_spend_budget_gauges(state: &AppState, reading: &crate::spend_budget::Reading) {
+    let now_unix = chrono::Utc::now().timestamp();
+    let budget = &state.config.spend_budget;
+    record_gauge(
+        state,
+        cog_core::metric_names::LLM_BUDGET_TOKENS,
+        budget.pool_tokens.unwrap_or(0) as f64,
+        &[],
+    )
+    .await;
+    // 没量到时写 0，与配速那一族的处置相同：0 本身读不出来，配着
+    // `llm_budget_measured_at_unix` 一起读才分得开"今天还没花"与"量不到"。
+    record_gauge(
+        state,
+        cog_core::metric_names::LLM_BUDGET_SPENT_TOKENS,
+        reading
+            .usable(now_unix)
+            .map(|s| s.total_tokens)
+            .unwrap_or(0) as f64,
+        &[],
+    )
+    .await;
+    record_gauge(
+        state,
+        cog_core::metric_names::LLM_BUDGET_MEASURED_AT_UNIX,
+        reading.measured_at_unix.unwrap_or(0) as f64,
+        &[],
+    )
+    .await;
+}
+
+/// 日预算的唯一出口：判定、计数与落账在同一次调用里。
+///
+/// 与 [`pooled_refusal`] 同一个理由：取到 `Some` 与写下那一行出自同一个判断，
+/// 调用点没有"判定为真而账没落"的中间态可走。计数也在这里，因为一行台账要等到
+/// 有人查库才看得见，而一个正在拒的网关应该在 `/metrics` 上自己说出来。
+async fn budget_refusal(
+    state: &AppState,
+    actor: &str,
+    style: &str,
+    origin: &str,
+    task: Option<&str>,
+    estimated_input: u64,
+) -> Option<crate::spend_budget::BudgetRefusal> {
+    let budget = &state.config.spend_budget;
+    if !budget.is_declared() {
+        return None;
+    }
+    let now_unix = chrono::Utc::now().timestamp();
+    let refusal = {
+        // 判定在锁内做完就放开：下面要 await，标准库的锁不许跨 await 持有。
+        let reading = state.spend_budget.lock().unwrap();
+        budget.judge(actor, estimated_input, reading.usable(now_unix), now_unix)?
+    };
+    record_counter_add(
+        state,
+        cog_core::metric_names::LLM_BUDGET_REFUSALS_TOTAL,
+        1.0,
+        &[("scope", refusal.scope.as_str()), ("actor", actor)],
+    )
+    .await;
+    land_usage_record(
+        state,
+        budget_refusal_usage(style, actor, origin, task, refusal),
+    );
+    Some(refusal)
+}
+
 /// 逐上游各算一份，池级那份只是把它们相加得到的报表：额度不是一份，能力也不是
 /// 一份，用一家的尺子关掉另一家，就是把"没量到"读成"没有"。
 async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> WindowPaceReading {
@@ -4209,6 +4402,15 @@ async fn refresh_pool_state(state: &AppState) {
         let pace = refresh_window_pace(state, &readings).await;
         publish_window_pace_gauges(state, &pace).await;
         *state.window_pace.lock().unwrap() = pace;
+    }
+
+    // 日预算与配速同一处置、同一拍：先算、再发、最后换掉请求路读的那一格。三条
+    // 顺序不能反——先换读数再发 gauge，观测面上就会有一段时间显示上一拍的数。
+    {
+        let previous = state.spend_budget.lock().unwrap().clone();
+        let reading = refresh_spend_budget(state, previous).await;
+        publish_spend_budget_gauges(state, &reading).await;
+        *state.spend_budget.lock().unwrap() = reading;
     }
 
     publish_pool_signal(state, down, bounds).await;
@@ -4840,6 +5042,65 @@ async fn stream_forward(
                 .to_string(),
             ))
             .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())));
+    }
+
+    // 日预算：我们自己声明的上限，与上游允不允许无关。位置在熔断之后、配速之前。
+    // 熔断先说，是因为池里一家都没有时该说的确实是"没有产能"——等一个窗口不会造
+    // 出上游。预算排在配速之前，是因为两者同时成立时真正约束调用方的是等的更久的
+    // 那一个：配速给的是几十秒的窗口，预算给的是到下一个 UTC 零点。反过来的话，
+    // 调用方会按一个根本不够的等待去重试。
+    //
+    // 交互调用不豁免：配速豁免交互是因为一次对话量级小、拦住它伤的是正在等的人，
+    // 而预算是一笔已经花掉的钱——按环境开豁免，上限就只在自动跑的那一族上成立。
+    if state.config.spend_budget.is_declared() {
+        let estimated_input = price_request(&String::from_utf8_lossy(&body));
+        if let Some(refusal) = budget_refusal(
+            &state,
+            &actor,
+            style,
+            &origin,
+            task.as_deref(),
+            estimated_input,
+        )
+        .await
+        {
+            tracing::warn!(
+                // 自称的那一格：429 同时是配速、是上游自己的限流、也是预算；
+                // 三者在状态码上同形，唯一分得开的是这一行。
+                refused_by_budget = true,
+                budget_scope = refusal.scope.as_str(),
+                budget_tokens = refusal.cap_tokens,
+                spent_tokens = refusal.spent_tokens,
+                estimated_input_tokens = refusal.estimated_input,
+                retry_after_secs = refusal.retry_after_secs,
+                "LLM 日预算：声明的上限已经用尽，快速失败 429"
+            );
+            let day_start = crate::spend_budget::day_start_unix(chrono::Utc::now().timestamp());
+            return Ok(axum::response::Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("retry-after", refusal.retry_after_secs.to_string())
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "error": "今天声明的 token 预算已经用尽",
+                        "refused_by_budget": true,
+                        // 哪一个上限拒的：池级与逐 actor 是两条不同的配置行，
+                        // 不写这一格，读者只能去猜该抬哪一个。
+                        "budget_scope": refusal.scope.as_str(),
+                        "budget_tokens": refusal.cap_tokens,
+                        "spent_tokens": refusal.spent_tokens,
+                        // 这次请求的输入侧我们量到的那一份。它没有真值可配对
+                        // （调用没发出去），所以它不是"用量"，只是判定用的数。
+                        "estimated_input_tokens": refusal.estimated_input,
+                        "retry_after_seconds": refusal.retry_after_secs,
+                        // 额度从这一刻重新开始计。与 retry_after 一起读：那个
+                        // 是"等多久"，这个是"这一天的账从哪一刻起算"。
+                        "budget_day_start_unix": day_start,
+                    })
+                    .to_string(),
+                ))
+                .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())));
+        }
     }
 
     // 窗口配速：额度还在，但按这一窗的长度摊到今天，剩下来的不够开一件新任务。
@@ -7329,6 +7590,9 @@ pub async fn run(
         pool_seeded: Arc::new(AtomicBool::new(false)),
         window_pace: Arc::new(std::sync::Mutex::new(WindowPaceReading::default())),
         measured_windows: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        spend_budget: Arc::new(std::sync::Mutex::new(
+            crate::spend_budget::Reading::default(),
+        )),
         volume_footprint,
         config: config.clone(),
     };
@@ -8122,6 +8386,8 @@ mod tests {
             database_url: None,
             redis_url: None,
             observability: ObservabilityExportersConfig::default(),
+            // No ceiling declared: the tests below that exercise it set one.
+            spend_budget: crate::spend_budget::SpendBudget::default(),
         }
     }
 
@@ -9042,6 +9308,123 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         // 任一上游恢复即解除熔断，真实请求立刻有机会试它。
         state.llm_health.note_success(&c);
         assert_eq!(state.pool_circuit_break(&all), None, "有上游可用即放行");
+    }
+
+    /// 日预算拒绝那一行的形状：零用量、无名上游、自带等待，且不许读成上游拒的。
+    ///
+    /// 与另外两种拒绝逐格对齐，因为它落在同一张表上，任何一格写歪都会让按
+    /// `result` 分组或者按上游分组的读者把一次自限额读成一次上游事件。
+    #[tokio::test]
+    async fn a_budget_refusal_is_one_ledger_row_that_names_its_ceiling() {
+        let refusal = crate::spend_budget::BudgetRefusal {
+            scope: crate::spend_budget::BudgetScope::Pool,
+            cap_tokens: 1_000,
+            spent_tokens: 1_200,
+            estimated_input: 42,
+            retry_after_secs: 3_600,
+        };
+        let row = budget_refusal_usage("openai", "ralph", "resident_worker", Some("t-1"), refusal);
+        assert_eq!(row.result, REFUSED_BY_BUDGET);
+        assert_ne!(
+            row.result, "error",
+            "记成 error 会让读者去查上游，而要查的是我们自己声明的那个数"
+        );
+        assert_eq!(
+            (row.tokens_input, row.tokens_output, row.tokens_cached),
+            (0, 0, 0),
+            "一个上游都没发出去，用量只能是零"
+        );
+        assert_eq!(
+            (row.upstream.as_str(), row.model.as_str()),
+            (POOLED_REFUSAL_UNNAMED, POOLED_REFUSAL_UNNAMED),
+            "上限是整个池（或一个 actor）的判定，挂到某个上游名下会读成「那一家拒了」"
+        );
+        assert_eq!(row.actor, "ralph");
+        assert_eq!(row.origin, "resident_worker");
+        assert_eq!(row.task.as_deref(), Some("t-1"));
+        assert_eq!(
+            row.retry_after_secs,
+            Some(3_600),
+            "预算的等待是一个确定的数——到下一个 UTC 零点，这一格必须带上"
+        );
+        assert!(
+            row.estimated_input.is_none(),
+            "这一列记的是与真值配对的那份估算；拒绝没有真值，写上来会让估算与真值的差变成一次假缺口"
+        );
+        assert!(row.pace.is_none(), "预算不是按窗口摊出来的判定，pace 留空");
+    }
+
+    /// 撞线的调用要在真正的入口上被拒，并且池里的上游一次都不被试。
+    ///
+    /// 判据走 `chat_completions_passthrough` 而不是只测判定函数：内部判对了而请求路
+    /// 没接上，是那种所有单元测试都绿、上限却一次也没拦过的修复。两侧都要断：声明了
+    /// 上限且今天已花完时必须 429（且响应体点名是哪一条上限），未声明上限时同一个
+    /// 请求必须照常到上游。
+    #[tokio::test]
+    async fn a_call_over_the_declared_budget_is_refused_before_any_upstream() {
+        let ok = spawn_stub_upstream(200, r#"{"choices":[],"usage":{"total_tokens":1}}"#).await;
+
+        // 没有声明上限：这条路上一切照旧。
+        let state = test_state(vec![stub_upstream(&ok, "m1")]);
+        let resp = chat_completions_passthrough(State(state.clone()), budget_request("ralph"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "没声明上限的部署不许被这个模块改变行为");
+
+        // 声明了上限，今天已经花到线：调用被拒，且响应体说得清是哪一条。
+        let mut state = test_state(vec![stub_upstream(&ok, "m1")]);
+        state.config.spend_budget =
+            crate::spend_budget::SpendBudget::parse(Some("1000"), None).unwrap();
+        let now = Utc::now().timestamp();
+        *state.spend_budget.lock().unwrap() = crate::spend_budget::Reading {
+            snapshot: Some(crate::spend_budget::SpendSnapshot {
+                day_start_unix: crate::spend_budget::day_start_unix(now),
+                total_tokens: 1_000,
+                actor_tokens: Default::default(),
+            }),
+            measured_at_unix: Some(now),
+        };
+        let resp = chat_completions_passthrough(State(state.clone()), budget_request("ralph"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers().contains_key("retry-after"),
+            "拒绝必须告诉调用方等多久，否则它只能立刻重试"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["refused_by_budget"], true, "{body}");
+        assert_eq!(body["budget_scope"], "pool", "{body}");
+        assert_eq!(body["budget_tokens"], 1_000, "{body}");
+        assert_eq!(body["spent_tokens"], 1_000, "{body}");
+        assert!(
+            body["estimated_input_tokens"].as_u64().unwrap() > 0,
+            "判定用的输入侧估算必须出去，否则读者不知道这次是差多少撞的线: {body}"
+        );
+        // 计数落在指标面上，且两个标签都在：只有 scope 没有 actor 时，读者知道
+        // 上限在拒，却点不出被饿死的是谁。
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("llm_budget_refusals_total")
+                    && l.contains("actor=\"ralph\"")
+                    && l.contains("scope=\"pool\"")
+                    && l.trim_end().ends_with('1')),
+            "撞线拒绝必须自己计数并带上身份:\n{text}"
+        );
+    }
+
+    fn budget_request(actor: &str) -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .method("POST")
+            .header(cog_core::LLM_ACTOR_HEADER, actor)
+            .body(axum::body::Body::from(
+                r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap()
     }
 
     /// 池级熔断拒绝必须在台账上留下一行，且这一行不能读成一次上游失败。
@@ -11666,6 +12049,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             pool_seeded: Arc::new(AtomicBool::new(true)),
             window_pace: Arc::new(std::sync::Mutex::new(WindowPaceReading::default())),
             measured_windows: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            spend_budget: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::spend_budget::Reading::default(),
+            )),
             volume_footprint: Vec::new(),
             config: SecurityGatewayConfig {
                 llm_upstreams: upstreams,

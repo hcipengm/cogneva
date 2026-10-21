@@ -207,6 +207,17 @@ pub const METRIC_DERIVATIONS: &[(&str, MetricDerivation)] = &[
     // reporters. `max` is the only aggregate that keeps the number honest.
     ("cogneva_task_unowned_rows", MetricDerivation::Store),
     ("llm_upstream_healthy", MetricDerivation::Store),
+    // The declared ceiling and the spend measured against it are written through
+    // the same durable funnel as `llm_upstream_healthy`: every process renders
+    // the store's newest row, so a `sum` over the copies would count the same
+    // fact once per process. `max` is the aggregate that keeps the number.
+    ("llm_budget_tokens", MetricDerivation::Store),
+    ("llm_budget_spent_tokens", MetricDerivation::Store),
+    ("llm_budget_measured_at_unix", MetricDerivation::Store),
+    // Refusals are counted in the gateway's own process from its own decisions,
+    // so a second process would report its own refusals rather than a copy of
+    // the first: adding them is the total.
+    ("llm_budget_refusals_total", MetricDerivation::Process),
     (
         "cogneva_evolution_learning_recurrence_at_threshold_total",
         MetricDerivation::Process,

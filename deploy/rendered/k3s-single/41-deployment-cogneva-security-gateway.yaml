@@ -33,7 +33,7 @@ spec:
       annotations:
         # 本 Pod 经 envFrom 取 cogneva-config。env 只在进程启动时读一次，所以
         # 只改配置的那次升级必须换掉这个模板，否则改完地址也不会生效。
-        checksum/config: 76e7a52e644617246f0ed9fa7b07458a60ae5bfcfbbf21db6654d49794ca51c1
+        checksum/config: 10c3af6caccc264d350292d3852571a9a3b63a9adce48bb6123d0c21eca0675e
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: security-gateway
@@ -92,6 +92,14 @@ spec:
                   name: cogneva-secrets-oob
                   key: llm-pool-min-healthy
                   optional: true
+            # 每日 token 预算（自己允许自己花多少，与上面那条"上游愿意给多少"
+            # 是两回事）。非凭证，所以走 values 渲染成普通 env 而不是 Secret。
+            # 空串 = 没声明上限 = 行为与从前一致：网关把它当"未声明"，而不是把
+            # 空串解析成某个数，所以这条键始终存在也不改变默认行为。
+            - name: COGNEVA_LLM_DAILY_TOKEN_BUDGET
+              value: ""
+            - name: COGNEVA_LLM_DAILY_TOKEN_BUDGET_ACTORS
+              value: ""
             - name: COGNEVA_GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:

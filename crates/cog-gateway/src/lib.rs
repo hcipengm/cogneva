@@ -63,6 +63,7 @@ pub mod secret_layout;
 pub mod secret_write;
 pub mod security_gateway;
 pub mod sessions;
+pub mod spend_budget;
 pub mod state;
 pub mod state_builder;
 pub mod supervisor_control;
