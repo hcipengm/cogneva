@@ -617,15 +617,16 @@ pub async fn register_handler(
 /// the demo switch (`gateway.demo_login_enabled`). Both issue an admin token;
 /// with neither configured the endpoint fails closed.
 async fn login_without_user_store(state: &GatewayState, payload: &LoginPayload) -> Response {
-    let admin_password = std::env::var("COGNEVA_ADMIN_PASSWORD").unwrap_or_default();
+    let admin_password = bootstrap_admin_password();
     let demo_enabled = state
         .config
         .read()
         .map(|c| c.demo_login_enabled)
         .unwrap_or(false);
 
-    let authorized = if !admin_password.is_empty() {
-        payload.username == "admin" && payload.password == admin_password
+    let authorized = if let Some(expected) = admin_password {
+        payload.username == "admin"
+            && password::constant_time_eq(payload.password.as_bytes(), expected.as_bytes())
     } else if demo_enabled {
         warn!(
             "demo login enabled; granting admin token to '{}'",
@@ -647,12 +648,18 @@ async fn login_without_user_store(state: &GatewayState, payload: &LoginPayload) 
         return AuthError::InvalidCredentials.into_response();
     }
 
+    issue_bootstrap_admin(state, &payload.username).await
+}
+
+/// 引导管理员的令牌签发：身份是 `Uuid::nil()`、不属于任何用户行。
+/// 有用户库与无用户库两条入口共用它，差别只在「谁被允许走到这里」。
+async fn issue_bootstrap_admin(state: &GatewayState, username: &str) -> Response {
     let admin_user = User {
         id: Uuid::nil(),
         phone: None,
         email: None,
-        username: payload.username.clone(),
-        display_name: Some(payload.username.clone()),
+        username: username.to_string(),
+        display_name: Some(username.to_string()),
         avatar_url: None,
         status: UserStatus::Active,
         user_type: UserType::Admin,
@@ -671,7 +678,7 @@ async fn login_without_user_store(state: &GatewayState, payload: &LoginPayload) 
         Ok(t) => t,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    info!("Bootstrap login (no user store): {}", payload.username);
+    info!("Bootstrap login: {}", username);
     (
         StatusCode::OK,
         Json(AuthResponse {
@@ -684,6 +691,14 @@ async fn login_without_user_store(state: &GatewayState, payload: &LoginPayload) 
         }),
     )
         .into_response()
+}
+
+/// 这个部署有没有配引导管理员口令。装机时随机生成、只从 Secret 注入；
+/// 仓库与 values 里永远为空，所以「没配」是常态，「配了」才是有人开了这扇门。
+fn bootstrap_admin_password() -> Option<String> {
+    std::env::var("COGNEVA_ADMIN_PASSWORD")
+        .ok()
+        .filter(|p| !p.is_empty())
 }
 
 pub async fn login_handler(
@@ -707,6 +722,18 @@ pub async fn login_handler(
                 })),
             )
                 .into_response();
+        }
+    }
+
+    // 有用户库时的引导管理员：正式部署里用户库一直在，而首个管理员除了外部平台
+    // 账号（要外网、要 OAuth 应用）没有本地入口——装完登录不进去。口令由安装脚本
+    // 随机写进 Secret，只有部署方能读到；口令不对时**照样往下走用户库**，
+    // 这样一个真名叫 `admin` 的本地账号仍能用自己的哈希登录，不会被人一配环境变量就顶掉。
+    if let Some(expected) = bootstrap_admin_password() {
+        if payload.username == "admin"
+            && password::constant_time_eq(payload.password.as_bytes(), expected.as_bytes())
+        {
+            return issue_bootstrap_admin(&state, "admin").await;
         }
     }
 

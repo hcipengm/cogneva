@@ -375,6 +375,10 @@ ensure_random pg-password
 ensure_random redis-password
 ensure_random webhook-internal
 ensure_random jwt-secret
+# 引导管理员（admin）的登录口令：正式部署里有用户库，但没有本地管理员——
+# 不生成这一条，客户装完只能走外部平台账号（要外网、要 OAuth 应用），本地登不进去。
+# 值由部署方从 Secret 读出，不在任何清单或日志里出现。
+ensure_random admin-password
 # 进化 Pod 的签名密钥：与主应用刻意不同源（它持有部署器，不能并入用户会话
 # 的鉴权域），但也必须跨重启稳定——它每推进一个 rev 就被重建一次，缺这条
 # 就等于鉴权域每轮换签。
