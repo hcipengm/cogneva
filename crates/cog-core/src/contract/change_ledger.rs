@@ -879,6 +879,33 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// dispatch stood still and how often, which an upserted row could not answer.
     async fn record_dispatch_state(&self, state: &DispatchState) -> SFResult<()>;
 
+    /// How many declarations have been answered, and how many are still owed.
+    ///
+    /// The demand side of the loop the account's own census is the supply side
+    /// of. `census` answers "what is still untrue of the tree"; this answers
+    /// "what did the documents ask for, and how much of it did the tree end up
+    /// holding". Until it existed the intake could only say what had been *asked*
+    /// -- a declaration was folded into the account and never spoken of again --
+    /// so the one question a reader of a change process actually asks ("did what
+    /// we said we would do get done") had no reading anywhere in the platform.
+    /// The host-side projection was left to answer it, which is the wrong side
+    /// of the boundary: the readers who need the number are the ones watching the
+    /// platform.
+    ///
+    /// Counted by declaration rather than by change, because the intake is keyed
+    /// per document: two documents asking for the same change are two demands,
+    /// and a change that lands answers both. Counting changes here would report
+    /// the same fact twice and lose the second document.
+    ///
+    /// `None` means this store cannot answer -- an implementation with no intake,
+    /// or a deployment whose migration has not run. It is not zero: a count that
+    /// was never taken and a count of nothing read the same on a dashboard, and
+    /// the whole point of the cells published from this is that "nobody asked"
+    /// and "nobody could look" stay apart.
+    async fn demand_closure(&self) -> SFResult<Option<DemandClosure>> {
+        Ok(None)
+    }
+
     /// Every write window the account holds, whatever state it is in.
     ///
     /// All of them rather than the live ones: a query filtered by "approved and
@@ -906,6 +933,20 @@ pub trait ChangeLedgerStore: Send + Sync {
 /// every delivered change as undelivered, which is exactly the reading the
 /// trailer exists to make possible.
 pub const LANDING_TRAILER: &str = "Landing change ";
+
+/// How much of what the documents asked for the tree has ended up holding.
+///
+/// Both halves, always: a reader given only the satisfied count cannot tell a
+/// demand set that is fully answered from one that was never asked, and the
+/// comparison across two ticks is what makes the loop's closure visible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DemandClosure {
+    /// Declarations whose change the account holds as landed.
+    pub satisfied: u64,
+    /// Declarations whose change is still untrue of the tree, or which no
+    /// measurement has reached at all.
+    pub owed: u64,
+}
 
 /// What one dispatch pass did, and the closed reason it did only that much.
 ///

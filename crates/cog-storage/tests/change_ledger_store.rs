@@ -1144,12 +1144,97 @@ async fn the_reason_of_a_transition_is_recorded_with_it() {
     cleanup(&pool, &marker).await;
 }
 
+/// A demand is answered only by a landing, and a declaration whose change was
+/// never measured counts as owed rather than vanishing.
+///
+/// This is the writeback the loop was missing: the intake is where a document
+/// says what it wants, and until the closure was read the account had no way to
+/// say which of those demands the tree ended up holding. The assertions are
+/// stated as "at least" on the global counts because the other probes in this
+/// file share the database and only ever add declarations -- a strict equality
+/// would be a test that fails when a neighbour runs, which teaches a reader to
+/// rerun rather than to look.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_demand_is_satisfied_by_a_landing_and_owed_until_one_is_measured() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "demand");
+    let doc = format!("{marker}.md");
+    let before = store
+        .demand_closure()
+        .await
+        .expect("read the closure")
+        .expect("a Postgres store answers the closure");
+
+    store
+        .declare(&[ChangeReading {
+            identity: id.clone(),
+            title: Some("a change the probe declares".into()),
+            assertion: None,
+            source: ChangeSource {
+                doc: doc.clone(),
+                verdict: None,
+                priority: ChangePriority::Unstated,
+            },
+        }])
+        .await
+        .expect("queue the declaration");
+    store
+        .fold_declarations(10_000, Some("probe-rev-declare"))
+        .await
+        .expect("fold the declaration in");
+
+    let declared = store
+        .demand_closure()
+        .await
+        .expect("read the closure")
+        .expect("a Postgres store answers the closure");
+    assert!(
+        declared.owed > before.owed,
+        "a declared change that has never been measured is owed, not absent from both halves: \
+         before {before:?}, after {declared:?}"
+    );
+    assert_eq!(
+        declared.satisfied, before.satisfied,
+        "declaring a change does not satisfy it -- only a measurement of the tree can"
+    );
+
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(id.clone(), ChangeState::Landed)
+                .at_revision("probe-rev-delivered"),
+        )
+        .await
+        .expect("land the change");
+
+    let landed = store
+        .demand_closure()
+        .await
+        .expect("read the closure")
+        .expect("a Postgres store answers the closure");
+    assert!(
+        landed.satisfied > declared.satisfied,
+        "the landing is what answers the demand: before {declared:?}, after {landed:?}"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
 async fn cleanup(pool: &PgPool, marker: &str) {
     sqlx::query("DELETE FROM change_ledger WHERE scope LIKE $1")
         .bind(format!("{marker}/%"))
         .execute(pool)
         .await
         .expect("clean up the probe rows");
+    // The declarations this run queued, which are also the demand side of the
+    // account: a row left behind is not inert -- it keeps counting as a demand
+    // the closure reports, so a probe that skipped this would make the next
+    // run's closure read higher for a reason nobody could find in that run.
+    sqlx::query("DELETE FROM change_ledger_declared WHERE scope LIKE $1")
+        .bind(format!("{marker}/%"))
+        .execute(pool)
+        .await
+        .expect("clean up the probe declarations");
     // The intake is left as it was too: a queued retirement names the same
     // marker, and a row left behind would be folded by a later run's pass.
     sqlx::query("DELETE FROM change_ledger_retired WHERE scope LIKE $1")

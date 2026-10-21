@@ -16,8 +16,8 @@ use sqlx::{PgPool, Row};
 
 use cog_core::{
     ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangePriority,
-    ChangeReading, ChangeReopen, ChangeSource, ChangeState, DispatchState, RetireReason, SFError,
-    SFResult, WriteWindow,
+    ChangeReading, ChangeReopen, ChangeSource, ChangeState, DemandClosure, DispatchState,
+    RetireReason, SFError, SFResult, WriteWindow,
 };
 
 /// Every read returns these, in one place so no two readers can come back with
@@ -356,6 +356,21 @@ WITH prior AS (
      WHERE prior.before IS DISTINCT FROM applied.state
 )
 SELECT 1";
+
+/// Count the demands the tree has answered against the ones still owed.
+///
+/// One declaration per row of the intake, matched to the account on the identity
+/// it names. `LEFT JOIN` and `IS DISTINCT FROM 'landed'` rather than `l.state <>
+/// 'landed'`: a declaration whose change never entered the account has no state,
+/// and a plain comparison against NULL matches nothing -- which would file the
+/// most-owed demand there is as neither owed nor satisfied and quietly lose it
+/// from both halves of the reading.
+const DEMAND_CLOSURE_SQL: &str = "\
+SELECT count(*) FILTER (WHERE l.state = 'landed') AS satisfied, \
+       count(*) FILTER (WHERE l.state IS DISTINCT FROM 'landed') AS owed \
+  FROM change_ledger_declared d \
+  LEFT JOIN change_ledger l \
+    ON (l.kind, l.scope, l.literal) = (d.kind, d.scope, d.literal)";
 
 /// Append one reopen: a row the account had as done whose check no longer holds.
 ///
@@ -983,6 +998,35 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 (state, n)
             })
             .collect())
+    }
+
+    async fn demand_closure(&self) -> SFResult<Option<DemandClosure>> {
+        // A join rather than a column on the intake. The answer is a property of
+        // the pair -- what a document asked for, and what the account currently
+        // holds for that identity -- and a column would be a second copy of the
+        // account's state, written by whoever last measured and stale for every
+        // declaration folded before it. That copy would be wrong in the one
+        // direction that matters: a change declared after it was already landed
+        // would enter as owed and stay owed without anything ever being wrong
+        // enough to notice.
+        //
+        // The outer join is what keeps a declaration whose change never entered
+        // the account counted as owed instead of dropped: it is a demand nobody
+        // has measured yet, which is the most owed a demand can be.
+        let row = sqlx::query(DEMAND_CLOSURE_SQL)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("read demand closure: {e}")))?;
+        let satisfied: i64 = row
+            .try_get("satisfied")
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        let owed: i64 = row
+            .try_get("owed")
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        Ok(Some(DemandClosure {
+            satisfied: satisfied.max(0) as u64,
+            owed: owed.max(0) as u64,
+        }))
     }
 
     async fn record_dispatch_state(&self, state: &DispatchState) -> SFResult<()> {

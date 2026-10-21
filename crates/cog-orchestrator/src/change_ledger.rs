@@ -114,11 +114,11 @@ use tracing::{debug, info, warn};
 
 use cog_core::{
     metric_names, ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement,
-    ChangePriority, ChangeReading, ChangeReopen, ChangeSource, ChangeState, DispatchDecision,
-    DispatchState, LiveRevision, LiveRevisionSource, LlmPoolStatus, LlmWindowPace, MetricsBackend,
-    OrchestratorControl, OwnerLeaseBroker, PoolReading, PrincipleCheckKind, PrincipleLedgerStore,
-    PrincipleRow, RetireReason, SFResult, ShutdownSignal, StateBackend, Task, TaskStatus, TaskType,
-    WriteWindow,
+    ChangePriority, ChangeReading, ChangeReopen, ChangeSource, ChangeState, DemandClosure,
+    DispatchDecision, DispatchState, LiveRevision, LiveRevisionSource, LlmPoolStatus,
+    LlmWindowPace, MetricsBackend, OrchestratorControl, OwnerLeaseBroker, PoolReading,
+    PrincipleCheckKind, PrincipleLedgerStore, PrincipleRow, RetireReason, SFResult, ShutdownSignal,
+    StateBackend, Task, TaskStatus, TaskType, WriteWindow,
 };
 
 use cog_core::contract::llm::UpstreamFailure;
@@ -3087,6 +3087,23 @@ enum DispatchReadout {
     StatePending,
     StatePartial,
     StateUndecided,
+    /// The demand side of the same loop: how many of the declarations the
+    /// intake holds have been answered by a landing, and how many are still
+    /// owed.
+    ///
+    /// Every other cell here answers "what does the account still owe". These
+    /// two are the only place the platform says whether the work it was asked
+    /// for was actually done, and they are read from the intake joined to the
+    /// account rather than from this pass's slice: a demand is answered by a
+    /// measurement that may have happened many passes ago, on a row this pass
+    /// never looked at.
+    ///
+    /// They are cells of this metric because they are the closure of the same
+    /// set: `state_pending` falling while `demand_satisfied` does not move is
+    /// the shape of a ledger that is emptying itself by retiring rows, which is
+    /// the reading these two exist to make visible.
+    DemandSatisfied,
+    DemandOwed,
 }
 
 impl DispatchReadout {
@@ -3109,6 +3126,8 @@ impl DispatchReadout {
         DispatchReadout::StatePending,
         DispatchReadout::StatePartial,
         DispatchReadout::StateUndecided,
+        DispatchReadout::DemandSatisfied,
+        DispatchReadout::DemandOwed,
     ];
 
     /// The band a count cell is about, for the five that are about one.
@@ -3162,6 +3181,8 @@ impl DispatchReadout {
             Self::StatePending => "state_pending",
             Self::StatePartial => "state_partial",
             Self::StateUndecided => "state_undecided",
+            Self::DemandSatisfied => "demand_satisfied",
+            Self::DemandOwed => "demand_owed",
         }
     }
 }
@@ -3191,6 +3212,7 @@ async fn publish_dispatch_rows(
     state: &DispatchState,
     owed: Option<&[(ChangePriority, usize)]>,
     census: Option<&[(ChangeState, u64)]>,
+    demand: Option<DemandClosure>,
 ) {
     let Some(metrics) = metrics else {
         return;
@@ -3206,6 +3228,21 @@ async fn publish_dispatch_rows(
             DispatchReadout::Rearmed => state.rearmed,
             DispatchReadout::Unmeasurable => state.unmeasurable,
             DispatchReadout::LedgerPending => state.pending + state.unmeasurable,
+            // Both cells or neither. A store that cannot answer publishes
+            // nothing for either, because a satisfied count without the owed
+            // one cannot be read: the pair is the reading, and half of it would
+            // let a dashboard show demands being answered while the unpaid
+            // remainder it is to be judged against is missing.
+            DispatchReadout::DemandSatisfied | DispatchReadout::DemandOwed => {
+                let Some(closure) = demand else {
+                    continue;
+                };
+                if matches!(readout, DispatchReadout::DemandSatisfied) {
+                    closure.satisfied
+                } else {
+                    closure.owed
+                }
+            }
             // A band cell is written only when this pass managed to count the
             // owed set. Skipped rather than zeroed: a zero says the urgent work
             // is done, which is the one wrong answer, and a cell left at its
@@ -3639,7 +3676,24 @@ async fn record_dispatch_state(
     // Published from the same struct the row was built from, and after it: the
     // account is the record and the reading face is a view of it, so the two
     // cannot say different things about one pass.
-    publish_dispatch_rows(metrics, &state, owed.as_deref(), census.as_deref()).await;
+    // The demand side, read here for the same reason the census is: it is a
+    // property of the account as of this pass, not of the slice this pass handed
+    // out. `None` covers both "this store cannot answer" and "the read failed",
+    // and both publish nothing rather than a zero -- a demand count of zero and
+    // a demand count nobody took read identically on the panel, and it is the
+    // second that a failing join produces.
+    let demand = match store.demand_closure().await {
+        Ok(closure) => closure,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the demand closure could not be read, so this pass publishes \
+                 no demand cell"
+            );
+            None
+        }
+    };
+    publish_dispatch_rows(metrics, &state, owed.as_deref(), census.as_deref(), demand).await;
     publish_dispatch_verdict(metrics, &state).await;
 }
 
@@ -7211,7 +7265,22 @@ mod tests {
             (ChangeState::Landed, 900),
             (ChangeState::Retired, 40),
         ];
-        publish_dispatch_rows(Some(&metrics), &state, Some(&owed), Some(&census)).await;
+        // The demand side: what the documents asked for, and how much of it the
+        // account holds as done. A pair, and the test carries a non-trivial pair
+        // because a cell that only ever reads zero cannot tell a reading from an
+        // absent one.
+        let demand = DemandClosure {
+            satisfied: 41,
+            owed: 2085,
+        };
+        publish_dispatch_rows(
+            Some(&metrics),
+            &state,
+            Some(&owed),
+            Some(&census),
+            Some(demand),
+        )
+        .await;
         publish_dispatch_verdict(Some(&metrics), &state).await;
         publish_handover_readback(Some(&metrics), &readback).await;
 
@@ -7287,6 +7356,12 @@ mod tests {
         // halves rather than recomputed from the rows, so the face's number and
         // the pass's own split cannot disagree.
         assert_eq!(published["change_ledger_pending"], 148.0);
+        // The demand pair, and the reason both cells are published together:
+        // 41 answered against 2085 still owed is a loop that closes slowly, and
+        // the satisfied count alone would read exactly like a loop that closed
+        // every demand it was ever given.
+        assert_eq!(published["demand_satisfied"], 41.0);
+        assert_eq!(published["demand_owed"], 2085.0);
         // The band split, and the relation that makes it a reading rather than
         // five numbers: the bands partition the owed set, so they have to add up
         // to the state cells' total. A band that stopped being published, or a
@@ -7416,7 +7491,7 @@ mod tests {
             window_pace: None,
         };
         let metrics: Arc<dyn MetricsBackend> = Arc::new(cog_storage::MemoryMetricsBackend::new());
-        publish_dispatch_rows(Some(&metrics), &state, None, None).await;
+        publish_dispatch_rows(Some(&metrics), &state, None, None, None).await;
 
         let end = Utc::now() + chrono::Duration::seconds(1);
         let start = end - chrono::Duration::seconds(600);
@@ -7429,10 +7504,10 @@ mod tests {
             .filter_map(|sample| sample.labels.get("readout").cloned())
             .collect();
         assert!(
-            names
-                .iter()
-                .all(|name| !name.starts_with("owed_") && !name.starts_with("state_")),
-            "no band or census cell is written when the count failed: {names:?}"
+            names.iter().all(|name| !name.starts_with("owed_")
+                && !name.starts_with("state_")
+                && !name.starts_with("demand_")),
+            "no band, census or demand cell is written when the count failed: {names:?}"
         );
         assert!(
             names.iter().any(|name| name == "pending"),

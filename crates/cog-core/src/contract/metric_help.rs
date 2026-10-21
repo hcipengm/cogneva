@@ -1652,7 +1652,15 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          that could not count the account writes no band cell and no state cell \
          rather than writing zeros: a zero says the urgent work is done, which \
          is the one wrong answer, and the stamp on the last write is what tells \
-         a reader how old the cell is. \
+         a reader how old the cell is. demand_satisfied and demand_owed are the \
+         demand side of the same loop, counted by declaration rather than by \
+         change: how many of the documents' declarations the account now holds \
+         as landed, and how many are still owed. They are the only cells here \
+         that answer whether the work was actually done, as opposed to how much \
+         is outstanding; state_pending falling while demand_satisfied does not \
+         move is a ledger emptying itself by retiring rows rather than by \
+         completing them. Both are written or neither, from the intake joined to \
+         the account, and a store that cannot answer writes no demand cell. \
          Which of held_back's two causes a pass \
          was is not in this family: a paused pass hands nothing over at all, so a \
          pass that handed something over and still has rows held back is one whose \
