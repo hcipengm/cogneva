@@ -307,6 +307,21 @@ fn oauth_redirect_uri(origin: &str, provider: &str) -> Result<String, Response> 
     ))
 }
 
+/// The redirect the platform will actually send the browser to.
+///
+/// An install the platform cannot reach (anything behind NAT or on a private
+/// address) borrows a public landing page instead of its own callback. That
+/// borrowed value is what the authorize request carries, so it is also what
+/// the token exchange must repeat — the platform rejects a code presented
+/// with any other redirect_uri. Recording our own callback while authorising
+/// against the override is exactly that mismatch.
+fn effective_redirect(callback: &str, override_uri: Option<&str>) -> String {
+    match override_uri.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(uri) => uri.to_string(),
+        None => callback.to_string(),
+    }
+}
+
 /// POST /api/v1/auth/platform/start — begin the OAuth flow, returning the
 /// platform authorize URL the frontend opens in a new tab.
 pub async fn oauth_start_handler(Json(req): Json<OAuthStartRequest>) -> Response {
@@ -315,7 +330,14 @@ pub async fn oauth_start_handler(Json(req): Json<OAuthStartRequest>) -> Response
         Ok(u) => u,
         Err(r) => return r,
     };
-    let state = contrib::new_oauth_state(&redirect_uri);
+    let authorize_redirect = match provider.as_str() {
+        "gitee" => effective_redirect(
+            &redirect_uri,
+            contrib::gitee_oauth_redirect_override().as_deref(),
+        ),
+        _ => redirect_uri.clone(),
+    };
+    let state = contrib::new_oauth_state(&authorize_redirect);
     let url = match provider.as_str() {
         "gitee" => {
             let Some(client_id) = contrib::gitee_oauth_client_id().await else {
@@ -325,8 +347,7 @@ pub async fn oauth_start_handler(Json(req): Json<OAuthStartRequest>) -> Response
                     "尚未配置 Gitee OAuth 应用；请改用访问令牌（PAT）登录",
                 );
             };
-            let redirect = contrib::gitee_oauth_redirect_override().unwrap_or(redirect_uri);
-            contrib::build_gitee_authorize_url(&client_id, &redirect, &state)
+            contrib::build_gitee_authorize_url(&client_id, &authorize_redirect, &state)
         }
         "github" => {
             let Some(client_id) = contrib::oauth_client_id(None) else {
@@ -391,14 +412,39 @@ pub struct OAuthExchangeRequest {
     pub redirect_url: Option<String>,
 }
 
+/// A pasted value that carries no scheme and no query is the code itself.
+///
+/// The wizard has one box for two shapes ("the code, or the whole redirect
+/// URL"), and which field the request puts the text in is the client's guess.
+/// Reading only `redirect_url` as a URL means a client that always fills that
+/// field rejects a bare code with "please paste the code" — the one thing the
+/// person just did.
+fn bare_code(input: Option<&str>) -> Option<String> {
+    let value = input?.trim();
+    if value.is_empty() || value.contains("://") || value.contains('?') || value.contains('&') {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+/// Read the code out of whichever field the client chose. Both shapes are
+/// accepted in both fields on purpose: the box is single, and the answer to
+/// "which field is this text?" must not be "ask the person again".
+fn resolve_code(code: Option<&str>, redirect_url: Option<&str>) -> Option<String> {
+    bare_code(code)
+        .or_else(|| contrib::extract_gitee_code(None, code))
+        .or_else(|| contrib::extract_gitee_code(None, redirect_url))
+        .or_else(|| bare_code(redirect_url))
+}
+
 async fn exchange_code(
     provider: &str,
     state: &str,
     code: Option<&str>,
     redirect_url: Option<&str>,
 ) -> Result<(String, Option<String>), String> {
-    let code = contrib::extract_gitee_code(code, redirect_url)
-        .ok_or("请粘贴授权码，或授权后浏览器地址栏里的完整网址")?;
+    let code =
+        resolve_code(code, redirect_url).ok_or("请粘贴授权码，或授权后浏览器地址栏里的完整网址")?;
     let redirect_uri =
         contrib::take_oauth_state(state).ok_or("授权链接已过期或已使用，请重新发起登录")?;
     match provider {
@@ -615,6 +661,47 @@ mod tests {
             urlencoded("http://127.0.0.1:8080/cb?a=b&c=中"),
             "http%3A%2F%2F127.0.0.1%3A8080%2Fcb%3Fa%3Db%26c%3D%E4%B8%AD"
         );
+    }
+
+    #[test]
+    fn the_stored_redirect_is_the_one_the_platform_was_given() {
+        let callback = "http://192.168.2.19/api/v1/auth/platform/callback/gitee";
+        let landing = "https://hcipengm.github.io/cogneva/oauth-callback.html";
+        // Without an override the browser comes back to our own callback.
+        assert_eq!(effective_redirect(callback, None), callback);
+        // With one, the authorize request carries the landing page, so the
+        // exchange must repeat it — anything else is the mismatch Gitee reports
+        // as "redirect_uri does not match".
+        assert_eq!(effective_redirect(callback, Some(landing)), landing);
+        // A blank override is no override.
+        assert_eq!(effective_redirect(callback, Some("  ")), callback);
+    }
+
+    #[test]
+    fn the_code_is_read_from_whichever_field_the_client_used() {
+        // Bare code in `code`.
+        assert_eq!(
+            resolve_code(Some("abc123"), None).as_deref(),
+            Some("abc123")
+        );
+        // Bare code in `redirect_url`: the wizard's box takes either shape, and
+        // a client that always fills this field must still succeed.
+        assert_eq!(
+            resolve_code(None, Some("abc123")).as_deref(),
+            Some("abc123")
+        );
+        // Full redirect URL in either field.
+        assert_eq!(
+            resolve_code(None, Some("https://x/cb?code=abc123&state=s")).as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            resolve_code(Some("https://x/cb?code=abc123&state=s"), None).as_deref(),
+            Some("abc123")
+        );
+        // Nothing to read: say so instead of sending an empty code upstream.
+        assert_eq!(resolve_code(None, None), None);
+        assert_eq!(resolve_code(Some("  "), Some("https://x/cb")), None);
     }
 
     #[test]

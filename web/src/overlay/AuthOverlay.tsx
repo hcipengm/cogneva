@@ -59,17 +59,22 @@ export function AuthOverlay({
     }
   };
 
+  // One box holds either shape, so the shape decides the field: a value with a
+  // scheme or a query is the redirect URL, anything else is the bare code.
+  // Passing a bare code as `redirect_url` is what made the server answer
+  // "paste the code" to someone who had just pasted the code.
   const exchange = useCallback(
-    async (code: string | undefined, redirectUrl: string) => {
+    async (raw: string) => {
       if (!pending) return;
+      const isUrl = /^https?:\/\//i.test(raw) || raw.includes('?');
       setOauthError(null);
       setBusyProvider(pending.provider);
       try {
         const res = await platformOAuthExchange(
           pending.provider,
           pending.state,
-          code,
-          redirectUrl
+          isUrl ? undefined : raw,
+          isUrl ? raw : ''
         );
         localStorage.setItem('cogneva_token', res.token);
         window.location.reload();
@@ -86,7 +91,7 @@ export function AuthOverlay({
   const finishOAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!pending || !pasted.trim()) return;
-    await exchange(undefined, pasted.trim());
+    await exchange(pasted.trim());
   };
 
   // The redirect page posts the code to the window that opened it. Its origin
@@ -103,7 +108,7 @@ export function AuthOverlay({
       };
       if (data.type !== 'cogneva-gitee-oauth') return;
       if (!data.code || data.state !== pending.state) return;
-      void exchange(data.code, '');
+      void exchange(data.code);
     };
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
