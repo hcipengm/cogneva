@@ -32,22 +32,6 @@ impl InAppNotifier {
     }
 }
 
-/// 每条边沿一行，写给 `user_id`。
-///
-/// 独立成函数是为了让测试能递一个只数行的库进来：铃铛没有地址可配、没有 HTTP
-/// 客户端要建，正因如此它是部署唯一不会静默失去的出口——除非写库这一步坏了，
-/// 而那由 `write_failed` 那一格负责说出来。
-pub async fn write_notifications(
-    store: &dyn cog_core::NotificationStore,
-    user_id: &str,
-    fired: &[NewAlert],
-    metrics: Option<&Arc<dyn cog_core::MetricsBackend>>,
-) {
-    for alert in fired {
-        write_one(store, user_id, alert, metrics).await;
-    }
-}
-
 /// 写一条并如实返回是否落了行。
 ///
 /// 调用方要靠这个布尔决定"要不要把这一条记成已通知"：先记后写会在写失败时
