@@ -679,6 +679,12 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
             let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+            // 同一张 alerts 表前可能站着不止一个进程：主应用与进化进程都装了
+            // 这个插件，两者都在写告警。通知是 INSERT，不像 `set_alert` 那样按
+            // dedup_key 幂等——两个扫描者会把同一条告警各自写一行通知给同一个人。
+            // 租约把"扫表那半个"收成一个持有者；没有仲裁者的部署拿到的租约恒成立，
+            // 回到每个进程自己扫的行为（那时只有一个进程共享这张表）。
+            let role = ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>();
             let interval = std::time::Duration::from_secs(ALERT_BELL_INTERVAL_SECS);
             drop(cog_core::loop_health::spawn(
                 ALERT_BELL_LOOP,
@@ -689,12 +695,22 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                     let notifier = notifier.clone();
                     let metrics = metrics.clone();
                     let shutdown = shutdown.clone();
+                    let role = role.clone();
                     async move {
+                        let hold = cog_core::RoleHold::start(
+                            role,
+                            ALERT_BELL_ROLE,
+                            beat.clone(),
+                            &shutdown,
+                        );
                         let mut ticker = tokio::time::interval(interval);
                         loop {
                             beat.beat();
                             tokio::select! {
                                 _ = ticker.tick() => {
+                                    if !hold.may_act().await {
+                                        continue;
+                                    }
                                     match crate::bell::drain_pending(
                                         store.as_ref(),
                                         &notifier,
@@ -1275,6 +1291,9 @@ pub const ALERT_BRIDGE_LOOP: &str = "observability_alert_bridge";
 
 /// 通知中心那条扫表循环的名字，报在 `cogneva_loop_*` 的 `loop` 标签上。
 pub const ALERT_BELL_LOOP: &str = "observability_alert_bell";
+
+/// 扫表这半个循环在仲裁者里的角色名：同一张库上只许一个进程把告警变成通知。
+pub const ALERT_BELL_ROLE: &str = "alert_bell";
 
 /// 多久扫一次"在 firing、还没通知过人"的告警。
 ///
