@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: config
 data:
-  cogneva.json: |-
+  cogneva.json: |
     {
       "_comment": "Cogneva unified configuration. Place this file at /etc/cogneva/cogneva.json or set COGNEVA_CONFIG_PATH env.",
       "system": {
