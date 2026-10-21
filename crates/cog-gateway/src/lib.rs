@@ -2414,12 +2414,14 @@ async fn alerts_ack_handler(
             .into_response();
     };
 
-    match source.acknowledge_alert(&dedup_key, &claims.sub).await {
+    let who = acknowledging_identity(&claims);
+
+    match source.acknowledge_alert(&dedup_key, &who).await {
         Ok(Some(at)) => (
             StatusCode::OK,
             Json(json!({
                 "acknowledged_at": at.to_rfc3339(),
-                "acknowledged_by": claims.sub,
+                "acknowledged_by": who,
             })),
         )
             .into_response(),
@@ -2438,6 +2440,22 @@ async fn alerts_ack_handler(
             )
                 .into_response()
         }
+    }
+}
+
+/// Who to record on an acknowledgement.
+///
+/// The mark is read on a monitoring screen, where the subject id answers
+/// nobody's question ("3f2a… acknowledged this" names no one a person can go
+/// ask). The username the token carries is the identity people recognise, and
+/// recording it here keeps the written value and the listed value the same
+/// field — falling back to the subject only when the provider supplied no
+/// username, so the column is never blank.
+fn acknowledging_identity(claims: &cog_core::Claims) -> String {
+    if claims.preferred_username.trim().is_empty() {
+        claims.sub.clone()
+    } else {
+        claims.preferred_username.clone()
     }
 }
 
@@ -3695,6 +3713,41 @@ mod active_alert_merge_tests {
             Some(at.to_rfc3339().as_str())
         );
         assert_eq!(merged[0].acknowledged_by.as_deref(), Some("alice"));
+    }
+
+    fn claims_with(sub: &str, username: &str) -> cog_core::Claims {
+        cog_core::Claims {
+            sub: sub.to_string(),
+            iss: "test".to_string(),
+            aud: "test".to_string(),
+            exp: 0,
+            iat: 0,
+            jti: "test".to_string(),
+            preferred_username: username.to_string(),
+            user_type: cog_core::UserType::Standard,
+            workspace_ids: Vec::new(),
+            permissions: Vec::new(),
+            roles: Vec::new(),
+        }
+    }
+
+    /// The name on an acknowledgement is read by people, not by the store: a
+    /// UUID tells the reader nobody they can go ask.
+    #[test]
+    fn an_acknowledgement_records_the_username_not_the_subject_id() {
+        let claims = claims_with("3f2a1c00-0000-4000-8000-000000000000", "alice");
+        assert_eq!(acknowledging_identity(&claims), "alice");
+    }
+
+    /// A provider that sends no username still has to leave a name in the
+    /// column; the subject is the one identity always present.
+    #[test]
+    fn an_acknowledgement_falls_back_to_the_subject_when_no_username_is_sent() {
+        let claims = claims_with("3f2a1c00-0000-4000-8000-000000000000", "  ");
+        assert_eq!(
+            acknowledging_identity(&claims),
+            "3f2a1c00-0000-4000-8000-000000000000"
+        );
     }
 
     /// The process-local half has no sighting clock, and says so with `None`
