@@ -689,6 +689,14 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_verification_timeouts_total",
         "crates/cog-reflection/src/verification_budget.rs",
     ),
+    // The claim-capacity loop: what became of each volume in each round, and the
+    // two sizes the decision was made from. The outcome labels are a closed set
+    // published at zero, so "this loop never had to clamp" is a readable fact and
+    // not an absence.
+    (
+        "cogneva_volume_capacity_outcome_total",
+        "crates/cog-reflection/src/volume_capacity.rs",
+    ),
     // The notification outlets. A delivery that fails is invisible from
     // outside this process -- the caller cannot tell "a human was paged" from
     // "the message was dropped" -- so the per-outlet outcome counters are the

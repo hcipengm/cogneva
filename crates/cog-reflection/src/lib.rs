@@ -93,6 +93,7 @@ pub mod store_readouts;
 pub mod types;
 pub mod verification_budget;
 pub mod version_contract;
+pub mod volume_capacity;
 pub mod workspace;
 
 #[cfg(test)]

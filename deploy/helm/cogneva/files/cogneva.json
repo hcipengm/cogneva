@@ -725,6 +725,33 @@
           "summary": "Volume holds {value}x its declared size: the workload writes past the PVC's requests.storage, and nothing enforces that request, so the declared size is not a ceiling. For a directory-backed volume the excess lands on the node filesystem and the per-volume capacity the kubelet reports is the node's, not this volume's. Either the declaration is wrong for what this deployment writes, or the growth belongs somewhere else"
         },
         {
+          "name": "volume_capacity_clamped_by_admission",
+          "promql": "max(increase(cogneva_volume_capacity_outcome_total{outcome=\"clamped\"}[1h]))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The loop that raises a claim's declaration computed a size the volume needs {value} time(s) in the last hour and left the request alone: the number was above what admission accepts. Two bounds are read before the patch -- the LimitRange's per-claim storage maximum and what the namespace quota has left once this claim's own request is taken back out -- and the loop writes nothing above the tighter of them. This is the one outcome that no amount of retrying repairs: the loop re-decides every round on the same two bounds, so a count that keeps rising is the loop doing its job against a ceiling that has to move. Which one to raise is in the numbers beside it: read `cogneva_volume_capacity_bytes{state=\"peak\"}` against the same claim's `state=\"declared\"`. A peak close to the bound means the ceiling is what is wrong for this deployment; a peak far below it means the volume itself is growing faster than the declaration policy assumed and the ceiling is the second thing to look at, not the first. The loop's own arithmetic is the peak times the same headroom the shipped declarations are sized by, so a clamped outcome always means the declared size is smaller than what this process has already written plus that headroom"
+        },
+        {
+          "name": "volume_capacity_resize_refused",
+          "promql": "max(increase(cogneva_volume_capacity_outcome_total{outcome=\"refused\"}[1h]))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The loop that raises a claim's declaration had {value} resize(s) refused in the last hour: the request was computed inside the admission bounds, sent, and the API server said no. The usual cause is not permission -- the executor's Role grants patch on persistentvolumeclaims -- but the StorageClass: a class with `allowVolumeExpansion: false` refuses every request to grow a bound claim, and local-path ships that way. Read the loop's own warning for the patch's stderr before changing anything: a refusal naming allowVolumeExpansion is repaired on the StorageClass, while one naming the request itself belongs in the LimitRange and should have been reported as clamped instead. A refused claim is left alone for an hour before it is tried again, so this count rises slowly and each increment is a retry that was allowed to happen, not a storm"
+        },
+        {
+          "name": "volume_capacity_expansion_never_completes",
+          "promql": "max(increase(cogneva_volume_capacity_outcome_total{outcome=\"expanding\"}[6h]))",
+          "condition": {
+            "greater_than": 29.0
+          },
+          "severity": "warning",
+          "summary": "A claim has been asking for more than it has been given for hours: {value} rounds in the last six read the request ahead of the volume's status capacity. This is the outcome that says the declaration was raised successfully and the expansion never landed -- the request is what an alert reads (the rule that compares usage divides by requests.storage), so the shortfall disappears from every reading the moment the patch is accepted, while the filesystem underneath is still the old size. On a class with an external expander the request stays ahead of capacity until that controller acts, and thirty rounds is five hours of no controller acting. Nothing is retried on this outcome on purpose: an expansion is already in flight as far as the API is concerned, and a second patch while the first has not been carried out is refused rather than queued. The repair is on whoever owns the StorageClass -- the external resizer, or the class's volume expansion support -- and the sizes to read it against are `cogneva_volume_capacity_bytes{state=\"declared\"}` and the claim's own status capacity"
+        },
+        {
           "name": "pg_pool_ceiling_unmeasured",
           "promql": "max by (pool, source) (cogneva_pg_pool_max_connections{source=\"server_unreadable\"} and ((time() - cogneva_pg_pool_max_connections_observed_timestamp_seconds) < 1800))",
           "condition": {

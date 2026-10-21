@@ -132,6 +132,10 @@ pub struct ReflectionPlugin {
     /// start 拿到编排器后把求值器塞进去。
     promotion_eval_slot:
         Arc<std::sync::OnceLock<Arc<dyn crate::promotion_eval::PromotionEvaluator>>>,
+    /// 卷声明按实测峰值自动上抬那条闭环的读数。无条件建：只有挂载并走查该卷的
+    /// 进程会起循环，别的进程上这一族序列不存在，读作「没人在看这张卷」，
+    /// 与「看了、够用」是两件事。
+    volume_capacity: Arc<crate::volume_capacity::VolumeCapacityReadings>,
 }
 
 impl ReflectionPlugin {
@@ -154,6 +158,7 @@ impl ReflectionPlugin {
             discovery_outcome_readings: Arc::new(DiscoveryOutcomeReadings::new()),
             rework_gate: None,
             promotion_eval_slot: Arc::new(std::sync::OnceLock::new()),
+            volume_capacity: Arc::new(crate::volume_capacity::VolumeCapacityReadings::new()),
         }
     }
 }
@@ -965,6 +970,11 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // itself is armed in start(), with the other loops.
                 ctx.publish_observable(self.signal_readings.clone());
 
+                // 卷声明不够装时由谁抬高：实测峰值与准入上下界都在这一族读数里，
+                // 循环由 start() 在跑构建的那个进程上起。发布无条件，因为
+                // 「这张卷没人在看」本身就是读者最需要看到的那一格。
+                ctx.publish_observable(self.volume_capacity.clone());
+
                 // 自动晋级运行时一键暂停开关：admin API 与 AutoPromoter
                 // 共享同一实例，暂停立即对排队晋级生效。
                 let promotion_switch = Arc::new(crate::PromotionSwitch::new());
@@ -1553,6 +1563,25 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 dir = %ctx.config().self_evolution.workspaces.target_dir,
                 "this process runs no builds; the build cache is measured where it is built"
             ),
+        }
+
+        // 卷声明不够装时把它抬上去。角色前提与构建缓存同一条：只有跑构建这个
+        // 进程既挂着那几张卷、又有 patch 它们的权，别处起这条循环只会拿着一个
+        // 自己走不了的判据去改别人的卷。
+        if self.build_cache.is_some() {
+            let shutdown = cog_core::ShutdownSignal::new();
+            if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+                let shutdown = shutdown.clone();
+                let mut rx = broadcast_tx.0.subscribe();
+                tokio::spawn(async move {
+                    let _ = rx.recv().await;
+                    shutdown.trigger();
+                });
+            }
+            drop(crate::volume_capacity::spawn_volume_capacity_loop(
+                self.volume_capacity.clone(),
+                shutdown,
+            ));
         }
 
         // 决策统计的运行时作者从卷上的快照换成共享表。这一步放在 start 而不是
