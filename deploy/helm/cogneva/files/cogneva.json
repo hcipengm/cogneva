@@ -2800,16 +2800,16 @@
         },
         {
           "name": "image_store_reclaimed_by_kubelet",
-          "promql": "max by (node) (increase(kubelet_image_garbage_collected_total[6h]))",
+          "promql": "max by (node) (increase(kubelet_image_garbage_collected_total{node!=\"\"}[6h]))",
           "condition": {
             "greater_than": 0.0
           },
           "severity": "warning",
-          "summary": "The kubelet on {node} deleted {value} image(s) in the last six hours. This is the store's reclaim action and it is the runtime's own: it runs when the disk passes the image GC high watermark (85% by default), removes only images no container references, and stops at the low watermark (80%). There is nothing for us to execute here -- what this rule is for is the account's write-back, because the walk publishes how big the store is and nothing published that its bound had been applied. Read it with image_store_bytes{node}: a store that stays flat while this fires every window is a working set that reaches the watermark, so the next pull evicts the previous one and pods pay a re-pull on every start -- the bound is below the working set, and the fix is a watermark or a disk, not a smaller store. Firing next to image_store_over_the_watermark_without_a_gc is the other shape: the disk is over the line and the kubelet is not collecting"
+          "summary": "The kubelet on {node} deleted {value} image(s) in the last six hours. The reading is taken from the kubelet's own scrape and not from the apiserver's: this counter is scraped twice here, once from the kubelet on :10250 where the sample names its node, and once through the apiserver on :6443 where the kubelet's labels come through without a node at all. Both copies carry the same number, so a rule that reads them both reports one reclaim twice -- once against a node, once against nothing -- and the row without a node names no place to go and fix. `node!=\"\"` is the selection: a sample has to name the node it is about, which is also what the sibling rules join on. This is the store's reclaim action and it is the runtime's own: it runs when the disk passes the image GC high watermark (85% by default), removes only images no container references, and stops at the low watermark (80%). There is nothing for us to execute here -- what this rule is for is the account's write-back, because the walk publishes how big the store is and nothing published that its bound had been applied. Read it with image_store_bytes{node}: a store that stays flat while this fires every window is a working set that reaches the watermark, so the next pull evicts the previous one and pods pay a re-pull on every start -- the bound is below the working set, and the fix is a watermark or a disk, not a smaller store. Firing next to image_store_over_the_watermark_without_a_gc is the other shape: the disk is over the line and the kubelet is not collecting"
         },
         {
           "name": "image_store_over_the_watermark_without_a_gc",
-          "promql": "(100 - 100 * max by (node) (node_filesystem_avail_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"}) / max by (node) (node_filesystem_size_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"})) > 80 unless on(node) (max by (node) (increase(kubelet_image_garbage_collected_total[1h])) > 0)",
+          "promql": "(100 - 100 * max by (node) (node_filesystem_avail_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"}) / max by (node) (node_filesystem_size_bytes{mountpoint=\"/\", fstype=~\"ext4|xfs|overlay\"})) > 80 unless on(node) (max by (node) (increase(kubelet_image_garbage_collected_total{node!=\"\"}[1h])) > 0)",
           "condition": {
             "greater_than": 0.0
           },
