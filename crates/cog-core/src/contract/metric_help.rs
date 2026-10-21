@@ -1167,6 +1167,9 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          when this deployment has no outlet at all and 0 when it has at least \
          one; it is written in both directions, because the per-kind rows exist \
          only when there is an outlet and so could never say there is none. \
+         The in-app alert surface counts as an outlet: it has no address, so \
+         nothing about it can be misconfigured, and the WebUI reads the rows \
+         the external channels would carry. \
          Both kinds exist because the delivery counter only gains a row when a \
          batch is actually dispatched: on a quiet deployment with nothing \
          configured, 'nobody can be told' was on no series at all and read \

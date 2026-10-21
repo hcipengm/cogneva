@@ -92,6 +92,37 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_build_gate_slots",
         "crates/cog-core/src/contract/build_gate.rs",
     ),
+    // The host, as the gate measured it for its last derivation. Every one of
+    // these is a quantity the bound is derived from, published beside the
+    // ceiling that took the smallest of them so a reader can see which wall is
+    // binding and which is next. They live in the reflection crate rather than
+    // the contract crate because they are one process's sample of the host it
+    // runs on, not a name every crate shares -- and the rules below read them
+    // to say why a bound is where it is, not to move it.
+    (
+        "cogneva_build_gate_ceiling",
+        "crates/cog-core/src/contract/build_gate.rs",
+    ),
+    (
+        "cogneva_host_cpu_busy_cores",
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
+    (
+        "cogneva_host_cpu_cores",
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
+    (
+        "cogneva_host_memory_available_bytes",
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
+    (
+        "cogneva_host_pressure_avg60",
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
+    (
+        "cogneva_host_disk_free_bytes",
+        "crates/cog-reflection/src/build_gate/mod.rs",
+    ),
     // How long each held slot has been held, read by the rule that fires on a
     // hold longer than anyone is willing to wait. The refusal counter beside it
     // only exists where someone asked, and the starved case is the ask that
@@ -3345,7 +3376,7 @@ const UNREAD: &[(&str, Unread)] = &[
     // repository's rules and panels, which is why it does not close this entry.
     (
         "cogneva_alert_channels_configured",
-        Unread::Gap("which outlets this deployment can deliver an alert through. Two kinds of row with opposite polarity, told apart by `state`: `state=\"configured\"` rows name one outlet each in `channel` at 1, and no such row is written when there is no outlet -- a placeholder name would read as a kind that exists and is switched off -- and one `state=\"verdict\"` row carries no `channel` but the `readout` name the communication face owes, at 1 when there is no outlet at all and 0 when there is at least one -- written in both directions, since the configured rows exist only when there is an outlet and so could never say there is none. A reader must select one kind by `state` before aggregating; summing the family answers yes either way. Every value is a constant per process, so a reader takes one series rather than adding the copies: what it answers is whether an alert can reach a person at all, which is the question the persisted alert row cannot answer -- that row is written whether or not anyone was told. It is filed rather than given a threshold because every cell is the configuration itself: 1 is the ordinary state of a deployment with an outlet and 0 the ordinary state of one without, so neither number is a condition that turns into a fault at some level. What makes a deployment without an outlet wrong is a decision about that deployment, not something this series can bound"),
+        Unread::Gap("which outlets this deployment can deliver an alert through. Two kinds of row with opposite polarity, told apart by `state`: `state=\"configured\"` rows name one outlet each in `channel` at 1, and no such row is written when there is no outlet -- a placeholder name would read as a kind that exists and is switched off -- and one `state=\"verdict\"` row carries no `channel` but the `readout` name the communication face owes, at 1 when there is no outlet at all and 0 when there is at least one -- written in both directions, since the configured rows exist only when there is an outlet and so could never say there is none. The in-app alert surface counts as an outlet: it has no address, so nothing about it can be misconfigured, and the WebUI reads the same rows the external channels would carry. A reader must select one kind by `state` before aggregating; summing the family answers yes either way. Every value is a constant per process, so a reader takes one series rather than adding the copies. It is filed rather than given a threshold because every cell is the configuration itself: 1 is the ordinary state of a deployment with an outlet and 0 the ordinary state of one without, so neither number is a condition that turns into a fault at some level. What makes a deployment without an outlet wrong is a decision about that deployment, not something this series can bound"),
     ),
     // The account has counted refusals per principle since the gates first
     // reported them, and the platform surface published none of it: the only

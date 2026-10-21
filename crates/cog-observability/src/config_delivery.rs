@@ -494,7 +494,10 @@ async fn set_row(
                 })];
                 match notifier.as_ref() {
                     Some(notifier) => notifier.notify(&events).await,
-                    None => crate::alerts::record_undelivered(metrics, 1).await,
+                    // The row above was written, and that row is what the
+                    // in-app alert surface reads: no external outlet is not the
+                    // same as nobody being able to see it.
+                    None => crate::alerts::record_delivered_in_app(metrics, 1).await,
                 }
             }
         }

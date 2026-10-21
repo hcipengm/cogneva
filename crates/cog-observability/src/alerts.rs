@@ -352,12 +352,28 @@ async fn record_dispatch(
 /// `None` -- no channels configured, or an outlet without an HTTP client --
 /// there is no `notify` to call, so the absence of a delivery has to be written
 /// from here or it does not exist on any series while the alert row is still
-/// there.
+/// there. **Only when the row was not written either**: `alerts` is one of the
+/// places a person can read, so a batch that reached it was delivered (see
+/// [`record_delivered_in_app`]).
 pub async fn record_undelivered(
     metrics: Option<&std::sync::Arc<dyn cog_core::MetricsBackend>>,
     events: usize,
 ) {
     record_dispatch(metrics, "none", OUTCOME_NO_CHANNEL, events).await;
+}
+
+/// Record a batch that reached the in-app alert surface: the row is in the
+/// `alerts` table and the WebUI reads it from `/api/v1/alerts/active`.
+///
+/// This is an outlet with no address and therefore no configuration to get
+/// wrong, so the "no external channel" state is not the same as "nobody can be
+/// told". Counting the two together made a deployment that is *quiet and wired
+/// to the product itself* read exactly like one whose alerts vanish.
+pub async fn record_delivered_in_app(
+    metrics: Option<&std::sync::Arc<dyn cog_core::MetricsBackend>>,
+    events: usize,
+) {
+    record_dispatch(metrics, "in_app", OUTCOME_DELIVERED, events).await;
 }
 
 #[cfg(test)]

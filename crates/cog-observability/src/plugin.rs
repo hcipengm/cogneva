@@ -647,6 +647,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         publish_alert_channels(
             ctx.consume_service::<dyn cog_core::MetricsBackend>(),
             &alert_outlets,
+            self.alert_store.is_some(),
         )
         .await;
 
@@ -1097,10 +1098,15 @@ pub const ALERT_CHANNEL_NONE_READOUT: &str = "alert_notifications_channel_none";
 async fn publish_alert_channels(
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     outlets: &[&str],
+    in_app: bool,
 ) {
     let Some(metrics) = metrics else { return };
     // The verdict cell answers "is there anywhere to send an alert" as 1 = no
-    // outlet, and it is written on both paths. Deriving it from the per-kind
+    // outlet, and it is written on both paths. The in-app surface counts as an
+    // outlet: it has no address, so nothing about it can be misconfigured, and
+    // the WebUI reads the same rows an external channel would carry. Without
+    // that half, a deployment whose alerts are all visible in the product still
+    // reported "nowhere to send an alert". Deriving it from the per-kind
     // rows would leave it unwritten in exactly the state it reports: the rows
     // exist only when there is an outlet. It carries no `channel` label and
     // the per-kind rows carry `state="configured"`, so the two kinds are told
@@ -1118,7 +1124,11 @@ async fn publish_alert_channels(
     if let Err(e) = metrics
         .record_gauge(
             cog_core::metric_names::ALERT_CHANNELS_CONFIGURED,
-            if outlets.is_empty() { 1.0 } else { 0.0 },
+            if outlets.is_empty() && !in_app {
+                1.0
+            } else {
+                0.0
+            },
             verdict,
         )
         .await
@@ -1271,17 +1281,25 @@ fn spawn_alert_bridge(
                     if alerts.is_empty() {
                         continue;
                     }
+                    // Persist first: the row is what the in-app surface shows,
+                    // so whether it was written decides whether this batch
+                    // reached anybody when no external channel exists.
+                    let persisted = match &store {
+                        Some(store) => persist_alerts(store, &alerts).await,
+                        None => false,
+                    };
                     match &manager_for_task {
                         Some(manager) => manager.notify(&alerts).await,
-                        // Persisted, but there is no outlet to hand it to: the
-                        // row exists and the human was never told. Without this
-                        // cell the two are the same picture on every series.
+                        None if persisted => {
+                            crate::alerts::record_delivered_in_app(metrics.as_ref(), alerts.len())
+                                .await
+                        }
+                        // Neither an external outlet nor a row: nobody can be
+                        // told, and without this cell that absence is on no
+                        // series at all.
                         None => {
                             crate::alerts::record_undelivered(metrics.as_ref(), alerts.len()).await
                         }
-                    }
-                    if let Some(store) = &store {
-                        persist_alerts(store, &alerts).await;
                     }
                 }
             }
@@ -1333,7 +1351,11 @@ fn alert_message(inst: &AlertInstance) -> String {
 /// Drive mapped alerts into the PostgreSQL state machine: `Firing` guarantees an
 /// open `firing` row, `Resolved` closes the row with the same dedup key.
 /// Re-evaluating is idempotent, so a restarting producer cannot pile up rows.
-async fn persist_alerts(store: &PostgresAlertStore, alerts: &[AlertEvent]) {
+///
+/// Returns whether every row in the batch was written: the caller uses that to
+/// decide between "the in-app surface has it" and "nobody was told".
+async fn persist_alerts(store: &PostgresAlertStore, alerts: &[AlertEvent]) -> bool {
+    let mut all_written = true;
     for event in alerts {
         let (condition, inst) = match event {
             AlertEvent::Firing(inst) => (true, inst),
@@ -1348,8 +1370,10 @@ async fn persist_alerts(store: &PostgresAlertStore, alerts: &[AlertEvent]) {
         };
         if let Err(e) = store.set_alert(condition, &alert).await {
             warn!(rule = %alert.rule, error = %e, "alert persistence failed");
+            all_written = false;
         }
     }
+    all_written
 }
 
 /// Wrapper so [`crate::LogFilterHandle`] can be stored in [`cog_core::PluginContext`].
@@ -1545,7 +1569,7 @@ mod tests {
     #[tokio::test]
     async fn no_outlet_is_a_verdict_row_rather_than_no_series() {
         let backend = Arc::new(Gauges::default());
-        publish_alert_channels(Some(backend.clone()), &[]).await;
+        publish_alert_channels(Some(backend.clone()), &[], false).await;
         assert_eq!(
             backend.outlets(),
             Vec::new(),
@@ -1573,6 +1597,21 @@ mod tests {
         );
     }
 
+    /// The in-app surface is an outlet. A deployment with no external channel
+    /// but a readable `alerts` table can still tell somebody, and the row that
+    /// reports "nowhere to send an alert" must not call that a dangling state.
+    #[tokio::test]
+    async fn the_in_app_surface_counts_as_an_outlet_in_the_verdict() {
+        let backend = Arc::new(Gauges::default());
+        publish_alert_channels(Some(backend.clone()), &[], true).await;
+        assert_eq!(
+            backend.readouts(),
+            vec![(ALERT_CHANNEL_NONE_READOUT.to_string(), 0.0)],
+            "a readable in-app alert surface is somewhere an alert can go"
+        );
+        assert_states_are_paired(&backend.calls.lock().unwrap());
+    }
+
     /// The verdict cell is written in both directions, and it is the direction
     /// that matters that would otherwise be missing: the per-kind rows exist
     /// only when there is an outlet, so a cell derived from them could never
@@ -1581,7 +1620,7 @@ mod tests {
     #[tokio::test]
     async fn the_verdict_cell_answers_with_an_outlet_configured_too() {
         let backend = Arc::new(Gauges::default());
-        publish_alert_channels(Some(backend.clone()), &["webhook"]).await;
+        publish_alert_channels(Some(backend.clone()), &["webhook"], false).await;
         assert_eq!(
             backend.readouts(),
             vec![(ALERT_CHANNEL_NONE_READOUT.to_string(), 0.0)]
@@ -1595,7 +1634,7 @@ mod tests {
     #[tokio::test]
     async fn each_configured_outlet_is_its_own_row() {
         let backend = Arc::new(Gauges::default());
-        publish_alert_channels(Some(backend.clone()), &["webhook", "email"]).await;
+        publish_alert_channels(Some(backend.clone()), &["webhook", "email"], false).await;
         assert_eq!(
             backend.outlets(),
             vec![("webhook".to_string(), 1.0), ("email".to_string(), 1.0)]
@@ -1608,7 +1647,7 @@ mod tests {
     /// reading.
     #[tokio::test]
     async fn a_deployment_without_a_metrics_backend_still_starts() {
-        publish_alert_channels(None, &["webhook"]).await;
+        publish_alert_channels(None, &["webhook"], false).await;
     }
 
     fn inst(rule: &str, pairs: &[(&str, &str)], state: AlertState) -> AlertInstance {

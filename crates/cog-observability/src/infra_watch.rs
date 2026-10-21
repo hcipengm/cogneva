@@ -670,16 +670,27 @@ async fn notify_eval_failure(
         ends_at: None,
         updated_at: now,
     };
-    deliver(outlets, vec![AlertEvent::Firing(inst)]).await;
+    deliver(
+        outlets,
+        vec![AlertEvent::Firing(inst)],
+        outlets.store.is_some(),
+    )
+    .await;
 }
 
-/// Hand a batch to the notifier, or count it as reaching nobody.
+/// Hand a batch to the notifier, or record where it actually went.
 ///
-/// The two states the watcher used to share: an alert the notifier took and an
-/// alert with no notifier wired. Both persisted a row; only one was ever seen.
-async fn deliver(outlets: &InfraWatchOutlets, events: Vec<AlertEvent>) {
+/// Three states used to share one reading: an alert an external outlet took, an
+/// alert that reached only the `alerts` table (which the WebUI reads, so a
+/// person *can* see it), and an alert that reached nobody. `persisted` is the
+/// caller's answer for the middle state -- every call site writes the row before
+/// it calls here.
+async fn deliver(outlets: &InfraWatchOutlets, events: Vec<AlertEvent>, persisted: bool) {
     match &outlets.notifier {
         Some(notifier) => notifier.notify(&events).await,
+        None if persisted => {
+            crate::alerts::record_delivered_in_app(outlets.metrics.as_ref(), events.len()).await
+        }
         None => crate::alerts::record_undelivered(outlets.metrics.as_ref(), events.len()).await,
     }
 }
@@ -708,7 +719,7 @@ async fn resolve(key: &str, outlets: &InfraWatchOutlets) {
                     ends_at: Some(Utc::now()),
                     updated_at: Utc::now(),
                 };
-                deliver(outlets, vec![AlertEvent::Resolved(inst)]).await;
+                deliver(outlets, vec![AlertEvent::Resolved(inst)], true).await;
             }
             Ok(_) => {}
             Err(e) => warn!(key = %key, error = %e, "infra alert resolve failed"),
@@ -733,7 +744,12 @@ async fn notify(
         ends_at: None,
         updated_at: now,
     };
-    deliver(outlets, vec![AlertEvent::Firing(inst)]).await;
+    deliver(
+        outlets,
+        vec![AlertEvent::Firing(inst)],
+        outlets.store.is_some(),
+    )
+    .await;
 }
 
 /// What a comparison's side carries into the join.
