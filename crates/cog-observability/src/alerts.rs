@@ -26,6 +26,17 @@ pub const OUTCOME_FAILED: &str = "failed";
 pub const OUTCOME_SKIPPED: &str = "skipped";
 /// No outlet was configured at all, so the batch reached no channel.
 pub const OUTCOME_NO_CHANNEL: &str = "no_channel";
+/// The in-app notification row could not be written, so a person opening the
+/// bell will not find the alert that produced it.
+pub const OUTCOME_WRITE_FAILED: &str = "write_failed";
+
+/// The `channel` label for the notification centre: one row in
+/// `notifications`, addressed to the instance owner, shown behind the WebUI's
+/// bell. Distinct from `in_app`, which is the `alerts` table the alert panel
+/// reads: the two surfaces are read at different moments (the panel is the
+/// current state, the bell is what arrived), so one number for both would
+/// answer neither question.
+pub const CHANNEL_NOTIFICATION_CENTER: &str = "notification_center";
 
 /// What one channel did with one batch.
 enum Delivery {
@@ -374,6 +385,21 @@ pub async fn record_delivered_in_app(
     events: usize,
 ) {
     record_dispatch(metrics, "in_app", OUTCOME_DELIVERED, events).await;
+}
+
+/// Record a batch written as notification rows for the bell.
+///
+/// `delivered` here means the row exists in `notifications`; whether the page
+/// is open to see it is a separate question, and the row is what survives a
+/// closed tab. The same counter's `write_failed` outcome is the other half: a
+/// firing alert that could not be addressed is a bell that stays silent, and
+/// without that label the silence looks like "nothing happened".
+pub async fn record_notification_center(
+    metrics: Option<&std::sync::Arc<dyn cog_core::MetricsBackend>>,
+    outcome: &'static str,
+    events: usize,
+) {
+    record_dispatch(metrics, CHANNEL_NOTIFICATION_CENTER, outcome, events).await;
 }
 
 #[cfg(test)]

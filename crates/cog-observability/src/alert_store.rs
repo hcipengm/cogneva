@@ -32,7 +32,13 @@ ALTER TABLE alerts ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ
 ;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS acknowledged_by TEXT
 ;
+-- 站内铃铛的投递标记。NULL 表示这一条 firing 还没人被告知：它同时是"接上通知之前
+-- 就已在响的存量"与"写通知失败后待重试"的待办队列，因此不需要另建一张表。
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ
+;
 CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts(state, fired_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_unnotified \
+    ON alerts(fired_at) WHERE state = 'firing' AND notified_at IS NULL;
 "#;
 
 /// A new alert condition to raise (or close).
@@ -237,7 +243,12 @@ impl PostgresAlertStore {
                         -- this condition at this time, and carrying the mark
                         -- over would show a fresh alert as already handled.
                         acknowledged_at = NULL,
-                        acknowledged_by = NULL
+                        acknowledged_by = NULL,
+                        -- A new episode has not been announced yet either: the
+                        -- mark belongs to the episode that was notified, and
+                        -- carrying it over would leave the bell silent for a
+                        -- condition that just started again.
+                        notified_at = NULL
                     "#,
                 )
                 .bind(uuid::Uuid::new_v4().to_string())
@@ -345,6 +356,49 @@ impl PostgresAlertStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| r.get("dedup_key")))
+    }
+
+    /// Firing alerts nobody has been told about yet, oldest first.
+    ///
+    /// The queue the notification loop drains. Ordering by `fired_at` means a
+    /// long-running alert that predates the loop is announced before one that
+    /// started a moment ago — the person opening the bell reads the list the
+    /// way it happened.
+    pub async fn unnotified_firing(&self, limit: i64) -> anyhow::Result<Vec<NewAlert>> {
+        let rows = sqlx::query(
+            "SELECT rule, dedup_key, severity, message, labels FROM alerts \
+             WHERE state = 'firing' AND notified_at IS NULL \
+             ORDER BY fired_at ASC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| NewAlert {
+                rule: row.get("rule"),
+                dedup_key: row.get("dedup_key"),
+                severity: row.get("severity"),
+                message: row.get("message"),
+                labels: row.get("labels"),
+            })
+            .collect())
+    }
+
+    /// Record that a firing alert has been announced.
+    ///
+    /// Conditional on both `firing` and `notified_at IS NULL` so the write is
+    /// an edge, not a timer: a row resolved in the meantime must not receive a
+    /// mark that would suppress the notice of its next episode.
+    pub async fn mark_notified(&self, dedup_key: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE alerts SET notified_at = NOW() \
+             WHERE dedup_key = $1 AND state = 'firing' AND notified_at IS NULL",
+        )
+        .bind(dedup_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Alerts currently in the `firing` state, newest first.

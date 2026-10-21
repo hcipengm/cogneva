@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::alert_store::{NewAlert, PostgresAlertStore};
+use crate::bell::InAppNotifier;
 use crate::usage_store::LlmUsageStore;
 
 /// Loop name reported through the background-loop liveness family.
@@ -654,6 +655,75 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // ── Alert bridge: notification outlets + persistent state machine ──
         let alert_store = self.alert_store.clone();
 
+        // 站内铃铛的出口。两端都由别的插件发布，所以缺存储的部署在这里拿到
+        // `None`，而不是一个会虚构收件人或写进没人读的表的东西。它同时喂给两条
+        // 告警来源：supervisor 事件桥与 PromQL 的 infra watcher——现网在响的
+        // 告警绝大多数是后者，只接前者的话铃铛仍然长期是空的。
+        let bell = match (
+            ctx.consume_service::<dyn cog_core::NotificationStore>(),
+            ctx.consume_service::<dyn cog_core::UserStore>(),
+        ) {
+            (Some(store), Some(users)) => Some(Arc::new(InAppNotifier::new(store, users))),
+            _ => None,
+        };
+        let bell_wired = bell.is_some();
+
+        // ── 站内铃铛：把 firing 却还没通知过人的告警写成通知 ──
+        // 单点生产者。`alerts` 表有四个写入方（supervisor 事件桥、PromQL 的 infra
+        // watcher、配置声明检查、安全网关），在各自写入点直发就要四处各接一次，
+        // 而且接上通知之前就已在响的告警永远补不上。扫表让"还没通知"成为表上的
+        // 一列（`notified_at IS NULL`）：存量在部署后第一轮补发，写失败下一轮重试。
+        if let (Some(store), Some(notifier)) = (self.alert_store.clone(), bell.clone()) {
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or_default();
+            let metrics = ctx.consume_service::<dyn cog_core::MetricsBackend>();
+            let interval = std::time::Duration::from_secs(ALERT_BELL_INTERVAL_SECS);
+            drop(cog_core::loop_health::spawn(
+                ALERT_BELL_LOOP,
+                cog_core::loop_health::Cadence::Periodic(interval),
+                shutdown.clone(),
+                move |beat| {
+                    let store = store.clone();
+                    let notifier = notifier.clone();
+                    let metrics = metrics.clone();
+                    let shutdown = shutdown.clone();
+                    async move {
+                        let mut ticker = tokio::time::interval(interval);
+                        loop {
+                            beat.beat();
+                            tokio::select! {
+                                _ = ticker.tick() => {
+                                    match crate::bell::drain_pending(
+                                        store.as_ref(),
+                                        &notifier,
+                                        metrics.as_ref(),
+                                        ALERT_BELL_BATCH,
+                                    )
+                                    .await
+                                    {
+                                        Ok(0) => {}
+                                        Ok(n) => info!(
+                                            notified = n,
+                                            "firing alerts announced in the notification centre"
+                                        ),
+                                        Err(e) => warn!(
+                                            error = %e,
+                                            "the bell could not read the alerts still waiting to be announced"
+                                        ),
+                                    }
+                                }
+                                _ = shutdown.wait() => return,
+                            }
+                        }
+                    }
+                },
+            ));
+        } else if !bell_wired {
+            info!("notification centre disabled: no notification store or no user store published");
+        }
+
         if alert_store.is_some() || !alert_channels.is_empty() {
             match ctx.consume_service::<dyn cog_core::Supervisor>() {
                 Some(supervisor) => {
@@ -1203,6 +1273,18 @@ const LAG_CONSUMER_ALERT_BRIDGE: &str = "alert_bridge";
 /// 那族循环名同约定）。
 pub const ALERT_BRIDGE_LOOP: &str = "observability_alert_bridge";
 
+/// 通知中心那条扫表循环的名字，报在 `cogneva_loop_*` 的 `loop` 标签上。
+pub const ALERT_BELL_LOOP: &str = "observability_alert_bell";
+
+/// 多久扫一次"在 firing、还没通知过人"的告警。
+///
+/// 与前端 `useNotifications` 的轮询（60 秒）同一量级：更慢会让铃铛比轮询晚
+/// 一整拍才亮，更快只是空转——浏览器不会比这更早看到。
+const ALERT_BELL_INTERVAL_SECS: u64 = 60;
+
+/// 一轮最多发多少条。存量补发时不要一次写几千行把这一轮的墙钟撑破。
+const ALERT_BELL_BATCH: i64 = 200;
+
 fn spawn_alert_bridge(
     channels: Vec<AlertChannel>,
     timeout_secs: u64,
@@ -1283,7 +1365,9 @@ fn spawn_alert_bridge(
                     }
                     // Persist first: the row is what the in-app surface shows,
                     // so whether it was written decides whether this batch
-                    // reached anybody when no external channel exists.
+                    // reached anybody when no external channel exists. The bell
+                    // reads the same table on its own cadence; writing here is
+                    // what makes an alert visible there at all.
                     let persisted = match &store {
                         Some(store) => persist_alerts(store, &alerts).await,
                         None => false,
@@ -1354,6 +1438,12 @@ fn alert_message(inst: &AlertInstance) -> String {
 ///
 /// Returns whether every row in the batch was written: the caller uses that to
 /// decide between "the in-app surface has it" and "nobody was told".
+/// Write a batch into the alert state machine.
+///
+/// Returns whether every row was written. The notification edge is not
+/// extracted here: the bell drains `notified_at IS NULL` rows on its own
+/// cadence, so every writer of this table — including the ones added later —
+/// reaches the same bell without knowing about it.
 async fn persist_alerts(store: &PostgresAlertStore, alerts: &[AlertEvent]) -> bool {
     let mut all_written = true;
     for event in alerts {
