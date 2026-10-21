@@ -21,6 +21,22 @@
 # 判不动的（裸选择器、without(...)、函数套函数、多个向量做算术、ignoring(...) 的
 # 键集要按指标现有标签补齐）**计数上报**，不折进「绿」里：说不清不是一致。
 #
+# 第二段判的是**集合运算**（and / unless）不带 on()/ignoring() 的连接。集合运算
+# 默认按**全部标签**匹配：两侧标签集必须逐字相等才算连上，一侧多一个标签就永远连不上。
+# and 连不上 = 永远空、规则一生不响；unless 连不上 = 左边照单全收、规则恒亮。两种都
+# 不报错，只是读数与事实相反。2026-10-22 实测：`build_gate_host_readings_unpublished`
+# 两侧都写 `max without (pod, container, instance)`，左边是 ceiling、右边是宿主读数，
+# ceiling 带 dimension 标签而宿主读数不带，于是「宿主读数缺席」这一侧从来没有匹配过，
+# 规则在宿主读数齐全时照样点火——17:39 起一直亮着，只在 evolution 进程重启、连 ceiling
+# 也一起消失的那几十秒里被 resolved，读起来像「抖动」，实际是「恒亮」。
+# 判据分两档：
+#   - 两侧都是 by(...)：by 集不相等 = 连不上，违规；
+#   - 任一侧是 without(...)：命中标签集是「指标自己带了什么减去这几个」，静态读不到
+#     指标带了哪些标签（本仓没有标签名册），判不了 —— 逐条点名并计数，不改判词，把
+#     「把匹配键写成 on()/ignoring() 就能判」这件事摆在读者面前；
+#   - 其它形状（裸选择器、函数套函数）计数，不点名。
+# 只判**顶层**（不在聚合括号里）的集合运算；嵌在聚合里的另行计数，不假称判过。
+#
 # 用法：bash deploy/scripts/check-alert-rule-join-shape.sh [cogneva.json 路径] [清单目录]
 # 判词：rc=0 每一个判得动的比较都声明了多的一侧；rc=1 有点不出来的（逐条点名规则与
 #       运算符）；rc=3 规则读不了（看不了一眼不等于一致）。
@@ -135,6 +151,127 @@ def cut_top(s, seps):
 
 def is_scalar(expr):
     return bool(re.match(r'^\s*-?\d+(\.\d+)?\s*$', expr))
+
+
+def join_operand(expr):
+    """集合运算一侧的 (分组种类, 标签集)；判不动时返回 (None, 原因)。
+
+    集合运算不带 on()/ignoring() 时按**全部标签**匹配，所以要判就得分得清两侧各带
+    哪些标签。比较运算符本身不产生标签：`a > on(x) b` 的结果沿用左向量的标签（左是
+    标量时沿用右向量的），所以穿过比较去读它后面那个向量。by 给出的是精确集合；不带
+    分组的聚合把所有标签都收掉，集合为空；without 给的是补集，而补集的底是什么要看
+    指标自己带了哪些标签——本门没有那份名册，所以它只能算「判不动」，不能算绿。
+    """
+    e = strip_outer_parens(expr)
+    left, right = cut_top(e, CMP)
+    if right is not None:
+        if is_scalar(left):
+            return join_operand(right)
+        return join_operand(left)
+    m = AGG.match(e)
+    if not m:
+        return None, 'not an aggregation'
+    # 这四个不带 by() 时保留输入标签（它们挑行，不合并行），所以「没写分组＝空集」
+    # 对它们不成立。
+    keeps_labels = m.group(1) in ('topk', 'bottomk', 'quantile', 'count_values')
+    rest = e[m.end():].lstrip()
+    spec = ('none', frozenset())
+    for kind in ('by', 'without'):
+        if rest.startswith(kind):
+            rest = rest[len(kind):].lstrip()
+            if not rest.startswith('('):
+                return None, 'malformed %s' % kind
+            depth = 0
+            labels = None
+            for i, ch in enumerate(rest):
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        labels = frozenset(
+                            x.strip() for x in rest[1:i].split(',') if x.strip())
+                        rest = rest[i + 1:]
+                        break
+            if labels is None:
+                return None, 'unbalanced %s' % kind
+            spec = (kind, labels)
+            break
+    # 聚合要把它自己那段整个吃掉：`sum by (a) (x) + sum by (b) (y)` 的左侧不是
+    # 「标签集为 {a} 的聚合」，而是一整个算术表达式。
+    rest = rest.lstrip()
+    if not rest.startswith('('):
+        return None, 'aggregation does not cover the operand'
+    close = matching_paren(rest, 0)
+    if close is None or rest[close + 1:].strip():
+        return None, 'aggregation does not cover the operand'
+    if keeps_labels and spec[0] == 'none':
+        return None, 'label-preserving aggregation without by'
+    return spec, spec[0]
+
+
+def set_join_width(masked):
+    """(顶层集合运算, 嵌套集合运算) 的位置表。"""
+    top = []
+    nested = 0
+    depth = 0
+    i = 0
+    while i < len(masked):
+        ch = masked[i]
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        else:
+            for w in ('and', 'unless', 'or'):
+                before_ok = i == 0 or not (masked[i - 1].isalnum() or masked[i - 1] == '_')
+                after = i + len(w)
+                after_ok = after >= len(masked) or not (
+                    masked[after].isalnum() or masked[after] == '_')
+                if masked.startswith(w, i) and before_ok and after_ok:
+                    if depth == 0:
+                        top.append((w, i))
+                    else:
+                        nested += 1
+                    i += len(w) - 1
+                    break
+        i += 1
+    return top, nested
+
+
+def judge_set_joins(promql):
+    """(违规, 判不了的点名, 判不动的个数, 嵌套个数, 判得动的个数)。"""
+    masked = mask_strings(promql)
+    top, nested = set_join_width(masked)
+    violations = []
+    named = []
+    silent = 0
+    judged = 0
+    for op, pos in top:
+        if op == 'or':
+            # or 是并集：两侧标签集不同只是各留各的，不会让一句话变成假的。
+            judged += 1
+            continue
+        tail = masked[pos + len(op):]
+        if re.match(r'\s*(on|ignoring)\s*\(', tail):
+            # 显式给了匹配键：判得动，由上面那段 on() 的比较判。
+            judged += 1
+            continue
+        ls, _ = join_operand(operand_before(masked[:pos]))
+        rs, _ = join_operand(operand_after(tail))
+        if ls is None or rs is None:
+            silent += 1
+            continue
+        if 'without' in (ls[0], rs[0]):
+            # 两侧哪怕写的是同一条 without(...)，底下的指标也可能带不同的标签，
+            # 静态读不到，所以形状相同不构成「连得上」的证据。
+            named.append((op, ls, rs))
+            continue
+        if ls[1] != rs[1]:
+            violations.append((op, sorted(ls[1]), sorted(rs[1])))
+        else:
+            judged += 1
+    return violations, named, silent, nested, judged
 
 
 def label_set(expr):
@@ -289,6 +426,10 @@ def main(path, manifest_dir):
     unjudged = 0
     judged = 0
     no_on = 0
+    set_judged = 0
+    set_named = 0
+    set_silent = 0
+    set_nested = 0
     for rule in rules:
         violations, skipped, ok, plain = judge(rule.get('promql') or '')
         unjudged += skipped
@@ -298,9 +439,27 @@ def main(path, manifest_dir):
             bad += 1
             print('%s: `%s on(%s)` 把 %s 与 %s 相连，却没写 group_left/group_right'
                   % (rule.get('name', '?'), op, ','.join(keys), lb, rb))
+        set_bad, set_unjudgeable, set_hidden, set_nested_one, set_ok = judge_set_joins(
+            rule.get('promql') or '')
+        set_nested += set_nested_one
+        set_silent += set_hidden
+        set_judged += set_ok
+        for op, lb, rb in set_bad:
+            bad += 1
+            print('%s: `%s` 两边不带 on()/ignoring() 时按全部标签匹配，左边 %s 与右边 %s '
+                  '不可能相等——这条规则要么永远不成立（and），要么恒成立（unless）'
+                  % (rule.get('name', '?'), op, lb, rb))
+        for op, ls, rs in set_unjudgeable:
+            set_named += 1
+            print('%s: `%s` 两侧用了 %s(...)，命中的标签集取决于指标自己带了什么，'
+                  '本门判不了；要它可判，把匹配键写成 on(...)/ignoring(...)'
+                  % (rule.get('name', '?'), op, ls[0] if ls[0] == 'without' else rs[0]))
     print('check-alert-rule-join-shape: %d 条规则；判得动 %d 个带 on() 的比较，'
           '判不动 %d 个，违规 %d 处；另 %d 个比较不带 on()（不在本门射程内）'
           % (len(rules), judged, unjudged, bad, no_on))
+    print('check-alert-rule-join-shape: 集合运算（顶层 and/unless）判不了 %d 个、'
+          '形状判不动 %d 个、嵌在聚合里不在射程 %d 个；判得动的 %d 个'
+          % (set_named, set_silent, set_nested, set_judged))
     stray = stray_manifest_joins(manifest_dir)
     if stray is None:
         print('check-alert-rule-join-shape: 清单目录读不了（%s）：射程有没有缺口不知道，'

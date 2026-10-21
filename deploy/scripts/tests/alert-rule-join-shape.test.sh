@@ -92,7 +92,10 @@ grep -q '判不动 1 个' <<<"${out}" || fail "ignoring 的比较没有被记进
 ok "ignoring -> 绿但记判不动"
 
 # 5. 同一条规则两个 on() 比较、只缺一个 group_*：正好 1 处。
-mkvariant twojoins '{"build_gate_slot_held_too_long": "(max by (dir, role) (cogneva_build_gate_holder_seconds) > on(dir, role) max by (dir, role) (cogneva_build_gate_wait_budget_ms)) and (max by (dir, role, slot) (cogneva_build_gate_wait_seconds) > on(dir, role) max by (dir, role) (cogneva_build_gate_wait_budget_ms))"}'
+#    两段之间用 or 而不是 and：这里要考的是「两条比较逐条判、只报缺的那一条」，而
+#    and 会顺带考到第二段判据（两条比较的输出标签集 {dir,role} 与 {dir,role,slot} 不
+#    相等，那个 and 自己就永远连不上，是另一件事）。用例只该问一件事。
+mkvariant twojoins '{"build_gate_slot_held_too_long": "(max by (dir, role) (cogneva_build_gate_holder_seconds) > on(dir, role) max by (dir, role) (cogneva_build_gate_wait_budget_ms)) or (max by (dir, role, slot) (cogneva_build_gate_wait_seconds) > on(dir, role) max by (dir, role) (cogneva_build_gate_wait_budget_ms))"}'
 set +e
 out="$(bash "${gate}" "${work}/twojoins")"; rc=$?
 set -e
@@ -144,4 +147,25 @@ set -e
 grep -q '判词记 3' <<<"${out}" || fail "清单目录读不了时没说「判词记 3」：${out}"
 ok "射程守卫：清单里的连接红并点名，真清单绿，清单目录读不了记 3"
 
-echo "alert-rule-join-shape: 7 组用例全绿"
+# 8. 集合运算（and / unless）不带 on()/ignoring()：默认按全标签集匹配。
+#    8a 两侧 by 集不等 -> 连不上，红：and 恒空（规则一生不响）、unless 恒亮（永远在报）。
+mkvariant setjoin_bad '{"build_gate_slot_held_too_long": "max by (dir, role) (cogneva_build_gate_holder_seconds) unless max by (dir, role, slot) (cogneva_build_gate_wait_budget_ms)"}'
+set +e
+out="$(bash "${gate}" "${work}/setjoin_bad")"; rc=$?
+set -e
+[ "${rc}" -eq 1 ] || fail "两侧 by 集不等的 unless 应红，实际 rc=${rc}：${out}"
+grep -q '不可能相等' <<<"${out}" || fail "集合运算的判词没说「不可能相等」：${out}"
+ok "集合运算两侧 by 集不等 -> 红（连不上）"
+
+#    8b 两侧 without(...)：命中标签集取决于指标自己带了什么，判不了 -> 点名但判词不改，
+#       并且不许因为「两侧形状一样」就当成连得上（2026-10-22 的恒亮规则正是这个形状）。
+mkvariant setjoin_without '{"build_gate_slot_held_too_long": "max without (pod, container, instance) (cogneva_build_gate_holder_seconds) unless max without (pod, container, instance) (cogneva_build_gate_wait_budget_ms)"}'
+set +e
+out="$(bash "${gate}" "${work}/setjoin_without")"; rc=$?
+set -e
+[ "${rc}" -eq 0 ] || fail "without 判不了，不应改判词（rc=0），实际 rc=${rc}：${out}"
+grep -q 'build_gate_slot_held_too_long' <<<"${out}" || fail "判不了的集合运算没有点名规则：${out}"
+grep -q '两侧用了 without' <<<"${out}" || fail "判词没说清为什么判不了：${out}"
+ok "集合运算两侧 without(...) -> 点名判不了，不当成绿"
+
+echo "alert-rule-join-shape: 8 组用例全绿"
