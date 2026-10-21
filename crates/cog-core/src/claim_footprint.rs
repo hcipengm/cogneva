@@ -181,7 +181,8 @@ pub fn used_bytes_from_exposition(text: &str, claim: &str) -> Option<u64> {
         })
 }
 
-/// Mount points of this process's own mount namespace, unreadable ones omitted.
+/// Mount points of this process's own mount namespace, unreadable ones and
+/// directory-onto-itself binds omitted (see [`parse_mounts`]).
 ///
 /// Empty is a real answer — a container with no submounts under its volumes, or
 /// a platform where the table cannot be read. It degrades towards over-counting
@@ -193,12 +194,37 @@ pub fn current_mounts() -> Vec<PathBuf> {
     let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return Vec::new();
     };
+    parse_mounts(&text)
+}
+
+/// The mount points in a mountinfo table, minus the ones that mount a directory
+/// onto itself.
+///
+/// A store is allowed to bind-mount one of its own subdirectories back over
+/// itself -- the rootful build stores do exactly that for `storage/overlay` --
+/// and the entry is indistinguishable from a real submount by mount point alone.
+/// Excluding it would drop everything under that directory from the walk: the
+/// podman store measured 178 MB against the 55 GB it holds, because the only
+/// entry that carries any size was the one skipped. Whether it is a real
+/// submount is in the root field: a self-bind has the same path there as in the
+/// mount point, while a mount of something else has a different one.
+fn parse_mounts(text: &str) -> Vec<PathBuf> {
     text.lines()
         .filter_map(|line| {
             // `<id> <parent> <maj:min> <root> <mount point> <opts> [more] - <fstype> <src> <super opts>`
             let head = line.split(" - ").next()?;
-            let field = head.split_whitespace().nth(4)?;
-            Some(PathBuf::from(unescape_mount_field(field)))
+            let mut fields = head.split_whitespace();
+            let root = fields.nth(3)?;
+            let mount_point = fields.next()?;
+            let root = unescape_mount_field(root);
+            let mount_point = unescape_mount_field(mount_point);
+            // The root mount has `/` on both sides and is not a self-bind: a
+            // bind of a directory onto itself always names a path below the
+            // root, because the root is where that path is already mounted.
+            if root == mount_point && mount_point != "/" {
+                return None;
+            }
+            Some(PathBuf::from(mount_point))
         })
         .collect()
 }
@@ -441,6 +467,30 @@ mod tests {
         // The root is not its own exclusion: excluding it would make the volume
         // report zero forever.
         assert!(nested_mounts_under(&root, std::slice::from_ref(&root)).is_empty());
+    }
+
+    /// A store that bind-mounts one of its own subdirectories over itself has a
+    /// mount entry that a mount point alone cannot tell from a real submount.
+    /// Reading it as one excludes that directory from the walk, and for the
+    /// rootful build stores that directory is everything: measured live, the
+    /// podman store came out at 178 MB against the 55 GB it holds.
+    #[test]
+    fn a_directory_mounted_onto_itself_is_not_an_exclusion() {
+        let table = concat!(
+            "25 1 252:0 / / rw,relatime - ext4 /dev/mapper/vg-root rw\n",
+            // A real submount: root and mount point differ.
+            "3968 25 0:50 / /var/lib/rancher/k3s/storage/pvc-a rw - ext4 /dev/loop0 rw\n",
+            // The self-bind the podman store carries.
+            "3969 25 252:0 /var/lib/containers/storage/overlay",
+            " /var/lib/containers/storage/overlay rw,relatime - ext4 /dev/mapper/vg-root rw\n",
+        );
+        assert_eq!(
+            parse_mounts(table),
+            vec![
+                PathBuf::from("/"),
+                PathBuf::from("/var/lib/rancher/k3s/storage/pvc-a"),
+            ]
+        );
     }
 
     /// The two facts the exclusion needs — that a mount exists and where — come
