@@ -443,7 +443,7 @@ SELECT block, \
        CASE state WHEN 'landed' THEN 'landed' WHEN 'retired' THEN 'retired' \
                   ELSE 'owed' END AS state, \
        count(*) AS n, \
-       max(EXTRACT(EPOCH FROM (now() - COALESCE(measured_at, first_seen_at)))) \
+       max(EXTRACT(EPOCH FROM (now() - COALESCE(measured_at, first_seen_at))))::float8 \
          AS oldest_unmeasured_secs \
   FROM change_ledger \
  GROUP BY 1, 2";

@@ -1226,6 +1226,88 @@ async fn a_demand_is_satisfied_by_a_landing_and_owed_until_one_is_measured() {
     cleanup(&pool, &marker).await;
 }
 
+/// The face census reads every bucket and the age of a face's oldest owed row,
+/// and the age has to arrive as a number rather than as an interval.
+///
+/// This is the one reading in the census that is computed by the server rather
+/// than counted, and the type it comes back as is the database's decision, not
+/// the statement's apparent one: `EXTRACT(EPOCH FROM ...)` yields `NUMERIC` on
+/// a server new enough to have the interval arithmetic, so a row decoded as a
+/// float fails to decode at all -- and a store that answered with an error there
+/// published no face cell, which reads exactly like a deployment whose census
+/// was never wired. Nothing without a live server can catch that: a fake store
+/// returns the Rust type the fake chose, so the mismatch only exists across the
+/// wire. The buckets are checked beside it for the same reason the retired cell
+/// exists -- three buckets that add up to the face's population are what let a
+/// face that finished be told from one that retired its work.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn the_face_census_reads_a_number_for_the_age_and_three_buckets_that_add_up() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "census");
+    let doc = format!("{marker}.md");
+
+    store
+        .declare(&[ChangeReading {
+            identity: id.clone(),
+            title: Some("a change the probe files under a face".into()),
+            assertion: None,
+            source: ChangeSource {
+                doc: doc.clone(),
+                verdict: None,
+                priority: ChangePriority::Unstated,
+                block: ChangeBlock::Principles,
+            },
+        }])
+        .await
+        .expect("queue the declaration");
+    store
+        .fold_declarations(10_000, Some("probe-rev-census"))
+        .await
+        .expect("fold the declaration in");
+
+    let census = store
+        .block_census()
+        .await
+        .expect("read the face census")
+        .expect("a Postgres store answers the census");
+    let face = census
+        .iter()
+        .find(|row| row.block == ChangeBlock::Principles)
+        .unwrap_or_else(|| panic!("the declared face is counted; the census holds {census:?}"));
+    assert!(
+        face.owed >= 1,
+        "a declared change nobody measured is owed on its face: {face:?}"
+    );
+    assert!(
+        face.oldest_unmeasured_secs.is_some(),
+        "an owed row that was never measured has an age from the moment it first \
+         appeared, and the age is a number -- `None` here is the read failing to \
+         decode rather than every row in the face having been measured: {face:?}"
+    );
+    assert!(
+        census.iter().any(|row| row.block == ChangeBlock::None),
+        "a row whose documents name no face is counted too: a census that dropped \
+         the unfiled population would answer about the programme while reading as \
+         the whole account: {census:?}"
+    );
+
+    // The other two readings over the same account decode against the server as
+    // well; they are one statement each and nothing without a server checks them.
+    store
+        .blocking_surface()
+        .await
+        .expect("read the blocking surface")
+        .expect("a Postgres store answers the blocking surface");
+    store
+        .blocking_holders()
+        .await
+        .expect("read the blocking holders")
+        .expect("a Postgres store answers the blocking holders");
+
+    cleanup(&pool, &marker).await;
+}
+
 async fn cleanup(pool: &PgPool, marker: &str) {
     sqlx::query("DELETE FROM change_ledger WHERE scope LIKE $1")
         .bind(format!("{marker}/%"))
