@@ -959,7 +959,12 @@ const HOST_PRESSURE_AVG60: &str = "cogneva_host_pressure_avg60";
 const HOST_DISK_FREE_BYTES: &str = "cogneva_host_disk_free_bytes";
 /// What each dimension answers on its own, beside the ceiling that takes the
 /// smallest of them.
-const BUILD_GATE_DIMENSION_CEILING: &str = "cogneva_build_gate_dimension_ceiling";
+///
+/// `pub` because it is a series this build serves, and the tree-wide name
+/// census reads a producer's name only from a `pub const` or a `RawMetric::new`
+/// call: a private one leaves the name in no table at all, so what reads it
+/// goes unchecked.
+pub const BUILD_GATE_DIMENSION_CEILING: &str = "cogneva_build_gate_dimension_ceiling";
 
 /// The bound to enforce next, from the bound in force and what the host is
 /// showing.

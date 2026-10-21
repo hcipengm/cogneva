@@ -268,6 +268,27 @@ const UNREGISTERED: &[(&str, Unread)] = &[
         "cogneva_owner_leases",
         Unread::NotAReading("the Postgres table the owner-lease rows live in, not a series: the same constant is also listed in NOT_A_SERIES so the literal scan does not read it as a producer"),
     ),
+    // The volume-growth loop's two numbers, `declared` and `peak` per claim.
+    // The loop reads them -- the raise is decided from peak times its headroom
+    // against declared -- but a decision taken inside a process is not a face:
+    // the outcome it wrote is what the rules read, and the pair it decided
+    // from is left for a person to look up by hand, which is exactly what the
+    // clamped rule's summary tells a reader to do. So the debt is real and it
+    // is the reading surface, not the producer: nothing draws peak against
+    // declared for the claim an outcome rule has just named.
+    (
+        "cogneva_volume_capacity_bytes",
+        Unread::Gap("the request in force and the highest measured peak, per claim, in two `state` values. The growth loop decides from these and never publishes what it decided from -- `cogneva_volume_capacity_outcome_total` is the face, and the clamped rule's own summary sends a reader here to tell 'the ceiling is wrong' from 'the volume is growing faster than the policy assumed'. A sentence telling a person where to look is not a face, so what is owed is a rule or panel drawing the pair per claim"),
+    ),
+    // Four answers behind one decision reading. The ceiling the gate acts on is
+    // published separately with the binding dimension in a label, so a reader
+    // sees which dimension won but not by how much -- `cpu 6, memory 2` and
+    // `cpu 6, memory 5` read identically on the decision series while meaning
+    // very different hosts. Nothing names this one.
+    (
+        "cogneva_build_gate_dimension_ceiling",
+        Unread::Gap("how many builds each of the four dimensions would allow on its own, one series per `dimension`. The gate takes their smallest and republishes it with the winner's name on `cogneva_build_gate_ceiling`, which states which dimension binds but not the spread behind it -- and the spread is what separates a host that is nearly memory-bound from one where memory is the only thing that will ever move. It also is the whole answer when the ceiling is overridden, where the decision series says only `override`. No rule or panel draws it, so the debt is a face"),
+    ),
 ];
 
 /// How many `Gap` entries this census left.
@@ -324,7 +345,17 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// the one left behind -- the four other task-graph readings still have no
 /// reader, and the count's own bound still has no rule -- but the census asks
 /// whether anything reads a name, and now something does.
-const GAPS_AT_SCRAPE_CENSUS: usize = 13;
+///
+/// Fifteen, and the two that took it there were published by another round's
+/// producers and reached this census with no face and, in one case, no name in
+/// any table: `cogneva_build_gate_dimension_ceiling` was declared `const`
+/// rather than `pub const`, so the declaration scan never saw it and only the
+/// literal scan's red brought it into view. Qualifying it was the first half of
+/// the fix -- a series this build serves has to be visible to the scan that
+/// asks what reads it -- and filing the debt was the second, because nothing
+/// does. Both entries are decisions a person would want to see and neither has
+/// a rule or a panel behind it.
+const GAPS_AT_SCRAPE_CENSUS: usize = 15;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.
