@@ -111,8 +111,13 @@ for profile in k3s-single k3s-multi; do
 
   # Mutation control: a limit that cannot coincide with anything else in the tree.
   # If the number were a constant, or read from the wrong carrier, this would not
-  # move. It stays within the headroom (3 cores on top of the rendered set is
-  # still under the ceiling) so the gate stays green and the numbers are printed.
+  # move. It moves **down** so it cannot collide with anything: the headroom is
+  # shared with two other declared figures, and a value picked to sit "under the
+  # ceiling" stops sitting there the moment either of them or the rendered set
+  # grows -- which is what happened when the runtime-pod budget was added and the
+  # claim store's limits were raised under a fixed 3-core mutation. Lowering the
+  # limit only ever increases the headroom, so this leg keeps testing "the number
+  # follows the declaration" without also pinning three other figures.
   mutated="${work}/mutated-${profile}"
   cp -r "${dir}" "${mutated}"
   python3 - "${mutated}" <<'PYEOF'
@@ -125,7 +130,7 @@ for path in sorted(glob.glob(os.path.join(target, "*.yaml"))):
     for d in docs:
         data = d.get("data") or {}
         if "COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_LIMIT" in data:
-            data["COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_LIMIT"] = "3"
+            data["COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_LIMIT"] = "0.5"
             hit = True
     if hit:
         with open(path, "w") as fh:
@@ -134,8 +139,8 @@ PYEOF
   bash "${gate}" "${mutated}" > "${work}/mutated-${profile}.out" 2>&1 \
     || fail "the gate is red on the mutated ${profile}"
   read -r _ mutated_together < <(read_cpu "${work}/mutated-${profile}.out")
-  [ $(( mutated_together - alone )) -eq 3000 ] \
-    || fail "${profile}: raising the declared limit to 3 cores moved the reading to ${mutated_together}m from ${alone}m, not by 3000m"
+  [ $(( mutated_together - alone )) -eq 500 ] \
+    || fail "${profile}: moving the declared limit to 0.5 cores moved the reading to ${mutated_together}m from ${alone}m, not by 500m"
 
   # Verdict control: once the rendered set plus the judgement Job passes the
   # ceiling the gate must go red -- the Job is inside the verdict now, not a note.
