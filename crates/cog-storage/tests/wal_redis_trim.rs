@@ -1,3 +1,4 @@
+//! principle: feedback_a_bound_enforced_on_write_leaves_every_object_nobody_writes_anymore_over_it
 //! What a capped agent log is, against a live Redis.
 //!
 //! The log is a list that is appended to for as long as an agent lives and is

@@ -1,3 +1,4 @@
+//! principle: feedback_a_row_that_outlives_its_process_cannot_be_closed_only_by_the_one_that_opened_it
 //! Is the document this process runs the one its revision declares?
 //!
 //! The alert rules live in the configuration document, so the delivery of that

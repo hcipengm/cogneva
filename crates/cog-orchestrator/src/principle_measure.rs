@@ -1,3 +1,4 @@
+//! principle: feedback_a_short_circuit_decides_which_evidence_you_can_never_see
 //! Deciding whether anything enforces a principle, from the registries alone.
 //!
 //! Two registries answer, and neither of them is prose. The host side's column

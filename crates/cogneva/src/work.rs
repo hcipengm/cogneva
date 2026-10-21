@@ -1,3 +1,4 @@
+//! principle: feedback_an_observation_store_must_outlive_the_window_its_readers_compare_against
 //! `cogneva work` — the out-of-band worker's side of the task graph.
 //!
 //! A worker that runs outside the platform process (a shell in a session, a

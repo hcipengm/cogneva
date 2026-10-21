@@ -1,3 +1,5 @@
+//! principle: feedback_a_named_sample_that_falls_back_to_the_default_answers_a_different_question
+//! principle: feedback_a_rotation_ranked_by_never_proven_must_exclude_the_always_picked_one
 //! `cogneva backup` / `cogneva restore`：把权威数据面打成可搬运备份包。
 //!
 //! 权威面 = 关系数据（逻辑导出）+ 向量索引（服务端一致性快照）+ 对象 raw 层

@@ -1,3 +1,4 @@
+//! principle: feedback_a_description_filed_under_the_wrong_kind_is_not_a_description
 //! What each recorded series means, by kind.
 //!
 //! A name says what is measured only when it is self-explanatory, and most of

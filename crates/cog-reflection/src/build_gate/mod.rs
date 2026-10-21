@@ -1,3 +1,4 @@
+//! principle: feedback_a_caller_must_record_the_answer_to_its_write_not_its_intent
 //! A host-wide gate on how many builds run at once.
 //!
 //! The gate lives here, beside the builds it bounds, and not in `cog-core`:

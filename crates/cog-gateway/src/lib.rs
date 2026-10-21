@@ -1,3 +1,4 @@
+//! principle: feedback_a_merge_keyed_by_rule_name_collapses_instances_the_store_kept
 //! principle: feedback_a_snapshot_of_an_edge_may_not_shadow_a_refreshed_condition_row
 use axum::{
     extract::{MatchedPath, Path, Query, Request, State, WebSocketUpgrade},

@@ -1,3 +1,5 @@
+//! principle: feedback_a_debt_count_comes_down_by_writing_the_reader_not_by_deleting_the_registration
+//! principle: feedback_a_registration_row_is_evidence_only_if_its_producer_still_spells_the_name
 //! principle: feedback_a_retired_name_is_a_third_face_the_census_must_read_from_the_list
 //! Every series this build can render is on a face that records it.
 //!

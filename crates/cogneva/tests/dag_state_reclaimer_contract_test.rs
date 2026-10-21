@@ -1,3 +1,4 @@
+//! principle: feedback_a_readiness_rule_that_requires_completed_leaves_settled_dependents_with_no_reviser
 //! Gate: every task state a task can rest in has a code path that revisits it.
 //!
 //! A state whose only exit is an external event — the ready message being

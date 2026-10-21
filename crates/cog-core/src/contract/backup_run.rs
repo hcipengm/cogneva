@@ -1,3 +1,4 @@
+//! principle: feedback_a_verdict_must_not_absorb_evidence_it_does_not_test
 //!Contract for the backup account: one durable row per backup run, and the
 //!answers a reader takes from it.
 //!

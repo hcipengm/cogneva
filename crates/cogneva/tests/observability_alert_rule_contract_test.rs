@@ -1,3 +1,7 @@
+//! principle: feedback_a_closed_state_set_must_route_an_unrecognized_verdict_to_a_non_pass_state
+//! principle: feedback_a_row_is_an_event_so_the_agreeing_state_needs_its_own_series
+//! principle: feedback_a_rule_and_the_name_it_reads_are_locked_by_two_censuses_that_guard_opposite_directions
+//! principle: feedback_a_rule_that_certifies_a_window_must_require_the_window_to_be_covered
 //! principle: feedback_a_metric_vanishing_from_the_reader_census_means_the_clause_is_illegal
 //! principle: feedback_a_pair_exclusion_shipped_before_its_label_matches_nothing
 //! principle: feedback_a_registration_table_grows_only_where_its_consumers_are

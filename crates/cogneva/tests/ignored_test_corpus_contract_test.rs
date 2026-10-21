@@ -1,3 +1,4 @@
+//! principle: feedback_a_consumer_that_reads_literal_shape_needs_the_text_kept_in_that_shape_not_an_exception
 //! The workflow's `--ignored` steps and the workspace's ignore-marked tests
 //! have to name each other.
 //!

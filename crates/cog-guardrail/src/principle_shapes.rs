@@ -1,3 +1,4 @@
+//! principle: feedback_a_narrowing_is_accepted_by_the_cause_of_each_row_it_flips
 //! principle: feedback_meta_autonomy_decide_from_principles
 //! principle: feedback_shared_tree_add_only_your_own_paths
 //! principle: feedback_no_claude_attribution
