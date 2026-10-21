@@ -7,8 +7,10 @@
 # 消费者在跑，而它记的全是记录者自己造的那堵墙**——计数面全绿，账里却没有一件外面的
 # 事。所以这一面读 **subject 分布**，并把每个 subject 归一分档：
 #
-#   self_raised —— 平台自己的控制律造的墙（`build_gate.*`、`mainline advance:busy`、
-#                  `volume_capacity.*`）；
+#   self_raised —— 平台自己的控制律造的墙（`build_gate.*`、`volume_capacity.*`，以及
+#                  `build_gate` 四个墙名 `<asker>:busy|waited_out|maintenance_hold|queue_ahead`
+#                  ——同一道闸门的四种关法，按整条 subject 只认 `busy` 会把另外三种
+#                  读成「外面又多了一堵墙」）；
 #   external    —— 别的东西造的墙（`mainline advance:quota|limitrange|podsecurity` 等）。
 #
 # **external=0 不是判词**：那堵墙可能只是还没拒过这一次。「配额没满过」与「配额拒绝没
@@ -75,7 +77,10 @@ fi
 # 不影响任何退出码。
 is_self_raised() {
   case "$1" in
-    build_gate.*|"mainline advance:busy"|volume_capacity.*) return 0 ;;
+    build_gate.*|volume_capacity.*) return 0 ;;
+    # 闸门的四种关法，形状是 `<asker>:<wall>`。只认这个账当初先见到的那一种，
+    # 会把另外三种归到「别人造的墙」——而那一种读法正好让账显得比实际健康。
+    *:busy|*:waited_out|*:maintenance_hold|*:queue_ahead) return 0 ;;
     *) return 1 ;;
   esac
 }

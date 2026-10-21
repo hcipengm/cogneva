@@ -80,7 +80,15 @@ out="$(run "${work}/garbage.tsv")"; rc=$?
 ck_rc "认不得的输出退出码 3" 3 "$rc"
 ck_has "认不得时说认不得" "resource_account_verdict=unreadable" "$out"
 
-# 6. 卷容量环写的两族 subject：一堵自造墙（clamp）与一次界变动（grew）。
+# 6. 同一道闸门的另外三种关法（等超了、前面有人占着、缓存清扫占着场）也是自造的墙，
+#    不因为当初先见到的是 `busy` 就把它们读成外面的墙。
+printf '1TOT\t4\t0\t\t\t\n2KIND\tadmission_refusal\trefused\t4\tx\ty\n3SUBJ\tadmission_refusal\tmainline advance:busy\t1\tx\ty\n3SUBJ\tadmission_refusal\tmainline advance:waited_out\t1\tx\ty\n3SUBJ\tadmission_refusal\tmainline advance:queue_ahead\t1\tx\ty\n3SUBJ\tadmission_refusal\tmainline advance:maintenance_hold\t1\tx\ty\n' >"${work}/walls.tsv"
+out="$(run "${work}/walls.tsv")"; rc=$?
+ck_rc "闸门四堵墙都可读" 0 "$rc"
+ck_has "四堵墙全归自造" "coverage kind=admission_refusal subjects=4 self_raised=4 external=0" "$out"
+ck_absent "另外三种关法不冒充外部墙" "external kind=" "$out"
+
+# 7. 卷容量环写的两族 subject：一堵自造墙（clamp）与一次界变动（grew）。
 printf '1TOT\t2\t0\t\t\t\n2KIND\tadmission_refusal\trefused\t1\tx\ty\n2KIND\tbound_change\tapplied\t1\tx\ty\n3SUBJ\tadmission_refusal\tvolume_capacity.cogneva-evolution-source-pvc@admission_ceiling\t1\tx\ty\n3SUBJ\tbound_change\tvolume_capacity.cogneva-evolution-source-pvc\t1\tx\ty\n' >"${work}/volume.tsv"
 out="$(run "${work}/volume.tsv")"; rc=$?
 ck_rc "卷容量环的账可读" 0 "$rc"
