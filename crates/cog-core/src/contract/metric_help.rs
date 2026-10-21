@@ -1661,6 +1661,20 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          move is a ledger emptying itself by retiring rows rather than by \
          completing them. Both are written or neither, from the intake joined to \
          the account, and a store that cannot answer writes no demand cell. \
+         blocking_rows and held_landings are what the account is holding in \
+         front of itself: a change a commit delivered while the account still \
+         owes it is holding the line, because its claim is in the tree and not \
+         yet true there, and every other row measured at that same revision is \
+         standing on it. blocking_rows counts the holders and held_landings \
+         counts the rows behind them, each row once however many holders it \
+         stands on. They are written together and never as one number: a holder \
+         count alone cannot say whether one change is holding one row or the \
+         whole owed set, and a held count alone cannot say how many unrelated \
+         changes are behind it. block_conflicts counts the rows whose documents \
+         name more than one face of the programme -- the folded face column \
+         answers none for that case and for silence alike, and only this cell \
+         tells the two apart. A store that cannot answer writes none of the \
+         three rather than zeros. \
          Which of held_back's two causes a pass \
          was is not in this family: a paused pass hands nothing over at all, so a \
          pass that handed something over and still has rows held back is one whose \
@@ -1705,6 +1719,26 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          rather than by a label: a reader takes the two at one timestamp, which \
          is what the debt's own panel does, and neither family has to carry a \
          value that changes under its own label",
+    ),
+    (
+        "cogneva_change_block_census",
+        "The change account counted by the face of the programme its declaring \
+         documents named, on every change-ledger pass -- block (a closed set: \
+         token, resources, principles, change, persistence, communication, and \
+         none for rows no document filed or whose documents name more than one \
+         face) and reading (landed, owed, or oldest_unmeasured_seconds). The \
+         grouping answers a question the account's contents could not: how far \
+         along a face is. Its rows were always there; the heading was only in \
+         prose, so the answer depended on which substring search the reader \
+         typed. Every face is written on every pass, including ones that owe \
+         nothing, because a face missing from the census reads as a face that \
+         finished. oldest_unmeasured_seconds is the age of the owed row in that \
+         face that has gone longest without a measurement, taken from its entry \
+         time when nothing has measured it at all -- a row that was never \
+         measured is not ageless, it has been waiting since it arrived. Rows \
+         whose documents disagree about the face are folded into none and \
+         counted separately in cogneva_change_dispatch_readouts as \
+         block_conflicts, so a disagreement never reads as silence",
     ),
     (
         "cogneva_change_write_windows",

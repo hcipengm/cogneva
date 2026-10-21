@@ -15,9 +15,9 @@ use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
 use cog_core::{
-    ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangePriority,
-    ChangeReading, ChangeReopen, ChangeSource, ChangeState, DemandClosure, DispatchState,
-    RetireReason, SFError, SFResult, WriteWindow,
+    BlockCensus, BlockingSurface, ChangeBlock, ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore,
+    ChangeMeasurement, ChangePriority, ChangeReading, ChangeReopen, ChangeSource, ChangeState,
+    DemandClosure, DispatchState, RetireReason, SFError, SFResult, WriteWindow,
 };
 
 /// Every read returns these, in one place so no two readers can come back with
@@ -176,6 +176,11 @@ impl PostgresChangeLedgerStore {
                     .map_err(|e| format!("priority: {e}"))?
                     .parse()
                     .map_err(|e| format!("priority: {e}"))?,
+                block: row
+                    .try_get::<String, _>("block")
+                    .map_err(|e| format!("block: {e}"))?
+                    .parse()
+                    .map_err(|e| format!("block: {e}"))?,
             },
         })
     }
@@ -229,16 +234,16 @@ impl PostgresChangeLedgerStore {
 /// for rows that predate the reason column.
 ///
 /// The parameters are, in order: kind, scope, literal, title, assertion, doc,
-/// verdict, band, entry revision. The ninth is the last *column* but not the
-/// last parameter -- it takes the value slot after `sources`, whose expression
-/// needs the band before it. That gap is where a bind can be written down in
-/// the wrong place and still compile: binding the band after the revision made
-/// the band column hold a revision, and nothing but a live database reading the
-/// row back could tell. The parameter list is written here, next to the
-/// statement, because the numbering is not the column order.
+/// verdict, band, face, entry revision. The tenth is the last *column* but not
+/// the last parameter -- it takes the value slot after `sources`, whose
+/// expression needs the band and the face before it. That gap is where a bind
+/// can be written down in the wrong place and still compile: binding the band
+/// after the revision made the band column hold a revision, and nothing but a
+/// live database reading the row back could tell. The parameter list is written
+/// here, next to the statement, because the numbering is not the column order.
 const RECORD_READING_SQL: &str = "\
 INSERT INTO change_ledger (kind, scope, literal, state, title, assertion, sources, first_seen_rev)
-VALUES ($1, $2, $3, 'pending', $4, $5, jsonb_build_array(jsonb_build_object('doc', $6, 'verdict', $7, 'priority', $8)), $9)
+VALUES ($1, $2, $3, 'pending', $4, $5, jsonb_build_array(jsonb_build_object('doc', $6, 'verdict', $7, 'priority', $8, 'block', $9)), $10)
 ON CONFLICT (kind, scope, literal) DO UPDATE SET
     title = COALESCE(EXCLUDED.title, change_ledger.title),
     assertion = COALESCE(EXCLUDED.assertion, change_ledger.assertion),
@@ -251,12 +256,13 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
             SELECT 1 FROM jsonb_array_elements(change_ledger.sources) AS cited(entry)
             WHERE cited.entry->>'doc' = $6
               AND (cited.entry->>'verdict' IS DISTINCT FROM $7
-                   OR cited.entry->>'priority' IS DISTINCT FROM $8)
+                   OR cited.entry->>'priority' IS DISTINCT FROM $8
+                   OR COALESCE(cited.entry->>'block', 'none') IS DISTINCT FROM $9)
         ) THEN (
             SELECT jsonb_agg(
                 CASE
                     WHEN cited.entry->>'doc' = $6
-                    THEN jsonb_build_object('doc', $6, 'verdict', $7, 'priority', $8)
+                    THEN jsonb_build_object('doc', $6, 'verdict', $7, 'priority', $8, 'block', $9)
                     ELSE cited.entry
                 END
             )
@@ -371,6 +377,64 @@ SELECT count(*) FILTER (WHERE l.state = 'landed') AS satisfied, \
   FROM change_ledger_declared d \
   LEFT JOIN change_ledger l \
     ON (l.kind, l.scope, l.literal) = (d.kind, d.scope, d.literal)";
+
+/// What the account is holding in front of the rest of itself.
+///
+/// A holder is a change a commit delivered while the account still owes it: the
+/// line is carrying a claim the tree has not confirmed. What it holds is every
+/// other row measured on that same revision -- those measurements stand on a
+/// tree that contains a change nobody has confirmed, so the honest description
+/// of them is "not settled yet", and the holder is the row to look at first.
+/// This is the only blocking relation the account can measure about itself:
+/// which gates are red and who is waiting on a build are held by processes
+/// outside it, while delivery and measurement are its own facts.
+///
+/// `DISTINCT` on the held rows, because a row measured at a revision that two
+/// holders both delivered is one row behind two changes, not two rows.
+///
+/// `block_conflicts` is the ambiguity the folded `block` column cannot state:
+/// it folds both "nobody named a face" and "two documents named different
+/// faces" to `none`, and a reader that saw only the column would read a
+/// disagreement as silence.
+const BLOCKING_SURFACE_SQL: &str = "\
+WITH holder AS ( \
+    SELECT kind, scope, literal, delivered_rev FROM change_ledger \
+     WHERE delivered_rev IS NOT NULL AND state NOT IN ('landed', 'retired') \
+), held AS ( \
+    SELECT DISTINCT l.kind, l.scope, l.literal \
+      FROM change_ledger l JOIN holder h ON l.measured_rev = h.delivered_rev \
+     WHERE (l.kind, l.scope, l.literal) IS DISTINCT FROM (h.kind, h.scope, h.literal) \
+) \
+SELECT (SELECT count(*) FROM holder) AS holders, \
+       (SELECT count(*) FROM held) AS held_landings, \
+       (SELECT count(*) FROM change_ledger l \
+         WHERE l.state NOT IN ('landed', 'retired') \
+           AND (SELECT count(DISTINCT entry->>'block') \
+                  FROM jsonb_array_elements(l.sources) AS entry \
+                 WHERE entry->>'block' IN ('token', 'resources', 'principles', \
+                                           'change', 'persistence', 'communication')) > 1) \
+           AS block_conflicts";
+
+/// The owed set and the landed set, grouped by the face the documents named.
+///
+/// Terminal states other than `landed` are left out for the reason the account's
+/// own census leaves them out: a retired row's question is answered, and
+/// counting it as owed would make every finished face look like it still owes
+/// work forever.
+///
+/// The age is `COALESCE(measured_at, first_seen_at)` rather than `measured_at`
+/// alone. A row that has never been measured is not ageless -- it has been
+/// waiting since it entered -- and taking `NULL` as the answer would let a face
+/// full of never-measured rows report no wait at all.
+const BLOCK_CENSUS_SQL: &str = "\
+SELECT block, \
+       CASE WHEN state = 'landed' THEN 'landed' ELSE 'owed' END AS state, \
+       count(*) AS n, \
+       max(EXTRACT(EPOCH FROM (now() - COALESCE(measured_at, first_seen_at)))) \
+         AS oldest_unmeasured_secs \
+  FROM change_ledger \
+ WHERE state <> 'retired' \
+ GROUP BY 1, 2";
 
 /// Append one reopen: a row the account had as done whose check no longer holds.
 ///
@@ -498,8 +562,8 @@ fn check_measurement(m: &ChangeMeasurement) -> Result<(), String> {
 /// because the reading path kept a cited document's entry as it was. See
 /// [`RECORD_READING_SQL`].
 const DECLARE_SQL: &str = "\
-INSERT INTO change_ledger_declared (kind, scope, literal, doc, title, assertion, verdict, priority)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+INSERT INTO change_ledger_declared (kind, scope, literal, doc, title, assertion, verdict, priority, block)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (kind, scope, literal, doc) DO NOTHING";
 
 /// The declarations one fold takes, oldest first.
@@ -510,7 +574,7 @@ ON CONFLICT (kind, scope, literal, doc) DO NOTHING";
 /// different set on the next run, and a different one again on the other
 /// dialect.
 const FOLD_SELECT_SQL: &str = "\
-SELECT kind, scope, literal, doc, title, assertion, verdict, priority
+SELECT kind, scope, literal, doc, title, assertion, verdict, priority, block
 FROM change_ledger_declared
 WHERE folded_at IS NULL
 ORDER BY declared_at ASC, kind ASC, scope ASC, literal ASC, doc ASC
@@ -571,6 +635,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 .bind(&reading.source.doc)
                 .bind(&reading.source.verdict)
                 .bind(reading.source.priority.as_str())
+                .bind(reading.source.block.as_str())
                 .bind(first_seen_rev)
                 .execute(&self.pool)
                 .await
@@ -598,6 +663,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 .bind(&reading.assertion)
                 .bind(&reading.source.verdict)
                 .bind(reading.source.priority.as_str())
+                .bind(reading.source.block.as_str())
                 .execute(&self.pool)
                 .await
                 .map_err(|e| {
@@ -761,7 +827,15 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
     }
 
     async fn outstanding(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
-        // The band leads, because the bound is what makes the order matter: a
+        // What holds the line leads. A change a commit delivered while the
+        // account still owes it is carrying a claim the tree has not confirmed,
+        // and every row measured at that revision is standing on it; no band
+        // can outrank it, because a band is what a document asked for and this
+        // is what is actually in the way. It is a term of the order rather than
+        // a stored band for the reason the contract gives: the moment the claim
+        // becomes true the state moves and the term answers false.
+        //
+        // The band follows, because the bound is what makes the order matter: a
         // caller takes a slice, and a slice ordered only by staleness hands this
         // pass whatever has waited longest, which is all of it equally. A row a
         // document asked for at P0 and one nobody prioritised would then compete
@@ -784,7 +858,8 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             sqlx::query(&format!(
                 "SELECT {ROW_COLUMNS} FROM change_ledger \
                  WHERE state NOT IN ('landed', 'retired') \
-                 ORDER BY priority_rank DESC, measured_at ASC NULLS FIRST, first_seen_at ASC \
+                 ORDER BY (delivered_rev IS NOT NULL) DESC, priority_rank DESC, \
+                          measured_at ASC NULLS FIRST, first_seen_at ASC \
                  LIMIT $1"
             ))
             .bind(limit as i64)
@@ -1027,6 +1102,96 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             satisfied: satisfied.max(0) as u64,
             owed: owed.max(0) as u64,
         }))
+    }
+
+    async fn blocking_surface(&self) -> SFResult<Option<BlockingSurface>> {
+        // Three counts in one statement, because they are one reading: a holder
+        // is a row whose delivery is in front of a claim the tree has not
+        // confirmed, and what it holds is every other row measured at that same
+        // revision. Counting the two in separate reads would let a row land
+        // between them and be reported as holding work it had just released.
+        //
+        // The `DISTINCT` is the difference between "how much is behind this"
+        // and "how many pairs": a row measured at a revision two holders both
+        // delivered is one row held, not two.
+        let row = sqlx::query(BLOCKING_SURFACE_SQL)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("read blocking surface: {e}")))?;
+        let holders: i64 = row
+            .try_get("holders")
+            .map_err(|e| SFError::Database(format!("holders: {e}")))?;
+        let held: i64 = row
+            .try_get("held_landings")
+            .map_err(|e| SFError::Database(format!("held_landings: {e}")))?;
+        let conflicts: i64 = row
+            .try_get("block_conflicts")
+            .map_err(|e| SFError::Database(format!("block_conflicts: {e}")))?;
+        Ok(Some(BlockingSurface {
+            holders: holders.max(0) as u64,
+            held_landings: held.max(0) as u64,
+            block_conflicts: conflicts.max(0) as u64,
+        }))
+    }
+
+    async fn block_census(&self) -> SFResult<Option<Vec<BlockCensus>>> {
+        // One row per face the account knows, including the ones with nothing
+        // in them: a face that vanished from the census reads as a face that
+        // finished, and the whole point of the grouping is to answer "how far
+        // along is this one" without a reader supplying its existence.
+        //
+        // The oldest unmeasured age is taken over the owed rows only -- a landed
+        // row's measurement stopped being owed work the moment it landed -- and
+        // is `NULL` when every owed row in the face has been measured, which is
+        // a different answer from zero seconds.
+        let rows = sqlx::query(BLOCK_CENSUS_SQL)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("read block census: {e}")))?;
+        let mut counted: Vec<(String, String, i64, Option<f64>)> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            counted.push((
+                row.try_get("block")
+                    .map_err(|e| SFError::Database(format!("block: {e}")))?,
+                row.try_get("state")
+                    .map_err(|e| SFError::Database(format!("state: {e}")))?,
+                row.try_get("n")
+                    .map_err(|e| SFError::Database(format!("n: {e}")))?,
+                row.try_get("oldest_unmeasured_secs")
+                    .map_err(|e| SFError::Database(format!("oldest_unmeasured_secs: {e}")))?,
+            ));
+        }
+        let mut census = Vec::with_capacity(ChangeBlock::ALL.len());
+        for block in ChangeBlock::ALL {
+            let landed = counted
+                .iter()
+                .filter(|(found, state, _, _)| found == block.as_str() && state == "landed")
+                .map(|(_, _, n, _)| *n)
+                .sum::<i64>();
+            let owed = counted
+                .iter()
+                .filter(|(found, state, _, _)| {
+                    found == block.as_str() && state != "landed" && state != "retired"
+                })
+                .map(|(_, _, n, _)| *n)
+                .sum::<i64>();
+            let oldest = counted
+                .iter()
+                .filter(|(found, state, _, _)| {
+                    found == block.as_str() && state != "landed" && state != "retired"
+                })
+                .filter_map(|(_, _, _, secs)| *secs)
+                .fold(None::<f64>, |acc, secs| {
+                    Some(acc.map_or(secs, |a| a.max(secs)))
+                });
+            census.push(BlockCensus {
+                block,
+                landed: landed.max(0) as u64,
+                owed: owed.max(0) as u64,
+                oldest_unmeasured_secs: oldest.map(|secs| secs.max(0.0) as u64),
+            });
+        }
+        Ok(Some(census))
     }
 
     async fn record_dispatch_state(&self, state: &DispatchState) -> SFResult<()> {

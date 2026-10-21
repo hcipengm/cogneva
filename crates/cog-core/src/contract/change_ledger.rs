@@ -316,6 +316,95 @@ impl std::str::FromStr for ChangePriority {
     }
 }
 
+/// Which face of the programme a change belongs to, when the document asking
+/// for it named one.
+///
+/// The other half of the ordering key. A band says how soon within a face; the
+/// block says which face, and without it "how much of this face is done" is a
+/// substring search over provenance text rather than a count. It rides on the
+/// source for the same reason the band does: a grouping is something a document
+/// states about what it is asking for, not something a tree can measure.
+///
+/// `None` is a member rather than an absence, and so is the case where the
+/// documents disagree. The account cannot pick between two faces a set of
+/// documents names, and guessing one would silently file work under a heading
+/// nobody chose; the count of rows in that state is published beside the
+/// per-face census, so the ambiguity is readable instead of hidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeBlock {
+    /// No document that asks for this change named a face.
+    #[default]
+    None,
+    Token,
+    Resources,
+    Principles,
+    Change,
+    Persistence,
+    Communication,
+}
+
+impl ChangeBlock {
+    /// Every block, in the order a reading prints them.
+    pub const ALL: [ChangeBlock; 7] = [
+        ChangeBlock::None,
+        ChangeBlock::Token,
+        ChangeBlock::Resources,
+        ChangeBlock::Principles,
+        ChangeBlock::Change,
+        ChangeBlock::Persistence,
+        ChangeBlock::Communication,
+    ];
+
+    /// The literal stored in the account, and the one a reading prints.
+    ///
+    /// ASCII rather than the face names the programme uses, because this is a
+    /// column value and a label value: it travels through SQL, JSONB and metric
+    /// labels, and a value that needs quoting differs between those three.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChangeBlock::None => "none",
+            ChangeBlock::Token => "token",
+            ChangeBlock::Resources => "resources",
+            ChangeBlock::Principles => "principles",
+            ChangeBlock::Change => "change",
+            ChangeBlock::Persistence => "persistence",
+            ChangeBlock::Communication => "communication",
+        }
+    }
+
+    /// Whether this names a face at all. `None` is the answer to "no document
+    /// said" and to "the documents disagree", so it cannot be counted as one.
+    pub fn is_named(self) -> bool {
+        self != ChangeBlock::None
+    }
+}
+
+impl std::str::FromStr for ChangeBlock {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // The face names the programme is written in are accepted as aliases:
+        // declarations are prose documents first and machine input second, and
+        // a declaration that spells the face the way the owner does is not a
+        // mistake to refuse.
+        let canonical = match s {
+            "token" | "token管理" => "token",
+            "resources" | "资源" | "资源管理" => "resources",
+            "principles" | "原则" | "原则管理" => "principles",
+            "change" | "变更" | "变更管理" => "change",
+            "persistence" | "持久化" | "持久化存储" => "persistence",
+            "communication" | "通信" | "通信管理" => "communication",
+            "none" | "" | "-" => "none",
+            other => other,
+        };
+        Self::ALL
+            .into_iter()
+            .find(|block| block.as_str() == canonical)
+            .ok_or_else(|| format!("unknown change block: {s}"))
+    }
+}
+
 /// One document that asks for a change, and what that document said about it.
 ///
 /// Kept beside the row rather than folded into its state: what a document says
@@ -338,6 +427,14 @@ pub struct ChangeSource {
     /// `jsonb_build_object` the store builds -- carry the same keys.
     #[serde(default)]
     pub priority: ChangePriority,
+    /// The face this document files the change under, or [`ChangeBlock::None`].
+    ///
+    /// Defaulted for the same reason the band is: a source written before the
+    /// column existed was never asked, and refusing to read it would lose the
+    /// answer. Written out rather than skipped so this rendering and the store's
+    /// `jsonb_build_object` carry the same keys.
+    #[serde(default)]
+    pub block: ChangeBlock,
 }
 
 /// One row of the ledger.
@@ -424,6 +521,59 @@ impl ChangeLedgerRow {
             .map(|source| source.priority)
             .max()
             .unwrap_or_default()
+    }
+
+    /// The face to file this change under: the one its documents name, or
+    /// [`ChangeBlock::None`] when none of them name one or they disagree.
+    ///
+    /// Derived from the sources for the same reason the band is: a copy a
+    /// writer has to keep in step with the citations goes stale the first time
+    /// a document is corrected. Disagreement is folded to `none` here and
+    /// counted by [`Self::block_conflict`] rather than decided -- picking one
+    /// document's face over another's would file the row under a heading half
+    /// the people asking for it never chose.
+    pub fn block(&self) -> ChangeBlock {
+        let mut named = self
+            .sources
+            .iter()
+            .map(|source| source.block)
+            .filter(|block| block.is_named());
+        match (named.next(), named.next()) {
+            (Some(only), None) => only,
+            _ => ChangeBlock::None,
+        }
+    }
+
+    /// Whether the documents asking for this change name more than one face.
+    ///
+    /// Separated from [`Self::block`] because both answers fold to `none`, and a
+    /// reader that could not tell "nobody named a face" from "two documents
+    /// named different faces" would read a disagreement as silence.
+    pub fn block_conflict(&self) -> bool {
+        let mut distinct = self
+            .sources
+            .iter()
+            .map(|source| source.block)
+            .filter(|block| block.is_named())
+            .collect::<Vec<_>>();
+        distinct.sort_by_key(|block| block.as_str());
+        distinct.dedup();
+        distinct.len() > 1
+    }
+
+    /// Whether this change is standing in front of everyone else.
+    ///
+    /// A commit delivered it and the account still owes it: the line is
+    /// carrying a change whose claim is not true of the tree. Everything
+    /// measured on that tree stands on it, which is the one blocking relation
+    /// the account can measure about itself -- the holder is named by the
+    /// delivery, and the held are the rows measured at that same revision.
+    ///
+    /// Deliberately a method over the row's own facts rather than a stored
+    /// band: the moment the claim becomes true the state moves and this answers
+    /// false, with nothing left behind to go stale.
+    pub fn holds_the_line(&self) -> bool {
+        self.delivered_rev.is_some() && self.state.is_outstanding()
     }
 }
 
@@ -906,6 +1056,24 @@ pub trait ChangeLedgerStore: Send + Sync {
         Ok(None)
     }
 
+    /// What the account is holding in front of the rest of itself.
+    ///
+    /// `None` means this store cannot answer -- an implementation with no
+    /// ledger, or a deployment whose migration has not run -- and is not zero
+    /// for the same reason [`Self::demand_closure`] is not.
+    async fn blocking_surface(&self) -> SFResult<Option<BlockingSurface>> {
+        Ok(None)
+    }
+
+    /// The owed set counted by the face its documents named.
+    ///
+    /// `None` when the store cannot group by face; an empty vector means every
+    /// row it holds is unfaced, which the `none` entry states rather than
+    /// hides.
+    async fn block_census(&self) -> SFResult<Option<Vec<BlockCensus>>> {
+        Ok(None)
+    }
+
     /// Every write window the account holds, whatever state it is in.
     ///
     /// All of them rather than the live ones: a query filtered by "approved and
@@ -946,6 +1114,49 @@ pub struct DemandClosure {
     /// Declarations whose change is still untrue of the tree, or which no
     /// measurement has reached at all.
     pub owed: u64,
+}
+
+/// How much of the account is standing in front of the rest of it.
+///
+/// The ordering half of the account: what a change blocks is the one quantity a
+/// tree cannot state about urgency but the account can measure about itself. A
+/// commit delivered a change and the account still owes it, so every row
+/// measured on that same revision is standing on a claim that is not yet true.
+/// Counting those rows is what turns "which of these should be fixed first"
+/// from whoever is reading the dashboard's opinion into a number.
+///
+/// Both halves always. `holders` alone cannot say whether one change is holding
+/// one row or the whole outstanding set; the pair is what a reader needs to
+/// answer "how much of the queue is behind this".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockingSurface {
+    /// Changes a commit delivered while the account still owes them.
+    pub holders: u64,
+    /// Rows, other than their holders, measured at a revision a holder
+    /// delivered. Each row is counted once however many holders it stands on.
+    pub held_landings: u64,
+    /// Rows whose documents name more than one face. Folded to `none` by the
+    /// row's own answer, and counted here so a disagreement never reads as
+    /// silence.
+    pub block_conflicts: u64,
+}
+
+/// One face of the programme, counted by what the tree has made of it.
+///
+/// The grouping the account could not answer before: content was in the ledger
+/// but the heading was only in prose, so "how much of this face is done" was a
+/// substring search whose answer changed with who typed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockCensus {
+    pub block: ChangeBlock,
+    /// Rows the tree holds as landed.
+    pub landed: u64,
+    /// Rows still owed.
+    pub owed: u64,
+    /// How long the oldest owed row in this face has gone without a
+    /// measurement. `None` when nothing in it is owed or every owed row has
+    /// been measured: the two are different facts and neither is zero.
+    pub oldest_unmeasured_secs: Option<u64>,
 }
 
 /// What one dispatch pass did, and the closed reason it did only that much.
@@ -1435,6 +1646,7 @@ mod tests {
                     doc: format!("doc{i}.md"),
                     verdict: None,
                     priority: *band,
+                    block: ChangeBlock::None,
                 })
                 .collect(),
             first_seen_at: Utc::now(),
@@ -1456,5 +1668,106 @@ mod tests {
             row(&[ChangePriority::Unstated, ChangePriority::P1]).priority(),
             ChangePriority::P1
         );
+    }
+
+    /// Every face round-trips, the set is closed, and the names the programme
+    /// is written in are accepted as well as the stored literals: a declaration
+    /// spelled the way the owner speaks it is an answer, not a typo.
+    #[test]
+    fn every_block_round_trips_and_the_programme_names_are_aliases() {
+        for block in ChangeBlock::ALL {
+            assert_eq!(
+                block.as_str().parse::<ChangeBlock>(),
+                Ok(block),
+                "{} did not parse back",
+                block.as_str()
+            );
+        }
+        assert_eq!("资源".parse::<ChangeBlock>(), Ok(ChangeBlock::Resources));
+        assert_eq!(
+            "持久化存储".parse::<ChangeBlock>(),
+            Ok(ChangeBlock::Persistence)
+        );
+        assert_eq!("".parse::<ChangeBlock>(), Ok(ChangeBlock::None));
+        assert!("everything".parse::<ChangeBlock>().is_err());
+        assert_eq!(ChangeBlock::ALL.len(), 7);
+        assert!(!ChangeBlock::None.is_named());
+    }
+
+    /// A row takes the face its documents named, and a disagreement between
+    /// them is `none` *and* counted: folding both to `none` without the second
+    /// answer would let two documents asking for different things read exactly
+    /// like nobody having said.
+    #[test]
+    fn a_rows_block_is_the_one_its_sources_named_or_a_counted_conflict() {
+        let row = |blocks: &[ChangeBlock]| ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/", "x"),
+            state: ChangeState::Pending,
+            title: None,
+            assertion: None,
+            sources: blocks
+                .iter()
+                .enumerate()
+                .map(|(i, block)| ChangeSource {
+                    doc: format!("doc{i}.md"),
+                    verdict: None,
+                    priority: ChangePriority::Unstated,
+                    block: *block,
+                })
+                .collect(),
+            first_seen_at: Utc::now(),
+            measured_at: None,
+            measured_rev: None,
+            delivered_rev: None,
+            landed_at: None,
+            unsettled_reason: None,
+            retire_reason: None,
+            retired_at: None,
+        };
+
+        let one = row(&[ChangeBlock::None, ChangeBlock::Token]);
+        assert_eq!(one.block(), ChangeBlock::Token);
+        assert!(!one.block_conflict());
+
+        let silent = row(&[ChangeBlock::None, ChangeBlock::None]);
+        assert_eq!(silent.block(), ChangeBlock::None);
+        assert!(!silent.block_conflict());
+
+        let split = row(&[ChangeBlock::Token, ChangeBlock::Resources]);
+        assert_eq!(split.block(), ChangeBlock::None);
+        assert!(split.block_conflict());
+    }
+
+    /// Standing in front of the rest is a function of two facts the row
+    /// already holds, so it stops being true the moment the measurement says
+    /// so -- there is no stored band that could keep saying it.
+    #[test]
+    fn a_delivered_change_that_is_still_owed_holds_the_line() {
+        let mut row = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/", "x"),
+            state: ChangeState::Pending,
+            title: None,
+            assertion: None,
+            sources: Vec::new(),
+            first_seen_at: Utc::now(),
+            measured_at: None,
+            measured_rev: None,
+            delivered_rev: Some("abc123".into()),
+            landed_at: None,
+            unsettled_reason: None,
+            retire_reason: None,
+            retired_at: None,
+        };
+        assert!(row.holds_the_line());
+
+        row.delivered_rev = None;
+        assert!(
+            !row.holds_the_line(),
+            "owed but never delivered holds nothing"
+        );
+
+        row.delivered_rev = Some("abc123".into());
+        row.state = ChangeState::Landed;
+        assert!(!row.holds_the_line(), "a landed change holds nothing");
     }
 }

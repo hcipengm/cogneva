@@ -1181,6 +1181,21 @@ metric_names! {
     // them and what lets the release pass delete them.
     CHANGE_DISPATCH_READOUTS => "cogneva_change_dispatch_readouts",
 
+    // cog-orchestrator — the account counted by the face of the programme its
+    // declaring documents named.
+    //
+    // The grouping was in the account's contents and not in its shape: the rows
+    // a face's documents asked for were there, but the heading was only in prose,
+    // so "how far along is this face" was a substring search whose answer changed
+    // with who typed it. Two labels rather than one: `block` is the face (a
+    // closed set, with `none` for rows no document filed and for rows whose
+    // documents disagree) and `reading` is which count -- `landed`, `owed`, or
+    // `oldest_unmeasured_seconds`, the age of the owed row that has gone longest
+    // without a measurement, taken from when it entered if nothing has measured
+    // it at all. Every face is written on every pass, including the ones that owe
+    // nothing: a face missing from the census would read as a face that finished.
+    CHANGE_BLOCK_CENSUS => "cogneva_change_block_census",
+
     // cog-orchestrator — the verdict one change-ledger dispatch pass reached,
     // as one cell per combination of the two closed sets.
     //

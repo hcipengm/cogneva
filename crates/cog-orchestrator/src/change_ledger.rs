@@ -113,12 +113,12 @@ use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
 use cog_core::{
-    metric_names, ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement,
-    ChangePriority, ChangeReading, ChangeReopen, ChangeSource, ChangeState, DemandClosure,
-    DispatchDecision, DispatchState, LiveRevision, LiveRevisionSource, LlmPoolStatus,
-    LlmWindowPace, MetricsBackend, OrchestratorControl, OwnerLeaseBroker, PoolReading,
-    PrincipleCheckKind, PrincipleLedgerStore, PrincipleRow, RetireReason, SFResult, ShutdownSignal,
-    StateBackend, Task, TaskStatus, TaskType, WriteWindow,
+    metric_names, BlockCensus, BlockingSurface, ChangeBlock, ChangeIdentity, ChangeLedgerRow,
+    ChangeLedgerStore, ChangeMeasurement, ChangePriority, ChangeReading, ChangeReopen,
+    ChangeSource, ChangeState, DemandClosure, DispatchDecision, DispatchState, LiveRevision,
+    LiveRevisionSource, LlmPoolStatus, LlmWindowPace, MetricsBackend, OrchestratorControl,
+    OwnerLeaseBroker, PoolReading, PrincipleCheckKind, PrincipleLedgerStore, PrincipleRow,
+    RetireReason, SFResult, ShutdownSignal, StateBackend, Task, TaskStatus, TaskType, WriteWindow,
 };
 
 use cog_core::contract::llm::UpstreamFailure;
@@ -824,7 +824,18 @@ fn dispatch_rearm_limit() -> u32 {
 /// (`owed_p0` .. `owed_unstated`), so a band large enough to hold the graph is
 /// visible there before it can be mistaken for the graph simply being busy.
 fn dispatch_priority(row: &ChangeLedgerRow) -> i32 {
-    DISPATCH_TASK_PRIORITY.saturating_add(i32::from(row.priority().rank()))
+    // The blocking term is the account's own answer to "what holds the line",
+    // and it outranks every declared band: the pass hands such a row over
+    // first, and handing it over at a lower rank would undo that one step
+    // later. It is the same rank a P0 carries, not a sixth number, because a
+    // consumer reading priorities should not have to learn a scale the
+    // documents do not state.
+    let blocking = if row.holds_the_line() {
+        ChangePriority::P0.rank()
+    } else {
+        0
+    };
+    DISPATCH_TASK_PRIORITY.saturating_add(i32::from(row.priority().rank().max(blocking)))
 }
 
 fn dispatch_task(row: &ChangeLedgerRow, generation: u32) -> Task {
@@ -1478,6 +1489,9 @@ fn principle_debt_readings(rows: &[PrincipleRow]) -> (Vec<ChangeReading>, Unaime
                 // is: nothing there states a band, so the reading carries the one
                 // that says so rather than a band this path invented.
                 priority: ChangePriority::Unstated,
+                // The face, by contrast, this path does know: a principle's
+                // reading is filed under principles and nowhere else.
+                block: ChangeBlock::Principles,
             },
         });
     }
@@ -3104,6 +3118,23 @@ enum DispatchReadout {
     /// the reading these two exist to make visible.
     DemandSatisfied,
     DemandOwed,
+    /// What the account is holding in front of the rest of itself: how many
+    /// changes a commit delivered while the account still owes them, and how
+    /// many other rows are measured at a revision one of them delivered.
+    ///
+    /// The ordering half of the account. A band says what a document asked for;
+    /// this says what the line is actually carrying, which is the one quantity
+    /// that can move a change to the front without anybody stating that it is
+    /// urgent. `held_landings` alone cannot say whether one change is holding
+    /// one row or the whole owed set, and `blocking_rows` alone cannot say how
+    /// much is behind them, so the pair is the reading.
+    BlockingRows,
+    HeldLandings,
+    /// Rows whose documents name more than one face. The folded `block` column
+    /// answers `none` both for "nobody named a face" and for "the documents
+    /// disagree", so this cell is what keeps the second from reading as the
+    /// first.
+    BlockConflicts,
 }
 
 impl DispatchReadout {
@@ -3128,6 +3159,9 @@ impl DispatchReadout {
         DispatchReadout::StateUndecided,
         DispatchReadout::DemandSatisfied,
         DispatchReadout::DemandOwed,
+        DispatchReadout::BlockingRows,
+        DispatchReadout::HeldLandings,
+        DispatchReadout::BlockConflicts,
     ];
 
     /// The band a count cell is about, for the five that are about one.
@@ -3183,6 +3217,9 @@ impl DispatchReadout {
             Self::StateUndecided => "state_undecided",
             Self::DemandSatisfied => "demand_satisfied",
             Self::DemandOwed => "demand_owed",
+            Self::BlockingRows => "blocking_rows",
+            Self::HeldLandings => "held_landings",
+            Self::BlockConflicts => "block_conflicts",
         }
     }
 }
@@ -3213,6 +3250,7 @@ async fn publish_dispatch_rows(
     owed: Option<&[(ChangePriority, usize)]>,
     census: Option<&[(ChangeState, u64)]>,
     demand: Option<DemandClosure>,
+    blocking: Option<BlockingSurface>,
 ) {
     let Some(metrics) = metrics else {
         return;
@@ -3241,6 +3279,22 @@ async fn publish_dispatch_rows(
                     closure.satisfied
                 } else {
                     closure.owed
+                }
+            }
+            // All three or none, for the reason the demand pair gives: a
+            // "held landings" count with no "holding rows" beside it cannot be
+            // read as anything, and a conflict count taken from a store that
+            // could not answer would say the documents agree.
+            DispatchReadout::BlockingRows
+            | DispatchReadout::HeldLandings
+            | DispatchReadout::BlockConflicts => {
+                let Some(surface) = blocking else {
+                    continue;
+                };
+                match readout {
+                    DispatchReadout::BlockingRows => surface.holders,
+                    DispatchReadout::HeldLandings => surface.held_landings,
+                    _ => surface.block_conflicts,
                 }
             }
             // A band cell is written only when this pass managed to count the
@@ -3693,8 +3747,103 @@ async fn record_dispatch_state(
             None
         }
     };
-    publish_dispatch_rows(metrics, &state, owed.as_deref(), census.as_deref(), demand).await;
+    // What the account is holding in front of itself, read beside the demand
+    // side and for the same reason: it is a property of the whole account as of
+    // this pass. A failed read publishes nothing rather than zeros -- "nothing
+    // is blocked" and "nobody could look" are different answers, and the first
+    // is the one that stops anyone from looking twice.
+    let blocking = match store.blocking_surface().await {
+        Ok(surface) => surface,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the blocking surface could not be read, so this pass publishes \
+                 no blocking cell"
+            );
+            None
+        }
+    };
+    publish_dispatch_rows(
+        metrics,
+        &state,
+        owed.as_deref(),
+        census.as_deref(),
+        demand,
+        blocking,
+    )
+    .await;
+    // The same account, grouped by the face its documents named. Read here and
+    // not from the owed slice for the reason the census is not: a face is a
+    // property of everything the account holds, not of the rows one pass
+    // happened to look at.
+    let blocks = match store.block_census().await {
+        Ok(counts) => counts,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the per-face census could not be read, so this pass publishes \
+                 no face cell"
+            );
+            None
+        }
+    };
+    publish_block_census(metrics, blocks.as_deref()).await;
     publish_dispatch_verdict(metrics, &state).await;
+}
+
+/// Publish the account grouped by face: landed, owed, and how long the face's
+/// longest-waiting owed row has gone without a measurement.
+///
+/// Every face on every pass, including the ones that owe nothing, because a
+/// face that stopped being written would go on being served at its last value
+/// and a face that finished would be indistinguishable from one that is still
+/// being asked about. A store that cannot group publishes nothing at all rather
+/// than a set of zeros: zeros would say every face is empty, which is the one
+/// answer that stops anybody from asking again.
+async fn publish_block_census(
+    metrics: Option<&Arc<dyn MetricsBackend>>,
+    census: Option<&[BlockCensus]>,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    let Some(census) = census else {
+        return;
+    };
+    for face in census {
+        let mut cells = vec![("landed", face.landed as f64), ("owed", face.owed as f64)];
+        // An absence is not a zero: no age says every owed row in this face has
+        // been measured, which is a different fact from none of them having
+        // waited. The cell is skipped rather than written as zero, and the stamp
+        // on the last write is what tells a reader it is old.
+        if let Some(secs) = face.oldest_unmeasured_secs {
+            cells.push(("oldest_unmeasured_seconds", secs as f64));
+        }
+        for (reading, value) in cells {
+            if let Err(e) = publish_face_reading(metrics, face.block, reading, value).await {
+                warn!(
+                    error = %e,
+                    block = face.block.as_str(),
+                    reading,
+                    "change ledger: a face's count could not be published"
+                );
+            }
+        }
+    }
+}
+
+async fn publish_face_reading(
+    metrics: &Arc<dyn MetricsBackend>,
+    block: ChangeBlock,
+    reading: &str,
+    value: f64,
+) -> SFResult<()> {
+    let mut labels = HashMap::new();
+    labels.insert("block".to_string(), block.as_str().to_string());
+    labels.insert("reading".to_string(), reading.to_string());
+    metrics
+        .record_gauge(metric_names::CHANGE_BLOCK_CENSUS, value, labels)
+        .await
 }
 
 /// What the pool's snapshot says this pass should do.
@@ -4349,6 +4498,7 @@ mod tests {
                 doc: "2026-10-21_doc.md".into(),
                 verdict: None,
                 priority: band,
+                block: ChangeBlock::None,
             }];
             dispatch_task(&handed, 0).priority
         };
@@ -4373,6 +4523,46 @@ mod tests {
             ladder[0] < default_rank,
             "a row nobody prioritised keeps the floor below the default ({default_rank})"
         );
+    }
+
+    /// A change holding the line is filed at P0 whatever its documents said.
+    ///
+    /// The rank is the account's own measured answer, not a document's claim:
+    /// a commit delivered this change and the tree has not confirmed it, so
+    /// everything else measured at that revision stands on it. The pass takes
+    /// it first, and filing the handover at the band its documents stated
+    /// would undo that ordering one step later -- which is exactly the fault
+    /// the band lift was added to fix.
+    #[test]
+    fn a_change_holding_the_line_is_filed_at_p0_whatever_its_documents_said() {
+        let mut owed = row(ChangeState::Pending, Some(1_760_000_000));
+        owed.sources = vec![ChangeSource {
+            doc: "2026-10-21_doc.md".into(),
+            verdict: None,
+            priority: ChangePriority::Unstated,
+            block: ChangeBlock::None,
+        }];
+        let quiet = dispatch_task(&owed, 0).priority;
+
+        owed.delivered_rev = Some("abc1234".into());
+        let holding = dispatch_task(&owed, 0).priority;
+
+        assert_eq!(
+            holding,
+            DISPATCH_TASK_PRIORITY + i32::from(ChangePriority::P0.rank()),
+            "a delivered but unconfirmed change is filed at the top band"
+        );
+        assert!(
+            holding > quiet,
+            "holding the line outranks every stated band"
+        );
+
+        // A document that states P0 and a row that holds the line are the same
+        // rank: the account adds no sixth level for a consumer to learn.
+        owed.state = ChangeState::Landed;
+        owed.delivered_rev = Some("abc1234".into());
+        let landed = dispatch_task(&owed, 0).priority;
+        assert_eq!(landed, quiet, "a landed change holds nothing");
     }
 
     /// Generation 0 is the identity alone -- the id every handover carried before
@@ -7273,12 +7463,23 @@ mod tests {
             satisfied: 41,
             owed: 2085,
         };
+        // What the account is holding in front of itself: eleven changes have
+        // delivered a claim the tree has not confirmed, and 37 other rows are
+        // measured at the revisions they delivered. Two conflicting faces as
+        // well, because a cell that only ever reads zero cannot tell a reading
+        // from an absent one.
+        let blocking = BlockingSurface {
+            holders: 11,
+            held_landings: 37,
+            block_conflicts: 2,
+        };
         publish_dispatch_rows(
             Some(&metrics),
             &state,
             Some(&owed),
             Some(&census),
             Some(demand),
+            Some(blocking),
         )
         .await;
         publish_dispatch_verdict(Some(&metrics), &state).await;
@@ -7362,6 +7563,14 @@ mod tests {
         // every demand it was ever given.
         assert_eq!(published["demand_satisfied"], 41.0);
         assert_eq!(published["demand_owed"], 2085.0);
+        // What is holding the line, and how much is behind it: eleven changes
+        // delivered and still owed, holding 37 rows measured at their
+        // revisions, and two rows whose documents name different faces. The
+        // three are written together, so a reader never sees a held count with
+        // no holder count beside it.
+        assert_eq!(published["blocking_rows"], 11.0);
+        assert_eq!(published["held_landings"], 37.0);
+        assert_eq!(published["block_conflicts"], 2.0);
         // The band split, and the relation that makes it a reading rather than
         // five numbers: the bands partition the owed set, so they have to add up
         // to the state cells' total. A band that stopped being published, or a
@@ -7491,7 +7700,7 @@ mod tests {
             window_pace: None,
         };
         let metrics: Arc<dyn MetricsBackend> = Arc::new(cog_storage::MemoryMetricsBackend::new());
-        publish_dispatch_rows(Some(&metrics), &state, None, None, None).await;
+        publish_dispatch_rows(Some(&metrics), &state, None, None, None, None).await;
 
         let end = Utc::now() + chrono::Duration::seconds(1);
         let start = end - chrono::Duration::seconds(600);
@@ -7506,8 +7715,15 @@ mod tests {
         assert!(
             names.iter().all(|name| !name.starts_with("owed_")
                 && !name.starts_with("state_")
-                && !name.starts_with("demand_")),
-            "no band, census or demand cell is written when the count failed: {names:?}"
+                && !name.starts_with("demand_")
+                // Named rather than matched by prefix: `held_back` is a cell of
+                // the pass's own counts, and a prefix rule would take it for one
+                // of the blocking cells and pass on a cell that was written.
+                && name != "blocking_rows"
+                && name != "held_landings"
+                && name != "block_conflicts"),
+            "no band, census, demand or blocking cell is written when the count failed: \
+             {names:?}"
         );
         assert!(
             names.iter().any(|name| name == "pending"),

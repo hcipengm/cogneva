@@ -30,8 +30,8 @@
 use sqlx::PgPool;
 
 use cog_core::{
-    ChangeIdentity, ChangeLedgerStore, ChangeMeasurement, ChangePriority, ChangeReading,
-    ChangeReopen, ChangeSource, ChangeState, RetireReason,
+    ChangeBlock, ChangeIdentity, ChangeLedgerStore, ChangeMeasurement, ChangePriority,
+    ChangeReading, ChangeReopen, ChangeSource, ChangeState, RetireReason,
 };
 use cog_storage::PostgresChangeLedgerStore;
 
@@ -218,6 +218,7 @@ async fn the_entry_revision_is_written_once_and_never_moved() {
             doc: doc.to_string(),
             verdict: None,
             priority: ChangePriority::Unstated,
+            block: ChangeBlock::None,
         },
     };
 
@@ -416,6 +417,7 @@ async fn a_corrected_declaration_reaches_the_accounts_citation_of_its_document()
             doc: doc.clone(),
             verdict: Some(verdict.to_string()),
             priority: ChangePriority::Unstated,
+            block: ChangeBlock::None,
         },
     };
 
@@ -506,6 +508,7 @@ async fn a_declarations_band_rides_the_citation_and_the_row_takes_the_highest() 
             doc: doc.to_string(),
             verdict: Some("unlanded".into()),
             priority: band,
+            block: ChangeBlock::None,
         },
     };
 
@@ -622,6 +625,7 @@ async fn the_outstanding_read_hands_out_the_most_urgent_band_first() {
             doc: doc.to_string(),
             verdict: Some("unlanded".into()),
             priority: band,
+            block: ChangeBlock::None,
         },
     };
     let doc = |id: &ChangeIdentity| format!("docs/{}.md", id.scope.replace('/', "-"));
@@ -741,6 +745,7 @@ async fn a_freshly_folded_declaration_enters_pending_and_unmeasured() {
                 doc: format!("docs/{marker}.md"),
                 verdict: Some("pending".into()),
                 priority: ChangePriority::Unstated,
+                block: ChangeBlock::None,
             },
         }])
         .await
@@ -1175,6 +1180,7 @@ async fn a_demand_is_satisfied_by_a_landing_and_owed_until_one_is_measured() {
                 doc: doc.clone(),
                 verdict: None,
                 priority: ChangePriority::Unstated,
+                block: ChangeBlock::None,
             },
         }])
         .await
