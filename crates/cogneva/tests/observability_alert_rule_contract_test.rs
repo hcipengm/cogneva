@@ -1149,6 +1149,14 @@ const FOREIGN: &[(&str, &str)] = &[
         "kube_persistentvolumeclaim_status_phase",
         "kube-state-metrics（claim 自己的 phase；只挑 Bound 的，因为 Pending 的 claim 还没有目录，把它算进「没量到」会让一条规则在正常扩容期间常亮）",
     ),
+    (
+        "kube_persistentvolume_claim_ref",
+        "kube-state-metrics（每个 PV 一条，带它 claimRef 指向的 claim 的 namespace 与 name）。这是「盘上有个目录，集群还记不记得它」的另一半：claim 清单只答「那张 PVC 还在不在」，答不了「还有没有卷对象认领这堆字节」。PV 的 claimRef 不随 PVC 删除而清空，所以 claim 没了它还指着——「字节有主、主人已注销」这一格正是靠它从「连主人都没有」里分出来的，两者对磁盘的处置完全不同（一个删卷对象＋目录，一个连名字都只剩目录名）",
+    ),
+    (
+        "kube_persistentvolume_status_phase",
+        "kube-state-metrics（每个 PV 每个 phase 一条，当前 phase 为 1、其余为 0）。Released 是 Retain 策略留下的常态，Failed 是删过一次没删成：两者在 claimRef 上长得一模一样（都指着一个已经不存在的 claim），能把它们分开的只有这个字段，而两者要问的问题不同——一个是「这批字节留不留」，另一个是「为什么删不掉」",
+    ),
     ("kube_pod_container_info", "kube-state-metrics"),
     (
         "kube_pod_init_container_info",

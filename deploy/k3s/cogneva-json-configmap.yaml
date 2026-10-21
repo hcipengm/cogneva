@@ -817,12 +817,21 @@ data:
             },
             {
               "name": "claim_directory_without_a_claim",
-              "promql": "count(max by (namespace, persistentvolumeclaim) (cogneva_data_volume_used_bytes) unless on(namespace, persistentvolumeclaim) kube_persistentvolumeclaim_info)",
+              "promql": "max by (namespace, persistentvolumeclaim) (cogneva_data_volume_used_bytes) unless on (namespace, persistentvolumeclaim) kube_persistentvolumeclaim_info unless on (namespace, persistentvolumeclaim) max by (namespace, persistentvolumeclaim) (label_replace(label_replace(kube_persistentvolume_claim_ref, \"namespace\", \"$1\", \"claim_namespace\", \"(.*)\"), \"persistentvolumeclaim\", \"$1\", \"name\", \"(.*)\"))",
               "condition": {
-                "greater_than": 0.0
+                "greater_than_or_equal": 0.0
               },
               "severity": "warning",
-              "summary": "{value} measured volume(s) exist on disk with no claim behind them: a deleted PVC whose directory the reclaim policy kept, holding bytes that no object in the cluster accounts for and that nothing will ever clean up on its own. The disk is the node's, so this is space the quota does not know is spent. The label pair names the namespace and claim the directory was created for"
+              "summary": "The directory left for claim {namespace}/{persistentvolumeclaim} holds {value} bytes and nothing in the API names it any more: the claim object is gone and no volume object points at it either, so no workload can mount it -- a directory is mounted through a claim -- and the bytes are space the quota does not know is spent. The volume whose reclaim policy would have deleted it is gone with it, so nothing in the cluster will ever free this directory. That is what separates this state from the two beside it: a directory a claim still backs is measured against that claim's declaration, and one a released volume still names is claim_held_by_a_released_volume. Here the directory's own name is the only record of what it was for -- which bytes these are is not a thing any reading in this cluster can answer, so the rule names the decision rather than taking it: deleting frees node disk and destroys whatever is in it."
+            },
+            {
+              "name": "claim_held_by_a_released_volume",
+              "promql": "max by (namespace, persistentvolumeclaim, persistentvolume, phase) ((max by (namespace, persistentvolumeclaim, persistentvolume) (label_replace(label_replace(kube_persistentvolume_claim_ref, \"namespace\", \"$1\", \"claim_namespace\", \"(.*)\"), \"persistentvolumeclaim\", \"$1\", \"name\", \"(.*)\")) * on (namespace, persistentvolumeclaim) group_left () max by (namespace, persistentvolumeclaim) ((max by (namespace, persistentvolumeclaim) (cogneva_data_volume_used_bytes) unless on (namespace, persistentvolumeclaim) kube_persistentvolumeclaim_info))) * on (persistentvolume) group_left (phase) (kube_persistentvolume_status_phase == 1))",
+              "condition": {
+                "greater_than_or_equal": 0.0
+              },
+              "severity": "warning",
+              "summary": "{value} bytes are measured in the directory left for claim {namespace}/{persistentvolumeclaim}, whose claim object is gone, while volume object {persistentvolume} still names that claim and is in phase {phase}: the bytes are accounted for, and the volume is where the reclaim policy that decides their fate is written. Released is the phase a Retain policy leaves behind -- neither the volume object nor its directory is deleted, so this state sits until something ends it -- and Failed is a volume whose deletion was attempted and did not complete, which is the same directory with a different question to ask. Neither way of ending it is a repair: deleting the volume object frees no bytes, deleting the directory destroys what the claim held. One claim can be named by more than one volume object when a claim was destroyed and re-created, and this reading then appears once per object while {value} stays the claim's measured bytes rather than the bytes of any one of them, because the reading that walks the directory is keyed by namespace and claim and carries no volume identity. The rule beside it, claim_directory_without_a_claim, is the state where not even a volume object is left to name the directory"
             },
             {
               "name": "image_store_bytes_high",
