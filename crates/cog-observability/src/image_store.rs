@@ -207,26 +207,38 @@ impl ImageStoreObservable {
             found.insert(name.to_string(), entry.path());
         }
 
-        let mut store = self.store.lock().unwrap();
-        // Retire what the root no longer holds before walking what it does: a
-        // part deleted from disk must not be read back out of this process.
-        store.parts.retain(|key, _| found.contains_key(key));
+        // The store is held for the bookkeeping only, never for the walk: this
+        // tree is the largest thing the process touches, a scrape asks for the
+        // map on every request, and a walk that held the map would leave the pod
+        // unreadable for the minutes it takes -- including its own probes.
+        let work: Vec<_> = {
+            let mut store = self.store.lock().unwrap();
+            // Retire what the root no longer holds before walking what it does: a
+            // part deleted from disk must not be read back out of this process.
+            store.parts.retain(|key, _| found.contains_key(key));
+            found
+                .iter()
+                .map(|(name, path)| {
+                    let footprint = store
+                        .parts
+                        .entry(name.clone())
+                        .or_insert_with(|| {
+                            Arc::new(ClaimFootprint::new(
+                                name.clone(),
+                                path.clone(),
+                                cog_core::claim_footprint::nested_mounts_under(path, &mounts),
+                            ))
+                        })
+                        .clone();
+                    (name, path, footprint)
+                })
+                .collect()
+        };
 
         let mut readable = 0usize;
         let mut files = 0usize;
         let mut vanished = 0usize;
-        for (name, path) in &found {
-            let footprint = store
-                .parts
-                .entry(name.clone())
-                .or_insert_with(|| {
-                    Arc::new(ClaimFootprint::new(
-                        name.clone(),
-                        path.clone(),
-                        cog_core::claim_footprint::nested_mounts_under(path, &mounts),
-                    ))
-                })
-                .clone();
+        for (name, path, footprint) in &work {
             // A plain file at the top of the store is measured as itself: walking
             // it as a directory would fail and leave the part permanently
             // unreadable, which is a false claim about the store.
@@ -265,9 +277,11 @@ impl ImageStoreObservable {
             }
         }
 
-        store.readable = readable;
-        store.last_scan = Instant::now();
-        drop(store);
+        {
+            let mut store = self.store.lock().unwrap();
+            store.readable = readable;
+            store.last_scan = Instant::now();
+        }
         self.scans.fetch_add(1, Ordering::Relaxed);
 
         // The runtime creates and removes snapshots under this store as images
@@ -613,6 +627,50 @@ mod tests {
         assert_eq!(
             value_of(&readings(&observable).await, BYTES_METRIC, Some("snap")),
             Some(8192.0)
+        );
+    }
+
+    /// A scrape reads the previous walk's numbers, so it must not wait for the
+    /// walk in progress. The map is behind one mutex: a walk that held it would
+    /// leave this pod unscrapable -- and, since it answers its own probes on the
+    /// same runtime, restartable -- for as long as the store takes to walk.
+    ///
+    /// The bound is calibrated against the walk itself rather than an absolute
+    /// number: a collection issued a fraction into a walk must return in a
+    /// fraction of what that walk costs, on a fast machine and a loaded one
+    /// alike. Three attempts, because the failure this guards is a wait of the
+    /// whole walk -- one attempt getting descheduled by the OS is not it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scrape_is_not_held_by_the_walk_it_reads_past() {
+        let root = scratch("scrape-during-walk");
+        for part in 0..20 {
+            for file in 0..1000 {
+                write(
+                    &root.join(format!("part{part}")).join(format!("{file:04}")),
+                    8,
+                );
+            }
+        }
+        let observable = Arc::new(ImageStoreObservable::new(&root, NODE, STORE));
+
+        let started = std::time::Instant::now();
+        observable.scan();
+        let walk_costs = started.elapsed();
+
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let walking = Arc::clone(&observable);
+            let scan = std::thread::spawn(move || walking.scan());
+            std::thread::sleep(walk_costs / 4);
+            let collecting = std::time::Instant::now();
+            let _ = observable.collect_metrics("").await.unwrap();
+            best = best.min(collecting.elapsed());
+            scan.join().unwrap();
+        }
+
+        assert!(
+            best < walk_costs / 3,
+            "a scrape waited {best:?} on a walk that costs {walk_costs:?}"
         );
     }
 

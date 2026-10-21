@@ -297,24 +297,40 @@ impl ClaimStoreObservable {
             dirs.sort();
         }
 
-        let mut store = self.store.lock().unwrap();
-        // Retire what the root no longer holds before walking what it does, so a
-        // deleted claim cannot be read back out of this process's memory.
-        store.claims.retain(|key, _| found.contains_key(key));
+        // The store is held for the bookkeeping only, never for the walk. A
+        // scrape collects this map on every request, and the walk costs what the
+        // node holds -- minutes of throttled CPU once the image stores are in
+        // the same process -- so holding the map across it makes every scrape
+        // and probe of this pod wait for a walk that is not producing anything
+        // yet. The footprints themselves are shared and written in place, so a
+        // scrape during a walk reads the previous number; that is what the scan
+        // age next to it is for.
+        let work: Vec<_> = {
+            let mut store = self.store.lock().unwrap();
+            // Retire what the root no longer holds before walking what it does, so a
+            // deleted claim cannot be read back out of this process's memory.
+            store.claims.retain(|key, _| found.contains_key(key));
+            found
+                .iter()
+                .map(|(key, dirs)| {
+                    let footprint = store
+                        .claims
+                        .entry(key.clone())
+                        .or_insert_with(|| {
+                            Arc::new(ClaimFootprint::new(
+                                key.1.clone(),
+                                dirs[0].clone(),
+                                cog_core::claim_footprint::nested_mounts_under(&dirs[0], &mounts),
+                            ))
+                        })
+                        .clone();
+                    (key, dirs, footprint)
+                })
+                .collect()
+        };
 
         let mut readable = 0usize;
-        for (key, dirs) in &found {
-            let footprint = store
-                .claims
-                .entry(key.clone())
-                .or_insert_with(|| {
-                    Arc::new(ClaimFootprint::new(
-                        key.1.clone(),
-                        dirs[0].clone(),
-                        cog_core::claim_footprint::nested_mounts_under(&dirs[0], &mounts),
-                    ))
-                })
-                .clone();
+        for (key, dirs, footprint) in &work {
             // One claim name can own more than one directory on this node: a
             // claim that was deleted while its reclaim policy kept the
             // directory, and the claim that later came back under the same
@@ -340,7 +356,7 @@ impl ClaimStoreObservable {
             let mut total = 0u64;
             let mut gone_here = 0usize;
             let mut failure = None;
-            for dir in dirs {
+            for dir in dirs.iter() {
                 let exclude = cog_core::claim_footprint::nested_mounts_under(dir, &mounts);
                 match cog_core::fs_size::dir_bytes_counted_once(dir, &exclude) {
                     Ok(counted) => {
@@ -373,10 +389,12 @@ impl ClaimStoreObservable {
             }
         }
 
-        store.dirs = found.len();
-        store.readable = readable;
-        store.last_scan = Instant::now();
-        drop(store);
+        {
+            let mut store = self.store.lock().unwrap();
+            store.dirs = found.len();
+            store.readable = readable;
+            store.last_scan = Instant::now();
+        }
         self.scans.fetch_add(1, Ordering::Relaxed);
 
         // A claim whose directories were removed while it was walked is still a
@@ -752,6 +770,48 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
         observable.scan();
         assert!(observable.reported().is_empty());
+    }
+
+    /// A scrape reads the previous walk's numbers, so it must not wait for the
+    /// walk in progress: this node's storage root is 525k files, and a walk
+    /// that held the map would leave the pod unscrapable -- and, since its
+    /// probes run on the same runtime, restartable -- for seconds every
+    /// cadence. Calibrated against the walk itself, so the bound means the same
+    /// thing on a fast machine and a loaded one. Three attempts, because the
+    /// failure this guards is a wait of the whole walk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scrape_is_not_held_by_the_walk_it_reads_past() {
+        let root = scratch("scrape-during-walk");
+        let dir = claim_dir(&root, "cogneva", "data-pvc");
+        for part in 0..20 {
+            for file in 0..1000 {
+                write(
+                    &dir.join(format!("part{part}")).join(format!("{file:04}")),
+                    8,
+                );
+            }
+        }
+        let observable = observable(&root);
+
+        let started = std::time::Instant::now();
+        observable.scan();
+        let walk_costs = started.elapsed();
+
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let walking = Arc::clone(&observable);
+            let scan = std::thread::spawn(move || walking.scan());
+            std::thread::sleep(walk_costs / 4);
+            let collecting = std::time::Instant::now();
+            let _ = observable.collect_metrics("").await.unwrap();
+            best = best.min(collecting.elapsed());
+            scan.join().unwrap();
+        }
+
+        assert!(
+            best < walk_costs / 3,
+            "a scrape waited {best:?} on a walk that costs {walk_costs:?}"
+        );
     }
 
     fn chart_rule(name: &str) -> serde_json::Value {
