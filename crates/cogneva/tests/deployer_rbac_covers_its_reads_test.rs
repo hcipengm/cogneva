@@ -69,6 +69,10 @@ const SCANNED: &[&str] = &[
     "crates/cog-reflection/src/mainline_rollout.rs",
     "crates/cog-reflection/src/change_execution.rs",
     "crates/cog-reflection/src/image_rollout.rs",
+    // Runs in the same process and under the same ServiceAccount as the
+    // deployer: it reads a claim's sizes and patches its request, and the two
+    // admission bounds that cap that request.
+    "crates/cog-reflection/src/volume_capacity.rs",
 ];
 
 /// Crate sources that do talk to the cluster under a **different** principal.
