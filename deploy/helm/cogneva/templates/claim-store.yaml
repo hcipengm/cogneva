@@ -107,7 +107,7 @@ spec:
             httpGet:
               path: /health/live
               port: http
-{{ toYaml .Values.healthProbes.startup | indent 12 }}
+{{ toYaml .Values.healthProbes.claimStoreStartup | indent 12 }}
           livenessProbe:
             httpGet:
               path: /health/live

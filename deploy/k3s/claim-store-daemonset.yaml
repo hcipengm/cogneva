@@ -92,11 +92,14 @@ spec:
             - name: http
               containerPort: 9100
               protocol: TCP
+          # 开监听之前先把存储根与三个镜像库各走一遍（首拍不能是空的），启动
+          # 耗时等于那些树的规模：本机实测 3m35s，全局那套 300s 只剩不到两成
+          # 余量，撞破就是 CrashLoopBackOff。给到 600s。
           startupProbe:
             httpGet:
               path: /health/live
               port: http
-            failureThreshold: 60
+            failureThreshold: 120
             periodSeconds: 5
             timeoutSeconds: 5
           livenessProbe:

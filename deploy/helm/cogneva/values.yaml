@@ -858,6 +858,15 @@ healthProbes:
     periodSeconds: 5
     timeoutSeconds: 5
     failureThreshold: 60
+  # claim-store 自己有更长的一档：它在开监听之前先把存储根与三个镜像库各走一遍
+  # （首拍不能是空的），所以启动耗时等于这台节点上那些树的规模，而不是进程起来的
+  # 时间。本机实测 3m35s（containerd 60.5 GB + podman 55 GB + buildah 11 GB，
+  # 200m 配额下），上面那档 60×5s=300s 只剩不到两成余量，而库只会随镜像拉取与
+  # 构建变大——撞破就是 CrashLoopBackOff，且每次重启都要再走一遍。600s 是实测两倍。
+  claimStoreStartup:
+    periodSeconds: 5
+    timeoutSeconds: 5
+    failureThreshold: 120
   liveness:
     periodSeconds: 20
     timeoutSeconds: 10
