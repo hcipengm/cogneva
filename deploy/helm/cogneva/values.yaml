@@ -779,12 +779,17 @@ claimStore:
   resources:
     # 常态是每 300s 一次 readdir+stat 的走查，其余时间空转；内存按目录项规模取，
     # 与 5G 卷的量级无关（走查不读文件内容）。
+    #
+    # 上限是量出来的，不是撞出来的：只走完 content 那 13 GB 时这个容器的
+    # working set 已经 87Mi；整棵 60.5 GB（809k 文件，其中 38 万是 overlay 层之间的
+    # 硬链接）按边走边加的量法在裸进程里峰值 29 MB，两者相加给到 192Mi 留出余量。
+    # 早先 128Mi 时的 OOM 不是这个量法的成本——那是给每个文件留一条记录的旧量法。
     requests:
       cpu: 10m
       memory: 32Mi
     limits:
       cpu: 200m
-      memory: 128Mi
+      memory: 192Mi
 
 # 集群内镜像仓库：GitOps L1 金丝雀镜像秒级分发通道。
 # publisher（进化 Pod）把 overlay 镜像（cogneva 基镜像 + 新二进制）push 到
