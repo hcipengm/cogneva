@@ -1065,6 +1065,18 @@ pub trait ChangeLedgerStore: Send + Sync {
         Ok(None)
     }
 
+    /// Who is holding the line, and how much each one holds.
+    ///
+    /// The surface counts; this names. A reader that can say "three changes
+    /// hold eleven landings" still cannot act, because the first step is to
+    /// find the change -- and a count with no name sends it to search the
+    /// account in a different order than the one the count came from.
+    ///
+    /// `None` means this store cannot answer, not that nobody is holding.
+    async fn blocking_holders(&self) -> SFResult<Option<Vec<BlockingHolder>>> {
+        Ok(None)
+    }
+
     /// The owed set counted by the face its documents named.
     ///
     /// `None` when the store cannot group by face; an empty vector means every
@@ -1139,6 +1151,15 @@ pub struct BlockingSurface {
     /// row's own answer, and counted here so a disagreement never reads as
     /// silence.
     pub block_conflicts: u64,
+}
+
+/// One change that delivered a commit the tree has not confirmed, and how many
+/// other rows that delivery is holding back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockingHolder {
+    pub identity: ChangeIdentity,
+    /// Rows, other than this one, measured at the revision it delivered.
+    pub held: u64,
 }
 
 /// One face of the programme, counted by what the tree has made of it.

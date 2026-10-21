@@ -15,9 +15,10 @@ use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
 use cog_core::{
-    BlockCensus, BlockingSurface, ChangeBlock, ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore,
-    ChangeMeasurement, ChangePriority, ChangeReading, ChangeReopen, ChangeSource, ChangeState,
-    DemandClosure, DispatchState, RetireReason, SFError, SFResult, WriteWindow,
+    BlockCensus, BlockingHolder, BlockingSurface, ChangeBlock, ChangeIdentity, ChangeLedgerRow,
+    ChangeLedgerStore, ChangeMeasurement, ChangePriority, ChangeReading, ChangeReopen,
+    ChangeSource, ChangeState, DemandClosure, DispatchState, RetireReason, SFError, SFResult,
+    WriteWindow,
 };
 
 /// Every read returns these, in one place so no two readers can come back with
@@ -426,6 +427,17 @@ SELECT (SELECT count(*) FROM holder) AS holders, \
 /// alone. A row that has never been measured is not ageless -- it has been
 /// waiting since it entered -- and taking `NULL` as the answer would let a face
 /// full of never-measured rows report no wait at all.
+const BLOCKING_HOLDERS_SQL: &str = "\
+SELECT h.kind, h.scope, h.literal, \
+       (SELECT count(DISTINCT (l.kind, l.scope, l.literal)) \
+          FROM change_ledger l \
+         WHERE l.measured_rev = h.delivered_rev \
+           AND (l.kind, l.scope, l.literal) IS DISTINCT FROM (h.kind, h.scope, h.literal)) \
+         AS held \
+  FROM change_ledger h \
+ WHERE h.delivered_rev IS NOT NULL AND h.state NOT IN ('landed', 'retired') \
+ ORDER BY held DESC, h.kind, h.scope, h.literal";
+
 const BLOCK_CENSUS_SQL: &str = "\
 SELECT block, \
        CASE state WHEN 'landed' THEN 'landed' WHEN 'retired' THEN 'retired' \
@@ -1132,6 +1144,38 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             held_landings: held.max(0) as u64,
             block_conflicts: conflicts.max(0) as u64,
         }))
+    }
+
+    async fn blocking_holders(&self) -> SFResult<Option<Vec<BlockingHolder>>> {
+        // The same join the surface counts, asked the other way round: one row
+        // per holder rather than three totals. It is a second statement on
+        // purpose -- the counts have to come from one snapshot to agree, and a
+        // per-holder list is not something the totals can be recovered from
+        // because a landing two holders stand on is one landing, not two.
+        let rows = sqlx::query(BLOCKING_HOLDERS_SQL)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("read blocking holders: {e}")))?;
+        let mut holders = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let kind: String = row
+                .try_get("kind")
+                .map_err(|e| SFError::Database(format!("kind: {e}")))?;
+            let scope: String = row
+                .try_get("scope")
+                .map_err(|e| SFError::Database(format!("scope: {e}")))?;
+            let literal: String = row
+                .try_get("literal")
+                .map_err(|e| SFError::Database(format!("literal: {e}")))?;
+            let held: i64 = row
+                .try_get("held")
+                .map_err(|e| SFError::Database(format!("held: {e}")))?;
+            holders.push(BlockingHolder {
+                identity: ChangeIdentity::new(kind, scope, literal),
+                held: held.max(0) as u64,
+            });
+        }
+        Ok(Some(holders))
     }
 
     async fn block_census(&self) -> SFResult<Option<Vec<BlockCensus>>> {

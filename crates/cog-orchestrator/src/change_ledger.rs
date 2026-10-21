@@ -3763,6 +3763,45 @@ async fn record_dispatch_state(
             None
         }
     };
+    // The count says work is held; only a name says where to start. One line per
+    // pass names the holders, because the action this reading calls for is on a
+    // change and a reader that has to search the account for it is reading a
+    // different order than the one the count came from. A failed read says so
+    // and names nobody, rather than reading as an empty list.
+    match store.blocking_holders().await {
+        Ok(Some(holders)) if !holders.is_empty() => {
+            // Bounded on purpose: one line is an annotation, and an account that
+            // came to hold thousands of rows would otherwise turn this into a
+            // dump. The remainder is a count, not silence.
+            const NAMED: usize = 20;
+            let named: Vec<String> = holders
+                .iter()
+                .take(NAMED)
+                .map(|holder| {
+                    format!(
+                        "{}:{}:{} holds {}",
+                        holder.identity.kind,
+                        holder.identity.scope,
+                        holder.identity.literal,
+                        holder.held
+                    )
+                })
+                .collect();
+            info!(
+                holders = holders.len(),
+                unnamed = holders.len().saturating_sub(NAMED),
+                named = ?named,
+                "change ledger: changes holding the line"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the blocking holders could not be read, so this pass names none"
+            );
+        }
+    }
     publish_dispatch_rows(
         metrics,
         &state,
