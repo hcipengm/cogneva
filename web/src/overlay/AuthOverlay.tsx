@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   platformOAuthStart,
   platformOAuthExchange,
@@ -46,7 +46,11 @@ export function AuthOverlay({
     setBusyProvider(provider);
     try {
       const { authorize_url, state } = await platformOAuthStart(provider);
-      window.open(authorize_url, '_blank', 'noopener');
+      // Named window, opener kept: the redirect lands on a public page, and the
+      // only way it can hand the code back without a copy-paste is through
+      // `window.opener`. With `noopener` that page can do nothing but print the
+      // code, which leaves every login one manual step long.
+      window.open(authorize_url, 'cogneva-oauth', 'width=720,height=820');
       setPending({ provider, state });
     } catch (e) {
       setOauthError((e as { message?: string }).message ?? 'OAuth 发起失败');
@@ -55,28 +59,55 @@ export function AuthOverlay({
     }
   };
 
+  const exchange = useCallback(
+    async (code: string | undefined, redirectUrl: string) => {
+      if (!pending) return;
+      setOauthError(null);
+      setBusyProvider(pending.provider);
+      try {
+        const res = await platformOAuthExchange(
+          pending.provider,
+          pending.state,
+          code,
+          redirectUrl
+        );
+        localStorage.setItem('cogneva_token', res.token);
+        window.location.reload();
+      } catch (err) {
+        setOauthError(
+          (err as { message?: string }).message ?? '授权码交换失败，请重试'
+        );
+        setBusyProvider(null);
+      }
+    },
+    [pending]
+  );
+
   const finishOAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!pending || !pasted.trim()) return;
-    setOauthError(null);
-    setBusyProvider(pending.provider);
-    try {
-      const value = pasted.trim();
-      const res = await platformOAuthExchange(
-        pending.provider,
-        pending.state,
-        undefined,
-        value
-      );
-      localStorage.setItem('cogneva_token', res.token);
-      window.location.reload();
-    } catch (err) {
-      setOauthError(
-        (err as { message?: string }).message ?? '授权码交换失败，请重试'
-      );
-      setBusyProvider(null);
-    }
+    await exchange(undefined, pasted.trim());
   };
+
+  // The redirect page posts the code to the window that opened it. Its origin
+  // is not ours (it is a public page), so the state we issued is the proof this
+  // code belongs to this attempt; the server consumes that state single-use
+  // when it swaps the code for a token.
+  useEffect(() => {
+    if (!pending) return;
+    const onMessage = (e: MessageEvent) => {
+      const data = (e.data ?? {}) as {
+        type?: string;
+        code?: string;
+        state?: string;
+      };
+      if (data.type !== 'cogneva-gitee-oauth') return;
+      if (!data.code || data.state !== pending.state) return;
+      void exchange(data.code, '');
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [pending, exchange]);
 
   const submitPat = async (e: React.FormEvent) => {
     e.preventDefault();
