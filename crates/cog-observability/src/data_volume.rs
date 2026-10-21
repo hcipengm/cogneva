@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use cog_core::claim_footprint::MountEntry;
 use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::{SFResult, ShutdownSignal};
 use tracing::{info, warn};
@@ -125,7 +126,7 @@ pub fn watched_targets(
 ///
 /// What counts as a nested mount is the footprint reading's own rule, since the
 /// other process measuring a volume of its own applies the same one.
-pub fn derive_exclusions(targets: &mut [WatchedTarget], mounts: &[PathBuf]) {
+pub fn derive_exclusions(targets: &mut [WatchedTarget], mounts: &[MountEntry]) {
     for target in targets.iter_mut() {
         target.exclude = cog_core::claim_footprint::nested_mounts_under(&target.dir, mounts);
     }
@@ -589,13 +590,22 @@ mod tests {
                 },
             ],
         );
+        let mount = |mount_point: &str| cog_core::claim_footprint::MountEntry {
+            root: PathBuf::from(mount_point),
+            mount_point: PathBuf::from(mount_point),
+        };
         let mounts = vec![
-            PathBuf::from("/"),
-            PathBuf::from("/etc/hosts"),
-            PathBuf::from("/opt/cogneva/sandbox"),
-            PathBuf::from("/opt/cogneva/sandbox/src"),
+            mount("/"),
+            mount("/etc/hosts"),
+            mount("/opt/cogneva/sandbox"),
+            cog_core::claim_footprint::MountEntry {
+                // A different place mounted inside the walk, not the same
+                // directory seen twice.
+                root: PathBuf::from("/var/lib/rancher/k3s/storage/pvc-src"),
+                mount_point: PathBuf::from("/opt/cogneva/sandbox/src"),
+            },
             // 同前缀但不同目录：组件级比较必须不把它当成子目录。
-            PathBuf::from("/opt/cogneva/sandbox2"),
+            mount("/opt/cogneva/sandbox2"),
         ];
 
         let (mut targets, _) = watched_targets(&cfg, &app);

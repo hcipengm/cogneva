@@ -190,11 +190,25 @@ pub fn used_bytes_from_exposition(text: &str, claim: &str) -> Option<u64> {
 /// that is too large, which is visible, whereas leaving out a mount that should
 /// have been counted would report a volume as smaller than it is and silence its
 /// alert.
-pub fn current_mounts() -> Vec<PathBuf> {
+pub fn current_mounts() -> Vec<MountEntry> {
     let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return Vec::new();
     };
     parse_mounts(&text)
+}
+
+/// One row of the mount table: where the mounted filesystem's own root starts,
+/// and where it is attached in this namespace.
+///
+/// Both halves are needed to tell a directory that is being seen a second time
+/// from a different filesystem mounted inside the walk. A self-bind has the same
+/// path on both sides; a propagated copy (the same directory carried into a
+/// container under a different name) has two different paths that name the same
+/// place once the parent mount's root is taken into account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountEntry {
+    pub root: PathBuf,
+    pub mount_point: PathBuf,
 }
 
 /// The mount points in a mountinfo table, minus the ones that mount a directory
@@ -208,7 +222,7 @@ pub fn current_mounts() -> Vec<PathBuf> {
 /// entry that carries any size was the one skipped. Whether it is a real
 /// submount is in the root field: a self-bind has the same path there as in the
 /// mount point, while a mount of something else has a different one.
-fn parse_mounts(text: &str) -> Vec<PathBuf> {
+fn parse_mounts(text: &str) -> Vec<MountEntry> {
     text.lines()
         .filter_map(|line| {
             // `<id> <parent> <maj:min> <root> <mount point> <opts> [more] - <fstype> <src> <super opts>`
@@ -224,7 +238,10 @@ fn parse_mounts(text: &str) -> Vec<PathBuf> {
             if root == mount_point && mount_point != "/" {
                 return None;
             }
-            Some(PathBuf::from(mount_point))
+            Some(MountEntry {
+                root: PathBuf::from(root),
+                mount_point: PathBuf::from(mount_point),
+            })
         })
         .collect()
 }
@@ -255,12 +272,50 @@ fn unescape_mount_field(field: &str) -> String {
 /// `root` itself is not among them: excluding the measured directory would make
 /// it report nothing forever. Comparison is by path component, so a sibling
 /// whose name merely starts the same way is not a child of it.
-pub fn nested_mounts_under(root: &Path, mounts: &[PathBuf]) -> Vec<PathBuf> {
+pub fn nested_mounts_under(root: &Path, mounts: &[MountEntry]) -> Vec<PathBuf> {
     mounts
         .iter()
-        .filter(|mount| mount.as_path() != root && mount.starts_with(root))
-        .cloned()
+        .filter(|mount| mount.mount_point.as_path() != root && mount.mount_point.starts_with(root))
+        .filter(|mount| !is_the_same_directory_seen_again(root, mount, mounts))
+        .map(|mount| mount.mount_point.clone())
         .collect()
+}
+
+/// Whether this submount attaches the very directory that its parent mount
+/// already exposes at that relative path.
+///
+/// A host store that bind-mounts `storage/overlay` onto itself shows up twice in
+/// a container: the host's own entry is a self-bind and is dropped, but the
+/// container inherits a *copy* of it whose paths differ on the two sides --
+/// root `/var/lib/containers/storage/overlay`, mount point
+/// `/host/podman/storage/overlay`. Excluding that copy drops the largest
+/// directory in the store (58 GB against the 178 MB left behind), which reads as
+/// a store that is nearly empty rather than one that could not be walked.
+///
+/// The test is exact rather than a name match: take the nearest ancestor mount
+/// in the table, add this mount's path relative to it onto that mount's root,
+/// and compare with this mount's root. A real submount of another filesystem
+/// names a different place and fails the comparison.
+fn is_the_same_directory_seen_again(
+    root: &Path,
+    mount: &MountEntry,
+    mounts: &[MountEntry],
+) -> bool {
+    let parent = mounts
+        .iter()
+        .filter(|other| {
+            other.mount_point.as_path() != mount.mount_point.as_path()
+                && mount.mount_point.starts_with(&other.mount_point)
+                && root.starts_with(&other.mount_point)
+        })
+        .max_by_key(|other| other.mount_point.components().count());
+    let Some(parent) = parent else {
+        return false;
+    };
+    let Ok(relative) = mount.mount_point.strip_prefix(&parent.mount_point) else {
+        return false;
+    };
+    parent.root.join(relative) == mount.root
 }
 
 /// The measured footprint of one claim-backed directory.
@@ -451,14 +506,23 @@ mod tests {
     #[test]
     fn nested_mounts_leave_out_the_root_and_the_neighbours() {
         let root = PathBuf::from("/opt/cogneva/sandbox");
+        let mount = |mount_point: &str, root_field: &str| MountEntry {
+            root: PathBuf::from(root_field),
+            mount_point: PathBuf::from(mount_point),
+        };
         let mounts = vec![
-            PathBuf::from("/"),
-            PathBuf::from("/etc/hosts"),
-            PathBuf::from("/opt/cogneva/sandbox"),
-            PathBuf::from("/opt/cogneva/sandbox/src"),
+            mount("/", "/"),
+            mount("/etc/hosts", "/etc/hosts"),
+            mount("/opt/cogneva/sandbox", "/opt/cogneva/sandbox"),
+            // A volume of its own inside the walk: a different place, so it is
+            // left out.
+            mount(
+                "/opt/cogneva/sandbox/src",
+                "/var/lib/rancher/k3s/storage/pvc-a",
+            ),
             // Same prefix, different directory: a component-wise comparison must
             // not call this a child.
-            PathBuf::from("/opt/cogneva/sandbox2"),
+            mount("/opt/cogneva/sandbox2", "/opt/cogneva/sandbox2"),
         ];
         assert_eq!(
             nested_mounts_under(&root, &mounts),
@@ -466,7 +530,11 @@ mod tests {
         );
         // The root is not its own exclusion: excluding it would make the volume
         // report zero forever.
-        assert!(nested_mounts_under(&root, std::slice::from_ref(&root)).is_empty());
+        assert!(nested_mounts_under(
+            &root,
+            &[mount("/opt/cogneva/sandbox", "/opt/cogneva/sandbox")]
+        )
+        .is_empty());
     }
 
     /// A store that bind-mounts one of its own subdirectories over itself has a
@@ -485,11 +553,40 @@ mod tests {
             " /var/lib/containers/storage/overlay rw,relatime - ext4 /dev/mapper/vg-root rw\n",
         );
         assert_eq!(
-            parse_mounts(table),
+            parse_mounts(table)
+                .iter()
+                .map(|m| m.mount_point.clone())
+                .collect::<Vec<_>>(),
             vec![
                 PathBuf::from("/"),
                 PathBuf::from("/var/lib/rancher/k3s/storage/pvc-a"),
             ]
+        );
+    }
+
+    /// The same self-bind, propagated into a container under another name: the
+    /// two sides no longer read equal, so the self-bind rule alone misses it.
+    ///
+    /// Measured live on 2026-10-21: the claim-store container saw
+    /// `/var/lib/containers/storage/overlay` attached at
+    /// `/host/podman/storage/overlay`, excluded it as a nested mount, and
+    /// published 178 MB for a store holding 55 GB. The 58 GB in `overlay` was
+    /// simply absent from the account.
+    #[test]
+    fn a_directory_carried_into_a_container_under_another_name_is_not_an_exclusion() {
+        let table = concat!(
+            "25 1 252:0 / / rw,relatime - ext4 /dev/mapper/vg-root rw\n",
+            // The store, attached into the container.
+            "3806 25 252:0 /var/lib/containers /host/podman ro,relatime - ext4 /dev/mapper/vg-root rw\n",
+            // The host's self-bind, carrying the same directory to a different name.
+            "3812 3806 252:0 /var/lib/containers/storage/overlay /host/podman/storage/overlay rw,relatime - ext4 /dev/mapper/vg-root rw\n",
+            // A volume of its own mounted inside the same store.
+            "3813 3806 252:0 /var/lib/rancher/k3s/storage/pvc-b /host/podman/backup rw,relatime - ext4 /dev/mapper/vg-root rw\n",
+        );
+        let mounts = parse_mounts(table);
+        assert_eq!(
+            nested_mounts_under(Path::new("/host/podman"), &mounts),
+            vec![PathBuf::from("/host/podman/backup")]
         );
     }
 
@@ -500,11 +597,11 @@ mod tests {
     fn current_mounts_reads_this_processes_own_table() {
         let mounts = current_mounts();
         assert!(
-            mounts.iter().any(|m| m == Path::new("/")),
+            mounts.iter().any(|m| m.mount_point == Path::new("/")),
             "the root mount is always present, got {mounts:?}"
         );
         assert!(
-            !mounts.iter().any(|m| m.as_os_str().is_empty()),
+            !mounts.iter().any(|m| m.mount_point.as_os_str().is_empty()),
             "an unparsed line yields an empty path that would match nothing"
         );
     }

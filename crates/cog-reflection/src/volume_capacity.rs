@@ -621,7 +621,7 @@ pub fn targets_from_env() -> Vec<ClaimTarget> {
             );
         }
     }
-    let all: Vec<PathBuf> = mounts.iter().map(|m| PathBuf::from(&m.path)).collect();
+    let all = claim_footprint::current_mounts();
     mounts
         .into_iter()
         .map(|m| {
