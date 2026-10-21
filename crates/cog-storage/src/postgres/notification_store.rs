@@ -120,6 +120,24 @@ impl PostgresNotificationStore {
         Ok(())
     }
 
+    /// Drop read rows older than `keep_days`, leaving unread rows alone.
+    ///
+    /// Unread is the exception on purpose: a notification nobody has opened
+    /// yet is the only reason the table exists, and expiring it by age would
+    /// delete exactly the ones a person still has to see. Read rows are the
+    /// history — useful for a while, unbounded otherwise.
+    pub async fn prune_read(&self, keep_days: i64) -> SFResult<u64> {
+        let result = sqlx::query(
+            "DELETE FROM notifications \
+             WHERE is_read = true AND read_at < NOW() - make_interval(days => $1)",
+        )
+        .bind(keep_days as i32)
+        .execute(&self.pool)
+        .await
+        .map_err(to_sf)?;
+        Ok(result.rows_affected())
+    }
+
     async fn unread_count(&self, user_id: Uuid) -> SFResult<i64> {
         sqlx::query_scalar(
             "SELECT count(*) FROM notifications WHERE user_id = $1 AND is_read = false",

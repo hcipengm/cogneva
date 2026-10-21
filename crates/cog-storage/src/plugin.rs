@@ -535,6 +535,18 @@ impl cog_core::SystemPlugin for StoragePlugin {
             let notification_store = crate::PostgresNotificationStore::new(pool.clone());
             match notification_store.init_schema().await {
                 Ok(()) => {
+                    // 已读通知有保留期，未读的永远留着：表只增不减的话，它的体积
+                    // 由告警抖动的次数决定，而抖动正是这张表记的东西。启动时清一次，
+                    // 与 LLM 调用留底同一办理——进程滚得勤，漏一拍只少清一轮。
+                    match notification_store.prune_read(NOTIFICATION_KEEP_DAYS).await {
+                        Ok(removed) if removed > 0 => info!(
+                            removed,
+                            days = NOTIFICATION_KEEP_DAYS,
+                            "read notifications past retention removed"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => warn!(error = %e, "notification retention pass failed"),
+                    }
                     let store: Arc<dyn cog_core::NotificationStore> = Arc::new(notification_store);
                     ctx.publish_service(store);
                     info!("StoragePlugin notification store published");
@@ -1389,6 +1401,13 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
 
 /// How many PostgreSQL pools this plugin opens against the same database.
 const POSTGRES_POOL_COUNT: u32 = 4;
+
+/// How long a read notification stays in the table.
+///
+/// Longer than the LLM exchange ledger's 30 days because these rows are read by
+/// people rather than by joins: a bell that forgets what happened last month is
+/// still usable, but the history is the only record of what was announced.
+const NOTIFICATION_KEEP_DAYS: i64 = 90;
 
 /// The server's own connection ceiling and its superuser reserve.
 ///
