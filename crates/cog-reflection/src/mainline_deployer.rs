@@ -228,6 +228,7 @@ const BUILDAH_STEP_WALLS: &[(&str, u64)] = &[
     ("web-builder-rm", 120),
     ("clear-web", 300),
     ("copy-web", 300),
+    ("verify-web", 120),
     ("copy-manifest", 60),
     ("check-version", 120),
     ("label-revision", 60),
@@ -5983,6 +5984,20 @@ impl MainlineDeployer {
         self.buildah_step(
             "copy-web",
             &["copy", ctr, cache.to_str().unwrap(), WEB_DIST_DEST],
+        )
+        .await?;
+        // 拷进去的是这一棵还是"这一棵作为子目录"决定了镜像里有没有 `/index.html`。
+        // copy 成功只说明字节写出去了，所以在这里问镜像本身一句：入口在不在。
+        self.buildah_step(
+            "verify-web",
+            &[
+                "run",
+                ctr,
+                "--",
+                "test",
+                "-f",
+                &format!("{WEB_DIST_DEST}/index.html"),
+            ],
         )
         .await?;
         info!(
