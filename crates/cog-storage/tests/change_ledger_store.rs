@@ -593,6 +593,128 @@ async fn a_declarations_band_rides_the_citation_and_the_row_takes_the_highest() 
     cleanup(&pool, &marker).await;
 }
 
+/// The outstanding read hands the urgent rows out first, and the order follows
+/// the citations rather than a stamp taken when the row entered.
+///
+/// This is the half that a column cannot fake. The three rows below are declared
+/// in the order unstated, P3, P0, so a read ordered by anything about arrival --
+/// insertion, `first_seen_at`, the staleness key -- answers in exactly the
+/// reverse of what it should. What makes the assertion mean something is that
+/// all three are unmeasured, so the staleness key has no measured row to prefer
+/// and the band is the only thing that can produce this order.
+///
+/// The second half is the one a stored band would fail: the urgent document
+/// takes its declaration back and re-declares at `unstated`, and the row has to
+/// fall behind the P3 one on the next read. A copy that was written once would
+/// still say P0 here, and that is precisely the drift the contract refuses.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn the_outstanding_read_hands_out_the_most_urgent_band_first() {
+    let (store, pool, marker) = store().await;
+    let unstated = identity(&marker, "unstated");
+    let quiet = identity(&marker, "quiet");
+    let urgent = identity(&marker, "urgent");
+    let declare = |id: &ChangeIdentity, doc: &str, band: ChangePriority| ChangeReading {
+        identity: id.clone(),
+        title: Some("a change the order probe declares".into()),
+        assertion: None,
+        source: ChangeSource {
+            doc: doc.to_string(),
+            verdict: Some("unlanded".into()),
+            priority: band,
+        },
+    };
+    let doc = |id: &ChangeIdentity| format!("docs/{}.md", id.scope.replace('/', "-"));
+
+    store
+        .declare(&[
+            declare(&unstated, &doc(&unstated), ChangePriority::Unstated),
+            declare(&quiet, &doc(&quiet), ChangePriority::P3),
+            declare(&urgent, &doc(&urgent), ChangePriority::P0),
+        ])
+        .await
+        .expect("queue three declarations");
+    store
+        .fold_declarations(100, Some("probe-rev"))
+        .await
+        .expect("fold the declarations");
+
+    let order = |rows: Vec<cog_core::ChangeLedgerRow>| -> Vec<String> {
+        rows.into_iter()
+            .filter(|row| row.identity.scope.starts_with(&marker))
+            .map(|row| row.identity.scope)
+            .collect()
+    };
+    assert_eq!(
+        order(store.outstanding(10_000).await.expect("read the work")),
+        vec![
+            urgent.scope.clone(),
+            quiet.scope.clone(),
+            unstated.scope.clone()
+        ],
+        "P0 before P3 before unstated, though that is the reverse of the order \
+         the three entered in"
+    );
+
+    // The correction a document makes has to reach the order, or the column is a
+    // label: withdraw the P0 declaration and re-declare the same document at
+    // `unstated`, and the row falls behind the P3 one.
+    withdraw_declaration(&pool, &urgent, &doc(&urgent)).await;
+    store
+        .declare(&[declare(&urgent, &doc(&urgent), ChangePriority::Unstated)])
+        .await
+        .expect("re-declare at the lower band");
+    store
+        .fold_declarations(100, Some("probe-rev"))
+        .await
+        .expect("fold the correction");
+    assert_eq!(
+        order(
+            store
+                .outstanding(10_000)
+                .await
+                .expect("read the work again")
+        ),
+        vec![
+            quiet.scope.clone(),
+            unstated.scope.clone(),
+            urgent.scope.clone()
+        ],
+        "the row whose band was taken back now sits behind every row that still \
+         holds one, and among the rows nobody prioritised the order is arrival \
+         -- which is why the unstated row declared first comes before it"
+    );
+
+    // The count the reading face publishes partitions the same set the reads
+    // slice: five cells, every band present, summing to the outstanding census.
+    // A band dropped by the group-by -- or a rank the store did not fold back
+    // into a band -- shows up here as a sum that does not close.
+    let owed = store.owed_by_band().await.expect("count the owed set");
+    assert_eq!(
+        owed.iter().map(|(band, _)| *band).collect::<Vec<_>>(),
+        ChangePriority::ALL.to_vec(),
+        "every band is a cell, in the contract's own order"
+    );
+    let census: usize = store
+        .census()
+        .await
+        .expect("read the census")
+        .into_iter()
+        .filter(|(state, _)| state.is_outstanding())
+        .map(|(_, rows)| usize::try_from(rows).unwrap_or(usize::MAX))
+        .sum();
+    assert_eq!(
+        owed.iter().map(|(_, rows)| rows).sum::<usize>(),
+        census,
+        "the bands partition the outstanding set"
+    );
+
+    for id in [&unstated, &quiet, &urgent] {
+        withdraw_declaration(&pool, id, &doc(id)).await;
+    }
+    cleanup(&pool, &marker).await;
+}
+
 /// A declaration nobody has measured enters as work still owed, not as a stuck
 /// row.
 ///

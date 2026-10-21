@@ -270,7 +270,19 @@ impl ChangePriority {
     }
 
     /// Rank, with `P0` highest and `Unstated` below every band.
-    fn rank(self) -> u8 {
+    ///
+    /// Public because it is the number a store's own ordering column holds: the
+    /// ledger keeps the rank as a generated column so a bounded read can be
+    /// ordered before it is cut, and a count taken per rank has to be read back
+    /// as a band.
+    ///
+    /// The same five numbers are spelled in the migration that generates that
+    /// column, because a generated expression cannot call into Rust. That copy
+    /// cannot promote work nobody prioritised: a band the SQL does not know
+    /// ranks zero, the same answer as `unstated`, so a drift between the two
+    /// hides urgency rather than inventing it -- and the live counts are what
+    /// make it visible if it ever happens.
+    pub const fn rank(self) -> u8 {
         match self {
             ChangePriority::P0 => 4,
             ChangePriority::P1 => 3,
@@ -394,11 +406,18 @@ impl ChangeLedgerRow {
     /// The band to act on: the highest any document still asking for this
     /// change stated, or [`ChangePriority::Unstated`] when none of them said.
     ///
-    /// Derived from the sources on every read rather than stored in a column of
-    /// its own. A stored band would be a second answer to a question the
-    /// sources already answer, and the two would drift the first time a
-    /// declaration was corrected -- the reading path updates the source, and
-    /// nothing would update the copy.
+    /// Derived from the sources rather than handed in by a caller. A band a
+    /// writer supplies would be a second answer to a question the sources
+    /// already answer, and the two would drift the first time a declaration was
+    /// corrected -- the reading path updates the source, and nothing would
+    /// update the copy.
+    ///
+    /// The ledger table derives the same value from the same citations, as a
+    /// generated column, for one reason reading cannot serve: the bounded reads
+    /// cut a slice before the caller holds the rows, so they have to be ordered
+    /// by the band. Being generated, that copy is recomputed from the citations
+    /// by the database on every write that touches them, so it cannot disagree
+    /// with this method the way a maintained column could.
     pub fn priority(&self) -> ChangePriority {
         self.sources
             .iter()
@@ -684,7 +703,8 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// by what has been read about.
     async fn apply_measurement(&self, measurement: &ChangeMeasurement) -> SFResult<()>;
 
-    /// The rows that are still outstanding, stalest measurement first.
+    /// The rows that are still outstanding, most urgent band first and, within
+    /// a band, stalest measurement first.
     ///
     /// Both terminal states are left out, [`ChangeState::Landed`] and
     /// [`ChangeState::Retired`]: a row whose question is answered is not work,
@@ -693,9 +713,41 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// says -- which for an identity that is not an artifact is the unsettled
     /// answer this state exists to stop repeating.
     ///
-    /// `None` in `measured_at` sorts first: nothing has looked at those, which
-    /// is less known than a stale measurement, not more current.
+    /// The band leads because the bound is what makes the order matter. A caller
+    /// takes a slice of a set thousands deep, and a slice ordered only by
+    /// staleness spends itself on whichever rows have waited longest, which says
+    /// nothing about which changes matter. With this order the highest band a
+    /// document asked for is measured and handed over first, and every unstated
+    /// row is behind all of them rather than interleaved by insertion luck.
+    /// Within one band the rotation is unchanged: `None` in `measured_at` sorts
+    /// first, because nothing has looked at those and that is less known than a
+    /// stale measurement, not more current, and a row measured this pass goes to
+    /// the back of its own band rather than being re-asked next pass.
+    ///
+    /// A band nobody asked for is not a band, and it cannot starve what it sits
+    /// behind: the count of unstated rows is the account's own reading, and a set
+    /// of urgent rows large enough to hold the batch is visible there before it
+    /// can be mistaken for the batch simply being slow.
     async fn outstanding(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>>;
+
+    /// How much work is owed at each band, every band present, zero included.
+    ///
+    /// The whole owed set, not this pass's slice: [`Self::outstanding`] answers
+    /// what to hand out next, and this answers whether the hand-outs are getting
+    /// anywhere. Without it the band order is unobservable -- a pass that keeps
+    /// taking P0 rows looks exactly like a pass that keeps taking P3 ones, and
+    /// "the urgent work is not draining" has no reading to be read from.
+    ///
+    /// Every band is a cell in [`ChangePriority::ALL`] order whether or not it
+    /// has rows. A caller that got only the bands with work would have to know
+    /// which ones it was not told about to publish a zero, and the one it forgot
+    /// would read as a band that stopped being published rather than a band that
+    /// emptied.
+    ///
+    /// Counts rows that are outstanding, which is the same population
+    /// [`Self::outstanding`] slices: a landed or retired row is not work owed and
+    /// is not counted here.
+    async fn owed_by_band(&self) -> SFResult<Vec<(ChangePriority, usize)>>;
 
     /// The rows the account calls done, stalest measurement first, whose check a
     /// later pass is due to ask again.
@@ -719,6 +771,13 @@ pub trait ChangeLedgerStore: Send + Sync {
     ///
     /// Stalest first for the same reason the other read is: a caller that takes
     /// `limit` rows has to sweep the state, not re-ask the same head of it.
+    ///
+    /// The band does not order this read, unlike [`Self::outstanding`]. A landed
+    /// row is not work owed, and the question this read asks is freshness: has
+    /// what we call done stopped being true. Sorting by band here would let a
+    /// large urgent set push the oldest landed rows past every sweep, and an old
+    /// landed row is exactly the one most likely to have quietly stopped
+    /// holding. Urgency belongs to the work, staleness to the claim.
     async fn landed_due(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>>;
 
     /// The landed rows whose check reads something one of `paths` could change,

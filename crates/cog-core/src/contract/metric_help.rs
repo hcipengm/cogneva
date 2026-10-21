@@ -1175,7 +1175,6 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          rather than an accumulation, so a reader takes one series instead of \
          adding the copies every process that loads this plugin reports",
     ),
-
     (
         crate::metric_names::PG_POOL_MAX_CONNECTIONS.as_str(),
         "The ceiling one PostgreSQL pool may hold, labelled by `pool` \
@@ -1631,7 +1630,20 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          the pending set as the ledger holds it -- pending plus unmeasurable, \
          because a row whose check this pass could not settle has not stopped \
          being owed -- and it is a cell rather than a sum every reader does, so \
-         the face that owes this reading takes one number off one pass. Which of held_back's two causes a pass \
+         the face that owes this reading takes one number off one pass. \
+         owed_p0, owed_p1, owed_p2, owed_p3 and owed_unstated are that same \
+         owed set split by the band its declaring documents asked for, counted \
+         from the ledger rather than from this pass's slice, so they always add \
+         up to change_ledger_pending -- a band that stopped being published, or \
+         a row whose band the count could not place, shows up as a sum that no \
+         longer closes. These are the cells that make the band order visible: \
+         the pass hands out the highest band it holds, so a band whose count \
+         does not fall while the others move is urgent work that is not getting \
+         through, which no per-row reading can say. A pass that could not count \
+         the set writes no band cell at all rather than writing zeros: a zero \
+         says the urgent work is done, which is the one wrong answer, and the \
+         stamp on the last write is what tells a reader how old the cell is. \
+         Which of held_back's two causes a pass \
          was is not in this family: a paused pass hands nothing over at all, so a \
          pass that handed something over and still has rows held back is one whose \
          own slice ran out, and the cells below say what the pool looked like \

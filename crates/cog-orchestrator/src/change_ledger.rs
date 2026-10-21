@@ -340,6 +340,20 @@ struct UnsettledCheck {
 /// says which loop put it there.
 const DISPATCH_TASK_PREFIX: &str = "change-ledger-";
 
+/// The queue rank this loop declares for the work it submits: one below the
+/// default every other task lands on.
+///
+/// Declared by the submitter, not derived from what kind of task it is — the
+/// scheduler reads a number and a source field that never reaches admission.
+/// The rank matters because admission takes highest-priority first, and this
+/// loop is the graph's largest producer: over a thousand of its rows sat
+/// pending while a submitted goal was one row among them at the same rank, and
+/// equal rank does not mean an even share when one side is a thousand rows
+/// deep. One below the default keeps a dispatched change from taking the slot a
+/// submitted goal could have used, without making it ineligible: it still runs
+/// whenever the graph has room this pass did not claim.
+const DISPATCH_TASK_PRIORITY: i32 = 0;
+
 /// The task kind a dispatched change is submitted under.
 ///
 /// A name of the platform's own flows rather than a kind of hand: the change is
@@ -785,6 +799,36 @@ fn dispatch_rearm_limit() -> u32 {
 /// or failing that what the change asserts. An identity is the last resort
 /// rather than the first, because a goal that is only `grep:path:literal` tells
 /// the generator where to look and not what is wanted there.
+/// The task this loop hands one owed change over as.
+///
+/// Separate from the pass so the row it produces can be read on its own: the id,
+/// the kind the change-generation path is looked up by, and the rank the
+/// submitter declares are all decided here, and a test can state them without
+/// running a whole ledger pass.
+fn dispatch_task(row: &ChangeLedgerRow, generation: u32) -> Task {
+    let mut task = Task::new(
+        dispatch_task_id(&row.identity, generation),
+        TaskType::Custom(DISPATCH_TASK_KIND.into()),
+        serde_json::json!({
+            "goal": dispatch_goal(row),
+            "evolution_mode": "generate_change",
+            "task_kind": DISPATCH_TASK_KIND,
+            "change_identity": {
+                "kind": row.identity.kind,
+                "scope": row.identity.scope,
+                "literal": row.identity.literal,
+            },
+            "change_sources": row
+                .sources
+                .iter()
+                .map(|source| source.doc.as_str())
+                .collect::<Vec<_>>(),
+        }),
+    );
+    task.priority = DISPATCH_TASK_PRIORITY;
+    task
+}
+
 fn dispatch_goal(row: &ChangeLedgerRow) -> String {
     let text = row
         .title
@@ -2730,27 +2774,8 @@ async fn dispatch_pass(
                 if generation > 0 {
                     counts.rearmed += 1;
                 }
-                let task_id = dispatch_task_id(&row.identity, generation);
                 let goal = dispatch_goal(row);
-                let task = Task::new(
-                    task_id,
-                    TaskType::Custom(DISPATCH_TASK_KIND.into()),
-                    serde_json::json!({
-                        "goal": goal,
-                        "evolution_mode": "generate_change",
-                        "task_kind": DISPATCH_TASK_KIND,
-                        "change_identity": {
-                            "kind": row.identity.kind,
-                            "scope": row.identity.scope,
-                            "literal": row.identity.literal,
-                        },
-                        "change_sources": row
-                            .sources
-                            .iter()
-                            .map(|source| source.doc.as_str())
-                            .collect::<Vec<_>>(),
-                    }),
-                );
+                let task = dispatch_task(row, generation);
                 match orchestrator.submit_goal_auto(&goal, vec![task]).await {
                     Ok(_) => counts.submitted += 1,
                     Err(e) => {
@@ -3001,6 +3026,25 @@ enum DispatchReadout {
     /// owes the reading asks for the account's own count, not for a validation
     /// of the pass's arithmetic.
     LedgerPending,
+    /// How many rows are owed at each band, from the whole owed set rather than
+    /// from this pass's slice -- like [`DispatchReadout::LedgerPending`], an
+    /// account-level count carried in the same family because it is read at the
+    /// same tick about the same set.
+    ///
+    /// Five cells rather than one cell with a band label: the family's label set
+    /// is the readout, and a second label whose value is which band the count is
+    /// about would make the series identity depend on the reading's subject.
+    ///
+    /// These are the cells that make the band order visible. The pass hands out
+    /// the highest band it holds, so a P0 that stays owed across passes reads as
+    /// a number that is not falling while the rest of the set moves -- which is
+    /// the only shape in which "the urgent work is not getting through" is
+    /// sayable without watching individual rows.
+    OwedP0,
+    OwedP1,
+    OwedP2,
+    OwedP3,
+    OwedUnstated,
 }
 
 impl DispatchReadout {
@@ -3014,7 +3058,27 @@ impl DispatchReadout {
         DispatchReadout::Rearmed,
         DispatchReadout::Unmeasurable,
         DispatchReadout::LedgerPending,
+        DispatchReadout::OwedP0,
+        DispatchReadout::OwedP1,
+        DispatchReadout::OwedP2,
+        DispatchReadout::OwedP3,
+        DispatchReadout::OwedUnstated,
     ];
+
+    /// The band a count cell is about, for the five that are about one.
+    ///
+    /// `None` for every other cell, which is how the publish loop tells the two
+    /// kinds of value apart without a second list.
+    fn band(self) -> Option<ChangePriority> {
+        match self {
+            DispatchReadout::OwedP0 => Some(ChangePriority::P0),
+            DispatchReadout::OwedP1 => Some(ChangePriority::P1),
+            DispatchReadout::OwedP2 => Some(ChangePriority::P2),
+            DispatchReadout::OwedP3 => Some(ChangePriority::P3),
+            DispatchReadout::OwedUnstated => Some(ChangePriority::Unstated),
+            _ => None,
+        }
+    }
 
     fn as_str(self) -> &'static str {
         match self {
@@ -3027,6 +3091,11 @@ impl DispatchReadout {
             Self::Rearmed => "rearmed",
             Self::Unmeasurable => "unmeasurable",
             Self::LedgerPending => "change_ledger_pending",
+            Self::OwedP0 => "owed_p0",
+            Self::OwedP1 => "owed_p1",
+            Self::OwedP2 => "owed_p2",
+            Self::OwedP3 => "owed_p3",
+            Self::OwedUnstated => "owed_unstated",
         }
     }
 }
@@ -3051,7 +3120,11 @@ impl DispatchReadout {
 /// record the row is: the pass already happened, and a loop that gave up the
 /// handover because the reading face was closed would trade the working half for
 /// the recorded half.
-async fn publish_dispatch_rows(metrics: Option<&Arc<dyn MetricsBackend>>, state: &DispatchState) {
+async fn publish_dispatch_rows(
+    metrics: Option<&Arc<dyn MetricsBackend>>,
+    state: &DispatchState,
+    owed: Option<&[(ChangePriority, usize)]>,
+) {
     let Some(metrics) = metrics else {
         return;
     };
@@ -3066,6 +3139,25 @@ async fn publish_dispatch_rows(metrics: Option<&Arc<dyn MetricsBackend>>, state:
             DispatchReadout::Rearmed => state.rearmed,
             DispatchReadout::Unmeasurable => state.unmeasurable,
             DispatchReadout::LedgerPending => state.pending + state.unmeasurable,
+            // A band cell is written only when this pass managed to count the
+            // owed set. Skipped rather than zeroed: a zero says the urgent work
+            // is done, which is the one wrong answer, and a cell left at its
+            // last value is at least the truth as of a known earlier tick --
+            // the store stamps every write, so the staleness reads.
+            _ => {
+                let Some(band) = readout.band() else {
+                    continue;
+                };
+                let Some(count) = owed.and_then(|counts| {
+                    counts
+                        .iter()
+                        .find(|(found, _)| *found == band)
+                        .map(|(_, rows)| *rows)
+                }) else {
+                    continue;
+                };
+                u64::try_from(count).unwrap_or(u64::MAX)
+            }
         };
         let mut labels = HashMap::new();
         labels.insert("readout".to_string(), readout.as_str().to_string());
@@ -3427,10 +3519,30 @@ async fn record_dispatch_state(
              only in this line"
         );
     }
+    // The band counts are the account's own, read after the pass acted rather
+    // than derived from the slice it handed out. They answer "what is still owed
+    // at each band", which is the cell a reader watches to see whether the
+    // urgent work is draining; the slice answers a different question and would
+    // make a band that this pass happened to fill out look empty.
+    //
+    // A failed count publishes nothing, and says so: the cells then hold their
+    // last values, and a reader that wants to know how old they are has the
+    // stamp every write carries.
+    let owed = match store.owed_by_band().await {
+        Ok(counts) => Some(counts),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the owed set could not be counted by band, so this pass \
+                 publishes no band cell"
+            );
+            None
+        }
+    };
     // Published from the same struct the row was built from, and after it: the
     // account is the record and the reading face is a view of it, so the two
     // cannot say different things about one pass.
-    publish_dispatch_rows(metrics, &state).await;
+    publish_dispatch_rows(metrics, &state, owed.as_deref()).await;
     publish_dispatch_verdict(metrics, &state).await;
 }
 
@@ -4043,6 +4155,30 @@ mod tests {
         let two = ChangeIdentity::new("grep", "crates/x", "fn thing");
         assert_eq!(dispatch_task_id(&one, 0), dispatch_task_id(&two, 0));
         assert!(dispatch_task_id(&one, 0).starts_with(DISPATCH_TASK_PREFIX));
+    }
+
+    /// A dispatched change declares a rank below the one a task lands on by
+    /// default, and the rest of the row is unchanged by that.
+    ///
+    /// The rank is what admission reads, so this is the whole difference between
+    /// a customer's goal waiting behind a thousand housekeeping rows and not: the
+    /// loop states its own rank instead of leaving it at the default the graph
+    /// fills in. Asserting the payload too keeps the extraction honest -- moving
+    /// the construction into its own function must not quietly drop the marker
+    /// the change-generation path is routed on.
+    #[test]
+    fn a_dispatched_change_declares_a_rank_below_the_default() {
+        let task = dispatch_task(&row(ChangeState::Pending, Some(1_760_000_000)), 0);
+        let default_rank =
+            Task::new("t", TaskType::Custom("x".into()), serde_json::json!({})).priority;
+        assert!(
+            task.priority < default_rank,
+            "a dispatched change must rank below the default ({default_rank}), got {}",
+            task.priority
+        );
+        assert!(task.id.starts_with(DISPATCH_TASK_PREFIX));
+        assert_eq!(task.input["task_kind"], DISPATCH_TASK_KIND);
+        assert_eq!(task.input["evolution_mode"], "generate_change");
     }
 
     /// Generation 0 is the identity alone -- the id every handover carried before
@@ -4954,6 +5090,19 @@ mod tests {
                 .filter(|row| row.state.is_outstanding())
                 .take(limit)
                 .cloned()
+                .collect())
+        }
+        async fn owed_by_band(&self) -> SFResult<Vec<(ChangePriority, usize)>> {
+            Ok(ChangePriority::ALL
+                .into_iter()
+                .map(|band| {
+                    let rows = self
+                        .rows
+                        .iter()
+                        .filter(|row| row.state.is_outstanding() && row.priority() == band)
+                        .count();
+                    (band, rows)
+                })
                 .collect())
         }
         async fn landed_due(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
@@ -6902,7 +7051,17 @@ mod tests {
         };
         let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
         let metrics: Arc<dyn MetricsBackend> = metrics.clone();
-        publish_dispatch_rows(Some(&metrics), &state).await;
+        // The owed set by band, as the account's own count would answer it: the
+        // five cells add up to the ledger's pending set, which is the same
+        // population read two ways.
+        let owed = [
+            (ChangePriority::P0, 4usize),
+            (ChangePriority::P1, 2),
+            (ChangePriority::P2, 0),
+            (ChangePriority::P3, 1),
+            (ChangePriority::Unstated, 141),
+        ];
+        publish_dispatch_rows(Some(&metrics), &state, Some(&owed)).await;
         publish_dispatch_verdict(Some(&metrics), &state).await;
         publish_handover_readback(Some(&metrics), &readback).await;
 
@@ -6978,6 +7137,28 @@ mod tests {
         // halves rather than recomputed from the rows, so the face's number and
         // the pass's own split cannot disagree.
         assert_eq!(published["change_ledger_pending"], 148.0);
+        // The band split, and the relation that makes it a reading rather than
+        // five numbers: the bands partition the same owed set, so they have to
+        // add up to the ledger's pending cell. A band that stopped being
+        // published, or a rank the count dropped, shows up here as a sum that
+        // no longer closes.
+        assert_eq!(published["owed_p0"], 4.0);
+        assert_eq!(published["owed_p1"], 2.0);
+        assert_eq!(
+            published["owed_p2"], 0.0,
+            "a band with no rows is still a cell"
+        );
+        assert_eq!(published["owed_p3"], 1.0);
+        assert_eq!(published["owed_unstated"], 141.0);
+        assert_eq!(
+            published["owed_p0"]
+                + published["owed_p1"]
+                + published["owed_p2"]
+                + published["owed_p3"]
+                + published["owed_unstated"],
+            published["change_ledger_pending"],
+            "the bands partition the owed set the ledger counts"
+        );
 
         // The verdict: the whole product of the two closed sets, every pass, so
         // that the cell the previous pass held is written back to zero rather
@@ -7034,6 +7215,57 @@ mod tests {
             )],
             "exactly this pass's combination reads as one; two ones is a reader asking which \
              pass is current and being told there are two"
+        );
+    }
+
+    /// A pass that could not count the owed set publishes no band cell, rather
+    /// than publishing zeros.
+    ///
+    /// A zero is not a neutral placeholder here: `owed_p0 = 0` says the urgent
+    /// work is done, and that is the one answer a reader will act on. A skipped
+    /// cell leaves the previous tick's count standing, and every write carries
+    /// its own stamp, so "how old is this number" is readable. The pass says it
+    /// could not count in its own log line.
+    #[tokio::test]
+    async fn a_pass_that_could_not_count_the_bands_publishes_no_band_cell() {
+        let state = DispatchState {
+            decision: DispatchDecision::Proceed,
+            pool: PoolReading::Available,
+            pending: 0,
+            submitted: 0,
+            already: 0,
+            failed: 0,
+            dead_environment: 0,
+            held_back: 0,
+            rearmed: 0,
+            delivered: None,
+            unmeasurable: 0,
+            resume_at_unix: 0,
+            evidenced_recovery_unix: 0,
+            quota_window_secs: 0,
+            sources_unread: Some(String::new()),
+            window_pace: None,
+        };
+        let metrics: Arc<dyn MetricsBackend> = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        publish_dispatch_rows(Some(&metrics), &state, None).await;
+
+        let end = Utc::now() + chrono::Duration::seconds(1);
+        let start = end - chrono::Duration::seconds(600);
+        let samples = metrics
+            .query_gauge_range(metric_names::CHANGE_DISPATCH_READOUTS.as_str(), start, end)
+            .await
+            .expect("the reading face is readable");
+        let names: Vec<String> = samples
+            .iter()
+            .filter_map(|sample| sample.labels.get("readout").cloned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.starts_with("owed_")),
+            "no band cell is written when the count failed: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "pending"),
+            "the pass's own counts are still published: {names:?}"
         );
     }
 

@@ -15,9 +15,9 @@ use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
 use cog_core::{
-    ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangeReading,
-    ChangeReopen, ChangeSource, ChangeState, DispatchState, RetireReason, SFError, SFResult,
-    WriteWindow,
+    ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangePriority,
+    ChangeReading, ChangeReopen, ChangeSource, ChangeState, DispatchState, RetireReason, SFError,
+    SFResult, WriteWindow,
 };
 
 /// Every read returns these, in one place so no two readers can come back with
@@ -746,9 +746,19 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
     }
 
     async fn outstanding(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
-        // Rows nothing has measured sort first: an unmeasured row is the least
-        // known, not the freshest, and ordering it by insertion would put every
-        // newly read change ahead of one that has waited for a measurement.
+        // The band leads, because the bound is what makes the order matter: a
+        // caller takes a slice, and a slice ordered only by staleness hands this
+        // pass whatever has waited longest, which is all of it equally. A row a
+        // document asked for at P0 and one nobody prioritised would then compete
+        // for the same slot on the same rule, and with thousands of unstated
+        // rows the urgent one is reached only by luck of insertion order.
+        //
+        // Within a band, rows nothing has measured sort first: an unmeasured row
+        // is the least known, not the freshest, and ordering it by insertion
+        // would put every newly read change ahead of one that has waited for a
+        // measurement. A row that was just measured goes to the back of its own
+        // band, so the per-band rotation is the same one the staleness key gave
+        // the whole set.
         //
         // Both terminal states are excluded together, so the set this answers is
         // the same one `landed` was excluded to make: the work. A retired row is
@@ -759,13 +769,53 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             sqlx::query(&format!(
                 "SELECT {ROW_COLUMNS} FROM change_ledger \
                  WHERE state NOT IN ('landed', 'retired') \
-                 ORDER BY measured_at ASC NULLS FIRST, first_seen_at ASC \
+                 ORDER BY priority_rank DESC, measured_at ASC NULLS FIRST, first_seen_at ASC \
                  LIMIT $1"
             ))
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await,
         )
+    }
+
+    async fn owed_by_band(&self) -> SFResult<Vec<(ChangePriority, usize)>> {
+        // Counted by the rank column the reads are ordered by, so the two answer
+        // about the same rows by construction rather than by both spelling the
+        // outstanding predicate: a band that has rows in the order has them in
+        // this count.
+        //
+        // Ranks the account does not know are folded into `unstated` here rather
+        // than dropped, which is the same direction the generated column takes
+        // them: a count that vanished would make the five cells stop adding up to
+        // the owed set, and that sum is a reader's only check on the split.
+        let counted: Vec<(i16, i64)> = sqlx::query_as(
+            "SELECT priority_rank, count(*) FROM change_ledger \
+             WHERE state NOT IN ('landed', 'retired') \
+             GROUP BY priority_rank",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(format!("count the owed set by band: {e}")))?;
+        Ok(ChangePriority::ALL
+            .into_iter()
+            .map(|band| {
+                let rank = i16::from(band.rank());
+                let rows = counted
+                    .iter()
+                    .filter(|(found, _)| {
+                        // Unknown ranks read as `unstated`, exactly as the
+                        // generated column scores them.
+                        if rank == 0 {
+                            *found <= 0
+                        } else {
+                            *found == rank
+                        }
+                    })
+                    .map(|(_, count)| usize::try_from(*count).unwrap_or(usize::MAX))
+                    .sum();
+                (band, rows)
+            })
+            .collect())
     }
 
     async fn landed_due(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {

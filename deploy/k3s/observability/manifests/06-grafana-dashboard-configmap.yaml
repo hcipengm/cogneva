@@ -1477,6 +1477,46 @@ data:
               }
             },
             {
+              "expr": "max(cogneva_change_dispatch_readouts{readout=\"owed_p0\"})",
+              "legendFormat": "owed at P0",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_change_dispatch_readouts{readout=\"owed_p1\"})",
+              "legendFormat": "owed at P1",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_change_dispatch_readouts{readout=\"owed_p2\"})",
+              "legendFormat": "owed at P2",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_change_dispatch_readouts{readout=\"owed_p3\"})",
+              "legendFormat": "owed at P3",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max(cogneva_change_dispatch_readouts{readout=\"owed_unstated\"})",
+              "legendFormat": "owed, no band stated",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
               "expr": "max(cogneva_change_dispatch_readouts{readout=\"pending\"}) - max(cogneva_change_dispatch_readouts{readout=\"submitted\"}) - max(cogneva_change_dispatch_readouts{readout=\"already\"}) - max(cogneva_change_dispatch_readouts{readout=\"failed\"}) - max(cogneva_change_dispatch_readouts{readout=\"dead_environment\"}) - max(cogneva_change_dispatch_readouts{readout=\"held_back\"})",
               "legendFormat": "unaccounted for (should be zero)",
               "datasource": {
