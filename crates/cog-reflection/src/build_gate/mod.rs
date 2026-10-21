@@ -583,6 +583,47 @@ struct HostLoad {
     /// case on a host shell and the case the host's own dimensions already
     /// describe.
     budget: Option<BuildBudget>,
+    /// Free bytes of the filesystem the gate's own directory is on, or None when
+    /// it cannot be read.
+    ///
+    /// A reading rather than a dimension of the ceiling. The other four divide
+    /// the host by what one build costs of it, and there is no measured cost of
+    /// one build in bytes to divide by -- the build cache is shared across
+    /// revisions and its own cap is already derived from its measured peak, so
+    /// a per-build byte figure invented here would be the one number in this
+    /// derivation that no measurement stands behind. What the disk needs is to
+    /// be visible where the decision is made, so an operator reading a bound
+    /// that stopped moving can see whether the volume is what stopped it.
+    disk_free_bytes: Option<u64>,
+}
+
+/// Free bytes of the filesystem `dir` is on.
+///
+/// `f_bavail` rather than `f_bfree`: the space an unprivileged write may still
+/// use is what a build can spend, and the root reserve is exactly the part of
+/// the volume a non-root build must not plan on. A filesystem that cannot be
+/// read contributes no reading rather than a zero -- "this volume is full" and
+/// "nothing could be asked about this volume" are different facts.
+fn disk_bytes(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statvfs` writes into the `statvfs` it is given and retains
+    // neither the pointer nor the struct, and `path` is a NUL-terminated string
+    // that outlives the call. The struct is only read after the call returns
+    // zero, which is the C contract for it having been filled in.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let unit = if stat.f_frsize > 0 {
+        stat.f_frsize as u64
+    } else {
+        stat.f_bsize as u64
+    };
+    if unit == 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * unit)
 }
 
 /// The ceiling of the cgroup this process's builds run in.
@@ -741,6 +782,7 @@ impl HostLoad {
             busy_cores,
             cores,
             budget: BuildBudget::read(),
+            disk_free_bytes: disk_bytes(dir),
         })
     }
 
@@ -761,6 +803,26 @@ impl HostLoad {
     /// and the cgroup's limit is the right answer to "killing the build", and a
     /// bound has to answer both.
     fn ceiling(&self) -> (usize, &'static str) {
+        let dimensions = self.dimensions();
+        let mut tightest = dimensions[0];
+        for factor in &dimensions[1..] {
+            if factor.1 < tightest.1 {
+                tightest = *factor;
+            }
+        }
+        (tightest.1.floor().max(1.0) as usize, tightest.0)
+    }
+
+    /// What each dimension answers on its own, in the order the ceiling breaks
+    /// ties.
+    ///
+    /// Published beside the ceiling rather than folded into it: the ceiling is
+    /// one number and names one dimension, so a reader looking at it cannot tell
+    /// a host with one tight wall from a host with four nearly-tight ones, and
+    /// cannot see the wall that was second-closest and will bind next. The
+    /// ledger row for a bound move says which reading moved it; these are the
+    /// readings it is chosen from, taken in the same sample.
+    fn dimensions(&self) -> [(&'static str, f64); 4] {
         let cores = self.cores.max(1) as f64;
         let cpu = ((cores - self.busy_cores) / BUILD_DEMAND_CORES).clamp(1.0, cores);
         let memory = (self
@@ -779,20 +841,30 @@ impl HostLoad {
             .as_ref()
             .map(|b| b.ceiling().clamp(1.0, cores))
             .unwrap_or(cores);
+        [
+            (DIM_CPU, cpu),
+            (DIM_MEMORY, memory),
+            (DIM_IO, io),
+            (DIM_CGROUP_MEMORY, cgroup_memory),
+        ]
+    }
 
-        let mut tightest = cpu;
-        let mut dimension = DIM_CPU;
-        for (factor, name) in [
-            (memory, DIM_MEMORY),
-            (io, DIM_IO),
-            (cgroup_memory, DIM_CGROUP_MEMORY),
-        ] {
-            if factor < tightest {
-                tightest = factor;
-                dimension = name;
-            }
+    /// What this sample saw, in the form the readings are published from.
+    ///
+    /// Every field is a value taken by [`measure`](Self::measure), including the
+    /// per-dimension answers, so the published readings and the ceiling are one
+    /// sample rather than two readings of one moment that could disagree.
+    fn reading(&self) -> HostReading {
+        HostReading {
+            busy_cores: self.busy_cores,
+            cores: self.cores,
+            cpu_avg60: self.pressure.cpu_avg60,
+            io_avg60: self.pressure.io_avg60,
+            mem_avg60: self.pressure.mem_avg60,
+            mem_available_bytes: self.pressure.mem_available_bytes,
+            disk_free_bytes: self.disk_free_bytes,
+            dimensions: self.dimensions(),
         }
-        (tightest.floor().max(1.0) as usize, dimension)
     }
 
     /// Whether the host has been quiet enough for the bound to be allowed to
@@ -848,6 +920,46 @@ const DIM_OVERRIDE: &str = "override";
 const DIM_UNMEASURED: &str = "unmeasured";
 /// The label for a process that derives nothing because it bounds nothing.
 const DIM_NONE: &str = "none";
+
+/// The host, as the gate measured it for its last derivation.
+///
+/// One sample of every quantity the bound is derived from, kept so the readings
+/// and the bound describe the same moment. A gate that published its inputs from
+/// a second reading would let a reader see a cpu figure that never entered the
+/// decision it is shown beside.
+#[derive(Clone, Copy)]
+struct HostReading {
+    busy_cores: f64,
+    cores: usize,
+    cpu_avg60: f64,
+    io_avg60: f64,
+    mem_avg60: f64,
+    mem_available_bytes: u64,
+    disk_free_bytes: Option<u64>,
+    dimensions: [(&'static str, f64); 4],
+}
+
+/// Cores busy over the sample, counting neither idle nor io-waiting ones.
+const HOST_CPU_BUSY_CORES: &str = "cogneva_host_cpu_busy_cores";
+/// Cores the host has, from the file the busy time came from.
+const HOST_CPU_CORES: &str = "cogneva_host_cpu_cores";
+/// `MemAvailable`: what the host can hand to a new build without paging.
+const HOST_MEMORY_AVAILABLE_BYTES: &str = "cogneva_host_memory_available_bytes";
+/// Pressure stall information, `some avg60`, split by the resource it names.
+/// Both the percent and the seconds it stands for are derivable from it; the
+/// percent is what the thresholds are written in.
+const HOST_PRESSURE_AVG60: &str = "cogneva_host_pressure_avg60";
+/// Free bytes of the volume the build gate's directory is on.
+///
+/// The free count and not a usage percentage: what a build needs is an amount of
+/// room, and a share of the volume says nothing about it — half of a small
+/// volume is less room than a tenth of a large one. The volume's size is the
+/// node's own filesystem reading, which the deployment already publishes for
+/// every mountpoint; a second copy here would be a second producer for it.
+const HOST_DISK_FREE_BYTES: &str = "cogneva_host_disk_free_bytes";
+/// What each dimension answers on its own, beside the ceiling that takes the
+/// smallest of them.
+const BUILD_GATE_DIMENSION_CEILING: &str = "cogneva_build_gate_dimension_ceiling";
 
 /// The bound to enforce next, from the bound in force and what the host is
 /// showing.
@@ -927,6 +1039,62 @@ fn cpu_times() -> Option<(usize, u64, u64)> {
 struct Origin<'a> {
     dir: &'a str,
     role: &'a str,
+}
+
+/// The host side of the readings, from the sample the bound was last derived
+/// from.
+///
+/// Empty when nothing has been measured yet, and empty for a process that does
+/// not build: those processes publish the gate's own readings at zero with
+/// `role="control-plane"`, and a host figure from a process that never derives a
+/// bound would be a reading with no consumer that could disagree with the one
+/// that has one.
+fn host_metrics(reading: Option<HostReading>, origin: Origin<'_>) -> Vec<RawMetric> {
+    let Some(reading) = reading else {
+        return Vec::new();
+    };
+    let label = |m: RawMetric| {
+        m.with_label("dir", origin.dir.to_string())
+            .with_label("role", origin.role.to_string())
+    };
+    let mut out = vec![
+        label(RawMetric::new(HOST_CPU_BUSY_CORES, reading.busy_cores)),
+        label(RawMetric::new(HOST_CPU_CORES, reading.cores as f64)),
+        label(RawMetric::new(
+            HOST_MEMORY_AVAILABLE_BYTES,
+            reading.mem_available_bytes as f64,
+        )),
+    ];
+    // All three resources, always, even the ones that are not the tightest
+    // dimension: which of them is quiet is what says a bound that is not moving
+    // is not moving for a reason, and a resource that only appears when it is
+    // tight makes "quiet" and "not measured" the same absent series.
+    for (resource, value) in [
+        ("cpu", reading.cpu_avg60),
+        ("io", reading.io_avg60),
+        ("memory", reading.mem_avg60),
+    ] {
+        out.push(
+            label(RawMetric::new(HOST_PRESSURE_AVG60, value))
+                .with_label("resource", resource.to_string()),
+        );
+    }
+    if let Some(free) = reading.disk_free_bytes {
+        out.push(label(RawMetric::new(HOST_DISK_FREE_BYTES, free as f64)));
+    }
+    // Every dimension, not only the one the ceiling took: the second-closest
+    // wall is the one that binds next, and a reader who can only see the winner
+    // cannot tell a host with one wall from a host with four.
+    for (dimension, factor) in reading.dimensions {
+        out.push(
+            label(RawMetric::new(
+                BUILD_GATE_DIMENSION_CEILING,
+                factor.floor().max(1.0),
+            ))
+            .with_label("dimension", dimension.to_string()),
+        );
+    }
+    out
 }
 
 /// The whole series set, in one place: a reader that has to tell "no bound here"
@@ -1388,6 +1556,8 @@ pub struct BuildGate {
     measured_ceiling: AtomicU64,
     /// The dimension the ceiling came from.
     dimension: Mutex<&'static str>,
+    /// The sample that derivation was made from, published beside it.
+    host: Mutex<Option<HostReading>>,
     /// When the bound was last moved. A build is a tens-of-minutes event, so the
     /// window only has to damp the derivation against its own samples.
     window: Mutex<Option<Instant>>,
@@ -1503,6 +1673,7 @@ impl BuildGate {
             derived: AtomicU64::new(0),
             measured_ceiling: AtomicU64::new(0),
             dimension: Mutex::new(DIM_UNMEASURED),
+            host: Mutex::new(None),
             window: Mutex::new(None),
             controller: OnceLock::new(),
             in_flight: AtomicU64::new(0),
@@ -1730,6 +1901,10 @@ impl BuildGate {
             return;
         };
         let (ceiling, dimension) = load.ceiling();
+        // Kept beside the ceiling it produced, from the same sample: the
+        // readings published from here are the ones this decision was made on,
+        // not a second look at a host that has moved since.
+        *self.host.lock().unwrap_or_else(|e| e.into_inner()) = Some(load.reading());
         let calm = load.is_calm();
         let persisted = self.persisted_bound();
         let current = match (persisted, self.derived.load(Ordering::Relaxed) as usize) {
@@ -3082,6 +3257,14 @@ impl Observable for BuildGate {
             origin,
             self.wait_budget_ms(),
         );
+        // The sample the ceiling came from, published beside it. `step` above
+        // may have just taken one; a scrape that arrives inside the bound
+        // window publishes the last one, which is the one the bound in force is
+        // still derived from.
+        metrics.extend(host_metrics(
+            *self.host.lock().unwrap_or_else(|e| e.into_inner()),
+            origin,
+        ));
         // The holds are read from the same directory the occupancy count comes
         // from, and for the same reason: what matters is who is on the host, not
         // who asked this process. Published as a value beside the refusal that
@@ -3835,6 +4018,7 @@ mod tests {
             busy_cores: 0.0,
             cores: 24,
             budget: None,
+            disk_free_bytes: None,
         };
         let plenty = 64 * 1024 * 1024 * 1024;
         // Derived rather than written out: this is the cpu dimension's own
@@ -3869,6 +4053,166 @@ mod tests {
         );
     }
 
+    /// The ceiling and the per-dimension readings are one sample: whatever the
+    /// ceiling took, the dimension it took it from answers the same number, and
+    /// no dimension answers below the ceiling.
+    ///
+    /// This is the property that makes the published set worth reading. A
+    /// ceiling published beside dimensions computed a second time could show a
+    /// bound that none of its own inputs explains, and a reader would have no
+    /// way to tell that from a host whose walls are all close.
+    #[test]
+    fn the_ceiling_is_one_of_the_dimensions_it_publishes() {
+        let load = |busy: f64, io60: f64, mem_available: u64| HostLoad {
+            pressure: Pressure {
+                cpu_avg10: 0.0,
+                cpu_avg60: 0.0,
+                io_avg10: 0.0,
+                io_avg60: io60,
+                mem_avg10: 0.0,
+                mem_avg60: 0.0,
+                mem_available_bytes: mem_available,
+                builds_in_flight: 0,
+            },
+            busy_cores: busy,
+            cores: 24,
+            budget: None,
+            disk_free_bytes: Some(1 << 40),
+        };
+        let plenty = 64 * 1024 * 1024 * 1024;
+        for (busy, io, mem) in [
+            (0.0, 0.1, plenty),
+            (0.0, IO_STALL_BUDGET_PCT, plenty),
+            (0.0, 0.1, MEM_FLOOR_BYTES),
+            (0.0, IO_STALL_BUDGET_PCT * 3.0, MEM_FLOOR_BYTES),
+            (0.0, IO_STALL_BUDGET_PCT / 2.0, plenty),
+            (23.0, 0.1, plenty),
+            (12.0, IO_STALL_BUDGET_PCT / 3.0, MEM_FLOOR_BYTES * 2),
+        ] {
+            let host = load(busy, io, mem);
+            let (ceiling, dimension) = host.ceiling();
+            let dimensions = host.dimensions();
+            let named = dimensions
+                .iter()
+                .find(|(name, _)| *name == dimension)
+                .unwrap_or_else(|| panic!("{dimension} is one of the published dimensions"));
+            assert_eq!(
+                ceiling as f64,
+                named.1.floor().max(1.0),
+                "the ceiling {ceiling} is the answer {dimension} gives ({})",
+                named.1
+            );
+            assert!(
+                dimensions
+                    .iter()
+                    .all(|(_, f)| f.floor().max(1.0) >= ceiling as f64),
+                "no dimension answers below the ceiling that took the smallest of them"
+            );
+        }
+    }
+
+    /// The host readings carry the numbers the bound was derived from, one row
+    /// per quantity, and a process that has measured nothing publishes none of
+    /// them rather than publishing zeroes.
+    #[test]
+    fn the_host_readings_are_the_sample_the_bound_came_from() {
+        let reading = HostReading {
+            busy_cores: 6.5,
+            cores: 24,
+            cpu_avg60: 2.0,
+            io_avg60: 17.5,
+            mem_avg60: 0.5,
+            mem_available_bytes: 40 * 1024 * 1024 * 1024,
+            disk_free_bytes: Some(300 * 1024 * 1024 * 1024),
+            dimensions: [
+                (DIM_CPU, 4.2),
+                (DIM_MEMORY, 3.9),
+                (DIM_IO, 4.0),
+                (DIM_CGROUP_MEMORY, 24.0),
+            ],
+        };
+        let origin = Origin {
+            dir: "64512:1",
+            role: BUILD_GATE_ROLE_BUILDER,
+        };
+        let published = host_metrics(Some(reading), origin);
+        let value = |name: &str, labels: &[(&str, &str)]| -> Option<f64> {
+            published
+                .iter()
+                .find(|m| {
+                    m.name == name
+                        && labels
+                            .iter()
+                            .all(|(k, v)| m.labels.get(*k).map(String::as_str) == Some(*v))
+                })
+                .map(|m| m.value)
+        };
+        assert_eq!(value(HOST_CPU_BUSY_CORES, &[]), Some(6.5));
+        assert_eq!(value(HOST_CPU_CORES, &[]), Some(24.0));
+        assert_eq!(
+            value(HOST_MEMORY_AVAILABLE_BYTES, &[]),
+            Some((40u64 * 1024 * 1024 * 1024) as f64)
+        );
+        // All three resources, including the ones that are quiet: a resource
+        // that only appears when it is tight makes "quiet" and "not measured"
+        // the same absent series.
+        for (resource, expected) in [("cpu", 2.0), ("io", 17.5), ("memory", 0.5)] {
+            assert_eq!(
+                value(HOST_PRESSURE_AVG60, &[("resource", resource)]),
+                Some(expected),
+                "the {resource} stall is published"
+            );
+        }
+        assert_eq!(
+            value(HOST_DISK_FREE_BYTES, &[]),
+            Some((300u64 * 1024 * 1024 * 1024) as f64)
+        );
+        // Every dimension, and the same answers the ceiling was taken from.
+        for (dimension, expected) in reading.dimensions {
+            assert_eq!(
+                value(BUILD_GATE_DIMENSION_CEILING, &[("dimension", dimension)]),
+                Some(expected.floor().max(1.0)),
+                "{dimension} publishes its own answer"
+            );
+        }
+        assert!(published
+            .iter()
+            .all(|m| m.labels.get("dir").map(String::as_str) == Some("64512:1")));
+
+        // Never measured: no readings, not zeroes.
+        assert!(
+            host_metrics(None, origin).is_empty(),
+            "a gate that has not measured the host publishes no host readings"
+        );
+
+        // A volume that could not be read contributes no bytes rather than a
+        // zero, and the rest of the sample is still published.
+        let no_disk = host_metrics(
+            Some(HostReading {
+                disk_free_bytes: None,
+                ..reading
+            }),
+            origin,
+        );
+        assert!(!no_disk.iter().any(|m| m.name == HOST_DISK_FREE_BYTES));
+        assert!(no_disk.iter().any(|m| m.name == HOST_CPU_CORES));
+    }
+
+    /// The disk reading is taken from the directory the gate was given, and it
+    /// is a real reading: a total above zero, free no larger than it.
+    #[test]
+    fn the_disk_reading_is_taken_from_the_gate_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let free = disk_bytes(dir.path()).expect("a temporary directory is on a readable volume");
+        assert!(
+            free > 0,
+            "the volume holding the gate reports its free space"
+        );
+        // A path that is not there has no volume to report, and that is a
+        // missing reading rather than a zero.
+        assert_eq!(disk_bytes(&dir.path().join("not-here")), None);
+    }
+
     /// The cgroup the builds run in is a dimension of its own, and it is the one
     /// whose ceiling is a wall: a build over it is killed, so it is read whatever
     /// the host has free, and it is named apart from the host's own memory.
@@ -3893,6 +4237,7 @@ mod tests {
                 mem_current,
                 mem_reclaimable,
             }),
+            disk_free_bytes: None,
         };
         // One build per core the host could run, and then some: a limit this
         // roomy is above the cpu dimension's own answer, so the container is not
@@ -4098,6 +4443,7 @@ unevictable 28532736
             busy_cores: 1.0,
             cores: 24,
             budget: None,
+            disk_free_bytes: None,
         };
         assert!(quiet.is_calm(), "a quiet host is calm");
 
@@ -5344,6 +5690,109 @@ unevictable 28532736
         assert!(
             not_in_force.contains(&format!("\"{BUILD_GATE_ROLE_BUILDER}\"")),
             "rule {BUILD_GATE_IN_FORCE_RULE} must select builders by role, got: {not_in_force}"
+        );
+    }
+
+    /// The rules written on the host readings read the names this module
+    /// publishes, and the one that has to tell a blind gate from a quiet host
+    /// keeps reading both sides of that pair.
+    ///
+    /// The names are asserted here rather than in the alert-rule census because
+    /// the census checks that a producer exists somewhere in the tree; this is
+    /// the same question one step closer — that the producer is this module and
+    /// the rule reads what it emits, which is what a rename breaks.
+    #[test]
+    fn the_host_rules_read_the_host_readings_this_module_publishes() {
+        let rules = chart_rules();
+        let find = |name: &str| -> String {
+            rules
+                .iter()
+                .find(|(rule, _)| rule == name)
+                .map(|(_, promql)| promql.clone())
+                .unwrap_or_else(|| panic!("rule {name} missing"))
+        };
+        for (rule, series) in [
+            ("host_build_volume_free_low", HOST_DISK_FREE_BYTES),
+            ("host_memory_available_low", HOST_MEMORY_AVAILABLE_BYTES),
+            ("host_cpu_busy_share_high", HOST_CPU_BUSY_CORES),
+            ("host_pressure_io_high", HOST_PRESSURE_AVG60),
+            ("build_gate_host_readings_unpublished", HOST_CPU_CORES),
+        ] {
+            let promql = find(rule);
+            assert!(
+                promql.contains(series),
+                "rule {rule} must query {series}, got: {promql}"
+            );
+        }
+        // The io rule has to name which resource it is asking about; without
+        // the label it would fire on a cpu stall under the disk's name.
+        assert!(
+            find("host_pressure_io_high").contains("\"io\""),
+            "the io rule selects resource=\"io\""
+        );
+        // The pair rule has to exclude the operator's own bound: that gate
+        // derives nothing, so it is not blind when it publishes no host
+        // readings.
+        let pair = find("build_gate_host_readings_unpublished");
+        assert!(
+            pair.contains("override"),
+            "the pair rule leaves a pinned bound out, got: {pair}"
+        );
+        assert!(
+            pair.contains(BUILD_GATE_CEILING),
+            "the pair rule reads the gate's own readings as the side that is present"
+        );
+    }
+
+    /// Every host reading this module publishes is read by a shipped rule,
+    /// except the one the module itself consumes.
+    ///
+    /// This is the closed-set half of the test above: that one fails when a rule
+    /// names a series nothing publishes, this one fails when a series is
+    /// published and nothing reads it. A series with no reader is a reading
+    /// nobody acts on -- it costs a scrape, it makes a dashboard look complete,
+    /// and it is indistinguishable from a reading whose consumer was deleted.
+    /// The per-dimension ceiling is the exception because its consumer is the
+    /// bound itself: it is the row this module reads to decide what to enforce,
+    /// and it is what the ledger entry for a move names.
+    #[test]
+    fn every_host_reading_published_here_has_a_reader() {
+        let sample = HostReading {
+            busy_cores: 1.0,
+            cores: 24,
+            cpu_avg60: 0.0,
+            io_avg60: 0.0,
+            mem_avg60: 0.0,
+            mem_available_bytes: MEM_FLOOR_BYTES * 2,
+            disk_free_bytes: Some(1 << 40),
+            dimensions: [
+                (DIM_CPU, 5.0),
+                (DIM_MEMORY, 9.0),
+                (DIM_IO, 24.0),
+                (DIM_CGROUP_MEMORY, 24.0),
+            ],
+        };
+        let published = host_metrics(
+            Some(sample),
+            Origin {
+                dir: "x",
+                role: BUILD_GATE_ROLE_BUILDER,
+            },
+        );
+        let rules = chart_rules();
+        let read_by_a_rule = |name: &str| rules.iter().any(|(_, promql)| promql.contains(name));
+        let mut unread = Vec::new();
+        for metric in &published {
+            if metric.name == BUILD_GATE_DIMENSION_CEILING {
+                continue;
+            }
+            if !read_by_a_rule(&metric.name) && !unread.contains(&metric.name) {
+                unread.push(metric.name.clone());
+            }
+        }
+        assert!(
+            unread.is_empty(),
+            "这些宿主读数没有任何已发货的规则在读（发布了却没人接手，{unread:?}）"
         );
     }
 

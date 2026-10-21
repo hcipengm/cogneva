@@ -772,6 +772,51 @@ data:
               "summary": "A claim has been asking for more than it has been given for hours: {value} rounds in the last six read the request ahead of the volume's status capacity. This is the outcome that says the declaration was raised successfully and the expansion never landed -- the request is what an alert reads (the rule that compares usage divides by requests.storage), so the shortfall disappears from every reading the moment the patch is accepted, while the filesystem underneath is still the old size. On a class with an external expander the request stays ahead of capacity until that controller acts, and thirty rounds is five hours of no controller acting. Nothing is retried on this outcome on purpose: an expansion is already in flight as far as the API is concerned, and a second patch while the first has not been carried out is refused rather than queued. The repair is on whoever owns the StorageClass -- the external resizer, or the class's volume expansion support -- and the sizes to read it against are the declared reading `cogneva_volume_capacity_bytes` and the claim's own status capacity"
             },
             {
+              "name": "host_build_volume_free_low",
+              "promql": "min without (pod, container, instance) (cogneva_host_disk_free_bytes)",
+              "condition": {
+                "less_than": 32212254720.0
+              },
+              "severity": "warning",
+              "summary": "The filesystem the build gate's directory is on has {value} bytes free, under 30 GiB. This is the reading the bound does not divide by, and the one it has no arithmetic for: the other four dimensions answer how many builds fit in the host's cpu, memory, io and container memory, and none of them can see a volume running out of room, because one build's cost in bytes is shared with every earlier revision through the same cache. What the reading is for is attribution when a bound stops moving or a build fails with a write error: the volume is either the reason or it is not, and without this series that question is answered by hand. The build cache has its own cap derived from its measured peak, so a tree at its cap does not grow this number -- a free count that keeps falling is something else on the volume, and the host's own target garbage collector is the tiered remedy for the cache's share of it"
+            },
+            {
+              "name": "host_pressure_io_high",
+              "promql": "max without (pod, container, instance) (cogneva_host_pressure_avg60{resource=\"io\"})",
+              "condition": {
+                "greater_than": 30.0
+              },
+              "severity": "warning",
+              "summary": "The build host shows an io stall of {value}% over the last minute, above the 30% a single build's cold compile has been measured at. This is the same reading the bound's `io` dimension divides its budget by, published on its own so the reason a bound is sitting at one is readable rather than inferred: a ceiling labelled `io` says this number was the tightest, and this series says how tight. It is also the reading that tells a host whose builds are slow from a host whose device is shared with something else -- a stall this high while no build is running is the second case, and the first thing to look at is what else on the host is writing"
+            },
+            {
+              "name": "host_memory_available_low",
+              "promql": "min without (pod, container, instance) (cogneva_host_memory_available_bytes)",
+              "condition": {
+                "less_than": 12884901888.0
+              },
+              "severity": "warning",
+              "summary": "The build host can hand out {value} bytes without paging, under 12 GiB. `MemAvailable` counts the page cache a build can reclaim as available, so a number this low means the memory is held by something that will not give it back. The bound's `memory` dimension stops spending at a floor it keeps for the rest of the host, and this is the reading that floor is subtracted from: below the floor that dimension answers one build and cannot answer anything else, which is a bound held down by the host rather than sized for it. Read it beside the gate's `dimension` label -- a ceiling sitting at one and labelled `memory` is this number, and the repair is whoever else on the host is holding it, not the gate"
+            },
+            {
+              "name": "host_cpu_busy_share_high",
+              "promql": "max without (pod, container, instance) (cogneva_host_cpu_busy_cores / cogneva_host_cpu_cores)",
+              "condition": {
+                "greater_than": 0.9
+              },
+              "severity": "warning",
+              "summary": "The build host spent {value} of its cores on work over the sample, counting neither idle nor io-waiting ones. The bound's `cpu` dimension derives from the same two series, and the share is what that derivation reads: above this line the host has no core left for another build and the ceiling is the cpu's answer, one, whatever the other dimensions say. Cores blocked on the disk are excluded on purpose -- a host waiting on io reads as a busy host under load average, and that number would hold the bound down for a reason the io dimension is already charged for"
+            },
+            {
+              "name": "build_gate_host_readings_unpublished",
+              "promql": "(max without (pod, container, instance) (cogneva_build_gate_ceiling{role=\"builder\", dimension!=\"override\"}) >= 0) unless (max without (pod, container, instance) (cogneva_host_cpu_cores{role=\"builder\"}) >= 0)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "A process is running builds and publishing the gate's own readings, but none of the host readings that bound is derived from: `cogneva_host_cpu_cores`, `cogneva_host_memory_available_bytes`, `cogneva_host_pressure_avg60` and the disk pair are all absent for this `dir`. The gate takes that state deliberately -- a host it cannot read is not a host it may size a bound for, so the bound stays where it was instead of moving to a default -- but the consequence is a bound frozen at its last measurement with nothing saying so: every reading downstream of it is a number from an earlier host, and the alerts written on those readings stay quiet because the series they read are missing rather than wrong. The usual cause is `/proc/pressure`, `/proc/stat` or `/proc/meminfo` not being readable from this container, which is a mount in the deployment rather than anything the gate can repair. Read it against `build_gate_not_in_force`: that rule says the gate is not running, this one says it is running blind. A gate whose bound an operator pinned publishes `dimension=\"override\"` and derives nothing, so the rule leaves that cell out -- there is no derivation for it to be blind in, and firing there would page on a decision someone made on purpose"
+            },
+            {
               "name": "pg_pool_ceiling_unmeasured",
               "promql": "max by (pool, source) (cogneva_pg_pool_max_connections{source=\"server_unreadable\"} and ((time() - cogneva_pg_pool_max_connections_observed_timestamp_seconds) < 1800))",
               "condition": {
@@ -2657,7 +2702,7 @@ data:
         "poll_interval_secs": 60,
         "schema_repair_interval_secs": 600,
         "build_gate": {
-          "_comment": "宿主级构建闸门：同一宿主同时进行的编译/打镜像条数上限；这个上限默认不是写死的数：0 表示按宿主实测导出（宿主的 cpu / 内存 / 磁盘三项，加上构建所在容器的内存上限，取最紧的一项说几就几），正数才是钉死它的覆盖位，此时读数 cogneva_build_gate_ceiling 的 dimension 标签写 override 而不是 cpu / memory / io / cgroup_memory。构建与集群同宿主，多路叠加足以把整机拖进换页，此后连应该把这件事报出来的事件循环也一起退化。闸门只装在跑构建的进程里，锁定的是 lock_dir 这一个目录：两个进程指向同一个目录（同一 dev:ino）才互相设界，指向不同目录则各自设界——读数 cogneva_build_gate_slots 的 dir 标签就是用来分辨这件事的，role 标签分辨「跑构建的进程（builder）」与「不跑构建的进程（control-plane，只发零值）」。",
+          "_comment": "宿主级构建闸门：同一宿主同时进行的编译/打镜像条数上限；这个上限默认不是写死的数：0 表示按宿主实测导出（宿主的 cpu、内存、io 三项，加上构建所在容器的内存上限，四维各答「还装得下几条」，取最紧的一项说几就几；四维各自的答案同时发在 cogneva_build_gate_dimension_ceiling 上，最紧的那条再以 dimension 标签标在 cogneva_build_gate_ceiling 上），正数才是钉死它的覆盖位，此时读数 cogneva_build_gate_ceiling 的 dimension 标签写 override 而不是 cpu / memory / io / cgroup_memory。宿主面每一项读数都单独发布而不只发判决：忙核与总核（cogneva_host_cpu_busy_cores / _cpu_cores）、可用内存（cogneva_host_memory_available_bytes）、三条压力（cogneva_host_pressure_avg60{resource=cpu|io|memory}）、构建卷空闲字节（cogneva_host_disk_free_bytes，statvfs 现读，读不到就是没有这条序列而不是零），加四维各自的答案（cogneva_build_gate_dimension_ceiling{dimension}）。这些序列各自有已发货的规则在读；闸门读不到宿主时一条都不发，`build_gate_host_readings_unpublished` 专门报这一态——规则在而读数空，与「宿主很闲」同形，所以配对报。构建与集群同宿主，多路叠加足以把整机拖进换页，此后连应该把这件事报出来的事件循环也一起退化。闸门只装在跑构建的进程里，锁定的是 lock_dir 这一个目录：两个进程指向同一个目录（同一 dev:ino）才互相设界，指向不同目录则各自设界——读数 cogneva_build_gate_slots 的 dir 标签就是用来分辨这件事的，role 标签分辨「跑构建的进程（builder）」与「不跑构建的进程（control-plane，只发零值）」。",
           "enabled": true,
           "max_concurrent": 0,
           "wait_secs": 1800,
