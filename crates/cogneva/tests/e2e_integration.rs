@@ -366,6 +366,11 @@ async fn e2e_task_create_then_list() {
         return;
     };
 
+    // Submitted as a task the planner already verified, so the row is injected
+    // as given instead of the goal being decomposed. Decomposition is a model
+    // call: a case that needed one would be red wherever no upstream is
+    // configured, and what this case is about is the submission surface -- the
+    // row the caller asked for reaching the list the caller reads.
     let (status, body) = req_oneshot(
         app.state.clone(),
         "POST",
@@ -373,13 +378,15 @@ async fn e2e_task_create_then_list() {
         Body::from(
             serde_json::json!({
                 "goal": "e2e integration",
+                "intent_kind": "task",
                 "tasks": [
                     {
                         "id": "e2e-task-1",
                         "task_type": "echo",
                         "input": {"payload": "hello e2e"},
                         "blocked_by": [],
-                        "priority": 1
+                        "priority": 1,
+                        "planner": {"verified": true}
                     }
                 ]
             })
@@ -396,17 +403,33 @@ async fn e2e_task_create_then_list() {
     );
     assert_eq!(body["goal"], "e2e integration");
 
-    // List tasks
-    let (status, body) = req_oneshot(
-        app.state.clone(),
-        "GET",
-        "/api/v1/tasks/list",
-        Body::empty(),
-        Some(app.bearer_token().await),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let tasks = body.as_array().expect("tasks array");
+    // The handler answers before the row is injected -- it accepts the
+    // submission and the injection runs behind it. So the list is polled
+    // rather than read once: a single read asserts a scheduling order, and the
+    // contract being tested is that the accepted row arrives. The bound is
+    // short because nothing slow is on this path; a row that has not arrived
+    // by then did not arrive.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let tasks = loop {
+        let (status, body) = req_oneshot(
+            app.state.clone(),
+            "GET",
+            "/api/v1/tasks/list",
+            Body::empty(),
+            Some(app.bearer_token().await),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let tasks = body.as_array().expect("tasks array").clone();
+        if tasks.iter().any(|t| t["id"] == "e2e-task-1") {
+            break tasks;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the accepted task never reached the list: {tasks:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
     assert!(
         tasks.iter().any(|t| t["id"] == "e2e-task-1"),
         "e2e-task-1 should appear in list"
