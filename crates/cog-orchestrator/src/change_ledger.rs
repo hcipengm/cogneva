@@ -3224,7 +3224,7 @@ async fn publish_dispatch_rows(
                     }) else {
                         continue;
                     };
-                    u64::try_from(count).unwrap_or(u64::MAX)
+                    count
                 } else {
                     let Some(band) = readout.band() else {
                         continue;
