@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# principle: feedback_a_structure_the_gate_cannot_read_should_not_be_built_outside_its_reach
+#
 # check-alert-rule-join-shape.sh 的定向测试：判词必须由**表达式结构**推出来，
 # 而且「绿 / 红 / 判不动」三个方向各自都要点名到自己那一条。
 #
