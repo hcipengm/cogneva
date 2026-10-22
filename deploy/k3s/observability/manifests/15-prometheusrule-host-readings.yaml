@@ -304,3 +304,77 @@ spec:
           annotations:
             summary: "构建缓存已经放到地板之上仍回不去"
             description: "它把它能判的树都放过了，盘依然在地板之上。运行 journal 那一行会说是「缓存不是原因」还是「破坏性的一档被推迟到了 85%」。看谁在吃：`bash scripts/host/cogneva-host-footprint-trend-reading.sh`。"
+
+    # 文件大小普查（`crates/` 下每个 50 KiB 以上的 `.rs` 各判过没有）落后于活树多少。
+    #
+    # 为什么这条判据不在提交门上：普查表在私有仓，判的却是公开仓那棵树。挂在私有仓的
+    # 提交门上时，队友在公开仓把一个 `.rs` 顶过线、没补普查行，红会落在下一个在私有仓提交
+    # 的人身上——而那个文件的作者从构造上跑不到这道门。2026-10-22 两小时内实测两次。
+    # 于是判据分成两半：私有仓的测试判**钉的那一版**（钉文件 `file-size-census.pin`，
+    # 判树快照按它建，结果可复现、不随别人的提交变色）；活树与钉版之间的差在这里判。
+    #
+    # 两个方向分开，因为它们要修的是相反的：
+    #   · 越线却没有行：有人刚把文件顶过 50 KiB，没人判过它该单轴还是多轴——要补一行；
+    #   · 有行却没有文件：文件被删了或缩到线下——要撤一行，而且这一族从来不是急事。
+    # 合起来会变成「普查和树不一致」一句，读的人得先自己查是哪个方向。
+    - name: cogneva-file-size-census
+      rules:
+        # 越线没判：这一族里唯一要当天动手的一格——它意味着下一个写 size 规则的人会
+        # 第一次撞上一个没人数过的文件。
+        - alert: CognevaFileSizeCensusUnjudged
+          expr: cogneva_file_size_census_unjudged > 0
+          for: 2h
+          labels:
+            severity: warning
+          annotations:
+            summary: "有 {{ $value }} 个 50 KiB 以上的 .rs 没有任何一行普查判它"
+            description: "公开树 `crates/` 下越了线的文件数比普查表的行数多。跑 `python3 scripts/gates/check-file-size-census.py --repo ../cogneva` 看逐条点名，补 `scripts/data/file-size-census.tsv` 一行——判据是这个文件该单轴还是多轴，不是把它拆小。补完把 `scripts/data/file-size-census.pin` 的 rev 换成含这次改动的那一版。"
+
+        # 反方向：行还在、文件已经不在了。不急着当天修（撤一行而已），但不清掉的话
+        # 每一拍都在喊，喊久了就没人看了——所以它自己一格，窗口比上面长得多。
+        - alert: CognevaFileSizeCensusStale
+          expr: cogneva_file_size_census_stale > 0
+          for: 24h
+          labels:
+            severity: info
+          annotations:
+            summary: "普查里有 {{ $value }} 行描述的文件已经不在那条线上了"
+            description: "文件被删、或缩到了 50 KiB 以下。撤掉那几行（同一条命令会点名），再把钉文件的 rev 换到撤行之后的那一版。"
+
+        # 落后几个提交本身**不是**错：树在动、钉不必每提交都追。所以它没有告警，
+        # 只有这条读数——真正要人管的是上面两格。把 `pin_lag_commits` 也做成告警，
+        # 等于每次正常提交都喊一次，喊到没人看为止。
+
+    # 每日六列红绿表里**没有别人读**的那两格判词。
+    #
+    # 为什么只给两列立规则：那张表的六格里有四格的界本来就在别处有人读——`rss` 只报不判
+    # （瞬时 0.81 那条 `container_memory_near_limit` 拥有它），`redis_mem` 的 0.90 与
+    # `redis_memory_near_limit` 同值，`oomkill` / `restarts` 由 `pod_oom_killed`、
+    # `pod_restarting_fast` 各自持有。在那四格上再加规则就是同一条界两个信使，喊的次数
+    # 加倍而处置不变。剩下两格的界只有这张表自己在判，此前没有任何规则读它——它们在
+    # Prometheus 里只是一行没人按它做决定的字。
+    #
+    # 两格都不比瞬时值：表读的是窗口极值（默认 24 小时），所以这两条说的是「这个窗口里
+    # 发生过」，不是「此刻正红」。`for` 只是躲开一次抓取抖动，窗口由生产者自己声明，
+    # 不在这里另写一个数。
+    - name: cogneva-resource-six-column
+      rules:
+        # 连接数撞上 maxclients 就是新连接被拒：这是这一列界的定义本身，不是挑出来的比例。
+        - alert: CognevaResourceSixColumnConnExhausted
+          expr: resource_six_column_state{column="conn",state="red"} == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Redis 的 connected_clients 在最近一个窗口里撞到过 maxclients，新连接会被拒"
+            description: "窗口极值不是瞬时值（窗口多长读 `resource_six_column_window_seconds`，由生产者声明，不在这条规则里写死）：要确认是「此刻仍满」还是「某一刻满过」，跑 `bash scripts/host/cogneva-resource-six-column-reading.sh` 看 connected_clients 与 maxclients 两行的时刻。修法是查谁开了没关（连接池上限、租约 loop 的泄漏），不是直接抬 maxclients——抬界只是把同一条泄漏推迟到下一个更大的数。"
+
+        # 占用超过「这个窗口里提供过的最高界」＝某一次准入放过了界，是结构违规而不是水位高。
+        - alert: CognevaResourceSixColumnSlotOverAdmitted
+          expr: resource_six_column_state{column="slot",state="red"} == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "构建槽的占用峰值超过了同一窗口里提供过的最高界"
+            description: "这是准入放过了一个越界的请求，不是「槽很忙」：忙碌的代理是 holder_seconds 那一列，它只报不判。两侧都是窗口极值（窗口多长读 `resource_six_column_window_seconds`）——拿整窗的占用峰值比此刻的界会因为「界忙时降、闲时爬」而假红，所以这一格只在占用确实越过了那一天提供过的最高界时才红。查构建闸的准入判据与它读的界是不是同一份（`RESERVE_FRESH` 不是持有上限）。"

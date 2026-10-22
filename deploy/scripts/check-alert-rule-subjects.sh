@@ -360,6 +360,10 @@ NO_POD_REPORTER = {
     'CognevaHostTargetGcScriptUnverified': 'cogneva_host_target_gc_script_committed',
     'CognevaHostTargetGcProbeFailed': 'cogneva_host_target_gc_outcome{outcome="probe_failed"}',
     'CognevaHostTargetGcFloorUnreachable': 'cogneva_host_target_gc_outcome{outcome="floor_unreachable"}',
+    'CognevaFileSizeCensusUnjudged': 'cogneva_file_size_census_unjudged',
+    'CognevaFileSizeCensusStale': 'cogneva_file_size_census_stale',
+    'CognevaResourceSixColumnConnExhausted': 'resource_six_column_state{column="conn",state="red"}',
+    'CognevaResourceSixColumnSlotOverAdmitted': 'resource_six_column_state{column="slot",state="red"}',
 }
 HOST_READING_JOB = 'cogneva-host-readings'
 POD_LABELS = ('pod', 'container')
