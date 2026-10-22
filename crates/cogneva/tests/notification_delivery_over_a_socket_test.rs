@@ -1,3 +1,5 @@
+//! principle: feedback_a_test_stub_proves_the_classifier_not_the_wire
+//!
 //! 通知出口能不能把报文真的送到一个 socket 上。
 //!
 //! `cog-notification` 的单测把 `HttpClient` 换成替身，替身回答的是"我收到了一个
