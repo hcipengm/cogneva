@@ -498,9 +498,11 @@ pub async fn message_stream_handler(
 
 // ─── JSON-RPC 端点 ────────────────────────────────────────────────────────
 //
-// 三条方法共用一个地址：`message/stream`（在它自己的路径上，见上）、
-// `message/send`、`tasks/get`。前一条只能服务会流式的对端；后两条是 A2A 里
-// 每个对端都会用的那一对，缺了它们，一个按名片打过来的客户端能做的只有开流。
+// 四条方法共用一个地址：`message/send`、`message/stream`、`tasks/get`、
+// `tasks/cancel`。`message/stream` 另有自己的路径（上文的 `MESSAGE_STREAM`，
+// 名片上的旗子指着它），这里再按 `method` 收一次：规范给对端的是一张地址，
+// 照规范写的对端会把流也发到这里；只认路径不认方法，它拿到的就是「不认识这个方法」。
+// 另外两条是每个对端都会用的，缺了它们，一个按名片打过来的客户端能做的只有开流。
 
 /// 一帧 JSON-RPC 错误。
 ///
@@ -523,20 +525,34 @@ pub async fn rpc_handler(
     let rpc_id = body.get("id").cloned().unwrap_or(Value::Null);
     match body.get("method").and_then(Value::as_str) {
         Some("message/send") => rpc_message_send(&state, &body, &rpc_id).await,
+        Some("message/stream") => message_stream_handler(State(state), Json(body)).await,
         Some("tasks/get") => rpc_tasks_get(&state, &body, &rpc_id).await,
+        Some("tasks/cancel") => rpc_tasks_cancel(&state, &body, &rpc_id).await,
         other => (
             StatusCode::OK,
             Json(rpc_error(
                 &rpc_id,
                 -32601,
                 format!(
-                    "unknown method '{}'; this endpoint serves message/send and tasks/get",
+                    "unknown method '{}'; this endpoint serves message/send, \
+                     message/stream, tasks/get and tasks/cancel",
                     other.unwrap_or("<missing>")
                 ),
             )),
         )
             .into_response(),
     }
+}
+
+/// `tasks/get` 与 `tasks/cancel` 共用的 id 取法。
+fn rpc_task_id(body: &Value) -> Option<&str> {
+    let params = body.get("params")?;
+    // `id` 是 A2A 0.2 的字段名，`taskId` 是更早的草稿：两个都认，一个字段名的
+    // 差异不该让一份照旧版规范写的请求变成「没有任务」。
+    params
+        .get("id")
+        .or_else(|| params.get("taskId"))
+        .and_then(Value::as_str)
 }
 
 /// `message/send`：受理一条 message，立刻回这一行的当前样子。
@@ -585,14 +601,7 @@ async fn rpc_message_send(state: &Arc<GatewayState>, body: &Value, rpc_id: &Valu
 /// 这也是不流式的对端拿结果的唯一一条路——`message/send` 回的是受理那一刻的
 /// 样子，而结果是在之后写进这一行的。产物与流里终态帧同源（[`artifacts_of`]）。
 async fn rpc_tasks_get(state: &Arc<GatewayState>, body: &Value, rpc_id: &Value) -> Response {
-    let params = body.get("params").cloned().unwrap_or(Value::Null);
-    // `id` 是 A2A 0.2 的字段名，`taskId` 是更早的草稿：两个都认，一个字段名的
-    // 差异不该让一份照旧版规范写的请求变成「没有任务」。
-    let task_id = params
-        .get("id")
-        .or_else(|| params.get("taskId"))
-        .and_then(Value::as_str);
-    let Some(task_id) = task_id else {
+    let Some(task_id) = rpc_task_id(body) else {
         return (
             StatusCode::OK,
             Json(rpc_error(rpc_id, -32602, "tasks/get takes params.id")),
@@ -609,6 +618,64 @@ async fn rpc_tasks_get(state: &Arc<GatewayState>, body: &Value, rpc_id: &Value) 
         None => (
             StatusCode::OK,
             Json(rpc_error(rpc_id, -32001, format!("no task '{task_id}'"))),
+        )
+            .into_response(),
+    }
+}
+
+/// `tasks/cancel`：喊停一行及其下游，回停完之后的那一行。
+///
+/// 先读一次再喊停，是因为「这个 id 不存在」与「停了但读不回来」要对端看到不同
+/// 的东西：前者是它问错了 id（`-32001`），后者是平台这边的内部故障。两个都压成
+/// 一条错误文本，对端就只剩「取消失败」一个读数。
+///
+/// 返回的是**停完之后**的行，不是「已受理」：取消在这个平台上是同步做的
+/// （cascade 的 id 也随这次调用返回），所以对端拿到 `canceled` 就能收尾，
+/// 不必再问一次 `tasks/get` 猜它停没停。
+async fn rpc_tasks_cancel(state: &Arc<GatewayState>, body: &Value, rpc_id: &Value) -> Response {
+    let Some(task_id) = rpc_task_id(body) else {
+        return (
+            StatusCode::OK,
+            Json(rpc_error(rpc_id, -32602, "tasks/cancel takes params.id")),
+        )
+            .into_response();
+    };
+
+    if state.orchestrator.get_task(task_id).await.is_none() {
+        return (
+            StatusCode::OK,
+            Json(rpc_error(rpc_id, -32001, format!("no task '{task_id}'"))),
+        )
+            .into_response();
+    }
+
+    match state.orchestrator.cancel_task(task_id).await {
+        Ok(cascaded) => {
+            tracing::info!(task_id, cascaded = cascaded.len(), "a2a tasks/cancel");
+            match state.orchestrator.get_task(task_id).await {
+                Some(task) => (
+                    StatusCode::OK,
+                    Json(jsonrpc_result(rpc_id, json!(a2a_task(&task)))),
+                )
+                    .into_response(),
+                None => (
+                    StatusCode::OK,
+                    Json(rpc_error(
+                        rpc_id,
+                        -32603,
+                        format!("task '{task_id}' was cancelled but can no longer be read"),
+                    )),
+                )
+                    .into_response(),
+            }
+        }
+        Err(e) => (
+            StatusCode::OK,
+            Json(rpc_error(
+                rpc_id,
+                -32603,
+                format!("task '{task_id}' could not be cancelled: {e}"),
+            )),
         )
             .into_response(),
     }

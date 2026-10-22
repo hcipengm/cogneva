@@ -229,7 +229,7 @@ async fn the_endpoint_names_what_it_will_not_do() {
     let unknown = post(
         &app,
         &token,
-        json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/cancel", "params": {"id": "t-1"}}),
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/resubscribe", "params": {"id": "t-1"}}),
     )
     .await;
     assert_eq!(unknown["error"]["code"], -32601);
@@ -237,7 +237,7 @@ async fn the_endpoint_names_what_it_will_not_do() {
         .as_str()
         .expect("the refusal carries a message");
     assert!(
-        said.contains("tasks/cancel") && said.contains("message/send"),
+        said.contains("tasks/resubscribe") && said.contains("message/send"),
         "the refusal has to name what was asked and what is served: {said}"
     );
 
@@ -255,4 +255,98 @@ async fn the_endpoint_names_what_it_will_not_do() {
             .contains("params.id"),
         "a missing field is named: {no_id}"
     );
+}
+
+/// The card names one address and the specification dispatches on the method, so
+/// `message/stream` has to answer there too -- not only on its own path. A peer
+/// written to the spec never learns the other path exists; it reads
+/// `streaming: true` and posts the method to the address the card gave it.
+#[tokio::test]
+async fn the_card_address_serves_the_stream_method_too() {
+    let state = router_state::stateless();
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "a2a-rpc-stream").await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/protocol/a2a")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "message/stream",
+                "params": {"message": {"role": "user",
+                                       "parts": [{"kind": "text", "text": "probe stream"}]}},
+            })
+            .to_string(),
+        ))
+        .expect("the request is well formed");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("the router answers");
+
+    assert_eq!(response.status(), 200);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "the stream method has to answer with a stream here, not with a refusal: {content_type}"
+    );
+}
+
+/// A peer can stop a task it started, and gets back the row as it stands after
+/// the stop -- not an acknowledgement it would have to re-read the task to
+/// interpret.
+#[tokio::test]
+async fn a_peer_can_stop_a_task_it_started() {
+    let state = router_state::stateless();
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "a2a-rpc-cancel").await;
+    let client =
+        A2aClient::new(Arc::new(InProcess { app: app.clone() })).with_bearer(token.clone());
+
+    let accepted = client
+        .send_message(ENDPOINT, "probe cancel")
+        .await
+        .expect("the endpoint accepts a message");
+    read_until_present(&client, &accepted.id).await;
+
+    let cancelled = post(
+        &app,
+        &token,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tasks/cancel",
+               "params": {"id": accepted.id}}),
+    )
+    .await;
+    assert_eq!(
+        cancelled["result"]["status"], "canceled",
+        "the answer is the row after the stop: {cancelled}"
+    );
+
+    let afterwards = client
+        .get_task(ENDPOINT, &accepted.id)
+        .await
+        .expect("the cancelled task is still readable");
+    assert_eq!(afterwards.status, A2aTaskStatus::Canceled);
+
+    // Cancelling something that is not there is a refusal, not a silent success.
+    let missing = post(
+        &app,
+        &token,
+        json!({"jsonrpc": "2.0", "id": 4, "method": "tasks/cancel",
+               "params": {"id": "no-such-task"}}),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], -32001);
+    assert!(missing["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("no task 'no-such-task'"));
 }
