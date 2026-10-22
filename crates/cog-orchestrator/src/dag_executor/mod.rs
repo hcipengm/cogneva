@@ -63,6 +63,27 @@ impl Default for DagExecutorConfig {
     }
 }
 
+/// The most one pass puts on a queue when nothing measured the pool.
+///
+/// Every other loop in this crate hands over a slice per pass rather than
+/// draining its backlog, and the ready publisher was the one that did not: with
+/// no window bound its batch was the whole ready set. That is not a theoretical
+/// bound -- a pod that has just started has read no pool status yet, which is
+/// exactly a rollout, and a two-thousand-row ready set went out in one tick
+/// against a transport still loading its dataset; the writes were refused one
+/// message at a time and the rows sat in `Scheduled` until the stall sweep
+/// re-armed them.
+///
+/// The number is **chosen, not derived**, and it says so: nothing in this tree
+/// knows what one hand-over costs, so it cannot be solved from "one pass must
+/// be paid for inside one pass". It is the same borrow the change ledger's own
+/// hand-over ceiling makes, at the same size, and the reading that says whether
+/// it is too tight or too loose is `cogneva_ready_admission_held_total` with
+/// `reason="pass_ceiling"`: a healthy publisher holds nothing under that label,
+/// and one that holds a large share of every pass is a ceiling that should be
+/// re-tuned or a pool reading that never arrives.
+const READY_TASKS_PER_PASS: u64 = 200;
+
 /// What one pass may admit, together with the reading it was derived from.
 ///
 /// The pace rides along so a refusal can be logged with the numbers that
@@ -290,10 +311,22 @@ impl DagExecutorRuntime {
         ] {
             let ready = by_stream.get(&stream).map(|e| e.len()).unwrap_or(0) as u64;
             let owed = in_flight.get(&stream).copied().unwrap_or(0) as u64;
-            let admitted = crate::ready_queue::admitted(ready, owed, window_jobs);
-            admitted_by_stream.insert(stream.clone(), admitted);
-            self.record_admission(&stream, pays_for, owed, admitted, ready - admitted)
-                .await;
+            let admitted = crate::ready_queue::admission_for_pass(
+                ready,
+                owed,
+                window_jobs,
+                READY_TASKS_PER_PASS,
+            );
+            admitted_by_stream.insert(stream.clone(), admitted.jobs);
+            self.record_admission(
+                &stream,
+                pays_for,
+                owed,
+                admitted.jobs,
+                ready - admitted.jobs,
+                admitted.bound,
+            )
+            .await;
         }
 
         let mut first_error: Option<SFError> = None;
@@ -335,8 +368,36 @@ impl DagExecutorRuntime {
                             // already covers a job while nothing is admitted.
                             // A reader given only the numbers would tune the
                             // pace for a pool that is simply down.
-                            refusal = crate::ready_queue::hold_reason(bound.unavailable),
+                            refusal = crate::ready_queue::hold_reason(
+                                bound.unavailable,
+                                crate::ready_queue::PassBound::Window,
+                            ),
                             "holding ready tasks back: nothing may be admitted this pass, so they stay pending until the pool can serve them"
+                        );
+                    } else {
+                        // The other branch is the one with no window bound to
+                        // print, and it has two causes: no status read at all,
+                        // and a status whose measurement cannot bound the pool.
+                        // Both are throttles by the pass's own slice, and a
+                        // batch that shrank from two thousand to two hundred
+                        // with no line about it is a throttle nobody can find
+                        // later -- so the line is written, and it says which of
+                        // the two it was.
+                        tracing::info!(
+                            stream = %stream,
+                            ready = entries.len(),
+                            admitted,
+                            held = entries.len() as u64 - admitted,
+                            ceiling = READY_TASKS_PER_PASS,
+                            status_read = pays_for.is_some(),
+                            measured_upstreams = ?pays_for.map(|bound| bound.pace.measured_upstreams),
+                            pool_size = ?pays_for.map(|bound| bound.pool_size),
+                            reserve_tokens = ?pays_for.map(|bound| bound.pace.reserve_tokens),
+                            refusal = crate::ready_queue::hold_reason(
+                                false,
+                                crate::ready_queue::PassBound::Ceiling,
+                            ),
+                            "the pool gave no window bound this pass, so the batch is this pass's slice; the rest stays pending for the next one"
                         );
                     }
                     entries.truncate(usize::try_from(admitted).unwrap_or(usize::MAX));
@@ -440,6 +501,7 @@ impl DagExecutorRuntime {
         owed: u64,
         admitted: u64,
         held: u64,
+        pass_bound: crate::ready_queue::PassBound,
     ) {
         let Some(metrics) = self.orchestrator.metrics_backend() else {
             return;
@@ -532,8 +594,11 @@ impl DagExecutorRuntime {
             // the reader to tune a budget that is not the constraint.
             labels.insert(
                 "reason".to_string(),
-                crate::ready_queue::hold_reason(bound.is_some_and(|bound| bound.unavailable))
-                    .to_string(),
+                crate::ready_queue::hold_reason(
+                    bound.is_some_and(|bound| bound.unavailable),
+                    pass_bound,
+                )
+                .to_string(),
             );
             drop(
                 metrics

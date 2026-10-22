@@ -1123,8 +1123,8 @@ metric_names! {
     // holding work back and a publisher with nothing to publish leave exactly
     // the same trace: no dispatch. The counter says the gate refused, labelled
     // by `stream` and `reason` -- both closed sets, `shared`/`local` and
-    // `window_exhausted` -- so a reader can tell which queue is starved instead
-    // of seeing one anonymous refusal.
+    // `window_exhausted` / `pool_unavailable` / `pass_ceiling` -- so a reader
+    // can tell which queue is starved instead of seeing one anonymous refusal.
     //
     // Deliberately not labelled by a number or a task id: a label value that
     // changes with the tick is not part of a series' identity, and the gauge

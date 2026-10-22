@@ -783,9 +783,13 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     (
         "cogneva_ready_admission_held_total",
         "Ready tasks nothing admitted, by stream (shared or local) and reason \
-         (window_exhausted, or pool_unavailable when the gateway's own verdict \
-         held the pass while its window still paid for a job -- the two want \
-         opposite repairs, so they are separate cells and not one). A gate \
+         (window_exhausted; pool_unavailable when the gateway's own verdict \
+         held the pass while its window still paid for a job; pass_ceiling when \
+         the pass had no window bound at all and its own slice held the rest -- \
+         the three want opposite repairs, so they are separate cells and not \
+         one. A window is repaired by waiting, an unavailable pool by the \
+         upstreams coming back, and a ceiling by nothing: the next pass takes \
+         the rest). A gate \
          holding work back and a \
          publisher with nothing to publish leave the same trace -- no dispatch \
          -- so without this counter the two are indistinguishable on every \

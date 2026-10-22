@@ -160,17 +160,19 @@ pub fn jobs_the_window_can_pay_for_status(status: &cog_core::LlmPoolStatus) -> O
 
 /// Why a pass held work back, as the closed label the held counter carries.
 ///
-/// The two zeros above arrive at the same place and mean opposite things: a
-/// spent window is fixed by waiting, an unavailable pool is fixed by the
-/// upstreams coming back. Labelling both `window_exhausted` files an outage
+/// The zeros arrive at the same place and mean different things: a spent window
+/// is fixed by waiting, an unavailable pool is fixed by the upstreams coming
+/// back, and a hold by the pass's own slice is fixed by nothing -- the next
+/// pass takes the rest. Labelling any of them under another files an outage
 /// under a budget and sends its reader to tune an allowance that is not the
 /// constraint -- which is possible here precisely because the pool verdict
-/// overrides an allowance that still pays for a job.
-pub fn hold_reason(pool_unavailable: bool) -> &'static str {
-    if pool_unavailable {
-        "pool_unavailable"
-    } else {
-        "window_exhausted"
+/// overrides an allowance that still pays for a job, and because a pass with no
+/// reading at all has no window to blame.
+pub fn hold_reason(pool_unavailable: bool, bound: PassBound) -> &'static str {
+    match bound {
+        PassBound::Ceiling => "pass_ceiling",
+        PassBound::Window if pool_unavailable => "pool_unavailable",
+        PassBound::Window => "window_exhausted",
     }
 }
 
@@ -185,6 +187,69 @@ pub fn admitted(ready: u64, owed: u64, window_jobs: Option<u64>) -> u64 {
     match window_jobs {
         Some(window_jobs) => ready.min(window_jobs.saturating_sub(owed)),
         None => ready,
+    }
+}
+
+/// What one pass may put on a queue, and which gate produced that number.
+///
+/// `bound` is `window` when the pool's own allowance sized the batch and
+/// `ceiling` when nothing measured the pool and the pass's slice did. The two
+/// are different readings: a window that pays for nothing is repaired by
+/// waiting, a ceiling is repaired by nothing at all -- the rest goes out on the
+/// next pass -- and a reader told only "N held" would tune the first for the
+/// second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PassAdmission {
+    pub jobs: u64,
+    pub bound: PassBound,
+}
+
+/// Which gate sized one pass's batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassBound {
+    /// The pool's window allowance.
+    Window,
+    /// The pass's own slice, because nothing measured the pool.
+    Ceiling,
+}
+
+/// How many of `ready` one pass may put on the wire, when the pool may not
+/// have measured anything.
+///
+/// [`admitted`] reads `None` as "admit everything", and for a single pass that
+/// is what it means: the whole ready set goes out at once. That is affordable
+/// only if the pool is there. The pass that reads no status is a rollout -- a
+/// new process, before its first look at the pool -- which is also when the
+/// transport is most likely to still be loading, and a batch that size is a
+/// backlog handed to a stream whose writes may be refused one message at a
+/// time, leaving the whole batch in `Scheduled` until the stall sweep re-arms
+/// it.
+///
+/// So an unmeasured pass admits a slice instead. It does **not** admit nothing:
+/// a publisher that stopped on a missing reading would be driving the platform
+/// by the presence of a metric, and a pool source that is never attached would
+/// then hold every task forever. The slice makes progress whenever the reading
+/// is missing, at the ceiling's rate rather than the backlog's.
+///
+/// The owed count is deliberately not subtracted in this branch. `owed` is only
+/// meaningful against a known allowance; subtracting it from a ceiling would
+/// admit nothing as soon as the backlog exceeded one slice, which is the halt
+/// this branch exists to avoid.
+pub fn admission_for_pass(
+    ready: u64,
+    owed: u64,
+    window_jobs: Option<u64>,
+    ceiling: u64,
+) -> PassAdmission {
+    match window_jobs {
+        Some(_) => PassAdmission {
+            jobs: admitted(ready, owed, window_jobs),
+            bound: PassBound::Window,
+        },
+        None => PassAdmission {
+            jobs: ready.min(ceiling),
+            bound: PassBound::Ceiling,
+        },
     }
 }
 
@@ -342,7 +407,9 @@ mod tests {
 
     #[test]
     fn admission_is_measured_against_what_the_queue_already_owes() {
-        // Nothing measured: everything ready goes out.
+        // Nothing measured: this function says everything ready may go out.
+        // The publisher does not use that answer as it stands -- see
+        // `admission_for_pass`, which puts the pass's slice on this branch.
         assert_eq!(admitted(10, 5, None), 10);
         // Ten ready, five already owed, a window that pays for eight: three.
         // Compared with zero instead, this would be eight every pass -- the
@@ -353,6 +420,44 @@ mod tests {
         assert_eq!(admitted(10, 20, Some(8)), 0);
         // Fewer ready than the window could pay for: the queue is the bound.
         assert_eq!(admitted(2, 1, Some(100)), 2);
+    }
+
+    #[test]
+    fn a_pass_that_measured_nothing_takes_a_slice_and_not_the_backlog() {
+        // The case that made this a defect: a pod minutes old, no status read
+        // yet, two thousand ready tasks. Unbounded, the whole backlog went out
+        // on one tick and the transport -- still loading -- refused the writes,
+        // leaving all of them in `Scheduled` for a stall window.
+        let slice = admission_for_pass(2_024, 0, None, 200);
+        assert_eq!(slice.jobs, 200);
+        assert_eq!(slice.bound, PassBound::Ceiling);
+        // A measured pass is not trimmed to the slice: the pool's own answer is
+        // the bound, and a window that pays for more than one slice is a window
+        // that should be used.
+        let measured = admission_for_pass(2_024, 0, Some(500), 200);
+        assert_eq!(measured.jobs, 500);
+        assert_eq!(measured.bound, PassBound::Window);
+        // The owed count is not subtracted from the ceiling: with a backlog
+        // already in flight above one slice, subtracting would admit nothing,
+        // which is the halt the ceiling branch exists to avoid.
+        assert_eq!(admission_for_pass(2_024, 1_729, None, 200).jobs, 200);
+        // And a ready set smaller than a slice is still just the ready set.
+        assert_eq!(admission_for_pass(7, 0, None, 200).jobs, 7);
+    }
+
+    fn bound_of(window_jobs: Option<u64>) -> PassBound {
+        admission_for_pass(1, 0, window_jobs, 200).bound
+    }
+
+    #[test]
+    fn a_hold_names_the_slice_when_no_reading_decided_it() {
+        // Nothing measured the pool: neither the window nor availability can be
+        // what held the rest, and naming either would send the reader to repair
+        // something that is not the constraint.
+        assert_eq!(hold_reason(false, bound_of(None)), "pass_ceiling");
+        assert_eq!(hold_reason(true, bound_of(None)), "pass_ceiling");
+        assert_eq!(hold_reason(false, bound_of(Some(3))), "window_exhausted");
+        assert_eq!(hold_reason(true, bound_of(Some(0))), "pool_unavailable");
     }
 
     fn status(
@@ -395,8 +500,8 @@ mod tests {
     #[test]
     fn a_hold_names_the_gate_that_produced_it_not_the_one_it_is_filed_under() {
         // Both zeros reach the same hold; only the label says which repair.
-        assert_eq!(hold_reason(true), "pool_unavailable");
-        assert_eq!(hold_reason(false), "window_exhausted");
+        assert_eq!(hold_reason(true, PassBound::Window), "pool_unavailable");
+        assert_eq!(hold_reason(false, PassBound::Window), "window_exhausted");
         // The case that made this a defect: a pool that is down still has an
         // allowance that pays for jobs, so the window is not the constraint
         // while the bound is zero. Filing that under the window sends the
@@ -407,7 +512,10 @@ mod tests {
             jobs_the_window_can_pay_for(&down.pace, measurable_pool_size(&down)).unwrap_or(0) > 0,
             "the fixture must keep paying for a job, or it cannot show the two reasons apart"
         );
-        assert_eq!(hold_reason(down.unavailable), "pool_unavailable");
+        assert_eq!(
+            hold_reason(down.unavailable, bound_of(Some(0))),
+            "pool_unavailable"
+        );
     }
 
     #[test]
