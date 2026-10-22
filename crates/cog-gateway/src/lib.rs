@@ -2,7 +2,7 @@
 //! principle: feedback_a_snapshot_of_an_edge_may_not_shadow_a_refreshed_condition_row
 use axum::{
     extract::{MatchedPath, Path, Query, Request, State, WebSocketUpgrade},
-    http::{header, Method, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     middleware::{from_fn, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -3113,24 +3113,50 @@ async fn mcp_tool_call_handler(
     }
 }
 
-async fn a2a_agent_card_handler(State(state): State<Arc<GatewayState>>) -> Response {
+/// 名片上该报的对外地址。
+///
+/// 对端拿这张名片就是为了照上面的 `url` 打回来，所以这个地址必须是**它刚刚够得着
+/// 的那个**：直接从这次请求的 `Host` 与反代的 `X-Forwarded-Proto` 取，而不是报本
+/// 进程的绑定地址——`0.0.0.0` 是「监听所有接口」，不是任何一个对端能拨号的目标，
+/// 报它等于把一张写着「从这里找我」的名片指到没有门牌的地方。
+///
+/// 两个头都没有时退回到绑定地址：那是本机直连（或者探针）的场景，`Host` 由客户端
+/// 自己填，缺了就说明这次请求没有给出够得着的地址，只能报一个诚实的兜底。
+fn advertised_base(headers: &HeaderMap, port: u16) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|scheme| !scheme.is_empty())
+        .unwrap_or("http");
+    match headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+    {
+        Some(host) => format!("{scheme}://{host}"),
+        None => format!("http://0.0.0.0:{port}"),
+    }
+}
+
+async fn a2a_agent_card_handler(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+) -> Response {
     // Expose cogneva's own Agent Card
+    let port = state
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .http_port;
     let card = cog_core::AgentCard {
         name: "cogneva".into(),
         description: "Cogneva autonomous multi-agent collaboration platform".into(),
         // 名片上的 `url` 是对端真正会打的那一个地址，所以它带着端点路径：
         // 报一个根地址，对端按 A2A 惯例把 `message/send` 发过去，撞上的是路由表
-        // 里不存在的一条路径。主机名仍是本进程的绑定地址（`0.0.0.0` 不是可拨号
-        // 的目标），对外地址由部署侧的入口决定，不在这一行里猜。
-        url: format!(
-            "http://0.0.0.0:{}{}",
-            state
-                .config
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .http_port,
-            a2a::A2A_RPC
-        ),
+        // 里不存在的一条路径。
+        url: format!("{}{}", advertised_base(&headers, port), a2a::A2A_RPC),
         version: env!("CARGO_PKG_VERSION").into(),
         // 旗子不在这里写死：它由本模块真正服务的那张端点推出（见 `a2a::capabilities`）。
         capabilities: a2a::capabilities(),

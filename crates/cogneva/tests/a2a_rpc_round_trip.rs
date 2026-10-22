@@ -195,6 +195,59 @@ async fn a_peer_that_does_not_stream_can_send_and_then_read_the_outcome() {
     );
 }
 
+/// Ask for the agent card the way a peer on the other side of an ingress would:
+/// with the `Host` it reached us at, and the scheme the proxy terminated.
+async fn card_behind(
+    app: &axum::Router,
+    token: &str,
+    host: &str,
+    forwarded_proto: Option<&str>,
+) -> serde_json::Value {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri("/api/v1/protocol/a2a/agent-card")
+        .header("Host", host)
+        .header("Authorization", format!("Bearer {token}"));
+    if let Some(scheme) = forwarded_proto {
+        builder = builder.header("X-Forwarded-Proto", scheme);
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            builder
+                .body(Body::empty())
+                .expect("the request is well formed"),
+        )
+        .await
+        .expect("the router answers");
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the body comes back");
+    serde_json::from_slice(&bytes).expect("the card is JSON")
+}
+
+/// The card's `url` is the address the peer should call back, so it has to be
+/// the address the peer just reached us at -- not this process's bind address.
+/// `0.0.0.0` means "listen everywhere"; it is not a target anyone can dial.
+#[tokio::test]
+async fn the_card_names_the_address_the_caller_reached_us_at() {
+    let state = router_state::stateless();
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "a2a-card-probe").await;
+
+    let behind_tls = card_behind(&app, &token, "cogneva.example", Some("https")).await;
+    assert_eq!(
+        behind_tls["url"], "https://cogneva.example/api/v1/protocol/a2a",
+        "the card has to point back at the name and scheme the caller used: {behind_tls}"
+    );
+
+    let with_port = card_behind(&app, &token, "10.0.0.7:8080", None).await;
+    assert_eq!(
+        with_port["url"], "http://10.0.0.7:8080/api/v1/protocol/a2a",
+        "a plain request keeps its host and port: {with_port}"
+    );
+}
+
 /// One HTTP round trip to the endpoint, returning the JSON body. Used where the
 /// test has to send something the client would refuse to build.
 async fn post(app: &axum::Router, token: &str, body: serde_json::Value) -> serde_json::Value {
