@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_row_per_pod_life_is_not_an_incident
 # check-alert-rule-subjects.sh 的定向测试：判词必须由**表达式结构**推出来，
 # 而且三种失败方向各自都要点名到自己那一条。
 #
