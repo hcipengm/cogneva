@@ -179,6 +179,17 @@ const DECLARATIONS_PER_PASS: usize = 200;
 /// which the backlog reading says anyway.
 const RETIREMENTS_PER_PASS: usize = 200;
 
+/// How many retirements that say "another account answered this" one pass
+/// re-asks.
+///
+/// Deliberately larger than the fold's bound: those batches are written by a
+/// classifier in tens, while this set is every row a repair touched at once, and
+/// a bound under it would leave part of the set re-asked only on the pass after
+/// -- the rows it did not reach read as retirements nothing will ever revisit.
+/// It is still a bound, because the pass holds the owner lease and each row costs
+/// a read of the other account.
+const RESTORED_ANSWERED_PER_PASS: usize = 1024;
+
 /// How many rows one pass measures against the tree.
 ///
 /// The ledger holds rows in the thousands and a pass that walked all of them
@@ -1313,6 +1324,96 @@ impl Unaimed {
 /// account keeps the rows it already holds and the warning says this pass
 /// contributed none, so "no principle is owed a gate" and "the ledger could not
 /// be read" stay apart.
+/// Whether a retirement that says "another account answered this" still holds.
+///
+/// The gate is that account's word that something enforces the rule. An empty
+/// value and the account's own spelling for "nothing" are both "no gate": the
+/// column is text, and a writer that meant nothing may have written either.
+fn answered_elsewhere_holds(gate: Option<&str>) -> bool {
+    gate.is_some_and(|gate| {
+        let gate = gate.trim();
+        !gate.is_empty() && gate != "-"
+    })
+}
+
+/// Bring back the rows whose answering account has stopped carrying the gate.
+///
+/// A retirement is written from a fact, and this fact is not this account's: it
+/// is the other account's gate column. Every read that could notice a change in
+/// it excludes retired rows by design, so without this pass the retirement would
+/// outlive the fact that made it true -- the row would keep saying nobody has to
+/// write a check while the account that once carried one no longer does.
+///
+/// A read that failed is not a fact about the row, and neither is a rule the
+/// other account does not hold at all: that account has stopped carrying the
+/// rule, which is a different statement from having stopped carrying its gate.
+/// Both leave the row retired, and only a positive "the rule is here and has no
+/// gate" moves it.
+async fn restore_answered_elsewhere(
+    principles: &dyn PrincipleLedgerStore,
+    store: &dyn ChangeLedgerStore,
+) -> usize {
+    let rows = match store
+        .retired_answered_elsewhere(RESTORED_ANSWERED_PER_PASS)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the retirements this pass could revoke could not be read, so \
+                 none was re-asked"
+            );
+            return 0;
+        }
+    };
+    let mut restored = 0usize;
+    for row in rows {
+        // The identity is the declaration this account wrote for a principle. A
+        // row retired for this reason under any other literal was not written by
+        // this path, and there is no gate to ask about.
+        let Some(slug) = row
+            .identity
+            .literal
+            .strip_prefix(PRINCIPLE_DECLARATION_PREFIX)
+        else {
+            continue;
+        };
+        let still_answered = match principles.get(slug).await {
+            Ok(Some(principle)) => answered_elsewhere_holds(principle.host_gate.as_deref()),
+            Ok(None) => true,
+            Err(e) => {
+                warn!(
+                    principle = slug,
+                    error = %e,
+                    "change ledger: the principle ledger could not be read, so this retirement \
+                     was left as it is"
+                );
+                continue;
+            }
+        };
+        if still_answered {
+            continue;
+        }
+        let measurement = ChangeMeasurement::new(row.identity.clone(), ChangeState::Pending);
+        match store.apply_measurement(&measurement).await {
+            Ok(()) => restored += 1,
+            Err(e) => warn!(
+                change = %row.identity,
+                error = %e,
+                "change ledger: a row whose answer had gone could not be reopened"
+            ),
+        }
+    }
+    if restored > 0 {
+        info!(
+            restored,
+            "change ledger: reopened rows whose answering account no longer carries the gate"
+        );
+    }
+    restored
+}
+
 async fn principle_pass(
     principles: &dyn PrincipleLedgerStore,
     first_seen_rev: Option<&str>,
@@ -1353,6 +1454,10 @@ async fn principle_pass(
              written into the account"
         ),
     }
+    // The other direction of the same door, and it runs whether or not the
+    // readings landed: a retirement whose ground has gone is not made any less
+    // false by a write that failed, and the next pass would only ask again.
+    restore_answered_elsewhere(principles, store).await;
     // Said only for a read that failed: the ledger answered, and what failed was
     // the write into this account.
     None
@@ -4322,6 +4427,22 @@ mod tests {
         }
     }
 
+    /// A retirement that says another account answered it holds only while that
+    /// account carries a gate.
+    ///
+    /// The column is text, so "nothing" has more than one spelling: a writer that
+    /// meant nothing may have written an empty string, a dash, or left the column
+    /// out. Every one of those is "no gate", and reading any of them as an answer
+    /// would keep a row retired on the strength of a field that says nothing.
+    #[test]
+    fn a_retirement_answered_elsewhere_holds_only_while_a_gate_is_there() {
+        assert!(answered_elsewhere_holds(Some("test:scripts/a.test.sh")));
+        assert!(!answered_elsewhere_holds(Some("")));
+        assert!(!answered_elsewhere_holds(Some("   ")));
+        assert!(!answered_elsewhere_holds(Some("-")));
+        assert!(!answered_elsewhere_holds(None));
+    }
+
     /// The quota is the smallest batch that sweeps the landed set within the
     /// bound, at both ends: the sweep it buys fits, and one row fewer does not.
     ///
@@ -5658,6 +5779,18 @@ mod tests {
                 .filter(|row| {
                     row.state == ChangeState::Retired
                         && row.retire_reason == Some(RetireReason::SurfaceMoved)
+                })
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+        async fn retired_answered_elsewhere(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
+            Ok(self
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.state == ChangeState::Retired
+                        && row.retire_reason == Some(RetireReason::AnsweredElsewhere)
                 })
                 .take(limit)
                 .cloned()

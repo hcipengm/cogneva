@@ -182,15 +182,36 @@ pub enum RetireReason {
     /// for it, while this one returns only if the surface itself comes back
     /// into the measured tree.
     SurfaceMoved,
+    /// Another account has answered this row's question, on a surface this
+    /// account's checks cannot search.
+    ///
+    /// The row was minted rightly: at the time, nothing enforced the rule, and
+    /// the platform's own account said so. A gate was then written, and it is a
+    /// test in a tree this account does not measure -- the host keeps its own
+    /// carriers and reports them as a column of its own account, which is the
+    /// column this reason is produced from. Its identity here is a search of one
+    /// scope of one tree, so the answer can never arrive as a measurement, and
+    /// the row would stay outstanding while reading exactly like a rule nobody
+    /// has written a check for.
+    ///
+    /// Distinct from [`RetireReason::OutOfScope`], whose row names a scope this
+    /// account cannot read: this row's scope is read on every pass. Distinct from
+    /// [`RetireReason::SurfaceMoved`], whose row was measured here before its
+    /// surface left: this one was never measurable here at all. The question the
+    /// three answers differ on is whether the row can come back, and for this one
+    /// it can: the other account dropping the gate is what brings it back, and
+    /// that is a fact readable from that account on any pass.
+    AnsweredElsewhere,
 }
 
 impl RetireReason {
     /// Every reason, in the order the readings group them.
-    pub const ALL: [RetireReason; 4] = [
+    pub const ALL: [RetireReason; 5] = [
         RetireReason::Superseded,
         RetireReason::Fixture,
         RetireReason::OutOfScope,
         RetireReason::SurfaceMoved,
+        RetireReason::AnsweredElsewhere,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -199,6 +220,7 @@ impl RetireReason {
             RetireReason::Fixture => "fixture",
             RetireReason::OutOfScope => "out_of_scope",
             RetireReason::SurfaceMoved => "surface_moved",
+            RetireReason::AnsweredElsewhere => "answered_elsewhere",
         }
     }
 }
@@ -1005,6 +1027,22 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// re-asking the same head of it forever: a retirement that is still true
     /// has no measurement to advance, so nothing else in the order moves.
     async fn retired_surface_moved(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>>;
+
+    /// The rows retired because another account had answered them, oldest
+    /// retirement first.
+    ///
+    /// The counterpart of [`Self::retired_surface_moved`] for the one other
+    /// retirement whose ground can be falsified from outside this tree, and its
+    /// own read rather than a widened one because the fact that revives it lives
+    /// in a different account: the scope coming back is a question for the tree,
+    /// while "does the other account still carry the gate" is a question only
+    /// that account answers. A caller handed both kinds in one list would have to
+    /// know which door each row's answer comes from.
+    ///
+    /// Like its counterpart this is the finding only: the caller asks the account
+    /// that answered, and a read that failed there is not a fact about the row.
+    /// Ordered by `retired_at` for the same reason.
+    async fn retired_answered_elsewhere(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>>;
 
     /// Record that a commit delivered this row's change, and which commit.
     ///

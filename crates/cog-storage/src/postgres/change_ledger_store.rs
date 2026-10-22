@@ -1009,6 +1009,28 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         )
     }
 
+    async fn retired_answered_elsewhere(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
+        // The same shape as `retired_surface_moved` and for the same reason: a
+        // retirement this account wrote is a statement about a moment, and the
+        // fact that made it true can stop being true. For these rows the fact is
+        // the other account's, so whether it still holds is the caller's to ask
+        // -- this read only finds them.
+        //
+        // Ordered by `retired_at`: a retirement that still holds has no
+        // measurement to advance, so nothing else in this order moves.
+        Self::entries(
+            sqlx::query(&format!(
+                "SELECT {ROW_COLUMNS} FROM change_ledger \
+                 WHERE state = 'retired' AND retire_reason = 'answered_elsewhere' \
+                 ORDER BY retired_at ASC NULLS FIRST, first_seen_at ASC \
+                 LIMIT $1"
+            ))
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await,
+        )
+    }
+
     async fn record_reopen(&self, reopen: &ChangeReopen) -> SFResult<()> {
         sqlx::query(RECORD_REOPEN_SQL)
             .bind(&reopen.identity.kind)
