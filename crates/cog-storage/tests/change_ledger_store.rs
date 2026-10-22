@@ -27,7 +27,7 @@
 //! not the other fails only at runtime. Every row carries a per-run marker in its
 //! scope and is deleted at the end, so the database is left as it was found.
 
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 
 use cog_core::{
     ChangeBlock, ChangeIdentity, ChangeLedgerStore, ChangeMeasurement, ChangePriority,
@@ -83,6 +83,29 @@ async fn migrate_once(url: &str) {
         .execute(&mut *conn)
         .await
         .expect("release the schema lock");
+}
+
+/// Hold the retirement queue to one test at a time.
+///
+/// The backlog is global by design: `fold_retirements` folds whatever is
+/// queued, not only the caller's rows, and `pending_retirements` counts the
+/// whole table. Two tests asserting those numbers in parallel therefore fold
+/// each other's rows and count each other's queue -- the assertions still read
+/// as global facts, they are just no longer about the row under test. This
+/// session lock (a different key from the schema lock) makes the retirement
+/// tests exclusive; closing the connection releases it, including when a test
+/// panics.
+async fn retirement_lock() -> sqlx::PgConnection {
+    let url = database_url();
+    let mut conn = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("connect to take the retirement lock");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(97_003_i64)
+        .execute(&mut conn)
+        .await
+        .expect("take the retirement lock");
+    conn
 }
 
 fn identity(marker: &str, suffix: &str) -> ChangeIdentity {
@@ -289,6 +312,7 @@ async fn a_row_created_by_a_measurement_enters_at_that_measurements_revision() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn a_queued_retirement_folds_into_the_account_and_is_idempotent() {
+    let _retirement_lock = retirement_lock().await;
     let (store, pool, marker) = store().await;
     let id = identity(&marker, "fixture");
 
@@ -354,6 +378,7 @@ async fn a_queued_retirement_folds_into_the_account_and_is_idempotent() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn a_later_measurement_clears_a_retirement() {
+    let _retirement_lock = retirement_lock().await;
     let (store, pool, marker) = store().await;
     let id = identity(&marker, "re-examined");
 
