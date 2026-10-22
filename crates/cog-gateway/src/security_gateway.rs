@@ -2,6 +2,7 @@
 //! principle: feedback_seed_zero_per_cell_not_per_name
 //! principle: feedback_two_builders_of_one_sentence_are_routed_to_readers_by_the_merge_criterion
 //! principle: feedback_two_renderers_of_one_verdict_must_name_the_same_derived_quantity
+//! principle: feedback_a_cap_on_our_own_work_belongs_at_task_admission_not_in_the_mid_task_call_path
 //! 独立安全网关。
 //! 代持全部敏感凭证，沙盒零凭证。两个通道：
 //! - 外网代理（默认 8080）：`POST /proxy` 转发沙盒出站请求，域名白/黑名单 + 凭证脱敏审查；
@@ -10693,6 +10694,59 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert_eq!(&bytes[..], second_body.as_bytes());
         // 嫌疑上游没有被真实请求触碰（note_success 会清窗，窗应仍在）。
         assert!(state.llm_health.is_suspect(&stub_upstream(&first, "m1")));
+    }
+
+    /// 平台对自己工作的上限，判点落在准入与读数上，不落在请求路径上。
+    ///
+    /// 树里今天没有任何「按日总量拒答」的代码——这是有意的决定，不是遗漏。代价是
+    /// 这个决定没有守卫：把界重新放回请求路径的写法，与一次合法的快速失败长得一样，
+    /// 没有任何一格会因此变红。这里把读数设成一个任何能想到的上限都会被它超过的值，
+    /// 再走真实透传端点：只要有人让自有花费在请求路径上生效（拒绝、降级转 429），
+    /// 这一格立刻红；正常时它证明的是「读数是读数，不是闸门」。
+    ///
+    /// 反过来的一半也钉住：请求路径不许**改写**这条读数。读数只由池级刷新按拍写，
+    /// 谁在请求里动它一次，就会让同一天的账在别人的拍上读成另一个数。
+    #[tokio::test]
+    async fn a_recorded_spend_never_refuses_a_request() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+        let alive = spawn_stub_upstream(200, body).await;
+        let state = test_state(vec![stub_upstream(&alive, "m1")]);
+
+        let now = Utc::now().timestamp();
+        let huge = u64::MAX / 2;
+        *state.spend_reading.lock().unwrap() = crate::spend_reading::Reading {
+            snapshot: Some(crate::spend_reading::SpendSnapshot {
+                day_start_unix: crate::spend_reading::day_start_unix(now),
+                total_tokens: huge,
+                actor_tokens: [("somebody".to_string(), huge)].into_iter().collect(),
+            }),
+            measured_at_unix: Some(now),
+        };
+
+        let req = axum::extract::Request::builder()
+            .method("POST")
+            .body(axum::body::Body::from(
+                r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = chat_completions_passthrough(State(state.clone()), req)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "今天花了多少是读数，不是请求路径上的闸门"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], body.as_bytes());
+        let after = state.spend_reading.lock().unwrap().clone();
+        assert_eq!(
+            after.snapshot.as_ref().map(|s| s.total_tokens),
+            Some(huge),
+            "请求路径不许改写池级刷新写下的那条读数"
+        );
     }
 
     /// 空表不是"池可用"的实证。重启把健康表清零，此后只要没有真实请求进来
