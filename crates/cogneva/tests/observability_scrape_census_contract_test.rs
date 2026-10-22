@@ -103,6 +103,10 @@ const NOT_A_SERIES: &[(&str, &str)] = &[
         "cogneva_no_such_series",
         "a fixture: `MetricName::for_tests_only` exists so a test can publish a name no build can produce, which is the reading the closed set's own liveness check needs",
     ),
+    (
+        "cogneva_io_managed",
+        "a label key, not a series: the alert mirror selects the Prometheus alerts to copy by carrying this label, and the key travels in `observability.infra_watch.mirror_alerts.label` (cog-observability/src/config.rs) -- the same string is a value of `ALERTS`'s label set, not a name the exposition publishes",
+    ),
 ];
 
 /// The prefix every series name this build publishes is spelled with.
