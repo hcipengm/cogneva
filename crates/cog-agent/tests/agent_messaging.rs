@@ -553,6 +553,16 @@ struct Answering {
     answer: Option<serde_json::Value>,
     asked: Mutex<Option<String>>,
     deleted: Mutex<Vec<String>>,
+    /// What a reader on the reply stream sees: only what is published after it
+    /// subscribed.
+    ///
+    /// A broadcast channel rather than the memory backend underneath, on
+    /// purpose. That backend replays its buffer to every new subscriber, which
+    /// would make the ordering bug this test exists for invisible: a caller
+    /// that published first and subscribed second would still find the answer
+    /// waiting in the buffer. Redis does not replay, so the fake must not
+    /// either.
+    replies: tokio::sync::broadcast::Sender<(String, Vec<u8>)>,
 }
 
 impl Answering {
@@ -562,6 +572,7 @@ impl Answering {
             answer,
             asked: Mutex::new(None),
             deleted: Mutex::new(Vec::new()),
+            replies: tokio::sync::broadcast::channel(16).0,
         }
     }
 
@@ -586,7 +597,9 @@ impl MessageBackend for Answering {
                 *self.asked.lock().expect("lock") = Some(stream.clone());
                 if let Some(answer) = self.answer.as_ref() {
                     let bytes = serde_json::to_vec(answer).expect("encode answer");
-                    self.inner.publish(&stream, &bytes).await?;
+                    // A subscriber that is not attached yet receives nothing:
+                    // that is the property under test.
+                    let _ = self.replies.send(("1-0".to_string(), bytes));
                 }
             }
         }
@@ -598,6 +611,13 @@ impl MessageBackend for Answering {
     }
 
     async fn subscribe(&self, subject: &str, group: &str) -> SFResult<MessageStream> {
+        if subject.starts_with("orchestrator:reply:") {
+            let mut rx = self.replies.subscribe();
+            let live = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.ok().map(|msg| (Ok(msg), rx))
+            });
+            return Ok(Box::pin(live));
+        }
         self.inner.subscribe(subject, group).await
     }
 
