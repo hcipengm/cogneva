@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# principle: feedback_a_counter_incremented_inside_a_pipeline_is_lost_and_its_zero_reads_as_a_measurement
+# principle: feedback_a_generation_is_the_hash_not_the_file_that_carries_it
+# principle: feedback_a_tier_held_back_must_name_itself_in_the_ending
 # Deterministic gate for the host build-cache reclaimer.
 #
 # The reclaimer deletes files, so every judgement it makes has to be provable

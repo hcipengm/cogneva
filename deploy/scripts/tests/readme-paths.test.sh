@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_template_is_not_a_dead_path
 # check-readme-paths.sh 的判据：文档点名的路径必须在这棵树里。
 #
 # 这条规则的存在理由决定了夹具的形状——它要防的是**静默**的死指针（路径搬了家，

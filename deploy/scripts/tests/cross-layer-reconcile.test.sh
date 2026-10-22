@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_an_automatic_correction_is_bounded_by_a_measurement_not_by_a_direction
 # check-cross-layer-reconcile.sh 的定向测试。
 #
 # 这条读数判的是**两个层的差**，所以「它判得出来」这句话只能由反例证明：每个用例
