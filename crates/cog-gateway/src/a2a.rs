@@ -14,6 +14,11 @@
 //! `Task::goal_row` 构造、同一个 id）。于是流上报的状态与 HTTP 面读到的状态是
 //! 同一行，不存在第二套「A2A 视图里的任务」——一个平台里两套任务状态，迟早各自
 //! 漂。goal 分解出来的那张 DAG 是实现细节，不属于 A2A 任务。
+//!
+//! 状态只是这条流的一半。对端在另一个进程里，读不到本平台的任务表：流若只报
+//! 「完成」，它能知道的只有跑完了，不知道做成了什么。所以终态那一帧同时带上这一行
+//! 的 `result` 与 `error`，各占一件产物——合成一件之后，「跑完了但没有产出」与
+//! 「没跑完」在客户端读成同一个形状。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +31,7 @@ use axum::Json;
 use futures::stream::Stream;
 use serde_json::{json, Value};
 
-use cog_core::{A2aTaskStatus, OrchestratorControl, Task, TaskStatus};
+use cog_core::{A2aTaskStatus, MessagePart, OrchestratorControl, Task, TaskArtifact, TaskStatus};
 
 use crate::GatewayState;
 
@@ -271,7 +276,7 @@ impl StreamState {
             id: self.goal_id.clone(),
             status: state,
             messages: Vec::new(),
-            artifacts: Vec::new(),
+            artifacts: artifacts_of(task),
             created_at: task.created_at,
             updated_at: task.updated_at,
         })
@@ -286,17 +291,55 @@ impl StreamState {
     ///
     /// `final` 与终态判定同源（[`is_terminal`]），不是各写一遍：两处各判一次，
     /// 「流什么时候收」与「帧里说没收」迟早会不一致，而客户端信的正是帧里那个标记。
-    fn status_update(&self, state: A2aTaskStatus) -> Value {
-        jsonrpc_result(
-            &self.rpc_id,
-            json!({
-                "kind": "status-update",
-                "id": self.goal_id,
-                "status": state,
-                "final": is_terminal(state),
-            }),
-        )
+    ///
+    /// 终态那一帧带上产物：调用方在别的进程里，读不到本平台的任务表，流是它
+    /// 唯一看得到这次运行的地方，只报「完成了」而不给结果，等于让它再猜一次
+    /// 到底做成了什么。非终态不带——那时候还没有结果，带着一个空数组只是让
+    /// 「没有产物」与「还没产出」在客户端读成同一件事。
+    fn status_update(&self, task: &Task, state: A2aTaskStatus) -> Value {
+        let mut frame = json!({
+            "kind": "status-update",
+            "id": self.goal_id,
+            "status": state,
+            "final": is_terminal(state),
+        });
+        if let Some(obj) = frame.as_object_mut().filter(|_| is_terminal(state)) {
+            obj.insert("artifacts".into(), json!(artifacts_of(task)));
+        }
+        jsonrpc_result(&self.rpc_id, frame)
     }
+}
+
+/// 一行任务留在 A2A 线上的产物。
+///
+/// 平台的任务行只有两个可交付的字段：`result` 是运行产出，`error` 是失败原因。
+/// 两者各占一件产物而不是合成一件，因为客户端要能把「跑完了但没有产出」与
+/// 「没跑完」分开——并成一件之后，读到的都是「有产物」。
+///
+/// 文本里放 JSON 而不是把 `result` 摊成结构化片段：A2A 的 `Part` 只有文本与文件
+/// 两种，摊开需要发明一套字段映射，而那份映射一旦写错，客户端看到的是**残缺的**
+/// 结果，不是一条读不懂的结果。
+fn artifacts_of(task: &Task) -> Vec<TaskArtifact> {
+    let mut artifacts = Vec::new();
+    if let Some(result) = task.result.as_ref() {
+        artifacts.push(TaskArtifact {
+            name: "result".into(),
+            parts: vec![MessagePart::Text {
+                text: result.to_string(),
+            }],
+            index: artifacts.len() as u32,
+        });
+    }
+    if let Some(error) = task.error.as_ref() {
+        artifacts.push(TaskArtifact {
+            name: "error".into(),
+            parts: vec![MessagePart::Text {
+                text: error.clone(),
+            }],
+            index: artifacts.len() as u32,
+        });
+    }
+    artifacts
 }
 
 /// 把一条 goal 的推进做成 SSE 帧序列。
@@ -342,7 +385,7 @@ fn goal_stream(state: StreamState) -> impl Stream<Item = Result<Bytes, std::io::
                     let frame = if s.last.is_none() {
                         s.snapshot(&task, state)
                     } else {
-                        s.status_update(state)
+                        s.status_update(&task, state)
                     };
                     s.last = Some(state);
                     s.done = is_terminal(state);
@@ -443,13 +486,26 @@ mod tests {
         /// 依次给出的行状态；用完之后一直停在最后一个。
         script: Mutex<Vec<Option<TaskStatus>>>,
         asks: Mutex<usize>,
+        /// 这一行带回来的结果与失败原因，两者都是任务行自己的字段。
+        result: Option<Value>,
+        error: Option<String>,
     }
 
     impl ScriptedReader {
         fn new(script: Vec<Option<TaskStatus>>) -> Arc<Self> {
+            Self::with_outcome(script, None, None)
+        }
+
+        fn with_outcome(
+            script: Vec<Option<TaskStatus>>,
+            result: Option<Value>,
+            error: Option<&str>,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 script: Mutex::new(script),
                 asks: Mutex::new(0),
+                result,
+                error: error.map(str::to_string),
             })
         }
     }
@@ -468,6 +524,8 @@ mod tests {
                 .flatten()?;
             let mut row = Task::goal_row(goal_id.to_string(), "a goal");
             row.status = step;
+            row.result = self.result.clone();
+            row.error = self.error.clone();
             Some(row)
         }
     }
@@ -637,6 +695,90 @@ mod tests {
         assert!(
             stream.next().await.is_none(),
             "and it ends right after saying so"
+        );
+    }
+
+    /// 终态那一帧把这次运行的结果带给调用方，中间帧不带。
+    ///
+    /// 流是进程外调用方唯一看得到这次运行的地方：只报「completed」而不带产物，
+    /// 它能知道的只有「跑完了」，不知道做成了什么——那正是这条端点在商用闭环里
+    /// 缺的那一半。反过来，中间帧带一个空数组会让「还没产出」与「没有产出」在
+    /// 客户端读成同一件事，所以只有终态带。
+    #[tokio::test]
+    async fn the_terminal_frame_carries_what_the_run_produced_and_the_earlier_ones_do_not() {
+        let reader = ScriptedReader::with_outcome(
+            vec![
+                Some(TaskStatus::Pending),
+                Some(TaskStatus::Running),
+                Some(TaskStatus::Completed),
+            ],
+            Some(json!({"answer": 42})),
+            None,
+        );
+        let mut stream = Box::pin(goal_stream(state_of(reader)));
+
+        let first = parse_frame(&stream.next().await.expect("a frame").expect("a frame"));
+        assert_eq!(
+            first["result"]["kind"],
+            json!("task"),
+            "the first frame is the row's snapshot; whatever the row holds is reported as it stands"
+        );
+
+        let second = parse_frame(&stream.next().await.expect("a frame").expect("a frame"));
+        assert_eq!(second["result"]["status"], json!("working"));
+        assert!(
+            second["result"].get("artifacts").is_none(),
+            "a status update before the end does not carry an artifact list: {second}"
+        );
+
+        let third = parse_frame(&stream.next().await.expect("a frame").expect("a frame"));
+        assert_eq!(third["result"]["status"], json!("completed"));
+        assert_eq!(
+            third["result"]["artifacts"][0]["name"],
+            json!("result"),
+            "the outcome travels in an artifact named as such: {third}"
+        );
+        assert_eq!(
+            third["result"]["artifacts"][0]["parts"][0]["text"],
+            json!("{\"answer\":42}"),
+            "the artifact carries the task's own result rather than a rendering of it"
+        );
+    }
+
+    /// 一行既没有结果也没有错误时，产物是空的——不是一件空产物。
+    ///
+    /// 空片段在客户端读起来与「跑完了但没有产出」一样，而那句话该由一个空列表
+    /// 说，不该由一件内容为空的产物说。
+    #[test]
+    fn a_row_with_neither_result_nor_error_has_no_artifact() {
+        let row = Task::goal_row(String::from("g-1"), "a goal");
+        assert!(artifacts_of(&row).is_empty());
+    }
+
+    /// 失败的那一次带的是失败原因，而且与结果分两件产物。
+    ///
+    /// 合成一件之后，读到的都是「有产物」——客户端分不出「跑完了但没有产出」与
+    /// 「没跑完」。
+    #[tokio::test]
+    async fn a_failed_run_reports_its_reason_apart_from_a_result() {
+        let reader = ScriptedReader::with_outcome(
+            vec![Some(TaskStatus::Running), Some(TaskStatus::Failed)],
+            None,
+            Some("upstream refused the request"),
+        );
+        let mut stream = Box::pin(goal_stream(state_of(reader)));
+
+        let _running = parse_frame(&stream.next().await.expect("a frame").expect("a frame"));
+        let failed = parse_frame(&stream.next().await.expect("a frame").expect("a frame"));
+        assert_eq!(failed["result"]["status"], json!("failed"));
+        assert_eq!(
+            failed["result"]["artifacts"][0]["name"],
+            json!("error"),
+            "a failure names itself instead of borrowing the result's artifact: {failed}"
+        );
+        assert_eq!(
+            failed["result"]["artifacts"][0]["parts"][0]["text"],
+            json!("upstream refused the request")
         );
     }
 }
