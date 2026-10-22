@@ -36,6 +36,9 @@ spec:
 ---
 # traefik 专用：WebSocket/帧头与安全响应头。nginx ingress 原生支持
 # WebSocket，无此 CRD，不输出（目标集群无 traefik CRD 时 apply 会报错）。
+# 不碰 X-Forwarded-Proto：这条路由的 entrypoint 是 web（明文），traefik 自己按
+# 实际连接写的才是真值；写死 https 会让应用把明文请求当成 TLS 终止过的，凡是按
+# 它拼绝对地址的面（A2A 名片的 `url`）都会给对端一个拨不到的地址。
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
@@ -43,8 +46,6 @@ metadata:
   namespace: {{ include "cogneva.namespace" . }}
 spec:
   headers:
-    customRequestHeaders:
-      X-Forwarded-Proto: "https"
     customResponseHeaders:
       X-Frame-Options: "SAMEORIGIN"
 {{- end }}

@@ -4,6 +4,10 @@
 # 只对 traefik 输出：nginx ingress 原生支持 WebSocket Upgrade，不需要这一层。
 # 目标集群没有 traefik CRD 时这条 apply 会报错，这是有意的——静默跳过会让引用它的
 # ingress 指向一个不存在的 middleware。
+#
+# 不碰 X-Forwarded-Proto：这条路由的 entrypoint 是 web（明文），traefik 自己按实际
+# 连接写的才是真值；写死 https 会让应用把明文请求当成 TLS 终止过的，凡是按它拼绝对
+# 地址的面（A2A 名片的 `url`）都会给对端一个拨不到的地址。
 
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
@@ -12,7 +16,5 @@ metadata:
   namespace: cogneva
 spec:
   headers:
-    customRequestHeaders:
-      X-Forwarded-Proto: "https"
     customResponseHeaders:
       X-Frame-Options: "SAMEORIGIN"
