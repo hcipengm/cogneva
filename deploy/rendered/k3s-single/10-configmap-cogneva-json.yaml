@@ -2856,6 +2856,24 @@ data:
               },
               "severity": "warning",
               "summary": "{value} inter-agent question(s) in the last hour were sent and never answered within the asker's wait. The send itself is not what failed: the instruction was published, the target may still be running it, and neither the delivered nor the undelivered counter moves for a wait that gave up -- so this is the only series a timed-out ask appears in. Read it with agent_inbox_undelivered_total on kind=prompt: a timeout beside failures is a target whose handler is rejecting the work, while a timeout with no failures is a target that is simply slower than its askers are willing to wait. The wait is bounded per call (two minutes by default, ten at most), so a floor that keeps rising means either the target's runs have grown longer than its askers' patience or one caller keeps asking a peer that cannot answer. Every outcome is written on every scrape, so a zero here is a measurement rather than a missing series; the ask carries no agent or task id because the stream name, not a label, is what correlates a question with its answer"
+            },
+            {
+              "name": "agent_inbox_orphans_hold_commands",
+              "promql": "sum(agent_inbox_orphaned_entries)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "{value} command(s) sit in inbox streams whose agent is no longer registered. Retirement removes an inbox only when it is empty, so these are never delivered and never deleted: no consumer holds that id any more, and the pass refuses to destroy work somebody was told had been queued. The stream count is the other half of the reading -- agent_inbox_orphaned_streams{state=\"holding\"} says how many queues are stranded, this one says how much work is in them. Ages are not in the reading; to find out how long a command has waited, read the stream itself, never the age of this series"
+            },
+            {
+              "name": "agent_inbox_orphan_reading_missing",
+              "promql": "absent_over_time(agent_inbox_orphaned_streams[1h])",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "No process has published the inbox orphan inventory for an hour. The retirement pass walks every ten minutes, so six walks have come and gone without a reading -- and a walk that never ran and a store with nothing stranded would otherwise look the same, which is exactly what these two series exist to tell apart. This fires after a rollout too, until the first walk lands; that window is the cost of publishing nothing before the first walk rather than a zero that nobody measured"
             }
           ]
         },

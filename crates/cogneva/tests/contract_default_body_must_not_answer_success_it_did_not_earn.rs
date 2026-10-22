@@ -54,6 +54,7 @@ const DECLARED_CAPABILITIES: &[&str] = &[
     "pending_stats",
     "dlq",
     "delay_publish",
+    "delete_stream",
 ];
 
 /// One method of the trait: its name, and its body when it has a default.
@@ -266,16 +267,59 @@ fn every_defaulted_body_calls_the_trait_it_defaults_for() {
     for method in &defaulted {
         let body = method.body.as_deref().unwrap_or_default();
         assert!(
-            body.contains("self."),
-            "`{}` has a default body that does not call the trait: {}. \
+            default_body_is_honest(body),
+            "`{}` has a default body that neither calls the trait nor refuses: {}. \
              A default answering a success shape on behalf of a backend that \
              never implemented the capability is a claim the backend cannot \
              support; either make the method required (as `ack`, `pending_stats` \
-             and `claim_pending` are) or give the default real work to do.",
+             and `claim_pending` are), give the default real work to do, or have \
+             it return the error that says this backend cannot.",
             method.name,
             body.trim()
         );
     }
+}
+
+/// The two shapes a default body may have, and nothing else.
+///
+/// Either it does the work through the trait (`self.`), or it **refuses**: it
+/// returns an error, which is the one answer that cannot be mistaken for
+/// delivery. A body that returns a success shape — `Ok(())`, an empty vector, a
+/// `None` — is what this gate exists to reject; the two accepted shapes are the
+/// only ones that say something true about a backend nobody asked.
+fn default_body_is_honest(body: &str) -> bool {
+    body.contains("self.") || (body.contains("Err(") && !body.contains("Ok("))
+}
+
+/// The predicate above is the gate's instrument, so its own reading is pinned
+/// against the four shapes that matter. Without this, widening the predicate
+/// once would quietly widen what the gate accepts: a `self.`-free body that
+/// returns `Ok(())` would pass as "contains Err(" only if nobody looked.
+#[test]
+fn the_default_body_predicate_splits_the_four_shapes() {
+    let delegates = "for payload in payloads { self.publish(subject, payload).await?; } Ok(())";
+    let refuses = "Err(SFError::Agent(format!(\"cannot delete {subject:?}\")))";
+    let claims_success = "Ok(())";
+    let empty = "";
+
+    assert!(default_body_is_honest(delegates), "delegation is honest");
+    assert!(
+        default_body_is_honest(refuses),
+        "an explicit refusal is honest"
+    );
+    assert!(
+        !default_body_is_honest(claims_success),
+        "a bare success shape is the one answer a default may not give"
+    );
+    assert!(!default_body_is_honest(empty), "an empty body says nothing");
+    assert!(
+        default_body_is_honest("Err(e)"),
+        "a bare refusal is the other accepted shape"
+    );
+    assert!(
+        !default_body_is_honest("if cached { return Ok(()); } Err(e)"),
+        "a refusal that also answers success somewhere in the body is not a refusal"
+    );
 }
 
 /// The parser is the gate's instrument, so its own reading is pinned: the three

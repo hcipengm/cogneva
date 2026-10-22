@@ -1092,6 +1092,17 @@ const PRODUCED: &[(&str, &str)] = &[
         "agent_inbox_ask_total",
         "crates/cog-agent/src/observable.rs",
     ),
+    // 退役清扫只删「无主且空」的 inbox。另一半——属主已经不在注册表、条目却
+    // 还在——永远不会被投递、也不会被删，而清扫的输出只报它删掉了多少：没人
+    // 计过它留下的。两族都出声：只数流分不出「一条搁浅的命令」与「一万条」。
+    (
+        "agent_inbox_orphaned_streams",
+        "crates/cog-storage/src/inbox_orphan_readings.rs",
+    ),
+    (
+        "agent_inbox_orphaned_entries",
+        "crates/cog-storage/src/inbox_orphan_readings.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.

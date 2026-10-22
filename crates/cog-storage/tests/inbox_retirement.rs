@@ -241,3 +241,49 @@ async fn a_stream_that_gained_a_command_after_the_scan_survives_the_delete() {
     );
     clear(&agent).await;
 }
+
+/// The half the pass refuses to remove is the half nobody could see.
+///
+/// An inbox whose agent is gone but which still holds commands is never
+/// delivered, never retired and — before this reading — never counted: the
+/// pass's output says only what it removed. The same walk that nominates the
+/// empty half must report this one with its length, and it must stay out of the
+/// retirement list, or the reading would turn into a delete.
+#[tokio::test]
+#[ignore = "needs a live Redis named by COGNEVA_TEST_REDIS_URL"]
+async fn the_inboxes_retirement_refuses_are_reported_with_what_they_hold() {
+    let agent = format!("{PROBE}-stranded");
+    key(&agent).await;
+    publish(&agent, "prompt").await;
+    publish(&agent, "continue").await;
+
+    let scan = pass().await.scan().await.expect("scan");
+    let stream = cog_core::agent_inbox_stream(&agent);
+
+    assert_eq!(
+        find(&scan.empty, &agent),
+        None,
+        "a stream holding commands is not a retirement candidate"
+    );
+    assert_eq!(
+        find(&scan.holding, &agent),
+        Some(2),
+        "and it is reported on the other half, with the number of commands it holds"
+    );
+    assert!(
+        scan.held_entries() >= 2,
+        "the entry count adds up what the per-stream lengths say: {}",
+        scan.held_entries()
+    );
+    assert!(
+        !pass()
+            .await
+            .orphaned_streams()
+            .await
+            .expect("scan")
+            .iter()
+            .any(|(k, _)| k == &stream),
+        "the retirement list is still exactly the empty half"
+    );
+    clear(&agent).await;
+}

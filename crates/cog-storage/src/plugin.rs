@@ -772,6 +772,10 @@ impl cog_core::SystemPlugin for StoragePlugin {
         let inbox_retirement = Arc::new(crate::inbox_retirement::InboxRetirement::new(
             redis_conn.clone(),
         ));
+        // What the pass refuses to remove is a reading too, and it is the half
+        // nobody had: an inbox whose agent is gone but which still holds entries
+        // is never delivered, never retired and — before this — never counted.
+        ctx.publish_observable(inbox_retirement.readings());
         let _inbox_retirement = inbox_retirement.spawn_retirement(
             ctx.consume::<cog_core::ShutdownSignal>()
                 .map(|s| (*s).clone())
