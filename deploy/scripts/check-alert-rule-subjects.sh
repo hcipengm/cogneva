@@ -366,7 +366,7 @@ NO_POD_REPORTER = {
     'CognevaTasksPublishersDisagree': 'tasks_publishers_agree',
     'CognevaRefusalRedispatchBroken': 'cogneva_refusal_redispatch_state',
     'CognevaPrincipleSlugNoLanding': 'principle_carriers_slug_no_landing',
-    'CognevaE2eRingFailed': 'e2e_ten_rings_failed',
+    'CognevaE2eRingFailed': 'e2e_ten_rings_failed_settled',
     'CognevaE2eRingUnread': 'e2e_ten_rings_unread',
     'CognevaE2eRingNoCheck': 'e2e_ten_rings_unchecked',
     'CognevaVerdictSeriesUnread': 'cogneva_verdict_series_unread',

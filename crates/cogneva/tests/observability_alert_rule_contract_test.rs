@@ -1395,8 +1395,8 @@ const FOREIGN: &[(&str, &str)] = &[
         "宿主读数 `scripts/host/cogneva-principle-census-reading.sh`（私有仓 brain）：载体在树上声明了「已落」，账本里却查不到对应落地行的 slug 条数。载体与账两处都不在公开仓，所以这一格只能作为外来读数登记",
     ),
     (
-        "e2e_ten_rings_failed",
-        "宿主读数 `scripts/host/cogneva-e2e-rings-reading.sh`（私有仓 brain）：十环里有判据而不 ok 的环数。单环序列 `e2e_ten_rings{ring=…}` 刻意不进规则——按脚本 HELP，那一格的 0 同时表示「判了没过」与「这一拍读不到」，一条判据读一个二义值等于把两种修法混成一种；读不到与缺判据各有自己的计数序列",
+        "e2e_ten_rings_failed_settled",
+        "宿主读数 `scripts/host/cogneva-e2e-rings-reading.sh`（私有仓 brain）：十环里有判据而不 ok、且不是构建或部署还在路上的环数（第 3、4、6 环不计）。规则不读同族的 `e2e_ten_rings_failed`，因为那个数在每次落地后的几分钟内必然大于 0——新版本还没构建出镜像、部署器还没滚到主线——给它立规则会从第一天常红，而「六小时什么都没落地」这条界另有一条规则持有。单环序列 `e2e_ten_rings{ring=…}` 同样刻意不进规则：按脚本 HELP，那一格的 0 同时表示「判了没过」与「这一拍读不到」，一条判据读一个二义值等于把两种修法混成一种；读不到与缺判据各有自己的计数序列",
     ),
     (
         "e2e_ten_rings_unread",

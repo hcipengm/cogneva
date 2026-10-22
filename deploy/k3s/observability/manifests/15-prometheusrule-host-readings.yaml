@@ -474,15 +474,19 @@ spec:
     # 的输入，有环没有判据要补判据；合成一条的话读告警的人只知道「链有问题」。
     - name: cogneva-e2e-rings
       rules:
-        # 有判据的环里，有环不 ok。今天实测就是红的（3 环），所以这条不是「先立着」。
+        # 有判据的环里，有环不是 ok，且不是「构建/部署还在路上」。读的是扣掉第 3、4、6 环
+        # 的那一格，不是 `e2e_ten_rings_failed`：第 3、4 环在每次落地后的几分钟内必然红
+        # （新版本还没构建出镜像、部署器还没滚到主线），给它们立 `> 0` 会从第一天常红，
+        # 而「六小时什么都没落地」这条界已经由 CognevaMainlineImageTooOld 持有。
+        # 扣掉之后剩下的红，才是链上真断了一段、不会自己好的那种。
         - alert: CognevaE2eRingFailed
-          expr: e2e_ten_rings_failed > 0
+          expr: e2e_ten_rings_failed_settled > 0
           for: 15m
           labels:
             severity: warning
           annotations:
-            summary: "端到端链有 {{ $value }} 环不是 ok"
-            description: "跑 `bash scripts/host/cogneva-e2e-rings-reading.sh`（不带参数）逐环印一行 `ring_N ok|fail|unread|no_check 原因`，断在第几环就修那一段。别只看整链的 `e2e_ten_rings_yes`：它只说「不是全通」，说不出断在哪；也别按单环的 `e2e_ten_rings{ring=…}` 判——那一格的 0 把「判了没过」与「读不到」写在同一个值里。"
+            summary: "端到端链有 {{ $value }} 环不是 ok，且不是还在等构建/部署"
+            description: "跑 `bash scripts/host/cogneva-e2e-rings-reading.sh`（不带参数）逐环印一行 `ring_N ok|fail|unread|no_check 原因`，断在第几环就修那一段。第 3、4、6 环在落地途中本来就会红（镜像还没构建、部署器还在滚、滚动到一半），那几环不计入这条告警，也说明它们此刻不是这条的成因。别只看整链的 `e2e_ten_rings_yes`：它只说「不是全通」，说不出断在哪；也别按单环的 `e2e_ten_rings{ring=…}` 判——那一格的 0 把「判了没过」与「读不到」写在同一个值里。"
 
         # 环的输入这一拍读不到。与上一条分开：上一条是「量到了、不合格」，这一条是
         # 「没量到」，前者去修链，后者去修那一环读的东西（镜像清单、集群、计数器）。
