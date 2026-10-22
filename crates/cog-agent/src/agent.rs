@@ -1178,17 +1178,35 @@ impl Agent {
             while let Some(result) = stream.next().await {
                 match result {
                     Ok((msg_id, bytes)) => {
+                        // The kind of the command this delivery runs, recorded
+                        // only after its ack lands. A command whose ack fails
+                        // stays in the pending list and will run again, so
+                        // counting it here would book a delivery that the queue
+                        // does not agree happened.
+                        let mut acked_kind: Option<&'static str> = None;
                         match serde_json::from_slice::<InboxMessage>(&bytes) {
                             Ok(msg) => {
+                                let kind = crate::observable::inbox_kind(&msg);
                                 if let Err(e) = handler(msg).await {
                                     // Leave pending: redelivery retries the handler.
+                                    // Counted for the same reason `AgentConsumer`
+                                    // counts it: the retry waits for the next start
+                                    // of this consumer, so the log line is gone long
+                                    // before anything acts on the failure.
+                                    crate::observable::global_observable()
+                                        .record_inbox_undelivered(kind);
                                     tracing::warn!(
                                         msg_id = %msg_id,
+                                        kind,
                                         "Inbox handler error, message kept pending: {}",
                                         e
                                     );
                                     continue;
                                 }
+                                // Counted only once the ack below lands: until then
+                                // the queue still holds the command and the next
+                                // consumer start runs it again.
+                                acked_kind = Some(kind);
                             }
                             Err(e) => {
                                 // Same poison path as in `consumer`: the bytes
@@ -1215,6 +1233,7 @@ impl Agent {
                                         "dead-letter write failed; this message's bytes are now lost: {dlq_err}"
                                     );
                                 }
+                                crate::observable::global_observable().record_inbox_poisoned();
                             }
                         }
                         if let Err(e) = backend
@@ -1222,6 +1241,8 @@ impl Agent {
                             .await
                         {
                             tracing::warn!(msg_id = %msg_id, "Failed to ack inbox message: {}", e);
+                        } else if let Some(kind) = acked_kind {
+                            crate::observable::global_observable().record_inbox_delivered(kind);
                         }
                     }
                     Err(e) => tracing::warn!("Stream error: {}", e),

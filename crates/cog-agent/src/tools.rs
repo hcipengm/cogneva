@@ -1722,7 +1722,10 @@ pub mod builtins {
     /// an agent id nobody holds writes a stream no consumer group will ever
     /// read, which is indistinguishable at this call site from a successful
     /// delivery and leaves a key behind for good. A miss is therefore an error
-    /// naming the id, and nothing is published.
+    /// naming the id, and nothing is published. Both miss forms are counted
+    /// under their own reason: the caller gets the error, but a producer that
+    /// keeps addressing agents nobody holds publishes nothing, so no queue
+    /// depth or lag reading anywhere would show it.
     ///
     /// Delivery is at-least-once — the target acks after running the command,
     /// and a target that dies mid-run sees it again — so the instruction has to
@@ -1810,16 +1813,25 @@ pub mod builtins {
                     match registry.get(agent_id).await {
                         Ok(Some(_)) => {}
                         Ok(None) => {
+                            // Counted, not only returned: the caller sees the
+                            // error, but a producer that keeps naming agents
+                            // nobody holds looks like a working one from every
+                            // other reading -- it publishes nothing, so there
+                            // is no queue depth anywhere to notice either.
+                            crate::observable::global_observable()
+                                .record_inbox_refused("no_live_agent");
                             return Err(SFError::Validation(format!(
                                 "no live agent named {agent_id:?}; a message to it would be \
                                  written to an inbox no process reads"
-                            )))
+                            )));
                         }
                         Err(e) => {
+                            crate::observable::global_observable()
+                                .record_inbox_refused("roster_unreadable");
                             return Err(SFError::Agent(format!(
                                 "cannot read the agent roster, so whether {agent_id:?} is live \
                                  is unknown: {e}"
-                            )))
+                            )));
                         }
                     }
 

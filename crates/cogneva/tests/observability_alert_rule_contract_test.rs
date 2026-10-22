@@ -1072,6 +1072,19 @@ const PRODUCED: &[(&str, &str)] = &[
     // the bound they would be read against is a policy nobody has stated. The
     // series is published and filed as a debt in UNREAD instead; it moves into
     // this table on the same pass its rule lands.
+    // 跨 agent 投递的两格。命令读完并 ack 与「handler 失败、留在 pending 等
+    // 那次重启」在队列里都是同一条条目，而队列的 lag 读数看不见 pending，
+    // 于是失败唯一留下的证据是那一行日志——它在一小时后早就滚掉了。两格都按
+    // `kind`（prompt/continue/abort/reset/steering 这个闭集）分支，每次抓取
+    // 把全部 kind 写一遍（含 0），好让规则的分母在第一条命令到达之前就存在。
+    (
+        "agent_inbox_undelivered_total",
+        "crates/cog-agent/src/observable.rs",
+    ),
+    (
+        "agent_inbox_poisoned_total",
+        "crates/cog-agent/src/observable.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.

@@ -74,3 +74,10 @@ runtime_asset_not_refreshed	cogneva_runtime_asset_state	error_only_state	Same ga
 # four families read back with three series each at 16:11 +0800. The rows are
 # deleted, not kept "just in case" -- a declared absence that is no longer true
 # is reported stale, and a registry of stale rows stops being a reading.
+
+# --- code_not_deployed (2 rules): the producer is newer than the running image --
+# Both series are written on every scrape from the first one, zeros included, so
+# these rows are expected to go stale -- not to stay -- on the rollout that
+# carries the commit. Delete them then, per the rule at the top of this file.
+agent_inbox_commands_stuck	agent_inbox_undelivered_total	code_not_deployed	Counted in crates/cog-agent/src/observable.rs from the commit that adds the inbox delivery counters; the live image predates it. The series exists as soon as that image serves its first scrape, so this is a rollout wait rather than a permanent absence.
+agent_inbox_payloads_poisoned	agent_inbox_poisoned_total	code_not_deployed	Same publisher and same rollout. The poisoned counter is written unconditionally rather than only on a bad payload, so it appears with the image too.

@@ -2829,6 +2829,24 @@ data:
               },
               "severity": "warning",
               "summary": "The disk on {node} is {value}% full -- past the 85% high watermark where the kubelet's image GC starts -- and the kubelet has run no space-driven collection in the last hour. The bars are the kubelet's defaults: it starts at 85% and stops at 80%, and this host's k3s config sets no image-gc arguments, so the defaults are what is in force. 80% is the bottom of the band, not the trigger -- an earlier version of this rule fired at 80% and asked for a collection before the runtime had any reason to start one. Only reason=\"space\" answers for this: reason=\"age\" collections are the timer and run regardless (380 over the seven days to 2026-10-22 here, none under space), so testing whether the kubelet had collected at all let the timer answer for the watermark path every window, and the rule could never speak. Both sides of the unless carry a node because the filesystem reading is relabeled from the pod's node name at scrape time; before that, max by (node) returned an empty label set and on(node) could not match anything. The disk reading is the node's root filesystem, which is where imagefs lives on this k3s (both are /); on a host with a separate imagefs this number is the wrong disk. If this fires, the disk is over the line and nothing is reclaiming: read the kubelet log for the image manager (an eviction that fails, a watermark set above the disk's reachable size), and treat the store as unbounded until a space collection shows up. image_store_bytes may be small while the disk is full -- the GC removes images, and what filled the disk may be a volume or a log"
+            },
+            {
+              "name": "agent_inbox_commands_stuck",
+              "promql": "sum(increase(agent_inbox_undelivered_total[1h]))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "Commands were handed to an agent inbox and are still pending after an hour: {value} of them in the last hour across every kind. A command whose handler fails is left unacknowledged on purpose, so the queue still holds it -- but a pending entry is not lag, and the retry only happens when that agent's consumer next starts. Nothing else in the platform moves on its own here: the sender was told its publish succeeded, the entry is invisible to every lag reading, and the run the sender was promised simply never happens. Read it together with agent_inbox_delivered_total on the same kind label: a kind with failures and no deliveries is a handler that cannot run at all, while one with both is a handler failing on some inputs. The label is the command kind (prompt, continue, abort, reset, steering), which is a closed set, not an agent or task id. A single spike is usually one bad command meeting a handler that rejects it; a floor that never returns to zero across windows means every retry is failing the same way and the agent needs a restart at least, a fix at most"
+            },
+            {
+              "name": "agent_inbox_payloads_poisoned",
+              "promql": "sum(increase(agent_inbox_poisoned_total[1h]))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "{value} inbox payload(s) in the last hour were not a command at all and went to the dead-letter queue. These are acked out by design -- the same bytes can never parse, so redelivery would fail identically forever -- which makes the dead-letter queue the only place they exist and this counter the only signal that a producer is writing the wrong shape. The sender is not a suspect by default: the published bytes are the wire form of the inbox command, so the usual causes are a producer built against a different version of that form and a writer that put something else on the stream entirely. Look at the dead-letter queue for the bytes, and at the counter's rise time against a deploy: a step at a rollout is a version mismatch, a steady trickle is a second writer on the same stream"
             }
           ]
         },

@@ -74,6 +74,65 @@ pub struct AgentObservable {
     /// busy agent that will not stop means the budget is smaller than a turn, an
     /// idle one means the read loop never looked at the signal.
     retire_timeout_total: Mutex<HashMap<(String, bool, bool), u64>>,
+    /// Inbox commands this process finished and acknowledged, keyed by kind.
+    ///
+    /// The delivery path had no reading at all: a command that ran and a
+    /// command that was written to a stream no consumer group reads left the
+    /// same evidence behind, which was a log line from the sender and nothing
+    /// else. This is the denominator that makes the two below readable as a
+    /// rate rather than as isolated events.
+    inbox_delivered_total: Mutex<HashMap<&'static str, u64>>,
+    /// Inbox commands whose handler failed and that were left pending for
+    /// retry, keyed by kind.
+    ///
+    /// A failed command is not redelivered until this consumer next starts, so
+    /// without a counter it is invisible until a restart: the sender saw its
+    /// publish succeed, the queue holds the message, and no run will happen.
+    inbox_undelivered_total: Mutex<HashMap<&'static str, u64>>,
+    /// Inbox payloads that were not a command at all and went to the
+    /// dead-letter queue.
+    ///
+    /// Counted apart from the failures because the repair is different: these
+    /// can never succeed on redelivery, which is why they are acked out.
+    inbox_poisoned_total: AtomicU64,
+    /// Sends the addressing tool refused before writing anything, keyed by the
+    /// reason it refused.
+    ///
+    /// The refusal is the correct behaviour, but a caller that keeps naming
+    /// agents nobody holds is a broken producer, and the sender's retry loop
+    /// looks the same as a working one from the outside.
+    inbox_refused_total: Mutex<HashMap<&'static str, u64>>,
+}
+
+/// Every kind of inbox command this build can execute.
+///
+/// The series are written for all of these on every scrape, not only for the
+/// ones that have been seen, so that a zero is a measurement rather than an
+/// absence. Kept as a list beside [`inbox_kind`] so a variant added to the wire
+/// form without a label here shows up as a compile error at the match below
+/// rather than as a command counted under nothing.
+const INBOX_KINDS: [&str; 5] = ["prompt", "continue", "abort", "reset", "steering"];
+
+/// The reasons the addressing tool refuses a send before it writes anything.
+///
+/// Closed for the same reason the kinds are: one of these means the caller
+/// named an agent nobody holds, the other means the roster itself could not be
+/// read, and they call for different repairs.
+const INBOX_REFUSAL_REASONS: [&str; 2] = ["no_live_agent", "roster_unreadable"];
+
+/// The label an inbox command is counted under.
+///
+/// A closed set rather than the wire tag read back out of the payload: the set
+/// of commands a build can execute is fixed by this enum, and a label taken
+/// from bytes would let a producer choose the cardinality of the series.
+pub(crate) fn inbox_kind(msg: &cog_core::InboxMessage) -> &'static str {
+    match msg {
+        cog_core::InboxMessage::Prompt { .. } => "prompt",
+        cog_core::InboxMessage::Continue { .. } => "continue",
+        cog_core::InboxMessage::Abort => "abort",
+        cog_core::InboxMessage::Reset => "reset",
+        cog_core::InboxMessage::Steering { .. } => "steering",
+    }
 }
 
 /// The label a role's lifetime class is published under.
@@ -259,6 +318,38 @@ impl AgentObservable {
                 .entry((role.to_string(), task_scoped, report.was_busy))
                 .or_insert(0) += 1;
         }
+    }
+
+    /// Record one inbox command this process ran and acknowledged.
+    pub fn record_inbox_delivered(&self, kind: &'static str) {
+        let mut counts = self
+            .inbox_delivered_total
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *counts.entry(kind).or_insert(0) += 1;
+    }
+
+    /// Record one inbox command whose handler failed, left pending for retry.
+    pub fn record_inbox_undelivered(&self, kind: &'static str) {
+        let mut counts = self
+            .inbox_undelivered_total
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *counts.entry(kind).or_insert(0) += 1;
+    }
+
+    /// Record one inbox payload that was not a command and went to the DLQ.
+    pub fn record_inbox_poisoned(&self) {
+        self.inbox_poisoned_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a send the addressing tool refused, by the reason it gave.
+    pub fn record_inbox_refused(&self, reason: &'static str) {
+        let mut counts = self
+            .inbox_refused_total
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *counts.entry(reason).or_insert(0) += 1;
     }
 
     /// Record a high-level agent run (called by AgentRuntime::run).
@@ -517,6 +608,63 @@ impl Observable for AgentObservable {
                         .with_label("role", role)
                         .with_label("lifetime", lifetime_label(*task_scoped))
                         .with_label("state", if *was_busy { "busy" } else { "idle" }),
+                );
+            }
+        }
+
+        // Inter-agent delivery. Printed as a matching pair of counters over the
+        // same label set, because either alone can be read as healthy: a
+        // process that delivered nothing because nothing was sent and one that
+        // delivered nothing because every command failed both leave no
+        // `undelivered` series behind, and only the delivered counter beside it
+        // says which one happened.
+        {
+            let delivered = self
+                .inbox_delivered_total
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let undelivered = self
+                .inbox_undelivered_total
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Every kind is written, including the ones this process has never
+            // seen. A counter left out until its first event makes "no command
+            // of this kind has failed" and "this build cannot name this kind"
+            // the same absent series, and an alert written over the pair needs
+            // the denominator to exist before the first command arrives.
+            for kind in INBOX_KINDS {
+                metrics.push(
+                    RawMetric::new(
+                        "agent_inbox_delivered_total",
+                        delivered.get(kind).copied().unwrap_or(0) as f64,
+                    )
+                    .with_label("kind", kind),
+                );
+                metrics.push(
+                    RawMetric::new(
+                        "agent_inbox_undelivered_total",
+                        undelivered.get(kind).copied().unwrap_or(0) as f64,
+                    )
+                    .with_label("kind", kind),
+                );
+            }
+        }
+        metrics.push(RawMetric::new(
+            "agent_inbox_poisoned_total",
+            self.inbox_poisoned_total.load(Ordering::Relaxed) as f64,
+        ));
+        {
+            let refused = self
+                .inbox_refused_total
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for reason in INBOX_REFUSAL_REASONS {
+                metrics.push(
+                    RawMetric::new(
+                        "agent_inbox_refused_total",
+                        refused.get(reason).copied().unwrap_or(0) as f64,
+                    )
+                    .with_label("reason", reason),
                 );
             }
         }
@@ -1016,6 +1164,10 @@ mod tests {
             vec![
                 "agent_budget_exhausted_count",
                 "agent_guardrail_refused_runs",
+                "agent_inbox_delivered_total",
+                "agent_inbox_poisoned_total",
+                "agent_inbox_refused_total",
+                "agent_inbox_undelivered_total",
                 "agent_iteration_budget_exhausted",
                 "agent_iteration_budget_exhausted_no_deliverable",
                 "agent_run_count",
@@ -1031,5 +1183,100 @@ mod tests {
     #[test]
     fn no_dimension_is_declared_because_the_readings_do_not_vary_by_one() {
         assert!(AgentObservable::new().available_dimensions().is_empty());
+    }
+
+    /// A failed command stays pending until this consumer next starts, so the
+    /// only evidence that outlives the log window is the counter. Delivered and
+    /// undelivered are read together: either alone reads as healthy.
+    #[tokio::test]
+    async fn an_inbox_failure_is_counted_not_only_logged() {
+        let o = AgentObservable::new();
+        o.record_inbox_delivered("prompt");
+        o.record_inbox_delivered("prompt");
+        o.record_inbox_undelivered("steering");
+        o.record_inbox_poisoned();
+        o.record_inbox_refused("no_live_agent");
+
+        let metrics = o.collect_metrics("").await.expect("collect_metrics");
+        let labelled = |name: &str, key: &str, value: &str| {
+            metrics
+                .iter()
+                .find(|m| m.name == name && m.labels.get(key).map(String::as_str) == Some(value))
+                .map(|m| m.value)
+        };
+        assert_eq!(
+            labelled("agent_inbox_delivered_total", "kind", "prompt"),
+            Some(2.0)
+        );
+        assert_eq!(
+            labelled("agent_inbox_undelivered_total", "kind", "steering"),
+            Some(1.0)
+        );
+        assert_eq!(
+            labelled("agent_inbox_refused_total", "reason", "no_live_agent"),
+            Some(1.0)
+        );
+        assert_eq!(
+            metrics
+                .iter()
+                .find(|m| m.name == "agent_inbox_poisoned_total")
+                .map(|m| m.value),
+            Some(1.0)
+        );
+    }
+
+    /// A kind with no traffic is written as zero rather than left out, so the
+    /// pair exists before the first command and a rate can be computed without
+    /// waiting for the denominator to be born.
+    #[tokio::test]
+    async fn every_kind_is_written_even_before_any_command_arrives() {
+        let o = AgentObservable::new();
+        let metrics = o.collect_metrics("").await.expect("collect_metrics");
+        for name in [
+            "agent_inbox_delivered_total",
+            "agent_inbox_undelivered_total",
+        ] {
+            for kind in INBOX_KINDS {
+                let found = metrics.iter().find(|m| {
+                    m.name == name && m.labels.get("kind").map(String::as_str) == Some(kind)
+                });
+                assert_eq!(found.map(|m| m.value), Some(0.0), "{name} kind={kind}");
+            }
+        }
+        for reason in INBOX_REFUSAL_REASONS {
+            let found = metrics.iter().find(|m| {
+                m.name == "agent_inbox_refused_total"
+                    && m.labels.get("reason").map(String::as_str) == Some(reason)
+            });
+            assert_eq!(found.map(|m| m.value), Some(0.0), "reason={reason}");
+        }
+    }
+
+    /// The label list is a second spelling of the wire form, and a variant
+    /// added to the enum without a label here would be counted under nothing:
+    /// the scrape loop walks `INBOX_KINDS`, so the missing kind would simply
+    /// never be printed and its commands would vanish from the reading.
+    #[test]
+    fn the_label_list_covers_every_command_the_wire_form_can_carry() {
+        let every = [
+            cog_core::InboxMessage::Prompt {
+                goal: serde_json::Value::Null,
+                reply_stream: None,
+            },
+            cog_core::InboxMessage::Continue {
+                instruction: String::new(),
+            },
+            cog_core::InboxMessage::Abort,
+            cog_core::InboxMessage::Reset,
+            cog_core::InboxMessage::Steering {
+                instruction: String::new(),
+            },
+        ];
+        let mut kinds: Vec<&'static str> = every.iter().map(inbox_kind).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        let mut listed = INBOX_KINDS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(kinds, listed);
     }
 }

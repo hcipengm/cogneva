@@ -179,17 +179,21 @@ impl AgentConsumer {
                     {
                         tracing::warn!(msg_id = %msg_id, "Failed to ack poison inbox message: {e}");
                     }
+                    crate::observable::global_observable().record_inbox_poisoned();
                     return;
                 }
             };
+        let kind = crate::observable::inbox_kind(&message);
         if let Err(e) = handler(message).await {
             // Left pending on purpose: the handler did not finish, so acking
-            // would record a run that never happened. The log line is what
-            // makes the failure visible now, since the retry waits for the next
-            // start of this consumer.
+            // would record a run that never happened. The retry waits for the
+            // next start of this consumer, so the counter -- not the log line
+            // -- is what an operator can still see an hour later.
+            crate::observable::global_observable().record_inbox_undelivered(kind);
             tracing::warn!(
                 agent_id = %self.agent_id,
                 msg_id = %msg_id,
+                kind,
                 error = %e,
                 "Inbox command failed; the message stays pending for retry"
             );
@@ -201,7 +205,9 @@ impl AgentConsumer {
             .await
         {
             tracing::warn!(msg_id = %msg_id, "Failed to ack inbox message: {e}");
+            return;
         }
+        crate::observable::global_observable().record_inbox_delivered(kind);
     }
 
     /// Send a message to another agent's inbox.
