@@ -1533,6 +1533,125 @@ async fn the_face_census_reads_a_number_for_the_age_and_three_buckets_that_add_u
     cleanup(&pool, &marker).await;
 }
 
+/// A landing's parent reading is written once, survives a re-check, and a
+/// landing that has none is handed back with the revision it landed at.
+///
+/// All three are promises the statement makes and nothing without a server can
+/// check: "first one wins" is the `COALESCE` in the conflict clause, "survives a
+/// re-check" is that clause under a second measurement, and "the revision it
+/// landed at" is the event log's first transition rather than the row's
+/// `measured_rev`, which a re-check has moved.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_landings_parent_reading_is_written_once_and_the_backfill_answers_with_its_own_revision()
+{
+    let (store, pool, marker) = store().await;
+    let answered = identity(&marker, "arrived");
+    let owed = identity(&marker, "recorded");
+
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(answered.clone(), ChangeState::Landed)
+                .at_revision("probe-rev-1")
+                .with_parent_observation("absent"),
+        )
+        .await
+        .expect("write a landing that brought its artifact");
+    // A later pass re-checks the same row at a moved revision and finds it
+    // already there. The landing's own reading must not follow the tree.
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(answered.clone(), ChangeState::Landed)
+                .at_revision("probe-rev-2")
+                .with_parent_observation("satisfied"),
+        )
+        .await
+        .expect("re-check the landing");
+
+    let reading: Option<String> = sqlx::query_scalar(
+        "SELECT parent_observation FROM change_ledger \
+         WHERE kind = $1 AND scope = $2 AND literal = $3",
+    )
+    .bind(&answered.kind)
+    .bind(&answered.scope)
+    .bind(&answered.literal)
+    .fetch_one(&pool)
+    .await
+    .expect("read the parent reading back");
+    assert_eq!(
+        reading.as_deref(),
+        Some("absent"),
+        "the first landing's reading is the fact; a re-check at a later revision \
+         must not rewrite it into 'already there'"
+    );
+
+    // A landing written without the column, as every row before it existed was,
+    // is handed back with the revision of its first transition into `landed`.
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(owed.clone(), ChangeState::Landed).at_revision("probe-rev-1"),
+        )
+        .await
+        .expect("write a landing with no parent reading");
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(owed.clone(), ChangeState::Landed).at_revision("probe-rev-2"),
+        )
+        .await
+        .expect("re-check it");
+
+    let pending = store
+        .landed_awaiting_parent_observation(100_000)
+        .await
+        .expect("read the landings without a parent reading");
+    let found = pending
+        .iter()
+        .find(|(identity, _)| identity == &owed)
+        .map(|(_, rev)| rev.as_str());
+    assert_eq!(
+        found,
+        Some("probe-rev-1"),
+        "the backfill must ask the tree at the landing's revision, not at the one \
+         the re-check moved measured_rev to"
+    );
+    assert!(
+        !pending.iter().any(|(identity, _)| identity == &answered),
+        "a landing that already has a reading is not backfilled again"
+    );
+
+    assert!(
+        store
+            .record_parent_observation(&owed, "satisfied")
+            .await
+            .expect("record a parent reading"),
+        "a landing with no reading takes one"
+    );
+    assert!(
+        !store
+            .record_parent_observation(&owed, "absent")
+            .await
+            .expect("record a second parent reading"),
+        "a landing that has a reading is not written again"
+    );
+    let reading: Option<String> = sqlx::query_scalar(
+        "SELECT parent_observation FROM change_ledger \
+         WHERE kind = $1 AND scope = $2 AND literal = $3",
+    )
+    .bind(&owed.kind)
+    .bind(&owed.scope)
+    .bind(&owed.literal)
+    .fetch_one(&pool)
+    .await
+    .expect("read the second row back");
+    assert_eq!(
+        reading.as_deref(),
+        Some("satisfied"),
+        "the second write must be refused, not applied"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
 async fn cleanup(pool: &PgPool, marker: &str) {
     // One transaction, and the closure lock first: the deletes below are what a
     // neighbour's two reads of the whole-account closure must not see half of,

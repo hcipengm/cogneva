@@ -1020,6 +1020,43 @@ pub trait ChangeLedgerStore: Send + Sync {
         limit: usize,
     ) -> SFResult<Vec<ChangeLedgerRow>>;
 
+    /// Landed rows that carry no parent reading, with the revision each one
+    /// landed at, oldest landing first.
+    ///
+    /// The column was added after the rows were, and a re-check cannot fill it:
+    /// [`Self::landed_due`] asks about today's parent, and answering "already
+    /// there" for a row that landed weeks ago is exactly the reading the column
+    /// exists to tell apart from a real arrival. The landing's own revision is
+    /// a fact the account holds twice over -- as the row's `measured_rev` until
+    /// a re-check moves it, and as the first transition into `landed` in the
+    /// event log, which never moves. The event log is what this read answers
+    /// with, so a row that has been re-checked still gets its own landing.
+    ///
+    /// The pair is the identity and that revision; the row is not returned
+    /// because the only thing the caller can do with it is ask the tree at that
+    /// revision, and a whole row would invite it to write one back.
+    ///
+    /// A one-off repair rather than a reading, and it says so by emptying: a
+    /// caller that keeps finding rows here has a landing that writes no parent
+    /// reading, which is the state to fix.
+    async fn landed_awaiting_parent_observation(
+        &self,
+        limit: usize,
+    ) -> SFResult<Vec<(ChangeIdentity, String)>>;
+
+    /// Write the parent reading on a row that has none, returning whether this
+    /// call wrote it.
+    ///
+    /// Never overwrites: the first landing's reading is the fact, and a backfill
+    /// that could replace it would make the column say whatever ran last. A row
+    /// that already has one returns false -- not an error, because the caller's
+    /// work is done either way.
+    async fn record_parent_observation(
+        &self,
+        identity: &ChangeIdentity,
+        observation: &str,
+    ) -> SFResult<bool>;
+
     /// Record that a row the account called done no longer holds.
     ///
     /// What this keeps is what the next write destroys. Moving a row out of

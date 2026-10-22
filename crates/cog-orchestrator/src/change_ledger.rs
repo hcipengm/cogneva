@@ -210,6 +210,15 @@ const MEASUREMENTS_PER_PASS: usize = 200;
 /// not fit rather than their freshness.
 const TOUCHED_PER_PASS: usize = MEASUREMENTS_PER_PASS;
 
+/// How many existing landings one pass fills a parent reading for.
+///
+/// A repair, not a reading: the column arrived after the rows did, and this is
+/// what empties the set of rows that predate it. Every row it takes costs two
+/// git calls at a revision from the history, so it is bounded like the batches
+/// above; unlike them it does not rotate forever -- a row it writes leaves the
+/// set, so the bound is the length of a one-off sweep.
+const PARENT_BACKFILL_PER_PASS: usize = 50;
+
 /// How many retired rows one pass asks whether their surface came back.
 ///
 /// This bound is of a different kind from the batches above, and the difference
@@ -2193,6 +2202,11 @@ async fn measure_pass(
     }
 
     let reopened_pass = reopen_pass(store, tree, &snapshot, unsettled, changed).await;
+    // After the measurement and the landed re-check, because the rows it fills
+    // are the ones neither of them writes a parent reading for: they landed
+    // before the column existed, and a row that lands this pass arrives with one.
+    let parent_backfilled =
+        backfill_parent_observations(store, tree, PARENT_BACKFILL_PER_PASS).await;
 
     info!(
         measured = considered,
@@ -2223,6 +2237,7 @@ async fn measure_pass(
         // with nothing.
         landed_unsettleable = %reason_summary(&reopened_pass.unsettleable),
         landed_held = reopened_pass.held,
+        parent_backfilled,
         changed_paths = changed.len(),
         unsettled = %reason_summary(&by_reason),
         already_unsettled = known_unsettled,
@@ -2295,6 +2310,75 @@ struct ReopenPass {
 /// or spent its batch walking into rows that answer nothing, and a landed row
 /// that cannot be settled keeps its `measured_at` -- so it sits at the head of
 /// the staleness order forever while every other reading says the set is fresh.
+/// Fill the parent reading on landings that predate the column.
+///
+/// The reading answers "did this landing bring the artifact, or was it here
+/// already", and it can only be taken at the landing's own revision: a re-check
+/// asks today's parent, and for a row that landed days ago the answer is always
+/// "already there". The revision comes from the account's event log, which
+/// records the revision of every transition into `landed` -- including the ones
+/// a later re-check has moved `measured_rev` past. Rows with no such event
+/// landed before the log existed and are left alone; they read `unmeasured`,
+/// which is what they are.
+///
+/// A revision this repository does not carry is written as `unreadable` rather
+/// than retried forever: it is the same answer the measurement gives when no
+/// parent can be asked, and leaving the row out of the set would make an
+/// unreadable history look like a landing nobody has looked at.
+///
+/// Returns how many rows were written, so the pass reads as progress; a sweep
+/// that keeps returning zero while rows remain is the failure this number is
+/// for.
+async fn backfill_parent_observations(
+    store: &dyn ChangeLedgerStore,
+    tree: &CheckTree,
+    limit: usize,
+) -> usize {
+    let pending = match store.landed_awaiting_parent_observation(limit).await {
+        Ok(pending) => pending,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the landings that predate the parent reading could not be read, \
+                 so none was filled this pass"
+            );
+            return 0;
+        }
+    };
+    let mut written = 0usize;
+    for (identity, rev) in pending {
+        let observation = match tree.snapshot_at(&rev).await {
+            Ok(landed_at) => tree.parent_observation(&landed_at, &identity).await,
+            Err(why) => {
+                // Named rather than counted: a shallow clone and a landing whose
+                // revision was rewritten look the same from here, and only one
+                // of them is a history the repository can still be asked about.
+                warn!(
+                    change = %identity,
+                    revision = %rev,
+                    why = %why,
+                    "change ledger: this landing's revision is not in the tree, so its parent \
+                     reading is recorded as unreadable"
+                );
+                "unreadable".to_string()
+            }
+        };
+        match store
+            .record_parent_observation(&identity, &observation)
+            .await
+        {
+            Ok(true) => written += 1,
+            Ok(false) => {}
+            Err(e) => warn!(
+                change = %identity,
+                error = %e,
+                "change ledger: the parent reading could not be written for this landing"
+            ),
+        }
+    }
+    written
+}
+
 async fn reopen_pass(
     store: &dyn ChangeLedgerStore,
     tree: &CheckTree,
@@ -2632,7 +2716,13 @@ async fn reopen_pass(
                     .as_str(),
             )
             .at_revision(snapshot.rev()),
-            _ if state == ChangeState::Landed => {
+            // Only on the way in, never on a re-check: this pass also re-asks rows
+            // that are already landed, and the parent of *this* revision says
+            // nothing about the landing that first satisfied them -- it would
+            // answer "already there" for every old row, which is the one reading
+            // the column exists to tell apart from a real arrival. A row that was
+            // already landed keeps whatever reading it first got.
+            _ if state == ChangeState::Landed && row.state != ChangeState::Landed => {
                 ChangeMeasurement::new(row.identity.clone(), state)
                     .at_revision(snapshot.rev())
                     .with_parent_observation(tree.parent_observation(snapshot, &row.identity).await)
@@ -5362,6 +5452,95 @@ mod tests {
         dir
     }
 
+    /// A landing that predates the parent reading gets one at the revision it
+    /// landed at, not at today's.
+    ///
+    /// The distinction is the whole point of the column: asked at today's parent,
+    /// a row that landed days ago answers "already there" every time, and the
+    /// count of landings a pipeline reports would say it built nothing. The
+    /// revision comes from the account's event log, which the fake stands in for
+    /// with the row's own `measured_rev`; the tree is real, so the two answers
+    /// are the tree's.
+    #[tokio::test]
+    async fn a_landing_from_before_the_column_gets_its_parent_read_at_its_own_revision() {
+        let dir = repo_holding(&[("crates/a/src/lib.rs", "pub fn a() {}\n")]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let work = dir.path().join("work");
+        std::fs::write(
+            work.join("crates/a/src/lib.rs"),
+            "pub fn a() {}\npub fn b() {}\n",
+        )
+        .expect("the second revision's file");
+        let bare = dir.path().join("bare");
+        let bare_s = bare.to_str().expect("a spellable path");
+        let work_s = work.to_str().expect("a spellable path");
+        for args in [
+            vec!["--git-dir", bare_s, "--work-tree", work_s, "add", "--all"],
+            vec![
+                "--git-dir",
+                bare_s,
+                "--work-tree",
+                work_s,
+                "commit",
+                "-q",
+                "-m",
+                "second",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .output()
+                .expect("git on the test host");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let landed_rev = tree.rev().await.expect("the second head resolves");
+
+        let brought = ChangeIdentity::new(GREP_KIND, "crates/a/src/lib.rs", "pub fn b()");
+        let already = ChangeIdentity::new(GREP_KIND, "crates/a/src/lib.rs", "pub fn a()");
+        let landed = |identity: ChangeIdentity| ChangeLedgerRow {
+            identity,
+            measured_rev: Some(landed_rev.clone()),
+            ..row(ChangeState::Landed, Some(1_760_000_100))
+        };
+        let store = FakeLedger {
+            rows: vec![landed(brought.clone()), landed(already.clone())],
+            ..Default::default()
+        };
+
+        let written = backfill_parent_observations(&store, &tree, 10).await;
+        assert_eq!(written, 2, "both landings are filled in one pass");
+        let observations = store.parent_observations();
+        assert_eq!(
+            observations
+                .iter()
+                .find(|(identity, _)| identity == &brought)
+                .map(|(_, reading)| reading.as_str()),
+            Some("absent"),
+            "the parent does not hold this literal, so this landing brought it"
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .find(|(identity, _)| identity == &already)
+                .map(|(_, reading)| reading.as_str()),
+            Some("satisfied"),
+            "the parent already held this literal, so the landing recorded it"
+        );
+
+        // A second sweep writes nothing: the row has left the set of landings
+        // without a reading, and rewriting it would let a later pass speak for a
+        // landing it did not see.
+        assert_eq!(
+            backfill_parent_observations(&store, &tree, 10).await,
+            0,
+            "a landing that already has a reading is not written again"
+        );
+    }
+
     /// A gate outside the sources is found where it is declared, not where the
     /// account has always looked.
     ///
@@ -6158,11 +6337,16 @@ mod tests {
         measured: std::sync::Mutex<Vec<ChangeMeasurement>>,
         delivered: std::sync::Mutex<Vec<(ChangeIdentity, String)>>,
         reopened: std::sync::Mutex<Vec<ChangeReopen>>,
+        parent_observations: std::sync::Mutex<Vec<(ChangeIdentity, String)>>,
     }
 
     impl FakeLedger {
         fn written(&self) -> Vec<DispatchState> {
             self.written.lock().unwrap().clone()
+        }
+
+        fn parent_observations(&self) -> Vec<(ChangeIdentity, String)> {
+            self.parent_observations.lock().unwrap().clone()
         }
 
         fn deliveries(&self) -> Vec<(ChangeIdentity, String)> {
@@ -6270,6 +6454,44 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn landed_awaiting_parent_observation(
+            &self,
+            limit: usize,
+        ) -> SFResult<Vec<(ChangeIdentity, String)>> {
+            // The fake has no event log, so a landed row that carries a revision
+            // is the one this stand-in can offer; the real read answers from the
+            // first transition into `landed` instead.
+            Ok(self
+                .rows
+                .iter()
+                .filter(|row| row.state == ChangeState::Landed && row.measured_rev.is_some())
+                .take(limit)
+                .map(|row| {
+                    (
+                        row.identity.clone(),
+                        row.measured_rev.clone().unwrap_or_default(),
+                    )
+                })
+                .collect())
+        }
+
+        async fn record_parent_observation(
+            &self,
+            identity: &ChangeIdentity,
+            observation: &str,
+        ) -> SFResult<bool> {
+            // The "first one wins" rule the database enforces is repeated here so
+            // a test can see a second write refused rather than trusting the
+            // SQL: a backfill that overwrote a landing's reading would make the
+            // column say whatever ran last.
+            let mut written = self.parent_observations.lock().unwrap();
+            if written.iter().any(|(known, _)| known == identity) {
+                return Ok(false);
+            }
+            written.push((identity.clone(), observation.to_string()));
+            Ok(true)
+        }
+
         async fn retired_surface_moved(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
             Ok(self
                 .rows

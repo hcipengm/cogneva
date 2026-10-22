@@ -1036,6 +1036,75 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         )
     }
 
+    async fn landed_awaiting_parent_observation(
+        &self,
+        limit: usize,
+    ) -> SFResult<Vec<(ChangeIdentity, String)>> {
+        // The revision asked for is the *first* transition into `landed`, not
+        // the row's `measured_rev`: a landed row is re-checked on a timer, and
+        // the re-check moves `measured_rev` to today's revision while the event
+        // log keeps the landing. The event is also the only record of a landing
+        // that survives a reopen and a second landing under the same identity.
+        //
+        // Rows with no such event are not returned at all: their landing
+        // predates the event log, and `measured_rev` is the only revision they
+        // carry, which after any re-check is a revision their check was *not*
+        // done at. Those rows stay `unmeasured`, which is the truth about them.
+        let rows = sqlx::query(
+            "SELECT c.kind, c.scope, c.literal, l.measured_rev \
+             FROM change_ledger c \
+             JOIN LATERAL ( \
+                 SELECT e.measured_rev FROM change_ledger_event e \
+                 WHERE e.kind = c.kind AND e.scope = c.scope AND e.literal = c.literal \
+                   AND e.to_state = 'landed' AND e.measured_rev IS NOT NULL \
+                 ORDER BY e.observed_at ASC, e.id ASC LIMIT 1 \
+             ) l ON TRUE \
+             WHERE c.state = 'landed' AND c.parent_observation IS NULL \
+             ORDER BY c.measured_at ASC NULLS FIRST, c.first_seen_at ASC \
+             LIMIT $1",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    ChangeIdentity::new(
+                        row.try_get::<String, _>("kind")
+                            .map_err(|e| SFError::Database(format!("kind: {e}")))?,
+                        row.try_get::<String, _>("scope")
+                            .map_err(|e| SFError::Database(format!("scope: {e}")))?,
+                        row.try_get::<String, _>("literal")
+                            .map_err(|e| SFError::Database(format!("literal: {e}")))?,
+                    ),
+                    row.try_get::<String, _>("measured_rev")
+                        .map_err(|e| SFError::Database(format!("measured_rev: {e}")))?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn record_parent_observation(
+        &self,
+        identity: &ChangeIdentity,
+        observation: &str,
+    ) -> SFResult<bool> {
+        let result = sqlx::query(
+            "UPDATE change_ledger SET parent_observation = $4 \
+             WHERE kind = $1 AND scope = $2 AND literal = $3 \
+               AND parent_observation IS NULL",
+        )
+        .bind(&identity.kind)
+        .bind(&identity.scope)
+        .bind(&identity.literal)
+        .bind(observation)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn retired_surface_moved(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
         // The only read that can reach a retired row, and it exists because a
         // retirement is about the history while the row's truth is about the

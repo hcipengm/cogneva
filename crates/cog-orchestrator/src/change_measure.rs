@@ -492,6 +492,37 @@ impl CheckTree {
         Ok(Snapshot { rev, top_level })
     }
 
+    /// The same reading as [`Self::snapshot`], of a revision the caller names
+    /// rather than of the reference this tree tracks.
+    ///
+    /// A row's parent reading is about the revision the row landed at, which is
+    /// history: the reference has moved past it, and a pass that read the
+    /// landing's own revision through that reference would ask today's question
+    /// of every row and call the answer old. The revision has to exist in this
+    /// repository; one it does not carry is the caller's to report, not to
+    /// substitute.
+    pub async fn snapshot_at(&self, rev: &str) -> Result<Snapshot, String> {
+        let listing = self
+            .git(&["ls-tree", "--name-only", rev])
+            .await
+            .map_err(|e| {
+                format!(
+                    "the root of {}:{rev} could not be listed, so no check can answer for it: {e}",
+                    self.repo.display()
+                )
+            })?;
+        let top_level = listing
+            .lines()
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect();
+        Ok(Snapshot {
+            rev: rev.to_string(),
+            top_level,
+        })
+    }
+
     /// The paths that differ between two revisions, as the tree spells them.
     ///
     /// This is what lets a landed row be asked again because the bytes its check
