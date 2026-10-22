@@ -8,6 +8,7 @@
 //! principle: feedback_an_aggregate_over_a_series_family_can_starve_while_every_element_has_a_reader
 //! principle: feedback_an_alarm_moved_off_a_published_series_orphans_it_and_costs_a_census_entry
 //! principle: feedback_an_absence_question_needs_a_window_not_an_instant
+//! principle: feedback_a_companion_clock_only_moves_if_the_writer_advances_it
 //! principle: feedback_a_transient_that_hits_every_subject_at_once_is_one_event_not_n
 //!
 //! Every PromQL expression in the deployed alert rules reads series by name.
