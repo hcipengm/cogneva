@@ -1323,16 +1323,16 @@ const FOREIGN: &[(&str, &str)] = &[
         "同上（`ok`/`unreadable`/`empty` 三态互不重叠）。读不到（账本或卷问不出来）与没有包（账本没有 ok 行、或账本点名的文件不在卷上）修法相反，所以各有一条规则；聚合器那条 `host_reading_producer_up` 另管「这一拍根本没跑成」",
     ),
     (
-        "disk_trend_days_to_trigger",
-        "宿主生产者 `scripts/host/cogneva-host-disk-trend-reading.sh`（不在本仓），由聚合器按 `scripts/data/host-readings.tsv` 每拍拉起，经 `job=\"cogneva-host-readings\"` 印出。值说的是「按整窗拟合的斜率，根盘还有几天到构建缓存刹车的触发线」——而这条线**只能在宿主上算**：刹车（`deploy/scripts/host-target-gc.sh`）判的是 `df` 的 Use%，分母是 used+avail、不含 root 保留块，而 node-exporter 的 `1 − avail/size` 分母含保留块。两把尺子差的就是保留块在 size 里的份额（随文件系统类型与 `tune2fs -m` 的设定而变，不是常数），所以按 size 解出来的触发线离刹车真正动手的位置有多远，每台机器都不一样；在 PromQL 里重算就得先选一把尺子去逼近另一把，选错时这个差会原样变成提前量上的误差。规则只读宿主已经算好的天数，不做第二把尺子",
-    ),
-    (
         "disk_trend_trigger_line_readable",
         "同一生产者（触发线落不落得下来：1 落下了、0 没落下）。缺 `node_filesystem_free_bytes` 时保留块量不出来，触发线就落不到刹车那把尺子上，此时 `disk_trend_days_to_trigger` 整条缺席——「读不出来」与「还有很久」在规则里是同一个空集，这一格存在的唯一目的就是把它们分开。整条生产者死掉不在射程内，那由 `host_reading_producer_up` 按 producer 名报",
     ),
     (
-        "disk_trend_days_to_full_recent",
-        "同一生产者，但只用**最近 24 小时**那一段拟合（`COGNEVA_DISK_TREND_RECENT_DAYS`）。整窗斜率在加速段里会滞后：2026-10-20 实测整窗把 0.7 天算成 1.7 天，因为一周前那段几乎没在长。这一格是「按现在的速度还有几天写满」，非在长的时候**整条缺席**而不是印 0 或负数——「没在长」与「没量出来」由 `host_reading_producer_unreadable{producer=\"host_disk_trend\"}` 分开，不由这一格兼任",
+        "disk_trend_days_to_full_recent_margin",
+        "同一生产者：只用**最近 24 小时**那一段拟合（`COGNEVA_DISK_TREND_RECENT_DAYS`）得到的「还有几天写满」，减去它这一拍公布的提前期（`COGNEVA_HOST_DISK_FULL_LEAD_DAYS`，默认 7 天，同一个值也印成 `disk_trend_full_lead_days`）。用最近那段是因为整窗斜率在加速段里滞后：2026-10-20 实测整窗把 0.7 天算成 1.7 天。提前期是策略输入，所以它不该写在规则里：规则比余量与 0，改提前期是一次公布、不是一次改规则。负数＝余量不够提前期，与磨损余量（`cogneva_host_nvme_wear_headroom_pct`）同极性。非在长的时候整条缺席而不是印 0——「没在长」与「没量出来」由 `host_reading_producer_unreadable{producer=\"host_disk_trend\"}` 分开",
+    ),
+    (
+        "disk_trend_days_to_trigger_margin",
+        "宿主生产者 `scripts/host/cogneva-host-disk-trend-reading.sh`（不在本仓）印出的「到构建缓存刹车触发线的天数」减去 `COGNEVA_HOST_DISK_TRIGGER_LEAD_DAYS`（默认 1 天，同一个值印成 `disk_trend_trigger_lead_days`）。这条线**只能在宿主上算**：刹车（`deploy/scripts/host-target-gc.sh`）判的是 `df` 的 Use%，分母是 used+avail、不含 root 保留块，而 node-exporter 的 `1 − avail/size` 分母含保留块；两把尺子差的份额随文件系统类型与 `tune2fs -m` 变，不是常数，在 PromQL 里重算就得先选一把尺子去逼近另一把。提前期是策略输入（腾地方要多久随时变），所以由生产者公布、规则只把余量与 0 比。触发线读不出来时底数整条缺席，余量也跟着缺席——「量不出」与「余量充足」仍由 `disk_trend_trigger_line_readable` 分开",
     ),
     (
         "cogneva_host_target_gc_measured",
