@@ -280,6 +280,21 @@ impl MessageBackend for RedisMessageBackend {
         }
     }
 
+    async fn delete_stream(&self, subject: &str) -> SFResult<()> {
+        // DEL rather than one XDEL per id: deleting the key is also what drops
+        // the consumer groups it carries, and a stream left with no entries but
+        // with groups still attached is a set of pending ids pointing at
+        // nothing. The entries are discarded on purpose -- the caller owns this
+        // stream and is its only reader, so there is no position to steal.
+        let removed: u64 = redis::cmd("DEL")
+            .arg(subject)
+            .query_async(&mut self.connection.clone())
+            .await
+            .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
+        tracing::debug!(subject = %subject, removed, "deleted a stream this process owns");
+        Ok(())
+    }
+
     async fn subscribe_from(
         &self,
         subject: &str,
@@ -1217,5 +1232,80 @@ mod tests {
             .query_async(&mut raw)
             .await
             .expect("del");
+    }
+
+    /// Deleting a stream the caller owns takes its entries and its consumer
+    /// groups with it.
+    ///
+    /// The trait cannot remove an entry any other way, so a request-scoped
+    /// stream — one opened for a single exchange and read by nobody else —
+    /// would otherwise be a key per request for the life of the deployment.
+    /// The group matters as much as the entries: groups left on an emptied
+    /// stream keep pending ids that point at nothing.
+    #[tokio::test]
+    async fn a_deleted_stream_takes_its_entries_and_groups_with_it() {
+        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let backend = match RedisMessageBackend::new(&redis_url).await {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stream = format!("cog-test:delete-{suffix}");
+        let group = format!("delete-{suffix}");
+
+        backend
+            .create_consumer_group(&stream, &group)
+            .await
+            .unwrap();
+        backend.publish(&stream, b"one").await.unwrap();
+        backend.publish(&stream, b"two").await.unwrap();
+        assert_eq!(
+            backend.stream_lag(&stream, &group).await.unwrap(),
+            Some(2),
+            "two entries are waiting before the delete"
+        );
+
+        backend.delete_stream(&stream).await.unwrap();
+
+        let exists: i64 = redis::cmd("EXISTS")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("exists");
+        assert_eq!(exists, 0, "the key is gone, not merely emptied");
+        // XINFO GROUPS answers only for a key that exists, so its refusal is
+        // the group's obituary too: there is no stream left for a group to be
+        // attached to.
+        let groups: Result<redis::Value, redis::RedisError> = redis::cmd("XINFO")
+            .arg("GROUPS")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await;
+        match groups {
+            Err(e) => assert!(
+                e.to_string().contains("no such key"),
+                "the refusal is the missing key, not something else: {e}"
+            ),
+            Ok(rows) => assert!(
+                matches!(rows, redis::Value::Array(ref a) if a.is_empty()),
+                "a surviving key must carry no groups: {rows:?}"
+            ),
+        }
     }
 }

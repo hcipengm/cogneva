@@ -22,6 +22,16 @@ const MEMORY_READ_TIMEOUT_SECS: u64 = 30;
 /// holds; a caller that wants a larger source names its own budget.
 const DEFAULT_RAW_FETCH_BUDGET_BYTES: u64 = 262_144;
 
+/// How long an ask waits for its answer when the caller does not say, and the
+/// longest a caller may ask for.
+///
+/// The wait happens inside the caller's turn, holding it: long enough for a
+/// peer's run to finish, short enough that an unanswering peer costs one turn
+/// rather than the run. The cap exists because the bound is the only thing
+/// standing between "ask a peer" and "wait for it forever".
+const ASK_DEFAULT_TIMEOUT_MS: u64 = 120_000;
+const ASK_MAX_TIMEOUT_MS: u64 = 600_000;
+
 /// Real execution identity of one agent run. Carried explicitly from the
 /// actor (which knows the DAG task) through the runtime into sandbox requests,
 /// so the executor pod can attribute and route work per task.
@@ -1748,12 +1758,15 @@ pub mod builtins {
             description: "Send an instruction to another live agent's inbox. Delivery is \
                           at-least-once and the target acks only after it has run the \
                           command, so write instructions that survive being applied twice. \
-                          There is no reply: the target's run reports through the event \
-                          plane, and nothing is returned to you. The result repeats your \
-                          own agent id as `from` when the run established one, and `null` \
-                          when it did not. kind=prompt starts a run on the target, \
-                          kind=steering injects into a run already in progress, \
-                          kind=continue appends to the target's conversation."
+                          With expect_reply the call waits for the target's answer and \
+                          returns it under `reply`; without it the call returns as soon as \
+                          the instruction is queued and nothing comes back. The result \
+                          repeats your own agent id as `from` when the run established \
+                          one, and `null` when it did not. kind=prompt starts a run on the \
+                          target, kind=steering injects into a run already in progress, \
+                          kind=continue appends to the target's conversation; only \
+                          kind=prompt can carry expect_reply, because only a run produces \
+                          an answer."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -1770,6 +1783,17 @@ pub mod builtins {
                         "type": "string",
                         "enum": ["prompt", "steering", "continue"],
                         "description": "How the target should take it (default prompt)"
+                    },
+                    "expect_reply": {
+                        "type": "boolean",
+                        "description": "Wait for the target's answer and return it. Blocks \
+                                        this turn for up to timeout_ms, so ask only for an \
+                                        answer you need in this turn (default false)"
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "How long to wait when expect_reply is set (default \
+                                        120000, capped at 600000)"
                     }
                 },
                 "required": ["agent_id", "message"]
@@ -1788,11 +1812,28 @@ pub mod builtins {
                         .filter(|s| !s.trim().is_empty())
                         .ok_or_else(|| SFError::Validation("message required".into()))?;
                     let kind = args["kind"].as_str().unwrap_or("prompt");
+                    let expect_reply = args["expect_reply"].as_bool().unwrap_or(false);
+                    // Refused before anything is written: the other two commands
+                    // do not start a run, so there is no answer to wait for and
+                    // a wait would spend the whole timeout learning that.
+                    if expect_reply && kind != "prompt" {
+                        return Err(SFError::Validation(format!(
+                            "expect_reply needs kind=prompt; a {kind} command runs nothing, \
+                             so no answer can come back"
+                        )));
+                    }
+                    // The stream this call will read, named before the request
+                    // exists so the target can be told where to answer.
+                    let ask = if expect_reply {
+                        Some(ask_reply_stream())
+                    } else {
+                        None
+                    };
 
                     let inbox = match kind {
                         "prompt" => cog_core::InboxMessage::Prompt {
                             goal: serde_json::Value::String(message.to_string()),
-                            reply_stream: None,
+                            reply_stream: ask.clone(),
                         },
                         "steering" => cog_core::InboxMessage::Steering {
                             instruction: message.to_string(),
@@ -1835,9 +1876,23 @@ pub mod builtins {
                         }
                     }
 
-                    let stream = cog_core::agent_inbox_stream(agent_id);
+                    let inbox_stream = cog_core::agent_inbox_stream(agent_id);
                     let payload = serde_json::to_vec(&inbox).map_err(SFError::Serialization)?;
-                    backend.publish(&stream, &payload).await?;
+
+                    // Opened *before* the request goes out, because a consumer
+                    // group starts at the stream's current end: an answer
+                    // published between the two would sit behind the reader's
+                    // start position and never be delivered, and the wait would
+                    // run to its timeout with the answer already on the wire.
+                    let mut reply_reader = match ask.as_deref() {
+                        Some(stream) => {
+                            backend.create_consumer_group(stream, ASK_GROUP).await?;
+                            Some(backend.subscribe(stream, ASK_GROUP).await?)
+                        }
+                        None => None,
+                    };
+
+                    backend.publish(&inbox_stream, &payload).await?;
                     // One line per message, naming both ends: the queue keeps
                     // no sender anywhere — the wire form carries the command
                     // and nothing about who wrote it — so without this the only
@@ -1850,18 +1905,171 @@ pub mod builtins {
                         from = from.as_deref().unwrap_or("-"),
                         to = agent_id,
                         kind,
-                        stream = %stream,
+                        stream = %inbox_stream,
+                        awaiting_reply = ask.is_some(),
                         "inter-agent message published to an inbox"
                     );
-                    Ok(serde_json::json!({
+
+                    let mut receipt = serde_json::json!({
                         "delivered": true,
                         "from": from,
                         "agent_id": agent_id,
                         "kind": kind,
-                        "stream": stream,
-                    }))
+                        "stream": inbox_stream,
+                    });
+
+                    if let (Some(stream), Some(reader)) = (ask.as_deref(), reply_reader.as_mut()) {
+                        let waited = wait_for_reply(backend.as_ref(), stream, reader, &args).await;
+                        let observable = crate::observable::global_observable();
+                        observable.record_inbox_ask(waited.outcome);
+                        let waited_ms = waited.waited.as_millis() as u64;
+                        match waited.reply {
+                            Some(reply) => {
+                                receipt["replied"] = serde_json::json!(true);
+                                receipt["reply"] = reply;
+                            }
+                            None => {
+                                receipt["replied"] = serde_json::json!(false);
+                                receipt["reason"] = serde_json::json!(waited.outcome);
+                                receipt["hint"] = serde_json::json!(match waited.outcome {
+                                    "timeout" =>
+                                        "the target did not answer in time; it may \
+                                                  still be running the instruction, or its \
+                                                  handler failed and left it pending",
+                                    _ => "the reply channel closed before an answer arrived",
+                                });
+                            }
+                        }
+                        receipt["waited_ms"] = serde_json::json!(waited_ms);
+                    }
+
+                    Ok(receipt)
                 })
             })),
+        }
+    }
+
+    /// The consumer group a waiting ask reads its reply with.
+    ///
+    /// One name for every ask, because each ask owns its own stream: the group
+    /// is the reader, and a stream with exactly one reader in the whole
+    /// deployment does not need a second identity.
+    const ASK_GROUP: &str = "asker";
+
+    /// The stream one ask waits on, named by the ask itself.
+    ///
+    /// The name *is* the correlation. A reply carries nothing that says which
+    /// question it answers, so two questions sharing a stream would leave the
+    /// reader unable to tell the answers apart. Giving each ask its own stream
+    /// makes the correlation a property of the address instead of a field the
+    /// reply must carry and every producer must remember to fill in.
+    ///
+    /// Process id, wall clock and a counter together, because no one of them
+    /// is unique alone: the counter restarts at zero with the process, the
+    /// clock collides inside a tick, and the process id is reused.
+    fn ask_reply_stream() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!(
+            "orchestrator:reply:{}:{:x}:{}",
+            std::process::id(),
+            nanos,
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// What one wait produced: how it ended, what came back, and how long it
+    /// held the caller's turn.
+    struct Waited {
+        outcome: &'static str,
+        reply: Option<serde_json::Value>,
+        waited: Duration,
+    }
+
+    /// Wait for the first frame on a reply stream opened for this ask, then
+    /// give the stream back.
+    ///
+    /// The stream is deleted on every path — answered, timed out, closed — so
+    /// a request-scoped stream is bounded by the asks in flight rather than by
+    /// every ask ever made. Nothing else in the backend contract removes an
+    /// entry, which is what makes this the only cleanup there is.
+    ///
+    /// A timeout is reported, not raised. The instruction was published and
+    /// the target may still be running it, so turning the wait into a tool
+    /// error would tell the caller its send failed when what ran out was only
+    /// the waiting.
+    async fn wait_for_reply(
+        backend: &dyn cog_core::MessageBackend,
+        stream: &str,
+        reader: &mut cog_core::MessageStream,
+        args: &serde_json::Value,
+    ) -> Waited {
+        let started = std::time::Instant::now();
+        let timeout = Duration::from_millis(
+            args["timeout_ms"]
+                .as_u64()
+                .unwrap_or(ASK_DEFAULT_TIMEOUT_MS)
+                .clamp(1, ASK_MAX_TIMEOUT_MS),
+        );
+        let first = tokio::time::timeout(timeout, reader.next()).await;
+        let waited = started.elapsed();
+
+        let mut outcome = "timeout";
+        let mut reply = None;
+        match first {
+            Ok(Some(Ok((id, payload)))) => {
+                if let Err(e) = backend
+                    .ack(stream, ASK_GROUP, std::slice::from_ref(&id))
+                    .await
+                {
+                    tracing::warn!(stream = %stream, error = %e, "reply acked with an error");
+                }
+                // The target's answer is the result of its run, which is JSON
+                // by construction; a backend or build that published something
+                // else still answered, so the bytes are returned rather than
+                // the whole ask being called a failure.
+                reply = Some(serde_json::from_slice(&payload).unwrap_or_else(|_| {
+                    serde_json::Value::String(String::from_utf8_lossy(&payload).into_owned())
+                }));
+                outcome = "replied";
+            }
+            Ok(Some(Err(e))) => {
+                outcome = "stream_error";
+                tracing::warn!(stream = %stream, error = %e, "reply stream failed while waiting");
+            }
+            Ok(None) => {
+                // Closed before an answer arrived. Not a timeout: the wait did
+                // not run out, the channel went away under it.
+                outcome = "stream_error";
+            }
+            Err(_elapsed) => {}
+        }
+
+        close_reply_stream(backend, stream).await;
+        Waited {
+            outcome,
+            reply,
+            waited,
+        }
+    }
+
+    /// End the read loop and drop the stream, best effort.
+    ///
+    /// The delete error is logged and swallowed: the caller already has its
+    /// answer or its timeout, and cleanup that failed is a key left behind,
+    /// not a reason to turn a completed ask into an error.
+    async fn close_reply_stream(backend: &dyn cog_core::MessageBackend, stream: &str) {
+        backend.stop_stream(stream, ASK_GROUP).await;
+        if let Err(e) = backend.delete_stream(stream).await {
+            tracing::warn!(
+                stream = %stream,
+                error = %e,
+                "reply stream left behind: this backend cannot delete streams"
+            );
         }
     }
 

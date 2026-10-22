@@ -152,6 +152,28 @@ impl MessageBackend for MemoryMessageBackend {
         Ok(Box::pin(stream))
     }
 
+    async fn delete_stream(&self, subject: &str) -> SFResult<()> {
+        // Dropping the entry drops the broadcast sender with it, which ends
+        // every read parked on this subject: the same "nothing will be
+        // delivered here again" that `stop_stream` signals, without having to
+        // name the groups that are reading it.
+        let removed = {
+            let mut channels = self.channels.lock().unwrap();
+            channels.remove(subject)
+        };
+        if let Some(state) = removed {
+            // The buffer is what a later subscriber would replay; it is the
+            // part of the stream that outlives the request, so it has to go
+            // with the key it belongs to.
+            drop(state);
+            // Stop signals are per (stream, group); the stream is gone, so the
+            // signals that only exist to end reads on it are gone too.
+            let mut stops = self.stops.lock().unwrap();
+            stops.retain(|key, _flag| key.0 != subject);
+        }
+        Ok(())
+    }
+
     async fn stop_stream(&self, subject: &str, group: &str) {
         let sender = {
             let stops = self.stops.lock().unwrap();

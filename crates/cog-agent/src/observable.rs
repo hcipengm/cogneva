@@ -102,6 +102,13 @@ pub struct AgentObservable {
     /// agents nobody holds is a broken producer, and the sender's retry loop
     /// looks the same as a working one from the outside.
     inbox_refused_total: Mutex<HashMap<&'static str, u64>>,
+    /// Sends that waited for an answer, keyed by how the wait ended.
+    ///
+    /// An ask that timed out is not a failed send: the command was published
+    /// and the target may still be running it, so no failure counter moves and
+    /// no queue depth changes. The caller learns it from the tool result and
+    /// nobody else would ever learn it at all, which is what this is for.
+    inbox_ask_total: Mutex<HashMap<&'static str, u64>>,
 }
 
 /// Every kind of inbox command this build can execute.
@@ -119,6 +126,14 @@ const INBOX_KINDS: [&str; 5] = ["prompt", "continue", "abort", "reset", "steerin
 /// named an agent nobody holds, the other means the roster itself could not be
 /// read, and they call for different repairs.
 const INBOX_REFUSAL_REASONS: [&str; 2] = ["no_live_agent", "roster_unreadable"];
+
+/// How a waited-for answer ended.
+///
+/// `timeout` says the wait gave up, not that the send failed — the distinction
+/// is the reason these are counted apart from deliveries: a target that keeps
+/// taking longer than its askers are willing to wait is a capacity question,
+/// while a stream that closes under the reader is a broken channel.
+const INBOX_ASK_OUTCOMES: [&str; 3] = ["replied", "timeout", "stream_error"];
 
 /// The label an inbox command is counted under.
 ///
@@ -350,6 +365,15 @@ impl AgentObservable {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *counts.entry(reason).or_insert(0) += 1;
+    }
+
+    /// Record one send that waited for an answer, by how the wait ended.
+    pub fn record_inbox_ask(&self, outcome: &'static str) {
+        let mut counts = self
+            .inbox_ask_total
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *counts.entry(outcome).or_insert(0) += 1;
     }
 
     /// Record a high-level agent run (called by AgentRuntime::run).
@@ -665,6 +689,21 @@ impl Observable for AgentObservable {
                         refused.get(reason).copied().unwrap_or(0) as f64,
                     )
                     .with_label("reason", reason),
+                );
+            }
+        }
+        {
+            let asks = self
+                .inbox_ask_total
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for outcome in INBOX_ASK_OUTCOMES {
+                metrics.push(
+                    RawMetric::new(
+                        "agent_inbox_ask_total",
+                        asks.get(outcome).copied().unwrap_or(0) as f64,
+                    )
+                    .with_label("outcome", outcome),
                 );
             }
         }
@@ -1164,6 +1203,7 @@ mod tests {
             vec![
                 "agent_budget_exhausted_count",
                 "agent_guardrail_refused_runs",
+                "agent_inbox_ask_total",
                 "agent_inbox_delivered_total",
                 "agent_inbox_poisoned_total",
                 "agent_inbox_refused_total",
@@ -1250,6 +1290,54 @@ mod tests {
             });
             assert_eq!(found.map(|m| m.value), Some(0.0), "reason={reason}");
         }
+        for outcome in INBOX_ASK_OUTCOMES {
+            let found = metrics.iter().find(|m| {
+                m.name == "agent_inbox_ask_total"
+                    && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+            });
+            assert_eq!(found.map(|m| m.value), Some(0.0), "outcome={outcome}");
+        }
+    }
+
+    /// An ask that timed out moved no delivery counter: the command was
+    /// published and the target may still be running it, so the only place the
+    /// wait itself is visible is here. Counted by outcome because the three
+    /// call for different repairs -- a peer that is slow, a caller that waits
+    /// too briefly, and a channel that closed under the reader.
+    #[tokio::test]
+    async fn a_waited_for_answer_is_counted_by_how_the_wait_ended() {
+        let o = AgentObservable::new();
+        o.record_inbox_ask("replied");
+        o.record_inbox_ask("timeout");
+        o.record_inbox_ask("timeout");
+
+        let metrics = o.collect_metrics("").await.expect("collect_metrics");
+        let read = |outcome: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == "agent_inbox_ask_total"
+                        && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+                })
+                .map(|m| m.value)
+        };
+        assert_eq!(read("replied"), Some(1.0));
+        assert_eq!(read("timeout"), Some(2.0));
+        assert_eq!(
+            read("stream_error"),
+            Some(0.0),
+            "an outcome no ask met reads zero, not missing"
+        );
+        assert_eq!(
+            metrics
+                .iter()
+                .filter(|m| m.name.starts_with("agent_inbox_delivered")
+                    || m.name.starts_with("agent_inbox_undelivered"))
+                .map(|m| m.value)
+                .sum::<f64>(),
+            0.0,
+            "a wait that gave up says nothing about delivery either way"
+        );
     }
 
     /// The label list is a second spelling of the wire form, and a variant

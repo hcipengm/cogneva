@@ -195,8 +195,8 @@ fn registration(agent_id: &str, role: &str, capabilities: &[&str]) -> AgentRegis
 }
 
 /// Call the tool the way the registry does.
-async fn call(
-    backend: Arc<Recording>,
+async fn call<B: MessageBackend + 'static>(
+    backend: Arc<B>,
     roster: Arc<Roster>,
     args: serde_json::Value,
 ) -> SFResult<serde_json::Value> {
@@ -536,5 +536,242 @@ async fn a_run_with_no_identity_reports_null_and_marks_nobody() {
             .iter()
             .all(|a| a["is_me"] == serde_json::json!(false)),
         "no row is marked when the caller is unknown: {listed}"
+    );
+}
+
+/// A queue with a target on the other end: a prompt written to an inbox is
+/// treated as if that agent had run it, and the result goes to the stream the
+/// request named.
+///
+/// The target is simulated, deliberately. What is being decided here is the
+/// caller's half of the exchange — that it names a stream, opens its reader
+/// before the request goes out, hands back what arrives, and releases the
+/// stream afterwards. The target's half (running the prompt and publishing the
+/// result) is covered where the inbox handler runs.
+struct Answering {
+    inner: cog_stream::MemoryMessageBackend,
+    answer: Option<serde_json::Value>,
+    asked: Mutex<Option<String>>,
+    deleted: Mutex<Vec<String>>,
+}
+
+impl Answering {
+    fn new(answer: Option<serde_json::Value>) -> Self {
+        Self {
+            inner: cog_stream::MemoryMessageBackend::new(),
+            answer,
+            asked: Mutex::new(None),
+            deleted: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn reply_stream_asked(&self) -> Option<String> {
+        self.asked.lock().expect("lock").clone()
+    }
+
+    fn deleted(&self) -> Vec<String> {
+        self.deleted.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait]
+impl MessageBackend for Answering {
+    async fn publish(&self, subject: &str, payload: &[u8]) -> SFResult<()> {
+        if subject.starts_with("orchestrator:agent:") {
+            if let Ok(InboxMessage::Prompt {
+                reply_stream: Some(stream),
+                ..
+            }) = serde_json::from_slice::<InboxMessage>(payload)
+            {
+                *self.asked.lock().expect("lock") = Some(stream.clone());
+                if let Some(answer) = self.answer.as_ref() {
+                    let bytes = serde_json::to_vec(answer).expect("encode answer");
+                    self.inner.publish(&stream, &bytes).await?;
+                }
+            }
+        }
+        self.inner.publish(subject, payload).await
+    }
+
+    async fn payload_limit(&self, subject: &str) -> SFResult<Option<usize>> {
+        self.inner.payload_limit(subject).await
+    }
+
+    async fn subscribe(&self, subject: &str, group: &str) -> SFResult<MessageStream> {
+        self.inner.subscribe(subject, group).await
+    }
+
+    async fn subscribe_from(
+        &self,
+        subject: &str,
+        group: &str,
+        start_id: &str,
+    ) -> SFResult<MessageStream> {
+        self.inner.subscribe_from(subject, group, start_id).await
+    }
+
+    async fn stop_stream(&self, subject: &str, group: &str) {
+        self.inner.stop_stream(subject, group).await
+    }
+
+    async fn create_consumer_group(&self, stream: &str, group: &str) -> SFResult<()> {
+        self.inner.create_consumer_group(stream, group).await
+    }
+
+    async fn ack(&self, stream: &str, group: &str, ids: &[String]) -> SFResult<()> {
+        self.inner.ack(stream, group, ids).await
+    }
+
+    async fn claim_pending(
+        &self,
+        _stream: &str,
+        _group: &str,
+        _min_idle_ms: u64,
+        _count: usize,
+    ) -> SFResult<Option<Vec<(String, Vec<u8>)>>> {
+        Ok(None)
+    }
+
+    async fn pending_stats(
+        &self,
+        _stream: &str,
+        _group: &str,
+        _idle_threshold_ms: u64,
+    ) -> SFResult<Option<PendingStats>> {
+        Ok(None)
+    }
+
+    async fn stream_lag(&self, _stream: &str, _group: &str) -> SFResult<Option<u64>> {
+        Ok(None)
+    }
+
+    async fn delete_stream(&self, subject: &str) -> SFResult<()> {
+        self.deleted.lock().expect("lock").push(subject.to_string());
+        self.inner.delete_stream(subject).await
+    }
+}
+
+/// An ask comes back with the target's answer.
+///
+/// Before the tool could wait, the one producer an agent can reach returned as
+/// soon as the instruction was queued: an agent could address a peer but never
+/// hear from it, so a question could only be asked by a caller that had no way
+/// to use the answer. The receipt is where the answer arrives, and the stream
+/// it arrived on is gone afterwards — a request-scoped stream that outlived its
+/// request would be a key per question for the life of the deployment.
+#[tokio::test]
+async fn an_ask_returns_the_answer_and_releases_the_stream_it_arrived_on() {
+    let backend = Arc::new(Answering::new(Some(
+        serde_json::json!({ "ok": true, "text": "all tests pass" }),
+    )));
+    let roster = Arc::new(Roster::new(&["squad:task-1-tester"]));
+
+    let receipt = call(
+        backend.clone(),
+        roster,
+        serde_json::json!({
+            "agent_id": "squad:task-1-tester",
+            "message": "run the tests",
+            "expect_reply": true,
+            "timeout_ms": 5_000,
+        }),
+    )
+    .await
+    .expect("an answer is not an error");
+
+    assert_eq!(receipt["delivered"], serde_json::json!(true));
+    assert_eq!(receipt["replied"], serde_json::json!(true));
+    assert_eq!(
+        receipt["reply"]["text"],
+        serde_json::json!("all tests pass")
+    );
+
+    let stream = backend
+        .reply_stream_asked()
+        .expect("the request told the target where to answer");
+    assert!(
+        stream.starts_with("orchestrator:reply:"),
+        "the reply stream is named by the ask, not by the target: {stream}"
+    );
+    assert_eq!(
+        backend.deleted(),
+        vec![stream],
+        "the stream the answer arrived on is removed once the ask is done"
+    );
+}
+
+/// A peer that never answers is a wait that ended, not a send that failed.
+///
+/// The instruction was published, so nothing was lost at the sending end: the
+/// target may still be running it. Reporting an error would tell the caller its
+/// send failed, which is the opposite of what happened, and it would leave the
+/// caller no way to tell a slow peer from a broken channel.
+#[tokio::test]
+async fn a_peer_that_never_answers_ends_the_wait_without_calling_the_send_a_failure() {
+    let backend = Arc::new(Answering::new(None));
+    let roster = Arc::new(Roster::new(&["squad:task-1-tester"]));
+
+    let receipt = call(
+        backend.clone(),
+        roster,
+        serde_json::json!({
+            "agent_id": "squad:task-1-tester",
+            "message": "run the tests",
+            "expect_reply": true,
+            "timeout_ms": 50,
+        }),
+    )
+    .await
+    .expect("a silent peer is not an error");
+
+    assert_eq!(
+        receipt["delivered"],
+        serde_json::json!(true),
+        "the instruction reached the inbox"
+    );
+    assert_eq!(receipt["replied"], serde_json::json!(false));
+    assert_eq!(receipt["reason"], serde_json::json!("timeout"));
+    assert!(
+        receipt["hint"]
+            .as_str()
+            .expect("a hint")
+            .contains("still be running"),
+        "the receipt says the target may still be working on it: {receipt}"
+    );
+    assert_eq!(
+        backend.deleted().len(),
+        1,
+        "a wait that gave up still releases its stream"
+    );
+}
+
+/// Only a run can answer, so a command that starts none is refused before
+/// anything is written.
+///
+/// `steering` injects into a run already in progress and `continue` appends to
+/// a conversation; neither produces a result of its own. Accepting the flag
+/// would spend the caller's whole timeout to learn what the command kind
+/// already said.
+#[tokio::test]
+async fn a_command_that_starts_no_run_cannot_be_asked_for_an_answer() {
+    let backend = Arc::new(Answering::new(Some(serde_json::json!({"ok": true}))));
+    let roster = Arc::new(Roster::new(&["squad:task-1-tester"]));
+
+    let err = call(
+        backend.clone(),
+        roster,
+        serde_json::json!({
+            "agent_id": "squad:task-1-tester",
+            "message": "focus on the flaky one",
+            "kind": "steering",
+            "expect_reply": true,
+        }),
+    )
+    .await
+    .expect_err("a steering command has no answer");
+
+    assert!(
+        err.to_string().contains("kind=prompt"),
+        "the error names the kind that can answer: {err}"
     );
 }

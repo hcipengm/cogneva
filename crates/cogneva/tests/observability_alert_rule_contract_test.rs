@@ -1085,6 +1085,13 @@ const PRODUCED: &[(&str, &str)] = &[
         "agent_inbox_poisoned_total",
         "crates/cog-agent/src/observable.rs",
     ),
+    // 一次「问了另一 agent 并等回答」的结局。等超时不等于发送失败：命令已经
+    // 发布出去了，目标可能还在跑，成功/失败两个投递计数器一个都不动——不单独
+    // 记这一族，等待本身就没有任何读数。
+    (
+        "agent_inbox_ask_total",
+        "crates/cog-agent/src/observable.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.

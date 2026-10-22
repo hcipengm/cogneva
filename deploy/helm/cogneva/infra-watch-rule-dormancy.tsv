@@ -75,9 +75,16 @@ runtime_asset_not_refreshed	cogneva_runtime_asset_state	error_only_state	Same ga
 # deleted, not kept "just in case" -- a declared absence that is no longer true
 # is reported stale, and a registry of stale rows stops being a reading.
 
-# --- code_not_deployed (2 rules): the producer is newer than the running image --
-# Both series are written on every scrape from the first one, zeros included, so
-# these rows are expected to go stale -- not to stay -- on the rollout that
-# carries the commit. Delete them then, per the rule at the top of this file.
-agent_inbox_commands_stuck	agent_inbox_undelivered_total	code_not_deployed	Counted in crates/cog-agent/src/observable.rs from the commit that adds the inbox delivery counters; the live image predates it. The series exists as soon as that image serves its first scrape, so this is a rollout wait rather than a permanent absence.
-agent_inbox_payloads_poisoned	agent_inbox_poisoned_total	code_not_deployed	Same publisher and same rollout. The poisoned counter is written unconditionally rather than only on a bad payload, so it appears with the image too.
+# agent_inbox_commands_stuck and agent_inbox_payloads_poisoned were declared
+# code_not_deployed while 42cf75d7 was only in git. The rollout happened:
+# main-4f8e2a06e948 served its first scrape, and all four families --
+# agent_inbox_delivered_total, agent_inbox_undelivered_total,
+# agent_inbox_poisoned_total and agent_inbox_refused_total -- read back from
+# the live Prometheus. Both rows are deleted, per the rule at the top of this
+# file: a declared absence that is no longer true is reported stale.
+
+# --- code_not_deployed (1 rule): the producer is newer than the running image --
+# agent_inbox_asks_unanswered watches a family the running image does not write
+# yet. Its producer is the same observable as the four above but it ships in a
+# later commit, so the row goes away with that rollout like the two did.
+agent_inbox_asks_unanswered	agent_inbox_ask_total	code_not_deployed	Written by the addressing tool in crates/cog-agent/src/observable.rs from the commit that adds the ask path; the live image (main-4f8e2a06e948) predates it. Every outcome (replied, timeout, stream_error) is written on every scrape, so the series and its zeros appear together with the image. Delete this row on the rollout that carries that commit.

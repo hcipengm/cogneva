@@ -128,6 +128,31 @@ pub trait MessageBackend: Send + Sync {
     /// as a consumer that never exits.
     async fn stop_stream(&self, subject: &str, group: &str);
 
+    /// Remove `subject` and everything this backend keeps under it — its
+    /// entries and any consumer group on it.
+    ///
+    /// This is for streams a caller *owns* rather than reads: a reply channel
+    /// opened for one request, whose only reader is the party that opened it
+    /// and whose entries are worthless to everyone else once that party has
+    /// answered. Those streams would otherwise outlive every request that made
+    /// one: nothing else in this trait can remove an entry, so a request-scoped
+    /// stream is a key per request for the life of the deployment.
+    ///
+    /// The caller asserts ownership. Entries are discarded, not delivered, so
+    /// this is never a way to retire a stream that a consumer group is still
+    /// reading: that consumer's in-flight entries vanish with the rest.
+    ///
+    /// Defaulted to an error rather than to a no-op, and deliberately so: a
+    /// backend that cannot delete would otherwise leave the key while
+    /// reporting the cleanup done, and the only place that shows is a keyspace
+    /// that grew by one per request. A caller may treat the error as
+    /// best-effort and log it, but it cannot mistake it for success.
+    async fn delete_stream(&self, subject: &str) -> SFResult<()> {
+        Err(SFError::Agent(format!(
+            "this message backend cannot delete stream {subject:?}"
+        )))
+    }
+
     /// Create a consumer group on the target stream if it does not exist.
     async fn create_consumer_group(&self, stream: &str, group: &str) -> SFResult<()>;
 

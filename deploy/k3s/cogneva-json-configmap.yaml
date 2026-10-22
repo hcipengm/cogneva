@@ -2837,6 +2837,15 @@ data:
           },
           "severity": "warning",
           "summary": "{value} inbox payload(s) in the last hour were not a command at all and went to the dead-letter queue. These are acked out by design -- the same bytes can never parse, so redelivery would fail identically forever -- which makes the dead-letter queue the only place they exist and this counter the only signal that a producer is writing the wrong shape. The sender is not a suspect by default: the published bytes are the wire form of the inbox command, so the usual causes are a producer built against a different version of that form and a writer that put something else on the stream entirely. Look at the dead-letter queue for the bytes, and at the counter's rise time against a deploy: a step at a rollout is a version mismatch, a steady trickle is a second writer on the same stream"
+        },
+        {
+          "name": "agent_inbox_asks_unanswered",
+          "promql": "sum(increase(agent_inbox_ask_total{outcome=\"timeout\"}[1h]))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "{value} inter-agent question(s) in the last hour were sent and never answered within the asker's wait. The send itself is not what failed: the instruction was published, the target may still be running it, and neither the delivered nor the undelivered counter moves for a wait that gave up -- so this is the only series a timed-out ask appears in. Read it with agent_inbox_undelivered_total on kind=prompt: a timeout beside failures is a target whose handler is rejecting the work, while a timeout with no failures is a target that is simply slower than its askers are willing to wait. The wait is bounded per call (two minutes by default, ten at most), so a floor that keeps rising means either the target's runs have grown longer than its askers' patience or one caller keeps asking a peer that cannot answer. Every outcome is written on every scrape, so a zero here is a measurement rather than a missing series; the ask carries no agent or task id because the stream name, not a label, is what correlates a question with its answer"
         }
               ]
             },
