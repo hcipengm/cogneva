@@ -32,7 +32,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use chrono::{DateTime, TimeZone, Utc};
-use cog_core::{PrincipleLedgerStore, PrincipleRefusal, PLATFORM_DECLARATION_PREFIX};
+use cog_core::{PrincipleLedgerStore, PrincipleRefusal, PLATFORM_DECLARATION_PREFIXES};
 
 use crate::landing::run_git;
 
@@ -109,7 +109,10 @@ fn is_a_number(text: &str) -> bool {
 pub fn declared_slugs(source: &str) -> Vec<String> {
     let mut slugs = Vec::new();
     for line in source.lines() {
-        let Some(rest) = line.strip_prefix(PLATFORM_DECLARATION_PREFIX) else {
+        let Some(rest) = PLATFORM_DECLARATION_PREFIXES
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+        else {
             continue;
         };
         let slug = rest.split_whitespace().next().unwrap_or("");
@@ -282,6 +285,15 @@ mod tests {
     fn only_rust_sources_are_candidates() {
         assert!(failing_paths("panicked at scripts/run.sh:3:1").is_empty());
         assert!(failing_paths("panicked at /abs/path/x.rs:3:1").is_empty());
+    }
+
+    /// A shell gate declares in the comment syntax its language has. The shape
+    /// is the same one the registry reads, so a gate the account counts is a gate
+    /// a red run can name.
+    #[test]
+    fn a_shell_gate_declares_with_its_own_prefix() {
+        let source = "# principle: feedback_a\n#principle: feedback_b\n  # principle: feedback_c\n";
+        assert_eq!(declared_slugs(source), vec!["feedback_a".to_string()]);
     }
 
     #[test]

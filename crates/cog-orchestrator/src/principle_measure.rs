@@ -65,7 +65,9 @@ pub const HOST_RETIRED_PREFIX: &str = "retired:";
 /// from the other direction -- a run that failed, rather than the registry of
 /// what enforces what -- and one value keeps the two from drifting apart. Every
 /// reference below this line is to that one definition.
-pub use cog_core::PLATFORM_DECLARATION_PREFIX;
+pub use cog_core::{
+    PLATFORM_DECLARATION_PREFIX, PLATFORM_DECLARATION_PREFIXES, PLATFORM_SHELL_DECLARATION_PREFIX,
+};
 
 /// The expression the platform's registry is read with: the prefix at the start
 /// of a line, which is where a module header sits and where prose about the
@@ -81,13 +83,39 @@ pub use cog_core::PLATFORM_DECLARATION_PREFIX;
 /// this line mean "at the start of a line" rather than "somewhere in it", and it
 /// is a fact about the value, not about the spelling.
 pub fn platform_declaration_pattern() -> String {
-    format!("^{PLATFORM_DECLARATION_PREFIX}")
+    platform_declaration_pattern_for(PLATFORM_DECLARATION_PREFIX)
+}
+
+/// The same expression for one prefix of the closed set, so a second source is
+/// searched with the anchor derived from its own prefix rather than from a
+/// pattern written out a second time beside it.
+pub fn platform_declaration_pattern_for(prefix: &str) -> String {
+    format!("^{prefix}")
 }
 
 /// Which files may declare. Rust sources, because a declaration is a header of
 /// the test module that enforces it, and the tree's prose about the convention
 /// lives outside them.
 pub const PLATFORM_REGISTRY_FILES: &str = "*.rs";
+
+/// The shell gates the tree holds beside the deploy scripts.
+///
+/// A gate enforces a principle whether or not it is written in Rust, and the
+/// tests that pin the deploy scripts are the only gate several of these
+/// principles have. Reading only the Rust half made them indistinguishable from
+/// principles with no gate at all, which is a claim about the world that nothing
+/// had measured.
+pub const PLATFORM_DEPLOY_GATES: &str = "deploy/scripts/tests/*.test.sh";
+
+/// Where the registry is read from, as `(pathspec, prefix)` pairs.
+///
+/// Paired rather than two lists: a file type must never be searched with the
+/// other language's prefix, and two lists kept in step by hand are two lists that
+/// end up one step apart.
+pub const PLATFORM_REGISTRY_SOURCES: &[(&str, &str)] = &[
+    (PLATFORM_REGISTRY_FILES, PLATFORM_DECLARATION_PREFIX),
+    (PLATFORM_DEPLOY_GATES, PLATFORM_SHELL_DECLARATION_PREFIX),
+];
 
 /// Why a principle's gate could not be settled, as a closed set.
 ///
@@ -253,9 +281,14 @@ impl Declarations {
         let mut unreadable = Vec::new();
         let mut duplicates = Vec::new();
         for (path, text) in lines {
-            let Some(rest) = text.trim_start().strip_prefix(PLATFORM_DECLARATION_PREFIX) else {
-                // The pattern anchors the prefix at the start of the line, so a
-                // match that does not carry it was matched for some other reason.
+            let trimmed = text.trim_start();
+            let Some(rest) = PLATFORM_DECLARATION_PREFIXES
+                .iter()
+                .find_map(|prefix| trimmed.strip_prefix(prefix))
+            else {
+                // The pattern anchors a prefix at the start of the line, so a
+                // match that carries none of them was matched for some other
+                // reason.
                 unreadable.push((path.clone(), text.trim().to_string()));
                 continue;
             };
@@ -700,6 +733,35 @@ mod tests {
         );
     }
 
+    /// A shell gate declares the same way its Rust counterpart does, so a
+    /// principle whose only gate is a deploy test reads as a gate. Reading only
+    /// the Rust half answered "no gate" for every one of them, which is a claim
+    /// about the tree that the tree contradicts.
+    #[test]
+    fn a_shell_gate_declares_its_principle_too() {
+        let path = "deploy/scripts/tests/governance-runtime-job.test.sh";
+        let registry = declarations(&[(path, "# principle: feedback_still_room")]);
+        assert_eq!(registry.gate_for("feedback_still_room"), Some(path));
+        assert_eq!(
+            judge(&row("feedback_still_room", Some("-")), &registry),
+            Verdict::Enforced(GateSide::Platform)
+        );
+    }
+
+    /// The prefix is exact, and a near miss is kept as unreadable rather than
+    /// dropped: a spelling the registry does not search for is a gate nothing
+    /// measures, which is the answer this shape exists to surface.
+    #[test]
+    fn a_shell_gate_that_misses_the_prefix_is_unreadable_rather_than_a_gate() {
+        let registry = declarations(&[
+            ("deploy/scripts/tests/x.test.sh", "#principle: feedback_x"),
+            ("deploy/scripts/tests/y.test.sh", "#  principle: feedback_y"),
+        ]);
+        assert_eq!(registry.gate_for("feedback_x"), None);
+        assert_eq!(registry.gate_for("feedback_y"), None);
+        assert_eq!(registry.unreadable_count(), 2);
+    }
+
     /// The slug is parsed out of the line, so a declaration nothing can key on
     /// is found and named rather than filtered out of the reading.
     #[test]
@@ -842,12 +904,35 @@ mod tests {
             "the expression is read by an unanchored matcher: the anchor is the whole of what \
              separates a module header from a sentence about the convention"
         );
-        for c in PLATFORM_DECLARATION_PREFIX.chars() {
-            assert!(
-                !"\\.^$*+?()[]{}|".contains(c),
-                "the declaration prefix now carries {c:?}: concatenating it no longer anchors \
-                 it, so the expression has to escape it instead"
-            );
+        // Every source is searched with its own prefix, so every prefix has to
+        // survive being concatenated -- not just the one this test started with.
+        for (_, prefix) in PLATFORM_REGISTRY_SOURCES {
+            let pattern = platform_declaration_pattern_for(prefix);
+            assert_eq!(pattern.strip_prefix('^'), Some(*prefix));
+            for c in prefix.chars() {
+                assert!(
+                    !"\\.^$*+?()[]{}|".contains(c),
+                    "the declaration prefix now carries {c:?}: concatenating it no longer \
+                     anchors it, so the expression has to escape it instead"
+                );
+            }
         }
+    }
+
+    /// The sources are paired, one prefix per file type, and the shell half is
+    /// searched in the tree the deploy gates live in. A pair that drifted would
+    /// search a file with the other language's prefix and find nothing -- which
+    /// reads as "no gate", the exact answer this widening removes.
+    #[test]
+    fn every_registry_source_is_paired_with_its_own_prefix() {
+        assert_eq!(
+            PLATFORM_REGISTRY_SOURCES,
+            &[
+                (PLATFORM_REGISTRY_FILES, PLATFORM_DECLARATION_PREFIX),
+                (PLATFORM_DEPLOY_GATES, PLATFORM_SHELL_DECLARATION_PREFIX),
+            ]
+        );
+        assert!(PLATFORM_DEPLOY_GATES.starts_with("deploy/"));
+        assert!(PLATFORM_DEPLOY_GATES.ends_with("*.test.sh"));
     }
 }

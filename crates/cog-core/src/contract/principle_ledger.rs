@@ -377,6 +377,26 @@ pub struct PrincipleRefusal {
 /// of it that happen to match.
 pub const PLATFORM_DECLARATION_PREFIX: &str = "//! principle:";
 
+/// The same declaration written in a shell gate's comment syntax.
+///
+/// A gate is a file that runs, and this tree holds gates in two languages: Rust
+/// modules and the shell tests beside the deploy scripts. Only one of them was
+/// readable as a declaration before, so a shell gate that enforced a principle
+/// showed up on every surface exactly like no gate at all.
+pub const PLATFORM_SHELL_DECLARATION_PREFIX: &str = "# principle:";
+
+/// Every prefix a declaration may be written with, one per comment syntax the
+/// tree holds gates in.
+///
+/// Closed at two, and the readers iterate this rather than testing for a
+/// particular language: a reader that accepted a third syntax the registry does
+/// not search for would answer for a gate nothing measures, which is the failure
+/// the single value was introduced to prevent.
+pub const PLATFORM_DECLARATION_PREFIXES: &[&str] = &[
+    PLATFORM_DECLARATION_PREFIX,
+    PLATFORM_SHELL_DECLARATION_PREFIX,
+];
+
 /// A principle whose carrier is no longer the text the account measured against.
 ///
 /// Named by slug with both hashes, because a bare count of drifted principles

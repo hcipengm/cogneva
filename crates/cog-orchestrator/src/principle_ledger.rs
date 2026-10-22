@@ -50,8 +50,8 @@ use cog_core::{
 
 use crate::change_measure::CheckTree;
 use crate::principle_measure::{
-    drift_annotation, judge, measurable, platform_declaration_pattern, Declarations, DeclaredTwice,
-    UnsettledReason, Verdict, PLATFORM_REGISTRY_FILES,
+    drift_annotation, judge, measurable, platform_declaration_pattern_for, Declarations,
+    DeclaredTwice, UnsettledReason, Verdict, PLATFORM_REGISTRY_SOURCES,
 };
 
 /// This loop's name in the process liveness registry, and the value of
@@ -485,22 +485,30 @@ async fn read_registry(
             format!("the platform's own tree could not be resolved, so no declaration could be read: {why}"),
         )
     })?;
-    let lines = tree
-        .matching_lines(
-            snapshot.rev(),
-            PLATFORM_REGISTRY_FILES,
-            &platform_declaration_pattern(),
-        )
-        .await
-        .map_err(|why| {
-            (
-                UnsettledReason::RegistryUnreadable,
-                format!(
-                    "the declaration lines could not be read at {}: {why}",
-                    snapshot.rev()
-                ),
+    // Every source or none: a registry read from half the files that may
+    // declare is a registry that answers "no gate" for a principle whose gate is
+    // in the half it did not read, and that answer is indistinguishable from one
+    // it measured.
+    let mut lines = Vec::new();
+    for (pathspec, prefix) in PLATFORM_REGISTRY_SOURCES {
+        let mut found = tree
+            .matching_lines(
+                snapshot.rev(),
+                pathspec,
+                &platform_declaration_pattern_for(prefix),
             )
-        })?;
+            .await
+            .map_err(|why| {
+                (
+                    UnsettledReason::RegistryUnreadable,
+                    format!(
+                        "the declaration lines could not be read at {} ({pathspec}): {why}",
+                        snapshot.rev()
+                    ),
+                )
+            })?;
+        lines.append(&mut found);
+    }
     Ok((Declarations::parse(&lines), snapshot.rev().to_string()))
 }
 

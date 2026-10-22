@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_threshold_must_be_derived_from_the_thing_it_measures
 # check-alert-rule-derived-bounds.py 的定向测试。
 #
 # 被测的是「读余量的规则只能拿余量跟 0 比」这条判据。治的病不是某一条规则写错了，
