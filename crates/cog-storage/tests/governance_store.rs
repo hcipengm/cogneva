@@ -1,3 +1,4 @@
+//! principle: feedback_a_state_row_and_the_step_that_explains_it_are_one_write
 //! The governance store, against a live PostgreSQL.
 //!
 //! A face is a task row, and every rule the governance layer trusts is a claim

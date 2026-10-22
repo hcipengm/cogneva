@@ -1,6 +1,7 @@
 //! principle: feedback_a_summary_is_prose_so_promql_written_into_it_is_read_as_placeholders
 //! principle: feedback_a_config_fields_contract_lives_in_the_crate_that_parses_it
 //! principle: feedback_a_brace_in_prose_is_read_as_a_placeholder_of_the_document_it_sits_in
+//! principle: feedback_removing_a_rule_does_not_close_the_rows_it_left
 //! Infrastructure alert watcher — the producer side of persisted infra alerts.
 //!
 //! SupervisorEvents only cover what the supervisor itself observes (agents,
