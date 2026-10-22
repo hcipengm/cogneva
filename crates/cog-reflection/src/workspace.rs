@@ -1,3 +1,5 @@
+//! principle: feedback_a_registration_without_a_symmetric_removal_grows_a_shared_file_forever
+//!
 //! 沙盒工作区动态分配。
 //!
 //! 工作树层面的失败（取树、回收、git 起不来）是环境问题：变更本身没有被判定过，重试有意义。
