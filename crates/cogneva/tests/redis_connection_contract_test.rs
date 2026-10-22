@@ -1,3 +1,5 @@
+//! principle: feedback_a_text_scanning_gate_names_the_file_so_fixing_every_occurrence_is_the_unit
+//!
 //! Gate: every redis connection in this workspace is replaceable and bounded.
 //!
 //! Two failures this exists for, both of which cost hours in the cluster:
