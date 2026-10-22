@@ -774,7 +774,12 @@ async fn a_batch_the_bands_fill_completely_still_asks_the_rows_behind_them() {
         .await
         .expect("fold the declarations");
     // The banded rows are measured, so the rows behind them are strictly the
-    // oldest in the set rather than tied with them on "nothing has looked".
+    // oldest in the set rather than tied with them on "nothing has looked". The
+    // rows behind are then aged by hand: this file's other tests write to the
+    // same database at the same time, and a row nothing has measured sorts ahead
+    // of every measured one whatever its age, so the tie among the unmeasured
+    // rows is what decides which of them a bounded read reaches. Ten days puts
+    // these six at the head of that tie without sleeping.
     for id in &banded {
         store
             .apply_measurement(
@@ -783,6 +788,14 @@ async fn a_batch_the_bands_fill_completely_still_asks_the_rows_behind_them() {
             .await
             .expect("measure a banded row");
     }
+    sqlx::query(
+        "UPDATE change_ledger SET first_seen_at = now() - interval '10 days' \
+         WHERE scope LIKE $1",
+    )
+    .bind(format!("{marker}/behind-%"))
+    .execute(&pool)
+    .await
+    .expect("age the rows behind the bands");
     let behind_scopes: Vec<&str> = behind.iter().map(|id| id.scope.as_str()).collect();
     let in_slice = |rows: &[cog_core::ChangeLedgerRow]| -> Vec<String> {
         rows.iter()
@@ -792,11 +805,12 @@ async fn a_batch_the_bands_fill_completely_still_asks_the_rows_behind_them() {
     };
 
     let slice = in_slice(&store.outstanding(BATCH).await.expect("read the batch"));
-    assert_eq!(
-        slice.len(),
-        BATCH,
-        "the bound is still the bound: the two legs overlap only on a row that \
-         is both urgent and stale, and here none is"
+    assert!(
+        slice.len() <= BATCH,
+        "the bound still bounds: the two legs overlap only on a row that is both \
+         banded and stale, and the overlap cannot make the slice wider than the \
+         caller asked for -- got {} rows",
+        slice.len()
     );
     let reached = behind_scopes
         .iter()
@@ -808,13 +822,11 @@ async fn a_batch_the_bands_fill_completely_still_asks_the_rows_behind_them() {
          the rows behind it; the read has to reserve one, or those rows are \
          never asked -- the slice was {slice:?}"
     );
-    assert!(
-        banded.iter().any(|id| id.scope == slice[0]),
-        "reserving part of the bound does not hand it away: the slice still \
-         leads with the band order, got {}",
-        slice[0]
-    );
 
+    // The slice itself is shared with every other test in this file, so which of
+    // its slots are this probe's depends on what else is running. The order
+    // inside it does not: among the rows this probe owns, the ones holding a band
+    // come before the ones nobody prioritised, in every read.
     let whole = in_slice(&store.outstanding(10_000).await.expect("read the set"));
     assert_eq!(
         whole.len(),
@@ -824,7 +836,8 @@ async fn a_batch_the_bands_fill_completely_still_asks_the_rows_behind_them() {
     );
     assert!(
         banded.iter().any(|id| id.scope == whole[0]),
-        "and in the band order the hand-over reads: the urgent row is first, got {}",
+        "and in the band order the hand-over reads: the banded rows come before \
+         the ones behind them, got {}",
         whole[0]
     );
 
@@ -946,8 +959,12 @@ async fn landed_rows_are_the_other_half_of_outstanding_read_oldest_first() {
          two hours first"
     );
 
+    // The whole set, not a batch: which rows a bounded read takes is a question
+    // about the order and the bound, and this test is about which states are in
+    // it at all. A batch would also make the verdict depend on what the other
+    // tests in this file are writing at the same moment.
     let outstanding: Vec<ChangeIdentity> = store
-        .outstanding(50)
+        .outstanding(10_000)
         .await
         .expect("read the outstanding set")
         .into_iter()
