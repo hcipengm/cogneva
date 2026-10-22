@@ -1441,6 +1441,30 @@ fn alert_dedup_key(inst: &AlertInstance) -> String {
     }
 }
 
+/// Rules whose row in the `alerts` table belongs to a different writer.
+///
+/// `llm_upstream_pool_down` is written every tick by the gateway's pool sync,
+/// keyed by the pool-down *event* — the unix second the pool crossed its lower
+/// edge — so one row can answer "how many times did the pool die", and the
+/// recovery closes that row by the same name. This bridge sees the same
+/// condition as supervisor events, and its key is just the rule name: persisting
+/// it opens a **second** row for one event, and the recovery closes only the one
+/// it was keyed to.
+///
+/// Measured 2026-10-23: `llm_upstream_pool_down@1792687465` opened 16:44:25 and
+/// never resolved, while its bare-key twin opened 17:41:26 and resolved
+/// 22:55:29 — one condition, two rows, one of them doomed to stay firing and to
+/// count against every reader of the table (the attention verdict had it as the
+/// oldest unattended row at 3.4 days).
+///
+/// The webhook still receives these events; only the row is not ours to write.
+const PERSISTED_ELSEWHERE: &[&str] = &["llm_upstream_pool_down"];
+
+/// Whether this bridge is the writer of the row for `rule`.
+fn owns_the_row(rule: &str) -> bool {
+    !PERSISTED_ELSEWHERE.contains(&rule)
+}
+
 /// Human-readable alert text. The mapping layer writes the text into the
 /// `message` label (single source of truth for wording); this only falls back
 /// so a stored row never carries an empty message.
@@ -1478,6 +1502,12 @@ async fn persist_alerts(store: &PostgresAlertStore, alerts: &[AlertEvent]) -> bo
             AlertEvent::Firing(inst) => (true, inst),
             AlertEvent::Resolved(inst) => (false, inst),
         };
+        // A row another writer owns is not "failed to write": nothing was owed
+        // here, and reporting it as undelivered would put a false miss on the
+        // delivery series.
+        if !owns_the_row(&inst.rule_name) {
+            continue;
+        }
         let alert = NewAlert {
             rule: inst.rule_name.clone(),
             dedup_key: alert_dedup_key(inst),
@@ -1816,9 +1846,37 @@ mod tests {
             AlertState::Firing,
         );
         assert_eq!(alert_dedup_key(&resource), "agent_resource_alert:a1:cpu");
-        // 池全灭告警没有实例标签，去重键就是规则名（与网关侧写入同键）。
+        // 池全灭告警没有实例标签，去重键就是规则名——**不是**网关那一侧写的键：
+        // 网关按「这一次事件」开行（规则名 + 下沿的 unix 秒），恢复也照那个名字关。
+        // 两边同写一条条件，键却是两个，所以这一侧根本不该落库（见 `owns_the_row`）。
         let pool = inst("llm_upstream_pool_down", &[], AlertState::Firing);
         assert_eq!(alert_dedup_key(&pool), "llm_upstream_pool_down");
+    }
+
+    #[test]
+    fn the_bridge_does_not_write_the_row_the_gateway_owns() {
+        // 池全灭那条行由网关按事件开、按同一个名字关。这条桥的键是裸规则名，
+        // 同一次事件会在表里开出第二行，而恢复只关得掉其中一行——另一行就永远
+        // firing，并计入每一个读表的人（2026-10-23 实测：旧那行 3.4 天没关）。
+        assert!(!owns_the_row("llm_upstream_pool_down"));
+        // 反向对照：没有第二个写者的规则仍然由这条桥落库。少了这一格，「跳过」
+        // 写成「整批都不写」也会绿。
+        assert!(owns_the_row("agent_unhealthy"));
+        assert!(owns_the_row("task_dead_letter"));
+        // 跳过的是那一行，不是这条告警：通知出口照旧收到它。
+        let down = cog_core::SupervisorEvent::LlmUpstreamPoolDown {
+            evidenced_recovery_unix: 0,
+            next_attempt_unix: 0,
+            unavailable: vec!["https://example.invalid/v1|m".into()],
+            pool_size: 2,
+            declared_min_healthy: Some(1),
+            quota_window_secs: 3600,
+            timestamp: Utc::now(),
+        };
+        assert!(matches!(
+            supervisor_event_to_alert_events(&down).first(),
+            Some(AlertEvent::Firing(_))
+        ));
     }
 
     #[test]
