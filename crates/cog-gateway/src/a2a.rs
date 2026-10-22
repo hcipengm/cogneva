@@ -154,6 +154,38 @@ impl GoalReader for Arc<dyn OrchestratorControl> {
     }
 }
 
+/// 两个受理入口要的那一个口：把这一行递进去，再把它读回来。
+///
+/// 与 [`GoalReader`] 分开一层，是为了让「受理」这件事本身有一个能测的接线。
+/// 判据 [`accepted`] 只判回执；处理函数用没用它、读回来的那一行是不是库里
+/// 那一行，都在这一层才看得见——而直接对 `OrchestratorControl` 写测试要么桩
+/// 五十个方法，要么什么也没钉住。
+#[async_trait::async_trait]
+pub trait GoalSink: GoalReader {
+    async fn submit(&self, goal: &str, row: Task) -> cog_core::SFResult<Vec<String>>;
+}
+
+#[async_trait::async_trait]
+impl GoalSink for Arc<dyn OrchestratorControl> {
+    async fn submit(&self, goal: &str, row: Task) -> cog_core::SFResult<Vec<String>> {
+        self.submit_goal_auto(goal, vec![row]).await
+    }
+}
+
+/// 受理一条 goal：递进去、只认图回执、再把库里那一行读回来。
+///
+/// 三步是一件事的三个必要条件，所以收在一个函数里而不是留给每条入口各写一遍：
+/// 递进去不算收下（批量写入会跳过已在册的行，返回的是它收下的那些），收下不算
+/// 读得回来（读的是库里的当前行，不是递进去的那一份副本）。
+async fn accept_goal(sink: &dyn GoalSink, goal: &str, row: Task) -> Result<Task, String> {
+    let goal_id = row.id.clone();
+    let submitted = sink.submit(goal, row).await;
+    accepted(&goal_id, submitted)?;
+    sink.goal(&goal_id)
+        .await
+        .ok_or_else(|| format!("the goal '{goal_id}' was submitted but cannot be read back"))
+}
+
 // ─── 状态映射 ─────────────────────────────────────────────────────────────
 
 /// cogneva 调度器那一套状态 → A2A 线上那一套。
@@ -463,11 +495,7 @@ pub async fn message_stream_handler(
     // 提交在开流之前等它落地，理由与 `message/send` 是同一个：这一行要读不回来，
     // 流能给出的只有「这一行从没出现过」——而那与「提交被拒」是两件事，对端要等
     // 满一个截止时间才能听到前者。拒了就当场报一帧，理由照实说。
-    let submitted = state
-        .orchestrator
-        .submit_goal_auto(&request.goal, vec![goal_row])
-        .await;
-    if let Err(reason) = accepted(&goal_id, submitted) {
+    if let Err(reason) = accept_goal(&state.orchestrator, &request.goal, goal_row).await {
         tracing::error!(goal_id = %goal_id, reason = %reason, "a2a message/stream was not accepted");
         let frame = sse_frame(&json!({
             "jsonrpc": "2.0",
@@ -604,9 +632,18 @@ fn accepted(goal_id: &str, submitted: cog_core::SFResult<Vec<String>>) -> Result
 /// `tasks/get` 永远回「没有这个任务」的形状，与它抄错 id 完全同形。所以这里等的是
 /// **提交本身**（一次入图／落库），不是这一次运行。
 ///
-/// 这条等待今天是短的：本进程的编排器没有接规划器，`submit_goal_auto` 走的是直接
-/// 入图那条分支。哪天给它接上规划器（分解要调上游），这个处理函数要么改成「先落行、
-/// 后台分解」，要么给这次等待定一个上界，不能原样留在这里。
+/// 这条等待今天不是「一次入图」那么短：生产进程的编排器接了规划器
+/// （`OrchestratorPlugin` 把 `action_planner` 与 skill registry 都装上），
+/// 一条没有已验证子任务的 goal 会走分解——那是一次上游调用，重试次数由
+/// `decomposition_max_attempts` 定。所以等的是**分解的受理结论**，不是一次
+/// 数据库写入：
+///
+/// - 上游不可用时分解被拒，这里当场回一条带原因的拒答，不留下一个读不回来的 id；
+/// - 上游可用时回的是分解之后的图回执，对端拿到就能追。
+///
+/// 这条路今天的代价是延迟跟着分解走。若哪天分解慢到不可接受，改法不是把等待
+/// 删掉（那会退回「先答应、再失败」），而是把受理拆成两步：先落行、再由分解
+/// 写结论，并让这一行在分解完成前读作 `submitted`。
 async fn rpc_message_send(state: &Arc<GatewayState>, body: &Value, rpc_id: &Value) -> Response {
     let request = match parse_message_stream(body) {
         Ok(request) => request,
@@ -622,26 +659,14 @@ async fn rpc_message_send(state: &Arc<GatewayState>, body: &Value, rpc_id: &Valu
     let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
     goal_row.workspace_id = None;
     let orchestrator = state.orchestrator.clone();
-    let submitted = orchestrator
-        .submit_goal_auto(&request.goal, vec![goal_row])
-        .await;
-    if let Err(reason) = accepted(&goal_id, submitted) {
-        tracing::error!(goal_id = %goal_id, reason = %reason, "a2a message/send was not accepted");
-        return (StatusCode::OK, Json(rpc_error(rpc_id, -32603, reason))).into_response();
-    }
-
     // 回执读的是库里的那一行，不是本地构造的这一份：受理之后状态可能已经被派工
     // 改过，对端要的是它现在是什么样。
-    let Some(row) = orchestrator.get_task(&goal_id).await else {
-        return (
-            StatusCode::OK,
-            Json(rpc_error(
-                rpc_id,
-                -32603,
-                format!("the goal '{goal_id}' was submitted but cannot be read back"),
-            )),
-        )
-            .into_response();
+    let row = match accept_goal(&orchestrator, &request.goal, goal_row).await {
+        Ok(row) => row,
+        Err(reason) => {
+            tracing::error!(goal_id = %goal_id, reason = %reason, "a2a message/send was not accepted");
+            return (StatusCode::OK, Json(rpc_error(rpc_id, -32603, reason))).into_response();
+        }
     };
     tracing::info!(goal_id = %goal_id, "a2a message/send goal accepted");
 
@@ -1103,5 +1128,96 @@ mod tests {
     #[test]
     fn an_empty_receipt_is_not_an_acceptance() {
         assert!(accepted("g-1", Ok(Vec::new())).is_err());
+    }
+
+    /// 受理这一步自己要走完三步：递进去、只认回执、把库里那一行读回来。
+    ///
+    /// 这钉的是**接线**，不是判据：把 `accept_goal` 换回「spawn 之后回本地构造
+    /// 的那一行」，判据函数仍全绿，这里会红在「读回来的不是库里那一行」。
+    enum Receipt {
+        Takes,
+        TakesAnother(String),
+        Empty,
+        Fails(String),
+    }
+
+    struct ScriptedSink {
+        receipt: Receipt,
+        row: Option<Task>,
+    }
+
+    #[async_trait::async_trait]
+    impl GoalReader for ScriptedSink {
+        async fn goal(&self, _goal_id: &str) -> Option<Task> {
+            self.row.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GoalSink for ScriptedSink {
+        async fn submit(&self, _goal: &str, row: Task) -> cog_core::SFResult<Vec<String>> {
+            match &self.receipt {
+                Receipt::Takes => Ok(vec![row.id]),
+                Receipt::TakesAnother(other) => Ok(vec![other.clone()]),
+                Receipt::Empty => Ok(Vec::new()),
+                Receipt::Fails(reason) => Err(cog_core::SFError::Agent(reason.clone())),
+            }
+        }
+    }
+
+    fn offered() -> Task {
+        let mut row = Task::goal_row("g-1".to_string(), "a goal");
+        row.workspace_id = None;
+        row
+    }
+
+    #[tokio::test]
+    async fn a_submission_the_graph_refuses_is_refused_before_any_row_is_promised() {
+        for (label, receipt) in [
+            ("another id", Receipt::TakesAnother("g-2".into())),
+            ("nothing", Receipt::Empty),
+            ("store down", Receipt::Fails("store is down".into())),
+        ] {
+            let sink = ScriptedSink {
+                receipt,
+                // A row that is readable must not rescue a submission the graph
+                // did not take: the promise is about this id, not about the store.
+                row: Some(offered()),
+            };
+            let refused = accept_goal(&sink, "a goal", offered())
+                .await
+                .expect_err(&format!("{label} is not an acceptance"));
+            assert!(!refused.is_empty(), "{label}: the refusal has to say why");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_accepted_goal_answers_with_the_row_the_store_holds_now() {
+        let mut current = offered();
+        current.status = TaskStatus::Running;
+        let sink = ScriptedSink {
+            receipt: Receipt::Takes,
+            row: Some(current),
+        };
+        let row = accept_goal(&sink, "a goal", offered())
+            .await
+            .expect("the graph took this id and the store can read it back");
+        assert_eq!(
+            row.status,
+            TaskStatus::Running,
+            "the answer is the row read back from the store, not the copy we offered"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_goal_that_cannot_be_read_back_is_not_an_acceptance() {
+        let sink = ScriptedSink {
+            receipt: Receipt::Takes,
+            row: None,
+        };
+        let refused = accept_goal(&sink, "a goal", offered())
+            .await
+            .expect_err("an id that reads back as nothing is the never-existing case again");
+        assert!(refused.contains("read back"), "{refused}");
     }
 }
