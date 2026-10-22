@@ -39,13 +39,24 @@ async fn pass() -> InboxRetirement {
     InboxRetirement::new(raw_conn().await)
 }
 
-async fn key(agent_id: &str) -> String {
+/// Remove what a test made.
+///
+/// The pass itself will not: two of these streams end with a command in them, and
+/// a stream with an entry is exactly what it refuses to touch. Cleaning up here
+/// is what keeps a run against a live Redis from leaving a key nobody will ever
+/// read and no sweep will ever take.
+async fn clear(agent_id: &str) {
     let mut conn = raw_conn().await;
     let _: () = redis::cmd("DEL")
         .arg(cog_core::agent_inbox_stream(agent_id))
         .query_async(&mut conn)
         .await
         .expect("clear");
+}
+
+async fn key(agent_id: &str) -> String {
+    let mut conn = raw_conn().await;
+    clear(agent_id).await;
     let _: () = redis::cmd("XGROUP")
         .arg("CREATE")
         .arg(cog_core::agent_inbox_stream(agent_id))
@@ -124,6 +135,7 @@ async fn an_empty_inbox_whose_agent_is_not_registered_is_a_candidate() {
         Some(0),
         "an empty inbox with no owner is a candidate, and its length comes with it"
     );
+    clear(&agent).await;
 }
 
 #[tokio::test]
@@ -140,6 +152,7 @@ async fn an_inbox_whose_agent_is_registered_is_not_a_candidate() {
     assert_eq!(found, None, "a registered agent still owns its inbox");
 
     deregister(&agent).await;
+    clear(&agent).await;
 }
 
 /// An entry is a command somebody was told had been queued. Empty is the whole
@@ -159,6 +172,7 @@ async fn an_inbox_with_a_pending_command_is_not_a_candidate() {
         found, None,
         "an inbox holding a command is never a candidate, owned or not"
     );
+    clear(&agent).await;
 }
 
 #[tokio::test]
@@ -185,6 +199,7 @@ async fn retiring_removes_the_stream_and_reports_it() {
         None,
         "the retired stream is gone rather than reported again on the next pass"
     );
+    clear(&agent).await;
 }
 
 /// The scan and the delete are two round trips. A command published to an
@@ -224,4 +239,5 @@ async fn a_stream_that_gained_a_command_after_the_scan_survives_the_delete() {
         None,
         "the command is still in the stream, which is why the stream is no longer a candidate"
     );
+    clear(&agent).await;
 }
