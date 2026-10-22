@@ -502,12 +502,19 @@ fn parse_alerts_response(
             .iter()
             .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
             .collect();
-        if labels.get(&mirror.label).map(String::as_str) != Some(mirror.value.as_str()) {
+        let marked = labels.get(&mirror.label).map(String::as_str) == Some(mirror.value.as_str());
+        if !marked && !mirror.include_unmarked {
             continue;
         }
         let Some(rule) = labels.get("alertname").cloned() else {
             continue;
         };
+        // Exclusions beat both selections: a name listed here is never an
+        // incident, marked or not. It also keeps the reader honest -- the gap
+        // reading subtracts this same list from what it expects in the table.
+        if mirror.exclude.iter().any(|name| name == &rule) {
+            continue;
+        }
         // Already booked by the in-process evaluation of the same rule: two
         // writers keyed differently would open two rows for one incident.
         if own_rules.contains(rule.as_str()) || rule == EVAL_FAILURE_RULE || rule == MIRROR_SOURCE {
@@ -1453,6 +1460,8 @@ mod tests {
         let mirror = crate::config::AlertMirrorConfig {
             label: "cogneva_io_managed".into(),
             value: "true".into(),
+            include_unmarked: false,
+            exclude: Vec::new(),
         };
         // `node_disk_usage_high` is one of this process's own rules: the
         // in-process evaluation books it, and a second writer would open a
@@ -1468,11 +1477,84 @@ mod tests {
         assert_eq!(alerts[1].severity, cog_core::AlertSeverity::Critical);
     }
 
+    fn upstream_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "status": "success",
+            "data": {"alerts": [
+                {"state": "firing",
+                 "labels": {"alertname": "KubeJobFailed", "severity": "warning",
+                            "namespace": "cogneva", "pod": "cogneva-build-7f9c"}},
+                {"state": "firing",
+                 "labels": {"alertname": "Watchdog", "severity": "none"}},
+                {"state": "firing",
+                 "labels": {"alertname": "CognevaAlertUnattended", "severity": "warning",
+                            "cogneva_io_managed": "true"}},
+                {"state": "resolved",
+                 "labels": {"alertname": "KubePodCrashLooping", "severity": "warning"}}
+            ]}
+        })
+    }
+
+    fn upstream_mirror(include_unmarked: bool) -> crate::config::AlertMirrorConfig {
+        crate::config::AlertMirrorConfig {
+            label: "cogneva_io_managed".into(),
+            value: "true".into(),
+            include_unmarked,
+            exclude: vec!["Watchdog".into(), "InfoInhibitor".into()],
+        }
+    }
+
+    #[test]
+    fn unmarked_alerts_stay_out_until_the_mirror_is_asked_for_them() {
+        // 默认只抄带标记的：现网每一次升级都走这条路径，行为必须一模一样。
+        let alerts = parse_alerts_response(
+            &upstream_fixture(),
+            &upstream_mirror(false),
+            &HashSet::new(),
+        )
+        .unwrap();
+        let names: Vec<&str> = alerts.iter().map(|a| a.rule.as_str()).collect();
+        assert_eq!(names, vec!["CognevaAlertUnattended"]);
+    }
+
+    #[test]
+    fn asking_for_unmarked_alerts_puts_the_upstream_ones_in_the_ledger() {
+        let alerts =
+            parse_alerts_response(&upstream_fixture(), &upstream_mirror(true), &HashSet::new())
+                .unwrap();
+        let names: Vec<&str> = alerts.iter().map(|a| a.rule.as_str()).collect();
+        // `Watchdog` fires by construction, so it is in the fixture and must not
+        // come back; `KubePodCrashLooping` is resolved, not firing.
+        assert_eq!(
+            names,
+            vec!["KubeJobFailed", "CognevaAlertUnattended"],
+            "exclusions and the firing filter both still apply"
+        );
+        // 上游规则的身份带 pod：同一个 Job 失败一次就是一个实例，这一行说得清是谁。
+        assert_eq!(
+            alerts[0].key(),
+            "KubeJobFailed:namespace=cogneva,pod=cogneva-build-7f9c"
+        );
+    }
+
+    #[test]
+    fn an_excluded_name_is_skipped_even_when_it_carries_the_marker() {
+        // 排除表压过两种选择：列进去的名字永远不是事件。读侧减的是同一份表，
+        // 所以它也不会被报成缺口。
+        let mut mirror = upstream_mirror(true);
+        mirror.exclude.push("CognevaAlertUnattended".into());
+        let alerts = parse_alerts_response(&upstream_fixture(), &mirror, &HashSet::new()).unwrap();
+        let names: Vec<&str> = alerts.iter().map(|a| a.rule.as_str()).collect();
+        assert_eq!(names, vec!["KubeJobFailed"]);
+    }
+
     #[test]
     fn mirror_key_names_the_subject_not_the_alert_envelope() {
         let mirror = crate::config::AlertMirrorConfig {
             label: "cogneva_io_managed".into(),
             value: "true".into(),
+            include_unmarked: false,
+            exclude: Vec::new(),
         };
         let alerts = parse_alerts_response(&alerts_fixture(), &mirror, &HashSet::new()).unwrap();
         let e2e = &alerts[0];
@@ -1490,6 +1572,8 @@ mod tests {
         let mirror = crate::config::AlertMirrorConfig {
             label: "cogneva_io_managed".into(),
             value: "true".into(),
+            include_unmarked: false,
+            exclude: Vec::new(),
         };
         let err = serde_json::json!({"status": "error", "error": "boom"});
         assert!(parse_alerts_response(&err, &mirror, &HashSet::new()).is_err());

@@ -230,6 +230,31 @@ pub struct AlertMirrorConfig {
     /// arrives here as `cogneva_io_managed`.
     pub label: String,
     pub value: String,
+    /// Book alerts the marker does not select, too. A cluster running a
+    /// standard rules library carries alerts this repository never wrote --
+    /// `KubeJobFailed`, `CPUThrottlingHigh` -- and the marked-only selection
+    /// leaves them firing outside the ledger, so the table stops being the
+    /// whole account of what is wrong. Off by default because turning it on
+    /// books every upstream alert, including one row per affected pod, and
+    /// each row opens an evolution task.
+    #[serde(default)]
+    pub include_unmarked: bool,
+    /// Names never booked, whichever way they were selected. The default is
+    /// the two kube-prometheus sentinels: `Watchdog` fires by construction
+    /// (its absence is the alarm) and `InfoInhibitor` fires whenever no
+    /// informational alert is, so both would sit in the ledger forever
+    /// describing nothing. Excluding a name here is excluded from the reader
+    /// side too -- it reads the same list, so a name skipped by design is not
+    /// reported as a gap.
+    #[serde(default = "default_mirror_exclusions")]
+    pub exclude: Vec<String>,
+}
+
+fn default_mirror_exclusions() -> Vec<String> {
+    ["Watchdog", "InfoInhibitor"]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
 }
 
 impl Default for InfraWatchConfig {
@@ -791,6 +816,16 @@ mod tests {
         let dbg = format!("{:?}", cfg.clickhouse);
         assert!(!dbg.contains("p@ss"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mirror_selection_defaults_leave_the_ledger_as_it_was() {
+        // 现网配置里只有那一对标签。它必须照旧只抄带标记的，并且不列而排除哨兵——
+        // 少写一个键就悄悄开始抄上游告警，是这次改动最容易造成的破坏。
+        let cfg: AlertMirrorConfig =
+            serde_json::from_str(r#"{"label": "cogneva_io_managed", "value": "true"}"#).unwrap();
+        assert!(!cfg.include_unmarked);
+        assert_eq!(cfg.exclude, vec!["Watchdog", "InfoInhibitor"]);
     }
 
     #[test]

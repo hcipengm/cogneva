@@ -468,10 +468,15 @@ data:
           "prometheus_url": "http://cog-observability-prometheus.monitoring:9090",
           "poll_interval_secs": 60,
           "eval_failure_alert_after": 3,
-          "_mirror_alerts_comment": "Prometheus 自己求值的告警里，哪些该抄进同一张告警表。这里给一对标签键值：带这对标签的 firing 告警每拍被抄成一行，Prometheus 里不再 firing 就 resolve。标在规则上而不是列在这里，是为了让规则和它的投递声明同一次改动落地、改名也丢不掉投递。名字已经在本进程 rules 里的跳过：那条由进程内求值记账，两个写者会为同一件事开两行。不配 = 不抄。",
+          "_mirror_alerts_comment": "Prometheus 自己求值的告警里，哪些该抄进同一张告警表。这里给一对标签键值：带这对标签的 firing 告警每拍被抄成一行，Prometheus 里不再 firing 就 resolve。标在规则上而不是列在这里，是为了让规则和它的投递声明同一次改动落地、改名也丢不掉投递。名字已经在本进程 rules 里的跳过：那条由进程内求值记账，两个写者会为同一件事开两行。不配 = 不抄。另外两个键：`include_unmarked` 打开后连**不带标记**的告警也抄——集群自带的规则库（kube-prometheus 的 KubeJobFailed、CPUThrottlingHigh 一类）不带这个标记，不打开它们就永远进不了账本，账本也就不是全集；打开之前先确认读这张表的任务面排得空，因为每一行都会开一个演进任务。`exclude` 里点名的规则无论带不带标记都不抄，默认是 kube-prometheus 的两个哨兵：Watchdog 按构造常亮、InfoInhibitor 在没有任何 info 级告警时亮，两者进账本都只是在描述「没事」。",
           "mirror_alerts": {
             "label": "cogneva_io_managed",
-            "value": "true"
+            "value": "true",
+            "include_unmarked": false,
+            "exclude": [
+              "Watchdog",
+              "InfoInhibitor"
+            ]
           },
           "_retired_rules_comment": "已经停用的规则名。从 rules 里删掉一条规则不会动它已经开着的行，那些行会以「正在持续」的样子一直留在 state=firing 那一面上（resolved_at 空、last_seen_at 停在删除那一刻），会去关它的只有那条规则自己，而它已经不在了。点名在这里的，watcher 启动时按普通解析的同一路径把它们结算掉。停用的名字不能同时出现在 rules 里。",
           "retired_rules": [

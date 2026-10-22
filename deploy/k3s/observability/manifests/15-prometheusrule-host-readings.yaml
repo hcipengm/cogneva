@@ -669,8 +669,9 @@ spec:
             description: "这一环在名册里，但没有任何可执行的判据：它每一拍都被跳过，跳过在报告里长得像 ok。补判据，或者在 `scripts/host/cogneva-e2e-rings-reading.sh` 的环表里写明它为什么不该有判据。给一天的时间窗：新增一环、判据后补是正常节奏，缺判据挂一天才是欠账。"
 
     # 告警的**回写**：Prometheus 自己求值出来的告警（规则带 `cogneva_io_managed="true"`）每拍被
-    # 抄进 `alerts` 表，WebUI 的告警面读的正是这张表。这条链断在哪一段，四种红各自一格——
-    # 它们的修法完全不同，合并成一条「镜像坏了」只会让人从第一段开始猜。
+    # 抄进 `alerts` 表，WebUI 的告警面读的正是这张表。这条链断在哪一段，每种红各自一格——
+    # 它们的修法完全不同，合并成一条「镜像坏了」只会让人从第一段开始猜。最后两格不是「抄漏」，
+    # 而是「从来不抄」：账本的选择器之外还有正在响的规则，那份账就不是全集。
     - name: cogneva-alert-mirror
       rules:
         # 树上给规则打了标记、集群里的 PrometheusRule 对象一条都没有：清单没 apply。这一档
@@ -719,6 +720,32 @@ spec:
           annotations:
             summary: "有 {{ $value }} 行镜像告警开着，但已经有十分钟没人看过它"
             description: "开着的行靠 `last_seen_at` 每拍前进来证明「条件仍然成立」。它停住意味着镜像那一段不再跑（进程活着、只是这一支停了）或者 Prometheus 那边读不回来了。`cogneva_alert_mirror_stale_rule{rule=…}` 点名是哪几条；`cogneva_alert_mirror_oldest_open_age_seconds` 给最老的那一条。先看 `infra_watch_eval_failure` 有没有在同一条原因上响——读失败时镜像故意不 resolve，那时停住是设计，不是故障。"
+
+        # 前四格一直在绿而账本不是全集：Prometheus 里在响、规则不带镜像标记，选择器从来看
+        # 不见它们。这一格问的不是「抄漏了」而是「有没有位置抄」。上游规则（kube-prometheus
+        # 带的）正是这一档：`KubeJobFailed`、`CPUThrottlingHigh` 都在报真实事件，而平台的
+        # 告警面、告警账、`signal_watcher` 开任务的那条链，全都只知道带标记的那 49 条。
+        - alert: CognevaAlertMirrorUnmirrored
+          expr: max(cogneva_alert_mirror_unmirrored_firing) > 0
+          for: 1h
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "有 {{ $value }} 条告警正在 Prometheus 里响，而镜像的选择器从来看不见它们"
+            description: "`cogneva_alert_mirror_unmirrored_rule{rule=…}` 点名是哪几条。它们不是抄漏——带标记的那批的去向由前四格判；这批连选择器都没进过（`ALERTS{…cogneva_io_managed=\"true\"}` 之外）。哨兵 `Watchdog` / `InfoInhibitor` 已按设计剔除，只在 `cogneva_alert_mirror_unmirrored_ignored_firing` 里计数。给一小时：这是结构缺口，不是一次性的擦肩，短时间的上游抖动不该被读成「账本坏了」。修法两条，选哪条是设计决定：放宽镜像选择器（上游规则的身份带 pod，重新引入每 Pod 一行的抖动，得先想清楚怎么收敛），或者引入 Alertmanager 让上游告警走它自己的路由再回写。在那之前，这条红说的是实话：账本不是全集。"
+
+        # 全集这一面**读不到**：与上一格不同的坏法，修法也不同（一个是设计缺口，一个是探针
+        # 自身读不回来）。它必须自成一格，否则读不到会被下一格印成「没有未镜像的告警」。
+        - alert: CognevaAlertMirrorUnmirroredUnreadable
+          expr: max(cogneva_alert_mirror_unmirrored_measured) == 0
+          for: 15m
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "告警镜像读数读不到「全部 firing」那一面，账本完整与否未知"
+            description: "读数每拍会额外问一次 `ALERTS{alertstate=\"firing\"}`（不带标记过滤），用来判账本是不是全集。这一问失败了：`cogneva_alert_mirror_unmirrored_measured=0`，此时 `unmirrored_firing` 印 0 但那个 0 是**没读到**、不是**没有**。另外四格照常有效——读数故意不整体退化成读不到，因为丢掉四格有效读数换一个未知更亏。修法：查 Prometheus 能不能回答这条查询（`/api/v1/query?query=ALERTS{alertstate=\"firing\"}`），再查宿主到它的网络代理。给十五分钟：进程每 60 秒一拍。"
 
     # 表里的告警有没有人看：这一组是这条链的**读者**那一端。前面几组判「该进表的进没进、
     # 进了的还活不活」，都只说明到表为止；表之后原本没有读者，2026-10-22 主线停摆七十分钟，

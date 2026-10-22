@@ -107,3 +107,50 @@ tests:
           - exp_labels:
               severity: warning
               cogneva_io_managed: "true"
+
+  # 六、账本不是全集：上游规则在响、选择器看不见它。`for: 1h` ⇒ 55m 还不许响，65m 必须响。
+  # 这一格与「抄漏了」的差别只在读数上（`unmirrored` 对 `missing`），在规则形状上一样，
+  # 所以同样要钉住边界的**两侧**。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_mirror_unmirrored_firing'
+        values: '1x130'
+      - series: 'cogneva_alert_mirror_unmirrored_measured'
+        values: '1x130'
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: CognevaAlertMirrorUnmirrored
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: CognevaAlertMirrorUnmirrored
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+      # 全集读得到的时候，读不到那一格不许跟着响。
+      - eval_time: 65m
+        alertname: CognevaAlertMirrorUnmirroredUnreadable
+        exp_alerts: []
+
+  # 七、全集读不到：`unmirrored_measured=0` 而 `unmirrored_firing=0`——后一个 0 是「没读到」，
+  # 不是「没有」。把两条规则写成同一个形状（都判 firing > 0）就会在这里读成绿。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_mirror_unmirrored_measured'
+        values: '0x60'
+      - series: 'cogneva_alert_mirror_unmirrored_firing'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CognevaAlertMirrorUnmirroredUnreadable
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: CognevaAlertMirrorUnmirroredUnreadable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+      # 反过来：读不到那一格亮了，并不等于「有未镜像的告警」。
+      - eval_time: 20m
+        alertname: CognevaAlertMirrorUnmirrored
+        exp_alerts: []

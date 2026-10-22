@@ -1459,6 +1459,14 @@ const FOREIGN: &[(&str, &str)] = &[
         "同一生产者：表里开着、`last_seen_at` 超过十分钟没往前走的镜像行数。它与上一条是相反的两个方向——上一条是「从来没进去」，这一条是「曾经通过、后来停了」；读失败时镜像故意不 resolve，那一档由 `infra_watch_eval_failure` 报，所以这一条的点名序列要跟它一起读，否则会把设计读成故障",
     ),
     (
+        "cogneva_alert_mirror_unmirrored_firing",
+        "同一生产者：Prometheus 里正 firing、而镜像的选择器从来看不见的规则数（扣掉本进程自己的规则、`mirror_alerts.exclude` 点名的、以及已经有开着行的）。它与 `missing` 是两件事：`missing` 是「该抄的没抄到」，这里是「连位置都没有」——上游规则（kube-prometheus 的 `KubeJobFailed`、`CPUThrottlingHigh`）不带镜像标记，前四格全绿时账本照样不是全集。判据自己会变绿：有开着的行就不算，所以放宽选择器之后不需要有人回来改这一格",
+    ),
+    (
+        "cogneva_alert_mirror_unmirrored_measured",
+        "同一生产者：这一拍读不读得到「全部 firing」那一面。它自成一格而不是让整份读数退化成读不到，是因为另外四格仍然是有效读数，丢掉它们换一个未知更亏；但读不到的那一拍 `unmirrored_firing` 会印 0，而那个 0 是**没读到**、不是**没有**——不单独立一条判据，读不到就会被读成「账本完整」",
+    ),
+    (
         "cogneva_alert_attention_unattended",
         "宿主读数 `scripts/host/cogneva-alert-attention-reading.sh`（不在本仓，登记行 `alert_attention`）：`alerts` 表里正 firing、响了超过窗口（默认 1800 秒）而 `acknowledged_at` 仍为空的行。它是这条链的**读者**那一端——镜像那一族只判到「进了表」，进了之后有没有人接，此前没有任何序列在说；2026-10-22 主线停摆七十分钟，红与停都进了表、都被铃铛写过通知，而全程没有一条被确认。判词读 `acknowledged_at` 而不是 `notified_at`：后者只说明站内铃铛写过通知（没人点开也算），按它判会把「告诉了」读成「看了」。按窗口而不是按比例判，是因为十件事接了九件时，剩下那一件仍然是没人接的那一件。判词**不把判它自己那条规则算进输入**（`CognevaAlertUnattended` 自己也是一条 firing、没人接、过了窗口的行）：算进去它就在为自己点火，一旦亮起再也回不到绿，而一条永远红的判词与没有判词同价；它自己那几行另有 `cogneva_alert_attention_meta_unacknowledged` 单独数",
     ),
