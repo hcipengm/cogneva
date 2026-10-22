@@ -563,11 +563,36 @@ fn rpc_task_id(body: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-/// `message/send`：受理一条 message，立刻回这一行的当前样子。
+/// 受理的判据：图把它收下了，而且收下的就是这张 id。
+///
+/// `submit_goal_auto` 返回的是**图真正收下的 id**，不是递进去的那些：批量插入会
+/// 跳过已经在册的行，于是「递进去了」与「被收下了」是两件事。拿递进去的那份当
+/// 回执，对端会拿到一个它以后读不回来的 id——而「没有这个任务」与「你抄错了 id」
+/// 在它那里逐字同形。
+fn accepted(goal_id: &str, submitted: cog_core::SFResult<Vec<String>>) -> Result<(), String> {
+    match submitted {
+        Ok(ids) if ids.iter().any(|id| id == goal_id) => Ok(()),
+        Ok(ids) => Err(format!(
+            "the goal was not taken: the graph returned {ids:?}, not '{goal_id}'"
+        )),
+        Err(e) => Err(format!("the goal could not be submitted: {e}")),
+    }
+}
+
+/// `message/send`：受理一条 message，回**从库里读回来的**那一行。
 ///
 /// 不等它跑完：A2A 允许这里回一个还在跑的任务，对端用 `tasks/get` 追。等它跑完
 /// 再回，就把这个方法变成一次长请求——而「长」正是 `message/stream` 存在的理由，
 /// 一个不流式的对端选了 `message/send`，就是接受「先拿到受理、再来问结果」。
+///
+/// 但「不等它跑完」不等于「不等它落库」：受理是对端手里的一个承诺——这个 id 以后
+/// 一定读得回来。提交放在后台跑、失败只写一行日志，就会出现对端拿到 id、随后
+/// `tasks/get` 永远回「没有这个任务」的形状，与它抄错 id 完全同形。所以这里等的是
+/// **提交本身**（一次入图／落库），不是这一次运行。
+///
+/// 这条等待今天是短的：本进程的编排器没有接规划器，`submit_goal_auto` 走的是直接
+/// 入图那条分支。哪天给它接上规划器（分解要调上游），这个处理函数要么改成「先落行、
+/// 后台分解」，要么给这次等待定一个上界，不能原样留在这里。
 async fn rpc_message_send(state: &Arc<GatewayState>, body: &Value, rpc_id: &Value) -> Response {
     let request = match parse_message_stream(body) {
         Ok(request) => request,
@@ -582,24 +607,33 @@ async fn rpc_message_send(state: &Arc<GatewayState>, body: &Value, rpc_id: &Valu
     let goal_id = uuid::Uuid::new_v4().to_string();
     let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
     goal_row.workspace_id = None;
-    let accepted = goal_row.clone();
     let orchestrator = state.orchestrator.clone();
-    let goal = request.goal.clone();
-    let submit_id = goal_id.clone();
-    tokio::spawn(async move {
-        match orchestrator.submit_goal_auto(&goal, vec![goal_row]).await {
-            Ok(ids) => tracing::info!(
-                goal_id = %submit_id,
-                task_count = ids.len(),
-                "a2a message/send goal accepted"
-            ),
-            Err(e) => tracing::error!(goal_id = %submit_id, "a2a message/send submit failed: {e}"),
-        }
-    });
+    let submitted = orchestrator
+        .submit_goal_auto(&request.goal, vec![goal_row])
+        .await;
+    if let Err(reason) = accepted(&goal_id, submitted) {
+        tracing::error!(goal_id = %goal_id, reason = %reason, "a2a message/send was not accepted");
+        return (StatusCode::OK, Json(rpc_error(rpc_id, -32603, reason))).into_response();
+    }
+
+    // 回执读的是库里的那一行，不是本地构造的这一份：受理之后状态可能已经被派工
+    // 改过，对端要的是它现在是什么样。
+    let Some(row) = orchestrator.get_task(&goal_id).await else {
+        return (
+            StatusCode::OK,
+            Json(rpc_error(
+                rpc_id,
+                -32603,
+                format!("the goal '{goal_id}' was submitted but cannot be read back"),
+            )),
+        )
+            .into_response();
+    };
+    tracing::info!(goal_id = %goal_id, "a2a message/send goal accepted");
 
     (
         StatusCode::OK,
-        Json(jsonrpc_result(rpc_id, json!(a2a_task(&accepted)))),
+        Json(jsonrpc_result(rpc_id, json!(a2a_task(&row)))),
     )
         .into_response()
 }
@@ -1022,5 +1056,38 @@ mod tests {
             failed["result"]["artifacts"][0]["parts"][0]["text"],
             json!("upstream refused the request")
         );
+    }
+
+    /// 受理只认图回执里那一个 id。
+    ///
+    /// `submit_goal_auto` 返回的是图收下的 id，可能不含递进去的那个（批量插入会
+    /// 跳过在册的行）。拿递进去的那份当回执，对端会拿到一个永远读不回来的 id，
+    /// 而「没有这个任务」与「你抄错了 id」在它那里同形。
+    #[test]
+    fn acceptance_is_the_id_the_graph_handed_back_not_the_one_we_offered() {
+        assert!(
+            accepted("g-1", Ok(vec!["g-1".into()])).is_ok(),
+            "the graph took exactly the row we offered"
+        );
+
+        let refused = accepted("g-1", Ok(vec!["g-2".into()]))
+            .expect_err("a different id is not our row: the peer would read it as never existing");
+        assert!(
+            refused.contains("g-2") && refused.contains("g-1"),
+            "the refusal has to name both ids: {refused}"
+        );
+
+        let failed = accepted("g-1", Err(cog_core::SFError::Agent("store is down".into())))
+            .expect_err("a submission that failed is not an acceptance");
+        assert!(
+            failed.contains("store is down"),
+            "the peer's answer has to carry the reason the platform had: {failed}"
+        );
+    }
+
+    /// 图什么都不收（空回执）也算没受理——不是「受理了一条没有任务可跑的 goal」。
+    #[test]
+    fn an_empty_receipt_is_not_an_acceptance() {
+        assert!(accepted("g-1", Ok(Vec::new())).is_err());
     }
 }
