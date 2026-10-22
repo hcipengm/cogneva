@@ -872,6 +872,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         // 旗子与端点必须在同一处能被读出来——旗在这里挂，端点也在这里挂，改名的人
         // 会同时看到两张。
         .route(a2a::MESSAGE_STREAM, post(a2a::message_stream_handler))
+        // 名片上 `url` 指向的地址：不流式的对端在这里按 `method` 调
+        // `message/send` 与 `tasks/get`。没有它，照名片打过来的客户端能做的
+        // 只有开流，而那两个方法正是它唯一能用的一对。
+        .route(a2a::A2A_RPC, post(a2a::rpc_handler))
         // 外部价值判定：与 A2A 面同级（成员即可提交，见 operator 组），
         // 审计里记名。判定本身不是变更，它只是把「什么算好」变成一条进化输入。
         .route(
@@ -3114,13 +3118,18 @@ async fn a2a_agent_card_handler(State(state): State<Arc<GatewayState>>) -> Respo
     let card = cog_core::AgentCard {
         name: "cogneva".into(),
         description: "Cogneva autonomous multi-agent collaboration platform".into(),
+        // 名片上的 `url` 是对端真正会打的那一个地址，所以它带着端点路径：
+        // 报一个根地址，对端按 A2A 惯例把 `message/send` 发过去，撞上的是路由表
+        // 里不存在的一条路径。主机名仍是本进程的绑定地址（`0.0.0.0` 不是可拨号
+        // 的目标），对外地址由部署侧的入口决定，不在这一行里猜。
         url: format!(
-            "http://0.0.0.0:{}",
+            "http://0.0.0.0:{}{}",
             state
                 .config
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .http_port
+                .http_port,
+            a2a::A2A_RPC
         ),
         version: env!("CARGO_PKG_VERSION").into(),
         // 旗子不在这里写死：它由本模块真正服务的那张端点推出（见 `a2a::capabilities`）。

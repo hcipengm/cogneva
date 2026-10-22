@@ -45,6 +45,14 @@ use crate::GatewayState;
 /// 两件事当时分别落在两个文件的两个字面量上。
 pub const MESSAGE_STREAM: &str = "/api/v1/protocol/a2a/message/stream";
 
+/// 名片上那个 `url` 指向的端点：**一个地址，方法写在 JSON-RPC 的 `method` 里**。
+///
+/// A2A 的对端拿到名片后只认这一个地址，按 `method` 分派。只给一条
+/// `/message/stream` 路径，等于只服务会流式的对端：不流式的那一类要用的是
+/// `message/send` 与 `tasks/get`，两条都不在路径表上，它照名片打过来得到的是 404。
+/// 端点补上之后，名片上的 `url` 也指到这里，不再指一个没有路由的根。
+pub const A2A_RPC: &str = "/api/v1/protocol/a2a";
+
 /// A2A 的流式方法名。一杆旗成立的条件是「表里有一行，它指名的端点以这个名字
 /// 结尾」，不是「那一行非空」：端点换个前缀照旧成立，指到别的路由上旗子就灭。
 const A2A_STREAM_METHOD: &str = "message/stream";
@@ -342,6 +350,22 @@ fn artifacts_of(task: &Task) -> Vec<TaskArtifact> {
     artifacts
 }
 
+/// 一行任务在 A2A 线上的样子。
+///
+/// 与流里第一帧的快照同源（同一套状态映射、同一份产物），差别只在流那侧要额外
+/// 打一个 `kind` 标记。两处若各写一遍，「流里看到的结果」与「`tasks/get` 拿到的
+/// 结果」就会各自漂——而它们说的是同一行。
+fn a2a_task(task: &Task) -> cog_core::A2aTask {
+    cog_core::A2aTask {
+        id: task.id.clone(),
+        status: a2a_state(task.status),
+        messages: Vec::new(),
+        artifacts: artifacts_of(task),
+        created_at: task.created_at,
+        updated_at: task.updated_at,
+    }
+}
+
 /// 把一条 goal 的推进做成 SSE 帧序列。
 ///
 /// 形状是 `unfold` 而不是通道 + 后台任务：帧的产生只依赖「读一行、比对上一次」，
@@ -470,6 +494,124 @@ pub async fn message_stream_handler(
             )
                 .into_response()
         })
+}
+
+// ─── JSON-RPC 端点 ────────────────────────────────────────────────────────
+//
+// 三条方法共用一个地址：`message/stream`（在它自己的路径上，见上）、
+// `message/send`、`tasks/get`。前一条只能服务会流式的对端；后两条是 A2A 里
+// 每个对端都会用的那一对，缺了它们，一个按名片打过来的客户端能做的只有开流。
+
+/// 一帧 JSON-RPC 错误。
+///
+/// 协议的错写在 `error` 里、HTTP 状态仍是 200：一次「方法不认识」与一次「这一行
+/// 不存在」都是对端读得懂的答复，用 404 表达会逼它去猜一份非 JSON 的响应是不是
+/// 这个平台在说「没有」。
+fn rpc_error(rpc_id: &Value, code: i64, message: impl Into<String>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": rpc_id,
+        "error": {"code": code, "message": message.into()},
+    })
+}
+
+/// `POST /api/v1/protocol/a2a` —— 名片上那个地址，按 `method` 分派。
+pub async fn rpc_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let rpc_id = body.get("id").cloned().unwrap_or(Value::Null);
+    match body.get("method").and_then(Value::as_str) {
+        Some("message/send") => rpc_message_send(&state, &body, &rpc_id).await,
+        Some("tasks/get") => rpc_tasks_get(&state, &body, &rpc_id).await,
+        other => (
+            StatusCode::OK,
+            Json(rpc_error(
+                &rpc_id,
+                -32601,
+                format!(
+                    "unknown method '{}'; this endpoint serves message/send and tasks/get",
+                    other.unwrap_or("<missing>")
+                ),
+            )),
+        )
+            .into_response(),
+    }
+}
+
+/// `message/send`：受理一条 message，立刻回这一行的当前样子。
+///
+/// 不等它跑完：A2A 允许这里回一个还在跑的任务，对端用 `tasks/get` 追。等它跑完
+/// 再回，就把这个方法变成一次长请求——而「长」正是 `message/stream` 存在的理由，
+/// 一个不流式的对端选了 `message/send`，就是接受「先拿到受理、再来问结果」。
+async fn rpc_message_send(state: &Arc<GatewayState>, body: &Value, rpc_id: &Value) -> Response {
+    let request = match parse_message_stream(body) {
+        Ok(request) => request,
+        Err(message) => {
+            return (StatusCode::OK, Json(rpc_error(rpc_id, -32602, message))).into_response()
+        }
+    };
+
+    // 与 `POST /api/v1/tasks` 和 `message/stream` 走同一条受理路径：三条路各自
+    // 写一遍提交逻辑，就会出现「经某一条路提的 goal 少了某个字段」这种只在一条
+    // 路上存在的缺陷。
+    let goal_id = uuid::Uuid::new_v4().to_string();
+    let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
+    goal_row.workspace_id = None;
+    let accepted = goal_row.clone();
+    let orchestrator = state.orchestrator.clone();
+    let goal = request.goal.clone();
+    let submit_id = goal_id.clone();
+    tokio::spawn(async move {
+        match orchestrator.submit_goal_auto(&goal, vec![goal_row]).await {
+            Ok(ids) => tracing::info!(
+                goal_id = %submit_id,
+                task_count = ids.len(),
+                "a2a message/send goal accepted"
+            ),
+            Err(e) => tracing::error!(goal_id = %submit_id, "a2a message/send submit failed: {e}"),
+        }
+    });
+
+    (
+        StatusCode::OK,
+        Json(jsonrpc_result(rpc_id, json!(a2a_task(&accepted)))),
+    )
+        .into_response()
+}
+
+/// `tasks/get`：按 id 读一行，带上它已有的结果与失败原因。
+///
+/// 这也是不流式的对端拿结果的唯一一条路——`message/send` 回的是受理那一刻的
+/// 样子，而结果是在之后写进这一行的。产物与流里终态帧同源（[`artifacts_of`]）。
+async fn rpc_tasks_get(state: &Arc<GatewayState>, body: &Value, rpc_id: &Value) -> Response {
+    let params = body.get("params").cloned().unwrap_or(Value::Null);
+    // `id` 是 A2A 0.2 的字段名，`taskId` 是更早的草稿：两个都认，一个字段名的
+    // 差异不该让一份照旧版规范写的请求变成「没有任务」。
+    let task_id = params
+        .get("id")
+        .or_else(|| params.get("taskId"))
+        .and_then(Value::as_str);
+    let Some(task_id) = task_id else {
+        return (
+            StatusCode::OK,
+            Json(rpc_error(rpc_id, -32602, "tasks/get takes params.id")),
+        )
+            .into_response();
+    };
+
+    match state.orchestrator.get_task(task_id).await {
+        Some(task) => (
+            StatusCode::OK,
+            Json(jsonrpc_result(rpc_id, json!(a2a_task(&task)))),
+        )
+            .into_response(),
+        None => (
+            StatusCode::OK,
+            Json(rpc_error(rpc_id, -32001, format!("no task '{task_id}'"))),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
