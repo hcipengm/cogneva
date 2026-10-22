@@ -1534,6 +1534,29 @@ pub(crate) struct RevPin {
 /// 撤回钉的文件名（在部署器状态目录里）。循环只读它，写它的只有带外命令。
 const PIN_FILE: &str = "undeliver-pin.json";
 
+/// 一次撤回落到目标版本的那一刻。
+///
+/// 与 [`RevPin`] 分成两份文件，理由与它同一类：写者不同。钉由带外命令写、循环只读；
+/// 这一格只有循环写得出来（集群什么时候真的回到 `landed_rev`，命令在写钉那一刻并不
+/// 知道）。合进钉里就是两个写者互相覆盖，合进 `state.json` 会跟着循环每拍的整份重写
+/// 一起丢掉。
+///
+/// 它存在的理由是一个读数：从「决定撤回」到「产物换回去」的时长。没有它，事后只能
+/// 拿两份日志相减，而日志会轮转掉。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PinConvergence {
+    pub(crate) withdrawn_rev: String,
+    pub(crate) landed_rev: String,
+    /// 钉写下的那一刻，从钉里抄来：窗口的两端要在同一个形状里，读的人不该跨两份
+    /// 文件做减法。
+    pub(crate) pinned_unix: i64,
+    /// 循环第一次看到集群落在 `landed_rev` 上的那一刻。
+    pub(crate) converged_unix: i64,
+}
+
+/// 撤回落地记录的文件名（在部署器状态目录里）。写它的只有部署循环。
+const CONVERGED_FILE: &str = "undeliver-converged.json";
+
 /// 撤回钉住的时候，这一轮要不要把主线按住。
 ///
 /// 判据是**被撤的那一版还在不在**，不是「上游动没动」。撤回要挡的是这一版重新落地，
@@ -2127,6 +2150,28 @@ impl MainlineDeployer {
         }
     }
 
+    /// 读「这一次撤回落到了目标版本没有」。读不出来按「还没落下」处理，不按错误：
+    /// 它只喂一行读数，不该让一拍的推进停下来。
+    fn load_convergence(&self) -> Option<PinConvergence> {
+        read_convergence(&self.cfg.state_dir)
+    }
+
+    fn record_pin_convergence(&self, pin: &RevPin) {
+        if !record_convergence(&self.cfg.state_dir, pin, chrono::Utc::now().timestamp())
+            && read_convergence(&self.cfg.state_dir).is_none()
+        {
+            warn!(
+                landed = %rev12(&pin.landed_rev),
+                state_dir = %self.cfg.state_dir,
+                "could not record when the withdrawal landed; the hold is unchanged"
+            );
+        }
+    }
+
+    fn clear_convergence(&self) {
+        drop_convergence(&self.cfg.state_dir);
+    }
+
     fn load_state(&self) -> MainlineState {
         match std::fs::read_to_string(self.state_path()) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
@@ -2170,6 +2215,17 @@ impl MainlineDeployer {
             }
             _ => None,
         };
+        // 落地记录只在与盘上这一份钉同一对 rev 时才算数：上一份钉留下的时刻拿来
+        // 印在这一次上，会把一次还没落地的撤回报成「已经换回去了，用了 3 秒」。
+        let pin_converged_unix = match (&pin, self.load_convergence()) {
+            (PinReading::Pinned(p), Some(seen))
+                if rev12(&seen.withdrawn_rev) == rev12(&p.withdrawn_rev)
+                    && rev12(&seen.landed_rev) == rev12(&p.landed_rev) =>
+            {
+                Some(seen.converged_unix)
+            }
+            _ => None,
+        };
         let summary = heartbeat_message_with_pin(
             &state,
             &bare,
@@ -2178,6 +2234,7 @@ impl MainlineDeployer {
             chrono::Utc::now().timestamp(),
             &pin,
             pin_effective,
+            pin_converged_unix,
         );
         info!(heartbeat = %summary, "mainline deployer heartbeat");
     }
@@ -4956,6 +5013,9 @@ impl MainlineDeployer {
                     bare = %rev12(bare),
                     "a withdrawn revision pins the mainline at an earlier one; not advancing"
                 );
+                // 这一刻才是「产物换回去了」：集群已经在落点上，而撤下来的那一版
+                // 仍在历史里——两个条件缺一个都还不是一次成功的撤回。
+                self.record_pin_convergence(pin);
                 return Ok(true);
             }
             info!(
@@ -5112,7 +5172,7 @@ impl MainlineDeployer {
                     return Ok(());
                 }
             }
-            PinReading::None => {}
+            PinReading::None => self.clear_convergence(),
         }
 
         // 在飞任务收敛/终态处理。
@@ -7510,9 +7570,13 @@ fn heartbeat_message(
         now_unix,
         &PinReading::None,
         None,
+        None,
     )
 }
 
+// 这一行的每一格都是同一个读数的组成部分（撒开成结构体只是把「哪些格属于同一件事」
+// 藏起来），所以参数个数在这里是内容，不是坏味道。
+#[allow(clippy::too_many_arguments)]
 fn heartbeat_message_with_pin(
     state: &MainlineState,
     bare_rev: &str,
@@ -7524,6 +7588,10 @@ fn heartbeat_message_with_pin(
     // 它必须与「按着」分开：盘上还躺着一份早就松开的钉，与一份正在生效的钉，
     // 在这一行上原本完全同形。
     pin_effective: Option<bool>,
+    // 这一次撤回落地的时刻（与钉同一对 rev 时才有值）。它与 `pin_secs` 是两个数：
+    // `pin_secs` 是「按住多久了」，这一格是「从决定到换回去花了多久」——撤回落地
+    // 之后前者还在涨，后者不再变了。
+    pin_converged_unix: Option<i64>,
 ) -> String {
     let in_flight = state
         .in_flight
@@ -7541,6 +7609,10 @@ fn heartbeat_message_with_pin(
         PinReading::Unreadable(_) => ("unreadable".to_string(), "none".to_string(), "none".into()),
         PinReading::None => ("none".to_string(), "none".to_string(), "none".into()),
     };
+    let pin_took = match (pin, pin_converged_unix) {
+        (PinReading::Pinned(p), Some(at)) => (at - p.unix).max(0).to_string(),
+        _ => "none".to_string(),
+    };
     let pin_state = match (pin, pin_effective) {
         (PinReading::Pinned(_), Some(true)) => "holding",
         (PinReading::Pinned(_), Some(false)) => "released",
@@ -7549,7 +7621,7 @@ fn heartbeat_message_with_pin(
         (PinReading::None, _) => "none",
     };
     format!(
-        "bare={} upstream={} behind_revs={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={} advance_waits={} last_advance_wait={} pin={} pin_secs={} pin_actor={} pin_state={}",
+        "bare={} upstream={} behind_revs={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={} advance_waits={} last_advance_wait={} pin={} pin_secs={} pin_actor={} pin_state={} pin_took={}",
         rev12(bare_rev),
         upstream,
         // 落后几个 rev。`last_good_secs` 答的是"多久"，这一格答的是"几笔"——两者
@@ -7633,12 +7705,57 @@ fn heartbeat_message_with_pin(
         pin_secs,
         pin_actor,
         pin_state,
+        pin_took,
     )
 }
 
 /// 写一份撤回钉。原子换名，理由与 `save_state` 同一条：读的一方（循环）不能读到
 /// 一份写了一半的文件，而读到一半的后果是「读不出来 ⇒ 按住主线」——安全，但没必要
 /// 每天撞一次。
+/// 读落地记录。文件不在或读不成形都答 `None`：这一格只喂一行读数。
+pub(crate) fn read_convergence(state_dir: &str) -> Option<PinConvergence> {
+    let text = std::fs::read_to_string(Path::new(state_dir).join(CONVERGED_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// 记下这一次撤回落地的时刻，只记一次。
+///
+/// 判据是「这一份钉记过没有」，不是「本拍在不在目标版本上」：落地之后每一拍都在目标
+/// 版本上，按拍写会把这个小文件写成一本一秒一行的账，而撤回的时长只需要一行。
+///
+/// 写不进去不是撤回失败：钉还在，按住还在继续，丢的只是一个时长读数——所以这里
+/// 返回 `false` 而不是错误，调用方打一行 warn 就够。
+pub(crate) fn record_convergence(state_dir: &str, pin: &RevPin, now_unix: i64) -> bool {
+    if let Some(seen) = read_convergence(state_dir) {
+        if rev12(&seen.withdrawn_rev) == rev12(&pin.withdrawn_rev)
+            && rev12(&seen.landed_rev) == rev12(&pin.landed_rev)
+        {
+            return false;
+        }
+    }
+    let record = PinConvergence {
+        withdrawn_rev: pin.withdrawn_rev.clone(),
+        landed_rev: pin.landed_rev.clone(),
+        pinned_unix: pin.unix,
+        converged_unix: now_unix,
+    };
+    let path = Path::new(state_dir).join(CONVERGED_FILE);
+    let body = match serde_json::to_string_pretty(&record) {
+        Ok(body) => body,
+        Err(_) => return false,
+    };
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)
+        .and_then(|_| std::fs::rename(&tmp, &path))
+        .is_ok()
+}
+
+/// 钉没了就把落地记录一起删掉：留着它，下一份钉会继承上一次的时刻，而那个数会被
+/// 读成「这一次撤回落得很快」。
+pub(crate) fn drop_convergence(state_dir: &str) {
+    let _ = std::fs::remove_file(Path::new(state_dir).join(CONVERGED_FILE));
+}
+
 pub(crate) fn write_pin(state_dir: &str, pin: &RevPin) -> SFResult<()> {
     std::fs::create_dir_all(state_dir)
         .map_err(|e| SFError::IO(format!("create state dir {state_dir}: {e}")))?;
@@ -10989,6 +11106,42 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         );
     }
 
+    /// 撤回的时长只记一次、只属于这一份钉：按拍记会把小文件写成一本账，
+    /// 而记在上一份钉头上会把一次还没落地的撤回报成「零秒换回去了」。
+    #[test]
+    fn a_withdrawal_records_how_long_it_took_to_land_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let pin = RevPin {
+            withdrawn_rev: "cc3333333333aaaaaaaa".into(),
+            landed_rev: "aa1111111111bbbbbbbb".into(),
+            actor: "operator".into(),
+            reason: "bad deploy".into(),
+            unix: 40,
+        };
+        assert!(read_convergence(dir).is_none(), "还没落地时这里必须是空的");
+        assert!(record_convergence(dir, &pin, 100), "第一次落地要写进去");
+        let seen = read_convergence(dir).unwrap();
+        assert_eq!(seen.pinned_unix, 40, "窗口的左端从钉里抄来");
+        assert_eq!(seen.converged_unix, 100);
+        assert!(
+            !record_convergence(dir, &pin, 200),
+            "同一份钉的第二拍不许改写：落地时刻不是「最近一次看到它的时刻」"
+        );
+        assert_eq!(read_convergence(dir).unwrap().converged_unix, 100);
+        let next = RevPin {
+            landed_rev: "bb2222222222cccccccc".into(),
+            ..pin.clone()
+        };
+        assert!(record_convergence(dir, &next, 300), "换了一份钉就要换一行");
+        assert_eq!(read_convergence(dir).unwrap().converged_unix, 300);
+        drop_convergence(dir);
+        assert!(
+            read_convergence(dir).is_none(),
+            "钉清掉之后这份记录必须跟着消失，否则下一份钉会继承上一次的时刻"
+        );
+    }
+
     /// 清掉钉之后，「谁以什么理由撤过、落在哪一版」仍然读得出来。钉文件随
     /// `--clear` 消失，日志不该跟着消失——一次撤回是一条决定，不是一格当前状态。
     #[test]
@@ -11097,16 +11250,47 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             reason: "probe".into(),
             unix: 40,
         });
-        let msg =
-            heartbeat_message_with_pin(&state, "cc3333333333", "off", None, 100, &pin, Some(true));
+        let msg = heartbeat_message_with_pin(
+            &state,
+            "cc3333333333",
+            "off",
+            None,
+            100,
+            &pin,
+            Some(true),
+            None,
+        );
         assert!(msg.contains("pin=cc3333333333->aa1111111111"), "{msg}");
         assert!(msg.contains("pin_secs=60"), "{msg}");
         assert!(msg.contains("pin_actor=operator"), "{msg}");
         assert!(msg.contains("pin_state=holding"), "{msg}");
+        // 还没落地时这一格是 none：一个 0 会被读成「零秒就换回去了」。
+        assert!(msg.contains("pin_took=none"), "{msg}");
+        // 落地那一刻之后，这一格是「从决定到换回去」的时长，与还在涨的 pin_secs 分开。
+        let landed = heartbeat_message_with_pin(
+            &state,
+            "cc3333333333",
+            "off",
+            None,
+            100,
+            &pin,
+            Some(true),
+            Some(70),
+        );
+        assert!(landed.contains("pin_took=30"), "{landed}");
+        assert!(landed.contains("pin_secs=60"), "{landed}");
         // 钉还在盘上、上游已经把它 revert 掉：这一行必须是 released，不是 holding——
         // 两者的处置相反（一个是等人，一个是等下一拍照常推进）。
-        let released =
-            heartbeat_message_with_pin(&state, "cc3333333333", "off", None, 100, &pin, Some(false));
+        let released = heartbeat_message_with_pin(
+            &state,
+            "cc3333333333",
+            "off",
+            None,
+            100,
+            &pin,
+            Some(false),
+            Some(70),
+        );
         assert!(released.contains("pin_state=released"), "{released}");
         let none = heartbeat_message_with_pin(
             &state,
@@ -11116,8 +11300,10 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             100,
             &PinReading::None,
             None,
+            None,
         );
         assert!(none.contains("pin=none"), "{none}");
+        assert!(none.contains("pin_took=none"), "{none}");
         assert!(none.contains("pin_state=none"), "{none}");
         let bad = heartbeat_message_with_pin(
             &state,
@@ -11126,6 +11312,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             None,
             100,
             &PinReading::Unreadable("truncated".into()),
+            None,
             None,
         );
         assert!(bad.contains("pin=unreadable"), "{bad}");
