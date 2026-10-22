@@ -671,6 +671,12 @@ pub fn series_endpoint(line: &str) -> Option<&str> {
 pub const RETIRED_METRIC_NAMES: &[&str] = &[
     "metrics_samples_retention_seconds",
     "cogneva_change_dispatch_rows",
+    // The declared daily ceiling left the gateway's request path: the platform
+    // stopped capping its own spending, so nothing declares a ceiling any more
+    // and this series would have kept its last value (the "none declared" 0)
+    // as the current reading forever. The spend and its age stay live; only the
+    // declaration went.
+    "llm_budget_tokens",
 ];
 
 /// Whether `name` is a retired metric. See [`RETIRED_METRIC_NAMES`].

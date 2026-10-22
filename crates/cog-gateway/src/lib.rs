@@ -1384,10 +1384,15 @@ fn render_held_series_readings(held: &[String], read: bool) -> String {
         );
     }
 
+    // A retired name is not unproduced by accident: its rows are held only until
+    // the retirement pass deletes them, and the exposition already refuses to
+    // serve it. Reported here, it would keep this reading up for as long as the
+    // pass takes — and forever on a store the pass cannot reach — telling a
+    // reader to do the thing that was already done.
     let unproduced: BTreeSet<&str> = held
         .iter()
         .map(String::as_str)
-        .filter(|name| !cog_core::is_registered_metric(name))
+        .filter(|name| !cog_core::is_registered_metric(name) && !cog_core::is_retired_metric(name))
         .collect();
     if unproduced.is_empty() {
         return String::new();
@@ -3394,6 +3399,34 @@ mod metrics_exposition_tests {
                 cog_core::metric_names::MEMORY_UNEXTRACTED_RAW.as_str()
             )),
             "登记在册的名字有产出方，不该被报成无产出: {body}"
+        );
+    }
+
+    /// A retired name is held, not orphaned. Its rows are the retirement pass's
+    /// to delete and the exposition already refuses to serve it, so reporting it
+    /// here would ask a reader for the step that was already taken — and keep
+    /// asking until the pass reaches the store, or forever on one it cannot.
+    #[tokio::test]
+    async fn a_held_series_declared_retired_is_not_reported_as_unproduced() {
+        let retired = cog_core::RETIRED_METRIC_NAMES[0];
+        let mb = cog_storage::mem::MemoryMetricsBackend::new();
+        mb.record_gauge(
+            cog_core::MetricName::for_tests_only(retired),
+            0.0,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = render_backend_metrics(&mb).await;
+
+        assert!(
+            !body.contains(&format!("name=\"{retired}\"")),
+            "{retired} 已申报退役，不该被报成无产出的持有序列: {body}"
+        );
+        assert!(
+            !body.contains(UNPRODUCED_SERIES_METRIC),
+            "只持有退役名字时不该产生这条读数: {body}"
         );
     }
 
