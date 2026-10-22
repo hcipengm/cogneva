@@ -5,9 +5,11 @@
 //! the agent did. A live deployment held 12,571 of them, 12,568 empty; each is a
 //! stream with its own metadata and group table, and the store is `noeviction`,
 //! so that memory is memory the working set cannot have. The pass that removes
-//! them is judged here on the two things it must never get wrong: an inbox with
-//! an entry still in it is not empty, and an inbox that gains an entry between
-//! the scan and the delete has just as much right to survive.
+//! them is judged here on the two things it must never get wrong: an inbox that
+//! still owes a reader a command is not a candidate, and an inbox that gains an
+//! entry between the scan and the delete has just as much right to survive. The
+//! other side of the same rule is judged too — an inbox its group read and
+//! acknowledged is drained even though its entries are still on disk.
 //!
 //! ```text
 //! COGNEVA_TEST_REDIS_URL=redis://:pw@127.0.0.1:16379 \
@@ -79,6 +81,44 @@ async fn publish(agent_id: &str, body: &str) {
         .query_async(&mut conn)
         .await
         .expect("publish");
+}
+
+/// Take every entry the way the agent's own consumer does: read them with the
+/// group, then acknowledge them. That is what moves an unowned inbox from owing
+/// work to holding history.
+async fn read_and_ack(agent_id: &str) -> usize {
+    let k = cog_core::agent_inbox_stream(agent_id);
+    let group = format!("agent-{agent_id}");
+    let mut conn = raw_conn().await;
+    let entries: Vec<(String, Vec<String>)> = redis::cmd("XRANGE")
+        .arg(&k)
+        .arg("-")
+        .arg("+")
+        .query_async(&mut conn)
+        .await
+        .expect("range");
+    let _: redis::Value = redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg(&group)
+        .arg("probe")
+        .arg("COUNT")
+        .arg(100)
+        .arg("STREAMS")
+        .arg(&k)
+        .arg(">")
+        .query_async(&mut conn)
+        .await
+        .expect("read");
+    for (id, _) in &entries {
+        let _: i64 = redis::cmd("XACK")
+            .arg(&k)
+            .arg(&group)
+            .arg(id)
+            .query_async(&mut conn)
+            .await
+            .expect("ack");
+    }
+    entries.len()
 }
 
 async fn register(agent_id: &str) {
@@ -171,6 +211,61 @@ async fn an_inbox_with_a_pending_command_is_not_a_candidate() {
     assert_eq!(
         found, None,
         "an inbox holding a command is never a candidate, owned or not"
+    );
+    clear(&agent).await;
+}
+
+/// The other half of "owes nothing": entries still on disk but taken and
+/// acknowledged. Counting them as stranded work — which the reading did when it
+/// counted `XLEN` — made a queue that did its job look like a leak, and kept the
+/// key alive for a sweep that refused to touch a non-empty stream.
+#[tokio::test]
+#[ignore = "needs a live Redis named by COGNEVA_TEST_REDIS_URL"]
+async fn an_inbox_its_group_drained_is_a_candidate_even_though_entries_remain() {
+    let agent = format!("{PROBE}-drained");
+    key(&agent).await;
+    publish(&agent, "abort").await;
+    publish(&agent, "steering").await;
+    assert_eq!(
+        read_and_ack(&agent).await,
+        2,
+        "both commands are read and acked, the way the owner's consumer did"
+    );
+
+    let scan = pass().await.scan().await.expect("scan");
+    assert_eq!(
+        find(&scan.empty, &agent),
+        None,
+        "the stream is not empty; the history is still on disk"
+    );
+    assert_eq!(
+        find(&scan.holding, &agent),
+        None,
+        "and it owes no reader a thing"
+    );
+    assert_eq!(
+        find(&scan.consumed, &agent),
+        Some(2),
+        "it is reported as drained, with the length it carries"
+    );
+    assert!(
+        !scan
+            .holding
+            .iter()
+            .any(|(k, _)| k == &cog_core::agent_inbox_stream(&agent)),
+        "history a group already read is not stranded work"
+    );
+
+    let k = cog_core::agent_inbox_stream(&agent);
+    let outcome = pass()
+        .await
+        .retire_streams(std::slice::from_ref(&k))
+        .await
+        .expect("retire");
+    assert_eq!(
+        (outcome.retired, outcome.records),
+        (1, 2),
+        "the drained stream is removed and the entries that went with it are reported"
     );
     clear(&agent).await;
 }
