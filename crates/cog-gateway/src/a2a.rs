@@ -327,7 +327,15 @@ impl StreamState {
 /// 文本里放 JSON 而不是把 `result` 摊成结构化片段：A2A 的 `Part` 只有文本与文件
 /// 两种，摊开需要发明一套字段映射，而那份映射一旦写错，客户端看到的是**残缺的**
 /// 结果，不是一条读不懂的结果。
+///
+/// 产物只属于终态行。`error` 字段在活着的行上不是失败原因：编排器把「排队太久、
+/// 放回队列、不计一次重试」这类**进展**也写在这里，而那一行仍是 Scheduled（现网
+/// 2026-10-22 读到 `change-ledger-a16efa97104ac2dd` 就是这样）。不按状态分，
+/// 排队中的任务会被报成「submitted + 一件叫 error 的产物」，对端只能读成失败。
 fn artifacts_of(task: &Task) -> Vec<TaskArtifact> {
+    if !is_terminal(a2a_state(task.status)) {
+        return Vec::new();
+    }
     let mut artifacts = Vec::new();
     if let Some(result) = task.result.as_ref() {
         artifacts.push(TaskArtifact {
@@ -962,6 +970,31 @@ mod tests {
     fn a_row_with_neither_result_nor_error_has_no_artifact() {
         let row = Task::goal_row(String::from("g-1"), "a goal");
         assert!(artifacts_of(&row).is_empty());
+    }
+
+    /// 还没有终态的行即使挂着一条 `error` 文本也不是失败。
+    ///
+    /// 编排器把「排队太久、放回队列、不计一次重试」这类进展写在 `error` 里，行仍
+    /// 留在 Scheduled。把这段文本当失败原因发出去，对端拿到的是「submitted 外加
+    /// 一件叫 error 的产物」——同一条回答说两件事，读哪一句都能自圆其说。终态之后
+    /// 同一段文本才成为失败原因。
+    #[test]
+    fn a_note_on_a_row_that_is_still_queued_is_not_a_failure_artifact() {
+        let note = "never started: the task sat in Scheduled and was put back in line";
+        let mut row = Task::goal_row(String::from("g-2"), "a goal");
+        row.error = Some(note.into());
+        assert!(
+            artifacts_of(&row).is_empty(),
+            "a queued row has no outcome yet: {:?}",
+            artifacts_of(&row)
+        );
+
+        row.status = TaskStatus::Failed;
+        assert_eq!(
+            artifacts_of(&row)[0].name,
+            "error",
+            "once the row is terminal the same note is the failure reason"
+        );
     }
 
     /// 失败的那一次带的是失败原因，而且与结果分两件产物。
