@@ -1,4 +1,5 @@
 //! principle: feedback_a_request_scoped_stream_needs_a_delete_before_it_can_exist
+//! principle: feedback_a_self_test_sample_labelled_by_the_old_predicate_reads_as_a_predicate_bug
 //! Gate: a default body on a required capability must not answer with the shape
 //! of success it did not do.
 //!
