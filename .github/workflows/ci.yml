@@ -107,6 +107,37 @@ jobs:
         run: cargo test -p cog-storage --test wal_redis_trim -- --ignored
         env:
           COGNEVA_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # The two retirement passes are judged on the one thing a fixture cannot
+      # hold: they work by asking the server what a key is now, and then acting
+      # on the answer. An inbox's emptiness is a stream length the pass never
+      # wrote; a log's owner is a registration that may have been renewed after
+      # the scan and before the delete, and a pass that deletes on the stale
+      # answer takes the tail of an agent that is still reading. Both were
+      # expensive in production -- 12,571 inboxes of which 12,568 were empty,
+      # and 560 MB of logs belonging to agents that had retired, read off one
+      # deployment when the pass was written -- which is why they exist at all,
+      # and why the thing they must never get wrong is checked against a real
+      # server rather than a stand-in.
+      - name: Live-Redis inbox retirement
+        run: cargo test -p cog-storage --test inbox_retirement -- --ignored
+        env:
+          COGNEVA_TEST_REDIS_URL: redis://127.0.0.1:6379
+      - name: Live-Redis agent log retirement
+        run: cargo test -p cog-storage --test wal_retirement -- --ignored
+        env:
+          COGNEVA_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # The registry answers two questions through one key: who holds a name,
+      # and whether the holder is still beating. The second used to ride on the
+      # expiry alone, so a record whose writer died between `SET` and `EXPIRE`
+      # read as live forever; a live cluster held twenty of those, three days
+      # cold, offered as agents that could be sent work. Expiry and its absence
+      # are the server's own facts -- a fixture store has no clock to lose one
+      # against -- so the record that lost its expiry is planted here, on the
+      # server, and the registry is asked what it makes of it.
+      - name: Live-Redis agent registry liveness
+        run: cargo test -p cog-storage --test agent_registry_liveness -- --ignored
+        env:
+          COGNEVA_TEST_REDIS_URL: redis://127.0.0.1:6379
       - name: Live-DB partition tests
         run: cargo test -p cog-storage --test partition_maintainer -- --ignored
         env:
