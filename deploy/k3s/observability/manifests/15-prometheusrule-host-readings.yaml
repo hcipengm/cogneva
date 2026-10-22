@@ -738,3 +738,24 @@ spec:
           annotations:
             summary: "有告警响了半小时以上还没人确认（见 cogneva_alert_attention_unattended_rule）"
             description: "`cogneva_alert_attention_unattended_rule{rule=…}` 点名是哪几条，`cogneva_alert_attention_oldest_unacknowledged_age_seconds` 给最老的那一条响了多久。`acknowledged_at` 是 `alerts` 表里唯一机器可读的「有人看过」——它由 WebUI 告警浮层的确认按钮写，告警重新点火时清空，所以它记的是**这一轮**有没有人接，不是这条规则曾经被人看过。先逐条处置点名的那几条（能修的修、不能修的确认并写下原因），确认之后这一条自己会 resolve。"
+
+    # 这张表本身以什么速度长：前面两组判「进没进表」「进了有没有人看」，都是逐行的读数，
+    # 没有一条在看流量。于是「一条规则一小时写几十行」只能靠人去数表才发现——2026-10-22
+    # 两笔都是这么发现的：`stream_consumer_stalled` 六小时 82 行（每行一分钟内 resolve，
+    # 一个 Pod 一生的抖动），`governance_face_not_on_target` 一拍 17 行（一次注册表读不到
+    # 按面报了 17 次）。读表的人先学会「又来了」，真正的停摆就埋在同一张表里。
+    - name: cogneva-alert-traffic
+      rules:
+        # 读数自己带窗口（1 小时）与两个界（12 行、8 条短命行），这里只读它的判词，不另立
+        # 阈值：界与被判的对象是同一份字节，才不会出现两处数字各说各话。等十分钟是为了
+        # 让「这一小时里出现过一次爆发」与「这一小时一直是这副样子」分开——前者是一次事故，
+        # 后者是这条规则该改形状了。
+        - alert: CognevaAlertAccountNoisy
+          expr: max(cogneva_alert_traffic_noisy) > 0
+          for: 10m
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "有规则在一小时里往告警账里写了太多行（见 cogneva_alert_traffic_noisy_rule）"
+            description: "`cogneva_alert_traffic_noisy_rule{rule=…}` 点名是哪几条，`cogneva_alert_traffic_rows{rule=…}` 给一小时写了几行，`cogneva_alert_traffic_short_lived{rule=…}` 给其中活不过一分钟的有几条，`cogneva_alert_traffic_busiest_episode_rows{rule=…}` 给同一个 dedup_key 上反复写了几行。三种形状三种修法：短命行多 ⇒ 这条判据是「缺席即成立」或每 Pod 一生的那种，给它 `for_seconds`；同一个键反复写 ⇒ 条件在抖，先看被它读的那条读数是不是在两张值之间弹；每个键各一行、键里带 pod 或 replicas ⇒ 按对象报的规则报的是生命周期，不是事故。行数本身不是故障，是这张表还能不能被人读的预算。"

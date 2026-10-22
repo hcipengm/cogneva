@@ -1462,6 +1462,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "cogneva_alert_attention_unattended",
         "宿主读数 `scripts/host/cogneva-alert-attention-reading.sh`（不在本仓，登记行 `alert_attention`）：`alerts` 表里正 firing、响了超过窗口（默认 1800 秒）而 `acknowledged_at` 仍为空的行。它是这条链的**读者**那一端——镜像那一族只判到「进了表」，进了之后有没有人接，此前没有任何序列在说；2026-10-22 主线停摆七十分钟，红与停都进了表、都被铃铛写过通知，而全程没有一条被确认。判词读 `acknowledged_at` 而不是 `notified_at`：后者只说明站内铃铛写过通知（没人点开也算），按它判会把「告诉了」读成「看了」。按窗口而不是按比例判，是因为十件事接了九件时，剩下那一件仍然是没人接的那一件",
     ),
+    (
+        "cogneva_alert_traffic_noisy",
+        "宿主读数 `scripts/host/cogneva-alert-traffic-reading.sh`（不在本仓，登记行 `alert_traffic`）：有没有哪条规则在一小时里写进 `alerts` 表的行数、或其中一分钟内就 resolve 的短命行数，越过了界。同族的 `alert_mirror` 判「该进表的进没进」、`alert_attention` 判「进了表有没有人看」，两条都是**逐行**的读数；这一格是**流量**——2026-10-22 同一天里两条规则各把一件事写成 82 行与 17 行，系统自己不报，是有人去数表才发现的。两个数分开数是因为它们指向两种修法：行数多是同一件事反复重开（该合并 dedup_key 或抬保持时长），短命多是一拍抖动被写成一行（该给 `for_seconds`）",
+    ),
     ("up", "Prometheus 采集目标存活序列"),
 ];
 
