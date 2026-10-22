@@ -2844,7 +2844,7 @@
             "greater_than": 0.0
           },
           "severity": "warning",
-          "summary": "{value} command(s) sit in inbox streams whose agent is no longer registered. Retirement removes an inbox only when it is empty, so these are never delivered and never deleted: no consumer holds that id any more, and the pass refuses to destroy work somebody was told had been queued. The stream count is the other half of the reading -- agent_inbox_orphaned_streams{state=\"holding\"} says how many queues are stranded, this one says how much work is in them. Ages are not in the reading; to find out how long a command has waited, read the stream itself, never the age of this series"
+          "summary": "{value} command(s) sit in inbox streams whose agent is no longer registered. Retirement removes an inbox only when it is empty, so these are never delivered and never deleted: no consumer holds that id any more, and the pass refuses to destroy work somebody was told had been queued. The stream count is the other half of the reading -- agent_inbox_orphaned_streams, on the series whose state label reads \"holding\", says how many queues are stranded; this one says how much work is in them. Ages are not in the reading; to find out how long a command has waited, read the stream itself, never the age of this series"
         },
         {
           "name": "agent_inbox_orphan_reading_missing",
