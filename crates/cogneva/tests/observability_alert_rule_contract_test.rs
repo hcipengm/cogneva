@@ -1394,6 +1394,18 @@ const FOREIGN: &[(&str, &str)] = &[
         "principle_carriers_slug_no_landing",
         "宿主读数 `scripts/host/cogneva-principle-census-reading.sh`（私有仓 brain）：载体在树上声明了「已落」，账本里却查不到对应落地行的 slug 条数。载体与账两处都不在公开仓，所以这一格只能作为外来读数登记",
     ),
+    (
+        "e2e_ten_rings_failed",
+        "宿主读数 `scripts/host/cogneva-e2e-rings-reading.sh`（私有仓 brain）：十环里有判据而不 ok 的环数。单环序列 `e2e_ten_rings{ring=…}` 刻意不进规则——按脚本 HELP，那一格的 0 同时表示「判了没过」与「这一拍读不到」，一条判据读一个二义值等于把两种修法混成一种；读不到与缺判据各有自己的计数序列",
+    ),
+    (
+        "e2e_ten_rings_unread",
+        "同一生产者：有判据但这一拍读不到输入的环数。与 `_failed` 分开立规则，因为修法不同——前者修链上那一段，这一条修那一环读的东西（构建还没出 tag、集群读不到、计数器文件没生成）",
+    ),
+    (
+        "e2e_ten_rings_unchecked",
+        "同一生产者：压根没有可执行判据的环数。它不是 0 也不是缺席，是这一环被跳过，而跳过在文本报告里长得像 ok——十环少一环有判据，整链的结论就少一段依据",
+    ),
     ("up", "Prometheus 采集目标存活序列"),
 ];
 

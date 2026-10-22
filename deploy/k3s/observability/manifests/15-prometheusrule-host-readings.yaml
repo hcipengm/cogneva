@@ -464,3 +464,44 @@ spec:
           annotations:
             summary: "有 {{ $value }} 条原则载体声明已落，账上查不到落地行"
             description: "原则载体（`memory/` 里带 `# principle:` 行的那一份）声明了这个 slug 已落地，而账本里没有它落地的行。两种修法：载体说错了就改载体，账漏了就把落地行补上——不要为了消红去改账上的状态。逐条点名跑 `bash scripts/host/cogneva-principle-census-reading.sh`。"
+
+    # 端到端十环：一笔变更从被提出到用户真的用上它。这一族此前一条规则都没有，
+    # 而它恰恰是最不能靠肉眼的一族——2026-10-20 与 2026-10-22 两次实测都是「每一环
+    # 各自的尺子都合格，整条链却断了」：主线上没有对应镜像（第 3 环），部署器最后
+    # 一次落地停在旧 rev（第 4 环），现网工作负载跑的是第三个数（第 6 环）——
+    # 滚动 Job 全 Complete、Pod 全就绪、镜像版本各自一致，逐环绿而整链死。
+    # 三条分开立，因为三种红的修法不同：有环不 ok 要修那一段链，有环读不到要修那一环
+    # 的输入，有环没有判据要补判据；合成一条的话读告警的人只知道「链有问题」。
+    - name: cogneva-e2e-rings
+      rules:
+        # 有判据的环里，有环不 ok。今天实测就是红的（3 环），所以这条不是「先立着」。
+        - alert: CognevaE2eRingFailed
+          expr: e2e_ten_rings_failed > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "端到端链有 {{ $value }} 环不是 ok"
+            description: "跑 `bash scripts/host/cogneva-e2e-rings-reading.sh`（不带参数）逐环印一行 `ring_N ok|fail|unread|no_check 原因`，断在第几环就修那一段。别只看整链的 `e2e_ten_rings_yes`：它只说「不是全通」，说不出断在哪；也别按单环的 `e2e_ten_rings{ring=…}` 判——那一格的 0 把「判了没过」与「读不到」写在同一个值里。"
+
+        # 环的输入这一拍读不到。与上一条分开：上一条是「量到了、不合格」，这一条是
+        # 「没量到」，前者去修链，后者去修那一环读的东西（镜像清单、集群、计数器）。
+        - alert: CognevaE2eRingUnread
+          expr: e2e_ten_rings_unread > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "端到端链有 {{ $value }} 环这一拍读不到输入"
+            description: "这一环有判据，但判据要读的东西（主线 tag、集群状态、计数器文件）这一拍取不到——所以它既不算过也不算不过。`... --prometheus` 里单环值为 -1 才是「没有判据」，读不到在文本报告里印成 `unread`。先看那一环要读的是哪条路径：多数是外部输入没生成（构建还没出 tag），少数是权限或路径写错。"
+
+        # 有环压根没有判据。它不是 0、不是缺席，是这一环本身没被量——十环里少一环
+        # 有判据，就等于整链的结论少一段依据，而报告会照常印「其余环 ok」。
+        - alert: CognevaE2eRingNoCheck
+          expr: e2e_ten_rings_unchecked > 0
+          for: 24h
+          labels:
+            severity: warning
+          annotations:
+            summary: "端到端链有 {{ $value }} 环没有判据"
+            description: "这一环在名册里，但没有任何可执行的判据：它每一拍都被跳过，跳过在报告里长得像 ok。补判据，或者在 `scripts/host/cogneva-e2e-rings-reading.sh` 的环表里写明它为什么不该有判据。给一天的时间窗：新增一环、判据后补是正常节奏，缺判据挂一天才是欠账。"
