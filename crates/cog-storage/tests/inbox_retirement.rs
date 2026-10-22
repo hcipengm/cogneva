@@ -1,3 +1,5 @@
+//! principle: feedback_a_length_counts_history_not_work_on_a_store_that_never_trims
+//!
 //! Whether the inbox retirement can tell an inbox nobody owns from one that is
 //! waiting to be read, against a live Redis.
 //!
