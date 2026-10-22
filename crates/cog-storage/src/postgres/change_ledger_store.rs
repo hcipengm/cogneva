@@ -319,6 +319,14 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
 /// the event reads as "entered". That is also why the comparison is
 /// `IS DISTINCT FROM`: with plain `<>` a first measurement would compare against
 /// NULL, match nothing, and the row would enter the account silently.
+///
+/// `parent_observation` follows `landed_at`, not `measured_rev`: the parent
+/// reading describes the landing that first satisfied the row, so it is taken
+/// from the first measurement that produced one and never overwritten by a
+/// later pass. A later pass measures a *later* parent -- the tree has moved --
+/// and writing that over the arrival reading would say this row entered from a
+/// tree it was never absent from. Only a row that re-enters `landed` after
+/// being reopened has no earlier reading, and takes the new one.
 const APPLY_MEASUREMENT_SQL: &str = "\
 WITH prior AS (
     SELECT state AS before FROM change_ledger
@@ -326,11 +334,13 @@ WITH prior AS (
 ), applied AS (
     INSERT INTO change_ledger (
         kind, scope, literal, state, measured_rev, retire_reason, unsettled_reason,
+        parent_observation,
         first_seen_rev,
         measured_at, landed_at, retired_at
     )
     VALUES (
         $1, $2, $3, $4, $5, $6, $7,
+        $8,
         $5,
         now(),
         CASE WHEN $4 = 'landed' THEN now() ELSE NULL END,
@@ -341,6 +351,8 @@ WITH prior AS (
         measured_rev = EXCLUDED.measured_rev,
         retire_reason = EXCLUDED.retire_reason,
         unsettled_reason = EXCLUDED.unsettled_reason,
+        parent_observation = COALESCE(change_ledger.parent_observation,
+                                      EXCLUDED.parent_observation),
         measured_at = now(),
         landed_at = CASE
             WHEN EXCLUDED.state = 'landed' THEN COALESCE(change_ledger.landed_at, now())
@@ -827,6 +839,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .bind(&measurement.measured_rev)
             .bind(measurement.retire_reason.map(RetireReason::as_str))
             .bind(&measurement.unsettled_reason)
+            .bind(&measurement.parent_observation)
             .execute(&self.pool)
             .await
             .map_err(|e| {

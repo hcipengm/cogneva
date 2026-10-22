@@ -2171,6 +2171,13 @@ async fn measure_pass(
                     .as_str(),
             )
             .at_revision(snapshot.rev()),
+            _ if state == ChangeState::Landed => {
+                ChangeMeasurement::new(row.identity.clone(), state)
+                    .at_revision(snapshot.rev())
+                    .with_parent_observation(
+                        tree.parent_observation(&snapshot, &row.identity).await,
+                    )
+            }
             _ => ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev()),
         };
         if let Err(e) = store.apply_measurement(&measurement).await {
@@ -2625,6 +2632,11 @@ async fn reopen_pass(
                     .as_str(),
             )
             .at_revision(snapshot.rev()),
+            _ if state == ChangeState::Landed => {
+                ChangeMeasurement::new(row.identity.clone(), state)
+                    .at_revision(snapshot.rev())
+                    .with_parent_observation(tree.parent_observation(snapshot, &row.identity).await)
+            }
             _ => ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev()),
         };
         if let Err(e) = store.apply_measurement(&measurement).await {
@@ -2715,6 +2727,11 @@ async fn restore_retired(
                     .as_str(),
             )
             .at_revision(snapshot.rev()),
+            _ if state == ChangeState::Landed => {
+                ChangeMeasurement::new(row.identity.clone(), state)
+                    .at_revision(snapshot.rev())
+                    .with_parent_observation(tree.parent_observation(snapshot, &row.identity).await)
+            }
             _ => ChangeMeasurement::new(row.identity.clone(), state).at_revision(snapshot.rev()),
         };
         match store.apply_measurement(&measurement).await {

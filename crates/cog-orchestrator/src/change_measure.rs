@@ -667,6 +667,56 @@ impl CheckTree {
         }
     }
 
+    /// What this same check answered one revision before `snapshot`'s, in words
+    /// the account keeps.
+    ///
+    /// A landed row says the artifact is in this tree. It cannot say whether the
+    /// artifact arrived now or was already there when the demand was written
+    /// down, and those two stories are one population on every column the
+    /// account keeps -- which is what makes "recorded after the fact" and
+    /// "built" indistinguishable in a count of landings. Asking the identical
+    /// predicate at the parent separates them without a new vocabulary:
+    /// `satisfied` means the artifact predates this landing, `absent` means the
+    /// landing brought it.
+    ///
+    /// `unreadable` is the parent revision being unavailable (a root commit, a
+    /// shallow clone) and says nothing about the row; it is kept apart from
+    /// `unsettled:<reason>` because that one is the predicate speaking.
+    pub async fn parent_observation(
+        &self,
+        snapshot: &Snapshot,
+        identity: &ChangeIdentity,
+    ) -> String {
+        // `^` and not `^{commit}`: the latter asks for the commit object a name
+        // points at, which for a commit is the commit itself -- the first
+        // version of this read asked the landing's own revision and every row
+        // came back `satisfied`. The parent is one commit back.
+        let spec = format!("{}^", snapshot.rev());
+        let parent = match self.git(&["rev-parse", "--verify", spec.as_str()]).await {
+            Ok(rev) if !rev.trim().is_empty() => rev.trim().to_string(),
+            _ => return "unreadable".to_string(),
+        };
+        let listing = match self.git(&["ls-tree", "--name-only", parent.as_str()]).await {
+            Ok(listing) => listing,
+            Err(_) => return "unreadable".to_string(),
+        };
+        let top_level = listing
+            .lines()
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect();
+        let parent_snapshot = Snapshot {
+            rev: parent,
+            top_level,
+        };
+        match self.judge(&parent_snapshot, identity).await {
+            CheckOutcome::Landed => "satisfied".to_string(),
+            CheckOutcome::Absent => "absent".to_string(),
+            CheckOutcome::Unsettled { reason, .. } => format!("unsettled:{}", reason.as_str()),
+        }
+    }
+
     /// The whole predicate for an `exists` check, and the one place the tree
     /// cannot speak for itself.
     ///
@@ -1531,6 +1581,83 @@ mod tests {
         tree.snapshot()
             .await
             .expect("the fixture repository is readable")
+    }
+
+    /// Commit whatever the fixture's scratch worktree holds as the next revision.
+    fn commit_all(dir: &tempfile::TempDir, message: &str) {
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .expect("git on the test host");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let bare = dir.path().join("bare");
+        let bare = bare.to_str().expect("a spellable path");
+        let work = dir.path().join("work");
+        let work = work.to_str().expect("a spellable path");
+        git(&["--git-dir", bare, "--work-tree", work, "add", "--all"]);
+        git(&[
+            "--git-dir",
+            bare,
+            "--work-tree",
+            work,
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ]);
+    }
+
+    /// A landed row says the artifact is in this tree; it says nothing about
+    /// whether this landing brought it. Asking the same predicate at the parent
+    /// separates a landing that built something from one that recorded what was
+    /// already there, and a root commit has no parent to ask.
+    #[tokio::test]
+    async fn a_landing_says_whether_the_artifact_arrived_with_it() {
+        let dir = repo(&[("crates/a/src/lib.rs", "pub fn a() {}\n")]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        std::fs::write(
+            dir.path().join("work").join("crates/a/src/lib.rs"),
+            "pub fn a() {}\npub fn b() {}\n",
+        )
+        .expect("the second revision's file");
+        commit_all(&dir, "second");
+        let snapshot = fixture_snapshot(&tree).await;
+
+        let arrived = identity(GREP_KIND, "crates/a/src/lib.rs", "pub fn b()");
+        assert_eq!(tree.judge(&snapshot, &arrived).await, CheckOutcome::Landed);
+        assert_eq!(
+            tree.parent_observation(&snapshot, &arrived).await,
+            "absent",
+            "the parent does not hold the literal, so this landing brought it"
+        );
+
+        let early = identity(GREP_KIND, "crates/a/src/lib.rs", "pub fn a()");
+        assert_eq!(tree.judge(&snapshot, &early).await, CheckOutcome::Landed);
+        assert_eq!(
+            tree.parent_observation(&snapshot, &early).await,
+            "satisfied",
+            "the parent already held the literal, so the landing recorded it rather than built it"
+        );
+
+        let root_only = repo(&[("crates/a/src/lib.rs", "pub fn a() {}\n")]);
+        let root_tree = CheckTree::new(root_only.path().join("bare"), "main");
+        let root = fixture_snapshot(&root_tree).await;
+        assert_eq!(
+            root_tree
+                .parent_observation(
+                    &root,
+                    &identity(GREP_KIND, "crates/a/src/lib.rs", "pub fn a()")
+                )
+                .await,
+            "unreadable",
+            "a root commit has no parent, and that says nothing about the row"
+        );
     }
 
     /// What moved between two revisions, and the two sides a rename has: a row

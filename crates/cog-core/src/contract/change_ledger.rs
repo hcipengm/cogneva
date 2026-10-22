@@ -639,6 +639,17 @@ pub struct ChangeMeasurement {
     /// dropped it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub measured_rev: Option<String>,
+    /// What the same check answered at the revision before [`Self::measured_rev`],
+    /// or why it could not be asked there.
+    ///
+    /// A landed row says the artifact is in this tree. It does not say whether it
+    /// got there now or was already there when the demand was written down, and
+    /// those two read the same on every other column. Kept as the answer's own
+    /// words (`satisfied`, `absent`, `unsettled:<reason>`, `unreadable`) rather
+    /// than as a verdict, so the comparison is made by whichever reader needs it
+    /// and the storage does not carry this module's vocabulary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_observation: Option<String>,
 }
 
 impl ChangeMeasurement {
@@ -668,6 +679,7 @@ impl ChangeMeasurement {
             unsettled_reason: None,
             observation: None,
             measured_rev: None,
+            parent_observation: None,
         }
     }
 
@@ -687,6 +699,7 @@ impl ChangeMeasurement {
             unsettled_reason: Some(reason.into()),
             observation: None,
             measured_rev: None,
+            parent_observation: None,
         }
     }
 
@@ -705,12 +718,24 @@ impl ChangeMeasurement {
             unsettled_reason: None,
             observation: None,
             measured_rev: None,
+            parent_observation: None,
         }
     }
 
     /// The same measurement, naming the revision it was taken against.
     pub fn at_revision(mut self, revision: impl Into<String>) -> Self {
         self.measured_rev = Some(revision.into());
+        self
+    }
+
+    /// The same measurement, carrying what the same check answered one revision
+    /// earlier.
+    ///
+    /// Only a landed row carries this: for a row that is still outstanding the
+    /// answer is `absent` by definition, and for an undecided or retired row
+    /// there is no answer to compare.
+    pub fn with_parent_observation(mut self, observation: impl Into<String>) -> Self {
+        self.parent_observation = Some(observation.into());
         self
     }
 }
