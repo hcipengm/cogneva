@@ -1408,7 +1408,7 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "cogneva_alert_mirror_unapplied",
-        "宿主读数 `scripts/host/cogneva-alert-mirror-reading.sh`（私有仓 brain，登记行 `alert_mirror`）：树上给规则打了镜像标记、而集群里的 PrometheusRule 对象一条带标记的都没有。它读的是「清单 → 集群」这一段，与下一条的「配置 → 进程」是链路的两处断点，修法不同（重跑 apply / 重新部署），所以分成两格而不是一个「镜像坏了」",
+        "宿主读数 `scripts/host/cogneva-alert-mirror-reading.sh`（私有仓 brain，登记行 `alert_mirror`）：树上给规则打了镜像标记、而集群里的 PrometheusRule 对象里少了其中几条。按**名字**比，不按条数比：条数相等而名字换了时条数比法恰好判绿，而集群里多留一条树已删掉的规则又会把条数比法误报成「没落地」。它读的是「清单 → 集群」这一段，与下一条的「配置 → 进程」是链路的两处断点，修法不同（重跑 apply / 重新部署），所以分成两格而不是一个「镜像坏了」",
     ),
     (
         "cogneva_alert_mirror_unconfigured",

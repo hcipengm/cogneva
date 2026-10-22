@@ -564,8 +564,8 @@ spec:
             cogneva_io_managed: "true"
             severity: warning
           annotations:
-            summary: "规则库里有 {{ $value }} 处镜像标记，但集群里一条带标记的规则都没有"
-            description: "`deploy/k3s/observability/manifests/` 里的告警带 `cogneva_io_managed=\"true\"`，而集群里 `kubectl -n monitoring get prometheusrule` 的对象上没有这个标签：这份清单还没被 apply。重跑观测面的 apply（`scripts/install.sh` 的观测段，或直接 `kubectl apply -f deploy/k3s/observability/manifests/`），再看 `cogneva_alert_mirror_applied_rules` 是否等于 `declared_rules`。给两小时：观测面的 apply 与一次滚动同量级。"
+            summary: "规则库里声明了镜像标记，而集群里的规则对象少了其中几条（见 cogneva_alert_mirror_unapplied_rule）"
+            description: "`deploy/k3s/observability/manifests/` 里带 `cogneva_io_managed=\"true\"` 的告警，有几条在集群的 `kubectl -n monitoring get prometheusrule` 对象里找不到——按**名字**比，少哪几条由 `cogneva_alert_mirror_unapplied_rule{rule=…}` 点名。修法：重跑观测面的 apply（`scripts/install.sh` 的观测段，或直接 `kubectl apply -f deploy/k3s/observability/manifests/`）。给两小时：观测面的 apply 与一次滚动同量级，而收敛循环自己也会在下一拍补上。"
 
         # 规则上了集群、进程却不知道要抄（活配置里没有 `mirror_alerts`）。这是「落地≠生效」：
         # 清单换了，跑着的那份配置还是旧的，重启一次才对得上。
