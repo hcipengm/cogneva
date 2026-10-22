@@ -305,7 +305,9 @@ spec:
             summary: "构建缓存已经放到地板之上仍回不去"
             description: "它把它能判的树都放过了，盘依然在地板之上。运行 journal 那一行会说是「缓存不是原因」还是「破坏性的一档被推迟到了 85%」。看谁在吃：`bash scripts/host/cogneva-host-footprint-trend-reading.sh`。"
 
-    # 文件大小普查（`crates/` 下每个 50 KiB 以上的 `.rs` 各判过没有）落后于活树多少。
+    # 文件大小普查（`crates/` 下每个越过普查线的 `.rs` 各判过没有）落后于活树多少。
+    # 普查线是判据脚本 `scripts/gates/check-file-size-census.py` 自己的常量，这里不抄那个数：
+    # 抄一遍就有两份会各自漂移的规格，而其中一份没有任何东西会读它。
     #
     # 为什么这条判据不在提交门上：普查表在私有仓，判的却是公开仓那棵树。挂在私有仓的
     # 提交门上时，队友在公开仓把一个 `.rs` 顶过线、没补普查行，红会落在下一个在私有仓提交
@@ -314,7 +316,7 @@ spec:
     # 判树快照按它建，结果可复现、不随别人的提交变色）；活树与钉版之间的差在这里判。
     #
     # 两个方向分开，因为它们要修的是相反的：
-    #   · 越线却没有行：有人刚把文件顶过 50 KiB，没人判过它该单轴还是多轴——要补一行；
+    #   · 越线却没有行：有人刚把文件顶过普查线，没人判过它该单轴还是多轴——要补一行；
     #   · 有行却没有文件：文件被删了或缩到线下——要撤一行，而且这一族从来不是急事。
     # 合起来会变成「普查和树不一致」一句，读的人得先自己查是哪个方向。
     - name: cogneva-file-size-census
@@ -327,7 +329,7 @@ spec:
           labels:
             severity: warning
           annotations:
-            summary: "有 {{ $value }} 个 50 KiB 以上的 .rs 没有任何一行普查判它"
+            summary: "有 {{ $value }} 个越过普查线的 .rs 没有任何一行普查判它"
             description: "公开树 `crates/` 下越了线的文件数比普查表的行数多。跑 `python3 scripts/gates/check-file-size-census.py --repo ../cogneva` 看逐条点名，补 `scripts/data/file-size-census.tsv` 一行——判据是这个文件该单轴还是多轴，不是把它拆小。补完把 `scripts/data/file-size-census.pin` 的 rev 换成含这次改动的那一版。"
 
         # 反方向：行还在、文件已经不在了。不急着当天修（撤一行而已），但不清掉的话
@@ -339,7 +341,7 @@ spec:
             severity: info
           annotations:
             summary: "普查里有 {{ $value }} 行描述的文件已经不在那条线上了"
-            description: "文件被删、或缩到了 50 KiB 以下。撤掉那几行（同一条命令会点名），再把钉文件的 rev 换到撤行之后的那一版。"
+            description: "文件被删、或缩到了普查线以下。撤掉那几行（同一条命令会点名），再把钉文件的 rev 换到撤行之后的那一版。"
 
         # 落后几个提交本身**不是**错：树在动、钉不必每提交都追。所以它没有告警，
         # 只有这条读数——真正要人管的是上面两格。把 `pin_lag_commits` 也做成告警，
