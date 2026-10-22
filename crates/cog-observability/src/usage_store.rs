@@ -567,6 +567,14 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_upstreams JSONB;
 -- 可空且无默认值：非熔断行上 `NULL` 读作"不适用"，写 0 会读成"立刻可以重试"。
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS retry_after_secs BIGINT;
 CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts);
+-- 窗口配速那一次读按 `(upstream, result)` 与 `(upstream, refusal_kind)` 各取一
+-- 小撮，而表里绝大多数行是熔断拒绝（`upstream = '-'`，与任何一家都不匹配）。没有
+-- 这两个部分索引时两次取数都是全表顺序扫描：2026-10-22 实测 148k 行 / 34MB，
+-- 一次读数 223ms，且随行数线性变慢。部分索引把谓词写进索引，取数只碰匹配的行。
+CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ok_upstream
+    ON gateway_llm_usage (upstream, ts) WHERE result = 'ok';
+CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_quota_wall
+    ON gateway_llm_usage (upstream, ts) WHERE refusal_kind = 'quota_cycle';
 -- One row per upstream **and window length**, not one per measurement: the
 -- pacer only ever acts on the newest window it has an observation for, and a
 -- history of stale boundaries would make "which one is in force" a question the
@@ -856,16 +864,26 @@ impl LlmUsageStore {
                  WHERE upstream = $1 AND refusal_kind = 'quota_cycle'
             ),
             wall AS (SELECT MAX(ts) AS ts FROM walls),
-            -- One resume per wall: the first success after it. The latest of
-            -- them is a window start, which is what a pacer can anchor the
-            -- phase to. Grouping by the wall rather than taking the first
-            -- success after the newest wall keeps the previous cycle's resume
-            -- available while the current wall has none.
+            -- The latest resume is the first success after the newest wall
+            -- that has a success after it -- not after the newest wall as
+            -- such, which keeps the previous cycle's resume available while
+            -- the current wall has none. A wall has a success after it
+            -- exactly when it sits before the last success, so the wall set
+            -- collapses to its newest such row once, and the answer is the
+            -- first success above it. Pairing every wall with every success
+            -- instead (the obvious way to write "one resume per wall, take
+            -- the latest") re-materialised the whole success list per wall:
+            -- 223 ms over 13.5k successes x 112 walls on 2026-10-22, and it
+            -- grows with each cycle because walls only accumulate.
+            last_answerable_wall AS (
+                SELECT MAX(w.ts) AS ts
+                  FROM walls w
+                 WHERE w.ts < (SELECT ts FROM last)
+            ),
             resumes AS (
                 SELECT MIN(o.ts) AS ts
-                  FROM ok o, walls w
+                  FROM ok o, last_answerable_wall w
                  WHERE o.ts > w.ts
-                 GROUP BY w.ts
             )
             SELECT
                 -- FLOOR, not a bare cast: a cast rounds to the nearest second,
