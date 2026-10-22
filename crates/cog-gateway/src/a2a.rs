@@ -460,21 +460,35 @@ pub async fn message_stream_handler(
     // 存在的缺陷。
     let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
     goal_row.workspace_id = None;
-    let orchestrator = state.orchestrator.clone();
-    let goal = request.goal.clone();
-    let submit_id = goal_id.clone();
-    tokio::spawn(async move {
-        match orchestrator.submit_goal_auto(&goal, vec![goal_row]).await {
-            Ok(ids) => tracing::info!(
-                goal_id = %submit_id,
-                task_count = ids.len(),
-                "a2a message/stream goal accepted"
-            ),
-            Err(e) => {
-                tracing::error!(goal_id = %submit_id, "a2a message/stream submit failed: {e}")
-            }
-        }
-    });
+    // 提交在开流之前等它落地，理由与 `message/send` 是同一个：这一行要读不回来，
+    // 流能给出的只有「这一行从没出现过」——而那与「提交被拒」是两件事，对端要等
+    // 满一个截止时间才能听到前者。拒了就当场报一帧，理由照实说。
+    let submitted = state
+        .orchestrator
+        .submit_goal_auto(&request.goal, vec![goal_row])
+        .await;
+    if let Err(reason) = accepted(&goal_id, submitted) {
+        tracing::error!(goal_id = %goal_id, reason = %reason, "a2a message/stream was not accepted");
+        let frame = sse_frame(&json!({
+            "jsonrpc": "2.0",
+            "id": request.rpc_id,
+            "error": {"code": -32603, "message": reason},
+        }));
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header("x-accel-buffering", "no")
+            .body(Body::from(frame))
+            .unwrap_or_else(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "stream_unavailable"})),
+                )
+                    .into_response()
+            });
+    }
+    tracing::info!(goal_id = %goal_id, "a2a message/stream goal accepted");
 
     let stream = goal_stream(StreamState {
         reader: Arc::new(state.orchestrator.clone()),
