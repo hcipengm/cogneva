@@ -25,16 +25,20 @@
 #
 # Re-read 2026-10-19 02:20Z against Prometheus 3.14.0, kubelet v1.36.4+k3s1.
 
-# --- component_absent (9 rules): the delivery chain is not deployed ----------
-AlertmanagerFailedReload	alertmanager_config_last_reload_successful	component_absent	No Alertmanager is deployed (activeAlertmanagers=[]); this rule is the only witness that alert delivery has no home.
-AlertmanagerConfigInconsistent	alertmanager_config_hash	component_absent	No Alertmanager is deployed; the replica config drift this rule guards cannot occur yet.
-AlertmanagerClusterFailedToSendAlerts	alertmanager_notifications_failed_total,alertmanager_notifications_total	component_absent	No Alertmanager is deployed; there is no notification path to fail. Deploying Alertmanager (or a webhook relay) is the fix.
-AlertmanagerFailedToSendAlerts	alertmanager_notifications_failed_total,alertmanager_notifications_total	component_absent	No Alertmanager is deployed; same delivery gap as AlertmanagerClusterFailedToSendAlerts.
-AlertmanagerClusterFailedPeers	alertmanager_cluster_failed_peers	component_absent	No Alertmanager is deployed; the HA peer set this rule watches does not exist.
-AlertmanagerMembersInconsistent	alertmanager_cluster_members	component_absent	No Alertmanager is deployed; cluster membership cannot diverge with zero members.
-PrometheusErrorSendingAlertsToAnyAlertmanager	prometheus_notifications_errors_total,prometheus_notifications_sent_total	component_absent	Prometheus has no Alertmanager target, so the notification counters are never registered; the rule and the defect it reports are the same absence.
-PrometheusErrorSendingAlertsToSomeAlertmanagers	prometheus_notifications_errors_total,prometheus_notifications_sent_total	component_absent	Prometheus has no Alertmanager target; partial-send failures cannot be measured before any send exists.
-PrometheusNotificationQueueRunningFull	prometheus_notifications_queue_length	component_absent	The notification queue has no receiver and therefore no depth; it stays absent until Alertmanager exists.
+# --- component_absent (9 rules): retired 2026-10-23 -------------------------
+# These nine rules (six Alertmanager, three Prometheus notification) watched an
+# Alertmanager this deployment does not run and will not run: the alert delivery
+# path here is in-process rule evaluation -> the platform's `alerts` table -> the
+# WebUI panel, not a second delivery chain with its own queue and receivers.
+# Keeping guards for a component that is absent by design is not dormancy, it is
+# a permanent declared defect -- `component_absent` is documented as a defect.
+# So the rule groups are retired in the monitoring values
+# (`deploy/k3s/observability/helm/kube-prometheus-stack-values-small.yaml`:
+# `defaultRules.rules.alertmanager: false` plus the three Prometheus
+# notification rules under `defaultRules.disabled`), and their rows are deleted
+# from this registry -- a row for a rule that no longer exists is stale.
+# The full profile (`PROFILE=full`) does run Alertmanager and keeps the rules;
+# nothing in this registry is needed there because their series exist.
 
 # --- feature_off (3 rules): no remote write is configured -------------------
 PrometheusRemoteStorageFailures	prometheus_remote_storage_failed_samples_total,prometheus_remote_storage_samples_failed_total,prometheus_remote_storage_samples_total,prometheus_remote_storage_succeeded_samples_total	feature_off	No remote_write is configured, so the remote-storage queue never registers its counters.

@@ -250,6 +250,56 @@ async fn the_card_names_the_address_the_caller_reached_us_at() {
     );
 }
 
+/// A peer that has never talked to us has no credential yet -- and the card is
+/// what tells it which credential to get. So the card has to answer without
+/// one, while the endpoint it names has to refuse.
+///
+/// Asking with a bearer proves nothing here: the fixture carries a token the
+/// real first-contact caller cannot have, and both sides stay green while the
+/// peer is stuck at step one.
+#[tokio::test]
+async fn the_card_answers_a_peer_that_has_no_credential_yet() {
+    let state = router_state::stateless();
+    let app = create_router(state);
+
+    let card = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/protocol/a2a/agent-card")
+                .body(Body::empty())
+                .expect("the request is well formed"),
+        )
+        .await
+        .expect("the router answers");
+    assert_eq!(
+        card.status().as_u16(),
+        200,
+        "discovery cannot require the credential it is supposed to announce"
+    );
+
+    let rpc = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/protocol/a2a")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": "x"}})
+                        .to_string(),
+                ))
+                .expect("the request is well formed"),
+        )
+        .await
+        .expect("the router answers");
+    assert!(
+        matches!(rpc.status().as_u16(), 401 | 403),
+        "the business endpoint still refuses a caller with no credential, got {}",
+        rpc.status()
+    );
+}
+
 /// One HTTP round trip to the endpoint, returning the JSON body. Used where the
 /// test has to send something the client would refuse to build.
 async fn post(app: &axum::Router, token: &str, body: serde_json::Value) -> serde_json::Value {

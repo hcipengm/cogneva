@@ -210,6 +210,14 @@ kubeProxy:
 # 全量保留：规则只是 ConfigMap，被停用的组件（etcd 等）对应规则自然无数据
 defaultRules:
   create: true
+  rules:
+    # 本档不装 Alertmanager，而 chart 的 alertmanager 规则组整组看的是 `alertmanager_*`
+    # 指标：留着它们，等于给一个按设计不存在的组件装一套守卫，读数上永远落成
+    # 「组件不在」的缺陷（9 条里 6 条）。平台的告警投递面是进程内规则求值＋`alerts`
+    # 表＋WebUI（见下面 PrometheusNotConnectedToAlertmanagers 的注释），不靠
+    # Alertmanager；所以退役这组规则，而不是为它补一个第二个投递链。
+    # 上全量档（PROFILE=full，真的有 Alertmanager）时这张表不生效，规则照常出现。
+    alertmanager: false
   disabled:
     # Prometheus 3 删掉了聚合计数器 prometheus_sd_refresh_failures_total，上游模板
     # 仍引用它（91.5.2 与 main 都未修），这条规则因此永远不触发。关掉 chart 里那条，
@@ -225,6 +233,12 @@ defaultRules:
     # 在这一档仍然是事实——只是不该由一条恒红的规则来说。上全量档（有真的
     # Alertmanager 与接收端）时删掉这一行。
     PrometheusNotConnectedToAlertmanagers: true
+    # 同一件事的另外三条：Prometheus 侧「把告警发给 Alertmanager」的计数器与队列
+    # 在没有投递目标时根本不注册，规则引用不到任何序列——它们报的是本档的设计，
+    # 不是故障。退役规则，不在台账里把它们记成缺陷。
+    PrometheusErrorSendingAlertsToAnyAlertmanager: true
+    PrometheusErrorSendingAlertsToSomeAlertmanagers: true
+    PrometheusNotificationQueueRunningFull: true
 
 # ─── 补回被关掉的规则 ─────────────────────────────────────────────
 # 只放需要重写的规则；其余默认规则保持 chart 原样。

@@ -495,6 +495,14 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/auth/register", post(auth::register_handler))
         .route("/api/v1/auth/refresh", post(auth::refresh_handler))
         .route("/metrics", get(prometheus_metrics_handler))
+        // A2A 的发现入口：对端的第一步是「先取名片、再按名片上声明的方式取凭证」。
+        // 名片要是也跟在业务鉴权组里，这一步就闭成环——先有凭证才能知道该用什么
+        // 凭证。名片只公布地址、能力与鉴权方式，不含任何业务数据，所以它公开；
+        // 真正会动的 `message/stream` 与 RPC 仍留在 operator 组里按名片声明拒绝。
+        .route(
+            "/api/v1/protocol/a2a/agent-card",
+            get(a2a_agent_card_handler),
+        )
         .route("/ws", get(ws_handler))
         .route("/api/v1/evolution/stream", get(evolution::stream_handler))
         .route("/dashboard", get(dashboard::dashboard_handler))
@@ -864,10 +872,8 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/protocol/mcp/tools/call",
             post(mcp_tool_call_handler),
         )
-        .route(
-            "/api/v1/protocol/a2a/agent-card",
-            get(a2a_agent_card_handler),
-        )
+        // 名片本身不在这里：它是给「还没有凭证的对端」用的发现入口，挂在公开路由上
+        // （见 `public`）。留在这组会闭成环——要凭证才能读到「该用什么凭证」。
         // 名片上 `streaming` / `state_transition_history` 两杆旗指名的就是这个方法。
         // 旗子与端点必须在同一处能被读出来——旗在这里挂，端点也在这里挂，改名的人
         // 会同时看到两张。
