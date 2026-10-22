@@ -41,6 +41,6 @@
 11-podmonitor-redis.yaml deliver # Redis 的 AOF 修复明细导出（sidecar 暴露 /metrics），自发现规则的数据来源
 12-stack-convergence-rbac.yaml deliver # 授权面：让收敛循环能 apply 上面这些；只能安装期交付（循环按 kind 不应用 Role/RoleBinding），这一行说的是安装期的处置
 13-scrapeconfig-host-readings.yaml deliver # 宿主侧各面读数的唯一抓取目标（一个进程一个端口，面由 scripts/data/host-readings.tsv 决定）；生产者不在集群、也不在镜像里，目标由 install.sh 给本机节点打标选出
-15-prometheusrule-host-readings.yaml deliver # 宿主读数通道自己的告警：生产者死了、生产者读不到输入、整条通道抓不到，三条分开（修法不同）
+15-prometheusrule-host-readings.yaml deliver # 读宿主侧序列的全部规则：通道自身（生产者死了／读不到输入／整条抓不到）与各面读完自己那几格判词后要人动手的那几条；同一条规则里不合并修法不同的两态，逐组注释写明哪一格归谁
 16-recordingrules-face-first-readings.yaml deliver # 面表里「按名字取、且名字本身就是一条能算出来的 PromQL」的第一条读数，由 Prometheus 自己算出来发布（`资源管理` 的 buildgate_refused_by_what）；宿主脚本那条只留细节
 17-prometheusrule-acceptance-census.yaml deliver # 验收普查的消费者：stale>0、读数整条不见、读数停更三条分开；夹具让 Prometheus 规则引擎真跑一遍（deploy/scripts/test-acceptance-census-alert-rules.sh）
