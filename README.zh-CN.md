@@ -514,7 +514,7 @@ Cogneva 有 20+ 业务 crate，如果让它们直接互相依赖，很快会变�
 | 外部 API | — | HTTP / WebSocket | — |
 
 `MessageBackend` Trait 定义（`crates/cog-core/src/contract/stream.rs`）：
-- `publish` / `publish_batch` / `payload_limit` / `subscribe` / `subscribe_from` / `stop_stream` / `create_consumer_group` / `ack` / `claim_pending` / `pending_stats` / `stream_lag` / `dlq` / `delay_publish`
+- `publish` / `publish_batch` / `payload_limit` / `subscribe` / `subscribe_from` / `stop_stream` / `delete_stream` / `create_consumer_group` / `ack` / `claim_pending` / `pending_stats` / `stream_lag` / `dlq` / `delay_publish`
 - 实现方可针对 Redis pipeline、NATS 并发发布、内存单锁等优化 batch 和延迟发布
 
 ### 🗄️ 存储机制（Backend Trait 热插拔）
