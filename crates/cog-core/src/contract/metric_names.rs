@@ -1016,25 +1016,17 @@ metric_names! {
     LLM_POOL_RESERVE_TOKENS => "llm_pool_reserve_tokens",
     LLM_POOL_PACED_UPSTREAMS => "llm_pool_paced_upstreams",
     LLM_POOL_SIGNAL_CONNECTED => "llm_pool_signal_connected",
-    // The declared daily ceiling and how much of it the ledger says is used.
-    // Three series because the ceiling cannot be read from any one of them:
-    // `llm_budget_tokens` is what the deployment declared (0 = none declared),
-    // `llm_budget_spent_tokens` is today's sum from the ledger, and
-    // `measured_at` says whether that sum is still a reading at all. Without it
+    // What the ledger says was spent since the start of the UTC day, and which
+    // tick that sum came from. Two series because neither is a reading alone:
     // a spend of 0 is either "nothing spent yet today" or "the ledger could not
-    // be read", and those two call for opposite repairs — one is a quiet
-    // platform, the other is a blind meter. All three are written every tick,
-    // because a series that stops being written keeps its last value in the
-    // shared store and would stand as the current reading forever.
-    LLM_BUDGET_TOKENS => "llm_budget_tokens",
+    // be read", and those call for opposite repairs — one is a quiet platform,
+    // the other is a blind meter. Both are written every tick, because a series
+    // that stops being written keeps its last value in the shared store and
+    // would stand as the current reading forever. They are a reading only: the
+    // platform does not put a ceiling on its own work, so nothing refuses a call
+    // from these.
     LLM_BUDGET_SPENT_TOKENS => "llm_budget_spent_tokens",
     LLM_BUDGET_MEASURED_AT_UNIX => "llm_budget_measured_at_unix",
-    // Calls refused because the declared ceiling was reached, by which ceiling
-    // refused them and who asked. The scope cell is the knob to turn: a `pool`
-    // refusal is the deployment's own ceiling, an `actor` refusal is one
-    // component's allowance. The actor cell is there because a refusal count
-    // without it says the ceiling is biting but not which caller it starved.
-    LLM_BUDGET_REFUSALS_TOTAL => "llm_budget_refusals_total",
 
     // cog-gateway — the audited LLM channel.
     //

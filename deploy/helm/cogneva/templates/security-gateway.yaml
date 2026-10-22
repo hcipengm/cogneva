@@ -89,14 +89,6 @@ spec:
                   name: cogneva-secrets-oob
                   key: llm-pool-min-healthy
                   optional: true
-            # 每日 token 预算（自己允许自己花多少，与上面那条"上游愿意给多少"
-            # 是两回事）。非凭证，所以走 values 渲染成普通 env 而不是 Secret。
-            # 空串 = 没声明上限 = 行为与从前一致：网关把它当"未声明"，而不是把
-            # 空串解析成某个数，所以这条键始终存在也不改变默认行为。
-            - name: COGNEVA_LLM_DAILY_TOKEN_BUDGET
-              value: {{ .Values.securityGateway.dailyTokenBudget | quote }}
-            - name: COGNEVA_LLM_DAILY_TOKEN_BUDGET_ACTORS
-              value: {{ .Values.securityGateway.dailyTokenBudgetActors | quote }}
             - name: COGNEVA_GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:

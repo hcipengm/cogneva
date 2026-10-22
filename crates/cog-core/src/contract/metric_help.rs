@@ -147,19 +147,6 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          the two series is a reading that was never written at all",
     ),
     (
-        crate::metric_names::LLM_BUDGET_REFUSALS_TOTAL.as_str(),
-        "Calls the gateway refused because the declared daily token ceiling was \
-         reached, by which ceiling refused them (`scope`) and who asked \
-         (`actor`). `scope=\"actor\"` is one component's own allowance, \
-         `scope=\"pool\"` is the deployment's global one; they are different \
-         people's knobs, so one counter over both would say the ceiling is \
-         biting without saying which line of configuration to move. Read it \
-         beside `llm_budget_spent_tokens`: a spend at the ceiling with no \
-         refusals here means the calls that would have crossed it were not \
-         attempted, and a spend well under it with refusals climbing means an \
-         actor cap is doing the work, not the pool one",
-    ),
-    (
         "llm_upstream_client_errors_total",
         "Total LLM upstream calls rejected as malformed requests",
     ),
@@ -1472,14 +1459,6 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          not of the pool: the same number applies whichever upstream serves",
     ),
     (
-        "llm_budget_tokens",
-        "The declared daily ceiling on LLM tokens, in tokens per UTC day. Zero \
-         means no ceiling was declared, and the gateway then refuses nothing on \
-         this axis. Read against llm_budget_spent_tokens: the pair is the one \
-         bound on this platform that does not depend on what an upstream \
-         allows, so it is also the one that holds when the pool is generous",
-    ),
-    (
         "llm_budget_spent_tokens",
         "Tokens the ledger says were spent since the start of the UTC day, over \
          every row and not only successful calls: tokens an upstream answered \
@@ -1491,13 +1470,12 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     (
         "llm_budget_measured_at_unix",
         "When the gateway last summed today's spend from the ledger, unix \
-         seconds; absent until one succeeds on the current day. This is the age \
-         reading for the two budget figures beside it: nothing else in the \
-         family moves when the gateway dies, so a frozen spend and a frozen \
-         ceiling would otherwise sit there looking current. When the read fails \
-         the gateway allows the call rather than refusing it -- a meter that \
-         cannot read must not become an outage -- which makes this series the \
-         only thing that says the ceiling is currently not being enforced",
+         seconds; zero until one succeeds on the current day. This is the age \
+         reading for the spend figure beside it: nothing else in the family \
+         moves when the gateway dies, so a frozen spend and a fresh-looking \
+         number would otherwise sit there looking current. Read the pair \
+         together before replying on spend: a zero spend with a zero age is a \
+         sum that has not succeeded, not a day nobody spent",
     ),
     (
         "llm_pool_paced_upstreams",

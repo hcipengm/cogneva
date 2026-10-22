@@ -17,7 +17,7 @@
 //! All counters carry a TTL until the next UTC midnight, so daily reset is
 //! automatic.
 
-use chrono::{Duration, Timelike, Utc};
+use chrono::Utc;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -75,11 +75,13 @@ impl HierarchyManager {
         format!("quota:{}:history:{}:{}", scope.as_str(), id, ymd)
     }
 
+    /// How long a counter written now may live before the day turns.
+    ///
+    /// The bound is the rest of the UTC day, not "at least a minute": a counter
+    /// written at 23:59:30 with a minute of slack would outlive the reset and
+    /// charge the new day with yesterday's spend.
     fn seconds_until_midnight() -> u64 {
-        let now = Utc::now();
-        let seconds_today =
-            now.num_seconds_from_midnight() as i64 + now.timestamp_subsec_millis() as i64 / 1000;
-        (Duration::seconds(86400).num_seconds() - seconds_today).max(60) as u64
+        crate::day::seconds_to_next_day(Utc::now().timestamp())
     }
 
     /// Configure the soft/hard limits for a particular `(scope, target)` pair.
@@ -246,6 +248,51 @@ impl HierarchyManager {
         }
         Ok(out)
     }
+}
+
+/// A refusal a caller can act on: which ceiling stopped it, how far past that
+/// ceiling the projection went, and when the counters reset.
+///
+/// [`HierarchyDecision`] carries the same numbers per scope, but a caller
+/// answering a request needs two things it does not: one named ceiling (the
+/// first that blocked, in cascade order) and the wait until the reset. Both are
+/// derived at the moment of the decision rather than stored, because both are
+/// facts about that moment and not about the counter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DailyCapRefusal {
+    pub scope: QuotaScope,
+    pub target_id: String,
+    /// The scope's hard limit, in tokens per UTC day.
+    pub cap_tokens: u64,
+    /// What that scope had spent when the decision was made.
+    pub spent_tokens: u64,
+    /// The projection the decision was made with, passed back rather than
+    /// inferred: `spent_tokens` alone cannot say how far past the ceiling the
+    /// request would have gone.
+    pub estimated_tokens: u64,
+    /// Seconds until the counters reset, at least one.
+    pub retry_after_secs: u64,
+}
+
+/// The refusal a decision names, or `None` when it allows the call.
+///
+/// The first blocking scope is the one named, not the largest overrun: they are
+/// reported in cascade order (`user` before `workspace` before `global`), so the
+/// named ceiling is the narrowest one the caller can ask its owner to raise.
+pub fn refusal_for(
+    decision: &HierarchyDecision,
+    estimated_tokens: u64,
+    now_unix: i64,
+) -> Option<DailyCapRefusal> {
+    let blocked = decision.blocked_by.first()?;
+    Some(DailyCapRefusal {
+        scope: blocked.scope,
+        target_id: blocked.target_id.clone(),
+        cap_tokens: blocked.limits.hard_limit,
+        spent_tokens: blocked.used_today,
+        estimated_tokens,
+        retry_after_secs: crate::day::seconds_to_next_day(now_unix),
+    })
 }
 
 #[async_trait::async_trait]

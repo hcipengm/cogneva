@@ -306,3 +306,52 @@ async fn test_pre_deduct_returns_err_when_blocked() {
         "should error when projected exceeds hard limit"
     );
 }
+
+/// A blocked decision names the narrowest ceiling that stopped it, with the
+/// figures the decision was made from and the wait until the counters reset.
+///
+/// Both facts are what a request-facing caller cannot derive from the decision
+/// itself: the scopes are a list, and the reset is a clock fact rather than a
+/// stored one. Naming the first blocking scope (cascade order) is what makes the
+/// refusal point at the one allowance its owner can raise.
+#[tokio::test]
+async fn test_refusal_names_the_blocked_scope_and_the_reset() {
+    let prefix = "ti10";
+    let mgr = fresh_manager();
+    let ctx = QuotaContext {
+        user_id: Some(format!("{}:user", prefix)),
+        workspace_id: Some(format!("{}:ws", prefix)),
+        ..Default::default()
+    };
+    mgr.consume(&ctx, 95).await.expect("consume ok");
+
+    let decision = mgr.check(&ctx, 10).await;
+    assert!(!decision.allowed);
+    // Noon UTC: the pair below is the rest of the day.
+    let noon = 1_600_000_000 - 1_600_000_000 % 86_400 + 12 * 3600;
+    let refusal = cog_quota::refusal_for(&decision, 10, noon).expect("blocked");
+
+    assert_eq!(
+        refusal.scope,
+        QuotaScope::User,
+        "the narrowest blocked scope"
+    );
+    assert_eq!(refusal.target_id, format!("{}:user", prefix));
+    assert_eq!(refusal.cap_tokens, 100);
+    assert_eq!(refusal.spent_tokens, 95);
+    assert_eq!(refusal.estimated_tokens, 10);
+    assert_eq!(refusal.retry_after_secs, 12 * 3600);
+}
+
+/// An allowed decision has no refusal to report: `None`, not a zeroed one.
+#[tokio::test]
+async fn test_allowed_decision_has_no_refusal() {
+    let mgr = fresh_manager();
+    let ctx = QuotaContext {
+        user_id: Some("ti11:user".into()),
+        ..Default::default()
+    };
+    let decision = mgr.check(&ctx, 10).await;
+    assert!(decision.allowed);
+    assert_eq!(cog_quota::refusal_for(&decision, 10, 0), None);
+}

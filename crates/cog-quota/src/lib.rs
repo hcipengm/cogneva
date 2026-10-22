@@ -7,6 +7,10 @@
 //!   [`hierarchy::HierarchyManager`].
 //! - Per-day usage history with TTL-based daily resets at UTC midnight.
 //! - Two-phase quota consumption (`pre_deduct` → `consume` / `refund`).
+//! - The two facts a refused caller needs from that reset: the UTC day boundary
+//!   as a pure function ([`day`]) and the named refusal with its wait
+//!   ([`hierarchy::refusal_for`]), so a request-facing caller can answer with
+//!   `Retry-After` without re-deriving either.
 //! - Prometheus families via [`metrics::QuotaMetrics`]: per-account, and so
 //!   per-account keys are unbounded — which is why no periodic scrape carries
 //!   them and nothing serves them today.
@@ -28,6 +32,7 @@
 pub mod agent_budget;
 pub mod billing;
 pub mod budget_manager;
+pub mod day;
 pub mod error;
 pub mod hierarchy;
 pub mod metrics;
@@ -39,8 +44,9 @@ mod store;
 pub use agent_budget::{AgentBudget, BudgetAction, BudgetResult, BudgetTemplates};
 pub use billing::{BillingRecord, BillingRepository, RechargeRecord};
 pub use budget_manager::ContextBudgetManager;
+pub use day::{day_start_unix, seconds_to_next_day};
 pub use error::{QuotaError, QuotaResult};
-pub use hierarchy::HierarchyManager;
+pub use hierarchy::{refusal_for, DailyCapRefusal, HierarchyManager};
 pub use metrics::QuotaMetrics;
 pub use model::{ModelConfig, ModelRegistry, TaskType};
 pub use observable::{QuotaObservable, QuotaReadings};
