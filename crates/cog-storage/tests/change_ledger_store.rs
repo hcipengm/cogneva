@@ -85,26 +85,31 @@ async fn migrate_once(url: &str) {
         .expect("release the schema lock");
 }
 
-/// Hold the retirement queue to one test at a time.
+/// Hold the folder seat to one test at a time.
 ///
-/// The backlog is global by design: `fold_retirements` folds whatever is
-/// queued, not only the caller's rows, and `pending_retirements` counts the
-/// whole table. Two tests asserting those numbers in parallel therefore fold
-/// each other's rows and count each other's queue -- the assertions still read
-/// as global facts, they are just no longer about the row under test. This
-/// session lock (a different key from the schema lock) makes the retirement
-/// tests exclusive; closing the connection releases it, including when a test
-/// panics.
-async fn retirement_lock() -> sqlx::PgConnection {
+/// Both folds work on the queue itself rather than on the caller's rows: they
+/// take whatever is queued, write the account, and mark afterwards. One folder
+/// is what the product assumes -- the resident loop sits behind an owner lease,
+/// so a second one only exists when the lease has moved -- and the tests run in
+/// parallel, which is several folders at once. Two of them can then select the
+/// same queued row and write it in the other order: the slower fold marks the
+/// older reading after the newer one has already been written, and because the
+/// row is now folded, nothing goes back for it. The assertions still read as
+/// global facts; they are just no longer about the row under test.
+///
+/// This session lock (a key of its own, apart from the schema lock) makes the
+/// folding tests exclusive, which is the one-folder rule this suite is missing.
+/// Closing the connection releases it, including when a test panics.
+async fn folder_lock() -> sqlx::PgConnection {
     let url = database_url();
     let mut conn = sqlx::PgConnection::connect(&url)
         .await
-        .expect("connect to take the retirement lock");
+        .expect("connect to take the folder lock");
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(97_003_i64)
         .execute(&mut conn)
         .await
-        .expect("take the retirement lock");
+        .expect("take the folder lock");
     conn
 }
 
@@ -312,7 +317,7 @@ async fn a_row_created_by_a_measurement_enters_at_that_measurements_revision() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn a_queued_retirement_folds_into_the_account_and_is_idempotent() {
-    let _retirement_lock = retirement_lock().await;
+    let _folder_lock = folder_lock().await;
     let (store, pool, marker) = store().await;
     let id = identity(&marker, "fixture");
 
@@ -378,7 +383,7 @@ async fn a_queued_retirement_folds_into_the_account_and_is_idempotent() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn a_later_measurement_clears_a_retirement() {
-    let _retirement_lock = retirement_lock().await;
+    let _folder_lock = folder_lock().await;
     let (store, pool, marker) = store().await;
     let id = identity(&marker, "re-examined");
 
@@ -431,6 +436,7 @@ async fn a_later_measurement_clears_a_retirement() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn a_corrected_declaration_reaches_the_accounts_citation_of_its_document() {
+    let _folder_lock = folder_lock().await;
     let (store, pool, marker) = store().await;
     let id = identity(&marker, "corrected");
     let doc = format!("docs/{marker}.md");
@@ -520,6 +526,7 @@ async fn a_corrected_declaration_reaches_the_accounts_citation_of_its_document()
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn a_declarations_band_rides_the_citation_and_the_row_takes_the_highest() {
+    let _folder_lock = folder_lock().await;
     let (store, pool, marker) = store().await;
     let id = identity(&marker, "band");
     let urgent = format!("docs/{marker}-urgent.md");
@@ -638,6 +645,7 @@ async fn a_declarations_band_rides_the_citation_and_the_row_takes_the_highest() 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn the_outstanding_read_hands_out_the_most_urgent_band_first() {
+    let _folder_lock = folder_lock().await;
     let (store, pool, marker) = store().await;
     let unstated = identity(&marker, "unstated");
     let quiet = identity(&marker, "quiet");
@@ -758,6 +766,7 @@ async fn the_outstanding_read_hands_out_the_most_urgent_band_first() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn a_batch_the_bands_fill_completely_still_asks_the_rows_behind_them() {
+    let _folder_lock = folder_lock().await;
     const BATCH: usize = 40;
     const BANDED: usize = 60;
     const BEHIND: usize = 6;
@@ -885,6 +894,7 @@ async fn a_batch_the_bands_fill_completely_still_asks_the_rows_behind_them() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn a_freshly_folded_declaration_enters_pending_and_unmeasured() {
+    let _folder_lock = folder_lock().await;
     let (store, pool, marker) = store().await;
     let id = identity(&marker, "fresh");
     store
@@ -1406,6 +1416,7 @@ async fn the_reason_of_a_transition_is_recorded_with_it() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn a_demand_is_satisfied_by_a_landing_and_owed_until_one_is_measured() {
+    let _folder_lock = folder_lock().await;
     let (store, pool, marker) = store().await;
     // An empty transaction, held open for one thing only: the advisory lock is
     // transaction-scoped, so dropping it (including on a panic) releases the
@@ -1493,6 +1504,7 @@ async fn a_demand_is_satisfied_by_a_landing_and_owed_until_one_is_measured() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn the_face_census_reads_a_number_for_the_age_and_three_buckets_that_add_up() {
+    let _folder_lock = folder_lock().await;
     let (store, pool, marker) = store().await;
     let id = identity(&marker, "census");
     let doc = format!("{marker}.md");
