@@ -56,9 +56,11 @@ async fn registry() -> RedisAgentRegistry {
 /// it: no expiry at all, and whatever beat time the payload happens to hold.
 async fn plant_without_expiry(reg: &AgentRegistration) {
     let client = redis::Client::open(redis_url()).expect("redis url");
-    let mut conn = redis::aio::ConnectionManager::new(client)
-        .await
-        .expect("connection");
+    // The same self-healing, budget-bounded connect every other caller uses:
+    // building the manager straight from the driver leaves its retry delays
+    // uncapped, so a probe aimed at an address that is not there waits minutes
+    // before it can say so.
+    let mut conn = cog_redis::connect(&client).await.expect("connection");
     let payload = serde_json::to_string(reg).expect("serialize");
     let key = format!("orchestrator:agents:{}", reg.agent_id);
     let _: () = conn.set(&key, payload).await.expect("planted record");
@@ -70,9 +72,7 @@ async fn plant_without_expiry(reg: &AgentRegistration) {
 
 async fn ttl_secs(agent_id: &str) -> i64 {
     let client = redis::Client::open(redis_url()).expect("redis url");
-    let mut conn = redis::aio::ConnectionManager::new(client)
-        .await
-        .expect("connection");
+    let mut conn = cog_redis::connect(&client).await.expect("connection");
     conn.ttl(format!("orchestrator:agents:{agent_id}"))
         .await
         .expect("ttl")
@@ -185,9 +185,9 @@ async fn a_fresh_record_is_live_even_before_its_expiry_is_rearmed() {
 /// and the operator presence heartbeat do (`SET ... EX`).
 async fn plant_with_expiry(reg: &AgentRegistration, seconds: u64) {
     let client = redis::Client::open(redis_url()).expect("redis url");
-    let mut conn = redis::aio::ConnectionManager::new(client)
-        .await
-        .expect("connection");
+    // Bounded like the other plant helper: a probe must not spend minutes on an
+    // address that is not there.
+    let mut conn = cog_redis::connect(&client).await.expect("connection");
     let payload = serde_json::to_string(reg).expect("serialize");
     let key = format!("orchestrator:agents:{}", reg.agent_id);
     let _: () = conn
