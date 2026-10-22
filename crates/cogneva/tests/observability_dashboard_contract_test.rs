@@ -13,6 +13,7 @@
 //!
 //! principle: feedback_a_gate_keyed_on_the_artifacts_purpose_needs_a_fail_closed_type_table
 //! principle: feedback_a_judge_reading_only_its_own_green_corpus_cannot_be_shown_to_red
+//! principle: feedback_a_ledger_that_records_a_path_goes_blind_when_the_file_moves
 
 use std::collections::BTreeSet;
 
