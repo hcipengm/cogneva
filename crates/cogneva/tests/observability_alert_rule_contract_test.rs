@@ -5401,7 +5401,7 @@ fn reporter_aggregated_away(expr: &str, pos: usize) -> bool {
 }
 
 /// Every occurrence of `name` in `expr` that is not aggregated away.
-fn bare_occurrences<'a>(expr: &'a str, name: &str) -> Vec<usize> {
+fn bare_occurrences(expr: &str, name: &str) -> Vec<usize> {
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(found) = expr[from..].find(name) {
