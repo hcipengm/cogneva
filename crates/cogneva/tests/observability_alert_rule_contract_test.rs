@@ -2916,6 +2916,43 @@ fn a_windowless_read_is_the_subject_unless_arithmetic_holds_it() {
         .is_empty(),
         "作为时钟的读被当成了观测"
     );
+
+    // An existence question rather than a value read: a window over the series
+    // with nothing asked of its writer, which is the shape four absent-shaped
+    // rules ship. Silence here is the point -- a frozen value quiets this rule
+    // instead of pinning it on, so the guard would be dead weight.
+    let backups = only(&["cogneva_backup_run_readings"]);
+    assert!(
+        unguarded_store_reading_complaints(
+            "max(absent_over_time(cogneva_backup_run_readings{readout=\"drill\"}[10m]))",
+            &backups
+        )
+        .is_empty(),
+        "问「这条序列出现过没有」被当成「把值当观测」报了出来"
+    );
+    // The same window read as a value still needs its writer: the exemption is
+    // about existence, not about windows.
+    assert_eq!(
+        unguarded_store_reading_complaints(
+            "max(cogneva_backup_run_readings{readout=\"drill\"}[10m]) > 0",
+            &backups
+        )
+        .len(),
+        1,
+        "窗口内的取值没有被报出来"
+    );
+    // Both questions in one expression: the value read is still the subject, so
+    // the name must not be exempted wholesale.
+    assert_eq!(
+        unguarded_store_reading_complaints(
+            "max(absent_over_time(cogneva_backup_run_readings{readout=\"drill\"}[10m])) \
+             + max(cogneva_backup_run_readings{readout=\"drill\"}[10m]) > 0",
+            &backups
+        )
+        .len(),
+        1,
+        "同一个名字既问存在又读值时，读值那一处被一并豁免了"
+    );
 }
 
 /// The guard over the census has to look back further than the publisher's own

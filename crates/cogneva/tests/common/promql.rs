@@ -1256,11 +1256,71 @@ pub fn uncovered_window_complaints(expr: &str) -> Vec<String> {
 /// lets one live stream carry the gate for a stopped one; that arrangement is
 /// asserted rather than assumed in the tests below, and where it was found in
 /// the shipped rules it was moved inside the reduction instead.
+/// Gauge names this expression reads **only** to ask whether they existed in a
+/// window, never what they held.
+///
+/// `absent_over_time(<gauge>[W])` is the shape. The writer guard exists for a
+/// value read: a store-served gauge whose writer died keeps serving its last
+/// value, so a rule that reads that value keeps saying the same thing forever.
+/// An existence question runs the other way — a frozen value makes it *quiet*,
+/// never permanently lit — so the guard the criterion prescribes
+/// (`(time() - <companion>) < bound`) would sit next to it doing nothing, and
+/// the window it demands would only make the rule slower to answer the one
+/// question it asks.
+///
+/// Every occurrence has to be inside such a call. An expression that also reads
+/// the gauge's value elsewhere is asking both questions, and the value read
+/// still needs its guard.
+pub fn existence_only_reads(expr: &str, gated: &BTreeSet<String>) -> BTreeSet<String> {
+    const MARKER: &str = "absent_over_time(";
+    let stripped = strip_braces(&strip_quoted(expr));
+    let spans: Vec<(usize, usize)> = stripped
+        .match_indices(MARKER)
+        .filter_map(|(at, marker)| {
+            let open = at + marker.len() - 1;
+            matching_paren(&stripped, open).map(|close| (open, close))
+        })
+        .collect();
+    if spans.is_empty() {
+        return BTreeSet::new();
+    }
+    let bytes = stripped.as_bytes();
+    let mut only = BTreeSet::new();
+    for name in gated {
+        let mut seen = false;
+        let mut read_as_a_value = false;
+        let mut from = 0usize;
+        while let Some(rel) = stripped[from..].find(name.as_str()) {
+            let at = from + rel;
+            let end = at + name.len();
+            from = end;
+            if at > 0 && token_char(bytes[at - 1]) {
+                continue;
+            }
+            if end < bytes.len() && token_char(bytes[end]) {
+                continue;
+            }
+            seen = true;
+            if !spans.iter().any(|&(open, close)| at > open && end < close) {
+                read_as_a_value = true;
+            }
+        }
+        if seen && !read_as_a_value {
+            only.insert(name.clone());
+        }
+    }
+    only
+}
+
 pub fn unguarded_store_reading_complaints(expr: &str, gated: &BTreeSet<String>) -> Vec<String> {
     let stripped = strip_braces(&strip_quoted(expr));
+    let existence_only = existence_only_reads(expr, gated);
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for (name, window) in windows_over(expr, gated) {
+        if existence_only.contains(&name) {
+            continue;
+        }
         if !seen.insert(name.clone()) {
             continue;
         }
@@ -1280,6 +1340,9 @@ pub fn unguarded_store_reading_complaints(expr: &str, gated: &BTreeSet<String>) 
         ));
     }
     for name in bare_observation_reads(expr, gated) {
+        if existence_only.contains(&name) {
+            continue;
+        }
         if !seen.insert(name.clone()) {
             continue;
         }

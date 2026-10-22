@@ -1270,12 +1270,12 @@ data:
             },
             {
               "name": "runtime_asset_check_never_ran",
-              "promql": "absent(max without (pod, container, instance, job) (cogneva_runtime_asset_check_seconds))",
+              "promql": "absent_over_time(cogneva_runtime_asset_check_seconds[10m])",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "平台上一个进程都没有报出启动资产检查的时刻。这条读数问的不是「检查很久没跑了」——那不是这条序列的能量：它存的是 epoch 时刻而不是时长，没有可比的界，唯一的读法是「这份报告还在不在」，所以这里用 absent()。为什么这份报告必须有一条自己的读者：这一族只导出「出问题的状态」，一个判定为「没问题」的落点根本不发序列，于是「检查跑了、什么都没发现」与「检查从没跑过」在既有的四条规则上一模一样地安静——这个时刻就是用来把这两件事分开的，而在本规则之前没有任何一条规则读它，那份「检查还在不在」的可见性谁也看不见。这条读数本身是一个启动一次性检查：镜像里的资产在构建时就定死、运行期不会变，所以每个进程只跑一次、只留一个答案。同一份报告还把 manifest_absent 与 manifest_unusable（0 或 1）一起推出来，所以这几个序列要么同时在、要么同时不在：本规则亮起来的字面意思是「没有任何进程在报这份报告」，成因有三，要看连带的那几条才好判——启动检查的调用点被删掉、跑它的进程不在（或这一族的抓取没到）、或读数没进到库里。后两种情况下 runtime_asset_not_refreshed、content_drift、manifest_absent、manifest_unusable 会一起消失，那种「四条都绿」是四条一起失明，不是资产全对。表达式的 max without 是把报信者聚合掉：序列带 pod/container/instance/job，而这里讲的主体不是某个 Pod，不聚合的话一次滚动就会被读成一条属于那个 Pod 的告警。反过来这条规则也读不到「只有一部分进程没报」——那需要一份「谁应该跑这次检查」的名册，今天不存在，所以能判的只有整族消失。"
+              "summary": "平台上一个进程都没有报出启动资产检查的时刻。这条读数问的不是「检查很久没跑了」——那不是这条序列的能量：它存的是 epoch 时刻而不是时长，没有可比的界，唯一的读法是「这份报告还在不在」，所以这里用 absent_over_time()，窗口十分钟。为什么这份报告必须有一条自己的读者：这一族只导出「出问题的状态」，一个判定为「没问题」的落点根本不发序列，于是「检查跑了、什么都没发现」与「检查从没跑过」在既有的四条规则上一模一样地安静——这个时刻就是用来把这两件事分开的，而在本规则之前没有任何一条规则读它，那份「检查还在不在」的可见性谁也看不见。这条读数本身是一个启动一次性检查：镜像里的资产在构建时就定死、运行期不会变，所以每个进程只跑一次、只留一个答案。同一份报告还把 manifest_absent 与 manifest_unusable（0 或 1）一起推出来，所以这几个序列要么同时在、要么同时不在：本规则亮起来的字面意思是「没有任何进程在报这份报告」，成因有三，要看连带的那几条才好判——启动检查的调用点被删掉、跑它的进程不在（或这一族的抓取没到）、或读数没进到库里。后两种情况下 runtime_asset_not_refreshed、content_drift、manifest_absent、manifest_unusable 会一起消失，那种「四条都绿」是四条一起失明，不是资产全对。窗口取十分钟而不是「此刻」：absent_over_time() 吐出的是合成出来的、无标签的一条序列，报信的是哪个 Pod 不进身份；而此刻即判会把一次滚动留下的空档（旧进程已退、新进程还没被抓到）读成「一个进程都没报」，每次部署写一行又立刻收回——2026-10-23 实测，一次部署在同一秒里写了四条这样的行，这是其中一条。反过来这条规则也读不到「只有一部分进程没报」——那需要一份「谁应该跑这次检查」的名册，今天不存在，所以能判的只有整族消失。"
             },
             {
               "name": "node_capacity_overcommitted",
@@ -2368,12 +2368,12 @@ data:
             },
             {
               "name": "principle_producer_never_delivered",
-              "promql": "absent(max by (source) (cogneva_principle_producer_last_push_timestamp_seconds{trigger=\"timer\"}))",
+              "promql": "absent_over_time(cogneva_principle_producer_last_push_timestamp_seconds{trigger=\"timer\"}[10m])",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "原则总账的收件台从来没有收到过任何一次投递：平台上没有一条「生产者最近一次成功投递」的时刻，而不是「它很久没投了」——后者是另一条 principle_producer_stopped 的题目。这一格之所以要单列，是因为缺席读起来像健康：账上没有新行、收件台积压为 0、折账 loop 每一拍都绿，三样都成立，而生产者可能一次都没跑过。本规则的缺席还有第二个成因，报出来时要一并看：能读这张表的进程读不到它（库连不上、表没建出来、这一族的读数没被抓取），此时所有 principle_producer_* 一起消失。所以本规则是 principle_producer_stopped 的前置——那条规则要一个时刻与一个周期才算得出界，而两者都由生产者自己写：从来没投过的时候分母不存在，用 0 去凑会让它拿一个没人声明过的周期去比。修法是让宿主上的生产者（cogneva-principle-producer.timer）真的跑起来并投一次；投递按 (slug, 来源) 幂等，所以重跑不会排出第二遍。表达式先 max by (source) 聚一次再交给 absent：这一族的序列抓下来带 pod/container，而这条规则讲的主体是生产者（source），不聚合掉的话告警身份会跟着报信的 Pod 重建而换新——同一个「从来没有投过」会在每次滚动之后作为一条全新告警重报一遍。序列真的缺席时，裸选择器与聚合后的选择器给的是同一件事：一条没有标签的序列，所以这层聚合不改变这条规则判什么。选择器只看 `trigger=\"timer\"` 的行：同一次成功投递由定时器拉起的与由人手工跑的是两行，手工那一行照样导出（人能看见自己那一拍），但它不能替定时器回答「投递过没有」——两行合成一格的话，从未被定时器喂过的账会被一次手喂读成健康。"
+              "summary": "原则总账的收件台从来没有收到过任何一次投递：平台上没有一条「生产者最近一次成功投递」的时刻，而不是「它很久没投了」——后者是另一条 principle_producer_stopped 的题目。这一格之所以要单列，是因为缺席读起来像健康：账上没有新行、收件台积压为 0、折账 loop 每一拍都绿，三样都成立，而生产者可能一次都没跑过。本规则的缺席还有第二个成因，报出来时要一并看：能读这张表的进程读不到它（库连不上、表没建出来、这一族的读数没被抓取），此时所有 principle_producer_* 一起消失。所以本规则是 principle_producer_stopped 的前置——那条规则要一个时刻与一个周期才算得出界，而两者都由生产者自己写：从来没投过的时候分母不存在，用 0 去凑会让它拿一个没人声明过的周期去比。修法是让宿主上的生产者（cogneva-principle-producer.timer）真的跑起来并投一次；投递按 (slug, 来源) 幂等，所以重跑不会排出第二遍。表达式问的是「十分钟里这条序列出现过没有」，不是「此刻在不在」：absent_over_time 吐出的是一条合成出来的、不带任何标签的序列，身份不跟着报信的 Pod 走；而它真正挡住的是另一件事——一次滚动在旧进程退出与新进程被抓到之间会留下一段空档，此刻即判的 absent() 会把那段空档读成「从来没有投过」，于是每次部署都写一行、下一拍又收回（2026-10-23 实测：一次部署在同一秒里写了四条这样的行，这是其中一条）。十分钟远长于那段空档，又远短于这条规则本来要判的「装了很久却没投过」。选择器只看 `trigger=\"timer\"` 的行：同一次成功投递由定时器拉起的与由人手工跑的是两行，手工那一行照样导出（人能看见自己那一拍），但它不能替定时器回答「投递过没有」——两行合成一格的话，从未被定时器喂过的账会被一次手喂读成健康。"
             },
             {
               "name": "principle_producer_stopped",
@@ -2458,12 +2458,12 @@ data:
             },
             {
               "name": "backup_restore_drill_never_ran",
-              "promql": "(time() - max(kube_cronjob_created{cronjob=\"cogneva-backup-drill\"})) * max(absent(cogneva_backup_run_readings{readout=\"drill_latest_age_seconds\"}))",
+              "promql": "(time() - max(kube_cronjob_created{cronjob=\"cogneva-backup-drill\"})) * max(absent_over_time(cogneva_backup_run_readings{readout=\"drill_latest_age_seconds\"}[10m]))",
               "condition": {
                 "greater_than": 93600.0
               },
               "severity": "critical",
-              "summary": "The CronJob that drills the backup has existed for {value} seconds, past the 26 hours this family allows, and no drill has ever written a row: every package this installation has produced is a package nobody has opened. The expression has two factors for the same reason backup_nothing_ever_recorded has them -- the object's age says what should have happened by now, the absence says what has not, and multiplying them keeps the rule silent on an installation whose drill CronJob was deployed a minute ago. A drill is not a backup: a run that concluded ok says the package was written, and writing is not restoring. A truncated archive, a table whose CSV was cut short, a schema that moved under the data -- each leaves a package of ordinary size behind a successful run. This rule is the only one that can see that state, because the package's own record was written by the same process that believed it had succeeded. The bound is the family bound, a daily run scheduled once a day plus startingDeadlineSeconds plus runDeadlineSeconds, the longest a run may take.",
+              "summary": "The CronJob that drills the backup has existed for {value} seconds, past the 26 hours this family allows, and no drill has ever written a row: every package this installation has produced is a package nobody has opened. The expression has two factors for the same reason backup_nothing_ever_recorded has them -- the object's age says what should have happened by now, the absence over the last ten minutes says what has not -- a window rather than the instant, because the gap a rollout leaves between two processes is not an absence of the thing, and multiplying them keeps the rule silent on an installation whose drill CronJob was deployed a minute ago. A drill is not a backup: a run that concluded ok says the package was written, and writing is not restoring. A truncated archive, a table whose CSV was cut short, a schema that moved under the data -- each leaves a package of ordinary size behind a successful run. This rule is the only one that can see that state, because the package's own record was written by the same process that believed it had succeeded. The bound is the family bound, a daily run scheduled once a day plus startingDeadlineSeconds plus runDeadlineSeconds, the longest a run may take.",
               "_comment_why_absent": "the reading is absent, not zero, when no drill exists: the publisher writes nothing for a drill it has never read, so a zero would have to be invented here, and a zero in a seconds field means a drill just finished."
             },
             {
@@ -2507,12 +2507,12 @@ data:
             },
             {
               "name": "backup_offsite_copy_never_written",
-              "promql": "(time() - max(kube_cronjob_created{cronjob=\"cogneva-backup\"})) * max(absent(cogneva_backup_run_readings{readout=\"offsite_newest_age_seconds\"}))",
+              "promql": "(time() - max(kube_cronjob_created{cronjob=\"cogneva-backup\"})) * max(absent_over_time(cogneva_backup_run_readings{readout=\"offsite_newest_age_seconds\"}[10m]))",
               "condition": {
                 "greater_than": 93600.0
               },
               "severity": "critical",
-              "summary": "The backup CronJob has existed for {value} seconds, past the 26 hours this family allows, and no second copy of any package has ever been written outside the backup volume. The expression has the same two factors as backup_restore_drill_never_ran: the object's age says what should have happened by now, absent() says what has not, and multiplying them keeps the rule quiet on an installation whose CronJob was deployed a minute ago. A daily run copies its package to the offsite directory after writing it, so this state is a destination that was never set, never mounted or never writable -- and the first copy is exactly as complete as it was, which is why nothing else in this family would notice. What the second copy buys: the volume is a local-path PV, and deleting the claim, losing the volume or reinstalling under another name takes every package on it. What it does not buy: the destination is another path on the same host, so it shares the host's failure domain -- crossing a path is not crossing a machine. 93600 is the family bound: a daily run scheduled once a day, plus startingDeadlineSeconds, plus runDeadlineSeconds, the longest a run may take.",
+              "summary": "The backup CronJob has existed for {value} seconds, past the 26 hours this family allows, and no second copy of any package has ever been written outside the backup volume. The expression has the same two factors as backup_restore_drill_never_ran: the object's age says what should have happened by now, absent_over_time() over the last ten minutes says what has not. The window is not decoration: a rollout leaves a gap between the old process's last scrape and the new one's first, and an instant absent() reads that gap as never-having-existed, writing a row that the next scrape resolves -- measured on 2026-10-23, a single deploy wrote one of these for this rule, one for its drill sibling, and two more in the same second from other absence rules, and multiplying them keeps the rule quiet on an installation whose CronJob was deployed a minute ago. A daily run copies its package to the offsite directory after writing it, so this state is a destination that was never set, never mounted or never writable -- and the first copy is exactly as complete as it was, which is why nothing else in this family would notice. What the second copy buys: the volume is a local-path PV, and deleting the claim, losing the volume or reinstalling under another name takes every package on it. What it does not buy: the destination is another path on the same host, so it shares the host's failure domain -- crossing a path is not crossing a machine. 93600 is the family bound: a daily run scheduled once a day, plus startingDeadlineSeconds, plus runDeadlineSeconds, the longest a run may take.",
               "_comment_why_absent": "the reading is absent, not zero, when no copy exists: the publisher writes nothing for a package it has never seen outside the volume, so a zero would have to be invented by the reader and would then be indistinguishable from a copy that was written and failed to match."
             },
             {
