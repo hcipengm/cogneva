@@ -392,8 +392,8 @@ async fn tick(
         // in-process streak exists), and the streak resets.
         failure_streaks.remove(&rule.name);
         let eval_key = format!("{EVAL_FAILURE_RULE}:{}", rule.name);
-        if eval_failure_firing.remove(&eval_key) {
-            resolve(&eval_key, outlets).await;
+        if eval_failure_firing.contains(&eval_key) && resolve(&eval_key, outlets).await {
+            eval_failure_firing.remove(&eval_key);
         }
 
         let plan = plan_rule(rule, &series, known_firing);
@@ -418,8 +418,11 @@ async fn tick(
         // about one uninterrupted stretch, not about a total across ticks.
         forget_held_except(rule, &series, holding);
         for key in &plan.close {
-            resolve(key, outlets).await;
-            known_firing.remove(key);
+            // Keep believing it until the row is actually closed: the close
+            // retry lives in this set, and dropping the key here is what turns
+            // one failed write into a row that stays `firing` for good.
+            let closed = resolve(key, outlets).await;
+            settle_close(known_firing, key, closed);
         }
     }
 }
@@ -632,8 +635,8 @@ async fn mirror_prometheus_alerts(
     };
     state.failure_streak = 0;
     let eval_key = format!("{EVAL_FAILURE_RULE}:{MIRROR_SOURCE}");
-    if eval_failure_firing.remove(&eval_key) {
-        resolve(&eval_key, outlets).await;
+    if eval_failure_firing.contains(&eval_key) && resolve(&eval_key, outlets).await {
+        eval_failure_firing.remove(&eval_key);
     }
 
     let mut seen: HashSet<String> = HashSet::new();
@@ -645,8 +648,8 @@ async fn mirror_prometheus_alerts(
     }
     let gone: Vec<String> = state.firing.difference(&seen).cloned().collect();
     for key in gone {
-        resolve_from(&key, outlets, MIRROR_SOURCE).await;
-        state.firing.remove(&key);
+        let closed = resolve_from(&key, outlets, MIRROR_SOURCE).await;
+        settle_close(&mut state.firing, &key, closed);
     }
 }
 
@@ -1064,14 +1067,33 @@ async fn deliver(outlets: &InfraWatchOutlets, events: Vec<AlertEvent>, persisted
 }
 
 /// Close one alert row and notify the resolution.
-async fn resolve(key: &str, outlets: &InfraWatchOutlets) {
-    resolve_from(key, outlets, "infra_watch").await;
+///
+/// Returns whether the row is closed now. A caller that forgets the key without
+/// asking shuts the door behind itself: the key leaves the set that would retry
+/// the close, so a write that failed once leaves the row `firing` for good.
+/// Measured 2026-10-23: two rows were closed at 22:59:48 while the database was
+/// answering in two-second statements; both writes failed, both keys were
+/// dropped anyway, and both rows are still `firing` -- one of them naming a Pod
+/// that no longer exists, and both counting against every reader of the table.
+async fn resolve(key: &str, outlets: &InfraWatchOutlets) -> bool {
+    resolve_from(key, outlets, "infra_watch").await
+}
+
+/// Forget a key only when its row is known to be closed.
+///
+/// Separated out because "keep believing it" is the safe direction and
+/// "forget it" is the one that costs: the next tick retries whatever is still
+/// believed, and nothing retries what was forgotten.
+fn settle_close(believed: &mut HashSet<String>, key: &str, closed: bool) {
+    if closed {
+        believed.remove(key);
+    }
 }
 
 /// The same, saying which producer the row belonged to: a mirror row resolved
 /// under the in-process label would name the wrong writer in the very
 /// notification that says the incident is over.
-async fn resolve_from(key: &str, outlets: &InfraWatchOutlets, source: &str) {
+async fn resolve_from(key: &str, outlets: &InfraWatchOutlets, source: &str) -> bool {
     if let Some(store) = &outlets.store {
         let alert = NewAlert {
             rule: key.split(':').next().unwrap_or(key).to_string(),
@@ -1095,10 +1117,19 @@ async fn resolve_from(key: &str, outlets: &InfraWatchOutlets, source: &str) {
                     updated_at: Utc::now(),
                 };
                 deliver(outlets, vec![AlertEvent::Resolved(inst)], true).await;
+                true
             }
-            Ok(_) => {}
-            Err(e) => warn!(key = %key, error = %e, "infra alert resolve failed"),
+            // Nothing was firing under this key: there is nothing left to close,
+            // so the key may be forgotten.
+            Ok(_) => true,
+            Err(e) => {
+                warn!(key = %key, error = %e, "infra alert resolve failed");
+                false
+            }
         }
+    } else {
+        // No store, no row: nothing is owed and nothing can be left behind.
+        true
     }
 }
 
@@ -1399,6 +1430,28 @@ fn side_of(expr: &str) -> Side {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// A close that did not go through must leave the key believed, because the
+    /// belief set is the retry set: nothing else remembers that a row still has
+    /// to be closed. Measured 2026-10-23 — two rows were closed while the
+    /// database answered in two-second statements; the writes failed, the keys
+    /// were dropped anyway, and both rows stayed `firing` for good, one of them
+    /// naming a Pod that no longer exists.
+    #[test]
+    fn a_close_that_failed_keeps_the_key_so_the_next_tick_retries() {
+        let key = "pod_restarting_repeatedly:pod=gone";
+        let mut believed: HashSet<String> = HashSet::from([key.to_string()]);
+        settle_close(&mut believed, key, false);
+        assert!(
+            believed.contains(key),
+            "关不掉的行必须留在重试集里，否则再没有东西会去关它"
+        );
+        settle_close(&mut believed, key, true);
+        assert!(
+            !believed.contains(key),
+            "关掉之后不许再留着，那是重试集，不是历史"
+        );
+    }
 
     #[test]
     fn parse_vector_extracts_labels_and_values() {
