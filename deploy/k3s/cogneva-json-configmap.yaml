@@ -1059,12 +1059,22 @@ data:
                 },
                 {
                   "name": "governance_face_not_on_target",
-                  "promql": "max by (face, state) (cogneva_governance_face_state{state!=\"on_target\", state!~\"owner_idle|witness_is_owner|deputy_overlap\"})",
+                  "promql": "max by (face, state) (cogneva_governance_face_state{state!=\"on_target\", state!~\"owner_idle|witness_is_owner|deputy_overlap|unread\"})",
                   "condition": {
                     "greater_than": 0.0
                   },
                   "severity": "warning",
-                  "summary": "面 {face} 的漂移判词是 {state}。这个判词由漂移循环按面表与任务图现算：`no_owner` 是这一面没有主人、且缺位三件套不全；`vacancy_expired` 是声明过的缺位已经过期；`drifted_binding` 是未终态任务上的归属与面表不一致、或者有人替面主在跑；`unsigned_handover` 是换了主人却没有签字交接单；`unread` 是这一面根本没读到。判词以标签值的形式出现，所以规则**只点名什么是安静的**（`on_target` 与三个黄档），其余一律报警：反过来写「点名哪些状态要报」的话，明天新增一个状态，它谁都不匹配、表达式为空，报警保持沉默——与「这一族停了」在告警面上同形，而那正是这条规则要防的事。三个黄档（`owner_idle` 在岗但没活、`witness_is_owner` 见证人就是面主、`deputy_overlap` 面主兼副手）不在这里报：它们是只报不判的档，面主的阈值与升级归宿主侧的面读数，在集群里再判一次就多出第二个阈值副本。红档与 `unread` 的处置不同（后者先查存储与选主，不是去改面表），但都不安静，所以都在这条规则的射程里，靠 `state` 标签分开。直接读状态、不叠时长：非 `on_target` 的每一格都已经是结论，没有可容忍的基线，等一个时长只会让「已经漂了半小时」比「漂了」更难解释。判词回到 `on_target` 时这条规则自己熄灭；`cause` 不进 summary，因为它在同一状态内的取值不影响处置，写进报警身份只会让同一个面在不同原因之间反复换一条。"
+                  "summary": "面 {face} 的漂移判词是 {state}。这个判词由漂移循环按面表与任务图现算：`no_owner` 是这一面没有主人、且缺位三件套不全；`vacancy_expired` 是声明过的缺位已经过期；`drifted_binding` 是未终态任务上的归属与面表不一致、或者有人替面主在跑；`unsigned_handover` 是换了主人却没有签字交接单。判词以标签值的形式出现，所以规则**只点名什么是安静的**（`on_target`、三个黄档与 `unread`），其余一律报警：反过来写「点名哪些状态要报」的话，明天新增一个状态，它谁都不匹配、表达式为空，报警保持沉默——与「这一族停了」在告警面上同形，而那正是这条规则要防的事。三个黄档（`owner_idle` 在岗但没活、`witness_is_owner` 见证人就是面主、`deputy_overlap` 面主兼副手）不在这里报：它们是只报不判的档，面主的阈值与升级归宿主侧的面读数，在集群里再判一次就多出第二个阈值副本。`unread` 也不在这里报，但它**不安静**：它由 `governance_face_unread` 带着保持时长单独报——它的成因是「这一面读不到」，而「读不到」在进程刚起来的那一分钟里对每一面都成立，两个形状的处置与节奏都不同，所以是两条规则而不是一个标签值。红档直接读状态、不叠时长：非 `on_target` 的每一格都已经是结论，没有可容忍的基线，等一个时长只会让「已经漂了半小时」比「漂了」更难解释。判词回到 `on_target` 时这条规则自己熄灭；`cause` 不进 summary，因为它在同一状态内的取值不影响处置，写进报警身份只会让同一个面在不同原因之间反复换一条。"
+                },
+                {
+                  "name": "governance_face_unread",
+                  "promql": "max by (face) (cogneva_governance_face_state{state=\"unread\"})",
+                  "condition": {
+                    "greater_than": 0.0
+                  },
+                  "for_seconds": 600,
+                  "severity": "warning",
+                  "summary": "面 {face} 的漂移判词已经连续 10 分钟是 `unread`：这一面读不到，所以没有任何判词可言。`unread` 的成因只有两件——问注册表时它报错，或者任务图上挂着一个没有任何面节点认领的 id（后者 `cause=no_face_node`）——两件都不是「面漂了」，第一步是去查那一面的数据来源与注册表，不是去改面表。它不并进红档那条规则，是因为它几乎总是短的：进程刚起来、注册表还没就绪，或者一次抓取正好撞上存储抖动，**每一面都会同时读成 `unread`**，下一拍自己就好。2026-10-22 实测一次滚动写出 17 行告警、一分钟后全部 resolve——同一件事按面报了 17 次，读它的人只学会「又来了」。所以这一档叠保持时长：漂移循环 120 秒一轮，10 分钟够跨过重启、迁移与一次存储抖动，而持续读不到的面仍在 10 分钟内进来；红档不叠时长，因为「已经漂了半小时」不该比「漂了」更难解释。`cause` 不出现在报警身份里：它在同一档内的取值不改变第一步处置。"
                 },
                 {
                   "name": "governance_face_reading_stopped",

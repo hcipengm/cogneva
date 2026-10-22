@@ -5149,13 +5149,21 @@ fn the_derivation_gate_separates_a_label_list_from_an_operand() {
 /// exactly the drift that state was added to describe. That is the same
 /// silence a stopped publisher produces, which is why this rule names what is
 /// quiet instead -- everything that is not `on_target`, minus the yellow
-/// states.
+/// states and minus the states another rule answers with a hold.
+///
+/// A state may leave this rule's range only by being answered somewhere else,
+/// and "somewhere else" is checked rather than taken on trust: a rule whose
+/// expression selects that one state and whose `for_seconds` is set. `unread`
+/// is the state that needs this: it is what a scrape reads while the registry
+/// cannot be asked, so a rollout makes every face say it for one beat, and a
+/// rule without a hold turns that into one alert per face. A state that is
+/// merely added to the exclusion list with no rule behind it fails here.
 ///
 /// Both halves are read from the code that owns them rather than copied here:
 /// the tiers come from `DriftState`, the exclusion comes out of the shipped
 /// expression. A state added to the enum without a decision fails this test in
-/// whichever direction is wrong -- fired on while it is a yellow, or quietly
-/// folded into healthy.
+/// whichever direction is wrong -- fired on while it is a yellow, covered by a
+/// hold that does not exist, or quietly folded into healthy.
 #[test]
 fn the_face_drift_rule_is_quiet_on_exactly_the_states_the_enum_calls_yellow() {
     let rules = chart_json()["observability"]["infra_watch"]["rules"]
@@ -5177,6 +5185,22 @@ fn the_face_drift_rule_is_quiet_on_exactly_the_states_the_enum_calls_yellow() {
     });
     let quiet: BTreeSet<&str> = quiet.split('|').collect();
 
+    // A state this rule does not report may be reported by a rule of its own,
+    // but only one that holds: `for_seconds` is the only thing that separates
+    // "this face cannot be read right now" from "this process has not finished
+    // starting".
+    let held: BTreeSet<&str> = cog_core::DriftState::ALL
+        .iter()
+        .map(|state| state.as_str())
+        .filter(|name| {
+            let selector = format!(r#"state="{name}""#);
+            rules.iter().any(|r| {
+                r["promql"].as_str().unwrap_or_default().contains(&selector)
+                    && r["for_seconds"].as_u64().unwrap_or(0) > 0
+            })
+        })
+        .collect();
+
     let mut wrong: Vec<String> = Vec::new();
     for state in cog_core::DriftState::ALL {
         let name = state.as_str();
@@ -5185,18 +5209,25 @@ fn the_face_drift_rule_is_quiet_on_exactly_the_states_the_enum_calls_yellow() {
                 "{name} 是黄档，但不在规则点名安静的状态里——它会按红档报警"
             ));
         }
-        if !state.is_yellow() && quiet.contains(name) {
-            wrong.push(format!("{name} 不是黄档，却被规则当成安静的——它永远不会响"));
+        if !state.is_yellow() && quiet.contains(name) && !held.contains(name) {
+            wrong.push(format!(
+                "{name} 不是黄档，却被规则当成安静的，而没有任何规则带着保持时长替它报警——它永远不会响"
+            ));
+        }
+        if !state.is_yellow() && !quiet.contains(name) && held.contains(name) {
+            wrong.push(format!(
+                "{name} 已经在一条带保持时长的规则里，却又被红档规则立刻报——同一件事会响两次"
+            ));
         }
     }
     for listed in &quiet {
-        let known_yellow = match cog_core::DriftState::parse(listed) {
-            Some(state) => state.is_yellow(),
+        let justified = match cog_core::DriftState::parse(listed) {
+            Some(state) => state.is_yellow() || held.contains(listed),
             None => false,
         };
-        if !known_yellow {
+        if !justified {
             wrong.push(format!(
-                "规则点名的安静状态 {listed} 不是枚举里的黄档——这个名字没人认领"
+                "规则点名的安静状态 {listed} 既不是枚举里的黄档、也没有带保持时长的规则接手——这个名字没人认领"
             ));
         }
     }
