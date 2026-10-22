@@ -113,6 +113,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 主线跟踪自动部署的滚动端：独立 Job Pod 内执行，四部署门禁滚动，
         // 任一失败反向回滚 prev tag（进程本身跑在新镜像里，顺带 smoke test）。
         Command::MainlineRollout => cog_reflection::run_rollout_cli().await,
+        // 撤回一条已交付的 rev：只写部署器的钉，改集群的仍是部署循环那一条路径。
+        Command::MainlineUndeliver => cog_reflection::run_undeliver_cli().await,
         // 一条变更的一次执行：独立 Job Pod 内执行，apply → 验证 → 提交 → release
         // 构建 → 暂存二进制，判定写回共享卷上的结果文件，进程退出即结束。
         Command::ExecuteChange => cog_reflection::change_execution::run_execute_change_cli().await,

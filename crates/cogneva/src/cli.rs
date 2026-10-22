@@ -26,6 +26,7 @@ pub enum Command {
     ClaimStore,
     ValidateConfig,
     MainlineRollout,
+    MainlineUndeliver,
     ExecuteChange,
     Backup,
     Restore,
@@ -42,7 +43,7 @@ pub enum Command {
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 18] = [
+const SUBCOMMANDS: [(&str, Command); 19] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
@@ -50,6 +51,7 @@ const SUBCOMMANDS: [(&str, Command); 18] = [
     ("claim-store", Command::ClaimStore),
     ("validate-config", Command::ValidateConfig),
     ("mainline-rollout", Command::MainlineRollout),
+    ("mainline-undeliver", Command::MainlineUndeliver),
     ("execute-change", Command::ExecuteChange),
     ("backup", Command::Backup),
     ("restore", Command::Restore),
@@ -110,6 +112,11 @@ COMMANDS:
                            their footprints on /metrics
     validate-config        Validate configuration and dependencies, then exit non-zero on errors
     mainline-rollout       Roll the mainline revision across deployments (in-cluster Job)
+    mainline-undeliver <rev> --to <rev> --actor <name> --reason <text>
+                           Withdraw a revision: hold the mainline at --to and keep the withdrawn
+                           one (and anything containing it) from rolling again; --clear removes
+                           the hold. Writes the deployer's pin file and exits; the loop applies
+                           it on its next round
     execute-change         Apply, verify, commit and build one evolution change, then exit
     backup                 Package the data plane into a backup file
     restore <package>      Restore the data plane from a backup file

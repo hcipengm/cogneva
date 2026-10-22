@@ -42,7 +42,7 @@ use cog_core::{SFError, SFResult, ShutdownSignal};
 // path falls through to a rebuild without anything reporting a failure.
 use crate::registry_footprint::MANIFEST_ACCEPTS;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{CodePlatform, MainlineDeployerConfig, RolloutTargetConfig};
 use crate::rollout_resources::RolloutResourceReading;
@@ -1508,6 +1508,80 @@ fn evaluate_advance(
     AdvanceDecision::Advance
 }
 
+/// 一次撤回：主线必须停在 `landed_rev` 上，不得再把 `withdrawn_rev` 滚上去。
+///
+/// 它落在 state_dir 下一个独立文件里，而不是 `state.json` 里的一格，理由只有一个：
+/// 写者不同。`state.json` 只有部署循环写（每拍整份重写）；撤回由一次带外命令写。
+/// 写进同一份文件就是两个写者互相覆盖——命令写完、循环下一拍把它手里那份旧状态存
+/// 回去，撤回就无声地消失了。一个文件一个写者，撤回因此既不会被覆盖，也不会被
+/// 「读到了但存回去时丢了」这种形状损坏。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RevPin {
+    /// 被撤下来的那一版。主线不得再把它滚上去，也不得滚它的后代（后者的历史里
+    /// 仍然含着它，滚上去等于把它滚回来）。
+    withdrawn_rev: String,
+    /// 集群要回到的那一版。必须是 bare 仓库里还读得到的一版——撤回要 apply 的
+    /// 是它那一份清单，读不到就只是报错，不是撤回。
+    landed_rev: String,
+    /// 发起撤回的写者身份。撤回是一条带外的、有名有姓的决定，不是环境噪声。
+    actor: String,
+    /// 为什么撤。与 `actor` 同理由：事后读这一格的人要知道的是判断，不是时间戳。
+    reason: String,
+    /// 写下的那一刻，unix 秒。
+    unix: i64,
+}
+
+/// 撤回钉的文件名（在部署器状态目录里）。循环只读它，写它的只有带外命令。
+const PIN_FILE: &str = "undeliver-pin.json";
+
+/// 撤回钉住的时候，这一轮要不要把主线按住。
+///
+/// 判据是**被撤的那一版还在不在**，不是「上游动没动」。撤回要挡的是这一版重新落地，
+/// 而它可以经两条路回来：bare 还是它，或者上游在它之后又落了提交（新提交的历史里
+/// 仍然含着它，滚新提交等于把它滚回来）。上游真把它 revert 掉之后，它就不在 bare 的
+/// 历史里了，这一格自然松开——撤回因此自己会过期，不靠人记得来清。
+///
+/// `withdrawn_still_reachable` 由调用方用 git 祖先判定给出；判不出来时必须传真
+/// （按「还在历史里」处理）：读不出来就放行，是让一个 git 抖动把撤回悄悄解开。
+fn pin_holds(pin: &RevPin, bare_rev: &str, withdrawn_still_reachable: bool) -> bool {
+    rev12(bare_rev) != rev12(&pin.landed_rev)
+        && (rev12(bare_rev) == rev12(&pin.withdrawn_rev) || withdrawn_still_reachable)
+}
+
+/// 撤回文件的读取结果。三态而不是 `Option<RevPin>`：读不出来与没有撤回是两件事，
+/// 而它们的处置相反——没有撤回就照常推进，读不出来必须按住并大声报。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PinReading {
+    None,
+    Pinned(RevPin),
+    /// 文件在，但读不了或解析不了（含理由原文）。
+    Unreadable(String),
+}
+
+/// 解析撤回文件的内容。`None` = 文件不存在。
+///
+/// 解析失败不是「没有撤回」：一个截断或写坏的文件若被读成「没有」，下一拍就把被撤
+/// 的那一版重新滚上去了——那是这条路径最不该犯的错，而重写一份小文件是零成本的。
+fn parse_pin(text: Option<&str>) -> PinReading {
+    let Some(text) = text else {
+        return PinReading::None;
+    };
+    match serde_json::from_str::<RevPin>(text) {
+        Ok(pin) => {
+            if pin.withdrawn_rev.trim().is_empty() || pin.landed_rev.trim().is_empty() {
+                return PinReading::Unreadable("a pin needs both revisions".into());
+            }
+            if rev12(&pin.withdrawn_rev) == rev12(&pin.landed_rev) {
+                return PinReading::Unreadable(
+                    "the withdrawn and the landing revision are the same".into(),
+                );
+            }
+            PinReading::Pinned(pin)
+        }
+        Err(e) => PinReading::Unreadable(format!("unparseable: {e}")),
+    }
+}
+
 /// 构建锁陈旧判定：持锁进程已死，或锁龄超过构建超时（进程僵死/被杀）。
 fn lock_is_stale(age_secs: u64, timeout_secs: u64, owner_still_alive: bool) -> bool {
     !owner_still_alive || age_secs > timeout_secs
@@ -2038,6 +2112,21 @@ impl MainlineDeployer {
         Path::new(&self.cfg.state_dir).join("build.lock")
     }
 
+    /// 撤回钉的文件路径。与 `state.json` 分开的完整理由见 [`RevPin`]。
+    fn pin_path(&self) -> PathBuf {
+        Path::new(&self.cfg.state_dir).join(PIN_FILE)
+    }
+
+    /// 读撤回钉。日志只在这一层之外的调用点上打：本方法在心跳与轮询里都会被调，
+    /// 它自己报的话一次撤回会印两遍。
+    fn load_pin(&self) -> PinReading {
+        match std::fs::read_to_string(self.pin_path()) {
+            Ok(text) => parse_pin(Some(&text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PinReading::None,
+            Err(e) => PinReading::Unreadable(format!("cannot read the pin file: {e}")),
+        }
+    }
+
     fn load_state(&self) -> MainlineState {
         match std::fs::read_to_string(self.state_path()) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
@@ -2059,12 +2148,13 @@ impl MainlineDeployer {
         let behind = self
             .behind_revs(state.last_good_rev.as_deref(), &bare)
             .await;
-        let summary = heartbeat_message(
+        let summary = heartbeat_message_with_pin(
             &state,
             &bare,
             &self.upstream_note(),
             behind,
             chrono::Utc::now().timestamp(),
+            &self.load_pin(),
         );
         info!(heartbeat = %summary, "mainline deployer heartbeat");
     }
@@ -2536,7 +2626,16 @@ impl MainlineDeployer {
 
     /// older 是否 newer 的祖先（拒倒退/分叉）。
     async fn is_ancestor(&self, older: &str, newer: &str) -> bool {
-        tokio::process::Command::new("git")
+        self.is_ancestor_checked(older, newer).await == Some(true)
+    }
+
+    /// 祖先判定的三态：`None` = 问不出来（git 起不来、对象不存在）。
+    ///
+    /// `merge-base --is-ancestor` 用退出码回答：0 是、1 不是、其余是出错。把出错
+    /// 折进「不是」，在需要「判不出来就按最保守的那一支」的地方等于把一次抖动读成
+    /// 一个确定的答案；撤回的松开条件正是这种地方，所以这里把两种「否」分开。
+    async fn is_ancestor_checked(&self, older: &str, newer: &str) -> Option<bool> {
+        let out = tokio::process::Command::new("git")
             .args([
                 "--git-dir",
                 &self.cfg.bare_repo,
@@ -2547,8 +2646,12 @@ impl MainlineDeployer {
             ])
             .output()
             .await
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .ok()?;
+        match out.status.code() {
+            Some(0) => Some(true),
+            Some(1) => Some(false),
+            _ => None,
+        }
     }
 
     /// The version contract's evidence, read from the history this process
@@ -4789,6 +4892,102 @@ impl MainlineDeployer {
             .await;
     }
 
+    /// 服从一次撤回钉。返回 `true` 表示这一轮就到这里；`false` 表示没别的事，
+    /// 调用方照常往下走（要么撤回已经松开，要么撤回的滚动正在飞、交给在飞那一块）。
+    ///
+    /// 撤回派发走的是与正常滚动**同一条**路径（[`Self::roll_out`] → Job），不是另写
+    /// 一条直接 apply 的：判定、soak、失败回滚都在那条路径里，而「谁改集群的镜像」
+    /// 只该有一个答案。撤回只多两件事——跳过上游 CI 判词（那问的是目标那一版当时红
+    /// 没红，而与「谁要求撤」无关；拿它挡住撤回，撤回会永远发不出去），以及把在飞的
+    /// 那一版收掉。
+    async fn honour_pin(
+        &self,
+        state: &mut MainlineState,
+        pin: &RevPin,
+        deployed: &DeployedState,
+        bare: &str,
+    ) -> SFResult<bool> {
+        let on_target = matches!(
+            deployed,
+            DeployedState::Main(d) if rev12(d) == rev12(&pin.landed_rev)
+        );
+        if on_target {
+            let reachable = match self.is_ancestor_checked(&pin.withdrawn_rev, bare).await {
+                Some(contained) => contained,
+                None => {
+                    // 判不出来按「还在历史里」处理：见 [`pin_holds`]。
+                    warn!(
+                        withdrawn = %rev12(&pin.withdrawn_rev),
+                        bare = %rev12(bare),
+                        "could not tell whether main still carries the withdrawn revision; holding"
+                    );
+                    true
+                }
+            };
+            if pin_holds(pin, bare, reachable) {
+                info!(
+                    withdrawn = %rev12(&pin.withdrawn_rev),
+                    landed = %rev12(&pin.landed_rev),
+                    actor = %pin.actor,
+                    reason = %pin.reason,
+                    bare = %rev12(bare),
+                    "a withdrawn revision pins the mainline at an earlier one; not advancing"
+                );
+                return Ok(true);
+            }
+            info!(
+                withdrawn = %rev12(&pin.withdrawn_rev),
+                bare = %rev12(bare),
+                "main no longer carries the withdrawn revision; the pin releases the mainline and this round proceeds"
+            );
+            return Ok(false);
+        }
+
+        if let Some(inflight) = state.in_flight.clone() {
+            if rev12(&inflight.rev) == rev12(&pin.landed_rev) {
+                // 撤回的滚动已经在飞，收敛由在飞那一块接手。在这里再派一次会让
+                // 每一轮都多问一次上游、多记一次尝试，而 Job 还是那一个。
+                info!(
+                    landing = %rev12(&pin.landed_rev),
+                    phase = ?inflight.phase,
+                    "a rollback to the pin's landing revision is in flight; waiting for it"
+                );
+                return Ok(false);
+            }
+            // 在飞的是别的版本（通常正是被撤的那一版）：先把它收掉。两拨滚动同时往
+            // 集群上写，最后落在哪一版取决于谁跑得慢，而那一刻「撤回到底生效没有」
+            // 是无解的。删不掉就不派撤回——失败比一个读不出结论的集群好。
+            let job = job_name(&inflight.rev);
+            self.kubectl(&["delete", "job", &job, "--ignore-not-found"], 60)
+                .await?;
+            warn!(
+                rev = %rev12(&inflight.rev),
+                job = %job,
+                "the withdrawal supersedes the rollout in flight; its job was removed"
+            );
+            state.in_flight = None;
+            self.save_state(state)?;
+        }
+
+        let tag = main_image(&self.pull_endpoint(), &pin.landed_rev);
+        info!(
+            withdrawn = %rev12(&pin.withdrawn_rev),
+            landing = %rev12(&pin.landed_rev),
+            actor = %pin.actor,
+            reason = %pin.reason,
+            "the deployments are off the withdrawal's landing revision; rolling them back"
+        );
+        if !self.roll_out(state, &pin.landed_rev, &tag, true).await? {
+            return Ok(true);
+        }
+        state.in_flight = Some(InFlight {
+            rev: pin.landed_rev.clone(),
+            phase: Phase::Dispatched,
+        });
+        self.save_state(state)?;
+        Ok(true)
+    }
+
     /// 一轮轮询。
     pub async fn poll_once(&self) -> SFResult<()> {
         let mut state = self.load_state();
@@ -4868,6 +5067,30 @@ impl MainlineDeployer {
         // 压力的话——该回收它的条件是"库里有保留集之外的镜像"。挂在那边阈值上，
         // 结果是 registry 不挤的时候这个库谁也不管；而这两张卷的容量并不相关。
         self.buildah_store_round(&bare, &images, &mut state).await;
+
+        // 撤回钉：集群要停在撤下来的那一版之前，主线不得把被撤的那一版滚回去。
+        //
+        // 放在在飞处理**之前**：一条正在飞的滚动如果滚的正是被撤的那一版，撤回要当场
+        // 把它收掉，而不是等它跑完 soak、把坏那一版收敛上去之后再撤。又放在轮首那几
+        // 格心跳与回收之后：那些量的是这一轮之外的事，与撤不撤无关。
+        match self.load_pin() {
+            PinReading::Unreadable(e) => {
+                // 读不出来就按住。放行是让一次截断把撤回悄悄解开，而重写一份小文件
+                // 是零成本的；两种错的代价不对称。
+                error!(
+                    error = %e,
+                    path = %self.pin_path().display(),
+                    "the withdrawal pin cannot be read; holding the mainline rather than advancing past a withdrawal nobody can see"
+                );
+                return Ok(());
+            }
+            PinReading::Pinned(pin) => {
+                if self.honour_pin(&mut state, &pin, &deployed, &bare).await? {
+                    return Ok(());
+                }
+            }
+            PinReading::None => {}
+        }
 
         // 在飞任务收敛/终态处理。
         if let Some(inflight) = state.in_flight.clone() {
@@ -4979,7 +5202,7 @@ impl MainlineDeployer {
                     // re-dispatching without asking buys a rollout Job for a
                     // revision the upstream has already left — while the next
                     // round starts on the new tip anyway.
-                    self.roll_out(&mut state, &inflight.rev, &target_tag)
+                    self.roll_out(&mut state, &inflight.rev, &target_tag, false)
                         .await?;
                     return Ok(());
                 }
@@ -5200,7 +5423,7 @@ impl MainlineDeployer {
                 phase: Phase::Pushed,
             });
             self.save_state(&state)?;
-            if !self.roll_out(&mut state, &bare, &pull_tag).await? {
+            if !self.roll_out(&mut state, &bare, &pull_tag, false).await? {
                 return Ok(());
             }
             state.in_flight = Some(InFlight {
@@ -5400,7 +5623,7 @@ impl MainlineDeployer {
 
         // 4. 派滚动 Job（explosion radius 外；新镜像 smoke test）。Job 启动后
         // 自己快照各部署当前镜像作为回滚目标，无需部署器推导 prev。
-        if !self.roll_out(&mut state, &bare, &pull_tag).await? {
+        if !self.roll_out(&mut state, &bare, &pull_tag, false).await? {
             return Ok(());
         }
         state.in_flight = Some(InFlight {
@@ -5446,11 +5669,19 @@ impl MainlineDeployer {
     /// Returns whether the rollout was dispatched. A tip that could not be read
     /// is not an advance: holding a rollout on an unread upstream would trade a
     /// wasted cycle for a stalled mainline, which is the worse of the two.
+    ///
+    /// `withdrawal` says the caller is rolling an older revision back on
+    /// purpose. It skips the CI gate: that gate asks whether the checks on the
+    /// revision being rolled are red, and an operator's withdrawal is not an
+    /// answer to that question. Asking it would also make the withdrawal
+    /// silently unable to complete -- the rev is old, its verdict is whatever it
+    /// was then, and nothing will ever re-ask it.
     async fn roll_out(
         &self,
         state: &mut MainlineState,
         rev: &str,
         pull_tag: &str,
+        withdrawal: bool,
     ) -> SFResult<bool> {
         let tip = match self.bare_main_rev().await {
             Ok(tip) => match self.refresh_upstream(&tip).await {
@@ -5506,7 +5737,11 @@ impl MainlineDeployer {
         // rev 通常刚落上来、检查还没跑完；从这里到派发之间隔着一整段构建，那段
         // 时间足够检查跑出结论。扣住时把 `in_flight` 一起清掉——这一轮对这份
         // rev 已经收手，留着它，下一轮会去读一个从没派过的 Job 的状态。
-        if self.hold_if_ci_reports_failure(state, rev).await? {
+        //
+        // 撤回不问这一问：它问的是「要滚的这一版当时红没红」，而撤回不是对这个问题
+        // 的回答。而且这一次问出去之后没有任何东西会再问一遍——一个旧的判词会把撤回
+        // 永远按在原地，而按住的形态与「已经撤回去了」在读数上同形。
+        if !withdrawal && self.hold_if_ci_reports_failure(state, rev).await? {
             state.in_flight = None;
             self.save_state(state)?;
             return Ok(false);
@@ -7236,6 +7471,7 @@ fn note_renewed_reservation(state: &mut MainlineState, claimed: bool) -> bool {
     false
 }
 
+#[cfg(test)]
 fn heartbeat_message(
     state: &MainlineState,
     bare_rev: &str,
@@ -7243,13 +7479,42 @@ fn heartbeat_message(
     behind_revs: Option<u64>,
     now_unix: i64,
 ) -> String {
+    heartbeat_message_with_pin(
+        state,
+        bare_rev,
+        upstream,
+        behind_revs,
+        now_unix,
+        &PinReading::None,
+    )
+}
+
+fn heartbeat_message_with_pin(
+    state: &MainlineState,
+    bare_rev: &str,
+    upstream: &str,
+    behind_revs: Option<u64>,
+    now_unix: i64,
+    pin: &PinReading,
+) -> String {
     let in_flight = state
         .in_flight
         .as_ref()
         .map(|f| format!("{}@{:?}", rev12(&f.rev), f.phase))
         .unwrap_or_else(|| "none".into());
+    // 撤回是这一行上唯一一个「不推进是有人要求的」的原因，而它必须与「没有新 rev」
+    // 「被 CI 按住」「在冷却」分开读：前者的处置是等人，后三者的处置是等系统。
+    let (pin_rev, pin_secs, pin_actor) = match pin {
+        PinReading::Pinned(p) => (
+            format!("{}->{}", rev12(&p.withdrawn_rev), rev12(&p.landed_rev)),
+            (now_unix - p.unix).max(0).to_string(),
+            p.actor.clone(),
+        ),
+        PinReading::Unreadable(_) => ("unreadable".to_string(), "none".to_string(), "none".into()),
+        PinReading::None => ("none".to_string(), "none".to_string(), "none".into()),
+    };
     format!(
-        "bare={} upstream={} behind_revs={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={} advance_waits={} last_advance_wait={}",
+        "bare={} upstream={} behind_revs={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={} advance_waits={} last_advance_wait={} pin={} pin_secs={} pin_actor={}",
         rev12(bare_rev),
         upstream,
         // 落后几个 rev。`last_good_secs` 答的是"多久"，这一格答的是"几笔"——两者
@@ -7329,7 +7594,225 @@ fn heartbeat_message(
                 )
             })
             .unwrap_or_else(|| "none".into()),
+        pin_rev,
+        pin_secs,
+        pin_actor,
     )
+}
+
+/// 写一份撤回钉。原子换名，理由与 `save_state` 同一条：读的一方（循环）不能读到
+/// 一份写了一半的文件，而读到一半的后果是「读不出来 ⇒ 按住主线」——安全，但没必要
+/// 每天撞一次。
+pub(crate) fn write_pin(state_dir: &str, pin: &RevPin) -> SFResult<()> {
+    std::fs::create_dir_all(state_dir)
+        .map_err(|e| SFError::IO(format!("create state dir {state_dir}: {e}")))?;
+    let path = Path::new(state_dir).join(PIN_FILE);
+    let tmp = path.with_extension("json.tmp");
+    let text = serde_json::to_string_pretty(pin)?;
+    std::fs::write(&tmp, text).map_err(|e| SFError::IO(format!("write pin tmp: {e}")))?;
+    std::fs::rename(&tmp, &path).map_err(|e| SFError::IO(format!("rename pin: {e}")))?;
+    Ok(())
+}
+
+/// 撤掉撤回钉。返回它原来在不在——「清掉了一个」与「本来就没有」是两件事，
+/// 而这条命令的读者正是拿它当「现在可以往前滚了吗」的答案。
+pub(crate) fn clear_pin(state_dir: &str) -> SFResult<bool> {
+    let path = Path::new(state_dir).join(PIN_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(SFError::IO(format!("remove {}: {e}", path.display()))),
+    }
+}
+
+/// 把 `--rev` 这类入参解成提交 sha。解不出来就是撤回的输入不存在，当场报错——
+/// 一个拼错的 rev 写进钉里，循环会一直把它当祖先判定失败按住主线，而报错的人
+/// 早就不在终端前了。
+async fn resolve_commit(bare_repo: &str, rev: &str) -> Result<String, String> {
+    let out = tokio::process::Command::new("git")
+        .args([
+            "--git-dir",
+            bare_repo,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "the bare repository at {bare_repo} does not hold a commit named {rev:?}"
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `mainline-undeliver` 解析后的动作。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UndeliverAction {
+    /// 撤掉现有的钉。
+    Clear,
+    /// 下一次撤回。
+    Withdraw {
+        withdrawn: String,
+        landing: String,
+        actor: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UndeliverRequest {
+    /// 覆盖部署器状态目录（默认取部署器配置里的那一份）。
+    pub(crate) state_dir: Option<String>,
+    pub(crate) action: UndeliverAction,
+}
+
+/// 解析撤回命令的参数。做成纯函数是为了让「缺了必填项」在这里就被拒——撤回的三
+/// 个必填项各自回答一个不同的问题：撤哪一版、落在哪一版、**谁**以**什么理由**撤。
+/// 缺最后两个的撤回与一次环境事故在事后完全同形，而这条命令存在的理由正是让撤回
+/// 成为一条有名有姓的决定。
+///
+/// `--clear` 与撤回参数同时出现按错误处理，不按「先清再写」猜意图：两种意图合成
+/// 一条命令，事后没人能从参数上读出到底发生了什么。
+fn parse_undeliver_args(args: &[String]) -> Result<UndeliverRequest, String> {
+    let mut state_dir: Option<String> = None;
+    let mut clear = false;
+    let mut withdrawn: Option<String> = None;
+    let mut landing: Option<String> = None;
+    let mut actor: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let value = |i: usize| -> Result<String, String> {
+            args.get(i + 1)
+                .cloned()
+                .ok_or_else(|| format!("{} requires a value", args[i]))
+        };
+        match args[i].as_str() {
+            "--clear" => {
+                clear = true;
+                i += 1;
+            }
+            "--to" => {
+                landing = Some(value(i)?);
+                i += 2;
+            }
+            "--actor" => {
+                actor = Some(value(i)?);
+                i += 2;
+            }
+            "--reason" => {
+                reason = Some(value(i)?);
+                i += 2;
+            }
+            "--state-dir" => {
+                state_dir = Some(value(i)?);
+                i += 2;
+            }
+            other if other.starts_with("--") => {
+                return Err(format!("unknown argument: {other}"));
+            }
+            other => {
+                if withdrawn.is_some() {
+                    return Err(format!("unexpected argument: {other}"));
+                }
+                withdrawn = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    if clear {
+        if withdrawn.is_some() || landing.is_some() || actor.is_some() || reason.is_some() {
+            return Err("--clear takes no revision, --to, --actor or --reason".into());
+        }
+        return Ok(UndeliverRequest {
+            state_dir,
+            action: UndeliverAction::Clear,
+        });
+    }
+    let action = UndeliverAction::Withdraw {
+        withdrawn: withdrawn
+            .ok_or("usage: mainline-undeliver <rev> --to <rev> --actor <name> --reason <text>")?,
+        landing: landing
+            .ok_or("--to <rev> is required: name the revision the cluster must land on")?,
+        actor: actor.ok_or("--actor <name> is required: a withdrawal is somebody's decision")?,
+        reason: reason.ok_or("--reason <text> is required: say why the revision is withdrawn")?,
+    };
+    Ok(UndeliverRequest { state_dir, action })
+}
+
+/// `cogneva mainline-undeliver` 的主体。参数从进程 argv 里来（已去掉程序名与子
+/// 命令），配置与状态目录与部署循环同源——这条命令要写的那份文件，正是循环每拍
+/// 读的那一份。
+///
+/// 它只写钉，不碰集群：改集群镜像的只有部署循环那一条路径，撤回因此排在下一次
+/// 轮询上，而不是与循环并发地 apply 一遍。返回值只报告「钉写成了」，是否已经落
+/// 到目标版本由循环的日志与心跳回答。
+pub async fn run_undeliver_cli() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let request = parse_undeliver_args(&args)?;
+    let cfg = crate::MainlineDeployerConfig::load()?;
+    let state_dir = request.state_dir.unwrap_or_else(|| cfg.state_dir.clone());
+
+    let (withdrawn, landing, actor, reason) = match request.action {
+        UndeliverAction::Clear => {
+            let removed = clear_pin(&state_dir)?;
+            println!(
+                "{}",
+                serde_json::json!({"pin": "cleared", "was_set": removed, "state_dir": state_dir})
+            );
+            return Ok(());
+        }
+        UndeliverAction::Withdraw {
+            withdrawn,
+            landing,
+            actor,
+            reason,
+        } => (withdrawn, landing, actor, reason),
+    };
+
+    let withdrawn_rev = resolve_commit(&cfg.bare_repo, &withdrawn).await?;
+    let landed_rev = resolve_commit(&cfg.bare_repo, &landing).await?;
+    if rev12(&withdrawn_rev) == rev12(&landed_rev) {
+        return Err("the withdrawn and the landing revision are the same".into());
+    }
+    let pin = RevPin {
+        withdrawn_rev: withdrawn_rev.clone(),
+        landed_rev: landed_rev.clone(),
+        actor: actor.clone(),
+        reason: reason.clone(),
+        unix: chrono::Utc::now().timestamp(),
+    };
+    write_pin(&state_dir, &pin)?;
+    info!(
+        withdrawn = %rev12(&withdrawn_rev),
+        landing = %rev12(&landed_rev),
+        actor = %actor,
+        reason = %reason,
+        state_dir = %state_dir,
+        "withdrawal pin written; the deployer picks it up on its next round"
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "pin": "written",
+            "withdrawn_rev": withdrawn_rev,
+            "landed_rev": landed_rev,
+            "actor": actor,
+            "reason": reason,
+            "state_dir": state_dir,
+        })
+    );
+    Ok(())
 }
 
 /// This loop's name in the liveness census.
@@ -10292,6 +10775,163 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         );
     }
 
+    /// 撤回钉的三条路必须各自可辨：bare 还是被撤的那一版、bare 走到了含着它的新
+    /// 提交、上游真把它 revert 掉。三条里只有第三条该松开——按前两条放行，等于把
+    /// 一次撤回读成一次没发生过。
+    #[test]
+    fn a_withdrawal_pins_the_mainline_while_the_revision_is_still_reachable() {
+        let pin = RevPin {
+            withdrawn_rev: "cc3333333333aaaaaaaa".into(),
+            landed_rev: "aa1111111111bbbbbbbb".into(),
+            actor: "operator".into(),
+            reason: "probe".into(),
+            unix: 10,
+        };
+        assert!(
+            pin_holds(&pin, &pin.withdrawn_rev, false),
+            "bare 还是被撤的那一版：按住"
+        );
+        assert!(
+            pin_holds(&pin, "dd4444444444eeeeeeee", true),
+            "上游走到了含着它的新提交：滚新提交等于把被撤的那一版滚回来"
+        );
+        assert!(
+            !pin_holds(&pin, "dd4444444444eeeeeeee", false),
+            "上游真的 revert 掉了：不在历史里，松开"
+        );
+        assert!(
+            !pin_holds(&pin, &pin.landed_rev, true),
+            "bare 正好是撤回的落点：没有可按住的东西"
+        );
+    }
+
+    /// 读不出来的钉必须与「没有钉」分开。读成「没有」，下一拍就把被撤的那一版重新
+    /// 滚上去了——那是这条路径最不该犯的错。
+    #[test]
+    fn an_unreadable_pin_holds_rather_than_freeing_the_mainline() {
+        assert_eq!(parse_pin(None), PinReading::None);
+        assert!(matches!(
+            parse_pin(Some(r#"{"withdrawn_rev":"aa","landed"#)),
+            PinReading::Unreadable(_)
+        ));
+        let same = r#"{"withdrawn_rev":"aa1111111111","landed_rev":"aa1111111111","actor":"a","reason":"r","unix":1}"#;
+        assert!(
+            matches!(parse_pin(Some(same)), PinReading::Unreadable(_)),
+            "两版相同不是撤回"
+        );
+        let blank =
+            r#"{"withdrawn_rev":"","landed_rev":"aa1111111111","actor":"a","reason":"r","unix":1}"#;
+        assert!(
+            matches!(parse_pin(Some(blank)), PinReading::Unreadable(_)),
+            "空 rev 写进钉里只会让循环按一个解不开的祖先判定停住"
+        );
+    }
+
+    /// 钉文件的两个写者协议：命令写、循环只读。这里钉的是写字那一半的往返与
+    /// 「清掉一次之后再说清掉要答没有」——那个答案正是「现在能往前滚了吗」。
+    #[test]
+    fn the_pin_file_round_trips_through_the_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let pin = RevPin {
+            withdrawn_rev: "cc3333333333aaaaaaaa".into(),
+            landed_rev: "aa1111111111bbbbbbbb".into(),
+            actor: "operator".into(),
+            reason: "bad deploy".into(),
+            unix: 1_700_000_000,
+        };
+        write_pin(dir, &pin).unwrap();
+        let text = std::fs::read_to_string(tmp.path().join(PIN_FILE)).unwrap();
+        assert_eq!(parse_pin(Some(&text)), PinReading::Pinned(pin));
+        assert!(clear_pin(dir).unwrap(), "有钉时清掉要答 yes");
+        assert!(!clear_pin(dir).unwrap(), "再清一次要答没有");
+        assert_eq!(
+            parse_pin(
+                std::fs::read_to_string(tmp.path().join(PIN_FILE))
+                    .ok()
+                    .as_deref()
+            ),
+            PinReading::None
+        );
+    }
+
+    /// 撤回命令的必填项在解析期就拒：撤哪一版、落在哪一版、谁、为什么。缺后两个
+    /// 的撤回与一次环境事故在事后完全同形，而这条命令存在的理由正是让撤回成为一条
+    /// 有名有姓的决定。
+    #[test]
+    fn the_undeliver_command_refuses_an_unattributed_withdrawal() {
+        let args = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        let ok = parse_undeliver_args(&args(&[
+            "abc123def456",
+            "--to",
+            "111222333444",
+            "--actor",
+            "operator",
+            "--reason",
+            "probe",
+        ]))
+        .unwrap();
+        assert_eq!(
+            ok.action,
+            UndeliverAction::Withdraw {
+                withdrawn: "abc123def456".into(),
+                landing: "111222333444".into(),
+                actor: "operator".into(),
+                reason: "probe".into(),
+            }
+        );
+        // 四项各缺一次：每次都必须拒。
+        assert!(parse_undeliver_args(&args(&["abc", "--to", "def", "--reason", "x"])).is_err());
+        assert!(parse_undeliver_args(&args(&["abc", "--to", "def", "--actor", "me"])).is_err());
+        assert!(parse_undeliver_args(&args(&["abc", "--actor", "me", "--reason", "x"])).is_err());
+        assert!(
+            parse_undeliver_args(&args(&["--to", "def", "--actor", "me", "--reason", "x"]))
+                .is_err()
+        );
+        // 未知参数不是被忽略：一个敲错的开关让命令照常执行，等于让人以为它按
+        // 自己想的那个意思生效了。
+        assert!(parse_undeliver_args(&args(&[
+            "abc", "--to", "def", "--actor", "me", "--reason", "x", "--force"
+        ]))
+        .is_err());
+        // `--clear` 与撤回参数混用是错误，不按「先清再写」猜意图。
+        assert!(parse_undeliver_args(&args(&["--clear", "--actor", "me"])).is_err());
+        assert_eq!(
+            parse_undeliver_args(&args(&["--clear"])).unwrap().action,
+            UndeliverAction::Clear
+        );
+    }
+
+    /// 心跳上的撤回必须与「没有新 rev」「被 CI 按住」「在冷却」分开读：
+    /// 前者的处置是等人，后三者的处置是等系统。
+    #[test]
+    fn the_heartbeat_names_the_withdrawal_that_is_holding_the_mainline() {
+        let state = MainlineState::default();
+        let pin = PinReading::Pinned(RevPin {
+            withdrawn_rev: "cc3333333333aaaaaaaa".into(),
+            landed_rev: "aa1111111111bbbbbbbb".into(),
+            actor: "operator".into(),
+            reason: "probe".into(),
+            unix: 40,
+        });
+        let msg = heartbeat_message_with_pin(&state, "cc3333333333", "off", None, 100, &pin);
+        assert!(msg.contains("pin=cc3333333333->aa1111111111"), "{msg}");
+        assert!(msg.contains("pin_secs=60"), "{msg}");
+        assert!(msg.contains("pin_actor=operator"), "{msg}");
+        let none =
+            heartbeat_message_with_pin(&state, "cc3333333333", "off", None, 100, &PinReading::None);
+        assert!(none.contains("pin=none"), "{none}");
+        let bad = heartbeat_message_with_pin(
+            &state,
+            "cc3333333333",
+            "off",
+            None,
+            100,
+            &PinReading::Unreadable("truncated".into()),
+        );
+        assert!(bad.contains("pin=unreadable"), "{bad}");
+    }
+
     /// 失败落点的证据规则：同一处坏第二次出现才算复现；落点读不到时按"同因"记
     /// （判不准就往停下的一侧取）。
     #[test]
@@ -10477,8 +11117,10 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         state.advance_wait_ends[0].reserved = false;
         state.advance_wait_ends[0].reserved_by = Some("renewal".into());
         let msg = heartbeat_message(&state, "aabbccddeeff0011", "up-to-date", None, 1000);
+        // 后面紧跟下一格，是这一行的「没有多余后缀」：钉住 `ends_with` 会随这行
+        // 往后长而假红，钉住「紧跟着谁」才是在说「它自己到此为止」。
         assert!(
-            msg.ends_with("last_advance_wait=99887766aabb@600s/build_gate_busy"),
+            msg.contains("last_advance_wait=99887766aabb@600s/build_gate_busy pin="),
             "{msg}"
         );
     }
