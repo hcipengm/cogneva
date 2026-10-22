@@ -1,3 +1,5 @@
+//! principle: feedback_a_metrics_name_can_be_the_opposite_of_the_verdict_it_carries
+//!
 //! Observability plugin — implements [`cog_core::SystemPlugin`].
 
 use chrono::Utc;
