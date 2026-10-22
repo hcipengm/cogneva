@@ -1331,6 +1331,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "同一生产者（触发线落不落得下来：1 落下了、0 没落下）。缺 `node_filesystem_free_bytes` 时保留块量不出来，触发线就落不到刹车那把尺子上，此时 `disk_trend_days_to_trigger` 整条缺席——「读不出来」与「还有很久」在规则里是同一个空集，这一格存在的唯一目的就是把它们分开。整条生产者死掉不在射程内，那由 `host_reading_producer_up` 按 producer 名报",
     ),
     (
+        "disk_trend_days_to_full_recent",
+        "同一生产者，但只用**最近 24 小时**那一段拟合（`COGNEVA_DISK_TREND_RECENT_DAYS`）。整窗斜率在加速段里会滞后：2026-10-20 实测整窗把 0.7 天算成 1.7 天，因为一周前那段几乎没在长。这一格是「按现在的速度还有几天写满」，非在长的时候**整条缺席**而不是印 0 或负数——「没在长」与「没量出来」由 `host_reading_producer_unreadable{producer=\"host_disk_trend\"}` 分开，不由这一格兼任",
+    ),
+    (
         "cogneva_host_target_gc_measured",
         "宿主构建缓存回收器的读数 `scripts/host/cogneva-target-gc-reading.sh`（私有仓 brain），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出。它读的是回收器自己每拍写的状态文件（`~/.local/state/cogneva/target-gc.json`）。1 是这一拍有一份状态，0 是从没跑成过——「状态文件不在」与「读不到」由退出码 3（一条序列都不印）分开",
     ),

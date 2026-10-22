@@ -501,6 +501,15 @@ data:
                   "summary": "root filesystem inode usage on {node} above 85% (current {value}%): bytes still read comfortable while the filesystem refuses to create a file. Every tree this platform grows is a many-small-files shape -- the container image store alone held 809k files on 2026-10-21, the build caches hundreds of thousands more -- so inodes run out long before bytes do, and the two disk rules above cannot see it coming. Measured on the node on 2026-10-21: 6.97M of 62.3M inodes in use, 12%, so the bound sits far above the whole measured band. The action is to find the tree that is growing by file count rather than by byte count and prune it; the rule resolving is the writeback. The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched."
                 },
                 {
+                  "name": "host_disk_trend_approaching_full",
+                  "promql": "min(disk_trend_days_to_full_recent)",
+                  "condition": {
+                    "less_than": 7.0
+                  },
+                  "severity": "warning",
+                  "summary": "the root filesystem is {value} day(s) from full at the rate it has been growing over the last 24 hours, inside the one-week band. The level rules above sit on 75% and 85% and can stay quiet for a week while this crosses: a disk at 60% is comfortable until the days left turn single-digit, and by then every reclaim the build-cache brake makes happens under a running build. The projection is a rate, so it moves before the level does, and it is absent when the disk is not growing -- a silent rule here means either steady or unmeasured, and CognevaHostReadingProducerUnreadable names the second on the host-readings channel, which is why this rule does not repeat it. The writeback is to free space now, while there is still a week to decide what goes."
+                },
+                {
                   "name": "node_memory_pressure",
                   "promql": "max without (pod, container, instance) (kube_node_status_condition{condition=\"MemoryPressure\", status=\"true\"})",
                   "condition": {
