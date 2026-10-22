@@ -293,13 +293,35 @@ mod tests {
             promql.contains(READ_BLOCK_SECONDS_METRIC),
             "the bound must come from the period the consumers read at: {promql}"
         );
+        // The left side has to keep the labels that name which consumer
+        // stalled: the row carries the stream and the consumer group, not the
+        // reporter that happened to publish them. Bare is one way to keep
+        // them; a `without` that drops only reporter labels is the other, and
+        // it is what the shipped rule uses now, because keying the row on the
+        // reporter opened one row per replica for one incident and a fresh
+        // pair on every rollout. What must not appear is an aggregation that
+        // drops either label the row is keyed on, or a sum, which would climb
+        // with the population of replicas instead of with the stall.
+        let left = promql.split('>').next().unwrap_or_default().trim();
         assert!(
-            promql.trim_start().starts_with(READ_SILENT_SECONDS_METRIC)
-                && !promql.contains("sum(")
-                && !promql.contains("avg("),
-            "the silence has to stay one series per consumer so the alert can name \
-             the one that stalled: {promql}"
+            left.contains(READ_SILENT_SECONDS_METRIC),
+            "the condition has to read the consumers' silence: {promql}"
         );
+        assert!(
+            !left.contains("sum(") && !left.contains("avg("),
+            "pooling the replicas turns a stall into a reading that rises with \
+             the population it is averaged over: {promql}"
+        );
+        if let Some((_, clause)) = left.split_once("without (") {
+            let dropped = clause.split(')').next().unwrap_or_default();
+            for label in ["stream", "consumer_group"] {
+                assert!(
+                    !dropped.split(',').any(|name| name.trim() == label),
+                    "the row names {label}, so the left side cannot aggregate it \
+                     away: {promql}"
+                );
+            }
+        }
         // The left side keeps its labels, so the bound has to reach it as a
         // scalar: an aggregation without a by/without clause is a vector whose
         // label set is empty, and vector-to-vector comparison only pairs up
