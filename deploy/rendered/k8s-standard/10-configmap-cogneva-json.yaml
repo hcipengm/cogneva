@@ -1293,12 +1293,12 @@ data:
             },
             {
               "name": "node_capacity_changed",
-              "promql": "max without (pod, container, instance) (changes(kube_node_status_allocatable{node=~\".+\", resource=~\"cpu|memory|ephemeral_storage\"}[6h]))",
+              "promql": "max without (pod, container, instance) (changes(kube_node_status_allocatable{node=~\".+\", resource=~\"cpu|memory|ephemeral_storage\"}[6h])) and on(node) (time() - timestamp(kube_node_status_allocatable{node=~\".+\", resource=~\"cpu|memory|ephemeral_storage\"}) < 300)",
               "condition": {
                 "greater_than": 0.0
               },
               "severity": "warning",
-              "summary": "The allocatable {resource} of node {node} changed in the last six hours. That is not a fault by itself, but every number derived from the old capacity is now resting on a stale premise: the limits account above, how much build concurrency the host can take, and the probe and cache budgets that were sized against the old machine. Re-derive them; this clears on its own once the change ages out The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched."
+              "summary": "The allocatable {resource} of node {node} changed in the last six hours. That is not a fault by itself, but every number derived from the old capacity is now resting on a stale premise: the limits account above, how much build concurrency the host can take, and the probe and cache budgets that were sized against the old machine. Re-derive them; this clears on its own once the change ages out The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched. The subject has to still be there: a range selector keeps matching the samples of a node that has already left the cluster, so without that requirement this rule would name a machine that is gone for as long as the window lasts."
             },
             {
               "name": "node_without_memory_reserve",

@@ -8,6 +8,7 @@
 //! principle: feedback_an_aggregate_over_a_series_family_can_starve_while_every_element_has_a_reader
 //! principle: feedback_an_alarm_moved_off_a_published_series_orphans_it_and_costs_a_census_entry
 //! principle: feedback_an_absence_question_needs_a_window_not_an_instant
+//! principle: feedback_a_range_selector_keeps_reading_a_subject_that_has_already_been_deleted
 //! principle: feedback_a_companion_clock_only_moves_if_the_writer_advances_it
 //! principle: feedback_a_transient_that_hits_every_subject_at_once_is_one_event_not_n
 //!
@@ -2015,17 +2016,15 @@ fn a_difference_read_of_a_metering_family_is_one_the_producer_declared() {
     );
 }
 
-/// The pod-scoped series a rule reads through a range selector.
+/// The series a rule reads through a range selector whose subject the cluster
+/// can delete.
 ///
 /// A range selector matches every sample inside its window, and the samples of
 /// a series whose subject has been deleted stay in that window. A rule that
-/// counts over a window therefore keeps reporting on a pod that no longer
-/// exists for as long as the window lasts -- labelled with the dead pod's name,
-/// so the row it opens outlives its subject.
-///
-/// Only names whose subject is a pod are in reach: a node series that
-/// disappears means the node is gone, and that is a different question.
-fn pod_scoped_range_subjects(promql: &str) -> Vec<String> {
+/// counts over a window therefore keeps reporting on a pod -- or, one level up,
+/// on a node -- that no longer exists for as long as the window lasts, labelled
+/// with the dead subject's name, so the row it opens outlives its subject.
+fn range_subjects_where(promql: &str, wanted: impl Fn(&str) -> bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut index = 0usize;
     let mut in_string = false;
@@ -2049,13 +2048,25 @@ fn pod_scoped_range_subjects(promql: &str) -> Vec<String> {
             }
         }
         let name = &promql[index..end];
-        let pod_scoped = name.starts_with("kube_pod_") || name.starts_with("container_");
-        if pod_scoped && followed_by_range_selector(&promql[end..]) {
+        if wanted(name) && followed_by_range_selector(&promql[end..]) {
             out.push(name.to_string());
         }
         index = end;
     }
     out
+}
+
+/// Pod-scoped series: the subject is a pod, and a rollout deletes pods daily.
+fn pod_scoped_range_subjects(promql: &str) -> Vec<String> {
+    range_subjects_where(promql, |name| {
+        name.starts_with("kube_pod_") || name.starts_with("container_")
+    })
+}
+
+/// Node-scoped series: the subject is a node. A node leaving the cluster is
+/// rarer, which is exactly why a rule naming it for six hours goes unnoticed.
+fn node_scoped_range_subjects(promql: &str) -> Vec<String> {
+    range_subjects_where(promql, |name| name.starts_with("kube_node_"))
 }
 
 /// Whether what follows an identifier is `[<duration>]` or `{...}[<duration>]`.
@@ -2071,12 +2082,16 @@ fn followed_by_range_selector(tail: &str) -> bool {
     tail.trim_start().starts_with('[')
 }
 
-/// Rules that count a pod-scoped series over a window without asking whether
-/// the pod is still there.
-fn deleted_subject_complaints(rules: &[(String, String)]) -> Vec<String> {
+/// Rules that count a subject-scoped series over a window without asking
+/// whether the subject is still there.
+fn complaints_against(
+    rules: &[(String, String)],
+    subjects_of: fn(&str) -> Vec<String>,
+    subject: &str,
+) -> Vec<String> {
     let mut complaints: Vec<String> = Vec::new();
     for (rule, promql) in rules {
-        let subjects = pod_scoped_range_subjects(promql);
+        let subjects = subjects_of(promql);
         if subjects.is_empty() {
             continue;
         }
@@ -2086,11 +2101,19 @@ fn deleted_subject_complaints(rules: &[(String, String)]) -> Vec<String> {
             continue;
         }
         complaints.push(format!(
-            "{rule} 在窗口里数 {}，却没有要求这条序列最近还在被采集: {promql}",
+            "{rule} 在窗口里数 {}，却没有要求这条序列最近还在被采集（主体是{subject}）: {promql}",
             subjects.join(", ")
         ));
     }
     complaints
+}
+
+fn deleted_subject_complaints(rules: &[(String, String)]) -> Vec<String> {
+    complaints_against(rules, pod_scoped_range_subjects, "Pod")
+}
+
+fn deleted_node_complaints(rules: &[(String, String)]) -> Vec<String> {
+    complaints_against(rules, node_scoped_range_subjects, "节点")
 }
 
 /// A range selector keeps counting a subject that has already been deleted.
@@ -2154,6 +2177,54 @@ fn the_deleted_subject_gate_reports_the_rule_without_the_conjunct_and_allows_the
         "sum by (namespace) (increase(sandbox_oom_kills_total[30m]))",
     );
     assert!(deleted_subject_complaints(&namespaced).is_empty());
+}
+
+/// A node that leaves the cluster keeps its samples in the window too.
+///
+/// `node_capacity_changed` counts `changes()` over six hours and names the node
+/// it read; on a node removed from the cluster the count stays true for the
+/// rest of the window, so the alert outlives the machine it reports on. The
+/// pod gate above cannot see it: its subject is a node.
+#[test]
+fn a_range_selector_over_a_node_scoped_series_requires_the_node_to_still_exist() {
+    let complaints = deleted_node_complaints(&shipped_rules());
+    assert!(
+        complaints.is_empty(),
+        "这些规则会在节点被移出集群之后，其标签仍留在窗口里的样本继续让它们为真；\
+         给每个区间聚合加一个合取项 `and on(node) (time() - timestamp(<同一序列>) < 300)`:\n{}",
+        complaints.join("\n")
+    );
+}
+
+#[test]
+fn the_node_subject_gate_reports_the_rule_without_the_conjunct_and_allows_the_one_with_it() {
+    let unguarded = deleted_subject_case(
+        "capacity",
+        "max without (pod, container, instance) (changes(kube_node_status_allocatable{node=~\".+\", resource=~\"cpu|memory\"}[6h]))",
+    );
+    assert_eq!(deleted_node_complaints(&unguarded).len(), 1);
+
+    let guarded = deleted_subject_case(
+        "capacity",
+        "max without (pod, container, instance) (changes(kube_node_status_allocatable{node=~\".+\", resource=~\"cpu|memory\"}[6h])) and on(node) (time() - timestamp(kube_node_status_allocatable{node=~\".+\", resource=~\"cpu|memory\"}) < 300)",
+    );
+    assert!(deleted_node_complaints(&guarded).is_empty());
+
+    // A gauge read at an instant already goes silent with the node: not this shape.
+    let instant = deleted_subject_case(
+        "reserve",
+        "sum by (node) (kube_node_status_capacity{resource=\"memory\"}) - sum by (node) (kube_node_status_allocatable{resource=\"memory\"})",
+    );
+    assert!(deleted_node_complaints(&instant).is_empty());
+
+    // A pod-scoped rule is not the node gate's business either: the two gates
+    // must not stand in for one another.
+    let pod_scoped = deleted_subject_case(
+        "restart",
+        "changes(kube_pod_container_status_restarts_total[6h])",
+    );
+    assert!(deleted_node_complaints(&pod_scoped).is_empty());
+    assert_eq!(deleted_subject_complaints(&pod_scoped).len(), 1);
 }
 
 /// A rule whose expression does not parse never fires, and the check above
