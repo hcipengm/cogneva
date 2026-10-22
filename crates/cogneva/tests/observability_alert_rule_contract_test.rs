@@ -1082,6 +1082,14 @@ const FOREIGN: &[(&str, &str)] = &[
         "container_memory_rss",
         "cadvisor（kubelet 内置）。判内存余量读的是**不可回收**的那部分：工作集把可回收的页缓存算进分子，在这棵树上足以把每一个大容器都推到上限（app／沙箱／进化三族的 usage 峰值都在 0.9998–1.0000 of limit，而 rss 是 0.78／0.59／0.24–0.39），所以拿工作集当分子时「顶到上限」不携带信息。工作集名字本身仍在别的面板上被读，但**没有任何告警规则读它**，按 the_tables_hold_no_series_that_no_rule_reads 不能留在本表",
     ),
+    (
+        "container_memory_usage_bytes",
+        "cadvisor（kubelet 内置）。cgroup 记的**整笔**占用：匿名页 + 页缓存 + slab。判「这个容器顶到上限了」读的是它，而判「顶到上限的到底是什么」要接着读 cache 那一半——两者相除才是那条规则的问题（可回收占多数时，rss 与工作集都不动）",
+    ),
+    (
+        "container_memory_cache",
+        "cadvisor（kubelet 内置）。同一笔占用里可回收的那部分。它在这里是**分子的一半而不是噪声**：cgroup 贴着上限而其中过半是页缓存时，一次 GFP_NOFS 分配回收不了同一文件系统的缓存，内核直接 OOM，而按 rss 或工作集读全都不动",
+    ),
     ("kube_deployment_spec_replicas", "kube-state-metrics"),
     (
         "kube_deployment_status_replicas_available",
