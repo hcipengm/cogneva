@@ -754,11 +754,29 @@ impl cog_core::SystemPlugin for StoragePlugin {
         info!("StoragePlugin WAL backend published");
 
         // ── AgentRegistry (Redis) ──
-        let agent_registry = crate::RedisAgentRegistry::new(redis_conn)
+        let agent_registry = crate::RedisAgentRegistry::new(redis_conn.clone())
             .with_ttl_seconds(ctx.config().agent.registration_ttl_secs);
         let agent_registry_dyn: Arc<dyn cog_core::AgentRegistry> = Arc::new(agent_registry);
         ctx.publish_service(agent_registry_dyn);
         info!("StoragePlugin agent registry published");
+
+        // ── Inbox stream retirement ──
+        //
+        // Every agent gets `orchestrator:agent:{id}:inbox` and nothing removed
+        // it when the agent did, so the store grew with the number of instances
+        // ever started. The pass shares this process's one Redis manager and
+        // asks the same question the log retirement asks -- is the name still in
+        // the registry -- because an empty stream with no owner is the only
+        // shape that can be removed without destroying a command somebody was
+        // told had been delivered.
+        let inbox_retirement = Arc::new(crate::inbox_retirement::InboxRetirement::new(
+            redis_conn.clone(),
+        ));
+        let _inbox_retirement = inbox_retirement.spawn_retirement(
+            ctx.consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or_default(),
+        );
 
         // ── HookArchive (PostgreSQL) ──
         if let Some(ref pool) = config_pool {

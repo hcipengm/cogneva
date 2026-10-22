@@ -139,6 +139,52 @@ async fn a_log_whose_session_is_registered_is_not_an_orphan() {
         .expect("deregister");
 }
 
+/// The scan and the delete are two round trips. A task re-dispatched to the
+/// same role recreates the same agent id — the name comes from the task and the
+/// role, not from the process — and the first thing it does is register, then
+/// replay. If that registration lands between the scan and the delete, the key
+/// nominated as an orphan now has an owner, and deleting it takes the tail the
+/// resume came back for.
+#[tokio::test]
+#[ignore = "needs a live Redis named by COGNEVA_TEST_REDIS_URL"]
+async fn a_log_whose_session_registered_after_the_scan_survives_the_delete() {
+    let backend = backend().await;
+    let session = format!("{PROBE}:reowned");
+    plant(&session, 2).await;
+    let key = format!("wal:{session}");
+
+    // The scan's answer, taken while the name was still free.
+    assert_eq!(
+        find(&backend.orphaned_logs().await.expect("scan"), &session),
+        Some(2),
+        "the probe starts out as an orphan, which is what nominates it"
+    );
+    // Then the owner comes back before the pass acts on that answer.
+    register(&session).await;
+
+    let outcome = backend
+        .retire_logs(std::slice::from_ref(&key))
+        .await
+        .expect("retire");
+    assert_eq!(
+        (outcome.retired, outcome.records),
+        (0, 0),
+        "a key that gained an owner is not retired, and the outcome says so"
+    );
+    assert_eq!(
+        find(&backend.orphaned_logs().await.expect("scan"), &session),
+        None,
+        "the log is still there and still owned"
+    );
+
+    RedisAgentRegistry::from_url(&redis_url())
+        .await
+        .expect("registry")
+        .deregister(&session)
+        .await
+        .expect("deregister");
+}
+
 #[tokio::test]
 #[ignore = "needs a live Redis named by COGNEVA_TEST_REDIS_URL"]
 async fn retiring_a_log_reports_what_it_held_and_removes_it() {

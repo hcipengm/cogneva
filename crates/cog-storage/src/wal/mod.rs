@@ -534,8 +534,20 @@ impl RedisWalBackend {
     /// the session. That agent's registration is renewed by its heartbeat, so a
     /// missing registry record means the appender is gone — it retired and
     /// deregistered, or it stopped beating and the registry retired it. No one
-    /// will append again, and no one can ask for the log back: the object that
-    /// would have replayed it no longer exists.
+    /// will append again.
+    ///
+    /// It does *not* mean no one will read again. A task agent's id is derived
+    /// from the task and the role, not from the process, so dispatching the same
+    /// task to the same role later recreates the same name — and with it the
+    /// same key — and that agent restores from the checkpoint left on the task
+    /// board, then replays from this log. Retirement therefore costs the tail
+    /// between the checkpoint and the death of the previous holder, for a resume
+    /// that arrives after both passes. Nothing here can tell a resumed task is
+    /// coming: the pointer lives in the task board, not in this store. What the
+    /// store can do is refuse to lose the tail *silently* — [`read_since`] says
+    /// so when it is asked for a sequence on a key that is no longer there.
+    ///
+    /// [`read_since`]: RedisWalBackend::read_since
     ///
     /// The length comes back with the key so the caller can tell, without a
     /// second round trip, whether the log grew since the last pass. Growth is
@@ -585,6 +597,11 @@ impl RedisWalBackend {
     }
 
     /// Remove the given logs and report what they held.
+    ///
+    /// Ownership is tested again inside the script, not trusted from the scan
+    /// that nominated these keys: a session that registered since then has an
+    /// owner and is left alone, and `retired` counts what was actually removed
+    /// rather than what was asked for.
     pub async fn retire_logs(&self, keys: &[String]) -> Result<RetireOutcome, WalError> {
         if keys.is_empty() {
             return Ok(RetireOutcome::default());
@@ -592,13 +609,27 @@ impl RedisWalBackend {
         let mut conn = self.client.clone();
         let (retired, records): (u64, u64) = redis::cmd("EVAL")
             .arg(
+                // The scan that produced these keys and this delete are two
+                // round trips, and any agent can register in between — a resume
+                // starts by registering, then replays. Asking the ownership
+                // question again here, where nothing can slip between the answer
+                // and the `DEL`, is what makes "no owner" true at the moment it
+                // is acted on rather than at the moment it was observed.
                 r#"
                 local records = 0
+                local retired = 0
                 for i = 1, #KEYS do
-                  records = records + (redis.call("LLEN", KEYS[i]) or 0)
-                  redis.call("DEL", KEYS[i])
+                  local key = KEYS[i]
+                  if string.sub(key, 1, 4) == "wal:" then
+                    local session = string.sub(key, 5)
+                    if redis.call("EXISTS", "orchestrator:agents:" .. session) == 0 then
+                      records = records + (redis.call("LLEN", key) or 0)
+                      redis.call("DEL", key)
+                      retired = retired + 1
+                    end
+                  end
                 end
-                return {#KEYS, records}
+                return {retired, records}
                 "#,
             )
             .arg(keys.len())
@@ -757,6 +788,7 @@ impl WalBackend for RedisWalBackend {
             .map_err(|e| WalError::Backend(format!("Redis LRANGE failed: {}", e)))?;
 
         let mut records = Vec::new();
+        let read_anything = !items.is_empty();
         for line in items {
             let record = WalRecord::decode_from_json_line(&line)?;
             // The record's own sequence, not the list position: after a trim
@@ -776,6 +808,28 @@ impl WalBackend for RedisWalBackend {
                     requested_seq = seq,
                     retained_from_seq = first.seq,
                     "WAL records before the retained head were trimmed; the replay starts later than asked"
+                );
+            }
+        }
+        // The empty answer has two causes and only one of them is good news:
+        // nothing was written after `seq`, or the whole book is gone — retired
+        // because no session held the name when the pass last looked, and then
+        // re-owned by a resumed task that came back for its tail. Without this
+        // probe a resume that loses every post-checkpoint event is
+        // indistinguishable from one that had none, which is exactly how the
+        // retirement would disappear from the record.
+        if !read_anything && seq > 0 {
+            let key = Self::key(session_id);
+            let exists: bool = redis::cmd("EXISTS")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| WalError::Backend(format!("Redis EXISTS failed: {}", e)))?;
+            if !exists {
+                tracing::warn!(
+                    session_id,
+                    requested_seq = seq,
+                    "the log for this session is no longer in the store; a replay asking for it gets nothing"
                 );
             }
         }

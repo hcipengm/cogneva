@@ -27,6 +27,7 @@ pub(crate) mod consumer_lag;
 pub mod dlq;
 pub mod etcd;
 pub mod event_filter;
+pub mod inbox_retirement;
 pub mod pools;
 pub mod raw;
 #[cfg(feature = "s3")]
