@@ -127,7 +127,14 @@ prometheus-node-exporter:
       cpu: 30m
       memory: 64Mi
     limits:
-      cpu: 200m
+      # 200m → 500m：这一格 2026-10-23 实测 **0.399 的 CFS 周期被限流**，而平均用量
+      # 只有几十毫核——它的工作是每 15 秒一次把整台宿主的采集器全跑一遍，是一段短突发，
+      # 而配额是按 100ms 周期发的，突发形状而不是算力才是瓶颈。被削掉的是**读数本身**：
+      # 这台主机的 node_filesystem_* / node_pressure_* 都从这里来，限流一多，宿主读数
+      # 就慢半拍甚至缺样本，而宿主读数正是资源面与持久化面的输入。抬到 500m 是同族
+      # （redis-info-exporter、claim-store、registry）同一条处置：按一个周期内的突发定，
+      # 不按均值定。它不在 cogneva 命名空间，不受该命名空间的 limits.cpu 配额约束。
+      cpu: 500m
       memory: 128Mi
   prometheus:
     monitor:

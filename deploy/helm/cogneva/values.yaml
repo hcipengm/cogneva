@@ -869,7 +869,13 @@ clusterRegistry:
       cpu: 20m
       memory: 32Mi
     limits:
-      cpu: 200m
+      # 200m → 500m：2026-10-23 实测这一格 **0.304 的 CFS 周期被限流**，平均用量 23m
+      # ——它平时空转，一次镜像层的 push/pull 才是突发，而配额按 100ms 周期发，
+      # 100ms 里那 20ms 的花法决定成败。被削掉的是分发速度：金丝雀镜像经这里秒级
+      # 分发，限流一多就变成「按配额的速度分发」，而它下游站着部署器的滚动。
+      # 同族处置：redis-info-exporter、claim-store、node-exporter 都是这条——
+      # 按一个周期内的突发定，不按均值定。抬完配额仍有 7 核余量（配额 31，声明 23.6）。
+      cpu: 500m
       memory: 256Mi
   # 走查是 readdir+stat，不吃 CPU；内存按目录树规模取，10Gi 的 store 远在这以内。
   walkerResources:

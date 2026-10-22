@@ -80,7 +80,7 @@ spec:
               cpu: 20m
               memory: 32Mi
             limits:
-              cpu: 200m
+              cpu: 500m
               memory: 256Mi
           volumeMounts:
             # 与 registry 容器同一份挂载（GC 要删），根目录一处声明。
@@ -129,7 +129,7 @@ spec:
               cpu: 20m
               memory: 32Mi
             limits:
-              cpu: 200m
+              cpu: 500m
               memory: 256Mi
           volumeMounts:
             - name: data

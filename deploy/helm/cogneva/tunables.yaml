@@ -435,8 +435,12 @@ rows:
   - key: clusterRegistry.resources.limits.cpu
     source: override
     why: >-
-      Burst room for a push. No reading of the registry's own CPU is available to
-      derive it from.
+      Burst room for a push, and now a reading behind it: kubelet reports every
+      container's cfs periods, and on 2026-10-23 this one spent 0.304 of them
+      throttled while averaging 23m of cpu, which is what moved the bound from
+      200m to 500m. It stays `override` because a reading is not a loop: nothing
+      walks this number from the throttled ratio on its own, so the honest record
+      is that somebody read it and changed it.
 
   - key: clusterRegistry.resources.limits.memory
     source: override

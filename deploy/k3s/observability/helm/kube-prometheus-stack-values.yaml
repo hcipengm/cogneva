@@ -389,7 +389,10 @@ prometheus-node-exporter:
       cpu: 50m
       memory: 128Mi
     limits:
-      cpu: 200m
+      # 200m → 500m：理由与缩配档同一份（那一档写着实测 0.399 的 CFS 周期被限流、
+      # 而瓶颈是每 15 秒一次的采集突发而不是平均算力）。两档同一个数，免得换了档
+      # 才在监控栈上重新遇见同一个限流。
+      cpu: 500m
       memory: 256Mi
   prometheus:
     monitor:
