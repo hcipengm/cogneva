@@ -771,6 +771,25 @@ spec:
             summary: "有告警响了半小时以上，人和机器都没接（见 cogneva_alert_attention_unattended_rule）"
             description: "`cogneva_alert_attention_unattended_rule{rule=…}` 点名是哪几条，`cogneva_alert_attention_oldest_unattended_age_seconds` 给最老的那一条响了多久。`cogneva_alert_attention_acknowledged` 与 `_filed` 分别数「人确认过」与「机器已开出任务」——两个数是分开的，因为断点不同：前者由 WebUI 告警浮层的确认按钮写（告警重新点火时清空，所以它记的是**这一轮**有没有人接），后者是 `signal_watcher` 按告警的 `dedup_key` 开的那个任务。先看 `_filed` 是不是 0 而 `cogneva_signal_watcher_held_total` 在涨：那是「信号接收闸被 LLM 池暂停」挡住了整条自发现，修法在池，不在告警；否则才逐条处置（能修的修、不能修的确认并写下原因）。两者都做到之后这一条自己会 resolve。"
 
+        # 行还开着，但**没有写者还在看它**：条件早已不成立，只是打开它的那个人再也没回来关。
+        # 这是另外两条读数都看不见的坏法——`alert_mirror` 问「该进表的进没进」、
+        # `CognevaAlertUnattended` 问「进了有没有人接」，两条都以「这一行说的是真的」为前提，
+        # 而孤儿行在它们眼里是一个完全正常的、进行中的告警：计入 firing、计入未接、甚至成为
+        # 最老的那一条。唯一的机器可读特征是 `last_seen_at`：写者每次看见条件仍然成立都会推进
+        # 它，所以「开着 + 很久没动 = 没人看了」。窗口 900 秒长过任何一次正常滚动（实测部署器
+        # 滚动最长 185 秒没有可用 Pod），短到一行孤儿半小时内出现。
+        # 修法不是关掉它，是查那个写者：2026-10-23 两行孤儿正是「关行写失败、键照删」留下的，
+        # 写者侧修好之后新长出来的孤儿会消失；已经冻住的行得由写者重启后重新 sight 才能关。
+        - alert: CognevaAlertUnsighted
+          expr: max(cogneva_alert_sighting_unsighted) > 0
+          for: 5m
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "有告警行开着，但已经超过十五分钟没有任何写者报告过它的条件仍然成立"
+            description: "`cogneva_alert_sighting_unsighted_rule{rule=…}` 点名是哪几条，`cogneva_alert_sighting_oldest_unsighted_age_seconds` 给最老的那一行多久没被报告（负数表示这一行压根没有 `last_seen_at`——从来没被看见过的那一档）。它与 `CognevaAlertUnattended` 是两件事：那一条说「有人看但没人接」，这一条说「连看的人都不在了」，而后者会让前者一直亮着，因为没人接的判断本身依赖这条行还在被写者维持。先查写者：这一组的时间戳由告警写者每拍推进，写者停摆（进程活着、这一支停了）与这一行被孤儿化在读数面上同形，看同一时刻有没有 `infra_watch_eval_failure` 或 Pod 重启；再看这一行的条件是不是早就不成立（Pod 已删、任务已结束），那是它该被关闭却关不掉。给五分钟：最老的那一档已经冻了至少十五分钟，再挂五拍才不是擦肩而过。"
+
     # 这张表本身以什么速度长：前面两组判「进没进表」「进了有没有人看」，都是逐行的读数，
     # 没有一条在看流量。于是「一条规则一小时写几十行」只能靠人去数表才发现——2026-10-22
     # 两笔都是这么发现的：`stream_consumer_stalled` 六小时 82 行（每行一分钟内 resolve，

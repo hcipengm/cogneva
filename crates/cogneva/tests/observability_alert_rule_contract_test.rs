@@ -1473,6 +1473,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "宿主读数 `scripts/host/cogneva-alert-attention-reading.sh`（不在本仓，登记行 `alert_attention`）：`alerts` 表里正 firing、响了超过窗口（默认 1800 秒）、而**人和机器都没接**的行。它是这条链的**读者**那一端——镜像那一族只判到「进了表」，进了之后有没有人接，此前没有任何序列在说；2026-10-22 主线停摆七十分钟，红与停都进了表、都被铃铛写过通知，而全程没有一条被确认。「接了」有两个机器可读的写者：人的 `acknowledged_at`，与机器的任务——`signal_watcher` 按告警的 `dedup_key` 开出 `self-signal-alert-*`，任务入参里带着这个键，所以 `cog_dag_tasks` 里查得到；只看人那一格，系统恢复自愈之后判词会在「每条告警都被机器接走」的健康态上永远亮着，而永远亮的判词与没有判词同价（2026-10-23 实测：现网 10 条 firing 里已有 1 条被机器接走）。两个写作点分开印成 `_acknowledged` 与 `_filed`，判词取并集。`notified_at` 不能当判据：它只说明站内铃铛写过通知（没人点开也算），按它判会把「告诉了」读成「看了」。按窗口而不是按比例判，是因为十件事接了九件时，剩下那一件仍然是没人接的那一件。判词**不把判它自己那条规则算进输入**（`CognevaAlertUnattended` 自己也是一条 firing、没人接、过了窗口的行）：算进去它就在为自己点火，一旦亮起再也回不到绿；它自己那几行另有 `cogneva_alert_attention_meta_unacknowledged` 单独数",
     ),
     (
+        "cogneva_alert_sighting_unsighted",
+        "宿主读数 `scripts/host/cogneva-alert-sighting-reading.sh`（不在本仓，登记行 `alert_sighting`）：`alerts` 表里正 firing、而**超过窗口（默认 900 秒）没有任何写者报告过条件仍然成立**的行。它判的是另外两条读数都看不见的那一档：`alert_mirror` 问「该进表的进没进」、`CognevaAlertUnattended` 问「进了表有没有人接」，两条都以「这一行说的是真的」为前提，而孤儿行在它们眼里是一个完全正常的、进行中的告警（计入 firing、计入未接、甚至成为最老的那一条）。唯一的机器可读特征是 `last_seen_at`：写者每次看见条件仍然成立都会推进它，所以「开着 + 很久没动 = 没有写者在看它」。2026-10-23 实测就是这一格找到的：`pod_restarting_repeatedly`（Pod 早被删）与 `dag_task_stalled_after_ready` 的 `last_seen_at` 一起冻在 22:59:48——同一次数据库慢语句窗口里两次关行写失败、键照删，于是再没有东西会来关它们，而这两行实际是靠人逐条对 Prometheus 才发现的。按窗口而不是「一冻就红」判：写者有自己的节拍，部署一次会让它们停几分钟；没有 `last_seen_at` 的行按最老算，它是从来没被看见过的那一档，恰恰最该被点名",
+    ),
+    (
         "cogneva_alert_traffic_noisy",
         "宿主读数 `scripts/host/cogneva-alert-traffic-reading.sh`（不在本仓，登记行 `alert_traffic`）：有没有哪条规则在一小时里写进 `alerts` 表的行数、或其中一分钟内就 resolve 的短命行数，越过了界。同族的 `alert_mirror` 判「该进表的进没进」、`alert_attention` 判「进了表有没有人看」，两条都是**逐行**的读数；这一格是**流量**——2026-10-22 同一天里两条规则各把一件事写成 82 行与 17 行，系统自己不报，是有人去数表才发现的。两个数分开数是因为它们指向两种修法：行数多是同一件事反复重开（该合并 dedup_key 或抬保持时长），短命多是一拍抖动被写成一行（该给 `for_seconds`）",
     ),
@@ -2008,6 +2012,147 @@ fn a_difference_read_of_a_metering_family_is_one_the_producer_declared() {
         "基线表与规则表对不上（豁免的代价要由点得出名字的规则承担，声明也不能没有读者）:\n{}",
         missing_cost.join("\n")
     );
+}
+
+/// The pod-scoped series a rule reads through a range selector.
+///
+/// A range selector matches every sample inside its window, and the samples of
+/// a series whose subject has been deleted stay in that window. A rule that
+/// counts over a window therefore keeps reporting on a pod that no longer
+/// exists for as long as the window lasts -- labelled with the dead pod's name,
+/// so the row it opens outlives its subject.
+///
+/// Only names whose subject is a pod are in reach: a node series that
+/// disappears means the node is gone, and that is a different question.
+fn pod_scoped_range_subjects(promql: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut index = 0usize;
+    let mut in_string = false;
+    while index < promql.len() {
+        let ch = promql[index..].chars().next().expect("in range");
+        if ch == '"' {
+            in_string = !in_string;
+            index += ch.len_utf8();
+            continue;
+        }
+        if in_string || !(ch.is_ascii_alphabetic() || ch == '_') {
+            index += ch.len_utf8();
+            continue;
+        }
+        let mut end = index;
+        for (offset, c) in promql[index..].char_indices() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                end = index + offset + c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let name = &promql[index..end];
+        let pod_scoped = name.starts_with("kube_pod_") || name.starts_with("container_");
+        if pod_scoped && followed_by_range_selector(&promql[end..]) {
+            out.push(name.to_string());
+        }
+        index = end;
+    }
+    out
+}
+
+/// Whether what follows an identifier is `[<duration>]` or `{...}[<duration>]`.
+fn followed_by_range_selector(tail: &str) -> bool {
+    let tail = tail.trim_start();
+    let tail = match tail.strip_prefix('{') {
+        Some(rest) => match rest.find('}') {
+            Some(close) => &rest[close + 1..],
+            None => return false,
+        },
+        None => tail,
+    };
+    tail.trim_start().starts_with('[')
+}
+
+/// Rules that count a pod-scoped series over a window without asking whether
+/// the pod is still there.
+fn deleted_subject_complaints(rules: &[(String, String)]) -> Vec<String> {
+    let mut complaints: Vec<String> = Vec::new();
+    for (rule, promql) in rules {
+        let subjects = pod_scoped_range_subjects(promql);
+        if subjects.is_empty() {
+            continue;
+        }
+        // The conjunct reads the same series through an instant selector, which
+        // stops returning it once the series is older than the lookback delta.
+        if promql.contains("time() - timestamp(") {
+            continue;
+        }
+        complaints.push(format!(
+            "{rule} 在窗口里数 {}，却没有要求这条序列最近还在被采集: {promql}",
+            subjects.join(", ")
+        ));
+    }
+    complaints
+}
+
+/// A range selector keeps counting a subject that has already been deleted.
+///
+/// 2026-10-23: `pod_restarting_repeatedly` was still firing on
+/// `cogneva-6b4c7cb489-5rb44` four minutes after the pod left
+/// `kubectl get pods`, and would have gone on for six hours from its death --
+/// `changes(kube_pod_container_status_restarts_total{uid="f65ae7ac-..."}[6h])`
+/// read 3 while `kube_pod_info` for that uid was already empty. The rule's own
+/// summary claimed the six-hour tail was fixed by counting with `changes()`
+/// instead of `increase()`; both functions read the same window.
+#[test]
+fn a_range_selector_over_a_pod_scoped_series_requires_the_subject_to_still_exist() {
+    let complaints = deleted_subject_complaints(&shipped_rules());
+    assert!(
+        complaints.is_empty(),
+        "这些规则会在主体（Pod）被删除之后，其标签仍留在窗口里的样本继续让它们为真；\
+         给每个区间聚合加一个合取项 `and on(namespace, pod, container) (time() - timestamp(<同一序列>) < 300)`:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The gate's two directions, from fixtures rather than from the tree.
+fn deleted_subject_case(name: &str, promql: &str) -> Vec<(String, String)> {
+    vec![(name.to_string(), promql.to_string())]
+}
+
+#[test]
+fn the_deleted_subject_gate_reports_the_rule_without_the_conjunct_and_allows_the_one_with_it() {
+    let unguarded = deleted_subject_case(
+        "restart",
+        "changes(kube_pod_container_status_restarts_total[6h])",
+    );
+    assert_eq!(deleted_subject_complaints(&unguarded).len(), 1);
+
+    let guarded = deleted_subject_case(
+        "restart",
+        "changes(kube_pod_container_status_restarts_total[6h]) and on(namespace, pod, container) (time() - timestamp(kube_pod_container_status_restarts_total) < 300)",
+    );
+    assert!(deleted_subject_complaints(&guarded).is_empty());
+
+    // A gauge read at an instant carries no window, so the subject's absence
+    // already silences it: this rule must not be reported.
+    let instant = deleted_subject_case(
+        "memory",
+        "kube_pod_container_resource_limits{resource=\"memory\"}",
+    );
+    assert!(deleted_subject_complaints(&instant).is_empty());
+
+    // The matcher spelling is part of the same shape: `{...}[5m]` is a range
+    // too, and reading the identifier alone would let it through.
+    let with_matcher = deleted_subject_case(
+        "writes",
+        "max by (namespace, pod, container) (rate(container_fs_writes_bytes_total{container!=\"\"}[5m]))",
+    );
+    assert_eq!(deleted_subject_complaints(&with_matcher).len(), 1);
+
+    // A namespace aggregate whose subject is the namespace is not this shape.
+    let namespaced = deleted_subject_case(
+        "oom",
+        "sum by (namespace) (increase(sandbox_oom_kills_total[30m]))",
+    );
+    assert!(deleted_subject_complaints(&namespaced).is_empty());
 }
 
 /// A rule whose expression does not parse never fires, and the check above
