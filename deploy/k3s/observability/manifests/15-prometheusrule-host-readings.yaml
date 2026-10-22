@@ -342,17 +342,43 @@ spec:
     #
     # 两条分开：磨到界是**排期换盘**；SMART 自己举手（介质错误 / critical warning）是
     # **立刻换盘**——后者与磨到多少无关，一块用了 12% 的盘也可能已经在掉块。
+    #
+    # 界不是这里写死的数，是读数自己导出的 `cogneva_host_nvme_wear_limit_pct`：
+    # 100 − 提前期天数 × 这块盘的日磨损速率，夹在 [1,99]。写死一个百分比的毛病是它把
+    # 「还剩多少寿命」与「还要多久到」混成一个数——一块 0.05 %/天的盘在 80% 上还剩 400 天，
+    # 一块 0.8 %/天的盘在 80% 上只剩 25 天，同一个 80 对后者已经太晚。规则只在两边都有
+    # 这个 device 时比（`on(device)`）：界缺席的盘不报磨损，只由「读不到」那条接住。
     - name: cogneva-host-nvme-wear
       rules:
         - alert: CognevaHostNvmeWearHigh
-          expr: cogneva_host_nvme_percentage_used >= 80
+          expr: |
+            cogneva_host_nvme_percentage_used
+              >= on(device) cogneva_host_nvme_wear_limit_pct
           for: 1h
           labels:
             cogneva_io_managed: "true"
             severity: warning
           annotations:
-            summary: "NVMe {{ $labels.device }} 已磨损 {{ $value }}%：该排期换盘了"
-            description: "界 80 是寿命规划线，不是今天的数：2026-10-22 实测 8%，按平均 1.25 TB/天约 370 天到额定。这个数只增不减，没有补救动作。估剩余时间要两个一起读：`cogneva_host_nvme_percentage_used` 给还剩多少，`sudo nvme smart-log /dev/nvme0 Data Units Written` 给实际写入速率（2026-10-22 是 40.58 TB / 779 小时）。写它的载荷决定它磨多快——构建缓存与镜像库的写入是这台机上最大的两块。"
+            summary: "NVMe {{ $labels.device }} 已磨损 {{ $value }}%：按它自己的速率，剩余寿命不足一个换盘提前期"
+            description: "界来自读数 `cogneva_host_nvme_wear_limit_pct{device=\"{{ $labels.device }}\"}`：100 减去提前期天数乘这块盘的日磨损速率。2026-10-22 实测这块盘 8%、通电 779 小时 ⇒ 约 0.25 %/天，90 天提前期下界在 77.5%。来源标签 source 说清界是导出的（derived）、刚上机的退路（default，固定 80）还是人钉的（override）。这个数只增不减，没有补救动作，只能排期换盘。要知道还剩多久，读 `cogneva_host_nvme_wear_rate_pct_per_day`——它才是「还剩多少天」的分母。"
+
+        # 「突然变得更快」是另一件事：界回答「还够不够一个提前期」，这一条回答
+        # 「这块盘是不是刚换了一种用法」。近 6 小时的窗口速率压过它自己一生的平均速率
+        # 两倍才算，且绝对值要过 0.1 %/天——否则 8% 的盘多写 1% 就是两倍，天天响。
+        # 处置是查谁在猛写（构建缓存 / 镜像库 / 备份），不是换盘：速率回去了就不该换。
+        - alert: CognevaHostNvmeWearAccelerating
+          expr: |
+            (deriv(cogneva_host_nvme_percentage_used[6h]) * 86400)
+              > on(device) (cogneva_host_nvme_wear_rate_pct_per_day * 2)
+            and
+            (deriv(cogneva_host_nvme_percentage_used[6h]) * 86400) > 0.1
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "NVMe {{ $labels.device }} 近 6 小时磨得比它自己的平均速率快一倍以上"
+            description: "左边是近 6 小时的窗口速率（%/天），右边是这块盘一生的平均速率 `cogneva_host_nvme_wear_rate_pct_per_day` 的两倍。突然变快通常是新加了一种写载荷：构建缓存、镜像层、备份落盘。查 `bash scripts/host/cogneva-host-footprint-trend-reading.sh` 与宿主上的写入者；这一格的修法是挪走写载荷，不是换盘——速率降回去就不该换。"
 
         # 「磨到多少」与「有没有已经坏了」是两件事：介质错误计数只会涨，critical warning
         # 是控制器自己举手。这一格的处置是立刻换，不是排期。
@@ -380,6 +406,34 @@ spec:
           annotations:
             summary: "有 {{ $value }} 块 NVMe 的 SMART 读不出来，那块盘的磨损没人知道"
             description: "通常是 `sudo -n` 不再免密（宿主读数以普通用户跑，`nvme smart-log` 要 root），或这块盘的控制器节点换了名字。查 `bash scripts/host/cogneva-nvme-wear-reading.sh` 的 stderr，它会点名是哪一块。"
+
+        # 换盘是个**事件**，不是磨损读数上能看出来的一件事：换完之后 percentage_used 从
+        # 80 掉回 2，与「这块盘自己好了」逐字同形。所以读数带一个按序列号数的计数，只在
+        # 序列号变化时 +1，这一条把那个跳变转成一行可 ack 的告警——换盘的记录面就落在
+        # `alerts` 表里（fired → acknowledged → resolved），而不是只活在被换掉的那块盘上。
+        # severity 是 info：它记录的是「有人做对了」，不需要谁被叫醒。
+        - alert: CognevaHostNvmeReplacementDetected
+          expr: increase(cogneva_host_nvme_replacements_total[6h]) > 0
+          for: 5m
+          labels:
+            cogneva_io_managed: "true"
+            severity: info
+          annotations:
+            summary: "NVMe {{ $labels.device }} 位次上换过一块盘"
+            description: "`cogneva_host_nvme_replacements_total` 是这块位次上累计换过的盘数（读数按序列号数，第一次见不计）。降下去是换盘，不是盘变好了——磨损只增不减，同一块盘的 percentage_used 不会回落。要记录换的哪块、旧的磨到多少，看这一行告警的起止时间与换盘前的 `cogneva_host_nvme_percentage_used`。"
+
+        # 提前期是导出界那个公式里唯一的政策输入，钉得太短等于「等它响了再买」：
+        # 采购与上门要时间，界就是为这段时间留的。低于 30 天时导出的界贴到寿命尽头，
+        # 规则响了也已经来不及。这是政策读数自己的守卫，与任何一块盘的现状无关。
+        - alert: CognevaHostNvmeLeadTimeTooShort
+          expr: cogneva_host_nvme_lead_days < 30
+          for: 1h
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "NVMe 换盘提前期只有 {{ $value }} 天：导出的磨损界会贴到寿命尽头"
+            description: "界 = 100 − 提前期 × 日磨损速率，提前期太短就没给采购与上门留出时间。默认 90 天，由 `COGNEVA_HOST_NVME_LEAD_DAYS` 调；调短要同时改换盘流程的时长，否则这一格只是把告警推迟到无可挽回之后。"
 
     # 文件大小普查（`crates/` 下每个越过普查线的 `.rs` 各判过没有）落后于活树多少。
     # 普查线是判据脚本 `scripts/gates/check-file-size-census.py` 自己的常量，这里不抄那个数：

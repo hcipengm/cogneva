@@ -365,8 +365,11 @@ NO_POD_REPORTER = {
     # 保留它是必须的（一块盘磨到界与另一块无关，两块都要报），而报信的从来不是 Pod——
     # 读数由宿主上的生产者算好、聚合器送出去，聚合器重建也不改变盘是谁的。
     'CognevaHostNvmeWearHigh': 'cogneva_host_nvme_percentage_used',
+    'CognevaHostNvmeWearAccelerating': 'cogneva_host_nvme_wear_rate_pct_per_day',
     'CognevaHostNvmeHealthWarning': 'cogneva_host_nvme_media_errors_total',
     'CognevaHostNvmeUnreadable': 'cogneva_host_nvme_devices',
+    'CognevaHostNvmeReplacementDetected': 'cogneva_host_nvme_replacements_total',
+    'CognevaHostNvmeLeadTimeTooShort': 'cogneva_host_nvme_lead_days',
     'CognevaFileSizeCensusUnjudged': 'cogneva_file_size_census_unjudged',
     'CognevaHostReadingSeriesUndeclared': 'host_reading_series_undeclared',
     'CognevaReadingWitnessUnresolved': 'reading_witness_unresolved',
