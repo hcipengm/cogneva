@@ -40,6 +40,7 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: warning
+              cogneva_io_managed: "true"
               verdict: stale
       # 同一份输入下另外两条不许响：一份 stale 读数不代表读数不见了、也不代表它停了。
       - eval_time: 40m
@@ -85,6 +86,7 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: warning
+              cogneva_io_managed: "true"
 
   # 四、读数还在但不更新：年龄越过 1800 秒，`for: 10m` 之后亮；越过之前不亮。
   # 这一格是「停产的 beat 一直发最后一行」的唯一证据——另外两条对它都是哑的。
@@ -103,3 +105,4 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: warning
+              cogneva_io_managed: "true"

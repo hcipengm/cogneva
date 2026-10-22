@@ -129,6 +129,9 @@ pub async fn run_infra_watch_loop(
                 // `for_seconds` window first: value is the first tick it held.
                 let mut holding: HashMap<String, Instant> = HashMap::new();
                 let mut adopted = false;
+                // What the alert mirror last saw Prometheus firing. Empty on a
+                // restart is correct: the first successful read lists it all.
+                let mut mirror_state = MirrorState::default();
                 // 没有停用规则时这一趟本来就没事可做，标成已跑完，免得每拍都去
                 // 问一次 store——空名单不是"还没跑"，是"跑完了，没有要结算的"。
                 let mut retired = config.retired_rules.is_empty();
@@ -162,6 +165,17 @@ pub async fn run_infra_watch_loop(
                                 retired = retire_rules(&config, &outlets).await;
                             }
                             tick(&config, &outlets, &http, &mut known_firing, &mut eval_failure_firing, &mut failure_streaks, &mut holding).await;
+                            // After the rules, so a read that fails is one
+                            // more broken reading in the same tick's budget
+                            // rather than a reason to skip them.
+                            mirror_prometheus_alerts(
+                                &config,
+                                &outlets,
+                                &http,
+                                &mut mirror_state,
+                                &mut eval_failure_firing,
+                            )
+                            .await;
                             crate::config_delivery::check_loaded_rule_set(
                                 &mut rule_set_watch,
                                 &loaded_rule_names,
@@ -407,6 +421,280 @@ async fn tick(
             known_firing.remove(key);
         }
     }
+}
+
+/// The pseudo rule name a failed mirror read is booked under.
+///
+/// A read of `/api/v1/alerts` that fails must not resolve anything — absence of
+/// evidence is not evidence of health, exactly as for a rule's own query — and
+/// it must not vanish either: without a row, a mirror that has been broken for
+/// a day looks the same as one with nothing to copy. Booked through the same
+/// self-alert path as a broken rule so the two read alike.
+pub const MIRROR_SOURCE: &str = "prometheus_alerts";
+
+/// What the mirror remembers between ticks.
+#[derive(Default)]
+struct MirrorState {
+    /// Dedup keys believed firing, filled from what Prometheus reported. Not
+    /// adopted from the store on restart: the first successful read lists
+    /// everything Prometheus is firing, and `set_alert` on a row that already
+    /// exists reports a repeat rather than a transition, so nothing is
+    /// duplicated or re-announced.
+    firing: HashSet<String>,
+    failure_streak: u32,
+}
+
+/// One alert Prometheus evaluated and is currently firing, reduced to what a
+/// row needs.
+#[derive(Debug, Clone, PartialEq)]
+struct MirroredAlert {
+    rule: String,
+    severity: cog_core::AlertSeverity,
+    /// Identity labels only. The rule's name, its severity and Prometheus's own
+    /// alert-state label describe the alert rather than the thing that is wrong,
+    /// and a key carrying them would fork a row when either changes.
+    labels: BTreeMap<String, String>,
+    message: String,
+}
+
+impl MirroredAlert {
+    fn key(&self) -> String {
+        dedup_key(&self.rule, &self.labels)
+    }
+}
+
+/// Labels that are part of Prometheus's alert envelope, not of the subject.
+const MIRROR_ENVELOPE_LABELS: &[&str] = &["alertname", "alertstate", "severity"];
+
+/// Read one tick's worth of Prometheus-evaluated alerting state.
+///
+/// The pure part is split out because the decisions it makes — which alerts
+/// belong in this table, and what identifies one — are the whole feature, and a
+/// fixture can pin them without a server.
+fn parse_alerts_response(
+    body: &serde_json::Value,
+    mirror: &crate::config::AlertMirrorConfig,
+    own_rules: &HashSet<&str>,
+) -> Result<Vec<MirroredAlert>, String> {
+    if body.get("status").and_then(|s| s.as_str()) != Some("success") {
+        let detail = body
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("no error message");
+        return Err(format!("prometheus alerts query failed: {detail}"));
+    }
+    let alerts = body
+        .get("data")
+        .and_then(|d| d.get("alerts"))
+        .and_then(|a| a.as_array())
+        .ok_or_else(|| "prometheus alerts response has no data.alerts array".to_string())?;
+
+    let mut out = Vec::new();
+    for alert in alerts {
+        if alert.get("state").and_then(|s| s.as_str()) != Some("firing") {
+            continue;
+        }
+        let Some(raw) = alert.get("labels").and_then(|l| l.as_object()) else {
+            continue;
+        };
+        let labels: BTreeMap<String, String> = raw
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+            .collect();
+        if labels.get(&mirror.label).map(String::as_str) != Some(mirror.value.as_str()) {
+            continue;
+        }
+        let Some(rule) = labels.get("alertname").cloned() else {
+            continue;
+        };
+        // Already booked by the in-process evaluation of the same rule: two
+        // writers keyed differently would open two rows for one incident.
+        if own_rules.contains(rule.as_str()) || rule == EVAL_FAILURE_RULE || rule == MIRROR_SOURCE {
+            continue;
+        }
+        let severity = match labels.get("severity").map(String::as_str) {
+            Some("critical") => cog_core::AlertSeverity::Critical,
+            Some("info") => cog_core::AlertSeverity::Info,
+            _ => cog_core::AlertSeverity::Warning,
+        };
+        let summary = alert
+            .get("annotations")
+            .and_then(|a| a.get("summary"))
+            .and_then(|s| s.as_str())
+            .or_else(|| {
+                alert
+                    .get("annotations")
+                    .and_then(|a| a.get("description"))
+                    .and_then(|s| s.as_str())
+            })
+            .map(str::to_string)
+            .unwrap_or_else(|| rule.clone());
+        let labels = labels
+            .into_iter()
+            .filter(|(k, _)| {
+                !MIRROR_ENVELOPE_LABELS.contains(&k.as_str())
+                    && !NON_IDENTITY_LABELS.contains(&k.as_str())
+                    // The marking label says where the alert is delivered, not
+                    // what it is about; it is on every mirrored alert by
+                    // construction, so it identifies nothing.
+                    && k != &mirror.label
+            })
+            .collect();
+        out.push(MirroredAlert {
+            rule,
+            severity,
+            labels,
+            message: summary,
+        });
+    }
+    Ok(out)
+}
+
+async fn query_prometheus_alerts(
+    http: &Arc<dyn cog_core::HttpClient>,
+    base_url: &str,
+) -> Result<serde_json::Value, String> {
+    let url = format!("{}/api/v1/alerts", base_url.trim_end_matches('/'));
+    let mut req = cog_core::HttpRequest::get(url);
+    req.timeout_secs = Some(10);
+    let resp = http
+        .execute(req)
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !resp.is_success() {
+        return Err(match describe_api_error(&resp.body) {
+            Some(detail) => format!("prometheus returned {}: {detail}", resp.status),
+            None => format!("prometheus returned {}", resp.status),
+        });
+    }
+    serde_json::from_slice(&resp.body).map_err(|e| format!("invalid JSON: {e}"))
+}
+
+/// Copy the alerts Prometheus is firing under the mirror label into the alert
+/// table, and resolve the ones it stopped firing.
+///
+/// Resolution is driven by Prometheus's own `for:` windows and conditions: the
+/// mirror never re-evaluates them, because two evaluations of one rule is the
+/// pair that drifts.
+async fn mirror_prometheus_alerts(
+    config: &InfraWatchConfig,
+    outlets: &InfraWatchOutlets,
+    http: &Arc<dyn cog_core::HttpClient>,
+    state: &mut MirrorState,
+    eval_failure_firing: &mut HashSet<String>,
+) {
+    let Some(mirror) = &config.mirror_alerts else {
+        return;
+    };
+    let own_rules: HashSet<&str> = config.rules.iter().map(|r| r.name.as_str()).collect();
+    let body = match query_prometheus_alerts(http, &config.prometheus_url).await {
+        Ok(body) => body,
+        Err(e) => {
+            // Nothing is resolved here, for the same reason a rule's failed
+            // query resolves nothing: a read that did not happen is not a read
+            // that came back healthy.
+            state.failure_streak = state.failure_streak.saturating_add(1);
+            warn!(error = %e, "infra watch: alert mirror read failed");
+            let key = format!("{EVAL_FAILURE_RULE}:{MIRROR_SOURCE}");
+            let latched = eval_failure_firing.contains(&key);
+            if let Some(plan) = eval_failure_plan(
+                config.eval_failure_alert_after,
+                state.failure_streak,
+                latched,
+            ) {
+                if plan.sight {
+                    sight_eval_failure(MIRROR_SOURCE, state.failure_streak, &e, &key, outlets)
+                        .await;
+                }
+                if plan.notify {
+                    eval_failure_firing.insert(key.clone());
+                    notify_eval_failure(MIRROR_SOURCE, state.failure_streak, &e, outlets).await;
+                }
+            }
+            return;
+        }
+    };
+    let alerts = match parse_alerts_response(&body, mirror, &own_rules) {
+        Ok(alerts) => alerts,
+        Err(e) => {
+            state.failure_streak = state.failure_streak.saturating_add(1);
+            warn!(error = %e, "infra watch: alert mirror response unreadable");
+            return;
+        }
+    };
+    state.failure_streak = 0;
+    let eval_key = format!("{EVAL_FAILURE_RULE}:{MIRROR_SOURCE}");
+    if eval_failure_firing.remove(&eval_key) {
+        resolve(&eval_key, outlets).await;
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    for alert in &alerts {
+        let key = alert.key();
+        seen.insert(key.clone());
+        state.firing.insert(key.clone());
+        mirror_report(alert, &key, outlets).await;
+    }
+    let gone: Vec<String> = state.firing.difference(&seen).cloned().collect();
+    for key in gone {
+        resolve_from(&key, outlets, MIRROR_SOURCE).await;
+        state.firing.remove(&key);
+    }
+}
+
+/// Report one mirrored sighting: the row advances its liveness clock every
+/// tick, and a transition — not a repeat — is what notifies.
+async fn mirror_report(alert: &MirroredAlert, key: &str, outlets: &InfraWatchOutlets) {
+    let Some(store) = &outlets.store else {
+        mirror_notify(alert, &HashMap::new(), outlets).await;
+        return;
+    };
+    let mut labels: HashMap<String, String> = alert
+        .labels
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    labels.insert("message".into(), alert.message.clone());
+    labels.insert("source".into(), MIRROR_SOURCE.into());
+    let row = NewAlert {
+        rule: alert.rule.clone(),
+        dedup_key: key.to_string(),
+        severity: alert.severity.as_str().to_string(),
+        message: alert.message.clone(),
+        labels: serde_json::to_value(&labels).unwrap_or_else(|_| serde_json::json!({})),
+    };
+    match store.set_alert(true, &row).await {
+        Ok(AlertTransition::Fired) => {
+            warn!(rule = %alert.rule, key = %key, message = %alert.message, "mirrored alert firing");
+            mirror_notify(alert, &labels, outlets).await;
+        }
+        Ok(_) => {}
+        Err(e) => warn!(rule = %alert.rule, error = %e, "mirrored alert persist failed"),
+    }
+}
+
+async fn mirror_notify(
+    alert: &MirroredAlert,
+    labels: &HashMap<String, String>,
+    outlets: &InfraWatchOutlets,
+) {
+    let now = Utc::now();
+    let inst = AlertInstance {
+        rule_name: alert.rule.clone(),
+        labels: labels.clone(),
+        state: AlertState::Firing,
+        severity: alert.severity,
+        value: 1.0,
+        starts_at: now,
+        ends_at: None,
+        updated_at: now,
+    };
+    deliver(
+        outlets,
+        vec![AlertEvent::Firing(inst)],
+        outlets.store.is_some(),
+    )
+    .await;
 }
 
 /// Whether a rule's hold window has elapsed for a series that is not firing yet.
@@ -769,6 +1057,13 @@ async fn deliver(outlets: &InfraWatchOutlets, events: Vec<AlertEvent>, persisted
 
 /// Close one alert row and notify the resolution.
 async fn resolve(key: &str, outlets: &InfraWatchOutlets) {
+    resolve_from(key, outlets, "infra_watch").await;
+}
+
+/// The same, saying which producer the row belonged to: a mirror row resolved
+/// under the in-process label would name the wrong writer in the very
+/// notification that says the incident is over.
+async fn resolve_from(key: &str, outlets: &InfraWatchOutlets, source: &str) {
     if let Some(store) = &outlets.store {
         let alert = NewAlert {
             rule: key.split(':').next().unwrap_or(key).to_string(),
@@ -780,7 +1075,7 @@ async fn resolve(key: &str, outlets: &InfraWatchOutlets) {
         match store.set_alert(false, &alert).await {
             Ok(AlertTransition::Resolved) => {
                 info!(key = %key, "infra alert resolved");
-                let labels = HashMap::from([("source".to_string(), "infra_watch".to_string())]);
+                let labels = HashMap::from([("source".to_string(), source.to_string())]);
                 let inst = AlertInstance {
                     rule_name: alert.rule.clone(),
                     labels,
@@ -1121,6 +1416,86 @@ mod tests {
         // Missing data.result must error too, not read as zero series —
         // zero series resolves firing alerts.
         assert!(parse_vector_response(&serde_json::json!({"status": "success"})).is_err());
+    }
+
+    /// A `/api/v1/alerts` body with four alerts that differ in exactly the
+    /// dimensions the mirror decides on: state, the marking label, and whether
+    /// this process already evaluates the rule.
+    fn alerts_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "status": "success",
+            "data": {"alerts": [
+                {"state": "firing", "value": "1",
+                 "labels": {"alertname": "CognevaE2eRingFailed", "severity": "warning",
+                            "alertstate": "firing", "cogneva_io_managed": "true",
+                            "mountpoint": "/"},
+                 "annotations": {"summary": "环 3 停在失败态"}},
+                {"state": "pending", "value": "1",
+                 "labels": {"alertname": "StillBurning", "severity": "warning",
+                            "alertstate": "pending", "cogneva_io_managed": "true"}},
+                {"state": "firing", "value": "1",
+                 "labels": {"alertname": "Watchdog", "severity": "none",
+                            "alertstate": "firing"}},
+                {"state": "firing", "value": "1",
+                 "labels": {"alertname": "node_disk_usage_high", "severity": "warning",
+                            "alertstate": "firing", "cogneva_io_managed": "true"},
+                 "annotations": {"description": "整窗拟合说盘要到触发线了"}},
+                {"state": "firing", "value": "1",
+                 "labels": {"alertname": "NoSummary", "severity": "critical",
+                            "alertstate": "firing", "cogneva_io_managed": "true"}}
+            ]}
+        })
+    }
+
+    #[test]
+    fn mirror_takes_only_firing_marked_alerts_this_process_does_not_evaluate() {
+        let mirror = crate::config::AlertMirrorConfig {
+            label: "cogneva_io_managed".into(),
+            value: "true".into(),
+        };
+        // `node_disk_usage_high` is one of this process's own rules: the
+        // in-process evaluation books it, and a second writer would open a
+        // second row for one incident.
+        let own: HashSet<&str> = ["node_disk_usage_high"].into_iter().collect();
+        let alerts = parse_alerts_response(&alerts_fixture(), &mirror, &own).unwrap();
+        let names: Vec<&str> = alerts.iter().map(|a| a.rule.as_str()).collect();
+        assert_eq!(names, vec!["CognevaE2eRingFailed", "NoSummary"]);
+        // Summary first, then description, then the rule name: a row with no
+        // text says nothing about what is wrong.
+        assert_eq!(alerts[0].message, "环 3 停在失败态");
+        assert_eq!(alerts[1].message, "NoSummary");
+        assert_eq!(alerts[1].severity, cog_core::AlertSeverity::Critical);
+    }
+
+    #[test]
+    fn mirror_key_names_the_subject_not_the_alert_envelope() {
+        let mirror = crate::config::AlertMirrorConfig {
+            label: "cogneva_io_managed".into(),
+            value: "true".into(),
+        };
+        let alerts = parse_alerts_response(&alerts_fixture(), &mirror, &HashSet::new()).unwrap();
+        let e2e = &alerts[0];
+        assert_eq!(e2e.key(), "CognevaE2eRingFailed:mountpoint=/");
+        // The envelope labels must not reach the row either: they describe the
+        // alert, and a stored label is what the remediation text is built from.
+        assert!(!e2e.labels.contains_key("alertname"));
+        assert!(!e2e.labels.contains_key("severity"));
+        assert!(!e2e.labels.contains_key("alertstate"));
+        assert_eq!(e2e.labels.get("mountpoint").map(String::as_str), Some("/"));
+    }
+
+    #[test]
+    fn mirror_rejects_error_and_malformed_responses() {
+        let mirror = crate::config::AlertMirrorConfig {
+            label: "cogneva_io_managed".into(),
+            value: "true".into(),
+        };
+        let err = serde_json::json!({"status": "error", "error": "boom"});
+        assert!(parse_alerts_response(&err, &mirror, &HashSet::new()).is_err());
+        // `success` with no alerts array must error rather than read as "nothing
+        // is firing": that answer resolves every mirrored row.
+        let empty = serde_json::json!({"status": "success", "data": {}});
+        assert!(parse_alerts_response(&empty, &mirror, &HashSet::new()).is_err());
     }
 
     #[test]
@@ -1611,6 +1986,7 @@ mod tests {
             eval_failure_alert_after: threshold,
             rules: vec![test_rule("rule_a")],
             retired_rules: Vec::new(),
+            mirror_alerts: None,
         }
     }
 

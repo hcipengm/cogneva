@@ -457,6 +457,11 @@ data:
               "prometheus_url": "http://cog-observability-prometheus.monitoring:9090",
               "poll_interval_secs": 60,
               "eval_failure_alert_after": 3,
+              "_mirror_alerts_comment": "Prometheus 自己求值的告警里，哪些该抄进同一张告警表。这里给一对标签键值：带这对标签的 firing 告警每拍被抄成一行，Prometheus 里不再 firing 就 resolve。标在规则上而不是列在这里，是为了让规则和它的投递声明同一次改动落地、改名也丢不掉投递。名字已经在本进程 rules 里的跳过：那条由进程内求值记账，两个写者会为同一件事开两行。不配 = 不抄。",
+              "mirror_alerts": {
+                "label": "cogneva_io_managed",
+                "value": "true"
+              },
               "_retired_rules_comment": "已经停用的规则名。从 rules 里删掉一条规则不会动它已经开着的行，那些行会以「正在持续」的样子一直留在 state=firing 那一面上（resolved_at 空、last_seen_at 停在删除那一刻），会去关它的只有那条规则自己，而它已经不在了。点名在这里的，watcher 启动时按普通解析的同一路径把它们结算掉。停用的名字不能同时出现在 rules 里。",
               "retired_rules": [
                 "llm_pool_down",
@@ -2858,12 +2863,12 @@ data:
                 },
                 {
                   "name": "agent_inbox_orphans_hold_commands",
-                  "promql": "sum(agent_inbox_orphaned_entries)",
+                  "promql": "max(agent_inbox_orphaned_entries)",
                   "condition": {
                     "greater_than": 0.0
                   },
                   "severity": "warning",
-                  "summary": "{value} command(s) sit in inbox streams whose agent is no longer registered. Retirement removes an inbox only when it is empty, so these are never delivered and never deleted: no consumer holds that id any more, and the pass refuses to destroy work somebody was told had been queued. The stream count is the other half of the reading -- agent_inbox_orphaned_streams, on the series whose state label reads \"holding\", says how many queues are stranded; this one says how much work is in them. Ages are not in the reading; to find out how long a command has waited, read the stream itself, never the age of this series"
+                  "summary": "{value} command(s) sit unread in inbox streams whose agent is no longer registered. Nothing will take them: no consumer holds that id any more, and retirement refuses to destroy work somebody was told had been queued. Only unread commands are counted -- an entry its group read and acknowledged still makes the stream non-empty, but it owes nobody anything and is reported on agent_inbox_orphaned_streams under its consumed state; counting the stream length instead is how a queue that did its job was once reported as stranded work. The stream count is the other half of the reading: the series whose state label reads \"holding\" says how many queues still owe a command. This is a max rather than a sum because every process walks the same Redis and publishes the whole population, so summing multiplies it by the number of readers. Ages are not in the reading; to find out how long a command has waited, read the stream itself, never the age of this series"
                 },
                 {
                   "name": "agent_inbox_orphan_reading_missing",

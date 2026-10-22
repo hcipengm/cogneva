@@ -1596,6 +1596,145 @@ fn shipped_rules() -> Vec<(String, String)> {
     rules
 }
 
+/// Every alert in a `PrometheusRule` manifest here, as (file, alert, labels).
+fn manifest_alerts() -> Vec<(String, String, BTreeMap<String, String>)> {
+    let dir = repo_root().join(RULE_MANIFESTS_DIR);
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{} unreadable: {e}", dir.display()))
+        .map(|entry| entry.expect("manifest entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext == "yaml" || ext == "yml")
+        })
+        .collect();
+    paths.sort();
+
+    let mut alerts = Vec::new();
+    for path in paths {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        for document in serde_yaml::Deserializer::from_str(&text) {
+            let doc = serde_yaml::Value::deserialize(document).unwrap_or_else(|e| {
+                panic!("{} has a document that will not parse: {e}", path.display())
+            });
+            if doc["kind"].as_str() != Some("PrometheusRule") {
+                continue;
+            }
+            for group in doc["spec"]["groups"].as_sequence().into_iter().flatten() {
+                for rule in group["rules"].as_sequence().into_iter().flatten() {
+                    let Some(alert) = rule["alert"].as_str() else {
+                        continue;
+                    };
+                    let labels = rule["labels"]
+                        .as_mapping()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|(k, v)| {
+                            Some((k.as_str()?.to_string(), v.as_str()?.to_string()))
+                        })
+                        .collect();
+                    alerts.push((name.clone(), alert.to_string(), labels));
+                }
+            }
+        }
+    }
+    alerts
+}
+
+/// A rule the platform does not book is a rule that fires into nobody.
+///
+/// Two libraries ship alerts here. The chart's rules are evaluated inside the
+/// application, which writes them into the `alerts` table itself. The
+/// `PrometheusRule` manifests are evaluated by Prometheus, and the small
+/// profile runs no Alertmanager, so their firing exists only on Prometheus's
+/// `ALERTS` face — nobody is told and no row appears. The watcher closes that
+/// gap by copying the alerts that carry the mirror label out of Prometheus into
+/// the same table, which makes two properties load-bearing and neither is
+/// visible from either file alone:
+///
+///   * every manifest alert carries the label pair the config names — a rule
+///     that loses it silently stops being delivered;
+///   * no manifest alert shares a name with a rule the chart evaluates — that
+///     alert would be booked twice, once by each writer, under keys that differ
+///     because each writer reads a different response shape.
+#[test]
+fn every_manifest_alert_is_marked_for_the_mirror() {
+    let value = chart_json();
+    let mirror = &value["observability"]["infra_watch"]["mirror_alerts"];
+    let label = mirror["label"]
+        .as_str()
+        .filter(|l| !l.is_empty())
+        .expect("observability.infra_watch.mirror_alerts.label is missing");
+    let wanted = mirror["value"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .expect("observability.infra_watch.mirror_alerts.value is missing");
+
+    let chart_rule_names: BTreeSet<String> = chart_rules().into_iter().map(|(n, _)| n).collect();
+    let alerts = manifest_alerts();
+    assert!(
+        !alerts.is_empty(),
+        "no alert found in {RULE_MANIFESTS_DIR}, so this gate checked nothing"
+    );
+    let complaints = mirror_complaints(&alerts, label, wanted, &chart_rule_names);
+
+    assert!(
+        complaints.is_empty(),
+        "alerts that fire into nobody, or into two rows at once:\n{}",
+        complaints.join("\n")
+    );
+}
+
+fn mirror_complaints(
+    alerts: &[(String, String, BTreeMap<String, String>)],
+    label: &str,
+    wanted: &str,
+    chart_rule_names: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut complaints = Vec::new();
+    for (file, alert, labels) in alerts {
+        if labels.get(label).map(String::as_str) != Some(wanted) {
+            complaints.push(format!(
+                "{file}: {alert} does not carry {label}=\"{wanted}\", so nothing books its firing"
+            ));
+        }
+        if chart_rule_names.contains(alert) {
+            complaints.push(format!(
+                "{file}: {alert} is also evaluated by the chart, so both writers would book it"
+            ));
+        }
+    }
+    complaints
+}
+
+/// The gate above is aimed at both faults it means to catch: an unmarked alert
+/// and a doubly-booked one. Without this, a predicate that had drifted off
+/// either name would report nothing and look like a fully delivered fleet.
+#[test]
+fn the_mirror_gate_reports_both_the_unmarked_and_the_doubly_booked_alert() {
+    let marked = BTreeMap::from([("cogneva_io_managed".to_string(), "true".to_string())]);
+    let unmarked = BTreeMap::from([("severity".to_string(), "warning".to_string())]);
+    let chart: BTreeSet<String> = ["node_disk_usage_high".to_string()].into_iter().collect();
+    let alerts = vec![
+        ("15-x.yaml".to_string(), "Missing".to_string(), unmarked),
+        (
+            "15-x.yaml".to_string(),
+            "node_disk_usage_high".to_string(),
+            marked.clone(),
+        ),
+        ("15-x.yaml".to_string(), "Fine".to_string(), marked),
+    ];
+    let complaints = mirror_complaints(&alerts, "cogneva_io_managed", "true", &chart);
+    assert_eq!(complaints.len(), 2, "{complaints:#?}");
+    assert!(complaints.iter().any(|c| c.contains("Missing")));
+    assert!(complaints.iter().any(|c| c.contains("both writers")));
+}
+
 /// The alert-delivery counter is written by the same notifier every rule's
 /// notification goes through. A rule that reads `delivered`, `failed` or
 /// `skipped` can therefore be kept firing by its own delivery attempt: the

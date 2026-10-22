@@ -8,6 +8,13 @@
 #
 # 第三条盯通道本身：整个单元死了，上面两条都无从触发——没有样本就没有告警，
 # 这正是「缺席不会告警」的经典形状，所以通道要单独判 `up`。
+#
+# 每条规则都带 `cogneva_io_managed: "true"`：这份文件里的告警由 Prometheus 自己
+# 求值，而这一档没有 Alertmanager，求值出来只有 `ALERTS` 那一面看得见。平台进程每拍
+# 把带这个标签的 firing 告警抄进 `alerts` 表（`observability.infra_watch.mirror_alerts`），
+# 告警面读的正是那张表。**摘掉这个标签等于把这条规则从投递名单里摘掉**——它照样会亮，
+# 但没有人会被告诉。门在 `observability_alert_rule_contract_test`：
+# `every_manifest_alert_is_marked_for_the_mirror`。
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -25,6 +32,7 @@ spec:
           expr: host_reading_producer_up == 0
           for: 10m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "宿主读数生产者 {{ $labels.producer }} 没跑成"
@@ -36,6 +44,7 @@ spec:
           expr: host_reading_producer_unreadable == 1
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "宿主读数生产者 {{ $labels.producer }} 读不到输入"
@@ -46,6 +55,7 @@ spec:
           expr: up{job="cogneva-host-readings"} == 0
           for: 5m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "宿主读数端点抓不到"
@@ -69,6 +79,7 @@ spec:
               > 6 * cogneva_host_credential_surface_period_seconds
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "{{ $labels.source }} 侧的凭证面核对停了，最后一条判词是 {{ $value | humanizeDuration }} 以前"
@@ -89,6 +100,7 @@ spec:
               unless on(source) cogneva_host_credential_surface_period_seconds
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "{{ $labels.source }} 侧读不出节拍，「停了多久」这一条对它判不了"
@@ -102,6 +114,7 @@ spec:
           expr: cogneva_host_credential_surface_measured == 0
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "{{ $labels.source }} 侧的凭证面核对从没跑过"
@@ -119,6 +132,7 @@ spec:
               and on(source) cogneva_host_credential_surface_unreadable == 0
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "{{ $labels.source }} 侧的凭证面与登记表不一致"
@@ -130,6 +144,7 @@ spec:
           expr: cogneva_host_credential_surface_unreadable == 1
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "{{ $labels.source }} 侧的凭证面核对没读成，这一面当前没有判词"
@@ -149,6 +164,7 @@ spec:
           expr: cogneva_backup_package_owner_uid != 1001
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "最新一份已完成的备份包属主是 {{ $value }}，不是 1001"
@@ -159,6 +175,7 @@ spec:
           expr: cogneva_backup_package_reading_state{state="unreadable"} == 1
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "备份包属主这一读数读不到（账本或卷问不出来）"
@@ -170,6 +187,7 @@ spec:
           expr: cogneva_backup_package_reading_state{state="empty"} == 1
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "没有一份已完成的备份包可以恢复"
@@ -181,6 +199,7 @@ spec:
           expr: cogneva_backup_package_age_seconds > 93600
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "最新一份已完成的备份包已经 {{ $value }} 秒（超过 26 小时）"
@@ -199,6 +218,7 @@ spec:
           expr: min by (mountpoint) (disk_trend_days_to_trigger) < 1
           for: 30m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "{{ $labels.mountpoint }} 到构建缓存刹车的触发线不到一天（约 {{ $value }} 天）"
@@ -212,6 +232,7 @@ spec:
           expr: min(disk_trend_trigger_line_readable) == 0
           for: 2h
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "根盘的刹车触发线读不出来（缺 free 序列）"
@@ -239,6 +260,7 @@ spec:
               > 6 * cogneva_host_target_gc_period_seconds
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "宿主构建缓存回收器停了，最后一次运行是 {{ $value | humanizeDuration }} 以前"
@@ -255,6 +277,7 @@ spec:
               unless on() cogneva_host_target_gc_period_seconds
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "读不出回收器的节拍，「它停了多久」这一条判不了"
@@ -266,6 +289,7 @@ spec:
           expr: cogneva_host_target_gc_measured == 0
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "宿主构建缓存回收器从没跑成过一拍照"
@@ -278,6 +302,7 @@ spec:
           expr: cogneva_host_target_gc_script_committed == 0
           for: 1h
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "回收器跑的那份脚本不是 HEAD 里的那一份，它拒绝释放任何缓存"
@@ -289,6 +314,7 @@ spec:
           expr: cogneva_host_target_gc_outcome{outcome="probe_failed"} == 1
           for: 1h
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "有进程读不到属主／工作目录，回收器整轮不释放"
@@ -300,6 +326,7 @@ spec:
           expr: cogneva_host_target_gc_outcome{outcome="floor_unreachable"} == 1
           for: 1h
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "构建缓存已经放到地板之上仍回不去"
@@ -327,6 +354,7 @@ spec:
           expr: cogneva_file_size_census_unjudged > 0
           for: 2h
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "有 {{ $value }} 个越过普查线的 .rs 没有任何一行普查判它"
@@ -338,6 +366,7 @@ spec:
           expr: cogneva_file_size_census_stale > 0
           for: 24h
           labels:
+            cogneva_io_managed: "true"
             severity: info
           annotations:
             summary: "普查里有 {{ $value }} 行描述的文件已经不在那条线上了"
@@ -366,6 +395,7 @@ spec:
           expr: resource_six_column_state{column="conn",state="red"} == 1
           for: 5m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "Redis 的 connected_clients 在最近一个窗口里撞到过 maxclients，新连接会被拒"
@@ -376,6 +406,7 @@ spec:
           expr: resource_six_column_state{column="slot",state="red"} == 1
           for: 5m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "构建槽的占用峰值超过了同一窗口里提供过的最高界"
@@ -398,6 +429,7 @@ spec:
           expr: host_reading_series_undeclared > 0
           for: 1h
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "宿主端点上有 {{ $value }} 条序列不在账本里"
@@ -410,6 +442,7 @@ spec:
           expr: cogneva_verdict_series_unread > cogneva_verdict_series_ceiling
           for: 1h
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "宿主端点上标了判词、却没有规则读的序列涨到了 {{ $value }} 条（超过了已承认的欠账）"
@@ -427,6 +460,7 @@ spec:
           expr: reading_witness_unresolved > 0
           for: 30m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "有 {{ $value }} 面声明要读的读数按名字取不到"
@@ -438,6 +472,7 @@ spec:
           expr: tasks_publishers_agree == 0
           for: 30m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "任务面的发布者对不上"
@@ -449,6 +484,7 @@ spec:
           expr: cogneva_refusal_redispatch_state{state=~"refused_no_redispatch|below_bar|turn_off"} == 1
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "拒绝之后的交回断了（{{ $labels.state }}）"
@@ -460,6 +496,7 @@ spec:
           expr: principle_carriers_slug_no_landing > 0
           for: 1h
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "有 {{ $value }} 条原则载体声明已落，账上查不到落地行"
@@ -483,6 +520,7 @@ spec:
           expr: e2e_ten_rings_failed_settled > 0
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "端到端链有 {{ $value }} 环不是 ok，且不是还在等构建/部署"
@@ -494,6 +532,7 @@ spec:
           expr: e2e_ten_rings_unread > 0
           for: 15m
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "端到端链有 {{ $value }} 环这一拍读不到输入"
@@ -505,6 +544,7 @@ spec:
           expr: e2e_ten_rings_unchecked > 0
           for: 24h
           labels:
+            cogneva_io_managed: "true"
             severity: warning
           annotations:
             summary: "端到端链有 {{ $value }} 环没有判据"

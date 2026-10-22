@@ -179,6 +179,35 @@ pub struct InfraWatchConfig {
     /// 规则仍在 `rules` 里，于是所有按规则集合计数的读者都会把一条**没人求值**的
     /// 规则算进去。名单是负空间，规则集合只装真在跑的那些。
     pub retired_rules: Vec<String>,
+    /// Which Prometheus-evaluated alerts to copy into the same persisted table.
+    ///
+    /// This table's primary writer is the loop below: it evaluates `rules`
+    /// itself and books what it sees. Rules that live in a PrometheusRule
+    /// (`deploy/k3s/observability/manifests/*.yaml`) are evaluated by
+    /// Prometheus instead, and their firing exists only on its `ALERTS` face.
+    /// With no Alertmanager in the cluster that is where the chain stops: the
+    /// rule fires, no row appears, nothing is told to anyone, and the only way
+    /// to see it is to open the Prometheus UI at the right moment.
+    ///
+    /// One label pair says which of those alerts belong in this table. It is
+    /// carried by the rules themselves rather than listed here, so a rule and
+    /// its delivery claim travel in the same edit and a rename cannot silently
+    /// drop the delivery. Alerts whose name is already one of `rules` are
+    /// skipped: the in-process evaluation books those, and two writers keyed
+    /// differently would open two rows for one incident. `None` mirrors
+    /// nothing, which is what a deployment without PrometheusRule-owned
+    /// alerts wants.
+    pub mirror_alerts: Option<AlertMirrorConfig>,
+}
+
+/// The label pair marking a Prometheus-evaluated alert as one this platform
+/// books. See [`InfraWatchConfig::mirror_alerts`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertMirrorConfig {
+    /// Label name as Prometheus sees it: a `cogneva.io/managed` rule label
+    /// arrives here as `cogneva_io_managed`.
+    pub label: String,
+    pub value: String,
 }
 
 impl Default for InfraWatchConfig {
@@ -190,6 +219,7 @@ impl Default for InfraWatchConfig {
             eval_failure_alert_after: 3,
             rules: Vec::new(),
             retired_rules: Vec::new(),
+            mirror_alerts: None,
         }
     }
 }

@@ -209,6 +209,15 @@ defaultRules:
     # 由下面的 additionalPrometheusRulesMap 按现网真有的
     # prometheus_sd_kubernetes_failures_total 重写同名规则。
     PrometheusSDRefreshFailure: true
+    # 这一档不装 Alertmanager，于是 chart 里「没接到 Alertmanager」那条规则
+    # 从安装第一秒起就为真、永远在响——它报的不是故障，是本档的设计。真正该问的
+    # 是「Prometheus 求值出来的告警有没有到人手上」：本仓的 PrometheusRule 规则
+    # 都带 `cogneva_io_managed="true"`，平台进程每拍把它们抄进 `alerts` 表
+    # （`observability.infra_watch.mirror_alerts`），WebUI 的告警面读的正是这张表。
+    # chart 自带的其余告警不抄（没这个标签），所以「第三方规则没有投递」这件事
+    # 在这一档仍然是事实——只是不该由一条恒红的规则来说。上全量档（有真的
+    # Alertmanager 与接收端）时删掉这一行。
+    PrometheusNotConnectedToAlertmanagers: true
 
 # ─── 补回被关掉的规则 ─────────────────────────────────────────────
 # 只放需要重写的规则；其余默认规则保持 chart 原样。
