@@ -29,9 +29,14 @@
 #     tag itself, which is the tree's identity rather than cache data. Cargo
 #     writes that file once, when it makes the tree, and never writes it again:
 #     a run that removed it would leave a cache no later run can judge and no
-#     rebuild repairs. A tree that looks like a cache and has no tag is named in
-#     the reading, never guessed at -- the tag is the evidence, and a blind spot
-#     is a thing the reader has to be able to see;
+#     rebuild repairs. The name is not evidence in the other direction either:
+#     a tree cargo put at another name (`--target-dir`, `CARGO_TARGET_DIR`) is
+#     the same cache and leaves on the same guards, with cargo's layout file
+#     required as a second witness because the tag signature is a published
+#     convention that fontconfig and man carry as well. A tree that looks like a
+#     cache and has no tag is named in the reading, never guessed at -- the tag
+#     is the evidence, and a blind spot is a thing the reader has to be able to
+#     see;
 #   - deletes only on the filesystem the trigger was read from, and only inside
 #     a directory carrying that tag: freeing another filesystem would not move
 #     the reading that fired, and the tag is what makes a directory cargo's
@@ -340,6 +345,25 @@ looks_like_cargo_cache() {
     [ -f "$1/.rustc_info.json" ]
 }
 
+in_bound() {
+    [ -n "${bound}" ] || return 0
+    case "$1" in
+    "${bound}" | "${bound}"/*) return 0 ;;
+    esac
+    return 1
+}
+
+# Sorted order puts an ancestor before everything under it, so one pass with the
+# ancestors already kept is enough. A tree inside a candidate is that candidate's
+# bytes: the profile tier of the outer one takes the inner one with it, and one
+# cache counted twice makes the floor arithmetic believe there are two.
+drop_nested() {
+    awk '
+        { for (i = 1; i <= n; i++) if (index($0, keep[i] "/") == 1) next
+          keep[++n] = $0
+          print }'
+}
+
 find_candidates() { # file to list the cache-like trees that carry no tag
     # Every cargo cache on the filesystem the trigger was read from, not only
     # the ones under one configured directory. A second checkout is a checkout:
@@ -349,35 +373,86 @@ find_candidates() { # file to list the cache-like trees that carry no tag
     # from. Which caches exist is a fact about the disk; which ones someone
     # remembered to configure is not.
     #
+    # The same argument applies to the directory's name, which this enumeration
+    # used to require as well. Cargo's tag is the statement that a directory is a
+    # cache; `target` is only the name it happens to use by default. A checkout
+    # built with `--target-dir` or `CARGO_TARGET_DIR` makes the same cache under
+    # another name, and on this host a measured 11 such trees (~46 GiB) sat
+    # outside a candidate list that asked for the name -- every run read
+    # `caches=25` while 46 GiB of the same kind of thing was on the same disk.
+    # A release set narrower than the set of caches the run itself can see is a
+    # mechanism that stops short of its own reading.
+    #
+    # What replaces the name as the second witness is cargo's layout file. The
+    # tag's signature is the one the CACHEDIR.TAG convention publishes -- font
+    # config and man carry it too -- so the tag alone identifies "a directory
+    # declaring itself a cache"; `.rustc_info.json` is what says which cache.
+    # Named `target` the tag alone still decides, as it always did.
+    #
     # `${scan_depth}` is the reach this enumeration always had -- a worktree
     # nested inside a repository -- measured from where it now starts, so
-    # widening the start did not narrow the reach. `-xdev` keeps the scan on the
-    # judged filesystem: a cache on another one cannot move the reading that
-    # fired, and freeing it would escalate for nothing.
+    # widening the start did not narrow the reach. It is measured to the cache
+    # directory, and these walks match a file inside it, so they go one level
+    # deeper than the depth they promise. `-xdev` keeps the scan on the judged
+    # filesystem: a cache on another one cannot move the reading that fired, and
+    # freeing it would escalate for nothing.
     #
-    # Sorted, because the order decides which trees are reached before the floor
-    # ends the pass, and readdir order is a property of the filesystem rather
-    # than of any decision: two machines in the same state would release
-    # different files. The locale is pinned with it so the order is the bytes.
-    find "${scan_root}" -xdev -maxdepth "${scan_depth}" -type d -name target -prune -print 2>/dev/null |
-        LC_ALL=C sort |
+    # Both walks share the run's scope, so what they read is carried as one
+    # coverage note: `0` from a walk that was only allowed to see half the disk
+    # must not read like `0` from a walk that saw all of it.
+    local rc=0 coverage scan_ok=1
+    coverage="${scan_root}:${scan_depth}"
+    [ -z "${bound}" ] || coverage="${bound}~bound:${scan_root}:${scan_depth}"
+    # One traversal for both witnesses: this walk covers the judged filesystem,
+    # and every run makes it, so asking twice costs a whole second pass over
+    # every file on the disk.
+    find "${scan_root}" -xdev -maxdepth "$((scan_depth + 1))" \
+        \( -name CACHEDIR.TAG -o -name .rustc_info.json \) -printf '%f\t%h\n' \
+        >"${released_dir}/found" 2>"${released_dir}/found.err" || rc=$?
+    awk -F'\t' '$1 == "CACHEDIR.TAG" { print $2 }' "${released_dir}/found" |
+        LC_ALL=C sort -u >"${released_dir}/tagged"
+    awk -F'\t' '$1 == ".rustc_info.json" { print $2 }' "${released_dir}/found" |
+        LC_ALL=C sort -u >"${released_dir}/shaped"
+    # The two ways a walk falls short are spelled differently: a walk that could
+    # not read some subtrees still returns something (find says 1, which is what
+    # walking `/` as this user always says), and a walk that aborted (find >1)
+    # returns nothing that may be read as a count.
+    if [ "${rc}" -gt 1 ]; then
+        coverage="${coverage}!failed(rc=${rc})"
+        scan_ok=0
+    elif [ "${rc}" -eq 1 ]; then
+        coverage="${coverage}~partial"
+        scan_ok=0
+    fi
+    printf '%s\n%s' "${coverage}" "${scan_ok}" >"${released_dir}/scan_coverage"
+
+    {
         while IFS= read -r dir; do
-            if [ -n "${bound}" ]; then
-                case "${dir}" in
-                "${bound}" | "${bound}"/*) ;;
-                *) continue ;;
-                esac
+            [ -n "${dir}" ] || continue
+            in_bound "${dir}" || continue
+            is_cargo_cache "${dir}" || continue
+            if [ "${dir##*/}" != target ]; then
+                looks_like_cargo_cache "${dir}" || continue
             fi
-            if is_cargo_cache "${dir}"; then
-                printf '%s\n' "${dir}"
-            elif looks_like_cargo_cache "${dir}"; then
-                # Off the candidate list and onto a side channel: the list is
-                # this function's stdout, and a path that is not a candidate
-                # must never be read as one.
-                printf '%s\t%s\n' "${dir}" \
-                    "$(human_kb "$(du -sk -- "${dir}" 2>/dev/null | cut -f1)")" >>"$1"
-            fi
-        done
+            printf '%s\n' "${dir}"
+        done <"${released_dir}/tagged"
+        while IFS= read -r dir; do
+            [ -n "${dir}" ] || continue
+            in_bound "${dir}" || continue
+            is_cargo_cache "${dir}" && continue
+            # Off the candidate list and onto a side channel: the list is this
+            # function's stdout, and a path that is not a candidate must never
+            # be read as one.
+            printf '%s\t%s\n' "${dir}" \
+                "$(human_kb "$(du -sk -- "${dir}" 2>/dev/null | cut -f1)")" >>"$1"
+        done <"${released_dir}/shaped"
+    } |
+        # Sorted, because the order decides which trees are reached before the
+        # floor ends the pass, and readdir order is a property of the filesystem
+        # rather than of any decision: two machines in the same state would
+        # release different files. The locale is pinned with it so the order is
+        # the bytes.
+        LC_ALL=C sort -u | drop_nested
 }
 
 # --- release -----------------------------------------------------------------
@@ -551,12 +626,12 @@ release_tier() { # tier, target
     esac
 }
 
-write_state() { # outcome, released_kb, gap_pct, targets, skipped, unreadable, unlabelled, deferred_tier, deferred_need_pct, out_of_band
+write_state() { # outcome, released_kb, gap_pct, targets, skipped, unreadable, unlabelled, deferred_tier, deferred_need_pct, tag_reached
     mkdir -p -- "$(dirname -- "${state_file}")"
     local tmp
     tmp="$(mktemp "${state_file}.XXXXXX")"
     cat >"${tmp}" <<EOF
-{"last_run":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","outcome":"$1","trigger_pct":${trigger_pct},"floor_pct":${floor_pct},"used_pct_before":${before_pct},"used_pct_after":${disk_pct},"released_bytes":$(( $2 * 1024 )),"gap_pct":$3,"targets":$4,"skipped":$5,"unreadable":$6,"unlabelled":$7,"deferred_tier":"$8","deferred_need_pct":${9:-null},"out_of_band":${10:-0},"out_of_band_scan":"${out_of_band_scan:-}","dry_run":${dry_run},"rev":"${script_rev}","rev_state":"${script_state}","script":"${script_sha}"}
+{"last_run":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","outcome":"$1","trigger_pct":${trigger_pct},"floor_pct":${floor_pct},"used_pct_before":${before_pct},"used_pct_after":${disk_pct},"released_bytes":$(( $2 * 1024 )),"gap_pct":$3,"targets":$4,"skipped":$5,"unreadable":$6,"unlabelled":$7,"deferred_tier":"$8","deferred_need_pct":${9:-null},"tag_reached":${10:-0},"scan":"${scan_coverage:-}","dry_run":${dry_run},"rev":"${script_rev}","rev_state":"${script_state}","script":"${script_sha}"}
 EOF
     mv -f -- "${tmp}" "${state_file}"
 }
@@ -566,16 +641,16 @@ EOF
 # stopped, which tier it held back and what that tier is waiting for, and which
 # version of this file produced the reading -- the last one is what makes any of
 # the others reviewable later.
-report() { # outcome, released_kb, covered, skipped, unreadable, unlabelled, deferred_tier, deferred_need_pct, out_of_band
+report() { # outcome, released_kb, covered, skipped, unreadable, unlabelled, deferred_tier, deferred_need_pct, tag_reached
     local gap=0
     [ "${disk_pct}" -gt "${floor_pct}" ] && gap=$((disk_pct - floor_pct))
-    local oob="${9:-0}"
-    printf 'target-gc: outcome=%s trigger=%s%% floor=%s%% before=%s%% after=%s%% released=%s gap=%s%% caches=%s skipped=%s unlabelled=%s unreadable=%s out_of_band=%s out_of_band_scan=%s deferred_tier=%s deferred_need_pct=%s rev=%s rev_state=%s script=%s\n' \
+    local reached="${9:-0}"
+    printf 'target-gc: outcome=%s trigger=%s%% floor=%s%% before=%s%% after=%s%% released=%s gap=%s%% caches=%s skipped=%s unlabelled=%s unreadable=%s tag_reached=%s scan=%s deferred_tier=%s deferred_need_pct=%s rev=%s rev_state=%s script=%s\n' \
         "$1" "${trigger_pct}" "${floor_pct}" "${before_pct}" "${disk_pct}" \
-        "$(human_kb "$2")" "${gap}" "$3" "$4" "$6" "$5" "${oob}" \
-        "${out_of_band_scan:-}" "${7:-}" "${8:-}" \
+        "$(human_kb "$2")" "${gap}" "$3" "$4" "$6" "$5" "${reached}" \
+        "${scan_coverage:-}" "${7:-}" "${8:-}" \
         "${script_rev}" "${script_state}" "${script_sha}"
-    write_state "$1" "$2" "${gap}" "$3" "$4" "$5" "$6" "${7:-}" "${8:-}" "${oob}"
+    write_state "$1" "$2" "${gap}" "$3" "$4" "$5" "$6" "${7:-}" "${8:-}" "${reached}"
 }
 
 # --- run ---------------------------------------------------------------------
@@ -656,13 +731,33 @@ trap 'rm -rf -- "${released_dir}"' EXIT
 # show a tree that stopped being visible, which is how a cache drifts out of
 # reach without anyone noticing.
 mapfile -t candidates < <(find_candidates "${released_dir}/unlabelled")
+# The scope both walks read, carried to the reading next to `caches=`: a count
+# from a walk that could only see part of the disk is still a reading of what it
+# covered, but it is not the same statement as a count from a walk that saw it
+# all, and only this string tells them apart.
+scan_coverage=""
+scan_ok=1
+if [ -s "${released_dir}/scan_coverage" ]; then
+    { read -r scan_coverage; read -r scan_ok; } <"${released_dir}/scan_coverage" || true
+fi
+readonly scan_coverage scan_ok
 skipped=0
 covered=0
+tag_reached_file="${released_dir}/tag_reached"
+: >"${tag_reached_file}"
 for target in "${candidates[@]}"; do
     if [ "$(fs_identity "${target}")" != "${work_fs}" ]; then
         log "skipping ${target}: another filesystem (the trigger was read from ${work_root})"
         skipped=$((skipped + 1))
         continue
+    fi
+    # Which candidates came in on the tag rather than on the name. Both are
+    # releasable; a reader still has to be able to see how much of the release
+    # set is outside the conventional name, because that is the part a run of an
+    # older version of this script could not see at all.
+    if [ "${target##*/}" != target ]; then
+        printf '%s\t%s\n' "${target}" \
+            "$(human_kb "$(du -sk -- "${target}" 2>/dev/null | cut -f1)")" >>"${tag_reached_file}"
     fi
     covered=$((covered + 1))
 done
@@ -682,77 +777,23 @@ if [ -s "${released_dir}/unlabelled" ]; then
 fi
 
 # The mirror of the reading above. That one names cache-like trees the
-# enumeration saw and could not judge; this one names cargo's trees that the
-# enumeration never looked at, because it only walks directories named `target`.
-# The two counts together are what "how much sits outside the candidate set"
-# means; a count of candidates alone cannot say it, and reads like a statement
-# about the whole disk.
-#
-# Both evidence files are required. The tag alone is not enough: the signature it
-# carries is the one the CACHEDIR.TAG convention publishes, so fontconfig and man
-# carry it too, and a reading that called those cargo caches would be off by a
-# category. Cargo's own layout file is what separates them.
-#
-# Reading only: nothing here widens what a run may release. Widening the set is a
-# separate decision, because the same enumeration would then reach trees this
-# script has no business deleting.
-out_of_band_file="${released_dir}/out_of_band"
-: >"${out_of_band_file}"
-# What the reading covers, carried with it. `out_of_band=0` has to mean "I
-# looked there and found none", never "I did not look there" -- so the root and
-# the reach travel with the count. The two ways a walk falls short are spelled
-# differently too: a walk that could not read some subtrees still returns
-# something (find says 1, which is what walking `/` as this user always says),
-# and a walk that aborted (find >1) returns nothing that may be read as a count.
-out_of_band_scan="${scan_root}:${scan_depth}"
-[ -z "${bound}" ] || out_of_band_scan="${bound}~bound:${scan_root}:${scan_depth}"
-if [ -n "${scan_root}" ] && [ -n "${scan_depth}" ]; then
-    tags_file="${released_dir}/out_of_band.tags"
-    find_rc=0
-    find "${scan_root}" -xdev -maxdepth "${scan_depth}" -name CACHEDIR.TAG -printf '%h\n' \
-        >"${tags_file}" 2>"${released_dir}/out_of_band.err" || find_rc=$?
-    case "${find_rc}" in
-    0) ;;
-    1)
-        out_of_band_scan="${out_of_band_scan}~partial"
-        log "the out-of-band walk under ${scan_root} could not read every subtree (some paths are unreadable to this user); the count covers what it could read"
-        ;;
-    *)
-        out_of_band_scan="${out_of_band_scan}!failed(rc=${find_rc})"
-        log "the out-of-band walk under ${scan_root} aborted (rc=${find_rc}): the count is not a reading of this filesystem$(head -1 "${released_dir}/out_of_band.err" 2>/dev/null | sed 's/^/: /')"
-        ;;
-    esac
-    if [ "${find_rc}" -le 1 ]; then
-        LC_ALL=C sort -u "${tags_file}" |
-            while IFS= read -r dir; do
-                [ -n "${dir}" ] || continue
-                [ "${dir##*/}" = target ] && continue
-                # A narrowed run reads the scope it was narrowed to: the count
-                # sits next to `caches=`, and two numbers about two different
-                # scopes in one line invite the wrong comparison.
-                if [ -n "${bound}" ]; then
-                    case "${dir}" in
-                    "${bound}" | "${bound}"/*) ;;
-                    *) continue ;;
-                    esac
-                fi
-                is_cargo_cache "${dir}" || continue
-                looks_like_cargo_cache "${dir}" || continue
-                printf '%s\t%s\n' "${dir}" \
-                    "$(human_kb "$(du -sk -- "${dir}" 2>/dev/null | cut -f1)")"
-            done >"${out_of_band_file}"
-    fi
+# enumeration saw and could not judge; this one names the candidates that came
+# in on the tag rather than on the name. Both are releasable; the split is what
+# lets a reader see how much of the release set is outside the conventional
+# name, which is exactly the part a run of an older version could not see at
+# all.
+if [ "${scan_ok}" != 1 ]; then
+    log "the enumeration under ${scan_root} did not cover all of it (${scan_coverage}): the counts below describe what it could read"
 fi
-readonly out_of_band_scan
-out_of_band=0
-if [ -s "${out_of_band_file}" ]; then
-    out_of_band="$(wc -l <"${out_of_band_file}")"
-    log "${out_of_band} cargo cache tree(s) the candidate list never walks (it only visits directories named target), scanned under ${out_of_band_scan}:"
-    head -n 5 "${out_of_band_file}" |
+tag_reached=0
+if [ -s "${tag_reached_file}" ]; then
+    tag_reached="$(wc -l <"${tag_reached_file}")"
+    log "${tag_reached} of ${covered} releasable tree(s) carry cargo's tag at a name other than target (--target-dir trees); they leave on the same guards:"
+    head -n 5 "${tag_reached_file}" |
         while IFS=$'\t' read -r path size; do
-            log "  ${path}: ${size} on disk, tagged and cargo-shaped, not named target"
+            log "  ${path}: ${size} on disk, tagged and cargo-shaped"
         done
-    [ "${out_of_band}" -le 5 ] || log "  (+$((out_of_band - 5)) more)"
+    [ "${tag_reached}" -le 5 ] || log "  (+$((tag_reached - 5)) more)"
 fi
 
 if [ "${disk_pct}" -lt "${trigger_pct}" ]; then
@@ -763,7 +804,7 @@ if [ "${disk_pct}" -lt "${trigger_pct}" ]; then
     # triggered runs report.
     if [ "${dry_run}" != 1 ]; then
         log "below trigger: ${disk_pct}% used, trigger ${trigger_pct}%"
-        report below_trigger 0 "${covered}" "${skipped}" 0 "${unlabelled}" "" "" "${out_of_band}"
+        report below_trigger 0 "${covered}" "${skipped}" 0 "${unlabelled}" "" "" "${tag_reached}"
         exit 0
     fi
     log "below trigger: ${disk_pct}% used, trigger ${trigger_pct}% -- this is a dry run, so the plan below is what a run would do on the day the trigger is reached"
@@ -773,7 +814,7 @@ if [ "${covered}" -eq 0 ]; then
     log "nothing to release: ${disk_pct}% used, trigger ${trigger_pct}%, no cargo cache under ${searched} -- the cache is not what is filling this filesystem$(
         [ "${unlabelled}" -eq 0 ] || printf ', and %s tree(s) that look like caches cannot be judged at all' "${unlabelled}"
     )"
-    report floor_unreachable 0 "${#candidates[@]}" "${skipped}" 0 "${unlabelled}" "" "" "${out_of_band}"
+    report floor_unreachable 0 "${#candidates[@]}" "${skipped}" 0 "${unlabelled}" "" "" "${tag_reached}"
     exit 0
 fi
 
@@ -893,4 +934,4 @@ fi
 # One site prints the reading and writes the state: two of them would be two
 # chances for a field to exist in one and not the other.
 report "${outcome}" "${released_kb}" "${covered}" "${skipped}" "${unreadable:-0}" "${unlabelled}" \
-    "${deferred_tier}" "${deferred_need_pct}" "${out_of_band}"
+    "${deferred_tier}" "${deferred_need_pct}" "${tag_reached}"
