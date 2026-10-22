@@ -25,6 +25,7 @@ pub mod knowledge;
 pub mod kv;
 pub mod live_revision;
 pub mod llm;
+pub mod loop_health;
 pub mod media;
 pub mod memory;
 pub mod metric_help;

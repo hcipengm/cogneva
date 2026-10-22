@@ -339,7 +339,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use crate::loop_health::{Cadence, LoopHealth};
+    use crate::contract::loop_health::Cadence;
+    use crate::loop_health::LoopHealth;
 
     /// A lease whose answers are written by the test.
     struct Scripted {
