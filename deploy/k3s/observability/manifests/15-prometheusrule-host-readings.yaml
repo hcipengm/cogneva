@@ -380,3 +380,37 @@ spec:
           annotations:
             summary: "构建槽的占用峰值超过了同一窗口里提供过的最高界"
             description: "这是准入放过了一个越界的请求，不是「槽很忙」：忙碌的代理是 holder_seconds 那一列，它只报不判。两侧都是窗口极值（窗口多长读 `resource_six_column_window_seconds`）——拿整窗的占用峰值比此刻的界会因为「界忙时降、闲时爬」而假红，所以这一格只在占用确实越过了那一天提供过的最高界时才红。查构建闸的准入判据与它读的界是不是同一份（`RESERVE_FRESH` 不是持有上限）。"
+
+    # 这条链最前面那本账的两个方向。
+    #
+    # 账本是 `cogneva-brain/scripts/data/host-readings.tsv`（只此一本）：一行一个生产者，
+    # 第四列列出它发的每一条序列，判词后缀 `=verdict`。下面两条读的是这本账自己有没有
+    # 漏人——一条管「端点上的序列在不在账上」，一条管「账上标了判词的有没有读者」。
+    #
+    # 为什么它们必须在规则里而不是只在脚本里：没有读者这件事本身与「这一面压根没写生产者」
+    # 在读数面上逐字同形（都是一条决定也不产生）。把「还剩几条判词没人读」做成序列，再让
+    # 一条规则读它，这个缺口才有闭合的可能。
+    - name: cogneva-host-readings-ledger
+      rules:
+        # 印了却没在账上登记：有人悄悄加了一条序列，或者账本漏了一行。两条都得有人补，
+        # 所以它没有「承认的欠账」一说——补一行是零成本的，不像补一条读者那样要设计。
+        - alert: CognevaHostReadingSeriesUndeclared
+          expr: host_reading_series_undeclared > 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "宿主端点上有 {{ $value }} 条序列不在账本里"
+            description: "这些序列每一拍都在被采集，但 `scripts/data/host-readings.tsv` 那一行没有登记它们——所以没人说得清端点上一共有多少条、新加的有没有人读。跑 `bash scripts/host/cogneva-host-readings.sh`（key=value 模式）会逐条点名 `undeclared producer=… series=…`：把它们补进那个生产者所在行的第四列。别用加一行新生产者的办法绕过——那会让同一批序列有两个名字。"
+
+        # 涨过承认的欠账才是新闻。写成 `> 0` 会在第一天就常红（今天就有十几条判词没有读者，
+        # 它们分属不同面、要逐个设计规则），而常红等于没有：整条告警会被静音掉，包括它本该
+        # 报的那一次增长。上限写在账本表头里（`unread_ceiling=N`），只许变小。
+        - alert: CognevaVerdictSeriesUnread
+          expr: cogneva_verdict_series_unread > cogneva_verdict_series_ceiling
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "宿主端点上标了判词、却没有规则读的序列涨到了 {{ $value }} 条（超过了已承认的欠账）"
+            description: "账本里标 `=verdict` 的序列，在 `deploy/` 下任何一个规则文件里都找不到名字。判词没有读者＝这封信没人收：它红的时候什么都不会发生，与「这一面没在判」完全同形。跑 `bash scripts/host/cogneva-verdict-readers-reading.sh` 逐条点名（`unread_member name=… producer=…`），然后要么给那条判词立一条规则（真有人按它动手），要么把它从 `=verdict` 拿掉（它是值，被人看就够了）——两种修法都要顺手把账本表头的 `unread_ceiling` 调回实测值，只许变小。"

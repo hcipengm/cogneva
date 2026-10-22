@@ -361,6 +361,8 @@ NO_POD_REPORTER = {
     'CognevaHostTargetGcProbeFailed': 'cogneva_host_target_gc_outcome{outcome="probe_failed"}',
     'CognevaHostTargetGcFloorUnreachable': 'cogneva_host_target_gc_outcome{outcome="floor_unreachable"}',
     'CognevaFileSizeCensusUnjudged': 'cogneva_file_size_census_unjudged',
+    'CognevaHostReadingSeriesUndeclared': 'host_reading_series_undeclared',
+    'CognevaVerdictSeriesUnread': 'cogneva_verdict_series_unread',
     'CognevaFileSizeCensusStale': 'cogneva_file_size_census_stale',
     'CognevaResourceSixColumnConnExhausted': 'resource_six_column_state{column="conn",state="red"}',
     'CognevaResourceSixColumnSlotOverAdmitted': 'resource_six_column_state{column="slot",state="red"}',

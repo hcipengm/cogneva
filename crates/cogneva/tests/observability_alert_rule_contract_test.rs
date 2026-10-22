@@ -1362,6 +1362,18 @@ const FOREIGN: &[(&str, &str)] = &[
         "resource_six_column_state",
         "宿主读数 `scripts/host/cogneva-resource-six-column-reading.sh`（私有仓 brain）的逐列判词，one-hot 带 `column` 与 `state` 标签：rss／redis_mem／conn／oomkill／restarts／slot。六格里有四格的界归别的规则（`container_memory_near_limit` 的 0.81、`redis_memory_near_limit` 的 0.90、`pod_oom_killed`、`pod_restarting_*`），本仓库只有 conn（撞 maxclients）与 slot（占用越过窗口内提供过的最高界）两格此前没有任何读者，所以规则只读这两格。每一列都是**窗口极值**算出来的判词，窗口长度由同一生产者发的 `resource_six_column_window_seconds` 声明",
     ),
+    (
+        "host_reading_series_undeclared",
+        "宿主聚合器 `scripts/host/cogneva-host-readings.sh`（私有仓 brain）自己发的一条：端点上有、而登记表那一行的第四列没登记多少条序列。账本只有一本（`scripts/data/host-readings.tsv`），这格就是它漏人的方向——印了却没登记。修法是把名字补进那一行（零成本），所以它没有「承认的欠账」：与下面那条方向相反，那一格是登记了却没人读",
+    ),
+    (
+        "cogneva_verdict_series_unread",
+        "宿主读数 `scripts/host/cogneva-verdict-readers-reading.sh`（私有仓 brain）：登记表里标了 `=verdict`、却在 `deploy/` 下任何一个规则文件里都找不到名字的条数。它与「这一面压根没写生产者」在读数面上同形（都是一条决定也不产生）。判红的是「涨过表头声明的 `unread_ceiling`」（下面那条），不是「大于 0」：今天就有十几条判词没有读者，写成 `> 0` 会让整条告警从第一天起常红",
+    ),
+    (
+        "cogneva_verdict_series_ceiling",
+        "同一生产者：登记表表头里写下的、已经承认的欠账条数。它是这条判据的**另一半**，不是一个可调的界——只许跟着实测值往下走（补上一条读者就减一）。做成第二条序列而不是写进规则表达式，是因为它属于账本，而账本在私有仓；规则里写死一个数，账本一改两边就各说各话",
+    ),
     ("up", "Prometheus 采集目标存活序列"),
 ];
 
