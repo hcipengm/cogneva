@@ -51,6 +51,16 @@ const KEY: &str = "\"capabilities\":";
 /// new line.
 const KNOWN: &[(&str, usize, &str)] = &[
     (
+        "crates/cog-agent/src/tools.rs",
+        1,
+        "a roster entry, not an advertisement: `list_agents` echoes each \
+         registered agent's own `capabilities` exactly as the registry holds \
+         them, which is the same field the send path checks before publishing. \
+         Nothing in it claims what this process can be asked to do, and there \
+         is no serving table to build it from -- the value belongs to the agent \
+         it describes, not to the server returning it",
+    ),
+    (
         "crates/cog-protocol/src/a2a.rs",
         1,
         "test fixture: the wire shape a client parses back into an agent card",
