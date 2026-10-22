@@ -379,10 +379,11 @@ grep -q 'no CACHEDIR.TAG' <<<"${out}" \
 # --- 8c) a cache at another name is a cache: the tag is the evidence ----------
 # The candidate list used to be "directories named target that carry the tag",
 # and the name is the part that is not evidence. Eleven real trees on this host
-# sit outside it purely on that account (~46 GiB), so a run that reported only
-# `caches=` said "this is the whole disk's worth of cache" while 46 GiB of the
-# same kind of thing was absent from every reading. Cargo's tag is what makes a
-# directory a cache; `target` is only the name it uses by default.
+# sit outside it purely on that account (a measured ~46 GiB), so a run that
+# reported only `caches=` said "this is the whole disk's worth of cache" while
+# a measured 46 GiB of the same kind of thing was absent from every reading.
+# Cargo's tag is what makes a directory a cache; `target` is only the name it
+# uses by default.
 #
 # The tag is not the only witness, either. Its signature is the one the
 # CACHEDIR.TAG convention publishes, so fontconfig and man carry it as well; a

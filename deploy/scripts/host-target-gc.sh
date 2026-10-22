@@ -379,7 +379,8 @@ find_candidates() { # file to list the cache-like trees that carry no tag
     # built with `--target-dir` or `CARGO_TARGET_DIR` makes the same cache under
     # another name, and on this host a measured 11 such trees (~46 GiB) sat
     # outside a candidate list that asked for the name -- every run read
-    # `caches=25` while 46 GiB of the same kind of thing was on the same disk.
+    # `caches=25` while a measured 46 GiB of the same kind of thing was on the
+    # same disk.
     # A release set narrower than the set of caches the run itself can see is a
     # mechanism that stops short of its own reading.
     #
