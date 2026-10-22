@@ -343,24 +343,23 @@ spec:
     # 两条分开：磨到界是**排期换盘**；SMART 自己举手（介质错误 / critical warning）是
     # **立刻换盘**——后者与磨到多少无关，一块用了 12% 的盘也可能已经在掉块。
     #
-    # 界不是这里写死的数，是读数自己导出的 `cogneva_host_nvme_wear_limit_pct`：
-    # 100 − 提前期天数 × 这块盘的日磨损速率，夹在 [1,99]。写死一个百分比的毛病是它把
-    # 「还剩多少寿命」与「还要多久到」混成一个数——一块 0.05 %/天的盘在 80% 上还剩 400 天，
-    # 一块 0.8 %/天的盘在 80% 上只剩 25 天，同一个 80 对后者已经太晚。规则只在两边都有
-    # 这个 device 时比（`on(device)`）：界缺席的盘不报磨损，只由「读不到」那条接住。
+    # 界不是这里写死的数，而是读数自己导出的余量 `cogneva_host_nvme_wear_headroom_pct`：
+    # 界（100 − 提前期天数 × 这块盘的日磨损速率，夹在 [1,99]）减去已用，负数即越界。
+    # 写死一个百分比的毛病是它把「还剩多少寿命」与「还要多久到」混成一个数——一块
+    # 0.05 %/天的盘在 80% 上还剩 400 天，一块 0.8 %/天的盘在 80% 上只剩 25 天，同一个 80
+    # 对后者已经太晚。发余量而不是界本身，是因为余量一个比较就能判：界与已用两条序列做
+    # `on(device)` 连接的话，标签集一旦对不上就是静默的空结果，而清单里的连接形状没有门在读。
     - name: cogneva-host-nvme-wear
       rules:
         - alert: CognevaHostNvmeWearHigh
-          expr: |
-            cogneva_host_nvme_percentage_used
-              >= on(device) cogneva_host_nvme_wear_limit_pct
+          expr: cogneva_host_nvme_wear_headroom_pct < 0
           for: 1h
           labels:
             cogneva_io_managed: "true"
             severity: warning
           annotations:
-            summary: "NVMe {{ $labels.device }} 已磨损 {{ $value }}%：按它自己的速率，剩余寿命不足一个换盘提前期"
-            description: "界来自读数 `cogneva_host_nvme_wear_limit_pct{device=\"{{ $labels.device }}\"}`：100 减去提前期天数乘这块盘的日磨损速率。2026-10-22 实测这块盘 8%、通电 779 小时 ⇒ 约 0.25 %/天，90 天提前期下界在 77.5%。来源标签 source 说清界是导出的（derived）、刚上机的退路（default，固定 80）还是人钉的（override）。这个数只增不减，没有补救动作，只能排期换盘。要知道还剩多久，读 `cogneva_host_nvme_wear_rate_pct_per_day`——它才是「还剩多少天」的分母。"
+            summary: "NVMe {{ $labels.device }} 的磨损余量是 {{ $value }}%：按它自己的速率，剩余寿命已不足一个换盘提前期"
+            description: "余量 = 界 − 已用，界是 100 减去提前期天数乘这块盘的日磨损速率。2026-10-22 实测这块盘 8%、通电 779 小时 ⇒ 约 0.246 %/天，90 天提前期下界在 77.85%，余量 69.85。来源标签 source 说清界是导出的（derived）、刚上机的退路（default，固定 80）还是人钉的（override），退路不许装作导出的。这个数只会往下走，没有补救动作，只能排期换盘。要知道按当前速率还剩多少天，用余量除以 `cogneva_host_nvme_wear_rate_pct_per_day`。"
 
         # 「突然变得更快」是另一件事：界回答「还够不够一个提前期」，这一条回答
         # 「这块盘是不是刚换了一种用法」。近 6 小时的窗口速率压过它自己一生的平均速率
@@ -369,7 +368,7 @@ spec:
         - alert: CognevaHostNvmeWearAccelerating
           expr: |
             (deriv(cogneva_host_nvme_percentage_used[6h]) * 86400)
-              > on(device) (cogneva_host_nvme_wear_rate_pct_per_day * 2)
+              > (cogneva_host_nvme_wear_rate_pct_per_day * 2)
             and
             (deriv(cogneva_host_nvme_percentage_used[6h]) * 86400) > 0.1
           for: 30m
