@@ -39,7 +39,7 @@ spec:
             severity: warning
           annotations:
             summary: "有 {{ $value }} 条验收项的规格与它自己的判据不符（verdict=stale）"
-            description: "不是读数坏了，是规格说了「已落」而判据跑不过。逐条点名跑一把普查：`python3 -I scripts/gates/run-spec-acceptance.py --census --root <brain> --cwd <cogneva 树>`，看 verdict=stale 的那几行；修的是规格或它点名的代码，不是这条规则。数值是条数，不是持续时间。"
+            description: "不是读数坏了，是规格说了「已落」而判据跑不过。逐条点名跑一把普查：`python3 -I scripts/gates/run-spec-acceptance.py --census --root <那棵树> --cwd <cogneva 树>`，看 verdict=stale 的那几行；修的是规格或它点名的代码，不是这条规则。数值是条数，不是持续时间。"
 
         # 二、整条读数不见了。`absent_over_time` 的作用是「窗口内一条样本都没有」，
         # 它不继承被抓序列的标签，所以身份只剩规则名——这是对的：主体是「这条读数」。

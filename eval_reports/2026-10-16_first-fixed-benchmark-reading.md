@@ -2,7 +2,7 @@
 
 This is the report for work order W1 ("run the fixed benchmark once and commit a report").
 The run was **registered before it produced anything**: the registration is
-`2026-10-16_固定基准首次登记（rev对·种子·子集·跑法，跑前定稿）.md` in the private `cogneva-brain`
+`2026-10-16_固定基准首次登记（rev对·种子·子集·跑法，跑前定稿）.md` in the private companion repository
 repo, committed as `03f19e6f` at 2026-10-16T03:06:56Z. The registration is the pre-commitment —
 what ranges were run, with which seeds, over which subset — and it is what makes this first
 report non-cherry-pickable. This document is the run's outcome; the registration is unchanged.

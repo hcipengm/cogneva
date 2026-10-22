@@ -4,7 +4,7 @@
 # These rules run inside the application, not in Prometheus, and they have no
 # query API: this chart file is the only source of truth for their expressions.
 # The witness reading (scripts/host/cogneva-alert-rule-witness-reading.sh in the
-# private brain repo, COGNEVA_RULE_LAYER=infra_watch) checks each rule's vector
+# private companion repository, COGNEVA_RULE_LAYER=infra_watch) checks each rule's vector
 # selectors against the live series face and the 24h sample window, exactly as
 # it does for the Prometheus layer.
 #

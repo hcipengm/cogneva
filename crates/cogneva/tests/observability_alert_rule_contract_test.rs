@@ -1260,7 +1260,7 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "host_reading_producer_up",
-        "宿主读数聚合器 `scripts/host/cogneva-host-readings.sh`（私有仓），由它按 `scripts/data/host-readings.tsv` 逐行拉起生产者，并把每拍跑成没跑成印成这条判活序列。它只有聚合器能发：单个生产者退出码为 127 时与崩溃同形，聚合器是唯一知道「这一行没脚本」的地方",
+        "宿主读数聚合器 `scripts/host/cogneva-host-readings.sh`（不在本仓），由它按 `scripts/data/host-readings.tsv` 逐行拉起生产者，并把每拍跑成没跑成印成这条判活序列。它只有聚合器能发：单个生产者退出码为 127 时与崩溃同形，聚合器是唯一知道「这一行没脚本」的地方",
     ),
     (
         "host_reading_producer_unreadable",
@@ -1268,19 +1268,19 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "helm_release_revision_vs_workload_rev",
-        "宿主生产者 `scripts/host/cogneva-upgrade-path-reading.sh`（私有仓 brain），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出。值说的是「helm release 与现网工作负载是不是同一版」：1 是同版且 release 为 deployed，0 是不是。0 里混着两种成因（修订号不同、或 release 本身不是 deployed），所以这一格只给判据，成因由 `release_revision`/`workload_rev`/`status` 三个标签分开读；`state=\"no-release\"` 是走 apply 投递、本来就没有 release 的集群，按构造不参与判定。读不到时它整条序列都不印而不是印 0——「这台上没有 release」「两边不同版」与「生产者死了」是三个不同的修法，合成一个空集会指错方向",
+        "宿主生产者 `scripts/host/cogneva-upgrade-path-reading.sh`（不在本仓），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出。值说的是「helm release 与现网工作负载是不是同一版」：1 是同版且 release 为 deployed，0 是不是。0 里混着两种成因（修订号不同、或 release 本身不是 deployed），所以这一格只给判据，成因由 `release_revision`/`workload_rev`/`status` 三个标签分开读；`state=\"no-release\"` 是走 apply 投递、本来就没有 release 的集群，按构造不参与判定。读不到时它整条序列都不印而不是印 0——「这台上没有 release」「两边不同版」与「生产者死了」是三个不同的修法，合成一个空集会指错方向",
     ),
     (
         "image_wiring_yes",
-        "宿主生产者 `scripts/host/cogneva-image-wiring-reading.sh`（私有仓 brain），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 印出。值说的是「现网工作负载的镜像 tag 与主线 main 头是不是同一个提交」：1 是，0 不是。这一格只给判据，成因由同族序列分开读——差几笔看 `image_wiring_behind_commits`，部署器自己以为上到哪版看 `deployer_rev` 标签。读不到时它整条序列都不印而不是印 0：「对齐了」与「没量到」处置相反，后者由 `image_wiring_reading_stopped` 那条缺席规则接住",
+        "宿主生产者 `scripts/host/cogneva-image-wiring-reading.sh`（不在本仓），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 印出。值说的是「现网工作负载的镜像 tag 与主线 main 头是不是同一个提交」：1 是，0 不是。这一格只给判据，成因由同族序列分开读——差几笔看 `image_wiring_behind_commits`，部署器自己以为上到哪版看 `deployer_rev` 标签。读不到时它整条序列都不印而不是印 0：「对齐了」与「没量到」处置相反，后者由 `image_wiring_reading_stopped` 那条缺席规则接住",
     ),
     (
         "image_wiring_live_commit_age_seconds",
-        "同一个宿主生产者（`scripts/host/cogneva-image-wiring-reading.sh`，私有仓 brain），同一个 `job=\"cogneva-host-readings\"`。值说的是「现网在跑的那一版是多久以前提交的」，**起算点是提交时刻**，不是它在现网待了多久——里面同时装着流水线从提交走到上市的那段滞后。所以它判的是「流水线多久没把新东西送上线」，不是「现网多久没换」：要后者得用两次采样夹同一个 `live_rev`。拿它冒充「现网没换」会把每一条正常的构建滞后都读成故障；反过来，用「现网这一版不是主线尖端」当失败判也会永远在响（部署按小时滚、主线持续提交，两者不同步是常态）。读不到时整条序列都不印，那一半由 `image_wiring_yes` 的缺席规则接住",
+        "同一个宿主生产者（`scripts/host/cogneva-image-wiring-reading.sh`，不在本仓），同一个 `job=\"cogneva-host-readings\"`。值说的是「现网在跑的那一版是多久以前提交的」，**起算点是提交时刻**，不是它在现网待了多久——里面同时装着流水线从提交走到上市的那段滞后。所以它判的是「流水线多久没把新东西送上线」，不是「现网多久没换」：要后者得用两次采样夹同一个 `live_rev`。拿它冒充「现网没换」会把每一条正常的构建滞后都读成故障；反过来，用「现网这一版不是主线尖端」当失败判也会永远在响（部署按小时滚、主线持续提交，两者不同步是常态）。读不到时整条序列都不印，那一半由 `image_wiring_yes` 的缺席规则接住",
     ),
     (
         "cogneva_host_credential_surface_age_seconds",
-        "宿主凭证面生产者 `scripts/host/cogneva-credential-surface-state-reading.sh`（私有仓），经聚合器以 `job=\"cogneva-host-readings\"` 暴露。它判的是归档最后一行的年龄：一个读「每拍追加一行」的归档的生产者，停更之后每一拍照样跑成、判词照样是 aligned，只有这一条会往后退",
+        "宿主凭证面生产者 `scripts/host/cogneva-credential-surface-state-reading.sh`（不在本仓），经聚合器以 `job=\"cogneva-host-readings\"` 暴露。它判的是归档最后一行的年龄：一个读「每拍追加一行」的归档的生产者，停更之后每一拍照样跑成、判词照样是 aligned，只有这一条会往后退",
     ),
     (
         "cogneva_host_credential_surface_measured",
@@ -1300,7 +1300,7 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "cogneva_mainline_behind_verdict_stalled",
-        "宿主侧生产者 `scripts/host/cogneva-mainline-behind-verdict.sh`（私有仓 brain），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出，15 分钟一拍。它判的是「现网那一版还动不动」：连续两拍现网 rev 相同、且两拍都没有构建在飞才印 1；判不了时整条序列不印，由 `_judged` 那一格说清楚。这条序列是「部署器空转」唯一的判词：等槽被拒的轮数、Job 尝试数在健康的有界滞后里都会涨（tip 一直在动，每一轮都要重新排队），回答不了这个问题",
+        "宿主侧生产者 `scripts/host/cogneva-mainline-behind-verdict.sh`（不在本仓），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出，15 分钟一拍。它判的是「现网那一版还动不动」：连续两拍现网 rev 相同、且两拍都没有构建在飞才印 1；判不了时整条序列不印，由 `_judged` 那一格说清楚。这条序列是「部署器空转」唯一的判词：等槽被拒的轮数、Job 尝试数在健康的有界滞后里都会涨（tip 一直在动，每一轮都要重新排队），回答不了这个问题",
     ),
     (
         "cogneva_mainline_behind_verdict_judged",
@@ -1308,11 +1308,11 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "cogneva_acceptance_age_seconds",
-        "宿主侧生产者 `scripts/host/cogneva-acceptance-census-reading.sh`（私有仓 brain，登记行 `acceptance_census`），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出。年龄由生产者自己算：快照里的 `taken_at` 是同一台机上跑完那一趟普查时写的，减它的是同一台机的钟；把 `taken_at` 当序列交给 Prometheus 再减 `time()`，减的是另一台机的钟，两边时钟源不同时，「普查停了多久」会随漂移假响或假静。这一格是 `CognevaAcceptanceCensusOld` 唯一能问的问题：判词那一族只说得清这一趟判了什么，说不清这一趟是多久以前的——而一份停在三天前的 all-ok 与一份刚跑完的 all-ok 在判词上是同一句话",
+        "宿主侧生产者 `scripts/host/cogneva-acceptance-census-reading.sh`（不在本仓，登记行 `acceptance_census`），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出。年龄由生产者自己算：快照里的 `taken_at` 是同一台机上跑完那一趟普查时写的，减它的是同一台机的钟；把 `taken_at` 当序列交给 Prometheus 再减 `time()`，减的是另一台机的钟，两边时钟源不同时，「普查停了多久」会随漂移假响或假静。这一格是 `CognevaAcceptanceCensusOld` 唯一能问的问题：判词那一族只说得清这一趟判了什么，说不清这一趟是多久以前的——而一份停在三天前的 all-ok 与一份刚跑完的 all-ok 在判词上是同一句话",
     ),
     (
         "cogneva_backup_package_owner_uid",
-        "持久化存储面生产者 `scripts/host/cogneva-backup-package-owner-reading.sh`（私有仓），经聚合器以 `job=\"cogneva-host-readings\"` 暴露。它读的是账本 `backup_runs` 里最新一行 `outcome='ok'` 点名的那个包在卷上的属主：包是恢复唯一能读的东西，属主决定「谁能读」，而备份面此前所有判据都不读它。裸 gauge，不拿包名当标签——包名一天一条，是标签最不该长的形状",
+        "持久化存储面生产者 `scripts/host/cogneva-backup-package-owner-reading.sh`（不在本仓），经聚合器以 `job=\"cogneva-host-readings\"` 暴露。它读的是账本 `backup_runs` 里最新一行 `outcome='ok'` 点名的那个包在卷上的属主：包是恢复唯一能读的东西，属主决定「谁能读」，而备份面此前所有判据都不读它。裸 gauge，不拿包名当标签——包名一天一条，是标签最不该长的形状",
     ),
     (
         "cogneva_backup_package_age_seconds",
@@ -1324,7 +1324,7 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "disk_trend_days_to_trigger",
-        "宿主生产者 `scripts/host/cogneva-host-disk-trend-reading.sh`（私有仓 brain），由聚合器按 `scripts/data/host-readings.tsv` 每拍拉起，经 `job=\"cogneva-host-readings\"` 印出。值说的是「按整窗拟合的斜率，根盘还有几天到构建缓存刹车的触发线」——而这条线**只能在宿主上算**：刹车（`deploy/scripts/host-target-gc.sh`）判的是 `df` 的 Use%，分母是 used+avail、不含 root 保留块，而 node-exporter 的 `1 − avail/size` 分母含保留块。两把尺子差的就是保留块在 size 里的份额（随文件系统类型与 `tune2fs -m` 的设定而变，不是常数），所以按 size 解出来的触发线离刹车真正动手的位置有多远，每台机器都不一样；在 PromQL 里重算就得先选一把尺子去逼近另一把，选错时这个差会原样变成提前量上的误差。规则只读宿主已经算好的天数，不做第二把尺子",
+        "宿主生产者 `scripts/host/cogneva-host-disk-trend-reading.sh`（不在本仓），由聚合器按 `scripts/data/host-readings.tsv` 每拍拉起，经 `job=\"cogneva-host-readings\"` 印出。值说的是「按整窗拟合的斜率，根盘还有几天到构建缓存刹车的触发线」——而这条线**只能在宿主上算**：刹车（`deploy/scripts/host-target-gc.sh`）判的是 `df` 的 Use%，分母是 used+avail、不含 root 保留块，而 node-exporter 的 `1 − avail/size` 分母含保留块。两把尺子差的就是保留块在 size 里的份额（随文件系统类型与 `tune2fs -m` 的设定而变，不是常数），所以按 size 解出来的触发线离刹车真正动手的位置有多远，每台机器都不一样；在 PromQL 里重算就得先选一把尺子去逼近另一把，选错时这个差会原样变成提前量上的误差。规则只读宿主已经算好的天数，不做第二把尺子",
     ),
     (
         "disk_trend_trigger_line_readable",
@@ -1336,7 +1336,7 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "cogneva_host_target_gc_measured",
-        "宿主构建缓存回收器的读数 `scripts/host/cogneva-target-gc-reading.sh`（私有仓 brain），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出。它读的是回收器自己每拍写的状态文件（`~/.local/state/cogneva/target-gc.json`）。1 是这一拍有一份状态，0 是从没跑成过——「状态文件不在」与「读不到」由退出码 3（一条序列都不印）分开",
+        "宿主构建缓存回收器的读数 `scripts/host/cogneva-target-gc-reading.sh`（不在本仓），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出。它读的是回收器自己每拍写的状态文件（`~/.local/state/cogneva/target-gc.json`）。1 是这一拍有一份状态，0 是从没跑成过——「状态文件不在」与「读不到」由退出码 3（一条序列都不印）分开",
     ),
     (
         "cogneva_host_target_gc_age_seconds",
@@ -1356,7 +1356,7 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "cogneva_host_nvme_percentage_used",
-        "宿主读数 `scripts/host/cogneva-nvme-wear-reading.sh`（私有仓 brain，登记行 `nvme_wear`）：每块 NVMe 的磨损百分比，读自 `nvme smart-log`。资源账其余每一格问「用掉多少」，只有这一格问「还能用多久」——磨损没有补救动作（清缓存、删卷、抬配额都退不回这个数），只能在它走到 100% 之前换盘。node-exporter 的 nvme collector 只发容量与设备状态、不导出磨损（SMART log 要 ioctl 到控制器字符设备），所以别处没有第二份读数",
+        "宿主读数 `scripts/host/cogneva-nvme-wear-reading.sh`（不在本仓，登记行 `nvme_wear`）：每块 NVMe 的磨损百分比，读自 `nvme smart-log`。资源账其余每一格问「用掉多少」，只有这一格问「还能用多久」——磨损没有补救动作（清缓存、删卷、抬配额都退不回这个数），只能在它走到 100% 之前换盘。node-exporter 的 nvme collector 只发容量与设备状态、不导出磨损（SMART log 要 ioctl 到控制器字符设备），所以别处没有第二份读数",
     ),
     (
         "cogneva_host_nvme_media_errors_total",
@@ -1392,7 +1392,7 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "cogneva_file_size_census_unjudged",
-        "宿主读数 `scripts/host/cogneva-file-size-census-reading.sh`（私有仓 brain）：公开仓 `crates/` 下 50 KiB 以上的 `.rs` 里，普查表没判过的有几个。它读的是 `scripts/gates/check-file-size-census.py --reading` 的同一次判决——普查表在私有仓、被判的树在公开仓，所以这道判据不能挂在任何一方的提交门上（挂在私有仓就会红在不持有那些字节的人身上，挂在公开仓则读不到表），它的位置是读数面。越线却没判要当天补一行，与反方向那格分开",
+        "宿主读数 `scripts/host/cogneva-file-size-census-reading.sh`（不在本仓）：公开仓 `crates/` 下 50 KiB 以上的 `.rs` 里，普查表没判过的有几个。它读的是 `scripts/gates/check-file-size-census.py --reading` 的同一次判决——普查表在私有仓、被判的树在公开仓，所以这道判据不能挂在任何一方的提交门上（挂在私有仓就会红在不持有那些字节的人身上，挂在公开仓则读不到表），它的位置是读数面。越线却没判要当天补一行，与反方向那格分开",
     ),
     (
         "cogneva_file_size_census_stale",
@@ -1400,39 +1400,39 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "resource_six_column_state",
-        "宿主读数 `scripts/host/cogneva-resource-six-column-reading.sh`（私有仓 brain）的逐列判词，one-hot 带 `column` 与 `state` 标签：rss／redis_mem／conn／oomkill／restarts／slot。六格里有四格的界归别的规则（`container_memory_near_limit` 的 0.81、`redis_memory_near_limit` 的 0.90、`pod_oom_killed`、`pod_restarting_*`），本仓库只有 conn（撞 maxclients）与 slot（占用越过窗口内提供过的最高界）两格此前没有任何读者，所以规则只读这两格。每一列都是**窗口极值**算出来的判词，窗口长度由同一生产者发的 `resource_six_column_window_seconds` 声明",
+        "宿主读数 `scripts/host/cogneva-resource-six-column-reading.sh`（不在本仓）的逐列判词，one-hot 带 `column` 与 `state` 标签：rss／redis_mem／conn／oomkill／restarts／slot。六格里有四格的界归别的规则（`container_memory_near_limit` 的 0.81、`redis_memory_near_limit` 的 0.90、`pod_oom_killed`、`pod_restarting_*`），本仓库只有 conn（撞 maxclients）与 slot（占用越过窗口内提供过的最高界）两格此前没有任何读者，所以规则只读这两格。每一列都是**窗口极值**算出来的判词，窗口长度由同一生产者发的 `resource_six_column_window_seconds` 声明",
     ),
     (
         "host_reading_series_undeclared",
-        "宿主聚合器 `scripts/host/cogneva-host-readings.sh`（私有仓 brain）自己发的一条：端点上有、而登记表那一行的第四列没登记多少条序列。账本只有一本（`scripts/data/host-readings.tsv`），这格就是它漏人的方向——印了却没登记。修法是把名字补进那一行（零成本），所以它没有「承认的欠账」：与下面那条方向相反，那一格是登记了却没人读",
+        "宿主聚合器 `scripts/host/cogneva-host-readings.sh`（不在本仓）自己发的一条：端点上有、而登记表那一行的第四列没登记多少条序列。账本只有一本（`scripts/data/host-readings.tsv`），这格就是它漏人的方向——印了却没登记。修法是把名字补进那一行（零成本），所以它没有「承认的欠账」：与下面那条方向相反，那一格是登记了却没人读",
     ),
     (
         "cogneva_verdict_series_unread",
-        "宿主读数 `scripts/host/cogneva-verdict-readers-reading.sh`（私有仓 brain）：登记表里标了 `=verdict`、却在 `deploy/` 下任何一个规则文件里都找不到名字的条数。它与「这一面压根没写生产者」在读数面上同形（都是一条决定也不产生）。判红的是「涨过表头声明的 `unread_ceiling`」（下面那条），不是「大于 0」：今天就有十几条判词没有读者，写成 `> 0` 会让整条告警从第一天起常红",
+        "宿主读数 `scripts/host/cogneva-verdict-readers-reading.sh`（不在本仓）：登记表里标了 `=verdict`、却在 `deploy/` 下任何一个规则文件里都找不到名字的条数。它与「这一面压根没写生产者」在读数面上同形（都是一条决定也不产生）。判红的是「涨过表头声明的 `unread_ceiling`」（下面那条），不是「大于 0」：今天就有十几条判词没有读者，写成 `> 0` 会让整条告警从第一天起常红",
     ),
     (
         "cogneva_verdict_series_ceiling",
-        "同一生产者：登记表表头里写下的、已经承认的欠账条数。它是这条判据的**另一半**，不是一个可调的界——只许跟着实测值往下走（补上一条读者就减一）。做成第二条序列而不是写进规则表达式，是因为它属于账本，而账本在私有仓；规则里写死一个数，账本一改两边就各说各话",
+        "同一生产者：登记表表头里写下的、已经承认的欠账条数。它是这条判据的**另一半**，不是一个可调的界——只许跟着实测值往下走（补上一条读者就减一）。做成第二条序列而不是写进规则表达式，是因为它属于账本，而账本不在本仓；规则里写死一个数，账本一改两边就各说各话",
     ),
     (
         "reading_witness_unresolved",
-        "宿主读数 `scripts/host/cogneva-reading-witness-reading.sh`（私有仓 brain）：面表里声明要读、按它写的名字却在端点上取不到值的面数。它管的是「面表与生产者对不上」，不是「那一面坏了」——后者有那一面自己的判词。逐面定位读同一生产者发的 `reading_witness_face_resolved{face}=0`",
+        "宿主读数 `scripts/host/cogneva-reading-witness-reading.sh`（不在本仓）：面表里声明要读、按它写的名字却在端点上取不到值的面数。它管的是「面表与生产者对不上」，不是「那一面坏了」——后者有那一面自己的判词。逐面定位读同一生产者发的 `reading_witness_face_resolved{face}=0`",
     ),
     (
         "tasks_publishers_agree",
-        "宿主读数 `scripts/host/cogneva-tasks-face-reading.sh`（私有仓 brain）：同一批任务的两个发布者是否报出同一份状态，1 一致 / 0 不一致。判据不需要阈值——同一份正本的两个投影本来就该一致，不一致本身就是缺陷",
+        "宿主读数 `scripts/host/cogneva-tasks-face-reading.sh`（不在本仓）：同一批任务的两个发布者是否报出同一份状态，1 一致 / 0 不一致。判据不需要阈值——同一份正本的两个投影本来就该一致，不一致本身就是缺陷",
     ),
     (
         "cogneva_refusal_redispatch_state",
-        "宿主读数 `scripts/host/cogneva-refusal-redispatch-reading.sh`（私有仓 brain）的逐拍判词，one-hot 带 `state` 标签。规则只读三个红态：`refused_no_redispatch`（有拒绝、免费重投为 0，等于白挡一次）、`below_bar`（重投通道在跑却交不回 1/3）、`turn_off`（按预登记判据该关掉这条路）。`not_wired` / `no_refusals` / `undecided` / `keep` 是绿态，不进规则",
+        "宿主读数 `scripts/host/cogneva-refusal-redispatch-reading.sh`（不在本仓）的逐拍判词，one-hot 带 `state` 标签。规则只读三个红态：`refused_no_redispatch`（有拒绝、免费重投为 0，等于白挡一次）、`below_bar`（重投通道在跑却交不回 1/3）、`turn_off`（按预登记判据该关掉这条路）。`not_wired` / `no_refusals` / `undecided` / `keep` 是绿态，不进规则",
     ),
     (
         "principle_carriers_slug_no_landing",
-        "宿主读数 `scripts/host/cogneva-principle-census-reading.sh`（私有仓 brain）：载体在树上声明了「已落」，账本里却查不到对应落地行的 slug 条数。载体与账两处都不在公开仓，所以这一格只能作为外来读数登记",
+        "宿主读数 `scripts/host/cogneva-principle-census-reading.sh`（不在本仓）：载体在树上声明了「已落」，账本里却查不到对应落地行的 slug 条数。载体与账两处都不在公开仓，所以这一格只能作为外来读数登记",
     ),
     (
         "e2e_ten_rings_failed_settled",
-        "宿主读数 `scripts/host/cogneva-e2e-rings-reading.sh`（私有仓 brain）：十环里有判据而不 ok、且不是构建或部署还在路上的环数（第 3、4、6 环不计）。规则不读同族的 `e2e_ten_rings_failed`，因为那个数在每次落地后的几分钟内必然大于 0——新版本还没构建出镜像、部署器还没滚到主线——给它立规则会从第一天常红，而「六小时什么都没落地」这条界另有一条规则持有。单环序列 `e2e_ten_rings{ring=…}` 同样刻意不进规则：按脚本 HELP，那一格的 0 同时表示「判了没过」与「这一拍读不到」，一条判据读一个二义值等于把两种修法混成一种；读不到与缺判据各有自己的计数序列",
+        "宿主读数 `scripts/host/cogneva-e2e-rings-reading.sh`（不在本仓）：十环里有判据而不 ok、且不是构建或部署还在路上的环数（第 3、4、6 环不计）。规则不读同族的 `e2e_ten_rings_failed`，因为那个数在每次落地后的几分钟内必然大于 0——新版本还没构建出镜像、部署器还没滚到主线——给它立规则会从第一天常红，而「六小时什么都没落地」这条界另有一条规则持有。单环序列 `e2e_ten_rings{ring=…}` 同样刻意不进规则：按脚本 HELP，那一格的 0 同时表示「判了没过」与「这一拍读不到」，一条判据读一个二义值等于把两种修法混成一种；读不到与缺判据各有自己的计数序列",
     ),
     (
         "e2e_ten_rings_unread",
@@ -1444,7 +1444,7 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "cogneva_alert_mirror_unapplied",
-        "宿主读数 `scripts/host/cogneva-alert-mirror-reading.sh`（私有仓 brain，登记行 `alert_mirror`）：树上给规则打了镜像标记、而集群里的 PrometheusRule 对象里少了其中几条。按**名字**比，不按条数比：条数相等而名字换了时条数比法恰好判绿，而集群里多留一条树已删掉的规则又会把条数比法误报成「没落地」。它读的是「清单 → 集群」这一段，与下一条的「配置 → 进程」是链路的两处断点，修法不同（重跑 apply / 重新部署），所以分成两格而不是一个「镜像坏了」",
+        "宿主读数 `scripts/host/cogneva-alert-mirror-reading.sh`（不在本仓，登记行 `alert_mirror`）：树上给规则打了镜像标记、而集群里的 PrometheusRule 对象里少了其中几条。按**名字**比，不按条数比：条数相等而名字换了时条数比法恰好判绿，而集群里多留一条树已删掉的规则又会把条数比法误报成「没落地」。它读的是「清单 → 集群」这一段，与下一条的「配置 → 进程」是链路的两处断点，修法不同（重跑 apply / 重新部署），所以分成两格而不是一个「镜像坏了」",
     ),
     (
         "cogneva_alert_mirror_unconfigured",
@@ -1457,6 +1457,10 @@ const FOREIGN: &[(&str, &str)] = &[
     (
         "cogneva_alert_mirror_stale_rows",
         "同一生产者：表里开着、`last_seen_at` 超过十分钟没往前走的镜像行数。它与上一条是相反的两个方向——上一条是「从来没进去」，这一条是「曾经通过、后来停了」；读失败时镜像故意不 resolve，那一档由 `infra_watch_eval_failure` 报，所以这一条的点名序列要跟它一起读，否则会把设计读成故障",
+    ),
+    (
+        "cogneva_alert_attention_unattended",
+        "宿主读数 `scripts/host/cogneva-alert-attention-reading.sh`（不在本仓，登记行 `alert_attention`）：`alerts` 表里正 firing、响了超过窗口（默认 1800 秒）而 `acknowledged_at` 仍为空的行。它是这条链的**读者**那一端——镜像那一族只判到「进了表」，进了之后有没有人接，此前没有任何序列在说；2026-10-22 主线停摆七十分钟，红与停都进了表、都被铃铛写过通知，而全程没有一条被确认。判词读 `acknowledged_at` 而不是 `notified_at`：后者只说明站内铃铛写过通知（没人点开也算），按它判会把「告诉了」读成「看了」。按窗口而不是按比例判，是因为十件事接了九件时，剩下那一件仍然是没人接的那一件",
     ),
     ("up", "Prometheus 采集目标存活序列"),
 ];

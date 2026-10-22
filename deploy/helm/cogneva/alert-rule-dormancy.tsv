@@ -19,7 +19,7 @@
 #   known_defect      a defect that is declared, with the fix named in why
 #
 # The witness reading (`scripts/host/cogneva-alert-rule-witness-reading.sh` in
-# the private brain repo) treats an absent series without a row here as red.
+# the private companion repository) treats an absent series without a row here as red.
 # A row whose series is back (or whose rule is gone) is reported as stale and
 # must be deleted -- the condition it describes is no longer true.
 #

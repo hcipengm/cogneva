@@ -532,7 +532,7 @@ spec:
 
     # 这条链最前面那本账的两个方向。
     #
-    # 账本是 `cogneva-brain/scripts/data/host-readings.tsv`（只此一本）：一行一个生产者，
+    # 账本是 `scripts/data/host-readings.tsv`（只此一本，不在本仓）：一行一个生产者，
     # 第四列列出它发的每一条序列，判词后缀 `=verdict`。下面两条读的是这本账自己有没有
     # 漏人——一条管「端点上的序列在不在账上」，一条管「账上标了判词的有没有读者」。
     #
@@ -719,3 +719,22 @@ spec:
           annotations:
             summary: "有 {{ $value }} 行镜像告警开着，但已经有十分钟没人看过它"
             description: "开着的行靠 `last_seen_at` 每拍前进来证明「条件仍然成立」。它停住意味着镜像那一段不再跑（进程活着、只是这一支停了）或者 Prometheus 那边读不回来了。`cogneva_alert_mirror_stale_rule{rule=…}` 点名是哪几条；`cogneva_alert_mirror_oldest_open_age_seconds` 给最老的那一条。先看 `infra_watch_eval_failure` 有没有在同一条原因上响——读失败时镜像故意不 resolve，那时停住是设计，不是故障。"
+
+    # 表里的告警有没有人看：这一组是这条链的**读者**那一端。前面几组判「该进表的进没进、
+    # 进了的还活不活」，都只说明到表为止；表之后原本没有读者，2026-10-22 主线停摆七十分钟，
+    # 红与停都进了表、都没人接，而系统里没有任何一个数说「这件事还没人接管」。
+    - name: cogneva-alert-attention
+      rules:
+        # 响了超过窗口（读数自己带 1800 秒）还没人确认。修法只有一条：看那条告警并确认
+        # （WebUI 告警浮层的确认按钮写 `acknowledged_at`），读数的下一拍就会把它从名单上摘掉。
+        # 这一条自己也会进表、也会被同一个读数数到——那是诚实的：一条「没人看告警」的告警
+        # 本身没人看时，它说的仍然是事实，而确认那条原告警之后两者一起 resolve。
+        - alert: CognevaAlertUnattended
+          expr: max(cogneva_alert_attention_unattended) > 0
+          for: 5m
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "有告警响了半小时以上还没人确认（见 cogneva_alert_attention_unattended_rule）"
+            description: "`cogneva_alert_attention_unattended_rule{rule=…}` 点名是哪几条，`cogneva_alert_attention_oldest_unacknowledged_age_seconds` 给最老的那一条响了多久。`acknowledged_at` 是 `alerts` 表里唯一机器可读的「有人看过」——它由 WebUI 告警浮层的确认按钮写，告警重新点火时清空，所以它记的是**这一轮**有没有人接，不是这条规则曾经被人看过。先逐条处置点名的那几条（能修的修、不能修的确认并写下原因），确认之后这一条自己会 resolve。"
