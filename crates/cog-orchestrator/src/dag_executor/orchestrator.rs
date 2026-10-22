@@ -1730,11 +1730,26 @@ impl DagExecutor {
     /// The second half exists because admission asks "how many may run" and
     /// that question is only answerable against what is already owed: a bound
     /// compared with zero every pass admits the whole allowance again while the
-    /// previous batch is still queued. `Scheduled` counts as owed -- the
-    /// publisher marks a task scheduled before it writes it to the transport, so
-    /// a task in this set has already been handed a slot even if nothing has
-    /// picked it up. `Running` does too. Everything else is settled or waiting
-    /// on a dependency, and neither is spending this window.
+    /// previous batch is still queued. `Running` counts as owed -- someone is
+    /// spending the window on it right now. So does `Scheduled` while its owner
+    /// may still be there: the publisher marks a task scheduled before it
+    /// writes it to the transport, so the row has been handed a slot even if
+    /// nothing has picked it up yet.
+    ///
+    /// A `Scheduled` row whose lease has lapsed does not count. Whoever held it
+    /// is gone, and the message that put it there is either acked without the
+    /// task having started or lost with the queue it was written to. Re-arming
+    /// that row is the stall sweep's job, and until the sweep reaches it the
+    /// row is waiting, not spending: nothing about it will consume an
+    /// allowance. Counting it turns a leak into a ceiling -- two thousand rows
+    /// that reached this state over three days and never left are then
+    /// subtracted from every window the pool ever opens, and the reading is a
+    /// queue that is full when the queue is in fact empty.
+    ///
+    /// `lease_expiry` is read here rather than `lease_expires_at` for the reason
+    /// it exists: a row that carries a start time and no explicit lease is
+    /// still judgeable, and one carrying neither is not evidence of expiry at
+    /// all.
     ///
     /// Per queue, not per process: the process-local queue can hold a backlog
     /// of its own for weeks while the shared queue is empty, and one combined
@@ -1743,19 +1758,22 @@ impl DagExecutor {
         &self,
     ) -> (Vec<Task>, std::collections::HashMap<String, usize>) {
         let tasks = self.all_tasks_unified().await;
+        let now = chrono::Utc::now();
         let mut in_flight: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        for t in tasks
-            .iter()
-            .filter(|t| matches!(t.status, TaskStatus::Scheduled | TaskStatus::Running))
-        {
+        for t in tasks.iter().filter(|t| match t.status {
+            TaskStatus::Running => true,
+            TaskStatus::Scheduled => t
+                .lease_expiry(self.task_lease)
+                .is_none_or(|expires| expires > now),
+            _ => false,
+        }) {
             *in_flight
                 .entry(crate::ready_queue::ready_stream_for(t, &self.workspace_id))
                 .or_default() += 1;
         }
         let by_id: std::collections::HashMap<&str, &Task> =
             tasks.iter().map(|t| (t.id.as_str(), t)).collect();
-        let now = chrono::Utc::now();
         let mut ready: Vec<Task> = tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Pending)
@@ -3651,6 +3669,50 @@ mod tests {
     /// 传输层答不出积压时的清扫：大多数测试只关心「超过窗就收回」这一条。
     async fn sweep(dag: &DagExecutor, stall_after_secs: u64, streams: &[String]) -> usize {
         sweep_with(dag, stall_after_secs, streams, &HashMap::new()).await
+    }
+
+    /// 一条自我进化任务，落进过程内队列——与现网那批 `change-ledger-*` 同形。
+    fn evolution_task(id: &str) -> Task {
+        Task::new(
+            id,
+            TaskType::Generator,
+            serde_json::json!({ "evolution_mode": "generate_change" }),
+        )
+    }
+
+    /// 欠账计数只算「有人可能正在花这个窗口」的行。
+    ///
+    /// 三个 Scheduled 形状放进同一张图里，`owed` 必须只把后两个算进去：
+    /// 租约过期的那条，持有者已经没了、消息不是被吞了就是被 ack 掉了，它正等着
+    /// 清扫器把它放回队列，等着的行不花任何窗口的额度。
+    #[tokio::test]
+    async fn a_scheduled_row_nobody_holds_is_not_owed() {
+        let pod = DagExecutor::new("ws-owed".into());
+        let local = crate::ready_queue::process_local_ready_stream("ws-owed");
+
+        let mut abandoned = evolution_task("abandoned");
+        abandoned.status = TaskStatus::Scheduled;
+        abandoned.lease_owner = Some("gone".into());
+        abandoned.lease_expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(3));
+        pod.add_task(abandoned).await.unwrap();
+
+        let mut held = evolution_task("held");
+        held.status = TaskStatus::Scheduled;
+        held.lease_owner = Some("here".into());
+        held.lease_expires_at = Some(chrono::Utc::now() + chrono::Duration::minutes(5));
+        pod.add_task(held).await.unwrap();
+
+        let mut unclaimed = evolution_task("unclaimed");
+        unclaimed.status = TaskStatus::Scheduled;
+        pod.add_task(unclaimed).await.unwrap();
+
+        let (_, owed) = pod.ready_tasks_and_in_flight().await;
+        assert_eq!(
+            owed.get(&local).copied().unwrap_or(0),
+            2,
+            "a lease that lapsed three hours ago must not be subtracted from the \
+             next window the pool opens: {owed:?}"
+        );
     }
 
     /// 记下每一次计数的序列名：断言的是「这条曲线被记过没有」，不是内部原子。
