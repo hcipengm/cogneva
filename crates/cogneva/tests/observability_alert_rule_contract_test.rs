@@ -1293,7 +1293,7 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "disk_trend_days_to_trigger",
-        "宿主生产者 `scripts/host/cogneva-host-disk-trend-reading.sh`（私有仓 brain），由聚合器按 `scripts/data/host-readings.tsv` 每拍拉起，经 `job=\"cogneva-host-readings\"` 印出。值说的是「按整窗拟合的斜率，根盘还有几天到构建缓存刹车的触发线」——而这条线**只能在宿主上算**：刹车（`deploy/scripts/host-target-gc.sh`）判的是 `df` 的 Use%，分母是 used+avail、不含 root 保留块，而 node-exporter 的 `1 − avail/size` 分母含保留块，两把尺子同一刻差一个保留块的分额（2026-10-22 实测 68.2% 对 66.8%）。在 PromQL 里重算就得先选一把尺子去逼近另一把，选错时触发线落低 42.9→18.2 GiB，把 1.5 天读成 0.6 天；所以规则只读宿主已经算好的天数，不做第二把尺子",
+        "宿主生产者 `scripts/host/cogneva-host-disk-trend-reading.sh`（私有仓 brain），由聚合器按 `scripts/data/host-readings.tsv` 每拍拉起，经 `job=\"cogneva-host-readings\"` 印出。值说的是「按整窗拟合的斜率，根盘还有几天到构建缓存刹车的触发线」——而这条线**只能在宿主上算**：刹车（`deploy/scripts/host-target-gc.sh`）判的是 `df` 的 Use%，分母是 used+avail、不含 root 保留块，而 node-exporter 的 `1 − avail/size` 分母含保留块。两把尺子差的就是保留块在 size 里的份额（随文件系统类型与 `tune2fs -m` 的设定而变，不是常数），所以按 size 解出来的触发线离刹车真正动手的位置有多远，每台机器都不一样；在 PromQL 里重算就得先选一把尺子去逼近另一把，选错时这个差会原样变成提前量上的误差。规则只读宿主已经算好的天数，不做第二把尺子",
     ),
     (
         "disk_trend_trigger_line_readable",

@@ -441,6 +441,11 @@ jobs:
       # 写清，不是把引用换个说法。
       - name: Check comments cite no document
         run: bash deploy/scripts/check-comment-doc-references.sh
+      # 注释不得把某一台机器的容量写成软件的属性：注释不参与渲染、不参与 parity、
+      # 不进任何告警，写错的数字没有读者会红。存量已按行内容记进基线（只许缩），
+      # 新写的一条要么说清是谁的数（实测／本机／默认／例如），要么写机制与比例。
+      - name: Check comments state whose capacity they quote
+        run: bash deploy/scripts/check-comment-capacity-figures.sh
       # README 里点名的源码路径必须存在。死在正文里的路径不会让任何东西失败——
       # 文件搬了家，正文照常渲染成一句看着完整的说明，只有读者照着去开文件才发现
       # 是个死指针。判的是反引号括起来、带扩展名的串（口径见脚本头部）。
