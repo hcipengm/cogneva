@@ -158,9 +158,18 @@ pub async fn get_handler(
 /// The inbox subscription and the command semantics existed, but nothing in
 /// the platform ever produced a message for them, so an agent could be
 /// addressed only from inside its own process. This is the producer that
-/// closes the path: the body is the wire form of [`cog_core::InboxMessage`]
-/// and a `prompt` that names a `reply_stream` publishes its result there for
-/// the caller to read with the standard message backend.
+/// closes the path: the body is the wire form of [`cog_core::InboxMessage`].
+///
+/// A `reply_stream` named by the caller is refused here. The platform ends a
+/// reply stream once the ask it belongs to is over -- that ending is the only
+/// thing that keeps one from outliving its question -- and a name supplied
+/// from outside belongs to a reader this process cannot see, so nothing here
+/// may delete it. The stream is also not something an outside caller can read:
+/// the store is not reachable from the client side. Accepting the field would
+/// therefore answer 202 for a key that can stay in the store for good, with no
+/// way to drain it. An agent asking another agent gets an answer through the
+/// `send_to_agent` tool with `expect_reply`, whose stream the platform opens
+/// and ends by construction.
 ///
 /// Two delivery paths, tried in that order:
 ///
@@ -183,6 +192,26 @@ pub async fn send_message_handler(
     Path(agent_id): Path<String>,
     Json(msg): Json<cog_core::InboxMessage>,
 ) -> Response {
+    // Checked before either delivery path: both of them hand the command to a
+    // handler that would publish the answer into that stream and leave it
+    // there, because ending it is the asker's job and this route has no asker
+    // it knows.
+    if let Some(stream) = caller_named_reply_stream(&msg) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "this route does not take a caller-named reply_stream: \
+                          the platform cannot read or reclaim a stream whose owner \
+                          it does not know. An agent asking another agent gets its \
+                          answer through the send_to_agent tool with expect_reply, \
+                          whose stream the platform opens and ends",
+                "reply_stream": stream,
+                "agent_id": agent_id,
+            })),
+        )
+            .into_response();
+    }
+
     // Local first. A miss is not an answer -- the same name may be held by
     // another process, which is the whole point of the registry.
     if let Some(pool) = state.agent_pool.as_ref() {
@@ -278,6 +307,21 @@ pub async fn send_message_handler(
             Json(serde_json::json!({"error": e.to_string(), "stream": stream})),
         )
             .into_response(),
+    }
+}
+
+/// The reply stream the caller put in the body, if any.
+///
+/// Split out so the refusal can be judged without a gateway state: what is
+/// being decided is which bodies this route will take, and that depends on the
+/// body alone.
+fn caller_named_reply_stream(msg: &cog_core::InboxMessage) -> Option<&str> {
+    match msg {
+        cog_core::InboxMessage::Prompt {
+            reply_stream: Some(stream),
+            ..
+        } => Some(stream),
+        _ => None,
     }
 }
 
@@ -442,5 +486,38 @@ pub async fn checkpoint_handler(
             })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::caller_named_reply_stream;
+    use cog_core::InboxMessage;
+
+    /// A reply stream the caller names is taken out of the body rather than
+    /// honoured, and the other two shapes -- a prompt with no reply stream and
+    /// a command that is not a prompt at all -- go through. Reading only the
+    /// refusal would not say the route still accepts anything.
+    #[test]
+    fn only_a_caller_named_reply_stream_is_refused() {
+        assert_eq!(
+            caller_named_reply_stream(&InboxMessage::Prompt {
+                goal: serde_json::json!({"goal": "run the tests"}),
+                reply_stream: Some("caller:reply:1".to_string()),
+            }),
+            Some("caller:reply:1")
+        );
+        assert_eq!(
+            caller_named_reply_stream(&InboxMessage::Prompt {
+                goal: serde_json::json!({"goal": "run the tests"}),
+                reply_stream: None,
+            }),
+            None
+        );
+        assert_eq!(
+            caller_named_reply_stream(&InboxMessage::Abort),
+            None,
+            "only a prompt can name a reply stream"
+        );
     }
 }
