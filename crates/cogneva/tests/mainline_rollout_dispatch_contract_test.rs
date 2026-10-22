@@ -76,14 +76,42 @@ fn no_rollout_is_dispatched_without_passing_the_guard() {
 fn every_path_that_starts_a_rollout_asks_the_guard() {
     let source = read(DEPLOYER);
     let production = production_source(&source);
-    // Three paths reach a dispatch: the registry fast path, the build path, and
-    // the re-dispatch an external apply forces. A deleted call site changes no
-    // behaviour that any other reading can see.
+    // Four paths reach a dispatch: the registry fast path, the build path, the
+    // re-dispatch an external apply forces, and the rollback a withdrawal
+    // dispatches to the pin's landing revision. A deleted call site changes no
+    // behaviour that any other reading can see; an added one is a new answer to
+    // "which revision goes on the cluster", so it is counted here on purpose.
     let guarded = production.matches(GUARD_CALL).count();
     assert_eq!(
-        guarded, 3,
+        guarded, 4,
         "{guarded} of the deployer's dispatch paths ask the guard. Adding or removing one is a \
          change to which revisions get rolled — and to nothing else this file can observe"
+    );
+}
+
+#[test]
+fn only_the_withdrawal_skips_the_ci_verdict() {
+    let source = read(DEPLOYER);
+    let production = production_source(&source);
+    // The guard takes a `withdrawal` flag that skips the CI gate: that gate asks
+    // whether the revision being rolled has a failing check, and an operator's
+    // withdrawal is not an answer to that question. Every other path has to ask
+    // it. The flag is a bare `true`/`false` at a call site, so moving it — or
+    // copying a call and leaving it `true` — would roll red revisions with
+    // nothing in this file, or any series, reading differently.
+    let skipping = production
+        .match_indices(GUARD_CALL)
+        .filter(|(i, _)| {
+            let tail = &production[*i..];
+            let args = &tail[..tail.find(')').unwrap_or(tail.len())];
+            args.trim_end().ends_with("true")
+        })
+        .count();
+    assert_eq!(
+        skipping, 1,
+        "{skipping} of the deployer's dispatch paths skip the CI verdict. Only a withdrawal is \
+         entitled to: it rolls a revision that was already delivered, whose check verdict is \
+         whatever it was then and will never be re-asked"
     );
 }
 
