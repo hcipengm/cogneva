@@ -800,6 +800,12 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                     .settle_secs
                     .max(crate::config::ConfigDeclarationConfig::MIN_SETTLE_SECS),
             ),
+            std::time::Duration::from_secs(
+                obs_cfg
+                    .config_declaration
+                    .hold_secs
+                    .max(crate::config::ConfigDeclarationConfig::MIN_HOLD_SECS),
+            ),
             self.alert_store.clone(),
             declaration_notifier,
             ctx.consume_service::<dyn cog_core::MetricsBackend>(),

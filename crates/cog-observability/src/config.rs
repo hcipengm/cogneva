@@ -61,11 +61,28 @@ pub struct ConfigDeclarationConfig {
     /// applied around it; when the file has moved on by the second read, the
     /// process is on its way to being replaced rather than stuck.
     pub settle_secs: u64,
+    /// How long to wait before the third read, taken only when the second one
+    /// still differs.
+    ///
+    /// The settle window separates "the mount has not caught up yet" from "the
+    /// document is behind". It does not separate "this pod is about to be
+    /// replaced" from "this pod will never be replaced": both keep differing
+    /// until the process dies or someone acts, and the process that is about to
+    /// die cannot report that about itself. The hold is that distinction in
+    /// time — a config-changing rollout replaces the pod well inside it, while
+    /// a stuck process keeps differing past it. Measured 2026-10-22: a rollout
+    /// that added one alert rule raised this row for 73 seconds, one row per
+    /// config-changing deploy, and every one of them was the old pod saying its
+    /// replacement had not happened yet.
+    pub hold_secs: u64,
 }
 
 impl Default for ConfigDeclarationConfig {
     fn default() -> Self {
-        Self { settle_secs: 60 }
+        Self {
+            settle_secs: 60,
+            hold_secs: 300,
+        }
     }
 }
 
@@ -74,6 +91,11 @@ impl ConfigDeclarationConfig {
     /// own sync period, so a window shorter than that would read the same stale
     /// document twice and call a rollout a permanent gap.
     pub const MIN_SETTLE_SECS: u64 = 10;
+
+    /// Floor for the hold. Below the settle floor it would only re-read the
+    /// same window; the pod replacement it is there to wait out takes minutes,
+    /// not seconds.
+    pub const MIN_HOLD_SECS: u64 = 60;
 }
 
 /// Persistent-volume footprint watcher: measures the application data
@@ -677,6 +699,10 @@ pub const OBS_ENV: &[(&str, &str)] = &[
     (
         "COGNEVA_CONFIG_DECLARATION_SETTLE_SECS",
         "config_declaration.settle_secs",
+    ),
+    (
+        "COGNEVA_CONFIG_DECLARATION_HOLD_SECS",
+        "config_declaration.hold_secs",
     ),
 ];
 

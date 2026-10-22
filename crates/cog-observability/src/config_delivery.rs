@@ -87,9 +87,26 @@ pub fn decide(first: &DocumentDelivery, later: &DocumentDelivery, source: &str) 
     }
 }
 
+/// Whether a second reading is enough to conclude, or whether the window a pod
+/// replacement takes has to be waited out first.
+///
+/// Only `Differs` is held. `Unusable` says the mounted document cannot be used
+/// at all — the atomic writer swaps a complete file in, so a half-written
+/// document is not a rollout — and `Absent`/`Matches` already conclude.
+pub fn needs_the_hold(later: &DocumentDelivery) -> bool {
+    matches!(later, DocumentDelivery::Differs(_))
+}
+
 /// Read the document, wait out the settle window, read it again, and act.
+///
+/// The hold is taken only when the second read still differs, and the verdict is
+/// then decided over the last two readings rather than the first two: a pod that
+/// was replaced during the hold is gone, so this task dies with it and writes
+/// nothing; a process that outlived its own replacement is the stuck one this
+/// check exists to report.
 pub async fn run_config_declaration_check(
     settle: Duration,
+    hold: Duration,
     store: Option<Arc<PostgresAlertStore>>,
     notifier: Option<Arc<AlertManager>>,
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
@@ -101,7 +118,29 @@ pub async fn run_config_declaration_check(
         tokio::time::sleep(settle).await;
     }
     let later = judge(&path);
-    match decide(&first, &later, &source) {
+    // The pair that decides is (later, after_hold): whatever the first read saw
+    // is now two windows old, and the question has narrowed to "did the
+    // replacement happen".
+    let (action, seen) = if hold > Duration::ZERO && needs_the_hold(&later) {
+        tokio::time::sleep(hold).await;
+        let after_hold = judge(&path);
+        (decide(&later, &after_hold, &source), after_hold)
+    } else {
+        (decide(&first, &later, &source), later)
+    };
+    act(action, store, notifier, metrics, &source, &seen).await
+}
+
+/// Carry out a verdict: raise or close the row, or leave it alone and say why.
+async fn act(
+    action: DeliveryAction,
+    store: Option<Arc<PostgresAlertStore>>,
+    notifier: Option<Arc<AlertManager>>,
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    source: &str,
+    seen: &DocumentDelivery,
+) {
+    match action {
         DeliveryAction::Fire(message) => {
             warn!(source = %source, "{}", message);
             set_row(
@@ -110,7 +149,7 @@ pub async fn run_config_declaration_check(
                 metrics.as_ref(),
                 CONFIG_DECLARATION_RULE,
                 true,
-                &source,
+                source,
                 &message,
             )
             .await;
@@ -119,7 +158,7 @@ pub async fn run_config_declaration_check(
             info!(
                 source = %source,
                 "{}",
-                config_sections::describe_delivery(&source, &first)
+                config_sections::describe_delivery(source, seen)
             );
             set_row(
                 &store,
@@ -127,7 +166,7 @@ pub async fn run_config_declaration_check(
                 metrics.as_ref(),
                 CONFIG_DECLARATION_RULE,
                 false,
-                &source,
+                source,
                 "",
             )
             .await;
@@ -545,6 +584,43 @@ mod tests {
             }
             other => panic!("expected an alert, got {other:?}"),
         }
+    }
+
+    /// Only `Differs` is held. A document that is unusable is already a failed
+    /// delivery at the first read — the atomic writer swaps a whole file in, so
+    /// there is no half-written stage a rollout could be in — and holding it
+    /// would only delay the row the deployment needs to see.
+    #[test]
+    fn only_a_document_that_differs_waits_out_its_replacement() {
+        assert!(needs_the_hold(&differs()));
+        assert!(!needs_the_hold(&DocumentDelivery::Matches));
+        assert!(!needs_the_hold(&DocumentDelivery::Absent));
+        assert!(!needs_the_hold(&DocumentDelivery::Unusable("bad".into())));
+    }
+
+    /// What the hold buys, stated as the sequence the three reads form.
+    ///
+    /// A pod that is replaced during the hold never reaches the third read, so
+    /// the pair this assertion covers is the one a *surviving* process sees: the
+    /// file moved on between the second and third reads means the replacement
+    /// happened late and this process is still the one that never got the
+    /// document — silence is wrong there, and `decide` is what says so. The
+    /// case the hold removes is the other one: the pod dies mid-hold, and this
+    /// task dies with it, so no row is written at all.
+    #[test]
+    fn the_hold_turns_only_the_third_read_into_the_verdict() {
+        // Second read differs, third read still differs: the stuck process.
+        assert!(matches!(
+            decide(&differs(), &differs(), SOURCE),
+            DeliveryAction::Fire(_)
+        ));
+        // Second read differs, third read matches: the replacement landed while
+        // this process was still running. It is a rollout behind, and stays
+        // silent — the same verdict the settle window gives one read earlier.
+        assert!(matches!(
+            decide(&differs(), &DocumentDelivery::Matches, SOURCE),
+            DeliveryAction::Silent(_)
+        ));
     }
 
     /// A document that vanished or broke between the two reads is still a

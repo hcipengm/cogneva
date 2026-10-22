@@ -114,6 +114,14 @@ fn the_plugin_runs_the_check_and_persists_its_verdict() {
         plugin.contains("config_declaration"),
         "投递判据的节奏不再来自配置面"
     );
+    // The hold is what keeps a config-changing rollout from writing a row that
+    // says "my replacement has not happened yet" — measured 2026-10-22: one such
+    // row per deploy, 73 seconds each. Dropping it from the call site turns every
+    // rollout back into that row, and no other test would notice.
+    assert!(
+        plugin.contains("hold_secs") && plugin.contains("MIN_HOLD_SECS"),
+        "投递判据不再等替换窗口：每一次改配置的滚动都会先写一行短命告警"
+    );
 }
 
 /// The row this check raises is the one the human surface serves.
