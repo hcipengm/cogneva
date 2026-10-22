@@ -1154,7 +1154,33 @@ async fn a_reopen_that_could_not_ask_the_tree_stores_no_answer() {
 /// verb does: a plain delete on the four columns the intake is keyed on, not
 /// through the store -- the store has no withdrawal, and the whole point of the
 /// verb is that it is the declarer's to run.
+/// The lock a probe holds while it compares two readings of the closure.
+///
+/// The closure counts every declaration in the database, not the caller's, so a
+/// probe that reads it, does one thing, and reads it again is comparing two
+/// whole-account numbers. That only holds still if nothing removes rows in
+/// between -- and something does: every probe here deletes its own rows at the
+/// end, so a neighbour finishing inside another probe's window moves the count
+/// for a reason that probe never did. This is not hypothetical. The batch probe
+/// declares 66 rows and cleans them up; when that cleanup landed between the
+/// closure probe's two reads, `owed` fell 67 -> 2 while the probe had only added
+/// a declaration, and the reading blamed the store for it. So every delete in
+/// this file takes this lock, and a probe that compares closure readings holds
+/// it across them: the account's population may move between comparisons, never
+/// under one.
+const CLOSURE_PROBE_LOCK: i64 = 5_110_202_610;
+
+async fn take_closure_lock(tx: &mut sqlx::PgTransaction<'_>) {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(CLOSURE_PROBE_LOCK)
+        .execute(&mut **tx)
+        .await
+        .expect("take the closure probe lock");
+}
+
 async fn withdraw_declaration(pool: &PgPool, id: &ChangeIdentity, doc: &str) {
+    let mut tx = pool.begin().await.expect("open the withdrawal transaction");
+    take_closure_lock(&mut tx).await;
     let removed = sqlx::query(
         "DELETE FROM change_ledger_declared \
          WHERE (kind, scope, literal, doc) = ($1, $2, $3, $4)",
@@ -1163,10 +1189,11 @@ async fn withdraw_declaration(pool: &PgPool, id: &ChangeIdentity, doc: &str) {
     .bind(&id.scope)
     .bind(&id.literal)
     .bind(doc)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .expect("withdraw the declaration")
     .rows_affected();
+    tx.commit().await.expect("commit the withdrawal");
     assert_eq!(removed, 1, "the declaration was there to withdraw");
 }
 
@@ -1345,13 +1372,21 @@ async fn the_reason_of_a_transition_is_recorded_with_it() {
 /// says what it wants, and until the closure was read the account had no way to
 /// say which of those demands the tree ended up holding. The assertions are
 /// stated as "at least" on the global counts because the other probes in this
-/// file share the database and only ever add declarations -- a strict equality
-/// would be a test that fails when a neighbour runs, which teaches a reader to
-/// rerun rather than to look.
+/// file share the database and add declarations of their own -- a strict
+/// equality would be a test that fails when a neighbour runs, which teaches a
+/// reader to rerun rather than to look. "At least" is only sound if the account
+/// cannot shrink under the probe, and neighbours do delete their rows on the way
+/// out, so the three reads are taken while holding `CLOSURE_PROBE_LOCK` and no
+/// neighbour's cleanup can land between them.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn a_demand_is_satisfied_by_a_landing_and_owed_until_one_is_measured() {
     let (store, pool, marker) = store().await;
+    // An empty transaction, held open for one thing only: the advisory lock is
+    // transaction-scoped, so dropping it (including on a panic) releases the
+    // lock rather than leaking it back into the pool with the connection.
+    let mut hold = pool.begin().await.expect("open the closure hold");
+    take_closure_lock(&mut hold).await;
     let id = identity(&marker, "demand");
     let doc = format!("{marker}.md");
     let before = store
@@ -1412,6 +1447,7 @@ async fn a_demand_is_satisfied_by_a_landing_and_owed_until_one_is_measured() {
         "the landing is what answers the demand: before {declared:?}, after {landed:?}"
     );
 
+    hold.rollback().await.expect("release the closure hold");
     cleanup(&pool, &marker).await;
 }
 
@@ -1498,9 +1534,14 @@ async fn the_face_census_reads_a_number_for_the_age_and_three_buckets_that_add_u
 }
 
 async fn cleanup(pool: &PgPool, marker: &str) {
+    // One transaction, and the closure lock first: the deletes below are what a
+    // neighbour's two reads of the whole-account closure must not see half of,
+    // so they land all at once and only while no probe is comparing readings.
+    let mut tx = pool.begin().await.expect("open the cleanup transaction");
+    take_closure_lock(&mut tx).await;
     sqlx::query("DELETE FROM change_ledger WHERE scope LIKE $1")
         .bind(format!("{marker}/%"))
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .expect("clean up the probe rows");
     // The declarations this run queued, which are also the demand side of the
@@ -1509,21 +1550,21 @@ async fn cleanup(pool: &PgPool, marker: &str) {
     // run's closure read higher for a reason nobody could find in that run.
     sqlx::query("DELETE FROM change_ledger_declared WHERE scope LIKE $1")
         .bind(format!("{marker}/%"))
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .expect("clean up the probe declarations");
     // The intake is left as it was too: a queued retirement names the same
     // marker, and a row left behind would be folded by a later run's pass.
     sqlx::query("DELETE FROM change_ledger_retired WHERE scope LIKE $1")
         .bind(format!("{marker}/%"))
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .expect("clean up the probe retirements");
     // And the reopen series, which nothing else ever deletes: its rows name the
     // same marker and outlive the account rows they were written beside.
     sqlx::query("DELETE FROM change_reopen WHERE scope LIKE $1")
         .bind(format!("{marker}/%"))
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .expect("clean up the probe reopens");
     // The event half outlives the account by design, so it is deleted by its
@@ -1531,7 +1572,8 @@ async fn cleanup(pool: &PgPool, marker: &str) {
     // table was built not to have.
     sqlx::query("DELETE FROM change_ledger_event WHERE scope LIKE $1")
         .bind(format!("{marker}/%"))
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .expect("clean up the probe events");
+    tx.commit().await.expect("commit the cleanup");
 }
