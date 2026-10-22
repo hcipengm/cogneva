@@ -1,3 +1,4 @@
+//! principle: feedback_failure_digest_budget_went_to_the_tail
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
