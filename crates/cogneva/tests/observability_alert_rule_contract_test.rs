@@ -373,7 +373,7 @@ const PRODUCED: &[(&str, &str)] = &[
     // contract instead.
     (
         "cogneva_loop_period_seconds",
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     // The work a cycle may run without a beat: the stall rule adds it to the
     // period, because a cadence bounds only the wait between cycles and a loop
@@ -381,22 +381,22 @@ const PRODUCED: &[(&str, &str)] = &[
     // construction.
     (
         "cogneva_loop_work_budget_seconds",
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     (
         "cogneva_loop_tick_age_seconds",
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     (
         "cogneva_loop_deaths_total",
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     // The restarts are a rule of their own rather than a note on the death rule:
     // a loop that panicked and was run again publishes all of its series again,
     // so every other reading in the deployment shows a loop that never stopped.
     (
         "cogneva_loop_restarts_total",
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     // Who holds the single-writer roles. A loop that exists once per deployment
     // rather than once per process takes a lease on the role it guards, and
@@ -420,23 +420,23 @@ const PRODUCED: &[(&str, &str)] = &[
     // family, which is what the probe-failure counter beside it is read for.
     (
         "cogneva_loop_role_declared",
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     (
         "cogneva_loop_owner_held",
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     (
         "cogneva_loop_owner_acquisitions_total",
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     (
         "cogneva_loop_owner_losses_total",
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     (
         "cogneva_loop_owner_probe_failures_total",
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     (
         "cogneva_landing_failures_total",
@@ -1353,6 +1353,26 @@ const FOREIGN: &[(&str, &str)] = &[
     (
         "cogneva_host_target_gc_outcome",
         "同一生产者（闭集六种结局的 one-hot：below_trigger／released／floor_unreachable／script_unverified／probe_failed／planned）。三种红必须分开：够不到地板是「去看谁在吃盘」，probe_failed 是进程身份读不到（权限），script_unverified 是脚本身份立不住（提交或还原）。合成一个布尔就指不出该修哪边",
+    ),
+    (
+        "cogneva_host_nvme_percentage_used",
+        "宿主读数 `scripts/host/cogneva-nvme-wear-reading.sh`（私有仓 brain，登记行 `nvme_wear`）：每块 NVMe 的磨损百分比，读自 `nvme smart-log`。资源账其余每一格问「用掉多少」，只有这一格问「还能用多久」——磨损没有补救动作（清缓存、删卷、抬配额都退不回这个数），只能在它走到 100% 之前换盘。node-exporter 的 nvme collector 只发容量与设备状态、不导出磨损（SMART log 要 ioctl 到控制器字符设备），所以别处没有第二份读数",
+    ),
+    (
+        "cogneva_host_nvme_media_errors_total",
+        "同一生产者（SMART 记到的介质错误数，只会涨）。与磨损那一格分开：介质错误是盘已经在坏，处置是立刻换盘，与它磨到多少无关——一块用了 12% 的盘也可能已经在掉块",
+    ),
+    (
+        "cogneva_host_nvme_critical_warning",
+        "同一生产者（SMART 的 critical warning 位图）。与上一格同一条规则读，但它是控制器自己举手而不是累计计数：位图非零时健康状态已经被控制器判定为异常，不需要等介质错误累计出来",
+    ),
+    (
+        "cogneva_host_nvme_devices",
+        "同一生产者（这一拍从 `nvme list` 里发现的盘数）。覆盖格，与下一条一起构成「有没有盘没读到」：单看每一块盘的序列，一块盘读不出来与一块健康的盘在指标面上同形（都是没有序列）",
+    ),
+    (
+        "cogneva_host_nvme_readable",
+        "同一生产者（其中 SMART 读成功的盘数）。`devices - readable > 0` 是「有盘没人看着它的磨损」；**全部**读不到时生产者退 3、一条序列都不印，那一档归 `CognevaHostReadingProducerUnreadable`（producer=\"nvme_wear\"），这一条不兼任",
     ),
     (
         "cogneva_file_size_census_unjudged",

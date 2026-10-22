@@ -518,22 +518,22 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     (
         "cogneva_loop_tick_age_seconds",
         &["loop"],
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     (
         "cogneva_loop_period_seconds",
         &["loop"],
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     (
         "cogneva_loop_registered",
         &["loop"],
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     (
         "cogneva_loop_deaths_total",
         &["loop"],
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     // Restarts are on the same panel as deaths because the whole point of the
     // pair is reading them together: a loop that panicked and came back shows
@@ -542,7 +542,7 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     (
         "cogneva_loop_restarts_total",
         &["loop"],
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     // The single-writer roles, drawn as one panel because none of the four
     // answers its own question: the holder cell cannot say the work moved, and
@@ -553,22 +553,22 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     (
         "cogneva_loop_owner_held",
         &["loop"],
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     (
         "cogneva_loop_owner_acquisitions_total",
         &["loop"],
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     (
         "cogneva_loop_owner_losses_total",
         &["loop"],
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     (
         "cogneva_loop_owner_probe_failures_total",
         &["loop"],
-        "crates/cog-core/src/loop_health.rs",
+        "crates/cog-core/src/contract/loop_health.rs",
     ),
     // Orphans collected, against the zombies still waiting. The gauge is what
     // the rule `orphans_unreaped` watches and it can only say a reaper stopped:
