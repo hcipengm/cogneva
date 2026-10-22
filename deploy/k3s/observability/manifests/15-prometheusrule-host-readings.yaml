@@ -752,8 +752,13 @@ spec:
     # 红与停都进了表、都没人接，而系统里没有任何一个数说「这件事还没人接管」。
     - name: cogneva-alert-attention
       rules:
-        # 响了超过窗口（读数自己带 1800 秒）还没人确认。修法只有一条：看那条告警并确认
-        # （WebUI 告警浮层的确认按钮写 `acknowledged_at`），读数的下一拍就会把它从名单上摘掉。
+        # 响了超过窗口（读数自己带 1800 秒）、而**人和机器都没接**。「接了」有两个写者：
+        # 人确认（WebUI 告警浮层写 `acknowledged_at`），或 `signal_watcher` 按这条告警的
+        # `dedup_key` 开出了任务——后者永远不会写 `acknowledged_at`，所以只看人那一格，
+        # 系统恢复自愈之后这条规则会在健康态上永远亮着。
+        # 两条修法对应两个断点：人没接 ⇒ 看那条告警并确认；机器没接 ⇒ 查信号接收闸
+        # （`cogneva_signal_watcher_held_total` 在涨：LLM 池被暂停时整条自发现都被搁置，
+        # 告警也就没人被开成任务）。
         # 这一条自己也会进表、也会被同一个读数数到——那是诚实的：一条「没人看告警」的告警
         # 本身没人看时，它说的仍然是事实，而确认那条原告警之后两者一起 resolve。
         - alert: CognevaAlertUnattended
@@ -763,8 +768,8 @@ spec:
             cogneva_io_managed: "true"
             severity: warning
           annotations:
-            summary: "有告警响了半小时以上还没人确认（见 cogneva_alert_attention_unattended_rule）"
-            description: "`cogneva_alert_attention_unattended_rule{rule=…}` 点名是哪几条，`cogneva_alert_attention_oldest_unacknowledged_age_seconds` 给最老的那一条响了多久。`acknowledged_at` 是 `alerts` 表里唯一机器可读的「有人看过」——它由 WebUI 告警浮层的确认按钮写，告警重新点火时清空，所以它记的是**这一轮**有没有人接，不是这条规则曾经被人看过。先逐条处置点名的那几条（能修的修、不能修的确认并写下原因），确认之后这一条自己会 resolve。"
+            summary: "有告警响了半小时以上，人和机器都没接（见 cogneva_alert_attention_unattended_rule）"
+            description: "`cogneva_alert_attention_unattended_rule{rule=…}` 点名是哪几条，`cogneva_alert_attention_oldest_unattended_age_seconds` 给最老的那一条响了多久。`cogneva_alert_attention_acknowledged` 与 `_filed` 分别数「人确认过」与「机器已开出任务」——两个数是分开的，因为断点不同：前者由 WebUI 告警浮层的确认按钮写（告警重新点火时清空，所以它记的是**这一轮**有没有人接），后者是 `signal_watcher` 按告警的 `dedup_key` 开的那个任务。先看 `_filed` 是不是 0 而 `cogneva_signal_watcher_held_total` 在涨：那是「信号接收闸被 LLM 池暂停」挡住了整条自发现，修法在池，不在告警；否则才逐条处置（能修的修、不能修的确认并写下原因）。两者都做到之后这一条自己会 resolve。"
 
     # 这张表本身以什么速度长：前面两组判「进没进表」「进了有没有人看」，都是逐行的读数，
     # 没有一条在看流量。于是「一条规则一小时写几十行」只能靠人去数表才发现——2026-10-22
