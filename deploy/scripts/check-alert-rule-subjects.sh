@@ -270,6 +270,7 @@ POD_SUBJECT = {
     'pod_restarting_repeatedly': '同上',
     'pod_oom_killed': '同上',
     'container_memory_near_limit': '讲的就是这个容器',
+    'container_memory_limit_sits_under_its_page_cache': '讲的就是这个容器——判的是它自己的上限装不装得下它自己走出来的那棵树。代价与前一条相同：DaemonSet 每滚一次就换一代身份，同一状况在新一代上重开一条；收这个代价是因为把 pod/container 聚合掉之后，这条读数就只剩一个数，说不出是哪个容器的上限比它自己的足迹还小',
     'redis_restarted': 'redis 是 StatefulSet，Pod 名稳定，Pod 就是它',
     'pod_stuck_terminating': '讲的是这个 Pod 的删除侧',
     'pod_failed_without_a_restart': '讲的就是这个 Pod 进了 Failed 阶段；Pod 名是这条事实本身，聚合掉它就只剩一个数，说不出是哪个 Pod 没被替换',
