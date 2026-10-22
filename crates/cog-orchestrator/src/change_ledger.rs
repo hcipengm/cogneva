@@ -7169,6 +7169,47 @@ mod tests {
         );
     }
 
+    /// A re-check that still holds writes no arrival reading.
+    ///
+    /// This pass asks rows that are already landed, and it writes the answer back
+    /// so `measured_at` can order the set. The write must not carry a parent
+    /// observation: the parent of *this* revision held the row's artifact already
+    /// -- the row was landed -- so every row the account had as done would come
+    /// back saying its artifact was "already there", which is precisely the one
+    /// reading the column exists to tell apart from a real arrival. Rows that
+    /// arrived before the column existed would be rewritten as if the column had
+    /// answered for them.
+    #[tokio::test]
+    async fn a_recheck_that_still_holds_writes_no_arrival_reading() {
+        let (dir, _first, _second) = two_revision_repo();
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = tree.snapshot().await.expect("the fixture is readable");
+        let store = FakeLedger {
+            rows: vec![ChangeLedgerRow {
+                identity: ChangeIdentity::new("grep", "file", "second"),
+                ..landed_row("file", None)
+            }],
+            ..Default::default()
+        };
+        let mut unsettled = HashMap::new();
+
+        let pass = reopen_pass(&store, &tree, &snapshot, &mut unsettled, &[]).await;
+
+        assert_eq!(pass.rechecked, 1, "the row's check still holds at the tip");
+        assert_eq!(pass.reopened, 0, "nothing left landed, so nothing reopened");
+        let measurements = store.measurements();
+        assert_eq!(measurements.len(), 1, "the re-check was written back");
+        assert_eq!(
+            measurements[0].state,
+            ChangeState::Landed,
+            "the check holds, so the row keeps its state"
+        );
+        assert_eq!(
+            measurements[0].parent_observation, None,
+            "a re-check is not an arrival: the parent of this revision already had it"
+        );
+    }
+
     /// A retired row whose scope came back is measured again.
     ///
     /// `landed` names the deletion commit and is true of it; the surface is not
