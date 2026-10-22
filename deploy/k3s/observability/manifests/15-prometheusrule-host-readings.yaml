@@ -216,3 +216,91 @@ spec:
           annotations:
             summary: "根盘的刹车触发线读不出来（缺 free 序列）"
             description: "free 与 avail 差的是 root 保留块；缺了它触发线落不到刹车那把尺子上。查 node-exporter 的 filesystem collector 是否还在发 node_filesystem_free_bytes。"
+
+    # 刹车本身（`host-target-gc`，每 30 分钟一拍的那个回收器）的读数。
+    #
+    # 为什么单独成组：上面 `cogneva-host-disk-runway` 判的是**盘**往哪走，它答不了
+    # 「刹车还在不在踩」。回收器每拍把判词写进 `~/.local/state/cogneva/target-gc.json`，
+    # 而那份文件曾经只进 journal、不进读数面——于是三种坏法在 Prometheus 里逐字同形，
+    # 都是一条序列也没有：
+    #   · timer 停了：脚本不再跑，盘照涨，runway 报的是盘（它说得对，但说不出刹车停了）；
+    #   · 跑了但拒绝动手：脚本身份立不住（被改过／不在仓库里）或有进程读不到，两条都
+    #     fail-closed 地不删——安全方向对，代价是「什么都没回收」；
+    #   · 跑了、每一档都走完，盘仍在地板之上：缓存不是原因。
+    # 三条的修法完全不同，所以三条分开，不合并成一个布尔。
+    #
+    # 阈值一律从生产者发布的周期推（界是「几倍周期」）；周期量不出来时 Stale 那条对它
+    # 恒哑，所以旁边单立一条报缺席——与凭证面那组同一个理由。
+    - name: cogneva-host-target-gc
+      rules:
+        - alert: CognevaHostTargetGcStale
+          expr: |
+            cogneva_host_target_gc_age_seconds
+              > 6 * cogneva_host_target_gc_period_seconds
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "宿主构建缓存回收器停了，最后一次运行是 {{ $value | humanizeDuration }} 以前"
+            description: "状态文件停在生前那一拍的判词上，所以 outcome 看上去仍然正常。界是周期序列的 6 倍（现网约 3 小时）。查 `systemctl --user list-timers cogneva-host-target-gc.timer` 与 `systemctl --user status cogneva-host-target-gc.service`；盘照涨而刹车没跑，最后一段只能靠 runway 那条提前量兜。"
+
+        # 上一条的分母缺席时它自己不响（`age > 6 * 周期` 在没有周期序列时判不出来）。
+        # 左半边仍是「这一拍确实有数据」：这台机器上根本没装宿主读数通道时两条序列都不在，
+        # 裸 absent 会从装上那天起恒响——那不叫读不出节拍，叫这一面不在这台机器上。
+        # `on()` 空集是刻意的：两侧都不带标签，连接键就是「没有键」；将来谁给其中一侧
+        # 加了标签，这一行就必须跟着改，写成裸 `unless` 会把那种错藏起来。
+        - alert: CognevaHostTargetGcCadenceUnknown
+          expr: |
+            cogneva_host_target_gc_measured == 1
+              unless on() cogneva_host_target_gc_period_seconds
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "读不出回收器的节拍，「它停了多久」这一条判不了"
+            description: "界是「6 × 周期」，周期来自 timer 自己的声明（`systemd-analyze calendar`）。单元名变了、timer 没装、或 systemd-analyze 不可用时这一格缺席。查 `systemctl --user cat cogneva-host-target-gc.timer`。"
+
+        # 从没跑成过：生产者只发 measured=0、不发年龄，缺席不会告警。与「停掉」修法不同——
+        # 这里是状态文件不在（查单元里的路径与有没有装过），那边是定时器停了（查 timer）。
+        - alert: CognevaHostTargetGcNeverRan
+          expr: cogneva_host_target_gc_measured == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "宿主构建缓存回收器从没跑成过一拍照"
+            description: "状态文件不在：先看 `systemctl --user status cogneva-host-target-gc.timer` 与 `deploy/scripts/install-host-target-gc.sh` 有没有在这台机器上跑过，不要先怀疑盘。"
+
+        # 身份立不住：脚本被改过、不在仓库里、或 git 读不出来，它一律不释放（删除不可撤销，
+        # 而磁盘等一次提交只要几分钟）。这种运行写出的 outcome 可能是 below_trigger，只看
+        # 结局的话与健康逐字同形——所以按身份这一格单独判。
+        - alert: CognevaHostTargetGcScriptUnverified
+          expr: cogneva_host_target_gc_script_committed == 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "回收器跑的那份脚本不是 HEAD 里的那一份，它拒绝释放任何缓存"
+            description: "检出的工作树上有未提交的改动，或有文件被换掉了。回收器比的是 blob 逐字节相等；提交或还原 `deploy/scripts/host-target-gc.sh` 之后下一拍恢复。读数里的 `rev` / `rev_state` 就是它给自己算的身份。"
+
+        # 有进程是「我们的」但读不到属主或工作目录：整轮一个字节都不删（fail-closed）。
+        # 与上一条不同——那边是脚本的身份，这边是**进程**的身份，修法在权限上。
+        - alert: CognevaHostTargetGcProbeFailed
+          expr: cogneva_host_target_gc_outcome{outcome="probe_failed"} == 1
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "有进程读不到属主／工作目录，回收器整轮不释放"
+            description: "它判断某棵树是不是被占着时必须认得占着它的进程；认不出就不动（删除不可撤销）。journal 里那一行会点名是哪个 pid、读不到的是什么。"
+
+        # 便宜的三档都走完、盘仍在地板之上：缓存不是这颗盘被填满的原因。这条红的意思是
+        # 「去看是谁在吃盘」，不是「缓存没删干净」——所以它与上两条分开。
+        - alert: CognevaHostTargetGcFloorUnreachable
+          expr: cogneva_host_target_gc_outcome{outcome="floor_unreachable"} == 1
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "构建缓存已经放到地板之上仍回不去"
+            description: "它把它能判的树都放过了，盘依然在地板之上。运行 journal 那一行会说是「缓存不是原因」还是「破坏性的一档被推迟到了 85%」。看谁在吃：`bash scripts/host/cogneva-host-footprint-trend-reading.sh`。"

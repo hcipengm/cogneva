@@ -1299,6 +1299,26 @@ const FOREIGN: &[(&str, &str)] = &[
         "disk_trend_trigger_line_readable",
         "同一生产者（触发线落不落得下来：1 落下了、0 没落下）。缺 `node_filesystem_free_bytes` 时保留块量不出来，触发线就落不到刹车那把尺子上，此时 `disk_trend_days_to_trigger` 整条缺席——「读不出来」与「还有很久」在规则里是同一个空集，这一格存在的唯一目的就是把它们分开。整条生产者死掉不在射程内，那由 `host_reading_producer_up` 按 producer 名报",
     ),
+    (
+        "cogneva_host_target_gc_measured",
+        "宿主构建缓存回收器的读数 `scripts/host/cogneva-target-gc-reading.sh`（私有仓 brain），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出。它读的是回收器自己每拍写的状态文件（`~/.local/state/cogneva/target-gc.json`）。1 是这一拍有一份状态，0 是从没跑成过——「状态文件不在」与「读不到」由退出码 3（一条序列都不印）分开",
+    ),
+    (
+        "cogneva_host_target_gc_age_seconds",
+        "同一生产者（最后一次运行有多旧）。停产时判词会停在最后一次的值上，只有这一格继续长，所以「停了多久」的界只能按它判",
+    ),
+    (
+        "cogneva_host_target_gc_period_seconds",
+        "同一生产者（拉起这一拍的 timer 声明的周期，现网 1800 秒）。规则里的界是它的倍数，而周期由 timer 自己声明：写死一个常数的话，宿主上改了调度、界不会跟着改，失败方向是静默的。量不出时整格缺席，缺席由 `CadenceUnknown` 那条规则单独报",
+    ),
+    (
+        "cogneva_host_target_gc_script_committed",
+        "同一生产者（跑的那份脚本是不是 HEAD 里的那一份，比的是 blob 逐字节相等）。为 0 时回收器一个字节都不删——删除不可撤销，而磁盘等一次提交只要几分钟。这种运行写出的 outcome 可能是 `below_trigger`，只看结局的话与健康逐字同形，所以身份单独成一格",
+    ),
+    (
+        "cogneva_host_target_gc_outcome",
+        "同一生产者（闭集六种结局的 one-hot：below_trigger／released／floor_unreachable／script_unverified／probe_failed／planned）。三种红必须分开：够不到地板是「去看谁在吃盘」，probe_failed 是进程身份读不到（权限），script_unverified 是脚本身份立不住（提交或还原）。合成一个布尔就指不出该修哪边",
+    ),
     ("up", "Prometheus 采集目标存活序列"),
 ];
 
