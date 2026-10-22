@@ -251,6 +251,7 @@ mod tests {
         cog_redis::ConnectBudget {
             budget_ms: 300,
             retries: 1,
+            ..cog_redis::ConnectBudget::default()
         }
     }
 

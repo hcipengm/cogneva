@@ -27,6 +27,18 @@
 //! trying have their own retry loop; what they never get from this crate is a
 //! call that hangs.
 //!
+//! A *connected* manager was the other half of that promise, and it was not
+//! kept: a command issued on a socket the peer silently stopped answering rode
+//! the operating system's TCP timeout. Measured on 2026-10-22: a consumer's
+//! reads went unanswered for **ten minutes** while the refusal counter stayed at
+//! zero — a hung read is not a refused one, so nothing counted it, nothing
+//! reconnected, and the only thing that ended the stall was the kernel giving
+//! up. Every connection built here therefore also carries a response timeout
+//! ([`ConnectBudget::response_timeout`]): a reply that does not arrive in that
+//! time is an I/O error, which is what makes the manager replace the socket and
+//! what the caller counts. A call site whose commands legitimately block longer
+//! (a `XREADGROUP ... BLOCK`) sets its own, above its block period.
+//!
 //! Scope: this crate owns *how a connection is built*. What is stored on redis —
 //! state, streams, registries, audit — belongs to `cog-storage` and `cog-stream`.
 
@@ -46,13 +58,30 @@ const DEFAULT_RETRIES: usize = 2;
 /// A budget below this would turn a momentary refusal into a permanent error.
 const MIN_BUDGET_MS: u64 = 100;
 
-/// How long a connection attempt may take, and how many times it is retried.
+/// How long one command on an established connection may wait for its reply.
+///
+/// Thirty seconds is not a latency target: it is the point past which a reply
+/// is not late but lost. Every command this workspace issues against redis other
+/// than a blocking stream read answers in milliseconds, and the reads that do
+/// block say so explicitly and widen this. Left unset, the wait is the kernel's,
+/// which is measured in minutes.
+const DEFAULT_RESPONSE_TIMEOUT_MS: u64 = 30_000;
+
+/// A response timeout below this is not a bound, it is a race against the
+/// round trip.
+const MIN_RESPONSE_TIMEOUT_MS: u64 = 100;
+
+/// How long a connection attempt may take, how many times it is retried, and how
+/// long one command on the finished connection may wait for its reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectBudget {
     /// Total budget in milliseconds.
     pub budget_ms: u64,
     /// Retries after the first attempt.
     pub retries: usize,
+    /// Upper bound on a single command's round trip, on the connection this
+    /// budget builds.
+    pub response_timeout_ms: u64,
 }
 
 impl Default for ConnectBudget {
@@ -60,6 +89,7 @@ impl Default for ConnectBudget {
         Self {
             budget_ms: DEFAULT_BUDGET_MS,
             retries: DEFAULT_RETRIES,
+            response_timeout_ms: DEFAULT_RESPONSE_TIMEOUT_MS,
         }
     }
 }
@@ -85,7 +115,17 @@ impl ConnectBudget {
                 .unwrap_or(default.budget_ms),
             retries: read("COGNEVA_REDIS_CONNECT_RETRIES").unwrap_or(default.retries as u64)
                 as usize,
+            response_timeout_ms: read("COGNEVA_REDIS_RESPONSE_TIMEOUT_MS")
+                .filter(|v| *v >= MIN_RESPONSE_TIMEOUT_MS)
+                .unwrap_or(default.response_timeout_ms),
         }
+    }
+
+    /// The same budget with a different response timeout, for the call sites
+    /// whose commands legitimately block past the default.
+    pub fn with_response_timeout_ms(mut self, ms: u64) -> Self {
+        self.response_timeout_ms = ms.max(MIN_RESPONSE_TIMEOUT_MS);
+        self
     }
 
     /// Per-attempt timeout. Without it a peer that silently drops packets (rather
@@ -100,6 +140,11 @@ impl ConnectBudget {
     /// multiplier it was handed.
     pub fn max_delay_ms(&self) -> u64 {
         self.budget_ms / (self.retries as u64 + 1)
+    }
+
+    /// How long one command on the built connection may wait for its reply.
+    pub fn response_timeout(&self) -> Duration {
+        Duration::from_millis(self.response_timeout_ms)
     }
 }
 
@@ -118,7 +163,12 @@ pub async fn connect_with(
     let config = ConnectionManagerConfig::new()
         .set_number_of_retries(budget.retries)
         .set_max_delay(budget.max_delay_ms())
-        .set_connection_timeout(budget.attempt_timeout());
+        .set_connection_timeout(budget.attempt_timeout())
+        // Also what makes a wedged socket recoverable: the driver reports a
+        // response timeout as an I/O error, and an I/O error is exactly what
+        // makes the manager replace the socket on its way back to the caller.
+        // Without it the error never happens and the swap never comes.
+        .set_response_timeout(budget.response_timeout());
     let started = std::time::Instant::now();
     let connection = ConnectionManager::new_with_config(client.clone(), config).await?;
     // Worth a line: a connect that needed retries means redis was away and came
@@ -236,6 +286,7 @@ mod tests {
         ConnectBudget {
             budget_ms: 500,
             retries: 2,
+            ..ConnectBudget::default()
         }
     }
 
@@ -247,6 +298,7 @@ mod tests {
         let b = ConnectBudget {
             budget_ms: 900,
             retries: 2,
+            ..ConnectBudget::default()
         };
         assert_eq!(b.max_delay_ms(), 300);
         assert_eq!(b.attempt_timeout(), Duration::from_millis(900));
@@ -254,6 +306,11 @@ mod tests {
         let default = ConnectBudget::default();
         assert_eq!(default.budget_ms, DEFAULT_BUDGET_MS);
         assert_eq!(default.retries, DEFAULT_RETRIES);
+        assert_eq!(
+            default.response_timeout(),
+            Duration::from_millis(DEFAULT_RESPONSE_TIMEOUT_MS),
+            "a connection built here must bound each command's round trip"
+        );
         assert!(
             default.max_delay_ms() * (default.retries as u64 + 1) <= default.budget_ms,
             "the delays alone must not be able to exceed the budget"
@@ -287,6 +344,99 @@ mod tests {
             nonsense,
             ConnectBudget::default(),
             "an unusable value falls back to the default instead of disabling retries"
+        );
+    }
+
+    /// The response timeout is a knob for call sites with blocking commands, and
+    /// the widening has to survive the reading; a value that would fire inside
+    /// the round trip is refused rather than honoured.
+    #[test]
+    fn the_response_timeout_widens_on_request_and_never_below_the_round_trip() {
+        let widened = ConnectBudget::default().with_response_timeout_ms(20_000);
+        assert_eq!(widened.response_timeout(), Duration::from_secs(20));
+
+        let narrowed = ConnectBudget::default().with_response_timeout_ms(0);
+        assert_eq!(
+            narrowed.response_timeout(),
+            Duration::from_millis(MIN_RESPONSE_TIMEOUT_MS),
+            "a timeout that fires before any answer could arrive would fail every command"
+        );
+
+        let from_env = ConnectBudget::from_lookup(|key| match key {
+            "COGNEVA_REDIS_RESPONSE_TIMEOUT_MS" => Some("45000".into()),
+            _ => None,
+        });
+        assert_eq!(from_env.response_timeout(), Duration::from_secs(45));
+
+        let unusable = ConnectBudget::from_lookup(|key| match key {
+            "COGNEVA_REDIS_RESPONSE_TIMEOUT_MS" => Some("0".into()),
+            _ => None,
+        });
+        assert_eq!(
+            unusable.response_timeout(),
+            Duration::from_millis(DEFAULT_RESPONSE_TIMEOUT_MS)
+        );
+    }
+
+    /// The stall this bound exists for: a peer that accepts the connection and
+    /// then answers nothing. Without a response timeout the command waits for
+    /// the kernel (measured at ten minutes in the cluster on 2026-10-22); with
+    /// one it comes back as an I/O error, which is what makes the manager swap
+    /// the socket and what a caller can count.
+    #[tokio::test]
+    async fn a_command_on_a_peer_that_answers_nothing_comes_back() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the silent peer");
+        let addr = listener.local_addr().expect("peer address");
+        // Answers until told not to. Silencing it from the first byte would
+        // test the connect path instead: this test is about a connection that
+        // was working and then stopped being answered.
+        let silent = Arc::new(AtomicBool::new(false));
+        let peer_silent = Arc::clone(&silent);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let silent = Arc::clone(&peer_silent);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = socket.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        if silent.load(Ordering::Relaxed) {
+                            continue; // read it, never answer it
+                        }
+                        // One reply per command: a client that pipelines the
+                        // handshake waits for as many replies as it sent.
+                        let replies = buf[..n].windows(2).filter(|w| *w == b"\r\n").count();
+                        let reply: Vec<u8> = b"+OK\r\n".repeat(replies.max(1));
+                        if socket.write_all(&reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = redis::Client::open(format!("redis://{addr}")).expect("a well-formed url");
+        let mut conn = connect_with(&client, budget().with_response_timeout_ms(300))
+            .await
+            .expect("the peer answers the handshake");
+        silent.store(true, Ordering::Relaxed);
+
+        let started = std::time::Instant::now();
+        let result: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut conn).await;
+        let elapsed = started.elapsed();
+        let error = result.expect_err("nothing ever answers this peer");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the command waited {elapsed:?} — that is the kernel's timeout, not ours"
+        );
+        assert!(
+            error.is_io_error(),
+            "a response timeout must surface as an I/O error, which is what makes \
+             the manager replace the socket; got {error:?}"
         );
     }
 

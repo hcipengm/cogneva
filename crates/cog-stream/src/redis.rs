@@ -25,6 +25,17 @@ use cog_core::{MessageBackend, MessageStream, SFError, SFResult};
 /// reported age says just as plainly.
 const PENDING_STATS_PAGE: usize = 1024;
 
+/// How long past its own block period a stream read may wait for a reply before
+/// the connection takes it as lost.
+///
+/// The block period is the server's promise to answer even when there is
+/// nothing to deliver, so anything beyond it means the answer is gone. The
+/// margin covers a busy server and a restart of the peer, and is deliberately
+/// not tight: a read wrongly declared lost is retried, re-delivered from the
+/// pending list and counted, which is noise, while a read left to the kernel is
+/// a process that stops consuming for minutes.
+const READ_RESPONSE_GRACE_MS: u64 = 15_000;
+
 /// Redis Streams-backed [`MessageBackend`].
 ///
 /// Hidden from the docs because the backend is chosen by the deployment's
@@ -121,7 +132,20 @@ impl RedisMessageBackend {
     /// Its own manager means its own socket and its own reconnect as well: one
     /// consumer's dead connection cannot stall the rest.
     async fn subscribe_connection(&self) -> SFResult<ConnectionManager> {
-        connect(&self.client).await
+        // A read loop's command is the one command here that legitimately holds
+        // the wire open, so its reply deadline has to clear the block period the
+        // loop asked for — otherwise every idle read would read as a refusal.
+        // Clear it by a wide margin: the margin costs nothing when the peer is
+        // healthy, and when it is not, it is the difference between a loop that
+        // counts a lost read and one that waits out the kernel's TCP timeout
+        // (measured on 2026-10-22: ten minutes of silence, zero refusals
+        // counted, every group of the process stalled at once).
+        let block_ms = self.read_block_ms.max(self.resume_block_ms) as u64;
+        let budget = cog_redis::ConnectBudget::from_env()
+            .with_response_timeout_ms(block_ms.saturating_add(READ_RESPONSE_GRACE_MS));
+        cog_redis::connect_with(&self.client, budget)
+            .await
+            .map_err(|e| SFError::Redis(e.to_string()))
     }
 }
 

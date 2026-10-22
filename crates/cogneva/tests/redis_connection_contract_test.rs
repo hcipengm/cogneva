@@ -58,6 +58,24 @@ const APPROVED: &str = concat!("cog_redis::", "connect");
 /// fails this gate instead of quietly widening it.
 const RECORDING_FILE: &str = "crates/cog-redis/src/lib.rs";
 
+/// The stream reads' own connection builder, and the two halves of the rule that
+/// its reply deadline clears the block period the read asked for.
+///
+/// A `XREADGROUP ... BLOCK n` is answered after `n` milliseconds even when there
+/// is nothing to deliver, so the connection's response deadline has to be above
+/// it. Written as a constant instead, it would be right for today's block period
+/// and wrong the moment an installation widens that period — and the failure is
+/// invisible: every idle read becomes a refusal, counted, followed by a
+/// reconnect.
+const SUBSCRIBER_FILE: &str = "crates/cog-stream/src/redis.rs";
+const SUBSCRIBER_DEADLINE: &str = concat!("with_response_", "timeout_ms");
+const SUBSCRIBER_BLOCK_BASE: &str = concat!("read_block_ms.max(self.", "resume_block_ms)");
+
+/// The rule, as a pure function of one file's text.
+fn read_deadline_clears_the_block(source: &str) -> bool {
+    source.contains(SUBSCRIBER_DEADLINE) && source.contains(SUBSCRIBER_BLOCK_BASE)
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -188,6 +206,38 @@ fn the_detectors_see_both_shapes_and_leave_the_other_ones_alone() {
         "Manager { connections: Vec<u8> }\nlet m = Connection",
         "Manager::new();"
     )));
+}
+
+#[test]
+fn the_read_deadline_detector_sees_the_wired_shape_and_not_a_constant() {
+    // A constant deadline is the shape this rule exists to keep out, so the
+    // detector has to tell the two apart — otherwise a rewrite that pinned the
+    // number would leave the assertion below green and enforcing nothing.
+    assert!(!read_deadline_clears_the_block(concat!(
+        "let budget = ConnectBudget::from_env().with_response_",
+        "timeout_ms(30_000);"
+    )));
+    assert!(read_deadline_clears_the_block(concat!(
+        "let block = self.read_block_ms.max(self.",
+        "resume_block_ms) as u64;\n\
+         let b = budget.with_response_",
+        "timeout_ms(block + GRACE);"
+    )));
+}
+
+#[test]
+fn the_subscriber_connection_bounds_a_read_by_its_own_block_period() {
+    let path = workspace_root().join(SUBSCRIBER_FILE);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{SUBSCRIBER_FILE} unreadable: {e}"));
+    assert!(
+        read_deadline_clears_the_block(production_source(&text)),
+        "{SUBSCRIBER_FILE} no longer widens its connection's response deadline past the \
+         block period it reads with. A read that blocks is answered at the end of that \
+         period; a deadline at or below it turns every idle read into a counted refusal \
+         and a reconnect, and a deadline that is merely the driver's default is the ten \
+         minutes of silence measured on 2026-10-22."
+    );
 }
 
 #[test]
