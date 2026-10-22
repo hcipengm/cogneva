@@ -776,6 +776,13 @@ jobs:
       # 改提前期是一次公布,不是一次改规则。判不动的(没有任何数值比较)计数上报。
       - name: Check alert rules derive their bound from the reading
         run: python3 deploy/scripts/check-alert-rule-derived-bounds.py
+      # 「比自己的平均值快一倍」不是一个界：低基数上噪声翻倍还是噪声，于是这条规则
+      # 常红；高基数上又可能太晚。两种错都不改表达式的合法性、不改主体、不改连接形状，
+      # 只会让规则一直响或一直静。这一格只按形状判：凡用 deriv/rate/irate 算出速率、
+      # 又拿它跟另一个序列的倍数比的规则，必须另有一个跟常数比的绝对下限。年龄跟自己的
+      # 周期比（`time() - ts > 6 * period`）不判——两边同为时长，周期本身就是下限。
+      - name: Check alert rules put a floor under every ratio
+        run: python3 deploy/scripts/check-alert-rule-ratio-floor.py
       # 上面两条只看表达式的形状。`for: 15y`、`[0m]`、`> 0` 写成 `>= 0` 在它们眼里
       # 都合法，而这些规则永远不会（或总是）亮。这一格让 Prometheus 自己的规则引擎跑
       # 一遍夹具：验收普查的三条告警必须真的从空走到 firing，且改坏清单时夹具自己会红。
