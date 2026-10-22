@@ -1350,6 +1350,18 @@ const FOREIGN: &[(&str, &str)] = &[
         "cogneva_host_target_gc_outcome",
         "同一生产者（闭集六种结局的 one-hot：below_trigger／released／floor_unreachable／script_unverified／probe_failed／planned）。三种红必须分开：够不到地板是「去看谁在吃盘」，probe_failed 是进程身份读不到（权限），script_unverified 是脚本身份立不住（提交或还原）。合成一个布尔就指不出该修哪边",
     ),
+    (
+        "cogneva_file_size_census_unjudged",
+        "宿主读数 `scripts/host/cogneva-file-size-census-reading.sh`（私有仓 brain）：公开仓 `crates/` 下 50 KiB 以上的 `.rs` 里，普查表没判过的有几个。它读的是 `scripts/gates/check-file-size-census.py --reading` 的同一次判决——普查表在私有仓、被判的树在公开仓，所以这道判据不能挂在任何一方的提交门上（挂在私有仓就会红在不持有那些字节的人身上，挂在公开仓则读不到表），它的位置是读数面。越线却没判要当天补一行，与反方向那格分开",
+    ),
+    (
+        "cogneva_file_size_census_stale",
+        "同一生产者（普查表里有行、那棵树里已经没有这个文件或它掉到线下）。与上一格是相反方向：那一格是树跑在表前面，这一格是表跑在树前面，修法一个补行一个撤行，合成一个数就读不出该做哪件",
+    ),
+    (
+        "resource_six_column_state",
+        "宿主读数 `scripts/host/cogneva-resource-six-column-reading.sh`（私有仓 brain）的逐列判词，one-hot 带 `column` 与 `state` 标签：rss／redis_mem／conn／oomkill／restarts／slot。六格里有四格的界归别的规则（`container_memory_near_limit` 的 0.81、`redis_memory_near_limit` 的 0.90、`pod_oom_killed`、`pod_restarting_*`），本仓库只有 conn（撞 maxclients）与 slot（占用越过窗口内提供过的最高界）两格此前没有任何读者，所以规则只读这两格。每一列都是**窗口极值**算出来的判词，窗口长度由同一生产者发的 `resource_six_column_window_seconds` 声明",
+    ),
     ("up", "Prometheus 采集目标存活序列"),
 ];
 
