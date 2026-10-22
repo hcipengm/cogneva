@@ -871,20 +871,22 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // the bands were folded. Reading the count of unstated rows makes that
         // visible; it does not make it stop.
         //
-        // So half the batch comes from that order and half from the stalest rows
-        // the set holds, band not consulted. The second leg is what makes this a
-        // rotation at every size: any outstanding row is asked within
+        // So the bound is split: half of it is the stalest rows the set holds,
+        // band not consulted, and the rest is filled from the band order over
+        // what the first half did not take. The first half is what makes this a
+        // rotation at every size -- any outstanding row is reached within
         // `ceil(outstanding / (limit / 2))` passes, a number about the set rather
-        // than about the bands inside it. The first leg keeps urgency where the
-        // two disagree -- an urgent row is asked again long before the oldest row
-        // of a set of thousands is due -- and the legs overlap only on a row that
-        // is both, so the slice is still the size the caller bounded.
+        // than about the bands inside it -- and the second keeps urgency where
+        // the two disagree, because an urgent row is asked again long before the
+        // oldest row of a set of thousands is due.
         //
-        // A caller that asks for the whole set gets the whole set in the band
-        // order: each leg reaches past the set on its own, and the union of two
-        // things that both cover it is it. That is how the hand-over reads, and
-        // it must keep the band order, because that order decides which of the
-        // owed rows this pass pays for.
+        // The two halves partition rather than overlap, and that is what keeps
+        // the slice exactly the caller's bound: taken as two independent prefixes
+        // they would return fewer rows than asked whenever a row is both banded
+        // and stale, and a caller that asks for the whole set would get less than
+        // the whole set -- which is how the hand-over reads, and it must keep the
+        // band order, because that order decides which of the owed rows this pass
+        // pays for.
         //
         // Both terminal states are excluded together, so the set this answers is
         // the same one `landed` was excluded to make: the work. A retired row is
@@ -894,21 +896,27 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         Self::entries(
             sqlx::query(&format!(
                 "SELECT {ROW_COLUMNS} FROM (\
-                     SELECT l.*, \
+                     SELECT ranked.*, \
                             row_number() OVER (\
-                                ORDER BY (l.delivered_rev IS NOT NULL) DESC, \
-                                         l.priority_rank DESC, \
-                                         l.measured_at ASC NULLS FIRST, \
-                                         l.first_seen_at ASC) AS by_band, \
-                            row_number() OVER (\
-                                ORDER BY l.measured_at ASC NULLS FIRST, \
-                                         l.first_seen_at ASC) AS by_age \
-                       FROM change_ledger l \
-                      WHERE l.state NOT IN ('landed', 'retired')\
-                 ) ranked \
-                 WHERE ranked.by_band <= $1::bigint - $2::bigint \
-                    OR ranked.by_age <= $2::bigint \
-                 ORDER BY ranked.by_band"
+                                PARTITION BY (ranked.by_age <= $2::bigint) \
+                                ORDER BY ranked.by_band) AS of_rest \
+                       FROM (\
+                             SELECT l.*, \
+                                    row_number() OVER (\
+                                        ORDER BY l.measured_at ASC NULLS FIRST, \
+                                                 l.first_seen_at ASC) AS by_age, \
+                                    row_number() OVER (\
+                                        ORDER BY (l.delivered_rev IS NOT NULL) DESC, \
+                                                 l.priority_rank DESC, \
+                                                 l.measured_at ASC NULLS FIRST, \
+                                                 l.first_seen_at ASC) AS by_band \
+                               FROM change_ledger l \
+                              WHERE l.state NOT IN ('landed', 'retired')\
+                       ) ranked \
+                 ) t \
+                 WHERE t.by_age <= $2::bigint \
+                    OR t.of_rest <= $1::bigint - $2::bigint \
+                 ORDER BY t.by_band"
             ))
             .bind(limit as i64)
             .bind((limit / 2) as i64)

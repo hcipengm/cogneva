@@ -804,14 +804,15 @@ async fn a_batch_the_bands_fill_completely_still_asks_the_rows_behind_them() {
             .collect()
     };
 
-    let slice = in_slice(&store.outstanding(BATCH).await.expect("read the batch"));
-    assert!(
-        slice.len() <= BATCH,
-        "the bound still bounds: the two legs overlap only on a row that is both \
-         banded and stale, and the overlap cannot make the slice wider than the \
-         caller asked for -- got {} rows",
-        slice.len()
+    let batch = store.outstanding(BATCH).await.expect("read the batch");
+    assert_eq!(
+        batch.len(),
+        BATCH,
+        "the bound is still the bound: the second half is taken from what the \
+         first did not take, so splitting the batch cannot return more or fewer \
+         rows than the caller asked for"
     );
+    let slice = in_slice(&batch);
     let reached = behind_scopes
         .iter()
         .filter(|scope| slice.iter().any(|seen| seen == *scope))
