@@ -1535,6 +1535,13 @@ pub mod builtins {
         pub metrics: Option<Arc<dyn MetricsBackend>>,
         pub memory_api_base: Option<String>,
         pub external_archive_threshold_chars: usize,
+        /// The queue an agent's commands travel on, and the roster that says
+        /// which names are live. Both are needed to hand one agent the ability
+        /// to address another: the first carries the message, the second is
+        /// what keeps it from being written into a stream no consumer will ever
+        /// read.
+        pub message_backend: Option<Arc<dyn cog_core::MessageBackend>>,
+        pub agent_registry: Option<Arc<dyn cog_core::AgentRegistry>>,
     }
 
     /// Register every built-in tool into `registry`.
@@ -1578,6 +1585,214 @@ pub mod builtins {
                 inputs.metrics.clone(),
             ),
         );
+        match (
+            inputs.message_backend.clone(),
+            inputs.agent_registry.clone(),
+        ) {
+            (Some(backend), Some(registry_handle)) => {
+                cog_core::ToolRegistry::register(registry, send_to_agent(backend, registry_handle))
+            }
+            // Both halves are needed, so the tool is absent when either is: a
+            // message with no roster check goes into a stream nobody reads, and
+            // a roster with no queue has nowhere to put it. Registered but
+            // failing would look the same from the model's side, and this way
+            // the process says which half is missing.
+            _ => tracing::warn!(
+                "no message backend or agent registry; the send_to_agent built-in is not registered"
+            ),
+        }
+        match inputs.agent_registry.clone() {
+            // Listing needs only the roster, so it stays when the queue is
+            // absent: discovery is still true, and the caller finds out which
+            // half is missing when it tries to send rather than by finding the
+            // directory gone.
+            Some(registry_handle) => {
+                cog_core::ToolRegistry::register(registry, list_agents(registry_handle))
+            }
+            None => tracing::warn!("no agent registry; the list_agents built-in is not registered"),
+        }
+    }
+
+    /// Names the live agents, so a caller has something to address.
+    ///
+    /// Without this the send tool has no address to send to: an agent id is
+    /// derived from the task and the role, and a squad member knows neither for
+    /// its peers. Reading it off the roster is the same lookup the send path
+    /// performs before publishing, so the two cannot disagree about who exists.
+    ///
+    /// The entries are the ones the roster calls live — a registration whose
+    /// expiry has passed is not returned, which is what makes "listed here" and
+    /// "will be delivered to" the same set.
+    pub fn list_agents(registry: Arc<dyn cog_core::AgentRegistry>) -> Tool {
+        Tool {
+            name: "list_agents".into(),
+            description: "List the live agents this platform has registered, optionally \
+                          filtered by role or capability. Use it to find the exact \
+                          agent_id to pass to send_to_agent. Only live agents appear: a \
+                          registration that has expired is not listed."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "description": "Only agents playing this role"
+                    },
+                    "capability": {
+                        "type": "string",
+                        "description": "Only agents declaring this capability"
+                    }
+                }
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let registry = registry.clone();
+                Box::pin(async move {
+                    let role = args["role"].as_str();
+                    let capability = args["capability"].as_str();
+                    let live = registry.list().await?;
+                    let agents: Vec<serde_json::Value> = live
+                        .into_iter()
+                        .filter(|r| role.is_none_or(|role| r.role == role))
+                        .filter(|r| {
+                            capability.is_none_or(|cap| r.capabilities.iter().any(|c| c == cap))
+                        })
+                        .map(|r| {
+                            serde_json::json!({
+                                "agent_id": r.agent_id,
+                                "role": r.role,
+                                "workspace_id": r.workspace_id,
+                                "capabilities": r.capabilities,
+                                "last_heartbeat": r.last_heartbeat.to_rfc3339(),
+                            })
+                        })
+                        .collect();
+                    Ok(serde_json::json!({
+                        "count": agents.len(),
+                        "agents": agents,
+                    }))
+                })
+            })),
+        }
+    }
+
+    /// Hand one agent's instruction to another agent's inbox.
+    ///
+    /// This is the only route between agents. The HTTP face of the same
+    /// operation sits behind the gateway's credentials, and the processes that
+    /// run agent loops hold none on purpose, so a tool that dialed the API
+    /// would be a tool that never works in the deployment it ships in. The
+    /// queue is already in this process, and the wire form is the one the
+    /// inbox consumer reads.
+    ///
+    /// The roster check is part of the delivery, not a courtesy: publishing to
+    /// an agent id nobody holds writes a stream no consumer group will ever
+    /// read, which is indistinguishable at this call site from a successful
+    /// delivery and leaves a key behind for good. A miss is therefore an error
+    /// naming the id, and nothing is published.
+    ///
+    /// Delivery is at-least-once — the target acks after running the command,
+    /// and a target that dies mid-run sees it again — so the instruction has to
+    /// be one that tolerates being applied twice. There is no reply channel:
+    /// the run's events reach the event plane as any other run's do, but a
+    /// caller waiting on an answer waits forever. `reply_stream` exists on the
+    /// wire for callers that can read a stream; a tool call cannot.
+    pub fn send_to_agent(
+        backend: Arc<dyn cog_core::MessageBackend>,
+        registry: Arc<dyn cog_core::AgentRegistry>,
+    ) -> Tool {
+        Tool {
+            name: "send_to_agent".into(),
+            description: "Send an instruction to another live agent's inbox. Delivery is \
+                          at-least-once and the target acks only after it has run the \
+                          command, so write instructions that survive being applied twice. \
+                          There is no reply: the target's run reports through the event \
+                          plane, and nothing is returned to you. kind=prompt starts a run \
+                          on the target, kind=steering injects into a run already in \
+                          progress, kind=continue appends to the target's conversation."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Exact agent id as it appears in the roster"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The instruction the target agent receives"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["prompt", "steering", "continue"],
+                        "description": "How the target should take it (default prompt)"
+                    }
+                },
+                "required": ["agent_id", "message"]
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let backend = backend.clone();
+                let registry = registry.clone();
+                Box::pin(async move {
+                    let agent_id = args["agent_id"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| SFError::Validation("agent_id required".into()))?;
+                    let message = args["message"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .ok_or_else(|| SFError::Validation("message required".into()))?;
+                    let kind = args["kind"].as_str().unwrap_or("prompt");
+
+                    let inbox = match kind {
+                        "prompt" => cog_core::InboxMessage::Prompt {
+                            goal: serde_json::Value::String(message.to_string()),
+                            reply_stream: None,
+                        },
+                        "steering" => cog_core::InboxMessage::Steering {
+                            instruction: message.to_string(),
+                        },
+                        "continue" => cog_core::InboxMessage::Continue {
+                            instruction: message.to_string(),
+                        },
+                        other => {
+                            return Err(SFError::Validation(format!(
+                                "kind {other:?} is not one of prompt, steering, continue"
+                            )))
+                        }
+                    };
+
+                    // Asked before the write, because the two answers a missing
+                    // name produces are not the same: an error here, or a key
+                    // that outlives every process and never delivers anything.
+                    match registry.get(agent_id).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            return Err(SFError::Validation(format!(
+                                "no live agent named {agent_id:?}; a message to it would be \
+                                 written to an inbox no process reads"
+                            )))
+                        }
+                        Err(e) => {
+                            return Err(SFError::Agent(format!(
+                                "cannot read the agent roster, so whether {agent_id:?} is live \
+                                 is unknown: {e}"
+                            )))
+                        }
+                    }
+
+                    let stream = cog_core::agent_inbox_stream(agent_id);
+                    let payload = serde_json::to_vec(&inbox).map_err(SFError::Serialization)?;
+                    backend.publish(&stream, &payload).await?;
+                    Ok(serde_json::json!({
+                        "delivered": true,
+                        "agent_id": agent_id,
+                        "kind": kind,
+                        "stream": stream,
+                    }))
+                })
+            })),
+        }
     }
 
     pub fn search_code() -> Tool {

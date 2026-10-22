@@ -42,15 +42,19 @@
 use std::sync::Arc;
 
 use cog_agent::tools::builtins::{register_builtins, BuiltinInputs};
-use cog_core::{HttpClient, HttpRequest, HttpResponse, SFResult};
+use cog_core::{AgentRegistry, HttpClient, HttpRequest, HttpResponse, MessageBackend, SFResult};
+use cog_storage::MemoryAgentRegistry;
+use cog_stream::MemoryMessageBackend;
 
 /// The names the whole built-in set answers to. Written out, not derived.
-const WHOLE_SET: [&str; 6] = [
+const WHOLE_SET: [&str; 8] = [
     "http_request",
+    "list_agents",
     "raw_fetch",
     "raw_list",
     "read_file",
     "run_command",
+    "send_to_agent",
     "write_file",
 ];
 
@@ -71,9 +75,16 @@ impl HttpClient for UnusedClient {
     }
 }
 
-fn names_with_client(present: bool) -> Vec<String> {
+fn names_with(client: Option<Arc<dyn HttpClient>>, messaging: bool) -> Vec<String> {
     let registry = cog_agent::tools::ToolRegistry::new();
-    let client: Option<Arc<dyn HttpClient>> = present.then(|| Arc::new(UnusedClient) as Arc<_>);
+    let (message_backend, agent_registry) = if messaging {
+        (
+            Some(Arc::new(MemoryMessageBackend::new()) as Arc<dyn MessageBackend>),
+            Some(Arc::new(MemoryAgentRegistry::new()) as Arc<dyn AgentRegistry>),
+        )
+    } else {
+        (None, None)
+    };
     register_builtins(
         &registry,
         BuiltinInputs {
@@ -81,11 +92,18 @@ fn names_with_client(present: bool) -> Vec<String> {
             metrics: None,
             memory_api_base: Some("http://memory.invalid".into()),
             external_archive_threshold_chars: 4096,
+            message_backend,
+            agent_registry,
         },
     );
     let mut names = registry.names();
     names.sort();
     names
+}
+
+fn names_with_client(present: bool) -> Vec<String> {
+    let client: Option<Arc<dyn HttpClient>> = present.then(|| Arc::new(UnusedClient) as Arc<_>);
+    names_with(client, true)
 }
 
 /// With everything available, the list is the whole set and nothing else.
@@ -95,7 +113,7 @@ fn the_whole_builtin_set_is_registered_by_one_constructor() {
     let expected: Vec<String> = WHOLE_SET.iter().map(|n| (*n).to_string()).collect();
     assert_eq!(
         names, expected,
-        "the built-in set is the six named tools; a tool added or dropped here is a \
+        "the built-in set is the eight named tools; a tool added or dropped here is a \
          change to what every caller of this process is offered"
     );
 }
@@ -126,6 +144,28 @@ fn a_missing_client_removes_one_tool_and_does_not_empty_the_list() {
     );
 }
 
+/// A process with no roster removes the two tools that are addressed through
+/// it, and nothing else.
+///
+/// The pairing is the point for the send half: a message published without a
+/// roster check lands in a stream no consumer group reads, which looks like a
+/// successful delivery and leaves a key behind. The listing half has nothing to
+/// list. Both are absent here together, and the names say which condition held
+/// rather than leaving a runtime error that reads like a delivery failure.
+#[test]
+fn a_missing_roster_removes_the_two_addressing_tools() {
+    let with = names_with_client(true);
+    let without = names_with(Some(Arc::new(UnusedClient) as Arc<_>), false);
+
+    let removed: Vec<&String> = with.iter().filter(|n| !without.contains(n)).collect();
+    assert_eq!(
+        removed,
+        vec!["list_agents", "send_to_agent"],
+        "only the tools addressed through the roster may leave the list: \
+         with={with:?} without={without:?}"
+    );
+}
+
 /// The two paths that serve these tools take the list whole.
 ///
 /// Each must call the one constructor and must not build a tool itself. This is
@@ -141,6 +181,8 @@ fn neither_serving_path_lays_out_its_own_tool_list() {
         "raw_list",
         "raw_fetch",
         "http_request",
+        "send_to_agent",
+        "list_agents",
     ];
 
     // Relative to this crate's manifest, which is where cargo runs the test.

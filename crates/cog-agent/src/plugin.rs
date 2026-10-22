@@ -207,6 +207,12 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 memory_api_base: memory_api_base.clone(),
                 external_archive_threshold_chars: agent_loop_config
                     .external_archive_threshold_chars,
+                // The pair that lets one agent address another. Both travel
+                // into the same tool: a message without the roster check is a
+                // key no consumer ever reads, and the roster without the queue
+                // has nowhere to send it.
+                message_backend: shared_message_backend.clone(),
+                agent_registry: Some(agent_registry.clone()),
             },
         );
         info!(

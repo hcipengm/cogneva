@@ -70,6 +70,12 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
             metrics: None,
             memory_api_base: agent_loop.memory_api_base.clone(),
             external_archive_threshold_chars: agent_loop.external_archive_threshold_chars,
+            // 这个进程由客户端拉起，不连 Redis、也没有 agent 台账，所以 `send_to_agent`
+            // 不注册：没有队列可写，也判断不了对面还活不活着。工具缺席在这里是实情，
+            // 而不是把「这一层不存在」说成「没有这个工具」——后者是那份更短的工具
+            // 表犯过的错。
+            message_backend: None,
+            agent_registry: None,
         },
     );
 
