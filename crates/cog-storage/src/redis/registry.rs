@@ -167,17 +167,35 @@ impl AgentRegistry for RedisAgentRegistry {
     async fn get(&self, agent_id: &str) -> SFResult<Option<AgentRegistration>> {
         let key = agent_key(agent_id);
         let mut conn = self.connection.clone();
-        let raw: Option<String> = conn
+        // Both facts in one round trip: whether the key says anything, and
+        // whether its writer declared when that answer stops being true.
+        let (raw, ttl): (Option<String>, i64) = redis::pipe()
             .get(&key)
+            .ttl(&key)
+            .query_async(&mut conn)
             .await
             .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
         let Some(s) = raw else {
             return Ok(None);
         };
+        if ttl == -2 {
+            // Expired between the two commands in the pipeline.
+            return Ok(None);
+        }
         let reg: AgentRegistration = serde_json::from_str(&s).map_err(SFError::Serialization)?;
-        // The key exists, but existence is only as good as its TTL: a record
-        // whose writer stopped beating is absent, whatever the key says.
-        if self.is_stale(&reg) {
+        // A key that carries its own expiry is the writer's declaration of how
+        // long this record is good for, and Redis enforces it. Judging that
+        // declaration a second time against *this reader's* `stale_after_secs`
+        // is applying one process's scale to another's fact: a presence record
+        // written to live fifteen minutes was being deleted by a governance
+        // reader configured for thirty-second agent registrations after ninety
+        // seconds, so every face whose owner beats slower than that window
+        // flipped to `owner_idle/unknown_unit` between two heartbeats.
+        //
+        // Records without an expiry are the crash window (`SET` before the
+        // `EXPIRE`): they declare nothing, so the last heartbeat is all there
+        // is, and an old one is not evidence of life.
+        if ttl == -1 && self.is_stale(&reg) {
             self.forget(agent_id).await;
             return Ok(None);
         }

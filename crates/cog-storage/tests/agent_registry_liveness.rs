@@ -181,6 +181,54 @@ async fn a_fresh_record_is_live_even_before_its_expiry_is_rearmed() {
         .expect("deregister");
 }
 
+/// Plant a record with whatever expiry the writer chose, the way `register`
+/// and the operator presence heartbeat do (`SET ... EX`).
+async fn plant_with_expiry(reg: &AgentRegistration, seconds: u64) {
+    let client = redis::Client::open(redis_url()).expect("redis url");
+    let mut conn = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("connection");
+    let payload = serde_json::to_string(reg).expect("serialize");
+    let key = format!("orchestrator:agents:{}", reg.agent_id);
+    let _: () = conn
+        .set_ex(&key, payload, seconds)
+        .await
+        .expect("planted record");
+    let _: () = conn
+        .sadd("orchestrator:agents:index", &reg.agent_id)
+        .await
+        .expect("indexed");
+}
+
+#[tokio::test]
+#[ignore = "needs a live Redis named by COGNEVA_TEST_REDIS_URL"]
+async fn a_record_written_for_a_long_window_is_judged_by_its_own_window() {
+    // The operator presence heartbeat writes with a window measured in
+    // minutes; agents register with one measured in seconds. The reader used
+    // to apply its own (agent) window to both and delete the slow-beating
+    // record well before the writer said it was over -- which is why a face
+    // whose owner is present flipped to `unknown_unit` between two beats.
+    let registry = registry().await; // default registration window: 30s
+    let slow = Utc::now() - ChronoDuration::seconds(300);
+    let reg = registration("long_window", slow);
+    plant_with_expiry(&reg, 900).await;
+
+    assert_eq!(
+        registry.get(&reg.agent_id).await.expect("get").map(|r| r.agent_id),
+        Some(reg.agent_id.clone()),
+        "a record that still has minutes left on its own expiry is live, however little the reader's window is"
+    );
+    assert!(
+        ttl_secs(&reg.agent_id).await > 0,
+        "the reader must not delete a record whose writer declared it alive"
+    );
+
+    registry
+        .deregister(&reg.agent_id)
+        .await
+        .expect("deregister");
+}
+
 #[tokio::test]
 #[ignore = "needs a live Redis named by COGNEVA_TEST_REDIS_URL"]
 async fn a_heartbeat_keeps_an_agent_live_past_its_first_expiry() {
