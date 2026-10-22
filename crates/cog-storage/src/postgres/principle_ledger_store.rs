@@ -348,24 +348,36 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         // it here would leave the row retired in everything but the query it
         // just fell out of.
         //
-        // A stamped row is in this lane only when its host column names a gate:
-        // the verdict that reads that column is code, so a row looked at before
-        // that verdict existed keeps an empty state while its own evidence says
-        // a machine holds it, and nothing else asks the row again -- the batch
+        // A stamped row is in this lane when its host column names a gate: the
+        // verdict that reads that column is code, so a row looked at before that
+        // verdict existed keeps an empty state while its own evidence says a
+        // machine holds it, and nothing else asks the row again -- the batch
         // sorts the tier behind a debt deeper than one pass. The dashed and
         // `stale:` values are the host registry saying "no gate" and "I could
         // not read it"; neither is evidence to settle on, and listing them here
         // would re-stamp rows that have not changed. One look writes the verdict
         // and the row leaves the lane.
+        //
+        // `unenforced` is the third shape, and it is here for the opposite
+        // reason: it is the one state this tier can never write. A row measured
+        // before its carrier declared the tier keeps `unenforced`, which reads
+        // on every surface as a debt, and no other path asks it again -- the
+        // batch sorts the tier behind the debt, and an empty-state lane never
+        // sees a row that has a state. So a stamped row holding it is asked even
+        // with no gate named, because the state itself is the evidence that has
+        // to be re-read. It sorts first: a wrong verdict is worse than a stamp
+        // nobody has written yet.
         let rows = sqlx::query(&format!(
             "SELECT {ROW_COLUMNS} FROM principle_ledger \
-             WHERE state IS NULL \
+             WHERE (state IS NULL OR state = 'unenforced') \
                AND check_kind = 'judgement' \
                AND (host_gate IS NULL OR host_gate NOT LIKE 'retired:%') \
-               AND (measured_at IS NULL \
+               AND (state = 'unenforced' \
+                    OR measured_at IS NULL \
                     OR (COALESCE(host_gate, '') NOT IN ('', '-') \
                         AND host_gate NOT LIKE 'stale:%')) \
-             ORDER BY (measured_at IS NOT NULL) ASC, first_seen_at ASC, slug ASC \
+             ORDER BY (state = 'unenforced') DESC, \
+                      (measured_at IS NOT NULL) ASC, first_seen_at ASC, slug ASC \
              LIMIT $1"
         ))
         .bind(limit as i64)

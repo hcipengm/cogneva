@@ -704,3 +704,57 @@ async fn a_stamped_held_row_whose_host_column_names_a_gate_is_asked_again() {
 
     cleanup(&pool, &marker).await;
 }
+
+/// A held row carrying the one state its tier cannot write is asked again.
+///
+/// `unenforced` is the verdict "both registries were read and neither names a
+/// gate", which is a debt. For a principle a person holds that answer cannot be
+/// right: the tier says no gate is meant to exist, so the registry's silence is
+/// not a finding. A row measured before its carrier declared the tier keeps the
+/// state anyway, and it reads as a debt on every surface -- the batch sorts the
+/// tier behind the debt, and a lane for rows with no state never looks at a row
+/// that has one. The state itself is what has to be re-read, whether or not the
+/// host column names a gate, so the row is offered with neither.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_held_row_holding_the_state_its_tier_cannot_write_is_asked_again() {
+    let _pass = PASS.lock().await;
+    let (store, pool, marker) = store().await;
+    let stale = file(&store, &marker, "stale", 1, PrincipleCheckKind::Judgement)
+        .await
+        .remove(0);
+    let held = file(&store, &marker, "held", 1, PrincipleCheckKind::Judgement)
+        .await
+        .remove(0);
+    store
+        .record_human_only(&held, Some("probe-rev"))
+        .await
+        .expect("record the look");
+
+    // The shape a look wrote before the tier was declared on the carrier: a
+    // debt, on a row a person holds.
+    let mut measurement = PrincipleMeasurement::new(&stale, PrincipleState::Unenforced);
+    measurement.platform_gate = None;
+    store
+        .apply_principle_measurement(&measurement)
+        .await
+        .expect("write the verdict");
+
+    assert_eq!(
+        swept(&store, &marker).await,
+        vec![stale.clone()],
+        "the lane asks again the held row holding a state its tier can never write"
+    );
+
+    // The look that settles it clears the state, and the row leaves the lane.
+    store
+        .record_human_only(&stale, Some("probe-rev"))
+        .await
+        .expect("record the look");
+    assert!(
+        swept(&store, &marker).await.is_empty(),
+        "a held row the tier has answered is not asked again"
+    );
+
+    cleanup(&pool, &marker).await;
+}
