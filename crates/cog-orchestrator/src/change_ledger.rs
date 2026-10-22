@@ -2035,9 +2035,22 @@ async fn measure_pass(
         }
     };
 
+    // Read once for the whole pass: where each rule's gate is declared. `None`
+    // is no reading, and then no row is relocated -- a tree that could not be
+    // searched is not a tree whose declarations all moved.
+    //
+    // Both halves of the pass ask it, because a twin left behind by a
+    // declaration that moved can be in either: the row under the old root is
+    // outstanding until something looks at it, and a row that landed there
+    // before the move stays landed until the sweep re-asks it. The landed half
+    // takes the same reading of the same revision once its own batch is known
+    // to be worth a pass.
+    let declared = declared_gate_scopes(tree, Some(snapshot.rev())).await;
+
     let mut landed = 0usize;
     let mut absent = 0usize;
     let mut undecided = 0usize;
+    let mut retired = 0usize;
     let mut by_reason: HashMap<UnsettledReason, usize> = HashMap::new();
     let mut known_unsettled = 0usize;
     let mut considered = 0usize;
@@ -2048,6 +2061,42 @@ async fn measure_pass(
                 continue;
             }
             // Past its window: asked again rather than assumed unchanged.
+        }
+        // The declaration is the only thing that puts a rule's row under a
+        // root. When the same rule is declared under another one, the row here
+        // is not a check that failed: it is the same demand under an identity
+        // this tree no longer answers, and leaving it outstanding charges the
+        // account for a gate it can see. A look cannot settle that -- asking
+        // the old root for the literal answers "absent" for as long as the
+        // declaration stays where it moved. The successor is written by this
+        // pass's own intake from the same reading, so the demand survives the
+        // retirement, which is the only thing that makes it a retirement and
+        // not a deletion.
+        if let Some(scope) = declared
+            .as_ref()
+            .and_then(|declared| relocated_scope(&row.identity, declared))
+        {
+            let retirement =
+                ChangeMeasurement::retired(row.identity.clone(), RetireReason::Superseded);
+            match store.apply_measurement(&retirement).await {
+                Ok(()) => {
+                    retired += 1;
+                    warn!(
+                        change = %row.identity,
+                        declared_under = %scope,
+                        "change ledger: this rule's gate is declared under another root, so the \
+                         row under the root that no longer carries it is retired as superseded"
+                    );
+                }
+                Err(e) => warn!(
+                    change = %row.identity,
+                    declared_under = %scope,
+                    error = %e,
+                    "change ledger: the row's declaration moved and the row could not be retired, \
+                     so it stays outstanding under a root that no longer carries it"
+                ),
+            }
+            continue;
         }
         if considered == MEASUREMENTS_PER_PASS {
             break;
@@ -2142,6 +2191,11 @@ async fn measure_pass(
         landed,
         absent,
         undecided,
+        // Rows whose rule's declaration moved before this row ever landed, so
+        // the identity it carries is one this tree no longer answers. Its own
+        // number rather than folded into `absent`: the check did not run and
+        // find the literal missing, it was never the right question to ask.
+        retired_superseded = retired,
         rechecked = reopened_pass.rechecked,
         reopened = reopened_pass.reopened,
         touched = reopened_pass.touched,
@@ -2314,9 +2368,9 @@ async fn reopen_pass(
         }
     }
 
-    // Read once for the whole batch: where each rule's gate is declared. `None`
-    // is no reading, and then no row is relocated -- a tree that could not be
-    // searched is not a tree whose declarations all moved.
+    // The same reading the outstanding half took, of the same revision and the
+    // same tree, so the two halves cannot disagree about where a rule's gate is
+    // declared. `None` is no reading, and then no row is relocated.
     let declared = declared_gate_scopes(tree, Some(snapshot.rev())).await;
 
     let now = Instant::now();
@@ -5404,6 +5458,64 @@ mod tests {
                 &declared
             ),
             None
+        );
+    }
+
+    /// A row left under the old root leaves the account on a real pass.
+    ///
+    /// The pure rule above only says which identities are owed a retirement; the
+    /// pass is what writes it, and a pass that reads declarations from one place
+    /// and rows from another can satisfy the rule and still leave the twin
+    /// outstanding. Measured on 2026-10-22: after the intake started minting a
+    /// rule's row under the root its gate is declared in, the row under `crates`
+    /// was still measured against that root on every pass -- the same demand
+    /// carried by two identities, one of which could never close.
+    #[tokio::test]
+    async fn a_pass_retires_the_row_the_declaration_left_behind() {
+        let dir = repo_holding(&[(
+            "deploy/scripts/tests/gate.test.sh",
+            "#!/usr/bin/env bash\n# principle: feedback_deploy\n",
+        )]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let store = FakeLedger {
+            rows: vec![ChangeLedgerRow {
+                identity: ChangeIdentity::new(
+                    GREP_KIND,
+                    PRINCIPLE_GATE_SCOPE,
+                    "principle: feedback_deploy",
+                ),
+                ..row(ChangeState::Pending, None)
+            }],
+            ..Default::default()
+        };
+        let mut unsettled = HashMap::new();
+
+        let snapshot = tree.snapshot().await.expect("the fixture is readable");
+        let declared = declared_gate_scopes(&tree, Some(snapshot.rev()))
+            .await
+            .expect("a readable tree is a reading");
+        assert!(
+            declared.contains_key("feedback_deploy"),
+            "the pass cannot relocate a rule whose declaration it did not read: {declared:?}"
+        );
+
+        measure_pass(&store, &tree, &mut unsettled, &[]).await;
+
+        let measurements = store.measurements();
+        assert_eq!(measurements.len(), 1, "{measurements:?}");
+        assert_eq!(measurements[0].state, ChangeState::Retired);
+        assert_eq!(
+            measurements[0].retire_reason,
+            Some(RetireReason::Superseded),
+            "the row is retired because the demand moved, not because its check passed"
+        );
+        assert!(
+            !unsettled.contains_key(&ChangeIdentity::new(
+                GREP_KIND,
+                PRINCIPLE_GATE_SCOPE,
+                "principle: feedback_deploy"
+            )),
+            "a retired row is not left waiting to be asked again"
         );
     }
 
