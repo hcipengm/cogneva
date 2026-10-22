@@ -1,3 +1,4 @@
+//! principle: feedback_a_hung_read_is_not_a_refusal
 //! Redis connection construction, bounded.
 //!
 //! `redis::aio::ConnectionManager` is the layer that replaces a socket that died,

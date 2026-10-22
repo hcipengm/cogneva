@@ -1,3 +1,4 @@
+//! principle: feedback_a_field_named_error_is_not_a_failure_until_the_row_says_it_is_terminal
 //! A2A 服务端：`message/stream` —— 一条 message 进来，任务状态作为 SSE 流出去。
 //!
 //! 这张名片一直在对外的 Agent Card 上宣称 `streaming: true` 与
