@@ -1,5 +1,6 @@
 //! principle: feedback_a_cell_named_for_a_contradiction_counts_the_normal_lifecycle
 //! principle: feedback_an_expected_reading_counts_the_set_the_reader_walks_not_the_source_population
+//! principle: feedback_a_rows_root_must_be_where_its_gate_is_declared_not_a_fixed_root
 //! The resident maintenance loop for the change ledger.
 //!
 //! The ledger's authoritative copy is the platform's own `change_ledger` table,

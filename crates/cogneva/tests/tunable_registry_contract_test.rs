@@ -1,4 +1,5 @@
 //! principle: feedback_a_whole_tree_census_reads_shapes_so_new_artifacts_must_declare_themselves
+//! principle: feedback_a_chart_value_without_a_registry_row_stops_every_later_rev_not_just_its_own
 //! Every number a deployment ships is one of three things: something a
 //! measurement sets, something a deployment names, or something that is not a
 //! dial at all. Only the first moves when the world it reads moves -- and the
