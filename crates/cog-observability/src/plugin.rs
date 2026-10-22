@@ -1175,12 +1175,14 @@ pub const ALERT_CHANNEL_NONE_READOUT: &str = "alert_notifications_channel_none";
 /// Publish which outlets this deployment can deliver through, one series per
 /// configured kind at 1.
 ///
-/// An empty list still writes one row — `channel="none"` at 0 — because the
-/// family has to exist when there is no outlet: the dispatch counter only
-/// moves when a batch is sent, so a quiet deployment with nothing configured
-/// and a quiet deployment with a working webhook are the same absence on every
-/// other series. The value is a constant per process, not an accumulation, so
-/// a reader takes one series rather than adding the copies.
+/// An empty list still writes one row, but it is the verdict row
+/// (`state="verdict"`, no `channel` label) and it says 1, not a placeholder at
+/// `channel="none"`. The family has to say something when there is no outlet:
+/// the dispatch counter only moves when a batch is sent, so a quiet deployment
+/// with nothing configured and a quiet deployment with a working webhook are the
+/// same absence on every other series. The per-profile value is a constant per
+/// process, not an accumulation, so a reader takes one series rather than adding
+/// the copies.
 async fn publish_alert_channels(
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     outlets: &[&str],
