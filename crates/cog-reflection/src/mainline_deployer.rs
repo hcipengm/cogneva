@@ -6754,21 +6754,6 @@ impl MainlineDeployer {
     /// 整条滚动链路停摆，而失败只是一条 WARN。服务端 apply 不写那条注解，体积只受
     /// etcd 请求上限约束。
     async fn publish_manifests_configmap(&self, rev: &str, bundle: &RolloutBundle) -> SFResult<()> {
-        if let Err(e) = self
-            .kubectl(
-                &[
-                    "delete",
-                    "configmap",
-                    "-l",
-                    "app.kubernetes.io/component=mainline-manifests",
-                    "--ignore-not-found",
-                ],
-                60,
-            )
-            .await
-        {
-            warn!(error = %e, "stale manifest configmap cleanup failed (best effort)");
-        }
         let mut data = serde_json::Map::new();
         data.insert(
             "support.yaml".into(),
@@ -6794,6 +6779,77 @@ impl MainlineDeployer {
         self.apply_stdin_server_side(&body, "manifests configmap")
             .await?;
         info!(rev = %rev12(rev), name = %manifests_configmap_name(rev), "manifest bundle published");
+        // 新包已经在集群里了，再收旧包：反过来做的话，清理与新包之间有一段
+        // 谁都没有包的窗口。
+        if let Err(e) = self.retain_manifest_configmaps(rev).await {
+            warn!(error = %e, "stale manifest configmap cleanup failed (best effort)");
+        }
+        Ok(())
+    }
+
+    /// 只删超出保留数的旧包，按创建时间新→旧。
+    ///
+    /// 保留而不是删净，是因为「撤回一个 rev」要 apply 的就是上一版的那一份包：
+    /// 一个集群里只剩当前 rev 的包时，撤回没有可 apply 的产物，能做的只有重新
+    /// 构建一个新 rev——那是 roll-forward，不是撤回。
+    ///
+    /// 判据先读再删：读不到清单就一个都不删。残留的包占用是有限的（一次发布的
+    /// 大小），删掉撤回唯一要用的那一份则不可恢复；两种错的代价不对称。
+    async fn retain_manifest_configmaps(&self, rev: &str) -> SFResult<()> {
+        let newest = manifests_configmap_name(rev);
+        let out = self
+            .kubectl(
+                &[
+                    "get",
+                    "configmap",
+                    "-l",
+                    "app.kubernetes.io/component=mainline-manifests",
+                    "-o",
+                    "json",
+                ],
+                60,
+            )
+            .await?;
+        let listing: serde_json::Value = serde_json::from_str(&out)?;
+        let mut items: Vec<(String, String)> = listing["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let name = item["metadata"]["name"].as_str()?.to_string();
+                        let created = item["metadata"]["creationTimestamp"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        Some((created, name))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // 新的在前；同一时刻按名字定序，免得两次读到的顺序不同。
+        items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+        let mut kept = vec![newest.clone()];
+        for (_, name) in items {
+            if name == newest {
+                continue;
+            }
+            if kept.len() < MANIFEST_BUNDLES_KEPT {
+                kept.push(name);
+            } else if let Err(e) = self
+                .kubectl(&["delete", "configmap", &name, "--ignore-not-found"], 60)
+                .await
+            {
+                warn!(configmap = %name, error = %e, "could not delete a stale manifest bundle");
+            }
+        }
+        info!(
+            newest = %newest,
+            kept = kept.len(),
+            revs = %kept.join(","),
+            "manifest bundles retained for a rollback"
+        );
         Ok(())
     }
 
@@ -7426,10 +7482,16 @@ pub(crate) fn target_manifest_key(deployment: &str) -> String {
     format!("deploy-{deployment}.yaml")
 }
 
-/// 清单包 ConfigMap 名（per-rev，不可变；旧包在下次发布前按 label 清理）。
+/// 清单包 ConfigMap 名（per-rev，不可变；旧包按 [`MANIFEST_BUNDLES_KEPT`] 保留）。
 fn manifests_configmap_name(rev: &str) -> String {
     format!("mainline-manifests-{}", rev12(rev))
 }
+
+/// 清单包保留的 rev 数（含刚发布的这一个）。
+///
+/// 撤回要用的是**上一版**的那一份包；保留一个数是为了让「留几个」成为一处可读的
+/// 决定，而不是散在清理逻辑里的隐含行为。改这个数的人要同时想清楚撤回窗口有多长。
+pub(crate) const MANIFEST_BUNDLES_KEPT: usize = 5;
 
 /// 集群级 kind：进化 SA 只有命名空间级 Role，apply 这些必然被拒；它们由
 /// 安装面（bootstrap/管理员 kubeconfig）管理，不进部署链路。
@@ -22036,5 +22098,134 @@ exit 0
             Some(("get".to_string(), "resourcequota".to_string()))
         );
         assert_eq!(refused_command(error, &[]), None);
+    }
+    /// 旧包按创建时间保留最近几个，撤回才有可用的产物。
+    ///
+    /// 「删干净」与「留最近 5 个」在集群里都表现为「有包」：只看今天有没有
+    /// `mainline-manifests-*`，两种经营态逐字同形——2026-10-22 实测就是只剩 1 个
+    /// （`count=1`），而镜像是留着的（29 个 tag）。所以这条判据读的是**删了哪几个**。
+    #[tokio::test]
+    async fn the_newest_manifest_bundles_are_kept_so_a_rev_can_be_rolled_back() {
+        let root = std::env::temp_dir().join(format!("cog-bundles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bare = root.join("bare.git");
+        let log = bin_dir.join("kubectl.log");
+
+        // 七个包，创建时间由旧到新；`-o json` 那一次回整份清单，其余调用记账。
+        let mut items = Vec::new();
+        for hour in 1..=7 {
+            let name = manifests_configmap_name(&format!("rev{hour:02}0000000000"));
+            items.push(format!(
+                r#"{{"metadata":{{"name":"{name}","creationTimestamp":"2026-10-22T0{hour}:00:00Z"}}}}"#
+            ));
+        }
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"get configmap"*) echo '{{"items":[{}]}}' ;;
+  *"delete configmap"*) echo "configmap deleted" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            items.join(","),
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let buildah = fake_buildah(&bin_dir, "");
+        let cfg = test_config(
+            &root,
+            &bare,
+            &buildah,
+            &bin_dir.join("fake-kubectl").to_string_lossy(),
+        );
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(&root, &bare));
+
+        // 最新那个已经在集群里（上一段 apply 出来的），这里只做保留。
+        deployer
+            .retain_manifest_configmaps("rev070000000000")
+            .await
+            .expect("the listing is readable");
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let deletes = calls.matches("delete configmap").count();
+        assert_eq!(
+            deletes, 2,
+            "7 个包里留 5 个：删的该是最旧的两个，实际调用是 {calls}"
+        );
+        for old in ["rev010000000000", "rev020000000000"] {
+            assert!(
+                calls.contains(&format!(
+                    "delete configmap {}",
+                    manifests_configmap_name(old)
+                )),
+                "最旧的包没有被删：{calls}"
+            );
+        }
+        for kept in [
+            "rev030000000000",
+            "rev040000000000",
+            "rev050000000000",
+            "rev060000000000",
+            "rev070000000000",
+        ] {
+            assert!(
+                !calls.contains(&format!(
+                    "delete configmap {}",
+                    manifests_configmap_name(kept)
+                )),
+                "撤回要用到的包被删了：{kept}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 清单读不到时一个都不删：残留比丢掉撤回唯一要用的那一份便宜。
+    #[tokio::test]
+    async fn an_unreadable_listing_deletes_nothing() {
+        let root =
+            std::env::temp_dir().join(format!("cog-bundles-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bare = root.join("bare.git");
+        let log = bin_dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"get configmap"*) echo "not json" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let buildah = fake_buildah(&bin_dir, "");
+        let cfg = test_config(
+            &root,
+            &bare,
+            &buildah,
+            &bin_dir.join("fake-kubectl").to_string_lossy(),
+        );
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(&root, &bare));
+
+        assert!(
+            deployer
+                .retain_manifest_configmaps("rev070000000000")
+                .await
+                .is_err(),
+            "读不懂的清单不是「没有旧包」"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.contains("delete configmap"),
+            "清单读不到时删了东西：{calls}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
