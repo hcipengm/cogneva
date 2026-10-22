@@ -343,7 +343,7 @@ looks_like_cargo_cache() {
 find_candidates() { # file to list the cache-like trees that carry no tag
     # Every cargo cache on the filesystem the trigger was read from, not only
     # the ones under one configured directory. A second checkout is a checkout:
-    # one living under $HOME rather than beside this one grew to 146 GiB without
+    # one living under $HOME rather than beside this one grew to a measured 146 GiB without
     # a single reading naming it, because the enumeration started at a directory
     # someone had named rather than at the file system the water level was read
     # from. Which caches exist is a fact about the disk; which ones someone
@@ -406,7 +406,7 @@ tier_stale() {
         local count size
         # -printf '%s' is bytes, and human_kb takes KiB -- the same unit every
         # other line of this run gets from `du -sk`. Passing bytes straight
-        # through made a 3.1 GiB scratch tree print as 3.2 TiB, which reads as
+        # through made a measured 3.1 GiB scratch tree print as 3.2 TiB, which reads as
         # "this one tier is enough" on a plan that would not have moved the
         # disk at all. The rounding up keeps a non-empty release from reading
         # as zero.

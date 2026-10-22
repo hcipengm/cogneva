@@ -4,7 +4,7 @@
 # software, not the machine it happened to run on" turned into a reading.
 #
 # Why it is a rule at all: a comment outlives the machine it was written on, and
-# a figure like "the overlay layer is 47 GB" or "13 GiB of headroom left" is true
+# a figure like "the overlay layer is N GB" or "N GiB of headroom left" is true
 # of exactly one host at exactly one moment. A reader on another deployment does
 # not see a stale note; they see a specification. They will size something
 # against it, and nothing downstream contradicts them: comments take no part in
@@ -26,20 +26,36 @@
 #     tunable with `tune2fs -m`") travels; a byte count does not.
 #
 # The read is deliberately narrow. It judges comment lines in the deployment
-# manifests and in the Rust sources, and a capacity figure is a number followed
-# by a binary or decimal unit. A bare number with no unit is not judged: "512"
-# in a comment may be anything, and a rule that guessed would be refused the
-# first time it guessed wrong.
+# manifests, the deployment scripts and the Rust sources, plus the alert
+# annotation values (`summary:` / `description:`), which are the same mistake in
+# a louder place: an operator on any deployment reads those. A capacity figure is
+# a number followed by a binary or decimal unit. A bare number with no unit is
+# not judged: "512" in a comment may be anything, and a rule that guessed would
+# be refused the first time it guessed wrong.
+#
+# Two scope decisions, written down so they are not silent:
+#   - `deploy/rendered/` is not read. It is generated from the chart by
+#     `render-deploy.sh`; the same comment is judged in the template that owns
+#     it. Reading the generated copy would turn an honest chart edit into a
+#     finding against a file nobody hand-writes.
+#   - Markdown is not read. Changelogs, READMEs and design notes are records of
+#     what was true when they were written, and the wide ones quote sizes of
+#     outside artifacts (a pinned dataset, a registry limit) that are properties
+#     of that artifact. If one of those starts quoting this host, that is a
+#     documentation review, not something a line-wise check can judge.
 #
 # Existing debt is baselined by line content rather than waived by file, so a
 # violation that moves to another line is still the same violation and the
 # baseline cannot be grown by reformatting. A hit that is not in the baseline
-# fails the check; the baseline may only shrink.
+# fails the check, and `--update-baseline` itself refuses to grow the baseline:
+# new debt is fixed, never recorded. (Re-scoping the check is the one case that
+# legitimately moves the count, and it says so with `--allow-grow`.)
 #
-# Usage: check-comment-capacity-figures.sh [--stock] [--update-baseline] [file ...]
-#        (default: every manifest and Rust source the tree tracks)
+# Usage: check-comment-capacity-figures.sh [--stock] [--update-baseline [--allow-grow]] [file ...]
+#        (default: every manifest, deploy script and Rust source the tree tracks)
 #   --stock            print every violation, baselined or not, and exit 0
 #   --update-baseline  rewrite the baseline from what is in the tree now
+#   --allow-grow       let --update-baseline write more lines than it had before
 set -uo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -48,37 +64,69 @@ baseline_file="$here/comment-capacity-figures.baseline"
 
 stock=0
 update=0
+grow=0
 files=()
 for arg in "$@"; do
     case "$arg" in
         --stock)           stock=1 ;;
         --update-baseline) update=1 ;;
-        -*)                echo "usage: $0 [--stock] [--update-baseline] [file ...]" >&2; exit 2 ;;
+        --allow-grow)      grow=1 ;;
+        -*)                echo "usage: $0 [--stock] [--update-baseline [--allow-grow]] [file ...]" >&2; exit 2 ;;
         *)                 files+=("$arg") ;;
     esac
 done
 
 if [ "${#files[@]}" -eq 0 ]; then
     command -v git >/dev/null || { echo "FAIL: git is needed to find the tree's files" >&2; exit 1; }
-    mapfile -t files < <(cd "$root" && git ls-files 'deploy/**/*.yaml' 'deploy/**/*.yml' 'crates/**/*.rs')
+    # `deploy/rendered/` 是 render-deploy.sh 从 chart 生成的：同一句注释由拥有它的
+    # 模板负责，读生成物只会把一次正当的 chart 改动记到没人手写的文件头上。
+    # 路径一律补成绝对路径：git 给的是相对仓库根的路径，而下面按调用者的 cwd 去读；
+    # 从别的目录跑（排队作业、钩子）时相对路径一个都不存在，那就是退出码 0 的假绿。
+    mapfile -t files < <(git -C "$root" ls-files 'deploy/**/*.yaml' 'deploy/**/*.yml' \
+        'deploy/**/*.sh' 'crates/**/*.rs' | grep -v '^deploy/rendered/' | sed "s#^#$root/#")
 fi
 [ "${#files[@]}" -gt 0 ] || { echo "FAIL: no file to read" >&2; exit 1; }
 
+yaml_files=()
+for f in "${files[@]}"; do
+    case "$f" in *.yaml|*.yml) yaml_files+=("$f") ;; esac
+done
+
 # 一条注释行：YAML 的 `#`、Rust 的 `//` 家族与块注释的 `*` 续行。
+# 一条告警注解：`summary:` / `description:` 这类值，运维在任何部署上都读得到。
 # 一条容量数字：数字（可带小数）紧跟二进制或十进制单位，允许中间有空格。
+# 归属标记：说清这个数是谁的——实测/本机/默认/例如，或一个日期。
 unit='(KiB|MiB|GiB|TiB|PiB|KB|MB|GB|TB|PB|Ki|Mi|Gi|Ti)'
+provenance='实测|本机|这台|该机|本地|默认|例如|如 |[0-9]{4}-[0-9]{2}-[0-9]{2}|measured|on this host|by default|e\.g\.'
 hits="$(
-    grep -nH -E "^[[:space:]]*(#|//|/\*|\*)" "${files[@]}" 2>/dev/null \
-        | grep -E "[0-9]+(\.[0-9]+)?[[:space:]]*${unit}([^A-Za-z0-9]|$)" \
-        | grep -vE '实测|本机|这台|该机|本地|默认|例如|如 ' || true
+    {
+        grep -nH -E "^[[:space:]]*(#|//|/\*|\*)" "${files[@]}" 2>/dev/null
+        if [ "${#yaml_files[@]}" -gt 0 ]; then
+            grep -nH -E "^[[:space:]]*(summary|description|message|title):" "${yaml_files[@]}" 2>/dev/null
+        fi
+    } | grep -E "[0-9]+(\.[0-9]+)?[[:space:]]*${unit}([^A-Za-z0-9]|$)" \
+      | grep -vE "$provenance" || true
 )"
 
 if [ "$update" -eq 1 ]; then
+    new_file="$(mktemp)" || exit 1
     printf '%s\n' "$hits" | grep -v '^$' | while IFS= read -r line; do
         printf '%s\n' "${line#*:}" | sed -E 's/^[^:]*://' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
             | sha1sum | cut -d' ' -f1
-    done | sort >"$baseline_file"
-    echo "baseline rewritten: $(wc -l <"$baseline_file") 行（只许缩）"
+    done | sort >"$new_file"
+    old_count=0
+    [ -f "$baseline_file" ] && old_count=$(grep -c '' "$baseline_file")
+    new_count=$(grep -c '' "$new_file")
+    if [ "$new_count" -gt "$old_count" ] && [ "$grow" -ne 1 ]; then
+        # 基线只许缩：新账要改掉，不是记下来。放开基线就等于把这道门变成一道记录。
+        rm -f "$new_file"
+        echo "REFUSED: 基线要长到 $new_count 行（原 $old_count 行）。" >&2
+        echo "         新出现的命中要改：写机制与比例，或标明这是谁的数（实测 YYYY-MM-DD／本机／默认／例如）。" >&2
+        echo "         只有「这次扩了扫描范围」这类口径变更才配 --allow-grow。" >&2
+        exit 1
+    fi
+    mv "$new_file" "$baseline_file"
+    echo "baseline rewritten: $new_count 行（原 $old_count 行，只许缩）"
     exit 0
 fi
 
@@ -95,7 +143,7 @@ while IFS= read -r line; do
         grep -qxF "$hash" "$baseline_file" && known=1
     fi
     if [ "$stock" -eq 1 ] || [ "$known" -eq 0 ]; then
-        report+="$line"$'\n'
+        report+="${line#"$root"/}"$'\n'
         [ "$known" -eq 0 ] && new=$((new + 1))
     fi
 done <<<"$hits"
