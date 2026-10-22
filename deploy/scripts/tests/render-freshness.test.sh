@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_new_rule_lands_in_three_places_and_the_render_freshness_gate_names_the_one_you_forgot
 # render-deploy.sh --check 的定向测试。
 #
 # 为什么要有这份测试：这条命令是**判定管线里的准入条件**——触及 deploy/** 的变更要
