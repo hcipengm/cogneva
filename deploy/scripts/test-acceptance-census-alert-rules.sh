@@ -12,14 +12,20 @@
 # 清单是 PrometheusRule 这个 CRD，promtool 只认裸的 `groups:`——所以这里从清单本身抽出
 # `spec.groups` 写成临时规则文件再指给测试用。规则只有一份，测试读的就是发出去的那份。
 #
-# 用法：bash deploy/scripts/test-acceptance-census-alert-rules.sh
+# 用法：
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh                  # 验收普查那三条
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh <清单> <夹具>    # 任一份清单
+#
+# 第二、三种用法不是顺手加的：一个规则族「会不会响」只能这样判，而它不该只对一份清单
+# 有效——每复制一份跑者，取 promtool 的那段（`$PROMTOOL` → PATH → apt 解包）就会多一份
+# 会各自漂的副本。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-# `RULES_MANIFEST` 只给夹具自己用：它把清单的副本改坏（界写成 `>= 0`、`for: 15y`、
-# 删掉一条规则）来证明这份单测**会红**。生产路径永远是下面这个文件。
-MANIFEST="${RULES_MANIFEST:-${ROOT}/deploy/k3s/observability/manifests/17-prometheusrule-acceptance-census.yaml}"
-CASE="${ROOT}/deploy/k3s/observability/tests/17-prometheusrule-acceptance-census.test.yaml"
+# `RULES_MANIFEST` / `RULES_CASE` 只给夹具自己用：它把清单的副本改坏（界写成 `>= 0`、
+# `for: 15y`、删掉一条规则）来证明这份单测**会红**。生产路径永远是默认那两份文件。
+MANIFEST="${1:-${RULES_MANIFEST:-${ROOT}/deploy/k3s/observability/manifests/17-prometheusrule-acceptance-census.yaml}}"
+CASE="${2:-${RULES_CASE:-${ROOT}/deploy/k3s/observability/tests/17-prometheusrule-acceptance-census.test.yaml}}"
 
 [ -f "${MANIFEST}" ] || { echo "找不到清单：${MANIFEST}" >&2; exit 3; }
 [ -f "${CASE}" ] || { echo "找不到夹具：${CASE}" >&2; exit 3; }
@@ -74,7 +80,10 @@ awk '
 [ -s "${work}/rules.yaml" ] || { echo "清单里抽不出 spec.groups：${MANIFEST}" >&2; exit 3; }
 
 # 测试文件里的 rule_files 指回清单（给人读的），这里改指抽出来的裸规则文件。
-sed "s|^  - .*17-prometheusrule-acceptance-census\.yaml$|  - ${work}/rules.yaml|" \
+# 按**形状**改（`rule_files:` 下面那一格，行首正好两格缩进），不按某一份清单的文件名：
+# 写死文件名时，夹具把清单复制到另一个名字下做改坏实验，这一行就静默改不动，promtool 读到
+# CRD 文件直接判未知字段——那是一条与规则本身无关的红（实测：三格改坏实验全报 rc=3）。
+sed "s|^  - .*\.yaml\$|  - ${work}/rules.yaml|" \
     "${CASE}" >"${work}/case.yaml"
 grep -q "^  - ${work}/rules.yaml$" "${work}/case.yaml" || {
     echo "夹具的 rule_files 行没改写成功——路径写法变了，改这条 sed" >&2

@@ -1406,6 +1406,22 @@ const FOREIGN: &[(&str, &str)] = &[
         "e2e_ten_rings_unchecked",
         "同一生产者：压根没有可执行判据的环数。它不是 0 也不是缺席，是这一环被跳过，而跳过在文本报告里长得像 ok——十环少一环有判据，整链的结论就少一段依据",
     ),
+    (
+        "cogneva_alert_mirror_unapplied",
+        "宿主读数 `scripts/host/cogneva-alert-mirror-reading.sh`（私有仓 brain，登记行 `alert_mirror`）：树上给规则打了镜像标记、而集群里的 PrometheusRule 对象一条带标记的都没有。它读的是「清单 → 集群」这一段，与下一条的「配置 → 进程」是链路的两处断点，修法不同（重跑 apply / 重新部署），所以分成两格而不是一个「镜像坏了」",
+    ),
+    (
+        "cogneva_alert_mirror_unconfigured",
+        "同一生产者：集群里有带标记的规则、而跑着的配置里没有 `observability.infra_watch.mirror_alerts`。这是「落地≠生效」——清单换了、进程启动时读到的还是旧配置，那些标记只是注释。判它要读**活配置**（ConfigMap），不是读仓库里那份：读仓库只能证明有人写了，证明不了跑着的那份知道",
+    ),
+    (
+        "cogneva_alert_mirror_missing",
+        "同一生产者：Prometheus 里正 firing 的带标记规则，`alerts` 表里没有开着的行。按**规则名**比而不是按 `dedup_key`：后者是身份标签的序列化，在宿主上重算它就是把写面的那条规则抄第二遍，两份实现总有一份先漂；按名字比看不见「同一规则只抄了一部分实例」，那一段由同族的 `prometheus_firing` 与 `rows_open` 并排印出来、由人读",
+    ),
+    (
+        "cogneva_alert_mirror_stale_rows",
+        "同一生产者：表里开着、`last_seen_at` 超过十分钟没往前走的镜像行数。它与上一条是相反的两个方向——上一条是「从来没进去」，这一条是「曾经通过、后来停了」；读失败时镜像故意不 resolve，那一档由 `infra_watch_eval_failure` 报，所以这一条的点名序列要跟它一起读，否则会把设计读成故障",
+    ),
     ("up", "Prometheus 采集目标存活序列"),
 ];
 

@@ -549,3 +549,55 @@ spec:
           annotations:
             summary: "端到端链有 {{ $value }} 环没有判据"
             description: "这一环在名册里，但没有任何可执行的判据：它每一拍都被跳过，跳过在报告里长得像 ok。补判据，或者在 `scripts/host/cogneva-e2e-rings-reading.sh` 的环表里写明它为什么不该有判据。给一天的时间窗：新增一环、判据后补是正常节奏，缺判据挂一天才是欠账。"
+
+    # 告警的**回写**：Prometheus 自己求值出来的告警（规则带 `cogneva_io_managed="true"`）每拍被
+    # 抄进 `alerts` 表，WebUI 的告警面读的正是这张表。这条链断在哪一段，四种红各自一格——
+    # 它们的修法完全不同，合并成一条「镜像坏了」只会让人从第一段开始猜。
+    - name: cogneva-alert-mirror
+      rules:
+        # 树上给规则打了标记、集群里的 PrometheusRule 对象一条都没有：清单没 apply。这一档
+        # 与下一档的区别是链路断在「清单 → 集群」，不是「配置 → 进程」。
+        - alert: CognevaAlertMirrorUnapplied
+          expr: max(cogneva_alert_mirror_unapplied) > 0
+          for: 2h
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "规则库里有 {{ $value }} 处镜像标记，但集群里一条带标记的规则都没有"
+            description: "`deploy/k3s/observability/manifests/` 里的告警带 `cogneva_io_managed=\"true\"`，而集群里 `kubectl -n monitoring get prometheusrule` 的对象上没有这个标签：这份清单还没被 apply。重跑观测面的 apply（`scripts/install.sh` 的观测段，或直接 `kubectl apply -f deploy/k3s/observability/manifests/`），再看 `cogneva_alert_mirror_applied_rules` 是否等于 `declared_rules`。给两小时：观测面的 apply 与一次滚动同量级。"
+
+        # 规则上了集群、进程却不知道要抄（活配置里没有 `mirror_alerts`）。这是「落地≠生效」：
+        # 清单换了，跑着的那份配置还是旧的，重启一次才对得上。
+        - alert: CognevaAlertMirrorUnconfigured
+          expr: max(cogneva_alert_mirror_unconfigured) > 0
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "规则带镜像标记，但跑着的配置里没有 mirror_alerts"
+            description: "集群里已经有带标记的规则，而 ConfigMap `cogneva-json` 里 `observability.infra_watch.mirror_alerts` 缺席：这些标记只是注释，规则响它的、表里什么都没有。修法是让配置生效——滚动一次部署（配置在启动时读），不是改规则。判据是 `cogneva_alert_mirror_configured` 变成 1。给半小时：一次滚动的时间。"
+
+        # 配置对、进程在抄，但这一条没进表。缺口按规则名点名，修法从名单开始查。
+        - alert: CognevaAlertMirrorMissing
+          expr: max(cogneva_alert_mirror_missing) > 0
+          for: 15m
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "有 {{ $value }} 条带标记的告警正在 Prometheus 里响，表里却没有开着的行"
+            description: "`cogneva_alert_mirror_missing_rule{rule=…}` 点名是哪几条。先看那一拍的进程日志有没有 `alert mirror read failed`（读失败不会 resolve、也不会写新行，只累积自警）；再看规则是不是与进程内 `rules` 重名（重名的会被跳过，那条由进程内求值记账）。给十五分钟：进程每 60 秒一拍，缺口挂十五拍才不是擦肩而过。"
+
+        # 行还在、`last_seen_at` 不再走动：看的人以为它新鲜，实际没有任何东西在看它。与上一档
+        # 的区别是「曾经通过、后来停了」——上一档是「从来没进去」。
+        - alert: CognevaAlertMirrorRowsStale
+          expr: max(cogneva_alert_mirror_stale_rows) > 0
+          for: 15m
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "有 {{ $value }} 行镜像告警开着，但已经有十分钟没人看过它"
+            description: "开着的行靠 `last_seen_at` 每拍前进来证明「条件仍然成立」。它停住意味着镜像那一段不再跑（进程活着、只是这一支停了）或者 Prometheus 那边读不回来了。`cogneva_alert_mirror_stale_rule{rule=…}` 点名是哪几条；`cogneva_alert_mirror_oldest_open_age_seconds` 给最老的那一条。先看 `infra_watch_eval_failure` 有没有在同一条原因上响——读失败时镜像故意不 resolve，那时停住是设计，不是故障。"

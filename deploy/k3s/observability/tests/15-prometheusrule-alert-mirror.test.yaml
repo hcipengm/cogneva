@@ -1,0 +1,109 @@
+# promtool 规则单测：告警镜像那四条判词**真的会 firing**。
+#
+# 为什么要有这一层：那四条规则全是一个形状——`max(<一个 gauge>) > 0` 加一个 `for:`
+# ——而形状对不代表会响。把界写成 `>= 0`、把 `for:` 写成 `15y`、把 `max` 漏掉写成
+# `sum(...) > 0`（多实例下永远不是 0）在 `check-alert-rule-subjects.sh` 与
+# `check-alert-rule-join-shape.sh` 眼里都合法，而它们永远不会亮。这里让 Prometheus
+# 自己的规则引擎跑一遍：先造序列，断言「界之前不许响、界之后必须响」，每一条都带一格
+# 反向证据。
+#
+# 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh \
+#         deploy/k3s/observability/manifests/15-prometheusrule-host-readings.yaml \
+#         deploy/k3s/observability/tests/15-prometheusrule-alert-mirror.test.yaml
+#       （本地没有 promtool 时那个跑者会从 apt 取一份到临时目录，取不到就退 3——
+#        看不了不是一致）
+#
+# `rule_files` 这一行由跑者重写：promtool 只认裸的 `groups:`，不认 PrometheusRule 这个
+# CRD。它从**清单本身**抽出 `spec.groups` 再改指过去——规则只有一份，测试读的就是它。
+rule_files:
+  - ../manifests/15-prometheusrule-host-readings.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 一、清单没上集群：`unapplied=1` 一直为真，`for: 2h` 之前不许响。
+  # 反向证据在前半格（1h55m 仍是空），正向在 2h 之后。给两小时是因为观测面的 apply
+  # 与一次滚动同量级——刚 apply 完就红，等于把正常节奏报成故障。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_mirror_unapplied'
+        values: '1x200'
+    alert_rule_test:
+      - eval_time: 115m
+        alertname: CognevaAlertMirrorUnapplied
+        exp_alerts: []
+      - eval_time: 125m
+        alertname: CognevaAlertMirrorUnapplied
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+
+  # 二、负对照：`unapplied` 一直是 0（其余序列再热闹也不关它的事）⇒ 全程不许响。
+  # 没有这一格，把界写成 `>= 0` 也能过上面那一格。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_mirror_unapplied'
+        values: '0x200'
+      - series: 'cogneva_alert_mirror_missing'
+        values: '3x200'
+    alert_rule_test:
+      - eval_time: 195m
+        alertname: CognevaAlertMirrorUnapplied
+        exp_alerts: []
+
+  # 三、配置没生效：`for: 30m`，25 分钟时还不许响，35 分钟时必须在响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_mirror_unconfigured'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaAlertMirrorUnconfigured
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: CognevaAlertMirrorUnconfigured
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+
+  # 四、抄漏了：缺口在第 10 拍才出现，`for: 15m` ⇒ 25m 才该亮；20m 时是 pending，不许响。
+  # 「先 0 后 2」而不是「从头就是 2」：从头为真测不到 `for:` 真的在等。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_mirror_missing'
+        values: '0x10 2x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaAlertMirrorMissing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CognevaAlertMirrorMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+      # 同一份输入下另外三条不许跟着响：一个缺口不说明配置没生效，也不说明清单没上集群。
+      - eval_time: 30m
+        alertname: CognevaAlertMirrorUnapplied
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CognevaAlertMirrorUnconfigured
+        exp_alerts: []
+
+  # 五、停住了：行还在、时钟停在第 60 拍，`for: 15m` ⇒ 70m 是 pending，80m 才响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_mirror_stale_rows'
+        values: '0x60 3x60'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: CognevaAlertMirrorRowsStale
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: CognevaAlertMirrorRowsStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
