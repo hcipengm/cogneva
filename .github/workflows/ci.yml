@@ -783,6 +783,14 @@ jobs:
       # 周期比（`time() - ts > 6 * period`）不判——两边同为时长，周期本身就是下限。
       - name: Check alert rules put a floor under every ratio
         run: python3 deploy/scripts/check-alert-rule-ratio-floor.py
+      # 应用按 X-Forwarded-Proto 拼绝对地址（A2A 名片的 url 就是其中一个），而合成头
+      # 测试自己塞头、自己断言，对「反代把这个头写死成另一个 scheme」完全失明：
+      # 2026-10-22 现网就是这样给出 `https://<ip>/…`，而这条路由只开明文 web，那个
+      # 地址拨过去 404。渲染期没有症状——清单合法、parity 绿、五条集成测试也绿。
+      # 这一格拿每套清单自己的 ingress 注解（entrypoint / tls）去对它引用的
+      # middleware 写死的值；不写这个头的 middleware 不判，读不到路由退 3 而不是绿。
+      - name: Check a rewritten X-Forwarded-Proto matches the route it serves
+        run: python3 deploy/scripts/check-ingress-forwarded-proto.py
       # 上面两条只看表达式的形状。`for: 15y`、`[0m]`、`> 0` 写成 `>= 0` 在它们眼里
       # 都合法，而这些规则永远不会（或总是）亮。这一格让 Prometheus 自己的规则引擎跑
       # 一遍夹具：验收普查的三条告警必须真的从空走到 firing，且改坏清单时夹具自己会红。
