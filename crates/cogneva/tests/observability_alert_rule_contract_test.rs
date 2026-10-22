@@ -5280,3 +5280,196 @@ fn a_retired_rule_is_named_where_the_watcher_can_settle_it() {
          它留下的 firing 行没有任何东西会去结算，会一直挂在「现在有什么在响」那一面上"
     );
 }
+
+/// Readings this workspace publishes **once per process, about a subject that
+/// is not the process**.
+///
+/// The distinction decides what the alert ledger keys on. Every replica that
+/// reads a stream publishes its own `read_silent_seconds` for its own loops,
+/// and the labels it publishes carry the stream and the consumer group — not
+/// the pod. So the pod on the scraped series names whoever answered that
+/// scrape, which is exactly what `NON_IDENTITY_LABELS` keeps out of the dedup
+/// key for the scrape's own `job`/`endpoint`/`service`: identity for this
+/// reading is the name, and the reporter is noise.
+///
+/// Left in the key, it forks one incident into one row per replica and opens a
+/// fresh fire/resolve pair on every rollout. Measured on 2026-10-23 over seven
+/// days: `stream_consumer_stalled` wrote 379 rows, 379 distinct keys, 65 pods,
+/// 78 stream/group names — 79 keys once the reporter is off the key, and half
+/// the rows (`resolved_at - fired_at < 60s`) were that churn rather than an
+/// incident that came and went.
+///
+/// The list is a design statement, not something a scan reads off the source,
+/// which is why it is written here by hand. It is deliberately narrow: most
+/// `cogneva_*` rules legitimately identify a pod (`orphans_unreaped` is one row
+/// per pod that failed to reap its own orphans), so a rule like "no app metric
+/// may be selected bare" would flag sixty correct rules and be turned off.
+const PUBLISHED_PER_REPLICA: &[&str] = &[
+    "cogneva_stream_read_silent_seconds",
+    "cogneva_stream_read_failures_total",
+    "cogneva_stream_read_loops",
+];
+
+/// The aggregation directly around the metric name at `pos`, as
+/// `(function, modifier, its label list)`, or `None` when the name is selected
+/// bare.
+///
+/// Only the shape PromQL allows here is recognised — `agg (name)`,
+/// `agg by (…) (name)`, `agg without (…) (name)` — because that is the shape a
+/// rule over these readings takes. Anything else is reported as bare, which is
+/// the conservative answer: it keeps the check from passing a rule it could not
+/// read.
+fn aggregation_around(expr: &str, pos: usize) -> Option<(String, Option<String>, Option<String>)> {
+    let bytes = expr.as_bytes();
+    let mut i = pos;
+    let backtrack = |mut i: usize| {
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        i
+    };
+    i = backtrack(i);
+    if i == 0 || bytes[i - 1] != b'(' {
+        return None;
+    }
+    i = backtrack(i - 1);
+    let mut list = None;
+    if i > 0 && bytes[i - 1] == b')' {
+        let mut depth = 1usize;
+        let mut j = i - 1;
+        while j > 0 {
+            j -= 1;
+            match bytes[j] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return None;
+        }
+        list = Some(expr[j + 1..i - 1].to_string());
+        i = backtrack(j);
+    }
+    let word_at = |mut i: usize| {
+        let end = i;
+        while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+            i -= 1;
+        }
+        (i, expr[i..end].to_string())
+    };
+    let (start, word) = word_at(i);
+    if word == "by" || word == "without" {
+        let (_, function) = word_at(backtrack(start));
+        if function.is_empty() {
+            return None;
+        }
+        return Some((function, Some(word), list));
+    }
+    if word.is_empty() {
+        return None;
+    }
+    Some((word, None, list))
+}
+
+/// Whether the metric selected at `pos` has the reporter aggregated away.
+///
+/// `agg(name)` drops every label, so it is clean; `agg by (…)` is clean as long
+/// as `pod`, `instance` and `container` are not in the list; `agg without (…)`
+/// is clean only when `pod` is. What is not clean is a bare selector — `None`
+/// from [`aggregation_around`], or an aggregation whose label list keeps the
+/// reporter.
+fn reporter_aggregated_away(expr: &str, pos: usize) -> bool {
+    let Some((_function, modifier, list)) = aggregation_around(expr, pos) else {
+        return false;
+    };
+    let Some(modifier) = modifier else {
+        // `max(NAME)`: every label is dropped.
+        return true;
+    };
+    let list = list.unwrap_or_default();
+    let keeps = |label: &str| list.split(',').map(str::trim).any(|l| l == label);
+    match modifier.as_str() {
+        "without" => keeps("pod"),
+        _ => !(keeps("pod") || keeps("instance") || keeps("container")),
+    }
+}
+
+/// Every occurrence of `name` in `expr` that is not aggregated away.
+fn bare_occurrences<'a>(expr: &'a str, name: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(found) = expr[from..].find(name) {
+        let pos = from + found;
+        // A prefix of a longer identifier is not a selector of this name.
+        let after_is_ident = expr[pos + name.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !after_is_ident && !reporter_aggregated_away(expr, pos) {
+            out.push(pos);
+        }
+        from = pos + name.len();
+    }
+    out
+}
+
+/// A rule that reads a per-replica reading keeps the reporter out of the alert
+/// instance.
+///
+/// The failure it exists for is not the reading being wrong — it is the ledger
+/// filling with rows that name a pod instead of the thing that broke. A face
+/// whose rows are one per replica cannot answer "what is broken" without the
+/// reader first collapsing them by hand, and a rollout closes and reopens every
+/// row it touches.
+#[test]
+fn a_reading_published_by_every_replica_is_not_keyed_on_the_reporter() {
+    // The detector has to tell the two shapes apart, or the check below passes
+    // on a rewritten rule that put the reporter back.
+    let keyed_on_the_reporter =
+        "cogneva_stream_read_silent_seconds > scalar(12 * max(cogneva_stream_read_block_seconds))";
+    assert!(
+        !bare_occurrences(keyed_on_the_reporter, "cogneva_stream_read_silent_seconds").is_empty()
+    );
+    let aggregated = "max without (pod, container, instance) \
+                      (cogneva_stream_read_silent_seconds) > 0";
+    assert!(bare_occurrences(aggregated, "cogneva_stream_read_silent_seconds").is_empty());
+    let by_the_name = "max by (stream, consumer_group) (cogneva_stream_read_loops)";
+    assert!(bare_occurrences(by_the_name, "cogneva_stream_read_loops").is_empty());
+    // `by` that still carries the reporter is the same defect spelled the other
+    // way round, and must not read as clean.
+    let by_the_pod = "max by (stream, pod) (cogneva_stream_read_loops)";
+    assert!(!bare_occurrences(by_the_pod, "cogneva_stream_read_loops").is_empty());
+
+    let mut checked = 0usize;
+    let mut wrong: Vec<String> = Vec::new();
+    for (rule, expr) in shipped_rules() {
+        for name in PUBLISHED_PER_REPLICA {
+            let positions = bare_occurrences(&expr, name);
+            if expr.contains(name) {
+                checked += 1;
+            }
+            for pos in positions {
+                let start = pos.saturating_sub(40);
+                wrong.push(format!(
+                    "{rule}: 选择 {name} 时没有把上报者聚合掉 —— {}…",
+                    &expr[start..pos + name.len()]
+                ));
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "没有一条规则在读 {PUBLISHED_PER_REPLICA:?}，这条判据什么也没判 —— 名单该跟着读数走"
+    );
+    assert!(
+        wrong.is_empty(),
+        "这些规则按上报它的 Pod 给告警实例分键，一件事会被拆成每个副本一行、每次滚动再开一对:\n{}",
+        wrong.join("\n")
+    );
+}
