@@ -1,3 +1,5 @@
+//! principle: feedback_a_rollback_needs_the_artifact_of_the_rev_before_it
+//!
 //! 主线跟踪自动部署器：让集群自治跟踪公版 main。
 //!
 //! 构建侧（进化 Pod 内，[`MainlineDeployer`] + [`run_mainline_loop`]）：

@@ -1,3 +1,5 @@
+//! principle: feedback_a_reader_must_be_attached_before_the_message_it_waits_for_is_sent
+//!
 //! What the agent-addressing built-ins put on the wire, and what they refuse to
 //! put there.
 //!
