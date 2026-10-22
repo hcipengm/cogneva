@@ -7,6 +7,7 @@
 //! principle: feedback_a_registration_table_grows_only_where_its_consumers_are
 //! principle: feedback_an_aggregate_over_a_series_family_can_starve_while_every_element_has_a_reader
 //! principle: feedback_an_alarm_moved_off_a_published_series_orphans_it_and_costs_a_census_entry
+//! principle: feedback_an_absence_question_needs_a_window_not_an_instant
 //!
 //! Every PromQL expression in the deployed alert rules reads series by name.
 //!
@@ -2113,6 +2114,87 @@ fn the_device_counter_gate_reports_the_counter_it_is_aimed_at() {
     ] {
         assert!(!sums_in_flight_time(allowed), "{allowed} should be allowed");
     }
+}
+
+/// Which aggregation a rule applies to the declared ceilings it compares to the
+/// node's capacity, and whether that aggregation takes one container or the fleet.
+///
+/// The subject is the aggregation in front of `kube_pod_container_resource_limits`:
+/// `max by (...)` picks the largest single container, `sum by (...)` adds every
+/// container up. Only the first can be a ceiling the node can never honour. The
+/// second is above one in the steady state of any platform that sizes limits as
+/// per-period burst allowances rather than as reservations -- on 2026-10-23 this
+/// node read 1.20 on cpu and 1.01 on memory with nothing wrong -- so a rule
+/// conditioned on it is lit every day, and it flaps across the boundary whenever
+/// a pod is replaced: the two rows it raised resolved by themselves an hour later.
+fn capacity_subject_complaints(rules: &[(String, String)]) -> Vec<String> {
+    const LIMITS: &str = "kube_pod_container_resource_limits";
+    const CAPACITY: &str = "kube_node_status_allocatable";
+    let mut complaints = Vec::new();
+    for (rule, promql) in rules {
+        let Some(metric_at) = promql.find(LIMITS) else {
+            continue;
+        };
+        if !promql.contains(CAPACITY) {
+            continue;
+        }
+        let head = &promql[..metric_at];
+        let nearest = ["max by", "sum by", "avg by", "min by"]
+            .into_iter()
+            .filter_map(|aggregation| head.rfind(aggregation).map(|at| (at, aggregation)))
+            .max_by_key(|(at, _)| *at);
+        match nearest {
+            Some((_, "max by")) => {}
+            Some((_, aggregation)) => complaints.push(format!(
+                "{rule}: applies `{aggregation}` to the declared ceilings, so the reading is about \
+                 the fleet rather than about one container's reachable ceiling\n    {promql}"
+            )),
+            None => complaints.push(format!(
+                "{rule}: divides declared ceilings by node capacity without an aggregation that \
+                 picks a single container\n    {promql}"
+            )),
+        }
+    }
+    complaints
+}
+
+/// A rule that compares declared ceilings to what a node holds takes one
+/// container as its subject, not the sum of them all.
+#[test]
+fn a_capacity_rule_compares_one_container_to_the_node_not_the_sum_of_them() {
+    let complaints = capacity_subject_complaints(&shipped_rules());
+    assert!(
+        complaints.is_empty(),
+        "these capacity rules alarm on a ratio that is above one by design, so they are \
+         lit whenever the fleet is healthy:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The gate above is aimed at the shape it means to catch, and lets the other
+/// one through.
+#[test]
+fn the_capacity_subject_gate_catches_a_summed_fleet_and_allows_a_single_container() {
+    let envelope = |aggregation: &str| {
+        (
+            "capacity_under_test".to_string(),
+            format!(
+                r#"{aggregation} by (node, resource) (kube_pod_container_resource_limits{{resource=~"cpu|memory"}}) / on(node, resource) group_left sum by (node, resource) (kube_node_status_allocatable{{resource=~"cpu|memory"}})"#
+            ),
+        )
+    };
+
+    for summed in ["sum by", "avg by"] {
+        assert_eq!(
+            capacity_subject_complaints(&[envelope(summed)]).len(),
+            1,
+            "`{summed}` over the ceilings should be reported"
+        );
+    }
+    assert!(
+        capacity_subject_complaints(&[envelope("max by")]).is_empty(),
+        "the largest single container is the subject this gate asks for"
+    );
 }
 
 /// A guard that reads the very series it guards never lets the rule through.
