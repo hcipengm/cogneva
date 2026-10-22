@@ -414,3 +414,53 @@ spec:
           annotations:
             summary: "宿主端点上标了判词、却没有规则读的序列涨到了 {{ $value }} 条（超过了已承认的欠账）"
             description: "账本里标 `=verdict` 的序列，在 `deploy/` 下任何一个规则文件里都找不到名字。判词没有读者＝这封信没人收：它红的时候什么都不会发生，与「这一面没在判」完全同形。跑 `bash scripts/host/cogneva-verdict-readers-reading.sh` 逐条点名（`unread_member name=… producer=…`），然后要么给那条判词立一条规则（真有人按它动手），要么把它从 `=verdict` 拿掉（它是值，被人看就够了）——两种修法都要顺手把账本表头的 `unread_ceiling` 调回实测值，只许变小。"
+
+    # 账本上标了判词、也确实有决定可做的几格。判词的定义是「它红的时候有人要动手」，
+    # 所以这一组每条都要能说出往哪修；说不出修法的格不在这里立规则，而是从账本上把
+    # `=verdict` 拿掉（它是值，不是判词）。
+    - name: cogneva-host-readings-verdicts
+      rules:
+        # 面表里某一面声明要读的读数，按它写的名字取不到值。这不是「那一面坏了」——
+        # 那一面坏了有它自己的判词；这是**面表与生产者对不上**：名字写错了，或者那面
+        # 压根没写生产者。两种修法都要改面表，不是改读数。
+        - alert: CognevaReadingWitnessUnresolved
+          expr: reading_witness_unresolved > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "有 {{ $value }} 面声明要读的读数按名字取不到"
+            description: "面表（`scripts/host/cogneva-reading-witness-reading.sh` 读的那份名册）里逐面写了这一面欠哪个读数，而那个读数名在宿主端点上取不到值。逐面点名读 `reading_witness_face_resolved{face=…} == 0`。修的是面表那一行的名字或那一面的生产者，不是读数本身——同一条链上「读数没有」与「面表写错了」是两件事，这一条只管后者。"
+
+        # 任务面的两个发布者对不上：同一批任务，两条路径报出来的状态不同。判据是它们
+        # 应当一致（同一份正本的两个投影），所以不一致本身就是缺陷，不需要等某个阈值。
+        - alert: CognevaTasksPublishersDisagree
+          expr: tasks_publishers_agree == 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "任务面的发布者对不上"
+            description: "同一批任务经两条路径发布（正本与投影），两边报出来的状态不一致。先跑 `bash scripts/host/cogneva-tasks-face-reading.sh`（不带参数）——它逐个发布者印一行，指出是谁跟谁对不上。修的是让两边读同一份正本，不是把差异抹平。"
+
+        # 拒绝在挡，但没有任何免费重投：规则拦下了动作，却没有把它交回请求方。这是
+        # 这一族里最贵的断点——拒绝本身是对的行为，缺的是拒绝之后那一步。
+        - alert: CognevaRefusalRedispatchBroken
+          expr: cogneva_refusal_redispatch_state{state=~"refused_no_redispatch|below_bar|turn_off"} == 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "拒绝之后的交回断了（{{ $labels.state }}）"
+            description: "`refused_no_redispatch`：有拒绝、免费重投为 0——规则在挡，被挡的请求没有交回，等于白挡一次；`below_bar`：有完成但不到 1/3，重投通道在跑却交不回大多数；`turn_off`：免费重投 ≥ 10 条任务而完成 0 条，按预登记判据该关掉这条路。三种修法不同，都在 `scripts/host/cogneva-refusal-redispatch-reading.sh` 表头那一格里写着，先看它再动手。"
+
+        # 声明了落地的原则载体，账上没有对应的落地行。判据是「载体在树上说了它已落，
+        # 账上能查到那一行」，两者不符就是有一边在说谎；条数不多，每条都能指出是哪一份。
+        - alert: CognevaPrincipleSlugNoLanding
+          expr: principle_carriers_slug_no_landing > 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "有 {{ $value }} 条原则载体声明已落，账上查不到落地行"
+            description: "原则载体（`memory/` 里带 `# principle:` 行的那一份）声明了这个 slug 已落地，而账本里没有它落地的行。两种修法：载体说错了就改载体，账漏了就把落地行补上——不要为了消红去改账上的状态。逐条点名跑 `bash scripts/host/cogneva-principle-census-reading.sh`。"

@@ -1378,6 +1378,22 @@ const FOREIGN: &[(&str, &str)] = &[
         "cogneva_verdict_series_ceiling",
         "同一生产者：登记表表头里写下的、已经承认的欠账条数。它是这条判据的**另一半**，不是一个可调的界——只许跟着实测值往下走（补上一条读者就减一）。做成第二条序列而不是写进规则表达式，是因为它属于账本，而账本在私有仓；规则里写死一个数，账本一改两边就各说各话",
     ),
+    (
+        "reading_witness_unresolved",
+        "宿主读数 `scripts/host/cogneva-reading-witness-reading.sh`（私有仓 brain）：面表里声明要读、按它写的名字却在端点上取不到值的面数。它管的是「面表与生产者对不上」，不是「那一面坏了」——后者有那一面自己的判词。逐面定位读同一生产者发的 `reading_witness_face_resolved{face}=0`",
+    ),
+    (
+        "tasks_publishers_agree",
+        "宿主读数 `scripts/host/cogneva-tasks-face-reading.sh`（私有仓 brain）：同一批任务的两个发布者是否报出同一份状态，1 一致 / 0 不一致。判据不需要阈值——同一份正本的两个投影本来就该一致，不一致本身就是缺陷",
+    ),
+    (
+        "cogneva_refusal_redispatch_state",
+        "宿主读数 `scripts/host/cogneva-refusal-redispatch-reading.sh`（私有仓 brain）的逐拍判词，one-hot 带 `state` 标签。规则只读三个红态：`refused_no_redispatch`（有拒绝、免费重投为 0，等于白挡一次）、`below_bar`（重投通道在跑却交不回 1/3）、`turn_off`（按预登记判据该关掉这条路）。`not_wired` / `no_refusals` / `undecided` / `keep` 是绿态，不进规则",
+    ),
+    (
+        "principle_carriers_slug_no_landing",
+        "宿主读数 `scripts/host/cogneva-principle-census-reading.sh`（私有仓 brain）：载体在树上声明了「已落」，账本里却查不到对应落地行的 slug 条数。载体与账两处都不在公开仓，所以这一格只能作为外来读数登记",
+    ),
     ("up", "Prometheus 采集目标存活序列"),
 ];
 
