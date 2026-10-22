@@ -96,6 +96,15 @@ impl OrphanScan {
     }
 }
 
+/// What one walk's script returns, in the order its reply packs it: empty keys,
+/// holding keys, the entries each of them owes, consumed keys, and the length
+/// each consumed stream carries.
+///
+/// Named rather than written out at the call site because the five-part tuple is
+/// the wire shape of one Lua reply and nothing else; a reader comparing it to the
+/// script's `return` line should only have to look in one place.
+type WalkReply = (Vec<String>, Vec<String>, Vec<i64>, Vec<String>, Vec<i64>);
+
 /// Redis connection used by the pass.
 pub struct InboxRetirement {
     connection: ConnectionManager,
@@ -133,7 +142,7 @@ impl InboxRetirement {
     /// disagree with this one.
     pub async fn scan(&self) -> Result<OrphanScan, redis::RedisError> {
         let mut conn = self.connection.clone();
-        let keys: (Vec<String>, Vec<String>, Vec<i64>, Vec<String>, Vec<i64>) = redis::cmd("EVAL")
+        let keys: WalkReply = redis::cmd("EVAL")
             .arg(
                 // One walk, inside the server: thousands of keys, and asking for
                 // them one round trip at a time costs more than the walk costs
