@@ -651,7 +651,17 @@ report() { # outcome, released_kb, covered, skipped, unreadable, unlabelled, def
         "$(human_kb "$2")" "${gap}" "$3" "$4" "$6" "$5" "${reached}" \
         "${scan_coverage:-}" "${7:-}" "${8:-}" \
         "${script_rev}" "${script_state}" "${script_sha}"
-    write_state "$1" "$2" "${gap}" "$3" "$4" "$5" "$6" "${7:-}" "${8:-}" "${reached}"
+    # A plan is not a run, so it does not become the last run. The state file is
+    # what the exported reading reports as "what this actor last decided"; a dry
+    # run written into it would turn "the reclaimer ran and did nothing" into
+    # "the reclaimer planned", and the next timed run would be read against a
+    # plan rather than against what happened. The plan still reaches the journal
+    # through the line above -- that is where a person reads it.
+    if [ "${dry_run}" = 1 ]; then
+        log "state left alone: a dry run is a plan, not a run"
+    else
+        write_state "$1" "$2" "${gap}" "$3" "$4" "$5" "$6" "${7:-}" "${8:-}" "${reached}"
+    fi
 }
 
 # --- run ---------------------------------------------------------------------

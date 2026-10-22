@@ -300,6 +300,15 @@ cat >"${work}/reader-below" <<'EOF'
 echo '400000 40'
 EOF
 chmod +x "${work}/reader-below"
+# A plan is not a run, so it must not become the last run either. The state file
+# is the actor's own reading -- the exported surface reports it as "what the
+# reclaimer last decided" -- and a hand-run plan written into it would turn
+# "ran, released nothing" into "planned", which is a statement about a run that
+# did not happen. Seeded first so that "did not write" and "wrote the same
+# bytes" are distinguishable from "never had a file to preserve".
+printf '{"last_run":"2026-01-01T00:00:00Z","outcome":"below_trigger","seeded":1}\n' \
+  >"${work}/state-dry.json"
+seeded_state="$(cksum <"${work}/state-dry.json")"
 out="$(env COGNEVA_HOST_WORK_ROOT="$work/host" COGNEVA_TARGET_GC_DELETE_UNDER="$work/host" \
   COGNEVA_TARGET_GC_STATE="$work/state-dry.json" \
   COGNEVA_TARGET_GC_DISK_READER="${work}/reader-below" COGNEVA_TARGET_GC_DRY_RUN=1 \
@@ -315,6 +324,10 @@ grep -q 'full rebuild of this tree' <<<"${out}" \
 [ -f "${dry_tree}/debug/deps/libstale.rlib" ] || fail "dry run 删了过期产物"
 [ -d "${dry_tree}/debug/incremental" ] || fail "dry run 删了增量缓存"
 [ -d "${dry_tree}/llvm-cov-target" ] || fail "dry run 删了覆盖率目录"
+grep -q 'state left alone' <<<"${out}" \
+  || fail "dry run 没有说明它没写状态；沉默地不写与沉默地写了读起来一样：${out}"
+[ "$(cksum <"${work}/state-dry.json")" = "${seeded_state}" ] \
+  || fail "dry run 覆盖了上一次真运行的读数；计划成了「最近一次运行」：$(cat "${work}/state-dry.json")"
 
 # The size on that line is a reading, and its unit has to be the one every
 # other line of the run gets from `du -sk`: KiB. The first version summed
@@ -707,4 +720,4 @@ grep -q 'rev_state=norepo' <<<"${out}" || fail "没有说出读不出身份的�
 [ -f "${gate_tree}/debug/deps/libstale.rlib" ] \
   || fail "读不出身份的脚本删了文件"
 
-echo "PASS: 工作根不猜、锚点根之外的缓存也够得到、被收窄的运行不越界且说明了自己、低于触发线不动手但照样点名它能看到什么、四档按序升级并在地板停手、破坏性的一档等自己的水位且结局读得出推迟了谁、同一 stem 只留最新一代、释放过的树下次仍是候选、名字不够格不当候选、无标签的缓存类树只读数不动手、别的名字下带标签的 cargo 树被当成候选且在触发时释放、嵌在候选里的树不重复计数、读数和它的扫描范围一起走、只有标签不算 cargo、构建中的树按进程名与 fd 两条腿都挡住、无候选时报「缓存不是原因」、dry run 在任何水位都给计划且不删也不报别人的流量、每次运行都留下自己的读数、只有提交过的版本才动手（改过的与读不出身份的都不删）、载体是算出来的定时器且启用后回读排期"
+echo "PASS: 工作根不猜、锚点根之外的缓存也够得到、被收窄的运行不越界且说明了自己、低于触发线不动手但照样点名它能看到什么、四档按序升级并在地板停手、破坏性的一档等自己的水位且结局读得出推迟了谁、同一 stem 只留最新一代、释放过的树下次仍是候选、名字不够格不当候选、无标签的缓存类树只读数不动手、别的名字下带标签的 cargo 树被当成候选且在触发时释放、嵌在候选里的树不重复计数、读数和它的扫描范围一起走、只有标签不算 cargo、构建中的树按进程名与 fd 两条腿都挡住、无候选时报「缓存不是原因」、dry run 在任何水位都给计划且不删也不报别人的流量、计划不覆盖上一次真运行的读数（状态属于运行）、每次运行都留下自己的读数、只有提交过的版本才动手（改过的与读不出身份的都不删）、载体是算出来的定时器且启用后回读排期"
