@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_test_that_asserts_there_is_still_room_is_pinned_to_its_neighbours
 # Deterministic gate for the headroom reading in check-governance-consistency.sh.
 #
 # The reading that went wrong: the quota headroom was computed over the rendered

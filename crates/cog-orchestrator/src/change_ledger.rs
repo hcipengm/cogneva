@@ -406,6 +406,15 @@ const PRINCIPLE_GATE_SCOPE: &str = "crates";
 /// plain fixed-string search hits, and the exact slug hits either way.
 const PRINCIPLE_DECLARATION_PREFIX: &str = "principle: ";
 
+/// The shape a gate's declaration is written in, as an extended expression.
+///
+/// A header, not a mention: the three comment markers the tree's carriers use for
+/// the line that announces a gate. Matching the prefix anywhere instead would
+/// close a row on a document that quoted the declaration -- the rule stated and
+/// the rule enforced would read the same, which is the one difference this whole
+/// account exists to state.
+const PRINCIPLE_DECLARATION_LINE: &str = r"^(//!|///|#) principle: ";
+
 /// What the source column of a principle reading says.
 ///
 /// The account the rows were read out of, where the other two intakes name a file
@@ -1105,7 +1114,8 @@ pub fn spawn_change_ledger_loop(
                         // has news of is an act somebody took and not a line in
                         // this revision.
                         if let Some(unread) =
-                            principle_pass(&**principles, first_seen_rev.as_deref(), &*store).await
+                            principle_pass(&**principles, &tree, first_seen_rev.as_deref(), &*store)
+                                .await
                         {
                             sources_unread.push(unread);
                         }
@@ -1416,10 +1426,11 @@ async fn restore_answered_elsewhere(
 
 async fn principle_pass(
     principles: &dyn PrincipleLedgerStore,
+    tree: &CheckTree,
     first_seen_rev: Option<&str>,
     store: &dyn ChangeLedgerStore,
 ) -> Option<&'static str> {
-    let (readings, unaimed) = match principle_readings(principles).await {
+    let (readings, unaimed) = match principle_readings(principles, tree, first_seen_rev).await {
         Ok(read) => read,
         Err(why) => {
             warn!(
@@ -1489,6 +1500,8 @@ async fn principle_pass(
 /// part, because a refused row can be one the account counts as enforced.
 async fn principle_readings(
     principles: &dyn PrincipleLedgerStore,
+    tree: &CheckTree,
+    rev: Option<&str>,
 ) -> Result<(Vec<ChangeReading>, Unaimed), String> {
     let census = principles
         .census()
@@ -1506,7 +1519,95 @@ async fn principle_readings(
         .refused(usize::try_from(census.total()).unwrap_or(usize::MAX))
         .await
         .map_err(|e| format!("the principle ledger's refused set could not be read: {e}"))?;
-    Ok(principle_debt_readings(&principle_faces(unpaid, refused)))
+    let scopes = declared_gate_scopes(tree, rev).await;
+    Ok(principle_debt_readings(
+        &principle_faces(unpaid, refused),
+        scopes.as_ref(),
+    ))
+}
+
+/// Where each rule's gate is declared, for the rules whose declaration is not
+/// under [`PRINCIPLE_GATE_SCOPE`].
+///
+/// `Some` is a reading of this revision, and it is empty when every gate is where
+/// the account has always looked for it. `None` is no reading: a tree that could
+/// not be searched must not be read as a tree whose declarations all moved, so
+/// nothing is relocated on a pass whose reading failed.
+///
+/// The root is the directory the declaring file sits in, and the directory is the
+/// identity: a row whose gate is `deploy/scripts/tests/x.test.sh` is asked of
+/// `deploy/scripts/tests`. A rule declared under the sources keeps the identity
+/// it has always had -- the reading that the same rule is now declared in two
+/// places must not rewrite the identity of a row that has been closing there for
+/// a year.
+///
+/// Two declarations outside the sources are answered with the lexicographically
+/// first directory, so the same tree always yields the same identity; a rule
+/// whose carrier moves between two such directories is a move that shows up as a
+/// retirement and a fresh row, not as a row that silently changes hands.
+///
+/// Only source files are read as carriers. Every carrier this account has ever
+/// closed a row on is a Rust or shell file, and the alternative -- any file that
+/// opens a line with the marker -- would let a document that quotes the
+/// declaration close the row of a rule nothing enforces. A carrier written in a
+/// third language is therefore not relocated: its row stays outstanding under the
+/// sources, which is the direction that keeps a false gate out of the account.
+async fn declared_gate_scopes(
+    tree: &CheckTree,
+    rev: Option<&str>,
+) -> Option<HashMap<String, String>> {
+    let rev = rev?;
+    let lines = match tree
+        .matching_lines(rev, "", PRINCIPLE_DECLARATION_LINE)
+        .await
+    {
+        Ok(lines) => lines,
+        Err(why) => {
+            warn!(
+                rev = %rev,
+                why = %why,
+                "change ledger: the tree's principle declarations could not be read, so every \
+                 rule is looked for under the root the account has always used"
+            );
+            return None;
+        }
+    };
+    let mut found: HashMap<String, Vec<String>> = HashMap::new();
+    for (path, line) in lines {
+        if !(path.ends_with(".rs") || path.ends_with(".sh")) {
+            continue;
+        }
+        let Some((_, after)) = line.split_once(PRINCIPLE_DECLARATION_PREFIX) else {
+            continue;
+        };
+        let Some(slug) = after.split_whitespace().next() else {
+            continue;
+        };
+        let Some((dir, _file)) = path.rsplit_once('/') else {
+            // A declaration at the top of the tree has no directory to name, and
+            // a scope of the empty string is the whole tree -- wider than the
+            // question, so it is not an identity this derivation may hand out.
+            continue;
+        };
+        found
+            .entry(slug.to_string())
+            .or_default()
+            .push(dir.to_string());
+    }
+    let mut out = HashMap::new();
+    for (slug, mut dirs) in found {
+        dirs.sort();
+        let in_sources = dirs
+            .iter()
+            .any(|dir| dir == PRINCIPLE_GATE_SCOPE || dir.starts_with("crates/"));
+        if in_sources {
+            continue;
+        }
+        if let Some(dir) = dirs.into_iter().next() {
+            out.insert(slug, dir);
+        }
+    }
+    Some(out)
 }
 
 /// The account's two faces as one list, one row per principle.
@@ -1559,7 +1660,10 @@ fn principle_faces(unpaid: Vec<PrincipleRow>, refused: Vec<PrincipleRow>) -> Vec
 /// declaration the principle ledger's own look reads as the platform-side gate
 /// column. Both accounts therefore close this row on one fact, and neither can
 /// close it while the other still calls it owed.
-fn principle_debt_readings(rows: &[PrincipleRow]) -> (Vec<ChangeReading>, Unaimed) {
+fn principle_debt_readings(
+    rows: &[PrincipleRow],
+    scopes: Option<&HashMap<String, String>>,
+) -> (Vec<ChangeReading>, Unaimed) {
     let mut readings = Vec::new();
     let mut unaimed = Unaimed::default();
     for row in rows {
@@ -1573,12 +1677,16 @@ fn principle_debt_readings(rows: &[PrincipleRow]) -> (Vec<ChangeReading>, Unaime
             },
             None => None,
         };
+        // The root the gate is declared under, not a constant: a rule whose only
+        // gate is a test outside the sources is gated by this tree all the same,
+        // and asking it of the sources would keep it owed forever while the tree
+        // carries the very declaration that closes it.
+        let scope = scopes
+            .and_then(|scopes| scopes.get(&row.slug))
+            .map(String::as_str)
+            .unwrap_or(PRINCIPLE_GATE_SCOPE);
         readings.push(ChangeReading {
-            identity: ChangeIdentity::new(
-                GREP_KIND,
-                PRINCIPLE_GATE_SCOPE,
-                principle_literal(&row.slug),
-            ),
+            identity: ChangeIdentity::new(GREP_KIND, scope, principle_literal(&row.slug)),
             title: Some(principle_goal(row, lane)),
             // The violation rides on the row and not only inside the goal: a
             // reader of the account has to be able to see that this rule was
@@ -1857,6 +1965,27 @@ fn times(n: i64) -> String {
 ///
 /// Nothing here is raised: a pass is a maintenance tick, the next tick is the
 /// retry, and every tick leaves a line either way.
+/// The root a row's rule is declared under, when that is not the root the row
+/// was minted under.
+///
+/// `None` is every other case, and each of them has its own reason: a row that is
+/// not a principle declaration has no declaration to follow; a rule the reading
+/// did not place outside the sources has not moved; and a row already asked of
+/// the root its gate is declared under is the ordinary case, not a move.
+fn relocated_scope<'a>(
+    identity: &ChangeIdentity,
+    declared: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    if identity.kind != GREP_KIND {
+        return None;
+    }
+    let slug = identity
+        .literal
+        .strip_prefix(PRINCIPLE_DECLARATION_PREFIX)?;
+    let scope = declared.get(slug)?;
+    (scope != &identity.scope).then_some(scope.as_str())
+}
+
 async fn measure_pass(
     store: &dyn ChangeLedgerStore,
     tree: &CheckTree,
@@ -2185,6 +2314,11 @@ async fn reopen_pass(
         }
     }
 
+    // Read once for the whole batch: where each rule's gate is declared. `None`
+    // is no reading, and then no row is relocated -- a tree that could not be
+    // searched is not a tree whose declarations all moved.
+    let declared = declared_gate_scopes(tree, Some(snapshot.rev())).await;
+
     let now = Instant::now();
     for row in rows {
         // The same window the outstanding pass keeps, for the same reason: a row
@@ -2203,6 +2337,41 @@ async fn reopen_pass(
                 pass.held += 1;
                 continue;
             }
+        }
+        // A principle's identity names the root its gate was declared under, and
+        // the declaration is the only thing that can put it there. When the same
+        // rule is declared under another root, the row under the old one is not a
+        // check that failed: it is the same demand under an identity this tree no
+        // longer answers, and leaving it outstanding charges the account for a
+        // gate it can see. The successor is written by this pass's own intake,
+        // which derives the root from the same reading, so the demand survives
+        // the retirement -- which is the only thing that makes it a retirement
+        // and not a deletion.
+        if let Some(scope) = declared
+            .as_ref()
+            .and_then(|declared| relocated_scope(&row.identity, declared))
+        {
+            let retirement =
+                ChangeMeasurement::retired(row.identity.clone(), RetireReason::Superseded);
+            match store.apply_measurement(&retirement).await {
+                Ok(()) => {
+                    pass.retired += 1;
+                    warn!(
+                        change = %row.identity,
+                        declared_under = %scope,
+                        "change ledger: this rule's gate is declared under another root, so the \
+                         row under the root that no longer carries it is retired as superseded"
+                    );
+                }
+                Err(e) => warn!(
+                    change = %row.identity,
+                    declared_under = %scope,
+                    error = %e,
+                    "change ledger: the row's declaration moved and the row could not be retired, \
+                     so it stays outstanding under a root that no longer carries it"
+                ),
+            }
+            continue;
         }
         let outcome = tree.judge(snapshot, &row.identity).await;
         // A landed row whose scope the tree has lost is not a check that ran and
@@ -5043,11 +5212,14 @@ mod tests {
     /// keeps a longer slug from closing this row.
     #[test]
     fn an_unpaid_principle_becomes_a_check_against_the_trees_declaration() {
-        let (rows, unaimed) = principle_debt_readings(&[principle_row(
-            "feedback_x",
-            Some(PrincipleCheckKind::Tree),
-            Some("a reading must be quoted with its construction"),
-        )]);
+        let (rows, unaimed) = principle_debt_readings(
+            &[principle_row(
+                "feedback_x",
+                Some(PrincipleCheckKind::Tree),
+                Some("a reading must be quoted with its construction"),
+            )],
+            None,
+        );
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(unaimed.is_empty(), "{}", unaimed.summary());
         assert_eq!(rows[0].identity.kind, GREP_KIND);
@@ -5075,6 +5247,193 @@ mod tests {
         );
     }
 
+    /// A temporary repository holding exactly the files given, committed on
+    /// `main`, so a reading of declarations is asked of a tree and not of a mock.
+    fn repo_holding(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let bare = dir.path().join("bare");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).expect("the scratch worktree");
+        let bare_s = bare.to_str().expect("a path this host can spell");
+        let work_s = work.to_str().expect("a path this host can spell");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .expect("git on the test host");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        git(&["init", "-q", "--bare", "-b", "main", bare_s]);
+        git(&["--git-dir", bare_s, "config", "user.email", "t@example.com"]);
+        git(&["--git-dir", bare_s, "config", "user.name", "t"]);
+        for (path, body) in files {
+            let full = work.join(path);
+            std::fs::create_dir_all(full.parent().expect("a parent")).expect("the fixture dir");
+            std::fs::write(full, body).expect("the fixture file");
+        }
+        git(&["--git-dir", bare_s, "--work-tree", work_s, "add", "--all"]);
+        git(&[
+            "--git-dir",
+            bare_s,
+            "--work-tree",
+            work_s,
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ]);
+        dir
+    }
+
+    /// A gate outside the sources is found where it is declared, not where the
+    /// account has always looked.
+    ///
+    /// The tree is the authority here for the reason it is everywhere else in
+    /// this account: the declaration is a line in a file, and whether that file
+    /// sits under `crates/` is not a fact about whether the rule is enforced.
+    #[tokio::test]
+    async fn a_declaration_outside_the_sources_is_read_where_it_is_written() {
+        let dir = repo_holding(&[
+            (
+                "deploy/scripts/tests/gate.test.sh",
+                "#!/usr/bin/env bash\n# principle: feedback_deploy\n",
+            ),
+            (
+                "crates/x/tests/gate_test.rs",
+                "//! principle: feedback_source\n",
+            ),
+            // A document whose heading is the declaration, character for
+            // character: the shape matches, and what keeps it out of the account
+            // is that a document is not a carrier.
+            (
+                "docs/notes.md",
+                "# principle: feedback_quoted\n\nThis heading is not a gate.\n",
+            ),
+        ]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let rev = tree.rev().await.expect("the fixture revision");
+        let scopes = declared_gate_scopes(&tree, Some(&rev))
+            .await
+            .expect("a readable tree is a reading");
+        // The rule declared in the sources keeps the identity it has always had:
+        // the reading must not rewrite the root of a row that closes there.
+        assert!(
+            !scopes.contains_key("feedback_source"),
+            "a rule declared under the sources moved the root of its row: {scopes:?}"
+        );
+        assert_eq!(
+            scopes.get("feedback_deploy").map(String::as_str),
+            Some("deploy/scripts/tests")
+        );
+        // Prose is not a gate: a document quoting the declaration must not close
+        // the row of a rule nothing enforces.
+        assert!(
+            !scopes.contains_key("feedback_quoted"),
+            "a quoted declaration was read as a gate: {scopes:?}"
+        );
+        // A tree that was never resolved is no reading at all, so nothing is
+        // relocated on a pass whose tree could not be found.
+        assert!(
+            declared_gate_scopes(&tree, None).await.is_none(),
+            "an unresolved revision produced a reading"
+        );
+    }
+
+    /// The retirement is owed exactly when the row is asked of a root its
+    /// declaration no longer sits under.
+    ///
+    /// Each `None` here is a different reason, and a rule that collapsed them
+    /// would retire rows that are exactly where they belong.
+    #[test]
+    fn a_retirement_is_owed_only_when_the_declaration_moved() {
+        let mut declared = HashMap::new();
+        declared.insert(
+            "feedback_moved".to_string(),
+            "deploy/scripts/tests".to_string(),
+        );
+        let identity =
+            |kind: &str, scope: &str, literal: &str| ChangeIdentity::new(kind, scope, literal);
+        assert_eq!(
+            relocated_scope(
+                &identity(GREP_KIND, PRINCIPLE_GATE_SCOPE, "principle: feedback_moved"),
+                &declared
+            ),
+            Some("deploy/scripts/tests")
+        );
+        // Already asked of the root the declaration sits under: the ordinary
+        // case, not a move.
+        assert_eq!(
+            relocated_scope(
+                &identity(
+                    GREP_KIND,
+                    "deploy/scripts/tests",
+                    "principle: feedback_moved"
+                ),
+                &declared
+            ),
+            None
+        );
+        // A rule this reading did not place anywhere else.
+        assert_eq!(
+            relocated_scope(
+                &identity(
+                    GREP_KIND,
+                    PRINCIPLE_GATE_SCOPE,
+                    "principle: feedback_elsewhere"
+                ),
+                &declared
+            ),
+            None
+        );
+        // Not a principle declaration at all.
+        assert_eq!(
+            relocated_scope(
+                &identity(GREP_KIND, PRINCIPLE_GATE_SCOPE, "feedback_moved"),
+                &declared
+            ),
+            None
+        );
+        assert_eq!(
+            relocated_scope(
+                &identity("exists", PRINCIPLE_GATE_SCOPE, "principle: feedback_moved"),
+                &declared
+            ),
+            None
+        );
+    }
+
+    /// The reading that mints an unpaid rule's row asks it of the root the gate
+    /// is declared under.
+    #[test]
+    fn an_unpaid_principle_is_asked_of_the_root_its_gate_is_declared_under() {
+        let mut declared = HashMap::new();
+        declared.insert(
+            "feedback_deploy".to_string(),
+            "deploy/scripts/tests".to_string(),
+        );
+        let (rows, unaimed) = principle_debt_readings(
+            &[
+                principle_row("feedback_deploy", Some(PrincipleCheckKind::Tree), None),
+                principle_row("feedback_unwritten", Some(PrincipleCheckKind::Tree), None),
+            ],
+            Some(&declared),
+        );
+        assert!(unaimed.is_empty(), "{}", unaimed.summary());
+        assert_eq!(
+            rows[0].identity.scope, "deploy/scripts/tests",
+            "the row was minted at the root the account has always used instead of the one \
+             carrying its declaration: {rows:?}"
+        );
+        // A rule with no declaration anywhere keeps the historical root: the
+        // absent reading is what says the gate is still owed.
+        assert_eq!(rows[1].identity.scope, PRINCIPLE_GATE_SCOPE);
+    }
+
     /// The goal's first line is the landing header, so it is written to fit
     /// there and to tell sibling rules apart.
     ///
@@ -5084,18 +5443,21 @@ mod tests {
     /// template and the shared category prefix left too little room for a tail.
     #[test]
     fn a_principle_goal_opens_with_a_title_that_fits_and_differs() {
-        let (rows, _) = principle_debt_readings(&[
-            principle_row(
-                "feedback_an_absence_claim_needs_the_reader_s_own_root",
-                Some(PrincipleCheckKind::Tree),
-                None,
-            ),
-            principle_row(
-                "feedback_an_absence_claim_needs_the_reader_that_could_answer_it",
-                Some(PrincipleCheckKind::Tree),
-                None,
-            ),
-        ]);
+        let (rows, _) = principle_debt_readings(
+            &[
+                principle_row(
+                    "feedback_an_absence_claim_needs_the_reader_s_own_root",
+                    Some(PrincipleCheckKind::Tree),
+                    None,
+                ),
+                principle_row(
+                    "feedback_an_absence_claim_needs_the_reader_that_could_answer_it",
+                    Some(PrincipleCheckKind::Tree),
+                    None,
+                ),
+            ],
+            None,
+        );
         assert_eq!(rows.len(), 2, "{rows:?}");
         let titles: Vec<&str> = rows
             .iter()
@@ -5175,15 +5537,18 @@ mod tests {
     /// row is the tree carrying a header that declares the gate.
     #[test]
     fn a_principle_a_person_holds_is_not_work_and_one_with_no_tier_is() {
-        let (rows, unaimed) = principle_debt_readings(&[
-            principle_row(
-                "feedback_held",
-                Some(PrincipleCheckKind::Judgement),
-                Some("a person's"),
-            ),
-            principle_row("feedback_untiered", None, Some("nobody said")),
-            principle_row("feedback_owed", Some(PrincipleCheckKind::Live), None),
-        ]);
+        let (rows, unaimed) = principle_debt_readings(
+            &[
+                principle_row(
+                    "feedback_held",
+                    Some(PrincipleCheckKind::Judgement),
+                    Some("a person's"),
+                ),
+                principle_row("feedback_untiered", None, Some("nobody said")),
+                principle_row("feedback_owed", Some(PrincipleCheckKind::Live), None),
+            ],
+            None,
+        );
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0].identity.literal, "principle: feedback_untiered");
         assert_eq!(
@@ -5224,27 +5589,30 @@ mod tests {
     /// do not depend on which face a slug arrived by.
     #[test]
     fn a_refused_principle_carries_the_violation_on_the_row_it_already_had() {
-        let (rows, unaimed) = principle_debt_readings(&[
-            refused_principle_row(
-                "feedback_refused",
-                Some(PrincipleCheckKind::Shape),
-                Some("only stage your own paths"),
-                Some("NARROW_ADD_RE"),
-                3,
-                Some(1_762_000_000),
-            ),
-            // Refused, and counted rather than aimed at, because the tier says no
-            // machine may judge it: the count is the reading, and it is counted
-            // apart from the rows this intake can aim.
-            refused_principle_row(
-                "feedback_refused_held",
-                Some(PrincipleCheckKind::Judgement),
-                Some("a person's"),
-                Some("NARROW_ADD_RE"),
-                1,
-                Some(1_762_000_000),
-            ),
-        ]);
+        let (rows, unaimed) = principle_debt_readings(
+            &[
+                refused_principle_row(
+                    "feedback_refused",
+                    Some(PrincipleCheckKind::Shape),
+                    Some("only stage your own paths"),
+                    Some("NARROW_ADD_RE"),
+                    3,
+                    Some(1_762_000_000),
+                ),
+                // Refused, and counted rather than aimed at, because the tier says no
+                // machine may judge it: the count is the reading, and it is counted
+                // apart from the rows this intake can aim.
+                refused_principle_row(
+                    "feedback_refused_held",
+                    Some(PrincipleCheckKind::Judgement),
+                    Some("a person's"),
+                    Some("NARROW_ADD_RE"),
+                    1,
+                    Some(1_762_000_000),
+                ),
+            ],
+            None,
+        );
         assert_eq!(rows.len(), 1, "{rows:?}");
         // Refused is not the same as aimable: the second fixture is in the
         // account's refused face and is still counted rather than read as work,
@@ -5353,7 +5721,7 @@ mod tests {
         assert_eq!(faces[1].slug, "feedback_y");
         // And the readings minted from the merged list are one identity per
         // subject, each carrying the violation it was read with.
-        let (rows, unaimed) = principle_debt_readings(&faces);
+        let (rows, unaimed) = principle_debt_readings(&faces, None);
         assert!(unaimed.is_empty(), "{}", unaimed.summary());
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0].identity.literal, "principle: feedback_x");
@@ -5381,7 +5749,7 @@ mod tests {
             Some(PrincipleCheckKind::Shape),
             Some("state nothing"),
         );
-        let (rows, _) = principle_debt_readings(&[stated, silent]);
+        let (rows, _) = principle_debt_readings(&[stated, silent], None);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0].source.priority, ChangePriority::P0);
         assert_eq!(rows[1].source.priority, ChangePriority::Unstated);
