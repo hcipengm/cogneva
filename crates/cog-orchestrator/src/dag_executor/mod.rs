@@ -296,6 +296,7 @@ impl DagExecutorRuntime {
                 .await;
         }
 
+        let mut first_error: Option<SFError> = None;
         for (stream, mut entries) in by_stream {
             if let Some(&admitted) = admitted_by_stream.get(&stream) {
                 if (entries.len() as u64) > admitted {
@@ -364,9 +365,38 @@ impl DagExecutorRuntime {
             if payloads.is_empty() {
                 continue;
             }
-            self.backend.publish_batch(&stream, &payloads).await?;
+            // The tasks in `payloads` are already `Scheduled`, and the batch is
+            // written one message at a time, so a failure here leaves a prefix
+            // of them on the wire and the rest without a message. Nothing is
+            // rolled back: a task that was published and then put back in line
+            // would be run twice, and running a task twice costs more than
+            // waiting for the stall sweep to re-arm the ones that never went
+            // out. What the failure does owe its reader is the count -- the
+            // sweep's own total cannot tell a transport that refused the write
+            // from a consumer that took the message and never started the task,
+            // and those send their reader to different components.
+            //
+            // One stream's refusal is not the other's: the two queues are
+            // separate subjects, so the pass still offers the sibling stream
+            // rather than letting one dead subject hold every queue back. The
+            // first error is kept and returned after both have had their turn.
+            if let Err(e) = self.backend.publish_batch(&stream, &payloads).await {
+                tracing::warn!(
+                    stream = %stream,
+                    scheduled = payloads.len(),
+                    error = %e,
+                    "publish failed after these tasks were moved to Scheduled: the messages that never went out will stay there until the stall sweep re-arms them, and some of this batch may already be on the wire"
+                );
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+                continue;
+            }
         }
-        Ok(())
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// What the pool's window can still pay for, with the reading it was
