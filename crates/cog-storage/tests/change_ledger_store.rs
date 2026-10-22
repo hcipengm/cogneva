@@ -1,3 +1,4 @@
+//! principle: feedback_when_the_behaviour_under_test_is_global_serialize_the_tests_do_not_scope_them
 //! The change ledger's storage, against a live PostgreSQL.
 //!
 //! What these tests check is what the database decides: that the reason a row is
@@ -1732,4 +1733,82 @@ async fn cleanup(pool: &PgPool, marker: &str) {
         .await
         .expect("clean up the probe events");
     tx.commit().await.expect("commit the cleanup");
+}
+
+/// The one-folder rule is a lock, and a lock nobody remembers to take is a
+/// comment. Everything else in this file is `#[ignore]`d behind a live
+/// database, so the concurrency they guard against is invisible on every run
+/// that does not start one -- a new fold test written without the lock would
+/// pass locally, pass in CI's ignored step whenever it happened to run alone,
+/// and silently drop the rule this file exists to hold.
+///
+/// Read rather than executed: the shape being judged is source text (does the
+/// test body take the lock), and the fold tests cannot run without a server.
+#[test]
+fn every_fold_test_holds_the_one_folder_lock() {
+    fn close(name: &mut Option<String>, folds: bool, locked: bool, offenders: &mut Vec<String>) {
+        if let Some(n) = name.take() {
+            if folds && !locked {
+                offenders.push(n);
+            }
+        }
+    }
+
+    let name = std::path::Path::new(file!())
+        .file_name()
+        .expect("the test file has a name")
+        .to_string_lossy()
+        .into_owned();
+    let path = format!("{}/tests/{name}", env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(&path).expect("this test reads its own file");
+    let mut offenders: Vec<String> = Vec::new();
+    let mut name: Option<String> = None;
+    let mut folds = false;
+    let mut locked = false;
+    let mut fold_bodies = 0usize;
+
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        let is_item = indent <= 4
+            && ["fn ", "async fn ", "pub fn ", "pub async fn "]
+                .iter()
+                .any(|prefix| trimmed.starts_with(prefix));
+        if is_item {
+            close(&mut name, folds, locked, &mut offenders);
+            folds = false;
+            locked = false;
+            let head = trimmed
+                .trim_start_matches("pub ")
+                .trim_start_matches("async ")
+                .trim_start_matches("fn ");
+            name = Some(head.split('(').next().unwrap_or("?").to_string());
+        }
+        if name.is_some() {
+            let folds_here =
+                trimmed.contains("fold_declarations(") || trimmed.contains("fold_retirements(");
+            if folds_here && !folds {
+                folds = true;
+                fold_bodies += 1;
+            }
+            if trimmed.contains("folder_lock()") {
+                locked = true;
+            }
+        }
+    }
+    close(&mut name, folds, locked, &mut offenders);
+
+    // A parser that finds nothing would read exactly like a file with no
+    // offenders, which is the failure this test is supposed to catch.
+    assert!(
+        fold_bodies >= 5,
+        "only {fold_bodies} fold bodies were found; the shape this test reads has changed \
+         and it is no longer judging the file it was written for"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these tests fold the account without taking the one-folder lock, so two of them \
+         can interleave and the slower fold can land the older reading over the newer one: \
+         {offenders:?}"
+    );
 }
