@@ -861,6 +861,31 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // band, so the per-band rotation is the same one the staleness key gave
         // the whole set.
         //
+        // That order does not rotate the rows below the band it stops agreeing
+        // with, and the bound is what turns that into a starvation: a slice of
+        // the band order is a prefix, so a banded set at least as large as the
+        // batch takes every slot on every pass and whatever sits behind it is
+        // never reached. Measured on the live ledger when 229 rows held a band
+        // and the batch was 200: the batch carried none of the eleven rows no
+        // pass had ever measured, and had carried none in the three hours since
+        // the bands were folded. Reading the count of unstated rows makes that
+        // visible; it does not make it stop.
+        //
+        // So half the batch comes from that order and half from the stalest rows
+        // the set holds, band not consulted. The second leg is what makes this a
+        // rotation at every size: any outstanding row is asked within
+        // `ceil(outstanding / (limit / 2))` passes, a number about the set rather
+        // than about the bands inside it. The first leg keeps urgency where the
+        // two disagree -- an urgent row is asked again long before the oldest row
+        // of a set of thousands is due -- and the legs overlap only on a row that
+        // is both, so the slice is still the size the caller bounded.
+        //
+        // A caller that asks for the whole set gets the whole set in the band
+        // order: each leg reaches past the set on its own, and the union of two
+        // things that both cover it is it. That is how the hand-over reads, and
+        // it must keep the band order, because that order decides which of the
+        // owed rows this pass pays for.
+        //
         // Both terminal states are excluded together, so the set this answers is
         // the same one `landed` was excluded to make: the work. A retired row is
         // not work -- its question is answered -- and leaving it in would hand a
@@ -868,13 +893,25 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // retirement with the unsettled answer it was retired to stop repeating.
         Self::entries(
             sqlx::query(&format!(
-                "SELECT {ROW_COLUMNS} FROM change_ledger \
-                 WHERE state NOT IN ('landed', 'retired') \
-                 ORDER BY (delivered_rev IS NOT NULL) DESC, priority_rank DESC, \
-                          measured_at ASC NULLS FIRST, first_seen_at ASC \
-                 LIMIT $1"
+                "SELECT {ROW_COLUMNS} FROM (\
+                     SELECT l.*, \
+                            row_number() OVER (\
+                                ORDER BY (l.delivered_rev IS NOT NULL) DESC, \
+                                         l.priority_rank DESC, \
+                                         l.measured_at ASC NULLS FIRST, \
+                                         l.first_seen_at ASC) AS by_band, \
+                            row_number() OVER (\
+                                ORDER BY l.measured_at ASC NULLS FIRST, \
+                                         l.first_seen_at ASC) AS by_age \
+                       FROM change_ledger l \
+                      WHERE l.state NOT IN ('landed', 'retired')\
+                 ) ranked \
+                 WHERE ranked.by_band <= $1::bigint - $2::bigint \
+                    OR ranked.by_age <= $2::bigint \
+                 ORDER BY ranked.by_band"
             ))
             .bind(limit as i64)
+            .bind((limit / 2) as i64)
             .fetch_all(&self.pool)
             .await,
         )

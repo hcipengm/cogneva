@@ -719,6 +719,118 @@ async fn the_outstanding_read_hands_out_the_most_urgent_band_first() {
     cleanup(&pool, &marker).await;
 }
 
+/// A batch the bands fill completely still reaches the rows behind them.
+///
+/// The band order is a prefix, so on its own it rotates only inside the rows that
+/// hold a band: once the banded set is at least as large as the batch, every slot
+/// is taken on every pass and a row nobody prioritised is never asked at all.
+/// That is not hypothetical -- it is how the live ledger came to hold rows that
+/// no pass had ever measured while the band counts were showing the cause. The
+/// read keeps the band order where it leads and reserves part of its bound for
+/// the stalest rows the set holds, whatever bands they carry. Probed by making
+/// the banded set larger than the batch and asking whether the unprioritised
+/// rows, which are the oldest in the set, are in the slice.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_batch_the_bands_fill_completely_still_asks_the_rows_behind_them() {
+    const BATCH: usize = 40;
+    const BANDED: usize = 60;
+    const BEHIND: usize = 6;
+    let (store, pool, marker) = store().await;
+    let banded: Vec<ChangeIdentity> = (0..BANDED)
+        .map(|i| identity(&marker, &format!("banded-{i}")))
+        .collect();
+    let behind: Vec<ChangeIdentity> = (0..BEHIND)
+        .map(|i| identity(&marker, &format!("behind-{i}")))
+        .collect();
+    let reading = |id: &ChangeIdentity, band: ChangePriority| ChangeReading {
+        identity: id.clone(),
+        title: Some("a change the batch probe declares".into()),
+        assertion: None,
+        source: ChangeSource {
+            doc: format!("docs/{}.md", id.scope.replace('/', "-")),
+            verdict: Some("unlanded".into()),
+            priority: band,
+            block: ChangeBlock::None,
+        },
+    };
+    // The banded rows carry a band; the ones behind carry none, which is the
+    // whole point of the probe.
+    let mut readings: Vec<ChangeReading> = banded
+        .iter()
+        .map(|id| reading(id, ChangePriority::P2))
+        .collect();
+    readings.extend(
+        behind
+            .iter()
+            .map(|id| reading(id, ChangePriority::Unstated)),
+    );
+    store
+        .declare(&readings)
+        .await
+        .expect("queue the probe declarations");
+    store
+        .fold_declarations(1_000, Some("probe-rev"))
+        .await
+        .expect("fold the declarations");
+    // The banded rows are measured, so the rows behind them are strictly the
+    // oldest in the set rather than tied with them on "nothing has looked".
+    for id in &banded {
+        store
+            .apply_measurement(
+                &ChangeMeasurement::new(id.clone(), ChangeState::Pending).at_revision("probe-rev"),
+            )
+            .await
+            .expect("measure a banded row");
+    }
+    let behind_scopes: Vec<&str> = behind.iter().map(|id| id.scope.as_str()).collect();
+    let in_slice = |rows: &[cog_core::ChangeLedgerRow]| -> Vec<String> {
+        rows.iter()
+            .filter(|row| row.identity.scope.starts_with(marker.as_str()))
+            .map(|row| row.identity.scope.clone())
+            .collect()
+    };
+
+    let slice = in_slice(&store.outstanding(BATCH).await.expect("read the batch"));
+    assert_eq!(
+        slice.len(),
+        BATCH,
+        "the bound is still the bound: the two legs overlap only on a row that \
+         is both urgent and stale, and here none is"
+    );
+    let reached = behind_scopes
+        .iter()
+        .filter(|scope| slice.iter().any(|seen| seen == *scope))
+        .count();
+    assert_eq!(
+        reached, BEHIND,
+        "a banded set larger than the batch leaves the band order no slot for \
+         the rows behind it; the read has to reserve one, or those rows are \
+         never asked -- the slice was {slice:?}"
+    );
+    assert!(
+        banded.iter().any(|id| id.scope == slice[0]),
+        "reserving part of the bound does not hand it away: the slice still \
+         leads with the band order, got {}",
+        slice[0]
+    );
+
+    let whole = in_slice(&store.outstanding(10_000).await.expect("read the set"));
+    assert_eq!(
+        whole.len(),
+        BANDED + BEHIND,
+        "a caller that asks for the whole set gets the whole set, whatever legs \
+         it was taken from"
+    );
+    assert!(
+        banded.iter().any(|id| id.scope == whole[0]),
+        "and in the band order the hand-over reads: the urgent row is first, got {}",
+        whole[0]
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
 /// A declaration nobody has measured enters as work still owed, not as a stuck
 /// row.
 ///

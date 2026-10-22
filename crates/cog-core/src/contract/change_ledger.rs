@@ -911,10 +911,15 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// stale measurement, not more current, and a row measured this pass goes to
     /// the back of its own band rather than being re-asked next pass.
     ///
-    /// A band nobody asked for is not a band, and it cannot starve what it sits
-    /// behind: the count of unstated rows is the account's own reading, and a set
-    /// of urgent rows large enough to hold the batch is visible there before it
-    /// can be mistaken for the batch simply being slow.
+    /// A band nobody asked for is not a band, but it is also not a guarantee
+    /// against starvation, and the reading is not one either. The band order is
+    /// a prefix, so a banded set at least as large as the batch holds every slot
+    /// and what sits behind it is never reached -- a set of urgent rows that big
+    /// is visible in the band counts, and being visible does not make the rows
+    /// behind it move. So the bound is split: part of it is taken from the band
+    /// order and the rest from the stalest rows the set holds, band not
+    /// consulted. Every outstanding row is then asked within a number of passes
+    /// that follows from the size of the set, whatever the bands in it are.
     async fn outstanding(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>>;
 
     /// How much work is owed at each band, every band present, zero included.
