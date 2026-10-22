@@ -215,14 +215,14 @@ spec:
     - name: cogneva-host-disk-runway
       rules:
         - alert: CognevaHostDiskRunwayShort
-          expr: min by (mountpoint) (disk_trend_days_to_trigger) < 1
+          expr: min by (mountpoint) (disk_trend_days_to_trigger_margin) < 0
           for: 30m
           labels:
             cogneva_io_managed: "true"
             severity: warning
           annotations:
-            summary: "{{ $labels.mountpoint }} 到构建缓存刹车的触发线不到一天（约 {{ $value }} 天）"
-            description: "整窗拟合的斜率把当前可用空间带到触发线只需不到一天。刹车的触发线在 df 那把尺子上（见宿主读数里的 `used_pct_brake`），触发之后它会开始删构建缓存，所以这条告警给出的是「准备为人腾地方」的提前量，不是「盘要满了」。要看是谁在吃：`bash scripts/host/cogneva-host-footprint-trend-reading.sh`。"
+            summary: "{{ $labels.mountpoint }} 到构建缓存刹车触发线的余量已经是 {{ $value }} 天（负数＝不够提前期）"
+            description: "余量＝宿主算出的「到触发线还剩几天」减去宿主公布的提前期（`disk_trend_trigger_lead_days`），小于 0 就是不够提前量了。提前期是策略输入、不是这里该写死的数：它随「腾地方要多久」变，所以由宿主公布、这条规则只跟 0 比。刹车的触发线在 df 那把尺子上（见宿主读数里的 `used_pct_brake`），触发之后它会开始删构建缓存，所以这条告警给出的是「准备为人腾地方」的提前量，不是「盘要满了」。要看是谁在吃：`bash scripts/host/cogneva-host-footprint-trend-reading.sh`。"
 
         # 上一条的分母缺席时它自己不响：触发线读不出来（free 序列缺席）就没有
         # `disk_trend_days_to_trigger`，于是「读不出来」与「还有很久」同形。

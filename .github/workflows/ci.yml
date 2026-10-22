@@ -769,6 +769,13 @@ jobs:
       # 连接键集），判不动的计数上报，不折进绿里。
       - name: Check alert rules declare the many side of a join
         run: bash deploy/scripts/check-alert-rule-join-shape.sh
+      # 提前期不是规则里该写死的数，是策略输入：清理一次要多久，随盘、随负载、随人变。
+      # 写进规则之后它就无法被看见地漂——规则照常响或照常不响,没人知道那个「七天」
+      # 代表哪一次的判断。所以读 runway 家族的规则(`_days_to_` / `_headroom_` /
+      # `_days_left`)只许比 0:生产者把提前期与「还剩几天减提前期」的余量一起公布,
+      # 改提前期是一次公布,不是一次改规则。判不动的(没有任何数值比较)计数上报。
+      - name: Check alert rules derive their bound from the reading
+        run: python3 deploy/scripts/check-alert-rule-derived-bounds.py
       # 上面两条只看表达式的形状。`for: 15y`、`[0m]`、`> 0` 写成 `>= 0` 在它们眼里
       # 都合法，而这些规则永远不会（或总是）亮。这一格让 Prometheus 自己的规则引擎跑
       # 一遍夹具：验收普查的三条告警必须真的从空走到 firing，且改坏清单时夹具自己会红。

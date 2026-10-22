@@ -498,12 +498,12 @@
         },
         {
           "name": "host_disk_trend_approaching_full",
-          "promql": "min(disk_trend_days_to_full_recent)",
+          "promql": "min(disk_trend_days_to_full_recent_margin)",
           "condition": {
-            "less_than": 7.0
+            "less_than": 0.0
           },
           "severity": "warning",
-          "summary": "the root filesystem is {value} day(s) from full at the rate it has been growing over the last 24 hours, inside the one-week band. The level rules above sit on 75% and 85% and can stay quiet for a week while this crosses: a disk at 60% is comfortable until the days left turn single-digit, and by then every reclaim the build-cache brake makes happens under a running build. The projection is a rate, so it moves before the level does, and it is absent when the disk is not growing -- a silent rule here means either steady or unmeasured, and CognevaHostReadingProducerUnreadable names the second on the host-readings channel, which is why this rule does not repeat it. The writeback is to free space now, while there is still a week to decide what goes."
+          "summary": "the root filesystem's runway to full is {value} day(s) short of what emptying it needs (negative means short). The margin is the host's own projection at the rate it has been growing over the last 24 hours, minus the lead time the host publishes as how long reclaiming here takes; the lead is a policy input and therefore sits on the reading surface rather than inside this rule, so changing it is one publish and no rule edit. The level rules above sit on 75% and 85% and can stay quiet for a week while this crosses: a disk at 60% is comfortable until the days left turn single-digit, and by then every reclaim the build-cache brake makes happens under a running build. The projection is a rate, so it moves before the level does, and it is absent when the disk is not growing -- a silent rule here means either steady or unmeasured, and CognevaHostReadingProducerUnreadable names the second on the host-readings channel, which is why this rule does not repeat it. The writeback is to free space now, while there is still the published lead to decide what goes."
         },
         {
           "name": "node_memory_pressure",
