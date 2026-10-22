@@ -1460,7 +1460,7 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "cogneva_alert_attention_unattended",
-        "宿主读数 `scripts/host/cogneva-alert-attention-reading.sh`（不在本仓，登记行 `alert_attention`）：`alerts` 表里正 firing、响了超过窗口（默认 1800 秒）而 `acknowledged_at` 仍为空的行。它是这条链的**读者**那一端——镜像那一族只判到「进了表」，进了之后有没有人接，此前没有任何序列在说；2026-10-22 主线停摆七十分钟，红与停都进了表、都被铃铛写过通知，而全程没有一条被确认。判词读 `acknowledged_at` 而不是 `notified_at`：后者只说明站内铃铛写过通知（没人点开也算），按它判会把「告诉了」读成「看了」。按窗口而不是按比例判，是因为十件事接了九件时，剩下那一件仍然是没人接的那一件",
+        "宿主读数 `scripts/host/cogneva-alert-attention-reading.sh`（不在本仓，登记行 `alert_attention`）：`alerts` 表里正 firing、响了超过窗口（默认 1800 秒）而 `acknowledged_at` 仍为空的行。它是这条链的**读者**那一端——镜像那一族只判到「进了表」，进了之后有没有人接，此前没有任何序列在说；2026-10-22 主线停摆七十分钟，红与停都进了表、都被铃铛写过通知，而全程没有一条被确认。判词读 `acknowledged_at` 而不是 `notified_at`：后者只说明站内铃铛写过通知（没人点开也算），按它判会把「告诉了」读成「看了」。按窗口而不是按比例判，是因为十件事接了九件时，剩下那一件仍然是没人接的那一件。判词**不把判它自己那条规则算进输入**（`CognevaAlertUnattended` 自己也是一条 firing、没人接、过了窗口的行）：算进去它就在为自己点火，一旦亮起再也回不到绿，而一条永远红的判词与没有判词同价；它自己那几行另有 `cogneva_alert_attention_meta_unacknowledged` 单独数",
     ),
     (
         "cogneva_alert_traffic_noisy",
