@@ -1,6 +1,7 @@
 //! principle: feedback_a_reader_must_be_attached_before_the_message_it_waits_for_is_sent
 //! principle: feedback_a_timeout_is_a_third_outcome_not_a_send_failure
 //! principle: feedback_cleanup_on_the_way_out_never_runs_when_the_future_is_dropped
+//! principle: feedback_a_process_global_counter_asserted_from_two_parallel_tests_moves_under_them
 //!
 //! What the agent-addressing built-ins put on the wire, and what they refuse to
 //! put there.

@@ -1,4 +1,5 @@
 //! principle: feedback_when_the_behaviour_under_test_is_global_serialize_the_tests_do_not_scope_them
+//! principle: feedback_showing_how_big_the_starved_set_is_does_not_stop_it_starving
 //! The change ledger's storage, against a live PostgreSQL.
 //!
 //! What these tests check is what the database decides: that the reason a row is
