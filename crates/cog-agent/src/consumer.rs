@@ -8,15 +8,30 @@
 //!
 //! Delivery is at-least-once for as long as the backend keeps unacked
 //! messages: a handler that fails leaves its message pending rather than acked,
-//! and a transport that brokers a persistent queue can hand it back. Reading
-//! those back is [`cog_core::MessageBackend::claim_pending`], which this loop
-//! does not call — nothing asks for reclaim yet, and a reclaim pass that no
-//! caller waits on is a second moving part in the delivery path.
+//! and a transport that brokers a persistent queue hands it back. Both halves of
+//! that sentence are the loop's own work: it reclaims what a previous
+//! incarnation was handed and never acked when it starts, and it keeps running
+//! across a handler error rather than treating one failed command as the end of
+//! the inbox.
 
 use std::sync::Arc;
 
 use cog_core::SFResult;
 use futures::StreamExt;
+
+/// How long a delivered-but-unacked message must sit before a starting
+/// consumer takes it back.
+///
+/// Only this consumer reads the group -- the group name carries the agent id,
+/// and an agent id names one process -- so at start nothing else can be holding
+/// a message of ours. The threshold covers the narrow case where a producer
+/// wrote just as the previous incarnation was dying: too small and it could
+/// take back a message that a still-draining process is finishing; nothing
+/// waits on this value, so it is chosen for safety rather than latency.
+const INBOX_RECLAIM_MIN_IDLE_MS: u64 = 60_000;
+
+/// How many pending messages one reclaim call asks for.
+const INBOX_RECLAIM_BATCH: usize = 64;
 
 /// Generic agent consumer backed by any [`cog_core::MessageBackend`] implementation.
 /// This type was originally in `cog-core` but has been moved to `cog-agent`
@@ -62,6 +77,47 @@ impl AgentConsumer {
             .create_consumer_group(&self.inbox_stream, &group_name)
             .await?;
 
+        // Take back what a previous incarnation of this consumer was handed and
+        // never acked, before reading anything new. The read below asks only
+        // for messages never delivered (`>`), so without this a command that
+        // arrived while the process was dying stays in the pending list for as
+        // long as the group exists: accepted by the producer, executed by
+        // nobody, and absent from every lag reading, because a pending entry is
+        // not lag.
+        let mut reclaimed = 0usize;
+        loop {
+            let Some(batch) = self
+                .backend
+                .claim_pending(
+                    &self.inbox_stream,
+                    &group_name,
+                    INBOX_RECLAIM_MIN_IDLE_MS,
+                    INBOX_RECLAIM_BATCH,
+                )
+                .await?
+            else {
+                // Backend has no reclaim path; its delivery guarantees are its
+                // own to state.
+                break;
+            };
+            let full = batch.len() == INBOX_RECLAIM_BATCH;
+            for (msg_id, bytes) in batch {
+                self.deliver(&msg_id, &bytes, &group_name, &mut handler)
+                    .await;
+                reclaimed += 1;
+            }
+            if !full {
+                break;
+            }
+        }
+        if reclaimed > 0 {
+            tracing::warn!(
+                agent_id = %self.agent_id,
+                messages = reclaimed,
+                "Took back inbox messages a previous consumer never acknowledged"
+            );
+        }
+
         let mut stream = self
             .backend
             .subscribe(&self.inbox_stream, &group_name)
@@ -69,9 +125,28 @@ impl AgentConsumer {
 
         while let Some(result) = stream.next().await {
             let (msg_id, bytes) = result?;
-            let message: cog_core::InboxMessage = match serde_json::from_slice(&bytes)
-                .map_err(cog_core::SFError::Serialization)
-            {
+            self.deliver(&msg_id, &bytes, &group_name, &mut handler)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    /// Hand one message to the handler and ack it, or leave it pending.
+    ///
+    /// Nothing here ends the loop. A handler that fails used to propagate out
+    /// of `run`, which stopped the consumer for good: the agent stayed
+    /// registered and kept beating while the group it owned read nothing, so a
+    /// dead inbox looked exactly like a quiet one. A failed command now costs
+    /// its own delivery and no more -- it stays pending, is reported, and is
+    /// retried when this consumer next starts.
+    async fn deliver<F, Fut>(&self, msg_id: &str, bytes: &[u8], group_name: &str, handler: &mut F)
+    where
+        F: FnMut(cog_core::InboxMessage) -> Fut,
+        Fut: std::future::Future<Output = SFResult<()>>,
+    {
+        let message: cog_core::InboxMessage =
+            match serde_json::from_slice(bytes).map_err(cog_core::SFError::Serialization) {
                 Ok(m) => m,
                 Err(e) => {
                     // Poison message: ack it out, otherwise every redelivery
@@ -86,8 +161,8 @@ impl AgentConsumer {
                         .backend
                         .dlq(
                             &self.inbox_stream,
-                            &msg_id,
-                            &bytes,
+                            msg_id,
+                            bytes,
                             &format!("unparsable InboxMessage: {e}"),
                         )
                         .await
@@ -99,35 +174,34 @@ impl AgentConsumer {
                     }
                     if let Err(e) = self
                         .backend
-                        .ack(
-                            &self.inbox_stream,
-                            &group_name,
-                            std::slice::from_ref(&msg_id),
-                        )
+                        .ack(&self.inbox_stream, group_name, &[msg_id.to_string()])
                         .await
                     {
                         tracing::warn!(msg_id = %msg_id, "Failed to ack poison inbox message: {e}");
                     }
-                    continue;
+                    return;
                 }
             };
-            // Handler error propagates: the message stays pending for
-            // redelivery instead of being acked as processed.
-            handler(message).await?;
-            if let Err(e) = self
-                .backend
-                .ack(
-                    &self.inbox_stream,
-                    &group_name,
-                    std::slice::from_ref(&msg_id),
-                )
-                .await
-            {
-                tracing::warn!(msg_id = %msg_id, "Failed to ack inbox message: {e}");
-            }
+        if let Err(e) = handler(message).await {
+            // Left pending on purpose: the handler did not finish, so acking
+            // would record a run that never happened. The log line is what
+            // makes the failure visible now, since the retry waits for the next
+            // start of this consumer.
+            tracing::warn!(
+                agent_id = %self.agent_id,
+                msg_id = %msg_id,
+                error = %e,
+                "Inbox command failed; the message stays pending for retry"
+            );
+            return;
         }
-
-        Ok(())
+        if let Err(e) = self
+            .backend
+            .ack(&self.inbox_stream, group_name, &[msg_id.to_string()])
+            .await
+        {
+            tracing::warn!(msg_id = %msg_id, "Failed to ack inbox message: {e}");
+        }
     }
 
     /// Send a message to another agent's inbox.
