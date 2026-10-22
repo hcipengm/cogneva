@@ -1,4 +1,3 @@
-use chrono::{Duration, Timelike, Utc};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -87,11 +86,12 @@ impl QuotaManager {
     }
 
     /// Get seconds until next midnight (UTC).
+    ///
+    /// Delegates to the crate's one day boundary: a second copy of this
+    /// arithmetic is a second answer to "when does the day turn", and a key
+    /// whose TTL was computed by the other copy outlives the reset.
     fn seconds_until_midnight() -> u64 {
-        let now = Utc::now();
-        let seconds_today =
-            now.num_seconds_from_midnight() as i64 + now.timestamp_subsec_millis() as i64 / 1000;
-        (Duration::seconds(86400).num_seconds() - seconds_today).max(0) as u64
+        crate::day::seconds_to_next_day(chrono::Utc::now().timestamp())
     }
 
     /// Bootstrap a missing quota key to `default_quota` with TTL until midnight.
