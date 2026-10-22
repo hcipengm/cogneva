@@ -29,7 +29,7 @@ spec:
   hard:
     requests.cpu: "6"
     requests.memory: 12Gi
-    limits.cpu: "30"
+    limits.cpu: "31"
     # 52Gi：稳态 43.7Gi（渲染期门禁自报）+ 判据 Job 512Mi + 运行期自建临时 Pod
     # 3.75Gi（eval 表 3Gi + 验收演练 768Mi）+ 替换重叠 3.4Gi = 51.35Gi。
     # 运行期自建 Pod 不是渲染集里的工作负载，但它们的预算写在上面的注解里，

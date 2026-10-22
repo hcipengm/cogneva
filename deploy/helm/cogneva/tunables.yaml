@@ -263,7 +263,14 @@ rows:
   - key: backends.redis.infoExporter.resources.limits.cpu
     source: override
     why: >-
-      A burst bound for the poll loop; no measurement of that burst feeds back into it.
+      A burst bound for the poll loop. The burst is real and now measured: at
+      100m the poller spent 57% of its CFS periods throttled while drawing under
+      a millicore on average, because a fork-and-parse burst spends the whole
+      100 ms quota in its first few milliseconds -- which is why the draw is not
+      the reading that decides this number. Raised to 500m against that ratio on
+      2026-10-23. Still an override: nothing re-derives it, so a pod that begins
+      throttling again is caught by CPUThrottlingHigh and by the ledger row for
+      an alert the mirror never sees, not by this value moving on its own.
   - key: backends.redis.infoExporter.resources.limits.memory
     source: override
     why: >-

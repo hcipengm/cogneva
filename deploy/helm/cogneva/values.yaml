@@ -101,7 +101,12 @@ resourceGovernance:
   quota:
     requestsCpu: "6"
     requestsMemory: 12Gi
-    limitsCpu: "30"
+    # 声明工作负载的 limits.cpu 之和 + 部署器判据 Job（2）+ 运行期预算（3）必须
+    # ≤ 这个数，渲染期门禁逐 profile 现算。2026-10-23 抬 1 核：redis-info-exporter
+    # 从 100m 到 500m（它被自己的 CFS 配额限掉 57% 的周期），声明和也随之 +400m，
+    # 而旧上限恰好贴着旧的声明和——这正是「有准入上限约束的旋钮是一对」的那种：
+    # 只抬容器那份，准入会先把下一次滚动 Job 拒掉。
+    limitsCpu: "31"
     limitsMemory: 52Gi
     pods: "40"
     # 存储声明是**命名空间内全部 PVC 之和的上限**，不是某个卷的容量：目录型卷
@@ -966,8 +971,14 @@ backends:
         requests:
           cpu: 10m
           memory: 16Mi
+        # The poller draws under a millicore on average and still spent 57% of
+        # its CFS periods throttled at 100m: the work is a short burst (one
+        # redis-cli fork, one parse) that burns the whole 100 ms quota in its
+        # first few milliseconds, so the average says nothing about whether the
+        # quota fits. 500m clears the burst and still lets a tight node
+        # schedule the pod, because the request is what the scheduler reads.
         limits:
-          cpu: 100m
+          cpu: 500m
           memory: 64Mi
   qdrant:
     enabled: true
