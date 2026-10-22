@@ -133,7 +133,16 @@ const INBOX_REFUSAL_REASONS: [&str; 2] = ["no_live_agent", "roster_unreadable"];
 /// is the reason these are counted apart from deliveries: a target that keeps
 /// taking longer than its askers are willing to wait is a capacity question,
 /// while a stream that closes under the reader is a broken channel.
-const INBOX_ASK_OUTCOMES: [&str; 3] = ["replied", "timeout", "stream_error"];
+///
+/// `abandoned` is the fourth: the asker stopped before the wait could return,
+/// either because the turn that was waiting was cancelled or because the send
+/// failed after the reply stream already existed. It is counted apart from
+/// `timeout` because the repair is different — nothing is slow here; the party
+/// that was going to read the answer went away, so the answer will be written
+/// to a stream nobody is subscribed to. Before this cell existed the reply
+/// stream of a cancelled ask was simply left in the backend with no record that
+/// it had ever been asked for.
+const INBOX_ASK_OUTCOMES: [&str; 4] = ["replied", "timeout", "stream_error", "abandoned"];
 
 /// The label an inbox command is counted under.
 ///

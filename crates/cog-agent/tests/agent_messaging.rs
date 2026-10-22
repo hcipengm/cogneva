@@ -27,8 +27,8 @@ use async_trait::async_trait;
 
 use cog_agent::tools::builtins::{list_agents, send_to_agent};
 use cog_core::{
-    AgentRegistration, AgentRegistry, InboxMessage, MessageBackend, MessageStream, PendingStats,
-    ResourceInfo, SFResult, ToolImplementation,
+    AgentRegistration, AgentRegistry, InboxMessage, MessageBackend, MessageStream, Observable,
+    PendingStats, ResourceInfo, SFResult, ToolImplementation,
 };
 
 /// A queue that keeps what it was given.
@@ -539,6 +539,17 @@ async fn a_run_with_no_identity_reports_null_and_marks_nobody() {
     );
 }
 
+/// The ask counters are process-global and cargo runs this file's tests on
+/// parallel threads, so the two tests that assert on them take turns: what one
+/// books is exactly what the other says was not booked.
+static ASK_COUNTS: Mutex<()> = Mutex::new(());
+
+fn ask_counts() -> std::sync::MutexGuard<'static, ()> {
+    ASK_COUNTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// A queue with a target on the other end: a prompt written to an inbox is
 /// treated as if that agent had run it, and the result goes to the stream the
 /// request named.
@@ -551,6 +562,9 @@ async fn a_run_with_no_identity_reports_null_and_marks_nobody() {
 struct Answering {
     inner: cog_stream::MemoryMessageBackend,
     answer: Option<serde_json::Value>,
+    /// The queue refuses the request itself, after the caller has already
+    /// opened its reply stream.
+    refuse_publish: bool,
     asked: Mutex<Option<String>>,
     deleted: Mutex<Vec<String>>,
     /// What a reader on the reply stream sees: only what is published after it
@@ -570,9 +584,17 @@ impl Answering {
         Self {
             inner: cog_stream::MemoryMessageBackend::new(),
             answer,
+            refuse_publish: false,
             asked: Mutex::new(None),
             deleted: Mutex::new(Vec::new()),
             replies: tokio::sync::broadcast::channel(16).0,
+        }
+    }
+
+    fn refusing() -> Self {
+        Self {
+            refuse_publish: true,
+            ..Self::new(None)
         }
     }
 
@@ -589,18 +611,26 @@ impl Answering {
 impl MessageBackend for Answering {
     async fn publish(&self, subject: &str, payload: &[u8]) -> SFResult<()> {
         if subject.starts_with("orchestrator:agent:") {
-            if let Ok(InboxMessage::Prompt {
-                reply_stream: Some(stream),
-                ..
-            }) = serde_json::from_slice::<InboxMessage>(payload)
-            {
+            let named = match serde_json::from_slice::<InboxMessage>(payload) {
+                Ok(InboxMessage::Prompt {
+                    reply_stream: Some(stream),
+                    ..
+                }) => Some(stream),
+                _ => None,
+            };
+            if let Some(stream) = named.as_ref() {
                 *self.asked.lock().expect("lock") = Some(stream.clone());
-                if let Some(answer) = self.answer.as_ref() {
-                    let bytes = serde_json::to_vec(answer).expect("encode answer");
-                    // A subscriber that is not attached yet receives nothing:
-                    // that is the property under test.
-                    let _ = self.replies.send(("1-0".to_string(), bytes));
-                }
+            }
+            // Refused after the request has named its stream: the caller has
+            // opened a key by then, which is exactly what has to be cleaned up.
+            if self.refuse_publish {
+                return Err(cog_core::SFError::Agent("queue refused the write".into()));
+            }
+            if let (Some(_), Some(answer)) = (named, self.answer.as_ref()) {
+                let bytes = serde_json::to_vec(answer).expect("encode answer");
+                // A subscriber that is not attached yet receives nothing:
+                // that is the property under test.
+                let _ = self.replies.send(("1-0".to_string(), bytes));
             }
         }
         self.inner.publish(subject, payload).await
@@ -794,4 +824,162 @@ async fn a_command_that_starts_no_run_cannot_be_asked_for_an_answer() {
         err.to_string().contains("kind=prompt"),
         "the error names the kind that can answer: {err}"
     );
+}
+
+/// A turn cancelled mid-wait still ends the stream it opened, and says so.
+///
+/// The wait deletes the reply stream on every path it reaches. A cancelled turn
+/// reaches none of them: the future is dropped at the await it was parked on, so
+/// the cleanup after the wait never runs and the key stays in the backend with
+/// its consumer group and nobody left to read it. The same happens on the `?`
+/// returns between creating the group and starting the wait -- a publish that
+/// fails leaves the stream behind just as surely.
+///
+/// A guard armed when the key starts existing is the only thing that runs on
+/// both, and it also has to tell the reader what happened: before it existed a
+/// cancelled ask moved no counter at all, so an agent whose turns keep being
+/// interrupted looked exactly like one that never asked.
+#[tokio::test]
+async fn a_cancelled_ask_ends_its_stream_and_is_counted_apart_from_a_timeout() {
+    let _counts = ask_counts();
+    let backend = Arc::new(Answering::new(None));
+    let roster = Arc::new(Roster::new(&["squad:task-1-tester"]));
+
+    let tool = send_to_agent(backend.clone(), roster);
+    let ToolImplementation::Native(handler) = tool.implementation else {
+        panic!("send_to_agent is a native tool");
+    };
+    let asking = tokio::spawn(async move {
+        (handler)(serde_json::json!({
+            "agent_id": "squad:task-1-tester",
+            "message": "run the tests",
+            "expect_reply": true,
+            // Long enough that the wait cannot end on its own: what this test
+            // cancels has to be a wait that was still in progress.
+            "timeout_ms": 60_000,
+        }))
+        .await
+    });
+
+    // The call opens its reply stream before it publishes, and then parks on a
+    // reply channel that never carries anything. Wait for the first half.
+    let mut stream = None;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        stream = backend.reply_stream_asked();
+        if stream.is_some() {
+            break;
+        }
+    }
+    let stream = stream.expect("the ask opened its reply stream before waiting");
+
+    asking.abort();
+    let _ = asking.await;
+
+    // The guard deletes from a task it spawned on the way out, so let the
+    // runtime reach it before reading what the backend saw.
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        if !backend.deleted().is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        backend.deleted(),
+        vec![stream.clone()],
+        "a cancelled ask releases the stream it opened: {stream}"
+    );
+
+    let metrics = cog_agent::observable::global_observable()
+        .collect_metrics("")
+        .await
+        .expect("collect_metrics");
+    let read = |outcome: &str| {
+        metrics
+            .iter()
+            .find(|m| {
+                m.name == "agent_inbox_ask_total"
+                    && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+            })
+            .map(|m| m.value)
+    };
+    assert_eq!(
+        read("abandoned"),
+        Some(1.0),
+        "a cancelled ask is counted under its own outcome, not as a timeout"
+    );
+}
+
+/// A question the queue never accepted is not an abandoned question.
+///
+/// The reply stream is opened before the request is published, so a publish
+/// that fails leaves the key behind -- the same leak a cancelled turn has, and
+/// the same guard has to end it. What it must not do is book the failure as an
+/// outcome of asking: the caller is holding an error from the send itself, and
+/// `abandoned` has to keep meaning "the asker left while waiting". Counting a
+/// refused write there would make the two indistinguishable in the reading that
+/// exists to tell them apart.
+#[tokio::test]
+async fn a_question_the_queue_refused_is_not_booked_as_abandoned() {
+    let _counts = ask_counts();
+    let backend = Arc::new(Answering::refusing());
+    let roster = Arc::new(Roster::new(&["squad:task-1-tester"]));
+
+    // The counter is process-global and another test in this file books
+    // `abandoned` on purpose, so the claim is about the delta this call moves:
+    // nothing.
+    let abandoned_before = abandoned_count().await;
+
+    let tool = send_to_agent(backend.clone(), roster);
+    let ToolImplementation::Native(handler) = tool.implementation else {
+        panic!("send_to_agent is a native tool");
+    };
+    let refused = (handler)(serde_json::json!({
+        "agent_id": "squad:task-1-tester",
+        "message": "run the tests",
+        "expect_reply": true,
+        "timeout_ms": 60_000,
+    }))
+    .await;
+    assert!(
+        refused.is_err(),
+        "a refused publish is the caller's error to see: {refused:?}"
+    );
+
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        if !backend.deleted().is_empty() {
+            break;
+        }
+    }
+    let stream = backend
+        .reply_stream_asked()
+        .expect("the reply stream was opened before the publish was attempted");
+    assert_eq!(
+        backend.deleted(),
+        vec![stream],
+        "the stream the failed send had already opened is ended"
+    );
+
+    assert_eq!(
+        abandoned_count().await,
+        abandoned_before,
+        "a publish that failed never became a question, so no ask outcome is booked for it"
+    );
+}
+
+/// The cancelled asks the whole process has booked so far.
+async fn abandoned_count() -> f64 {
+    let metrics = cog_agent::observable::global_observable()
+        .collect_metrics("")
+        .await
+        .expect("collect_metrics");
+    metrics
+        .iter()
+        .find(|m| {
+            m.name == "agent_inbox_ask_total"
+                && m.labels.get("outcome").map(String::as_str) == Some("abandoned")
+        })
+        .map(|m| m.value)
+        .unwrap_or(0.0)
 }

@@ -1884,11 +1884,23 @@ pub mod builtins {
                     // published between the two would sit behind the reader's
                     // start position and never be delivered, and the wait would
                     // run to its timeout with the answer already on the wire.
-                    let mut reply_reader = match ask.as_deref() {
+                    //
+                    // The group is created first, and it is what creates the
+                    // key: every `?` between here and the wait's own cleanup
+                    // can return with the stream already in the backend. The
+                    // guard is armed at that moment, so a failed publish, a
+                    // dropped future or a cancelled turn all end the same way
+                    // as an answer does -- with the stream deleted and the ask
+                    // counted under the outcome it actually met.
+                    let mut reply_guard = match ask.as_deref() {
                         Some(stream) => {
                             backend.create_consumer_group(stream, ASK_GROUP).await?;
-                            Some(backend.subscribe(stream, ASK_GROUP).await?)
+                            Some(ReplyStreamGuard::new(backend.clone(), stream))
                         }
+                        None => None,
+                    };
+                    let mut reply_reader = match ask.as_deref() {
+                        Some(stream) => Some(backend.subscribe(stream, ASK_GROUP).await?),
                         None => None,
                     };
 
@@ -1919,7 +1931,15 @@ pub mod builtins {
                     });
 
                     if let (Some(stream), Some(reader)) = (ask.as_deref(), reply_reader.as_mut()) {
+                        if let Some(guard) = reply_guard.as_mut() {
+                            guard.begin_wait();
+                        }
                         let waited = wait_for_reply(backend.as_ref(), stream, reader, &args).await;
+                        // The wait deletes the stream on every path it reaches,
+                        // so from here on the guard has nothing left to clean.
+                        if let Some(guard) = reply_guard.as_mut() {
+                            guard.disarm();
+                        }
                         let observable = crate::observable::global_observable();
                         observable.record_inbox_ask(waited.outcome);
                         let waited_ms = waited.waited.as_millis() as u64;
@@ -1980,6 +2000,90 @@ pub mod builtins {
             nanos,
             NEXT.fetch_add(1, Ordering::Relaxed)
         )
+    }
+
+    /// Ends a reply stream the wait never got to end, and counts the ask.
+    ///
+    /// `wait_for_reply` closes the stream on every path it *reaches*. A
+    /// cancelled turn reaches none of them: the future is dropped at whatever
+    /// `.await` it was parked on, so the `close_reply_stream` at the end never
+    /// runs and the key stays in the backend with its consumer group and
+    /// nothing left to read it. The same is true of the `?` returns between
+    /// the group's creation and the wait — a publish that fails leaves the
+    /// stream behind just as surely.
+    ///
+    /// A guard is the only construct that runs on both. It is armed when the
+    /// key starts existing and disarmed when the wait has done its own
+    /// cleanup, so its `Drop` fires exactly on the paths that skip that
+    /// cleanup. The delete is spawned rather than awaited because `Drop`
+    /// cannot wait: the runtime is still up (a drop only happens inside one),
+    /// and a delete that fails is the same orphaned key the wait itself
+    /// tolerates and logs.
+    ///
+    /// The ask is counted as `abandoned` here, not by the wait: the wait's
+    /// outcomes all mean the caller got an answer or ran out of patience, and
+    /// neither is what happened. Only a drop *after* the wait began is booked
+    /// that way: a publish that failed never became an ask, so its caller has
+    /// an error in hand and there is no question to count -- the stream it had
+    /// already opened is cleaned up all the same.
+    struct ReplyStreamGuard {
+        backend: std::sync::Arc<dyn cog_core::MessageBackend>,
+        stream: String,
+        armed: bool,
+        waiting: bool,
+    }
+
+    impl ReplyStreamGuard {
+        fn new(backend: std::sync::Arc<dyn cog_core::MessageBackend>, stream: &str) -> Self {
+            Self {
+                backend,
+                stream: stream.to_string(),
+                armed: true,
+                waiting: false,
+            }
+        }
+
+        /// The question is on the wire and the caller is now waiting for it.
+        fn begin_wait(&mut self) {
+            self.waiting = true;
+        }
+
+        /// The wait has already deleted the stream; do not delete it twice.
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for ReplyStreamGuard {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            if self.waiting {
+                crate::observable::global_observable().record_inbox_ask("abandoned");
+            }
+            let backend = self.backend.clone();
+            let stream = self.stream.clone();
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        backend.stop_stream(&stream, ASK_GROUP).await;
+                        if let Err(e) = backend.delete_stream(&stream).await {
+                            tracing::warn!(
+                                stream = %stream,
+                                error = %e,
+                                "an abandoned ask left its reply stream behind: this \
+                                 backend cannot delete streams"
+                            );
+                        }
+                    });
+                }
+                Err(_) => tracing::warn!(
+                    stream = %self.stream,
+                    "an abandoned ask could not be reaped: no runtime to close its reply stream"
+                ),
+            }
+        }
     }
 
     /// What one wait produced: how it ended, what came back, and how long it
