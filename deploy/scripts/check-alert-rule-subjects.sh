@@ -335,6 +335,9 @@ def find_container(o):
 # 「同一条告警随报信 Pod 重建而换身份」在这里不存在，所以这不是「漏聚合」，是这条抓取路径
 # 上**没有那个维**。
 #
+# 构建缓存回收器那一组（`CognevaHostTargetGc*`）读的是同一条通道：那几格是宿主自己的
+# 定时器与状态文件的读数，由同一条 host-readings 抓取路径送出，没有第二个进程在报信。
+#
 # 但这种豁免最容易变成盲区，所以它带前提：premise 从树上的 ScrapeConfig 读出来（见
 # scrape_jobs_without_pod），哪天这条通道改成 Pod 发现、或 relabel 开始挂 pod/container，
 # 这些名字就自动回到「未收敛」一栏，而不是继续被静默放行。
@@ -351,6 +354,12 @@ NO_POD_REPORTER = {
     'CognevaBackupPackageUnreadable': 'cogneva_backup_package_reading_state{state="unreadable"}',
     'CognevaBackupPackageMissing': 'cogneva_backup_package_reading_state{state="empty"}',
     'CognevaBackupPackageStale': 'cogneva_backup_package_age_seconds',
+    'CognevaHostTargetGcStale': 'cogneva_host_target_gc_age_seconds',
+    'CognevaHostTargetGcCadenceUnknown': 'cogneva_host_target_gc_measured',
+    'CognevaHostTargetGcNeverRan': 'cogneva_host_target_gc_measured',
+    'CognevaHostTargetGcScriptUnverified': 'cogneva_host_target_gc_script_committed',
+    'CognevaHostTargetGcProbeFailed': 'cogneva_host_target_gc_outcome{outcome="probe_failed"}',
+    'CognevaHostTargetGcFloorUnreachable': 'cogneva_host_target_gc_outcome{outcome="floor_unreachable"}',
 }
 HOST_READING_JOB = 'cogneva-host-readings'
 POD_LABELS = ('pod', 'container')
