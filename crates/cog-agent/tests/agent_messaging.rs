@@ -612,7 +612,7 @@ impl MessageBackend for Answering {
 
     async fn subscribe(&self, subject: &str, group: &str) -> SFResult<MessageStream> {
         if subject.starts_with("orchestrator:reply:") {
-            let mut rx = self.replies.subscribe();
+            let rx = self.replies.subscribe();
             let live = futures::stream::unfold(rx, |mut rx| async move {
                 rx.recv().await.ok().map(|msg| (Ok(msg), rx))
             });
