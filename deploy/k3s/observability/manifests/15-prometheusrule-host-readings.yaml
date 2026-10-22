@@ -421,6 +421,22 @@ spec:
             summary: "NVMe {{ $labels.device }} 位次上换过一块盘"
             description: "`cogneva_host_nvme_replacements_total` 是这块位次上累计换过的盘数（读数按序列号数，第一次见不计）。降下去是换盘，不是盘变好了——磨损只增不减，同一块盘的 percentage_used 不会回落。要记录换的哪块、旧的磨到多少，看这一行告警的起止时间与换盘前的 `cogneva_host_nvme_percentage_used`。"
 
+        # 换盘计数是本族唯一一个**基线在宿主侧的序列**（状态文件按序列号记着每一位次换过几块）。
+        # 那个文件被删、被清理脚本扫掉、或换了个用户跑，计数就从 0 重来——而这件事在宿主侧
+        # 看不出来：生产者只知道自己手里没有基线，分不清「第一次跑」与「基线没了」。
+        # 能看见它的只有比基线活得久的东西，也就是 Prometheus 的时序：计数只增不减，
+        # 回落一次就说明基线被重置过。不接这一条，下一次换盘会被静默吞掉（新基线把它当
+        # 第一次见），而读数面上一切正常。计数本来是 0 时这条不会响——没有东西可丢。
+        - alert: CognevaHostNvmeBaselineLost
+          expr: resets(cogneva_host_nvme_replacements_total[1h]) > 0
+          for: 10m
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "NVMe 换盘计数回落：{{ $labels.device }} 的宿主侧基线被重置了"
+            description: "`cogneva_host_nvme_replacements_total` 只增不减——同一位次上序列号变了才 +1。它回落只有一个原因：宿主侧状态文件被删、读不懂或换了个用户跑，计数从 0 重来。这不影响磨损与界，但会让下一次换盘被静默吞掉（新基线把它当第一次见）。修法：确认这个位次实际换过几块，把旧计数写回 `COGNEVA_HOST_NVME_STATE` 指向的文件（默认 `~/.local/state/cogneva/nvme-wear.json`）再让下一次抓取覆盖它。"
+
         # 提前期是导出界那个公式里唯一的政策输入，钉得太短等于「等它响了再买」：
         # 采购与上门要时间，界就是为这段时间留的。低于 30 天时导出的界贴到寿命尽头，
         # 规则响了也已经来不及。这是政策读数自己的守卫，与任何一块盘的现状无关。

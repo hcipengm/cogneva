@@ -360,7 +360,7 @@ NO_POD_REPORTER = {
     'CognevaHostTargetGcScriptUnverified': 'cogneva_host_target_gc_script_committed',
     'CognevaHostTargetGcProbeFailed': 'cogneva_host_target_gc_outcome{outcome="probe_failed"}',
     'CognevaHostTargetGcFloorUnreachable': 'cogneva_host_target_gc_outcome{outcome="floor_unreachable"}',
-    # NVMe 那三条读的是同一台宿主上的盘，走同一条 host-readings 抓取通道（Node 角色，
+    # NVMe 那一族读的是同一台宿主上的盘，走同一条 host-readings 抓取通道（Node 角色，
     # 抓取面上没有 pod/container）。它们的身份由规则名与盘区分：`device` 是身份的一半，
     # 保留它是必须的（一块盘磨到界与另一块无关，两块都要报），而报信的从来不是 Pod——
     # 读数由宿主上的生产者算好、聚合器送出去，聚合器重建也不改变盘是谁的。
@@ -370,6 +370,7 @@ NO_POD_REPORTER = {
     'CognevaHostNvmeUnreadable': 'cogneva_host_nvme_devices',
     'CognevaHostNvmeReplacementDetected': 'cogneva_host_nvme_replacements_total',
     'CognevaHostNvmeLeadTimeTooShort': 'cogneva_host_nvme_lead_days',
+    'CognevaHostNvmeBaselineLost': 'cogneva_host_nvme_replacements_total',
     'CognevaFileSizeCensusUnjudged': 'cogneva_file_size_census_unjudged',
     'CognevaHostReadingSeriesUndeclared': 'host_reading_series_undeclared',
     'CognevaReadingWitnessUnresolved': 'reading_witness_unresolved',
