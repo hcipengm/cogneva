@@ -31,6 +31,29 @@ pub struct ToolScope {
     pub agent_id: String,
 }
 
+tokio::task_local! {
+    /// The agent whose run is making the tool call on this task.
+    ///
+    /// A tool is registered once per process and shared by every agent in it,
+    /// so nothing in the handler's own state can say who is calling; the run
+    /// loop is the only party that knows, and it is also the one that
+    /// dispatches the call. It announces the id around the await, and a handler
+    /// that needs an identity reads it back here rather than inventing one.
+    ///
+    /// Absent when the dispatcher never established one — a runtime created
+    /// without an agent config, a handler called directly by a test. Tools that
+    /// report an identity say `null` in that case: "nobody said who is calling"
+    /// and "the caller has no id" are different facts, and a made-up name would
+    /// read as the second when the truth is the first.
+    pub static CALLER_AGENT_ID: String;
+}
+
+/// The id of the agent whose run is making this call, when the dispatcher
+/// announced one. See [`CALLER_AGENT_ID`].
+pub fn caller_agent_id() -> Option<String> {
+    CALLER_AGENT_ID.try_with(|id| id.clone()).ok()
+}
+
 /// Why a tool call produced no value.
 ///
 /// A guardrail refusal is kept apart from a tool failure on purpose. A refusal is
@@ -1629,7 +1652,9 @@ pub mod builtins {
             description: "List the live agents this platform has registered, optionally \
                           filtered by role or capability. Use it to find the exact \
                           agent_id to pass to send_to_agent. Only live agents appear: a \
-                          registration that has expired is not listed."
+                          registration that has expired is not listed. When the run \
+                          established an identity, your own entry carries `is_me: true` \
+                          and the result repeats your id as `caller`."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -1649,6 +1674,12 @@ pub mod builtins {
                 Box::pin(async move {
                     let role = args["role"].as_str();
                     let capability = args["capability"].as_str();
+                    // The caller's own row is marked, because an id derived
+                    // from a task and a role is not something an agent can
+                    // reconstruct from its prompt: without the mark the only
+                    // way to find yourself in the directory is to guess which
+                    // of several peers you are.
+                    let me = caller_agent_id();
                     let live = registry.list().await?;
                     let agents: Vec<serde_json::Value> = live
                         .into_iter()
@@ -1657,17 +1688,20 @@ pub mod builtins {
                             capability.is_none_or(|cap| r.capabilities.iter().any(|c| c == cap))
                         })
                         .map(|r| {
+                            let is_me = me.as_deref() == Some(r.agent_id.as_str());
                             serde_json::json!({
                                 "agent_id": r.agent_id,
                                 "role": r.role,
                                 "workspace_id": r.workspace_id,
                                 "capabilities": r.capabilities,
                                 "last_heartbeat": r.last_heartbeat.to_rfc3339(),
+                                "is_me": is_me,
                             })
                         })
                         .collect();
                     Ok(serde_json::json!({
                         "count": agents.len(),
+                        "caller": me,
                         "agents": agents,
                     }))
                 })
@@ -1696,6 +1730,12 @@ pub mod builtins {
     /// the run's events reach the event plane as any other run's do, but a
     /// caller waiting on an answer waits forever. `reply_stream` exists on the
     /// wire for callers that can read a stream; a tool call cannot.
+    ///
+    /// The caller's own id comes from the run loop, which is the only party
+    /// that knows it: the handler is shared by every agent in the process and
+    /// its signature carries arguments only. It rides into the log line and
+    /// into the result, so a message can be traced to its sender and an agent
+    /// that was never told its own id can read it off the receipt.
     pub fn send_to_agent(
         backend: Arc<dyn cog_core::MessageBackend>,
         registry: Arc<dyn cog_core::AgentRegistry>,
@@ -1706,9 +1746,11 @@ pub mod builtins {
                           at-least-once and the target acks only after it has run the \
                           command, so write instructions that survive being applied twice. \
                           There is no reply: the target's run reports through the event \
-                          plane, and nothing is returned to you. kind=prompt starts a run \
-                          on the target, kind=steering injects into a run already in \
-                          progress, kind=continue appends to the target's conversation."
+                          plane, and nothing is returned to you. The result repeats your \
+                          own agent id as `from` when the run established one, and `null` \
+                          when it did not. kind=prompt starts a run on the target, \
+                          kind=steering injects into a run already in progress, \
+                          kind=continue appends to the target's conversation."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -1784,8 +1826,24 @@ pub mod builtins {
                     let stream = cog_core::agent_inbox_stream(agent_id);
                     let payload = serde_json::to_vec(&inbox).map_err(SFError::Serialization)?;
                     backend.publish(&stream, &payload).await?;
+                    // One line per message, naming both ends: the queue keeps
+                    // no sender anywhere — the wire form carries the command
+                    // and nothing about who wrote it — so without this the only
+                    // party who could ever say who asked is the caller's own
+                    // transcript. What the line says is what happened at this
+                    // point: published, not delivered, because delivery is the
+                    // target's ack and this process does not see it.
+                    let from = caller_agent_id();
+                    tracing::info!(
+                        from = from.as_deref().unwrap_or("-"),
+                        to = agent_id,
+                        kind,
+                        stream = %stream,
+                        "inter-agent message published to an inbox"
+                    );
                     Ok(serde_json::json!({
                         "delivered": true,
+                        "from": from,
                         "agent_id": agent_id,
                         "kind": kind,
                         "stream": stream,

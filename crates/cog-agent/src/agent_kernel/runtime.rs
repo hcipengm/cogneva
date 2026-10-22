@@ -1425,9 +1425,20 @@ impl AgentRuntime {
                     task_id: tid.to_string(),
                     agent_id: self.config.agent_id.clone(),
                 });
-                let checked = self
-                    .tools
-                    .execute_scoped_checked(&tc.name, tc.arguments.clone(), scope.as_ref())
+                // The tool is shared by every agent in this process, so the
+                // handler cannot tell whose call this is unless the dispatcher
+                // says so. It is named around the await rather than passed in:
+                // the handler signature is the same for every native tool, and
+                // only the addressing tools need a caller.
+                let checked = crate::tools::CALLER_AGENT_ID
+                    .scope(
+                        self.config.agent_id.clone(),
+                        self.tools.execute_scoped_checked(
+                            &tc.name,
+                            tc.arguments.clone(),
+                            scope.as_ref(),
+                        ),
+                    )
                     .await;
 
                 // A guardrail refusal is not a tool failure. A failed tool might

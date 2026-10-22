@@ -447,3 +447,94 @@ async fn an_empty_message_is_refused() {
     assert!(error.to_string().contains("message required"), "{error}");
     assert!(backend.published().is_empty());
 }
+
+/// The run's own identity reaches both tools, and reaches them as the same
+/// answer.
+///
+/// A tool is shared by every agent in the process, so the handler cannot know
+/// who is calling unless the run says so; what it says arrives here through the
+/// task-local the dispatcher sets around the call. The mark matters for the
+/// directory because an agent id is derived from a task and a role, and an
+/// agent cannot reconstruct either for itself: "which of these peers is me" has
+/// no other answer inside the process.
+///
+/// The two results are asserted together because they are one fact seen twice.
+/// A receipt naming a sender the directory does not mark would mean the two
+/// tools read identity from different places.
+#[tokio::test]
+async fn the_run_identity_reaches_the_receipt_and_the_directory_alike() {
+    let roster = Arc::new(Roster::with_roles(&[
+        ("squad:task-1-coder", "coder", &[]),
+        ("squad:task-1-reviewer", "reviewer", &[]),
+    ]));
+    let backend = Arc::new(Recording::default());
+
+    let (sent, listed) = cog_agent::tools::CALLER_AGENT_ID
+        .scope("squad:task-1-reviewer".to_string(), async {
+            let sent = call(
+                backend.clone(),
+                roster.clone(),
+                serde_json::json!({ "agent_id": "squad:task-1-coder", "message": "run the tests" }),
+            )
+            .await
+            .expect("sent");
+            let listed = call_list(roster.clone(), serde_json::json!({}))
+                .await
+                .expect("listed");
+            (sent, listed)
+        })
+        .await;
+
+    assert_eq!(sent["from"], serde_json::json!("squad:task-1-reviewer"));
+    assert_eq!(listed["caller"], serde_json::json!("squad:task-1-reviewer"));
+    let marked: Vec<&str> = listed["agents"]
+        .as_array()
+        .expect("agents is a list")
+        .iter()
+        .filter(|a| a["is_me"] == serde_json::json!(true))
+        .map(|a| a["agent_id"].as_str().expect("agent_id"))
+        .collect();
+    assert_eq!(
+        marked,
+        vec!["squad:task-1-reviewer"],
+        "exactly the caller is marked: {listed}"
+    );
+}
+
+/// A run that announced no identity says so, rather than being given a name.
+///
+/// Both tools are reachable from callers that were never told who they are —
+/// a runtime built without an agent config, a tool invoked straight from a
+/// test. The honest answer is `null`: a made-up id in the receipt would read as
+/// "this message came from X", which is a claim about a sender that does not
+/// exist, and in the directory it would mark a row at random.
+#[tokio::test]
+async fn a_run_with_no_identity_reports_null_and_marks_nobody() {
+    let roster = Arc::new(Roster::with_roles(&[
+        ("squad:task-1-coder", "coder", &[]),
+        ("squad:task-1-reviewer", "reviewer", &[]),
+    ]));
+    let backend = Arc::new(Recording::default());
+
+    let sent = call(
+        backend.clone(),
+        roster.clone(),
+        serde_json::json!({ "agent_id": "squad:task-1-coder", "message": "run the tests" }),
+    )
+    .await
+    .expect("sent");
+    assert_eq!(sent["from"], serde_json::Value::Null);
+
+    let listed = call_list(roster, serde_json::json!({}))
+        .await
+        .expect("listed");
+    assert_eq!(listed["caller"], serde_json::Value::Null);
+    assert!(
+        listed["agents"]
+            .as_array()
+            .expect("agents is a list")
+            .iter()
+            .all(|a| a["is_me"] == serde_json::json!(false)),
+        "no row is marked when the caller is unknown: {listed}"
+    );
+}
