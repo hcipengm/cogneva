@@ -1,3 +1,5 @@
+//! principle: feedback_a_nullable_reading_field_bound_straight_into_a_not_null_column_is_rejected
+//!
 //! The principle ledger's intake, against a live PostgreSQL.
 //!
 //! What these tests check is what the statement decides, and it is the one thing
