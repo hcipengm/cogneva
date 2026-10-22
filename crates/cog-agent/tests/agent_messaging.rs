@@ -840,6 +840,10 @@ async fn a_command_that_starts_no_run_cannot_be_asked_for_an_answer() {
 /// cancelled ask moved no counter at all, so an agent whose turns keep being
 /// interrupted looked exactly like one that never asked.
 #[tokio::test]
+// The guard is a serializer, not shared state: the counters these two tests read
+// are process-global, so the lock has to outlive every await in the test for the
+// delta to mean anything. Holding a std lock across awaits is the point here.
+#[allow(clippy::await_holding_lock)]
 async fn a_cancelled_ask_ends_its_stream_and_is_counted_apart_from_a_timeout() {
     let _counts = ask_counts();
     let backend = Arc::new(Answering::new(None));
@@ -920,6 +924,9 @@ async fn a_cancelled_ask_ends_its_stream_and_is_counted_apart_from_a_timeout() {
 /// refused write there would make the two indistinguishable in the reading that
 /// exists to tell them apart.
 #[tokio::test]
+// Same serializer as the test above: the delta this asserts is meaningless if
+// another test books an outcome between the two reads.
+#[allow(clippy::await_holding_lock)]
 async fn a_question_the_queue_refused_is_not_booked_as_abandoned() {
     let _counts = ask_counts();
     let backend = Arc::new(Answering::refusing());
