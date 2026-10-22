@@ -2148,13 +2148,36 @@ impl MainlineDeployer {
         let behind = self
             .behind_revs(state.last_good_rev.as_deref(), &bare)
             .await;
+        let pin = self.load_pin();
+        // 钉在盘上不等于它还按着：上游 revert 掉被撤的那一版之后它就松开了，而文件
+        // 仍在（循环不替命令删它）。心跳上只印「撤了哪一版」，读的人分不出「正被
+        // 按住」与「早就松开了，只是没人清」——而这两者的处置相反。
+        let pin_effective = match &pin {
+            PinReading::Pinned(p) => {
+                if bare.len() >= 7 && bare.chars().all(|c| c.is_ascii_hexdigit()) {
+                    let reachable = if rev12(&bare) == rev12(&p.withdrawn_rev) {
+                        true
+                    } else {
+                        // 判不出来时按「还在历史里」：与轮询里同一个方向。
+                        self.is_ancestor_checked(&p.withdrawn_rev, &bare)
+                            .await
+                            .unwrap_or(true)
+                    };
+                    Some(pin_holds(p, &bare, reachable))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
         let summary = heartbeat_message_with_pin(
             &state,
             &bare,
             &self.upstream_note(),
             behind,
             chrono::Utc::now().timestamp(),
-            &self.load_pin(),
+            &pin,
+            pin_effective,
         );
         info!(heartbeat = %summary, "mainline deployer heartbeat");
     }
@@ -7486,6 +7509,7 @@ fn heartbeat_message(
         behind_revs,
         now_unix,
         &PinReading::None,
+        None,
     )
 }
 
@@ -7496,6 +7520,10 @@ fn heartbeat_message_with_pin(
     behind_revs: Option<u64>,
     now_unix: i64,
     pin: &PinReading,
+    // 钉现在还按不按得住。`None` 是「这一行说不出来」（没有钉，或 bare 读不到）。
+    // 它必须与「按着」分开：盘上还躺着一份早就松开的钉，与一份正在生效的钉，
+    // 在这一行上原本完全同形。
+    pin_effective: Option<bool>,
 ) -> String {
     let in_flight = state
         .in_flight
@@ -7513,8 +7541,15 @@ fn heartbeat_message_with_pin(
         PinReading::Unreadable(_) => ("unreadable".to_string(), "none".to_string(), "none".into()),
         PinReading::None => ("none".to_string(), "none".to_string(), "none".into()),
     };
+    let pin_state = match (pin, pin_effective) {
+        (PinReading::Pinned(_), Some(true)) => "holding",
+        (PinReading::Pinned(_), Some(false)) => "released",
+        (PinReading::Pinned(_), None) => "unknown",
+        (PinReading::Unreadable(_), _) => "unreadable",
+        (PinReading::None, _) => "none",
+    };
     format!(
-        "bare={} upstream={} behind_revs={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={} advance_waits={} last_advance_wait={} pin={} pin_secs={} pin_actor={}",
+        "bare={} upstream={} behind_revs={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={} advance_waits={} last_advance_wait={} pin={} pin_secs={} pin_actor={} pin_state={}",
         rev12(bare_rev),
         upstream,
         // 落后几个 rev。`last_good_secs` 答的是"多久"，这一格答的是"几笔"——两者
@@ -7597,6 +7632,7 @@ fn heartbeat_message_with_pin(
         pin_rev,
         pin_secs,
         pin_actor,
+        pin_state,
     )
 }
 
@@ -7611,6 +7647,32 @@ pub(crate) fn write_pin(state_dir: &str, pin: &RevPin) -> SFResult<()> {
     let text = serde_json::to_string_pretty(pin)?;
     std::fs::write(&tmp, text).map_err(|e| SFError::IO(format!("write pin tmp: {e}")))?;
     std::fs::rename(&tmp, &path).map_err(|e| SFError::IO(format!("rename pin: {e}")))?;
+    Ok(())
+}
+
+/// 撤回事件日志：一行一次决定的追加式记录，与钉文件同目录。
+///
+/// 钉文件只回答「现在按着谁」——清掉之后它就没了，而「这一版被谁以什么理由撤过」
+/// 是一个不该随一次 `--clear` 消失的事实。这里只增不改：一行一次 `write_all`，
+/// 行远小于一页，追加写因此是原子的一整行。
+const PIN_EVENT_FILE: &str = "undeliver-events.jsonl";
+
+/// 追加一行撤回事件。序列化失败在这里就报错——写半行进去的日志，读的人会把它当
+/// 一条坏行跳过，而跳过的那一条恰好可能是唯一一次撤回。
+pub(crate) fn append_pin_event(state_dir: &str, event: &serde_json::Value) -> SFResult<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(state_dir)
+        .map_err(|e| SFError::IO(format!("create state dir {state_dir}: {e}")))?;
+    let path = Path::new(state_dir).join(PIN_EVENT_FILE);
+    let mut line = serde_json::to_string(event)?;
+    line.push('\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| SFError::IO(format!("open {}: {e}", path.display())))?;
+    file.write_all(line.as_bytes())
+        .map_err(|e| SFError::IO(format!("append {}: {e}", path.display())))?;
     Ok(())
 }
 
@@ -7652,8 +7714,9 @@ async fn resolve_commit(bare_repo: &str, rev: &str) -> Result<String, String> {
 /// `mainline-undeliver` 解析后的动作。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UndeliverAction {
-    /// 撤掉现有的钉。
-    Clear,
+    /// 撤掉现有的钉。清掉一次按住同样是一条决定，所以它也要署名与理由：一次没有
+    /// 署名的解除，事后与「钉被谁顺手删了」同形。
+    Clear { actor: String, reason: String },
     /// 下一次撤回。
     Withdraw {
         withdrawn: String,
@@ -7725,12 +7788,16 @@ fn parse_undeliver_args(args: &[String]) -> Result<UndeliverRequest, String> {
         }
     }
     if clear {
-        if withdrawn.is_some() || landing.is_some() || actor.is_some() || reason.is_some() {
-            return Err("--clear takes no revision, --to, --actor or --reason".into());
+        if withdrawn.is_some() || landing.is_some() {
+            return Err("--clear takes no revision and no --to".into());
         }
         return Ok(UndeliverRequest {
             state_dir,
-            action: UndeliverAction::Clear,
+            action: UndeliverAction::Clear {
+                actor: actor.ok_or("--actor <name> is required: releasing a hold is a decision")?,
+                reason: reason
+                    .ok_or("--reason <text> is required: say why the hold is being released")?,
+            },
         });
     }
     let action = UndeliverAction::Withdraw {
@@ -7764,11 +7831,56 @@ pub async fn run_undeliver_cli() -> Result<(), Box<dyn std::error::Error>> {
     let state_dir = request.state_dir.unwrap_or_else(|| cfg.state_dir.clone());
 
     let (withdrawn, landing, actor, reason) = match request.action {
-        UndeliverAction::Clear => {
+        UndeliverAction::Clear { actor, reason } => {
+            let unix = chrono::Utc::now().timestamp();
+            // 先读后删：被解除的那一条是谁、撤的是哪一版，只能从文件里读出来，
+            // 删完之后就只剩一句「清掉了」。
+            let cleared = match self::parse_pin(
+                std::fs::read_to_string(Path::new(&state_dir).join(PIN_FILE))
+                    .ok()
+                    .as_deref(),
+            ) {
+                PinReading::Pinned(pin) => Some(pin),
+                other => {
+                    if !matches!(other, PinReading::None) {
+                        // 读不出来的钉同样要清掉：留着它只会让循环一直按住，
+                        // 而清掉这件事本身已经记下来了。
+                        eprintln!("the pin file is unreadable; clearing it anyway");
+                    }
+                    None
+                }
+            };
             let removed = clear_pin(&state_dir)?;
+            let recorded = append_pin_event(
+                &state_dir,
+                &serde_json::json!({
+                    "kind": "cleared",
+                    "actor": actor,
+                    "reason": reason,
+                    "cleared_unix": unix,
+                    "withdrawn_rev": cleared.as_ref().map(|p| p.withdrawn_rev.clone()),
+                    "landed_rev": cleared.as_ref().map(|p| p.landed_rev.clone()),
+                    "pinned_unix": cleared.as_ref().map(|p| p.unix),
+                    "was_set": removed,
+                }),
+            )
+            .is_ok();
+            info!(
+                actor = %actor,
+                reason = %reason,
+                was_set = removed,
+                recorded,
+                state_dir = %state_dir,
+                "withdrawal pin cleared; the mainline advances again on its next round"
+            );
             println!(
                 "{}",
-                serde_json::json!({"pin": "cleared", "was_set": removed, "state_dir": state_dir})
+                serde_json::json!({
+                    "pin": "cleared",
+                    "was_set": removed,
+                    "recorded": recorded,
+                    "state_dir": state_dir,
+                })
             );
             return Ok(());
         }
@@ -7792,15 +7904,36 @@ pub async fn run_undeliver_cli() -> Result<(), Box<dyn std::error::Error>> {
         reason: reason.clone(),
         unix: chrono::Utc::now().timestamp(),
     };
+    // 先写钉、再记事件：钉是生效的那一半，事件是事后读的那一半。顺序反过来，
+    // 一次写钉失败会留下一行「撤过」的记录而集群照旧跑着被撤的那一版。
     write_pin(&state_dir, &pin)?;
+    let recorded = append_pin_event(
+        &state_dir,
+        &serde_json::json!({
+            "kind": "withdrawn",
+            "withdrawn_rev": withdrawn_rev,
+            "landed_rev": landed_rev,
+            "actor": actor,
+            "reason": reason,
+            "unix": pin.unix,
+        }),
+    )
+    .is_ok();
     info!(
         withdrawn = %rev12(&withdrawn_rev),
         landing = %rev12(&landed_rev),
         actor = %actor,
         reason = %reason,
         state_dir = %state_dir,
+        recorded,
         "withdrawal pin written; the deployer picks it up on its next round"
     );
+    if !recorded {
+        eprintln!(
+            "the pin is in place, but its event could not be appended to {PIN_EVENT_FILE}; \
+             the withdrawal itself is unchanged"
+        );
+    }
     println!(
         "{}",
         serde_json::json!({
@@ -7809,6 +7942,7 @@ pub async fn run_undeliver_cli() -> Result<(), Box<dyn std::error::Error>> {
             "landed_rev": landed_rev,
             "actor": actor,
             "reason": reason,
+            "recorded": recorded,
             "state_dir": state_dir,
         })
     );
@@ -10855,6 +10989,43 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         );
     }
 
+    /// 清掉钉之后，「谁以什么理由撤过、落在哪一版」仍然读得出来。钉文件随
+    /// `--clear` 消失，日志不该跟着消失——一次撤回是一条决定，不是一格当前状态。
+    #[test]
+    fn a_cleared_pin_still_leaves_the_decision_in_the_event_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let pin = RevPin {
+            withdrawn_rev: "cc3333333333aaaaaaaa".into(),
+            landed_rev: "aa1111111111bbbbbbbb".into(),
+            actor: "operator".into(),
+            reason: "bad deploy".into(),
+            unix: 1_700_000_000,
+        };
+        write_pin(dir, &pin).unwrap();
+        append_pin_event(
+            dir,
+            &serde_json::json!({"kind": "withdrawn", "withdrawn_rev": pin.withdrawn_rev,
+                                "landed_rev": pin.landed_rev, "actor": pin.actor,
+                                "reason": pin.reason, "unix": pin.unix}),
+        )
+        .unwrap();
+        assert!(clear_pin(dir).unwrap());
+        append_pin_event(
+            dir,
+            &serde_json::json!({"kind": "cleared", "withdrawn_rev": pin.withdrawn_rev,
+                                "actor": "ops", "reason": "reverted upstream"}),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(Path::new(dir).join(PIN_EVENT_FILE)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].contains(r#""kind":"withdrawn""#), "{text}");
+        assert!(lines[1].contains(r#""kind":"cleared""#), "{text}");
+        // 解除那一行仍然说得出撤的是哪一版：这正是清掉钉之后唯一还能读到的。
+        assert!(lines[1].contains(&pin.withdrawn_rev), "{text}");
+    }
+
     /// 撤回命令的必填项在解析期就拒：撤哪一版、落在哪一版、谁、为什么。缺后两个
     /// 的撤回与一次环境事故在事后完全同形，而这条命令存在的理由正是让撤回成为一条
     /// 有名有姓的决定。
@@ -10894,12 +11065,24 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             "abc", "--to", "def", "--actor", "me", "--reason", "x", "--force"
         ]))
         .is_err());
-        // `--clear` 与撤回参数混用是错误，不按「先清再写」猜意图。
+        // 解除一次按住同样要署名与理由：一次没有署名的解除，事后与「钉被谁顺手
+        // 删了」同形。
+        assert!(parse_undeliver_args(&args(&["--clear"])).is_err());
         assert!(parse_undeliver_args(&args(&["--clear", "--actor", "me"])).is_err());
         assert_eq!(
-            parse_undeliver_args(&args(&["--clear"])).unwrap().action,
-            UndeliverAction::Clear
+            parse_undeliver_args(&args(&["--clear", "--actor", "me", "--reason", "reverted"]))
+                .unwrap()
+                .action,
+            UndeliverAction::Clear {
+                actor: "me".into(),
+                reason: "reverted".into()
+            }
         );
+        // `--clear` 与撤回参数混用是错误，不按「先清再写」猜意图。
+        assert!(parse_undeliver_args(&args(&[
+            "--clear", "--to", "def", "--actor", "me", "--reason", "x"
+        ]))
+        .is_err());
     }
 
     /// 心跳上的撤回必须与「没有新 rev」「被 CI 按住」「在冷却」分开读：
@@ -10914,13 +11097,28 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             reason: "probe".into(),
             unix: 40,
         });
-        let msg = heartbeat_message_with_pin(&state, "cc3333333333", "off", None, 100, &pin);
+        let msg =
+            heartbeat_message_with_pin(&state, "cc3333333333", "off", None, 100, &pin, Some(true));
         assert!(msg.contains("pin=cc3333333333->aa1111111111"), "{msg}");
         assert!(msg.contains("pin_secs=60"), "{msg}");
         assert!(msg.contains("pin_actor=operator"), "{msg}");
-        let none =
-            heartbeat_message_with_pin(&state, "cc3333333333", "off", None, 100, &PinReading::None);
+        assert!(msg.contains("pin_state=holding"), "{msg}");
+        // 钉还在盘上、上游已经把它 revert 掉：这一行必须是 released，不是 holding——
+        // 两者的处置相反（一个是等人，一个是等下一拍照常推进）。
+        let released =
+            heartbeat_message_with_pin(&state, "cc3333333333", "off", None, 100, &pin, Some(false));
+        assert!(released.contains("pin_state=released"), "{released}");
+        let none = heartbeat_message_with_pin(
+            &state,
+            "cc3333333333",
+            "off",
+            None,
+            100,
+            &PinReading::None,
+            None,
+        );
         assert!(none.contains("pin=none"), "{none}");
+        assert!(none.contains("pin_state=none"), "{none}");
         let bad = heartbeat_message_with_pin(
             &state,
             "cc3333333333",
@@ -10928,6 +11126,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             None,
             100,
             &PinReading::Unreadable("truncated".into()),
+            None,
         );
         assert!(bad.contains("pin=unreadable"), "{bad}");
     }
