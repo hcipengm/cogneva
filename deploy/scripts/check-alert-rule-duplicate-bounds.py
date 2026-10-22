@@ -59,7 +59,9 @@ NUM = r"(-?[0-9]+(?:\.[0-9]+)?)"
 # A comparison against a constant: `A > 0.9`, `A >= 1`, `A == 0`. The left side
 # may be any expression, so the match starts at the operator; what is being
 # compared is the text to its left, cut at the nearest top-level `and`/`or`.
-COMPARISON = re.compile(rf"\s*{CMP}\s*{NUM}")
+# `x < bool 1` is still a comparison: the `bool` modifier changes the result
+# (filter vs 0/1) but not which number the rule insists on.
+COMPARISON = re.compile(rf"\s*{CMP}\s*(?:bool\s+)?{NUM}")
 # Top-level binary operator keywords: a comparison's subject never crosses one.
 BINARY = (" and ", " or ", " unless ")
 NAME = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
@@ -153,6 +155,7 @@ def yaml_rules() -> list[dict]:
                             {
                                 "name": rule["alert"],
                                 "expr": str(rule["expr"]),
+                                "for": str(rule.get("for") or ""),
                                 "source": f"manifests/{path.name}",
                                 "kind": "yaml",
                             }
@@ -190,6 +193,7 @@ def chart_rules() -> list[dict]:
             {
                 "name": rule.get("name", "<unnamed>"),
                 "expr": str(expr),
+                "for": "",
                 "bound": bound,
                 "source": "chart/cogneva.json",
                 "kind": "json",
@@ -223,6 +227,39 @@ def bounds(rule: dict) -> list[tuple[str, str, float]]:
     for m in COMPARISON.finditer(rule["expr"]):
         found.append((left_operand(rule["expr"], m.start()), m.group(1), float(m.group(2))))
     return found
+
+
+def horizon(rule: dict) -> tuple[str, ...]:
+    """How long the rule insists before it means it: the `for:` clause plus every
+    range selector in the expression.
+
+    The window is part of the bound. `stale > 0` held 15 minutes and `stale > 0`
+    held the whole of 30 minutes with a full sample count are two different
+    claims -- an early warning and a confirmation -- and reporting them as one
+    bound written twice would be wrong in the same direction as reporting the
+    80 and 90 tiers of one expression as copies.
+    """
+    ranges = tuple(sorted(set(re.findall(r"\[(\d+[smhdwy])(?::[^\]]*)?\]", rule["expr"]))))
+    return (f"for={rule.get('for') or '-'}", *ranges)
+
+
+def comparisons(rule: dict) -> tuple[tuple[str, float], ...]:
+    """Every constant comparison the rule makes, as a sorted multiset.
+
+    This is what tells "the same bound written twice" from "two rules that
+    happen to touch the same series". The evolution queue pair compares the
+    owner count `< 1` and `> 1` -- opposite directions of one question, two
+    messages on purpose; the credential pair shares `measured == 1` but one
+    rule leads with it and the other leads with `aligned == 0`. Both are pairs
+    of *different* questions, and the multiset says so where the subject alone
+    could not.
+    """
+    found = [(m.group(1), float(m.group(2)))
+             for m in COMPARISON.finditer(rule["expr"])]
+    cond = rule.get("bound")
+    if rule["kind"] == "json" and cond:
+        found.append((cond[0], float(cond[1])))
+    return tuple(sorted(found))
 
 
 def whole_bound(rule: dict) -> tuple[str, str | None, float | None]:
@@ -264,7 +301,7 @@ def main() -> int:
         die("no alert rules found in either library")
 
     identical: dict[tuple[str, str, float], list[dict]] = {}
-    by_subject: dict[tuple[str, str, float], list[dict]] = {}
+    by_subject: dict[tuple[str, str, float, tuple[str, ...], tuple], list[dict]] = {}
     for rule in rules:
         # Tier 1 is about the expression as a whole. Comparing the *comparison*
         # instead would pair two rules that merely share a guard clause
@@ -279,7 +316,9 @@ def main() -> int:
             # combinations collide without meaning anything.
             if len(subs) == 1:
                 (sub,) = subs
-                by_subject.setdefault((sub, op, value), []).append(
+                by_subject.setdefault(
+                    (sub, op, value, horizon(rule), comparisons(rule)), []
+                ).append(
                     {**rule, "op": op, "value": value, "object": norm(raw)}
                 )
 
@@ -294,7 +333,7 @@ def main() -> int:
             "value": None,
             "rules": [{"name": m["name"], "source": m["source"]} for m in members],
         })
-    for (sub, op, value), members in sorted(by_subject.items(), key=lambda kv: (-len(kv[1]), str(kv[0]))):
+    for (sub, op, value, hz, _cmp), members in sorted(by_subject.items(), key=lambda kv: (-len(kv[1]), str(kv[0]))):
         # Already reported as an identical copy: same subject, same number, same text.
         names = {(m["name"], m["source"]) for m in members}
         if len(names) < 2:
@@ -306,6 +345,7 @@ def main() -> int:
             "tier": "same_subject_same_threshold",
             "object": sub,
             "op": op,
+            "horizon": list(hz),
             "value": value,
             "rules": [{"name": m["name"], "source": m["source"]} for m in members],
         })

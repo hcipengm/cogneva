@@ -104,14 +104,14 @@ out="$(run "$t")"
 ck_hasnt "3. 同表达式不同阈值（分级告警）不报" "$out" "identical_bound"
 ck_hasnt "3. 分级告警也不该进受试层（阈值不同）" "$out" "node_disk_state"
 
-# 4. 同一受试序列、同一个数、不同表达式 ⇒ 同一界两种问法，报
+# 4. 同一受试序列、同一个数、同一段时间、同一组比较，只是包法不同 ⇒ 同一界写了两遍，报
 t="$work/same-subject"; seed "$t"
-yaml_rule "$t" SeenAbsent 'absent_over_time(same_state[15m]) > 0'
+yaml_rule "$t" SeenMax 'max by (node) (same_state) > 0'
 printf 'seen_zero|1 - max by (node) (same_state)|>|0\n' | json_rules "$t"
 out="$(run "$t")"
 ck_has "4. 同一受试序列同一个数 ⇒ 报" "$out" "same_subject_same_threshold"
 ck_has "4. 点名受试序列" "$out" "object=same_state"
-ck_has "4. 两条规则都点名" "$out" "SeenAbsent@manifests/10-SeenAbsent.yaml"
+ck_has "4. 两条规则都点名" "$out" "SeenMax@manifests/10-SeenMax.yaml"
 
 # 5. 同一受试序列、不同数 ⇒ 不报（两个界不是同一个界）
 t="$work/diff-num"; seed "$t"
@@ -152,7 +152,33 @@ yaml_rule "$t" GuardB 'surface_aligned == 0
 printf 'guard_c|unrelated_state|>|0\n' | json_rules "$t"
 out="$(run "$t")"
 ck_hasnt "9. 守卫子句相同不等于整条表达式相同（不报副本）" "$out" "identical_bound"
-ck_has "9. 但同一序列同一个数在受试层报出来给人判" "$out" "same_subject_same_threshold"
+# 也不进受试层：`surface_measured == 1` 只是两条规则的**守卫**，各自要比的是
+# 「没有周期」与「aligned 掉了」。判据是**比较的集合**——两条规则的比较集不同，
+# 就不是同一个界；只看受试序列会把「共用一句守卫」误报成「同一个界两个信使」。
+ck_hasnt "9. 共用一句守卫不算同一个界（比较集不同）" "$out" "same_subject_same_threshold"
+
+# 9b. **窗口属于界**：同一个序列、同一个数、同一组比较，但一个是「连续 15 分钟」
+#     另一个是「30 分钟里每一拍都大于 0」。这是早期预警与确认两档，不是副本——
+#     与「80 / 90 两级阈值」同一种正常写法。判据落在 `for:` 与表达式里的区间选择器上。
+t="$work/windows"; seed "$t"
+yaml_rule "$t" EarlyWarn 'stale_state > 0'
+printf 'confirmed|min_over_time(stale_state[30m])|>|0\n' | json_rules "$t"
+# 给清单那条补上 for: 15m
+python3 - "$t/deploy/k3s/observability/manifests/10-EarlyWarn.yaml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read().replace("          expr:", "          for: 15m\n          expr:")
+open(p, "w", encoding="utf-8").write(s)
+PY
+out="$(run "$t")"
+ck_hasnt "9b. 窗口不同的同一序列不报（早期预警 vs 确认）" "$out" "same_subject_same_threshold"
+
+# 9c. 比较集不同 ⇒ 不是同一个界：`> 0` 与 `> 0` 之外还多比了一个数
+t="$work/cmp-set"; seed "$t"
+yaml_rule "$t" CmpA 'alpha_state > 0'
+printf 'cmp_b|alpha_state and (beta_state > 0)|>|0\n' | json_rules "$t"
+out="$(run "$t")"
+ck_hasnt "9c. 比较集不同的同一受试序列不报" "$out" "same_subject_same_threshold"
 
 # 10. 清单目录不在 ⇒ 读不到（3），不是「没有重复」
 t="$work/no-manifests"; mkdir -p "$t/deploy/helm/cogneva/files"
