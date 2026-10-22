@@ -1,3 +1,4 @@
+//! principle: feedback_a_counted_call_site_going_red_asks_for_a_signature_not_a_loosened_assertion
 //! The deployer decides which revision to roll at the top of a round, then
 //! spends a cold release build getting there. Nothing between those two moments
 //! errors when the upstream moves past that revision — the rollout simply

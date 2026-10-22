@@ -1,3 +1,4 @@
+//! principle: feedback_retiring_a_metric_name_is_part_of_the_rename
 //! Guards the retired-name list against its own dangerous direction.
 //!
 //! The list names series that may be deleted from every store a metric lives in
