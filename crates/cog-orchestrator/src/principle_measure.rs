@@ -1,4 +1,5 @@
 //! principle: feedback_a_short_circuit_decides_which_evidence_you_can_never_see
+//! principle: feedback_a_registry_that_searches_one_language_reads_another_languages_gate_as_no_gate
 //! Deciding whether anything enforces a principle, from the registries alone.
 //!
 //! Two registries answer, and neither of them is prose. The host side's column
