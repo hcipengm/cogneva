@@ -1,0 +1,379 @@
+# 卷容量、运行时资产与监督者巡检那十六条读数的单测夹具。
+#
+# volume 一族守的是「声明要的容量与真正拿到的容量」：准入把容量夹小、扩容被拒、
+# 声明了却六小时没长上去（且一直没变）、持有量超过授予量、容量量不出来。
+# 三条「六小时」的规则共用同一个差值序列，判据各差一条腿：
+#   - `expansion_never_completes`：六小时里最小值 > 0 **且** 最大值等于最小值（一直没动）。
+#   - `declared_ahead_of_granted`：只要最小值 > 0，且读数存在超过六小时。
+#   - `holds_more_than_the_storage_granted`：同一形状，换成持有峰值减授予。
+# 第四格把差值在第六小时内改过一次：declared_ahead 亮、never_completes 静——这是两条
+# 规则唯一的差（「一直没动」这条腿），删掉它那一格会响。
+#
+# runtime 一族守的是运行时资产（清单、种子）有没有被刷新：状态不是 not_refreshed /
+# content_drift、清单在场可解析、检查读数是新鲜的。
+#
+# supervisor 一族是五条同形的「某一类巡检全失败」：失败在涨、而同一类的成功没涨。
+# 每条都配了「两半都在」的静格（第六格），删掉任一条 `unless` 那一格会响。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-volume-supervisor.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: volume_capacity_clamped_by_admission
+# rule: volume_capacity_resize_refused
+# rule: volume_capacity_expansion_never_completes
+# rule: volume_declared_ahead_of_granted
+# rule: volume_holds_more_than_the_storage_granted
+# rule: volume_capacity_cannot_measure
+# rule: runtime_asset_not_refreshed
+# rule: runtime_asset_content_drift
+# rule: runtime_asset_manifest_absent
+# rule: runtime_asset_manifest_unusable
+# rule: runtime_asset_check_never_ran
+# rule: supervisor_health_pass_failing
+# rule: supervisor_quota_pass_failing
+# rule: supervisor_rebalance_pass_failing
+# rule: supervisor_event_pass_failing
+# rule: supervisor_control_plane_pass_failing
+
+evaluation_interval: 5m
+
+tests:
+  # 一套健康的卷、资产与巡检：没有夹小/拒绝/量不出、声明等于授予（差值为零）、
+  # 持有量低于授予量；四类资产状态都是 0、检查读数在写；五类巡检都只有成功。
+  # 十六条全静。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="clamped"}'
+        values: '0x156'
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="refused"}'
+        values: '0x156'
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="unmeasured"}'
+        values: '0x156'
+      - series: 'cogneva_volume_capacity_bytes{persistentvolumeclaim="data",state="declared"}'
+        values: '100x156'
+      - series: 'cogneva_volume_capacity_bytes{persistentvolumeclaim="data",state="granted"}'
+        values: '100x156'
+      - series: 'cogneva_volume_capacity_bytes{persistentvolumeclaim="data",state="peak"}'
+        values: '90x156'
+      - series: 'cogneva_runtime_asset_state{asset="manifest",state="not_refreshed"}'
+        values: '0x156'
+      - series: 'cogneva_runtime_asset_state{asset="seed",state="content_drift"}'
+        values: '0x156'
+      - series: 'cogneva_runtime_asset_manifest_absent{asset="manifest"}'
+        values: '0x156'
+      - series: 'cogneva_runtime_asset_manifest_unusable{asset="manifest"}'
+        values: '0x156'
+      - series: 'cogneva_runtime_asset_check_seconds'
+        values: '120x156'
+      - series: 'cogneva_supervisor_pass_total{pass="health",outcome="ok"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="quota",outcome="ok"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="rebalance",outcome="ok"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="event",outcome="ok"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="control_plane",outcome="ok"}'
+        values: '0x155 1x1'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: volume_capacity_clamped_by_admission
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: volume_capacity_resize_refused
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: volume_capacity_expansion_never_completes
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: volume_declared_ahead_of_granted
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: volume_holds_more_than_the_storage_granted
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: volume_capacity_cannot_measure
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: runtime_asset_not_refreshed
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: runtime_asset_content_drift
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: runtime_asset_manifest_absent
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: runtime_asset_manifest_unusable
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: runtime_asset_check_never_ran
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: supervisor_health_pass_failing
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: supervisor_quota_pass_failing
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: supervisor_rebalance_pass_failing
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: supervisor_event_pass_failing
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: supervisor_control_plane_pass_failing
+        exp_alerts: []
+
+  # 准入夹小了三次、扩容被拒了两次、容量量不出三次：三条计数规则亮。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="clamped"}'
+        values: '0x150 3x6'
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="refused"}'
+        values: '0x150 2x6'
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="unmeasured"}'
+        values: '0x150 3x6'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: volume_capacity_clamped_by_admission
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 13h
+        alertname: volume_capacity_resize_refused
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 13h
+        alertname: volume_capacity_cannot_measure
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 声明 200、授予 100，十三小时一直没变：三条「差值」规则全亮（扩容一直没完成、
+  # 声明跑在授予前面、持有量超过授予量——第三格另给一条峰值）。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_volume_capacity_bytes{persistentvolumeclaim="data",state="declared"}'
+        values: '200x156'
+      - series: 'cogneva_volume_capacity_bytes{persistentvolumeclaim="data",state="granted"}'
+        values: '100x156'
+      - series: 'cogneva_volume_capacity_bytes{persistentvolumeclaim="data",state="peak"}'
+        values: '300x156'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: volume_capacity_expansion_never_completes
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              persistentvolumeclaim: data
+      - eval_time: 13h
+        alertname: volume_declared_ahead_of_granted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              persistentvolumeclaim: data
+      - eval_time: 13h
+        alertname: volume_holds_more_than_the_storage_granted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              persistentvolumeclaim: data
+
+  # 声明在第六小时里从 200 长到 250、授予还是 100：差值一直大于零，但**不再恒定**。
+  # `declared_ahead_of_granted` 亮，而 `expansion_never_completes` 静——它在等一个稳定的
+  # 目标，正在往上走的扩容不归它喊。删掉「最大值等于最小值」那条腿，第二格会响。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_volume_capacity_bytes{persistentvolumeclaim="data",state="declared"}'
+        values: '200x120 250x36'
+      - series: 'cogneva_volume_capacity_bytes{persistentvolumeclaim="data",state="granted"}'
+        values: '100x156'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: volume_declared_ahead_of_granted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              persistentvolumeclaim: data
+      - eval_time: 13h
+        alertname: volume_capacity_expansion_never_completes
+        exp_alerts: []
+
+  # 声明比授予多 100，但这条读数只有三小时历史：还判不了「声明跑在前面」——那要它存在
+  # 超过六小时。两条差值规则都静（第二条的恒定性腿成立、第三条历史腿不成立）。
+  # 删掉「读数存在超过六小时」那条腿，这一格会响。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_volume_capacity_bytes{persistentvolumeclaim="data",state="declared"}'
+        values: '200x36'
+      - series: 'cogneva_volume_capacity_bytes{persistentvolumeclaim="data",state="granted"}'
+        values: '100x36'
+    alert_rule_test:
+      - eval_time: 3h
+        alertname: volume_declared_ahead_of_granted
+        exp_alerts: []
+      - eval_time: 3h
+        alertname: volume_capacity_expansion_never_completes
+        exp_alerts: []
+
+  # 声明与持有量都是三小时前才涨上去的：**现在**的差值大于零，但六小时里最小值不成立
+  # （前三个小时它们是平的）。三条差值规则全静——它们问的是「至少六小时都这样」，
+  # 不是「这一刻超了」。删掉任一条的 `min_over_time > 0`，这一格会响。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_volume_capacity_bytes{persistentvolumeclaim="data",state="declared"}'
+        values: '100x120 200x36'
+      - series: 'cogneva_volume_capacity_bytes{persistentvolumeclaim="data",state="granted"}'
+        values: '100x156'
+      - series: 'cogneva_volume_capacity_bytes{persistentvolumeclaim="data",state="peak"}'
+        values: '90x120 300x36'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: volume_declared_ahead_of_granted
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: volume_holds_more_than_the_storage_granted
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: volume_capacity_expansion_never_completes
+        exp_alerts: []
+
+  # 四类资产状态都在报、检查读数根本没有：五条全亮。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_runtime_asset_state{asset="manifest",state="not_refreshed"}'
+        values: '1x156'
+      - series: 'cogneva_runtime_asset_state{asset="seed",state="content_drift"}'
+        values: '1x156'
+      - series: 'cogneva_runtime_asset_manifest_absent{asset="manifest"}'
+        values: '1x156'
+      - series: 'cogneva_runtime_asset_manifest_unusable{asset="manifest"}'
+        values: '1x156'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: runtime_asset_not_refreshed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              asset: manifest
+              state: not_refreshed
+      - eval_time: 13h
+        alertname: runtime_asset_content_drift
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              asset: seed
+              state: content_drift
+      - eval_time: 13h
+        alertname: runtime_asset_manifest_absent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              asset: manifest
+      - eval_time: 13h
+        alertname: runtime_asset_manifest_unusable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              asset: manifest
+      - eval_time: 13h
+        alertname: runtime_asset_check_never_ran
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 五类巡检都在失败、而且没有一次成功（成功那半根本没出现）：五条全亮。
+  # 反事实那一半为空时 `unless` 不挡——这是对的：没读数不等于有成功。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_supervisor_pass_total{pass="health",outcome="failed"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="quota",outcome="failed"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="rebalance",outcome="failed"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="event",outcome="failed"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="control_plane",outcome="failed"}'
+        values: '0x155 1x1'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: supervisor_health_pass_failing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              pass: health
+              outcome: failed
+      - eval_time: 13h
+        alertname: supervisor_quota_pass_failing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              pass: quota
+              outcome: failed
+      - eval_time: 13h
+        alertname: supervisor_rebalance_pass_failing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              pass: rebalance
+              outcome: failed
+      - eval_time: 13h
+        alertname: supervisor_event_pass_failing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              pass: event
+              outcome: failed
+      - eval_time: 13h
+        alertname: supervisor_control_plane_pass_failing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              pass: control_plane
+              outcome: failed
+
+  # 同样的失败，但每一类也都成功过：五条全静。删掉任一条 `unless`，这一格会先响。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_supervisor_pass_total{pass="health",outcome="failed"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="health",outcome="ok"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="quota",outcome="failed"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="quota",outcome="ok"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="rebalance",outcome="failed"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="rebalance",outcome="ok"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="event",outcome="failed"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="event",outcome="ok"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="control_plane",outcome="failed"}'
+        values: '0x155 1x1'
+      - series: 'cogneva_supervisor_pass_total{pass="control_plane",outcome="ok"}'
+        values: '0x155 1x1'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: supervisor_health_pass_failing
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: supervisor_quota_pass_failing
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: supervisor_rebalance_pass_failing
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: supervisor_event_pass_failing
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: supervisor_control_plane_pass_failing
+        exp_alerts: []

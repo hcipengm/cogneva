@@ -1,0 +1,216 @@
+# 节点那九条读数的单测夹具：根盘用了多少、磁盘/内存压力、inode 用了多少、调度请求占比、
+# 超卖比、可分配容量变过、内存有没有留出保留量。
+#
+# 这一族的两处易错点：
+#   - 两条盘用量规则只是界不同（75 / 85）：一格 50% 全静、一格 90% 两条都亮。
+#   - `capacity_overcommitted` 与 `capacity_changed` 各带一条**时间腿**：
+#     前者只算启了十五分钟以上的 Pod（刚起来的调度不算超卖），后者只算五分钟内报过的
+#     可分配容量（读数停了就不是「刚变过」）。第三格把这两条腿各自单独证一遍——删掉任一条，
+#     那一格会响。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-node.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: node_disk_usage_high
+# rule: node_disk_usage_critical
+# rule: node_disk_pressure
+# rule: node_inodes_high
+# rule: node_memory_pressure
+# rule: node_scheduling_requests_high
+# rule: node_capacity_overcommitted
+# rule: node_capacity_changed
+# rule: node_without_memory_reserve
+
+evaluation_interval: 1m
+
+tests:
+  # 一台宽裕的节点：根盘半满、没有磁盘/内存压力、inode 半满、CPU 请求占四成、
+  # 一个跑了很久的 Pod 只申请了十分之一、可分配容量六小时没变、内存留了一成保留。
+  # 九条全静。
+  - interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{node="n1",mountpoint="/",fstype="ext4"}'
+        values: '500x60'
+      - series: 'node_filesystem_size_bytes{node="n1",mountpoint="/",fstype="ext4"}'
+        values: '1000x60'
+      - series: 'node_filesystem_files_free{node="n1",mountpoint="/",fstype="ext4"}'
+        values: '500x60'
+      - series: 'node_filesystem_files{node="n1",mountpoint="/",fstype="ext4"}'
+        values: '1000x60'
+      - series: 'kube_node_status_condition{node="n1",condition="DiskPressure",status="true"}'
+        values: '0x60'
+      - series: 'kube_node_status_condition{node="n1",condition="MemoryPressure",status="true"}'
+        values: '0x60'
+      - series: 'kube_pod_container_resource_requests{node="n1",resource="cpu"}'
+        values: '4x60'
+      - series: 'kube_node_status_allocatable{node="n1",resource="cpu"}'
+        values: '10x60'
+      - series: 'kube_pod_container_resource_limits{namespace="cogneva",pod="p1",node="n1",resource="cpu"}'
+        values: '1x60'
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="p1",phase="Running"}'
+        values: '1x60'
+      - series: 'kube_pod_start_time{namespace="cogneva",pod="p1"}'
+        values: '0x60'
+      - series: 'kube_node_status_capacity{node="n1",resource="memory"}'
+        values: '1000x60'
+      - series: 'kube_node_status_allocatable{node="n1",resource="memory"}'
+        values: '900x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: node_disk_usage_high
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: node_disk_usage_critical
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: node_disk_pressure
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: node_inodes_high
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: node_memory_pressure
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: node_scheduling_requests_high
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: node_capacity_overcommitted
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: node_capacity_changed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: node_without_memory_reserve
+        exp_alerts: []
+
+  # 一台快撑爆的节点：根盘九成、两种压力都在报、inode 九成、CPU 请求占九成、
+  # 一个老 Pod 申请了四倍的可分配 CPU、可分配 CPU 这一小时从 4 变成 8、内存没有保留量。
+  # 九条全亮（盘用量那两条同一格同时亮）。
+  - interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{node="n1",mountpoint="/",fstype="ext4"}'
+        values: '100x60'
+      - series: 'node_filesystem_size_bytes{node="n1",mountpoint="/",fstype="ext4"}'
+        values: '1000x60'
+      - series: 'node_filesystem_files_free{node="n1",mountpoint="/",fstype="ext4"}'
+        values: '100x60'
+      - series: 'node_filesystem_files{node="n1",mountpoint="/",fstype="ext4"}'
+        values: '1000x60'
+      - series: 'kube_node_status_condition{node="n1",condition="DiskPressure",status="true"}'
+        values: '1x60'
+      - series: 'kube_node_status_condition{node="n1",condition="MemoryPressure",status="true"}'
+        values: '1x60'
+      - series: 'kube_pod_container_resource_requests{node="n1",resource="cpu"}'
+        values: '9x60'
+      - series: 'kube_node_status_allocatable{node="n1",resource="cpu"}'
+        values: '4x40 8x20'
+      - series: 'kube_pod_container_resource_limits{namespace="cogneva",pod="p1",node="n1",resource="cpu"}'
+        values: '40x60'
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="p1",phase="Running"}'
+        values: '1x60'
+      - series: 'kube_pod_start_time{namespace="cogneva",pod="p1"}'
+        values: '0x60'
+      - series: 'kube_node_status_capacity{node="n1",resource="memory"}'
+        values: '1000x60'
+      - series: 'kube_node_status_allocatable{node="n1",resource="memory"}'
+        values: '1000x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: node_disk_usage_high
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+              mountpoint: /
+              fstype: ext4
+      - eval_time: 60m
+        alertname: node_disk_usage_critical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              node: n1
+              mountpoint: /
+              fstype: ext4
+      - eval_time: 60m
+        alertname: node_disk_pressure
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              node: n1
+              condition: DiskPressure
+              status: "true"
+      - eval_time: 60m
+        alertname: node_inodes_high
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+              mountpoint: /
+              fstype: ext4
+      - eval_time: 60m
+        alertname: node_memory_pressure
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+              condition: MemoryPressure
+              status: "true"
+      - eval_time: 60m
+        alertname: node_scheduling_requests_high
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+              resource: cpu
+      - eval_time: 60m
+        alertname: node_capacity_overcommitted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+              resource: cpu
+      - eval_time: 60m
+        alertname: node_capacity_changed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+              resource: cpu
+      - eval_time: 60m
+        alertname: node_without_memory_reserve
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+
+  # 一个十五分钟前才起来的 Pod 申请了四倍的可分配 CPU：它还在启动期，调度器自己会把它
+  # 挪走，不归「超卖」问。删掉 `time() - start > 900` 那条腿，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_container_resource_limits{namespace="cogneva",pod="p1",node="n1",resource="cpu"}'
+        values: '40x60'
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="p1",phase="Running"}'
+        values: '1x60'
+      - series: 'kube_pod_start_time{namespace="cogneva",pod="p1"}'
+        values: '3000x60'
+      - series: 'kube_node_status_allocatable{node="n1",resource="cpu"}'
+        values: '10x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: node_capacity_overcommitted
+        exp_alerts: []
+
+  # 可分配容量在四十分钟前变过一次（4 → 8），但那条读数四十分钟前就停了：不是「刚变过」。
+  # 删掉「五分钟内报过」那条腿，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'kube_node_status_allocatable{node="n1",resource="cpu"}'
+        values: '4x20 8x20'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: node_capacity_changed
+        exp_alerts: []

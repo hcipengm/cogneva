@@ -1,0 +1,783 @@
+# 备份那二十七条读数的单测夹具。它们守的是「持久化还能不能恢复」：最近一次成功多久了、
+# 从来没成功过、CronJob 停了或被挂起、演练跑没跑/多久没跑/跑失败、保留策略漏留、
+# 离站副本写没写/是不是最新/缺没缺包/密钥老不老、跑得超过自己的期限、跑被放弃、
+# 成功没记账、包缩水。
+#
+# 这一族的规则几乎每条都带**新鲜度腿**（`(time() - …_observed_timestamp_seconds) < 1800`）：
+# 读数停在半小时前时值再大也不算，那是写者不在，不是当前坏。第二格专门把所有观测时间戳
+# 停在起点、值全部越过界——十八条读数规则必须全静。删掉任何一条新鲜度腿，这一格会先红。
+#
+# 另有五条是「反事实」形状——**该有的那一半没发生**才响：
+#   - `backup_never_succeeded`：有失败、窗口里没有成功。
+#   - `backup_nothing_ever_recorded`：CronJob 建了很久、四种读数都在写且都是 0。
+#   - `backup_restore_drill_never_ran` / `backup_offsite_copy_never_written` /
+#     `backup_offsite_repository_is_never_observed`：CronJob 建了很久、那条读数**从来没出现过**。
+#   - `backup_success_not_recorded`：CronJob 说自己成功过、读数里 26 小时没有一次成功。
+# 每条都配了「两半都在」的静格（第一格），或在与它同形的升格格里断言静。
+#
+# 26 小时的界都在 `interval: 1h` 的格子里问，求值点取 30h——promtool 的 `time()` 从
+# 测试起点（零）算起，所以 CronJob 的创建/调度时间取 0 就是「三十小时前」。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-backup.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: backup_no_recent_success
+# rule: backup_never_succeeded
+# rule: backup_never_succeeded_by_the_cronjob
+# rule: backup_nothing_ever_recorded
+# rule: backup_cronjob_suspended
+# rule: backup_cronjob_stopped_scheduling
+# rule: backup_restore_drill_cronjob_suspended
+# rule: backup_restore_drill_cronjob_stopped_scheduling
+# rule: backup_restore_drill_never_ran
+# rule: backup_restore_drill_is_stale
+# rule: backup_restore_drill_failed
+# rule: backup_restore_drill_window_has_unproven_packages
+# rule: backup_volume_package_count_disagrees_with_the_last_run
+# rule: backup_offsite_copy_never_written
+# rule: backup_offsite_copy_is_stale
+# rule: backup_offsite_copy_is_not_the_latest_package
+# rule: backup_offsite_copy_missing_from_window
+# rule: backup_offsite_remote_copy_is_stale
+# rule: backup_offsite_repository_key_is_old
+# rule: backup_offsite_repository_has_no_snapshot
+# rule: backup_offsite_repository_is_never_observed
+# rule: backup_run_over_its_own_deadline
+# rule: backup_run_abandoned
+# rule: backup_success_not_recorded
+# rule: backup_retention_left_more_than_its_target
+# rule: backup_oldest_package_past_its_retention
+# rule: backup_newest_package_shrank_below_its_own_recent_shape
+
+evaluation_interval: 1m
+
+tests:
+  # 一套健康的备份：一小时前成功过、失败 0 / 成功 5 / 在跑 0 / 放弃 0、没有超期、
+  # 包数与保留目标一致（14/14）、最老的包还没到保留线、演练一小时前跑过且成功、
+  # 离站副本存在且就是最新那个包、没有缺包、密钥一天前轮过、仓库十四分钟前刚看过、
+  # CronJob 没挂起也确实在调度。二十七条全静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_backup_run_readings{readout="latest_success_age_seconds"}'
+        values: '3600x60'
+      - series: 'cogneva_backup_run_readings{readout="runs_failed"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings{readout="runs_ok"}'
+        values: '0x5 5x55'
+      - series: 'cogneva_backup_run_readings{readout="runs_running"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings{readout="runs_abandoned"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings{readout="oldest_running_age_seconds"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings{readout="oldest_running_deadline_seconds"}'
+        values: '7200x60'
+      - series: 'cogneva_backup_run_readings{readout="newest_package_bytes"}'
+        values: '1000x60'
+      - series: 'cogneva_backup_run_readings{readout="volume_packages"}'
+        values: '14x60'
+      - series: 'cogneva_backup_run_readings{readout="kept"}'
+        values: '14x60'
+      - series: 'cogneva_backup_run_readings{readout="keep_target"}'
+        values: '14x60'
+      - series: 'cogneva_backup_run_readings{readout="oldest_kept_age_seconds"}'
+        values: '1200000x60'
+      - series: 'cogneva_backup_run_readings{readout="drill_latest_age_seconds"}'
+        values: '3600x60'
+      - series: 'cogneva_backup_run_readings{readout="drill_latest_ok"}'
+        values: '1x60'
+      - series: 'cogneva_backup_run_readings{readout="drill_window_unproven_packages"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_newest_age_seconds"}'
+        values: '3600x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_matches_volume"}'
+        values: '1x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_missing_packages"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_remote_newest_age_seconds"}'
+        values: '3600x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_repository_key_age_seconds"}'
+        values: '86400x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_observation_age_seconds"}'
+        values: '300x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="latest_success_age_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_failed"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_ok"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_running"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_abandoned"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="oldest_running_age_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="oldest_running_deadline_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="newest_package_bytes"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="volume_packages"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="kept"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="keep_target"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="oldest_kept_age_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_latest_age_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_latest_ok"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_window_unproven_packages"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_newest_age_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_matches_volume"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_missing_packages"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_remote_newest_age_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_repository_key_age_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_observation_age_seconds"}'
+        values: '3500x60'
+      - series: 'kube_cronjob_status_last_successful_time{cronjob="cogneva-backup"}'
+        values: '3000x60'
+      - series: 'kube_cronjob_status_last_schedule_time{cronjob="cogneva-backup"}'
+        values: '3000x60'
+      - series: 'kube_cronjob_created{cronjob="cogneva-backup"}'
+        values: '0x60'
+      - series: 'kube_cronjob_spec_suspend{cronjob="cogneva-backup"}'
+        values: '0x60'
+      - series: 'kube_cronjob_created{cronjob="cogneva-backup-drill"}'
+        values: '0x60'
+      - series: 'kube_cronjob_status_last_schedule_time{cronjob="cogneva-backup-drill"}'
+        values: '3000x60'
+      - series: 'kube_cronjob_spec_suspend{cronjob="cogneva-backup-drill"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: backup_no_recent_success
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_never_succeeded
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_never_succeeded_by_the_cronjob
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_nothing_ever_recorded
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_cronjob_suspended
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_cronjob_stopped_scheduling
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_restore_drill_cronjob_suspended
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_restore_drill_cronjob_stopped_scheduling
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_restore_drill_never_ran
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_restore_drill_is_stale
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_restore_drill_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_restore_drill_window_has_unproven_packages
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_volume_package_count_disagrees_with_the_last_run
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_offsite_copy_never_written
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_offsite_copy_is_stale
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_offsite_copy_is_not_the_latest_package
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_offsite_copy_missing_from_window
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_offsite_remote_copy_is_stale
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_offsite_repository_key_is_old
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_offsite_repository_has_no_snapshot
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_offsite_repository_is_never_observed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_run_over_its_own_deadline
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_run_abandoned
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_success_not_recorded
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_retention_left_more_than_its_target
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_oldest_package_past_its_retention
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_newest_package_shrank_below_its_own_recent_shape
+        exp_alerts: []
+
+  # 同一天里那套读数**停止更新**了：值全部越过各自的界（最近成功 27 小时前、演练 27 小时前、
+  # 离站副本 27 小时前、密钥 92 天、包少了三个、缺一个包、跑超期、放弃在涨、保留多留了六个），
+  # 但每条观测时间戳都停在起点——写者半小时前就不在了。十八条读数规则必须全静。
+  # 这一格是新鲜度腿的唯一证据：删掉任意一条，对应的那条会在这里亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_backup_run_readings{readout="latest_success_age_seconds"}'
+        values: '100000x60'
+      - series: 'cogneva_backup_run_readings{readout="runs_failed"}'
+        values: '3x60'
+      - series: 'cogneva_backup_run_readings{readout="runs_ok"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings{readout="runs_running"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings{readout="runs_abandoned"}'
+        values: '0x40 1x20'
+      - series: 'cogneva_backup_run_readings{readout="oldest_running_age_seconds"}'
+        values: '10000x60'
+      - series: 'cogneva_backup_run_readings{readout="oldest_running_deadline_seconds"}'
+        values: '100x60'
+      - series: 'cogneva_backup_run_readings{readout="newest_package_bytes"}'
+        values: '300x60'
+      - series: 'cogneva_backup_run_readings{readout="volume_packages"}'
+        values: '14x60'
+      - series: 'cogneva_backup_run_readings{readout="kept"}'
+        values: '20x60'
+      - series: 'cogneva_backup_run_readings{readout="keep_target"}'
+        values: '14x60'
+      - series: 'cogneva_backup_run_readings{readout="oldest_kept_age_seconds"}'
+        values: '1500000x60'
+      - series: 'cogneva_backup_run_readings{readout="drill_latest_age_seconds"}'
+        values: '100000x60'
+      - series: 'cogneva_backup_run_readings{readout="drill_latest_ok"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings{readout="drill_window_unproven_packages"}'
+        values: '3x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_newest_age_seconds"}'
+        values: '100000x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_matches_volume"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_missing_packages"}'
+        values: '1x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_remote_newest_age_seconds"}'
+        values: '100000x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_repository_key_age_seconds"}'
+        values: '8000000x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_observation_age_seconds"}'
+        values: '300x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="latest_success_age_seconds"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_failed"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_ok"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_running"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_abandoned"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="oldest_running_age_seconds"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="oldest_running_deadline_seconds"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="newest_package_bytes"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="volume_packages"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="kept"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="keep_target"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="oldest_kept_age_seconds"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_latest_age_seconds"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_latest_ok"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_window_unproven_packages"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_newest_age_seconds"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_matches_volume"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_missing_packages"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_remote_newest_age_seconds"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_repository_key_age_seconds"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_observation_age_seconds"}'
+        values: '0x60'
+      # CronJob 那一半是新鲜的（十分钟前成功过），失败的正是读数这一半——这一行让
+      # `success_not_recorded` 的静必须由第三条腿（观测时间戳）来解释，而不是由「CronJob
+      # 读数缺席 → 整个乘积为空」遮住。
+      - series: 'kube_cronjob_status_last_successful_time{cronjob="cogneva-backup"}'
+        values: '3000x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: backup_no_recent_success
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_never_succeeded
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_nothing_ever_recorded
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_restore_drill_is_stale
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_restore_drill_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_restore_drill_window_has_unproven_packages
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_volume_package_count_disagrees_with_the_last_run
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_offsite_copy_is_stale
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_offsite_copy_is_not_the_latest_package
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_offsite_copy_missing_from_window
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_offsite_remote_copy_is_stale
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_offsite_repository_key_is_old
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_offsite_repository_has_no_snapshot
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_run_over_its_own_deadline
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_run_abandoned
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_success_not_recorded
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_retention_left_more_than_its_target
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_oldest_package_past_its_retention
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: backup_newest_package_shrank_below_its_own_recent_shape
+        exp_alerts: []
+
+  # 读数在写、而且都在说坏消息：最近成功 27 小时前、演练 27 小时前且失败、演练窗口里有
+  # 三个包没验过、包数 14 与账上 20 对不上、离站副本 27 小时前且不是最新、缺一个包、
+  # 远端 27 小时前、密钥 92 天、本次跑超期、放弃在涨、保留多留六个、最老的包过了保留线。
+  # 十四条亮。同一格里 `has_no_snapshot` 静（仓库观测缺席时它不问，那是下一条的活）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_backup_run_readings{readout="latest_success_age_seconds"}'
+        values: '100000x60'
+      - series: 'cogneva_backup_run_readings{readout="oldest_running_age_seconds"}'
+        values: '10000x60'
+      - series: 'cogneva_backup_run_readings{readout="oldest_running_deadline_seconds"}'
+        values: '100x60'
+      - series: 'cogneva_backup_run_readings{readout="runs_abandoned"}'
+        values: '0x40 1x20'
+      - series: 'cogneva_backup_run_readings{readout="volume_packages"}'
+        values: '14x60'
+      - series: 'cogneva_backup_run_readings{readout="kept"}'
+        values: '20x60'
+      - series: 'cogneva_backup_run_readings{readout="keep_target"}'
+        values: '14x60'
+      - series: 'cogneva_backup_run_readings{readout="oldest_kept_age_seconds"}'
+        values: '1500000x60'
+      - series: 'cogneva_backup_run_readings{readout="drill_latest_age_seconds"}'
+        values: '100000x60'
+      - series: 'cogneva_backup_run_readings{readout="drill_latest_ok"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings{readout="drill_window_unproven_packages"}'
+        values: '3x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_newest_age_seconds"}'
+        values: '100000x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_matches_volume"}'
+        values: '0x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_missing_packages"}'
+        values: '1x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_remote_newest_age_seconds"}'
+        values: '100000x60'
+      - series: 'cogneva_backup_run_readings{readout="offsite_repository_key_age_seconds"}'
+        values: '8000000x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="latest_success_age_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="oldest_running_age_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="oldest_running_deadline_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_abandoned"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="volume_packages"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="kept"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="keep_target"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="oldest_kept_age_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_latest_age_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_latest_ok"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="drill_window_unproven_packages"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_newest_age_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_matches_volume"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_missing_packages"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_remote_newest_age_seconds"}'
+        values: '3500x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_repository_key_age_seconds"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: backup_no_recent_success
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+      - eval_time: 60m
+        alertname: backup_restore_drill_is_stale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+      - eval_time: 60m
+        alertname: backup_restore_drill_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: backup_restore_drill_window_has_unproven_packages
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: backup_volume_package_count_disagrees_with_the_last_run
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: backup_offsite_copy_is_stale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+      - eval_time: 60m
+        alertname: backup_offsite_copy_is_not_the_latest_package
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: backup_offsite_copy_missing_from_window
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: backup_offsite_remote_copy_is_stale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+      - eval_time: 60m
+        alertname: backup_offsite_repository_key_is_old
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: backup_run_over_its_own_deadline
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: backup_run_abandoned
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: backup_retention_left_more_than_its_target
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: backup_oldest_package_past_its_retention
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      # 仓库观测这条读数根本没出现：`has_no_snapshot` 的第一腿就不成立，静。
+      - eval_time: 60m
+        alertname: backup_offsite_repository_has_no_snapshot
+        exp_alerts: []
+
+  # 有三次失败、一次成功都没有：`never_succeeded` 亮。同一格里
+  # `nothing_ever_recorded` 静——它在跑、在失败，不是「什么都没记」。CronJob 创建时间
+  # 与四种读数全在场、且都新鲜：只有这样它的静才归「失败数不为零」解释。缺任何一条时，
+  # 乘积为空也会静——实测：第一版这一格没给创建时间，删掉失败那一腿照样绿。
+  - interval: 1h
+    input_series:
+      - series: 'kube_cronjob_created{cronjob="cogneva-backup"}'
+        values: '0x30'
+      - series: 'cogneva_backup_run_readings{readout="runs_failed"}'
+        values: '3x30'
+      - series: 'cogneva_backup_run_readings{readout="runs_ok"}'
+        values: '0x30'
+      - series: 'cogneva_backup_run_readings{readout="runs_running"}'
+        values: '0x30'
+      - series: 'cogneva_backup_run_readings{readout="runs_abandoned"}'
+        values: '0x30'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_failed"}'
+        values: '107000x30'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_ok"}'
+        values: '107000x30'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_running"}'
+        values: '107000x30'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_abandoned"}'
+        values: '107000x30'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: backup_never_succeeded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 30h
+        alertname: backup_nothing_ever_recorded
+        exp_alerts: []
+
+  # CronJob 被挂起、而且上一次调度是三十小时前：四条 CronJob 规则全亮。同一格里
+  # `stopped_scheduling` 与 `suspended` 分开证：挂起的那条只看 0/1，停调度的那条看时间差。
+  - interval: 1h
+    input_series:
+      - series: 'kube_cronjob_spec_suspend{cronjob="cogneva-backup"}'
+        values: '1x30'
+      - series: 'kube_cronjob_status_last_schedule_time{cronjob="cogneva-backup"}'
+        values: '0x30'
+      - series: 'kube_cronjob_created{cronjob="cogneva-backup"}'
+        values: '0x30'
+      - series: 'kube_cronjob_spec_suspend{cronjob="cogneva-backup-drill"}'
+        values: '1x30'
+      - series: 'kube_cronjob_status_last_schedule_time{cronjob="cogneva-backup-drill"}'
+        values: '0x30'
+      - series: 'kube_cronjob_created{cronjob="cogneva-backup-drill"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: backup_cronjob_suspended
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 30h
+        alertname: backup_cronjob_stopped_scheduling
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+      - eval_time: 30h
+        alertname: backup_restore_drill_cronjob_suspended
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 30h
+        alertname: backup_restore_drill_cronjob_stopped_scheduling
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+
+  # CronJob 建了三十小时，四种读数都在写、而且全是 0：什么都没记过。`nothing_ever_recorded`
+  # 亮。同一格里 `never_succeeded` 与 `run_abandoned` 静：失败数是 0（不是「有失败」），
+  # 放弃的增量也是 0（不是「有放弃」）。
+  - interval: 1h
+    input_series:
+      - series: 'kube_cronjob_created{cronjob="cogneva-backup"}'
+        values: '0x30'
+      - series: 'cogneva_backup_run_readings{readout="runs_ok"}'
+        values: '0x30'
+      - series: 'cogneva_backup_run_readings{readout="runs_failed"}'
+        values: '0x30'
+      - series: 'cogneva_backup_run_readings{readout="runs_running"}'
+        values: '0x30'
+      - series: 'cogneva_backup_run_readings{readout="runs_abandoned"}'
+        values: '0x30'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_ok"}'
+        values: '107000x30'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_failed"}'
+        values: '107000x30'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_running"}'
+        values: '107000x30'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_abandoned"}'
+        values: '107000x30'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: backup_nothing_ever_recorded
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+      - eval_time: 30h
+        alertname: backup_never_succeeded
+        exp_alerts: []
+      - eval_time: 30h
+        alertname: backup_run_abandoned
+        exp_alerts: []
+
+  # 两个 CronJob 都建了三十小时，而演练与离站副本的三条「从来不出现」的读数**一条都没有**：
+  # 三条「从来没跑过 / 从来没写过 / 仓库从来没看过」亮。同一格里 `has_no_snapshot` 静——
+  # 它要求观测时间戳这一半存在，缺席是上一条的活，两条不重复喊。
+  - interval: 1h
+    input_series:
+      - series: 'kube_cronjob_created{cronjob="cogneva-backup"}'
+        values: '0x30'
+      - series: 'kube_cronjob_created{cronjob="cogneva-backup-drill"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: backup_restore_drill_never_ran
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+      - eval_time: 30h
+        alertname: backup_offsite_copy_never_written
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+      - eval_time: 30h
+        alertname: backup_offsite_repository_is_never_observed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 30h
+        alertname: backup_offsite_repository_has_no_snapshot
+        exp_alerts: []
+      - eval_time: 30h
+        alertname: backup_restore_drill_is_stale
+        exp_alerts: []
+
+  # CronJob 说自己十九小时前成功过，可读数里的成功计数二十六小时没有涨过：成功没记账。
+  # 这一格守的是「CronJob 与账本对不上」——两半都在、只是在互相矛盾。
+  - interval: 1h
+    input_series:
+      - series: 'kube_cronjob_status_last_successful_time{cronjob="cogneva-backup"}'
+        values: '100000x30'
+      - series: 'cogneva_backup_run_readings{readout="runs_ok"}'
+        values: '0x30'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="runs_ok"}'
+        values: '107000x30'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: backup_success_not_recorded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 30h
+        alertname: backup_never_succeeded_by_the_cronjob
+        exp_alerts: []
+
+  # 最新那个包只有一周前形状的三成：缩水。`newest_package_bytes` 在前一小时是 1000、
+  # 后一小时是 300，子查询 `[7d:1h]` 的一小时步长在 60m 处仍然看得到 1000。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_backup_run_readings{readout="newest_package_bytes"}'
+        values: '1000x60 300x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="newest_package_bytes"}'
+        values: '7100x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: backup_newest_package_shrank_below_its_own_recent_shape
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 同一个包大小一直没变：比例 1.0，静。这一格守的是「缩水」与「稳定」的差——把除数
+  # 写反（当前值除以当前值、或去掉子查询）时，它会是唯一一颗挡在前面的钉子。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_backup_run_readings{readout="newest_package_bytes"}'
+        values: '1000x120'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="newest_package_bytes"}'
+        values: '7100x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: backup_newest_package_shrank_below_its_own_recent_shape
+        exp_alerts: []
+
+  # 仓库十四分钟前刚看过，但远端根本没有快照这条读数：没有快照。这一格守的是第二腿——
+  # 观测在写不等于仓库里有东西。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_backup_run_readings{readout="offsite_observation_age_seconds"}'
+        values: '300x60'
+      - series: 'cogneva_backup_run_readings_observed_timestamp_seconds{readout="offsite_observation_age_seconds"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: backup_offsite_repository_has_no_snapshot
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 调度停在三十小时前，而且一次都没成功过（`last_successful_time` 这条读数根本不存在）：
+  # `never_succeeded_by_the_cronjob` 亮。下一格把那条读数补上，它立刻静——它是靠
+  # `absent(last_successful)` 这一半判的，不是靠「调度旧」。
+  - interval: 1h
+    input_series:
+      - series: 'kube_cronjob_status_last_schedule_time{cronjob="cogneva-backup"}'
+        values: '0x30'
+      - series: 'kube_cronjob_created{cronjob="cogneva-backup"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: backup_never_succeeded_by_the_cronjob
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+
+  # 同样的三十小时前调度，但成功过（`last_successful_time` 存在）：`never_succeeded_by_the_cronjob`
+  # 静，而 `cronjob_stopped_scheduling` 照样亮。这一格守的是两条规则的差：停调度是「不再排」，
+  # 没成功是「排了但没成」。
+  - interval: 1h
+    input_series:
+      - series: 'kube_cronjob_status_last_schedule_time{cronjob="cogneva-backup"}'
+        values: '0x30'
+      - series: 'kube_cronjob_status_last_successful_time{cronjob="cogneva-backup"}'
+        values: '3000x30'
+      - series: 'kube_cronjob_created{cronjob="cogneva-backup"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: backup_never_succeeded_by_the_cronjob
+        exp_alerts: []
+      - eval_time: 30h
+        alertname: backup_cronjob_stopped_scheduling
+        exp_alerts:
+          - exp_labels:
+              severity: critical

@@ -1,0 +1,353 @@
+# 镜像存储、治理面与变更流那十五条读数的单测夹具。
+#
+# image 一族守的是「节点上的镜像盘」：占用超过两成、扫描停了、读不全、kubelet 已经动手
+# 回收、盘过 85% 而 kubelet 一小时没回收。第五条带 `unless`：盘满但 kubelet 刚回收过
+# 就不是「没人管」，那两格（第二格与第三格）只在回收发生在不在最近一小时上分开。
+#
+# governance 一族守的是「面主在不在岗、读数在不在写」：
+#   - `face_not_on_target` 有两条排除：`state!="on_target"` 与一个状态白名单
+#     （owner_idle / witness_is_owner / deputy_overlap / unread）。第四格同时喂进
+#     on_target、unread 与 drifted，只有 drifted 该亮——删掉任一条排除都会多亮一条。
+#   - `ceiling_not_enforced` 是「漂移字段大于零**且**这条读数存在超过半小时」：
+#     第六格只用二十分钟历史，静。
+#   - `reading_stopped` 判的是**一条都没有**：第五格把整个读数撤掉。
+#
+# change 一族守的是「变更有没有走到落地」：diff 只从非树来源来、漏斗只有退役没有落地、
+# 漏斗里有归属不明的、落地失败的理由（五种算，别的不算）、分档路由从没走过真闸。
+# 五条里有三条是「A 在涨、B 没涨」的形状，第七格是它们的「两半都在」静格。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-image-governance-change.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: image_store_bytes_high
+# rule: image_store_scan_stale
+# rule: image_store_incomplete
+# rule: image_store_reclaimed_by_kubelet
+# rule: image_store_over_the_watermark_without_a_gc
+# rule: governance_ceiling_not_enforced
+# rule: governance_comparison_unreadable
+# rule: governance_face_not_on_target
+# rule: governance_face_unread
+# rule: governance_face_reading_stopped
+# rule: change_diff_never_harvested
+# rule: change_funnel_never_lands
+# rule: change_funnel_unattributed
+# rule: change_landing_failures
+# rule: change_tier_routing_inert
+
+evaluation_interval: 1m
+
+tests:
+  # 一切正常：镜像盘占一成、扫描十分钟前、十个分片全读到、kubelet 没回收过、根盘半满；
+  # 治理漂移字段为零、没有比较失败、面在岗、读数在写；变更 diff 从树来、漏斗有落地、
+  # 没有归属不明的、落地失败为零、真闸在走。十五条全静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_image_store_bytes{node="n1"}'
+        values: '100x60'
+      - series: 'kube_node_status_capacity{node="n1",resource="ephemeral_storage",unit="byte"}'
+        values: '1000x60'
+      - series: 'cogneva_image_store_age_seconds{node="n1"}'
+        values: '600x60'
+      - series: 'cogneva_image_store_parts{node="n1"}'
+        values: '10x60'
+      - series: 'cogneva_image_store_readable{node="n1"}'
+        values: '10x60'
+      - series: 'kubelet_image_garbage_collected_total{node="n1",reason="space"}'
+        values: '0x60'
+      - series: 'node_filesystem_avail_bytes{node="n1",mountpoint="/",fstype="ext4"}'
+        values: '500x60'
+      - series: 'node_filesystem_size_bytes{node="n1",mountpoint="/",fstype="ext4"}'
+        values: '1000x60'
+      - series: 'cogneva_governance_drift_fields'
+        values: '0x60'
+      - series: 'cogneva_governance_check_failures_total{namespace="cogneva",reason="api"}'
+        values: '0x60'
+      - series: 'cogneva_governance_face_state{face="resource",state="on_target"}'
+        values: '1x60'
+      - series: 'collab_change_diff_source_total{source="tree"}'
+        values: '0x50 1x10'
+      - series: 'cogneva_change_fate_total{intent="fix",fate="retired"}'
+        values: '0x60'
+      - series: 'cogneva_change_fate_total{intent="fix",fate="landed"}'
+        values: '0x60'
+      - series: 'cogneva_change_funnel{intent="unattributed",stage="parse"}'
+        values: '0x60'
+      - series: 'cogneva_change_funnel_observed_timestamp_seconds{intent="unattributed",stage="parse"}'
+        values: '3500x60'
+      - series: 'cogneva_landing_failures_total{category="rejected"}'
+        values: '0x60'
+      - series: 'cogneva_change_tier_total{tier="real_gate"}'
+        values: '0x50 1x10'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: image_store_bytes_high
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: image_store_scan_stale
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: image_store_incomplete
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: image_store_reclaimed_by_kubelet
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: image_store_over_the_watermark_without_a_gc
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: governance_ceiling_not_enforced
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: governance_comparison_unreadable
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: governance_face_not_on_target
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: governance_face_unread
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: governance_face_reading_stopped
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: change_diff_never_harvested
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: change_funnel_never_lands
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: change_funnel_unattributed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: change_landing_failures
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: change_tier_routing_inert
+        exp_alerts: []
+
+  # 镜像盘占三成、扫描五十分钟没跑、十个分片只读到八个、kubelet 两小时前因为空间回收过；
+  # 根盘用了九成，而最近一小时没有再回收。五条全亮。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_image_store_bytes{node="n1"}'
+        values: '300x36'
+      - series: 'kube_node_status_capacity{node="n1",resource="ephemeral_storage",unit="byte"}'
+        values: '1000x36'
+      - series: 'cogneva_image_store_age_seconds{node="n1"}'
+        values: '3000x36'
+      - series: 'cogneva_image_store_parts{node="n1"}'
+        values: '10x36'
+      - series: 'cogneva_image_store_readable{node="n1"}'
+        values: '8x36'
+      - series: 'kubelet_image_garbage_collected_total{node="n1",reason="space"}'
+        values: '0x12 1x24'
+      - series: 'node_filesystem_avail_bytes{node="n1",mountpoint="/",fstype="ext4"}'
+        values: '100x36'
+      - series: 'node_filesystem_size_bytes{node="n1",mountpoint="/",fstype="ext4"}'
+        values: '1000x36'
+    alert_rule_test:
+      - eval_time: 3h
+        alertname: image_store_bytes_high
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+      - eval_time: 3h
+        alertname: image_store_scan_stale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+      - eval_time: 3h
+        alertname: image_store_incomplete
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+      - eval_time: 3h
+        alertname: image_store_reclaimed_by_kubelet
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+      - eval_time: 3h
+        alertname: image_store_over_the_watermark_without_a_gc
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+
+  # 同样是用了九成的根盘，但 kubelet 五分钟前刚回收过：这是「有人管」，静。
+  # 删掉 `unless` 那半，这一格会响。
+  - interval: 5m
+    input_series:
+      - series: 'kubelet_image_garbage_collected_total{node="n1",reason="space"}'
+        values: '0x34 1x2'
+      - series: 'node_filesystem_avail_bytes{node="n1",mountpoint="/",fstype="ext4"}'
+        values: '100x36'
+      - series: 'node_filesystem_size_bytes{node="n1",mountpoint="/",fstype="ext4"}'
+        values: '1000x36'
+    alert_rule_test:
+      - eval_time: 3h
+        alertname: image_store_over_the_watermark_without_a_gc
+        exp_alerts: []
+
+  # 治理面：漂移字段两小时一直是 3、比较失败涨了七次、安全面在 drifted、资源面读不出来。
+  # 四条亮；同一格里 `reading_stopped` 静（读数在写，只是写的是坏消息）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_governance_drift_fields'
+        values: '3x120'
+      - series: 'cogneva_governance_check_failures_total{namespace="cogneva",reason="api"}'
+        values: '0x110 7x10'
+      - series: 'cogneva_governance_face_state{face="security",state="drifted"}'
+        values: '1x120'
+      - series: 'cogneva_governance_face_state{face="resource",state="unread"}'
+        values: '1x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: governance_ceiling_not_enforced
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 120m
+        alertname: governance_comparison_unreadable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+              reason: api
+      - eval_time: 120m
+        alertname: governance_face_not_on_target
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              face: security
+              state: drifted
+      - eval_time: 120m
+        alertname: governance_face_unread
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              face: resource
+      - eval_time: 120m
+        alertname: governance_face_reading_stopped
+        exp_alerts: []
+
+  # 治理面的读数一条都没有：`reading_stopped` 亮，而 `face_unread` / `face_not_on_target`
+  # 静——「没写」与「写的是 unread」是两件事。
+  - interval: 1m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: governance_face_reading_stopped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: governance_face_unread
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: governance_face_not_on_target
+        exp_alerts: []
+
+  # 漂移字段是 3，但这条读数只有二十分钟历史：还不够判「半小时里一直有漂移」。
+  # 删掉「读数存在超过半小时」那条腿，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_governance_drift_fields'
+        values: '3x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: governance_ceiling_not_enforced
+        exp_alerts: []
+
+  # 变更流在说坏消息：diff 只从 api 来（树上一份没有）、fix 这个意图只退役没落地、
+  # 漏斗里有两个归属不明的、落地失败里有两次 rejected、分档只走 fast 没走真闸。五条亮。
+  - interval: 1h
+    input_series:
+      - series: 'collab_change_diff_source_total{source="api"}'
+        values: '0x20 5x6'
+      - series: 'cogneva_change_fate_total{intent="fix",fate="retired"}'
+        values: '0x20 2x6'
+      - series: 'cogneva_change_fate_total{intent="fix",fate="landed"}'
+        values: '0x26'
+      - series: 'cogneva_change_funnel{intent="unattributed",stage="parse"}'
+        values: '2x26'
+      - series: 'cogneva_change_funnel_observed_timestamp_seconds{intent="unattributed",stage="parse"}'
+        values: '91800x26'
+      - series: 'cogneva_landing_failures_total{category="rejected"}'
+        values: '0x20 2x6'
+      - series: 'cogneva_landing_failures_total{category="other"}'
+        values: '0x20 9x6'
+      - series: 'cogneva_change_tier_total{tier="fast"}'
+        values: '0x20 3x6'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: change_diff_never_harvested
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              source: api
+      - eval_time: 26h
+        alertname: change_funnel_never_lands
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              intent: fix
+      - eval_time: 26h
+        alertname: change_funnel_unattributed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      # `other` 涨了九次，但它不在那五类里：结果只该有 rejected 一条。
+      - eval_time: 26h
+        alertname: change_landing_failures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: rejected
+      - eval_time: 26h
+        alertname: change_tier_routing_inert
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 同样的形状，但「另一半」也在涨：树上的 diff 在来、fix 也有落地、真闸也在走……
+  # 四条全静。删掉任一条 `unless` / 落地那一腿，这一格会先响。
+  - interval: 1h
+    input_series:
+      - series: 'collab_change_diff_source_total{source="api"}'
+        values: '0x20 5x6'
+      - series: 'collab_change_diff_source_total{source="tree"}'
+        values: '0x20 4x6'
+      - series: 'cogneva_change_fate_total{intent="fix",fate="retired"}'
+        values: '0x20 2x6'
+      - series: 'cogneva_change_fate_total{intent="fix",fate="landed"}'
+        values: '0x20 1x6'
+      - series: 'cogneva_change_funnel{intent="unattributed",stage="parse"}'
+        values: '2x26'
+      - series: 'cogneva_change_funnel_observed_timestamp_seconds{intent="unattributed",stage="parse"}'
+        values: '0x26'
+      - series: 'cogneva_change_tier_total{tier="fast"}'
+        values: '0x20 3x6'
+      - series: 'cogneva_change_tier_total{tier="real_gate"}'
+        values: '0x20 1x6'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: change_diff_never_harvested
+        exp_alerts: []
+      - eval_time: 26h
+        alertname: change_funnel_never_lands
+        exp_alerts: []
+      - eval_time: 26h
+        alertname: change_tier_routing_inert
+        exp_alerts: []
+      # 漏斗里有归属不明的，但那条读数是二十六小时前的：不再归它问。
+      - eval_time: 26h
+        alertname: change_funnel_unattributed
+        exp_alerts: []

@@ -1,0 +1,385 @@
+# 构建闸（build gate）、构建缓存与进化队列那十五条读数的单测夹具。
+#
+# build 一族守的是「构建这件事的闸与盘」：宿主读数没发布、闸拒绝得太多、闸没生效、
+# 槽被持有太久、预留过期/续约断档、缓存超了上限却没人回收、回收明明在跑。
+# 两处形状最容易写错：
+#   - `build_gate_not_in_force` 有两腿：最近五分钟里槽数掉到 0，**且**这条读数存在超过
+#     五分钟。第三格专门造「刚出现的 0」——删掉第二腿，一个刚启动、还没生效的闸会被判成
+#     「掉了」。
+#   - `build_gate_host_readings_unpublished` 的四条宿主读数要**同时**在场才算发布：缺一条
+#     就说明那一族没在写。第一格四条都在 → 静；第二格一条不给 → 响。
+#
+# evolution 一族守的是「队列还有没有人在推」：构建失败、学习复现从不爬升、队列没有执行者、
+# 执行者不止一个、队列不排空、常驻索引活得比变更还久、变更在飞超预算。
+# 其中三条是「A 成立、而 B 没发生」的反事实形状，每条都配了「两半都在」的静格。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-build-evolution.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: build_gate_host_readings_unpublished
+# rule: build_gate_refused
+# rule: build_gate_not_in_force
+# rule: build_gate_slot_held_too_long
+# rule: build_gate_reservation_lapsed
+# rule: build_gate_reservation_renew_gap
+# rule: build_cache_cap_unmet
+# rule: build_cache_reclaim_stalled
+# rule: build_cache_reclaim_ran
+# rule: evolution_build_failed
+# rule: evolution_learning_recurrence_never_climbs
+# rule: evolution_queue_has_no_executor
+# rule: evolution_queue_has_more_than_one_executor
+# rule: evolution_queue_not_draining
+# rule: evolution_resident_index_outlives_its_changes
+# rule: evolution_change_flight_over_budget
+
+evaluation_interval: 1m
+
+tests:
+  # 一套健康的构建与进化面：闸开着（两条槽）、四条宿主读数都在发布、拒绝五次（界 12）、
+  # 槽只持有十秒（预算六十秒）、没有预留过期、续约断档一分钟、缓存没超、回收没停、
+  # 进化没有失败、学习复现只在前两档、队列正好一个执行者、没有积压、常驻索引比变更少、
+  # 在飞时间在预算内。十六条全静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_gate_ceiling{dir="/work",role="builder",dimension="cpu"}'
+        values: '3x60'
+      - series: 'cogneva_host_cpu_cores{dir="/work",role="builder"}'
+        values: '24x60'
+      - series: 'cogneva_host_memory_available_bytes{dir="/work",role="builder"}'
+        values: '32000000000x60'
+      - series: 'cogneva_host_pressure_avg60{dir="/work",role="builder",resource="cpu"}'
+        values: '5x60'
+      - series: 'cogneva_host_disk_free_bytes{dir="/work",role="builder"}'
+        values: '100000000000x60'
+      - series: 'cogneva_build_gate_refused_total{dir="/work",role="builder",reason="busy",asker="main"}'
+        values: '0x40 5x20'
+      - series: 'cogneva_build_gate_slots{dir="/work",role="builder"}'
+        values: '2x60'
+      - series: 'cogneva_build_gate_holder_seconds{dir="/work",role="builder",slot="0",what="build"}'
+        values: '10x60'
+      - series: 'cogneva_build_gate_wait_budget_ms{dir="/work",role="builder"}'
+        values: '30000x60'
+      - series: 'cogneva_build_gate_reservation_lapsed_total{dir="/work",role="builder",asker="main"}'
+        values: '0x60'
+      - series: 'cogneva_build_gate_reservation_renew_gap_seconds{dir="/work",role="builder",asker="main"}'
+        values: '60x60'
+      - series: 'cogneva_build_target_unmet_bytes{dir="/work"}'
+        values: '0x60'
+      - series: 'cogneva_build_target_over_cap_seconds{dir="/work"}'
+        values: '0x60'
+      - series: 'cogneva_build_target_scan_interval_seconds{dir="/work"}'
+        values: '60x60'
+      - series: 'cogneva_build_target_over_cap_total{dir="/work",outcome="reclaimed"}'
+        values: '0x60'
+      - series: 'cogneva_evolution_build_outcomes_total{intent="fix",outcome="ok"}'
+        values: '0x40 1x20'
+      - series: 'cogneva_evolution_learning_recurrence_at_threshold_total{gate="hook",recurrence="1"}'
+        values: '0x40 5x20'
+      - series: 'cogneva_evolution_learning_recurrence_at_threshold_total{gate="hook",recurrence="2"}'
+        values: '0x40 5x20'
+      - series: 'cogneva_evolution_learning_recurrence_at_threshold_total{gate="hook",recurrence="3"}'
+        values: '0x60'
+      - series: 'cogneva_evolution_learning_recurrence_at_threshold_total{gate="hook",recurrence="4+"}'
+        values: '0x60'
+      - series: 'cogneva_evolution_change_queue_owner{dir="/work"}'
+        values: '1x60'
+      - series: 'cogneva_evolution_change_queue_oldest_seconds{dir="/work"}'
+        values: '10x60'
+      - series: 'cogneva_evolution_change_queue_poll_interval_seconds{dir="/work"}'
+        values: '60x60'
+      - series: 'cogneva_evolution_change_queue_pending{dir="/work"}'
+        values: '0x60'
+      - series: 'cogneva_evolution_resident_results{dir="/work"}'
+        values: '5x60'
+      - series: 'cogneva_evolution_change_queue_files{dir="/work"}'
+        values: '10x60'
+      - series: 'cogneva_evolution_change_flight_seconds{dir="/work"}'
+        values: '100x60'
+      - series: 'cogneva_evolution_change_flight_budget_seconds{dir="/work"}'
+        values: '600x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: build_gate_host_readings_unpublished
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: build_gate_refused
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: build_gate_not_in_force
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: build_gate_slot_held_too_long
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: build_gate_reservation_lapsed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: build_gate_reservation_renew_gap
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: build_cache_cap_unmet
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: build_cache_reclaim_stalled
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: build_cache_reclaim_ran
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: evolution_build_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: evolution_learning_recurrence_never_climbs
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: evolution_queue_has_no_executor
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: evolution_queue_has_more_than_one_executor
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: evolution_queue_not_draining
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: evolution_resident_index_outlives_its_changes
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: evolution_change_flight_over_budget
+        exp_alerts: []
+
+  # 闸在，但宿主读数一条都没发布：`host_readings_unpublished` 亮。拒绝一小时涨了十三次、
+  # 槽在前半小时就掉到 0、槽被持有了一百秒（预算六十）、预留过期、续约断档十六分钟：五条亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_gate_ceiling{dir="/work",role="builder",dimension="cpu"}'
+        values: '3x60'
+      - series: 'cogneva_build_gate_refused_total{dir="/work",role="builder",reason="busy",asker="main"}'
+        values: '0x50 13x10'
+      - series: 'cogneva_build_gate_slots{dir="/work",role="builder"}'
+        values: '1x30 0x30'
+      - series: 'cogneva_build_gate_holder_seconds{dir="/work",role="builder",slot="0",what="build"}'
+        values: '100x60'
+      - series: 'cogneva_build_gate_wait_budget_ms{dir="/work",role="builder"}'
+        values: '30000x60'
+      - series: 'cogneva_build_gate_reservation_lapsed_total{dir="/work",role="builder",asker="main"}'
+        values: '0x40 1x20'
+      - series: 'cogneva_build_gate_reservation_renew_gap_seconds{dir="/work",role="builder",asker="main"}'
+        values: '1000x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: build_gate_host_readings_unpublished
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: /work
+              role: builder
+              dimension: cpu
+      - eval_time: 60m
+        alertname: build_gate_refused
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: /work
+              role: builder
+              reason: busy
+              asker: main
+      - eval_time: 60m
+        alertname: build_gate_not_in_force
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: /work
+              role: builder
+      - eval_time: 60m
+        alertname: build_gate_slot_held_too_long
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: /work
+              role: builder
+              slot: "0"
+              what: build
+      - eval_time: 60m
+        alertname: build_gate_reservation_lapsed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: /work
+              role: builder
+              asker: main
+      - eval_time: 60m
+        alertname: build_gate_reservation_renew_gap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: /work
+              role: builder
+              asker: main
+
+  # 槽数是 0，但这条读数只有十分钟历史：它可能是刚启动、还没生效，不是「掉出了生效」。
+  # 删掉「读数存在超过五分钟」那一条腿，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_gate_slots{dir="/work",role="builder"}'
+        values: '0x5'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: build_gate_not_in_force
+        exp_alerts: []
+
+  # 缓存超了上限十个字节、超上限状态持续了七百秒（扫描间隔六十秒，界三百六十秒）、
+  # 而且这一小时里回收跑过一次：三条亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_target_unmet_bytes{dir="/work"}'
+        values: '10x60'
+      - series: 'cogneva_build_target_over_cap_seconds{dir="/work"}'
+        values: '700x60'
+      - series: 'cogneva_build_target_scan_interval_seconds{dir="/work"}'
+        values: '60x60'
+      - series: 'cogneva_build_target_over_cap_total{dir="/work",outcome="reclaimed"}'
+        values: '0x40 1x20'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: build_cache_cap_unmet
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: /work
+      - eval_time: 60m
+        alertname: build_cache_reclaim_stalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: /work
+      - eval_time: 60m
+        alertname: build_cache_reclaim_ran
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: /work
+
+  # 进化面在说坏消息：一次构建失败、复现只在第一档爬（三档和四档一次都没有）、
+  # 队列没有执行者、最老的变更等了七百秒（轮询六十秒）且还剩三个、常驻索引十条而变更只有
+  # 五条、在飞九百秒超了六百秒的预算。六条亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_evolution_build_outcomes_total{intent="fix",outcome="failed"}'
+        values: '0x40 2x20'
+      - series: 'cogneva_evolution_learning_recurrence_at_threshold_total{gate="hook",recurrence="1"}'
+        values: '0x40 30x20'
+      - series: 'cogneva_evolution_learning_recurrence_at_threshold_total{gate="hook",recurrence="2"}'
+        values: '0x40 10x20'
+      - series: 'cogneva_evolution_learning_recurrence_at_threshold_total{gate="hook",recurrence="3"}'
+        values: '0x60'
+      - series: 'cogneva_evolution_learning_recurrence_at_threshold_total{gate="hook",recurrence="4+"}'
+        values: '0x60'
+      - series: 'cogneva_evolution_change_queue_owner{dir="/work"}'
+        values: '1x20 0x40'
+      - series: 'cogneva_evolution_change_queue_oldest_seconds{dir="/work"}'
+        values: '700x60'
+      - series: 'cogneva_evolution_change_queue_poll_interval_seconds{dir="/work"}'
+        values: '60x60'
+      - series: 'cogneva_evolution_change_queue_pending{dir="/work"}'
+        values: '3x60'
+      - series: 'cogneva_evolution_resident_results{dir="/work"}'
+        values: '10x60'
+      - series: 'cogneva_evolution_change_queue_files{dir="/work"}'
+        values: '5x60'
+      - series: 'cogneva_evolution_change_flight_seconds{dir="/work"}'
+        values: '900x60'
+      - series: 'cogneva_evolution_change_flight_budget_seconds{dir="/work"}'
+        values: '600x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: evolution_build_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              intent: fix
+      - eval_time: 60m
+        alertname: evolution_learning_recurrence_never_climbs
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: evolution_queue_has_no_executor
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: evolution_queue_not_draining
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: /work
+      - eval_time: 60m
+        alertname: evolution_resident_index_outlives_its_changes
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: /work
+      - eval_time: 60m
+        alertname: evolution_change_flight_over_budget
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: /work
+
+  # 复现爬到了第三档：不是「从不爬升」。删掉「三档与四档为 0」那一条腿，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_evolution_learning_recurrence_at_threshold_total{gate="hook",recurrence="1"}'
+        values: '0x40 30x20'
+      - series: 'cogneva_evolution_learning_recurrence_at_threshold_total{gate="hook",recurrence="3"}'
+        values: '0x40 5x20'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: evolution_learning_recurrence_never_climbs
+        exp_alerts: []
+
+  # 队列上有两个执行者：`has_more_than_one_executor` 亮（critical），
+  # `has_no_executor` 静。这一格守的是两条的形状相同、判词相反。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_evolution_change_queue_owner{dir="/work"}'
+        values: '2x40'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: evolution_queue_has_more_than_one_executor
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+      - eval_time: 40m
+        alertname: evolution_queue_has_no_executor
+        exp_alerts: []
+
+  # 执行者刚消失十分钟：这条读数只有十分钟历史，还不够判「没人管」。
+  # 删掉「读数存在超过十五分钟」那一条腿，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_evolution_change_queue_owner{dir="/work"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: evolution_queue_has_no_executor
+        exp_alerts: []
+
+  # 最老的变更等了七百秒，但队列里一个待处理的都没有：不归「不排空」问。
+  # 删掉 `pending > 0` 那一条腿，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_evolution_change_queue_oldest_seconds{dir="/work"}'
+        values: '700x60'
+      - series: 'cogneva_evolution_change_queue_poll_interval_seconds{dir="/work"}'
+        values: '60x60'
+      - series: 'cogneva_evolution_change_queue_pending{dir="/work"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: evolution_queue_not_draining
+        exp_alerts: []

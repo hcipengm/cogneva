@@ -1,0 +1,406 @@
+# 数据卷（claim）与记忆面那十五条读数的单测夹具。
+#
+# claim 一族守的是「卷上的数据与账上对得上」：填充率过九成但没满、有目录没卷认领、
+# 卷已释放却还被引用、扫描停了/没扫全、有节点从不汇报。两处形状最容易写错：
+#   - `claim_fill_level_high` 带一条**上界腿**（比例必须 < 1.0）：满了归另一条规则，
+#     这一条只管「快满但还没满」。第三格把比例正好做成 1.0——删掉上界腿它就会响。
+#   - `claim_directory_without_a_claim` 的判据是「非空即响」：三个 `unless` 各自挡掉
+#     一种「其实有人认领」的情形。第五格用「PV 的 claimRef 指向它」把第二腿证一遍。
+#
+# memory 一族守的是「收进来的东西有没有被处理掉」：衰减全失败、原始积压老化而重驱不动、
+# 抽取扫描失败、写进死信、schema 修复全失败、schema 孤儿修不了、总线认领全失败、
+# 某个后端操作从没成功过。八条里有五条是「A 在涨、B 没涨」的**反事实**形状，
+# 每条都配了「两半都在」的静格：把 `unless` 删掉，那一格会亮。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-claim-memory.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: claim_fill_level_high
+# rule: claim_usage_unmeasured
+# rule: claim_directory_without_a_claim
+# rule: claim_held_by_a_released_volume
+# rule: claim_scan_stale
+# rule: claim_scan_incomplete
+# rule: claim_store_node_unreported
+# rule: memory_decay_passes_all_failed
+# rule: memory_raw_backlog_aged_out
+# rule: memory_unextracted_scan_failed
+# rule: memory_discarded_to_dead_letter
+# rule: memory_schema_repair_passes_all_failed
+# rule: memory_schema_orphans_unrepairable
+# rule: memory_bus_claim_rounds_all_failed
+# rule: memory_backend_operation_never_succeeds
+
+evaluation_interval: 1m
+
+tests:
+  # 一套健康的卷与记忆面：卷用了 50%、有对应的 PVC 对象、PV 认领的是同一个 claim 且状态
+  # 正常、扫描一分钟前刚跑过且十个目录全读到、节点只有一个且汇报了；衰减有成功、
+  # 没有积压老化、扫描没失败、没写死信、schema 修复有成功、没有孤儿、总线认领有成功、
+  # 后端操作的错误率低于总操作数。十五条全静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_data_volume_used_bytes{namespace="cogneva",persistentvolumeclaim="data"}'
+        values: '50x60'
+      - series: 'kube_persistentvolumeclaim_resource_requests_storage_bytes{namespace="cogneva",persistentvolumeclaim="data"}'
+        values: '100x60'
+      - series: 'kube_persistentvolumeclaim_info{namespace="cogneva",persistentvolumeclaim="data",storageclass="local-path"}'
+        values: '1x60'
+      - series: 'kube_persistentvolumeclaim_status_phase{namespace="cogneva",persistentvolumeclaim="data",phase="Bound"}'
+        values: '1x60'
+      - series: 'kube_persistentvolume_claim_ref{persistentvolume="pv1",name="data",claim_namespace="cogneva"}'
+        values: '1x60'
+      - series: 'kube_persistentvolume_status_phase{persistentvolume="pv1",phase="Bound"}'
+        values: '1x60'
+      - series: 'cogneva_claim_scan_age_seconds{node="n1"}'
+        values: '60x60'
+      - series: 'cogneva_claim_scan_dirs{node="n1"}'
+        values: '10x60'
+      - series: 'cogneva_claim_scan_readable{node="n1"}'
+        values: '10x60'
+      - series: 'kube_node_info{node="n1"}'
+        values: '1x60'
+      - series: 'cogneva_memory_decay_total{outcome="failed"}'
+        values: '0x40 1x20'
+      - series: 'cogneva_memory_decay_total{outcome="ok"}'
+        values: '0x40 1x20'
+      - series: 'memory_unextracted_raw_aged_out'
+        values: '0x60'
+      - series: 'memory_unextracted_raw_aged_out_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'memory_unextracted_scan_failed'
+        values: '0x60'
+      - series: 'memory_unextracted_scan_failed_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'memory_operations_total{operation="dlq_written"}'
+        values: '0x60'
+      - series: 'cogneva_memory_schema_repair_total{outcome="failed"}'
+        values: '0x40 1x20'
+      - series: 'cogneva_memory_schema_repair_total{outcome="ok"}'
+        values: '0x40 1x20'
+      - series: 'cogneva_memory_schema_repair_total{outcome="unrepairable"}'
+        values: '0x60'
+      - series: 'memory_operations_total{operation="bus_claim_failed"}'
+        values: '0x60'
+      - series: 'memory_operations_total{operation="bus_claim"}'
+        values: '0x55 1x5'
+      - series: 'memory_operation_errors_total{operation="fetch"}'
+        values: '0x40 1x20'
+      - series: 'memory_operations_total{operation="fetch"}'
+        values: '0x40 2x20'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: claim_fill_level_high
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: claim_usage_unmeasured
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: claim_directory_without_a_claim
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: claim_held_by_a_released_volume
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: claim_scan_stale
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: claim_scan_incomplete
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: claim_store_node_unreported
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: memory_decay_passes_all_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: memory_raw_backlog_aged_out
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: memory_unextracted_scan_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: memory_discarded_to_dead_letter
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: memory_schema_repair_passes_all_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: memory_schema_orphans_unrepairable
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: memory_bus_claim_rounds_all_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: memory_backend_operation_never_succeeds
+        exp_alerts: []
+
+  # 卷用了 95%、申请 100：过九成但还没满，`fill_level_high` 亮，标签带着卷的身份。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_data_volume_used_bytes{namespace="cogneva",persistentvolumeclaim="data"}'
+        values: '95x60'
+      - series: 'kube_persistentvolumeclaim_resource_requests_storage_bytes{namespace="cogneva",persistentvolumeclaim="data"}'
+        values: '100x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: claim_fill_level_high
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+              persistentvolumeclaim: data
+
+  # 同样的 100/100：比例正好 1.0，满了不归这条规则问——它在等另一条（扩容或清理）。
+  # 删掉 `< 1.0` 那条上界腿，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_data_volume_used_bytes{namespace="cogneva",persistentvolumeclaim="data"}'
+        values: '100x60'
+      - series: 'kube_persistentvolumeclaim_resource_requests_storage_bytes{namespace="cogneva",persistentvolumeclaim="data"}'
+        values: '100x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: claim_fill_level_high
+        exp_alerts: []
+
+  # 一个 Bound 的 local-path 卷没有用量读数（`usage_unmeasured` 亮），同时有一个目录有
+  # 用量、却没有任何 PVC 对象认领它（`directory_without_a_claim` 亮）。两条的方向相反：
+  # 一条是「账上有卷、读数里没有」，一条是「读数里有目录、账上没有」。
+  - interval: 1m
+    input_series:
+      - series: 'kube_persistentvolumeclaim_info{namespace="cogneva",persistentvolumeclaim="data",storageclass="local-path"}'
+        values: '1x60'
+      - series: 'kube_persistentvolumeclaim_status_phase{namespace="cogneva",persistentvolumeclaim="data",phase="Bound"}'
+        values: '1x60'
+      - series: 'cogneva_data_volume_used_bytes{namespace="cogneva",persistentvolumeclaim="orphan"}'
+        values: '10x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: claim_usage_unmeasured
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: claim_directory_without_a_claim
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+              persistentvolumeclaim: orphan
+
+  # 一个没有 PVC 对象的目录，被一块已释放的 PV 认领着：`held_by_a_released_volume` 亮，
+  # 标签带 PV 与它的相位。同一格里 `directory_without_a_claim` 静——第二腿（PV 的
+  # claimRef 指向它）把它挡掉了。删掉那条腿，这一格会响第二条。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_data_volume_used_bytes{namespace="cogneva",persistentvolumeclaim="data"}'
+        values: '10x60'
+      - series: 'kube_persistentvolume_claim_ref{persistentvolume="pv1",name="data",claim_namespace="cogneva"}'
+        values: '1x60'
+      - series: 'kube_persistentvolume_status_phase{persistentvolume="pv1",phase="Released"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: claim_held_by_a_released_volume
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+              persistentvolumeclaim: data
+              persistentvolume: pv1
+              phase: Released
+      - eval_time: 60m
+        alertname: claim_directory_without_a_claim
+        exp_alerts: []
+
+  # 扫描十六分钟没跑了、十个目录只读到八个、集群里有两个节点但只有 n1 汇报过：三条亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_claim_scan_age_seconds{node="n1"}'
+        values: '1000x60'
+      - series: 'cogneva_claim_scan_dirs{node="n1"}'
+        values: '10x60'
+      - series: 'cogneva_claim_scan_readable{node="n1"}'
+        values: '8x60'
+      - series: 'kube_node_info{node="n1"}'
+        values: '1x60'
+      - series: 'kube_node_info{node="n2"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: claim_scan_stale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+      - eval_time: 60m
+        alertname: claim_scan_incomplete
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+      - eval_time: 60m
+        alertname: claim_store_node_unreported
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n2
+
+  # 记忆面八条**全部**在说坏消息：衰减只有失败、原始积压老化而重驱一次没跑、抽取扫描失败、
+  # 死信写了、schema 修复只有失败、孤儿修不了、总线认领只有失败、fetch 的错误数等于总操作数
+  # （成功数 0）。八条全亮。
+  # 注意「重驱」「总线认领成功」这两条读数必须**存在且为 0**：反事实那一半是空的时，
+  # 整个乘积也是空的——规则宁可不响，也不拿「没读数」当「没有成功」。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_memory_decay_total{outcome="failed"}'
+        values: '0x40 2x20'
+      - series: 'memory_unextracted_raw_aged_out'
+        values: '5x60'
+      - series: 'memory_unextracted_raw_aged_out_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'memory_operations_total{operation="aged_out_redrive"}'
+        values: '0x60'
+      - series: 'memory_unextracted_scan_failed'
+        values: '1x60'
+      - series: 'memory_unextracted_scan_failed_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'memory_operations_total{operation="dlq_written"}'
+        values: '0x40 1x20'
+      - series: 'cogneva_memory_schema_repair_total{outcome="failed"}'
+        values: '0x40 2x20'
+      - series: 'cogneva_memory_schema_repair_total{outcome="unrepairable"}'
+        values: '0x60'
+      - series: 'memory_operations_total{operation="bus_claim_failed"}'
+        values: '0x55 1x5'
+      - series: 'memory_operation_errors_total{operation="fetch"}'
+        values: '0x40 1x20'
+      - series: 'memory_operations_total{operation="fetch"}'
+        values: '0x40 1x20'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: memory_decay_passes_all_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outcome: failed
+      - eval_time: 60m
+        alertname: memory_raw_backlog_aged_out
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: memory_unextracted_scan_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: memory_discarded_to_dead_letter
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: memory_schema_repair_passes_all_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outcome: failed
+      - eval_time: 60m
+        alertname: memory_bus_claim_rounds_all_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              operation: bus_claim_failed
+      - eval_time: 60m
+        alertname: memory_backend_operation_never_succeeds
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              operation: fetch
+
+  # schema 修复里既有失败、也有「修不了」的孤儿：`orphans_unrepairable` 亮；而
+  # `repair_passes_all_failed` 静——「修不了」算在「非失败」那一半里，所以这一轮不是全失败。
+  # 这一格守的是 `outcome!="failed"` 那条腿：把它删掉，第二条会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_memory_schema_repair_total{outcome="failed"}'
+        values: '0x40 2x20'
+      - series: 'cogneva_memory_schema_repair_total{outcome="unrepairable"}'
+        values: '0x40 1x20'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: memory_schema_orphans_unrepairable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outcome: unrepairable
+      - eval_time: 60m
+        alertname: memory_schema_repair_passes_all_failed
+        exp_alerts: []
+
+  # 总线认领这一小时既有失败、也有成功：不是「全失败」。删掉 `unless` 那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'memory_operations_total{operation="bus_claim_failed"}'
+        values: '0x55 1x5'
+      - series: 'memory_operations_total{operation="bus_claim"}'
+        values: '0x55 3x5'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: memory_bus_claim_rounds_all_failed
+        exp_alerts: []
+
+  # 积压老化了，但重驱在跑：`raw_backlog_aged_out` 静。删掉「重驱没有增量」那一腿会响。
+  - interval: 1m
+    input_series:
+      - series: 'memory_unextracted_raw_aged_out'
+        values: '5x60'
+      - series: 'memory_unextracted_raw_aged_out_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'memory_operations_total{operation="aged_out_redrive"}'
+        values: '0x40 1x20'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: memory_raw_backlog_aged_out
+        exp_alerts: []
+
+  # 积压老化、重驱也没跑，但拉取闸正持有（`pull_gate_shared` == 1）：这时不动是设计好的，
+  # 不归这条规则问。删掉 `unless` 那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'memory_unextracted_raw_aged_out'
+        values: '5x60'
+      - series: 'memory_unextracted_raw_aged_out_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'memory_operations_total{operation="aged_out_redrive"}'
+        values: '0x60'
+      - series: 'cogneva_memory_pull_gate_holder{operation="pull_gate_shared"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: memory_raw_backlog_aged_out
+        exp_alerts: []
+
+  # 两条带新鲜度腿的读数停在半小时前：积压老化 5、扫描失败 1，值都在，但写者不在了。
+  # 两条必须静——删掉任一条新鲜度腿，这一格会先响。
+  - interval: 1m
+    input_series:
+      - series: 'memory_unextracted_raw_aged_out'
+        values: '5x60'
+      - series: 'memory_unextracted_raw_aged_out_observed_timestamp_seconds'
+        values: '0x60'
+      - series: 'memory_unextracted_scan_failed'
+        values: '1x60'
+      - series: 'memory_unextracted_scan_failed_observed_timestamp_seconds'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: memory_raw_backlog_aged_out
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: memory_unextracted_scan_failed
+        exp_alerts: []
