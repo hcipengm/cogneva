@@ -728,12 +728,15 @@ pub async fn import_face_with(
         return Ok(FaceImportOutcome::Inserted);
     };
 
+    // The gap task is the plan for filling a seat, not the seat itself: a file
+    // that only re-points it is asking for a description refresh, and counting
+    // it here would send that refresh down the branch that keeps ownership and
+    // then quietly drop the one cell that changed.
     let ownership_same = current.owner_unit == incoming.owner_unit
         && current.spec.deputy_unit == incoming.spec.deputy_unit
         && current.spec.witness_unit == incoming.spec.witness_unit
         && current.spec.vacancy_until == incoming.spec.vacancy_until
-        && current.spec.vacancy_assigner == incoming.spec.vacancy_assigner
-        && current.spec.gap_task_id == incoming.spec.gap_task_id;
+        && current.spec.vacancy_assigner == incoming.spec.vacancy_assigner;
 
     let ownership_kept =
         !ownership_same && (current.revision() > 1 || ownership == ImportOwnership::HandoverOnly);
@@ -746,6 +749,18 @@ pub async fn import_face_with(
         kept.spec.entry_path = incoming.spec.entry_path.clone();
         kept.spec.legacy_front_id = incoming.spec.legacy_front_id.clone();
         kept.spec.source_fronts = incoming.spec.source_fronts.clone();
+        // The plan follows the file even when the seat does not. What the import
+        // may not do is turn a declared vacancy into an empty one: a file that
+        // proposes an owner carries no gap task, and taking that cell would
+        // leave a row with no owner, a deadline, and no task to close it -- a
+        // face nobody ever staffed, which is a louder claim than the file made.
+        kept.spec.gap_task_id = incoming.spec.gap_task_id.clone();
+        if kept.owner_unit.is_none()
+            && current.spec.has_named_vacancy()
+            && !kept.spec.has_named_vacancy()
+        {
+            kept.spec.gap_task_id = current.spec.gap_task_id.clone();
+        }
         kept
     } else {
         let mut updated = incoming.clone();

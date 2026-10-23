@@ -2166,6 +2166,94 @@ mod tests {
         );
     }
 
+    /// The gap task names the work expected to close a vacancy, not the person
+    /// who fills it -- so keeping the owner is no reason to keep the plan. A
+    /// face whose gap task the import refuses to carry keeps handing its owner
+    /// a job that was replaced, and the file that says so is the only place the
+    /// replacement is written down.
+    #[tokio::test]
+    async fn a_continuous_import_carries_the_gap_task_while_keeping_the_owner() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let face = |owner: Option<&str>, gap: &str| {
+            let mut spec = cog_core::FaceSpec::first("f", cog_core::FaceKind::Face);
+            spec.gap_task_id = Some(gap.to_string());
+            spec.vacancy_until = Some(now + chrono::Duration::weeks(1));
+            spec.vacancy_assigner = Some("operator".into());
+            cog_core::Face {
+                face_id: "f".into(),
+                owner_unit: owner.map(str::to_string),
+                bound_by_handover_id: None,
+                spec,
+                updated_at: now,
+            }
+        };
+
+        cog_core::import_face(&store, &face(Some("c2"), "OLD-GAP"))
+            .await
+            .unwrap();
+        cog_core::import_face_with(
+            &store,
+            &face(Some("c2"), "NEW-GAP"),
+            cog_core::ImportOwnership::HandoverOnly,
+        )
+        .await
+        .unwrap();
+
+        let row = cog_core::Face::from_task(&store.row("f")).unwrap();
+        assert_eq!(
+            row.spec.gap_task_id.as_deref(),
+            Some("NEW-GAP"),
+            "the plan follows the file; only the seat needs a handover"
+        );
+        assert_eq!(row.owner_unit.as_deref(), Some("c2"));
+    }
+
+    /// A file that proposes an owner is not a handover, so the import keeps the
+    /// seat empty -- but the file also stops naming a gap task, and a vacancy
+    /// without one is not a vacancy at all: it would read as a face nobody ever
+    /// staffed, which is a louder claim than the one the file made. The
+    /// declaration keeps the task it was declared with until a handover or a
+    /// new declaration replaces it.
+    #[tokio::test]
+    async fn a_file_that_proposes_an_owner_cannot_retire_the_vacancy_it_never_filled() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let vacancy = |owner: Option<&str>, gap: Option<&str>| {
+            let mut spec = cog_core::FaceSpec::first("f", cog_core::FaceKind::Face);
+            spec.gap_task_id = gap.map(str::to_string);
+            spec.vacancy_until = Some(now + chrono::Duration::weeks(1));
+            spec.vacancy_assigner = Some("operator".into());
+            cog_core::Face {
+                face_id: "f".into(),
+                owner_unit: owner.map(str::to_string),
+                bound_by_handover_id: None,
+                spec,
+                updated_at: now,
+            }
+        };
+
+        cog_core::import_face(&store, &vacancy(None, Some("GAP")))
+            .await
+            .unwrap();
+        cog_core::import_face_with(
+            &store,
+            &vacancy(Some("c2"), None),
+            cog_core::ImportOwnership::HandoverOnly,
+        )
+        .await
+        .unwrap();
+
+        let row = cog_core::Face::from_task(&store.row("f")).unwrap();
+        assert_eq!(row.owner_unit, None, "the file cannot hand over the seat");
+        assert_eq!(
+            row.spec.gap_task_id.as_deref(),
+            Some("GAP"),
+            "an unfilled vacancy keeps the task it was declared with"
+        );
+        assert!(row.spec.has_named_vacancy());
+    }
+
     /// A roster import carries no handover. When the file agrees with the
     /// graph, the import must still leave the applied handover in place --
     /// otherwise the beat that changes nothing is the beat that erases the
