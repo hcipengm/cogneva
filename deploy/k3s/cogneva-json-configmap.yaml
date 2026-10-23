@@ -2682,12 +2682,12 @@ data:
                 },
                 {
                   "name": "policy_store_announced_without_a_version",
-                  "promql": "(count(cogneva_policy_store_readings{readout=\"data_dir\"} and ((time() - cogneva_policy_store_readings_observed_timestamp_seconds{readout=\"data_dir\"}) < 1800)) > bool count(cogneva_policy_store_readings{readout=\"active_version\"} and ((time() - cogneva_policy_store_readings_observed_timestamp_seconds{readout=\"active_version\"}) < 1800)))",
+                  "promql": "(count(cogneva_policy_store_readings{readout=\"data_dir\"} and ((time() - cogneva_policy_store_readings_observed_timestamp_seconds{readout=\"data_dir\"}) < 1800)) > bool (count(cogneva_policy_store_readings{readout=\"active_version\"} and ((time() - cogneva_policy_store_readings_observed_timestamp_seconds{readout=\"active_version\"}) < 1800)) or vector(0)))",
                   "condition": {
                     "greater_than": 0.0
                   },
                   "severity": "warning",
-                  "summary": "有进程声明了自己从某个 `data_dir` 加载过策略库，却没有报出对应数量的 ACTIVE 版本（{value} 为 1 表示声明多于版本）。这两格是同一轮写出来的：`readout=\"data_dir\"` 是「这个进程在这里、读的是这条路径」的声明，`readout=\"active_version\"` 是同一个库的 ACTIVE。一个库一轮里只写这两格，所以面上的数量对不上只有一种成因——那一轮写了一半，或者某条读数被后端拒了。值得单独报，因为版本那一格正是恢复核对与「策略库加载了哪一版」全部读的那一格：它少一条，读它的人会把「这个库这一版」读成「这个库没有读数」，而后者在任何按库聚合的查询里都变成「这个库不存在」。两个标签是格子的身份而不是装饰：`data_dir` 与 `store` 一起才唯一确定一个库，同一块 PVC 上两个不同的 `data_dir` 是两个库、两份独立状态，把工作负载名当身份会把它们合成一个数，那个数哪个库都不是；备份包也按这个身份逐库记版本。用计数相减而不是逐标签比对，是因为 PromQL 拿不到「同一个 (data_dir, store) 上少了一条」这件事，只有两族的总数可比，而总数不等就足够说明有一轮没写全。0 不亮，它也不常亮；亮了要去看那条进程的日志里 policy store reading could not be published 那几行。两侧各带 1800 秒新鲜合取：读数停了则两边都为空、整条为空，停了的循环归 background_loop_stalled。"
+                  "summary": "有进程声明了自己从某个 `data_dir` 加载过策略库，却没有报出对应数量的 ACTIVE 版本（{value} 为 1 表示声明多于版本）。这两格是同一轮写出来的：`readout=\"data_dir\"` 是「这个进程在这里、读的是这条路径」的声明，`readout=\"active_version\"` 是同一个库的 ACTIVE。一个库一轮里只写这两格，所以面上的数量对不上只有一种成因——那一轮写了一半，或者某条读数被后端拒了。值得单独报，因为版本那一格正是恢复核对与「策略库加载了哪一版」全部读的那一格：它少一条，读它的人会把「这个库这一版」读成「这个库没有读数」，而后者在任何按库聚合的查询里都变成「这个库不存在」。两个标签是格子的身份而不是装饰：`data_dir` 与 `store` 一起才唯一确定一个库，同一块 PVC 上两个不同的 `data_dir` 是两个库、两份独立状态，把工作负载名当身份会把它们合成一个数，那个数哪个库都不是；备份包也按这个身份逐库记版本。用计数相减而不是逐标签比对，是因为 PromQL 拿不到「同一个 (data_dir, store) 上少了一条」这件事，只有两族的总数可比，而总数不等就足够说明有一轮没写全。0 不亮，它也不常亮；亮了要去看那条进程的日志里 policy store reading could not be published 那几行。两侧各带 1800 秒新鲜合取：读数停了则两边都为空、整条为空，停了的循环归 background_loop_stalled。版本那一侧**一条读数都没有**时按 0 算（`or vector(0)`）：整面连一条版本都没写出来，正是「声明多于版本」的极端情形，不能因为右侧聚合为空就把这一格读成不适用——聚合对空输入返回空，这一格会在最该响的时候静掉。"
                 },
                 {
                   "name": "policy_store_active_pointer_names_a_missing_version",
