@@ -1001,7 +1001,7 @@ spec:
     - name: cogneva-host-verdict-readers
       rules:
         - alert: CognevaCommitFastLaneSlow
-          expr: commit_fast_lane_seconds > 60
+          expr: max(commit_fast_lane_seconds) > 60
           for: 30m
           labels:
             cogneva_io_managed: "true"
@@ -1012,7 +1012,7 @@ spec:
             description: "跑 `bash scripts/host/cogneva-commit-lane-reading.sh` 看两格：`commit_fast_lane_seconds` 与 `commit_fast_lane_hold_seconds`。只端到端超界、持槽没超，是它在排队（槽数与并发）；两格一起超，是快车道里的门本身慢了。分母看 `commit_fast_lane_samples`——样本个位数时中位数没什么可判的。"
 
         - alert: CognevaProductCommitShareLow
-          expr: product_commit_share < 0.5
+          expr: min(product_commit_share) < 0.5
           for: 1h
           labels:
             cogneva_io_managed: "true"
@@ -1023,7 +1023,7 @@ spec:
             description: "跑 `bash scripts/host/cogneva-product-commit-share-reading.sh`：分母 `product_commit_total` 是窗口内非 merge 提交数，分子 `product_commit_count` 是其中推进了 `crates/`（`crates/cog-observability/` 以外）的。分子为零而分母不小，说明这一周的提交都在刻度与门禁上；分母也小，说明这一周本来就没提交几笔，先看那一格再谈占比。"
 
         - alert: CognevaMemoryBudgetOver
-          expr: brain_budget_remaining < 0
+          expr: min(brain_budget_remaining) < 0
           for: 15m
           labels:
             cogneva_io_managed: "true"
