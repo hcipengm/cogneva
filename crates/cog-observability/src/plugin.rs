@@ -351,6 +351,12 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // from the outside. Publishing the count is what tells them apart.
         ctx.publish_observable(Arc::new(crate::process_zombies::ProcessZombieObservable));
 
+        // ── Where the birth footprint went ──
+        // Published even though most of the marks are taken before this plugin
+        // initialises: the observable reads the registry at scrape time, so the
+        // snapshots taken during startup are all there by the time anyone asks.
+        ctx.publish_observable(Arc::new(crate::boot_footprint::BootFootprintObservable));
+
         // ── Host producers that feed the platform's accounts ──
         // The row is written by the producer on the host, once per successful
         // cycle whether or not that cycle had anything new to queue; the intake

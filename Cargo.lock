@@ -1650,6 +1650,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cog-core",
+ "cog-observability",
  "cog-storage",
  "cog-stream",
  "fastembed",

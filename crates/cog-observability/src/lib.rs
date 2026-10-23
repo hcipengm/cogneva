@@ -2,6 +2,7 @@ pub mod alert_store;
 pub mod alerts;
 pub mod analytics;
 pub mod bell;
+pub mod boot_footprint;
 pub mod claim_store;
 pub mod config;
 pub mod config_delivery;
