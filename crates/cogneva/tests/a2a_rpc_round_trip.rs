@@ -509,7 +509,7 @@ async fn the_card_is_discoverable_where_the_specification_puts_it() {
     );
     assert_eq!(with_token, card, "the card is the same for everyone");
 
-    // 规范 §8.6：名片带一个由内容导出的 ETag，对端过期后用条件请求取而不是重下。
+    // 名片带一个由内容导出的 ETag，对端过期后用条件请求取而不是重下。
     let etag = etag.expect("a discovery card carries an ETag");
     assert!(etag.starts_with('"'), "an ETag is a quoted string: {etag}");
     let (again_status, _, again_etag, _) = fetch(None, None, None).await;

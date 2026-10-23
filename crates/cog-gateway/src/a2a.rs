@@ -288,8 +288,8 @@ pub async fn agent_card_handler(
 
 /// `GET /.well-known/agent-card.json`
 ///
-/// 规范（1.0 §8.2、0.3 §5.2）把发现入口钉在这个 well-known 路径上：对端找到
-/// 一个 agent 的第一件事就是 GET 它，没有「先配置一个我们自己的路径」这一步。
+/// 两个版本的规范都把发现入口钉在这个 well-known 路径上：对端找到一个 agent
+/// 的第一件事就是 GET 它，没有「先配置一个我们自己的路径」这一步。
 /// 只把名片放在自定义路径上，照规范写的对端与官方 TCK 都发现不了我们——那是
 /// 对端面唯一一类「我们全对、对面就是接不上」的缺陷。
 ///
@@ -329,8 +329,8 @@ fn card_response(port: u16, headers: &HeaderMap, uri: &Uri, default: A2aVersion)
         A2aVersion::V10 => card_v10(&base),
     };
     let body = serde_json::to_vec(&card).unwrap_or_else(|_| b"{}".to_vec());
-    // 规范 §8.6：名片应当带一个由内容（或 `version` 字段）导出的 `ETag`，对端
-    // 过期后应当用条件请求而不是重下。这里取内容哈希：`version` 只在发版时变，
+    // 名片要带一个由内容（或 `version` 字段）导出的 `ETag`，对端过期后应当用
+    // 条件请求而不是重下。这里取内容哈希：`version` 只在发版时变，
     // 而名片还会随 `Host`（地址）变，哈希把这两件事都覆盖住。
     let digest = Sha256::digest(&body);
     let etag = format!("\"{}\"", hex16(&digest[..]));
