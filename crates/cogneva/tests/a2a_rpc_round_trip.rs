@@ -662,6 +662,63 @@ async fn the_endpoint_names_what_it_will_not_do() {
     );
 }
 
+/// The card advertises `stateTransitionHistory`, so a peer that asks for the
+/// history has to get back the message that created the task -- and a peer that
+/// asks for nothing has to get no `history` key at all. An always-empty array is
+/// the one answer that makes the card's claim false while every shape-based
+/// check still passes: the key is there, the array is an array, and nothing says
+/// it should have been longer.
+#[tokio::test]
+async fn tasks_get_returns_the_message_that_created_the_task_when_it_is_asked_for() {
+    let state = router_state::stateless();
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "a2a-rpc-history").await;
+    let goal = "刷新接口未区分访问令牌";
+    let client =
+        A2aClient::new(Arc::new(InProcess { app: app.clone() })).with_bearer(token.clone());
+
+    let accepted = client
+        .send_message(ENDPOINT, goal)
+        .await
+        .expect("the endpoint accepts a message");
+
+    let asked = post(
+        &app,
+        &token,
+        json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tasks/get",
+            "params": {"id": accepted.id, "historyLength": 1}
+        }),
+    )
+    .await;
+    assert_eq!(
+        asked["result"]["id"],
+        json!(accepted.id),
+        "the history comes back on the row that was asked for: {asked}"
+    );
+    let history = asked["result"]["history"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the history was asked for and is an array: {asked}"));
+    assert_eq!(history.len(), 1, "{asked}");
+    assert_eq!(history[0]["role"], json!("user"));
+    assert_eq!(
+        history[0]["parts"][0]["text"],
+        json!(goal),
+        "the history carries what the peer actually said"
+    );
+
+    let unasked = post(
+        &app,
+        &token,
+        json!({"jsonrpc": "2.0", "id": 10, "method": "tasks/get", "params": {"id": accepted.id}}),
+    )
+    .await;
+    assert!(
+        unasked["result"].get("history").is_none(),
+        "a caller that asked for no history gets no history key, not an empty one: {unasked}"
+    );
+}
+
 /// The card names one address and the specification dispatches on the method, so
 /// `message/stream` has to answer there too -- not only on its own path. A peer
 /// written to the spec never learns the other path exists; it reads

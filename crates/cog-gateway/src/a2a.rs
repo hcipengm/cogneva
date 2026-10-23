@@ -36,7 +36,7 @@ use sha2::{Digest, Sha256};
 
 use cog_core::{
     A2aTask, A2aTaskStatus, A2aVersion, MessagePart, OrchestratorControl, Task, TaskArtifact,
-    TaskStatus,
+    TaskMessage, TaskStatus,
 };
 
 use crate::GatewayState;
@@ -728,6 +728,62 @@ fn a2a_task(task: &Task) -> A2aTask {
     }
 }
 
+/// 调用方要几条历史。
+///
+/// 两版把这一格放在不同的地方：0.3 的 `tasks/get` 是 `params.historyLength`，
+/// `message/send` 是 `params.configuration.historyLength`；1.0 的 `TaskQueryParams`
+/// 也把它平铺在 `params` 上。两处都认，是因为**认错一格不会报错，只会静默地
+/// 什么都不给**——而「对端要了历史、我们回了空」正是这次要修的那件事。
+/// 缺省 0：没要就不给，历史不是白送的。
+fn requested_history(body: &Value) -> usize {
+    let params = body.get("params");
+    params
+        .and_then(|p| p.get("historyLength"))
+        .or_else(|| {
+            params
+                .and_then(|p| p.get("configuration"))
+                .and_then(|c| c.get("historyLength"))
+        })
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize
+}
+
+/// 这条任务交换过的 message，最多 `wanted` 条（规范说的是**最近** N 条）。
+///
+/// 名片一直宣称 `stateTransitionHistory: true`，而 `tasks/get` 一直回 `history: []`
+/// ——旗子说「我留着交换过的消息」，读回来一条也没有。这与「旗后没有端点」是同一
+/// 类假承诺，只是更难看见：端点答了 200，形状也对，空的那一格没人会去核对。
+///
+/// 本平台不落 message 表，但这条任务**是由一条 message 建出来的**，那句话就在
+/// `input.goal` 上（`Task::goal_row` 的唯一形状）。所以能给的恰好就是一条：
+/// 建出这个任务的那条用户消息。给不出时回空，而不是编一条。
+fn history_of(task: &Task, wanted: usize) -> Vec<TaskMessage> {
+    if wanted == 0 {
+        return Vec::new();
+    }
+    let Some(goal) = task.input.get("goal").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    // 一次提交一条 goal，历史最多一条，所以「最近 N 条」的截断在这里没有可截的；
+    // 取 `wanted` 只为把「要了才给」写清楚，别让它变成一个恒真的形状。
+    let _ = wanted;
+    vec![TaskMessage {
+        // 同一个任务上的同一条消息，两次读必须是同一个 id：对端会拿它去重。
+        message_id: format!("{}-goal", task.id),
+        role: String::from("user"),
+        parts: vec![MessagePart::Text {
+            text: goal.to_string(),
+        }],
+    }]
+}
+
+/// 与 [`a2a_task`] 同源，只多带调用方要的历史。
+fn a2a_task_with_history(task: &Task, wanted: usize) -> A2aTask {
+    let mut view = a2a_task(task);
+    view.history = history_of(task, wanted);
+    view
+}
+
 /// 把一条 goal 的推进做成 SSE 帧序列。
 ///
 /// 形状是 `unfold` 而不是通道 + 后台任务：帧的产生只依赖「读一行、比对上一次」，
@@ -1120,7 +1176,10 @@ async fn rpc_message_send(
         StatusCode::OK,
         Json(jsonrpc_result(
             rpc_id,
-            send_message_result(version, &a2a_task(&row)),
+            send_message_result(
+                version,
+                &a2a_task_with_history(&row, requested_history(body)),
+            ),
         )),
     )
         .into_response()
@@ -1204,7 +1263,10 @@ async fn rpc_tasks_get(
     match state.orchestrator.get_task(task_id).await {
         Some(task) => (
             StatusCode::OK,
-            Json(jsonrpc_result(rpc_id, a2a_task(&task).to_wire(version))),
+            Json(jsonrpc_result(
+                rpc_id,
+                a2a_task_with_history(&task, requested_history(body)).to_wire(version),
+            )),
         )
             .into_response(),
         None => (
@@ -1252,7 +1314,10 @@ async fn rpc_tasks_cancel(
             match state.orchestrator.get_task(task_id).await {
                 Some(task) => (
                     StatusCode::OK,
-                    Json(jsonrpc_result(rpc_id, a2a_task(&task).to_wire(version))),
+                    Json(jsonrpc_result(
+                        rpc_id,
+                        a2a_task_with_history(&task, requested_history(body)).to_wire(version),
+                    )),
                 )
                     .into_response(),
                 None => (
@@ -1857,6 +1922,57 @@ mod tests {
             group[1]
         );
         assert!(stream.next().await.is_none(), "the stream still ends");
+    }
+
+    /// 名片宣称 `stateTransitionHistory: true`：对端要几条历史就得真拿到，
+    /// 而不是一个永远空的格子。
+    #[test]
+    fn a_task_returns_the_message_that_created_it_when_history_is_asked_for() {
+        let row = Task::goal_row(String::from("g-1"), "刷新接口未区分访问令牌");
+
+        // 没要就不给：空历史在 `to_wire` 里连这个键都不写。
+        let none = a2a_task_with_history(&row, 0).to_wire(A2aVersion::V03);
+        assert!(none.get("history").is_none(), "{none}");
+
+        let v03 = a2a_task_with_history(&row, 1).to_wire(A2aVersion::V03);
+        let history = v03["history"].as_array().expect("history is an array");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["kind"], json!("message"));
+        assert_eq!(history[0]["role"], json!("user"));
+        assert_eq!(
+            history[0]["parts"][0]["text"],
+            json!("刷新接口未区分访问令牌")
+        );
+        assert_eq!(history[0]["messageId"], json!("g-1-goal"));
+
+        // 1.0 换了拼法：没有 `kind`，role 是 proto 枚举名。
+        let v10 = a2a_task_with_history(&row, 1).to_wire(A2aVersion::V10);
+        let history = v10["history"].as_array().expect("history is an array");
+        assert!(history[0].get("kind").is_none(), "{}", history[0]);
+        assert_eq!(history[0]["role"], json!("ROLE_USER"));
+        // 同一个任务读两次必须是同一个 messageId：对端拿它去重。
+        assert_eq!(history[0]["messageId"], v03["history"][0]["messageId"]);
+    }
+
+    /// `historyLength` 两版放在不同的位置，而认错一格**不会报错**——只会静默地
+    /// 什么都不给，正好复现要修的那件事。
+    #[test]
+    fn the_history_length_is_read_from_both_shapes() {
+        assert_eq!(
+            requested_history(&json!({"params": {"id": "g", "historyLength": 3}})),
+            3
+        );
+        assert_eq!(
+            requested_history(&json!({"params": {"message": {},
+                "configuration": {"historyLength": 2}}})),
+            2
+        );
+        assert_eq!(requested_history(&json!({"params": {"id": "g"}})), 0);
+        assert_eq!(
+            requested_history(&json!({"params": {"id": "g", "historyLength": "3"}})),
+            0,
+            "a string is not a count"
+        );
     }
 
     /// 1.0 的 `SendMessage` 回 `SendMessageResponse`，任务包在 `task` 键里；
