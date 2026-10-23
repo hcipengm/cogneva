@@ -204,13 +204,19 @@ async fn adopt_active_alerts(
     known_firing: &mut HashSet<String>,
     eval_failure_firing: &mut HashSet<String>,
 ) {
-    match store.list_active(1000).await {
+    // Ask for this watcher's own rules rather than for "the active alerts", and
+    // ask without a limit: with one, a busy table turns the answer into a
+    // sample, and a row past the cut is not adopted -- from this process it is
+    // indistinguishable from a row that does not exist, so after a restart
+    // nothing will ever close it.
+    let mut wanted: Vec<String> = config.rules.iter().map(|r| r.name.clone()).collect();
+    wanted.push(EVAL_FAILURE_RULE.to_string());
+    match store.firing_rows_for_rules(&wanted).await {
         Ok(records) => {
-            let rule_names: HashSet<&str> = config.rules.iter().map(|r| r.name.as_str()).collect();
             for record in records {
                 if record.rule == EVAL_FAILURE_RULE {
                     eval_failure_firing.insert(record.dedup_key);
-                } else if rule_names.contains(record.rule.as_str()) {
+                } else {
                     known_firing.insert(record.dedup_key);
                 }
             }
@@ -237,7 +243,10 @@ async fn retire_rules(config: &InfraWatchConfig, outlets: &InfraWatchOutlets) ->
     let Some(store) = &outlets.store else {
         return true;
     };
-    match store.list_active(1000).await {
+    // Same reason as adoption: a limited read would settle only the retired
+    // rules that happen to be in the sample, and the rest stay firing with no
+    // one left to close them.
+    match store.firing_rows_for_rules(&config.retired_rules).await {
         Ok(records) => {
             for key in retired_keys(&config.retired_rules, &records) {
                 resolve(key, outlets).await;
@@ -2627,5 +2636,119 @@ mod tests {
         // 查询失败把这一条规则的所有时钟一起清掉。
         forget_held(&rule, &mut holding);
         assert!(holding.is_empty());
+    }
+
+    /// Adopting and retiring must see every firing row of the rules they name.
+    ///
+    /// Both read through `list_active(1000)`, which orders by `fired_at DESC`
+    /// and stops. Past a thousand open rows that is a sample, and a sampled row
+    /// is indistinguishable from a row that does not exist: it is not adopted,
+    /// so after the restart nothing remembers it, and it is not settled, so it
+    /// stays `firing` with `resolved_at` empty and `last_seen_at` frozen --
+    /// exactly the reading a continuing incident produces. Nothing else in the
+    /// process knows the key, so nothing else will ever close it.
+    ///
+    /// The rows that fall out are the oldest ones, which is also what a real
+    /// table looks like: after a restart everything that was already firing is
+    /// older than whatever is firing now.
+    #[tokio::test]
+    #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+    async fn adoption_and_retirement_reach_rows_past_the_old_read_limit() {
+        use std::str::FromStr;
+
+        use sqlx::postgres::PgConnectOptions;
+        use sqlx::{Connection, PgConnection, PgPool};
+
+        let url = std::env::var("COGNEVA_TEST_DATABASE_URL")
+            .expect("set COGNEVA_TEST_DATABASE_URL to a throwaway database");
+        let schema = format!("alert_adopt_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = PgConnection::connect(&url)
+            .await
+            .expect("the throwaway database is reachable");
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&mut admin)
+            .await
+            .expect("the probe schema is created");
+        let options = PgConnectOptions::from_str(&url)
+            .expect("the test database URL parses")
+            .options([("search_path", schema.as_str())]);
+        let pool = PgPool::connect_with(options)
+            .await
+            .expect("the probe schema is reachable");
+        let store = PostgresAlertStore::new(pool.clone());
+        store
+            .init_schema()
+            .await
+            .expect("the alert DDL runs in one piece");
+
+        // 1001 rows newer than the three that matter: any reader that takes the
+        // newest N of the whole table loses exactly these.
+        sqlx::query(
+            "INSERT INTO alerts (id, rule, dedup_key, severity, state, message, labels, \
+             fired_at, updated_at, last_seen_at) \
+             SELECT 'noise-' || g, 'noise_rule', 'noise_rule:' || g, 'warning', 'firing', \
+                    'noise', '{}'::jsonb, now() - (g || ' seconds')::interval, now(), now() \
+             FROM generate_series(1, 1001) g",
+        )
+        .execute(&pool)
+        .await
+        .expect("the competing rows are written");
+        sqlx::query(
+            "INSERT INTO alerts (id, rule, dedup_key, severity, state, message, labels, \
+             fired_at, updated_at, last_seen_at) VALUES \
+             ('w-1', 'watched_rule', 'watched_rule:pod=a', 'warning', 'firing', 'm', \
+              '{}'::jsonb, now() - interval '3 days', now(), now()), \
+             ('r-1', 'retired_rule', 'retired_rule:pod=b', 'warning', 'firing', 'm', \
+              '{}'::jsonb, now() - interval '3 days', now(), now()), \
+             ('e-1', 'infra_watch_eval_failure', 'infra_watch_eval_failure:rule_a', \
+              'warning', 'firing', 'm', '{}'::jsonb, now() - interval '3 days', now(), now())",
+        )
+        .execute(&pool)
+        .await
+        .expect("the watched rows are written");
+
+        let mut config = test_config(3);
+        config.rules = vec![test_rule("watched_rule")];
+        config.retired_rules = vec!["retired_rule".to_string()];
+
+        let mut known_firing = HashSet::new();
+        let mut eval_failure_firing = HashSet::new();
+        adopt_active_alerts(&store, &config, &mut known_firing, &mut eval_failure_firing).await;
+        assert!(
+            known_firing.contains("watched_rule:pod=a"),
+            "a row older than a thousand newer ones is still this watcher's \
+             to close; skipping it leaves it firing for good"
+        );
+        assert!(
+            eval_failure_firing.contains("infra_watch_eval_failure:rule_a"),
+            "the eval-failure latch has to survive a restart the same way"
+        );
+
+        let outlets = InfraWatchOutlets {
+            store: Some(Arc::new(PostgresAlertStore::new(pool.clone()))),
+            notifier: None,
+            metrics: None,
+        };
+        assert!(
+            retire_rules(&config, &outlets).await,
+            "the retirement pass has to reach the store"
+        );
+        let resolved: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM alerts \
+             WHERE dedup_key = 'retired_rule:pod=b' AND state = 'resolved'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the retired row is read back");
+        assert_eq!(
+            resolved, 1,
+            "a retired rule's row older than the read limit would otherwise \
+             never be settled"
+        );
+
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&mut admin)
+            .await
+            .expect("the probe schema is dropped");
     }
 }

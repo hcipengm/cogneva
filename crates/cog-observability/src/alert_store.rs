@@ -438,6 +438,37 @@ impl PostgresAlertStore {
         Ok(rows.into_iter().map(row_to_record).collect())
     }
 
+    /// Every firing row whose rule is one of `rules`, with no limit.
+    ///
+    /// The loop that adopts and retires rows on startup asks the store "which
+    /// of my rules are still firing", and the answer has to be the whole
+    /// answer. `list_active` takes a limit because it feeds a panel; adopting
+    /// through it made the list a sample, and a sample is indistinguishable
+    /// from the full set: past the limit, a row that is firing reads exactly
+    /// like a row that does not exist, so it is neither adopted nor settled and
+    /// stays `firing` for good. After a restart nothing else remembers it.
+    ///
+    /// The rule list bounds the answer instead of a row count: it is as long as
+    /// the configuration, and every row a given rule can raise is in scope.
+    pub async fn firing_rows_for_rules(
+        &self,
+        rules: &[String],
+    ) -> anyhow::Result<Vec<AlertRecord>> {
+        if rules.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT id, rule, dedup_key, severity, state, message, labels, \
+             fired_at, resolved_at, updated_at, last_seen_at, \
+             acknowledged_at, acknowledged_by FROM alerts \
+             WHERE state = 'firing' AND rule = ANY($1)",
+        )
+        .bind(rules)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_record).collect())
+    }
+
     /// Full alert history (firing and resolved), newest first.
     pub async fn list_history(&self, limit: i64) -> anyhow::Result<Vec<AlertRecord>> {
         let rows = sqlx::query(

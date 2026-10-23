@@ -421,6 +421,18 @@ jobs:
         run: cargo test -p cog-observability --test alert_mirror_source -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Adoption and retirement ask the store "which of my rules still have a
+      # firing row". A read that returns the newest N rows answers that
+      # question only for rules whose rows happen to be young: a busy rule
+      # pushes an older one past the cutoff, and the caller reads the empty
+      # answer as "it recovered" -- adopting nothing after a restart, or
+      # settling a row that never closed. The test seeds a thousand newer rows
+      # so a bounded read loses the three rows under test; the rule list
+      # replaces the row count.
+      - name: Live-DB watcher adoption and retirement reach every row
+        run: cargo test -p cog-observability --lib adoption_and_retirement -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A taste submission is evidence and a claimable row at once, and both
       # faces are decided by one statement each: whether a second disposition
       # rewrites the first fate, and whether a re-sent id replaces the words
