@@ -12,6 +12,10 @@
 #      留着不划，基线就成了「这些永远免检」的许可证。
 #   3. 夹具点名的规则必须在这一库里。名字漂了（改名、拼错、删了规则）时，那一格夹具
 #      会变成永远不执行的死指针，而 promtool 那边只会报「取不到规则」——这里先拦住。
+#   4. 「点过名」不算「证明会响」：夹具里必须有至少一格断言它**响**（`exp_alerts` 非空）。
+#      只断言安静的夹具证明的是「这份数据上它没响」，一条恒假的规则同样满足——而恒假
+#      正是这一族最想抓住的形状。这样的规则留在欠账里，读数里单列成
+#      `named-but-never-fires`。
 #
 # 基线按**名字**存，不按文件：改名就是删一条加一条，两条都会红，这是对的。
 #
@@ -73,14 +77,36 @@ if not population:
 # 出现「门说覆盖了、跑者却取不到」或反过来。
 named = re.compile(r"^#\s*rule:\s*(\S+)\s*$", re.M)
 proofs = {}
+# 「被点过名」与「被证明会响」不是一件事：一份只断言安静的夹具（`exp_alerts: []`）证明的
+# 是「这条规则在这份数据上没响」，恒假规则恰好满足它。所以另记一格：夹具里有没有一处
+# `alertname: <它>` 下面跟着非空的 `exp_alerts`——这才是「会响」的那一半证据。
+firing = {}
 for path in sorted(glob.glob(os.path.join(fixtures_dir, "*.test.yaml"))):
-    for name in named.findall(open(path, encoding="utf-8").read()):
-        proofs.setdefault(name, []).append(os.path.basename(path))
+    text = open(path, encoding="utf-8").read()
+    base = os.path.basename(path)
+    for name in named.findall(text):
+        proofs.setdefault(name, []).append(base)
+    current = None
+    for line in text.splitlines():
+        hit = re.match(r"^\s*alertname:\s*(\S+)\s*$", line)
+        if hit:
+            current = hit.group(1)
+            continue
+        # 一条断言块里只认它自己那一层：出现下一个 key 就换对象。
+        if re.match(r"^\s*-\s+eval_time:", line) or re.match(r"^\s*alertname:", line):
+            current = None
+            continue
+        if current and re.match(r"^\s*-\s+exp_labels:", line):
+            firing.setdefault(current, set()).add(base)
 
 pop = set(population)
 covered = pop & set(proofs)
 uncovered = pop - set(proofs)
 stray = set(proofs) - pop
+# 点过名、但从来没被断言过「响」的规则：不算证明，留在欠账里。
+silent_only = covered - set(firing)
+uncovered |= silent_only
+covered -= silent_only
 
 baseline = set()
 if os.path.exists(baseline_path):
@@ -97,7 +123,13 @@ new_debt = uncovered - baseline
 if stock:
     for name in sorted(pop):
         who = ",".join(proofs.get(name, []))
-        print(f"{'proven' if name in covered else 'unproven'}\t{name}\t{who}")
+        if name in covered:
+            state = "proven"
+        elif name in silent_only:
+            state = "named-but-never-fires"
+        else:
+            state = "unproven"
+        print(f"{state}\t{name}\t{who}")
     print()
     for name in sorted(stray):
         print(f"stray\t{name}\t{','.join(proofs[name])}")
@@ -159,6 +191,7 @@ if fail:
 
 print(
     f"ALERT FIRING COVERAGE OK：全库 {len(pop)} 条，已证明 {len(covered)} 条，"
-    f"基线内未证明 {len(uncovered)} 条（新增零条）。"
+    f"基线内未证明 {len(uncovered)} 条（新增零条；其中 {len(silent_only)} 条被夹具点过名、"
+    "却从没被断言过响——静格不算证明）。"
 )
 PY

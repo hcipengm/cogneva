@@ -86,6 +86,25 @@ else
     bad "夹具点名不存在规则应红" "rc=1 且点到 ${proven}_typo" "$rc；$(head -3 "${work}/out" | tr '\n' ' ')"
 fi
 
+# 4b) 夹具点了名、但只断言它安静：不算证明。把该规则从基线里拿掉后必须红——
+# 「静格」证明的是这份数据上它没响，恒假的规则同样满足，而那正是这一族要抓的形状。
+mkdir -p "${work}/fx-silent"
+cp "${fixtures}"/*.test.yaml "${work}/fx-silent/" 2>/dev/null
+silent_rule="container_memory_near_limit"
+printf '# rule: %s\n\nevaluation_interval: 1m\ntests:\n  - interval: 1m\n    input_series:\n      - series: %s\n        values: "1x5"\n    alert_rule_test:\n      - eval_time: 4m\n        alertname: %s\n        exp_alerts: []\n' \
+    "$silent_rule" "$silent_rule" "$silent_rule" >"${work}/fx-silent/silent.test.yaml"
+grep -v "^${silent_rule}\$" "$baseline" >"${work}/no-silent.baseline"
+run "$config" "${work}/fx-silent" "${work}/no-silent.baseline"
+if [ "$rc" -eq 1 ] && grep -q "$silent_rule" "${work}/out"; then
+    ok "只断言安静的夹具：不算证明（恒假规则同样满足它）"
+else
+    bad "只断言安静应记成未证明" "rc=1 且点到 $silent_rule" "$rc；$(head -3 "${work}/out" | tr '\n' ' ')"
+fi
+run "$config" "${work}/fx-silent" "${work}/no-silent.baseline" --stock
+grep -q "^named-but-never-fires	${silent_rule}" "${work}/out" \
+    && ok "读数里单列 named-but-never-fires（点过名≠证明会响）" \
+    || bad "读数应把只断言安静的规则单列" "named-but-never-fires 行" "$(grep "$silent_rule" "${work}/out" | head -1)"
+
 # 5) --update-baseline 想把基线写大：必须拒绝，且基线文件不被改动。
 cp "$baseline" "${work}/grow.baseline"
 before=$(sha256sum "${work}/grow.baseline" | cut -d' ' -f1)
