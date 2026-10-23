@@ -797,6 +797,12 @@ jobs:
       # promtool 由脚本从 apt 取包解到临时目录（不安装、不动系统），拿不到则退 3。
       - name: Test acceptance census alert rules fire
         run: bash deploy/scripts/tests/acceptance-census-alert-rules.test.sh
+      # 上一步证明的是「通道能用」，不是「都用过」。进程内那一库两百多条规则里，
+      # 结构与形状门对每一条一视同仁地绿，而夹具只点过其中几条；剩下的与「没人跑过」
+      # 在读数上完全一样。这一格把覆盖做成能读的数（基线内＝欠账），并且拦住**新增**：
+      # 新写一条没有夹具的规则，这一笔就红。基线只许缩小，划掉一条＝给它写了夹具。
+      - name: Check every alert rule has been shown to fire
+        run: bash deploy/scripts/check-alert-rule-firing-coverage.sh
       # 样本日志那几条 gauge 的写者身份：容量与容量判定是每个部署自己的声明，
       # 却落在共用表里、series 键就是标签集。值取成 Pod 标签时拿到的是**应用**名，
       # 同一个镜像的每个工作负载都带着它，那道「别家不许顶这一家的声明」的闸
