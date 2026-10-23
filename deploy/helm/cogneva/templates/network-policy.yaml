@@ -127,8 +127,9 @@ spec:
           port: 53
 ---
 # 主线滚动 Job Pod（新镜像 smoke test + 门禁滚动四部署）：网络面最小化，
-# 只准访问 kube-apiserver（kubectl set image / 查 rollout 与 pod 健康）与
-# DNS，不需要数据面、网关、registry（构建与 push 都在进化 Pod 完成）。
+# 只准访问 kube-apiserver（kubectl set image / 查 rollout 与 pod 健康）、
+# 安全网关的 CI 透传端点（落地之前复问一次上游 CI）与 DNS；不需要数据面与
+# registry（构建与 push 都在进化 Pod 完成）。
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -156,6 +157,16 @@ spec:
           port: 443
         - protocol: TCP
           port: 6443
+    # 安全网关（8081）：滚动进程在**第一处写动作之前**复问一次上游 CI。没有这一条，
+    # 那次读取会被策略静默丢弃（连接超时 ⇒ 读不到 ⇒ 按放行处理），门看起来装好了却
+    # 一次都没生效——「读不到」与「没有红」在这条通道上同形。
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: security-gateway
+      ports:
+        - protocol: TCP
+          port: 8081
     - to:
         - namespaceSelector:
             matchLabels:
