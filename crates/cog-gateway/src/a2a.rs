@@ -27,13 +27,16 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::stream::Stream;
 use serde_json::{json, Value};
 
-use cog_core::{A2aTaskStatus, MessagePart, OrchestratorControl, Task, TaskArtifact, TaskStatus};
+use cog_core::{
+    A2aTask, A2aTaskStatus, A2aVersion, MessagePart, OrchestratorControl, Task, TaskArtifact,
+    TaskStatus,
+};
 
 use crate::GatewayState;
 
@@ -105,6 +108,192 @@ fn advertises(capability: &str) -> bool {
     ADVERTISED
         .iter()
         .any(|a| a.capability == capability && a.endpoint.ends_with(A2A_STREAM_METHOD))
+}
+
+// ─── 版本 ─────────────────────────────────────────────────────────────────
+//
+// 服务两版：0.3 与 1.0。
+//
+// 判据只有一条：**线上格式是这套系统里唯一不能单方面改的东西**。代码、部署、
+// 数据模型都是我们自己的，随时能改；而对面那个 agent 是别人的进程，它的解析器
+// 不会因为我们改了版本就跟着改。所以版本的选择标准不是「我们现网在跑哪版」
+// （那随时可以换），而是「按某个版本写的对端，我们能不能接得住」。
+//
+// - 1.0（最新已发布版，1.0.1 是补丁）必须服务：新对端、各语言 SDK 都照它写，
+//   不接就是把自己排除在新增的协作面之外。
+// - 0.3 必须服务：规范自己规定**空的 `A2A-Version` 按 0.3 解释**——不接它，
+//   等于把「没写版本头的对端」这一类按规范合法的请求判成错。而且 0.3 的已装
+//   客户端基数最大，两者线上形状又不是两套模型（同一份中立任务模型带两个编解码），
+//   增量成本是可控的。
+// - 0.2 及更早不服务：方法名与 part/状态编码都不同（`tasks/send` 一族），是第三
+//   套编解码；而两版名片都没有字段能宣告它们，一个 0.2 的对端连发现都发现不了。
+//   加它的触发条件是「真有一个按 `tasks/send` 打的调用方」——那会以一条具名的
+//   `-32601`（拒绝时点名我们服务的方法）出现在日志里，不是靠猜。
+// - 1.2 不存在：已发布版本止于 v1.0.1。等真发布了新的 major.minor，现有代码会
+//   用 `-32009` 点名「只说 0.3 和 1.0」把它挡住——那条拒绝就是回来加支持的信号。
+//
+// 入站按规范允许的兼容期两版的写法都收；出站只按请求头声明的版本渲染一份。
+
+/// 请求声明的协议版本：`A2A-Version` 头优先，其次查询参数，都没有（或为空）
+/// 按规范解释成 0.3。
+///
+/// 认不出的版本是**错误**，不是回落到 0.3：一个 1.2 的客户端按 1.2 的语义发请求，
+/// 拿 0.3 的答复去读，读出来的是「对端行为怪异」而不是「版本不支持」。
+fn requested_version(headers: &HeaderMap, uri: &Uri) -> Result<A2aVersion, String> {
+    let from_header = headers
+        .get("a2a-version")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty());
+    let from_query = uri.query().and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            name.eq_ignore_ascii_case("a2a-version")
+                .then(|| value.trim())
+                .filter(|value| !value.is_empty())
+        })
+    });
+    match from_header.or(from_query) {
+        None => Ok(A2aVersion::V03),
+        Some(raw) => A2aVersion::parse(raw).ok_or_else(|| {
+            format!("A2A version '{raw}' is not served; this endpoint speaks 0.3 and 1.0")
+        }),
+    }
+}
+
+// ─── 名片 ─────────────────────────────────────────────────────────────────
+
+/// 名片 `url` 的基址：**调用方刚刚够得着的那一个**，从这次请求的 `Host` 与
+/// 反代的 `X-Forwarded-Proto` 取，不是本进程的绑定地址。`0.0.0.0` 的意思是
+/// 「监听所有接口」，不是任何一个对端能拨号的目标。
+fn advertised_base(headers: &HeaderMap, port: u16) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|scheme| !scheme.is_empty())
+        .unwrap_or("http");
+    match headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+    {
+        Some(host) => format!("{scheme}://{host}"),
+        None => format!("http://0.0.0.0:{port}"),
+    }
+}
+
+/// 两版名片共用的技能表。
+fn skills() -> Value {
+    json!([
+        {
+            "id": "task_orchestration",
+            "name": "Task Orchestration",
+            "description": "DAG-based task scheduling and execution",
+            "tags": ["orchestration", "dag"],
+            "examples": ["Split this migration into stages and run them in order"],
+        },
+        {
+            "id": "multi_agent_collaboration",
+            "name": "Multi-Agent Collaboration",
+            "description": "Crew-based multi-agent problem solving",
+            "tags": ["collaboration", "crew"],
+            "examples": ["Have a crew review this design and report by concern"],
+        },
+    ])
+}
+
+/// 能力旗的线上形状。两版都是 camelCase；值仍由 [`ADVERTISED`] 推出。
+fn capabilities_wire() -> Value {
+    let caps = capabilities();
+    json!({
+        "streaming": caps.streaming,
+        "pushNotifications": caps.push_notifications,
+        "stateTransitionHistory": caps.state_transition_history,
+    })
+}
+
+/// 0.3 的名片：必填字段按 0.3 的 schema——`protocolVersion`、`defaultInputModes`、
+/// `defaultOutputModes`、`url` 都在。鉴权只用 `securitySchemes`/`security`，
+/// 不再发更早草稿的 `authentication`。
+fn card_v03(base: &str) -> Value {
+    json!({
+        "protocolVersion": "0.3",
+        "name": "cogneva",
+        "description": "Cogneva autonomous multi-agent collaboration platform",
+        "url": format!("{base}{A2A_RPC}"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "capabilities": capabilities_wire(),
+        "defaultInputModes": ["text/plain"],
+        "defaultOutputModes": ["text/plain"],
+        "skills": skills(),
+        "securitySchemes": {
+            "jwt": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"},
+        },
+        "security": [{"jwt": []}],
+    })
+}
+
+/// 1.0 的名片：没有顶层 `url`，端点挪进 `supportedInterfaces`；安全方案是
+/// 判别联合（`httpAuthSecurityScheme`）。列表里两条指向同一个地址，一条 1.0
+/// 一条 0.3——一个 1.0 的客户端因此看得出这个对端也听得懂 0.3。
+fn card_v10(base: &str) -> Value {
+    let endpoint = format!("{base}{A2A_RPC}");
+    json!({
+        "name": "cogneva",
+        "description": "Cogneva autonomous multi-agent collaboration platform",
+        "supportedInterfaces": [
+            {"url": endpoint, "protocolBinding": "JSONRPC", "protocolVersion": "1.0"},
+            {"url": endpoint, "protocolBinding": "JSONRPC", "protocolVersion": "0.3"},
+        ],
+        "version": env!("CARGO_PKG_VERSION"),
+        "capabilities": capabilities_wire(),
+        "defaultInputModes": ["text/plain"],
+        "defaultOutputModes": ["text/plain"],
+        "skills": skills(),
+        "securitySchemes": {
+            "jwt": {"httpAuthSecurityScheme": {"scheme": "Bearer", "bearerFormat": "JWT"}},
+        },
+    })
+}
+
+/// `GET /api/v1/protocol/a2a/agent-card`
+///
+/// 名片是公开的（对端的第一件事实在是「该用什么凭证」），且是只读发现文档：
+/// 短 TTL 让重复发现不必每次落到进程里重算，又短到地址或能力变更几分钟内就能
+/// 被看到。公开缓存是安全的——名片里没有任何按调用方不同的内容。
+pub async fn agent_card_handler(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let version = match requested_version(&headers, &uri) {
+        Ok(version) => version,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "version_not_supported", "message": message})),
+            )
+                .into_response();
+        }
+    };
+    let port = state
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .http_port;
+    let base = advertised_base(&headers, port);
+    let card = match version {
+        A2aVersion::V03 => card_v03(&base),
+        A2aVersion::V10 => card_v10(&base),
+    };
+    let mut response = (StatusCode::OK, Json(card)).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("public, max-age=300"),
+    );
+    response
 }
 
 // ─── 两个旋钮 ──────────────────────────────────────────────────────────────
@@ -212,13 +401,11 @@ fn a2a_state(status: TaskStatus) -> A2aTaskStatus {
 
 /// 终态：到了这里流就该收，因为这一行不会再动。
 ///
-/// 与 [`a2a_state`] 同源读同一套枚举，但这里是**判据**不是映射：新增一个线上态
-/// 而忘了在这里归类，流会永远开着——所以它对着 A2aTaskStatus 穷举，不留 `_`。
+/// 与 [`a2a_state`] 同源读同一套枚举，判定收在 `A2aTaskStatus::is_terminal` 一处：
+/// 流什么时候收、产物什么时候发、名片上的 `stateTransitionHistory` 意味着什么，
+/// 都读同一个答案；两处各判一次，迟早有一处把「完成的」读成「还在跑」。
 fn is_terminal(state: A2aTaskStatus) -> bool {
-    match state {
-        A2aTaskStatus::Completed | A2aTaskStatus::Failed | A2aTaskStatus::Canceled => true,
-        A2aTaskStatus::Submitted | A2aTaskStatus::Working | A2aTaskStatus::InputRequired => false,
-    }
+    state.is_terminal()
 }
 
 // ─── 请求解析 ─────────────────────────────────────────────────────────────
@@ -255,10 +442,15 @@ fn parse_message_stream(body: &Value) -> Result<StreamRequest, String> {
     let text = parts
         .iter()
         .filter_map(|part| {
-            // A2A 0.2 用 `kind` 标 part 类型，早期 draft 用 `type`。两个都认：
-            // 一个字段名的差异不该让一份照规范写的 message 变成「没有文本」。
+            // 文本 part 三种写法都收：0.3 是 `{"kind":"text","text":…}`，早期草稿
+            // 是 `{"type":"text",…}`，1.0 的 Part 是成员名判别的 `{"text":…}`（没有
+            // kind 字段）。一个判别字段的写法差异不该让一份照规范写的 message
+            // 变成「没有文本」。
             let is_text = part.get("kind").and_then(Value::as_str) == Some("text")
-                || part.get("type").and_then(Value::as_str) == Some("text");
+                || part.get("type").and_then(Value::as_str) == Some("text")
+                || (part.get("kind").is_none()
+                    && part.get("type").is_none()
+                    && part.get("text").is_some());
             if !is_text {
                 return None;
             }
@@ -297,6 +489,8 @@ struct StreamState {
     reader: Arc<dyn GoalReader>,
     goal_id: String,
     rpc_id: Value,
+    /// 请求声明的协议版本：帧按它渲染。
+    version: A2aVersion,
     /// 上一次发出去的线上态。与本次相同就不发——重复帧不是「更多信息」，
     /// 而是把「变了」这个信号淹掉的噪声。
     last: Option<A2aTaskStatus>,
@@ -311,44 +505,70 @@ struct StreamState {
 impl StreamState {
     /// 第一帧：整条任务快照。
     ///
-    /// 快照与后续的状态帧用 `kind` 分开，而不是靠「第一帧特殊」这个位置约定：
-    /// 位置约定在客户端重连或从中间接入时会立刻失效，字段则一直成立。
-    fn snapshot(&self, task: &Task, state: A2aTaskStatus) -> Value {
-        let mut a2a = serde_json::to_value(cog_core::A2aTask {
-            id: self.goal_id.clone(),
-            status: state,
-            messages: Vec::new(),
-            artifacts: artifacts_of(task),
-            created_at: task.created_at,
-            updated_at: task.updated_at,
-        })
-        .unwrap_or_else(|_| json!({}));
-        if let Some(obj) = a2a.as_object_mut() {
-            obj.insert("kind".into(), json!("task"));
-        }
-        jsonrpc_result(&self.rpc_id, a2a)
+    /// 快照与后续的状态帧靠**对象类型**分开（0.3 是 `kind:"task"`，1.0 是
+    /// `{"task": …}` 这层包装），而不是靠「第一帧特殊」这个位置约定：位置约定
+    /// 在客户端重连或从中间接入时会立刻失效，字段则一直成立。
+    fn snapshot(&self, task: &Task) -> Vec<Value> {
+        let body = a2a_task(task).to_wire(self.version);
+        let result = match self.version {
+            A2aVersion::V03 => body,
+            A2aVersion::V10 => json!({"task": body}),
+        };
+        vec![jsonrpc_result(&self.rpc_id, result)]
     }
 
-    /// 后续帧：状态变了才发，带 `final` 标出这是不是最后一条。
+    /// 后续帧：状态变了才发。终态时先发产物事件，再发状态帧。
     ///
-    /// `final` 与终态判定同源（[`is_terminal`]），不是各写一遍：两处各判一次，
-    /// 「流什么时候收」与「帧里说没收」迟早会不一致，而客户端信的正是帧里那个标记。
-    ///
-    /// 终态那一帧带上产物：调用方在别的进程里，读不到本平台的任务表，流是它
-    /// 唯一看得到这次运行的地方，只报「完成了」而不给结果，等于让它再猜一次
-    /// 到底做成了什么。非终态不带——那时候还没有结果，带着一个空数组只是让
-    /// 「没有产物」与「还没产出」在客户端读成同一件事。
-    fn status_update(&self, task: &Task, state: A2aTaskStatus) -> Value {
-        let mut frame = json!({
-            "kind": "status-update",
-            "id": self.goal_id,
-            "status": state,
-            "final": is_terminal(state),
-        });
-        if let Some(obj) = frame.as_object_mut().filter(|_| is_terminal(state)) {
-            obj.insert("artifacts".into(), json!(artifacts_of(task)));
+    /// 产物走规范自己的 `TaskArtifactUpdateEvent`（两版都有），不塞进状态事件：
+    /// 状态事件说的是「到哪一步了」，产物是「做成了什么」。合成一帧之后，
+    /// 「跑完了但没有产出」与「跑完并且有产出」在客户端读成同一个形状。
+    fn status_update(&self, task: &Task, state: A2aTaskStatus) -> Vec<Value> {
+        let view = a2a_task(task);
+        let mut frames = Vec::new();
+        if is_terminal(state) {
+            for artifact in &view.artifacts {
+                frames.push(jsonrpc_result(&self.rpc_id, self.artifact_frame(artifact)));
+            }
         }
-        jsonrpc_result(&self.rpc_id, frame)
+        let status = view.to_wire(self.version)["status"].clone();
+        let frame = match self.version {
+            // 0.3 的状态事件自带 `final`：客户端据此收流。1.0 取消了 `final`，
+            // 终态由状态值本身表达，所以那一版不拼这个字段。
+            A2aVersion::V03 => json!({
+                "kind": "status-update",
+                "taskId": self.goal_id,
+                "contextId": self.goal_id,
+                "status": status,
+                "final": is_terminal(state),
+            }),
+            A2aVersion::V10 => json!({
+                "statusUpdate": {
+                    "taskId": self.goal_id,
+                    "contextId": self.goal_id,
+                    "status": status,
+                }
+            }),
+        };
+        frames.push(jsonrpc_result(&self.rpc_id, frame));
+        frames
+    }
+
+    fn artifact_frame(&self, artifact: &TaskArtifact) -> Value {
+        match self.version {
+            A2aVersion::V03 => json!({
+                "kind": "artifact-update",
+                "taskId": self.goal_id,
+                "contextId": self.goal_id,
+                "artifact": artifact.to_wire(A2aVersion::V03),
+            }),
+            A2aVersion::V10 => json!({
+                "artifactUpdate": {
+                    "taskId": self.goal_id,
+                    "contextId": self.goal_id,
+                    "artifact": artifact.to_wire(A2aVersion::V10),
+                }
+            }),
+        }
     }
 }
 
@@ -373,38 +593,45 @@ fn artifacts_of(task: &Task) -> Vec<TaskArtifact> {
     let mut artifacts = Vec::new();
     if let Some(result) = task.result.as_ref() {
         artifacts.push(TaskArtifact {
-            name: "result".into(),
+            artifact_id: "result".into(),
+            name: Some("result".into()),
+            description: Some("the run's output".into()),
             parts: vec![MessagePart::Text {
                 text: result.to_string(),
             }],
-            index: artifacts.len() as u32,
         });
     }
     if let Some(error) = task.error.as_ref() {
         artifacts.push(TaskArtifact {
-            name: "error".into(),
+            artifact_id: "error".into(),
+            name: Some("error".into()),
+            description: Some("why the run did not produce a result".into()),
             parts: vec![MessagePart::Text {
                 text: error.clone(),
             }],
-            index: artifacts.len() as u32,
         });
     }
     artifacts
 }
 
-/// 一行任务在 A2A 线上的样子。
+/// 一行任务在 A2A 线上、版本无关的样子。
 ///
-/// 与流里第一帧的快照同源（同一套状态映射、同一份产物），差别只在流那侧要额外
-/// 打一个 `kind` 标记。两处若各写一遍，「流里看到的结果」与「`tasks/get` 拿到的
-/// 结果」就会各自漂——而它们说的是同一行。
-fn a2a_task(task: &Task) -> cog_core::A2aTask {
-    cog_core::A2aTask {
+/// 与流里第一帧的快照同源（同一套状态映射、同一份产物、同一句状态说明），差别只在
+/// 流那侧要额外包一层事件。两处若各写一遍，「流里看到的结果」与「`tasks/get` 拿到
+/// 的结果」就会各自漂——而它们说的是同一行。
+fn a2a_task(task: &Task) -> A2aTask {
+    A2aTask {
         id: task.id.clone(),
+        // 一条 message 建一个任务，没有跨任务会话：上下文就是任务自己。
+        context_id: task.id.clone(),
         status: a2a_state(task.status),
-        messages: Vec::new(),
-        artifacts: artifacts_of(task),
-        created_at: task.created_at,
+        // 行上的 `error` 在活着的行上不是失败原因，是编排器写的推进笔记
+        // （排队太久、放回队列）。把它放进 `status.message` 是如实的——它在
+        // 说「现在怎么着了」；失败由 `state` 说，产物里另有一件。
+        status_message: task.error.clone(),
         updated_at: task.updated_at,
+        artifacts: artifacts_of(task),
+        history: Vec::new(),
     }
 }
 
@@ -448,14 +675,22 @@ fn goal_stream(state: StreamState) -> impl Stream<Item = Result<Bytes, std::io::
                 s.seen_row = true;
                 let state = a2a_state(task.status);
                 if s.last != Some(state) {
-                    let frame = if s.last.is_none() {
-                        s.snapshot(&task, state)
+                    let frames = if s.last.is_none() {
+                        s.snapshot(&task)
                     } else {
                         s.status_update(&task, state)
                     };
                     s.last = Some(state);
                     s.done = is_terminal(state);
-                    return Some((Ok(sse_frame(&frame)), s));
+                    // 一次推进可能产出多帧（终态是「产物事件 + 状态事件」）：
+                    // 逐帧交给客户端，但整组作为一个 stream item 返回，因为
+                    // 它们描述的是同一次观测，拆开就要在两次 poll 之间重新
+                    // 读一遍库、可能读到同一个状态发两轮。
+                    let body = frames
+                        .iter()
+                        .map(|frame| String::from_utf8_lossy(&sse_frame(frame)).into_owned())
+                        .collect::<String>();
+                    return Some((Ok(Bytes::from(body)), s));
                 }
             }
             tokio::time::sleep(s.interval).await;
@@ -472,7 +707,32 @@ fn goal_stream(state: StreamState) -> impl Stream<Item = Result<Bytes, std::io::
 /// 到的中间态全丢了。
 pub async fn message_stream_handler(
     State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    uri: Uri,
     Json(body): Json<Value>,
+) -> Response {
+    let version = match requested_version(&headers, &uri) {
+        Ok(version) => version,
+        Err(message) => {
+            // 请求都没解释成我们服务的某一版，就不该按某一版的形状回帧：
+            // 报一条 JSON-RPC 的版本错，对端按错误码就能分辨「版本不对」与
+            // 「请求写错了」，而回一份 0.3 形状的流只会让它误读。
+            let rpc_id = body.get("id").cloned().unwrap_or(Value::Null);
+            return (StatusCode::OK, Json(rpc_error(&rpc_id, -32009, message))).into_response();
+        }
+    };
+    message_stream_for(state, body, version).await
+}
+
+/// 版本已经定下来之后的流式受理。
+///
+/// 与 handler 分两截，是因为同一个方法有两个入口：名片上的统一地址（按
+/// `method` 分派）和旗子指名的 `/message/stream` 路径。版本只在入口取一次，
+/// 两条入口共用同一段受理逻辑，版本渲染不会各写一遍。
+async fn message_stream_for(
+    state: Arc<GatewayState>,
+    body: Value,
+    version: A2aVersion,
 ) -> Response {
     let request = match parse_message_stream(&body) {
         Ok(request) => request,
@@ -524,6 +784,7 @@ pub async fn message_stream_handler(
         reader: Arc::new(state.orchestrator.clone()),
         goal_id,
         rpc_id: request.rpc_id,
+        version,
         last: None,
         seen_row: false,
         done: false,
@@ -569,17 +830,76 @@ fn rpc_error(rpc_id: &Value, code: i64, message: impl Into<String>) -> Value {
     })
 }
 
+/// A2A 定义了、但这个平台不提供的方法。
+///
+/// 这些名字回 `-32004 UnsupportedOperation`，而不是和拼错的字符串一起回
+/// `-32601 MethodNotFound`：对端要知道的差别是「你的规范我认，这个能力我没有」
+/// 还是「你写的这个方法名不存在」。压成同一个码，一份照规范写了推送配置的
+/// 客户端会去翻自己的拼写，而它拼得没错。
+fn defined_but_unsupported(method: &str) -> bool {
+    matches!(
+        method,
+        // 0.3 名字
+        "tasks/resubscribe"
+            | "tasks/pushNotificationConfig/set"
+            | "tasks/pushNotificationConfig/get"
+            | "tasks/pushNotificationConfig/list"
+            | "tasks/pushNotificationConfig/delete"
+            | "agent/getAuthenticatedExtendedCard"
+            | "agent/authenticatedExtendedCard"
+            // 1.0 名字
+            | "SubscribeToTask"
+            | "ListTasks"
+            | "CreateTaskPushNotificationConfig"
+            | "GetTaskPushNotificationConfig"
+            | "ListTaskPushNotificationConfigs"
+            | "DeleteTaskPushNotificationConfig"
+            | "GetExtendedAgentCard"
+    )
+}
+
 /// `POST /api/v1/protocol/a2a` —— 名片上那个地址，按 `method` 分派。
+///
+/// 方法名两版都收（0.3 的 `message/send` 与 1.0 的 `SendMessage`），因为它们
+/// 指的同一次调用；版本只决定**回执按哪一版的形状渲染**。入站宽、出站严：
+/// 一份 0.3 客户端不会因为服务端也认得 PascalCase 而受害，而一份 1.0 客户端
+/// 拿到 0.3 形状的回执会解析失败。
 pub async fn rpc_handler(
     State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    uri: Uri,
     Json(body): Json<Value>,
 ) -> Response {
     let rpc_id = body.get("id").cloned().unwrap_or(Value::Null);
+    let version = match requested_version(&headers, &uri) {
+        Ok(version) => version,
+        Err(message) => {
+            return (StatusCode::OK, Json(rpc_error(&rpc_id, -32009, message))).into_response()
+        }
+    };
     match body.get("method").and_then(Value::as_str) {
-        Some("message/send") => rpc_message_send(&state, &body, &rpc_id).await,
-        Some("message/stream") => message_stream_handler(State(state), Json(body)).await,
-        Some("tasks/get") => rpc_tasks_get(&state, &body, &rpc_id).await,
-        Some("tasks/cancel") => rpc_tasks_cancel(&state, &body, &rpc_id).await,
+        Some("message/send") | Some("SendMessage") => {
+            rpc_message_send(&state, &body, &rpc_id, version).await
+        }
+        Some("message/stream") | Some("SendStreamingMessage") => {
+            message_stream_for(state, body, version).await
+        }
+        Some("tasks/get") | Some("GetTask") => rpc_tasks_get(&state, &body, &rpc_id, version).await,
+        Some("tasks/cancel") | Some("CancelTask") => {
+            rpc_tasks_cancel(&state, &body, &rpc_id, version).await
+        }
+        Some(method) if defined_but_unsupported(method) => (
+            StatusCode::OK,
+            Json(rpc_error(
+                &rpc_id,
+                -32004,
+                format!(
+                    "'{method}' is defined by A2A but not served here; this endpoint \
+                     serves message/send, message/stream, tasks/get and tasks/cancel"
+                ),
+            )),
+        )
+            .into_response(),
         other => (
             StatusCode::OK,
             Json(rpc_error(
@@ -593,6 +913,20 @@ pub async fn rpc_handler(
             )),
         )
             .into_response(),
+    }
+}
+
+/// 1.0 的 `SendMessage` 回 `SendMessageResponse`，它是 `{task}|{message}` 的
+/// oneof：ProtoJSON 把 oneof 渲染成「成员名 → 值」。0.3 的 `message/send` 直接
+/// 回 Task 本身。这层包装只差一个键，但少了它，1.0 的客户端解出来的是一份没有
+/// `task` 字段的响应——和「服务端回了个它不认识的类型」同形。
+///
+/// 只有这一条方法有这个包装：1.0 的 `GetTask`/`CancelTask` 直接回 `Task`。
+fn send_message_result(version: A2aVersion, task: &A2aTask) -> Value {
+    let body = task.to_wire(version);
+    match version {
+        A2aVersion::V03 => body,
+        A2aVersion::V10 => json!({"task": body}),
     }
 }
 
@@ -646,7 +980,18 @@ fn accepted(goal_id: &str, submitted: cog_core::SFResult<Vec<String>>) -> Result
 /// 这条路今天的代价是延迟跟着分解走。若哪天分解慢到不可接受，改法不是把等待
 /// 删掉（那会退回「先答应、再失败」），而是把受理拆成两步：先落行、再由分解
 /// 写结论，并让这一行在分解完成前读作 `submitted`。
-async fn rpc_message_send(state: &Arc<GatewayState>, body: &Value, rpc_id: &Value) -> Response {
+///
+/// **1.0 的 `SendMessage` 还有一层**：那一版规定不带 `configuration.returnImmediately`
+/// 时默认**阻塞**到任务进入终态或被打断（`INPUT_REQUIRED`/`AUTH_REQUIRED`）。这不是
+/// 可选的风格差异，是同一份请求在两版里承诺不同的东西：0.3 的 `message/send` 回的是
+/// 「受理了」，1.0 回的是「跑完了」。按 0.3 的样子回给 1.0 的对端，它会拿一个
+/// `submitted` 当最终答复收工——比报错更糟，因为它不报错。
+async fn rpc_message_send(
+    state: &Arc<GatewayState>,
+    body: &Value,
+    rpc_id: &Value,
+    version: A2aVersion,
+) -> Response {
     let request = match parse_message_stream(body) {
         Ok(request) => request,
         Err(message) => {
@@ -672,18 +1017,89 @@ async fn rpc_message_send(state: &Arc<GatewayState>, body: &Value, rpc_id: &Valu
     };
     tracing::info!(goal_id = %goal_id, "a2a message/send goal accepted");
 
+    let row = if blocks_until_done(body, version) {
+        wait_until_done(&orchestrator, &goal_id, &row).await
+    } else {
+        row
+    };
+
     (
         StatusCode::OK,
-        Json(jsonrpc_result(rpc_id, json!(a2a_task(&row)))),
+        Json(jsonrpc_result(
+            rpc_id,
+            send_message_result(version, &a2a_task(&row)),
+        )),
     )
         .into_response()
+}
+
+/// 这一次 `SendMessage` 要不要阻塞到任务结束。
+///
+/// 只看 1.0：0.3 没有 `configuration.returnImmediately` 这个字段，它的
+/// `message/send` 语义就是先回受理。缺省值是 `false`（阻塞）——规范把
+/// 「不回就等」定为默认，读成「默认不等」会让对端以为拿到的是结果。
+fn blocks_until_done(body: &Value, version: A2aVersion) -> bool {
+    if version != A2aVersion::V10 {
+        return false;
+    }
+    !body
+        .get("params")
+        .and_then(|params| params.get("configuration"))
+        .and_then(|config| config.get("returnImmediately"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// 等到这一行进入终态（或被打断），等不到就回当前这一行。
+///
+/// 上限与流用同一个旋钮：两者承载的是同一类长任务，给两套上限只会让「流挂得住、
+/// 阻塞请求挂不住」这种差别出现在没有理由的地方。到点仍没结束不是错误——回一行
+/// 仍在跑的、带 id 的任务，对端可以接着 `tasks/get`；比回一个「超时」错误有用，
+/// 因为那会把「还在跑」说成「失败了」。
+async fn wait_until_done(
+    orchestrator: &Arc<dyn OrchestratorControl>,
+    goal_id: &str,
+    first: &Task,
+) -> Task {
+    let deadline = tokio::time::Instant::now() + max_stream();
+    let mut current = first.clone();
+    // 停止点是「终态，或被打断」：规范把 `INPUT_REQUIRED`/`AUTH_REQUIRED` 也算作
+    // 「可以回来了」。本平台今天没有产出这两档的来源，写在这里是为了让判据跟着
+    // 规范走——哪天接上问人/Auth 的流程，这一行不用回来改。
+    let stopped = |state: A2aTaskStatus| {
+        state.is_terminal()
+            || matches!(
+                state,
+                A2aTaskStatus::InputRequired | A2aTaskStatus::AuthRequired
+            )
+    };
+    while !stopped(a2a_state(current.status)) {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                goal_id,
+                "a blocking SendMessage hit its wait ceiling; answering with the row as it stands"
+            );
+            return current;
+        }
+        tokio::time::sleep(poll_interval()).await;
+        match orchestrator.get_task(goal_id).await {
+            Some(row) => current = row,
+            None => return current,
+        }
+    }
+    current
 }
 
 /// `tasks/get`：按 id 读一行，带上它已有的结果与失败原因。
 ///
 /// 这也是不流式的对端拿结果的唯一一条路——`message/send` 回的是受理那一刻的
 /// 样子，而结果是在之后写进这一行的。产物与流里终态帧同源（[`artifacts_of`]）。
-async fn rpc_tasks_get(state: &Arc<GatewayState>, body: &Value, rpc_id: &Value) -> Response {
+async fn rpc_tasks_get(
+    state: &Arc<GatewayState>,
+    body: &Value,
+    rpc_id: &Value,
+    version: A2aVersion,
+) -> Response {
     let Some(task_id) = rpc_task_id(body) else {
         return (
             StatusCode::OK,
@@ -695,7 +1111,7 @@ async fn rpc_tasks_get(state: &Arc<GatewayState>, body: &Value, rpc_id: &Value) 
     match state.orchestrator.get_task(task_id).await {
         Some(task) => (
             StatusCode::OK,
-            Json(jsonrpc_result(rpc_id, json!(a2a_task(&task)))),
+            Json(jsonrpc_result(rpc_id, a2a_task(&task).to_wire(version))),
         )
             .into_response(),
         None => (
@@ -715,7 +1131,12 @@ async fn rpc_tasks_get(state: &Arc<GatewayState>, body: &Value, rpc_id: &Value) 
 /// 返回的是**停完之后**的行，不是「已受理」：取消在这个平台上是同步做的
 /// （cascade 的 id 也随这次调用返回），所以对端拿到 `canceled` 就能收尾，
 /// 不必再问一次 `tasks/get` 猜它停没停。
-async fn rpc_tasks_cancel(state: &Arc<GatewayState>, body: &Value, rpc_id: &Value) -> Response {
+async fn rpc_tasks_cancel(
+    state: &Arc<GatewayState>,
+    body: &Value,
+    rpc_id: &Value,
+    version: A2aVersion,
+) -> Response {
     let Some(task_id) = rpc_task_id(body) else {
         return (
             StatusCode::OK,
@@ -738,7 +1159,7 @@ async fn rpc_tasks_cancel(state: &Arc<GatewayState>, body: &Value, rpc_id: &Valu
             match state.orchestrator.get_task(task_id).await {
                 Some(task) => (
                     StatusCode::OK,
-                    Json(jsonrpc_result(rpc_id, json!(a2a_task(&task)))),
+                    Json(jsonrpc_result(rpc_id, a2a_task(&task).to_wire(version))),
                 )
                     .into_response(),
                 None => (
@@ -767,6 +1188,7 @@ async fn rpc_tasks_cancel(state: &Arc<GatewayState>, body: &Value, rpc_id: &Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
     use futures::StreamExt;
     use std::sync::Mutex;
 
@@ -827,6 +1249,7 @@ mod tests {
             reader,
             goal_id: "g-1".into(),
             rpc_id: json!(7),
+            version: A2aVersion::V03,
             last: None,
             seen_row: false,
             done: false,
@@ -835,13 +1258,30 @@ mod tests {
         }
     }
 
-    fn parse_frame(bytes: &Bytes) -> Value {
+    /// 一次 stream item 里的**全部** JSON-RPC 消息。
+    ///
+    /// 一组帧是「同一次观测」的产物（终态是产物事件＋状态事件），所以按组返回：
+    /// 只读第一帧的辅助函数会让「终态那帧带产物」这件事看起来成立，实际读到的是
+    /// 产物帧，状态帧被扔掉。
+    fn parse_frames(bytes: &Bytes) -> Vec<Value> {
         let text = std::str::from_utf8(bytes).expect("an SSE frame is UTF-8");
-        let line = text
-            .lines()
-            .find_map(|l| l.strip_prefix("data: "))
-            .expect("every frame carries a data line");
-        serde_json::from_str(line).expect("the data line is a JSON-RPC message")
+        text.split("\n\n")
+            .filter(|chunk| !chunk.trim().is_empty())
+            .map(|chunk| {
+                let line = chunk
+                    .lines()
+                    .find_map(|l| l.strip_prefix("data: "))
+                    .expect("every frame carries a data line");
+                serde_json::from_str(line).expect("the data line is a JSON-RPC message")
+            })
+            .collect()
+    }
+
+    fn parse_frame(bytes: &Bytes) -> Value {
+        parse_frames(bytes)
+            .into_iter()
+            .next()
+            .expect("at least one frame")
     }
 
     /// 名片上每一杆旗，都得是表里那一行算出来的；指名的端点必须是那张 A2A 方法。
@@ -941,12 +1381,14 @@ mod tests {
         let first = parse_frame(&stream.next().await.expect("a frame").expect("a frame"));
         assert_eq!(first["id"], json!(7), "the frame carries the request's id");
         assert_eq!(first["result"]["kind"], json!("task"));
-        assert_eq!(first["result"]["status"], json!("submitted"));
+        assert_eq!(first["result"]["status"]["state"], json!("submitted"));
         assert_eq!(first["result"]["id"], json!("g-1"));
 
         let second = parse_frame(&stream.next().await.expect("a frame").expect("a frame"));
         assert_eq!(second["result"]["kind"], json!("status-update"));
-        assert_eq!(second["result"]["status"], json!("working"));
+        assert_eq!(second["result"]["taskId"], json!("g-1"));
+        assert_eq!(second["result"]["contextId"], json!("g-1"));
+        assert_eq!(second["result"]["status"]["state"], json!("working"));
         assert_eq!(
             second["result"]["final"],
             json!(false),
@@ -955,7 +1397,7 @@ mod tests {
 
         let third = parse_frame(&stream.next().await.expect("a frame").expect("a frame"));
         assert_eq!(
-            third["result"]["status"],
+            third["result"]["status"]["state"],
             json!("completed"),
             "the repeat of running produced no frame of its own"
         );
@@ -1017,24 +1459,35 @@ mod tests {
         );
 
         let second = parse_frame(&stream.next().await.expect("a frame").expect("a frame"));
-        assert_eq!(second["result"]["status"], json!("working"));
+        assert_eq!(second["result"]["status"]["state"], json!("working"));
         assert!(
             second["result"].get("artifacts").is_none(),
             "a status update before the end does not carry an artifact list: {second}"
         );
 
-        let third = parse_frame(&stream.next().await.expect("a frame").expect("a frame"));
-        assert_eq!(third["result"]["status"], json!("completed"));
+        // 终态那一组：产物事件在前，状态事件在后。
+        let group = parse_frames(&stream.next().await.expect("a frame").expect("a frame"));
         assert_eq!(
-            third["result"]["artifacts"][0]["name"],
+            group.len(),
+            2,
+            "the terminal observation is an artifact frame plus a status frame: {group:?}"
+        );
+        assert_eq!(group[0]["result"]["kind"], json!("artifact-update"));
+        assert_eq!(group[0]["result"]["taskId"], json!("g-1"));
+        assert_eq!(
+            group[0]["result"]["artifact"]["name"],
             json!("result"),
-            "the outcome travels in an artifact named as such: {third}"
+            "the outcome travels in an artifact named as such: {:?}",
+            group[0]
         );
         assert_eq!(
-            third["result"]["artifacts"][0]["parts"][0]["text"],
+            group[0]["result"]["artifact"]["parts"][0]["text"],
             json!("{\"answer\":42}"),
             "the artifact carries the task's own result rather than a rendering of it"
         );
+        assert_eq!(group[1]["result"]["kind"], json!("status-update"));
+        assert_eq!(group[1]["result"]["status"]["state"], json!("completed"));
+        assert_eq!(group[1]["result"]["final"], json!(true));
     }
 
     /// 一行既没有结果也没有错误时，产物是空的——不是一件空产物。
@@ -1066,8 +1519,8 @@ mod tests {
 
         row.status = TaskStatus::Failed;
         assert_eq!(
-            artifacts_of(&row)[0].name,
-            "error",
+            artifacts_of(&row)[0].name.as_deref(),
+            Some("error"),
             "once the row is terminal the same note is the failure reason"
         );
     }
@@ -1086,17 +1539,19 @@ mod tests {
         let mut stream = Box::pin(goal_stream(state_of(reader)));
 
         let _running = parse_frame(&stream.next().await.expect("a frame").expect("a frame"));
-        let failed = parse_frame(&stream.next().await.expect("a frame").expect("a frame"));
-        assert_eq!(failed["result"]["status"], json!("failed"));
+        let group = parse_frames(&stream.next().await.expect("a frame").expect("a frame"));
+        assert_eq!(group.len(), 2, "{group:?}");
         assert_eq!(
-            failed["result"]["artifacts"][0]["name"],
+            group[0]["result"]["artifact"]["name"],
             json!("error"),
-            "a failure names itself instead of borrowing the result's artifact: {failed}"
+            "a failure names itself instead of borrowing the result's artifact: {:?}",
+            group[0]
         );
         assert_eq!(
-            failed["result"]["artifacts"][0]["parts"][0]["text"],
+            group[0]["result"]["artifact"]["parts"][0]["text"],
             json!("upstream refused the request")
         );
+        assert_eq!(group[1]["result"]["status"]["state"], json!("failed"));
     }
 
     /// 受理只认图回执里那一个 id。
@@ -1208,6 +1663,124 @@ mod tests {
             row.status,
             TaskStatus::Running,
             "the answer is the row read back from the store, not the copy we offered"
+        );
+    }
+
+    // ─── 版本 ─────────────────────────────────────────────────────────────
+
+    fn negotiation() -> (HeaderMap, Uri) {
+        let headers = HeaderMap::new();
+        let uri: Uri = "/api/v1/protocol/a2a".parse().expect("a valid path");
+        (headers, uri)
+    }
+
+    /// 空/缺省的版本按 0.3 解释，认不出的版本是错误而不是回落。
+    ///
+    /// 回落看着「更宽容」，实际是把一份按 1.2 语义写的请求用 0.3 的形状回过去：
+    /// 对端读到的会是「这个对端行为怪异」，而不是「它不说我这个版本」。
+    #[test]
+    fn an_absent_version_means_0_3_and_an_unknown_one_is_refused() {
+        let (mut headers, uri) = negotiation();
+        assert_eq!(requested_version(&headers, &uri), Ok(A2aVersion::V03));
+
+        headers.insert("a2a-version", HeaderValue::from_static("  "));
+        assert_eq!(
+            requested_version(&headers, &uri),
+            Ok(A2aVersion::V03),
+            "an empty header is the same as no header"
+        );
+
+        headers.insert("a2a-version", HeaderValue::from_static("1.0"));
+        assert_eq!(requested_version(&headers, &uri), Ok(A2aVersion::V10));
+        headers.insert("a2a-version", HeaderValue::from_static("0.3"));
+        assert_eq!(requested_version(&headers, &uri), Ok(A2aVersion::V03));
+
+        for raw in ["0.1", "1.2", "latest"] {
+            headers.insert("a2a-version", HeaderValue::from_str(raw).unwrap());
+            let refused = requested_version(&headers, &uri)
+                .expect_err("an unserved version is refused, not rounded down");
+            assert!(
+                refused.contains("0.3") && refused.contains("1.0"),
+                "{refused}"
+            );
+        }
+    }
+
+    /// 查询参数是版本的第二入口（规范允许），且头优先。
+    #[test]
+    fn the_query_parameter_declares_the_version_and_the_header_wins() {
+        let (mut headers, _) = negotiation();
+        let uri: Uri = "/api/v1/protocol/a2a?a2a-version=1.0".parse().unwrap();
+        assert_eq!(requested_version(&headers, &uri), Ok(A2aVersion::V10));
+
+        headers.insert("a2a-version", HeaderValue::from_static("0.3"));
+        assert_eq!(
+            requested_version(&headers, &uri),
+            Ok(A2aVersion::V03),
+            "the header is the declared version; the query is the fallback"
+        );
+    }
+
+    /// 1.0 的帧形状：快照包在 `{"task": …}` 里，状态事件叫 `statusUpdate`，
+    /// 没有 `final` 字段，状态值是 `TASK_STATE_*`。
+    ///
+    /// 这三处与 0.3 各不相同，而且**都不是可选的**：少一层包装、多一个 `final`、
+    /// 或者用 0.3 的小写状态值，1.0 的客户端都会解析失败或读错状态。
+    #[tokio::test]
+    async fn a_1_0_stream_renders_the_oneof_wrappers_and_the_enum_spellings() {
+        let reader = ScriptedReader::with_outcome(
+            vec![Some(TaskStatus::Running), Some(TaskStatus::Completed)],
+            Some(json!({"answer": 42})),
+            None,
+        );
+        let mut state = state_of(reader);
+        state.version = A2aVersion::V10;
+        let mut stream = Box::pin(goal_stream(state));
+
+        let first = parse_frame(&stream.next().await.expect("a frame").expect("a frame"));
+        assert_eq!(
+            first["result"]["task"]["status"]["state"],
+            json!("TASK_STATE_WORKING")
+        );
+        assert!(
+            first["result"].get("kind").is_none(),
+            "1.0 has no `kind` discriminator: {first}"
+        );
+        assert_eq!(first["result"]["task"]["id"], json!("g-1"));
+
+        let group = parse_frames(&stream.next().await.expect("a frame").expect("a frame"));
+        assert_eq!(group.len(), 2, "{group:?}");
+        assert_eq!(
+            group[0]["result"]["artifactUpdate"]["artifact"]["parts"][0]["text"],
+            json!("{\"answer\":42}")
+        );
+        assert_eq!(
+            group[1]["result"]["statusUpdate"]["status"]["state"],
+            json!("TASK_STATE_COMPLETED")
+        );
+        assert!(
+            group[1]["result"]["statusUpdate"].get("final").is_none(),
+            "1.0 dropped `final`: the terminal state itself ends the stream: {:?}",
+            group[1]
+        );
+        assert!(stream.next().await.is_none(), "the stream still ends");
+    }
+
+    /// 1.0 的 `SendMessage` 回 `SendMessageResponse`，任务包在 `task` 键里；
+    /// 0.3 直接回任务本身。
+    #[test]
+    fn send_message_wraps_the_task_only_in_1_0() {
+        let row = Task::goal_row(String::from("g-1"), "a goal");
+        let task = a2a_task(&row);
+        let v03 = send_message_result(A2aVersion::V03, &task);
+        assert_eq!(v03["id"], json!("g-1"));
+        assert!(v03.get("task").is_none());
+
+        let v10 = send_message_result(A2aVersion::V10, &task);
+        assert_eq!(v10["task"]["id"], json!("g-1"));
+        assert_eq!(
+            v10["task"]["status"]["state"],
+            json!("TASK_STATE_SUBMITTED")
         );
     }
 

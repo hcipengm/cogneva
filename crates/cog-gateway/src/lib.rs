@@ -2,7 +2,7 @@
 //! principle: feedback_a_snapshot_of_an_edge_may_not_shadow_a_refreshed_condition_row
 use axum::{
     extract::{MatchedPath, Path, Query, Request, State, WebSocketUpgrade},
-    http::{header, HeaderMap, Method, StatusCode},
+    http::{header, Method, StatusCode},
     middleware::{from_fn, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -501,7 +501,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         // 真正会动的 `message/stream` 与 RPC 仍留在 operator 组里按名片声明拒绝。
         .route(
             "/api/v1/protocol/a2a/agent-card",
-            get(a2a_agent_card_handler),
+            get(a2a::agent_card_handler),
         )
         .route("/ws", get(ws_handler))
         .route("/api/v1/evolution/stream", get(evolution::stream_handler))
@@ -3122,85 +3122,6 @@ async fn mcp_tool_call_handler(
         )
             .into_response(),
     }
-}
-
-/// 名片上该报的对外地址。
-///
-/// 对端拿这张名片就是为了照上面的 `url` 打回来，所以这个地址必须是**它刚刚够得着
-/// 的那个**：直接从这次请求的 `Host` 与反代的 `X-Forwarded-Proto` 取，而不是报本
-/// 进程的绑定地址——`0.0.0.0` 是「监听所有接口」，不是任何一个对端能拨号的目标，
-/// 报它等于把一张写着「从这里找我」的名片指到没有门牌的地方。
-///
-/// 两个头都没有时退回到绑定地址：那是本机直连（或者探针）的场景，`Host` 由客户端
-/// 自己填，缺了就说明这次请求没有给出够得着的地址，只能报一个诚实的兜底。
-fn advertised_base(headers: &HeaderMap, port: u16) -> String {
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|scheme| !scheme.is_empty())
-        .unwrap_or("http");
-    match headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|host| !host.is_empty())
-    {
-        Some(host) => format!("{scheme}://{host}"),
-        None => format!("http://0.0.0.0:{port}"),
-    }
-}
-
-async fn a2a_agent_card_handler(
-    State(state): State<Arc<GatewayState>>,
-    headers: HeaderMap,
-) -> Response {
-    // Expose cogneva's own Agent Card
-    let port = state
-        .config
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .http_port;
-    let card = cog_core::AgentCard {
-        name: "cogneva".into(),
-        description: "Cogneva autonomous multi-agent collaboration platform".into(),
-        // 名片上的 `url` 是对端真正会打的那一个地址，所以它带着端点路径：
-        // 报一个根地址，对端按 A2A 惯例把 `message/send` 发过去，撞上的是路由表
-        // 里不存在的一条路径。
-        url: format!("{}{}", advertised_base(&headers, port), a2a::A2A_RPC),
-        version: env!("CARGO_PKG_VERSION").into(),
-        // 旗子不在这里写死：它由本模块真正服务的那张端点推出（见 `a2a::capabilities`）。
-        capabilities: a2a::capabilities(),
-        skills: vec![
-            cog_core::AgentSkill {
-                id: "task_orchestration".into(),
-                name: "Task Orchestration".into(),
-                description: "DAG-based task scheduling and execution".into(),
-                tags: vec!["orchestration".into(), "dag".into()],
-                examples: vec![],
-            },
-            cog_core::AgentSkill {
-                id: "multi_agent_collaboration".into(),
-                name: "Multi-Agent Collaboration".into(),
-                description: "Crew-based multi-agent problem solving".into(),
-                tags: vec!["collaboration".into(), "crew".into()],
-                examples: vec![],
-            },
-        ],
-        authentication: cog_core::AgentAuthentication {
-            schemes: vec!["jwt".into()],
-            credentials: None,
-        },
-    };
-    let mut response = (StatusCode::OK, Json(json!(card))).into_response();
-    // 名片是只读的发现文档，对端会周期性重拉：短 TTL 让重复发现不必每次落到进程里
-    // 重算，又短到地址或能力变更几分钟内就能被看到。公开缓存是安全的——名片里没有
-    // 任何按调用方不同的内容，鉴权发生在它指名的业务端点上。
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("public, max-age=300"),
-    );
-    response
 }
 
 #[cfg(test)]

@@ -170,7 +170,7 @@ async fn a_peer_that_does_not_stream_can_send_and_then_read_the_outcome() {
         "a completed run carries exactly one artifact: {:?}",
         done.artifacts
     );
-    assert_eq!(done.artifacts[0].name, "result");
+    assert_eq!(done.artifacts[0].name.as_deref(), Some("result"));
     let text = done.artifacts[0]
         .parts
         .first()
@@ -310,6 +310,84 @@ async fn the_card_answers_a_peer_that_has_no_credential_yet() {
     );
 }
 
+/// Two versions are served, and the card says which one the caller asked for.
+///
+/// A 1.0 card has no top-level `url`: endpoints live in `supportedInterfaces`,
+/// and listing both versions there is how a 1.0 peer learns it can also fall
+/// back to 0.3. A version nobody serves is refused by name instead of being
+/// rounded down to the default -- a 1.2 client must not read a 0.3 answer as
+/// "this peer behaves oddly".
+#[tokio::test]
+async fn the_card_answers_in_the_version_the_caller_asked_for() {
+    let state = router_state::stateless();
+    let app = create_router(state);
+
+    let ask = |version: Option<&'static str>| {
+        let app = app.clone();
+        async move {
+            let mut builder = Request::builder()
+                .method("GET")
+                .uri("/api/v1/protocol/a2a/agent-card")
+                .header("Host", "cogneva.example");
+            if let Some(version) = version {
+                builder = builder.header("A2A-Version", version);
+            }
+            let response = app
+                .oneshot(builder.body(Body::empty()).expect("well formed"))
+                .await
+                .expect("the router answers");
+            let status = response.status().as_u16();
+            let bytes = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("the body comes back");
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            )
+        }
+    };
+
+    let (status, default_card) = ask(None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        default_card["protocolVersion"], "0.3",
+        "an absent version header is 0.3 by the specification's own default"
+    );
+    assert_eq!(
+        default_card["url"],
+        "http://cogneva.example/api/v1/protocol/a2a"
+    );
+
+    let (status, v10_card) = ask(Some("1.0")).await;
+    assert_eq!(status, 200);
+    assert!(
+        v10_card.get("url").is_none(),
+        "1.0 moved the endpoint into supportedInterfaces: {v10_card}"
+    );
+    let interfaces = v10_card["supportedInterfaces"]
+        .as_array()
+        .expect("a 1.0 card lists its interfaces");
+    let versions: Vec<&str> = interfaces
+        .iter()
+        .filter_map(|i| i["protocolVersion"].as_str())
+        .collect();
+    assert!(
+        versions.contains(&"1.0") && versions.contains(&"0.3"),
+        "a 1.0 peer has to see that 0.3 is served too: {versions:?}"
+    );
+
+    let (status, refusal) = ask(Some("1.2")).await;
+    assert_eq!(
+        status, 400,
+        "an unserved version is refused, not rounded down"
+    );
+    let said = refusal["message"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("0.3") && said.contains("1.0"),
+        "the refusal names the versions that are served: {said}"
+    );
+}
+
 /// One HTTP round trip to the endpoint, returning the JSON body. Used where the
 /// test has to send something the client would refuse to build.
 async fn post(app: &axum::Router, token: &str, body: serde_json::Value) -> serde_json::Value {
@@ -347,7 +425,11 @@ async fn the_endpoint_names_what_it_will_not_do() {
         json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/resubscribe", "params": {"id": "t-1"}}),
     )
     .await;
-    assert_eq!(unknown["error"]["code"], -32601);
+    assert_eq!(
+        unknown["error"]["code"], -32004,
+        "a method A2A defines but this platform does not serve is UnsupportedOperation, \
+         not MethodNotFound -- the peer's spelling is right, the capability is absent"
+    );
     let said = unknown["error"]["message"]
         .as_str()
         .expect("the refusal carries a message");
@@ -441,7 +523,7 @@ async fn a_peer_can_stop_a_task_it_started() {
     )
     .await;
     assert_eq!(
-        cancelled["result"]["status"], "canceled",
+        cancelled["result"]["status"]["state"], "canceled",
         "the answer is the row after the stop: {cancelled}"
     );
 
