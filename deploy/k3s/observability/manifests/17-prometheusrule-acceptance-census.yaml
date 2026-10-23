@@ -13,6 +13,10 @@
 # 第三条判的是年龄，不是 `time()` 减观测时刻：那条算法只能在真 Prometheus 里验，
 # 规则单测里的 `time()` 是真实钟，夹具写不出「已经停了 40 分钟」，测试会在半小时后
 # 自己变红。年龄由生产者按自己的钟算好发布，夹具就能钉住。
+#
+# 三条都带 `cogneva_io_managed`（抄进 `alerts` 表）与 `cogneva_io_face`（响了归哪个面）。
+# 面是规则自己的性质，随告警行流进 `alerts.labels`；「面 → 人」那一跳不在这里，由读的人
+# 在面主表上 join——面主换人时不该有任何一条规则需要改。
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -36,6 +40,7 @@ spec:
           for: 15m
           labels:
             cogneva_io_managed: "true"
+            cogneva_io_face: "落地≠生效"
             severity: warning
           annotations:
             summary: "有 {{ $value }} 条验收项的规格与它自己的判据不符（verdict=stale）"
@@ -52,6 +57,7 @@ spec:
           for: 5m
           labels:
             cogneva_io_managed: "true"
+            cogneva_io_face: "落地≠生效"
             severity: warning
           annotations:
             summary: "验收普查的读数整条不见了：这一面此刻没有任何判据在跑"
@@ -67,6 +73,7 @@ spec:
           for: 10m
           labels:
             cogneva_io_managed: "true"
+            cogneva_io_face: "落地≠生效"
             severity: warning
           annotations:
             summary: "验收普查最后一趟在 {{ $value | humanizeDuration }} 以前，读数不再更新"

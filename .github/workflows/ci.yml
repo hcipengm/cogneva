@@ -769,6 +769,15 @@ jobs:
       # 连接键集），判不动的计数上报，不折进绿里。
       - name: Check alert rules declare the many side of a join
         run: bash deploy/scripts/check-alert-rule-join-shape.sh
+      # 告警链五环里前四环（读数、产出者、消费者、判据）都有机器可读的答案，第五环
+      # 「归谁」没有：2026-10-23 实测表里正 firing 十一行、ack 全空、最老一行开了
+      # 5550 分钟，而写者每半分钟还在推进 last_seen_at——不是没人抄，是没人看，而
+      # 「该谁看」在系统里根本没有答案。缺的那一跳是「规则 → 面」，它是规则自己的
+      # 性质（和它的表达式同级），所以随规则走：带 cogneva_io_managed 的规则必须同时
+      # 申报 cogneva_io_face，标签随告警行流进 alerts.labels，读的人才答得出该叫谁。
+      # 「面 → 人」那一跳不在这里：面主换人时不该有任何一条规则需要改。
+      - name: Check every delivered alert rule declares its face
+        run: bash deploy/scripts/check-alert-rule-faces.sh
       # 提前期不是规则里该写死的数，是策略输入：清理一次要多久，随盘、随负载、随人变。
       # 写进规则之后它就无法被看见地漂——规则照常响或照常不响,没人知道那个「七天」
       # 代表哪一次的判断。所以读 runway 家族的规则(`_days_to_` / `_headroom_` /

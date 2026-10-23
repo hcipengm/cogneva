@@ -38,6 +38,7 @@ tests:
           - exp_labels:
               severity: warning
               cogneva_io_managed: "true"
+              cogneva_io_face: "可观测与告警"
 
   # 二、负对照：`unapplied` 一直是 0（其余序列再热闹也不关它的事）⇒ 全程不许响。
   # 没有这一格，把界写成 `>= 0` 也能过上面那一格。
@@ -67,6 +68,7 @@ tests:
           - exp_labels:
               severity: warning
               cogneva_io_managed: "true"
+              cogneva_io_face: "可观测与告警"
 
   # 四、抄漏了：缺口在第 10 拍才出现，`for: 15m` ⇒ 25m 才该亮；20m 时是 pending，不许响。
   # 「先 0 后 2」而不是「从头就是 2」：从头为真测不到 `for:` 真的在等。
@@ -84,6 +86,7 @@ tests:
           - exp_labels:
               severity: warning
               cogneva_io_managed: "true"
+              cogneva_io_face: "可观测与告警"
       # 同一份输入下另外三条不许跟着响：一个缺口不说明配置没生效，也不说明清单没上集群。
       - eval_time: 30m
         alertname: CognevaAlertMirrorUnapplied
@@ -107,6 +110,7 @@ tests:
           - exp_labels:
               severity: warning
               cogneva_io_managed: "true"
+              cogneva_io_face: "可观测与告警"
 
   # 六、账本不是全集：上游规则在响、选择器看不见它。`for: 1h` ⇒ 55m 还不许响，65m 必须响。
   # 这一格与「抄漏了」的差别只在读数上（`unmirrored` 对 `missing`），在规则形状上一样，
@@ -127,6 +131,7 @@ tests:
           - exp_labels:
               severity: warning
               cogneva_io_managed: "true"
+              cogneva_io_face: "可观测与告警"
       # 全集读得到的时候，读不到那一格不许跟着响。
       - eval_time: 65m
         alertname: CognevaAlertMirrorUnmirroredUnreadable
@@ -150,6 +155,7 @@ tests:
           - exp_labels:
               severity: warning
               cogneva_io_managed: "true"
+              cogneva_io_face: "可观测与告警"
       # 反过来：读不到那一格亮了，并不等于「有未镜像的告警」。
       - eval_time: 20m
         alertname: CognevaAlertMirrorUnmirrored
