@@ -424,8 +424,8 @@ SELECT (SELECT count(*) FROM holder) AS holders, \
          WHERE l.state NOT IN ('landed', 'retired') \
            AND (SELECT count(DISTINCT entry->>'block') \
                   FROM jsonb_array_elements(l.sources) AS entry \
-                 WHERE entry->>'block' IN ('token', 'resources', 'principles', \
-                                           'change', 'persistence', 'communication')) > 1) \
+                 WHERE entry->>'block' IS NOT NULL \
+                   AND entry->>'block' <> 'none') > 1) \
            AS block_conflicts";
 
 /// The owed set and the landed set, grouped by the face the documents named.

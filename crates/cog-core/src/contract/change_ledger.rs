@@ -358,24 +358,43 @@ pub enum ChangeBlock {
     /// No document that asks for this change named a face.
     #[default]
     None,
+    Tasks,
     Token,
     Resources,
     Principles,
     Change,
     Persistence,
     Communication,
+    Security,
+    Install,
+    Observability,
+    Ci,
+    Delivery,
 }
 
 impl ChangeBlock {
     /// Every block, in the order a reading prints them.
-    pub const ALL: [ChangeBlock; 7] = [
+    ///
+    /// The names are the twelve faces the programme is organised into, not the
+    /// five cross-cutting lines that run across them: a change is filed under
+    /// one face, and a line that cuts across all of them is a second question
+    /// about the same row rather than a thirteenth answer to this one. Filing a
+    /// row under `leak` or `e2e` would mean the row has to be counted twice to
+    /// stay visible under its own face.
+    pub const ALL: [ChangeBlock; 13] = [
         ChangeBlock::None,
+        ChangeBlock::Tasks,
         ChangeBlock::Token,
         ChangeBlock::Resources,
         ChangeBlock::Principles,
         ChangeBlock::Change,
         ChangeBlock::Persistence,
         ChangeBlock::Communication,
+        ChangeBlock::Security,
+        ChangeBlock::Install,
+        ChangeBlock::Observability,
+        ChangeBlock::Ci,
+        ChangeBlock::Delivery,
     ];
 
     /// The literal stored in the account, and the one a reading prints.
@@ -386,12 +405,18 @@ impl ChangeBlock {
     pub fn as_str(self) -> &'static str {
         match self {
             ChangeBlock::None => "none",
+            ChangeBlock::Tasks => "tasks",
             ChangeBlock::Token => "token",
             ChangeBlock::Resources => "resources",
             ChangeBlock::Principles => "principles",
             ChangeBlock::Change => "change",
             ChangeBlock::Persistence => "persistence",
             ChangeBlock::Communication => "communication",
+            ChangeBlock::Security => "security",
+            ChangeBlock::Install => "install",
+            ChangeBlock::Observability => "observability",
+            ChangeBlock::Ci => "ci",
+            ChangeBlock::Delivery => "delivery",
         }
     }
 
@@ -411,12 +436,18 @@ impl std::str::FromStr for ChangeBlock {
         // a declaration that spells the face the way the owner does is not a
         // mistake to refuse.
         let canonical = match s {
+            "tasks" | "任务" | "任务管理" => "tasks",
             "token" | "token管理" => "token",
             "resources" | "资源" | "资源管理" => "resources",
             "principles" | "原则" | "原则管理" => "principles",
             "change" | "变更" | "变更管理" => "change",
             "persistence" | "持久化" | "持久化存储" => "persistence",
             "communication" | "通信" | "通信管理" => "communication",
+            "security" | "安全" | "安全与凭证" => "security",
+            "install" | "安装" | "安装/升级/回滚" => "install",
+            "observability" | "可观测" | "可观测与告警" => "observability",
+            "ci" | "CI" | "CI/构建/部署" => "ci",
+            "delivery" | "交付" | "商用交付" => "delivery",
             "none" | "" | "-" => "none",
             other => other,
         };
@@ -1833,9 +1864,27 @@ mod tests {
             "持久化存储".parse::<ChangeBlock>(),
             Ok(ChangeBlock::Persistence)
         );
+        assert_eq!("任务管理".parse::<ChangeBlock>(), Ok(ChangeBlock::Tasks));
+        assert_eq!(
+            "安全与凭证".parse::<ChangeBlock>(),
+            Ok(ChangeBlock::Security)
+        );
+        assert_eq!(
+            "安装/升级/回滚".parse::<ChangeBlock>(),
+            Ok(ChangeBlock::Install)
+        );
+        assert_eq!(
+            "可观测与告警".parse::<ChangeBlock>(),
+            Ok(ChangeBlock::Observability)
+        );
+        assert_eq!("CI/构建/部署".parse::<ChangeBlock>(), Ok(ChangeBlock::Ci));
+        assert_eq!("商用交付".parse::<ChangeBlock>(), Ok(ChangeBlock::Delivery));
         assert_eq!("".parse::<ChangeBlock>(), Ok(ChangeBlock::None));
         assert!("everything".parse::<ChangeBlock>().is_err());
-        assert_eq!(ChangeBlock::ALL.len(), 7);
+        // The cross-cutting lines are not faces: a row is filed under one face,
+        // and a lens over all of them cannot be the value of a single column.
+        assert!("端到端演练".parse::<ChangeBlock>().is_err());
+        assert_eq!(ChangeBlock::ALL.len(), 13);
         assert!(!ChangeBlock::None.is_named());
     }
 
