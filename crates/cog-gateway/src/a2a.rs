@@ -822,6 +822,168 @@ fn a2a_task_with_history(task: &Task, wanted: usize) -> A2aTask {
     view
 }
 
+// ─── `ListTasks`：翻一页对端建过的任务 ────────────────────────────────────
+
+/// 一页默认几条、最多几条。两数出自规范对 `page_size` 的说明：不写就按 50，
+/// 值域 1..=100。
+const LIST_PAGE_DEFAULT: usize = 50;
+const LIST_PAGE_MAX: usize = 100;
+
+/// `ListTasks` 的过滤与分页条件（解析之后的样子）。
+///
+/// 解析与取页分成两半，是因为这一半全是判断：哪个值是过滤、哪个值是分页、
+/// 认不出的值报不报错、写错一格的代价是「多一条」还是「一条都没有」。这半截
+/// 没有库、没有状态，能单独钉住；另一半只剩「读全量、渲染」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListQuery {
+    context_id: Option<String>,
+    status: Option<A2aTaskStatus>,
+    page_size: usize,
+    offset: usize,
+    history: usize,
+    include_artifacts: bool,
+    updated_after: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// 取一格可选的字符串。
+///
+/// 写了但不是字符串（`"status": 5`）要报错，不能当成「没写」：当成没写，这个
+/// 过滤就静默地不生效，对端拿到的是全部任务——它读不出「我的过滤被丢了」，
+/// 只会读出「这些任务都符合条件」。
+fn optional_str<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.as_str())),
+        Some(other) => Err(format!("{key} takes a string, not {other}")),
+    }
+}
+
+fn parse_list_query(body: &Value) -> Result<ListQuery, String> {
+    let params = body.get("params").cloned().unwrap_or_else(|| json!({}));
+
+    let page_size = match params.get("pageSize") {
+        None | Some(Value::Null) => LIST_PAGE_DEFAULT,
+        Some(value) => match value.as_i64() {
+            Some(n) if n >= 1 => (n as usize).min(LIST_PAGE_MAX),
+            Some(n) => return Err(format!("pageSize is at least 1, not {n}")),
+            None => return Err(format!("pageSize takes an integer, not {value}")),
+        },
+    };
+
+    // 空串不是错：那正是我们自己写在 `nextPageToken` 里表示「没有下一页」的值，
+    // 对端把它原样带回来时应当读成第一页。
+    let offset = match optional_str(&params, "pageToken")? {
+        None | Some("") => 0,
+        Some(token) => token.parse::<usize>().map_err(|_| {
+            format!("pageToken '{token}' was not issued by this endpoint: it is the decimal offset a previous page ended after")
+        })?,
+    };
+
+    let status = match optional_str(&params, "status")? {
+        None | Some("") => None,
+        Some(raw) => {
+            let parsed = A2aTaskStatus::parse(raw);
+            // `parse` 认不出的值退成 `Unknown`，而 `Unknown` 自己也是合法的线上值
+            // （`unknown` / `TASK_STATE_UNSPECIFIED`）。所以判「认不认得」不看它落
+            // 在哪个变体上，看这个值能不能原样拼回来：能，它就是规范里的一个状态。
+            if parsed.wire(A2aVersion::V03) == raw || parsed.wire(A2aVersion::V10) == raw {
+                Some(parsed)
+            } else {
+                return Err(format!(
+                    "'{raw}' is not a task state; use one of {} / {}",
+                    A2aTaskStatus::Submitted.wire(A2aVersion::V03),
+                    A2aTaskStatus::Completed.wire(A2aVersion::V03),
+                ));
+            }
+        }
+    };
+
+    let updated_after = match optional_str(&params, "statusTimestampAfter")? {
+        None | Some("") => None,
+        Some(raw) => Some(
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map_err(|e| format!("statusTimestampAfter is not an RFC 3339 instant: {e}"))?
+                .with_timezone(&chrono::Utc),
+        ),
+    };
+
+    let include_artifacts = match params.get("includeArtifacts") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(other) => return Err(format!("includeArtifacts takes a boolean, not {other}")),
+    };
+
+    Ok(ListQuery {
+        // 本平台一条 message 建一个任务，没有跨任务会话：上下文就是任务自己。
+        // 所以按 `contextId` 过滤就是按 id 过滤，不另立一张会话表。
+        context_id: optional_str(&params, "contextId")?
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
+        status,
+        page_size,
+        offset,
+        history: requested_history(body),
+        include_artifacts,
+        updated_after,
+    })
+}
+
+/// 按条件筛一遍、排定、切一页，回（这一页，下一页游标，筛完的总数）。
+///
+/// 顺序是契约的一部分：游标是一个位次，位次每次读都不同就翻不了页。新→旧，
+/// 同一时刻按 id 兜底——两行同一毫秒更新时不能互相换位，否则第二页会重复
+/// 或漏掉其中一行。
+///
+/// 位次是**偏移量**而不是「上一页最后一条的 id」：偏移量对同一批行稳定，
+/// 而跨页期间有人提交了新任务时，新行落在队头会把后面整体推后一格，翻页
+/// 可能重复一行——读端拿 `id` 去重，这是分页游标的固有代价，不是缺陷；
+/// 换成 id 游标在同一场景下则可能**漏掉**一行，漏比重复更难发现。
+fn list_page(tasks: Vec<Task>, query: &ListQuery) -> (Vec<Task>, String, usize) {
+    let mut matched: Vec<Task> = tasks
+        .into_iter()
+        // 只列承载行：A2A 的任务就是一次被委派的工作，分解出来的 DAG 是实现
+        // 细节。`tasks/get` 读得到子任务，是为了排障，不是它们也成了对端建的
+        // 任务——列出来会让对端看见一堆它从没发过的 id。
+        .filter(Task::is_goal_row)
+        .filter(|task| {
+            query
+                .context_id
+                .as_deref()
+                .is_none_or(|want| task.id == want)
+        })
+        .filter(|task| {
+            query
+                .status
+                .is_none_or(|want| a2a_state(task.status) == want)
+        })
+        .filter(|task| {
+            query
+                .updated_after
+                .is_none_or(|after| task.updated_at >= after)
+        })
+        .collect();
+
+    matched.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let total = matched.len();
+    let start = query.offset.min(total);
+    let page: Vec<Task> = matched
+        .into_iter()
+        .skip(start)
+        .take(query.page_size)
+        .collect();
+    let next = if start + page.len() < total {
+        (start + page.len()).to_string()
+    } else {
+        String::new()
+    };
+    (page, next, total)
+}
+
 /// 把一条 goal 的推进做成 SSE 帧序列。
 ///
 /// 形状是 `unfold` 而不是通道 + 后台任务：帧的产生只依赖「读一行、比对上一次」，
@@ -1041,8 +1203,7 @@ fn goal_stream_response(
 ///
 /// 一次拒答本身不解决问题，但它得让对端知道该改用什么——所以两条拒答（不认识的
 /// 方法、认识但没做的方法）读同一个常量：手抄两份，加一条方法时只会更新其中一份。
-const SERVED_METHODS: &str =
-    "this endpoint serves message/send, message/stream, tasks/get, tasks/cancel and tasks/resubscribe";
+const SERVED_METHODS: &str = "this endpoint serves message/send, message/stream, tasks/get, tasks/cancel, tasks/resubscribe and ListTasks";
 
 /// 一帧 JSON-RPC 错误。
 ///
@@ -1074,7 +1235,6 @@ fn defined_but_unsupported(method: &str) -> bool {
             | "agent/getAuthenticatedExtendedCard"
             | "agent/authenticatedExtendedCard"
             // 1.0 名字
-            | "ListTasks"
             | "CreateTaskPushNotificationConfig"
             | "GetTaskPushNotificationConfig"
             | "ListTaskPushNotificationConfigs"
@@ -1116,6 +1276,7 @@ pub async fn rpc_handler(
         Some("tasks/resubscribe") | Some("SubscribeToTask") => {
             rpc_tasks_resubscribe(&state, &body, &rpc_id, version).await
         }
+        Some("ListTasks") => rpc_list_tasks(&state, &body, &rpc_id, version).await,
         Some(method) if defined_but_unsupported(method) => (
             StatusCode::OK,
             Json(rpc_error(
@@ -1387,6 +1548,64 @@ async fn rpc_tasks_get(
         )
             .into_response(),
     }
+}
+
+/// `ListTasks`（1.0）：翻一页对端能看见的任务。
+///
+/// 没有这条方法时，对端对它建过的任务只有一个视野：`message/send` 当时回给它的
+/// 那些 id。进程重启一次，这个视野就整个消失——任务还在跑、结果还读得回来，
+/// 但已经没有那条路。`tasks/get` 答的是「我知道 id」，这条答的是「我不知道」，
+/// 两者不是同一件事，前者替代不了后者。
+///
+/// `includeArtifacts` 缺省**不带产物**（规范如此，为的是压住整页的体积）；要
+/// 结果的对端要么在请求里写 `true`，要么拿 id 去 `tasks/get`。
+async fn rpc_list_tasks(
+    state: &Arc<GatewayState>,
+    body: &Value,
+    rpc_id: &Value,
+    version: A2aVersion,
+) -> Response {
+    let query = match parse_list_query(body) {
+        Ok(query) => query,
+        Err(message) => {
+            return (StatusCode::OK, Json(rpc_error(rpc_id, -32602, message))).into_response()
+        }
+    };
+
+    let (page, next, total) = list_page(state.orchestrator.get_all_tasks().await, &query);
+    let tasks: Vec<Value> = page
+        .iter()
+        .map(|task| {
+            let mut view = a2a_task_with_history(task, query.history);
+            if !query.include_artifacts {
+                view.artifacts.clear();
+            }
+            view.to_wire(version)
+        })
+        .collect();
+    tracing::debug!(
+        offset = query.offset,
+        returned = tasks.len(),
+        total,
+        "a2a ListTasks"
+    );
+    (
+        StatusCode::OK,
+        Json(jsonrpc_result(
+            rpc_id,
+            json!({
+                "tasks": tasks,
+                // 空串＝没有下一页，不是「再来取一次」。用回同一个词是因为
+                // 规范把它定义成「空即到底」，对端读的是这个约定。
+                "nextPageToken": next,
+                "pageSize": query.page_size,
+                // 分页之前的总数：对端据此知道还有多远，而不是靠一页一页
+                // 试到底。
+                "totalSize": total,
+            }),
+        )),
+    )
+        .into_response()
 }
 
 /// `tasks/resubscribe`（0.3）／`SubscribeToTask`（1.0）：接回一条正在跑的任务。
@@ -2170,6 +2389,137 @@ mod tests {
             v10["task"]["status"]["state"],
             json!("TASK_STATE_SUBMITTED")
         );
+    }
+
+    /// 一条 goal 承载行，时间与状态由用例给定。
+    fn goal_row_at(id: &str, status: TaskStatus, minutes: i64) -> Task {
+        let mut row = Task::goal_row(String::from(id), "a goal");
+        row.status = status;
+        row.updated_at = chrono::DateTime::parse_from_rfc3339("2026-10-23T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            + chrono::Duration::minutes(minutes);
+        row
+    }
+
+    /// 一条分解出来的子任务：不是承载行，列任务时不该出现。
+    fn sub_task(id: &str, minutes: i64) -> Task {
+        let mut row = Task::new(
+            String::from(id),
+            cog_core::TaskType::Planner,
+            json!({"description": "a step"}),
+        );
+        row.goal_id = Some(String::from("g-1"));
+        row.is_executable = true;
+        row.updated_at = chrono::DateTime::parse_from_rfc3339("2026-10-23T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            + chrono::Duration::minutes(minutes);
+        row
+    }
+
+    /// 一页按新→旧取、只取承载行，游标接着上一页结束的位置。
+    /// 判据：把 `.filter(Task::is_goal_row)` 摘掉，这条会因为多出一条子任务而红。
+    #[test]
+    fn a_page_lists_the_goal_rows_newest_first_and_the_cursor_continues_where_it_stopped() {
+        let tasks = vec![
+            goal_row_at("g-old", TaskStatus::Completed, 0),
+            sub_task("sub-1", 5),
+            goal_row_at("g-new", TaskStatus::Running, 10),
+            goal_row_at("g-mid", TaskStatus::Pending, 5),
+        ];
+
+        let first = parse_list_query(&json!({"params": {"pageSize": 2}})).expect("plain query");
+        let (page, next, total) = list_page(tasks.clone(), &first);
+        assert_eq!(
+            page.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["g-new", "g-mid"],
+            "newest first, and the decomposition step is not a task the peer created"
+        );
+        assert_eq!(total, 3);
+        assert_eq!(next, "2");
+
+        let second = parse_list_query(&json!({"params": {"pageSize": 2, "pageToken": next}}))
+            .expect("the token we just issued");
+        let (page, next, total) = list_page(tasks, &second);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "g-old");
+        assert_eq!(next, "", "the last page says there is no next one");
+        assert_eq!(total, 3, "the total counts the whole filter, not the page");
+    }
+
+    /// 过滤是过滤，写错的东西要报错，不能静默变成「没有过滤」。
+    /// 判据：把 `status: 5` 当成「没写」那条分支改回去，这条会红。
+    #[test]
+    fn a_filter_is_either_applied_or_refused_never_silently_dropped() {
+        let by_state = parse_list_query(&json!({"params": {"status": "TASK_STATE_WORKING"}}))
+            .expect("1.0 spelling");
+        assert_eq!(by_state.status, Some(A2aTaskStatus::Working));
+        let by_state_v03 =
+            parse_list_query(&json!({"params": {"status": "working"}})).expect("0.3 spelling");
+        assert_eq!(by_state_v03.status, Some(A2aTaskStatus::Working));
+
+        for (params, expected) in [
+            (json!({"status": 5}), "takes a string"),
+            (json!({"status": "busy"}), "is not a task state"),
+            (json!({"pageSize": 0}), "at least 1"),
+            (json!({"pageSize": "many"}), "takes an integer"),
+            (json!({"pageToken": "abc"}), "was not issued"),
+            (json!({"includeArtifacts": "yes"}), "takes a boolean"),
+            (json!({"statusTimestampAfter": "yesterday"}), "RFC 3339"),
+        ] {
+            let error = parse_list_query(&json!({"params": params}))
+                .expect_err("a malformed filter is refused, not ignored");
+            assert!(error.contains(expected), "{params}: {error}");
+        }
+
+        let clamped = parse_list_query(&json!({"params": {"pageSize": 500}})).expect("too many");
+        assert_eq!(clamped.page_size, LIST_PAGE_MAX);
+        let defaulted = parse_list_query(&json!({"params": {}})).expect("nothing asked");
+        assert_eq!(defaulted.page_size, LIST_PAGE_DEFAULT);
+        assert!(!defaulted.include_artifacts, "the spec defaults to false");
+    }
+
+    /// 状态、上下文、时间三个过滤各管各的；空 `pageToken` 是「第一页」。
+    #[test]
+    fn the_state_context_and_time_filters_each_narrow_the_page() {
+        let tasks = vec![
+            goal_row_at("g-1", TaskStatus::Completed, 0),
+            goal_row_at("g-2", TaskStatus::Running, 5),
+            goal_row_at("g-3", TaskStatus::Failed, 10),
+        ];
+
+        let running = parse_list_query(&json!({"params": {"status": "TASK_STATE_WORKING"}}))
+            .expect("a state filter");
+        let (page, _, total) = list_page(tasks.clone(), &running);
+        assert_eq!(
+            page.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["g-2"]
+        );
+        assert_eq!(total, 1);
+
+        let one_context =
+            parse_list_query(&json!({"params": {"contextId": "g-3"}})).expect("a context filter");
+        let (page, _, _) = list_page(tasks.clone(), &one_context);
+        assert_eq!(
+            page.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["g-3"]
+        );
+
+        let recent =
+            parse_list_query(&json!({"params": {"statusTimestampAfter": "2026-10-23T10:05:00Z"}}))
+                .expect("a time filter");
+        let (page, _, total) = list_page(tasks, &recent);
+        assert_eq!(total, 2, "the boundary is inclusive");
+        assert_eq!(
+            page.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["g-3", "g-2"],
+            "the task updated exactly at the boundary is in, the older one is out"
+        );
+
+        let echoed_empty_token =
+            parse_list_query(&json!({"params": {"pageToken": ""}})).expect("our own empty token");
+        assert_eq!(echoed_empty_token.offset, 0);
     }
 
     #[tokio::test]

@@ -599,6 +599,16 @@ impl Task {
         task
     }
 
+    /// 这一行是不是一次目标提交的承载行（[`Self::goal_row`] 造出来的那种）。
+    ///
+    /// 判据只有一处，因为标记本身只在这里：让读面各自去比 `Custom("goal")`，
+    /// 就是把同一个私有字面量抄进别的 crate，改名时只会改到其中一份，而认错的
+    /// 后果是「列出任务时多出一堆分解出来的子任务」或「一行都列不出来」——两种
+    /// 都不会报错。
+    pub fn is_goal_row(&self) -> bool {
+        matches!(&self.task_type, TaskType::Custom(kind) if kind == GOAL_ROW_TASK_TYPE)
+    }
+
     /// 进入 Running 的唯一入口：开始时刻与租约一起落定。
     ///
     /// 两者必须同时写，因为回收判据读的是租约而状态机给的是 Running，任何一处

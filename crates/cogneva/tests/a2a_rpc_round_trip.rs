@@ -1125,6 +1125,161 @@ async fn a_peer_that_reconnects_can_resubscribe_to_the_task_it_holds() {
         .contains("no task 'no-such-task'"));
 }
 
+#[tokio::test]
+async fn a_peer_that_lost_its_ids_can_list_the_tasks_it_created() {
+    let state = router_state::stateless();
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "a2a-rpc-list").await;
+    let client =
+        A2aClient::new(Arc::new(InProcess { app: app.clone() })).with_bearer(token.clone());
+
+    // Two goals, then the sending side disappears: what is left is the platform
+    // and a peer that remembers no ids.
+    let mut sent = Vec::new();
+    for goal in ["probe list one", "probe list two"] {
+        let accepted = client
+            .send_message(ENDPOINT, goal)
+            .await
+            .expect("the endpoint accepts a message");
+        read_until_present(&client, &accepted.id).await;
+        sent.push(accepted.id);
+    }
+
+    let all = post_version(
+        &app,
+        &token,
+        "1.0",
+        json!({"jsonrpc": "2.0", "id": 1, "method": "ListTasks",
+               "params": {"pageSize": 100}}),
+    )
+    .await;
+    let tasks = all["result"]["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("ListTasks answers a page: {all}"));
+    for id in &sent {
+        assert!(
+            tasks.iter().any(|task| task["id"] == json!(id)),
+            "the page holds a task the peer created but can no longer name: {all}"
+        );
+    }
+    assert_eq!(
+        all["result"]["totalSize"],
+        json!(tasks.len()),
+        "a page big enough to hold everything says the whole size: {all}"
+    );
+    assert!(
+        tasks[0]["artifacts"].as_array().is_none_or(Vec::is_empty),
+        "the spec's default is to leave artifacts out: {all}"
+    );
+
+    // One result per page, and the cursor walks the same order the first page
+    // named: paging is not a re-sort.
+    let mut seen: Vec<String> = Vec::new();
+    let mut token_from_page = String::new();
+    loop {
+        let mut params = json!({"pageSize": 1});
+        if !token_from_page.is_empty() {
+            params["pageToken"] = json!(token_from_page);
+        }
+        let page = post_version(
+            &app,
+            &token,
+            "1.0",
+            json!({"jsonrpc": "2.0", "id": 2, "method": "ListTasks", "params": params}),
+        )
+        .await;
+        let rows = page["result"]["tasks"]
+            .as_array()
+            .unwrap_or_else(|| panic!("every page is a page: {page}"));
+        assert!(rows.len() <= 1, "pageSize is a cap: {page}");
+        for row in rows {
+            seen.push(row["id"].as_str().expect("a task has an id").to_string());
+        }
+        token_from_page = page["result"]["nextPageToken"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if seen.len() > 32 {
+            panic!("the cursor never reaches the end: {seen:?}");
+        }
+        if token_from_page.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        seen,
+        tasks
+            .iter()
+            .map(|task| task["id"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>(),
+        "walking the cursor visits the same rows in the same order as one big page"
+    );
+
+    // Filters narrow; a filter nobody can satisfy reads as an empty page, not
+    // as an error, because an empty answer is a legitimate answer.
+    let working = post_version(
+        &app,
+        &token,
+        "1.0",
+        json!({"jsonrpc": "2.0", "id": 3, "method": "ListTasks",
+               "params": {"status": "TASK_STATE_WORKING"}}),
+    )
+    .await;
+    assert_eq!(working["result"]["totalSize"], json!(0), "{working}");
+
+    let one_context = post_version(
+        &app,
+        &token,
+        "1.0",
+        json!({"jsonrpc": "2.0", "id": 4, "method": "ListTasks",
+               "params": {"contextId": sent[0]}}),
+    )
+    .await;
+    assert_eq!(
+        one_context["result"]["totalSize"],
+        json!(1),
+        "a context is one task on this platform: {one_context}"
+    );
+    assert_eq!(one_context["result"]["tasks"][0]["id"], json!(sent[0]));
+
+    // A value the endpoint does not understand is refused by name: silently
+    // dropping it would answer "all of them" to a peer that asked for a subset.
+    let misspelled = post_version(
+        &app,
+        &token,
+        "1.0",
+        json!({"jsonrpc": "2.0", "id": 5, "method": "ListTasks",
+               "params": {"status": "busy"}}),
+    )
+    .await;
+    assert_eq!(misspelled["error"]["code"], -32602, "{misspelled}");
+    let bad_cursor = post_version(
+        &app,
+        &token,
+        "1.0",
+        json!({"jsonrpc": "2.0", "id": 6, "method": "ListTasks",
+               "params": {"pageToken": "cursor-token"}}),
+    )
+    .await;
+    assert_eq!(bad_cursor["error"]["code"], -32602, "{bad_cursor}");
+
+    // The same rows are rendered in the version the caller speaks: 0.3 spells
+    // states in lowercase, and its peers get that spelling even though only 1.0
+    // defines this method.
+    let v03 = post(
+        &app,
+        &token,
+        json!({"jsonrpc": "2.0", "id": 7, "method": "ListTasks",
+               "params": {"contextId": sent[1]}}),
+    )
+    .await;
+    assert_eq!(
+        v03["result"]["tasks"][0]["status"]["state"],
+        json!("submitted"),
+        "a 0.3 caller reads the 0.3 state spelling: {v03}"
+    );
+}
+
 /// One HTTP round trip that declares the protocol version with the header the
 /// endpoint reads, returning the JSON-RPC body.
 async fn post_version(
