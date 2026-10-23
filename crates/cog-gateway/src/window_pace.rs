@@ -54,8 +54,9 @@ impl MeasuredWindow {
     ///
     /// Windows repeat from the instant the previous one was spent, because that
     /// is the only boundary this measurement knows. A clock earlier than the
-    /// burn reads the burn itself: the arithmetic must not wrap backwards into
-    /// a window start in the future.
+    /// burn reads the burn itself: `elapsed` is clamped at zero rather than
+    /// divided while still negative, which would put the start after `now_unix`
+    /// -- an allowance for a window that has not begun.
     pub fn window_start_at(&self, now_unix: i64) -> i64 {
         if !self.is_usable() {
             return self.burned_at_unix;
