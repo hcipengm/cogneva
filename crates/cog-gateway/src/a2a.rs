@@ -986,10 +986,24 @@ async fn message_stream_for(
         tracing::info!(goal_id = %goal_id, "a2a message/stream goal accepted");
     }
 
+    goal_stream_response(&state, goal_id, request.rpc_id, version)
+}
+
+/// 按版本把一行任务跟到底的 SSE 响应。
+///
+/// 开流（收到一条新消息）与续流（请求重新订阅已有的一行）在这里汇合：两条入口
+/// 之后看到的是同一个任务、同一套帧，各写一遍只会有一边忘了某条头、或者忘了
+/// 终态之后收流。
+fn goal_stream_response(
+    state: &Arc<GatewayState>,
+    goal_id: String,
+    rpc_id: Value,
+    version: A2aVersion,
+) -> Response {
     let stream = goal_stream(StreamState {
         reader: Arc::new(state.orchestrator.clone()),
         goal_id,
-        rpc_id: request.rpc_id,
+        rpc_id,
         version,
         last: None,
         seen_row: false,
@@ -1023,6 +1037,13 @@ async fn message_stream_for(
 // 照规范写的对端会把流也发到这里；只认路径不认方法，它拿到的就是「不认识这个方法」。
 // 另外两条是每个对端都会用的，缺了它们，一个按名片打过来的客户端能做的只有开流。
 
+/// 这个端点服务哪些方法，写给对端看。
+///
+/// 一次拒答本身不解决问题，但它得让对端知道该改用什么——所以两条拒答（不认识的
+/// 方法、认识但没做的方法）读同一个常量：手抄两份，加一条方法时只会更新其中一份。
+const SERVED_METHODS: &str =
+    "this endpoint serves message/send, message/stream, tasks/get, tasks/cancel and tasks/resubscribe";
+
 /// 一帧 JSON-RPC 错误。
 ///
 /// 协议的错写在 `error` 里、HTTP 状态仍是 200：一次「方法不认识」与一次「这一行
@@ -1046,15 +1067,13 @@ fn defined_but_unsupported(method: &str) -> bool {
     matches!(
         method,
         // 0.3 名字
-        "tasks/resubscribe"
-            | "tasks/pushNotificationConfig/set"
+        "tasks/pushNotificationConfig/set"
             | "tasks/pushNotificationConfig/get"
             | "tasks/pushNotificationConfig/list"
             | "tasks/pushNotificationConfig/delete"
             | "agent/getAuthenticatedExtendedCard"
             | "agent/authenticatedExtendedCard"
             // 1.0 名字
-            | "SubscribeToTask"
             | "ListTasks"
             | "CreateTaskPushNotificationConfig"
             | "GetTaskPushNotificationConfig"
@@ -1094,15 +1113,15 @@ pub async fn rpc_handler(
         Some("tasks/cancel") | Some("CancelTask") => {
             rpc_tasks_cancel(&state, &body, &rpc_id, version).await
         }
+        Some("tasks/resubscribe") | Some("SubscribeToTask") => {
+            rpc_tasks_resubscribe(&state, &body, &rpc_id, version).await
+        }
         Some(method) if defined_but_unsupported(method) => (
             StatusCode::OK,
             Json(rpc_error(
                 &rpc_id,
                 -32004,
-                format!(
-                    "'{method}' is defined by A2A but not served here; this endpoint \
-                     serves message/send, message/stream, tasks/get and tasks/cancel"
-                ),
+                format!("'{method}' is defined by A2A but not served here; {SERVED_METHODS}"),
             )),
         )
             .into_response(),
@@ -1112,8 +1131,7 @@ pub async fn rpc_handler(
                 &rpc_id,
                 -32601,
                 format!(
-                    "unknown method '{}'; this endpoint serves message/send, \
-                     message/stream, tasks/get and tasks/cancel",
+                    "unknown method '{}'; {SERVED_METHODS}",
                     other.unwrap_or("<missing>")
                 ),
             )),
@@ -1363,6 +1381,42 @@ async fn rpc_tasks_get(
             )),
         )
             .into_response(),
+        None => (
+            StatusCode::OK,
+            Json(rpc_error(rpc_id, -32001, format!("no task '{task_id}'"))),
+        )
+            .into_response(),
+    }
+}
+
+/// `tasks/resubscribe`（0.3）／`SubscribeToTask`（1.0）：接回一条正在跑的任务。
+///
+/// 流会断，而任务不会因为断线停下——对端重连时拿的是它手里的那个 id，不是重新
+/// 发一遍消息。没有这条方法，一个跑了二十分钟的任务在客户端掉线一次之后就只剩
+/// 轮询；而轮询与流看到的不是同一份东西（流里有中间态，`tasks/get` 只有当下）。
+///
+/// id 不存在时**回信封错误而不是开一条流**：这一行在不在，开流之前就知道，没有
+/// 理由让对端先收一条永远是空的流、再从一个错误帧里读结论。
+async fn rpc_tasks_resubscribe(
+    state: &Arc<GatewayState>,
+    body: &Value,
+    rpc_id: &Value,
+    version: A2aVersion,
+) -> Response {
+    let Some(task_id) = rpc_task_id(body) else {
+        return (
+            StatusCode::OK,
+            Json(rpc_error(
+                rpc_id,
+                -32602,
+                "tasks/resubscribe takes params.id",
+            )),
+        )
+            .into_response();
+    };
+
+    match GoalReader::goal(&state.orchestrator, task_id).await {
+        Some(_) => goal_stream_response(state, task_id.to_string(), rpc_id.clone(), version),
         None => (
             StatusCode::OK,
             Json(rpc_error(rpc_id, -32001, format!("no task '{task_id}'"))),

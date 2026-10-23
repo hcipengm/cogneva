@@ -630,7 +630,8 @@ async fn the_endpoint_names_what_it_will_not_do() {
     let unknown = post(
         &app,
         &token,
-        json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/resubscribe", "params": {"id": "t-1"}}),
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/pushNotificationConfig/set",
+               "params": {"id": "t-1", "pushNotificationConfig": {"url": "https://peer.example/hook"}}}),
     )
     .await;
     assert_eq!(
@@ -642,7 +643,7 @@ async fn the_endpoint_names_what_it_will_not_do() {
         .as_str()
         .expect("the refusal carries a message");
     assert!(
-        said.contains("tasks/resubscribe") && said.contains("message/send"),
+        said.contains("tasks/pushNotificationConfig/set") && said.contains("message/send"),
         "the refusal has to name what was asked and what is served: {said}"
     );
 
@@ -1022,6 +1023,102 @@ async fn a_peer_can_stop_a_task_it_started() {
     )
     .await;
     assert_eq!(missing["error"]["code"], -32001);
+    assert!(missing["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("no task 'no-such-task'"));
+}
+
+/// A peer whose connection dropped mid-run holds a task id, not the message it
+/// sent. `tasks/resubscribe` is how it gets the stream back without sending the
+/// work a second time; polling `tasks/get` is not the same thing, because a poll
+/// cannot see what happened while it was not asking.
+#[tokio::test]
+async fn a_peer_that_reconnects_can_resubscribe_to_the_task_it_holds() {
+    let state = router_state::stateless();
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "a2a-rpc-resubscribe").await;
+    let client =
+        A2aClient::new(Arc::new(InProcess { app: app.clone() })).with_bearer(token.clone());
+
+    let accepted = client
+        .send_message(ENDPOINT, "probe resubscribe")
+        .await
+        .expect("the endpoint accepts a message");
+    read_until_present(&client, &accepted.id).await;
+    state
+        .orchestrator
+        .schedule_task(&accepted.id)
+        .await
+        .expect("an accepted goal can be scheduled");
+    state
+        .orchestrator
+        .start_task(&accepted.id)
+        .await
+        .expect("a scheduled goal can be started");
+    state
+        .orchestrator
+        .complete_task(&accepted.id, json!({"answer": 7}))
+        .await
+        .expect("a running goal can be completed");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/protocol/a2a")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tasks/resubscribe",
+                   "params": {"id": accepted.id}})
+            .to_string(),
+        ))
+        .expect("the request is well formed");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("the router answers");
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream"),
+        "resubscribing opens a stream, not a single JSON answer"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the stream body comes back and ends");
+    let text = String::from_utf8_lossy(&body).into_owned();
+    let first = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap_or_else(|| panic!("the stream carries a data frame: {text}"));
+    let frame: serde_json::Value = serde_json::from_str(first).expect("the frame is JSON");
+    assert_eq!(
+        frame["result"]["id"],
+        json!(accepted.id),
+        "the first frame is the task the peer asked to follow: {frame}"
+    );
+    assert_eq!(
+        frame["result"]["status"]["state"], "completed",
+        "it is the row as it stands now, not a replay from the start: {frame}"
+    );
+    assert_eq!(
+        frame["result"]["artifacts"][0]["name"], "result",
+        "a peer that missed the end still gets what the run produced: {frame}"
+    );
+
+    // An id nobody has is refused before a stream is opened: the answer is the
+    // same envelope `tasks/get` gives, not an empty stream to interpret.
+    let missing = post(
+        &app,
+        &token,
+        json!({"jsonrpc": "2.0", "id": 4, "method": "tasks/resubscribe",
+               "params": {"id": "no-such-task"}}),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], -32001, "{missing}");
     assert!(missing["error"]["message"]
         .as_str()
         .unwrap_or_default()
