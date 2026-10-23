@@ -100,22 +100,28 @@ fn is_a_number(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// The principle slugs a source file's header declares.
+/// The principle slugs a source file declares.
 ///
-/// Read from the start of a line, with no tolerance for indentation: the reader
-/// that builds the registry anchors its pattern the same way, and a reader that
-/// accepted a declaration the registry does not see would answer for a gate that
-/// nothing measures.
+/// The line is read from its first non-blank character, which is where a
+/// declaration sits -- a module header at the file's own level, a test's own
+/// declaration inside `mod tests`. The reader that builds the registry allows the
+/// same indent, and a reader that accepted a declaration the registry does not
+/// see would answer for a gate that nothing measures.
+///
+/// The rest of the line has to be exactly one slug, the same shape the registry
+/// parses: a line carrying a sentence after the slug is not a declaration to
+/// either reader.
 pub fn declared_slugs(source: &str) -> Vec<String> {
     let mut slugs = Vec::new();
     for line in source.lines() {
+        let trimmed = line.trim_start();
         let Some(rest) = PLATFORM_DECLARATION_PREFIXES
             .iter()
-            .find_map(|prefix| line.strip_prefix(prefix))
+            .find_map(|prefix| trimmed.strip_prefix(prefix))
         else {
             continue;
         };
-        let slug = rest.split_whitespace().next().unwrap_or("");
+        let slug = rest.trim();
         if is_a_slug(slug) {
             slugs.push(slug.to_string());
         }
@@ -287,21 +293,39 @@ mod tests {
         assert!(failing_paths("panicked at /abs/path/x.rs:3:1").is_empty());
     }
 
-    /// A shell gate declares in the comment syntax its language has. The shape
-    /// is the same one the registry reads, so a gate the account counts is a gate
-    /// a red run can name.
+    /// A shell gate declares in the comment syntax its language has, at whatever
+    /// indent its gate sits at -- the shape the registry reads, so a gate the
+    /// account counts is a gate a red run can name. `#principle:` with no space
+    /// is a different prefix and stays out of both readers.
     #[test]
     fn a_shell_gate_declares_with_its_own_prefix() {
         let source = "# principle: feedback_a\n#principle: feedback_b\n  # principle: feedback_c\n";
-        assert_eq!(declared_slugs(source), vec!["feedback_a".to_string()]);
-    }
-
-    #[test]
-    fn the_declaration_prefix_has_to_start_the_line() {
-        let source = "//! principle: feedback_a\n  //! principle: feedback_b\n/// principle: feedback_c\n//! principle: feedback_d trailing words\n//! principle: not-a-slug!\n";
         assert_eq!(
             declared_slugs(source),
-            vec!["feedback_a".to_string(), "feedback_d".to_string()]
+            vec!["feedback_a".to_string(), "feedback_c".to_string()]
+        );
+    }
+
+    /// A declaration is read at the indentation of the thing it speaks for: the
+    /// module header at the file's own level, and the test's own declaration
+    /// inside the test module. Both are the same claim, and the registry reads
+    /// both, so a red run has to name both -- a gate the account counts and a run
+    /// that cannot point at it are two accounts of one file.
+    ///
+    /// What is still not a declaration: a line whose prefix is not at the start
+    /// of its text (`#principle:`), one carrying words after the slug, and one
+    /// with no slug at all.
+    #[test]
+    fn the_declaration_prefix_starts_the_declaration_not_the_sentence() {
+        let source = "//! principle: feedback_a\n  //! principle: feedback_b\n    /// principle: feedback_c\n# principle: feedback_d\n#principle: feedback_e\n//! principle: feedback_f trailing words\n//! principle: not-a-slug!\n";
+        assert_eq!(
+            declared_slugs(source),
+            vec![
+                "feedback_a".to_string(),
+                "feedback_b".to_string(),
+                "feedback_c".to_string(),
+                "feedback_d".to_string(),
+            ]
         );
     }
 

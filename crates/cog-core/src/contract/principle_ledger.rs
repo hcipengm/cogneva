@@ -385,16 +385,29 @@ pub const PLATFORM_DECLARATION_PREFIX: &str = "//! principle:";
 /// showed up on every surface exactly like no gate at all.
 pub const PLATFORM_SHELL_DECLARATION_PREFIX: &str = "# principle:";
 
+/// The same declaration written as a doc comment on the item it speaks for.
+///
+/// A module header says what the module holds; the test that pins one principle
+/// is the more precise place to say it, and the tree had already written sixteen
+/// of them that way before anything looked: an outer doc comment belongs to the
+/// item below it, so a reader that knew only the inner form found a gate and
+/// counted the file as having none. Both spellings are the same claim, and the
+/// shape check -- the rest of the line is exactly one slug -- is what keeps a
+/// sentence about the convention from passing as a declaration, not the nesting
+/// of the comment.
+pub const PLATFORM_ITEM_DECLARATION_PREFIX: &str = "/// principle:";
+
 /// Every prefix a declaration may be written with, one per comment syntax the
 /// tree holds gates in.
 ///
-/// Closed at two, and the readers iterate this rather than testing for a
-/// particular language: a reader that accepted a third syntax the registry does
-/// not search for would answer for a gate nothing measures, which is the failure
-/// the single value was introduced to prevent.
+/// Closed at three, and the readers iterate this rather than testing for a
+/// particular language: a reader that accepted a syntax the registry does not
+/// search for would answer for a gate nothing measures, which is the failure the
+/// single value was introduced to prevent.
 pub const PLATFORM_DECLARATION_PREFIXES: &[&str] = &[
     PLATFORM_DECLARATION_PREFIX,
     PLATFORM_SHELL_DECLARATION_PREFIX,
+    PLATFORM_ITEM_DECLARATION_PREFIX,
 ];
 
 /// A principle whose carrier is no longer the text the account measured against.

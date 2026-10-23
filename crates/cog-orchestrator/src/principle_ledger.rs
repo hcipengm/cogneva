@@ -1423,10 +1423,13 @@ mod tests {
     // Driven over a real repository, because the declaration the re-open turns on
     // is read out of one.
 
-    /// A bare repository whose one Rust source declares `slug` at its head, plus
-    /// a work tree to write it from: the shape the platform's registry is read
-    /// out of.
-    fn repo_declaring(slug: &str) -> tempfile::TempDir {
+    /// A bare repository holding exactly these files, committed on `main`, plus
+    /// the work tree they were written from.
+    ///
+    /// The git plumbing lives here rather than in each fixture: it is the part a
+    /// fixture gets wrong, and two copies of it are two chances to get it wrong
+    /// differently.
+    fn repo_with(files: &[(&str, String)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let bare = dir.path().join("bare");
         let work = dir.path().join("work");
@@ -1448,12 +1451,13 @@ mod tests {
         git(&["init", "-q", "--bare", "-b", "main", bare_s]);
         git(&["--git-dir", bare_s, "config", "user.email", "t@example.com"]);
         git(&["--git-dir", bare_s, "config", "user.name", "t"]);
-        std::fs::create_dir_all(work.join("crates/x/tests")).expect("the fixture directory");
-        std::fs::write(
-            work.join("crates/x/tests/gate_test.rs"),
-            format!("//! principle: {slug}\n"),
-        )
-        .expect("the fixture file");
+        for (path, body) in files {
+            let full = work.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).expect("the fixture directory");
+            }
+            std::fs::write(&full, body).expect("the fixture file");
+        }
         git(&["--git-dir", bare_s, "--work-tree", work_s, "add", "--all"]);
         git(&[
             "--git-dir",
@@ -1466,6 +1470,69 @@ mod tests {
             "fixture",
         ]);
         dir
+    }
+
+    /// A bare repository whose one Rust source declares `slug` at its head, plus
+    /// a work tree to write it from: the shape the platform's registry is read
+    /// out of.
+    fn repo_declaring(slug: &str) -> tempfile::TempDir {
+        repo_with(&[(
+            "crates/x/tests/gate_test.rs",
+            format!("//! principle: {slug}\n"),
+        )])
+    }
+
+    /// A declaration is read at whichever depth its author put it: on the module,
+    /// on the test module inside it, or on the test itself.
+    ///
+    /// The three are one claim, and two of them are indented -- which is why the
+    /// expression allows the indent instead of anchoring at column zero. Anchored
+    /// there, a reader found the module header and answered "no gate" for the
+    /// other two, an answer indistinguishable from a principle nothing enforces.
+    #[tokio::test]
+    async fn a_declaration_is_read_at_the_depth_its_gate_sits_at() {
+        let dir = repo_with(&[
+            (
+                "crates/x/src/on_module.rs",
+                "//! principle: feedback_on_the_module\n\npub fn gate() {}\n".to_string(),
+            ),
+            (
+                "crates/x/src/on_test_module.rs",
+                "pub fn gate() {}\n\n#[cfg(test)]\nmod tests {\n    //! principle: feedback_on_the_test_module\n\n    fn t() {}\n}\n"
+                    .to_string(),
+            ),
+            (
+                "crates/x/src/on_test.rs",
+                "pub fn gate() {}\n\n#[cfg(test)]\nmod tests {\n    /// principle: feedback_on_the_test\n    #[test]\n    fn t() {}\n}\n"
+                    .to_string(),
+            ),
+        ]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let (declarations, _rev) = read_registry(&tree)
+            .await
+            .expect("the fixture registry is read");
+
+        for (slug, path) in [
+            ("feedback_on_the_module", "crates/x/src/on_module.rs"),
+            (
+                "feedback_on_the_test_module",
+                "crates/x/src/on_test_module.rs",
+            ),
+            ("feedback_on_the_test", "crates/x/src/on_test.rs"),
+        ] {
+            assert_eq!(
+                declarations.gate_for(slug),
+                Some(path),
+                "{slug} was not read where its gate sits: the account answers \"no gate\" for a \
+                 principle that has one at {path}"
+            );
+        }
+        assert_eq!(
+            declarations.unreadable_count(),
+            0,
+            "a line was matched and could not be read: {:?}",
+            declarations.unreadable()
+        );
     }
 
     /// A store with exactly the two behaviours the re-open path reads: the row it

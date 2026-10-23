@@ -67,22 +67,27 @@ pub const HOST_RETIRED_PREFIX: &str = "retired:";
 /// what enforces what -- and one value keeps the two from drifting apart. Every
 /// reference below this line is to that one definition.
 pub use cog_core::{
-    PLATFORM_DECLARATION_PREFIX, PLATFORM_DECLARATION_PREFIXES, PLATFORM_SHELL_DECLARATION_PREFIX,
+    PLATFORM_DECLARATION_PREFIX, PLATFORM_DECLARATION_PREFIXES, PLATFORM_ITEM_DECLARATION_PREFIX,
+    PLATFORM_SHELL_DECLARATION_PREFIX,
 };
 
 /// The expression the platform's registry is read with: the prefix at the start
-/// of a line, which is where a module header sits and where prose about the
-/// convention does not.
+/// of a line, after whatever indentation the item it speaks for is nested at.
+///
+/// The indent is part of the anchor rather than left out of it: a declaration
+/// written above a test sits inside `mod tests`, so "start of the line" alone
+/// found only the two files whose gate happened to be the whole module and read
+/// the other sixteen as files with no gate. What the anchor still excludes is the
+/// sentence about the convention, because that sentence does not begin with the
+/// prefix at all.
 ///
 /// Built from the prefix rather than spelled a second time. One shape is read
 /// from two directions here -- a line is stripped with the prefix, and the tree
 /// is searched with the expression -- and a second spelling is a second thing to
 /// keep in step.
 ///
-/// Anchoring is a concatenation and not an escape because the prefix carries no
-/// expression metacharacter, which the test below holds down: it is what makes
-/// this line mean "at the start of a line" rather than "somewhere in it", and it
-/// is a fact about the value, not about the spelling.
+/// The anchor is concatenation and not an escape because the prefix carries no
+/// expression metacharacter, which the test below holds down.
 pub fn platform_declaration_pattern() -> String {
     platform_declaration_pattern_for(PLATFORM_DECLARATION_PREFIX)
 }
@@ -91,12 +96,21 @@ pub fn platform_declaration_pattern() -> String {
 /// searched with the anchor derived from its own prefix rather than from a
 /// pattern written out a second time beside it.
 pub fn platform_declaration_pattern_for(prefix: &str) -> String {
-    format!("^{prefix}")
+    format!("{PLATFORM_DECLARATION_ANCHOR}{prefix}")
 }
 
-/// Which files may declare. Rust sources, because a declaration is a header of
-/// the test module that enforces it, and the tree's prose about the convention
-/// lives outside them.
+/// How a declaration may be indented and still be read: any run of spaces or
+/// tabs, then the prefix, then the rest of the line.
+///
+/// A declaration's slug is parsed out of the whole line, so the line's tail is
+/// already held to "exactly one slug" -- the anchor's job is only to keep the
+/// search from finding the prefix in the middle of a sentence, and indentation
+/// does not make a sentence.
+pub const PLATFORM_DECLARATION_ANCHOR: &str = "^[[:space:]]*";
+
+/// Which files may declare. Rust sources, because a declaration is written on
+/// the module or the test that enforces it, and the tree's prose about the
+/// convention lives outside them.
 pub const PLATFORM_REGISTRY_FILES: &str = "*.rs";
 
 /// The shell gates the tree holds beside the deploy scripts.
@@ -123,6 +137,7 @@ pub const PLATFORM_REPO_GATES: &str = ".github/scripts/tests/*.test.sh";
 /// end up one step apart.
 pub const PLATFORM_REGISTRY_SOURCES: &[(&str, &str)] = &[
     (PLATFORM_REGISTRY_FILES, PLATFORM_DECLARATION_PREFIX),
+    (PLATFORM_REGISTRY_FILES, PLATFORM_ITEM_DECLARATION_PREFIX),
     (PLATFORM_DEPLOY_GATES, PLATFORM_SHELL_DECLARATION_PREFIX),
     (PLATFORM_REPO_GATES, PLATFORM_SHELL_DECLARATION_PREFIX),
 ];
@@ -895,12 +910,12 @@ mod tests {
         assert!(!is_slug("feedback_x/y"));
     }
 
-    /// The registry expression is the prefix anchored, built by concatenation --
-    /// which is only the same as anchoring while the prefix holds no expression
-    /// metacharacter. That is a fact about the value rather than about the
-    /// spelling, so it is asserted rather than assumed: if one ever appears, the
-    /// line that builds the expression stops meaning "at the start of a line",
-    /// and has to escape what it concatenates.
+    /// The registry expression is the anchor followed by the prefix, built by
+    /// concatenation -- which is only the same as anchoring while the prefix
+    /// holds no expression metacharacter. That is a fact about the value rather
+    /// than about the spelling, so it is asserted rather than assumed: if one
+    /// ever appears, the line that builds the expression stops meaning "at the
+    /// start of a line", and has to escape what it concatenates.
     ///
     /// The body is read back off the expression because that is the whole of what
     /// makes the two readers one shape -- a body that had drifted from the prefix
@@ -909,16 +924,23 @@ mod tests {
     fn the_registry_expression_may_be_built_by_concatenation() {
         let pattern = platform_declaration_pattern();
         assert_eq!(
-            pattern.strip_prefix('^'),
+            pattern.strip_prefix(PLATFORM_DECLARATION_ANCHOR),
             Some(PLATFORM_DECLARATION_PREFIX),
-            "the expression is read by an unanchored matcher: the anchor is the whole of what \
-             separates a module header from a sentence about the convention"
+            "the expression is read by a matcher that would find the prefix mid-sentence: the \
+             anchor is the whole of what separates a declaration from prose about it"
         );
+        // The indent is the half of the anchor that reaches a declaration written
+        // on the item it speaks for; without it a gate inside `mod tests` is the
+        // same bytes to the account as no gate at all.
+        assert_eq!(PLATFORM_DECLARATION_ANCHOR, "^[[:space:]]*");
         // Every source is searched with its own prefix, so every prefix has to
         // survive being concatenated -- not just the one this test started with.
         for (_, prefix) in PLATFORM_REGISTRY_SOURCES {
             let pattern = platform_declaration_pattern_for(prefix);
-            assert_eq!(pattern.strip_prefix('^'), Some(*prefix));
+            assert_eq!(
+                pattern.strip_prefix(PLATFORM_DECLARATION_ANCHOR),
+                Some(*prefix)
+            );
             for c in prefix.chars() {
                 assert!(
                     !"\\.^$*+?()[]{}|".contains(c),
@@ -933,12 +955,17 @@ mod tests {
     /// searched in the trees the shell gates live in. A pair that drifted would
     /// search a file with the other language's prefix and find nothing -- which
     /// reads as "no gate", the exact answer this widening removes.
+    ///
+    /// The Rust half carries two prefixes because a Rust gate may be named by the
+    /// module or by the test inside it; both are the same claim written where its
+    /// author could see it.
     #[test]
     fn every_registry_source_is_paired_with_its_own_prefix() {
         assert_eq!(
             PLATFORM_REGISTRY_SOURCES,
             &[
                 (PLATFORM_REGISTRY_FILES, PLATFORM_DECLARATION_PREFIX),
+                (PLATFORM_REGISTRY_FILES, PLATFORM_ITEM_DECLARATION_PREFIX),
                 (PLATFORM_DEPLOY_GATES, PLATFORM_SHELL_DECLARATION_PREFIX),
                 (PLATFORM_REPO_GATES, PLATFORM_SHELL_DECLARATION_PREFIX),
             ]
@@ -947,5 +974,16 @@ mod tests {
         assert!(PLATFORM_DEPLOY_GATES.ends_with("*.test.sh"));
         assert!(PLATFORM_REPO_GATES.starts_with('.'));
         assert!(PLATFORM_REPO_GATES.ends_with("*.test.sh"));
+        // Every prefix of the closed set has a source that searches for it: a
+        // prefix the registry never searches for is a shape the parser would
+        // accept from a line nothing ever found.
+        for prefix in PLATFORM_DECLARATION_PREFIXES {
+            assert!(
+                PLATFORM_REGISTRY_SOURCES
+                    .iter()
+                    .any(|(_, searched)| searched == prefix),
+                "{prefix:?} is readable but never searched for"
+            );
+        }
     }
 }
