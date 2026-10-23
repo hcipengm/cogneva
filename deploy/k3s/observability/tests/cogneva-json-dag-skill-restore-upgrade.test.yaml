@@ -1,0 +1,329 @@
+# DAG 卡死回收、技能热重载、恢复核对、升级路径、活镜像那十二条读数的单测夹具。
+#
+# dag 两条是同一件事的两面：回收了（`stalled_after_ready`）与「明明还有积压也回收了」
+# （`reclaimed_despite_backlog`）。后者更重，所以它自己一条。
+#
+# skill 两条：`passes_all_failed` 是「失败 unless 非失败」，第二格让一个非失败结局同时出现，
+# 删掉 `unless` 那半这一格会响；`failing_every_scan` 只认 `reload_failed` 这一个结局。
+#
+# restore 两条都靠**两次启动之间**的两格读数相减：读进来的是不是包里那一版、读进来的决策证据
+# 比包里少没少。两侧都带 1800 秒新鲜合取，第三格把「一边过期」时的静格单独证出来。
+#
+# upgrade 两条：`not_on_the_release` 判的是自报状态值 < 1（并排除 `state="no-release"`——
+# 没装过 release 的部署不归它问）；`reading_stopped` 判的是**一条都没有**。
+#
+# live 两条：镜像提交的年龄超过六小时、以及布线读数消失。后者用空输入证。
+#
+# buildah 两条：`round_incomplete` 是「一小时里跑过」与「读数超过十二小时没更新」的合取
+# （界比别的族宽得多——构建存储的读数本来就慢）；`live_refs_empty` 判的是唯一活镜像数掉到 1 以下。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-dag-skill-restore-upgrade.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: dag_task_stalled_after_ready
+# rule: dag_task_reclaimed_despite_backlog
+# rule: skill_hot_reload_passes_all_failed
+# rule: skill_reload_failing_every_scan
+# rule: restore_loaded_version_is_not_the_packages
+# rule: restore_loaded_less_decision_evidence_than_the_package
+# rule: upgrade_path_not_on_the_release
+# rule: upgrade_path_reading_stopped
+# rule: live_image_too_old
+# rule: live_image_reading_stopped
+# rule: buildah_store_round_incomplete
+# rule: buildah_store_live_refs_empty
+
+evaluation_interval: 1m
+
+tests:
+  # 一切正常：没有 DAG 任务被回收、热重载没失败、恢复读到的版本与决策证据与包里一致、
+  # 升级后自报已对齐、活镜像一小时前合的、布线读数在。十二条全静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_dag_stalled_scheduled_reclaimed_total{namespace="cogneva"}'
+        values: '0x60'
+      - series: 'cogneva_dag_stalled_scheduled_reclaimed_with_backlog_total{namespace="cogneva"}'
+        values: '0x60'
+      - series: 'cogneva_skill_hot_reload_total{outcome="failed",job="skills"}'
+        values: '0x60'
+      - series: 'cogneva_skill_hot_reload_total{outcome="reloaded",job="skills"}'
+        values: '0x50 2x10'
+      - series: 'cogneva_skill_hot_reload_total{outcome="reload_failed",job="skills"}'
+        values: '0x60'
+      - series: 'cogneva_policy_store_readings{readout="restore_loaded_active_version",store="default",data_dir="/var/policy"}'
+        values: '5x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="restore_loaded_active_version",store="default",data_dir="/var/policy"}'
+        values: '3500x60'
+      - series: 'cogneva_policy_store_readings{readout="restore_expected_active_version",store="default",data_dir="/var/policy"}'
+        values: '5x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="restore_expected_active_version",store="default",data_dir="/var/policy"}'
+        values: '3500x60'
+      - series: 'cogneva_policy_store_readings{readout="restore_expected_decision_trials",data_dir="/var/policy"}'
+        values: '40x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="restore_expected_decision_trials",data_dir="/var/policy"}'
+        values: '3500x60'
+      - series: 'cogneva_policy_store_readings{readout="restore_loaded_decision_trials",data_dir="/var/policy"}'
+        values: '40x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="restore_loaded_decision_trials",data_dir="/var/policy"}'
+        values: '3500x60'
+      - series: 'helm_release_revision_vs_workload_rev{node="n1",state="on-release"}'
+        values: '1x60'
+      - series: 'image_wiring_live_commit_age_seconds{node="n1"}'
+        values: '1000x60'
+      - series: 'image_wiring_yes{node="n1"}'
+        values: '1x60'
+      - series: 'cogneva_buildah_store_live_images{job="buildah"}'
+        values: '3x60'
+      - series: 'cogneva_buildah_store_live_images_observed_timestamp_seconds{job="buildah"}'
+        values: '3500x60'
+      - series: 'cogneva_buildah_store_rounds_total{outcome="pruned",job="buildah"}'
+        values: '0x60'
+      - series: 'cogneva_buildah_store_reading_unix{job="buildah"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: dag_task_stalled_after_ready
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: dag_task_reclaimed_despite_backlog
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: skill_hot_reload_passes_all_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: skill_reload_failing_every_scan
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: restore_loaded_version_is_not_the_packages
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: restore_loaded_less_decision_evidence_than_the_package
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: upgrade_path_not_on_the_release
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: upgrade_path_reading_stopped
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: live_image_too_old
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: live_image_reading_stopped
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: buildah_store_round_incomplete
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: buildah_store_live_refs_empty
+        exp_alerts: []
+
+  # 都在说坏消息：DAG 回收了三个（其中两个是明知有积压还回收）、热重载全部失败且有两个
+  # `reload_failed`、恢复读到的版本是 4 而包里是 5、决策证据读进来 30 条而包里 40 条、
+  # 升级后自报值 0、活镜像七小时前合的（年龄 25200）、构建存储唯一活镜像数掉到 0。
+  # 十一条全亮（`reading_stopped` 静——读数都在写）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_dag_stalled_scheduled_reclaimed_total{namespace="cogneva"}'
+        values: '0x40 3x20'
+      - series: 'cogneva_dag_stalled_scheduled_reclaimed_with_backlog_total{namespace="cogneva"}'
+        values: '0x45 2x15'
+      - series: 'cogneva_skill_hot_reload_total{outcome="failed",job="skills"}'
+        values: '0x56 1x4'
+      - series: 'cogneva_policy_store_readings{readout="restore_loaded_active_version",store="default",data_dir="/var/policy"}'
+        values: '4x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="restore_loaded_active_version",store="default",data_dir="/var/policy"}'
+        values: '3500x60'
+      - series: 'cogneva_policy_store_readings{readout="restore_expected_active_version",store="default",data_dir="/var/policy"}'
+        values: '5x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="restore_expected_active_version",store="default",data_dir="/var/policy"}'
+        values: '3500x60'
+      - series: 'cogneva_policy_store_readings{readout="restore_expected_decision_trials",data_dir="/var/policy"}'
+        values: '40x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="restore_expected_decision_trials",data_dir="/var/policy"}'
+        values: '3500x60'
+      - series: 'cogneva_policy_store_readings{readout="restore_loaded_decision_trials",data_dir="/var/policy"}'
+        values: '30x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="restore_loaded_decision_trials",data_dir="/var/policy"}'
+        values: '3500x60'
+      - series: 'helm_release_revision_vs_workload_rev{node="n1",state="drifted"}'
+        values: '0x60'
+      - series: 'image_wiring_live_commit_age_seconds{node="n1"}'
+        values: '25200x60'
+      - series: 'image_wiring_yes{node="n1"}'
+        values: '1x60'
+      - series: 'cogneva_buildah_store_live_images{job="buildah"}'
+        values: '0x60'
+      - series: 'cogneva_buildah_store_live_images_observed_timestamp_seconds{job="buildah"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: dag_task_stalled_after_ready
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+      - eval_time: 60m
+        alertname: dag_task_reclaimed_despite_backlog
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+      - eval_time: 60m
+        alertname: skill_hot_reload_passes_all_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outcome: failed
+      - eval_time: 60m
+        alertname: restore_loaded_version_is_not_the_packages
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              store: default
+              data_dir: /var/policy
+      - eval_time: 60m
+        alertname: restore_loaded_less_decision_evidence_than_the_package
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              data_dir: /var/policy
+      - eval_time: 60m
+        alertname: upgrade_path_not_on_the_release
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+      - eval_time: 60m
+        alertname: live_image_too_old
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+      - eval_time: 60m
+        alertname: buildah_store_live_refs_empty
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: buildah
+      - eval_time: 60m
+        alertname: upgrade_path_reading_stopped
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: live_image_reading_stopped
+        exp_alerts: []
+
+  # `reload_failed` 是**另一个结局**：对 `passes_all_failed` 来说它满足 `outcome!="failed"`，
+  # 所以会把那条规则压静——「每次扫描都重载失败」由 `failing_every_scan` 单独报，不靠这条。
+  # 这一格同时证两件事：`failing_every_scan` 只认 `reload_failed`，而 `passes_all_failed` 静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_skill_hot_reload_total{outcome="reload_failed",job="skills"}'
+        values: '0x55 2x5'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: skill_reload_failing_every_scan
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outcome: reload_failed
+      - eval_time: 60m
+        alertname: skill_hot_reload_passes_all_failed
+        exp_alerts: []
+
+  # 热重载有失败，但同一窗口里也有成功：不是「全失败」。删掉 `unless` 那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_skill_hot_reload_total{outcome="failed",job="skills"}'
+        values: '0x56 1x4'
+      - series: 'cogneva_skill_hot_reload_total{outcome="reloaded",job="skills"}'
+        values: '0x57 1x3'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: skill_hot_reload_passes_all_failed
+        exp_alerts: []
+
+  # 恢复读到的版本与包里一致，但「包里那一版」的读数已经过期：比的是旧值，不算数。
+  # 删掉新鲜度那半，这一格会响（4 对 5 有差）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_policy_store_readings{readout="restore_loaded_active_version",store="default",data_dir="/var/policy"}'
+        values: '4x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="restore_loaded_active_version",store="default",data_dir="/var/policy"}'
+        values: '3500x60'
+      - series: 'cogneva_policy_store_readings{readout="restore_expected_active_version",store="default",data_dir="/var/policy"}'
+        values: '5x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="restore_expected_active_version",store="default",data_dir="/var/policy"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: restore_loaded_version_is_not_the_packages
+        exp_alerts: []
+
+  # 构建存储：一小时里确实跑过一轮，但这条读数十三小时没更新（界是十二小时）：跑的是哪一轮不知道。
+  # 亮。删掉「读数超过十二小时没更新」那半，这一格会静。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_buildah_store_rounds_total{outcome="pruned",job="buildah"}'
+        values: '0x150 1x6'
+      - series: 'cogneva_buildah_store_reading_unix{job="buildah"}'
+        values: '1000x156'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: buildah_store_round_incomplete
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 同样的跑动，但读数一刻钟前刚更新过：那一轮有结论。删掉「读数超过十二小时没更新」
+  # 那半，这一格会响。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_buildah_store_rounds_total{outcome="pruned",job="buildah"}'
+        values: '0x150 1x6'
+      - series: 'cogneva_buildah_store_reading_unix{job="buildah"}'
+        values: '45900x156'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: buildah_store_round_incomplete
+        exp_alerts: []
+
+  # 活镜像数与布线读数一条都没有：两条 `reading_stopped` 亮，其余静。
+  - interval: 1m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: upgrade_path_reading_stopped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: live_image_reading_stopped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: upgrade_path_not_on_the_release
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: live_image_too_old
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: buildah_store_live_refs_empty
+        exp_alerts: []
+
+  # 构建存储的活镜像数是 0，但这条读数十三小时没更新（界是十二小时）：现在是不是 0 不知道。
+  # 删掉新鲜度那半，这一格会响。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_buildah_store_live_images{job="buildah"}'
+        values: '0x156'
+      - series: 'cogneva_buildah_store_live_images_observed_timestamp_seconds{job="buildah"}'
+        values: '0x156'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: buildah_store_live_refs_empty
+        exp_alerts: []

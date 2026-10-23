@@ -1,0 +1,207 @@
+# 策略面三件（进化轮次全失败、宣告了存储却没有版本、活跃指针指向不存在的版本）与
+# 原则面三件（生产者从没交付、生产者停了、账本普查停了）的单测夹具。
+#
+# policy 一族的易错点：
+#   - `rounds_all_failed` 是 `失败 unless 非失败`：第二格让一个非失败结局也在涨，删掉 `unless`
+#     那半这一格会响。左半边保留 `outcome` 标签（`without` 没点它），所以断言里带 outcome。
+#   - `announced_without_a_version` 用 `> bool` 把两个 count 比成 0/1：只有当 data_dir 读数
+#     比 active_version 读数**多**时才响。`> bool` 之后标签全丢，断言里只有 severity。
+#   - `active_pointer_names_a_missing_version` 的值是负数（指针指向的版本不在），
+#     判据是 `< 0`；它同时带新鲜度腿，第三格单独证。
+#
+# principle 一族的易错点：
+#   - 两条 `absent_over_time` 判的是「**一条都没有**」：第四条把输入整个清空。
+#   - `producer_stopped` 的界是 6 × 自报周期，不是常数。
+#   - `ledger_census_stopped` 的「没有」是**子查询里没有点**，不是「没有这条序列」：
+#     第五条给出序列但把时间戳钉死，让子查询每个点都判不过——删掉新鲜度那半这一格会静。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-policy-principle.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: policy_evolution_rounds_all_failed
+# rule: policy_store_announced_without_a_version
+# rule: policy_store_active_pointer_names_a_missing_version
+# rule: principle_producer_never_delivered
+# rule: principle_producer_stopped
+# rule: principle_ledger_census_stopped
+
+evaluation_interval: 1m
+
+tests:
+  # 策略面健康：有轮次成功过、存储宣告与活跃版本两条读数都在、活跃指针指向存在的版本；
+  # 原则生产者在一分钟前推过、账本普查五分钟前跑过。六条全静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_policy_evolution_rounds_total{outcome="failed",job="policy"}'
+        values: '0x60'
+      - series: 'cogneva_policy_evolution_rounds_total{outcome="landed",job="policy"}'
+        values: '0x50 3x10'
+      - series: 'cogneva_policy_store_readings{readout="data_dir",store="default"}'
+        values: '1x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="data_dir",store="default"}'
+        values: '3500x60'
+      - series: 'cogneva_policy_store_readings{readout="active_version",store="default",data_dir="/var/policy"}'
+        values: '1x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="active_version",store="default",data_dir="/var/policy"}'
+        values: '3500x60'
+      - series: 'cogneva_principle_producer_last_push_timestamp_seconds{trigger="timer",source="main"}'
+        values: '3500x60'
+      - series: 'cogneva_principle_producer_push_period_seconds{trigger="timer",source="main"}'
+        values: '60x60'
+      - series: 'cogneva_principle_ledger_rows'
+        values: '120x60'
+      - series: 'cogneva_principle_ledger_rows_observed_timestamp_seconds'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: policy_evolution_rounds_all_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: policy_store_announced_without_a_version
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: policy_store_active_pointer_names_a_missing_version
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: principle_producer_never_delivered
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: principle_producer_stopped
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: principle_ledger_census_stopped
+        exp_alerts: []
+
+  # 都在说坏消息：六小时里两轮全失败且没有一轮成功、data_dir 读数在而 active_version 读数缺席、
+  # 活跃指针指向 -1（版本不在）；原则生产者从不推、账本普查没有一行。六条全亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_policy_evolution_rounds_total{outcome="failed",job="policy"}'
+        values: '0x50 2x10'
+      - series: 'cogneva_policy_store_readings{readout="data_dir",store="default"}'
+        values: '1x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="data_dir",store="default"}'
+        values: '3500x60'
+      - series: 'cogneva_policy_store_readings{readout="active_version",store="default",data_dir="/var/policy"}'
+        values: '-1x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="active_version",store="default",data_dir="/var/policy"}'
+        values: '3500x60'
+      - series: 'cogneva_principle_producer_last_push_timestamp_seconds{trigger="timer",source="main"}'
+        values: '1000x60'
+      - series: 'cogneva_principle_producer_push_period_seconds{trigger="timer",source="main"}'
+        values: '60x60'
+      - series: 'cogneva_principle_ledger_rows'
+        values: '0x60'
+      - series: 'cogneva_principle_ledger_rows_observed_timestamp_seconds'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: policy_evolution_rounds_all_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outcome: failed
+      # 这一格里活跃版本读数在（哪怕值是 -1），所以「宣告了却没有版本」静——
+      # 它问的是那条读数缺不缺，不是它的值好不好。缺读数的情形见下一格。
+      - eval_time: 60m
+        alertname: policy_store_announced_without_a_version
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: policy_store_active_pointer_names_a_missing_version
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              store: default
+              data_dir: /var/policy
+      - eval_time: 60m
+        alertname: principle_producer_never_delivered
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: principle_producer_stopped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              source: main
+      - eval_time: 60m
+        alertname: principle_ledger_census_stopped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 存储宣告说自己在某个目录上，可活跃版本那条读数**一条都没有**：宣告了却没有版本。
+  # 给 active_version 补一条读数，这一格就静（上一格已证）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_policy_store_readings{readout="data_dir",store="default"}'
+        values: '1x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="data_dir",store="default"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: policy_store_announced_without_a_version
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: policy_store_active_pointer_names_a_missing_version
+        exp_alerts: []
+
+  # 轮次有失败，但同一窗口里也有成功：不是「全失败」。删掉 `unless` 那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_policy_evolution_rounds_total{outcome="failed",job="policy"}'
+        values: '0x50 2x10'
+      - series: 'cogneva_policy_evolution_rounds_total{outcome="landed",job="policy"}'
+        values: '0x40 1x20'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: policy_evolution_rounds_all_failed
+        exp_alerts: []
+
+  # 活跃指针读数是 -1，但这份读数一小时前就停了：现在指向哪儿不知道。
+  # 删掉新鲜度那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_policy_store_readings{readout="active_version",store="default",data_dir="/var/policy"}'
+        values: '-1x60'
+      - series: 'cogneva_policy_store_readings_observed_timestamp_seconds{readout="active_version",store="default",data_dir="/var/policy"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: policy_store_active_pointer_names_a_missing_version
+        exp_alerts: []
+
+  # 账本普查的序列在，但它的观测时间戳钉死了：子查询里没有一个「新鲜的」点，等于没在普查。
+  # 删掉新鲜度那半，这一格会静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_principle_ledger_rows'
+        values: '120x60'
+      - series: 'cogneva_principle_ledger_rows_observed_timestamp_seconds'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: principle_ledger_census_stopped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 原则生产者的序列一条都没有：`never_delivered` 亮，而 `stopped` 静——它比的是两条读数之间
+  # 的差，缺了右边那条就是空，不响。
+  - interval: 1m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: principle_producer_never_delivered
+        exp_alerts:
+          # `absent_over_time` 会把选择器里的等值匹配器**合成到结果标签上**：
+          # 序列缺席时仍然带着 `trigger="timer"`，所以断言里要写它。
+          - exp_labels:
+              severity: warning
+              trigger: timer
+      - eval_time: 60m
+        alertname: principle_producer_stopped
+        exp_alerts: []
