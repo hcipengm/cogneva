@@ -1,0 +1,74 @@
+# 出生占用那条告警的单测夹具：让 Prometheus 自己的规则引擎跑一遍，断言它真的会从
+# 「空」走到 firing，且在四种该安静的形状下真的安静。
+#
+# 这条规则读的序列由应用发布（`cogneva_boot_rss_bytes`，每个启动阶段一条），它的规则
+# 不在 PrometheusRule 清单里，而在部署配置的进程内 watcher 那一库——所以这里点名规则名，
+# 由跑者从 `deploy/helm/cogneva/files/cogneva.json` 按名字取正文：
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-boot-phase-footprint.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+#
+# `rule_files` 这一行由跑的人重写：promtool 只认裸的 `groups:` 文件，不认部署配置。
+# 跑者按下面的 `# rule:` 行从 `cogneva.json` 把这几条规则抽到临时文件再改指过去——
+# 规则只有一份，测试读的就是发出去的那份。
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: boot_phase_footprint_grew
+
+evaluation_interval: 5m
+
+tests:
+  # 一代新生阶段的占用比最近三天的最低值高 10%：响。1.05 的界、1 GiB 的地板、
+  # 六天的采样铺满三天——三腿都要成立，这条才该响。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_boot_rss_bytes{phase="reranker",pod="a"}'
+        values: '2000000000x1728'
+      - series: 'cogneva_boot_rss_bytes{phase="reranker",pod="b"}'
+        values: '_x1440 2200000000x288'
+    alert_rule_test:
+      - eval_time: 143h55m
+        alertname: boot_phase_footprint_grew
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              phase: reranker
+
+  # 同样的两代、同样的大小：比值 1.0，安静。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_boot_rss_bytes{phase="reranker",pod="a"}'
+        values: '2000000000x1728'
+      - series: 'cogneva_boot_rss_bytes{phase="reranker",pod="b"}'
+        values: '_x1440 2000000000x288'
+    alert_rule_test:
+      - eval_time: 143h55m
+        alertname: boot_phase_footprint_grew
+        exp_alerts: []
+
+  # 序列比窗口年轻：比值 1.2 也不许响——三天那句话没有被六天的采样铺满，
+  # 这正是「一个刚起的 Pod 凭一条采样证明自己已经持续了三天」那个形状。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_boot_rss_bytes{phase="reranker",pod="a"}'
+        values: '2000000000x576'
+      - series: 'cogneva_boot_rss_bytes{phase="reranker",pod="b"}'
+        values: '_x288 2400000000x288'
+    alert_rule_test:
+      - eval_time: 47h55m
+        alertname: boot_phase_footprint_grew
+        exp_alerts: []
+
+  # 不到 1 GiB 的阶段：300 MiB 涨到 400 MiB 是 1.33 倍，仍然不归这条规则问。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_boot_rss_bytes{phase="process-start",pod="a"}'
+        values: '314572800x1728'
+      - series: 'cogneva_boot_rss_bytes{phase="process-start",pod="b"}'
+        values: '_x1440 419430400x288'
+    alert_rule_test:
+      - eval_time: 143h55m
+        alertname: boot_phase_footprint_grew
+        exp_alerts: []
