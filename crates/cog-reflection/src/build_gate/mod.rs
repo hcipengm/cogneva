@@ -1,4 +1,5 @@
 //! principle: feedback_a_caller_must_record_the_answer_to_its_write_not_its_intent
+//! principle: feedback_a_takeover_is_not_a_renewal_so_the_interval_belongs_to_the_claim_it_replaced
 //! A host-wide gate on how many builds run at once.
 //!
 //! The gate lives here, beside the builds it bounds, and not in `cog-core`:
@@ -2058,14 +2059,20 @@ impl BuildGate {
             dir = %self.dir.display(),
             "claiming the next build: builds stand down until this work gets one"
         );
-        // Reaching here means the claim just written either replaced this work's
-        // own fresh one or met an empty field; another work's claim returns
-        // above. The gap is the interval this work's renewal cadence runs at, so
-        // a cadence that crowds the line is visible while the claim is still
-        // alive, not only once it has expired and been read as stale.
-        if let Some((_, previous_since)) = previous {
-            self.renew_gap_seconds[asker_index(what)]
-                .store(since.saturating_sub(previous_since), Ordering::Relaxed);
+        // Reaching here means the claim just written replaced this work's own
+        // fresh one, met an empty field, or took the turn over another work's
+        // claim. Only the first is a renewal, and only a renewal measures this
+        // work's cadence: over the second there is no interval, and after a
+        // take-over the interval would be the length of *the other* work's
+        // claim, published under this asker. The gauge is the only reading that
+        // says whether a holder renews faster than builds can be served, so
+        // crediting it to the wrong asker hides exactly the starvation it exists
+        // to show.
+        if let Some((previous_holder, previous_since)) = previous {
+            if previous_holder == what {
+                self.renew_gap_seconds[asker_index(what)]
+                    .store(since.saturating_sub(previous_since), Ordering::Relaxed);
+            }
         }
         true
     }
@@ -4785,6 +4792,41 @@ unevictable 28532736
             gate.counters().renew_gap_seconds[asker_index("change verification")],
             0,
             "a work that never renewed has no interval to report"
+        );
+    }
+
+    /// A claim taken over from another work is not a renewal of this one. The
+    /// seconds between the two field writes belong to the work that held the
+    /// claim, and publishing them under the asker that overtook it would credit
+    /// a slow cadence to the work with the fast one -- or the reverse.
+    #[test]
+    fn a_taken_over_claim_does_not_report_the_other_works_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 0);
+        let path = dir.path().join(RESERVE_FILE);
+        let gap = |gate: &BuildGate| {
+            gate.counters().renew_gap_seconds[asker_index("change verification")]
+        };
+
+        // The other work claimed 400 seconds ago and this one is told to leave
+        // the turn to it; that first stand-down is what starts the clock.
+        let earlier = unix_now().saturating_sub(400);
+        write_gate_file(&path, &format!("mainline advance\t{earlier}\n")).unwrap();
+        assert!(
+            !gate.reserve_build_field("change verification"),
+            "the first stand-down leaves the turn to the work that asked first"
+        );
+        // Being served is what makes the turn movable: that work has had its
+        // turn, so a stand-down that outlives the service is being passed over.
+        gate.note_served("mainline advance");
+        assert!(
+            gate.reserve_build_field("change verification"),
+            "the work that was served has had its turn, so this one takes the claim"
+        );
+        assert_eq!(
+            gap(&gate),
+            0,
+            "the interval after a take-over belongs to the work that was overtaken"
         );
     }
 
