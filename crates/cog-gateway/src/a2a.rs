@@ -363,7 +363,25 @@ fn card_response(port: u16, headers: &HeaderMap, uri: &Uri, default: A2aVersion)
         header::HeaderValue::from_str(&etag)
             .unwrap_or_else(|_| header::HeaderValue::from_static("\"\"")),
     );
+    headers_mut.insert(header::LAST_MODIFIED, card_last_modified());
     response
+}
+
+/// 名片这个表示「上一次可能改动」的时刻，按 HTTP 的日期格式给出去。
+///
+/// 取本进程第一次渲染名片的时刻：正文是发版版本、进程配置与调用方 `Host` 的函数，
+/// 前两者随进程启动而定，第三者随请求变、已经由内容 `ETag` 覆盖。所以对一个固定的
+/// 调用方，正文在这个进程里不会再变，而**报早一点是安全的**——缓存只是多来问一次；
+/// 报晚一点则会让对端拿着一张过期名片继续用。强 `ETag` 优先于这个弱校验器。
+fn card_last_modified() -> header::HeaderValue {
+    use chrono::{DateTime, Utc};
+    use std::sync::OnceLock;
+    use std::time::SystemTime;
+
+    static FIRST_RENDER: OnceLock<SystemTime> = OnceLock::new();
+    let at: DateTime<Utc> = (*FIRST_RENDER.get_or_init(SystemTime::now)).into();
+    header::HeaderValue::from_str(&at.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+        .unwrap_or_else(|_| header::HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"))
 }
 
 /// 哈希的前 16 个十六进制位：足够区分名片，又不至于把响应头撑长。

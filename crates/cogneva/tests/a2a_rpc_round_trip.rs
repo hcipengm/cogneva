@@ -528,6 +528,74 @@ async fn the_card_is_discoverable_where_the_specification_puts_it() {
     assert_eq!(body, serde_json::Value::Null, "304 carries no body");
 }
 
+/// 名片还带一个弱校验器 `Last-Modified`，而且它在两次取之间不动。
+///
+/// 强 `ETag` 管「内容变没变」，`Last-Modified` 管「什么时候可能变过」——老代理与
+/// 只认时间的客户端只有后者。它必须是**进程级固定值**：每取一次就换一个时刻的头，
+/// 会让所有按时间判断的缓存永远判成「刚变过」，等于没有这个头。
+#[tokio::test]
+async fn the_card_carries_a_last_modified_that_does_not_move_between_fetches() {
+    let state = router_state::stateless();
+    let app = create_router(state);
+
+    let fetch = |inm: Option<String>| {
+        let app = app.clone();
+        async move {
+            let mut builder = Request::builder()
+                .method("GET")
+                .uri("/.well-known/agent-card.json")
+                .header("Host", "cogneva.example");
+            if let Some(etag) = inm {
+                builder = builder.header("If-None-Match", etag);
+            }
+            let response = app
+                .oneshot(builder.body(Body::empty()).expect("well formed"))
+                .await
+                .expect("the router answers");
+            let header = |name: &str| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            };
+            let status = response.status().as_u16();
+            (status, header("etag"), header("last-modified"))
+        }
+    };
+
+    let (status, etag, first) = fetch(None).await;
+    assert_eq!(status, 200);
+    let etag = etag.expect("a discovery card carries an ETag");
+    let last_modified = first.expect("a discovery card carries a Last-Modified");
+    // HTTP 只认这一种日期拼法（`Sun, 06 Nov 1994 08:49:37 GMT`）；长度与结尾一起判，
+    // 是因为一个「差不多像」的日期串不会被解析器拒绝，只会被静默忽略。
+    assert_eq!(
+        last_modified.len(),
+        29,
+        "an HTTP date is 29 characters: {last_modified}"
+    );
+    assert!(
+        last_modified.ends_with(" GMT"),
+        "an HTTP date ends in GMT: {last_modified}"
+    );
+
+    let (_, _, again) = fetch(None).await;
+    assert_eq!(
+        again.as_deref(),
+        Some(last_modified.as_str()),
+        "the same process serves the same Last-Modified, or no cache can trust it"
+    );
+
+    let (status, _, on_304) = fetch(Some(etag)).await;
+    assert_eq!(status, 304);
+    assert_eq!(
+        on_304.as_deref(),
+        Some(last_modified.as_str()),
+        "a 304 repeats the validators it would have sent with the body"
+    );
+}
+
 /// One HTTP round trip to the endpoint, returning the JSON body. Used where the
 /// test has to send something the client would refuse to build.
 async fn post(app: &axum::Router, token: &str, body: serde_json::Value) -> serde_json::Value {
