@@ -1,0 +1,315 @@
+# 样本日志/退休表的五个读数（容量已经顶到地板、扫描失败、日志没在剪、退休的行还在来、
+# 退休释放失败）与 clippy 判据面的四个读数（判据没产出、待判的迟迟不结、判据账本坏了、
+# 读数停了）的单测夹具。
+#
+# metrics 一族的五条都带同一条**新鲜度腿**（`time() - *_observed_timestamp_seconds < …`），
+# 第三格把它们各自单独证一遍：值越界而时间戳陈旧时，五条都必须静——删掉新鲜度那半，那一格会响。
+# 另外两条是「A 在涨而 B 没涨」的形状（日志的样本行数没剪、退休的行还在来），各带一条
+# 「读数得存在够久」的腿；第四、五、七格用 `_` 空采样把「读数刚出现」造出来，让那条腿单独可证。
+#
+# 反过来说，`metrics_sample_log_unpruned` 的「超预算」那半与新鲜度腿共用了同一个空乘积：
+# 预算那条序列缺席时整个乘积为空、静的是空而不是判据。所以预算序列在每一格里都显式给全。
+#
+# clippy 一族的第四条判的是「一条都没有」（`absent_over_time`），第五格用空输入证它；
+# 而第一条是 `1 - present`，present 缺席时结果也是空(不是 1)——所以第六格特意给出
+# present=0 的「在写、写的是坏消息」情形，只有这一格能让第一条亮。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-metrics-clippy.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: metrics_log_at_floor_capacity
+# rule: metrics_sample_sweep_failed
+# rule: metrics_sample_log_unpruned
+# rule: metrics_retired_rows_still_arriving
+# rule: metrics_retirement_release_failed
+# rule: clippy_verdict_not_produced
+# rule: clippy_verdict_pending_never_settles
+# rule: clippy_verdict_ledger_damaged
+# rule: clippy_verdict_readings_stopped
+
+evaluation_interval: 1m
+
+tests:
+  # 一切正常：没撞容量地板、扫描没失败、样本行数在预算内、没有退休行在来、释放没失败；
+  # clippy 判据在产出、没有积压、账本没坏行。九条全静。
+  - interval: 1m
+    input_series:
+      - series: 'metrics_samples_over_capacity{pod="p1",container="app",instance="i1"}'
+        values: '0x60'
+      - series: 'metrics_samples_over_capacity_observed_timestamp_seconds{pod="p1",container="app",instance="i1"}'
+        values: '3500x60'
+      - series: 'metrics_sample_sweep_failed{pod="p1",container="app",instance="i1"}'
+        values: '0x60'
+      - series: 'metrics_sample_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1"}'
+        values: '3500x60'
+      - series: 'metrics_samples_rows{pod="p1",container="app",instance="i1"}'
+        values: '80x60'
+      - series: 'metrics_samples_rows_observed_timestamp_seconds{pod="p1",container="app",instance="i1"}'
+        values: '3500x60'
+      - series: 'metrics_samples_budget_rows{pod="p1",container="app",instance="i1"}'
+        values: '100x60'
+      - series: 'metrics_retired_rows_removed{table="events"}'
+        values: '0x60'
+      - series: 'metrics_retired_rows_removed_observed_timestamp_seconds{table="events"}'
+        values: '3500x60'
+      - series: 'metrics_retirement_release_failed{pod="p1",container="app",instance="i1",job="metrics"}'
+        values: '0x60'
+      - series: 'metrics_retirement_release_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",job="metrics"}'
+        values: '3500x60'
+      - series: 'cogneva_clippy_verdict_present{node="n1"}'
+        values: '1x60'
+      - series: 'cogneva_clippy_pending_revs{node="n1"}'
+        values: '0x60'
+      - series: 'cogneva_clippy_verdict_unparsable_lines{node="n1"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: metrics_log_at_floor_capacity
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: metrics_sample_sweep_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: metrics_sample_log_unpruned
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: metrics_retired_rows_still_arriving
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: metrics_retirement_release_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: clippy_verdict_not_produced
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: clippy_verdict_pending_never_settles
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: clippy_verdict_ledger_damaged
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: clippy_verdict_readings_stopped
+        exp_alerts: []
+
+  # 坏消息：撞了容量地板、扫描失败了一次、样本行数 200 而预算 100、释放失败过一次。
+  # 四条亮（退休行那条要两小时历史，另开一格）。
+  - interval: 1m
+    input_series:
+      - series: 'metrics_samples_over_capacity{pod="p1",container="app",instance="i1"}'
+        values: '1x60'
+      - series: 'metrics_samples_over_capacity_observed_timestamp_seconds{pod="p1",container="app",instance="i1"}'
+        values: '3500x60'
+      - series: 'metrics_sample_sweep_failed{pod="p1",container="app",instance="i1"}'
+        values: '1x60'
+      - series: 'metrics_sample_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1"}'
+        values: '3500x60'
+      - series: 'metrics_samples_rows{pod="p1",container="app",instance="i1"}'
+        values: '200x60'
+      - series: 'metrics_samples_rows_observed_timestamp_seconds{pod="p1",container="app",instance="i1"}'
+        values: '3500x60'
+      - series: 'metrics_samples_budget_rows{pod="p1",container="app",instance="i1"}'
+        values: '100x60'
+      - series: 'metrics_retirement_release_failed{pod="p1",container="app",instance="i1",job="metrics"}'
+        values: '1x60'
+      - series: 'metrics_retirement_release_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",job="metrics"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: metrics_log_at_floor_capacity
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: metrics_sample_sweep_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: metrics_sample_log_unpruned
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: metrics_retirement_release_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 同样的坏消息，但四条读数的时间戳停在很久以前：现在是涨是跌不知道。
+  # 删掉新鲜度那半，这一格会响四条。
+  # `sample_log_unpruned` 的新鲜度腿长在 `[30m:1m]` 子查询里，子查询每个点各问一次
+  # `time() - ts`：时间戳停在 1 分 40 秒的话，子查询最左那个点（time()=1800）仍算新鲜，
+  # 整条照样响。所以这一格把时间戳钉在 0 —— 连窗口起点都够不着，才真正是「过期」。
+  - interval: 1m
+    input_series:
+      - series: 'metrics_samples_over_capacity{pod="p1",container="app",instance="i1"}'
+        values: '1x60'
+      - series: 'metrics_samples_over_capacity_observed_timestamp_seconds{pod="p1",container="app",instance="i1"}'
+        values: '100x60'
+      - series: 'metrics_sample_sweep_failed{pod="p1",container="app",instance="i1"}'
+        values: '1x60'
+      - series: 'metrics_sample_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1"}'
+        values: '100x60'
+      - series: 'metrics_samples_rows{pod="p1",container="app",instance="i1"}'
+        values: '200x60'
+      - series: 'metrics_samples_rows_observed_timestamp_seconds{pod="p1",container="app",instance="i1"}'
+        values: '0x60'
+      - series: 'metrics_samples_budget_rows{pod="p1",container="app",instance="i1"}'
+        values: '100x60'
+      - series: 'metrics_retirement_release_failed{pod="p1",container="app",instance="i1",job="metrics"}'
+        values: '1x60'
+      - series: 'metrics_retirement_release_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",job="metrics"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: metrics_log_at_floor_capacity
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: metrics_sample_sweep_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: metrics_sample_log_unpruned
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: metrics_retirement_release_failed
+        exp_alerts: []
+
+  # 样本行数 200、预算 100，但这条读数一小时前才开始报：先攒够观察窗口再判。
+  # 删掉「一小时里的点比半小时里的多」那条腿，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'metrics_samples_rows{pod="p1",container="app",instance="i1"}'
+        values: '_x40 200x20'
+      - series: 'metrics_samples_rows_observed_timestamp_seconds{pod="p1",container="app",instance="i1"}'
+        values: '3500x60'
+      - series: 'metrics_samples_budget_rows{pod="p1",container="app",instance="i1"}'
+        values: '100x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: metrics_sample_log_unpruned
+        exp_alerts: []
+
+  # 样本行数 200 但预算也是 200：没超一成就不是「没剪」。删掉「超预算」那条腿，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'metrics_samples_rows{pod="p1",container="app",instance="i1"}'
+        values: '200x60'
+      - series: 'metrics_samples_rows_observed_timestamp_seconds{pod="p1",container="app",instance="i1"}'
+        values: '3500x60'
+      - series: 'metrics_samples_budget_rows{pod="p1",container="app",instance="i1"}'
+        values: '200x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: metrics_sample_log_unpruned
+        exp_alerts: []
+
+  # clippy 面：判据在写、写的却是「没产出」；待判的 4 个 rev 六小时没动过；账本里有一行坏的。
+  # 三条亮。同一格里 `readings_stopped` 静——读数在写，只是写的是坏消息。
+  # 这条要六小时历史：判据是「六小时里的点比三小时里的多」，读数总共才一小时时两半相等、
+  # 那条腿永远不成立——所以这一格必须跑到 360 分钟。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_clippy_verdict_present{node="n1"}'
+        values: '0x360'
+      - series: 'cogneva_clippy_pending_revs{node="n1"}'
+        values: '4x360'
+      - series: 'cogneva_clippy_verdict_unparsable_lines{node="n1"}'
+        values: '1x360'
+    alert_rule_test:
+      - eval_time: 360m
+        alertname: clippy_verdict_not_produced
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+      - eval_time: 360m
+        alertname: clippy_verdict_pending_never_settles
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+      - eval_time: 360m
+        alertname: clippy_verdict_ledger_damaged
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+      - eval_time: 360m
+        alertname: clippy_verdict_readings_stopped
+        exp_alerts: []
+
+  # 一条 clippy 读数都没有：只有 `readings_stopped` 亮，其余三条静——「没写」不是「写了坏消息」。
+  - interval: 1m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: clippy_verdict_readings_stopped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: clippy_verdict_not_produced
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: clippy_verdict_pending_never_settles
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: clippy_verdict_ledger_damaged
+        exp_alerts: []
+
+  # 待判的 4 个 rev 已经积压，但这条读数才报了 40 分钟：还不到判「三小时没结」的时候。
+  # 删掉「六小时里的点比三小时里的多」那条腿，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_clippy_pending_revs{node="n1"}'
+        values: '_x200 4x40'
+    alert_rule_test:
+      - eval_time: 240m
+        alertname: clippy_verdict_pending_never_settles
+        exp_alerts: []
+
+  # 退休表：`events` 这张表还在删退休的行（每小时删 5 行），读数两小时前就有、时间戳很新。
+  # 亮。
+  - interval: 1m
+    input_series:
+      - series: 'metrics_retired_rows_removed{table="events"}'
+        values: '5x120'
+      - series: 'metrics_retired_rows_removed_observed_timestamp_seconds{table="events"}'
+        values: '7000x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: metrics_retired_rows_still_arriving
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              table: events
+
+  # 同样的行数，但 `removed` 是 0：没有行在被删，「还在来」不成立。
+  # 这一格记的是行为，不是判据：规则里的 `> 0` 与外层阈值的 `> 0` 是同一个界，
+  # 把内层那半删掉，结果值仍是 0，外层照样静——**这条腿无法单独证**，别拿这一格当证明。
+  - interval: 1m
+    input_series:
+      - series: 'metrics_retired_rows_removed{table="events"}'
+        values: '0x120'
+      - series: 'metrics_retired_rows_removed_observed_timestamp_seconds{table="events"}'
+        values: '7000x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: metrics_retired_rows_still_arriving
+        exp_alerts: []
+
+  # 表还在删，但这条读数一小时前才开始报：先攒够两小时窗口。
+  # 删掉「两小时里的点比一小时里的多」那条腿，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'metrics_retired_rows_removed{table="events"}'
+        values: '_x60 5x60'
+      - series: 'metrics_retired_rows_removed_observed_timestamp_seconds{table="events"}'
+        values: '7000x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: metrics_retired_rows_still_arriving
+        exp_alerts: []

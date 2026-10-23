@@ -1,0 +1,212 @@
+# 容器四件（内存上限被页缓存顶穿、CPU 被限流、日志逼近轮转上限、盘写入太快）与
+# 重驱四件（原因耗尽、没证据也重驱、读侧预算丢了、写侧扣费没落库）的单测夹具。
+#
+# container 一族的四处易错点：
+#   - `memory_limit_sits_under_its_page_cache` 是「用量占上限 > 99%」**且**「缓存占用量 > 50%」
+#     两条同时成立才算。第三格把用量顶满而缓存只占一成：静。去掉第二个条件它就该亮。
+#     反过来说，只让缓存占比高、用量不高的情形在这条规则上**证不出来**——外层判据仍要求
+#     结果 > 0.99，而 `and` 的值取自左半边（用量比），左半边不高时结果本来就不 > 0.99。
+#   - `cpu_throttled` 与 `disk_write_rate_high` 都带 `time() - timestamp(...) < 300` 的新鲜腿。
+#     cpu 那条的窗口是 30m，读数停在十分钟前时窗口里还剩十来个点、rate 仍有值，所以第四格
+#     能真正单独证这条腿。disk 那条的窗口正好也是 5m，与新解度门槛等长：读数停到 5 分钟前
+#     时窗口里只剩一个点，rate 先变成空——这条腿在这条规则上**无法单独证**，只作抓取抖动
+#     下的兜底，不假装有判据。
+#   - `cpu_throttled` 的判据是 `rate * 0.1`：CFS 每秒最多 100 个周期，*10 之后才是「被限流
+#     周期的占比」，所以 > 0.5 就是「过半周期被限流」。夹具里为了让「停更」那一格在 extrapolation
+#     截断后仍越界，用了 2000/分钟（远超物理上限）的增量——这一格证的是腿，不是现实值。
+#   - `log_near_rotation_cap` 直接用 kubelet 报的字节数，判据是 64 MiB。
+#
+# redrive 一族四条全是 `increase(counter[24h]) > 0`，各自只认一个标签值；所以第六格同时让
+# `reason="other"` 在涨，四条仍静——标签选择器是判据的一部分。第五格是四条全静的健康账。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-container-redrive.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: container_memory_limit_sits_under_its_page_cache
+# rule: container_cpu_throttled
+# rule: container_log_near_rotation_cap
+# rule: container_disk_write_rate_high
+# rule: redrive_cause_exhausted
+# rule: redrive_refused_without_evidence
+# rule: redrive_budget_forgotten
+# rule: redrive_charge_not_persisted
+
+evaluation_interval: 1m
+
+tests:
+  # 一个安分的容器：内存用了一半、缓存占其中一成、没被限流过、日志才 1 KiB、盘写入为零。
+  # 四条全静。
+  - interval: 1m
+    input_series:
+      - series: 'container_memory_usage_bytes{namespace="cogneva",pod="p1",container="app"}'
+        values: '50x60'
+      - series: 'kube_pod_container_resource_limits{namespace="cogneva",pod="p1",container="app",resource="memory"}'
+        values: '100x60'
+      - series: 'container_memory_cache{namespace="cogneva",pod="p1",container="app"}'
+        values: '10x60'
+      - series: 'container_cpu_cfs_throttled_periods_total{namespace="cogneva",pod="p1",container="app"}'
+        values: '0x60'
+      - series: 'kubelet_container_log_filesystem_used_bytes{exported_namespace="cogneva",pod="p1",container="app"}'
+        values: '1024x60'
+      - series: 'container_fs_writes_bytes_total{namespace="cogneva",pod="p1",container="app"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: container_memory_limit_sits_under_its_page_cache
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: container_cpu_throttled
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: container_log_near_rotation_cap
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: container_disk_write_rate_high
+        exp_alerts: []
+
+  # 一个难受的容器：内存顶到上限且一半以上是页缓存、过半 CPU 周期被限流、
+  # 日志 100 MiB、盘写入 400 MiB/s。四条全亮。
+  - interval: 1m
+    input_series:
+      - series: 'container_memory_usage_bytes{namespace="cogneva",pod="p1",container="app"}'
+        values: '100x60'
+      - series: 'kube_pod_container_resource_limits{namespace="cogneva",pod="p1",container="app",resource="memory"}'
+        values: '100x60'
+      - series: 'container_memory_cache{namespace="cogneva",pod="p1",container="app"}'
+        values: '60x60'
+      - series: 'container_cpu_cfs_throttled_periods_total{namespace="cogneva",pod="p1",container="app"}'
+        values: '0+2000x59'
+      - series: 'kubelet_container_log_filesystem_used_bytes{exported_namespace="cogneva",pod="p1",container="app"}'
+        values: '104857600x60'
+      - series: 'container_fs_writes_bytes_total{namespace="cogneva",pod="p1",container="app"}'
+        values: '0+24000000000x59'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: container_memory_limit_sits_under_its_page_cache
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+              pod: p1
+              container: app
+      - eval_time: 60m
+        alertname: container_cpu_throttled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+              pod: p1
+              container: app
+      - eval_time: 60m
+        alertname: container_log_near_rotation_cap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              exported_namespace: cogneva
+              pod: p1
+              container: app
+      - eval_time: 60m
+        alertname: container_disk_write_rate_high
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+              pod: p1
+              container: app
+
+  # 内存顶满上限，但页缓存只占一成：这是应用自己吃掉的，不是「上限压到了页缓存底下」。
+  # 去掉「缓存占比 > 50%」那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'container_memory_usage_bytes{namespace="cogneva",pod="p1",container="app"}'
+        values: '100x60'
+      - series: 'kube_pod_container_resource_limits{namespace="cogneva",pod="p1",container="app",resource="memory"}'
+        values: '100x60'
+      - series: 'container_memory_cache{namespace="cogneva",pod="p1",container="app"}'
+        values: '10x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: container_memory_limit_sits_under_its_page_cache
+        exp_alerts: []
+
+  # 限流计数一路在涨，但这条读数二十分钟前就停了：现在涨不涨不知道。
+  # 去掉「五分钟内报过」那条腿，这一格会响（30 分钟窗口里还剩十个点，rate 有值）。
+  - interval: 1m
+    input_series:
+      - series: 'container_cpu_cfs_throttled_periods_total{namespace="cogneva",pod="p1",container="app"}'
+        values: '0+2000x39'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: container_cpu_throttled
+        exp_alerts: []
+
+  # 重驱账本一切归零：没有任何原因耗尽、没有无证据重驱、两侧预算都没丢。
+  - interval: 1h
+    input_series:
+      - series: 'cogneva_redrive_refusals_total{reason="cause_exhausted"}'
+        values: '0x26'
+      - series: 'cogneva_redrive_refusals_total{reason="no_evidence"}'
+        values: '0x26'
+      - series: 'cogneva_redrive_budget_losses_total{side="read"}'
+        values: '0x26'
+      - series: 'cogneva_redrive_budget_losses_total{side="write"}'
+        values: '0x26'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: redrive_cause_exhausted
+        exp_alerts: []
+      - eval_time: 26h
+        alertname: redrive_refused_without_evidence
+        exp_alerts: []
+      - eval_time: 26h
+        alertname: redrive_budget_forgotten
+        exp_alerts: []
+      - eval_time: 26h
+        alertname: redrive_charge_not_persisted
+        exp_alerts: []
+
+  # 重驱账本在说坏消息：因「原因耗尽」拒了 3 次、因「没证据」拒了 2 次、读侧丢了 1 份预算、
+  # 写侧扣费 4 次没落库。四条全亮。同一格里 `reason="other"` 涨了九次、`side="other"` 涨了
+  # 九次，它们不在任何一条的选择器里，不许多出一条。
+  - interval: 1h
+    input_series:
+      - series: 'cogneva_redrive_refusals_total{reason="cause_exhausted"}'
+        values: '0x20 3x6'
+      - series: 'cogneva_redrive_refusals_total{reason="no_evidence"}'
+        values: '0x22 2x4'
+      - series: 'cogneva_redrive_refusals_total{reason="other"}'
+        values: '0x20 9x6'
+      - series: 'cogneva_redrive_budget_losses_total{side="read"}'
+        values: '0x24 1x2'
+      - series: 'cogneva_redrive_budget_losses_total{side="write"}'
+        values: '0x19 4x7'
+      - series: 'cogneva_redrive_budget_losses_total{side="other"}'
+        values: '0x20 9x6'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: redrive_cause_exhausted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: cause_exhausted
+      - eval_time: 26h
+        alertname: redrive_refused_without_evidence
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: no_evidence
+      - eval_time: 26h
+        alertname: redrive_budget_forgotten
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              side: read
+      - eval_time: 26h
+        alertname: redrive_charge_not_persisted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              side: write
