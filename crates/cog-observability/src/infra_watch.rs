@@ -377,11 +377,26 @@ async fn tick(
                     eval_failure_plan(config.eval_failure_alert_after, *streak, latched)
                 {
                     if plan.sight {
-                        sight_eval_failure(&rule.name, *streak, &e, &key, outlets).await;
+                        sight_eval_failure(
+                            &rule.name,
+                            Some(rule.face.as_str()),
+                            *streak,
+                            &e,
+                            &key,
+                            outlets,
+                        )
+                        .await;
                     }
                     if plan.notify {
                         eval_failure_firing.insert(key.clone());
-                        notify_eval_failure(&rule.name, *streak, &e, outlets).await;
+                        notify_eval_failure(
+                            &rule.name,
+                            Some(rule.face.as_str()),
+                            *streak,
+                            &e,
+                            outlets,
+                        )
+                        .await;
                     }
                 }
                 continue;
@@ -436,6 +451,16 @@ async fn tick(
 /// self-alert path as a broken rule so the two read alike.
 pub const MIRROR_SOURCE: &str = "prometheus_alerts";
 
+/// The face that owns a failure of the mirror itself.
+///
+/// It is spelled here rather than left empty because the mirror is the alerting
+/// pipeline: when it cannot read Prometheus, the reading that would have said
+/// "this rule is firing" stops existing, and the face that keeps the alerting
+/// pipeline working is the one that has to act. An empty face would file that
+/// under nobody -- which is the exact failure this whole ownership field exists
+/// to end.
+const MIRROR_SOURCE_FACE: &str = "可观测与告警";
+
 /// What the mirror remembers between ticks.
 #[derive(Default)]
 struct MirrorState {
@@ -458,6 +483,11 @@ struct MirroredAlert {
     /// alert-state label describe the alert rather than the thing that is wrong,
     /// and a key carrying them would fork a row when either changes.
     labels: BTreeMap<String, String>,
+    /// The face the rule declared, kept out of [`Self::labels`] and out of the
+    /// key for the same reason severity is: it says who is called, not what
+    /// happened. Held separately so the row can still carry it -- a reader that
+    /// has to answer "who acts on this" reads it from the stored row.
+    face: Option<String>,
     message: String,
 }
 
@@ -468,7 +498,11 @@ impl MirroredAlert {
 }
 
 /// Labels that are part of Prometheus's alert envelope, not of the subject.
-const MIRROR_ENVELOPE_LABELS: &[&str] = &["alertname", "alertstate", "severity"];
+///
+/// `cogneva_io_face` belongs here rather than with the identity labels: it is
+/// the rule's own declaration of who acts, so handing the same rule to another
+/// face would otherwise fork a second row for an incident that never changed.
+const MIRROR_ENVELOPE_LABELS: &[&str] = &["alertname", "alertstate", "severity", ALERT_FACE_LABEL];
 
 /// Read one tick's worth of Prometheus-evaluated alerting state.
 ///
@@ -540,6 +574,10 @@ fn parse_alerts_response(
             })
             .map(str::to_string)
             .unwrap_or_else(|| rule.clone());
+        let face = labels
+            .get(ALERT_FACE_LABEL)
+            .filter(|f| !f.is_empty())
+            .cloned();
         let labels = labels
             .into_iter()
             .filter(|(k, _)| {
@@ -555,6 +593,7 @@ fn parse_alerts_response(
             rule,
             severity,
             labels,
+            face,
             message: summary,
         });
     }
@@ -614,12 +653,26 @@ async fn mirror_prometheus_alerts(
                 latched,
             ) {
                 if plan.sight {
-                    sight_eval_failure(MIRROR_SOURCE, state.failure_streak, &e, &key, outlets)
-                        .await;
+                    sight_eval_failure(
+                        MIRROR_SOURCE,
+                        Some(MIRROR_SOURCE_FACE),
+                        state.failure_streak,
+                        &e,
+                        &key,
+                        outlets,
+                    )
+                    .await;
                 }
                 if plan.notify {
                     eval_failure_firing.insert(key.clone());
-                    notify_eval_failure(MIRROR_SOURCE, state.failure_streak, &e, outlets).await;
+                    notify_eval_failure(
+                        MIRROR_SOURCE,
+                        Some(MIRROR_SOURCE_FACE),
+                        state.failure_streak,
+                        &e,
+                        outlets,
+                    )
+                    .await;
                 }
             }
             return;
@@ -665,6 +718,11 @@ async fn mirror_report(alert: &MirroredAlert, key: &str, outlets: &InfraWatchOut
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    // The key leaves the face out; the row must not. A reader answering "who
+    // acts on this" only has the stored row to read.
+    if let Some(face) = &alert.face {
+        labels.insert(ALERT_FACE_LABEL.into(), face.clone());
+    }
     labels.insert("message".into(), alert.message.clone());
     labels.insert("source".into(), MIRROR_SOURCE.into());
     let row = NewAlert {
@@ -929,12 +987,29 @@ fn dedup_key(rule_name: &str, labels: &BTreeMap<String, String>) -> String {
 /// plus the rendered message and the source. Built from [`identity_labels`] so
 /// the row's subject is the same one the key was computed for — a scrape label
 /// here would name a pod that merely served the metric.
-fn alert_labels(sample: &SeriesSample, message: &str) -> HashMap<String, String> {
+///
+/// The face is added here, after the key was computed, and never enters it: the
+/// face says who is called, not what happened. Reassigning a face must not fork
+/// a row, and a rule that names no face must not make its rows indistinguishable
+/// from owned ones, so an empty face writes no label at all rather than an empty
+/// one -- readers count rows whose label is absent or blank as unowned, and an
+/// empty string would make the absence look like a value.
+fn alert_labels(sample: &SeriesSample, message: &str, face: &str) -> HashMap<String, String> {
     let mut labels: HashMap<String, String> = identity_labels(&sample.labels).into_iter().collect();
+    if !face.is_empty() {
+        labels.insert(ALERT_FACE_LABEL.into(), face.to_string());
+    }
     labels.insert("message".into(), message.to_string());
     labels.insert("source".into(), "infra_watch".into());
     labels
 }
+
+/// The label a stored alert row uses to name the face that acts on it.
+///
+/// The same key the PrometheusRule manifests put on their rules, because both
+/// writers fill one table and the reader there must not have to know which
+/// writer wrote the row.
+const ALERT_FACE_LABEL: &str = "cogneva_io_face";
 
 /// Report one sighting to the store and notify on the edge.
 ///
@@ -949,7 +1024,7 @@ async fn report_sighting(
     outlets: &InfraWatchOutlets,
 ) {
     let message = render_summary(&rule.summary, sample.value, &sample.labels);
-    let labels = alert_labels(sample, &message);
+    let labels = alert_labels(sample, &message, &rule.face);
 
     if let Some(store) = &outlets.store {
         let alert = NewAlert {
@@ -987,6 +1062,7 @@ fn eval_failure_text(rule_name: &str, streak: u32, error: &str) -> String {
 /// the notification, not to the sighting -- see `notify_eval_failure`.
 async fn sight_eval_failure(
     rule_name: &str,
+    face: Option<&str>,
     streak: u32,
     error: &str,
     key: &str,
@@ -994,11 +1070,18 @@ async fn sight_eval_failure(
 ) {
     let Some(store) = &outlets.store else { return };
     let message = eval_failure_text(rule_name, streak, error);
-    let labels = HashMap::from([
+    let mut labels = HashMap::from([
         ("watched_rule".to_string(), rule_name.to_string()),
         ("message".to_string(), message.clone()),
         ("source".to_string(), "infra_watch".to_string()),
     ]);
+    // The rule that could not be evaluated is watched by the same face that
+    // would act on it firing: to that face the two are one thing -- a reading it
+    // owns is not being produced -- and a self-alert nobody owns is the very
+    // failure this row reports.
+    if let Some(face) = face.filter(|f| !f.is_empty()) {
+        labels.insert(ALERT_FACE_LABEL.to_string(), face.to_string());
+    }
     let alert = NewAlert {
         rule: EVAL_FAILURE_RULE.to_string(),
         dedup_key: key.to_string(),
@@ -1020,16 +1103,20 @@ async fn sight_eval_failure(
 /// threshold exists to prevent.
 async fn notify_eval_failure(
     rule_name: &str,
+    face: Option<&str>,
     streak: u32,
     error: &str,
     outlets: &InfraWatchOutlets,
 ) {
     let message = eval_failure_text(rule_name, streak, error);
-    let labels = HashMap::from([
+    let mut labels = HashMap::from([
         ("watched_rule".to_string(), rule_name.to_string()),
         ("message".to_string(), message),
         ("source".to_string(), "infra_watch".to_string()),
     ]);
+    if let Some(face) = face.filter(|f| !f.is_empty()) {
+        labels.insert(ALERT_FACE_LABEL.to_string(), face.to_string());
+    }
     let now = Utc::now();
     let inst = AlertInstance {
         rule_name: EVAL_FAILURE_RULE.to_string(),
@@ -1620,6 +1707,65 @@ mod tests {
         assert_eq!(e2e.labels.get("mountpoint").map(String::as_str), Some("/"));
     }
 
+    /// The face tells a reader who to call, so it has to survive into the row —
+    /// and it must stay out of the key, or handing a rule to another face forks
+    /// a second row for an incident that never changed.
+    #[test]
+    fn mirror_keeps_the_declared_face_out_of_the_key_and_in_the_row() {
+        let mirror = crate::config::AlertMirrorConfig {
+            label: "cogneva_io_managed".into(),
+            value: "true".into(),
+            include_unmarked: false,
+            exclude: Vec::new(),
+        };
+        let with_face = serde_json::json!({
+            "status": "success",
+            "data": {"alerts": [
+                {"state": "firing", "value": "1",
+                 "labels": {"alertname": "CognevaE2eRingFailed", "severity": "warning",
+                            "alertstate": "firing", "cogneva_io_managed": "true",
+                            "cogneva_io_face": "端到端演练", "mountpoint": "/"}}
+            ]}
+        });
+        let alerts = parse_alerts_response(&with_face, &mirror, &HashSet::new()).unwrap();
+        let alert = &alerts[0];
+        assert_eq!(alert.key(), "CognevaE2eRingFailed:mountpoint=/");
+        assert_eq!(alert.face.as_deref(), Some("端到端演练"));
+        assert!(!alert.labels.contains_key(ALERT_FACE_LABEL));
+
+        // A rule that declares no face keeps the same key and an empty face:
+        // the reader counts that row unowned rather than lending it the face of
+        // whatever fired next to it.
+        let unfaced = parse_alerts_response(&alerts_fixture(), &mirror, &HashSet::new()).unwrap();
+        assert_eq!(unfaced[0].key(), alert.key());
+        assert_eq!(unfaced[0].face, None);
+    }
+
+    /// The in-process writer hangs the face on the row the same way: present
+    /// when the rule declared one, absent (not empty) when it did not, and never
+    /// part of the identity the key was computed from.
+    #[test]
+    fn alert_labels_carry_the_face_without_changing_identity() {
+        let s = sample(&[("node", "vm-1"), ("job", "node-exporter")], 90.0);
+        let key_before = dedup_key("node_disk_usage_high", &s.labels);
+
+        let owned = alert_labels(&s, "root filesystem 90%", "资源管理");
+        assert_eq!(
+            owned.get(ALERT_FACE_LABEL).map(String::as_str),
+            Some("资源管理")
+        );
+        assert_eq!(dedup_key("node_disk_usage_high", &s.labels), key_before);
+        // The face must not become an identity label: it is not derived from
+        // the series, and identity labels are copied from the sample.
+        assert!(!identity_labels(&s.labels).contains_key(ALERT_FACE_LABEL));
+
+        let unowned = alert_labels(&s, "root filesystem 90%", "");
+        assert!(
+            !unowned.contains_key(ALERT_FACE_LABEL),
+            "an undeclared face must write no label at all, not an empty one"
+        );
+    }
+
     #[test]
     fn mirror_rejects_error_and_malformed_responses() {
         let mirror = crate::config::AlertMirrorConfig {
@@ -1687,7 +1833,7 @@ mod tests {
             ],
             1.0,
         );
-        let labels = alert_labels(&s, "backlog aged out");
+        let labels = alert_labels(&s, "backlog aged out", "");
 
         assert_eq!(labels.get("node").map(String::as_str), Some("vm-1"));
         assert_eq!(
@@ -2112,6 +2258,7 @@ mod tests {
             condition: cog_core::AlertCondition::GreaterThan(0.0),
             severity: cog_core::AlertSeverity::Warning,
             summary: "s".to_string(),
+            face: String::new(),
             for_seconds: None,
         }
     }

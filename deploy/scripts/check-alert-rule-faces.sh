@@ -19,24 +19,38 @@
 # **申报了没有**；申报了一个不存在的面名，是读取方那一步的事——它 join 面主表时找不到面主，
 # 那一行照样是「没人管」。两处各判一件事，判据才不会互相抄成两个口径。
 #
-# 射程是 `deploy/k3s/observability/manifests/` 里的 PrometheusRule 清单。chart 里那套
-# 由进程自己求值的规则（`deploy/helm/cogneva/files/cogneva.json`）**不在这条门的射程里**，
-# 这是已知的缺口而不是判断：那些规则今天没有任何面可申报（配置结构里没有这一格），它们
-# 写进 `alerts` 表的行因此全是无主的。补法是给这套规则加同一格并逐条归类，与这条门分开落。
+# 射程两套，因为告警有两个写者，两边都会往同一张 `alerts` 表里写行：
 #
-# 用法：bash deploy/scripts/check-alert-rule-faces.sh [manifest 目录]
+#   1. `deploy/k3s/observability/manifests/` 里的 PrometheusRule 清单（Prometheus 求值、
+#      镜像进表）。这里判两向：带 `cogneva_io_managed` 的缺面即红；面标签挂在不投递的
+#      规则上也红。
+#   2. chart 里那套由进程自己求值的规则（`deploy/helm/cogneva/files/cogneva.json` 的
+#      `observability.infra_watch.rules`）。它们的配置结构里有独立的 `face` 一格，进程把它
+#      写进存库行的 `cogneva_io_face` 标签，读法两边一致。这里判一向：每条规则都要有面。
+#      **这一套才是现网最响的那一半**——2026-10-23 实测正 firing 的十一行里八行出自它，
+#      而当时这一格还不存在，于是它们全是无主的，门却绿着。
+#
+# 只读 chart 那一份就够：`deploy/k3s/cogneva-json-configmap.yaml` 与 `deploy/rendered/`
+# 是它的载物，由 check-deploy-parity.sh 逐字段比对，在这里再抄一遍判据只会多一份会各自漂的
+# 口径。
+#
+# 用法：bash deploy/scripts/check-alert-rule-faces.sh [manifest 目录] [chart 配置路径]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MANIFESTS="${1:-${ROOT}/deploy/k3s/observability/manifests}"
+CHART_CONFIG="${2:-${ROOT}/deploy/helm/cogneva/files/cogneva.json}"
 [ -d "${MANIFESTS}" ] || { echo "找不到规则目录：${MANIFESTS}" >&2; exit 2; }
+[ -f "${CHART_CONFIG}" ] || { echo "找不到 chart 配置：${CHART_CONFIG}" >&2; exit 2; }
 
 command -v python3 >/dev/null || { echo "缺少依赖：python3" >&2; exit 2; }
-python3 - "${MANIFESTS}" <<'PYEOF'
+python3 - "${MANIFESTS}" "${CHART_CONFIG}" <<'PYEOF'
+import json
 import os
 import sys
 
 manifests = sys.argv[1]
+chart_config = sys.argv[2]
 managed_label = "cogneva_io_managed"
 face_label = "cogneva_io_face"
 
@@ -134,16 +148,45 @@ if total == 0:
     print(f"没在 {manifests} 里读到任何告警规则，所以这条门什么都没看", file=sys.stderr)
     sys.exit(2)
 
+# 第二套：chart 里那批由进程自己求值的规则。读 JSON 而不是扫文本，因为这一格本来就是
+# 配置里的一个字段——写成文本再扫，等于把「结构里有没有」换成一门自己发明的语法。
+try:
+    with open(chart_config, encoding="utf-8") as f:
+        chart_rules = json.load(f)["observability"]["infra_watch"]["rules"]
+except (OSError, ValueError, KeyError) as e:
+    print(f"读不出 {chart_config} 的 observability.infra_watch.rules：{e}", file=sys.stderr)
+    sys.exit(2)
+
+if not chart_rules:
+    print(f"{chart_config} 里一条进程内规则都没有，这一半没被看过", file=sys.stderr)
+    sys.exit(2)
+
+chart_owned = 0
+for rule in chart_rules:
+    if not isinstance(rule, dict) or "name" not in rule:
+        complaints.append(f"{os.path.basename(chart_config)}: 有一条规则连 name 都没有，读不出它归谁")
+        continue
+    face = str(rule.get("face") or "").strip()
+    if not face:
+        complaints.append(
+            f"{os.path.basename(chart_config)}: {rule['name']} 由进程自己求值并写进告警账，"
+            f"却没有 face——这一行响了之后没有任何面的读法答得出该谁动"
+        )
+    else:
+        chart_owned += 1
+
 if complaints:
     for c in complaints:
         print("RED " + c)
     print(
-        f"\n{len(complaints)} 条问题：托管规则 {tagged}/{managed} 条申报了面"
-        f"（共 {total} 条告警，{seen_files} 份清单）"
+        f"\n{len(complaints)} 条问题：清单里托管规则 {tagged}/{managed} 条申报了面"
+        f"（共 {total} 条告警，{seen_files} 份清单）；chart 里进程内规则 "
+        f"{chart_owned}/{len(chart_rules)} 条申报了面"
     )
     sys.exit(1)
 
 print(
-    f"ok：{managed} 条托管告警规则都申报了面（共 {total} 条告警，{seen_files} 份清单）"
+    f"ok：清单 {managed} 条托管告警规则、chart {chart_owned} 条进程内规则都申报了面"
+    f"（共 {total} 条清单告警，{seen_files} 份清单）"
 )
 PYEOF

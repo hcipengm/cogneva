@@ -293,6 +293,20 @@ pub struct InfraRule {
     /// Human-readable summary; `{value}` is substituted with the last
     /// observed sample value.
     pub summary: String,
+    /// Which face acts when this rule fires, spelled the way the face roster
+    /// spells it.
+    ///
+    /// The row this rule writes has to answer "who do we call" on its own: the
+    /// table is what readers query at three in the morning, and a join table
+    /// would let a rule be added without anyone ever naming its owner. So the
+    /// answer travels with the rule and is copied into the stored labels.
+    ///
+    /// Empty means nobody declared one, and the ownership reading counts those
+    /// rows as unowned instead of defaulting to something plausible -- a rule
+    /// sent to the wrong face is worse than one that names nobody, because the
+    /// wrong face believes it is covered.
+    #[serde(default)]
+    pub face: String,
     /// How long the condition has to keep holding before a row is raised.
     ///
     /// One sample is evidence that something is wrong only when the reading
