@@ -402,12 +402,29 @@ impl MessageBackend for RedisMessageBackend {
         if ids.is_empty() {
             return Ok(());
         }
-        let _: i64 = self
-            .connection
-            .clone()
+        let mut conn = self.connection.clone();
+        let _: i64 = conn
             .xack(stream, group, ids)
             .await
             .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
+        // An ack is the moment an entry stops being anybody's work, so it is
+        // also the moment the stream may stop paying for it. Letting the entry
+        // stay makes the stream's length a lifetime traffic counter instead of
+        // a queue depth, and the retention is the server's whole memory: one
+        // live deployment carried 77 116 entries on a ready stream whose group
+        // had acked every one of them.
+        //
+        // Failing here must not fail the ack: the message is done, and a read
+        // loop that sees an error would redeliver work that already finished.
+        // What is lost is only the trimming, so the warning names the stream —
+        // the same symptom (entries nobody can read) then shows up again on the
+        // next ack instead of disappearing into a failed call.
+        if let Err(e) = trim_handled_prefix(&mut conn, stream).await {
+            tracing::warn!(
+                stream = %stream,
+                "trim after ack failed; acked entries stay in the stream: {e}"
+            );
+        }
         Ok(())
     }
 
@@ -587,6 +604,112 @@ impl MessageBackend for RedisMessageBackend {
     }
 }
 
+/// Delete the prefix of `stream` that no consumer group can be handed again.
+///
+/// `XACK` takes an id out of one group's pending list and nothing else: the
+/// entry itself stays in the stream for the life of the key. A stream that has
+/// done its job is therefore shaped exactly like a stream with a backlog — one
+/// live deployment held 77 116 entries on a ready stream with `lag` 0 and
+/// `pending` 0, memory nothing could ever read again on a server with no
+/// `maxmemory` to stop it. Length could only mean "work still in the queue" if
+/// something removed what left the queue.
+///
+/// What is safe to remove is decided per group and then the smallest answer
+/// wins. A group's floor is the oldest entry still in its pending list, or —
+/// when that list is empty — one past the last id it was delivered. Entries
+/// below the floor either were acked by that group or were never going to be
+/// handed to it at all: an explicit-id `XREADGROUP` reads only the caller's
+/// pending list, and a `>` read only starts after the last delivered id, so a
+/// group cannot reach below its own floor. Taking the minimum over groups keeps
+/// one group's progress from deleting what a slower group still owes.
+///
+/// The floor also closes the race between the two reads here: an entry handed
+/// out after `XINFO`/`XPENDING` answered carries an id above any id they
+/// reported, so the trim below it cannot touch a delivery in flight.
+async fn trim_handled_prefix(conn: &mut ConnectionManager, stream: &str) -> SFResult<()> {
+    let reply: redis::streams::StreamInfoGroupsReply = match redis::cmd("XINFO")
+        .arg("GROUPS")
+        .arg(stream)
+        .query_async(conn)
+        .await
+    {
+        Ok(reply) => reply,
+        // No key, or a stream without a group: nothing was ever handed to
+        // anybody, so nothing in it is history yet.
+        Err(e) if e.code() == Some("NOGROUP") => return Ok(()),
+        Err(e) if e.code() == Some("ERR") && e.to_string().contains("no such key") => return Ok(()),
+        Err(e) => return Err(SFError::Redis(e.to_string())),
+    };
+
+    let mut floor: Option<(u64, u64)> = None;
+    for group in &reply.groups {
+        let group_floor = if group.pending == 0 {
+            next_stream_id(&group.last_delivered_id)
+        } else {
+            // The oldest id this group was handed and has not acked. One row
+            // is enough and the server lists them in id order.
+            let rows: Vec<(String, String, u64, u64)> = redis::cmd("XPENDING")
+                .arg(stream)
+                .arg(&group.name)
+                .arg("-")
+                .arg("+")
+                .arg(1)
+                .query_async(conn)
+                .await
+                .map_err(|e| SFError::Redis(e.to_string()))?;
+            match rows.first().and_then(|(id, _, _, _)| parse_stream_id(id)) {
+                Some(id) => id,
+                // The group says it holds an unacked entry and the listing
+                // does not produce one, so the two reads disagree and this
+                // function cannot say what is safe. Deleting nothing is the
+                // only answer that cannot lose work.
+                None => return Ok(()),
+            }
+        };
+        floor = Some(match floor {
+            Some(current) => current.min(group_floor),
+            None => group_floor,
+        });
+    }
+
+    let Some(floor) = floor else {
+        return Ok(());
+    };
+    // `MINID` is exclusive: everything strictly below the floor is handled.
+    // A floor of 0-1 means no group has been handed anything yet.
+    if floor == (0, 1) {
+        return Ok(());
+    }
+    let minid = format!("{}-{}", floor.0, floor.1);
+    let _: u64 = redis::cmd("XTRIM")
+        .arg(stream)
+        .arg("MINID")
+        .arg(&minid)
+        .query_async(conn)
+        .await
+        .map_err(|e| SFError::Redis(e.to_string()))?;
+    Ok(())
+}
+
+/// `ms-seq` of a stream id, or `None` for anything else.
+fn parse_stream_id(id: &str) -> Option<(u64, u64)> {
+    let (ms, seq) = id.split_once('-')?;
+    Some((ms.parse().ok()?, seq.parse().ok()?))
+}
+
+/// The first id after `id`.
+fn next_stream_id(id: &str) -> (u64, u64) {
+    match parse_stream_id(id) {
+        Some((ms, seq)) => match seq.checked_add(1) {
+            Some(seq) => (ms, seq),
+            None => (ms.saturating_add(1), 0),
+        },
+        // A group that has been handed nothing reports `0-0`; the caller only
+        // formats this back, so any id that deletes nothing will do.
+        None => (0, 1),
+    }
+}
+
 async fn group_read(
     conn: &mut ConnectionManager,
     subject: &str,
@@ -747,6 +870,214 @@ mod tests {
 
         backend.ack(stream, group, &[id]).await.unwrap();
         assert_eq!(pending_count(&mut raw, stream, group).await, 0);
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+    }
+
+    async fn xlen(raw: &mut MultiplexedConnection, stream: &str) -> i64 {
+        redis::cmd("XLEN")
+            .arg(stream)
+            .query_async(raw)
+            .await
+            .expect("XLEN")
+    }
+
+    /// Read `count` messages in order, or `None` when the stream stops
+    /// answering — the caller turns that into a skip, as the tests above do.
+    async fn read_n(
+        backend: &Arc<dyn MessageBackend>,
+        stream: &str,
+        group: &str,
+        count: usize,
+    ) -> Option<Vec<(String, Vec<u8>)>> {
+        let mut sub = backend.subscribe(stream, group).await.ok()?;
+        let mut out = Vec::new();
+        for _ in 0..count {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await {
+                Ok(Some(Ok(msg))) => out.push(msg),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// 一条流「做完了」不能和「积压着」长得一样。XACK 只把 id 从 PEL 里摘掉，
+    /// 条目本身留在流里，于是 XLEN 变成了「历史上发过多少条」：现场一条 ready 流
+    /// 上 77116 条全部已 ack、lag 0、pending 0，没有一条还能被递给任何组，而服务器
+    /// 没有 maxmemory 来兜底。队列长度要表示「还没做完的活」，就得有人把做完的删掉。
+    #[tokio::test]
+    async fn acked_entries_leave_the_stream() {
+        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let stream = "cog-test:trim-acked";
+        let group = "trim-acked-group";
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+
+        let backend: Arc<dyn MessageBackend> =
+            Arc::new(RedisMessageBackend::new(&redis_url).await.unwrap());
+        backend.create_consumer_group(stream, group).await.unwrap();
+        for payload in [b"one".as_slice(), b"two", b"three"] {
+            backend.publish(stream, payload).await.unwrap();
+        }
+        let Some(messages) = read_n(&backend, stream, group, 3).await else {
+            eprintln!("SKIP: Redis stream read timed out or failed");
+            return;
+        };
+        assert_eq!(xlen(&mut raw, stream).await, 3, "三条都在流里，等着被 ack");
+
+        let ids: Vec<String> = messages.into_iter().map(|(id, _)| id).collect();
+        backend.ack(stream, group, &ids).await.unwrap();
+        assert_eq!(
+            xlen(&mut raw, stream).await,
+            0,
+            "已 ack 的条目仍留在流里：长度变成历史流量而不是排队深度，在没有 maxmemory 的服务器上就是无界增长"
+        );
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+    }
+
+    /// 比最老未 ack 更新的条目即使已 ack 也不许删：裁剪点取各组「最老未 ack」，
+    /// 不是「最大已 ack」。取错的话，被删的那条还在 PEL 里等着重投，重投时已经
+    /// 没有内容可读了。
+    #[tokio::test]
+    async fn an_unacked_entry_keeps_the_newer_acked_ones() {
+        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let stream = "cog-test:trim-pending";
+        let group = "trim-pending-group";
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+
+        let backend: Arc<dyn MessageBackend> =
+            Arc::new(RedisMessageBackend::new(&redis_url).await.unwrap());
+        backend.create_consumer_group(stream, group).await.unwrap();
+        for payload in [b"one".as_slice(), b"two", b"three"] {
+            backend.publish(stream, payload).await.unwrap();
+        }
+        let Some(messages) = read_n(&backend, stream, group, 3).await else {
+            eprintln!("SKIP: Redis stream read timed out or failed");
+            return;
+        };
+        let ids: Vec<String> = messages.into_iter().map(|(id, _)| id).collect();
+
+        // 第一条与第三条 ack，中间那条留着——它才是裁剪点。
+        backend
+            .ack(stream, group, &[ids[0].clone(), ids[2].clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_count(&mut raw, stream, group).await,
+            1,
+            "中间那条仍在 PEL 里等重投"
+        );
+        assert_eq!(
+            xlen(&mut raw, stream).await,
+            2,
+            "只剩它下面那条被删：裁剪点是最老未 ack 的那条，不是最大已 ack 的那条"
+        );
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+    }
+
+    /// 一个组读完了，不代表它对另一个组也是历史。裁剪点取各组下界的最小值：
+    /// 只问本组，就会把另一个组还没收到的消息删掉，而那个组永远收不到它们
+    /// （`>` 只投递最后投递号之后的条目）。
+    #[tokio::test]
+    async fn a_group_that_has_not_read_keeps_the_history_alive() {
+        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let stream = "cog-test:trim-two-groups";
+        let fast = "trim-two-groups-fast";
+        let slow = "trim-two-groups-slow";
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+
+        let backend: Arc<dyn MessageBackend> =
+            Arc::new(RedisMessageBackend::new(&redis_url).await.unwrap());
+        backend.create_consumer_group(stream, fast).await.unwrap();
+        for payload in [b"one".as_slice(), b"two", b"three"] {
+            backend.publish(stream, payload).await.unwrap();
+        }
+        // 第二个组从 0 开始建：它欠这三条，而第一个组已经要读完了。
+        let _: String = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(stream)
+            .arg(slow)
+            .arg("0")
+            .query_async(&mut raw)
+            .await
+            .expect("XGROUP CREATE");
+
+        let Some(messages) = read_n(&backend, stream, fast, 3).await else {
+            eprintln!("SKIP: Redis stream read timed out or failed");
+            return;
+        };
+        let ids: Vec<String> = messages.into_iter().map(|(id, _)| id).collect();
+        backend.ack(stream, fast, &ids).await.unwrap();
+        assert_eq!(
+            xlen(&mut raw, stream).await,
+            3,
+            "第二个组一条都没收到，这三条对它是待办不是历史"
+        );
+
+        // 第二个组补上之后，三条才成为两个组共同的过去。
+        let Some(second) = read_n(&backend, stream, slow, 3).await else {
+            eprintln!("SKIP: Redis stream read timed out or failed");
+            return;
+        };
+        let ids: Vec<String> = second.into_iter().map(|(id, _)| id).collect();
+        backend.ack(stream, slow, &ids).await.unwrap();
+        assert_eq!(
+            xlen(&mut raw, stream).await,
+            0,
+            "两个组都 ack 过之后，条目才是可以删的"
+        );
 
         let _: i64 = redis::cmd("DEL")
             .arg(stream)
