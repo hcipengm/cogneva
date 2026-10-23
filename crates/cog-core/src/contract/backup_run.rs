@@ -165,6 +165,15 @@ pub struct BackupRunClosing {
     pub package: Option<String>,
     /// The package file's size in bytes.
     pub bytes: Option<i64>,
+    /// The digest of the package's bytes, as they were written.
+    ///
+    /// Size says how much was written; this says it is the same file. They part
+    /// ways in the case worth catching -- a copy truncated and padded back to
+    /// the same length, a disk that returned different blocks, a rename over the
+    /// package by a file of equal size. Absent on a run that produced nothing,
+    /// and absent on packages written before this was recorded: a reader must be
+    /// able to tell "never recorded" from "recorded and equal".
+    pub package_checksum: Option<String>,
     /// How many packages the run's own retention pass left in the directory.
     pub kept_after: Option<i32>,
     /// The oldest package still in the directory after that pass, timed by the
@@ -191,6 +200,10 @@ pub struct BackupPackageRecord {
     /// but kept here because it is the name a restore is asked for by.
     pub package: Option<String>,
     pub bytes: Option<i64>,
+    /// The digest the run recorded for the package it wrote, or `None` when that
+    /// run recorded none. A drill comparing its own digest against this one has
+    /// three answers, not two: equal, different, and nothing to compare against.
+    pub package_checksum: Option<String>,
     /// The bound this run was actually run under, and what its own pass left.
     pub keep_target: i32,
     pub kept_after: Option<i32>,

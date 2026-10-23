@@ -58,8 +58,8 @@ ON CONFLICT (run_id) DO NOTHING";
 /// and a second report cannot move it.
 const CLOSE_RUN_SQL: &str = "\
 UPDATE backup_runs \
-SET outcome = $2, finished_at = $3, package = $4, bytes = $5, \
-    kept_after = $6, oldest_kept_at = $7, error = $8 \
+SET outcome = $2, finished_at = $3, package = $4, bytes = $5, package_checksum = $6, \
+    kept_after = $7, oldest_kept_at = $8, error = $9 \
 WHERE run_id = $1 AND outcome = 'running'";
 
 /// Conclude every run that has outlived the deadline it was opened under.
@@ -102,7 +102,7 @@ WHERE outcome = 'running' \
 /// for and nobody could see.
 const READ_ACCOUNT_SQL: &str = "\
 WITH snapshot AS MATERIALIZED ( \
-    SELECT run_id, started_at, finished_at, outcome, package, bytes, \
+    SELECT run_id, started_at, finished_at, outcome, package, bytes, package_checksum, \
            keep_target, run_deadline_seconds, kept_after, oldest_kept_at \
     FROM backup_runs \
 ) \
@@ -118,6 +118,7 @@ SELECT \
     newest.finished_at     AS package_finished_at, \
     newest.package         AS package, \
     newest.bytes           AS package_bytes, \
+    newest.package_checksum AS package_checksum, \
     newest.keep_target     AS package_keep_target, \
     newest.kept_after      AS package_kept_after, \
     newest.oldest_kept_at  AS package_oldest_kept_at \
@@ -237,6 +238,7 @@ impl BackupRunStore for PostgresBackupRunStore {
             .bind(closing.finished_at)
             .bind(closing.package.as_deref())
             .bind(closing.bytes)
+            .bind(closing.package_checksum.as_deref())
             .bind(closing.kept_after)
             .bind(closing.oldest_kept_at)
             .bind(closing.error.as_deref())
@@ -315,6 +317,9 @@ impl BackupRunStore for PostgresBackupRunStore {
                     bytes: row
                         .try_get("package_bytes")
                         .map_err(|e| SFError::Database(format!("package_bytes: {e}")))?,
+                    package_checksum: row
+                        .try_get("package_checksum")
+                        .map_err(|e| SFError::Database(format!("package_checksum: {e}")))?,
                     keep_target: row
                         .try_get("package_keep_target")
                         .map_err(|e| SFError::Database(format!("package_keep_target: {e}")))?,

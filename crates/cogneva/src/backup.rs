@@ -1186,6 +1186,7 @@ fn untar_package_with_key(
 struct LeftBehind {
     package: PathBuf,
     bytes: Option<i64>,
+    checksum: Option<String>,
     kept_after: Option<i32>,
     oldest_kept_at: Option<chrono::DateTime<Utc>>,
 }
@@ -1348,6 +1349,7 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
                     finished_at: Utc::now(),
                     package: None,
                     bytes: None,
+                    package_checksum: None,
                     kept_after: None,
                     oldest_kept_at: None,
                     error: Some(reason.clone()),
@@ -1374,6 +1376,7 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
                         .and_then(|n| n.to_str())
                         .map(str::to_string),
                     bytes: left.bytes,
+                    package_checksum: left.checksum,
                     kept_after: left.kept_after,
                     oldest_kept_at: left.oldest_kept_at,
                     error: None,
@@ -1391,6 +1394,7 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
                     finished_at: Utc::now(),
                     package: None,
                     bytes: None,
+                    package_checksum: None,
                     kept_after: None,
                     oldest_kept_at: None,
                     error: Some(recordable_error(e.as_ref(), cfg)),
@@ -1520,9 +1524,24 @@ async fn finish_backup(
                 "backup package complete"
             );
             let bytes = std::fs::metadata(&package).ok().map(|m| m.len() as i64);
+            // 摘要读失败不判这一趟失败：包已经落地了，拿「算不出摘要」把它判成没有备份，
+            // 是拿被保护的东西换那张说明它的纸。留一条 warn，因为「没记」和「记了又对上」
+            // 在账上是两种不同的缺席，而只有日志能说出这一趟属于哪种。
+            let checksum = match package_digest(&package) {
+                Ok(digest) => Some(digest),
+                Err(e) => {
+                    tracing::warn!(
+                        package = %package.display(),
+                        error = %e,
+                        "备份：包写完了，但摘要算不出来，这一趟在账上不会有校验和"
+                    );
+                    None
+                }
+            };
             Ok(LeftBehind {
                 package,
                 bytes,
+                checksum,
                 kept_after,
                 oldest_kept_at,
             })
@@ -3268,6 +3287,37 @@ async fn package_belongs_to_its_run(
     ))
 }
 
+/// 盘上这一份包的字节，是不是写它那一跑记下的那一份。
+///
+/// 问的是账上新开的那一列，不是重新打一遍包：写端算摘要的时刻在包落盘之后、
+/// 交给卷外复制之前，所以读者算出来的不同就只能是「这之后字节变了」。
+async fn package_checksum_mismatch(
+    live: &PgPool,
+    name: &str,
+    package: &Path,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let run_id = name.strip_suffix(PACKAGE_SUFFIX).unwrap_or(name);
+    let recorded: Option<Option<String>> =
+        sqlx::query_scalar("SELECT package_checksum FROM backup_runs WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_optional(live)
+            .await?;
+    let Some(recorded) = recorded else {
+        return Ok(None);
+    };
+    if recorded.is_none() {
+        // 这一次改动之前写的包没有这一列。不是缺陷，但必须有人看得见「这一格比不了」，
+        // 否则一次写入侧的回归（摘要再也记不进去）会以同样的形状沉默。
+        tracing::warn!(
+            package = %name,
+            "账上没有这一份包的摘要，校验和这一格比不了"
+        );
+        return Ok(None);
+    }
+    let actual = package_digest(package)?;
+    Ok(checksum_violation(name, recorded.as_deref(), &actual))
+}
+
 /// 包内时刻该落在这一跑的起止之间，判词单独可测。
 fn run_window_violation(
     name: &str,
@@ -3414,6 +3464,45 @@ async fn least_recently_proven(
 fn same_file(a: &Path, b: &Path) -> bool {
     a.file_name() == b.file_name()
         && std::fs::metadata(a).ok().map(|m| m.len()) == std::fs::metadata(b).ok().map(|m| m.len())
+}
+
+/// 一份包的摘要，算法名跟着值一起存。
+///
+/// 字节数说的是「写了多少」，摘要说的是「还是不是同一份」。两者在这一格分道：
+/// 一份复制被截断又补零、盘上读回来的是别的块、同名文件被覆盖成同样大小的一份，
+/// 字节数一格都不动。算法名写进值里，是为了将来换算法时账上两种值不会互相比较。
+fn package_digest(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    // 分块读而不是整个读进内存：包按百 MB 计，而这一路和导出、打包跑在同一个
+    // 内存受限的容器里。
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+/// 账上记的摘要和盘上此刻算出来的是否同意。
+///
+/// `None` 表示这一跑没记摘要（这一次改动之前写的包），**不是**同意：没有任何东西
+/// 可比的包，这一格什么也没证明。调用点为此留一条日志，好让「没记」和「记了又对上」
+/// 不共享同一个沉默。
+fn checksum_violation(name: &str, recorded: Option<&str>, actual: &str) -> Option<String> {
+    let recorded = recorded?;
+    (recorded != actual).then(|| {
+        format!(
+            "包 {name} 的字节与写它那一跑记下的摘要对不上：账上 {recorded}，盘上 {actual}。\
+             字节数可能一格没变（截断补零、坏块、被同名文件覆盖），变的正是包里的数据"
+        )
+    })
 }
 
 /// 解包用的临时目录，离开作用域就删。
@@ -3747,6 +3836,12 @@ async fn drill_once(
     // 名字说这是哪一晚的包，内容也得这么说。这一条不读 outcome：它问的是「开的是
     // 不是这一份」，而一套把旧包改名当成新包的流程每一晚都会 ok。
     if let Some(reason) = package_belongs_to_its_run(live, &name, &manifest.created_at).await? {
+        return Err(reason.into());
+    }
+    // 名字对上了还不够：盘上这串字节也得还是写它那一跑交给卷的那一串。一条能解开的
+    // 包也可能已经不是原件——坏块、截断补零、被同名文件覆盖，恢复时会以数据不对的形式
+    // 暴露，而不是以「包坏了」的形式。
+    if let Some(reason) = package_checksum_mismatch(live, &name, &package).await? {
         return Err(reason.into());
     }
     // 清单说这个包里有什么，此刻盘上是事实。这一段覆盖的是 qdrant 与对象层：
@@ -4409,6 +4504,45 @@ mod tests {
             .unwrap()
             .expect("包是密文、这一跑没口令，演练必须拒绝判绿");
         assert!(reason.contains("密文"), "reason={reason}");
+    }
+
+    /// 一份包在写下之后被改过字节，就不是那一晚的备份了。
+    ///
+    /// 这一格专门挑**等长**的替换：字节数看不见它，账上那一列也不动，只有摘要能把它
+    /// 说出来。真正的现场是坏块、复制被截断后补零、同名文件覆盖——三者都以「包能解开」
+    /// 的样子出现，直到恢复出来才发现数据不对。
+    #[test]
+    fn a_package_whose_bytes_changed_since_it_was_written_is_not_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir
+            .path()
+            .join(format!("{PACKAGE_PREFIX}20261024T031700Z{PACKAGE_SUFFIX}"));
+        std::fs::write(&pkg, b"first night's bytes").unwrap();
+        let recorded = package_digest(&pkg).unwrap();
+        assert!(
+            recorded.starts_with("sha256:"),
+            "算法名要跟着值走，否则换算法那天账上两种值会互相比较：{recorded}"
+        );
+        let again = package_digest(&pkg).unwrap();
+        assert_eq!(recorded, again, "同一份字节两次算出来的摘要必须一样");
+        assert!(checksum_violation("pkg", Some(&recorded), &again).is_none());
+
+        assert_eq!(
+            b"first night's bytes".len(),
+            b"FIRST night's bytes".len(),
+            "夹具得等长，否则这一格验的还是字节数，不是摘要"
+        );
+        std::fs::write(&pkg, b"FIRST night's bytes").unwrap();
+        let changed = package_digest(&pkg).unwrap();
+        let reason =
+            checksum_violation("pkg", Some(&recorded), &changed).expect("等长的不同字节必须判红");
+        assert!(
+            reason.contains(&recorded) && reason.contains(&changed),
+            "判词要把账上和盘上两个值都写出来，读的人才知道差在哪：{reason}"
+        );
+
+        // 这一跑压根没记摘要：没有可比的，也就什么也没证明。它不许被读成「对上了」。
+        assert!(checksum_violation("pkg", None, &changed).is_none());
     }
 
     #[test]

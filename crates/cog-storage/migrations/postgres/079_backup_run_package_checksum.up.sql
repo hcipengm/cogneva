@@ -1,0 +1,18 @@
+-- Migration: 079_backup_run_package_checksum
+-- The digest of the package a run produced, written down where the run's other
+-- facts already are.
+--
+-- The package is the thing a restore depends on, and until now nothing outside
+-- the file itself could say whether the bytes handed back were the bytes that
+-- were written. `bytes` answers "how big"; a checksum answers "the same file".
+-- Those come apart in exactly the case worth catching: a copy that was truncated
+-- and padded, a disk that returned different blocks than it stored, a package
+-- renamed over by a file of the same size. The drill opens and restores the
+-- package, which catches most corruption, but it cannot catch a change to a
+-- package it is not opening, and a restore that succeeds says nothing about the
+-- other six in the window.
+--
+-- NULL is a real answer and not a zero: packages written before this column
+-- existed have no digest, and a reader must see "never recorded" rather than a
+-- digest of nothing. It is therefore not backfilled.
+ALTER TABLE backup_runs ADD COLUMN IF NOT EXISTS package_checksum TEXT;
