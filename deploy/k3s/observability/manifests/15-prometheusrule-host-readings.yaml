@@ -866,3 +866,30 @@ spec:
           annotations:
             summary: "外部对端走不通 A2A 的发现这一步（名片拿不到，或名片说的与业务面做的不一致）"
             description: "跑 `bash scripts/host/cogneva-a2a-discovery-reach-reading.sh`（不带 `--prometheus`）点名是哪一种：`discovery-closed`＝名片要凭证（对端得先有凭证才知道该用什么凭证，闭环，修法是把名片挪回公开组）；`both-open`＝名片声明 jwt 而 RPC 收匿名调用方（声明与实现不符，不是更开放）；`broken-service`＝服务不健康（修服务，不是修路由）；`unexpected`＝名片答了 404/5xx 一类既非 2xx 也非 401/403 的码（路由没挂上或上游坏了）。`a2a_reach_http_status{probe=…}` 是三条探针各拿到的码，`a2a_reach_card_cacheable` 是另一件事（名片有没有给 max-age 窗口），它退化不会点燃这一条。"
+
+    # A2A 对端面·第三方尺子：上面那些 A2A 判据都是「我们照规范写出来的」，写判据的
+    # 人与写实现的人是同一拨，判据错在同一个方向上时两边一起错。这一条读的是上游官方
+    # 套件（a2aproject/a2a-tck）的名片用例结果——它红的地方没法用「我们的理解就是
+    # 这样」解释过去。量的是名片那一层：套件不带凭证，而本平台 RPC 按名片声明的方案要
+    # bearer，跑下去只会得到一片 401，那不是「不合规」而是「量法不适用」。
+    #
+    # 判词取 `a2a_tck_conformant`（1＝全过，0＝名片非 200 或有失败/错误）。`passed`
+    # 是分母：没有分母的 0 失败说明不了「比过」，所以读 `failed`/`errors` 的规则应当
+    # 连着 `passed > 0` 一起判，而这里判的是同一次跑出来的那个 0/1。
+    #
+    # 不另立「读不到」：这一面退 3 时一条序列都不印（尺子没装、转发没人答话），
+    # 归 `CognevaHostReadingProducerUnreadable{producer="a2a_tck"}`——「套件没跑起来」
+    # 与「套件全绿」在读数上必须分开，否则坏掉的是尺子而读数说平台合规。
+    - name: cogneva-a2a-tck
+      rules:
+        # 十五分钟：套件量的是公开名片，名片只在部署或路由改动时才会变；一次滚动
+        # 期间的抖动不该点着它，而连着十五分钟不合规就是有东西真的动了对外形状。
+        - alert: CognevaA2aTckDrifted
+          expr: min(a2a_tck_conformant) < 1
+          for: 15m
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "上游 A2A 一致性套件判名片不合规（这套判据不是我们自己写的）"
+            description: "跑 `bash scripts/host/cogneva-a2a-tck-reading.sh`（不带 `--prometheus`）看判词与第一条失败用例：`a2a_tck_card_status` 不是 200 说明名片这一条规范要求就没满足（401/403 是名片不公开，404/405 是没这条路由），否则看 `a2a_tck_first` 点名的用例。`a2a_tck_passed` 是同一次跑通过的条数——它掉了又没失败，说明套件本身缩小了覆盖面，而不是平台变好了。套件读的是 `COGNEVA_A2A_TCK_DIR` 指向的那份检出；升级套件等于换尺子，换完要么全绿，要么新红的就是真缺口。"

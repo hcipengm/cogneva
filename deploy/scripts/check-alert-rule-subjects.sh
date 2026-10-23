@@ -385,6 +385,7 @@ NO_POD_REPORTER = {
     # 一个进程、一个端口，报信者不是 Pod，聚合器重建也不改变「这一格是谁的」。
     'CognevaA2aConformanceDrifted': 'a2a_conformance_drift_cells',
     'CognevaA2aDiscoveryClosed': 'a2a_reach_defect',
+    'CognevaA2aTckDrifted': 'a2a_tck_conformant',
     'CognevaResourceSixColumnConnExhausted': 'resource_six_column_state{column="conn",state="red"}',
     'CognevaResourceSixColumnSlotOverAdmitted': 'resource_six_column_state{column="slot",state="red"}',
 }
