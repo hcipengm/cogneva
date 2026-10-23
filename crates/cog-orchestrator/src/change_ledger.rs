@@ -1136,6 +1136,29 @@ pub fn spawn_change_ledger_loop(
                     // gives: a fixture retired this pass is not measured and
                     // re-said as unsettled by the same pass.
                     retire_pass(&*store).await;
+                    // What the line says it has landed, read from the same
+                    // repository the measurement reads, and written **before**
+                    // the measurement runs. A change whose diff and whose check
+                    // arrive in one revision leaves the owed set the moment it
+                    // is measured, and the write below walks that set: stamped
+                    // after the measurement it would record only the changes
+                    // whose check still failed, so the column would hold the
+                    // ones that did not land and stay empty for the ones that
+                    // did -- the exact inversion the trailer exists to prevent.
+                    let deliveries = match tree.landing_log(LANDING_LOG_COMMITS).await {
+                        Ok(log) => Some(landing_trailers(&log)),
+                        Err(why) => {
+                            warn!(
+                                why = %why,
+                                "change ledger: the commit log could not be read, so this \
+                                 pass cannot say which owed changes were delivered"
+                            );
+                            None
+                        }
+                    };
+                    if let Some(ref deliveries) = deliveries {
+                        stamp_deliveries(&*store, deliveries).await;
+                    }
                     measure_pass(&*store, &tree, &mut unsettled, &changed).await;
                     // The second face of "is it done", read after the
                     // measurement so that a row this pass just found landed is
@@ -1156,24 +1179,6 @@ pub fn spawn_change_ledger_loop(
                     // and a change this pass just found missing is handed over on
                     // the same pass that found it, rather than one period later.
                     if let Some(ref orchestrator) = orchestrator {
-                        // What the line says it has landed, read from the same
-                        // repository the measurement reads. A change whose diff
-                        // went in is still owed until its check holds, and the
-                        // two facts are only together in the pass -- which is
-                        // why the count is taken here rather than by a write
-                        // from the landing process, whose record would be lost
-                        // the day it died between the commit and the write.
-                        let deliveries = match tree.landing_log(LANDING_LOG_COMMITS).await {
-                            Ok(log) => Some(landing_trailers(&log)),
-                            Err(why) => {
-                                warn!(
-                                    why = %why,
-                                    "change ledger: the commit log could not be read, so this \
-                                     pass cannot say which owed changes were delivered"
-                                );
-                                None
-                            }
-                        };
                         let pool = pool.as_deref();
                         if let Some(read) = dispatch_pass(
                             &*store,
@@ -3082,6 +3087,74 @@ fn dispatchable(
 /// would only move the same list to a type that exists to hold it, and the list
 /// grows with the number of source accounts rather than with anything this pass
 /// decides.
+/// Stamp the revision that delivered each owed row, ahead of the measurement.
+///
+/// The hand-over's own delivery write is kept below because it also carries the
+/// per-pass count, but it alone is not enough: it runs after `measure_pass`, and
+/// the rows it walks are the ones still owed. A change whose diff and whose
+/// check arrive in the same revision is marked landed by that measurement and is
+/// no longer in the set, so the delivery of exactly the changes that landed
+/// would never be written.
+///
+/// Only rows the log actually names are written to, so the additional pass costs
+/// one read of the owed set and no writes at all on a pass whose commits carry no
+/// trailer. `record_delivery` is guarded by `delivered_rev IS NULL`, so a row
+/// this writes and the hand-over then sees again is not stamped twice.
+async fn stamp_deliveries(
+    store: &dyn ChangeLedgerStore,
+    deliveries: &HashMap<String, String>,
+) -> usize {
+    let outstanding_total = match store.census().await {
+        Ok(census) => census
+            .iter()
+            .filter(|(state, _)| state.is_outstanding())
+            .map(|(_, count)| *count)
+            .sum::<u64>(),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the census could not be read, so no delivery was stamped this pass"
+            );
+            return 0;
+        }
+    };
+    let rows = match store.outstanding(outstanding_total as usize).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the owed set could not be read, so no delivery was stamped this pass"
+            );
+            return 0;
+        }
+    };
+    let mut recorded = 0usize;
+    for row in &rows {
+        if row.delivered_rev.is_some() {
+            continue;
+        }
+        let Some(rev) = delivered_revision(&row.identity, deliveries) else {
+            continue;
+        };
+        match store.record_delivery(&row.identity, rev).await {
+            Ok(()) => recorded += 1,
+            Err(e) => warn!(
+                change = %row.identity,
+                error = %e,
+                "change ledger: a delivery could not be recorded, so the row will read as \
+                 never delivered until a later pass finds it again"
+            ),
+        }
+    }
+    if recorded > 0 {
+        info!(
+            recorded,
+            "change ledger: owed changes a commit on the line names as landed"
+        );
+    }
+    recorded
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_pass(
     store: &dyn ChangeLedgerStore,
@@ -6339,6 +6412,14 @@ mod tests {
         delivered: std::sync::Mutex<Vec<(ChangeIdentity, String)>>,
         reopened: std::sync::Mutex<Vec<ChangeReopen>>,
         parent_observations: std::sync::Mutex<Vec<(ChangeIdentity, String)>>,
+        /// Rows a measurement has moved out of the owed set.
+        ///
+        /// `rows` is the fixture and is never mutated, so without this a row
+        /// measured to a terminal state would still come back from
+        /// `outstanding` forever -- and a pass whose order of steps is the thing
+        /// under test would be indistinguishable from one that ran them the
+        /// other way round.
+        settled: std::sync::Mutex<std::collections::HashSet<ChangeIdentity>>,
     }
 
     impl FakeLedger {
@@ -6407,13 +6488,20 @@ mod tests {
         }
         async fn apply_measurement(&self, measurement: &ChangeMeasurement) -> SFResult<()> {
             self.measured.lock().unwrap().push(measurement.clone());
+            if !measurement.state.is_outstanding() {
+                self.settled
+                    .lock()
+                    .unwrap()
+                    .insert(measurement.identity.clone());
+            }
             Ok(())
         }
         async fn outstanding(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>> {
+            let settled = self.settled.lock().unwrap();
             Ok(self
                 .rows
                 .iter()
-                .filter(|row| row.state.is_outstanding())
+                .filter(|row| row.state.is_outstanding() && !settled.contains(&row.identity))
                 .take(limit)
                 .cloned()
                 .collect())
@@ -8176,6 +8264,65 @@ mod tests {
         // product.
         assert_eq!(value, 2.0);
         assert_eq!(readout_cell(&metrics, "handover_products").await, Some(1.0));
+    }
+
+    /// The delivery is stamped for a row that is still owed, from the commit
+    /// log alone -- and it is stamped *before* the measurement can settle the
+    /// row, which is the only order that catches a change whose diff and whose
+    /// check arrive in the same revision.
+    ///
+    /// Written as the two steps the pass runs rather than through the loop:
+    /// the loop's timer is virtual in this harness and the tree read is a real
+    /// subprocess, so a paused clock makes every look time out before it can
+    /// settle anything. What this pins is the pair, in order; the loop body
+    /// calls them in this same order and says why.
+    #[tokio::test]
+    async fn a_delivery_is_stamped_before_the_measurement_can_settle_the_row() {
+        let pending = pending_row("file");
+        let id = dispatch_task_id(&pending.identity, 0);
+        let (dir, bare, work) = scratch_repo();
+        std::fs::write(std::path::Path::new(&work).join("file"), "fn thing")
+            .expect("the fixture file");
+        let rev = commit_all(&bare, &work, &format!("fixture\n\nLanding change {id}"));
+
+        let fake = FakeLedger {
+            rows: vec![pending],
+            ..Default::default()
+        };
+        let identity = fake.rows[0].identity.clone();
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+
+        let log = tree
+            .landing_log(LANDING_LOG_COMMITS)
+            .await
+            .expect("the log reads");
+        let deliveries = landing_trailers(&log);
+        assert!(
+            deliveries.contains_key(&id),
+            "the fixture's commit has to name the handover the row is filed under"
+        );
+
+        // The pass's own order: stamp, then measure.
+        stamp_deliveries(&fake, &deliveries).await;
+        let mut unsettled = HashMap::new();
+        measure_pass(&fake, &tree, &mut unsettled, &[]).await;
+
+        assert_eq!(
+            fake.deliveries(),
+            vec![(identity.clone(), rev.clone())],
+            "the row is named in the log, so its delivery is a fact the account can keep"
+        );
+        let measurements = fake.measurements();
+        assert_eq!(
+            measurements.first().map(|m| m.state),
+            Some(ChangeState::Landed),
+            "and the same pass is the one that lands it: {measurements:?}"
+        );
+        assert_eq!(
+            measurements[0].measured_rev.as_deref(),
+            Some(rev.as_str()),
+            "the measurement is taken at the revision the log was read at"
+        );
     }
 
     /// The pass reads the handovers back over the same set it hands over, and
