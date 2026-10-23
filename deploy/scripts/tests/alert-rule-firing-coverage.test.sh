@@ -90,7 +90,14 @@ fi
 # 「静格」证明的是这份数据上它没响，恒假的规则同样满足，而那正是这一族要抓的形状。
 mkdir -p "${work}/fx-silent"
 cp "${fixtures}"/*.test.yaml "${work}/fx-silent/" 2>/dev/null
-silent_rule="container_memory_near_limit"
+# 挑一条**目录里没有任何夹具**的规则：否则真夹具里的响格会让它照样算已证明，
+# 这一格就测不到「静格不算证明」。
+silent_rule="pod_oom_killed"
+# 那一格的前提是「真树里没人证明过它」。哪天有人给它写了夹具，这一格会静默地测不到
+# 东西（静格与响格并存 ⇒ 它照样算已证明），所以先当场判这个前提。
+run "$config" "$fixtures" "$baseline" --stock
+grep -q "^proven	${silent_rule}" "${work}/out" &&
+    bad "这一格选中的规则已经被真夹具证明了，换一条" "没有夹具的规则" "$silent_rule"
 printf '# rule: %s\n\nevaluation_interval: 1m\ntests:\n  - interval: 1m\n    input_series:\n      - series: %s\n        values: "1x5"\n    alert_rule_test:\n      - eval_time: 4m\n        alertname: %s\n        exp_alerts: []\n' \
     "$silent_rule" "$silent_rule" "$silent_rule" >"${work}/fx-silent/silent.test.yaml"
 grep -v "^${silent_rule}\$" "$baseline" >"${work}/no-silent.baseline"

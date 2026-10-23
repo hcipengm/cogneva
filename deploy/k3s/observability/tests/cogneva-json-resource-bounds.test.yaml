@@ -1,0 +1,111 @@
+# 资源面三条读数的单测夹具：它们各自守着一条**只有界、没有形状**的判据，坏掉的症状
+# 都是「安静」——容器贴着 limit、资源事件没人折账、构建槽被一个持有者占死，全都不改任何
+# 结构门读的字节。
+#
+# 三条各带一条自己的腿，各自的静格就是那条腿存在的理由：
+#   - `container_memory_near_limit`：RSS 与 limit 按 `on(namespace,pod,container)` 对齐，
+#     没有 limit 的容器不参与（那是另一条规则的事）。
+#   - `resource_ledger_fold_backlog`：除了「积压够久」，还要求**这条读数本身是新的**。
+#     读数停摆时 age 会一直涨，但那是写者不在，不是积压——两件事必须分开。
+#   - `build_gate_slot_held_too_long`：界不是常数，是 2 倍等待预算（`group_left` 连接）。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-resource-bounds.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: container_memory_near_limit
+# rule: resource_ledger_fold_backlog
+# rule: build_gate_slot_held_too_long
+
+evaluation_interval: 1m
+
+tests:
+  # 一条贴着 limit（0.9 > 0.81）、一条离得远（0.7）；积压 600 秒而周期 60 秒（界 360 秒）
+  # 且这条读数是新的；一个槽被持有 500 秒而它的等待预算是 60 秒（界 120 秒）。
+  - interval: 1m
+    input_series:
+      - series: 'container_memory_rss{namespace="cogneva",pod="near",container="app"}'
+        values: '9000000000x20'
+      - series: 'kube_pod_container_resource_limits{namespace="cogneva",pod="near",container="app",resource="memory"}'
+        values: '10000000000x20'
+      - series: 'container_memory_rss{namespace="cogneva",pod="far",container="app"}'
+        values: '7000000000x20'
+      - series: 'kube_pod_container_resource_limits{namespace="cogneva",pod="far",container="app",resource="memory"}'
+        values: '10000000000x20'
+      - series: 'cogneva_resource_events_oldest_unfolded_age_seconds'
+        values: '600x20'
+      - series: 'cogneva_resource_events_oldest_unfolded_age_seconds_observed_timestamp_seconds'
+        values: '900x20'
+      - series: 'cogneva_loop_period_seconds{loop="resource_ledger"}'
+        values: '60x20'
+      - series: 'cogneva_build_gate_holder_seconds{dir="/var/lib/cogneva-build-gate",role="worker",slot="0",what="build"}'
+        values: '500x20'
+      - series: 'cogneva_build_gate_wait_budget_ms{dir="/var/lib/cogneva-build-gate",role="worker"}'
+        values: '60000x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: container_memory_near_limit
+        exp_alerts:
+          # 只有贴着 limit 的那条 Pod 在结果里：比值是按 `on()` 对齐出来的，
+          # `pod` 留在标签里，所以一条告警点名一个容器，而不是一个笼统的总数。
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+              pod: near
+              container: app
+      - eval_time: 20m
+        alertname: resource_ledger_fold_backlog
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 20m
+        alertname: build_gate_slot_held_too_long
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: /var/lib/cogneva-build-gate
+              role: worker
+              slot: "0"
+              what: build
+
+  # 同一条积压读数，但**没有人在写它**（观测时间戳停在很早）：age 依然很大，
+  # 而那不是积压、是写者不在。这一格守着表达式里那条时间腿——删掉它，写者停摆
+  # 会永远伪装成「积压」，而且越停越像。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_resource_events_oldest_unfolded_age_seconds'
+        values: '6000x20'
+      - series: 'cogneva_resource_events_oldest_unfolded_age_seconds_observed_timestamp_seconds'
+        values: '100x20'
+      - series: 'cogneva_loop_period_seconds{loop="resource_ledger"}'
+        values: '60x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: resource_ledger_fold_backlog
+        exp_alerts: []
+
+  # 持有时间没到 2 倍等待预算（100 < 120）：安静。差一点就不许亮，这一格守的是
+  # 「界是从预算导出的、且是严格大于」，而不是一个写死的秒数。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_gate_holder_seconds{dir="/var/lib/cogneva-build-gate",role="worker",slot="0",what="build"}'
+        values: '100x20'
+      - series: 'cogneva_build_gate_wait_budget_ms{dir="/var/lib/cogneva-build-gate",role="worker"}'
+        values: '60000x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: build_gate_slot_held_too_long
+        exp_alerts: []
+
+  # 没有 limit 的容器不归这条规则问：`kube_pod_container_resource_limits` 缺席时那个容器
+  # 根本不进结果（除零在这里表现为「没有这一条」，而不是无穷大或一条假告警）。
+  - interval: 1m
+    input_series:
+      - series: 'container_memory_rss{namespace="cogneva",pod="unlimited",container="app"}'
+        values: '9000000000x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: container_memory_near_limit
+        exp_alerts: []
