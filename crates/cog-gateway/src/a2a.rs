@@ -32,6 +32,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::stream::Stream;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use cog_core::{
     A2aTask, A2aTaskStatus, A2aVersion, MessagePart, OrchestratorControl, Task, TaskArtifact,
@@ -327,12 +328,47 @@ fn card_response(port: u16, headers: &HeaderMap, uri: &Uri, default: A2aVersion)
         A2aVersion::V03 => card_v03(&base),
         A2aVersion::V10 => card_v10(&base),
     };
-    let mut response = (StatusCode::OK, Json(card)).into_response();
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("public, max-age=300"),
+    let body = serde_json::to_vec(&card).unwrap_or_else(|_| b"{}".to_vec());
+    // 规范 §8.6：名片应当带一个由内容（或 `version` 字段）导出的 `ETag`，对端
+    // 过期后应当用条件请求而不是重下。这里取内容哈希：`version` 只在发版时变，
+    // 而名片还会随 `Host`（地址）变，哈希把这两件事都覆盖住。
+    let digest = Sha256::digest(&body);
+    let etag = format!("\"{}\"", hex16(&digest[..]));
+    let cache_control = header::HeaderValue::from_static("public, max-age=300");
+
+    // 条件请求命中就回 304：对端每拍都来发现一次，内容没变时不该再传一遍正文。
+    let matched = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == etag || candidate == "*")
+        })
+        .unwrap_or(false);
+    let mut response = if matched {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response()
+    };
+    let headers_mut = response.headers_mut();
+    headers_mut.insert(header::CACHE_CONTROL, cache_control);
+    headers_mut.insert(
+        header::ETAG,
+        header::HeaderValue::from_str(&etag)
+            .unwrap_or_else(|_| header::HeaderValue::from_static("\"\"")),
     );
     response
+}
+
+/// 哈希的前 16 个十六进制位：足够区分名片，又不至于把响应头撑长。
+fn hex16(bytes: &[u8]) -> String {
+    bytes.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 // ─── 两个旋钮 ──────────────────────────────────────────────────────────────

@@ -404,40 +404,49 @@ async fn the_card_is_discoverable_where_the_specification_puts_it() {
     let state = router_state::stateless();
     let app = create_router(state);
 
-    let fetch = |version: Option<&'static str>, token: Option<&'static str>| {
-        let app = app.clone();
-        async move {
-            let mut builder = Request::builder()
-                .method("GET")
-                .uri("/.well-known/agent-card.json")
-                .header("Host", "cogneva.example");
-            if let Some(version) = version {
-                builder = builder.header("A2A-Version", version);
+    let fetch =
+        |version: Option<&'static str>, token: Option<&'static str>, inm: Option<String>| {
+            let app = app.clone();
+            async move {
+                let mut builder = Request::builder()
+                    .method("GET")
+                    .uri("/.well-known/agent-card.json")
+                    .header("Host", "cogneva.example");
+                if let Some(version) = version {
+                    builder = builder.header("A2A-Version", version);
+                }
+                if let Some(token) = token {
+                    builder = builder.header("Authorization", format!("Bearer {token}"));
+                }
+                if let Some(etag) = inm {
+                    builder = builder.header("If-None-Match", etag);
+                }
+                let response = app
+                    .oneshot(builder.body(Body::empty()).expect("well formed"))
+                    .await
+                    .expect("the router answers");
+                let status = response.status().as_u16();
+                let cache = response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let etag = response
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let bytes = to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("the body comes back");
+                let card = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .unwrap_or(serde_json::Value::Null);
+                (status, cache, etag, card)
             }
-            if let Some(token) = token {
-                builder = builder.header("Authorization", format!("Bearer {token}"));
-            }
-            let response = app
-                .oneshot(builder.body(Body::empty()).expect("well formed"))
-                .await
-                .expect("the router answers");
-            let status = response.status().as_u16();
-            let cache = response
-                .headers()
-                .get("cache-control")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            let bytes = to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("the body comes back");
-            let card = serde_json::from_slice::<serde_json::Value>(&bytes)
-                .unwrap_or(serde_json::Value::Null);
-            (status, cache, card)
-        }
-    };
+        };
 
     // 无版本头、无令牌：这就是「第一次接触的对端」发出的那一个请求。
-    let (status, cache, card) = fetch(None, None).await;
+    let (status, cache, etag, card) = fetch(None, None, None).await;
     assert_eq!(
         status, 200,
         "discovery must not need a credential, or it closes a loop: the credential          is what the card is supposed to tell you how to get"
@@ -475,7 +484,7 @@ async fn the_card_is_discoverable_where_the_specification_puts_it() {
     );
 
     // 显式要 0.3 的对端在同一个路径上拿到 0.3 名片（带 `url`，它就是这么拼地址的）。
-    let (status, _, v03) = fetch(Some("0.3"), None).await;
+    let (status, _, _, v03) = fetch(Some("0.3"), None, None).await;
     assert_eq!(status, 200);
     assert_eq!(v03["protocolVersion"], "0.3");
     assert_eq!(
@@ -484,7 +493,7 @@ async fn the_card_is_discoverable_where_the_specification_puts_it() {
     );
 
     // 不服务的版本仍是同一个拒绝，不是 404、也不是悄悄回一份缺省名片。
-    let (status, _, refusal) = fetch(Some("1.2"), None).await;
+    let (status, _, _, refusal) = fetch(Some("1.2"), None, None).await;
     assert_eq!(status, 400);
     let said = refusal["message"].as_str().unwrap_or_default();
     assert!(
@@ -493,12 +502,30 @@ async fn the_card_is_discoverable_where_the_specification_puts_it() {
     );
 
     // 带令牌也是同一份名片：这张卡不按调用方不同而不同。
-    let (status, _, with_token) = fetch(None, Some("irrelevant-but-well-formed")).await;
+    let (status, _, _, with_token) = fetch(None, Some("irrelevant-but-well-formed"), None).await;
     assert_eq!(
         status, 200,
         "the discovery route is public; a token neither helps nor hurts"
     );
     assert_eq!(with_token, card, "the card is the same for everyone");
+
+    // 规范 §8.6：名片带一个由内容导出的 ETag，对端过期后用条件请求取而不是重下。
+    let etag = etag.expect("a discovery card carries an ETag");
+    assert!(etag.starts_with('"'), "an ETag is a quoted string: {etag}");
+    let (again_status, _, again_etag, _) = fetch(None, None, None).await;
+    assert_eq!(again_status, 200);
+    assert_eq!(
+        again_etag.as_deref(),
+        Some(etag.as_str()),
+        "the same card has to hash to the same ETag, or no peer can cache it"
+    );
+    let (status, _, echoed, body) = fetch(None, None, Some(etag.clone())).await;
+    assert_eq!(
+        status, 304,
+        "a matching If-None-Match gets the unchanged answer, not the body again"
+    );
+    assert_eq!(echoed.as_deref(), Some(etag.as_str()));
+    assert_eq!(body, serde_json::Value::Null, "304 carries no body");
 }
 
 /// One HTTP round trip to the endpoint, returning the JSON body. Used where the
