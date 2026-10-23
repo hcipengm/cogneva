@@ -42,6 +42,10 @@ use tracing::{debug, info, warn};
 /// not raise.
 pub const CANARY_GATE_BLIND_RULE: &str = "canary_metric_gate_blind";
 
+/// 这一行归哪个面：灰度判据读不到它要读的那条读数，要动的人是部署流水线——
+/// 要么让读数被采到，要么改灰度按什么判。
+const CANARY_GATE_BLIND_FACE: &str = "CI/构建/部署";
+
 /// The gates a canary rolls on. One list: the coverage summary, the blindness
 /// verdict and the alert rows all read it, so a gate cannot be added to one
 /// and forgotten in the others.
@@ -1220,6 +1224,7 @@ impl GitOpsPuller {
                 "gate": gate,
                 "cause": cause,
                 "ticks": ticks,
+                cog_core::alerts::ALERT_FACE_LABEL: CANARY_GATE_BLIND_FACE,
             }),
         }
     }

@@ -1006,10 +1006,11 @@ fn alert_labels(sample: &SeriesSample, message: &str, face: &str) -> HashMap<Str
 
 /// The label a stored alert row uses to name the face that acts on it.
 ///
-/// The same key the PrometheusRule manifests put on their rules, because both
-/// writers fill one table and the reader there must not have to know which
-/// writer wrote the row.
-const ALERT_FACE_LABEL: &str = "cogneva_io_face";
+/// The same key the PrometheusRule manifests put on their rules, because every
+/// writer fills one table and the reader there must not have to know which
+/// writer wrote the row. Re-exported from the alerts contract, where it is
+/// spelled once for writers that do not share a crate.
+pub use cog_core::alerts::ALERT_FACE_LABEL;
 
 /// Report one sighting to the store and notify on the edge.
 ///

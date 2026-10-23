@@ -383,6 +383,20 @@ pub struct PersistentAlertDraft {
     pub labels: serde_json::Value,
 }
 
+/// The label a stored alert row carries to name the face that acts on it.
+///
+/// It lives here because the `alerts` table has more than one writer and they
+/// do not share a crate: the rule library, the pool sync, the config delivery
+/// check and the convergence checks all fill the same rows. The key is spelled
+/// once so a row cannot be unreadable to the reader simply because a writer
+/// copied the name a little differently.
+///
+/// The value is the same string the face roster spells. It names who is called,
+/// never a measurement, so it rides the row's labels and stays out of every
+/// dedup key: reassigning a row to another face does not mean the condition
+/// happened again.
+pub const ALERT_FACE_LABEL: &str = "cogneva_io_face";
+
 /// Longest an alert label value may be before it is truncated.
 pub const ALERT_LABEL_VALUE_MAX_CHARS: usize = 1024;
 

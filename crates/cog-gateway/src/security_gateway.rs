@@ -3561,6 +3561,39 @@ fn pool_event_dedup_key(rule: &str, down: bool, open_key: Option<&str>, now_unix
     }
 }
 
+/// 这一行告警在存库标签里带的那一格：该谁动。
+///
+/// 池不可用归 token 管理——要动的是上游配置与凭证，不是部署或读数。写在这里而不是
+/// 让读者按规则名猜：告警表里还有别的写者，唯独这一行不是从规则库来的，配置里没有
+/// 任何一处替它申报面。
+const POOL_ALERT_FACE: &str = "token 管理";
+
+/// 池告警这一行的存库标签。
+///
+/// 面在键算完之后才加，也不进 `pool_event_dedup_key`：换个人负责，发生的事一个字节
+/// 都没变，不该因此开第二条 firing 行。
+fn pool_alert_labels(
+    pool_size: usize,
+    unavailable: &[String],
+    floor: usize,
+    floor_source: &str,
+    evidenced_recovery_unix: i64,
+    next_attempt_unix: i64,
+    quota_window_secs: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "serving": pool_size.saturating_sub(unavailable.len()),
+        "pool_size": pool_size,
+        "unavailable": unavailable,
+        "min_healthy": floor,
+        "min_healthy_source": floor_source,
+        "evidenced_recovery_unix": evidenced_recovery_unix,
+        "next_attempt_unix": next_attempt_unix,
+        "quota_window_secs": quota_window_secs,
+        cog_core::alerts::ALERT_FACE_LABEL: POOL_ALERT_FACE,
+    })
+}
+
 /// 推进 PG 告警状态机（幂等）。每拍调用，让 PG 里的告警状态始终是池状态的投影；
 /// Fired/Resolved 各打一条日志——告警历史落在 PG，重启后仍可查。
 async fn sync_pool_alert(state: &AppState, down: bool) {
@@ -3614,16 +3647,15 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
         } else {
             "LLM 上游池已恢复，LLM 依赖型任务自动继续".into()
         },
-        labels: serde_json::json!({
-            "serving": pool_size.saturating_sub(unavailable.len()),
-            "pool_size": pool_size,
-            "unavailable": unavailable,
-            "min_healthy": floor,
-            "min_healthy_source": floor_source,
-            "evidenced_recovery_unix": bounds.evidenced_unix,
-            "next_attempt_unix": bounds.next_probe_unix,
-            "quota_window_secs": bounds.window_secs,
-        }),
+        labels: pool_alert_labels(
+            pool_size,
+            &unavailable,
+            floor,
+            floor_source,
+            bounds.evidenced_unix,
+            bounds.next_probe_unix,
+            bounds.window_secs,
+        ),
     };
     match alerts.set_alert(down, &alert).await {
         Ok(AlertTransition::Fired) => {
@@ -9237,6 +9269,34 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         // 没有任何开着的行、也没灭：这个身份永远不被写下来，只需要不等于一个
         // 「在 fire」的行。
         assert_eq!(pool_event_dedup_key(rule, false, None, 2_060), rule);
+    }
+
+    /// 池不可用这一行的存库标签必须带面，且带的面不改变身份。
+    ///
+    /// 这一行不是从规则库来的，配置里没有任何一处替它申报面；读者按「标签缺失或空白
+    /// 就无主」判，所以它漏了就是一行永远答不出该谁动的告警。身份那一半另算：
+    /// `pool_event_dedup_key` 只吃规则名与事件时刻，面进不进标签都不影响它。
+    #[test]
+    fn the_pool_alert_row_names_the_face_that_acts_on_it() {
+        let unavailable = vec!["https://a.example.com".to_string()];
+        let labels = pool_alert_labels(
+            4,
+            &unavailable,
+            2,
+            "declared",
+            1_700_000_000,
+            1_700_000_600,
+            3600,
+        );
+        let face = labels
+            .get(cog_core::alerts::ALERT_FACE_LABEL)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(
+            face, POOL_ALERT_FACE,
+            "池不可用这一行没写面，无主读数会把它算成没人接：{labels}"
+        );
+        assert!(!face.trim().is_empty());
     }
 
     #[tokio::test]

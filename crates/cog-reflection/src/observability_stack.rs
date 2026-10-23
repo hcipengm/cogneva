@@ -37,6 +37,10 @@ use crate::mainline_deployer::{classify_doc, split_docs, DocFate, MainlineDeploy
 /// 因为配置没到的时候它正是要说这件事的那一条。
 pub const STACK_NOT_CONVERGED_RULE: &str = "observability_stack_not_converged";
 
+/// 这一行归哪个面：清单已经在集群里、可观测栈却没收敛到它声明的形状，要动的人是
+/// 把交付真正变成生效的那一环。
+const STACK_NOT_CONVERGED_FACE: &str = "落地≠生效";
+
 /// 处置表在清单目录里的文件名。刻意不是 `.yaml`：清单目录按 `*.yaml` 遍历，
 /// 表自己被当成清单交付一次就成了一个误会。
 pub const DISPOSITIONS_FILE: &str = "delivery-dispositions.txt";
@@ -770,6 +774,7 @@ impl StackConvergence {
                 "namespace": self.cfg.namespace,
                 "manifest_dir": self.cfg.manifest_dir,
                 "rev": rev12(rev),
+                cog_core::alerts::ALERT_FACE_LABEL: STACK_NOT_CONVERGED_FACE,
             }),
         };
         if let Err(e) = sink.set_persistent_alert(firing, &draft).await {

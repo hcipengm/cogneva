@@ -1497,6 +1497,35 @@ fn alert_message(inst: &AlertInstance) -> String {
 ///
 /// Returns whether every row in the batch was written: the caller uses that to
 /// decide between "the in-app surface has it" and "nobody was told".
+/// 监督者事件落成的那一行归哪个面。
+///
+/// 这些行不是从规则库来的，配置里没有一处替它们申报面，映射只在这里：事件的主题
+/// 与「谁去处理」在同一个地方一次定完，两边不会各改各的。写进来的规则名对不上任何
+/// 一条时返回 `None`——那一行会以无主的样子出现，这正是它该有的样子（读数按
+/// 「缺面」点名），而不是默认派给某个面。
+fn supervisor_face(rule_name: &str) -> Option<&'static str> {
+    match rule_name {
+        "agent_unhealthy" | "task_dead_letter" | "squad_respawn_requested" => Some("任务管理"),
+        "quota_threshold_breached" | "llm_upstream_pool_down" => Some("token 管理"),
+        "agent_resource_alert" => Some("资源管理"),
+        _ => None,
+    }
+}
+
+/// 落库标签：映射层带来的标签原样保留，再补上这一行的面。
+///
+/// 已有面（PrometheusRule 抄进来的那些行自带一格）不覆盖：写者自己的申报比这里的
+/// 默认更权威，而这里只是替那些没有规则库可申报的行补上。
+fn row_labels(inst: &AlertInstance) -> HashMap<String, String> {
+    let mut labels = inst.labels.clone();
+    if !labels.contains_key(cog_core::alerts::ALERT_FACE_LABEL) {
+        if let Some(face) = supervisor_face(&inst.rule_name) {
+            labels.insert(cog_core::alerts::ALERT_FACE_LABEL.into(), face.into());
+        }
+    }
+    labels
+}
+
 /// Write a batch into the alert state machine.
 ///
 /// Returns whether every row was written. The notification edge is not
@@ -1521,7 +1550,8 @@ async fn persist_alerts(store: &PostgresAlertStore, alerts: &[AlertEvent]) -> bo
             dedup_key: alert_dedup_key(inst),
             severity: inst.severity.as_str().to_string(),
             message: alert_message(inst),
-            labels: serde_json::to_value(&inst.labels).unwrap_or_else(|_| serde_json::json!({})),
+            labels: serde_json::to_value(row_labels(inst))
+                .unwrap_or_else(|_| serde_json::json!({})),
         };
         if let Err(e) = store.set_alert(condition, &alert).await {
             warn!(rule = %alert.rule, error = %e, "alert persistence failed");
@@ -1859,6 +1889,44 @@ mod tests {
         // 两边同写一条条件，键却是两个，所以这一侧根本不该落库（见 `owns_the_row`）。
         let pool = inst("llm_upstream_pool_down", &[], AlertState::Firing);
         assert_eq!(alert_dedup_key(&pool), "llm_upstream_pool_down");
+    }
+
+    /// 这条桥落的每一行都要带面：读者在 `alerts` 表里按「标签缺失或空白」判无主，
+    /// 而这些规则名不在规则库里，没有别处替它们申报。
+    #[test]
+    fn every_row_the_bridge_persists_names_the_face_that_acts_on_it() {
+        for (rule, face) in [
+            ("agent_unhealthy", "任务管理"),
+            ("task_dead_letter", "任务管理"),
+            ("squad_respawn_requested", "任务管理"),
+            ("quota_threshold_breached", "token 管理"),
+            ("llm_upstream_pool_down", "token 管理"),
+            ("agent_resource_alert", "资源管理"),
+        ] {
+            assert_eq!(supervisor_face(rule), Some(face), "{rule} 的面");
+            let row = row_labels(&inst(rule, &[], AlertState::Firing));
+            assert_eq!(
+                row.get(cog_core::alerts::ALERT_FACE_LABEL)
+                    .map(String::as_str),
+                Some(face),
+                "{rule} 落库时没带面"
+            );
+        }
+
+        // 规则库来的一行自带面（清单上申报的），映射这里不覆盖它。
+        let declared = inst(
+            "CognevaSomeRule",
+            &[(cog_core::alerts::ALERT_FACE_LABEL, "通信")],
+            AlertState::Firing,
+        );
+        assert_eq!(
+            row_labels(&declared)
+                .get(cog_core::alerts::ALERT_FACE_LABEL)
+                .map(String::as_str),
+            Some("通信")
+        );
+        // 认不出的规则名不臆造一个面：无主就该读成无主。
+        assert_eq!(supervisor_face("CognevaSomeRule"), None);
     }
 
     #[test]

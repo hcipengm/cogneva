@@ -486,6 +486,21 @@ fn judge(path: &std::path::Path) -> DocumentDelivery {
     config_sections::judge_delivery(delivered.as_deref(), crate::config::DECLARED_CONFIG_JSON)
 }
 
+/// 这两条自我告警归哪个面：配置声明在盘上、进程读到的却是别的（或缺的）东西，
+/// 要动的人去修的是交付那一环，不是写规则的人。
+const CONFIG_DELIVERY_FACE: &str = "落地≠生效";
+
+/// 这一行的存库标签。
+///
+/// 面写进标签、不进 `dedup_key`（身份是规则名＋文档路径）：交接给另一个面时发生的
+/// 事一个字节都没变，不该因此重开一行；而不写进标签，读表的人就问不出该叫谁。
+fn row_labels(source: &str) -> serde_json::Value {
+    serde_json::json!({
+        "source": source,
+        cog_core::alerts::ALERT_FACE_LABEL: CONFIG_DELIVERY_FACE,
+    })
+}
+
 /// Raise or close the one row this check owns.
 ///
 /// One row for the whole deployment, keyed by the document's path: every
@@ -509,7 +524,7 @@ async fn set_row(
         dedup_key: format!("{rule}:{source}"),
         severity: if firing { "warning" } else { "info" }.to_string(),
         message: message.to_string(),
-        labels: serde_json::json!({ "source": source }),
+        labels: row_labels(source),
     };
     match store.set_alert(firing, &alert).await {
         Ok(_) => {
@@ -703,6 +718,24 @@ mod tests {
                 names.join(", ")
             );
         }
+    }
+
+    /// 这条自我告警的行走的是同一个 `alerts` 表，读者在那里按「标签缺失或空白」
+    /// 判无主；面不写进标签，它就永远答不出该叫谁。
+    #[test]
+    fn the_row_names_the_face_that_acts_on_it() {
+        let labels = row_labels("/etc/cogneva/cogneva.json");
+        assert_eq!(
+            labels
+                .get(cog_core::alerts::ALERT_FACE_LABEL)
+                .and_then(|v| v.as_str()),
+            Some(CONFIG_DELIVERY_FACE)
+        );
+        assert_eq!(
+            labels.get("source").and_then(|v| v.as_str()),
+            Some("/etc/cogneva/cogneva.json"),
+            "面加进来不该把原有的来源那一格挤掉"
+        );
     }
 
     /// The check judges the file it is pointed at, and tells a missing file
