@@ -107,6 +107,10 @@ const NOT_A_SERIES: &[(&str, &str)] = &[
         "cogneva_io_managed",
         "a label key, not a series: the alert mirror selects the Prometheus alerts to copy by carrying this label, and the key travels in `observability.infra_watch.mirror_alerts.label` (cog-observability/src/config.rs) -- the same string is a value of `ALERTS`'s label set, not a name the exposition publishes",
     ),
+    (
+        "cogneva_io_face",
+        "a label key, not a series: the rule that raised a row declares which face acts on it, and the declaration rides the stored row's labels while staying out of the dedup key (cog-observability/src/infra_watch.rs) -- it names who is called, never a measurement, so the exposition publishes nothing under it",
+    ),
 ];
 
 /// The prefix every series name this build publishes is spelled with.
