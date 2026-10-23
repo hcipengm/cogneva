@@ -1019,6 +1019,23 @@ mod tests {
             .map(|row| row.face)
             .collect();
         let projection = render_roster(&faces);
+        // The host readers find their columns by name in this line, and the
+        // comment marker is what keeps the importer from reading it as a data
+        // row. Both halves are pinned here: a host reader that looks for
+        // `face` fails on `# face` and reports the projection as having no
+        // such column, which reads downstream as a producer that cannot read
+        // its input on every beat. Which side carries the bug does not matter
+        // to whoever sees the alert; a change to this line has to be made
+        // knowing both consumers exist.
+        assert_eq!(
+            projection.lines().next(),
+            Some(
+                "# face\tkind\towner\tdeputy\twitness\ttime_share\tvacancy_until\t\
+                 vacancy_assigner\tgap_task\tfirst_reading\tentry_path\tupdated_at\t\
+                 source_fronts"
+            ),
+            "the column line is the contract with the host readers that locate columns by name"
+        );
         let back = parse_roster(&projection).unwrap_or_else(|e| {
             panic!("the projection must be readable by the import it is named after: {e}\n{projection}")
         });
