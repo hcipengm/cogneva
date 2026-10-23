@@ -1,0 +1,208 @@
+# 后台 loop 那七条读数的单测夹具：停了、死了、重启了、角色没人持有、角色被两个进程同时
+# 持有、角色探测在失败、角色账不平衡。
+#
+# 这一族守的是「循环还在不在转、它的角色归谁」——都是只有界、没有形状的判据。写错界的
+# 症状是安静（该亮的没亮）或者恒亮（不该亮的永远亮），没有任何结构门会红。
+#
+# 每条静格的理由：
+#   - `background_loop_stalled`：界不是常数，是 6 倍周期加工作预算；而且**周期为零的 loop
+#     不归它问**——没有周期就没有「本该怎么久转一次」。
+#   - `background_loop_role_unowned`：最近 15 分钟里有人持有过就不算没人。持有者刚退出、
+#     还没等到下一拍换届，不是丢角色。
+#   - `background_loop_role_split`：两条序列各为 1 才相加成 2；`unowned` 在那一格里必须静——
+#     有人持有（两个人持有也是持有），而它的抑制腿只看「最大值是不是 1」。
+#   - 三条计数器（死亡、重启、探测失败）不走窗口就不响；`role_books_unbalanced` 只有在
+#     取得、失去、持有三者对不上时才响。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-background-loops.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: background_loop_stalled
+# rule: background_loop_died
+# rule: background_loop_restarted
+# rule: background_loop_role_unowned
+# rule: background_loop_role_split
+# rule: background_loop_role_probe_failing
+# rule: background_loop_role_books_unbalanced
+
+evaluation_interval: 1m
+
+tests:
+  # 一个健康了一整小时的 loop：周期六十秒、最后一次心跳三十秒前、没有死亡、没有重启、
+  # 没有探测失败、账平衡、角色有人且只有一个人。七条全静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_loop_tick_age_seconds{loop="healthy"}'
+        values: '30x60'
+      - series: 'cogneva_loop_period_seconds{loop="healthy"}'
+        values: '60x60'
+      - series: 'cogneva_loop_work_budget_seconds{loop="healthy"}'
+        values: '30x60'
+      - series: 'cogneva_loop_deaths_total{loop="healthy"}'
+        values: '0x60'
+      - series: 'cogneva_loop_restarts_total{loop="healthy"}'
+        values: '0x60'
+      - series: 'cogneva_loop_owner_probe_failures_total{loop="healthy"}'
+        values: '0x60'
+      - series: 'cogneva_loop_owner_acquisitions_total{loop="healthy"}'
+        values: '4x60'
+      - series: 'cogneva_loop_owner_losses_total{loop="healthy"}'
+        values: '3x60'
+      - series: 'cogneva_loop_owner_held{loop="healthy",pod="p-1"}'
+        values: '1x60'
+      - series: 'cogneva_loop_role_declared{loop="healthy"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: background_loop_stalled
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: background_loop_died
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: background_loop_restarted
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: background_loop_role_unowned
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: background_loop_role_split
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: background_loop_role_probe_failing
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: background_loop_role_books_unbalanced
+        exp_alerts: []
+
+  # 一个坏掉的 loop：心跳停在 400 秒（界是 6×60+30=390，刚过去十秒）、死了一次、重启过一次、
+  # 探测失败两次、账上取得 5、失去 2、持有 1（对不上二）。五条亮；角色有关的另外两条静：
+  # 声明了、也正有人持有。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_loop_tick_age_seconds{loop="bad"}'
+        values: '400x60'
+      - series: 'cogneva_loop_period_seconds{loop="bad"}'
+        values: '60x60'
+      - series: 'cogneva_loop_work_budget_seconds{loop="bad"}'
+        values: '30x60'
+      - series: 'cogneva_loop_deaths_total{loop="bad"}'
+        values: '0x5 1x55'
+      - series: 'cogneva_loop_restarts_total{loop="bad"}'
+        values: '0x5 1x55'
+      - series: 'cogneva_loop_owner_probe_failures_total{loop="bad"}'
+        values: '0x5 2x55'
+      - series: 'cogneva_loop_owner_acquisitions_total{loop="bad"}'
+        values: '5x60'
+      - series: 'cogneva_loop_owner_losses_total{loop="bad"}'
+        values: '2x60'
+      - series: 'cogneva_loop_owner_held{loop="bad",pod="p-1"}'
+        values: '1x60'
+      - series: 'cogneva_loop_role_declared{loop="bad"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: background_loop_stalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              loop: bad
+      - eval_time: 60m
+        alertname: background_loop_died
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              loop: bad
+      - eval_time: 60m
+        alertname: background_loop_restarted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              loop: bad
+      - eval_time: 60m
+        alertname: background_loop_role_probe_failing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              loop: bad
+      - eval_time: 60m
+        alertname: background_loop_role_books_unbalanced
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              loop: bad
+      - eval_time: 60m
+        alertname: background_loop_role_unowned
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: background_loop_role_split
+        exp_alerts: []
+
+  # 没声明周期的 loop：心跳再老也不归 `stalled` 问。这一格守着表达式末尾那条 `period > 0`——
+  # 删掉它，界会退化成 `6×0 + 预算`，任何一条只报心跳年龄、不报周期的序列都会在健康态上
+  # 恒亮，而恒亮的判据与没有判据同价。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_loop_tick_age_seconds{loop="timeless"}'
+        values: '99999x60'
+      - series: 'cogneva_loop_period_seconds{loop="timeless"}'
+        values: '0x60'
+      - series: 'cogneva_loop_work_budget_seconds{loop="timeless"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: background_loop_stalled
+        exp_alerts: []
+
+  # 角色被两个进程同时持有：两条序列各为 1，和是 2 ⇒ `split` 亮（critical）。
+  # 同一格里 `unowned` 必须静——有人持有，哪怕两个人持有也是「有人」。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_loop_owner_held{loop="split",pod="p-1"}'
+        values: '1x60'
+      - series: 'cogneva_loop_owner_held{loop="split",pod="p-2"}'
+        values: '1x60'
+      - series: 'cogneva_loop_role_declared{loop="split"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: background_loop_role_split
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              loop: split
+      - eval_time: 60m
+        alertname: background_loop_role_unowned
+        exp_alerts: []
+
+  # 角色声明了，但过去十五分钟里没有任何人持有过：`unowned` 亮（critical）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_loop_role_declared{loop="ownerless"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: background_loop_role_unowned
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              loop: ownerless
+
+  # 持有者二十多分钟前就退出了：十五分钟的窗口里一个样本都没有。这一格守着窗口本身——
+  # 把 `[15m]` 写成 `[1h]`，这一格会红（那时它还被算作「有人持有」）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_loop_owner_held{loop="lapsed",pod="p-1"}'
+        values: '1x20'
+      - series: 'cogneva_loop_role_declared{loop="lapsed"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: background_loop_role_unowned
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              loop: lapsed
