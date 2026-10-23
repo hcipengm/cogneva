@@ -20,7 +20,7 @@ rule_files:
 evaluation_interval: 5m
 
 tests:
-  # 一代新生阶段的占用比最近三天的最低值高 10%：响。1.05 的界、1 GiB 的地板、
+  # 一代新生阶段的占用比最近三天的最低值高 10%：响。默认的 1.05 界、默认的 1 GiB 地板、
   # 六天的采样铺满三天——三腿都要成立，这条才该响。
   - interval: 5m
     input_series:
@@ -61,7 +61,7 @@ tests:
         alertname: boot_phase_footprint_grew
         exp_alerts: []
 
-  # 不到 1 GiB 的阶段：300 MiB 涨到 400 MiB 是 1.33 倍，仍然不归这条规则问。
+  # 不到默认地板（1 GiB）的阶段：例如 300 MiB 涨到 400 MiB 是 1.33 倍，仍然不归这条规则问。
   - interval: 5m
     input_series:
       - series: 'cogneva_boot_rss_bytes{phase="process-start",pod="a"}'
