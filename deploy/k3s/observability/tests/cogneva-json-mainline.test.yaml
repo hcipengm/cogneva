@@ -1,0 +1,315 @@
+# 主干（自进化部署器）那十三条读数的单测夹具。它们说的是「部署这件事还在不在往前走」：
+# CI 判词失败或读不出来、换代问句停了、预检与 kubectl 被拒、发布被拒、发布从不落地、
+# 构建变慢、CI 持有太久、推进被饿死、定位判词停在「不前进」、判词沉默、轮询全失败。
+#
+# 这一族里有一半是「反事实」形状——**该有的那一半没发生**才响：
+#   - `mainline_rollout_never_lands`：有尝试、窗口里没有完成。
+#   - `mainline_poll_cycles_all_failed`：有失败、窗口里没有成功。
+#   - `mainline_supersession_question_stopped`：有尝试、没有换代问句。
+#   - `mainline_progress_verdict_mute`：四小时里判过、最近两小时没有一次正判词。
+# 每一条都配了「两半都在」的静格；没有那一格，把 `unless` 删掉照样绿——而它删掉之后
+# 这条规则就变成恒亮。
+#
+# 另有三条（构建慢、CI 持有太久、推进被饿死）各带一条**新鲜度腿**：读数停在几小时前时
+# 值再大也不算，那是写者不在，不是当前慢。最后一格专门把所有观测时间戳停在起点、
+# 在八小时后问它们——三条都必须静。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-mainline.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: mainline_ci_verdict_failed
+# rule: mainline_ci_verdict_unreadable
+# rule: mainline_supersession_question_stopped
+# rule: mainline_delivery_preflight_refused
+# rule: mainline_kubectl_refused
+# rule: mainline_rollout_refused
+# rule: mainline_rollout_never_lands
+# rule: mainline_build_slow
+# rule: mainline_ci_hold_too_long
+# rule: mainline_advance_starved
+# rule: mainline_not_progressing
+# rule: mainline_progress_verdict_mute
+# rule: mainline_poll_cycles_all_failed
+
+evaluation_interval: 1m
+
+tests:
+  # 健康的一小时：CI 判词是 pass、没有「读不出判词」、每次尝试都问过换代、没有被拒、
+  # 尝试与完成一起长、构建 900 秒且读数新鲜、CI 持有 100 秒且新鲜、没有推迟、定位判词
+  # 不在「不前进」、判词一直在判、轮询有成功。十三条全静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_mainline_ci_verdict_total{verdict="pass"}'
+        values: '0x5 3x55'
+      - series: 'cogneva_mainline_ci_no_verdict_reason_total{reason="pending"}'
+        values: '0x60'
+      - series: 'cogneva_mainline_rollout_attempts_total'
+        values: '0x5 2x55'
+      - series: 'cogneva_mainline_supersession_checks_total'
+        values: '0x5 2x55'
+      - series: 'cogneva_mainline_rollout_completed_total'
+        values: '0x5 2x55'
+      - series: 'cogneva_mainline_preflight_refused_total{verb="apply",resource="deployments"}'
+        values: '0x60'
+      - series: 'cogneva_mainline_kubectl_refused_total{verb="apply",resource="deployments"}'
+        values: '0x60'
+      - series: 'cogneva_mainline_rollout_refused_total{reason="not_ready"}'
+        values: '0x60'
+      - series: 'cogneva_mainline_build_seconds{outcome="ok"}'
+        values: '900x60'
+      - series: 'cogneva_mainline_build_seconds_observed_timestamp_seconds{outcome="ok"}'
+        values: '100x60'
+      - series: 'cogneva_mainline_ci_hold_seconds'
+        values: '100x60'
+      - series: 'cogneva_mainline_ci_hold_seconds_observed_timestamp_seconds'
+        values: '100x60'
+      - series: 'cogneva_mainline_advance_deferrals'
+        values: '0x60'
+      - series: 'cogneva_mainline_advance_deferrals_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'cogneva_mainline_behind_verdict_stalled'
+        values: '0x60'
+      - series: 'cogneva_mainline_behind_verdict_judged'
+        values: '1x60'
+      - series: 'cogneva_mainline_poll_cycles_total{outcome="ok"}'
+        values: '0x5 5x55'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: mainline_ci_verdict_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_ci_verdict_unreadable
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_supersession_question_stopped
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_delivery_preflight_refused
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_kubectl_refused
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_rollout_refused
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_rollout_never_lands
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_build_slow
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_ci_hold_too_long
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_advance_starved
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_not_progressing
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_progress_verdict_mute
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_poll_cycles_all_failed
+        exp_alerts: []
+
+  # 一次卡住的主干：CI 判 fail、有六小时里读不出的判词（`pending` 按设计不算）、
+  # 尝试在长而换代问句没长、预检与 kubectl 被拒、发布因 not_ready 被拒、尝试长了而
+  # 完成没长、轮询有失败没有成功。八条亮。
+  # 同一格里三条「慢」的规则静——它们的读数不够慢；换代问句那条只看差，不看总数。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_mainline_ci_verdict_total{verdict="fail"}'
+        values: '0x5 2x55'
+      - series: 'cogneva_mainline_ci_verdict_total{verdict="pass"}'
+        values: '0x60'
+      - series: 'cogneva_mainline_ci_no_verdict_reason_total{reason="unreadable"}'
+        values: '0x5 1x55'
+      - series: 'cogneva_mainline_ci_no_verdict_reason_total{reason="pending"}'
+        values: '0x5 4x55'
+      - series: 'cogneva_mainline_rollout_attempts_total'
+        values: '0x5 3x55'
+      - series: 'cogneva_mainline_supersession_checks_total'
+        values: '0x60'
+      - series: 'cogneva_mainline_rollout_completed_total'
+        values: '0x60'
+      - series: 'cogneva_mainline_preflight_refused_total{verb="apply",resource="deployments"}'
+        values: '0x5 1x55'
+      - series: 'cogneva_mainline_kubectl_refused_total{verb="get",resource="pods"}'
+        values: '0x5 2x55'
+      - series: 'cogneva_mainline_rollout_refused_total{reason="not_ready"}'
+        values: '0x5 1x55'
+      - series: 'cogneva_mainline_build_seconds{outcome="ok"}'
+        values: '900x60'
+      - series: 'cogneva_mainline_build_seconds_observed_timestamp_seconds{outcome="ok"}'
+        values: '100x60'
+      - series: 'cogneva_mainline_ci_hold_seconds'
+        values: '100x60'
+      - series: 'cogneva_mainline_ci_hold_seconds_observed_timestamp_seconds'
+        values: '100x60'
+      - series: 'cogneva_mainline_advance_deferrals'
+        values: '1x60'
+      - series: 'cogneva_mainline_advance_deferrals_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'cogneva_mainline_behind_verdict_stalled'
+        values: '1x60'
+      - series: 'cogneva_mainline_behind_verdict_judged'
+        values: '0x60'
+      - series: 'cogneva_mainline_poll_cycles_total{outcome="failed"}'
+        values: '0x5 2x55'
+      - series: 'cogneva_mainline_poll_cycles_total{outcome="ok"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: mainline_ci_verdict_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              verdict: fail
+      - eval_time: 60m
+        alertname: mainline_ci_verdict_unreadable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: unreadable
+      - eval_time: 60m
+        alertname: mainline_supersession_question_stopped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: mainline_delivery_preflight_refused
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              verb: apply
+              resource: deployments
+      - eval_time: 60m
+        alertname: mainline_kubectl_refused
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              verb: get
+              resource: pods
+      - eval_time: 60m
+        alertname: mainline_rollout_refused
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: not_ready
+      - eval_time: 60m
+        alertname: mainline_rollout_never_lands
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: mainline_not_progressing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: mainline_poll_cycles_all_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outcome: failed
+      # 三条「慢/饿死」的读数在这里都不够界，必须静：这一格证明它们判的是值，不是「有数据」。
+      - eval_time: 60m
+        alertname: mainline_build_slow
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_ci_hold_too_long
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_advance_starved
+        exp_alerts: []
+
+  # 慢、久、饿死：构建 2000 秒（界 1200）、CI 持有 20000 秒（界 14400）、推迟 5 次（界 3），
+  # 三条读数都新鲜。三条亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_mainline_build_seconds{outcome="ok"}'
+        values: '2000x60'
+      - series: 'cogneva_mainline_build_seconds_observed_timestamp_seconds{outcome="ok"}'
+        values: '100x60'
+      - series: 'cogneva_mainline_ci_hold_seconds'
+        values: '20000x60'
+      - series: 'cogneva_mainline_ci_hold_seconds_observed_timestamp_seconds'
+        values: '100x60'
+      - series: 'cogneva_mainline_advance_deferrals'
+        values: '5x60'
+      - series: 'cogneva_mainline_advance_deferrals_observed_timestamp_seconds'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: mainline_build_slow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: mainline_ci_hold_too_long
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: mainline_advance_starved
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 同样的三个值，但观测时间戳一直停在起点：八小时后问它们时，三条读数都已经是
+  # 陈旧的了。三条必须静——那是写者不在，不是当前慢。删掉任何一条的新鲜度腿，
+  # 这一格会先红。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_mainline_build_seconds{outcome="ok"}'
+        values: '2000x480'
+      - series: 'cogneva_mainline_build_seconds_observed_timestamp_seconds'
+        values: '0x480'
+      - series: 'cogneva_mainline_ci_hold_seconds'
+        values: '20000x480'
+      - series: 'cogneva_mainline_ci_hold_seconds_observed_timestamp_seconds'
+        values: '0x480'
+      - series: 'cogneva_mainline_advance_deferrals'
+        values: '5x480'
+      - series: 'cogneva_mainline_advance_deferrals_observed_timestamp_seconds'
+        values: '0x480'
+    alert_rule_test:
+      - eval_time: 480m
+        alertname: mainline_build_slow
+        exp_alerts: []
+      - eval_time: 480m
+        alertname: mainline_ci_hold_too_long
+        exp_alerts: []
+      - eval_time: 480m
+        alertname: mainline_advance_starved
+        exp_alerts: []
+
+  # 判词沉默：判词在一百分前有过正的一次，之后**连续两小时以上全是 0**。最近两小时里
+  # 最大值为 0、而四小时的采样数多过两小时 ⇒ 亮。这一格守的是「沉默」与「还在判」的差：
+  # 正判词必须落在两小时窗口**之外**，落在里面就是健康（下一格）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_mainline_behind_verdict_judged'
+        values: '1x100 0x140'
+    alert_rule_test:
+      - eval_time: 240m
+        alertname: mainline_progress_verdict_mute
+        exp_alerts:
+          - exp_labels:
+              severity: info
+
+  # 最近两小时里判出过一次正的：不沉默。删掉 `max_over_time[2h] < 1` 那一腿，这一格会红——
+  # 而那正是「判词说前进」与「判词沉默」必须分开的地方。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_mainline_behind_verdict_judged'
+        values: '0x100 1x140'
+    alert_rule_test:
+      - eval_time: 240m
+        alertname: mainline_progress_verdict_mute
+        exp_alerts: []
