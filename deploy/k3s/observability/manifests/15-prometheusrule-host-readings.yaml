@@ -1048,6 +1048,21 @@ spec:
             summary: "本周记忆产出超过产品产出 {{ $value }} 篇"
             description: "跑 `bash scripts/host/cogneva-brain-budget-reading.sh` 看三格：`brain_memory_new_7d`、`brain_budget_product_commits`、`brain_budget_product_share`。这条是唯一**事前**判的一格——`UserPromptSubmit` 钩子把缓存卡印在回合开头，余量为负时这一轮不新建记忆文件，要记的教训写进当天流水或写成门测试。判的是「多开文件」，改既有篇不收费。"
 
+        # 「门红了」是回归还是噪声：must-green 里自己会红的成员，每响一次让当时排队的每个
+        # 提交者各付一整轮门（15～25 分钟）。判词读的是**同一个**驱动者在窗口里重复出现，
+        # 不是「有过一次」——一次是抖动。界与窗口只写在生产者里（`flaky_suite_budget`、
+        # `flaky_window_days` 逐拍一起印），这条规则读判词，不另立一套数。
+        - alert: CognevaMustGreenFlakeRepeat
+          expr: max(must_green_flake_repeat_verdict) > 0
+          for: 1h
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "原则管理"
+            severity: warning
+          annotations:
+            summary: "同一个 must-green 驱动者在窗口内重复假红"
+            description: "跑 `bash scripts/principles/must-green-flake-reading.sh` 看 `flaky_by_suite_window`：哪个套件堆得高、几次。界是 `flaky_suite_budget`（默认 3 次／窗口，窗口 7 天），改界改生产者的 `COGNEVA_FLAKE_SUITE_BUDGET`，这条规则读的是判词。记录里只有驱动套件、没有成员名（`host-tests.test.sh` 一份驱动整层 `scripts/host/*.test.sh`），所以下一步是去那一层里找哪一份不稳，不是重试那一笔提交。假红与真红分开数：真红落在 `red/`、不复跑、不进这一堆。"
+
         # 面名这一环：正本（另一棵树里的 `scripts/data/faces.tsv`）与树内载体申报的面集合。
         # 这三格此前只有「规则真响之后」才看得见——载体挂着一个正本不认的面，读数面报
         # `face_unknown`，而那要等某条规则真的越界。三条都在没有任何规则响的时候就能红。
