@@ -25,6 +25,7 @@ rule_files:
 # rule: llm_pool_open_but_idle
 # rule: llm_spend_reading_is_blind
 # rule: llm_upstream_refusal_that_waiting_cannot_repair
+# rule: llm_pool_down_on_a_quota_cycle
 # rule: llm_calls_all_failing
 # rule: llm_pool_signal_undelivered
 # rule: llm_usage_upstream_silent
@@ -419,3 +420,117 @@ tests:
           - exp_labels:
               severity: warning
               upstream: u1
+
+  # 池掉线，而一家上游自己说是**额度周期**用完了（kind=quota_cycle，观测新鲜）：
+  # `llm_pool_down_on_a_quota_cycle` 亮，`llm_pool_open_but_idle` **静**。
+  #
+  # 这一格是 2026-10-24 现场的形状：四条 idle 腿全部成立（额度还够、限速在做、准入
+  # 读数新鲜、用量计数器一小时没动），而 kimi／ark 用 429 明说「本周额度已用完」。
+  # 同一个小时里，`llm_pool_open_but_idle` 真的响了，它的摘要说「非负意味着门不是为
+  # 预算拒的」——而门恰恰是为预算拒的。两条规则必须在同一格里一响一静：
+  #   静的这条说「不是预算」，响的那条说「是预算、等哪个时刻」。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_allowance_tokens'
+        values: '100x60'
+      - series: 'llm_pool_allowance_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_spent_tokens'
+        values: '10x60'
+      - series: 'llm_pool_spent_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_reserve_tokens'
+        values: '10x60'
+      - series: 'llm_pool_reserve_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_paced_upstreams'
+        values: '1x60'
+      - series: 'llm_pool_paced_upstreams_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'cogneva_ready_admission_readings{kind="ready"}'
+        values: '1x60'
+      - series: 'cogneva_ready_admission_readings_observed_timestamp_seconds{kind="ready"}'
+        values: '3500x60'
+      - series: 'llm_usage_readings_total{outcome="read"}'
+        values: '7x60'
+      - series: 'llm_upstream_refusal_kind{upstream="u1",kind="quota_cycle"}'
+        values: '1x60'
+      - series: 'llm_upstream_refusal_kind_observed_timestamp_seconds{upstream="u1",kind="quota_cycle"}'
+        values: '3500x60'
+      - series: 'llm_pool_available'
+        values: '0x60'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_down_on_a_quota_cycle
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              upstream: u1
+      - eval_time: 60m
+        alertname: llm_pool_open_but_idle
+        exp_alerts: []
+
+  # 同一家上游同样在额度周期里，但**池是活的**（其余成员还在供）：新的那条静——
+  # 有活干的时候不该有人被告知池掉了；而 idle 那条照旧亮，因为「开着却一小时没人
+  # 用」在池能接活时仍然是个真问题。这一格守的是新规则的第二条腿（池不可用），
+  # 少了它，一条上游的额度周期会把「池可用但通道坏了」这个诊断整体吞掉。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_allowance_tokens'
+        values: '100x60'
+      - series: 'llm_pool_allowance_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_spent_tokens'
+        values: '10x60'
+      - series: 'llm_pool_spent_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_reserve_tokens'
+        values: '10x60'
+      - series: 'llm_pool_reserve_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_paced_upstreams'
+        values: '1x60'
+      - series: 'llm_pool_paced_upstreams_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'cogneva_ready_admission_readings{kind="ready"}'
+        values: '1x60'
+      - series: 'cogneva_ready_admission_readings_observed_timestamp_seconds{kind="ready"}'
+        values: '3500x60'
+      - series: 'llm_usage_readings_total{outcome="read"}'
+        values: '7x60'
+      - series: 'llm_upstream_refusal_kind{upstream="u1",kind="quota_cycle"}'
+        values: '1x60'
+      - series: 'llm_upstream_refusal_kind_observed_timestamp_seconds{upstream="u1",kind="quota_cycle"}'
+        values: '3500x60'
+      - series: 'llm_pool_available'
+        values: '1x60'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_down_on_a_quota_cycle
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_pool_open_but_idle
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+
+  # 上游说过额度周期，但那一格是八小时前写的：写者早停了，最后那一行被存储永远服务。
+  # 不是当前状态，静——这一格守着新鲜度腿。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_refusal_kind{upstream="u1",kind="quota_cycle"}'
+        values: '1x480'
+      - series: 'llm_upstream_refusal_kind_observed_timestamp_seconds{upstream="u1",kind="quota_cycle"}'
+        values: '0x480'
+      - series: 'llm_pool_available'
+        values: '0x480'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '27500x480'
+    alert_rule_test:
+      - eval_time: 480m
+        alertname: llm_pool_down_on_a_quota_cycle
+        exp_alerts: []
