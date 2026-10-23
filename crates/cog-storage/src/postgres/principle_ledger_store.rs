@@ -911,12 +911,45 @@ ON CONFLICT (slug) DO UPDATE SET
     measured_at = now(),
     measured_rev = EXCLUDED.measured_rev";
 
+/// Which rows are *not* a principle, in the one place both censuses read.
+///
+/// The account holds a row per slug a gate refused work for, and a slug is not
+/// always a principle: a gate that cannot read its own material records the
+/// refusal under its own name (`principle-gate.sh:shape-table-unreadable`), and
+/// so does the drill that proves that path works. Those rows belong in the
+/// account -- the refusal counts are published by slug, and a counter that
+/// drops the gate's own outage is the one failure the count exists to catch --
+/// but they are not corpus, and the census says "how much of the corpus has a
+/// gate". Counting them there is not a rounding error: those rows have no
+/// state and no measurement by construction, so they land in `unmeasured`
+/// forever and pin "principles nothing has ever looked at" at a number that can
+/// never fall. Measured on 2026-10-23: that cell read 2, both of them gate
+/// identities, and nothing in the reading could name which two.
+///
+/// Matched by shape rather than by a list of today's names, because the gate
+/// gains refusal identities over time and a list would silently stop covering
+/// them: a principle is named after the file that carries it, and a gate names
+/// its own refusals `<script>.sh:<reason>`. The predicate is the shape, not the
+/// substring -- a principle whose name happens to contain a colon is not
+/// excluded by the colon, and the counterexample census on the live account
+/// found exactly two colon-carrying slugs, both gate identities.
+macro_rules! not_a_principle {
+    () => {
+        "slug !~ '^[A-Za-z0-9_.-]+\\.sh:'"
+    };
+}
+
 /// The three counts in one read, the unset state included: `GROUP BY` over a
 /// nullable column already forms a group for `NULL`, and filtering it out would
 /// mean a second query to learn the same thing.
-const CENSUS_SQL: &str = "\
-SELECT state, count(*) AS n FROM principle_ledger
-GROUP BY state";
+///
+/// The gate's own refusal identities are left out for the reason on
+/// [`not_a_principle`].
+const CENSUS_SQL: &str = concat!(
+    "SELECT state, count(*) AS n FROM principle_ledger WHERE ",
+    not_a_principle!(),
+    " GROUP BY state"
+);
 
 /// The same census by the tier that checks each row, the undeclared rows grouped
 /// under `NULL`.
@@ -924,9 +957,15 @@ GROUP BY state";
 /// A separate statement from the state census rather than a `state, check_kind`
 /// cross product: the two questions are asked by different readers at different
 /// times, and a joint grouping would make each one pay for the other's cardinality.
-const CHECK_KIND_CENSUS_SQL: &str = "\
-SELECT check_kind, count(*) AS n FROM principle_ledger
-GROUP BY check_kind";
+///
+/// Filtered by the same predicate as the state census: the two are read side by
+/// side, and a tier census whose total disagreed with the state census by the
+/// gate's own rows would make every reader ask which one is wrong.
+const CHECK_KIND_CENSUS_SQL: &str = concat!(
+    "SELECT check_kind, count(*) AS n FROM principle_ledger WHERE ",
+    not_a_principle!(),
+    " GROUP BY check_kind"
+);
 
 /// Queue one refusal, keeping the largest report for its second.
 ///

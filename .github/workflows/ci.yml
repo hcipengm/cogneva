@@ -201,6 +201,16 @@ jobs:
         run: cargo test -p cog-storage --test principle_ledger_outstanding -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The census counts the corpus, and the account also holds rows that are
+      # not corpus: a gate records its own refusals under its own name, and
+      # those rows carry no state by construction. Which rows a grouped count
+      # covered cannot be seen from the values -- a count is one number per
+      # group either way -- so the predicate that separates the two has to be
+      # run against a server.
+      - name: Live-DB principle-ledger census
+        run: cargo test -p cog-storage --test principle_ledger_census -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The sample-log sweep is expressed almost entirely as one DELETE, so its
       # correctness cannot be checked without a server; the DB-free tests beside
       # it only cover the sweep period. Leaving these out of the gate is how a
