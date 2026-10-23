@@ -447,6 +447,50 @@ fn join_or_dash(items: &[String]) -> String {
     }
 }
 
+/// The roster, one line per face, in the column order `import-faces` reads.
+///
+/// The projection is written under the name the import reads, so it has to be
+/// the same schema: a projection that carried fewer columns would be a second
+/// format behind one file name, unreadable by the reader it is named after, and
+/// every field it dropped would live only in whichever hand-kept copy happened
+/// to have it. Those are the fields a reader needs most -- the reading a face is
+/// judged by, where its work enters the change path, the share of a person's
+/// time it takes -- so losing them here is losing the whole point of projecting.
+///
+/// A vacancy is a claim with three parts: by when, who fills it, and the task
+/// expected to close it. Only the deadline would let a reader mistake a bare
+/// date for a declared vacancy, which is the difference between a staffed face
+/// and `no_owner`.
+fn render_roster(faces: &[Face]) -> String {
+    let mut out = String::from(
+        "# face\tkind\towner\tdeputy\twitness\ttime_share\tvacancy_until\t\
+         vacancy_assigner\tgap_task\tfirst_reading\tentry_path\tupdated_at\t\
+         source_fronts\n",
+    );
+    for face in faces {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            face.face_id,
+            face.spec.kind.as_str(),
+            face.owner_unit.as_deref().unwrap_or("-"),
+            face.spec.deputy_unit.as_deref().unwrap_or("-"),
+            face.spec.witness_unit.as_deref().unwrap_or("-"),
+            face.spec.time_share.as_deref().unwrap_or("-"),
+            face.spec
+                .vacancy_until
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "-".into()),
+            face.spec.vacancy_assigner.as_deref().unwrap_or("-"),
+            face.spec.gap_task_id.as_deref().unwrap_or("-"),
+            face.spec.first_reading.as_deref().unwrap_or("-"),
+            face.spec.entry_path.as_deref().unwrap_or("-"),
+            face.updated_at.to_rfc3339(),
+            face.spec.source_fronts.as_deref().unwrap_or("-"),
+        ));
+    }
+    out
+}
+
 /// The projection a freshness gate reads.
 ///
 /// Two header lines carry when the file was taken and which revision of the
@@ -469,31 +513,7 @@ async fn project(
     );
 
     let mut faces_tsv = String::from(&stamp);
-    // A vacancy is a claim with three parts: by when, who fills it, and the
-    // task expected to close it. A projection that carried only the deadline
-    // would let a reader -- and every gate reading this file -- mistake a bare
-    // date for a declared vacancy, which is exactly the difference between a
-    // staffed face and `no_owner`.
-    faces_tsv.push_str(
-        "face\tkind\towner\tdeputy\twitness\tvacancy_until\tvacancy_assigner\tgap_task\trevision\n",
-    );
-    for face in &faces {
-        faces_tsv.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            face.face_id,
-            face.spec.kind.as_str(),
-            face.owner_unit.as_deref().unwrap_or("-"),
-            face.spec.deputy_unit.as_deref().unwrap_or("-"),
-            face.spec.witness_unit.as_deref().unwrap_or("-"),
-            face.spec
-                .vacancy_until
-                .map(|t| t.to_rfc3339())
-                .unwrap_or_else(|| "-".into()),
-            face.spec.vacancy_assigner.as_deref().unwrap_or("-"),
-            face.spec.gap_task_id.as_deref().unwrap_or("-"),
-            face.revision(),
-        ));
-    }
+    faces_tsv.push_str(&render_roster(&faces));
 
     let readings = readings(store, redis_url).await?;
     let mut drift_tsv = String::from(&stamp);
@@ -980,6 +1000,71 @@ mod tests {
         assert!(face.spec.has_named_vacancy());
         assert_eq!(face.spec.gap_task_id.as_deref(), Some("SEC-BASELINE"));
         assert_eq!(face.spec.revision, 1);
+    }
+
+    /// The file the projection writes is the file the import reads, so it has
+    /// to survive a round trip through the parser. A projection that dropped a
+    /// column would still look complete to a human reading it -- the rows are
+    /// there, the names are right -- and only the import would notice, at the
+    /// moment somebody tried to seed a machine from it.
+    #[test]
+    fn the_projection_is_a_roster_the_import_reads_back_unchanged() {
+        let text = "\
+任务管理\tface\toperator\t8b2\tc2\ttoken:60,comm:40\t-\t-\t-\ttasks_rows_read\toperator/8b2\t2026-10-19T14:55:00+08:00\toperator/8b2
+可评估\tface\t-\t-\t-\t-\t2026-11-06T00:00:00+08:00\toperator\tEVAL-BENCH\teval_bench_score\t-\t2026-10-24T00:20:00+08:00\t-
+";
+        let faces: Vec<Face> = parse_roster(text)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.face)
+            .collect();
+        let projection = render_roster(&faces);
+        let back = parse_roster(&projection).unwrap_or_else(|e| {
+            panic!("the projection must be readable by the import it is named after: {e}\n{projection}")
+        });
+        assert_eq!(back.len(), faces.len());
+        for (before, after) in faces.iter().zip(back.iter().map(|row| &row.face)) {
+            let name = &before.face_id;
+            assert_eq!(&after.face_id, name);
+            assert_eq!(after.owner_unit, before.owner_unit, "{name}: owner");
+            assert_eq!(after.spec.kind, before.spec.kind, "{name}: kind");
+            assert_eq!(
+                after.spec.deputy_unit, before.spec.deputy_unit,
+                "{name}: deputy"
+            );
+            assert_eq!(
+                after.spec.witness_unit, before.spec.witness_unit,
+                "{name}: witness"
+            );
+            assert_eq!(
+                after.spec.time_share, before.spec.time_share,
+                "{name}: time_share"
+            );
+            assert_eq!(
+                after.spec.vacancy_until, before.spec.vacancy_until,
+                "{name}: vacancy_until"
+            );
+            assert_eq!(
+                after.spec.vacancy_assigner, before.spec.vacancy_assigner,
+                "{name}: vacancy_assigner"
+            );
+            assert_eq!(
+                after.spec.gap_task_id, before.spec.gap_task_id,
+                "{name}: gap_task"
+            );
+            assert_eq!(
+                after.spec.first_reading, before.spec.first_reading,
+                "{name}: first_reading is the reading the face is judged by"
+            );
+            assert_eq!(
+                after.spec.entry_path, before.spec.entry_path,
+                "{name}: entry_path"
+            );
+            assert_eq!(
+                after.spec.source_fronts, before.spec.source_fronts,
+                "{name}: source_fronts"
+            );
+        }
     }
 
     #[test]
