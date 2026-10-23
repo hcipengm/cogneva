@@ -3489,7 +3489,15 @@ impl RolloutExecutor {
                 e,
             ));
         }
-        self.rollback(&e, done, prevs, refs).await;
+        let verdict = self.rollback(&e, done, prevs, refs).await;
+        // 回滚没落地这件事必须走进返回给调用方的错误里。回滚后各工作负载都 Ready
+        // 是两个版本共有的形状（Ready 只说明它收敛在**某个**镜像上），把它读成
+        // 「退回去了」是这一步最贵的误读：调用方会以为自己在旧版本上，而实际留在
+        // 失败版本上。判词来自回读到的镜像，不来自就绪。
+        let e = match verdict.not_landed_note() {
+            Some(note) => SFError::Agent(format!("{e}; {note}")),
+            None => e,
+        };
         // 授权被拒这一类在滚动中仍回滚并记版本类：改过的东西要退回去。落点写成
         // auth 而不是 observed，好让"因为读不到集群而回滚"与"版本真的没起来"在
         // 记账和报告里分得开。
@@ -3504,13 +3512,18 @@ impl RolloutExecutor {
     /// 尽力回滚：已滚目标按快照的各自 prev 镜像反向 set image 并等收敛
     /// （不用 rollout undo——多目标无事务性，undo 还会连带回退其他字段）。
     /// 回滚本身失败只 warn（人工介入兜底），不掩盖原始错误。
+    ///
+    /// 返回的是回滚自己的判词，两条分开：**落地**是回读到的镜像真的变回了
+    /// 快照那一份，**收敛**是它后面又起来了。就绪只说后者，而两个版本都能 Ready
+    /// ——拿就绪当落地判词，"退回去了"与"原地没动"读起来是同一句话。
     pub(crate) async fn rollback(
         &self,
         cause: &SFError,
         done: &[&RolloutTarget],
         prevs: &[(String, String)],
         refs: &RefSnapshots,
-    ) {
+    ) -> RollbackVerdict {
+        let mut verdict = RollbackVerdict::default();
         warn!(
             count = done.len(),
             error = %cause,
@@ -3551,15 +3564,132 @@ impl RolloutExecutor {
                     .cloned(),
             );
             if self.restore_rewritten_refs(&here).await > 0 {
+                // 命令没发出去，读回来也只会是失败版本；这一处已经由上面那条
+                // warn 点名，不再当成"落地了但没收敛"重复记一遍。
+                verdict.not_landed.push(format!(
+                    "deployment/{}: restore command failed",
+                    t.deployment
+                ));
                 continue;
             }
+            self.confirm_restored(&here, &mut verdict).await;
             if let Err(e) = self.wait_rollout_complete(t, &live_shape).await {
                 warn!(deployment = %t.deployment, error = %e, "rollback wait failed");
+                verdict.not_converged.push(t.deployment.clone());
             }
         }
         // 支撑面在任何镜像变更之前就 apply 了，所以它的引用一定被改过——不论目标
         // 滚到了第几个。它的工作负载只有一份文档、各自独立，按工作负载一条命令还。
-        self.restore_rewritten_refs(&refs.support).await;
+        if self.restore_rewritten_refs(&refs.support).await > 0 {
+            verdict
+                .not_landed
+                .push("support workloads: restore command failed".to_string());
+        } else {
+            self.confirm_restored(&refs.support, &mut verdict).await;
+        }
+        verdict
+    }
+
+    /// 回读一处工作负载的 Pod 模板，把每个被改写的容器与它应当退回的镜像对上。
+    ///
+    /// 读不回来、或者读出来认不出形状时进 `unconfirmed` 而不是 `not_landed`：没
+    /// 有观测就不下结论，与滚动那一侧的判据同一条。落地判词的误报方向和漏报方向
+    /// 不对称——把"读不到"写成"没落地"会让运维去追一个不存在的失败。
+    async fn confirm_restored(&self, refs: &[RewrittenRef], verdict: &mut RollbackVerdict) {
+        let mut workloads: Vec<(String, String)> = Vec::new();
+        for r in refs {
+            if !workloads
+                .iter()
+                .any(|(res, n)| res == &r.resource && n == &r.name)
+            {
+                workloads.push((r.resource.clone(), r.name.clone()));
+            }
+        }
+        for (resource, name) in workloads {
+            let live = match self.live_images(&resource, &name).await {
+                Ok(live) => live,
+                Err(e) => {
+                    verdict.unconfirmed.push(format!(
+                        "{resource}/{name}: could not read the images back: {e}"
+                    ));
+                    continue;
+                }
+            };
+            for r in refs
+                .iter()
+                .filter(|r| r.resource == resource && r.name == name)
+            {
+                match live.iter().find(|(c, _)| c == &r.container) {
+                    Some((_, actual)) if actual == &r.image => {
+                        verdict
+                            .landed
+                            .push(format!("{resource}/{}={}", name, r.container));
+                    }
+                    Some((_, actual)) => verdict.not_landed.push(format!(
+                        "{resource}/{name} {}: set to {}, reads back {}",
+                        r.container, r.image, actual
+                    )),
+                    None => verdict.unconfirmed.push(format!(
+                        "{resource}/{name} {}: not in the pod template any more",
+                        r.container
+                    )),
+                }
+            }
+        }
+    }
+
+    /// 一个工作负载 Pod 模板里每个容器的镜像，`(容器, 镜像)`，init 容器在前。
+    ///
+    /// 一条命令读两种容器：`seed-source`、`aof-repair` 这些被回滚改写的引用恰好
+    /// 都在 init 容器里，只读 `containers[*]` 会让它们全部落到"模板里没有这个容器"。
+    async fn live_images(&self, resource: &str, name: &str) -> SFResult<Vec<(String, String)>> {
+        let jsonpath = "jsonpath={range .spec.template.spec.initContainers[*]}{.name}={.image}{\"\\n\"}{end}{range .spec.template.spec.containers[*]}{.name}={.image}{\"\\n\"}{end}";
+        let out = self
+            .run_kubectl(&["get", resource, name, "-o", jsonpath], 30)
+            .await?;
+        let mut images = Vec::new();
+        for line in out.lines() {
+            let Some((container, image)) = line.trim().split_once('=') else {
+                continue;
+            };
+            if container.is_empty() || image.is_empty() {
+                continue;
+            }
+            images.push((container.to_string(), image.to_string()));
+        }
+        Ok(images)
+    }
+}
+
+/// 一次回滚自己的两条判词，落地与收敛分开记。
+///
+/// 现场把它读错过一次：`helm rollback --wait` 因为一个与这次回滚无关的工作负载
+/// 起不来而返回 failed，而回滚其实已经落地；同一个集群、同一份清单，去掉 `--wait`
+/// 就是绿的。反方向同样成立——每个工作负载都 Ready 也可能是回滚命令根本没生效，
+/// 因为它 Ready 在失败版本上。所以两条判词分开取：落地看回读到的镜像，收敛看
+/// 各工作负载的 Ready。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RollbackVerdict {
+    /// 读回来确认回到了快照镜像的 `资源/名字=容器`。
+    pub landed: Vec<String>,
+    /// 读回来仍是失败版本的那几处。这一条一旦非空，回滚**没有**落地。
+    pub not_landed: Vec<String>,
+    /// 命令发出去了但读不回来，或读出来的形状认不出——不下结论。
+    pub unconfirmed: Vec<String>,
+    /// 落地了但没收敛的工作负载。
+    pub not_converged: Vec<String>,
+}
+
+impl RollbackVerdict {
+    /// 回滚没落地时说给调用方听的那一句；落地了就 `None`，原文不变。
+    pub(crate) fn not_landed_note(&self) -> Option<String> {
+        if self.not_landed.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "rollback did not land: {}",
+            self.not_landed.join("; ")
+        ))
     }
 }
 

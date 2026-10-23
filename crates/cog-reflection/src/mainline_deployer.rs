@@ -17051,6 +17051,169 @@ exit 0
         );
     }
 
+    /// 回滚的判词不是「工作负载都 Ready」。两个版本都能 Ready，就绪只说它收敛在
+    /// **某个**镜像上；这里让集群给出的每个就绪读数都是绿的，而回读到的镜像仍是
+    /// 失败版本——结论必须说回滚没落地，而不是"回滚完成"。
+    #[tokio::test]
+    async fn a_rollback_that_did_not_land_is_not_reported_as_converged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"get deployment cogneva-evolution -o jsonpath={{range"*)
+    printf '%s\n' 'seed-source=localhost:30500/cogneva:main-seedold' 'cogneva=localhost:30500/cogneva:main-stale' ;;
+  *"get statefulset redis -o jsonpath={{range"*)
+    printf '%s\n' 'aof-repair=localhost:30500/cogneva:main-aofold' ;;
+  *generation*) echo "1|1|1|1|0|" ;;
+  *"get pods"*) echo "0 true " ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            0,
+            0,
+        );
+        let target = RolloutTarget {
+            deployment: "cogneva-evolution".into(),
+            container: "cogneva".into(),
+            component: "evolution".into(),
+            name: "cogneva".into(),
+        };
+        let refs = RefSnapshots {
+            targets: vec![RewrittenRef {
+                resource: "deployment".into(),
+                name: "cogneva-evolution".into(),
+                container: "seed-source".into(),
+                image: "localhost:30500/cogneva:main-seedold".into(),
+            }],
+            support: vec![RewrittenRef {
+                resource: "statefulset".into(),
+                name: "redis".into(),
+                container: "aof-repair".into(),
+                image: "localhost:30500/cogneva:main-aofold".into(),
+            }],
+        };
+        let done = vec![&target];
+        let prevs = vec![(
+            "cogneva-evolution".to_string(),
+            "localhost:30500/cogneva:main-old".to_string(),
+        )];
+
+        let verdict = executor
+            .rollback(
+                &SFError::Agent("rollout did not complete".into()),
+                &done,
+                &prevs,
+                &refs,
+            )
+            .await;
+
+        assert!(
+            verdict
+                .landed
+                .contains(&"deployment/cogneva-evolution=seed-source".to_string()),
+            "the init container did read back at its snapshot image: {verdict:?}"
+        );
+        assert!(
+            verdict.not_landed.iter().any(|s| s.contains(
+                "deployment/cogneva-evolution cogneva: set to \
+                 localhost:30500/cogneva:main-old, reads back localhost:30500/cogneva:main-stale"
+            )),
+            "the main container still reads back at the failed revision: {verdict:?}"
+        );
+        let note = verdict
+            .not_landed_note()
+            .expect("a rollback that did not land must say so");
+        assert!(
+            note.starts_with("rollback did not land:") && note.contains("cogneva"),
+            "the note names the workload that stayed on the failed revision: {note}"
+        );
+    }
+
+    /// 反方向：镜像都回读到了快照那一份时，判词不许报"没落地"——误报会让人去
+    /// 追一个不存在的失败，而这时返回给调用方的错误必须保持原文。
+    #[tokio::test]
+    async fn a_rollback_that_landed_carries_no_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"get deployment cogneva-evolution -o jsonpath={{range"*)
+    printf '%s\n' 'seed-source=localhost:30500/cogneva:main-seedold' 'cogneva=localhost:30500/cogneva:main-old' ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            0,
+            0,
+        );
+        let target = RolloutTarget {
+            deployment: "cogneva-evolution".into(),
+            container: "cogneva".into(),
+            component: "evolution".into(),
+            name: "cogneva".into(),
+        };
+        let refs = RefSnapshots {
+            targets: vec![RewrittenRef {
+                resource: "deployment".into(),
+                name: "cogneva-evolution".into(),
+                container: "seed-source".into(),
+                image: "localhost:30500/cogneva:main-seedold".into(),
+            }],
+            support: Vec::new(),
+        };
+        let done = vec![&target];
+        let prevs = vec![(
+            "cogneva-evolution".to_string(),
+            "localhost:30500/cogneva:main-old".to_string(),
+        )];
+
+        let verdict = executor
+            .rollback(
+                &SFError::Agent("rollout did not complete".into()),
+                &done,
+                &prevs,
+                &refs,
+            )
+            .await;
+
+        assert!(
+            verdict.not_landed.is_empty(),
+            "every rewritten reference read back at its snapshot image: {verdict:?}"
+        );
+        assert_eq!(
+            verdict.landed.len(),
+            2,
+            "both the main container and the init container were confirmed: {verdict:?}"
+        );
+        assert!(
+            verdict.not_landed_note().is_none(),
+            "a landed rollback leaves the caller's error text alone"
+        );
+    }
+
     /// 端到端：清单包里的引用在 apply 之前被快照下来，滚动失败时整组还原——目标清单里
     /// 的 init 容器与支撑清单里的边车都算数（它们正是留在失败 rev 上的那几处）。
     #[tokio::test]
