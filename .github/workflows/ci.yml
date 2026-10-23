@@ -439,8 +439,15 @@ jobs:
       # settling a row that never closed. The test seeds a thousand newer rows
       # so a bounded read loses the three rows under test; the rule list
       # replaces the row count.
+      #
+      # The step names the whole lib rather than filtering to the one test by
+      # name: a name filter that matches nothing exits 0, so the step would go
+      # green after a rename having run nothing, and the ignored-test corpus
+      # contract refuses to read a filter it cannot resolve to a test it knows.
+      # There is one ignore-marked test in this crate's lib, so the whole-lib
+      # form costs nothing today.
       - name: Live-DB watcher adoption and retirement reach every row
-        run: cargo test -p cog-observability --lib adoption_and_retirement -- --ignored
+        run: cargo test -p cog-observability --lib -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A taste submission is evidence and a claimable row at once, and both

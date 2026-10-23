@@ -366,6 +366,20 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_task_router_claim_hold_bound_seconds",
         "crates/cog-orchestrator/src/observable.rs",
     ),
+    // The two task-graph readings a rule on "the graph stopped moving" is
+    // built from, and they are a pair for the reason a stall is hard to read:
+    // the oldest-untouched age grows while everything else holds still, and
+    // the last-success stamp is what separates a graph that looks the same
+    // because nothing changed from one that looks the same because the reader
+    // died. Neither is a count, so neither belongs to the status vector.
+    (
+        "cogneva_task_oldest_untouched_seconds",
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
+    (
+        "cogneva_task_graph_measure_last_seconds",
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
     (
         "collab_task_resume_total",
         "crates/cog-collaboration/src/observable.rs",
