@@ -61,9 +61,22 @@ const KNOWN: &[(&str, usize, &str)] = &[
          it describes, not to the server returning it",
     ),
     (
+        "crates/cog-gateway/src/a2a.rs",
+        2,
+        "two server replies, one per version served (the 0.3 card and the 1.0 \
+         card). Both take the object from `capabilities_wire()`, which derives \
+         every flag from `capabilities()` and so from `ADVERTISED`; neither card \
+         spells a flag out. The count is two because the versions are two \
+         distinct documents, not because there are two authors of the promise \
+         -- a third one would have to go through the same constructor",
+    ),
+    (
         "crates/cog-protocol/src/a2a.rs",
-        1,
-        "test fixture: the wire shape a client parses back into an agent card",
+        2,
+        "test fixtures: the wire shape a client parses back into an agent card -- \
+         one 0.3 card and one 1.0 card, in the same test, because the two \
+         versions differ in where the endpoint and the version live. Neither is \
+         a reply this tree sends",
     ),
     (
         "crates/cog-protocol/src/mcp.rs",
