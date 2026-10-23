@@ -604,6 +604,21 @@ spec:
             summary: "宿主端点上有 {{ $value }} 条序列不在账本里"
             description: "这些序列每一拍都在被采集，但 `scripts/data/host-readings.tsv` 那一行没有登记它们——所以没人说得清端点上一共有多少条、新加的有没有人读。跑 `bash scripts/host/cogneva-host-readings.sh`（key=value 模式）会逐条点名 `undeclared producer=… series=…`：把它们补进那个生产者所在行的第四列。别用加一行新生产者的办法绕过——那会让同一批序列有两个名字。"
 
+        # 账上承诺每一拍都印、生产者跑成了却没印的。与上一条分开：上一条是「有人加了没登记的」，
+        # 这一条是「登记过的少了一条」。混在一个数里就只能当值看——账上本来就有一批只在坏事件
+        # 才印的序列（标 `=error`），它们缺席是设计。判词亮说明生产者的分支漏了、改名了，
+        # 或者换了输出模式而账本没跟上：两种都要有人改，且改哪边很清楚（`# vanished producer=…`）。
+        - alert: CognevaHostReadingSeriesVanished
+          expr: host_reading_series_vanished > 0
+          for: 1h
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "读数正确性"
+            severity: warning
+          annotations:
+            summary: "宿主端点上有 {{ $value }} 条账本承诺的序列这一拍没印"
+            description: "生产者退 0/1（它跑成了、也判出来了），但账本那一行声明它每一拍都会印的序列少了一条。跑 `bash scripts/host/cogneva-host-readings.sh` 逐条点名 `vanished producer=… series=…`：要么生产者的分支/改名把它弄丢了，要么它只在某些模式下印而账本没写这一层——改生产者，或者把那一行改成实情。只在坏事件才印的序列标 `=error`，标了就不进这个数；生产者退 3 的拍也不进（那是「读不到」，有 `host_reading_producer_unreadable` 那一条）。"
+
         # 涨过承认的欠账才是新闻。写成 `> 0` 会在第一天就常红（今天就有十几条判词没有读者，
         # 它们分属不同面、要逐个设计规则），而常红等于没有：整条告警会被静音掉，包括它本该
         # 报的那一次增长。上限写在账本表头里（`unread_ceiling=N`），只许变小。
@@ -796,8 +811,8 @@ spec:
             cogneva_io_face: "可观测与告警"
             severity: warning
           annotations:
-            summary: "有 {{ $value }} 条告警正在 Prometheus 里响，而镜像的选择器从来看不见它们"
-            description: "`cogneva_alert_mirror_unmirrored_rule{rule=…}` 点名是哪几条。它们不是抄漏——带标记的那批的去向由前四格判；这批连选择器都没进过（`ALERTS{…cogneva_io_managed=\"true\"}` 之外）。哨兵 `Watchdog` / `InfoInhibitor` 已按设计剔除，只在 `cogneva_alert_mirror_unmirrored_ignored_firing` 里计数。给一小时：这是结构缺口，不是一次性的擦肩，短时间的上游抖动不该被读成「账本坏了」。修法两条，选哪条是设计决定：放宽镜像选择器（上游规则的身份带 pod，重新引入每 Pod 一行的抖动，得先想清楚怎么收敛），或者引入 Alertmanager 让上游告警走它自己的路由再回写。在那之前，这条红说的是实话：账本不是全集。"
+            summary: "有 {{ $value }} 条告警正在 Prometheus 里响，账本该收下它们，表里却没有行"
+            description: "`cogneva_alert_mirror_unmirrored_rule{rule=…}` 点名是哪几条。判据跟着配置走：`mirror_alerts.include_unmarked` 打开时，账本承诺是全集，选择器没盖到的每一条都算在这里；关着时（默认）不带标记的那一批是写下来的决定，落在 `cogneva_alert_mirror_unmirrored_unselected_firing` 里，只印不判。这样分是因为反过来的实测：默认配置下这条判词对着两个已过期的构建失败亮了十几个小时，而它的修法是「要不要放宽选择器」这个设计决定，没人能执行——永远亮的判词与没有判词同价。两种情形都点名，所以「按设计不进账本」与「没有告警」在读数上不同形；升面时读 `unselected` 那一格，不要把它当成绿。"
 
         # 全集这一面**读不到**：与上一格不同的坏法，修法也不同（一个是设计缺口，一个是探针
         # 自身读不回来）。它必须自成一格，否则读不到会被下一格印成「没有未镜像的告警」。

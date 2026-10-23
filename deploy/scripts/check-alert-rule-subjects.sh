@@ -372,6 +372,7 @@ NO_POD_REPORTER = {
     'CognevaHostNvmeBaselineLost': 'cogneva_host_nvme_replacements_total',
     'CognevaFileSizeCensusUnjudged': 'cogneva_file_size_census_unjudged',
     'CognevaHostReadingSeriesUndeclared': 'host_reading_series_undeclared',
+    'CognevaHostReadingSeriesVanished': 'host_reading_series_vanished',
     'CognevaReadingWitnessUnresolved': 'reading_witness_unresolved',
     'CognevaTasksPublishersDisagree': 'tasks_publishers_agree',
     'CognevaRefusalRedispatchBroken': 'cogneva_refusal_redispatch_state',
