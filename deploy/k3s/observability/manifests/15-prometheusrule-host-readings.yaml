@@ -362,22 +362,28 @@ spec:
             description: "余量 = 界 − 已用，界是 100 减去提前期天数乘这块盘的日磨损速率。2026-10-22 实测这块盘 8%、通电 779 小时 ⇒ 约 0.246 %/天，90 天提前期下界在 77.85%，余量 69.85。来源标签 source 说清界是导出的（derived）、刚上机的退路（default，固定 80）还是人钉的（override），退路不许装作导出的。这个数只会往下走，没有补救动作，只能排期换盘。要知道按当前速率还剩多少天，用余量除以 `cogneva_host_nvme_wear_rate_pct_per_day`。"
 
         # 「突然变得更快」是另一件事：界回答「还够不够一个提前期」，这一条回答
-        # 「这块盘是不是刚换了一种用法」。近 6 小时的窗口速率压过它自己一生的平均速率
-        # 两倍才算，且绝对值要过 0.1 %/天——否则 8% 的盘多写 1% 就是两倍，天天响。
+        # 「这块盘是不是刚换了一种用法」。近 6 小时的写入速率压过它自己一生的平均写入速率
+        # 两倍才算，且折成磨损要过 0.1 %/天——否则 8% 的盘多写 1% 就是两倍，天天响。
+        # 两条都读**字节**，不读磨损百分比：`percentage_used` 是 1% 的整数颗粒度，6 小时
+        # 窗口里进一格 `deriv` 就报约 4 %/天，比任何阈值都高一个数量级 ⇒ 一次进位（不是
+        # 载荷变化）就够点着它。2026-10-23 现网正是这么响的：窗口读数 4.40 %/天，同一时刻
+        # 按字节计数器只有一生平均的 1.45 倍（6 小时 1.82 TB/天 vs 一生 1.27 TB/天）。
         # 处置是查谁在猛写（构建缓存 / 镜像库 / 备份），不是换盘：速率回去了就不该换。
         - alert: CognevaHostNvmeWearAccelerating
           expr: |
-            (deriv(cogneva_host_nvme_percentage_used[6h]) * 86400)
-              > (cogneva_host_nvme_wear_rate_pct_per_day * 2)
+            (deriv(cogneva_host_nvme_written_bytes_total[6h]) * 86400)
+              > (cogneva_host_nvme_written_bytes_per_day * 2)
             and
-            (deriv(cogneva_host_nvme_percentage_used[6h]) * 86400) > 0.1
+            (deriv(cogneva_host_nvme_written_bytes_total[6h]) * 86400
+              / cogneva_host_nvme_written_bytes_per_day
+              * cogneva_host_nvme_wear_rate_pct_per_day) > 0.1
           for: 30m
           labels:
             cogneva_io_managed: "true"
             severity: warning
           annotations:
-            summary: "NVMe {{ $labels.device }} 近 6 小时磨得比它自己的平均速率快一倍以上"
-            description: "左边是近 6 小时的窗口速率（%/天），右边是这块盘一生的平均速率 `cogneva_host_nvme_wear_rate_pct_per_day` 的两倍。突然变快通常是新加了一种写载荷：构建缓存、镜像层、备份落盘。查 `bash scripts/host/cogneva-host-footprint-trend-reading.sh` 与宿主上的写入者；这一格的修法是挪走写载荷，不是换盘——速率降回去就不该换。"
+            summary: "NVMe {{ $labels.device }} 近 6 小时的写入速率是 {{ $value | humanize }}B/天，超过它一生平均的两倍"
+            description: "左边是近 6 小时的写入速率（字节/天，来自控制器自己的写入计数器），右边是这块盘一生的平均写入速率 `cogneva_host_nvme_written_bytes_per_day` 的两倍；第二句把窗口速率折成磨损，要求它本身也过 0.1 %/天，否则一块几乎不写的盘多写一兆就是「两倍」。不用 `percentage_used` 判这一格：它只有 1% 的颗粒度，6 小时里进一格就等于 4 %/天，一次进位就能点着这条规则——那不是变快，是计数器的分辨率。突然变快通常是新加了一种写载荷：构建缓存、镜像层、备份落盘。查 `bash scripts/host/cogneva-host-footprint-trend-reading.sh` 与宿主上的写入者；这一格的修法是挪走写载荷，不是换盘——速率降回去就不该换。"
 
         # 「磨到多少」与「有没有已经坏了」是两件事：介质错误计数只会涨，critical warning
         # 是控制器自己举手。这一格的处置是立刻换，不是排期。
