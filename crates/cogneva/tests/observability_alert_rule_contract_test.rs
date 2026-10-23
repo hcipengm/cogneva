@@ -1138,6 +1138,14 @@ const FOREIGN: &[(&str, &str)] = &[
         "宿主读数 `scripts/host/cogneva-a2a-conformance-reading.sh`（不在本仓，登记行 `a2a_conformance`）：这一拍里答得不是协议说的那样的格数，每拍真打十五个请求量出来。它与 `a2a_conformance_cells` 一起印，是因为没有分母的 0 证不了「比过」——生产者读不到时两条一起缺席，那种「没量」由宿主读数的生产者契约报，不在这里另立一条规则",
     ),
     (
+        "a2a_tck_conformant",
+        "宿主读数 `scripts/host/cogneva-a2a-tck-reading.sh`（不在本仓，登记行 `a2a_tck`）：上游官方套件（a2aproject/a2a-tck）按名片逐条跑出来的 0/1 判词，1 表示名片那一层全过。它是这一面唯一不由本仓库作者写的读数——其余 A2A 判据与实现出自同一拨人，错在同一个方向上时两边一起错，所以需要一个外面的尺子说了算。套件没跑起来时这条序列不出现，那是 `CognevaHostReadingProducerUnreadable{producer=\"a2a_tck\"}` 的事，不是「合规」",
+    ),
+    (
+        "cogneva_alert_ownership_unowned",
+        "宿主读数 `scripts/host/cogneva-alert-ownership-reading.sh`（不在本仓）：`alerts` 表里正 firing、却答不出「该谁动」的行数。它必须读表而不是读规则清单——规则的申报写在树里，而这一行只在运行时才知道响没响，两个写者（进程内求值、Prometheus 镜像）也只有表能把它们算在一起。逐条点名在 `cogneva_alert_ownership_unowned_rule{rule,reason}`，三种理由分开（`no_face`/`face_unknown`/`owner_vacant`）：补标签与派人不是同一个修法。分母 `cogneva_alert_ownership_firing`；读不到时一条序列都不印，与「表里没有无主」不同形",
+    ),
+    (
         "a2a_reach_defect",
         "宿主读数 `scripts/host/cogneva-a2a-discovery-reach-reading.sh`（不在本仓，登记行 `a2a_discovery_reach`）：0/1 判词，1 表示外部对端连发现这一步都走不通（名片要凭证、名片声明 jwt 而 RPC 收匿名调用方、服务不健康，或名片答了别的码）。三种坏法靠 key=value 档里的标签分开而不是各立一条序列：序列名一样、只差标签的话，「哪一条在响」会落到读的人自己拼。它盖住的是一个此前只有「想跑就手跑一下」的读数面——那种读数的判据再准，在读数面上也与「这一面没人看」同形，而网关路由或鉴权层一动，名片被挪回业务鉴权组这件事没有任何一个数会变色",
     ),
