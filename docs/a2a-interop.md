@@ -37,8 +37,17 @@ version that request declared.
 ## 1. Discovery
 
 ```
-GET /api/v1/protocol/a2a/agent-card
+GET /.well-known/agent-card.json    # the path the specification names
+GET /api/v1/protocol/a2a/agent-card # the same card, at our own path
 ```
+
+A peer finds an agent at the well-known path; nothing tells it our private one
+first. Both paths serve the same card and honour the same `A2A-Version`
+negotiation, with one difference in the default: the well-known path defaults to
+**1.0**, because that URI is defined by the 1.0 specification and a 1.0 client
+needs `supportedInterfaces` to choose a transport at all. The private path keeps
+the 0.3 default that the specification assigns to a request that names no
+version. Say `A2A-Version: 0.3` and either path returns the 0.3 card.
 
 The agent card is **public**: it answers without a credential, because a peer
 that has never talked to you cannot have one yet, and the card is what tells it

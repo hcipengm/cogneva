@@ -503,6 +503,13 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/protocol/a2a/agent-card",
             get(a2a::agent_card_handler),
         )
+        // 规范的发现入口：对端 GET 这个 well-known 路径找名片，没有「先知道我们
+        // 自定义路径」这一步。它和上面那条是同一份名片，只是缺省版本取 1.0
+        // （这个路径由 1.0 规范定义，1.0 的对端要从 `supportedInterfaces` 选传输）。
+        .route(
+            "/.well-known/agent-card.json",
+            get(a2a::well_known_card_handler),
+        )
         .route("/ws", get(ws_handler))
         .route("/api/v1/evolution/stream", get(evolution::stream_handler))
         .route("/dashboard", get(dashboard::dashboard_handler))

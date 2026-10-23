@@ -140,6 +140,20 @@ fn advertises(capability: &str) -> bool {
 /// 认不出的版本是**错误**，不是回落到 0.3：一个 1.2 的客户端按 1.2 的语义发请求，
 /// 拿 0.3 的答复去读，读出来的是「对端行为怪异」而不是「版本不支持」。
 fn requested_version(headers: &HeaderMap, uri: &Uri) -> Result<A2aVersion, String> {
+    requested_version_or(headers, uri, A2aVersion::V03)
+}
+
+/// 同一条协商规则，只换「没写版本时按哪一版」。缺省值不是口味问题：
+/// 0.3 规范自己规定空的 `A2A-Version` 按 0.3 解释，所以 RPC 路径的缺省是 0.3；
+/// 而 `/.well-known/agent-card.json` 是 1.0 规范定义的发现入口（0.3 也把名片
+/// 放在这个路径，但它的名片自带 `protocolVersion` 与 `url`），所以发现路径的
+/// 缺省是 1.0——一个照 1.0 写的对端先取名片、再按 `supportedInterfaces` 选传输，
+/// 拿不到 `supportedInterfaces` 的卡它连传输都选不出来。显式声明的那一版永远优先。
+fn requested_version_or(
+    headers: &HeaderMap,
+    uri: &Uri,
+    default: A2aVersion,
+) -> Result<A2aVersion, String> {
     let from_header = headers
         .get("a2a-version")
         .and_then(|value| value.to_str().ok())
@@ -154,7 +168,7 @@ fn requested_version(headers: &HeaderMap, uri: &Uri) -> Result<A2aVersion, Strin
         })
     });
     match from_header.or(from_query) {
-        None => Ok(A2aVersion::V03),
+        None => Ok(default),
         Some(raw) => A2aVersion::parse(raw).ok_or_else(|| {
             format!("A2A version '{raw}' is not served; this endpoint speaks 0.3 and 1.0")
         }),
@@ -268,7 +282,37 @@ pub async fn agent_card_handler(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    let version = match requested_version(&headers, &uri) {
+    card_response(http_port(&state), &headers, &uri, A2aVersion::V03)
+}
+
+/// `GET /.well-known/agent-card.json`
+///
+/// 规范（1.0 §8.2、0.3 §5.2）把发现入口钉在这个 well-known 路径上：对端找到
+/// 一个 agent 的第一件事就是 GET 它，没有「先配置一个我们自己的路径」这一步。
+/// 只把名片放在自定义路径上，照规范写的对端与官方 TCK 都发现不了我们——那是
+/// 对端面唯一一类「我们全对、对面就是接不上」的缺陷。
+///
+/// 缺省给 1.0：这个路径由 1.0 规范定义，而 1.0 的对端要先从 `supportedInterfaces`
+/// 选出传输，拿不到就无路可走。显式要 0.3 的对端在这里照旧拿到带 `url` 的 0.3 名片。
+pub async fn well_known_card_handler(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    card_response(http_port(&state), &headers, &uri, A2aVersion::V10)
+}
+
+/// 本进程监听的那个口：名片要能给出「调用方够得着的基址」，缺 `Host` 时退回它。
+fn http_port(state: &GatewayState) -> u16 {
+    state
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .http_port
+}
+
+fn card_response(port: u16, headers: &HeaderMap, uri: &Uri, default: A2aVersion) -> Response {
+    let version = match requested_version_or(headers, uri, default) {
         Ok(version) => version,
         Err(message) => {
             return (
@@ -278,12 +322,7 @@ pub async fn agent_card_handler(
                 .into_response();
         }
     };
-    let port = state
-        .config
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .http_port;
-    let base = advertised_base(&headers, port);
+    let base = advertised_base(headers, port);
     let card = match version {
         A2aVersion::V03 => card_v03(&base),
         A2aVersion::V10 => card_v10(&base),

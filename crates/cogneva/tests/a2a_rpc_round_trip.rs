@@ -388,6 +388,119 @@ async fn the_card_answers_in_the_version_the_caller_asked_for() {
     );
 }
 
+/// The discovery entry point the specification names, served without credentials.
+///
+/// A peer finds an agent by GETting `/.well-known/agent-card.json`; there is no
+/// step where it is told our own path first. A card reachable only at a private
+/// path is invisible to every client written to the specification and to the
+/// official conformance kit -- the one class of defect where nothing on our side
+/// is wrong and the peer still cannot connect.
+///
+/// The default there is 1.0, not 0.3: this URI comes from the 1.0 specification,
+/// and a 1.0 client needs `supportedInterfaces` to pick a transport at all. The
+/// older version stays one header away.
+#[tokio::test]
+async fn the_card_is_discoverable_where_the_specification_puts_it() {
+    let state = router_state::stateless();
+    let app = create_router(state);
+
+    let fetch = |version: Option<&'static str>, token: Option<&'static str>| {
+        let app = app.clone();
+        async move {
+            let mut builder = Request::builder()
+                .method("GET")
+                .uri("/.well-known/agent-card.json")
+                .header("Host", "cogneva.example");
+            if let Some(version) = version {
+                builder = builder.header("A2A-Version", version);
+            }
+            if let Some(token) = token {
+                builder = builder.header("Authorization", format!("Bearer {token}"));
+            }
+            let response = app
+                .oneshot(builder.body(Body::empty()).expect("well formed"))
+                .await
+                .expect("the router answers");
+            let status = response.status().as_u16();
+            let cache = response
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let bytes = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("the body comes back");
+            let card = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .unwrap_or(serde_json::Value::Null);
+            (status, cache, card)
+        }
+    };
+
+    // 无版本头、无令牌：这就是「第一次接触的对端」发出的那一个请求。
+    let (status, cache, card) = fetch(None, None).await;
+    assert_eq!(
+        status, 200,
+        "discovery must not need a credential, or it closes a loop: the credential          is what the card is supposed to tell you how to get"
+    );
+    assert_eq!(
+        cache.as_deref(),
+        Some("public, max-age=300"),
+        "a public, read-only document should be cacheable, and briefly"
+    );
+    for field in [
+        "name",
+        "description",
+        "version",
+        "capabilities",
+        "skills",
+        "supportedInterfaces",
+        "defaultInputModes",
+        "defaultOutputModes",
+    ] {
+        assert!(
+            card.get(field).is_some(),
+            "a 1.0 card carries {field}: {card}"
+        );
+    }
+    assert!(
+        card.get("url").is_none(),
+        "1.0 moved the endpoint into supportedInterfaces: {card}"
+    );
+    let interfaces = card["supportedInterfaces"]
+        .as_array()
+        .expect("a discovered card lists its interfaces");
+    assert!(
+        interfaces.iter().any(|i| i["protocolVersion"] == "1.0"),
+        "the discovery card has to name the version it is written in: {interfaces:?}"
+    );
+
+    // 显式要 0.3 的对端在同一个路径上拿到 0.3 名片（带 `url`，它就是这么拼地址的）。
+    let (status, _, v03) = fetch(Some("0.3"), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(v03["protocolVersion"], "0.3");
+    assert_eq!(
+        v03["url"], "http://cogneva.example/api/v1/protocol/a2a",
+        "the 0.3 card is what an older peer builds its call address from"
+    );
+
+    // 不服务的版本仍是同一个拒绝，不是 404、也不是悄悄回一份缺省名片。
+    let (status, _, refusal) = fetch(Some("1.2"), None).await;
+    assert_eq!(status, 400);
+    let said = refusal["message"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("0.3") && said.contains("1.0"),
+        "the refusal names what is served: {said}"
+    );
+
+    // 带令牌也是同一份名片：这张卡不按调用方不同而不同。
+    let (status, _, with_token) = fetch(None, Some("irrelevant-but-well-formed")).await;
+    assert_eq!(
+        status, 200,
+        "the discovery route is public; a token neither helps nor hurts"
+    );
+    assert_eq!(with_token, card, "the card is the same for everyone");
+}
+
 /// One HTTP round trip to the endpoint, returning the JSON body. Used where the
 /// test has to send something the client would refuse to build.
 async fn post(app: &axum::Router, token: &str, body: serde_json::Value) -> serde_json::Value {
