@@ -1526,6 +1526,30 @@ const FOREIGN: &[(&str, &str)] = &[
         "cogneva_alert_traffic_noisy",
         "宿主读数 `scripts/host/cogneva-alert-traffic-reading.sh`（不在本仓，登记行 `alert_traffic`）：有没有哪条规则在一小时里写进 `alerts` 表的行数、或其中一分钟内就 resolve 的短命行数，越过了界。同族的 `alert_mirror` 判「该进表的进没进」、`alert_attention` 判「进了表有没有人看」，两条都是**逐行**的读数；这一格是**流量**——2026-10-22 同一天里两条规则各把一件事写成 82 行与 17 行，系统自己不报，是有人去数表才发现的。两个数分开数是因为它们指向两种修法：行数多是同一件事反复重开（该合并 dedup_key 或抬保持时长），短命多是一拍抖动被写成一行（该给 `for_seconds`）",
     ),
+    (
+        "commit_fast_lane_seconds",
+        "宿主读数 `scripts/host/cogneva-commit-lane-reading.sh`（不在本仓，登记行 `commit_lane`）：走完提交门的那一笔从入队到落地的中位数，只数只动记忆、规格与文档的提交。它在宿主上量，因为门槛要的那一段——排队、判树、投影重算——一半在钩子里、一半在宿主进程里，本仓的构建产物里没有任何一刻同时看得见两头",
+    ),
+    (
+        "product_commit_share",
+        "宿主读数 `scripts/host/cogneva-product-commit-share-reading.sh`（不在本仓，登记行 `product_commit_share`）：近 7 天非 merge 提交里推进了 `crates/`（读数与观测那一格以外）的占比。分母与分子由同一个生产者同一拍发出来，规则侧不再另配一份——两份分母一旦不同步，「占比低」与「分母算错」就分不开了",
+    ),
+    (
+        "brain_budget_remaining",
+        "宿主读数 `scripts/host/cogneva-brain-budget-reading.sh`（不在本仓，登记行 `brain_budget`）：这一周还能新建几篇记忆，等于产品提交数减去新增记忆文件数。它是事前读数：余量为负时那一轮不新建记忆文件，所以规则要它响在**下一次**动笔之前，而不是等一周结束去数余量",
+    ),
+    (
+        "face_symmetry_unknown",
+        "宿主读数 `scripts/host/cogneva-face-symmetry-reading.sh`（不在本仓，登记行 `face_symmetry`）：本仓规则申报的面名里、正本不认的有几个。正本与载体分住两个仓，两侧的静态门都只看自己那棵树，于是改名只有等某条规则真的越界、读数面报出 `face_unknown` 才看得见。这一格把它提前到没有任何规则响的时候",
+    ),
+    (
+        "face_symmetry_uncovered_excess",
+        "同一生产者：正本里有、本仓却没有任何规则挂那个名字的面，超出已承认欠账（正本表头的 `# uncovered_ceiling=N`）的部分。欠账本身不是新闻——今天就有面还没有规则；涨过它才是。与上面那一格分开，是因为两个方向的修法不同：多出来的名字改载体，欠账涨了是去写第一条规则或者重新划这个面的责任",
+    ),
+    (
+        "face_symmetry_invalid",
+        "同一生产者：正本里读不出来的行数（列数不够、种类写成 face/cross 以外、同名声明两次）。有坏行的那一拍，上面两格不印——残缺的分母会让「少了一个面」和「少了一行」看起来是同一件事，而这两种情况的修法相反",
+    ),
     ("up", "Prometheus 采集目标存活序列"),
 ];
 
