@@ -24,7 +24,11 @@ use cog_core::{SummaryEntry, SummarySearchResult};
 pub const DEFAULT_SUMMARY_COLLECTION: &str = "summaries";
 
 /// Attempts at creating the summary collection before the failure is reported.
-const CREATE_COLLECTION_ATTEMPTS: u32 = 4;
+///
+/// Five, because the window has to outlast the six seconds the live Qdrant took
+/// between deleting the collection and creating it again: a window that ends
+/// before the server does is the same failure as no retry at all.
+const CREATE_COLLECTION_ATTEMPTS: u32 = 5;
 
 /// Delay before the second attempt; doubled for each attempt after that.
 const CREATE_COLLECTION_BACKOFF_MS: u64 = 500;
@@ -138,39 +142,62 @@ impl VectorSummaryBackend {
         Ok(())
     }
 
-    /// Create the collection, retrying a bounded number of times.
+    /// Create the collection, retrying a bounded number of times, and stop as
+    /// soon as the collection turns out to be there for someone else's reason.
     ///
-    /// The client's timeout is shorter than the create can take: the live
-    /// Qdrant logged the delete and the create of `summaries` six seconds
-    /// apart while the caller had already given up, and with
-    /// `strict_persistence=true` that timeout took the whole process down and
-    /// restarted it. Creating is idempotent — the backend asks
-    /// `collection_exists` first, so a repeat after a timed-out attempt finds
-    /// the collection the server did create — and the cost of being wrong in
-    /// this direction is a slower start instead of a crash loop.
+    /// Two failures reach this loop that are not the server saying no: the
+    /// client's timeout is shorter than the create can take (the live Qdrant
+    /// logged the delete and the create of `summaries` six seconds apart while
+    /// the caller had already given up), and the create is refused because a
+    /// second process sharing the collection got there first — a rollout starts
+    /// the workloads at once, and every one of them rebuilds this collection.
+    /// Both leave the collection present, and with `strict_persistence=true`
+    /// reporting either one takes the whole process down and restarts it, so
+    /// each failed attempt asks the server what it actually has instead of
+    /// treating the refusal as final. The cost of being wrong in this direction
+    /// is a slower start instead of a crash loop.
     async fn create_collection_with_retry(&self) -> SFResult<()> {
         let mut attempt: u32 = 1;
         loop {
-            match self
+            let failure = match self
                 .vector
                 .create_collection(&self.collection, self.embedding_dim)
                 .await
             {
                 Ok(()) => return Ok(()),
-                Err(e) if attempt >= CREATE_COLLECTION_ATTEMPTS => return Err(e),
-                Err(e) => {
-                    let delay_ms = CREATE_COLLECTION_BACKOFF_MS << (attempt - 1);
-                    tracing::warn!(
+                Err(e) => e,
+            };
+            match self.vector.collection_exists(&self.collection).await {
+                Ok(true) => {
+                    tracing::info!(
                         collection = %self.collection,
                         attempt,
-                        delay_ms,
-                        error = %e,
-                        "vector collection create failed; retrying"
+                        error = %failure,
+                        "vector collection create failed but the collection is there; continuing"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    attempt += 1;
+                    return Ok(());
                 }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    collection = %self.collection,
+                    attempt,
+                    error = %e,
+                    "could not read whether the collection exists after a failed create"
+                ),
             }
+            if attempt >= CREATE_COLLECTION_ATTEMPTS {
+                return Err(failure);
+            }
+            let delay_ms = CREATE_COLLECTION_BACKOFF_MS << (attempt - 1);
+            tracing::warn!(
+                collection = %self.collection,
+                attempt,
+                delay_ms,
+                error = %failure,
+                "vector collection create failed; retrying"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            attempt += 1;
         }
     }
 
@@ -1187,6 +1214,117 @@ mod tests {
         async fn collection_exists(&self, collection: &str) -> SFResult<bool> {
             self.inner.collection_exists(collection).await
         }
+    }
+
+    /// A create another writer won. The collection is there — a second process
+    /// sharing it, or the server still finishing a call whose client had given
+    /// up — and this caller is told no anyway. That refusal is convergence.
+    struct LostCreateRace {
+        inner: cog_storage::MemoryVectorBackend,
+        seeded: std::sync::atomic::AtomicBool,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LostCreateRace {
+        fn new() -> Self {
+            Self {
+                inner: cog_storage::MemoryVectorBackend::new(),
+                seeded: std::sync::atomic::AtomicBool::new(false),
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn attempts(&self) -> usize {
+            self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl VectorBackend for LostCreateRace {
+        async fn create_collection(&self, collection: &str, dimension: usize) -> SFResult<()> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.seeded.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.inner.create_collection(collection, dimension).await?;
+            }
+            Err(SFError::Validation(format!(
+                "qdrant create collection failed: Error in the response: \
+                 Wrong input: Collection `{collection}` already exists!"
+            )))
+        }
+        async fn delete_collection(&self, collection: &str) -> SFResult<()> {
+            self.inner.delete_collection(collection).await
+        }
+        async fn insert(
+            &self,
+            collection: &str,
+            vectors: Vec<Vec<f32>>,
+            metadata: Vec<serde_json::Value>,
+        ) -> SFResult<Vec<String>> {
+            self.inner.insert(collection, vectors, metadata).await
+        }
+        async fn insert_sparse(
+            &self,
+            collection: &str,
+            sparse: Vec<cog_core::contract::storage::SparseEmbedding>,
+            metadata: Vec<serde_json::Value>,
+        ) -> SFResult<Vec<String>> {
+            self.inner.insert_sparse(collection, sparse, metadata).await
+        }
+        async fn search(
+            &self,
+            collection: &str,
+            vector: &[f32],
+            top_k: usize,
+        ) -> SFResult<Vec<cog_core::contract::storage::VectorSearchResult>> {
+            self.inner.search(collection, vector, top_k).await
+        }
+        async fn delete(&self, collection: &str, ids: &[String]) -> SFResult<()> {
+            self.inner.delete(collection, ids).await
+        }
+        async fn collection_exists(&self, collection: &str) -> SFResult<bool> {
+            self.inner.collection_exists(collection).await
+        }
+    }
+
+    /// A create refused because the collection already exists is the server
+    /// answering "it is already what you asked for". Under
+    /// `strict_persistence=true` reading that refusal as a failure takes the
+    /// process down and restarts it, next to a writer that had done nothing
+    /// wrong.
+    #[tokio::test]
+    async fn a_create_lost_to_another_writer_continues_on_the_existing_collection() {
+        let store = Arc::new(DurableStubStore::new());
+        store.upsert(&entry("s1")).await.unwrap();
+        let vector = Arc::new(LostCreateRace::new());
+        let backend = VectorSummaryBackend::new(vector.clone(), 4).with_store(store);
+
+        backend
+            .load()
+            .await
+            .expect("the collection is there, so startup continues");
+
+        assert_eq!(
+            vector.attempts(),
+            1,
+            "the answered question ends the retries: one create, then the collection was there"
+        );
+        let hits = backend
+            .search_summary("default", &[1.0, 0.0, 0.0, 0.0], 10, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "the rebuilt index still holds the entry");
+    }
+
+    /// The window is what makes the retries worth anything: a window that ends
+    /// before the server finishes is no retry at all.
+    #[test]
+    fn the_retry_window_outlasts_a_six_second_create() {
+        let window_ms =
+            CREATE_COLLECTION_BACKOFF_MS * ((1u64 << (CREATE_COLLECTION_ATTEMPTS - 1)) - 1);
+        assert!(
+            window_ms >= 6_000,
+            "the retry window is {window_ms} ms; the live Qdrant took six seconds"
+        );
     }
 
     #[tokio::test]
