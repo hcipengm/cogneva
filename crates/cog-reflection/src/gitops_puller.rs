@@ -130,6 +130,18 @@ pub struct GitOpsPuller {
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
+/// 这一行存下来时的标签。把面写在这里而不是散在调用点：读表的人问「该谁动」只看这一份，
+/// 少写一格的那一行就成了无主，而它照样 firing。
+fn blindness_labels(cluster: &str, gate: &str, cause: &str, ticks: u32) -> serde_json::Value {
+    serde_json::json!({
+        "cluster": cluster,
+        "gate": gate,
+        "cause": cause,
+        "ticks": ticks,
+        cog_core::alerts::ALERT_FACE_LABEL: CANARY_GATE_BLIND_FACE,
+    })
+}
+
 impl GitOpsPuller {
     pub fn new(config: GitOpsConfig, ledger: Arc<dyn PromotionLedger>, cluster: String) -> Self {
         Self {
@@ -1219,13 +1231,7 @@ impl GitOpsPuller {
             dedup_key: format!("{CANARY_GATE_BLIND_RULE}:{gate}"),
             severity: "warning".into(),
             message,
-            labels: serde_json::json!({
-                "cluster": self.cluster,
-                "gate": gate,
-                "cause": cause,
-                "ticks": ticks,
-                cog_core::alerts::ALERT_FACE_LABEL: CANARY_GATE_BLIND_FACE,
-            }),
+            labels: blindness_labels(&self.cluster, gate, cause, ticks),
         }
     }
 
@@ -2571,6 +2577,25 @@ fn mounters_of_config(manifest: &str) -> SFResult<Vec<(&'static str, String)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 灰度判据瞎了那一行，必须自己说出该谁动。它不是规则库里的规则，没有配置
+    /// 可以申报面，所以这一格只能在代码里，且只能由这条断言看着——删掉那一行
+    /// 标签，行照写、照 firing，只是天亮时没人被叫。
+    #[test]
+    fn the_canary_blindness_row_names_the_face_that_acts_on_it() {
+        let labels = blindness_labels("prod", "latency", "no_reading", 3);
+        assert_eq!(
+            labels
+                .get(cog_core::alerts::ALERT_FACE_LABEL)
+                .and_then(|v| v.as_str()),
+            Some("CI/构建/部署"),
+        );
+        // 面只加一格，其余标签照旧：把它写成替换而不是追加，读「哪个 gate 瞎了」的人
+        // 会在补面的同一笔里丢掉 gate。
+        assert_eq!(labels.get("gate").and_then(|v| v.as_str()), Some("latency"));
+        assert_eq!(labels.get("cluster").and_then(|v| v.as_str()), Some("prod"));
+        assert_eq!(labels.get("ticks").and_then(|v| v.as_u64()), Some(3));
+    }
 
     /// 窗口求和语义下的错误率，就是改造前的「值本身相除」。
     fn windowed_rate(signals: CanarySignals) -> Option<f64> {

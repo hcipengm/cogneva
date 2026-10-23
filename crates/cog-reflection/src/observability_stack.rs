@@ -770,17 +770,23 @@ impl StackConvergence {
             dedup_key: STACK_NOT_CONVERGED_RULE.into(),
             severity: verdict.severity().into(),
             message,
-            labels: serde_json::json!({
-                "namespace": self.cfg.namespace,
-                "manifest_dir": self.cfg.manifest_dir,
-                "rev": rev12(rev),
-                cog_core::alerts::ALERT_FACE_LABEL: STACK_NOT_CONVERGED_FACE,
-            }),
+            labels: convergence_alert_labels(&self.cfg.namespace, &self.cfg.manifest_dir, rev),
         };
         if let Err(e) = sink.set_persistent_alert(firing, &draft).await {
             warn!(error = %e, "observability stack verdict not persisted");
         }
     }
+}
+
+/// 收敛告警那一行存下来时的标签。这条判据不能在规则库里：配置还没到的时候，正是它要说
+/// 这件事。所以「该谁动」也只能在这里写，读表的人除了这一格外没有别的依据。
+fn convergence_alert_labels(namespace: &str, manifest_dir: &str, rev: &str) -> serde_json::Value {
+    serde_json::json!({
+        "namespace": namespace,
+        "manifest_dir": manifest_dir,
+        "rev": rev12(rev),
+        cog_core::alerts::ALERT_FACE_LABEL: STACK_NOT_CONVERGED_FACE,
+    })
 }
 
 /// 供门禁使用：把清单目录里的文件名收敛成可比较的形状。
@@ -850,6 +856,30 @@ pub fn validate_config(cfg: &ObservabilityStackConfig) -> SFResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 可观测栈没收敛那一行要说得出该谁动。这条规则按设计不在规则库里（配置没到的
+    /// 时候正是它要说话），所以面没有配置可申报，只有这一格写着——删掉它，行照 firing，
+    /// 只是没人被叫，而这在读数上和「有人接了但没动」同形。
+    #[test]
+    fn the_stack_convergence_row_names_the_face_that_acts_on_it() {
+        let labels = convergence_alert_labels("cogneva", "/manifests", "0123456789abcdef");
+        assert_eq!(
+            labels
+                .get(cog_core::alerts::ALERT_FACE_LABEL)
+                .and_then(|v| v.as_str()),
+            Some("落地≠生效"),
+        );
+        // 面是追加的一格，不是整份标签：丢掉 manifest_dir 或 rev，读这一行的人就不知道
+        // 是哪一份清单没收敛。
+        assert_eq!(
+            labels.get("manifest_dir").and_then(|v| v.as_str()),
+            Some("/manifests")
+        );
+        assert_eq!(
+            labels.get("rev").and_then(|v| v.as_str()),
+            Some("0123456789ab")
+        );
+    }
 
     fn entry(file: &str, disposition: Disposition, reason: &str) -> DispositionEntry {
         DispositionEntry {
