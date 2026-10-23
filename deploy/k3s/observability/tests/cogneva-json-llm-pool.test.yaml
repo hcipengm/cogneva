@@ -1,0 +1,421 @@
+# LLM 池那十二条读数的单测夹具（`llm_context_per_call_above_its_own_week` 要七天的
+# 分位样本，单独一份）：它们说的是「上游池还看不看得见、账还平不平、判词还在不在判」。
+#
+# 这一族一半的规则是**合取**——两条腿都成立才响，而缺一条腿在纯表达式检查下看不出来：
+#   - 三条 `*_verdict_unmeasured`：只有**池说它健康**时，「判词没量过」才是个洞；上游
+#     本来就不健康时不归它们问。
+#   - `llm_upstream_rejecting_while_pool_reads_available`：池说可用时被拒才是矛盾。
+#   - `llm_calls_all_failing`：有失败、而窗口里**没有任何一次用量读数**才算全灭；读数
+#     还在写（哪怕 outcome=absent）就不归它。
+#   - `llm_pool_open_but_idle`：四条腿缺一不可（额度还够、限速在做、准入读数新鲜、
+#     用量计数器一小时没动过）。
+# 另外三条（盲账、拒绝、池掉线）各带一条**新鲜度腿**：观测时间戳旧了就不是当前状态。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-llm-pool.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: llm_usage_verdict_unmeasured
+# rule: llm_tool_calls_verdict_unmeasured
+# rule: llm_temperature_verdict_unmeasured
+# rule: llm_upstream_rejecting_while_pool_reads_available
+# rule: llm_pool_capacity_degraded
+# rule: llm_pool_open_but_idle
+# rule: llm_spend_reading_is_blind
+# rule: llm_upstream_refusal_that_waiting_cannot_repair
+# rule: llm_calls_all_failing
+# rule: llm_pool_signal_undelivered
+# rule: llm_usage_upstream_silent
+# rule: llm_usage_ledger_incomplete
+# rule: llm_call_without_declared_actor
+# rule: llm_cached_tokens_exceed_input
+
+evaluation_interval: 1m
+
+tests:
+  # 健康的池：一家上游、三个判词都量过、没有被拒、额度够、账测得新鲜、没有资格类拒绝、
+  # 没有失败、信号连着、用量读数在写、账平、调用都带 actor、缓存不超过输入。
+  # 十三条全静。
+  - interval: 1m
+    input_series:
+      - series: 'llm_usage_verdict_measured{upstream="u1"}'
+        values: '1x60'
+      - series: 'llm_tool_calls_verdict_measured{upstream="u1"}'
+        values: '1x60'
+      - series: 'llm_temperature_verdict_measured{upstream="u1"}'
+        values: '1x60'
+      - series: 'llm_upstream_healthy{upstream="u1"}'
+        values: '1x60'
+      - series: 'llm_upstream_client_errors_total{upstream="u1"}'
+        values: '0x60'
+      - series: 'llm_pool_available'
+        values: '1x60'
+      - series: 'llm_pool_allowance_tokens'
+        values: '100x60'
+      - series: 'llm_pool_allowance_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_spent_tokens'
+        values: '10x60'
+      - series: 'llm_pool_spent_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_reserve_tokens'
+        values: '10x60'
+      - series: 'llm_pool_reserve_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      # 限速关着：`open_but_idle` 的第二条腿不成立，所以这一格里它是静的。
+      - series: 'llm_pool_paced_upstreams'
+        values: '0x60'
+      - series: 'llm_pool_paced_upstreams_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_budget_spent_tokens'
+        values: '100x60'
+      - series: 'llm_budget_measured_at_unix'
+        values: '3500x60'
+      - series: 'llm_upstream_refusal_kind{upstream="u1",kind="entitlement"}'
+        values: '0x60'
+      - series: 'llm_upstream_refusal_kind_observed_timestamp_seconds{upstream="u1",kind="entitlement"}'
+        values: '3500x60'
+      - series: 'llm_upstream_failures_total{upstream="u1",source="caller"}'
+        values: '0x60'
+      - series: 'llm_pool_signal_connected'
+        values: '1x60'
+      - series: 'llm_usage_readings_total{outcome="absent",upstream="u1"}'
+        values: '0x60'
+      - series: 'llm_calls_total{result="ok",upstream="u1"}'
+        values: '5x60'
+      - series: 'llm_usage_readings_total{upstream="u1"}'
+        values: '5x60'
+      - series: 'llm_calls_total{actor="unknown"}'
+        values: '0x60'
+      - series: 'llm_tokens_total{kind="cached",upstream="u1"}'
+        values: '0x60'
+      - series: 'llm_tokens_total{kind="input",upstream="u1"}'
+        values: '100x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_usage_verdict_unmeasured
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_tool_calls_verdict_unmeasured
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_temperature_verdict_unmeasured
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_upstream_rejecting_while_pool_reads_available
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_pool_capacity_degraded
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_pool_open_but_idle
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_spend_reading_is_blind
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_upstream_refusal_that_waiting_cannot_repair
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_calls_all_failing
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_pool_signal_undelivered
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_usage_upstream_silent
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_usage_ledger_incomplete
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_call_without_declared_actor
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_cached_tokens_exceed_input
+        exp_alerts: []
+
+  # 上游健康、三个判词却全是 0：三条一起亮。同一格里再放一家**不健康**的上游（u2，
+  # 判词也没量过）——它不归这三条问，所以结果里只该有 u1 三份。
+  - interval: 1m
+    input_series:
+      - series: 'llm_usage_verdict_measured{upstream="u1"}'
+        values: '0x60'
+      - series: 'llm_tool_calls_verdict_measured{upstream="u1"}'
+        values: '0x60'
+      - series: 'llm_temperature_verdict_measured{upstream="u1"}'
+        values: '0x60'
+      - series: 'llm_upstream_healthy{upstream="u1"}'
+        values: '1x60'
+      - series: 'llm_usage_verdict_measured{upstream="u2"}'
+        values: '0x60'
+      - series: 'llm_tool_calls_verdict_measured{upstream="u2"}'
+        values: '0x60'
+      - series: 'llm_temperature_verdict_measured{upstream="u2"}'
+        values: '0x60'
+      - series: 'llm_upstream_healthy{upstream="u2"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_usage_verdict_unmeasured
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              upstream: u1
+      - eval_time: 60m
+        alertname: llm_tool_calls_verdict_unmeasured
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              upstream: u1
+      - eval_time: 60m
+        alertname: llm_temperature_verdict_unmeasured
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              upstream: u1
+
+  # 池说可用（`llm_pool_available=1`）而上游在拒：矛盾，亮。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_client_errors_total{upstream="u1"}'
+        values: '0x5 2x55'
+      - series: 'llm_pool_available'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_upstream_rejecting_while_pool_reads_available
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              upstream: u1
+
+  # 同样的拒绝，但池已经说不可用了：不归这条问。这一格守着 `and on ()` 那半条腿——
+  # 删掉它，池掉线期间的每一次拒绝都会被读成「池说可用却在拒」。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_client_errors_total{upstream="u1"}'
+        values: '0x5 2x55'
+      - series: 'llm_pool_available'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_upstream_rejecting_while_pool_reads_available
+        exp_alerts: []
+
+  # 两家上游、一家不健康：池是降级，不是全灭。亮。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_healthy{upstream="u1"}'
+        values: '1x60'
+      - series: 'llm_upstream_healthy{upstream="u2"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_capacity_degraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 池开着却一小时没人用：额度够（100-10-10=80）、限速做着（1）、准入读数新鲜、
+  # 用量计数器一小时没动。四条腿都成立 ⇒ 亮。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_allowance_tokens'
+        values: '100x60'
+      - series: 'llm_pool_allowance_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_spent_tokens'
+        values: '10x60'
+      - series: 'llm_pool_spent_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_reserve_tokens'
+        values: '10x60'
+      - series: 'llm_pool_reserve_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_paced_upstreams'
+        values: '1x60'
+      - series: 'llm_pool_paced_upstreams_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'cogneva_ready_admission_readings{kind="ready"}'
+        values: '1x60'
+      - series: 'cogneva_ready_admission_readings_observed_timestamp_seconds{kind="ready"}'
+        values: '3500x60'
+      - series: 'llm_usage_readings_total{outcome="read"}'
+        values: '7x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_open_but_idle
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+
+  # 额度已经不够（10-10-10 = -10）：不开着却闲，是没额度。静。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_allowance_tokens'
+        values: '10x60'
+      - series: 'llm_pool_allowance_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_spent_tokens'
+        values: '10x60'
+      - series: 'llm_pool_spent_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_reserve_tokens'
+        values: '10x60'
+      - series: 'llm_pool_reserve_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_paced_upstreams'
+        values: '1x60'
+      - series: 'llm_pool_paced_upstreams_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'cogneva_ready_admission_readings{kind="ready"}'
+        values: '1x60'
+      - series: 'cogneva_ready_admission_readings_observed_timestamp_seconds{kind="ready"}'
+        values: '3500x60'
+      - series: 'llm_usage_readings_total{outcome="read"}'
+        values: '7x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_open_but_idle
+        exp_alerts: []
+
+  # 账停在 3500 秒前测的那一次：读数是盲的（界三十分钟）。亮。
+  - interval: 1m
+    input_series:
+      - series: 'llm_budget_spent_tokens'
+        values: '100x60'
+      - series: 'llm_budget_measured_at_unix'
+        values: '100x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_spend_reading_is_blind
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 资格类拒绝（等不会好）：亮。同一格里放一条**别种**拒绝的参照——选择器只认
+  # kind=entitlement，另一种拒绝不归它问。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_refusal_kind{upstream="u1",kind="entitlement"}'
+        values: '1x60'
+      - series: 'llm_upstream_refusal_kind_observed_timestamp_seconds{upstream="u1",kind="entitlement"}'
+        values: '3500x60'
+      - series: 'llm_upstream_refusal_kind{upstream="u2",kind="quota"}'
+        values: '1x60'
+      - series: 'llm_upstream_refusal_kind_observed_timestamp_seconds{upstream="u2",kind="quota"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_upstream_refusal_that_waiting_cannot_repair
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              upstream: u1
+
+  # 资格拒绝的观测时间戳停在很久以前：不再是当前状态，静。这一格守着新鲜度腿。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_refusal_kind{upstream="u1",kind="entitlement"}'
+        values: '1x480'
+      - series: 'llm_upstream_refusal_kind_observed_timestamp_seconds{upstream="u1",kind="entitlement"}'
+        values: '0x480'
+    alert_rule_test:
+      - eval_time: 480m
+        alertname: llm_upstream_refusal_that_waiting_cannot_repair
+        exp_alerts: []
+
+  # 六小时里失败计数器动过、而**没有任何一次用量读数**：全灭。亮。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_failures_total{upstream="u1",source="caller"}'
+        values: '0x5 3x55'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_calls_all_failing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              upstream: u1
+
+  # 同样有失败，但窗口里用量读数在写（哪怕是 absent）：不是全灭。这一格守着 `unless` 腿。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_failures_total{upstream="u1",source="caller"}'
+        values: '0x5 3x55'
+      - series: 'llm_usage_readings_total{upstream="u1",outcome="absent"}'
+        values: '0x5 2x55'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_calls_all_failing
+        exp_alerts: []
+
+  # 信号线一直没连上：池的判断没人送达。亮。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_signal_connected'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_signal_undelivered
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 上游的用量读数是 `absent`：有调用但没有用量。亮。
+  - interval: 1m
+    input_series:
+      - series: 'llm_usage_readings_total{upstream="u1",outcome="absent"}'
+        values: '0x5 2x55'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_usage_upstream_silent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              upstream: u1
+
+  # 十五分钟前那条腿算出来的成功调用，比一小时一刻钟里的用量读数多：账漏了。亮。
+  - interval: 1m
+    input_series:
+      - series: 'llm_calls_total{result="ok",upstream="u1"}'
+        values: '0x5 3x55'
+      - series: 'llm_usage_readings_total{upstream="u1"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_usage_ledger_incomplete
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              upstream: u1
+
+  # 调用没有带已声明的 actor：花的钱没有归属。亮。
+  - interval: 1m
+    input_series:
+      - series: 'llm_calls_total{actor="unknown"}'
+        values: '0x5 4x55'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_call_without_declared_actor
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 缓存计费超过输入：上游把缓存算重了。亮。
+  - interval: 1m
+    input_series:
+      - series: 'llm_tokens_total{kind="cached",upstream="u1"}'
+        values: '0x5 10x55'
+      - series: 'llm_tokens_total{kind="input",upstream="u1"}'
+        values: '0x5 1x55'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_cached_tokens_exceed_input
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              upstream: u1
