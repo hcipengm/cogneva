@@ -71,7 +71,7 @@ Cogneva 的元启动，从一台空白 Linux 机器开始，执行 `bootstrap.sh
 
 进化不是只能等人下命令。它同时接收：
 
-- **外部意图 / 目标输入**：人类或其他 AI 通过 WebUI、API、GitHub issue/PR/comment 等渠道向系统注入需求、问题与目标；`cog-github` 采集这些外部反馈并汇入全进化反馈回路，使其成为驱动系统进化的外部反馈源。未来 A2A 场景下，任意 AI 智能体均可直接提交进化意图。
+- **外部意图 / 目标输入**：人类或其他 AI 通过 WebUI、API、GitHub issue/PR/comment 等渠道向系统注入需求、问题与目标；`cog-github` 采集这些外部反馈并汇入全进化反馈回路，使其成为驱动系统进化的外部反馈源。A2A 场景下，外部智能体今天就能直接提交进化意图：`POST /api/v1/protocol/a2a/message/stream` 把消息变成一条 goal 并把它的状态流式回传。对外接入（名片、鉴权、四个方法、流的帧形状）见 [`docs/a2a-interop.md`](docs/a2a-interop.md)。
 - **系统自发现**：`cog-observability` 持续采集指标、日志、链路追踪；`cog-supervisor` 做健康检查与自动恢复；`cog-reflection` 把 Agent、Tool、Squad、代码变更的运行结果沉淀为 `Learning` / `ErrorEntry` / `SkillOutcome`。当某类错误反复出现、某个技能效果退化、某个模式成熟时，Reflection 会主动生成进化任务。
 
 #### 双轨进化
