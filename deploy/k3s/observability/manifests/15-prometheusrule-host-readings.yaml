@@ -857,6 +857,34 @@ spec:
             summary: "有告警行开着，但已经超过十五分钟没有任何写者报告过它的条件仍然成立"
             description: "`cogneva_alert_sighting_unsighted_rule{rule=…}` 点名是哪几条，`cogneva_alert_sighting_oldest_unsighted_age_seconds` 给最老的那一行多久没被报告（负数表示这一行压根没有 `last_seen_at`——从来没被看见过的那一档）。它与 `CognevaAlertUnattended` 是两件事：那一条说「有人看但没人接」，这一条说「连看的人都不在了」，而后者会让前者一直亮着，因为没人接的判断本身依赖这条行还在被写者维持。先查写者：这一组的时间戳由告警写者每拍推进，写者停摆（进程活着、这一支停了）与这一行被孤儿化在读数面上同形，看同一时刻有没有 `infra_watch_eval_failure` 或 Pod 重启；再看这一行的条件是不是早就不成立（Pod 已删、任务已结束），那是它该被关闭却关不掉。给五分钟：最老的那一档已经冻了至少十五分钟，再挂五拍才不是擦肩而过。"
 
+    # 这条链的**第五环**：前面四环（读数、产出者、消费者、判据）各有机器可读的答案，
+    # 「这一行归谁」没有。前一组的 `CognevaAlertUnattended` 说的是「有人看但没人接」，
+    # 而它自己也答不出该叫谁来接——读的人只能靠记性，读者恰恰是缺的那一环。
+    #
+    # 判据读两跳，缺一不可：这一行带没带面（规则自己的 `cogneva_io_face`，随行抄进
+    # `alerts.labels`），以及那个面在面主表里有没有人。三种无主分开数，因为修法完全不同：
+    # 规则没申报面 ⇒ 给规则补标签；面名不在名册 ⇒ 改拼错的名字；面在名册但面主一格是空
+    # ⇒ 那是缺位，走缺位那套（具名、限期、派活）。合成一个数会让两边都以为对方在处理。
+    #
+    # 这一条**今天会亮**，而那是它该说的实话：chart 里那两百多条由进程自己求值的规则还没有
+    # 面可申报（配置结构里没有这一格），它们写进表里的行因此全是无主的。补法在另一笔里，
+    # 与这条规则无关——判词不因为「还没补完」就该闭嘴，那正是它存在的理由。它不会自己把
+    # 自己算进无主（它自己的面有人管），所以补完之后它会真的回绿，而不是永远亮着。
+    - name: cogneva-alert-ownership
+      rules:
+        # 等十五分钟：面标签是规则上的静态性质，一条行的无主不会「自己长好」；十五分钟
+        # 只是让一次滚动期间的重建（行关掉又开）不在读数里翻一次面。
+        - alert: CognevaAlertFiringUnowned
+          expr: max(cogneva_alert_ownership_unowned) > 0
+          for: 15m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "可观测与告警"
+            severity: warning
+          annotations:
+            summary: "有 {{ $value }} 条告警正响着，而没有任何面的读法答得出该谁动"
+            description: "`cogneva_alert_ownership_unowned_rule{rule=…,reason=…}` 逐条点名并给出理由：`no_face` 是那条规则没申报面（给规则加 `cogneva_io_face`，值是它判的那个面）；`face_unknown` 是它申报了一个面主表上没有的名字（改标签）；`owner_vacant` 是那个面在名册上但面主一格是空的（这是缺位，得派人，改标签没用）。分母是 `cogneva_alert_ownership_firing`——正 firing 的行数。三种理由分开，是因为把「补标签」和「派人」合成一件事之后，两边都会以为对方在处理。"
+
     # 这张表本身以什么速度长：前面两组判「进没进表」「进了有没有人看」，都是逐行的读数，
     # 没有一条在看流量。于是「一条规则一小时写几十行」只能靠人去数表才发现——2026-10-22
     # 两笔都是这么发现的：`stream_consumer_stalled` 六小时 82 行（每行一分钟内 resolve，
