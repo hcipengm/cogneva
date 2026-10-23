@@ -370,18 +370,23 @@ pub enum ChangeBlock {
     Observability,
     Ci,
     Delivery,
+    Eval,
 }
 
 impl ChangeBlock {
     /// Every block, in the order a reading prints them.
     ///
-    /// The names are the twelve faces the programme is organised into, not the
-    /// five cross-cutting lines that run across them: a change is filed under
-    /// one face, and a line that cuts across all of them is a second question
-    /// about the same row rather than a thirteenth answer to this one. Filing a
-    /// row under `leak` or `e2e` would mean the row has to be counted twice to
-    /// stay visible under its own face.
-    pub const ALL: [ChangeBlock; 13] = [
+    /// The names are the thirteen faces the programme is organised into, not
+    /// the five cross-cutting lines that run across them: a change is filed
+    /// under one face, and a line that cuts across all of them is a second
+    /// question about the same row rather than a fourteenth answer to this one.
+    /// Filing a row under `leak` or `e2e` would mean the row has to be counted
+    /// twice to stay visible under its own face.
+    ///
+    /// `Eval` is last because it joined last, and because the order is what a
+    /// reading prints: appending keeps every earlier line in the census where a
+    /// reader already looks for it.
+    pub const ALL: [ChangeBlock; 14] = [
         ChangeBlock::None,
         ChangeBlock::Tasks,
         ChangeBlock::Token,
@@ -395,6 +400,7 @@ impl ChangeBlock {
         ChangeBlock::Observability,
         ChangeBlock::Ci,
         ChangeBlock::Delivery,
+        ChangeBlock::Eval,
     ];
 
     /// The literal stored in the account, and the one a reading prints.
@@ -417,6 +423,7 @@ impl ChangeBlock {
             ChangeBlock::Observability => "observability",
             ChangeBlock::Ci => "ci",
             ChangeBlock::Delivery => "delivery",
+            ChangeBlock::Eval => "eval",
         }
     }
 
@@ -448,6 +455,7 @@ impl std::str::FromStr for ChangeBlock {
             "observability" | "可观测" | "可观测与告警" => "observability",
             "ci" | "CI" | "CI/构建/部署" => "ci",
             "delivery" | "交付" | "商用交付" => "delivery",
+            "eval" | "评估" | "可评估" => "eval",
             "none" | "" | "-" => "none",
             other => other,
         };
@@ -1879,12 +1887,17 @@ mod tests {
         );
         assert_eq!("CI/构建/部署".parse::<ChangeBlock>(), Ok(ChangeBlock::Ci));
         assert_eq!("商用交付".parse::<ChangeBlock>(), Ok(ChangeBlock::Delivery));
+        assert_eq!("可评估".parse::<ChangeBlock>(), Ok(ChangeBlock::Eval));
         assert_eq!("".parse::<ChangeBlock>(), Ok(ChangeBlock::None));
         assert!("everything".parse::<ChangeBlock>().is_err());
         // The cross-cutting lines are not faces: a row is filed under one face,
         // and a lens over all of them cannot be the value of a single column.
         assert!("端到端演练".parse::<ChangeBlock>().is_err());
-        assert_eq!(ChangeBlock::ALL.len(), 13);
+        // Thirteen named faces and `none`. The count is pinned rather than
+        // derived because the growth of this set has an owner outside the tree:
+        // a face declared in the programme lands here as one more value, and a
+        // variant added without that landing is what this line catches.
+        assert_eq!(ChangeBlock::ALL.len(), 14);
         assert!(!ChangeBlock::None.is_named());
     }
 
