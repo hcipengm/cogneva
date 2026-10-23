@@ -1551,6 +1551,14 @@ const FOREIGN: &[(&str, &str)] = &[
         "同一生产者：正本里读不出来的行数（列数不够、种类写成 face/cross 以外、同名声明两次）。有坏行的那一拍，上面两格不印——残缺的分母会让「少了一个面」和「少了一行」看起来是同一件事，而这两种情况的修法相反",
     ),
     ("up", "Prometheus 采集目标存活序列"),
+    (
+        "host_reading_series_vanished",
+        "宿主读数聚合器 `scripts/host/cogneva-host-readings.sh` 自己发的四条之一（不在登记表任何一行里，表头写明不许替它加行）：登记表承诺每拍会印、生产者跑成了（退 0/1）却少印的序列数。标了 `=error` 的缺席是设计，不进这个数；退 3 的拍也不算——「读不到」已经有 `host_reading_producer_unreadable`，同一件事不该红两次。它红的意思只有一个：某一行账本与它的生产者分家了，修法在那一行或那个脚本里",
+    ),
+    (
+        "must_green_flake_repeat_verdict",
+        "宿主读数 `scripts/principles/must-green-flake-reading.sh`（不在本仓，登记行 `must_green_flake`）：0/1 判词，1 表示**同一个**驱动套件在窗口（默认 7 天）里留下的假红记录达到界（默认 3 次）。假红＝第一次红、同一份字节再跑转绿——真正复现的红落在 `red/`、不进这一堆，两群混起来数会把回归算成噪声。降到套件粒度是因为修法就在那一层（去查那一层里哪一份不稳），而代价落在所有排队提交者身上：每一条记录都让当时排队的人各付一整轮门。界与窗口只写在生产者里，这条规则读判词、不另立一套数；读不到目录时生产者一条序列都不印，那是 `CognevaHostReadingProducerUnreadable{producer=\"must_green_flake\"}` 的事，不是「这一周没有假红」",
+    ),
 ];
 
 /// A registered name that no rule reads yet, and what will judge it meanwhile.
