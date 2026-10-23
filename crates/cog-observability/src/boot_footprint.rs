@@ -1,15 +1,16 @@
 //! Where the birth footprint went: one resident-memory snapshot per named
 //! startup phase, published as a gauge labelled by phase.
 //!
-//! The application is born holding most of what it will ever hold — over the
-//! twenty-four hours to 2026-10-23 the generations that lived long enough to be
-//! sampled were born at 4821 to 5051 MiB and moved at most 112 MiB inside a
-//! generation. That makes the birth footprint, not the runtime, the quantity
-//! that decides whether the container has room. The band rule above it can see
-//! the footprint and the bound can see it drift, but neither can say *which*
-//! part of startup the footprint belongs to: the only way to attribute it was
-//! to replay the startup by hand, and the eight days in which it rose by about
-//! 300 MiB were attributed by nobody.
+//! The application is born holding most of what it will ever hold — measured over
+//! the twenty-four hours to 2026-10-23, generations that lived long enough to be
+//! sampled were born at 4821 to 5051 MiB and moved at most 112 MiB (measured
+//! 2026-10-23) inside a generation. That makes the birth footprint, not the
+//! runtime, the quantity that decides whether the container has room. The band
+//! rule above it can see the footprint and the bound can see it drift, but
+//! neither can say *which* part of startup the footprint belongs to: the only
+//! way to attribute it was to replay the startup by hand, and the eight days
+//! (measured to 2026-10-23) in which it rose by about 300 MiB were attributed by
+//! nobody.
 //!
 //! So a handful of points in startup each take one snapshot: process entry,
 //! config loaded, each model session built, all plugins initialised, serving.
@@ -221,15 +222,22 @@ mod tests {
         clear_for_tests();
     }
 
-    #[tokio::test]
-    async fn every_marked_phase_is_a_series_carrying_its_own_name() {
+    // Driven from a sync test on purpose: the guard this suite serializes on is
+    // a std mutex, and holding one across an await is both a lint and a real
+    // hazard -- another test running on the same thread would wait for a lock
+    // whose holder is parked in the same executor. Here the guard is held for
+    // the whole body and the await happens inside a runtime this test owns.
+    #[test]
+    fn every_marked_phase_is_a_series_carrying_its_own_name() {
         let _guard = one_at_a_time();
         clear_for_tests();
         mark("process-start");
         mark("plugins-initialized");
-        let metrics = BootFootprintObservable
-            .collect_metrics("")
-            .await
+        let metrics = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for one reading")
+            .block_on(BootFootprintObservable.collect_metrics(""))
             .expect("the reading never fails");
         let phases: Vec<String> = metrics
             .iter()
