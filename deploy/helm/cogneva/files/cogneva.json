@@ -520,6 +520,16 @@
           "summary": "kubelet reports MemoryPressure The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched."
         },
         {
+          "name": "node_dirty_bytes_outrun_device_writeback",
+          "promql": "max by (node) (node_memory_Dirty_bytes) / clamp_min(sum by (node) (rate(node_disk_written_bytes_total{device!~\"loop[0-9]+|ram[0-9]+|sr[0-9]+|dm-[0-9]+\"}[5m])), 1048576)",
+          "condition": {
+            "greater_than": 30.0
+          },
+          "for_seconds": 600,
+          "severity": "warning",
+          "summary": "{node} is holding {value} seconds of write in dirty pages: what the kernel has buffered, divided by how fast its disks have actually been writing over the last five minutes. The node-io step of the bootstrap sizes vm.dirty_bytes at five seconds' worth of a device's steady write, and the number it sizes from has no producer: it arrives as environment variables -- bytes per second, device, window, busy percent, measured at -- that a person reads off a working node and passes in. Until someone does, the kernel's own default governs the allowance, and that default is a fraction of RAM rather than a duration: on a slow device the whole allowance fills before writeback starts, and every process that touches the page cache waits behind it. The denominator carries a floor of one mebibyte per second so that an idle device cannot make this ratio large by division alone -- under the floor the reading answers with the backlog itself, and a heap of dirty pages on a device that has stopped writing is exactly the shape worth paging on. Thirty seconds is six times the five the bootstrap aims for: a write stream settles at the allowance rather than below it, so a healthy node reads close to five, and six times the target is a setting that was never applied rather than one being approached. The writeback is to take the measured rate, the device, the window and the busy percentage and run the node-io step with them; this rule going quiet is what confirms the allowance is now sized from the device rather than from memory. The publishing pod is a scrape detail, not the subject: it is deleted and recreated with every monitoring rollout, so it is aggregated out while the label naming the subject is left untouched."
+        },
+        {
           "name": "pod_restarting_fast",
           "promql": "increase(kube_pod_container_status_restarts_total[15m]) and on(namespace, pod, container) (time() - timestamp(kube_pod_container_status_restarts_total) < 300)",
           "condition": {

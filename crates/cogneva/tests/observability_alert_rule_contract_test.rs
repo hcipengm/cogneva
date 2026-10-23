@@ -1138,6 +1138,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "宿主读数 `scripts/host/cogneva-a2a-conformance-reading.sh`（不在本仓，登记行 `a2a_conformance`）：这一拍里答得不是协议说的那样的格数，每拍真打十五个请求量出来。它与 `a2a_conformance_cells` 一起印，是因为没有分母的 0 证不了「比过」——生产者读不到时两条一起缺席，那种「没量」由宿主读数的生产者契约报，不在这里另立一条规则",
     ),
     (
+        "a2a_reach_defect",
+        "宿主读数 `scripts/host/cogneva-a2a-discovery-reach-reading.sh`（不在本仓，登记行 `a2a_discovery_reach`）：0/1 判词，1 表示外部对端连发现这一步都走不通（名片要凭证、名片声明 jwt 而 RPC 收匿名调用方、服务不健康，或名片答了别的码）。三种坏法靠 key=value 档里的标签分开而不是各立一条序列：序列名一样、只差标签的话，「哪一条在响」会落到读的人自己拼。它盖住的是一个此前只有「想跑就手跑一下」的读数面——那种读数的判据再准，在读数面上也与「这一面没人看」同形，而网关路由或鉴权层一动，名片被挪回业务鉴权组这件事没有任何一个数会变色",
+    ),
+    (
         "container_memory_usage_bytes",
         "cadvisor（kubelet 内置）。cgroup 记的**整笔**占用：匿名页 + 页缓存 + slab。判「这个容器顶到上限了」读的是它，而判「顶到上限的到底是什么」要接着读 cache 那一半——两者相除才是那条规则的问题（可回收占多数时，rss 与工作集都不动）",
     ),
@@ -1249,6 +1253,14 @@ const FOREIGN: &[(&str, &str)] = &[
     (
         "node_filesystem_files",
         "node-exporter（同一序列的分母，inode 表的总数）。分子分母同源同标签，比值才是判据",
+    ),
+    (
+        "node_memory_Dirty_bytes",
+        "node-exporter（/proc/meminfo 的 Dirty：此刻还没有写回设备的页）。它与设备吞吐配对才成判据——单看它只是一个数，除以设备此刻的写速才是「这些脏页要多久才写得完」，而那个时长正是 bootstrap 的 node-io 那一步要给 vm.dirty_bytes 定的大小",
+    ),
+    (
+        "node_disk_written_bytes_total",
+        "node-exporter（/proc/diskstats 的写字节累计，按 device）。它是上面那条的分母，也是唯一能从集群里读出「这台机器的盘实际写得多快」的地方——bootstrap 要的 COGNEVA_NODE_IO_WRITE_BYTES_PER_SEC 今天没有生产者，只能由人照这条读数抄进去；过滤掉 loop/ram/sr/dm 是因为它们不是承载脏页回写的那张盘",
     ),
     (
         "kube_resourcequota",
@@ -1379,8 +1391,12 @@ const FOREIGN: &[(&str, &str)] = &[
         "同一生产者（闭集六种结局的 one-hot：below_trigger／released／floor_unreachable／script_unverified／probe_failed／planned）。三种红必须分开：够不到地板是「去看谁在吃盘」，probe_failed 是进程身份读不到（权限），script_unverified 是脚本身份立不住（提交或还原）。合成一个布尔就指不出该修哪边",
     ),
     (
-        "cogneva_host_nvme_percentage_used",
-        "宿主读数 `scripts/host/cogneva-nvme-wear-reading.sh`（不在本仓，登记行 `nvme_wear`）：每块 NVMe 的磨损百分比，读自 `nvme smart-log`。资源账其余每一格问「用掉多少」，只有这一格问「还能用多久」——磨损没有补救动作（清缓存、删卷、抬配额都退不回这个数），只能在它走到 100% 之前换盘。node-exporter 的 nvme collector 只发容量与设备状态、不导出磨损（SMART log 要 ioctl 到控制器字符设备），所以别处没有第二份读数",
+        "cogneva_host_nvme_written_bytes_total",
+        "宿主读数 `scripts/host/cogneva-nvme-wear-reading.sh`（不在本仓，登记行 `nvme_wear`）：控制器自己的写字节累计，按盘一条。加速那条规则拿它取六小时窗口速率，再折成 %/天。用它而不是 `percentage_used` 判加速，是因为磨损百分比只有 1% 的颗粒度——六小时里进一格就等于约 4 %/天，一次进位就能点着规则，那不是盘磨得快，是读数分辨率不够。node-exporter 的 nvme collector 不发这一格（要 ioctl 到控制器），所以别处没有第二份",
+    ),
+    (
+        "cogneva_host_nvme_written_bytes_per_day",
+        "同一生产者（这块盘一生平均的写字节／天，由累计写字节与通电小时数导出）。它是上面那条窗口速率的分母：绝对值单看没有意义，「比它自己一生平均快一倍」才是事件，而翻倍在多写一兆上也会成立——所以规则里还配一条「折成磨损要过 0.1 %/天」的地板。这一格缺席时那条规则整条不响，而不是拿 0 当分母",
     ),
     (
         "cogneva_host_nvme_media_errors_total",

@@ -14,7 +14,7 @@
 #   - `cpu_throttled` 的判据是 `rate * 0.1`：CFS 每秒最多 100 个周期，*10 之后才是「被限流
 #     周期的占比」，所以 > 0.5 就是「过半周期被限流」。夹具里为了让「停更」那一格在 extrapolation
 #     截断后仍越界，用了 2000/分钟（远超物理上限）的增量——这一格证的是腿，不是现实值。
-#   - `log_near_rotation_cap` 直接用 kubelet 报的字节数，判据是 64 MiB。
+#   - `log_near_rotation_cap` 直接用 kubelet 报的字节数，判据是 kubelet 默认的 64 MiB。
 #
 # redrive 一族四条全是 `increase(counter[24h]) > 0`，各自只认一个标签值；所以第六格同时让
 # `reason="other"` 在涨，四条仍静——标签选择器是判据的一部分。第五格是四条全静的健康账。
@@ -37,7 +37,7 @@ rule_files:
 evaluation_interval: 1m
 
 tests:
-  # 一个安分的容器：内存用了一半、缓存占其中一成、没被限流过、日志才 1 KiB、盘写入为零。
+  # 一个安分的容器（例如：内存用了一半、缓存占其中一成、没被限流过、日志才 1 KiB、盘写入为零）。
   # 四条全静。
   - interval: 1m
     input_series:
@@ -68,7 +68,7 @@ tests:
         exp_alerts: []
 
   # 一个难受的容器：内存顶到上限且一半以上是页缓存、过半 CPU 周期被限流、
-  # 日志 100 MiB、盘写入 400 MiB/s。四条全亮。
+  # 例如日志 100 MiB、盘写入 400 MiB/s。四条全亮。
   - interval: 1m
     input_series:
       - series: 'container_memory_usage_bytes{namespace="cogneva",pod="p1",container="app"}'
