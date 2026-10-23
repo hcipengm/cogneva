@@ -31,7 +31,7 @@ rule_files:
 evaluation_interval: 1m
 
 tests:
-  # 一台宽裕的机器：磁盘趋势还有十二天、构建盘 64 GiB、三种压力都低、内存 40 GiB、
+  # 例如一台宽裕的机器：磁盘趋势还有十二天、构建盘 64 GiB、三种压力都低、内存 40 GiB、
   # CPU 用了 0.4 核、user.slice 匿名内存 4 GiB（地板 8 GiB）、台账认得这台节点且三个
   # slice 都读得到。十条全静。
   - interval: 1m
@@ -92,8 +92,8 @@ tests:
         alertname: host_ledger_slices_invisible
         exp_alerts: []
 
-  # 一台快满的机器：磁盘趋势负三天（已经过了推算的满日）、构建盘 10 GiB、三种压力都高、
-  # 内存 8 GiB、CPU 用了 19/20 = 0.95 核、user.slice 匿名内存 10 GiB 且持续了半小时、
+  # 例如一台快满的机器：磁盘趋势负三天（已经过了推算的满日）、构建盘 10 GiB、三种压力都高、
+  # 例如内存 8 GiB、CPU 用了 19/20 = 0.95 核、user.slice 匿名内存 10 GiB 且持续了半小时、
   # 台账里有 n1 却没有 n2（集群里有这台节点）、n1 的 slice 只读到两个。十条全亮。
   - interval: 1m
     input_series:
@@ -183,7 +183,7 @@ tests:
 
   # user.slice 的匿名内存越过了地板，但这条读数才出现了十分钟：半小时那一腿不成立 ⇒ 静。
   # 这一格守的是「越界」与「越界了半小时」的差——删掉第二腿，一个刚起来的读数会被读成
-  # 「地板被穿透了半小时」。（值本身在最近十五分钟里一直是 10 GiB，所以第一腿成立。）
+  # 「地板被穿透了半小时」。（输入是一条 10 GiB 的常量序列——例如最近十五分钟一直是 10 GiB，所以第一腿成立。）
   - interval: 1m
     input_series:
       - series: 'cogneva_host_slice_anon_bytes{node="n1",slice="user.slice"}'

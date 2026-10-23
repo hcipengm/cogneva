@@ -1134,6 +1134,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "同一生产者（这一拍从 `kube_pod_container_resource_limits` 读回来的声明上限）。它跟着读数一起走而不是由规则侧另配一份：分母与分子必须来自同一次回放、同一个容器，否则滚动重叠那几分钟会把比值读错一半（同命名空间里进化 Pod 的容器同名、上限 16Gi，选择器不钉死就会取到它）",
     ),
     (
+        "a2a_conformance_drift_cells",
+        "宿主读数 `scripts/host/cogneva-a2a-conformance-reading.sh`（不在本仓，登记行 `a2a_conformance`）：这一拍里答得不是协议说的那样的格数，每拍真打十五个请求量出来。它与 `a2a_conformance_cells` 一起印，是因为没有分母的 0 证不了「比过」——生产者读不到时两条一起缺席，那种「没量」由宿主读数的生产者契约报，不在这里另立一条规则",
+    ),
+    (
         "container_memory_usage_bytes",
         "cadvisor（kubelet 内置）。cgroup 记的**整笔**占用：匿名页 + 页缓存 + slab。判「这个容器顶到上限了」读的是它，而判「顶到上限的到底是什么」要接着读 cache 那一半——两者相除才是那条规则的问题（可回收占多数时，rss 与工作集都不动）",
     ),
