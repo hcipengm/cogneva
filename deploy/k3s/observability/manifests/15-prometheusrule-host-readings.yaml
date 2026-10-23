@@ -810,3 +810,28 @@ spec:
           annotations:
             summary: "有规则在一小时里往告警账里写了太多行（见 cogneva_alert_traffic_noisy_rule）"
             description: "`cogneva_alert_traffic_noisy_rule{rule=…}` 点名是哪几条，`cogneva_alert_traffic_rows{rule=…}` 给一小时写了几行，`cogneva_alert_traffic_short_lived{rule=…}` 给其中活不过一分钟的有几条，`cogneva_alert_traffic_busiest_episode_rows{rule=…}` 给同一个 dedup_key 上反复写了几行。三种形状三种修法：短命行多 ⇒ 这条判据是「缺席即成立」或每 Pod 一生的那种，给它 `for_seconds`；同一个键反复写 ⇒ 条件在抖，先看被它读的那条读数是不是在两张值之间弹；每个键各一行、键里带 pod 或 replicas ⇒ 按对象报的规则报的是生命周期，不是事故。行数本身不是故障，是这张表还能不能被人读的预算。"
+
+    # A2A 对端面：对端照着错误码和版本协商写自己的重试逻辑，所以这一面「还是不是协议
+    # 说的那个样子」得每拍量一次，而且要在对端踩到之前知道。这一族此前没有任何规则读，
+    # 读数本身也不在账上——对端面因此是全树唯一一块「改了没有任何人会发现」的地方：
+    # 我方的测试跟着我方实现一起改，而对端只会照着旧语义重试，然后在对端那边超时。
+    #
+    # 只立一条：分母（`a2a_conformance_cells`）与漂移数（`a2a_conformance_drift_cells`）
+    # 一起由 `scripts/host/cogneva-a2a-conformance-reading.sh` 每拍送上来，漂移数就是
+    # 判词。不另立「读不到」那一条：这一面读不到时一条序列都不印，那是生产者契约里
+    # `CognevaHostReadingProducerUnreadable` 管的事，在这里再写一条会是同一个状况两个名字。
+    - name: cogneva-a2a-conformance
+      rules:
+        # 等十五分钟：这一面每拍打十五个请求，2026-10-23 实测网关偶尔一次请求拖到二十秒
+        # （同一枚请求连打三次是 0.71 / 1.59 / 0.44 秒，并发打时偶有一格拿到 000 也就是
+        # 连不上）。那种抖动是一格的、自己会回来的；能连着十五拍都漂的，才是有人真的改了
+        # 对外语义。判据取「持续」而不是「出现过一次」，否则这条规则会教人忽略它。
+        - alert: CognevaA2aConformanceDrifted
+          expr: a2a_conformance_drift_cells > 0
+          for: 15m
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "A2A 对端面有 {{ $value }} 格答得不是协议说的那样"
+            description: "对端的重试逻辑建立在这些格子的答复上（错误码、版本协商、名片形状），改了它们等于改了对外契约，而对端不会来问。跑 `bash scripts/host/cogneva-a2a-conformance-reading.sh`（不带 `--prometheus`）逐个印出是哪几格、实得什么、期望什么；`a2a_conformance_cells` 是这一拍比了几格，没有分母的 0 说明不了什么。三种常见来源：网关路由改动带掉了某个方法、版本协商的优先级被调换、名片里的字段按某一版协议改了却漏了另一版。"

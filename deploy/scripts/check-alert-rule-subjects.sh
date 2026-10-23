@@ -381,6 +381,9 @@ NO_POD_REPORTER = {
     'CognevaE2eRingNoCheck': 'e2e_ten_rings_unchecked',
     'CognevaVerdictSeriesUnread': 'cogneva_verdict_series_unread',
     'CognevaFileSizeCensusStale': 'cogneva_file_size_census_stale',
+    # A2A 对端面走的是同一条 host-readings 通道（Node 角色，抓取面上没有 pod/container）：
+    # 一个进程、一个端口，报信者不是 Pod，聚合器重建也不改变「这一格是谁的」。
+    'CognevaA2aConformanceDrifted': 'a2a_conformance_drift_cells',
     'CognevaResourceSixColumnConnExhausted': 'resource_six_column_state{column="conn",state="red"}',
     'CognevaResourceSixColumnSlotOverAdmitted': 'resource_six_column_state{column="slot",state="red"}',
 }
