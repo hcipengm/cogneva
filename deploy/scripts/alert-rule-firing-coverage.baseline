@@ -1,10 +1,5 @@
 # 进程内那一库（observability.infra_watch.rules）里还没有「会响」证明的规则名。
 # 一行一条。划掉一条 = 给它写了夹具；新债不许记进来（--update-baseline 会先拒绝）。
-acceptance_census_covered_no_specs
-acceptance_census_never_completed
-acceptance_items_stale_persisting
-acceptance_reading_stopped
-acceptance_snapshot_not_refreshed
 analytics_flush_batches_all_failed
 audited_request_refused
 backup_cronjob_stopped_scheduling

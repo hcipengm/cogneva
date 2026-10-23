@@ -1,0 +1,137 @@
+# 验收普查那五条（进程内那一库）的单测夹具。它们说的是「规格普查这件事本身还在不在」：
+# 一台节点从来没有完成过、读数停了、快照一小时没刷新、stale 项持续不走、以及一台节点
+# 覆盖了零条规格。
+#
+# 这一族最容易写错的地方是「零」：`== 0` 与「序列缺席」在告警规则里是两件不同的事——
+# 缺席时表达式返回空集、不响，而这五条里有两条恰恰是「零才响」。所以每一格都要有序列，
+# 让它读到零；读数缺席由 `acceptance_reading_stopped` 单独问，不问两次。
+#
+# 每条静格的理由：
+#   - `never_completed` / `covered_no_specs`：零才是事件，一是健康。
+#   - `reading_stopped`：在写就静；停满十五分钟才响。窗口是这一条的判据本身。
+#   - `snapshot_not_refreshed`：界是一小时。五十分钟前的快照静，两小时前的响。
+#   - `items_stale_persisting`：只有「半小时前就有、这半小时一直在」才算持续；
+#     刚出现十分钟的 stale 项归另一条规则问（`CognevaAcceptanceSpecStale` 在 CRD 那一库）。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-acceptance-census.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: acceptance_census_never_completed
+# rule: acceptance_reading_stopped
+# rule: acceptance_snapshot_not_refreshed
+# rule: acceptance_items_stale_persisting
+# rule: acceptance_census_covered_no_specs
+
+evaluation_interval: 1m
+
+tests:
+  # 一台健康的节点：完成过（present=1）、覆盖了八十条规格、stale 是零、快照五分钟前刷过。
+  # 五条全静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_present{node="n1"}'
+        values: '1x70'
+      - series: 'cogneva_acceptance_specs{node="n1"}'
+        values: '80x70'
+      - series: 'cogneva_acceptance_items{node="n1",verdict="stale"}'
+        values: '0x70'
+      - series: 'cogneva_acceptance_observed_timestamp_seconds{node="n1"}'
+        values: '3600x70'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: acceptance_census_never_completed
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: acceptance_reading_stopped
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: acceptance_snapshot_not_refreshed
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: acceptance_items_stale_persisting
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: acceptance_census_covered_no_specs
+        exp_alerts: []
+
+  # 一台从没完成过的节点、覆盖零条规格、快照停在一小时多以前（时间走到 70 分钟，
+  # 而快照停在 0 秒）。三条亮；「读数停了」与「stale 持续」静——序列一直都有人在写，
+  # 只是写的内容是零。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_present{node="n2"}'
+        values: '0x70'
+      - series: 'cogneva_acceptance_specs{node="n2"}'
+        values: '0x70'
+      - series: 'cogneva_acceptance_items{node="n2",verdict="stale"}'
+        values: '0x70'
+      - series: 'cogneva_acceptance_observed_timestamp_seconds{node="n2"}'
+        values: '0x70'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: acceptance_census_never_completed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n2
+      - eval_time: 70m
+        alertname: acceptance_census_covered_no_specs
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n2
+      - eval_time: 70m
+        alertname: acceptance_snapshot_not_refreshed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n2
+      - eval_time: 70m
+        alertname: acceptance_reading_stopped
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: acceptance_items_stale_persisting
+        exp_alerts: []
+
+  # stale 项从第五十分钟才开始出现（前十条采样都是零）：刚出现的 stale 项不是「持续」。
+  # 这一格守着两个窗口的差——删掉 `count_over_time[1h] > count_over_time[30m]` 那一腿，
+  # 它会和「持续了一小时」一样亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_items{node="n1",verdict="stale"}'
+        values: '0x50 2x20'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: acceptance_items_stale_persisting
+        exp_alerts: []
+
+  # 同样的两格值，但从头就在：半小时前就有（值 2）、这半小时里每分钟都在，最小也是 2 ⇒
+  # 「持续」成立。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_items{node="n1",verdict="stale"}'
+        values: '2x70'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: acceptance_items_stale_persisting
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+
+  # 普查停了：最后一次发布在第十分钟，之后一小时没有新值。这一格守着 15 分钟的窗口：
+  # 写成 `[0m]`（或去掉）停摆会被读成静，而 `acceptance_reading_stopped` 存在的理由
+  # 正是「停摆」与「没有 stale」在别处长得一样。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_present{node="n1"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: acceptance_reading_stopped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
