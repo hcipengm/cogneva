@@ -1,0 +1,333 @@
+# 命名空间配额、数据卷超声明、沙盒 OOM、ralph 终止数、分区维护欠账、
+# GitOps 拉取失败、PG 连接池上限没量出来、工作负载没有可用副本那十条读数的夹具。
+#
+# 形状上有三种：
+#   1. 比值型（配额、数据卷）：左边按 (namespace, resource|pvc) 聚合，右边靠 `on(...)` 对齐。
+#      比值本身没有新鲜度腿——两边的读数一起停住时它仍然有值，这是这一族的缺口，夹具不补。
+#   2. 计数增量型（OOM、ralph、分区）：窗口里的跳变。跳变必须落在窗口**内部**，压在
+#      窗口起点上 increase 读出来是 0——本文件所有跳变都放在 t=50，窗口是 30m/1h。
+#   3. 新鲜度合取型（PG 上限、GitOps 拉取）：值本身加上「观测时间戳在一刻钟/半小时内」。
+#      这两条的静格各自把时间戳钉死，删掉新鲜度那半那一格会响。
+#
+# `cogneva_workload_metrics_unscraped` 是四条链的 `and`/`unless`：
+#   容器信息 and 相位 Running == 1 and 启动超过一刻钟 unless 归 Job 管 unless 一刻钟里抓过。
+#   它的静格单独证「一刻钟里抓过」那半；`and on(pod)` 只看 pod，不看 namespace——夹具两条
+#   序列都带 namespace 才不会互相错配。
+#
+# `workload_no_available_replica` 有三条腿：可用副本最大值 < 1、声明副本 > 0、
+#   且这条读数存在超过半小时（`count_over_time[1h] > count_over_time[30m]`）。
+#   后两条各有一格静格。
+#
+# `baseline_port_tick_failing_every_round` 要求「两小时里每一分钟都在失败」且「读数存在超过两小时」，
+#   所以它要跑满四小时；用 `_` 空采样把「读数刚出现」造出来，证第二条腿。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-infra-floors.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: namespace_quota_near_ceiling
+# rule: sandbox_command_oom_killed
+# rule: ralph_loop_terminations_high
+# rule: cogneva_workload_metrics_unscraped
+# rule: data_volume_over_declared_size
+# rule: pg_pool_ceiling_unmeasured
+# rule: workload_no_available_replica
+# rule: gitops_pull_failed
+# rule: baseline_port_tick_failing_every_round
+# rule: partition_maintenance_round_came_up_short
+
+evaluation_interval: 1m
+
+tests:
+  # 一切正常：配额用了一半、没有 OOM、没有终止、Pod 在跑且被抓着、数据卷用了一半、
+  # PG 上限量得出来且在、副本都在、拉取没失败、分区维护没欠账。九条全静
+  # （`baseline_port_tick_failing_every_round` 的静格在最后，它要跑四小时）。
+  - interval: 1m
+    input_series:
+      - series: 'kube_resourcequota{namespace="cogneva",resource="requests.cpu",type="used"}'
+        values: '50x60'
+      - series: 'kube_resourcequota{namespace="cogneva",resource="requests.cpu",type="hard"}'
+        values: '100x60'
+      - series: 'sandbox_oom_kills_total{namespace="cogneva"}'
+        values: '0x60'
+      - series: 'ralph_terminations_total'
+        values: '0x60'
+      - series: 'kube_pod_container_info{namespace="cogneva",pod="p1",image="cogneva/app:1"}'
+        values: '1x60'
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="p1",phase="Running"}'
+        values: '1x60'
+      - series: 'kube_pod_start_time{namespace="cogneva",pod="p1"}'
+        values: '3500x60'
+      - series: 'up{namespace="cogneva",pod="p1"}'
+        values: '1x60'
+      - series: 'cogneva_data_volume_used_bytes{namespace="cogneva",persistentvolumeclaim="data"}'
+        values: '50x60'
+      - series: 'kube_persistentvolumeclaim_resource_requests_storage_bytes{namespace="cogneva",persistentvolumeclaim="data"}'
+        values: '100x60'
+      - series: 'cogneva_pg_pool_max_connections{pool="pg",source="server_unreadable"}'
+        values: '0x60'
+      - series: 'cogneva_pg_pool_max_connections_observed_timestamp_seconds{pool="pg",source="server_unreadable"}'
+        values: '3500x60'
+      - series: 'kube_deployment_status_replicas_available{namespace="cogneva",deployment="app"}'
+        values: '2x60'
+      - series: 'kube_deployment_spec_replicas{namespace="cogneva",deployment="app"}'
+        values: '2x60'
+      - series: 'gitops_pull_failed'
+        values: '0x60'
+      - series: 'gitops_pull_failed_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'cogneva_partition_maintenance_failures_total'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: namespace_quota_near_ceiling
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: sandbox_command_oom_killed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: ralph_loop_terminations_high
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: cogneva_workload_metrics_unscraped
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: data_volume_over_declared_size
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: pg_pool_ceiling_unmeasured
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: workload_no_available_replica
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: gitops_pull_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: partition_maintenance_round_came_up_short
+        exp_alerts: []
+
+  # 都在说坏消息：配额到了 95%、半小时里 OOM 两次、ralph 被终止 25 次、
+  # 一个跑了一小时的 cogneva Pod 没有任何抓取样本、数据卷用了 150% 的声明大小、
+  # PG 上限读不出来且这条读数在、部署一个可用副本都没有、GitOps 拉取失败、分区维护失败一次。
+  # 九条全亮。
+  - interval: 1m
+    input_series:
+      - series: 'kube_resourcequota{namespace="cogneva",resource="requests.cpu",type="used"}'
+        values: '95x60'
+      - series: 'kube_resourcequota{namespace="cogneva",resource="requests.cpu",type="hard"}'
+        values: '100x60'
+      - series: 'sandbox_oom_kills_total{namespace="cogneva"}'
+        values: '0x50 2x10'
+      - series: 'ralph_terminations_total'
+        values: '0x50 25x10'
+      - series: 'kube_pod_container_info{namespace="cogneva",pod="p2",image="cogneva/app:1"}'
+        values: '1x60'
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="p2",phase="Running"}'
+        values: '1x60'
+      - series: 'kube_pod_start_time{namespace="cogneva",pod="p2"}'
+        values: '0x60'
+      - series: 'cogneva_data_volume_used_bytes{namespace="cogneva",persistentvolumeclaim="data"}'
+        values: '150x60'
+      - series: 'kube_persistentvolumeclaim_resource_requests_storage_bytes{namespace="cogneva",persistentvolumeclaim="data"}'
+        values: '100x60'
+      - series: 'cogneva_pg_pool_max_connections{pool="pg",source="server_unreadable"}'
+        values: '1x60'
+      - series: 'cogneva_pg_pool_max_connections_observed_timestamp_seconds{pool="pg",source="server_unreadable"}'
+        values: '3500x60'
+      - series: 'kube_deployment_status_replicas_available{namespace="cogneva",deployment="app"}'
+        values: '0x60'
+      - series: 'kube_deployment_spec_replicas{namespace="cogneva",deployment="app"}'
+        values: '1x60'
+      - series: 'gitops_pull_failed'
+        values: '1x60'
+      - series: 'gitops_pull_failed_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'cogneva_partition_maintenance_failures_total'
+        values: '0x50 1x10'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: namespace_quota_near_ceiling
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+              resource: requests.cpu
+      - eval_time: 60m
+        alertname: sandbox_command_oom_killed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+      - eval_time: 60m
+        alertname: ralph_loop_terminations_high
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: cogneva_workload_metrics_unscraped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: data_volume_over_declared_size
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+              persistentvolumeclaim: data
+      - eval_time: 60m
+        alertname: pg_pool_ceiling_unmeasured
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              pool: pg
+              source: server_unreadable
+      - eval_time: 60m
+        alertname: workload_no_available_replica
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: cogneva
+              deployment: app
+      - eval_time: 60m
+        alertname: gitops_pull_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: partition_maintenance_round_came_up_short
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 两条界各差一口气：配额 50%、ralph 只被终止 15 次（界是超过 20）。都静。
+  - interval: 1m
+    input_series:
+      - series: 'kube_resourcequota{namespace="cogneva",resource="requests.cpu",type="used"}'
+        values: '50x60'
+      - series: 'kube_resourcequota{namespace="cogneva",resource="requests.cpu",type="hard"}'
+        values: '100x60'
+      - series: 'ralph_terminations_total'
+        values: '0x50 15x10'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: namespace_quota_near_ceiling
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: ralph_loop_terminations_high
+        exp_alerts: []
+
+  # 同上那个跑了一小时的 Pod，但一刻钟里抓过它：不是「没被抓」。删掉
+  # `unless on(pod) present_over_time(...)` 那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_container_info{namespace="cogneva",pod="p2",image="cogneva/app:1"}'
+        values: '1x60'
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="p2",phase="Running"}'
+        values: '1x60'
+      - series: 'kube_pod_start_time{namespace="cogneva",pod="p2"}'
+        values: '0x60'
+      - series: 'up{namespace="cogneva",pod="p2"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: cogneva_workload_metrics_unscraped
+        exp_alerts: []
+
+  # 同样是 cogneva 的 Pod，但它归一个 Job 管：Job 的生命周期短，抓不抓得到不归这条问。
+  # 删掉 `unless on(pod) kube_pod_owner{...}` 那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_container_info{namespace="cogneva",pod="p3",image="cogneva/app:1"}'
+        values: '1x60'
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="p3",phase="Running"}'
+        values: '1x60'
+      - series: 'kube_pod_start_time{namespace="cogneva",pod="p3"}'
+        values: '0x60'
+      - series: 'kube_pod_owner{namespace="cogneva",pod="p3",owner_kind="Job",owner_name="j1"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: cogneva_workload_metrics_unscraped
+        exp_alerts: []
+
+  # PG 上限说读不出来，但这条读数一小时前就停了：现在是什么状态不知道。
+  # 删掉新鲜度那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_pg_pool_max_connections{pool="pg",source="server_unreadable"}'
+        values: '1x60'
+      - series: 'cogneva_pg_pool_max_connections_observed_timestamp_seconds{pool="pg",source="server_unreadable"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: pg_pool_ceiling_unmeasured
+        exp_alerts: []
+
+  # 拉取失败过，但这条读数一小时前就停了。删掉新鲜度那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'gitops_pull_failed'
+        values: '1x60'
+      - series: 'gitops_pull_failed_observed_timestamp_seconds'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: gitops_pull_failed
+        exp_alerts: []
+
+  # 一个可用副本都没有，但部署本来就不该有副本（声明为 0）：不归这条问。
+  # 删掉「声明副本 > 0」那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'kube_deployment_status_replicas_available{namespace="cogneva",deployment="app"}'
+        values: '0x60'
+      - series: 'kube_deployment_spec_replicas{namespace="cogneva",deployment="app"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: workload_no_available_replica
+        exp_alerts: []
+
+  # 同样的零可用副本，但这条读数半小时前才开始报：还不知道它是不是一直这样。
+  # 删掉「读数的历史比半小时长」那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'kube_deployment_status_replicas_available{namespace="cogneva",deployment="app"}'
+        values: '_x30 0x30'
+      - series: 'kube_deployment_spec_replicas{namespace="cogneva",deployment="app"}'
+        values: '_x30 1x30'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: workload_no_available_replica
+        exp_alerts: []
+
+  # 端口基线那一轮两小时里每一分钟都在失败，读数也够老（四小时前就有）：亮。
+  - interval: 1m
+    input_series:
+      - series: 'baseline_port_tick_failed'
+        values: '1x240'
+      - series: 'baseline_port_tick_failed_observed_timestamp_seconds'
+        values: '10000x240'
+    alert_rule_test:
+      - eval_time: 240m
+        alertname: baseline_port_tick_failing_every_round
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 同样的失败，但读数半小时前才出现：两小时窗口里它占不满，四小时窗口的计数
+  # 并不比两小时窗口多。删掉「读数的历史比两小时长」那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'baseline_port_tick_failed'
+        values: '_x210 1x30'
+      - series: 'baseline_port_tick_failed_observed_timestamp_seconds'
+        values: '10000x240'
+    alert_rule_test:
+      - eval_time: 240m
+        alertname: baseline_port_tick_failing_every_round
+        exp_alerts: []

@@ -1,0 +1,73 @@
+# 「一个智能体每次调用带的上下文超过它自己这一周的常态」那条读数的夹具。
+#
+# 这条的界不是常数，是同一个 actor 过去七天每小时 `tokens/calls` 的 99 分位——
+# 所以夹具必须真的攒够七天：采样间隔 15 分钟、终点 168 小时，计数器每步都在涨。
+#
+# 为什么是 15 分钟而不是 1 小时：子查询的步长是 1 小时，每个点算一次 `increase(...[1h])`；
+# 若采样间隔也是 1 小时，窗口左端开区间把唯一的另一个点排除掉，`increase` 只剩一个采样，
+# 算出来是 0，整条表达式从头到尾为空。
+#
+# 为什么「跳变只占最后那一小时」：99 分位是插值出来的。若高值占了七天的 1% 以上
+# （169 个点里的两个以上），分位本身就跟着抬上去，比值反而掉回界内——那样这一格
+# 证明的就不是「比值越界」，而是「分位被自己的尖峰抬高」。所以尖峰只压在一个点上。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-llm-context.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: llm_context_per_call_above_its_own_week
+
+evaluation_interval: 15m
+
+tests:
+  # 一整周都是每步 1 次调用、400 个输入 token：每次 400，恰好等于自己这一周的 99 分位。
+  # 判据是严格大于 1.0，所以静。
+  - interval: 15m
+    input_series:
+      - series: 'llm_calls_total{result="ok",actor="a1"}'
+        values: '0+1x672'
+      - series: 'llm_tokens_total{kind="input",actor="a1"}'
+        values: '0+400x672'
+    alert_rule_test:
+      - eval_time: 168h
+        alertname: llm_context_per_call_above_its_own_week
+        exp_alerts: []
+
+  # 前六天多都是每步 400，最后一小时抬到每步 2000：最后这一个小时的点是七天里的少数，
+  # 99 分位量出来的仍是常态那一档，比值越界。亮。
+  - interval: 15m
+    input_series:
+      - series: 'llm_calls_total{result="ok",actor="a1"}'
+        values: '0+1x672'
+      - series: 'llm_tokens_total{kind="input",actor="a1"}'
+        values: '0+400x668 269200 271200 273200 275200'
+    alert_rule_test:
+      - eval_time: 168h
+        alertname: llm_context_per_call_above_its_own_week
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              actor: a1
+
+  # 同一个尖峰，旁边还有一个整整一周都这么贵的 actor：界是**各人自己的**，所以只有 a1 亮。
+  # 若把界写成全局分位（比如按所有 actor 合起来算），a2 的常态会把界抬上去，a1 这一格就静了
+  # ——这一格就是那条「界按 actor 分开算」的判据。
+  - interval: 15m
+    input_series:
+      - series: 'llm_calls_total{result="ok",actor="a1"}'
+        values: '0+1x672'
+      - series: 'llm_tokens_total{kind="input",actor="a1"}'
+        values: '0+400x668 269200 271200 273200 275200'
+      - series: 'llm_calls_total{result="ok",actor="a2"}'
+        values: '0+1x672'
+      - series: 'llm_tokens_total{kind="input",actor="a2"}'
+        values: '0+2000x672'
+    alert_rule_test:
+      - eval_time: 168h
+        alertname: llm_context_per_call_above_its_own_week
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              actor: a1

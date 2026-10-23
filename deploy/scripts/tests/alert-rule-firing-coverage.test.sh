@@ -90,14 +90,32 @@ fi
 # 「静格」证明的是这份数据上它没响，恒假的规则同样满足，而那正是这一族要抓的形状。
 mkdir -p "${work}/fx-silent"
 cp "${fixtures}"/*.test.yaml "${work}/fx-silent/" 2>/dev/null
-# 挑一条**目录里没有任何夹具**的规则：否则真夹具里的响格会让它照样算已证明，
-# 这一格就测不到「静格不算证明」。
-# 规则名从读数里现取，不写死：写死的那一天有人给它写了夹具，这一格就会静默地测不到
-# 东西（静格与响格并存 ⇒ 它照样算已证明）。取当前第一条**没有任何证明**的规则。
-run "$config" "$fixtures" "$baseline" --stock
-silent_rule=$(awk -F'\t' '$1 == "unproven" { print $2; exit }' "${work}/out")
-[ -n "$silent_rule" ] && ok "为无证明的规则建夹具：取到 ${silent_rule}" \
-    || bad "找不到一条没有证明的规则，这一格无从构造" "至少一条 unproven" "0"
+# 挑一条**只有一份夹具点名**的规则，把那份从副本里拿掉：它就从「已证明」退回「未知」。
+# 曾经是「从读数里现取第一条 unproven」，那写法在库里还欠着账时能借到现成的标本；
+# 欠账清零那天，它自己变成了「找不到标本」——一条只在有债时才测得了门的门。
+# 现造标本不依赖欠账：从夹具头部的 `# rule:` 点名声里数出现次数为 1 的规则即可。
+# 不清空反例而只取现成的一条，是因为「静格与响格并存 ⇒ 照样算已证明」：
+# 真正在测的是「没有任何响格时它算不算数」，所以标本必须先把响格拿掉。
+declare -A named_in=()
+for f in "${fixtures}"/*.test.yaml; do
+    while IFS= read -r name; do
+        named_in[$name]="${named_in[$name]:-} ${f}"
+    done < <(sed -n 's/^# rule: //p' "$f")
+done
+silent_rule=""; silent_file=""
+for name in "${!named_in[@]}"; do
+    set -- ${named_in[$name]}
+    if [ "$#" -eq 1 ]; then silent_rule="$name"; silent_file="$1"; break; fi
+done
+if [ -n "$silent_rule" ]; then
+    rm -f "${work}/fx-silent/$(basename "${silent_file}")"
+    run "$config" "${work}/fx-silent" "$baseline" --stock
+    awk -F'\t' -v r="$silent_rule" '$1 == "unproven" && $2 == r { found = 1 } END { exit found ? 0 : 1 }' "${work}/out" \
+        && ok "拿掉唯一一份夹具后，${silent_rule} 退回未证明（标本是现造的，不靠欠账）" \
+        || bad "拿掉唯一一份夹具后应退回未证明" "${silent_rule} 出现在 unproven 行" "$(grep -c . "${work}/out") 行"
+else
+    bad "找不到一条只被一份夹具点名的规则，这一格无从构造" "至少一条 count==1" "0"
+fi
 printf '# rule: %s\n\nevaluation_interval: 1m\ntests:\n  - interval: 1m\n    input_series:\n      - series: %s\n        values: "1x5"\n    alert_rule_test:\n      - eval_time: 4m\n        alertname: %s\n        exp_alerts: []\n' \
     "$silent_rule" "$silent_rule" "$silent_rule" >"${work}/fx-silent/silent.test.yaml"
 grep -v "^${silent_rule}\$" "$baseline" >"${work}/no-silent.baseline"

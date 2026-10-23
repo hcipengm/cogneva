@@ -1,0 +1,263 @@
+# 失败分类没记上、目标类没带上、生成的变更被整份丢弃、可观测栈漂移没修好、孤儿没回收、
+# 镜像落后、路由声明面消失、网关持久写失败、工具输出归档失败那九条读数的夹具。
+#
+# 形状与各自的腿：
+#   - `declared_failure_class_unrecorded` 只判值（> 0），标签 `class` 就是判据的一部分；
+#     `without` 没点 `class`，所以它就留在告警上。
+#   - `goal_class_not_carried` 是 6 小时里的增量，标签 `source` 落在告警上。
+#   - `generated_change_discarded_in_full` 是「有不忠实的或无私的」unless「有任何忠实的」：
+#     第二格让忠实那一支也在涨，删掉 `unless` 那半这一格会响。
+#   - `observability_stack_drift_not_repaired` 与 `orphans_unreaped` 同形：半小时里一直有值，
+#     且读数存在超过半小时。各有一格静格用 `_` 空采样把「读数刚出现」造出来。
+#   - `routing_declaration_face_gone` 是「决定了」unless「宣告过」：第二格两边都在涨，删掉
+#     `unless` 这一格会响。注意右边是**比较**结果——宣告量是 0 时右边为空，`unless` 反而
+#     留着左边，所以「一条宣告都没有」也是这个规则的静默盲区，第三格是那种情形。
+#   - `gateway_durable_writes_failing` 是「写失败过」and「存储里那份读数已经老过心跳的两倍」：
+#     两条腿各有一格静格（时间戳新鲜 / 根本没有失败）。
+#   - `landing_mirror_behind` 与 `tool_output_archive_failing` 只判值，标签是对外的身份。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-evolution-routing.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: declared_failure_class_unrecorded
+# rule: goal_class_not_carried
+# rule: generated_change_discarded_in_full
+# rule: observability_stack_drift_not_repaired
+# rule: orphans_unreaped
+# rule: landing_mirror_behind
+# rule: routing_declaration_face_gone
+# rule: gateway_durable_writes_failing
+# rule: tool_output_archive_failing
+
+evaluation_interval: 1m
+
+tests:
+  # 一切正常：没有「宣告了失败类却没记上」、目标类没走成宿主类型、生成的与忠实的同步在涨、
+  # 漂移为零、没有孤儿、镜像没被拒、路由与宣告都在动、持久写没失败且那份读数新鲜、
+  # 没有归档失败。九条全静。
+  - interval: 1m
+    input_series:
+      - series: 'collab_classification_unreachable{class="timeout",pod="p1",container="app",instance="i1"}'
+        values: '0x120'
+      - series: 'collab_goal_class_source_total{source="host_type",job="planner"}'
+        values: '0x120'
+      - series: 'evolution_generated_change_files_total{job="evolution"}'
+        values: '0+10x120'
+      - series: 'evolution_generated_change_files_faithful{job="evolution"}'
+        values: '0+10x120'
+      - series: 'evolution_generated_change_hunks_total{job="evolution"}'
+        values: '0+20x120'
+      - series: 'evolution_generated_change_hunks_faithful{job="evolution"}'
+        values: '0+20x120'
+      - series: 'cogneva_observability_drift_lines{manifest="m1"}'
+        values: '0x120'
+      - series: 'cogneva_process_zombies'
+        values: '0x120'
+      - series: 'cogneva_mirror_push_failures_total{mirror="github"}'
+        values: '0x120'
+      - series: 'collab_route_decisions_total{job="router"}'
+        values: '0+5x120'
+      - series: 'collab_declared_scale_total{tier="shortcut",job="router"}'
+        values: '0+5x120'
+      - series: 'cogneva_gateway_durable_write_failures_total{reason="refused",job="gateway"}'
+        values: '0x120'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '7000x120'
+      - series: 'cogneva_tool_output_archive_failed_total{tool="read",cause="unreachable"}'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: declared_failure_class_unrecorded
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: goal_class_not_carried
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: generated_change_discarded_in_full
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: observability_stack_drift_not_repaired
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: orphans_unreaped
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: landing_mirror_behind
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: routing_declaration_face_gone
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: gateway_durable_writes_failing
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: tool_output_archive_failing
+        exp_alerts: []
+
+  # 都在说坏消息：`timeout` 这一类在宣告却一直是零、六小时里三次走成宿主类型、
+  # 生成的文件与 hunk 都在涨而忠实的一个都没有、漂移两行持续两小时、三个孤儿一直没回收、
+  # github 拒了两次推送、路由在决定而一条宣告都没有、网关持久写被拒两次且那份读数
+  # 一小时四十分没刷新（心跳的两倍是 3600 秒）、工具输出归档失败。九条全亮。
+  #
+  # 这里的时间戳取 1000 而不是 0：门槛是严格大于 3600 秒，eval 在 7200 秒处，
+  # 0 会算出 7200（亮），但这条用例想同时覆盖别的窗口，所以用一个肯定过线的旧值。
+  - interval: 1m
+    input_series:
+      - series: 'collab_classification_unreachable{class="timeout",pod="p1",container="app",instance="i1"}'
+        values: '1x120'
+      - series: 'collab_goal_class_source_total{source="host_type",job="planner"}'
+        values: '0x110 3x10'
+      - series: 'evolution_generated_change_files_total{job="evolution"}'
+        values: '0+10x120'
+      - series: 'evolution_generated_change_files_faithful{job="evolution"}'
+        values: '0x120'
+      - series: 'evolution_generated_change_hunks_total{job="evolution"}'
+        values: '0+20x120'
+      - series: 'evolution_generated_change_hunks_faithful{job="evolution"}'
+        values: '0x120'
+      - series: 'cogneva_observability_drift_lines{manifest="m1"}'
+        values: '2x120'
+      - series: 'cogneva_process_zombies'
+        values: '3x120'
+      - series: 'cogneva_mirror_push_failures_total{mirror="github"}'
+        values: '0x110 2x10'
+      - series: 'collab_route_decisions_total{job="router"}'
+        values: '0+5x120'
+      - series: 'cogneva_gateway_durable_write_failures_total{reason="refused",job="gateway"}'
+        values: '0x110 2x10'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '1000x120'
+      - series: 'cogneva_tool_output_archive_failed_total{tool="read",cause="unreachable"}'
+        values: '0x110 1x10'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: declared_failure_class_unrecorded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              class: timeout
+      - eval_time: 120m
+        alertname: goal_class_not_carried
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              source: host_type
+      - eval_time: 120m
+        alertname: generated_change_discarded_in_full
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 120m
+        alertname: observability_stack_drift_not_repaired
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              manifest: m1
+      - eval_time: 120m
+        alertname: orphans_unreaped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 120m
+        alertname: landing_mirror_behind
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              mirror: github
+      - eval_time: 120m
+        alertname: routing_declaration_face_gone
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 120m
+        alertname: gateway_durable_writes_failing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: refused
+      - eval_time: 120m
+        alertname: tool_output_archive_failing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              tool: read
+              cause: unreachable
+
+  # 生成的变更有不忠实的，但同一窗口里也有忠实的：不是「整份丢弃」。
+  # 删掉 `unless` 那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'evolution_generated_change_files_total{job="evolution"}'
+        values: '0+10x120'
+      - series: 'evolution_generated_change_files_faithful{job="evolution"}'
+        values: '0+2x120'
+      - series: 'evolution_generated_change_hunks_total{job="evolution"}'
+        values: '0+20x120'
+      - series: 'evolution_generated_change_hunks_faithful{job="evolution"}'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: generated_change_discarded_in_full
+        exp_alerts: []
+
+  # 路由在决定，宣告也在涨：不是「声明面消失」。删掉 `unless` 那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'collab_route_decisions_total{job="router"}'
+        values: '0+5x120'
+      - series: 'collab_declared_scale_total{tier="shortcut",job="router"}'
+        values: '0+2x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: routing_declaration_face_gone
+        exp_alerts: []
+
+  # 漂移两行，但这份读数半小时前才开始报：还不知道它是不是一直没被修。
+  # 删掉「读数的历史比半小时长」那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_observability_drift_lines{manifest="m1"}'
+        values: '_x90 2x30'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: observability_stack_drift_not_repaired
+        exp_alerts: []
+
+  # 孤儿三个，但这条读数半小时前才开始报。删掉「读数的历史比半小时长」那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_process_zombies'
+        values: '_x90 3x30'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: orphans_unreaped
+        exp_alerts: []
+
+  # 持久写失败过，但存储里那份池读数下一刻钟前刚刷新：写失败已经被下一次重写修好了。
+  # 删掉「那份读数老过心跳两倍」那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_gateway_durable_write_failures_total{reason="refused",job="gateway"}'
+        values: '0x110 2x10'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '7100x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: gateway_durable_writes_failing
+        exp_alerts: []
+
+  # 存储里那份读数确实很旧，但网关这一侧根本没有失败：不是「写不进去」。
+  # 删掉「写失败过」那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_gateway_durable_write_failures_total{reason="refused",job="gateway"}'
+        values: '0x120'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '1000x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: gateway_durable_writes_failing
+        exp_alerts: []
