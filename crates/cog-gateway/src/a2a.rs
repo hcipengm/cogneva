@@ -510,6 +510,9 @@ struct StreamRequest {
     rpc_id: Value,
     /// 拿 message 的文本 part 拼成的 goal。
     goal: String,
+    /// 对端给这条消息的 id（两版都叫 `messageId`）。它决定重发能不能落到同一行
+    /// 上：见 [`goal_id_for`]。
+    message_id: Option<String>,
 }
 
 /// 从请求体里取出 message 的文本，作为 goal。
@@ -558,7 +561,42 @@ fn parse_message_stream(body: &Value) -> Result<StreamRequest, String> {
         // 造出一堆无意义的子任务，而调用方在流上看不出是自己发空了。
         return Err("the message has no text part to use as a goal".to_string());
     }
-    Ok(StreamRequest { rpc_id, goal })
+    // 两版的 `Message` 都把这个字段写在同一个位置上（0.3 与 1.0 的
+    // `TaskMessage::to_wire` 都是 `messageId`），所以只读这一种拼法。
+    let message_id = message
+        .get("messageId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(StreamRequest {
+        rpc_id,
+        goal,
+        message_id,
+    })
+}
+
+/// 这一条消息该落到哪一行上。
+///
+/// 对端重发是通信面上的常态，不是例外：它自己的超时比我们的分解短、连接在
+/// 半路断了、代理重试了一次——这些都会把同一条 message 再发一遍。每次新开一
+/// 条 goal 意味着同一件事被分解、执行、计费两遍，两份结果还各自回流，对端最终
+/// 拿到哪一份取决于它问的是哪个 id。
+///
+/// 所以 id 由 message 自己的 `messageId` 现算，而不是每次现抽一个：同一个
+/// `messageId` 派生出同一个 id，于是「这一行已经在库里」就是重发的全部证据——
+/// 读得到就返回它，读不到才受理。不查表、不新增存储，重启之后依然成立，因为
+/// 映射不是被记住的，是被算出来的。
+///
+/// 没有 `messageId` 的请求仍然是每次新抽一个：没有幂等键就没有幂等的依据，
+/// 替它编一个（比如按文本哈希）会把两个不同对端说的同一句话并成一个任务。
+fn goal_id_for(message_id: Option<&str>) -> String {
+    match message_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => {
+            let digest = Sha256::digest(id.as_bytes());
+            let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+            format!("message-{hex}")
+        }
+        None => uuid::Uuid::new_v4().to_string(),
+    }
 }
 
 // ─── SSE 帧 ───────────────────────────────────────────────────────────────
@@ -896,38 +934,57 @@ async fn message_stream_for(
 
     // goal id 由这里生成并回给客户端，而不是等编排器分配：客户端要拿它去订阅、
     // 去查，而这个 id 只有在第一帧之前就定下来，才可能出现在第一帧里。
-    let goal_id = uuid::Uuid::new_v4().to_string();
+    let goal_id = goal_id_for(request.message_id.as_deref());
 
     // 与 HTTP 面同一个受理路径（同一行构造、同一次 spawn）：两条路各自写一遍
     // 提交逻辑，就会出现「经 A2A 提的 goal 少了某个字段」这类只在一条路上
-    // 存在的缺陷。
-    let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
-    goal_row.workspace_id = None;
-    // 提交在开流之前等它落地，理由与 `message/send` 是同一个：这一行要读不回来，
-    // 流能给出的只有「这一行从没出现过」——而那与「提交被拒」是两件事，对端要等
-    // 满一个截止时间才能听到前者。拒了就当场报一帧，理由照实说。
-    if let Err(reason) = accept_goal(&state.orchestrator, &request.goal, goal_row).await {
-        tracing::error!(goal_id = %goal_id, reason = %reason, "a2a message/stream was not accepted");
-        let frame = sse_frame(&json!({
-            "jsonrpc": "2.0",
-            "id": request.rpc_id,
-            "error": {"code": -32603, "message": reason},
-        }));
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .header("x-accel-buffering", "no")
-            .body(Body::from(frame))
-            .unwrap_or_else(|_| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "stream_unavailable"})),
-                )
-                    .into_response()
-            });
+    // 存在的缺陷。重发的判据也与 `message/send` 同一个：这一行已经在，就订阅
+    // 它，不再分解一次。
+    let already = if request.message_id.is_some() {
+        GoalReader::goal(&state.orchestrator, &goal_id).await
+    } else {
+        None
+    };
+    if already.is_some() {
+        tracing::info!(goal_id = %goal_id, "a2a message/stream repeated a message already accepted");
+    } else {
+        let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
+        goal_row.workspace_id = None;
+        // 提交在开流之前等它落地，理由与 `message/send` 是同一个：这一行要读不回来，
+        // 流能给出的只有「这一行从没出现过」——而那与「提交被拒」是两件事，对端要等
+        // 满一个截止时间才能听到前者。拒了就当场报一帧，理由照实说。
+        if let Err(reason) = accept_goal(&state.orchestrator, &request.goal, goal_row).await {
+            // 同一个 `messageId` 的两份请求可以同时到：先到的插了行，后到的在批量
+            // 注入里被跳过。库里有这一行就照样订阅，不把一次已受理读成拒收。
+            let raced = request.message_id.is_some()
+                && GoalReader::goal(&state.orchestrator, &goal_id)
+                    .await
+                    .is_some();
+            if !raced {
+                tracing::error!(goal_id = %goal_id, reason = %reason, "a2a message/stream was not accepted");
+                let frame = sse_frame(&json!({
+                    "jsonrpc": "2.0",
+                    "id": request.rpc_id,
+                    "error": {"code": -32603, "message": reason},
+                }));
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header("x-accel-buffering", "no")
+                    .body(Body::from(frame))
+                    .unwrap_or_else(|_| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": "stream_unavailable"})),
+                        )
+                            .into_response()
+                    });
+            }
+            tracing::info!(goal_id = %goal_id, "a2a message/stream lost the race to the same message and subscribes to the row it found");
+        }
+        tracing::info!(goal_id = %goal_id, "a2a message/stream goal accepted");
     }
-    tracing::info!(goal_id = %goal_id, "a2a message/stream goal accepted");
 
     let stream = goal_stream(StreamState {
         reader: Arc::new(state.orchestrator.clone()),
@@ -1151,23 +1208,60 @@ async fn rpc_message_send(
     // 与 `POST /api/v1/tasks` 和 `message/stream` 走同一条受理路径：三条路各自
     // 写一遍提交逻辑，就会出现「经某一条路提的 goal 少了某个字段」这种只在一条
     // 路上存在的缺陷。
-    let goal_id = uuid::Uuid::new_v4().to_string();
+    let goal_id = goal_id_for(request.message_id.as_deref());
+    let orchestrator = state.orchestrator.clone();
+
+    // 重发先读、后提交：提交会经过分解，那是一次要花配额的上游调用——先读一行
+    // 比再分解一次便宜得多，而这一行在，就说明这条消息已经被受理过。
+    if request.message_id.is_some() {
+        if let Some(existing) = GoalReader::goal(&orchestrator, &goal_id).await {
+            tracing::info!(goal_id = %goal_id, "a2a message/send repeated a message already accepted");
+            return send_result(rpc_id, version, &orchestrator, &goal_id, existing, body).await;
+        }
+    }
+
     let mut goal_row = Task::goal_row(goal_id.clone(), &request.goal);
     goal_row.workspace_id = None;
-    let orchestrator = state.orchestrator.clone();
     // 回执读的是库里的那一行，不是本地构造的这一份：受理之后状态可能已经被派工
     // 改过，对端要的是它现在是什么样。
     let row = match accept_goal(&orchestrator, &request.goal, goal_row).await {
         Ok(row) => row,
-        Err(reason) => {
-            tracing::error!(goal_id = %goal_id, reason = %reason, "a2a message/send was not accepted");
-            return (StatusCode::OK, Json(rpc_error(rpc_id, -32603, reason))).into_response();
-        }
+        // 同一个 `messageId` 的两份请求可以同时到：两份都没读到行，先到的那份
+        // 把行插进去，后到的那份在批量注入里按 id 被跳过、回执里没有这个 id。
+        // 这不等于「没受理」——库里有这一行就是受理了，回它。
+        Err(reason) => match GoalReader::goal(&orchestrator, &goal_id).await {
+            Some(existing) if request.message_id.is_some() => {
+                tracing::info!(
+                    goal_id = %goal_id,
+                    "a2a message/send lost the race to the same message and answers the row it found"
+                );
+                return send_result(rpc_id, version, &orchestrator, &goal_id, existing, body).await;
+            }
+            _ => {
+                tracing::error!(goal_id = %goal_id, reason = %reason, "a2a message/send was not accepted");
+                return (StatusCode::OK, Json(rpc_error(rpc_id, -32603, reason))).into_response();
+            }
+        },
     };
     tracing::info!(goal_id = %goal_id, "a2a message/send goal accepted");
 
+    send_result(rpc_id, version, &orchestrator, &goal_id, row, body).await
+}
+
+/// 把一行任务按对端要的版本与形状答回去（必要时先等到终态）。
+///
+/// 受理成功与「这条消息已经受理过、直接答」两条路要答的是同一件事，所以收在
+/// 一处：两份写法迟早会有一份忘了按版本渲染，或者忘了读 `historyLength`。
+async fn send_result(
+    rpc_id: &Value,
+    version: A2aVersion,
+    orchestrator: &Arc<dyn OrchestratorControl>,
+    goal_id: &str,
+    row: Task,
+    body: &Value,
+) -> Response {
     let row = if blocks_until_done(body, version) {
-        wait_until_done(&orchestrator, &goal_id, &row).await
+        wait_until_done(orchestrator, goal_id, &row).await
     } else {
         row
     };
@@ -1972,6 +2066,37 @@ mod tests {
             requested_history(&json!({"params": {"id": "g", "historyLength": "3"}})),
             0,
             "a string is not a count"
+        );
+    }
+
+    /// 同一个 `messageId` 必须派生出同一个 goal id，否则「重发读到同一行」这条
+    /// 判据根本无从成立：id 每次都不一样，读的永远是空。
+    #[test]
+    fn the_same_message_id_always_derives_the_same_goal_id() {
+        let first = goal_id_for(Some("7c9e6679-7425-40de-944b-e07fc1f90ae7"));
+        let again = goal_id_for(Some("7c9e6679-7425-40de-944b-e07fc1f90ae7"));
+        assert_eq!(first, again);
+        assert_ne!(first, goal_id_for(Some("another-message")));
+        assert!(
+            first.starts_with("message-"),
+            "a derived id says where it came from: {first}"
+        );
+
+        // 没有幂等键的请求不是「所有无键请求都是同一条」，而是每次都是新的：
+        // 按文本之类的代理键合并，会把两个对端说的同一句话并成一个任务。
+        let anon = goal_id_for(None);
+        assert_ne!(anon, goal_id_for(None));
+        assert_eq!(anon.len(), 36, "still one id shape for a task row: {anon}");
+        let blank_a = goal_id_for(Some("   "));
+        let blank_b = goal_id_for(Some("   "));
+        assert_eq!(
+            blank_a.len(),
+            36,
+            "a blank messageId is no key at all: {blank_a}"
+        );
+        assert_ne!(
+            blank_a, blank_b,
+            "with no key every send is a new goal, not one shared one"
         );
     }
 

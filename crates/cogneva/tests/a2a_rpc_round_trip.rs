@@ -662,6 +662,56 @@ async fn the_endpoint_names_what_it_will_not_do() {
     );
 }
 
+/// A peer that times out and sends the same message again is asking about the
+/// same work, not for more of it. The `messageId` is the key that says so, and
+/// answering with a second task means the goal is decomposed, run and paid for
+/// twice while the peer holds two ids for one answer.
+#[tokio::test]
+async fn a_retry_carrying_the_same_message_id_answers_the_same_task() {
+    let state = router_state::stateless();
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "a2a-rpc-retry").await;
+
+    let send = |message_id: &str| {
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "message/send",
+            "params": {"message": {
+                "kind": "message",
+                "messageId": message_id,
+                "role": "user",
+                "parts": [{"kind": "text", "text": "probe goal"}]
+            }}
+        })
+    };
+
+    let first = post(&app, &token, send("retry-probe-1")).await;
+    let again = post(&app, &token, send("retry-probe-1")).await;
+    let other = post(&app, &token, send("retry-probe-2")).await;
+
+    let first_id = first["result"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the first send answers a task: {first}"));
+    assert_eq!(
+        again["result"]["id"], first["result"]["id"],
+        "the same messageId is the same task: {again}"
+    );
+    assert_ne!(
+        other["result"]["id"],
+        json!(first_id),
+        "a different message is a different task: {other}"
+    );
+
+    // The retry has to answer the row itself, not just the same id: a peer that
+    // retries after the task moved on reads whatever state it is in now.
+    let read = post(
+        &app,
+        &token,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": first_id}}),
+    )
+    .await;
+    assert_eq!(read["result"]["id"], json!(first_id), "{read}");
+}
+
 /// The card advertises `stateTransitionHistory`, so a peer that asks for the
 /// history has to get back the message that created the task -- and a peer that
 /// asks for nothing has to get no `history` key at all. An always-empty array is
@@ -864,12 +914,11 @@ async fn the_stream_carries_states_and_the_outcome_and_then_ends() {
         .as_str()
         .expect("the snapshot names the task the peer is following")
         .to_string();
-    assert_eq!(
+    assert!(
         first["result"]["artifacts"]
             .as_array()
             .map(|a| a.is_empty())
             .unwrap_or(false),
-        true,
         "an accepted goal has produced nothing yet; an artifact here would be a lie"
     );
 
