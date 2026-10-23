@@ -1,0 +1,293 @@
+# 自进化产出、版本契约与工作树索引那十条读数的单测夹具。
+#
+# self 一族守的是「进化循环有没有东西交出来」：
+#   - `yields_no_change` 把五种「没交出变更」的结局合起来数，界是六小时三次（> 2）；
+#     健康格里给 2 次，证明界不是「有一次就算」。
+#   - `submitted_nothing` 与 `rework_never_handed_off` 都是 `A unless B` 的形状：整体在动、
+#     而「交出」那一支没动。第二格是它们的静格（两半都在动），删掉 `unless` 那半就会响。
+#   - `yields_no_change` 的选择器是正则，健康格里让 `outcome="other"` 在涨，不算进账。
+#
+# version 一族三条都带新鲜度腿（观测时间戳一小时内），第三格把它的静格单独证一遍；
+# `judgement_stopped` 反过来是「六小时里一次都没跑」（`increase == 0`，比较运算保留左值 0，
+# 外层 `< 1` 才成立），所以健康格里计数必须在涨。
+#
+# worktree 一族三条的新鲜度门槛是**三小时**（索引重建要几十分钟，读数慢是正常的），
+# 所以「过期」那一格必须把时间戳钉到窗口起点都够不着的位置，不能只放到一小时前。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-self-version-worktree.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: self_evolution_yields_no_change
+# rule: self_evolution_has_no_change_sink
+# rule: self_evolution_submitted_nothing
+# rule: self_evolution_rework_never_handed_off
+# rule: version_contract_violated
+# rule: version_contract_unjudged
+# rule: version_contract_judgement_stopped
+# rule: worktree_tree_about_to_rebuild
+# rule: worktree_index_absent
+# rule: worktree_index_sample_incomplete
+
+evaluation_interval: 1m
+
+tests:
+  # 进化在交东西：没有一次「没产出」的结局、没有「没有出口」、退役为零（所以不用问返工交没交）；
+  # 版本契约没有违约、没有被搁置没判的、六小时里判过五次；
+  # 工作树索引在、缺的文件为零、抽样完整。十条全静。
+  - interval: 1h
+    input_series:
+      - series: 'self_evolution_change_yield_total{outcome="no_artifacts",job="evolution"}'
+        values: '0x26'
+      - series: 'self_evolution_change_yield_total{outcome="other",job="evolution"}'
+        values: '0x20 9x6'
+      - series: 'self_evolution_change_yield_total{outcome="submitted",job="evolution"}'
+        values: '0x20 4x6'
+      - series: 'self_evolution_change_yield_total{outcome="no_sink",job="evolution"}'
+        values: '0x26'
+      - series: 'cogneva_change_fate_total{fate="retired",job="evolution"}'
+        values: '0x26'
+      - series: 'self_evolution_change_rework_total{outcome="submitted",job="evolution"}'
+        values: '0x26'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: self_evolution_yields_no_change
+        exp_alerts: []
+      - eval_time: 26h
+        alertname: self_evolution_has_no_change_sink
+        exp_alerts: []
+      - eval_time: 26h
+        alertname: self_evolution_submitted_nothing
+        exp_alerts: []
+      - eval_time: 26h
+        alertname: self_evolution_rework_never_handed_off
+        exp_alerts: []
+
+  # 进化空转：六小时里三次「没产出」、一次「没有出口」、九次别的结局（不在选择器里）、
+  # 二十次产出但一次都没交出去、两次退役而没有一次返工交回。四条全亮。
+  - interval: 1h
+    input_series:
+      - series: 'self_evolution_change_yield_total{outcome="payload_missing",job="evolution"}'
+        values: '0x22 3x4'
+      - series: 'self_evolution_change_yield_total{outcome="other",job="evolution"}'
+        values: '0x20 9x6'
+      - series: 'self_evolution_change_yield_total{outcome="no_sink",job="evolution"}'
+        values: '0x25 1x1'
+      - series: 'self_evolution_change_yield_total{outcome="drafted",job="evolution"}'
+        values: '0x20 20x6'
+      - series: 'cogneva_change_fate_total{fate="retired",job="evolution"}'
+        values: '0x24 2x2'
+      - series: 'self_evolution_change_rework_total{outcome="submitted",job="evolution"}'
+        values: '0x26'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: self_evolution_yields_no_change
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outcome: payload_missing
+      - eval_time: 26h
+        alertname: self_evolution_has_no_change_sink
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outcome: no_sink
+      # `submitted_nothing` 的左半边**按结局分开**：`max without (pod, container, instance, job)`
+      # 没有把 `outcome` 算掉，所以「有产出、没交出」的每个结局各报一条。这是有意的
+      # ——summary 写着「the other cells say which way each run failed」，一条只报总数就把
+      # 失败方式丢掉了。所以这一格是四条，不是一条。
+      - eval_time: 26h
+        alertname: self_evolution_submitted_nothing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outcome: drafted
+          - exp_labels:
+              severity: warning
+              outcome: no_sink
+          - exp_labels:
+              severity: warning
+              outcome: other
+          - exp_labels:
+              severity: warning
+              outcome: payload_missing
+      - eval_time: 26h
+        alertname: self_evolution_rework_never_handed_off
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              fate: retired
+
+  # 六小时里只有两次「没产出」，界是「超过两次」：静。把 2.0 降到 1.9 这一格会响。
+  - interval: 1h
+    input_series:
+      - series: 'self_evolution_change_yield_total{outcome="no_artifacts",job="evolution"}'
+        values: '0x24 2x2'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: self_evolution_yields_no_change
+        exp_alerts: []
+
+  # 整体在动、也确实有交出去的：两条 `unless` 都该静。
+  # 删掉任一条 `unless` 那半，这一格会响对应的那条。
+  - interval: 1h
+    input_series:
+      - series: 'self_evolution_change_yield_total{outcome="drafted",job="evolution"}'
+        values: '0x20 20x6'
+      - series: 'self_evolution_change_yield_total{outcome="submitted",job="evolution"}'
+        values: '0x20 8x6'
+      - series: 'cogneva_change_fate_total{fate="retired",job="evolution"}'
+        values: '0x24 2x2'
+      - series: 'self_evolution_change_rework_total{outcome="submitted",job="evolution"}'
+        values: '0x22 1x4'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: self_evolution_submitted_nothing
+        exp_alerts: []
+      - eval_time: 26h
+        alertname: self_evolution_rework_never_handed_off
+        exp_alerts: []
+
+  # 版本契约安分：没有违约、没有搁置、六小时判过五次；
+  # 工作树索引在、缺的文件为零、抽样完整。六条全静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_version_contract_violations{clause="retention"}'
+        values: '0x60'
+      - series: 'cogneva_version_contract_violations_observed_timestamp_seconds{clause="retention"}'
+        values: '3500x60'
+      - series: 'cogneva_version_contract_unjudged{pod="p1",container="app",instance="i1"}'
+        values: '0x60'
+      - series: 'cogneva_version_contract_unjudged_observed_timestamp_seconds{pod="p1",container="app",instance="i1"}'
+        values: '3500x60'
+      - series: 'cogneva_version_contract_checks_total{job="versions"}'
+        values: '0x50 5x10'
+      - series: 'cogneva_worktree_index_missing_files{worktree="main"}'
+        values: '0x60'
+      - series: 'cogneva_worktree_index_missing_files_observed_timestamp_seconds{worktree="main"}'
+        values: '3500x60'
+      - series: 'cogneva_worktree_index_present{worktree="main"}'
+        values: '1x60'
+      - series: 'cogneva_worktree_index_present_observed_timestamp_seconds{worktree="main"}'
+        values: '3500x60'
+      - series: 'cogneva_worktree_index_sample_incomplete{worktree="main"}'
+        values: '0x60'
+      - series: 'cogneva_worktree_index_sample_incomplete_observed_timestamp_seconds{worktree="main"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: version_contract_violated
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: version_contract_unjudged
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: version_contract_judgement_stopped
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: worktree_tree_about_to_rebuild
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: worktree_index_absent
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: worktree_index_sample_incomplete
+        exp_alerts: []
+
+  # 都在说坏消息：`retention` 这条契约违约两次、有一份判据被搁置、六小时里一次都没判过；
+  # 工作树索引不见了（缺的文件 5 个、索引标记 0、抽样不完整）。六条全亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_version_contract_violations{clause="retention"}'
+        values: '2x60'
+      - series: 'cogneva_version_contract_violations_observed_timestamp_seconds{clause="retention"}'
+        values: '3500x60'
+      - series: 'cogneva_version_contract_unjudged{pod="p1",container="app",instance="i1"}'
+        values: '1x60'
+      - series: 'cogneva_version_contract_unjudged_observed_timestamp_seconds{pod="p1",container="app",instance="i1"}'
+        values: '3500x60'
+      - series: 'cogneva_version_contract_checks_total{job="versions"}'
+        values: '0x60'
+      - series: 'cogneva_worktree_index_missing_files{worktree="main"}'
+        values: '5x60'
+      - series: 'cogneva_worktree_index_missing_files_observed_timestamp_seconds{worktree="main"}'
+        values: '3500x60'
+      - series: 'cogneva_worktree_index_present{worktree="main"}'
+        values: '0x60'
+      - series: 'cogneva_worktree_index_present_observed_timestamp_seconds{worktree="main"}'
+        values: '3500x60'
+      - series: 'cogneva_worktree_index_sample_incomplete{worktree="main"}'
+        values: '3x60'
+      - series: 'cogneva_worktree_index_sample_incomplete_observed_timestamp_seconds{worktree="main"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: version_contract_violated
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              clause: retention
+      - eval_time: 60m
+        alertname: version_contract_unjudged
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: version_contract_judgement_stopped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: worktree_tree_about_to_rebuild
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              worktree: main
+      - eval_time: 60m
+        alertname: worktree_index_absent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              worktree: main
+      - eval_time: 60m
+        alertname: worktree_index_sample_incomplete
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              worktree: main
+
+  # 同样的坏消息，但四处读数的时间戳都停在四小时前（门槛是三小时）：现在什么状态不知道。
+  # 删掉新鲜度那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_version_contract_violations{clause="retention"}'
+        values: '2x240'
+      - series: 'cogneva_version_contract_violations_observed_timestamp_seconds{clause="retention"}'
+        values: '0x240'
+      - series: 'cogneva_worktree_index_missing_files{worktree="main"}'
+        values: '5x240'
+      - series: 'cogneva_worktree_index_missing_files_observed_timestamp_seconds{worktree="main"}'
+        values: '0x240'
+      - series: 'cogneva_worktree_index_present{worktree="main"}'
+        values: '0x240'
+      - series: 'cogneva_worktree_index_present_observed_timestamp_seconds{worktree="main"}'
+        values: '0x240'
+      - series: 'cogneva_worktree_index_sample_incomplete{worktree="main"}'
+        values: '3x240'
+      - series: 'cogneva_worktree_index_sample_incomplete_observed_timestamp_seconds{worktree="main"}'
+        values: '0x240'
+    alert_rule_test:
+      - eval_time: 240m
+        alertname: version_contract_violated
+        exp_alerts: []
+      - eval_time: 240m
+        alertname: worktree_tree_about_to_rebuild
+        exp_alerts: []
+      - eval_time: 240m
+        alertname: worktree_index_absent
+        exp_alerts: []
+      - eval_time: 240m
+        alertname: worktree_index_sample_incomplete
+        exp_alerts: []
