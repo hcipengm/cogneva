@@ -4221,6 +4221,7 @@ mod helm_delivery_single_writer_tests {
     /// 由 apply 链正常滚动的集群；把它读成"归 helm 管"，下一次元启动就会把集群翻到
     /// helm 路径——chart 渲染 `:local` 浮动签，抹掉落地读数依赖的 `main-<rev>` tag，
     /// 并在 20+ 个对象的字段所有权上立刻失败。谁把这条改回"存在即 helm"，这里变红。
+    /// principle: feedback_a_failed_release_does_not_authorize_helm_delivery
     #[test]
     fn a_failed_release_does_not_authorize_helm() {
         let live = br#"[{"name":"cogneva","namespace":"cogneva","revision":"2",

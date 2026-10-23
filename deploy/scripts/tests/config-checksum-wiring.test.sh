@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # principle: feedback_a_guard_that_nothing_asserts_can_be_deleted_in_silence
 # principle: feedback_a_new_rule_lands_in_three_places_and_the_render_freshness_gate_names_the_one_you_forgot
+# principle: feedback_a_config_only_revision_does_not_roll_the_running_process
 # check-config-checksum-wiring.sh 的定向测试。
 #
 # 这道门禁守的是一条**只在真升级里才现形**的接线：读同一份配置的工作负载必须带着
