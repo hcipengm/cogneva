@@ -706,6 +706,172 @@ async fn the_card_address_serves_the_stream_method_too() {
     );
 }
 
+/// A frame off the SSE body, split into its `event:` name and its `data:` JSON.
+///
+/// Reads exactly one frame at a time and leaves the rest in `buf`: the point of
+/// the test below is that frames arrive as the task moves, so consuming the
+/// whole body up front would hide exactly what is being measured.
+async fn read_frame(
+    body: &mut axum::body::BodyDataStream,
+    buf: &mut String,
+) -> Option<serde_json::Value> {
+    use futures::StreamExt;
+    loop {
+        if let Some(end) = buf.find("\n\n") {
+            let frame: String = buf.drain(..end + 2).collect();
+            let mut event = None;
+            let mut data = String::new();
+            for line in frame.trim_end().lines() {
+                if let Some(rest) = line.strip_prefix("event:") {
+                    event = Some(rest.trim().to_string());
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    data.push_str(rest.trim_start());
+                }
+            }
+            assert_eq!(
+                event.as_deref(),
+                Some("message"),
+                "every frame on this stream is a JSON-RPC message: {frame}"
+            );
+            return Some(
+                serde_json::from_str(&data)
+                    .unwrap_or_else(|e| panic!("the data line is JSON ({e}): {frame}")),
+            );
+        }
+        let next = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .expect("a frame has to arrive before the timeout");
+        let chunk = next?.expect("the body yields bytes");
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+    }
+}
+
+/// The stream says "where it is" and "what it made" in separate frames, and it
+/// ends when the row reaches a terminal state.
+///
+/// The rest of this file proves the *shape* of the stream response -- status
+/// 200, `text/event-stream`. That is the answer to "does the endpoint exist".
+/// What a streaming peer actually acts on is the frames: the snapshot that
+/// hands it the task id, the status updates it follows, the artifact frame that
+/// carries the outcome, and a stream that stops instead of hanging until the
+/// deadline. None of that is visible from the headers, so it is measured here
+/// against the same row the HTTP face reads: the test drives the orchestrator
+/// between frames exactly as a worker would.
+#[tokio::test]
+async fn the_stream_carries_states_and_the_outcome_and_then_ends() {
+    let state = router_state::stateless();
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "a2a-rpc-stream-frames").await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/protocol/a2a")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "message/stream",
+                "params": {"message": {"role": "user",
+                                       "parts": [{"kind": "text", "text": "probe frames"}]}},
+            })
+            .to_string(),
+        ))
+        .expect("the request is well formed");
+    let response = app.oneshot(request).await.expect("the router answers");
+    assert_eq!(response.status(), 200);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "the stream method has to answer with a stream here: {content_type}"
+    );
+
+    let mut body = response.into_body().into_data_stream();
+    let mut buf = String::new();
+
+    // 第一帧是整条任务快照：对端靠它拿到 id，后面每一帧都按这个 id 对上。
+    let first = read_frame(&mut body, &mut buf)
+        .await
+        .expect("an accepted stream speaks before it goes quiet");
+    assert_eq!(first["jsonrpc"], "2.0");
+    assert_eq!(first["id"], 11, "the JSON-RPC id comes back in every frame");
+    assert_eq!(first["result"]["kind"], "task");
+    assert_eq!(first["result"]["status"]["state"], "submitted");
+    let goal_id = first["result"]["id"]
+        .as_str()
+        .expect("the snapshot names the task the peer is following")
+        .to_string();
+    assert_eq!(
+        first["result"]["artifacts"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(false),
+        true,
+        "an accepted goal has produced nothing yet; an artifact here would be a lie"
+    );
+
+    // 让这一行动起来，与别的写者读的是同一行。
+    state
+        .orchestrator
+        .schedule_task(&goal_id)
+        .await
+        .expect("an accepted goal can be scheduled");
+    state
+        .orchestrator
+        .start_task(&goal_id)
+        .await
+        .expect("a scheduled goal can be started");
+
+    let working = read_frame(&mut body, &mut buf)
+        .await
+        .expect("a state change produces a frame");
+    assert_eq!(working["result"]["kind"], "status-update");
+    assert_eq!(working["result"]["taskId"], goal_id);
+    assert_eq!(working["result"]["status"]["state"], "working");
+    assert_eq!(working["result"]["final"], false);
+
+    state
+        .orchestrator
+        .complete_task(&goal_id, json!({"summary": "frames crossed the wire"}))
+        .await
+        .expect("a running goal can be completed");
+
+    // 终态先发产物、再发状态：一件是「做成了什么」，一件是「到哪一步了」。
+    let artifact = read_frame(&mut body, &mut buf)
+        .await
+        .expect("the outcome is a frame of its own");
+    assert_eq!(artifact["result"]["kind"], "artifact-update");
+    assert_eq!(artifact["result"]["taskId"], goal_id);
+    assert_eq!(artifact["result"]["artifact"]["artifactId"], "result");
+    assert_eq!(artifact["result"]["artifact"]["name"], "result");
+
+    let last = read_frame(&mut body, &mut buf)
+        .await
+        .expect("the terminal state is reported");
+    assert_eq!(last["result"]["kind"], "status-update");
+    assert_eq!(last["result"]["status"]["state"], "completed");
+    assert_eq!(
+        last["result"]["final"], true,
+        "a peer reads `final` to stop following; without it the stream has no end on its side"
+    );
+
+    // 终态之后流必须收：一直接到 deadline 的流，在对端看来与「还在跑」同形。
+    use futures::StreamExt;
+    let end = tokio::time::timeout(Duration::from_secs(5), body.next())
+        .await
+        .expect("the stream closes once the row is terminal");
+    assert!(
+        end.is_none(),
+        "the stream has to end after the terminal frame, not keep polling"
+    );
+}
+
 /// A peer can stop a task it started, and gets back the row as it stands after
 /// the stop -- not an acknowledgement it would have to re-read the task to
 /// interpret.
@@ -754,4 +920,197 @@ async fn a_peer_can_stop_a_task_it_started() {
         .as_str()
         .unwrap_or_default()
         .contains("no task 'no-such-task'"));
+}
+
+/// One HTTP round trip that declares the protocol version with the header the
+/// endpoint reads, returning the JSON-RPC body.
+async fn post_version(
+    app: &axum::Router,
+    token: &str,
+    version: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/protocol/a2a")
+        .header("Content-Type", "application/json")
+        .header("A2A-Version", version)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::from(body.to_string()))
+        .expect("the request is well formed");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("the router answers");
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the body comes back");
+    serde_json::from_slice(&bytes).expect("the endpoint answers JSON-RPC")
+}
+
+/// Watches for the goal row and finishes it after `delay`.
+///
+/// The delay is the whole trick: with it, "the request waited for the task" and
+/// "the request happened to read a row that was already finished" stop looking
+/// alike. A non-blocking answer cannot come back completed, because nothing has
+/// completed it yet when the answer leaves.
+async fn finish_the_goal_after(
+    orchestrator: Arc<dyn cog_core::OrchestratorControl>,
+    delay: Duration,
+    result: serde_json::Value,
+) {
+    let mut seen: Option<std::time::Instant> = None;
+    loop {
+        if let Some(task) = orchestrator
+            .get_all_tasks()
+            .await
+            .into_iter()
+            .find(|task| task.status == cog_core::TaskStatus::Pending)
+        {
+            let since = *seen.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= delay {
+                let _ = orchestrator.schedule_task(&task.id).await;
+                let _ = orchestrator.start_task(&task.id).await;
+                let _ = orchestrator.complete_task(&task.id, result.clone()).await;
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 1.0's `SendMessage` waits for the task unless the caller asked otherwise,
+/// and what it hands back is the finished row with its outcome.
+///
+/// This is not a style difference from 0.3: the same request promises different
+/// things in the two versions. 0.3's `message/send` answers "accepted"; 1.0's
+/// answers "done". A peer written to 1.0 takes the reply as the final answer, so
+/// a `submitted` row handed to it is read as success -- worse than an error,
+/// because nothing tells it to keep asking.
+#[tokio::test]
+async fn v10_send_waits_for_the_task_and_returns_its_outcome() {
+    let state = router_state::stateless();
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "a2a-v10-blocking").await;
+
+    let worker = tokio::spawn(finish_the_goal_after(
+        state.orchestrator.clone(),
+        Duration::from_millis(300),
+        json!({"summary": "finished while the peer waited"}),
+    ));
+
+    let answer = post_version(
+        &app,
+        &token,
+        "1.0",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "message/send",
+            "params": {"message": {"role": "user", "parts": [{"text": "v10 blocking probe"}]}},
+        }),
+    )
+    .await;
+    worker.await.expect("the worker finished the goal");
+
+    let task = &answer["result"]["task"];
+    assert_eq!(
+        task["status"]["state"], "TASK_STATE_COMPLETED",
+        "without `returnImmediately` a 1.0 SendMessage has to come back finished: {answer}"
+    );
+    let artifacts = task["artifacts"]
+        .as_array()
+        .expect("a finished task carries what it made");
+    assert!(
+        artifacts
+            .iter()
+            .any(|artifact| artifact["name"] == "result"),
+        "the peer lives in another process and can only act on the artifact: {answer}"
+    );
+}
+
+/// `configuration.returnImmediately: true` is the caller saying it will follow
+/// up with `tasks/get`, so the reply is the accepted row and it comes back at
+/// once -- not after the task has run.
+#[tokio::test]
+async fn v10_send_returns_the_accepted_row_when_the_caller_asks_to_not_wait() {
+    let state = router_state::stateless();
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "a2a-v10-immediate").await;
+
+    // Nothing finishes this goal for long enough that a waiting implementation
+    // could not possibly return the submitted row.
+    let worker = tokio::spawn(finish_the_goal_after(
+        state.orchestrator.clone(),
+        Duration::from_secs(5),
+        json!({"summary": "much later"}),
+    ));
+
+    let started = std::time::Instant::now();
+    let answer = post_version(
+        &app,
+        &token,
+        "1.0",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "message/send",
+            "params": {
+                "message": {"role": "user", "parts": [{"text": "v10 immediate probe"}]},
+                "configuration": {"returnImmediately": true},
+            },
+        }),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    worker.abort();
+
+    assert_eq!(
+        answer["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
+        "`returnImmediately` means the answer is the accepted row: {answer}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "asking not to wait and then waiting {elapsed:?} is the same as not honouring the flag"
+    );
+}
+
+/// 0.3 has no `returnImmediately`: its `message/send` has always meant "accepted
+/// and readable", and `tasks/get` is how the peer follows up.
+#[tokio::test]
+async fn v03_send_answers_the_accepted_row_and_does_not_wait() {
+    let state = router_state::stateless();
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "a2a-v03-no-wait").await;
+
+    let worker = tokio::spawn(finish_the_goal_after(
+        state.orchestrator.clone(),
+        Duration::from_secs(5),
+        json!({"summary": "much later"}),
+    ));
+
+    let started = std::time::Instant::now();
+    let answer = post_version(
+        &app,
+        &token,
+        "0.3",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 23,
+            "method": "message/send",
+            "params": {"message": {"role": "user", "kind": "message",
+                                   "parts": [{"kind": "text", "text": "v03 probe"}]}},
+        }),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    worker.abort();
+
+    assert_eq!(answer["result"]["kind"], "task");
+    assert_eq!(answer["result"]["status"]["state"], "submitted");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "0.3 never waits for the run: it waited {elapsed:?}"
+    );
 }
