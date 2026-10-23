@@ -835,3 +835,28 @@ spec:
           annotations:
             summary: "A2A 对端面有 {{ $value }} 格答得不是协议说的那样"
             description: "对端的重试逻辑建立在这些格子的答复上（错误码、版本协商、名片形状），改了它们等于改了对外契约，而对端不会来问。跑 `bash scripts/host/cogneva-a2a-conformance-reading.sh`（不带 `--prometheus`）逐个印出是哪几格、实得什么、期望什么；`a2a_conformance_cells` 是这一拍比了几格，没有分母的 0 说明不了什么。三种常见来源：网关路由改动带掉了某个方法、版本协商的优先级被调换、名片里的字段按某一版协议改了却漏了另一版。"
+
+    # A2A 发现面：平台外部的对端第一步是拿名片。这一面此前有一份「想要的时候跑一下」
+    # 的读数，判据写得再准，在读数面上也与「这一面没人看」同形——网关路由或鉴权层一动，
+    # 名片被挪回业务鉴权组这件事就没有任何一个数会变色，而对端连第一步都走不到。
+    #
+    # 只立一条，读 `a2a_reach_defect`：它是 0/1 判词，1 覆盖三种坏法（名片要凭证、
+    # 名片声明 jwt 而 RPC 收匿名调用方、服务不健康、或名片答了别的码）。三种坏法分得开
+    # 是在 key=value 档里点名的，不在这里各立一条：序列名一样、只是标签不同的话，
+    # 「哪一条在响」会变成读的人自己拼。三条探针的状态码与名片可缓存窗口是值不是判词，
+    # 读不读它们不改变这一条。
+    #
+    # 不另立「读不到」：读不到时这一面一条序列都不印，归 `CognevaHostReadingProducerUnreadable`。
+    - name: cogneva-a2a-discovery
+      rules:
+        # 十五分钟：这一面每拍打三条地址，2026-10-23 实测整趟不到 1 秒。抖动不会是
+        # 三次同向的；能连着十五分钟都判「外部对端走不通」的，才是路由或鉴权真的动了。
+        - alert: CognevaA2aDiscoveryClosed
+          expr: max(a2a_reach_defect) > 0
+          for: 15m
+          labels:
+            cogneva_io_managed: "true"
+            severity: warning
+          annotations:
+            summary: "外部对端走不通 A2A 的发现这一步（名片拿不到，或名片说的与业务面做的不一致）"
+            description: "跑 `bash scripts/host/cogneva-a2a-discovery-reach-reading.sh`（不带 `--prometheus`）点名是哪一种：`discovery-closed`＝名片要凭证（对端得先有凭证才知道该用什么凭证，闭环，修法是把名片挪回公开组）；`both-open`＝名片声明 jwt 而 RPC 收匿名调用方（声明与实现不符，不是更开放）；`broken-service`＝服务不健康（修服务，不是修路由）；`unexpected`＝名片答了 404/5xx 一类既非 2xx 也非 401/403 的码（路由没挂上或上游坏了）。`a2a_reach_http_status{probe=…}` 是三条探针各拿到的码，`a2a_reach_card_cacheable` 是另一件事（名片有没有给 max-age 窗口），它退化不会点燃这一条。"
