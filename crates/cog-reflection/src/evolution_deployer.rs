@@ -1,4 +1,5 @@
 //! principle: feedback_a_promise_shared_by_two_knobs_is_not_proven_by_a_test_on_one_of_them
+//! principle: feedback_a_gate_never_fired_because_its_input_has_no_producer
 //! Deployment stage of L2 self-evolution.
 //!
 //! Responsibilities:
@@ -415,8 +416,26 @@ impl EvolutionDeployer {
 /// that in the one form the rule forbids. A trailer added here would live in
 /// the history the release tag and every clone carry, where the only repair is
 /// a rewrite, which is why the check happens at the message and not later.
+///
+/// The landing trailer is the opposite case and is required. It is the only
+/// writer of the fact the change ledger reads back to answer "which commit
+/// delivered this row": the reader walks the log for [`cog_core::LANDING_TRAILER`]
+/// and records the first revision that names a handover id. Nothing else on the
+/// production path emits one -- only fixtures did -- so the account held a
+/// delivery column that could only ever be filled by hand. With the trailer
+/// absent the column reads as "never delivered" for every change the platform
+/// landed itself, which is indistinguishable from having landed none.
+///
+/// The id is safe to publish: it is the handover's own task id, a hash of the
+/// change identity, so it names nothing the reader did not already hold. The
+/// form is taken from the constant the reader matches on rather than written
+/// out here, because a second spelling of the same trailer would be a reader and
+/// a writer that agree today and are free to disagree later.
 fn self_evolution_commit_message(change_id: &str) -> String {
-    format!("feat(evolution): apply self-generated change {change_id}")
+    format!(
+        "feat(evolution): apply self-generated change {change_id}\n\n{}{change_id}",
+        cog_core::LANDING_TRAILER
+    )
 }
 
 #[cfg(test)]
@@ -496,6 +515,29 @@ mod tests {
                 "a self-generated commit must not carry {forbidden:?}: {message}"
             );
         }
+    }
+
+    /// The other half: the message must carry the landing trailer, because
+    /// nothing else on the production path writes one.
+    ///
+    /// Read the way the reading reads it -- a line whose trimmed text starts
+    /// with the trailer constant, taking the next whitespace-delimited token as
+    /// the id -- rather than substring-matching the id somewhere in the body.
+    /// A message that mentioned the id only inside the subject would pass a
+    /// substring check and still deliver nothing.
+    #[test]
+    fn a_self_generated_commit_names_the_change_it_lands() {
+        let message = self_evolution_commit_message("change-ledger-367c97da26b1a416-3f9a2b1c");
+        let named: Vec<&str> = message
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(cog_core::LANDING_TRAILER))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .collect();
+        assert_eq!(
+            named,
+            vec!["change-ledger-367c97da26b1a416-3f9a2b1c"],
+            "the change ledger finds a delivery only through this trailer: {message}"
+        );
     }
 
     #[test]
