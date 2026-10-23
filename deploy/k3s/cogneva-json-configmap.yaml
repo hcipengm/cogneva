@@ -576,7 +576,7 @@ data:
                 },
                 {
                   "name": "alert_bound_band_reaches_bound",
-                  "promql": "(cogneva_alert_bound_band_birth_max_bytes + cogneva_alert_bound_band_move_max_bytes) / cogneva_alert_bound_band_limit_bytes",
+                  "promql": "max by (namespace) ((cogneva_alert_bound_band_birth_max_bytes + cogneva_alert_bound_band_move_max_bytes) / cogneva_alert_bound_band_limit_bytes)",
                   "condition": {
                     "greater_than": 0.81
                   },
@@ -3128,4 +3128,3 @@ data:
             "max_issues_per_scan": 50
           }
         }
-
