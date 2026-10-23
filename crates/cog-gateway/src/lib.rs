@@ -3192,7 +3192,15 @@ async fn a2a_agent_card_handler(
             credentials: None,
         },
     };
-    (StatusCode::OK, Json(json!(card))).into_response()
+    let mut response = (StatusCode::OK, Json(json!(card))).into_response();
+    // 名片是只读的发现文档，对端会周期性重拉：短 TTL 让重复发现不必每次落到进程里
+    // 重算，又短到地址或能力变更几分钟内就能被看到。公开缓存是安全的——名片里没有
+    // 任何按调用方不同的内容，鉴权发生在它指名的业务端点上。
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("public, max-age=300"),
+    );
+    response
 }
 
 #[cfg(test)]

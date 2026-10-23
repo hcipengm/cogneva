@@ -278,6 +278,16 @@ async fn the_card_answers_a_peer_that_has_no_credential_yet() {
         200,
         "discovery cannot require the credential it is supposed to announce"
     );
+    // The card is a read-only discovery document that peers re-fetch; a short
+    // TTL keeps repeat discovery from recomputing it, and stays short enough
+    // that a changed address or capability shows up within minutes.
+    assert_eq!(
+        card.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("public, max-age=300"),
+        "the card must be cacheable for a short, declared window"
+    );
 
     let rpc = app
         .oneshot(
