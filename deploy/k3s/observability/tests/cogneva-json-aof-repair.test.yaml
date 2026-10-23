@@ -1,0 +1,150 @@
+# AOF 修复那六条读数的单测夹具。它们守的是「消息队列启动时丢没丢东西」，六条全都
+# 只有界、没有形状——把 `> 0` 写成 `>= 0`、或者把读数缺席写成零，没有任何结构门会红。
+#
+# 各自的静格就是那条腿存在的理由：
+#   - `aof_repair_gave_up_bytes`：丢过字节才响；一次干净的启动必须是零，不是缺席。
+#   - `aof_repair_untouched_torn_tail`：尾部脏数据留在别人拥有的文件里——**什么都还没坏**，
+#     它响的是「下次可能起不来」，所以零必须是零。
+#   - `aof_repair_suspected_interior_holes` / `aof_repair_unhandled_layout`：同理，只有
+#     正数才是发现。
+#   - `aof_repair_verdict_absent`：判词没发布才响；发布过（值 1）必须静。**序列缺席不会让它响**
+#     （`max` 对空集返回空），这是这一族里唯一「缺席＝静」的地方，另一条规则专门补它。
+#   - `aof_repair_reading_absent`：两边**数**出来的差，不是假设：跑着 aof-repair 初始化容器
+#     却没有任何修复读数 ⇒ 响；redis 缩到零副本 ⇒ 两边都是零 ⇒ 静（缩容不是故障）。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-aof-repair.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: aof_repair_gave_up_bytes
+# rule: aof_repair_untouched_torn_tail
+# rule: aof_repair_suspected_interior_holes
+# rule: aof_repair_unhandled_layout
+# rule: aof_repair_verdict_absent
+# rule: aof_repair_reading_absent
+
+evaluation_interval: 1m
+
+tests:
+  # 一次坏的启动：丢了 4096 字节、别人文件上有 512 字节没写、一个内部空洞、一个不认识的布局、
+  # 判词没发布、而 Pod 就在跑。六条同时亮——这就是「这次启动到底发生了什么」的全集。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_aof_repair_dropped_bytes'
+        values: '4096x10'
+      - series: 'cogneva_aof_repair_untouched_torn_tail_bytes'
+        values: '512x10'
+      - series: 'cogneva_aof_repair_suspected_interior_holes'
+        values: '1x10'
+      - series: 'cogneva_aof_repair_unhandled_layout'
+        values: '1x10'
+      - series: 'cogneva_aof_repair_verdict_published'
+        values: '0x10'
+      - series: 'kube_pod_init_container_info{namespace="cogneva",pod="redis-0",container="aof-repair"}'
+        values: '1x10'
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="redis-0",phase="Running"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: aof_repair_gave_up_bytes
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 5m
+        alertname: aof_repair_untouched_torn_tail
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 5m
+        alertname: aof_repair_suspected_interior_holes
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 5m
+        alertname: aof_repair_unhandled_layout
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 5m
+        alertname: aof_repair_verdict_absent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 5m
+        alertname: aof_repair_reading_absent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 一次干净的启动：六个数都是零、判词发布了、读数到了。六条全静——把任何一条的界写成
+  # `>= 0`，这一格会先红。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_aof_repair_dropped_bytes'
+        values: '0x10'
+      - series: 'cogneva_aof_repair_untouched_torn_tail_bytes'
+        values: '0x10'
+      - series: 'cogneva_aof_repair_suspected_interior_holes'
+        values: '0x10'
+      - series: 'cogneva_aof_repair_unhandled_layout'
+        values: '0x10'
+      - series: 'cogneva_aof_repair_verdict_published'
+        values: '1x10'
+      - series: 'cogneva_aof_repair_pass_timestamp_seconds'
+        values: '1000x10'
+      - series: 'kube_pod_init_container_info{namespace="cogneva",pod="redis-0",container="aof-repair"}'
+        values: '1x10'
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="redis-0",phase="Running"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: aof_repair_gave_up_bytes
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: aof_repair_untouched_torn_tail
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: aof_repair_suspected_interior_holes
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: aof_repair_unhandled_layout
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: aof_repair_verdict_absent
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: aof_repair_reading_absent
+        exp_alerts: []
+
+  # redis 缩到零副本：没有任何 Pod 在跑 aof-repair，也没有任何修复读数。两边都是零，
+  # 差是零。这一格守着 `reading_absent` 的「缩容不是故障」——把 Pod 那一侧省掉、
+  # 直接写 `count(读数) == 0`，缩容时它会永远亮着。
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="redis-gone",phase="Running"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: aof_repair_reading_absent
+        exp_alerts: []
+
+  # redis 是起来的（Pod 在跑），但这一次**什么都没发布**：判词缺席、读数也缺席。
+  # 只这一格不含 `verdict_published`（它缺席时 `max` 取空集，不响），所以亮的是
+  # `reading_absent` 一条——它补的正是「缺席不等于干净」这个洞。
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_init_container_info{namespace="cogneva",pod="redis-0",container="aof-repair"}'
+        values: '1x10'
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="redis-0",phase="Running"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: aof_repair_reading_absent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 5m
+        alertname: aof_repair_verdict_absent
+        exp_alerts: []

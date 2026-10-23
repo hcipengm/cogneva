@@ -1,0 +1,117 @@
+# agent inbox 那五条读数的单测夹具。它们守的是「发给某个 agent 的命令有没有落到地上」：
+# 卡住未投递、写坏进死信、问了没人答、孤儿流上还压着命令、以及孤儿盘点这一小时没人写。
+#
+# 各自的静格就是那条腿存在的理由：
+#   - 三条 `increase(...[1h])`：**计数器不动就不响**。写成 `>= 0` 或去掉窗口，一个健康的
+#     平台会每拍都亮，而亮的次数一多，读的人只会学会忽略它。
+#   - `agent_inbox_asks_unanswered` 只数 `outcome="timeout"`：同一窗口里被回答的提问再多
+#     也不归它问——这一格守着选择器，删掉它所有提问都会变成超时。
+#   - `agent_inbox_orphans_hold_commands` 是 `max` 不是 `sum`：每个进程都发布全量，
+#     求和会把同一个数乘上读者个数。零必须是零。
+#   - `agent_inbox_orphan_reading_missing`：**在**发布就静，一小时没有才响——孤儿盘点每十分钟
+#     走一次，这条守的是「走没走」，不是「有没有孤儿」。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-agent-inbox.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: agent_inbox_commands_stuck
+# rule: agent_inbox_payloads_poisoned
+# rule: agent_inbox_asks_unanswered
+# rule: agent_inbox_orphans_hold_commands
+# rule: agent_inbox_orphan_reading_missing
+
+evaluation_interval: 1m
+
+tests:
+  # 一小时里：两条命令卡住未投递、一个负载写坏进死信、三次提问超时（被回答的那些不算）、
+  # 两个孤儿流上还压着命令、孤儿盘点在写。前四条同时亮，第五条必须静。
+  - interval: 1m
+    input_series:
+      - series: 'agent_inbox_undelivered_total{kind="prompt"}'
+        values: '0x5 2x55'
+      - series: 'agent_inbox_poisoned_total'
+        values: '0x5 1x55'
+      - series: 'agent_inbox_ask_total{outcome="timeout"}'
+        values: '0x5 3x55'
+      - series: 'agent_inbox_ask_total{outcome="answered"}'
+        values: '0x5 9x55'
+      - series: 'agent_inbox_orphaned_entries'
+        values: '2x60'
+      - series: 'agent_inbox_orphaned_streams{state="holding"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: agent_inbox_commands_stuck
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: agent_inbox_payloads_poisoned
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: agent_inbox_asks_unanswered
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: agent_inbox_orphans_hold_commands
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: agent_inbox_orphan_reading_missing
+        exp_alerts: []
+
+  # 健康的一小时：三条计数器都在涨，但涨的是**被回答**的提问、**投递成功**的命令、
+  # 解析成功的负载；孤儿是零；盘点在写。五条全静。
+  - interval: 1m
+    input_series:
+      - series: 'agent_inbox_undelivered_total{kind="prompt"}'
+        values: '0x60'
+      - series: 'agent_inbox_delivered_total{kind="prompt"}'
+        values: '0x5 40x55'
+      - series: 'agent_inbox_poisoned_total'
+        values: '0x60'
+      - series: 'agent_inbox_ask_total{outcome="timeout"}'
+        values: '0x60'
+      - series: 'agent_inbox_ask_total{outcome="answered"}'
+        values: '0x5 12x55'
+      - series: 'agent_inbox_orphaned_entries'
+        values: '0x60'
+      - series: 'agent_inbox_orphaned_streams{state="consumed"}'
+        values: '3x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: agent_inbox_commands_stuck
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: agent_inbox_payloads_poisoned
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: agent_inbox_asks_unanswered
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: agent_inbox_orphans_hold_commands
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: agent_inbox_orphan_reading_missing
+        exp_alerts: []
+
+  # 孤儿盘点停了：最后一次发布在两分钟处，之后一小时没有新值。第六十三分钟问它，
+  # 过去一小时里一个样本都没有 ⇒ 响。这一格守着 `absent_over_time` 的窗口：把 `[1h]`
+  # 写成 `[0m]` 或去掉，停摆会被读成静。
+  - interval: 1m
+    input_series:
+      - series: 'agent_inbox_orphaned_streams{state="holding"}'
+        values: '1x2'
+    alert_rule_test:
+      - eval_time: 63m
+        alertname: agent_inbox_orphan_reading_missing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
