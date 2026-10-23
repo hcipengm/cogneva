@@ -1118,6 +1118,18 @@ const FOREIGN: &[(&str, &str)] = &[
         "cadvisor（kubelet 内置）。判内存余量读的是**不可回收**的那部分：工作集把可回收的页缓存算进分子，在这棵树上足以把每一个大容器都推到上限（app／沙箱／进化三族的 usage 峰值都在 0.9998–1.0000 of limit，而 rss 是 0.78／0.59／0.24–0.39），所以拿工作集当分子时「顶到上限」不携带信息。工作集名字本身仍在别的面板上被读，但**没有任何告警规则读它**，按 the_tables_hold_no_series_that_no_rule_reads 不能留在本表",
     ),
     (
+        "cogneva_alert_bound_band_birth_max_bytes",
+        "宿主读数 `scripts/host/cogneva-alert-bound-band-reading.sh`（不在本仓，登记行 `alert_bound_band`）：每一代应用 Pod **稳定之后**（跳过开头几个采样点）的 rss，取窗口里的最大值。它是「告警界脚下的那条带」的上沿——界是按「带上沿 ＋ 代内涨幅」定的，带往上漂而界不动，界就会开始把新常态报成压力。取稳定之后而不是第一次抓到的值：刚起的 Pod 第一次被采到时可能只有几 MiB，拿它当出生值会把代内涨幅读成整个进程那么大",
+    ),
+    (
+        "cogneva_alert_bound_band_move_max_bytes",
+        "同一生产者。代内涨幅（该代最大值 − 稳定后的出生值）在窗口里的最大值，即「同一代自己会走多远」，是界必须多留的余量。出生与涨幅分开公布而不是直接公布比值：分母换一档时这两个字节不变，比值要靠重算，而重算是另一件事",
+    ),
+    (
+        "cogneva_alert_bound_band_limit_bytes",
+        "同一生产者（这一拍从 `kube_pod_container_resource_limits` 读回来的声明上限）。它跟着读数一起走而不是由规则侧另配一份：分母与分子必须来自同一次回放、同一个容器，否则滚动重叠那几分钟会把比值读错一半（同命名空间里进化 Pod 的容器同名、上限 16Gi，选择器不钉死就会取到它）",
+    ),
+    (
         "container_memory_usage_bytes",
         "cadvisor（kubelet 内置）。cgroup 记的**整笔**占用：匿名页 + 页缓存 + slab。判「这个容器顶到上限了」读的是它，而判「顶到上限的到底是什么」要接着读 cache 那一半——两者相除才是那条规则的问题（可回收占多数时，rss 与工作集都不动）",
     ),
@@ -5817,4 +5829,48 @@ fn a_reading_published_by_every_replica_is_not_keyed_on_the_reporter() {
         "这些规则按上报它的 Pod 给告警实例分键，一件事会被拆成每个副本一行、每次滚动再开一对:\n{}",
         wrong.join("\n")
     );
+}
+
+/// 界与带共用一个常数：`alert_bound_band_reaches_bound` 用 0.81 判「占用带已经爬到界上」，
+/// `container_memory_near_limit` 用同一个 0.81 判「容器 rss 超过界」。它们是同一个数在两个
+/// 问题上的两个身份——分开改，前一个就不再回答「界该不该动」，而后者会在带已经压上来之后
+/// 继续把新常态报成压力（2026-10-23 的实测）。
+///
+/// 两向：任何一边单独改，这条测试红。这是这一对常数唯一的锁；带的生产者不在本仓，
+/// 它读的是哪三条序列由 `FOREIGN` 那几行点名，形状由本测试第二段兜——分子少了涨幅，
+/// 或者分母换成了别的量，这条规则读的就不是那条带了。
+#[test]
+fn the_bound_under_the_band_is_the_same_number_as_the_bound_above_it() {
+    let chart = chart_json();
+    let rules = chart["observability"]["infra_watch"]["rules"]
+        .as_array()
+        .expect("observability.infra_watch.rules is not an array");
+    let find = |name: &str| -> &serde_json::Value {
+        rules
+            .iter()
+            .find(|rule| rule["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("{name} 不在规则表里"))
+    };
+    let band = find("alert_bound_band_reaches_bound");
+    let container = find("container_memory_near_limit");
+    let band_bound = band["condition"]["greater_than"]
+        .as_f64()
+        .expect("alert_bound_band_reaches_bound 的界不是数");
+    let container_bound = container["condition"]["greater_than"]
+        .as_f64()
+        .expect("container_memory_near_limit 的界不是数");
+    assert_eq!(
+        band_bound, container_bound,
+        "带与界必须是同一个常数：band={band_bound} container={container_bound}"
+    );
+
+    let expr = band["promql"].as_str().expect("表达式不是字符串");
+    for series in [
+        "cogneva_alert_bound_band_birth_max_bytes",
+        "cogneva_alert_bound_band_move_max_bytes",
+        "cogneva_alert_bound_band_limit_bytes",
+    ] {
+        assert!(expr.contains(series), "表达式里缺 {series}：{expr}");
+    }
+    assert!(expr.contains(") / "), "必须除以声明上限：{expr}");
 }
