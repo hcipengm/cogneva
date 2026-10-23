@@ -170,6 +170,67 @@ async fn connect(client: &redis::Client) -> SFResult<ConnectionManager> {
         .map_err(|e| SFError::Redis(e.to_string()))
 }
 
+/// Create a stream's consumer group, tolerating the group already being there.
+///
+/// `$` rather than `0`: this makes the same claim the startup path makes — begin
+/// where the stream is now. An empty stream answers both the same way, and a
+/// stream that still holds entries is one this process already consumed from, so
+/// reading it from the start again would deliver work it has already handled.
+async fn ensure_stream_group(
+    conn: &mut ConnectionManager,
+    stream: &str,
+    group: &str,
+) -> SFResult<()> {
+    let result: Result<(), RedisError> = redis::cmd("XGROUP")
+        .arg("CREATE")
+        .arg(stream)
+        .arg(group)
+        .arg("$")
+        .arg("MKSTREAM")
+        .query_async(conn)
+        .await;
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if e.code() == Some("BUSYGROUP") => {
+            // Group already exists from a previous pod/session; treat as
+            // idempotent success so consumers can resume from the last
+            // acknowledged ID instead of exiting.
+            Ok(())
+        }
+        Err(e) => Err(SFError::Redis(e.to_string())),
+    }
+}
+
+/// Put the group back when a read says it is gone, and answer what the read was.
+///
+/// A group can disappear under a live consumer — the server restarted without
+/// the stream key, or someone deleted it — and `XREADGROUP` then answers
+/// `NOGROUP` to every attempt for as long as the process runs: nothing else
+/// recreates a group, and the read loop's backoff only spaces the failures out.
+/// Creating it again is the same idempotent call `subscribe` makes before the
+/// first read, so the loop makes it itself and resumes.
+///
+/// Nothing else about a refused read changes. The caller still counts it — the
+/// recovery says the next read will not be refused for this reason, not that
+/// this one was not — and every other refusal is left alone, because a
+/// transport or server error is the connection's problem and recreating a group
+/// over it would be a guess at somebody else's state.
+async fn recover_refused_read<F, Fut>(refusal: ReadRefusal, recreate: F) -> ReadRefusal
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = SFResult<()>>,
+{
+    if refusal == ReadRefusal::NoGroup {
+        if let Err(e) = recreate().await {
+            tracing::warn!(
+                error = %e,
+                "could not create the consumer group after a NOGROUP read; the next read will be refused again"
+            );
+        }
+    }
+    refusal
+}
+
 #[async_trait]
 impl MessageBackend for RedisMessageBackend {
     async fn payload_limit(&self, _subject: &str) -> SFResult<Option<usize>> {
@@ -268,11 +329,16 @@ impl MessageBackend for RedisMessageBackend {
                                 backoff = 0;
                             }
                             Err(e) => {
-                                guard.note_failure(read_refusal(&e));
+                                let refusal = read_refusal(&e);
+                                guard.note_failure(refusal);
                                 tracing::warn!(
                                     stream = %subject,
                                     "XREADGROUP failed, retrying with backoff: {e}"
                                 );
+                                recover_refused_read(refusal, || {
+                                    ensure_stream_group(&mut conn, &subject, &group)
+                                })
+                                .await;
                                 backoff = sleep_backoff(backoff).await;
                             }
                         }
@@ -361,11 +427,16 @@ impl MessageBackend for RedisMessageBackend {
                                 backoff = 0;
                             }
                             Err(e) => {
-                                guard.note_failure(read_refusal(&e));
+                                let refusal = read_refusal(&e);
+                                guard.note_failure(refusal);
                                 tracing::warn!(
                                     stream = %subject,
                                     "XREADGROUP failed, retrying with backoff: {e}"
                                 );
+                                recover_refused_read(refusal, || {
+                                    ensure_stream_group(&mut conn, &subject, &group)
+                                })
+                                .await;
                                 backoff = sleep_backoff(backoff).await;
                             }
                         }
@@ -378,24 +449,8 @@ impl MessageBackend for RedisMessageBackend {
     }
 
     async fn create_consumer_group(&self, stream: &str, group: &str) -> SFResult<()> {
-        let result: Result<(), RedisError> = redis::cmd("XGROUP")
-            .arg("CREATE")
-            .arg(stream)
-            .arg(group)
-            .arg("$")
-            .arg("MKSTREAM")
-            .query_async(&mut self.connection.clone())
-            .await;
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) if e.code() == Some("BUSYGROUP") => {
-                // Group already exists from a previous pod/session; treat as
-                // idempotent success so consumers can resume from the last
-                // acknowledged ID instead of exiting.
-                Ok(())
-            }
-            Err(e) => Err(SFError::Redis(e.to_string())),
-        }
+        let mut conn = self.connection.clone();
+        ensure_stream_group(&mut conn, stream, group).await
     }
 
     async fn ack(&self, stream: &str, group: &str, ids: &[String]) -> SFResult<()> {
@@ -1318,6 +1373,207 @@ mod tests {
             ReadRefusal::NoGroup,
             "only the server's NOGROUP goes under that label, and this one is \
              {e:?}"
+        );
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+    }
+
+    /// A refused read is fixed by the loop that saw it, and only one kind is.
+    ///
+    /// `NOGROUP` is answered to every read after a group disappears, so nothing
+    /// but a create ends it: the loop has to make that create itself. Every
+    /// other refusal is the connection's or the server's, and creating a group
+    /// over it would be a guess at somebody else's state.
+    ///
+    /// The refusal comes back either way: the recovery says the next read will
+    /// not be refused for this reason, not that this one was not.
+    #[tokio::test]
+    async fn only_a_missing_group_is_put_back() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let other = Arc::clone(&calls);
+        let refusal = recover_refused_read(ReadRefusal::Other, || async move {
+            other.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert_eq!(refusal, ReadRefusal::Other);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a transport failure is not a missing group"
+        );
+
+        let missing = Arc::clone(&calls);
+        let refusal = recover_refused_read(ReadRefusal::NoGroup, || async move {
+            missing.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert_eq!(
+            refusal,
+            ReadRefusal::NoGroup,
+            "the refusal still belongs in the counter"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The create is its own round trip and can fail: a server that went away
+    /// between the read and the create must leave the loop counting and
+    /// retrying rather than panicking or forgetting the refusal.
+    #[tokio::test]
+    async fn a_create_that_fails_leaves_the_refusal_counted() {
+        let refusal = recover_refused_read(ReadRefusal::NoGroup, || async {
+            Err(SFError::Redis("connection refused".into()))
+        })
+        .await;
+        assert_eq!(refusal, ReadRefusal::NoGroup);
+    }
+
+    /// The recovery against a live server, because the question is whether the
+    /// server accepts the create the loop makes — a group deleted together with
+    /// its stream key is exactly the shape a redis restart leaves behind.
+    #[tokio::test]
+    async fn a_group_lost_with_its_stream_is_put_back_by_the_recovery() {
+        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stream = format!("cog-test:lost-group-{suffix}");
+        let group = format!("lost-{suffix}");
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+
+        let backend = RedisMessageBackend::new(&redis_url).await.unwrap();
+        let mut conn = backend.connection.clone();
+        backend
+            .create_consumer_group(&stream, &group)
+            .await
+            .unwrap();
+
+        // The key goes away and the group goes with it.
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+        let e = group_read(&mut conn, &stream, &group, ">", 0)
+            .await
+            .expect_err("a group that went with its stream is gone");
+        assert_eq!(read_refusal(&e), ReadRefusal::NoGroup, "{e}");
+
+        let refusal = recover_refused_read(read_refusal(&e), || {
+            ensure_stream_group(&mut conn, &stream, &group)
+        })
+        .await;
+        assert_eq!(refusal, ReadRefusal::NoGroup);
+
+        // Answered, not refused: an empty stream under a live group is nil.
+        // A short block rather than 0, which the server reads as "block for
+        // ever" rather than "do not block".
+        group_read(&mut conn, &stream, &group, ">", 100)
+            .await
+            .expect("the group is back");
+
+        // And it delivers what is published after the loss, which is the point
+        // of putting it back rather than waiting for the pod to be replaced.
+        backend.publish(&stream, b"after-the-loss").await.unwrap();
+        let item = group_read(&mut conn, &stream, &group, ">", 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            item.map(|(_, payload)| payload),
+            Some(b"after-the-loss".to_vec())
+        );
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+    }
+
+    /// The loop itself, not the helper: a group that disappears under a live
+    /// consumer has to come back without the pod being replaced.
+    ///
+    /// Nothing else recreates a group, so a loop that only backs off answers
+    /// `NOGROUP` for the rest of its life while the producers keep publishing
+    /// into a stream nobody is reading — the state the cluster was found in
+    /// after redis restarted under it. The messages go out in a loop because
+    /// the create begins at the stream's tail: the one this test can claim is
+    /// the one published after the loop put the group back, and when that
+    /// happens depends on the loop's own block period and backoff. A loop that
+    /// never recovers delivers none of them.
+    #[tokio::test]
+    async fn a_live_loop_recovers_the_group_it_lost() {
+        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stream = format!("cog-test:loop-recovery-{suffix}");
+        let group = format!("loop-{suffix}");
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+
+        let backend = RedisMessageBackend::new(&redis_url).await.unwrap();
+        let mut sub = backend.subscribe(&stream, &group).await.unwrap();
+
+        // Let the loop take its first read before the key is taken away, so the
+        // loss lands on a consumer that is already reading rather than on one
+        // that has not started.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next()).await;
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+
+        let mut delivered = None;
+        for _ in 0..60 {
+            backend.publish(&stream, b"after-the-loss").await.unwrap();
+            if let Ok(Some(Ok((_, payload)))) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), sub.next()).await
+            {
+                delivered = Some(payload);
+                break;
+            }
+        }
+        assert_eq!(
+            delivered,
+            Some(b"after-the-loss".to_vec()),
+            "the consumer never came back: its group is gone and nothing put it back"
         );
 
         let _: i64 = redis::cmd("DEL")
