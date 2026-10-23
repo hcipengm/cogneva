@@ -1,0 +1,103 @@
+# 三条各自守着一个「数到头了」的读数：容器被 OOM 杀过、重启次数在涨、样本日志已经顶到
+# 容量上限。它们的共同点是**只有界、没有形状**——没有一条结构门会因为界写错而红。
+#
+# 后两条各有一条时间腿，静格就是那条腿的理由：
+#   - `pod_restarting_repeatedly`：六小时里重启过三次以上，还要求**这条计数是新的**。
+#     一个早就不存在的 Pod 的重启次数不该在几天后被翻出来报一次。
+#   - `metrics_log_at_floor_capacity`：顶到容量了，还要求**这条读数是新的**。写者停摆时
+#     最后一拍的值会一直挂着，那是写者不在，不是容量到头。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-pod-and-sample-limits.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: pod_oom_killed
+# rule: pod_restarting_repeatedly
+# rule: metrics_log_at_floor_capacity
+
+evaluation_interval: 1m
+
+tests:
+  # 一个容器被 OOM 杀过、一个六小时内重启了三次且计数是新的、样本日志顶到容量且这一拍是新的。
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_last_terminated_reason{namespace="cogneva",pod="killed",container="app",reason="OOMKilled"}'
+        values: '1x20'
+      - series: 'kube_pod_container_status_restarts_total{namespace="cogneva",pod="flappy",container="app"}'
+        values: '0x3 1x3 2x3 3x11'
+      - series: 'metrics_samples_over_capacity'
+        values: '1x20'
+      - series: 'metrics_samples_over_capacity_observed_timestamp_seconds'
+        values: '1000x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: pod_oom_killed
+        exp_alerts:
+          - exp_labels:
+              # OOM 是 critical：容器已经被杀过一次，下一次可能就是服务断。
+              severity: critical
+              namespace: cogneva
+              pod: killed
+              container: app
+              reason: OOMKilled
+      - eval_time: 20m
+        alertname: pod_restarting_repeatedly
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+              pod: flappy
+              container: app
+      - eval_time: 20m
+        alertname: metrics_log_at_floor_capacity
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 同一个容器、同样的终止次数，但原因是 `Error` 而不是 OOM：不归这条规则问。
+  # 选择器上的 `reason="OOMKilled"` 就是「只报这一种死法」，删掉它会让所有终止都变成 OOM。
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_last_terminated_reason{namespace="cogneva",pod="crashed",container="app",reason="Error"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: pod_oom_killed
+        exp_alerts: []
+
+  # 六小时内确实重启了三次（`changes` 数到 3），但计数停在九分钟前：这条读数已经没人写了。
+  # 时间腿在这里起作用——删掉它，一个早已消失的 Pod 会在它最后一次重启后的六小时里
+  # 一直被报。
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{namespace="cogneva",pod="gone",container="app"}'
+        values: '0x3 1x3 2x3 3x3'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: pod_restarting_repeatedly
+        exp_alerts: []
+
+  # 样本日志顶到容量，但这条读数停在四十多分钟前：写者不在，不是容量到头。
+  - interval: 1m
+    input_series:
+      - series: 'metrics_samples_over_capacity'
+        values: '1x40'
+      - series: 'metrics_samples_over_capacity_observed_timestamp_seconds'
+        values: '500x40'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: metrics_log_at_floor_capacity
+        exp_alerts: []
+
+  # 六小时内只重启过两次：没到「反复重启」。这一格守的是 `> 2` 那个界，
+  # 写成 `>= 1` 时它会先红。
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{namespace="cogneva",pod="twice",container="app"}'
+        values: '0x5 1x5 2x10'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: pod_restarting_repeatedly
+        exp_alerts: []
