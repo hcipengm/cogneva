@@ -986,3 +986,49 @@ spec:
           annotations:
             summary: "上游 A2A 一致性套件判名片不合规（这套判据不是我们自己写的）"
             description: "跑 `bash scripts/host/cogneva-a2a-tck-reading.sh`（不带 `--prometheus`）看判词与第一条失败用例：`a2a_tck_card_status` 不是 200 说明名片这一条规范要求就没满足（401/403 是名片不公开，404/405 是没这条路由），否则看 `a2a_tck_first` 点名的用例。`a2a_tck_passed` 是同一次跑通过的条数——它掉了又没失败，说明套件本身缩小了覆盖面，而不是平台变好了。套件读的是 `COGNEVA_A2A_TCK_DIR` 指向的那份检出；升级套件等于换尺子，换完要么全绿，要么新红的就是真缺口。"
+
+    # 宿主读数里那三条**判词**此前没有任何规则读它们：生产者每拍都在发，而
+    # `CognevaVerdictSeriesUnread` 数的正是这个（2026-10-23 实测 unread=3、ceiling=0）。
+    # 一条判词没人读，与「这一面压根没写生产者」在读数面上逐字同形——都是一条决定也不
+    # 产生。补读者的方向是给每条判词一条规则，不是把界线调松。
+    #
+    # 三条的界都照抄生产者自己那一行（`scripts/data/host-readings.tsv` 与脚本开头），
+    # 不在这里另立一套数：读数说绿、告警说红的两套界，读的人只会去改自己看得见的那份。
+    #
+    # `for:` 取的是「多慢才算数」：快车道判的是中位数，一次尖峰不该点着它；产品面占比
+    # 是周尺度的量，一小时内的抖动不是「这周没做产品」；记忆预算是事前读数，积起来才
+    # 说明这一周的记忆产出压过了产品产出。
+    - name: cogneva-host-verdict-readers
+      rules:
+        - alert: CognevaCommitFastLaneSlow
+          expr: commit_fast_lane_seconds > 60
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "变更管理"
+            severity: warning
+          annotations:
+            summary: "提交快车道端到端中位数 {{ $value }} 秒，界是 60 秒"
+            description: "跑 `bash scripts/host/cogneva-commit-lane-reading.sh` 看两格：`commit_fast_lane_seconds` 与 `commit_fast_lane_hold_seconds`。只端到端超界、持槽没超，是它在排队（槽数与并发）；两格一起超，是快车道里的门本身慢了。分母看 `commit_fast_lane_samples`——样本个位数时中位数没什么可判的。"
+
+        - alert: CognevaProductCommitShareLow
+          expr: product_commit_share < 0.5
+          for: 1h
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "变更管理"
+            severity: warning
+          annotations:
+            summary: "近 7 天产品面提交占比 {{ $value }}，界是 0.50"
+            description: "跑 `bash scripts/host/cogneva-product-commit-share-reading.sh`：分母 `product_commit_total` 是窗口内非 merge 提交数，分子 `product_commit_count` 是其中推进了 `crates/`（`crates/cog-observability/` 以外）的。分子为零而分母不小，说明这一周的提交都在刻度与门禁上；分母也小，说明这一周本来就没提交几笔，先看那一格再谈占比。"
+
+        - alert: CognevaMemoryBudgetOver
+          expr: brain_budget_remaining < 0
+          for: 15m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "原则管理"
+            severity: warning
+          annotations:
+            summary: "本周记忆产出超过产品产出 {{ $value }} 篇"
+            description: "跑 `bash scripts/host/cogneva-brain-budget-reading.sh` 看三格：`brain_memory_new_7d`、`brain_budget_product_commits`、`brain_budget_product_share`。这条是唯一**事前**判的一格——`UserPromptSubmit` 钩子把缓存卡印在回合开头，余量为负时这一轮不新建记忆文件，要记的教训写进当天流水或写成门测试。判的是「多开文件」，改既有篇不收费。"
