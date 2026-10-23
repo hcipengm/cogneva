@@ -464,13 +464,26 @@ const MIRROR_SOURCE_FACE: &str = "可观测与告警";
 /// What the mirror remembers between ticks.
 #[derive(Default)]
 struct MirrorState {
-    /// Dedup keys believed firing, filled from what Prometheus reported. Not
-    /// adopted from the store on restart: the first successful read lists
-    /// everything Prometheus is firing, and `set_alert` on a row that already
-    /// exists reports a repeat rather than a transition, so nothing is
-    /// duplicated or re-announced.
-    firing: HashSet<String>,
+    /// Consecutive failed reads, for the self-alert's threshold. The keys the
+    /// mirror believes firing are deliberately *not* remembered here: the
+    /// store holds them, and a memory that resets with the process is what
+    /// stranded the rows opened before the restart.
     failure_streak: u32,
+}
+
+/// Mirror-owned rows Prometheus is no longer firing.
+///
+/// `open` comes from the store, `seen` from this pass's read. The subtraction
+/// is the whole rule, and it is a rule about rows rather than about memory:
+/// a row opened by a previous process, a row whose close write failed, and a
+/// row whose identity moved because the rule's expression gained or lost a
+/// label are each unobserved without being closed, and only the store still
+/// lists all three.
+fn mirror_orphans(open: &[String], seen: &HashSet<String>) -> Vec<String> {
+    open.iter()
+        .filter(|key| !seen.contains(*key))
+        .cloned()
+        .collect()
 }
 
 /// One alert Prometheus evaluated and is currently firing, reduced to what a
@@ -696,13 +709,29 @@ async fn mirror_prometheus_alerts(
     for alert in &alerts {
         let key = alert.key();
         seen.insert(key.clone());
-        state.firing.insert(key.clone());
         mirror_report(alert, &key, outlets).await;
     }
-    let gone: Vec<String> = state.firing.difference(&seen).cloned().collect();
-    for key in gone {
-        let closed = resolve_from(&key, outlets, MIRROR_SOURCE).await;
-        settle_close(&mut state.firing, &key, closed);
+    // What to close is asked of the store, not of this process's memory: the
+    // row outlives the writer that opened it. An in-memory set is empty after
+    // a restart, and it is also blind to a failed close write and to a rule
+    // whose identity labels moved -- in all three the store holds an open row
+    // that memory has no entry for, so a memory-driven diff closes nothing and
+    // the row keeps counting as an alert that is still happening.
+    let open = match &outlets.store {
+        Some(store) => match store.firing_keys_from_source(MIRROR_SOURCE).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                // A store that did not answer is not a store that said
+                // "nothing is open": resolving on this tick would turn one
+                // read error into every mirrored alert reporting recovery.
+                warn!(error = %e, "infra watch: alert mirror could not read its open rows");
+                return;
+            }
+        },
+        None => Vec::new(),
+    };
+    for key in mirror_orphans(&open, &seen) {
+        resolve_from(&key, outlets, MIRROR_SOURCE).await;
     }
 }
 
@@ -2292,6 +2321,43 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
         }
+    }
+
+    /// 镜像要关掉的行由**表**决定，不由本进程记得什么决定。
+    ///
+    /// 2026-10-23 实测：表里六行镜像告警开着，`last_seen_at` 冻在同一秒，而
+    /// Prometheus 早已不再报它们——它们各自的规则表达式换了聚合方式，标签集变了，
+    /// 于是新身份写出一行新的，旧身份那行留在 `state='firing'`。镜像当时拿
+    /// `state.firing`（内存里的 HashSet，重启即空、失败一次即丢）去减这一拍看见的键，
+    /// 减出来的是空集：**它只关得掉自己还记得的那些行，而需要关的恰恰是它不记得的**。
+    ///
+    /// 所以判据的输入换成 store：`open` 是表里还开着的、带本生产者 source 标签的键。
+    /// 下面钉住三种「记得就关不掉」的形状：另一进程开的行、这一拍没看见的行、
+    /// 以及这一拍看见了别的行时不该被误关的行。
+    #[test]
+    fn mirror_closes_rows_the_store_holds_that_this_pass_did_not_see() {
+        let seen: HashSet<String> = ["CognevaAlertUnattended:".to_string()]
+            .into_iter()
+            .collect();
+        let open = vec![
+            // 本进程这一拍确实看见了它——不许关。
+            "CognevaAlertUnattended:".to_string(),
+            // 上一进程开的、身份带面标签的旧行：本进程从没见过这个键。
+            "CognevaAlertUnattended:cogneva_io_face=可观测与告警".to_string(),
+            "CognevaAcceptanceSpecStale:verdict=stale,instance=cogneva".to_string(),
+        ];
+        let mut orphans = mirror_orphans(&open, &seen);
+        orphans.sort_unstable();
+        assert_eq!(
+            orphans,
+            vec![
+                "CognevaAcceptanceSpecStale:verdict=stale,instance=cogneva",
+                "CognevaAlertUnattended:cogneva_io_face=可观测与告警",
+            ]
+        );
+
+        // 表里一行都没开着：无事可做，不是错误，也不该凭空发出解析通知。
+        assert!(mirror_orphans(&[], &seen).is_empty());
     }
 
     /// 停用一条规则要把它**所有**开着的行都结算掉，而不只是第一条。

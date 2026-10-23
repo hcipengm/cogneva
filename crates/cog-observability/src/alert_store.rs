@@ -400,6 +400,30 @@ impl PostgresAlertStore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Dedup keys of the firing rows one producer owns, in no particular order.
+    ///
+    /// Asked of the store rather than remembered in the process because the
+    /// process is not the owner of the answer: a row outlives the writer that
+    /// opened it, so a restart, a failed close, or a rule whose label set moved
+    /// all leave rows that no in-memory set recalls. A writer that reconciles
+    /// against its own memory therefore closes only what it still remembers,
+    /// which is exactly the rows that needed no help.
+    ///
+    /// No limit: the caller is deciding what to close by subtracting what it
+    /// just observed, and a truncated list reads as "the rest are not mine" --
+    /// every row past the cut would be silently skipped, forever, because the
+    /// next pass reads the same truncated list.
+    pub async fn firing_keys_from_source(&self, source: &str) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT dedup_key FROM alerts \
+             WHERE state = 'firing' AND labels->>'source' = $1",
+        )
+        .bind(source)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|row| row.get("dedup_key")).collect())
+    }
+
     /// Alerts currently in the `firing` state, newest first.
     pub async fn list_active(&self, limit: i64) -> anyhow::Result<Vec<AlertRecord>> {
         let rows = sqlx::query(

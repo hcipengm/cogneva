@@ -407,6 +407,20 @@ jobs:
         run: cargo test -p cog-observability --test alert_schema -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The alert mirror decides what to close by subtracting the keys it just
+      # read from the rows the store says it owns. Both ends are server
+      # answers: ownership is a JSONB label lookup, and "still firing" is a
+      # state column. A lookup that matched nothing would make the subtraction
+      # empty and the mirror would report a clean reconciliation every tick
+      # while every row it opened stayed firing -- the shape measured on
+      # 2026-10-23, six rows frozen at one second. The other half of the
+      # reading is that rows of other producers and resolved rows are *not*
+      # returned, because returning them would have the mirror announce
+      # recoveries that never happened.
+      - name: Live-DB alert mirror ownership
+        run: cargo test -p cog-observability --test alert_mirror_source -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A taste submission is evidence and a claimable row at once, and both
       # faces are decided by one statement each: whether a second disposition
       # rewrites the first fate, and whether a re-sent id replaces the words
