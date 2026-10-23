@@ -108,6 +108,14 @@ pub const PLATFORM_REGISTRY_FILES: &str = "*.rs";
 /// had measured.
 pub const PLATFORM_DEPLOY_GATES: &str = "deploy/scripts/tests/*.test.sh";
 
+/// The shell gates that hold the repository's own scripts to their contracts.
+///
+/// A second directory of the same kind of file, kept as its own source rather
+/// than folded into the deploy glob: the two answer to different owners, and
+/// naming the directory is what makes a reader that loses one of them lose a
+/// visible entry rather than half of an entry.
+pub const PLATFORM_REPO_GATES: &str = ".github/scripts/tests/*.test.sh";
+
 /// Where the registry is read from, as `(pathspec, prefix)` pairs.
 ///
 /// Paired rather than two lists: a file type must never be searched with the
@@ -116,6 +124,7 @@ pub const PLATFORM_DEPLOY_GATES: &str = "deploy/scripts/tests/*.test.sh";
 pub const PLATFORM_REGISTRY_SOURCES: &[(&str, &str)] = &[
     (PLATFORM_REGISTRY_FILES, PLATFORM_DECLARATION_PREFIX),
     (PLATFORM_DEPLOY_GATES, PLATFORM_SHELL_DECLARATION_PREFIX),
+    (PLATFORM_REPO_GATES, PLATFORM_SHELL_DECLARATION_PREFIX),
 ];
 
 /// Why a principle's gate could not be settled, as a closed set.
@@ -921,7 +930,7 @@ mod tests {
     }
 
     /// The sources are paired, one prefix per file type, and the shell half is
-    /// searched in the tree the deploy gates live in. A pair that drifted would
+    /// searched in the trees the shell gates live in. A pair that drifted would
     /// search a file with the other language's prefix and find nothing -- which
     /// reads as "no gate", the exact answer this widening removes.
     #[test]
@@ -931,9 +940,12 @@ mod tests {
             &[
                 (PLATFORM_REGISTRY_FILES, PLATFORM_DECLARATION_PREFIX),
                 (PLATFORM_DEPLOY_GATES, PLATFORM_SHELL_DECLARATION_PREFIX),
+                (PLATFORM_REPO_GATES, PLATFORM_SHELL_DECLARATION_PREFIX),
             ]
         );
         assert!(PLATFORM_DEPLOY_GATES.starts_with("deploy/"));
         assert!(PLATFORM_DEPLOY_GATES.ends_with("*.test.sh"));
+        assert!(PLATFORM_REPO_GATES.starts_with('.'));
+        assert!(PLATFORM_REPO_GATES.ends_with("*.test.sh"));
     }
 }

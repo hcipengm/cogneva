@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_contract_member_list_marked_as_definition_is_a_gate_not_a_comment
 # check-readme-trait-members.sh 的判据：README 里标成 Trait「定义」的成员表，必须与源一致。
 #
 # 这条门的分档是它的全部：`definition` 差一个成员就要红，`example` 少列只作读数。所以
