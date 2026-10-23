@@ -1,0 +1,220 @@
+# Redis 四件与总线流五件的单测夹具：重启过、内存逼近上限、INFO 读数过期、
+# WAL 普查过期、待领消息压太久、测量停更、测量在失败、消费者读不动、
+# 以及「没人领的积压」与「认领间隔」的对照。
+#
+# redis 一族的易错点：
+#   - `restarted` 除了「一小时里涨过」还要「五分钟内报过」：第三格让计数停在四十分钟前，
+#     卡在窗口里的涨幅仍然算得出来，只有新鲜腿能把它压住——删掉新鲜腿这一格会响。
+#   - `info_stale` / `wal_census_stale` 的界是**读出来的**（3 × 那个间隔读数），不是常数：
+#     第四格把 INFO 时间戳放到过期，同时保持间隔 60 秒，才证明「3 ×」确实参与了判据。
+#   - `max without` 只丢掉点名的标签（pod/container/instance），`namespace` 留在结果上；
+#     而 `time()` 是标量，`time() - max without(...)` 保留右边那条序列的标签。所以两条
+#     过期规则的断言里带 namespace，别照抄「聚合算光了标签」的老经验。
+#
+# stream 一族的易错点：
+#   - `pending_unreclaimed` 是「最老的待领」对「认领间隔」的两倍，两半缺一即空。
+#   - 三条时间型规则的界同样来自**另一条读数**（间隔、阻塞时长），夹具里必须显式给出来，
+#     不然 `scalar(...)` 是 NaN、比较恒假，静的是空而不是判据。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-redis-stream.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: redis_restarted
+# rule: redis_memory_near_limit
+# rule: redis_info_stale
+# rule: redis_wal_census_stale
+# rule: stream_pending_unreclaimed
+# rule: stream_pending_measure_stale
+# rule: stream_pending_measure_failing
+# rule: stream_consumer_stalled
+
+evaluation_interval: 1m
+
+tests:
+  # Redis 安分、总线顺：没重启过、内存八成、INFO 与 WAL 普查都新鲜、待领的最老的只有 15 秒、
+  # 测量在一分钟前、没有失败、消费者 10 秒前刚读到过。九条全静。
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{namespace="cogneva",pod="redis-0",container="redis"}'
+        values: '0x60'
+      - series: 'cogneva_redis_memory_used_bytes{namespace="cogneva",pod="redis-0"}'
+        values: '80x60'
+      - series: 'kube_pod_container_resource_limits{namespace="cogneva",pod="redis-0",container="redis",resource="memory",unit="byte"}'
+        values: '100x60'
+      - series: 'cogneva_redis_info_updated_timestamp_seconds{namespace="cogneva",pod="redis-0"}'
+        values: '3500x60'
+      - series: 'cogneva_redis_info_interval_seconds{namespace="cogneva",pod="redis-0"}'
+        values: '60x60'
+      - series: 'cogneva_redis_wal_scan_timestamp_seconds{namespace="cogneva",pod="redis-0"}'
+        values: '3500x60'
+      - series: 'cogneva_redis_wal_scan_interval_seconds{namespace="cogneva",pod="redis-0"}'
+        values: '60x60'
+      - series: 'cogneva_stream_pending_unreclaimed_oldest_idle_seconds{stream="tasks"}'
+        values: '15x60'
+      - series: 'cogneva_stream_pending_claim_idle_seconds{stream="tasks"}'
+        values: '100x60'
+      - series: 'cogneva_stream_pending_measure_last_seconds{stream="tasks"}'
+        values: '3540x60'
+      - series: 'cogneva_stream_pending_measure_interval_seconds{stream="tasks"}'
+        values: '60x60'
+      - series: 'cogneva_stream_pending_measure_failures_total{stream="tasks"}'
+        values: '0x60'
+      - series: 'cogneva_stream_read_silent_seconds{stream="tasks"}'
+        values: '10x60'
+      - series: 'cogneva_stream_read_block_seconds{stream="tasks"}'
+        values: '2x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: redis_restarted
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: redis_memory_near_limit
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: redis_info_stale
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: redis_wal_census_stale
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: stream_pending_unreclaimed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: stream_pending_measure_stale
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: stream_pending_measure_failing
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: stream_consumer_stalled
+        exp_alerts: []
+
+  # 全都在说坏消息：Redis 十分钟前重启过一次、内存九成五、INFO 与 WAL 普查都停在很久以前、
+  # 最老的待领消息压了十分钟（认领间隔 100 秒）、测量十分钟没更新、一小时里失败三次、
+  # 消费者六百秒没读到（阻塞时长 2 秒，门槛 24 秒）。八条全亮。
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{namespace="cogneva",pod="redis-0",container="redis"}'
+        values: '0x50 1x10'
+      - series: 'cogneva_redis_memory_used_bytes{namespace="cogneva",pod="redis-0"}'
+        values: '95x60'
+      - series: 'kube_pod_container_resource_limits{namespace="cogneva",pod="redis-0",container="redis",resource="memory",unit="byte"}'
+        values: '100x60'
+      - series: 'cogneva_redis_info_updated_timestamp_seconds{namespace="cogneva",pod="redis-0"}'
+        values: '1000x60'
+      - series: 'cogneva_redis_info_interval_seconds{namespace="cogneva",pod="redis-0"}'
+        values: '60x60'
+      - series: 'cogneva_redis_wal_scan_timestamp_seconds{namespace="cogneva",pod="redis-0"}'
+        values: '1000x60'
+      - series: 'cogneva_redis_wal_scan_interval_seconds{namespace="cogneva",pod="redis-0"}'
+        values: '60x60'
+      - series: 'cogneva_stream_pending_unreclaimed_oldest_idle_seconds{stream="tasks"}'
+        values: '600x60'
+      - series: 'cogneva_stream_pending_claim_idle_seconds{stream="tasks"}'
+        values: '100x60'
+      - series: 'cogneva_stream_pending_measure_last_seconds{stream="tasks"}'
+        values: '3000x60'
+      - series: 'cogneva_stream_pending_measure_interval_seconds{stream="tasks"}'
+        values: '60x60'
+      - series: 'cogneva_stream_pending_measure_failures_total{stream="tasks"}'
+        values: '0x50 3x10'
+      - series: 'cogneva_stream_read_silent_seconds{stream="tasks"}'
+        values: '600x60'
+      - series: 'cogneva_stream_read_block_seconds{stream="tasks"}'
+        values: '2x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: redis_restarted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+              pod: redis-0
+              container: redis
+      - eval_time: 60m
+        alertname: redis_memory_near_limit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 60m
+        alertname: redis_info_stale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+      - eval_time: 60m
+        alertname: redis_wal_census_stale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+      - eval_time: 60m
+        alertname: stream_pending_unreclaimed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              stream: tasks
+      - eval_time: 60m
+        alertname: stream_pending_measure_stale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              stream: tasks
+      - eval_time: 60m
+        alertname: stream_pending_measure_failing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              stream: tasks
+      - eval_time: 60m
+        alertname: stream_consumer_stalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              stream: tasks
+
+  # 重启的涨幅还在窗口里（一小时窗口留得住四十分钟前那次），但这条读数四十分钟前停了：
+  # 现在是不是又重启了不知道。删掉「五分钟内报过」那条腿，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{namespace="cogneva",pod="redis-0",container="redis"}'
+        values: '0x20 1x20'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: redis_restarted
+        exp_alerts: []
+
+  # INFO 读数停在四十分钟前，而它自报的间隔仍是 60 秒：界是 3×60=180 秒，早该响了。
+  # 把界换成常数 3600 这一格就会静——所以这一格同时证明了「界是从间隔读数算出来的」。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_redis_info_updated_timestamp_seconds{namespace="cogneva",pod="redis-0"}'
+        values: '3200x60'
+      - series: 'cogneva_redis_info_interval_seconds{namespace="cogneva",pod="redis-0"}'
+        values: '60x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: redis_info_stale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+
+  # 最老的待领消息压了 250 秒，认领间隔说 100 秒：两倍是 200，越界了。
+  # 反过来把它压到 150 秒就静（上面健康格已证）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_stream_pending_unreclaimed_oldest_idle_seconds{stream="tasks"}'
+        values: '250x60'
+      - series: 'cogneva_stream_pending_claim_idle_seconds{stream="tasks"}'
+        values: '100x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: stream_pending_unreclaimed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              stream: tasks
