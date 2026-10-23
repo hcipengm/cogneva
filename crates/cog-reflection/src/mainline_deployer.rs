@@ -1131,6 +1131,15 @@ pub(crate) enum FailureLocus {
     /// 的那一侧**（部署器）从 Pod 状态里读出来。三种杀法在退出码上是同一个 137，
     /// 只在 Pod 状态里分得开，所以原因跟着落点走，而不是折成一个"被杀"。
     Killed(KilledReason),
+    /// 滚动进程在动手之前复问了一次上游 CI，上游给了明确的失败结论。它说的
+    /// **是这一版的属性**（上游已经跑完的检查判了它红），不是集群此刻的状态，
+    /// 所以按版本类处置：不动集群、不回滚，等一个新 rev；而集群一个字节都没改，
+    /// 所以它又出现在 `before_any_change` 的那条路径上——那一档默认把说不出版本
+    /// 好坏的落点判成环境类，这一支要在那里单独放行（见 [`Self::class`]）。
+    ///
+    /// 它与 [`FailureLocus::Reference`] 位置相邻、类别相反，理由正是两句话不同：
+    /// 「集群缺一个它该有的对象」是环境，「上游判了这一版红」是版本。
+    UpstreamCi,
     /// 其余按"观测到的版本缺陷"论，含回滚过的那一支。
     Observed,
 }
@@ -1163,7 +1172,7 @@ impl KilledReason {
 
 impl FailureLocus {
     /// 全部落点，供读回签名时校验值域用。
-    const ALL: [FailureLocus; 13] = [
+    const ALL: [FailureLocus; 14] = [
         FailureLocus::Unreachable,
         FailureLocus::Admission,
         FailureLocus::Reference,
@@ -1176,6 +1185,7 @@ impl FailureLocus {
         FailureLocus::Killed(KilledReason::Evicted),
         FailureLocus::Killed(KilledReason::Deadline),
         FailureLocus::Killed(KilledReason::Unreadable),
+        FailureLocus::UpstreamCi,
         FailureLocus::Observed,
     ];
 
@@ -1190,6 +1200,7 @@ impl FailureLocus {
             FailureLocus::ImageSource => "image-source",
             FailureLocus::NeverRan => "never-ran",
             FailureLocus::Killed(reason) => reason.as_str(),
+            FailureLocus::UpstreamCi => "upstream-ci",
             FailureLocus::Observed => "observed",
         }
     }
@@ -1211,9 +1222,18 @@ impl FailureLocus {
     /// 上限里装的可能是新版本自己的二进制：容器吃爆上限时，说不清是上限太小还是
     /// 这一版吃得多，而代价不对称——判不准就往停下的一侧取，误停只是等一个新 rev。
     /// 它的可读部分因此不放在类别上，放在落点里（原因跟落点走，见 [`KilledReason`]）。
+    ///
+    /// 「上游已判红」同样两个阶段都按版本类。`before_any_change` 那一支默认把
+    /// 非 Observed 的落点全判成环境类——那是给"动手之前就说不清"的那些落点
+    /// （集群不可达、集群缺对象、工具起不来）定的；这一支恰恰相反：它说不出新
+    /// 版本跑起来好不好，但它说得清上游自己跑过的那一遍判了红，那是**这一版的
+    /// 属性**。判成环境类会让同一份红版本在冷却窗后无限重试。
     pub(crate) fn class(self, before_any_change: bool) -> FailureClass {
         let environment = if before_any_change {
-            self != FailureLocus::Observed && !matches!(self, FailureLocus::Killed(_))
+            !matches!(
+                self,
+                FailureLocus::Observed | FailureLocus::Killed(_) | FailureLocus::UpstreamCi
+            )
         } else {
             matches!(
                 self,
@@ -1257,6 +1277,28 @@ pub(crate) fn failure_signature(
     locus: FailureLocus,
 ) -> String {
     format!("{}:{stage}:{target}:{}", class.as_str(), locus.as_str())
+}
+
+/// 滚动进程在**第一处写动作之前**做的那一段检查统一记在这个阶段名下。
+///
+/// 两个检查共用它（引用面门与上游 CI 门），因为它们回答的是同一个问题——「现在
+/// 能不能开始动集群」——而落点把它们分得开。合成一个阶段名不是省事：阶段是
+/// 「坏在流程的哪一段」，把它们分成两个阶段会让同一处"动手之前"在历史里长出两个
+/// 名字，之后读回签名的人要记得两个都算。
+pub(crate) const ROLLOUT_PRECHECK_STAGE: &str = "precheck";
+
+/// 「上游已经判了这一版红」的失败签名。
+///
+/// 部署器读回 Job 的终止消息时按这一条认人：它自己那两次提问记的判词读数只覆盖
+/// 到派发为止，而扣住其实可能发生在 Job 里（派发 → 落地之间）。不把这一条也记进
+/// 同一个计数器，「提前拦下」与「这一版本来就是绿的」在计数面上同形。
+pub(crate) fn upstream_ci_hold_signature() -> String {
+    failure_signature(
+        FailureClass::Version,
+        ROLLOUT_PRECHECK_STAGE,
+        "",
+        FailureLocus::UpstreamCi,
+    )
 }
 
 /// 这次失败是不是已经见过的那一处坏。证据取不到（`None`）时不做区分：读不出
@@ -2020,7 +2062,7 @@ enum PlatformReadFailure {
 /// 配置），落在同一个标签里就是把三个人的活记成一个人的，而失败的那一支永远有借口。
 /// 所以每一轮 `no_evidence` 都要带上它的原因，取值域是闭集，每个取值对着一个动作。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CiNoVerdictReason {
+pub(crate) enum CiNoVerdictReason {
     /// 读到了、里面有检查，但至少一条还没有结论。动作只有一个：等下一轮。
     Pending,
     /// 读到了、里面一条检查都没有。**这是"问到了、没有东西"，不是"没问到"**——
@@ -2040,7 +2082,7 @@ enum CiNoVerdictReason {
 
 impl CiNoVerdictReason {
     /// 读数的标签取值域：闭集，每个取值对着一个可做动作的主人。
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::NoRuns => "no_runs",
@@ -3230,8 +3272,11 @@ impl MainlineDeployer {
     /// 失败**分形状**带回来而不是折成一句错误文本：判据要在没有结论时说出是哪一种
     /// 没能读到，而状态码与传输错误只有在这一层还在手上（见 [`PlatformReadFailure`]，
     /// 它折成读数标签的那一步在 [`CiNoVerdictReason`]）。
+    /// 关联函数而非方法：滚动侧（Job 进程）也要问同一条路径，而它没有
+    /// `MainlineDeployer` 实例（那一侧不持有部署器配置、不记指标）。判据只有
+    /// 一份——把折叠规则复制到相邻模块，就是两个版本，改一处忘一处的那天没人
+    /// 看得出来。
     async fn platform_get_json(
-        &self,
         api_base: &str,
         path: &str,
     ) -> Result<serde_json::Value, PlatformReadFailure> {
@@ -3273,8 +3318,7 @@ impl MainlineDeployer {
     /// 一条检查都没有）时，原因就是内容说的那个；那一次失败时，原因就是它的失败形状。
     /// 兜底那条 status 接口自己的失败**不**改写原因——两处都没有结论时，先问的那个
     /// 更接近真相（"上游还在跑"与"这条路不通"是两种话，后者才需要动作）。
-    async fn platform_ci_verdict(
-        &self,
+    pub(crate) async fn platform_ci_verdict(
         api_base: &str,
         repo: &str,
         rev: &str,
@@ -3298,8 +3342,7 @@ impl MainlineDeployer {
         // 原因由这一段的形状决定（读到内容 / 读失败），没有"默认值"这种中间态：
         // 两条分支各给一个，读的人不会看到一个谁都没写的值。
         let mut reason;
-        match self
-            .platform_get_json(api_base, &format!("/repos/{repo}/commits/{rev}/check-runs"))
+        match Self::platform_get_json(api_base, &format!("/repos/{repo}/commits/{rev}/check-runs"))
             .await
         {
             Ok(v) => {
@@ -3310,7 +3353,7 @@ impl MainlineDeployer {
                             Some(c) => {
                                 if matches!(c, "failure" | "error") {
                                     if let Some(workflow) =
-                                        self.excluded_check_workflow(api_base, repo, run).await
+                                        Self::excluded_check_workflow(api_base, repo, run).await
                                     {
                                         let name = run
                                             .get("name")
@@ -3349,9 +3392,8 @@ impl MainlineDeployer {
             return (Some(verdict), None, failed_checks, excluded_checks);
         }
         // 只用提交状态上报 CI 的仓库（没有 check runs），与落地通道同一条兜底。
-        if let Ok(status) = self
-            .platform_get_json(api_base, &format!("/repos/{repo}/commits/{rev}/status"))
-            .await
+        if let Ok(status) =
+            Self::platform_get_json(api_base, &format!("/repos/{repo}/commits/{rev}/status")).await
         {
             match status.get("state").and_then(|s| s.as_str()) {
                 Some("success") => {
@@ -3382,7 +3424,6 @@ impl MainlineDeployer {
     /// 链接里的运行 id。拿不到身份就照常判失败——排除是一句"这条检查不判这棵树"
     /// 的断言，断言不了就不能替它免责。
     async fn excluded_check_workflow(
-        &self,
         api_base: &str,
         repo: &str,
         run: &serde_json::Value,
@@ -3394,10 +3435,10 @@ impl MainlineDeployer {
             .iter()
             .filter_map(|key| run.get(*key).and_then(|v| v.as_str()))
             .find_map(actions_run_id)?;
-        let workflow = self
-            .platform_get_json(api_base, &format!("/repos/{repo}/actions/runs/{run_id}"))
-            .await
-            .ok()?;
+        let workflow =
+            Self::platform_get_json(api_base, &format!("/repos/{repo}/actions/runs/{run_id}"))
+                .await
+                .ok()?;
         let path = workflow.get("path").and_then(|p| p.as_str())?.trim();
         NON_JUDGING_CHECK_WORKFLOWS
             .iter()
@@ -3454,7 +3495,8 @@ impl MainlineDeployer {
                 continue;
             };
             let repo = up.repo.trim().trim_end_matches(".git");
-            let (verdict, reason, names, skipped) = self.platform_ci_verdict(base, repo, rev).await;
+            let (verdict, reason, names, skipped) =
+                Self::platform_ci_verdict(base, repo, rev).await;
             failed.extend(names.into_iter().map(|n| format!("{platform}:{n}")));
             for (name, workflow) in skipped {
                 self.record_ci_check_excluded_reading(platform, &workflow)
@@ -5299,6 +5341,19 @@ impl MainlineDeployer {
                     // 也不构成版本结论），不是从 Job 日志里找字符串。
                     let failure = self.job_failure(&job_name(&inflight.rev)).await;
                     let class = failure.class;
+                    // 扣住发生在 Job 里时，这一侧唯一读得到的就是终止消息里那条
+                    // 签名。把它也记进判词计数器：两次提问都答"放行"、而 Job 在
+                    // 落地前复问时答"红"的那一版，在某些计数面上与一直没问题的
+                    // 那一版同形——区别全在这一次复问，不记就只剩日志。
+                    if failure.signature.as_deref() == Some(upstream_ci_hold_signature().as_str()) {
+                        self.record_ci_verdict_reading(Some(false)).await;
+                        warn!(
+                            rev = %rev12(&inflight.rev),
+                            "the rollout job held this revision before it touched the cluster: \
+                             upstream CI reports a failure that was still running when the job \
+                             was dispatched"
+                        );
+                    }
                     let same_rev = state.failed_rev.as_deref() == Some(inflight.rev.as_str());
                     if !same_rev {
                         // 换 rev 就是换了一份待验的东西：上一份的证据不能拿
@@ -6515,6 +6570,33 @@ impl MainlineDeployer {
             "--startup-timeout".into(),
             self.cfg.startup_timeout_secs.to_string(),
         ];
+        // 上游清单随 Job 一起带过去：这一侧问过一次 CI，但提问到落地之间还隔着
+        // 整段构建（构建、推镜像、拉取都在 Job 里），那一段时间足够一条要红的检查
+        // 跑出结论。Job 自己拿着同一份上游清单在动手之前复问一次，判据走同一个
+        // `platform_ci_verdict`——不在滚动侧另写一份折叠规则。配置为空时一个字也
+        // 不传：没有上游就没有可问的东西，Job 不该凭空造一个答案。
+        let ci_upstreams: Vec<String> = self
+            .cfg
+            .upstreams
+            .iter()
+            .filter_map(|up| {
+                let base = up
+                    .api_base
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())?;
+                let repo = up.repo.trim().trim_end_matches(".git");
+                Some(format!("{}|{}|{}", up.platform.slug(), base, repo))
+            })
+            .collect();
+        if !ci_upstreams.is_empty() {
+            args.push("--rev".into());
+            args.push(rev.to_string());
+            for up in ci_upstreams {
+                args.push("--ci-upstream".into());
+                args.push(up);
+            }
+        }
         let mut volumes: Vec<serde_json::Value> = Vec::new();
         let mut mounts: Vec<serde_json::Value> = Vec::new();
         if self.cfg.deliver_manifests {
@@ -6580,6 +6662,10 @@ impl MainlineDeployer {
                     + self.cfg.soak_secs
                     + self.cfg.startup_timeout_secs
                     + PREFLIGHT_RETRYING_READS * self.cfg.rollout_timeout_secs
+                    // 落地之前复问一次上游 CI：那一段在 Job 里、在第一个写动作
+                    // 之前，自带墙钟上界。上界不进这里，慢网关就会把它挤进滚动
+                    // 预算，失败于是以「判定进程没跑完」的形状出现。
+                    + crate::mainline_rollout::CI_ASK_BUDGET_SECS
                     + 15,
                 "ttlSecondsAfterFinished": 86400,
                 "template": {
@@ -9372,15 +9458,15 @@ mod tests {
         changed_workloads, classify_before_any_change, config_change_needs_restart,
         config_consumers, defined_objects, environment_class, image_pull_blocked,
         is_admission_denied, is_image_source_unavailable, is_placement_blocked,
-        locate_before_any_change, normalize_placement_shape, pod_samples, pod_selector,
-        pod_template_limits, pod_waiting_states, readiness_overdue, replicaset_failures,
-        rollout_converged, rollout_pods_fatal, rollout_pods_ready, stage_rollout_manifest,
-        staged_manifest_path, summarize_events, summarize_pod_states, support_pod_causes,
-        support_pod_selector, support_settled, unresolved_configmaps, unschedulable_pods,
-        write_termination_message, ProbeCycle, RefSnapshots, ReplicaSetFailure, RewrittenRef,
-        RolloutExecutor, RolloutPlan, SupportCause, SupportWorkload, ADMISSION_DENIED_MARKER,
-        IMAGE_PULL_WAITING_REASONS, NEW_REVISION_NEVER_RAN_MARKER, PLACEMENT_BLOCKED_MARKER,
-        SUPPORT_CAUSE_POD_LIMIT,
+        locate_before_any_change, normalize_placement_shape, parse_rollout_args, pod_samples,
+        pod_selector, pod_template_limits, pod_waiting_states, readiness_overdue,
+        replicaset_failures, rollout_converged, rollout_pods_fatal, rollout_pods_ready,
+        stage_rollout_manifest, staged_manifest_path, summarize_events, summarize_pod_states,
+        support_pod_causes, support_pod_selector, support_settled, unresolved_configmaps,
+        unschedulable_pods, write_termination_message, ProbeCycle, RefSnapshots, ReplicaSetFailure,
+        RewrittenRef, RolloutExecutor, RolloutPlan, SupportCause, SupportWorkload, UpstreamCiAsk,
+        UpstreamCiTarget, ADMISSION_DENIED_MARKER, IMAGE_PULL_WAITING_REASONS,
+        NEW_REVISION_NEVER_RAN_MARKER, PLACEMENT_BLOCKED_MARKER, SUPPORT_CAUSE_POD_LIMIT,
     };
 
     #[test]
@@ -13306,6 +13392,128 @@ exec {real} "$@"
         // 只有报失败的那一条，且带平台前缀；成功的那条不进这一列。
         assert_eq!(failed, vec!["github:Clippy".to_string()]);
         let _ = handle.await.unwrap();
+    }
+
+    /// 复问的位置在**第一处写动作之前**，判词落在签名里：这一版为什么没落地，
+    /// 读终止消息的人要能一眼看出「上游判的红」，而不是与集群侧的失败混在一个
+    /// 说不清的落点里。它同时按版本类处置——上游跑过的那一遍是这一版的属性。
+    #[test]
+    fn the_ci_hold_signature_survives_the_termination_channel() {
+        let sig = upstream_ci_hold_signature();
+        assert_eq!(sig, "version:precheck::upstream-ci");
+        assert_eq!(parse_failure_signature(&format!("{sig}\n")), Some(sig));
+        assert_eq!(FailureLocus::UpstreamCi.class(true), FailureClass::Version);
+        assert_eq!(FailureLocus::UpstreamCi.class(false), FailureClass::Version);
+    }
+
+    /// 派发时答"还在跑"的那一版，落地之前必须再问一次：2–3 分钟的构建窗口足够
+    /// 一条检查跑出结论，而这条通道上此后再没有人复读。这里证明 Job 侧的复问
+    /// 真的会扣住，而且回的是哪一个上游、哪一条检查。
+    #[tokio::test]
+    async fn the_rollout_asks_ci_again_before_it_touches_the_cluster() {
+        let (endpoint, handle) = fake_registry(vec![http_200(
+            r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#,
+        )])
+        .await;
+        let executor =
+            RolloutExecutor::new("kubectl", "cogneva", 0, 1, 1, 1).with_ci_ask(UpstreamCiAsk {
+                rev: "abc123".into(),
+                upstreams: vec![UpstreamCiTarget {
+                    platform: "github".into(),
+                    api_base: format!("http://{endpoint}/github"),
+                    repo: "owner/repo".into(),
+                }],
+            });
+        let plan = RolloutPlan::from_config(
+            &MainlineDeployerConfig::default(),
+            "reg/cog:main-abc123".into(),
+        );
+        let failure = executor.run(&plan).await.unwrap_err();
+        assert_eq!(failure.signature, "version:precheck::upstream-ci");
+        assert_eq!(failure.class, FailureClass::Version);
+        assert!(
+            failure.to_string().contains("github:Test"),
+            "扣住的理由要名到哪一条检查：{failure}"
+        );
+        let reqs = handle.await.unwrap();
+        assert!(
+            reqs[0].starts_with("GET /github/repos/owner/repo/commits/abc123/check-runs "),
+            "{:?}",
+            reqs[0]
+        );
+    }
+
+    /// 只扣明确的失败：还在跑、读不到，一律放行。一次平台抖动不该停掉整条主线——
+    /// 这条与派发侧那两次提问是同一条判据，只是提问点不同。
+    #[tokio::test]
+    async fn a_pending_check_does_not_hold_the_rollout() {
+        let (endpoint, _handle) =
+            fake_registry(vec![http_200(r#"{"check_runs":[{"conclusion":null}]}"#)]).await;
+        let executor = RolloutExecutor::new("kubectl", "cogneva", 0, 1, 1, 1);
+        let ask = UpstreamCiAsk {
+            rev: "abc123".into(),
+            upstreams: vec![UpstreamCiTarget {
+                platform: "github".into(),
+                api_base: format!("http://{endpoint}/github"),
+                repo: "owner/repo".into(),
+            }],
+        };
+        assert_eq!(executor.ask_upstreams(&ask).await, None);
+        // 一个上游都没有时连问都不问：没有清单就没有可问的东西。
+        assert_eq!(
+            executor
+                .ask_upstreams(&UpstreamCiAsk {
+                    rev: "abc123".into(),
+                    upstreams: Vec::new(),
+                })
+                .await,
+            None
+        );
+    }
+
+    /// 参数面是这一侧与派发侧之间唯一的契约：拼错的开关在别的通道上是一句报错，
+    /// 在这条通道上会变成"安静地少问一次 CI"。
+    #[test]
+    fn the_rollout_cli_carries_the_upstreams_it_was_given() {
+        let argv = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        let parsed = parse_rollout_args(&argv(&[
+            "--tag",
+            "reg/cog:main-abc123",
+            "--rev",
+            "abc123",
+            "--ci-upstream",
+            "github|http://gw:8081/github|owner/repo",
+            "--ci-upstream",
+            "gitee|http://gw:8081/gitee|owner/repo",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.rev, "abc123");
+        assert_eq!(parsed.ci_upstreams.len(), 2);
+        assert_eq!(parsed.ci_upstreams[1].platform, "gitee");
+        assert_eq!(parsed.ci_upstreams[0].api_base, "http://gw:8081/github");
+        // 有上游却没有 rev：问的是"哪一版的 CI"，答不出来就不许安静跳过。
+        assert!(parse_rollout_args(&argv(&[
+            "--tag",
+            "t",
+            "--ci-upstream",
+            "github|http://gw:8081/github|owner/repo"
+        ]))
+        .is_err());
+        // 三段缺一段同样是拼错了，不是"少问一个上游"。
+        assert!(parse_rollout_args(&argv(&[
+            "--tag",
+            "t",
+            "--rev",
+            "abc",
+            "--ci-upstream",
+            "github|http://gw:8081/github"
+        ]))
+        .is_err());
+        // 没有上游时不要求 rev：旧派发侧不传这两项，Job 照样能滚。
+        assert!(parse_rollout_args(&argv(&["--tag", "t"]))
+            .unwrap()
+            .rev
+            .is_empty());
     }
 
     /// check run 本身不带工作流字段，身份只能从链接里那个运行 id 追。

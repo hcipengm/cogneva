@@ -40,10 +40,10 @@ use crate::mainline_deployer::{
     is_admission_policy_denied, is_authorization_denied, is_cluster_unreachable,
     is_observation_tool_failure, namespace_docs, primary_message, render_docs, sample_fields,
     split_docs, target_manifest_key, workload_kind, workload_kind_of_resource, ConfigConsumer,
-    FailureClass, FailureLocus, PodSample, RolloutTarget, WaitingState, WorkloadKind,
-    CLUSTER_UNREACHABLE_MARKER, FATAL_WAITING_REASONS, IMAGE_SOURCE_UNAVAILABLE_MARKER,
-    OBSERVATION_TOOL_MARKER, ROLLOUT_EXIT_ENVIRONMENT, SUPPORT_CAUSE_MESSAGE_CHARS,
-    SUPPORT_CAUSE_SEPARATOR, WORKLOAD_KINDS,
+    FailureClass, FailureLocus, MainlineDeployer, PodSample, RolloutTarget, WaitingState,
+    WorkloadKind, CLUSTER_UNREACHABLE_MARKER, FATAL_WAITING_REASONS,
+    IMAGE_SOURCE_UNAVAILABLE_MARKER, OBSERVATION_TOOL_MARKER, ROLLOUT_EXIT_ENVIRONMENT,
+    ROLLOUT_PRECHECK_STAGE, SUPPORT_CAUSE_MESSAGE_CHARS, SUPPORT_CAUSE_SEPARATOR, WORKLOAD_KINDS,
 };
 use crate::rollout_resources::{self, RolloutResourceReading};
 
@@ -59,6 +59,12 @@ use crate::rollout_resources::{self, RolloutResourceReading};
 /// 所以归环境类、不回滚，等镜像源恢复后新副本自己就能起来（见
 /// IMAGE_SOURCE_UNAVAILABLE_MARKER）。
 pub(crate) const IMAGE_PULL_WAITING_REASONS: &[&str] = &["ErrImagePull", "ImagePullBackOff"];
+
+/// 「落地之前复问一次上游 CI」这一段的墙钟上界（秒）。
+///
+/// 两头都要用它：这一侧拿它包住整段提问（超时按"读不到"放行），派发侧把它加进
+/// Job 的 `activeDeadlineSeconds`——只封一头，另一头的界就名不副实。
+pub(crate) const CI_ASK_BUDGET_SECS: u64 = 180;
 
 /// The workload kinds this rollout waits for after the apply, and why the list
 /// is shorter than [`WORKLOAD_KINDS`]: settling is read as replicas
@@ -1552,6 +1558,28 @@ pub struct RolloutExecutor {
     restart_threshold: u32,
     rollout_timeout_secs: u64,
     startup_timeout_secs: u64,
+    /// 动手之前要复问的上游 CI。`None` = 这一趟没有上游清单（派发侧没配上游
+    /// 或它是旧版二进制），此时不提问、也不假装问过。
+    ci_ask: Option<UpstreamCiAsk>,
+}
+
+/// 一次「落地之前再问一次 CI」的全部输入：要问的 rev，以及问哪些上游。
+///
+/// 由派发侧（部署器）从它自己那份上游配置里原样带过来，不在这里另立一份：仓库
+/// 身份只有一个家，Job 只是拿着同一份清单再问一次。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpstreamCiAsk {
+    pub rev: String,
+    pub upstreams: Vec<UpstreamCiTarget>,
+}
+
+/// 一个上游：平台名（只用于日志与判词落点）、网关透传基址、仓库。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpstreamCiTarget {
+    /// `CodePlatform::slug()` 的取值。不参与判据，只用来说清「是谁说的红」。
+    pub platform: String,
+    pub api_base: String,
+    pub repo: String,
 }
 
 impl RolloutExecutor {
@@ -1570,7 +1598,14 @@ impl RolloutExecutor {
             restart_threshold,
             rollout_timeout_secs,
             startup_timeout_secs,
+            ci_ask: None,
         }
+    }
+
+    /// 挂上"动手之前复问上游 CI"这一趟。只有从命令行起的 Job 会调它。
+    pub(crate) fn with_ci_ask(mut self, ask: UpstreamCiAsk) -> Self {
+        self.ci_ask = Some(ask);
+        self
     }
 
     async fn run_kubectl(&self, args: &[&str], timeout_secs: u64) -> SFResult<String> {
@@ -2945,6 +2980,92 @@ impl RolloutExecutor {
         failed
     }
 
+    /// 落地之前复问上游 CI：`Some(reason)` = 至少一个上游给出了明确的失败结论。
+    ///
+    /// 判据不在这里另写一份：每个上游的结论都交给
+    /// [`MainlineDeployer::platform_ci_verdict`]——同一个函数服务派发侧那两次提问，
+    /// 里面就是 `fold_ci_signals`。滚动侧若自己写一份折叠规则，「一条已经给出的
+    /// 失败不能被还在跑压住」这类判断就会有两个版本。
+    ///
+    /// 返回的原因里带着报失败的检查名：只说「有一项红」时，定位要绕到仓库外去问，
+    /// 而名字在这一次读里本来就有。
+    async fn upstream_ci_hold(&self) -> Option<String> {
+        let ask = self.ci_ask.as_ref()?;
+        // 整段提问有自己的上界：每次 HTTP 读自带 30 秒连接 + 60 秒读，而上游可以
+        // 有多个、报失败的检查还要逐条问工作流身份，不封顶就会被一次慢网关把
+        // Job 的期限吃光——那时失败会以"被判进程没跑完"的形状出现，谁也看不出
+        // 是这一步。超时按"读不到"处理：放行，与其余读失败同一条判据。
+        match tokio::time::timeout(
+            Duration::from_secs(CI_ASK_BUDGET_SECS),
+            self.ask_upstreams(ask),
+        )
+        .await
+        {
+            Ok(hold) => hold,
+            Err(_) => {
+                warn!(
+                    rev = %ask.rev,
+                    budget_secs = CI_ASK_BUDGET_SECS,
+                    "the pre-apply CI question did not answer within its budget; continuing as \
+                     if there were no verdict"
+                );
+                None
+            }
+        }
+    }
+
+    pub(crate) async fn ask_upstreams(&self, ask: &UpstreamCiAsk) -> Option<String> {
+        let mut verdicts: Vec<bool> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        for up in &ask.upstreams {
+            let (verdict, reason, names, excluded) =
+                MainlineDeployer::platform_ci_verdict(&up.api_base, &up.repo, &ask.rev).await;
+            if !excluded.is_empty() {
+                // 排掉的那几条要留话：这个 rev 上游确实有一条红检查，只是那条不判
+                // 这棵树，所以它没有进判词。不写这一行，事后只剩一个"放行"。
+                info!(
+                    rev = %ask.rev,
+                    platform = %up.platform,
+                    excluded = %excluded
+                        .iter()
+                        .map(|(n, w)| format!("{n}@{w}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    "checks that do not judge this tree were left out of the CI verdict"
+                );
+            }
+            match verdict {
+                Some(v) => verdicts.push(v),
+                None => info!(
+                    rev = %ask.rev,
+                    platform = %up.platform,
+                    reason = %reason.map(|r| r.label()).unwrap_or("unknown"),
+                    "upstream CI gave no verdict for this revision; letting the rollout continue"
+                ),
+            }
+            if verdict == Some(false) {
+                failed.extend(names.into_iter().map(|n| format!("{}:{n}", up.platform)));
+            }
+        }
+        if !verdicts.iter().any(|v| !*v) {
+            return None;
+        }
+        Some(if failed.is_empty() {
+            // 结论来自提交状态兜底时没有可命名的检查——那是"这个平台不逐条给名字"，
+            // 不是"没有失败项"。
+            format!(
+                "upstream CI reports a failure for {} (no check runs named the failure)",
+                ask.rev
+            )
+        } else {
+            format!(
+                "upstream CI reports a failure for {}: {}",
+                ask.rev,
+                failed.join(",")
+            )
+        })
+    }
+
     /// 先落地支撑清单（如随镜像下发），再按计划顺序滚动四部署，逐部署等
     /// rollout 完成，全滚完后 soak 复查；任一失败把**这次 apply 改写过的整组引用**
     /// 还原回改动之前的现场值（不用 rollout undo——多目标无事务性，undo 还会连带
@@ -2952,6 +3073,28 @@ impl RolloutExecutor {
     /// 回滚只回退 image：支撑资源不反向删改（apply 是幂等 upsert，旧镜像配新支撑
     /// 资源可运行；删改支撑资源反而可能把在跑集群打坏）。
     pub async fn run(&self, plan: &RolloutPlan) -> Result<(), RolloutFailure> {
+        // 上游 CI 的复问。派发侧在派 Job 之前问过一次，但提问到落地之间隔着整段
+        // 构建——镜像在这里才被拉下来、apply 在这里才发生，那段时间足够一条要红的
+        // 检查跑出结论（实测一次带红上线：派发 2 分 47 秒后应用 Pod 才起来，而
+        // 第一条红线在那之前 2 分 19 秒就已经存在）。所以在这个进程里、在第一处
+        // 写动作之前再问一次；派发侧那一次答不出来，不代表落地时也答不出来。
+        //
+        // 只扣 `Some(false)`：读不到结论（平台抖动、检查还在跑、仓库没有 check
+        // runs）照常滚，理由与派发侧同一条——一次平台抖动不该停掉整条主线。
+        if let Some(reason) = self.upstream_ci_hold().await {
+            warn!(
+                reason = %reason,
+                "mainline rollout: holding this rollout before it starts; upstream CI reports a \
+                 failure for this revision, so nothing is applied and the next round asks again"
+            );
+            return Err(RolloutFailure::at(
+                ROLLOUT_PRECHECK_STAGE,
+                "",
+                FailureLocus::UpstreamCi,
+                true,
+                SFError::Config(reason),
+            ));
+        }
         // 这次 apply 会改写的整组引用，两个面各一份，回滚按同一组还原。
         let mut refs = RefSnapshots::default();
         // 引用面门：这次 apply 会引用的 ConfigMap 必须要么随本次 apply 一起来、要么
@@ -2983,7 +3126,7 @@ impl RolloutExecutor {
                  and the next round retries once whatever owns it has created it"
             );
             return Err(RolloutFailure::at(
-                "precheck",
+                ROLLOUT_PRECHECK_STAGE,
                 "",
                 FailureLocus::Reference,
                 true,
@@ -3433,71 +3576,26 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
     let args: Vec<String> = std::env::args().skip(2).collect();
-    let mut tag = String::new();
-    let mut ns = "cogneva".to_string();
-    let mut soak_secs = 120u64;
-    let mut restart_threshold = 1u32;
-    let mut timeout = 300u64;
-    let mut startup_timeout = 900u64;
-    let mut kubectl = "kubectl".to_string();
-    let mut manifests_dir: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        let value = |i: usize| -> Result<String, Box<dyn std::error::Error>> {
-            args.get(i + 1)
-                .cloned()
-                .ok_or_else(|| format!("--{} requires a value", args[i]).into())
-        };
-        match args[i].as_str() {
-            "--tag" => {
-                tag = value(i)?;
-                i += 2;
-            }
-            "--ns" => {
-                ns = value(i)?;
-                i += 2;
-            }
-            "--soak-secs" => {
-                soak_secs = value(i)?.parse()?;
-                i += 2;
-            }
-            "--restart-threshold" => {
-                restart_threshold = value(i)?.parse()?;
-                i += 2;
-            }
-            "--timeout" => {
-                timeout = value(i)?.parse()?;
-                i += 2;
-            }
-            "--startup-timeout" => {
-                startup_timeout = value(i)?.parse()?;
-                i += 2;
-            }
-            "--kubectl" => {
-                kubectl = value(i)?;
-                i += 2;
-            }
-            "--manifests-dir" => {
-                manifests_dir = Some(value(i)?);
-                i += 2;
-            }
-            other => return Err(format!("unknown argument: {other}").into()),
-        }
-    }
-    if tag.is_empty() {
-        return Err("--tag is required".into());
-    }
+    let parsed = parse_rollout_args(&args)?;
     let cfg = MainlineDeployerConfig::default();
-    let mut plan = RolloutPlan::from_config(&cfg, tag);
-    plan.manifests_dir = manifests_dir;
+    let mut plan = RolloutPlan::from_config(&cfg, parsed.tag.clone());
+    plan.manifests_dir = parsed.manifests_dir.clone();
     let executor = RolloutExecutor::new(
-        kubectl,
-        ns,
-        soak_secs,
-        restart_threshold,
-        timeout,
-        startup_timeout,
+        parsed.kubectl.clone(),
+        parsed.ns.clone(),
+        parsed.soak_secs,
+        parsed.restart_threshold,
+        parsed.timeout,
+        parsed.startup_timeout,
     );
+    let executor = if parsed.ci_upstreams.is_empty() {
+        executor
+    } else {
+        executor.with_ci_ask(UpstreamCiAsk {
+            rev: parsed.rev.trim().to_string(),
+            upstreams: parsed.ci_upstreams,
+        })
+    };
     match executor.run(&plan).await {
         // 成功也留下读数：这一轮跑得离上限有多近，只有跑完的这一刻在同一个进程里
         // 对照得出来（上限写在 Job 清单里，用掉的量在这个容器自己的 cgroup 里）。
@@ -3519,6 +3617,122 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
             Err(Box::new(f))
         }
     }
+}
+
+/// `mainline-rollout` 子命令的参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RolloutCliArgs {
+    pub tag: String,
+    pub ns: String,
+    pub soak_secs: u64,
+    pub restart_threshold: u32,
+    pub timeout: u64,
+    pub startup_timeout: u64,
+    pub kubectl: String,
+    pub manifests_dir: Option<String>,
+    /// 要问 CI 的这一版。空 = 不提问（没有随 Job 带过来的上游清单）。
+    pub rev: String,
+    pub ci_upstreams: Vec<UpstreamCiTarget>,
+}
+
+/// 解析 `mainline-rollout` 的参数。
+///
+/// 从入口里拆出来只有一个理由：让它可测。参数面是这个进程与派发侧之间唯一的契约，
+/// 而「拼错一个开关」在这条通道上的后果是安静地少问一次 CI——入口里读
+/// `std::env::args()` 的那一版没有任何用例碰得到它。
+pub(crate) fn parse_rollout_args(
+    args: &[String],
+) -> Result<RolloutCliArgs, Box<dyn std::error::Error>> {
+    let mut out = RolloutCliArgs {
+        tag: String::new(),
+        ns: "cogneva".to_string(),
+        soak_secs: 120,
+        restart_threshold: 1,
+        timeout: 300,
+        startup_timeout: 900,
+        kubectl: "kubectl".to_string(),
+        manifests_dir: None,
+        rev: String::new(),
+        ci_upstreams: Vec::new(),
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let value = |i: usize| -> Result<String, Box<dyn std::error::Error>> {
+            args.get(i + 1)
+                .cloned()
+                .ok_or_else(|| format!("--{} requires a value", args[i]).into())
+        };
+        match args[i].as_str() {
+            "--tag" => {
+                out.tag = value(i)?;
+                i += 2;
+            }
+            "--ns" => {
+                out.ns = value(i)?;
+                i += 2;
+            }
+            "--soak-secs" => {
+                out.soak_secs = value(i)?.parse()?;
+                i += 2;
+            }
+            "--restart-threshold" => {
+                out.restart_threshold = value(i)?.parse()?;
+                i += 2;
+            }
+            "--timeout" => {
+                out.timeout = value(i)?.parse()?;
+                i += 2;
+            }
+            "--startup-timeout" => {
+                out.startup_timeout = value(i)?.parse()?;
+                i += 2;
+            }
+            "--kubectl" => {
+                out.kubectl = value(i)?;
+                i += 2;
+            }
+            "--manifests-dir" => {
+                out.manifests_dir = Some(value(i)?);
+                i += 2;
+            }
+            "--rev" => {
+                out.rev = value(i)?;
+                i += 2;
+            }
+            // 形如 `github|http://gw:8081/github|owner/repo`，可重复。刻意与派发侧
+            // 那份上游配置同形同值：Job 只是拿着同一份清单再问一次，不在这里重新
+            // 推导仓库身份。
+            "--ci-upstream" => {
+                let raw = value(i)?;
+                let mut parts = raw.splitn(3, '|');
+                let platform = parts.next().unwrap_or("").trim().to_string();
+                let api_base = parts.next().unwrap_or("").trim().to_string();
+                let repo = parts.next().unwrap_or("").trim().to_string();
+                if platform.is_empty() || api_base.is_empty() || repo.is_empty() {
+                    return Err(format!(
+                        "--ci-upstream expects platform|api_base|repo, got {raw:?}"
+                    )
+                    .into());
+                }
+                out.ci_upstreams.push(UpstreamCiTarget {
+                    platform,
+                    api_base,
+                    repo,
+                });
+                i += 2;
+            }
+            other => return Err(format!("unknown argument: {other}").into()),
+        }
+    }
+    if out.tag.is_empty() {
+        return Err("--tag is required".into());
+    }
+    // 有上游却没有 rev：这份清单没法问（问的是"哪一版的 CI"）。宁可让 Job 起不来
+    // 并报错，也不安静地跳过提问——跳过与"问了、答不上来"在日志上同形。
+    if !out.ci_upstreams.is_empty() && out.rev.trim().is_empty() {
+        return Err("--ci-upstream requires --rev".into());
+    }
+    Ok(out)
 }
 
 /// 容器终止消息文件（kubelet 的 `terminationMessagePath` 默认值）。失败落点与资源读数
