@@ -31,8 +31,8 @@ trap 'rm -rf "${work}"' EXIT
 run() { RULES_MANIFEST="$1" RULES_CASE="${2:-$case_file}" bash "$runner" >"${work}/out" 2>&1; rc=$?; }
 
 # 把那一库的副本按一段 python 改坏。改的是**部署配置的副本**，规则名不变。
-mutate() { # $1=输出文件  $2=python 片段（拿到 rules 里那条规则的 dict，改它）
-    python3 - "$config" "$1" "$rule" "$2" <<'PY'
+mutate() { # $1=输出文件  $2=python 片段（拿到 rules 里那条规则的 dict，改它）  ${3:-}=改哪条（默认 $rule）
+    python3 - "$config" "$1" "${3:-$rule}" "$2" <<'PY'
 import json
 import sys
 
@@ -82,11 +82,43 @@ run "${work}/c4.json"
 [ "$rc" -eq 1 ] && ok "删掉 1 GiB 地板：单测红（小阶段的比值重新算数）" \
     || bad "删掉 1 GiB 地板应红" "1" "$rc"
 
+# 4b) 只改 `condition` 的阈值（表达式一个字节不动）：单测必须红。
+# 这一格的存在本身是那条判据：不把 condition 折进表达式，Prometheus 看到的是「表达式返回
+# 元素就点火」，阈值改成十亿也照样亮，于是「值到没到界」这一半没有任何一格在证明。
+mutate "${work}/c5.json" 'rule["condition"] = {"greater_than": 1e9}'
+run "${work}/c5.json"
+[ "$rc" -eq 1 ] && ok "只把阈值抬到十亿：单测红（条件真的被跑到了）" \
+    || bad "只改阈值应红" "1" "$rc"
+
+# 4c) condition 换成一个不认识的算子：必须非零，不许被当作「没条件」跳过。
+mutate "${work}/c6.json" 'rule["condition"] = {"greater_than_or_whatever": 0.0}'
+run "${work}/c6.json"
+[ "$rc" -ne 0 ] && ok "不认识的 condition 算子：非零（不认识的算子不许当成没条件）" \
+    || bad "不认识的算子应非零" "非零" "0"
+
 # 5) 夹具点名一条库里没有的规则：必须非零——「取不到规则」不许读成「没判出问题」。
 sed "s/^# rule: ${rule}\$/# rule: ${rule}_not_in_the_library/" "$case_file" >"${work}/missing.test.yaml"
 run "$config" "${work}/missing.test.yaml"
 [ "$rc" -ne 0 ] && ok "夹具点名的规则不在库里：非零（没取到 ≠ 没问题）" \
     || bad "夹具点名库里没有的规则应非零" "非零" "0"
+
+# 5b) 夹具目录里每一份 `cogneva-json-*.test.yaml` 都必须**真跑绿**。
+# 覆盖门（check-alert-rule-firing-coverage.sh）按夹具头把规则记成「已证明」，但它不跑夹具：
+# 一份红着的、或从来没被任何地方执行过的夹具，在它眼里与一份绿的完全一样。这一格把
+# 「点过名」补成「跑过且绿」，否则覆盖数会以夹具的名义涨上去而证明是空的。
+for f in "${repo}"/deploy/k3s/observability/tests/cogneva-json-*.test.yaml; do
+    [ -e "$f" ] || { bad "夹具目录里一份 cogneva-json-*.test.yaml 都没有" "至少一份" "0"; continue; }
+    run "$config" "$f"
+    [ "$rc" -eq 0 ] && ok "夹具真跑绿：$(basename "$f")" \
+        || bad "夹具应跑绿：$(basename "$f")" "0" "$rc；$(tail -3 "${work}/out" | tr '\n' ' ')"
+done
+
+# 5c) 告警出口那条规则的 `unless` 腿是承重的：删掉它，「watcher 自己在跑」那格必须红。
+# 这一格证明上面那份新夹具不是橡皮图章——它真的会在规则被改坏时说话。
+mutate "${work}/c7.json" 'rule["promql"] = rule["promql"].split(" unless")[0]' "alert_batch_reached_no_outlet"
+run "${work}/c7.json" "${repo}/deploy/k3s/observability/tests/cogneva-json-alert-pipeline.test.yaml"
+[ "$rc" -eq 1 ] && ok "删掉 unless 腿：夹具红（watcher 在跑时不该报「没有出口」）" \
+    || bad "删掉 unless 腿应红" "1" "$rc"
 
 # 6) 拿不到 promtool：必须退 3，不许报绿。
 PROMTOOL=/nonexistent/promtool RULES_MANIFEST="$config" RULES_CASE="$case_file" \

@@ -93,13 +93,41 @@ by_name = {rule["name"]: rule for rule in library}
 missing = [name for name in wanted if name not in by_name]
 if missing:
     sys.exit(f"部署配置里没有这些规则：{', '.join(missing)}")
+# 阈值必须折进表达式里。这一库的规则不是「表达式非空就响」：进程拿到每个序列的**值**再
+# 按 `condition` 比一次（`AlertCondition::evaluate`），而 Prometheus 的告警规则只要表达式
+# 返回元素就点火。两种语义在一处恰好同形——表达式自己带比较、condition 又是 `> 0`——其余
+# 全部不同：`node_disk_usage_high` 的表达式返回百分比、阈值 75，不折进去的话夹具在 80 上亮、
+# 在 7500 上也亮，改坏阈值这条门一格都抓不住。所以这里把条件写成 PromQL 的比较，让
+# promtool 的「响不响」就是进程的「响不响」。
+OPERATORS = {
+    "greater_than": ("{p} > {th}"),
+    "less_than": ("{p} < {th}"),
+    "greater_than_or_equal": ("{p} >= {th}"),
+    "less_than_or_equal": ("{p} <= {th}"),
+    # 进程那两种是 EPSILON 比较，不是精确相等：`abs(v - th) < f64::EPSILON`。
+    "equal": ("abs({p} - {th}) < 2.220446049250313e-16"),
+    "not_equal": ("abs({p} - {th}) >= 2.220446049250313e-16"),
+}
+
+
+def fires_when(rule):
+    condition = rule.get("condition") or {}
+    if len(condition) != 1:
+        sys.exit(f"{rule['name']}：condition 恰好要有一个算子，实得 {condition}")
+    (key, threshold), = condition.items()
+    shape = OPERATORS.get(key)
+    if shape is None:
+        sys.exit(f"{rule['name']}：不认识的 condition 算子 {key!r}")
+    return shape.format(p=f"({rule['promql']})", th=repr(float(threshold)))
+
+
 rules = []
 for name in wanted:
     rule = by_name[name]
     # annotations 逐字比对，会把「改一次措辞」变成一次红；夹具判的是响不响。
     entry = {
         "alert": name,
-        "expr": rule["promql"],
+        "expr": fires_when(rule),
         "labels": {"severity": rule.get("severity", "warning")},
     }
     if "for_seconds" in rule:

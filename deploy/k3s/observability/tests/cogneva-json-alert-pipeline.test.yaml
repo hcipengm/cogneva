@@ -1,0 +1,167 @@
+# 告警管自己那几条规则的单测夹具：谁看住看门的人。
+#
+# 这几条规则的主题不是业务，而是**告警链本身**——规则库与配置对不对得上、算出来的告警有没有
+# 出口、通知发不发得出去、签不了名的通知有没有人知道、内存带宽离界还有多远。它们坏掉的
+# 症状是「一切安静」：链子断在任何一段，读者看到的都是没有新告警。所以这一族最需要
+# 「会不会响」的证明，而不是再一条结构门。
+#
+# 规则在部署配置的进程内 watcher 那一库，不在 PrometheusRule 清单里，所以这里点名规则名，
+# 由跑者从 `deploy/helm/cogneva/files/cogneva.json` 按名字取正文（连同它自己的 `condition`）：
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-alert-pipeline.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: alert_rule_count_reading_stopped
+# rule: alert_rule_set_disagrees_with_configmap
+# rule: alert_batch_reached_no_outlet
+# rule: notification_delivery_failing
+# rule: notification_sign_refused
+# rule: alert_bound_band_reaches_bound
+
+evaluation_interval: 1m
+
+tests:
+  # 链子健康：规则数与配置一致、没有通知落空、通知都发出去也签了名、带宽没贴界。
+  # 五条都必须安静——这是「不会白红」的那一半。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_rule_count{state="agrees",pod="cogneva-0"}'
+        values: '1x20'
+      - series: 'cogneva_alert_notifications_total{outcome="no_channel"}'
+        values: '0x20'
+      - series: 'cogneva_signal_watcher_running'
+        values: '1x20'
+      - series: 'cogneva_notification_delivery_total{outlet="webui",result="ok"}'
+        values: '4x20'
+      - series: 'cogneva_notification_sign_total{outlet="webui",outcome="signed"}'
+        values: '4x20'
+      - series: 'cogneva_alert_bound_band_birth_max_bytes{namespace="cogneva"}'
+        values: '5000x20'
+      - series: 'cogneva_alert_bound_band_move_max_bytes{namespace="cogneva"}'
+        values: '200x20'
+      - series: 'cogneva_alert_bound_band_limit_bytes{namespace="cogneva"}'
+        values: '8192x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: alert_rule_count_reading_stopped
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: alert_rule_set_disagrees_with_configmap
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: alert_batch_reached_no_outlet
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: notification_delivery_failing
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: notification_sign_refused
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: alert_bound_band_reaches_bound
+        exp_alerts: []
+
+  # 每一段都断了：
+  #   - 规则数与配置对不上（agrees 掉到 0）⇒ 判不一致的那条响；
+  #   - 有告警算出来了却没有任何出口，而 watcher 自己又没在跑（没人替它兜底）⇒ 响；
+  #   - 通知投递失败、签名被拒 ⇒ 两条各自响；
+  #   - 出生占用 + 代内移动已经吃掉 limit 的 84%（界 0.81）⇒ 响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_rule_count{state="agrees",pod="cogneva-0"}'
+        values: '1x5 0x15'
+      - series: 'cogneva_alert_notifications_total{outcome="no_channel"}'
+        values: '0x5 1x15'
+      - series: 'cogneva_signal_watcher_running'
+        values: '0x20'
+      - series: 'cogneva_notification_delivery_total{outlet="webui",result="error"}'
+        values: '0x5 1x15'
+      - series: 'cogneva_notification_sign_total{outlet="webui",outcome="refused"}'
+        values: '0x5 1x15'
+      - series: 'cogneva_alert_bound_band_birth_max_bytes{namespace="cogneva"}'
+        values: '6000x20'
+      - series: 'cogneva_alert_bound_band_move_max_bytes{namespace="cogneva"}'
+        values: '1000x20'
+      - series: 'cogneva_alert_bound_band_limit_bytes{namespace="cogneva"}'
+        values: '8192x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: alert_rule_set_disagrees_with_configmap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              state: agrees
+      - eval_time: 20m
+        alertname: alert_batch_reached_no_outlet
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 20m
+        alertname: notification_delivery_failing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outlet: webui
+              result: error
+      - eval_time: 20m
+        alertname: notification_sign_refused
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outlet: webui
+              outcome: refused
+      - eval_time: 20m
+        alertname: alert_bound_band_reaches_bound
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+
+  # watcher 自己在跑的时候，「没有出口」不算故障：它就是那个出口的兜底，
+  # 落空的通知会被它自己记账。这一格守的是 `unless on()` 那条腿——删掉它，
+  # 上面那格照样绿，而这条规则会变成每次自我记账都报一次。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_notifications_total{outcome="no_channel"}'
+        values: '0x5 5x15'
+      - series: 'cogneva_signal_watcher_running'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: alert_batch_reached_no_outlet
+        exp_alerts: []
+
+  # 「规则数的读数没了」：整条序列缺席，不是权重 0。缺席与 0 是两件事——0 说「一条规则都
+  # 没装上」（那由判不一致的那条接住），缺席说「没人报数」，而后者会让这一族其余几条
+  # 一起静默地看着。
+  - interval: 1m
+    input_series:
+      - series: 'up{job="prometheus"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: alert_rule_count_reading_stopped
+        exp_alerts:
+          # `absent_over_time` 会把选择器里的等值匹配子留成标签：缺席的那条序列是什么样，
+          # 这条告警就带着它的名字与 `state`。写成「只有 severity」会红在形状上。
+          - exp_labels:
+              severity: warning
+              state: agrees
+
+  # 带宽贴着界但没过（6635 / 8192 = 0.8099）：规则写的是严格大于，差一点就是不许亮。
+  # 这一格守的是那个比较方向——写成 `>=` 时它会先红，而不是等现网哪天刚好落在 0.8100。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_bound_band_birth_max_bytes{namespace="cogneva"}'
+        values: '5635x20'
+      - series: 'cogneva_alert_bound_band_move_max_bytes{namespace="cogneva"}'
+        values: '1000x20'
+      - series: 'cogneva_alert_bound_band_limit_bytes{namespace="cogneva"}'
+        values: '8192x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: alert_bound_band_reaches_bound
+        exp_alerts: []
