@@ -1,0 +1,116 @@
+# 任务管理面「这一面还动不动」那三条告警的规则单测夹具。
+#
+# 为什么这一族此前一条规则都没有：应用一直在发布 `cogneva_task_oldest_untouched_seconds`、
+# `cogneva_task_unowned_rows` 与 `cogneva_task_graph_measure_last_seconds`，面读数也在读它们、
+# 面板也在画它们，而**没有一条规则读它们**。2026-10-24 实测那一面是 2041 行、没有一行有主、
+# 最老的一行四天没人碰过——一个任何读表的人都会叫停的局面，没有叫醒任何人。面板不是人看，
+# 这三条规则就是那个「没人看」到「有人看」之间缺的一跳。
+#
+# 三条各答一件不同的事，修法也不同：
+#   `unowned_task_untouched_past_pickup` 有人该干、没人接手，而且已经等太久（领任务的
+#     循环每分钟跑一趟，一小时＝六十趟都没人接）；
+#   `task_graph_measure_stale` 任务图还在发，但读到的是旧照片（读数停住＝面瞎了，而不是面安静）；
+#   `task_graph_measure_absent` 连印记都没了——上面那条用减法判，印记不在时它**取不到序列**，
+#     于是「没人在量」被读成「大家都同意」，这正是这一族最想抓住的形状。
+#
+# 格子：
+#   一格「有主的活等了两小时」：量到的年龄越过新规则的界，但它不在 `unassigned` 那个桶里，
+#     第一条必须静——这一格判的是选择器，不是阈值；
+#   一格「无主的活等了 4000 秒」：只有第一条响，另两条静；
+#   一格「读图的印记冻住」：只有第二条响；
+#   一格「印记整条不见」：只有第三条响，另两条**也不许响**（它们没有可减的数）。
+# 四条断言在别处都被证明过「会响」，此处再要求「该静的那几条真的静」——否则三条都写成
+# 恒真也能过。
+#
+# 跑法：
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-tasks-face.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: unowned_task_untouched_past_pickup
+# rule: task_graph_measure_stale
+# rule: task_graph_measure_absent
+
+evaluation_interval: 1m
+
+tests:
+  # 一、图是活的，活都有主：无主桶根本不存在，读图印记一拍一拍在推进。三条全静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_task_oldest_untouched_seconds{agent="agent-a",namespace="cogneva"}'
+        values: '7200x60'
+      - series: 'cogneva_task_graph_measure_last_seconds{namespace="cogneva",pod="cogneva-1"}'
+        values: '0+60x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: unowned_task_untouched_past_pickup
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: task_graph_measure_stale
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: task_graph_measure_absent
+        exp_alerts: []
+
+  # 二、有一行没人接、等了四千秒，图照常在读：只有第一条响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_task_oldest_untouched_seconds{agent="unassigned",namespace="cogneva"}'
+        values: '4000x60'
+      - series: 'cogneva_task_oldest_untouched_seconds{agent="agent-a",namespace="cogneva"}'
+        values: '120x60'
+      - series: 'cogneva_task_graph_measure_last_seconds{namespace="cogneva",pod="cogneva-1"}'
+        values: '0+60x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: unowned_task_untouched_past_pickup
+        exp_alerts:
+          - exp_labels:
+              namespace: cogneva
+              severity: warning
+      - eval_time: 30m
+        alertname: task_graph_measure_stale
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: task_graph_measure_absent
+        exp_alerts: []
+
+  # 三、印记冻在零：读图停了半小时。只有第二条响；印记还在，所以第三条（按缺席判）静——
+  # 「冻住」与「不见」是两种坏，混成一条会漏掉其中一种。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_task_graph_measure_last_seconds{namespace="cogneva",pod="cogneva-1"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: unowned_task_untouched_past_pickup
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: task_graph_measure_stale
+        exp_alerts:
+          - exp_labels:
+              namespace: cogneva
+              severity: warning
+      - eval_time: 30m
+        alertname: task_graph_measure_absent
+        exp_alerts: []
+
+  # 四、印记整条不见：序列都不在，减法那条无可减，只有第三条响。
+  - interval: 1m
+    input_series:
+      - series: 'up{job="cogneva"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: unowned_task_untouched_past_pickup
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: task_graph_measure_stale
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: task_graph_measure_absent
+        exp_alerts:
+          - exp_labels:
+              severity: warning

@@ -1312,6 +1312,36 @@
           "face": "任务管理"
         },
         {
+          "name": "unowned_task_untouched_past_pickup",
+          "promql": "max by (namespace) (cogneva_task_oldest_untouched_seconds{agent=\"unassigned\"})",
+          "condition": {
+            "greater_than": 3600.0
+          },
+          "severity": "warning",
+          "summary": "The oldest task nobody owns has gone {value}s without changing state. Neither reading beside this one can say that: the count by status says how much work is queued and the unowned rows say how much of it has nobody behind it, while a queue being drained and a queue nobody reads look identical until someone asks when the oldest row was last touched. The claim loop hands out work every minute, so an hour is sixty passes that ended with nobody taking this row — well past a burst, and short enough that the work is still worth resuming rather than rebuilding. Read cogneva_task_unowned_rows beside this one for how much of the graph is in that shape, because one stranded row and a thousand produce the same age and call for different urgency. The cell for the shared unassigned bucket exists only while such a row does, so this rule is quiet when nothing is unowned, and the quiet is the healthy reading rather than a missing one. The age is taken as the largest value any process reports: each process derives it from its own read of the store, so the maximum says at least this long, which is the direction a threshold needs, while summing would make the number grow with the number of readers.",
+          "face": "任务管理"
+        },
+        {
+          "name": "task_graph_measure_stale",
+          "promql": "time() - max by (namespace) (cogneva_task_graph_measure_last_seconds)",
+          "condition": {
+            "greater_than": 900.0
+          },
+          "severity": "warning",
+          "summary": "The task graph has not been read successfully for {value}s, so every number on this face is a photograph of an earlier moment. The rows and ages are deliberately kept across a failed read — that is what makes the failure show as a frozen graph instead of a blank one — but a frozen graph looks exactly like a quiet system, and the face's own counts keep answering with the shape they had when the reading stopped. The age is computed from the producer's stamp of its last successful read rather than from the scrape, so a scrape that keeps arriving with an unchanged number cannot hide it. Compare it with cogneva_task_graph_measure_failures_total: that counter moving means the store is refusing reads, and it not moving means the loop that reads the graph is not running at all. The staleness is read as the freshest stamp any process reports: a process still reading the graph proves the reading is alive, and the per-process cells stay separate only so a rollout's leftover pod cannot outvote the one that is working.",
+          "face": "任务管理"
+        },
+        {
+          "name": "task_graph_measure_absent",
+          "promql": "absent_over_time(cogneva_task_graph_measure_last_seconds[15m])",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "Nothing has published the task graph's last-read stamp for fifteen minutes, so the reading this face is built on is gone rather than frozen. The stale rule beside this one cannot cover it: it subtracts from a stamp, and an absent stamp leaves it with no series to subtract from, which reads as agreement exactly when the answer is that nobody is measuring. Fifteen minutes is three scrape intervals plus slack, long enough that a scrape slowing down does not raise it and short enough that a face that has gone blind is reported inside a quarter of an hour. Read the application's own health beside it: if the process is serving other series and only this family is missing, the observable was dropped from the scrape; if nothing at all is arriving, the fault is the process, and this rule is the first place it shows up.",
+          "face": "任务管理"
+        },
+        {
           "name": "runtime_asset_not_refreshed",
           "promql": "max without (pod, container, instance) (cogneva_runtime_asset_state{state=\"not_refreshed\"}) > 0",
           "condition": {
