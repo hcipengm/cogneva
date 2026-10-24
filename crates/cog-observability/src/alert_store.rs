@@ -309,6 +309,46 @@ impl PostgresAlertStore {
         }
     }
 
+    /// Close the firing rows of `rule` that nothing has refreshed since `stale_before`.
+    ///
+    /// Some rules describe a process's own in-memory bookkeeping rather than
+    /// the cluster: `agent_unhealthy` is raised per agent id the supervisor's
+    /// registry has stopped hearing from, and the only thing that keeps the row
+    /// open is the same process saying so on the next pass. When that process
+    /// restarts it comes back with an empty registry, so nothing will ever name
+    /// those ids again — the rows stay firing for good. Measured on
+    /// 2026-10-24: 3992 firing `agent_unhealthy` rows, the oldest untouched
+    /// since 08:40 that morning, while sixteen live agents refreshed theirs
+    /// every ten seconds. A surface that shows four thousand alerts nobody can
+    /// act on is a surface nobody reads.
+    ///
+    /// The predicate is the liveness clock, not the rule alone: a row whose
+    /// `last_seen_at` has not moved for several health intervals describes an
+    /// agent the live pass is not looking at. Resolving it is safe in the only
+    /// direction that matters — an agent that is genuinely still unhealthy
+    /// re-fires on the next pass through the same dedup key, so a wrong guess
+    /// repairs itself within one interval.
+    ///
+    /// Answers how many rows it closed.
+    pub async fn resolve_unrefreshed(
+        &self,
+        rule: &str,
+        stale_before: DateTime<Utc>,
+    ) -> anyhow::Result<u64> {
+        let now = Utc::now();
+        let closed = sqlx::query(
+            "UPDATE alerts SET state = 'resolved', resolved_at = $1, updated_at = $1 \
+             WHERE rule = $2 AND state = 'firing' \
+               AND (last_seen_at IS NULL OR last_seen_at < $3)",
+        )
+        .bind(now)
+        .bind(rule)
+        .bind(stale_before)
+        .execute(&self.pool)
+        .await?;
+        Ok(closed.rows_affected())
+    }
+
     /// Record that `by` has seen the firing alert under `dedup_key`, answering
     /// when — or `None` when there is no firing row to acknowledge.
     ///

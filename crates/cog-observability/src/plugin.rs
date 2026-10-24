@@ -771,6 +771,13 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                         alert_store,
                         &supervisor,
                         ctx.consume_service::<dyn cog_core::MetricsBackend>(),
+                        // Ten health passes. The row's liveness clock moves on
+                        // every pass for an agent the registry still tracks, so
+                        // this many misses cannot be a busy pass -- only the id
+                        // having left the registry, or a previous process life.
+                        std::time::Duration::from_secs(
+                            ctx.config().supervisor.health_interval_secs.max(1) * 10,
+                        ),
                         bridge_stop,
                     );
                     // Report both outlets, not just the HTTP ones. With no
@@ -1349,6 +1356,9 @@ const ALERT_BELL_INTERVAL_SECS: u64 = 60;
 /// 一轮最多发多少条。存量补发时不要一次写几千行把这一轮的墙钟撑破。
 const ALERT_BELL_BATCH: i64 = 200;
 
+// 参数多是因为这一环的每个入参都来自不同的插件服务，把它们捆成一个结构体只是把
+// 「谁给了什么」藏进构造点；这里逐个点名反而更好读。
+#[allow(clippy::too_many_arguments)]
 fn spawn_alert_bridge(
     channels: Vec<AlertChannel>,
     timeout_secs: u64,
@@ -1356,6 +1366,10 @@ fn spawn_alert_bridge(
     store: Option<Arc<PostgresAlertStore>>,
     supervisor: &Arc<dyn cog_core::Supervisor>,
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    // How long a firing row of a per-process rule may go unrefreshed before
+    // the bridge closes it. Several health passes, so a live pass always
+    // beats it to the row.
+    row_stale_after: std::time::Duration,
     stop: cog_core::ShutdownSignal,
 ) -> Option<Arc<crate::alerts::AlertManager>> {
     let manager = alert_manager(
@@ -1383,6 +1397,37 @@ fn spawn_alert_bridge(
             let metrics = metrics.clone();
             let stop = stop.clone();
             async move {
+                // 先收掉上一个进程留下的按进程告警行。
+                //
+                // `agent_unhealthy` 说的是「本进程的注册表多久没听见这个 agent」：注册表在
+                // 内存里，进程重启后它从空开始，于是重启前那一批 id 再也不会被谁提起，它们
+                // 的行就永远停在 firing。2026-10-24 实测 3992 行，最老的一行从当天 08:40 起
+                // 没人刷新过，而活着的 16 个 agent 每十秒刷新一次。判据是**存活钟**而不是
+                // 规则名：一条 `last_seen_at` 好几个健康周期没动过的行，说的就是这个进程
+                // 没在看它。收掉它只在一个方向上可能猜错——真的还不健康的 agent 会在下一拍
+                // 用同一个 dedup 键重新点亮，一个周期内自愈。
+                if let Some(store) = store.clone() {
+                    let stale_before = chrono::Utc::now()
+                        - chrono::Duration::from_std(row_stale_after)
+                            .unwrap_or_else(|_| chrono::Duration::seconds(600));
+                    match store
+                        .resolve_unrefreshed("agent_unhealthy", stale_before)
+                        .await
+                    {
+                        Ok(0) => {}
+                        Ok(n) => warn!(
+                            resolved = n,
+                            "closed unhealthy-agent rows that no live health pass has \
+                             refreshed; they belong to a previous life of this process \
+                             and nothing would ever have moved them again"
+                        ),
+                        Err(e) => warn!(
+                            error = %e,
+                            "could not close the unhealthy-agent rows left unrefreshed; \
+                             the alert surface keeps showing them as live"
+                        ),
+                    }
+                }
                 // 三种结局分开写：`Lagged` 也是一个 `Err`，`while let Ok(..)` 会把它读成
                 // 「订阅结束」，于是这条桥静静退出——告警**从此不再落库**，而数据库里那张
                 // 表看起来与「这段时间没有告警」一模一样。这条桥没有别的存活读数。

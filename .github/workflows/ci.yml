@@ -260,6 +260,17 @@ jobs:
         run: cargo test -p cog-storage --test notification_retention -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The sweep that closes the alert rows a dead process left firing is two
+      # predicates in one statement, and only the server can say which rows a
+      # WHERE kept: the liveness clock (a row nothing has refreshed) and the
+      # rule name (whose rows these are). Drop the clock and a live alert is
+      # closed the moment the bridge starts; drop the rule and every other
+      # producer's stale row goes with it, with nobody left to re-raise it.
+      # Both regressions still close *some* rows and still report a count.
+      - name: Live-DB alert row sweep
+        run: cargo test -p cog-observability --test alert_row_sweep -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Which replica may act is decided by one statement, and the acceptance
       # for it is a question about two processes: two asks landing at once leave
       # exactly one holder, and a holder that stops renewing loses the role to
