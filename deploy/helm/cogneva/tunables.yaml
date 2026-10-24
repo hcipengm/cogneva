@@ -1271,6 +1271,45 @@ rows:
     why: >-
       Burst room over the resident cost. Not derived from a reading.
 
+  # --- web search (SearXNG) ---------------------------------------------------
+  - key: webSearch.replicas
+    source: fixed
+    why: >-
+      One in-cluster instance answers every agent's web_search call. A second
+      replica would add capacity that nothing measures: the call path caps how
+      many results it reads, and no reading of queue depth or query latency is
+      fed back into this number. A deployment that runs it hot raises this by
+      hand.
+
+  - key: webSearch.resources.requests.cpu
+    source: override
+    why: >-
+      A request, not a measurement: without one the scheduler treats the Pod as
+      BestEffort and evicts it first, and an evicted search backend turns every
+      web_search call into a failure. Sized from an idle serving cost observed
+      when the instance was added; nothing reads that cost back.
+
+  - key: webSearch.resources.requests.memory
+    source: override
+    why: >-
+      The resident cost of an idle SearXNG process with its engines loaded. A
+      derived value would read the measured working set; nothing does.
+
+  - key: webSearch.resources.limits.cpu
+    source: override
+    why: >-
+      Burst room for concurrent queries. Each query is a fan-out to upstream
+      engines, so the burst is longer than a single request; no reading of query
+      latency or concurrency is fed back into this number.
+
+  - key: webSearch.resources.limits.memory
+    source: override
+    why: >-
+      Burst room over the resident cost for one query's parsed pages. Not derived
+      from a reading. This number and the namespace quota are one knob in two
+      places: the governance check refuses a ceiling the quota cannot admit, so
+      raising it alone stops the next rollout rather than this Pod.
+
   # --- platform webhook -------------------------------------------------------
   - key: webhook.nodePort
     source: fixed

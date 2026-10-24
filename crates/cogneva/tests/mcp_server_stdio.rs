@@ -68,6 +68,8 @@ async fn the_binary_lists_its_tools_and_reads_a_file_on_request() {
             "raw_list",
             "read_file",
             "run_command",
+            "web_fetch",
+            "web_search",
             "write_file",
         ],
         "the tool set is the whole built-in one, in a stable order"
