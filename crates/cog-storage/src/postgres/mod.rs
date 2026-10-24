@@ -1,6 +1,7 @@
 pub mod audit_recorder;
 pub mod backup_run_store;
 pub mod change_ledger_store;
+pub mod chat_turn_store;
 pub mod decision_stats_store;
 pub mod governance_store;
 pub mod hook_archive;
@@ -18,6 +19,9 @@ pub mod user_store;
 pub use audit_recorder::PostgresAuditRecorder;
 pub use backup_run_store::PostgresBackupRunStore;
 pub use change_ledger_store::PostgresChangeLedgerStore;
+pub use chat_turn_store::{
+    ChatTurn, ChatTurnRole, ChatTurnStore, PostgresChatTurnStore, ROWS_KEPT_PER_SESSION,
+};
 pub use decision_stats_store::PostgresDecisionStatsStore;
 pub use governance_store::PostgresGovernanceStore;
 pub use hook_archive::{HookArchiveRow, PostgresHookArchive};

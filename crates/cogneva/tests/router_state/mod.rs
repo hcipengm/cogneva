@@ -205,9 +205,7 @@ pub fn stateless() -> Arc<GatewayState> {
         taste_intent_sink: None,
         llm_usage_reader: None,
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
-        chat_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        chat_turns: None,
     })
 }
 

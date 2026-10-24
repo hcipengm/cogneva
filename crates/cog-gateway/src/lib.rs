@@ -85,12 +85,14 @@ pub use state::{AuthState, HttpState, InfraState, OpsState, RuntimeState};
 
 /// Shared slot for the LLM client used by the WebSocket chat handler.
 pub type SharedLlmClient = Arc<std::sync::RwLock<Option<Arc<dyn cog_core::LlmClient>>>>;
-/// Per-session chat histories: session_id → (messages oldest-first, last-touched).
-pub type ChatSessionStore = Arc<
-    tokio::sync::Mutex<
-        std::collections::HashMap<String, (Vec<cog_core::Message>, chrono::DateTime<chrono::Utc>)>,
-    >,
->;
+/// The chat transcript, when this deployment has a database behind it.
+///
+/// `None` is a deployment without that database, and it is not a second store:
+/// the turn still answers, and nothing is written down. What it must never be is
+/// a process-local map standing in for the table -- that is the shape this type
+/// replaced, where a restart quietly took every conversation with it while the
+/// schema still said the history was kept.
+pub type ChatTurnHandle = Option<Arc<dyn cog_storage::ChatTurnStore>>;
 
 /// Consumer names for [`cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL`].
 ///
@@ -325,7 +327,7 @@ pub struct GatewayState {
     pub llm_client: SharedLlmClient,
     /// Per-session chat history for the WebSocket chat handler
     /// (session_id → messages, oldest first, capped).
-    pub chat_sessions: ChatSessionStore,
+    pub chat_turns: ChatTurnHandle,
 }
 
 impl GatewayState {

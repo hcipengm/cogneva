@@ -86,6 +86,7 @@ pub async fn build_gateway_state(
     taste_intent_sink: &Option<Arc<dyn cog_core::TasteIntentSink>>,
     llm_usage_reader: &Option<Arc<dyn cog_core::LlmUsageReader>>,
     governance_store: &Option<Arc<dyn cog_core::GovernanceStore>>,
+    chat_turns: &crate::ChatTurnHandle,
     shutdown: &cog_core::ShutdownSignal,
 ) -> Result<Arc<crate::GatewayState>, Box<dyn std::error::Error>> {
     // Cache of the supervisor's event channel, filled by the drain task below.
@@ -169,7 +170,7 @@ pub async fn build_gateway_state(
         taste_intent_sink: taste_intent_sink.clone(),
         llm_usage_reader: llm_usage_reader.clone(),
         llm_client: Arc::new(std::sync::RwLock::new(None)),
-        chat_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        chat_turns: chat_turns.clone(),
     });
 
     // Drain the supervisor's event channel into the cache. A lagged reader

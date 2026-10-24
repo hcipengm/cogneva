@@ -59,12 +59,13 @@ pub use mem::{
 
 #[cfg(feature = "postgres")]
 pub use postgres::{
-    HookArchiveRow, PostgresAuditRecorder, PostgresBackupRunStore, PostgresChangeLedgerStore,
+    ChatTurn, ChatTurnRole, ChatTurnStore, HookArchiveRow, PostgresAuditRecorder,
+    PostgresBackupRunStore, PostgresChangeLedgerStore, PostgresChatTurnStore,
     PostgresDecisionStatsStore, PostgresGovernanceStore, PostgresHookArchive,
     PostgresMetricsBackend, PostgresNotificationStore, PostgresObservabilityGateway,
     PostgresPrincipleLedgerStore, PostgresRawLogIndexStore, PostgresResourceEventStore,
     PostgresSnapshotStore, PostgresStateBackend, PostgresTasteIntentStore, PostgresUserStore,
-    EVENTS_PAGE_SQL, GAUGE_LATEST_SQL,
+    EVENTS_PAGE_SQL, GAUGE_LATEST_SQL, ROWS_KEPT_PER_SESSION,
 };
 
 #[cfg(feature = "redis")]

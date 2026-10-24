@@ -12,10 +12,11 @@ use crate::websocket_protocol::ServerMessage;
 use crate::GatewayState;
 use cog_observability::usage_store::LlmOrigin;
 
-/// Per-session history cap (user + assistant messages combined).
+/// 一次请求里最多带多少条历史（用户与助手合计）。
+///
+/// 这是「装得进一次请求」的界，不是「存得下多少」的界：记录本身留在库里，按会话
+/// 自己的上界裁剪，见存储面。
 const SESSION_HISTORY_CAP: usize = 40;
-/// Hard bound on concurrent session histories; oldest-touched evicted first.
-const MAX_SESSIONS: usize = 256;
 /// Connecting to the LLM backend should be fast; the failover pool handles
 /// slow backends by switching.
 const CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -170,6 +171,61 @@ fn goal_report(goal_id: &str, row: Option<&cog_core::Task>) -> String {
     }
 }
 
+/// 这一轮给模型看的历史：最近 [`SESSION_HISTORY_CAP`] 条，旧的最先。
+///
+/// 读不到就按「没有历史」回答，不按「历史是空的」记一笔：这两种在读数上要分得开，
+/// 而这一趟能做的只有回答——拿一个读不到的库把聊天停掉，是把「不知道」当成「没有」。
+async fn load_history(store: &crate::ChatTurnHandle, session_id: &str) -> Vec<cog_core::Message> {
+    let Some(store) = store else {
+        tracing::warn!(
+            session = %session_id,
+            "聊天：这套部署没有聊天记录库，这一轮没有历史上下文"
+        );
+        return Vec::new();
+    };
+    match store.history(session_id, SESSION_HISTORY_CAP).await {
+        Ok(turns) => turns_to_messages(turns),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                session = %session_id,
+                "聊天：历史读不出来，这一轮按没有上下文回答"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// 记录里的一行变成模型看得懂的一条。角色的闭集在存储面，这里只做搬运。
+fn turns_to_messages(turns: Vec<cog_storage::ChatTurn>) -> Vec<cog_core::Message> {
+    turns
+        .into_iter()
+        .map(|turn| match turn.role {
+            cog_storage::ChatTurnRole::User => cog_core::Message::user(turn.content),
+            cog_storage::ChatTurnRole::Assistant => cog_core::Message::assistant_text(turn.content),
+        })
+        .collect()
+}
+
+/// 把这一轮写进记录。写不进去只留一条 warn：用户已经在等一个回答，拿「记不下来」
+/// 把回答吞掉，比丢一行历史更糟。
+async fn record_turn(store: &crate::ChatTurnHandle, session_id: &str, user: &str, assistant: &str) {
+    let Some(store) = store else {
+        tracing::warn!(
+            session = %session_id,
+            "聊天：这套部署没有聊天记录库，这一轮不会留下记录"
+        );
+        return;
+    };
+    if let Err(e) = store.record_turn(session_id, user, assistant).await {
+        tracing::warn!(
+            error = %e,
+            session = %session_id,
+            "聊天：这一轮没写进记录"
+        );
+    }
+}
+
 /// Run one chat turn: echo the user message, stream the LLM reply delta by
 /// delta (typewriter style — the routing layer still fails over transparently
 /// if a backend errors before the first content delta), and record the turn in
@@ -218,17 +274,15 @@ pub async fn run_chat_turn(
         // 这一行下面。当场定下来才报得出「是哪个目标」，用户也才有得可查——空 `tasks`
         // 那条提交形态同样合法，但那样身份的诞生就落在了分解里面，读的人拿不到。
         let goal_id = uuid::Uuid::new_v4().to_string();
-        emit_delta(
-            &out,
-            &session_id,
-            &assistant_mid,
-            &format!(
-                "收到，这是可执行意图。已作为目标 {goal_id} 提交给编排器：分解为任务后由 squad 接管执行，\
-                 进度会实时出现在右侧目标流水线（按 goal_id={goal_id} 可查）；分解完成或失败我都会在这里回报。"
-            ),
-        )
-        .await;
+        let ack = format!(
+            "收到，这是可执行意图。已作为目标 {goal_id} 提交给编排器：分解为任务后由 squad 接管执行，\
+             进度会实时出现在右侧目标流水线（按 goal_id={goal_id} 可查）；分解完成或失败我都会在这里回报。"
+        );
+        emit_delta(&out, &session_id, &assistant_mid, &ack).await;
         emit_message_end(&out, &session_id, &assistant_mid).await;
+        // 可执行意图这一支也要留痕：下一次追问「刚才那个目标怎么样了」时，历史里
+        // 得有这次提交，否则模型只看见一句没头没尾的追问。
+        record_turn(&state.chat_turns, &session_id, &content, &ack).await;
 
         let orchestrator = state.orchestrator.clone();
         let out2 = out.clone();
@@ -256,13 +310,7 @@ pub async fn run_chat_turn(
     }
 
     // 3. Build the request from session history + the new user message.
-    let mut messages = {
-        let sessions = state.chat_sessions.lock().await;
-        sessions
-            .get(&session_id)
-            .map(|(msgs, _)| msgs.clone())
-            .unwrap_or_default()
-    };
+    let mut messages = load_history(&state.chat_turns, &session_id).await;
     messages.insert(0, cog_core::Message::system(CHAT_SYSTEM_PROMPT));
     messages.push(cog_core::Message::user(content.clone()));
 
@@ -399,32 +447,14 @@ pub async fn run_chat_turn(
     // 5. Record the turn (skip failed/timeout replies — they are not useful
     //    context for later turns).
     if failure.is_none() && !reply.is_empty() {
-        let mut sessions = state.chat_sessions.lock().await;
-        if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(&session_id) {
-            if let Some(oldest) = sessions
-                .iter()
-                .min_by_key(|(_, (_, ts))| *ts)
-                .map(|(k, _)| k.clone())
-            {
-                sessions.remove(&oldest);
-            }
-        }
-        let entry = sessions
-            .entry(session_id)
-            .or_insert_with(|| (Vec::new(), chrono::Utc::now()));
-        entry.0.push(cog_core::Message::user(content));
-        entry.0.push(cog_core::Message::assistant_text(reply));
-        if entry.0.len() > SESSION_HISTORY_CAP {
-            let drop = entry.0.len() - SESSION_HISTORY_CAP;
-            entry.0.drain(..drop);
-        }
-        entry.1 = chrono::Utc::now();
+        record_turn(&state.chat_turns, &session_id, &content, &reply).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cog_storage::ChatTurnStore;
 
     /// 判退落在目标行的 `Failed` 上、`submit_goal_auto` 照样返回 `Ok`——所以回报必须
     /// 读那一行，否则失败会被报成「已受理，进度见右侧」，用户去右侧只会等一个不会来的
@@ -472,6 +502,124 @@ mod tests {
         let text = goal_report("goal-4", None);
         assert!(text.contains("没有被记下"), "{text}");
         assert!(!text.contains("已受理"), "{text}");
+    }
+
+    /// 历史从记录里来，不从这个进程的内存里来。
+    ///
+    /// 这一格替换掉的是那个 `HashMap`：它在同一个进程里读自己刚写的东西，所以
+    /// 「历史还在」这件事在重启之前永远为真——而重启正是要证明的那一件事。
+    #[tokio::test]
+    async fn the_history_the_model_sees_comes_from_the_store() {
+        let store = std::sync::Arc::new(FakeTurns::default());
+        store
+            .record_turn("s1", "上一问", "上一答")
+            .await
+            .expect("seed the fake transcript");
+        let handle: crate::ChatTurnHandle = Some(store.clone());
+
+        let messages = load_history(&handle, "s1").await;
+        assert_eq!(
+            messages.iter().map(|m| m.role()).collect::<Vec<_>>(),
+            vec!["user", "assistant"]
+        );
+        assert_eq!(messages[0].content(), "上一问");
+        assert_eq!(messages[1].content(), "上一答");
+        // 上下文窗口的界要有人传给存储面，否则「最近 40 条」只是这里的一句注释。
+        assert_eq!(*store.last_limit.lock().await, Some(SESSION_HISTORY_CAP));
+    }
+
+    /// 回答出来的这一轮必须写进记录，且是作为一问一答一起写。
+    #[tokio::test]
+    async fn an_answered_turn_is_written_down_as_a_pair() {
+        let store = std::sync::Arc::new(FakeTurns::default());
+        let handle: crate::ChatTurnHandle = Some(store.clone());
+        record_turn(&handle, "s1", "问", "答").await;
+        let held = store.turns.lock().await.clone();
+        assert_eq!(
+            held,
+            vec![
+                cog_storage::ChatTurn {
+                    role: cog_storage::ChatTurnRole::User,
+                    content: "问".into()
+                },
+                cog_storage::ChatTurn {
+                    role: cog_storage::ChatTurnRole::Assistant,
+                    content: "答".into()
+                },
+            ]
+        );
+    }
+
+    /// 没有记录库的部署：照样回答，不假装有历史，也不悄悄记在别处。
+    #[tokio::test]
+    async fn a_deployment_without_a_store_answers_without_history() {
+        let handle: crate::ChatTurnHandle = None;
+        assert!(load_history(&handle, "s1").await.is_empty());
+        // 不发散：这里只要求「不写进任何东西」——没有第二个家可写。
+        record_turn(&handle, "s1", "问", "答").await;
+    }
+
+    /// 读记录失败按「没有历史」回答，而不是按「历史是空的」记一笔。
+    #[tokio::test]
+    async fn a_transcript_that_cannot_be_read_answers_without_context() {
+        let store = std::sync::Arc::new(FakeTurns::default());
+        store
+            .record_turn("s1", "问", "答")
+            .await
+            .expect("seed the fake transcript");
+        store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let handle: crate::ChatTurnHandle = Some(store.clone());
+        assert!(load_history(&handle, "s1").await.is_empty());
+        // 写也失败时不许把这一轮的回答吞掉：record_turn 只留 warn。
+        record_turn(&handle, "s1", "问", "答").await;
+    }
+
+    /// 一份内存里的记录，只作测试替身。生产里没有它的对应物——这次改动拆掉的
+    /// 正是那样一张表。
+    #[derive(Default)]
+    struct FakeTurns {
+        turns: tokio::sync::Mutex<Vec<cog_storage::ChatTurn>>,
+        last_limit: tokio::sync::Mutex<Option<usize>>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_storage::ChatTurnStore for FakeTurns {
+        async fn record_turn(
+            &self,
+            session_id: &str,
+            user: &str,
+            assistant: &str,
+        ) -> cog_core::SFResult<()> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(cog_core::SFError::Database("unreachable".into()));
+            }
+            let mut held = self.turns.lock().await;
+            if session_id != "s1" {
+                return Ok(());
+            }
+            held.push(cog_storage::ChatTurn {
+                role: cog_storage::ChatTurnRole::User,
+                content: user.to_string(),
+            });
+            held.push(cog_storage::ChatTurn {
+                role: cog_storage::ChatTurnRole::Assistant,
+                content: assistant.to_string(),
+            });
+            Ok(())
+        }
+
+        async fn history(
+            &self,
+            _session_id: &str,
+            limit: usize,
+        ) -> cog_core::SFResult<Vec<cog_storage::ChatTurn>> {
+            *self.last_limit.lock().await = Some(limit);
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(cog_core::SFError::Database("unreachable".into()));
+            }
+            Ok(self.turns.lock().await.clone())
+        }
     }
 
     #[test]
