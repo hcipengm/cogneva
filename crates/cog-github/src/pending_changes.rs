@@ -147,6 +147,7 @@ mod tests {
             self_review_score: None,
             issue_number: None,
             intent: Some(cog_core::EvolutionIntent::IssueFix),
+            producer: None,
         }
     }
 

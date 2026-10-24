@@ -111,6 +111,21 @@ pub struct GeneratedChange {
     /// nothing exactly when the backlog is oldest. Records written before this
     /// field read as `None`, which the census reports as unattributed.
     pub intent: Option<crate::types::task::EvolutionIntent>,
+    /// The agent that produced this change, by the id it registers under
+    /// (`luna-1822ab0e`).
+    ///
+    /// Carried on the change rather than resolved when the change lands:
+    /// landing runs after the task row is gone, so a commit that had to look
+    /// the producer up would sign every old change with the platform instead
+    /// of with whoever did the work. Employee ids outlive rollouts, so a name
+    /// written here still resolves to a live registrant later.
+    ///
+    /// `None` on records written before this field and on any change whose
+    /// producer is not known; landing then signs with the instance identity
+    /// and adds no producer trailer, rather than attributing the work to a
+    /// guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<String>,
 }
 
 /// Which deterministic criterion a generated change failed.

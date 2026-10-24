@@ -4584,6 +4584,7 @@ mod tests {
             self_review_score: Some(0.85),
             issue_number: Some(4),
             intent: Some(cog_core::EvolutionIntent::IssueFix),
+            producer: None,
         }
     }
 

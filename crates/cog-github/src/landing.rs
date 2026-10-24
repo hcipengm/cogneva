@@ -952,8 +952,12 @@ impl MainChannel {
             }
         }
         run_git(&wt, &["add", "-A"]).await?;
-        self.commit(&wt, &commit_message(&self.config.bot_identity, change))
-            .await?;
+        self.commit(
+            &wt,
+            &commit_message(&self.config.bot_identity, change),
+            change.producer.as_deref(),
+        )
+        .await?;
         let rev = run_git(&wt, &["rev-parse", "HEAD"])
             .await?
             .trim()
@@ -1026,15 +1030,15 @@ impl MainChannel {
         Ok(wt)
     }
 
-    async fn commit(&self, dir: &Path, message: &str) -> Result<()> {
-        let identity = &self.config.bot_identity;
+    async fn commit(&self, dir: &Path, message: &str, producer: Option<&str>) -> Result<()> {
+        let (name, email) = commit_author(&self.config.bot_identity, producer);
         run_git(
             dir,
             &[
                 "-c",
-                &format!("user.name={}", identity.git_author_name()),
+                &format!("user.name={name}"),
                 "-c",
-                &format!("user.email={}", identity.git_author_email()),
+                &format!("user.email={email}"),
                 "commit",
                 "-m",
                 message,
@@ -1345,7 +1349,10 @@ impl MainChannel {
              {CHANGE_ID_TRAILER}: revert-{}\n",
             record.change.change_id, record.landed_rev, record.change.change_id
         );
-        self.commit(&wt, &message).await?;
+        // 回退由平台发起（CI 红了、判定撤回），不是哪位员工做的，所以署名
+        // 留在实例身份上：把平台的动作记成员工的动作，读历史的人会去找一个
+        // 从没做过这件事的人。
+        self.commit(&wt, &message, None).await?;
         let rev = run_git(&wt, &["rev-parse", "HEAD"])
             .await?
             .trim()
@@ -1938,12 +1945,13 @@ fn commit_message(identity: &BotIdentityConfig, change: &GeneratedChange) -> Str
             change.affected_files.join(", ")
         ));
     }
-    body.push_str(&format!(
-        "\n{}: {}\n\n{}\n",
-        CHANGE_ID_TRAILER,
-        change.change_id,
-        identity_signoff(identity)
-    ));
+    body.push_str(&format!("\n{}: {}\n", CHANGE_ID_TRAILER, change.change_id));
+    // 员工署名是这条变更的产出者，不是提交它的平台：读提交的人问的是
+    // "这活是谁干的"，而平台对每一条都签得到，签了等于没签。
+    if let Some(producer) = &change.producer {
+        body.push_str(&format!("Produced-by: {producer}\n"));
+    }
+    body.push_str(&format!("\n{}\n", identity_signoff(identity)));
     body
 }
 
@@ -2075,6 +2083,20 @@ fn commit_scope(change: &GeneratedChange) -> &str {
             (!name.is_empty()).then_some(name)
         })
         .unwrap_or("cogneva")
+}
+
+/// The git author a landing is committed under.
+///
+/// The employee who produced the change when the change names one, the
+/// instance otherwise. `git log --format=%an` then answers "who made this
+/// change" with a name that still resolves to a registrant, and old records
+/// (written before the field existed) keep the instance author instead of
+/// being attributed to whoever happens to be live now.
+fn commit_author(identity: &BotIdentityConfig, producer: Option<&str>) -> (String, String) {
+    match producer {
+        Some(id) => (id.to_string(), format!("{id}@cogneva.ai")),
+        None => (identity.git_author_name(), identity.git_author_email()),
+    }
 }
 
 fn identity_signoff(identity: &BotIdentityConfig) -> String {
@@ -2484,6 +2506,7 @@ mod tests {
             self_review_score: Some(0.9),
             issue_number: None,
             intent: Some(cog_core::EvolutionIntent::CiFix),
+            producer: None,
         }
     }
 
@@ -3336,6 +3359,39 @@ mod tests {
         let err = channel(policy).land(&ch, None).await.unwrap_err();
 
         assert!(err.to_string().contains("over the 1-line cap"), "{err}");
+    }
+
+    /// 提交里的署名要指向干活的那一位：平台对每一条变更都签得到，签了等于
+    /// 没签；读者从历史里要找的是"这活是谁干的"。
+    #[test]
+    fn a_landing_names_the_agent_that_produced_it() {
+        let mut produced = change("chg-42", "diff");
+        produced.producer = Some("luna-1822ab0e".into());
+
+        let msg = commit_message(&BotIdentityConfig::default(), &produced);
+        assert!(msg.contains("Produced-by: luna-1822ab0e"), "{msg}");
+
+        let (name, email) = commit_author(&BotIdentityConfig::default(), Some("luna-1822ab0e"));
+        assert_eq!(name, "luna-1822ab0e");
+        assert_eq!(email, "luna-1822ab0e@cogneva.ai");
+    }
+
+    /// 产出者未知时不许猜：署名退回实例身份，提交体里也不出现空的
+    /// `Produced-by`，否则读的人会以为有一条记录是某个员工做的。
+    #[test]
+    fn a_change_without_a_known_producer_keeps_the_instance_signature() {
+        let msg = commit_message(&BotIdentityConfig::default(), &change("chg-42", "diff"));
+        assert!(!msg.contains("Produced-by:"), "{msg}");
+
+        let identity = BotIdentityConfig {
+            fingerprint: Some(
+                "a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1a3f9d2c1".into(),
+            ),
+            ..Default::default()
+        };
+        let (name, email) = commit_author(&identity, None);
+        assert_eq!(name, identity.git_author_name());
+        assert_eq!(email, identity.git_author_email());
     }
 
     #[test]

@@ -817,6 +817,7 @@ impl CollaborationExecutor {
                     &Self::pge_mode_str(&result.pge_mode),
                     task.input.get("issue_number").and_then(|v| v.as_u64()),
                     &task.id,
+                    task.agent_id.as_deref(),
                     task.evolution_intent(),
                 ) {
                     // The cause is what came back with the emptiness, and it is
@@ -1161,6 +1162,7 @@ impl CollaborationExecutor {
         pge_mode: &str,
         issue_number: Option<u64>,
         task_id: &str,
+        producer: Option<&str>,
         intent: Option<cog_core::EvolutionIntent>,
     ) -> Result<Vec<cog_core::GeneratedChange>, ChangeYieldOutcome> {
         let mut changes = Vec::new();
@@ -1216,6 +1218,7 @@ impl CollaborationExecutor {
                 self_review_score: Self::extract_score(squad_result).map(|s| s as f32),
                 issue_number,
                 intent,
+                producer: producer.map(str::to_string),
             });
         }
 
@@ -2665,6 +2668,7 @@ mod tests {
             None,
             "task-1",
             None,
+            None,
         )
         .expect("the diff the debate produced must reach the sink");
 
@@ -2673,6 +2677,38 @@ mod tests {
             changes[0].affected_files,
             vec!["crates/cog-core/src/lib.rs".to_string()]
         );
+    }
+
+    /// 产出这条变更的员工要跟着变更走。落地发生在任务行消失之后，那一步
+    /// 没有别的地方能查到是谁做的；漏记这一位，提交就只剩平台署名。
+    #[test]
+    fn a_change_carries_the_agent_that_produced_it() {
+        use crate::squad::pge::types::Artifact;
+
+        let diff = "--- a/crates/cog-core/src/lib.rs\n\
+                    +++ b/crates/cog-core/src/lib.rs\n\
+                    @@ -1 +1 @@\n\
+                    -old\n\
+                    +new\n";
+        let squad_result = roundtable_squad_result(vec![Artifact {
+            name: "change.diff".into(),
+            content: diff.into(),
+            artifact_type: "change".into(),
+        }]);
+
+        let changes = CollaborationExecutor::extract_changes(
+            &squad_result,
+            "goal",
+            "roundtable",
+            None,
+            "task-1",
+            Some("luna-1822ab0e"),
+            None,
+        )
+        .expect("the diff the debate produced must reach the sink");
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].producer.as_deref(), Some("luna-1822ab0e"));
     }
 
     /// The reading that the dropped diff was missing: the score and the
