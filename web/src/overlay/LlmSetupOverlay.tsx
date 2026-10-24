@@ -22,10 +22,14 @@ const PRESETS: Preset[] = [
   { label: '自定义', base_url: '', model: '', api_style: 'openai' },
   {
     // Kimi for Coding：OpenAI 兼容面在 `/coding/v1`，Anthropic 面在 `/coding`
-    // （再拼 `/v1/messages`）。这里按平台池里在用的那一份填。
+    // （再拼 `/v1/messages`）。模型名取自这个端点自己的 `/models` 回答，那是唯一
+    // 权威名单：它给的调用名是 k3 / k3-256k / k3.1-pro / k3.1-pro-highspeed /
+    // kimi-for-coding / kimi-for-coding-highspeed，没有 kimi-k3 这个名字。
+    // 不能靠"配额耗尽时也报同一个错"来验证：那个端点先查额度再认模型，写错的名字
+    // 与写对的名字在额度耗尽期间回的是同一个 429，所以只能照名单写。
     label: 'Kimi（月之暗面）',
     base_url: 'https://api.kimi.com/coding/v1',
-    model: 'kimi-k3',
+    model: 'k3',
     api_style: 'openai',
   },
   {
