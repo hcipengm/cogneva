@@ -48,6 +48,10 @@ export function FilesView() {
   const [findQuery, setFindQuery] = useState('');
   const [findIndex, setFindIndex] = useState(0);
   const [replaceText, setReplaceText] = useState('');
+  const [gotoOpen, setGotoOpen] = useState(false);
+  const [gotoInput, setGotoInput] = useState('');
+  /** 跳转请求。`serial` 让「同一行再跳一次」也真的发生。 */
+  const [goto, setGoto] = useState<{ line: number; serial: number } | null>(null);
 
   const load = useCallback(async (target: string) => {
     setLoading(true);
@@ -167,13 +171,18 @@ export function FilesView() {
       } else if (meta && event.key.toLowerCase() === 'f') {
         event.preventDefault();
         setFindOpen(true);
+      } else if (meta && event.key.toLowerCase() === 'g') {
+        event.preventDefault();
+        setGotoOpen(true);
       } else if (event.key === 'Escape' && findOpen) {
         setFindOpen(false);
+      } else if (event.key === 'Escape' && gotoOpen) {
+        setGotoOpen(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [save, findOpen]);
+  }, [save, findOpen, gotoOpen]);
 
   if (!path) {
     return (
@@ -229,6 +238,7 @@ export function FilesView() {
         </span>
         <div className="ml-auto flex items-center gap-2">
           <Button onClick={() => setFindOpen((open) => !open)}>查找 ⌘F</Button>
+          <Button onClick={() => setGotoOpen((open) => !open)}>跳到行 ⌘G</Button>
           <Button onClick={() => void downloadWorkspaceFile(path)}>下载</Button>
           <Button onClick={() => void load(path)}>重读</Button>
           <Button onClick={() => void save()} tone={dirty ? 'accent' : undefined}>
@@ -327,6 +337,37 @@ export function FilesView() {
         </div>
       )}
 
+      {gotoOpen && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-[var(--line)] bg-[var(--ink-800)] px-4 py-1">
+          <input
+            autoFocus
+            value={gotoInput}
+            onChange={(event) => setGotoInput(event.target.value.replace(/[^0-9]/g, ''))}
+            onKeyDown={(event) => {
+              if (event.key !== 'Enter') return;
+              event.preventDefault();
+              const line = Number(gotoInput);
+              if (!Number.isFinite(line) || line < 1) return;
+              setGoto({ line, serial: Date.now() });
+              setGotoOpen(false);
+            }}
+            placeholder="第几行"
+            className="mono w-24 border border-[var(--line)] bg-[var(--ink-900)] px-2 py-1 text-[12px] outline-none focus:border-[var(--brass)]"
+            style={{ color: 'var(--paper)' }}
+          />
+          <span className="mono text-[11px] text-[var(--muted)]">
+            这一份共 {lines} 行；超出时停在最后一行
+          </span>
+          <button
+            type="button"
+            onClick={() => setGotoOpen(false)}
+            className="ml-auto text-[11px] text-[var(--muted)] transition-colors hover:text-[var(--paper)]"
+          >
+            关闭
+          </button>
+        </div>
+      )}
+
       {loading && !file ? (
         <Loading what={path} />
       ) : file?.binary ? (
@@ -337,6 +378,7 @@ export function FilesView() {
           text={text}
           findQuery={findOpen ? findQuery : undefined}
           findIndex={findIndex}
+          goto={goto}
           onChange={(next) => {
             setDraft(path, next);
           }}

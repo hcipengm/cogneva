@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef } from 'react';
+import { offsetOfLine, onBracket, onEnter } from '@/files/editing';
 import { TOKEN_VAR, findMatches, languageOf, tokenize } from '@/files/highlight';
 
 /**
@@ -24,6 +25,7 @@ export function CodeEditor({
   onChange,
   findQuery,
   findIndex,
+  goto,
 }: {
   path: string;
   text: string;
@@ -36,10 +38,18 @@ export function CodeEditor({
    */
   findQuery?: string;
   findIndex?: number;
+  /**
+   * 跳到某一行。带一个每次都换的 `serial`：跳到同一行第二次时，值没变而
+   * 光标已经被挪开过，只比行号的话那一次跳转不会发生。
+   */
+  goto?: { line: number; serial: number } | null;
 }) {
   const areaRef = useRef<HTMLTextAreaElement>(null);
   const preRef = useRef<HTMLPreElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
+
+  /** 键盘接管之后要把光标放回去：受控的 textarea 重渲染会把光标送回末尾。 */
+  const pendingCaret = useRef<number | null>(null);
 
   const tokens = useMemo(() => tokenize(text, languageOf(path)), [text, path]);
   const lineCount = useMemo(() => text.split('\n').length, [text]);
@@ -64,6 +74,30 @@ export function CodeEditor({
     }
     if (gutterRef.current) gutterRef.current.scrollTop = area.scrollTop;
   }, [findQuery, findIndex, text]);
+
+  // 打字接管之后落光标。放在正文变化之后跑：React 把新值写进 textarea 之后
+  // 才轮得到设置选区，早一步设会被下一次重渲染覆盖。
+  useEffect(() => {
+    const area = areaRef.current;
+    if (!area || pendingCaret.current === null) return;
+    const at = pendingCaret.current;
+    pendingCaret.current = null;
+    area.selectionStart = at;
+    area.selectionEnd = at;
+  }, [text]);
+
+  // 跳到第几行：光标落在行首，并把那一行滚进视野。
+  useEffect(() => {
+    const area = areaRef.current;
+    if (!area || !goto) return;
+    const at = offsetOfLine(text, goto.line);
+    area.focus();
+    area.setSelectionRange(at, at);
+    const lineHeight = 12 * 1.65;
+    area.scrollTop = Math.max(0, (Math.max(goto.line, 1) - 1) * lineHeight - area.clientHeight / 3);
+    syncScroll();
+    // `text` 故意不进依赖：改正文不该把光标拽回上一次跳转的那一行。
+  }, [goto?.serial]);
 
   const syncScroll = () => {
     const area = areaRef.current;
@@ -127,7 +161,27 @@ export function CodeEditor({
           onChange={(event) => onChange(event.target.value)}
           onScroll={syncScroll}
           onKeyDown={(event) => {
-            if (event.key !== 'Tab' || readOnly) return;
+            if (readOnly) return;
+            // 回车与括号由这一层算：缩进与配对是编辑器的行为，不是浏览器的。
+            if (event.key === 'Enter' && !event.shiftKey && !event.altKey) {
+              event.preventDefault();
+              const area = event.currentTarget;
+              const edit = onEnter(text, area.selectionStart, area.selectionEnd);
+              pendingCaret.current = edit.caret;
+              onChange(edit.text);
+              return;
+            }
+            if (event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey) {
+              const area = event.currentTarget;
+              const edit = onBracket(text, area.selectionStart, area.selectionEnd, event.key);
+              if (edit) {
+                event.preventDefault();
+                pendingCaret.current = edit.caret;
+                onChange(edit.text);
+                return;
+              }
+            }
+            if (event.key !== 'Tab') return;
             event.preventDefault();
             const area = event.currentTarget;
             const { selectionStart: start, selectionEnd: end } = area;

@@ -696,6 +696,11 @@ jobs:
       # diff——三种都编得过。这一步同时跑静态判据与 `pairHunk` 的实跑断言。
       - name: Check source control reaches the screen and its diff lines up
         run: bash deploy/scripts/check-web-source-control.sh
+      # 打字行为错了不会报错：回车少缩进一格、多出半个括号、跳完行光标又弹回末尾，
+      # 三种都编得过、也「跑得起来」。这一步把缩进、配对、行号换下标三个纯函数
+      # 编译出来按判据跑，再查接线有没有把它们接进编辑器。
+      - name: Check the editor indents, pairs brackets, and lands the caret
+        run: bash deploy/scripts/check-web-editing.sh
 
   entry-scripts:
     name: Entry Scripts Lint
