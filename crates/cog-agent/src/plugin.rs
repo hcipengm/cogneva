@@ -151,13 +151,12 @@ impl PoolSpawner {
                     async move {
                         if let cog_core::InboxMessage::Prompt { goal, .. } = msg {
                             if let Ok(task) = serde_json::from_value::<cog_core::Task>(goal) {
-                                // A worker that cannot get a turn waits for
-                                // one rather than dropping the message: the
+                                // A worker that has no turn yet waits for one
+                                // rather than dropping the message: the
                                 // message is already taken, and a dropped one
                                 // is work nobody will be handed again.
-                                if let Some(_turn) = gate.acquire().await {
-                                    runner.execute_task(task).await;
-                                }
+                                let _turn = gate.acquire().await;
+                                runner.execute_task(task).await;
                             }
                         }
                         Ok(())

@@ -143,8 +143,8 @@ impl SlotCost {
 /// The next count, from the count in force and what the machine says.
 ///
 /// `declared_cap` is an operator's own ceiling when one is written down --
-/// `None` means they did not write one and nothing but the measurement
-/// bounds the count. `capacity` is [`SlotCost::capacity`] once this process
+/// `None`, and `Some(0)` with it, means they did not write one and nothing
+/// but the measurement bounds the count. `capacity` is [`SlotCost::capacity`] once this process
 /// has measured a task; until then the count may still grow one step at a
 /// time, which is how the first task is run at all.
 ///
@@ -169,9 +169,13 @@ pub fn next_slots(
         memory_fraction: fraction,
         capacity,
     };
-    if declared_cap == Some(0) {
-        return plan(0, SlotMove::Hold);
-    }
+    // A written zero is how a config says it wrote no cap -- every configmap
+    // on both install paths documents it that way -- so it is not a ceiling of
+    // nothing and it must not switch the pool off. Judged here as well as at
+    // the config boundary, because this function is where the arithmetic
+    // lives and a caller that hands it a zero should get the same answer as
+    // the operator who typed it.
+    let declared_cap = declared_cap.filter(|cap| *cap > 0);
     // Whichever bound is tighter; with neither written down there is no
     // bound, which is the whole point of the declared cap being optional.
     let bound = match (declared_cap, capacity) {
@@ -257,8 +261,14 @@ pub struct PoolConcurrency {
 }
 
 impl PoolConcurrency {
+    /// A pool with the operator's ceiling, if they wrote one.
+    ///
+    /// A written zero is not a ceiling of nothing: it is the absence of a
+    /// ceiling, and it is dropped here so that no method below has to ask
+    /// the question twice.
     pub fn new(declared_cap: Option<usize>) -> Self {
-        let slots = if declared_cap == Some(0) { 0 } else { 1 };
+        let declared_cap = declared_cap.filter(|cap| *cap > 0);
+        let slots = 1;
         Self {
             declared_cap,
             slots: AtomicUsize::new(slots),
@@ -283,12 +293,11 @@ impl PoolConcurrency {
 
     /// Wait for a turn to run one task.
     ///
-    /// `None` means the pool is switched off and this worker will never run
-    /// anything -- distinct from a turn that arrives late.
-    pub async fn acquire(&self) -> Option<PoolTurn> {
-        if self.declared_cap == Some(0) {
-            return None;
-        }
+    /// There is no way to be refused: the count can be as low as one, never
+    /// zero, so a worker that asks always gets a turn eventually. A worker
+    /// that had a way of being switched off would be work already taken from
+    /// the inbox and then dropped.
+    pub async fn acquire(&self) -> PoolTurn {
         loop {
             let turns = self.turns.read().await.clone();
             match turns.clone().acquire_owned().await {
@@ -299,10 +308,10 @@ impl PoolConcurrency {
                     // allows, so it is dropped and the waiter asks again.
                     if Arc::ptr_eq(&turns, &*self.turns.read().await) {
                         self.in_use.fetch_add(1, Ordering::Relaxed);
-                        return Some(PoolTurn {
+                        return PoolTurn {
                             _permit: permit,
                             in_use: self.in_use.clone(),
-                        });
+                        };
                     }
                 }
                 Err(_) => continue,
@@ -312,9 +321,6 @@ impl PoolConcurrency {
 
     /// Move the count. Returns whether it changed.
     pub async fn set_slots(&self, slots: usize) -> bool {
-        if self.declared_cap == Some(0) {
-            return false;
-        }
         let slots = match self.declared_cap {
             Some(cap) => slots.clamp(1, cap.max(1)),
             None => slots.max(1),
@@ -423,9 +429,19 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_cap_of_zero_switches_the_pool_off() {
+    fn a_written_zero_is_no_cap_at_all() {
+        // The configmap documents `worker_count: 0` as "not declared", on both
+        // install paths, and that is the whole surface an operator has. Read
+        // here as a ceiling of nothing, the same zero would have shut the pool
+        // down -- so the two readings of one written value must not exist.
         let plan = next_slots(3, Some(0), calm(), Some(8));
-        assert_eq!(plan.slots, 0);
+        assert_eq!(
+            plan,
+            next_slots(3, None, calm(), Some(8)),
+            "a written zero has to answer exactly as no cap"
+        );
+        assert_eq!(plan.slots, 4);
+        assert_eq!(plan.movement, SlotMove::Grow);
     }
 
     #[test]
@@ -493,7 +509,7 @@ mod tests {
     async fn a_moved_count_is_reached_without_retiring_a_worker() {
         let gate = Arc::new(PoolConcurrency::new(None));
         assert_eq!(gate.slots(), 1);
-        let first = gate.acquire().await.expect("a turn");
+        let first = gate.acquire().await;
         assert_eq!(gate.in_use(), 1);
         assert!(gate.set_slots(3).await);
         assert_eq!(gate.slots(), 3);
@@ -502,16 +518,25 @@ mod tests {
         assert_eq!(gate.in_use(), 0);
         // And the widened gate hands out three turns, not the one it started
         // with.
-        let _a = gate.acquire().await.expect("a turn");
-        let _b = gate.acquire().await.expect("a turn");
-        let _c = gate.acquire().await.expect("a turn");
+        let _a = gate.acquire().await;
+        let _b = gate.acquire().await;
+        let _c = gate.acquire().await;
         assert_eq!(gate.in_use(), 3);
     }
 
     #[tokio::test]
-    async fn a_worker_spawned_under_a_cap_of_zero_never_runs() {
+    async fn a_pool_created_with_a_written_zero_still_runs_a_task() {
+        // A worker that could never get a turn would hold a message it can
+        // never answer, so "zero" must reach this type as no cap rather than
+        // as a shut gate.
         let gate = PoolConcurrency::new(Some(0));
-        assert_eq!(gate.slots(), 0);
-        assert!(gate.acquire().await.is_none());
+        assert_eq!(gate.slots(), 1);
+        assert_eq!(gate.declared_cap(), None);
+        let turn = gate.acquire().await;
+        assert_eq!(gate.in_use(), 1);
+        drop(turn);
+        assert_eq!(gate.in_use(), 0);
+        assert!(gate.set_slots(4).await, "no cap means the count may move");
+        assert_eq!(gate.slots(), 4);
     }
 }
