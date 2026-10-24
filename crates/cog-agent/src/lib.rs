@@ -13,6 +13,7 @@ pub mod pool_sizing;
 pub mod runtime;
 pub mod tools;
 pub mod wal;
+pub mod web;
 pub mod worktree;
 
 pub use archive::{HttpToolOutputArchive, ToolOutputArchive};

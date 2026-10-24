@@ -1495,7 +1495,10 @@ impl cog_core::ToolRegistry for ToolRegistry {
 
 /// 内置工具工厂。
 pub mod builtins {
+    // 网页检索与抓取实现放在 `crate::web`（自带测试与地址守卫），这里只把它们
+    // 并进同一张注册表：工具的**清单**仍然只有 `register_builtins` 一处。
     use super::*;
+    pub use crate::web::{web_fetch, web_search};
 
     pub fn read_file() -> Tool {
         Tool {
@@ -1575,6 +1578,12 @@ pub mod builtins {
         /// read.
         pub message_backend: Option<Arc<dyn cog_core::MessageBackend>>,
         pub agent_registry: Option<Arc<dyn cog_core::AgentRegistry>>,
+        /// Where the free web search backend lives. `None` means the
+        /// deployment wired none: `web_search` is registered anyway and names
+        /// the missing setting when called, because a caller has to be able to
+        /// tell "this deployment has no web access" from "this tool does not
+        /// exist".
+        pub web_search_base: Option<String>,
     }
 
     /// Register every built-in tool into `registry`.
@@ -1618,6 +1627,14 @@ pub mod builtins {
                 inputs.metrics.clone(),
             ),
         );
+        // 网页检索与抓取：都用同一个 HTTP 客户端。搜索后端地址缺失时工具照常注册，
+        // 调用时报出缺的那个设置——这样「这个部署没接网页检索」与「没有这个工具」
+        // 在调用者眼里不是同一个答案。
+        cog_core::ToolRegistry::register(
+            registry,
+            web_search(inputs.http_client.clone(), inputs.web_search_base.clone()),
+        );
+        cog_core::ToolRegistry::register(registry, web_fetch(inputs.http_client.clone()));
         match (
             inputs.message_backend.clone(),
             inputs.agent_registry.clone(),

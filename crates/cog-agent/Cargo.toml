@@ -27,6 +27,10 @@ futures = { workspace = true }
 # 数字员工的名字由机器指纹哈希得出，需要确定性哈希。
 sha2 = { workspace = true }
 hex = { workspace = true }
+# 网页抓取：地址解析（scheme/host 的公共性判断）用成熟的 URL 解析器，正文抽取
+# 用 readability 算法的实现；两件都是纯函数，无网络、无 IO，测试可离线跑。
+url = "2"
+dom_smoothie = { version = "0.18", default-features = false }
 
 [dev-dependencies]
 # The inbox reply tests read their answer back through a real message backend;

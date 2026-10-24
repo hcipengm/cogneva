@@ -51,7 +51,13 @@ fn changes_the_workspace(tool: &cog_core::Tool) -> Option<bool> {
 /// The non-shell tools and what their effects are: `(name, changes the
 /// workspace)`. One entry per tool that reaches outside the checkout -- an HTTP
 /// request mutates whatever it is pointed at, and only the name says so.
-const NATIVE_EFFECTS: [(&str, bool); 1] = [("http_request", true)];
+const NATIVE_EFFECTS: [(&str, bool); 3] = [
+    ("http_request", true),
+    // 检索与抓取只发 GET：它们把外面的字读回来，不改工作区，也不改被访问的那一端
+    // （查询串里没有状态）。所以它们和 `http_request` 不在同一侧——那条能发 POST。
+    ("web_search", false),
+    ("web_fetch", false),
+];
 
 #[derive(Debug)]
 struct UnreachableClient;
@@ -109,7 +115,8 @@ impl cog_core::SandboxBackend for ReadingSandbox {
 }
 
 /// The registry as the agent plugin builds it: the built-in execution tools,
-/// plus `http_request` when an HTTP client is available. Kept in step with the
+/// plus the three tools that reach the network when an HTTP client is
+/// available. Kept in step with the
 /// plugin by the vocabulary assertion below — a tool added there and forgotten
 /// here surfaces as a skill naming something this registry cannot answer.
 fn production_registry() -> ToolRegistry {
@@ -120,6 +127,17 @@ fn production_registry() -> ToolRegistry {
     cog_core::ToolRegistry::register(
         &registry,
         builtins::http_request(Arc::new(UnreachableClient), None, 8192),
+    );
+    cog_core::ToolRegistry::register(
+        &registry,
+        builtins::web_search(
+            Some(Arc::new(UnreachableClient)),
+            Some("http://searxng.invalid:8080".into()),
+        ),
+    );
+    cog_core::ToolRegistry::register(
+        &registry,
+        builtins::web_fetch(Some(Arc::new(UnreachableClient))),
     );
     registry
 }

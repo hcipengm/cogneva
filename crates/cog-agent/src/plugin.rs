@@ -382,6 +382,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 // has nowhere to send it.
                 message_backend: shared_message_backend.clone(),
                 agent_registry: Some(agent_registry.clone()),
+                web_search_base: agent_loop_config.web_search_base.clone(),
             },
         );
         info!(

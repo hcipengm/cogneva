@@ -73,6 +73,10 @@ pub const AGENT_LOOP_ENV: &[(&str, &str)] = &[
         "COGNEVA_AGENT_LOOP_EXTERNAL_ARCHIVE_THRESHOLD_CHARS",
         "external_archive_threshold_chars",
     ),
+    // 网页检索的地址：集群内自建的 SearXNG。与内存 API 同一条理由——它指向一个
+    // 共享端点而不是本节的一个旋钮，所以名字不带 `AGENT_LOOP` 前缀。空表示这个
+    // 部署没有接网页检索，工具在调用时报出这个名字，而不是从列表里消失。
+    (crate::web::WEB_SEARCH_BASE_ENV, "web_search_base"),
 ];
 
 const AGENT_POOL_ENV: &[(&str, &str)] = &[
@@ -124,6 +128,11 @@ pub struct AgentLoopConfig {
     /// that drops the reference.
     #[serde(default = "default_external_archive_threshold_chars")]
     pub external_archive_threshold_chars: usize,
+    /// Base URL of the SearXNG instance behind the `web_search` tool. Absent
+    /// when the deployment runs none; the tool then stays in the list and says
+    /// which setting is missing, so "no web access here" is not read as "no
+    /// such tool".
+    pub web_search_base: Option<String>,
 }
 
 /// The size at which a fetched response stops being a conversational answer and
@@ -147,6 +156,7 @@ impl Default for AgentLoopConfig {
             final_draft_timeout_secs: 420,
             memory_api_base: None,
             external_archive_threshold_chars: default_external_archive_threshold_chars(),
+            web_search_base: None,
         }
     }
 }
