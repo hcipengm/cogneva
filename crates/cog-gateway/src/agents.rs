@@ -371,6 +371,10 @@ impl Delivered {
 }
 
 /// Put the command on the named agent's queue, or say why it could not go.
+// The refusal is an HTTP response the route hands straight back to axum, so
+// the large variant is the type the caller actually wants; boxing it would
+// only move the same bytes onto the heap for the length of one return.
+#[allow(clippy::result_large_err)]
 async fn deliver(
     state: &GatewayState,
     agent_id: &str,

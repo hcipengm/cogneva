@@ -10703,8 +10703,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             .unwrap();
         let err = openai_responses_passthrough(State(state.clone()), req)
             .await
-            .err()
-            .expect("没验过这个面就没有候选");
+            .expect_err("没验过这个面就没有候选");
         assert_eq!(err.0, StatusCode::NOT_IMPLEMENTED);
         assert!(
             err.1.contains("/responses"),

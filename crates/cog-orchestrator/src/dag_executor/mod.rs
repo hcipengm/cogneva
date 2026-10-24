@@ -1895,7 +1895,7 @@ mod consumer_ack_tests {
                         .status,
                 );
             }
-            (got[0].clone(), got[1].clone())
+            (got[0], got[1])
         }
 
         let free = statuses_after_publish(false).await;
