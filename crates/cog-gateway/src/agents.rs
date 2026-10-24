@@ -985,6 +985,39 @@ fn caller_named_reply_stream(msg: &cog_core::InboxMessage) -> Option<&str> {
     }
 }
 
+/// One registry record as the roster prints it.
+///
+/// The routing id stays exactly as registered — it is derived from (task, role)
+/// at both ends and cannot carry a name — and the readable name is derived from
+/// that id here, at the one surface a person reads. Storing the name instead
+/// would let the two drift: a record whose id was rewritten would keep a name
+/// that no longer resolves to it.
+fn agent_view(reg: &cog_core::AgentRegistration) -> serde_json::Value {
+    let mut view = serde_json::to_value(reg).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = view.as_object_mut() {
+        obj.insert(
+            "display_name".to_string(),
+            serde_json::json!(cog_core::display_name_for(&reg.agent_id)),
+        );
+    }
+    view
+}
+
+/// Split the roster into the two populations it actually holds.
+///
+/// A pool worker is capacity: it exists whether or not there is work. A squad
+/// member is demand: one squad per task in flight, created when the task is
+/// dispatched and retired when it ends. Summed into one number they answer no
+/// question — "few agents" then reads alike whether the pool is idle or the
+/// work has stopped coming.
+fn roster_split(regs: &[cog_core::AgentRegistration]) -> (usize, usize) {
+    let squads = regs
+        .iter()
+        .filter(|r| r.agent_id.starts_with(cog_core::SQUAD_ID_PREFIX))
+        .count();
+    (regs.len() - squads, squads)
+}
+
 pub async fn list_handler(State(state): State<Arc<GatewayState>>) -> Response {
     let Some(registry) = state.agent_registry.as_ref() else {
         return (
@@ -994,7 +1027,20 @@ pub async fn list_handler(State(state): State<Arc<GatewayState>>) -> Response {
             .into_response();
     };
     match registry.list().await {
-        Ok(regs) => (StatusCode::OK, Json(serde_json::json!({"agents": regs}))).into_response(),
+        Ok(regs) => {
+            let agents: Vec<serde_json::Value> = regs.iter().map(agent_view).collect();
+            let (workers, squads) = roster_split(&regs);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "agents": agents,
+                    "count": regs.len(),
+                    "worker_agents": workers,
+                    "squad_agents": squads,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -1151,8 +1197,53 @@ pub async fn checkpoint_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::caller_named_reply_stream;
+    use super::{agent_view, caller_named_reply_stream, roster_split};
     use cog_core::InboxMessage;
+
+    /// 名册上每一行都要读得成一个名字，而路由用的 id 一个字节都不能变：
+    /// 有读 id 的调用方，动了它就断；名字只是给读的人看的那一列。
+    /// 池子是按产能起的那一批，小队是按任务起的那一批。合成一个数就答不了
+    /// 任何问题：「人少」既可能是池子闲着，也可能是活停了。
+    #[test]
+    fn the_roster_counts_capacity_apart_from_demand() {
+        let pool = cog_core::AgentRegistration::new(
+            "luna-1822ab0e",
+            "cog-agent",
+            "127.0.0.1",
+            "planner",
+            "default",
+            vec![],
+            cog_core::ResourceInfo::default(),
+        );
+        let squad = cog_core::AgentRegistration::new(
+            cog_core::agent_id_for("task-1", "generator"),
+            "cog-agent",
+            "127.0.0.1",
+            "generator",
+            "default",
+            vec![],
+            cog_core::ResourceInfo::default(),
+        );
+        assert_eq!(roster_split(&[pool, squad]), (1, 1));
+    }
+
+    #[test]
+    fn the_roster_prints_a_name_next_to_the_id_it_keeps() {
+        let reg = cog_core::AgentRegistration::new(
+            cog_core::agent_id_for("task-1", "planner"),
+            "cog-agent",
+            "127.0.0.1",
+            "planner",
+            "default",
+            vec!["planner".into()],
+            cog_core::ResourceInfo::default(),
+        );
+        let view = agent_view(&reg);
+        assert_eq!(view["agent_id"], reg.agent_id);
+        let name = view["display_name"].as_str().expect("display_name present");
+        assert!(name.contains('#'), "name {name} is not a handle");
+        assert_eq!(name, cog_core::display_name_for(&reg.agent_id));
+    }
 
     /// A reply stream the caller names is taken out of the body rather than
     /// honoured, and the other two shapes -- a prompt with no reply stream and
