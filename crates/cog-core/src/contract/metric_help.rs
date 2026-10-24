@@ -1705,19 +1705,19 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     (
         "cogneva_change_block_census",
         "The change account counted by the face of the programme its declaring \
-         documents named, on every change-ledger pass -- block (a closed set: \
-         token, resources, principles, change, persistence, communication, and \
-         none for rows no document filed or whose documents name more than one \
-         face) and reading (landed, owed, retired, or \
-         oldest_unmeasured_seconds). The three counts are the whole population \
+         documents named, on every change-ledger pass -- block (the face name a \
+         document wrote, so the set is whatever the account holds; none for rows \
+         no document filed or whose documents name more than one face) and \
+         reading (landed, owed, retired, or oldest_unmeasured_seconds). The three counts are the whole population \
          of the face: a face that retired its work would otherwise look exactly \
          like one that finished. The \
          grouping answers a question the account's contents could not: how far \
          along a face is. Its rows were always there; the heading was only in \
          prose, so the answer depended on which substring search the reader \
-         typed. Every face is written on every pass, including ones that owe \
-         nothing, because a face missing from the census reads as a face that \
-         finished. oldest_unmeasured_seconds is the age of the owed row in that \
+         typed. Every face the account holds is written on every pass, including \
+         ones that owe nothing, because a face missing from the census reads as \
+         a face that finished; none is written even at zero, because that is the \
+         count of work no heading claims. oldest_unmeasured_seconds is the age of the owed row in that \
          face that has gone longest without a measurement, taken from its entry \
          time when nothing has measured it at all -- a row that was never \
          measured is not ageless, it has been waiting since it arrived. Rows \
