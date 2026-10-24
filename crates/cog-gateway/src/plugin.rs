@@ -286,6 +286,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             // it the tree has been measured to hold, and how much intake is
             // still queued had no exit other than SQL against the deployment.
             &ctx.consume_service::<dyn cog_core::ChangeLedgerStore>(),
+            &key_value,
             &chat_turns,
             &agent_messages,
             &object_backend,

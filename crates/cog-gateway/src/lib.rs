@@ -313,6 +313,13 @@ pub struct GatewayState {
     /// that there is no account rather than answer an empty one, because an
     /// empty answer is the claim that nothing is owed.
     pub change_ledger: Option<Arc<dyn cog_core::ChangeLedgerStore>>,
+    /// The shared key-value face this deployment's processes publish to.
+    ///
+    /// The gateway that holds the upstream credentials writes the LLM pool's
+    /// snapshot here under a TTL; this process only reads it. `None` means
+    /// there is no shared face to read, which the pool reading reports as
+    /// unknown rather than as a healthy pool.
+    pub key_value: Option<Arc<dyn cog_core::KeyValueStore>>,
     pub workspace_store:
         Option<Arc<std::sync::RwLock<std::collections::HashMap<String, workspaces::Workspace>>>>,
     /// External skill registry (Markdown-based skills).

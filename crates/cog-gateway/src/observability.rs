@@ -5,7 +5,7 @@ use axum::{
     Json,
 };
 use futures::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::error::ApiError;
@@ -101,7 +101,7 @@ async fn apply_agent_census(
 
 pub async fn cluster_overview_handler(
     State(state): State<Arc<GatewayState>>,
-) -> Result<Json<cog_core::observability::ClusterOverview>, ApiError> {
+) -> Result<Json<ClusterOverviewResponse>, ApiError> {
     let gateway = state
         .observability_gateway
         .as_ref()
@@ -112,7 +112,98 @@ pub async fn cluster_overview_handler(
         .map_err(|e| ApiError::internal(format!("failed to get cluster overview: {e}")))?;
     apply_alert_verdict(&mut overview, state.active_alert_source.as_ref()).await;
     apply_agent_census(&mut overview, state.agent_registry.as_ref()).await;
-    Ok(Json(overview))
+    let llm_pool = llm_pool_view(&state).await;
+    Ok(Json(ClusterOverviewResponse { overview, llm_pool }))
+}
+
+/// The cluster's counts, and what the model plane can currently do.
+///
+/// The pool is a separate cell rather than a field of the overview because it
+/// is a different kind of fact: the counts describe this gateway's own books,
+/// and the pool is a snapshot another process published. `None` is not a
+/// healthy pool — it is "there is no snapshot to read", which a reader must
+/// not mistake for "the upstreams are fine".
+#[derive(Debug, Serialize)]
+pub struct ClusterOverviewResponse {
+    #[serde(flatten)]
+    pub overview: cog_core::observability::ClusterOverview,
+    pub llm_pool: Option<LlmPoolView>,
+}
+
+/// What the LLM pool can do right now, as its own writer published it.
+///
+/// Deliberately counts and instants only. The upstream identities in the
+/// snapshot carry vendor hosts and model names, and the business plane is
+/// meant to be vendor-neutral: an operator who needs to know which account to
+/// top up reads that on the gateway that holds the credentials. What the rest
+/// of the platform legitimately needs is whether anything can serve, how many
+/// members the pool has, and when it may come back.
+#[derive(Debug, Serialize)]
+pub struct LlmPoolView {
+    /// Whether the pool as a whole can serve, as the writing process latched
+    /// it. Not re-derived here: the latch is cleared only by an upstream
+    /// actually answering, and a reader that recomputed it from the suspect
+    /// list would clear it whenever a probe window expired.
+    pub available: bool,
+    /// How many upstreams the pool is configured with; zero when the writer
+    /// did not say, never a pool of no upstreams.
+    pub pool_size: usize,
+    /// How many must serve for the pool to count as able to carry
+    /// LLM-dependent work, when the operator declared a floor.
+    pub min_healthy: Option<usize>,
+    pub unavailable_count: usize,
+    /// The longest quota window a suspect upstream stated, when it stated one.
+    /// An upstream that only says its weekly window has to run out names no
+    /// instant, and this is then the only statement of how long the outage
+    /// lasts.
+    pub quota_window_secs: u64,
+    /// The earliest instant an upstream said its quota resets.
+    pub recovery_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The earliest instant our own probe will try an upstream again.
+    pub next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the writing process last saw an upstream actually answer. Per
+    /// process: a freshly started writer reports nothing, which is "no
+    /// evidence yet" rather than "nothing has served".
+    pub last_served_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn instant(unix: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    if unix <= 0 {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(unix, 0)
+}
+
+/// Read the pool snapshot the credential-holding gateway publishes.
+///
+/// Absent store, absent key, or a payload that does not parse all answer
+/// `None` for one reason: each of them means nothing here can say whether the
+/// pool can serve, and a fabricated `false` would be as wrong as a fabricated
+/// `true`.
+async fn llm_pool_view(state: &GatewayState) -> Option<LlmPoolView> {
+    let store = state.key_value.as_ref()?;
+    let raw = store
+        .get(cog_core::LLM_POOL_STATUS_KEY)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "the LLM pool snapshot could not be read");
+        })
+        .ok()??;
+    let status: cog_core::LlmPoolStatus = serde_json::from_str(&raw)
+        .map_err(|e| {
+            tracing::warn!(error = %e, "the LLM pool snapshot did not parse");
+        })
+        .ok()?;
+    Some(LlmPoolView {
+        available: !status.unavailable,
+        pool_size: status.pool_size,
+        min_healthy: status.declared_min_healthy,
+        unavailable_count: status.unavailable_upstreams.len(),
+        quota_window_secs: status.quota_window_secs,
+        recovery_at: instant(status.evidenced_recovery_unix),
+        next_attempt_at: instant(status.next_attempt_unix),
+        last_served_at: instant(status.last_success_unix),
+    })
 }
 
 // ─── Squad State ───

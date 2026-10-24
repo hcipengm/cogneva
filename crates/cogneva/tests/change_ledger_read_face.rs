@@ -375,6 +375,7 @@ fn state(change_ledger: Option<Arc<FakeLedger>>) -> Arc<GatewayState> {
         governance_store: None,
         principle_ledger: None,
         change_ledger: change_ledger.map(|ledger| ledger as Arc<dyn ChangeLedgerStore>),
+        key_value: None,
         external_skill_registry: None,
         notification_dispatcher: None,
         notification_tx: broadcast::channel(16).0,

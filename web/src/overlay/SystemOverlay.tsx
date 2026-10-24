@@ -439,6 +439,60 @@ function ResourcesPanel() {
         )}
       </Panel>
 
+      <Panel
+        title="模型面上游池"
+        subtitle="持有凭证的网关按 TTL 发布，这里只读。空着是「没有快照可读」，不是「上游都好着」。"
+      >
+        {c && c.llm_pool ? (
+          <>
+            <div className="grid grid-cols-4 gap-2">
+              {[
+                [
+                  '可用',
+                  c.llm_pool.available ? '是' : '否',
+                  c.llm_pool.available ? 'text-emerald-300' : 'text-red-400',
+                ],
+                [
+                  '池子',
+                  `${c.llm_pool.pool_size - c.llm_pool.unavailable_count} / ${c.llm_pool.pool_size}`,
+                  c.llm_pool.unavailable_count > 0 ? 'text-amber-400' : 'text-emerald-300',
+                ],
+                [
+                  '下限',
+                  c.llm_pool.min_healthy === null ? '未声明' : String(c.llm_pool.min_healthy),
+                  'text-slate-300',
+                ],
+                [
+                  '配额窗',
+                  c.llm_pool.quota_window_secs > 0
+                    ? `${Math.round(c.llm_pool.quota_window_secs / 3600)} h`
+                    : '未声明',
+                  'text-slate-300',
+                ],
+              ].map(([label, value, cls]) => (
+                <div key={label as string} className="rounded-lg bg-slate-900/60 px-3 py-2">
+                  <div className="text-xs text-slate-500">{label as string}</div>
+                  <div className={`text-lg tabular-nums ${cls as string}`}>{value as string}</div>
+                </div>
+              ))}
+            </div>
+            <p className="mt-3 text-xs text-slate-500">
+              上游说最早 {stamp(c.llm_pool.recovery_at)} 恢复 · 我方下次探测{' '}
+              {stamp(c.llm_pool.next_attempt_at)} · 最后一次有上游答话在{' '}
+              {stamp(c.llm_pool.last_served_at)}
+            </p>
+            <p className="mt-1 text-xs text-slate-600">
+              配额窗是嫌疑上游自己声明的最长窗口：只说了周窗、说不出时刻的上游，这一格是唯一的界。
+              上游名字留在持有凭证的网关上，这里只有计数与时刻。
+            </p>
+          </>
+        ) : (
+          <p className="text-sm text-slate-500">
+            {c ? '没有池快照可读：写它的网关不在，或这条键已过期。' : '等集群概况回来。'}
+          </p>
+        )}
+      </Panel>
+
       <Panel title="组件" subtitle="一套安装的三个固定工作负载。unknown 是读不到 Kubernetes，不是挂了。">
         <div className="mb-3 space-y-2">
           <BucketNote bucket={components} what="组件状态" />

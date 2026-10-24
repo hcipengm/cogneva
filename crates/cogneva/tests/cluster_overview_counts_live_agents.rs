@@ -20,8 +20,8 @@ use tower::ServiceExt;
 
 use cog_auth::jwt::{JwtConfig, JwtManager};
 use cog_core::{
-    AgentRegistration, AgentRegistry, GatewayConfig, PreCheckResult, QuotaManager, QuotaSummary,
-    ResourceInfo, SFResult, StateBackend, User, UserStatus, UserType,
+    AgentRegistration, AgentRegistry, GatewayConfig, KeyValueStore, PreCheckResult, QuotaManager,
+    QuotaSummary, ResourceInfo, SFResult, StateBackend, User, UserStatus, UserType,
 };
 use cog_gateway::{create_router, GatewayState};
 use cog_storage::{MemoryAgentRegistry, MemoryObservabilityGateway, MemoryStateBackend};
@@ -119,6 +119,13 @@ impl QuotaManager for OpenQuota {
 /// The gateway state the router is built over. Everything is absent or a
 /// stand-in except the two surfaces this route reads.
 fn state(agent_registry: Option<Arc<MemoryAgentRegistry>>) -> Arc<GatewayState> {
+    state_with(agent_registry, None)
+}
+
+fn state_with(
+    agent_registry: Option<Arc<MemoryAgentRegistry>>,
+    key_value: Option<Arc<FakeKeyValue>>,
+) -> Arc<GatewayState> {
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
     let raw_logger: Arc<dyn cog_core::RawLogger> = Arc::new(cog_storage::MemoryRawLogger::new());
@@ -197,6 +204,7 @@ fn state(agent_registry: Option<Arc<MemoryAgentRegistry>>) -> Arc<GatewayState> 
         governance_store: None,
         principle_ledger: None,
         change_ledger: None,
+        key_value: key_value.map(|kv| kv as Arc<dyn cog_core::KeyValueStore>),
         external_skill_registry: None,
         notification_dispatcher: None,
         notification_tx: broadcast::channel(16).0,
@@ -301,4 +309,153 @@ async fn without_a_registry_the_count_is_unknown_not_zero() {
         "no registry is no reading, not an empty fleet: {body}"
     );
     assert!(body["active_agents"].is_null(), "{body}");
+}
+
+/// A key-value face holding whatever the case put in it.
+///
+/// Only `get` and `set` are implemented: the reading under test reads one key,
+/// and a stand-in that quietly grew a second behaviour would make the route
+/// look exercised on a path nothing calls.
+#[derive(Default)]
+struct FakeKeyValue {
+    values: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+#[async_trait::async_trait]
+impl cog_core::KeyValueStore for FakeKeyValue {
+    async fn get(&self, key: &str) -> SFResult<Option<String>> {
+        Ok(self.values.lock().unwrap().get(key).cloned())
+    }
+
+    async fn set(&self, key: &str, value: &str) -> SFResult<()> {
+        self.values
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+    async fn set_ex(&self, key: &str, value: &str, _ttl_secs: u64) -> SFResult<()> {
+        self.set(key, value).await
+    }
+
+    async fn del(&self, _key: &str) -> SFResult<()> {
+        unimplemented!("the pool reading does not delete")
+    }
+
+    async fn expire(&self, _key: &str, _ttl_secs: i64) -> SFResult<()> {
+        unimplemented!("the pool reading does not set expiry")
+    }
+
+    async fn ttl(&self, _key: &str) -> SFResult<i64> {
+        unimplemented!("the pool reading does not ask for a TTL")
+    }
+
+    async fn incr(&self, _key: &str, _by: i64) -> SFResult<i64> {
+        unimplemented!("the pool reading does not count")
+    }
+
+    async fn decr(&self, _key: &str, _by: i64) -> SFResult<i64> {
+        unimplemented!("the pool reading does not count")
+    }
+
+    async fn incr_ex(&self, _key: &str, _by: i64, _ttl_secs: u64) -> SFResult<i64> {
+        unimplemented!("the pool reading does not count")
+    }
+
+    async fn sadd(&self, _key: &str, _member: &str) -> SFResult<()> {
+        unimplemented!("the pool reading does not touch sets")
+    }
+
+    async fn srem(&self, _key: &str, _member: &str) -> SFResult<()> {
+        unimplemented!("the pool reading does not touch sets")
+    }
+
+    async fn smembers(&self, _key: &str) -> SFResult<Vec<String>> {
+        unimplemented!("the pool reading does not touch sets")
+    }
+
+    async fn hset(&self, _key: &str, _field: &str, _value: &str) -> SFResult<()> {
+        unimplemented!("the pool reading does not touch hashes")
+    }
+
+    async fn hget(&self, _key: &str, _field: &str) -> SFResult<Option<String>> {
+        unimplemented!("the pool reading does not touch hashes")
+    }
+
+    async fn hdel(&self, _key: &str, _field: &str) -> SFResult<()> {
+        unimplemented!("the pool reading does not touch hashes")
+    }
+
+    async fn hvals(&self, _key: &str) -> SFResult<Vec<String>> {
+        unimplemented!("the pool reading does not touch hashes")
+    }
+
+    async fn hgetall(&self, _key: &str) -> SFResult<Vec<(String, String)>> {
+        unimplemented!("the pool reading does not touch hashes")
+    }
+
+    async fn hlen(&self, _key: &str) -> SFResult<u64> {
+        unimplemented!("the pool reading does not touch hashes")
+    }
+}
+
+/// The pool's own verdict reaches the route, including when it comes back.
+///
+/// The two instants are the whole point of publishing this: an outage whose
+/// only statement is "not available" leaves the operator with no bound on how
+/// long to wait, and one upstream here states no instant at all — only the
+/// length of its window.
+#[tokio::test]
+async fn the_pool_verdict_is_the_snapshot_and_not_a_recomputation() {
+    let kv = Arc::new(FakeKeyValue::default());
+    let snapshot = serde_json::json!({
+        "unavailable": true,
+        "unavailable_upstreams": ["https://a.example/v1|model-a", "https://b.example/v1|model-b"],
+        "pool_size": 2,
+        "declared_min_healthy": 1,
+        "evidenced_recovery_unix": 1_793_807_999,
+        "next_attempt_unix": 1_792_839_444,
+        "quota_window_secs": 2_592_000,
+        "last_success_unix": 1_792_800_000,
+    });
+    kv.set(cog_core::LLM_POOL_STATUS_KEY, &snapshot.to_string())
+        .await
+        .expect("the stand-in takes the snapshot");
+
+    let (status, body) = overview(state_with(None, Some(kv))).await;
+
+    assert_eq!(status, StatusCode::OK, "the route answers: {body}");
+    let pool = &body["llm_pool"];
+    assert_eq!(pool["available"], false, "{body}");
+    assert_eq!(pool["pool_size"], 2, "{body}");
+    assert_eq!(pool["min_healthy"], 1, "{body}");
+    assert_eq!(pool["unavailable_count"], 2, "{body}");
+    assert_eq!(pool["quota_window_secs"], 2_592_000, "{body}");
+    assert!(
+        pool["recovery_at"].is_string(),
+        "the stated reset instant is the reading that bounds the outage: {body}"
+    );
+    assert!(pool["next_attempt_at"].is_string(), "{body}");
+    assert!(pool["last_served_at"].is_string(), "{body}");
+    assert!(
+        !pool.to_string().contains("example"),
+        "upstream identities stay on the gateway that holds the credentials: {body}"
+    );
+}
+
+/// A snapshot nobody published is not a healthy pool. The writer holds the
+/// key under a TTL, so an absent key means the writer is gone, and a
+/// fabricated "available" would send the operator looking elsewhere.
+#[tokio::test]
+async fn no_snapshot_is_unknown_not_available() {
+    let kv = Arc::new(FakeKeyValue::default());
+
+    let (status, body) = overview(state_with(None, Some(kv))).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["llm_pool"].is_null(),
+        "nothing to read is not a verdict: {body}"
+    );
 }

@@ -243,6 +243,7 @@ fn build(
         governance_store: None,
         principle_ledger: None,
         change_ledger: None,
+        key_value: None,
         external_skill_registry: None,
         notification_dispatcher: None,
         notification_tx: broadcast::channel(16).0,

@@ -90,6 +90,31 @@ export interface ClusterOverview {
   timestamp: string;
   total_squads: number | null;
   active_squads: number | null;
+  /**
+   * 模型面上游池的判词，由持有凭证的网关按 TTL 发布、这里只读。
+   *
+   * 为 null 是「没有快照可读」，不是「上游都好着」：写者消失与池子健康在
+   * 界面上必须长得不一样。
+   */
+  llm_pool: LlmPoolView | null;
+}
+
+/** 上游池能做什么。只有计数与时刻，没有厂商名：那部分留在持有凭证的网关上。 */
+export interface LlmPoolView {
+  available: boolean;
+  /** 池子里配了几条；0 是「写者没说」，不是「一条都没有」。 */
+  pool_size: number;
+  /** 运维声明的下限；没有声明就是 null。 */
+  min_healthy: number | null;
+  unavailable_count: number;
+  /** 嫌疑上游声明的最长配额窗（秒）。说了窗长却说不出时刻时，这是唯一的界。 */
+  quota_window_secs: number;
+  /** 上游自己说的最早恢复时刻。 */
+  recovery_at: string | null;
+  /** 我方下一次探测上游的时刻。 */
+  next_attempt_at: string | null;
+  /** 写它的那个进程最后一次看见上游真的答话的时刻。 */
+  last_served_at: string | null;
 }
 
 export interface ClusterNode {
