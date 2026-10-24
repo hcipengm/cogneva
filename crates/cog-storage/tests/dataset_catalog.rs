@@ -234,3 +234,28 @@ async fn a_half_interval_or_an_empty_name_is_refused_rather_than_stored() {
     assert!(versions.is_empty(), "被拒的两行有一行落库了：{versions:?}");
     cleanup(&probe).await;
 }
+
+/// A migration asks the whole catalog, not one dataset at a time: "did they all
+/// come across" is a different question from "did this one".
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn every_dataset_walks_out_newest_first() {
+    let probe = probe().await;
+    probe
+        .catalog
+        .register(row(&probe, "v1", '3'))
+        .await
+        .expect("register");
+    probe
+        .catalog
+        .register(row(&probe, "v2", '4'))
+        .await
+        .expect("register");
+
+    let all = probe.catalog.all(10).await.expect("walk every dataset");
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].version, "v2", "最新的不在最前：{:?}", all);
+    let zero = probe.catalog.all(0).await.expect("limit 0");
+    assert!(zero.is_empty(), "limit 0 读成了「不限」：{zero:?}");
+    cleanup(&probe).await;
+}

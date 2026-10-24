@@ -96,6 +96,12 @@ pub trait DatasetCatalog: Send + Sync {
     /// The newest `limit` versions of a dataset, newest first. A limit of zero
     /// asks for nothing and answers nothing rather than for everything.
     async fn list(&self, name: &str, limit: usize) -> SFResult<Vec<DatasetEntry>>;
+
+    /// The newest `limit` versions across every dataset, newest first.
+    ///
+    /// What a verification pass walks: after a migration the question is not
+    /// "did this one dataset come across" but "did all of them".
+    async fn all(&self, limit: usize) -> SFResult<Vec<DatasetEntry>>;
 }
 
 /// `sha256:<hex>` over the bytes. The algorithm name travels with the value so
@@ -245,6 +251,21 @@ impl DatasetCatalog for PostgresDatasetCatalog {
             .fetch_all(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("list a dataset's versions: {e}")))?;
+        rows.iter().map(Self::entry_from).collect()
+    }
+
+    async fn all(&self, limit: usize) -> SFResult<Vec<DatasetEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM datasets ORDER BY created_at DESC, id DESC LIMIT $1"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("list every dataset version: {e}")))?;
         rows.iter().map(Self::entry_from).collect()
     }
 }

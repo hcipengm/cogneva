@@ -127,6 +127,104 @@ pub async fn get_handler(
     }
 }
 
+/// Verify every catalogued version against the bytes in the store.
+///
+/// The migration gate. A restore that finished and a restore that carried
+/// nothing look identical from outside -- both leave a process answering
+/// requests -- so this route reports what was actually compared: how many
+/// versions were checked, and for each one whether its bytes are still the ones
+/// the catalog recorded. An empty catalog answers `all_verified: false`, because
+/// a pass that verified nothing has not passed.
+pub async fn verify_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    let Some(ref store) = state.datasets else {
+        return unavailable();
+    };
+    // A cap rather than no bound: this walks object storage, and a request that
+    // reads every object in the bucket is a request that blocks for as long as
+    // the bucket is large.
+    let limit = query.limit.unwrap_or(10_000);
+    match store.verify(limit).await {
+        Ok(report) => {
+            let checks: Vec<_> = report
+                .checks
+                .iter()
+                .map(|check| {
+                    let (outcome, detail) = match &check.outcome {
+                        cog_storage::DatasetOutcome::Verified => ("verified", json!({})),
+                        cog_storage::DatasetOutcome::Mismatched {
+                            recorded,
+                            actual,
+                            recorded_bytes,
+                            actual_bytes,
+                        } => (
+                            "mismatched",
+                            json!({
+                                "recorded_sha256": recorded,
+                                "actual_sha256": actual,
+                                "recorded_bytes": recorded_bytes,
+                                "actual_bytes": actual_bytes,
+                            }),
+                        ),
+                        cog_storage::DatasetOutcome::Missing => ("missing", json!({})),
+                        cog_storage::DatasetOutcome::Unreadable(e) => {
+                            ("unreadable", json!({ "error": e }))
+                        }
+                    };
+                    let mut row = json!({
+                        "name": check.name,
+                        "version": check.version,
+                        "object_key": check.object_key,
+                        "outcome": outcome,
+                    });
+                    if let (Some(row), serde_json::Value::Object(detail)) =
+                        (row.as_object_mut(), detail)
+                    {
+                        row.extend(detail);
+                    }
+                    row
+                })
+                .collect();
+            let all_verified = report.all_verified();
+            let status = if all_verified {
+                StatusCode::OK
+            } else {
+                // 一次没通过的校验不是一个「处理成功」的请求：调用方读状态码就够了，
+                // 不必去解析正文才知道迁移没成功。
+                StatusCode::CONFLICT
+            };
+            (
+                status,
+                Json(json!({
+                    "code": if all_verified { "ok" } else { "verification_failed" },
+                    "data": {
+                        "checked": report.checked(),
+                        "verified": report.verified(),
+                        "failed": report.failed(),
+                        "all_verified": all_verified,
+                        "checks": checks,
+                    }
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "verifying the dataset catalog failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "code": "internal_error",
+                    "error": "catalog_verify_failed",
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 fn unavailable() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,

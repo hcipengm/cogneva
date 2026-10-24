@@ -173,6 +173,115 @@ impl DatasetStore {
     pub async fn versions(&self, name: &str, limit: usize) -> SFResult<Vec<DatasetEntry>> {
         self.catalog.list(name, limit).await
     }
+
+    /// Walk the catalog and check every version against the bytes actually in
+    /// the store.
+    ///
+    /// This is what a migration is judged by. "The process came up" says the
+    /// binary starts against whatever the store happens to hold; it says nothing
+    /// about whether the objects that were supposed to come across did, and a
+    /// restore that moved no data answers exactly the same way as one that moved
+    /// all of it. So: the digest the row recorded against the digest of the
+    /// bytes now under that key, size against what was registered.
+    ///
+    /// One unreadable object does not stop the walk: a pass that gives up on the
+    /// first failure reports one problem and hides the rest, and after a
+    /// migration the count of what is wrong is the part that decides.
+    pub async fn verify(&self, limit: usize) -> SFResult<DatasetVerification> {
+        let entries = self.catalog.all(limit).await?;
+        let mut checks = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let outcome = match self.objects.get(&entry.object_key).await {
+                Ok(Some(bytes)) => {
+                    let actual = sha256_of(&bytes);
+                    let actual_bytes = bytes.len() as i64;
+                    if actual == entry.content_sha256 && actual_bytes == entry.bytes {
+                        DatasetOutcome::Verified
+                    } else {
+                        DatasetOutcome::Mismatched {
+                            recorded: entry.content_sha256.clone(),
+                            actual,
+                            recorded_bytes: entry.bytes,
+                            actual_bytes,
+                        }
+                    }
+                }
+                Ok(None) => DatasetOutcome::Missing,
+                Err(e) => DatasetOutcome::Unreadable(e.to_string()),
+            };
+            checks.push(DatasetCheck {
+                name: entry.name,
+                version: entry.version,
+                object_key: entry.object_key,
+                outcome,
+            });
+        }
+        Ok(DatasetVerification { checks })
+    }
+}
+
+/// What one catalogued version turned out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatasetOutcome {
+    /// The object is the one the row describes.
+    Verified,
+    /// The object is there and is not what the row describes. Both digests and
+    /// both lengths travel: a reader has to be able to see whether this is a
+    /// different file or the same file damaged, and a length alone cannot say.
+    Mismatched {
+        recorded: String,
+        actual: String,
+        recorded_bytes: i64,
+        actual_bytes: i64,
+    },
+    /// The catalog says this version exists and the store has nothing there.
+    Missing,
+    /// The store could not be asked. Distinct from [`Self::Missing`]: a store
+    /// that is down has not been shown to be empty.
+    Unreadable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatasetCheck {
+    pub name: String,
+    pub version: String,
+    pub object_key: String,
+    pub outcome: DatasetOutcome,
+}
+
+/// The result of one verification pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatasetVerification {
+    /// In catalog order: newest first.
+    pub checks: Vec<DatasetCheck>,
+}
+
+impl DatasetVerification {
+    pub fn checked(&self) -> usize {
+        self.checks.len()
+    }
+
+    pub fn verified(&self) -> usize {
+        self.count(|o| matches!(o, DatasetOutcome::Verified))
+    }
+
+    pub fn failed(&self) -> usize {
+        self.checked() - self.verified()
+    }
+
+    fn count(&self, pred: impl Fn(&DatasetOutcome) -> bool) -> usize {
+        self.checks.iter().filter(|c| pred(&c.outcome)).count()
+    }
+
+    /// Whether the pass proved anything.
+    ///
+    /// An empty catalog is not a pass. Zero datasets verified is the same
+    /// reading as a migration that carried nothing, and that is exactly the case
+    /// a green verdict must not cover -- so the caller is told no, with
+    /// [`Self::checked`] at zero to say why.
+    pub fn all_verified(&self) -> bool {
+        self.checked() > 0 && self.failed() == 0
+    }
 }
 
 /// `datasets/<name>/<version>/sha256-<first 12 hex>`.
@@ -315,6 +424,18 @@ mod tests {
             out.reverse();
             Ok(out)
         }
+
+        async fn all(&self, limit: usize) -> SFResult<Vec<DatasetEntry>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .take(limit)
+                .cloned()
+                .collect())
+        }
     }
 
     fn spec(version: &str) -> DatasetWrite {
@@ -414,6 +535,83 @@ mod tests {
         assert!(
             matches!(opened, Err(SFError::Internal(_))),
             "账上有行、桶里没东西，必须报错而不是当作没有这个版本：{opened:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pass_over_untouched_datasets_verifies_every_one() {
+        let (store, _, _) = store();
+        store.put(spec("v1"), b"first").await.expect("put v1");
+        store.put(spec("v2"), b"second").await.expect("put v2");
+
+        let report = store.verify(100).await.expect("verify");
+        assert_eq!(report.checked(), 2);
+        assert_eq!(report.verified(), 2);
+        assert!(report.all_verified(), "{report:?}");
+    }
+
+    /// The corruption that a byte count cannot see: same length, different
+    /// content.
+    #[tokio::test]
+    async fn an_object_replaced_by_one_of_the_same_length_still_reads_as_mismatched() {
+        let (store, objects, _) = store();
+        let entry = store.put(spec("v1"), b"first night").await.expect("put");
+        {
+            let mut written = objects.written.lock().unwrap();
+            written.insert(entry.object_key.clone(), b"FIRST night".to_vec());
+        }
+
+        let report = store.verify(100).await.expect("verify");
+        assert_eq!(report.checked(), 1);
+        assert_eq!(report.verified(), 0);
+        assert!(!report.all_verified());
+        match &report.checks[0].outcome {
+            DatasetOutcome::Mismatched {
+                recorded,
+                actual,
+                recorded_bytes,
+                actual_bytes,
+            } => {
+                assert_ne!(recorded, actual, "同样长度的替换没被摘要抓到");
+                assert_eq!(recorded_bytes, actual_bytes, "这次坏的不是长度");
+            }
+            other => panic!("读成了 {other:?}，应当是 Mismatched"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_row_whose_object_is_gone_reads_as_missing_and_the_walk_continues() {
+        let (store, objects, _) = store();
+        let gone = store.put(spec("v1"), b"lost").await.expect("put v1");
+        store.put(spec("v2"), b"kept").await.expect("put v2");
+        objects
+            .delete(&gone.object_key)
+            .await
+            .expect("delete behind the catalog's back");
+
+        let report = store.verify(100).await.expect("verify");
+        assert_eq!(
+            report.checked(),
+            2,
+            "一个坏对象让整趟停下，其余的就没人量了"
+        );
+        assert_eq!(report.verified(), 1);
+        let missing = report
+            .checks
+            .iter()
+            .find(|c| matches!(c.outcome, DatasetOutcome::Missing))
+            .expect("丢的那个读成了 Missing");
+        assert_eq!(missing.version, "v1");
+    }
+
+    #[tokio::test]
+    async fn an_empty_catalog_is_not_a_green_pass() {
+        let (store, _, _) = store();
+        let report = store.verify(100).await.expect("verify");
+        assert_eq!(report.checked(), 0);
+        assert!(
+            !report.all_verified(),
+            "一个数据集也没量到却判绿：这正是「进程起来了」冒充「迁移成功」的样子"
         );
     }
 

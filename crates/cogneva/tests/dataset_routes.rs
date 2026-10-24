@@ -142,6 +142,18 @@ impl DatasetCatalog for VecCatalog {
             .cloned()
             .collect())
     }
+
+    async fn all(&self, limit: usize) -> SFResult<Vec<DatasetEntry>> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect())
+    }
 }
 
 struct Fixture {
@@ -417,4 +429,92 @@ async fn a_producer_writing_through_the_store_gets_a_catalogued_version() {
         .expect("find")
         .is_some());
     assert_eq!(objects.objects.lock().unwrap().len(), 1);
+}
+
+/// The migration gate: after a restore, "the process is up" is not the answer,
+/// and this route is where the answer comes from.
+#[tokio::test]
+async fn a_verify_pass_answers_for_every_catalogued_object() {
+    let fixture = fixture(true);
+    let (first, _) = upload(&fixture, "notes.txt", b"first edition").await;
+    assert_eq!(first, StatusCode::CREATED);
+    let (second, _) = upload(&fixture, "notes.txt", b"second edition").await;
+    assert_eq!(second, StatusCode::CREATED);
+
+    let app = create_router(fixture.state.clone());
+    let token = bearer(&fixture.state).await;
+    let (status, report) = ask(
+        &app,
+        "POST",
+        "/api/v1/datasets/verify",
+        &token,
+        "application/json",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["data"]["checked"], 2);
+    assert_eq!(report["data"]["verified"], 2);
+    assert_eq!(report["data"]["failed"], 0);
+    assert_eq!(report["data"]["all_verified"], true);
+}
+
+#[tokio::test]
+async fn an_object_that_changed_after_it_was_catalogued_fails_the_pass() {
+    let fixture = fixture(true);
+    let (status, uploaded) = upload(&fixture, "notes.txt", b"first night").await;
+    assert_eq!(status, StatusCode::CREATED, "{uploaded}");
+    let key = uploaded["data"]["uri"].as_str().expect("the object key");
+    // 同样的长度、不同的字节：字节数那一关过得了，只有摘要抓得住。
+    fixture
+        .objects
+        .objects
+        .lock()
+        .unwrap()
+        .insert(key.to_string(), b"FIRST night".to_vec());
+
+    let app = create_router(fixture.state.clone());
+    let token = bearer(&fixture.state).await;
+    let (status, report) = ask(
+        &app,
+        "POST",
+        "/api/v1/datasets/verify",
+        &token,
+        "application/json",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "校验没过却回了成功状态码：{report}"
+    );
+    assert_eq!(report["data"]["failed"], 1);
+    assert_eq!(report["data"]["all_verified"], false);
+    assert_eq!(report["data"]["checks"][0]["outcome"], "mismatched");
+    assert_eq!(
+        report["data"]["checks"][0]["recorded_bytes"], report["data"]["checks"][0]["actual_bytes"],
+        "这次坏的不是长度"
+    );
+}
+
+/// A catalog with nothing in it has verified nothing, and that is not a pass:
+/// it is the exact shape a migration that carried no data would have.
+#[tokio::test]
+async fn an_empty_catalog_does_not_verify() {
+    let fixture = fixture(true);
+    let app = create_router(fixture.state.clone());
+    let token = bearer(&fixture.state).await;
+    let (status, report) = ask(
+        &app,
+        "POST",
+        "/api/v1/datasets/verify",
+        &token,
+        "application/json",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{report}");
+    assert_eq!(report["data"]["checked"], 0);
+    assert_eq!(report["data"]["all_verified"], false);
 }

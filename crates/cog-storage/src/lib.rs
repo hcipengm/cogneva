@@ -26,7 +26,7 @@ pub mod backends;
 pub(crate) mod consumer_lag;
 pub mod datasets;
 pub mod dlq;
-pub use datasets::{DatasetStore, DatasetWrite};
+pub use datasets::{DatasetCheck, DatasetOutcome, DatasetStore, DatasetVerification, DatasetWrite};
 pub mod etcd;
 pub mod event_filter;
 pub mod inbox_orphan_readings;

@@ -1044,6 +1044,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             get(workspaces::list_workspace_members_handler),
         )
         .route("/api/v1/files/upload", post(files::upload_file_handler))
+        .route("/api/v1/datasets/verify", post(datasets::verify_handler))
         .route("/api/v1/datasets/{name}", get(datasets::list_handler))
         .route(
             "/api/v1/datasets/{name}/{version}",
