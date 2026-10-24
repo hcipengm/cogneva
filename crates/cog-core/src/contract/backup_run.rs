@@ -174,6 +174,18 @@ pub struct BackupRunClosing {
     /// and absent on packages written before this was recorded: a reader must be
     /// able to tell "never recorded" from "recorded and equal".
     pub package_checksum: Option<String>,
+    /// What the package covered, as the manifest declared it: the tables and
+    /// their row counts, the collections and their points, the object subtree's
+    /// files and bytes, the artifact roots, the secret key names.
+    ///
+    /// The other columns measure the package from outside, and every one of them
+    /// reads the same for a package carrying the whole authoritative surface and
+    /// one carrying a single secret: both are a few hundred kilobytes or a few
+    /// hundred megabytes, both conclude `ok`, both restore. The list is what
+    /// separates "the backup ran" from "the backup carried these things", and it
+    /// is stored here because the manifest that says so lives inside the package
+    /// and cannot be read without opening one.
+    pub package_coverage: Option<String>,
     /// How many packages the run's own retention pass left in the directory.
     pub kept_after: Option<i32>,
     /// The oldest package still in the directory after that pass, timed by the
@@ -204,6 +216,10 @@ pub struct BackupPackageRecord {
     /// run recorded none. A drill comparing its own digest against this one has
     /// three answers, not two: equal, different, and nothing to compare against.
     pub package_checksum: Option<String>,
+    /// What that package covered, in the manifest's own terms. Absent on a run
+    /// that recorded none, which is a fact about the record and not about the
+    /// package.
+    pub package_coverage: Option<String>,
     /// The bound this run was actually run under, and what its own pass left.
     pub keep_target: i32,
     pub kept_after: Option<i32>,

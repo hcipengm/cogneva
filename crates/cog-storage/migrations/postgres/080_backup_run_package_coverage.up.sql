@@ -1,0 +1,21 @@
+-- Migration: 080_backup_run_package_coverage
+-- What the package a run produced actually covered, written down next to the
+-- run's other facts.
+--
+-- Every part of the account so far measures the package from outside: how many
+-- bytes, when it finished, whether the last drill could open it. None of them
+-- answers "which data is in there". A package that carried the instance secrets
+-- and nothing else is a few hundred bytes and concludes `ok`, and from the
+-- account it is indistinguishable from a full one -- the manifest that says so
+-- lives inside the package, so reading it takes a package to open.
+--
+-- The value is the manifest's own segment summary as JSON: the tables and their
+-- row counts, the vector collections and their points, the object subtree's
+-- files and bytes, the artifact roots, the secret key names. Stored as text
+-- rather than jsonb so the shape stays the writer's to change without a
+-- migration, and read with a cast when a query wants to walk it.
+--
+-- NULL means "this run recorded no coverage", which is not the same as an empty
+-- JSON object: a package written before this column existed covered the same
+-- surfaces as today's, nobody wrote them down. Not backfilled.
+ALTER TABLE backup_runs ADD COLUMN IF NOT EXISTS package_coverage TEXT;

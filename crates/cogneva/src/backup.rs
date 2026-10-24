@@ -1187,6 +1187,7 @@ struct LeftBehind {
     package: PathBuf,
     bytes: Option<i64>,
     checksum: Option<String>,
+    coverage: String,
     kept_after: Option<i32>,
     oldest_kept_at: Option<chrono::DateTime<Utc>>,
 }
@@ -1350,6 +1351,7 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
                     package: None,
                     bytes: None,
                     package_checksum: None,
+                    package_coverage: None,
                     kept_after: None,
                     oldest_kept_at: None,
                     error: Some(reason.clone()),
@@ -1377,6 +1379,7 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
                         .map(str::to_string),
                     bytes: left.bytes,
                     package_checksum: left.checksum,
+                    package_coverage: Some(left.coverage),
                     kept_after: left.kept_after,
                     oldest_kept_at: left.oldest_kept_at,
                     error: None,
@@ -1395,6 +1398,7 @@ pub async fn run_backup(cfg: &BackupConfig) -> Result<PathBuf, Box<dyn std::erro
                     package: None,
                     bytes: None,
                     package_checksum: None,
+                    package_coverage: None,
                     kept_after: None,
                     oldest_kept_at: None,
                     error: Some(recordable_error(e.as_ref(), cfg)),
@@ -1499,6 +1503,9 @@ async fn finish_backup(
 ) -> Result<LeftBehind, Box<dyn std::error::Error>> {
     match run_backup_into(cfg, staging).await {
         Ok(manifest) => {
+            // 覆盖清单在打包之前算：它说的是「这个包**该有**什么」，而清单是包内
+            // 唯一那份声明。打包之后就算不出来了——staging 已经删掉。
+            let coverage = package_coverage(&manifest);
             let manifest_json = serde_json::to_string_pretty(&manifest)?;
             std::fs::write(staging.join("manifest.json"), format!("{manifest_json}\n"))?;
             let package = cfg.backup_dir.join(package_name(now));
@@ -1542,6 +1549,7 @@ async fn finish_backup(
                 package,
                 bytes,
                 checksum,
+                coverage,
                 kept_after,
                 oldest_kept_at,
             })
@@ -3490,6 +3498,46 @@ fn package_digest(path: &Path) -> std::io::Result<String> {
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
+/// 这个包覆盖了哪些数据，按清单自己的分段写成一串 JSON。
+///
+/// 为什么要有这一格：其余每一列都是从包**外面**量的——多少字节、什么时候跑完、上一次
+/// 演练开不开得开。它们对「包里装着整套权威面」和「包里只装了一个 Secret」给出同样的
+/// 读数：两种都是几百字节到几百 MB、都收尾 ok、都装得回去。清单说出了差在哪，而它躺在
+/// 包里面，不开一份包就读不到。
+///
+/// 段名与清单里的段名一致（postgres／qdrant／objects／artifacts／secrets），空数组读作
+/// 「这一段一份都没有」，与「这一段没声明」分开：旧包的清单里本来就没有 artifacts 段，
+/// 而今天一段都没有是事实。
+fn package_coverage(manifest: &BackupManifest) -> String {
+    serde_json::json!({
+        "secrets": manifest.secrets_keys,
+        "postgres": {
+            "tables": manifest
+                .postgres
+                .tables
+                .iter()
+                .map(|t| serde_json::json!([t.name, t.rows]))
+                .collect::<Vec<_>>(),
+            "sequences": manifest.postgres.sequences,
+        },
+        "qdrant": manifest
+            .qdrant
+            .iter()
+            .map(|c| serde_json::json!([c.name, c.points]))
+            .collect::<Vec<_>>(),
+        "objects": {"files": manifest.objects.files, "bytes": manifest.objects.bytes},
+        "artifacts": manifest
+            .artifacts
+            .iter()
+            .map(|r| serde_json::json!([
+                r.root,
+                r.policy_stores.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ]))
+            .collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
 /// 账上记的摘要和盘上此刻算出来的是否同意。
 ///
 /// `None` 表示这一跑没记摘要（这一次改动之前写的包），**不是**同意：没有任何东西
@@ -4511,6 +4559,96 @@ mod tests {
     /// 这一格专门挑**等长**的替换：字节数看不见它，账上那一列也不动，只有摘要能把它
     /// 说出来。真正的现场是坏块、复制被截断后补零、同名文件覆盖——三者都以「包能解开」
     /// 的样子出现，直到恢复出来才发现数据不对。
+    /// 账上那一格要说得出包里装着什么，而不只是「有这么一个包」。
+    ///
+    /// 这一格存在的理由是它替换掉的那种读数：字节数对「整套权威面」和「一个 Secret」
+    /// 给出同样的量级判断，而两者收尾都是 ok。所以断言不看有没有字段，而是逐段读回来，
+    /// 并且要求「一段都没有」写成空数组而不是缺席——缺席按约定是「旧包没声明」。
+    #[test]
+    fn the_run_records_what_its_package_covered() {
+        let mut manifest: BackupManifest = serde_json::from_str(
+            r#"{
+                "version": "1",
+                "revision": "abc123",
+                "instance_fingerprint": "fp",
+                "namespace": "cogneva",
+                "created_at": "2026-10-24T03:17:00Z",
+                "secrets_keys": ["pg-password", "jwt-secret"]
+            }"#,
+        )
+        .expect("最小清单能读出来");
+        manifest.postgres.tables = vec![
+            TableReport {
+                name: "public.backup_runs".into(),
+                rows: 42,
+            },
+            TableReport {
+                name: "public.empty_table".into(),
+                rows: 0,
+            },
+        ];
+        manifest.postgres.sequences = 3;
+        manifest.qdrant = vec![CollectionReport {
+            name: "code".into(),
+            snapshot: "code.snapshot".into(),
+            points: 1024,
+        }];
+        manifest.objects = ObjectsReport {
+            files: 7,
+            bytes: 2048,
+        };
+        manifest.artifacts = vec![ArtifactRootReport {
+            root: "app".into(),
+            data_dir: "/data".into(),
+            policies_present: true,
+            policy_stores: vec![PolicyStoreReport {
+                name: "meta_learning".into(),
+                ..Default::default()
+            }],
+            decision_stats: None,
+        }];
+
+        let value: serde_json::Value =
+            serde_json::from_str(&package_coverage(&manifest)).expect("覆盖清单是 JSON");
+        assert_eq!(
+            value["secrets"],
+            serde_json::json!(["pg-password", "jwt-secret"])
+        );
+        // 反例之一：行数为 0 的表必须还在单子上。「有这张表、它是空的」和「没这张表」
+        // 是两件不同的事，把零当成没有就会让一次漏备读成一次正常。
+        assert_eq!(
+            value["postgres"]["tables"],
+            serde_json::json!([["public.backup_runs", 42], ["public.empty_table", 0]])
+        );
+        assert_eq!(value["postgres"]["sequences"], 3);
+        assert_eq!(value["qdrant"], serde_json::json!([["code", 1024]]));
+        assert_eq!(
+            value["objects"],
+            serde_json::json!({"files": 7, "bytes": 2048})
+        );
+        assert_eq!(
+            value["artifacts"],
+            serde_json::json!([["app", ["meta_learning"]]])
+        );
+
+        // 另一头：一段都没有时写成空数组。读的人据此能说「这一段今天空着」，
+        // 而不是「这一段没写」。
+        let bare: BackupManifest = serde_json::from_str(
+            r#"{
+                "version": "1",
+                "revision": "abc123",
+                "instance_fingerprint": "fp",
+                "namespace": "cogneva",
+                "created_at": "2026-10-24T03:17:00Z"
+            }"#,
+        )
+        .expect("最小清单能读出来");
+        let value: serde_json::Value = serde_json::from_str(&package_coverage(&bare)).unwrap();
+        assert_eq!(value["qdrant"], serde_json::json!([]));
+        assert_eq!(value["artifacts"], serde_json::json!([]));
+        assert_eq!(value["postgres"]["tables"], serde_json::json!([]));
+    }
+
     #[test]
     fn a_package_whose_bytes_changed_since_it_was_written_is_not_a_backup() {
         let dir = tempfile::tempdir().unwrap();

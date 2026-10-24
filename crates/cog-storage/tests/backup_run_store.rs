@@ -158,6 +158,9 @@ fn ok_closing(
         // share one: an assertion on this column that reads the wrong row would
         // otherwise pass.
         package_checksum: Some(format!("sha256:{package}:{bytes}")),
+        // Likewise derived from the package name: a reading that took this
+        // column from another row would return another name's list.
+        package_coverage: Some(format!(r#"{{"package":"{package}"}}"#)),
         kept_after: Some(kept_after),
         oldest_kept_at: Some(oldest_kept_at),
         error: None,
@@ -171,6 +174,7 @@ fn failed_closing(error: &str) -> BackupRunClosing {
         package: None,
         bytes: None,
         package_checksum: None,
+        package_coverage: None,
         kept_after: None,
         oldest_kept_at: None,
         error: Some(error.to_string()),
@@ -361,6 +365,10 @@ async fn the_newest_package_carries_its_own_retention_pair() {
         pkg.package_checksum.as_deref(),
         Some("sha256:newer.tar.zst:20")
     );
+    assert_eq!(
+        pkg.package_coverage.as_deref(),
+        Some(r#"{"package":"newer.tar.zst"}"#)
+    );
     // 这一对必须来自同一行。4 是旧那笔留下的，混着读会让 old 的份数配上 new 的
     // 界，得到一个任何一行上都不成立的组合。
     assert_eq!(pkg.kept_after, Some(9), "留下的份数不是这一笔自己的答案");
@@ -375,14 +383,16 @@ async fn the_newest_package_carries_its_own_retention_pair() {
     cleanup(&probe).await;
 }
 
-/// A recorded digest reads back as it was written, and "never recorded" reads
-/// back as absent.
+/// A recorded digest and coverage read back as they were written, and "never
+/// recorded" reads back as absent.
 ///
 /// The second half is the reason this is a test and not an assertion elsewhere:
-/// a NULL here means the run that wrote the package recorded no digest, which is
-/// a fact a reader has to be able to tell from "recorded, and equal". Folding it
-/// into an empty string -- the shortcut a NOT NULL column would have forced --
-/// would make every package written before this column existed look compared.
+/// a NULL here means the run that wrote the package recorded no digest and no
+/// coverage, which is a fact a reader has to be able to tell from "recorded, and
+/// equal". Folding it into an empty string -- the shortcut a NOT NULL column
+/// would have forced -- would make every package written before these columns
+/// existed look compared, and an empty coverage object would read as a package
+/// that carried nothing.
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_recorded_digest_reads_back_and_an_unrecorded_one_stays_absent() {
@@ -410,11 +420,17 @@ async fn a_recorded_digest_reads_back_and_an_unrecorded_one_stays_absent() {
         Some("sha256:digest.tar.zst:11"),
         "记下的摘要没有原样读回来"
     );
+    assert_eq!(
+        pkg.package_coverage.as_deref(),
+        Some(r#"{"package":"digest.tar.zst"}"#),
+        "记下的覆盖清单没有原样读回来"
+    );
 
     // 紧跟着的一跑没记摘要：它是最新的包，而最新那一格必须是「没有」而不是空串。
     probe.open(&without, Utc::now(), 7).await;
     let mut closing = ok_closing("without.tar.zst", 12, 7, Utc::now() - Duration::hours(1));
     closing.package_checksum = None;
+    closing.package_coverage = None;
     assert!(probe.close(&without, closing).await);
     let account = probe.store.read_account().await.expect("read the account");
     let pkg = account
@@ -424,6 +440,10 @@ async fn a_recorded_digest_reads_back_and_an_unrecorded_one_stays_absent() {
     assert_eq!(
         pkg.package_checksum, None,
         "没记过摘要的一跑读回来必须是缺席，不能是空串或别的替身"
+    );
+    assert_eq!(
+        pkg.package_coverage, None,
+        "没记过覆盖清单的一跑读回来必须是缺席，不能是空对象"
     );
 
     cleanup(&probe).await;
@@ -467,6 +487,7 @@ async fn a_conclusion_stands_and_a_reading_run_is_refused() {
                 package: None,
                 bytes: None,
                 package_checksum: None,
+                package_coverage: None,
                 kept_after: None,
                 oldest_kept_at: None,
                 error: None,
@@ -639,6 +660,7 @@ async fn a_run_cannot_close_itself_as_abandoned() {
                 package: None,
                 bytes: None,
                 package_checksum: None,
+                package_coverage: None,
                 kept_after: None,
                 oldest_kept_at: None,
                 error: Some("自己判自己没在跑".into()),
