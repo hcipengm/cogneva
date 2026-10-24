@@ -5654,20 +5654,32 @@ async fn probe_suspect_upstreams(state: &AppState) {
 
 /// 最小连通性探测：max_tokens=1 的单轮 ping，只认 HTTP 状态码。
 /// 不带 tools（探测目标是"这家还能不能用"，能力准入另有探测）。
+/// Where an entry is probed: the same address the request path calls.
+///
+/// Composed by the functions the runtime uses rather than by a second copy of
+/// the rule. The copy that used to live here appended `/v1/messages` to every
+/// Anthropic entry, so a base that already carried its version segment was
+/// probed one segment too deep: the upstream answered 404, the entry sat in the
+/// suspect window with `unclassified` evidence, the pool stayed latched
+/// unavailable, and every request that would have reached the working face was
+/// refused first. A probe that asks a different address than the client is a
+/// reading of nothing.
+fn probe_target(style: &str, base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    match style {
+        "anthropic" => cog_llm::anthropic::messages_url(base),
+        cog_llm::responses::API_STYLE => cog_llm::responses::responses_url(base),
+        _ => cog_llm::openai::chat_completions_url(base),
+    }
+}
+
 async fn probe_upstream(state: &AppState, upstream: &LlmUpstream) -> Result<(), UpstreamRefusal> {
-    let base = upstream.base_url.trim_end_matches('/');
     // The probe asks the face the entry was admitted on. Probing an entry
     // verified on `/responses` with a chat-shaped body would read a 404 as the
     // upstream being down, and a healthy entry would sit in the suspect window
     // forever with no request ever reaching it.
     let responses_face = upstream.api_style == cog_llm::responses::API_STYLE;
-    let url = if upstream.api_style == "anthropic" {
-        format!("{base}/v1/messages")
-    } else if responses_face {
-        cog_llm::responses::responses_url(base)
-    } else {
-        format!("{base}/chat/completions")
-    };
+    let url = probe_target(&upstream.api_style, &upstream.base_url);
     let payload = if responses_face {
         serde_json::json!({
             "model": upstream.model,
@@ -7681,6 +7693,36 @@ mod tests {
             requires_temperature_one: None,
             supports_usage_in_streaming: None,
         }
+    }
+
+    /// 探测地址必须就是请求路径要打的那一个，包括 base_url 自己已经带了版本段
+    /// 的那些（`https://api.kimi.com/coding/v1` 这类）。
+    ///
+    /// 早先这一格按协议面各拼各的：Anthropic 那一支无条件再补 `/v1/messages`，
+    /// 于是带版本段的条目被打到 `/v1/v1/messages`，上游回 404，条目进可疑窗、
+    /// 池一直扣着，而它其实是能干活的那一面——探测问错了地址，读数就是零。
+    #[test]
+    fn the_probe_asks_the_address_the_request_path_calls() {
+        for (style, base) in [
+            ("anthropic", "https://api.kimi.com/coding/v1"),
+            ("anthropic", "https://api.anthropic.com/v1"),
+            ("openai", "https://api.kimi.com/coding/v1"),
+            ("openai", "https://api.deepseek.com"),
+            (cog_llm::responses::API_STYLE, "https://api.openai.com/v1"),
+        ] {
+            let probe = probe_target(style, base);
+            let request = match style {
+                "anthropic" => cog_llm::anthropic::messages_url(base),
+                cog_llm::responses::API_STYLE => cog_llm::responses::responses_url(base),
+                _ => cog_llm::openai::chat_completions_url(base),
+            };
+            assert_eq!(probe, request, "{style} {base}");
+        }
+        assert_eq!(
+            probe_target("anthropic", "https://api.kimi.com/coding/v1"),
+            "https://api.kimi.com/coding/v1/messages",
+            "one version segment, not two"
+        );
     }
 
     /// 留底正文里抹掉的是密钥那一段，不是整条正文：整条丢掉等于把这次调用从留底里
