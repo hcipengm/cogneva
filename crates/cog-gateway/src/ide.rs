@@ -48,6 +48,10 @@ const SEARCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// 一次搜索默认回多少条匹配，以及调用方能要到多少。
 const SEARCH_DEFAULT_LIMIT: usize = 100;
 const SEARCH_MAX_LIMIT: usize = 500;
+/// 每个用户工作区的容量上限（字节）。取一个部署能改的默认值：编辑器与上传是同一块
+/// 持久卷，没有上限时一个用户把卷写满，代价由同一卷上的其他状态一起付。
+const WORKSPACE_MAX_BYTES_ENV: &str = "COGNEVA_WORKSPACE_MAX_BYTES";
+const DEFAULT_WORKSPACE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct TreeQuery {
@@ -377,6 +381,84 @@ async fn write_file(path: &Path, text: &str) -> Result<u64, ApiError> {
     }
 }
 
+/// 一次工作区的用量读数。
+#[derive(Debug, Serialize)]
+pub struct UsageResponse {
+    pub files: u64,
+    /// 按文件大小相加：这是「这块盘被我占了多少」，不是「块占了多少」。
+    pub bytes: u64,
+    /// 上限。`0` 表示部署把上限关掉了（不限），不是「一点也不能写」。
+    pub limit_bytes: u64,
+}
+
+fn workspace_limit_bytes() -> u64 {
+    match non_empty_env(WORKSPACE_MAX_BYTES_ENV).and_then(|raw| raw.parse::<u64>().ok()) {
+        Some(0) => 0,
+        Some(limit) => limit,
+        None => DEFAULT_WORKSPACE_MAX_BYTES,
+    }
+}
+
+/// 走一遍用户根，累加文件数与字节。不跟符号链接：链接可以指向根外，把它算进
+/// 用量等于让用户用一条链接占别人的空间。
+async fn measure_usage(root: &Path) -> Result<(u64, u64), ApiError> {
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut reader = match tokio::fs::read_dir(&dir).await {
+            Ok(reader) => reader,
+            Err(_) => continue,
+        };
+        while let Some(entry) = reader
+            .next_entry()
+            .await
+            .map_err(|e| ApiError::internal(format!("cannot measure the workspace: {e}")))?
+        {
+            let file_type = match entry.file_type().await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                if let Ok(meta) = entry.metadata().await {
+                    files += 1;
+                    bytes += meta.len();
+                }
+            }
+        }
+    }
+    Ok((files, bytes))
+}
+
+/// 写之前先问「写完还装得下吗」。
+///
+/// `replacing` 是这次写入会覆盖掉的那份字节数（新建文件传 0）：用它把「改一个
+/// 已经存在的文件」与「再塞一份新的」分开，否则每次保存都要凭空多算一遍自己。
+async fn check_capacity(
+    root: &Path,
+    limit: u64,
+    adding: u64,
+    replacing: u64,
+) -> Result<(), ApiError> {
+    if limit == 0 {
+        return Ok(());
+    }
+    let (_, used) = measure_usage(root).await?;
+    let after = used.saturating_sub(replacing).saturating_add(adding);
+    if after > limit {
+        return Err(ApiError::bad_request(format!(
+            "工作区放不下：这次写入后是 {after} 字节，上限 {limit} 字节。先删一些文件，\
+             或让部署调高 {WORKSPACE_MAX_BYTES_ENV}"
+        )));
+    }
+    Ok(())
+}
+
 /// 建目录（含父目录）。返回这一条在树里的形状。
 async fn make_dir(root: &Path, rel: &str) -> Result<TreeEntry, ApiError> {
     let path = resolve_under(root, rel)?;
@@ -700,6 +782,12 @@ pub async fn upload_handler(
     body: axum::body::Bytes,
 ) -> Result<Json<FileResponse>, ApiError> {
     let root = ensure_user_root(&claims).await?;
+    let target = resolve_under(&root, &query.path)?;
+    let replacing = tokio::fs::metadata(&target)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    check_capacity(&root, workspace_limit_bytes(), body.len() as u64, replacing).await?;
     write_bytes(&root, &query.path, &body).await?;
     tracing::info!(user = %claims.sub, path = %query.path, bytes = body.len(), "workspace file uploaded");
     let path = resolve_under(&root, &query.path)?;
@@ -726,6 +814,18 @@ async fn ensure_user_root(claims: &Claims) -> Result<PathBuf, ApiError> {
         .await
         .map_err(|e| ApiError::internal(format!("cannot create workspace: {e}")))?;
     Ok(user)
+}
+
+pub async fn usage_handler(
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<UsageResponse>, ApiError> {
+    let root = ensure_user_root(&claims).await?;
+    let (files, bytes) = measure_usage(&root).await?;
+    Ok(Json(UsageResponse {
+        files,
+        bytes,
+        limit_bytes: workspace_limit_bytes(),
+    }))
 }
 
 pub async fn tree_handler(
@@ -760,6 +860,17 @@ pub async fn write_handler(
         bytes = body.text.len(),
         "workspace file written"
     );
+    let replacing = tokio::fs::metadata(&path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    check_capacity(
+        &root,
+        workspace_limit_bytes(),
+        body.text.len() as u64,
+        replacing,
+    )
+    .await?;
     write_file(&path, &body.text).await?;
     Ok(Json(read_file(&path, &body.path).await?))
 }
@@ -1036,6 +1147,76 @@ mod tests {
             .await
             .expect_err("空查询必须拒绝");
         assert_eq!(err.error, "BadRequest");
+    }
+
+    #[tokio::test]
+    async fn usage_counts_files_and_bytes_but_not_through_a_symlink() {
+        let dir = tempdir();
+        let root = dir.path().join("root");
+        tokio::fs::create_dir_all(root.join("sub")).await.unwrap();
+        tokio::fs::write(root.join("sub/a.txt"), "12345")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("b.txt"), "67").await.unwrap();
+        let outside = dir.path().join("outside");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::write(outside.join("big.bin"), vec![0u8; 4096])
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let (files, bytes) = measure_usage(&root).await.unwrap();
+
+        assert_eq!(files, 2, "链接后面的文件不算我的用量");
+        assert_eq!(bytes, 7);
+    }
+
+    #[tokio::test]
+    async fn a_write_that_would_pass_the_cap_never_reaches_the_disk() {
+        let dir = tempdir();
+        let root = dir.path();
+        tokio::fs::write(root.join("a.txt"), vec![b'x'; 60])
+            .await
+            .unwrap();
+
+        let err = check_capacity(root, 100, 60, 0)
+            .await
+            .expect_err("60 + 60 > 100 必须拒绝");
+        assert_eq!(err.error, "BadRequest");
+        assert!(
+            err.message.contains("COGNEVA_WORKSPACE_MAX_BYTES"),
+            "拒绝里要写出改哪个部署开关：{}",
+            err.message
+        );
+        assert!(!root.join("b.txt").exists(), "拒绝发生在写之前");
+    }
+
+    #[tokio::test]
+    async fn rewriting_a_file_counts_its_old_bytes_out_of_the_cap() {
+        let dir = tempdir();
+        let root = dir.path();
+        tokio::fs::write(root.join("a.txt"), vec![b'x'; 60])
+            .await
+            .unwrap();
+
+        // 覆盖同一份 60 字节：占用不变，不该被拦。
+        check_capacity(root, 100, 60, 60)
+            .await
+            .expect("改一个已经存在的文件不该多算一遍自己");
+        // 再写一份新的 60 字节：这时才真的放不下。
+        let err = check_capacity(root, 100, 60, 0)
+            .await
+            .expect_err("再塞一份 60 字节确实超了");
+        assert_eq!(err.error, "BadRequest");
+    }
+
+    #[tokio::test]
+    async fn a_cap_of_zero_means_unlimited_rather_than_read_only() {
+        let dir = tempdir();
+        let huge = u64::MAX / 2;
+        check_capacity(dir.path(), 0, huge, 0)
+            .await
+            .expect("0 是「不限」，不是「一点也不能写」");
     }
 
     #[tokio::test]

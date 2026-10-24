@@ -856,6 +856,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         // 是磁盘——一个只能读的编辑器和没有编辑器一样，但一个谁都能写的根目录
         // 是另一回事。路径判据在 `ide::resolve_under` 里，出根一律 403。
         .route("/api/v1/ide/tree", get(ide::tree_handler))
+        .route("/api/v1/ide/usage", get(ide::usage_handler))
         .route("/api/v1/ide/file", get(ide::file_handler))
         .route("/api/v1/ide/file", axum::routing::put(ide::write_handler))
         .route(

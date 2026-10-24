@@ -1045,3 +1045,15 @@ export async function searchWorkspace(
     `/api/v1/ide/search?q=${encodeURIComponent(query)}&limit=${limit}`
   );
 }
+
+export interface WorkspaceUsage {
+  files: number;
+  bytes: number;
+  /** 0 表示不限量。 */
+  limit_bytes: number;
+}
+
+/** 我的工作区占了多少、上限多少——写不进去之前，读者该先看见还剩多少。 */
+export async function getWorkspaceUsage(): Promise<WorkspaceUsage> {
+  return api.get<WorkspaceUsage>('/api/v1/ide/usage');
+}

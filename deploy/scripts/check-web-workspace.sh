@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 「工作区搜索」的消费者门禁。
+# 工作区（文件树 / 搜索 / 配额）的消费者门禁。
 #
 # 搜索的成品不是 `/api/v1/ide/search` 这个路由，是**在左栏打两个字、看见哪个文件里
 # 有、点一下落到那一行**。这三步各有自己的坏形状，全都不出声：
@@ -18,8 +18,14 @@
 #   4. 那一格同时 `openTab(` 与 `setReveal(`，文件页消费 `reveal`；
 #   5. 网关登记了 `/api/v1/ide/search`，且 `ide.rs` 里 `search_workspace` 仍在
 #      跳过符号链接、仍拒绝空查询。
+#   6. 配额读数摆到了屏幕上：`client.ts` 声明 `/api/v1/ide/usage` 并导出
+#      `getWorkspaceUsage`，从 `main.tsx` 可达的组件调它并渲染 `<WorkspaceUsage`。
+#      ——上限在服务端是一条硬判据，撞上就拒写；只有撞上那一刻才看得见上限，
+#      读者会写了一下午才被拦下。
+#   7. 网关登记了 `/api/v1/ide/usage`，且 `write_handler` / `upload_handler` 在落盘
+#      前仍在过 `check_capacity`——配额只画在屏幕上、写之前不问，等于没上限。
 #
-# 用法：bash deploy/scripts/check-web-workspace-search.sh [仓库根目录]
+# 用法：bash deploy/scripts/check-web-workspace.sh [仓库根目录]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -98,7 +104,12 @@ if not callers:
     )
 
 # ── 3. 面板被渲染 ──
-rendered = [rel for rel in sorted(graph) if re.search(r"<SearchPanel[\s/>]", read(rel))]
+# 只在 .tsx 里找 JSX：`Promise<SearchPanel>` 这种类型参数也长得像 `<SearchPanel`。
+rendered = [
+    rel
+    for rel in sorted(graph)
+    if rel.endswith(".tsx") and re.search(r"<SearchPanel[\s/>]", read(rel))
+]
 if not rendered:
     sys.exit("没有任何可达的组件渲染 <SearchPanel：面板在文件里，但不在任何一屏上")
 
@@ -147,5 +158,40 @@ if "is_symlink()" not in ide_src:
 if "non-empty q" not in ide_src:
     sys.exit(f"{IDE}: 空查询没有被拒绝——一个空串会把每一行都算成命中")
 
-print("WORKSPACE SEARCH OK：路由、取数、渲染、落点、后端判据五段都在")
+# ── 6. 配额读数：取数函数有可达的调用点，组件被渲染 ──
+if "/api/v1/ide/usage" not in client_src:
+    sys.exit(f"{CLIENT} 里没有 /api/v1/ide/usage：屏幕上不会出现「还剩多少」")
+if not re.search(r"export\s+(?:async\s+)?function\s+getWorkspaceUsage\b", client_src):
+    sys.exit(f"{CLIENT} 没有导出 getWorkspaceUsage：路径在了，但没有人能取它")
+usage_callers = [rel for rel in sorted(graph) if rel != CLIENT and "getWorkspaceUsage(" in read(rel)]
+if not usage_callers:
+    sys.exit(
+        f"从 {ENTRY} 可达的源码里没有一处调用 getWorkspaceUsage："
+        "配额读数没有活的消费者，读者只能在写入被拒时才知道有上限"
+    )
+if not [
+    rel
+    for rel in graph
+    if rel.endswith(".tsx") and re.search(r"<WorkspaceUsage[\s/>]", read(rel))
+]:
+    sys.exit("没有任何可达的组件渲染 <WorkspaceUsage：组件在文件里，但不在任何一屏上")
+
+# ── 7. 后端：用量路由在，写之前仍问容量 ──
+if '"/api/v1/ide/usage"' not in gw_src:
+    sys.exit(f"{GATEWAY} 没有登记 /api/v1/ide/usage：配额组件打下去只有 404")
+if "fn measure_usage" not in ide_src:
+    sys.exit(f"{IDE} 里没有 measure_usage：用量无从量起")
+for handler in ("write_handler", "upload_handler"):
+    start = ide_src.find(f"pub async fn {handler}")
+    if start < 0:
+        sys.exit(f"{IDE} 里没有 {handler}")
+    end = ide_src.find("\npub async fn ", start + 1)
+    body = ide_src[start:end if end > 0 else len(ide_src)]
+    if "check_capacity(" not in body:
+        sys.exit(
+            f"{IDE}: {handler} 落盘前没有过 check_capacity——"
+            "上限只画在屏幕上，写到磁盘那一步不问，等于没有上限"
+        )
+
+print("WORKSPACE OK：搜索与配额两条链路的路由、取数、渲染、落点、后端判据都在")
 PYEOF

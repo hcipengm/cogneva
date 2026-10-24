@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import { FileTree } from '@/files/FileTree';
 import { SearchPanel } from '@/files/SearchPanel';
+import { WorkspaceUsage } from '@/files/WorkspaceUsage';
 import { useServices } from '@/shell/context';
 import { Icon, type IconName } from '@/shell/icons';
 import { useShell, type ActivityId } from '@/shell/store';
@@ -132,6 +133,7 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
       <>
         <SearchPanel />
         <FileTree />
+        <WorkspaceUsage />
       </>
     );
   const setActivity = useShell((s) => s.setActivity);

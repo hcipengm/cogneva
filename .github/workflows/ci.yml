@@ -638,7 +638,7 @@ jobs:
       # 之后继续绿；落点（打开文件后按行号定位）更是一消失就退回「开了但停在第一行」，
       # 而那看起来只是「搜索不太好用」。
       - name: Check workspace search reaches the screen and lands on its line
-        run: bash deploy/scripts/check-web-workspace-search.sh
+        run: bash deploy/scripts/check-web-workspace.sh
 
   # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读
   # 覆盖端点），它结构上证明不了 `web/` 编得过：类型错、装不上的依赖、打包不进
