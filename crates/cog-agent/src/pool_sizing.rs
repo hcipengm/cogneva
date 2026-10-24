@@ -1,15 +1,26 @@
-//! How many tasks the pool runs at once, read off the memory it runs in.
+//! How many tasks the pool runs at once, read off the container it runs in.
 //!
-//! `agent_pool.worker_count` is a ceiling somebody declared, not a reading: it
-//! does not move when the container that carries it gets tighter, and until
-//! this module nothing measured whether the box could carry it at all. The
-//! number in force is the ceiling *or* what the container has room for,
-//! whichever is smaller, re-read on a period.
+//! The count used to be `agent_pool.worker_count`: a number somebody typed into
+//! a configmap, never asked again. Nothing measured whether the box could
+//! carry it, and the box getting tighter did not move it.
+//!
+//! The count is now derived from two measurements, both taken here:
+//!
+//! - **What one task costs.** The working set with nothing running is the
+//!   baseline; what the working set rises by while N tasks run, divided by N,
+//!   is the marginal cost of one. Kept as a running maximum, because the
+//!   number this feeds is a capacity and an under-estimate of the cost is an
+//!   over-estimate of how many fit.
+//! - **What the container has.** The cgroup's limit, against the share of it
+//!   this pool will fill.
+//!
+//! `worker_count` remains as an operator's own cap when one is written down;
+//! absent (zero), nothing but the measurement bounds the count. A declared cap
+//! is the only number in this path that is not read off the machine.
 //!
 //! The scarce thing is not an idle worker -- an agent waiting on its inbox
 //! costs kilobytes -- it is a task in flight: a squad of role agents, their
-//! tool output and their context. So the pool keeps its declared number of
-//! workers and bounds how many of them may hold a task at once.
+//! tool output and their context.
 //!
 //! Only memory is read here. The token window also bounds how much work may
 //! start, but that bound lives upstream in the orchestrator's admission, which
@@ -17,8 +28,7 @@
 //! arithmetic in this crate would be a second answer to one question.
 //!
 //! An unreadable container is not a calm one: with no reading the count stays
-//! at the ceiling, which is the same thing this process did before the module
-//! existed, rather than treating "not measured" as "no pressure".
+//! where it is, rather than treating "not measured" as "no pressure".
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -33,16 +43,20 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 /// about to be killed.
 pub const MEMORY_RED_FRACTION: f64 = 0.78;
 
-/// Grow again only below this share, so one step cannot both shrink and grow.
+/// Grow only below this share, so one step cannot both shrink and grow.
 ///
-/// It has to sit above the container's own baseline: measured 2026-10-24 on
-/// the main pod, the working set was 6.01 GiB of an 8 GiB limit (0.70) with
-/// the pool idle, and most of that is not the pool's. A growth line below the
-/// baseline would trap a shrunk pool at one slot forever.
+/// It has to sit above the container's own baseline: measured on the main pod
+/// on 2026-10-24, the working set stayed between 0.70 and 0.72 of an 8 GiB
+/// limit through the day, and most of that is not the pool's. A growth line
+/// below the baseline would trap a shrunk pool at one slot forever.
 pub const MEMORY_GROW_FRACTION: f64 = 0.73;
 
+/// A growth line at or above the red line would let one pass both shrink and
+/// grow the pool, so the ordering is checked when the crate is built.
+const _: () = assert!(MEMORY_GROW_FRACTION < MEMORY_RED_FRACTION);
+
 /// Which way the last step moved, so a reader can tell a pool holding at its
-/// ceiling from one holding because it could not read anything.
+/// measured capacity from one holding because it could not read anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotMove {
     Grow,
@@ -57,15 +71,91 @@ pub struct SlotPlan {
     pub movement: SlotMove,
     /// Working set over limit, when the container could be read.
     pub memory_fraction: Option<f64>,
+    /// How many tasks the container has room for, once that is measured.
+    pub capacity: Option<usize>,
 }
 
-/// The next count, from the count in force and the container's memory.
+/// What this container spends to run one task, measured rather than declared.
 ///
-/// `ceiling` is the operator's declaration and is never exceeded; zero means
-/// the pool is switched off and stays off. The floor is one worker: a pool
-/// that shrank to zero stops consuming, and nothing left is listening to
-/// notice when the pressure clears.
-pub fn next_slots(current: usize, ceiling: usize, memory: Option<(u64, u64)>) -> SlotPlan {
+/// The baseline is the lowest working set seen with nothing running. The cost
+/// of a task is the rise above it divided by how many were running when the
+/// reading was taken, kept as a maximum: a task that has not finished has not
+/// yet peaked, so the largest figure seen is the one that has actually
+/// happened to this process.
+///
+/// Both are measurements of *this* process in *this* container. Neither
+/// travels: a different pod with a different mix of work has a different
+/// baseline, and copying one into a config would be the same mistake as the
+/// typed count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SlotCost {
+    pub baseline_bytes: Option<u64>,
+    pub per_task_bytes: Option<u64>,
+}
+
+impl SlotCost {
+    /// Feed one reading: the working set and how many tasks were running.
+    ///
+    /// A reading with nothing running is a baseline, and only ever lowers it:
+    /// a container that has been busier before has already paid for whatever
+    /// is resident now. A reading with work running contributes a marginal
+    /// cost only against a known baseline -- without one, the whole resident
+    /// set would be divided by the task count and every other component in
+    /// the pod would be charged to the pool.
+    pub fn observe(&mut self, working_set: u64, tasks_running: usize) {
+        if tasks_running == 0 {
+            self.baseline_bytes = Some(match self.baseline_bytes {
+                Some(baseline) => baseline.min(working_set),
+                None => working_set,
+            });
+            return;
+        }
+        let Some(baseline) = self.baseline_bytes else {
+            return;
+        };
+        if working_set <= baseline {
+            return;
+        }
+        let marginal = (working_set - baseline) / tasks_running as u64;
+        self.per_task_bytes = Some(match self.per_task_bytes {
+            Some(cost) => cost.max(marginal),
+            None => marginal,
+        });
+    }
+
+    /// How many tasks fit in `limit` bytes, once both figures are measured.
+    ///
+    /// The pool plans to the growth line rather than the limit: planning to
+    /// the limit means every step taken at the plan lands in the red band and
+    /// the next pass takes it back.
+    pub fn capacity(&self, limit: u64) -> Option<usize> {
+        let baseline = self.baseline_bytes?;
+        let per_task = self.per_task_bytes?;
+        if per_task == 0 {
+            return None;
+        }
+        let budget = (limit as f64 * MEMORY_GROW_FRACTION) as u64;
+        let room = budget.saturating_sub(baseline);
+        Some((room / per_task) as usize)
+    }
+}
+
+/// The next count, from the count in force and what the machine says.
+///
+/// `declared_cap` is an operator's own ceiling when one is written down --
+/// `None` means they did not write one and nothing but the measurement
+/// bounds the count. `capacity` is [`SlotCost::capacity`] once this process
+/// has measured a task; until then the count may still grow one step at a
+/// time, which is how the first task is run at all.
+///
+/// The floor is one worker: a pool that shrank to zero stops consuming, and
+/// nothing left is listening to notice when the pressure clears.
+pub fn next_slots(
+    current: usize,
+    declared_cap: Option<usize>,
+    memory: Option<(u64, u64)>,
+    capacity: Option<usize>,
+) -> SlotPlan {
     let fraction = memory.and_then(|(used, limit)| {
         if limit == 0 {
             None
@@ -73,37 +163,49 @@ pub fn next_slots(current: usize, ceiling: usize, memory: Option<(u64, u64)>) ->
             Some(used as f64 / limit as f64)
         }
     });
-    if ceiling == 0 {
-        return SlotPlan {
-            slots: 0,
-            movement: SlotMove::Hold,
-            memory_fraction: fraction,
-        };
-    }
-    let current = current.clamp(1, ceiling);
     let plan = |slots: usize, movement: SlotMove| SlotPlan {
         slots,
         movement,
         memory_fraction: fraction,
+        capacity,
     };
-    match fraction {
-        Some(fraction) if fraction >= MEMORY_RED_FRACTION => {
-            plan((current / 2).max(1), SlotMove::Shrink)
-        }
-        Some(fraction) if fraction < MEMORY_GROW_FRACTION && current < ceiling => {
-            plan(current + 1, SlotMove::Grow)
-        }
-        _ => plan(current, SlotMove::Hold),
+    if declared_cap == Some(0) {
+        return plan(0, SlotMove::Hold);
     }
+    // Whichever bound is tighter; with neither written down there is no
+    // bound, which is the whole point of the declared cap being optional.
+    let bound = match (declared_cap, capacity) {
+        (Some(declared), Some(measured)) => Some(declared.min(measured)),
+        (Some(declared), None) => Some(declared),
+        (None, Some(measured)) => Some(measured),
+        (None, None) => None,
+    };
+    let mut next = current.max(1);
+    if let Some(bound) = bound {
+        next = next.min(bound.max(1));
+    }
+    if let Some(fraction) = fraction {
+        if fraction >= MEMORY_RED_FRACTION {
+            next = (next / 2).max(1);
+        } else if fraction < MEMORY_GROW_FRACTION && bound.is_none_or(|bound| next < bound) {
+            next += 1;
+        }
+    }
+    let movement = match next.cmp(&current) {
+        std::cmp::Ordering::Greater => SlotMove::Grow,
+        std::cmp::Ordering::Less => SlotMove::Shrink,
+        std::cmp::Ordering::Equal => SlotMove::Hold,
+    };
+    plan(next, movement)
 }
 
 /// The container's working set and its limit, or `None` when either cannot be
 /// read.
 ///
-/// The working set is `memory.current` minus the page cache that the kernel
-/// would drop under pressure (`inactive_file`). `memory.current` alone counts
-/// cache this container is not holding onto, and a pool that backed off
-/// because a file was read would be reading the wrong number.
+/// The working set is `memory.current` minus the page cache the kernel would
+/// drop under pressure (`inactive_file`). `memory.current` alone counts cache
+/// this container is not holding onto, and a pool that backed off because a
+/// file was read would be reading the wrong number.
 pub fn read_container_memory() -> Option<(u64, u64)> {
     let used = read_number("/sys/fs/cgroup/memory.current")?;
     let limit = read_number("/sys/fs/cgroup/memory.max")?;
@@ -122,27 +224,46 @@ fn read_memory_stat_field(path: &str, field: &str) -> Option<u64> {
         .find_map(|line| line.strip_prefix(field)?.trim_start().parse().ok())
 }
 
-/// How many workers may hold a task at once, movable while they run.
+/// One task's turn at running.
+///
+/// A guard rather than a bare permit so the count of tasks in flight is known
+/// when the permit is dropped, wherever it is dropped. That count is what the
+/// cost measurement divides by, so it cannot be reconstructed from anywhere
+/// else after the fact.
+pub struct PoolTurn {
+    _permit: OwnedSemaphorePermit,
+    in_use: Arc<AtomicUsize>,
+}
+
+impl Drop for PoolTurn {
+    fn drop(&mut self) {
+        self.in_use.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// How many tasks may run at once, movable while they run.
 ///
 /// The workers are spawned once and outlive the count: a worker that cannot
-/// get a permit waits for one instead of being retired, because retiring a
-/// consumer that is between messages means the message it was about to take
-/// lands in the stream's pending list with nobody reading it. The count moves
-/// by widening or narrowing the permits, and a task already running keeps its
-/// permit until it finishes -- no count can take back work that has started.
+/// get a turn waits for one instead of being retired, because retiring a
+/// consumer between messages risks the message it was about to take. The
+/// count moves by widening or narrowing the turns, and a task already running
+/// keeps its turn until it finishes -- no count can take back work that has
+/// started.
 pub struct PoolConcurrency {
-    ceiling: usize,
+    declared_cap: Option<usize>,
     slots: AtomicUsize,
-    permits: RwLock<Arc<Semaphore>>,
+    in_use: Arc<AtomicUsize>,
+    turns: RwLock<Arc<Semaphore>>,
 }
 
 impl PoolConcurrency {
-    pub fn new(ceiling: usize) -> Self {
-        let slots = ceiling.max(1);
+    pub fn new(declared_cap: Option<usize>) -> Self {
+        let slots = if declared_cap == Some(0) { 0 } else { 1 };
         Self {
-            ceiling,
-            slots: AtomicUsize::new(if ceiling == 0 { 0 } else { slots }),
-            permits: RwLock::new(Arc::new(Semaphore::new(slots))),
+            declared_cap,
+            slots: AtomicUsize::new(slots),
+            in_use: Arc::new(AtomicUsize::new(0)),
+            turns: RwLock::new(Arc::new(Semaphore::new(slots))),
         }
     }
 
@@ -151,29 +272,37 @@ impl PoolConcurrency {
         self.slots.load(Ordering::Relaxed)
     }
 
-    pub fn ceiling(&self) -> usize {
-        self.ceiling
+    pub fn declared_cap(&self) -> Option<usize> {
+        self.declared_cap
+    }
+
+    /// How many tasks hold a turn at this instant.
+    pub fn in_use(&self) -> usize {
+        self.in_use.load(Ordering::Relaxed)
     }
 
     /// Wait for a turn to run one task.
     ///
     /// `None` means the pool is switched off and this worker will never run
-    /// anything -- distinct from a permit that arrives late.
-    pub async fn acquire(&self) -> Option<OwnedSemaphorePermit> {
-        if self.ceiling == 0 {
+    /// anything -- distinct from a turn that arrives late.
+    pub async fn acquire(&self) -> Option<PoolTurn> {
+        if self.declared_cap == Some(0) {
             return None;
         }
         loop {
-            let permits = self.permits.read().await.clone();
-            match permits.clone().acquire_owned().await {
+            let turns = self.turns.read().await.clone();
+            match turns.clone().acquire_owned().await {
                 Ok(permit) => {
                     // The count may have moved while this waiter queued on the
-                    // old gate. Holding a permit from a gate nobody shares any
-                    // more would put one more task in flight than the current
-                    // reading allows, so the permit is dropped and the waiter
-                    // asks again on the gate in force.
-                    if Arc::ptr_eq(&permits, &*self.permits.read().await) {
-                        return Some(permit);
+                    // old gate. A turn from a gate nobody shares any more would
+                    // put one more task in flight than the current reading
+                    // allows, so it is dropped and the waiter asks again.
+                    if Arc::ptr_eq(&turns, &*self.turns.read().await) {
+                        self.in_use.fetch_add(1, Ordering::Relaxed);
+                        return Some(PoolTurn {
+                            _permit: permit,
+                            in_use: self.in_use.clone(),
+                        });
                     }
                 }
                 Err(_) => continue,
@@ -183,19 +312,22 @@ impl PoolConcurrency {
 
     /// Move the count. Returns whether it changed.
     pub async fn set_slots(&self, slots: usize) -> bool {
-        if self.ceiling == 0 {
+        if self.declared_cap == Some(0) {
             return false;
         }
-        let slots = slots.clamp(1, self.ceiling);
+        let slots = match self.declared_cap {
+            Some(cap) => slots.clamp(1, cap.max(1)),
+            None => slots.max(1),
+        };
         if slots == self.slots() {
             return false;
         }
-        let mut permits = self.permits.write().await;
-        let previous = std::mem::replace(&mut *permits, Arc::new(Semaphore::new(slots)));
-        // Closing wakes everyone queued on the gate being replaced: an
-        // `acquire` that resolves on the old gate with a stale count is the
-        // over-admission this swap exists to prevent. Permits already handed
-        // out are unaffected, so tasks in flight wind down on their own.
+        let mut turns = self.turns.write().await;
+        let previous = std::mem::replace(&mut *turns, Arc::new(Semaphore::new(slots)));
+        // Closing wakes everyone queued on the gate being replaced: a turn that
+        // resolves on the old gate with a stale count is the over-admission
+        // this swap exists to prevent. Turns already handed out are unaffected,
+        // so tasks in flight wind down on their own.
         previous.close();
         self.slots.store(slots, Ordering::Relaxed);
         true
@@ -208,18 +340,54 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
+    fn calm() -> Option<(u64, u64)> {
+        Some((2 * GIB, 8 * GIB))
+    }
+
     #[test]
-    fn a_container_with_room_keeps_the_declared_ceiling() {
-        let plan = next_slots(3, 3, Some((3 * GIB, 8 * GIB)));
-        assert_eq!(plan.slots, 3);
+    fn a_measured_capacity_bounds_the_count() {
+        let plan = next_slots(6, None, calm(), Some(6));
+        assert_eq!(plan.slots, 6);
         assert_eq!(plan.movement, SlotMove::Hold);
+    }
+
+    #[test]
+    fn a_capacity_below_the_count_takes_the_count_down_to_it() {
+        let plan = next_slots(6, None, calm(), Some(2));
+        assert_eq!(plan.slots, 2);
+        assert_eq!(plan.movement, SlotMove::Shrink);
+    }
+
+    #[test]
+    fn without_a_declared_cap_the_measurement_is_the_only_bound() {
+        // Calm, below a capacity of six: the count grows one step at a time.
+        let plan = next_slots(1, None, calm(), Some(6));
+        assert_eq!(plan.slots, 2);
+        assert_eq!(plan.movement, SlotMove::Grow);
+    }
+
+    #[test]
+    fn a_declared_cap_still_wins_when_it_is_the_tighter_one() {
+        let plan = next_slots(2, Some(2), calm(), Some(8));
+        assert_eq!(plan.slots, 2);
+        assert_eq!(plan.movement, SlotMove::Hold);
+    }
+
+    #[test]
+    fn before_any_task_is_measured_the_count_may_still_grow() {
+        // Nothing has finished yet, so there is no cost to divide by. The
+        // count can still grow -- otherwise the first task could never run --
+        // and the memory line is what stops it.
+        let plan = next_slots(1, None, calm(), None);
+        assert_eq!(plan.slots, 2);
+        assert_eq!(plan.movement, SlotMove::Grow);
     }
 
     #[test]
     fn a_container_near_its_limit_halves_the_pool() {
         // A container whose page cache has already been dropped: 7.4 GiB of
         // working set against an 8 GiB limit is 0.92, past the red line.
-        let plan = next_slots(3, 3, Some((7_946_364_672, 8_589_934_592)));
+        let plan = next_slots(3, None, Some((7_946_364_672, 8_589_934_592)), Some(8));
         assert_eq!(plan.slots, 1);
         assert_eq!(plan.movement, SlotMove::Shrink);
     }
@@ -227,37 +395,22 @@ mod tests {
     #[test]
     fn the_measured_shape_of_the_main_pod_does_not_shrink_the_pool() {
         // Measured 2026-10-24: memory.current 6.80 GiB with 0.79 GiB of
-        // inactive file cache, against an 8 GiB limit -- 0.70, not red. The
-        // pod was carrying three slots' worth of work at that ratio, and the
-        // count that was declared is what the reading supports.
-        let plan = next_slots(3, 3, Some((6_804_500_480 - 790_851_584, 8_589_934_592)));
+        // inactive file cache, against an 8 GiB limit -- 0.70, not red.
+        let plan = next_slots(
+            3,
+            Some(3),
+            Some((6_804_500_480 - 790_851_584, 8_589_934_592)),
+            None,
+        );
         assert_eq!(plan.slots, 3);
         assert_eq!(plan.movement, SlotMove::Hold);
         assert!((plan.memory_fraction.expect("read") - 0.70).abs() < 1e-3);
     }
 
     #[test]
-    fn a_shrunk_pool_grows_back_once_there_is_room() {
-        let plan = next_slots(1, 3, Some((2 * GIB, 8 * GIB)));
-        assert_eq!(plan.slots, 2);
-        assert_eq!(plan.movement, SlotMove::Grow);
-    }
-
-    #[test]
-    fn the_band_between_shrinking_and_growing_is_wide_enough_to_hold() {
-        // Between the two lines a pool neither grows nor shrinks: that is the
-        // hysteresis that keeps a pool sitting at the edge of its limit from
-        // stepping every pass.
-        let plan = next_slots(2, 3, Some((6 * GIB, 8 * GIB)));
-        assert_eq!(plan.movement, SlotMove::Hold);
-        assert!((plan.memory_fraction.expect("read") - 0.75).abs() < 1e-9);
-    }
-
-    #[test]
-    fn an_unreadable_container_holds_the_ceiling() {
-        // "Not measured" must not read as "no pressure": with no reading the
-        // pool does what it did before the count was measured at all.
-        let plan = next_slots(3, 3, None);
+    fn an_unreadable_container_holds_the_count() {
+        // "Not measured" must not read as "no pressure".
+        let plan = next_slots(3, None, None, Some(8));
         assert_eq!(plan.slots, 3);
         assert_eq!(plan.movement, SlotMove::Hold);
         assert_eq!(plan.memory_fraction, None);
@@ -265,47 +418,99 @@ mod tests {
 
     #[test]
     fn the_pool_never_drops_below_one_worker() {
-        let plan = next_slots(1, 3, Some((8 * GIB, 8 * GIB)));
+        let plan = next_slots(1, None, Some((8 * GIB, 8 * GIB)), Some(0));
         assert_eq!(plan.slots, 1);
-        assert_eq!(plan.movement, SlotMove::Shrink);
     }
 
     #[test]
-    fn a_ceiling_of_zero_switches_the_pool_off() {
-        let plan = next_slots(3, 0, Some((GIB, 8 * GIB)));
+    fn a_declared_cap_of_zero_switches_the_pool_off() {
+        let plan = next_slots(3, Some(0), calm(), Some(8));
         assert_eq!(plan.slots, 0);
     }
 
     #[test]
-    fn the_growth_line_sits_below_the_red_line() {
-        assert!(
-            MEMORY_GROW_FRACTION < MEMORY_RED_FRACTION,
-            "a growth line at or above the red line would let one pass both \
-             shrink and grow the pool"
+    fn a_baseline_is_learned_from_an_idle_reading_and_only_ever_lowers() {
+        let mut cost = SlotCost::default();
+        cost.observe(4 * GIB, 0);
+        assert_eq!(cost.baseline_bytes, Some(4 * GIB));
+        cost.observe(5 * GIB, 0);
+        assert_eq!(
+            cost.baseline_bytes,
+            Some(4 * GIB),
+            "a busier moment is not this container's floor"
         );
+        assert_eq!(cost.per_task_bytes, None);
+    }
+
+    #[test]
+    fn a_task_costs_what_the_working_set_rose_by_over_the_baseline() {
+        let mut cost = SlotCost::default();
+        cost.observe(4 * GIB, 0);
+        cost.observe(6 * GIB, 2);
+        assert_eq!(cost.per_task_bytes, Some(GIB));
+        // A later reading with more in flight raises the figure only if it is
+        // larger: an under-estimate of the cost is an over-estimate of how
+        // many tasks fit.
+        cost.observe(9 * GIB, 3);
+        assert_eq!(cost.per_task_bytes, Some(5 * GIB / 3));
+    }
+
+    #[test]
+    fn capacity_is_planned_to_the_growth_line_not_the_limit() {
+        let mut cost = SlotCost::default();
+        cost.observe(4 * GIB, 0);
+        cost.observe(5 * GIB, 1);
+        // 8 GiB limit -> 5.84 GiB of budget at the growth line -> 1.84 GiB of
+        // room over the baseline -> one more task of 1 GiB fits.
+        assert_eq!(cost.capacity(8 * GIB), Some(1));
+    }
+
+    #[test]
+    fn capacity_is_unknown_until_both_figures_are_measured() {
+        let mut cost = SlotCost::default();
+        assert_eq!(cost.capacity(8 * GIB), None);
+        cost.observe(4 * GIB, 0);
+        assert_eq!(
+            cost.capacity(8 * GIB),
+            None,
+            "a baseline alone does not say what a task costs"
+        );
+        cost.observe(5 * GIB, 1);
+        assert!(cost.capacity(8 * GIB).is_some());
+    }
+
+    #[test]
+    fn a_reading_with_work_in_flight_before_any_baseline_measures_nothing() {
+        // Without a baseline the whole resident set would be divided by the
+        // task count, charging every other component in the pod to the pool.
+        let mut cost = SlotCost::default();
+        cost.observe(6 * GIB, 2);
+        assert_eq!(cost.baseline_bytes, None);
+        assert_eq!(cost.per_task_bytes, None);
     }
 
     #[tokio::test]
     async fn a_moved_count_is_reached_without_retiring_a_worker() {
-        let gate = std::sync::Arc::new(PoolConcurrency::new(3));
-        assert_eq!(gate.slots(), 3);
-        let first = gate.acquire().await.expect("a permit");
-        assert!(gate.set_slots(1).await);
+        let gate = Arc::new(PoolConcurrency::new(None));
         assert_eq!(gate.slots(), 1);
-        // The task already running keeps its permit and finishes normally.
+        let first = gate.acquire().await.expect("a turn");
+        assert_eq!(gate.in_use(), 1);
+        assert!(gate.set_slots(3).await);
+        assert_eq!(gate.slots(), 3);
+        // The task already running keeps its turn and finishes normally.
         drop(first);
-        // And the narrowed gate hands out exactly one turn, not the three the
-        // count used to allow.
-        let _only = gate
-            .acquire()
-            .await
-            .expect("the narrowed gate still has a turn");
-        assert_eq!(gate.permits.read().await.available_permits(), 0);
+        assert_eq!(gate.in_use(), 0);
+        // And the widened gate hands out three turns, not the one it started
+        // with.
+        let _a = gate.acquire().await.expect("a turn");
+        let _b = gate.acquire().await.expect("a turn");
+        let _c = gate.acquire().await.expect("a turn");
+        assert_eq!(gate.in_use(), 3);
     }
 
     #[tokio::test]
-    async fn a_worker_spawned_under_a_count_of_zero_never_runs() {
-        let gate = PoolConcurrency::new(0);
+    async fn a_worker_spawned_under_a_cap_of_zero_never_runs() {
+        let gate = PoolConcurrency::new(Some(0));
         assert_eq!(gate.slots(), 0);
         assert!(gate.acquire().await.is_none());
     }

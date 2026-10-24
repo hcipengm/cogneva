@@ -23,27 +23,56 @@ const POOL_SIZING_PERIOD: std::time::Duration = std::time::Duration::from_secs(3
 /// asked every period. The reading is logged on every move and on the first
 /// pass, so a pool sitting at one slot can be told apart from one that never
 /// read anything.
-fn spawn_pool_sizing_loop(concurrency: Arc<crate::pool_sizing::PoolConcurrency>) {
-    let ceiling = concurrency.ceiling();
-    let _ = cog_core::loop_health::spawn_unstoppable(
+fn spawn_pool_sizing_loop(
+    concurrency: Arc<crate::pool_sizing::PoolConcurrency>,
+    spawner: PoolSpawner,
+) {
+    drop(cog_core::loop_health::spawn_unstoppable(
         POOL_SIZING_LOOP,
         cog_core::loop_health::Cadence::Periodic(POOL_SIZING_PERIOD),
         move |beat| {
             let concurrency = concurrency.clone();
+            let spawner = spawner.clone();
             async move {
                 let mut interval = tokio::time::interval(POOL_SIZING_PERIOD);
+                let mut cost = crate::pool_sizing::SlotCost::default();
                 let mut first = true;
                 loop {
                     beat.beat();
                     interval.tick().await;
                     let reading = crate::pool_sizing::read_container_memory();
-                    let plan =
-                        crate::pool_sizing::next_slots(concurrency.slots(), ceiling, reading);
+                    if let Some((working_set, _)) = reading {
+                        cost.observe(working_set, concurrency.in_use());
+                    }
+                    let capacity = reading.and_then(|(_, limit)| cost.capacity(limit));
+                    let plan = crate::pool_sizing::next_slots(
+                        concurrency.slots(),
+                        concurrency.declared_cap(),
+                        reading,
+                        capacity,
+                    );
                     let changed = concurrency.set_slots(plan.slots).await;
+                    // Workers are objects, the count is a measurement: the
+                    // pool holds as many as the count in force, and until a
+                    // task has been measured it adds one only while every
+                    // worker it has is busy -- otherwise a quiet container
+                    // would grow a consumer a minute for doing nothing.
+                    let spawned = spawner.spawned();
+                    let target = match capacity {
+                        Some(_) => plan.slots,
+                        None if concurrency.in_use() >= spawned.max(1) => {
+                            (spawned + 1).min(plan.slots.max(1))
+                        }
+                        None => spawned,
+                    };
+                    while spawner.spawned() < target {
+                        spawner.spawn_one().await;
+                    }
                     if changed || first || plan.movement != crate::pool_sizing::SlotMove::Hold {
                         info!(
                             slots = plan.slots,
-                            ceiling,
+                            workers = spawner.spawned(),
+                            capacity = plan.capacity,
                             movement = ?plan.movement,
                             memory_fraction = plan.memory_fraction,
                             "agent pool concurrency"
@@ -51,14 +80,100 @@ fn spawn_pool_sizing_loop(concurrency: Arc<crate::pool_sizing::PoolConcurrency>)
                     }
                     crate::observable::global_observable().publish_pool_sizing(
                         plan.slots,
-                        ceiling,
+                        spawner.spawned(),
+                        plan.capacity,
                         plan.memory_fraction,
                     );
                     first = false;
                 }
             }
         },
-    );
+    ));
+}
+
+/// Everything one pool worker needs to be created again later.
+///
+/// The count of workers is a measurement, so workers are created from the
+/// sizing loop and not only from startup: this holds what the startup loop
+/// used to capture directly.
+#[derive(Clone)]
+struct PoolSpawner {
+    pool: Arc<crate::GlobalAgentManager>,
+    llm: Arc<dyn cog_core::LlmClient>,
+    runner: Arc<dyn cog_core::TaskExecutionCallback>,
+    concurrency: Arc<crate::pool_sizing::PoolConcurrency>,
+    role: String,
+    instance: String,
+    workspace: String,
+    spawned: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PoolSpawner {
+    fn spawned(&self) -> usize {
+        self.spawned.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Create the next worker. The slot number is the worker's own index, so
+    /// a name is never reused by two objects.
+    async fn spawn_one(&self) {
+        let slot = self
+            .spawned
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = crate::identity::worker_name(slot);
+        if !name.stable {
+            warn!(
+                slot, name = %name.handle,
+                "no instance fingerprint available; worker names change with the next pod roll"
+            );
+        }
+        let agent_id = name.id.clone();
+        let registration = cog_core::AgentRegistration::new(
+            agent_id.clone(),
+            &self.instance,
+            "127.0.0.1",
+            &self.role,
+            &self.workspace,
+            vec!["plan".into(), "generate".into(), "evaluate".into()],
+            cog_core::ResourceInfo::default(),
+        );
+        let runner = self.runner.clone();
+        let gate = self.concurrency.clone();
+        if let Err(e) = self
+            .pool
+            .spawn_worker(
+                agent_id.clone(),
+                self.role.clone(),
+                self.llm.clone(),
+                registration,
+                move |msg| {
+                    let runner = runner.clone();
+                    let gate = gate.clone();
+                    async move {
+                        if let cog_core::InboxMessage::Prompt { goal, .. } = msg {
+                            if let Ok(task) = serde_json::from_value::<cog_core::Task>(goal) {
+                                // A worker that cannot get a turn waits for
+                                // one rather than dropping the message: the
+                                // message is already taken, and a dropped one
+                                // is work nobody will be handed again.
+                                if let Some(_turn) = gate.acquire().await {
+                                    runner.execute_task(task).await;
+                                }
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await
+        {
+            warn!("Failed to spawn agent pool worker {}: {}", agent_id, e);
+        } else {
+            info!(
+                "Agent pool worker {} spawned (id={}, role={:?})",
+                name.handle, agent_id, self.role
+            );
+        }
+    }
 }
 
 /// Agent plugin that self-assembles and publishes hook engine, agent registry,
@@ -459,76 +574,28 @@ impl cog_core::SystemPlugin for AgentPlugin {
                     let agent_pool = crate::AgentManagerConfig::load()?;
                     let role = agent_pool.worker_role.clone();
                     let instance = crate::identity::agent_instance();
-                    // The declared count is the ceiling. How many of those
-                    // workers may hold a task at once is read off the memory
-                    // this container has, and moves while they run; see
-                    // `pool_sizing` for why the workers outlive the count.
-                    let concurrency = Arc::new(crate::pool_sizing::PoolConcurrency::new(
-                        agent_pool.worker_count,
-                    ));
-                    for i in 0..agent_pool.worker_count {
-                        let name = crate::identity::worker_name(i);
-                        if !name.stable {
-                            warn!(
-                                slot = i,
-                                name = %name.handle,
-                                "no instance fingerprint available; worker names change \
-                                 with the next pod roll"
-                            );
-                        }
-                        let agent_id = name.id.clone();
-                        let registration = cog_core::AgentRegistration::new(
-                            agent_id.clone(),
-                            &instance,
-                            "127.0.0.1",
-                            &agent_pool.worker_role,
-                            &config.dag_executor.workspace_id,
-                            vec!["plan".into(), "generate".into(), "evaluate".into()],
-                            cog_core::ResourceInfo::default(),
-                        );
-                        let runner = task_runner.clone();
-                        let gate = concurrency.clone();
-                        if let Err(e) = pool
-                            .spawn_worker(
-                                agent_id.clone(),
-                                role.clone(),
-                                llm.clone(),
-                                registration,
-                                move |msg| {
-                                    let runner = runner.clone();
-                                    let gate = gate.clone();
-                                    async move {
-                                        if let cog_core::InboxMessage::Prompt { goal, .. } = msg {
-                                            if let Ok(task) =
-                                                serde_json::from_value::<cog_core::Task>(goal)
-                                            {
-                                                // A worker that cannot get a
-                                                // turn waits for one rather
-                                                // than dropping the message:
-                                                // the message is already
-                                                // taken, and a dropped one is
-                                                // work nobody will be handed
-                                                // again.
-                                                if let Some(_turn) = gate.acquire().await {
-                                                    runner.execute_task(task).await;
-                                                }
-                                            }
-                                        }
-                                        Ok(())
-                                    }
-                                },
-                            )
-                            .await
-                        {
-                            warn!("Failed to spawn agent pool worker {}: {}", agent_id, e);
-                        } else {
-                            info!(
-                                "Agent pool worker {} spawned (id={}, role={:?})",
-                                name.handle, agent_id, role
-                            );
-                        }
-                    }
-                    spawn_pool_sizing_loop(concurrency);
+                    // A written-down `worker_count` is the operator's own
+                    // cap; zero means they wrote none, and then nothing but
+                    // what this container measures bounds the pool. The count
+                    // moves while tasks run, and the worker objects are
+                    // created by the sizing loop, so they are built from one
+                    // spawner rather than inline here.
+                    let declared_cap =
+                        (agent_pool.worker_count > 0).then_some(agent_pool.worker_count);
+                    let concurrency =
+                        Arc::new(crate::pool_sizing::PoolConcurrency::new(declared_cap));
+                    let spawner = PoolSpawner {
+                        pool: pool.clone(),
+                        llm: llm.clone(),
+                        runner: task_runner.clone(),
+                        concurrency: concurrency.clone(),
+                        role: role.clone(),
+                        instance: instance.clone(),
+                        workspace: config.dag_executor.workspace_id.clone(),
+                        spawned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    };
+                    spawner.spawn_one().await;
+                    spawn_pool_sizing_loop(concurrency, spawner);
                 }
             }
         }

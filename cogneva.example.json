@@ -498,7 +498,8 @@
   },
   "agent_pool": {
     "enabled": true,
-    "worker_count": 3,
+    "_comment_worker_count": "并发上限，操作者自己写下的数，0 = 不声明。实际并发由容器内存读数与单任务实测开销每三十秒算一次，这里写下的数只在比实测更紧时才生效。",
+    "worker_count": 0,
     "worker_role": "planner"
   },
   "self_evolution": {

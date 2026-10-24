@@ -183,6 +183,11 @@ impl From<AgentLoopConfig> for cog_core::RuntimeConfig {
 #[serde(default)]
 pub struct AgentManagerConfig {
     pub enabled: bool,
+    /// 操作者自己写下的并发上限；0 表示不写，此时只有资源读数约束并发。
+    ///
+    /// 它曾经是并发本身：写 3 就同时跑 3 个任务，谁也不问容器装不装得下。
+    /// 现在并发由 `pool_sizing` 按容器内存与单任务实测开销算出来，这里写下的
+    /// 数只在它比实测更紧时生效。写 0 就是不设这个上限。
     pub worker_count: usize,
     pub worker_role: String,
 }
@@ -191,7 +196,7 @@ impl Default for AgentManagerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            worker_count: 3,
+            worker_count: 0,
             worker_role: "planner".into(),
         }
     }
@@ -222,7 +227,8 @@ mod tests {
         assert_eq!(l.eval_max_iterations, 5);
         let p = AgentManagerConfig::default();
         assert!(p.enabled);
-        assert_eq!(p.worker_count, 3);
+        // 0 = 不声明上限：默认并发由资源读数决定，不再是一个写死的数。
+        assert_eq!(p.worker_count, 0);
     }
 
     #[test]
@@ -252,7 +258,8 @@ mod tests {
     fn reads_section_and_missing_file_defaults() {
         let p = Path::new("/nonexistent/cogneva.json");
         assert_eq!(AgentLoopConfig::load_from(p).unwrap().role, "planner");
-        assert_eq!(AgentManagerConfig::load_from(p).unwrap().worker_count, 3);
+        // 文件里没写上限就当作没声明：并发交给资源读数定。
+        assert_eq!(AgentManagerConfig::load_from(p).unwrap().worker_count, 0);
 
         let dir = std::env::temp_dir().join(format!("cog-agent-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
