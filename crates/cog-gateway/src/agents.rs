@@ -190,7 +190,8 @@ pub async fn get_handler(
 pub async fn send_message_handler(
     State(state): State<Arc<GatewayState>>,
     Path(agent_id): Path<String>,
-    Json(msg): Json<cog_core::InboxMessage>,
+    Query(query): Query<MessageQuery>,
+    Json(mut msg): Json<cog_core::InboxMessage>,
 ) -> Response {
     // Checked before either delivery path: both of them hand the command to a
     // handler that would publish the answer into that stream and leave it
@@ -202,9 +203,11 @@ pub async fn send_message_handler(
             Json(serde_json::json!({
                 "error": "this route does not take a caller-named reply_stream: \
                           the platform cannot read or reclaim a stream whose owner \
-                          it does not know. An agent asking another agent gets its \
-                          answer through the send_to_agent tool with expect_reply, \
-                          whose stream the platform opens and ends",
+                          it does not know. Pass `?wait_secs=N` instead and this \
+                          route will open the stream itself, read the answer and \
+                          end it before it answers; an agent asking another agent \
+                          gets the same thing through the send_to_agent tool with \
+                          expect_reply",
                 "reply_stream": stream,
                 "agent_id": agent_id,
             })),
@@ -212,61 +215,214 @@ pub async fn send_message_handler(
             .into_response();
     }
 
+    let wait = match ask_window(&msg, query.wait_secs) {
+        Ok(wait) => wait,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e, "agent_id": agent_id})),
+            )
+                .into_response()
+        }
+    };
+
+    // Opened before the command goes out, whichever path delivers it: a
+    // consumer group starts at the stream's current end, so an answer
+    // published between the publish and the subscribe would sit behind the
+    // reader and the wait would run to its deadline with the answer already
+    // on the wire.
+    let ask = match wait {
+        Some(window) => {
+            // The answer is read off the queue, so a deployment with no queue
+            // cannot serve this one request even when the agent is in this
+            // process: the reply has nowhere to land.
+            let Some(backend) = state.message_backend.clone() else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "message_backend not configured: an answer has \
+                                  nowhere to land without one",
+                        "agent_id": agent_id,
+                    })),
+                )
+                    .into_response();
+            };
+            match Ask::open(backend, &mut msg, window).await {
+                Ok(ask) => Some(ask),
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e, "agent_id": agent_id})),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        None => None,
+    };
+
+    // A dropped `ask` on any of the returns below ends its stream, so a
+    // refused delivery does not leave one behind.
+    let delivered = match deliver(&state, &agent_id, msg).await {
+        Ok(delivered) => delivered,
+        Err(response) => return response,
+    };
+
+    match ask {
+        None => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "queued": true,
+                "agent_id": agent_id,
+                "via": delivered.label(),
+            })),
+        )
+            .into_response(),
+        Some(ask) => answer_with_reply(agent_id, delivered, ask).await,
+    }
+}
+
+/// How long the route will hold a request open waiting for an answer.
+///
+/// A route that waits is a connection held by the caller, and every proxy in
+/// front of it has its own idle bound; a request told to wait longer than this
+/// is refused rather than silently cut down to it, because a caller that asked
+/// for five minutes and was given two would read the timeout as the agent's
+/// silence rather than as this bound.
+pub const MAX_WAIT_SECS: u64 = 120;
+
+/// The consumer group the route reads its answers with.
+///
+/// One name for every ask because each ask owns its own stream: the group is
+/// the reader, and a stream with exactly one reader does not need a second
+/// identity.
+const ASK_GROUP: &str = "asker";
+
+/// What the request asked for beyond delivery.
+#[derive(Debug, Deserialize, Default)]
+pub struct MessageQuery {
+    /// Seconds to wait for the agent's answer. Absent means do not wait: the
+    /// reply is queued and this route answers `202`, which is what it has
+    /// always done.
+    #[serde(default)]
+    pub wait_secs: Option<u64>,
+}
+
+/// Whether this request wants an answer, and why not when it cannot have one.
+///
+/// Split out from the handler so the decision is a function of the request
+/// alone: which commands have an answer at all is a property of the command,
+/// not of the deployment it is sent to.
+fn ask_window(
+    msg: &cog_core::InboxMessage,
+    wait_secs: Option<u64>,
+) -> Result<Option<std::time::Duration>, String> {
+    let Some(secs) = wait_secs else {
+        return Ok(None);
+    };
+    if !matches!(msg, cog_core::InboxMessage::Prompt { .. }) {
+        return Err(format!(
+            "wait_secs applies to `prompt` only: the other commands carry no answer \
+             (an abort, a reset and a steering change what the agent is doing, and \
+             a continue resumes a run that answers on its own stream); got {}",
+            command_name(msg)
+        ));
+    }
+    if secs == 0 {
+        return Err("wait_secs must be at least 1".into());
+    }
+    if secs > MAX_WAIT_SECS {
+        return Err(format!(
+            "wait_secs above {MAX_WAIT_SECS} is refused rather than clamped: a caller \
+             that asked for {secs}s and was given less would read the timeout as the \
+             agent's silence"
+        ));
+    }
+    Ok(Some(std::time::Duration::from_secs(secs)))
+}
+
+/// The command's own name, for error text.
+fn command_name(msg: &cog_core::InboxMessage) -> &'static str {
+    match msg {
+        cog_core::InboxMessage::Prompt { .. } => "prompt",
+        cog_core::InboxMessage::Steering { .. } => "steering",
+        cog_core::InboxMessage::Continue { .. } => "continue",
+        cog_core::InboxMessage::Abort => "abort",
+        cog_core::InboxMessage::Reset => "reset",
+    }
+}
+
+/// Which of the two delivery paths took the command.
+#[derive(Clone, Copy)]
+enum Delivered {
+    /// An agent in this process, handed the command directly.
+    Pool,
+    /// A name held elsewhere, reached through the shared inbox stream.
+    Inbox,
+}
+
+impl Delivered {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pool => "agent_pool",
+            Self::Inbox => "inbox",
+        }
+    }
+}
+
+/// Put the command on the named agent's queue, or say why it could not go.
+async fn deliver(
+    state: &GatewayState,
+    agent_id: &str,
+    msg: cog_core::InboxMessage,
+) -> Result<Delivered, Response> {
     // Local first. A miss is not an answer -- the same name may be held by
     // another process, which is the whole point of the registry.
     if let Some(pool) = state.agent_pool.as_ref() {
-        match pool.get_agent(&agent_id).await {
+        match pool.get_agent(agent_id).await {
             Ok(Some(agent)) => {
                 return match agent.receive_message(msg).await {
-                    Ok(()) => (
-                        StatusCode::ACCEPTED,
-                        Json(serde_json::json!({
-                            "queued": true,
-                            "agent_id": agent_id,
-                            "via": "agent_pool",
-                        })),
-                    )
-                        .into_response(),
-                    Err(e) => (
+                    Ok(()) => Ok(Delivered::Pool),
+                    Err(e) => Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({"error": e.to_string()})),
                     )
-                        .into_response(),
+                        .into_response()),
                 }
             }
             Ok(None) => {}
             Err(e) => {
-                return (
+                return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": e.to_string()})),
                 )
-                    .into_response()
+                    .into_response())
             }
         }
     }
 
     let Some(registry) = state.agent_registry.as_ref() else {
-        return (
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "agent_registry not configured"})),
         )
-            .into_response();
+            .into_response());
     };
-    match registry.get(&agent_id).await {
+    match registry.get(agent_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
-            return (
+            return Err((
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "no live agent under this name"})),
             )
-                .into_response()
+                .into_response())
         }
         Err(e) => {
-            return (
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": e.to_string()})),
             )
-                .into_response()
+                .into_response())
         }
     }
 
@@ -274,40 +430,277 @@ pub async fn send_message_handler(
     // deployment fault, not a delivery: say so instead of answering 202 for a
     // message that was never written anywhere.
     let Some(backend) = state.message_backend.as_ref() else {
-        return (
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "message_backend not configured"})),
         )
-            .into_response();
+            .into_response());
     };
     let payload = match serde_json::to_vec(&msg) {
         Ok(payload) => payload,
         Err(e) => {
-            return (
+            return Err((
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": e.to_string()})),
             )
-                .into_response()
+                .into_response())
         }
     };
-    let stream = cog_core::agent_inbox_stream(&agent_id);
+    let stream = cog_core::agent_inbox_stream(agent_id);
     match backend.publish(&stream, &payload).await {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({
-                "queued": true,
-                "agent_id": agent_id,
-                "via": "inbox",
-                "stream": stream,
-            })),
-        )
-            .into_response(),
-        Err(e) => (
+        Ok(()) => Ok(Delivered::Inbox),
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string(), "stream": stream})),
         )
+            .into_response()),
+    }
+}
+
+/// Wait for the answer to a delivered prompt and turn it into the response.
+async fn answer_with_reply(agent_id: String, delivered: Delivered, ask: Ask) -> Response {
+    let started = std::time::Instant::now();
+    let outcome = ask.await_reply().await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    // One line per ask, beside the queue: the queue keeps no record of who
+    // asked, so this is the only place the two ends meet.
+    tracing::info!(
+        to = %agent_id,
+        via = delivered.label(),
+        outcome = outcome.label(),
+        elapsed_ms,
+        "asked an agent and waited for its answer"
+    );
+    match outcome {
+        AskOutcome::Replied(reply) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "replied": true,
+                "agent_id": agent_id,
+                "via": delivered.label(),
+                "reply": reply,
+            })),
+        )
+            .into_response(),
+        AskOutcome::TimedOut { waited_secs } => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "replied": false,
+                "agent_id": agent_id,
+                "via": delivered.label(),
+                "waited_secs": waited_secs,
+                "error": "the agent did not answer within the wait this request \
+                          asked for; the run itself was not cancelled",
+            })),
+        )
+            .into_response(),
+        AskOutcome::Unreadable { error } => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "replied": false,
+                "agent_id": agent_id,
+                "error": format!("the agent answered with bytes that are not JSON: {error}"),
+            })),
+        )
+            .into_response(),
+        AskOutcome::StreamError { error } => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "replied": false,
+                "agent_id": agent_id,
+                "error": format!("the reply stream failed before an answer arrived: {error}"),
+            })),
+        )
             .into_response(),
     }
+}
+
+/// One ask's reply stream, from the moment the key exists until it is ended.
+///
+/// The stream is opened here rather than named by the caller for the reason
+/// the refusal above gives: ending it is the asker's job, and this is the
+/// asker. It is ended on every path the wait reaches, and the `Drop` below is
+/// what covers the paths that reach none of them -- a cancelled request, or a
+/// `?` return between the group's creation and the wait.
+struct Ask {
+    backend: Arc<dyn cog_core::MessageBackend>,
+    stream: String,
+    reader: cog_core::MessageStream,
+    window: std::time::Duration,
+    armed: bool,
+}
+
+impl Ask {
+    /// Open a reply stream and put its name on `msg`.
+    ///
+    /// The group is created before the subscribe because that is what brings
+    /// the key into existence, and the subscriber starts from the stream's
+    /// current end; a group created afterwards would start behind the answer
+    /// this call is about to ask for.
+    async fn open(
+        backend: Arc<dyn cog_core::MessageBackend>,
+        msg: &mut cog_core::InboxMessage,
+        window: std::time::Duration,
+    ) -> Result<Self, String> {
+        let stream = ask_stream();
+        if let cog_core::InboxMessage::Prompt { reply_stream, .. } = msg {
+            *reply_stream = Some(stream.clone());
+        } else {
+            return Err("only a prompt has an answer to wait for".into());
+        }
+        backend
+            .create_consumer_group(&stream, ASK_GROUP)
+            .await
+            .map_err(|e| format!("cannot open a reply stream: {e}"))?;
+        let reader = match backend.subscribe(&stream, ASK_GROUP).await {
+            Ok(reader) => reader,
+            // The key exists from the group's creation, and no guard owns it
+            // yet, so this path ends it here.
+            Err(e) => {
+                backend.stop_stream(&stream, ASK_GROUP).await;
+                if let Err(del) = backend.delete_stream(&stream).await {
+                    tracing::warn!(
+                        stream = %stream,
+                        error = %del,
+                        "a reply stream opened for an ask that could not read it was left behind"
+                    );
+                }
+                return Err(format!("cannot read the reply stream: {e}"));
+            }
+        };
+        Ok(Self {
+            backend,
+            stream,
+            reader,
+            window,
+            armed: true,
+        })
+    }
+
+    /// End the stream and stop counting this ask as outstanding.
+    async fn close(&mut self) {
+        self.backend.stop_stream(&self.stream, ASK_GROUP).await;
+        if let Err(e) = self.backend.delete_stream(&self.stream).await {
+            tracing::warn!(
+                stream = %self.stream,
+                error = %e,
+                "the ask's reply stream outlived its answer: this backend cannot delete streams"
+            );
+        }
+        self.armed = false;
+    }
+
+    async fn await_reply(mut self) -> AskOutcome {
+        let window = self.window;
+        let waited = tokio::time::timeout(window, futures::StreamExt::next(&mut self.reader)).await;
+        let outcome = match waited {
+            Ok(Some(Ok((id, bytes)))) => {
+                if let Err(e) = self
+                    .backend
+                    .ack(&self.stream, ASK_GROUP, std::slice::from_ref(&id))
+                    .await
+                {
+                    tracing::warn!(stream = %self.stream, error = %e, "cannot ack an answer");
+                }
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .map(AskOutcome::Replied)
+                    .unwrap_or_else(|e| AskOutcome::Unreadable {
+                        error: e.to_string(),
+                    })
+            }
+            Ok(Some(Err(e))) => AskOutcome::StreamError {
+                error: e.to_string(),
+            },
+            Ok(None) => AskOutcome::StreamError {
+                error: "the reply stream ended without a message".into(),
+            },
+            Err(_) => AskOutcome::TimedOut {
+                waited_secs: window.as_secs(),
+            },
+        };
+        self.close().await;
+        outcome
+    }
+}
+
+impl Drop for Ask {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let backend = self.backend.clone();
+        let stream = self.stream.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    backend.stop_stream(&stream, ASK_GROUP).await;
+                    if let Err(e) = backend.delete_stream(&stream).await {
+                        tracing::warn!(
+                            stream = %stream,
+                            error = %e,
+                            "an abandoned ask left its reply stream behind"
+                        );
+                    }
+                });
+            }
+            Err(_) => tracing::warn!(
+                stream = %self.stream,
+                "an abandoned ask could not be reaped: no runtime to end its stream"
+            ),
+        }
+    }
+}
+
+/// How one ask ended.
+enum AskOutcome {
+    Replied(serde_json::Value),
+    TimedOut {
+        waited_secs: u64,
+    },
+    /// The agent published something that is not JSON.
+    Unreadable {
+        error: String,
+    },
+    /// The queue failed, or the stream ended without a message.
+    StreamError {
+        error: String,
+    },
+}
+
+impl AskOutcome {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Replied(_) => "replied",
+            Self::TimedOut { .. } => "timeout",
+            Self::Unreadable { .. } => "unreadable",
+            Self::StreamError { .. } => "stream_error",
+        }
+    }
+}
+
+/// The stream one ask waits on, named by the ask itself.
+///
+/// The name is the correlation: a reply carries nothing saying which question
+/// it answers, so two questions sharing a stream would leave the reader unable
+/// to tell the answers apart. Giving each ask its own stream makes the
+/// correlation a property of the address.
+///
+/// Process id, wall clock and a counter together, because no one of them is
+/// unique alone: the counter restarts at zero with the process, the clock
+/// collides inside a tick, and the process id is reused.
+fn ask_stream() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "gateway:ask:{}:{:x}:{}",
+        std::process::id(),
+        nanos,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// The reply stream the caller put in the body, if any.

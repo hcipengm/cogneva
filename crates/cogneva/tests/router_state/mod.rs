@@ -1,3 +1,6 @@
+// 每个集成测试文件各自编一次这份夹具，只用得到其中一个构造函数的文件不该为此报警。
+#![allow(dead_code)]
+
 //! A gateway state with no store behind it, for contract tests about routes.
 //!
 //! The suites that judge the route table need a [`GatewayState`] and nothing
@@ -128,6 +131,27 @@ pub fn stateless() -> Arc<GatewayState> {
 pub fn stateless_with_datasets(
     datasets: Option<Arc<cog_storage::DatasetStore>>,
 ) -> Arc<GatewayState> {
+    build(datasets, None, None)
+}
+
+/// The same state, with a queue and a roster behind it.
+///
+/// The routes that put a command on an agent's inbox and wait for its answer
+/// reach both: the roster is how a name is resolved, the queue is where the
+/// command goes and where the answer comes back. A suite that judges those
+/// routes supplies the two and stands in for the agent's own consumer.
+pub fn with_messaging(
+    backend: Arc<dyn cog_core::MessageBackend>,
+    registry: Arc<dyn cog_core::AgentRegistry>,
+) -> Arc<GatewayState> {
+    build(None, Some(backend), Some(registry))
+}
+
+fn build(
+    datasets: Option<Arc<cog_storage::DatasetStore>>,
+    message_backend: Option<Arc<dyn cog_core::MessageBackend>>,
+    agent_registry: Option<Arc<dyn cog_core::AgentRegistry>>,
+) -> Arc<GatewayState> {
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
     let raw_logger: Arc<dyn cog_core::RawLogger> = Arc::new(cog_storage::MemoryRawLogger::new());
@@ -171,7 +195,7 @@ pub fn stateless_with_datasets(
         hook_engine: None,
         orchestrator,
         task_executors: Arc::new(cog_orchestrator::TaskExecutorRouter::new()),
-        agent_registry: None,
+        agent_registry,
         observability_gateway: None,
         connection_manager: None,
         wiki_adapter: None,
@@ -207,7 +231,7 @@ pub fn stateless_with_datasets(
         notification_dispatcher: None,
         notification_tx: broadcast::channel(16).0,
         agent_pool: None,
-        message_backend: None,
+        message_backend,
         event_publisher: None,
         media_backend: None,
         websocket_client: None,
