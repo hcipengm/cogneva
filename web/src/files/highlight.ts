@@ -217,3 +217,31 @@ export function findMatches(text: string, query: string): Array<[number, number]
   }
   return matches;
 }
+
+/**
+ * 在正文里替换掉一处或全部命中。
+ *
+ * 替换按**找到的区间**做，不是按正则、也不是按大小写不敏感地再搜一遍：搜索是
+ * 大小写不敏感的，替换却必须一字不差地只动命中的那几段，否则「大小写不敏感地
+ * 找、按另一种大小写写回去」会把原文里的大写也一并改写掉。
+ *
+ * 从后往前拼：从前往后替换会让后面每一处命中的下标都往前挪，第二处开始就错位。
+ *
+ * `only` 是只替换那一处（按 `findMatches` 的下标）；不给就是全部。返回替换后的
+ * 正文与替换了多少处——调用方拿后者决定要不要提示「一处都没替换」。
+ */
+export function replaceMatches(
+  text: string,
+  query: string,
+  replacement: string,
+  only?: number
+): { text: string; replaced: number } {
+  const matches = findMatches(text, query);
+  const picked = only === undefined ? matches : matches.slice(only, only + 1);
+  if (picked.length === 0) return { text, replaced: 0 };
+  let out = text;
+  for (const [start, end] of [...picked].reverse()) {
+    out = out.slice(0, start) + replacement + out.slice(end);
+  }
+  return { text: out, replaced: picked.length };
+}

@@ -6,7 +6,7 @@ import {
   type WorkspaceFile,
 } from '@/api/client';
 import { CodeEditor } from '@/files/CodeEditor';
-import { findMatches } from '@/files/highlight';
+import { findMatches, replaceMatches } from '@/files/highlight';
 import { useDrafts } from '@/files/store';
 import { useShell } from '@/shell/store';
 import { Button, Empty, Loading, ReadError } from '@/ui/primitives';
@@ -47,6 +47,7 @@ export function FilesView() {
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState('');
   const [findIndex, setFindIndex] = useState(0);
+  const [replaceText, setReplaceText] = useState('');
 
   const load = useCallback(async (target: string) => {
     setLoading(true);
@@ -74,6 +75,11 @@ export function FilesView() {
   const dirty = draft !== undefined && draft !== file?.text;
   const lines = text ? text.split('\n').length : 0;
   const matches = findOpen ? findMatches(text, findQuery) : [];
+  /** 查找框里显示的「第几处」，按命中数为 0 时回到第 1 处处理。 */
+  const resolveFindIndex = (): number => {
+    if (matches.length === 0) return 0;
+    return ((findIndex % matches.length) + matches.length) % matches.length;
+  };
 
   // 搜索结果是「哪个文件、第几行」。落到哪儿由这一层算：只有它手里有正文。
   useEffect(() => {
@@ -120,6 +126,24 @@ export function FilesView() {
     },
     [path, dirty, saving, text, file, clearDraft, appendOutput]
   );
+
+  /**
+   * 替换。落在草稿上、不落盘：改完还要按一次保存才算写进工作区。
+   *
+   * 这一条与「保存」分开是有意的——替换全部一次能改几十处，直接写盘的话读者
+   * 只能靠撤销找回原样；改草稿则一次关掉页签就能整份放弃。
+   */
+  const replace = (all: boolean) => {
+    if (!path || !findQuery) return;
+    const outcome = replaceMatches(text, findQuery, replaceText, all ? undefined : resolveFindIndex());
+    if (outcome.replaced === 0) {
+      appendOutput(`没有可替换的「${findQuery}」`);
+      return;
+    }
+    setDraft(path, outcome.text);
+    appendOutput(`替换 ${outcome.replaced} 处「${findQuery}」（还没保存）`);
+    setFindIndex(0);
+  };
 
   const createFile = async () => {
     const target = newPath.trim();
@@ -274,6 +298,25 @@ export function FilesView() {
                 : `${(((findIndex % matches.length) + matches.length) % matches.length) + 1} / ${matches.length}`
               : '输入要查找的文字'}
           </span>
+          <input
+            value={replaceText}
+            onChange={(event) => setReplaceText(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                replace(event.shiftKey ? true : false);
+              }
+            }}
+            placeholder="替换为（回车替换这一处，Shift+回车全部）"
+            className="mono w-72 border border-[var(--line)] bg-[var(--ink-900)] px-2 py-1 text-[12px] outline-none focus:border-[var(--brass)]"
+            style={{ color: 'var(--paper)' }}
+          />
+          <Button onClick={() => replace(false)} disabled={!findQuery}>
+            替换
+          </Button>
+          <Button onClick={() => replace(true)} disabled={!findQuery} tone="accent">
+            全部替换
+          </Button>
           <button
             type="button"
             onClick={() => setFindOpen(false)}

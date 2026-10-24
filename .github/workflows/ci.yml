@@ -684,6 +684,12 @@ jobs:
       - name: Build the WebUI
         working-directory: web
         run: npm run build
+      # 替换的语义不是「编译过」能证的东西：从前往后拼、忽略 only 下标、大小写
+      # 跟着替换文本走，三种都编得过、跑起来也「成功」，只是把文件改坏。这一步把
+      # `replaceMatches` 单文件编译出来在 node 里按判据跑，放在装过依赖的作业
+      # 里——它要那一份 tsc，别的作业没有。
+      - name: Check in-file replace keeps every byte it should
+        run: bash deploy/scripts/check-web-replace-semantics.sh
 
   entry-scripts:
     name: Entry Scripts Lint
