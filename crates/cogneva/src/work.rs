@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 
@@ -52,6 +53,10 @@ SUBCOMMANDS:
                            it retries, is cancelled or goes to the dead letter.
     release --task <id>    Put a claimed or started task back in line without
                            charging an attempt.
+    inbox                  Print what other agents sent this unit, one message per
+                           line as JSON, and acknowledge each after printing it.
+                           Runs until interrupted; the unit stays registered as
+                           alive for as long as it listens.
 
 OPTIONS:
     --unit <unit>          The unit this caller acts for (required).
@@ -90,6 +95,7 @@ pub enum Action {
     Release {
         task: String,
     },
+    Inbox,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +185,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
             error: error.ok_or("--error is required for fail")?,
         },
         Some("release") => Action::Release { task: task()? },
+        Some("inbox") => Action::Inbox,
         Some(other) => return Err(format!("unknown work subcommand {other}")),
         None => return Err("work needs a subcommand".into()),
     };
@@ -364,6 +371,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
             .await?;
             println!("{} failure published", task.id);
         }
+        Action::Inbox => inbox(unit, &endpoints).await?,
         Action::Release { task } => {
             let task = owned_task(&*backend, workspace, &task, unit).await?;
             transition(
@@ -632,6 +640,60 @@ async fn presence(unit: &str, workspace: &str, redis_url: &str) -> Result<(), Bo
     Ok(())
 }
 
+/// How often a listening unit re-states that it is alive.
+///
+/// Half of [`UNIT_PRESENCE_TTL_SECS`], so one missed renewal still leaves the
+/// record standing: a unit that is listening is alive whatever its queue looks
+/// like, and the face readings ask the registry rather than the queue.
+const INBOX_PRESENCE_RENEWAL: Duration = Duration::from_secs(UNIT_PRESENCE_TTL_SECS / 2);
+
+/// Read the messages other agents sent this unit, and acknowledge them.
+///
+/// The graph is one direction of this unit's traffic -- it asks for work and
+/// answers with a result -- and the inbox is the other. Both exist, and a unit
+/// that only ever pulled would be reachable as a name nobody can speak to: the
+/// producer checks the registry before it publishes and refuses a name nobody
+/// holds, so listening and registering are the same act here rather than two
+/// steps a caller has to remember.
+///
+/// Registering matters for a second reason: the retirement pass deletes the
+/// inbox of a unit the registry does not know, so a listener that never
+/// registered would have the stream it is reading taken out from under it.
+async fn inbox(unit: &str, endpoints: &Endpoints) -> Result<(), Box<dyn Error>> {
+    let backend = transport(endpoints).await?;
+    presence(unit, &endpoints.workspace, &endpoints.redis_url).await?;
+    let renewal = {
+        let unit = unit.to_string();
+        let workspace = endpoints.workspace.clone();
+        let redis_url = endpoints.redis_url.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(INBOX_PRESENCE_RENEWAL).await;
+                if let Err(e) = presence(&unit, &workspace, &redis_url).await {
+                    // Named rather than silent: a unit whose presence lapsed
+                    // keeps reading, but nothing can be addressed to it, and
+                    // that is not visible from inside the read loop.
+                    eprintln!("# could not renew presence for {unit}: {e}");
+                }
+            }
+        })
+    };
+    let consumer = cog_agent::AgentConsumer::new(unit, backend);
+    let result = consumer
+        .run(|message| async move {
+            let line = serde_json::to_string(&message).map_err(cog_core::SFError::Serialization)?;
+            // One line per message, printed before the ack: a reader that was
+            // handed the message and then lost it would have been answered
+            // with an acknowledgement it never earned.
+            println!("{line}");
+            Ok(())
+        })
+        .await;
+    renewal.abort();
+    result?;
+    Ok(())
+}
+
 /// The owned tasks this unit can start now, and how many it owns at all.
 ///
 /// Split out from the command so the filter is a function of the rows: the
@@ -725,6 +787,11 @@ mod tests {
         let request = parse_args(&args(&["heartbeat", "--unit", "8b"])).unwrap();
         assert_eq!(request.action, Action::Heartbeat);
 
+        // Listening needs no task: the unit is the whole operand, and a
+        // listener that had to name a task would have nothing to listen for.
+        let request = parse_args(&args(&["inbox", "--unit", "8b"])).unwrap();
+        assert_eq!(request.action, Action::Inbox);
+
         let request = parse_args(&args(&[
             "complete",
             "--unit",
@@ -741,6 +808,20 @@ mod tests {
                 task: "t-1".into(),
                 result: serde_json::json!({"ok": true}),
             }
+        );
+    }
+
+    #[test]
+    fn a_listening_unit_renews_its_presence_before_the_record_lapses() {
+        // The renewal is what keeps a listener addressable: a producer refuses
+        // a name the registry does not hold, and the retirement pass deletes
+        // the inbox of a unit it cannot find. A renewal at or beyond the
+        // record's own lifetime would let both happen while the unit was
+        // reading.
+        assert!(
+            INBOX_PRESENCE_RENEWAL < Duration::from_secs(UNIT_PRESENCE_TTL_SECS),
+            "renewal {INBOX_PRESENCE_RENEWAL:?} must be inside the presence record's lifetime \
+             of {UNIT_PRESENCE_TTL_SECS}s"
         );
     }
 
