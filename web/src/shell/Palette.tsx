@@ -135,7 +135,9 @@ export function Palette() {
     const themes: Command[] = THEMES.map((entry) => ({
       id: `theme:${entry.id}`,
       group: '主题' as const,
-      title: `${entry.name}${entry.id === theme ? '（当前）' : ''}`,
+      // 标题里带上游名字：认这套主题的人搜的是「Neon Lagoon」，不是我们起的
+      // 中文名；只放中文名时，搜上游名字一条都匹配不到。
+      title: `${entry.name} · ${entry.origin}${entry.id === theme ? '（当前）' : ''}`,
       hint: entry.note,
       run: () => setTheme(entry.id),
     }));

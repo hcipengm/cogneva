@@ -89,6 +89,7 @@ function ThemeCard({
           {selected ? '当前' : '切换'}
         </span>
       </span>
+      <span className="mono text-[10px] leading-snug text-[var(--paper-dim)]">{theme.origin}</span>
       <span className="text-[10px] leading-snug text-[var(--muted)]">{theme.note}</span>
     </button>
   );

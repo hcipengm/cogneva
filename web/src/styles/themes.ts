@@ -41,6 +41,14 @@ export type ThemeTokens = Record<TokenKey, string>;
 export interface Theme {
   id: string;
   name: string;
+  /**
+   * 这套配色在上游叫什么（主题包 / 主题名）。
+   *
+   * 单独占一格而不是并进 `note`：中文名是我们起的，认这套主题的人记的是
+   * 上游那个名字（Pink Pixel 的 Neon Lagoon、Absolutely 的 Matrix…）。并进
+   * 说明里就变成了「一句描述」，没人能从里面认出自己找的那一套。
+   */
+  origin: string;
   /** 一行说明这个主题的性格，选的时候看得见。 */
   note: string;
   /** 亮色主题要把浏览器的原生控件（滚动条、表单）也切到亮色。 */
@@ -71,7 +79,8 @@ export const THEMES: Theme[] = [
   {
     id: 'lagoon',
     name: '霓虹泻湖',
-    note: 'Pink Pixel Neon Lagoon · 深青底 / 亮青强调 / 珊瑚粉蓝',
+    origin: 'Pink Pixel · Neon Lagoon',
+    note: '深青底 / 亮青强调 / 珊瑚粉蓝',
     light: false,
     tokens: {
       'ink-1000': '#031014',
@@ -95,7 +104,8 @@ export const THEMES: Theme[] = [
   {
     id: 'sugarstorm',
     name: '电糖风暴',
-    note: 'Pink Pixel Electric Sugarstorm · 洋红 + 霓虹青',
+    origin: 'Pink Pixel · Electric Sugarstorm',
+    note: '洋红 + 霓虹青，这一组里最张扬的一套',
     light: false,
     tokens: {
       'ink-1000': '#050607',
@@ -119,7 +129,8 @@ export const THEMES: Theme[] = [
   {
     id: 'nebula',
     name: '糖果星云',
-    note: 'Pink Pixel Candy Nebula · 深紫底 / 品红 / 薄荷绿',
+    origin: 'Pink Pixel · Candy Nebula',
+    note: '深紫底 / 品红 / 薄荷绿',
     light: false,
     tokens: {
       'ink-1000': '#08010e',
@@ -143,7 +154,8 @@ export const THEMES: Theme[] = [
   {
     id: 'aurora',
     name: '极光爆发',
-    note: 'Pink Pixel Aurora Burst · 石墨底 / 珊瑚红 / 荧光绿',
+    origin: 'Pink Pixel · Aurora Burst',
+    note: '石墨底 / 珊瑚红 / 荧光绿',
     light: false,
     tokens: {
       'ink-1000': '#111319',
@@ -167,7 +179,8 @@ export const THEMES: Theme[] = [
   {
     id: 'peachy',
     name: '蜜桃',
-    note: '热粉 #FF4791 · 薄荷与奶油色点缀',
+    origin: 'Peachy Themes',
+    note: '热粉 #FF4791 / 薄荷 / 奶油黄',
     light: false,
     tokens: {
       'ink-1000': '#1a0a10',
@@ -191,7 +204,8 @@ export const THEMES: Theme[] = [
   {
     id: 'elhassan',
     name: '荧光紫',
-    note: 'Elhassan Neon · 深紫底 / 品红 / RGB 青色强调',
+    origin: 'Elhassan Neon',
+    note: '深紫底 / 品红 / RGB 青色强调',
     light: false,
     tokens: {
       'ink-1000': '#080312',
@@ -215,7 +229,8 @@ export const THEMES: Theme[] = [
   {
     id: 'violet',
     name: '紫罗兰',
-    note: 'Shades of Purple · 深浅紫打底 / 薰衣草强调',
+    origin: 'Shades of Purple',
+    note: '深浅紫打底 / 薰衣草强调',
     light: false,
     tokens: {
       'ink-1000': '#170f24',
@@ -239,7 +254,8 @@ export const THEMES: Theme[] = [
   {
     id: 'orangefox',
     name: '橙狐',
-    note: 'OrangeFox · 火焰橙强调 / 暖棕底',
+    origin: 'OrangeFox',
+    note: '火焰橙强调 / 暖棕底',
     light: false,
     tokens: {
       'ink-1000': '#170e0a',
@@ -263,7 +279,8 @@ export const THEMES: Theme[] = [
   {
     id: 'oscurange',
     name: '暗橙',
-    note: 'Oscurange · 近黑底 / 琥珀橙 / 暖纸色',
+    origin: 'Absolutely Theme · Oscurange',
+    note: '近黑底 / 琥珀橙 / 暖纸色',
     light: false,
     tokens: {
       'ink-1000': '#0e0a06',
@@ -287,7 +304,8 @@ export const THEMES: Theme[] = [
   {
     id: 'lobster',
     name: '龙虾',
-    note: 'Lobster · 酒红底 / 朱红强调 / 珊瑚橙',
+    origin: 'Absolutely Theme · Lobster',
+    note: '酒红底 / 朱红强调 / 珊瑚橙',
     light: false,
     tokens: {
       'ink-1000': '#120507',
@@ -311,7 +329,8 @@ export const THEMES: Theme[] = [
   {
     id: 'barva',
     name: '刺绣',
-    note: 'Barva · 红蓝黄绿四色并置 / 民俗撞色',
+    origin: 'Barva',
+    note: '红蓝黄绿四色并置 / 民俗撞色',
     light: false,
     tokens: {
       'ink-1000': '#100c0b',
@@ -335,7 +354,8 @@ export const THEMES: Theme[] = [
   {
     id: 'matrix',
     name: '矩阵',
-    note: 'Absolutely Matrix · 近黑底 / 荧光绿读数',
+    origin: 'Absolutely Theme · Matrix',
+    note: '近黑底 / 荧光绿读数',
     light: false,
     tokens: {
       'ink-1000': '#030d07',
@@ -359,7 +379,8 @@ export const THEMES: Theme[] = [
   {
     id: 'spicy',
     name: '辛辣红',
-    note: 'Spicy Red · 酒红底 / 朱红强调 / 琥珀点缀',
+    origin: 'Spicy Red',
+    note: '酒红底 / 朱红强调 / 琥珀点缀',
     light: false,
     tokens: {
       'ink-1000': '#150607',
@@ -383,7 +404,8 @@ export const THEMES: Theme[] = [
   {
     id: 'softgreen',
     name: '护眼绿',
-    note: '自定义浅绿底 #E9F5DB · 长时间读日志用（亮色）',
+    origin: 'IDEA 自定义背景 · #E9F5DB',
+    note: '长时间读日志用的浅绿纸（亮色）',
     light: true,
     tokens: {
       'ink-1000': '#ffffff',
@@ -407,7 +429,8 @@ export const THEMES: Theme[] = [
   {
     id: 'cream',
     name: '米黄纸',
-    note: '自定义米黄底 #FFFFE0 · 低蓝光（亮色）',
+    origin: 'IDEA 自定义背景 · #FFFFE0',
+    note: '米黄纸底 / 低蓝光（亮色）',
     light: true,
     tokens: {
       'ink-1000': '#ffffff',
@@ -431,7 +454,8 @@ export const THEMES: Theme[] = [
   {
     id: 'sunny',
     name: '晴天',
-    note: 'Mango / Sunny · 米黄纸底 / 橙强调（亮色）',
+    origin: 'Mango / Sunny',
+    note: '米黄纸底 / 橙强调（亮色）',
     light: true,
     tokens: {
       'ink-1000': '#ffffff',
@@ -455,7 +479,8 @@ export const THEMES: Theme[] = [
   {
     id: 'bubblegum',
     name: '泡泡糖',
-    note: 'Bubblegum · 粉纸底 / 洋红强调（亮色）',
+    origin: 'Bubblegum',
+    note: '粉纸底 / 洋红强调（亮色）',
     light: true,
     tokens: {
       'ink-1000': '#ffffff',
