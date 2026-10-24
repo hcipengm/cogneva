@@ -6036,7 +6036,12 @@ async fn measure_face_answers(state: &AppState) {
             let result = probe_face(state, upstream, face).await;
             let answer = classify_face_answer(&result);
             if let Err(refusal) = &result {
-                tracing::debug!(
+                // `info` 而不是 `debug`：三值里的 -1 只说"问到了话但不是关于这一面"，
+                // 而这一格到底是什么原因，只有这条状态码能分开——401/403 是这把钥匙
+                // 在这个面上没有资格（改配置或改计划），429 是等，400 是请求形状。读数
+                // 面上没有这一位，日志再不给，旁边的人就只能看着 -1 猜。只在到期那一拍
+                // 写一次（半小时），一条上游一个面一行。
+                tracing::info!(
                     upstream = %upstream.base_url.trim_end_matches('/'),
                     face,
                     status = refusal.status.unwrap_or(0),
@@ -6046,7 +6051,7 @@ async fn measure_face_answers(state: &AppState) {
                         FaceAnswer::Inconclusive => "inconclusive",
                     },
                     error = %refusal.message,
-                    "面探测"
+                    "面探测问到了话，但不是这一面能接的答复"
                 );
             }
             state.llm_health.note_face_answer(upstream, face, answer);
