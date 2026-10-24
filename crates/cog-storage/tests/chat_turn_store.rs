@@ -1,8 +1,9 @@
 //! The chat transcript's storage, against a live PostgreSQL.
 //!
-//! Three facts here are the database's rather than the caller's, and none of
-//! them can be checked without a server: that a turn is written as a pair so a
-//! reader never sees a question whose answer is still in flight, that the bound
+//! Four facts here are the database's rather than the caller's, and none of them
+//! can be checked without a server: that a turn is written as a pair so a reader
+//! never sees a question whose answer is still in flight, that a turn whose
+//! reply never came is kept but kept out of the prompt's history, that the bound
 //! applies per session rather than to the table as a whole, and that the
 //! transcript survives a new store handle -- which is the whole point, since the
 //! store this replaced lived in one process and died with it.
@@ -228,6 +229,81 @@ async fn the_bound_trims_one_session_and_leaves_another_alone() {
         .execute(&probe.pool)
         .await
         .expect("delete the rows this test wrote");
+}
+
+/// An exchange whose reply never came is kept, and it is kept out of the
+/// history a prompt is built from.
+///
+/// This is the database's half of the guarantee: what the user said survives an
+/// upstream outage, and the reason it went unanswered is on the same row. The
+/// row count is read directly because `history` is the view that deliberately
+/// hides it -- a test that only asked `history` would pass on a store that
+/// dropped the row entirely.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn an_unanswered_turn_is_kept_out_of_the_history_but_not_out_of_the_table() {
+    let probe = probe().await;
+    probe
+        .store
+        .record_failed_turn(&probe.session, "上游坏了的时候问的话", "API error 503")
+        .await
+        .expect("record an unanswered turn");
+
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT role, content, failure FROM chat_turns WHERE session_id = $1 ORDER BY id",
+    )
+    .bind(&probe.session)
+    .fetch_all(&probe.pool)
+    .await
+    .expect("read the rows back");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "user".to_string(),
+                "上游坏了的时候问的话".to_string(),
+                Some("API error 503".to_string())
+            ),
+            (
+                "assistant".to_string(),
+                String::new(),
+                Some("API error 503".to_string())
+            ),
+        ],
+        "没答出来的那一轮没有连原因一起落库：{rows:?}"
+    );
+
+    let history = probe
+        .store
+        .history(&probe.session, 40)
+        .await
+        .expect("read the history");
+    assert!(
+        history.is_empty(),
+        "失败通知被当成模型说过的话喂回上下文：{history:?}"
+    );
+
+    // 之后正常的一轮不能被它挡住，也不该把它顶出上下文窗口。
+    probe
+        .store
+        .record_turn(&probe.session, "恢复之后问的话", "答")
+        .await
+        .expect("record an answered turn");
+    let history = probe
+        .store
+        .history(&probe.session, 40)
+        .await
+        .expect("read the history again");
+    assert_eq!(
+        history,
+        vec![
+            turn(ChatTurnRole::User, "恢复之后问的话"),
+            turn(ChatTurnRole::Assistant, "答"),
+        ],
+        "恢复之后的那一轮读错了：{history:?}"
+    );
+
+    cleanup(&probe).await;
 }
 
 #[tokio::test]

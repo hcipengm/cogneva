@@ -84,11 +84,27 @@ pub trait ChatTurnStore: Send + Sync {
     /// answer that never came.
     async fn record_turn(&self, session_id: &str, user: &str, assistant: &str) -> SFResult<()>;
 
+    /// Record one exchange whose reply never arrived, and why.
+    ///
+    /// A failed model call used to leave nothing behind: the words the user
+    /// said to this platform existed only in the response they had just
+    /// received, and the next attempt started from a history that denied the
+    /// earlier one had happened. The answer's absence is a fact about the turn,
+    /// not a reason to forget the turn -- so the question is kept, and the row
+    /// carries the reason instead of an answer.
+    async fn record_failed_turn(&self, session_id: &str, user: &str, failure: &str)
+        -> SFResult<()>;
+
     /// The last `limit` lines of a session, oldest first.
     ///
     /// Empty for a session that was never recorded, which is what a reader
     /// starting a fresh conversation wants; a limit of zero asks for nothing and
     /// answers nothing rather than the whole transcript.
+    ///
+    /// Unanswered exchanges are left out: this is the view a prompt is built
+    /// from, and a failure notice replayed as an assistant turn would put words
+    /// in the model's mouth that the user never received as an answer. They
+    /// stay readable in the table itself.
     async fn history(&self, session_id: &str, limit: usize) -> SFResult<Vec<ChatTurn>>;
 }
 
@@ -101,36 +117,20 @@ impl PostgresChatTurnStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
-}
 
-/// One statement for the pair, so the transcript never holds a question whose
-/// answer is missing.
-const INSERT_TURN_SQL: &str = "\
-INSERT INTO chat_turns (session_id, role, content) \
-VALUES ($1, 'user', $2), ($1, 'assistant', $3)";
-
-/// Drop what fell out of the window. `NOT IN` over the newest rows keeps the
-/// bound per session rather than global: one busy session must not push another
-/// one's history out.
-const TRIM_TURNS_SQL: &str = "\
-DELETE FROM chat_turns \
-WHERE session_id = $1 \
-  AND id NOT IN ( \
-      SELECT id FROM chat_turns WHERE session_id = $1 ORDER BY id DESC LIMIT $2 \
-  )";
-
-/// The newest `limit` rows, then put back into the order a prompt is built in.
-/// Reading oldest-first directly would need a count of the session, which is a
-/// second query that can disagree with the first under a concurrent write.
-const HISTORY_SQL: &str = "\
-SELECT role, content FROM ( \
-    SELECT id, role, content FROM chat_turns WHERE session_id = $1 ORDER BY id DESC LIMIT $2 \
-) newest \
-ORDER BY id";
-
-#[async_trait]
-impl ChatTurnStore for PostgresChatTurnStore {
-    async fn record_turn(&self, session_id: &str, user: &str, assistant: &str) -> SFResult<()> {
+    /// Write one exchange and keep the session's window bounded, in one
+    /// transaction.
+    ///
+    /// `assistant` and `failure` are the two shapes a turn has: an answer that
+    /// was delivered, or the reason none was. Exactly one of them is given, so a
+    /// row can never claim both.
+    async fn write(
+        &self,
+        session_id: &str,
+        user: &str,
+        assistant: Option<&str>,
+        failure: Option<&str>,
+    ) -> SFResult<()> {
         if session_id.trim().is_empty() {
             return Err(SFError::Validation(
                 "a chat turn cannot be recorded without a session: it would land in a transcript \
@@ -142,10 +142,18 @@ impl ChatTurnStore for PostgresChatTurnStore {
             self.pool.begin().await.map_err(|e| {
                 SFError::Database(format!("start the chat turn's transaction: {e}"))
             })?;
-        sqlx::query(INSERT_TURN_SQL)
-            .bind(session_id)
-            .bind(user)
-            .bind(assistant)
+        let mut query = sqlx::query(if assistant.is_some() {
+            INSERT_TURN_SQL
+        } else {
+            INSERT_FAILED_TURN_SQL
+        })
+        .bind(session_id)
+        .bind(user);
+        query = match assistant {
+            Some(reply) => query.bind(reply),
+            None => query.bind(failure.unwrap_or("")),
+        };
+        query
             .execute(&mut *tx)
             .await
             .map_err(|e| SFError::Database(format!("record a chat turn: {e}")))?;
@@ -162,6 +170,57 @@ impl ChatTurnStore for PostgresChatTurnStore {
             .await
             .map_err(|e| SFError::Database(format!("commit the chat turn: {e}")))?;
         Ok(())
+    }
+}
+
+/// One statement for the pair, so the transcript never holds a question whose
+/// answer is missing.
+const INSERT_TURN_SQL: &str = "\
+INSERT INTO chat_turns (session_id, role, content) \
+VALUES ($1, 'user', $2), ($1, 'assistant', $3)";
+
+/// The same pair for an exchange that never got an answer: the reply's content
+/// is empty because nothing was said, and `failure` carries why. Both rows get
+/// the reason so a reader that finds either half knows what happened to the
+/// turn.
+const INSERT_FAILED_TURN_SQL: &str = "\
+INSERT INTO chat_turns (session_id, role, content, failure) \
+VALUES ($1, 'user', $2, $3), ($1, 'assistant', '', $3)";
+
+/// Drop what fell out of the window. `NOT IN` over the newest rows keeps the
+/// bound per session rather than global: one busy session must not push another
+/// one's history out.
+const TRIM_TURNS_SQL: &str = "\
+DELETE FROM chat_turns \
+WHERE session_id = $1 \
+  AND id NOT IN ( \
+      SELECT id FROM chat_turns WHERE session_id = $1 ORDER BY id DESC LIMIT $2 \
+  )";
+
+/// The newest `limit` rows, then put back into the order a prompt is built in.
+/// Reading oldest-first directly would need a count of the session, which is a
+/// second query that can disagree with the first under a concurrent write.
+const HISTORY_SQL: &str = "\
+SELECT role, content FROM ( \
+    SELECT id, role, content FROM chat_turns \
+    WHERE session_id = $1 AND failure IS NULL \
+    ORDER BY id DESC LIMIT $2 \
+) newest \
+ORDER BY id";
+
+#[async_trait]
+impl ChatTurnStore for PostgresChatTurnStore {
+    async fn record_turn(&self, session_id: &str, user: &str, assistant: &str) -> SFResult<()> {
+        self.write(session_id, user, Some(assistant), None).await
+    }
+
+    async fn record_failed_turn(
+        &self,
+        session_id: &str,
+        user: &str,
+        failure: &str,
+    ) -> SFResult<()> {
+        self.write(session_id, user, None, Some(failure)).await
     }
 
     async fn history(&self, session_id: &str, limit: usize) -> SFResult<Vec<ChatTurn>> {

@@ -1,0 +1,21 @@
+-- Migration: 083_chat_turn_failure
+-- A turn whose reply never came is still a turn the user had.
+--
+-- The transcript used to record only exchanges that completed: the gateway
+-- skipped the write whenever the model call failed or timed out, so a user who
+-- asked a question during an upstream outage left no trace anywhere. The words
+-- were said to this platform and the platform has no record of them, which is
+-- the one thing a transcript exists to prevent. The reply not existing is a
+-- fact about the turn, not a reason to forget the turn.
+--
+-- `failure` is null for an answered exchange and holds the reason for one that
+-- was not. Null rather than a boolean plus a separate text: a row that says
+-- "failed" without saying why only moves the question one column over. Prompt
+-- history reads rows where it is null -- a failure notice is not something the
+-- model said, and replaying it as an assistant turn would put words in its
+-- mouth that the user never saw as an answer.
+--
+-- Rows written before this migration are answered exchanges in practice: the
+-- old writer only ran after a reply had been delivered, so the default is
+-- correct for them.
+ALTER TABLE chat_turns ADD COLUMN IF NOT EXISTS failure TEXT;

@@ -226,6 +226,34 @@ async fn record_turn(store: &crate::ChatTurnHandle, session_id: &str, user: &str
     }
 }
 
+/// 记下这一轮没答出来的那句话，以及没答出来的原因。
+///
+/// 答不出来的那一轮同样是用户对这个平台说过话的一轮：什么都不写，用户说的那句
+/// 就只活在他刚收到的那个响应里，下一次提问的上下文里也没有它——一段对话在最
+/// 需要留下证据的时候（上游坏了）反而是空的。原因写在同一行上，读者才知道这一
+/// 轮为什么有问无答；将来构建提示词时它不会当成模型说过的话被回放。
+async fn record_failed_turn(
+    store: &crate::ChatTurnHandle,
+    session_id: &str,
+    user: &str,
+    failure: &str,
+) {
+    let Some(store) = store else {
+        tracing::warn!(
+            session = %session_id,
+            "聊天：这套部署没有聊天记录库，这一轮不会留下记录"
+        );
+        return;
+    };
+    if let Err(e) = store.record_failed_turn(session_id, user, failure).await {
+        tracing::warn!(
+            error = %e,
+            session = %session_id,
+            "聊天：这一轮没写进记录"
+        );
+    }
+}
+
 /// Run one chat turn: echo the user message, stream the LLM reply delta by
 /// delta (typewriter style — the routing layer still fails over transparently
 /// if a backend errors before the first content delta), and record the turn in
@@ -444,10 +472,23 @@ pub async fn run_chat_turn(
     }
     emit_message_end(&out, &session_id, &assistant_mid).await;
 
-    // 5. Record the turn (skip failed/timeout replies — they are not useful
-    //    context for later turns).
-    if failure.is_none() && !reply.is_empty() {
-        record_turn(&state.chat_turns, &session_id, &content, &reply).await;
+    // 5. Record the turn. 失败的那一轮也写：用户说的这句话是对这个平台说过的，
+    //    模型没答出来是这一轮的一个事实，不是把它忘掉的许可。空回复按失败写，
+    //    因为它对用户而言和一个错误没有分别，而「什么都不写」是最坏的那种差别。
+    match (&failure, reply.is_empty()) {
+        (Some(err), _) => {
+            record_failed_turn(&state.chat_turns, &session_id, &content, err).await;
+        }
+        (None, true) => {
+            record_failed_turn(
+                &state.chat_turns,
+                &session_id,
+                &content,
+                "模型没有返回任何内容",
+            )
+            .await;
+        }
+        (None, false) => record_turn(&state.chat_turns, &session_id, &content, &reply).await,
     }
 }
 
@@ -550,6 +591,27 @@ mod tests {
         );
     }
 
+    /// 没答出来的那一轮同样是用户说过的一句话，必须留下。
+    ///
+    /// 上游不可用的那段时间，这个平台收到的每一句话原本都会消失：记录只在
+    /// 回答送达后才写。这里要的正是反面——问句和原因都进记录，而构建上下文时
+    /// 它不冒充模型说过的话。
+    #[tokio::test]
+    async fn an_unanswered_turn_still_keeps_what_the_user_said() {
+        let store = std::sync::Arc::new(FakeTurns::default());
+        let handle: crate::ChatTurnHandle = Some(store.clone());
+        record_failed_turn(&handle, "s1", "问", "upstream 503").await;
+
+        let held = store.unanswered.lock().await.clone();
+        assert_eq!(
+            held,
+            vec![("问".to_string(), "upstream 503".to_string())],
+            "问句与原因都要落在记录里"
+        );
+        // 它不进上下文：失败通知不是模型说过的话。
+        assert!(store.turns.lock().await.is_empty());
+    }
+
     /// 没有记录库的部署：照样回答，不假装有历史，也不悄悄记在别处。
     #[tokio::test]
     async fn a_deployment_without_a_store_answers_without_history() {
@@ -557,6 +619,7 @@ mod tests {
         assert!(load_history(&handle, "s1").await.is_empty());
         // 不发散：这里只要求「不写进任何东西」——没有第二个家可写。
         record_turn(&handle, "s1", "问", "答").await;
+        record_failed_turn(&handle, "s1", "问", "答不出来").await;
     }
 
     /// 读记录失败按「没有历史」回答，而不是按「历史是空的」记一笔。
@@ -579,6 +642,8 @@ mod tests {
     #[derive(Default)]
     struct FakeTurns {
         turns: tokio::sync::Mutex<Vec<cog_storage::ChatTurn>>,
+        /// 有问无答的那几轮：留在记录里，但不进上下文（`history` 不返回它们）。
+        unanswered: tokio::sync::Mutex<Vec<(String, String)>>,
         last_limit: tokio::sync::Mutex<Option<usize>>,
         fail: std::sync::atomic::AtomicBool,
     }
@@ -606,6 +671,25 @@ mod tests {
                 role: cog_storage::ChatTurnRole::Assistant,
                 content: assistant.to_string(),
             });
+            Ok(())
+        }
+
+        async fn record_failed_turn(
+            &self,
+            session_id: &str,
+            user: &str,
+            failure: &str,
+        ) -> cog_core::SFResult<()> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(cog_core::SFError::Database("unreachable".into()));
+            }
+            if session_id != "s1" {
+                return Ok(());
+            }
+            self.unanswered
+                .lock()
+                .await
+                .push((user.to_string(), failure.to_string()));
             Ok(())
         }
 
