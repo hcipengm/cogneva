@@ -391,8 +391,8 @@ mod tests {
 
     #[test]
     fn a_container_near_its_limit_halves_the_pool() {
-        // A container whose page cache has already been dropped: 7.4 GiB of
-        // working set against an 8 GiB limit is 0.92, past the red line.
+        // A container whose page cache has already been dropped: working set
+        // at 92% of its limit, past the red line.
         let plan = next_slots(3, None, Some((7_946_364_672, 8_589_934_592)), Some(8));
         assert_eq!(plan.slots, 1);
         assert_eq!(plan.movement, SlotMove::Shrink);
@@ -400,8 +400,8 @@ mod tests {
 
     #[test]
     fn the_measured_shape_of_the_main_pod_does_not_shrink_the_pool() {
-        // Measured 2026-10-24: memory.current 6.80 GiB with 0.79 GiB of
-        // inactive file cache, against an 8 GiB limit -- 0.70, not red.
+        // Measured 2026-10-24: memory.current minus the inactive file cache
+        // came to 70% of this container's limit -- not red.
         let plan = next_slots(
             3,
             Some(3),
@@ -476,8 +476,9 @@ mod tests {
         let mut cost = SlotCost::default();
         cost.observe(4 * GIB, 0);
         cost.observe(5 * GIB, 1);
-        // 8 GiB limit -> 5.84 GiB of budget at the growth line -> 1.84 GiB of
-        // room over the baseline -> one more task of 1 GiB fits.
+        // Observations of 4 and 5 put the per-task cost at one unit. The
+        // growth line leaves 73% of the limit as budget and the baseline takes
+        // 50% of it, so exactly one more task fits.
         assert_eq!(cost.capacity(8 * GIB), Some(1));
     }
 
