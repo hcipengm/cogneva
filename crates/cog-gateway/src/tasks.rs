@@ -255,6 +255,12 @@ pub struct TaskView {
     pub retry_count: u32,
     pub max_retries: u32,
     pub agent_id: Option<String>,
+    /// 这道任务指定由谁执行（`owner_unit`）。与 `agent_id` 不是同一列：前者是
+    /// 「谁被指定来做」，后者是「结果是谁交的」。带归属的任务不进共享就绪队列，
+    /// 只等它点名的那个 unit 来开工，所以这一列是读侧唯一能看出「这道活已经有人
+    /// 认领、别人抢不到」的地方——不印出来，认领成功的响应与没认领过一模一样。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_unit: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// 所属 goal。提交时网关生成（未带则用 UUID），响应里以 `message_id` 交回；同一 goal
@@ -288,6 +294,7 @@ impl From<Task> for TaskView {
             retry_count: t.retry_count,
             max_retries: t.max_retries,
             agent_id: t.agent_id,
+            owner_unit: t.owner_unit,
             created_at: t.created_at.to_rfc3339(),
             updated_at: t.updated_at.to_rfc3339(),
             goal_id: t.goal_id,
@@ -818,8 +825,11 @@ pub struct AssignTaskRequest {
 /// POST /api/v1/tasks/{id}/assign -- name the executor a task belongs to.
 ///
 /// Assignment is a step of its own: the planner says what the steps are, this
-/// says who carries one out. It only moves a task that has not started, so a
-/// finished or running task keeps the executor its state refers to.
+/// says who carries one out. It binds the owner column the ready queue reads,
+/// so the task stops being offered to whoever is idle and waits for the unit
+/// named here. Only a task still `Pending` can be bound: one already offered to
+/// the shared queue may have been picked up, and a binding made after that
+/// would be refused by the completion path rather than honoured.
 pub async fn assign_task_handler(
     State(state): State<Arc<GatewayState>>,
     claims: Option<axum::Extension<cog_core::Claims>>,

@@ -1758,6 +1758,90 @@ mod consumer_ack_tests {
         );
     }
 
+    /// A task that names its executor must not be offered to the queue every
+    /// worker competes for: the first reader of an entry runs it, so an
+    /// assigned task published there goes to whoever happens to be idle.
+    ///
+    /// Discriminating on the column: the designation has to land on the one
+    /// the ready scan reads. Written to the delivery column instead, the row
+    /// reads back as assigned and still goes out — which is what made an
+    /// assignment change nothing about who ran the task.
+    #[tokio::test]
+    async fn a_task_named_to_an_executor_is_not_offered_to_the_shared_queue() {
+        let backend = ScriptedBackend::default();
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-limit-test".into(),
+            consumer_group: "grp-limit-test".into(),
+            max_retries: 1,
+            ..DagExecutorConfig::default()
+        };
+        let runtime = test_runtime_with(backend.clone(), config);
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-limit",
+                vec![
+                    ready_task("task-owned", serde_json::json!({})),
+                    ready_task("task-free", serde_json::json!({})),
+                ],
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .orchestrator()
+            .assign_task("task-owned", "unit-6e")
+            .await
+            .expect("a pending task takes a binding");
+        runtime.publish_ready_tasks().await.unwrap();
+
+        let owned = runtime
+            .orchestrator()
+            .get_task("task-owned")
+            .await
+            .expect("task present");
+        assert_eq!(
+            owned.owner_unit.as_deref(),
+            Some("unit-6e"),
+            "the designation lands on the column the ready scan reads"
+        );
+        assert_eq!(
+            owned.agent_id, None,
+            "nobody has delivered this result yet, so the delivery column stays empty"
+        );
+        assert_eq!(
+            owned.status,
+            cog_core::TaskStatus::Pending,
+            "an owned task waits for its owner instead of being published"
+        );
+
+        let free = runtime
+            .orchestrator()
+            .get_task("task-free")
+            .await
+            .expect("task present");
+        assert_eq!(
+            free.status,
+            cog_core::TaskStatus::Scheduled,
+            "the unowned task from the same submission is still published"
+        );
+
+        // Once the row has been offered, a binding can no longer be honoured:
+        // the run that happens may already be somebody else's, and completion
+        // refuses a result that does not come from the owner. Refusing here
+        // keeps the caller from believing it bound work it did not.
+        let err = runtime
+            .orchestrator()
+            .assign_task("task-free", "unit-6e")
+            .await
+            .expect_err("an offered task cannot be re-bound");
+        assert!(
+            err.to_string().contains("already been offered"),
+            "the refusal has to say why: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn stale_result_for_unknown_task_is_acked() {
         // Regression: run_consumer discarded msg_id and never acked, so stale

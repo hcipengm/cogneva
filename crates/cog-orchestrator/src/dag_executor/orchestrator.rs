@@ -2132,18 +2132,34 @@ impl DagExecutor {
         Ok(())
     }
 
+    /// Bind a task to the unit that has to run it.
+    ///
+    /// The name goes on `owner_unit`, not `agent_id`. The two columns answer
+    /// different questions -- `agent_id` is who delivered the result, a
+    /// designation is who was told to -- and only the owner column takes a task
+    /// off the shared ready queue. Writing the designation into `agent_id`
+    /// reads back as assigned while the task still sits in the queue every
+    /// worker competes for, which is the one thing a designation has to change.
+    ///
+    /// Only a task that has not been offered yet can be bound. `Scheduled`
+    /// means the row has been handed to the ready queue, so the run that
+    /// happens may already be somebody else's; binding it now would make that
+    /// result unacceptable, because completion refuses a sender that is not the
+    /// owner, and the row would stay unfinished with nothing to show why.
+    ///
+    /// No event is emitted. The status does not move: the task waits for its
+    /// owner in `Pending`, so announcing `task_scheduled` would tell every
+    /// reader it had been handed to a worker when nobody had picked it up.
     pub async fn assign_task(&self, task_id: &str, agent_id: &str) -> SFResult<()> {
         if self.fg().is_some() {
             return self
                 .store_transition(
                     task_id,
-                    &[TaskStatus::Pending, TaskStatus::Scheduled],
-                    "Cannot assign task in {} state",
-                    |t| t.agent_id = Some(agent_id.into()),
-                    Some(cog_core::TaskEvent::TaskScheduled {
-                        task_id: task_id.into(),
-                        timestamp: chrono::Utc::now(),
-                    }),
+                    &[TaskStatus::Pending],
+                    "Cannot assign task in {} state: it has already been offered to the \
+                     shared ready queue, and a binding made now could not be honoured",
+                    |t| t.owner_unit = Some(agent_id.into()),
+                    None,
                 )
                 .await;
         }
@@ -2157,21 +2173,20 @@ impl DagExecutor {
                 reason: "Task not found".into(),
             })?;
 
-        if task.status != TaskStatus::Pending && task.status != TaskStatus::Scheduled {
+        if task.status != TaskStatus::Pending {
             return Err(cog_core::SFError::TaskFailed {
                 task_id: task_id.into(),
-                reason: format!("Cannot assign task in {:?} state", task.status),
+                reason: format!(
+                    "Cannot assign task in {:?} state: it has already been offered to the \
+                     shared ready queue, and a binding made now could not be honoured",
+                    task.status
+                ),
             });
         }
 
-        task.agent_id = Some(agent_id.into());
+        task.owner_unit = Some(agent_id.into());
         let task_snapshot = task.clone();
         drop(inner);
-        self.emit_event(cog_core::TaskEvent::TaskScheduled {
-            task_id: task_id.into(),
-            timestamp: chrono::Utc::now(),
-        })
-        .await;
         self.persist_task_fine_grained(&task_snapshot).await;
         self.persist_state().await;
         Ok(())
