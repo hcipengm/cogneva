@@ -5164,11 +5164,7 @@ async fn stream_forward(
         let base = upstream.base_url.trim_end_matches('/');
         // 请求面决定地址：同一个上游的两个 OpenAI 面是两个端点，把
         // Responses 形状的体发到 `/chat/completions` 只换回一个 400。
-        let url = match style {
-            "anthropic" => format!("{base}/v1/messages"),
-            cog_llm::responses::API_STYLE => cog_llm::responses::responses_url(base),
-            _ => format!("{base}/chat/completions"),
-        };
+        let url = face_url(style, base);
         let mut clamped_temperature = false;
         // Field names this attempt reshaped for the upstream, for the reading.
         let mut adapted_fields: Vec<&'static str> = Vec::new();
@@ -5715,34 +5711,30 @@ async fn probe_suspect_upstreams(state: &AppState) {
     }
 }
 
-/// 最小连通性探测：max_tokens=1 的单轮 ping，只认 HTTP 状态码。
-/// 不带 tools（探测目标是"这家还能不能用"，能力准入另有探测）。
-/// Where an entry is probed: the same address the request path calls.
+/// 一个请求面上的那一个地址：请求路径的每一次尝试、池探测、准入探测共用它。
 ///
-/// Composed by the functions the runtime uses rather than by a second copy of
-/// the rule. The copy that used to live here appended `/v1/messages` to every
-/// Anthropic entry, so a base that already carried its version segment was
-/// probed one segment too deep: the upstream answered 404, the entry sat in the
-/// suspect window with `unclassified` evidence, the pool stayed latched
-/// unavailable, and every request that would have reached the working face was
-/// refused first. A probe that asks a different address than the client is a
-/// reading of nothing.
-fn probe_target(style: &str, base_url: &str) -> String {
-    let base = base_url.trim_end_matches('/');
+/// 这三处早先各自拼各自的：探测问 `{base}/messages`，而请求路径无条件再补
+/// `/v1/messages`。于是一条 `base_url` 自带版本段的条目
+/// （`https://api.kimi.com/coding/v1`）在探测面读「健康」，而每一次真请求都被
+/// 打到 `/v1/v1/messages` 换回 404——两个读数各说各的，池据此一直声称自己
+/// 可用。地址只写一遍是这条约束唯一守得住的形式。
+fn face_url(style: &str, base_url: &str) -> String {
     match style {
-        "anthropic" => cog_llm::anthropic::messages_url(base),
-        cog_llm::responses::API_STYLE => cog_llm::responses::responses_url(base),
-        _ => cog_llm::openai::chat_completions_url(base),
+        "anthropic" => cog_llm::anthropic::messages_url(base_url),
+        cog_llm::responses::API_STYLE => cog_llm::responses::responses_url(base_url),
+        _ => cog_llm::openai::chat_completions_url(base_url),
     }
 }
 
+/// 最小连通性探测：max_tokens=1 的单轮 ping，只认 HTTP 状态码。
+/// 不带 tools（探测目标是"这家还能不能用"，能力准入另有探测）。
 async fn probe_upstream(state: &AppState, upstream: &LlmUpstream) -> Result<(), UpstreamRefusal> {
     // The probe asks the face the entry was admitted on. Probing an entry
     // verified on `/responses` with a chat-shaped body would read a 404 as the
     // upstream being down, and a healthy entry would sit in the suspect window
     // forever with no request ever reaching it.
     let responses_face = upstream.api_style == cog_llm::responses::API_STYLE;
-    let url = probe_target(&upstream.api_style, &upstream.base_url);
+    let url = face_url(&upstream.api_style, &upstream.base_url);
     let payload = if responses_face {
         serde_json::json!({
             "model": upstream.model,
@@ -5935,7 +5927,7 @@ async fn call_one_upstream(
         };
         let resp = state
             .client
-            .post(format!("{base}/v1/messages"))
+            .post(face_url("anthropic", base))
             .header("x-api-key", &upstream.api_key)
             .header("anthropic-version", "2023-06-01")
             .json(&request)
@@ -5997,7 +5989,7 @@ async fn call_one_upstream(
     };
     let resp = state
         .client
-        .post(format!("{base}/chat/completions"))
+        .post(face_url("openai", base))
         .bearer_auth(&upstream.api_key)
         .json(&request)
         .send()
@@ -7758,33 +7750,121 @@ mod tests {
         }
     }
 
-    /// 探测地址必须就是请求路径要打的那一个，包括 base_url 自己已经带了版本段
-    /// 的那些（`https://api.kimi.com/coding/v1` 这类）。
-    ///
-    /// 早先这一格按协议面各拼各的：Anthropic 那一支无条件再补 `/v1/messages`，
-    /// 于是带版本段的条目被打到 `/v1/v1/messages`，上游回 404，条目进可疑窗、
-    /// 池一直扣着，而它其实是能干活的那一面——探测问错了地址，读数就是零。
+    /// 平台只往后接一个路径段，版本段归 base 自己带——三个面同一把尺子。
     #[test]
-    fn the_probe_asks_the_address_the_request_path_calls() {
-        for (style, base) in [
-            ("anthropic", "https://api.kimi.com/coding/v1"),
-            ("anthropic", "https://api.anthropic.com/v1"),
-            ("openai", "https://api.kimi.com/coding/v1"),
-            ("openai", "https://api.deepseek.com"),
-            (cog_llm::responses::API_STYLE, "https://api.openai.com/v1"),
+    fn every_face_appends_exactly_one_path_element() {
+        for (style, base, want) in [
+            (
+                "anthropic",
+                "https://api.kimi.com/coding/v1",
+                "https://api.kimi.com/coding/v1/messages",
+            ),
+            (
+                "anthropic",
+                "https://api.anthropic.com/v1/",
+                "https://api.anthropic.com/v1/messages",
+            ),
+            (
+                "openai",
+                "https://api.deepseek.com/anthropic/v1",
+                "https://api.deepseek.com/anthropic/v1/chat/completions",
+            ),
+            (
+                cog_llm::responses::API_STYLE,
+                "https://api.openai.com/v1",
+                "https://api.openai.com/v1/responses",
+            ),
         ] {
-            let probe = probe_target(style, base);
-            let request = match style {
-                "anthropic" => cog_llm::anthropic::messages_url(base),
-                cog_llm::responses::API_STYLE => cog_llm::responses::responses_url(base),
-                _ => cog_llm::openai::chat_completions_url(base),
-            };
-            assert_eq!(probe, request, "{style} {base}");
+            assert_eq!(face_url(style, base), want, "{style} {base}");
         }
+    }
+
+    /// 真请求打到的地址必须就是探测验证过的那个地址。
+    ///
+    /// 这一格早先只把「探测拼出来的串」和「测试自己按同一条规则拼出来的串」放在
+    /// 一起比——它证明的是这份测试认得这条规则，而不是请求路径用了它。于是真
+    /// 正的错位一直没人看见：请求路径无条件再补 `/v1/messages`，一条 base_url
+    /// 自带版本段的条目（`https://api.kimi.com/coding/v1`）在探测面读「健康」，
+    /// 每一次真请求却被送到 `/v1/v1/messages` 换回 404。
+    ///
+    /// 所以这里跑真路径：上游桩只在 `{base}/messages` 上应答，base 带版本段，
+    /// 其余路径一律 404——拼错一段就是一个可读的失败，不是一个可以自证的相等。
+    #[tokio::test]
+    async fn a_request_asks_the_address_its_probe_verified() {
+        use axum::http::header;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let capture = seen.clone();
+        let app = Router::new().route(
+            "/{*rest}",
+            post(move |uri: axum::http::Uri| {
+                let seen = capture.clone();
+                async move {
+                    let path = uri.path().to_string();
+                    seen.lock().unwrap().push(path.clone());
+                    if path == "/v1/messages" {
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"pong"}],"model":"k3","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+                        )
+                    } else {
+                        (
+                            StatusCode::NOT_FOUND,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"error":{"message":"The requested resource was not found","type":"resource_not_found_error"}}"#,
+                        )
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{addr}/v1");
+
+        let mut upstream = stub_upstream(&base, "k3");
+        upstream.api_style = "anthropic".into();
+        let state = test_state(vec![upstream]);
         assert_eq!(
-            probe_target("anthropic", "https://api.kimi.com/coding/v1"),
-            "https://api.kimi.com/coding/v1/messages",
+            face_url("anthropic", &base),
+            format!("http://{addr}/v1/messages"),
+            "the address the probe would ask"
+        );
+
+        let body = r#"{"model":"placeholder","max_tokens":8,"messages":[{"role":"user","content":"ping"}]}"#;
+        let resp = anthropic_messages_passthrough(State(state.clone()), json_request(body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "the entry is healthy on this face, so the request must land on the address \
+             the probe verified; asked: {:?}",
+            seen.lock().unwrap()
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["/v1/messages"],
             "one version segment, not two"
+        );
+
+        // 网关自己那条意图分类调用走同一个地址，不走第二份拼法。
+        let direct = call_llm(
+            &state,
+            vec![ChatMessage {
+                role: "user".into(),
+                content: "ping".into(),
+            }],
+        )
+        .await
+        .expect("the anthropic branch of the gateway's own call must reach the same address");
+        assert_eq!(direct.0.content, "pong");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["/v1/messages", "/v1/messages"],
+            "both request paths ask the one address"
         );
     }
 
