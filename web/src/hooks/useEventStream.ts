@@ -90,7 +90,13 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     const handleEvent = (event: AgentEvent) => {
       // 先记一行活动，再按类型分派：活动流是「总线上来了什么」的完整账，
       // 任何一条被分派分支漏掉的事件也仍然在账上，界面上不会凭空消失。
-      recordActivity(describeEvent(event));
+      //
+      // 两个例外，按构造高频：`message_update` 每个 token 一帧（正文由画布
+      // 自己拼），`heartbeat` 每个 agent 每条心跳一帧。把它们记进来，一次
+      // 回话就能把整张活动表冲干净，真正要紧的工具调用被挤出去。
+      if (event.type !== 'message_update' && event.type !== 'heartbeat') {
+        recordActivity(describeEvent(event));
+      }
 
       const p = event.payload as Record<string, unknown>;
       const agentId = typeof p.agent_id === 'string' ? p.agent_id : null;
