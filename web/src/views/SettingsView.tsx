@@ -2,6 +2,9 @@ import { listEvalDatasets } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { useServices } from '@/shell/context';
 import { useShell } from '@/shell/store';
+import { useTheme } from '@/shell/theme';
+import { THEMES } from '@/styles/themes';
+import { ThemePicker } from '@/ui/ThemePicker';
 import { Button, Empty, Loading, ReadError, Reading, Table, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -19,6 +22,8 @@ export function SettingsView() {
   const toggleSidebar = useShell((s) => s.toggleSidebar);
   const panelOpen = useShell((s) => s.panelOpen);
   const togglePanel = useShell((s) => s.togglePanel);
+  const theme = useTheme((s) => s.theme);
+  const setTheme = useTheme((s) => s.setTheme);
 
   const status = llm.status;
   const backend = status?.backends?.[0];
@@ -123,6 +128,16 @@ export function SettingsView() {
             rowKey={(d) => d.path}
           />
         )}
+      </section>
+
+      <section className="border-b border-[var(--line)]">
+        <header className="flex items-center gap-3 px-4 py-2">
+          <h2 className="text-[12px]">配色主题</h2>
+          <span className="text-[11px] text-[var(--muted)]">
+            只影响这台浏览器，不写回服务端；命令面板里搜主题名也能换
+          </span>
+        </header>
+        <ThemePicker themes={THEMES} active={theme} onPick={setTheme} />
       </section>
 
       <section className="border-b border-[var(--line)]">

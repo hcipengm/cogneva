@@ -1,3 +1,5 @@
+import { font, token, tokenAlpha } from '@/renderer/theme';
+
 export function drawThinkingBlock(
   ctx: CanvasRenderingContext2D,
   text: string,
@@ -10,7 +12,7 @@ export function drawThinkingBlock(
 
   // Background
   ctx.save();
-  ctx.fillStyle = 'rgba(30, 41, 59, 0.6)';
+  ctx.fillStyle = tokenAlpha('ink-800', 0.6);
   roundRect(ctx, x, y, width, height, radius);
   ctx.fill();
   ctx.restore();
@@ -19,17 +21,17 @@ export function drawThinkingBlock(
   const time = Date.now() / 1000;
   const alpha = 0.5 + 0.5 * Math.sin(time * 3);
   ctx.save();
-  ctx.shadowColor = '#a855f7';
+  ctx.shadowColor = token('brass');
   ctx.shadowBlur = 8;
-  ctx.fillStyle = `rgba(168, 85, 247, ${alpha})`;
+  ctx.fillStyle = tokenAlpha('brass', alpha);
   ctx.beginPath();
   ctx.arc(x + 18, y + 21, 4, 0, Math.PI * 2);
   ctx.fill();
   ctx.restore();
 
   // Text
-  ctx.fillStyle = '#c084fc';
-  ctx.font = '500 13px Inter, sans-serif';
+  ctx.fillStyle = token('brass');
+  ctx.font = `500 13px ${font('ui')}`;
   ctx.fillText(text || '思考中...', x + 34, y + 25);
 
   return height;

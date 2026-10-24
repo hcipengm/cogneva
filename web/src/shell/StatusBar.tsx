@@ -1,6 +1,8 @@
 import type { ReactNode } from 'react';
 import { useServices } from '@/shell/context';
 import { useShell, type ActivityId } from '@/shell/store';
+import { useTheme } from '@/shell/theme';
+import { themeById } from '@/styles/themes';
 import { useStreamStore } from '@/store/streamStore';
 
 /**
@@ -16,6 +18,7 @@ export function StatusBar() {
   const toggleSidebar = useShell((s) => s.toggleSidebar);
   const togglePanel = useShell((s) => s.togglePanel);
   const setPalette = useShell((s) => s.setPalette);
+  const theme = useTheme((s) => s.theme);
 
   const o = overview.data;
   const firing = alerts.alerts?.count ?? 0;
@@ -80,6 +83,14 @@ export function StatusBar() {
         title={notifications.error ?? '未读通知'}
       >
         收件 {notifications.error ? '读不到' : notifications.unreadCount}
+      </Cell>
+
+      <Cell
+        onClick={() => setActivity('settings')}
+        tone="var(--muted)"
+        title="配色主题：在这里点开设置换，或在命令面板里搜主题名"
+      >
+        主题 {themeById(theme).name}
       </Cell>
 
       <div className="ml-auto flex items-center">

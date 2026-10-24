@@ -12,6 +12,7 @@ import { drawToolCallCard } from './toolCallPainter';
 import { drawThinkingBlock } from './thinkingPainter';
 import type { TopologyNode, TopologyEdge } from './topologyPainter';
 import type { PipelineStage } from './pipelinePainter';
+import { font, token, tokenAlpha } from './theme';
 
 export interface Viewport {
   width: number;
@@ -180,13 +181,13 @@ export class CanvasRenderer {
       viewport.height / 2,
       viewport.width * 0.8
     );
-    gradient.addColorStop(0, '#0b1221');
-    gradient.addColorStop(1, '#020617');
+    gradient.addColorStop(0, token('ink-900'));
+    gradient.addColorStop(1, token('ink-1000'));
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, viewport.width, viewport.height);
 
     // Subtle grid
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.04)';
+    ctx.strokeStyle = tokenAlpha('line', 0.35);
     ctx.lineWidth = 1;
 
     const gridSize = 48;
@@ -205,8 +206,8 @@ export class CanvasRenderer {
 
     // Top fade for input area
     const topFade = ctx.createLinearGradient(0, 0, 0, 80);
-    topFade.addColorStop(0, 'rgba(2, 6, 23, 0.7)');
-    topFade.addColorStop(1, 'rgba(2, 6, 23, 0)');
+    topFade.addColorStop(0, tokenAlpha('ink-1000', 0.7));
+    topFade.addColorStop(1, tokenAlpha('ink-1000', 0));
     ctx.fillStyle = topFade;
     ctx.fillRect(0, 0, viewport.width, 80);
   }
@@ -266,13 +267,13 @@ export class CanvasRenderer {
     const y = 28;
 
     const colors: Record<string, string> = {
-      open: '#22c55e',
-      connecting: '#f59e0b',
-      closed: '#64748b',
-      error: '#ef4444',
+      open: token('ok'),
+      connecting: token('warn'),
+      closed: token('muted'),
+      error: token('danger'),
     };
 
-    const color = colors[status] ?? '#64748b';
+    const color = colors[status] ?? token('muted');
 
     ctx.save();
     ctx.shadowColor = color;
@@ -283,8 +284,8 @@ export class CanvasRenderer {
     ctx.fill();
     ctx.restore();
 
-    ctx.fillStyle = 'rgba(226, 232, 240, 0.7)';
-    ctx.font = '11px Inter, sans-serif';
+    ctx.fillStyle = tokenAlpha('paper', 0.7);
+    ctx.font = `11px ${font('mono')}`;
     ctx.textAlign = 'right';
     ctx.fillText(status, x - 14, y + 4);
     ctx.textAlign = 'left';

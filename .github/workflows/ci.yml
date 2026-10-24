@@ -628,6 +628,11 @@ jobs:
       # （旧发作的确认盖在新一次上）。门把前端可达性与这三处服务端事实一起判。
       - name: Check the alert list and its acknowledge have a consumer
         run: bash deploy/scripts/check-web-alert-panel.sh
+      # 配色主题：每个主题都自己填满全部颜色令牌、首帧的 :root 与默认主题逐字相等、
+      # 选择器被渲染且接齐列表/当前值/回调、进页面先套用上次的选择。少一个令牌不会
+      # 报错——它会悄悄继承上一个主题的颜色，在一屏里留下两种风格。
+      - name: Check every theme fills the token set and is pickable
+        run: bash deploy/scripts/check-web-theme-picker.sh
 
   # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读
   # 覆盖端点），它结构上证明不了 `web/` 编得过：类型错、装不上的依赖、打包不进

@@ -1,3 +1,5 @@
+import { font, token, tokenAlpha } from '@/renderer/theme';
+
 export interface TopologyNode {
   id: string;
   label: string;
@@ -13,19 +15,31 @@ export interface TopologyEdge {
   active: boolean;
 }
 
-const NODE_COLORS: Record<TopologyNode['status'], string> = {
-  healthy: '#22c55e',
-  running: '#3b82f6',
-  error: '#ef4444',
-  idle: '#64748b',
-};
+function nodeColor(status: TopologyNode['status']): string {
+  switch (status) {
+    case 'healthy':
+      return token('ok');
+    case 'running':
+      return token('brass');
+    case 'error':
+      return token('danger');
+    case 'idle':
+      return token('muted');
+  }
+}
 
-const TYPE_COLORS: Record<TopologyNode['type'], string> = {
-  core: '#a855f7',
-  agent: '#3b82f6',
-  sandbox: '#f59e0b',
-  gateway: '#14b8a6',
-};
+function typeColor(type: TopologyNode['type']): string {
+  switch (type) {
+    case 'core':
+      return token('brass');
+    case 'agent':
+      return token('live');
+    case 'sandbox':
+      return token('warn');
+    case 'gateway':
+      return token('ok');
+  }
+}
 
 export function drawTopology(
   ctx: CanvasRenderingContext2D,
@@ -38,18 +52,18 @@ export function drawTopology(
 ): void {
   // Panel background
   ctx.save();
-  ctx.fillStyle = 'rgba(15, 23, 42, 0.6)';
+  ctx.fillStyle = tokenAlpha('ink-800', 0.6);
   roundRect(ctx, panelX, panelY, panelW, panelH, 16);
   ctx.fill();
 
-  ctx.strokeStyle = 'rgba(148, 163, 184, 0.15)';
+  ctx.strokeStyle = tokenAlpha('line', 0.8);
   ctx.lineWidth = 1;
   ctx.stroke();
   ctx.restore();
 
   // Title
-  ctx.fillStyle = '#94a3b8';
-  ctx.font = '12px Inter, sans-serif';
+  ctx.fillStyle = token('muted');
+  ctx.font = `12px ${font('ui')}`;
   ctx.fillText('CLUSTER TOPOLOGY', panelX + 16, panelY + 24);
 
   // Edges
@@ -65,8 +79,8 @@ export function drawTopology(
     ctx.moveTo(panelX + from.x, panelY + from.y);
     ctx.lineTo(panelX + to.x, panelY + to.y);
     ctx.strokeStyle = edge.active
-      ? `rgba(59, 130, 246, ${0.3 + 0.2 * Math.sin(time * 3)})`
-      : 'rgba(148, 163, 184, 0.15)';
+      ? tokenAlpha('live', 0.3 + 0.2 * Math.sin(time * 3))
+      : tokenAlpha('line', 0.5);
     ctx.lineWidth = edge.active ? 2 : 1;
     ctx.stroke();
   });
@@ -78,24 +92,24 @@ export function drawTopology(
 
     // Glow
     ctx.save();
-    ctx.shadowColor = NODE_COLORS[node.status];
+    ctx.shadowColor = nodeColor(node.status);
     ctx.shadowBlur = 12;
-    ctx.fillStyle = NODE_COLORS[node.status];
+    ctx.fillStyle = nodeColor(node.status);
     ctx.beginPath();
     ctx.arc(x, y, 6, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
 
     // Ring
-    ctx.strokeStyle = TYPE_COLORS[node.type];
+    ctx.strokeStyle = typeColor(node.type);
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.arc(x, y, 9, 0, Math.PI * 2);
     ctx.stroke();
 
     // Label
-    ctx.fillStyle = '#e2e8f0';
-    ctx.font = '11px Inter, sans-serif';
+    ctx.fillStyle = token('paper');
+    ctx.font = `11px ${font('ui')}`;
     ctx.fillText(node.label, x + 16, y + 4);
   });
 }

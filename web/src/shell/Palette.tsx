@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useServices } from '@/shell/context';
 import { Icon } from '@/shell/icons';
 import { useShell, VIEW_TITLES, type ActivityId } from '@/shell/store';
+import { useTheme } from '@/shell/theme';
+import { THEMES } from '@/styles/themes';
 
 /**
  * 命令面板：一个输入框，两种问法。
@@ -12,7 +14,7 @@ import { useShell, VIEW_TITLES, type ActivityId } from '@/shell/store';
  */
 interface Command {
   id: string;
-  group: '前往' | '动作';
+  group: '前往' | '动作' | '主题';
   title: string;
   hint?: string;
   run: () => void;
@@ -42,6 +44,8 @@ export function Palette() {
   const clearOutput = useShell((s) => s.clearOutput);
   const { alerts, notifications, overlays, signOut } = useServices();
   const { openConversations, openLlmSetup } = overlays;
+  const theme = useTheme((s) => s.theme);
+  const setTheme = useTheme((s) => s.setTheme);
 
   const [query, setQuery] = useState('');
   const [index, setIndex] = useState(0);
@@ -126,7 +130,17 @@ export function Palette() {
       { id: 'action:signout', group: '动作', title: '退出登录', run: signOut },
     ];
 
-    return [...views, ...actions];
+    // 每个主题是一条命令，而不是「切到下一个」——找颜色的人记得住名字，记不住
+    // 自己现在停在第几个；一条命令一个终点，按名字搜得到。
+    const themes: Command[] = THEMES.map((entry) => ({
+      id: `theme:${entry.id}`,
+      group: '主题' as const,
+      title: `${entry.name}${entry.id === theme ? '（当前）' : ''}`,
+      hint: entry.note,
+      run: () => setTheme(entry.id),
+    }));
+
+    return [...views, ...actions, ...themes];
   }, [
     setActivity,
     openConversations,
@@ -139,6 +153,8 @@ export function Palette() {
     setPanelTab,
     clearOutput,
     signOut,
+    theme,
+    setTheme,
   ]);
 
   const visible = useMemo(

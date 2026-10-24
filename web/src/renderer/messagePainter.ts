@@ -5,6 +5,7 @@ import {
   type Prepared,
 } from '@/layout/textEngine';
 import type { MessageRole } from '@/store/streamStore';
+import { font, token, tokenAlpha } from '@/renderer/theme';
 
 export interface RenderMessage {
   id: string;
@@ -22,14 +23,9 @@ const GAP_BETWEEN_MESSAGES = 20;
 const LINE_HEIGHT = 1.55;
 const FONT_SIZE = 15;
 
-const COLORS = {
-  userBg: ['#3b82f6', '#2563eb'] as const,
-  assistantBg: ['#1e293b', '#0f172a'] as const,
-  userText: '#ffffff',
-  assistantText: '#e2e8f0',
-  shadow: 'rgba(0, 0, 0, 0.35)',
-  indicator: '#38bdf8',
-};
+// 气泡颜色跟着主题走：用户那一条是强调色（它标「这句话是你说的」），助手那条
+// 是表面色。阴影不是配色，它只负责让气泡浮起，所以留在黑色上。
+const SHADOW = 'rgba(0, 0, 0, 0.35)';
 
 export function prepareMessage(message: RenderMessage): RenderMessage {
   return {
@@ -94,18 +90,18 @@ export function drawMessageBubble(
 
   // Shadow
   ctx.save();
-  ctx.shadowColor = COLORS.shadow;
+  ctx.shadowColor = SHADOW;
   ctx.shadowBlur = 16;
   ctx.shadowOffsetY = 6;
 
   // Bubble background with gradient
   const gradient = ctx.createLinearGradient(x, y, x, y + bubbleHeight);
   if (isUser) {
-    gradient.addColorStop(0, COLORS.userBg[0]);
-    gradient.addColorStop(1, COLORS.userBg[1]);
+    gradient.addColorStop(0, token('brass'));
+    gradient.addColorStop(1, token('brass-dim'));
   } else {
-    gradient.addColorStop(0, COLORS.assistantBg[0]);
-    gradient.addColorStop(1, COLORS.assistantBg[1]);
+    gradient.addColorStop(0, token('ink-800'));
+    gradient.addColorStop(1, token('ink-900'));
   }
 
   ctx.fillStyle = gradient;
@@ -114,8 +110,8 @@ export function drawMessageBubble(
   ctx.restore();
 
   // Text
-  ctx.fillStyle = isUser ? COLORS.userText : COLORS.assistantText;
-  ctx.font = `500 ${FONT_SIZE}px Inter, "PingFang SC", "Microsoft YaHei", sans-serif`;
+  ctx.fillStyle = isUser ? token('ink-1000') : token('paper');
+  ctx.font = `500 ${FONT_SIZE}px ${font('ui')}`;
   ctx.textBaseline = 'alphabetic';
 
   const lineHeightPx = FONT_SIZE * LINE_HEIGHT;
@@ -141,9 +137,9 @@ function drawStreamingIndicator(
   const time = Date.now() / 1000;
   const alpha = 0.5 + 0.5 * Math.sin(time * 4);
   ctx.save();
-  ctx.shadowColor = COLORS.indicator;
+  ctx.shadowColor = token('live');
   ctx.shadowBlur = 8;
-  ctx.fillStyle = `rgba(56, 189, 248, ${alpha})`;
+  ctx.fillStyle = tokenAlpha('live', alpha);
   ctx.beginPath();
   ctx.arc(x, y, 3, 0, Math.PI * 2);
   ctx.fill();

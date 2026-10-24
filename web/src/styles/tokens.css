@@ -1,30 +1,35 @@
 /*
- * 工作台的调色板与字阶。
+ * 调色板、字阶，以及结构化的那几条样式。
  *
- * 方向是「仪表盘」而不是「后台模板」：底色是偏青的深石墨，文字是暖白，强调色
- * 只有一种黄铜色——它标的是「你需要动手的地方」，不是装饰。结构靠 1px 细线和
- * 间距编码，不靠圆角卡片堆叠：这是一个人长时间盯着看的界面，不是营销页。
+ * 颜色不是写死在这里的：`:root` 只是**默认主题的落点**（首帧还没跑 JS 时的底色），
+ * 换主题是往文档根上写一组同名变量（见 `styles/themes.ts`）。两组值必须逐字相等，
+ * 否则首帧与渲染后的第一屏是两种配色——`deploy/scripts/check-web-theme-picker.sh`
+ * 拿这条相等当判据。
+ *
+ * 令牌的角色是固定的：`ink-1000…600` 从最深的底色到最浅的表面，`paper*` 是文字，
+ * `brass` 是唯一的强调色（标「你需要动手的地方」），`live/danger/warn/ok` 是状态。
+ * 结构靠 1px 细线和间距编码，不靠圆角卡片堆叠。
  *
  * 字阶只有四档（11/12/13/15）。密度是这一面的功能：同样的屏幕要多看几行日志、
  * 多扫几行表格，字号就不可能按营销页的排法来。
  */
 :root {
-  --ink-1000: #07100f;
-  --ink-900: #0b1615;
-  --ink-800: #101e1d;
-  --ink-700: #162625;
-  --ink-600: #1d302f;
-  --line: #263c3a;
-  --line-strong: #33514e;
-  --paper: #e3ece8;
-  --paper-dim: #a9bcb7;
-  --muted: #7b938f;
-  --brass: #d7a54d;
-  --brass-dim: #8a6a2f;
-  --live: #6fd3c7;
-  --danger: #e2725b;
-  --warn: #e0b45c;
-  --ok: #79c68b;
+  --ink-1000: #02171a;
+  --ink-900: #05232a;
+  --ink-800: #0a2f38;
+  --ink-700: #0f3d46;
+  --ink-600: #154c56;
+  --line: #1c5a63;
+  --line-strong: #2b7f88;
+  --paper: #dcf7f5;
+  --paper-dim: #a5d4d2;
+  --muted: #6fa6a8;
+  --brass: #22d3ee;
+  --brass-dim: #0e7490;
+  --live: #34e5c4;
+  --danger: #fb7185;
+  --warn: #fbbf24;
+  --ok: #4ade80;
 
   --font-ui: 'IBM Plex Sans', 'PingFang SC', 'Noto Sans SC', 'Microsoft YaHei', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
