@@ -14,22 +14,22 @@
  * 多扫几行表格，字号就不可能按营销页的排法来。
  */
 :root {
-  --ink-1000: #02171a;
-  --ink-900: #05232a;
-  --ink-800: #0a2f38;
-  --ink-700: #0f3d46;
-  --ink-600: #154c56;
-  --line: #1c5a63;
-  --line-strong: #2b7f88;
-  --paper: #dcf7f5;
-  --paper-dim: #a5d4d2;
-  --muted: #6fa6a8;
-  --brass: #22d3ee;
-  --brass-dim: #0e7490;
-  --live: #34e5c4;
-  --danger: #fb7185;
-  --warn: #fbbf24;
-  --ok: #4ade80;
+  --ink-1000: #031014;
+  --ink-900: #04121a;
+  --ink-800: #03161d;
+  --ink-700: #082430;
+  --ink-600: #0c3140;
+  --line: #123c4b;
+  --line-strong: #1c5b6e;
+  --paper: #dcf9ff;
+  --paper-dim: #93c8d6;
+  --muted: #4e6e7c;
+  --brass: #28ffe0;
+  --brass-dim: #0f9c8a;
+  --live: #46c5ff;
+  --danger: #ff6b7a;
+  --warn: #f7ff5a;
+  --ok: #a4ff5f;
 
   --font-ui: 'IBM Plex Sans', 'PingFang SC', 'Noto Sans SC', 'Microsoft YaHei', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
