@@ -119,10 +119,20 @@ pub fn gap_goal_text(reading: &FaceDriftReading) -> String {
 /// face with no owner stays unaddressed on purpose -- there is nobody to
 /// address it to, and inventing an addressee would queue the work behind a
 /// unit that cannot act on it.
+///
+/// The same reasoning applies to a name the registry does not answer to. A
+/// reading that fired `unknown_unit` is saying that the owner is not a unit at
+/// all, so an owned row would never be offered -- the shared queue refuses
+/// owned work by design and only the owner can claim it -- and the remediation
+/// would sit Pending for as long as the name stays wrong. The finding still
+/// goes out; it goes out unaddressed, where an executor can take it.
 pub fn gap_goal_row(reading: &FaceDriftReading, id: String) -> Task {
     let mut row = Task::goal_row(id, &gap_goal_text(reading));
     row.face_id = Some(reading.face_id.clone());
-    row.owner_unit = reading.owner.clone();
+    row.owner_unit = match reading.cause.as_deref() {
+        Some("unknown_unit") => None,
+        _ => reading.owner.clone(),
+    };
     // The row is the goal's identity marker and is never executed; the planner
     // decomposes it into work and stamps the same face and owner on the
     // children.
@@ -356,6 +366,19 @@ mod tests {
         assert_eq!(row.owner_unit.as_deref(), Some("unit-7"));
         assert_eq!(row.face_id.as_deref(), Some("task-management"));
         assert!(!row.is_executable);
+    }
+
+    #[test]
+    fn a_goal_is_never_addressed_to_a_name_the_registry_does_not_answer_to() {
+        // Owned work is never offered to the shared queue and only the owner
+        // can claim it, so binding a finding to a name that is not a unit is
+        // the same as deleting it: the row stays Pending while its face stays
+        // broken.
+        let mut unknown = reading(Some("worker"));
+        unknown.cause = Some("unknown_unit".into());
+        let row = gap_goal_row(&unknown, "goal-3".into());
+        assert_eq!(row.owner_unit, None);
+        assert_eq!(row.face_id.as_deref(), Some("task-management"));
     }
 
     #[test]
