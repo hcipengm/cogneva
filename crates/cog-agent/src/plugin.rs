@@ -6,6 +6,61 @@ use tracing::{debug, info, warn};
 /// Loop name reported through the background-loop liveness family.
 pub const GRPC_CONTROL_HEARTBEAT_LOOP: &str = "agent_grpc_control_heartbeat";
 
+/// Loop name of the reading that moves the pool's concurrency.
+pub const POOL_SIZING_LOOP: &str = "agent_pool_sizing";
+
+/// How often the container's memory is re-read against the count in force.
+///
+/// Shorter than the pool's own task length on purpose: a task holds its turn
+/// for minutes, so a reading that stepped faster than that could shrink the
+/// pool and regrow it between two tasks without either reading being wrong.
+const POOL_SIZING_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Keep the pool's concurrency equal to what the container can carry.
+///
+/// The declared worker count is the ceiling this moves under, never above: a
+/// `worker_count` of three means "three if the box allows it", and the box is
+/// asked every period. The reading is logged on every move and on the first
+/// pass, so a pool sitting at one slot can be told apart from one that never
+/// read anything.
+fn spawn_pool_sizing_loop(concurrency: Arc<crate::pool_sizing::PoolConcurrency>) {
+    let ceiling = concurrency.ceiling();
+    let _ = cog_core::loop_health::spawn_unstoppable(
+        POOL_SIZING_LOOP,
+        cog_core::loop_health::Cadence::Periodic(POOL_SIZING_PERIOD),
+        move |beat| {
+            let concurrency = concurrency.clone();
+            async move {
+                let mut interval = tokio::time::interval(POOL_SIZING_PERIOD);
+                let mut first = true;
+                loop {
+                    beat.beat();
+                    interval.tick().await;
+                    let reading = crate::pool_sizing::read_container_memory();
+                    let plan =
+                        crate::pool_sizing::next_slots(concurrency.slots(), ceiling, reading);
+                    let changed = concurrency.set_slots(plan.slots).await;
+                    if changed || first || plan.movement != crate::pool_sizing::SlotMove::Hold {
+                        info!(
+                            slots = plan.slots,
+                            ceiling,
+                            movement = ?plan.movement,
+                            memory_fraction = plan.memory_fraction,
+                            "agent pool concurrency"
+                        );
+                    }
+                    crate::observable::global_observable().publish_pool_sizing(
+                        plan.slots,
+                        ceiling,
+                        plan.memory_fraction,
+                    );
+                    first = false;
+                }
+            }
+        },
+    );
+}
+
 /// Agent plugin that self-assembles and publishes hook engine, agent registry,
 /// and tool registry.
 use futures::StreamExt;
@@ -404,6 +459,13 @@ impl cog_core::SystemPlugin for AgentPlugin {
                     let agent_pool = crate::AgentManagerConfig::load()?;
                     let role = agent_pool.worker_role.clone();
                     let instance = crate::identity::agent_instance();
+                    // The declared count is the ceiling. How many of those
+                    // workers may hold a task at once is read off the memory
+                    // this container has, and moves while they run; see
+                    // `pool_sizing` for why the workers outlive the count.
+                    let concurrency = Arc::new(crate::pool_sizing::PoolConcurrency::new(
+                        agent_pool.worker_count,
+                    ));
                     for i in 0..agent_pool.worker_count {
                         let name = crate::identity::worker_name(i);
                         if !name.stable {
@@ -425,6 +487,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
                             cog_core::ResourceInfo::default(),
                         );
                         let runner = task_runner.clone();
+                        let gate = concurrency.clone();
                         if let Err(e) = pool
                             .spawn_worker(
                                 agent_id.clone(),
@@ -433,12 +496,22 @@ impl cog_core::SystemPlugin for AgentPlugin {
                                 registration,
                                 move |msg| {
                                     let runner = runner.clone();
+                                    let gate = gate.clone();
                                     async move {
                                         if let cog_core::InboxMessage::Prompt { goal, .. } = msg {
                                             if let Ok(task) =
                                                 serde_json::from_value::<cog_core::Task>(goal)
                                             {
-                                                runner.execute_task(task).await;
+                                                // A worker that cannot get a
+                                                // turn waits for one rather
+                                                // than dropping the message:
+                                                // the message is already
+                                                // taken, and a dropped one is
+                                                // work nobody will be handed
+                                                // again.
+                                                if let Some(_turn) = gate.acquire().await {
+                                                    runner.execute_task(task).await;
+                                                }
                                             }
                                         }
                                         Ok(())
@@ -455,6 +528,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
                             );
                         }
                     }
+                    spawn_pool_sizing_loop(concurrency);
                 }
             }
         }

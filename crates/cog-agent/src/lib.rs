@@ -9,6 +9,7 @@ pub mod hooks;
 pub mod identity;
 pub mod lifecycle;
 pub mod observable;
+pub mod pool_sizing;
 pub mod runtime;
 pub mod tools;
 pub mod wal;

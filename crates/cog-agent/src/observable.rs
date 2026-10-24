@@ -109,6 +109,19 @@ pub struct AgentObservable {
     /// no queue depth changes. The caller learns it from the tool result and
     /// nobody else would ever learn it at all, which is what this is for.
     inbox_ask_total: Mutex<HashMap<&'static str, u64>>,
+    /// How many pool workers may hold a task at once, and the declared ceiling
+    /// they are moving under.
+    ///
+    /// Published apart from the roster on purpose: the roster is how many
+    /// workers this process holds, which does not change when the container
+    /// tightens, and a pool that kept every worker but let one hold a task read
+    /// exactly like a busy one on the roster alone.
+    pool_slots: AtomicU64,
+    pool_ceiling: AtomicU64,
+    /// Working set over limit, when the container could be read. `None` is
+    /// "not measured" and writes no series: a zero here would read as a
+    /// container with nothing in it.
+    pool_memory_fraction: Mutex<Option<f64>>,
 }
 
 /// Every kind of inbox command this build can execute.
@@ -274,6 +287,20 @@ impl RunOutcome {
 impl AgentObservable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Publish the pool's concurrency and the reading that decided it.
+    ///
+    /// `memory_fraction` is `None` when the container could not be read, and
+    /// then no fraction series is written at all: the pool holds its ceiling in
+    /// that state, and a zero would say the opposite.
+    pub fn publish_pool_sizing(&self, slots: usize, ceiling: usize, memory_fraction: Option<f64>) {
+        self.pool_slots.store(slots as u64, Ordering::Relaxed);
+        self.pool_ceiling.store(ceiling as u64, Ordering::Relaxed);
+        *self
+            .pool_memory_fraction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = memory_fraction;
     }
 
     /// Replace the published roster with `entries` (role, creation instant).
@@ -714,6 +741,25 @@ impl Observable for AgentObservable {
                     )
                     .with_label("outcome", outcome),
                 );
+            }
+        }
+
+        // The pool's concurrency and the reading behind it. Written only when
+        // a pool exists: a process with the pool switched off has no count to
+        // report, and a zero would read as a pool that shrank to nothing.
+        let ceiling = self.pool_ceiling.load(Ordering::Relaxed);
+        if ceiling > 0 {
+            metrics.push(RawMetric::new(
+                "agent_pool_slots",
+                self.pool_slots.load(Ordering::Relaxed) as f64,
+            ));
+            metrics.push(RawMetric::new("agent_pool_ceiling", ceiling as f64));
+            if let Some(fraction) = *self
+                .pool_memory_fraction
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                metrics.push(RawMetric::new("agent_pool_memory_fraction", fraction));
             }
         }
 
