@@ -24,6 +24,10 @@ data:
   COGNEVA_STORAGE_PROVIDER: "local-fs"
 
   COGNEVA_WORKSPACE_ID: "default"
+  # 每个用户工作区的字节上限（0 = 不限）。拒绝写入时把这条错误信息里点名的
+  # 就是这一个键，所以它必须真的能从 values 走到这里——否则报错指的是一条
+  # 运维按正常路径改不动的开关。
+  COGNEVA_WORKSPACE_MAX_BYTES: {{ .Values.workspace.maxBytes | int64 | quote }}
   COGNEVA_CONSUMER_GROUP: "cogneva"
 
   COGNEVA_HTTP_PORT: "8080"

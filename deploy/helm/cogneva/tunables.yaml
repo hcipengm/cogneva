@@ -1271,6 +1271,17 @@ rows:
     why: >-
       Burst room over the resident cost. Not derived from a reading.
 
+  # --- workspace quota (WebUI file surface) ---
+  - key: workspace.maxBytes
+    source: override
+    why: >-
+      A per-user cap on the workspace under the shared data volume. Nothing
+      reads a user's usage back into it: the volume-level headroom is judged by
+      the container and volume readings, which cannot see one user's share, so
+      the number stays pinned until a reading of per-user usage exists. Zero
+      means unlimited and is a deliberate deployment choice, not a missing
+      value.
+
   # --- web search (SearXNG) ---------------------------------------------------
   - key: webSearch.replicas
     source: fixed

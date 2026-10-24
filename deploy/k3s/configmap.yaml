@@ -36,6 +36,8 @@ data:
   # 插值占位），不在此明文配置；env 映射优先级高于 json，置在这里会盖掉认证。
   # DagExecutor
   COGNEVA_WORKSPACE_ID: "default"
+  # 每个用户工作区的字节上限（0 = 不限）。拒绝写入时错误信息点名的就是这一个键。
+  COGNEVA_WORKSPACE_MAX_BYTES: "1073741824"
   COGNEVA_CONSUMER_GROUP: "cogneva"
 
   # Gateway
