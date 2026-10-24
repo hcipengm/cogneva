@@ -24,6 +24,11 @@
 #      读者会写了一下午才被拦下。
 #   7. 网关登记了 `/api/v1/ide/usage`，且 `write_handler` / `upload_handler` 在落盘
 #      前仍在过 `check_capacity`——配额只画在屏幕上、写之前不问，等于没上限。
+#   8. 保存是「读到的这一份还在不在」的比较交换：`saveWorkspaceFile` 收第三个参数
+#      （底稿指纹），文件页把它带上、并且真的处理 409；网关 `write_handler` 在写
+#      之前仍过 `ensure_unchanged`。
+#      ——工作区里不止一个写者（另一个会话、智能体的写工具），整份覆盖不问一句
+#      就会静默抹掉对方刚写下去的东西，屏幕上还什么异常都看不出来。
 #
 # 用法：bash deploy/scripts/check-web-workspace.sh [仓库根目录]
 set -euo pipefail
@@ -181,17 +186,63 @@ if '"/api/v1/ide/usage"' not in gw_src:
     sys.exit(f"{GATEWAY} 没有登记 /api/v1/ide/usage：配额组件打下去只有 404")
 if "fn measure_usage" not in ide_src:
     sys.exit(f"{IDE} 里没有 measure_usage：用量无从量起")
-for handler in ("write_handler", "upload_handler"):
-    start = ide_src.find(f"pub async fn {handler}")
+def handler_body(name):
+    """
+    一个 handler 的函数体，边界停在测试模块之前。
+
+    不能停在下一条 `pub async fn` 上：`#[cfg(test)] mod tests` 里也调这些函数，
+    截到文件尾就把测试里的调用也算成「handler 里还在过判据」，于是删掉真实调用
+    之后门照样绿。
+    """
+    start = ide_src.find(f"pub async fn {name}")
     if start < 0:
-        sys.exit(f"{IDE} 里没有 {handler}")
-    end = ide_src.find("\npub async fn ", start + 1)
-    body = ide_src[start:end if end > 0 else len(ide_src)]
-    if "check_capacity(" not in body:
+        sys.exit(f"{IDE} 里没有 {name}")
+    stops = [i for i in (ide_src.find("\n#[cfg(test)]", start), ide_src.find("\npub async fn ", start + 1)) if i > 0]
+    return ide_src[start:min(stops) if stops else len(ide_src)]
+
+
+for handler in ("write_handler", "upload_handler"):
+    if "check_capacity(" not in handler_body(handler):
         sys.exit(
             f"{IDE}: {handler} 落盘前没有过 check_capacity——"
             "上限只画在屏幕上，写到磁盘那一步不问，等于没有上限"
         )
 
-print("WORKSPACE OK：搜索与配额两条链路的路由、取数、渲染、落点、后端判据都在")
+# ── 8. 保存前的比较交换：底稿指纹带上去了，409 有人接 ──
+if not re.search(r"saveWorkspaceFile\s*\([^)]*expectHash", client_src):
+    sys.exit(
+        f"{CLIENT}: saveWorkspaceFile 不收底稿指纹——"
+        "整份覆盖无从比较，谁先写谁说了算"
+    )
+if "expect_hash" not in client_src:
+    sys.exit(f"{CLIENT}: 请求体里没有 expect_hash：指纹收进来了，却没发出去")
+forced = [
+    rel
+    for rel in sorted(graph)
+    if rel.endswith(".tsx")
+    and re.search(r"saveWorkspaceFile\s*\(([^)]*,\s*){2}", read(rel))
+]
+if not forced:
+    sys.exit(
+        "没有任何可达的文件页把底稿指纹传给 saveWorkspaceFile："
+        "服务端的比较交换永远收不到第二个值，覆盖照旧是无声的"
+    )
+if not [
+    rel
+    for rel in forced
+    # 按形式判，不认裸的 "409"：注释里提一句 409 不算处理了冲突。
+    if re.search(r"status\s*===\s*409", read(rel)) and "setConflict(" in read(rel)
+]:
+    sys.exit(
+        "带着指纹保存的那一处没有处理 409：冲突被当成一次普通的保存失败，"
+        "读者只会看到「保存失败」，不知道对方的版本还在盘上"
+    )
+if "fn ensure_unchanged" not in ide_src:
+    sys.exit(f"{IDE} 里没有 ensure_unchanged：底稿比对没有落地")
+if "expect_hash" not in ide_src:
+    sys.exit(f"{IDE}: WriteBody 不收 expect_hash：客户端带了，服务端不看")
+if "ensure_unchanged(" not in handler_body("write_handler"):
+    sys.exit(f"{IDE}: write_handler 落盘前不比底稿——409 永远不会出现")
+
+print("WORKSPACE OK：搜索、配额、保存冲突三条链路的取数、渲染、落点、后端判据都在")
 PYEOF

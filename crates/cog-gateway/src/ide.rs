@@ -68,6 +68,11 @@ pub struct FileQuery {
 pub struct WriteBody {
     pub path: String,
     pub text: String,
+    /// 读这一份时服务端报回来的 `hash`。带上它，写入就变成一次比较交换：盘上
+    /// 那一份在这期间被别的写者换过，这一次就拒，而不是把对方的改动盖掉。
+    /// 不带就是无条件覆盖——新建文件、以及智能体那一路写工具本来就没有底稿。
+    #[serde(default)]
+    pub expect_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +146,24 @@ pub struct FileResponse {
     pub truncated: bool,
     pub text: Option<String>,
     pub modified_ms: Option<u64>,
+    /// 这一份内容的指纹，写回时带在 `expect_hash` 上，服务端据此判断「我读到的
+    /// 那一份还在不在」。二进制与超过上限的文件不给：前者没读全，后者只读了前
+    /// 一段，拿它当底稿写回去会把后半段截掉。
+    pub hash: Option<String>,
+}
+
+/// 内容指纹：FNV-1a 64。
+///
+/// 用途只有一个——「我读到的这一份还是不是盘上那一份」。它不比密码学哈希，
+/// 也不需要跨版本稳定（同一个部署里两头算的是一套），但必须是纯函数：同样的
+/// 字节，任何一次算出来都一样，否则读写两边永远对不上。
+fn content_hash(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// 用户根目录：`<COGNEVA_WORKSPACE_ROOT>/<user uuid>`。
@@ -317,6 +340,8 @@ async fn read_file(path: &Path, rel: &str) -> Result<FileResponse, ApiError> {
             truncated: false,
             text: None,
             modified_ms: modified_ms(&meta),
+            // 二进制只读了探针那一段，算出来的指纹不是整份的。
+            hash: None,
         });
     }
 
@@ -335,13 +360,20 @@ async fn read_file(path: &Path, rel: &str) -> Result<FileResponse, ApiError> {
     // 截断可能切在多字节字符中间：用 from_utf8 的容错解码，不要拒绝整页。
     let text = String::from_utf8_lossy(&bytes).to_string();
 
+    let truncated = size > MAX_FILE_BYTES;
     Ok(FileResponse {
         path: to_response_path(rel),
         size,
         binary: false,
-        truncated: size > MAX_FILE_BYTES,
+        truncated,
         text: Some(text),
         modified_ms: modified_ms(&meta),
+        // 截断时只读到前一段，指纹对不上整份内容：不给，写回就是无条件覆盖。
+        hash: if truncated {
+            None
+        } else {
+            Some(content_hash(&bytes))
+        },
     })
 }
 
@@ -802,6 +834,7 @@ pub async fn upload_handler(
             truncated: false,
             text: None,
             modified_ms: None,
+            hash: None,
         })),
     }
 }
@@ -846,12 +879,48 @@ pub async fn file_handler(
     Ok(Json(read_file(&path, &query.path).await?))
 }
 
+/// 读过的这一份还是不是盘上那一份。
+///
+/// 同一个工作区里不止一个写者：用户开着的这一页、另一个会话、智能体的写工具。
+/// 编辑器里的「保存」是一次整份覆盖，如果不先问一句，对方在这之间写下去的东西
+/// 会被静默抹掉——而屏幕上什么异常都看不出来，等到发现时对方的版本已经不在了。
+async fn ensure_unchanged(path: &Path, rel: &str, expected: &str) -> Result<(), ApiError> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::conflict(format!(
+                "{rel} 已经不在了：你打开它之后被删掉或被改了名。要按现在这一份新建，\
+                 请先清掉底稿再保存"
+            )))
+        }
+        Err(e) => return Err(ApiError::internal(format!("cannot read {rel}: {e}"))),
+    };
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(ApiError::conflict(format!(
+            "{rel} 现在有 {} 字节，超过编辑器能读的上限：盘上这一份已经不是你看的那一份，\
+             保存会把它截成你手里的这一段",
+            bytes.len()
+        )));
+    }
+    if content_hash(&bytes) != expected {
+        return Err(ApiError::conflict(format!(
+            "{rel} 在你打开之后被改过（盘上 {} 字节）：直接保存会盖掉对方的改动。\
+             选择覆盖，或者先重读",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
 pub async fn write_handler(
     Extension(claims): Extension<Claims>,
     Json(body): Json<WriteBody>,
 ) -> Result<Json<FileResponse>, ApiError> {
     let root = ensure_user_root(&claims).await?;
     let path = resolve_under(&root, &body.path)?;
+    if let Some(expected) = body.expect_hash.as_deref() {
+        ensure_unchanged(&path, &body.path, expected).await?;
+    }
     // 写之前先把「写的是谁、写到哪」记下来：文件面出问题要能回答这个问题，
     // 而响应体不会被任何人留档。
     tracing::info!(
@@ -934,6 +1003,95 @@ mod tests {
         assert!(!read.truncated);
         assert_eq!(read.text.as_deref(), Some("第一行\n第二行\n"));
         assert_eq!(read.path, "notes/todo.md");
+    }
+
+    #[tokio::test]
+    async fn a_read_reports_the_fingerprint_that_a_save_can_be_pinned_to() {
+        let dir = tempdir();
+        let path = resolve_under(dir.path(), "a.txt").unwrap();
+        write_file(&path, "v1").await.unwrap();
+
+        let first = read_file(&path, "a.txt").await.unwrap();
+        let again = read_file(&path, "a.txt").await.unwrap();
+        assert_eq!(first.hash, again.hash, "同样的字节，两次读要给出同一个指纹");
+        assert!(first.hash.is_some());
+
+        write_file(&path, "v2").await.unwrap();
+        let changed = read_file(&path, "a.txt").await.unwrap();
+        assert_ne!(first.hash, changed.hash, "内容变了，指纹必须跟着变");
+    }
+
+    #[tokio::test]
+    async fn saving_over_a_file_someone_else_changed_is_refused() {
+        let dir = tempdir();
+        let path = resolve_under(dir.path(), "a.txt").unwrap();
+        write_file(&path, "v1").await.unwrap();
+        let base = read_file(&path, "a.txt").await.unwrap().hash.unwrap();
+
+        // 另一个写者（另一个会话、或者智能体的写工具）在这之间写下去了。
+        write_file(&path, "对方写的").await.unwrap();
+
+        let err = ensure_unchanged(&path, "a.txt", &base)
+            .await
+            .expect_err("盘上那一份已经不是我读的那一份了，不能直接盖");
+        assert_eq!(err.error, "Conflict");
+        assert!(
+            err.message.contains("覆盖"),
+            "拒绝里要告诉读者下一步有哪两条路：{}",
+            err.message
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "对方写的",
+            "拒绝必须发生在写之前：对方的版本一个字都不能少"
+        );
+    }
+
+    #[tokio::test]
+    async fn saving_with_the_fingerprint_you_read_goes_through() {
+        let dir = tempdir();
+        let path = resolve_under(dir.path(), "a.txt").unwrap();
+        write_file(&path, "v1").await.unwrap();
+        let base = read_file(&path, "a.txt").await.unwrap().hash.unwrap();
+
+        ensure_unchanged(&path, "a.txt", &base)
+            .await
+            .expect("没有人动过它，这一次保存应该放行");
+    }
+
+    #[tokio::test]
+    async fn saving_a_file_that_was_deleted_meanwhile_is_a_conflict_not_a_create() {
+        let dir = tempdir();
+        let path = resolve_under(dir.path(), "a.txt").unwrap();
+        write_file(&path, "v1").await.unwrap();
+        let base = read_file(&path, "a.txt").await.unwrap().hash.unwrap();
+        tokio::fs::remove_file(&path).await.unwrap();
+
+        let err = ensure_unchanged(&path, "a.txt", &base)
+            .await
+            .expect_err("底稿对应的文件没了，这是一次冲突，不是一次新建");
+        assert_eq!(err.error, "Conflict");
+    }
+
+    #[tokio::test]
+    async fn a_file_too_big_to_read_whole_cannot_be_saved_against_a_fingerprint() {
+        let dir = tempdir();
+        let path = resolve_under(dir.path(), "big.txt").unwrap();
+        tokio::fs::write(&path, vec![b'a'; MAX_FILE_BYTES as usize + 1])
+            .await
+            .unwrap();
+
+        let read = read_file(&path, "big.txt").await.unwrap();
+        assert!(read.truncated);
+        assert!(
+            read.hash.is_none(),
+            "只读到前一段时不能给指纹：拿它当底稿写回去会把后半段截掉"
+        );
+
+        let err = ensure_unchanged(&path, "big.txt", "0000000000000000")
+            .await
+            .expect_err("盘上那一份比编辑器读到的长，不能按手里的这一段覆盖");
+        assert_eq!(err.error, "Conflict");
     }
 
     #[tokio::test]

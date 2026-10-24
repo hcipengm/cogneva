@@ -48,6 +48,14 @@ impl ApiError {
         }
     }
 
+    /// 一次比较交换输给了别的写者：请求本身没错，是它脚下的状态变了。
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            error: "Conflict".into(),
+            message: message.into(),
+        }
+    }
+
     /// A submitted row names an owner the face it serves does not have.
     ///
     /// Its own error name rather than plain `Conflict`: the caller has to

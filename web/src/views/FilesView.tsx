@@ -41,6 +41,8 @@ export function FilesView() {
   const [error, setError] = useState<{ message: string } | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  /** 保存被 409 挡下时的提示；空表示没有冲突。 */
+  const [conflict, setConflict] = useState<string | null>(null);
   const [newPath, setNewPath] = useState('');
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState('');
@@ -52,6 +54,8 @@ export function FilesView() {
     try {
       const page = await getWorkspaceFile(target);
       setFile(page);
+      // 重读之后手里的底稿就是盘上这一份：冲突已经处理过，条子该收了。
+      setConflict(null);
     } catch (e) {
       setError({ message: (e as { message?: string }).message ?? '读取失败' });
       setFile(null);
@@ -84,22 +88,38 @@ export function FilesView() {
     setReveal(null);
   }, [path, file, text, reveal, setReveal]);
 
-  const save = useCallback(async () => {
-    if (!path || !dirty || saving) return;
-    setSaving(true);
-    try {
-      const saved = await saveWorkspaceFile(path, text);
-      setFile(saved);
-      clearDraft(path);
-      appendOutput(`已保存 ${path}（${saved.size} 字节）`);
-    } catch (e) {
-      const message = (e as { message?: string }).message ?? '保存失败';
-      appendOutput(`保存 ${path} 失败：${message}`);
-      setError({ message });
-    } finally {
-      setSaving(false);
-    }
-  }, [path, dirty, saving, text, clearDraft, appendOutput]);
+  /**
+   * 保存。默认拿着读进来时的指纹去写：盘上那一份在这期间被别的写者换过，服务端
+   * 回 409，这里把它摆成一条要人选的岔路，而不是把对方的改动盖掉。`force` 是
+   * 读者自己选的那条「我就是要覆盖」。
+   */
+  const save = useCallback(
+    async (force = false) => {
+      if (!path || !dirty || saving) return;
+      setSaving(true);
+      try {
+        const saved = await saveWorkspaceFile(path, text, force ? null : file?.hash);
+        setFile(saved);
+        clearDraft(path);
+        setConflict(null);
+        appendOutput(`已保存 ${path}（${saved.size} 字节）`);
+      } catch (e) {
+        const status = (e as { status?: number }).status;
+        if (status === 409 && !force) {
+          // 服务端说的是「你手里那份底稿已经不在了」。原文是给机器看的一行 JSON，
+          // 这里换成读者能照着做的两个动作。
+          setConflict(`盘上的 ${path} 在你打开之后被改过（另一个会话或智能体写过）。`);
+        } else {
+          const message = (e as { message?: string }).message ?? '保存失败';
+          appendOutput(`保存 ${path} 失败：${message}`);
+          setError({ message });
+        }
+      } finally {
+        setSaving(false);
+      }
+    },
+    [path, dirty, saving, text, file, clearDraft, appendOutput]
+  );
 
   const createFile = async () => {
     const target = newPath.trim();
@@ -192,6 +212,30 @@ export function FilesView() {
           </Button>
         </div>
       </header>
+
+      {conflict && (
+        <div
+          className="flex shrink-0 items-center gap-3 border-b border-[var(--line)] px-4 py-1.5"
+          style={{ background: 'var(--ink-800)' }}
+        >
+          <span className="text-[11px]" style={{ color: 'var(--warn)' }}>
+            {conflict}
+          </span>
+          <div className="ml-auto flex items-center gap-2">
+            <Button onClick={() => void save(true)} tone="accent">
+              仍要覆盖
+            </Button>
+            <Button
+              onClick={() => {
+                if (path) void load(path);
+                setConflict(null);
+              }}
+            >
+              重读（留下我的版本）
+            </Button>
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="px-4 py-2">

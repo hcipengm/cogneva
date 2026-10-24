@@ -952,6 +952,11 @@ export interface WorkspaceFile {
   truncated: boolean;
   text: string | null;
   modified_ms: number | null;
+  /**
+   * 这一份内容的指纹；写回时带上，服务端据此判断「我读到的这一份还在不在」。
+   * 二进制与超过上限的文件没有指纹——那两种情况下手里的不是完整的一份。
+   */
+  hash: string | null;
 }
 
 export async function getWorkspaceTree(path = ''): Promise<WorkspaceTree> {
@@ -962,11 +967,23 @@ export async function getWorkspaceFile(path: string): Promise<WorkspaceFile> {
   return api.get<WorkspaceFile>(`/api/v1/ide/file?path=${encodeURIComponent(path)}`);
 }
 
+/**
+ * 写回一份文件。
+ *
+ * 带上 `expectHash` 就是一次比较交换：盘上那一份在这期间被别人换过，服务端回
+ * 409 而不是把对方盖掉。不带就是无条件覆盖——新建文件、以及「知道自己在覆盖」
+ * 的那一下。
+ */
 export async function saveWorkspaceFile(
   path: string,
-  text: string
+  text: string,
+  expectHash?: string | null
 ): Promise<WorkspaceFile> {
-  return api.put<WorkspaceFile>('/api/v1/ide/file', { path, text });
+  return api.put<WorkspaceFile>('/api/v1/ide/file', {
+    path,
+    text,
+    ...(expectHash ? { expect_hash: expectHash } : {}),
+  });
 }
 
 export async function createWorkspaceDir(path: string): Promise<WorkspaceEntry> {
