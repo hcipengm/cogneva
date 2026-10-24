@@ -162,21 +162,13 @@ fn work(id: &str, owner: Option<&str>, face_id: Option<&str>, status: TaskStatus
 }
 
 async fn clean(pool: &PgPool, prefix: &str) {
-    sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id LIKE $1")
-        .bind(format!("{prefix}%"))
-        .execute(pool)
-        .await
-        .expect("clean up");
-    sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1 AND task_id LIKE $2")
-        .bind(GOVERNANCE_WORKSPACE)
-        .bind(format!("{prefix}%"))
-        .execute(pool)
-        .await
-        .expect("clean up");
-    // Event ids carry the decision id in the middle (`decision-event:<id>:<seq>`),
-    // so the marker is not a prefix there.
-    sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1 AND task_id LIKE $2")
-        .bind(GOVERNANCE_WORKSPACE)
+    // The marker is in the task id, not in the workspace. Fixtures live in
+    // throwaway product workspaces (`test-ws-a`) whose names know nothing
+    // about the round, and an event id carries its marker in the middle
+    // (`decision-event:<id>:<seq>`). Deleting by workspace alone leaves the
+    // product-workspace fixtures behind, and every leftover row is a face the
+    // resident drift pass keeps rewriting.
+    sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id LIKE $1 OR task_id LIKE $1")
         .bind(format!("%{prefix}%"))
         .execute(pool)
         .await
@@ -246,6 +238,19 @@ async fn only_the_reserved_workspace_rows_typed_as_faces_are_faces() {
     assert!(handovers.iter().any(|row| row.id == handover_id));
 
     clean(&pool, &prefix).await;
+    // The look-alike was seeded into a workspace whose name has nothing to do
+    // with the round, so this is the row a workspace-only cleanup misses.
+    let left: Vec<(String,)> =
+        sqlx::query_as("SELECT task_id FROM cog_dag_tasks WHERE task_id LIKE $1")
+            .bind(format!("%{prefix}%"))
+            .fetch_all(&pool)
+            .await
+            .expect("read back what survived");
+    assert!(
+        left.is_empty(),
+        "cleanup left fixture rows behind, and a leftover row is a face the \
+         drift pass will keep working on: {left:?}"
+    );
 }
 
 /// Open work for a face is every non-terminal row that names it, in any product
