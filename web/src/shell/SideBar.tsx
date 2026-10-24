@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 import { FileTree } from '@/files/FileTree';
+import { SearchPanel } from '@/files/SearchPanel';
 import { useServices } from '@/shell/context';
 import { Icon, type IconName } from '@/shell/icons';
 import { useShell, type ActivityId } from '@/shell/store';
@@ -126,7 +127,13 @@ function CrossLinks({ links }: { links: { id: ActivityId; label: string; note?: 
 }
 
 function ActivityPanel({ activity }: { activity: ActivityId }) {
-  if (activity === 'files') return <FileTree />;
+  if (activity === 'files')
+    return (
+      <>
+        <SearchPanel />
+        <FileTree />
+      </>
+    );
   const setActivity = useShell((s) => s.setActivity);
   const { alerts, notifications, overview } = useServices();
   const connectionStatus = useStreamStore((s) => s.connectionStatus);

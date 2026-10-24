@@ -633,6 +633,12 @@ jobs:
       # 报错——它会悄悄继承上一个主题的颜色，在一屏里留下两种风格。
       - name: Check every theme fills the token set and is pickable
         run: bash deploy/scripts/check-web-theme-picker.sh
+      # 工作区搜索的成品是「打两个字、看见哪个文件里有、点一下落到那一行」，不是
+      # `/api/v1/ide/search` 这条路由。路由、取数、渲染三段各自都能在另外两段消失
+      # 之后继续绿；落点（打开文件后按行号定位）更是一消失就退回「开了但停在第一行」，
+      # 而那看起来只是「搜索不太好用」。
+      - name: Check workspace search reaches the screen and lands on its line
+        run: bash deploy/scripts/check-web-workspace-search.sh
 
   # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读
   # 覆盖端点），它结构上证明不了 `web/` 编得过：类型错、装不上的依赖、打包不进

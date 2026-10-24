@@ -868,6 +868,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             axum::routing::post(ide::rename_handler),
         )
         .route("/api/v1/ide/raw", get(ide::raw_handler))
+        .route("/api/v1/ide/search", get(ide::search_handler))
         .route(
             "/api/v1/ide/upload",
             axum::routing::post(ide::upload_handler),

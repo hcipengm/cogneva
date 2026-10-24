@@ -30,6 +30,9 @@ export function FilesView() {
     ? active.id.slice('file:'.length)
     : null;
 
+  const reveal = useShell((s) => s.reveal);
+  const setReveal = useShell((s) => s.setReveal);
+
   const draft = useDrafts((s) => (path ? s.drafts[path] : undefined));
   const setDraft = useDrafts((s) => s.setDraft);
   const clearDraft = useDrafts((s) => s.clearDraft);
@@ -67,6 +70,19 @@ export function FilesView() {
   const dirty = draft !== undefined && draft !== file?.text;
   const lines = text ? text.split('\n').length : 0;
   const matches = findOpen ? findMatches(text, findQuery) : [];
+
+  // 搜索结果是「哪个文件、第几行」。落到哪儿由这一层算：只有它手里有正文。
+  useEffect(() => {
+    if (!path || !file || !reveal || reveal.path !== path) return;
+    const hits = findMatches(text, reveal.query);
+    const index = hits.findIndex(
+      ([start]) => text.slice(0, start).split('\n').length - 1 === reveal.line - 1
+    );
+    setFindOpen(true);
+    setFindQuery(reveal.query);
+    setFindIndex(index >= 0 ? index : 0);
+    setReveal(null);
+  }, [path, file, text, reveal, setReveal]);
 
   const save = useCallback(async () => {
     if (!path || !dirty || saving) return;

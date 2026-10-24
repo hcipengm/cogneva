@@ -58,6 +58,12 @@ interface ShellState {
   palette: 'closed' | 'commands' | 'open';
   /** 底部输出格的累积行。命令与失败都写在这里，读者不必打开控制台。 */
   output: string[];
+  /**
+   * 「把这一页打开到这一行」的请求。搜索结果是路径 + 行号，而页的身份是
+   * `file:<路径>`：点击时先把页打开、再把落点留在这里，由文件页在读到正文之后
+   * 消费掉——它才是唯一知道这一行在正文里是什么位置的那一层。
+   */
+  reveal: { path: string; line: number; query: string } | null;
 
   setActivity: (activity: ActivityId) => void;
   toggleSidebar: () => void;
@@ -69,6 +75,7 @@ interface ShellState {
   setPalette: (mode: ShellState['palette']) => void;
   appendOutput: (line: string) => void;
   clearOutput: () => void;
+  setReveal: (reveal: ShellState['reveal']) => void;
 }
 
 const FIRST_TAB: EditorTab = {
@@ -86,6 +93,7 @@ export const useShell = create<ShellState>((set, get) => ({
   panelTab: 'problems',
   palette: 'closed',
   output: [],
+  reveal: null,
 
   setActivity: (activity) =>
     set((state) => {
@@ -155,6 +163,7 @@ export const useShell = create<ShellState>((set, get) => ({
       output: [...state.output.slice(-499), line],
     })),
   clearOutput: () => set({ output: [] }),
+  setReveal: (reveal) => set({ reveal }),
 }));
 
 /** 一页页签的身份：视图键就是身份，同一面不会开两页。 */

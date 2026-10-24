@@ -1013,3 +1013,35 @@ export async function downloadWorkspaceFile(path: string): Promise<void> {
   // 立刻撤销会让部分浏览器拿到空文件，下一轮事件循环再放掉。
   setTimeout(() => URL.revokeObjectURL(url), 0);
 }
+
+export interface WorkspaceSearchMatch {
+  path: string;
+  /** 从 1 开始；列按字符算，不按字节。 */
+  line: number;
+  column: number;
+  text: string;
+}
+
+export interface WorkspaceSearchResult {
+  query: string;
+  matches: WorkspaceSearchMatch[];
+  scanned_files: number;
+  scanned_bytes: number;
+  /** 命中条数或扫描面到了上限，结果被截断。 */
+  truncated: boolean;
+}
+
+/**
+ * 在整个工作区里按字面量找。
+ *
+ * 与文件内查找分开：那条只在已打开的这一份里走，回答的是「这一份里还有没有」；
+ * 这一条回答「哪个文件里有」，所以它回的是路径 + 行号，不是编辑器里的下标。
+ */
+export async function searchWorkspace(
+  query: string,
+  limit = 100
+): Promise<WorkspaceSearchResult> {
+  return api.get<WorkspaceSearchResult>(
+    `/api/v1/ide/search?q=${encodeURIComponent(query)}&limit=${limit}`
+  );
+}

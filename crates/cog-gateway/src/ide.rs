@@ -41,6 +41,13 @@ const BINARY_PROBE_BYTES: usize = 8192;
 /// 但必须落在路由层请求体的封顶之下并留出余量：超过那条线的大请求在到达这里
 /// 之前就被拒，本层再给一个更大的数只会让两边说法不一致。
 const TRANSFER_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// 一次搜索最多走多少个文件、读多少字节：搜索是同步回答的请求，没有一个
+/// 上界时一个装满构建产物的根目录会让这一次请求把连接占满。
+const SEARCH_MAX_FILES: usize = 5_000;
+const SEARCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// 一次搜索默认回多少条匹配，以及调用方能要到多少。
+const SEARCH_DEFAULT_LIMIT: usize = 100;
+const SEARCH_MAX_LIMIT: usize = 500;
 
 #[derive(Debug, Deserialize)]
 pub struct TreeQuery {
@@ -70,6 +77,36 @@ pub struct RenameBody {
     pub from: String,
     #[serde(rename = "to")]
     pub to: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    /// 要找的文字。按字面量、不区分 ASCII 大小写，不当正则：搜索框里打一个
+    /// `(` 不该回 400，也不该把一次误输入变成一次昂贵的正则执行。
+    pub q: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchMatch {
+    pub path: String,
+    /// 从 1 开始的行号与列号（列按字符算，不按字节：中文一列一个字）。
+    pub line: usize,
+    pub column: usize,
+    /// 那一行的原文，未截断——读者要能看见命中的上下文。
+    pub text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchResponse {
+    pub query: String,
+    pub matches: Vec<SearchMatch>,
+    /// 走过了多少文件 / 字节：读者据此知道「没找到」是真的没有，还是没走完。
+    pub scanned_files: usize,
+    pub scanned_bytes: u64,
+    /// 条数或扫描面到了上限，结果被截断。
+    pub truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -466,6 +503,135 @@ async fn write_bytes(root: &Path, rel: &str, bytes: &[u8]) -> Result<(), ApiErro
         .map_err(|e| ApiError::internal(format!("cannot write {rel}: {e}")))
 }
 
+/// 在工作区里按字面量找，一行一条匹配。
+///
+/// 三条判据写在这里而不是交给调用方：
+/// - 只走自己的根。目录项是符号链接就跳过——链接可以指向根外，顺着它走等于让
+///   被搜索的内容决定搜索能看见什么。
+/// - 二进制与超大文件不读。命中一行替换字符组成的「匹配」比没有匹配更糟。
+/// - 扫描面有上界，并且把「被截断」写进回答：读者要能分出「确实没有」和
+///   「没走到那儿」。
+async fn search_workspace(
+    root: &Path,
+    q: &str,
+    limit: Option<usize>,
+) -> Result<SearchResponse, ApiError> {
+    let needle = q.trim();
+    if needle.is_empty() {
+        return Err(ApiError::bad_request(
+            "search needs a non-empty q; an empty query matches every line",
+        ));
+    }
+    let limit = limit
+        .unwrap_or(SEARCH_DEFAULT_LIMIT)
+        .clamp(1, SEARCH_MAX_LIMIT);
+    // `to_ascii_lowercase` 逐字节保长，所以找到的字节下标就是原文的下标；
+    // 非 ASCII 的字节原样保留，中文按字面量比较。
+    let needle_lower = needle.to_ascii_lowercase();
+
+    let mut response = SearchResponse {
+        query: needle.to_string(),
+        matches: Vec::new(),
+        scanned_files: 0,
+        scanned_bytes: 0,
+        truncated: false,
+    };
+    let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
+
+    while let Some((dir, rel)) = stack.pop() {
+        let mut reader = match tokio::fs::read_dir(&dir).await {
+            Ok(reader) => reader,
+            // 目录在这一刻被删掉、或读不动：跳过它，不因为它让整次搜索失败。
+            Err(_) => continue,
+        };
+        while let Some(entry) = reader
+            .next_entry()
+            .await
+            .map_err(|e| ApiError::internal(format!("cannot walk the workspace: {e}")))?
+        {
+            if response.scanned_files >= SEARCH_MAX_FILES
+                || response.scanned_bytes >= SEARCH_MAX_BYTES
+            {
+                response.truncated = true;
+                return Ok(response);
+            }
+            // `file_type` 不跟随链接；`metadata` 会跟随，两者别混用。
+            let file_type = match entry.file_type().await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let child_rel = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if file_type.is_dir() {
+                stack.push((entry.path(), child_rel));
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let meta = match entry.metadata().await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.len() > MAX_FILE_BYTES {
+                continue;
+            }
+            let bytes = match tokio::fs::read(&path).await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            response.scanned_files += 1;
+            response.scanned_bytes += bytes.len() as u64;
+            let probe_len = bytes.len().min(BINARY_PROBE_BYTES);
+            if bytes[..probe_len].contains(&0) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            for (index, line) in text.lines().enumerate() {
+                let Some(byte_pos) = line.to_ascii_lowercase().find(&needle_lower) else {
+                    continue;
+                };
+                response.matches.push(SearchMatch {
+                    path: to_response_path(&child_rel),
+                    line: index + 1,
+                    column: line[..byte_pos].chars().count() + 1,
+                    text: line.to_string(),
+                });
+                if response.matches.len() >= limit {
+                    response.truncated = true;
+                    return Ok(response);
+                }
+            }
+        }
+    }
+    Ok(response)
+}
+
+pub async fn search_handler(
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<SearchResponse>, ApiError> {
+    let root = ensure_user_root(&claims).await?;
+    let response = search_workspace(&root, &query.q, query.limit).await?;
+    tracing::info!(
+        user = %claims.sub,
+        query = %response.query,
+        matches = response.matches.len(),
+        scanned_files = response.scanned_files,
+        truncated = response.truncated,
+        "workspace searched"
+    );
+    Ok(Json(response))
+}
+
 pub async fn mkdir_handler(
     Extension(claims): Extension<Claims>,
     Json(body): Json<MkdirBody>,
@@ -769,6 +935,107 @@ mod tests {
             .expect_err("超过传输上限必须拒绝");
         assert_eq!(err.error, "BadRequest");
         assert!(!root.join("big.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn search_reports_path_line_and_column_for_each_hit() {
+        let dir = tempdir();
+        let root = dir.path();
+        tokio::fs::create_dir_all(root.join("notes")).await.unwrap();
+        tokio::fs::write(root.join("notes/todo.md"), "第一行\nTODO: 写搜索\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("main.rs"), "fn main() {}\n// TODO: 还债\n")
+            .await
+            .unwrap();
+
+        let found = search_workspace(root, "todo", None).await.unwrap();
+
+        assert_eq!(found.matches.len(), 2, "{found:?}");
+        let md = found
+            .matches
+            .iter()
+            .find(|m| m.path == "notes/todo.md")
+            .expect("中文同一行里的 TODO 也要命中");
+        assert_eq!(md.line, 2);
+        assert_eq!(md.column, 1);
+        let rs = found
+            .matches
+            .iter()
+            .find(|m| m.path == "main.rs")
+            .expect("注释里的 TODO 也要命中");
+        assert_eq!(rs.line, 2);
+        // 列按字符算：「// TODO」里的 T 是这一行的第 4 个字符。
+        assert_eq!(rs.column, 4);
+        assert_eq!(found.scanned_files, 2);
+        assert!(!found.truncated);
+    }
+
+    #[tokio::test]
+    async fn search_does_not_read_binary_files() {
+        let dir = tempdir();
+        let root = dir.path();
+        // 前面是文本、中间一个 NUL：按文本读回来就是一屏替换字符。
+        let mut body = b"needle in the head\n".to_vec();
+        body.push(0);
+        body.extend_from_slice(b"needle after the nul\n");
+        tokio::fs::write(root.join("blob.bin"), &body)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("plain.txt"), "needle here\n")
+            .await
+            .unwrap();
+
+        let found = search_workspace(root, "needle", None).await.unwrap();
+
+        assert_eq!(found.matches.len(), 1, "{found:?}");
+        assert_eq!(found.matches[0].path, "plain.txt");
+        assert_eq!(found.scanned_files, 2, "两个文件都走到了，只是二进制不读");
+    }
+
+    #[tokio::test]
+    async fn search_stops_at_the_limit_and_says_it_was_truncated() {
+        let dir = tempdir();
+        let root = dir.path();
+        let body: String = (0..20).map(|i| format!("needle {i}\n")).collect();
+        tokio::fs::write(root.join("many.txt"), body).await.unwrap();
+
+        let found = search_workspace(root, "needle", Some(5)).await.unwrap();
+
+        assert_eq!(found.matches.len(), 5);
+        assert!(
+            found.truncated,
+            "到了条数上限就必须说，否则「只有 5 处」是假读数"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_does_not_follow_a_symlink_out_of_the_root() {
+        let dir = tempdir();
+        let root = dir.path().join("root");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let outside = dir.path().join("outside");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::write(outside.join("secret.txt"), "needle outside\n")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let found = search_workspace(&root, "needle", None).await.unwrap();
+
+        assert!(
+            found.matches.is_empty(),
+            "根外的内容不能因为一条链接被搜出来：{found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_query_is_refused_rather_than_matching_every_line() {
+        let dir = tempdir();
+        let err = search_workspace(dir.path(), "   ", None)
+            .await
+            .expect_err("空查询必须拒绝");
+        assert_eq!(err.error, "BadRequest");
     }
 
     #[tokio::test]
