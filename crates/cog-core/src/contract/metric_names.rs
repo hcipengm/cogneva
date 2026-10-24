@@ -1008,6 +1008,8 @@ metric_names! {
     // between rollouts say the reorder reached the running pool.
     LLM_UPSTREAM_POSITION => "llm_upstream_position",
     LLM_POOL_AVAILABLE => "llm_pool_available",
+    LLM_POOL_FACE_SERVING => "llm_pool_face_serving",
+    LLM_POOL_FACE_UPSTREAMS => "llm_pool_face_upstreams",
     LLM_POOL_EVIDENCED_RECOVERY_UNIX => "llm_pool_evidenced_recovery_unix",
     LLM_POOL_NEXT_ATTEMPT_UNIX => "llm_pool_next_attempt_unix",
     LLM_POOL_QUOTA_WINDOW_SECS => "llm_pool_quota_window_secs",

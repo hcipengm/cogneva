@@ -1953,6 +1953,16 @@ data:
                   "face": "token 管理"
                 },
                 {
+                  "name": "llm_pool_face_without_a_serving_member",
+                  "promql": "(max by (face) (llm_pool_face_upstreams and ((time() - llm_pool_face_upstreams_observed_timestamp_seconds) < 1800)) > 0) and on (face) (max by (face) (llm_pool_face_serving) == 0) and on (face) (max by (face) ((time() - llm_pool_face_serving_observed_timestamp_seconds) < 1800)) and on () (max(llm_pool_available and ((time() - llm_pool_available_observed_timestamp_seconds) < 1800)) == 1)",
+                  "condition": {
+                    "greater_than": 0.0
+                  },
+                  "severity": "critical",
+                  "summary": "One protocol face has upstreams configured and not one of them can take a call -- {value} is how many are configured for {face} -- while the pool as a whole reads available. Those two readings answer different questions and the pool-wide one cannot stand in for this one: a pool holds members of several protocol faces, a request names one face, and a face whose members are all inside a refusal window refuses every request on it while `llm_pool_available` still reads 1, because another face still has a healthy member. Measured 2026-10-24: one face's only member had answered with a spent quota window, the other face had a healthy member, every call on the first face got a 503 from the circuit before any upstream was reached, and a retry loop that gates on the pool-wide series started rounds that could produce nothing for as long as the window lasted. The denominator is what makes the zero readable, and both come from the same pass: {face} with a configured count above zero and a serving count of zero is a face whose members are being refused, while a face nothing is configured for publishes zero on both and stays outside this rule -- that state is a configuration mistake, and its repair is to configure a member rather than to wait out a window. The pool being unavailable is a different state and the last leg deliberately excludes it, so this rule and `llm_pool_down_on_a_quota_cycle` never describe one outage twice; where the pool itself reads down, those rules own it and this one stays quiet. Every leg is bounded by an age on its companion `_observed_timestamp_seconds` clock -- now minus that timestamp under half an hour -- because the store serves a gauge's newest row forever, and a writer that stopped would otherwise leave a frozen snapshot here reading as a live verdict; the bound sits inside each leg rather than beside the merged value so one live writer cannot carry a value kept from a stopped one. Read it beside `llm_upstream_refusal_kind` for which kind of refusal emptied the face: an entitlement or a spent subscription repairs on the account and no amount of waiting reaches it, while a quota window comes back by itself. What this rule does not answer is whether anybody routes to that face: a face nobody calls and nobody configured reads zero on both series and is quiet here, and a face somebody calls with nothing configured reads zero on both as well, so read `llm_pool_face_upstreams` beside the business routing before deciding which face needs a member.",
+                  "face": "token 管理"
+                },
+                {
                   "name": "llm_calls_all_failing",
                   "promql": "((sum by (upstream) (changes(llm_upstream_failures_total{upstream=~\".+\",source=\"caller\"}[6h])) > 0) or (sum by (upstream) (changes(llm_upstream_client_errors_total{upstream=~\".+\"}[6h])) > 0)) unless on () (sum(changes(llm_usage_readings_total{outcome=~\"read|absent|not_asked\"}[6h])) > 0)",
                   "condition": {
@@ -3459,4 +3469,3 @@ data:
             "max_issues_per_scan": 50
           }
         }
-    

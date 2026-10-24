@@ -1534,6 +1534,12 @@ pub const DURABLE_GAUGE_HEARTBEAT: std::time::Duration = std::time::Duration::fr
 pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
     cog_core::metric_names::LLM_POOL_SIGNAL_CONNECTED,
     cog_core::metric_names::LLM_POOL_AVAILABLE,
+    // 同一个发布循环里写的，按面分开的那一行。它比池级那一行更该活得比进程久：
+    // 池级读数在「另一面还有成员」时恒为 1，真正决定请求能不能过的是这一行。
+    cog_core::metric_names::LLM_POOL_FACE_SERVING,
+    // 同一个循环里的分母：没有它，`face_serving` 的 0 分不清「成员全在拒绝窗里」
+    // 与「这一面压根没配过」，两种 0 要的修法是相反的。
+    cog_core::metric_names::LLM_POOL_FACE_UPSTREAMS,
     cog_core::metric_names::LLM_POOL_EVIDENCED_RECOVERY_UNIX,
     cog_core::metric_names::LLM_POOL_NEXT_ATTEMPT_UNIX,
     cog_core::metric_names::LLM_POOL_QUOTA_WINDOW_SECS,
@@ -4119,6 +4125,30 @@ async fn refresh_pool_state(state: &AppState) {
         .iter()
         .filter(|upstream| !state.llm_health.is_suspect(upstream))
         .count();
+    // 池级那个数是**整个池**的容量，回答不了「我要的这一面还能不能接」：一个池里
+    // 同时住着两种协议面时，anthropic 面还有一家健康、openai 面一家都不剩，池级
+    // `available` 读 1，而每一次 /v1/chat/completions 都在熔断处被拒。2026-10-24 的
+    // 现场就是这样：续跑循环按 `available` 判「窗口开了」，一轮轮起跑、一轮轮零产出。
+    // 所以每个请求面各自报一行，判法与请求路同用一个 `serves_face`。
+    for (face, members, up) in face_capacity(upstreams, |u| state.llm_health.is_suspect(u)) {
+        // 分母先写：「这一面有几家」与「还能接几家」是两个人读同一格时要分开的两件事。
+        // 只写后者时，一个 0 既可能是成员全在拒绝窗里，也可能是这一面从没配过，而
+        // 前者的修法是等、后者的修法是配。
+        record_gauge(
+            state,
+            cog_core::metric_names::LLM_POOL_FACE_UPSTREAMS,
+            members as f64,
+            &[("face", face)],
+        )
+        .await;
+        record_gauge(
+            state,
+            cog_core::metric_names::LLM_POOL_FACE_SERVING,
+            up as f64,
+            &[("face", face)],
+        )
+        .await;
+    }
     let floor = cog_core::pool_floor(upstreams.len(), state.config.llm_pool_min_healthy);
     let below_floor = serving < floor;
     let recovered = state.pool_recovered.swap(false, Ordering::SeqCst);
@@ -4880,6 +4910,31 @@ fn serves_face(upstream_style: &str, requested: &str) -> bool {
     }
 }
 
+/// 池里每一个请求面此刻各有几家配着、几家能接（后者＝不在嫌疑窗内的家数）。
+///
+/// 面是**请求**的面，不是上游条目的面：一个在 `/responses` 上实证过的 OpenAI 条目
+/// 也接 `/v1/chat/completions`，所以按 [`serves_face`] 数，与请求路同一个判据。
+/// 三个面每拍都发，缺省那个 0 才是要看的数——只发有人接的那一面，另一面归零之后
+/// 序列直接消失，图上读成「没这个面」。
+///
+/// 配额那一个是分母，不是第二份读数：能接的那个 0 单独出现时答不了「是成员都被
+/// 挡住了，还是这一面从来没人配」，而这两种 0 的修法相反。
+fn face_capacity<'a>(
+    upstreams: &'a [LlmUpstream],
+    suspect: impl Fn(&LlmUpstream) -> bool,
+) -> Vec<(&'static str, usize, usize)> {
+    let faces: [&'static str; 3] = ["openai", "anthropic", cog_llm::responses::API_STYLE];
+    faces
+        .iter()
+        .map(|face| {
+            let on_face = || upstreams.iter().filter(|u| serves_face(&u.api_style, face));
+            let members = on_face().count();
+            let serving = on_face().filter(|u| !suspect(u)).count();
+            (*face, members, serving)
+        })
+        .collect()
+}
+
 async fn stream_forward(
     state: AppState,
     req: axum::extract::Request,
@@ -5005,9 +5060,13 @@ async fn stream_forward(
             // 的地方就是这一行。没有它，读者只能从"这次花了多久"反推，而那是
             // 一个会被网络抖动污染的代理量。
             refused_by_circuit = true,
+            // 被拒的是**这一面**，不是整个池：池里另一面还有健康成员时，池级
+            // available 仍是 1，而这一次请求照样回 503。少了这一格，读者会去查
+            // 一个并没有全灭的池。
+            face = style,
             retry_after_secs = retry_after,
             quota_window_secs = quota_window,
-            "LLM 上游池当前无可用上游，快速失败 503"
+            "这一面的 LLM 上游当前无可用成员，快速失败 503"
         );
         return Ok(axum::response::Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -5016,6 +5075,10 @@ async fn stream_forward(
             .body(axum::body::Body::from(
                 serde_json::json!({
                     "error": "所有 LLM 上游当前不可用",
+                    // 被拒的是哪一个协议面。加在正文字段里而不是只写进日志：
+                    // 调用侧唯一能看见的就是这段正文，而池里另一面还有健康成员时，
+                    // 「所有上游不可用」这句话本身不足以让读者判断该换面还是该等。
+                    "face": style,
                     "retry_after_seconds": retry_after,
                     // 上游自述的窗口长度（秒），没有上游报过就是 null。它与
                     // retry_after_seconds 答的是两个问题：那个是"什么时候值得再试"
@@ -12193,6 +12256,70 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 ..cfg(&[], &[])
             },
         }
+    }
+
+    /// 池里另一面还有健康成员时，池级 `available` 仍是 1，而这一面的请求照样回
+    /// 503：这两个数说的是两件事，合在一格里就会让续跑循环按 `available` 判「窗口
+    /// 开了」，一轮轮起跑、一轮轮零产出。
+    ///
+    /// 判据落在**面**上而不是**池**上，所以这个用例把两家摆成两个面：openai 那家
+    /// 在嫌疑窗里，anthropic 那家健康。
+    #[tokio::test]
+    async fn a_face_with_no_serving_member_reads_zero_while_the_pool_reads_available() {
+        let mut openai = stub_upstream("https://openai.example.com", "m1");
+        openai.api_style = "openai".into();
+        let mut anthropic = stub_upstream("https://anthropic.example.com", "m2");
+        anthropic.api_style = "anthropic".into();
+        let state = test_state(vec![openai.clone(), anthropic.clone()]);
+        state.llm_health.note_failure(
+            &openai,
+            300,
+            Some(Utc::now().timestamp() + 3600),
+            Some(3600),
+            Some(RefusalKind::QuotaCycle),
+        );
+
+        refresh_pool_state(&state).await;
+
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            text.contains(r#"llm_pool_available 1"#),
+            "the pool as a whole still has a member that can take a request — that is \
+             what the pool-wide series answers, and it has to keep answering it:\n{text}"
+        );
+        assert!(
+            text.contains(r#"llm_pool_face_serving{face="openai"} 0"#),
+            "the face this pool cannot serve must read 0, not be missing and not be 1:\n{text}"
+        );
+        assert!(
+            text.contains(r#"llm_pool_face_serving{face="anthropic"} 1"#),
+            "the face that still has a member must read 1:\n{text}"
+        );
+        assert!(
+            text.contains(r#"llm_pool_face_serving{face="openai-responses"} 0"#)
+                || text.contains(r#"llm_pool_face_serving{face="responses"} 0"#),
+            "a face nobody serves is published at zero every pass; a vanished series \
+             reads as a face that was never configured:\n{text}"
+        );
+        // 分母与分子成对：openai 那一面**配着一家、能接零家**，说明这个 0 是拒绝窗造
+        // 成的；第三个面两个都是 0，说明它压根没配过。少了分母这两个 0 长得一模一样。
+        assert!(
+            text.contains(r#"llm_pool_face_upstreams{face="openai"} 1"#),
+            "the openai face is configured with one upstream, so its serving count of 0 \
+             must read as a refusal window rather than an empty face:\n{text}"
+        );
+        assert!(
+            text.contains(r#"llm_pool_face_upstreams{face="anthropic"} 1"#),
+            "the anthropic face is configured with one upstream:\n{text}"
+        );
+        let responses_zero = text.contains(r#"llm_pool_face_upstreams{face="openai-responses"} 0"#)
+            || text.contains(r#"llm_pool_face_upstreams{face="responses"} 0"#);
+        assert!(
+            responses_zero,
+            "a face nothing is configured for publishes a configured count of 0 -- the \
+             denominator is what tells that 0 apart from a face whose members are all \
+             in a refusal window:\n{text}"
+        );
     }
 
     /// 本地桩上游：固定状态码 + 固定 body 的 /chat/completions。

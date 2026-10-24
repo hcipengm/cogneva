@@ -1414,6 +1414,31 @@ const GAUGE_HELP: &[(&str, &str)] = &[
         "Whether any LLM upstream is usable, 1 or 0",
     ),
     (
+        "llm_pool_face_serving",
+        "How many upstreams can take one request face right now, per face. \
+         The pool-wide `llm_pool_available` answers a different question and \
+         cannot stand in for this one: a pool may hold members of several \
+         protocol faces, and a face with no usable member refuses every request \
+         on it while the pool as a whole still reads available. All three faces \
+         are published every pass, so a face that lost its last member reads 0 \
+         instead of disappearing from the exposition -- a vanished series reads \
+         as a face nobody ever configured. Read it beside \
+         `llm_pool_face_upstreams`: 0 serving with a configured count above 0 \
+         is a face whose members are all in a refusal window, while 0 beside 0 \
+         is a face nothing was ever configured for, and the two need different \
+         repairs",
+    ),
+    (
+        "llm_pool_face_upstreams",
+        "How many upstreams are configured for one request face, per face, \
+         whatever their health. It is the denominator of \
+         `llm_pool_face_serving` and exists so a reader can tell a face that \
+         lost its members from a face that never had any: both publish a \
+         serving count of 0, and only this series says which one is being read. \
+         Counted by the same face predicate the request path uses, so an \
+         upstream that answers two faces counts on both",
+    ),
+    (
         "llm_pool_signal_connected",
         "Whether the last attempt to publish the pool verdict to Redis \
          succeeded, 1 or 0. The gateway is the only process holding upstream \

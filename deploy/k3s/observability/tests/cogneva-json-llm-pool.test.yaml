@@ -26,6 +26,7 @@ rule_files:
 # rule: llm_spend_reading_is_blind
 # rule: llm_upstream_refusal_that_waiting_cannot_repair
 # rule: llm_pool_down_on_a_quota_cycle
+# rule: llm_pool_face_without_a_serving_member
 # rule: llm_calls_all_failing
 # rule: llm_pool_signal_undelivered
 # rule: llm_usage_upstream_silent
@@ -533,4 +534,131 @@ tests:
     alert_rule_test:
       - eval_time: 480m
         alertname: llm_pool_down_on_a_quota_cycle
+        exp_alerts: []
+
+  # 一面配着一家、那一家在拒绝窗里，而池级读数说可用（另一面还有健康成员）：亮。
+  # 这是 2026-10-24 的形状——池级 `available` 读 1，这一面的每一次请求都在熔断处
+  # 回 503，续跑循环按池级读数判「窗口开了」，一轮轮起跑、一轮轮零产出。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_face_upstreams{face="openai"}'
+        values: '1x60'
+      - series: 'llm_pool_face_upstreams_observed_timestamp_seconds{face="openai"}'
+        values: '3500x60'
+      - series: 'llm_pool_face_serving{face="openai"}'
+        values: '0x60'
+      - series: 'llm_pool_face_serving_observed_timestamp_seconds{face="openai"}'
+        values: '3500x60'
+      # 另一面还活着：池级那一格正因为这一面才读 1。
+      - series: 'llm_pool_face_upstreams{face="anthropic"}'
+        values: '1x60'
+      - series: 'llm_pool_face_upstreams_observed_timestamp_seconds{face="anthropic"}'
+        values: '3500x60'
+      - series: 'llm_pool_face_serving{face="anthropic"}'
+        values: '1x60'
+      - series: 'llm_pool_face_serving_observed_timestamp_seconds{face="anthropic"}'
+        values: '3500x60'
+      - series: 'llm_pool_available'
+        values: '1x60'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_face_without_a_serving_member
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              face: openai
+
+  # 同一个仓库里还有一个**没配过**的面：两个数都是 0。不归这条问——它守的是
+  # 分母那半条腿，删掉 `> 0`，每一个没用到的协议面都会常年亮着。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_face_upstreams{face="openai"}'
+        values: '1x60'
+      - series: 'llm_pool_face_upstreams_observed_timestamp_seconds{face="openai"}'
+        values: '3500x60'
+      - series: 'llm_pool_face_serving{face="openai"}'
+        values: '1x60'
+      - series: 'llm_pool_face_serving_observed_timestamp_seconds{face="openai"}'
+        values: '3500x60'
+      - series: 'llm_pool_face_upstreams{face="openai-responses"}'
+        values: '0x60'
+      - series: 'llm_pool_face_upstreams_observed_timestamp_seconds{face="openai-responses"}'
+        values: '3500x60'
+      - series: 'llm_pool_face_serving{face="openai-responses"}'
+        values: '0x60'
+      - series: 'llm_pool_face_serving_observed_timestamp_seconds{face="openai-responses"}'
+        values: '3500x60'
+      - series: 'llm_pool_available'
+        values: '1x60'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_face_without_a_serving_member
+        exp_alerts: []
+
+  # 同样一面全灭，但池自己已经说不可用了：那是池掉线，归别的规则问。这一格守着
+  # 「池可用」那条腿，少了它，一次池级故障会被两条规则各答一遍。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_face_upstreams{face="openai"}'
+        values: '1x60'
+      - series: 'llm_pool_face_upstreams_observed_timestamp_seconds{face="openai"}'
+        values: '3500x60'
+      - series: 'llm_pool_face_serving{face="openai"}'
+        values: '0x60'
+      - series: 'llm_pool_face_serving_observed_timestamp_seconds{face="openai"}'
+        values: '3500x60'
+      - series: 'llm_pool_available'
+        values: '0x60'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_face_without_a_serving_member
+        exp_alerts: []
+
+  # 面那一格是八小时前写的：写者早停了，存储永远服务最后一行。不是当前状态，静
+  # ——这一格守着两条新鲜度腿。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_face_upstreams{face="openai"}'
+        values: '1x480'
+      - series: 'llm_pool_face_upstreams_observed_timestamp_seconds{face="openai"}'
+        values: '0x480'
+      - series: 'llm_pool_face_serving{face="openai"}'
+        values: '0x480'
+      - series: 'llm_pool_face_serving_observed_timestamp_seconds{face="openai"}'
+        values: '0x480'
+      - series: 'llm_pool_available'
+        values: '1x480'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '27500x480'
+    alert_rule_test:
+      - eval_time: 480m
+        alertname: llm_pool_face_without_a_serving_member
+        exp_alerts: []
+
+  # 分母那一格是新鲜的、能接那一格停在很久以前：两条腿各有自己的新鲜度界，因为它们是
+  # 两次独立写。少了能接那一格自己的界，一个停止刷新的 `serving` 会被读成「这一面从此
+  # 一家都接不了」，而它只是没人写。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_face_upstreams{face="openai"}'
+        values: '1x60'
+      - series: 'llm_pool_face_upstreams_observed_timestamp_seconds{face="openai"}'
+        values: '3500x60'
+      - series: 'llm_pool_face_serving{face="openai"}'
+        values: '0x60'
+      - series: 'llm_pool_face_serving_observed_timestamp_seconds{face="openai"}'
+        values: '0x60'
+      - series: 'llm_pool_available'
+        values: '1x60'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_face_without_a_serving_member
         exp_alerts: []
