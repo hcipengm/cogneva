@@ -17,6 +17,16 @@ use crate::{
     AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, Usage,
 };
 
+/// The chat endpoint a base URL names.
+///
+/// Same rule as the Anthropic side: the platform appends exactly one path
+/// element, so the base carries everything before it (`…/v1`,
+/// `…/api/paas/v4`, `…/compatible-mode/v1`). A base that stops short of the
+/// version segment composes an address the vendor does not serve.
+pub fn chat_completions_url(base_url: &str) -> String {
+    format!("{}/chat/completions", base_url.trim_end_matches('/'))
+}
+
 /// Per-index accumulator for a streaming tool call. OpenAI-compatible SSE
 /// deltas carry an explicit `index` because one turn can contain several
 /// parallel tool calls; chunks for distinct calls must never share a buffer.
@@ -467,7 +477,7 @@ impl LLMProvider for OpenAIProvider {
             body
         };
 
-        let url = format!("{}/chat/completions", model.base_url);
+        let url = chat_completions_url(&model.base_url);
         let raw_logger = options.raw_logger.clone();
 
         tokio::spawn(async move {

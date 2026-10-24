@@ -11,6 +11,19 @@ use crate::{
     model::Model, AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, Usage,
 };
 
+/// The messages endpoint a base URL names.
+///
+/// The version segment belongs to the base URL, because this is the only path
+/// the platform appends. Every base therefore has to carry whatever precedes
+/// `/messages` in its vendor's documented endpoint:
+/// `https://api.anthropic.com/v1` for Anthropic itself,
+/// `https://api.deepseek.com/anthropic/v1` for a compatible one. A base that
+/// leaves it out composes an address that never existed, and the refusal reads
+/// as a rejected key rather than as a wrong address.
+pub fn messages_url(base_url: &str) -> String {
+    format!("{}/messages", base_url.trim_end_matches('/'))
+}
+
 pub struct AnthropicProvider {
     client: Option<Arc<dyn cog_core::HttpClient>>,
     model: Model,
@@ -204,7 +217,7 @@ impl LLMProvider for AnthropicProvider {
         let body = self.build_request_body(messages, options);
         let abort_signal = options.abort_signal.clone();
 
-        let url = format!("{}/messages", model.base_url);
+        let url = messages_url(&model.base_url);
         let raw_logger = options.raw_logger.clone();
 
         tokio::spawn(async move {

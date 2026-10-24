@@ -619,6 +619,22 @@ enum ApiStyleProbe {
 ///
 /// 拒绝服务不整单判死（见 `ApiStyleProbe::Refused`），只有「两个协议面都
 /// 没有该端点」或「连不上」才拒收。前端仍可带 skip_verify 直接采信首猜。
+/// The address a protocol face is probed at.
+///
+/// Composed by the same functions the runtime uses, not by a second copy of
+/// the rule. A probe that checks one address and a client that calls another
+/// accepts a configuration that then fails every request, and the failure
+/// reads as a wrong key rather than as a wrong address: this used to probe
+/// `{base}/v1/messages` while the provider called `{base}/messages`, so an
+/// Anthropic entry saved as `https://api.anthropic.com` passed the wizard and
+/// 404'd in production.
+fn protocol_probe_url(style: &str, base_url: &str) -> String {
+    match style {
+        "openai" => cog_llm::openai::chat_completions_url(base_url),
+        _ => cog_llm::anthropic::messages_url(base_url),
+    }
+}
+
 async fn detect_api_style(
     base_url: &str,
     model: &str,
@@ -645,7 +661,7 @@ async fn detect_api_style(
         let result = match style {
             "openai" => {
                 client
-                    .post(format!("{base}/chat/completions"))
+                    .post(protocol_probe_url(style, base))
                     .bearer_auth(api_key)
                     .json(&json!({
                         "model": model,
@@ -657,7 +673,7 @@ async fn detect_api_style(
             }
             _ => {
                 client
-                    .post(format!("{base}/v1/messages"))
+                    .post(protocol_probe_url(style, base))
                     .header("x-api-key", api_key)
                     .header("anthropic-version", "2023-06-01")
                     .json(&json!({
@@ -704,7 +720,10 @@ async fn detect_api_style(
         return ApiStyleProbe::Invalid(message);
     }
     ApiStyleProbe::Invalid(format!(
-        "{base_url} 上没有可用的协议端点（两种协议面都返回 404），请检查 base_url 是否为不带 /chat/completions 的根地址"
+        "{base_url} 上没有可用的协议端点（两种协议面都返回 404）。base_url 要写到\n\
+         版本段为止、不要写到最后的资源段：平台只往后接 `/chat/completions`（OpenAI 兼容）\n\
+         或 `/messages`（Anthropic），所以 Anthropic 官方地址是 https://api.anthropic.com/v1，\n\
+         DeepSeek 的 Anthropic 面是 https://api.deepseek.com/anthropic/v1"
     ))
 }
 
@@ -925,8 +944,77 @@ impl KubeClient {
 mod tests {
     use super::{
         apiserver_denies_ownership, classify_probe, classify_temperature_probe,
-        classify_usage_probe, ProbeOutcome,
+        classify_usage_probe, protocol_probe_url, ProbeOutcome,
     };
+
+    /// 向导里每个预设的 base_url，拼出来必须是各家文档给出的那个端点。
+    ///
+    /// 这条判据盯的是**地址的形状**：平台只往后接最后一段，版本段因此属于
+    /// base_url。少一段的写法能过旧探测（它自己补 `/v1`）却在运行时 404，
+    /// 读起来像密钥不对。预设值改错、或者有人把拼法改成别的形状，这里当场红。
+    #[test]
+    fn each_vendor_preset_composes_the_endpoint_that_vendor_documents() {
+        for (style, base_url, want) in [
+            // DeepSeek 文档给的 base_url 不带 `/v1`，拼出来的就是文档示例打到的那一个。
+            (
+                "openai",
+                "https://api.deepseek.com",
+                "https://api.deepseek.com/chat/completions",
+            ),
+            (
+                "openai",
+                "https://api.openai.com/v1",
+                "https://api.openai.com/v1/chat/completions",
+            ),
+            (
+                "anthropic",
+                "https://api.anthropic.com/v1",
+                "https://api.anthropic.com/v1/messages",
+            ),
+            // Anthropic 协议的第三方面（DeepSeek 的 Anthropic 兼容端点）。
+            (
+                "anthropic",
+                "https://api.deepseek.com/anthropic/v1",
+                "https://api.deepseek.com/anthropic/v1/messages",
+            ),
+            (
+                "openai",
+                "https://api.kimi.com/coding/v1",
+                "https://api.kimi.com/coding/v1/chat/completions",
+            ),
+            (
+                "openai",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            ),
+            (
+                "openai",
+                "https://open.bigmodel.cn/api/paas/v4",
+                "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            ),
+            (
+                "openai",
+                "https://api.minimaxi.com/v1",
+                "https://api.minimaxi.com/v1/chat/completions",
+            ),
+            (
+                "openai",
+                "https://ark.cn-beijing.volces.com/api/v3",
+                "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+            ),
+        ] {
+            assert_eq!(protocol_probe_url(style, base_url), want, "{base_url}");
+        }
+    }
+
+    /// 末尾带斜杠是同一把钥匙：不许因此拼出 `//messages`。
+    #[test]
+    fn a_trailing_slash_does_not_change_the_address() {
+        assert_eq!(
+            protocol_probe_url("anthropic", "https://api.anthropic.com/v1/"),
+            protocol_probe_url("anthropic", "https://api.anthropic.com/v1")
+        );
+    }
 
     #[test]
     fn probe_outcome_follows_the_upstream_answer_not_a_status_table() {

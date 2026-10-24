@@ -13,18 +13,27 @@ interface Preset {
   api_style: string;
 }
 
+// base_url 必须是**完整前缀**，把版本段带在里面：平台自己只往后接最后一段
+// （OpenAI 兼容接 `/chat/completions`，Anthropic 接 `/messages`），不再补 `/v1`。
+// 少一段的写法（`https://api.anthropic.com`）会拼成 `/messages`——那是 404，
+// 而且错在探测之前，各家的协议探测连不上会读成「这个 key 不行」。
+// model 用各家文档当前给出的调用名，不是界面上展示的型号名。
 const PRESETS: Preset[] = [
   { label: '自定义', base_url: '', model: '', api_style: 'openai' },
   {
+    // Kimi for Coding：OpenAI 兼容面在 `/coding/v1`，Anthropic 面在 `/coding`
+    // （再拼 `/v1/messages`）。这里按平台池里在用的那一份填。
     label: 'Kimi（月之暗面）',
     base_url: 'https://api.kimi.com/coding/v1',
-    model: 'k3',
-    api_style: 'anthropic',
+    model: 'kimi-k3',
+    api_style: 'openai',
   },
   {
+    // 照文档原样：base_url 是 https://api.deepseek.com，不带 `/v1`；模型名用
+    // `deepseek-flash`（旧名 deepseek-v4-flash 已下线）。
     label: 'DeepSeek',
-    base_url: 'https://api.deepseek.com/v1',
-    model: 'deepseek-v4-flash',
+    base_url: 'https://api.deepseek.com',
+    model: 'deepseek-flash',
     api_style: 'openai',
   },
   {
@@ -35,8 +44,8 @@ const PRESETS: Preset[] = [
   },
   {
     label: 'Anthropic',
-    base_url: 'https://api.anthropic.com',
-    model: 'claude-opus-5',
+    base_url: 'https://api.anthropic.com/v1',
+    model: 'claude-opus-5-5',
     api_style: 'anthropic',
   },
   {
@@ -60,7 +69,7 @@ const PRESETS: Preset[] = [
   {
     label: '豆包（火山方舟）',
     base_url: 'https://ark.cn-beijing.volces.com/api/v3',
-    model: 'doubao-seed-evolving',
+    model: 'doubao-seed-2-1-pro-260628',
     api_style: 'openai',
   },
   {

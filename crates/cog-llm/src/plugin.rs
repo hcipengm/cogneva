@@ -104,7 +104,9 @@ pub fn default_model_for(provider: crate::Provider) -> crate::Model {
             name: "Claude Sonnet 4.7".into(),
             api: ApiType::AnthropicMessages,
             provider,
-            base_url: "https://api.anthropic.com".into(),
+            // 版本段在 base 里：`AnthropicProvider` 只往后接 `/messages`，
+            // 少一段就是 `https://api.anthropic.com/messages`——那个地址不存在。
+            base_url: "https://api.anthropic.com/v1".into(),
             context_window: 200_000,
             max_tokens: 4096,
             supports_tools: true,
