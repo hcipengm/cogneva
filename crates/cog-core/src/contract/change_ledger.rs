@@ -1319,6 +1319,17 @@ pub struct BlockCensus {
     /// measurement. `None` when nothing in it is owed or every owed row has
     /// been measured: the two are different facts and neither is zero.
     pub oldest_unmeasured_secs: Option<u64>,
+    /// How long since anything in this face moved: the newest of its rows'
+    /// first-seen, measured and landed stamps. `None` only for a face with no
+    /// rows, which is `none` on an account holding nothing at all -- a face the
+    /// census reports always has rows behind it.
+    ///
+    /// This is what separates a heading that is finished from one that is
+    /// between jobs: both hold no live row, and only this says for how long.
+    /// Measured rather than counted from passes, because a process that
+    /// restarted would otherwise forget the count and one that replayed would
+    /// invent it.
+    pub newest_activity_secs: Option<u64>,
 }
 
 /// What one dispatch pass did, and the closed reason it did only that much.

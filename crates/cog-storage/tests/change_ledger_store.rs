@@ -1572,6 +1572,68 @@ async fn the_face_census_reads_a_number_for_the_age_and_three_buckets_that_add_u
     cleanup(&pool, &marker).await;
 }
 
+/// How long a face has been idle is measured, not inferred from the passes.
+///
+/// A face is proposed for retirement when nothing in it has moved for a period,
+/// and the two ways to answer "for how long" are a counter in the loop and a
+/// stamp in the account. The counter is the wrong one twice: it forgets on
+/// restart, so a face that has been dead for a week reads as newly dead after
+/// every rollout, and it counts passes rather than time, so a loop that fell
+/// behind reads as a longer silence than the account actually had. This checks
+/// the measurement exists and is a number -- the idle rule itself is unit-tested
+/// where it is decided.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_face_reports_how_long_ago_anything_in_it_moved() {
+    let _folder_lock = folder_lock().await;
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "idle");
+    let face = ChangeBlock::named("infra_probe_idle").expect("a face name");
+
+    store
+        .declare(&[ChangeReading {
+            identity: id.clone(),
+            title: Some("a change that has just been filed".into()),
+            assertion: None,
+            source: ChangeSource {
+                doc: format!("{marker}.md"),
+                verdict: None,
+                priority: ChangePriority::Unstated,
+                block: face.clone(),
+            },
+        }])
+        .await
+        .expect("queue the declaration");
+    store
+        .fold_declarations(10_000, Some("probe-rev-idle"))
+        .await
+        .expect("fold the declaration in");
+
+    let census = store
+        .block_census()
+        .await
+        .expect("read the face census")
+        .expect("a Postgres store answers the census");
+    let row = census
+        .iter()
+        .find(|row| row.block == face)
+        .unwrap_or_else(|| panic!("the face just filed under is counted: {census:?}"));
+    let idle = row.newest_activity_secs.unwrap_or_else(|| {
+        panic!(
+            "a face with a row that has just been folded has a measurable idle time; \
+             `None` here is the column failing to decode, and it reads at the \
+             retirement rule as `never moved`, which never proposes anything: {row:?}"
+        )
+    });
+    assert!(
+        idle < 3600,
+        "the row was folded a moment ago, so the newest movement in the face is \
+         seconds old: {idle}"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
 /// A face the code has never heard of is filed and counted by naming it.
 ///
 /// The census used to be a list of the faces the service carried, so a face

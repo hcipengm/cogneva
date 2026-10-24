@@ -456,7 +456,10 @@ SELECT block, \
                   ELSE 'owed' END AS state, \
        count(*) AS n, \
        max(EXTRACT(EPOCH FROM (now() - COALESCE(measured_at, first_seen_at))))::float8 \
-         AS oldest_unmeasured_secs \
+         AS oldest_unmeasured_secs, \
+       min(EXTRACT(EPOCH FROM (now() - GREATEST(COALESCE(measured_at, first_seen_at), \
+                                                COALESCE(landed_at, first_seen_at)))))::float8 \
+         AS newest_activity_secs \
   FROM change_ledger \
  GROUP BY 1, 2";
 
@@ -1340,11 +1343,25 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // row's measurement stopped being owed work the moment it landed -- and
         // is `NULL` when every owed row in the face has been measured, which is
         // a different answer from zero seconds.
+        //
+        // Beside it, the age of the newest movement anywhere in the face, from
+        // the same rows and the same pass. The two answer different questions: a
+        // face can owe work it has not measured for a week while having been
+        // filed into an hour ago, and a face that holds nothing live is only
+        // finished rather than between jobs if nothing in it has moved for a
+        // while. Measured here rather than counted by the pass, because a
+        // counter would be forgotten by a restart and would count ticks rather
+        // than time.
         let rows = sqlx::query(BLOCK_CENSUS_SQL)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("read block census: {e}")))?;
-        let mut counted: Vec<(String, String, i64, Option<f64>)> = Vec::with_capacity(rows.len());
+        // Per (face, bucket) row: the count, the oldest unmeasured age among
+        // the owed rows, and the age of the newest movement in the bucket. The
+        // face's own newest movement is the smallest of those ages, since the
+        // age counts backwards from now.
+        let mut counted: Vec<(String, String, i64, Option<f64>, Option<f64>)> =
+            Vec::with_capacity(rows.len());
         for row in &rows {
             counted.push((
                 row.try_get("block")
@@ -1355,11 +1372,13 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                     .map_err(|e| SFError::Database(format!("n: {e}")))?,
                 row.try_get("oldest_unmeasured_secs")
                     .map_err(|e| SFError::Database(format!("oldest_unmeasured_secs: {e}")))?,
+                row.try_get("newest_activity_secs")
+                    .map_err(|e| SFError::Database(format!("newest_activity_secs: {e}")))?,
             ));
         }
         let mut names: Vec<&str> = counted
             .iter()
-            .map(|(block, _, _, _)| block.as_str())
+            .map(|(block, _, _, _, _)| block.as_str())
             .collect();
         names.sort_unstable();
         names.dedup();
@@ -1370,37 +1389,45 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         for name in names {
             let landed = counted
                 .iter()
-                .filter(|(found, state, _, _)| found == name && state == "landed")
-                .map(|(_, _, n, _)| *n)
+                .filter(|(found, state, _, _, _)| found == name && state == "landed")
+                .map(|(_, _, n, _, _)| *n)
                 .sum::<i64>();
             let owed = counted
                 .iter()
-                .filter(|(found, state, _, _)| {
+                .filter(|(found, state, _, _, _)| {
                     found == name && state != "landed" && state != "retired"
                 })
-                .map(|(_, _, n, _)| *n)
+                .map(|(_, _, n, _, _)| *n)
                 .sum::<i64>();
             let retired = counted
                 .iter()
-                .filter(|(found, state, _, _)| found == name && state == "retired")
-                .map(|(_, _, n, _)| *n)
+                .filter(|(found, state, _, _, _)| found == name && state == "retired")
+                .map(|(_, _, n, _, _)| *n)
                 .sum::<i64>();
             let oldest = counted
                 .iter()
-                .filter(|(found, state, _, _)| {
+                .filter(|(found, state, _, _, _)| {
                     found == name && state != "landed" && state != "retired"
                 })
-                .filter_map(|(_, _, _, secs)| *secs)
+                .filter_map(|(_, _, _, secs, _)| *secs)
                 .fold(None::<f64>, |acc, secs| {
                     Some(acc.map_or(secs, |a| a.max(secs)))
                 });
-            let block = ChangeBlock::named(name).map_err(|e| SFError::Database(format!("{e}")))?;
+            let newest = counted
+                .iter()
+                .filter(|(found, _, _, _, _)| found == name)
+                .filter_map(|(_, _, _, _, secs)| *secs)
+                .fold(None::<f64>, |acc, secs| {
+                    Some(acc.map_or(secs, |a| a.min(secs)))
+                });
+            let block = ChangeBlock::named(name).map_err(|e| SFError::Database(e.clone()))?;
             census.push(BlockCensus {
                 block,
                 landed: landed.max(0) as u64,
                 owed: owed.max(0) as u64,
                 retired: retired.max(0) as u64,
                 oldest_unmeasured_secs: oldest.map(|secs| secs.max(0.0) as u64),
+                newest_activity_secs: newest.map(|secs| secs.max(0.0) as u64),
             });
         }
         Ok(Some(census))

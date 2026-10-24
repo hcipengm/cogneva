@@ -1,4 +1,4 @@
-//! principle: feedback_a_closed_set_copied_into_sql_drifts_from_the_one_that_validates_it
+//! principle: feedback_a_copied_closed_set_reveals_additions_but_not_redefinitions
 //!
 //! The face a change is filed under used to be a closed set living in three
 //! places that cannot import each other: a variant list in the service, an `IN`

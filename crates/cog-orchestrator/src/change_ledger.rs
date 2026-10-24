@@ -3443,6 +3443,7 @@ async fn dispatch_pass(
     }
     record_dispatch_state(
         store,
+        &**orchestrator,
         metrics,
         &verdict,
         pending.len(),
@@ -4225,9 +4226,17 @@ async fn publish_write_windows(
 /// one per collaborator: a struct here would restate the row's shape in a type
 /// that exists only to hold it, and the next column would then have to be added
 /// in two places.
+///
+/// This also asks the account the two questions its per-face census can answer
+/// with an action -- name a face for the unclaimed work, retire one that has
+/// held nothing for a period -- because the census is read here. Reading it a
+/// second time for them would be two snapshots of one account taken a moment
+/// apart, and a finding published from one while the ask is computed from the
+/// other is a reader's disagreement waiting to happen.
 #[allow(clippy::too_many_arguments)]
 async fn record_dispatch_state(
     store: &dyn ChangeLedgerStore,
+    orchestrator: &dyn OrchestratorControl,
     metrics: Option<&Arc<dyn MetricsBackend>>,
     verdict: &PoolVerdict,
     pending: usize,
@@ -4400,6 +4409,12 @@ async fn record_dispatch_state(
         }
     };
     publish_block_census(metrics, blocks.as_deref()).await;
+    // The census says where the account's headings stand; these are the two
+    // questions it can answer with an action. Asked from the pass that already
+    // holds the seat and has just read the census, so the finding and the ask
+    // come from one reading rather than from two that can disagree.
+    crate::face_lifecycle::dispatch_face_lifecycle(orchestrator, blocks.as_deref(), Utc::now())
+        .await;
     publish_dispatch_verdict(metrics, &state).await;
 }
 

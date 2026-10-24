@@ -61,15 +61,22 @@ pub const FACE_DRIFT_METRIC: &str = "cogneva_governance_face_state";
 /// Public so a test can assert the shape without running a pass, and so the
 /// reader of a task id can tell what produced it.
 pub fn gap_goal_id(face_id: &str, state: &str, day: &str) -> String {
-    // The id travels through the graph as a task id, so it has to be an ASCII
-    // task id. Folding every unsafe character to a dash would not do: face ids
-    // are written in whatever language names them, and two names that differ
-    // only in characters outside `[a-z0-9_-]` would fold to one id -- one
-    // face's daily remediation would then be refused as already submitted
-    // because another face had submitted one. Each unsafe character is escaped
-    // to its code point instead, under a marker no literal character can
-    // produce, so the mapping is injective.
-    let face: String = face_id
+    format!("face-gap-{}-{state}-{day}", face_slug(face_id))
+}
+
+/// A face id as it can travel inside a task id.
+///
+/// The id travels through the graph as a task id, so it has to be an ASCII task
+/// id. Folding every unsafe character to a dash would not do: face ids are
+/// written in whatever language names them, and two names that differ only in
+/// characters outside `[a-z0-9_-]` would fold to one id -- one face's daily
+/// remediation would then be refused as already submitted because another face
+/// had submitted one. Each unsafe character is escaped to its code point
+/// instead, under a marker no literal character can produce, so the mapping is
+/// injective. Shared with the lifecycle goals so that two ids naming one face
+/// are escaped the same way rather than by two rules that agree today.
+pub fn face_slug(face_id: &str) -> String {
+    face_id
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -78,8 +85,7 @@ pub fn gap_goal_id(face_id: &str, state: &str, day: &str) -> String {
                 format!("~{code:x}", code = c as u32)
             }
         })
-        .collect();
-    format!("face-gap-{face}-{state}-{day}")
+        .collect()
 }
 
 /// The text a red face is handed to the planner with.
