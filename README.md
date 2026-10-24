@@ -636,7 +636,7 @@ The change ledger, the per-face readings and the alerts are all derived from the
 Written down rather than left to be discovered:
 
 - **Declared quota is not enforced.** The hierarchy of limits is configurable and the check runs at submission, but nothing records today's usage into those levels, so the check cannot block anything today. A deployment that needs a hard spend ceiling must enforce it upstream of the platform.
-- **Alerts reach the in-app bell, not the outside world, until you configure an outlet.** With no channel configured, a firing alert is a row and a badge; nothing is emailed or paged.
+- **Alerts are delivered to the WebUI panel, not to the outside world.** The panel is the delivery surface: a firing alert is a row with its own badge and an inbox that keeps it until someone marks it seen. Email, Slack and webhook outlets are optional add-ons on top, and stay silent until an address is configured.
 - **There is no diagnosis command and no support bundle.** The readings are the surfaces (metrics, alerts, the task graph); collecting them is left to the operator's own tooling.
 - **The WebUI observes; it does not submit work.** It shows the task graph, the agents, the alerts and token spend, and it talks to running agents. Goals are submitted through the API above.
 
@@ -725,7 +725,7 @@ For manual compilation: `cargo build --release`. Container image: see `Dockerfil
 
 - **Namespaces partition data, they are not an authorization boundary.** A namespace scopes memory and task storage; the platform does not authenticate a caller *as* a tenant and does not enforce namespace-level access control.
 - **Neither quota enforcement nor billing reaches the request path.** The `cog-quota` crate is initialised in the application process and publishes its pre-check counter (`quota_pre_checks_total`; on 2026-10-20 both `allowed=true` and `allowed=false` read 0, i.e. no pre-check has ever run on a real request), but there is no tenant dimension and no metering or invoicing component.
-- **Alert delivery needs an outlet you provide.** Alert rules and the `alerts` table ship with the platform; notification channels (email, Slack, generic webhook) are empty until configured, and nothing is sent until then.
+- **Alert delivery is the WebUI panel.** Rules and the `alerts` table ship with the platform, and every firing alert appears in the panel with its own inbox entry; that surface needs no address. Outbound channels (email, Slack, generic webhook) are optional and stay empty until configured.
 - **Upgrade and rollback are not yet exercised end-to-end in production.** The live deployments so far were delivered by manifest apply and image rollouts; run `helm upgrade` / `helm rollback` on a staging cluster before depending on them for a production upgrade.
 
 ---
