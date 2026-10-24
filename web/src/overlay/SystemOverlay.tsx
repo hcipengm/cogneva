@@ -16,12 +16,13 @@ import type {
  * 什么都没有。
  */
 
-type Tab = 'activity' | 'faces' | 'tasks' | 'backends' | 'eval';
+type Tab = 'activity' | 'faces' | 'tasks' | 'backends' | 'governance' | 'eval';
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'activity', label: '活动' },
   { key: 'faces', label: '面与读数' },
   { key: 'tasks', label: '任务' },
+  { key: 'governance', label: '治理与演化' },
   { key: 'backends', label: '资源与后端' },
   { key: 'eval', label: '评估' },
 ];
@@ -412,6 +413,68 @@ function BackendsPanel() {
   );
 }
 
+function GovernancePanel() {
+  const { supervisor, evolution } = useSystemSurfaceContext();
+  const s = supervisor.data;
+  const e = evolution.data;
+
+  const tile = (label: string, value: number | string, cls: string) => (
+    <div key={label} className="rounded-lg bg-slate-900/60 px-3 py-2">
+      <div className="text-xs text-slate-500">{label}</div>
+      <div className={`text-lg tabular-nums ${cls}`}>{value}</div>
+    </div>
+  );
+
+  return (
+    <div className="space-y-4">
+      <Panel
+        title="在岗与调度"
+        subtitle="监管者每轮巡检的结论。四个数分开计：健康、失联、可疑、卡住是四种不同的处置。"
+      >
+        <div className="mb-3 space-y-2">
+          <BucketNote bucket={supervisor} what="监管者状态" />
+        </div>
+        {s && (
+          <>
+            <div className="grid grid-cols-4 gap-2">
+              {tile('健康', s.healthy_agents, 'text-emerald-300')}
+              {tile('失联', s.dead_agents, s.dead_agents > 0 ? 'text-red-400' : 'text-slate-400')}
+              {tile('可疑', s.suspect_agents, s.suspect_agents > 0 ? 'text-amber-400' : 'text-slate-400')}
+              {tile('卡住', s.stuck_agents, s.stuck_agents > 0 ? 'text-amber-400' : 'text-slate-400')}
+            </div>
+            <p className="mt-3 text-xs text-slate-500">
+              第 {s.cycle} 轮 · 待接管 {s.pending_handoffs} · 调度器
+              {s.scheduler_paused ? (
+                <span className="ml-1 text-amber-400">已暂停</span>
+              ) : (
+                <span className="ml-1 text-emerald-400">在跑</span>
+              )}
+              {' · '}上次发出再平衡计划 {stamp(s.last_plan_emitted_at)}
+            </p>
+            <p className="mt-1 text-xs text-slate-600">
+              读于 {stamp(s.timestamp)}。这一格是每次请求现算的，不是上一轮的存值。
+            </p>
+          </>
+        )}
+      </Panel>
+
+      <Panel title="演化与变更" subtitle="平台登记的累计计数；它们只增不减，用来对账而不是看趋势。">
+        <div className="mb-3 space-y-2">
+          <BucketNote bucket={evolution} what="演化计数" />
+        </div>
+        {e && (
+          <div className="grid grid-cols-4 gap-2">
+            {tile('事件', e.events_total, 'text-slate-200')}
+            {tile('事件失败', e.events_failed, e.events_failed > 0 ? 'text-red-400' : 'text-slate-400')}
+            {tile('变更落地', e.changes_applied, 'text-emerald-300')}
+            {tile('变更失败', e.changes_failed, e.changes_failed > 0 ? 'text-red-400' : 'text-slate-400')}
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
 function EvalPanel() {
   const { datasets } = useSystemSurfaceContext();
   return (
@@ -547,6 +610,7 @@ export function SystemOverlay({
             {tab === 'activity' && <ActivityPanel />}
             {tab === 'faces' && <FacesPanel />}
             {tab === 'tasks' && <TasksPanel />}
+            {tab === 'governance' && <GovernancePanel />}
             {tab === 'backends' && <BackendsPanel />}
             {tab === 'eval' && <EvalPanel />}
           </div>

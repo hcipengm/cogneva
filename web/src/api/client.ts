@@ -637,6 +637,41 @@ export async function getBackendHealth(): Promise<BackendHealthMatrix> {
   return api.get<BackendHealthMatrix>('/api/v1/health/backends');
 }
 
+/**
+ * 监管者当前一轮健康巡检的结论。
+ *
+ * 四个数分开给而不是一个「健康度」：健康、失联、可疑、卡住是四种不同的
+ * 处置，合成一个数之后，读的人分不出该重启谁。
+ */
+export interface SupervisorStatus {
+  cycle: number;
+  healthy_agents: number;
+  dead_agents: number;
+  suspect_agents: number;
+  stuck_agents: number;
+  pending_handoffs: number;
+  scheduler_paused: boolean;
+  /** 上一次真的有 rebalance 计划发出去的时间；从没发过是 `null`。 */
+  last_plan_emitted_at: string | null;
+  timestamp: string;
+}
+
+export async function getSupervisorStatus(): Promise<SupervisorStatus> {
+  return api.get<SupervisorStatus>('/api/v1/supervisor/status');
+}
+
+/** 演化与变更的累计计数，来自平台自己登记的那几个指标。 */
+export interface EvolutionMetrics {
+  events_total: number;
+  events_failed: number;
+  changes_applied: number;
+  changes_failed: number;
+}
+
+export async function getEvolutionMetrics(): Promise<EvolutionMetrics> {
+  return api.get<EvolutionMetrics>('/api/v1/evolution/metrics');
+}
+
 export interface EvalDatasetInfo {
   name: string;
   path: string;

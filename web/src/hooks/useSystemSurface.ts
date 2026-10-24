@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   getBackendHealth,
+  getEvolutionMetrics,
   getGovernanceDrift,
   getGovernanceFaces,
+  getSupervisorStatus,
   getTaskSummary,
   listEvalDatasets,
   listTasks,
   type BackendHealthMatrix,
   type EvalDatasetInfo,
+  type EvolutionMetrics,
   type FaceDriftReading,
   type GovernanceFace,
+  type SupervisorStatus,
   type TaskRow,
   type TaskSummaryCounts,
 } from '@/api/client';
@@ -60,6 +64,8 @@ export function useSystemSurface({ enabled, intervalMs = 15000 }: UseSystemSurfa
   const [taskRows, setTaskRows] = useState<SurfaceBucket<TaskRow[]>>(emptyBucket);
   const [backends, setBackends] = useState<SurfaceBucket<BackendHealthMatrix>>(emptyBucket);
   const [datasets, setDatasets] = useState<SurfaceBucket<EvalDatasetInfo[]>>(emptyBucket);
+  const [supervisor, setSupervisor] = useState<SurfaceBucket<SupervisorStatus>>(emptyBucket);
+  const [evolution, setEvolution] = useState<SurfaceBucket<EvolutionMetrics>>(emptyBucket);
 
   const loadFaces = useCallback(async () => {
     setFaces((b) => ({ ...b, loading: true }));
@@ -138,13 +144,45 @@ export function useSystemSurface({ enabled, intervalMs = 15000 }: UseSystemSurfa
     }
   }, []);
 
+  const loadSupervisor = useCallback(async () => {
+    setSupervisor((b) => ({ ...b, loading: true }));
+    try {
+      const status = await getSupervisorStatus();
+      setSupervisor({
+        data: status,
+        loading: false,
+        error: null,
+        loadedAt: status.timestamp,
+      });
+    } catch (e) {
+      setSupervisor((b) => ({ ...b, loading: false, error: describeError(e, '监管者状态') }));
+    }
+  }, []);
+
+  const loadEvolution = useCallback(async () => {
+    setEvolution((b) => ({ ...b, loading: true }));
+    try {
+      const metrics = await getEvolutionMetrics();
+      setEvolution({
+        data: metrics,
+        loading: false,
+        error: null,
+        loadedAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      setEvolution((b) => ({ ...b, loading: false, error: describeError(e, '演化计数') }));
+    }
+  }, []);
+
   const refreshAll = useCallback(() => {
     void loadFaces();
     void loadDrift();
     void loadTasks();
     void loadBackends();
     void loadDatasets();
-  }, [loadFaces, loadDrift, loadTasks, loadBackends, loadDatasets]);
+    void loadSupervisor();
+    void loadEvolution();
+  }, [loadFaces, loadDrift, loadTasks, loadBackends, loadDatasets, loadSupervisor, loadEvolution]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -160,6 +198,8 @@ export function useSystemSurface({ enabled, intervalMs = 15000 }: UseSystemSurfa
     taskRows,
     backends,
     datasets,
+    supervisor,
+    evolution,
     refreshAll,
   };
 }
