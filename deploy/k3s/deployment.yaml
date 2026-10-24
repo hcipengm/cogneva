@@ -160,6 +160,9 @@ spec:
             # 角色判，零凭证的调用方恒吃 401。不经安全网关。缺这个值＝归档未配置。
             - name: COGNEVA_MEMORY_API_BASE
               value: "http://127.0.0.1:8085"
+            # 免费网页检索后端（集群内 SearXNG），与 chart 的 gateway 部署同源。
+            - name: COGNEVA_WEB_SEARCH_BASE
+              value: "http://searxng:8080"
             # git 身份自举的基线仓库（owner/name）。自举循环跑在**本进程**：
             # cogneva-secrets 的属主就是这里（WebUI 向导与贡献通道写同一份），
             # 而自举要的正是属主手里的三样东西——Secret 读写、到 GitHub 的

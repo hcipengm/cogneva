@@ -245,6 +245,9 @@ spec:
             # 端口放行，归档请求会被静默丢弃。与主应用那份同源。
             - name: COGNEVA_MEMORY_API_BASE
               value: "http://cogneva:8085"
+            # 免费网页检索后端（集群内 SearXNG），与 chart 的 evolution 部署同源。
+            - name: COGNEVA_WEB_SEARCH_BASE
+              value: "http://searxng:8080"
             # 实例身份指纹：身份的规范来源，安装期生成、升级复用。身份决定
             # `evol/<id>` 分支名与按实例命名的常驻工作树，必须跨重启与重装稳定。
             - name: COGNEVA_INSTANCE_FINGERPRINT

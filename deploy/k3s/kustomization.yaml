@@ -43,6 +43,7 @@ resources:
   - nats-deployment.yaml
   - nats-service.yaml
   - meilisearch.yaml
+  - searxng.yaml
   - seaweedfs.yaml
   - cluster-registry.yaml
   - backup-pvc.yaml

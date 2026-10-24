@@ -29,15 +29,17 @@ spec:
   hard:
     requests.cpu: "6"
     requests.memory: 12Gi
-    limits.cpu: "31"
+    limits.cpu: "32"
     # 56Gi：稳态 47.8Gi（渲染期门禁自报 45.8Gi，实测 2026-10-23；含 gateway 上限
     # 6Gi → 8Gi 抬的 2Gi）+ 判据 Job 512Mi + 运行期自建临时 Pod 3.75Gi（实测
     # 2026-10-23：eval 表 3Gi + 验收演练 768Mi）+ 替换重叠 3.4Gi（实测 2026-10-19）
     # = 55.45Gi（实测 2026-10-23 按上面几项相加）。
+    # 2026-10-24：新增 SearXNG 检索 Pod（limits 1000m / 1Gi），两维一起抬到 32 核 /
+    # 57Gi——只加工作负载不抬额度，准入会先拒掉下一次滚动 Job，而不是这个 Pod。
     # 运行期自建 Pod 不是渲染集里的工作负载，但它们的预算写在上面的注解里，
     # 渲染期门禁把预算加进同一条不等式；留不够就在渲染期红，而不是等到准入被拒、
     # 部署器每轮空转。完整算式见 chart values 的 resourceGovernance 段。
-    limits.memory: "56Gi"
+    limits.memory: "57Gi"
     pods: "40"
     requests.storage: 480Gi
 ---

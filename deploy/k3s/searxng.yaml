@@ -1,0 +1,127 @@
+# 网页检索后端（SearXNG）：`web_search` 工具问的就是这个 Service。
+#
+# 与 chart 的 templates/searxng.yaml 同源，字段级对齐由
+# deploy/scripts/check-deploy-parity.sh 校验。这里只有集群内的面：没有 Ingress，
+# Service 是 ClusterIP，NetworkPolicy 只放行进化 Pod。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: searxng-settings
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: searxng
+    app.kubernetes.io/component: search
+data:
+  settings.yml: |
+    use_default_settings: true
+    general:
+      instance_name: "cogneva"
+    server:
+      limiter: false
+      image_proxy: false
+      secret_key: "cogneva-cluster-internal-searxng"
+    search:
+      safe_search: 0
+      formats:
+        - html
+        - json
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: searxng
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: searxng
+    app.kubernetes.io/component: search
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: searxng
+      app.kubernetes.io/component: search
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: searxng
+        app.kubernetes.io/component: search
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: searxng
+          image: docker.io/searxng/searxng:2026.9.8-3fdc6d753
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: SEARXNG_SETTINGS_PATH
+              value: /etc/searxng/settings.yml
+          volumeMounts:
+            - name: settings
+              mountPath: /etc/searxng
+              readOnly: true
+            - name: cache
+              mountPath: /var/cache/searxng
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+      volumes:
+        - name: settings
+          configMap:
+            name: searxng-settings
+        - name: cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: searxng
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: searxng
+    app.kubernetes.io/component: search
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: searxng
+    app.kubernetes.io/component: search
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

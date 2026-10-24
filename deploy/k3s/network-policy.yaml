@@ -68,6 +68,16 @@ spec:
         # 从外面看一样。
         - protocol: TCP
           port: 9100
+    # 网页检索后端（SearXNG，8080）：`web_search` 只问这一个地址。单独立一条而不是并进
+    # 上面的命名空间内数据面块——那一块按端口放行所有本地 Pod，8080 一并放开就等于把
+    # 主 API 的 8080 也打开，而上面那句「8080 不在这里」正是为此写的。
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: searxng
+      ports:
+        - protocol: TCP
+          port: 8080
     # 监控栈（9090）：infra_watch 按 PromQL 探测节点磁盘 / Pod OOM 等基础设施
     # 信号，查询跨命名空间落到 monitoring 命名空间的 Prometheus。
     # podSelector:{} 只匹配本命名空间，必须显式 namespaceSelector。

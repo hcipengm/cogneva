@@ -158,6 +158,10 @@ spec:
             # unconfigured 的原因。
             - name: COGNEVA_MEMORY_API_BASE
               value: "http://127.0.0.1:8085"
+            # 免费网页检索的后端（集群内 SearXNG）：本进程里的 agent 循环用它，
+            # 与进化 Pod 同源同名，少一条就有一面的 `web_search` 用不了。
+            - name: COGNEVA_WEB_SEARCH_BASE
+              value: "http://searxng:8080"
             # git 身份自举的基线仓库（owner/name）。自举循环跑在**本进程**：
             # cogneva-secrets 的属主就是这里（WebUI 向导与贡献通道写同一份），
             # 而自举要的正是属主手里的三样东西——Secret 读写、到 GitHub 的
