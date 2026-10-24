@@ -1,6 +1,7 @@
 import { AgentsView } from '@/views/AgentsView';
 import { AlertsView } from '@/views/AlertsView';
 import { ChangesView } from '@/views/ChangesView';
+import { FilesView } from '@/views/FilesView';
 import { GovernanceView } from '@/views/GovernanceView';
 import { InboxView } from '@/views/InboxView';
 import { ObservabilityView } from '@/views/ObservabilityView';
@@ -22,6 +23,8 @@ export function ViewFor({ view }: { view: string }) {
   switch (view) {
     case 'workspace':
       return <WorkspaceView />;
+    case 'files':
+      return <FilesView />;
     case 'inbox':
       return <InboxView />;
     case 'alerts':

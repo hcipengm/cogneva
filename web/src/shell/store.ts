@@ -11,6 +11,7 @@ import { create } from 'zustand';
 /** 左栏的活动项。每一项对应侧栏里的一个面板，与编辑器里的页不是一回事。 */
 export type ActivityId =
   | 'workspace'
+  | 'files'
   | 'inbox'
   | 'agents'
   | 'tasks'
@@ -23,6 +24,7 @@ export type ActivityId =
 /** 每一面在页签上写什么。切面时要能顺手开出这一页，名字就得在这里认得出。 */
 export const VIEW_TITLES: Record<ActivityId, string> = {
   workspace: '工作台',
+  files: '文件',
   inbox: '收件箱',
   agents: '智能体',
   tasks: '任务',
@@ -89,7 +91,12 @@ export const useShell = create<ShellState>((set, get) => ({
     set((state) => {
       // 点左栏 = 「我要看这一面」：侧栏展开，编辑器同步开到这一面的页上。
       // 只切侧栏不切页，会让同一个动作在窄屏上看起来什么都没发生。
-      const existing = state.tabs.find((t) => t.id === activity);
+      // 先找「这一面自己的页」，再找「认同一个视图的页」：文件面会为每个打开
+      // 的文件开一页（id 是 `file:<路径>`），点左栏时该落到最后打开的那个文件上，
+      // 而不是再开一页空的「文件」。
+      const existing =
+        state.tabs.find((t) => t.id === activity) ??
+        state.tabs.find((t) => t.view === activity);
       if (existing) {
         return { activity, sidebarVisible: true, activeTabId: existing.id };
       }

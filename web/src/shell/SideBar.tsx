@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import { FileTree } from '@/files/FileTree';
 import { useServices } from '@/shell/context';
 import { Icon, type IconName } from '@/shell/icons';
 import { useShell, type ActivityId } from '@/shell/store';
@@ -43,6 +44,7 @@ export function SideBar() {
 
 const TITLES: Record<ActivityId, string> = {
   workspace: '工作台',
+  files: '资源管理器',
   inbox: '收件箱',
   agents: '智能体',
   tasks: '任务',
@@ -124,6 +126,7 @@ function CrossLinks({ links }: { links: { id: ActivityId; label: string; note?: 
 }
 
 function ActivityPanel({ activity }: { activity: ActivityId }) {
+  if (activity === 'files') return <FileTree />;
   const setActivity = useShell((s) => s.setActivity);
   const { alerts, notifications, overview } = useServices();
   const connectionStatus = useStreamStore((s) => s.connectionStatus);

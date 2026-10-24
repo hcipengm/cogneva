@@ -49,6 +49,7 @@ pub mod governance;
 pub mod heartbeat_history;
 pub mod hook_forwarder;
 pub mod hooks;
+pub mod ide;
 pub mod knowledge;
 pub mod llm_admin;
 pub mod memory;
@@ -851,6 +852,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
 
     // Operator-level protected routes (orchestrator read / agents read / hooks read / memory read / raw_logs)
     let operator_routes = Router::new()
+        // 工作区文件面：树 / 读 / 写。写也放在这一组而不是更宽的组里，因为它落的
+        // 是磁盘——一个只能读的编辑器和没有编辑器一样，但一个谁都能写的根目录
+        // 是另一回事。路径判据在 `ide::resolve_under` 里，出根一律 403。
+        .route("/api/v1/ide/tree", get(ide::tree_handler))
+        .route("/api/v1/ide/file", get(ide::file_handler))
+        .route("/api/v1/ide/file", axum::routing::put(ide::write_handler))
         .route("/api/v1/governance/faces", get(governance::faces_handler))
         .route("/api/v1/governance/drift", get(governance::drift_handler))
         .route(

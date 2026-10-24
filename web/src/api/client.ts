@@ -58,6 +58,13 @@ export class ApiClient {
       body: JSON.stringify(body),
     });
   }
+
+  put<T>(path: string, body: unknown): Promise<T> {
+    return this.request<T>(path, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+  }
 }
 
 export const api = new ApiClient();
@@ -879,4 +886,51 @@ export interface EvolutionChangesPage {
 
 export async function getEvolutionChanges(): Promise<EvolutionChangesPage> {
   return api.get<EvolutionChangesPage>('/api/v1/evolution/changes');
+}
+
+// ── 工作区文件 ──
+
+/**
+ * 文件树里的一条。`path` 是相对用户根的路径，既当 key 也当下一页的入参：
+ * 界面上显示的是 `name`，请求里带的是 `path`，两者不能混用——同名文件在不同
+ * 目录下很常见。
+ */
+export interface WorkspaceEntry {
+  path: string;
+  name: string;
+  dir: boolean;
+  size: number;
+  modified_ms: number | null;
+}
+
+export interface WorkspaceTree {
+  path: string;
+  entries: WorkspaceEntry[];
+  /** 目录条数超过服务端上限，这里只列了前一部分。 */
+  truncated: boolean;
+}
+
+export interface WorkspaceFile {
+  path: string;
+  size: number;
+  /** 二进制文件没有正文；`text` 那时是 null。 */
+  binary: boolean;
+  truncated: boolean;
+  text: string | null;
+  modified_ms: number | null;
+}
+
+export async function getWorkspaceTree(path = ''): Promise<WorkspaceTree> {
+  return api.get<WorkspaceTree>(`/api/v1/ide/tree?path=${encodeURIComponent(path)}`);
+}
+
+export async function getWorkspaceFile(path: string): Promise<WorkspaceFile> {
+  return api.get<WorkspaceFile>(`/api/v1/ide/file?path=${encodeURIComponent(path)}`);
+}
+
+export async function saveWorkspaceFile(
+  path: string,
+  text: string
+): Promise<WorkspaceFile> {
+  return api.put<WorkspaceFile>('/api/v1/ide/file', { path, text });
 }
