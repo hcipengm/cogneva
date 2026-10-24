@@ -1842,6 +1842,77 @@ mod consumer_ack_tests {
         );
     }
 
+    /// Where a task came from is bookkeeping, not a routing fact: two tasks
+    /// that differ only in `input.source` have to be allocated the same way.
+    /// A pair that splits — one queued, one held — would mean the allocator is
+    /// reading the origin of the work, and no caller above it could undo that.
+    ///
+    /// Both directions are checked because they are the two allocations there
+    /// are: offered to the shared queue, and held for a named owner.
+    #[tokio::test]
+    async fn allocation_is_source_independent() {
+        async fn statuses_after_publish(
+            owned: bool,
+        ) -> (cog_core::TaskStatus, cog_core::TaskStatus) {
+            let backend = ScriptedBackend::default();
+            let config = DagExecutorConfig {
+                redis_url: "memory".into(),
+                workspace_id: "ws-limit-test".into(),
+                consumer_group: "grp-limit-test".into(),
+                max_retries: 1,
+                ..DagExecutorConfig::default()
+            };
+            let runtime = test_runtime_with(backend.clone(), config);
+            runtime
+                .orchestrator()
+                .submit_goal(
+                    "goal-limit",
+                    vec![
+                        ready_task("task-github", serde_json::json!({ "source": "github" })),
+                        ready_task("task-manual", serde_json::json!({ "source": "manual" })),
+                    ],
+                )
+                .await
+                .unwrap();
+            if owned {
+                for id in ["task-github", "task-manual"] {
+                    runtime
+                        .orchestrator()
+                        .assign_task(id, "unit-6e")
+                        .await
+                        .expect("a pending task takes a binding");
+                }
+            }
+            runtime.publish_ready_tasks().await.unwrap();
+            let mut got = Vec::new();
+            for id in ["task-github", "task-manual"] {
+                got.push(
+                    runtime
+                        .orchestrator()
+                        .get_task(id)
+                        .await
+                        .expect("task present")
+                        .status,
+                );
+            }
+            (got[0].clone(), got[1].clone())
+        }
+
+        let free = statuses_after_publish(false).await;
+        assert_eq!(
+            free.0, free.1,
+            "both unowned tasks go to the shared queue whatever their source: {free:?}"
+        );
+        assert_eq!(free.0, cog_core::TaskStatus::Scheduled);
+
+        let owned = statuses_after_publish(true).await;
+        assert_eq!(
+            owned.0, owned.1,
+            "both tasks bound to one unit wait for it, whatever their source: {owned:?}"
+        );
+        assert_eq!(owned.0, cog_core::TaskStatus::Pending);
+    }
+
     #[tokio::test]
     async fn stale_result_for_unknown_task_is_acked() {
         // Regression: run_consumer discarded msg_id and never acked, so stale
