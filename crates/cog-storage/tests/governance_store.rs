@@ -27,7 +27,10 @@
 //!   cargo test -p cog-storage --test governance_store -- --ignored
 //! ```
 //!
-//! Every id carries a per-run marker and every row is deleted at the end.
+//! Every id carries a per-run marker and every row is deleted at the end; a
+//! round that died before its own cleanup is reclaimed by the next one (see
+//! [`sweep_abandoned`]), because a leftover row is a face the resident drift
+//! pass would keep working on.
 
 use chrono::Utc;
 use cog_core::{
@@ -50,6 +53,62 @@ fn marker() -> String {
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     )
+}
+
+/// Rows a round that never reached its own cleanup left behind.
+///
+/// Cleanup runs at the end of a test, and "the end" is exactly what an aborted
+/// round does not reach: an assertion failure, a deadlock, a Ctrl-C. A leaked
+/// row here is not inert -- it is a face node in the graph, and the resident
+/// drift pass reads every face node in that workspace, so it rewrites the
+/// abandoned row's owner every couple of minutes and logs a face that no
+/// person put there.
+///
+/// The marker carries the round's start time, so a row whose marker is older
+/// than [`ABANDONED_AFTER`] cannot belong to a round still running: a round
+/// that is still going started less than that ago.
+const ABANDONED_AFTER: chrono::Duration = chrono::Duration::minutes(10);
+
+async fn sweep_abandoned(pool: &PgPool) {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT task_id, workspace_id FROM cog_dag_tasks \
+          WHERE workspace_id LIKE 'governance-store-test%' \
+             OR task_id LIKE 'governance-store-test%'",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the test family");
+
+    let cutoff = Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        - ABANDONED_AFTER.num_nanoseconds().unwrap_or_default();
+    for (task_id, workspace) in rows {
+        let started = marker_stamp(&task_id).or_else(|| {
+            workspace
+                .as_deref()
+                .and_then(marker_stamp)
+                .filter(|_| task_id.starts_with("governance-store-test:"))
+        });
+        if started.is_some_and(|nanos| nanos < cutoff) {
+            sqlx::query("DELETE FROM cog_dag_tasks WHERE task_id = $1")
+                .bind(&task_id)
+                .execute(pool)
+                .await
+                .expect("delete an abandoned row");
+        }
+    }
+}
+
+/// The start time embedded in a marker: `governance-store-test:<pid>:<nanos>`.
+fn marker_stamp(id: &str) -> Option<i64> {
+    id.split(':')
+        .nth(2)
+        .and_then(|nanos| nanos.parse::<i64>().ok())
+}
+
+/// The per-run marker, after reclaiming whatever an earlier round abandoned.
+async fn begin(pool: &PgPool) -> String {
+    sweep_abandoned(pool).await;
+    marker()
 }
 
 fn face_node(id: &str, owner: &str, revision: i64) -> Task {
@@ -137,7 +196,7 @@ async fn only_the_reserved_workspace_rows_typed_as_faces_are_faces() {
     backend.init_schema().await.expect("init the schema");
     let store = PostgresGovernanceStore::new(pool.clone());
 
-    let prefix = marker();
+    let prefix = begin(&pool).await;
     let face_id = format!("{prefix}:face");
     let product_id = format!("{prefix}:product");
     let handover_id = format!("{prefix}:handover");
@@ -203,7 +262,7 @@ async fn open_work_is_global_and_excludes_terminal_unbound_and_face_rows() {
     backend.init_schema().await.expect("init the schema");
     let store = PostgresGovernanceStore::new(pool.clone());
 
-    let prefix = marker();
+    let prefix = begin(&pool).await;
     let face_id = format!("{prefix}:face");
     let open = format!("{prefix}:open");
     let running = format!("{prefix}:running");
@@ -283,7 +342,7 @@ async fn a_face_write_needs_the_revision_the_caller_actually_read() {
     backend.init_schema().await.expect("init the schema");
     let store = PostgresGovernanceStore::new(pool.clone());
 
-    let prefix = marker();
+    let prefix = begin(&pool).await;
     let face_id = format!("{prefix}:face");
     store
         .save_face_node(&face_node(&face_id, "8b", 1))
@@ -337,7 +396,7 @@ async fn applying_a_handover_moves_the_face_and_the_unstarted_work_only() {
     backend.init_schema().await.expect("init the schema");
     let store = PostgresGovernanceStore::new(pool.clone());
 
-    let prefix = marker();
+    let prefix = begin(&pool).await;
     let face_id = format!("{prefix}:face");
     let handover_id = format!("{prefix}:handover");
     let pending = format!("{prefix}:pending");
@@ -462,7 +521,7 @@ async fn unstarted_face_work_follows_a_unit_that_is_present() {
     backend.init_schema().await.expect("init the schema");
     let store = PostgresGovernanceStore::new(pool.clone());
 
-    let prefix = marker();
+    let prefix = begin(&pool).await;
     let face_id = format!("{prefix}:face");
     let pending = format!("{prefix}:pending");
     let running = format!("{prefix}:running");
@@ -557,7 +616,7 @@ async fn a_handover_whose_face_moved_under_it_writes_nothing() {
     backend.init_schema().await.expect("init the schema");
     let store = PostgresGovernanceStore::new(pool.clone());
 
-    let prefix = marker();
+    let prefix = begin(&pool).await;
     let face_id = format!("{prefix}:face");
     let handover_id = format!("{prefix}:handover");
 
@@ -622,7 +681,7 @@ async fn a_status_move_and_its_event_are_written_together_or_not_at_all() {
     backend.init_schema().await.expect("init the schema");
     let store = PostgresGovernanceStore::new(pool.clone());
 
-    let prefix = marker();
+    let prefix = begin(&pool).await;
     let face_id = format!("{prefix}:face");
     let decision_id = format!("{prefix}:decision");
     let row_id = format!("{prefix}:handover");
@@ -701,4 +760,64 @@ async fn a_status_move_and_its_event_are_written_together_or_not_at_all() {
     );
 
     clean(&pool, &prefix).await;
+}
+
+/// A round that died before its cleanup leaves face nodes behind, and the
+/// resident drift pass reads every face node in the graph: an abandoned face
+/// is a face it keeps rewriting. The next round reclaims them.
+///
+/// The age is the discriminator, not the name: two rounds can be running at
+/// once, and sweeping the whole family would delete the other one's fixtures
+/// mid-assertion. A row whose marker is older than the abandon window cannot
+/// belong to a round still in progress.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_round_that_died_before_its_cleanup_is_reclaimed_by_the_next_one() {
+    let pool = PgPool::connect(&database_url())
+        .await
+        .expect("connect to the test database");
+    let backend = PostgresStateBackend::new(pool.clone());
+    backend.init_schema().await.expect("init the schema");
+
+    let long_ago = (Utc::now() - chrono::Duration::hours(1))
+        .timestamp_nanos_opt()
+        .unwrap_or_default();
+    let abandoned = format!("governance-store-test:1:{long_ago}:face");
+    let current = format!(
+        "governance-store-test:{}:{}:face",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    for id in [&abandoned, &current] {
+        backend
+            .dag_set_task(GOVERNANCE_WORKSPACE, id, &face_node(id, "gone-unit", 1))
+            .await
+            .expect("seed a face");
+    }
+
+    sweep_abandoned(&pool).await;
+
+    let left: Vec<(String,)> =
+        sqlx::query_as("SELECT task_id FROM cog_dag_tasks WHERE task_id = ANY($1)")
+            .bind(vec![abandoned.clone(), current.clone()])
+            .fetch_all(&pool)
+            .await
+            .expect("read back what survived");
+    let names: Vec<&str> = left.iter().map(|(id,)| id.as_str()).collect();
+    assert!(
+        !names.contains(&abandoned.as_str()),
+        "an hour-old fixture is an abandoned round's leftover: {names:?}"
+    );
+    assert!(
+        names.contains(&current.as_str()),
+        "a fixture from this minute may belong to a round still running: {names:?}"
+    );
+
+    let prefix = marker();
+    clean(&pool, &prefix).await;
+    sqlx::query("DELETE FROM cog_dag_tasks WHERE task_id = $1")
+        .bind(&current)
+        .execute(&pool)
+        .await
+        .expect("clean up the fresh fixture");
 }
