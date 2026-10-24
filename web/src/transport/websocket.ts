@@ -1,4 +1,4 @@
-import type { AgentEvent, EventType } from '@/types/events';
+import { isEventType, type AgentEvent } from '@/types/events';
 import type { NotificationItem } from '@/api/client';
 
 export type ConnectionStatus = 'connecting' | 'open' | 'closed' | 'error';
@@ -149,6 +149,21 @@ export class EventStreamClient {
       return;
     }
 
+    // 服务端把 agent 事件按事件自己的名字直接写在 `type` 上，没有外层信封。
+    // 只认 `agent_event` 那层信封的话，工具调用、状态迁移、错误这些帧全部在
+    // 这里被静默丢掉——总线上有、界面上永远没有。
+    if (isEventType(message.type)) {
+      this.options.onEvent({
+        id: message.event_id ?? `${message.type}-${Date.now()}`,
+        type: message.type,
+        timestamp:
+          (message as unknown as { timestamp?: string }).timestamp ??
+          new Date().toISOString(),
+        payload: message as unknown as Record<string, unknown>,
+      });
+      return;
+    }
+
     if (message.type === 'agent_event' && message.payload) {
       const event = normalizeAgentEvent(message.payload, message.event_id ?? message.payload.id as string);
       if (event) {
@@ -244,8 +259,8 @@ function normalizeAgentEvent(
   payload: Record<string, unknown>,
   fallbackId: string
 ): AgentEvent | null {
-  const type = payload.type as EventType | undefined;
-  if (!type) return null;
+  const type = payload.type;
+  if (!isEventType(type)) return null;
 
   return {
     id: (payload.id as string) ?? fallbackId,

@@ -506,3 +506,147 @@ export async function sendAgentPrompt(
     };
   }
 }
+
+// ─── 系统面：面与读数、任务、后端健康、评估集 ───
+//
+// 每个面都读网关现有的路由，不另造一份数据：读数在别处被门禁与常驻 loop 用着，
+// 界面若从第二条路重算一次，就会在某一刻与门禁看到的不是同一个数。
+
+export interface GovernanceFaceSpec {
+  display_name: string;
+  kind: 'face' | 'cross' | string;
+  deputy_unit: string | null;
+  witness_unit: string | null;
+  time_share: string | null;
+  vacancy_until: string | null;
+  vacancy_assigner: string | null;
+  gap_task_id: string | null;
+  first_reading: string | null;
+  entry_path: string | null;
+  revision: number;
+}
+
+export interface GovernanceFace {
+  face_id: string;
+  owner_unit: string | null;
+  bound_by_handover_id: string | null;
+  spec: GovernanceFaceSpec;
+  updated_at: string;
+}
+
+export interface GovernanceCensus {
+  faces: number;
+  cross: number;
+  unstaffed: number;
+  expired: number;
+}
+
+export interface GovernanceFacesPage {
+  generated_at: string;
+  census: GovernanceCensus;
+  faces: GovernanceFace[];
+}
+
+export interface FaceDriftReading {
+  face_id: string;
+  state: string;
+  owner: string | null;
+  owner_source: 'declared' | 'measured' | string;
+  red_rules: string[];
+  yellow_rules: string[];
+  cause: string | null;
+  detail: string | null;
+  observed_at: string;
+  source_revision: number;
+}
+
+export interface GovernanceDriftPage {
+  generated_at: string;
+  readings: FaceDriftReading[];
+}
+
+export async function getGovernanceFaces(): Promise<GovernanceFacesPage> {
+  return api.get<GovernanceFacesPage>('/api/v1/governance/faces');
+}
+
+export async function getGovernanceDrift(): Promise<GovernanceDriftPage> {
+  return api.get<GovernanceDriftPage>('/api/v1/governance/drift');
+}
+
+export interface TaskSummaryCounts {
+  total: number;
+  ready: number;
+  running: number;
+  completed: number;
+  failed: number;
+  all_completed: boolean;
+}
+
+export async function getTaskSummary(): Promise<TaskSummaryCounts> {
+  return api.get<TaskSummaryCounts>('/api/v1/tasks/status');
+}
+
+export interface TaskRow {
+  id: string;
+  task_type: string;
+  status: string;
+  owner_unit: string | null;
+  agent_id: string | null;
+  goal_id: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  input: Record<string, unknown>;
+}
+
+/**
+ * 任务行。过滤条件只有服务端认的三个：`goal_id`、`agent_id`、`status`。
+ *
+ * `limit` 在本地截：端点不认它，发过去也会被忽略——带着一个看着生效、实际
+ * 没生效的参数，读者会以为看到的是「最近 50 条」，其实是全部。
+ */
+export async function listTasks(params: {
+  status?: string;
+  goal_id?: string;
+  agent_id?: string;
+  limit?: number;
+} = {}): Promise<TaskRow[]> {
+  const query = new URLSearchParams();
+  if (params.status) query.set('status', params.status);
+  if (params.goal_id) query.set('goal_id', params.goal_id);
+  if (params.agent_id) query.set('agent_id', params.agent_id);
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  const rows = await api.get<TaskRow[]>(`/api/v1/tasks/list${suffix}`);
+  return params.limit ? rows.slice(0, params.limit) : rows;
+}
+
+export interface BackendHealth {
+  name: string;
+  status: 'up' | 'down' | 'degraded' | 'unknown' | string;
+  latency_ms: number | null;
+  last_checked: string | null;
+  error: string | null;
+}
+
+export interface BackendHealthMatrix {
+  overall: string;
+  backends: BackendHealth[];
+}
+
+export async function getBackendHealth(): Promise<BackendHealthMatrix> {
+  return api.get<BackendHealthMatrix>('/api/v1/health/backends');
+}
+
+export interface EvalDatasetInfo {
+  name: string;
+  path: string;
+  case_count: number;
+  tags: string[];
+}
+
+export async function listEvalDatasets(): Promise<EvalDatasetInfo[]> {
+  const page = await api.get<{ datasets: EvalDatasetInfo[] }>(
+    '/api/v1/eval/datasets'
+  );
+  return page.datasets ?? [];
+}
