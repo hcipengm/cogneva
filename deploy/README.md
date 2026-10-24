@@ -92,6 +92,30 @@ StorageClass，如 Longhorn）。渲染检查：`helm template cogneva deploy/he
 > 必须与 chart k3s profile 字段级对齐，由 CI 与 `deploy/scripts/check-deploy-parity.sh`
 > 强制（覆盖多少资源与资源类型以脚本自报为准）。改拓扑的顺序见 `deploy/k3s/README.md`。
 
+### 升级与回滚
+
+升级就是重跑安装那一步：apply 投递的集群重新 `kubectl apply -f deploy/rendered/<profile>/`，
+helm 投递的集群 `helm upgrade cogneva deploy/helm/cogneva -f ...`。两条路都幂等。
+
+回滚（apply 投递）：
+
+```bash
+bash deploy/scripts/rollback.sh --to <上一版 rev>              # 只出计划，不碰集群
+bash deploy/scripts/rollback.sh --to <上一版 rev> --apply --wait
+```
+
+单位是**那一版的 `deploy/rendered/<profile>/`**，也就是升级时吃进去的那份清单：
+它把拓扑送回那一版，不动数据（PVC、库里的行），也不改仓库。它拒绝往前/旁支的版本
+（那是变更，走评审），也拒绝那一版没有清单目录、或目录里没有 yaml（apply 空目录会
+退出 0，读起来像回滚成功）。默认只打印计划，写集群要显式 `--apply`。
+
+从 apply 投递迁到 helm 托管时，现网对象此前没有 helm 归属三件套，`helm upgrade` 会在
+归属校验上整单拒收。先用 `helm upgrade cogneva deploy/helm/cogneva -f
+deploy/helm/cogneva/profiles/<profile>.yaml --dry-run=server` 看缺哪些对象，确认它们都是
+这个 chart 渲染的之后，再用 `--take-ownership`（helm ≥ 4）接管——接管意味着这些对象
+从此由该 release 管理。
+
+
 ---
 
 ## Linux (systemd)
