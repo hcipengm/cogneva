@@ -1,5 +1,6 @@
 import { AgentsView } from '@/views/AgentsView';
 import { AlertsView } from '@/views/AlertsView';
+import { AuditView } from '@/views/AuditView';
 import { ChangesView } from '@/views/ChangesView';
 import { FilesView } from '@/views/FilesView';
 import { GovernanceView } from '@/views/GovernanceView';
@@ -39,6 +40,8 @@ export function ViewFor({ view }: { view: string }) {
       return <GovernanceView />;
     case 'observability':
       return <ObservabilityView />;
+    case 'audit':
+      return <AuditView />;
     case 'settings':
       return <SettingsView />;
     default:

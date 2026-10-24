@@ -640,6 +640,13 @@ jobs:
       - name: Check workspace search reaches the screen and lands on its line
         run: bash deploy/scripts/check-web-workspace.sh
 
+      # 审计面的成品是「打开那一屏、看见那段时间留了什么、按触发类型筛一遍」，不是
+      # `/api/v1/audit/events` 这条路由。视图文件写在树上但没在活动栏 / 页标题 /
+      # 视图注册表里登记，从界面永远打不开；筛选框画在屏上却没进请求，读者会以为
+      # 已经筛过了——这两种都不会让任何东西变红。
+      - name: Check the audit panel opens, filters, and stays read-only
+        run: bash deploy/scripts/check-web-audit-panel.sh
+
   # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读
   # 覆盖端点），它结构上证明不了 `web/` 编得过：类型错、装不上的依赖、打包不进
   # bundle，三条它一条也看不见。构建这一半必须自己有一个作业，否则「新增功能不得

@@ -19,6 +19,7 @@ export type ActivityId =
   | 'changes'
   | 'governance'
   | 'observability'
+  | 'audit'
   | 'settings';
 
 /** 每一面在页签上写什么。切面时要能顺手开出这一页，名字就得在这里认得出。 */
@@ -32,6 +33,7 @@ export const VIEW_TITLES: Record<ActivityId, string> = {
   changes: '变更',
   governance: '治理',
   observability: '观测',
+  audit: '审计',
   settings: '设置',
 };
 

@@ -25,6 +25,7 @@ const PATHS: Record<string, string[]> = {
   ],
   governance: ['M12 3.5 19 6v6c0 4-3 6.5-7 8.5-4-2-7-4.5-7-8.5V6z', 'M9 12l2 2 4-4'],
   observability: ['M3 12h4l2.5-6 4 12 2.5-6h5'],
+  audit: ['M6 3.5h9l3.5 3.5v13H6z', 'M15 3.5V7h3.5', 'M9 12h6M9 15.5h6M9 8.5h2.5'],
   settings: ['M4 7h9M18 7h2M4 12h3M12 12h8M4 17h11M20 17h0', 'M15.5 5.2v3.6M9.5 10.2v3.6M17.5 15.2v3.6'],
   search: ['M11 17a6 6 0 1 0 0-12 6 6 0 0 0 0 12z', 'M15.5 15.5 20 20'],
   close: ['M6 6l12 12M18 6 6 18'],

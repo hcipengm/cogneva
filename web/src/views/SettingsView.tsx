@@ -1,4 +1,4 @@
-import { listEvalDatasets } from '@/api/client';
+import { getQuotaUsage, listEvalDatasets } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { useServices } from '@/shell/context';
 import { useShell } from '@/shell/store';
@@ -18,6 +18,7 @@ export function SettingsView() {
   const { llm, overlays, signOut, username } = useServices();
   const { openLlmSetup } = overlays;
   const datasets = useResource('评估集', listEvalDatasets, 120_000);
+  const quota = useResource('额度', getQuotaUsage, 60_000);
   const sidebarVisible = useShell((s) => s.sidebarVisible);
   const toggleSidebar = useShell((s) => s.toggleSidebar);
   const panelOpen = useShell((s) => s.panelOpen);
@@ -128,6 +129,34 @@ export function SettingsView() {
             rowKey={(d) => d.path}
           />
         )}
+      </section>
+
+      <section className="border-b border-[var(--line)]">
+        <header className="flex items-center gap-3 px-4 py-2">
+          <h2 className="text-[12px]">额度与用量</h2>
+          <span className="text-[11px] text-[var(--muted)]">
+            按账号算；按执行者拆开的 token 花销在观测页
+          </span>
+          <div className="ml-auto">
+            <Button onClick={quota.refresh}>重读</Button>
+          </div>
+        </header>
+        {quota.error ? (
+          <ReadError what="额度" error={quota.error} onRetry={quota.refresh} />
+        ) : !quota.data ? (
+          <Loading what="额度" />
+        ) : (
+          <div className="flex flex-wrap py-2">
+            <Reading label="今天已用" value={quota.data.used_today.toLocaleString()} />
+            <Reading label="剩余额度" value={quota.data.remaining.toLocaleString()} />
+            <Reading label="额度总量" value={quota.data.total_quota.toLocaleString()} />
+            <Reading label="账号" value={<span className="mono text-[13px]">{quota.data.user_id}</span>} />
+          </div>
+        )}
+        <p className="px-4 pb-2 text-[11px] text-[var(--muted)]">
+          剩余额度是配额管理这一侧的数，与观测页按执行者统计的 token 花销是两套计数：前者拦调用，
+          后者记账，对不上时以拦得住的这一侧为准。
+        </p>
       </section>
 
       <section className="border-b border-[var(--line)]">

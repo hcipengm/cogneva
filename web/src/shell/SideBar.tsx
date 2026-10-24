@@ -54,6 +54,7 @@ const TITLES: Record<ActivityId, string> = {
   changes: '变更',
   governance: '治理',
   observability: '观测',
+  audit: '审计',
   settings: '设置',
 };
 
@@ -364,12 +365,32 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
         </>
       );
 
+    case 'audit':
+      return (
+        <>
+          <Section title="这一页有什么">
+            <Row label="留档事件" note="只追加，读不写" />
+            <Row label="过滤" note="触发类型 / 智能体 / 时间窗" />
+            <Row label="展开" note="点内容那一格看整段" />
+          </Section>
+          <Note>
+            审计只覆盖 hook 事件：没有事件不等于没有动作，只是那一种动作不进这张表。
+          </Note>
+          <CrossLinks
+            links={[
+              { id: 'observability', label: '观测', note: '现在的读数' },
+              { id: 'governance', label: '治理', note: '判据与放行' },
+            ]}
+          />
+        </>
+      );
+
     case 'settings':
       return (
         <>
           <Section title="这一页有什么">
             <Row label="模型" note="上游配置与连通探测" />
-            <Row label="用量" note="按执行者的令牌花销" />
+            <Row label="额度与用量" note="按账号的剩余额度；按执行者的花销在观测页" />
             <Row label="评估集" note="可跑的评估用例" />
             <Row label="界面" note="侧栏与面板的开关" />
           </Section>

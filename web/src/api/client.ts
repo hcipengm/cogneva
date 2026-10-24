@@ -1074,3 +1074,51 @@ export interface WorkspaceUsage {
 export async function getWorkspaceUsage(): Promise<WorkspaceUsage> {
   return api.get<WorkspaceUsage>('/api/v1/ide/usage');
 }
+
+export interface AuditEvent {
+  id: number;
+  trigger_type: string;
+  dedup_key: string | null;
+  agent_id: string | null;
+  task_id: string | null;
+  crew_id: string | null;
+  squad_id: string | null;
+  payload: unknown;
+  timestamp: string;
+}
+
+export interface AuditQuery {
+  agent_id?: string;
+  task_id?: string;
+  trigger_type?: string;
+  since?: string;
+  limit?: number;
+}
+
+/**
+ * 归档表里的一段事件。
+ *
+ * 这张表只追加：读得少、读错了都不影响它，所以「某一刻总线上去过什么」这件事
+ * 事后还能问。不是全部动作都进来——只有 hook 事件在这里留档。
+ */
+export async function listAuditEvents(query: AuditQuery = {}): Promise<AuditEvent[]> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || value === null || value === '') continue;
+    params.set(key, String(value));
+  }
+  const suffix = params.toString();
+  return api.get<AuditEvent[]>(`/api/v1/audit/events${suffix ? `?${suffix}` : ''}`);
+}
+
+export interface QuotaUsage {
+  user_id: string;
+  remaining: number;
+  used_today: number;
+  total_quota: number;
+}
+
+/** 我这一份 token 额度今天用了多少、还剩多少。 */
+export async function getQuotaUsage(): Promise<QuotaUsage> {
+  return api.get<QuotaUsage>('/api/v1/quota/usage');
+}
