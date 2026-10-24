@@ -110,6 +110,26 @@ pub fn gap_goal_text(reading: &FaceDriftReading) -> String {
     )
 }
 
+/// The row a red face's remediation is submitted under.
+///
+/// The reading already names who answers for the face; the row carries that
+/// name so the decomposition hands it to that unit rather than to whoever
+/// happens to poll first. That is the difference between a finding and an
+/// announcement: an unaddressed goal is work nobody was asked to do, and a
+/// face with no owner stays unaddressed on purpose -- there is nobody to
+/// address it to, and inventing an addressee would queue the work behind a
+/// unit that cannot act on it.
+pub fn gap_goal_row(reading: &FaceDriftReading, id: String) -> Task {
+    let mut row = Task::goal_row(id, &gap_goal_text(reading));
+    row.face_id = Some(reading.face_id.clone());
+    row.owner_unit = reading.owner.clone();
+    // The row is the goal's identity marker and is never executed; the planner
+    // decomposes it into work and stamps the same face and owner on the
+    // children.
+    row.is_executable = false;
+    row
+}
+
 /// Submit one remediation goal per red face, at most once a day each.
 async fn dispatch_red_faces(
     readings: &[FaceDriftReading],
@@ -120,12 +140,7 @@ async fn dispatch_red_faces(
     for reading in readings.iter().filter(|r| r.state.is_red()) {
         let id = gap_goal_id(&reading.face_id, reading.state.as_str(), &day);
         let goal = gap_goal_text(reading);
-        let mut row = Task::goal_row(id.clone(), &goal);
-        row.face_id = Some(reading.face_id.clone());
-        // The row is the goal's identity marker and is never executed; the
-        // planner decomposes it into work and stamps the same face on the
-        // children.
-        row.is_executable = false;
+        let row = gap_goal_row(reading, id.clone());
         match orchestrator.submit_goal_auto(&goal, vec![row]).await {
             Ok(added) if added.is_empty() => {
                 info!(
@@ -313,6 +328,42 @@ mod tests {
             gap_goal_id("a~5b", "no_owner", "2026-10-19"),
             gap_goal_id("a[", "no_owner", "2026-10-19")
         );
+    }
+
+    fn reading(owner: Option<&str>) -> FaceDriftReading {
+        FaceDriftReading {
+            face_id: "task-management".into(),
+            state: DriftState::NoOwner,
+            owner: owner.map(str::to_string),
+            owner_source: Default::default(),
+            red_rules: vec!["no_owner".into()],
+            yellow_rules: Vec::new(),
+            cause: None,
+            detail: None,
+            observed_at: Utc::now(),
+            source_revision: 1,
+        }
+    }
+
+    #[test]
+    fn a_red_face_is_handed_to_the_unit_the_reading_names() {
+        // A finding with no addressee is an announcement: the goal would sit
+        // in the queue until whoever polls first picked it up, and the face it
+        // came from would not be anybody's in particular. The reading already
+        // knows who answers for the face, so the row carries that name and the
+        // decomposition copies it onto the children.
+        let row = gap_goal_row(&reading(Some("unit-7")), "goal-1".into());
+        assert_eq!(row.owner_unit.as_deref(), Some("unit-7"));
+        assert_eq!(row.face_id.as_deref(), Some("task-management"));
+        assert!(!row.is_executable);
+    }
+
+    #[test]
+    fn a_face_with_no_owner_is_left_unaddressed_rather_than_addressed_to_nobody() {
+        let row = gap_goal_row(&reading(None), "goal-2".into());
+        assert_eq!(row.owner_unit, None);
+        assert_eq!(row.face_id.as_deref(), Some("task-management"));
+        assert!(!row.is_executable);
     }
 
     #[test]
