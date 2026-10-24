@@ -466,7 +466,8 @@ pub struct FaceObservation<'a> {
     pub now: DateTime<Utc>,
 }
 
-/// The unit holding the most open work on the face.
+/// The unit holding the most open work on the face, among the units that are
+/// alive.
 ///
 /// The measurement that answers "who is on this face" when no declared name is
 /// a unit. Majority rather than first-seen: a face with one person on five
@@ -474,10 +475,30 @@ pub struct FaceObservation<'a> {
 /// row the store happened to return first would make the answer depend on row
 /// order. Ties go to the smallest name so two readers of the same graph print
 /// the same owner.
-pub fn measured_owner(open_tasks: &[Task]) -> Option<&str> {
+///
+/// `live` is the set of names the heartbeat registry holds, and it is not
+/// optional decoration: a task's `owner_unit` is a name somebody typed, and a
+/// face whose work is bound to a name nobody answers to would otherwise
+/// measure as owned by that name -- the reading would then report an absent
+/// owner as the answer to "who", which is the one thing a measurement must not
+/// do. Work bound to a unit that is not alive measures as work bound to
+/// nobody.
+///
+/// `None` means the registry could not be read, which is a different statement
+/// from "nobody is alive": the caller has no way to tell which names answer,
+/// so the name the work carries is all it has and is used as-is. The reading
+/// turns that into `unread` rather than a verdict.
+pub fn measured_owner(open_tasks: &[Task], live: Option<&[String]>) -> Option<String> {
     let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
     for task in open_tasks {
-        if let Some(unit) = task.owner_unit.as_deref() {
+        let Some(unit) = task.owner_unit.as_deref() else {
+            continue;
+        };
+        let answers = match live {
+            Some(units) => units.iter().any(|live| live == unit),
+            None => true,
+        };
+        if answers {
             *counts.entry(unit).or_insert(0) += 1;
         }
     }
@@ -489,7 +510,7 @@ pub fn measured_owner(open_tasks: &[Task]) -> Option<&str> {
         .max_by(|(a_name, a_count), (b_name, b_count)| {
             a_count.cmp(b_count).then_with(|| b_name.cmp(a_name))
         })
-        .map(|(unit, _)| unit)
+        .map(|(unit, _)| unit.to_string())
 }
 
 /// Apply the closed rule set to one face.
@@ -953,6 +974,18 @@ pub async fn read_drift(
         .filter(|handover| handover.state() == crate::HandoverState::Signed)
         .collect();
 
+    // One listing for the whole read: the set of names that answer is a fact
+    // about the deployment, not about a face, and asking once keeps two faces
+    // from being measured against two different rosters.
+    let live_units: Option<Vec<String>> = match agents {
+        Some(registry) => registry
+            .list()
+            .await
+            .ok()
+            .map(|registrations| registrations.into_iter().map(|r| r.agent_id).collect()),
+        None => None,
+    };
+
     let mut by_face: std::collections::BTreeMap<&str, Vec<Task>> = Default::default();
     for task in &open {
         if let Some(face_id) = task.face_id.as_deref() {
@@ -987,8 +1020,11 @@ pub async fn read_drift(
             Some(name) => {
                 let liveness = ask_registry(agents, name).await;
                 if liveness == OwnerLiveness::Unknown {
-                    match measured_owner(open_tasks) {
-                        Some(measured) => (Some(measured), ask_registry(agents, measured).await),
+                    match measured_owner(open_tasks, live_units.as_deref()) {
+                        Some(measured) => {
+                            let seen = ask_registry(agents, &measured).await;
+                            (Some(measured), seen)
+                        }
                         None => (None, liveness),
                     }
                 } else {
@@ -1000,8 +1036,11 @@ pub async fn read_drift(
             // would turn a declared vacancy into a gray row. Work that names a
             // unit and lands on an ownerless face still measures, because the
             // unit holding the work is the only answer to "who" that exists.
-            None => match measured_owner(open_tasks) {
-                Some(measured) => (Some(measured), ask_registry(agents, measured).await),
+            None => match measured_owner(open_tasks, live_units.as_deref()) {
+                Some(measured) => {
+                    let seen = ask_registry(agents, &measured).await;
+                    (Some(measured), seen)
+                }
                 None => (None, OwnerLiveness::Unknown),
             },
         };
@@ -1016,7 +1055,7 @@ pub async fn read_drift(
             face,
             open_tasks,
             signed_handovers: &signed_handovers,
-            measured_owner: measured,
+            measured_owner: measured.as_deref(),
             owner_liveness,
             now,
         }));
@@ -1155,7 +1194,7 @@ mod tests {
             task(Some("8b"), TaskStatus::Running),
             task(Some("6e"), TaskStatus::Pending),
         ];
-        assert_eq!(measured_owner(&tasks), Some("8b"));
+        assert_eq!(measured_owner(&tasks, None).as_deref(), Some("8b"));
 
         // A tie goes to the smallest name, so two readers of the same graph
         // print the same owner instead of depending on row order.
@@ -1163,12 +1202,41 @@ mod tests {
             task(Some("8b"), TaskStatus::Running),
             task(Some("6e"), TaskStatus::Running),
         ];
-        assert_eq!(measured_owner(&tied), Some("6e"));
+        assert_eq!(measured_owner(&tied, None).as_deref(), Some("6e"));
 
         // Work nobody has claimed names no owner: an unassigned task is not a
         // measurement of who did it.
         let unclaimed = vec![task(None, TaskStatus::Pending)];
-        assert_eq!(measured_owner(&unclaimed), None);
+        assert_eq!(measured_owner(&unclaimed, None), None);
+    }
+
+    #[test]
+    fn work_bound_to_a_name_that_does_not_answer_measures_as_nobody_s() {
+        // The deployment's own shape: every face's work carries the name of a
+        // terminal session that is not a unit, next to one task a real unit
+        // picked up. The session name holds more work, and it is still not the
+        // owner -- reading it as one reports an absent party as the answer to
+        // "who is on this face".
+        let tasks = vec![
+            task(Some("worker"), TaskStatus::Pending),
+            task(Some("worker"), TaskStatus::Pending),
+            task(Some("cogneva-worker-pod-0"), TaskStatus::Running),
+        ];
+        let live = vec!["cogneva-worker-pod-0".to_string()];
+        assert_eq!(
+            measured_owner(&tasks, Some(&live)).as_deref(),
+            Some("cogneva-worker-pod-0")
+        );
+
+        // Nothing in the work belongs to a live unit, and the registry was
+        // readable: the measurement is "nobody", not the name on the rows.
+        let all_dead = vec![task(Some("worker"), TaskStatus::Pending)];
+        assert_eq!(measured_owner(&all_dead, Some(&live)), None);
+
+        // A registry that could not be read is not a roster of nobody, and the
+        // reading must not claim a vacancy it cannot see. The name the work
+        // carries is used, and the caller reports `unread` from liveness.
+        assert_eq!(measured_owner(&all_dead, None).as_deref(), Some("worker"));
     }
 
     #[test]
