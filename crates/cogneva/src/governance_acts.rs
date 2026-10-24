@@ -1767,6 +1767,7 @@ mod tests {
             face: Some(&moved),
             open_tasks: &in_flight,
             signed_handovers: &[],
+            measured_owner: None,
             owner_liveness: cog_core::OwnerLiveness::Seen(now),
             now,
         });
@@ -1778,6 +1779,7 @@ mod tests {
             face: Some(&moved),
             open_tasks: &settled,
             signed_handovers: &[],
+            measured_owner: None,
             owner_liveness: cog_core::OwnerLiveness::Seen(now),
             now,
         });

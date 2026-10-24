@@ -320,6 +320,8 @@ mod tests {
         let reading = FaceDriftReading {
             face_id: "security".into(),
             state: DriftState::VacancyExpired,
+            owner: None,
+            owner_source: Default::default(),
             red_rules: vec!["vacancy_expired".into(), "no_owner".into()],
             yellow_rules: Vec::new(),
             cause: None,

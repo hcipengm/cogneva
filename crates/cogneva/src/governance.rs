@@ -512,10 +512,31 @@ async fn project(
         revision
     );
 
-    let mut faces_tsv = String::from(&stamp);
-    faces_tsv.push_str(&render_roster(&faces));
-
+    // The owner column is the measurement's answer, not the row's declaration.
+    // A projection that copies the declaration is a copy of what somebody
+    // typed, and it keeps saying so after that person is gone; the reading is
+    // the closed loop's own answer -- whoever holds the face's open work, as
+    // long as the heartbeat registry has them. The declaration stays where it
+    // is, on the node, so a signed handover still has something to move.
     let readings = readings(store, redis_url).await?;
+    let measured: std::collections::BTreeMap<&str, Option<&str>> = readings
+        .iter()
+        .map(|reading| (reading.face_id.as_str(), reading.owner.as_deref()))
+        .collect();
+    let projected: Vec<Face> = faces
+        .iter()
+        .map(|face| {
+            let mut face = face.clone();
+            if let Some(owner) = measured.get(face.face_id.as_str()) {
+                face.owner_unit = owner.map(str::to_string);
+            }
+            face
+        })
+        .collect();
+
+    let mut faces_tsv = String::from(&stamp);
+    faces_tsv.push_str(&render_roster(&projected));
+
     let mut drift_tsv = String::from(&stamp);
     drift_tsv.push_str("face\tstate\tred\tyellow\tdetail\n");
     for reading in &readings {

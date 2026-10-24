@@ -347,6 +347,16 @@ impl DriftState {
 pub struct FaceDriftReading {
     pub face_id: String,
     pub state: DriftState,
+    /// The unit the reading holds answerable for this face.
+    ///
+    /// Not necessarily the name written on the row: see [`OwnerSource`]. A
+    /// reader that wants "who is on this face" asks this field, because the
+    /// row's name is a declaration that ages, and this is the answer the
+    /// observation can stand behind.
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub owner_source: OwnerSource,
     /// The red rules that held, in the order the pass checked them.
     pub red_rules: Vec<String>,
     pub yellow_rules: Vec<String>,
@@ -402,6 +412,30 @@ pub enum OwnerLiveness {
     Unreadable,
 }
 
+/// Where the owner a reading is about came from.
+///
+/// A face row's owner is a name written when the face was seeded or handed
+/// over. A name answers "who" only while the heartbeat registry still has it as
+/// a unit: a roster typed by hand outlives the sessions it was typed from, and
+/// a reading pinned to it reports the face as owned by a string nothing
+/// recognises, forever. Work in flight does not age that way -- it names the
+/// unit that is holding it right now -- so when the row's name is not a unit
+/// the reading takes its owner from the work. Which of the two answered has to
+/// travel with the reading, because "the declared owner is working" and "nobody
+/// declared this, but this unit is doing it" are different facts about a face.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerSource {
+    /// The row names this unit and the registry has it. This is the default so
+    /// that a reading which predates the measurement reads as the plain case
+    /// rather than as a measurement it never took.
+    #[default]
+    Declared,
+    /// No name on the row was a unit the registry knows, so the owner was
+    /// measured from the open work on the face.
+    Measured,
+}
+
 /// What a face's owner has been seen doing, gathered by the caller.
 ///
 /// The caller owns the reads; this type exists so the rules are one function
@@ -419,8 +453,43 @@ pub struct FaceObservation<'a> {
     pub open_tasks: &'a [Task],
     /// Handovers naming this face that are fully signed and not yet applied.
     pub signed_handovers: &'a [crate::Handover],
+    /// The unit the caller measured as holding this face's open work, when the
+    /// name on the row is not a unit the heartbeat registry knows.
+    ///
+    /// `None` means the reading uses the row's own `owner_unit`. Separate from
+    /// `owner_liveness` because the same triple -- no work, unknown name --
+    /// reads differently depending on whether the caller could measure at all.
+    pub measured_owner: Option<&'a str>,
+    /// Liveness of whoever this reading holds answerable: the measured unit
+    /// when there is one, otherwise the name on the row.
     pub owner_liveness: OwnerLiveness,
     pub now: DateTime<Utc>,
+}
+
+/// The unit holding the most open work on the face.
+///
+/// The measurement that answers "who is on this face" when no declared name is
+/// a unit. Majority rather than first-seen: a face with one person on five
+/// tasks and a passer-by on one is owned by the first, and picking whichever
+/// row the store happened to return first would make the answer depend on row
+/// order. Ties go to the smallest name so two readers of the same graph print
+/// the same owner.
+pub fn measured_owner(open_tasks: &[Task]) -> Option<&str> {
+    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for task in open_tasks {
+        if let Some(unit) = task.owner_unit.as_deref() {
+            *counts.entry(unit).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        // `max_by_key` keeps the last of equal keys, so ordering by (count,
+        // reversed name) would be needed to break ties; sorting the tuple
+        // instead reads as what it is.
+        .max_by(|(a_name, a_count), (b_name, b_count)| {
+            a_count.cmp(b_count).then_with(|| b_name.cmp(a_name))
+        })
+        .map(|(unit, _)| unit)
 }
 
 /// Apply the closed rule set to one face.
@@ -435,6 +504,8 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
         return FaceDriftReading {
             face_id: observation.face_id.to_string(),
             state: DriftState::Unread,
+            owner: None,
+            owner_source: OwnerSource::Declared,
             red_rules: Vec::new(),
             yellow_rules: Vec::new(),
             detail: Some("no face node carries this id".into()),
@@ -449,10 +520,24 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
     let mut detail: Option<String> = None;
     let mut cause: Option<String> = None;
 
-    if !face.is_staffed() {
+    // The row's name is the declaration; the measurement is the answer. A
+    // measured owner wins because the row's name is not a unit at all, so
+    // holding the face to it reports a string instead of a person.
+    let (owner, owner_source) = match observation.measured_owner {
+        Some(measured) => (Some(measured), OwnerSource::Measured),
+        None => (face.owner_unit.as_deref(), OwnerSource::Declared),
+    };
+
+    // A measured owner fills the seat: the row declaring nobody, or a vacancy
+    // whose deadline passed, is a statement about the paperwork, and the unit
+    // holding the face's open work contradicts it. Judging the seat empty while
+    // somebody is demonstrably in it would report the declaration instead of
+    // the face.
+    let measured = owner_source == OwnerSource::Measured;
+    if !face.is_staffed() && !measured {
         red.push(DriftState::NoOwner.as_str().to_string());
     }
-    if face.vacancy_expired_at(now) {
+    if face.vacancy_expired_at(now) && !measured {
         red.push(DriftState::VacancyExpired.as_str().to_string());
     }
     // An ownership move that nobody signed, and a signature nobody applied,
@@ -467,17 +552,23 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
     }) {
         red.push(DriftState::UnsignedHandover.as_str().to_string());
     }
-    if let Some(owner) = face.owner_unit.as_deref() {
+    if let Some(owner) = owner {
         // Work is misbound when it names a different unit, or when it is
         // running under somebody else. An unassigned task on a staffed face is
         // not drift: nobody has claimed it yet, and an owner who has not
         // started it is a separate fact from the binding being wrong.
-        let misbound = observation.open_tasks.iter().any(|task| {
-            task.owner_unit
-                .as_deref()
-                .map(|bound| bound != owner)
-                .unwrap_or(task.status == crate::TaskStatus::Running)
-        });
+        //
+        // Only a declared owner can be contradicted. A measured owner was read
+        // off this same set of tasks, so comparing the two would declare every
+        // face with a second contributor misbound -- and a majority holder is
+        // the normal shape once a face is staffed by whoever is working it.
+        let misbound = !measured
+            && observation.open_tasks.iter().any(|task| {
+                task.owner_unit
+                    .as_deref()
+                    .map(|bound| bound != owner)
+                    .unwrap_or(task.status == crate::TaskStatus::Running)
+            });
         if misbound {
             red.push(DriftState::DriftedBinding.as_str().to_string());
         }
@@ -523,7 +614,7 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
     // that could not be read means no verdict rather than a yellow one.
     let state = if !red.is_empty() {
         DriftState::parse(red[0].as_str()).unwrap_or(DriftState::Unread)
-    } else if observation.owner_liveness == OwnerLiveness::Unreadable && face.owner_unit.is_some() {
+    } else if observation.owner_liveness == OwnerLiveness::Unreadable && owner.is_some() {
         DriftState::Unread
     } else if !yellow.is_empty() {
         DriftState::parse(yellow[0].as_str()).unwrap_or(DriftState::Unread)
@@ -531,9 +622,24 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
         DriftState::OnTarget
     };
 
+    // A measured owner is a fact a reader has to be told: the face reads as
+    // staffed while the name on its row does not answer to anybody, and the
+    // next reader of that row would otherwise take a green verdict as
+    // confirmation that the name is right.
+    if measured && detail.is_none() {
+        detail = Some(match owner {
+            Some(owner) => format!(
+                "ownership measured from open work: no name on the row is a unit the registry knows, and {owner} holds its open tasks"
+            ),
+            None => "no owner is declared and no open work names one".into(),
+        });
+    }
+
     FaceDriftReading {
         face_id: face.face_id.clone(),
         state,
+        owner: owner.map(str::to_string),
+        owner_source,
         red_rules: red,
         yellow_rules: yellow,
         // An unreadable registry outranks any detail the rules could write: the
@@ -816,6 +922,17 @@ pub async fn import_face_with(
 /// no registry is published in this deployment, and that is `unread` rather
 /// than idle -- a deployment that cannot see heartbeats has not seen an idle
 /// owner, it has seen nothing.
+async fn ask_registry(agents: Option<&dyn crate::AgentRegistry>, unit: &str) -> OwnerLiveness {
+    match agents {
+        Some(registry) => match registry.get(unit).await {
+            Ok(Some(registration)) => OwnerLiveness::Seen(registration.last_heartbeat),
+            Ok(None) => OwnerLiveness::Unknown,
+            Err(_) => OwnerLiveness::Unreadable,
+        },
+        None => OwnerLiveness::Unreadable,
+    }
+}
+
 pub async fn read_drift(
     store: &dyn GovernanceStore,
     agents: Option<&dyn crate::AgentRegistry>,
@@ -857,21 +974,38 @@ pub async fn read_drift(
     let mut readings = Vec::with_capacity(ids.len());
     for face_id in ids {
         let face = faces.iter().find(|f| f.face_id == face_id);
-        let owner_liveness = match face.and_then(|f| f.owner_unit.as_deref()) {
-            Some(owner) => match agents {
-                Some(registry) => match registry.get(owner).await {
-                    Ok(Some(registration)) => OwnerLiveness::Seen(registration.last_heartbeat),
-                    Ok(None) => OwnerLiveness::Unknown,
-                    Err(_) => OwnerLiveness::Unreadable,
-                },
-                None => OwnerLiveness::Unreadable,
-            },
+        let open_tasks = by_face.get(face_id).map(Vec::as_slice).unwrap_or_default();
+
+        // Ask the registry about the name the row carries. A name it knows is
+        // the owner and nothing needs to be measured; a name it does not know
+        // is not an owner at all, and the reading has to come from the unit
+        // actually holding the face's work. The distinction cannot be made
+        // without the registry, which is why it lives here and not in
+        // `observe`.
+        let declared = face.and_then(|f| f.owner_unit.as_deref());
+        let (measured, owner_liveness) = match declared {
+            Some(name) => {
+                let liveness = ask_registry(agents, name).await;
+                if liveness == OwnerLiveness::Unknown {
+                    match measured_owner(open_tasks) {
+                        Some(measured) => (Some(measured), ask_registry(agents, measured).await),
+                        None => (None, liveness),
+                    }
+                } else {
+                    (None, liveness)
+                }
+            }
             // No owner is not an unreadable owner: the vacancy rules answer
             // this row on their own, and asking about a name that is not there
-            // would turn a declared vacancy into a gray row.
-            None => OwnerLiveness::Unknown,
+            // would turn a declared vacancy into a gray row. Work that names a
+            // unit and lands on an ownerless face still measures, because the
+            // unit holding the work is the only answer to "who" that exists.
+            None => match measured_owner(open_tasks) {
+                Some(measured) => (Some(measured), ask_registry(agents, measured).await),
+                None => (None, OwnerLiveness::Unknown),
+            },
         };
-        let open_tasks = by_face.get(face_id).map(Vec::as_slice).unwrap_or_default();
+
         let signed_handovers: Vec<crate::Handover> = handovers
             .iter()
             .filter(|handover| handover.spec.face_id == face_id)
@@ -882,6 +1016,7 @@ pub async fn read_drift(
             face,
             open_tasks,
             signed_handovers: &signed_handovers,
+            measured_owner: measured,
             owner_liveness,
             now,
         }));
@@ -938,6 +1073,7 @@ mod tests {
             face: Some(&face),
             open_tasks: &tasks,
             signed_handovers: &[],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Seen(Utc::now()),
             now: Utc::now(),
         });
@@ -953,11 +1089,86 @@ mod tests {
             face: Some(&face),
             open_tasks: &[],
             signed_handovers: &[],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Seen(Utc::now()),
             now: Utc::now(),
         });
         assert_eq!(reading.state, DriftState::OwnerIdle);
         assert!(reading.state.is_yellow());
+    }
+
+    #[test]
+    fn a_declared_name_that_is_not_a_unit_is_replaced_by_whoever_holds_the_work() {
+        // The row was seeded from a roster of session names. The registry has
+        // no such unit, so the name is not an owner at all; the open work names
+        // one, and that is the answer a reader asked for.
+        let face = face(Some("worker"));
+        let tasks = vec![task(Some("8b"), TaskStatus::Running)];
+        let reading = observe(FaceObservation {
+            face_id: "task-management",
+            face: Some(&face),
+            open_tasks: &tasks,
+            signed_handovers: &[],
+            measured_owner: Some("8b"),
+            owner_liveness: OwnerLiveness::Seen(Utc::now()),
+            now: Utc::now(),
+        });
+        assert_eq!(reading.state, DriftState::OnTarget, "{reading:?}");
+        assert_eq!(reading.owner.as_deref(), Some("8b"));
+        assert_eq!(reading.owner_source, OwnerSource::Measured);
+        assert_eq!(reading.cause, None);
+    }
+
+    #[test]
+    fn work_in_flight_fills_a_declared_vacancy_instead_of_reading_as_empty() {
+        // A vacancy is a statement about the paperwork. Somebody holding the
+        // face's open work contradicts it, and reporting the seat as empty
+        // while it is demonstrably occupied is the declaration overriding the
+        // observation.
+        let mut face = face(None);
+        face.spec.vacancy_until = Some(Utc::now() - chrono::Duration::minutes(1));
+        face.spec.vacancy_assigner = Some("unit-operator".into());
+        face.spec.gap_task_id = Some("gap-1".into());
+        let tasks = vec![task(Some("6e"), TaskStatus::Running)];
+        let reading = observe(FaceObservation {
+            face_id: "task-management",
+            face: Some(&face),
+            open_tasks: &tasks,
+            signed_handovers: &[],
+            measured_owner: Some("6e"),
+            owner_liveness: OwnerLiveness::Seen(Utc::now()),
+            now: Utc::now(),
+        });
+        assert_eq!(reading.state, DriftState::OnTarget, "{reading:?}");
+        assert_eq!(reading.owner.as_deref(), Some("6e"));
+    }
+
+    #[test]
+    fn the_measured_owner_is_the_unit_holding_most_of_the_face_s_work() {
+        // Majority, not whichever row came first: one contributor on five
+        // tasks and a passer-by on one is owned by the contributor.
+        let tasks = vec![
+            task(Some("8b"), TaskStatus::Running),
+            task(Some("8b"), TaskStatus::Pending),
+            task(Some("8b"), TaskStatus::Scheduled),
+            task(Some("8b"), TaskStatus::Running),
+            task(Some("8b"), TaskStatus::Running),
+            task(Some("6e"), TaskStatus::Pending),
+        ];
+        assert_eq!(measured_owner(&tasks), Some("8b"));
+
+        // A tie goes to the smallest name, so two readers of the same graph
+        // print the same owner instead of depending on row order.
+        let tied = vec![
+            task(Some("8b"), TaskStatus::Running),
+            task(Some("6e"), TaskStatus::Running),
+        ];
+        assert_eq!(measured_owner(&tied), Some("6e"));
+
+        // Work nobody has claimed names no owner: an unassigned task is not a
+        // measurement of who did it.
+        let unclaimed = vec![task(None, TaskStatus::Pending)];
+        assert_eq!(measured_owner(&unclaimed), None);
     }
 
     #[test]
@@ -970,6 +1181,7 @@ mod tests {
             face: Some(&face),
             open_tasks: &tasks,
             signed_handovers: &[],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Seen(Utc::now()),
             now: Utc::now(),
         });
@@ -988,6 +1200,7 @@ mod tests {
             face: Some(&face),
             open_tasks: &tasks,
             signed_handovers: &[],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Seen(Utc::now()),
             now: Utc::now(),
         });
@@ -1004,6 +1217,7 @@ mod tests {
             face: Some(&face),
             open_tasks: &[],
             signed_handovers: &[],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Seen(Utc::now()),
             now: Utc::now(),
         });
@@ -1024,6 +1238,7 @@ mod tests {
             face: Some(&face),
             open_tasks: &tasks,
             signed_handovers: &[],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Unknown,
             now: Utc::now(),
         });
@@ -1041,6 +1256,7 @@ mod tests {
             face: Some(&face),
             open_tasks: &tasks,
             signed_handovers: &[],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Seen(
                 Utc::now() - chrono::Duration::seconds(OWNER_IDLE_AFTER_SECS + 1),
             ),
@@ -1084,6 +1300,7 @@ mod tests {
                 face: f,
                 open_tasks: open,
                 signed_handovers: &[],
+                measured_owner: None,
                 owner_liveness: liveness,
                 now: Utc::now(),
             });
@@ -1111,6 +1328,7 @@ mod tests {
             face: Some(&face),
             open_tasks: &tasks,
             signed_handovers: &[],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Seen(Utc::now()),
             now: Utc::now(),
         });
@@ -1126,6 +1344,7 @@ mod tests {
             face: Some(&face),
             open_tasks: &[],
             signed_handovers: &[],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Unknown,
             now: Utc::now(),
         });
@@ -1144,6 +1363,7 @@ mod tests {
             face: Some(&face),
             open_tasks: &[],
             signed_handovers: &[],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Unknown,
             now: Utc::now(),
         });
@@ -1158,6 +1378,7 @@ mod tests {
             face: None,
             open_tasks: &[],
             signed_handovers: &[],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Unknown,
             now: Utc::now(),
         });
@@ -1227,6 +1448,7 @@ mod tests {
             face: Some(&face),
             open_tasks: &[],
             signed_handovers: &[],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Seen(now),
             now,
         });
@@ -1247,6 +1469,7 @@ mod tests {
             face: Some(&face),
             open_tasks: &[],
             signed_handovers: &[stale],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Seen(now),
             now,
         });
@@ -1263,6 +1486,7 @@ mod tests {
             face: Some(&face),
             open_tasks: &[],
             signed_handovers: &[fresh],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Seen(now),
             now,
         });
@@ -1286,6 +1510,7 @@ mod tests {
             face: Some(&face),
             open_tasks: &[],
             signed_handovers: &[stale],
+            measured_owner: None,
             owner_liveness: OwnerLiveness::Seen(now),
             now,
         });
