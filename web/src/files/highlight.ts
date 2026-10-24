@@ -196,3 +196,24 @@ export const TOKEN_VAR: Record<TokenKind, string> = {
   type: 'var(--live)',
   punct: 'var(--paper-dim)',
 };
+
+/**
+ * 在文本里找一处字面量（不区分大小写）。
+ *
+ * 编辑器里的「查找」不做正则：在代码里打一个 `.` 会匹配所有字符，这种误伤
+ * 在只有几十行的小框里没人会先想到「我输入的是正则」。
+ */
+export function findMatches(text: string, query: string): Array<[number, number]> {
+  if (!query) return [];
+  const haystack = text.toLowerCase();
+  const needle = query.toLowerCase();
+  const matches: Array<[number, number]> = [];
+  let from = 0;
+  for (;;) {
+    const at = haystack.indexOf(needle, from);
+    if (at < 0) break;
+    matches.push([at, at + needle.length]);
+    from = at + Math.max(1, needle.length);
+  }
+  return matches;
+}

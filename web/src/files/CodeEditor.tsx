@@ -1,5 +1,5 @@
-import { useMemo, useRef } from 'react';
-import { TOKEN_VAR, languageOf, tokenize } from '@/files/highlight';
+import { useEffect, useMemo, useRef } from 'react';
+import { TOKEN_VAR, findMatches, languageOf, tokenize } from '@/files/highlight';
 
 /**
  * 代码编辑器：着色层 + 输入层 + 行号槽。
@@ -22,11 +22,20 @@ export function CodeEditor({
   text,
   readOnly,
   onChange,
+  findQuery,
+  findIndex,
 }: {
   path: string;
   text: string;
   readOnly?: boolean;
   onChange: (next: string) => void;
+  /**
+   * 查找状态由外面持着：计数与上一处 / 下一处要画在同一根工具条上。
+   * 两个原语而不是一个对象——对象每次渲染都是新的，跳转的 effect 会因此
+   * 每帧重跑，选中区被反复重置，打字打不进去。
+   */
+  findQuery?: string;
+  findIndex?: number;
 }) {
   const areaRef = useRef<HTMLTextAreaElement>(null);
   const preRef = useRef<HTMLPreElement>(null);
@@ -34,6 +43,27 @@ export function CodeEditor({
 
   const tokens = useMemo(() => tokenize(text, languageOf(path)), [text, path]);
   const lineCount = useMemo(() => text.split('\n').length, [text]);
+
+  // 跳到当前匹配处：选中它，并把那一行滚到视野里。
+  useEffect(() => {
+    const area = areaRef.current;
+    if (!area || !findQuery) return;
+    const matches = findMatches(text, findQuery);
+    if (matches.length === 0) return;
+    const raw = findIndex ?? 0;
+    const index = ((raw % matches.length) + matches.length) % matches.length;
+    const [start, end] = matches[index];
+    area.focus();
+    area.setSelectionRange(start, end);
+    const line = text.slice(0, start).split('\n').length - 1;
+    const lineHeight = 12 * 1.65;
+    area.scrollTop = Math.max(0, line * lineHeight - area.clientHeight / 3);
+    if (preRef.current) {
+      preRef.current.scrollTop = area.scrollTop;
+      preRef.current.scrollLeft = area.scrollLeft;
+    }
+    if (gutterRef.current) gutterRef.current.scrollTop = area.scrollTop;
+  }, [findQuery, findIndex, text]);
 
   const syncScroll = () => {
     const area = areaRef.current;

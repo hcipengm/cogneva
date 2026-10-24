@@ -5,7 +5,7 @@
 //! `/proc`）和用户在编辑器里该看到的东西，是两套完全不同的东西。
 //!
 //! 根目录取 `COGNEVA_WORKSPACE_ROOT`；没设时落在应用数据卷上
-//! （`$COGNEVA_DATA_DIR/workspace/users`，默认 `/var/lib/cogneva-data/...`）——
+//! （`$COGNEVA_DATA_DIR/workspace`，默认 `/var/lib/cogneva-data/workspace`）——
 //! 工作区必须跨 Pod 重启存活，而容器根文件系统是一次性的。每个用户在下面有一个
 //! 以自己 UUID 命名的子目录，第一次打开时创建。按用户分而不是共用一个根：共用根时，
 //! A 在树里能看见 B 的草稿、能覆盖 B 的文件，而这不会有任何报错。
@@ -37,6 +37,10 @@ const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_TREE_ENTRIES: usize = 2000;
 /// 判断二进制时看的前缀长度，也是这类文件永不返回正文的理由。
 const BINARY_PROBE_BYTES: usize = 8192;
+/// 上传 / 下载的上限。比编辑器那条宽——整份构建产物、一张截图也该能搬进搬出，
+/// 但必须落在路由层请求体的封顶之下并留出余量：超过那条线的大请求在到达这里
+/// 之前就被拒，本层再给一个更大的数只会让两边说法不一致。
+const TRANSFER_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct TreeQuery {
@@ -53,6 +57,19 @@ pub struct FileQuery {
 pub struct WriteBody {
     pub path: String,
     pub text: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MkdirBody {
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenameBody {
+    #[serde(rename = "from")]
+    pub from: String,
+    #[serde(rename = "to")]
+    pub to: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,7 +116,9 @@ fn configured_root() -> PathBuf {
         return PathBuf::from(explicit);
     }
     let data = non_empty_env(DATA_DIR_ENV).unwrap_or_else(|| DEFAULT_DATA_DIR.to_string());
-    PathBuf::from(data).join("workspace").join("users")
+    // 只拼一级：每个用户的 UUID 目录直接落在数据根的 workspace 下，再多一层
+    // 就多一个要在数据根台账里登记的子目录，而它并不承载独立语义。
+    PathBuf::from(data).join("workspace")
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -321,6 +340,218 @@ async fn write_file(path: &Path, text: &str) -> Result<u64, ApiError> {
     }
 }
 
+/// 建目录（含父目录）。返回这一条在树里的形状。
+async fn make_dir(root: &Path, rel: &str) -> Result<TreeEntry, ApiError> {
+    let path = resolve_under(root, rel)?;
+    tokio::fs::create_dir_all(&path)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("cannot create {rel}: {e}")))?;
+    let meta = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| ApiError::internal(format!("cannot stat {rel}: {e}")))?;
+    Ok(TreeEntry {
+        path: to_response_path(rel.trim()),
+        name: path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        dir: true,
+        size: meta.len(),
+        modified_ms: modified_ms(&meta),
+    })
+}
+
+/// 改名 / 移动。两端都在同一个用户根里，且目标已存在时拒绝——覆盖式改名在
+/// 文件管理器里是「手滑一次就没了一个文件」，而这里没有撤销。
+async fn move_entry(root: &Path, from_rel: &str, to_rel: &str) -> Result<(), ApiError> {
+    let from = resolve_under(root, from_rel)?;
+    let to = resolve_under(root, to_rel)?;
+    if tokio::fs::symlink_metadata(&from).await.is_err() {
+        return Err(ApiError::not_found(format!("no such file: {from_rel}")));
+    }
+    if tokio::fs::symlink_metadata(&to).await.is_ok() {
+        return Err(ApiError::bad_request(format!(
+            "{to_rel} already exists; refusing to overwrite"
+        )));
+    }
+    if let Some(parent) = to.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("cannot create parent directory: {e}")))?;
+    }
+    tokio::fs::rename(&from, &to)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("cannot rename: {e}")))
+}
+
+/// 删除文件或空目录。非空目录要先把内容删掉：这条规矩让「删一个目录」不会
+/// 连带删掉读者没看见的东西。
+async fn remove_entry(root: &Path, rel: &str) -> Result<(), ApiError> {
+    let path = resolve_under(root, rel)?;
+    let meta = tokio::fs::symlink_metadata(&path)
+        .await
+        .map_err(|_| ApiError::not_found(format!("no such file: {rel}")))?;
+    if meta.is_dir() {
+        let mut reader = tokio::fs::read_dir(&path)
+            .await
+            .map_err(|e| ApiError::internal(format!("cannot read directory: {e}")))?;
+        if reader
+            .next_entry()
+            .await
+            .map_err(|e| ApiError::internal(format!("cannot read directory: {e}")))?
+            .is_some()
+        {
+            return Err(ApiError::bad_request(format!(
+                "{rel} is not empty; delete its contents first"
+            )));
+        }
+        tokio::fs::remove_dir(&path)
+            .await
+            .map_err(|e| ApiError::internal(format!("cannot remove directory: {e}")))
+    } else {
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|e| ApiError::internal(format!("cannot remove file: {e}")))
+    }
+}
+
+/// 原样读取字节。编辑器那条路会把文本转成 UTF-8 并截断，二进制文件更是没有
+/// 正文；搬文件要的是字节本身。
+async fn read_raw(root: &Path, rel: &str) -> Result<(PathBuf, Vec<u8>), ApiError> {
+    let path = resolve_under(root, rel)?;
+    let meta = tokio::fs::metadata(&path)
+        .await
+        .map_err(|_| ApiError::not_found(format!("no such file: {rel}")))?;
+    if meta.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "{rel} is a directory; listing it is the tree endpoint"
+        )));
+    }
+    if meta.len() > TRANSFER_MAX_BYTES as u64 {
+        return Err(ApiError::bad_request(format!(
+            "{rel} is {} bytes; transfers stop at {TRANSFER_MAX_BYTES}",
+            meta.len()
+        )));
+    }
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| ApiError::internal(format!("cannot read {rel}: {e}")))?;
+    Ok((path, bytes))
+}
+
+/// 原样写入字节（上传）。不截断、不做编码转换：上传的东西就是盘上该有的东西。
+async fn write_bytes(root: &Path, rel: &str, bytes: &[u8]) -> Result<(), ApiError> {
+    if bytes.len() > TRANSFER_MAX_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "upload is {} bytes; the limit is {TRANSFER_MAX_BYTES}",
+            bytes.len()
+        )));
+    }
+    let path = resolve_under(root, rel)?;
+    if tokio::fs::metadata(&path)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        return Err(ApiError::bad_request(format!("{rel} is a directory")));
+    }
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("cannot create parent directory: {e}")))?;
+    }
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|e| ApiError::internal(format!("cannot write {rel}: {e}")))
+}
+
+pub async fn mkdir_handler(
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<MkdirBody>,
+) -> Result<Json<TreeEntry>, ApiError> {
+    let root = ensure_user_root(&claims).await?;
+    let entry = make_dir(&root, &body.path).await?;
+    tracing::info!(user = %claims.sub, path = %body.path, "workspace directory created");
+    Ok(Json(entry))
+}
+
+pub async fn rename_handler(
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<RenameBody>,
+) -> Result<Json<FileResponse>, ApiError> {
+    let root = ensure_user_root(&claims).await?;
+    move_entry(&root, &body.from, &body.to).await?;
+    tracing::info!(user = %claims.sub, from = %body.from, to = %body.to, "workspace entry renamed");
+    read_file(&resolve_under(&root, &body.to)?, &body.to)
+        .await
+        .map(Json)
+}
+
+pub async fn delete_handler(
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<FileQuery>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let root = ensure_user_root(&claims).await?;
+    remove_entry(&root, &query.path).await?;
+    tracing::info!(user = %claims.sub, path = %query.path, "workspace entry deleted");
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+pub async fn raw_handler(
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<FileQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+
+    let root = ensure_user_root(&claims).await?;
+    let (path, bytes) = read_raw(&root, &query.path).await?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("download")
+        .replace('"', "");
+    Ok((
+        [
+            ("content-type", "application/octet-stream".to_string()),
+            (
+                "content-disposition",
+                format!("attachment; filename=\"{name}\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// 上传：请求体就是文件内容，路径由查询参数给出。
+///
+/// 不用 multipart：这一条只搬一个文件，多出来的边界解析与表单字段没有一处会
+/// 用到，而它正是这类接口出过问题的地方。
+pub async fn upload_handler(
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<FileQuery>,
+    body: axum::body::Bytes,
+) -> Result<Json<FileResponse>, ApiError> {
+    let root = ensure_user_root(&claims).await?;
+    write_bytes(&root, &query.path, &body).await?;
+    tracing::info!(user = %claims.sub, path = %query.path, bytes = body.len(), "workspace file uploaded");
+    let path = resolve_under(&root, &query.path)?;
+    match read_file(&path, &query.path).await {
+        Ok(file) => Ok(Json(file)),
+        // 二进制附件读不出正文，但上传确实成功了：回一条没有正文的记录，
+        // 而不是把一次成功的写入报成失败。
+        Err(_) => Ok(Json(FileResponse {
+            path: to_response_path(query.path.trim()),
+            size: body.len() as u64,
+            binary: true,
+            truncated: false,
+            text: None,
+            modified_ms: None,
+        })),
+    }
+}
+
 /// 按需建立用户根：第一次打开文件面板的人不该看到一个「目录不存在」的错误。
 async fn ensure_user_root(claims: &Claims) -> Result<PathBuf, ApiError> {
     let root = configured_root();
@@ -452,6 +683,92 @@ mod tests {
             .expect_err("超过上限必须拒绝");
         assert_eq!(err.error, "BadRequest");
         assert!(!path.exists(), "被拒绝的写入不该在盘上留下文件");
+    }
+
+    #[tokio::test]
+    async fn directories_are_created_including_missing_parents() {
+        let dir = tempdir();
+        let root = dir.path();
+
+        let entry = make_dir(root, "notes/2026").await.unwrap();
+        assert!(entry.dir);
+        assert_eq!(entry.path, "notes/2026");
+        assert!(root.join("notes/2026").is_dir());
+    }
+
+    #[tokio::test]
+    async fn rename_moves_within_the_root_and_refuses_to_overwrite() {
+        let dir = tempdir();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        std::fs::write(root.join("b.txt"), "two").unwrap();
+
+        move_entry(root, "a.txt", "c.txt").await.unwrap();
+        assert!(root.join("c.txt").exists());
+        assert!(!root.join("a.txt").exists());
+
+        let err = move_entry(root, "c.txt", "b.txt")
+            .await
+            .expect_err("目标已存在时必须拒绝");
+        assert_eq!(err.error, "BadRequest");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "two");
+    }
+
+    #[tokio::test]
+    async fn rename_cannot_reach_outside_the_root() {
+        let dir = tempdir();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+
+        let err = move_entry(&root, "a.txt", "../escaped.txt")
+            .await
+            .expect_err("出根的改名必须拒绝");
+        assert_eq!(err.error, "Forbidden");
+        assert!(root.join("a.txt").exists(), "被拒绝的改名不能动原文件");
+    }
+
+    #[tokio::test]
+    async fn a_non_empty_directory_is_not_deleted() {
+        let dir = tempdir();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("keep")).unwrap();
+        std::fs::write(root.join("keep/inside.txt"), "x").unwrap();
+
+        let err = remove_entry(root, "keep")
+            .await
+            .expect_err("非空目录必须拒绝");
+        assert_eq!(err.error, "BadRequest");
+        assert!(root.join("keep/inside.txt").exists());
+
+        remove_entry(root, "keep/inside.txt").await.unwrap();
+        remove_entry(root, "keep").await.unwrap();
+        assert!(!root.join("keep").exists());
+    }
+
+    #[tokio::test]
+    async fn raw_transfers_keep_bytes_exactly() {
+        let dir = tempdir();
+        let root = dir.path();
+        let payload = [0u8, 159, 146, 150, 255];
+
+        write_bytes(root, "blob.bin", &payload).await.unwrap();
+        let (path, bytes) = read_raw(root, "blob.bin").await.unwrap();
+        assert_eq!(path, root.join("blob.bin"));
+        assert_eq!(bytes, payload, "原样搬运不能经过任何编码转换");
+    }
+
+    #[tokio::test]
+    async fn uploads_above_the_transfer_cap_are_refused() {
+        let dir = tempdir();
+        let root = dir.path();
+        let big = vec![b'x'; TRANSFER_MAX_BYTES + 1];
+
+        let err = write_bytes(root, "big.bin", &big)
+            .await
+            .expect_err("超过传输上限必须拒绝");
+        assert_eq!(err.error, "BadRequest");
+        assert!(!root.join("big.bin").exists());
     }
 
     #[tokio::test]

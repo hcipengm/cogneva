@@ -858,6 +858,20 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/ide/tree", get(ide::tree_handler))
         .route("/api/v1/ide/file", get(ide::file_handler))
         .route("/api/v1/ide/file", axum::routing::put(ide::write_handler))
+        .route(
+            "/api/v1/ide/file",
+            axum::routing::delete(ide::delete_handler),
+        )
+        .route("/api/v1/ide/mkdir", axum::routing::post(ide::mkdir_handler))
+        .route(
+            "/api/v1/ide/rename",
+            axum::routing::post(ide::rename_handler),
+        )
+        .route("/api/v1/ide/raw", get(ide::raw_handler))
+        .route(
+            "/api/v1/ide/upload",
+            axum::routing::post(ide::upload_handler),
+        )
         .route("/api/v1/governance/faces", get(governance::faces_handler))
         .route("/api/v1/governance/drift", get(governance::drift_handler))
         .route(

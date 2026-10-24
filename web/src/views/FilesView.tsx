@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
-import { getWorkspaceFile, saveWorkspaceFile, type WorkspaceFile } from '@/api/client';
+import {
+  downloadWorkspaceFile,
+  getWorkspaceFile,
+  saveWorkspaceFile,
+  type WorkspaceFile,
+} from '@/api/client';
 import { CodeEditor } from '@/files/CodeEditor';
+import { findMatches } from '@/files/highlight';
 import { useDrafts } from '@/files/store';
 import { useShell } from '@/shell/store';
 import { Button, Empty, Loading, ReadError } from '@/ui/primitives';
@@ -33,6 +39,9 @@ export function FilesView() {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [newPath, setNewPath] = useState('');
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState('');
+  const [findIndex, setFindIndex] = useState(0);
 
   const load = useCallback(async (target: string) => {
     setLoading(true);
@@ -57,6 +66,7 @@ export function FilesView() {
   const text = draft ?? file?.text ?? '';
   const dirty = draft !== undefined && draft !== file?.text;
   const lines = text ? text.split('\n').length : 0;
+  const matches = findOpen ? findMatches(text, findQuery) : [];
 
   const save = useCallback(async () => {
     if (!path || !dirty || saving) return;
@@ -90,14 +100,20 @@ export function FilesView() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
+      const meta = event.metaKey || event.ctrlKey;
+      if (meta && event.key.toLowerCase() === 's') {
         event.preventDefault();
         void save();
+      } else if (meta && event.key.toLowerCase() === 'f') {
+        event.preventDefault();
+        setFindOpen(true);
+      } else if (event.key === 'Escape' && findOpen) {
+        setFindOpen(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [save]);
+  }, [save, findOpen]);
 
   if (!path) {
     return (
@@ -152,6 +168,8 @@ export function FilesView() {
           {file?.binary ? ' · 二进制文件不显示正文' : ''}
         </span>
         <div className="ml-auto flex items-center gap-2">
+          <Button onClick={() => setFindOpen((open) => !open)}>查找 ⌘F</Button>
+          <Button onClick={() => void downloadWorkspaceFile(path)}>下载</Button>
           <Button onClick={() => void load(path)}>重读</Button>
           <Button onClick={() => void save()} tone={dirty ? 'accent' : undefined}>
             {saving ? '保存中…' : '保存 ⌘S'}
@@ -169,6 +187,43 @@ export function FilesView() {
         </div>
       )}
 
+      {findOpen && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-[var(--line)] bg-[var(--ink-800)] px-4 py-1">
+          <input
+            autoFocus
+            value={findQuery}
+            onChange={(event) => {
+              setFindQuery(event.target.value);
+              setFindIndex(0);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                const step = event.shiftKey ? -1 : 1;
+                setFindIndex((current) => current + step);
+              }
+            }}
+            placeholder="查找（回车下一处，Shift+回车上一处）"
+            className="mono w-72 border border-[var(--line)] bg-[var(--ink-900)] px-2 py-1 text-[12px] outline-none focus:border-[var(--brass)]"
+            style={{ color: 'var(--paper)' }}
+          />
+          <span className="mono text-[11px] text-[var(--muted)]">
+            {findQuery
+              ? matches.length === 0
+                ? '没有匹配'
+                : `${(((findIndex % matches.length) + matches.length) % matches.length) + 1} / ${matches.length}`
+              : '输入要查找的文字'}
+          </span>
+          <button
+            type="button"
+            onClick={() => setFindOpen(false)}
+            className="ml-auto text-[11px] text-[var(--muted)] transition-colors hover:text-[var(--paper)]"
+          >
+            关闭
+          </button>
+        </div>
+      )}
+
       {loading && !file ? (
         <Loading what={path} />
       ) : file?.binary ? (
@@ -177,6 +232,8 @@ export function FilesView() {
         <CodeEditor
           path={path}
           text={text}
+          findQuery={findOpen ? findQuery : undefined}
+          findIndex={findIndex}
           onChange={(next) => {
             setDraft(path, next);
           }}

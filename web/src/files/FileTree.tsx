@@ -1,5 +1,19 @@
-import { useCallback, useEffect, useState, type ReactElement } from 'react';
-import { getWorkspaceTree, type WorkspaceEntry } from '@/api/client';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+  type ReactElement,
+} from 'react';
+import {
+  createWorkspaceDir,
+  deleteWorkspaceEntry,
+  getWorkspaceTree,
+  renameWorkspaceEntry,
+  uploadWorkspaceFile,
+  type WorkspaceEntry,
+} from '@/api/client';
 import { Icon } from '@/shell/icons';
 import { useShell } from '@/shell/store';
 
@@ -12,6 +26,9 @@ import { useShell } from '@/shell/store';
  *
  * 读失败画在自己这一行上：目录读不到（权限、被删、服务端不可达）与「这个目录
  * 就是空的」在界面上必须分得开，否则空目录会被当成「我的文件没了」。
+ *
+ * 改名 / 删除 / 新建 / 上传都在这里：这些动作改的是磁盘，所以每一次都要么成功
+ * 刷新出新的样子，要么把失败原文贴出来——静默失败在这里等于「我的文件去哪了」。
  */
 export function FileTree() {
   const [children, setChildren] = useState<Record<string, WorkspaceEntry[]>>({});
@@ -19,9 +36,20 @@ export function FileTree() {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState<Record<string, boolean>>({});
   const [truncated, setTruncated] = useState<Record<string, boolean>>({});
+  const [busy, setBusy] = useState(false);
+  const uploadRef = useRef<HTMLInputElement>(null);
 
   const openTab = useShell((s) => s.openTab);
   const activeTabId = useShell((s) => s.activeTabId);
+  const appendOutput = useShell((s) => s.appendOutput);
+
+  const report = useCallback(
+    (message: string) => {
+      appendOutput(message);
+      setErrors((prev) => ({ ...prev, '': message }));
+    },
+    [appendOutput]
+  );
 
   const load = useCallback(async (path: string) => {
     setLoading((prev) => ({ ...prev, [path]: true }));
@@ -30,6 +58,7 @@ export function FileTree() {
       setChildren((prev) => ({ ...prev, [path]: page.entries }));
       setTruncated((prev) => ({ ...prev, [path]: page.truncated }));
       setErrors((prev) => {
+        if (!(path in prev)) return prev;
         const next = { ...prev };
         delete next[path];
         return next;
@@ -46,7 +75,19 @@ export function FileTree() {
     void load('');
   }, [load]);
 
-  const refresh = () => {
+  const reload = useCallback(
+    (path: string) => {
+      setChildren((prev) => {
+        const next = { ...prev };
+        delete next[path];
+        return next;
+      });
+      void load(path);
+    },
+    [load]
+  );
+
+  const refreshAll = () => {
     setChildren({});
     setExpanded({ '': true });
     setErrors({});
@@ -70,6 +111,70 @@ export function FileTree() {
       view: 'files',
       hint: entry.path,
     });
+  };
+
+  const parentOf = (path: string) =>
+    path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+
+  const newFolder = async () => {
+    const base = parentOf(activePathOf(activeTabId));
+    const name = window.prompt('新建目录（相对路径）', base ? `${base}/` : '');
+    if (!name) return;
+    setBusy(true);
+    try {
+      const created = await createWorkspaceDir(name.trim());
+      appendOutput(`已新建目录 ${created.path}`);
+      setExpanded((prev) => ({ ...prev, [parentOf(created.path)]: true }));
+      reload(parentOf(created.path));
+    } catch (e) {
+      report(`新建目录失败：${(e as { message?: string }).message ?? '未知错误'}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const rename = async (entry: WorkspaceEntry) => {
+    const next = window.prompt('改名 / 移动（相对路径）', entry.path);
+    if (!next || next.trim() === entry.path) return;
+    setBusy(true);
+    try {
+      await renameWorkspaceEntry(entry.path, next.trim());
+      appendOutput(`已改名 ${entry.path} → ${next.trim()}`);
+      reload(parentOf(entry.path));
+      reload(parentOf(next.trim()));
+    } catch (e) {
+      report(`改名失败：${(e as { message?: string }).message ?? '未知错误'}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (entry: WorkspaceEntry) => {
+    if (!window.confirm(`删除 ${entry.path}？${entry.dir ? '（目录必须为空）' : ''}`)) return;
+    setBusy(true);
+    try {
+      await deleteWorkspaceEntry(entry.path);
+      appendOutput(`已删除 ${entry.path}`);
+      reload(parentOf(entry.path));
+    } catch (e) {
+      report(`删除失败：${(e as { message?: string }).message ?? '未知错误'}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const upload = async (file: File) => {
+    setBusy(true);
+    try {
+      const created = await uploadWorkspaceFile(file.name, file);
+      appendOutput(`已上传 ${created.path}（${created.size} 字节）`);
+      reload('');
+    } catch (e) {
+      report(`上传失败：${(e as { message?: string }).message ?? '未知错误'}`);
+    } finally {
+      setBusy(false);
+      if (uploadRef.current) uploadRef.current.value = '';
+    }
   };
 
   const renderLevel = (path: string, depth: number) => {
@@ -112,12 +217,19 @@ export function FileTree() {
         const active = activeTabId === `file:${entry.path}`;
         const isOpen = !!expanded[entry.path];
         items.push(
-          <button
+          <div
             key={entry.path}
-            type="button"
+            role="button"
+            tabIndex={0}
             onClick={() => (entry.dir ? toggle(entry) : openFile(entry))}
+            onKeyDown={(event) => {
+              if (event.key !== 'Enter' && event.key !== ' ') return;
+              event.preventDefault();
+              if (entry.dir) toggle(entry);
+              else openFile(entry);
+            }}
             title={entry.path}
-            className="flex w-full items-center gap-1 py-[3px] pr-2 text-left text-[12px] transition-colors hover:bg-[var(--ink-700)]"
+            className="group flex w-full cursor-pointer items-center gap-1 py-[3px] pr-2 text-left text-[12px] transition-colors hover:bg-[var(--ink-700)]"
             style={{
               paddingLeft: 8 + depth * 12,
               background: active ? 'var(--ink-700)' : undefined,
@@ -136,7 +248,27 @@ export function FileTree() {
               style={{ color: entry.dir ? 'var(--brass)' : 'var(--muted)' }}
             />
             <span className="truncate">{entry.name}</span>
-          </button>
+            <span className="ml-auto hidden shrink-0 items-center gap-1 group-hover:flex">
+              <InlineAction
+                title="改名 / 移动"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void rename(entry);
+                }}
+              >
+                <span className="mono text-[10px]">改</span>
+              </InlineAction>
+              <InlineAction
+                title="删除"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void remove(entry);
+                }}
+              >
+                <Icon name="close" size={10} />
+              </InlineAction>
+            </span>
+          </div>
         );
         if (entry.dir && isOpen) {
           items.push(...renderLevel(entry.path, depth + 1));
@@ -162,16 +294,78 @@ export function FileTree() {
     <section className="pb-2">
       <div className="flex items-center px-3 py-1.5">
         <h2 className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">工作区</h2>
-        <button
-          type="button"
-          onClick={refresh}
-          title="重新读取"
-          className="ml-auto text-[var(--muted)] transition-colors hover:text-[var(--paper)]"
-        >
-          <Icon name="refresh" size={13} />
-        </button>
+        <span className="ml-auto flex items-center gap-1">
+          <IconButton title="新建目录" onClick={() => void newFolder()} disabled={busy}>
+            <Icon name="plus" size={12} />
+          </IconButton>
+          <IconButton title="上传文件到根目录" onClick={() => uploadRef.current?.click()} disabled={busy}>
+            <Icon name="save" size={12} />
+          </IconButton>
+          <IconButton title="重新读取" onClick={refreshAll} disabled={busy}>
+            <Icon name="refresh" size={12} />
+          </IconButton>
+        </span>
       </div>
+      <input
+        ref={uploadRef}
+        type="file"
+        className="hidden"
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          if (file) void upload(file);
+        }}
+      />
       <div>{renderLevel('', 0)}</div>
     </section>
   );
+}
+
+function IconButton({
+  title,
+  onClick,
+  disabled,
+  children,
+}: {
+  title: string;
+  onClick: () => void;
+  disabled?: boolean;
+  children: ReactElement;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      onClick={onClick}
+      disabled={disabled}
+      className="flex h-4 w-4 items-center justify-center text-[var(--muted)] transition-colors hover:text-[var(--paper)] disabled:opacity-40"
+    >
+      {children}
+    </button>
+  );
+}
+
+function InlineAction({
+  title,
+  onClick,
+  children,
+}: {
+  title: string;
+  onClick: (event: ReactMouseEvent) => void;
+  children: ReactElement;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      onClick={onClick}
+      className="flex h-4 w-4 items-center justify-center text-[var(--muted)] transition-colors hover:text-[var(--paper)]"
+    >
+      {children}
+    </button>
+  );
+}
+
+/** 页签 id 形如 `file:<路径>`；不是文件页时返回空串。 */
+function activePathOf(tabId: string): string {
+  return tabId.startsWith('file:') ? tabId.slice('file:'.length) : '';
 }

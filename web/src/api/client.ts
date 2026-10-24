@@ -65,6 +65,40 @@ export class ApiClient {
       body: JSON.stringify(body),
     });
   }
+
+  delete<T>(path: string): Promise<T> {
+    return this.request<T>(path, { method: 'DELETE' });
+  }
+
+  /**
+   * 原样收发字节。
+   *
+   * 不能走 `request`：那条路会自己写上 `Content-Type: application/json`，而搬
+   * 文件要的是字节本身——给一个 PNG 贴上 JSON 的类型，服务端再原样存下来，
+   * 盘上的文件头就还是对的，但中间任何一层都可能按声明去解释它。
+   */
+  async sendBytes<T>(path: string, method: 'POST' | 'PUT', body: Blob): Promise<T> {
+    const headers = new Headers();
+    headers.set('Content-Type', 'application/octet-stream');
+    if (this.token) headers.set('Authorization', `Bearer ${this.token}`);
+    const response = await fetch(`${API_BASE_URL}${path}`, { method, body, headers });
+    if (!response.ok) {
+      const text = await response.text();
+      throw { status: response.status, message: text || response.statusText } as ApiError;
+    }
+    return (await response.json()) as T;
+  }
+
+  async getBytes(path: string): Promise<Blob> {
+    const headers = new Headers();
+    if (this.token) headers.set('Authorization', `Bearer ${this.token}`);
+    const response = await fetch(`${API_BASE_URL}${path}`, { headers });
+    if (!response.ok) {
+      const text = await response.text();
+      throw { status: response.status, message: text || response.statusText } as ApiError;
+    }
+    return response.blob();
+  }
 }
 
 export const api = new ApiClient();
@@ -933,4 +967,49 @@ export async function saveWorkspaceFile(
   text: string
 ): Promise<WorkspaceFile> {
   return api.put<WorkspaceFile>('/api/v1/ide/file', { path, text });
+}
+
+export async function createWorkspaceDir(path: string): Promise<WorkspaceEntry> {
+  return api.post<WorkspaceEntry>('/api/v1/ide/mkdir', { path });
+}
+
+export async function renameWorkspaceEntry(
+  from: string,
+  to: string
+): Promise<WorkspaceFile> {
+  return api.post<WorkspaceFile>('/api/v1/ide/rename', { from, to });
+}
+
+export async function deleteWorkspaceEntry(path: string): Promise<void> {
+  await api.delete<void>(`/api/v1/ide/file?path=${encodeURIComponent(path)}`);
+}
+
+export async function uploadWorkspaceFile(
+  path: string,
+  blob: Blob
+): Promise<WorkspaceFile> {
+  return api.sendBytes<WorkspaceFile>(
+    `/api/v1/ide/upload?path=${encodeURIComponent(path)}`,
+    'POST',
+    blob
+  );
+}
+
+/**
+ * 下载：先取字节再交给浏览器另存。
+ *
+ * 直接写一个 `<a href>` 不行——那条请求不带 Authorization 头，会被鉴权挡下，
+ * 而把一个长期有效的令牌塞进 URL 里，等于把它留在浏览历史里。
+ */
+export async function downloadWorkspaceFile(path: string): Promise<void> {
+  const blob = await api.getBytes(`/api/v1/ide/raw?path=${encodeURIComponent(path)}`);
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = path.split('/').pop() ?? 'download';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  // 立刻撤销会让部分浏览器拿到空文件，下一轮事件循环再放掉。
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
