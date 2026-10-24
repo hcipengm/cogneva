@@ -13,7 +13,25 @@ metadata:
     app.kubernetes.io/component: search
 data:
   settings.yml: |
-    use_default_settings: true
+    # 只留这台主机连得上的引擎：镜像默认开着的 brave / duckduckgo / google cse /
+    # startpage / wikidata / wikipedia 在境内都不可达，每次查询各自等满超时后返回
+    # 零条，HTTP 也是 200——那看起来像「网上没有」，其实一条都没问出去。baidu 与
+    # sogou 连得上但一问就撞验证码或撞适配层崩溃，也裁掉。
+    use_default_settings:
+      engines:
+        keep_only:
+          - bing
+          - 360search
+    engines:
+      - name: bing
+        disabled: false
+        # `www.bing.com` 在境内 302 到 `cn.bing.com`，而这一层不跟这一步，只拿回
+        # 302 的空壳（零结果且不报错）；直接问 cn 就绕开了这次跳转。
+        base_url: https://cn.bing.com
+        # 同一地址走 HTTP/3 拿不回可用响应，切回 HTTP/2。
+        enable_http3: false
+      - name: 360search
+        disabled: false
     general:
       instance_name: "cogneva"
     server:
@@ -48,6 +66,11 @@ spec:
     spec:
       automountServiceAccountToken: false
       securityContext:
+        # 镜像默认以 root 起步；977 是镜像里 searxng 那个用户的 uid，写出来
+        # runAsNonRoot 才有落点。
+        runAsUser: 977
+        runAsGroup: 977
+        fsGroup: 977
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault

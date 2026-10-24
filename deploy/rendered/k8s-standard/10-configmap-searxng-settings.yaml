@@ -18,7 +18,29 @@ metadata:
     app.kubernetes.io/component: search
 data:
   settings.yml: |
-    use_default_settings: true
+    # 只留这台主机真的连得上的引擎。镜像默认开着的那一群（brave、duckduckgo、
+    # google cse、startpage、wikidata、wikipedia）在境内一律不可达：它们各自超时，
+    # 于是每次查询都等满超时、拿回零条结果，而 HTTP 仍是 200——调用方看到的像
+    # 「网上没有这条」，实际是一个都没问出去。baidu 与 sogou 倒是连得上，但这家
+    # 出口 IP 一问就撞验证码、或撞引擎适配层的崩溃，留在表里只会在每次查询的
+    # `unresponsive_engines` 里多两条噪声，没有一条结果。于是只留实测出结果的两家。
+    use_default_settings:
+      engines:
+        keep_only:
+          - bing
+          - 360search
+    engines:
+      # keep_only 只是留下条目，它们默认仍是关的，必须逐个打开。
+      - name: bing
+        disabled: false
+        # 200 之外还有一次 302：`www.bing.com` 在境内把请求转给 `cn.bing.com`，
+        # 而这一层的客户端不跟这一步，只拿回 302 的空壳——零结果且不报错。直接
+        # 问 `cn.bing.com` 就绕开了这次跳转。
+        base_url: https://cn.bing.com
+        # 开了 HTTP/3 时同样的地址拿不回可用响应；这一家走 HTTP/2 才稳定。
+        enable_http3: false
+      - name: 360search
+        disabled: false
     general:
       instance_name: "cogneva"
     server:

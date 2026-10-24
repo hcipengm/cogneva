@@ -25,6 +25,14 @@ spec:
       # 只读根 + 无 token：本 Pod 不持有任何凭证，也不写任何需要活过重启的东西。
       automountServiceAccountToken: false
       securityContext:
+        # 镜像的 entrypoint 默认以 root 起步（它只在 root 时才跑
+        # update-ca-certificates），而这里不需要那一步：写明 977 才是镜像里
+        # `searxng` 那个用户的 uid，`runAsNonRoot` 才有可核对的落点——只写
+        # runAsNonRoot 时 kubelet 看到的仍是镜像里的 root，容器起不来。
+        runAsUser: 977
+        runAsGroup: 977
+        # emptyDir 随 `fsGroup` 归到同一组，缓存目录才写得进去。
+        fsGroup: 977
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
