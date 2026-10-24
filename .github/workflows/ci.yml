@@ -186,6 +186,18 @@ jobs:
         run: cargo test -p cog-storage --test chat_turn_store -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The agent conversation's two claims are the database's rather than the
+      # caller's: that one exchange lands in both histories, which is decided by
+      # how the read side joins the two unit columns, and that the retention
+      # bound trims per receiving peer so a chatty peer cannot push another
+      # conversation out of reach, which is decided by the window function the
+      # trim statement uses. An in-memory store answers the first by
+      # construction and has no bound at all, so neither claim is visible
+      # without a server.
+      - name: Live-DB agent message store
+        run: cargo test -p cog-storage --test agent_message_store -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The catalog's one invariant is a unique constraint and its optional
       # columns are nullable on purpose: that a version holds one content, that
       # an absent row count stays absent instead of becoming zero, and that the
