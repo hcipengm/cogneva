@@ -1963,6 +1963,16 @@ data:
                   "face": "token 管理"
                 },
                 {
+                  "name": "llm_upstream_declared_face_missing",
+                  "promql": "((max by (upstream, face) (llm_upstream_face_answers{declared=\"1\"} and on (upstream, face, declared) ((time() - llm_upstream_face_answers_observed_timestamp_seconds) < 1800))) == bool 0)",
+                  "condition": {
+                    "greater_than": 0.0
+                  },
+                  "severity": "critical",
+                  "summary": "upstream {upstream} was asked for a minimal request on {face}, the face it is declared to serve, and the answer was 0: the address that face's calls are composed for does not exist, so every request routed to this entry on {face} comes back 404 before it reaches a model. `declared=\"1\"` restricts this to the face the router already takes this entry on without asking -- the one its calls actually go to -- because a 0 on any other face is the expected answer and only the reason this entry is not used as a fallback there; without that label every entry would fire for every protocol face it does not serve, which is the normal state of a single-face vendor. The value is a measurement and not the health verdict: a 404 on an entry's own face never entered the suspect window, so `llm_upstream_healthy` and the pool-wide verdict can both read fine while this is true, and no other rule states it. Measured 2026-10-25: an entry's base_url carried its version segment, the probe composed one path element after it and the request path composed two, the entry read healthy for as long as it was configured, and every real call on that face came back 404 from an address the vendor never served. The repair is the base_url -- exactly one path element may be appended, so the version segment belongs in it -- and waiting never reaches that, which is what separates this from the -1 reading, a refusal about the account or the network that may clear by itself; -1 never fires this rule, so an outage on the way to an endpoint is not reported here as a wrong address. The freshness bound is this writer's own clock on the companion `_observed_timestamp_seconds`, now minus that stamp under half an hour, because the store serves a gauge's newest row forever and a writer that stopped would otherwise leave a frozen 0 reading as a live verdict: what such a stop costs is this rule going quiet, and `llm_pool_signal_undelivered` is the one that reads the writer.",
+                  "face": "token 管理"
+                },
+                {
                   "name": "llm_calls_all_failing",
                   "promql": "((sum by (upstream) (changes(llm_upstream_failures_total{upstream=~\".+\",source=\"caller\"}[6h])) > 0) or (sum by (upstream) (changes(llm_upstream_client_errors_total{upstream=~\".+\"}[6h])) > 0)) unless on () (sum(changes(llm_usage_readings_total{outcome=~\"read|absent|not_asked\"}[6h])) > 0)",
                   "condition": {

@@ -763,6 +763,12 @@ struct UpstreamRefusal {
     /// 从拒绝正文读出的成因。连接层与解析层失败没有上游的话可读，这里是 `None`
     /// ——"没拿到话"与"拿到了但读不懂"（`Unclassified`）不是同一格。
     refusal_kind: Option<RefusalKind>,
+    /// 上游回的状态码；连不上时没有。
+    ///
+    /// 面探测要用它把"这一面在这个 base 上不存在"（404）与"这一面拒了我"（401/
+    /// 403/429）分开。成因那三个取值分不出这两类——两者读正文都可能是
+    /// `unclassified`——而它们的修法相反：前者要改地址，后者等或换账号。
+    status: Option<u16>,
 }
 
 impl UpstreamRefusal {
@@ -773,16 +779,18 @@ impl UpstreamRefusal {
             quota_reset_unix: None,
             quota_window_secs: None,
             refusal_kind: None,
+            status: None,
         }
     }
 
-    /// 上游给了非 2xx：三样证据都从这一次的正文里读。
-    fn from_body(message: String, text: &str, retry_after: Option<&str>) -> Self {
+    /// 上游给了非 2xx：四样证据都从这一次的应答里读。
+    fn from_body(status: u16, message: String, text: &str, retry_after: Option<&str>) -> Self {
         Self {
             message,
             quota_reset_unix: parse_quota_reset(text, retry_after),
             quota_window_secs: parse_quota_window_secs(text),
             refusal_kind: Some(classify_refusal(text)),
+            status: Some(status),
         }
     }
 }
@@ -957,7 +965,57 @@ struct LlmHealthTable {
     last_success_unix: std::sync::atomic::AtomicI64,
     /// 运行时补问到的能力判定，按上游身份存（与上面两个表同一个键）。
     runtime_caps: Mutex<std::collections::HashMap<String, RuntimeCapabilityProbe>>,
+    /// 每台上游在**每个请求面**上最近一次问出来的答复，键 `{上游身份}|{面}`。
+    ///
+    /// 条目里的 `api_style` 记的是它**在哪一面被准入**，此后没有任何一拍再问过
+    /// 别的面。一家同时会说几个面的上游因此只在一个面上被数到，在别的面上跟
+    /// 不存在一样——2026-10-25 的现场就是这个形状：业务与评测唯一会打的那个面
+    /// 十天没有一家能接，而池里配着的另一家**就在那个面上应答着**。
+    ///
+    /// 与 `states` 分开是因为判的东西不同：`states` 判"这一家能不能干活"，这条
+    /// 只判"这一家在这一面上说不说话"。一条上游在一面上一声不吭不是它的失败——
+    /// 它从没被声明在那面上——所以这里的答复**不进**嫌疑窗，也不改
+    /// `llm_upstream_healthy`。
+    face_answers: Mutex<std::collections::HashMap<String, FaceAnswerReading>>,
 }
+
+/// 一次面探测问出来的三种答复。
+///
+/// 三值而不是"能不能用"：能接、这一面在这个地址上不存在、以及问到了话但不是
+/// 关于这一面的（配额/资格/连不上）。后两者的修法相反——前者要改 `base_url`，
+/// 等多久都不会好；后者是账号或网络，这一条随时可能恢复。合成一个"不能接"会让
+/// 运营者去改一个正确的地址。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FaceAnswer {
+    Answers,
+    NoSuchEndpoint,
+    Inconclusive,
+}
+
+impl FaceAnswer {
+    /// 发到读数面上的值。
+    fn reading(self) -> f64 {
+        match self {
+            Self::Answers => 1.0,
+            Self::NoSuchEndpoint => 0.0,
+            Self::Inconclusive => -1.0,
+        }
+    }
+}
+
+/// 一台上游在一个面上最近一次的答复与时刻。
+#[derive(Clone, Copy, Debug)]
+struct FaceAnswerReading {
+    answer: FaceAnswer,
+    measured_at: std::time::Instant,
+}
+
+/// 面答复多久重问一次。
+///
+/// 一次面探测就是一次 `max_tokens=1` 的 ping，配额成本可以忽略；而"某个面没了"
+/// 是件**慢**事（厂商下掉端点、运维写错地址），要的是迟早会看见，不是三十秒内
+/// 看见。这个间隔同时是候选资格的有效期：一条十天前的答复不该替今天放行流量。
+const FACE_ANSWER_TTL_SECS: u64 = 1800;
 
 /// 准入探测问的三个问题。
 ///
@@ -1370,6 +1428,53 @@ impl LlmHealthTable {
         caps.retain(|key, _| upstreams.iter().any(|u| Self::key(u) == *key));
     }
 
+    /// 面上那一条记录的键：上游身份与面分开折进去，一个面一条。
+    fn face_key(u: &LlmUpstream, face: &str) -> String {
+        format!("{}\u{1f}{face}", Self::key(u))
+    }
+
+    /// 这台上游此刻在这个面上的答复；没问过或答复已过期都是 `None`。
+    ///
+    /// 过期即"没有答复"而不是沿用旧值：候选资格是拿它放行流量的，一条十天后
+    /// 还能生效的旧答复，在厂商下掉端点之后仍然会把请求送过去。
+    fn face_answer(&self, u: &LlmUpstream, face: &str) -> Option<FaceAnswer> {
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(FACE_ANSWER_TTL_SECS);
+        self.face_answers
+            .lock()
+            .unwrap()
+            .get(&Self::face_key(u, face))
+            .filter(|reading| now.saturating_duration_since(reading.measured_at) < ttl)
+            .map(|reading| reading.answer)
+    }
+
+    /// 落一次面探测的答复。三种答复都落，包括"问到了话但不是关于这一面的"：
+    /// 它至少说明这一面不是 404，而下一次重问的时刻由它决定。
+    fn note_face_answer(&self, u: &LlmUpstream, face: &str, answer: FaceAnswer) {
+        self.face_answers.lock().unwrap().insert(
+            Self::face_key(u, face),
+            FaceAnswerReading {
+                answer,
+                measured_at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// 这一家在这一面上该不该现在重问一次。
+    fn due_for_face_probe(&self, u: &LlmUpstream, face: &str) -> bool {
+        self.face_answer(u, face).is_none()
+    }
+
+    /// 丢掉不在池里的上游的面答复，理由与 `forget_unconfigured_capabilities`
+    /// 同一条：换掉的配置不该留着一条谁也读不到的记录。
+    fn forget_unconfigured_faces(&self, upstreams: &[LlmUpstream]) {
+        let live: std::collections::HashSet<String> = upstreams.iter().map(Self::key).collect();
+        self.face_answers.lock().unwrap().retain(|key, _| {
+            key.rsplit_once('\u{1f}')
+                .is_some_and(|(upstream, _)| live.contains(upstream))
+        });
+    }
+
     /// 嫌疑上游的复测窗口是否到期：只有这些需要主动探测，
     /// 健康上游不探（每次探测都烧真实配额，由真实请求实证即可）。
     ///
@@ -1550,6 +1655,10 @@ pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
     cog_core::metric_names::LLM_UPSTREAM_QUOTA_RESET_UNIX,
     cog_core::metric_names::LLM_UPSTREAM_CONSECUTIVE_FAILURES,
     cog_core::metric_names::LLM_UPSTREAM_REFUSAL_KIND,
+    // 同一个循环里按面写的答复。它比进程活得久的理由与 `face_serving` 相同：
+    // 一个厂商悄悄下掉一个面是件漫水的事，读数要能被回头比对，而不是随 Pod
+    // 换代消失。
+    cog_core::metric_names::LLM_UPSTREAM_FACE_ANSWERS,
     cog_core::metric_names::LLM_USAGE_VERDICT_MEASURED,
     cog_core::metric_names::LLM_TOOL_CALLS_VERDICT_MEASURED,
     cog_core::metric_names::LLM_TEMPERATURE_VERDICT_MEASURED,
@@ -4129,8 +4238,8 @@ async fn refresh_pool_state(state: &AppState) {
     // 同时住着两种协议面时，anthropic 面还有一家健康、openai 面一家都不剩，池级
     // `available` 读 1，而每一次 /v1/chat/completions 都在熔断处被拒。2026-10-24 的
     // 现场就是这样：续跑循环按 `available` 判「窗口开了」，一轮轮起跑、一轮轮零产出。
-    // 所以每个请求面各自报一行，判法与请求路同用一个 `serves_face`。
-    for (face, members, up) in face_capacity(upstreams, |u| state.llm_health.is_suspect(u)) {
+    // 所以每个请求面各自报一行，判法与请求路同用一个 `can_take_request`。
+    for (face, members, up) in face_capacity(upstreams, &state.llm_health) {
         // 分母先写：「这一面有几家」与「还能接几家」是两个人读同一格时要分开的两件事。
         // 只写后者时，一个 0 既可能是成员全在拒绝窗里，也可能是这一面从没配过，而
         // 前者的修法是等、后者的修法是配。
@@ -4203,6 +4312,43 @@ async fn refresh_pool_state(state: &AppState) {
             &[("upstream", &LlmHealthTable::key(upstream))],
         )
         .await;
+    }
+
+    // 每台上游在三个面上各一条答复。没问过的那一格**不发**：缺席在这个介质上
+    // 读作"还没有读数"，而这一族的三条曲线分别是"能接""这个地址上没这一面"
+    // "问到了话但不是关于这一面的"，没有一个值能诚实地代表"还没问"。探测器在
+    // 进程起步的第一拍就问，之后每 `FACE_ANSWER_TTL_SECS` 重问一次，所以缺席
+    // 只出现在最初那一两秒；而读过一次就停下不写的旧值会带着一个不动的观测
+    // 时刻留在库里，读它的规则必须同时界这个时刻——见下面那条告警。
+    for upstream in upstreams.iter() {
+        let key = LlmHealthTable::key(upstream);
+        for face in REQUEST_FACES {
+            let Some(answer) = state.llm_health.face_answer(upstream, face) else {
+                continue;
+            };
+            // `declared` 是**路由是否已经相信这一面**，与请求路同一个判据
+            // （`serves_face`），不是"这一面等不等于条目写的那一个字符串"：一条
+            // 在 `/responses` 上准入的条目按声明就接 chat 面，它在这一面上 404
+            // 与一条 anthropic 条目在这一面上 404 完全是两件事，读的人要分得开。
+            record_gauge(
+                state,
+                cog_core::metric_names::LLM_UPSTREAM_FACE_ANSWERS,
+                answer.reading(),
+                &[
+                    ("upstream", &key),
+                    ("face", face),
+                    (
+                        "declared",
+                        if serves_face(&upstream.api_style, face) {
+                            "1"
+                        } else {
+                            "0"
+                        },
+                    ),
+                ],
+            )
+            .await;
+        }
     }
 
     for reading in &readings {
@@ -4441,6 +4587,7 @@ fn ask_unmeasured_capabilities(
     readings: &[UpstreamReading],
 ) {
     state.llm_health.forget_unconfigured_capabilities(upstreams);
+    state.llm_health.forget_unconfigured_faces(upstreams);
     let base_secs = state.config.llm_health_probe_secs;
     for u in upstreams {
         // 条目里有判定、或补问已经问出结论的，就没有要问的问题。
@@ -4891,7 +5038,7 @@ async fn anthropic_messages_passthrough(
 /// 池耗尽时把最后一个真实上游错误透传给调用方——厂商错误标记
 /// （如 access_terminated_error）是调用侧终止性失败分类的依据，
 /// 不能被合成文本吃掉。
-/// Whether a pool entry can take a request for the named face.
+/// Whether a pool entry's declaration lets it take a request for the named face.
 ///
 /// An OpenAI entry records the face it was *verified* on. Being verified on
 /// `/responses` says the vendor speaks the newer shape and, because the two
@@ -4900,6 +5047,10 @@ async fn anthropic_messages_passthrough(
 /// never been asked about `/responses`, and forwarding there on the strength of
 /// its neighbour face would turn every call into a 404 the caller reads as its
 /// own mistake.
+///
+/// This is the declaration half only. What the request path uses is
+/// [`can_take_request`], which adds the measured half — an entry that answered
+/// a simple request on a face serves it whether or not it was declared there.
 fn serves_face(upstream_style: &str, requested: &str) -> bool {
     if requested == cog_llm::responses::API_STYLE {
         upstream_style == cog_llm::responses::API_STYLE
@@ -4910,6 +5061,29 @@ fn serves_face(upstream_style: &str, requested: &str) -> bool {
     }
 }
 
+/// 这一条此刻能不能接这个面上的请求：**声明算数，实测也算数**。
+///
+/// 声明那半见 [`serves_face`]。实测那半是补的：条目里的 `api_style` 只是它被
+/// 准入的那一面，此后没有人再问过别的面，于是会说几个面的上游只在一个面上被
+/// 数到。一台上游在一个面上答过一个最小请求，它就能接那个面的请求——请求体
+/// 的形状由**调用方**决定，走的是那一面自己的地址，中间不需要翻译。
+///
+/// 只有 [`FaceAnswer::Answers`] 放行：`NoSuchEndpoint`（这面在这个地址上不存在）
+/// 与 `Inconclusive`（配额/资格/连不上，这一面可能好得很）都不放行——后者仍由
+/// 声明那半管着，它被承认或不被承认与这一问无关。
+fn can_take_request(health: &LlmHealthTable, upstream: &LlmUpstream, face: &str) -> bool {
+    serves_face(&upstream.api_style, face) || answers_face(health, upstream, face)
+}
+
+/// 实测那一半：这一条在这个面上答过一个最小请求，且那次答复还没过期。
+///
+/// 只有 [`FaceAnswer::Answers`] 为真。`NoSuchEndpoint` 说明这一面在这个地址上
+/// 不存在，`Inconclusive` 说明问到了话但不是关于这一面的（配额、资格、连不上）
+/// ——两种都不该放行流量，也不该反过来取消条目在**声明**那一面上的资格。
+fn answers_face(health: &LlmHealthTable, upstream: &LlmUpstream, face: &str) -> bool {
+    health.face_answer(upstream, face) == Some(FaceAnswer::Answers)
+}
+
 /// 池里每一个请求面此刻各有几家配着、几家能接（后者＝不在嫌疑窗内的家数）。
 ///
 /// 面是**请求**的面，不是上游条目的面：一个在 `/responses` 上实证过的 OpenAI 条目
@@ -4917,19 +5091,26 @@ fn serves_face(upstream_style: &str, requested: &str) -> bool {
 /// 三个面每拍都发，缺省那个 0 才是要看的数——只发有人接的那一面，另一面归零之后
 /// 序列直接消失，图上读成「没这个面」。
 ///
-/// 配额那一个是分母，不是第二份读数：能接的那个 0 单独出现时答不了「是成员都被
-/// 挡住了，还是这一面从来没人配」，而这两种 0 的修法相反。
-fn face_capacity<'a>(
-    upstreams: &'a [LlmUpstream],
-    suspect: impl Fn(&LlmUpstream) -> bool,
+/// 能与配是两个判据：**配**只数声明（[`serves_face`]），**能接**数
+/// [`can_take_request`]，所以后者可以大于前者——一家声明在别的面上、实测在这个
+/// 面上应答的上游，确实能接这个面。两个数放在一起读才不会把「这一面没人配过」
+/// 与「配了但接不了」当成同一件事，也不会把「没人配、却有成员能接」读成后者。
+fn face_capacity(
+    upstreams: &[LlmUpstream],
+    health: &LlmHealthTable,
 ) -> Vec<(&'static str, usize, usize)> {
-    let faces: [&'static str; 3] = ["openai", "anthropic", cog_llm::responses::API_STYLE];
-    faces
+    REQUEST_FACES
         .iter()
         .map(|face| {
-            let on_face = || upstreams.iter().filter(|u| serves_face(&u.api_style, face));
-            let members = on_face().count();
-            let serving = on_face().filter(|u| !suspect(u)).count();
+            let members = upstreams
+                .iter()
+                .filter(|u| serves_face(&u.api_style, face))
+                .count();
+            let serving = upstreams
+                .iter()
+                .filter(|u| can_take_request(health, u, face))
+                .filter(|u| !health.is_suspect(u))
+                .count();
             (*face, members, serving)
         })
         .collect()
@@ -5011,13 +5192,35 @@ async fn stream_forward(
         .and_then(|v| v.get("tools"))
         .and_then(|t| t.as_array())
         .is_some_and(|t| !t.is_empty());
-    let candidates: Vec<&LlmUpstream> = state
+    // 候选 = 声明在这一面上的条目在前，**实测**在这一面上应答的条目在后。
+    //
+    // 顺序就是优先级：声明是运维写下的意图，实测只是补上他没写的那一半。所以
+    // 跨面条目永远排在所有声明条目之后，绝不会顶掉一个本来就该接这条请求的
+    // 上游；它能把一次注定的 503 变成一次尝试，最坏也只是多失败一次，然后照旧
+    // 报原来那条错。
+    //
+    // 这条补的是 2026-10-25 那个形状：业务与评测唯一会打的 openai 面十天没有
+    // 一家声明在那里的成员能接（唯一的一家在额度窗里），而池里另一家配着、
+    // 就在这个面上应答着——它被准入在 anthropic 面上，于是从来没被当成候选。
+    let usable = |u: &&LlmUpstream| {
+        !wants_tools || state.llm_health.effective_tool_calls_verdict(u) != Some(false)
+    };
+    let mut candidates: Vec<&LlmUpstream> = state
         .config
         .llm_upstreams
         .iter()
         .filter(|u| serves_face(&u.api_style, style))
-        .filter(|u| !wants_tools || state.llm_health.effective_tool_calls_verdict(u) != Some(false))
+        .filter(usable)
         .collect();
+    candidates.extend(
+        state
+            .config
+            .llm_upstreams
+            .iter()
+            .filter(|u| !serves_face(&u.api_style, style))
+            .filter(|u| answers_face(&state.llm_health, u, style))
+            .filter(usable),
+    );
     if candidates.is_empty() {
         // 池里一个能接这个面的条目都没有时说清是哪一种「没有」：一家上游
         // 都没配、配了但没有这个面、还是这个面的条目都被工具能力的实证挡掉了。
@@ -5293,7 +5496,11 @@ async fn stream_forward(
             .post(&url)
             .header("Content-Type", "application/json")
             .body(body);
-        let builder = match upstream.api_style.as_str() {
+        // 凭证头按**被请求的那一面**，不按条目的准入面：一家会说几面的上游在
+        // anthropic 面上认 `x-api-key`、在 OpenAI 族两面认 Bearer，而这条请求
+        // 走的就是它被测出能接的那一面。按准入面发，跨面时会发错那一套头，
+        // 而发错头换回来的 401 会被读成"这家坏了"。
+        let builder = match style {
             "anthropic" => builder
                 .header("x-api-key", &upstream.api_key)
                 .header("anthropic-version", "2023-06-01"),
@@ -5615,6 +5822,10 @@ fn spawn_llm_health_prober(state: AppState) -> tokio::task::JoinHandle<()> {
                     beat.beat();
                     ticker.tick().await;
                     probe_suspect_upstreams(&state).await;
+                    // 面答复与嫌疑窗分开问：那一支判"这一家还能不能干活"，这一支
+                    // 判"这一家在这一面上说不说话"。同一拍里跑，各按各的节拍
+                    // （后者由 `FACE_ANSWER_TTL_SECS` 门控）。
+                    measure_face_answers(&state).await;
                 }
             }
         },
@@ -5729,12 +5940,23 @@ fn face_url(style: &str, base_url: &str) -> String {
 /// 最小连通性探测：max_tokens=1 的单轮 ping，只认 HTTP 状态码。
 /// 不带 tools（探测目标是"这家还能不能用"，能力准入另有探测）。
 async fn probe_upstream(state: &AppState, upstream: &LlmUpstream) -> Result<(), UpstreamRefusal> {
-    // The probe asks the face the entry was admitted on. Probing an entry
-    // verified on `/responses` with a chat-shaped body would read a 404 as the
-    // upstream being down, and a healthy entry would sit in the suspect window
-    // forever with no request ever reaching it.
-    let responses_face = upstream.api_style == cog_llm::responses::API_STYLE;
-    let url = face_url(&upstream.api_style, &upstream.base_url);
+    // 探的就是它被准入的那一面：拿 chat 形状的体去问一条在 `/responses` 上
+    // 验证过的条目，回 404 会被读成"这家坏了"，而它其实一直是好的。
+    probe_face(state, upstream, &upstream.api_style).await
+}
+
+/// 在**指定的一面**上问一次最小请求。
+///
+/// 面决定两件事，都从参数来而不是从条目的 `api_style` 来：地址（[`face_url`]）
+/// 与凭证头（anthropic 面用 `x-api-key`，OpenAI 族两面用 Bearer）。一家会说几个
+/// 面的上游，在这几面上要用各自那套——按准入面发，探别面时就发错了头。
+async fn probe_face(
+    state: &AppState,
+    upstream: &LlmUpstream,
+    face: &str,
+) -> Result<(), UpstreamRefusal> {
+    let responses_face = face == cog_llm::responses::API_STYLE;
+    let url = face_url(face, &upstream.base_url);
     let payload = if responses_face {
         serde_json::json!({
             "model": upstream.model,
@@ -5753,7 +5975,7 @@ async fn probe_upstream(state: &AppState, upstream: &LlmUpstream) -> Result<(), 
         .post(&url)
         .header("Content-Type", "application/json")
         .json(&payload);
-    let builder = match upstream.api_style.as_str() {
+    let builder = match face {
         "anthropic" => builder
             .header("x-api-key", &upstream.api_key)
             .header("anthropic-version", "2023-06-01"),
@@ -5774,10 +5996,61 @@ async fn probe_upstream(state: &AppState, upstream: &LlmUpstream) -> Result<(), 
             .map(|s| s.to_string());
         let text = resp.text().await.unwrap_or_default();
         Err(UpstreamRefusal::from_body(
+            status.as_u16(),
             format!("HTTP {status}: {}", error_excerpt(&text)),
             &text,
             retry_after.as_deref(),
         ))
+    }
+}
+
+/// 三个请求面。
+const REQUEST_FACES: [&str; 3] = ["openai", "anthropic", cog_llm::responses::API_STYLE];
+
+/// 一次面探测的答复怎么读。
+///
+/// 判据只有一条：**这条应答是不是在回答"这一面在不在"**。
+/// - 2xx 是这一面收下了。
+/// - 404 是这一面在这个地址上不存在——路径没这个资源，与凭证无关。
+/// - 其余（401/403/429/5xx、连不上）问到了话但不是关于面的那一句：这一面可能
+///   好得很，只是这个账号现在不能用。判成"不存在"会让运营者改一个正确的地址。
+fn classify_face_answer(result: &Result<(), UpstreamRefusal>) -> FaceAnswer {
+    match result {
+        Ok(()) => FaceAnswer::Answers,
+        Err(refusal) if refusal.status == Some(404) => FaceAnswer::NoSuchEndpoint,
+        Err(_) => FaceAnswer::Inconclusive,
+    }
+}
+
+/// 面探测：每台上游在每个面上按 [`FACE_ANSWER_TTL_SECS`] 重问一次。
+///
+/// 与嫌疑窗那一支分开跑，判的东西本来也不同：那一支判"这一家还能不能干活"，
+/// 这一支只判"这一家在这一面上说不说话"。所以这里**不记失败、不进嫌疑窗**——
+/// 一条上游在一面上一声不吭不是它的失败，它从没被声明在那面上。
+async fn measure_face_answers(state: &AppState) {
+    for upstream in &state.config.llm_upstreams {
+        for face in REQUEST_FACES {
+            if !state.llm_health.due_for_face_probe(upstream, face) {
+                continue;
+            }
+            let result = probe_face(state, upstream, face).await;
+            let answer = classify_face_answer(&result);
+            if let Err(refusal) = &result {
+                tracing::debug!(
+                    upstream = %upstream.base_url.trim_end_matches('/'),
+                    face,
+                    status = refusal.status.unwrap_or(0),
+                    answer = match answer {
+                        FaceAnswer::Answers => "answers",
+                        FaceAnswer::NoSuchEndpoint => "no_such_endpoint",
+                        FaceAnswer::Inconclusive => "inconclusive",
+                    },
+                    error = %refusal.message,
+                    "面探测"
+                );
+            }
+            state.llm_health.note_face_answer(upstream, face, answer);
+        }
     }
 }
 
@@ -5943,6 +6216,7 @@ async fn call_one_upstream(
                 .map(|s| s.to_string());
             let text = resp.text().await.unwrap_or_default();
             return Err(UpstreamRefusal::from_body(
+                status.as_u16(),
                 format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text)),
                 &text,
                 retry_after.as_deref(),
@@ -6004,6 +6278,7 @@ async fn call_one_upstream(
             .map(|s| s.to_string());
         let text = resp.text().await.unwrap_or_default();
         return Err(UpstreamRefusal::from_body(
+            status.as_u16(),
             format!("上游 {base} 返回 HTTP {status}: {}", error_excerpt(&text)),
             &text,
             retry_after.as_deref(),
@@ -12400,6 +12675,275 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
              denominator is what tells that 0 apart from a face whose members are all \
              in a refusal window:\n{text}"
         );
+    }
+
+    /// 一个面探测问出来的答复必须有人读，而且读法只有一条：**它决定这一条能不能
+    /// 接这个面的请求**。
+    ///
+    /// 2026-10-25 的形状：业务与评测唯一会打的那一面没有一家声明成员能接，池里
+    /// 另一家配着、就在那个面上应答着，而它被准入在另一面，于是从来没被当作候选
+    /// ——十天零产出，指标面上没有一条序列说出这件事。
+    #[tokio::test]
+    async fn a_member_measured_on_a_face_the_pool_never_declared_takes_its_requests() {
+        // 桩同时在两个面上应答：`{base}/chat/completions` 与 `{base}/messages`。
+        let (stub, seen) = spawn_face_stub(&["/v1/chat/completions", "/v1/messages"]).await;
+        let base = format!("{stub}/v1");
+        let mut member = stub_upstream(&base, "k3");
+        // 准入在 anthropic 面——正是现场那一条的声明。
+        member.api_style = "anthropic".into();
+        let state = test_state(vec![member.clone()]);
+
+        // 问之前：openai 面一家声明都没有，也没有实测，请求根本走不出去。
+        let before = chat_completions_passthrough(
+            State(state.clone()),
+            json_request(r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#),
+        )
+        .await;
+        assert!(
+            before.is_err(),
+            "before anything measured the face, there is no candidate and the caller must \
+             be told so rather than sent to a guess"
+        );
+
+        measure_face_answers(&state).await;
+        assert_eq!(
+            state.llm_health.face_answer(&member, "openai"),
+            Some(FaceAnswer::Answers),
+            "the stub answers /chat/completions, so the measurement must say so"
+        );
+        seen.lock().unwrap().clear();
+
+        let resp = chat_completions_passthrough(
+            State(state.clone()),
+            json_request(r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#),
+        )
+        .await
+        .expect("a member measured on this face must take the request");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["/v1/chat/completions"],
+            "the request goes to the face's own address, one path element after the base"
+        );
+
+        // 读数面：能接的家数大于配着的家数——这一面没人配过，却有成员能接。
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            text.contains(r#"llm_pool_face_upstreams{face="openai"} 0"#),
+            "nothing is declared on the openai face:\n{text}"
+        );
+        assert!(
+            text.contains(r#"llm_pool_face_serving{face="openai"} 1"#),
+            "one member was measured as answering the openai face, so it can take its \
+             requests even though it was never declared there:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                r#"llm_upstream_face_answers{{declared="0",face="openai",upstream="{}"}} 1"#,
+                LlmHealthTable::key(&member)
+            )),
+            "the measurement itself is published, so the pool's count can be traced back \
+             to who answered. declared=0 because this member is admitted on another face and \
+             only answers this one: the pair (declared=0, 1) is what says a fallback was \
+             found, while (declared=1, 0) is the entry whose own address is wrong:\n{text}"
+        );
+    }
+
+    /// 对面那一面**不存在**时不许放行，也不许把这条记成失败：它只是没被声明在
+    /// 那一面。答复要落到读数面上，并且与"问到了话但不是关于这一面的"分开。
+    #[tokio::test]
+    async fn a_face_that_does_not_exist_is_neither_a_candidate_nor_a_failure() {
+        let (stub, _seen) = spawn_face_stub(&["/v1/messages"]).await;
+        let base = format!("{stub}/v1");
+        let mut member = stub_upstream(&base, "k3");
+        member.api_style = "anthropic".into();
+        let state = test_state(vec![member.clone()]);
+
+        measure_face_answers(&state).await;
+
+        assert_eq!(
+            state.llm_health.face_answer(&member, "openai"),
+            Some(FaceAnswer::NoSuchEndpoint),
+            "the stub answers 404 on every path but /v1/messages"
+        );
+        assert!(
+            !state.llm_health.is_suspect(&member),
+            "a face the entry was never admitted on refusing it is not this entry failing; \
+             pushing it into the suspect window would take the anthropic face down with it"
+        );
+        let err = chat_completions_passthrough(
+            State(state.clone()),
+            json_request(r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#),
+        )
+        .await
+        .expect_err("a measured 404 must not become a candidate");
+        assert_ne!(err.0, StatusCode::OK);
+
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            text.contains(&format!(
+                r#"llm_upstream_face_answers{{declared="0",face="openai",upstream="{}"}} 0"#,
+                LlmHealthTable::key(&member)
+            )),
+            "0 says the face does not exist at this base, which is the wrong-address \
+             repair; declared=0 keeps it apart from an entry that was admitted on that face \
+             and 404s anyway, and either way it must not read as a health verdict:\n{text}"
+        );
+    }
+
+    /// 问到了话但不是关于这一面的（配额/资格/连不上）：三值里的 -1。判成 0 会
+    /// 让运营者去改一个正确的地址。
+    #[tokio::test]
+    async fn a_refusal_that_is_not_about_the_face_reads_unknown_not_missing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/{*rest}",
+            post(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("content-type", "application/json")],
+                    r#"{"error":{"message":"quota exceeded","type":"insufficient_quota"}}"#,
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut member = stub_upstream(&format!("http://{addr}/v1"), "k3");
+        member.api_style = "anthropic".into();
+        let state = test_state(vec![member.clone()]);
+
+        measure_face_answers(&state).await;
+
+        assert_eq!(
+            state.llm_health.face_answer(&member, "openai"),
+            Some(FaceAnswer::Inconclusive)
+        );
+        refresh_pool_state(&state).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            text.contains(&format!(
+                r#"llm_upstream_face_answers{{declared="0",face="openai",upstream="{}"}} -1"#,
+                LlmHealthTable::key(&member)
+            )),
+            "a quota refusal says nothing about whether the face exists, and reporting it \
+             as 0 would send an operator to edit a correct address:\n{text}"
+        );
+    }
+
+    /// 声明在别处的成员只能垫底：它不许顶掉一个本来就在这一面上声明过的上游。
+    #[tokio::test]
+    async fn a_declared_member_still_comes_before_a_measured_one() {
+        let (declared_stub, declared_seen) =
+            spawn_face_stub(&["/v1/chat/completions", "/v1/messages"]).await;
+        let (cross_stub, cross_seen) =
+            spawn_face_stub(&["/v1/chat/completions", "/v1/messages"]).await;
+        let declared = stub_upstream(&format!("{declared_stub}/v1"), "m1");
+        let mut cross = stub_upstream(&format!("{cross_stub}/v1"), "m2");
+        cross.api_style = "anthropic".into();
+        let state = test_state(vec![cross.clone(), declared.clone()]);
+
+        measure_face_answers(&state).await;
+        // 探针自己也会打这些桩，先清干净，剩下记到的才是请求路发的。
+        declared_seen.lock().unwrap().clear();
+        cross_seen.lock().unwrap().clear();
+        // 声明那一家排在配置的第二位，跨面那一家在第一位——顺序要按资格分，
+        // 不按配置位置。
+        let resp = chat_completions_passthrough(
+            State(state.clone()),
+            json_request(r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#),
+        )
+        .await
+        .expect("both can serve, so the request must succeed");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            declared_seen.lock().unwrap().as_slice(),
+            ["/v1/chat/completions"],
+            "the member declared on this face takes the call"
+        );
+        assert!(
+            cross_seen.lock().unwrap().is_empty(),
+            "the measured member is a fallback, not a peer: it must not take traffic from \
+             a member that was declared for this face"
+        );
+    }
+
+    /// 答复过期就不再放行：一条十天前的"这一面能接"会把请求送给一个已经下掉
+    /// 端点的厂商。
+    #[test]
+    fn a_face_answer_older_than_the_ttl_stops_granting_candidacy() {
+        let member = stub_upstream("https://kimi.example.com/v1", "k3");
+        let health = LlmHealthTable::default();
+        health.face_answers.lock().unwrap().insert(
+            LlmHealthTable::face_key(&member, "openai"),
+            FaceAnswerReading {
+                answer: FaceAnswer::Answers,
+                measured_at: std::time::Instant::now()
+                    - std::time::Duration::from_secs(FACE_ANSWER_TTL_SECS + 1),
+            },
+        );
+        assert_eq!(health.face_answer(&member, "openai"), None);
+        assert!(!answers_face(&health, &member, "openai"));
+        assert!(
+            health.due_for_face_probe(&member, "openai"),
+            "an expired answer is a question again, not a standing verdict"
+        );
+    }
+
+    /// 本地桩上游：`served` 里的路径回 200，其余一律 404（带厂商那句真实的
+    /// `resource_not_found_error`）。返回基址与它收到的路径。
+    async fn spawn_face_stub(
+        served: &'static [&'static str],
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::http::header;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let capture = seen.clone();
+        let app = Router::new().route(
+            "/{*rest}",
+            post(move |req: axum::extract::Request| {
+                let seen = capture.clone();
+                async move {
+                    let path = req.uri().path().to_string();
+                    seen.lock().unwrap().push(path.clone());
+                    if !served.contains(&path.as_str()) {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"error":{"message":"The requested resource was not found","type":"resource_not_found_error"}}"#,
+                        );
+                    }
+                    // 每个面认自己那一套凭证头：OpenAI 族收 Bearer，anthropic
+                    // 收 `x-api-key`。按条目的准入面发头，跨面时会发错那一套，
+                    // 而发错头换回来的 401 会被读成"这家坏了"。
+                    let authenticated = if path.ends_with("/messages") {
+                        req.headers().contains_key("x-api-key")
+                    } else {
+                        req.headers().contains_key(header::AUTHORIZATION)
+                    };
+                    if !authenticated {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"error":{"message":"Invalid Authentication","type":"invalid_authentication_error"}}"#,
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"id":"x","type":"message","role":"assistant","content":[{"type":"text","text":"pong"}],"choices":[{"message":{"role":"assistant","content":"pong"}}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), seen)
     }
 
     /// 本地桩上游：固定状态码 + 固定 body 的 /chat/completions。

@@ -27,6 +27,7 @@ rule_files:
 # rule: llm_upstream_refusal_that_waiting_cannot_repair
 # rule: llm_pool_down_on_a_quota_cycle
 # rule: llm_pool_face_without_a_serving_member
+# rule: llm_upstream_declared_face_missing
 # rule: llm_calls_all_failing
 # rule: llm_pool_signal_undelivered
 # rule: llm_usage_upstream_silent
@@ -661,4 +662,59 @@ tests:
     alert_rule_test:
       - eval_time: 60m
         alertname: llm_pool_face_without_a_serving_member
+        exp_alerts: []
+
+  # 声明的那一面在自己家门口不存在：每一次路由到这一面的请求都会 404，而健康面与池
+  # 判词都还是绿的（这条读的是测量，不是健康判词），所以只有这条规则能说出来。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_face_answers{upstream="k3",face="anthropic",declared="1"}'
+        values: '0x60'
+      - series: 'llm_upstream_face_answers_observed_timestamp_seconds{upstream="k3",face="anthropic",declared="1"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_upstream_declared_face_missing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              upstream: k3
+              face: anthropic
+
+  # 同一家在自己的面上答得上来：静。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_face_answers{upstream="k3",face="anthropic",declared="1"}'
+        values: '1x60'
+      - series: 'llm_upstream_face_answers_observed_timestamp_seconds{upstream="k3",face="anthropic",declared="1"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_upstream_declared_face_missing
+        exp_alerts: []
+
+  # 没声明的那一面是 0：这是正常的（单面厂商的其余两面都是 0），删掉 `declared="1"`
+  # 这一条腿，每一家都会常年亮着两条假警。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_face_answers{upstream="k3",face="openai",declared="0"}'
+        values: '0x60'
+      - series: 'llm_upstream_face_answers_observed_timestamp_seconds{upstream="k3",face="openai",declared="0"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_upstream_declared_face_missing
+        exp_alerts: []
+
+  # 那一格是八小时前写的：存储永远服务最后一行，停了写者的 0 不是当前状态。少了新鲜
+  # 度这条腿，一个已经下线的网关会把它最后一句「这一面不存在」永远说下去。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_face_answers{upstream="k3",face="anthropic",declared="1"}'
+        values: '0x480'
+      - series: 'llm_upstream_face_answers_observed_timestamp_seconds{upstream="k3",face="anthropic",declared="1"}'
+        values: '0x480'
+    alert_rule_test:
+      - eval_time: 480m
+        alertname: llm_upstream_declared_face_missing
         exp_alerts: []

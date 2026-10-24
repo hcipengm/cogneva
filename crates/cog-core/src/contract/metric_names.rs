@@ -992,6 +992,23 @@ metric_names! {
     // holding is written back to zero instead of standing as the last thing ever
     // said.
     LLM_UPSTREAM_REFUSAL_KIND => "llm_upstream_refusal_kind",
+    // Whether an upstream takes a call on a named protocol face, by `upstream`
+    // and `face`: 1 it answered a minimal request, 0 the face does not exist at
+    // this base, -1 it answered something that is not about the face (quota,
+    // entitlement, transport).
+    //
+    // `api_style` is where an entry was *admitted*, and nothing re-asks it
+    // afterwards, so a vendor that serves several faces contributes to one of
+    // them and is invisible on the others: on 2026-10-25 the only face the
+    // business and the eval arm call had no serving member for ten days while a
+    // second configured member answered that same face. The pool could have
+    // served it there and nothing said so.
+    //
+    // Three values rather than two because the repair differs: 0 is a wrong
+    // base_url and no amount of waiting fixes it, -1 is an account or a network
+    // and this entry may well be usable later. Collapsing -1 into 0 would send
+    // an operator to edit an address that is correct.
+    LLM_UPSTREAM_FACE_ANSWERS => "llm_upstream_face_answers",
     LLM_UPSTREAM_CONSECUTIVE_FAILURES => "llm_upstream_consecutive_failures",
     // Where each upstream sits in the order a call tries the pool, 0 first, by
     // `upstream`. The order is not the declared one: candidates are demoted by

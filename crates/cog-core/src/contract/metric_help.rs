@@ -1398,6 +1398,28 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          verdict -- llm_upstream_healthy is that -- and it does not feed one",
     ),
     (
+        "llm_upstream_face_answers",
+        "Whether an upstream takes a call on a named protocol face, by \
+         `upstream` and `face`: 1 it answered a minimal request on that face, 0 \
+         that face does not exist at this base URL, -1 it answered something \
+         that is not about the face (quota, entitlement, transport). The \
+         declared `api_style` only records where an entry was admitted, and \
+         nothing asked it again afterwards, so a vendor serving several faces \
+         was counted on one and invisible on the others; this series is the \
+         question re-asked on every face at a slow cadence. `declared` is 1 when \
+         the router already takes this entry on this face without asking -- the \
+         same predicate the request path uses, not a comparison of the face name \
+         with `api_style` -- so a 0 on a declared face (this entry's own address \
+         does not exist: every call to it will 404) is distinguishable from a 0 \
+         on a face it was never admitted on (expected, and only the reason it \
+         does not fall back there). Three values rather than two because the \
+         repair differs: 0 is a wrong base URL and waiting never fixes it, while \
+         -1 is an account or a network problem and the entry may be usable once \
+         it clears. It is a measurement, not a health verdict -- it never enters \
+         the suspect window and never changes `llm_upstream_healthy` -- because a \
+         face an entry was never admitted on refusing it is not that entry failing",
+    ),
+    (
         "llm_upstream_shape_errored",
         "Whether each LLM upstream is holding a shape-class rejection \
          (400/404/422) that has not been settled yet, 1 or 0. Such a status \
@@ -1422,11 +1444,14 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          on it while the pool as a whole still reads available. All three faces \
          are published every pass, so a face that lost its last member reads 0 \
          instead of disappearing from the exposition -- a vanished series reads \
-         as a face nobody ever configured. Read it beside \
-         `llm_pool_face_upstreams`: 0 serving with a configured count above 0 \
-         is a face whose members are all in a refusal window, while 0 beside 0 \
-         is a face nothing was ever configured for, and the two need different \
-         repairs",
+         as a face nobody ever configured. A member counts on every face it can \
+         take a call on, not only the one it was admitted on: an upstream \
+         measured to answer a face it was not declared for counts there too, \
+         which is why this count can exceed `llm_pool_face_upstreams`. Read it \
+         beside that series: 0 serving with a configured count above 0 is a \
+         face whose members are all in a refusal window, while 0 beside 0 is a \
+         face nothing is configured for and nothing measured as answering, and \
+         the two need different repairs",
     ),
     (
         "llm_pool_face_upstreams",
@@ -1435,8 +1460,11 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          `llm_pool_face_serving` and exists so a reader can tell a face that \
          lost its members from a face that never had any: both publish a \
          serving count of 0, and only this series says which one is being read. \
-         Counted by the same face predicate the request path uses, so an \
-         upstream that answers two faces counts on both",
+         It counts declarations only -- the face an entry was admitted on and \
+         the OpenAI family it implies -- so it answers 'was this face set up at \
+         all', not 'can this face be served right now'; the serving count \
+         answers the second and may be larger, because a member measured to \
+         answer a face it was not declared for serves it too",
     ),
     (
         "llm_pool_signal_connected",
