@@ -73,6 +73,32 @@ async fn apply_alert_verdict(
     overview.cluster_health = cluster_health_of(&firing).to_string();
 }
 
+/// Fill the agent counts from the registry that actually holds presence.
+///
+/// The storage layer answers these two cells from a table no process writes,
+/// so it reports `None`; only a surface that holds the agent registry may
+/// replace that with a count. The registry is where an agent announces itself
+/// and keeps beating, and it drops a record whose beats stop — so its listing
+/// is live units, not names that were once taken. Both cells carry that one
+/// count: the index behind it keeps retired names forever, and counting the
+/// index would report tombstones as agents, disagreeing with the roster
+/// printed next to it. A failed read leaves both `None`, because "unknown" and
+/// "zero" are the two answers this exists to keep apart.
+async fn apply_agent_census(
+    overview: &mut cog_core::observability::ClusterOverview,
+    registry: Option<&Arc<dyn cog_core::AgentRegistry>>,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    let Ok(live) = registry.list().await else {
+        return;
+    };
+    let count = live.len();
+    overview.total_agents = Some(count);
+    overview.active_agents = Some(count);
+}
+
 pub async fn cluster_overview_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<cog_core::observability::ClusterOverview>, ApiError> {
@@ -85,6 +111,7 @@ pub async fn cluster_overview_handler(
         .await
         .map_err(|e| ApiError::internal(format!("failed to get cluster overview: {e}")))?;
     apply_alert_verdict(&mut overview, state.active_alert_source.as_ref()).await;
+    apply_agent_census(&mut overview, state.agent_registry.as_ref()).await;
     Ok(Json(overview))
 }
 

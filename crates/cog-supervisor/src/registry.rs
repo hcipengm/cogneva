@@ -547,6 +547,57 @@ impl AgentRegistry {
         }
     }
 
+    /// Pull the live population out of the shared registry into this map.
+    ///
+    /// The map only knows agents something told *this process* about, and in
+    /// the deployed topology the only writer of presence is the agent itself:
+    /// it registers and beats into the shared registry. A health pass over the
+    /// map alone therefore judged nobody and reported an empty fleet — the
+    /// same reading a genuinely empty deployment produces, so the two could
+    /// not be told apart. Attaching the shared registry was never enough: the
+    /// delegation methods answer single lookups, while the pass asks for the
+    /// whole population, and nothing copied it over.
+    ///
+    /// The shared registry drops a record whose beats stop, so a listing is a
+    /// live unit rather than a name that was once taken. Entries already
+    /// tracked keep the fresher of the two heartbeat stamps: a local `touch`
+    /// and the agent's own beat run on different clocks, and letting the older
+    /// stamp win would age an agent that is beating.
+    pub async fn sync_from_shared(&self) -> SupervisorResult<usize> {
+        let registrations = self.list_registered_agents().await?;
+        let mut agents = self.agents.write().expect("agent registry poisoned");
+        for registration in &registrations {
+            match agents.get_mut(&registration.agent_id) {
+                Some(tracked) => {
+                    tracked.last_heartbeat =
+                        tracked.last_heartbeat.max(registration.last_heartbeat);
+                    if tracked.role.is_none() {
+                        tracked.role = Some(registration.role.clone());
+                    }
+                }
+                None => {
+                    agents.insert(
+                        registration.agent_id.clone(),
+                        AgentInfo {
+                            agent_id: registration.agent_id.clone(),
+                            role: Some(registration.role.clone()),
+                            crew_id: None,
+                            squad_id: None,
+                            task_ids: Vec::new(),
+                            last_heartbeat: registration.last_heartbeat,
+                            // Its current state is at most as old as its last
+                            // beat; the durable state backend, when it answers,
+                            // is what the stuck check dates from.
+                            state_since: registration.last_heartbeat,
+                            registered_at: registration.registered_at,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(registrations.len())
+    }
+
     /// List agents by role from the global registry, if attached.
     pub async fn list_registered_agents_by_role(
         &self,

@@ -181,20 +181,6 @@ impl PostgresObservabilityGateway {
         self
     }
 
-    /// A count query whose failure is a missing reading, not a zero.
-    ///
-    /// Returning 0 for a failed query would report an empty cluster in exactly
-    /// the shape of a real reading — the one thing a reader cannot tell apart.
-    async fn count_or_none(&self, sql: &str) -> Option<usize> {
-        match sqlx::query_as::<_, (i64,)>(sql).fetch_one(&self.pool).await {
-            Ok((n,)) => Some(n.max(0) as usize),
-            Err(e) => {
-                tracing::warn!(error = %e, query = %sql, "cluster overview count unavailable");
-                None
-            }
-        }
-    }
-
     /// Apply the observability schema. Safe to call repeatedly.
     pub async fn init_schema(&self) -> SFResult<()> {
         sqlx::raw_sql(OBSERVABILITY_DDL)
@@ -595,12 +581,19 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
         let total_squads = None;
         let active_squads = None;
 
-        let total_agents = self
-            .count_or_none("SELECT COUNT(*) FROM cog_agent_states")
-            .await;
-        let active_agents = self
-            .count_or_none("SELECT COUNT(*) FROM cog_agent_states WHERE state = 'active'")
-            .await;
+        // No production writer fills `cog_agent_states`: an agent announces
+        // itself into the shared registry and beats there, and only the
+        // supervisor's own heartbeat path ever called the state backend that
+        // would write this table. A count over it is a zero nothing produced,
+        // and printing it next to a roster of live workers says the fleet is
+        // empty. `None` says "not measured here"; the surface that holds the
+        // registry fills both cells from it before delivering the overview.
+        //
+        // The old `WHERE state = 'active'` was wrong twice over: the column
+        // holds a serialized `AgentState`, so a bare string never matches even
+        // once rows appear.
+        let total_agents = None;
+        let active_agents = None;
 
         Ok(ClusterOverview {
             total_agents,

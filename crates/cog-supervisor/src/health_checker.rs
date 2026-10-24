@@ -88,9 +88,23 @@ impl HealthChecker {
     }
 
     /// Run a single health check pass over the registry.
+    ///
+    /// The population is refreshed from the shared registry first, because
+    /// that is where an agent writes its own presence and the supervisor's map
+    /// only holds what something told this process. Judging the map alone
+    /// reported an empty fleet while the workers were alive and beating.
     pub async fn check(&self) -> SupervisorResult<HealthReport> {
         let mut report = HealthReport::default();
         let now = Utc::now();
+        if let Err(e) = self.registry.sync_from_shared().await {
+            // The pass still runs over whatever this process already tracks:
+            // a stale population is a worse reading than none, but a failed
+            // read of the shared registry must not turn into a failed pass.
+            tracing::warn!(
+                error = %e,
+                "health pass could not read the shared agent registry; judging only locally tracked agents"
+            );
+        }
         let agents = self.registry.agents();
 
         for agent in agents {

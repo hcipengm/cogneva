@@ -1509,16 +1509,17 @@ impl ObservabilityGateway for MemoryObservabilityGateway {
             .filter(|s| matches!(s.status, SquadStatus::Running))
             .count();
 
-        let total_agents = squads.values().map(|s| s.agents.len()).sum::<usize>();
-        let active_agents = squads
-            .values()
-            .flat_map(|s| s.agents.iter())
-            .filter(|a| matches!(a.state, cog_core::AgentState::Active))
-            .count();
+        // Agents are not counted here. Squad membership is not presence: a
+        // deployment with live workers and no squads would read zero, which is
+        // the same string an empty cluster prints. Presence lives in the agent
+        // registry an agent writes itself into, and the surface holding that
+        // registry fills these two cells before delivering the overview.
+        let total_agents = None;
+        let active_agents = None;
 
         Ok(ClusterOverview {
-            total_agents: Some(total_agents),
-            active_agents: Some(active_agents),
+            total_agents,
+            active_agents,
             total_tasks: counts.map(|c| c.total),
             active_tasks: counts.map(|c| c.active),
             queued_tasks: counts.map(|c| c.queued),

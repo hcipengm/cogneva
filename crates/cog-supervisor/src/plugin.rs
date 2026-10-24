@@ -144,10 +144,20 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
             .clone();
 
         // ── Build supervisor registry ──
-        let supervisor_registry = Arc::new(
-            crate::AgentRegistry::new()
-                .with_heartbeat_history_max(supervisor_config.heartbeat_history_max),
-        );
+        //
+        // Attached to the shared agent registry when this deployment has one:
+        // an agent's own pod is the only writer of presence, and the health
+        // pass can only judge who it can see. Without the attachment the
+        // supervisor's map stayed empty forever and every reading built on it
+        // — the health pass, the status route, the process view — printed a
+        // fleet of zero next to a roster of live workers.
+        let mut supervisor_registry = crate::AgentRegistry::new()
+            .with_heartbeat_history_max(supervisor_config.heartbeat_history_max);
+        match ctx.consume_service::<dyn cog_core::AgentRegistry>() {
+            Some(shared) => supervisor_registry = supervisor_registry.with_agent_registry(shared),
+            None => info!("supervisor registry has no shared agent registry to read presence from"),
+        }
+        let supervisor_registry = Arc::new(supervisor_registry);
         ctx.publish(supervisor_registry.clone());
         info!("SupervisorPlugin registry published");
 
