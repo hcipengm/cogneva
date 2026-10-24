@@ -1851,10 +1851,19 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // other judgements: they answer "which name is running, and how
                 // far that name sits past a release", which is not the question
                 // the build and rollout judgements ask.
-                match ctx.consume_service::<dyn cog_core::MetricsBackend>() {
-                    Some(metrics) => std::sync::Arc::new(deployer.with_metrics(metrics)),
-                    None => std::sync::Arc::new(deployer),
-                }
+                let deployer = match ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                    Some(metrics) => deployer.with_metrics(metrics),
+                    None => deployer,
+                };
+                // A CI hold stops the rollout and then waits for a revision
+                // nobody was asked to write. The failing checks are in hand at
+                // that moment, so the finding goes to the same planner every
+                // other goal goes through. Absent a planner the hold still
+                // happens and still logs.
+                std::sync::Arc::new(match orchestrator.clone() {
+                    Some(planner) => deployer.with_orchestrator(planner),
+                    None => deployer,
+                })
             };
             let shutdown = cog_core::ShutdownSignal::new();
             if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {

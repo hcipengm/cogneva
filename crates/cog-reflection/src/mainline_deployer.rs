@@ -1301,6 +1301,39 @@ pub(crate) fn upstream_ci_hold_signature() -> String {
     )
 }
 
+/// 「上游判了这一版红」这条待办的行 id：一版一份、一天一份。
+///
+/// 由 rev 与日期推出而不是随机：图把已持有的 id 当幂等空操作，而这一支在扣住期间
+/// 每一轮都会走到。换一天换一个 id，因为一版红到第二天还没人动，那是另一个发现，
+/// 不是同一张单子。
+pub(crate) fn ci_hold_goal_id(rev: &str, day: &str) -> String {
+    format!("ci-red-{}-{day}", rev12(rev))
+}
+
+/// 交给规划器的那段话。
+///
+/// 首行是落地抬头，接着写判词、失败的检查名与「关掉它长什么样」。刻意不写步骤：
+/// 分解是规划器的事，一条已经把步骤写死的目标会把规划该做的判断也一起做掉。
+/// 检查名可能为空——结论来自提交状态兜底时上游没给名字，那就直说没有名字，而不是
+/// 让读的人以为没有失败的检查。
+pub(crate) fn ci_hold_goal_text(rev: &str, failed_checks: &[String]) -> String {
+    let checks = if failed_checks.is_empty() {
+        "上游没有给出具体的检查名（结论来自提交状态接口），请到那一版的 Actions 页读出失败的是哪几条"
+            .to_string()
+    } else {
+        failed_checks.join("、")
+    };
+    format!(
+        "Make upstream CI green again for mainline {}\n\n\
+         主线提交 {} 在上游 CI 上被判为失败，部署器已扣住这一版不发版。失败的检查：{}。\
+         请拉取这几条检查的失败反馈、修好根因再提交一个新版本。\
+         判据是新的 main 提交在同一组检查上全绿，且这一版被它取代；只有那时部署器才会放开滚动。",
+        rev12(rev),
+        rev,
+        checks,
+    )
+}
+
 /// 这次失败是不是已经见过的那一处坏。证据取不到（`None`）时不做区分：读不出
 /// 落点的失败恰是"判不准"，它不排除"和上次同因"，按同因记——判不准就往停下的一
 /// 侧取，误停只是等一个新 rev，误放是无限重滚一个真坏的 rev。
@@ -2016,6 +2049,17 @@ pub struct MainlineDeployer {
     /// Where these readings land. Without it the comparison still runs and only
     /// the log records it.
     governance_drift: Option<std::sync::Arc<crate::governance_drift::GovernanceDrift>>,
+    /// Where a CI hold goes when it has to become work rather than a line in a
+    /// log.
+    ///
+    /// A hold is the one judgement this loop cannot act on by itself: it stops
+    /// the rollout and then waits for a revision that nobody has been asked to
+    /// write. The failing checks are already in hand at the moment of the
+    /// decision, so the finding travels to the same planner every other goal
+    /// goes through instead of resting on somebody reading the log. With no
+    /// handle the hold still happens and still logs -- its existence does not
+    /// depend on anyone being able to take the work.
+    orchestrator: Option<std::sync::Arc<dyn cog_core::OrchestratorControl>>,
     /// 「一轮都没走完过」这件事在抓取面上只补一次的那个闸。
     ///
     /// 这条读数只在走完一轮的分支里写，于是从没走完过的库在抓取面上是一条**缺席**
@@ -2135,6 +2179,7 @@ impl MainlineDeployer {
             metrics: None,
             declared_governance: std::sync::Mutex::new(None),
             governance_drift: None,
+            orchestrator: None,
             buildah_reading_seeded: std::sync::atomic::AtomicBool::new(false),
             registry_reading_seeded: std::sync::atomic::AtomicBool::new(false),
             loop_beat: std::sync::OnceLock::new(),
@@ -2149,6 +2194,15 @@ impl MainlineDeployer {
     /// Report the version contract's own readings.
     pub fn with_metrics(mut self, metrics: std::sync::Arc<dyn cog_core::MetricsBackend>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Hand a CI hold to the planner as work, rather than only to the log.
+    pub fn with_orchestrator(
+        mut self,
+        orchestrator: std::sync::Arc<dyn cog_core::OrchestratorControl>,
+    ) -> Self {
+        self.orchestrator = Some(orchestrator);
         self
     }
 
@@ -3600,7 +3654,58 @@ impl MainlineDeployer {
             .map(|h| (now - h.since_unix).max(0))
             .unwrap_or(0);
         self.record_ci_hold_reading(held_secs).await;
+        // After the hold is on disk: a submission that fails must not cost the
+        // record of how long this revision has been held, which is the reading
+        // the alert rests on.
+        self.dispatch_ci_remediation(rev, &failed_checks).await;
         Ok(true)
+    }
+
+    /// Turn a CI hold into a goal the planner can decompose.
+    ///
+    /// A hold without this is a loop that stops and waits for a revision nobody
+    /// was asked to write: the deployer knows which checks failed, says so in a
+    /// log line that scrolls away with the pod, and the next cycle asks the same
+    /// question of the same revision. The finding goes out through the same
+    /// entry every other goal uses, so the pieces land in the DAG and the
+    /// ordinary executors carry them.
+    ///
+    /// One goal per revision and day, derived rather than random: the id is held
+    /// by the graph as an idempotent no-op, and this branch runs on every
+    /// polling cycle while the hold stands. A new day gets a new id, because a
+    /// revision still red tomorrow is a finding nobody acted on.
+    async fn dispatch_ci_remediation(&self, rev: &str, failed_checks: &[String]) {
+        let Some(orchestrator) = self.orchestrator.as_ref() else {
+            return;
+        };
+        let id = ci_hold_goal_id(rev, &Utc::now().format("%Y-%m-%d").to_string());
+        let goal = ci_hold_goal_text(rev, failed_checks);
+        let mut row = cog_core::Task::goal_row(id.clone(), &goal);
+        // The row is the goal's identity marker and is never executed: the
+        // planner decomposes it and the children carry the work. It is not
+        // addressed to a unit -- the deployer knows who is present no better
+        // than the share of the work it is asking for, and an owned row that no
+        // present unit holds waits forever in the shared queue.
+        row.is_executable = false;
+        match orchestrator.submit_goal_auto(&goal, vec![row]).await {
+            Ok(added) if added.is_empty() => info!(
+                rev = %rev12(rev),
+                goal_id = %id,
+                "this revision already has today's CI remediation goal; nothing new queued"
+            ),
+            Ok(added) => info!(
+                rev = %rev12(rev),
+                goal_id = %id,
+                tasks = added.len(),
+                failed_checks = %failed_checks.join(","),
+                "the CI hold was handed to the action planner"
+            ),
+            Err(e) => warn!(
+                rev = %rev12(rev),
+                error = %e,
+                "the CI hold could not be submitted; it stays a held rollout and a log line"
+            ),
+        }
     }
 
     /// 被扣住了多久：这条读数自己就是那条界的观测值。
@@ -13391,6 +13496,238 @@ exec {real} "$@"
         assert_eq!(verdict, Some(false));
         // 只有报失败的那一条，且带平台前缀；成功的那条不进这一列。
         assert_eq!(failed, vec!["github:Clippy".to_string()]);
+        let _ = handle.await.unwrap();
+    }
+
+    /// 把提交记下来、并按图的规则对待已持有 id 的替身。
+    ///
+    /// 这条支路对编排器做的唯一一件事是 `submit_goal_auto`，所以其余方法一律
+    /// `unimplemented!()`：一个会在测试里悄悄做事的替身，是让断言落到别的东西上的
+    /// 第一步。`submit_goal_auto` 自己照图的规则答——已持有的 id 是幂等空操作，
+    /// 不回报成"刚加进去的"——否则"同一版只开一张单子"这件事在替身上就成了空话。
+    /// 一次提交：目标正文、这一笔带的 id、其中真正新加进去的 id。
+    type Submission = (String, Vec<String>, Vec<String>);
+
+    #[derive(Default)]
+    struct RecordingPlanner {
+        submissions: std::sync::Mutex<Vec<Submission>>,
+    }
+
+    impl RecordingPlanner {
+        fn submissions(&self) -> Vec<Submission> {
+            self.submissions.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::OrchestratorControl for RecordingPlanner {
+        async fn submit_goal(&self, _goal: &str, _tasks: Vec<cog_core::Task>) -> SFResult<()> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn submit_goal_auto(
+            &self,
+            goal: &str,
+            tasks: Vec<cog_core::Task>,
+        ) -> SFResult<Vec<String>> {
+            let ids: Vec<String> = tasks.iter().map(|task| task.id.clone()).collect();
+            let mut held = self.submissions.lock().unwrap();
+            let fresh: Vec<String> = ids
+                .iter()
+                .filter(|id| !held.iter().any(|(_, held_ids, _)| held_ids.contains(id)))
+                .cloned()
+                .collect();
+            held.push((goal.to_string(), ids, fresh.clone()));
+            Ok(fresh)
+        }
+        async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> SFResult<()> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn add_task(&self, _task: cog_core::Task) -> SFResult<()> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn crew_can_retry(&self, _task_ids: &[String]) -> bool {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn crew_retry_all(&self, _task_ids: &[String]) -> usize {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn get_ready_tasks(&self) -> Vec<cog_core::Task> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn get_all_tasks(&self) -> Vec<cog_core::Task> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn retry_task(&self, _task_id: &str) -> SFResult<()> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn dlq_len(&self) -> SFResult<usize> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn start_task(&self, _task_id: &str) -> SFResult<()> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn complete_task(
+            &self,
+            _task_id: &str,
+            _result: serde_json::Value,
+        ) -> SFResult<Vec<String>> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn fail_task(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::UpstreamFailure>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn fail_task_after(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::UpstreamFailure>,
+            _retry_after_secs: Option<u64>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn cancel_task(&self, _task_id: &str) -> SFResult<Vec<String>> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn get_task(&self, _task_id: &str) -> Option<cog_core::Task> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn schedule_task(&self, _task_id: &str) -> SFResult<()> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn get_dependents(&self, _task_id: &str) -> Option<Vec<cog_core::Task>> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn get_dependencies(&self, _task_id: &str) -> Option<Vec<cog_core::Task>> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn get_graph(&self) -> (Vec<cog_core::Task>, Vec<(String, String)>) {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn delete_task(&self, _task_id: &str) -> SFResult<()> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn all_completed(&self) -> bool {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+        async fn replay_dlq(&self, _task_id: &str) -> SFResult<bool> {
+            unimplemented!("the hold submits through submit_goal_auto")
+        }
+    }
+
+    /// 被上游判红的一版不是只把滚动停下来：失败的检查名在判词那一刻就在手上，
+    /// 它必须变成一张能被分解的单子，否则这条链的下一环永远是"等人读日志"。
+    #[tokio::test]
+    async fn a_ci_hold_opens_one_goal_naming_the_revision_and_the_failed_checks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![http_200(
+            r#"{"check_runs":[{"name":"Test","conclusion":"failure"},{"name":"Clippy","conclusion":"success"}]}"#,
+        )])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let mut state = MainlineState::default();
+        assert!(
+            deployer
+                .hold_if_ci_reports_failure(&mut state, "abc123")
+                .await
+                .unwrap(),
+            "a completed failure holds the rollout"
+        );
+
+        let submissions = planner.submissions();
+        assert_eq!(submissions.len(), 1, "{submissions:?}");
+        let (goal, ids, added) = &submissions[0];
+        let day = Utc::now().format("%Y-%m-%d").to_string();
+        assert_eq!(ids, &vec![ci_hold_goal_id("abc123", &day)]);
+        assert_eq!(added, ids, "the first submission is the one that lands");
+        assert!(goal.contains("abc123"), "the revision is named: {goal}");
+        assert!(
+            goal.contains("github:Test"),
+            "the check that failed is named, not just the fact of a failure: {goal}"
+        );
+        assert!(
+            !goal.contains("Clippy"),
+            "a check that passed is not a failure: {goal}"
+        );
+        let _ = handle.await.unwrap();
+    }
+
+    /// 同一版、同一天的第二轮只带同一个 id：扣住期间每一轮都会走到这里，而
+    /// 每分钟往图里塞一张新单子会把队列灌满。
+    #[tokio::test]
+    async fn a_second_hold_on_the_same_revision_queues_nothing_new() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let mut state = MainlineState::default();
+        for _ in 0..2 {
+            assert!(deployer
+                .hold_if_ci_reports_failure(&mut state, "abc123")
+                .await
+                .unwrap());
+        }
+
+        let submissions = planner.submissions();
+        assert_eq!(submissions.len(), 2, "{submissions:?}");
+        assert_eq!(submissions[0].1, submissions[1].1, "the id is derived");
+        assert_eq!(submissions[0].2.len(), 1);
+        assert!(
+            submissions[1].2.is_empty(),
+            "the graph already held that id, so nothing new is queued: {submissions:?}"
+        );
+        let _ = handle.await.unwrap();
+    }
+
+    /// 绿的一版不开单子。一个拿不到证据就开单的门会把每次上游抖动变成待办。
+    #[tokio::test]
+    async fn a_green_verdict_opens_no_goal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![http_200(
+            r#"{"check_runs":[{"name":"Test","conclusion":"success"}]}"#,
+        )])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let mut state = MainlineState::default();
+        assert!(!deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123")
+            .await
+            .unwrap());
+        assert!(planner.submissions().is_empty());
         let _ = handle.await.unwrap();
     }
 
