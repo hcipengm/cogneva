@@ -403,9 +403,18 @@ impl cog_core::SystemPlugin for AgentPlugin {
                     let config = ctx.config();
                     let agent_pool = crate::AgentManagerConfig::load()?;
                     let role = agent_pool.worker_role.clone();
-                    let instance = agent_instance();
+                    let instance = crate::identity::agent_instance();
                     for i in 0..agent_pool.worker_count {
-                        let agent_id = format!("cogneva-worker-{instance}-{i}");
+                        let name = crate::identity::worker_name(i);
+                        if !name.stable {
+                            warn!(
+                                slot = i,
+                                name = %name.handle,
+                                "no instance fingerprint available; worker names change \
+                                 with the next pod roll"
+                            );
+                        }
+                        let agent_id = name.id.clone();
                         let registration = cog_core::AgentRegistration::new(
                             agent_id.clone(),
                             &instance,
@@ -440,7 +449,10 @@ impl cog_core::SystemPlugin for AgentPlugin {
                         {
                             warn!("Failed to spawn agent pool worker {}: {}", agent_id, e);
                         } else {
-                            info!("Agent pool worker {} spawned (role={:?})", agent_id, role);
+                            info!(
+                                "Agent pool worker {} spawned (id={}, role={:?})",
+                                name.handle, agent_id, role
+                            );
                         }
                     }
                 }
@@ -517,29 +529,12 @@ impl cog_core::SystemPlugin for AgentPlugin {
     }
 }
 
-/// The process this pool runs in, as it appears in every agent name the pool
-/// registers.
-///
-/// A worker index alone names a slot, not a process. The mainline pod and the
-/// evolution pod mount the same config and each start `worker_count` workers
-/// under the same indices, so both registered `cogneva-worker-0`: the second
-/// write overwrote the first's registry record, both joined one inbox consumer
-/// group, and a command addressed to that name was read by whichever process
-/// polled first. The roster then could not say how many workers existed, nor
-/// where any of them ran -- every one of them reported `localhost` /
-/// `127.0.0.1`. The instance is what makes a name resolve to one process.
-///
-/// Kubernetes exports the pod name as `HOSTNAME`; the evolution deployment
-/// also sets `COGNEVA_POD_NAME` explicitly. A plain host run has no instance of
-/// its own, and `local` is then the honest answer rather than a fiction of
-/// uniqueness.
-fn agent_instance() -> String {
-    std::env::var("COGNEVA_POD_NAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "local".to_string())
-}
+// The process a pool runs in is now only the worker's *locator*: the name a
+// worker registers under comes from `crate::identity`, which deliberately
+// leaves the pod name out of it. A pod name changes on every roll, and every
+// record keyed by the agent id -- who holds a task, who authored a change,
+// which unit owns a face -- would change with it, reading as a roster that
+// turned over when in fact the same slot came back in a new pod.
 
 /// Classify an AgentEvent by frequency.
 /// High-frequency events are batched via Client Streaming (`upload_events`).

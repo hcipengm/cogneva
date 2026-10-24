@@ -253,6 +253,10 @@ spec:
                   name: cogneva-secrets
                   key: instance-fingerprint
                   optional: true
+            # 数字员工的分组名：它进员工名字的哈希材料，与主应用那份必须不同
+            # ——两个进程同机、槽位号相同，同值就会算出同名员工。
+            - name: COGNEVA_AGENT_GROUP
+              value: "evolution"
             # wiki 检索后端（Meilisearch）主密钥：cogneva.json 的
             # providers.wiki.options.api_key 经 ${MEILI_MASTER_KEY} 插值。
             - name: MEILI_MASTER_KEY

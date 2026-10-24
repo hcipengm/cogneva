@@ -183,6 +183,12 @@ spec:
                   name: cogneva-secrets
                   key: instance-fingerprint
                   optional: true
+            # 数字员工的分组名：它进员工名字的哈希材料。主应用与进化两个进程
+            # 在同一台机器上各跑一个 worker 池、槽位号相同，少了分组两个池会
+            # 算出同名；它是清单里的字面量，所以滚动不会换名。与 evolution 那份
+            # 必须不同源同值。
+            - name: COGNEVA_AGENT_GROUP
+              value: "main"
             # wiki 检索后端（Meilisearch）主密钥：cogneva.json 的
             # providers.wiki.options.api_key 经 ${MEILI_MASTER_KEY} 插值。必填——
             # /health 不鉴权，密钥错误只会在真正读写索引时才暴露，留空会把问题

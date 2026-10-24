@@ -24,6 +24,9 @@ chrono = { workspace = true }
 base64 = "0.22"
 uuid = { workspace = true }
 futures = { workspace = true }
+# 数字员工的名字由机器指纹哈希得出，需要确定性哈希。
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 # The inbox reply tests read their answer back through a real message backend;
