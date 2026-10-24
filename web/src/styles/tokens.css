@@ -1,0 +1,101 @@
+/*
+ * 工作台的调色板与字阶。
+ *
+ * 方向是「仪表盘」而不是「后台模板」：底色是偏青的深石墨，文字是暖白，强调色
+ * 只有一种黄铜色——它标的是「你需要动手的地方」，不是装饰。结构靠 1px 细线和
+ * 间距编码，不靠圆角卡片堆叠：这是一个人长时间盯着看的界面，不是营销页。
+ *
+ * 字阶只有四档（11/12/13/15）。密度是这一面的功能：同样的屏幕要多看几行日志、
+ * 多扫几行表格，字号就不可能按营销页的排法来。
+ */
+:root {
+  --ink-1000: #07100f;
+  --ink-900: #0b1615;
+  --ink-800: #101e1d;
+  --ink-700: #162625;
+  --ink-600: #1d302f;
+  --line: #263c3a;
+  --line-strong: #33514e;
+  --paper: #e3ece8;
+  --paper-dim: #a9bcb7;
+  --muted: #7b938f;
+  --brass: #d7a54d;
+  --brass-dim: #8a6a2f;
+  --live: #6fd3c7;
+  --danger: #e2725b;
+  --warn: #e0b45c;
+  --ok: #79c68b;
+
+  --font-ui: 'IBM Plex Sans', 'PingFang SC', 'Noto Sans SC', 'Microsoft YaHei', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+}
+
+.shell-root {
+  background: var(--ink-900);
+  color: var(--paper);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.shell-root .mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.shell-root .hairline {
+  border-color: var(--line);
+}
+
+.shell-root ::selection {
+  background: color-mix(in srgb, var(--brass) 35%, transparent);
+}
+
+/* 滚动条：细、暗、不抢注意力。 */
+.shell-root ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.shell-root ::-webkit-scrollbar-thumb {
+  background: var(--ink-600);
+  border: 2px solid var(--ink-900);
+}
+.shell-root ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 表格式读数：单元格左对齐、数字用等宽，行hover给整行一点亮度。 */
+.grid-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.grid-table th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--muted);
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  background: var(--ink-800);
+  white-space: nowrap;
+}
+.grid-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
+  vertical-align: top;
+}
+.grid-table tbody tr:hover td {
+  background: color-mix(in srgb, var(--ink-700) 70%, transparent);
+}
+
+/* 状态点：一个形状只表示一种状态，颜色之外还有文字，色弱也读得出。 */
+.dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: middle;
+}

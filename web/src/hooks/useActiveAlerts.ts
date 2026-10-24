@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import { acknowledgeAlert, getActiveAlerts, type ActiveAlerts } from '@/api/client';
 
+/** 一次确认的结局。界面要把它写进输出格，而不是只留一个可能看不见的横幅。 */
+export interface AckOutcome {
+  ok: boolean;
+  message?: string;
+}
+
 /**
  * 读一次活跃告警。
  *
@@ -38,7 +44,7 @@ export function useActiveAlerts(enabled: boolean, pollMs = 30_000) {
    * 404 单独说：告警在列表与点击之间清掉了，服务端不写、也不该写——下次 firing
    * 复用同一行，旧标记会被读成「有人已经看过这一次」。
    */
-  const acknowledge = useCallback(async (id: string) => {
+  const acknowledge = useCallback(async (id: string): Promise<AckOutcome> => {
     setPendingAck((p) => ({ ...p, [id]: true }));
     setAckError(null);
     try {
@@ -59,13 +65,15 @@ export function useActiveAlerts(enabled: boolean, pollMs = 30_000) {
             }
           : prev,
       );
+      return { ok: true };
     } catch (e) {
       const err = e as { status?: number; message?: string };
-      setAckError(
+      const message =
         err?.status === 404
           ? '这条已经不在 firing 了（可能刚清掉），刷新一下列表。'
-          : `确认没写进去（HTTP ${err?.status ?? '?'}）——它仍然是未确认。`,
-      );
+          : `确认没写进去（HTTP ${err?.status ?? '?'}）——它仍然是未确认。`;
+      setAckError(message);
+      return { ok: false, message };
     } finally {
       setPendingAck((p) => {
         const next = { ...p };

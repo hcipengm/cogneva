@@ -1,5 +1,11 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+/*
+ * 字体只取两族：界面用 IBM Plex Sans（字面窄、可压密度），等宽用 JetBrains
+ * Mono（读数与标识按列对齐）。中文字面走系统字体——从网络上拉一份中文字体
+ * 是几 MB，而这一面最常在内网里打开。
+ */
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
 @import "tailwindcss";
+@import "./tokens.css";
 
 html,
 body,
@@ -12,17 +18,9 @@ body,
 }
 
 body {
-  font-family:
-    Inter,
-    "PingFang SC",
-    "Microsoft YaHei",
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    Roboto,
-    sans-serif;
-  background-color: #020617;
-  color: #e2e8f0;
+  font-family: var(--font-ui);
+  background-color: var(--ink-900);
+  color: var(--paper);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }

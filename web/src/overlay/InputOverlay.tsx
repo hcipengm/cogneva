@@ -28,8 +28,9 @@ export function InputOverlay({ clientRef }: InputOverlayProps) {
   }, [text, clientRef]);
 
   return (
-    <div className="absolute bottom-0 left-0 right-0 p-4 pointer-events-none">
-      <div className="mx-auto flex max-w-3xl gap-3 pointer-events-auto rounded-2xl border border-slate-700/60 bg-slate-900/80 p-2 shadow-2xl backdrop-blur-md">
+    <div className="pointer-events-none absolute inset-x-0 bottom-0 p-4">
+      <div className="pointer-events-auto mx-auto flex max-w-3xl items-stretch gap-2 border border-[var(--line-strong)] bg-[color-mix(in_srgb,var(--ink-800)_88%,transparent)] p-1.5 backdrop-blur-sm">
+        <span className="mono flex items-center pl-2 text-[11px] text-[var(--muted)]">意图</span>
         <input
           type="text"
           value={text}
@@ -37,14 +38,16 @@ export function InputOverlay({ clientRef }: InputOverlayProps) {
           onKeyDown={(e) => {
             if (e.key === 'Enter') send();
           }}
-          placeholder="输入意图..."
-          className="flex-1 rounded-xl bg-transparent px-4 py-3 text-white placeholder-slate-500 outline-none"
-          aria-label="Message input"
+          placeholder="说一句话，交给在岗的执行者…"
+          className="min-w-0 flex-1 bg-transparent px-2 py-2 text-[13px] text-[var(--paper)] outline-none placeholder:text-[var(--muted)]"
+          aria-label="发一句话"
         />
         <button
+          type="button"
           onClick={send}
           disabled={!text.trim()}
-          className="rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 px-6 py-3 font-medium text-white shadow-lg transition hover:from-blue-500 hover:to-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+          className="px-4 py-2 text-[12px] transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+          style={{ background: 'var(--brass)', color: 'var(--ink-1000)' }}
         >
           发送
         </button>

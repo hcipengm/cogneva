@@ -1,35 +1,37 @@
-import { useState } from 'react';
-import { CanvasStage } from './canvas/CanvasStage';
-import { InputOverlay } from './overlay/InputOverlay';
-import { AuthOverlay } from './overlay/AuthOverlay';
-import { LlmSetupOverlay } from './overlay/LlmSetupOverlay';
-import { TokenUsageOverlay } from './overlay/TokenUsageOverlay';
-import { ActiveAlertsOverlay } from './overlay/ActiveAlertsOverlay';
-import { NotificationsOverlay } from './overlay/NotificationsOverlay';
-import { AgentsOverlay } from './overlay/AgentsOverlay';
-import { SystemOverlay } from './overlay/SystemOverlay';
-import { useActiveAlerts } from './hooks/useActiveAlerts';
-import { useEventStream } from './hooks/useEventStream';
-import { useNotifications } from './hooks/useNotifications';
-import { useAuth } from './hooks/useAuth';
-import { useLlmStatus } from './hooks/useLlmStatus';
+import { useCallback, useMemo, useState } from 'react';
+import { getClusterOverview } from '@/api/client';
+import { useActiveAlerts } from '@/hooks/useActiveAlerts';
+import { useAuth } from '@/hooks/useAuth';
+import { useEventStream } from '@/hooks/useEventStream';
+import { useLlmStatus } from '@/hooks/useLlmStatus';
+import { useNotifications } from '@/hooks/useNotifications';
+import { useResource } from '@/hooks/useResource';
+import { AuthOverlay } from '@/overlay/AuthOverlay';
+import { ShellServicesProvider, type ShellServices } from '@/shell/context';
+import { Shell } from '@/shell/Shell';
 
 const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true';
 
+/**
+ * 入口：先判身份，再把跨面共用的读数装进工作台。
+ *
+ * 共用读数放在这一层而不是各面自己读：状态条、侧栏、问题面板、收件箱要看到
+ * 同一个数，否则同一秒里两处会给出两个不同的答案，而读者还不知道该信谁。
+ */
 export default function App() {
-  const { token, isAuthenticated, isLoading, error, signIn, signInPlatformToken, signOut } =
-    useAuth();
+  const auth = useAuth();
+  const signedIn = USE_MOCK || auth.isAuthenticated;
 
-  const wsUrl = token
+  const wsUrl = auth.token
     ? `${
         import.meta.env.VITE_WS_URL ??
         `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`
-      }/ws?token=${token}`
+      }/ws?token=${auth.token}`
     : '';
 
-  // 通知中心先于事件流建：事件流的推送回调要直接落进它的列表，
-  // 顺序反过来只能缓存或轮询，两种都是「看得见但要晚一拍」。
-  const notifications = useNotifications(!USE_MOCK && isAuthenticated);
+  // 通知中心先于事件流建：推送到达时要直接落进它的列表，顺序反过来只能缓存
+  // 或轮询，两种都是「看得见但要晚一拍」。
+  const notifications = useNotifications(signedIn && !USE_MOCK);
 
   const { clientRef } = useEventStream({
     mock: USE_MOCK,
@@ -40,178 +42,74 @@ export default function App() {
     onNotification: notifications.receive,
   });
 
-  const {
-    status: llmStatus,
-    loading: llmLoading,
-    refresh: refreshLlmStatus,
-  } = useLlmStatus(!USE_MOCK && isAuthenticated);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [usageOpen, setUsageOpen] = useState(false);
-  const [alertsOpen, setAlertsOpen] = useState(false);
-  const [notificationsOpen, setNotificationsOpen] = useState(false);
-  const [agentsOpen, setAgentsOpen] = useState(false);
-  const [systemOpen, setSystemOpen] = useState(false);
-  // 轮询放在 App 层：面板关着的时候它的计数也在更新，否则「有人看才亮」
-  // 就还是面板里的一个数。
-  const {
-    alerts: activeAlerts,
-    loading: alertsLoading,
-    error: alertsError,
-    ackError: alertsAckError,
-    pendingAck: alertsPendingAck,
-    acknowledge: acknowledgeAlert,
-    refresh: refreshAlerts,
-  } = useActiveAlerts(!USE_MOCK && isAuthenticated);
-  const firingCount = activeAlerts?.count ?? 0;
+  const llm = useLlmStatus(signedIn && !USE_MOCK);
+  const alerts = useActiveAlerts(signedIn && !USE_MOCK, 30_000);
+  const overview = useResource(
+    '集群概况',
+    getClusterOverview,
+    30_000,
+    signedIn && !USE_MOCK
+  );
 
-  const llmReady = !!llmStatus?.configured;
-  const showLlmWizard =
-    !USE_MOCK && isAuthenticated && !llmLoading && !llmReady;
+  const [conversations, setConversations] = useState(false);
+  const [llmSetup, setLlmSetup] = useState(false);
+
+  const openConversations = useCallback(() => setConversations(true), []);
+  const closeConversations = useCallback(() => setConversations(false), []);
+  const openLlmSetup = useCallback(() => setLlmSetup(true), []);
+  const closeLlmSetup = useCallback(() => setLlmSetup(false), []);
+
+  const services = useMemo<ShellServices>(
+    () => ({
+      username: auth.username,
+      clientRef,
+      overview,
+      alerts,
+      notifications,
+      llm,
+      signOut: auth.signOut,
+      overlays: {
+        conversations,
+        llmSetup,
+        openConversations,
+        closeConversations,
+        openLlmSetup,
+        closeLlmSetup,
+      },
+    }),
+    [
+      auth.username,
+      auth.signOut,
+      clientRef,
+      overview,
+      alerts,
+      notifications,
+      llm,
+      conversations,
+      llmSetup,
+      openConversations,
+      closeConversations,
+      openLlmSetup,
+      closeLlmSetup,
+    ]
+  );
+
+  if (!signedIn) {
+    return (
+      <div className="relative h-screen w-screen overflow-hidden bg-[var(--ink-1000)]">
+        <AuthOverlay
+          onLogin={auth.signIn}
+          onPlatformToken={auth.signInPlatformToken}
+          error={auth.error}
+          isLoading={auth.isLoading}
+        />
+      </div>
+    );
+  }
 
   return (
-    <div className="relative h-screen w-screen overflow-hidden bg-slate-950 text-slate-100">
-      <CanvasStage />
-      <InputOverlay clientRef={clientRef} />
-
-      {!USE_MOCK && !isAuthenticated && (
-        <AuthOverlay
-          onLogin={signIn}
-          onPlatformToken={signInPlatformToken}
-          error={error}
-          isLoading={isLoading}
-        />
-      )}
-
-      {!USE_MOCK && isAuthenticated && (showLlmWizard || settingsOpen) && (
-        <LlmSetupOverlay
-          initial={llmStatus?.backends?.[0]}
-          mandatory={!llmReady}
-          onConfigured={() => {
-            setSettingsOpen(false);
-            refreshLlmStatus();
-          }}
-          onClose={llmReady ? () => setSettingsOpen(false) : undefined}
-        />
-      )}
-
-      {!USE_MOCK && isAuthenticated && usageOpen && (
-        <TokenUsageOverlay onClose={() => setUsageOpen(false)} />
-      )}
-
-      {!USE_MOCK && isAuthenticated && notificationsOpen && (
-        <NotificationsOverlay
-          items={notifications.items}
-          unreadCount={notifications.unreadCount}
-          loading={notifications.loading}
-          error={notifications.error}
-          refresh={notifications.refresh}
-          markRead={notifications.markRead}
-          markAllRead={notifications.markAllRead}
-          onClose={() => setNotificationsOpen(false)}
-        />
-      )}
-
-      {!USE_MOCK && isAuthenticated && alertsOpen && (
-        <ActiveAlertsOverlay
-          alerts={activeAlerts}
-          loading={alertsLoading}
-          error={alertsError}
-          ackError={alertsAckError}
-          pendingAck={alertsPendingAck}
-          acknowledge={acknowledgeAlert}
-          refresh={refreshAlerts}
-          onClose={() => setAlertsOpen(false)}
-        />
-      )}
-
-      {!USE_MOCK && isAuthenticated && agentsOpen && (
-        <AgentsOverlay onClose={() => setAgentsOpen(false)} />
-      )}
-
-      {!USE_MOCK && isAuthenticated && systemOpen && (
-        <SystemOverlay
-          onClose={() => setSystemOpen(false)}
-          onOpenConversations={() => {
-            setSystemOpen(false);
-            setAgentsOpen(true);
-          }}
-        />
-      )}
-
-      {!USE_MOCK && isAuthenticated && (
-        <div className="absolute right-4 top-12 z-10 flex gap-2">
-          <button
-            onClick={() => setNotificationsOpen(true)}
-            className={`rounded-lg border px-3 py-1.5 text-xs backdrop-blur-sm transition ${
-              notifications.error
-                ? 'border-amber-500/60 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
-                : notifications.unreadCount > 0
-                  ? 'border-sky-500/60 bg-sky-500/10 text-sky-300 hover:bg-sky-500/20'
-                  : 'border-slate-700/60 bg-slate-900/80 text-slate-300 hover:bg-slate-800'
-            }`}
-            title={
-              notifications.error
-                ? '通知读数没读到——不是没有通知'
-                : '发给你的通知'
-            }
-          >
-            {notifications.error
-              ? '通知 ?'
-              : `通知 ${notifications.unreadCount}`}
-          </button>
-          <button
-            onClick={() => setSystemOpen(true)}
-            className="rounded-lg border border-slate-700/60 bg-slate-900/80 px-3 py-1.5 text-xs text-slate-300 backdrop-blur-sm transition hover:bg-slate-800"
-            title="实时活动、面与读数、任务、后端与评估"
-          >
-            系统
-          </button>
-          <button
-            onClick={() => setAgentsOpen(true)}
-            className="rounded-lg border border-slate-700/60 bg-slate-900/80 px-3 py-1.5 text-xs text-slate-300 backdrop-blur-sm transition hover:bg-slate-800"
-            title="在岗的 agent 名单与各自的会话"
-          >
-            会话
-          </button>
-          <button
-            onClick={() => setUsageOpen(true)}
-            className="rounded-lg border border-slate-700/60 bg-slate-900/80 px-3 py-1.5 text-xs text-slate-300 backdrop-blur-sm transition hover:bg-slate-800"
-          >
-            用量
-          </button>
-          <button
-            onClick={() => setAlertsOpen(true)}
-            className={`rounded-lg border px-3 py-1.5 text-xs backdrop-blur-sm transition ${
-              alertsError
-                ? 'border-amber-500/60 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
-                : firingCount > 0
-                  ? 'border-red-500/60 bg-red-500/10 text-red-300 hover:bg-red-500/20'
-                  : 'border-slate-700/60 bg-slate-900/80 text-slate-300 hover:bg-slate-800'
-            }`}
-            title={
-              alertsError
-                ? '告警读数没读到——不是没有告警'
-                : '当前 firing 的告警'
-            }
-          >
-            {alertsError ? '告警 ?' : `告警 ${firingCount}`}
-          </button>
-          {llmReady && (
-            <button
-              onClick={() => setSettingsOpen(true)}
-              className="rounded-lg border border-slate-700/60 bg-slate-900/80 px-3 py-1.5 text-xs text-slate-300 backdrop-blur-sm transition hover:bg-slate-800"
-            >
-              LLM 设置
-            </button>
-          )}
-          <button
-            onClick={signOut}
-            className="rounded-lg border border-slate-700/60 bg-slate-900/80 px-3 py-1.5 text-xs text-slate-300 backdrop-blur-sm transition hover:bg-slate-800"
-          >
-            退出登录
-          </button>
-        </div>
-      )}
-    </div>
+    <ShellServicesProvider services={services}>
+      <Shell />
+    </ShellServicesProvider>
   );
 }
