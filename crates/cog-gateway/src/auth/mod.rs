@@ -1150,8 +1150,10 @@ pub struct BiometricPayload {
 }
 
 /// Bind or verify a biometric credential (Touch ID / Face ID / fingerprint).
-/// **Status:** Stub — validates payload shape and returns OK. Real signature
-/// verification and per-device key storage will land alongside the secure
+/// **Status:** Not implemented — validates the payload's shape and answers
+/// `501`. There is no key store behind this route, so there is nothing to
+/// enrol into and nothing to check a signature against; answering success
+/// would hand the caller a receipt for a credential that does not exist.
 pub async fn biometric_handler(
     State(_state): State<Arc<GatewayState>>,
     req: axum::extract::Request,
@@ -1190,63 +1192,59 @@ pub async fn biometric_handler(
         }
     };
 
+    let (status, body) = biometric_reply(&payload, &user_id.to_string());
+    (status, Json(body)).into_response()
+}
+
+/// What this build can tell a biometric caller.
+///
+/// Nothing -- and it has to say so. The handler used to answer `registered` and
+/// `verified` after writing a log line: a client that enrolled a key got a
+/// receipt for a key the platform never stored, and found out at the first
+/// unlock. A stub that reports success is worse than a missing route, because
+/// the caller has no way to tell the two apart. The shape checks stay so a
+/// caller learns what a real request looks like, and the answer to a
+/// well-formed one is `501`: the credential is not kept anywhere, so there is
+/// nothing to accept.
+fn biometric_reply(payload: &BiometricPayload, user_id: &str) -> (StatusCode, serde_json::Value) {
     match payload.action.as_str() {
-        "register" => {
-            if payload.biometric_public_key.is_none() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": "missing_public_key",
-                        "message": "biometric_public_key is required for action=register"
-                    })),
-                )
-                    .into_response();
-            }
+        "register" if payload.biometric_public_key.is_none() => (
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "missing_public_key",
+                "message": "biometric_public_key is required for action=register"
+            }),
+        ),
+        "verify" if payload.signature.is_none() => (
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "missing_signature",
+                "message": "signature is required for action=verify"
+            }),
+        ),
+        "register" | "verify" => {
             info!(
-                "Biometric public key registered: user={} device={}",
-                user_id, payload.device_id
+                user = user_id,
+                device = %payload.device_id,
+                action = %payload.action,
+                "biometric request refused: no key store exists in this build"
             );
             (
-                StatusCode::OK,
-                Json(json!({
-                    "status": "registered",
-                    "device_id": payload.device_id,
-                })),
+                StatusCode::NOT_IMPLEMENTED,
+                json!({
+                    "error": "not_implemented",
+                    "message": "biometric registration and verification are not implemented; \
+                                no credential was stored",
+                }),
             )
-                .into_response()
-        }
-        "verify" => {
-            if payload.signature.is_none() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": "missing_signature",
-                        "message": "signature is required for action=verify"
-                    })),
-                )
-                    .into_response();
-            }
-            info!(
-                "Biometric verification accepted (stub): user={} device={}",
-                user_id, payload.device_id
-            );
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "status": "verified",
-                    "device_id": payload.device_id,
-                })),
-            )
-                .into_response()
         }
         other => (
             StatusCode::BAD_REQUEST,
-            Json(json!({
+            json!({
                 "error": "invalid_action",
                 "message": format!("action must be 'register' or 'verify', got: {}", other)
-            })),
-        )
-            .into_response(),
+            }),
+        ),
     }
 }
 
@@ -1343,5 +1341,54 @@ pub async fn validate_session_handler(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod biometric_tests {
+    use super::*;
+
+    fn payload(action: &str) -> BiometricPayload {
+        BiometricPayload {
+            action: action.into(),
+            biometric_public_key: Some("pk".into()),
+            signature: Some("sig".into()),
+            device_id: "device-1".into(),
+        }
+    }
+
+    #[test]
+    fn a_well_formed_biometric_request_is_refused_instead_of_reported_as_done() {
+        // The endpoint used to answer `registered`/`verified` and store nothing:
+        // a client enrolled a key and got a receipt for a key the platform does
+        // not have. Both actions have to say they are not implemented.
+        for action in ["register", "verify"] {
+            let (status, body) = biometric_reply(&payload(action), "user-1");
+            assert_eq!(
+                status,
+                StatusCode::NOT_IMPLEMENTED,
+                "{action} answered {body}"
+            );
+            assert_eq!(body["error"], "not_implemented");
+        }
+    }
+
+    #[test]
+    fn a_malformed_request_is_told_what_it_is_missing() {
+        let mut register = payload("register");
+        register.biometric_public_key = None;
+        let (status, body) = biometric_reply(&register, "user-1");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "missing_public_key");
+
+        let mut verify = payload("verify");
+        verify.signature = None;
+        let (status, body) = biometric_reply(&verify, "user-1");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "missing_signature");
+
+        let (status, body) = biometric_reply(&payload("enrol"), "user-1");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_action");
     }
 }
