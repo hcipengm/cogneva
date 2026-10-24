@@ -598,30 +598,40 @@ pub enum SupervisorEvent {
         timestamp: DateTime<Utc>,
     },
 
-    /// An Agent was killed by an operator command.
+    /// An Agent left the platform on purpose — an operator killed it, or the
+    /// supervisor dropped it after its heartbeat had been gone past the grace
+    /// period; `reason` says which.
     ///
-    /// A record of something a person did, not a condition that wants an
-    /// acknowledgement, so neither alert reader maps it: in the alert store it
-    /// would sit active forever at Info severity, and the other bridge is for
-    /// outbound alerts a human should be interrupted by. The audit stream it is
-    /// meant for does not exist yet, so until one does this is a named
-    /// exemption to "a landing needs a reader" rather than an unnoticed gap.
+    /// Not a condition that wants an acknowledgement, but it settles one: an
+    /// agent that no longer exists cannot be unhealthy, so the observability
+    /// bridge closes the `agent_unhealthy` row this id left firing. Without
+    /// that the row stays open with a clock nothing moves, which is
+    /// indistinguishable from an agent that is still down. The in-memory alert
+    /// store does not map it — that store is a record of what was raised, not a
+    /// state machine over it. The audit stream this is also meant for does not
+    /// exist yet.
     AgentKilled {
         agent_id: String,
         reason: String,
         timestamp: DateTime<Utc>,
     },
 
-    /// An Agent was restarted by an operator command. See [`AgentKilled`] for
-    /// why no alert reader maps this one.
+    /// An Agent was restarted by an operator command.
+    ///
+    /// No alert reader maps this one, and unlike [`AgentKilled`] there is
+    /// nothing to settle: the agent is still registered and still expected to
+    /// beat, so an unhealthy row about it stands or falls on its heartbeats.
     AgentRestarted {
         agent_id: String,
         preserve_context: bool,
         timestamp: DateTime<Utc>,
     },
 
-    /// A checkpoint was requested for an Agent by an operator command. See
-    /// [`AgentKilled`] for why no alert reader maps this one.
+    /// A checkpoint was requested for an Agent by an operator command.
+    ///
+    /// No alert reader maps this one, and unlike [`AgentKilled`] there is
+    /// nothing to settle: the agent stays registered and its health row keeps
+    /// following its heartbeats.
     CheckpointRequested {
         agent_id: String,
         task_id: String,

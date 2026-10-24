@@ -141,6 +141,87 @@ async fn health_pass_emits_unhealthy_event() {
     assert!(saw, "expected an AgentUnhealthy event");
 }
 
+/// An agent whose heartbeat has been gone past the grace period leaves the
+/// registry, and the health pass says so on the event stream; one that has only
+/// just stopped beating stays.
+///
+/// Without the reap the registry keeps every agent that ever sent a heartbeat,
+/// and every pass after this one announces the same agent again — forever. That
+/// is what makes the bus volume grow with the number of agents that have ever
+/// existed rather than with the number alive, and what every subscriber falls
+/// behind by. The second agent in this test is the other half of the rule: the
+/// reap must not take an agent the respawner is still working on.
+#[tokio::test]
+async fn health_pass_reaps_agents_dead_past_the_grace() {
+    let registry = Arc::new(AgentRegistry::new());
+    let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
+    let orchestrator = make_orchestrator();
+    let gateway: Arc<dyn ObservabilityGateway> =
+        Arc::new(MemoryObservabilityGateway::new(backend.clone()));
+    let gate = Arc::new(SchedulerGate::new());
+
+    let agent = |id: &str, beat_secs_ago: i64| cog_supervisor::registry::AgentInfo {
+        agent_id: id.into(),
+        role: None,
+        crew_id: None,
+        squad_id: None,
+        task_ids: vec![],
+        last_heartbeat: Utc::now() - ChronoDuration::seconds(beat_secs_ago),
+        state_since: Utc::now(),
+        registered_at: Utc::now(),
+    };
+    // Dead by a wide margin against the grace, and dead only just now.
+    registry.register_agent(agent("a-long-gone", 7_200));
+    registry.register_agent(agent("a-just-stopped", 120));
+
+    let supervisor = build_supervisor(
+        registry.clone(),
+        backend,
+        orchestrator.clone(),
+        fake_quota_source(2_000),
+        gateway,
+        gate,
+    );
+    let mut rx = supervisor.subscribe();
+    supervisor.run_health_pass().await.unwrap();
+
+    assert!(
+        registry.get_agent("a-long-gone").is_none(),
+        "an agent dead past the grace must leave the registry"
+    );
+    assert!(
+        registry.get_agent("a-just-stopped").is_some(),
+        "an agent the respawner may still recover must stay in the registry"
+    );
+
+    // The event is the other half: it is what settles the alert row the agent
+    // left firing, so the reap without it would leave a row open forever.
+    let mut reaped: Option<String> = None;
+    let mut reaped_a_live_one = false;
+    for _ in 0..16 {
+        match rx.try_recv() {
+            Ok(SupervisorEvent::AgentKilled { agent_id, .. }) => {
+                if agent_id == "a-long-gone" {
+                    reaped = Some(agent_id);
+                } else {
+                    reaped_a_live_one = true;
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        reaped.as_deref(),
+        Some("a-long-gone"),
+        "expected AgentKilled for the reaped agent"
+    );
+    assert!(
+        !reaped_a_live_one,
+        "the reap must not announce an agent it kept"
+    );
+}
+
 #[tokio::test]
 async fn quota_pass_pauses_scheduler_on_breach() {
     let registry = Arc::new(AgentRegistry::new());

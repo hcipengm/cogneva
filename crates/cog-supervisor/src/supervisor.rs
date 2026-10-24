@@ -10,6 +10,17 @@ use crate::autonomous::{AutonomousCollaborator, AutonomousConfig, AUTONOMOUS_EVE
 
 /// Loop name reported through the background-loop liveness family.
 pub const SUPERVISOR_LOOP: &str = "supervisor_main";
+
+/// How long an agent whose heartbeat has stopped stays in the registry before
+/// it is dropped.
+///
+/// Counted from the last heartbeat, and long enough that the recovery paths
+/// finish first: the respawner reads the dead set on every pass to retry the
+/// crew an agent belonged to, and a crew is retried more than once before it is
+/// given up on. Reaping earlier would delete the evidence while the attempt to
+/// bring the crew back was still running; reaping later costs nothing but the
+/// announcement each pass makes about an agent that is already gone.
+const REAP_AFTER_DEAD: Duration = Duration::from_secs(1800);
 use crate::control_plane::{ControlPlaneClient, HttpControlPlaneClient, SupervisorStatus};
 use crate::error::SupervisorResult;
 use crate::event_aggregator::{EventAggregator, EVENT_AGGREGATOR_LOOP};
@@ -426,7 +437,71 @@ impl Supervisor {
             }
         }
 
+        self.reap_agents_gone(&report.dead);
+
         Ok(report)
+    }
+
+    /// Drop agents whose heartbeat has been gone past the grace period, and
+    /// say so on the event stream so the alert row they left behind is settled.
+    ///
+    /// Without this the registry is a ledger of every agent that ever sent a
+    /// heartbeat: `touch` and `record_heartbeat` insert unknown ids, and nothing
+    /// in the platform calls `unregister_agent`. A respawn registers a new id,
+    /// so the predecessor never comes back, and each health pass then announces
+    /// every one of those ids as dead. The volume a supervisor event subscriber
+    /// has to carry is therefore proportional to the number of agents that have
+    /// *ever* existed, and every subscriber falls behind it in that proportion
+    /// — the alerts among them stop being written while looking exactly like a
+    /// quiet period. Dropping the entry is what ends the announcement; the
+    /// event is the other half of it, because an agent that no longer exists
+    /// cannot be unhealthy and its row must not stay firing with a clock that
+    /// nothing moves.
+    ///
+    /// The grace is measured from the moment the agent was last seen, not from
+    /// when this pass noticed: a supervisor that restarts has no memory of the
+    /// previous pass, and a grace counted from first observation would restart
+    /// with it.
+    fn reap_agents_gone(&self, dead: &[(String, cog_core::HealthIssue)]) {
+        if dead.is_empty() {
+            return;
+        }
+        let dead_after = self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .health_checker
+            .dead_after;
+        let grace = chrono::Duration::from_std(dead_after).unwrap_or_default()
+            + chrono::Duration::from_std(REAP_AFTER_DEAD).unwrap_or_default();
+        let now = Utc::now();
+        for (agent_id, issue) in dead {
+            let last_seen = match issue {
+                cog_core::HealthIssue::Dead { last_seen } => *last_seen,
+                // Not a heartbeat verdict: fall back to the registry's own
+                // clock, and keep the agent when there is no entry left to
+                // read (another pass already reaped it).
+                _ => match self.registry.get_agent(agent_id) {
+                    Some(info) => info.last_heartbeat,
+                    None => continue,
+                },
+            };
+            let gone_for = now.signed_duration_since(last_seen);
+            if gone_for < grace {
+                continue;
+            }
+            self.registry.unregister_agent(agent_id);
+            warn!(
+                agent_id = %agent_id,
+                gone_secs = gone_for.num_seconds(),
+                "reaped an agent that has been dead past its grace"
+            );
+            let _ = self.event_tx.send(SupervisorEvent::AgentKilled {
+                agent_id: agent_id.clone(),
+                reason: format!("reaped: no heartbeat for {}s", gone_for.num_seconds()),
+                timestamp: now,
+            });
+        }
     }
 
     /// Drive a single quota-enforcement pass and emit events.

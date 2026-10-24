@@ -1129,6 +1129,35 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             };
             vec![AlertEvent::Firing(inst)]
         }
+        // An agent that has left the platform cannot be unhealthy any more.
+        // The supervisor reaps one whose heartbeat has been gone past the grace
+        // period; without this the row it left behind stays `firing` with a
+        // clock nothing moves, which reads exactly like an agent that is still
+        // down. `AgentKilled` is also what an operator kill emits, and the same
+        // reasoning holds there: the subject is gone, so its row is settled.
+        cog_core::SupervisorEvent::AgentKilled {
+            agent_id,
+            reason,
+            timestamp,
+        } => {
+            let mut labels = HashMap::new();
+            labels.insert("agent_id".into(), agent_id.clone());
+            labels.insert(
+                "message".into(),
+                format!("Agent left the platform: {reason}"),
+            );
+            let inst = AlertInstance {
+                rule_name: "agent_unhealthy".into(),
+                labels,
+                state: AlertState::Resolved,
+                severity: AlertSeverity::Info,
+                value: 0.0,
+                starts_at: *timestamp,
+                ends_at: Some(now),
+                updated_at: now,
+            };
+            vec![AlertEvent::Resolved(inst)]
+        }
         cog_core::SupervisorEvent::AgentRecovered {
             agent_id,
             timestamp,
@@ -1874,6 +1903,39 @@ mod tests {
         // 触发与恢复必须落同一行，否则 resolve 关不掉。
         assert_eq!(key_of(&firing), key_of(&recovered));
         assert_eq!(key_of(&firing), "agent_unhealthy:a1");
+    }
+
+    /// 一个离开平台的 agent 不可能还「不健康」：回收它之后，它留下的那一行必须
+    /// 有人关。不关的话 `state='firing'` 会一直挂着、`last_seen_at` 再也不动，
+    /// 而运营读「现在有什么在响」读的正是那一面——一条已经不存在的 agent 会永远
+    /// 显示成正在出问题。
+    #[test]
+    fn an_agent_that_left_the_platform_closes_its_unhealthy_row() {
+        let firing = cog_core::SupervisorEvent::AgentUnhealthy {
+            agent_id: "a1".into(),
+            issue: cog_core::HealthIssue::Dead {
+                last_seen: Utc::now(),
+            },
+            timestamp: Utc::now(),
+        };
+        let killed = cog_core::SupervisorEvent::AgentKilled {
+            agent_id: "a1".into(),
+            reason: "reaped: no heartbeat for 7200s".into(),
+            timestamp: Utc::now(),
+        };
+        let alerts = supervisor_event_to_alert_events(&killed);
+        let Some(AlertEvent::Resolved(inst)) = alerts.first() else {
+            panic!("回收事件必须映射成一条恢复，否则那一行没人关");
+        };
+        assert_eq!(inst.rule_name, "agent_unhealthy");
+        assert_eq!(
+            alert_dedup_key(inst),
+            alert_dedup_key(match supervisor_event_to_alert_events(&firing).first() {
+                Some(AlertEvent::Firing(i)) => i,
+                _ => panic!("已知不健康必须是一条 firing"),
+            }),
+            "关的那一行必须是开的同一行"
+        );
     }
 
     #[test]
