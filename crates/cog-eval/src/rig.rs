@@ -135,11 +135,14 @@ struct CheckpointLog {
 impl CheckpointLog {
     /// 打开（必要时新建）检查点，读回已经跑完的那些例，并**占住这一份记录**。
     ///
-    /// 三种情形分开处理，因为它们在文件系统上长得一样、处理却完全不同：
+    /// 四种情形分开处理，因为它们在文件系统上长得一样、处理却完全不同：
     /// - 还不存在：新建，写头一行。
-    /// - 头一行是**另一次实验**：拒绝，不是从头再来。把两次实验的例装进同一份记录，
-    ///   表上完全看不出来，而它的读数会被当成一次完整实验读（这正是「id 已被占用」
-    ///   与「工作还在手上」是两件事的那一族）。
+    /// - 头一行是**另一次实验**、并且后面跟着例：拒绝，不是从头再来。把两次实验的例
+    ///   装进同一份记录，表上完全看不出来，而它的读数会被当成一次完整实验读（这正是
+    ///   「id 已被占用」与「工作还在手上」是两件事的那一族）。
+    /// - 头一行是**另一次实验**、后面一条例都没有：按旧身份归档，这一份从表头重开。
+    ///   没有例可混，而软件身份换一次镜像就变一次，不归档的话每一条续跑都会撞在同一条
+    ///   拒绝上、一次也落不了地。
     /// - 末行残缺：一次崩在追加中途留下的。截到最后一个换行，那一例按没跑过重跑——
     ///   半行 JSON 留在文件里的话，下次接会在中间那一行炸掉，把整份记录变成不可读。
     ///
@@ -156,7 +159,7 @@ impl CheckpointLog {
                     anyhow::anyhow!("cannot read the checkpoint {}: {e}", cp.path.display())
                 })?;
         }
-        let usable = bytes
+        let mut usable = bytes
             .iter()
             .rposition(|b| *b == b'\n')
             .map(|at| at + 1)
@@ -166,9 +169,15 @@ impl CheckpointLog {
         let text = String::from_utf8_lossy(&bytes[..usable]);
         let mut lines = text.lines();
         if let Some(first) = lines.next() {
+            let mut restart = false;
             match serde_json::from_str::<CheckpointLine>(first) {
-                Ok(CheckpointLine::Header { run_id }) => {
-                    if run_id != cp.run_id {
+                // 另一份实验的记录，而且里面还有例：人得决定怎么处置它（并档还是另起），
+                // 所以拒绝。它守的是「两份实验的例别混进一张表」——一条例都没承载的
+                // 记录里没有可混的东西，而软件身份每换一次镜像就变一次，留着它只会让
+                // 每一条无人值守的续跑都在同一条拒绝上撞死、一次也落不了地。
+                Ok(CheckpointLine::Header { run_id }) if run_id != cp.run_id => {
+                    let carried = lines.clone().any(|line| !line.trim().is_empty());
+                    if carried {
                         anyhow::bail!(
                             "the checkpoint {} belongs to a different run ({} vs {}): resuming it \
                              would put two experiments' cases in one table, so this run refuses \
@@ -178,7 +187,20 @@ impl CheckpointLog {
                             cp.run_id
                         );
                     }
+                    let archived = archive_name(&cp.path, &run_id);
+                    std::fs::rename(&cp.path, &archived).map_err(|e| {
+                        anyhow::anyhow!(
+                            "the checkpoint {} is a header from another run and cannot be moved \
+                             aside to {}: {e}",
+                            cp.path.display(),
+                            archived.display()
+                        )
+                    })?;
+                    // 归档之后这一份记录从表头重新开始：下面那段按 `usable` 判要不要写头。
+                    usable = 0;
+                    restart = true;
                 }
+                Ok(CheckpointLine::Header { .. }) => {}
                 _ => anyhow::bail!(
                     "the checkpoint {} does not start with a run header: it is either not a \
                      checkpoint or it was written by something else",
@@ -186,6 +208,10 @@ impl CheckpointLog {
                 ),
             }
             for (n, line) in lines.enumerate() {
+                // 已经归档的那一份不是这次实验的记录，它的行一行都不该读回来。
+                if restart {
+                    break;
+                }
                 let parsed: CheckpointLine = serde_json::from_str(line).map_err(|e| {
                     anyhow::anyhow!(
                         "the checkpoint {}: line {} is unreadable ({e}); only the last line of a \
@@ -292,6 +318,18 @@ impl CheckpointLog {
         file.flush()?;
         Ok(())
     }
+}
+
+/// 归档名：旧身份（前 12 位）＋归档时刻。
+///
+/// 两截缺一不可：只有时间戳，事后说不出挪走的是哪一次实验的记录；只有身份，同一次
+/// 实验连着归档两次（第一次没落地就崩了）会第二次顶掉第一次那份文件。
+fn archive_name(path: &std::path::Path, run_id: &str) -> std::path::PathBuf {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let short = run_id.get(..12).unwrap_or(run_id);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".pre-{short}-{stamp}"));
+    path.with_file_name(name)
 }
 
 /// 拿一份记录的独占权。第二个驱动拿不到就当场失败，不排队等：它等的是另一份可能
@@ -1776,6 +1814,45 @@ mod tests {
             cell.resumed(),
             2,
             "这一格两题都是从盘上接回来的，表上要看得见"
+        );
+    }
+
+    /// 表头属于另一次实验、却一条例都没承载：按旧身份归档，这一次从表头重新开始。
+    ///
+    /// 软件身份每换一次镜像就变一次，所以这条拒绝在无人值守的续跑里会一直撞下去，
+    /// 一次也落不了地——而它守的是「两份实验的例别混进一张表」，一条例都没有的记录
+    /// 里没有可混的东西。归档名带旧身份，事后仍能说出挪走的是哪一次。
+    #[tokio::test]
+    async fn a_header_only_checkpoint_from_another_run_is_moved_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.cases.jsonl");
+        let mut text = serde_json::to_string(&CheckpointLine::Header {
+            run_id: "run-old".into(),
+        })
+        .unwrap();
+        text.push('\n');
+        std::fs::write(&path, text).unwrap();
+
+        let log = CheckpointLog::open(&checkpoint_at(&path, "run-new")).unwrap();
+        drop(log);
+
+        let fresh = std::fs::read_to_string(&path).unwrap();
+        let first: CheckpointLine = serde_json::from_str(fresh.lines().next().unwrap()).unwrap();
+        assert!(
+            matches!(first, CheckpointLine::Header { ref run_id } if run_id == "run-new"),
+            "这一份记录从这次实验的表头重新开始，不是接上一次的：{fresh}"
+        );
+
+        let archived: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".pre-run-old-"))
+            .collect();
+        assert_eq!(
+            archived.len(),
+            1,
+            "旧记录按它自己的身份归档，一份也不多：{archived:?}"
         );
     }
 
