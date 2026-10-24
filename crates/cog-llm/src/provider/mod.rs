@@ -3,6 +3,7 @@ pub mod google;
 pub mod media;
 pub mod ollama;
 pub mod openai;
+pub mod responses;
 
 use cog_core::LlmClient as LLMProvider;
 

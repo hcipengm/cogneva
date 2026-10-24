@@ -102,7 +102,7 @@ fn first_balanced_json_object(text: &str) -> Option<serde_json::Value> {
 
 /// Normalize an already-parsed tool-call argument value into a JSON object so
 /// historical assistant tool_calls are always wire-valid.
-fn sanitize_tool_arguments(value: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn sanitize_tool_arguments(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(_) => value.clone(),
         serde_json::Value::String(s) => parse_tool_arguments(s),
@@ -111,7 +111,7 @@ fn sanitize_tool_arguments(value: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Finalize a tool call block by parsing accumulated JSON arguments.
-fn finalize_tool_call(block: &mut ContentBlock, buffer: &str) {
+pub(crate) fn finalize_tool_call(block: &mut ContentBlock, buffer: &str) {
     if let ContentBlock::ToolCall {
         ref mut arguments, ..
     } = block
@@ -1223,7 +1223,7 @@ impl LLMProvider for OpenAIProvider {
     }
 }
 
-async fn finish_block(
+pub(crate) async fn finish_block(
     block: &ContentBlock,
     idx: usize,
     producer: &crate::AssistantMessageEventProducer,

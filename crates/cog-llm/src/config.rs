@@ -55,7 +55,8 @@ pub struct LLMBackendConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     pub model: String,
-    /// API 兼容风格：`openai` 或 `anthropic`。默认 `openai`。
+    /// API 兼容风格：`openai`（chat-completions 形状）、`openai-responses`
+    /// （Responses 形状，同一家的较新那个面）或 `anthropic`。默认 `openai`。
     #[serde(default = "default_api_style")]
     pub api_style: String,
     pub weight: u32,

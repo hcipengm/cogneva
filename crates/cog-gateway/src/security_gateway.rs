@@ -416,9 +416,19 @@ fn parse_upstreams(raw: &str) -> Vec<LlmUpstream> {
         .collect()
 }
 
+/// The face a pool entry is read in.
+///
+/// Every value outside the three known ones reads as the chat face, which is
+/// the behaviour an unreadable string had before this face existed. An
+/// `openai-responses` entry that was folded into `openai` here would lose the
+/// one fact the admission probe paid a real request for: whether this vendor
+/// answers `/responses`. Nothing would fail loudly — the entry would simply
+/// stop being a candidate for the face it was verified on.
 fn normalize_style(raw: &str) -> String {
     if raw == "anthropic" {
         "anthropic".into()
+    } else if cog_llm::responses::is_openai_family(raw) && raw != "openai" {
+        cog_llm::responses::API_STYLE.into()
     } else {
         "openai".into()
     }
@@ -1289,7 +1299,9 @@ impl LlmHealthTable {
     /// `stream_options`），对 anthropic 端点问它，回来的既不是这个问题也不是
     /// 这个形状的答案，那条判定还会一直停在"问不出来"，每过一个退避窗再花一次。
     fn open_capability_questions(&self, u: &LlmUpstream) -> Vec<CapabilityQuestion> {
-        if u.api_style != "openai" {
+        // OpenAI 族的两个面共用这三条读点与同一组 chat 形状的探测；anthropic
+        // 面上它们既不读也不问得通。
+        if !cog_llm::responses::is_openai_family(&u.api_style) {
             return Vec::new();
         }
         let caps = self.runtime_caps.lock().unwrap();
@@ -3006,6 +3018,21 @@ fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<
             let output = json.pointer("/usage/output_tokens").and_then(as_u64);
             (None, output, None)
         }
+        // Responses 面：用量在 `response.completed`（以及 `response.incomplete`）
+        // 的 `response.usage` 里，名字是 `input_tokens` / `output_tokens`。
+        // 同一个上游换到这个面之后，按 chat 那两个名字去取只会读到 0，而 0 与
+        // "上游没报"在这一格同形，计量会安静地归零。
+        Some(kind) if kind.starts_with("response.") => {
+            let usage = json.pointer("/response/usage");
+            (
+                usage.and_then(|u| u.get("input_tokens")).and_then(as_u64),
+                usage.and_then(|u| u.get("output_tokens")).and_then(as_u64),
+                usage
+                    .and_then(|u| u.pointer("/input_tokens_details/cached_tokens"))
+                    .and_then(as_u64)
+                    .or_else(|| usage.and_then(cached_of)),
+            )
+        }
         _ => {
             let usage = json.get("usage");
             (
@@ -4224,7 +4251,7 @@ async fn refresh_pool_state(state: &AppState) {
             // 写判定、或网关在健康时自己再问一次）在那面上都不存在——准入探测
             // 本身也只问 openai 条目（见 `llm_admin` 的 `resolve_upstream`），
             // 补问发出的探测又都是 openai 形状的。
-            if upstream.api_style == "openai" {
+            if cog_llm::responses::is_openai_family(&upstream.api_style) {
                 // 用量能力判定有没有出处。这一条把"计量恒零"从一个结果变成一个
                 // 可告警的条件：上游正在承接流量而我们还在按厂商画像猜着剥
                 // `stream_options`，它的 token 计数就不可能非零。别的序列看不出
@@ -4801,6 +4828,17 @@ async fn chat_completions_passthrough(
     stream_forward(state, req, "openai").await
 }
 
+/// Responses 透传端点：OpenAI 协议族里较新的那个形状（`input` /
+/// `output` 条目、`response.*` 流事件），转发到 `{base}/responses`。
+/// 它与 `/v1/chat/completions` 是同一个上游的两个面，不是一个新上游：
+/// 只有准入时在 `/responses` 上实证通过过的条目才接这条请求。
+async fn openai_responses_passthrough(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    stream_forward(state, req, cog_llm::responses::API_STYLE).await
+}
+
 /// Anthropic 透传端点：与 OpenAI 透传对称，转发 `/v1/messages`，
 /// 出站凭证换成 `x-api-key` + `anthropic-version`。
 async fn anthropic_messages_passthrough(
@@ -4823,6 +4861,25 @@ async fn anthropic_messages_passthrough(
 /// 池耗尽时把最后一个真实上游错误透传给调用方——厂商错误标记
 /// （如 access_terminated_error）是调用侧终止性失败分类的依据，
 /// 不能被合成文本吃掉。
+/// Whether a pool entry can take a request for the named face.
+///
+/// An OpenAI entry records the face it was *verified* on. Being verified on
+/// `/responses` says the vendor speaks the newer shape and, because the two
+/// are endpoints of the same service, that it still speaks the older one. The
+/// converse does not hold: an entry verified only on `/chat/completions` has
+/// never been asked about `/responses`, and forwarding there on the strength of
+/// its neighbour face would turn every call into a 404 the caller reads as its
+/// own mistake.
+fn serves_face(upstream_style: &str, requested: &str) -> bool {
+    if requested == cog_llm::responses::API_STYLE {
+        upstream_style == cog_llm::responses::API_STYLE
+    } else if requested == "openai" {
+        cog_llm::responses::is_openai_family(upstream_style)
+    } else {
+        upstream_style == requested
+    }
+}
+
 async fn stream_forward(
     state: AppState,
     req: axum::extract::Request,
@@ -4903,17 +4960,26 @@ async fn stream_forward(
         .config
         .llm_upstreams
         .iter()
-        .filter(|u| u.api_style == style)
+        .filter(|u| serves_face(&u.api_style, style))
         .filter(|u| !wants_tools || state.llm_health.effective_tool_calls_verdict(u) != Some(false))
         .collect();
     if candidates.is_empty() {
-        if wants_tools
-            && state
-                .config
-                .llm_upstreams
-                .iter()
-                .any(|u| u.api_style == style)
-        {
+        // 池里一个能接这个面的条目都没有时说清是哪一种「没有」：一家上游
+        // 都没配、配了但没有这个面、还是这个面的条目都被工具能力的实证挡掉了。
+        let pool_has_face = state
+            .config
+            .llm_upstreams
+            .iter()
+            .any(|u| serves_face(&u.api_style, style));
+        if !pool_has_face && style == cog_llm::responses::API_STYLE {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                "池里没有在 /responses 上实证通过的 OpenAI 协议族上游；\
+                 重新保存一次配置会做这个探测，答得通的条目会落在 Responses 面上"
+                    .into(),
+            ));
+        }
+        if wants_tools && pool_has_face {
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!(
@@ -5033,8 +5099,11 @@ async fn stream_forward(
     )> = None;
     for upstream in candidates {
         let base = upstream.base_url.trim_end_matches('/');
+        // 请求面决定地址：同一个上游的两个 OpenAI 面是两个端点，把
+        // Responses 形状的体发到 `/chat/completions` 只换回一个 400。
         let url = match style {
             "anthropic" => format!("{base}/v1/messages"),
+            cog_llm::responses::API_STYLE => cog_llm::responses::responses_url(base),
             _ => format!("{base}/chat/completions"),
         };
         let mut clamped_temperature = false;
@@ -5075,9 +5144,12 @@ async fn stream_forward(
                     if rewrote_role {
                         adapted_fields.push("role");
                     }
-                    // 其余按字段形状做的兼容调整只对 OpenAI 形状的体有意义：
-                    // anthropic 形状的 `max_tokens` 是必填字段，改名会把它弄坏。
-                    if style != "anthropic" {
+                    // 其余按字段形状做的兼容调整只对 chat-completions 那个形状的
+                    // 体有意义：anthropic 形状的 `max_tokens` 是必填字段，改名会把
+                    // 它弄坏；Responses 形状的字段名本来就不是那一组（`input`、
+                    // `max_output_tokens`、顶层工具定义），按 chat 的名字去改只会
+                    // 命中它没有的字段，一个都改不到，却把"改过什么"记成空。
+                    if style == "openai" {
                         let compat = cog_llm::utils::compat::detect_compat(base);
                         // 这里是**追加**不是赋值。这一格要留的是"本趟一共改过
                         // 哪些字段"，适配器返回的只是其中的一半——上面那条角色
@@ -5088,19 +5160,26 @@ async fn stream_forward(
                             &compat,
                             state.llm_health.effective_usage_verdict(upstream),
                         ));
-                        // 有的推理模型只接受 temperature=1，别的值直接 400。调
-                        // 用方判定不了这件事：它连的是网关，base URL 里没有厂商
-                        // 身份，客户端侧按 vendor 域名做的兼容探测在部署形态下
-                        // 永远不命中。网关是唯一知道真实上游的地方。
-                        // 实证优先：准入探测对这台上游直接问过就是证据，运行期
-                        // 补问到的也算（`effective_temperature_verdict`：池条目
-                        // 优先、补问的顶上），只有两条路都没有结论时才用厂商画像
-                        // 兜底——而那一格是全系统里唯一会**改掉调用方自己挑的数**
-                        // 的兜底，所以它值得一条回去问的路。
+                    }
+                    // 温度钳制与上面那条不同：它的读点（`temperature`）在两个
+                    // OpenAI 面上同名同义，所以它对整个 OpenAI 族都成立，只有
+                    // anthropic 面不在此列（那边这个字段的取值面不同）。
+                    // 有的推理模型只接受 temperature=1，别的值直接 400。调
+                    // 用方判定不了这件事：它连的是网关，base URL 里没有厂商
+                    // 身份，客户端侧按 vendor 域名做的兼容探测在部署形态下
+                    // 永远不命中。网关是唯一知道真实上游的地方。
+                    // 实证优先：准入探测对这台上游直接问过就是证据，运行期
+                    // 补问到的也算（`effective_temperature_verdict`：池条目
+                    // 优先、补问的顶上），只有两条路都没有结论时才用厂商画像
+                    // 兜底——而那一格是全系统里唯一会**改掉调用方自己挑的数**
+                    // 的兜底，所以它值得一条回去问的路。
+                    if style != "anthropic" {
                         let requires_one = state
                             .llm_health
                             .effective_temperature_verdict(upstream)
-                            .unwrap_or(compat.requires_temperature_one);
+                            .unwrap_or_else(|| {
+                                cog_llm::utils::compat::detect_compat(base).requires_temperature_one
+                            });
                         if requires_one {
                             if let Some(t) = obj.get_mut("temperature") {
                                 if t.as_f64() != Some(1.0) {
@@ -5111,10 +5190,11 @@ async fn stream_forward(
                         }
                     }
                     // 流式请求没带 stream_options，就是我们从没让上游在流里报用量。
-                    // 非流式响应本身就带 usage，用不着要；anthropic 的流自带用量帧。
+                    // 非流式响应本身就带 usage，用不着要；anthropic 的流自带用量帧；
+                    // Responses 的用量在 `response.completed` 事件里，没有要的开关。
                     let streaming = obj.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
                     asked_for_usage =
-                        style == "anthropic" || !streaming || obj.contains_key("stream_options");
+                        style != "openai" || !streaming || obj.contains_key("stream_options");
                 }
                 serde_json::to_vec(&v).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
             }
@@ -5576,15 +5656,31 @@ async fn probe_suspect_upstreams(state: &AppState) {
 /// 不带 tools（探测目标是"这家还能不能用"，能力准入另有探测）。
 async fn probe_upstream(state: &AppState, upstream: &LlmUpstream) -> Result<(), UpstreamRefusal> {
     let base = upstream.base_url.trim_end_matches('/');
-    let url = match upstream.api_style.as_str() {
-        "anthropic" => format!("{base}/v1/messages"),
-        _ => format!("{base}/chat/completions"),
+    // The probe asks the face the entry was admitted on. Probing an entry
+    // verified on `/responses` with a chat-shaped body would read a 404 as the
+    // upstream being down, and a healthy entry would sit in the suspect window
+    // forever with no request ever reaching it.
+    let responses_face = upstream.api_style == cog_llm::responses::API_STYLE;
+    let url = if upstream.api_style == "anthropic" {
+        format!("{base}/v1/messages")
+    } else if responses_face {
+        cog_llm::responses::responses_url(base)
+    } else {
+        format!("{base}/chat/completions")
     };
-    let payload = serde_json::json!({
-        "model": upstream.model,
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "ping"}],
-    });
+    let payload = if responses_face {
+        serde_json::json!({
+            "model": upstream.model,
+            "max_output_tokens": 1,
+            "input": "ping",
+        })
+    } else {
+        serde_json::json!({
+            "model": upstream.model,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "ping"}],
+        })
+    };
     let builder = state
         .stream_client
         .post(&url)
@@ -6984,6 +7080,7 @@ fn llm_channel_router() -> Router<AppState> {
         .route("/v1/intent", post(intent_handler))
         .route("/v1/chat", post(chat_handler))
         .route("/v1/chat/completions", post(chat_completions_passthrough))
+        .route("/v1/responses", post(openai_responses_passthrough))
         .route("/v1/messages", post(anthropic_messages_passthrough))
         .route(
             crate::secret_write::SECRET_PATCH_PATH,
@@ -7960,6 +8057,29 @@ mod tests {
         assert_eq!(never_asked.outcome(), UsageOutcome::NotAsked);
     }
 
+    /// The Responses face names the same two counts differently and carries
+    /// them in one completion event. Reading only the chat names would return
+    /// zero, and zero is the same reading as "the upstream reported nothing",
+    /// so the metering would go quietly to zero the day an entry moved to this
+    /// face.
+    #[test]
+    fn a_responses_completion_event_is_a_usage_reading() {
+        let mut s = UsageScanner {
+            asked: true,
+            ..UsageScanner::default()
+        };
+        s.feed(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+              data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":\
+              {\"input_tokens\":120,\"output_tokens\":30,\"total_tokens\":150,\
+              \"input_tokens_details\":{\"cached_tokens\":100}}}}\n\n",
+        );
+        s.finish();
+        assert_eq!(s.outcome(), UsageOutcome::Read);
+        assert_eq!((s.tokens_input, s.tokens_output), (120, 30));
+        assert_eq!(s.tokens_cached, 100);
+    }
+
     /// A cut body is not a quiet upstream. Even when frames arrived first, the
     /// reading is incomplete and has to say so.
     #[test]
@@ -8361,6 +8481,28 @@ mod tests {
         assert_eq!(list[0].api_style, "anthropic");
         assert_eq!(list[0].model, "m1");
         assert_eq!(list[1].api_style, "openai");
+    }
+
+    /// 读池子的时候必须把 Responses 面读回来。
+    ///
+    /// 这是准入探测唯一买到的那个事实：这台厂商答不答 `/responses`。读池时
+    /// 把它折成 `openai` 不会有任何报错——条目只是从这个面的候选集里安静地
+    /// 消失，请求于是回 501，而池子看起来"配置过了"。
+    #[test]
+    fn the_pool_keeps_the_face_an_entry_was_verified_on() {
+        let list = parse_upstreams(
+            r#"[
+                {"api_style": "openai-responses", "base_url": "https://a.example.com", "model": "m1", "api_key": "k1"},
+                {"api_style": "openai", "base_url": "https://b.example.com", "model": "m2", "api_key": "k2"},
+                {"api_style": "something-new", "base_url": "https://c.example.com", "model": "m3", "api_key": "k3"}
+            ]"#,
+        );
+        assert_eq!(list[0].api_style, cog_llm::responses::API_STYLE);
+        assert_eq!(list[1].api_style, "openai");
+        assert_eq!(
+            list[2].api_style, "openai",
+            "an unknown face still reads as the chat face"
+        );
     }
 
     #[test]
@@ -10470,6 +10612,132 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(at(0, &keys[0]), "首位仍在配置序里的第一个: {text}");
         assert!(at(1, &keys[2]), "没失败过的那家补上来: {text}");
         assert!(at(2, &keys[1]), "失败的那家沉到最后: {text}");
+    }
+
+    /// 一条条目只接它在准入时被实证过的那个面。
+    ///
+    /// OpenAI 族的两个面是同一台上游的两个端点，记录的是**验过哪个**：验过
+    /// `/responses` 的条目两个面都能接（旧面并没有因此消失）；只验过 chat
+    /// 面的条目没被问过 `/responses`，把它当成"也支持"就是把每一次调用送进
+    /// 一个 404，而那个 404 在对调用方来说读起来像他自己写错了请求。
+    #[test]
+    fn a_pool_entry_serves_the_faces_it_was_verified_on() {
+        for (recorded, requested, serves) in [
+            ("openai", "openai", true),
+            ("openai", "openai-responses", false),
+            ("openai-responses", "openai-responses", true),
+            ("openai-responses", "openai", true),
+            ("anthropic", "openai", false),
+            ("openai", "anthropic", false),
+            ("anthropic", "anthropic", true),
+        ] {
+            assert_eq!(
+                serves_face(recorded, requested),
+                serves,
+                "entry recorded on {recorded}, request for {requested}"
+            );
+        }
+    }
+
+    /// 本地桩上游：任何路径都回 200 与一段 Responses 形状的流，并记下被请求的路径。
+    async fn spawn_responses_stub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::http::header;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().fallback(post(move |uri: axum::http::Uri| {
+            let record = record.clone();
+            async move {
+                record.lock().unwrap().push(uri.path().to_string());
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\
+                     \"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+                )
+            }
+        }));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// `/v1/responses` 把体送到上游的 `/responses`，而不是 `/chat/completions`：
+    /// 两个面是两个端点，送错只换回一个 400，而调用方会把它读成自己写错了体。
+    #[tokio::test]
+    async fn a_responses_request_reaches_the_responses_endpoint() {
+        let (base, seen) = spawn_responses_stub().await;
+        let mut entry = stub_upstream(&base, "m1");
+        entry.api_style = cog_llm::responses::API_STYLE.into();
+        let state = test_state(vec![entry]);
+        let req = axum::extract::Request::builder()
+            .method("POST")
+            .body(axum::body::Body::from(
+                r#"{"model":"placeholder","input":"hi"}"#,
+            ))
+            .unwrap();
+        let resp = openai_responses_passthrough(State(state.clone()), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await;
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["/responses".to_string()],
+            "上游只该看到这个面自己的端点"
+        );
+    }
+
+    /// 只在 chat 面验过的条目接不了 Responses 面的请求，而且拒得出来：501 与
+    /// 一句说明，不是把一个 chat 形状的调用发给一个没验过的端点之后收到的 404。
+    #[tokio::test]
+    async fn a_chat_only_pool_refuses_the_responses_face_by_name() {
+        let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let req = axum::extract::Request::builder()
+            .method("POST")
+            .body(axum::body::Body::from(
+                r#"{"model":"placeholder","input":"hi"}"#,
+            ))
+            .unwrap();
+        let err = openai_responses_passthrough(State(state.clone()), req)
+            .await
+            .err()
+            .expect("没验过这个面就没有候选");
+        assert_eq!(err.0, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            err.1.contains("/responses"),
+            "拒绝要点名缺的是哪个面: {}",
+            err.1
+        );
+    }
+
+    /// 验过 Responses 面的条目仍然接 chat 面的请求：平台自己的主链路走的是
+    /// chat 面，条目换成新面之后如果掉出旧面的候选集，整条链会在配置改对
+    /// 的那一刻断掉。
+    #[tokio::test]
+    async fn an_entry_verified_on_responses_still_serves_the_chat_face() {
+        let (base, seen) = spawn_responses_stub().await;
+        let mut entry = stub_upstream(&base, "m1");
+        entry.api_style = cog_llm::responses::API_STYLE.into();
+        let state = test_state(vec![entry]);
+        let req = axum::extract::Request::builder()
+            .method("POST")
+            .body(axum::body::Body::from(
+                r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = chat_completions_passthrough(State(state.clone()), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await;
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["/chat/completions".to_string()],
+            "chat 面的请求走 chat 面的端点"
+        );
     }
 
     #[tokio::test]

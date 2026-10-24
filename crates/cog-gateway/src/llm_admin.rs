@@ -288,6 +288,7 @@ async fn resolve_upstream(
         unverified = Some("已按 skip_verify 跳过连通验证".to_string());
         match style_hint {
             Some("anthropic") => "anthropic",
+            Some(cog_llm::responses::API_STYLE) => cog_llm::responses::API_STYLE,
             _ => "openai",
         }
     } else {
@@ -327,7 +328,7 @@ async fn resolve_upstream(
         "model": model,
         "api_key": api_key,
     });
-    if api_style == "openai" && !skip_verify {
+    if cog_llm::responses::is_openai_family(api_style) && !skip_verify {
         match detect_tool_call_support(base_url, model, api_key).await {
             Some(supported) => {
                 entry["supports_tool_calls"] = json!(supported);
@@ -594,6 +595,7 @@ fn classify_probe(status: u16) -> ProbeOutcome {
 }
 
 /// 协议探测的判决。
+#[derive(Debug)]
 enum ApiStyleProbe {
     /// 探针当场通了这个协议面。
     Verified(&'static str),
@@ -631,6 +633,7 @@ enum ApiStyleProbe {
 fn protocol_probe_url(style: &str, base_url: &str) -> String {
     match style {
         "openai" => cog_llm::openai::chat_completions_url(base_url),
+        cog_llm::responses::API_STYLE => cog_llm::responses::responses_url(base_url),
         _ => cog_llm::anthropic::messages_url(base_url),
     }
 }
@@ -649,16 +652,39 @@ async fn detect_api_style(
         Err(e) => return ApiStyleProbe::Invalid(format!("HTTP 客户端构建失败: {e}")),
     };
     let base = base_url.trim_end_matches('/');
-    let first_openai = style_hint != Some("anthropic");
+    let first_anthropic = style_hint == Some("anthropic");
 
     let mut refused: Option<(&'static str, String)> = None;
+    // 在 Responses 面上被明确拒服的那一次。它不能进 `refused`：那个面是**偏好**
+    // 而不是唯一候选，一次 400/429 可能只是"这个端点不认这个体"，而同一台上游
+    // 的 chat 面完全可能当场通——先把它按 chat 面入池才对。只有整个族都没有一个
+    // 面给过 2xx 时，它才作为这个族的拒服证据拿出来。
+    let mut responses_refusal: Option<String> = None;
     let mut unreachable: Option<String> = None;
-    for style in if first_openai {
-        ["openai", "anthropic"]
+
+    // 顺序就是偏好：OpenAI 族里先问 Responses 面，答得通就记那个面。这是**同一台
+    // 上游的两个端点**，先问新的那个不会让旧的消失（池条目按族匹配请求面），而
+    // 反过来先问 chat 面会把这个能力整个问不出来。
+    let order: [&'static str; 3] = if first_anthropic {
+        ["anthropic", cog_llm::responses::API_STYLE, "openai"]
     } else {
-        ["anthropic", "openai"]
-    } {
+        [cog_llm::responses::API_STYLE, "openai", "anthropic"]
+    };
+
+    for style in order {
         let result = match style {
+            cog_llm::responses::API_STYLE => {
+                client
+                    .post(protocol_probe_url(style, base))
+                    .bearer_auth(api_key)
+                    .json(&json!({
+                        "model": model,
+                        "max_output_tokens": 16,
+                        "input": "ping"
+                    }))
+                    .send()
+                    .await
+            }
             "openai" => {
                 client
                     .post(protocol_probe_url(style, base))
@@ -698,8 +724,20 @@ async fn detect_api_style(
                         .chars()
                         .take(160)
                         .collect();
+                    let message = format!("{base_url} 返回 HTTP {status}: {detail}");
+                    if style == cog_llm::responses::API_STYLE {
+                        tracing::info!(
+                            base_url = %base_url,
+                            status = %status,
+                            "responses probe was refused; asking the chat face before drawing a conclusion"
+                        );
+                        if responses_refusal.is_none() {
+                            responses_refusal = Some(message);
+                        }
+                        continue;
+                    }
                     if refused.is_none() {
-                        refused = Some((style, format!("{base_url} 返回 HTTP {status}: {detail}")));
+                        refused = Some((style, message));
                     }
                 }
             },
@@ -716,14 +754,19 @@ async fn detect_api_style(
     if let Some((style, message)) = refused {
         return ApiStyleProbe::Refused(style, message);
     }
+    if let Some(message) = responses_refusal {
+        // 只有 Responses 面答过话（而且拒绝了）：按最不张扬的判定入池——chat 面
+        // 没验证过，不能记成 Responses 面。
+        return ApiStyleProbe::Refused("openai", message);
+    }
     if let Some(message) = unreachable {
         return ApiStyleProbe::Invalid(message);
     }
     ApiStyleProbe::Invalid(format!(
-        "{base_url} 上没有可用的协议端点（两种协议面都返回 404）。base_url 要写到\n\
+        "{base_url} 上没有可用的协议端点（三个面都返回 404）。base_url 要写到\n\
          版本段为止、不要写到最后的资源段：平台只往后接 `/chat/completions`（OpenAI 兼容）\n\
-         或 `/messages`（Anthropic），所以 Anthropic 官方地址是 https://api.anthropic.com/v1，\n\
-         DeepSeek 的 Anthropic 面是 https://api.deepseek.com/anthropic/v1"
+         或 `/responses`（OpenAI Responses）或 `/messages`（Anthropic），所以 Anthropic 官方地址是\n\
+         https://api.anthropic.com/v1，DeepSeek 的 Anthropic 面是 https://api.deepseek.com/anthropic/v1"
     ))
 }
 
@@ -944,7 +987,7 @@ impl KubeClient {
 mod tests {
     use super::{
         apiserver_denies_ownership, classify_probe, classify_temperature_probe,
-        classify_usage_probe, protocol_probe_url, ProbeOutcome,
+        classify_usage_probe, detect_api_style, protocol_probe_url, ApiStyleProbe, ProbeOutcome,
     };
 
     /// 向导里每个预设的 base_url，拼出来必须是各家文档给出的那个端点。
@@ -1004,6 +1047,52 @@ mod tests {
             ),
         ] {
             assert_eq!(protocol_probe_url(style, base_url), want, "{base_url}");
+        }
+    }
+
+    /// A vendor that answers on `/responses` is admitted on that face, and a
+    /// vendor that only answers chat completions is admitted on the older one.
+    ///
+    /// The Responses face is the preference, not an assumption: asking it first
+    /// must not deny the chat face to a vendor that has not implemented it, and
+    /// answering it must not be recorded as anything the vendor proved. Each
+    /// stub serves exactly one path, which is how the two outcomes are told
+    /// apart here.
+    #[tokio::test]
+    async fn the_admitted_face_is_the_one_the_vendor_answered_on() {
+        async fn spawn_stub(served: &'static [&'static str]) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = axum::Router::new().fallback(axum::routing::any(
+                move |uri: axum::http::Uri| async move {
+                    if served.contains(&uri.path()) {
+                        (axum::http::StatusCode::OK, "{}")
+                    } else {
+                        (axum::http::StatusCode::NOT_FOUND, "{}")
+                    }
+                },
+            ));
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            format!("http://{addr}")
+        }
+
+        for (served, want) in [
+            (&["/v1/responses"][..], cog_llm::responses::API_STYLE),
+            (&["/v1/chat/completions"][..], "openai"),
+            (
+                &["/v1/responses", "/v1/chat/completions"][..],
+                cog_llm::responses::API_STYLE,
+            ),
+        ] {
+            let base = spawn_stub(served).await;
+            match detect_api_style(&format!("{base}/v1"), "m", "k", None).await {
+                ApiStyleProbe::Verified(style) => {
+                    assert_eq!(style, want, "stub served {served:?}")
+                }
+                other => panic!("stub served {served:?}, expected {want}: {other:?}"),
+            }
         }
     }
 

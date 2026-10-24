@@ -9,6 +9,8 @@ use crate::Usage;
 pub enum ApiType {
     #[serde(rename = "openai-completions")]
     OpenAICompletions,
+    #[serde(rename = "openai-responses")]
+    OpenAIResponses,
     #[serde(rename = "anthropic-messages")]
     AnthropicMessages,
     #[serde(rename = "google-generative-ai")]

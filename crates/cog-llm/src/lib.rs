@@ -29,7 +29,7 @@ pub use hot_swap::HotSwappableLlmClient;
 pub use model::{ApiType, Model, ModelCost, Provider};
 pub use observable::LlmObservable;
 pub use observed::ObservedLlmClient;
-pub use provider::{anthropic, google, ollama, openai};
+pub use provider::{anthropic, google, ollama, openai, responses};
 pub use registry::ProviderRegistry;
 pub use resilience::{BackoffStrategy, ResilientProvider, RetryPolicy};
 pub use routing::RoutingProvider;

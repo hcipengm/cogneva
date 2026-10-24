@@ -176,6 +176,13 @@ pub fn build_single_provider(
         "ollama" => default_model_for(crate::Provider::Ollama),
         _ => default_model_for(crate::Provider::OpenAI),
     };
+    // The style names a wire shape, and the OpenAI family has two. The
+    // Responses shape is the vendor's current one for the same endpoint, so a
+    // backend that says so gets the provider that speaks it; anything else in
+    // the family keeps the chat-completions provider.
+    if backend.api_style == crate::responses::API_STYLE {
+        model.api = crate::ApiType::OpenAIResponses;
+    }
     model.id = backend.model.clone();
     model.name = backend.model.clone();
     if let Some(ref url) = backend.base_url {
@@ -203,6 +210,14 @@ pub fn build_single_provider(
         "ollama" => {
             let mut p =
                 crate::ollama::OllamaProvider::new(model).with_stream_capacity(stream_capacity);
+            if let Some(ref c) = http_client {
+                p = p.with_client(c.clone());
+            }
+            Arc::new(p)
+        }
+        "openai-responses" => {
+            let mut p = crate::responses::OpenAIResponsesProvider::new(model, &backend.api_key)
+                .with_stream_capacity(stream_capacity);
             if let Some(ref c) = http_client {
                 p = p.with_client(c.clone());
             }
@@ -267,3 +282,85 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     optional_requires: &[],
     factory: || Box::new(LlmPlugin::new()),
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::{ChatOptions, Message, SFError, SFResult};
+    use futures::StreamExt;
+    use std::sync::Mutex;
+
+    /// Records the address the provider chose, then answers an empty stream.
+    #[derive(Debug)]
+    struct AddressRecorder {
+        seen: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::HttpClient for AddressRecorder {
+        async fn execute(&self, _req: cog_core::HttpRequest) -> SFResult<cog_core::HttpResponse> {
+            unreachable!("stream path only")
+        }
+        async fn execute_stream(
+            &self,
+            req: cog_core::HttpRequest,
+        ) -> SFResult<cog_core::HttpStreamResponse> {
+            self.seen.lock().unwrap().push(req.url.clone());
+            let chunk: Result<bytes::Bytes, SFError> = Ok(bytes::Bytes::from_static(
+                b"data: {\"type\": \"response.completed\", \"response\": {\"id\": \"r\", \"usage\": {\"input_tokens\": 1, \"output_tokens\": 1}}}\n\n",
+            ));
+            let stream: cog_core::HttpBodyStream = Box::pin(futures::stream::iter(vec![chunk]));
+            Ok(cog_core::HttpStreamResponse {
+                status: 200,
+                headers: std::collections::HashMap::new(),
+                stream,
+            })
+        }
+    }
+
+    fn backend(style: &str) -> crate::LLMBackendConfig {
+        crate::LLMBackendConfig {
+            provider: "gateway".into(),
+            api_key: "placeholder".into(),
+            base_url: Some("http://cogneva-security-gateway:8081/v1".into()),
+            model: "via-security-gateway".into(),
+            api_style: style.into(),
+            weight: 1,
+            enabled: true,
+        }
+    }
+
+    /// The style is what chooses the wire shape, and the two shapes are served
+    /// at different addresses on the same host. A backend that declares the
+    /// Responses face and is answered on `/chat/completions` would be talking
+    /// to a face it did not choose — and the reply would be parsed as the
+    /// wrong shape rather than refused.
+    #[tokio::test]
+    async fn each_style_name_reaches_its_own_endpoint() {
+        for (style, want) in [
+            (
+                "openai",
+                "http://cogneva-security-gateway:8081/v1/chat/completions",
+            ),
+            (
+                "openai-responses",
+                "http://cogneva-security-gateway:8081/v1/responses",
+            ),
+        ] {
+            let recorder = Arc::new(AddressRecorder {
+                seen: Mutex::new(Vec::new()),
+            });
+            let provider = build_single_provider(&backend(style), 8, 4096, Some(recorder.clone()));
+            let mut stream = provider
+                .chat_stream(&[Message::user("hi")], &ChatOptions::default())
+                .await
+                .expect("the provider builds a stream");
+            while stream.next().await.is_some() {}
+            assert_eq!(
+                recorder.seen.lock().unwrap().as_slice(),
+                [want.to_string()],
+                "style {style}"
+            );
+        }
+    }
+}
