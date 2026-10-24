@@ -792,7 +792,96 @@ function GovernancePanel() {
           </table>
         )}
       </Panel>
+
+      <ChangeLedgerPanel />
     </div>
+  );
+}
+
+function ChangeLedgerPanel() {
+  const { ledger } = useSystemSurfaceContext();
+  const l = ledger.data;
+
+  return (
+    <Panel
+      title="变更账"
+      subtitle={
+        l
+          ? `读于 ${stamp(l.generated_at)}。状态、优先级带、待折叠三段读数各自独立。`
+          : '语料要求的变更、树被量到的状态，与还在排队等着折叠进账的交接。'
+      }
+    >
+      <div className="mb-3 space-y-2">
+        <BucketNote bucket={ledger} what="变更账" />
+      </div>
+      {l && (
+        <>
+          <div className="mb-4 grid grid-cols-6 gap-2">
+            {l.census.map((cell) => (
+              <div key={cell.state} className="rounded-lg bg-slate-900/60 px-3 py-2">
+                <div className="text-xs text-slate-500">{cell.state}</div>
+                <div
+                  className={`text-lg tabular-nums ${
+                    cell.outstanding && cell.rows > 0 ? 'text-amber-400' : 'text-slate-300'
+                  }`}
+                >
+                  {cell.rows}
+                </div>
+              </div>
+            ))}
+          </div>
+          <p className="mb-3 text-xs text-slate-500">
+            全账 {l.total} 条，其中还欠着 {l.outstanding_total} 条。前四个状态是欠账，landed 与
+            retired 是两种结案方式——后两个往往被数成欠账，所以这里每个格子自带它算不算欠账。
+          </p>
+          <p className="mb-3 text-xs text-slate-500">
+            按优先级带：{' '}
+            {l.owed_by_band.map((band) => `${band.band} ${band.rows}`).join(' · ')}。
+            五个带都在，空给 0；缺一格与「这一带是空的」在界面上长得一样。
+          </p>
+          <p className="mb-3 text-xs text-slate-500">
+            待折叠的读取 {l.pending_declarations} 条、退役 {l.pending_retirements} 条。
+            这是「账本被告知过没有」的唯一读数：交接了却还没进账的变更只出现在这里，
+            所以只有零才说明账已经追上了。
+          </p>
+          {l.outstanding.length === 0 ? (
+            <p className="text-sm text-slate-500">没有还欠着的变更。</p>
+          ) : (
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-slate-500">
+                  <th className="pb-2 pr-3 text-left font-medium">变更</th>
+                  <th className="pb-2 pr-3 text-left font-medium">状态</th>
+                  <th className="pb-2 pr-3 text-left font-medium">来源</th>
+                  <th className="pb-2 text-left font-medium">最近量于</th>
+                </tr>
+              </thead>
+              <tbody>
+                {l.outstanding.slice(0, 100).map((row) => (
+                  <tr key={row.identity} className="border-t border-slate-800/60">
+                    <td className="py-1.5 pr-3 text-slate-300" title={row.assertion ?? row.identity}>
+                      {row.title ? short(row.title, 56) : short(row.identity, 56)}
+                    </td>
+                    <td className={`py-1.5 pr-3 ${stateColor(row.state)}`}>{row.state}</td>
+                    <td className="py-1.5 pr-3 text-slate-500" title={row.sources.join(', ')}>
+                      {short(row.sources[0] ?? '—', 32)}
+                    </td>
+                    <td className="py-1.5 tabular-nums text-slate-500">
+                      {row.measured_at ? stamp(row.measured_at) : '还没人看过'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {l.outstanding_total > l.outstanding.length && (
+            <p className="mt-2 text-xs text-slate-600">
+              本页 {l.outstanding.length} 条，总共欠 {l.outstanding_total} 条。
+            </p>
+          )}
+        </>
+      )}
+    </Panel>
   );
 }
 

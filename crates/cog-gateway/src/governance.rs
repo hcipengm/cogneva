@@ -202,3 +202,159 @@ pub async fn principles_handler(
         refused,
     }))
 }
+
+/// What `GET /api/v1/governance/changes` returns.
+///
+/// The change account's state, and the rows it hands out next. Four readings
+/// rather than one number: how many rows sit in each state, how much outstanding
+/// work each priority band holds, how much intake is queued and not yet folded
+/// into the account, and the head of the queue itself. A single "changes: N"
+/// cannot separate a corpus whose demands are all landed from one whose demands
+/// were never looked at, and those two want opposite work.
+#[derive(Debug, Serialize)]
+pub struct ChangesResponse {
+    pub generated_at: DateTime<Utc>,
+    /// Every row the account holds, whatever its state.
+    pub total: u64,
+    /// One cell per state, in `ChangeState::ALL` order. A state with no rows is
+    /// present with zero: a missing cell and an empty state read the same to a
+    /// caller that has to guess which one it was not told, and the guess it
+    /// makes about a terminal state is the expensive one.
+    pub census: Vec<ChangeStateCount>,
+    /// Outstanding rows per band, every band present. Summed, this is the same
+    /// population the non-terminal cells of `census` sum to; the two are
+    /// published together so that a disagreement between them is visible
+    /// instead of being resolved silently in favour of one.
+    pub owed_by_band: Vec<ChangeBandCount>,
+    /// Readings queued and not yet folded into the account.
+    ///
+    /// The one reading that says whether "the ledger was told" happened: a
+    /// change handed over and not yet folded appears here and nowhere else, so
+    /// zero is the only value at which the account is known to have caught up.
+    pub pending_declarations: u64,
+    /// Retirements queued and not yet folded, the same reading for the other
+    /// intake.
+    pub pending_retirements: u64,
+    /// How many rows are outstanding, over the whole set rather than the list
+    /// below it. `outstanding.len()` is a page length and answering this
+    /// question with it would make the backlog look as small as the page.
+    pub outstanding_total: u64,
+    /// The rows the ledger hands out next, most urgent band first.
+    pub outstanding: Vec<ChangeLedgerRowView>,
+}
+
+/// One state's row count.
+#[derive(Debug, Serialize)]
+pub struct ChangeStateCount {
+    pub state: String,
+    /// Whether a row in this state is still work. Printed rather than left for
+    /// the reader to derive from the state's name: the two terminal states are
+    /// exactly the ones a reader is most likely to miscount.
+    pub outstanding: bool,
+    pub rows: u64,
+}
+
+/// One priority band's outstanding row count.
+#[derive(Debug, Serialize)]
+pub struct ChangeBandCount {
+    pub band: String,
+    pub rows: u64,
+}
+
+/// One outstanding row, as the operator reads it.
+///
+/// Not the stored row verbatim: the identity is flattened into the words that
+/// name it, and the columns no landed row has are left off, so a reader sees
+/// what to do rather than a record of every measurement ever taken.
+#[derive(Debug, Serialize)]
+pub struct ChangeLedgerRowView {
+    pub identity: String,
+    pub state: String,
+    pub title: Option<String>,
+    pub assertion: Option<String>,
+    /// The documents that ask for this change.
+    pub sources: Vec<String>,
+    pub first_seen_at: DateTime<Utc>,
+    /// `None` while nothing has measured the row. Kept distinct from an old
+    /// measurement: "nobody has looked" and "looked at a while ago" want
+    /// different work, and a filled-in timestamp makes them one row.
+    pub measured_at: Option<DateTime<Utc>>,
+    pub measured_rev: Option<String>,
+}
+
+/// How many outstanding rows the route returns. The account can hold thousands;
+/// this bounds the body without bounding `outstanding_total`, which is taken
+/// from the census.
+const OUTSTANDING_PAGE: usize = 100;
+
+fn changes(state: &GatewayState) -> Result<&Arc<dyn cog_core::ChangeLedgerStore>, ApiError> {
+    state.change_ledger.as_ref().ok_or_else(|| ApiError {
+        error: "ServiceUnavailable".into(),
+        message: "no shared database is published, so there is no change ledger to read".into(),
+    })
+}
+
+pub async fn changes_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<ChangesResponse>, ApiError> {
+    let ledger = changes(&state)?;
+    let now = Utc::now();
+    let counted: std::collections::HashMap<cog_core::ChangeState, u64> =
+        ledger.census().await?.into_iter().collect();
+    let by_band: std::collections::HashMap<cog_core::ChangePriority, usize> =
+        ledger.owed_by_band().await?.into_iter().collect();
+    let pending_declarations = ledger.pending_declarations().await?;
+    let pending_retirements = ledger.pending_retirements().await?;
+    let rows = ledger.outstanding(OUTSTANDING_PAGE).await?;
+
+    let census: Vec<ChangeStateCount> = cog_core::ChangeState::ALL
+        .iter()
+        .map(|state| ChangeStateCount {
+            state: state.as_str().to_string(),
+            outstanding: state.is_outstanding(),
+            rows: counted.get(state).copied().unwrap_or(0),
+        })
+        .collect();
+    let total: u64 = census.iter().map(|cell| cell.rows).sum();
+    let outstanding_total: u64 = census
+        .iter()
+        .filter(|cell| cell.outstanding)
+        .map(|cell| cell.rows)
+        .sum();
+    let owed_by_band: Vec<ChangeBandCount> = cog_core::ChangePriority::ALL
+        .iter()
+        .map(|band| ChangeBandCount {
+            band: band.as_str().to_string(),
+            rows: by_band.get(band).copied().unwrap_or(0) as u64,
+        })
+        .collect();
+
+    let outstanding = rows
+        .into_iter()
+        .map(|row| ChangeLedgerRowView {
+            identity: row.identity.as_key(),
+            state: row.state.as_str().to_string(),
+            title: row.title,
+            assertion: row.assertion,
+            sources: row
+                .sources
+                .iter()
+                .map(|source| source.doc.clone())
+                .collect(),
+            first_seen_at: row.first_seen_at,
+            measured_at: row.measured_at,
+            measured_rev: row.measured_rev,
+        })
+        .collect();
+
+    Ok(Json(ChangesResponse {
+        generated_at: now,
+        total,
+        census,
+        owed_by_band,
+        pending_declarations,
+        pending_retirements,
+        outstanding_total,
+        outstanding,
+    }))
+}

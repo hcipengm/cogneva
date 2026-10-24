@@ -226,6 +226,7 @@ async fn build_test_state() -> Option<AutonomousTestState> {
         workspace_store: None,
         governance_store: None,
         principle_ledger: None,
+        change_ledger: None,
         external_skill_registry: None,
         notification_dispatcher: None,
         notification_tx: broadcast::channel(16).0,

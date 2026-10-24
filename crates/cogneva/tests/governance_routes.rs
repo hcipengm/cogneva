@@ -295,6 +295,7 @@ fn state_with(
         workspace_store: None,
         governance_store,
         principle_ledger,
+        change_ledger: None,
         external_skill_registry: None,
         notification_dispatcher: None,
         notification_tx: broadcast::channel(16).0,

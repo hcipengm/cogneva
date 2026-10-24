@@ -307,6 +307,12 @@ pub struct GatewayState {
     /// 与面名册同样按请求现读；`None` 时那条路由报「没有台账」而不是回一份
     /// 全零的账——全零会被读成「一条原则都没有」。
     pub principle_ledger: Option<Arc<dyn cog_core::PrincipleLedgerStore>>,
+    /// The change account: what the corpus asks for, what the tree has been
+    /// measured to hold, and how much intake is still waiting to be folded in.
+    /// Read per request, like the face roster; `None` makes the route report
+    /// that there is no account rather than answer an empty one, because an
+    /// empty answer is the claim that nothing is owed.
+    pub change_ledger: Option<Arc<dyn cog_core::ChangeLedgerStore>>,
     pub workspace_store:
         Option<Arc<std::sync::RwLock<std::collections::HashMap<String, workspaces::Workspace>>>>,
     /// External skill registry (Markdown-based skills).
@@ -843,6 +849,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/governance/principles",
             get(governance::principles_handler),
+        )
+        .route(
+            "/api/v1/governance/changes",
+            get(governance::changes_handler),
         )
         .route("/api/v1/tasks/{id}", get(tasks::get_task_handler))
         .route("/api/v1/tasks/list", get(tasks::list_tasks_handler))

@@ -765,6 +765,64 @@ export async function getGovernancePrinciples(): Promise<PrinciplesPage> {
   return api.get<PrinciplesPage>('/api/v1/governance/principles');
 }
 
+// ── 变更账 ──
+
+/**
+ * 一格状态计数。
+ *
+ * `outstanding` 由服务端给，不在前端按名字推：六个状态里恰好两个终态不算欠账，
+ * 而这两个正是最容易数错的两个。
+ */
+export interface ChangeStateCell {
+  state: string;
+  outstanding: boolean;
+  rows: number;
+}
+
+/** 一个优先级带上的欠账条数；每个带都在，空的给 0。 */
+export interface ChangeBandCell {
+  band: string;
+  rows: number;
+}
+
+/**
+ * 一条还欠着的变更。
+ *
+ * `measured_at` 为空是「还没有人看过」，不是「很久以前看过」：两者要做的活相反，
+ * 所以服务端不发一个填好的时间戳。
+ */
+export interface ChangeLedgerRow {
+  identity: string;
+  state: string;
+  title: string | null;
+  assertion: string | null;
+  sources: string[];
+  first_seen_at: string;
+  measured_at: string | null;
+  measured_rev: string | null;
+}
+
+/**
+ * 变更账的一份读数。
+ *
+ * `outstanding` 是**节选**，`outstanding_total` 才是全集：拿本页条数当欠账总条数，
+ * 会让积压看起来和这一页一样小。
+ */
+export interface ChangesPage {
+  generated_at: string;
+  total: number;
+  census: ChangeStateCell[];
+  owed_by_band: ChangeBandCell[];
+  pending_declarations: number;
+  pending_retirements: number;
+  outstanding_total: number;
+  outstanding: ChangeLedgerRow[];
+}
+
+export async function getGovernanceChanges(): Promise<ChangesPage> {
+  return api.get<ChangesPage>('/api/v1/governance/changes');
+}
+
 // ── 变更队列 ──
 
 /** 一条变更候选。`status` 是它在流水线上的位置，服务端给的是原字符串。 */

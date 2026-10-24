@@ -5,6 +5,7 @@ import {
   getClusterOverview,
   getEvolutionChanges,
   getEvolutionMetrics,
+  getGovernanceChanges,
   getGovernancePrinciples,
   getTokenUsage,
   getGovernanceDrift,
@@ -19,6 +20,7 @@ import {
   type EvalDatasetInfo,
   type EvolutionChangesPage,
   type EvolutionMetrics,
+  type ChangesPage,
   type PrinciplesPage,
   type FaceDriftReading,
   type GovernanceFace,
@@ -80,6 +82,7 @@ export function useSystemSurface({ enabled, intervalMs = 15000 }: UseSystemSurfa
   const [components, setComponents] = useState<SurfaceBucket<ClusterComponentsPage>>(emptyBucket);
   const [usage, setUsage] = useState<SurfaceBucket<TokenUsage>>(emptyBucket);
   const [principles, setPrinciples] = useState<SurfaceBucket<PrinciplesPage>>(emptyBucket);
+  const [ledger, setLedger] = useState<SurfaceBucket<ChangesPage>>(emptyBucket);
   const [changes, setChanges] = useState<SurfaceBucket<EvolutionChangesPage>>(emptyBucket);
 
   const loadFaces = useCallback(async () => {
@@ -242,6 +245,21 @@ export function useSystemSurface({ enabled, intervalMs = 15000 }: UseSystemSurfa
     }
   }, []);
 
+  const loadLedger = useCallback(async () => {
+    setLedger((b) => ({ ...b, loading: true }));
+    try {
+      const page = await getGovernanceChanges();
+      setLedger({
+        data: page,
+        loading: false,
+        error: null,
+        loadedAt: page.generated_at,
+      });
+    } catch (e) {
+      setLedger((b) => ({ ...b, loading: false, error: describeError(e, '变更账') }));
+    }
+  }, []);
+
   const loadChanges = useCallback(async () => {
     setChanges((b) => ({ ...b, loading: true }));
     try {
@@ -268,6 +286,7 @@ export function useSystemSurface({ enabled, intervalMs = 15000 }: UseSystemSurfa
     void loadCluster();
     void loadUsage();
     void loadPrinciples();
+    void loadLedger();
     void loadChanges();
   }, [
     loadFaces,
@@ -280,6 +299,7 @@ export function useSystemSurface({ enabled, intervalMs = 15000 }: UseSystemSurfa
     loadCluster,
     loadUsage,
     loadPrinciples,
+    loadLedger,
     loadChanges,
   ]);
 
@@ -303,6 +323,7 @@ export function useSystemSurface({ enabled, intervalMs = 15000 }: UseSystemSurfa
     components,
     usage,
     principles,
+    ledger,
     changes,
     refreshAll,
   };

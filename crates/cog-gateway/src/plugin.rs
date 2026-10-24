@@ -280,6 +280,12 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             // 这里只借读面：属主要在同一个界面里看见语料判成了什么、哪几条
             // 真的拦下过东西，而那几个数除了这条路由没有第二个出口。
             &ctx.consume_service::<dyn cog_core::PrincipleLedgerStore>(),
+            // The change account is published by the same storage plugin and
+            // written by the evolution loop's resident writer. This side only
+            // borrows the read face: how much the corpus asks for, how much of
+            // it the tree has been measured to hold, and how much intake is
+            // still queued had no exit other than SQL against the deployment.
+            &ctx.consume_service::<dyn cog_core::ChangeLedgerStore>(),
             &chat_turns,
             &agent_messages,
             &object_backend,
