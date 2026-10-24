@@ -609,6 +609,91 @@ async fn unstarted_face_work_follows_a_unit_that_is_present() {
     clean(&pool, &prefix).await;
 }
 
+/// Releasing a face's work clears the owner from both the row and the goal the
+/// claimer reads, which is what puts the rows back in front of every worker.
+///
+/// A row that keeps either copy is still refused by the shared queue, so a
+/// release that wrote only one of them would report the work as freed while
+/// nothing could pick it up -- the same shape as re-addressing it to a name
+/// nobody answers to.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn released_face_work_is_offered_to_every_worker() {
+    let pool = PgPool::connect(&database_url())
+        .await
+        .expect("connect to the test database");
+    let backend = PostgresStateBackend::new(pool.clone());
+    backend.init_schema().await.expect("init the schema");
+    let store = PostgresGovernanceStore::new(pool.clone());
+
+    let prefix = begin(&pool).await;
+    let face_id = format!("{prefix}:face");
+    let pending = format!("{prefix}:pending");
+    let running = format!("{prefix}:running");
+    let workspace = format!("{prefix}-ws");
+
+    store
+        .save_face_node(&face_node(&face_id, "gone-unit", 1))
+        .await
+        .expect("seed the face");
+    for (id, status) in [
+        (&pending, TaskStatus::Pending),
+        (&running, TaskStatus::Running),
+    ] {
+        let mut row = work(id, Some("gone-unit"), Some(&face_id), status);
+        row.input = serde_json::json!({"goal": "hold the face", "owner_unit": "gone-unit"});
+        backend
+            .dag_set_task(&workspace, id, &row)
+            .await
+            .expect("seed the work");
+    }
+
+    let released = store
+        .release_face_work(&face_id)
+        .await
+        .expect("release the unstarted work");
+    assert_eq!(released, 1, "only the unstarted row is released");
+
+    let row = backend
+        .dag_get_task(&workspace, &pending)
+        .await
+        .expect("read the pending row")
+        .expect("the pending row is still there");
+    assert_eq!(row.owner_unit, None, "the row is offered again: {row:?}");
+    assert_eq!(
+        row.input.get("owner_unit"),
+        None,
+        "the goal must not still name a unit the queue never routed it from: {row:?}"
+    );
+    assert_eq!(
+        row.input.get("goal").and_then(|v| v.as_str()),
+        Some("hold the face"),
+        "releasing must not rewrite the goal: {row:?}"
+    );
+
+    let running_row = backend
+        .dag_get_task(&workspace, &running)
+        .await
+        .expect("read the running row")
+        .expect("the running row is still there");
+    assert_eq!(
+        running_row.owner_unit.as_deref(),
+        Some("gone-unit"),
+        "a run in flight belongs to the session holding its lease: {running_row:?}"
+    );
+
+    assert_eq!(
+        store
+            .release_face_work(&face_id)
+            .await
+            .expect("a second pass"),
+        0,
+        "a row that already carries no owner is not rewritten every pass"
+    );
+
+    clean(&pool, &prefix).await;
+}
+
 /// A stale face revision rolls the whole transaction back: the handover row must
 /// not read as applied while the face still says the old owner.
 #[tokio::test]

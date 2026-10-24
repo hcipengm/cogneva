@@ -805,6 +805,27 @@ pub trait GovernanceStore: Send + Sync {
     ///
     /// Returns how many rows moved.
     async fn reassign_face_work(&self, face_id: &str, to_unit: &str) -> SFResult<usize>;
+
+    /// Give a face's unstarted work back to the shared queue.
+    ///
+    /// The row and the goal payload lose their `owner_unit`, which is the only
+    /// thing that keeps a task off the queue every deployment reads. This is
+    /// the move for a face whose named owner does not answer to the registry:
+    /// an owned row whose owner is gone is offered to nobody -- the shared
+    /// queue hands out only unowned work -- and handing it to *another*
+    /// registered unit does not make it runnable either, because a unit named
+    /// on a row can only take it through the claim command. A name picked from
+    /// the registry is therefore a guess, and a guess that lands on a pool
+    /// worker or a squad strands the row exactly where it was while the face
+    /// stops reading as drifted. Releasing is the one placement that runs
+    /// whoever is available; a returning owner gets the face's duty back
+    /// through the ordinary assignment pass or through a signed handover.
+    ///
+    /// A `running` row is left alone for the same reason a handover leaves it:
+    /// its lease is what makes it executable.
+    ///
+    /// Returns how many rows were released.
+    async fn release_face_work(&self, face_id: &str) -> SFResult<usize>;
 }
 
 /// What an import did with one row.

@@ -140,75 +140,61 @@ pub fn gap_goal_row(reading: &FaceDriftReading, id: String) -> Task {
     row
 }
 
-/// How many faces the present units are holding, for choosing who takes one
-/// more.
-///
-/// Counting faces rather than tasks keeps the answer stable: a face's task
-/// count grows and shrinks with its decomposition, so a unit would be handed a
-/// face for having *finished* work on another one.
-pub fn holdings(
-    readings: &[FaceDriftReading],
-    live: &[String],
-) -> std::collections::BTreeMap<String, usize> {
-    let mut load: std::collections::BTreeMap<String, usize> =
-        live.iter().map(|unit| (unit.clone(), 0)).collect();
-    for reading in readings {
-        if let Some(owner) = reading.owner.as_deref() {
-            if let Some(count) = load.get_mut(owner) {
-                *count += 1;
-            }
-        }
-    }
-    load
+/// What one pass does with a face's unstarted work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkPlacement {
+    /// The named owner answers to the registry; the rows stay where they are.
+    Keep,
+    /// The named owner does not answer, and no unit is present to take it.
+    Stranded,
+    /// The named owner does not answer; the rows go back to the shared queue.
+    Release,
 }
 
-/// The unit a face's unstarted work should follow.
+/// Where a face's unstarted work belongs, given who answers right now.
 ///
 /// A face's owner is a declaration of intent; whether that name answers is a
 /// fact measured from the heartbeat registry on every pass. When it does, the
-/// face stays where it was put. When it does not, the work belongs to whoever
-/// is present -- chosen as the present unit holding the fewest faces, ties by
-/// name so two readers of the same registry pick the same unit -- because the
-/// alternative is work addressed to a session that is gone, which no queue can
-/// hand out and no reading can call busy.
+/// face stays where it was put.
 ///
-/// `None` means nobody is present. That is the one situation in which a face
-/// is idle rather than reassigned: there is no unit to give it to, and moving
-/// it would only erase the record of who was asked to do it.
-pub fn reassignment_target(
-    preferred: Option<&str>,
-    live: &[String],
-    load: &std::collections::BTreeMap<String, usize>,
-) -> Option<String> {
-    if live.is_empty() {
-        return None;
-    }
+/// When it does not, the work is released to the shared queue rather than
+/// handed to whichever present unit is least loaded. Handing it on does not
+/// make it runnable: a row that carries an owner is offered to that owner
+/// alone, and a registered unit takes owned work only through the claim
+/// command, so re-addressing a row to a pool worker or a squad moves the name
+/// and leaves the row exactly as stuck as before -- while the face stops
+/// reading as drifted, because its rows now name somebody the registry
+/// answers. Measured on a live cluster: eighteen face rows sat unstarted for
+/// five days through repeated re-addressing, first to operator names and then
+/// to three pool workers whose pods a rollout deleted. Clearing the owner is
+/// the one placement every executor can take, and the face's declared owner
+/// keeps the face node, so a returning owner is given the duty back by the
+/// assignment pass or by a signed handover.
+///
+/// `Stranded` is the one case a face is left alone: with nobody present there
+/// is nothing to hand the work to, and rewriting the rows would only erase the
+/// record of who was asked to do it.
+pub fn placement_for(preferred: Option<&str>, live: &[String]) -> WorkPlacement {
     if let Some(name) = preferred {
         if live.iter().any(|unit| unit == name) {
-            return Some(name.to_string());
+            return WorkPlacement::Keep;
         }
     }
-    live.iter()
-        .min_by(|a, b| {
-            load.get(*a)
-                .copied()
-                .unwrap_or(0)
-                .cmp(&load.get(*b).copied().unwrap_or(0))
-                .then_with(|| a.cmp(b))
-        })
-        .cloned()
+    if live.is_empty() {
+        return WorkPlacement::Stranded;
+    }
+    WorkPlacement::Release
 }
 
-/// Hand each face's unstarted work to a unit that is present.
+/// Put each face's unstarted work back where it can be picked up.
 ///
 /// Only unstarted rows move; a run in flight belongs to the session holding
 /// its lease, and taking it away would leave two units claiming one run. The
 /// move is a row rewrite, not a handover: no signature is involved because the
 /// face did not change hands on paper, the unit holding its rows simply left,
 /// and a departed unit cannot sign. The declared owner stays on the face node,
-/// so the measurement -- which already prefers the present unit holding the
-/// work -- reports who is doing the face while the declaration still says who
-/// it was meant for.
+/// so the reading still says who the face was meant for while the work itself
+/// is available to whoever is running.
 async fn reassign_faces(
     store: &dyn GovernanceStore,
     readings: &[FaceDriftReading],
@@ -222,33 +208,22 @@ async fn reassign_faces(
         );
         return;
     }
-    let mut load = holdings(readings, live);
     for reading in readings {
-        let Some(target) = reassignment_target(reading.owner.as_deref(), live, &load) else {
+        if placement_for(reading.owner.as_deref(), live) != WorkPlacement::Release {
             continue;
-        };
-        // The unit taking this face is now holding one more, so the next face
-        // that needs a home sees the same share this one did.
-        let held = reading.owner.as_deref() == Some(target.as_str());
-        if !held {
-            if let Some(count) = load.get_mut(&target) {
-                *count += 1;
-            }
         }
-        match store.reassign_face_work(&reading.face_id, &target).await {
+        match store.release_face_work(&reading.face_id).await {
             Ok(0) => {}
-            Ok(moved) => info!(
+            Ok(released) => info!(
                 face = %reading.face_id,
-                to = %target,
-                rows = moved,
-                "face work handed to a unit that is present; the unit it named is gone"
+                owner = reading.owner.as_deref().unwrap_or("nobody"),
+                rows = released,
+                "face work released to the shared queue; the unit it named is gone"
             ),
             Err(e) => warn!(
                 face = %reading.face_id,
-                to = %target,
                 error = %e,
-                "face work could not be moved to a present unit; the reading still reports the \
-                 face as it stands"
+                "face work could not be released; the reading still reports the face as it stands"
             ),
         }
     }
@@ -481,50 +456,27 @@ mod tests {
         names.iter().map(|name| name.to_string()).collect()
     }
 
-    /// A name the registry answers to keeps the face it was given, even when
-    /// another unit is less loaded: a face that moves for reasons other than
-    /// absence reports a different owner every pass.
+    /// A name the registry answers to keeps the face it was given: a face that
+    /// moves for reasons other than absence reports a different owner every
+    /// pass.
     #[test]
     fn a_present_owner_keeps_its_face() {
         let live = units(&["f5", "worker"]);
-        let load = holdings(&[], &live);
-        assert_eq!(
-            reassignment_target(Some("worker"), &live, &load),
-            Some("worker".to_string())
-        );
+        assert_eq!(placement_for(Some("worker"), &live), WorkPlacement::Keep);
     }
 
-    /// The unit holding a departed face's rows is gone. The work goes to a
-    /// unit the registry answers to, chosen by share so one session does not
-    /// collect every face -- otherwise the idle reading would simply move
-    /// rather than close.
+    /// A departed owner's work is released to the shared queue, not handed to
+    /// another name. Handing it on was measured to strand rows on a live
+    /// cluster: the units the registry answers to are pool workers and squads,
+    /// which take owned work from nobody, so the row kept its owner, never
+    /// reached the queue, and the face stopped reading as drifted.
     #[test]
-    fn work_follows_a_unit_that_is_present_when_the_owner_is_gone() {
-        let live = units(&["f5", "worker"]);
-        let mut load = holdings(&[], &live);
-        load.insert("f5".into(), 3);
-
+    fn a_gone_owners_work_is_released_rather_than_readdressed() {
+        let live = units(&["alice-0fca56bd", "squad:change-ledger-1-planner"]);
         assert_eq!(
-            reassignment_target(Some("gone-8b"), &live, &load),
-            Some("worker".to_string()),
-            "the present unit holding fewer faces takes the next one"
-        );
-        assert_eq!(
-            reassignment_target(None, &live, &load),
-            Some("worker".to_string()),
-            "a face with no owner also lands on the present unit with room"
-        );
-    }
-
-    /// Ties resolve by name, so two passes that read the same registry pick the
-    /// same unit and a face does not wander between equal shares.
-    #[test]
-    fn equal_shares_are_broken_by_name_rather_than_by_row_order() {
-        let live = units(&["b-unit", "a-unit"]);
-        let load = holdings(&[], &live);
-        assert_eq!(
-            reassignment_target(None, &live, &load),
-            Some("a-unit".to_string())
+            placement_for(Some("gone-8b"), &live),
+            WorkPlacement::Release,
+            "no present unit can claim an owned row, so re-addressing it only moves the name"
         );
     }
 
@@ -533,10 +485,7 @@ mod tests {
     /// was asked.
     #[test]
     fn with_nobody_present_the_work_is_left_where_it_is() {
-        assert_eq!(
-            reassignment_target(Some("f5"), &[], &Default::default()),
-            None
-        );
+        assert_eq!(placement_for(Some("f5"), &[]), WorkPlacement::Stranded);
     }
 
     fn reading(owner: Option<&str>) -> FaceDriftReading {
@@ -588,10 +537,11 @@ mod tests {
         assert!(!row.is_executable);
     }
 
-    /// Records which faces the pass asked to move, and to whom.
+    /// Records which faces the pass asked to release.
     #[derive(Default)]
     struct RecordingStore {
-        moves: std::sync::Mutex<Vec<(String, String)>>,
+        adopted: std::sync::Mutex<Vec<(String, String)>>,
+        released: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -638,36 +588,60 @@ mod tests {
             Ok(None)
         }
         async fn reassign_face_work(&self, face_id: &str, to_unit: &str) -> SFResult<usize> {
-            self.moves
+            self.adopted
                 .lock()
                 .expect("the recorder lock is not poisoned")
                 .push((face_id.to_string(), to_unit.to_string()));
             Ok(0)
         }
+        async fn release_face_work(&self, face_id: &str) -> SFResult<usize> {
+            self.released
+                .lock()
+                .expect("the recorder lock is not poisoned")
+                .push(face_id.to_string());
+            Ok(0)
+        }
     }
 
-    /// The pass hands a departed owner's face to a unit that is present, and
-    /// hands nothing anywhere when no unit is present: the second half is what
-    /// keeps "idle" meaning "nobody is here" rather than "the pass did not
-    /// run".
+    /// The pass releases a departed owner's face to the queue and touches
+    /// nothing when nobody is present: re-addressing is the shape that was
+    /// measured to strand rows, so the pass must not do it at all, and the
+    /// second half is what keeps "idle" meaning "nobody is here" rather than
+    /// "the pass did not run".
     #[tokio::test]
-    async fn the_pass_moves_a_gone_owners_face_to_a_present_unit_and_moves_nothing_without_one() {
+    async fn the_pass_releases_a_gone_owners_face_and_touches_nothing_without_a_unit() {
         let store = RecordingStore::default();
         let readings = vec![reading(Some("gone-unit"))];
 
         reassign_faces(&store, &readings, &["present-unit".to_string()]).await;
         assert_eq!(
-            store.moves.lock().expect("lock").clone(),
-            vec![("task-management".to_string(), "present-unit".to_string())],
-            "work addressed to a session that is gone is given to the unit that answers"
+            store.released.lock().expect("lock").clone(),
+            vec!["task-management".to_string()],
+            "work addressed to a session that is gone goes back to the shared queue"
+        );
+        assert!(
+            store.adopted.lock().expect("lock").is_empty(),
+            "a name picked from the registry cannot claim the row, so none is chosen"
         );
 
-        store.moves.lock().expect("lock").clear();
+        store.released.lock().expect("lock").clear();
         reassign_faces(&store, &readings, &[]).await;
         assert!(
-            store.moves.lock().expect("lock").is_empty(),
+            store.released.lock().expect("lock").is_empty(),
             "nobody present means nobody to hand the face to; the idle reading is the truth"
         );
+    }
+
+    /// A face whose seat is filled by a unit that answers is left alone, even
+    /// though every other face in the same pass is released.
+    #[tokio::test]
+    async fn a_present_owners_rows_are_never_released() {
+        let store = RecordingStore::default();
+        let readings = vec![reading(Some("present-unit"))];
+
+        reassign_faces(&store, &readings, &["present-unit".to_string()]).await;
+        assert!(store.released.lock().expect("lock").is_empty());
+        assert!(store.adopted.lock().expect("lock").is_empty());
     }
 
     #[test]

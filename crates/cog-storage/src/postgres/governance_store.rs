@@ -163,6 +163,25 @@ UPDATE cog_dag_tasks \
    AND task ->> 'owner_unit' <> $3 \
    AND status IN ('pending', 'scheduled')";
 
+/// Give one face's unstarted work back to the shared queue.
+///
+/// Both copies of the owner go, for the same reason both were written: the row
+/// and the goal payload are read by different hands, and a row whose payload
+/// still names a unit tells the executor it is working for somebody the queue
+/// never routed it from. `owner_unit` is removed rather than set to a name,
+/// which is what puts the rows back in front of every worker.
+const RELEASE_FACE_WORK_SQL: &str = "\
+UPDATE cog_dag_tasks \
+   SET task = (task - 'agent_id' - 'lease_owner' - 'owner_unit') || jsonb_build_object( \
+                'input', CASE WHEN jsonb_typeof(task -> 'input') = 'object' \
+                              THEN (task -> 'input') - 'owner_unit' \
+                              ELSE task -> 'input' END), \
+       updated_at = NOW() \
+ WHERE workspace_id <> $1 \
+   AND task ->> 'face_id' = $2 \
+   AND task ->> 'owner_unit' IS NOT NULL \
+   AND status IN ('pending', 'scheduled')";
+
 /// PostgreSQL governance store.
 #[derive(Clone)]
 pub struct PostgresGovernanceStore {
@@ -403,5 +422,16 @@ impl GovernanceStore for PostgresGovernanceStore {
             .map_err(|e| SFError::Database(format!("governance reassign face work: {e}")))?
             .rows_affected() as usize;
         Ok(moved)
+    }
+
+    async fn release_face_work(&self, face_id: &str) -> SFResult<usize> {
+        let released = sqlx::query(RELEASE_FACE_WORK_SQL)
+            .bind(GOVERNANCE_WORKSPACE)
+            .bind(face_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("governance release face work: {e}")))?
+            .rows_affected() as usize;
+        Ok(released)
     }
 }

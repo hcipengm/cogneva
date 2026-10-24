@@ -1526,6 +1526,30 @@ mod tests {
             }
             Ok(moved)
         }
+
+        async fn release_face_work(&self, face_id: &str) -> cog_core::SFResult<usize> {
+            let mut rows = self.rows.lock().unwrap();
+            let mut released = 0;
+            for row in rows.iter_mut() {
+                // Only rows that carry a name are released: an ownerless row is
+                // already in front of every worker, and rewriting it would move
+                // the timestamp of work somebody may be about to pick up.
+                if row.face_id.as_deref() != Some(face_id)
+                    || row.owner_unit.is_none()
+                    || !matches!(
+                        row.status,
+                        cog_core::TaskStatus::Pending | cog_core::TaskStatus::Scheduled
+                    )
+                {
+                    continue;
+                }
+                row.owner_unit = None;
+                row.agent_id = None;
+                row.lease_owner = None;
+                released += 1;
+            }
+            Ok(released)
+        }
     }
 
     fn write_replies(dir: &std::path::Path, pairs: &[(&str, &str)]) {

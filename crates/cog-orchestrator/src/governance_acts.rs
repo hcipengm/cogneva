@@ -1132,6 +1132,10 @@ mod tests {
         ) -> cog_core::SFResult<usize> {
             Ok(0)
         }
+
+        async fn release_face_work(&self, _face_id: &str) -> cog_core::SFResult<usize> {
+            Ok(0)
+        }
     }
 
     /// Reads what it was given but fails every transactional write, standing
@@ -1209,6 +1213,10 @@ mod tests {
             _face_id: &str,
             _to_unit: &str,
         ) -> cog_core::SFResult<usize> {
+            Err(cog_core::SFError::Database("unreachable".into()))
+        }
+
+        async fn release_face_work(&self, _face_id: &str) -> cog_core::SFResult<usize> {
             Err(cog_core::SFError::Database("unreachable".into()))
         }
     }
