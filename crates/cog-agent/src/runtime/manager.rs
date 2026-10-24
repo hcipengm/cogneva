@@ -570,6 +570,25 @@ impl GlobalAgentManager {
     }
 }
 
+/// How a task's role agent (planner / generator / evaluator) registers.
+///
+/// The host is the process this one runs in, not the literal `cog-agent`: a
+/// roster whose every row claims to run on a host by that name cannot say
+/// which pod holds which squad, so a stuck squad in one pod and a quiet pod
+/// read the same. The pod name is available as `COGNEVA_POD_NAME` or
+/// `HOSTNAME`, and a plain host run honestly reports that host.
+fn task_agent_registration(agent_id: &str, role: &str) -> cog_core::AgentRegistration {
+    cog_core::AgentRegistration::new(
+        agent_id,
+        crate::identity::agent_instance(),
+        "127.0.0.1",
+        role.to_string(),
+        "default",
+        vec![role.to_string()],
+        cog_core::ResourceInfo::default(),
+    )
+}
+
 #[async_trait::async_trait]
 impl cog_core::AgentManager for GlobalAgentManager {
     async fn create_agent(
@@ -601,15 +620,7 @@ impl cog_core::AgentManager for GlobalAgentManager {
         let config = self.runtime_config_for(agent_id, role).await;
 
         let capabilities = vec![role.to_string()];
-        let registration = cog_core::AgentRegistration::new(
-            agent_id,
-            "cog-agent",
-            "127.0.0.1",
-            role.to_string(),
-            "default",
-            capabilities.clone(),
-            cog_core::ResourceInfo::default(),
-        );
+        let registration = task_agent_registration(agent_id, role);
 
         let agent = {
             let mut a = Agent::new(config, llm)
@@ -807,6 +818,28 @@ mod tests {
     /// 那一跳的另一半：装上的技能预算真的成为运行时的预算。角色名只有本用例
     /// 用——预算还跟着该角色自己跑出来的读数走，借用别的用例写过的角色名会把
     /// 断言变成对执行顺序的断言。
+    /// 名册上"这个 agent 跑在哪里"必须答得出真话。原来每个任务角色的 agent
+    /// 都登记成 `cog-agent`——那不是任何一台机器的名字，于是「某个 pod 里的
+    /// squad 卡住了」和「那个 pod 闲著」在名册上读成同一行。
+    #[test]
+    fn a_task_agent_registers_under_the_host_it_runs_on() {
+        // 环境变量是进程级的：与 identity 的用例抢同一把锁，避免读到别人设的值。
+        let _guard = crate::identity::tests::env_lock();
+        let previous = std::env::var("COGNEVA_POD_NAME").ok();
+        std::env::set_var("COGNEVA_POD_NAME", "cogneva-647bb49dcd-4cttc");
+
+        let reg = task_agent_registration("squad:task-1-planner", "planner");
+
+        assert_eq!(reg.hostname, "cogneva-647bb49dcd-4cttc");
+        assert_eq!(reg.role, "planner");
+        assert_eq!(reg.capabilities, vec!["planner".to_string()]);
+
+        match previous {
+            Some(v) => std::env::set_var("COGNEVA_POD_NAME", v),
+            None => std::env::remove_var("COGNEVA_POD_NAME"),
+        }
+    }
+
     #[tokio::test]
     async fn the_installed_skill_sets_the_runtime_budget() {
         let role = "skill-chain-budget-test";

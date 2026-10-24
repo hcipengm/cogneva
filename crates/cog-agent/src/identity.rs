@@ -122,11 +122,16 @@ pub fn agent_instance() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// 环境变量是进程级的，改它的用例串行跑。
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 别的模块的用例也要改这两个环境变量，共用同一把锁。
+    pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn clear_env() {
         std::env::remove_var(ENV_FINGERPRINT);
