@@ -177,6 +177,24 @@ jobs:
         run: cargo test -p cog-storage --test backup_run_store -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The transcript's three claims are the database's: that a turn is written
+      # as a pair in one statement so no reader sees a question whose answer is
+      # still in flight, that the bound trims per session rather than across the
+      # table, and that a new handle reads the same conversation -- the last one
+      # being the whole point, since what this replaced lived in one process.
+      - name: Live-DB chat turn store
+        run: cargo test -p cog-storage --test chat_turn_store -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The catalog's one invariant is a unique constraint and its optional
+      # columns are nullable on purpose: that a version holds one content, that
+      # an absent row count stays absent instead of becoming zero, and that the
+      # ordering a restore depends on is the database's. All three are decided by
+      # the server, so no in-memory fake can see them.
+      - name: Live-DB dataset catalog
+        run: cargo test -p cog-storage --test dataset_catalog -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The principle ledger's intake is keyed on `(slug, source)`, so every
       # later reading of a principle lands on the row already queued for it, and
       # whether that row is rewritten is decided by the conflict clause alone --

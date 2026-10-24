@@ -405,8 +405,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|r| r.name == name)
-                .next_back()
+                .rev()
+                .find(|r| r.name == name)
                 .cloned())
         }
 

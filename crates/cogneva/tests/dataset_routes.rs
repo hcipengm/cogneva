@@ -21,7 +21,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use cog_core::{ObjectBackend, SFError, SFResult, User, UserStatus, UserType};
+use cog_core::{ObjectBackend, SFError, SFResult};
 use cog_gateway::{create_router, GatewayState};
 use cog_storage::{
     sha256_of, DatasetCatalog, DatasetEntry, DatasetStore, DatasetWrite, NewDataset,
@@ -125,8 +125,8 @@ impl DatasetCatalog for VecCatalog {
             .lock()
             .unwrap()
             .iter()
-            .filter(|r| r.name == name)
-            .next_back()
+            .rev()
+            .find(|r| r.name == name)
             .cloned())
     }
 
@@ -159,7 +159,6 @@ impl DatasetCatalog for VecCatalog {
 struct Fixture {
     state: Arc<GatewayState>,
     objects: Arc<MapObjects>,
-    catalog: Arc<VecCatalog>,
 }
 
 fn fixture(with_catalog: bool) -> Fixture {
@@ -176,29 +175,11 @@ fn fixture(with_catalog: bool) -> Fixture {
     Fixture {
         state: router_state::stateless_with_datasets(store),
         objects,
-        catalog,
     }
 }
 
 async fn bearer(state: &Arc<GatewayState>) -> String {
-    let user = User {
-        id: uuid::Uuid::new_v4(),
-        phone: None,
-        email: None,
-        username: "dataset-route-probe".into(),
-        display_name: None,
-        avatar_url: None,
-        status: UserStatus::Active,
-        user_type: UserType::Admin,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    };
-    state
-        .jwt_manager
-        .generate_token(&user, vec![], vec![])
-        .await
-        .expect("the state's signer issues a token")
-        .access_token
+    router_state::admin_bearer(state, "dataset-route-probe").await
 }
 
 /// One multipart upload body, the way a browser sends a single file.
@@ -379,9 +360,11 @@ async fn a_version_the_catalog_does_not_hold_answers_not_found() {
 
 #[tokio::test]
 async fn the_catalog_routes_refuse_when_the_deployment_has_no_catalog() {
-    let fixture = fixture(false);
-    let app = create_router(fixture.state.clone());
-    let token = bearer(&fixture.state).await;
+    // The plain fixture, not one with an absent store: a deployment that never
+    // had a catalog configured is the case being judged.
+    let state = router_state::stateless();
+    let app = create_router(state.clone());
+    let token = router_state::admin_bearer(&state, "dataset-route-probe").await;
     for path in [
         "/api/v1/datasets/notes.txt",
         "/api/v1/datasets/notes.txt/v1",
