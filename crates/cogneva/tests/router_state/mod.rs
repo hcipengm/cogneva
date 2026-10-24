@@ -117,6 +117,17 @@ impl QuotaManager for OpenQuota {
 /// The gateway state the router is built over: every component either absent or
 /// a stand-in, and none of them touched by a request that only has to be routed.
 pub fn stateless() -> Arc<GatewayState> {
+    stateless_with_datasets(None)
+}
+
+/// The same state, with a dataset store (and so an object store) behind it.
+///
+/// Separate from [`stateless`] rather than another argument there: the suites
+/// that only route a request should not have to name a store they never touch,
+/// and a suite that does touch one should be visible in its first line.
+pub fn stateless_with_datasets(
+    datasets: Option<Arc<cog_storage::DatasetStore>>,
+) -> Arc<GatewayState> {
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
     let raw_logger: Arc<dyn cog_core::RawLogger> = Arc::new(cog_storage::MemoryRawLogger::new());
@@ -206,6 +217,7 @@ pub fn stateless() -> Arc<GatewayState> {
         llm_usage_reader: None,
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
         chat_turns: None,
+        datasets,
     })
 }
 

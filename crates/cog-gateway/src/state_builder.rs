@@ -87,6 +87,8 @@ pub async fn build_gateway_state(
     llm_usage_reader: &Option<Arc<dyn cog_core::LlmUsageReader>>,
     governance_store: &Option<Arc<dyn cog_core::GovernanceStore>>,
     chat_turns: &crate::ChatTurnHandle,
+    object_backend: &Option<Arc<dyn cog_core::ObjectBackend>>,
+    datasets: &Option<Arc<cog_storage::DatasetStore>>,
     shutdown: &cog_core::ShutdownSignal,
 ) -> Result<Arc<crate::GatewayState>, Box<dyn std::error::Error>> {
     // Cache of the supervisor's event channel, filled by the drain task below.
@@ -152,7 +154,7 @@ pub async fn build_gateway_state(
         observables,
         metrics_dimensions: config.metrics.scrape_dimensions.clone(),
         mcp_client: mcp_client.clone(),
-        object_backend: None,
+        object_backend: object_backend.clone(),
         notification_store: notification_store.clone(),
         notification_dispatcher: notification_dispatcher.clone(),
         notification_tx: notification_tx.clone(),
@@ -171,6 +173,7 @@ pub async fn build_gateway_state(
         llm_usage_reader: llm_usage_reader.clone(),
         llm_client: Arc::new(std::sync::RwLock::new(None)),
         chat_turns: chat_turns.clone(),
+        datasets: datasets.clone(),
     });
 
     // Drain the supervisor's event channel into the cache. A lagged reader

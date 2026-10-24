@@ -35,6 +35,7 @@ pub mod cluster;
 pub mod collaboration;
 pub mod contribution_admin;
 pub mod dashboard;
+pub mod datasets;
 pub mod document_egress;
 pub mod error;
 pub mod evolution;
@@ -328,6 +329,10 @@ pub struct GatewayState {
     /// Per-session chat history for the WebSocket chat handler
     /// (session_id → messages, oldest first, capped).
     pub chat_turns: ChatTurnHandle,
+    /// Dataset catalog plus the object store it describes. Absent when either
+    /// half is: a catalog with no store could promise bytes it cannot deliver,
+    /// and a store with no catalog holds bytes nothing can name.
+    pub datasets: Option<Arc<cog_storage::DatasetStore>>,
 }
 
 impl GatewayState {
@@ -1039,6 +1044,11 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             get(workspaces::list_workspace_members_handler),
         )
         .route("/api/v1/files/upload", post(files::upload_file_handler))
+        .route("/api/v1/datasets/{name}", get(datasets::list_handler))
+        .route(
+            "/api/v1/datasets/{name}/{version}",
+            get(datasets::get_handler),
+        )
         .route("/api/v1/files/{id}", get(files::get_file_handler))
         .route(
             "/api/v1/files/{id}",

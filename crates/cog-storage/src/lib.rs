@@ -24,7 +24,9 @@ pub mod agent_id;
 pub mod audit_stream;
 pub mod backends;
 pub(crate) mod consumer_lag;
+pub mod datasets;
 pub mod dlq;
+pub use datasets::{DatasetStore, DatasetWrite};
 pub mod etcd;
 pub mod event_filter;
 pub mod inbox_orphan_readings;
@@ -59,13 +61,14 @@ pub use mem::{
 
 #[cfg(feature = "postgres")]
 pub use postgres::{
-    ChatTurn, ChatTurnRole, ChatTurnStore, HookArchiveRow, PostgresAuditRecorder,
-    PostgresBackupRunStore, PostgresChangeLedgerStore, PostgresChatTurnStore,
-    PostgresDecisionStatsStore, PostgresGovernanceStore, PostgresHookArchive,
-    PostgresMetricsBackend, PostgresNotificationStore, PostgresObservabilityGateway,
-    PostgresPrincipleLedgerStore, PostgresRawLogIndexStore, PostgresResourceEventStore,
-    PostgresSnapshotStore, PostgresStateBackend, PostgresTasteIntentStore, PostgresUserStore,
-    EVENTS_PAGE_SQL, GAUGE_LATEST_SQL, ROWS_KEPT_PER_SESSION,
+    sha256_of, ChatTurn, ChatTurnRole, ChatTurnStore, DatasetCatalog, DatasetEntry, HookArchiveRow,
+    NewDataset, PostgresAuditRecorder, PostgresBackupRunStore, PostgresChangeLedgerStore,
+    PostgresChatTurnStore, PostgresDatasetCatalog, PostgresDecisionStatsStore,
+    PostgresGovernanceStore, PostgresHookArchive, PostgresMetricsBackend,
+    PostgresNotificationStore, PostgresObservabilityGateway, PostgresPrincipleLedgerStore,
+    PostgresRawLogIndexStore, PostgresResourceEventStore, PostgresSnapshotStore,
+    PostgresStateBackend, PostgresTasteIntentStore, PostgresUserStore, EVENTS_PAGE_SQL,
+    GAUGE_LATEST_SQL, ROWS_KEPT_PER_SESSION,
 };
 
 #[cfg(feature = "redis")]

@@ -82,13 +82,25 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             .and_then(|p| p.0.clone());
         // 聊天记录的落点。没有这个池就是这套部署没有那个库：那一趟照样回答，只是
         // 不写下来——绝不用进程内的一张表顶替它，那正是这次改动拆掉的形状。
-        let chat_turns: crate::ChatTurnHandle = ctx
+        let chat_pool = ctx
             .consume::<cog_storage::MessagesPool>()
-            .and_then(|p| p.0.clone())
-            .map(|pool| {
-                Arc::new(cog_storage::PostgresChatTurnStore::new(pool))
-                    as Arc<dyn cog_storage::ChatTurnStore>
-            });
+            .and_then(|p| p.0.clone());
+        let chat_turns: crate::ChatTurnHandle = chat_pool.as_ref().map(|pool| {
+            Arc::new(cog_storage::PostgresChatTurnStore::new(pool.clone()))
+                as Arc<dyn cog_storage::ChatTurnStore>
+        });
+        // 对象存储与它的目录。上传面此前拿到的是 None，于是这条路由在现网永远是
+        // 503；即便接上后端，桶里也只有字节、没有一行说它们是什么。两半都在才装：
+        // 只有目录会让恢复去取不存在的对象，只有桶则留下谁也点不到名的数据。
+        let object_backend: Option<Arc<dyn cog_core::ObjectBackend>> =
+            ctx.consume_service::<dyn cog_core::ObjectBackend>();
+        let datasets: Option<Arc<cog_storage::DatasetStore>> = match (&object_backend, &chat_pool) {
+            (Some(objects), Some(pool)) => Some(Arc::new(cog_storage::DatasetStore::new(
+                objects.clone(),
+                Arc::new(cog_storage::PostgresDatasetCatalog::new(pool.clone())),
+            ))),
+            _ => None,
+        };
         let hook_archive = ctx.consume_service::<dyn cog_core::HookArchive>();
         let media_backend = ctx.consume_service::<dyn cog_core::MediaBackend>();
         let shared_orchestrator: Arc<dyn cog_core::OrchestratorControl> = ctx
@@ -259,6 +271,8 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &llm_usage_reader,
             &ctx.consume_service::<dyn cog_core::GovernanceStore>(),
             &chat_turns,
+            &object_backend,
+            &datasets,
             // 拿不到就是这套部署没有发布停机信号，那它拿到的是一个永不触发的
             // 信号，语义等同于「没有人给过它停的办法」。
             &ctx.consume::<cog_core::ShutdownSignal>()

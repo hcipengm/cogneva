@@ -21,15 +21,18 @@ pub async fn upload_file_handler(
     State(state): State<Arc<GatewayState>>,
     mut multipart: Multipart,
 ) -> Response {
-    let backend = match state.object_backend {
-        Some(ref b) => b.clone(),
+    // 上传要走带着目录的那一条路。只把字节写进桶、不写目录行，回答里那个「多大、
+    // 什么时候传的、校验和是多少」就只活在这一个响应里，之后谁也答不上来——这正是
+    // 目录表要修的那件事，所以宁可拒绝上传，也不写一份没人点得到名的数据。
+    let store = match state.datasets {
+        Some(ref s) => s.clone(),
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
                     "code": "service_unavailable",
-                    "error": "object_backend_not_configured",
-                    "message": "File storage backend is not available"
+                    "error": "dataset_catalog_not_configured",
+                    "message": "File uploads need an object store and its catalog; one of them is missing"
                 })),
             )
                 .into_response();
@@ -88,28 +91,49 @@ pub async fn upload_file_handler(
 
     let file_id = format!("file-{}", uuid::Uuid::new_v4());
     let key = format!("files/{}", file_id);
+    // 名字取客户端给的那个；没给就写 upload，别拿 id 冒充名字——目录里那一列是给
+    // 人读的，混进一个 uuid 就没人再认得出这是哪个文件。
+    let name = file_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or("upload")
+        .to_string();
 
-    match backend.put(&key, &file_data).await {
-        Ok(uri) => {
-            let size = file_data.len() as u64;
+    let spec = cog_storage::DatasetWrite {
+        name: name.clone(),
+        version: file_id.clone(),
+        source: "upload".to_string(),
+        row_count: None,
+        coverage: None,
+        media_type: content_type.clone(),
+    };
+
+    match store.put_at(&key, spec, &file_data).await {
+        Ok(entry) => {
             (
                 StatusCode::CREATED,
                 Json(json!({
                     "code": "ok",
                     "data": {
                         "file_id": file_id,
-                        "uri": uri,
-                        "file_name": file_name.unwrap_or_default(),
+                        "uri": key,
+                        "file_name": name,
                         "content_type": content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        "size": size,
-                        "uploaded_at": chrono::Utc::now().to_rfc3339(),
+                        "size": entry.bytes,
+                        "content_sha256": entry.content_sha256,
+                        "uploaded_at": entry.created_at.to_rfc3339(),
+                        "dataset": {
+                            "name": entry.name,
+                            "version": entry.version,
+                        },
                     }
                 })),
             )
                 .into_response()
         }
         Err(e) => {
-            tracing::warn!("ObjectBackend put failed: {}", e);
+            tracing::warn!("Dataset write failed: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
