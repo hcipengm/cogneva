@@ -599,6 +599,41 @@ curl -X POST http://localhost:8080/api/v1/admin/llm-config \
        "extra_upstreams":[{"base_url":"https://api.deepseek.com","model":"deepseek-flash","api_key":"sk-..."}]}'
 ```
 
+### 🎯 交第一件事
+
+向导走完，平台就能用了；接着该给它派活。活从任务接口进来：一个目标被拆成任务、任务派给沙箱里的 agent，产出经平台改自己的同一条流水线落成提交。
+
+```bash
+# 引导管理员 admin 的口令由安装时随机生成、只从集群 Secret 注入；
+# 仓库里没有它的任何可用值。
+ADMIN_PASSWORD=$(kubectl -n cogneva get secret cogneva-secrets \
+  -o jsonpath='{.data.admin-password}' | base64 -d)
+TOKEN=$(curl -sX POST http://localhost:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PASSWORD\"}" | jq -r .access_token)
+
+# 目标的第一行会成为落地提交的标题，所以要写成一行标题、不超过 50 个字；
+# 空行之后的部分原样写进提交正文。
+curl -sX POST http://localhost:8080/api/v1/tasks \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"goal":"修复 webhook 发送端的重试退避\n\n现在失败后立即重试；应改为指数退避并设上限。"}'
+
+# 异步受理：拆解一个目标要多轮模型调用，所以回复里给的是用来跟进的 id，不是任务本身。
+curl -s http://localhost:8080/api/v1/tasks/list \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.[] | "\(.id)\t\(.status)"'
+```
+
+变更账、各面读数、告警，全都是这条链路产生的事件推出来的，所以第一件事也是你能从头跟到尾的第一件事。平台自己按节奏提交的那些，走的同样是这个接口。
+
+### 📋 这套部署不提供什么
+
+以下四条是刻意的缺省，不是遗漏：
+
+- **声明出来的配额不执法。** 五级限额可配、提交时也确实检查，但今天没有任何代码把「今天用了多少」写进那几级，所以这个检查现在拦不下东西。需要硬性花费上限的部署，得在平台上游做。
+- **没配出口之前，告警只到应用内铃铛。** 没有配置任何通道时，一条 firing 告警就是一行记录加一个角标，不发邮件、不呼人。
+- **没有诊断命令，也没有支持包。** 可读的面就是那些读数（指标、告警、任务图）；把它们收集起来留给运维工具。
+- **WebUI 只观察，不提交任务。** 它显示任务图、agent、告警与 token 花费，并能和运行中的 agent 对话；目标从上面对接口提交。
+
 ### ☸️ 已有集群
 
 **不需要任何手动部署步骤，也不用在 K3s、标准 K8s、Helm 之间做选择**——这些只是内部材料形态。元启动检测到可连通的集群会跳过安装、直接复用，全程无人值守，自动探测环境决定用哪份材料、怎么投递：

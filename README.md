@@ -603,6 +603,43 @@ curl -X POST http://localhost:8080/api/v1/admin/llm-config \
        "extra_upstreams":[{"base_url":"https://api.deepseek.com","model":"deepseek-flash","api_key":"sk-..."}]}'
 ```
 
+### 🎯 Your first change
+
+The wizard ends with a working platform; the first thing to do with it is give it work. Work enters through the task API: a goal is decomposed into tasks, the tasks are dispatched to agents in the sandbox, and what they produce lands as a commit through the same pipeline the platform runs on itself.
+
+```bash
+# The installer generates the bootstrap admin's password at install time and
+# injects it from the cluster Secret; no password for it is in this repository.
+ADMIN_PASSWORD=$(kubectl -n cogneva get secret cogneva-secrets \
+  -o jsonpath='{.data.admin-password}' | base64 -d)
+TOKEN=$(curl -sX POST http://localhost:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PASSWORD\"}" | jq -r .access_token)
+
+# The first line of the goal becomes the landing commit's subject, so it has to
+# read as a title: one line, at most 50 characters. Everything after it is the
+# body, written into the commit verbatim.
+curl -sX POST http://localhost:8080/api/v1/tasks \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"goal":"Fix the webhook sender retry backoff\n\nThe sender retries immediately after a failure; it should back off exponentially up to a cap."}'
+
+# Accepted asynchronously: decomposing a goal takes more than one model call, so
+# the reply carries the id to follow rather than the tasks themselves.
+curl -s http://localhost:8080/api/v1/tasks/list \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.[] | "\(.id)\t\(.status)"'
+```
+
+The change ledger, the per-face readings and the alerts are all derived from the events this produces, so the first goal is also the first thing you can follow end to end. Everything the platform submits on its own schedule enters through the same route.
+
+### 📋 What this deployment does not provide
+
+Written down rather than left to be discovered:
+
+- **Declared quota is not enforced.** The hierarchy of limits is configurable and the check runs at submission, but nothing records today's usage into those levels, so the check cannot block anything today. A deployment that needs a hard spend ceiling must enforce it upstream of the platform.
+- **Alerts reach the in-app bell, not the outside world, until you configure an outlet.** With no channel configured, a firing alert is a row and a badge; nothing is emailed or paged.
+- **There is no diagnosis command and no support bundle.** The readings are the surfaces (metrics, alerts, the task graph); collecting them is left to the operator's own tooling.
+- **The WebUI observes; it does not submit work.** It shows the task graph, the agents, the alerts and token spend, and it talks to running agents. Goals are submitted through the API above.
+
 ### ☸️ Existing cluster
 
 **There are no manual deployment steps, and no choice to make between K3s, standard K8s, and Helm** — those are internal material forms; from the user's side there is only the meta-bootstrapper. When it finds a reachable cluster it skips installation and reuses the cluster, fully unattended, probing the environment to decide both which material to use and how to deliver it:
