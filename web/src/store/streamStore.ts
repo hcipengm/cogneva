@@ -78,6 +78,16 @@ export function describeEvent(event: AgentEvent): ActivityEntry {
     case 'state_change':
       return { ...base, summary: `状态 ${text(p.from)} → ${text(p.to)}`, detail: null, failed: false };
     case 'task_status_change':
+      // 钩子事件借同一个变体过总线（`status` 上写着 `hook_event`），它们不是
+      // 任务在换状态，印成「任务 X 变为 hook_event」会读成一次虚假的状态迁移。
+      if (p.status === 'hook_event') {
+        return {
+          ...base,
+          summary: `钩子事件（任务 ${text(p.task_id)}）`,
+          detail: null,
+          failed: false,
+        };
+      }
       return {
         ...base,
         summary: `任务 ${text(p.task_id)} 变为 ${text(p.status)}`,

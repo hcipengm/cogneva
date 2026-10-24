@@ -34,7 +34,9 @@ export default function App() {
   const { clientRef } = useEventStream({
     mock: USE_MOCK,
     url: wsUrl,
-    channels: ['agent:*', 'hooks'],
+    // 任务状态不走 `agent:<id>` 面，它按 `task:<id>` 分频道。只订 agent 面时
+    // 界面上一件事都看不见任务在动，而总线上它一直在动。
+    channels: ['agent:*', 'task:*', 'hooks'],
     onNotification: notifications.receive,
   });
 

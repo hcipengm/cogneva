@@ -36,6 +36,16 @@ export interface UseEventStreamOptions {
   onNotification?: (notification: NotificationItem) => void;
 }
 
+/** 任务的五个状态各自对应进度条上的位置。未列出的状态读作「刚起步」。 */
+const TASK_PROGRESS: Record<string, number> = {
+  pending: 0,
+  scheduled: 10,
+  running: 50,
+  completed: 100,
+  failed: 100,
+  cancelled: 100,
+};
+
 /**
  * 一条增量事件里真正要追加的那段文字。
  *
@@ -120,10 +130,12 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
         case 'task_status_change': {
           const taskId = typeof p.task_id === 'string' ? p.task_id : null;
           const status = typeof p.status === 'string' ? p.status : '';
-          if (!taskId) break;
+          // `hook_event` 借这个变体过总线，它不是任务在换状态；把它当状态
+          // 写进进度条，画布上就会显示一个从没发生过的迁移。
+          if (!taskId || status === 'hook_event') break;
           setTaskProgress({
             taskId,
-            progress: status === 'completed' ? 100 : 0,
+            progress: TASK_PROGRESS[status.toLowerCase()] ?? 0,
             step: status,
           });
           break;
