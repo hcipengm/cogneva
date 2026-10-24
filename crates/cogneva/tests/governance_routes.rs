@@ -212,6 +212,13 @@ impl QuotaManager for OpenQuota {
 /// The gateway state the router is built over. Every component is absent or a
 /// stand-in except the one under test.
 fn state(governance_store: Option<Arc<dyn GovernanceStore>>) -> Arc<GatewayState> {
+    state_with(governance_store, None)
+}
+
+fn state_with(
+    governance_store: Option<Arc<dyn GovernanceStore>>,
+    principle_ledger: Option<Arc<dyn cog_core::PrincipleLedgerStore>>,
+) -> Arc<GatewayState> {
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
     let raw_logger: Arc<dyn cog_core::RawLogger> = Arc::new(cog_storage::MemoryRawLogger::new());
@@ -287,6 +294,7 @@ fn state(governance_store: Option<Arc<dyn GovernanceStore>>) -> Arc<GatewayState
         mcp_client: None,
         workspace_store: None,
         governance_store,
+        principle_ledger,
         external_skill_registry: None,
         notification_dispatcher: None,
         notification_tx: broadcast::channel(16).0,
@@ -503,4 +511,177 @@ async fn a_binding_on_a_row_the_planner_will_replace_is_refused() {
 
     let (status, answer) = ask(&app, "POST", "/api/v1/tasks", &token, &body.to_string()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+}
+
+/// A principle ledger with an account in it and nothing else behind it.
+///
+/// The three readings the route prints are the three this holds: the state
+/// census, the tier census, and the rows a gate has refused something for. The
+/// write half is `unimplemented!` because a route test that silently wrote the
+/// account would be testing a different route than the one it named.
+struct Ledger {
+    census: cog_core::PrincipleCensus,
+    check_kinds: cog_core::PrincipleCheckKindCensus,
+    refused: Vec<cog_core::PrincipleRow>,
+}
+
+fn refused_row(slug: &str, refusals: i64) -> cog_core::PrincipleRow {
+    cog_core::PrincipleRow {
+        slug: slug.into(),
+        lead: Some(format!("{slug} 的那句话")),
+        carrier_path: None,
+        carrier_sha256: None,
+        host_gate: None,
+        where_red: None,
+        platform_gate: None,
+        check_kind: None,
+        priority: cog_core::ChangePriority::Unstated,
+        state: Some(cog_core::PrincipleState::Enforced),
+        refusals,
+        last_refused_at: Some(chrono::Utc::now()),
+        first_seen_at: chrono::Utc::now(),
+        measured_at: None,
+        measured_rev: None,
+    }
+}
+
+#[async_trait::async_trait]
+impl cog_core::PrincipleLedgerStore for Ledger {
+    async fn record_readings(&self, _: &[cog_core::PrincipleReading]) -> cog_core::SFResult<usize> {
+        unimplemented!()
+    }
+    async fn declare(&self, _: &[cog_core::PrincipleReading]) -> cog_core::SFResult<usize> {
+        unimplemented!()
+    }
+    async fn fold_declarations(&self, _: usize) -> cog_core::SFResult<cog_core::PrincipleFold> {
+        unimplemented!()
+    }
+    async fn pending_declarations(&self) -> cog_core::SFResult<u64> {
+        unimplemented!()
+    }
+    async fn apply_principle_measurement(
+        &self,
+        _: &cog_core::PrincipleMeasurement,
+    ) -> cog_core::SFResult<()> {
+        unimplemented!()
+    }
+    async fn record_human_only(&self, _: &str, _: Option<&str>) -> cog_core::SFResult<()> {
+        unimplemented!()
+    }
+    async fn unsettled_judgement(
+        &self,
+        _: usize,
+    ) -> cog_core::SFResult<Vec<cog_core::PrincipleRow>> {
+        Ok(Vec::new())
+    }
+    async fn outstanding(&self, _: usize) -> cog_core::SFResult<Vec<cog_core::PrincipleRow>> {
+        Ok(Vec::new())
+    }
+    async fn reopen_platform_gate_drift(
+        &self,
+        _: &std::collections::HashMap<String, String>,
+    ) -> cog_core::SFResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+    async fn refused(&self, limit: usize) -> cog_core::SFResult<Vec<cog_core::PrincipleRow>> {
+        Ok(self.refused.iter().take(limit).cloned().collect())
+    }
+    async fn get(&self, _: &str) -> cog_core::SFResult<Option<cog_core::PrincipleRow>> {
+        Ok(None)
+    }
+    async fn slugs(&self) -> cog_core::SFResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+    async fn census(&self) -> cog_core::SFResult<cog_core::PrincipleCensus> {
+        Ok(self.census)
+    }
+    async fn check_kind_census(&self) -> cog_core::SFResult<cog_core::PrincipleCheckKindCensus> {
+        Ok(self.check_kinds)
+    }
+    async fn report_refusals(&self, _: &[cog_core::PrincipleRefusal]) -> cog_core::SFResult<usize> {
+        unimplemented!()
+    }
+    async fn fold_refusals(&self, _: usize) -> cog_core::SFResult<usize> {
+        unimplemented!()
+    }
+    async fn pending_refusals(&self) -> cog_core::SFResult<u64> {
+        unimplemented!()
+    }
+}
+
+/// The account route prints what the ledger holds, and the two totals describe
+/// the whole set rather than the page it prints.
+///
+/// The ledger here holds more refused principles than the route prints, which
+/// is the case that separates "how many were refused" from "how many I showed
+/// you". Summing the printed list would answer the second and label it the
+/// first.
+#[tokio::test]
+async fn the_principle_account_is_what_the_ledger_holds() {
+    const ROWS: usize = 60;
+    let ledger = Ledger {
+        census: cog_core::PrincipleCensus {
+            enforced: 574,
+            unenforced: 1867,
+            unmeasured: 767,
+            retired: 14,
+        },
+        check_kinds: cog_core::PrincipleCheckKindCensus {
+            shape: 12,
+            tree: 900,
+            live: 40,
+            judgement: 30,
+            undeclared: 2240,
+        },
+        // Descending counts, so the sort the route applies is visible: the
+        // store hands them back in the order it was given and the route is what
+        // puts the most-refused first.
+        refused: (0..ROWS)
+            .map(|i| refused_row(&format!("principle_{i:02}"), (ROWS - i) as i64))
+            .collect(),
+    };
+    let state = state_with(None, Some(Arc::new(ledger)));
+    let app = create_router(state.clone());
+    let token = bearer(&state).await;
+
+    let (status, body) = ask(&app, "GET", "/api/v1/governance/principles", &token, "{}").await;
+    assert_eq!(status, StatusCode::OK, "the account route answers: {body}");
+    assert_eq!(body["census"]["enforced"], 574);
+    assert_eq!(body["census"]["unenforced"], 1867);
+    assert_eq!(body["census"]["unmeasured"], 767);
+    assert_eq!(body["census"]["retired"], 14);
+    assert_eq!(body["check_kinds"]["undeclared"], 2240);
+    assert_eq!(
+        body["refused_principles"], ROWS,
+        "the total counts every refused principle, not the page: {body}"
+    );
+    assert_eq!(
+        body["refusals_total"],
+        (1..=ROWS as i64).sum::<i64>(),
+        "the refusal total is over the whole set: {body}"
+    );
+    let listed = body["refused"].as_array().expect("refused is an array");
+    assert!(
+        listed.len() < ROWS,
+        "the route was asked to page the list: {}",
+        listed.len()
+    );
+    assert_eq!(
+        listed.first().and_then(|row| row["slug"].as_str()),
+        Some("principle_00"),
+        "the most refused principle comes first: {body}"
+    );
+}
+
+/// With no ledger published the route says so. An empty account would read as
+/// "this deployment holds no principles", which is the one verdict a missing
+/// ledger must never produce.
+#[tokio::test]
+async fn a_missing_ledger_is_unavailable_rather_than_an_empty_account() {
+    let state = state(None);
+    let app = create_router(state.clone());
+    let token = bearer(&state).await;
+
+    let (status, _) = ask(&app, "GET", "/api/v1/governance/principles", &token, "{}").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }

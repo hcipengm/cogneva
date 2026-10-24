@@ -70,10 +70,26 @@ export interface LoginResponse {
   };
 }
 
+/**
+ * 集群概况：**计数，不是节点清单**。
+ *
+ * 服务端回的是各口径的数与一个健康判词，没有逐节点或逐 agent 的数组。
+ * 按节点清单去读，界面上每个字段都是 `undefined`——读的人只会看到一片空白，
+ * 分不出「集群里没有节点」与「类型对不上」。
+ */
 export interface ClusterOverview {
-  nodes: ClusterNode[];
-  agents: ClusterAgent[];
-  tasks: ClusterTask[];
+  total_agents: number | null;
+  active_agents: number | null;
+  total_tasks: number | null;
+  active_tasks: number | null;
+  queued_tasks: number | null;
+  failed_tasks: number | null;
+  avg_task_duration_ms: number | null;
+  /** 告警面的判词：有东西在 firing 就是 degraded，没有来源答话就是 unknown。 */
+  cluster_health: string;
+  timestamp: string;
+  total_squads: number | null;
+  active_squads: number | null;
 }
 
 export interface ClusterNode {
@@ -684,4 +700,100 @@ export async function listEvalDatasets(): Promise<EvalDatasetInfo[]> {
     '/api/v1/eval/datasets'
   );
   return page.datasets ?? [];
+}
+
+
+/** 集群里三个固定工作负载各自的存活读数。 */
+export interface ClusterComponent {
+  id: string;
+  /** up / down / unknown。unknown 是读不到，不是挂了。 */
+  status: string;
+  ready_replicas: number | null;
+  desired_replicas: number | null;
+}
+
+export interface ClusterComponentsPage {
+  components: ClusterComponent[];
+}
+
+export async function getClusterComponents(): Promise<ClusterComponentsPage> {
+  return api.get<ClusterComponentsPage>('/api/v1/cluster/components');
+}
+
+// ── 原则台账 ──
+
+/** 语料按判定结果分四格。`unmeasured` 是「没有一次判读settle过它」。 */
+export interface PrincipleCensus {
+  enforced: number;
+  unenforced: number;
+  unmeasured: number;
+  retired: number;
+}
+
+/** 语料按「该怎么查」分格；`undeclared` 是没人声明过档位的那部分。 */
+export interface PrincipleCheckKindCensus {
+  shape: number;
+  tree: number;
+  live: number;
+  judgement: number;
+  undeclared: number;
+}
+
+export interface RefusedPrinciple {
+  slug: string;
+  lead: string | null;
+  refusals: number;
+  last_refused_at: string | null;
+}
+
+/**
+ * 原则台账的三份读数。
+ *
+ * `refused` 是**节选**，两个总数却是全集的：拿节选求和当总数，会在被拦过的
+ * 原则多于本页条数时低报，而低报的那个数看起来完全正常。
+ */
+export interface PrinciplesPage {
+  generated_at: string;
+  census: PrincipleCensus;
+  check_kinds: PrincipleCheckKindCensus;
+  refused: RefusedPrinciple[];
+  refused_principles: number;
+  refusals_total: number;
+}
+
+export async function getGovernancePrinciples(): Promise<PrinciplesPage> {
+  return api.get<PrinciplesPage>('/api/v1/governance/principles');
+}
+
+// ── 变更队列 ──
+
+/** 一条变更候选。`status` 是它在流水线上的位置，服务端给的是原字符串。 */
+export interface EvolutionChange {
+  id: string;
+  kind: string;
+  description: string;
+  status: string;
+  created_at: string;
+  diff_summary?: string | null;
+  eval_summary?: string | null;
+}
+
+/**
+ * 列举一条变更实际读的队列。
+ *
+ * 空列表与「读的不是同一个队列」在没有这条读数时长得一样：两个部署把不同的
+ * 卷挂在同一个相对路径上，生成变更的进程和列举变更的进程读的不是同一批文件。
+ */
+export interface EvolutionQueueView {
+  dir: string;
+  owner: boolean;
+}
+
+export interface EvolutionChangesPage {
+  changes: EvolutionChange[];
+  queue: EvolutionQueueView | null;
+}
+
+export async function getEvolutionChanges(): Promise<EvolutionChangesPage> {
+  return api.get<EvolutionChangesPage>('/api/v1/evolution/changes');
 }

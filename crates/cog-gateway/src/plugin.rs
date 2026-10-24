@@ -276,6 +276,10 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &taste_intent_sink,
             &llm_usage_reader,
             &ctx.consume_service::<dyn cog_core::GovernanceStore>(),
+            // 原则台账由持有共用库的存储插件发布。它写面归演化的常驻租约，
+            // 这里只借读面：属主要在同一个界面里看见语料判成了什么、哪几条
+            // 真的拦下过东西，而那几个数除了这条路由没有第二个出口。
+            &ctx.consume_service::<dyn cog_core::PrincipleLedgerStore>(),
             &chat_turns,
             &agent_messages,
             &object_backend,

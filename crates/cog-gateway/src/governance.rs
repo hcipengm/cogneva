@@ -118,3 +118,87 @@ pub async fn import_face_handler(
     let outcome = cog_core::import_face(&**store, &face).await?;
     Ok(Json(outcome))
 }
+
+/// What `GET /api/v1/governance/principles` returns.
+///
+/// Three readings, not one number: how many rows sit in each judged state, how
+/// many carry each kind of gate, and which principles have actually stopped
+/// something. A single "principles: N" would answer none of the questions a
+/// reader comes with -- it cannot tell a corpus with no gate from one whose
+/// gates never fire, and those two want opposite work.
+#[derive(Debug, Serialize)]
+pub struct PrinciplesResponse {
+    pub generated_at: DateTime<Utc>,
+    pub census: cog_core::PrincipleCensus,
+    pub check_kinds: cog_core::PrincipleCheckKindCensus,
+    /// The principles a gate has refused something for, most refused first.
+    pub refused: Vec<RefusedPrinciple>,
+    /// How many principles have been refused at all, and the sum of their
+    /// counts. Both are totals over the whole set, not over the list below it:
+    /// a total taken from a page is an answer to a different question than the
+    /// one the label asks.
+    pub refused_principles: u64,
+    pub refusals_total: i64,
+}
+
+/// One principle a gate has stopped something for.
+#[derive(Debug, Serialize)]
+pub struct RefusedPrinciple {
+    pub slug: String,
+    pub lead: Option<String>,
+    pub refusals: i64,
+    pub last_refused_at: Option<DateTime<Utc>>,
+}
+
+/// How many refused principles the route returns in the list. The totals are
+/// taken before the truncation, so this bounds the list without making either
+/// total a page count.
+const REFUSED_PAGE: usize = 50;
+/// How many refused rows are read to compute the totals. The selection is
+/// `refusals > 0`, so this is a bound on how many principles have ever been
+/// refused by a single deployment; reading the whole set is what lets the two
+/// totals describe the set rather than the page.
+const REFUSED_READ_CAP: usize = 10_000;
+
+fn principles(state: &GatewayState) -> Result<&Arc<dyn cog_core::PrincipleLedgerStore>, ApiError> {
+    state.principle_ledger.as_ref().ok_or_else(|| ApiError {
+        error: "ServiceUnavailable".into(),
+        message: "no shared database is published, so there is no principle ledger to read".into(),
+    })
+}
+
+pub async fn principles_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<PrinciplesResponse>, ApiError> {
+    let ledger = principles(&state)?;
+    let now = Utc::now();
+    let census = ledger.census().await?;
+    let check_kinds = ledger.check_kind_census().await?;
+    let mut refused: Vec<RefusedPrinciple> = ledger
+        .refused(REFUSED_READ_CAP)
+        .await?
+        .into_iter()
+        .map(|row| RefusedPrinciple {
+            slug: row.slug,
+            lead: row.lead,
+            refusals: row.refusals,
+            last_refused_at: row.last_refused_at,
+        })
+        .collect();
+    // The store selects `refusals > 0` and hands back whatever order the table
+    // gives; a list ordered by nothing reads as "these are the ones", when the
+    // next page would have named a different set.
+    refused.sort_by(|a, b| b.refusals.cmp(&a.refusals).then(a.slug.cmp(&b.slug)));
+    let refused_principles = refused.len() as u64;
+    let refusals_total: i64 = refused.iter().map(|row| row.refusals).sum();
+    refused.truncate(REFUSED_PAGE);
+
+    Ok(Json(PrinciplesResponse {
+        generated_at: now,
+        census,
+        check_kinds,
+        refused_principles,
+        refusals_total,
+        refused,
+    }))
+}

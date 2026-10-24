@@ -2,6 +2,7 @@ import { createContext, useContext, useMemo, useState } from 'react';
 import { useStreamStore, type ActivityEntry } from '@/store/streamStore';
 import { useSystemSurface, type SurfaceBucket } from '@/hooks/useSystemSurface';
 import type {
+  ActorUsage,
   BackendHealth,
   FaceDriftReading,
   GovernanceFace,
@@ -16,14 +17,22 @@ import type {
  * 什么都没有。
  */
 
-type Tab = 'activity' | 'faces' | 'tasks' | 'backends' | 'governance' | 'eval';
+type Tab =
+  | 'activity'
+  | 'faces'
+  | 'tasks'
+  | 'governance'
+  | 'resources'
+  | 'principles'
+  | 'eval';
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'activity', label: '活动' },
   { key: 'faces', label: '面与读数' },
   { key: 'tasks', label: '任务' },
   { key: 'governance', label: '治理与演化' },
-  { key: 'backends', label: '资源与后端' },
+  { key: 'resources', label: '资源与用量' },
+  { key: 'principles', label: '原则' },
   { key: 'eval', label: '评估' },
 ];
 
@@ -361,60 +370,327 @@ function TasksPanel() {
   );
 }
 
-function BackendsPanel() {
-  const { backends } = useSystemSurfaceContext();
+/** 一个数，或者「没答」——`null` 不打印成 0，那是另一种读数。 */
+function num(value: number | null | undefined): string {
+  return value === null || value === undefined ? '—' : String(value);
+}
+
+/**
+ * 资源与用量：后端探活、集群计数、三个固定组件、令牌花销。
+ *
+ * 四份读数分开报错。合成一格会在其中一个接口没权限或没配置时把另外三份
+ * 一起藏起来，而「读不到」与「没有」在界面上长得一样。
+ */
+function ResourcesPanel() {
+  const { backends, cluster, components, usage } = useSystemSurfaceContext();
   const overall = backends.data?.overall;
+  const c = cluster.data;
+  const actors: ActorUsage[] = usage.data?.actors ?? [];
+  const calls = actors.reduce((sum, a) => sum + a.calls, 0);
+  const failed = actors.reduce((sum, a) => sum + a.failed_calls, 0);
+  const tokensIn = actors.reduce((sum, a) => sum + a.tokens_input, 0);
+  const tokensOut = actors.reduce((sum, a) => sum + a.tokens_output, 0);
+
+  return (
+    <div className="space-y-4">
+      <Panel
+        title="集群计数"
+        subtitle="监管者与任务图各自报的数。空着的格子是「这个来源没答」，不是零。"
+      >
+        <div className="mb-3 space-y-2">
+          <BucketNote bucket={cluster} what="集群概况" />
+        </div>
+        {c && (
+          <>
+            <div className="grid grid-cols-4 gap-2">
+              {[
+                ['执行者', `${num(c.active_agents)} / ${num(c.total_agents)}`, 'text-emerald-300'],
+                ['进行中任务', `${num(c.active_tasks)} / ${num(c.total_tasks)}`, 'text-sky-300'],
+                ['排队', num(c.queued_tasks), 'text-slate-300'],
+                ['失败', num(c.failed_tasks), (c.failed_tasks ?? 0) > 0 ? 'text-red-400' : 'text-slate-400'],
+              ].map(([label, value, cls]) => (
+                <div key={label} className="rounded-lg bg-slate-900/60 px-3 py-2">
+                  <div className="text-xs text-slate-500">{label}</div>
+                  <div className={`text-lg tabular-nums ${cls}`}>{value}</div>
+                </div>
+              ))}
+            </div>
+            <p className="mt-3 text-xs text-slate-500">
+              健康判词{' '}
+              <span
+                className={
+                  c.cluster_health === 'healthy'
+                    ? 'text-emerald-400'
+                    : c.cluster_health === 'degraded'
+                      ? 'text-amber-400'
+                      : 'text-slate-400'
+                }
+              >
+                {c.cluster_health}
+              </span>
+              {' · '}平均任务耗时{' '}
+              {c.avg_task_duration_ms === null ? '—' : `${(c.avg_task_duration_ms / 1000).toFixed(1)} s`}
+              {' · '}读于 {stamp(c.timestamp)}
+            </p>
+            <p className="mt-1 text-xs text-slate-600">
+              判词的覆盖面只是告警面：healthy 说的是「没有东西在 firing」，不是「每个组件都验过」。
+            </p>
+          </>
+        )}
+      </Panel>
+
+      <Panel title="组件" subtitle="一套安装的三个固定工作负载。unknown 是读不到 Kubernetes，不是挂了。">
+        <div className="mb-3 space-y-2">
+          <BucketNote bucket={components} what="组件状态" />
+        </div>
+        {components.data && (
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-slate-500">
+                <th className="pb-2 pr-3 text-left font-medium">组件</th>
+                <th className="pb-2 pr-3 text-left font-medium">状态</th>
+                <th className="pb-2 text-left font-medium">副本</th>
+              </tr>
+            </thead>
+            <tbody>
+              {components.data.components.map((component) => (
+                <tr key={component.id} className="border-t border-slate-800/60">
+                  <td className="py-1.5 pr-3 text-slate-300">{component.id}</td>
+                  <td
+                    className={`py-1.5 pr-3 ${
+                      component.status === 'up'
+                        ? 'text-emerald-400'
+                        : component.status === 'down'
+                          ? 'text-red-400'
+                          : 'text-amber-400'
+                    }`}
+                  >
+                    {component.status}
+                  </td>
+                  <td className="py-1.5 tabular-nums text-slate-400">
+                    {component.ready_replicas === null && component.desired_replicas === null
+                      ? '—'
+                      : `${num(component.ready_replicas)} / ${num(component.desired_replicas)}`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Panel>
+
+      <Panel
+        title="令牌花销"
+        subtitle={
+          usage.data
+            ? `按执行者汇总。窗口 ${stamp(usage.data.covered_since)} → ${stamp(usage.data.covered_until)}——这是折叠层的窗口，不是「刚刚」。`
+            : '按执行者读耐久汇总，不是逐笔账本。'
+        }
+      >
+        <div className="mb-3 space-y-2">
+          <BucketNote bucket={usage} what="令牌花销" />
+        </div>
+        {usage.data && actors.length === 0 && (
+          <p className="text-sm text-slate-500">
+            这个窗口里没有折叠行。可能是真的没花，也可能是折叠还没跑到——看上面的窗口终点再判。
+          </p>
+        )}
+        {actors.length > 0 && (
+          <>
+            <div className="mb-3 grid grid-cols-4 gap-2">
+              {[
+                ['调用', String(calls), 'text-slate-200'],
+                ['失败', String(failed), failed > 0 ? 'text-red-400' : 'text-slate-400'],
+                ['输入', String(tokensIn), 'text-sky-300'],
+                ['输出', String(tokensOut), 'text-emerald-300'],
+              ].map(([label, value, cls]) => (
+                <div key={label} className="rounded-lg bg-slate-900/60 px-3 py-2">
+                  <div className="text-xs text-slate-500">{label}</div>
+                  <div className={`text-lg tabular-nums ${cls}`}>{value}</div>
+                </div>
+              ))}
+            </div>
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-slate-500">
+                  <th className="pb-2 pr-3 text-left font-medium">执行者</th>
+                  <th className="pb-2 pr-3 text-left font-medium">来源</th>
+                  <th className="pb-2 pr-3 text-right font-medium">调用</th>
+                  <th className="pb-2 pr-3 text-right font-medium">失败</th>
+                  <th className="pb-2 pr-3 text-right font-medium">输入</th>
+                  <th className="pb-2 pr-3 text-right font-medium">输出</th>
+                  <th className="pb-2 text-right font-medium">均耗</th>
+                </tr>
+              </thead>
+              <tbody>
+                {actors.slice(0, 50).map((a) => (
+                  <tr
+                    key={`${a.actor}|${a.origin}|${a.upstream}|${a.api_style}`}
+                    className="border-t border-slate-800/60"
+                  >
+                    <td className="py-1.5 pr-3 text-slate-300" title={a.actor}>
+                      {short(a.actor, 28)}
+                    </td>
+                    <td className="py-1.5 pr-3 text-slate-500" title={`${a.origin} · ${a.upstream} · ${a.api_style}`}>
+                      {a.origin}
+                    </td>
+                    <td className="py-1.5 pr-3 text-right tabular-nums text-slate-300">{a.calls}</td>
+                    <td
+                      className={`py-1.5 pr-3 text-right tabular-nums ${
+                        a.failed_calls > 0 ? 'text-red-400' : 'text-slate-500'
+                      }`}
+                    >
+                      {a.failed_calls}
+                    </td>
+                    <td className="py-1.5 pr-3 text-right tabular-nums text-slate-400">{a.tokens_input}</td>
+                    <td className="py-1.5 pr-3 text-right tabular-nums text-slate-400">{a.tokens_output}</td>
+                    <td className="py-1.5 text-right tabular-nums text-slate-500">
+                      {a.avg_latency_ms ? `${a.avg_latency_ms} ms` : '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="mt-2 text-xs text-slate-600">
+              输入 token 的含义逐协议不同（OpenAI 兼容线路已含缓存，Anthropic 上两者不相交），
+              跨协议不要相减或相加算命中率。
+            </p>
+          </>
+        )}
+      </Panel>
+
+      <Panel
+        title="后端探活"
+        subtitle={
+          overall
+            ? `整体 ${overall}。每次打开面板都重新探测，不是缓存上一次的结论。`
+            : '持久化、缓存、消息与记忆各自探一次。'
+        }
+      >
+        <div className="mb-3 space-y-2">
+          <BucketNote bucket={backends} what="后端健康" />
+        </div>
+        {backends.data && (
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-slate-500">
+                <th className="pb-2 pr-3 text-left font-medium">后端</th>
+                <th className="pb-2 pr-3 text-left font-medium">状态</th>
+                <th className="pb-2 pr-3 text-right font-medium">耗时</th>
+                <th className="pb-2 text-left font-medium">说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              {backends.data.backends.map((b: BackendHealth) => (
+                <tr key={b.name} className="border-t border-slate-800/60">
+                  <td className="py-1.5 pr-3 text-slate-300">{b.name}</td>
+                  <td
+                    className={`py-1.5 pr-3 ${
+                      b.status === 'up'
+                        ? 'text-emerald-400'
+                        : b.status === 'down'
+                          ? 'text-red-400'
+                          : 'text-amber-400'
+                    }`}
+                  >
+                    {b.status}
+                  </td>
+                  <td className="py-1.5 pr-3 text-right tabular-nums text-slate-400">
+                    {b.latency_ms === null ? '—' : `${b.latency_ms} ms`}
+                  </td>
+                  <td className="py-1.5 text-slate-500">{b.error ?? stamp(b.last_checked)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+/**
+ * 原则台账：语料判成了什么、按什么档位查、哪几条真的拦下过东西。
+ *
+ * 三个读数分开印。合成一个「原则 N 条」回答不了读者带来的任何一个问题：
+ * 分不出「没有门」与「门从没开过」，而这两件事要做的事相反。
+ */
+function PrinciplesPanel() {
+  const { principles } = useSystemSurfaceContext();
+  const p = principles.data;
 
   return (
     <Panel
-      title="资源与后端"
+      title="原则台账"
       subtitle={
-        overall
-          ? `整体 ${overall}。每次打开面板都重新探测，不是缓存上一次的结论。`
-          : '持久化、缓存、消息与记忆四个后端各自探一次。'
+        p
+          ? `读于 ${stamp(p.generated_at)}。判读结果、检查档位、拒绝次数三份读数各自独立。`
+          : '语料判定结果与拒绝计数，来自平台自己的台账。'
       }
     >
-      <BucketNote bucket={backends} what="后端健康" />
-      {backends.data && (
-        <table className="w-full text-xs">
-          <thead>
-            <tr className="text-slate-500">
-              <th className="pb-2 pr-3 text-left font-medium">后端</th>
-              <th className="pb-2 pr-3 text-left font-medium">状态</th>
-              <th className="pb-2 pr-3 text-right font-medium">耗时</th>
-              <th className="pb-2 text-left font-medium">说明</th>
-            </tr>
-          </thead>
-          <tbody>
-            {backends.data.backends.map((b: BackendHealth) => (
-              <tr key={b.name} className="border-t border-slate-800/60">
-                <td className="py-1.5 pr-3 text-slate-300">{b.name}</td>
-                <td
-                  className={`py-1.5 pr-3 ${
-                    b.status === 'up'
-                      ? 'text-emerald-400'
-                      : b.status === 'down'
-                        ? 'text-red-400'
-                        : 'text-amber-400'
-                  }`}
-                >
-                  {b.status}
-                </td>
-                <td className="py-1.5 pr-3 text-right tabular-nums text-slate-400">
-                  {b.latency_ms === null ? '—' : `${b.latency_ms} ms`}
-                </td>
-                <td className="py-1.5 text-slate-500">{b.error ?? stamp(b.last_checked)}</td>
-              </tr>
+      <div className="mb-3 space-y-2">
+        <BucketNote bucket={principles} what="原则台账" />
+      </div>
+      {p && (
+        <>
+          <div className="mb-4 grid grid-cols-4 gap-2">
+            {[
+              ['有门', p.census.enforced, 'text-emerald-300'],
+              ['无门', p.census.unenforced, 'text-amber-400'],
+              ['未判读', p.census.unmeasured, 'text-slate-400'],
+              ['已退役', p.census.retired, 'text-slate-500'],
+            ].map(([label, value, cls]) => (
+              <div key={label as string} className="rounded-lg bg-slate-900/60 px-3 py-2">
+                <div className="text-xs text-slate-500">{label}</div>
+                <div className={`text-lg tabular-nums ${cls}`}>{value as number}</div>
+              </div>
             ))}
-          </tbody>
-        </table>
+          </div>
+          <p className="mb-4 text-xs text-slate-500">
+            检查档位：形状 {p.check_kinds.shape} · 树 {p.check_kinds.tree} · 现场 {p.check_kinds.live} · 人判{' '}
+            {p.check_kinds.judgement} · 未声明 {p.check_kinds.undeclared}。人判与未声明是两件事：
+            前者是「本来就不该有机器的门」，后者是「还没人说过该怎么查」。
+          </p>
+          <p className="mb-3 text-xs text-slate-500">
+            被拒过的原则 {p.refused_principles} 条，累计拒绝 {p.refusals_total} 次。
+            下面是次数最多的几条，两个总数是全集口径。
+          </p>
+          {p.refused.length > 0 && (
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-slate-500">
+                  <th className="pb-2 pr-3 text-left font-medium">原则</th>
+                  <th className="pb-2 pr-3 text-right font-medium">拒绝</th>
+                  <th className="pb-2 text-left font-medium">最近一次</th>
+                </tr>
+              </thead>
+              <tbody>
+                {p.refused.map((row) => (
+                  <tr key={row.slug} className="border-t border-slate-800/60">
+                    <td className="py-1.5 pr-3 text-slate-300" title={row.lead ?? row.slug}>
+                      {row.lead ? short(row.lead, 60) : short(row.slug, 60)}
+                    </td>
+                    <td className="py-1.5 pr-3 text-right tabular-nums text-slate-300">
+                      {row.refusals}
+                    </td>
+                    <td className="py-1.5 tabular-nums text-slate-500">
+                      {stamp(row.last_refused_at)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </>
       )}
     </Panel>
   );
 }
 
 function GovernancePanel() {
-  const { supervisor, evolution } = useSystemSurfaceContext();
+  const { supervisor, evolution, changes } = useSystemSurfaceContext();
+  const queue = changes.data?.queue ?? null;
+  const changeRows = changes.data?.changes ?? [];
   const s = supervisor.data;
   const e = evolution.data;
 
@@ -469,6 +745,51 @@ function GovernancePanel() {
             {tile('变更落地', e.changes_applied, 'text-emerald-300')}
             {tile('变更失败', e.changes_failed, e.changes_failed > 0 ? 'text-red-400' : 'text-slate-400')}
           </div>
+        )}
+      </Panel>
+
+      <Panel
+        title="变更队列"
+        subtitle={
+          queue
+            ? `读的是 ${queue.dir}${queue.owner ? '（本进程就是这条队列的执行者）' : '（本进程不消费这条队列）'}。`
+            : '列举一条变更实际读的目录。'
+        }
+      >
+        <div className="mb-3 space-y-2">
+          <BucketNote bucket={changes} what="变更队列" />
+        </div>
+        {changes.data && changeRows.length === 0 && (
+          <p className="text-sm text-slate-500">
+            这条队列里没有变更。空列表也可能是「列举的进程读的不是生成变更的那个目录」——
+            看上面那行目录与属主再判。
+          </p>
+        )}
+        {changeRows.length > 0 && (
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-slate-500">
+                <th className="pb-2 pr-3 text-left font-medium">变更</th>
+                <th className="pb-2 pr-3 text-left font-medium">类型</th>
+                <th className="pb-2 pr-3 text-left font-medium">状态</th>
+                <th className="pb-2 pr-3 text-left font-medium">差异</th>
+                <th className="pb-2 text-left font-medium">生成于</th>
+              </tr>
+            </thead>
+            <tbody>
+              {changeRows.slice(0, 100).map((change) => (
+                <tr key={change.id} className="border-t border-slate-800/60">
+                  <td className="py-1.5 pr-3 text-slate-300" title={change.description}>
+                    {short(change.description, 48)}
+                  </td>
+                  <td className="py-1.5 pr-3 text-slate-500">{change.kind}</td>
+                  <td className="py-1.5 pr-3 text-slate-400">{change.status}</td>
+                  <td className="py-1.5 pr-3 text-slate-500">{change.diff_summary ?? '—'}</td>
+                  <td className="py-1.5 tabular-nums text-slate-500">{stamp(change.created_at)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         )}
       </Panel>
     </div>
@@ -545,7 +866,7 @@ export function SystemOverlay({
 
   const badge = (key: Tab): string | null => {
     if (key === 'faces' && redFaces > 0) return String(redFaces);
-    if (key === 'backends' && downBackends > 0) return String(downBackends);
+    if (key === 'resources' && downBackends > 0) return String(downBackends);
     return null;
   };
 
@@ -611,7 +932,8 @@ export function SystemOverlay({
             {tab === 'faces' && <FacesPanel />}
             {tab === 'tasks' && <TasksPanel />}
             {tab === 'governance' && <GovernancePanel />}
-            {tab === 'backends' && <BackendsPanel />}
+            {tab === 'resources' && <ResourcesPanel />}
+            {tab === 'principles' && <PrinciplesPanel />}
             {tab === 'eval' && <EvalPanel />}
           </div>
         </div>

@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   getBackendHealth,
+  getClusterComponents,
+  getClusterOverview,
+  getEvolutionChanges,
   getEvolutionMetrics,
+  getGovernancePrinciples,
+  getTokenUsage,
   getGovernanceDrift,
   getGovernanceFaces,
   getSupervisorStatus,
@@ -9,13 +14,18 @@ import {
   listEvalDatasets,
   listTasks,
   type BackendHealthMatrix,
+  type ClusterComponentsPage,
+  type ClusterOverview,
   type EvalDatasetInfo,
+  type EvolutionChangesPage,
   type EvolutionMetrics,
+  type PrinciplesPage,
   type FaceDriftReading,
   type GovernanceFace,
   type SupervisorStatus,
   type TaskRow,
   type TaskSummaryCounts,
+  type TokenUsage,
 } from '@/api/client';
 
 /**
@@ -66,6 +76,11 @@ export function useSystemSurface({ enabled, intervalMs = 15000 }: UseSystemSurfa
   const [datasets, setDatasets] = useState<SurfaceBucket<EvalDatasetInfo[]>>(emptyBucket);
   const [supervisor, setSupervisor] = useState<SurfaceBucket<SupervisorStatus>>(emptyBucket);
   const [evolution, setEvolution] = useState<SurfaceBucket<EvolutionMetrics>>(emptyBucket);
+  const [cluster, setCluster] = useState<SurfaceBucket<ClusterOverview>>(emptyBucket);
+  const [components, setComponents] = useState<SurfaceBucket<ClusterComponentsPage>>(emptyBucket);
+  const [usage, setUsage] = useState<SurfaceBucket<TokenUsage>>(emptyBucket);
+  const [principles, setPrinciples] = useState<SurfaceBucket<PrinciplesPage>>(emptyBucket);
+  const [changes, setChanges] = useState<SurfaceBucket<EvolutionChangesPage>>(emptyBucket);
 
   const loadFaces = useCallback(async () => {
     setFaces((b) => ({ ...b, loading: true }));
@@ -174,6 +189,74 @@ export function useSystemSurface({ enabled, intervalMs = 15000 }: UseSystemSurfa
     }
   }, []);
 
+  const loadCluster = useCallback(async () => {
+    setCluster((b) => ({ ...b, loading: true }));
+    setComponents((b) => ({ ...b, loading: true }));
+    try {
+      const overview = await getClusterOverview();
+      setCluster({ data: overview, loading: false, error: null, loadedAt: overview.timestamp });
+    } catch (e) {
+      setCluster((b) => ({ ...b, loading: false, error: describeError(e, '集群概况') }));
+    }
+    try {
+      const page = await getClusterComponents();
+      setComponents({
+        data: page,
+        loading: false,
+        error: null,
+        loadedAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      setComponents((b) => ({ ...b, loading: false, error: describeError(e, '集群组件') }));
+    }
+  }, []);
+
+  const loadUsage = useCallback(async () => {
+    setUsage((b) => ({ ...b, loading: true }));
+    try {
+      const page = await getTokenUsage(24);
+      setUsage({
+        data: page,
+        loading: false,
+        error: null,
+        // 折叠层的窗口终点才是这份读数的时间，不是本机此刻。
+        loadedAt: page.covered_until,
+      });
+    } catch (e) {
+      setUsage((b) => ({ ...b, loading: false, error: describeError(e, '令牌花销') }));
+    }
+  }, []);
+
+  const loadPrinciples = useCallback(async () => {
+    setPrinciples((b) => ({ ...b, loading: true }));
+    try {
+      const page = await getGovernancePrinciples();
+      setPrinciples({
+        data: page,
+        loading: false,
+        error: null,
+        loadedAt: page.generated_at,
+      });
+    } catch (e) {
+      setPrinciples((b) => ({ ...b, loading: false, error: describeError(e, '原则台账') }));
+    }
+  }, []);
+
+  const loadChanges = useCallback(async () => {
+    setChanges((b) => ({ ...b, loading: true }));
+    try {
+      const page = await getEvolutionChanges();
+      setChanges({
+        data: page,
+        loading: false,
+        error: null,
+        loadedAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      setChanges((b) => ({ ...b, loading: false, error: describeError(e, '变更队列') }));
+    }
+  }, []);
+
   const refreshAll = useCallback(() => {
     void loadFaces();
     void loadDrift();
@@ -182,7 +265,23 @@ export function useSystemSurface({ enabled, intervalMs = 15000 }: UseSystemSurfa
     void loadDatasets();
     void loadSupervisor();
     void loadEvolution();
-  }, [loadFaces, loadDrift, loadTasks, loadBackends, loadDatasets, loadSupervisor, loadEvolution]);
+    void loadCluster();
+    void loadUsage();
+    void loadPrinciples();
+    void loadChanges();
+  }, [
+    loadFaces,
+    loadDrift,
+    loadTasks,
+    loadBackends,
+    loadDatasets,
+    loadSupervisor,
+    loadEvolution,
+    loadCluster,
+    loadUsage,
+    loadPrinciples,
+    loadChanges,
+  ]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -200,6 +299,11 @@ export function useSystemSurface({ enabled, intervalMs = 15000 }: UseSystemSurfa
     datasets,
     supervisor,
     evolution,
+    cluster,
+    components,
+    usage,
+    principles,
+    changes,
     refreshAll,
   };
 }

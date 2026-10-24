@@ -211,6 +211,7 @@ async fn spawn_app_full(
         mcp_client: None,
         workspace_store: None,
         governance_store: None,
+        principle_ledger: None,
         external_skill_registry: None,
         notification_dispatcher: None,
         notification_tx: broadcast::channel(16).0,

@@ -303,6 +303,10 @@ pub struct GatewayState {
     /// failure rather than an empty roster, because an empty roster is a claim
     /// that there are no faces.
     pub governance_store: Option<Arc<dyn cog_core::GovernanceStore>>,
+    /// 原则台账：语料有多少条、各自被判成什么、哪几条真的拦下过东西。
+    /// 与面名册同样按请求现读；`None` 时那条路由报「没有台账」而不是回一份
+    /// 全零的账——全零会被读成「一条原则都没有」。
+    pub principle_ledger: Option<Arc<dyn cog_core::PrincipleLedgerStore>>,
     pub workspace_store:
         Option<Arc<std::sync::RwLock<std::collections::HashMap<String, workspaces::Workspace>>>>,
     /// External skill registry (Markdown-based skills).
@@ -836,6 +840,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
     let operator_routes = Router::new()
         .route("/api/v1/governance/faces", get(governance::faces_handler))
         .route("/api/v1/governance/drift", get(governance::drift_handler))
+        .route(
+            "/api/v1/governance/principles",
+            get(governance::principles_handler),
+        )
         .route("/api/v1/tasks/{id}", get(tasks::get_task_handler))
         .route("/api/v1/tasks/list", get(tasks::list_tasks_handler))
         .route("/api/v1/tasks/ready", get(tasks::get_ready_tasks_handler))
