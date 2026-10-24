@@ -2,11 +2,13 @@ import { AgentsView } from '@/views/AgentsView';
 import { AlertsView } from '@/views/AlertsView';
 import { AuditView } from '@/views/AuditView';
 import { ChangesView } from '@/views/ChangesView';
+import { DiffView } from '@/views/DiffView';
 import { FilesView } from '@/views/FilesView';
 import { GovernanceView } from '@/views/GovernanceView';
 import { InboxView } from '@/views/InboxView';
 import { ObservabilityView } from '@/views/ObservabilityView';
 import { SettingsView } from '@/views/SettingsView';
+import { SourceControlView } from '@/views/SourceControlView';
 import { TasksView } from '@/views/TasksView';
 import { WorkspaceView } from '@/views/WorkspaceView';
 import { Empty } from '@/ui/primitives';
@@ -26,6 +28,10 @@ export function ViewFor({ view }: { view: string }) {
       return <WorkspaceView />;
     case 'files':
       return <FilesView />;
+    case 'scm':
+      return <SourceControlView />;
+    case 'diff':
+      return <DiffView />;
     case 'inbox':
       return <InboxView />;
     case 'alerts':

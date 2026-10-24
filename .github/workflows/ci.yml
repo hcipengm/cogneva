@@ -690,6 +690,12 @@ jobs:
       # 里——它要那一份 tsc，别的作业没有。
       - name: Check in-file replace keeps every byte it should
         run: bash deploy/scripts/check-web-replace-semantics.sh
+      # 源代码管理这一面的成品是「看见改了哪些文件、点开一份并排差异、提交掉」，不是
+      # `/api/v1/ide/git/status` 这条路由。视图登记不全就永远打不开；差异页少了
+      # 「看哪一侧」就永远画同一份；对齐算法把两删一新配错位，屏幕上照样是一份
+      # diff——三种都编得过。这一步同时跑静态判据与 `pairHunk` 的实跑断言。
+      - name: Check source control reaches the screen and its diff lines up
+        run: bash deploy/scripts/check-web-source-control.sh
 
   entry-scripts:
     name: Entry Scripts Lint

@@ -196,13 +196,21 @@ fn non_empty_env(name: &str) -> Option<String> {
 ///
 /// 拒绝的东西一律回 403 而不是 404：调用方要能分清「这里没有这个文件」和
 /// 「这个路径本来就不许出现」，否则换一个路径重试就成了唯一线索。
-fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, ApiError> {
+pub(crate) fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, ApiError> {
     let rel = rel.trim();
     if rel.is_empty() {
         return Ok(root.to_path_buf());
     }
     for component in Path::new(rel).components() {
         match component {
+            // `.git` 里放的是钩子与配置：一条 `filter.x.clean` 就能把「保存一个
+            // 文件」变成「在网关进程里执行一条命令」。这一层不给写，源代码管理面
+            // 也不给它出现在路径里——历史由那一面按固定命令改，不由编辑器改。
+            Component::Normal(name) if is_git_dir(name) => {
+                return Err(ApiError::forbidden(
+                    "'.git' is managed by the source-control surface, not by the editor",
+                ))
+            }
             Component::Normal(_) => {}
             Component::CurDir => {
                 return Err(ApiError::forbidden(
@@ -242,6 +250,14 @@ fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, ApiError> {
     }
 }
 
+/// 路径里有没有一段叫 `.git`。
+///
+/// 只在**路径段**上判，不按裸子串：一个叫 `notes.git.md` 的文件完全正常，
+/// 而被它挡住的话，用户会以为编辑器坏了。
+fn is_git_dir(name: &std::ffi::OsStr) -> bool {
+    name == std::ffi::OsStr::new(".git")
+}
+
 fn modified_ms(meta: &std::fs::Metadata) -> Option<u64> {
     meta.modified()
         .ok()
@@ -275,6 +291,11 @@ async fn read_tree(dir: &Path, rel: &str) -> Result<TreeResponse, ApiError> {
             break;
         }
         let name = entry.file_name().to_string_lossy().to_string();
+        // 仓库内部目录不列出来：它在路径判据那边就已经打不开，列出来只是一个
+        // 点了会 403 的条目。
+        if entry.file_name() == std::ffi::OsStr::new(".git") {
+            continue;
+        }
         let meta = match entry.metadata().await {
             Ok(m) => m,
             // 目录在这一刻被删掉了：跳过，不因为它让整棵树失败。
@@ -677,6 +698,11 @@ async fn search_workspace(
             if file_type.is_symlink() {
                 continue;
             }
+            // 搜索不走仓库内部目录：那里的对象文件是压缩字节，扫一遍既慢又
+            // 只会得到「二进制，跳过」。
+            if entry.file_name() == std::ffi::OsStr::new(".git") {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().to_string();
             let child_rel = if rel.is_empty() {
                 name
@@ -840,7 +866,7 @@ pub async fn upload_handler(
 }
 
 /// 按需建立用户根：第一次打开文件面板的人不该看到一个「目录不存在」的错误。
-async fn ensure_user_root(claims: &Claims) -> Result<PathBuf, ApiError> {
+pub(crate) async fn ensure_user_root(claims: &Claims) -> Result<PathBuf, ApiError> {
     let root = configured_root();
     let user = user_root(&root, claims)?;
     tokio::fs::create_dir_all(&user)
@@ -959,6 +985,26 @@ mod tests {
         for bad in ["/etc/passwd", "../escape", "a/../../b", "..", "./x"] {
             let err = resolve_under(root, bad).expect_err(bad);
             assert_eq!(err.error, "Forbidden", "{bad} 必须被拒绝");
+        }
+    }
+
+    #[test]
+    fn the_git_directory_is_not_an_editor_path() {
+        let dir = tempdir();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        for bad in [
+            ".git",
+            ".git/config",
+            ".git/hooks/pre-commit",
+            "sub/.git/config",
+        ] {
+            let err = resolve_under(root, bad).expect_err(bad);
+            assert_eq!(err.error, "Forbidden", "{bad} 必须被拒绝");
+        }
+        // 名字里带 `.git` 的普通文件不受影响：判的是路径段，不是子串。
+        for good in ["notes.git.md", "git/.gitignore", "src/.gitkeep"] {
+            resolve_under(root, good).unwrap_or_else(|e| panic!("{good} 不该被拒: {e:?}"));
         }
     }
 

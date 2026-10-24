@@ -61,6 +61,7 @@ pub mod processes;
 pub mod prometheus_render;
 pub mod promotion_gate;
 pub mod raw_logs;
+pub mod scm;
 pub mod secret_layout;
 pub mod secret_write;
 pub mod security_gateway;
@@ -873,6 +874,27 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/ide/upload",
             axum::routing::post(ide::upload_handler),
+        )
+        // 源代码管理面：工作区里那本本地 git 历史。与文件面同一组权限——
+        // 能改这个工作区的人，才轮得到给它的历史记账。
+        .route("/api/v1/ide/git/status", get(scm::status_handler))
+        .route("/api/v1/ide/git/log", get(scm::log_handler))
+        .route("/api/v1/ide/git/diff", get(scm::diff_handler))
+        .route(
+            "/api/v1/ide/git/init",
+            axum::routing::post(scm::init_handler),
+        )
+        .route(
+            "/api/v1/ide/git/stage",
+            axum::routing::post(scm::stage_handler),
+        )
+        .route(
+            "/api/v1/ide/git/unstage",
+            axum::routing::post(scm::unstage_handler),
+        )
+        .route(
+            "/api/v1/ide/git/commit",
+            axum::routing::post(scm::commit_handler),
         )
         .route("/api/v1/governance/faces", get(governance::faces_handler))
         .route("/api/v1/governance/drift", get(governance::drift_handler))

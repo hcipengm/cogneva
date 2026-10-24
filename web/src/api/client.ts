@@ -1122,3 +1122,100 @@ export interface QuotaUsage {
 export async function getQuotaUsage(): Promise<QuotaUsage> {
   return api.get<QuotaUsage>('/api/v1/quota/usage');
 }
+
+export interface ScmChange {
+  path: string;
+  /** `M` 改、`A` 加、`D` 删、`R` 改名、`C` 复制、`U` 冲突、`?` 未跟踪。 */
+  code: string;
+}
+
+export interface ScmStatus {
+  /** 这个工作区还不是仓库时，下面各格都是空的。 */
+  repo: boolean;
+  branch: string | null;
+  head: string | null;
+  staged: ScmChange[];
+  unstaged: ScmChange[];
+  truncated: boolean;
+}
+
+export interface ScmCommit {
+  id: string;
+  short: string;
+  author: string;
+  /** 提交时刻（Unix 秒）。 */
+  at: number;
+  subject: string;
+}
+
+export interface ScmLog {
+  repo: boolean;
+  commits: ScmCommit[];
+}
+
+export interface DiffLine {
+  kind: 'context' | 'add' | 'del';
+  old_no: number | null;
+  new_no: number | null;
+  text: string;
+}
+
+export interface DiffHunk {
+  header: string;
+  old_start: number;
+  old_lines: number;
+  new_start: number;
+  new_lines: number;
+  lines: DiffLine[];
+}
+
+export interface FileDiff {
+  path: string;
+  staged: boolean;
+  /** 二进制文件没有可比的正文。 */
+  binary: boolean;
+  hunks: DiffHunk[];
+  added: number;
+  removed: number;
+  truncated: boolean;
+}
+
+export interface CommitOutcome {
+  commit: ScmCommit;
+  status: ScmStatus;
+}
+
+/** 工作区的 git 状态。轮询它，源码管理面板与页签上的角标读的是同一份。 */
+export async function getScmStatus(): Promise<ScmStatus> {
+  return api.get<ScmStatus>('/api/v1/ide/git/status');
+}
+
+export async function getScmLog(limit = 20): Promise<ScmLog> {
+  return api.get<ScmLog>(`/api/v1/ide/git/log?limit=${limit}`);
+}
+
+/**
+ * 一个文件的差异。行号由服务端算：前后端各算一份必然在某一刻错位，
+ * 而错位的 diff 会把改动指到错误的行上。
+ */
+export async function getScmDiff(path: string, staged: boolean): Promise<FileDiff> {
+  const params = new URLSearchParams({ path, staged: staged ? 'true' : 'false' });
+  return api.get<FileDiff>(`/api/v1/ide/git/diff?${params.toString()}`);
+}
+
+export async function initWorkspaceRepo(): Promise<ScmStatus> {
+  return api.post<ScmStatus>('/api/v1/ide/git/init', {});
+}
+
+export async function stagePaths(paths: string[]): Promise<ScmStatus> {
+  return api.post<ScmStatus>('/api/v1/ide/git/stage', { paths });
+}
+
+export async function unstagePaths(paths: string[]): Promise<ScmStatus> {
+  return api.post<ScmStatus>('/api/v1/ide/git/unstage', { paths });
+}
+
+/** 提交暂存区。说明由服务端去空白并拒绝空串——一条没有理由的提交没有信息。 */
+export async function commitStaged(message: string): Promise<CommitOutcome> {
+  return api.post<CommitOutcome>('/api/v1/ide/git/commit', { message });
+}

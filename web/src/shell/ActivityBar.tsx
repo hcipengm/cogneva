@@ -11,6 +11,7 @@ import { useShell, type ActivityId } from '@/shell/store';
 const ITEMS: { id: ActivityId; label: string; icon: IconName }[] = [
   { id: 'workspace', label: '工作台', icon: 'workspace' },
   { id: 'files', label: '文件', icon: 'folder' },
+  { id: 'scm', label: '源代码管理', icon: 'scm' },
   { id: 'inbox', label: '收件箱', icon: 'inbox' },
   { id: 'alerts', label: '告警', icon: 'alerts' },
   { id: 'tasks', label: '任务', icon: 'tasks' },

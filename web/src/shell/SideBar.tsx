@@ -47,6 +47,7 @@ export function SideBar() {
 const TITLES: Record<ActivityId, string> = {
   workspace: '工作台',
   files: '资源管理器',
+  scm: '源代码管理',
   inbox: '收件箱',
   agents: '智能体',
   tasks: '任务',
@@ -177,6 +178,27 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             <Row label="收起/展开侧栏" note="⌘B" />
             <Row label="收起/展开面板" note="⌘J" />
           </Section>
+        </>
+      );
+
+    case 'scm':
+      return (
+        <>
+          <Section title="这一面怎么读">
+            <Row label="已暂存" note="下一次提交会带走" />
+            <Row label="未暂存" note="还没被选中" />
+            <Row label="提交历史" note="只在这个工作区里" />
+            <Note>
+              历史只留在自己的工作区：没有远端，也没有推送。差异页的行号由服务端算，
+              取用的那一行会先跟盘上的指纹对一次。
+            </Note>
+          </Section>
+          <CrossLinks
+            links={[
+              { id: 'files', label: '资源管理器', note: '改动落在哪个文件' },
+              { id: 'changes', label: '变更', note: '平台自己的变更队列' },
+            ]}
+          />
         </>
       );
 
