@@ -869,6 +869,11 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     // write the same zeros on every pass as a pass that read
                     // nothing.
                     ctx.consume_service::<dyn cog_core::StateBackend>(),
+                    // The alert surface, for the third place work with no owner
+                    // shows up: a rule that fires with no face on it is work
+                    // nobody was handed, and the same comparison that nominates
+                    // a face for unowned rows nominates one for these.
+                    ctx.consume_service::<dyn cog_core::ActiveAlertSource>(),
                 );
             }
             None => info!("change ledger loop not started: no ChangeLedgerStore published"),
@@ -1064,6 +1069,17 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     // resume chain without its write side, which is the state this edge exists
     // to end.
     requires: &["storage", "agent"],
-    optional_requires: &["llm", "stream", "collaboration", "extension"],
+    // `observability` is soft: the ledger loop reads the firing alerts as a
+    // second pile of work nobody has a name on, and a process without that
+    // surface simply reads one pile instead of two. It stays optional so an
+    // orchestrator-only process still starts; what must not happen is the read
+    // racing the publish, which is why the edge is declared at all.
+    optional_requires: &[
+        "llm",
+        "stream",
+        "collaboration",
+        "extension",
+        "observability",
+    ],
     factory: || Box::new(OrchestratorPlugin::new()),
 };

@@ -152,6 +152,13 @@ pub const CHANGE_LEDGER_ROLE: &str = "change_ledger";
 /// threshold.
 pub const CHANGE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How many firing alerts one pass reads when it counts the ones no face owns.
+///
+/// A bound is needed because the read returns the rows themselves; it is set
+/// far above any real firing set so that a pass which fills it knows its own
+/// count is not a census and says so rather than comparing a truncated pile.
+pub const ALERT_CENSUS_LIMIT: i64 = 5000;
+
 /// How many outstanding rows one round reads.
 ///
 /// The round exists for one thing: to make "the ledger is readable, and this is
@@ -943,6 +950,12 @@ pub fn spawn_change_ledger_loop(
     principles: Option<Arc<dyn PrincipleLedgerStore>>,
     live_revision: Option<Arc<dyn LiveRevisionSource>>,
     events: Option<Arc<dyn StateBackend>>,
+    // The firing alerts, read so that a face nobody's name is on is a finding
+    // about work and not only about the account's own rows. Optional like the
+    // loop's other collaborators: a process that holds no alert surface has
+    // none to read, and a loop that refused to keep the account over that would
+    // trade a missing intake for a missing ledger.
+    alert_source: Option<Arc<dyn cog_core::ActiveAlertSource>>,
 ) {
     info!(
         interval_secs = CHANGE_LEDGER_PASS_INTERVAL.as_secs(),
@@ -1013,6 +1026,7 @@ pub fn spawn_change_ledger_loop(
             let principles = principles.clone();
             let live_revision = live_revision.clone();
             let events = events.clone();
+            let alert_source = alert_source.clone();
             async move {
                 // The role is renewed on the lease contract's own cadence rather
                 // than once per pass: a pass can be long, and a term that ran out
@@ -1180,6 +1194,36 @@ pub fn spawn_change_ledger_loop(
                     // the same pass that found it, rather than one period later.
                     if let Some(ref orchestrator) = orchestrator {
                         let pool = pool.as_deref();
+                        // Work with nobody's name on it shows up in the rows
+                        // of this account filed under no face, and in the
+                        // alerts nobody owns -- the persisted rows of the
+                        // alert state machine are also this platform's record
+                        // of what went wrong, so one read covers both of the
+                        // sources there are. The first is the census above;
+                        // this is the second, and one comparison decides both.
+                        // A read that failed is `None`, not an empty list: a
+                        // surface nobody could look at is not a surface with
+                        // nothing ringing on it.
+                        let firing = match alert_source.as_ref() {
+                            Some(source) => {
+                                match source.list_active_alerts(ALERT_CENSUS_LIMIT).await {
+                                    // A read that filled its bound is not a
+                                    // census: the pile may be larger than what
+                                    // came back, and a count that stops at the
+                                    // bound would compare the wrong number.
+                                    Some(alerts) if alerts.len() as i64 >= ALERT_CENSUS_LIMIT => {
+                                        warn!(
+                                            bound = ALERT_CENSUS_LIMIT,
+                                            "change ledger: the firing alerts filled the read's \
+                                             bound, so this pass counts none of them"
+                                        );
+                                        None
+                                    }
+                                    other => other,
+                                }
+                            }
+                            None => None,
+                        };
                         if let Some(read) = dispatch_pass(
                             &*store,
                             orchestrator,
@@ -1190,6 +1234,7 @@ pub fn spawn_change_ledger_loop(
                             events.as_deref(),
                             &sources_unread,
                             deliveries.as_ref(),
+                            firing.as_deref(),
                         )
                         .await
                         {
@@ -3168,6 +3213,10 @@ async fn dispatch_pass(
     // The changes the commit log says it landed, by task id. `None` when the
     // log could not be read: delivery is then unmeasured, not zero.
     deliveries: Option<&HashMap<String, String>>,
+    // The firing alerts this pass could read. `None` is "nobody could look",
+    // which is a different finding from "nothing is ringing", and the face
+    // lifecycle reads it as a second intake of work nobody has a name on.
+    alerts: Option<&[cog_core::PersistedAlert]>,
 ) -> Option<PoolVerdict> {
     // The read is bounded by the ledger's own census rather than by a number
     // chosen here, and it has to be that wide because of where pending rows sit
@@ -3453,6 +3502,7 @@ async fn dispatch_pass(
         // `None`, not zero, when the log could not be read: a failed read is
         // not a pass that found nothing delivered.
         deliveries.map(|_| counts.delivered as u64),
+        alerts,
     )
     .await;
     // The readback is published from here rather than from the row's own state:
@@ -4244,7 +4294,11 @@ async fn record_dispatch_state(
     counts: &TickCounts,
     sources_unread: &[&'static str],
     delivered: Option<u64>,
+    // The firing alerts this pass could read, or `None` when nobody could look.
+    // Read by the caller so that one pass reads the surface once.
+    alerts: Option<&[cog_core::PersistedAlert]>,
 ) {
+    let alert_pile = alerts.map(|alerts| crate::face_lifecycle::alert_pile(alerts, Utc::now()));
     let state = DispatchState {
         // Written for every pass, empty when every intake answered: `None` is
         // reserved for rows that predate the column, and a pass that reused it
@@ -4413,8 +4467,13 @@ async fn record_dispatch_state(
     // questions it can answer with an action. Asked from the pass that already
     // holds the seat and has just read the census, so the finding and the ask
     // come from one reading rather than from two that can disagree.
-    crate::face_lifecycle::dispatch_face_lifecycle(orchestrator, blocks.as_deref(), Utc::now())
-        .await;
+    crate::face_lifecycle::dispatch_face_lifecycle(
+        orchestrator,
+        blocks.as_deref(),
+        alert_pile.as_ref(),
+        Utc::now(),
+    )
+    .await;
     publish_dispatch_verdict(metrics, &state).await;
 }
 
@@ -7576,6 +7635,86 @@ mod tests {
         }
     }
 
+    fn firing(face: Option<&str>) -> cog_core::PersistedAlert {
+        let mut labels = serde_json::Map::new();
+        if let Some(face) = face {
+            labels.insert(
+                cog_core::alerts::ALERT_FACE_LABEL.to_string(),
+                serde_json::Value::String(face.to_string()),
+            );
+        }
+        cog_core::PersistedAlert {
+            rule: "some_rule".into(),
+            dedup_key: format!("some_rule/{face:?}"),
+            severity: "warning".into(),
+            state: "firing".into(),
+            message: "something is wrong".into(),
+            labels: serde_json::Value::Object(labels),
+            fired_at: Utc.timestamp_opt(1_760_000_000, 0).unwrap(),
+            last_seen_at: None,
+            acknowledged_at: None,
+            acknowledged_by: None,
+        }
+    }
+
+    /// The alert surface is the second place work with no owner shows up, and a
+    /// pass whose account is unreadable still has to ask about it: an alert
+    /// ringing with nobody's name on it is the finding, and it does not become
+    /// invisible because the ledger could not be read this time.
+    #[tokio::test]
+    async fn a_pass_asks_about_unowned_alerts_even_with_no_account_census() {
+        let store = FakeLedger::default();
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        // Three alerts with no face, one with a face they outgrow.
+        let alerts = vec![
+            firing(None),
+            firing(None),
+            firing(None),
+            firing(Some("tasks")),
+        ];
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            Some(&alerts),
+        )
+        .await;
+
+        let asked = graph.submitted();
+        assert!(
+            asked.iter().any(|id| id.starts_with("face-propose-")),
+            "the pass did not ask about the unowned alerts: {asked:?}"
+        );
+
+        // The other side of the same reading: alerts that all carry a face ask
+        // for nothing, so the submission above came from the pile and not from
+        // the pass running at all.
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            Some(&[firing(Some("tasks")), firing(Some("tasks"))]),
+        )
+        .await;
+        assert!(graph.submitted().is_empty(), "{:?}", graph.submitted());
+    }
+
     /// A pass that hands over places every owed row: the one the graph already
     /// holds, the one whose handover the environment killed and which therefore
     /// goes out again, and the one nothing has ever held.
@@ -7612,6 +7751,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await;
@@ -7669,6 +7809,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await;
 
@@ -7716,6 +7857,7 @@ mod tests {
             None,
             &[],
             Some(&deliveries),
+            None,
         )
         .await;
 
@@ -7772,6 +7914,7 @@ mod tests {
             None,
             &[],
             Some(&deliveries),
+            None,
         )
         .await;
 
@@ -7812,6 +7955,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await;
@@ -7859,6 +8003,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await;
@@ -7910,6 +8055,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await;
 
@@ -7945,6 +8091,7 @@ mod tests {
             None,
             &[INTAKE_PRINCIPLES],
             None,
+            None,
         )
         .await;
         let state = store.written().pop().expect("the pass wrote its row");
@@ -7966,6 +8113,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await;
@@ -7990,6 +8138,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await
@@ -8026,6 +8175,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await;
@@ -8073,6 +8223,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await;
 
@@ -8105,6 +8256,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await;
@@ -8255,6 +8407,7 @@ mod tests {
             None,
             None,
             Some(events),
+            None,
         );
 
         // The first tick is one pass interval away. Paused time makes that a
@@ -8387,6 +8540,7 @@ mod tests {
             Some(&metrics),
             Some(&events),
             &[],
+            None,
             None,
         )
         .await;

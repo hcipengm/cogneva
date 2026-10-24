@@ -30,7 +30,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use tracing::{info, warn};
 
-use cog_core::{BlockCensus, ChangeBlock, OrchestratorControl, Task};
+use cog_core::{BlockCensus, ChangeBlock, OrchestratorControl, PersistedAlert, Task};
 
 /// How long a face has to hold nothing before it is proposed for retirement.
 ///
@@ -51,16 +51,44 @@ pub fn retire_goal_id(face: &str, day: &str) -> String {
     format!("face-retire-{}-{day}", crate::face_drift::face_slug(face))
 }
 
-/// Unclaimed work large enough to be worth a heading of its own.
+/// Which reading a pile of unclaimed work was counted in.
+///
+/// The name travels with the finding because the answer is different for each:
+/// a change row is filed under a heading by editing one document, while a rule
+/// that fires with nobody's name on it is handed to a face by naming it where
+/// the rule is written. Whoever is asked needs to know which of the two piles
+/// they are being asked about.
+pub const LEDGER_SOURCE: &str = "变更账";
+/// Firing alerts that carry no face.
+pub const ALERTS_SOURCE: &str = "告警";
+
+/// A pile of work that nobody's name is on, and the yardstick it is measured
+/// against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nomination {
-    /// Rows filed under no face at all.
+    /// The reading this pile was counted in.
+    pub source: &'static str,
+    /// Items in that reading filed under no face at all.
     pub uncovered: u64,
-    /// What the largest named face holds, for the reader who wants to check the
-    /// comparison rather than take the verdict.
+    /// What the largest named face holds in the same reading, for the reader who
+    /// wants to check the comparison rather than take the verdict.
     pub largest_named: u64,
-    /// How long the least-recently-measured of those rows has waited.
+    /// How long the least-recently-observed of those items has waited.
     pub oldest_unmeasured_secs: Option<u64>,
+}
+
+impl Nomination {
+    /// Whether this pile is large enough to be worth a heading of its own.
+    ///
+    /// Larger than every named face **of the same reading**, not merely
+    /// non-zero: one unreported item is a document that forgot a column, and a
+    /// heading invented for it would be work about work. The bar is that
+    /// reading's own spread, so it rises with the account instead of being a
+    /// number that was right once -- and two readings of different things (rows
+    /// of an account, alerts that are ringing now) never share a bar.
+    fn worth_a_heading(&self) -> bool {
+        self.uncovered > 0 && self.uncovered > self.largest_named
+    }
 }
 
 /// A face that has held nothing for a full reporting period.
@@ -81,33 +109,82 @@ pub struct FaceLifecycle {
     pub retire: Vec<Retirement>,
 }
 
-/// Read the two findings off one census.
+/// The pile the change account itself carries: rows filed under no face.
+fn ledger_pile(census: &[BlockCensus]) -> Option<Nomination> {
+    let uncovered = census.iter().find(|face| !face.block.is_named())?;
+    Some(Nomination {
+        source: LEDGER_SOURCE,
+        uncovered: uncovered.owed,
+        largest_named: census
+            .iter()
+            .filter(|face| face.block.is_named())
+            .map(|face| face.owed)
+            .max()
+            .unwrap_or(0),
+        oldest_unmeasured_secs: uncovered.oldest_unmeasured_secs,
+    })
+}
+
+/// The pile the alert surface carries: firing alerts with no face on them.
+///
+/// Only *firing* alerts count. A rule that is silent is not work anybody owes,
+/// and counting every rule that names no face would nominate a heading for a
+/// rulebook rather than for work. The pile is the firing alerts with no face;
+/// the yardstick is the largest pile any one named face holds, so the two sides
+/// of the comparison are the same kind of thing.
+///
+/// The face comes from the label the mirror writes when the rule declared one.
+/// A label that is present but empty is the same as absent -- an empty name is
+/// exactly what the writer drops rather than writes.
+pub fn alert_pile(alerts: &[PersistedAlert], now: DateTime<Utc>) -> Nomination {
+    let mut named: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    let mut uncovered = 0u64;
+    let mut oldest: Option<u64> = None;
+    for alert in alerts {
+        let face = alert
+            .labels
+            .get(cog_core::alerts::ALERT_FACE_LABEL)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|face| !face.is_empty());
+        match face {
+            Some(face) => *named.entry(face).or_default() += 1,
+            None => {
+                uncovered += 1;
+                let age = now
+                    .signed_duration_since(alert.fired_at)
+                    .num_seconds()
+                    .max(0) as u64;
+                oldest = Some(oldest.map_or(age, |seen: u64| seen.max(age)));
+            }
+        }
+    }
+    Nomination {
+        source: ALERTS_SOURCE,
+        uncovered,
+        largest_named: named.values().copied().max().unwrap_or(0),
+        oldest_unmeasured_secs: oldest,
+    }
+}
+
+/// Read the two findings off the census, plus whatever the alert surface said.
 ///
 /// A census that could not be read is `None` at the call site rather than an
 /// empty slice, and neither is the same as an account with nothing in it: the
 /// empty slice here means the store answered and the answer was "no faces",
 /// which cannot happen while `none` is always printed -- so anything that
 /// arrives empty is treated as nothing to say rather than as a finding.
-pub fn read_face_lifecycle(census: &[BlockCensus]) -> FaceLifecycle {
-    let uncovered = census.iter().find(|face| !face.block.is_named());
-    let largest_named = census
-        .iter()
-        .filter(|face| face.block.is_named())
-        .map(|face| face.owed)
-        .max()
-        .unwrap_or(0);
-    let nominate = uncovered.and_then(|face| {
-        // Larger than every named face, not merely non-zero: one unreported row
-        // is a document that forgot a column, and a heading invented for it
-        // would be work about work. The comparison is against the account's own
-        // spread, so the bar rises with it instead of being a number that was
-        // right once.
-        (face.owed > 0 && face.owed > largest_named).then_some(Nomination {
-            uncovered: face.owed,
-            largest_named,
-            oldest_unmeasured_secs: face.oldest_unmeasured_secs,
-        })
-    });
+///
+/// The two piles are compared separately and the larger winner is returned: one
+/// counts rows of the account, the other counts alerts ringing now, and a count
+/// of one is not a bar for the other. Whichever pile is bigger is the one worth
+/// somebody's attention first.
+pub fn read_face_lifecycle(census: &[BlockCensus], alerts: Option<&Nomination>) -> FaceLifecycle {
+    let nominate = ledger_pile(census)
+        .into_iter()
+        .chain(alerts.cloned())
+        .filter(Nomination::worth_a_heading)
+        .max_by_key(|pile| pile.uncovered);
     let retire = census
         .iter()
         .filter(|face| face.block.is_named())
@@ -133,16 +210,29 @@ pub fn read_face_lifecycle(census: &[BlockCensus]) -> FaceLifecycle {
 pub fn propose_goal_text(nomination: &Nomination) -> String {
     let waited = match nomination.oldest_unmeasured_secs {
         Some(secs) => format!("{} 秒", secs),
-        None => "未知（这些行都已量过，或从未量过）".to_string(),
+        None => "未知（这些条目都已量过，或从未量过）".to_string(),
+    };
+    // The two readings are cleared in different places, so the ask names the
+    // one this pile came from rather than describing both and leaving the
+    // reader to guess which half they are being asked about.
+    let what = match nomination.source {
+        ALERTS_SOURCE => {
+            "有若干条**正在响的告警**没有挂面：没有面就没有人去动它，响着的规则和没写的规则在这里\
+             是同一件事。请读这些告警的规则与消息，找出它们共同关心的那个面：如果确实构成一个新面，\
+             就在写这些规则的地方把它补成一个面名；如果它们分属已有面，就在规则上补上漏写的面。"
+                .to_string()
+        }
+        _ => "请读这些行的文档与标题，找出它们共同关心的那个面：如果确实构成一个新面，就在提出这些\
+              变更的文档里写下那个面名——账认名字本身，不需要改代码、不需要迁移；\
+              如果它们分属已有面，就补上那些文档漏写的面。"
+            .to_string(),
     };
     format!(
         "Name a face for the unclaimed work\n\n\
-         账上有 {} 条变更不属于任何面，比任何一个具名面此刻持有的都多（最大的具名面 {} 条）；\
-         其中最久没被量过的那条已等待 {}。\
-         请读这些行的文档与标题，找出它们共同关心的那个面：如果确实构成一个新面，就在提出这些\
-         变更的文档里写下那个面名——账认名字本身，不需要改代码、不需要迁移；\
-         如果它们分属已有面，就补上那些文档漏写的面。做完之后，这个数应当落到任何具名面之下。",
-        nomination.uncovered, nomination.largest_named, waited,
+         {} 里有 {} 条不属于任何面，比同一个读数里任何一个具名面此刻持有的都多（最大的具名面 {} 条）；\
+         其中最久的那条已经等了 {}。{}\
+         做完之后，这个数应当落到任何具名面之下。",
+        nomination.source, nomination.uncovered, nomination.largest_named, waited, what,
     )
 }
 
@@ -186,12 +276,15 @@ fn lifecycle_row(id: String, text: &str) -> Task {
 pub async fn dispatch_face_lifecycle(
     orchestrator: &dyn OrchestratorControl,
     census: Option<&[BlockCensus]>,
+    alerts: Option<&Nomination>,
     now: DateTime<Utc>,
 ) {
-    let Some(census) = census else {
-        return;
-    };
-    let plan = read_face_lifecycle(census);
+    // The retirement question is the account's alone: a face stops being worth
+    // its line when nothing in the account moves, and the alert surface has no
+    // rows to ask that about. So a pass with no census asks nothing -- but it
+    // still must not skip a pile of unowned alerts it can see.
+    let empty: &[BlockCensus] = &[];
+    let plan = read_face_lifecycle(census.unwrap_or(empty), alerts);
     if plan.nominate.is_none() && plan.retire.is_empty() {
         return;
     }
@@ -264,14 +357,18 @@ mod tests {
     fn unclaimed_work_is_nominated_only_when_it_outgrows_every_named_face() {
         // More unclaimed rows than the biggest face holds: the account is
         // saying the headings no longer cover the work.
-        let plan = read_face_lifecycle(&[
-            face("none", 0, 9, 0, Some(0)),
-            face("tasks", 10, 8, 2, Some(0)),
-            face("token", 0, 3, 0, Some(0)),
-        ]);
+        let plan = read_face_lifecycle(
+            &[
+                face("none", 0, 9, 0, Some(0)),
+                face("tasks", 10, 8, 2, Some(0)),
+                face("token", 0, 3, 0, Some(0)),
+            ],
+            None,
+        );
         assert_eq!(
             plan.nominate,
             Some(Nomination {
+                source: LEDGER_SOURCE,
                 uncovered: 9,
                 largest_named: 8,
                 oldest_unmeasured_secs: None
@@ -280,27 +377,34 @@ mod tests {
 
         // Equal is not larger: a pile the same size as a face nobody made a
         // heading for is a document that forgot a column, not a missing face.
-        let plan = read_face_lifecycle(&[
-            face("none", 0, 8, 0, Some(0)),
-            face("tasks", 0, 8, 0, Some(0)),
-        ]);
+        let plan = read_face_lifecycle(
+            &[
+                face("none", 0, 8, 0, Some(0)),
+                face("tasks", 0, 8, 0, Some(0)),
+            ],
+            None,
+        );
         assert_eq!(plan.nominate, None);
 
         // Nothing unclaimed at all.
-        let plan = read_face_lifecycle(&[
-            face("none", 4, 0, 1, Some(0)),
-            face("tasks", 0, 1, 0, Some(0)),
-        ]);
+        let plan = read_face_lifecycle(
+            &[
+                face("none", 4, 0, 1, Some(0)),
+                face("tasks", 0, 1, 0, Some(0)),
+            ],
+            None,
+        );
         assert_eq!(plan.nominate, None);
 
         // No named face at all: every row is unclaimed, so there is more
         // unclaimed work than any face holds -- this is an account whose
         // headings have not been written yet, and the first one is what it
         // needs.
-        let plan = read_face_lifecycle(&[face("none", 0, 1, 0, Some(0))]);
+        let plan = read_face_lifecycle(&[face("none", 0, 1, 0, Some(0))], None);
         assert_eq!(
             plan.nominate,
             Some(Nomination {
+                source: LEDGER_SOURCE,
                 uncovered: 1,
                 largest_named: 0,
                 oldest_unmeasured_secs: None
@@ -310,7 +414,142 @@ mod tests {
         // An account with no rows at all has nothing to say: `none` is always
         // printed by the store, so an empty census is a reader that was handed
         // nothing rather than an account that holds nothing.
-        assert_eq!(read_face_lifecycle(&[]).nominate, None);
+        assert_eq!(read_face_lifecycle(&[], None).nominate, None);
+    }
+
+    fn alert(face: Option<&str>, age_secs: i64) -> PersistedAlert {
+        let mut labels = serde_json::Map::new();
+        if let Some(face) = face {
+            labels.insert(
+                cog_core::alerts::ALERT_FACE_LABEL.to_string(),
+                serde_json::Value::String(face.to_string()),
+            );
+        }
+        PersistedAlert {
+            rule: "some_rule".into(),
+            dedup_key: format!("some_rule/{face:?}/{age_secs}"),
+            severity: "warning".into(),
+            state: "firing".into(),
+            message: "something is wrong".into(),
+            labels: serde_json::Value::Object(labels),
+            fired_at: Utc::now() - chrono::Duration::seconds(age_secs),
+            last_seen_at: None,
+            acknowledged_at: None,
+            acknowledged_by: None,
+        }
+    }
+
+    #[test]
+    fn firing_alerts_with_no_face_are_counted_against_the_faces_that_do_carry_one() {
+        let pile = alert_pile(
+            &[
+                alert(None, 30),
+                alert(Some(""), 10),
+                alert(Some("  "), 10),
+                alert(Some("tasks"), 5),
+                alert(Some("tasks"), 5),
+                alert(Some("observability"), 5),
+            ],
+            Utc::now(),
+        );
+        // Absent, empty and blank all mean the same thing to the writer that
+        // stores these rows -- no name -- so they are one pile here too.
+        assert_eq!(pile.source, ALERTS_SOURCE);
+        assert_eq!(pile.uncovered, 3);
+        assert_eq!(pile.largest_named, 2);
+        // The oldest unowned alert is the one that has waited longest with
+        // nobody's name on it; a named one's age says nothing about that wait.
+        let waited = pile.oldest_unmeasured_secs.expect("two unclaimed ages");
+        assert!((25..=30).contains(&waited), "waited {waited}");
+
+        // Nothing ringing means nothing to nominate, not a division by zero.
+        let quiet = alert_pile(&[], Utc::now());
+        assert_eq!(quiet.uncovered, 0);
+        assert_eq!(quiet.oldest_unmeasured_secs, None);
+
+        // A rulebook is not a pile of work: named alerts alone never nominate.
+        let owned = alert_pile(&[alert(Some("tasks"), 5), alert(Some("s"), 5)], Utc::now());
+        assert_eq!(owned.uncovered, 0);
+    }
+
+    #[test]
+    fn an_unowned_alert_pile_nominates_on_its_own_bar() {
+        // The account is quiet: nothing unclaimed in it at all.
+        let census = [
+            face("none", 0, 0, 0, Some(0)),
+            face("tasks", 3, 2, 0, Some(0)),
+        ];
+
+        // Three unowned alerts against a biggest named pile of two: the alert
+        // surface is the reading that nominates, and it says so.
+        let alerts = alert_pile(
+            &[
+                alert(None, 5),
+                alert(None, 5),
+                alert(None, 5),
+                alert(Some("tasks"), 5),
+                alert(Some("tasks"), 5),
+            ],
+            Utc::now(),
+        );
+        let plan = read_face_lifecycle(&census, Some(&alerts));
+        let nomination = plan.nominate.expect("the alert pile outgrew its bar");
+        assert_eq!(nomination.source, ALERTS_SOURCE);
+        assert_eq!(nomination.uncovered, 3);
+        assert_eq!(nomination.largest_named, 2);
+
+        // The other direction: an alert pile that is smaller than the named
+        // pile of the *same* reading does not nominate, however large the
+        // account's own unclaimed count is -- the two bars are not shared.
+        let small = alert_pile(
+            &[
+                alert(None, 5),
+                alert(Some("tasks"), 5),
+                alert(Some("tasks"), 5),
+            ],
+            Utc::now(),
+        );
+        let plan = read_face_lifecycle(&census, Some(&small));
+        assert_eq!(plan.nominate, None);
+
+        // With no alert reading at all, the account's own pile is still read.
+        let owed = [
+            face("none", 0, 4, 0, Some(0)),
+            face("tasks", 0, 2, 0, Some(0)),
+        ];
+        let plan = read_face_lifecycle(&owed, None);
+        assert_eq!(
+            plan.nominate.map(|n| (n.source, n.uncovered)),
+            Some((LEDGER_SOURCE, 4))
+        );
+    }
+
+    #[test]
+    fn the_larger_of_the_two_piles_is_the_one_asked_about() {
+        let census = [
+            face("none", 0, 6, 0, Some(0)),
+            face("tasks", 0, 4, 0, Some(0)),
+        ];
+        let alerts = alert_pile(
+            &[
+                alert(None, 5),
+                alert(None, 5),
+                alert(None, 5),
+                alert(None, 5),
+                alert(None, 5),
+                alert(None, 5),
+                alert(None, 5),
+                alert(Some("tasks"), 5),
+                alert(Some("tasks"), 5),
+            ],
+            Utc::now(),
+        );
+        let plan = read_face_lifecycle(&census, Some(&alerts));
+        // Seven unowned alerts beat six unowned rows: two findings, one goal.
+        assert_eq!(
+            plan.nominate.map(|n| (n.source, n.uncovered)),
+            Some((ALERTS_SOURCE, 7))
+        );
     }
 
     #[test]
@@ -322,7 +561,7 @@ mod tests {
             face("just_retired", 0, 0, 2, Some(60)),
             face("landed_only", 5, 0, 0, Some(DAY + 1)),
         ];
-        let plan = read_face_lifecycle(&census);
+        let plan = read_face_lifecycle(&census, None);
         let retired: Vec<&str> = plan.retire.iter().map(|r| r.face.as_str()).collect();
         assert_eq!(retired, vec!["done"]);
         assert_eq!(plan.retire[0].retired, 4);
@@ -330,13 +569,13 @@ mod tests {
 
         // A face that still owes work is not idle, however long since it moved:
         // an old debt is the face doing its job, not a face that is finished.
-        let plan = read_face_lifecycle(&[face("owed", 0, 1, 3, Some(DAY * 30))]);
+        let plan = read_face_lifecycle(&[face("owed", 0, 1, 3, Some(DAY * 30))], None);
         assert!(plan.retire.is_empty());
 
         // A face with nothing in it at all is not a census row: the census is
         // measured from rows, so a heading nobody ever named is not reported
         // here as a face to retire.
-        let plan = read_face_lifecycle(&[]);
+        let plan = read_face_lifecycle(&[], None);
         assert_eq!(plan, FaceLifecycle::default());
     }
 
@@ -363,6 +602,7 @@ mod tests {
     #[test]
     fn the_texts_lead_with_what_is_being_asked_and_carry_the_numbers_behind_it() {
         let nomination = Nomination {
+            source: LEDGER_SOURCE,
             uncovered: 12,
             largest_named: 7,
             oldest_unmeasured_secs: Some(3600),
@@ -371,6 +611,18 @@ mod tests {
         assert!(text.starts_with("Name a face for the unclaimed work"));
         assert!(text.contains("12"));
         assert!(text.contains("7"));
+
+        // The ask has to say which reading the pile came from: clearing a row
+        // of the account and clearing an alert that is ringing now are two
+        // different pieces of work, and the reader is handed one of them.
+        let from_alerts = Nomination {
+            source: ALERTS_SOURCE,
+            ..nomination.clone()
+        };
+        let alert_text = propose_goal_text(&from_alerts);
+        assert!(alert_text.contains(ALERTS_SOURCE));
+        assert!(alert_text.contains("告警"));
+        assert!(!text.contains(ALERTS_SOURCE));
 
         let retirement = Retirement {
             face: ChangeBlock::named("delivery").expect("a face name"),
