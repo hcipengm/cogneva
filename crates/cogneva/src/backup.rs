@@ -17,11 +17,13 @@
 //! <pkg>/objects/storage/...           cogneva-data-pvc 的 storage 子树原样
 //! <pkg>/artifacts/<root>/policies/... 每个数据根的产物级进化策略库
 //! <pkg>/artifacts/<root>/meta_learning/decision_stats.json  调参证据
+//! <pkg>/artifacts/<root>/workspace/... 编辑器工作区整树
 //! ```
 //!
-//! `artifacts/` 只收 `policies/` 与 `meta_learning/decision_stats.json`，不收数据根
-//! 的其余子树（工作树、数仓、原始日志）：那些要么可重建，要么体积以百 GiB 计，
-//! 且不属于「换机后必须逐字节相同」的权威面。
+//! `artifacts/` 只收 `policies/`、`meta_learning/decision_stats.json` 与 `workspace/`，
+//! 不收数据根的其余子树（工作树、数仓、原始日志）：那些要么可重建，要么体积以百 GiB
+//! 计，且不属于「换机后必须逐字节相同」的权威面。`workspace/` 是例外里的例外——它
+//! 没有第二条重建路径，用户在编辑器里新建的文件只有这一份。
 //! 整包打成 `cogneva-backup-<UTC 时间戳>.tar.zst`，时间戳字典序即新旧序。
 
 use std::collections::BTreeMap;
@@ -133,6 +135,24 @@ pub struct ArtifactRootReport {
     pub policy_stores: Vec<PolicyStoreReport>,
     #[serde(default)]
     pub decision_stats: Option<DecisionStatsReport>,
+    /// 编辑器工作区树（`{data_dir}/workspace`）的读数。`None` = 这个根没有工作区，
+    /// 或者这个包是按更早的格式打出来的——两种情况都表示「包里没有这一棵树」，
+    /// 恢复端不做任何事，而不是把它当成「有一个空工作区」。
+    ///
+    /// 它进包的理由与策略库不同：策略库能说「谁带它」，工作区不能——用户在那里面
+    /// 写下的东西没有第二个副本，换一台机器就是没了。
+    #[serde(default)]
+    pub workspace: Option<WorkspaceReport>,
+}
+
+/// 工作区整棵树的读数：文件数与总字节。
+///
+/// 恢复端拿这两项去核**将要落地的那一份**，而不是「目录存在」——一个空目录与
+/// 一棵真的抄过去的树，在 `is_dir()` 面前是同一件事。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceReport {
+    pub files: u64,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1920,7 +1940,7 @@ fn git_ok(dir: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error
 
 /// 把每个数据根的产物层抄进包，并留下逐库读数。
 ///
-/// 只抄 `policies/` 与 `meta_learning/decision_stats.json`。写点已经是
+/// 抄 `policies/`、`meta_learning/decision_stats.json` 与 `workspace/`。写点已经是
 /// tmp+fsync+rename，读者要么看到旧文件要么看到新文件；版本文件与 ACTIVE 之间
 /// 仍可能隔一拍，清单因此把 head 与 active 分开记，恢复端按「active 指向的版本
 /// 存在且 hash 对得上」判，不按「active 必须等于 head」。
@@ -2136,6 +2156,16 @@ async fn collect_artifact_root(
             trials,
             bytes,
         });
+    }
+
+    // 编辑器工作区整树进包。它不像策略库那样有「从哪重建」的第二条路：用户在
+    // 里面新建的文件只有这一份，而机器换掉时数据根就是全部。逐文件复制，清单记
+    // 下文件数与字节数，恢复端据此判「抄过去的这一份是不是当年那一份」。
+    let workspace_src = dir.join("workspace");
+    if workspace_src.is_dir() {
+        let dst = staging.join("artifacts").join(root).join("workspace");
+        let (files, bytes) = copy_tree(&workspace_src, &dst)?;
+        report.workspace = Some(WorkspaceReport { files, bytes });
     }
 
     Ok(report)
@@ -3057,6 +3087,30 @@ async fn stage_artifact_root(
         std::fs::rename(&staged, dir.join("decision_stats.json"))?;
         std::fs::File::open(&dir)?.sync_all()?;
     }
+
+    if let Some(workspace) = &root.workspace {
+        let src = base.join("workspace");
+        if !src.is_dir() {
+            return Err(format!("{} 不在包里，但清单说这个根有工作区", src.display()).into());
+        }
+        let staged = scratch.join("workspace");
+        let (files, bytes) = copy_tree(&src, &staged)?;
+        if files != workspace.files || bytes != workspace.bytes {
+            return Err(format!(
+                "{}: 抄过去的是 {files} 个文件 / {bytes} 字节，清单声明 {} 个 / {} 字节",
+                src.display(),
+                workspace.files,
+                workspace.bytes
+            )
+            .into());
+        }
+        sync_tree(&staged)?;
+        replace_dir(&staged, &target.join("workspace"))?;
+        readings.push(format!(
+            "{}: 工作区 {files} 个文件 / {bytes} 字节（清单一致）",
+            root.root
+        ));
+    }
     Ok(())
 }
 
@@ -3956,6 +4010,24 @@ async fn verify_artifact_stores(
                 }
             }
         }
+        if let Some(workspace) = &root.workspace {
+            drill.artifacts_expected += 1;
+            match measure_tree(&base.join("workspace")) {
+                Ok((files, bytes)) if files == workspace.files && bytes == workspace.bytes => {
+                    drill.artifacts_restored += 1;
+                    drill
+                        .artifact_readings
+                        .push(format!("{}/workspace: {files} 个文件 / {bytes} 字节", root.root));
+                }
+                Ok((files, bytes)) => drill.artifact_errors.push(format!(
+                    "{}/workspace: 包内实测 {files} 个文件 / {bytes} 字节，清单声明 {} 个 / {} 字节",
+                    root.root, workspace.files, workspace.bytes
+                )),
+                Err(e) => drill
+                    .artifact_errors
+                    .push(format!("{}/workspace: 读不出来：{e}", root.root)),
+            }
+        }
         if let Some(stats) = &root.decision_stats {
             drill.artifacts_expected += 1;
             let path = base.join("meta_learning").join("decision_stats.json");
@@ -4606,6 +4678,7 @@ mod tests {
                 ..Default::default()
             }],
             decision_stats: None,
+            workspace: None,
         }];
 
         let value: serde_json::Value =
@@ -6000,6 +6073,97 @@ mod tests {
         );
     }
 
+    /// 编辑器工作区是数据根下唯一没有第二条重建路径的子树：用户在编辑器里新建的
+    /// 文件只有这一份。它没有进包时，备份照样绿、恢复演练照样绿，换机后那棵树
+    /// 就静默没了——所以这里从「数据根里的文件」一路测到「恢复端写回去的那一份」。
+    #[tokio::test]
+    async fn the_editor_workspace_travels_in_the_package_and_comes_back_whole() {
+        let pkg = tempfile::tempdir().unwrap();
+        let live = tempfile::tempdir().unwrap();
+        let data = live.path().join("data");
+        let user = data.join("workspace/6f1c2a44-0000-0000-0000-000000000001");
+        std::fs::create_dir_all(user.join("notes")).unwrap();
+        std::fs::write(user.join("notes/todo.md"), "# 待办\n\n- 一件\n").unwrap();
+        std::fs::write(user.join("scratch.txt"), "草稿").unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let report = collect_artifact_root("app", &data, staging.path())
+            .await
+            .unwrap();
+        let workspace = report
+            .workspace
+            .as_ref()
+            .expect("数据根里有 workspace/ 时清单必须声明它");
+        assert_eq!(workspace.files, 2);
+        assert_eq!(
+            workspace.bytes,
+            "# 待办\n\n- 一件\n".len() as u64 + "草稿".len() as u64
+        );
+
+        let source = pkg.path().join("artifacts/app");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::rename(staging.path().join("artifacts/app"), &source).unwrap();
+        let manifest = manifest_with(vec![report]);
+
+        let target = tempfile::tempdir().unwrap();
+        let readings = restore_artifacts_into(
+            pkg.path(),
+            &manifest,
+            &[("app".to_string(), target.path().to_path_buf())],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            readings.iter().any(|line| line.contains("工作区")),
+            "恢复读数里要点出工作区这一份：{readings:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                target
+                    .path()
+                    .join("workspace/6f1c2a44-0000-0000-0000-000000000001/notes/todo.md")
+            )
+            .unwrap(),
+            "# 待办\n\n- 一件\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                target
+                    .path()
+                    .join("workspace/6f1c2a44-0000-0000-0000-000000000001/scratch.txt")
+            )
+            .unwrap(),
+            "草稿"
+        );
+    }
+
+    /// 清单说这个根有工作区、包里却没有那一棵树：恢复必须停，而不是写回一个空
+    /// 目录——空目录与「用户什么都没写」在盘上长得一模一样。
+    #[tokio::test]
+    async fn a_package_that_declares_a_workspace_without_the_tree_is_refused() {
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pkg.path().join("artifacts/app")).unwrap();
+        let manifest = manifest_with(vec![ArtifactRootReport {
+            root: "app".to_string(),
+            data_dir: "/var/lib/cogneva-data".to_string(),
+            workspace: Some(WorkspaceReport { files: 1, bytes: 4 }),
+            ..Default::default()
+        }]);
+        let target = tempfile::tempdir().unwrap();
+        let err = restore_artifacts_into(
+            pkg.path(),
+            &manifest,
+            &[("app".to_string(), target.path().to_path_buf())],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("workspace"),
+            "错误里要点出缺的是哪一段：{err}"
+        );
+    }
+
     /// 写回成功与「新进程加载了这一份」不是同一件事：恢复端要把包里的版本与证据
     /// 规模留在数据根里，新进程开机时才有可对的标准。
     #[tokio::test]
@@ -6072,6 +6236,7 @@ mod tests {
             policies_present: false,
             policy_stores: Vec::new(),
             decision_stats: None,
+            workspace: None,
         }]);
         let target = tempfile::tempdir().unwrap();
         restore_artifacts_into(
@@ -6246,6 +6411,7 @@ mod tests {
             policies_present: false,
             policy_stores: Vec::new(),
             decision_stats: None,
+            workspace: None,
         }]);
         let err = restore_artifacts_into(
             pkg.path(),
