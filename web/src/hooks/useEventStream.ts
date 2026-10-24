@@ -65,6 +65,10 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
   const clientRef = useRef<StreamClient | null>(null);
   const notificationHandler = useRef(options.onNotification);
   notificationHandler.current = options.onNotification;
+  // 频道列表按内容比，不按数组身份比。调用方写的是字面量 `['agent:*', …]`，
+  // 每次渲染都是一个新数组；把它放进依赖里，任何一次重渲染（告警轮询每十
+  // 几秒一次）都会断开重连，实时视图于是每隔一会儿就空一段。
+  const channelKey = (options.channels ?? []).join(',');
   const startMessage = useStreamStore((state) => state.startMessage);
   const appendDelta = useStreamStore((state) => state.appendDelta);
   const endMessage = useStreamStore((state) => state.endMessage);
@@ -145,6 +149,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       }
     };
 
+    const channels = channelKey ? channelKey.split(',') : [];
     const client = options.mock
       ? new MockEventStreamClient({
           onEvent: handleEvent,
@@ -152,7 +157,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
         })
       : new EventStreamClient({
           url: options.url ?? '',
-          channels: options.channels,
+          channels,
           onEvent: handleEvent,
           onNotification: (notification) =>
             notificationHandler.current?.(notification),
@@ -172,7 +177,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
   }, [
     options.mock,
     options.url,
-    options.channels,
+    channelKey,
     startMessage,
     appendDelta,
     endMessage,
