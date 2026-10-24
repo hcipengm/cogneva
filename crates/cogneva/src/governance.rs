@@ -747,6 +747,7 @@ async fn assign(
     let mut assigned = 0usize;
     let mut rebound = 0usize;
     let mut kept = 0usize;
+    let mut released = 0usize;
     let mut vacant = 0usize;
     for face in selected {
         let Some(owner) = face.owner_unit.clone() else {
@@ -763,19 +764,27 @@ async fn assign(
                 existing.status,
                 TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
             ) {
-                if existing.owner_unit.as_deref() == Some(owner.as_str()) {
-                    kept += 1;
-                    continue;
+                match standing_row_disposition(existing.owner_unit.as_deref(), &owner) {
+                    StandingRow::Keep => {
+                        kept += 1;
+                        continue;
+                    }
+                    StandingRow::LeaveReleased => {
+                        released += 1;
+                        continue;
+                    }
+                    // The face's owner moved after this row was written, and
+                    // a row that keeps the previous name is not "kept work":
+                    // the drift reading takes the row as the evidence of who
+                    // is doing the face, so it goes on reporting the face as
+                    // bound to nobody while a row for it sits in the queue.
+                    StandingRow::Rebind => {
+                        let moved = rebind_standing_row(existing, &face.face_id, &owner, workspace);
+                        backend.dag_set_task(workspace, &id, &moved).await?;
+                        rebound += 1;
+                        continue;
+                    }
                 }
-                // The face's owner moved after this row was written, and a
-                // row that keeps the previous name is not "kept work": the
-                // drift reading takes the row as the evidence of who is
-                // doing the face, so it goes on reporting the face as bound
-                // to nobody while a row for it sits in the queue.
-                let moved = rebind_standing_row(existing, &face.face_id, &owner, workspace);
-                backend.dag_set_task(workspace, &id, &moved).await?;
-                rebound += 1;
-                continue;
             }
         }
         let reading = face
@@ -807,10 +816,38 @@ async fn assign(
         assigned += 1;
     }
     println!(
-        "assigned {assigned}, rebound {rebound}, kept {kept}, vacant {vacant} \
-         (workspace {workspace})"
+        "assigned {assigned}, rebound {rebound}, kept {kept}, released {released}, \
+         vacant {vacant} (workspace {workspace})"
     );
     Ok(())
+}
+
+/// What `assign` does with an open standing work row it already found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandingRow {
+    /// The row already names the face's owner.
+    Keep,
+    /// The row names some other unit: the face changed hands after the row was
+    /// written, and the row is the evidence the drift reading takes of who is
+    /// doing the face.
+    Rebind,
+    /// The row names nobody, which is the state the drift pass leaves behind
+    /// when the unit it named stopped answering to the registry. Clearing the
+    /// owner is the only move that puts the work back in front of every
+    /// executor -- the shared queue hands out unowned work only -- so giving
+    /// the row an owner again would take it off the queue and hand it to the
+    /// same absent name. `assign` and the drift pass would then undo each
+    /// other for as long as both ran, while the face read as staffed the whole
+    /// time.
+    LeaveReleased,
+}
+
+fn standing_row_disposition(existing_owner: Option<&str>, face_owner: &str) -> StandingRow {
+    match existing_owner {
+        Some(owner) if owner == face_owner => StandingRow::Keep,
+        Some(_) => StandingRow::Rebind,
+        None => StandingRow::LeaveReleased,
+    }
 }
 
 /// Point an open standing row at the face's current owner.
@@ -1112,6 +1149,37 @@ mod tests {
         assert!(
             moved.input.get("goal").and_then(|v| v.as_str()).is_some(),
             "a rebind must not drop the goal: {moved:?}"
+        );
+    }
+
+    /// A row the drift pass released must not be handed back to the absent
+    /// name by the next `assign`.
+    ///
+    /// The two passes have opposite jobs on the same row: the drift pass
+    /// clears the owner when the unit it names stops answering, `assign`
+    /// makes the row name the face's owner again. Run together on a face
+    /// whose owner is gone, they undo each other -- the row never becomes
+    /// runnable, and because it is owned again the face stops reading as
+    /// drifted. Measured on the live cluster: eighteen face rows stayed
+    /// unstarted for five days this way. Leaving a released row alone is
+    /// what breaks the loop: the shared queue runs it, and a returning owner
+    /// gets the duty back through a signed handover.
+    #[test]
+    fn a_released_standing_row_is_not_re_owned_by_the_next_assign() {
+        assert_eq!(
+            standing_row_disposition(None, "f5"),
+            StandingRow::LeaveReleased,
+            "a row with no owner was released on purpose; re-owning it takes it off the queue"
+        );
+        assert_eq!(
+            standing_row_disposition(Some("f5"), "f5"),
+            StandingRow::Keep,
+            "a row that already names the face's owner is kept as it is"
+        );
+        assert_eq!(
+            standing_row_disposition(Some("c2"), "f5"),
+            StandingRow::Rebind,
+            "a face that changed hands moves its open row with it"
         );
     }
 
