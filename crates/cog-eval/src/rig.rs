@@ -659,6 +659,15 @@ impl Rig {
         }
     }
 
+    /// 换掉「肯为一次拒绝坐等多久」这条界（`None` ＝上游说多久就等多久）。
+    ///
+    /// 就地换而不是重建：重建会把已经记下的拒绝与配额一起丢掉，而这几个数是报表
+    /// 那一行 `refusal-backoff` 的读数。
+    pub fn with_refusal_wait_cap(self, cap: Option<std::time::Duration>) -> Self {
+        self.backoff.set_wait_cap(cap);
+        self
+    }
+
     /// 注册一个外壳。同名重复注册是错误——两行同名会让表里出现两个一样的行，
     /// 读的人分不出哪个是哪个。
     pub fn with_scaffold(mut self, scaffold: Arc<dyn AgentScaffold>) -> Self {
@@ -1277,6 +1286,32 @@ mod tests {
                 vision: false,
             },
         )
+    }
+
+    /// 命令行上的那一截要真的落到打上游的那一层，并且**当场可读**回来：
+    /// 只把它存进配置、读数仍是默认 600，这一跑照旧会睡掉上游说的小时数。
+    #[test]
+    fn the_wait_cap_handed_to_the_rig_is_the_one_the_caller_side_uses() {
+        assert_eq!(
+            rig().backoff_reading().wait_cap_secs,
+            Some(crate::backoff::DEFAULT_REFUSAL_WAIT_CAP.as_secs()),
+            "a rig built without saying anything keeps the default bound"
+        );
+        assert_eq!(
+            rig()
+                .with_refusal_wait_cap(None)
+                .backoff_reading()
+                .wait_cap_secs,
+            None,
+            "`0` on the command line has to reach the caller side as «no bound»"
+        );
+        assert_eq!(
+            rig()
+                .with_refusal_wait_cap(Some(std::time::Duration::from_secs(90)))
+                .backoff_reading()
+                .wait_cap_secs,
+            Some(90),
+        );
     }
 
     /// 把一份存档写到临时文件里再读回来——跑表走的就是这条路。

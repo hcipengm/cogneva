@@ -69,6 +69,7 @@ usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <mo
                           [--concurrency-slot <n>] [--admission <dir>]
                           [--admission-floor-unmeasured <n>]
                           [--admission-ceiling-unmeasured <n>]
+                          [--refusal-wait-cap <secs>]
 
   --pins       the pins file: what the data is pinned by, as printed by
                deploy/scripts/fetch-benchmark-data.sh --print-pins
@@ -117,6 +118,16 @@ usage: cogneva eval-table --pins <file> --backbone <model>@<version> --judge <mo
                controller moves it between the
                two bounds below as the host's pressure moves, and only judged cases are ever held
                back.
+  --refusal-wait-cap
+               how long this run is willing to sit through for **one** refusal before it gives up
+               on that call and lets the case fail. Defaults to 600s. `0` means no cap: wait as
+               long as the upstream says. Without a cap, a stated wait longer than the pod's own
+               life is sat out in full, so the run produces no row at all while reading, in the
+               checkpoint and in the process io, exactly like a model that is still generating --
+               that is why the cap exists and why it is not zero by default. The number the
+               upstream stated is never truncated by it: a call that would have to wait longer is
+               refused with the stated seconds attached, and the bound in force is printed in the
+               `refusal-backoff` line of the report.
   --admission-floor-unmeasured
   --admission-ceiling-unmeasured
                the gate's lower and upper bounds. NEITHER HAS BEEN MEASURED on this host: both are
@@ -257,6 +268,8 @@ pub struct EvalTableArgs {
     pub admission_floor_unmeasured: Option<usize>,
     /// 闸门的上界。**未实测**。
     pub admission_ceiling_unmeasured: Option<usize>,
+    /// 一跑肯为**一次**拒绝坐等多久；`None` ＝上游说多久就等多久（`--refusal-wait-cap 0`）。
+    pub refusal_wait_cap: Option<std::time::Duration>,
     pub pins: PathBuf,
     pub tools: ToolArm,
     /// 骨干能不能看图；`None` 是今天唯一能跑的那一臂。
@@ -363,6 +376,9 @@ impl EvalTableArgs {
         let mut admission_dir: Option<PathBuf> = None;
         let mut admission_floor: Option<usize> = None;
         let mut admission_ceiling: Option<usize> = None;
+        // 外面那层 `Some` 是「命令行上说没说」，里面那层是「有没有界」：两者混成一个
+        // `Option` 的话，不给这个参数与给 0（不设界）就分不开了。
+        let mut refusal_wait_cap: Option<Option<std::time::Duration>> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -433,6 +449,18 @@ impl EvalTableArgs {
                 }
                 "--admission-ceiling-unmeasured" => {
                     admission_ceiling = Some(count_arg(args, i, flag)?);
+                    i += 2;
+                }
+                "--refusal-wait-cap" => {
+                    let raw = next_arg(args, i, flag)?;
+                    let secs: u64 = raw.parse().map_err(|e| {
+                        format!("--refusal-wait-cap: `{raw}` is not a count of seconds: {e}")
+                    })?;
+                    refusal_wait_cap = Some(if secs == 0 {
+                        None
+                    } else {
+                        Some(std::time::Duration::from_secs(secs))
+                    });
                     i += 2;
                 }
                 other => return Err(format!("unknown argument: {other}")),
@@ -509,6 +537,8 @@ impl EvalTableArgs {
             admission_dir,
             admission_floor_unmeasured: admission_floor,
             admission_ceiling_unmeasured: admission_ceiling,
+            refusal_wait_cap: refusal_wait_cap
+                .unwrap_or(Some(cog_eval::backoff::DEFAULT_REFUSAL_WAIT_CAP)),
             out,
         })
     }
@@ -1273,7 +1303,9 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
             admission: admission.clone(),
             vision: args.vision.can_see(),
         },
-    );
+    )
+    // 这次跑肯为一次拒绝坐等多久，从命令行一路带到真正打上游的那一层。
+    .with_refusal_wait_cap(args.refusal_wait_cap);
     for scaffold in table_scaffolds(platform) {
         if args.scaffolds.iter().any(|name| name == scaffold.name()) {
             rig = rig.with_scaffold(scaffold);
@@ -1581,12 +1613,18 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
     out.push_str("refusal-backoff\t");
     match &table.backoff {
         Some(b) => out.push_str(&format!(
-            "attempts-per-minute={}\tunstated-wait-secs={}\tattempts={}\trefusals={}\twaited-secs={}\n",
+            "attempts-per-minute={}\tunstated-wait-secs={}\twait-cap-secs={}\tattempts={}\t\
+             refusals={}\twaited-secs={}\trefused-to-wait={}\trefused-wait-secs={}\n",
             b.attempts_per_minute,
             b.default_wait_secs,
+            b.wait_cap_secs
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "none".to_string()),
             b.attempts,
             b.refusals,
-            b.waited_secs
+            b.waited_secs,
+            b.calls_refused_to_wait,
+            b.refused_wait_secs
         )),
         None => out.push_str(
             "unknown: this table was not produced by the eval rig, so the caller-side wait is \
@@ -2235,6 +2273,40 @@ mod tests {
         );
         assert!(!toolathlon_toolkit(false).binds_factory());
         assert!(has_tool_implementations("toolathlon"));
+    }
+
+    /// 命令行上那一截要能说出三种状态，而且**默认不是「不等」**：
+    /// 不给参数＝600 秒，`0` ＝不设界，正数＝那个数。把默认做成「不设界」的话，
+    /// 一次 20 948 秒的拒绝又会把整个 Pod 坐穿，而命令行上看不出少了什么。
+    #[test]
+    fn the_refusal_wait_cap_is_a_bound_the_command_line_states_and_defaults_to_one() {
+        let parsed = EvalTableArgs::parse(&minimal()).unwrap();
+        assert_eq!(
+            parsed.refusal_wait_cap,
+            Some(cog_eval::backoff::DEFAULT_REFUSAL_WAIT_CAP),
+            "a run that says nothing still gets a bound"
+        );
+
+        let mut raw = minimal();
+        raw.extend(["--refusal-wait-cap", "0"].iter().map(|s| s.to_string()));
+        let parsed = EvalTableArgs::parse(&raw).unwrap();
+        assert_eq!(
+            parsed.refusal_wait_cap, None,
+            "`0` is «wait as long as the upstream says», and it must not be confused with \
+             «the flag was not given»"
+        );
+
+        let mut raw = minimal();
+        raw.extend(["--refusal-wait-cap", "90"].iter().map(|s| s.to_string()));
+        assert_eq!(
+            EvalTableArgs::parse(&raw).unwrap().refusal_wait_cap,
+            Some(std::time::Duration::from_secs(90))
+        );
+
+        let mut raw = minimal();
+        raw.extend(["--refusal-wait-cap", "soon"].iter().map(|s| s.to_string()));
+        let err = EvalTableArgs::parse(&raw).unwrap_err();
+        assert!(err.contains("--refusal-wait-cap"), "{err}");
     }
 
     #[test]
@@ -3190,14 +3262,18 @@ mod tests {
         table.backoff = Some(cog_eval::backoff::BackoffReading {
             attempts_per_minute: 600,
             default_wait_secs: 1,
+            wait_cap_secs: Some(600),
             attempts: 9,
             refusals: 7,
             waited_secs: 42,
+            calls_refused_to_wait: 2,
+            refused_wait_secs: 20948,
         });
         let text = render_with(&table, &[]);
         assert!(
             text.contains(
-                "refusal-backoff\tattempts-per-minute=600\tunstated-wait-secs=1\tattempts=9\trefusals=7\twaited-secs=42\n"
+                "refusal-backoff\tattempts-per-minute=600\tunstated-wait-secs=1\twait-cap-secs=600\t\
+                 attempts=9\trefusals=7\twaited-secs=42\trefused-to-wait=2\trefused-wait-secs=20948\n"
             ),
             "wiring must carry the bound, how many calls were made, and how often it bit:\n{text}"
         );

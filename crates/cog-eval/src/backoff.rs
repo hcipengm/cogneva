@@ -5,12 +5,14 @@
 //! 2026-10-19T01:23Z 那一刻，一个窗口翻页造成的四分钟黑障被这种紧循环放大成
 //! 一分钟 455 条拒绝——**请求没有变多，是重试没有间隔**。
 //!
-//! 三条界都是**调用方自己**的，不改网关语义：
+//! 四条界都是**调用方自己**的，不改网关语义：
 //!   * 读到提示就睡到那个时刻。提示可能只以文本形式剩下（错误在层与层之间被压平成
 //!     字符串），所以既读类型化字段也读渲染，读法与产生它的那一处共用同一个记号。
 //!   * 读不到提示也**不许立即重试**：失败之后至少隔 [`DEFAULT_REFUSAL_BACKOFF`]。
 //!   * 同一个调用方一分钟内的尝试次数有上界 [`ATTEMPTS_PER_MINUTE`]：这一条防的不是
 //!     单次退避，而是「很多短促的尝试接连发生」——每一次都合规，合起来仍是风暴。
+//!   * 要等的时刻比一跑肯等的还远时**不等**（[`DEFAULT_REFUSAL_WAIT_CAP`]）：上游
+//!     说的等待可以有几小时，等下去整个跑次就只剩「什么都不做」这一种读数。
 //!
 //! 界是**每一次调用前**问的（`before_call`），所以并发跑的那些任务会一起等：
 //! 一个任务撞上的拒绝，也是其余任务下一次上游调用的时刻。
@@ -23,7 +25,7 @@ use std::time::{Duration, Instant};
 use cog_core::contract::llm::retry_after_hint_in;
 use cog_core::{
     AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, LlmClient, Message,
-    SFResult,
+    SFError, SFResult, UpstreamFailure,
 };
 
 /// 没读到提示时，两次上游尝试之间的最短间隔。
@@ -41,6 +43,21 @@ pub const DEFAULT_REFUSAL_BACKOFF: Duration = Duration::from_secs(1);
 /// 不是正常路径的节流阀；它只在拒绝风暴里咬合。
 pub const ATTEMPTS_PER_MINUTE: usize = 600;
 
+/// 一跑最多肯为**一次**拒绝坐等多久；默认 600 秒。
+///
+/// 上游说的等待可以比这一跑能活的时间更长：2026-10-24 实测网关按池的
+/// `next_attempt` 回 `retry-after: 20948`（5.8 小时），而评测 Pod 2700 秒就被收走。
+/// 坐着等下去的形状是「检查点一行不涨、进程 io 一条不动」——与「模型在长流式生成」
+/// 在读数上同形，于是一次拒绝被读成一整轮停滞，二十天里每一轮都这样收场。
+///
+/// 超过这一截就不再坐着等，而是**当场把这次调用判成被拒绝**：错误里带着上游说的秒数，
+/// 一路走到检查点、报表与退出码上。这不是把上游说的秒数改小——那等于替上游改口，
+/// 紧循环会把一次四分钟的黑障放大成一分钟四百多条请求——是不等。
+///
+/// 600 秒这个数取的是「比实测见过的窗口翻页（约 4 分钟）长、又明显短于一次 Pod 的
+/// 寿命（45 分钟）」，两头都留得下一段。
+pub const DEFAULT_REFUSAL_WAIT_CAP: Duration = Duration::from_secs(600);
+
 /// 一跑里调用侧退避的界，以及它咬合了多少次。随表一起出（`Table::backoff`）。
 ///
 /// 只印界不印次数，「装了退避」与「退避从没生效过」在产物上同形；只印次数不印界，
@@ -52,9 +69,18 @@ pub const ATTEMPTS_PER_MINUTE: usize = 600;
 pub struct BackoffReading {
     pub attempts_per_minute: usize,
     pub default_wait_secs: u64,
+    /// 这一跑肯为一次拒绝坐等多久；`None` ＝上游说多久就等多久。
+    pub wait_cap_secs: Option<u64>,
     pub attempts: u64,
     pub refusals: u64,
     pub waited_secs: u64,
+    /// 有多少次调用是**没有坐等**、当场判成被拒绝的。
+    ///
+    /// 只印 `waited_secs` 时，「等了 20 948 秒」与「拒绝了本来要等 20 948 秒的那一次」
+    /// 在读数上同形，而后者才是这一跑没往下走的原因。
+    pub calls_refused_to_wait: u64,
+    /// 那些调用本来要等到多少秒。它们一秒也没等，所以不进 `waited_secs`。
+    pub refused_wait_secs: u64,
 }
 
 /// 调用侧共享的退避状态。
@@ -73,6 +99,14 @@ pub struct RefusalBackoff {
     /// 实际发出去的调用数。与 `refusals` 同印，才能分开「池子关着」与「退避把正常
     /// 调用压住了」。
     attempts_total: AtomicU64,
+    /// 一跑最多肯坐等多久。`None` ＝上游说多久就等多久。
+    ///
+    /// 放锁里而不是 `Copy` 字段：跑次多半是先建好、再从命令行参数调它，就地换掉这条界
+    /// 比重建一个退避要稳——重建会连同已经记下的拒绝与配额一起丢掉。
+    wait_cap: Mutex<Option<Duration>>,
+    /// 没有坐等、当场判成被拒绝的调用数，以及它们本来要等的秒数。
+    calls_refused_to_wait: AtomicU64,
+    refused_wait_secs: AtomicU64,
 }
 
 impl RefusalBackoff {
@@ -91,7 +125,21 @@ impl RefusalBackoff {
             refusals: AtomicU64::new(0),
             waited_secs: AtomicU64::new(0),
             attempts_total: AtomicU64::new(0),
+            wait_cap: Mutex::new(Some(DEFAULT_REFUSAL_WAIT_CAP)),
+            calls_refused_to_wait: AtomicU64::new(0),
+            refused_wait_secs: AtomicU64::new(0),
         }
+    }
+
+    /// 换掉「肯为一次拒绝坐等多久」这条界。`None` ＝上游说多久就等多久。
+    pub fn with_wait_cap(self, cap: Option<Duration>) -> Self {
+        self.set_wait_cap(cap);
+        self
+    }
+
+    /// 就地换这条界（同 [`Self::with_wait_cap`]，给已经建好、要按参数调整的跑次用）。
+    pub fn set_wait_cap(&self, cap: Option<Duration>) {
+        *self.wait_cap.lock().unwrap() = cap;
     }
 
     /// 记下一次「上游说现在不行」，返回被推迟到多久之后。
@@ -121,13 +169,40 @@ impl RefusalBackoff {
     ///
     /// 等待在**循环里重算**：睡着的这段时间里可能有别的任务把 `next_allowed` 又往后
     /// 推了，醒来不复核就等于按一个已经过期的时刻发请求。
-    pub async fn before_call(&self) {
+    ///
+    /// 要等的时刻超过 [`Self::with_wait_cap`] 给的那一截时，这里**不睡**，交回一个
+    /// 带着上游原话的错误：一次跑不该把整个 Pod 的寿命花在一个它等不到的时刻上，
+    /// 而「坐着等」在检查点与 io 两列读数上与「模型还在生成」同形。
+    pub async fn before_call(&self) -> SFResult<()> {
         loop {
             match self.wait_now() {
-                Some(d) if !d.is_zero() => tokio::time::sleep(d).await,
+                Some(d) if !d.is_zero() => {
+                    let cap = *self.wait_cap.lock().unwrap();
+                    if let Some(cap) = cap {
+                        if d > cap {
+                            // 向上取整，不向下截：报出去的是「上游说的秒数」，少报一秒
+                            // 就是替上游改口；而此刻剩下的时间总是比 `note_refusal` 记下的
+                            // 那一刻略短，直接 `as_secs()` 会把 3600 读成 3599。
+                            let secs = d.as_secs() + u64::from(d.subsec_nanos() > 0);
+                            self.calls_refused_to_wait.fetch_add(1, Ordering::Relaxed);
+                            self.refused_wait_secs.fetch_add(secs, Ordering::Relaxed);
+                            return Err(SFError::upstream_refused_after(
+                                UpstreamFailure::RateLimited,
+                                format!(
+                                    "the upstream asked for another {secs}s; this run refuses to \
+                                     sit through more than {}s for one refusal, so this call is \
+                                     refused now instead of idling the whole run behind it",
+                                    cap.as_secs()
+                                ),
+                                Some(secs),
+                            ));
+                        }
+                    }
+                    tokio::time::sleep(d).await
+                }
                 _ => {
                     self.record_attempt();
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -139,9 +214,12 @@ impl RefusalBackoff {
         BackoffReading {
             attempts_per_minute: self.per_minute,
             default_wait_secs: DEFAULT_REFUSAL_BACKOFF.as_secs(),
+            wait_cap_secs: self.wait_cap.lock().unwrap().map(|d| d.as_secs()),
             attempts: self.attempts_total.load(Ordering::Relaxed),
             refusals,
             waited_secs,
+            calls_refused_to_wait: self.calls_refused_to_wait.load(Ordering::Relaxed),
+            refused_wait_secs: self.refused_wait_secs.load(Ordering::Relaxed),
         }
     }
 
@@ -242,7 +320,7 @@ impl LlmClient for BackoffLlm {
         messages: &[Message],
         options: &ChatOptions,
     ) -> SFResult<AssistantMessageEventStream> {
-        self.backoff.before_call().await;
+        self.backoff.before_call().await?;
         let stream = self.inner.chat_stream(messages, options).await;
         if let Err(e) = &stream {
             self.backoff
@@ -257,7 +335,7 @@ impl LlmClient for BackoffLlm {
         prompt: &str,
         options: &CompleteOptions,
     ) -> SFResult<AssistantMessageEventStream> {
-        self.backoff.before_call().await;
+        self.backoff.before_call().await?;
         let stream = self.inner.complete_stream(prompt, options).await;
         if let Err(e) = &stream {
             self.backoff
@@ -267,7 +345,7 @@ impl LlmClient for BackoffLlm {
     }
 
     async fn chat(&self, messages: &[Message], options: &ChatOptions) -> SFResult<ChatResponse> {
-        self.backoff.before_call().await;
+        self.backoff.before_call().await?;
         match self.inner.chat(messages, options).await {
             Ok(response) => {
                 self.note_if_refused(&response);
@@ -291,7 +369,6 @@ impl LlmClient for BackoffLlm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cog_core::{SFError, UpstreamFailure};
     use std::sync::Mutex;
 
     /// 提示要**真的**被等到：断言的是实际发生的时刻差，不是「记了一个数」。
@@ -301,7 +378,10 @@ mod tests {
         let applied = backoff.note_refusal(Some(1), "");
         assert_eq!(applied, Duration::from_secs(1));
         let before = Instant::now();
-        backoff.before_call().await;
+        backoff
+            .before_call()
+            .await
+            .expect("the waits these cases set are inside the cap");
         assert!(
             before.elapsed() >= Duration::from_secs(1),
             "the next call must not happen before the wait the upstream stated, waited {:?}",
@@ -316,7 +396,10 @@ mod tests {
         let applied = backoff.note_refusal(None, "API error (HTTP 503): no hint here");
         assert_eq!(applied, DEFAULT_REFUSAL_BACKOFF);
         let before = Instant::now();
-        backoff.before_call().await;
+        backoff
+            .before_call()
+            .await
+            .expect("the waits these cases set are inside the cap");
         assert!(
             before.elapsed() >= DEFAULT_REFUSAL_BACKOFF,
             "a refusal without a hint still needs a floor, waited {:?}",
@@ -330,10 +413,19 @@ mod tests {
     async fn the_attempt_window_bounds_a_burst() {
         let window = Duration::from_millis(200);
         let backoff = RefusalBackoff::with_window(2, window);
-        backoff.before_call().await;
-        backoff.before_call().await;
+        backoff
+            .before_call()
+            .await
+            .expect("the waits these cases set are inside the cap");
+        backoff
+            .before_call()
+            .await
+            .expect("the waits these cases set are inside the cap");
         let before = Instant::now();
-        backoff.before_call().await;
+        backoff
+            .before_call()
+            .await
+            .expect("the waits these cases set are inside the cap");
         assert!(
             before.elapsed() >= window.mul_f32(0.8),
             "the third attempt inside the window must wait for the first to age out, waited {:?}",
@@ -348,7 +440,10 @@ mod tests {
         backoff.note_refusal(Some(1), "");
         backoff.note_refusal(Some(0), "");
         let before = Instant::now();
-        backoff.before_call().await;
+        backoff
+            .before_call()
+            .await
+            .expect("the waits these cases set are inside the cap");
         assert!(
             before.elapsed() >= Duration::from_secs(1),
             "a later zero must not undo the deadline an earlier refusal set, waited {:?}",
@@ -427,6 +522,113 @@ mod tests {
             (1, 1),
             "one refusal and one second of wait must be counted for the reading"
         );
+    }
+
+    /// 上游要等的比这一跑肯等的更远时**不等**：当场把这次调用判成被拒绝，
+    /// 错误里带着上游说的秒数，而且一次也不去打扰上游。
+    ///
+    /// 这条界的形状只在「不睡」上看得见：只要它退化成「照旧睡」，这个用例就会
+    /// 在 3600 秒里跑不完——所以它断言的时刻差是硬判据，不是余量。
+    #[tokio::test]
+    async fn a_stated_wait_beyond_the_cap_is_refused_instead_of_waited_out() {
+        struct NeverCalled {
+            calls: Mutex<Vec<Instant>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmClient for NeverCalled {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _options: &ChatOptions,
+            ) -> SFResult<ChatResponse> {
+                self.calls.lock().unwrap().push(Instant::now());
+                Ok(ChatResponse::default())
+            }
+
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _options: &ChatOptions,
+            ) -> SFResult<AssistantMessageEventStream> {
+                self.calls.lock().unwrap().push(Instant::now());
+                unimplemented!("this fixture is only called through `chat`")
+            }
+
+            async fn complete_stream(
+                &self,
+                _prompt: &str,
+                _options: &CompleteOptions,
+            ) -> SFResult<AssistantMessageEventStream> {
+                unimplemented!("this fixture is only called through `chat`")
+            }
+
+            async fn health_check(&self) -> bool {
+                true
+            }
+        }
+
+        let inner = Arc::new(NeverCalled {
+            calls: Mutex::new(Vec::new()),
+        });
+        let backoff = Arc::new(RefusalBackoff::new(ATTEMPTS_PER_MINUTE));
+        let llm = BackoffLlm::new(inner.clone(), backoff.clone());
+
+        backoff.note_refusal(Some(3600), "");
+
+        let before = Instant::now();
+        let verdict = llm.chat(&[], &ChatOptions::default()).await;
+        let elapsed = before.elapsed();
+
+        let err = verdict.expect_err("a wait longer than the cap must refuse this call, not sleep");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the call must come back at once instead of sleeping out the stated wait, took {elapsed:?}"
+        );
+        assert_eq!(
+            err.retry_after_secs(),
+            Some(3600),
+            "the refusal must carry the seconds the upstream itself stated"
+        );
+        assert!(
+            inner.calls.lock().unwrap().is_empty(),
+            "a call refused before it was made must never reach the upstream"
+        );
+
+        let reading = backoff.reading();
+        assert_eq!(
+            reading.wait_cap_secs,
+            Some(DEFAULT_REFUSAL_WAIT_CAP.as_secs())
+        );
+        assert_eq!(
+            reading.calls_refused_to_wait, 1,
+            "the reading must show that one call was refused instead of waited out"
+        );
+        assert_eq!(
+            reading.refused_wait_secs, 3600,
+            "the reading must carry the wait that was declined, not the capped value"
+        );
+    }
+
+    /// 关掉这条界（`None`）时行为回到「上游说多久就等多久」：界是**可关的**，
+    /// 而关掉之后不该还留着「超过某个默认值就拒绝」的半截逻辑。
+    #[tokio::test]
+    async fn without_a_cap_a_long_stated_wait_is_still_waited_out() {
+        let backoff = RefusalBackoff::new(ATTEMPTS_PER_MINUTE).with_wait_cap(None);
+        backoff.note_refusal(Some(2), "");
+        let before = Instant::now();
+        backoff
+            .before_call()
+            .await
+            .expect("with the cap off nothing may refuse the call");
+        assert!(
+            before.elapsed() >= Duration::from_secs(2),
+            "with the cap off the stated wait is still waited, waited {:?}",
+            before.elapsed()
+        );
+        let reading = backoff.reading();
+        assert_eq!(reading.wait_cap_secs, None);
+        assert_eq!(reading.calls_refused_to_wait, 0);
     }
 
     /// 一个**只有 prose** 的拒绝也要被读到：中间层把错误压成字符串之后，
