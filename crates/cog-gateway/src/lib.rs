@@ -95,6 +95,15 @@ pub type SharedLlmClient = Arc<std::sync::RwLock<Option<Arc<dyn cog_core::LlmCli
 /// schema still said the history was kept.
 pub type ChatTurnHandle = Option<Arc<dyn cog_storage::ChatTurnStore>>;
 
+/// Where a command sent to an agent, and the answer it got, are written down.
+///
+/// `None` is a deployment without that database: the send still goes through,
+/// and nothing is written down. The transcript exists so a person can read the
+/// conversation again after the response has scrolled away; a process-local map
+/// in its place would answer that question right up until the next restart and
+/// then answer it wrongly.
+pub type AgentMessageHandle = Option<Arc<dyn cog_storage::AgentMessageStore>>;
+
 /// Consumer names for [`cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL`].
 ///
 /// Each is the loop or task that subscribes to a broadcast channel and can fall
@@ -329,6 +338,9 @@ pub struct GatewayState {
     /// Per-session chat history for the WebSocket chat handler
     /// (session_id → messages, oldest first, capped).
     pub chat_turns: ChatTurnHandle,
+    /// Every command sent to an agent, with what came back. Written by the
+    /// send route, read by the conversation view.
+    pub agent_messages: AgentMessageHandle,
     /// Dataset catalog plus the object store it describes. Absent when either
     /// half is: a catalog with no store could promise bytes it cannot deliver,
     /// and a store with no catalog holds bytes nothing can name.
@@ -650,7 +662,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         )
         .route(
             "/api/v1/agents/{id}/messages",
-            post(agents::send_message_handler),
+            post(agents::send_message_handler).get(agents::conversation_handler),
         )
         .route("/api/v1/agents/{id}/kill", post(agents::kill_handler))
         .route("/api/v1/agents/{id}/restart", post(agents::restart_handler))

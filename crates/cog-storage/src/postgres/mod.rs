@@ -1,3 +1,4 @@
+pub mod agent_message_store;
 pub mod audit_recorder;
 pub mod backup_run_store;
 pub mod change_ledger_store;
@@ -17,6 +18,10 @@ pub mod state_backend;
 pub mod taste_intent_store;
 pub mod user_store;
 
+pub use agent_message_store::{
+    AgentMessage, AgentMessageStore, NewAgentMessage, PostgresAgentMessageStore, SendOutcome,
+    ROWS_KEPT_PER_PEER,
+};
 pub use audit_recorder::PostgresAuditRecorder;
 pub use backup_run_store::PostgresBackupRunStore;
 pub use change_ledger_store::PostgresChangeLedgerStore;

@@ -225,6 +225,7 @@ async fn spawn_app_full(
         llm_usage_reader: None,
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
         chat_turns: None,
+        agent_messages: None,
         datasets: None,
     });
 

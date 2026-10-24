@@ -89,6 +89,12 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             Arc::new(cog_storage::PostgresChatTurnStore::new(pool.clone()))
                 as Arc<dyn cog_storage::ChatTurnStore>
         });
+        // 发给 agent 的话与它回的答案。与聊天记录同一个池，因为它本来就是「谁
+        // 说了什么」的另一种会话；没有这个池时这一趟照发，只是不写下来。
+        let agent_messages: crate::AgentMessageHandle = chat_pool.as_ref().map(|pool| {
+            Arc::new(cog_storage::PostgresAgentMessageStore::new(pool.clone()))
+                as Arc<dyn cog_storage::AgentMessageStore>
+        });
         // 对象存储与它的目录。上传面此前拿到的是 None，于是这条路由在现网永远是
         // 503；即便接上后端，桶里也只有字节、没有一行说它们是什么。两半都在才装：
         // 只有目录会让恢复去取不存在的对象，只有桶则留下谁也点不到名的数据。
@@ -271,6 +277,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &llm_usage_reader,
             &ctx.consume_service::<dyn cog_core::GovernanceStore>(),
             &chat_turns,
+            &agent_messages,
             &object_backend,
             &datasets,
             // 拿不到就是这套部署没有发布停机信号，那它拿到的是一个永不触发的

@@ -61,14 +61,15 @@ pub use mem::{
 
 #[cfg(feature = "postgres")]
 pub use postgres::{
-    sha256_of, ChatTurn, ChatTurnRole, ChatTurnStore, DatasetCatalog, DatasetEntry, HookArchiveRow,
-    NewDataset, PostgresAuditRecorder, PostgresBackupRunStore, PostgresChangeLedgerStore,
-    PostgresChatTurnStore, PostgresDatasetCatalog, PostgresDecisionStatsStore,
-    PostgresGovernanceStore, PostgresHookArchive, PostgresMetricsBackend,
-    PostgresNotificationStore, PostgresObservabilityGateway, PostgresPrincipleLedgerStore,
-    PostgresRawLogIndexStore, PostgresResourceEventStore, PostgresSnapshotStore,
-    PostgresStateBackend, PostgresTasteIntentStore, PostgresUserStore, EVENTS_PAGE_SQL,
-    GAUGE_LATEST_SQL, ROWS_KEPT_PER_SESSION,
+    sha256_of, AgentMessage, AgentMessageStore, ChatTurn, ChatTurnRole, ChatTurnStore,
+    DatasetCatalog, DatasetEntry, HookArchiveRow, NewAgentMessage, NewDataset,
+    PostgresAgentMessageStore, PostgresAuditRecorder, PostgresBackupRunStore,
+    PostgresChangeLedgerStore, PostgresChatTurnStore, PostgresDatasetCatalog,
+    PostgresDecisionStatsStore, PostgresGovernanceStore, PostgresHookArchive,
+    PostgresMetricsBackend, PostgresNotificationStore, PostgresObservabilityGateway,
+    PostgresPrincipleLedgerStore, PostgresRawLogIndexStore, PostgresResourceEventStore,
+    PostgresSnapshotStore, PostgresStateBackend, PostgresTasteIntentStore, PostgresUserStore,
+    SendOutcome, EVENTS_PAGE_SQL, GAUGE_LATEST_SQL, ROWS_KEPT_PER_PEER, ROWS_KEPT_PER_SESSION,
 };
 
 #[cfg(feature = "redis")]

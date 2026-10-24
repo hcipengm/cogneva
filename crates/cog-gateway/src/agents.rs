@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crate::GatewayState;
 use cog_core::{AgentRegistration, ResourceInfo};
+use cog_storage::{NewAgentMessage, SendOutcome};
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
@@ -193,11 +194,41 @@ pub async fn send_message_handler(
     Query(query): Query<MessageQuery>,
     Json(mut msg): Json<cog_core::InboxMessage>,
 ) -> Response {
+    // Who said it, taken from the request rather than invented: this route has
+    // no authenticated caller, so the default names the channel the owner
+    // speaks through instead of guessing at a unit they may not be.
+    let from_unit = query
+        .from
+        .as_deref()
+        .map(str::trim)
+        .filter(|from| !from.is_empty())
+        .unwrap_or(WEBUI_SENDER)
+        .to_string();
+    // Read before delivery: opening the ask rewrites the reply stream on the
+    // message, and the transcript is of what was said, not of what was
+    // rewritten on the way out.
+    let kind = command_name(&msg);
+    let body = command_body(&msg);
+    let sent = Sent {
+        from: &from_unit,
+        to: &agent_id,
+        kind,
+        body: &body,
+    };
+
     // Checked before either delivery path: both of them hand the command to a
     // handler that would publish the answer into that stream and leave it
     // there, because ending it is the asker's job and this route has no asker
     // it knows.
     if let Some(stream) = caller_named_reply_stream(&msg) {
+        record_send(
+            &state,
+            &sent,
+            SendOutcome::Refused,
+            None,
+            Some("the request named its own reply_stream, which this route refuses"),
+        )
+        .await;
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -218,11 +249,12 @@ pub async fn send_message_handler(
     let wait = match ask_window(&msg, query.wait_secs) {
         Ok(wait) => wait,
         Err(e) => {
+            record_send(&state, &sent, SendOutcome::Refused, None, Some(&e)).await;
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": e, "agent_id": agent_id})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -237,6 +269,14 @@ pub async fn send_message_handler(
             // cannot serve this one request even when the agent is in this
             // process: the reply has nowhere to land.
             let Some(backend) = state.message_backend.clone() else {
+                record_send(
+                    &state,
+                    &sent,
+                    SendOutcome::Refused,
+                    None,
+                    Some("message_backend not configured: an answer has nowhere to land"),
+                )
+                .await;
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(serde_json::json!({
@@ -250,11 +290,12 @@ pub async fn send_message_handler(
             match Ask::open(backend, &mut msg, window).await {
                 Ok(ask) => Some(ask),
                 Err(e) => {
+                    record_send(&state, &sent, SendOutcome::Refused, None, Some(&e)).await;
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({"error": e, "agent_id": agent_id})),
                     )
-                        .into_response()
+                        .into_response();
                 }
             }
         }
@@ -265,20 +306,133 @@ pub async fn send_message_handler(
     // refused delivery does not leave one behind.
     let delivered = match deliver(&state, &agent_id, msg).await {
         Ok(delivered) => delivered,
-        Err(response) => return response,
+        Err(response) => {
+            let detail = format!(
+                "delivery was refused before the command reached the agent: HTTP {}",
+                response.status().as_u16()
+            );
+            record_send(&state, &sent, SendOutcome::Refused, None, Some(&detail)).await;
+            return response;
+        }
     };
 
     match ask {
-        None => (
-            StatusCode::ACCEPTED,
+        None => {
+            record_send(&state, &sent, SendOutcome::Queued, None, None).await;
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "queued": true,
+                    "agent_id": agent_id,
+                    "via": delivered.label(),
+                })),
+            )
+                .into_response()
+        }
+        Some(ask) => {
+            let answer = answer_with_reply(agent_id.clone(), delivered, ask).await;
+            record_send(
+                &state,
+                &sent,
+                answer.outcome,
+                answer.reply.as_deref(),
+                answer.detail.as_deref(),
+            )
+            .await;
+            answer.response
+        }
+    }
+}
+
+/// The name the transcript uses for a command sent through this route.
+///
+/// The route is how a person reaches an agent; it deliberately does not invent
+/// a unit name for them, because a transcript that attributes a person's words
+/// to an agent they may not hold would read as something an agent said.
+const WEBUI_SENDER: &str = "webui";
+
+/// Read the conversation with one agent, both directions, oldest first.
+///
+/// The counterpart of the send route: what a person said to an agent and what
+/// it answered, readable after the response has scrolled away. A deployment
+/// with no database says so rather than answering an empty conversation, which
+/// a reader would take as "nothing was ever said".
+pub async fn conversation_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(agent_id): Path<String>,
+    Query(query): Query<ConversationQuery>,
+) -> Response {
+    let Some(store) = state.agent_messages.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "queued": true,
+                "error": "no database is configured for agent conversations: this \
+                          deployment keeps no transcript",
                 "agent_id": agent_id,
-                "via": delivered.label(),
             })),
         )
+            .into_response();
+    };
+    let limit = query
+        .limit
+        .unwrap_or(CONVERSATION_DEFAULT_LIMIT)
+        .min(cog_storage::ROWS_KEPT_PER_PEER as usize);
+    match store.conversation(&agent_id, limit).await {
+        Ok(messages) => {
+            let lines: Vec<MessageView> = messages.iter().map(MessageView::from).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "agent_id": agent_id, "messages": lines })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string(), "agent_id": agent_id})),
+        )
             .into_response(),
-        Some(ask) => answer_with_reply(agent_id, delivered, ask).await,
+    }
+}
+
+/// What a reader may ask a conversation for.
+#[derive(Debug, Deserialize, Default)]
+pub struct ConversationQuery {
+    /// How many lines, newest window first, returned oldest first. Absent means
+    /// the default; above the store's bound is clamped to the bound, because
+    /// asking for more than is kept is not an error -- it is the whole window.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// One line of a conversation as the reader gets it.
+#[derive(Debug, Serialize)]
+pub struct MessageView {
+    pub id: i64,
+    pub from_unit: String,
+    pub to_unit: String,
+    pub kind: String,
+    pub body: String,
+    pub outcome: String,
+    pub reply: Option<String>,
+    pub outcome_detail: Option<String>,
+    /// RFC 3339, so a reader in another timezone can tell when it was said
+    /// without parsing the server's formatting choice.
+    pub created_at: String,
+}
+
+impl From<&cog_storage::AgentMessage> for MessageView {
+    fn from(message: &cog_storage::AgentMessage) -> Self {
+        Self {
+            id: message.id,
+            from_unit: message.from_unit.clone(),
+            to_unit: message.to_unit.clone(),
+            kind: message.kind.clone(),
+            body: message.body.clone(),
+            outcome: message.outcome.as_str().to_string(),
+            reply: message.reply.clone(),
+            outcome_detail: message.outcome_detail.clone(),
+            created_at: message.created_at.to_rfc3339(),
+        }
     }
 }
 
@@ -306,7 +460,14 @@ pub struct MessageQuery {
     /// always done.
     #[serde(default)]
     pub wait_secs: Option<u64>,
+    /// Who is speaking, for the transcript. Absent means a person through the
+    /// WebUI; an agent that sends through this route names itself.
+    #[serde(default)]
+    pub from: Option<String>,
 }
+
+/// How many lines of a conversation a read returns when the caller does not say.
+const CONVERSATION_DEFAULT_LIMIT: usize = 100;
 
 /// Whether this request wants an answer, and why not when it cannot have one.
 ///
@@ -349,6 +510,67 @@ fn command_name(msg: &cog_core::InboxMessage) -> &'static str {
         cog_core::InboxMessage::Continue { .. } => "continue",
         cog_core::InboxMessage::Abort => "abort",
         cog_core::InboxMessage::Reset => "reset",
+    }
+}
+
+/// The words a command carries, for the transcript.
+///
+/// A prompt's payload is a JSON goal, which is the whole of what was said; the
+/// two commands that carry no text answer with their own name so a reader sees
+/// that something happened rather than an empty line.
+fn command_body(msg: &cog_core::InboxMessage) -> String {
+    match msg {
+        cog_core::InboxMessage::Prompt { goal, .. } => match goal {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        },
+        cog_core::InboxMessage::Continue { instruction } => instruction.clone(),
+        cog_core::InboxMessage::Steering { instruction } => instruction.clone(),
+        cog_core::InboxMessage::Abort => "(abort)".into(),
+        cog_core::InboxMessage::Reset => "(reset)".into(),
+    }
+}
+
+/// What was said, before the outcome is known: the four fields every written
+/// line carries whichever way the send ends.
+struct Sent<'a> {
+    from: &'a str,
+    to: &'a str,
+    kind: &'a str,
+    body: &'a str,
+}
+
+/// Write one settled send down, if this deployment has somewhere to write it.
+///
+/// A store that fails does not change the answer the caller is about to get:
+/// the command was delivered or refused already, and a lost transcript line is
+/// not a reason to report the delivery as failed.
+async fn record_send(
+    state: &GatewayState,
+    sent: &Sent<'_>,
+    outcome: SendOutcome,
+    reply: Option<&str>,
+    detail: Option<&str>,
+) {
+    let Some(store) = state.agent_messages.as_ref() else {
+        return;
+    };
+    let message = NewAgentMessage {
+        from_unit: sent.from,
+        to_unit: sent.to,
+        kind: sent.kind,
+        body: sent.body,
+        outcome,
+        reply,
+        outcome_detail: detail,
+    };
+    if let Err(e) = store.record(&message).await {
+        tracing::warn!(
+            to = %sent.to,
+            outcome = outcome.as_str(),
+            error = %e,
+            "could not record a message sent to an agent"
+        );
     }
 }
 
@@ -461,8 +683,16 @@ async fn deliver(
     }
 }
 
+/// One asked exchange: the response to return, and what to write down.
+struct Answer {
+    response: Response,
+    outcome: SendOutcome,
+    reply: Option<String>,
+    detail: Option<String>,
+}
+
 /// Wait for the answer to a delivered prompt and turn it into the response.
-async fn answer_with_reply(agent_id: String, delivered: Delivered, ask: Ask) -> Response {
+async fn answer_with_reply(agent_id: String, delivered: Delivered, ask: Ask) -> Answer {
     let started = std::time::Instant::now();
     let outcome = ask.await_reply().await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -476,46 +706,79 @@ async fn answer_with_reply(agent_id: String, delivered: Delivered, ask: Ask) -> 
         "asked an agent and waited for its answer"
     );
     match outcome {
-        AskOutcome::Replied(reply) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "replied": true,
-                "agent_id": agent_id,
-                "via": delivered.label(),
-                "reply": reply,
-            })),
-        )
-            .into_response(),
-        AskOutcome::TimedOut { waited_secs } => (
-            StatusCode::GATEWAY_TIMEOUT,
-            Json(serde_json::json!({
-                "replied": false,
-                "agent_id": agent_id,
-                "via": delivered.label(),
-                "waited_secs": waited_secs,
-                "error": "the agent did not answer within the wait this request \
-                          asked for; the run itself was not cancelled",
-            })),
-        )
-            .into_response(),
-        AskOutcome::Unreadable { error } => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "replied": false,
-                "agent_id": agent_id,
-                "error": format!("the agent answered with bytes that are not JSON: {error}"),
-            })),
-        )
-            .into_response(),
-        AskOutcome::StreamError { error } => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "replied": false,
-                "agent_id": agent_id,
-                "error": format!("the reply stream failed before an answer arrived: {error}"),
-            })),
-        )
-            .into_response(),
+        AskOutcome::Replied(reply) => {
+            // The answer arrives as parsed JSON; a string answer is what the
+            // agent said, any other shape is kept as its JSON text so the
+            // transcript never drops an answer it does not recognise.
+            let text = match &reply {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            Answer {
+                response: (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "replied": true,
+                        "agent_id": agent_id,
+                        "via": delivered.label(),
+                        "reply": reply,
+                    })),
+                )
+                    .into_response(),
+                outcome: SendOutcome::Replied,
+                reply: Some(text),
+                detail: None,
+            }
+        }
+        AskOutcome::TimedOut { waited_secs } => Answer {
+            response: (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "replied": false,
+                    "agent_id": agent_id,
+                    "via": delivered.label(),
+                    "waited_secs": waited_secs,
+                    "error": "the agent did not answer within the wait this request \
+                              asked for; the run itself was not cancelled",
+                })),
+            )
+                .into_response(),
+            outcome: SendOutcome::TimedOut,
+            reply: None,
+            detail: Some(format!("no answer arrived within {waited_secs}s")),
+        },
+        AskOutcome::Unreadable { error } => Answer {
+            response: (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "replied": false,
+                    "agent_id": agent_id,
+                    "error": format!("the agent answered with bytes that are not JSON: {error}"),
+                })),
+            )
+                .into_response(),
+            outcome: SendOutcome::Failed,
+            reply: None,
+            detail: Some(format!(
+                "the agent answered with bytes that are not JSON: {error}"
+            )),
+        },
+        AskOutcome::StreamError { error } => Answer {
+            response: (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "replied": false,
+                    "agent_id": agent_id,
+                    "error": format!("the reply stream failed before an answer arrived: {error}"),
+                })),
+            )
+                .into_response(),
+            outcome: SendOutcome::Failed,
+            reply: None,
+            detail: Some(format!(
+                "the reply stream failed before an answer arrived: {error}"
+            )),
+        },
     }
 }
 

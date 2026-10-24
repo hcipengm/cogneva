@@ -6,6 +6,7 @@ import { LlmSetupOverlay } from './overlay/LlmSetupOverlay';
 import { TokenUsageOverlay } from './overlay/TokenUsageOverlay';
 import { ActiveAlertsOverlay } from './overlay/ActiveAlertsOverlay';
 import { NotificationsOverlay } from './overlay/NotificationsOverlay';
+import { AgentsOverlay } from './overlay/AgentsOverlay';
 import { useActiveAlerts } from './hooks/useActiveAlerts';
 import { useEventStream } from './hooks/useEventStream';
 import { useNotifications } from './hooks/useNotifications';
@@ -45,6 +46,7 @@ export default function App() {
   const [usageOpen, setUsageOpen] = useState(false);
   const [alertsOpen, setAlertsOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [agentsOpen, setAgentsOpen] = useState(false);
   // 轮询放在 App 层：面板关着的时候它的计数也在更新，否则「有人看才亮」
   // 就还是面板里的一个数。
   const {
@@ -118,6 +120,10 @@ export default function App() {
         />
       )}
 
+      {!USE_MOCK && isAuthenticated && agentsOpen && (
+        <AgentsOverlay onClose={() => setAgentsOpen(false)} />
+      )}
+
       {!USE_MOCK && isAuthenticated && (
         <div className="absolute right-4 top-12 z-10 flex gap-2">
           <button
@@ -138,6 +144,13 @@ export default function App() {
             {notifications.error
               ? '通知 ?'
               : `通知 ${notifications.unreadCount}`}
+          </button>
+          <button
+            onClick={() => setAgentsOpen(true)}
+            className="rounded-lg border border-slate-700/60 bg-slate-900/80 px-3 py-1.5 text-xs text-slate-300 backdrop-blur-sm transition hover:bg-slate-800"
+            title="在岗的 agent 名单与各自的会话"
+          >
+            会话
           </button>
           <button
             onClick={() => setUsageOpen(true)}

@@ -413,3 +413,96 @@ export async function markNotificationRead(id: string): Promise<void> {
 export async function markAllNotificationsRead(): Promise<void> {
   await api.post('/api/v1/notifications/read-all', {});
 }
+
+// ---- 和每个 agent 的会话 -------------------------------------------------
+//
+// 名单、对话、发送三件事都走 `/api/v1/agents`：名单是「谁能被叫到」，对话是
+// 「之前跟它说过什么、它回了什么」，发送是「现在说一句」。对话在服务端按发送
+// 与接收两侧都算进同一个会话，所以这里不需要分开拉两份。
+
+export interface AgentSummary {
+  agent_id: string;
+  role: string;
+  workspace_id: string;
+  hostname: string;
+  pod_ip: string;
+  capabilities: string[];
+  last_heartbeat: string;
+}
+
+export async function listAgents(): Promise<AgentSummary[]> {
+  const page = await api.get<{ agents: AgentSummary[] }>('/api/v1/agents');
+  return page.agents ?? [];
+}
+
+export interface AgentConversationLine {
+  id: number;
+  from_unit: string;
+  to_unit: string;
+  kind: string;
+  body: string;
+  outcome: 'queued' | 'replied' | 'timed_out' | 'refused' | 'failed' | string;
+  reply: string | null;
+  outcome_detail: string | null;
+  created_at: string;
+}
+
+export async function getAgentConversation(
+  agentId: string,
+  limit = 200
+): Promise<AgentConversationLine[]> {
+  const page = await api.get<{ agent_id: string; messages: AgentConversationLine[] }>(
+    `/api/v1/agents/${encodeURIComponent(agentId)}/messages?limit=${limit}`
+  );
+  return page.messages ?? [];
+}
+
+/**
+ * 一句发出去的话，以及它落定的形状。
+ *
+ * 不以抛错表示「没答上来」：等待超时、流断开、名字没人应答，都是这次发送的
+ * 结局，而不是这次调用失败——面板要把结局写在那一行上，而不是弹一个错误框
+ * 让人以为话没发出去。
+ */
+export interface AgentSendOutcome {
+  /** 话送出去了、没有等回答（202）。 */
+  queued: boolean;
+  replied: boolean;
+  reply: string | null;
+  error: string | null;
+}
+
+export async function sendAgentPrompt(
+  agentId: string,
+  prompt: string,
+  waitSecs?: number
+): Promise<AgentSendOutcome> {
+  const query = waitSecs ? `?wait_secs=${waitSecs}` : '';
+  try {
+    const body = await api.post<{ replied?: boolean; reply?: unknown; queued?: boolean }>(
+      `/api/v1/agents/${encodeURIComponent(agentId)}/messages${query}`,
+      { type: 'prompt', goal: prompt }
+    );
+    return {
+      queued: !!body.queued,
+      replied: !!body.replied,
+      reply: body.reply === undefined ? null : String(body.reply),
+      error: null,
+    };
+  } catch (e) {
+    const err = e as { status?: number; message?: string };
+    let message = err?.message?.trim() || `发送失败（HTTP ${err?.status ?? '?'}）`;
+    try {
+      const parsed = JSON.parse(message) as { error?: string };
+      if (parsed.error) message = parsed.error;
+    } catch {
+      // 不是 JSON 就把原文留着：原文本身也是读数。
+    }
+    return {
+      queued: false,
+      replied: false,
+      reply: null,
+      error: message,
+    };
+  }
+}

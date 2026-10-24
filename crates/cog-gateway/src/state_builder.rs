@@ -87,6 +87,7 @@ pub async fn build_gateway_state(
     llm_usage_reader: &Option<Arc<dyn cog_core::LlmUsageReader>>,
     governance_store: &Option<Arc<dyn cog_core::GovernanceStore>>,
     chat_turns: &crate::ChatTurnHandle,
+    agent_messages: &crate::AgentMessageHandle,
     object_backend: &Option<Arc<dyn cog_core::ObjectBackend>>,
     datasets: &Option<Arc<cog_storage::DatasetStore>>,
     shutdown: &cog_core::ShutdownSignal,
@@ -173,6 +174,7 @@ pub async fn build_gateway_state(
         llm_usage_reader: llm_usage_reader.clone(),
         llm_client: Arc::new(std::sync::RwLock::new(None)),
         chat_turns: chat_turns.clone(),
+        agent_messages: agent_messages.clone(),
         datasets: datasets.clone(),
     });
 

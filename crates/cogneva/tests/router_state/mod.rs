@@ -131,7 +131,7 @@ pub fn stateless() -> Arc<GatewayState> {
 pub fn stateless_with_datasets(
     datasets: Option<Arc<cog_storage::DatasetStore>>,
 ) -> Arc<GatewayState> {
-    build(datasets, None, None)
+    build(datasets, None, None, None)
 }
 
 /// The same state, with a queue and a roster behind it.
@@ -144,13 +144,27 @@ pub fn with_messaging(
     backend: Arc<dyn cog_core::MessageBackend>,
     registry: Arc<dyn cog_core::AgentRegistry>,
 ) -> Arc<GatewayState> {
-    build(None, Some(backend), Some(registry))
+    build(None, Some(backend), Some(registry), None)
+}
+
+/// The same state, with somewhere to keep what was said to an agent.
+///
+/// The transcript is handed in rather than assumed: a suite that judges it
+/// needs to read what the route wrote, and a suite that only routes must not
+/// have to name a store it never touches.
+pub fn with_messaging_and_transcript(
+    backend: Arc<dyn cog_core::MessageBackend>,
+    registry: Arc<dyn cog_core::AgentRegistry>,
+    transcript: Arc<dyn cog_storage::AgentMessageStore>,
+) -> Arc<GatewayState> {
+    build(None, Some(backend), Some(registry), Some(transcript))
 }
 
 fn build(
     datasets: Option<Arc<cog_storage::DatasetStore>>,
     message_backend: Option<Arc<dyn cog_core::MessageBackend>>,
     agent_registry: Option<Arc<dyn cog_core::AgentRegistry>>,
+    agent_messages: Option<Arc<dyn cog_storage::AgentMessageStore>>,
 ) -> Arc<GatewayState> {
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
@@ -241,6 +255,7 @@ fn build(
         llm_usage_reader: None,
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
         chat_turns: None,
+        agent_messages,
         datasets,
     })
 }
