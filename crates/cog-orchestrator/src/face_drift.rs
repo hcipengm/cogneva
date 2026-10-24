@@ -140,6 +140,120 @@ pub fn gap_goal_row(reading: &FaceDriftReading, id: String) -> Task {
     row
 }
 
+/// How many faces the present units are holding, for choosing who takes one
+/// more.
+///
+/// Counting faces rather than tasks keeps the answer stable: a face's task
+/// count grows and shrinks with its decomposition, so a unit would be handed a
+/// face for having *finished* work on another one.
+pub fn holdings(
+    readings: &[FaceDriftReading],
+    live: &[String],
+) -> std::collections::BTreeMap<String, usize> {
+    let mut load: std::collections::BTreeMap<String, usize> =
+        live.iter().map(|unit| (unit.clone(), 0)).collect();
+    for reading in readings {
+        if let Some(owner) = reading.owner.as_deref() {
+            if let Some(count) = load.get_mut(owner) {
+                *count += 1;
+            }
+        }
+    }
+    load
+}
+
+/// The unit a face's unstarted work should follow.
+///
+/// A face's owner is a declaration of intent; whether that name answers is a
+/// fact measured from the heartbeat registry on every pass. When it does, the
+/// face stays where it was put. When it does not, the work belongs to whoever
+/// is present -- chosen as the present unit holding the fewest faces, ties by
+/// name so two readers of the same registry pick the same unit -- because the
+/// alternative is work addressed to a session that is gone, which no queue can
+/// hand out and no reading can call busy.
+///
+/// `None` means nobody is present. That is the one situation in which a face
+/// is idle rather than reassigned: there is no unit to give it to, and moving
+/// it would only erase the record of who was asked to do it.
+pub fn reassignment_target(
+    preferred: Option<&str>,
+    live: &[String],
+    load: &std::collections::BTreeMap<String, usize>,
+) -> Option<String> {
+    if live.is_empty() {
+        return None;
+    }
+    if let Some(name) = preferred {
+        if live.iter().any(|unit| unit == name) {
+            return Some(name.to_string());
+        }
+    }
+    live.iter()
+        .min_by(|a, b| {
+            load.get(*a)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&load.get(*b).copied().unwrap_or(0))
+                .then_with(|| a.cmp(b))
+        })
+        .cloned()
+}
+
+/// Hand each face's unstarted work to a unit that is present.
+///
+/// Only unstarted rows move; a run in flight belongs to the session holding
+/// its lease, and taking it away would leave two units claiming one run. The
+/// move is a row rewrite, not a handover: no signature is involved because the
+/// face did not change hands on paper, the unit holding its rows simply left,
+/// and a departed unit cannot sign. The declared owner stays on the face node,
+/// so the measurement -- which already prefers the present unit holding the
+/// work -- reports who is doing the face while the declaration still says who
+/// it was meant for.
+async fn reassign_faces(
+    store: &dyn GovernanceStore,
+    readings: &[FaceDriftReading],
+    live: &[String],
+) {
+    if live.is_empty() {
+        info!(
+            faces = readings.len(),
+            "no unit is present; face work stays where it is and the idle readings are the \
+             truth rather than a dispatch fault"
+        );
+        return;
+    }
+    let mut load = holdings(readings, live);
+    for reading in readings {
+        let Some(target) = reassignment_target(reading.owner.as_deref(), live, &load) else {
+            continue;
+        };
+        // The unit taking this face is now holding one more, so the next face
+        // that needs a home sees the same share this one did.
+        let held = reading.owner.as_deref() == Some(target.as_str());
+        if !held {
+            if let Some(count) = load.get_mut(&target) {
+                *count += 1;
+            }
+        }
+        match store.reassign_face_work(&reading.face_id, &target).await {
+            Ok(0) => {}
+            Ok(moved) => info!(
+                face = %reading.face_id,
+                to = %target,
+                rows = moved,
+                "face work handed to a unit that is present; the unit it named is gone"
+            ),
+            Err(e) => warn!(
+                face = %reading.face_id,
+                to = %target,
+                error = %e,
+                "face work could not be moved to a present unit; the reading still reports the \
+                 face as it stands"
+            ),
+        }
+    }
+}
+
 /// Submit one remediation goal per red face, at most once a day each.
 async fn dispatch_red_faces(
     readings: &[FaceDriftReading],
@@ -245,6 +359,29 @@ pub fn spawn_face_drift_loop(
                         faces = readings.len(),
                         red, "face drift pass read the graph"
                     );
+                    // Who is present decides where work goes. A registry that
+                    // cannot be read is not an empty roster: without it there
+                    // is no way to tell a unit that left from one whose
+                    // heartbeat was briefly unreadable, so no row is moved and
+                    // the reading the pass just took stands as it is.
+                    if let Some(ref registry) = agents {
+                        match registry.list().await {
+                            Ok(registrations) => {
+                                let mut live: Vec<String> = registrations
+                                    .into_iter()
+                                    .map(|registration| registration.agent_id)
+                                    .collect();
+                                live.sort();
+                                live.dedup();
+                                reassign_faces(&*store, &readings, &live).await;
+                            }
+                            Err(e) => warn!(
+                                error = %e,
+                                "the unit registry could not be read; no face work was moved \
+                                 this pass"
+                            ),
+                        }
+                    }
                     if let Some(ref orchestrator) = orchestrator {
                         dispatch_red_faces(&readings, &**orchestrator, now).await;
                     }
@@ -305,7 +442,7 @@ impl Observable for FaceDriftObservable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cog_core::DriftState;
+    use cog_core::{DriftState, TaskStatus};
 
     #[test]
     fn the_goal_id_is_stable_within_a_day_and_changes_with_it() {
@@ -337,6 +474,68 @@ mod tests {
         assert_ne!(
             gap_goal_id("a~5b", "no_owner", "2026-10-19"),
             gap_goal_id("a[", "no_owner", "2026-10-19")
+        );
+    }
+
+    fn units(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// A name the registry answers to keeps the face it was given, even when
+    /// another unit is less loaded: a face that moves for reasons other than
+    /// absence reports a different owner every pass.
+    #[test]
+    fn a_present_owner_keeps_its_face() {
+        let live = units(&["f5", "worker"]);
+        let load = holdings(&[], &live);
+        assert_eq!(
+            reassignment_target(Some("worker"), &live, &load),
+            Some("worker".to_string())
+        );
+    }
+
+    /// The unit holding a departed face's rows is gone. The work goes to a
+    /// unit the registry answers to, chosen by share so one session does not
+    /// collect every face -- otherwise the idle reading would simply move
+    /// rather than close.
+    #[test]
+    fn work_follows_a_unit_that_is_present_when_the_owner_is_gone() {
+        let live = units(&["f5", "worker"]);
+        let mut load = holdings(&[], &live);
+        load.insert("f5".into(), 3);
+
+        assert_eq!(
+            reassignment_target(Some("gone-8b"), &live, &load),
+            Some("worker".to_string()),
+            "the present unit holding fewer faces takes the next one"
+        );
+        assert_eq!(
+            reassignment_target(None, &live, &load),
+            Some("worker".to_string()),
+            "a face with no owner also lands on the present unit with room"
+        );
+    }
+
+    /// Ties resolve by name, so two passes that read the same registry pick the
+    /// same unit and a face does not wander between equal shares.
+    #[test]
+    fn equal_shares_are_broken_by_name_rather_than_by_row_order() {
+        let live = units(&["b-unit", "a-unit"]);
+        let load = holdings(&[], &live);
+        assert_eq!(
+            reassignment_target(None, &live, &load),
+            Some("a-unit".to_string())
+        );
+    }
+
+    /// Nobody present is the one case a face stays idle: there is no unit to
+    /// give the work to, and rewriting the owner would erase the record of who
+    /// was asked.
+    #[test]
+    fn with_nobody_present_the_work_is_left_where_it_is() {
+        assert_eq!(
+            reassignment_target(Some("f5"), &[], &Default::default()),
+            None
         );
     }
 
@@ -387,6 +586,88 @@ mod tests {
         assert_eq!(row.owner_unit, None);
         assert_eq!(row.face_id.as_deref(), Some("task-management"));
         assert!(!row.is_executable);
+    }
+
+    /// Records which faces the pass asked to move, and to whom.
+    #[derive(Default)]
+    struct RecordingStore {
+        moves: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GovernanceStore for RecordingStore {
+        async fn face_nodes(&self) -> SFResult<Vec<Task>> {
+            Ok(Vec::new())
+        }
+        async fn open_face_bound_tasks(&self) -> SFResult<Vec<Task>> {
+            Ok(Vec::new())
+        }
+        async fn save_face_node(&self, _task: &Task) -> SFResult<()> {
+            Ok(())
+        }
+        async fn save_face_node_if_revision(&self, _task: &Task, _expected: i64) -> SFResult<bool> {
+            Ok(false)
+        }
+        async fn governance_nodes(&self, _task_type: &str) -> SFResult<Vec<Task>> {
+            Ok(Vec::new())
+        }
+        async fn save_governance_node(&self, _task: &Task) -> SFResult<()> {
+            Ok(())
+        }
+        async fn save_governance_node_if_status(
+            &self,
+            _task: &Task,
+            _expected: &[TaskStatus],
+        ) -> SFResult<bool> {
+            Ok(false)
+        }
+        async fn save_governance_node_with_event(
+            &self,
+            _event: &Task,
+            _node: &Task,
+            _expected: &[TaskStatus],
+        ) -> SFResult<bool> {
+            Ok(false)
+        }
+        async fn apply_handover(
+            &self,
+            _handover: &Task,
+            _face: &Task,
+            _expected_revision: i64,
+        ) -> SFResult<Option<usize>> {
+            Ok(None)
+        }
+        async fn reassign_face_work(&self, face_id: &str, to_unit: &str) -> SFResult<usize> {
+            self.moves
+                .lock()
+                .expect("the recorder lock is not poisoned")
+                .push((face_id.to_string(), to_unit.to_string()));
+            Ok(0)
+        }
+    }
+
+    /// The pass hands a departed owner's face to a unit that is present, and
+    /// hands nothing anywhere when no unit is present: the second half is what
+    /// keeps "idle" meaning "nobody is here" rather than "the pass did not
+    /// run".
+    #[tokio::test]
+    async fn the_pass_moves_a_gone_owners_face_to_a_present_unit_and_moves_nothing_without_one() {
+        let store = RecordingStore::default();
+        let readings = vec![reading(Some("gone-unit"))];
+
+        reassign_faces(&store, &readings, &["present-unit".to_string()]).await;
+        assert_eq!(
+            store.moves.lock().expect("lock").clone(),
+            vec![("task-management".to_string(), "present-unit".to_string())],
+            "work addressed to a session that is gone is given to the unit that answers"
+        );
+
+        store.moves.lock().expect("lock").clear();
+        reassign_faces(&store, &readings, &[]).await;
+        assert!(
+            store.moves.lock().expect("lock").is_empty(),
+            "nobody present means nobody to hand the face to; the idle reading is the truth"
+        );
     }
 
     #[test]

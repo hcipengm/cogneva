@@ -715,6 +715,17 @@ async fn assign(
                     dag_executor.workspace_id"
             .into());
     }
+    // The governance workspace holds the face nodes themselves, so the drift
+    // reading deliberately skips it; work written there is invisible to the
+    // very reading it was meant to satisfy, and the pass would still report
+    // every face as assigned.
+    if workspace == cog_core::GOVERNANCE_WORKSPACE {
+        return Err(format!(
+            "{workspace} holds the face nodes and is excluded from the drift reading: \
+             assign the work into the workspace the faces are measured in"
+        )
+        .into());
+    }
     let backend = PostgresStateBackend::new(pool.clone());
     let all: Vec<Face> = store
         .face_nodes()
@@ -734,6 +745,7 @@ async fn assign(
         .into());
     }
     let mut assigned = 0usize;
+    let mut rebound = 0usize;
     let mut kept = 0usize;
     let mut vacant = 0usize;
     for face in selected {
@@ -751,7 +763,18 @@ async fn assign(
                 existing.status,
                 TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
             ) {
-                kept += 1;
+                if existing.owner_unit.as_deref() == Some(owner.as_str()) {
+                    kept += 1;
+                    continue;
+                }
+                // The face's owner moved after this row was written, and a
+                // row that keeps the previous name is not "kept work": the
+                // drift reading takes the row as the evidence of who is
+                // doing the face, so it goes on reporting the face as bound
+                // to nobody while a row for it sits in the queue.
+                let moved = rebind_standing_row(existing, &face.face_id, &owner, workspace);
+                backend.dag_set_task(workspace, &id, &moved).await?;
+                rebound += 1;
                 continue;
             }
         }
@@ -783,8 +806,34 @@ async fn assign(
         backend.dag_set_task(workspace, &id, &task).await?;
         assigned += 1;
     }
-    println!("assigned {assigned}, kept {kept}, vacant {vacant} (workspace {workspace})");
+    println!(
+        "assigned {assigned}, rebound {rebound}, kept {kept}, vacant {vacant} \
+         (workspace {workspace})"
+    );
     Ok(())
+}
+
+/// Point an open standing row at the face's current owner.
+///
+/// The owner is written three times into one row: the struct field, the
+/// payload's `owner_unit`, and the executor's `input.owner_unit`. The reading
+/// takes the row's own binding, and the executor hands the goal in `input` to
+/// whoever claims it, so a row whose copies disagree either reads as somebody
+/// else's work or tells the claimer about a unit that no longer owns the face.
+fn rebind_standing_row(mut row: Task, face_id: &str, owner: &str, workspace: &str) -> Task {
+    row.face_id = Some(face_id.to_string());
+    row.owner_unit = Some(owner.to_string());
+    row.workspace_id = Some(workspace.to_string());
+    match row.input.as_object_mut() {
+        Some(input) => {
+            input.insert("face".into(), face_id.into());
+            input.insert("owner_unit".into(), owner.into());
+        }
+        None => {
+            row.input = serde_json::json!({"face": face_id, "owner_unit": owner});
+        }
+    }
+    row
 }
 
 /// What one roster import did, cell by cell.
@@ -1021,6 +1070,49 @@ mod tests {
         assert!(face.spec.has_named_vacancy());
         assert_eq!(face.spec.gap_task_id.as_deref(), Some("SEC-BASELINE"));
         assert_eq!(face.spec.revision, 1);
+    }
+
+    /// A face's owner moves while its standing row stays open. Counting that
+    /// row as "kept" leaves the face bound to the previous name, and the drift
+    /// reading takes the row's binding as its evidence -- so the face keeps
+    /// reporting as bound to nobody while a row for it sits in the queue.
+    #[test]
+    fn a_standing_row_written_before_the_owner_moved_follows_the_face() {
+        let mut stale = Task::new(
+            "face-work-~901a~4fe1",
+            TaskType::DagNode,
+            serde_json::json!({
+                "goal": "keep the face in the target state",
+                "face": "通信",
+                "owner_unit": "operator",
+            }),
+        );
+        stale.face_id = Some("通信".into());
+        stale.owner_unit = Some("operator".into());
+        stale.workspace_id = Some("default".into());
+        let status_before = stale.status;
+
+        let moved = rebind_standing_row(stale, "通信", "f5", "default");
+
+        assert_eq!(moved.owner_unit.as_deref(), Some("f5"));
+        assert_eq!(
+            moved.status, status_before,
+            "rebinding changes who the row belongs to, not how far it got"
+        );
+        assert_eq!(
+            moved.input.get("owner_unit").and_then(|v| v.as_str()),
+            Some("f5"),
+            "the claimer is told from input which unit owns the face: {moved:?}"
+        );
+        assert_eq!(
+            moved.input.get("face").and_then(|v| v.as_str()),
+            Some("通信"),
+            "the row keeps the face it was written for: {moved:?}"
+        );
+        assert!(
+            moved.input.get("goal").and_then(|v| v.as_str()).is_some(),
+            "a rebind must not drop the goal: {moved:?}"
+        );
     }
 
     /// The file the projection writes is the file the import reads, so it has

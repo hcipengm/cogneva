@@ -1124,6 +1124,14 @@ mod tests {
         ) -> cog_core::SFResult<Option<usize>> {
             Ok(None)
         }
+
+        async fn reassign_face_work(
+            &self,
+            _face_id: &str,
+            _to_unit: &str,
+        ) -> cog_core::SFResult<usize> {
+            Ok(0)
+        }
     }
 
     /// Reads what it was given but fails every transactional write, standing
@@ -1194,6 +1202,14 @@ mod tests {
                 expected_revision,
             )
             .await
+        }
+
+        async fn reassign_face_work(
+            &self,
+            _face_id: &str,
+            _to_unit: &str,
+        ) -> cog_core::SFResult<usize> {
+            Err(cog_core::SFError::Database("unreachable".into()))
         }
     }
 

@@ -102,6 +102,10 @@ impl GovernanceStore for Roster {
     ) -> SFResult<Option<usize>> {
         Ok(None)
     }
+
+    async fn reassign_face_work(&self, _face_id: &str, _to_unit: &str) -> SFResult<usize> {
+        Ok(0)
+    }
 }
 
 fn face(face_id: &str, owner: &str, kind: FaceKind) -> Task {

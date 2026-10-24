@@ -126,11 +126,41 @@ const REBIND_FACE_TASKS_SQL: &str = "\
 UPDATE cog_dag_tasks \
    SET task = (task - 'agent_id' - 'lease_owner') || jsonb_build_object( \
                 'owner_unit', $3::text, \
+                'input', CASE WHEN jsonb_typeof(task -> 'input') = 'object' \
+                              THEN jsonb_set(task -> 'input', '{owner_unit}', \
+                                             to_jsonb($3::text), true) \
+                              ELSE task -> 'input' END, \
                 'bound_by_handover_id', $4::text), \
        updated_at = NOW() \
  WHERE workspace_id <> $1 \
    AND task ->> 'face_id' = $2 \
    AND task ->> 'owner_unit' = $5 \
+   AND status IN ('pending', 'scheduled')";
+
+/// Hand one face's unstarted work to a unit that is present.
+///
+/// The same row surgery as a handover's rebind, without the handover: the face
+/// did not change hands on paper, the unit that held its rows is simply gone.
+/// The new owner is written into the row and into the goal payload the claimer
+/// reads, because those two copies are how the executor learns who it is
+/// working for; a row whose copies disagree tells the claimer about a unit
+/// that is not there.
+///
+/// `$3` is compared before writing, so a face whose rows already belong to the
+/// present unit matches nothing and the pass reports zero rows moved rather
+/// than rewriting rows every two minutes.
+const REASSIGN_FACE_WORK_SQL: &str = "\
+UPDATE cog_dag_tasks \
+   SET task = (task - 'agent_id' - 'lease_owner') || jsonb_build_object( \
+                'owner_unit', $3::text, \
+                'input', CASE WHEN jsonb_typeof(task -> 'input') = 'object' \
+                              THEN jsonb_set(task -> 'input', '{owner_unit}', \
+                                             to_jsonb($3::text), true) \
+                              ELSE task -> 'input' END), \
+       updated_at = NOW() \
+ WHERE workspace_id <> $1 \
+   AND task ->> 'face_id' = $2 \
+   AND task ->> 'owner_unit' <> $3 \
    AND status IN ('pending', 'scheduled')";
 
 /// PostgreSQL governance store.
@@ -353,5 +383,25 @@ impl GovernanceStore for PostgresGovernanceStore {
             .await
             .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?;
         Ok(Some(rebound))
+    }
+
+    async fn reassign_face_work(&self, face_id: &str, to_unit: &str) -> SFResult<usize> {
+        let to_unit = to_unit.trim();
+        if to_unit.is_empty() {
+            return Err(SFError::Validation(
+                "reassigning a face's work needs the unit taking it: an empty name would \
+                 leave the rows owned by nobody while claiming they moved"
+                    .into(),
+            ));
+        }
+        let moved = sqlx::query(REASSIGN_FACE_WORK_SQL)
+            .bind(GOVERNANCE_WORKSPACE)
+            .bind(face_id)
+            .bind(to_unit)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("governance reassign face work: {e}")))?
+            .rows_affected() as usize;
+        Ok(moved)
     }
 }

@@ -1495,6 +1495,37 @@ mod tests {
             }
             Ok(Some(rebound))
         }
+
+        async fn reassign_face_work(
+            &self,
+            face_id: &str,
+            to_unit: &str,
+        ) -> cog_core::SFResult<usize> {
+            let mut rows = self.rows.lock().unwrap();
+            let mut moved = 0;
+            for row in rows.iter_mut() {
+                // An ownerless row is already claimable by anybody; moving it
+                // would take work somebody may be about to pick up. Matches the
+                // store, which compares against the owner the row carries.
+                if row.face_id.as_deref() != Some(face_id)
+                    || !row
+                        .owner_unit
+                        .as_deref()
+                        .is_some_and(|owner| owner != to_unit)
+                    || !matches!(
+                        row.status,
+                        cog_core::TaskStatus::Pending | cog_core::TaskStatus::Scheduled
+                    )
+                {
+                    continue;
+                }
+                row.owner_unit = Some(to_unit.to_string());
+                row.agent_id = None;
+                row.lease_owner = None;
+                moved += 1;
+            }
+            Ok(moved)
+        }
     }
 
     fn write_replies(dir: &std::path::Path, pairs: &[(&str, &str)]) {

@@ -443,6 +443,108 @@ async fn applying_a_handover_moves_the_face_and_the_unstarted_work_only() {
     clean(&pool, &prefix).await;
 }
 
+/// A face whose unit left keeps its unstarted work: the rows move to a unit
+/// that is present, in both the row's binding and the goal the claimer reads,
+/// while a run in flight and an ownerless row stay where they are.
+///
+/// The two copies of the owner are the failure this test exists for. The
+/// reading takes the row's binding and the executor hands the claimer the goal
+/// payload; a pass that moved one and not the other would report the face as
+/// reassigned while telling whoever picked it up that it belongs to a unit
+/// that is not there.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn unstarted_face_work_follows_a_unit_that_is_present() {
+    let pool = PgPool::connect(&database_url())
+        .await
+        .expect("connect to the test database");
+    let backend = PostgresStateBackend::new(pool.clone());
+    backend.init_schema().await.expect("init the schema");
+    let store = PostgresGovernanceStore::new(pool.clone());
+
+    let prefix = marker();
+    let face_id = format!("{prefix}:face");
+    let pending = format!("{prefix}:pending");
+    let running = format!("{prefix}:running");
+    let ownerless = format!("{prefix}:ownerless");
+    let workspace = format!("{prefix}-ws");
+
+    store
+        .save_face_node(&face_node(&face_id, "gone-unit", 1))
+        .await
+        .expect("seed the face");
+    for (id, owner, status) in [
+        (&pending, Some("gone-unit"), TaskStatus::Pending),
+        (&running, Some("gone-unit"), TaskStatus::Running),
+        (&ownerless, None, TaskStatus::Pending),
+    ] {
+        let mut row = work(id, owner, Some(&face_id), status);
+        row.input = serde_json::json!({"goal": "hold the face", "owner_unit": owner.unwrap_or("")});
+        backend
+            .dag_set_task(&workspace, id, &row)
+            .await
+            .expect("seed the work");
+    }
+
+    let moved = store
+        .reassign_face_work(&face_id, "present-unit")
+        .await
+        .expect("move the unstarted work");
+    assert_eq!(
+        moved, 1,
+        "only the unstarted row owned by the departed unit moves"
+    );
+
+    let row = backend
+        .dag_get_task(&workspace, &pending)
+        .await
+        .expect("read the pending row")
+        .expect("the pending row is still there");
+    assert_eq!(row.owner_unit.as_deref(), Some("present-unit"));
+    assert_eq!(
+        row.input.get("owner_unit").and_then(|v| v.as_str()),
+        Some("present-unit"),
+        "the claimer is told from the goal who it is working for: {row:?}"
+    );
+    assert_eq!(
+        row.input.get("goal").and_then(|v| v.as_str()),
+        Some("hold the face"),
+        "moving the owner must not rewrite the goal: {row:?}"
+    );
+
+    let running_row = backend
+        .dag_get_task(&workspace, &running)
+        .await
+        .expect("read the running row")
+        .expect("the running row is still there");
+    assert_eq!(
+        running_row.owner_unit.as_deref(),
+        Some("gone-unit"),
+        "a run in flight belongs to the session holding its lease: {running_row:?}"
+    );
+
+    let ownerless_row = backend
+        .dag_get_task(&workspace, &ownerless)
+        .await
+        .expect("read the ownerless row")
+        .expect("the ownerless row is still there");
+    assert_eq!(
+        ownerless_row.owner_unit, None,
+        "a row nobody owns is already claimable and must not be taken: {ownerless_row:?}"
+    );
+
+    assert_eq!(
+        store
+            .reassign_face_work(&face_id, "present-unit")
+            .await
+            .expect("a second pass"),
+        0,
+        "a pass that finds the work already where it belongs writes nothing"
+    );
+
+    clean(&pool, &prefix).await;
+}
+
 /// A stale face revision rolls the whole transaction back: the handover row must
 /// not read as applied while the face still says the old owner.
 #[tokio::test]

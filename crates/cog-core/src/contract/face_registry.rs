@@ -787,6 +787,24 @@ pub trait GovernanceStore: Send + Sync {
         face: &Task,
         expected_revision: i64,
     ) -> SFResult<Option<usize>>;
+
+    /// Move a face's unstarted work to the unit that is present.
+    ///
+    /// The owner named on a face is a declaration of intent; which unit holds
+    /// the face's rows is a fact about who was present when they were written.
+    /// When that unit is gone the rows are offered to nobody -- the shared
+    /// queue hands out only unowned work, and an owned row is offered to its
+    /// owner alone -- so a face whose work was assigned to a departed session
+    /// reads idle forever, even with other units present and able to take it.
+    /// This moves those rows, so the face's duty follows presence rather than
+    /// waiting for a signature from a unit that is no longer there to give one.
+    ///
+    /// A `running` row is left where it is, for the same reason a handover
+    /// leaves it: its lease is what makes it executable, and moving the owner
+    /// under a lease would give two units a claim on the same run.
+    ///
+    /// Returns how many rows moved.
+    async fn reassign_face_work(&self, face_id: &str, to_unit: &str) -> SFResult<usize>;
 }
 
 /// What an import did with one row.
