@@ -1329,10 +1329,12 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
     }
 
     async fn block_census(&self) -> SFResult<Option<Vec<BlockCensus>>> {
-        // One row per face the account knows, including the ones with nothing
-        // in them: a face that vanished from the census reads as a face that
-        // finished, and the whole point of the grouping is to answer "how far
-        // along is this one" without a reader supplying its existence.
+        // One row per face the account actually holds, read off the account
+        // rather than from a list in the code: a face appears when work is
+        // filed under it, and a face declared after this was written needs no
+        // change here to be counted. `none` is always printed even at zero --
+        // it is the count of work no document filed under a face, and that is
+        // a reading in its own right, not the absence of one.
         //
         // The oldest unmeasured age is taken over the owed rows only -- a landed
         // row's measurement stopped being owed work the moment it landed -- and
@@ -1355,34 +1357,44 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                     .map_err(|e| SFError::Database(format!("oldest_unmeasured_secs: {e}")))?,
             ));
         }
-        let mut census = Vec::with_capacity(ChangeBlock::ALL.len());
-        for block in ChangeBlock::ALL {
+        let mut names: Vec<&str> = counted
+            .iter()
+            .map(|(block, _, _, _)| block.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        if !names.contains(&ChangeBlock::NONE.as_str()) {
+            names.insert(0, ChangeBlock::NONE.as_str());
+        }
+        let mut census = Vec::with_capacity(names.len());
+        for name in names {
             let landed = counted
                 .iter()
-                .filter(|(found, state, _, _)| found == block.as_str() && state == "landed")
+                .filter(|(found, state, _, _)| found == name && state == "landed")
                 .map(|(_, _, n, _)| *n)
                 .sum::<i64>();
             let owed = counted
                 .iter()
                 .filter(|(found, state, _, _)| {
-                    found == block.as_str() && state != "landed" && state != "retired"
+                    found == name && state != "landed" && state != "retired"
                 })
                 .map(|(_, _, n, _)| *n)
                 .sum::<i64>();
             let retired = counted
                 .iter()
-                .filter(|(found, state, _, _)| found == block.as_str() && state == "retired")
+                .filter(|(found, state, _, _)| found == name && state == "retired")
                 .map(|(_, _, n, _)| *n)
                 .sum::<i64>();
             let oldest = counted
                 .iter()
                 .filter(|(found, state, _, _)| {
-                    found == block.as_str() && state != "landed" && state != "retired"
+                    found == name && state != "landed" && state != "retired"
                 })
                 .filter_map(|(_, _, _, secs)| *secs)
                 .fold(None::<f64>, |acc, secs| {
                     Some(acc.map_or(secs, |a| a.max(secs)))
                 });
+            let block = ChangeBlock::named(name).map_err(|e| SFError::Database(format!("{e}")))?;
             census.push(BlockCensus {
                 block,
                 landed: landed.max(0) as u64,

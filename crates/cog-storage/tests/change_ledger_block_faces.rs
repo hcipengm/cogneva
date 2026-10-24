@@ -1,25 +1,28 @@
 //! principle: feedback_a_closed_set_copied_into_sql_drifts_from_the_one_that_validates_it
 //!
-//! The face a change is filed under lives in three places that cannot import each
-//! other: the Rust enum the service reads and publishes, the SQL function that
-//! folds the citations into the column, and the CHECK constraints that refuse a
-//! value outside the set. A name added to one and not the others does not fail --
-//! it does something quieter. Added to the enum only, a document naming that face
-//! has its answer folded away by the function and the row reads as "nobody named
-//! a face": the same string the account uses for "nobody was read", so the work
-//! is not merely unfiled, it is indistinguishable from work that was never asked
-//! for. Added to the function only, the generated column produces a value the
-//! CHECK refuses and the whole fold statement fails, which stops every row behind
-//! it rather than the one that named the new face.
+//! The face a change is filed under used to be a closed set living in three
+//! places that cannot import each other: a variant list in the service, an `IN`
+//! list in the SQL function that folds the citations into the column, and two
+//! CHECK constraints. A face added to one and not the others did not fail -- it
+//! did something quieter. Added to the service only, a document naming that face
+//! had its answer folded away and the row read as "nobody named a face". Added
+//! to the function only, the generated column produced a value the CHECK refused
+//! and the fold statement failed, stopping every row behind it.
 //!
-//! So the sets are compared here, across the three places, from the files
-//! themselves. No database is opened -- the migration directory is what the
-//! runner reads, and the enum is what the service reads.
+//! That copy has since been removed rather than kept in step: nothing outside a
+//! document decides which faces exist. What all three still have to agree on is
+//! the *shape* of the value, because the value travels through SQL, JSONB and
+//! metric labels. This checks that agreement from the files themselves -- and
+//! that no list grows back into the fold.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use cog_core::contract::change_ledger::ChangeBlock;
+
+/// The shape migration 087 pins for the column. Taken from the service rather
+/// than written out again here: the point of this test is that the SQL and the
+/// service agree, and a third copy in the test would agree with neither.
+const SHAPE_IN_SQL: &str = ChangeBlock::SHAPE;
 
 fn postgres_migrations() -> PathBuf {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/postgres")).to_path_buf()
@@ -49,73 +52,66 @@ fn latest_definition_of_the_fold() -> (u64, String) {
     best.expect("some migration defines change_ledger_block")
 }
 
-/// The quoted names inside `WHERE entry->>'block' IN (...)`.
-fn names_the_fold_recognises(sql: &str) -> BTreeSet<String> {
-    let start = sql.find("IN ('").expect("the fold has an IN list");
-    let rest = &sql[start + 4..];
-    let end = rest.find(')').expect("the IN list closes");
-    rest[..end]
-        .split(',')
-        .map(|part| part.trim().trim_matches('\'').to_string())
-        .filter(|part| !part.is_empty())
-        .collect()
+/// What the pinned shape accepts, written out once so the Rust rule can be
+/// compared against the same definition rather than against a transcribed set
+/// of names.
+fn the_shape_accepts(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
 }
 
-/// The quoted names across every `block IN (...)` CHECK in the migration.
-fn names_the_constraints_accept(sql: &str) -> Vec<BTreeSet<String>> {
-    let mut found = Vec::new();
-    let mut rest = sql;
-    while let Some(at) = rest.find("CHECK (block IN (") {
-        let after = &rest[at + "CHECK (block IN (".len()..];
-        let end = after.find(')').expect("a CHECK list closes");
-        found.push(
-            after[..end]
-                .split(',')
-                .map(|part| part.trim().trim_matches('\'').to_string())
-                .filter(|part| !part.is_empty())
-                .collect(),
-        );
-        rest = &after[end..];
+#[test]
+fn the_fold_carries_no_list_of_faces() {
+    let (version, sql) = latest_definition_of_the_fold();
+    assert!(
+        !sql.contains("IN ('"),
+        "migration {version} went back to folding against a list of faces; a face declared \
+         after it was written then files its work under `none`, which is the value the \
+         account uses for `nobody named a face`"
+    );
+    // Two constraints, and both are about the shape rather than membership.
+    let checks = sql.matches("CHECK (block ~ '").count();
+    assert_eq!(
+        checks, 2,
+        "migration {version} should set the shape on both the account and the intake"
+    );
+}
+
+#[test]
+fn the_sql_and_the_service_accept_the_same_names() {
+    let (version, sql) = latest_definition_of_the_fold();
+    assert!(
+        sql.contains(SHAPE_IN_SQL),
+        "migration {version} no longer folds on the shape the service validates ({SHAPE_IN_SQL}); \
+         a name one side accepts and the other refuses is either work filed under `none` or a \
+         fold statement that fails every row behind it"
+    );
+    let longest = "a".repeat(64);
+    let too_long = "a".repeat(65);
+    for name in [
+        "tasks",
+        "token",
+        "infra",
+        "a_face_declared_today",
+        "a",
+        "a1_b",
+        &longest,
+    ] {
+        let by_sql = the_shape_accepts(name);
+        let by_service = ChangeBlock::named(name).is_ok();
+        assert!(by_sql, "{name:?} is inside the shape");
+        assert_eq!(by_service, by_sql, "{name:?} is accepted on one side only");
     }
-    found
-}
-
-#[test]
-fn the_fold_recognises_exactly_the_named_faces_the_enum_carries() {
-    let (version, sql) = latest_definition_of_the_fold();
-    let named: BTreeSet<String> = ChangeBlock::ALL
-        .iter()
-        .filter(|block| block.is_named())
-        .map(|block| block.as_str().to_string())
-        .collect();
-    let folded = names_the_fold_recognises(&sql);
-    assert_eq!(
-        folded, named,
-        "migration {version} folds a different set than the enum carries; a face on one side \
-         and not the other files work under `none`, which is the same value the account uses \
-         for `nobody named a face`"
-    );
-}
-
-#[test]
-fn both_constraints_accept_every_value_the_column_can_hold() {
-    let (version, sql) = latest_definition_of_the_fold();
-    let accepted: BTreeSet<String> = ChangeBlock::ALL
-        .iter()
-        .map(|block| block.as_str().to_string())
-        .collect();
-    let checks = names_the_constraints_accept(&sql);
-    assert_eq!(
-        checks.len(),
-        2,
-        "migration {version} should set the closed set on both the account and the intake"
-    );
-    for check in checks {
-        assert_eq!(
-            check, accepted,
-            "migration {version} has a constraint that accepts a different set than the \
-             contract can produce; the generated column writes what the fold answers, so a \
-             name the constraint refuses stops the fold statement rather than the one row"
+    for name in ["Tasks", "1abc", "has space", "端到端演练", &too_long] {
+        assert!(!the_shape_accepts(name), "{name:?} is outside the shape");
+        assert!(
+            ChangeBlock::named(name).is_err(),
+            "{name:?} is outside the shape and must not become a label value"
         );
     }
 }

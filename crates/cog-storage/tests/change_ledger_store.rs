@@ -248,7 +248,7 @@ async fn the_entry_revision_is_written_once_and_never_moved() {
             doc: doc.to_string(),
             verdict: None,
             priority: ChangePriority::Unstated,
-            block: ChangeBlock::None,
+            block: ChangeBlock::NONE,
         },
     };
 
@@ -450,7 +450,7 @@ async fn a_corrected_declaration_reaches_the_accounts_citation_of_its_document()
             doc: doc.clone(),
             verdict: Some(verdict.to_string()),
             priority: ChangePriority::Unstated,
-            block: ChangeBlock::None,
+            block: ChangeBlock::NONE,
         },
     };
 
@@ -542,7 +542,7 @@ async fn a_declarations_band_rides_the_citation_and_the_row_takes_the_highest() 
             doc: doc.to_string(),
             verdict: Some("unlanded".into()),
             priority: band,
-            block: ChangeBlock::None,
+            block: ChangeBlock::NONE,
         },
     };
 
@@ -660,7 +660,7 @@ async fn the_outstanding_read_hands_out_the_most_urgent_band_first() {
             doc: doc.to_string(),
             verdict: Some("unlanded".into()),
             priority: band,
-            block: ChangeBlock::None,
+            block: ChangeBlock::NONE,
         },
     };
     let doc = |id: &ChangeIdentity| format!("docs/{}.md", id.scope.replace('/', "-"));
@@ -787,7 +787,7 @@ async fn a_batch_the_bands_fill_completely_still_asks_the_rows_behind_them() {
             doc: format!("docs/{}.md", id.scope.replace('/', "-")),
             verdict: Some("unlanded".into()),
             priority: band,
-            block: ChangeBlock::None,
+            block: ChangeBlock::NONE,
         },
     };
     // The banded rows carry a band; the ones behind carry none, which is the
@@ -908,7 +908,7 @@ async fn a_freshly_folded_declaration_enters_pending_and_unmeasured() {
                 doc: format!("docs/{marker}.md"),
                 verdict: Some("pending".into()),
                 priority: ChangePriority::Unstated,
-                block: ChangeBlock::None,
+                block: ChangeBlock::NONE,
             },
         }])
         .await
@@ -1442,7 +1442,7 @@ async fn a_demand_is_satisfied_by_a_landing_and_owed_until_one_is_measured() {
                 doc: doc.clone(),
                 verdict: None,
                 priority: ChangePriority::Unstated,
-                block: ChangeBlock::None,
+                block: ChangeBlock::NONE,
             },
         }])
         .await
@@ -1520,7 +1520,7 @@ async fn the_face_census_reads_a_number_for_the_age_and_three_buckets_that_add_u
                 doc: doc.clone(),
                 verdict: None,
                 priority: ChangePriority::Unstated,
-                block: ChangeBlock::Principles,
+                block: ChangeBlock::named("principles").expect("a face name"),
             },
         }])
         .await
@@ -1537,7 +1537,7 @@ async fn the_face_census_reads_a_number_for_the_age_and_three_buckets_that_add_u
         .expect("a Postgres store answers the census");
     let face = census
         .iter()
-        .find(|row| row.block == ChangeBlock::Principles)
+        .find(|row| row.block == ChangeBlock::named("principles").expect("a face name"))
         .unwrap_or_else(|| panic!("the declared face is counted; the census holds {census:?}"));
     assert!(
         face.owed >= 1,
@@ -1550,7 +1550,7 @@ async fn the_face_census_reads_a_number_for_the_age_and_three_buckets_that_add_u
          decode rather than every row in the face having been measured: {face:?}"
     );
     assert!(
-        census.iter().any(|row| row.block == ChangeBlock::None),
+        census.iter().any(|row| row.block == ChangeBlock::NONE),
         "a row whose documents name no face is counted too: a census that dropped \
          the unfiled population would answer about the programme while reading as \
          the whole account: {census:?}"
@@ -1568,6 +1568,98 @@ async fn the_face_census_reads_a_number_for_the_age_and_three_buckets_that_add_u
         .await
         .expect("read the blocking holders")
         .expect("a Postgres store answers the blocking holders");
+
+    cleanup(&pool, &marker).await;
+}
+
+/// A face the code has never heard of is filed and counted by naming it.
+///
+/// The census used to be a list of the faces the service carried, so a face
+/// declared after that list was written could not be counted at all: the fold
+/// did not know the name, the row landed under `none`, and the new face's work
+/// read as work nobody filed. The fix is not a longer list -- the list is gone
+/// on both sides -- so the reading has to be measured from the rows. The name
+/// used here is one nothing in the tree mentions, which is the point: if it
+/// appears in the census with its own count, no edit to the code is needed for
+/// the next face either.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_face_the_code_never_heard_of_is_filed_and_counted_by_naming_it() {
+    let _folder_lock = folder_lock().await;
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "new-face");
+    let doc = format!("{marker}.md");
+    let name = "infra_probe_face";
+
+    store
+        .declare(&[ChangeReading {
+            identity: id.clone(),
+            title: Some("a change filed under a face declared after the code was written".into()),
+            assertion: None,
+            source: ChangeSource {
+                doc: doc.clone(),
+                verdict: None,
+                priority: ChangePriority::Unstated,
+                block: ChangeBlock::named(name).expect("a face name"),
+            },
+        }])
+        .await
+        .expect("queue the declaration");
+    store
+        .fold_declarations(10_000, Some("probe-rev-new-face"))
+        .await
+        .expect("fold the declaration in");
+
+    let stored: String =
+        sqlx::query_scalar("SELECT block FROM change_ledger WHERE kind = $1 AND scope = $2")
+            .bind(&id.kind)
+            .bind(&id.scope)
+            .fetch_one(&pool)
+            .await
+            .expect("read the folded face back");
+    assert_eq!(
+        stored, name,
+        "the folded column keeps the name the document wrote; folding it to `none` files this \
+         face's work as work nobody asked for"
+    );
+
+    let census = store
+        .block_census()
+        .await
+        .expect("read the face census")
+        .expect("a Postgres store answers the census");
+    let face = census
+        .iter()
+        .find(|row| row.block.as_str() == name)
+        .unwrap_or_else(|| panic!("the new face is counted; the census holds {census:?}"));
+    assert!(
+        face.owed >= 1,
+        "a declared change nobody measured is owed on its face: {face:?}"
+    );
+
+    // The census is the account's own set of faces, not a list it carries: the
+    // names it prints are exactly the ones the rows hold, `none` included even
+    // when every row names a face.
+    let named: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT block FROM change_ledger ORDER BY 1")
+            .fetch_all(&pool)
+            .await
+            .expect("read the account's faces");
+    let counted: Vec<String> = census
+        .iter()
+        .map(|row| row.block.as_str().to_string())
+        .collect();
+    for name in &named {
+        assert!(
+            counted.contains(name),
+            "the account holds a row under {name:?} and the census does not print it: {counted:?}"
+        );
+    }
+    assert!(
+        counted.contains(&ChangeBlock::NONE.as_str().to_string()),
+        "the unfiled population is printed even when it is empty, because a zero there is a \
+         reading: {counted:?}"
+    );
 
     cleanup(&pool, &marker).await;
 }

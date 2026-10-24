@@ -1721,7 +1721,7 @@ fn principle_debt_readings(
                 priority: row.priority,
                 // The face, by contrast, this path does know: a principle's
                 // reading is filed under principles and nowhere else.
-                block: ChangeBlock::Principles,
+                block: ChangeBlock::named("principles").expect("a face name"),
             },
         });
     }
@@ -4436,7 +4436,8 @@ async fn publish_block_census(
             cells.push(("oldest_unmeasured_seconds", secs as f64));
         }
         for (reading, value) in cells {
-            if let Err(e) = publish_face_reading(metrics, face.block, reading, value).await {
+            if let Err(e) = publish_face_reading(metrics, face.block.clone(), reading, value).await
+            {
                 warn!(
                     error = %e,
                     block = face.block.as_str(),
@@ -5130,7 +5131,7 @@ mod tests {
                 doc: "2026-10-21_doc.md".into(),
                 verdict: None,
                 priority: band,
-                block: ChangeBlock::None,
+                block: ChangeBlock::NONE,
             }];
             dispatch_task(&handed, 0).priority
         };
@@ -5172,7 +5173,7 @@ mod tests {
             doc: "2026-10-21_doc.md".into(),
             verdict: None,
             priority: ChangePriority::Unstated,
-            block: ChangeBlock::None,
+            block: ChangeBlock::NONE,
         }];
         let quiet = dispatch_task(&owed, 0).priority;
 

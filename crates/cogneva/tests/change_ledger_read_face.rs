@@ -62,7 +62,7 @@ fn row(state: ChangeState, doc: &str, scope: &str) -> ChangeLedgerRow {
             doc: doc.to_string(),
             verdict: Some("adopt".into()),
             priority: ChangePriority::P1,
-            block: ChangeBlock::None,
+            block: ChangeBlock::NONE,
         }],
         first_seen_at: chrono::Utc::now(),
         measured_at: None,

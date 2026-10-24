@@ -347,90 +347,78 @@ impl std::str::FromStr for ChangePriority {
 /// source for the same reason the band does: a grouping is something a document
 /// states about what it is asking for, not something a tree can measure.
 ///
-/// `None` is a member rather than an absence, and so is the case where the
+/// A name rather than a variant list. The faces are declared in the roster and
+/// the account keeps what the documents name; a closed set here would put the
+/// list of faces in this type, in the SQL fold and in two CHECK constraints, and
+/// every declared face would then have to be added to all of them. Those copies
+/// drift in a way that does not fail loudly -- a name the fold does not know is
+/// filed as `none`, which is the same value the account uses for "nobody named
+/// a face", so the new face's work reads as work nobody asked for. The set the
+/// census prints is measured from the rows instead, so a face appears when work
+/// is filed under it and needs no code change to be born.
+///
+/// It is still a shape, not free text: lowercase ASCII, digits and underscores,
+/// starting with a letter. The value travels through SQL, JSONB and metric
+/// labels, and a value that needs quoting differs among the three.
+///
+/// `none` is a member rather than an absence, and so is the case where the
 /// documents disagree. The account cannot pick between two faces a set of
 /// documents names, and guessing one would silently file work under a heading
 /// nobody chose; the count of rows in that state is published beside the
 /// per-face census, so the ambiguity is readable instead of hidden.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ChangeBlock {
-    /// No document that asks for this change named a face.
-    #[default]
-    None,
-    Tasks,
-    Token,
-    Resources,
-    Principles,
-    Change,
-    Persistence,
-    Communication,
-    Security,
-    Install,
-    Observability,
-    Ci,
-    Delivery,
-    Eval,
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ChangeBlock(std::borrow::Cow<'static, str>);
+
+impl Default for ChangeBlock {
+    fn default() -> Self {
+        Self::NONE
+    }
 }
 
 impl ChangeBlock {
-    /// Every block, in the order a reading prints them.
-    ///
-    /// The names are the thirteen faces the programme is organised into, not
-    /// the five cross-cutting lines that run across them: a change is filed
-    /// under one face, and a line that cuts across all of them is a second
-    /// question about the same row rather than a fourteenth answer to this one.
-    /// Filing a row under `leak` or `e2e` would mean the row has to be counted
-    /// twice to stay visible under its own face.
-    ///
-    /// `Eval` is last because it joined last, and because the order is what a
-    /// reading prints: appending keeps every earlier line in the census where a
-    /// reader already looks for it.
-    pub const ALL: [ChangeBlock; 14] = [
-        ChangeBlock::None,
-        ChangeBlock::Tasks,
-        ChangeBlock::Token,
-        ChangeBlock::Resources,
-        ChangeBlock::Principles,
-        ChangeBlock::Change,
-        ChangeBlock::Persistence,
-        ChangeBlock::Communication,
-        ChangeBlock::Security,
-        ChangeBlock::Install,
-        ChangeBlock::Observability,
-        ChangeBlock::Ci,
-        ChangeBlock::Delivery,
-        ChangeBlock::Eval,
-    ];
+    /// No document that asks for this change named a face, or its documents
+    /// named different ones.
+    pub const NONE: ChangeBlock = ChangeBlock(std::borrow::Cow::Borrowed("none"));
 
     /// The literal stored in the account, and the one a reading prints.
-    ///
-    /// ASCII rather than the face names the programme uses, because this is a
-    /// column value and a label value: it travels through SQL, JSONB and metric
-    /// labels, and a value that needs quoting differs between those three.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ChangeBlock::None => "none",
-            ChangeBlock::Tasks => "tasks",
-            ChangeBlock::Token => "token",
-            ChangeBlock::Resources => "resources",
-            ChangeBlock::Principles => "principles",
-            ChangeBlock::Change => "change",
-            ChangeBlock::Persistence => "persistence",
-            ChangeBlock::Communication => "communication",
-            ChangeBlock::Security => "security",
-            ChangeBlock::Install => "install",
-            ChangeBlock::Observability => "observability",
-            ChangeBlock::Ci => "ci",
-            ChangeBlock::Delivery => "delivery",
-            ChangeBlock::Eval => "eval",
-        }
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
-    /// Whether this names a face at all. `None` is the answer to "no document
+    /// Whether this names a face at all. `none` is the answer to "no document
     /// said" and to "the documents disagree", so it cannot be counted as one.
-    pub fn is_named(self) -> bool {
-        self != ChangeBlock::None
+    pub fn is_named(&self) -> bool {
+        self.as_str() != Self::NONE.as_str()
+    }
+
+    /// The shape, written once as text so that the copies of this rule living
+    /// where this crate cannot reach them -- the SQL function, the intake and
+    /// the projection -- can be compared against it instead of against a
+    /// transcription. [`Self::named`] below checks the same shape byte by byte
+    /// rather than by running a regular expression, so the two have to stay in
+    /// step: a test pins both against the same sample names, and the SQL on the
+    /// other side of a database is compared against this string.
+    pub const SHAPE: &str = "^[a-z][a-z0-9_]{0,63}$";
+
+    /// A face name, if it has the shape a column value and a label value can
+    /// carry. The empty string, `-` and `none` all mean "no face".
+    pub fn named(name: &str) -> Result<Self, String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed == "-" || trimmed == Self::NONE.as_str() {
+            return Ok(Self::NONE);
+        }
+        let ok = trimmed.len() <= 64
+            && trimmed.as_bytes()[0].is_ascii_lowercase()
+            && trimmed
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        if !ok {
+            return Err(format!(
+                "a change block is a lowercase ascii name (a-z, 0-9, _), got {name:?}"
+            ));
+        }
+        Ok(ChangeBlock(std::borrow::Cow::Owned(trimmed.to_string())))
     }
 }
 
@@ -438,31 +426,21 @@ impl std::str::FromStr for ChangeBlock {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // The face names the programme is written in are accepted as aliases:
-        // declarations are prose documents first and machine input second, and
-        // a declaration that spells the face the way the owner does is not a
-        // mistake to refuse.
-        let canonical = match s {
-            "tasks" | "任务" | "任务管理" => "tasks",
-            "token" | "token管理" => "token",
-            "resources" | "资源" | "资源管理" => "resources",
-            "principles" | "原则" | "原则管理" => "principles",
-            "change" | "变更" | "变更管理" => "change",
-            "persistence" | "持久化" | "持久化存储" => "persistence",
-            "communication" | "通信" | "通信管理" => "communication",
-            "security" | "安全" | "安全与凭证" => "security",
-            "install" | "安装" | "安装/升级/回滚" => "install",
-            "observability" | "可观测" | "可观测与告警" => "observability",
-            "ci" | "CI" | "CI/构建/部署" => "ci",
-            "delivery" | "交付" | "商用交付" => "delivery",
-            "eval" | "评估" | "可评估" => "eval",
-            "none" | "" | "-" => "none",
-            other => other,
-        };
-        Self::ALL
-            .into_iter()
-            .find(|block| block.as_str() == canonical)
-            .ok_or_else(|| format!("unknown change block: {s}"))
+        Self::named(s)
+    }
+}
+
+impl TryFrom<String> for ChangeBlock {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::named(&value)
+    }
+}
+
+impl From<ChangeBlock> for String {
+    fn from(block: ChangeBlock) -> String {
+        block.0.into_owned()
     }
 }
 
@@ -488,7 +466,7 @@ pub struct ChangeSource {
     /// `jsonb_build_object` the store builds -- carry the same keys.
     #[serde(default)]
     pub priority: ChangePriority,
-    /// The face this document files the change under, or [`ChangeBlock::None`].
+    /// The face this document files the change under, or [`ChangeBlock::NONE`].
     ///
     /// Defaulted for the same reason the band is: a source written before the
     /// column existed was never asked, and refusing to read it would lose the
@@ -585,7 +563,7 @@ impl ChangeLedgerRow {
     }
 
     /// The face to file this change under: the one its documents name, or
-    /// [`ChangeBlock::None`] when none of them name one or they disagree.
+    /// [`ChangeBlock::NONE`] when none of them name one or they disagree.
     ///
     /// Derived from the sources for the same reason the band is: a copy a
     /// writer has to keep in step with the citations goes stale the first time
@@ -597,11 +575,11 @@ impl ChangeLedgerRow {
         let mut named = self
             .sources
             .iter()
-            .map(|source| source.block)
+            .map(|source| &source.block)
             .filter(|block| block.is_named());
         match (named.next(), named.next()) {
-            (Some(only), None) => only,
-            _ => ChangeBlock::None,
+            (Some(only), None) => only.clone(),
+            _ => ChangeBlock::NONE,
         }
     }
 
@@ -614,10 +592,10 @@ impl ChangeLedgerRow {
         let mut distinct = self
             .sources
             .iter()
-            .map(|source| source.block)
-            .filter(|block| block.is_named())
+            .map(|source| source.block.as_str())
+            .filter(|name| *name != ChangeBlock::NONE.as_str())
             .collect::<Vec<_>>();
-        distinct.sort_by_key(|block| block.as_str());
+        distinct.sort_unstable();
         distinct.dedup();
         distinct.len() > 1
     }
@@ -1830,7 +1808,7 @@ mod tests {
                     doc: format!("doc{i}.md"),
                     verdict: None,
                     priority: *band,
-                    block: ChangeBlock::None,
+                    block: ChangeBlock::NONE,
                 })
                 .collect(),
             first_seen_at: Utc::now(),
@@ -1854,51 +1832,35 @@ mod tests {
         );
     }
 
-    /// Every face round-trips, the set is closed, and the names the programme
-    /// is written in are accepted as well as the stored literals: a declaration
-    /// spelled the way the owner speaks it is an answer, not a typo.
+    /// A face name round-trips, and a name nobody has written here yet is a
+    /// face the moment a document names it: the set of faces is measured from
+    /// the account, so a new one needs no edit to this file.
     #[test]
-    fn every_block_round_trips_and_the_programme_names_are_aliases() {
-        for block in ChangeBlock::ALL {
-            assert_eq!(
-                block.as_str().parse::<ChangeBlock>(),
-                Ok(block),
-                "{} did not parse back",
-                block.as_str()
-            );
+    fn a_block_is_any_face_name_and_a_new_face_needs_no_code_change() {
+        for name in [
+            "tasks",
+            "observability",
+            "delivery",
+            "a_face_declared_today",
+        ] {
+            let block = name.parse::<ChangeBlock>().expect("a face name");
+            assert_eq!(block.as_str(), name);
+            assert!(block.is_named());
+            assert_eq!(block.as_str().parse::<ChangeBlock>(), Ok(block));
         }
-        assert_eq!("资源".parse::<ChangeBlock>(), Ok(ChangeBlock::Resources));
-        assert_eq!(
-            "持久化存储".parse::<ChangeBlock>(),
-            Ok(ChangeBlock::Persistence)
-        );
-        assert_eq!("任务管理".parse::<ChangeBlock>(), Ok(ChangeBlock::Tasks));
-        assert_eq!(
-            "安全与凭证".parse::<ChangeBlock>(),
-            Ok(ChangeBlock::Security)
-        );
-        assert_eq!(
-            "安装/升级/回滚".parse::<ChangeBlock>(),
-            Ok(ChangeBlock::Install)
-        );
-        assert_eq!(
-            "可观测与告警".parse::<ChangeBlock>(),
-            Ok(ChangeBlock::Observability)
-        );
-        assert_eq!("CI/构建/部署".parse::<ChangeBlock>(), Ok(ChangeBlock::Ci));
-        assert_eq!("商用交付".parse::<ChangeBlock>(), Ok(ChangeBlock::Delivery));
-        assert_eq!("可评估".parse::<ChangeBlock>(), Ok(ChangeBlock::Eval));
-        assert_eq!("".parse::<ChangeBlock>(), Ok(ChangeBlock::None));
-        assert!("everything".parse::<ChangeBlock>().is_err());
-        // The cross-cutting lines are not faces: a row is filed under one face,
-        // and a lens over all of them cannot be the value of a single column.
+        // The empty string, `-` and `none` are the answer "no document named a
+        // face", which is a member rather than an error.
+        assert_eq!("".parse::<ChangeBlock>(), Ok(ChangeBlock::NONE));
+        assert_eq!("-".parse::<ChangeBlock>(), Ok(ChangeBlock::NONE));
+        assert_eq!("none".parse::<ChangeBlock>(), Ok(ChangeBlock::NONE));
+        assert!(!ChangeBlock::NONE.is_named());
+        // A shape, not free text: the value travels through SQL, JSONB and
+        // metric labels. A Chinese face name is transcribed to its literal by
+        // whoever declares it, and a name that needs quoting is refused here
+        // rather than stored in a form the three cannot agree on.
         assert!("端到端演练".parse::<ChangeBlock>().is_err());
-        // Thirteen named faces and `none`. The count is pinned rather than
-        // derived because the growth of this set has an owner outside the tree:
-        // a face declared in the programme lands here as one more value, and a
-        // variant added without that landing is what this line catches.
-        assert_eq!(ChangeBlock::ALL.len(), 14);
-        assert!(!ChangeBlock::None.is_named());
+        assert!("Tasks".parse::<ChangeBlock>().is_err());
+        assert!("has space".parse::<ChangeBlock>().is_err());
     }
 
     /// A row takes the face its documents named, and a disagreement between
@@ -1919,7 +1881,7 @@ mod tests {
                     doc: format!("doc{i}.md"),
                     verdict: None,
                     priority: ChangePriority::Unstated,
-                    block: *block,
+                    block: block.clone(),
                 })
                 .collect(),
             first_seen_at: Utc::now(),
@@ -1931,17 +1893,19 @@ mod tests {
             retire_reason: None,
             retired_at: None,
         };
+        let token = ChangeBlock::named("token").unwrap();
+        let resources = ChangeBlock::named("resources").unwrap();
 
-        let one = row(&[ChangeBlock::None, ChangeBlock::Token]);
-        assert_eq!(one.block(), ChangeBlock::Token);
+        let one = row(&[ChangeBlock::NONE, token.clone()]);
+        assert_eq!(one.block(), token);
         assert!(!one.block_conflict());
 
-        let silent = row(&[ChangeBlock::None, ChangeBlock::None]);
-        assert_eq!(silent.block(), ChangeBlock::None);
+        let silent = row(&[ChangeBlock::NONE, ChangeBlock::NONE]);
+        assert_eq!(silent.block(), ChangeBlock::NONE);
         assert!(!silent.block_conflict());
 
-        let split = row(&[ChangeBlock::Token, ChangeBlock::Resources]);
-        assert_eq!(split.block(), ChangeBlock::None);
+        let split = row(&[token, resources]);
+        assert_eq!(split.block(), ChangeBlock::NONE);
         assert!(split.block_conflict());
     }
 
