@@ -34,7 +34,7 @@
 //! reason the funnel keeps that value: an unnamed producer is a finding about
 //! the producer, not a gap in the reading.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -124,6 +124,18 @@ impl BuildEnding {
     fn measures_the_work(self) -> bool {
         matches!(self, BuildEnding::Built(_) | BuildEnding::Failed(_))
     }
+
+    /// The wall this ending carries, in seconds, for the rows that carry one.
+    /// A build that never reached cargo has none, and its row says so by leaving
+    /// the field out rather than by reporting zero.
+    fn elapsed_seconds(self) -> Option<f64> {
+        match self {
+            BuildEnding::Built(d) | BuildEnding::Failed(d) | BuildEnding::TimedOut(d) => {
+                Some(d.as_secs_f64())
+            }
+            BuildEnding::Unstarted => None,
+        }
+    }
 }
 
 /// One change kind's readings.
@@ -137,10 +149,22 @@ struct IntentRow {
     counts: BTreeMap<&'static str, u64>,
 }
 
-/// The builds this process ran, by change kind.
+/// How many attempts the in-process window keeps.
+///
+/// The window answers "what has this process been building since it started", not
+/// "what has ever been built"; the latter needs a store, and the reader here is the
+/// face someone looks at while deciding where to spend the next build. A depth that
+/// outlived a restart would have to be written down somewhere, and an unwritten
+/// window that silently drops the oldest row is the shape that lies least.
+pub const BUILD_RUN_WINDOW: usize = 64;
+
+/// The builds this process ran, by change kind, plus the last few as rows.
 #[derive(Debug, Default)]
 pub struct EvolutionBuildReadings {
     rows: Mutex<BTreeMap<&'static str, IntentRow>>,
+    /// 最近 [`BUILD_RUN_WINDOW`] 次尝试，新在前。与计数在同一个锁序里写，所以
+    /// 行数与计数不会互相漂移——两处分别记就会有一个先写一个后写。
+    runs: Mutex<VecDeque<cog_core::BuildRunInfo>>,
 }
 
 impl EvolutionBuildReadings {
@@ -154,7 +178,7 @@ impl EvolutionBuildReadings {
     /// recorded under the `unattributed` value the enum already has for exactly
     /// this, so the time it spent is still on the reading and the producer that
     /// failed to name its change is visible.
-    pub fn record(&self, intent: Option<EvolutionIntent>, ending: BuildEnding) {
+    pub fn record(&self, change_id: &str, intent: Option<EvolutionIntent>, ending: BuildEnding) {
         let key = intent.unwrap_or(EvolutionIntent::Unattributed).as_str();
         // A reading must not be the thing that breaks a build: a poisoned lock
         // means some other thread panicked while holding it, and the counter
@@ -168,6 +192,30 @@ impl EvolutionBuildReadings {
         if ending.measures_the_work() {
             row.last_secs = ending.host_seconds();
         }
+        drop(rows);
+
+        // 同一处写两遍：行与计数出自同一次调用，就不会出现「计数涨了、行没涨」
+        // 这种两个读者各说各话的状态。
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        runs.push_front(cog_core::BuildRunInfo {
+            change_id: change_id.to_string(),
+            intent: key.to_string(),
+            outcome: ending.outcome().to_string(),
+            seconds: ending.elapsed_seconds(),
+            at: chrono::Utc::now(),
+        });
+        while runs.len() > BUILD_RUN_WINDOW {
+            runs.pop_back();
+        }
+    }
+
+    /// 最近 `limit` 次尝试（新在前），不超过窗口深度。
+    pub fn recent_runs(&self, limit: usize) -> Vec<cog_core::BuildRunInfo> {
+        let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        runs.iter()
+            .take(limit.min(BUILD_RUN_WINDOW))
+            .cloned()
+            .collect()
     }
 }
 
@@ -308,6 +356,7 @@ mod tests {
     async fn a_build_moves_only_its_own_change_kind() {
         let readings = EvolutionBuildReadings::new();
         readings.record(
+            "change-ci",
             Some(EvolutionIntent::CiFix),
             BuildEnding::Built(Duration::from_secs(90)),
         );
@@ -343,6 +392,7 @@ mod tests {
     async fn a_killed_build_is_host_time_and_not_a_measurement_of_the_work() {
         let readings = EvolutionBuildReadings::new();
         readings.record(
+            "change-audit",
             Some(EvolutionIntent::SelfAudit),
             BuildEnding::TimedOut(Duration::from_secs(3600)),
         );
@@ -378,7 +428,11 @@ mod tests {
     #[tokio::test]
     async fn a_build_that_never_ran_has_no_seconds() {
         let readings = EvolutionBuildReadings::new();
-        readings.record(Some(EvolutionIntent::IssueFix), BuildEnding::Unstarted);
+        readings.record(
+            "change-fix",
+            Some(EvolutionIntent::IssueFix),
+            BuildEnding::Unstarted,
+        );
         assert_eq!(
             outcome_reading(
                 &readings,
@@ -411,7 +465,11 @@ mod tests {
     #[tokio::test]
     async fn a_build_with_no_change_kind_lands_under_unattributed() {
         let readings = EvolutionBuildReadings::new();
-        readings.record(None, BuildEnding::Failed(Duration::from_secs(30)));
+        readings.record(
+            "change-anon",
+            None,
+            BuildEnding::Failed(Duration::from_secs(30)),
+        );
         assert_eq!(
             outcome_reading(
                 &readings,
@@ -446,7 +504,11 @@ mod tests {
                 "{} is not in BUILD_OUTCOMES",
                 ending.outcome()
             );
-            readings.record(Some(EvolutionIntent::SelfEvolution), ending);
+            readings.record(
+                "change-evolve",
+                Some(EvolutionIntent::SelfEvolution),
+                ending,
+            );
         }
         let mut named: Vec<&str> = endings.iter().map(|e| e.outcome()).collect();
         named.sort_unstable();
@@ -470,5 +532,84 @@ mod tests {
                 "{outcome} was recorded but is not on the scrape"
             );
         }
+    }
+
+    /// 一条变更重试三次是三次尝试，不是一条变更：按变更去重会把重试藏起来，
+    /// 而重试次数正是决定下一次把构建花在哪里的那个数。
+    #[tokio::test]
+    async fn a_retried_change_gets_a_row_per_attempt() {
+        let readings = EvolutionBuildReadings::new();
+        readings.record(
+            "change-1",
+            Some(EvolutionIntent::IssueFix),
+            BuildEnding::Failed(Duration::from_secs(12)),
+        );
+        readings.record(
+            "change-1",
+            Some(EvolutionIntent::IssueFix),
+            BuildEnding::Built(Duration::from_secs(40)),
+        );
+        let runs = readings.recent_runs(10);
+        assert_eq!(runs.len(), 2, "two attempts are two rows");
+        assert!(runs.iter().all(|r| r.change_id == "change-1"));
+        // 新在前：读的人先看到最近那次是否成了。
+        assert_eq!(runs[0].outcome, "built");
+        assert_eq!(runs[1].outcome, "failed");
+        assert_eq!(runs[0].seconds, Some(40.0));
+    }
+
+    /// 没跑起来的构建在行里没有耗时一格，而不是 0——0 读起来像「跑了一瞬间」。
+    #[tokio::test]
+    async fn a_build_that_never_ran_has_no_seconds_in_its_row() {
+        let readings = EvolutionBuildReadings::new();
+        readings.record(
+            "change-2",
+            Some(EvolutionIntent::CiFix),
+            BuildEnding::Unstarted,
+        );
+        let runs = readings.recent_runs(10);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].outcome, OUTCOME_UNSTARTED);
+        assert_eq!(runs[0].seconds, None);
+    }
+
+    /// 没有携带入口的构建在行里读作 unattributed，与计数同一个值：两个读者看
+    /// 同一件事，不该各说各话。
+    #[tokio::test]
+    async fn a_row_without_a_change_kind_says_unattributed() {
+        let readings = EvolutionBuildReadings::new();
+        readings.record(
+            "change-3",
+            None,
+            BuildEnding::Failed(Duration::from_secs(5)),
+        );
+        let runs = readings.recent_runs(10);
+        assert_eq!(runs[0].intent, EvolutionIntent::Unattributed.as_str());
+        assert_eq!(runs[0].seconds, Some(5.0));
+    }
+
+    /// 窗口是有界的：超过深度就丢最老的，且「要多少给多少」不会被窗口外的
+    /// 请求骗出一个更长的列表。
+    #[tokio::test]
+    async fn the_window_keeps_the_newest_rows_and_drops_the_rest() {
+        let readings = EvolutionBuildReadings::new();
+        for i in 0..(BUILD_RUN_WINDOW + 3) {
+            readings.record(
+                &format!("change-{i}"),
+                Some(EvolutionIntent::SelfEvolution),
+                BuildEnding::Built(Duration::from_secs(1)),
+            );
+        }
+        let runs = readings.recent_runs(usize::MAX);
+        assert_eq!(runs.len(), BUILD_RUN_WINDOW);
+        assert_eq!(
+            runs[0].change_id,
+            format!("change-{}", BUILD_RUN_WINDOW + 2)
+        );
+        assert!(
+            runs.iter().all(|r| r.change_id != "change-0"),
+            "the oldest attempt is the one the window drops"
+        );
+        assert_eq!(readings.recent_runs(3).len(), 3);
     }
 }

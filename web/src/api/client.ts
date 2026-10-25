@@ -974,6 +974,37 @@ export async function getEvolutionMetrics(): Promise<EvolutionMetrics> {
   return api.get<EvolutionMetrics>('/api/v1/evolution/metrics');
 }
 
+/**
+ * 一次构建尝试。同一条变更重试三次就是三行——按变更去重会把重试藏起来，
+ * 而重试次数正是决定下一次把构建花在哪里的那个数。
+ */
+export interface BuildRun {
+  change_id: string;
+  /** 变更的入口；生成它的那一侧没有携带时是 `unattributed`。 */
+  intent: string;
+  /** `built` / `failed` / `timed_out` / `unstarted`。 */
+  outcome: string;
+  /** 这次构建占用主机的秒数；`unstarted` 没跑，所以没有这一格而不是 0。 */
+  seconds?: number;
+  at: string;
+}
+
+/**
+ * 构建跑次这次读的出处。窗口是演进进程内存里的，重启清零。
+ *
+ * `attached` 为 false 时 `runs` 恒为空，而那不是「一次都没构建过」：那种情形
+ * 要去看接线，空列表要做的只是什么都不做。
+ */
+export interface BuildRunsView {
+  attached: boolean;
+  limit: number;
+  runs: BuildRun[];
+}
+
+export async function getBuildRuns(): Promise<BuildRunsView> {
+  return api.get<BuildRunsView>('/api/v1/evolution/builds');
+}
+
 export interface EvalDatasetInfo {
   name: string;
   path: string;

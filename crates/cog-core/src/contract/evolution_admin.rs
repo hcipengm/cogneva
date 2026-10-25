@@ -39,6 +39,42 @@ pub struct EvolutionQueueView {
     pub owner: bool,
 }
 
+/// 一次构建尝试：为哪条变更跑的、怎么结束的、花了多久。
+///
+/// 与 `cogneva_evolution_build_*` 那几族计数不是同一件事。计数回答「这类变更一共
+/// 花了多少主机时间」，回答不了「这一次是谁、什么时候、以什么结局结束」。行是**一次
+/// 尝试**：同一条变更重试三次就是三行，按变更去重会把重试藏起来——而重试次数正是
+/// 决定下一次把构建花在哪里的那个数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildRunInfo {
+    /// 这次构建为哪条变更而跑。
+    pub change_id: String,
+    /// 变更的入口，与落地漏斗同一个身份；调用点没有携带时是 `unattributed`。
+    pub intent: String,
+    /// 结局：`built` / `failed` / `timed_out` / `unstarted`。
+    pub outcome: String,
+    /// 这次构建占用主机的秒数。`unstarted` 根本没跑，所以是 `None` 而不是 0——
+    /// 一个 0 读起来像「跑了一瞬间」，与「没跑」是两件事。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<f64>,
+    /// 结局落定的时刻。
+    pub at: DateTime<Utc>,
+}
+
+/// 构建跑次这次读的出处：哪个进程的内存窗口、窗口有多深。
+///
+/// 没有这一格时，一份空的跑次列表在两种情形下长得一样：这个部署器没挂构建读数
+/// （结构上看不到），还是挂着但确实一次都没构建过。它们要做的事相反。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildRunsView {
+    /// 本进程是否挂着构建读数；`false` 时 `runs` 恒为空而那不是「没构建过」。
+    pub attached: bool,
+    /// 窗口里最多留多少行。
+    pub limit: usize,
+    /// 新在前。
+    pub runs: Vec<BuildRunInfo>,
+}
+
 /// Request to evaluate an artifact-level policy candidate against a baseline.
 /// The verdict is gated by a two-proportion z-test;
 /// an `Adopt` verdict does **not** activate the policy — it stages the
@@ -217,6 +253,14 @@ pub trait EvolutionAdmin: Send + Sync {
     /// Default: not supported by this implementation.
     async fn list_events(&self, _limit: usize) -> crate::SFResult<Vec<EvolutionEventInfo>> {
         Err(crate::SFError::NotImplemented("evolution events".into()))
+    }
+
+    /// 本进程最近的构建尝试（新在前），连同这份读数的出处。
+    /// Default: not supported by this implementation.
+    async fn build_runs(&self, _limit: usize) -> crate::SFResult<BuildRunsView> {
+        Err(crate::SFError::NotImplemented(
+            "evolution build runs".into(),
+        ))
     }
 
     /// Evaluate an artifact-level policy candidate (产物级进化).

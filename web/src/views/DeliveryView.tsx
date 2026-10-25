@@ -1,4 +1,4 @@
-import { getDeployments, type DeploymentView } from '@/api/client';
+import { getBuildRuns, getDeployments, type DeploymentView } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
@@ -13,6 +13,15 @@ export function DeliveryView() {
   const deployments = useResource('部署版本', getDeployments, 15_000);
   const report = deployments.data;
   const rows = report?.deployments ?? [];
+
+  const builds = useResource('构建跑次', getBuildRuns, 20_000);
+  const view = builds.data;
+  const runs = view?.runs ?? [];
+  // 表要一个稳定 key，而同一变更的两次尝试可能落在同一秒：带上行号，不靠时间戳
+  // 自己去区分。
+  const runRows = runs.map((run, index) => ({ ...run, key: `${run.change_id}-${run.at}-${index}` }));
+  const built = runs.filter((r) => r.outcome === 'built');
+  const notBuilt = runs.filter((r) => r.outcome !== 'built');
 
   const rolled = rows.filter((d) => d.ready_replicas >= d.desired_replicas && d.updated_replicas >= d.desired_replicas);
   const stuck = rows.filter((d) => !d.conditions.every((c) => c.ok));
@@ -89,14 +98,103 @@ export function DeliveryView() {
       </section>
 
       <section>
-        <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">构建与门禁</h2>
-        <Empty>
-          构建运行与门禁读数还没有服务端来源：这一面先只画部署版本，不画一张没有数据的图。
-          等门禁结果落表之后，这里接的是那批行，不是另起一套心跳。
-        </Empty>
+        <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">构建跑次</h2>
+        {builds.error ? (
+          <ReadError what="构建跑次" error={builds.error} onRetry={builds.refresh} />
+        ) : !view ? (
+          <Loading what="构建跑次" />
+        ) : !view.attached ? (
+          <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
+            这个进程没有挂构建读数：0 行不是「没构建过」，是没人报。上面那张部署版本表
+            还能读，因为那是 apiserver 自己说的话。
+          </p>
+        ) : runs.length === 0 ? (
+          <Empty>挂了读数，但这个进程启动以来还没有构建过——下一次构建结束就会有一行。</Empty>
+        ) : (
+          <>
+            <Readings
+              from={builds}
+              source="GET /api/v1/evolution/builds"
+              caveat="窗口是演进进程内存里的，最多留最近若干次，重启清零：这一格回答的是「这一轮构建过什么」，不是历史。"
+            >
+              <div className="flex flex-wrap py-2">
+                <Reading label="窗口里的跑次" value={runs.length} note={`最多 ${view.limit} 行`} />
+                <Reading
+                  label="成了"
+                  value={built.length}
+                  tone={built.length ? 'ok' : 'plain'}
+                />
+                <Reading
+                  label="没成"
+                  value={notBuilt.length}
+                  tone={notBuilt.length ? 'warn' : 'plain'}
+                  note="失败、超预算被杀、没跑起来的合计"
+                />
+                <Reading
+                  label="涉及变更"
+                  value={new Set(runs.map((r) => r.change_id)).size}
+                  note="同一变更重试会占多行"
+                />
+              </div>
+            </Readings>
+            <Table
+              columns={[
+                { key: 'at', title: '结束于', width: '150px', render: (r) => <Moment iso={r.at} /> },
+                {
+                  key: 'change',
+                  title: '变更',
+                  width: '220px',
+                  render: (r) => <span className="mono text-[11px]">{r.change_id}</span>,
+                },
+                {
+                  key: 'intent',
+                  title: '入口',
+                  width: '120px',
+                  render: (r) => (
+                    <span className="mono text-[11px] text-[var(--muted)]">{r.intent}</span>
+                  ),
+                },
+                {
+                  key: 'outcome',
+                  title: '结局',
+                  width: '100px',
+                  render: (r) => (
+                    <span className="mono text-[11px]" style={{ color: outcomeColor(r.outcome) }}>
+                      {r.outcome}
+                    </span>
+                  ),
+                },
+                {
+                  key: 'seconds',
+                  title: '占用主机',
+                  render: (r) => (
+                    <span className="mono text-[11px]">
+                      {r.seconds === undefined ? '没跑，没有耗时' : `${r.seconds.toFixed(1)} 秒`}
+                    </span>
+                  ),
+                },
+              ]}
+              rows={runRows}
+              rowKey={(r) => r.key}
+            />
+            <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
+              一条变更重试三次是三行：按变更去重会把重试藏起来，而重试次数正是决定下一次
+              把构建花在哪里的那个数。耗时那一格 `unstarted` 留空而不是 0——没跑与跑了一瞬间
+              是两件事。
+            </p>
+          </>
+        )}
       </section>
     </ViewFrame>
   );
+}
+
+/** 行里那一个词的颜色：成了是绿的，被预算杀的是黄的，其余没成的是红的。 */
+function outcomeColor(outcome: string): string {
+  if (outcome === 'built') return 'var(--ok)';
+  if (outcome === 'timed_out') return 'var(--warn)';
+  if (outcome === 'unstarted') return 'var(--muted)';
+  return 'var(--danger)';
 }
 
 /** 条件一条一行。部署的条件与 Pod 不同向：这里 True 都是好消息。 */

@@ -762,6 +762,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/v1/evolution/metrics", get(evolution::metrics_handler))
         .route(
+            "/api/v1/evolution/builds",
+            get(evolution::build_runs_handler),
+        )
+        .route(
             "/api/v1/evolution/rollback",
             post(evolution::rollback_handler),
         )

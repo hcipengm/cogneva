@@ -826,6 +826,24 @@ impl EvolutionAdmin for EvolutionAdminService {
             .collect())
     }
 
+    /// 本进程最近的构建尝试。没挂读数的部署器回「没挂」而不是空列表：空列表在
+    /// 两种情形下长得一样，而它们要做的事相反（一次没构建过，还是这个进程结构上
+    /// 看不到构建）。
+    async fn build_runs(&self, limit: usize) -> SFResult<cog_core::BuildRunsView> {
+        let Some(readings) = self.deployer.build_readings() else {
+            return Ok(cog_core::BuildRunsView {
+                attached: false,
+                limit: crate::evolution_build_readings::BUILD_RUN_WINDOW,
+                runs: Vec::new(),
+            });
+        };
+        Ok(cog_core::BuildRunsView {
+            attached: true,
+            limit: crate::evolution_build_readings::BUILD_RUN_WINDOW,
+            runs: readings.recent_runs(limit),
+        })
+    }
+
     async fn promotion_switch(&self) -> SFResult<cog_core::PromotionSwitchInfo> {
         let Some(ref switch) = self.switch else {
             return Err(SFError::NotImplemented("promotion switch".into()));
@@ -1028,6 +1046,59 @@ mod tests {
         let events = admin.list_events(10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "from-a-previous-process");
+    }
+
+    /// 「这个进程没挂构建读数」与「一次都没构建过」都是空列表，而它们要做的事相反：
+    /// 一个要去看接线，一个什么都不用做。所以读数带着出处一起回，界面上那一格才
+    /// 不会把没接线读成空闲。
+    #[tokio::test]
+    async fn admin_service_tells_no_build_reader_apart_from_no_builds() {
+        // 引擎不 Clone，两套接线各起一个：这一条量的是读数出处，不是引擎共享。
+        let engine = || {
+            let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
+            let mut engine = crate::ReflectionEngine::new_in_memory(registry.clone());
+            let llm: Arc<dyn cog_core::LlmClient> = Arc::new(PlaceholderLlm);
+            engine.evolution = Some(Arc::new(crate::EvolutionEngine::new(llm, registry, None)));
+            engine
+        };
+        let project_root = std::env::current_dir().unwrap();
+        let change_dir =
+            std::env::temp_dir().join(format!("cogneva-test-changes-{}", uuid::Uuid::new_v4()));
+        let binary_dir =
+            std::env::temp_dir().join(format!("cogneva-test-bin-{}", uuid::Uuid::new_v4()));
+        let backup_dir =
+            std::env::temp_dir().join(format!("cogneva-test-backup-{}", uuid::Uuid::new_v4()));
+
+        let bare = crate::EvolutionAdminService::new(
+            Arc::new(engine()),
+            crate::ChangePipeline::new(&project_root, &change_dir, false),
+            crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir),
+            None,
+            None,
+        );
+        let view = bare.build_runs(10).await.unwrap();
+        assert!(!view.attached, "no reader attached must not read as idle");
+        assert!(view.runs.is_empty());
+
+        let readings = Arc::new(crate::evolution_build_readings::EvolutionBuildReadings::new());
+        readings.record(
+            "change-9",
+            Some(cog_core::EvolutionIntent::IssueFix),
+            crate::evolution_build_readings::BuildEnding::Built(std::time::Duration::from_secs(7)),
+        );
+        let wired = crate::EvolutionAdminService::new(
+            Arc::new(engine()),
+            crate::ChangePipeline::new(&project_root, &change_dir, false),
+            crate::EvolutionDeployer::new(&project_root, &binary_dir, &backup_dir)
+                .with_build_readings(readings),
+            None,
+            None,
+        );
+        let view = wired.build_runs(10).await.unwrap();
+        assert!(view.attached);
+        assert_eq!(view.runs.len(), 1);
+        assert_eq!(view.runs[0].change_id, "change-9");
+        assert_eq!(view.runs[0].outcome, "built");
     }
 
     /// 退休把变更挪出队列，也把常驻那一格丢掉；listing 若只读这两处，就会在变更

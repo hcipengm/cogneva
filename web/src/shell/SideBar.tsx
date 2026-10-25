@@ -501,9 +501,13 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             <Row label="版本" note="Deployment 的 revision 注解" />
             <Row label="就绪 / 目标" note="滚动还没走完时会差一截" />
             <Row label="条件" note="Progressing=False 是卡住" />
+            <Row label="构建跑次" note="一次构建一行，同一变更重试就有多行" />
+            <Row label="结局" note="built / failed / timed_out / unstarted" />
             <Note>
-              构建运行与门禁读数还没有服务端来源，这一面只画部署版本。没有数据的那一半写
-              「没有来源」，不画一张空图。
+              上半页读 apiserver：谁在跑第几版。下半页读演进进程：这轮构建过什么、每条
+              怎么结束的。下半页的窗口在演进进程内存里，重启清零，所以它回答的是「这一
+              轮」，不是历史；进程没挂读数时那一格写「没人报」，不写 0——两件事要做的事
+              相反。
             </Note>
           </Section>
           <CrossLinks

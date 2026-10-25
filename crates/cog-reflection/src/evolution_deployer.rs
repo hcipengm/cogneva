@@ -101,13 +101,19 @@ impl EvolutionDeployer {
             .unwrap_or_default()
     }
 
-    fn record_build(&self, intent: Option<EvolutionIntent>, ending: BuildEnding) {
+    fn record_build(&self, change_id: &str, intent: Option<EvolutionIntent>, ending: BuildEnding) {
         if let Ok(mut slot) = self.last_ending.lock() {
             *slot = Some(ending);
         }
         if let Some(readings) = &self.build_readings {
-            readings.record(intent, ending);
+            readings.record(change_id, intent, ending);
         }
+    }
+
+    /// 这几次构建报给了哪一族读数；没挂就是 `None`，与「挂了但一次没构建过」
+    /// 不是一件事，所以这里不拿一个空容器顶上。
+    pub fn build_readings(&self) -> Option<&Arc<EvolutionBuildReadings>> {
+        self.build_readings.as_ref()
     }
 
     pub fn with_target_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -178,7 +184,7 @@ impl EvolutionDeployer {
                     error = %e,
                     "Release build got no slot; commit kept, nothing judged"
                 );
-                self.record_build(intent, BuildEnding::Unstarted);
+                self.record_build(change_id, intent, BuildEnding::Unstarted);
                 return Err(e);
             }
         };
@@ -189,7 +195,9 @@ impl EvolutionDeployer {
 
         info!(change_id = %change_id, "Building release binary");
         let start = Instant::now();
-        let build_result = self.run_cargo_build(workdir, build_slot, intent).await;
+        let build_result = self
+            .run_cargo_build(workdir, build_slot, change_id, intent)
+            .await;
         let duration = start.elapsed();
 
         match build_result {
@@ -296,6 +304,7 @@ impl EvolutionDeployer {
         &self,
         workdir: &Path,
         _slot: Option<crate::build_gate::BuildPermit>,
+        change_id: &str,
         intent: Option<EvolutionIntent>,
     ) -> SFResult<()> {
         let mut cmd = tokio::process::Command::new("cargo");
@@ -317,7 +326,7 @@ impl EvolutionDeployer {
                             // cargo could not be spawned at all, so no build
                             // happened: same class as a build the gate refused,
                             // and no duration is reported for it.
-                            self.record_build(intent, BuildEnding::Unstarted);
+                            self.record_build(change_id, intent, BuildEnding::Unstarted);
                             return Err(SFError::IO(format!("Failed to run cargo build: {}", e)));
                         }
                     };
@@ -340,6 +349,7 @@ impl EvolutionDeployer {
                     // off at, and it is reported as such rather than as a
                     // measurement of the work.
                     self.record_build(
+                        change_id,
                         intent,
                         BuildEnding::TimedOut(Duration::from_secs(self.build_timeout_secs)),
                     );
@@ -351,7 +361,7 @@ impl EvolutionDeployer {
             };
 
         if !output.status.success() {
-            self.record_build(intent, BuildEnding::Failed(started.elapsed()));
+            self.record_build(change_id, intent, BuildEnding::Failed(started.elapsed()));
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SFError::Agent(format!(
@@ -359,7 +369,7 @@ impl EvolutionDeployer {
                 stdout, stderr
             )));
         }
-        self.record_build(intent, BuildEnding::Built(started.elapsed()));
+        self.record_build(change_id, intent, BuildEnding::Built(started.elapsed()));
         Ok(())
     }
 
@@ -482,7 +492,7 @@ mod tests {
             .with_build_timeout(1);
 
         let err = deployer
-            .run_cargo_build(root.path(), None, None)
+            .run_cargo_build(root.path(), None, "change-budget-probe", None)
             .await
             .expect_err("a build that cannot finish in a second must not be waited on");
 

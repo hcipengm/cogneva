@@ -148,6 +148,33 @@ pub async fn deploy_change_handler(
     }
 }
 
+/// 构建跑次：每一次为哪条变更构建、怎么结束的、花了多久。
+///
+/// 与 `/metrics` 那几族计数并排读：计数说这类变更一共花了多少主机时间，行说
+/// 这一次是谁、什么时候、以什么结局结束。窗口是演进进程内存里的，重启清零，
+/// 所以这一格回答的是「这一轮构建过什么」，不是「历史」。
+pub async fn build_runs_handler(State(state): State<Arc<crate::GatewayState>>) -> Response {
+    match state.evolution_admin {
+        Some(ref admin) => match admin.build_runs(BUILD_RUN_ROWS_ASKED).await {
+            Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+            Err(e) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "build_runs_unavailable", "message": e.to_string()})),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "evolution_admin_not_configured"})),
+        )
+            .into_response(),
+    }
+}
+
+/// 这一面一次要多少行。窗口本身比较浅，这个数比窗口大，意思是「把整个窗口都给我」，
+/// 而不是「只要最新的这么多」。
+const BUILD_RUN_ROWS_ASKED: usize = 200;
+
 /// Return the current self-evolution counters from the D5 observable metrics.
 pub async fn metrics_handler(State(state): State<Arc<crate::GatewayState>>) -> Response {
     let mut snapshot = EvolutionMetricsSnapshot {
