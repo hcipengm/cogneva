@@ -99,18 +99,25 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+          # 探针预算显式给出：kubelet 对 timeoutSeconds 默认 1 秒、failureThreshold 默认 3 次，
+          # 省略就等于按空闲节点取值；共址构建把节点 load 拉到 20+ 时，1 秒的默认会把好好的
+          # Pod 判死重启。
           readinessProbe:
             httpGet:
               path: /-/healthy
               port: http
             initialDelaySeconds: 3
             periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /-/healthy
               port: http
             initialDelaySeconds: 10
             periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
           resources:
             requests:
               cpu: 10m
