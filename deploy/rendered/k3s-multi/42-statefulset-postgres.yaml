@@ -111,8 +111,13 @@ spec:
           # 读数会永远显示"没有序列"——而"没有序列"和"事务都很短"在面板上是同一个
           # 样子。只开这一族，不放开默认之外的其他 opt-in（每一族都是每次抓取多跑
           # 一遍的查询）。
+          # 旗标名随 exporter 版本走：v0.15 把这一族叫 `stat_activity_autovacuum`
+          # （`--collector.stat_activity` 在这个版本里不存在，传了会在启动时以
+          # "unknown long flag" 退出，而它退出会让整个 Pod 不 Ready——库本身还活着，
+          # Service 却因此没有端点）。换版本时要按镜像的 `--help` 重核这个名字，
+          # 不按这里的字面照抄。
           args:
-            - "--collector.stat_activity"
+            - "--collector.stat_activity_autovacuum"
           ports:
             - name: pg-metrics
               containerPort: 9187
