@@ -70,11 +70,7 @@ function ClusterRow({ cluster, collectedAt }: { cluster: TopologyCluster; collec
           节点 {ready}/{cluster.nodes.length} 就绪 · Pod {pods}
           {cluster.unscheduled.length > 0 && ` · 未落节点 ${cluster.unscheduled.length}`}
         </span>
-        {!cluster.metrics_available && (
-          <span className="text-[11px]" style={{ color: 'var(--muted)' }}>
-            没有 metrics-server：只显示申报量，实际用量未知
-          </span>
-        )}
+        <UsageSourceNote source={cluster.usage_source} />
         <span className="mono ml-auto text-[10px] text-[var(--muted)]">
           {new Date(collectedAt).toLocaleTimeString('zh-CN')} 读
         </span>
@@ -110,10 +106,47 @@ function ClusterRow({ cluster, collectedAt }: { cluster: TopologyCluster; collec
   );
 }
 
+/**
+ * 用量的来源要说出来，因为两个来源的读数不是一回事：metrics-server 是它自己按
+ * 15 秒采样的结果，kubelet 的 summary 是这台机器当下的读数。读不到的时候说清缺
+ * 什么权限，而不是让读者以为「用量是 0」。
+ */
+function UsageSourceNote({ source }: { source: TopologyCluster['usage_source'] }) {
+  if (source === 'metrics-server') {
+    return <span className="text-[11px] text-[var(--muted)]">用量来自 metrics-server</span>;
+  }
+  if (source === 'kubelet-summary') {
+    return (
+      <span className="text-[11px] text-[var(--muted)]">
+        用量来自 kubelet 的 summary 接口（这个集群没装 metrics-server，不影响读数）
+      </span>
+    );
+  }
+  return (
+    <span className="text-[11px]" style={{ color: 'var(--warn)' }}>
+      读不到实际用量：没有 metrics-server，kubelet 的 summary 也读不了（要 nodes/stats 读权限）。下面只有申报量
+    </span>
+  );
+}
+
+/** 压力条件为真是坏消息，Ready 为真才是好消息——同一份条件，两个方向。 */
+function pressureWarnings(node: TopologyNode): string[] {
+  return node.conditions
+    .filter((condition) =>
+      condition.kind === 'Ready' ? !condition.ok : condition.kind.endsWith('Pressure') && condition.ok
+    )
+    .map((condition) =>
+      condition.kind === 'Ready'
+        ? '节点 NotReady'
+        : `${condition.kind}${condition.reason ? `：${condition.reason}` : ''}`
+    );
+}
+
 function NodeCard({ node }: { node: TopologyNode }) {
   const [open, setOpen] = useState(false);
   const cpuPercent = ratio(node.cpu_requested_millicores, node.cpu_allocatable_millicores);
   const memoryPercent = ratio(node.memory_requested_bytes, node.memory_allocatable_bytes);
+  const pressures = pressureWarnings(node);
 
   return (
     <div className="bg-[var(--ink-900)]">
@@ -162,6 +195,11 @@ function NodeCard({ node }: { node: TopologyNode }) {
             ))
           )}
         </div>
+      )}
+      {pressures.length > 0 && (
+        <p className="px-3 pb-1 text-[10px]" style={{ color: 'var(--danger)' }}>
+          {pressures.join(' · ')}：这个节点在驱逐 Pod，光看申报量看不出来。
+        </p>
       )}
       {!open && (cpuPercent >= 0.9 || memoryPercent >= 0.9) && (
         <p className="px-3 pb-2 text-[10px]" style={{ color: 'var(--warn)' }}>

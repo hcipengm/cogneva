@@ -1083,6 +1083,8 @@ export interface TopologyNode {
   memory_requested_bytes: number;
   cpu_used_millicores: number | null;
   memory_used_bytes: number | null;
+  /** Ready / MemoryPressure / DiskPressure …：压力条件为 true 才是坏消息。 */
+  conditions: TopologyCondition[];
   pods: TopologyPod[];
 }
 
@@ -1092,8 +1094,11 @@ export interface TopologyCluster {
   reachable: boolean;
   error: string | null;
   version: string | null;
-  /** 这个集群有没有 metrics-server；false 时所有用量字段都是 null。 */
-  metrics_available: boolean;
+  /**
+   * 实际用量这一次从哪儿读到的：metrics-server / kubelet-summary / null（都读不到）。
+   * 为 null 时所有用量字段都是 null——「不知道」不是「用了 0」。
+   */
+  usage_source: 'metrics-server' | 'kubelet-summary' | null;
   nodes: TopologyNode[];
   unscheduled: TopologyPod[];
 }

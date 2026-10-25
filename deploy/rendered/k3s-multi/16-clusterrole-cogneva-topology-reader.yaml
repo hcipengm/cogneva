@@ -30,3 +30,12 @@ rules:
   - apiGroups: ["metrics.k8s.io"]
     resources: ["nodes"]
     verbs: ["get", "list"]
+  # 没有 metrics-server 时的用量来源：kubelet 自带的 summary 接口，经 apiserver
+  # 代理读（`/api/v1/nodes/<节点>/proxy/stats/summary`）。apiserver 按路径把代理
+  # 请求映射到子资源，`/stats/*` 落到 `nodes/stats`，只读。
+  #
+  # 这里刻意不要 `nodes/proxy`：那一项连同 exec、run 一起授权，而这一面只需要读
+  # 用量。多一个只读子资源，就少一条能进任何 Pod 的路径。
+  - apiGroups: [""]
+    resources: ["nodes/stats"]
+    verbs: ["get"]

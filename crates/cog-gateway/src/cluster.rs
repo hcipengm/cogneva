@@ -115,9 +115,9 @@ pub struct ClusterView {
     pub reachable: bool,
     pub error: Option<String>,
     pub version: Option<String>,
-    /// 这个集群有没有 metrics-server。`false` 时所有用量字段都是 `None`，
-    /// 界面要说明白「只看到申报量」，而不是画一条零的线。
-    pub metrics_available: bool,
+    /// 实际用量这一次是从哪儿读到的：`metrics-server`、`kubelet-summary`，
+    /// 或者 `None`（两个来源都读不到，界面要说明白「只有申报量」，不能画一条零线）。
+    pub usage_source: Option<String>,
     pub nodes: Vec<NodeView>,
     /// 没有落到任何节点上的 Pod（待调度、或节点被删）。它们不出现在任何节点下，
     /// 但还是集群里的事实，不能因为画不出来就消失。
@@ -137,6 +137,9 @@ pub struct NodeView {
     /// 节点上所有 Pod 的实际用量之和（来自 metrics-server）。
     pub cpu_used_millicores: Option<u64>,
     pub memory_used_bytes: Option<u64>,
+    /// Ready / MemoryPressure / DiskPressure / PIDPressure。压力条件为真时是坏事，
+    /// 与 Pod 的条件语义相反，界面按名字分开解读。
+    pub conditions: Vec<ConditionView>,
     pub pods: Vec<PodView>,
 }
 
@@ -269,7 +272,7 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
         reachable: true,
         error: None,
         version: None,
-        metrics_available: false,
+        usage_source: None,
         nodes: Vec::new(),
         unscheduled: Vec::new(),
     };
@@ -303,20 +306,27 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
         }
     }
 
-    // 用量来自 metrics-server，它可能压根没装。读不到不是错误：这一面照样能画申报量，
-    // 只是要在界面上说清楚「这里只有申报量」。把它当成读失败，会让一个没装组件的
-    // 集群整天亮着一张红条。
-    let (usage, metrics_available) = match client
+    // 实际用量的来源按「谁在集群里就有」排，不把任何一个当必需品：
+    // 1. metrics-server —— 装了就有，但它是一个可选组件；
+    // 2. kubelet 自己的 summary 接口，经 apiserver 代理读 —— 每台机器的 kubelet
+    //    都在跑，不需要任何额外组件，只要 SA 对 `nodes/stats` 有 get；
+    // 3. 两个都没有：只显示申报量，并在界面上说明白，不画一条零线。
+    // 读不到不是错误：这一面照样能画申报量，把它当成读失败会让一个没装 metrics-server
+    // 的集群整天亮着一张红条。
+    let (usage, usage_source) = match client
         .get_json(&format!(
             "/apis/metrics.k8s.io/v1beta1/namespaces/{}/pods",
             client.namespace()
         ))
         .await
     {
-        Ok(list) => (usage_by_pod(&list), true),
-        Err(_) => (std::collections::HashMap::new(), false),
+        Ok(list) => (usage_by_pod(&list), Some(USAGE_FROM_METRICS.to_string())),
+        Err(_) => match usage_from_kubelets(&client, &view.nodes).await {
+            Some(usage) => (usage, Some(USAGE_FROM_KUBELET.to_string())),
+            None => (std::collections::HashMap::new(), None),
+        },
     };
-    view.metrics_available = metrics_available;
+    view.usage_source = usage_source;
 
     // 卷声明读一次，给持久卷补上「绑到哪块盘、多大」。读不到就只是缺这一层信息。
     let claims = match client
@@ -363,7 +373,7 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
         }
     }
 
-    if metrics_available {
+    if view.usage_source.is_some() {
         for node in &mut view.nodes {
             let used: Vec<(u64, u64)> = node
                 .pods
@@ -381,6 +391,104 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
         clusters: vec![view],
         collected_at,
     })
+}
+
+pub const USAGE_FROM_METRICS: &str = "metrics-server";
+pub const USAGE_FROM_KUBELET: &str = "kubelet-summary";
+
+/// 用量来源的第二条腿：每台节点的 kubelet 都在服务 summary 接口，经 apiserver 代理
+/// 就能读，不需要集群里装任何额外组件。
+///
+/// 这条腿要的是 `nodes/stats` 的读权限，不是 `nodes/proxy`：apiserver 按路径把代理
+/// 过来的请求映射到子资源，`/stats/*` 落到 `nodes/stats`。两者差着一整个 kubelet
+/// API——`nodes/proxy` 还能 exec 进任何 Pod，那是给这一面读用量用不着的权力。
+///
+/// 一台读不到不影响其它台：只要有一台回了，这一面就有用量；全读不到才退回到「只
+/// 有申报量」。
+async fn usage_from_kubelets(
+    client: &KubeClient,
+    nodes: &[NodeView],
+) -> Option<std::collections::HashMap<String, PodUsage>> {
+    let mut merged = std::collections::HashMap::new();
+    let mut read_any = false;
+    for node in nodes {
+        let path = format!("/api/v1/nodes/{}/proxy/stats/summary", node.name);
+        let Ok(summary) = client.get_json(&path).await else {
+            continue;
+        };
+        read_any = true;
+        for (name, usage) in usage_from_summary(&summary, client.namespace()) {
+            merged.insert(name, usage);
+        }
+    }
+    read_any.then_some(merged)
+}
+
+/// kubelet summary 的形状与 metrics-server 不同，语义也不同：这里只收本命名空间的
+/// Pod（summary 是整台机器的，别的命名空间的 Pod 不该出现在这一面），并且用
+/// `workingSetBytes` 而不是 `rssBytes`——工作集正是内存压力与 OOM 判定看的那一个数。
+fn usage_from_summary(summary: &Value, namespace: &str) -> Vec<(String, PodUsage)> {
+    let mut out = Vec::new();
+    let Some(pods) = summary.get("pods").and_then(Value::as_array) else {
+        return out;
+    };
+    for pod in pods {
+        if pod.pointer("/podRef/namespace").and_then(Value::as_str) != Some(namespace) {
+            continue;
+        }
+        let Some(name) = pod.pointer("/podRef/name").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut usage = PodUsage {
+            cpu: nanocores_millicores(pod.pointer("/cpu/usageNanoCores")),
+            memory: bytes_at(pod.pointer("/memory/workingSetBytes")),
+            containers: std::collections::HashMap::new(),
+        };
+        for container in pod
+            .get("containers")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            let Some(container_name) = container.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            usage.containers.insert(
+                container_name.to_string(),
+                (
+                    nanocores_millicores(container.pointer("/cpu/usageNanoCores")),
+                    bytes_at(container.pointer("/memory/workingSetBytes")),
+                ),
+            );
+        }
+        out.push((name.to_string(), usage));
+    }
+    out
+}
+
+/// summary 的数分两种写法：nanoCores 是十进制小数串或整数，字节量在 summary 里
+/// 是十进制数字串。读不出来按 0 算——这里已经在「读到了」这条腿里，缺一个容器的
+/// 数不等于整个 Pod 没有用量；缺的那一个会在容器那一层显示为 0，而 Pod 的总数
+/// 仍由加总得到。没有来源的情况（两个接口都读不到）在调用点分成 `None` 处理。
+fn nanocores_millicores(value: Option<&Value>) -> u64 {
+    let Some(value) = value else { return 0 };
+    let nanocores = value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()));
+    match nanocores {
+        Some(nanocores) if nanocores.is_finite() && nanocores > 0.0 => {
+            (nanocores / 1_000_000.0).round() as u64
+        }
+        _ => 0,
+    }
+}
+
+fn bytes_at(value: Option<&Value>) -> u64 {
+    let Some(value) = value else { return 0 };
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        .unwrap_or(0)
 }
 
 /// metrics-server 回的每个 Pod：各容器用量，加总成 Pod 的用量。
@@ -554,6 +662,7 @@ fn node_view(node: &Value) -> NodeView {
         name,
         ready,
         roles,
+        conditions: conditions_of(node),
         cpu_allocatable_millicores: allocatable
             .and_then(|value| value.get("cpu"))
             .and_then(Value::as_str)
@@ -688,7 +797,7 @@ fn pod_view(
 
     let volumes = pod_volumes(pod, claims);
     let pod_events = events.get(&name).cloned().unwrap_or_default();
-    let conditions = pod_conditions(pod);
+    let conditions = conditions_of(pod);
 
     PodView {
         namespace,
@@ -735,10 +844,12 @@ fn termination_view(value: &Value) -> TerminationView {
     }
 }
 
-/// 读 `status.conditions`。`ok` 只看 `status == "True"`：Kubernetes 用的是字符串
-/// 三元组，缺字段按「没成立」处理——把未知读成成立，会让一个卡住的 Pod 显示成正常。
-fn pod_conditions(pod: &Value) -> Vec<ConditionView> {
-    pod.pointer("/status/conditions")
+/// 读 `status.conditions`（节点与 Pod 是同一个形状）。`ok` 只看 `status == "True"`：
+/// Kubernetes 用的是字符串三元组，缺字段按「没成立」处理——把未知读成成立，会让一个
+/// 卡住的 Pod 显示成正常。
+fn conditions_of(object: &Value) -> Vec<ConditionView> {
+    object
+        .pointer("/status/conditions")
         .and_then(Value::as_array)
         .map(|conditions| {
             conditions
@@ -1047,7 +1158,7 @@ mod topology_tests {
             reachable: true,
             error: None,
             version: None,
-            metrics_available: false,
+            usage_source: None,
             nodes: nodes.iter().map(node_view).collect(),
             unscheduled: Vec::new(),
         }
@@ -1385,6 +1496,97 @@ mod topology_tests {
         assert!(
             !conditions[0].ok,
             "缺 status 字段按没成立算：读成成立会把卡住的 Pod 画成正常"
+        );
+    }
+
+    #[test]
+    fn the_kubelet_summary_is_a_usage_source_of_its_own_without_metrics_server() {
+        // 这是真实的 `stats/summary` 形状（kubelet 自己服务，装在每台机器上）。
+        let summary = json!({
+            "node": { "nodeName": "cogneva-01" },
+            "pods": [
+                {
+                    "podRef": { "name": "api-1", "namespace": "cogneva" },
+                    "cpu": { "usageNanoCores": 250_000_000u64 },
+                    "memory": { "workingSetBytes": 734_003_200u64, "rssBytes": 700_000_000u64 },
+                    "containers": [
+                        { "name": "api", "cpu": { "usageNanoCores": 200_000_000u64 },
+                          "memory": { "workingSetBytes": 600_000_000u64 } },
+                        { "name": "sidecar", "cpu": { "usageNanoCores": 50_000_000u64 },
+                          "memory": { "workingSetBytes": 134_003_200u64 } }
+                    ]
+                },
+                {
+                    "podRef": { "name": "postgres-0", "namespace": "other" },
+                    "cpu": { "usageNanoCores": 900_000_000u64 },
+                    "memory": { "workingSetBytes": 2_000_000_000u64 },
+                    "containers": []
+                }
+            ]
+        });
+
+        let usage = usage_from_summary(&summary, "cogneva");
+        assert_eq!(usage.len(), 1, "别的命名空间的 Pod 不属于这一面");
+        let (name, pod) = &usage[0];
+        assert_eq!(name, "api-1");
+        assert_eq!(pod.cpu, 250, "nanoCores 换算成毫核");
+        assert_eq!(pod.memory, 734_003_200, "取工作集，不取 RSS");
+        assert_eq!(pod.containers["api"], (200, 600_000_000));
+        assert_eq!(pod.containers["sidecar"], (50, 134_003_200));
+    }
+
+    #[test]
+    fn a_summary_that_names_no_namespace_matches_nothing_rather_than_everything() {
+        // 缺 namespace 的条目如果被当成「匹配」，整台机器的 Pod 都会记到这一面。
+        let summary =
+            json!({ "pods": [{ "podRef": { "name": "api-1" }, "cpu": {}, "memory": {} }] });
+        assert!(usage_from_summary(&summary, "cogneva").is_empty());
+    }
+
+    #[test]
+    fn nanocores_and_byte_fields_survive_both_number_and_string_forms() {
+        // 1.5 毫核按最近整数进：用量是读数，不必保留小数位。
+        assert_eq!(nanocores_millicores(Some(&json!(1_500_000u64))), 2);
+        assert_eq!(nanocores_millicores(Some(&json!("2000000"))), 2);
+        assert_eq!(nanocores_millicores(Some(&json!(0))), 0);
+        assert_eq!(nanocores_millicores(None), 0, "缺字段是 0，不是猜测");
+        assert_eq!(bytes_at(Some(&json!(4096))), 4096);
+        assert_eq!(bytes_at(Some(&json!("8192"))), 8192);
+        assert_eq!(bytes_at(None), 0);
+    }
+
+    #[test]
+    fn node_pressure_conditions_are_read_the_same_way_as_pod_conditions() {
+        let node = json!({
+            "metadata": { "name": "cogneva-01" },
+            "status": {
+                "conditions": [
+                    { "type": "Ready", "status": "True" },
+                    { "type": "MemoryPressure", "status": "True",
+                      "reason": "KubeletHasInsufficientMemory", "message": "kubelet has insufficient memory" },
+                    { "type": "DiskPressure", "status": "False" }
+                ],
+                "allocatable": { "cpu": "24000m", "memory": "62Gi", "pods": "110" }
+            }
+        });
+        let view = node_view(&node);
+        let kinds: Vec<(&str, bool)> = view
+            .conditions
+            .iter()
+            .map(|condition| (condition.kind.as_str(), condition.ok))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("Ready", true),
+                ("MemoryPressure", true),
+                ("DiskPressure", false)
+            ],
+            "压力条件为真就是坏消息，界面按名字解读"
+        );
+        assert_eq!(
+            view.conditions[1].reason.as_deref(),
+            Some("KubeletHasInsufficientMemory")
         );
     }
 

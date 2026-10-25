@@ -81,6 +81,12 @@ rules:
   - apiGroups: ["metrics.k8s.io"]
     resources: ["nodes"]
     verbs: ["get", "list"]
+  # 没有 metrics-server 时的用量来源：kubelet 的 summary 接口经 apiserver 代理读，
+  # apiserver 把 `/stats/*` 映射到 `nodes/stats` 子资源。只读；不给 `nodes/proxy`，
+  # 那一项连 exec 一起授权。
+  - apiGroups: [""]
+    resources: ["nodes/stats"]
+    verbs: ["get"]
 ---
 # 拓扑面在命名空间里额外要的三样：事件、卷声明、Pod 的实际用量。
 # pods 本身已由上面 gitops 看护那条 Role 授权，这里不重复。
