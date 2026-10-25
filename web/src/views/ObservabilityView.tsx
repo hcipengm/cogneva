@@ -6,6 +6,7 @@ import {
   getTokenUsage,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { ClusterTopology } from '@/topology/ClusterTopology';
 import { Empty, Loading, Moment, ReadError, Reading, Status, Table, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -46,6 +47,13 @@ export function ObservabilityView() {
           </div>
         )
       )}
+
+      <section className="border-b border-[var(--line)]">
+        <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
+          拓扑 · 集群 → 节点 → Pod → 容器
+        </h2>
+        <ClusterTopology />
+      </section>
 
       <section className="border-b border-[var(--line)]">
         <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">监管者</h2>

@@ -986,6 +986,65 @@ export interface WorkspaceFile {
   hash: string | null;
 }
 
+/**
+ * 集群拓扑：集群 → 节点 → Pod → 容器。
+ *
+ * 量一律是「申报量」而不是「用量」：requests 是调度器排得进去的依据，也是
+ * 「这台机器还剩多少」唯一能事先算出来的那部分。真实用掉多少要看指标面，
+ * 两者混在一张图上，读者会拿用量去判断还能不能排。
+ */
+export interface TopologyContainer {
+  name: string;
+  image: string;
+  ready: boolean;
+  restarts: number;
+  /** running / waiting:<原因> / terminated:<原因> / unknown */
+  state: string;
+}
+
+export interface TopologyPod {
+  namespace: string;
+  name: string;
+  phase: string;
+  ready: boolean;
+  restarts: number;
+  node: string | null;
+  cpu_requested_millicores: number;
+  memory_requested_bytes: number;
+  containers: TopologyContainer[];
+}
+
+export interface TopologyNode {
+  name: string;
+  ready: boolean;
+  roles: string[];
+  cpu_allocatable_millicores: number | null;
+  memory_allocatable_bytes: number | null;
+  pods_allocatable: number | null;
+  cpu_requested_millicores: number;
+  memory_requested_bytes: number;
+  pods: TopologyPod[];
+}
+
+export interface TopologyCluster {
+  id: string;
+  name: string;
+  reachable: boolean;
+  error: string | null;
+  version: string | null;
+  nodes: TopologyNode[];
+  unscheduled: TopologyPod[];
+}
+
+export interface ClusterTopology {
+  clusters: TopologyCluster[];
+  collected_at: string;
+}
+
+export async function getClusterTopology(): Promise<ClusterTopology> {
+  return api.get<ClusterTopology>('/api/v1/cluster/topology');
+}
+
 export async function getWorkspaceTree(path = ''): Promise<WorkspaceTree> {
   return api.get<WorkspaceTree>(`/api/v1/ide/tree?path=${encodeURIComponent(path)}`);
 }
