@@ -1,47 +1,89 @@
-import { useState } from 'react';
-import { getTaskSummary, listTasks, type TaskRow } from '@/api/client';
+import { useMemo, useState } from 'react';
+import {
+  getTaskGraph,
+  getTaskSummary,
+  listTasks,
+  type TaskRow,
+} from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { Empty, Loading, Moment, ReadError, Reading, Status, Table, ViewFrame } from '@/ui/primitives';
 
 /**
- * 任务面：现在有什么在跑、跑成了什么、卡在哪一步。
+ * 任务面：两类问题两个视图。
  *
- * 先读一次汇总，再按状态过滤列表——汇总里的数是服务端算的，列表是同一个端点
- * 的另一面，两者用同一个过滤词才不会出现「上面写着 12 个失败，下面一条没有」。
+ * 列表答「这一批活各自是什么状态」；图答「谁在等谁、一次意图被分解成了哪几块」。
+ * 两个视图读的是同一个端点族（`/tasks/list` 与 `/tasks/graph`），过滤词也是同一个，
+ * 所以「列表里 12 条失败、图上一条红都看不到」这种口径不一致不会发生。
+ *
+ * 图和列表都能点开一条任务：展开的是它自己的行，不是再发一次请求——图与列表本来
+ * 就已经带着完整的一行回来了。
  */
 const FILTERS = ['全部', 'running', 'ready', 'completed', 'failed'] as const;
 
+type Mode = 'list' | 'graph';
+
 export function TasksView() {
   const [filter, setFilter] = useState<(typeof FILTERS)[number]>('全部');
+  const [mode, setMode] = useState<Mode>('list');
+  const [selected, setSelected] = useState<string | null>(null);
+
   const summary = useResource('任务汇总', getTaskSummary, 15_000);
-  const rows = useResource(
+  const list = useResource(
     '任务列表',
     () => listTasks(filter === '全部' ? { limit: 300 } : { status: filter, limit: 300 }),
     15_000
   );
+  const graph = useResource(
+    '任务图',
+    () => getTaskGraph(filter === '全部' ? {} : { status: filter }),
+    15_000,
+    mode === 'graph'
+  );
 
-  const tasks = rows.data ?? [];
+  const tasks = list.data ?? [];
+  const nodes = graph.data?.nodes ?? [];
   const counts = summary.data;
+  const picked = useMemo(
+    () => tasks.find((t) => t.id === selected) ?? nodes.find((t) => t.id === selected) ?? null,
+    [tasks, nodes, selected]
+  );
 
   return (
     <ViewFrame
       title="任务"
       meta={counts ? `共 ${counts.total} · 运行 ${counts.running} · 就绪 ${counts.ready} · 失败 ${counts.failed}` : '按 15 秒重读'}
       actions={
-        <div className="flex gap-1">
-          {FILTERS.map((f) => (
-            <button
-              key={f}
-              onClick={() => setFilter(f)}
-              className="border px-2 py-1 text-[11px]"
-              style={{
-                borderColor: filter === f ? 'var(--brass-dim)' : 'var(--line)',
-                color: filter === f ? 'var(--brass)' : 'var(--paper-dim)',
-              }}
-            >
-              {f}
-            </button>
-          ))}
+        <div className="flex items-center gap-3">
+          <div className="flex gap-1">
+            {(['list', 'graph'] as const).map((m) => (
+              <button
+                key={m}
+                onClick={() => setMode(m)}
+                className="border px-2 py-1 text-[11px]"
+                style={{
+                  borderColor: mode === m ? 'var(--brass-dim)' : 'var(--line)',
+                  color: mode === m ? 'var(--brass)' : 'var(--paper-dim)',
+                }}
+              >
+                {m === 'list' ? '列表' : '图'}
+              </button>
+            ))}
+          </div>
+          <div className="flex gap-1">
+            {FILTERS.map((f) => (
+              <button
+                key={f}
+                onClick={() => setFilter(f)}
+                className="border px-2 py-1 text-[11px]"
+                style={{
+                  borderColor: filter === f ? 'var(--brass-dim)' : 'var(--line)',
+                  color: filter === f ? 'var(--brass)' : 'var(--paper-dim)',
+                }}
+              >
+                {f}
+              </button>
+            ))}
+          </div>
         </div>
       }
     >
@@ -54,38 +96,366 @@ export function TasksView() {
           <Reading label="失败" value={counts.failed} tone={counts.failed > 0 ? 'danger' : 'plain'} />
         </div>
       )}
-      {rows.error ? (
-        <ReadError what="任务列表" error={rows.error} onRetry={rows.refresh} />
-      ) : !rows.data && rows.loading ? (
-        <Loading what="任务列表" />
-      ) : tasks.length === 0 ? (
-        <Empty>这个过滤条件下没有任务。</Empty>
-      ) : (
-        <Table<TaskRow>
-          columns={[
-            { key: 'id', title: 'id', width: '150px', render: (t) => (
-              <span className="mono text-[11px] text-[var(--paper-dim)]">{t.id.slice(0, 18)}</span>
-            ) },
-            { key: 'type', title: '类型', width: '130px', render: (t) => t.task_type },
-            { key: 'status', title: '状态', width: '110px', render: (t) => <Status value={t.status} /> },
-            { key: 'owner', title: '归属', width: '150px', render: (t) => (
-              <span className="mono text-[11px] text-[var(--muted)]">{t.owner_unit ?? t.agent_id ?? '—'}</span>
-            ) },
-            { key: 'goal', title: '目标', width: '120px', render: (t) => (
-              <span className="mono text-[11px] text-[var(--muted)]">{t.goal_id?.slice(0, 12) ?? '—'}</span>
-            ) },
-            { key: 'error', title: '结局', render: (t) =>
-              t.error ? (
-                <span className="text-[11px] text-[var(--danger)]">{t.error}</span>
-              ) : (
-                <span className="text-[11px] text-[var(--muted)]">—</span>
+
+      {mode === 'list' ? (
+        list.error ? (
+          <ReadError what="任务列表" error={list.error} onRetry={list.refresh} />
+        ) : !list.data && list.loading ? (
+          <Loading what="任务列表" />
+        ) : tasks.length === 0 ? (
+          <Empty>这个过滤条件下没有任务。</Empty>
+        ) : (
+          <Table<TaskRow>
+            columns={[
+              { key: 'id', title: 'id', width: '150px', render: (t) => (
+                <button
+                  onClick={() => setSelected(t.id)}
+                  className="mono text-[11px] text-[var(--paper-dim)] underline-offset-2 hover:underline"
+                >
+                  {t.id.slice(0, 18)}
+                </button>
               ) },
-            { key: 'updated', title: '更新', width: '100px', render: (t) => <Moment iso={t.updated_at} /> },
-          ]}
-          rows={tasks}
-          rowKey={(t) => t.id}
+              { key: 'type', title: '类型', width: '130px', render: (t) => t.task_type },
+              { key: 'status', title: '状态', width: '110px', render: (t) => <Status value={t.status} /> },
+              { key: 'owner', title: '归属', width: '150px', render: (t) => (
+                <span className="mono text-[11px] text-[var(--muted)]">{t.owner_unit ?? t.agent_id ?? '—'}</span>
+              ) },
+              { key: 'blocked', title: '等谁', width: '70px', render: (t) => (
+                <span className="mono text-[11px]" style={{ color: (t.blocked_by?.length ?? 0) > 0 ? 'var(--warn)' : 'var(--muted)' }}>
+                  {t.blocked_by?.length || '—'}
+                </span>
+              ) },
+              { key: 'error', title: '结局', render: (t) =>
+                t.error ? (
+                  <span className="text-[11px] text-[var(--danger)]">
+                    {t.error_cause ? `[${t.error_cause}] ` : ''}
+                    {t.error}
+                  </span>
+                ) : (
+                  <span className="text-[11px] text-[var(--muted)]">—</span>
+                ) },
+              { key: 'updated', title: '更新', width: '100px', render: (t) => <Moment iso={t.updated_at} /> },
+            ]}
+            rows={tasks}
+            rowKey={(t) => t.id}
+          />
+        )
+      ) : graph.error ? (
+        <ReadError what="任务图" error={graph.error} onRetry={graph.refresh} />
+      ) : !graph.data && graph.loading ? (
+        <Loading what="任务图" />
+      ) : nodes.length === 0 ? (
+        <Empty>这个过滤条件下图里没有节点。</Empty>
+      ) : (
+        <TaskGraphPanel
+          nodes={nodes}
+          selected={selected}
+          onSelect={(id) => setSelected(id === selected ? null : id)}
         />
       )}
+
+      {picked && <TaskDetail task={picked} onSelect={setSelected} onClose={() => setSelected(null)} />}
     </ViewFrame>
   );
+}
+
+const COLUMN_WIDTH = 236;
+const NODE_WIDTH = 196;
+const NODE_HEIGHT = 58;
+const ROW_GAP = 74;
+const PAD = 18;
+
+/**
+ * 任务图：一列一层，边从左往右。
+ *
+ * 分层按 `blocked_by` 的最长路径算：一条任务落在「它所有依赖都落定之后」的那一列，
+ * 所以从左往右读就是执行顺序。算的过程中撞回自己在走的路径，就是一个环——那时
+ * 不画一张看起来合理的图，而是把它点出来：环是分解的缺陷，不是布局问题。
+ */
+function TaskGraphPanel({
+  nodes,
+  selected,
+  onSelect,
+}: {
+  nodes: TaskRow[];
+  selected: string | null;
+  onSelect: (id: string) => void;
+}) {
+  const layout = useMemo(() => computeLayout(nodes), [nodes]);
+  const { placed, cycle } = layout;
+  const maxDepth = Math.max(0, ...placed.map((p) => p.depth));
+  const byLayer: TaskRow[][] = Array.from({ length: maxDepth + 1 }, () => []);
+  for (const node of placed) byLayer[node.depth].push(node.task);
+
+  const width = PAD * 2 + (maxDepth + 1) * COLUMN_WIDTH;
+  const height = PAD * 2 + Math.max(1, ...byLayer.map((layer) => layer.length)) * ROW_GAP;
+  const position = new Map<string, { x: number; y: number }>();
+  byLayer.forEach((layer, column) => {
+    layer.forEach((task, row) => {
+      position.set(task.id, {
+        x: PAD + column * COLUMN_WIDTH,
+        y: PAD + row * ROW_GAP,
+      });
+    });
+  });
+
+  return (
+    <div className="border-b border-[var(--line)]">
+      {cycle.length > 0 && (
+        <p className="px-4 py-2 text-[11px] text-[var(--danger)]">
+          图里有环：{cycle.map((t) => t.id).join('、')}。环上的任务互相等待，永远不会被调度——
+          这是分解的缺陷，不是布局的问题。
+        </p>
+      )}
+      <div className="overflow-x-auto">
+        <svg width={width} height={height} className="block">
+          {placed.map(({ task }) =>
+            (task.blocked_by ?? []).map((blocker) => {
+              const from = position.get(blocker);
+              const to = position.get(task.id);
+              if (!from || !to) return null;
+              const x1 = from.x + NODE_WIDTH;
+              const y1 = from.y + NODE_HEIGHT / 2;
+              const x2 = to.x;
+              const y2 = to.y + NODE_HEIGHT / 2;
+              const mid = (x1 + x2) / 2;
+              return (
+                <path
+                  key={`${blocker}->${task.id}`}
+                  d={`M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`}
+                  fill="none"
+                  stroke="var(--line)"
+                  strokeWidth={1}
+                />
+              );
+            })
+          )}
+          {placed.map(({ task }) => {
+            const at = position.get(task.id);
+            if (!at) return null;
+            const active = task.id === selected;
+            const color = statusColor(task.status);
+            return (
+              <g key={task.id} onClick={() => onSelect(task.id)} style={{ cursor: 'pointer' }}>
+                <rect
+                  x={at.x}
+                  y={at.y}
+                  width={NODE_WIDTH}
+                  height={NODE_HEIGHT}
+                  fill="var(--paper)"
+                  stroke={active ? 'var(--brass)' : 'var(--line)'}
+                  strokeWidth={active ? 2 : 1}
+                />
+                <rect x={at.x} y={at.y} width={3} height={NODE_HEIGHT} fill={color} />
+                <text x={at.x + 12} y={at.y + 18} className="mono" fontSize={10} fill="var(--paper-dim)">
+                  {task.id.slice(0, 24)}
+                </text>
+                <text x={at.x + 12} y={at.y + 34} fontSize={11} fill="var(--paper)">
+                  {task.task_type}
+                </text>
+                <text x={at.x + 12} y={at.y + 49} fontSize={10} fill="var(--muted)">
+                  {task.owner_unit ?? task.agent_id ?? '未归属'}
+                  {' · '}
+                  {task.status}
+                  {task.face_id ? ` · ${task.face_id}` : ''}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+      <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
+        一列一层：越往右越晚。边的方向是「等」——左边那条完成后，右边那条才可调度。
+        点一个节点看它自己的行。
+      </p>
+    </div>
+  );
+}
+
+/** 一条任务的全貌。字段分组按读者的问题排：它是什么、谁负责、等谁、为什么失败、执行到哪。 */
+function TaskDetail({
+  task,
+  onSelect,
+  onClose,
+}: {
+  task: TaskRow;
+  onSelect: (id: string) => void;
+  onClose: () => void;
+}) {
+  const leaseExpired =
+    task.lease_expires_at != null && new Date(task.lease_expires_at).getTime() < Date.now();
+
+  return (
+    <section className="border-t border-[var(--line)]">
+      <div className="flex items-center px-4 py-2">
+        <span className="mono text-[11px] text-[var(--paper-dim)]">{task.id}</span>
+        <Status value={task.status} />
+        <button onClick={onClose} className="ml-auto text-[11px] text-[var(--muted)] hover:text-[var(--paper)]">
+          收起
+        </button>
+      </div>
+      <dl className="grid grid-cols-[110px_1fr] gap-x-3 gap-y-1 px-4 pb-3 text-[11px]">
+        <Field label="类型">{task.task_type}</Field>
+        <Field label="归属">
+          {task.owner_unit ?? '—'}
+          {task.agent_id ? ` · 交付 ${task.agent_id}` : ''}
+          {task.bound_by_handover_id ? ` · 交接单 ${task.bound_by_handover_id}` : ''}
+        </Field>
+        <Field label="服务面">{task.face_id ?? '不服务任何面'}</Field>
+        <Field label="目标 / 父">
+          {task.goal_id ?? '—'}
+          {task.parent_task_id ? ` · 父 ${task.parent_task_id.slice(0, 18)}` : ''}
+          {task.sink_task_id ? ` · 收口 ${task.sink_task_id.slice(0, 18)}` : ''}
+        </Field>
+        <Field label="可调度">{task.is_executable === false ? '否（占位行）' : '是'}</Field>
+        <Field label="等谁">
+          <Refs ids={task.blocked_by} onSelect={onSelect} empty="不依赖任何任务" />
+        </Field>
+        <Field label="解锁谁">
+          <Refs ids={task.blocks} onSelect={onSelect} empty="没有下游" />
+        </Field>
+        <Field label="失败">
+          {task.error ? (
+            <span className="text-[var(--danger)]">
+              {task.error_cause ? `[${task.error_cause}] ` : ''}
+              {task.error}
+            </span>
+          ) : (
+            '—'
+          )}
+        </Field>
+        <Field label="重试">
+          {task.retry_count ?? 0} / {task.max_retries ?? 0}
+          {task.retry_not_before ? ` · 不早于 ${fmt(task.retry_not_before)}` : ''}
+        </Field>
+        <Field label="执行">
+          {task.lease_owner ? (
+            <span style={{ color: leaseExpired ? 'var(--danger)' : undefined }}>
+              {task.lease_owner}
+              {task.lease_expires_at ? ` · 租约至 ${fmt(task.lease_expires_at)}` : ''}
+              {leaseExpired ? ' · 已过期，持有它的进程可能不在了' : ''}
+            </span>
+          ) : (
+            '没有持有者'
+          )}
+        </Field>
+        <Field label="时间">
+          开始 {task.started_at ? fmt(task.started_at) : '未开始'} · 超时 {task.timeout_seconds ?? '—'} 秒
+        </Field>
+        <Field label="创建 / 更新">
+          <Moment iso={task.created_at} /> · <Moment iso={task.updated_at} />
+        </Field>
+        <Field label="输入">
+          <Json value={task.input} />
+        </Field>
+        {task.result && (
+          <Field label="结果">
+            <Json value={task.result} />
+          </Field>
+        )}
+      </dl>
+    </section>
+  );
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <>
+      <dt className="text-[var(--muted)]">{label}</dt>
+      <dd className="text-[var(--paper-dim)]">{children}</dd>
+    </>
+  );
+}
+
+function Refs({
+  ids,
+  onSelect,
+  empty,
+}: {
+  ids?: string[];
+  onSelect: (id: string) => void;
+  empty: string;
+}) {
+  if (!ids || ids.length === 0) return <span className="text-[var(--muted)]">{empty}</span>;
+  return (
+    <span className="flex flex-wrap gap-1">
+      {ids.map((id) => (
+        <button
+          key={id}
+          onClick={() => onSelect(id)}
+          className="mono border border-[var(--line)] px-1 text-[10px] hover:border-[var(--brass-dim)]"
+        >
+          {id.slice(0, 18)}
+        </button>
+      ))}
+    </span>
+  );
+}
+
+function Json({ value }: { value: Record<string, unknown> }) {
+  return (
+    <pre className="mono max-h-40 overflow-auto whitespace-pre-wrap break-all text-[10px] text-[var(--muted)]">
+      {JSON.stringify(value, null, 2)}
+    </pre>
+  );
+}
+
+function fmt(iso: string): string {
+  return new Date(iso).toLocaleString('zh-CN');
+}
+
+function statusColor(status: string): string {
+  switch (status.toLowerCase()) {
+    case 'running':
+      return 'var(--ok)';
+    case 'failed':
+      return 'var(--danger)';
+    case 'completed':
+      return 'var(--paper-dim)';
+    default:
+      return 'var(--warn)';
+  }
+}
+
+/**
+ * 按最长依赖路径分层，同时点出环。
+ *
+ * 一个节点在算的过程中沿 `blocked_by` 走回自己正在走的路径，就是环。这时不把深度
+ * 写成 0 假装它是一层的起点——那会让一张自相矛盾的图看起来刚刚好。
+ */
+function computeLayout(nodes: TaskRow[]): { placed: { task: TaskRow; depth: number }[]; depth: Map<string, number>; cycle: TaskRow[] } {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const depth = new Map<string, number>();
+  const cycle: TaskRow[] = [];
+  const inCycle = new Set<string>();
+
+  const visit = (id: string, stack: Set<string>): number => {
+    const known = depth.get(id);
+    if (known != null) return known;
+    const node = byId.get(id);
+    if (!node) return 0;
+    if (stack.has(id)) {
+      if (!inCycle.has(id)) {
+        inCycle.add(id);
+        cycle.push(node);
+      }
+      return 0;
+    }
+    stack.add(id);
+    let level = 0;
+    for (const blocker of node.blocked_by ?? []) {
+      if (!byId.has(blocker)) continue;
+      level = Math.max(level, visit(blocker, stack) + 1);
+    }
+    stack.delete(id);
+    depth.set(id, level);
+    return level;
+  };
+
+  for (const node of nodes) visit(node.id, new Set());
+  return {
+    placed: nodes.map((task) => ({ task, depth: depth.get(task.id) ?? 0 })),
+    depth,
+    cycle,
+  };
 }

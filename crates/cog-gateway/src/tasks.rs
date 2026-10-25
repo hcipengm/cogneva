@@ -278,6 +278,32 @@ pub struct TaskView {
     /// 能否被 DagExecutor 调度。原始任务被重新注入成占位时是 false——它只做层级与查询，
     /// 不能被当成「还没跑的活」。
     pub is_executable: bool,
+    /// 这道任务解锁了谁。与 `blocked_by` 是同一条边的两个方向，读的人不必为了
+    /// 「我卡住了谁」再发一次请求。
+    #[serde(default)]
+    pub blocks: Vec<String>,
+    /// 失败原因的类型（来自传输层的 HTTP 状态），与给人看的 `error` 文本分开。
+    /// 读面丢掉它就只剩措辞：同一句「请求失败」可能该等、该换 key、该改请求。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_cause: Option<cog_core::contract::llm::UpstreamFailure>,
+    /// 执行权持有者与租约到期时刻。状态是 Running 而租约已过期，说明持有它的进程
+    /// 已经不在了——这是从行里唯一能读出来的「孤儿」证据。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<String>,
+    /// 失败后的退避到期时刻：早于此刻不会重试。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_not_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    pub timeout_seconds: u64,
+    /// 服务哪个面（面节点的这一列指向自己）。`None` 是不服务任何面，不是默认面。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub face_id: Option<String>,
+    /// 由哪张交接单签来的归属。与 `owner_unit` 一起读，才知道归属是改派还是漂移。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bound_by_handover_id: Option<String>,
 }
 
 impl From<Task> for TaskView {
@@ -301,6 +327,15 @@ impl From<Task> for TaskView {
             parent_task_id: t.parent_task_id,
             sink_task_id: t.sink_task_id,
             is_executable: t.is_executable,
+            blocks: t.blocks,
+            error_cause: t.error_cause,
+            lease_owner: t.lease_owner,
+            lease_expires_at: t.lease_expires_at.map(|at| at.to_rfc3339()),
+            retry_not_before: t.retry_not_before.map(|at| at.to_rfc3339()),
+            started_at: t.started_at.map(|at| at.to_rfc3339()),
+            timeout_seconds: t.timeout_seconds,
+            face_id: t.face_id,
+            bound_by_handover_id: t.bound_by_handover_id,
         }
     }
 }
@@ -1602,5 +1637,35 @@ mod tests {
             visible_to_claims(Some(&unscoped), &theirs),
             "a token that declares no scope is not restricted by one"
         );
+    }
+
+    /// 读面丢掉调度器与回收判据真正读的那几列，界面上就只剩一个状态词：
+    /// 「为什么失败」「谁还拿着执行权」「什么时候才许重试」三件事都不在响应里。
+    #[test]
+    fn the_view_keeps_the_columns_the_scheduler_acts_on() {
+        let mut t = task("a", cog_core::TaskStatus::Running, "t", 0);
+        t.blocks = vec!["b".into()];
+        t.error_cause = Some(cog_core::contract::llm::UpstreamFailure::QuotaExhausted);
+        t.lease_owner = Some("gateway-1".into());
+        t.lease_expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
+        t.retry_not_before = Some(chrono::Utc::now() + chrono::Duration::seconds(60));
+        t.started_at = Some(chrono::Utc::now());
+        t.timeout_seconds = 900;
+        t.face_id = Some("face-resources".into());
+        t.bound_by_handover_id = Some("handover-7".into());
+
+        let view = TaskView::from(t);
+        assert_eq!(view.blocks, vec!["b".to_string()]);
+        assert_eq!(
+            view.error_cause,
+            Some(cog_core::contract::llm::UpstreamFailure::QuotaExhausted)
+        );
+        assert_eq!(view.lease_owner.as_deref(), Some("gateway-1"));
+        assert!(view.lease_expires_at.is_some());
+        assert!(view.retry_not_before.is_some());
+        assert!(view.started_at.is_some());
+        assert_eq!(view.timeout_seconds, 900);
+        assert_eq!(view.face_id.as_deref(), Some("face-resources"));
+        assert_eq!(view.bound_by_handover_id.as_deref(), Some("handover-7"));
     }
 }

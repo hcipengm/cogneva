@@ -706,6 +706,44 @@ export interface TaskRow {
   created_at: string;
   updated_at: string;
   input: Record<string, unknown>;
+  /** 依赖：这条任务要等谁。 */
+  blocked_by?: string[];
+  /** 解锁：这条任务完成后放开谁。与 `blocked_by` 是同一条边的两个方向。 */
+  blocks?: string[];
+  /** 失败原因的类型（传输层信号），与给人看的 `error` 文本分开。 */
+  error_cause?: string | null;
+  lease_owner?: string | null;
+  lease_expires_at?: string | null;
+  retry_not_before?: string | null;
+  started_at?: string | null;
+  timeout_seconds?: number;
+  retry_count?: number;
+  max_retries?: number;
+  priority?: number;
+  parent_task_id?: string | null;
+  sink_task_id?: string | null;
+  face_id?: string | null;
+  bound_by_handover_id?: string | null;
+  is_executable?: boolean;
+  result?: Record<string, unknown> | null;
+}
+
+export interface TaskGraph {
+  nodes: TaskRow[];
+  /** 依赖边 `[先, 后]`：两端都在这张图里，悬边已被服务端收掉。 */
+  edges: [string, string][];
+}
+
+/** 任务图。过滤条件与列表相同；边只连两端都留下来的节点。 */
+export async function getTaskGraph(
+  params: { status?: string; goal_id?: string; agent_id?: string } = {}
+): Promise<TaskGraph> {
+  const query = new URLSearchParams();
+  if (params.status) query.set('status', params.status);
+  if (params.goal_id) query.set('goal_id', params.goal_id);
+  if (params.agent_id) query.set('agent_id', params.agent_id);
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return api.get<TaskGraph>(`/api/v1/tasks/graph${suffix}`);
 }
 
 /**
