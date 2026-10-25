@@ -927,12 +927,11 @@ fn rebind_standing_row(mut row: Task, face_id: &str, owner: &str, workspace: &st
     row.face_id = Some(face_id.to_string());
     row.owner_unit = Some(owner.to_string());
     row.workspace_id = Some(workspace.to_string());
-    // A row written before the standing shape was settled is still executable,
-    // and an executable marker is exactly the row the executor picks up, burns
-    // its budget on, and fails -- taking the face's binding with it. Re-binding
-    // is the pass that already has the row in hand, so it is also the pass that
-    // puts the shape right.
-    row.is_executable = false;
+    // A row written before the standing shape was settled can be in either
+    // broken form -- executable and untyped, or typed and non-executable -- and
+    // re-binding is the pass that already has the row in hand, so it is also
+    // the pass that puts the shape right.
+    cog_orchestrator::governance_acts::ensure_duty_shape(&mut row);
     match row.input.as_object_mut() {
         Some(input) => {
             input.insert("face".into(), face_id.into());
@@ -1221,6 +1220,20 @@ mod tests {
         assert!(
             moved.input.get("goal").and_then(|v| v.as_str()).is_some(),
             "a rebind must not drop the goal: {moved:?}"
+        );
+        // The two readers of this row disagree on purpose, and a rebind that
+        // satisfies only one of them takes the face's binding away: a
+        // non-executable row is invisible to the drift reading's count of open
+        // work (the face reads idle with a row right there), and an untyped
+        // executable row is started by the dispatcher, failed for having no
+        // body, and leaves the face with nothing bound to it.
+        assert!(
+            moved.is_executable,
+            "the reading counts only executable rows, so a rebind must leave it executable: {moved:?}"
+        );
+        assert!(
+            !cog_orchestrator::ready_queue::is_dispatchable_work(&moved),
+            "a duty has no body to run, so the dispatcher must leave it alone: {moved:?}"
         );
     }
 

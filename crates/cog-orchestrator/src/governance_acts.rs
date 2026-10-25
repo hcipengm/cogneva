@@ -67,6 +67,23 @@ pub fn face_work_id(face_id: &str) -> String {
 /// face's only evidence of staffing with it and leaves the face reading idle.
 pub const FACE_DUTY_TASK_TYPE: &str = "face-duty";
 
+/// Put a standing row into the one shape both of its readers agree on.
+///
+/// Two readers ask two different questions of this row and a row has to answer
+/// both: the drift reading counts only executable rows as the face's open work,
+/// and the dispatcher must never start a row that has no body to run. Either
+/// half alone loses one of the two -- non-executable is invisible to the
+/// reading, and an untyped executable row is eaten by the dispatcher and failed,
+/// which takes the face's only evidence of staffing with it. A row written
+/// before this shape settled can be in either broken form, so every writer that
+/// already has the row in hand puts it right here.
+pub fn ensure_duty_shape(task: &mut Task) {
+    task.is_executable = true;
+    if !matches!(&task.task_type, TaskType::Custom(kind) if kind == FACE_DUTY_TASK_TYPE) {
+        task.task_type = TaskType::Custom(FACE_DUTY_TASK_TYPE.to_string());
+    }
+}
+
 /// The standing duty row a face's owner works from, as one shape written once.
 ///
 /// The row carries the face's id and the name of the unit answerable for it,
@@ -105,6 +122,7 @@ pub fn standing_row(face: &Face, workspace: &str) -> Task {
     task.face_id = Some(face.face_id.clone());
     task.owner_unit = face.owner_unit.clone();
     task.workspace_id = Some(workspace.to_string());
+    ensure_duty_shape(&mut task);
     task
 }
 
