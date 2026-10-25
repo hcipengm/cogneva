@@ -373,6 +373,10 @@ NO_POD_REPORTER = {
     'CognevaFileSizeCensusUnjudged': 'cogneva_file_size_census_unjudged',
     'CognevaHostReadingSeriesUndeclared': 'host_reading_series_undeclared',
     'CognevaHostReadingSeriesVanished': 'host_reading_series_vanished',
+    # 「读数点名的指标，抓取面上一人都不发」：数与上面几条同源，读的是同一条
+    # host-readings 通道。身份要的是「有几条读数没有生产者」这件事本身，不是「谁数的」；
+    # 逐条点名由同族的 `reading_producer_missing` 带 reading/metric 标签回答。
+    'CognevaReadingProducerAbsent': 'reading_producer_absent',
     'CognevaReadingWitnessUnresolved': 'reading_witness_unresolved',
     'CognevaTasksPublishersDisagree': 'tasks_publishers_agree',
     'CognevaRefusalRedispatchBroken': 'cogneva_refusal_redispatch_state',
