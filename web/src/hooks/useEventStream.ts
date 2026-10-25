@@ -1,7 +1,12 @@
 import { useEffect, useRef } from 'react';
 import { EventStreamClient } from '@/transport/websocket';
 import { MockEventStreamClient } from '@/transport/mockStream';
-import { describeEvent, useStreamStore, type MessageRole } from '@/store/streamStore';
+import {
+  describeEvent,
+  useStreamStore,
+  type FrameSink,
+  type MessageRole,
+} from '@/store/streamStore';
 import { useChatStore } from '@/store/chatStore';
 import type { AgentEvent } from '@/types/events';
 import type { NotificationItem } from '@/api/client';
@@ -69,6 +74,8 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     (state) => state.setConnectionStatus
   );
   const recordActivity = useStreamStore((state) => state.recordActivity);
+  const noteFrame = useStreamStore((state) => state.noteFrame);
+  const noteUnrecorded = useStreamStore((state) => state.noteUnrecorded);
   const ingestChatFrame = useChatStore((state) => state.ingestFrame);
   /** 每个 agent 正在流的那一条消息（agent_id → 画布上的消息 id）。 */
   const streaming = useRef(new Map<string, string>());
@@ -80,18 +87,13 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     }
 
     const handleEvent = (event: AgentEvent) => {
-      // 先记一行活动，再按类型分派：活动流是「总线上来了什么」的完整账，
-      // 任何一条被分派分支漏掉的事件也仍然在账上，界面上不会凭空消失。
-      //
-      // 两个例外，按构造高频：`message_update` 每个 token 一帧（正文由画布
-      // 自己拼），`heartbeat` 每个 agent 每条心跳一帧。把它们记进来，一次
-      // 回话就能把整张活动表冲干净，真正要紧的工具调用被挤出去。
-      if (event.type !== 'message_update' && event.type !== 'heartbeat') {
-        recordActivity(describeEvent(event));
-      }
-
       const p = event.payload as Record<string, unknown>;
       const agentId = typeof p.agent_id === 'string' ? p.agent_id : null;
+
+      // 这一帧有没有真的改动折叠出来的态。由每个分支在确实写完之后自己置位：
+      // 时间轴上那条「态」徽记是读者判断「这帧改了东西吗」的唯一依据，估着置位
+      // 就变成了替这一帧编一个它没做过的改动。
+      let changedState = false;
 
       switch (event.type) {
         case 'message_start': {
@@ -101,13 +103,17 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
             'assistant') as MessageRole;
           streaming.current.set(agentId, id);
           startMessage(id, agentId, role);
+          changedState = true;
           break;
         }
         case 'message_update': {
           if (!agentId) break;
           const delta = extractDelta(p.assistant_event);
           const id = streaming.current.get(agentId);
-          if (id && delta) appendDelta(id, delta);
+          if (id && delta) {
+            appendDelta(id, delta);
+            changedState = true;
+          }
           break;
         }
         case 'message_end': {
@@ -115,7 +121,10 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
           const id = streaming.current.get(agentId);
           // 用整条消息补一次正文：用户发的与工具回的不走增量，只收尾的话
           // 画布上那一条是空的。
-          if (id) finishMessage(id, messageText(p.message));
+          if (id) {
+            finishMessage(id, messageText(p.message));
+            changedState = true;
+          }
           streaming.current.delete(agentId);
           break;
         }
@@ -124,7 +133,10 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
           // 转着「生成中」，而平台其实早就停了。
           if (agentId) {
             const id = streaming.current.get(agentId);
-            if (id) endMessage(id);
+            if (id) {
+              endMessage(id);
+              changedState = true;
+            }
             streaming.current.delete(agentId);
           }
           break;
@@ -136,11 +148,28 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
           // 写进进度条，画布上就会显示一个从没发生过的迁移。
           if (!taskId || status === 'hook_event') break;
           noteTaskStatus({ taskId, status, at: event.timestamp });
+          changedState = true;
           break;
         }
         default:
           break;
       }
+
+      // 两个按构造高频的变体：`message_update` 每个 token 一帧、`heartbeat` 每个
+      // agent 每条心跳一帧。逐条入账，一次回话就能把帧流与时间轴一起冲干净，真正
+      // 要紧的工具调用被挤出去。它们不是消失了：按类型计数，面板上写着各自多少条。
+      if (event.type === 'message_update' || event.type === 'heartbeat') {
+        noteUnrecorded(event.type);
+        return;
+      }
+
+      // 逐条的事先进帧流，再在时间轴上落一个点，点上记着它到底改过哪几处。
+      // 这一行同时是「不认识的变体也留一行」的地方：认不出不等于没发生。
+      const entry = describeEvent(event);
+      const fed: FrameSink[] = ['stream', 'timeline'];
+      if (changedState) fed.push('state');
+      recordActivity(entry);
+      noteFrame({ ...entry, fed });
     };
 
     const channels = channelKey ? channelKey.split(',') : [];
@@ -181,6 +210,8 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     noteTaskStatus,
     setConnectionStatus,
     recordActivity,
+    noteFrame,
+    noteUnrecorded,
     ingestChatFrame,
   ]);
 

@@ -22,6 +22,30 @@ export interface ActivityEntry {
   failed: boolean;
 }
 
+/**
+ * 一帧能落进去的三处。
+ *
+ * 三处答的不是同一个问题：「帧流」是总线上来了什么，「时间轴」是这些事按时间排开
+ * 长什么样，「态」是到这一刻为止平台被折成了什么样子。一条帧只进其中一两处是常态，
+ * 但哪几处被它改过必须看得见——读者才能分清「这帧没影响任何状态」与「这帧根本没被
+ * 认出来」。
+ */
+export type FrameSink = 'stream' | 'timeline' | 'state';
+
+export const SINK_LABELS: Record<FrameSink, string> = {
+  stream: '帧流',
+  timeline: '时间轴',
+  state: '态',
+};
+
+/** 时间轴保留的点数。与活动流同一个量级：它记的也是「刚才」，不是审计。 */
+export const TIMELINE_LIMIT = 300;
+
+/** 时间轴上的一个点：一行活动，外加这一帧真的落进了哪几处。 */
+export interface TimelinePoint extends ActivityEntry {
+  fed: FrameSink[];
+}
+
 /** 一段 JSON 的紧凑预览，超长截断——活动流一行放不下整份工具输出。 */
 function preview(value: unknown, max = 180): string | null {
   if (value === undefined || value === null) return null;
@@ -194,8 +218,25 @@ export interface StreamState {
    * 工具在调。
    */
   activity: ActivityEntry[];
+  /**
+   * 进了账的每一帧，新的在前，各带「它落进了哪几处」。
+   *
+   * 与活动流是同一条帧的两种读法：活动流按「做了什么」排，这一列按「这一帧改了什么」
+   * 排。少了它，「这帧只记了一行、没改任何状态」与「这帧认出来了」在画面上是同一件事。
+   */
+  timeline: TimelinePoint[];
+  /**
+   * 按构造不入账的帧，按类型计数。
+   *
+   * 正文增量每 token 一帧、心跳每 agent 一次，逐条入账会把上面两列一起冲干净。
+   * 不计的话，它们的缺席就变成「总线上从没有过这些帧」——那是在替数据说谎。
+   */
+  unrecorded: Record<string, number>;
   recordActivity: (entry: ActivityEntry) => void;
   clearActivity: () => void;
+  noteFrame: (point: TimelinePoint) => void;
+  noteUnrecorded: (type: string) => void;
+  clearTimeline: () => void;
   startMessage: (id: string, agent: string | null, role: MessageRole) => void;
   appendDelta: (messageId: string, delta: string) => void;
   endMessage: (messageId: string) => void;
@@ -249,6 +290,8 @@ export const useStreamStore = create<StreamState>((set) => ({
   liveTasks: [],
   connectionStatus: 'connecting',
   activity: [],
+  timeline: [],
+  unrecorded: {},
 
   recordActivity: (entry) =>
     set((state) => {
@@ -260,6 +303,20 @@ export const useStreamStore = create<StreamState>((set) => ({
     }),
 
   clearActivity: () => set({ activity: [] }),
+
+  noteFrame: (point) =>
+    set((state) => {
+      // 与活动流同一条去重：重连时服务端会把窗口内的帧重放一遍，同一个点上
+      // 出现两次「调用工具」像是平台在重复干活。
+      if (state.timeline.some((p) => p.id === point.id)) return state;
+      const next = [point, ...state.timeline];
+      return { timeline: next.length > TIMELINE_LIMIT ? next.slice(0, TIMELINE_LIMIT) : next };
+    }),
+
+  noteUnrecorded: (type) =>
+    set((state) => ({ unrecorded: { ...state.unrecorded, [type]: (state.unrecorded[type] ?? 0) + 1 } })),
+
+  clearTimeline: () => set({ timeline: [], unrecorded: {} }),
 
   startMessage: (id, agent, role) =>
     set((state) => {

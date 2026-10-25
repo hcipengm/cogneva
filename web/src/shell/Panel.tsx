@@ -3,21 +3,30 @@ import { useServices } from '@/shell/context';
 import { deriveProblems } from '@/shell/problems';
 import { Icon } from '@/shell/icons';
 import { useShell, type PanelTab } from '@/shell/store';
-import { useStreamStore } from '@/store/streamStore';
+import {
+  SINK_LABELS,
+  useStreamStore,
+  TIMELINE_LIMIT,
+  type FrameSink,
+} from '@/store/streamStore';
 
 /**
- * 底部面板：问题、输出、日志、原文。
+ * 底部面板：问题、输出、日志、时间轴、原文。
  *
- * 四格回答四个不同的问题——「有什么需要人处理」「我刚才点的那个动作结果如何」
- * 「总线上真的在跑什么」「智能体正在说什么」。合成一格会让最要紧的那类被最多的
- * 那类淹没。
+ * 五格回答五个不同的问题——「有什么需要人处理」「我刚才点的那个动作结果如何」
+ * 「总线上真的在跑什么」「这些帧各自改了什么」「智能体正在说什么」。合成一格会让
+ * 最要紧的那类被最多的那类淹没。
  */
 const TABS: { key: PanelTab; label: string }[] = [
   { key: 'problems', label: '问题' },
   { key: 'output', label: '输出' },
   { key: 'logs', label: '日志' },
+  { key: 'frames', label: '时间轴' },
   { key: 'text', label: '原文' },
 ];
+
+/** 三处的顺序固定：读者拿两行去比时，徽记要落在同一列上。 */
+const SINKS: FrameSink[] = ['stream', 'timeline', 'state'];
 
 const MIN_HEIGHT = 120;
 const MAX_HEIGHT = 520;
@@ -31,6 +40,8 @@ export function Panel() {
   const setActivity = useShell((s) => s.setActivity);
   const { overview, alerts, llm } = useServices();
   const logs = useStreamStore((s) => s.activity);
+  const points = useStreamStore((s) => s.timeline);
+  const unrecorded = useStreamStore((s) => s.unrecorded);
   const messages = useStreamStore((s) => s.messages);
 
   const problems = deriveProblems({
@@ -75,6 +86,7 @@ export function Panel() {
     problems: problems.length,
     output: output.length,
     logs: logs.length,
+    frames: points.length,
     text: messages.length,
   };
 
@@ -209,6 +221,85 @@ export function Panel() {
               ))}
             </ul>
           )
+        )}
+
+        {tab === 'frames' && (
+          <div>
+            <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 border-b border-[var(--line)] px-3 py-1 text-[11px] text-[var(--muted)]">
+              <span>
+                时间轴上 {points.length} 个点（最多留 {TIMELINE_LIMIT}）
+              </span>
+              <span>改动过态的 {points.filter((p) => p.fed.includes('state')).length}</span>
+              <span>没动过态的 {points.filter((p) => !p.fed.includes('state')).length}</span>
+              {Object.entries(unrecorded).map(([type, count]) => (
+                <span key={type} className="mono">
+                  {type} {count} 条未逐条入账
+                </span>
+              ))}
+            </div>
+            {points.length === 0 ? (
+              <p className="px-3 py-3 text-[11px] text-[var(--muted)]">
+                这台浏览器还没收到过帧。它与时间轴面不是同一份：这一列只记连上之后到达的，
+                刷新即失；盘上那些轨迹要看时间轴面。
+              </p>
+            ) : (
+              <ul>
+                {points.map((point) => (
+                  <li
+                    key={point.id}
+                    className="flex items-baseline gap-3 border-b border-[color-mix(in_srgb,var(--line)_55%,transparent)] px-3 py-1 text-[11px]"
+                  >
+                    <span className="mono w-16 shrink-0 text-[var(--muted)]">
+                      {new Date(point.at).toLocaleTimeString('zh-CN', { hour12: false })}
+                    </span>
+                    <span
+                      className="mono w-32 shrink-0 truncate text-[var(--live)]"
+                      title={point.agent ?? ''}
+                    >
+                      {point.agent ?? '—'}
+                    </span>
+                    <span className="flex w-28 shrink-0 gap-1.5">
+                      {SINKS.map((sink) => {
+                        const fed = point.fed.includes(sink);
+                        // 没进的那两处也占着位置并压暗：三徽记始终对齐，读者一眼
+                        // 看出「这帧只改了一处」，而不是以为它只该有两处。
+                        return (
+                          <span
+                            key={sink}
+                            className="mono text-[10px]"
+                            style={{
+                              color: fed ? 'var(--ok)' : 'var(--muted)',
+                              opacity: fed ? 1 : 0.35,
+                            }}
+                            title={fed ? `进了${SINK_LABELS[sink]}` : `没进${SINK_LABELS[sink]}`}
+                          >
+                            {SINK_LABELS[sink]}
+                          </span>
+                        );
+                      })}
+                    </span>
+                    <span
+                      className="w-64 shrink-0 truncate"
+                      style={{ color: point.failed ? 'var(--danger)' : 'var(--paper-dim)' }}
+                    >
+                      {point.summary}
+                    </span>
+                    <span
+                      className="min-w-0 flex-1 truncate text-[var(--muted)]"
+                      title={point.detail ?? ''}
+                    >
+                      {point.detail ?? ''}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p className="px-3 py-2 text-[11px] text-[var(--muted)]">
+              进账的每一帧都先落进帧流与时间轴，改得动折叠出的态的再多一个「态」；
+              压暗的那一处是这一帧没动过的。两条按构造高频的帧不逐条列——正文增量改的是
+              画布上那条消息，心跳什么都不改——它们只计入上面那一行，不列为「没来过」。
+            </p>
+          </div>
         )}
 
         {tab === 'text' && (
