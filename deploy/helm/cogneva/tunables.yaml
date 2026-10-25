@@ -1167,11 +1167,28 @@ rows:
       observed creation rate; nothing measures it.
 
   - key: sandboxExecutor.workspaceTtlSecs
-    source: override
+    source: derived
     why: >-
-      How long an idle task worktree may live. A derived TTL would follow the
-      measured idle time before a task returns; the executor does not publish
-      that.
+      How long an idle task worktree may live. The reclamation pass derives it
+      from the two readings that do not depend on the TTL itself: how many
+      trees the volume holds (the measured cap) and how far apart new trees
+      arrive (from the sidecars' creation times). The hold is as long as it
+      takes arrivals to refill half the volume, floored at an hour. The reuse
+      history cannot set it -- a tree idle longer than the TTL is already gone,
+      so every observed gap is shorter than the number it would feed and such
+      a rule doubles forever while looking like a closed loop. The configured
+      value applies until two trees exist to measure an arrival interval.
+      `the_idle_ttl_follows_arrivals_and_capacity_not_reuse_gaps` drives the
+      pure function with faster arrivals, a larger volume, one tree, and no
+      span.
+    published:
+      owner: crates/cog-extension/src/workdir.rs
+      file: crates/cog-extension/src/workdir.rs
+      metric: TTL_METRIC
+      label: source
+    proof:
+      file: crates/cog-extension/src/workdir.rs
+      test: the_idle_ttl_follows_arrivals_and_capacity_not_reuse_gaps
 
   # --- security gateway -------------------------------------------------------
   - key: securityGateway.auditedLlmMaxBodyBytes

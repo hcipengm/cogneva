@@ -105,6 +105,9 @@ const MIN_FETCH_INTERVAL_SECS: u64 = 30;
 const FETCH_INTERVAL_METRIC: &str = "sandbox_repo_fetch_interval_seconds";
 const FETCH_INTERVAL_SOURCE_LABEL: &str = "source";
 
+/// The published name of the idle TTL the reclamation pass is using.
+const TTL_METRIC: &str = "sandbox_workspace_ttl_seconds";
+
 /// How long the fetch loop should wait, given how long `main` was still before
 /// it last moved.
 ///
@@ -161,6 +164,32 @@ fn workspace_cap(disk: DiskReading, trees_bytes: u64, trees: usize) -> Option<us
         / 100;
     Some(trees + (room / per_tree) as usize)
 }
+
+/// How long an idle tree is worth holding, from the two readings that decide
+/// it: how many trees the volume holds and how fast new ones arrive.
+///
+/// The reuse history cannot set this. A tree idle longer than the TTL has
+/// already been reaped, so every gap anyone can observe is shorter than the
+/// number it would be feeding -- a rule built on them doubles the TTL over and
+/// over and never settles, all while looking like a closed loop. What does not
+/// depend on the TTL is the arrival rate and the capacity: holding a tree for
+/// as long as it takes new trees to refill half the volume is the point past
+/// which holding costs more than rebuilding.
+fn ttl_from(capacity: usize, trees: usize, span_secs: u64) -> Option<Duration> {
+    if capacity == 0 || trees < 2 || span_secs == 0 {
+        return None;
+    }
+    let between_arrivals = span_secs / trees as u64;
+    if between_arrivals == 0 {
+        return None;
+    }
+    let held = (capacity as u64).saturating_mul(between_arrivals) / 2;
+    Some(Duration::from_secs(held.max(MIN_TTL_SECS)))
+}
+
+/// The shortest an idle tree is held, whatever the arithmetic says: below this
+/// the executor rebuilds trees it has just finished with.
+const MIN_TTL_SECS: u64 = 3600;
 
 /// How long a git command may run, from the slowest one that has completed.
 fn git_timeout_from(slowest_ms: u64) -> Duration {
@@ -328,6 +357,8 @@ pub struct WorkdirMetrics {
     /// one, and the loop quietly going back to the configured value would
     /// read as if nothing had changed.
     fetch_interval: GaugeVec,
+    /// The idle TTL in force, labelled by whether it came from a measurement.
+    ttl_seconds: GaugeVec,
 }
 
 impl WorkdirMetrics {
@@ -396,6 +427,14 @@ impl WorkdirMetrics {
             &[FETCH_INTERVAL_SOURCE_LABEL],
         )?;
         registry.register(Box::new(fetch_interval.clone()))?;
+        let ttl_seconds = GaugeVec::new(
+            Opts::new(
+                TTL_METRIC,
+                "Seconds an idle task worktree is held before reclamation",
+            ),
+            &[FETCH_INTERVAL_SOURCE_LABEL],
+        )?;
+        registry.register(Box::new(ttl_seconds.clone()))?;
         Ok(Self {
             registry,
             workspaces,
@@ -408,6 +447,7 @@ impl WorkdirMetrics {
             disk_avail_bytes,
             data_volume_used,
             fetch_interval,
+            ttl_seconds,
         })
     }
 
@@ -804,8 +844,35 @@ impl WorkdirRouter {
     pub async fn gc_once(&self) -> SFResult<u64> {
         let _g = self.create_lock.lock().await;
         let now = unix_now();
-        let ttl = self.cfg.ttl.as_secs() as i64;
         let trees = self.list_task_trees().await;
+        let capacity = self.cap_for(&trees).await;
+        // Oldest arrival to now, so the span covers exactly the trees being
+        // counted. Without a second tree there is no arrival interval to read,
+        // and the configured TTL stands.
+        let oldest = trees
+            .iter()
+            .filter_map(|(id, _)| self.read_meta(id))
+            .map(|meta| meta.created_at_unix)
+            .min();
+        let derived = oldest.and_then(|first| {
+            ttl_from(
+                capacity,
+                trees.len(),
+                now.saturating_sub(first).max(0) as u64,
+            )
+        });
+        if let Some(d) = derived {
+            self.metrics
+                .ttl_seconds
+                .with_label_values(&["measured"])
+                .set(d.as_secs() as f64);
+        } else {
+            self.metrics
+                .ttl_seconds
+                .with_label_values(&["configured"])
+                .set(self.cfg.ttl.as_secs() as f64);
+        }
+        let ttl = derived.unwrap_or(self.cfg.ttl).as_secs() as i64;
         let mut reclaimed = 0u64;
         for (id, path) in trees.iter() {
             // Asked per tree at the decision rather than from a snapshot taken
@@ -861,21 +928,7 @@ impl WorkdirRouter {
         // multiplying. Which one applied is logged whenever the measurement is
         // the tighter of the two, because a cap that quietly stopped being the
         // configured one reads exactly like a cap that was never reached.
-        let declared = self.cfg.max_workspaces;
-        let max = match self.measured_cap(&trees).await {
-            Some(measured) => {
-                if measured < declared {
-                    info!(
-                        declared,
-                        measured,
-                        trees = trees.len(),
-                        "task worktree cap lowered to what the volume holds"
-                    );
-                }
-                measured.min(declared)
-            }
-            None => declared,
-        };
+        let max = self.cap_for(&trees).await;
         if trees.len() + incoming <= max {
             return;
         }
@@ -1400,6 +1453,31 @@ impl WorkdirRouter {
             return None;
         }
         parse_df(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// The cap this pass runs under. Two different numbers, and the lower one
+    /// wins: the configured value is a policy ceiling (how many trees this
+    /// executor is meant to serve at once), while the measured one is what the
+    /// volume can actually hold at the size these trees are. A policy ceiling
+    /// on its own cannot stop the disk filling up -- the trees grow with the
+    /// repository -- and a disk reading on its own cannot stop inotify watches
+    /// and git processes multiplying.
+    async fn cap_for(&self, trees: &[(String, PathBuf)]) -> usize {
+        let declared = self.cfg.max_workspaces;
+        match self.measured_cap(trees).await {
+            Some(measured) => {
+                if measured < declared {
+                    info!(
+                        declared,
+                        measured,
+                        trees = trees.len(),
+                        "task worktree cap lowered to what the volume holds"
+                    );
+                }
+                measured.min(declared)
+            }
+            None => declared,
+        }
     }
 
     /// What the volume and the trees say it can hold. `None` when neither has
@@ -2404,6 +2482,34 @@ pub(crate) mod tests {
             git_timeout_from(1_500),
             Duration::from_secs(GIT_TIMEOUT_FLOOR_SECS)
         );
+    }
+
+    /// The TTL is set by how fast trees arrive and how many fit -- never by how
+    /// long trees have sat idle, which is the one input that cannot be observed
+    /// independently of the TTL itself.
+    #[test]
+    fn the_idle_ttl_follows_arrivals_and_capacity_not_reuse_gaps() {
+        // Ten trees over ten hours is one an hour; a volume holding 20 takes
+        // twenty hours to refill, and half of that is the hold.
+        assert_eq!(
+            ttl_from(20, 10, 10 * 3600),
+            Some(Duration::from_secs(10 * 3600))
+        );
+        // Twice the arrivals in the same span: the same volume holds half as
+        // much time.
+        assert_eq!(
+            ttl_from(20, 20, 10 * 3600),
+            Some(Duration::from_secs(5 * 3600))
+        );
+        // A bigger volume holds longer.
+        assert!(ttl_from(40, 10, 10 * 3600) > ttl_from(20, 10, 10 * 3600));
+        // Never below the floor, and never invented from one tree.
+        assert_eq!(
+            ttl_from(1, 10, 10 * 3600),
+            Some(Duration::from_secs(MIN_TTL_SECS))
+        );
+        assert_eq!(ttl_from(20, 1, 10 * 3600), None);
+        assert_eq!(ttl_from(20, 10, 0), None);
     }
 
     #[test]

@@ -473,6 +473,11 @@ sandboxExecutor:
     - https://github.com/hcipengm/cogneva.git
     - https://gitee.com/hcipengm/cogneva.git
   # 每任务工作树生命周期（秒）：空闲超 TTL 回收，数量超上限按 LRU 驱逐。
+  # **TTL 由两个读数推，不由「空闲多久后被复用」推**：后者有个自指陷阱——空闲超过
+  # TTL 的树已经被回收了，能观察到的间隔永远短于它要喂的那个数，按它调只会一轮轮
+  # 翻倍。现在用的是不依赖 TTL 的两头：卷能装多少棵树（见 maxTaskWorkspaces 那段）＋
+  # 新树到达的间隔（元数据里的 created_at 算出来），取「新树把半个卷填满要多久」。
+  # 树来得快、卷更小，TTL 就短；量不出来（不足两棵树）时才用这个数。
   workspaceTtlSecs: 21600
   workspaceGcIntervalSecs: 600
   # **只在第一次观察到 main 变动之前生效。** 之后抓取周期跟着实测走：裸仓里 `main`
