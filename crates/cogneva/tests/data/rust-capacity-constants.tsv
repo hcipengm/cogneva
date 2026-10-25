@@ -176,7 +176,7 @@ crates/cog-orchestrator/src/observable.rs	CLAIM_IDLE_MS	600_000	bound	test fixtu
 crates/cog-orchestrator/src/plugin.rs	BACKLOG_WINDOWS_BEFORE_RECLAIM	3	bound	three stall windows of backlog are tolerated before the sweep re-arms the task
 crates/cog-orchestrator/src/principle_ledger.rs	DECLARATIONS_PER_PASS	1000	bound	wider than the one-shot corpus intake, so one pass folds the list whole
 crates/cog-orchestrator/src/principle_ledger.rs	PRINCIPLE_LEDGER_PASS_INTERVAL	300s	bound	maintenance cadence for a human-driven account; the liveness alert uses 6x this period
-crates/cog-orchestrator/src/replan.rs	MAX_ATTEMPTS	3	unreviewed	
+crates/cog-orchestrator/src/replan.rs	MAX_ATTEMPTS	3	bound	room for one run, one that dies halfway, and one more; past three the missing thing is a reader, not a fourth row that fails the same way
 crates/cog-orchestrator/src/resource_ledger.rs	CARRY_CAPACITY	1024	bound	four 256-event rings' worth, so it fills only when the account has been unwritable for long
 crates/cog-orchestrator/src/resource_ledger.rs	RESOURCE_LEDGER_PASS_INTERVAL	10s	bound	a wide margin under the ring depth: more than 25 events/s would be needed to overflow between passes
 crates/cog-orchestrator/src/task_executor_router.rs	CLAIM_CONCURRENCY	4	bound	a process-wide in-flight ceiling; enough that a 90-minute task cannot stall recovery
