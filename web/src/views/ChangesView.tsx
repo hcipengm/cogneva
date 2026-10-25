@@ -8,7 +8,7 @@ import {
   type ChangeTimelineEvent,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
-import { Empty, Loading, Moment, ReadError, Reading, Status, Table, ViewFrame } from '@/ui/primitives';
+import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 
 /**
  * 一条变更的来路：它入账之后走过哪些状态，每一步由哪一次判读、因为什么。
@@ -163,6 +163,7 @@ export function ChangesView() {
         {metrics.error ? (
           <ReadError what="演化计数" error={metrics.error} onRetry={metrics.refresh} />
         ) : metrics.data ? (
+          <Readings from={metrics} source="GET /api/v1/evolution/metrics 的累计一栏" caveat="这些是演化进程自己的累计计数，进程重启后从头算。">
           <div className="flex flex-wrap py-2">
             <Reading label="事件" value={metrics.data.events_total} />
             <Reading
@@ -177,6 +178,7 @@ export function ChangesView() {
               tone={metrics.data.changes_failed > 0 ? 'danger' : 'plain'}
             />
           </div>
+          </Readings>
         ) : (
           <Loading what="演化计数" />
         )}

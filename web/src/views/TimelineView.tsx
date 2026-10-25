@@ -3,7 +3,8 @@ import { getTrace, listTraces, type AgentTrace, type TraceMeta, type WireFrame }
 import { useResource } from '@/hooks/useResource';
 import { describeEvent, type ActivityEntry } from '@/store/streamStore';
 import type { AgentEvent } from '@/types/events';
-import { Empty, Loading, Moment, ReadError, Reading, Table, ViewFrame } from '@/ui/primitives';
+import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
+import type { ExplainOrigin } from '@/ui/explain';
 
 /**
  * 线上的一帧 → 活动流认得的形状。
@@ -35,7 +36,7 @@ function clock(iso: string): string {
  * 是它当时的样子。分不出「当时什么都没发生」与「这一格没记下来」的地方，这里不
  * 画点，因为画上去的那一格就是在替数据说话。
  */
-function TraceScrubber({ trace }: { trace: AgentTrace }) {
+function TraceScrubber({ trace, origin }: { trace: AgentTrace; origin: ExplainOrigin }) {
   const frames = trace.events;
   const [cursor, setCursor] = useState(frames.length > 0 ? frames.length - 1 : 0);
 
@@ -72,6 +73,7 @@ function TraceScrubber({ trace }: { trace: AgentTrace }) {
           回到最后一帧
         </button>
       </div>
+      <Readings from={origin} source="GET /api/v1/traces/{id} 读回来的那一份轨迹" caveat="这条读数是本地拖动状态：位置与「当时」随游标变，不代表平台此刻的样子。">
       <div className="flex flex-wrap py-2">
         <Reading label="拖到的位置" value={`${cursor + 1} / ${frames.length}`} />
         <Reading label="当时" value={now ? clock(now) : '—'} note={first ? `起点 ${clock(first)}` : undefined} />
@@ -82,6 +84,7 @@ function TraceScrubber({ trace }: { trace: AgentTrace }) {
         />
         <Reading label="校验和" value={<span className="text-[11px]">{trace.checksum ? '在' : '缺'}</span>} note={trace.version} />
       </div>
+      </Readings>
       <div className="px-4 pb-2">
         <input
           type="range"
@@ -213,7 +216,7 @@ export function TimelineView() {
           ) : !trace.data && trace.loading ? (
             <Loading what="轨迹" />
           ) : trace.data ? (
-            <TraceScrubber trace={trace.data} />
+            <TraceScrubber trace={trace.data} origin={trace} />
           ) : null}
         </section>
       )}

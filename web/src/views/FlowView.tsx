@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import { getProcessOverview, type GoalGroup, type ProcessTask } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { frameIsNewer, liveIndex, useStreamStore } from '@/store/streamStore';
-import { Empty, Loading, Moment, ReadError, Reading, Table, ViewFrame } from '@/ui/primitives';
+import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 /**
  * 流程面：一次意图从进来、被分解、被调度、被认领到收口，现在停在哪一段。
@@ -52,6 +52,11 @@ export function FlowView() {
             <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
               一段活走到哪了 · 每一个数都是一行任务
             </h2>
+            <Readings
+              from={processes}
+              source="GET /api/v1/processes：每一段由 goals[].tasks[] 的状态算出来"
+              caveat="分段计数用的是这份快照加上比它新的帧；快照的采集时刻在标题上。"
+            >
             <div className="flex flex-wrap items-stretch py-2">
               <Reading label="意图（goal）" value={overview.goals.length} />
               <Arrow />
@@ -73,6 +78,12 @@ export function FlowView() {
               <Reading
                 label="帧里更新过"
                 value={fromFrame}
+                caveat="只数比这份快照新的那些帧；它数的是差，不是总量。"
+                frames={liveTasks.slice(0, 20).map((t) => ({
+                  at: t.at,
+                  type: 'task_status_change',
+                  summary: `任务 ${t.taskId} → ${t.status}`,
+                }))}
                 tone={fromFrame > 0 ? 'warn' : 'plain'}
                 note="比这份快照新"
               />
@@ -85,6 +96,7 @@ export function FlowView() {
                 />
               )}
             </div>
+            </Readings>
             <p className="px-4 pb-2 text-[11px] text-[var(--muted)]">
               评测与落地不在这条线上：它们的读数在评测面与变更面。把它们画进这一段，
               会让「没有来源」看起来像「这一段没活」。

@@ -8,7 +8,7 @@ import {
 import { useResource } from '@/hooks/useResource';
 import { TokenShare } from '@/observability/TokenShare';
 import { ClusterTopology } from '@/topology/ClusterTopology';
-import { Empty, Loading, Moment, ReadError, Reading, Status, Table, ViewFrame } from '@/ui/primitives';
+import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 
 /**
  * 观测面：集群、后端、监管者、模型用量四个口径并排放。
@@ -34,6 +34,7 @@ export function ObservabilityView() {
         <Loading what="集群概况" />
       ) : (
         o && (
+          <Readings from={overview} source="GET /api/v1/cluster/overview">
           <div className="flex flex-wrap border-b border-[var(--line)] py-2">
             <Reading label="在岗智能体" value={o.active_agents ?? '—'} note={`共 ${o.total_agents ?? '?'}`} />
             <Reading label="活动任务" value={o.active_tasks ?? '—'} note={`就绪 ${o.queued_tasks ?? '?'} · 失败 ${o.failed_tasks ?? '?'}`} />
@@ -46,6 +47,7 @@ export function ObservabilityView() {
             />
             <Reading label="集群判词" value={o.cluster_health} tone={o.cluster_health === 'healthy' ? 'ok' : 'warn'} />
           </div>
+          </Readings>
         )
       )}
 
@@ -61,6 +63,7 @@ export function ObservabilityView() {
         {supervisor.error ? (
           <ReadError what="监管者状态" error={supervisor.error} onRetry={supervisor.refresh} />
         ) : s ? (
+          <Readings from={supervisor} source="GET /api/v1/supervisor/status">
           <div className="flex flex-wrap py-2">
             <Reading label="健康" value={s.healthy_agents} tone="ok" />
             <Reading label="失联" value={s.dead_agents} tone={s.dead_agents ? 'danger' : 'plain'} />
@@ -70,6 +73,7 @@ export function ObservabilityView() {
             <Reading label="调度器" value={s.scheduler_paused ? '已暂停' : '运行中'} tone={s.scheduler_paused ? 'warn' : 'ok'} />
             <Reading label="巡检轮次" value={s.cycle} note={`上次派发计划 ${s.last_plan_emitted_at ? new Date(s.last_plan_emitted_at).toLocaleTimeString('zh-CN') : '从未'}`} />
           </div>
+          </Readings>
         ) : (
           <Empty>读不到监管者状态。</Empty>
         )}
@@ -126,6 +130,11 @@ export function ObservabilityView() {
         {usage.error ? (
           <ReadError what="模型用量" error={usage.error} onRetry={usage.refresh} />
         ) : usage.data ? (
+          <Readings
+            from={usage}
+            source="GET /api/v1/observability/token-usage（按执行者累加的折叠行）"
+            caveat="这里的总量是这份返回里各行相加，窗口由「折叠窗口」那一格给出；没有折叠行的窗口读出来是 0，不是「没人用过模型」。"
+          >
           <div className="flex flex-wrap py-2">
             <Reading
               label="输入 token"
@@ -166,6 +175,7 @@ export function ObservabilityView() {
               />
             ))}
           </div>
+          </Readings>
         ) : (
           <Loading what="模型用量" />
         )}

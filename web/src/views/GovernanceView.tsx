@@ -1,6 +1,6 @@
 import { getGovernanceDrift, getGovernanceFaces, getGovernancePrinciples } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
-import { Empty, Loading, Moment, ReadError, Reading, Status, Table, ViewFrame } from '@/ui/primitives';
+import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 
 /**
  * 治理面：哪些面有人在守、哪些面已经过期、原则语料被判成了什么。
@@ -22,6 +22,7 @@ export function GovernanceView() {
       meta={census ? `${census.faces} 个面 · ${census.cross} 条横切 · 无人守 ${census.unstaffed} · 过期 ${census.expired}` : '按 60 秒重读'}
     >
       {census && (
+        <Readings from={faces} source="GET /api/v1/governance/faces 的 census 一栏">
         <div className="flex flex-wrap border-b border-[var(--line)] py-2">
           <Reading label="面" value={census.faces} />
           <Reading label="横切线" value={census.cross} />
@@ -29,12 +30,26 @@ export function GovernanceView() {
           <Reading label="守约过期" value={census.expired} tone={census.expired ? 'danger' : 'ok'} />
           {principles.data && (
             <>
-              <Reading label="原则已强制" value={principles.data.census.enforced} tone="ok" />
-              <Reading label="未强制" value={principles.data.census.unenforced} />
-              <Reading label="从未判读" value={principles.data.census.unmeasured} tone={principles.data.census.unmeasured ? 'warn' : 'plain'} />
+              <Reading
+                label="原则已强制"
+                from={principles}
+                source="GET /api/v1/governance/principles 的 census 一栏"
+                caveat="三个数是语料自己数的：强制、未强制、从未判读，相加是语料条数，不是面数。"
+                value={principles.data.census.enforced}
+                tone="ok"
+              />
+              <Reading label="未强制" from={principles} source="GET /api/v1/governance/principles 的 census 一栏" value={principles.data.census.unenforced} />
+              <Reading
+                label="从未判读"
+                from={principles}
+                source="GET /api/v1/governance/principles 的 census 一栏"
+                value={principles.data.census.unmeasured}
+                tone={principles.data.census.unmeasured ? 'warn' : 'plain'}
+              />
             </>
           )}
         </div>
+        </Readings>
       )}
       {faces.error ? (
         <ReadError what="面的清单" error={faces.error} onRetry={faces.refresh} />

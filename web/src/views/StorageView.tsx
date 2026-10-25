@@ -11,7 +11,7 @@ import {
   type RawMetadata,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
-import { Empty, Loading, Moment, ReadError, Reading, Table, ViewFrame } from '@/ui/primitives';
+import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 const PAGE = 50;
 const PREVIEW_CHARS = 4000;
@@ -112,6 +112,11 @@ export function StorageView() {
       }
     >
       {stats.data && (
+        <Readings
+          from={stats}
+          source="GET /api/v1/memory/stats"
+          caveat="这六个数是网关进程自己的计数器：从进程启动算起，重启归零；它们数的是动作，不是存量。"
+        >
         <div className="flex flex-wrap border-b border-[var(--line)] py-2">
           <Reading label="归档过的来源" value={stats.data.raw_archived} />
           <Reading label="被读回来的次数" value={stats.data.raw_retrieved} />
@@ -120,6 +125,7 @@ export function StorageView() {
           <Reading label="写入的摘要" value={stats.data.summary_stored} />
           <Reading label="摘要查询" value={stats.data.summary_searched} />
         </div>
+        </Readings>
       )}
       {stats.data && (
         <p className="px-4 pb-3 text-[11px] text-[var(--muted)]">
@@ -196,11 +202,17 @@ export function StorageView() {
           </Empty>
         ) : (
           <>
+            <Readings
+              from={logs}
+              source="GET /api/v1/memory/raw_logs 返回的这一页"
+              caveat="三个数只覆盖这一页：翻页、换过滤之后它们各自重算，不是全仓的总量。"
+            >
             <div className="flex flex-wrap py-2">
               <Reading label="这一页的文件" value={logEntries.length} />
               <Reading label="这一页的字节" value={bytes(logBytes)} />
               <Reading label="这一页的事件" value={logEvents} />
             </div>
+            </Readings>
             <Table
               columns={[
                 { key: 'stream', title: '流', width: '150px', render: (e: RawLogEntry) => (

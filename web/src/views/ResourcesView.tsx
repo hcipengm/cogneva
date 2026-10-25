@@ -6,7 +6,7 @@ import {
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { formatBytes, formatCpu } from '@/topology/ClusterTopology';
-import { Empty, Loading, Moment, ReadError, Reading, Table, ViewFrame } from '@/ui/primitives';
+import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 /**
  * 资源面：配额、可调度余量、存储账本。
@@ -122,6 +122,11 @@ export function ResourcesView() {
           <Empty>{cluster.error ?? '读不到集群。'}</Empty>
         ) : (
           <>
+            <Readings
+              from={topology}
+              source="GET /api/v1/cluster/topology（与观测面共用的同一份集群读数）"
+              caveat="「用量来源」说的是实际用量从哪儿来：没有 metrics-server 时只有申报量，实际用量是空的，不是 0。"
+            >
             <div className="flex flex-wrap py-2">
               <Reading label="节点" value={cluster.nodes.length} note={`未调度 Pod ${cluster.unscheduled.length}`} />
               <Reading
@@ -137,6 +142,7 @@ export function ResourcesView() {
               />
               <Reading label="采集于" value={<Moment iso={topology.data?.collected_at} />} />
             </div>
+            </Readings>
             <Table
               columns={[
                 { key: 'node', title: '节点', width: '180px', render: (n) => (

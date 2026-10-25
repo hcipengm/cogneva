@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { ActivityBar } from '@/shell/ActivityBar';
+import { ExplainDrawer } from '@/shell/ExplainDrawer';
 import { useServices } from '@/shell/context';
 import { Palette } from '@/shell/Palette';
 import { Panel } from '@/shell/Panel';
@@ -75,6 +76,8 @@ export function Shell() {
       </div>
       <StatusBar />
       <Palette />
+      {/* 抽屉挂在最外层：任何一面里的任何一个带虚线的数都从这里打开，不各面自带一份。 */}
+      <ExplainDrawer />
 
       {overlays.conversations && <AgentsOverlay onClose={overlays.closeConversations} />}
 

@@ -5,7 +5,7 @@ import { useShell } from '@/shell/store';
 import { useTheme } from '@/shell/theme';
 import { THEMES } from '@/styles/themes';
 import { ThemePicker } from '@/ui/ThemePicker';
-import { Button, Empty, Loading, ReadError, Reading, Table, ViewFrame } from '@/ui/primitives';
+import { Button, Empty, Loading, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 /**
  * 设置：模型、评估集、界面。
@@ -146,12 +146,18 @@ export function SettingsView() {
         ) : !quota.data ? (
           <Loading what="额度" />
         ) : (
+          <Readings
+            from={quota}
+            source="GET /api/v1/quota/usage（配额管理这一侧的数）"
+            caveat="这一侧拦调用，观测页那一侧记花销；两套计数对不上时以拦得住的这一侧为准。"
+          >
           <div className="flex flex-wrap py-2">
             <Reading label="今天已用" value={quota.data.used_today.toLocaleString()} />
             <Reading label="剩余额度" value={quota.data.remaining.toLocaleString()} />
             <Reading label="额度总量" value={quota.data.total_quota.toLocaleString()} />
             <Reading label="账号" value={<span className="mono text-[13px]">{quota.data.user_id}</span>} />
           </div>
+          </Readings>
         )}
         <p className="px-4 pb-2 text-[11px] text-[var(--muted)]">
           剩余额度是配额管理这一侧的数，与观测页按执行者统计的 token 花销是两套计数：前者拦调用，

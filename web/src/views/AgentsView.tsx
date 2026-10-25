@@ -1,6 +1,6 @@
 import { listAgents, type AgentSummary } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
-import { Button, Empty, Loading, Moment, ReadError, Reading, Table, ViewFrame } from '@/ui/primitives';
+import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 /**
  * 在岗名单。
@@ -10,7 +10,8 @@ import { Button, Empty, Loading, Moment, ReadError, Reading, Table, ViewFrame } 
  * 行数就是当下能同时干活的个数。
  */
 export function AgentsView() {
-  const { data, error, loading, refresh } = useResource('在岗名单', listAgents, 15_000);
+  const resources = useResource('在岗名单', listAgents, 15_000);
+  const { data, error, loading, refresh } = resources;
   const agents = data ?? [];
   const roles = new Map<string, number>();
   for (const agent of agents) {
@@ -31,11 +32,13 @@ export function AgentsView() {
         <Empty>当前没有在岗的智能体。心跳过期的注册不会出现在这里。</Empty>
       ) : (
         <>
+          <Readings from={resources} source="GET /api/v1/agents 按角色数这一页" caveat="数的是这次读回来的名单，心跳过期的注册不在里面。">
           <div className="flex flex-wrap border-b border-[var(--line)] py-2">
             {[...roles.entries()].map(([role, count]) => (
               <Reading key={role} label={role} value={count} />
             ))}
           </div>
+          </Readings>
           <Table<AgentSummary>
             columns={[
               { key: 'id', title: 'agent_id', render: (a) => <span className="mono text-[11px]">{a.agent_id}</span> },

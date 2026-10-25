@@ -6,7 +6,7 @@ import {
   type CollaborationLinkType,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
-import { Empty, Loading, Moment, ReadError, Reading, Table, ViewFrame } from '@/ui/primitives';
+import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 const LINK_LABELS: Record<CollaborationLinkType, string> = {
   hand_off: '交接',
@@ -170,6 +170,11 @@ export function CommsView() {
       }
     >
       {stats && (
+        <Readings
+          from={graph}
+          source="GET /api/v1/collaboration/graph 的 stats 一栏"
+          caveat="这张图活在网关进程的内存里：重启归零，归零不等于没有过交接。"
+        >
         <div className="flex flex-wrap border-b border-[var(--line)] py-2">
           <Reading label="边总数" value={stats.total_links} />
           <Reading label="交接" value={stats.handoffs} tone={stats.handoffs > 0 ? 'ok' : 'plain'} />
@@ -183,8 +188,10 @@ export function CommsView() {
             label="重启"
             value={stats.respawns}
             note="没有任何一处在写这个计数"
+            caveat="这个计数没有任何写入者，读到的 0 说的是「没人写」，不是「没有重启过」。"
           />
         </div>
+        </Readings>
       )}
       <section className="border-b border-[var(--line)]">
         <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">边的来路</h2>

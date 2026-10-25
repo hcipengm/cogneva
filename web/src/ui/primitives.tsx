@@ -1,4 +1,10 @@
-import type { ReactNode } from 'react';
+import { createContext, useContext, type ReactNode } from 'react';
+import {
+  openExplain,
+  type ExplainFrame,
+  type ExplainOrigin,
+  type ExplainSubject,
+} from '@/ui/explain';
 
 /**
  * 视图里共用的几块形状。放一处，是为了让「读失败」「没有数据」「正在读」在这
@@ -53,17 +59,70 @@ export function Button({
   );
 }
 
-/** 一块读数：上方是值，下方是它是什么。值比标签大，但都在这两行之内。 */
+/**
+ * 同一格里的一块读数各自的来路来自同一份读数时，写一次就够。
+ *
+ * 包一层上下文而不是给每一格加参数：一块读数的来路是它上面那份数据带的，不是
+ * 这一格自己知道的；逐格抄一遍，抄漏的那格就会安静地没有来路。
+ */
+const ReadingOrigin = createContext<{
+  origin: ExplainOrigin;
+  source: string;
+  caveat?: string;
+} | null>(null);
+
+export function Readings({
+  from,
+  source,
+  caveat,
+  children,
+}: {
+  from: ExplainOrigin;
+  source: string;
+  /** 这一组数共同的边界（「进程启动算起」「截断前」）；各格也可以自己盖过它。 */
+  caveat?: string;
+  children: ReactNode;
+}) {
+  return (
+    <ReadingOrigin.Provider value={{ origin: from, source, caveat }}>
+      {children}
+    </ReadingOrigin.Provider>
+  );
+}
+
+/** 画出来的值（图形、组件）不是一串数，抽屉里就直说，不去猜它的文本。 */
+function shown(value: ReactNode): string {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number') return String(value);
+  return '（这一格是画出来的，不是一串数）';
+}
+
+/**
+ * 一块读数：上方是值，下方是它是什么。值比标签大，但都在这两行之内。
+ *
+ * 带得出来路的数字可以点开：读的是什么、什么时候算的、由哪几帧折出来。没有来路
+ * 的数字**不做成按钮**——一格点开却只能说「不知道」的控件，比不点更坏。
+ */
 export function Reading({
   label,
   value,
   tone,
   note,
+  from,
+  source,
+  frames,
+  caveat,
 }: {
   label: string;
   value: ReactNode;
   tone?: 'ok' | 'warn' | 'danger' | 'plain';
   note?: string;
+  /** 这一格自己的读数来路；不给就跟随外层 `Readings`。 */
+  from?: ExplainOrigin;
+  source?: string;
+  /** 这个数由哪几帧算出来的。轮询来的聚合数不传，而不是传个空数组冒充「没有帧」。 */
+  frames?: ExplainFrame[];
+  caveat?: string;
 }) {
   const color =
     tone === 'ok'
@@ -73,10 +132,35 @@ export function Reading({
         : tone === 'danger'
           ? 'var(--danger)'
           : 'var(--paper)';
+  const group = useContext(ReadingOrigin);
+  const origin = from ?? group?.origin ?? null;
+  const src = source ?? group?.source ?? origin?.what ?? null;
+  const subject: ExplainSubject | null =
+    origin || src
+      ? {
+          label,
+          value: shown(value),
+          source: src ?? '没有记下来源',
+          computedAt: origin?.at ?? null,
+          frames,
+          caveat: caveat ?? group?.caveat,
+        }
+      : null;
   return (
     <div className="border-l border-[var(--line)] py-1 pl-3 pr-4">
       <div className="mono text-[17px] leading-tight" style={{ color }}>
-        {value}
+        {subject ? (
+          <button
+            type="button"
+            onClick={() => openExplain(subject)}
+            title="这个数由什么算出来"
+            className="cursor-pointer text-left underline decoration-dotted decoration-transparent underline-offset-4 transition-colors hover:decoration-[var(--muted)]"
+          >
+            {value}
+          </button>
+        ) : (
+          value
+        )}
       </div>
       <div className="text-[11px] text-[var(--muted)]">{label}</div>
       {note && <div className="text-[11px] text-[var(--muted)] opacity-80">{note}</div>}

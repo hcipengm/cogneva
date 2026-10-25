@@ -1,6 +1,6 @@
 import { getDeployments, type DeploymentView } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
-import { Empty, Loading, Moment, ReadError, Reading, Table, ViewFrame } from '@/ui/primitives';
+import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 /**
  * 构建与部署面：谁在跑第几版、滚动到哪一步。
@@ -34,6 +34,7 @@ export function DeliveryView() {
           <Empty>这个命名空间里没有 Deployment。</Empty>
         ) : (
           <>
+            <Readings from={deployments} source="GET /api/v1/cluster/deployments" caveat="「采集于」是服务端读 apiserver 的时刻；这份读数在两次轮询之间不会自己变。">
             <div className="flex flex-wrap py-2">
               <Reading label="工作负载" value={rows.length} />
               <Reading
@@ -49,6 +50,7 @@ export function DeliveryView() {
               />
               <Reading label="采集于" value={<Moment iso={report.collected_at} />} />
             </div>
+            </Readings>
             <Table
               columns={[
                 { key: 'name', title: '工作负载', width: '190px', render: (d) => (

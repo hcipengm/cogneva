@@ -199,9 +199,20 @@ export function EvalView() {
       </section>
       {picked && <ReportBody report={picked} onClose={() => setPicked(null)} />}
       <div className="flex flex-wrap border-t border-[var(--line)] py-2">
-        <Reading label="数据集" value={setList.length} />
-        <Reading label="报告（全目录）" value={reportTotal} />
-        <Reading label="报告（这一页）" value={reportList.length} />
+        <Reading label="数据集" from={datasets} source="GET /api/v1/eval/datasets" value={setList.length} />
+        <Reading
+          label="报告（全目录）"
+          from={reports}
+          source="GET /api/v1/eval/reports 的 total"
+          caveat="服务端在截断前数出来的：目录里还有更老的报告，这一页不一定列全。"
+          value={reportTotal}
+        />
+        <Reading
+          label="报告（这一页）"
+          from={reports}
+          source="GET /api/v1/eval/reports 返回的这一页"
+          value={reportList.length}
+        />
       </div>
       <p className="px-4 pb-4 text-[11px] text-[var(--muted)]">
         两处都从盘上读：数据集是数据目录里的文件，报告是跑完落下来的 JSON。目录换过、挂载丢过，

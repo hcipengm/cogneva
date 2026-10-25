@@ -6,6 +6,16 @@ export interface Resource<T> {
   error: string | null;
   loading: boolean;
   refresh: () => void;
+  /**
+   * 这份读数叫什么、最近一次读回的**本地时刻**、按多少毫秒重读。
+   *
+   * 数字的来路由读数自己带出来：界面上一格「17」读者要知道的是「几点的 17」。
+   * 读失败时 `at` 不清空——它说的是最后一次真的读回来的那一刻，清空会让失败
+   * 看起来像「从没读过」。
+   */
+  what: string;
+  at: string | null;
+  pollMs: number;
 }
 
 /**
@@ -23,6 +33,7 @@ export function useResource<T>(
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [at, setAt] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
   // 回调放在 ref 里：调用方常写成内联箭头函数，进依赖会让每次渲染都重开定时器。
   const loadRef = useRef(load);
@@ -41,6 +52,7 @@ export function useResource<T>(
         if (!cancelled) {
           setData(value);
           setError(null);
+          setAt(new Date().toISOString());
         }
       } catch (e) {
         const err = e as { status?: number; message?: string };
@@ -60,5 +72,5 @@ export function useResource<T>(
     };
   }, [pollMs, enabled, what, revision]);
 
-  return { data, error, loading, refresh };
+  return { data, error, loading, refresh, what, at, pollMs };
 }

@@ -12,7 +12,7 @@ import {
   useStreamStore,
   type LiveTaskStatus,
 } from '@/store/streamStore';
-import { Empty, Loading, Moment, ReadError, Reading, Status, Table, ViewFrame } from '@/ui/primitives';
+import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 
 /**
  * 任务面：两类问题两个视图。
@@ -103,6 +103,11 @@ export function TasksView() {
       }
     >
       {counts && (
+        <Readings
+          from={summary}
+          source="GET /api/v1/tasks/summary"
+          caveat="五个数是服务端在那一时刻数的全部任务，不随下面的过滤词变。"
+        >
         <div className="flex flex-wrap border-b border-[var(--line)] py-2">
           <Reading label="全部" value={counts.total} />
           <Reading label="运行中" value={counts.running} tone="ok" />
@@ -112,10 +117,19 @@ export function TasksView() {
           <Reading
             label="帧里更新过"
             value={fromFrame}
+            from={list}
+            source="这一页任务行与总线上 task_status_change 取新的那个"
+            caveat="只算这一页列出来的任务，且只算比这次轮询新的帧；它数的是差，不是总量。"
+            frames={liveTasks.slice(0, 20).map((t) => ({
+              at: t.at,
+              type: 'task_status_change',
+              summary: `任务 ${t.taskId} → ${t.status}`,
+            }))}
             tone={fromFrame > 0 ? 'warn' : 'plain'}
             note="比这次轮询新"
           />
         </div>
+        </Readings>
       )}
 
       {mode === 'list' ? (
