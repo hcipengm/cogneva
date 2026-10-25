@@ -272,12 +272,20 @@ impl cog_core::ReplanMinter for OrchestratorControlImpl {
                 let cog_core::ReplanOutcome::Minted { task_id } = &minted[at].outcome else {
                     continue;
                 };
-                if !added.contains(task_id) {
-                    minted[at].outcome = cog_core::ReplanOutcome::AlreadyMinted {
-                        task_id: task_id.clone(),
-                        open: true,
-                    };
+                if added.contains(task_id) {
+                    continue;
                 }
+                // 没进图：同 id 的行已经在里面了。它是不管用还是已经死了，读那一行
+                // 自己的状态，不在这里硬写一个 `open: true`——那会把一条走完了的活
+                // 报成「结论还在路上」，而读者会一直等一个已经不用等的结果。
+                let open = tasks
+                    .iter()
+                    .find(|t| &t.id == task_id)
+                    .is_none_or(|t| !t.status.is_terminal());
+                minted[at].outcome = cog_core::ReplanOutcome::AlreadyMinted {
+                    task_id: task_id.clone(),
+                    open,
+                };
             }
         }
         Ok(minted)

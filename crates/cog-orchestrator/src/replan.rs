@@ -28,6 +28,14 @@ pub const REPLAN_INPUT_KEY: &str = "replan";
 /// id 的可读前缀。后面跟指数名与一段摘要。
 const ID_PREFIX: &str = "replan";
 
+/// 同一版基线上，同一条越界最多造几条重规划。
+///
+/// 三条：一条没跑起来、一条跑死在半路，都还留一次机会。三条都走完了而基线
+/// 还是那一版，缺的就不是第四次尝试，是有人去看这三条为什么都没交货——再往下
+/// 造就只是每轮往队列里添一条注定失败的活，而队列上那一堆长得一样的行会把真
+/// 正在等的那条埋掉。
+pub const MAX_ATTEMPTS: usize = 3;
+
 /// 造任务这一侧的判断结果。
 ///
 /// 与交给判定侧的 [`ReplanOutcome`] 是两个东西：那一个是「这件事落定了没有」，
@@ -57,12 +65,15 @@ impl From<Decision> for ReplanOutcome {
     }
 }
 
-/// 一条重规划任务的 id：同一（项目、指数、基线版本）永远同一个。
+/// 一条重规划任务的 id：同一（项目、指数、基线版本、第几次尝试）永远同一个。
 ///
 /// 可读的那几个事实写在任务的输入里，不塞进 id：id 会进 URL 与日志，而基线版本
 /// 是一个带 `:` 与 `+` 的时间戳，塞进去只会让每个调用点各自转义一次。
-pub fn replan_id(project: &str, index: PerformanceIndex, revision: &str) -> String {
-    let digest = blake3::hash(format!("{project}\u{0}{revision}").as_bytes());
+///
+/// 尝试次数进摘要：一次尝试死掉之后，下一次要造的是一条**新**活——同一个 id 再
+/// 造一遍会被入图那一侧按「已经有过」顶掉，而它顶掉的那一行是死的。
+pub fn replan_id(project: &str, index: PerformanceIndex, revision: &str, attempt: u32) -> String {
+    let digest = blake3::hash(format!("{project}\u{0}{revision}\u{0}{attempt}").as_bytes());
     let hex = digest.to_hex();
     format!("{ID_PREFIX}-{}-{}", index.code(), &hex.as_str()[..16])
 }
@@ -116,19 +127,56 @@ pub fn replan_task(
         ));
     }
 
-    if let Some(previous) = existing
+    // 这一版基线上已经有过的重规划。去重键留在 `is_replan_for` 里：项目、指数、
+    // 基线版本三格都在那一处认。
+    //
+    // 走到这里说明当前基线版本还是 `revision`——一个交了货的重规划会把基线推
+    // 到新的一版，那么下一次比较的就不是这一版了，这些行也不会再被认出来。
+    // 换句话说：这些行里没有一条交付过，它们的终态只说明「这一次尝试结束了」。
+    let attempts: Vec<&Task> = existing
         .iter()
-        .find(|t| is_replan_for(t, &breach.project, breach.index, revision))
-    {
+        .filter(|t| is_replan_for(t, &breach.project, breach.index, revision))
+        .collect();
+
+    // 还有一条没走完：它的结论还在路上，等它，别再添一条问同一个问题的活。
+    if let Some(open) = attempts.iter().find(|t| !t.status.is_terminal()) {
         return Decision::AlreadyMinted {
-            task_id: previous.id.clone(),
-            // 还没走完说的是「它的结论还在路上」；已经走完说的是「去看它的结论，
-            // 那一版基线就是它的交付物」。两件事读者要做的事不同。
-            open: !previous.status.is_terminal(),
+            task_id: open.id.clone(),
+            open: true,
         };
     }
 
-    let task_id = replan_id(&breach.project, breach.index, revision);
+    // 全走完了。造下一条是因为这条越界还在，不是因为它值得再问一遍：同一条
+    // 越界在队列上堆到第四条的时候，缺的是有人去看前三条为什么没交货。
+    if attempts.len() >= MAX_ATTEMPTS {
+        let died: Vec<String> = attempts
+            .iter()
+            .map(|t| format!("{}={:?}", t.id, t.status))
+            .collect();
+        return rejected(format!(
+            "这一版基线（{revision}）上的重规划已经走过 {} 条都没交货（{}）：\
+             再造一条只是把同一个问题再问一遍，先看它们为什么都走完了而基线没动",
+            attempts.len(),
+            died.join("、")
+        ));
+    }
+    let attempt = attempts.len() as u32 + 1;
+
+    // 挂在哪一行下面：这一组的根，而不是项目 id。
+    //
+    // 项目 id 是 goal 的标识，不是任何一条任务的 id——把它写进 parent_task_id，
+    // 每条重规划都是一条父指针悬空的孤儿：范围树按父指针成树，读出来就是「父不在
+    // 图里」，而那个标记是为分解缺陷准备的，从第一天起恒亮之后没人再看它。
+    //
+    // 根在这一组里恰好该有一条：`parent_task_id` 为空的那一行。零条说明这一组
+    // 没有根（分解没交上来或者已被删），两条以上说明挑哪条都是猜——两种都拒绝，
+    // 不造一条挂在空处的活。
+    let root = match project_root(&breach.project, existing) {
+        Ok(root) => root,
+        Err(reason) => return rejected(reason),
+    };
+
+    let task_id = replan_id(&breach.project, breach.index, revision, attempt);
     let mut task = Task::new(
         task_id,
         TaskType::Custom(REPLAN_TASK_KIND.to_string()),
@@ -142,14 +190,15 @@ pub fn replan_task(
                 "against": breach.against,
                 "gap_tokens": breach.gap_tokens(),
                 "baseline_rev": revision,
+                "attempt": attempt,
                 "observed_at": now.to_rfc3339(),
             },
         }),
     );
-    // 挂在这个项目的根下：项目就是 goal 根连同它的后代，挂在别处它就不是这个
-    // 项目的活——看板、范围树、挣值三面都不会把它算进来。
+    // 归组读 `goal_id`，成树读 `parent_task_id`：前者让它进这个项目，后者让它
+    // 挂在根下面。两格答的是两个问题，一个都不能省。
     task.goal_id = Some(breach.project.clone());
-    task.parent_task_id = Some(breach.project.clone());
+    task.parent_task_id = Some(root.to_string());
     task.acceptance = acceptance_for(breach, revision);
     task.created_at = now;
     task.updated_at = now;
@@ -170,6 +219,28 @@ pub fn replan_task(
 
 fn rejected(reason: String) -> Decision {
     Decision::Refused { reason }
+}
+
+/// 这个项目组的根行：`goal_id` 是它、`parent_task_id` 为空的那一条。
+///
+/// 返回 `Err` 而不是猜一条：一个组的根是用来挂活的锚点，锚点有两个的时候，
+/// 「挂在其中一个下面」与「挂在另一个下面」在范围树里是两棵不同的树。
+fn project_root<'a>(project: &str, tasks: &'a [Task]) -> Result<&'a str, String> {
+    let roots: Vec<&Task> = tasks
+        .iter()
+        .filter(|task| task.goal_id.as_deref() == Some(project) && task.parent_task_id.is_none())
+        .collect();
+    match roots.as_slice() {
+        [root] => Ok(root.id.as_str()),
+        [] => Err(format!(
+            "项目 {project} 在任务图里没有根行（goal_id 指向它、parent_task_id 为空的那一条），\
+             重规划无处可挂"
+        )),
+        many => Err(format!(
+            "项目 {project} 在任务图里有 {} 条根行，挑哪一条都是猜，不造挂在其中一个下面的活",
+            many.len()
+        )),
+    }
 }
 
 /// 这条活要做的事，一句自己站得住的话：越界的是哪一项、差多少、按哪一版。
@@ -244,6 +315,27 @@ mod tests {
         }
     }
 
+    /// 项目组的根行：`goal_id` 指向这个项目、自己头上没有父。重规划的父指针
+    /// 必须落在它身上——项目 id 不是任何一条任务的 id。
+    const ROOT_TASK: &str = "task-root-1";
+
+    fn root_row() -> Task {
+        let mut task = Task::new(
+            ROOT_TASK,
+            TaskType::Custom("goal".into()),
+            serde_json::json!({}),
+        );
+        task.goal_id = Some(PROJECT.to_string());
+        task
+    }
+
+    /// 一个项目组：根行，加上调用方给的那些行。
+    fn group(rows: Vec<Task>) -> Vec<Task> {
+        let mut all = vec![root_row()];
+        all.extend(rows);
+        all
+    }
+
     fn minted(decision: Decision) -> Task {
         match decision {
             Decision::Mint(task) => *task,
@@ -255,10 +347,19 @@ mod tests {
     #[test]
     fn a_breach_mints_one_task_under_the_project_root_naming_the_index_and_the_gap() {
         let found = breach(PerformanceIndex::Schedule, 0.62, 6_200, 10_000);
-        let task = minted(replan_task(&found, REV, &[], at(0)));
+        let task = minted(replan_task(&found, REV, &group(vec![]), at(0)));
 
-        assert_eq!(task.goal_id.as_deref(), Some(PROJECT), "挂在项目根下");
-        assert_eq!(task.parent_task_id.as_deref(), Some(PROJECT));
+        assert_eq!(task.goal_id.as_deref(), Some(PROJECT), "归进这个项目");
+        assert_eq!(
+            task.parent_task_id.as_deref(),
+            Some(ROOT_TASK),
+            "父指针落在这一组的根行上"
+        );
+        assert_ne!(
+            task.parent_task_id.as_deref(),
+            Some(PROJECT),
+            "项目 id 是 goal 的标识，不是任何一条任务的 id——写进父指针就是一条孤儿"
+        );
         assert!(task.is_executable, "这是一条要被跑的活，不是登记行");
         assert!(!task.acceptance.is_empty(), "工作包必须带验收标准");
 
@@ -277,41 +378,102 @@ mod tests {
 
     /// 同一处越界重问一次不产生第二条活：判定侧每一轮都会再报一遍。
     #[test]
-    fn the_same_breach_on_the_same_revision_mints_once_and_says_whether_it_is_open() {
+    fn the_same_breach_on_the_same_revision_mints_once_while_the_first_is_still_open() {
         let found = breach(PerformanceIndex::Cost, 0.5, 1_000, 2_000);
-        let first = minted(replan_task(&found, REV, &[], at(0)));
+        let first = minted(replan_task(&found, REV, &group(vec![]), at(0)));
 
-        let again = replan_task(&found, REV, &[first.clone()], at(60));
+        let again = replan_task(&found, REV, &group(vec![first.clone()]), at(60));
         assert_eq!(
             again,
             Decision::AlreadyMinted {
                 task_id: first.id.clone(),
                 open: true,
             },
-            "同一个 id 的活还在待办里，就是还没交货"
+            "同一条还在待办里，就是还没交货——再问一遍不会多出新东西"
         );
+    }
 
-        let mut done = first.clone();
-        done.status = cog_core::TaskStatus::Completed;
-        assert_eq!(
-            replan_task(&found, REV, &[done], at(120)),
-            Decision::AlreadyMinted {
-                task_id: first.id.clone(),
-                open: false,
-            },
-            "它走完了：该去看它的结论，而不是再造一条一样的问题"
-        );
+    /// 尝试走完了而基线还是那一版，说明它没交货：要造的是一条**新**活，而不是
+    /// 把「它走完了」读成「这件事有人管了」。
+    ///
+    /// 两种终态都算没交货，因为判据不读它的状态而读基线：交了货的重规划会把基线
+    /// 推到新的一版，那么下一次比较的根本不是这一版，这条重规划也就不会再被认
+    /// 出来。还认得出它，就说明基线没动。
+    #[test]
+    fn an_attempt_that_ended_without_moving_the_baseline_gets_a_successor() {
+        let found = breach(PerformanceIndex::Schedule, 0.5, 1_000, 2_000);
+        let first = minted(replan_task(&found, REV, &group(vec![]), at(0)));
+
+        for ended in [
+            cog_core::TaskStatus::Completed,
+            cog_core::TaskStatus::Failed,
+        ] {
+            let mut previous = first.clone();
+            previous.status = ended;
+            let successor = minted(replan_task(
+                &found,
+                REV,
+                &group(vec![previous.clone()]),
+                at(120),
+            ));
+            assert_ne!(
+                successor.id, previous.id,
+                "{ended:?} 之后再造还得是一条新活"
+            );
+            assert_eq!(
+                successor.input[REPLAN_INPUT_KEY]["attempt"], 2,
+                "第几次尝试写在输入里：读面要分得开这两条是同一处越界的两次追问"
+            );
+            assert_eq!(
+                successor.input[REPLAN_INPUT_KEY]["baseline_rev"], REV,
+                "还是那一版基线：去重键没变，变的只是尝试次数"
+            );
+        }
+    }
+
+    /// 三条都走完还是那一版基线，就不再造第四条：这时候缺的是有人去看前三条，
+    /// 而不是队列上多一条注定一样的活。
+    #[test]
+    fn a_breach_that_outlived_its_attempts_is_refused_with_all_of_them_named() {
+        let found = breach(PerformanceIndex::Cost, 0.5, 1_000, 2_000);
+        let mut rows: Vec<Task> = Vec::new();
+        // 依次造出三条：每一条都按「前一条已死」走到下一个尝试号。
+        for attempt in 1..=MAX_ATTEMPTS {
+            let next = minted(replan_task(
+                &found,
+                REV,
+                &group(rows.clone()),
+                at(attempt as i64),
+            ));
+            assert_eq!(next.input[REPLAN_INPUT_KEY]["attempt"], attempt as u64);
+            let mut dead = next;
+            dead.status = cog_core::TaskStatus::Failed;
+            rows.push(dead);
+        }
+        match replan_task(&found, REV, &group(rows), at(600)) {
+            Decision::Refused { reason } => {
+                assert!(
+                    reason.contains(&MAX_ATTEMPTS.to_string()),
+                    "判词要说清走过几条：{reason}"
+                );
+                assert!(
+                    reason.contains("Failed"),
+                    "判词要点名它们各自的结局：{reason}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     /// 版本动了而还在落后，那是新的事实：id 换一个，值得再问一次。
     #[test]
     fn a_new_baseline_revision_is_a_new_breach() {
         let found = breach(PerformanceIndex::Schedule, 0.7, 7_000, 10_000);
-        let before = minted(replan_task(&found, REV, &[], at(0)));
+        let before = minted(replan_task(&found, REV, &group(vec![]), at(0)));
         let after = minted(replan_task(
             &found,
             "2026-10-27T09:00:00+00:00",
-            &[before.clone()],
+            &group(vec![before.clone()]),
             at(86_400),
         ));
         assert_ne!(before.id, after.id);
@@ -321,7 +483,8 @@ mod tests {
             replan_id(
                 PROJECT,
                 PerformanceIndex::Schedule,
-                "2026-10-27T09:00:00+00:00"
+                "2026-10-27T09:00:00+00:00",
+                1
             )
         );
     }
@@ -333,7 +496,12 @@ mod tests {
     #[test]
     fn every_minted_package_passes_the_same_gate_the_decomposition_uses() {
         for index in PerformanceIndex::ALL {
-            let task = minted(replan_task(&breach(index, 0.5, 1, 2), REV, &[], at(0)));
+            let task = minted(replan_task(
+                &breach(index, 0.5, 1, 2),
+                REV,
+                &group(vec![]),
+                at(0),
+            ));
             assert!(!task.acceptance.is_empty(), "{index:?} 造出了空验收标准");
             let defects = crate::wbs::check_work_package(&task.id, &task.acceptance);
             assert_eq!(
@@ -352,6 +520,42 @@ mod tests {
         assert_eq!(defects[0].kind, crate::wbs::WbsDefectKind::NoAcceptance);
     }
 
+    /// 一个组没有根行时不造活。造出来会是什么样：一条父指针指向空处的孤儿，
+    /// 而范围树里「父不在图里」那个标记是为分解缺陷准备的——它从部署第一天起
+    /// 恒亮之后，真正的分解缺陷就没人看得见了。
+    #[test]
+    fn a_group_without_a_root_row_is_refused_instead_of_minted_as_an_orphan() {
+        let found = breach(PerformanceIndex::Schedule, 0.5, 1_000, 2_000);
+        // 一条属于这个组、却也是一条后代的行：没有根，就找不到该挂的地方。
+        let mut child = Task::new(
+            "task-child",
+            TaskType::Custom("work".into()),
+            serde_json::json!({}),
+        );
+        child.goal_id = Some(PROJECT.to_string());
+        child.parent_task_id = Some("task-gone".into());
+        match replan_task(&found, REV, &[child], at(0)) {
+            Decision::Refused { reason } => {
+                assert!(reason.contains("没有根行"), "判词要说清是缺根：{reason}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// 两条根行也不造：挑哪一条都是猜，而两种挑法在范围树里是两棵不同的树。
+    #[test]
+    fn a_group_with_two_roots_is_refused_rather_than_guessing_one() {
+        let found = breach(PerformanceIndex::Schedule, 0.5, 1_000, 2_000);
+        let mut second = root_row();
+        second.id = "task-root-2".into();
+        match replan_task(&found, REV, &group(vec![second]), at(0)) {
+            Decision::Refused { reason } => {
+                assert!(reason.contains("2 条根行"), "判词要数出来有几条：{reason}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     /// 不成立的读数不造活：造出来的那条要花的 token 是真的。
     #[test]
     fn a_reading_that_is_not_a_breach_is_refused_with_the_reason() {
@@ -361,7 +565,7 @@ mod tests {
             (breach(PerformanceIndex::Schedule, 0.0, 0, 0), "分母是 0"),
             (breach(PerformanceIndex::Cost, f64::NAN, 1, 2), "非有限"),
         ] {
-            match replan_task(&found, REV, &[], at(0)) {
+            match replan_task(&found, REV, &group(vec![]), at(0)) {
                 Decision::Refused { reason } => assert!(
                     reason.contains(pinch),
                     "判词要说清是哪一件不成立（找 {pinch}）：{reason}"
