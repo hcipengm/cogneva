@@ -26,6 +26,7 @@
 //!   one-constructor rule is there to prevent.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cog_core::{HttpClient, HttpRequest, SFError, SFResult, Tool, ToolImplementation};
 use futures::StreamExt;
@@ -87,6 +88,26 @@ pub const WEB_FETCH_BASE_ENV: &str = "COGNEVA_WEB_FETCH_BASE";
 /// How long one rendered fetch may take. A browser has to start, load, run the
 /// page's scripts and settle; the in-process deadline would cut that short.
 const RENDER_TIMEOUT_SECS: u64 = 60;
+
+/// How long one rendered page stays servable out of the backend's own cache.
+///
+/// The backend keys its render cache on the revision the request carries, and
+/// its default revision is one bucket for the life of the process. A render
+/// that caught a client-rendered page before its scripts ran is then handed to
+/// every later call for that URL: the caller gets the shell again and again,
+/// with nothing in the answer that says it is stale. A bucket that moves on its
+/// own keeps a repeat fetch inside the minute cheap while letting a thin render
+/// expire instead of sticking to the URL.
+const RENDER_CACHE_SECS: u64 = 60;
+
+/// How many times a page the backend failed on is asked for again.
+///
+/// A renderer answers 5xx when its own page budget ran out mid-render, which is
+/// what a cold browser on a heavy page looks like; the second attempt starts
+/// from a warm one and usually returns the page. Only a 5xx is repeated: a 4xx
+/// is a verdict about this URL and repeating it costs the caller the same wait
+/// for the same answer.
+const RENDER_ATTEMPTS: u32 = 2;
 
 fn encode_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -608,6 +629,17 @@ fn render_base(base: Option<&str>) -> Option<String> {
         .map(|b| b.trim_end_matches('/').to_string())
 }
 
+/// The cache revision the backend is asked for at `now`, in buckets of
+/// [`RENDER_CACHE_SECS`]. Reads the clock so it is a function of the time only,
+/// which is what lets a test say when a stale render expires.
+fn render_cache_revision(now: SystemTime) -> String {
+    let secs = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (secs / RENDER_CACHE_SECS).to_string()
+}
+
 /// Read one page through the rendering backend and return its Markdown.
 ///
 /// The backend is asked for the *filtered* Markdown (`f: fit`): the raw body of
@@ -625,26 +657,42 @@ async fn fetch_rendered(
     max_chars: usize,
 ) -> SFResult<serde_json::Value> {
     let endpoint = format!("{base}/md");
-    let body = serde_json::json!({ "url": url.as_str(), "f": "fit" });
-    let mut req = HttpRequest::new("POST", endpoint.clone());
-    req.headers
-        .insert("Content-Type".into(), "application/json".into());
-    req.timeout_secs = Some(RENDER_TIMEOUT_SECS);
-    req.body = Some(serde_json::to_vec(&body).map_err(SFError::Serialization)?);
-    let resp = client.execute(req).await.map_err(|e| {
-        SFError::Agent(format!(
-            "the rendering backend at {base} did not answer ({e}); the page was not read \
-             in process instead, because this deployment asked for rendering"
-        ))
-    })?;
-    if !(200..300).contains(&resp.status) {
-        let detail = String::from_utf8_lossy(&resp.body);
-        return Err(SFError::Agent(format!(
-            "the rendering backend at {base} refused {url} with HTTP {}: {}",
-            resp.status,
-            truncate_chars(&detail, 300).0
-        )));
-    }
+    let body = serde_json::to_vec(&serde_json::json!({
+        "url": url.as_str(),
+        "f": "fit",
+        "c": render_cache_revision(SystemTime::now()),
+    }))
+    .map_err(SFError::Serialization)?;
+    let mut attempt = 0;
+    let resp = loop {
+        attempt += 1;
+        let mut req = HttpRequest::new("POST", endpoint.clone());
+        req.headers
+            .insert("Content-Type".into(), "application/json".into());
+        req.timeout_secs = Some(RENDER_TIMEOUT_SECS);
+        req.body = Some(body.clone());
+        let resp = client.execute(req).await.map_err(|e| {
+            SFError::Agent(format!(
+                "the rendering backend at {base} did not answer ({e}); the page was not read \
+                 in process instead, because this deployment asked for rendering"
+            ))
+        })?;
+        if (200..300).contains(&resp.status) {
+            break resp;
+        }
+        let detail = truncate_chars(&String::from_utf8_lossy(&resp.body), 300).0;
+        if !(500..600).contains(&resp.status) || attempt >= RENDER_ATTEMPTS {
+            let tries = if attempt == 1 {
+                String::new()
+            } else {
+                format!(" on {attempt} attempts")
+            };
+            return Err(SFError::Agent(format!(
+                "the rendering backend at {base} refused {url} with HTTP {}{tries}: {detail}",
+                resp.status
+            )));
+        }
+    };
     let mut parsed: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
         SFError::Agent(format!(
             "the rendering backend at {base} answered non-JSON: {e}"
@@ -669,6 +717,17 @@ async fn fetch_rendered(
             ))
         })?
         .to_string();
+    if markdown.trim().is_empty() {
+        // A 200 with nothing in it is the shape a document gets here: the
+        // renderer opened it and found no HTML to reduce. Returning the empty
+        // string would read as "this page says nothing", which is a different
+        // fact and calls for a different repair.
+        return Err(SFError::Agent(format!(
+            "the rendering backend at {base} opened {url} but extracted no text; the \
+             renderer reads HTML pages, so a binary document or a page that draws itself \
+             outside the document tree comes back empty"
+        )));
+    }
     let (text, truncated) = truncate_chars(&markdown, max_chars);
     let mut out = serde_json::json!({
         "url": url.as_str(),
@@ -709,11 +768,12 @@ pub fn web_fetch(client: Option<Arc<dyn HttpClient>>, base: Option<String>) -> T
         description: "Fetch one public web page and return its readable text, with the \
                       page title. When this deployment runs a rendering backend the page \
                       is rendered in a real browser first and returned as filtered \
-                      Markdown, so client-side-rendered pages and PDFs come back with \
-                      their content; otherwise HTML is reduced to its article content in \
-                      process. Plain text and JSON come back as they are. Binary files \
-                      are reported, not returned. Private, loopback and cluster-internal \
-                      addresses are refused."
+                      Markdown, so client-side-rendered pages come back with the text \
+                      their scripts produced; otherwise HTML is reduced to its article \
+                      content in process. Plain text and JSON come back as they are. \
+                      Binary files, including PDFs, are reported rather than returned: \
+                      the backend renders pages, it does not extract documents. Private, \
+                      loopback and cluster-internal addresses are refused."
             .into(),
         parameters: serde_json::json!({
             "type": "object",
@@ -861,6 +921,24 @@ mod tests {
                     content_type: content_type.to_string(),
                     body: body.into(),
                 }]),
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Answers in the order the requests arrive, first request first.
+        fn answering_in_order(answers: Vec<(u16, &str, String)>) -> Arc<Self> {
+            Arc::new(Self {
+                answers: Mutex::new(
+                    answers
+                        .into_iter()
+                        .rev()
+                        .map(|(status, content_type, body)| HttpResponse {
+                            status,
+                            content_type: content_type.to_string(),
+                            body: body.into_bytes(),
+                        })
+                        .collect(),
+                ),
                 asked: Mutex::new(Vec::new()),
             })
         }
@@ -1144,6 +1222,11 @@ mod tests {
             sent["f"], "fit",
             "the filtered body, not the raw one: {sent}"
         );
+        assert!(
+            sent["c"].is_string() && !sent["c"].as_str().unwrap().is_empty(),
+            "the request carries a cache revision of its own; the backend's default \
+             bucket outlives every page it serves: {sent}"
+        );
 
         assert_eq!(out["extraction"], "rendered", "{out}");
         assert_eq!(out["format"], "markdown", "{out}");
@@ -1219,6 +1302,145 @@ mod tests {
             msg.contains("http://render.invalid:11235"),
             "and the answer still names who gave it: {msg}"
         );
+    }
+
+    /// A render that came back thin must not be served forever, which means the
+    /// revision the request carries has to move without anyone remembering to
+    /// move it.
+    #[test]
+    fn a_renders_cache_revision_moves_on_its_own() {
+        let at = |secs: u64| UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        assert_eq!(
+            render_cache_revision(at(600)),
+            render_cache_revision(at(659)),
+            "within one bucket the revision is stable, so repeat fetches stay cheap"
+        );
+        assert_ne!(
+            render_cache_revision(at(600)),
+            render_cache_revision(at(660)),
+            "a minute later it is a different revision, so a stale render expires"
+        );
+        assert_ne!(
+            render_cache_revision(UNIX_EPOCH),
+            render_cache_revision(at(60)),
+            "the first bucket is not the empty string the backend treats as unset"
+        );
+    }
+
+    /// A 5xx is the renderer failing on its own budget, and one more ask gets the
+    /// page. Without the retry the caller sees the failure the backend had
+    /// while its browser was cold and reads it as a page that cannot be fetched.
+    #[tokio::test]
+    async fn a_render_the_backend_failed_on_is_asked_for_again() {
+        let scripted = Scripted::answering_in_order(vec![
+            (500, "text/plain", "render budget exhausted".into()),
+            (
+                200,
+                "application/json",
+                serde_json::json!({
+                    "url": "https://example.com/heavy",
+                    "success": true,
+                    "markdown": "# Heavy Page\n\nIt rendered the second time.",
+                })
+                .to_string(),
+            ),
+        ]);
+        let tool = web_fetch(
+            client_of(&scripted),
+            Some("http://render.invalid:11235".into()),
+        );
+        let out = call(
+            &tool,
+            serde_json::json!({"url":"https://example.com/heavy"}),
+        )
+        .await
+        .expect("a page the backend failed on once is asked for again");
+        assert_eq!(
+            scripted.asked().len(),
+            2,
+            "the failure is repeated once, then the page comes back"
+        );
+        assert!(out["text"]
+            .as_str()
+            .unwrap()
+            .contains("rendered the second time"));
+    }
+
+    /// A page the backend keeps failing on carries how many times it was asked,
+    /// so a reader can tell a flaky renderer from a page that never renders.
+    #[tokio::test]
+    async fn a_render_that_keeps_failing_says_how_many_attempts_it_took() {
+        let failing = || (500u16, "text/plain", "render budget exhausted".to_string());
+        let scripted = Scripted::answering_in_order(vec![failing(), failing()]);
+        let tool = web_fetch(
+            client_of(&scripted),
+            Some("http://render.invalid:11235".into()),
+        );
+        let err = call(
+            &tool,
+            serde_json::json!({"url":"https://example.com/heavy"}),
+        )
+        .await
+        .expect_err("two failures are still a failure");
+        let msg = err.to_string();
+        assert_eq!(scripted.asked().len(), 2, "the retry is bounded at two");
+        assert!(
+            msg.contains("on 2 attempts") && msg.contains("render budget exhausted"),
+            "the error names the attempt count and the backend's own words: {msg}"
+        );
+    }
+
+    /// A render that produced no text is a failure, not an empty page.
+    ///
+    /// This is the shape a PDF takes through the renderer: it opens fine and has
+    /// no HTML to reduce. Returning `chars: 0` would be indistinguishable from a
+    /// page that genuinely says nothing.
+    #[tokio::test]
+    async fn a_render_with_no_text_is_an_error_not_an_empty_page() {
+        let scripted = Scripted::answering(
+            200,
+            "application/json",
+            serde_json::json!({
+                "url": "https://example.com/paper.pdf",
+                "success": true,
+                "markdown": "\n",
+            })
+            .to_string(),
+        );
+        let tool = web_fetch(
+            client_of(&scripted),
+            Some("http://render.invalid:11235".into()),
+        );
+        let err = call(
+            &tool,
+            serde_json::json!({"url":"https://example.com/paper.pdf"}),
+        )
+        .await
+        .expect_err("an empty render is not an empty page");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("extracted no text") && msg.contains("http://render.invalid:11235"),
+            "the error says what happened and who did it: {msg}"
+        );
+    }
+
+    /// A 4xx is a verdict about this URL. Repeating it would spend the same wait
+    /// to be told the same thing.
+    #[tokio::test]
+    async fn a_refused_url_is_not_asked_again() {
+        let scripted = Scripted::answering(404, "text/plain", "no such path");
+        let tool = web_fetch(
+            client_of(&scripted),
+            Some("http://render.invalid:11235".into()),
+        );
+        let err = call(
+            &tool,
+            serde_json::json!({"url":"https://example.com/missing"}),
+        )
+        .await
+        .expect_err("a 404 from the backend is an error");
+        assert_eq!(scripted.asked().len(), 1, "asked once, then reported");
+        assert!(err.to_string().contains("HTTP 404"));
     }
 
     #[test]
