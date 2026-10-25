@@ -1,4 +1,3 @@
-//! principle: feedback_a_number_nobody_derived_is_a_number_that_will_be_wrong
 //! The resource ceiling is a function of the workload set, not an environment
 //! parameter. Every container already declares its limits, every Deployment
 //! already declares its replicas and its surge strategy, every PVC already
