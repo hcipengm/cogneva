@@ -9,6 +9,12 @@ metadata:
 spec:
   type: ClusterIP
   clusterIP: None
+  # 单副本 Headless 下「不 Ready 就不给端点」换不到任何东西——没有第二个副本可
+  # 以替它接，只有「整个库对每个客户端消失」这一个后果。端点是按 Pod 判的，而
+  # 这个 Pod 里还住着读数边车：边车崩一次，库本身好好地在跑，客户端读到的却是
+  # 名字解析不到。库真没起时，客户端应该读到 connection refused（那句话点名的
+  # 是坏掉的东西），而不是一个空 Service。
+  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: postgres
     app.kubernetes.io/component: database
