@@ -105,6 +105,13 @@ spec:
               value: "false"
             - name: PG_EXPORTER_INCLUDE_DATABASES
               value: "cogneva"
+          # `pg_stat_activity` 是 opt-in 的一族：最老事务年龄那条读数与 Grafana 上
+          # 同一块面板都读 `pg_stat_activity_max_tx_duration`，不点名打开它，那条
+          # 读数会永远显示"没有序列"——而"没有序列"和"事务都很短"在面板上是同一个
+          # 样子。只开这一族，不放开默认之外的其他 opt-in（每一族都是每次抓取多跑
+          # 一遍的查询）。
+          args:
+            - "--collector.stat_activity"
           readinessProbe:
             httpGet:
               path: /metrics
