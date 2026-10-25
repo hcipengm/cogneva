@@ -74,11 +74,6 @@ const GIT_TIMEOUT_FLOOR_SECS: u64 = 120;
 const GIT_TIMEOUT_MULTIPLE: u64 = 10;
 const META_DIR_NAME: &str = ".meta";
 
-/// Killed git processes (OOM, node restart) leave stale `.lock` files behind;
-/// every git write in this process is bounded by the derived timeout and
-/// kill-on-drop, so a lock older than this can only be a corpse.
-const STALE_GIT_LOCK_AGE: Duration = Duration::from_secs(600);
-
 /// Maximum task id length, keeps the on-disk directory name clear of
 /// `ENAMETOOLONG` while accommodating generated ids such as
 /// `ralph-roundtable-<uuid>`.
@@ -1502,7 +1497,7 @@ impl WorkdirRouter {
             Err(e) => {
                 let cleared = match stale_lock_candidate(&e.to_string()) {
                     Some(lock) => {
-                        let gone = clear_stale_git_lock(&lock, STALE_GIT_LOCK_AGE).await;
+                        let gone = clear_stale_git_lock(&lock, self.stale_lock_age()).await;
                         if gone {
                             warn!(lock = %lock.display(),
                                 "removed stale git lock left by a killed process; retrying");
@@ -1526,6 +1521,18 @@ impl WorkdirRouter {
     /// it now needs, rather than being killed at a number written elsewhere.
     fn git_timeout(&self) -> Duration {
         git_timeout_from(self.git_slowest_ms.load(Ordering::Relaxed))
+    }
+
+    /// How old a git lock has to be before it can only be a corpse.
+    ///
+    /// Killed git processes (OOM, node restart) leave `.lock` files behind, and
+    /// every git write here is bounded by [`Self::git_timeout`] and
+    /// kill-on-drop. So a lock older than twice that timeout cannot belong to a
+    /// live command: the command that made it would have been killed first. Twice
+    /// rather than once, because a command may have taken the lock just as this
+    /// pass looked at the clock.
+    fn stale_lock_age(&self) -> Duration {
+        self.git_timeout() * 2
     }
 
     async fn run_git_once(&self, args: &[&str], workdir: Option<&Path>) -> SFResult<String> {
@@ -2482,6 +2489,10 @@ pub(crate) mod tests {
             git_timeout_from(1_500),
             Duration::from_secs(GIT_TIMEOUT_FLOOR_SECS)
         );
+        // A lock is a corpse once no live command could still hold it, which is
+        // the timeout doubled -- so the lock age follows the same measurement
+        // instead of being a second number kept in step by hand.
+        assert_eq!(git_timeout_from(40_000) * 2, Duration::from_secs(800));
     }
 
     /// The TTL is set by how fast trees arrive and how many fit -- never by how
