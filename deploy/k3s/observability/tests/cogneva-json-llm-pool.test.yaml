@@ -45,16 +45,26 @@ tests:
     input_series:
       - series: 'llm_usage_verdict_measured{upstream="u1"}'
         values: '1x60'
+      - series: 'llm_usage_verdict_measured_observed_timestamp_seconds{upstream="u1"}'
+        values: '3500x60'
       - series: 'llm_tool_calls_verdict_measured{upstream="u1"}'
         values: '1x60'
+      - series: 'llm_tool_calls_verdict_measured_observed_timestamp_seconds{upstream="u1"}'
+        values: '3500x60'
       - series: 'llm_temperature_verdict_measured{upstream="u1"}'
         values: '1x60'
+      - series: 'llm_temperature_verdict_measured_observed_timestamp_seconds{upstream="u1"}'
+        values: '3500x60'
       - series: 'llm_upstream_healthy{upstream="u1"}'
         values: '1x60'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{upstream="u1"}'
+        values: '3500x60'
       - series: 'llm_upstream_client_errors_total{upstream="u1"}'
         values: '0x60'
       - series: 'llm_pool_available'
         values: '1x60'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x60'
       - series: 'llm_pool_allowance_tokens'
         values: '100x60'
       - series: 'llm_pool_allowance_tokens_observed_timestamp_seconds'
@@ -146,20 +156,36 @@ tests:
     input_series:
       - series: 'llm_usage_verdict_measured{upstream="u1"}'
         values: '0x60'
+      - series: 'llm_usage_verdict_measured_observed_timestamp_seconds{upstream="u1"}'
+        values: '3500x60'
       - series: 'llm_tool_calls_verdict_measured{upstream="u1"}'
         values: '0x60'
+      - series: 'llm_tool_calls_verdict_measured_observed_timestamp_seconds{upstream="u1"}'
+        values: '3500x60'
       - series: 'llm_temperature_verdict_measured{upstream="u1"}'
         values: '0x60'
+      - series: 'llm_temperature_verdict_measured_observed_timestamp_seconds{upstream="u1"}'
+        values: '3500x60'
       - series: 'llm_upstream_healthy{upstream="u1"}'
         values: '1x60'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{upstream="u1"}'
+        values: '3500x60'
       - series: 'llm_usage_verdict_measured{upstream="u2"}'
         values: '0x60'
+      - series: 'llm_usage_verdict_measured_observed_timestamp_seconds{upstream="u2"}'
+        values: '3500x60'
       - series: 'llm_tool_calls_verdict_measured{upstream="u2"}'
         values: '0x60'
+      - series: 'llm_tool_calls_verdict_measured_observed_timestamp_seconds{upstream="u2"}'
+        values: '3500x60'
       - series: 'llm_temperature_verdict_measured{upstream="u2"}'
         values: '0x60'
+      - series: 'llm_temperature_verdict_measured_observed_timestamp_seconds{upstream="u2"}'
+        values: '3500x60'
       - series: 'llm_upstream_healthy{upstream="u2"}'
         values: '0x60'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{upstream="u2"}'
+        values: '3500x60'
     alert_rule_test:
       - eval_time: 60m
         alertname: llm_usage_verdict_unmeasured
@@ -187,6 +213,8 @@ tests:
         values: '0x5 2x55'
       - series: 'llm_pool_available'
         values: '1x60'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x60'
     alert_rule_test:
       - eval_time: 60m
         alertname: llm_upstream_rejecting_while_pool_reads_available
@@ -203,6 +231,8 @@ tests:
         values: '0x5 2x55'
       - series: 'llm_pool_available'
         values: '0x60'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x60'
     alert_rule_test:
       - eval_time: 60m
         alertname: llm_upstream_rejecting_while_pool_reads_available
@@ -213,14 +243,51 @@ tests:
     input_series:
       - series: 'llm_upstream_healthy{upstream="u1"}'
         values: '1x60'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{upstream="u1"}'
+        values: '3500x60'
       - series: 'llm_upstream_healthy{upstream="u2"}'
         values: '0x60'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{upstream="u2"}'
+        values: '3500x60'
     alert_rule_test:
       - eval_time: 60m
         alertname: llm_pool_capacity_degraded
         exp_alerts:
           - exp_labels:
               severity: warning
+
+  # 池那一行是**冻住的**：伴生钟八小时没动，而拒绝还在动。少了新鲜度腿这一格会亮，
+  # 判词说「池说可用」——可那个 1 是八小时前写下的，写它的进程已经不在了。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_client_errors_total{upstream="u1"}'
+        values: '0x5 2x475'
+      - series: 'llm_pool_available'
+        values: '1x480'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x480'
+    alert_rule_test:
+      - eval_time: 480m
+        alertname: llm_upstream_rejecting_while_pool_reads_available
+        exp_alerts: []
+
+  # 一家健康、另一家的判词是八小时前写的：那不是「一家不健康」，是「没有这一家此刻的
+  # 测量」。只数被量过的成员，所以这一格静——旧的算法会把 u2 同时数进分母与减数，
+  # 于是池永远「在变薄」，变薄的那一次测量已经过去八小时了。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_healthy{upstream="u1"}'
+        values: '1x480'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{upstream="u1"}'
+        values: '27500x480'
+      - series: 'llm_upstream_healthy{upstream="u2"}'
+        values: '0x480'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{upstream="u2"}'
+        values: '3500x480'
+    alert_rule_test:
+      - eval_time: 480m
+        alertname: llm_pool_capacity_degraded
+        exp_alerts: []
 
   # 池开着却一小时没人用：额度够（100-10-10=80）、限速做着（1）、准入读数新鲜、
   # 用量计数器一小时没动。四条腿都成立 ⇒ 亮。
