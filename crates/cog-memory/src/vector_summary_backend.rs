@@ -23,15 +23,29 @@ use cog_core::{SummaryEntry, SummarySearchResult};
 /// Default collection name when none is provided.
 pub const DEFAULT_SUMMARY_COLLECTION: &str = "summaries";
 
-/// Attempts at creating the summary collection before the failure is reported.
+/// How long startup keeps trying to (re)create the summary collection before it
+/// reports the failure.
 ///
-/// Five, because the window has to outlast the six seconds the live Qdrant took
-/// between deleting the collection and creating it again: a window that ends
-/// before the server does is the same failure as no retry at all.
-const CREATE_COLLECTION_ATTEMPTS: u32 = 5;
+/// A rollout starts every workload at once and each of them drops and rebuilds
+/// this one collection, so the creates arrive as a storm and the live Qdrant
+/// answers slower than the client's own six-second timeout. Waiting is the
+/// cheap side of this trade: under `strict_persistence=true` the alternative is
+/// exiting, which restarts the process into the same storm while the readiness
+/// probe is the only thing keeping traffic off, and a restart costs more than
+/// the wait. Two minutes is several times the window a live storm needed (about
+/// half a minute of failed attempts took a process down on 2026-10-25) and it
+/// stays well inside the 300s startup probe, so a store that is genuinely
+/// broken still surfaces instead of hanging.
+const CREATE_COLLECTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Delay before the second attempt; doubled for each attempt after that.
+/// Delay before the second attempt; doubled for each attempt after that, up to
+/// [`CREATE_COLLECTION_BACKOFF_DOUBLINGS`], so a long wait keeps asking often
+/// instead of sleeping one long block.
 const CREATE_COLLECTION_BACKOFF_MS: u64 = 500;
+
+/// How many times the backoff doubles before it stops growing: 500ms × 2⁴ = 8s
+/// between attempts.
+const CREATE_COLLECTION_BACKOFF_DOUBLINGS: u32 = 4;
 
 /// What one repair pass did.
 ///
@@ -66,6 +80,12 @@ pub struct VectorSummaryBackend {
     /// Optional directory for `<dir>/summary.json` persistence (fallback for
     /// in-memory entry stores).
     persist_dir: RwLock<Option<PathBuf>>,
+    /// How long a failed collection create is retried before the failure is
+    /// reported; [`CREATE_COLLECTION_DEADLINE`] unless a test says otherwise.
+    collection_retry_deadline: std::time::Duration,
+    /// Base delay between attempts; [`CREATE_COLLECTION_BACKOFF_MS`] unless a
+    /// test says otherwise.
+    collection_retry_backoff_ms: u64,
 }
 
 impl VectorSummaryBackend {
@@ -91,7 +111,20 @@ impl VectorSummaryBackend {
             vec_ids: RwLock::new(HashMap::new()),
             init_guard: Mutex::new(false),
             persist_dir: RwLock::new(None),
+            collection_retry_deadline: CREATE_COLLECTION_DEADLINE,
+            collection_retry_backoff_ms: CREATE_COLLECTION_BACKOFF_MS,
         }
+    }
+
+    /// Shorten the collection-create retry window.
+    ///
+    /// Test-only: the production window is minutes long, and a test that sits
+    /// through it proves nothing the constants do not already pin.
+    #[cfg(test)]
+    fn with_collection_retry(mut self, deadline: std::time::Duration, backoff_ms: u64) -> Self {
+        self.collection_retry_deadline = deadline;
+        self.collection_retry_backoff_ms = backoff_ms;
+        self
     }
 
     /// Builder-style helper that replaces the entry store.
@@ -142,8 +175,9 @@ impl VectorSummaryBackend {
         Ok(())
     }
 
-    /// Create the collection, retrying a bounded number of times, and stop as
-    /// soon as the collection turns out to be there for someone else's reason.
+    /// Create the collection, retrying until [`CREATE_COLLECTION_DEADLINE`] and
+    /// stopping as soon as the collection turns out to be there for someone
+    /// else's reason.
     ///
     /// Two failures reach this loop that are not the server saying no: the
     /// client's timeout is shorter than the create can take (the live Qdrant
@@ -156,7 +190,13 @@ impl VectorSummaryBackend {
     /// each failed attempt asks the server what it actually has instead of
     /// treating the refusal as final. The cost of being wrong in this direction
     /// is a slower start instead of a crash loop.
+    ///
+    /// The bound is a deadline rather than a count of attempts because the
+    /// failures are slow: with the client's own timeout in front of it, five
+    /// attempts are about half a minute, and a storm of deletes and recreates
+    /// from the workloads starting together outlasts that.
     async fn create_collection_with_retry(&self) -> SFResult<()> {
+        let started = std::time::Instant::now();
         let mut attempt: u32 = 1;
         loop {
             let failure = match self
@@ -185,18 +225,25 @@ impl VectorSummaryBackend {
                     "could not read whether the collection exists after a failed create"
                 ),
             }
-            if attempt >= CREATE_COLLECTION_ATTEMPTS {
-                return Err(failure);
-            }
-            let delay_ms = CREATE_COLLECTION_BACKOFF_MS << (attempt - 1);
+            let left = match self
+                .collection_retry_deadline
+                .checked_sub(started.elapsed())
+            {
+                Some(left) => left,
+                None => return Err(failure),
+            };
+            let delay_ms = self
+                .collection_retry_backoff_ms
+                .saturating_mul(1u64 << (attempt - 1).min(CREATE_COLLECTION_BACKOFF_DOUBLINGS));
             tracing::warn!(
                 collection = %self.collection,
                 attempt,
                 delay_ms,
+                waited_secs = started.elapsed().as_secs(),
                 error = %failure,
                 "vector collection create failed; retrying"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms).min(left)).await;
             attempt += 1;
         }
     }
@@ -1316,14 +1363,28 @@ mod tests {
     }
 
     /// The window is what makes the retries worth anything: a window that ends
-    /// before the server finishes is no retry at all.
+    /// before the server finishes is no retry at all. The failures are slow —
+    /// each one costs the client's own timeout — so the window is measured in
+    /// minutes, and it has to fit inside the startup probe that keeps the
+    /// container alive while it waits.
     #[test]
-    fn the_retry_window_outlasts_a_six_second_create() {
-        let window_ms =
-            CREATE_COLLECTION_BACKOFF_MS * ((1u64 << (CREATE_COLLECTION_ATTEMPTS - 1)) - 1);
+    fn the_retry_window_outlasts_a_collection_storm_and_fits_the_startup_probe() {
         assert!(
-            window_ms >= 6_000,
-            "the retry window is {window_ms} ms; the live Qdrant took six seconds"
+            CREATE_COLLECTION_DEADLINE >= std::time::Duration::from_secs(60),
+            "the retry window is {:?}; a storm of deletes and recreates from the workloads \
+             starting together ran longer than half a minute on 2026-10-25",
+            CREATE_COLLECTION_DEADLINE
+        );
+        assert!(
+            CREATE_COLLECTION_DEADLINE < std::time::Duration::from_secs(300),
+            "the retry window is {:?}; the startup probe kills the container after 300s, so a \
+             window past that is a window nobody waits in",
+            CREATE_COLLECTION_DEADLINE
+        );
+        assert_eq!(
+            CREATE_COLLECTION_BACKOFF_MS * (1u64 << CREATE_COLLECTION_BACKOFF_DOUBLINGS),
+            8_000,
+            "the backoff tops out at 8s, so a long wait still asks often"
         );
     }
 
@@ -1344,19 +1405,48 @@ mod tests {
         assert_eq!(hits.len(), 1, "the rebuilt index still holds the entry");
     }
 
+    /// A storm lasts longer than a handful of attempts. Every workload in a
+    /// rollout drops and rebuilds this collection, and each of them is slower
+    /// than the client's timeout, so a bound counted in attempts gives up in
+    /// the middle of exactly the situation it exists for.
+    #[tokio::test]
+    async fn a_create_storm_outlasting_a_handful_of_attempts_is_waited_out() {
+        let store = Arc::new(DurableStubStore::new());
+        store.upsert(&entry("s1")).await.unwrap();
+        // Nine creates fail before one gets through — more attempts than any
+        // fixed count this loop ever had.
+        let vector = Arc::new(SlowCreate::failing(8));
+        let backend = VectorSummaryBackend::new(vector.clone(), 4)
+            .with_store(store)
+            .with_collection_retry(std::time::Duration::from_millis(200), 1);
+
+        backend
+            .load()
+            .await
+            .expect("the storm ends and startup continues");
+
+        assert_eq!(vector.attempts(), 9, "the loop kept trying past the storm");
+    }
+
     /// Retries are bounded: a collection that cannot be created at all still
     /// reports the failure rather than starting with a silently empty index.
     #[tokio::test]
     async fn a_create_that_keeps_failing_gives_up_after_the_bound() {
         let store = Arc::new(DurableStubStore::new());
         let vector = Arc::new(SlowCreate::failing(usize::MAX));
-        let backend = VectorSummaryBackend::new(vector.clone(), 4).with_store(store);
+        let backend = VectorSummaryBackend::new(vector.clone(), 4)
+            .with_store(store)
+            .with_collection_retry(std::time::Duration::from_millis(50), 1);
 
         let err = backend.load().await.expect_err("the failure is reported");
         assert!(
             err.to_string().contains("Timeout expired"),
             "the last error survives the retries: {err}"
         );
-        assert_eq!(vector.attempts() as u32, CREATE_COLLECTION_ATTEMPTS);
+        assert!(
+            vector.attempts() > 1,
+            "the bound is a wait, not the first failure: {} attempt(s)",
+            vector.attempts()
+        );
     }
 }
