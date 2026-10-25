@@ -1186,9 +1186,13 @@ rows:
   - key: sandboxExecutor.storage
     source: override
     why: >-
-      The executor's own volume. Its contents are enumerated beside the cache cap
-      (cargo home, bare repo, worktrees), so a derived value could add them up
-      against the volume's free space; nothing does.
+      The executor's own volume. How full it is, is measured: the walk over the
+      declared claims publishes cogneva_data_volume_used_bytes for this claim,
+      over the whole mount that the task worktrees, the bare repository and the
+      build cache share. What is still hand-set is the size itself -- resizing a
+      claim is a delivery decision, not a value this process may write -- so the
+      reading is what someone resizes from, and no loop turns it into a new PVC
+      size.
 
   - key: sandboxExecutor.workspaceGcIntervalSecs
     source: derived
