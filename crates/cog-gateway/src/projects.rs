@@ -28,7 +28,7 @@ use crate::GatewayState;
 
 /// 没有 `goal_id` 的任务归到这里。它是一个**具名**的桶，不是被丢掉的那些：
 /// 把无归属的任务悄悄排除，全部项目加起来会小于总数，而那个差没有任何地方会说。
-pub const UNGROUPED: &str = "ungrouped";
+pub const UNGROUPED: &str = cog_core::UNGROUPED_PROJECT;
 
 #[derive(Debug, Serialize)]
 pub struct Source {
@@ -257,10 +257,9 @@ async fn readable_plans(
 }
 
 fn project_key(task: &Task) -> &str {
-    match task.goal_id.as_deref() {
-        Some(g) if !g.is_empty() => g,
-        _ => UNGROUPED,
-    }
+    // 项目身份只有一处定义：发布侧的列上限与这里的看板读面必须按同一个 id
+    // 记账，否则某项目的上限按 A 记、超限按 B 报。
+    task.project_key()
 }
 
 /// 一条任务在界面上叫什么。任务没有独立的名字列，标题只能从输入里取；取不到就
@@ -382,16 +381,22 @@ fn tasks_of_project<'a>(tasks: &'a [Task], id: &str) -> Vec<&'a Task> {
     tasks.iter().filter(|t| project_key(t) == id).collect()
 }
 
-fn build_board_columns(rows: &[&Task]) -> Vec<BoardColumn> {
+fn build_board_columns(rows: &[&Task], limits: &cog_core::BoardWipLimits) -> Vec<BoardColumn> {
     status_counts(rows)
         .into_iter()
-        .map(|c| BoardColumn {
-            status: c.status,
-            count: c.count,
-            // 列上限要等计划基线（期 2）才有出处。现在留 `None` 而不是填一个默认数：
-            // 填了默认数，界面就会说「上限 32，未超」，而实际上没有任何东西在拦派发。
-            wip_limit: None,
-            over_limit: None,
+        .map(|c| {
+            // 没配上限的列两格都是 `None`：印成 0 会让「没有上限」看起来像
+            // 「上限为零」，印成 `false` 会让「没有东西在拦」读成「拦过、没超」。
+            let limit = limits.limit_for(&c.status);
+            BoardColumn {
+                wip_limit: limit,
+                // 满了就拦：到达上限这一刻，发布侧已经不再往这一列放新活。读面
+                // 与拦住它的那道判据用同一个比较，读数才不会说「未超」而派发
+                // 已经被拦下。
+                over_limit: limit.map(|limit| c.count >= limit),
+                status: c.status,
+                count: c.count,
+            }
         })
         .collect()
 }
@@ -444,7 +449,17 @@ pub async fn project_board_handler(
         return Err(ApiError::not_found(format!("project {id}")));
     }
 
-    let columns = build_board_columns(&rows);
+    // 上限是本进程的环境配置，与发布侧读的是同一个变量、同一个解析：看板上
+    // 写着的上限，就是拦住派发的那个数。
+    let (limits, problems) = cog_core::BoardWipLimits::from_env();
+    for problem in problems {
+        tracing::warn!(
+            variable = cog_core::config::BOARD_WIP_LIMITS_ENV,
+            problem = %problem,
+            "board WIP limit entry ignored"
+        );
+    }
+    let columns = build_board_columns(&rows, &limits);
 
     Ok(Json(BoardResponse {
         project_id: id,
@@ -946,9 +961,34 @@ mod tests {
     #[test]
     fn board_columns_report_no_limit_as_absent_rather_than_as_no_overflow() {
         let t = task("a", Some("g1"));
-        let columns = build_board_columns(&[&t]);
+        let (limits, _) = cog_core::BoardWipLimits::from_spec("");
+        let columns = build_board_columns(&[&t], &limits);
         assert!(columns.iter().all(|c| c.wip_limit.is_none()));
         assert!(columns.iter().all(|c| c.over_limit.is_none()));
+    }
+
+    /// 配了上限的列要把数读出来，并给出「满了没有」。判据与发布侧同一条：
+    /// 到达上限就是满了——那一刻发布侧已经不往这一列放新活，读面说「未超」
+    /// 就是两处口径不一致。
+    #[test]
+    fn a_configured_limit_is_reported_with_the_same_comparison_the_gate_uses() {
+        let mut a = task("a", Some("g1"));
+        a.status = cog_core::TaskStatus::Running;
+        let mut b = task("b", Some("g1"));
+        b.status = cog_core::TaskStatus::Running;
+        let (limits, problems) = cog_core::BoardWipLimits::from_spec("running=2,scheduled=8");
+        assert!(problems.is_empty(), "{problems:?}");
+        let columns = build_board_columns(&[&a, &b], &limits);
+        let running = columns.iter().find(|c| c.status == "running").unwrap();
+        assert_eq!(running.count, 2);
+        assert_eq!(running.wip_limit, Some(2));
+        assert_eq!(running.over_limit, Some(true), "到了上限就等于满了");
+        let scheduled = columns.iter().find(|c| c.status == "scheduled").unwrap();
+        assert_eq!(scheduled.wip_limit, Some(8));
+        assert_eq!(scheduled.over_limit, Some(false));
+        let pending = columns.iter().find(|c| c.status == "pending").unwrap();
+        assert_eq!(pending.wip_limit, None, "没配的列不许借隔壁的数");
+        assert_eq!(pending.over_limit, None);
     }
 
     /// 六列的集合与顺序固定：缺的列要显式出 0，否则「这一列没有任务」与
@@ -956,7 +996,8 @@ mod tests {
     #[test]
     fn board_columns_are_all_six_statuses_in_a_fixed_order() {
         let t = task("a", Some("g1"));
-        let columns = build_board_columns(&[&t]);
+        let (limits, _) = cog_core::BoardWipLimits::from_spec("");
+        let columns = build_board_columns(&[&t], &limits);
         let order: Vec<&str> = columns.iter().map(|c| c.status.as_str()).collect();
         let expected: Vec<&str> = cog_core::TaskStatus::ALL
             .iter()

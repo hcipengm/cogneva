@@ -333,7 +333,7 @@ function BoardPanel({ project }: { project: ProjectRow }) {
       <Readings
         from={board}
         source={`GET /api/v1/projects/${project.id}/board`}
-        caveat="六列是同一批任务按状态分组的结果，加起来等于总数；列上限还没有出处，所以每列都写「没配上限」。"
+        caveat="六列是同一批任务按状态分组的结果，加起来等于总数；上限来自部署配置，没配的列写「没配上限」而不是 0。"
       >
         <div className="flex flex-wrap border-b border-[var(--line)] py-2">
           <Reading label="总数" value={data.total} />
@@ -357,8 +357,9 @@ function BoardPanel({ project }: { project: ProjectRow }) {
         ))}
       </div>
       <div className="px-4 py-2 text-[11px] text-[var(--muted)]">
-        上限是准入控制，不是画在列头的红字。计划基线（期 2）落地之前这里不显示上限，
-        因为填一个默认数会让一列看起来在拦派发，而实际上没有任何东西在拦。
+        上限是准入控制，不是画在列头的红字：到达上限时，这一列的活不再派发，任务留在
+        待办里等下一轮，所以「已超限」是这一列正在拦住新活的读数。上限由部署配置给出
+        （发布侧与这里读的是同一份），没配的列就是不限。
       </div>
     </>
   );

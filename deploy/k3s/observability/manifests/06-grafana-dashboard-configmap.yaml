@@ -2427,6 +2427,45 @@ data:
           }
         },
         {
+          "id": 63,
+          "title": "Publisher Holds: The Window and the Board",
+          "description": "Ready tasks the publisher refused to dispatch, as a rate per ten minutes. Both counters only rise, so the raw totals would say 'held at least once since this process started' and nothing about now. They are drawn together because each hides behind the same trace -- no dispatch -- which is exactly what a publisher with nothing to do looks like. The `window:` lines are the token window refusing a pass, by `reason`: `window_exhausted` repairs by waiting, `pool_unavailable` by the upstreams coming back, and `pass_ceiling` by nothing at all since the next pass takes the rest. The `board:` lines are a project's column sitting at the WIP limit configured for it, by `project` and `column`: that task stays Pending and is offered again next pass, so the column has to drain before the queue moves. No rule watches either counter, and none should: every nonzero value is the gate working as designed, and what would make a hold a fault is one that outlasts the thing that justified it -- a spent window resets on its own, a full column empties when its work finishes -- so the drawn comparison is the reading. A hold that never drains shows as a rate that stays flat while the column's own occupancy stays at its limit; a burst that clears in one pass is a spike. A blank stretch means nothing was held, not that the publisher stopped; its liveness is read on the loop tick. Cells appear only after a first refusal, which is why a board with no configured limit contributes no line at all.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 272
+          },
+          "targets": [
+            {
+              "expr": "max by (reason) (increase(cogneva_ready_admission_held_total[10m]))",
+              "legendFormat": "window: {{reason}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (project, column) (increase(cogneva_board_column_held_total[10m]))",
+              "legendFormat": "board: {{project}} / {{column}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
           "id": 58,
           "title": "Volume Capacity: Declaration, Granted and Measured Peak",
           "description": "The three numbers the growth loop decides from, per claim, drawn side by side: the declaration in force, what the storage side gave back (`granted`, the claim status capacity), and the highest usage ever measured against them. The `ceiling` line appears only while a claim is actually clamped, and its legend names the object that set it -- `limit_range` or `quota` -- so the wall and its owner arrive together rather than being inferred. The loop raises a declaration once the peak no longer fits, so on a healthy volume the peak line stays below the declared one and the gap is the headroom the loop is working with. A granted line below the declared one is an expansion that was asked for and never handed back -- on a class that cannot carry one it stays below forever, and the volume has no real bound at all. A peak above the granted line is data already on disk past what the volume was given. Neither number is derivable from the other side of the account -- the declaration is a request, the granted size is an answer, and the peak is a measurement -- which is why they are drawn rather than reduced to one ratio.",

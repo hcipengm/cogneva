@@ -1656,9 +1656,183 @@ fn set_json_path_at(current: &mut serde_json::Value, parts: &[&str], leaf: serde
     }
 }
 
+// ─── Board WIP limits ──────────────────────────────────────────────────────
+
+/// Environment variable holding the board's per-column work-in-progress limits.
+///
+/// Format: `column=limit[,column=limit]`, columns named by the board's own
+/// status vocabulary (`scheduled`, `running` are the admissible ones; see
+/// [`BoardWipLimits::from_spec`] for why the other four are refused). Unset
+/// means **no limit is configured** — not "zero", and not a platform default:
+/// an invented default is a hard admission cap nobody chose.
+pub const BOARD_WIP_LIMITS_ENV: &str = "COGNEVA_BOARD_WIP_LIMITS";
+
+/// The board's per-column work-in-progress limits.
+///
+/// This lives in core because two processes have to answer "what is this
+/// column's limit" the same way: the publisher, which refuses to push more work
+/// into a full column, and the board reading, which reports the column's count
+/// against it. Two parsers would be two rulers for one decision, and the board
+/// would sooner or later report a limit the publisher never read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoardWipLimits {
+    limits: std::collections::BTreeMap<String, usize>,
+}
+
+impl BoardWipLimits {
+    /// Parse a `column=limit,…` specification.
+    ///
+    /// Returns the limits plus one line per entry that could not be used. The
+    /// problems are returned rather than logged here so the caller can report
+    /// them where its own readers look; dropping a typo'd entry silently would
+    /// leave a configuration that reads like a limit and blocks nothing.
+    ///
+    /// A limit of `0` is refused rather than honoured. "Zero may pass" is a
+    /// freeze of the whole column, which is far more often a typo for
+    /// "unlimited" than an intention — and one of the two misreadings stops
+    /// dispatch across the platform.
+    ///
+    /// Only `scheduled` and `running` are accepted. The publisher's transition
+    /// is `pending` → `scheduled`, so a limit on `pending` would refuse the very
+    /// publish that empties it: the column would sit at its cap and never move.
+    /// The three terminal columns only ever grow, so their limit would stop
+    /// dispatch for good the first time it was reached. Both are reported as
+    /// problems rather than honoured, because a board that quietly freezes is
+    /// worse than one that refused the setting out loud.
+    pub fn from_spec(spec: &str) -> (Self, Vec<String>) {
+        let mut limits = std::collections::BTreeMap::new();
+        let mut problems = Vec::new();
+        for entry in spec.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let Some((column, limit)) = entry.split_once('=') else {
+                problems.push(format!("`{entry}` is not `column=limit`"));
+                continue;
+            };
+            let column = column.trim().to_ascii_lowercase();
+            let Some(status) = crate::TaskStatus::parse(&column) else {
+                problems.push(format!(
+                    "`{column}` is not a board column; the limitable ones are scheduled and running"
+                ));
+                continue;
+            };
+            let column = status.as_str().to_string();
+            if status == crate::TaskStatus::Pending {
+                problems.push(format!(
+                    "`{column}` is the intake column and publishing is what drains it: a limit \
+                     there would stop the queue that would relieve it"
+                ));
+                continue;
+            }
+            if status.is_terminal() {
+                problems.push(format!(
+                    "`{column}` only grows, so a limit there would stop dispatch for good once \
+                     reached"
+                ));
+                continue;
+            }
+            match limit.trim().parse::<usize>() {
+                Ok(0) => problems.push(format!(
+                    "`{column}=0` would freeze the column; leave the column out to leave it unlimited"
+                )),
+                Ok(n) => {
+                    limits.insert(column, n);
+                }
+                Err(_) => problems.push(format!(
+                    "`{}` is not a count of tasks",
+                    limit.trim()
+                )),
+            }
+        }
+        (Self { limits }, problems)
+    }
+
+    /// The limits configured for this process's environment.
+    pub fn from_env() -> (Self, Vec<String>) {
+        match std::env::var(BOARD_WIP_LIMITS_ENV) {
+            Ok(raw) => Self::from_spec(&raw),
+            Err(_) => (Self::default(), Vec::new()),
+        }
+    }
+
+    /// This column's limit, or `None` when the column was left out.
+    ///
+    /// `None` is "no limit", never `0`: a caller that read absence as a zero
+    /// cap would stop every column nobody configured.
+    pub fn limit_for(&self, column: &str) -> Option<usize> {
+        self.limits.get(column).copied()
+    }
+
+    /// Every configured `(column, limit)`, in the board's column order.
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, usize)> + '_ {
+        crate::TaskStatus::ALL.iter().filter_map(move |s| {
+            self.limits
+                .get(s.as_str())
+                .map(|limit| (s.as_str(), *limit))
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.limits.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 没配就是没配：每一列都读成 `None`，不是 0。0 在调用点是一个具体的
+    /// 判据（「一条也不许进」），没配是「没有任何东西在拦」。
+    #[test]
+    fn an_unset_board_limit_is_absent_and_never_zero() {
+        let (limits, problems) = BoardWipLimits::from_spec("");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(limits.limit_for("running"), None);
+        assert!(limits.is_empty());
+    }
+
+    /// 上限读出来就是人写的那个数，列的拼写大小写不敏感（配置是人手敲的）。
+    #[test]
+    fn configured_limits_read_back_by_column_name() {
+        let (limits, problems) = BoardWipLimits::from_spec("running=4, Scheduled = 32");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(limits.limit_for("running"), Some(4));
+        assert_eq!(limits.limit_for("scheduled"), Some(32));
+        assert_eq!(limits.limit_for("pending"), None);
+        let seen: Vec<(&str, usize)> = limits.iter().collect();
+        assert_eq!(
+            seen,
+            vec![("scheduled", 32), ("running", 4)],
+            "按看板的列序输出，同一份配置两次读出的顺序一致"
+        );
+    }
+
+    /// 敲错的条目必须被点名。静默丢掉一条拼错的配置，留下的是「看起来设了上限、
+    /// 实际上一条都没拦」——正是这份门存在要防的那种读数。
+    #[test]
+    fn a_misspelt_or_zero_entry_is_reported_rather_than_dropped() {
+        let (limits, problems) = BoardWipLimits::from_spec("runnning=8, 0, running=0, running=x");
+        assert!(limits.is_empty(), "四条都不该生效：{limits:?}");
+        assert_eq!(problems.len(), 4, "{problems:?}");
+        assert!(problems[0].contains("runnning"), "{problems:?}");
+        assert!(problems[2].contains("freeze"), "{problems:?}");
+    }
+
+    /// 两头都配不上的列被明确拒绝，而不是收下后把看板冻住：`pending` 的限额会
+    /// 拦住唯一能腾空它的那次发布（自锁），终态列的限额一旦达到就再也放不出活
+    /// （永冻）。静默接受这两类配置，等于给运维一把「看起来在工作」的锁。
+    #[test]
+    fn a_limit_on_the_intake_or_a_terminal_column_is_refused_with_the_reason() {
+        let (limits, problems) = BoardWipLimits::from_spec("pending=5, completed=100, running=4");
+        assert_eq!(limits.limit_for("running"), Some(4));
+        assert_eq!(limits.limit_for("pending"), None);
+        assert_eq!(limits.limit_for("completed"), None);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("intake"), "{problems:?}");
+        assert!(problems[1].contains("only grows"), "{problems:?}");
+    }
 
     /// The cache cap arrives as a string from the environment, through the same
     /// path every other setting takes: a byte count, `0` for "measure only",

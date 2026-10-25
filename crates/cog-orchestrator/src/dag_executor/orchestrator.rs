@@ -40,6 +40,21 @@ struct Inner {
     last_persist: Option<std::time::Instant>,
 }
 
+/// One snapshot of the graph, answering every question admission asks.
+///
+/// `columns` is per project and counts only tasks that have not finished: a
+/// column's occupancy is the work standing in it now, and a completed row is
+/// history, not a resident. `tasks` that belong to no goal land under
+/// [`cog_core::UNGROUPED_PROJECT`], the same bucket the board reading names.
+#[derive(Debug, Clone, Default)]
+pub struct ReadyWork {
+    pub ready: Vec<Task>,
+    /// How many tasks each ready queue already owes, by ready stream.
+    pub in_flight: HashMap<String, usize>,
+    /// Per project, how many unfinished tasks stand in each board column.
+    pub columns: HashMap<String, std::collections::BTreeMap<&'static str, u64>>,
+}
+
 pub struct DagExecutor {
     workspace_id: String,
     /// 本进程的运行身份，任务租约的持有者。每次构造新产生一个值，所以它随进程
@@ -1767,7 +1782,37 @@ impl DagExecutor {
     pub async fn ready_tasks_and_in_flight(
         &self,
     ) -> (Vec<Task>, std::collections::HashMap<String, usize>) {
+        let work = self.ready_work().await;
+        (work.ready, work.in_flight)
+    }
+
+    /// One read of the graph, answering every question admission asks: what is
+    /// ready, what each queue already owes, and how each project's board
+    /// columns are occupied.
+    ///
+    /// The column counts are per project because a WIP limit is a board's
+    /// limit, and a board is one project: two projects filling the same column
+    /// are not each other's backpressure. They are counted here rather than in
+    /// a second scan so the occupancy a decision is made on and the ready set
+    /// it is made about come from the same snapshot -- a second read could see
+    /// work finish in between and refuse against a column that has already
+    /// drained.
+    pub async fn ready_work(&self) -> ReadyWork {
         let tasks = self.all_tasks_unified().await;
+        let mut columns: std::collections::HashMap<
+            String,
+            std::collections::BTreeMap<&'static str, u64>,
+        > = std::collections::HashMap::new();
+        for t in &tasks {
+            if t.status.is_terminal() {
+                continue;
+            }
+            *columns
+                .entry(t.project_key().to_string())
+                .or_default()
+                .entry(t.status.as_str())
+                .or_insert(0) += 1;
+        }
         let now = chrono::Utc::now();
         let mut in_flight: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
@@ -1802,7 +1847,11 @@ impl DagExecutor {
             .cloned()
             .collect();
         ready.sort_by_key(|t| -t.priority);
-        (ready, in_flight)
+        ReadyWork {
+            ready,
+            in_flight,
+            columns,
+        }
     }
 
     /// Return all tasks that are ready for execution (Pending or Scheduled).

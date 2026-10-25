@@ -27,5 +27,5 @@ pub use self_review::{SelfReviewConfig, SelfReviewRecord, SelfReviewResult};
 pub use task::{
     ActionPlannerMeta, ActionPlannerSource, DagMessage, EvolutionIntent, GoalClass,
     GoalClassSource, GoalMessage, GoalSource, Task, TaskDAG, TaskPayload, TaskPlan, TaskStatus,
-    TaskStatusCounts, TaskType,
+    TaskStatusCounts, TaskType, UNGROUPED_PROJECT,
 };

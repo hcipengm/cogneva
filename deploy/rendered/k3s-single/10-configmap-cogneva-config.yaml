@@ -36,6 +36,13 @@ data:
   # 运维按正常路径改不动的开关。
   COGNEVA_WORKSPACE_MAX_BYTES: "1073741824"
   COGNEVA_CONSUMER_GROUP: "cogneva"
+  # 看板列的在制品上限。空串＝没配＝不限，渲染成空串而不是省略：省略会让「清单里
+  # 没有这个键」与「运维没配」变成同一件事。发布侧与看板读面都经 envFrom 取这一份，
+  # 写在这里的数就是真正拦住派发的那个——两处各配一份，看板会报一个没人拦的数。
+  #
+  # 发布是 `pending`→`scheduled` 这一步，所以可配的列只有 scheduled 与
+  # running：pending 的限额会拦住唯一能腾空它的那一步，终态列只增不减。
+  COGNEVA_BOARD_WIP_LIMITS: ""
 
   COGNEVA_HTTP_PORT: "8080"
   COGNEVA_WS_PORT: "8081"

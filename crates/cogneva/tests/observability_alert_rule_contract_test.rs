@@ -4177,17 +4177,16 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_dag_stalled_scheduled_deferred_for_backlog_total",
         Unread::Gap("rows the sweep left in Scheduled because their queue still held undelivered entries. Any nonzero is the wait working as designed, so a rule on it would page on a healthy backlog; what would make a run of deferrals a fault is a backlog that never drains, and the sweep cannot state that -- it counts the rows it left alone, not the messages still waiting, and the queue's undelivered count is read inside the process that asks rather than published as a series. Closing this entry means publishing that backlog depth and reading the two together, not inventing a threshold for this one"),
     ),
-    // The pair minted when the publisher started holding ready tasks back on
-    // what the window can pay for. Both arrive in the pass that made the hold
-    // visible, and both are debts whose reader is a panel rather than a rule:
-    // each of their cells is the gate working as designed at some level, so a
-    // threshold on either would page on the mechanism doing its job. Filing
-    // them here is the deliberate admission that the panel was not written in
-    // this pass, not a claim that no reader can exist.
-    (
-        "cogneva_ready_admission_held_total",
-        Unread::Gap("tasks the publisher refused to dispatch because the pool's window could not pay for them, by `stream` and `reason`. A rule cannot close it: any nonzero is the admission gate holding correctly while the window is spent, and what would make a hold a fault is one that outlasts the window that justified it -- a bound nobody has declared, since the only operand for it is the window's own reset time, which the readings series beside this one carries. Its reader is a panel drawing this count beside the remaining allowance and the reset, which is a panel because the healthy state is a nonzero count for as long as the window is spent. No such panel was written in this pass"),
-    ),
+    // The pair minted when the publisher started holding ready tasks back --
+    // one on what the window can pay for, one on the board column that is full
+    // -- is not counted here any more: the dashboard's "Publisher Holds: The
+    // Window and the Board" panel draws both, which is the reader the window
+    // half was filed as owing. A rule still cannot take either: every nonzero
+    // is the gate working as designed, and what would make a hold a fault is
+    // one that outlasts what justified it. The window entry left with the
+    // panel; the board entry never had to be filed, because it arrived with its
+    // reader in the same pass -- which is why the count moves by one.
+    //
     // The write-window record, published for the first time in this pass because
     // the face that owes the reading had nowhere to get it from. Four cells, and
     // a rule on any of them would have to say when an overlap or a self-approval
@@ -4473,7 +4472,16 @@ const UNREAD: &[(&str, Unread)] = &[
 /// that was always in the rows but only ever in prose, and the bound that would
 /// turn any of its cells into a fault is a policy about how much owed work is
 /// normal, which nobody has stated. The panel is the reader it owes.
-const GAPS_AT_CENSUS: usize = 30;
+///
+/// It went back to 29 in the pass that gave the publisher's holds their panel.
+/// That pass also published a new series, `cogneva_board_column_held_total` --
+/// the other way a ready task is held back, this one by a project's board
+/// column -- and it arrived with the same panel already drawing it, so it added
+/// no debt to file. A new series that a fancier publisher would have filed and
+/// left is the shape this number punishes; here the two holds are one picture
+/// because a reader who saw only the window's would think a starved column was
+/// an idle one.
+const GAPS_AT_CENSUS: usize = 29;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

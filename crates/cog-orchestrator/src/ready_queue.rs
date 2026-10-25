@@ -190,6 +190,33 @@ pub fn admitted(ready: u64, owed: u64, window_jobs: Option<u64>) -> u64 {
     }
 }
 
+/// Whether a project's board can take one more task, and which column says no.
+///
+/// A board column's limit is admission control, not a colour: when a project's
+/// column is full, its ready work is not put on a queue at all -- the task stays
+/// `Pending` and is offered again on the next pass, the same shape as a task
+/// waiting on a dependency. "Full" means at or over, so a column configured at
+/// four holds four and takes no fifth.
+///
+/// Publishing moves a task into `scheduled`, so `scheduled`'s limit bounds the
+/// publish directly: the caller asks once per task, and the tasks already
+/// admitted in the same pass count as occupancy, which is what keeps one pass
+/// from filling a column past its limit. `running`'s limit is the upstream the
+/// queue feeds -- pushing more work into a full `running` column does not make
+/// it finish any faster, so it stops the publish rather than queueing behind it.
+///
+/// `occupancy` is called with a column name so the caller's snapshot is read
+/// once per configured column, and an unconfigured board costs one `is_empty`.
+pub fn column_at_limit(
+    limits: &cog_core::BoardWipLimits,
+    occupancy: impl Fn(&str) -> u64,
+) -> Option<&'static str> {
+    limits
+        .iter()
+        .find(|(column, limit)| occupancy(column) >= *limit as u64)
+        .map(|(column, _)| column)
+}
+
 /// What one pass may put on a queue, and which gate produced that number.
 ///
 /// `bound` is `window` when the pool's own allowance sized the batch and
@@ -547,6 +574,46 @@ mod tests {
                 &["quota_cycle", "entitlement", "quota_cycle", "entitlement"]
             )),
             None
+        );
+    }
+
+    /// 没配上限的看板放行一切：一个「没人配上限」被读成「上限为零」的实现，
+    /// 会在第一次没有配置的部署里停掉整块看板的派发。
+    #[test]
+    fn an_unconfigured_board_admits_everything() {
+        let (limits, _) = cog_core::BoardWipLimits::from_spec("");
+        assert_eq!(column_at_limit(&limits, |_| 1_000), None);
+    }
+
+    /// 满了就拦，并且点名是哪一列拦的——判词要能把人送到该去松的那一列。
+    /// 边界是「到」不是「超」：上限 4 的第 5 条进不来，第 4 条进得来。
+    #[test]
+    fn a_full_column_names_itself_and_at_the_limit_is_full() {
+        let (limits, _) = cog_core::BoardWipLimits::from_spec("scheduled=4");
+        assert_eq!(
+            column_at_limit(&limits, |c| if c == "scheduled" { 4 } else { 0 }),
+            Some("scheduled")
+        );
+        assert_eq!(
+            column_at_limit(&limits, |c| if c == "scheduled" { 3 } else { 0 }),
+            None
+        );
+    }
+
+    /// 别的列满了也是拦：往上游再压活不能让它变快。这里 `running` 满了而
+    /// `scheduled` 还空着，若只看 scheduled 的余量，这一轮会照发一整批，
+    /// 而它们只会堆在同一列后面。
+    #[test]
+    fn a_full_running_column_stops_the_queue_that_feeds_it() {
+        let (limits, _) = cog_core::BoardWipLimits::from_spec("running=4");
+        assert_eq!(
+            column_at_limit(&limits, |c| if c == "running" { 4 } else { 0 }),
+            Some("running")
+        );
+        assert_eq!(
+            column_at_limit(&limits, |c| if c == "running" { 3 } else { 0 }),
+            None,
+            "有空的 running 列不该被凭空当成满"
         );
     }
 

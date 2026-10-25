@@ -39,6 +39,10 @@ data:
   # 每个用户工作区的字节上限（0 = 不限）。拒绝写入时错误信息点名的就是这一个键。
   COGNEVA_WORKSPACE_MAX_BYTES: "1073741824"
   COGNEVA_CONSUMER_GROUP: "cogneva"
+  # 看板列的在制品上限（`column=limit,…`，可配 scheduled / running）。空串＝不配
+  # ＝不限。发布侧与看板读面都从这一份 env 取，所以在这里写下的数就是真正拦住
+  # 派发的那个。
+  COGNEVA_BOARD_WIP_LIMITS: ""
 
   # Gateway
   COGNEVA_HTTP_PORT: "8080"

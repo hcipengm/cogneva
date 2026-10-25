@@ -119,6 +119,24 @@ struct AdmissionBound {
     retry_at_unix: i64,
 }
 
+/// The board's per-column WIP limits for this process, read once.
+///
+/// Entries that cannot be used are reported here, once, where an operator can
+/// see them: a misspelt column that was quietly dropped is a configuration that
+/// reads like a limit and blocks nothing, which is the failure the limit exists
+/// to make impossible.
+fn load_board_wip_limits() -> cog_core::BoardWipLimits {
+    let (limits, problems) = cog_core::BoardWipLimits::from_env();
+    for problem in problems {
+        tracing::warn!(
+            variable = cog_core::config::BOARD_WIP_LIMITS_ENV,
+            problem = %problem,
+            "board WIP limit entry ignored"
+        );
+    }
+    limits
+}
+
 /// DagExecutor 运行时。
 /// 负责 message-backend 连接、DAG 编排、Agent 消费。
 #[derive(Clone)]
@@ -138,6 +156,11 @@ pub struct DagExecutorRuntime {
     /// Empty means no source was published (a single-process deployment),
     /// which admits everything: an unread pool is not an empty one.
     pool_source: Arc<tokio::sync::OnceCell<Arc<dyn cog_core::LlmPoolStatusSource>>>,
+    /// 看板每一列的在制品上限，构造时从环境读一次。
+    ///
+    /// 读一次而不是每轮读：限制是配置，不是读数；每轮读环境会让同一份配置在
+    /// 两个进程里给出两个答案，而派发与看板读面必须按同一个数拦。
+    board_wip_limits: cog_core::BoardWipLimits,
 }
 
 impl DagExecutorRuntime {
@@ -153,6 +176,7 @@ impl DagExecutorRuntime {
             action_planner: None,
             skill_registry: None,
             pool_source: Arc::new(tokio::sync::OnceCell::new()),
+            board_wip_limits: load_board_wip_limits(),
         }
     }
 
@@ -168,7 +192,16 @@ impl DagExecutorRuntime {
             action_planner: None,
             skill_registry: None,
             pool_source: Arc::new(tokio::sync::OnceCell::new()),
+            board_wip_limits: load_board_wip_limits(),
         }
+    }
+
+    /// 换一套列上限。生产路径只从环境读（[`load_board_wip_limits`]），这个入口
+    /// 给测试用：一个只能在改环境变量下才验证得了的准入，会和同进程里别的用例
+    /// 抢同一份环境。
+    pub fn with_board_wip_limits(mut self, limits: cog_core::BoardWipLimits) -> Self {
+        self.board_wip_limits = limits;
+        self
     }
 
     /// Point the ready-queue publisher at the pool's own reading.
@@ -246,7 +279,9 @@ impl DagExecutorRuntime {
     /// A task whose artifact is only readable by its producer does not go on
     /// the queue every worker competes for; see [`crate::ready_queue`].
     pub async fn publish_ready_tasks(&self) -> SFResult<()> {
-        let (ready_tasks, in_flight) = self.orchestrator.ready_tasks_and_in_flight().await;
+        let work = self.orchestrator.ready_work().await;
+        let columns = work.columns;
+        let (ready_tasks, in_flight) = (work.ready, work.in_flight);
         // What the pool's window can still pay for, together with how much of
         // the pool the measurement covered. No bound admits everything: a
         // missing reading is not a closed window, and a publisher that stopped
@@ -330,6 +365,7 @@ impl DagExecutorRuntime {
         }
 
         let mut first_error: Option<SFError> = None;
+        let mut column_holds: HashMap<(String, &'static str), u64> = HashMap::new();
         for (stream, mut entries) in by_stream {
             if let Some(&admitted) = admitted_by_stream.get(&stream) {
                 if (entries.len() as u64) > admitted {
@@ -405,7 +441,37 @@ impl DagExecutorRuntime {
             }
             let limit = self.backend.payload_limit(&stream).await?;
             let mut payloads = Vec::with_capacity(entries.len());
+            // 每一列的在制品上限，按项目判。放进逐条循环而不是在批头上截断：
+            // 同一批里可能混着多个项目，一个项目满了不该拦住另一个项目。
+            // 这一轮已经放进 `scheduled` 的那几条要算进占用，否则一次 pass 就能
+            // 把一列灌到上限之外。
+            let mut taken: HashMap<String, u64> = HashMap::new();
             for (task, payload) in entries {
+                if !self.board_wip_limits.is_empty() {
+                    let project = task.project_key().to_string();
+                    let here = taken.get(&project).copied().unwrap_or(0);
+                    let occupancy = columns.get(&project);
+                    let at_limit =
+                        crate::ready_queue::column_at_limit(&self.board_wip_limits, |column| {
+                            let standing =
+                                occupancy.and_then(|c| c.get(column)).copied().unwrap_or(0);
+                            // 这一轮已经放行的活落在 scheduled 这一列上。
+                            let admitted_here = if column == "scheduled" { here } else { 0 };
+                            standing + admitted_here
+                        });
+                    if let Some(column) = at_limit {
+                        *column_holds.entry((project.clone(), column)).or_insert(0) += 1;
+                        tracing::debug!(
+                            task_id = %task.id,
+                            project = %project,
+                            column,
+                            limit = ?self.board_wip_limits.limit_for(column),
+                            "holding a ready task back: its project's board column is at its limit"
+                        );
+                        continue;
+                    }
+                    *taken.entry(project).or_insert(0) += 1;
+                }
                 if let Some(limit) = limit {
                     if payload.len() > limit {
                         tracing::error!(
@@ -452,6 +518,27 @@ impl DagExecutorRuntime {
                     first_error = Some(e);
                 }
                 continue;
+            }
+        }
+        // 这一轮被列上限拦下的活，按项目与列记账。计数器而不是 gauge：列满了
+        // 这件事会随活干完自己消失，gauge 在填满前后都读 0。没配上限时一条都
+        // 不写——一排零会让「没人配」看起来像「没有一次被拦」。
+        if !column_holds.is_empty() {
+            if let Some(metrics) = self.orchestrator.metrics_backend() {
+                for ((project, column), held) in column_holds {
+                    let mut labels = HashMap::new();
+                    labels.insert("project".to_string(), project);
+                    labels.insert("column".to_string(), column.to_string());
+                    drop(
+                        metrics
+                            .record_counter(
+                                cog_core::metric_names::BOARD_COLUMN_HELD_TOTAL,
+                                held as f64,
+                                labels,
+                            )
+                            .await,
+                    );
+                }
             }
         }
         match first_error {
@@ -1757,6 +1844,208 @@ mod consumer_ack_tests {
             cog_core::TaskStatus::Pending,
             "the over-limit task stays pending so the next scan offers it again"
         );
+    }
+
+    /// 只留计数器的 metrics 后端：这里要看的读数是「谁被上限拦了」，gauge 与
+    /// 查询都不参与。
+    #[derive(Default)]
+    struct Counters {
+        writes: std::sync::Mutex<Vec<(String, f64, HashMap<String, String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::MetricsBackend for Counters {
+        async fn record_gauge(
+            &self,
+            _: cog_core::MetricName,
+            _: f64,
+            _: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn record_counter(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            self.writes
+                .lock()
+                .unwrap()
+                .push((name.as_str().to_string(), value, labels));
+            Ok(())
+        }
+        async fn record_histogram(
+            &self,
+            _: cog_core::MetricName,
+            _: f64,
+            _: HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn query_gauge_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn query_gauge_latest(
+            &self,
+            _: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn query_counter_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn query_counter_totals(
+            &self,
+            _: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn query_histogram_totals(
+            &self,
+            _: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::HistogramTotals>> {
+            Ok(Vec::new())
+        }
+        async fn query_histogram_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+        async fn list_metric_names(
+            &self,
+            _: cog_core::MetricType,
+        ) -> cog_core::SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn health_check(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+
+    /// 上限拦下活这件事要在读数里看得见，而且要点名是哪个项目、哪一列：一个
+    /// 只有条数的读数说不出的，正是「该去松哪一列」。
+    #[tokio::test]
+    async fn the_column_that_refused_is_named_in_the_reading() {
+        let backend = ScriptedBackend::default();
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-wip-reading".into(),
+            consumer_group: "grp-wip-reading".into(),
+            max_retries: 1,
+            ..DagExecutorConfig::default()
+        };
+        let (limits, _) = cog_core::BoardWipLimits::from_spec("scheduled=1");
+        let runtime = test_runtime_with(backend, config).with_board_wip_limits(limits);
+        let counters = Arc::new(Counters::default());
+        runtime.orchestrator().attach_metrics(counters.clone());
+
+        let under = |id: &str| {
+            let mut t = ready_task(id, serde_json::json!({}));
+            t.goal_id = Some("goal-wip".into());
+            t
+        };
+        runtime
+            .orchestrator()
+            .submit_goal("goal-wip", vec![under("task-1"), under("task-2")])
+            .await
+            .unwrap();
+        runtime.publish_ready_tasks().await.unwrap();
+
+        let writes = counters.writes.lock().unwrap().clone();
+        let held: Vec<&(String, f64, HashMap<String, String>)> = writes
+            .iter()
+            .filter(|(name, _, _)| name == "cogneva_board_column_held_total")
+            .collect();
+        assert_eq!(
+            held.len(),
+            1,
+            "一条判词，不是每条被拦的任务一条：{writes:?}"
+        );
+        assert_eq!(held[0].1, 1.0, "被拦下的是一条");
+        assert_eq!(
+            held[0].2.get("column").map(String::as_str),
+            Some("scheduled")
+        );
+        assert_eq!(
+            held[0].2.get("project").map(String::as_str),
+            Some("goal-wip")
+        );
+    }
+
+    /// 列上限是准入控制，不是画在列头上的红字：这一列满了，新活留在
+    /// `Pending`，下一轮再看——而不是照发出去、然后在界面上标红。
+    ///
+    /// 区分在这一列上：若上限只是「读面标红」，三条任务会全部变成
+    /// `Scheduled`，这条断言就会红。
+    #[tokio::test]
+    async fn a_full_board_column_holds_ready_tasks_back_in_pending() {
+        let backend = ScriptedBackend::default();
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-wip-test".into(),
+            consumer_group: "grp-wip-test".into(),
+            max_retries: 1,
+            ..DagExecutorConfig::default()
+        };
+        let (limits, problems) = cog_core::BoardWipLimits::from_spec("scheduled=1");
+        assert!(problems.is_empty(), "{problems:?}");
+        let runtime = test_runtime_with(backend, config).with_board_wip_limits(limits);
+
+        let urgent = {
+            let mut t = ready_task("task-urgent", serde_json::json!({}));
+            t.priority = 9;
+            t
+        };
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-wip",
+                vec![
+                    urgent,
+                    ready_task("task-2", serde_json::json!({})),
+                    ready_task("task-3", serde_json::json!({})),
+                ],
+            )
+            .await
+            .unwrap();
+        runtime.publish_ready_tasks().await.unwrap();
+
+        let status = |id: &'static str| {
+            let orchestrator = runtime.orchestrator().clone();
+            async move {
+                orchestrator
+                    .get_task(id)
+                    .await
+                    .unwrap_or_else(|| panic!("{id} present"))
+                    .status
+            }
+        };
+        assert_eq!(
+            status("task-urgent").await,
+            cog_core::TaskStatus::Scheduled,
+            "上限只放一条时，放的是优先级最高的那条"
+        );
+        for held in ["task-2", "task-3"] {
+            assert_eq!(
+                status(held).await,
+                cog_core::TaskStatus::Pending,
+                "列满了就留在 Pending，等下一轮——放出去才是真的超了"
+            );
+        }
     }
 
     /// A task that names its executor must not be offered to the queue every

@@ -1142,6 +1142,26 @@ metric_names! {
     // store freezes the last value of every label combination it has seen.
     READY_ADMISSION_HELD_TOTAL => "cogneva_ready_admission_held_total",
 
+    // cog-orchestrator — ready tasks held back because one of their project's
+    // board columns was at its configured limit.
+    //
+    // Labelled by `project` and `column`, both read off work the publisher was
+    // about to dispatch: `project` is the goal root the task belongs to (or the
+    // named bucket for tasks outside every goal), `column` is one of the board's
+    // status names. The limit itself is never a label -- it is configuration,
+    // and a series that renames itself when a setting changes is a series whose
+    // history cannot be read.
+    //
+    // A counter, because the state it describes clears itself as work finishes:
+    // a gauge would read zero both before the column filled and after it
+    // drained. Absent until a column first refuses, which is also what keeps an
+    // unconfigured board from publishing a row of zeros.
+    //
+    // The `_total` suffix is not decoration: the exposition types a series from
+    // its name alone, and the live probe selects counters by the same suffix,
+    // so a counter named without it renders as a gauge holding a sum.
+    BOARD_COLUMN_HELD_TOTAL => "cogneva_board_column_held_total",
+
     // The same pass's arithmetic, as one cell per `stream` × `kind` pair.
     //
     // `kind` is a closed set: `bounded` (1 when the window's allowance bounded

@@ -469,6 +469,41 @@ impl TaskStatus {
             _ => None,
         }
     }
+
+    /// Whether the task has stopped moving on its own: no transition leaves
+    /// these states, so a row in one of them is history rather than work
+    /// standing in a column.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        )
+    }
+}
+
+/// The bucket id for tasks that belong to no goal.
+///
+/// Named rather than dropped: a reading that leaves those rows out makes the
+/// projects sum to less than the whole graph, and the difference is a number
+/// no surface reports. The writer that labels the workspace totals and the
+/// board reading that labels a column both use this spelling, so a limit
+/// configured for one is read back under the name the other publishes.
+pub const UNGROUPED_PROJECT: &str = "ungrouped";
+
+impl Task {
+    /// Which project this task belongs to: the goal root it was submitted
+    /// under, or [`UNGROUPED_PROJECT`] when it was submitted outside a goal.
+    ///
+    /// The publisher's WIP limits and the project reading both key on this, so
+    /// it is defined once. An empty goal id counts as none: a row written by a
+    /// path that set the field to `""` was not submitted under a project either,
+    /// and treating it as one would invent a project named after nothing.
+    pub fn project_key(&self) -> &str {
+        match self.goal_id.as_deref() {
+            Some(goal) if !goal.is_empty() => goal,
+            _ => UNGROUPED_PROJECT,
+        }
+    }
 }
 
 /// How the tasks a store holds distribute over the states the cluster

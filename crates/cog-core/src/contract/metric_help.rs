@@ -768,6 +768,19 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          the first deferral",
     ),
     (
+        "cogneva_board_column_held_total",
+        "Ready tasks held back because one of their project's board columns \
+         was at its configured limit, by project (the goal root the task \
+         belongs to, or the named bucket for tasks outside every goal) and \
+         column (one of the board's status names). It is the only reading that \
+         separates 'the column limit is doing its job' from 'the publisher had \
+         nothing to do': both leave the same trace, no dispatch. Summed over \
+         passes rather than served as a level because the state it describes \
+         clears itself as work finishes. A limit of zero never appears here: \
+         the parser refuses it, so an empty column cannot be mistaken for an \
+         unlimited one. Absent until a column first refuses",
+    ),
+    (
         "cogneva_ready_admission_held_total",
         "Ready tasks nothing admitted, by stream (shared or local) and reason \
          (window_exhausted; pool_unavailable when the gateway's own verdict \
