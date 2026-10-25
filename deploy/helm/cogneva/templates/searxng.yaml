@@ -20,20 +20,21 @@ data:
     # 于是每次查询都等满超时、拿回零条结果，而 HTTP 仍是 200——调用方看到的像
     # 「网上没有这条」，实际是一个都没问出去。
     #
-    # 留下的两家是实测读数（本镜像搜出来的：bing 每次 9~10 条、sogou 8~11 条，
-    # 三条不同查询各约 1 秒）。sogou 能出结果这件事依赖镜像里的网络层：这一版
-    # 的 SearXNG 用 curl_cffi 并默认以 Chrome 的 TLS 指纹发请求，所以它不再被
-    # 当成脚本拒掉——换回用 httpx 的旧版会重新出现适配层崩溃，届时读数是
-    # `unresponsive_engines` 里的 sogou，而不是零结果。
+    # 只留 bing。它是唯一一条在这台主机上稳定出货的读数：每次 9~10 条、约 1 秒。
     #
-    # baidu 与 360search 不在表里，各有各的读数：baidu 每次查询都被判「Suspended:
-    # CAPTCHA」（TLS 指纹这一层已经解决，卡住它的是出口 IP 的信誉），360search
-    # 返回零条且不报错。留在表里只会给每次查询多一条噪声。
+    # sogou 曾在这个表里，现在不能留：它每次查询都崩在 `sogou.py` 的
+    # `resp.next_request` 上（本镜像的响应对象没有这个属性），故障进
+    # `unresponsive_engines`、零条结果。一个人人都崩的引擎不是备用通道，是每条
+    # 查询都带一条假警报——`web_search` 把这个字段原样交给调用方，于是模型每次
+    # 搜索都读到「有一个引擎坏了」，而它其实每次都是坏的，读它学不到任何东西。
+    # baidu（出口 IP 被判 CAPTCHA）、360search（零条且不报错）同理不在表里。
+    #
+    # 判据：表里的每个引擎都必须在 `unresponsive_engines` 里长期不出现；一旦某家
+    # 变成每次都崩，就从表里删掉，而不是留着当噪音。
     use_default_settings:
       engines:
         keep_only:
           - bing
-          - sogou
     engines:
       # keep_only 只是留下条目，它们默认仍是关的，必须逐个打开。
       - name: bing
@@ -44,8 +45,6 @@ data:
         base_url: https://cn.bing.com
         # 开了 HTTP/3 时同样的地址拿不回可用响应；这一家走 HTTP/2 才稳定。
         enable_http3: false
-      - name: sogou
-        disabled: false
     general:
       instance_name: "cogneva"
     server:

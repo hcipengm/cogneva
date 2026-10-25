@@ -17,16 +17,15 @@ data:
     # startpage / wikidata / wikipedia 在境内都不可达，每次查询各自等满超时后返回
     # 零条，HTTP 也是 200——那看起来像「网上没有」，其实一条都没问出去。
     #
-    # 留下的两家是实测读数：bing 每次 9~10 条、sogou 8~11 条，三条不同查询各约
-    # 1 秒。sogou 能出结果依赖这一版镜像的网络层（curl_cffi，默认 Chrome TLS
-    # 指纹）；换回 httpx 的旧版会重新出现适配层崩溃。baidu 每次都被判 CAPTCHA
-    # （TLS 这一层已解决，卡住它的是出口 IP 信誉），360search 返回零条且不报错，
-    # 两家都不留在表里。
+    # 只留 bing：这台主机上唯一稳定出货的一家（每次 9~10 条、约 1 秒）。sogou
+    # 每次查询都崩在 `sogou.py` 的 `resp.next_request`（本镜像的响应对象没有该
+    # 属性），崩溃落进 `unresponsive_engines`、零条结果——一个每次都坏的引擎只会
+    # 让每条查询多一条假警报，而 `web_search` 把这个字段原样交给调用方。baidu
+    # （出口 IP 被判 CAPTCHA）、360search（零条且不报错）同理不在表里。
     use_default_settings:
       engines:
         keep_only:
           - bing
-          - sogou
     engines:
       - name: bing
         disabled: false
@@ -35,8 +34,6 @@ data:
         base_url: https://cn.bing.com
         # 同一地址走 HTTP/3 拿不回可用响应，切回 HTTP/2。
         enable_http3: false
-      - name: sogou
-        disabled: false
     general:
       instance_name: "cogneva"
     server:
