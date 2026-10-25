@@ -149,4 +149,20 @@ async fn the_design_guidance_has_one_home_and_points_at_the_live_token_table() {
         def.skill_md.contains("--brass"),
         "规程没有点名唯一的强调色：不写清楚，每个视图都会自己造一个强调色"
     );
+
+    // 正文是上游 anthropics/skills 的 frontend-design 原文，逐字保留。它被
+    // 删节过一次——「压缩成要点」看着像整理，实际是把唯一经过验证的部分换成
+    // 了转述，而转述没有人验证过。这几节是它的骨架，缺一节就是删节而不是编辑。
+    for section in [
+        "## Ground your designs in the subject matter",
+        "## Design principles",
+        "## Process: plan, review against the brief, build, critique",
+        "## Restraint and self-critique",
+        "## More on writing in design",
+    ] {
+        assert!(
+            def.skill_md.contains(section),
+            "skills/frontend-design/SKILL.md 少了上游的一节：{section}"
+        );
+    }
 }

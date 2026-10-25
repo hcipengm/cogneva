@@ -1,103 +1,110 @@
 ---
 name: 前端设计
-description: 做界面时的设计规程：先定一份能说清的设计计划（色／字／布局／一条原则），再检它是否只是这类页面的默认长相，然后才写代码；含 cogneva WebUI 的令牌约束、结构即信息、克制与自审。适用于新增视图、重做页面、调整配色排版、做可视化、以及任何「让它好看好用」的请求。
+description: 做界面时的设计规程：把每一单当成设计工作室接的一单，先定设计计划（色／字／布局／一条原则）再检查它是不是这类页面的默认长相，最后才写代码；含排版、结构即信息、动效、文案、克制与自审，以及 cogneva WebUI 的令牌约束。适用于新增视图、重做页面、调整配色排版、做可视化，以及任何「让它好看好用」的请求。
 ---
 
-# 前端设计
+# Frontend Design
 
-把这个任务当成设计工作室接的一单：客户付钱要的是一个**只属于这件事**的样子，不是
-一张放到任何仪表盘上都成立的模板。所以每个选择都要能回答「为什么是它」，答不上来
-的那一条就是默认值，默认值就是没做设计。
+Approach this as the design lead at a design studio known for giving every client a distinct visual identity that is not mistaken for anyone else's. This client has already rejected proposals that felt cliché or templated, and is paying for a distinctive point of view: make deliberate, opinionated choices about palette, typography, and layout that are specific to this brief, and take aesthetic risk if justified.
 
-## 一、先有主题，再有配色
+## Ground your designs in the subject matter
 
-配色不是从色轮上挑的，是从**这个东西本身是什么**长出来的。做的是一个多智能体平台
-的工作台，那么它的材料是事件流、时间、并发、状态迁移；它的读者是盯着屏幕看线上在
-发生什么的人，不是来读营销页的人。颜色的分工就该按这个来：底色是长时间注视不累的，
-强调色只标「这里需要你动手」，状态色只在状态真的变了时才出现。
+If the brief does not identify what the product or subject matter is, identify it yourself before designing, and confirm with the client. You can come up with one concrete subject, the design's audience, and the design's primary job, as a proposal. If there's any information in your memory about the client's preferences or context about what they're building, use that as a hint. The subject's industry, subject matter, materials, and vernacular are where distinctive visual choices come from — a design for a toy for girls aged 8–11 will be very aesthetically different from a dashboard for financial analysts. Build with the brief's real content and subject matter throughout.
 
-写 cogneva 的界面时，配色与字阶**已经定好了**：`web/src/styles/tokens.css` 是唯一
-的令牌表，`web/src/styles/themes.ts` 是换主题的地方。各面里不写死颜色，全部读 `--x`。
+## Design principles
+
+For web designs, the hero is the first thing viewers will see. Open with the most characteristic thing in the subject's world, in the form that is most appropriate: a headline, an image, an animation, a live demo, an interactive moment, or other treatments. Be deliberate with your choice: a big number with a small label, supporting stats, and a gradient accent is the default treatment, so only use it if that's truly the best option.
+
+Typography carries the personality of the page. You don't need a different typeface for display or headline text and body content: use one family or two, and if two, make them clearly distinct.
+
+Choose your typefaces deliberately, not the default families you would reach for on any other project, and set a clear type scale following the default guidance of The Elements of Typographic Style with intentional weights, widths, and spacing. When type is used as a headline or visual element, use the type treatment itself as an active part of the design, not a neutral delivery vehicle for the content.
+
+Default to line lengths of less than 80 characters. Serif typefaces can have slightly longer line lengths; give serif body text slightly more line-height than a sans-serif.
+
+Avoid these default typographic treatments; they are the commonest tells of a generated page:
+- Accenting just a single word or phrase in a headline, like putting one word in italic/bold or a different color.
+- Using all caps for labels.
+- Adding unnecessary typographic labels above content.
+
+Visual structure is information. Structural devices like outlines, borders, numbering, eyebrows, dividers, labels, etc., encode useful information about the content rather than decorate it. Many generic designs use numbered markers (01 / 02 / 03), but that's only appropriate if the content actually is a sequence — like a stepped process or a timeline. Before adding numbered markers, check the content really is a sequence.
+
+Use non-user-triggered motion sparingly and deliberately, only to draw attention. A single orchestrated moment — one page-load sequence or one reveal — lands better than scattered effects; fade-and-slide-up entrances on each section and hover transitions on every card are the generic default and read as AI-generated. Motion that answers a person's action (opening, expanding, confirming) is welcome when it shows what changed.
+
+Consider written content carefully. Often a design brief may not contain real content, and it's up to you to come up with copy and placeholder content. Copy can make a design feel as templated as the design itself. See the below section on writing for more guidance.
+
+## Process: plan, review against the brief, build, critique
+
+For calibration, AI-generated design right now clusters around some traits:
+1. a warm cream background (near #F4F1EA) with a high-contrast serif display and a terracotta or warm-clay accent (often near #D97757 — Anthropic's own Claude-interaction accent, so on a user's brief it reads as a tell);
+2. a near-black background with a single bright acid-green or vermilion accent;
+3. a broadsheet-style layout with hairline rules, zero border-radius, and dense newspaper-like columns;
+4. the SaaS-card kit: content chopped into identical rounded cards, one border-radius on everything regardless of hierarchy, the same soft grey shadow (rgba(0,0,0,.1)) under each, and gradient washes as decoration;
+5. template chrome that appears whatever the subject: a tracked-out ALL-CAPS eyebrow label above every heading; meta strings joined with middle dots ('A · B · C'); labels built as 'WORD — fragment' with a spaced em dash; tinted near-black (#0B0B0B, #111) standing in for black; a monospace face for small data labels; a '→' appended to link and button text.
+
+All traits are legitimate for some briefs, but they are defaults rather than choices, and they appear regardless of subject. Where the brief pins down a visual direction, follow it exactly — the brief's own words always win, including when it asks for one of these looks. Where it leaves an axis free, don't spend that freedom on one of these defaults. As with a hired human designer, there's often a careful balance between doing what you're good at and taking each project as a chance to experiment and learn.
+
+Work in two passes. First, brainstorm a short design plan based on the client's design brief: create a compact token system with color, type, layout, and principles.
+- Color: describe the core base palette as 4–6 named hex values.
+- Type: the typefaces and their roles.
+- Layout: a layout concept, using one-sentence prose descriptions and ASCII wireframes to ideate and compare. Include alignment guidance; should the content be left aligned, center aligned, justified?
+- Principles: the high-level guidance for what makes this page unique.
+
+Then review that plan against the brief before building: if any part of it reads like the generic default you would produce for any similar page (work through a similar prompt to see if you arrive somewhere similar) rather than a choice made for this specific brief — revise that part, say what you changed and why. Only after you've confirmed the relative uniqueness of your design plan should you start to write the code, following the revised plan.
+
+When writing the code, be careful of structuring your CSS selector specificities. It's easy to generate CSS classes that cancel each other out (especially with a type-based selector like .section and an element-based selector like .cta). This can happen often with padding/margin between sections.
+
+## Restraint and self-critique
+
+Spend your boldness in one place. Let one element be the memorable thing, keep everything around it quiet and disciplined, and cut any decoration that does not serve the brief. Build to a quality floor without announcing it: responsive down to mobile, visible keyboard focus, reduced motion respected, visually accessible, harmonious color palettes. Critique your own work as you build, taking screenshots to review if your environment supports it — a picture is worth 1000 tokens. Consider Chanel's advice: before leaving the house, take a look in the mirror and remove one accessory. Human creatives have memory and always try to do something new, so if you have a space to quickly jot down notes about what you've tried, it can help you in future passes.
+
+## More on writing in design
+
+Words appear in a design for one reason: to make it easier to understand and use. They are design content, not decoration. Bring the same intentionality and minimalism to copywriting that you would bring to spacing and color. Before writing anything, ask what the design needs to say, and how it can best be said to help the person navigate the experience.
+
+Write from the end user's perspective. Name things by what users will understand in simple language, not by how the system is built. A user manages notifications, not webhook config. Describe what something is or does in plain terms rather than selling it. Being specific and legible to new users is always better than being clever.
+
+Use active voice as default. A CTA says exactly what happens when it is used: "Save changes," not "Submit." An action keeps the same name through the whole flow, so the button that says "Publish" produces a toast that says "Published." The vocabulary of an interface is the signposting for someone navigating the product. Cohesion and consistency are how people learn their way around.
+
+Treat failure and emptiness as moments for direction, not mood. Explain what went wrong and how to fix it, in the interface's voice rather than a person's. Errors don't apologize, and they are never vague about what happened. An empty screen is an invitation to act.
+
+Keep the tone conversational: plain verbs, sentence case, no filler, with tone matched to the brand and the audience. Let each written element do exactly one job.
+
+---
+
+# 本仓库的落点（cogneva 补充）
+
+上面的正文是通用规程，逐条适用。这一节只写「在这棵树里，那几条落在哪里」，
+因为规程里说的「先定调色板」在这里已经有答案了。
+
+## 颜色与字阶不是每单重定，是从令牌表里取
+
+`web/src/styles/tokens.css` 是唯一的令牌表，`web/src/styles/themes.ts` 是换主题的
+地方。各面里不写死颜色，全部读 `--x`；画布上的自绘部分（`web/src/renderer/`）读的
+也是同一套，否则换主题后会在一屏里留下第二种风格。
+
 令牌的角色是固定的：
 
 - `ink-1000…600`：从最深的底到最浅的表面。
-- `paper*`：文字；`--muted` 是次要文字。
-- `--brass`：唯一的强调色，只标需要人动手的地方。它不是装饰色，用满一屏就等于没用。
+- `paper` / `paper-dim`：文字与次要文字；`--muted` 是更次一级。
+- `--brass`：唯一的强调色，只标「这里需要你动手」。它不是装饰色，用满一屏就等于没用。
 - `--live` / `--ok` / `--warn` / `--danger`：状态，只在状态为真时出现。
 
-要新颜色，先问「哪一条现有令牌的角色不对」。答不出来才加令牌，而且要按同一套角色
-命名，不能加一个 `--purple-accent` 这种只有这一处知道含义的东西。
+要加颜色，先回答「哪一条现有令牌的角色不对」。答不出来才加，而且按同一套角色命名，
+不要加一个只有这一处知道含义的 `--purple-accent`。
 
-## 二、字阶是密度的函数
+字阶只有四档（11 / 12 / 13 / 15）。密度是这一面的功能：同一屏里要多看几行日志、
+多扫几行状态，字号就不可能照营销页的排法来。数字与标识符用等宽体并带
+`font-variant-numeric: tabular-nums`，否则数字一多就左右跳。
 
-这里的读者要在同一屏里多看几行日志、多扫几行状态。字阶只有四档（11/12/13/15），
-正文用等宽体承载数字与标识符（`--font-mono`，带 `tabular-nums`，否则数字一多就左右
-跳）。不要为了「有设计感」放大标题——大标题在这个界面里是纯占位，它挤掉的正是读者
-要看的那几行。
+## 需求里点名的东西优先，其余按通用规程办
 
-行宽控制在 80 字符以内。衬线正文比无衬线要多给一点行高（本界面正文不用衬线）。
+工作台的底是主题纯色，不铺栅格（栅格是「这里能拖东西」的暗示）；与数据无关的
+动效不进背景，粒子只做极低频的呼吸感，`prefers-reduced-motion` 打开时连它也不动。
 
-## 三、结构即信息
+状态的四种画面必须区分得出来：加载中、空、读失败、离线。混成一片空白，读者看到
+的会是「一切正常」。
 
-边框、细线、编号、分组、留白，都是**在编码信息**，不是在装饰版面。加一条线之前
-问：它分开的是两件不同的事吗？加一个编号之前问：这真的是一段有先后顺序的流程吗？
-不是流程却编上 01/02/03，读者会以为存在一个不存在的次序。
+## 自审的落点
 
-反过来，该有结构而没有的地方要补上：一屏数字里分不出「哪些是同一层的对比」「哪些
-是同一个数的不同时间截面」，那不是简洁，是信息缺失。
-
-## 四、默认长相清单
-
-生成出来的页面有一批共同的长相。它们各自在某个设计里可能是对的，但它们是**默认值
-而不是选择**，而且不管做什么主题都长一样。动手前先把这张单过一遍，命中的部分要说
-清为什么是它：
-
-1. 米白底 ＋ 高对比衬线标题 ＋ 陶土色强调。
-2. 近黑底 ＋ 一个荧光强调色，其余全灰。
-3. 报纸式排法：发丝线、零圆角、密排多栏。
-4. SaaS 卡片套件：内容切成一张张一模一样的圆角卡片，阴影全是同一个柔和灰。
-5. 与主题无关的模板件：每个标题上方的全大写字距拉开的眉标；用中点连接的元信息
-   （`A · B · C`）；`词 —— 半句` 形式的标签；把 `#0B0B0B` 当纯黑；给每个按钮和链接
-   末尾加一个箭头。
-6. 每一段都有淡入上移的入场动画，每张卡片都有悬停位移。
-
-需求本身点名了某一种样子，就照做——需求里的字永远优先。需求没定的轴上，不要用
-上面这些默认值去填。
-
-## 五、动效
-
-只做两件事：回答人的动作（打开、展开、确认——让人看见刚才发生了什么），以及在
-极少数时候引导注意力。**不做**周期性装饰动效，也不做「每块内容各自入场」的散点动画：
-一次编排好的入场比十处小动画更像人做的。
-
-状态的变化要用位置和数量表达（新增一行、进度前移、计数跳动），不要用颜色闪烁：
-颜色闪烁在一屏状态色里读不出来。
-
-## 六、设计计划：四格，动手前写
-
-1. **色**：4 到 6 个命名色值，各说一句它负责什么。
-2. **字**：用哪几个字族，各自承担什么，字阶怎么排。
-3. **布局**：一句话说清 + 一张 ASCII 草图；左右两三种排法画出来比一比；顺带定对齐
-   方式（左对齐／居中／两端对齐只选一种为主）。
-4. **一条原则**：这一页凭什么被记住，一句话。
-
-写完先拿它跟一个「同类主题的通用页」对一遍：如果换一个题目你也给出同一份计划，那份
-计划就是默认值，改掉它，并说明改了什么。确认之后才写代码。
-
-## 七、写代码时的坑
-
-- CSS 特异性：一个类选择器（`.section`）与一个元素选择器（`.cta`）很容易互相取消，
-  尤其是段落间距——症状是「这一块调了没反应」。同类问题优先用同一层级的类解决。
-- 画布上的自绘部分（`web/src/renderer/*Painter.ts`）读的是同一套令牌，换主题要跟着
-  换。写死颜色的画布在换主题后会变成一屏里的第二种风格。
-- 状态必须能从界面上读出来：加载中、空、失败、离线是四种不同的画面，不能都长成空白。
-
-## 八、克制与自审
-
-力气花在一处。让一个元素是这一页被记住的东西，其余全部安静，砍掉不服务任务的装饰。
-
-质量地板不用宣传，是要有的：窄屏可用、键盘焦点可见、尊重 `prefers-reduced-motion`、
-前景背景对比度达标、颜色之外还有第二种手段区分状态（形状、位置、文字）。
-
-边写边审：能用截图就用截图看，一张图胜过一千个 token。最后按「出门前摘掉一件配饰」
-的规矩再看一遍，去掉一个东西。
+改完之后自己读一遍：这个界面的每一个数字，能不能点开看到它由什么算出来？点不开
+的那些如果长得像读数，就是装饰——装饰冒充读数，比空白更坏。
