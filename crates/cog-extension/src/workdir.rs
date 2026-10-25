@@ -2320,8 +2320,9 @@ pub(crate) mod tests {
             total_bytes: 5 * 1024 * MIB,
             avail_bytes: avail_mib * MIB,
         };
-        // Four trees of 100 MiB each on a volume with 4 GiB free: 15% of the
-        // free space stays free, so the 3.4 GiB left buys 34 more at 100 MiB.
+        // Fixtures picked for the test, not a machine: e.g. four trees of
+        // 100 MiB each on a volume with e.g. 4 GiB free. With 15% of the free
+        // space kept free, e.g. the 3.4 GiB left buys 34 more at 100 MiB.
         assert_eq!(workspace_cap(disk_with(4096), 4 * 100 * MIB, 4), Some(38));
         // The same four trees, with the volume nearly full: the cap is smaller
         // than the number of trees that already exist, so the next pass
