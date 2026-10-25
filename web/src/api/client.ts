@@ -942,11 +942,14 @@ export interface EvmReading {
   basis: string;
 }
 
+/**
+ * 每一格都是 `number | null`：`null` 是「这一格没量过」，不是零。
+ */
 export interface EvmAttribution {
-  tasks_with_cost: number;
-  baselined_tasks_without_cost: number;
+  tasks_with_cost: number | null;
+  baselined_tasks_without_cost: number | null;
   /** 项目里没有基线的任务条数：它们的预算不在挣值里。 */
-  tasks_outside_baseline: number;
+  tasks_outside_baseline: number | null;
 }
 
 export interface ProjectEvmReading {

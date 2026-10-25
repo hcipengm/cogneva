@@ -630,15 +630,24 @@ function EarnedValuePanel({
               这条账没有项目维度，拿它除本项目的花销，项目越小算出的比例越大。`}
         </p>
         <p className="mt-1 text-[var(--muted)]">
-          账上有花销的任务 {data.attribution.tasks_with_cost} 条；有基线预算但账上一条花销
-          都没有的已完成任务 {data.attribution.baselined_tasks_without_cost} 条——那不是
-          「免费」，是这笔账上看不到它。另有 {data.attribution.tasks_outside_baseline} 条
-          任务没有基线，它们的预算不在挣值里。
+          账上有花销的任务 {countOf(data.attribution.tasks_with_cost)}；有基线预算但账上一条
+          花销都没有的已完成任务 {countOf(data.attribution.baselined_tasks_without_cost)}
+          ——那不是「免费」，是这笔账上看不到它。另有{' '}
+          {countOf(data.attribution.tasks_outside_baseline)}任务没有基线，它们的预算不在
+          挣值里。
         </p>
         <p className="mt-1 text-[var(--muted)]">{data.assumption}</p>
       </div>
     </>
   );
+}
+
+/**
+ * 计数格。`null` 是「没量过」，不能印成 0——0 在这一屏上是一个具体的结论
+ * （「一条都没有」），而没量过是「不知道」。
+ */
+function countOf(n: number | null): string {
+  return n === null ? '量不了' : `${n} 条`;
 }
 
 /** 一个量的三种印法：有数、量不了、以及有数但读法要跟着说明走。 */

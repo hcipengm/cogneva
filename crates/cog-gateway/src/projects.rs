@@ -152,16 +152,21 @@ impl EvmReading {
 }
 
 /// 实际成本的归因面：成本只在账上带任务身份的那些行里，剩下的单独报。
+///
+/// 每一格都是 `Option`：`None` 是「这一格没量过」，不是零。这个区分在这里比在别处
+/// 更重要——一屏挣值里有好几处零，而「有多少条任务在挣值之外」写成 0 是在断言
+/// 「一条都没有」，与「基线读不到」正好相反。
 #[derive(Debug, Serialize, PartialEq)]
 pub struct EvmAttribution {
-    /// 这些任务里，账上有花销记录的条数。
-    pub tasks_with_cost: usize,
-    /// 有基线预算、账上却一条花销都没有的任务条数。它不是「免费」，是这笔账
-    /// 上看不到它——两个都不该被读成省下来的钱。
-    pub baselined_tasks_without_cost: usize,
+    /// 项目里账上有花销记录的任务条数；逐笔账读不到时为 `None`。
+    pub tasks_with_cost: Option<usize>,
+    /// 有基线预算、账上却一条花销都没有的**已完成**任务条数。它不是「免费」，
+    /// 是这笔账上看不到它——两个都不该被读成省下来的钱。基线或账读不到时为 `None`。
+    pub baselined_tasks_without_cost: Option<usize>,
     /// 项目里没有基线的任务条数：它们的预算不在挣值里，所以挣值必然少于项目
     /// 的全部工作量。不报这个数，读者会把「挣值还小」读成「干得少」。
-    pub tasks_outside_baseline: usize,
+    /// 基线读不到时为 `None`——那时一条也判不出在不在基线之外。
+    pub tasks_outside_baseline: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -553,15 +558,25 @@ fn build_evm_response(
     unattributed: Option<u64>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> EvmResponse {
+    let spent: Option<std::collections::BTreeSet<&str>> =
+        spends.map(|s| s.keys().map(String::as_str).collect());
+    // 账读不到时这一格也不算：0 会被读成「一条都没有花过钱」。
+    let tasks_with_cost = spent.as_ref().map(|spent| {
+        rows.iter()
+            .filter(|t| spent.contains(t.id.as_str()))
+            .count()
+    });
+
     let (planned_value, earned_value, baselined, attribution) = match plans {
         None => (
             EvmReading::unmeasurable("计划基线读不到：这一部署回答不了「本来该完成多少」"),
             EvmReading::unmeasurable("计划基线读不到：挣值没有分母可比"),
             Vec::new(),
             EvmAttribution {
-                tasks_with_cost: 0,
-                baselined_tasks_without_cost: 0,
-                tasks_outside_baseline: rows.len(),
+                tasks_with_cost,
+                // 基线读不到时一条也判不出在不在基线之外：写 0 是断言「全都有基线」。
+                baselined_tasks_without_cost: None,
+                tasks_outside_baseline: None,
             },
         ),
         Some(plans) => {
@@ -578,9 +593,9 @@ fn build_evm_response(
                     EvmReading::unmeasurable("没有基线就没有可挣的计划价值"),
                     baselined,
                     EvmAttribution {
-                        tasks_with_cost: 0,
-                        baselined_tasks_without_cost: 0,
-                        tasks_outside_baseline: outside,
+                        tasks_with_cost,
+                        baselined_tasks_without_cost: spent.as_ref().map(|_| 0),
+                        tasks_outside_baseline: Some(outside),
                     },
                 )
             } else {
@@ -611,24 +626,18 @@ fn build_evm_response(
                         ),
                     ),
                     baselined.clone(),
-                    {
-                        let spent: std::collections::BTreeSet<&str> = spends
-                            .map(|s| s.keys().map(String::as_str).collect())
-                            .unwrap_or_default();
-                        EvmAttribution {
-                            tasks_with_cost: rows
-                                .iter()
-                                .filter(|t| spent.contains(t.id.as_str()))
-                                .count(),
-                            baselined_tasks_without_cost: baselined
+                    EvmAttribution {
+                        tasks_with_cost,
+                        baselined_tasks_without_cost: spent.as_ref().map(|spent| {
+                            baselined
                                 .iter()
                                 .filter(|(t, _)| {
                                     !spent.contains(t.id.as_str())
                                         && t.status == TaskStatus::Completed
                                 })
-                                .count(),
-                            tasks_outside_baseline: outside,
-                        }
+                                .count()
+                        }),
+                        tasks_outside_baseline: Some(outside),
                     },
                 )
             }
@@ -883,6 +892,7 @@ mod tests {
             planned_end: Some(chrono::Utc::now() + chrono::Duration::minutes(10)),
             budget_tokens: tokens,
             baseline_rev: "rev-1".into(),
+            acceptance: vec!["有产出".into()],
             updated_at: chrono::Utc::now(),
         }
     }
@@ -974,6 +984,7 @@ mod tests {
             planned_end: Some(end),
             budget_tokens: tokens,
             baseline_rev: "rev-1".into(),
+            acceptance: vec!["有产出".into()],
             updated_at: start,
         }
     }
@@ -999,6 +1010,12 @@ mod tests {
         assert_eq!(blind.unattributed_window_start, None, "没量就没有窗口");
         assert_eq!(blind.cost_performance_index, None, "分母量不出来就没有指数");
         assert_eq!(blind.schedule_performance_index, None);
+        assert_eq!(
+            blind.attribution.tasks_outside_baseline, None,
+            "基线读不到时一条也判不出在不在基线之外；写 0 是断言「全都有基线」"
+        );
+        assert_eq!(blind.attribution.tasks_with_cost, None, "账也读不到");
+        assert_eq!(blind.attribution.baselined_tasks_without_cost, None);
 
         // 基线读到了、这个项目一条都没有：进度不是零，是没排过期。
         let empty = build_evm_response(
@@ -1085,9 +1102,10 @@ mod tests {
             reading.unattributed_window_start.is_some(),
             "不带窗口起点的数会被下一个读者当成常数带走"
         );
-        assert_eq!(reading.attribution.tasks_with_cost, 2);
+        assert_eq!(reading.attribution.tasks_with_cost, Some(2));
         assert_eq!(
-            reading.attribution.baselined_tasks_without_cost, 0,
+            reading.attribution.baselined_tasks_without_cost,
+            Some(0),
             "两条都在账上找到了"
         );
         assert!(
@@ -1140,11 +1158,13 @@ mod tests {
             "1000 挣值 / 500 同批成本；用 9500 会算出 0.105，读作「花得多挣得少」"
         );
         assert_eq!(
-            reading.attribution.tasks_outside_baseline, 1,
+            reading.attribution.tasks_outside_baseline,
+            Some(1),
             "读者要知道挣值少算了多少条"
         );
         assert_eq!(
-            reading.attribution.tasks_with_cost, 2,
+            reading.attribution.tasks_with_cost,
+            Some(2),
             "账上有花销的是两条，与挣值覆盖的那一批不是一个数"
         );
     }
