@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,18 +97,31 @@ impl HealthChecker {
     pub async fn check(&self) -> SupervisorResult<HealthReport> {
         let mut report = HealthReport::default();
         let now = Utc::now();
-        if let Err(e) = self.registry.sync_from_shared().await {
-            // The pass still runs over whatever this process already tracks:
-            // a stale population is a worse reading than none, but a failed
-            // read of the shared registry must not turn into a failed pass.
-            tracing::warn!(
-                error = %e,
-                "health pass could not read the shared agent registry; judging only locally tracked agents"
-            );
+        // 共享注册表是「这个舰队里有谁」的权威，所以它的名单也决定这一拍可以忘掉谁
+        // （见下面的退休一段）。读失败时 `listed` 留在 `None`：过期的种群是比没有
+        // 更差的读数，但一次读不到绝不能读成「所有人都走了」。
+        let mut listed: Option<HashSet<String>> = None;
+        match self.registry.sync_from_shared().await {
+            Ok(ids) => {
+                // 没挂共享注册表时 `list` 也返回空表——那个空表说的是「本进程没有
+                // 意见」，不是「舰队空了」，所以只有挂上时它才是名单。
+                if self.registry.shares_a_registry() {
+                    listed = Some(ids.into_iter().collect());
+                }
+            }
+            Err(e) => {
+                // The pass still runs over whatever this process already tracks:
+                // a stale population is a worse reading than none, but a failed
+                // read of the shared registry must not turn into a failed pass.
+                tracing::warn!(
+                    error = %e,
+                    "health pass could not read the shared agent registry; judging only locally tracked agents"
+                );
+            }
         }
         let agents = self.registry.agents();
 
-        for agent in agents {
+        for agent in &agents {
             // 1. Check the durable state first — explicit Dead beats heartbeat.
             let backend_state = self
                 .state_backend
@@ -167,7 +181,45 @@ impl HealthChecker {
                 }
             }
 
-            report.healthy.push(agent.agent_id);
+            report.healthy.push(agent.agent_id.clone());
+        }
+
+        // 退休：舰队名单里已经没有、而它的死亡已经有机会被报出去的 id，从本进程的
+        // 表里删掉。
+        //
+        // 为什么必须删：这张表只增不减，于是每一个曾经存在过的 id（短命 squad 成员、
+        // 每次进化都换名的 agent）都被永久判死——每一拍重新判一次死、重新点亮一次
+        // 告警行，种群与告警行都不收敛。实测 2026-10-26：`agent_unhealthy` 一张表里
+        // 两万行、当下 firing 的 754 行全部由已经不在名单上的 id 撑着，而真正的舰队
+        // 只有个位数 agent，于是「告警太多没人看」把真正要人动手的那两三条埋掉。
+        //
+        // 为什么等一个死判决的窗口再删：删得太早会让「它掉线了」这件事一次都不被报出
+        // ——不在名单里就没人问、没人报，而这条规则存在的理由正是报它。`dead_after`
+        // 之后它已经被判死过至少一拍（真实 TTL 远大于这个窗口），再留一个窗口是为了
+        // 让那一拍真的跑过，而不是刚好错过。
+        if let Some(listed) = listed {
+            let forget_after = self.cfg.dead_after * 2;
+            let gone: Vec<String> = agents
+                .iter()
+                .filter(|a| !listed.contains(&a.agent_id))
+                .filter(|a| {
+                    (now - a.last_heartbeat)
+                        .to_std()
+                        .unwrap_or(Duration::from_secs(0))
+                        >= forget_after
+                })
+                .map(|a| a.agent_id.clone())
+                .collect();
+            for id in &gone {
+                self.registry.unregister_agent(id);
+            }
+            if !gone.is_empty() {
+                tracing::debug!(
+                    retired = gone.len(),
+                    "forgot agents the shared registry no longer lists; nothing would ever \
+                     have refreshed their verdict again"
+                );
+            }
         }
 
         Ok(report)

@@ -563,7 +563,16 @@ impl AgentRegistry {
     /// tracked keep the fresher of the two heartbeat stamps: a local `touch`
     /// and the agent's own beat run on different clocks, and letting the older
     /// stamp win would age an agent that is beating.
-    pub async fn sync_from_shared(&self) -> SupervisorResult<usize> {
+    ///
+    /// Returns the ids the shared registry listed, so the caller can tell the
+    /// difference between "still there and quiet" and "gone". This map only
+    /// ever grows, and a map that only grows turns every id that ever existed
+    /// into a permanently dead agent: the pass re-convicts it on every round,
+    /// the alert row is refreshed on every round, and neither the population
+    /// nor the row ever settles. What to do about a gone id is the caller's
+    /// decision, because only the caller knows how long a dead verdict has to
+    /// stand before the subject can be forgotten.
+    pub async fn sync_from_shared(&self) -> SupervisorResult<Vec<String>> {
         let registrations = self.list_registered_agents().await?;
         let mut agents = self.agents.write().expect("agent registry poisoned");
         for registration in &registrations {
@@ -595,7 +604,17 @@ impl AgentRegistry {
                 }
             }
         }
-        Ok(registrations.len())
+        Ok(registrations.into_iter().map(|r| r.agent_id).collect())
+    }
+
+    /// Whether a shared registry is attached at all.
+    ///
+    /// The difference matters to a caller that wants to treat the shared
+    /// listing as the population: an attached registry that lists nothing means
+    /// the fleet is gone, while no registry means this process has no opinion
+    /// and whatever it tracks locally is all there is.
+    pub fn shares_a_registry(&self) -> bool {
+        self.agent_registry.is_some()
     }
 
     /// List agents by role from the global registry, if attached.
