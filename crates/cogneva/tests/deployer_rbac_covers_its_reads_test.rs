@@ -133,11 +133,16 @@ fn production_source(text: &str) -> &str {
 // The Role
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Role {
+    /// `Role` 还是 `ClusterRole`。两者规则同形，差别只在作用域：一份清单同时
+    /// 声明这两类时，只看 `Role` 会让 ClusterRole 的规则在判据里凭空消失。
+    kind: String,
     name: String,
     rules: Vec<Rule>,
 }
 
+#[derive(Clone)]
 struct Rule {
     groups: Vec<String>,
     resources: Vec<String>,
@@ -175,23 +180,48 @@ fn strings(value: Option<&serde_yaml::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The Roles a manifest file declares, plus who its RoleBindings bind.
+/// 一条绑定：把哪条 Role 授给谁。
+///
+/// 每份清单可以有多条绑定（namespace 的 RoleBinding 与集群作用域的
+/// ClusterRoleBinding 常常写在一起），所以这里是一列，不是一个值。早先只留
+/// 最后一个 roleRef 的写法在同一份文件里第二条绑定出现时会静默指错对象。
+struct Binding {
+    kind: String,
+    role_name: String,
+    subjects: Vec<String>,
+}
+
+/// The Roles a manifest file declares, plus its bindings.
 struct RoleFile {
     roles: Vec<Role>,
-    bound_subjects: Vec<String>,
-    bound_role: Option<String>,
+    bindings: Vec<Binding>,
+}
+
+impl RoleFile {
+    /// 授给 `subject` 的那几条角色，按名字从 `roles` 里取。
+    ///
+    /// 一份清单里同一个身份可以同时被 namespace 的 RoleBinding 与集群作用域的
+    /// ClusterRoleBinding 绑定，API server 按并集判权，所以这里返回一列。
+    fn held_by(&self, subject: &str) -> Vec<&Role> {
+        self.bindings
+            .iter()
+            .filter(|b| b.subjects.iter().any(|s| s == subject))
+            .flat_map(|b| self.roles.iter().filter(move |r| r.name == b.role_name))
+            .collect()
+    }
 }
 
 fn roles_in(relative: &str) -> RoleFile {
     let text = read(relative);
     let mut roles: Vec<Role> = Vec::new();
-    let mut bound_subjects: Vec<String> = Vec::new();
-    let mut bound_role: Option<String> = None;
+    let mut bindings: Vec<Binding> = Vec::new();
 
     for doc in yaml_docs(&text, relative) {
         let kind = doc.get("kind").and_then(|k| k.as_str()).unwrap_or("");
         match kind {
-            "Role" => {
+            // 两类都是「一张规则表」，只差作用域。丢下 ClusterRole 的规则会让
+            // 自检的条数对不上——而它对不上时唯一的解释是「有一段规则没进判据」。
+            "Role" | "ClusterRole" => {
                 let name = doc
                     .get("metadata")
                     .and_then(|m| m.get("name"))
@@ -212,24 +242,40 @@ fn roles_in(relative: &str) -> RoleFile {
                         names: strings(rule.get("resourceNames")),
                     });
                 }
-                roles.push(Role { name, rules });
+                roles.push(Role {
+                    kind: kind.to_string(),
+                    name,
+                    rules,
+                });
             }
-            "RoleBinding" => {
-                for subject in doc
+            "RoleBinding" | "ClusterRoleBinding" => {
+                let subjects: Vec<String> = doc
                     .get("subjects")
                     .and_then(|s| s.as_sequence())
                     .map(|s| s.to_vec())
                     .unwrap_or_default()
-                {
-                    if let Some(n) = subject.get("name").and_then(|n| n.as_str()) {
-                        bound_subjects.push(n.to_string());
-                    }
-                }
-                bound_role = doc
+                    .iter()
+                    .filter_map(|subject| {
+                        subject
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect();
+                let role_name = doc
                     .get("roleRef")
                     .and_then(|r| r.get("name"))
                     .and_then(|n| n.as_str())
                     .map(str::to_string);
+                assert!(
+                    role_name.is_some(),
+                    "{relative} 的 {kind} 没有 roleRef.name：绑定指向不明，判不了它授给了谁"
+                );
+                bindings.push(Binding {
+                    kind: kind.to_string(),
+                    role_name: role_name.unwrap_or_default(),
+                    subjects,
+                });
             }
             _ => {}
         }
@@ -244,33 +290,50 @@ fn roles_in(relative: &str) -> RoleFile {
         "{relative} 的规则条数解析后对不上，比对结果不可信"
     );
 
-    RoleFile {
-        roles,
-        bound_subjects,
-        bound_role,
-    }
+    RoleFile { roles, bindings }
 }
 
 fn role() -> Role {
-    let RoleFile {
-        mut roles,
-        bound_subjects,
-        bound_role,
-    } = roles_in(RBAC);
+    let file = roles_in(RBAC);
 
-    assert!(!roles.is_empty(), "{RBAC} 里没有解析出任何规则");
+    assert!(!file.roles.is_empty(), "{RBAC} 里没有解析出任何规则");
     assert!(
-        bound_subjects.iter().any(|s| s == SERVICE_ACCOUNT),
-        "{RBAC} 的 RoleBinding 没有把这个 Role 绑给 {SERVICE_ACCOUNT}：授了权却落到别的身份上"
+        !file.bindings.is_empty(),
+        "{RBAC} 里没有任何绑定：授了权却没人拿到"
     );
-    let name = roles[0].name.clone();
+    let bound: Vec<&Binding> = file
+        .bindings
+        .iter()
+        .filter(|b| b.subjects.iter().any(|s| s == SERVICE_ACCOUNT))
+        .collect();
     assert_eq!(
-        bound_role.as_deref(),
-        Some(name.as_str()),
-        "{RBAC} 的 RoleBinding 指的不是被读的那条 Role"
+        bound.len(),
+        1,
+        "{RBAC} 里绑给 {SERVICE_ACCOUNT} 的绑定有 {} 条，这条判据只读得了唯一一条",
+        bound.len()
+    );
+    // 部署器要的是**命名空间内**的权利：ClusterRoleBinding 会把同一张表铺到
+    // 集群作用域，那不是这里判的东西，出现了要说出来而不是照读。
+    assert_eq!(
+        bound[0].kind, "RoleBinding",
+        "部署器的绑定是 {}，这条判据读的是命名空间内的 RoleBinding",
+        bound[0].kind
+    );
+    let held = file.held_by(SERVICE_ACCOUNT);
+    assert_eq!(
+        held.len(),
+        1,
+        "{RBAC} 的绑定指向 {:?}，但这份文件里叫这个名字的角色有 {} 个",
+        bound[0].role_name,
+        held.len()
+    );
+    assert_eq!(
+        held[0].kind, "Role",
+        "RoleBinding 指向的是 {} {}：命名空间绑定只能引用 Role",
+        held[0].kind, held[0].name
     );
 
-    roles.remove(0)
+    held[0].clone()
 }
 
 impl Role {
@@ -1082,7 +1145,10 @@ fn every_identity_that_can_publish_can_read_the_canary_base_names() {
             &["deploy/k3s/evolution-rbac.yaml"][..],
         ),
     ] {
-        // 一个 SA 上可以挂多条 Role，API server 按并集判权。
+        // 一个 SA 上可以挂多条角色，API server 按并集判权。并集里同时有
+        // 命名空间内的 Role 与集群作用域的 ClusterRole：这两类在授权上等价，
+        // 只是作用域不同，所以这里问的是「这个身份能不能读 deployment/<名>」，
+        // 不是「哪一条规则给的权利」。
         let rules: Vec<Rule> = files
             .iter()
             .flat_map(|f| roles_in(f).roles)
