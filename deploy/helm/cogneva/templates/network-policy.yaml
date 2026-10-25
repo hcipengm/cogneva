@@ -397,7 +397,6 @@ metadata:
   namespace: {{ include "cogneva.namespace" . }}
   labels:
     {{- include "cogneva.labels" . | nindent 4 }}
-    app.kubernetes.io/name: crawl4ai
     app.kubernetes.io/component: fetch
 spec:
   podSelector:
@@ -452,7 +451,6 @@ metadata:
   namespace: {{ include "cogneva.namespace" . }}
   labels:
     {{- include "cogneva.labels" . | nindent 4 }}
-    app.kubernetes.io/name: crawl4ai
     app.kubernetes.io/component: fetch
 spec:
   podSelector:

@@ -16,7 +16,6 @@ metadata:
     app.kubernetes.io/instance: cogneva
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.5.10"
-    app.kubernetes.io/name: crawl4ai
     app.kubernetes.io/component: fetch
 spec:
   podSelector:
