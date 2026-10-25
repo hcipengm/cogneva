@@ -1,0 +1,135 @@
+# 这个镜像实际会发出哪些序列、认哪些旗标——从镜像自己身上量的。
+#
+# 一张读数表点名一个序列，部署清单点名一个旗标；这两件事之间如果没有别的
+# 东西连起来，清单就可能指向一个不存在的旗标（边车启动即 "unknown long flag"
+# 退出，而它与数据库同 Pod：库还活着，Service 却没了端点），或者指向一个没有
+# 生产者的序列（面板永远空白，读起来和「一切正常」一样）。这份文件就是那条
+# 连线：读数的序列必须在下面的 series 里，清单的旗标必须在下面的 collector_flags
+# 里，而 image 这一行把它钉到具体版本上——换 tag 必须重跑下面这两条命令。
+#
+# 量法（image 换过就重跑，并把下面的 image 一起改掉）：
+#
+#   sudo -n k3s kubectl -n cogneva run exporter-inventory \
+#     --image=prometheuscommunity/postgres-exporter:v0.15.0 \
+#     --env="DATA_SOURCE_URI=<库地址>:5432/cogneva?sslmode=disable" \
+#     --env="DATA_SOURCE_USER=cog_user" --env="DATA_SOURCE_PASS=<口令>" \
+#     --env="PG_EXPORTER_AUTO_DISCOVER_DATABASES=false" \
+#     --env="PG_EXPORTER_DISABLE_SETTINGS_METRICS=false" \
+#     --env="PG_EXPORTER_INCLUDE_DATABASES=cogneva"
+#   sudo -n k3s kubectl -n cogneva port-forward pod/exporter-inventory 19190:9187 &
+#   curl -s 127.0.0.1:19190/metrics | grep -oE '^pg_[a-zA-Z0-9_]+' | sort -u
+#   sudo -n k3s kubectl -n cogneva run exporter-help --rm -i --restart=Never \
+#     --image=prometheuscommunity/postgres-exporter:v0.15.0 -- --help \
+#     | grep -oE '\-\-\[no-\]collector\.[a-z_]+'
+#
+# 抓取时**没有**传任何旗标：下面这些序列就是这个镜像在默认集合下发出的，
+# 所以部署清单不需要 args。带 `*` 的条目是前缀（那一族条目太多，逐条抄写只会
+# 抄错；`pg_settings_` 约 300 条）。
+image: prometheuscommunity/postgres-exporter:v0.15.0
+
+collector_flags:
+  - --collector.buffercache_summary
+  - --collector.database
+  - --collector.database_wraparound
+  - --collector.locks
+  - --collector.long_running_transactions
+  - --collector.postmaster
+  - --collector.process_idle
+  - --collector.replication
+  - --collector.replication_slot
+  - --collector.roles
+  - --collector.stat_activity_autovacuum
+  - --collector.stat_bgwriter
+  - --collector.stat_checkpointer
+  - --collector.stat_database
+  - --collector.statio_user_indexes
+  - --collector.statio_user_tables
+  - --collector.stat_progress_vacuum
+  - --collector.stat_statements
+  - --collector.stat_user_tables
+  - --collector.stat_wal_receiver
+  - --collector.wal
+  - --collector.xlog_location
+
+series:
+  - pg_database_size_bytes
+  - pg_exporter_last_scrape_duration_seconds
+  - pg_exporter_last_scrape_error
+  - pg_exporter_scrapes_total
+  - pg_locks_count
+  - pg_replication_is_replica
+  - pg_replication_lag_seconds
+  - pg_scrape_collector_duration_seconds
+  - pg_scrape_collector_success
+  - pg_stat_activity_count
+  - pg_stat_activity_max_tx_duration
+  - pg_stat_archiver_archived_count
+  - pg_stat_archiver_failed_count
+  - pg_stat_archiver_last_archive_age
+  - pg_stat_bgwriter_buffers_alloc_total
+  - pg_stat_bgwriter_buffers_backend_fsync_total
+  - pg_stat_bgwriter_buffers_backend_total
+  - pg_stat_bgwriter_buffers_checkpoint_total
+  - pg_stat_bgwriter_buffers_clean_total
+  - pg_stat_bgwriter_checkpoint_sync_time_total
+  - pg_stat_bgwriter_checkpoint_write_time_total
+  - pg_stat_bgwriter_checkpoints_req_total
+  - pg_stat_bgwriter_checkpoints_timed_total
+  - pg_stat_bgwriter_maxwritten_clean_total
+  - pg_stat_bgwriter_stats_reset_total
+  - pg_stat_database_blk_read_time
+  - pg_stat_database_blk_write_time
+  - pg_stat_database_blks_hit
+  - pg_stat_database_blks_read
+  - pg_stat_database_conflicts
+  - pg_stat_database_conflicts_confl_active_logicalslot
+  - pg_stat_database_conflicts_confl_bufferpin
+  - pg_stat_database_conflicts_confl_deadlock
+  - pg_stat_database_conflicts_confl_lock
+  - pg_stat_database_conflicts_confl_snapshot
+  - pg_stat_database_conflicts_confl_tablespace
+  - pg_stat_database_deadlocks
+  - pg_stat_database_numbackends
+  - pg_stat_database_stats_reset
+  - pg_stat_database_temp_bytes
+  - pg_stat_database_temp_files
+  - pg_stat_database_tup_deleted
+  - pg_stat_database_tup_fetched
+  - pg_stat_database_tup_inserted
+  - pg_stat_database_tup_returned
+  - pg_stat_database_tup_updated
+  - pg_stat_database_xact_commit
+  - pg_stat_database_xact_rollback
+  - pg_stat_user_tables_analyze_count
+  - pg_stat_user_tables_autoanalyze_count
+  - pg_stat_user_tables_autovacuum_count
+  - pg_stat_user_tables_idx_scan
+  - pg_stat_user_tables_idx_tup_fetch
+  - pg_stat_user_tables_last_analyze
+  - pg_stat_user_tables_last_autoanalyze
+  - pg_stat_user_tables_last_autovacuum
+  - pg_stat_user_tables_last_vacuum
+  - pg_stat_user_tables_n_dead_tup
+  - pg_stat_user_tables_n_live_tup
+  - pg_stat_user_tables_n_mod_since_analyze
+  - pg_stat_user_tables_n_tup_del
+  - pg_stat_user_tables_n_tup_hot_upd
+  - pg_stat_user_tables_n_tup_ins
+  - pg_stat_user_tables_n_tup_upd
+  - pg_stat_user_tables_seq_scan
+  - pg_stat_user_tables_seq_tup_read
+  - pg_stat_user_tables_size_bytes
+  - pg_stat_user_tables_vacuum_count
+  - pg_static
+  - pg_statio_user_tables_heap_blocks_hit
+  - pg_statio_user_tables_heap_blocks_read
+  - pg_statio_user_tables_idx_blocks_hit
+  - pg_statio_user_tables_idx_blocks_read
+  - pg_statio_user_tables_tidx_blocks_hit
+  - pg_statio_user_tables_tidx_blocks_read
+  - pg_statio_user_tables_toast_blocks_hit
+  - pg_statio_user_tables_toast_blocks_read
+  - pg_up
+  - pg_wal_segments
+  - pg_wal_size_bytes
+  - pg_settings_*
