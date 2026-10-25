@@ -195,6 +195,23 @@ pub fn prometheus_base() -> String {
         })
 }
 
+/// The client these queries go through.
+///
+/// Built from `cog-net`'s single definition of timeouts, pool and proxy rather
+/// than here: a second set of numbers in this file would keep its own default
+/// long after the shared one was judged, and the two would be discovered only
+/// by a query that hangs in one place and not the other. Both deadlines are
+/// five seconds because a dashboard reading that cannot answer in five seconds
+/// is already the answer.
+fn prometheus_client() -> Result<reqwest::Client, String> {
+    let config = cog_net::HttpClientConfig {
+        timeout_secs: 5,
+        connect_timeout_secs: 5,
+        ..Default::default()
+    };
+    cog_net::build_client(&config).map_err(|e| e.to_string())
+}
+
 /// Ask Prometheus for one query.
 async fn ask(client: &reqwest::Client, base: &str, query: &str) -> Result<Option<f64>, String> {
     let resp = client
@@ -220,15 +237,12 @@ pub async fn observability_readings_handler() -> axum::response::Response {
     use axum::Json;
 
     let base = prometheus_base();
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
+    let client = match prometheus_client() {
         Ok(c) => c,
         Err(e) => {
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "http_client", "message": e.to_string()})),
+                Json(serde_json::json!({"error": "http_client", "message": e})),
             )
                 .into_response()
         }

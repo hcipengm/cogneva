@@ -1547,6 +1547,7 @@ dependencies = [
  "chrono",
  "cog-core",
  "cog-llm",
+ "cog-net",
  "cog-observability",
  "cog-storage",
  "ed25519-dalek",

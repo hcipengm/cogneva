@@ -40,11 +40,10 @@ prometheus:
       # 入口本身：探的是"请求能不能走到后端"，不是"DNS 配没配"。两个
       # grafana/prometheus 的域名在集群内解析不到（它们由宿主的 hosts 或上游
       # DNS 提供），所以直接连入口代理的 Service，用 Host 头表达"我要那个站"。
-      #
-      # ingress-nginx 按 chart 默认落在 ingress-nginx 命名空间；装到别处时这一份
-      # 探不到，读数会报目标不通——这正是要看见的（选了错的入口形态），而不是
-      # 把它藏成一条零线。
       - job_name: blackbox-ingress
+        # ingress-nginx 按 chart 默认落在 ingress-nginx 命名空间；装到别处时这一份
+        # 探不到，读数会报目标不通——这正是要看见的（选了错的入口形态），而不是
+        # 把它藏成一条零线。
         metrics_path: /probe
         scrape_interval: 60s
         scrape_timeout: 10s

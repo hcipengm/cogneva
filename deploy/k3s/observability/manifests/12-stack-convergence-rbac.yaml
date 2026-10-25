@@ -8,7 +8,8 @@
 # （Grafana 面板、Loki 配置与探针模块）、services / statefulsets（两个日志与
 # 明细后端）、deployments（可达性探针本体——它没有需要保留下来的状态，用
 # Deployment 而不是 StatefulSet 才是诚实的形状）、ingresses（对外入口）、
-# scrapeconfigs（宿主读数生产者的抓取目标）。
+# scrapeconfigs（宿主读数生产者的抓取目标）、resourcequotas / limitranges
+# （01-namespace.yaml 一起交付的命名空间配额与默认限制）。
 # 没有 delete：收敛面没有删除路径，缺了它等于把
 # 「删掉一个对象」这件事从循环的能力面里拿掉。Role 自身命名空间有界，管不到
 # cogneva 命名空间里的任何东西。
@@ -22,7 +23,10 @@ metadata:
     app.kubernetes.io/component: stack-convergence
 rules:
   - apiGroups: [""]
-    resources: ["configmaps", "services"]
+    # resourcequotas / limitranges 是本目录里 01-namespace.yaml 一起交付的两件：
+    # 命名空间的对象数上限与默认资源限制。它们属于 core 组，忘了给就等于每轮
+    # 报一次「权限被拒」，而配额那一半在面板上看起来一直没被收敛过。
+    resources: ["configmaps", "services", "resourcequotas", "limitranges"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]
   - apiGroups: ["apps"]
     resources: ["statefulsets", "deployments"]
