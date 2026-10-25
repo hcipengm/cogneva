@@ -85,6 +85,36 @@ try:
 except ImportError:
     sys.exit("需要 python3-yaml（与 check-deploy-parity.sh 同一依赖）")
 
+
+class StrictLoader(yaml.SafeLoader):
+    """safe_load keeps the last of two equal keys and says nothing.
+
+    A Kubernetes object with a repeated key is refused by every consumer that
+    parses it — the API server, the deployer's manifest reader — so the render
+    must not produce one. Accepting the duplicate here only moves the refusal
+    to the install, where it arrives as "the version is bad" instead of "two
+    labels collided in a template".
+    """
+
+
+def _no_duplicate_keys(loader, node, deep=False):
+    seen = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in seen:
+            raise yaml.constructor.ConstructorError(
+                None, None,
+                f"duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        seen[key] = loader.construct_object(value_node, deep=deep)
+    return seen
+
+
+StrictLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicate_keys
+)
+
 order = {
     "Namespace": "00", "ResourceQuota": "01", "LimitRange": "02",
     "StorageClass": "05", "Secret": "08",
@@ -99,7 +129,12 @@ for doc in docs:
     doc = doc.strip("\n")
     if not doc.strip():
         continue
-    parsed = yaml.safe_load(doc)
+    try:
+        parsed = yaml.load(doc, Loader=StrictLoader)
+    except yaml.YAMLError as exc:
+        sys.exit(
+            f"{profile}: 渲染产物里有解析不了的文档，拒绝写出（装机会同样被拒）：\n{exc}"
+        )
     if not parsed or not parsed.get("kind"):
         continue
     kind = parsed["kind"]

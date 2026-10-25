@@ -90,4 +90,33 @@ fi
 grep -q 'helm-probe' <<<"${out}" \
   || fail "红了，但没报出 chart 侧的那处改动：${out}"
 
-echo "OK: render freshness 门禁在两种漂移上都红，在干净树上绿"
+# 用例 4：模板里写重了一个键 -> 渲染直接拒绝写产物。
+#
+# 为什么这一条在「新鲜度」的测试里：重复键的产物**能渲染出来也能提交上去**，
+# 它不违反新鲜度——chart 和 rendered 完全一致。它违反的是「产物能被解析」，
+# 而这两件事共用同一个写出点。真实故障：一份 NetworkPolicy 的 metadata.labels
+# 先由 chart 助手写了 app.kubernetes.io/name，模板里又手写了一遍，helm template
+# 成功、文件写进了树，等到 API server 与部署器的清单读取器解析时才被整份拒绝，
+# 装机和 4 条部署器测试同时红。所以写出点自己先把每份文档解析一遍。
+d="$(case_dir duplicate-key)"
+edit_once "${d}/deploy/helm/cogneva/templates/network-policy.yaml" \
+  '  name: crawl4ai-ingress
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: fetch
+' \
+  '  name: crawl4ai-ingress
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/name: crawl4ai
+    app.kubernetes.io/component: fetch
+'
+if out="$(bash "${d}/${gate_rel}" 2>&1)"; then
+  fail "模板里写重了键，渲染仍然写出了产物（解析不了的清单会一直被提交）：${out}"
+fi
+grep -q "duplicate key 'app.kubernetes.io/name'" <<<"${out}" \
+  || fail "红了，但没报出重复的那个键：${out}"
+
+echo "OK: render freshness 门禁在两种漂移上都红，在干净树上绿；模板写重键时渲染拒绝写出"
