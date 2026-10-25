@@ -4887,7 +4887,7 @@ fn outstanding_summary(rows: &[ChangeLedgerRow]) -> String {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use cog_core::{ChangeIdentity, LiveRevisionGap, SFError, SFResult};
+    use cog_core::{ChangeIdentity, ChangeLedgerEvent, LiveRevisionGap, SFError, SFResult};
 
     fn row(state: ChangeState, measured_at: Option<i64>) -> ChangeLedgerRow {
         ChangeLedgerRow {
@@ -6580,6 +6580,13 @@ mod tests {
                 .take(limit)
                 .cloned()
                 .collect())
+        }
+        async fn events(
+            &self,
+            _identity: &ChangeIdentity,
+            _limit: usize,
+        ) -> SFResult<Vec<ChangeLedgerEvent>> {
+            Ok(Vec::new())
         }
         async fn owed_by_band(&self) -> SFResult<Vec<(ChangePriority, usize)>> {
             Ok(ChangePriority::ALL

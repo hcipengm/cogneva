@@ -993,7 +993,12 @@ export interface ChangeBandCell {
  * 所以服务端不发一个填好的时间戳。
  */
 export interface ChangeLedgerRow {
+  /** 渲染用的 `kind:scope:literal`，不是可以反解的键——字面量里常有冒号。 */
   identity: string;
+  /** 身份的三段。要一条行的历史就发这三段，不要发上面那个键。 */
+  kind: string;
+  scope: string;
+  literal: string;
   state: string;
   title: string | null;
   assertion: string | null;
@@ -1001,6 +1006,43 @@ export interface ChangeLedgerRow {
   first_seen_at: string;
   measured_at: string | null;
   measured_rev: string | null;
+}
+
+/**
+ * 一条变更走过的一步。
+ *
+ * `from_state` 为空是入账那一步（此前没有状态），不是「状态未知」：把两者印成
+ * 一样，读者就看不出这条行是刚进来的还是状态读丢了。
+ */
+export interface ChangeTimelineEvent {
+  observed_at: string;
+  from_state: string | null;
+  to_state: string;
+  measured_rev: string | null;
+  retire_reason: string | null;
+  unsettled_reason: string | null;
+}
+
+export interface ChangeTimeline {
+  identity: string;
+  kind: string;
+  scope: string;
+  literal: string;
+  /** 新的在前。 */
+  events: ChangeTimelineEvent[];
+}
+
+export async function getChangeTimeline(
+  identity: { kind: string; scope: string; literal: string },
+  limit = 50
+): Promise<ChangeTimeline> {
+  const query = new URLSearchParams({
+    kind: identity.kind,
+    scope: identity.scope,
+    literal: identity.literal,
+    limit: String(limit),
+  });
+  return api.get<ChangeTimeline>(`/api/v1/governance/changes/events?${query.toString()}`);
 }
 
 /**

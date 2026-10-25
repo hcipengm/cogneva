@@ -23,9 +23,9 @@ use tower::ServiceExt;
 
 use cog_auth::jwt::{JwtConfig, JwtManager};
 use cog_core::{
-    ChangeBlock, ChangeIdentity, ChangeLedgerRow, ChangeLedgerStore, ChangePriority, ChangeReading,
-    ChangeSource, ChangeState, GatewayConfig, PreCheckResult, QuotaManager, QuotaSummary, SFResult,
-    User, UserStatus, UserType,
+    ChangeBlock, ChangeIdentity, ChangeLedgerEvent, ChangeLedgerRow, ChangeLedgerStore,
+    ChangePriority, ChangeReading, ChangeSource, ChangeState, GatewayConfig, PreCheckResult,
+    QuotaManager, QuotaSummary, SFResult, User, UserStatus, UserType,
 };
 use cog_gateway::{create_router, GatewayState};
 
@@ -121,6 +121,30 @@ impl ChangeLedgerStore for FakeLedger {
             .take(limit)
             .cloned()
             .collect())
+    }
+
+    async fn events(
+        &self,
+        identity: &ChangeIdentity,
+        limit: usize,
+    ) -> SFResult<Vec<ChangeLedgerEvent>> {
+        // A history for the rows this account holds, nothing for the rest: the
+        // route has to key by the whole identity, and a stand-in that answers
+        // for every identity would pass a route that keyed by none of it.
+        if !self.rows.iter().any(|row| &row.identity == identity) {
+            return Ok(Vec::new());
+        }
+        Ok(vec![ChangeLedgerEvent {
+            observed_at: chrono::Utc::now(),
+            from_state: Some(ChangeState::Pending),
+            to_state: ChangeState::Landed,
+            measured_rev: Some("rev-b".into()),
+            retire_reason: None,
+            unsettled_reason: None,
+        }]
+        .into_iter()
+        .take(limit)
+        .collect())
     }
 
     async fn owed_by_band(&self) -> SFResult<Vec<(ChangePriority, usize)>> {
@@ -461,6 +485,53 @@ async fn the_account_is_readable_with_a_token() {
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["total"], 2, "{body}");
+}
+
+/// One row's history, asked for by the three parts of its identity.
+///
+/// The request carries `kind`/`scope`/`literal` and not the rendered
+/// `kind:scope:literal` key: a literal routinely contains colons, so the key
+/// cannot be split back. A route that accepted only the key would answer with an
+/// empty history for such a row, and an empty history reads as "this row never
+/// moved" instead of "you asked the wrong question".
+#[tokio::test]
+async fn one_rows_history_is_read_by_the_three_parts_of_its_identity() {
+    let ledger = Arc::new(FakeLedger::new(
+        vec![row(
+            ChangeState::Landed,
+            "doc-a.md",
+            "crates/cog-gateway/src",
+        )],
+        0,
+        0,
+    ));
+    let state = state(Some(ledger));
+    let token = bearer(&state).await;
+
+    let (status, body) = get(
+        state.clone(),
+        "/api/v1/governance/changes/events?kind=grep&scope=crates/cog-gateway/src&literal=literal-in-crates/cog-gateway/src",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = body["events"].as_array().expect("events is a list");
+    assert_eq!(events.len(), 1, "{body}");
+    assert_eq!(events[0]["to_state"], "landed", "{body}");
+    assert_eq!(events[0]["measured_rev"], "rev-b", "{body}");
+
+    // 只给渲染键就是没给身份：三个必填段缺一个，请求在解析层就被拒。
+    let (status, body) = get(
+        state,
+        "/api/v1/governance/changes/events?identity=grep:crates/cog-gateway/src:literal",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a rendered key is not an identity: {body}"
+    );
 }
 
 /// Every state is a cell even when it holds nothing, and the two totals are

@@ -13,7 +13,10 @@
 //! stopped loop means is answered separately, by the loop's own liveness
 //! metric, so the two questions do not get one answer.
 
-use axum::{extract::State, Json};
+use axum::{
+    extract::{Query, State},
+    Json,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -301,7 +304,15 @@ pub struct ChangeBandCount {
 /// what to do rather than a record of every measurement ever taken.
 #[derive(Debug, Serialize)]
 pub struct ChangeLedgerRowView {
+    /// The flattened key, for display and for matching the repository views.
+    ///
+    /// Not the key to hand back: a literal routinely contains colons, so the
+    /// rendered form cannot be split into its parts again. The three columns
+    /// below are what a caller sends when it wants one row's history.
     pub identity: String,
+    pub kind: String,
+    pub scope: String,
+    pub literal: String,
     pub state: String,
     pub title: Option<String>,
     pub assertion: Option<String>,
@@ -366,6 +377,9 @@ pub async fn changes_handler(
         .into_iter()
         .map(|row| ChangeLedgerRowView {
             identity: row.identity.as_key(),
+            kind: row.identity.kind.clone(),
+            scope: row.identity.scope.clone(),
+            literal: row.identity.literal.clone(),
             state: row.state.as_str().to_string(),
             title: row.title,
             assertion: row.assertion,
@@ -389,6 +403,83 @@ pub async fn changes_handler(
         pending_retirements,
         outstanding_total,
         outstanding,
+    }))
+}
+
+/// What `GET /api/v1/governance/changes/events` takes.
+///
+/// The identity arrives in its three parts, never as the rendered key: the key
+/// is a display form, and a literal containing colons makes two different
+/// splits render identically. A caller that only had the key would get an empty
+/// history back and read it as "this row never moved", which is the one answer
+/// that is always wrong.
+#[derive(Debug, Deserialize)]
+pub struct ChangeTimelineQuery {
+    pub kind: String,
+    pub scope: String,
+    pub literal: String,
+    pub limit: Option<usize>,
+}
+
+/// One row's history: how it got to where it is.
+#[derive(Debug, Serialize)]
+pub struct ChangeTimelineResponse {
+    pub identity: String,
+    pub kind: String,
+    pub scope: String,
+    pub literal: String,
+    /// Newest first, the order the store returns.
+    pub events: Vec<cog_core::ChangeLedgerEvent>,
+}
+
+/// How many moves one history returns unless the caller asks for fewer. The
+/// steps come newest first, so the bound drops the oldest ones -- the account
+/// can be years deep and the question is "how did this get here".
+const TIMELINE_PAGE: usize = 50;
+const TIMELINE_MAX: usize = 200;
+
+/// The identity a timeline request names, or the reason it names none.
+///
+/// Split out from the handler so the rule has a reader that does not need a
+/// database: what makes a request bad is about the request, not about whether
+/// the ledger answered.
+fn timeline_identity(query: &ChangeTimelineQuery) -> Result<cog_core::ChangeIdentity, ApiError> {
+    if query.kind.trim().is_empty() || query.scope.trim().is_empty() {
+        return Err(ApiError {
+            error: "BadRequest".into(),
+            message: "kind and scope are what the identity is keyed by; an empty one matches rows \
+                      that were never named that way"
+                .into(),
+        });
+    }
+    // An empty literal is legitimate: some checks name a whole scope and no
+    // literal at all, and refusing those would make their history unreadable.
+    Ok(cog_core::ChangeIdentity::new(
+        query.kind.as_str(),
+        query.scope.as_str(),
+        query.literal.as_str(),
+    ))
+}
+
+fn timeline_limit(asked: Option<usize>) -> usize {
+    asked.unwrap_or(TIMELINE_PAGE).clamp(1, TIMELINE_MAX)
+}
+
+pub async fn change_timeline_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(query): Query<ChangeTimelineQuery>,
+) -> Result<Json<ChangeTimelineResponse>, ApiError> {
+    let identity = timeline_identity(&query)?;
+    let ledger = changes(&state)?;
+    let events = ledger
+        .events(&identity, timeline_limit(query.limit))
+        .await?;
+    Ok(Json(ChangeTimelineResponse {
+        identity: identity.as_key(),
+        kind: identity.kind,
+        scope: identity.scope,
+        literal: identity.literal,
+        events,
     }))
 }
 
@@ -435,5 +526,51 @@ mod tests {
         assert_eq!(view.check_kind.as_deref(), Some("tree"));
         assert_eq!(view.state.as_deref(), Some("enforced"));
         assert_eq!(view.priority, "p1");
+    }
+
+    fn query(kind: &str, scope: &str, literal: &str) -> ChangeTimelineQuery {
+        ChangeTimelineQuery {
+            kind: kind.into(),
+            scope: scope.into(),
+            literal: literal.into(),
+            limit: None,
+        }
+    }
+
+    /// 时间线的身份按三段给，不按渲染键反解：字面量里常有冒号，`kind:scope:literal`
+    /// 这个渲染式拆不回去。拿它反解出来的会是一条永远为空的历史，而空历史读作
+    /// 「这条行从来没动过」——恰恰是从来不对的那个答案。
+    #[test]
+    fn a_timeline_identity_is_three_parts_and_a_colon_in_the_literal_survives() {
+        let identity = timeline_identity(&query(
+            "grep",
+            "crates/cog-gateway/src/x.rs",
+            "route(\"/a:b\", get(h))",
+        ))
+        .expect("three parts is all a timeline needs");
+        assert_eq!(identity.kind, "grep");
+        assert_eq!(identity.scope, "crates/cog-gateway/src/x.rs");
+        assert_eq!(identity.literal, "route(\"/a:b\", get(h))");
+        // 渲染式是两个不同身份可以撞在一起的地方，这里只用来显示。
+        assert_eq!(
+            identity.as_key(),
+            "grep:crates/cog-gateway/src/x.rs:route(\"/a:b\", get(h))"
+        );
+    }
+
+    /// 一个 `absent` 式检查只点名一个范围、没有字面量；拒绝它会让这类行的历史
+    /// 永远读不出来。
+    #[test]
+    fn an_empty_literal_is_a_real_identity_and_an_empty_kind_is_not() {
+        assert!(timeline_identity(&query("absent", "deploy/k3s", "")).is_ok());
+        assert!(timeline_identity(&query("", "deploy/k3s", "x")).is_err());
+        assert!(timeline_identity(&query("grep", "   ", "x")).is_err());
+    }
+
+    #[test]
+    fn a_timeline_page_is_bounded_at_both_ends() {
+        assert_eq!(timeline_limit(None), TIMELINE_PAGE);
+        assert_eq!(timeline_limit(Some(0)), 1);
+        assert_eq!(timeline_limit(Some(10_000)), TIMELINE_MAX);
     }
 }

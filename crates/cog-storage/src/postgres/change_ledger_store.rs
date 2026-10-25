@@ -15,10 +15,10 @@ use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
 use cog_core::{
-    BlockCensus, BlockingHolder, BlockingSurface, ChangeBlock, ChangeIdentity, ChangeLedgerRow,
-    ChangeLedgerStore, ChangeMeasurement, ChangePriority, ChangeReading, ChangeReopen,
-    ChangeSource, ChangeState, DemandClosure, DispatchState, RetireReason, SFError, SFResult,
-    WriteWindow,
+    BlockCensus, BlockingHolder, BlockingSurface, ChangeBlock, ChangeIdentity, ChangeLedgerEvent,
+    ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangePriority, ChangeReading,
+    ChangeReopen, ChangeSource, ChangeState, DemandClosure, DispatchState, RetireReason, SFError,
+    SFResult, WriteWindow,
 };
 
 /// Every read returns these, in one place so no two readers can come back with
@@ -640,6 +640,21 @@ const FOLD_RETIRE_MARK_SQL: &str = "\
 UPDATE change_ledger_retired SET folded_at = now()
 WHERE folded_at IS NULL AND kind = $1 AND scope = $2 AND literal = $3";
 
+/// A stored state name, back into its variant.
+///
+/// `None` stays `None`: the event table uses NULL for "entered", which is a step
+/// in the story rather than a missing value, so it must not be manufactured into
+/// a state on the way out.
+fn parse_state(name: Option<String>) -> SFResult<Option<ChangeState>> {
+    match name {
+        None => Ok(None),
+        Some(name) => name
+            .parse::<ChangeState>()
+            .map(Some)
+            .map_err(|e| SFError::Database(format!("event state {name}: {e}"))),
+    }
+}
+
 const PENDING_RETIRE_SQL: &str =
     "SELECT count(*) AS n FROM change_ledger_retired WHERE folded_at IS NULL";
 
@@ -939,6 +954,70 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .fetch_all(&self.pool)
             .await,
         )
+    }
+
+    async fn events(
+        &self,
+        identity: &ChangeIdentity,
+        limit: usize,
+    ) -> SFResult<Vec<ChangeLedgerEvent>> {
+        // Newest first, and the id breaks ties: two moves recorded inside the
+        // same clock tick are still ordered by the order they were written, and
+        // `observed_at` alone would leave their order to the plan.
+        let rows = sqlx::query(
+            "SELECT observed_at, from_state, to_state, measured_rev, retire_reason, \
+                    unsettled_reason \
+               FROM change_ledger_event \
+              WHERE kind = $1 AND scope = $2 AND literal = $3 \
+              ORDER BY observed_at DESC, id DESC \
+              LIMIT $4",
+        )
+        .bind(&identity.kind)
+        .bind(&identity.scope)
+        .bind(&identity.literal)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(format!("events for {}: {e}", identity.as_key())))?;
+
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let from_state: Option<String> = row
+                .try_get("from_state")
+                .map_err(|e| SFError::Database(format!("event from_state: {e}")))?;
+            let to_state: String = row
+                .try_get("to_state")
+                .map_err(|e| SFError::Database(format!("event to_state: {e}")))?;
+            let retire_reason: Option<String> = row
+                .try_get("retire_reason")
+                .map_err(|e| SFError::Database(format!("event retire_reason: {e}")))?;
+            events.push(ChangeLedgerEvent {
+                observed_at: row
+                    .try_get("observed_at")
+                    .map_err(|e| SFError::Database(format!("event observed_at: {e}")))?,
+                from_state: parse_state(from_state)?,
+                // The column does not admit NULL, so a parse failure here is a
+                // value nothing wrote through the store -- a hand edit or a
+                // migration. Refusing beats folding it into `undecided`, which
+                // would read as "nothing has looked".
+                to_state: parse_state(Some(to_state.clone()))?.ok_or_else(|| {
+                    SFError::Database(format!("event to_state is NULL: {to_state}"))
+                })?,
+                measured_rev: row
+                    .try_get("measured_rev")
+                    .map_err(|e| SFError::Database(format!("event measured_rev: {e}")))?,
+                retire_reason: match retire_reason {
+                    None => None,
+                    Some(name) => Some(name.parse::<RetireReason>().map_err(|e| {
+                        SFError::Database(format!("event retire_reason {name}: {e}"))
+                    })?),
+                },
+                unsettled_reason: row
+                    .try_get("unsettled_reason")
+                    .map_err(|e| SFError::Database(format!("event unsettled_reason: {e}")))?,
+            });
+        }
+        Ok(events)
     }
 
     async fn owed_by_band(&self) -> SFResult<Vec<(ChangePriority, usize)>> {

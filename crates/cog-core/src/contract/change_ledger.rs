@@ -801,6 +801,36 @@ pub struct ChangeReopen {
     pub scope_present: Option<bool>,
 }
 
+/// One move the account recorded for one identity.
+///
+/// The stored row says where a change is now; this says how it got there. Both
+/// are needed to answer "why does the account hold this row at all", and the
+/// answer is not recoverable from the row: a row that moved `undecided` ->
+/// `landed` and one that never left `landed` read identically once the earlier
+/// steps are gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeLedgerEvent {
+    /// When the move was recorded, not when the tree was read. A pass that
+    /// landed late records the instant it was written; `measured_rev` is what
+    /// ties the move back to a tree.
+    pub observed_at: DateTime<Utc>,
+    /// The state the row held before. `None` is the account's word for
+    /// "entered": there was no earlier state to leave.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_state: Option<ChangeState>,
+    pub to_state: ChangeState,
+    /// The revision the measurement behind the move read, when it named one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_rev: Option<String>,
+    /// Why the row was retired, on the moves that retired it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retire_reason: Option<RetireReason>,
+    /// Why the move left the row unsettled, on the moves that could not settle
+    /// it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsettled_reason: Option<String>,
+}
+
 /// Durable storage for the change ledger.
 ///
 /// The only way to move a row's state is [`Self::apply_measurement`]. Rows enter
@@ -963,6 +993,23 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// consulted. Every outstanding row is then asked within a number of passes
     /// that follows from the size of the set, whatever the bands in it are.
     async fn outstanding(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>>;
+
+    /// The moves recorded for one identity, newest first.
+    ///
+    /// Takes the identity in its three parts rather than the flattened key: the
+    /// key is a rendering, not a field, and a literal full of colons makes two
+    /// different splits render the same. A caller that only holds the key is a
+    /// caller that will send the wrong question and get an empty history back,
+    /// which reads as "this row never moved" -- the answer that is never true.
+    ///
+    /// `limit` bounds the answer; an identity's whole history is not needed to
+    /// answer "how did this get here", and the oldest steps are the ones a
+    /// reader can live without.
+    async fn events(
+        &self,
+        identity: &ChangeIdentity,
+        limit: usize,
+    ) -> SFResult<Vec<ChangeLedgerEvent>>;
 
     /// How much work is owed at each band, every band present, zero included.
     ///

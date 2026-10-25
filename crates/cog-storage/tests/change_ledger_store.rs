@@ -1360,6 +1360,64 @@ async fn entering_and_moving_are_events_while_a_repeat_measurement_is_not() {
     cleanup(&pool, &marker).await;
 }
 
+/// One row's history reads back through the store, newest first, and stays on
+/// its own identity.
+///
+/// The account says where a change is now; it does not say how it got there, and
+/// once a later measurement has replaced the earlier one the steps exist only in
+/// the event table. Two ways this read can be quietly wrong: it can return
+/// another identity's moves (the identity is keyed by all three parts, and two
+/// rows in one scope differ only in the literal), and it can hand back the
+/// oldest steps when the reader asked for the newest.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_history_reads_back_through_the_store_newest_first_and_on_its_own_identity() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "history");
+    // Same kind, same scope, one character different in the literal: the pair
+    // that a read keyed by anything less than all three parts would merge.
+    let sibling = ChangeIdentity::new("grep", id.scope.clone(), "fn probe, renamed");
+
+    for (state, rev) in [
+        (ChangeState::Pending, "rev-a"),
+        (ChangeState::Partial, "rev-b"),
+        (ChangeState::Landed, "rev-c"),
+    ] {
+        store
+            .apply_measurement(&ChangeMeasurement::new(id.clone(), state).at_revision(rev))
+            .await
+            .unwrap_or_else(|e| panic!("measure {rev}: {e}"));
+    }
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(sibling.clone(), ChangeState::Pending).at_revision("rev-x"),
+        )
+        .await
+        .expect("measure the sibling row");
+
+    let history = store.events(&id, 50).await.expect("read one row's history");
+    assert_eq!(history.len(), 3, "the sibling's move is not this row's");
+    assert_eq!(history[0].to_state, ChangeState::Landed);
+    assert_eq!(history[0].from_state, Some(ChangeState::Partial));
+    assert_eq!(history[0].measured_rev.as_deref(), Some("rev-c"));
+    assert_eq!(
+        history[2].from_state, None,
+        "entering the account is the one move with nothing before it"
+    );
+    assert_eq!(history[2].to_state, ChangeState::Pending);
+    assert_eq!(history[2].measured_rev.as_deref(), Some("rev-a"));
+
+    let newest = store.events(&id, 1).await.expect("read the newest move");
+    assert_eq!(newest.len(), 1);
+    assert_eq!(
+        newest[0].to_state,
+        ChangeState::Landed,
+        "the bound has to drop the oldest steps, not keep them"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
 /// The reason a state carried travels with the transition, not only with the
 /// row.
 ///

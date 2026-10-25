@@ -906,6 +906,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/governance/changes",
             get(governance::changes_handler),
         )
+        .route(
+            "/api/v1/governance/changes/events",
+            get(governance::change_timeline_handler),
+        )
         .route("/api/v1/tasks/{id}", get(tasks::get_task_handler))
         .route("/api/v1/tasks/list", get(tasks::list_tasks_handler))
         .route("/api/v1/tasks/ready", get(tasks::get_ready_tasks_handler))
