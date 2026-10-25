@@ -38,7 +38,6 @@ fn read(rel: &str) -> String {
 
 fn yaml_docs(text: &str, what: &str) -> Vec<serde_yaml::Value> {
     serde_yaml::Deserializer::from_str(text)
-        .into_iter()
         .enumerate()
         .map(|(i, doc)| {
             serde_yaml::Value::deserialize(doc)
@@ -66,7 +65,7 @@ fn profiles() -> Vec<String> {
 }
 
 /// values 里的 `prometheus.prometheusSpec.additionalScrapeConfigs`（没有就是空）。
-fn scrape_configs<'a>(doc: &'a serde_yaml::Value) -> Vec<&'a serde_yaml::Value> {
+fn scrape_configs(doc: &serde_yaml::Value) -> Vec<&serde_yaml::Value> {
     let mut node = doc;
     for key in PROMETHEUS_PATH {
         node = match node.get(key) {
