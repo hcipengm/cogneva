@@ -67,7 +67,8 @@ const DEFAULT_SCAN_INTERVAL_SECS: u64 = 300;
 const DEFAULT_MAX_BYTES: u64 = cog_core::build_cache_readings::DEFAULT_CACHE_MAX_BYTES;
 
 /// Deployment variable naming the claim this cache sits on and its declared
-/// size, as `claim=size` (`cogneva-sandbox-pvc=5Gi`).
+/// size, as `claim=size` -- 例如 `cogneva-sandbox-pvc=5Gi`, which is this
+/// chart's own default rather than a capacity this code assumes.
 ///
 /// The declared size is the one input no walk inside the pod can produce: a
 /// directory-backed claim reports the node's filesystem, so the claim's own
