@@ -217,6 +217,7 @@ fn state_with(
         audit_stream: None,
         taste_intent_sink: None,
         llm_usage_reader: None,
+        llm_usage: None,
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
         chat_turns: None,
         agent_messages: None,
