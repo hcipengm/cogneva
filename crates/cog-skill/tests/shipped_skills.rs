@@ -103,3 +103,50 @@ async fn web_research_skill_tells_the_model_how_to_search_without_paid_apis() {
         );
     }
 }
+
+/// 设计规程只有一个家，而且它指向的令牌表还在。
+///
+/// 这份规程原先躺在 `.claude/skills/` 里——那是给某个编辑器会话读的目录，
+/// 不是平台的技能目录：镜像不复制它，注册表不扫描它，模型在选择技能时看不到
+/// 它，于是「界面该怎么做」这件事只对一个碰巧在那个目录下干活的会话生效。
+/// 技能的正本在 `skills/`，`Dockerfile` 把它整棵复制进 `/opt/cogneva/skills`，
+/// 系统提示里按 description 列出，任何一次前端改动都读得到同一份。
+///
+/// 规程里点名了令牌表的位置。路径会漂——表搬了、规程没跟上，它教的就是一个
+/// 不存在的文件，而读者只会以为是自己找不到。所以这里把两边钉在一起。
+#[tokio::test]
+async fn the_design_guidance_has_one_home_and_points_at_the_live_token_table() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+    let stray = root.join(".claude/skills");
+    assert!(
+        !stray.exists(),
+        "{} 又出现了：设计规程只许有一个家（skills/），第二份会与正本漂开",
+        stray.display()
+    );
+
+    let path = root.join("skills/frontend-design");
+    let def = cog_skill::loader::load_skill(&path)
+        .await
+        .expect("skills/frontend-design 装不起来");
+
+    assert!(
+        def.frontmatter.description.contains("界面"),
+        "description 里没有「界面」：模型按它判断该不该用这个技能，读不出来就不会用"
+    );
+
+    let tokens = root.join("web/src/styles/tokens.css");
+    assert!(
+        tokens.is_file(),
+        "规程指向的令牌表不在：{}",
+        tokens.display()
+    );
+    assert!(
+        def.skill_md.contains("web/src/styles/tokens.css"),
+        "规程没有点名令牌表的路径，读者只能自己猜颜色该从哪儿取"
+    );
+    assert!(
+        def.skill_md.contains("--brass"),
+        "规程没有点名唯一的强调色：不写清楚，每个视图都会自己造一个强调色"
+    );
+}
