@@ -359,7 +359,7 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
             // 卷的实际占用来自平台自己的走查端：每台节点上都有一个 claim-store，
             // 它量的是节点磁盘上每个卷的真实字节数。这条不经过 metrics-server，
             // 也不经过 kubelet——它读的是这个平台自己记的账。
-            let measured = measured_claim_bytes(pods.get("items"), &claims).await;
+            let measured = measured_claim_bytes(client.http(), pods.get("items"), &claims).await;
             let sources = Sources {
                 events,
                 usage,
@@ -621,6 +621,7 @@ struct Sources {
 /// 读不到就是读不到：端点没起来、端口换了、页面里没有这个声明，都只让这一格是
 /// `None`，不拿声明量去填——那是另一个数。
 async fn measured_claim_bytes(
+    http: &reqwest::Client,
     pods: Option<&Value>,
     claims: &std::collections::HashMap<String, ClaimView>,
 ) -> std::collections::HashMap<String, u64> {
@@ -629,13 +630,6 @@ async fn measured_claim_bytes(
         return measured;
     }
     let Some(items) = pods.and_then(Value::as_array) else {
-        return measured;
-    };
-    // 超时压得很短：这一面是轮询的，一个不响的走查端不能把整次读取拖住。
-    let Ok(http) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    else {
         return measured;
     };
     for pod in items {
@@ -663,7 +657,15 @@ async fn measured_claim_bytes(
             continue;
         };
         let url = format!("http://{ip}:{port}/metrics");
-        let Ok(response) = http.get(&url).send().await else {
+        // 期限压得很短、且挂在请求上：这一面是轮询的，一个不响的走查端不能把
+        // 整次读取拖住；而共用客户端的默认期限是给 apiserver 往返的，套在这里
+        // 会把一次前端刷新拖到那个数。
+        let Ok(response) = http
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        else {
             continue;
         };
         let Ok(text) = response.text().await else {
@@ -2086,20 +2088,24 @@ mod topology_tests {
             "spec": { "containers": [{ "ports": [{ "name": "http", "containerPort": 9100 }] }] },
             "status": {}
         }]);
-        assert!(measured_claim_bytes(Some(&no_ip), &claims).await.is_empty());
+        // 一个不会发出请求的客户端就够：这几条路径在发请求之前就返回。
+        let http = reqwest::Client::new();
+        assert!(measured_claim_bytes(&http, Some(&no_ip), &claims)
+            .await
+            .is_empty());
 
         let no_port = json!([{
             "metadata": { "name": "cogneva-claim-store-x", "labels": { "app.kubernetes.io/component": "claim-store" } },
             "spec": { "containers": [{ "ports": [{ "name": "metrics-admin", "containerPort": 9100 }] }] },
             "status": { "podIP": "127.0.0.1" }
         }]);
-        assert!(measured_claim_bytes(Some(&no_port), &claims)
+        assert!(measured_claim_bytes(&http, Some(&no_port), &claims)
             .await
             .is_empty());
 
         // 没有声明要量，就不必去敲任何端点。
         assert!(
-            measured_claim_bytes(Some(&no_port), &std::collections::HashMap::new())
+            measured_claim_bytes(&http, Some(&no_port), &std::collections::HashMap::new())
                 .await
                 .is_empty()
         );
