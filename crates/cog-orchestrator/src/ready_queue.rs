@@ -176,6 +176,26 @@ pub fn hold_reason(pool_unavailable: bool, bound: PassBound) -> &'static str {
     }
 }
 
+/// 计划预算这一道准入在读数里用的原因值。
+///
+/// 与 [`hold_reason`] 的三个值同一个 `reason` 轴：那一轴上的每个值都回答
+/// 「哪个闸门说了零」。这道闸门的零不是池子给的，也不是这一拍的切片给的，
+/// 是这个任务自己的计划基线给的——把它记进前两个里的任何一个，读它的人会去
+/// 调池子的额度，而额度不是这里的约束。
+pub const BUDGET_SPENT_REASON: &str = "budget_spent";
+
+/// 这条任务是否已经花掉了计划基线给它的 token。
+///
+/// 判据是「到线即停」，不是「明显超了再停」：预算是一个承诺过的数，多花一个
+/// token 就是多花了；容忍度要有的话得有人先定出来，凭空写下的 10% 会让一条
+/// 已经越界的任务继续跑，而越界这件事本身没有争议。
+///
+/// `budget == 0` 一律不拦。零预算是「这条基线没有给出 token 计划」，与
+/// 「计划花零个 token」是两件事——后者会把每一次派发都拦下，而前者什么都不该拦。
+pub fn past_its_budget(spent: u64, budget: u64) -> bool {
+    budget > 0 && spent >= budget
+}
+
 /// How many of `ready` may go on the wire, given what the queue already owes.
 ///
 /// `window_jobs` is the pool's own bound, or `None` when nothing measured one
@@ -615,6 +635,25 @@ mod tests {
             None,
             "有空的 running 列不该被凭空当成满"
         );
+    }
+
+    /// 到线即停：花到预算的那一条算花完了，不必再等它明显超出去。中间那一格
+    /// 是这一族的形状陷阱——差一个 token 的两侧读起来几乎一样，判成放行就是
+    /// 「预算说完的地方它还可以再跑一次」。
+    #[test]
+    fn a_task_that_spent_its_budget_is_past_it() {
+        assert!(!past_its_budget(999, 1000), "没花完就还能派");
+        assert!(past_its_budget(1000, 1000), "刚好花完也算花完");
+        assert!(past_its_budget(1001, 1000), "超了当然算花完");
+    }
+
+    /// 零预算与「计划花零个 token」不是一件事：前者是没有计划，后者会把每一次
+    /// 派发都拦下。基线表里 `budget_tokens` 的零值来自「分解没给估算」，所以它
+    /// 只能读成不设界。
+    #[test]
+    fn a_plan_without_a_budget_holds_nothing() {
+        assert!(!past_its_budget(0, 0));
+        assert!(!past_its_budget(1_000_000, 0));
     }
 
     #[test]

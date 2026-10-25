@@ -434,6 +434,14 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     "OrchestratorPlugin: no LLM pool status source; ready-queue admission admits everything"
                 ),
             }
+            // 计划预算那道准入读的是每条任务自己的 token 清点。取不到就是没有
+            // 这个读面：预算不设界，而不是拦下全部——读不到花销不等于花销是零。
+            match ctx.consume_service::<dyn cog_core::ObservabilityGateway>() {
+                Some(gateway) => runtime_holder.attach_observability(gateway),
+                None => info!(
+                    "OrchestratorPlugin: no observability gateway; the plan budget does not gate dispatch"
+                ),
+            }
             if let Some(ref exec_loop) = self.exec_loop {
                 if let Some(backend) = ctx.consume_service::<dyn cog_core::MessageBackend>() {
                     if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {

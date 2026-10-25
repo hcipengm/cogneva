@@ -156,6 +156,13 @@ pub struct DagExecutorRuntime {
     /// Empty means no source was published (a single-process deployment),
     /// which admits everything: an unread pool is not an empty one.
     pool_source: Arc<tokio::sync::OnceCell<Arc<dyn cog_core::LlmPoolStatusSource>>>,
+    /// 每条任务自己那一轮跑下来花掉的 token。
+    ///
+    /// 与 `pool_source` 同一个形状、同一个理由：发布它的 crate 与本 crate 的
+    /// `init` 谁先谁后不由这里决定，而 `start` 是所有 `init` 都跑完之后才开始的，
+    /// 所以挂在这一格上、由 `start` 填。空表示没有这个读面（进程内后端），
+    /// 那时计划预算不设界——读不到一个花销不等于花销是零。
+    observability: Arc<tokio::sync::OnceCell<Arc<dyn cog_core::ObservabilityGateway>>>,
     /// 看板每一列的在制品上限，构造时从环境读一次。
     ///
     /// 读一次而不是每轮读：限制是配置，不是读数；每轮读环境会让同一份配置在
@@ -176,6 +183,7 @@ impl DagExecutorRuntime {
             action_planner: None,
             skill_registry: None,
             pool_source: Arc::new(tokio::sync::OnceCell::new()),
+            observability: Arc::new(tokio::sync::OnceCell::new()),
             board_wip_limits: load_board_wip_limits(),
         }
     }
@@ -192,6 +200,7 @@ impl DagExecutorRuntime {
             action_planner: None,
             skill_registry: None,
             pool_source: Arc::new(tokio::sync::OnceCell::new()),
+            observability: Arc::new(tokio::sync::OnceCell::new()),
             board_wip_limits: load_board_wip_limits(),
         }
     }
@@ -211,6 +220,20 @@ impl DagExecutorRuntime {
     pub fn attach_pool_status_source(&self, source: Arc<dyn cog_core::LlmPoolStatusSource>) {
         if self.pool_source.set(source).is_err() {
             tracing::warn!("pool status source already attached; keeping the first one");
+        }
+    }
+
+    /// Point the publisher at the per-task token census.
+    ///
+    /// Called from `start`, for the same reason the pool source is: the crate
+    /// that publishes this reading and this one both publish during `init`, in
+    /// an order neither controls. Setting it twice is refused and said out
+    /// loud -- two censuses would be two readings of one number, and a budget
+    /// judged against either would be a budget whose verdict depends on which
+    /// one won.
+    pub fn attach_observability(&self, gateway: Arc<dyn cog_core::ObservabilityGateway>) {
+        if self.observability.set(gateway).is_err() {
+            tracing::warn!("token census already attached; keeping the first one");
         }
     }
 
@@ -293,12 +316,23 @@ impl DagExecutorRuntime {
         // Serialise and group first, changing no state.
         let mut by_stream: HashMap<String, Vec<(Task, Vec<u8>)>> = HashMap::new();
         let mut held_for_owner = 0usize;
+        // 计划预算这一道准入，与列上限、池窗口并列：它判的是「这条任务自己
+        // 还能不能再花」。拦在这里而不是派发之后，是因为拦住的那条要留在
+        // `Pending`——已经进了 `Scheduled` 的行，就绪扫描不会再回来看它。
+        let budgets = self.planned_budgets().await;
+        let mut budget_holds: HashMap<&'static str, u64> = HashMap::new();
         for task in ready_tasks {
             // A task that names the unit responsible for it waits for that unit
             // to ask for it; see [`crate::ready_queue::carries_an_owner`]. It
             // stays Pending, so it is offered again on the next pass.
             if crate::ready_queue::carries_an_owner(&task) {
                 held_for_owner += 1;
+                continue;
+            }
+            if self.spent_its_budget(&task, budgets.as_ref()).await {
+                let stream = crate::ready_queue::ready_stream_for(&task, &self.config.workspace_id);
+                let kind = crate::ready_queue::stream_kind(&stream, &self.config.workspace_id);
+                *budget_holds.entry(kind).or_insert(0) += 1;
                 continue;
             }
             let payload = serde_json::to_vec(&task).map_err(SFError::Serialization)?;
@@ -541,9 +575,113 @@ impl DagExecutorRuntime {
                 }
             }
         }
+        // 这一拍被计划预算拦下的活，按队列记账。与列上限同一个理由用计数器：
+        // 「花完了」会随一次重规划重新排预算消失，gauge 在前后都读 0。一条都
+        // 没拦时不写——一排零会让「没有哪条任务有预算」看起来像「没有一次被拦」。
+        if !budget_holds.is_empty() {
+            if let Some(metrics) = self.orchestrator.metrics_backend() {
+                for (kind, held) in budget_holds {
+                    let mut labels = HashMap::new();
+                    labels.insert("stream".to_string(), kind.to_string());
+                    labels.insert(
+                        "reason".to_string(),
+                        crate::ready_queue::BUDGET_SPENT_REASON.to_string(),
+                    );
+                    drop(
+                        metrics
+                            .record_counter(
+                                cog_core::metric_names::READY_ADMISSION_HELD_TOTAL,
+                                held as f64,
+                                labels,
+                            )
+                            .await,
+                    );
+                }
+            }
+        }
         match first_error {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+
+    /// 这一 workspace 里每条任务计划花掉的 token，按任务 id 索引；零预算的
+    /// 行不留——它在判据里就是「没有计划」（见
+    /// [`crate::ready_queue::past_its_budget`]），留着只会让每个读者自己记得跳过。
+    ///
+    /// 一次读整张表而不是逐条 `task_plan`：这一拍要判的是全部就绪任务的预算，
+    /// 逐条问是每条一次往返，而基线的行数比任务少一个量级。读不到（进程内后端
+    /// 没有这个面、或者库这一下不可用）返回 `None`：不设界，但也不假装设了界。
+    async fn planned_budgets(&self) -> Option<HashMap<String, u64>> {
+        let backend = self.orchestrator.state_backend()?;
+        match backend.task_plans(&self.config.workspace_id).await {
+            Ok(rows) => Some(
+                rows.into_iter()
+                    .filter(|plan| plan.budget_tokens > 0)
+                    .map(|plan| (plan.task_id, plan.budget_tokens))
+                    .collect(),
+            ),
+            Err(e) => {
+                tracing::debug!(
+                    workspace_id = %self.config.workspace_id,
+                    error = %e,
+                    "no plan baselines read this pass; the plan budget does not hold anything"
+                );
+                None
+            }
+        }
+    }
+
+    /// 这条任务是否已经把它计划的那点 token 花完了。
+    ///
+    /// 三道都得过才算：有预算（`budgets` 里没有它的行就是没计划）、跑过一遍
+    /// （没跑过的任务不可能有花销，问一次就是白问一趟库）、以及花销真的到了线。
+    /// 「跑过一遍」读 `started_at` 与 `retry_count`：两条都在任务行上，换进程也
+    /// 还在——重排回 `Pending` 只改状态，不清开始时刻。
+    ///
+    /// 花销读的是这条任务自己的 token 清点（每次运行结束时按任务 id 累加），
+    /// 回答的是「这条活自己花了多少」；项目账上那个按调用归因的和数回答的是
+    /// 另一个问题（「这个项目花到哪去了」），两者不在此处互换。
+    ///
+    /// 读不到就放行：没有清点行的任务（从没跑完过一轮、或者清点写失败）与一个
+    /// 花光了的任务在读数上都是「读不到」，而把读不到当成花光了，会让一条写失败
+    /// 的日志永久停掉整条任务线。
+    async fn spent_its_budget(&self, task: &Task, budgets: Option<&HashMap<String, u64>>) -> bool {
+        let Some(&budget) = budgets.and_then(|budgets| budgets.get(&task.id)) else {
+            return false;
+        };
+        if task.started_at.is_none() && task.retry_count == 0 {
+            return false;
+        }
+        let Some(gateway) = self.observability.get() else {
+            return false;
+        };
+        match gateway.get_task_metrics(&task.id).await {
+            Ok(metrics) => {
+                let spent = metrics.total_tokens;
+                if !crate::ready_queue::past_its_budget(spent, budget) {
+                    return false;
+                }
+                // 拦下这件事在这一拍只留一条具名日志：计数器给的是这一拍被这道
+                // 闸门拦住几条，而把一条任务停在这里的原因（花了多少、预算多少）
+                // 只有这一行会说。它不会自己好起来——预算得由一次重规划重新排，
+                // 所以这行是「谁、差多少」，不是「等下一拍」。
+                tracing::debug!(
+                    task_id = %task.id,
+                    spent_tokens = spent,
+                    budget_tokens = budget,
+                    "holding a ready task back: it has spent the tokens its plan gave it"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::debug!(
+                    task_id = %task.id,
+                    error = %e,
+                    "no token census for this task; its plan budget does not hold it"
+                );
+                false
+            }
         }
     }
 
@@ -2629,6 +2767,366 @@ mod consumer_ack_tests {
         let _ = handle.await.unwrap();
 
         assert_eq!(acks, vec!["gid-refused".to_string()]);
+    }
+
+    // ─── 计划预算：第四道准入 ───
+
+    /// 只答计划基线的 StateBackend。其余方法是契约的其余部分，这条路径不读，
+    /// 一律返回空——写成 `unimplemented!()` 会让「没读」从事实退化成假设。
+    struct PlanBook {
+        plans: Vec<cog_core::TaskPlan>,
+    }
+
+    #[async_trait]
+    impl cog_core::StateBackend for PlanBook {
+        async fn get_agent_state(
+            &self,
+            _agent_id: &str,
+        ) -> cog_core::SFResult<Option<cog_core::AgentState>> {
+            Ok(None)
+        }
+        async fn set_agent_state(
+            &self,
+            _agent_id: &str,
+            _state: &cog_core::AgentState,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn cas_agent_state(
+            &self,
+            _agent_id: &str,
+            _expected: &cog_core::AgentState,
+            _new: &cog_core::AgentState,
+        ) -> cog_core::SFResult<bool> {
+            Ok(true)
+        }
+        async fn get_events(
+            &self,
+            _task_id: &str,
+            _offset: u64,
+            _limit: usize,
+        ) -> cog_core::SFResult<Vec<cog_core::Event>> {
+            Ok(Vec::new())
+        }
+        async fn get_checkpoint(
+            &self,
+            _task_id: &str,
+        ) -> cog_core::SFResult<Option<cog_core::TaskCheckpoint>> {
+            Ok(None)
+        }
+        async fn save_checkpoint(
+            &self,
+            _checkpoint: &cog_core::TaskCheckpoint,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _task_id: &str,
+            _event: &cog_core::Event,
+        ) -> cog_core::SFResult<u64> {
+            Ok(0)
+        }
+        async fn get_board(
+            &self,
+            _task_id: &str,
+        ) -> cog_core::SFResult<Option<cog_core::ContextBoard>> {
+            Ok(None)
+        }
+        async fn set_board_field(
+            &self,
+            _task_id: &str,
+            _field: &str,
+            _value: &str,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn delete_checkpoint(&self, _task_id: &str) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn delete_board(&self, _task_id: &str) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn remove_board_field(&self, _task_id: &str, _field: &str) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+        async fn task_plans(
+            &self,
+            _workspace_id: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::TaskPlan>> {
+            Ok(self.plans.clone())
+        }
+    }
+
+    /// 只答每条任务 token 清点的观测面。没有行的任务照契约报错——真实实现就是
+    /// 这么答的，把「没有行」也编成零会让这条路径永远看不到「读不到」。
+    #[derive(Default)]
+    struct Census {
+        spent: Mutex<HashMap<String, u64>>,
+    }
+
+    impl Census {
+        fn with(rows: &[(&str, u64)]) -> Self {
+            let mut spent = HashMap::new();
+            for (task_id, tokens) in rows {
+                spent.insert((*task_id).to_string(), *tokens);
+            }
+            Self {
+                spent: Mutex::new(spent),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl cog_core::ObservabilityGateway for Census {
+        async fn subscribe_events(
+            &self,
+            _filter: cog_core::EventFilter,
+        ) -> cog_core::SFResult<cog_core::observability::AgentEventStream> {
+            unimplemented!("the budget path never subscribes")
+        }
+        async fn get_agent_state(
+            &self,
+            _agent_id: &str,
+        ) -> cog_core::SFResult<cog_core::AgentState> {
+            unimplemented!("the budget path never reads agent state")
+        }
+        async fn get_task_checkpoint(
+            &self,
+            _task_id: &str,
+        ) -> cog_core::SFResult<Option<cog_core::TaskCheckpoint>> {
+            unimplemented!("the budget path never reads checkpoints")
+        }
+        async fn get_task_metrics(
+            &self,
+            task_id: &str,
+        ) -> cog_core::SFResult<cog_core::TaskMetrics> {
+            match self.spent.lock().unwrap().get(task_id).copied() {
+                Some(total_tokens) => Ok(cog_core::TaskMetrics {
+                    task_id: task_id.into(),
+                    total_tokens,
+                    prompt_tokens: total_tokens,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                    iterations: 1,
+                    duration_ms: 1,
+                    timestamp: chrono::Utc::now(),
+                }),
+                None => Err(cog_core::SFError::Agent(format!(
+                    "metrics not found for task {task_id}"
+                ))),
+            }
+        }
+        async fn record_task_metrics(
+            &self,
+            _metrics: cog_core::TaskMetrics,
+        ) -> cog_core::SFResult<()> {
+            unimplemented!("the budget path never writes the census")
+        }
+        async fn get_task_logs(
+            &self,
+            _task_id: &str,
+            _limit: usize,
+        ) -> cog_core::SFResult<Vec<cog_core::LogEntry>> {
+            unimplemented!("the budget path never reads logs")
+        }
+        async fn get_snapshot_url(&self, _snapshot_id: &str) -> cog_core::SFResult<String> {
+            unimplemented!("the budget path never reads snapshots")
+        }
+        async fn get_raw_log_index(
+            &self,
+            _stream: &str,
+            _date: chrono::NaiveDate,
+        ) -> cog_core::SFResult<Vec<cog_core::RawLogIndex>> {
+            unimplemented!("the budget path never reads raw logs")
+        }
+        async fn get_cluster_overview(&self) -> cog_core::SFResult<cog_core::ClusterOverview> {
+            unimplemented!("the budget path never reads the cluster")
+        }
+        async fn get_squad_state(
+            &self,
+            _squad_id: &str,
+        ) -> cog_core::SFResult<cog_core::SquadState> {
+            unimplemented!("the budget path never reads squads")
+        }
+        fn publish_event(&self, _event: cog_core::AgentEvent) {}
+    }
+
+    fn plan(task_id: &str, budget_tokens: u64) -> cog_core::TaskPlan {
+        cog_core::TaskPlan {
+            workspace_id: "ws-budget-test".into(),
+            task_id: task_id.into(),
+            planned_start: None,
+            planned_end: None,
+            budget_tokens,
+            baseline_rev: "rev-1".into(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// 一条已经跑过一轮、又回到就绪队列的任务：`started_at` 是「它跑过」的
+    /// 落盘证据，重排只改状态不清它。
+    fn ran_before(mut task: cog_core::Task) -> cog_core::Task {
+        task.started_at = Some(chrono::Utc::now() - chrono::Duration::minutes(5));
+        task
+    }
+
+    fn budget_runtime(census: Census, plans: Vec<cog_core::TaskPlan>) -> DagExecutorRuntime {
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-budget-test".into(),
+            consumer_group: "grp-budget-test".into(),
+            max_retries: 1,
+            ..DagExecutorConfig::default()
+        };
+        let orchestrator = DagExecutor::new("ws-budget-test".into())
+            .with_state_backend(Arc::new(PlanBook { plans }));
+        let runtime = DagExecutorRuntime::new_with_backend(config, ScriptedBackend::default())
+            .with_orchestrator(Arc::new(orchestrator));
+        runtime.attach_observability(Arc::new(census));
+        runtime
+    }
+
+    /// 计划预算是一道准入，不是面板上的一个进度条：花完了这条活在下一轮不派，
+    /// 留在 `Pending`，等一次重规划重新排预算——而不是照发出去然后再记一笔超支。
+    ///
+    /// 区分在这条上：若预算只是读数，两条任务都会是 `Scheduled`，这条断言就红。
+    #[tokio::test]
+    async fn a_ready_task_that_spent_its_plan_budget_is_held_back() {
+        let runtime = budget_runtime(
+            Census::with(&[("task-spent", 150), ("task-room", 50)]),
+            vec![plan("task-spent", 100), plan("task-room", 100)],
+        );
+        let counters = Arc::new(Counters::default());
+        runtime.orchestrator().attach_metrics(counters.clone());
+
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-budget",
+                vec![
+                    ran_before(ready_task("task-spent", serde_json::json!({}))),
+                    ran_before(ready_task("task-room", serde_json::json!({}))),
+                ],
+            )
+            .await
+            .unwrap();
+        runtime.publish_ready_tasks().await.unwrap();
+
+        let orchestrator = runtime.orchestrator().clone();
+        let status = |id: &str| {
+            let orchestrator = orchestrator.clone();
+            let id = id.to_string();
+            async move {
+                orchestrator
+                    .get_task(&id)
+                    .await
+                    .unwrap_or_else(|| panic!("{id} present"))
+                    .status
+            }
+        };
+        assert_eq!(
+            status("task-spent").await,
+            cog_core::TaskStatus::Pending,
+            "花完预算的一条留在 Pending：派出去就是花一份没人批过的钱"
+        );
+        assert_eq!(
+            status("task-room").await,
+            cog_core::TaskStatus::Scheduled,
+            "还没花完的一条照派——预算是逐条的，不是把一个项目的账摊到每条上"
+        );
+
+        let writes = counters.writes.lock().unwrap().clone();
+        let held: Vec<&(String, f64, HashMap<String, String>)> = writes
+            .iter()
+            .filter(|(name, _, _)| name == "cogneva_ready_admission_held_total")
+            .collect();
+        assert_eq!(held.len(), 1, "这一拍只拦了一条：{writes:?}");
+        assert_eq!(held[0].1, 1.0);
+        assert_eq!(
+            held[0].2.get("reason").map(String::as_str),
+            Some("budget_spent"),
+            "原因指到预算这道闸门，不是池窗口——修法完全不同"
+        );
+        assert_eq!(held[0].2.get("stream").map(String::as_str), Some("shared"));
+    }
+
+    /// 没有清点行不是「花完了」：清点写是尽力而为的，把它读成零会让一条写失败的
+    /// 日志永久停掉这条任务线。读不到就放行，与池读数缺失时的处置同一条规矩。
+    #[tokio::test]
+    async fn a_task_whose_spending_was_never_read_is_not_held() {
+        let runtime = budget_runtime(Census::default(), vec![plan("task-unread", 100)]);
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-budget",
+                vec![ran_before(ready_task("task-unread", serde_json::json!({})))],
+            )
+            .await
+            .unwrap();
+        runtime.publish_ready_tasks().await.unwrap();
+
+        let task = runtime
+            .orchestrator()
+            .get_task("task-unread")
+            .await
+            .expect("task present");
+        assert_eq!(task.status, cog_core::TaskStatus::Scheduled);
+    }
+
+    /// 零预算是「这条基线没给 token 计划」，不是「计划花零个 token」。若有清点行
+    /// 而预算是零，每一次派发都会被拦下，整条任务线停在原地等一个永不会来的预算。
+    #[tokio::test]
+    async fn a_plan_with_no_budget_does_not_hold_anything() {
+        let runtime = budget_runtime(
+            Census::with(&[("task-nobudget", 999_999)]),
+            vec![plan("task-nobudget", 0)],
+        );
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-budget",
+                vec![ran_before(ready_task(
+                    "task-nobudget",
+                    serde_json::json!({}),
+                ))],
+            )
+            .await
+            .unwrap();
+        runtime.publish_ready_tasks().await.unwrap();
+
+        let task = runtime
+            .orchestrator()
+            .get_task("task-nobudget")
+            .await
+            .expect("task present");
+        assert_eq!(task.status, cog_core::TaskStatus::Scheduled);
+    }
+
+    /// 从没跑过的一条不去问清点：问一次就是一趟白跑的库往返，而就绪队列每一拍
+    /// 都可能很大。这里让清点里放一个巨大的数——若过滤没在问之前生效，它会被拦下。
+    #[tokio::test]
+    async fn a_task_that_never_ran_is_not_judged_by_a_census_it_cannot_have() {
+        let runtime = budget_runtime(
+            Census::with(&[("task-first", 999_999)]),
+            vec![plan("task-first", 100)],
+        );
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-budget",
+                vec![ready_task("task-first", serde_json::json!({}))],
+            )
+            .await
+            .unwrap();
+        runtime.publish_ready_tasks().await.unwrap();
+
+        let task = runtime
+            .orchestrator()
+            .get_task("task-first")
+            .await
+            .expect("task present");
+        assert_eq!(task.status, cog_core::TaskStatus::Scheduled);
     }
 }
 
