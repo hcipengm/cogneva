@@ -110,7 +110,7 @@ function ProjectStrip({
             key={r.id}
             onClick={() => onSelect(r.id)}
             className="flex w-full items-baseline gap-3 border-b border-[var(--line)] px-4 py-1.5 text-left last:border-b-0"
-            style={{ background: active ? 'var(--surface)' : 'transparent' }}
+            style={{ background: active ? 'var(--ink-800)' : 'transparent' }}
           >
             <span
               className="mono min-w-0 flex-1 truncate text-[11px]"
