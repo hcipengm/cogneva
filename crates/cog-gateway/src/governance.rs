@@ -148,6 +148,44 @@ pub struct RefusedPrinciple {
     pub lead: Option<String>,
     pub refusals: i64,
     pub last_refused_at: Option<DateTime<Utc>>,
+    /// 它会在哪儿红：载体自己写下的门与判据。空着表示还没有人说过，
+    /// 与「这一条没有门」是两个不同的结论，界面不能把两者画成同一格。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub where_red: Option<String>,
+    /// 这条原则的载体（记忆文件）。点开一条被拒过的原则，第一件要问的是它出自哪一页。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carrier_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_gate: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform_gate: Option<String>,
+    /// 检查档位：形状 / 树 / 现场 / 人判 / 未声明。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_kind: Option<String>,
+    /// 判读状态。空着表示还没有一次判读落过地。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    pub priority: String,
+}
+
+/// 一行台账 → 一条被拒原则的读数。
+///
+/// 抽成函数只为让这几列可测：它们都是从行上原样搬过来的，而「搬的时候掉了一列」
+/// 是这里唯一真会发生的错——行上有 where_red，读面没有，界面就只能给一个 slug。
+fn refused_view(row: cog_core::PrincipleRow) -> RefusedPrinciple {
+    RefusedPrinciple {
+        slug: row.slug,
+        lead: row.lead,
+        refusals: row.refusals,
+        last_refused_at: row.last_refused_at,
+        where_red: row.where_red,
+        carrier_path: row.carrier_path,
+        host_gate: row.host_gate,
+        platform_gate: row.platform_gate,
+        check_kind: row.check_kind.map(|kind| kind.as_str().to_string()),
+        state: row.state.map(|state| state.as_str().to_string()),
+        priority: row.priority.as_str().to_string(),
+    }
 }
 
 /// How many refused principles the route returns in the list. The totals are
@@ -178,12 +216,7 @@ pub async fn principles_handler(
         .refused(REFUSED_READ_CAP)
         .await?
         .into_iter()
-        .map(|row| RefusedPrinciple {
-            slug: row.slug,
-            lead: row.lead,
-            refusals: row.refusals,
-            last_refused_at: row.last_refused_at,
-        })
+        .map(refused_view)
         .collect();
     // The store selects `refusals > 0` and hands back whatever order the table
     // gives; a list ordered by nothing reads as "these are the ones", when the
@@ -357,4 +390,50 @@ pub async fn changes_handler(
         outstanding_total,
         outstanding,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn row() -> cog_core::PrincipleRow {
+        let at = Utc.with_ymd_and_hms(2026, 10, 25, 8, 0, 0).unwrap();
+        cog_core::PrincipleRow {
+            slug: "feedback_example".into(),
+            lead: Some("一句原则".into()),
+            carrier_path: Some("memory/feedback_example.md".into()),
+            carrier_sha256: None,
+            host_gate: Some("principle-gate.sh".into()),
+            where_red: Some("crates/x/src/y.rs:12".into()),
+            platform_gate: Some("check-before-push.sh".into()),
+            check_kind: Some(cog_core::PrincipleCheckKind::Tree),
+            priority: cog_core::ChangePriority::P1,
+            state: Some(cog_core::PrincipleState::Enforced),
+            refusals: 3,
+            last_refused_at: Some(at),
+            first_seen_at: at,
+            measured_at: Some(at),
+            measured_rev: Some("abc123".into()),
+        }
+    }
+
+    /// 台账行上有「它在哪儿会红」，读面以前只交了 slug 与次数：界面上点开一条
+    /// 被拒过的原则，看不出它出自哪一页、由哪扇门守、判读到什么状态。
+    #[test]
+    fn a_refused_principle_carries_where_it_would_go_red() {
+        let view = refused_view(row());
+        assert_eq!(view.slug, "feedback_example");
+        assert_eq!(view.refusals, 3);
+        assert_eq!(view.where_red.as_deref(), Some("crates/x/src/y.rs:12"));
+        assert_eq!(
+            view.carrier_path.as_deref(),
+            Some("memory/feedback_example.md")
+        );
+        assert_eq!(view.host_gate.as_deref(), Some("principle-gate.sh"));
+        assert_eq!(view.platform_gate.as_deref(), Some("check-before-push.sh"));
+        assert_eq!(view.check_kind.as_deref(), Some("tree"));
+        assert_eq!(view.state.as_deref(), Some("enforced"));
+        assert_eq!(view.priority, "p1");
+    }
 }

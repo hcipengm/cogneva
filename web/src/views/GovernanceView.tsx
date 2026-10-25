@@ -104,12 +104,32 @@ export function GovernanceView() {
           {principles.data.refused.length > 0 && (
             <Table
               columns={[
-                { key: 'slug', title: '原则', render: (r) => (
+                { key: 'slug', title: '原则', width: '260px', render: (r) => (
                   <span className="text-[12px]" title={r.slug}>
                     {r.lead ?? r.slug}
                   </span>
                 ) },
-                { key: 'n', title: '拒绝', width: '90px', render: (r) => (
+                { key: 'state', title: '判读', width: '100px', render: (r) => (
+                  <span className="text-[11px]" style={{ color: stateColor(r.state) }}>
+                    {r.state ?? '从未判读'}
+                  </span>
+                ) },
+                { key: 'where', title: '会在哪儿红', width: '230px', render: (r) => (
+                  <span className="mono text-[10px] text-[var(--muted)]" title={r.where_red ?? ''}>
+                    {r.where_red ?? '还没人说过'}
+                  </span>
+                ) },
+                { key: 'gate', title: '门', width: '200px', render: (r) => (
+                  <span className="mono text-[10px] text-[var(--muted)]">
+                    {[r.host_gate, r.platform_gate].filter(Boolean).join(' · ') || '—'}
+                  </span>
+                ) },
+                { key: 'carrier', title: '载体', width: '230px', render: (r) => (
+                  <span className="mono text-[10px] text-[var(--muted)]" title={r.carrier_path ?? ''}>
+                    {r.carrier_path ?? '—'}
+                  </span>
+                ) },
+                { key: 'n', title: '拒绝', width: '70px', render: (r) => (
                   <span className="mono text-[11px]">{r.refusals}</span>
                 ) },
                 { key: 'at', title: '最近一次', width: '110px', render: (r) => <Moment iso={r.last_refused_at} /> },
@@ -122,4 +142,16 @@ export function GovernanceView() {
       )}
     </ViewFrame>
   );
+}
+
+/** 判读状态的颜色：已强制是好的，未强制要人看，退役只是历史。 */
+function stateColor(state: string | null | undefined): string {
+  switch (state) {
+    case 'enforced':
+      return 'var(--ok)';
+    case 'unenforced':
+      return 'var(--warn)';
+    default:
+      return 'var(--muted)';
+  }
 }

@@ -934,6 +934,17 @@ export interface RefusedPrinciple {
   lead: string | null;
   refusals: number;
   last_refused_at: string | null;
+  /** 这条原则会在哪儿红。缺席是「还没人说过」，不是「没有门」。 */
+  where_red?: string | null;
+  /** 载体（记忆文件）。 */
+  carrier_path?: string | null;
+  host_gate?: string | null;
+  platform_gate?: string | null;
+  /** shape / tree / live / judgement；缺席是还没人声明怎么查。 */
+  check_kind?: string | null;
+  /** enforced / unenforced / retired；缺席是还没有一次判读落地。 */
+  state?: string | null;
+  priority?: string;
 }
 
 /**
