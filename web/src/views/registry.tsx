@@ -5,6 +5,7 @@ import { ChangesView } from '@/views/ChangesView';
 import { DeliveryView } from '@/views/DeliveryView';
 import { DiffView } from '@/views/DiffView';
 import { FilesView } from '@/views/FilesView';
+import { FlowView } from '@/views/FlowView';
 import { GovernanceView } from '@/views/GovernanceView';
 import { InboxView } from '@/views/InboxView';
 import { ObservabilityView } from '@/views/ObservabilityView';
@@ -40,6 +41,8 @@ export function ViewFor({ view }: { view: string }) {
       return <AlertsView />;
     case 'tasks':
       return <TasksView />;
+    case 'flow':
+      return <FlowView />;
     case 'agents':
       return <AgentsView />;
     case 'changes':

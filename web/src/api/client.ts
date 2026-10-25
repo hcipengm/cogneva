@@ -691,6 +691,65 @@ export interface TaskSummaryCounts {
   all_completed: boolean;
 }
 
+export interface ProcessTask {
+  id: string;
+  task_type: string;
+  status: string;
+  agent_id: string | null;
+  blocked_by: string[];
+  retry_count: number;
+  max_retries: number;
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+}
+
+export interface GoalGroup {
+  goal_id: string;
+  total: number;
+  completed: number;
+  failed: number;
+  running: number;
+  pending: number;
+  progress_pct: number;
+  tasks: ProcessTask[];
+}
+
+export interface CrewProgress {
+  crew_id: string;
+  agent_ids: string[];
+  total_tasks: number;
+  completed_tasks: number;
+  failed_tasks: number;
+  progress_pct: number;
+  crew_retry_count: number;
+  updated_at: string;
+}
+
+export interface AgentLoad {
+  agent_id: string;
+  role: string;
+  capabilities: string[];
+  /** healthy / suspect / stuck / dead / unknown（没有监管者判词）。 */
+  health: string;
+  running_tasks: number;
+  load_score: number | null;
+  last_heartbeat: string;
+}
+
+export interface ProcessOverview {
+  timestamp: string;
+  goals: GoalGroup[];
+  crews: CrewProgress[];
+  agents: AgentLoad[];
+  health: { healthy: number; suspect: number; stuck: number; dead: number };
+  dlq_len: number;
+}
+
+export async function getProcessOverview(): Promise<ProcessOverview> {
+  return api.get<ProcessOverview>('/api/v1/processes');
+}
+
 export async function getTaskSummary(): Promise<TaskSummaryCounts> {
   return api.get<TaskSummaryCounts>('/api/v1/tasks/status');
 }

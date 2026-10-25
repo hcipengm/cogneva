@@ -51,6 +51,7 @@ const TITLES: Record<ActivityId, string> = {
   inbox: '收件箱',
   agents: '智能体',
   tasks: '任务',
+  flow: '流程',
   alerts: '告警',
   changes: '变更',
   governance: '治理',
@@ -359,6 +360,28 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             </Note>
           </Section>
           <CrossLinks links={[{ id: 'changes', label: '变更', note: '判词要求的落地' }]} />
+        </>
+      );
+
+    case 'flow':
+      return (
+        <>
+          <Section title="这一面怎么读">
+            <Row label="意图" note="一个 goal 一行" />
+            <Row label="被挡住" note="等前面的任务完成" />
+            <Row label="就绪" note="没有依赖，等人认领" />
+            <Row label="执行中" note="已经有人在做" />
+            <Note>
+              任务面是对象图（谁等谁），这一面是时间轴（停在哪一段）。评测与落地在各自的
+              面上，不在这条线上。
+            </Note>
+          </Section>
+          <CrossLinks
+            links={[
+              { id: 'tasks', label: '任务', note: '依赖与归属的细节' },
+              { id: 'agents', label: '智能体', note: '执行者自己的读数' },
+            ]}
+          />
         </>
       );
 
