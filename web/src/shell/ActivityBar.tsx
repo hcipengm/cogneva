@@ -23,6 +23,7 @@ const ITEMS: { id: ActivityId; label: string; icon: IconName }[] = [
   { id: 'observability', label: '观测', icon: 'observability' },
   { id: 'resources', label: '资源', icon: 'resources' },
   { id: 'storage', label: '存储', icon: 'storage' },
+  { id: 'eval', label: '评测', icon: 'eval' },
   { id: 'delivery', label: '构建与部署', icon: 'delivery' },
   { id: 'audit', label: '审计', icon: 'audit' },
 ];

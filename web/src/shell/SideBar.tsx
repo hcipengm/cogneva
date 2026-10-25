@@ -59,6 +59,7 @@ const TITLES: Record<ActivityId, string> = {
   observability: '观测',
   resources: '资源',
   storage: '存储',
+  eval: '评测',
   delivery: '构建与部署',
   audit: '审计',
   settings: '设置',
@@ -446,6 +447,26 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             links={[
               { id: 'resources', label: '资源', note: '盘还有多少空' },
               { id: 'observability', label: '观测', note: '归档循环在不在跑' },
+            ]}
+          />
+        </>
+      );
+
+    case 'eval':
+      return (
+        <>
+          <Section title="两列">
+            <Row label="数据集" note="数据目录里的输入文件" />
+            <Row label="报告" note="跑完落盘的结论" />
+            <Note>
+              空列表说的是这个目录里没有，不是平台没跑过。只有「跑一次」是写，其余都是读；
+              报告存下来才会有下一次可比的基线。
+            </Note>
+          </Section>
+          <CrossLinks
+            links={[
+              { id: 'changes', label: '变更', note: '这次改动凭什么进集群' },
+              { id: 'storage', label: '存储', note: '数据目录里还有什么' },
             ]}
           />
         </>

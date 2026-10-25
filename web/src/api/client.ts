@@ -939,6 +939,49 @@ export async function listEvalDatasets(): Promise<EvalDatasetInfo[]> {
   return page.datasets ?? [];
 }
 
+/** 跑一次评测。报告会落到数据目录里，跑完就能在报告列表里读到。 */
+export async function runEval(datasetPath: string): Promise<void> {
+  await api.post('/api/v1/eval/run', { dataset_path: datasetPath });
+}
+
+/**
+ * 一份已经落盘的报告。
+ *
+ * `total` 是应用上限**之前**目录里有几份：它比 `reports.length` 大，说明这次只拿到
+ * 了前缀；`dir` 是这次读的目录，空列表要能说清是哪个目录空。
+ */
+export interface EvalReportList {
+  dir: string;
+  reports: EvalReportSummary[];
+  total: number;
+}
+
+export interface EvalReportSummary {
+  id: string;
+  dataset_name: string;
+  created_at: string;
+  size_bytes: number;
+}
+
+export async function listEvalReports(limit?: number): Promise<EvalReportList> {
+  const suffix = limit !== undefined ? `?limit=${limit}` : '';
+  return api.get<EvalReportList>(`/api/v1/eval/reports${suffix}`);
+}
+
+/** 一份报告的两个面：渲染过的 markdown，与原样的 JSON。 */
+export interface EvalReportDetail {
+  run_id: string;
+  dataset_name: string;
+  report_markdown: string;
+  report_json: string;
+}
+
+export async function getEvalReport(reportId: string): Promise<EvalReportDetail> {
+  return api.get<EvalReportDetail>(
+    `/api/v1/eval/report/${encodeURIComponent(reportId)}`
+  );
+}
+
 /**
  * 记忆后端自己数的六个计数。
  *
