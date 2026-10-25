@@ -79,6 +79,17 @@ spec:
         - protocol: TCP
           port: 8080
     {{- end }}
+    {{- if .Values.webFetch.enabled }}
+    # 网页抓取的渲染后端（Crawl4AI，11235）：`web_fetch` 把页面交给它渲染。单列一条
+    # 同检索那条的理由——按 Pod 选，不按端口对本命名空间全开。
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: crawl4ai
+      ports:
+        - protocol: TCP
+          port: 11235
+    {{- end }}
     {{- range $host, $allow := .Values.notification.egress }}
     # 告警通知出口 {{ $host }}：本 Pod 的 egress 是白名单，出口地址在集群外时须显式放行，
     # 否则通知被拦掉而 dispatch 只留下一行 warn——读起来像"没有告警"。一个宿主一条规则：
@@ -359,4 +370,108 @@ spec:
       ports:
         - protocol: TCP
           port: 8085
+{{- if .Values.webFetch.enabled }}
+---
+# 渲染后端的出站面：它必须能访问公网（那是它的活），但**不能**访问本集群。
+#
+# 一个「给我这个 URL 的内容」的服务，如果还能连到集群里的任何地址，那它就是一个
+# 从外网侧发起的内网探测器：谁能让 `web_fetch` 读一个地址，谁就能借它读到
+# apiserver、数据库、云元数据端点。代码侧的 `check_public_url` 已经拒了回环、
+# 私有网段与集群域名，但那是**调用方进程**的判断；放行整个 0.0.0.0/0 就等于让
+# 「一行代码写错」与「越权可达」之间只隔着一份代码。
+#
+# 排除清单与代码里的拒绝清单同源：
+#   - 10.0.0.0/8：RFC1918，其中 10.42.0.0/16 是 K3s 的 Pod 网段、10.43.0.0/16
+#     是 Service 网段，标准 kubeadm 集群的 10.96.0.0/12 也落在这一段里。
+#   - 172.16.0.0/12、192.168.0.0/16：另两段 RFC1918。
+#   - 127.0.0.0/8：回环，含容器自己起的服务。
+#   - 169.254.0.0/16：链路本地，云上的元数据端点（169.254.169.254）在这里。
+#   - 100.64.0.0/10：CGNAT 段，部分集群把它用作 Service 网段。
+#   - ::1/128、fc00::/7、fe80::/10：IPv6 的同一批。
+# 集群 DNS 单列一条放行：被排除的网段里只有它还需要通，否则浏览器连域名都解析
+# 不了，而失败形态是每次抓取都超时。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: crawl4ai-egress
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/name: crawl4ai
+    app.kubernetes.io/component: fetch
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: crawl4ai
+      app.kubernetes.io/component: fetch
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              - "::1/128"
+              - "fc00::/7"
+              - "fe80::/10"
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+---
+# 入站面：只有跑 agent 循环、真的会调 `web_fetch` 的两个工作负载够得到 11235。
+# 别的 Pod 一律不通——这个服务不需要有第二个调用方。写了 Ingress 类型就等于对这
+# 个 Pod 默认拒绝入站，所以探针那一侧要单独确认：kubelet 的探针从节点发起，
+# 而不是从 Pod（这条在集群上实测过，见本轮的部署验证）。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: crawl4ai-ingress
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/name: crawl4ai
+    app.kubernetes.io/component: fetch
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: crawl4ai
+      app.kubernetes.io/component: fetch
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cogneva
+              app.kubernetes.io/component: gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: evolution
+      ports:
+        - protocol: TCP
+          port: 11235
+{{- end }}
 {{- end }}

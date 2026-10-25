@@ -476,6 +476,11 @@ sandboxExecutor:
   workspaceTtlSecs: 21600
   workspaceGcIntervalSecs: 600
   repoFetchIntervalSecs: 300
+  # 上限是**两个数里较小的那个**：这个策略上限（同时服务多少棵树），与这块卷实测能
+  # 容纳多少个（每轮 GC 读 `df` 的可用字节，除以同一次 GC 里量出的单树大小，留 15%
+  # 余量给写入中的 git 命令）。树随仓库变大、卷被同住者占满时，实测那头会自己降下来
+  # ——写成固定值就等于把某一天的树大小封进配置，之后它不再跟着变。还没有任何树时
+  # 测不出单树大小，只剩这个策略值。
   maxTaskWorkspaces: 8
   # 本 Pod 自己那块构建缓存（`CARGO_TARGET_DIR`）的上限与复测周期。**它与进化侧
   # 的 `evolution.workspaces.targetMaxBytes` 是两个对象，不是同一个旋钮的两种写法**：
@@ -1182,6 +1187,29 @@ webSearch:
     limits:
       cpu: 1000m
       memory: 1Gi
+
+# 网页抓取的渲染后端（集群内 Crawl4AI）。
+# `web_fetch` 配了 `base` 就把页面交给真浏览器渲染再取正文，没配就本进程读 HTML。
+# 差别落在客户端渲染（SPA）与 PDF 上：本进程读到的是一句脚本还没跑的空壳，而
+# 空壳与「这一页本来就没内容」在返回值里同形。自建的理由同检索：抓取是 agent
+# 每回合都可能调的动作，按次计费的服务端抓取工具会把「读一下这一页」变成账单。
+webFetch:
+  enabled: true
+  # 空值＝这个部署不接渲染后端，`web_fetch` 回落到本进程读。
+  base: "http://crawl4ai:11235"
+  image: docker.io/unclecode/crawl4ai:0.7.4
+  replicas: 1
+  # Chromium 把共享内存当工作区用：默认的 64MiB /dev/shm 在中等页面上就会让
+  # 渲染进程崩掉，而崩掉的表现是抓取超时，不是「这一页读不了」。一个页面的
+  # 内存峰值 = 浏览器 + 这份 shm，limits 因此要比 shm 至少多出 1Gi。
+  shmSize: 1Gi
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 3Gi
 
 networkPolicy:
   enabled: true

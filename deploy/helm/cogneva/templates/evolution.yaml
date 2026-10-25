@@ -405,6 +405,13 @@ spec:
             # 检索面本来就是无凭证的集群内服务。空值＝这个部署不接网页检索。
             - name: COGNEVA_WEB_SEARCH_BASE
               value: {{ .Values.webSearch.base | quote }}
+            # 网页抓取的渲染后端（集群内 Crawl4AI）。它是零凭证的集群内服务，不走
+            # 安全网关；egress 白名单里那一条（11235）少了，抓取会被策略静默丢弃，
+            # 表现是每次抓取都超时。空值＝这个部署不接渲染，`web_fetch` 回落到本进程。
+            {{- if .Values.webFetch.enabled }}
+            - name: COGNEVA_WEB_FETCH_BASE
+              value: {{ .Values.webFetch.base | quote }}
+            {{- end }}
             # 实例身份指纹：身份的规范来源，安装期生成、升级复用。身份决定
             # `evol/<id>` 分支名与按实例命名的常驻工作树，必须跨重启与重装稳定。
             - name: COGNEVA_INSTANCE_FINGERPRINT

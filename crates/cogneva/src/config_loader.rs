@@ -1555,6 +1555,7 @@ mod tests {
             // these are carried to complete the literal.
             external_archive_threshold_chars: 8192,
             web_search_base: None,
+            web_fetch_base: None,
         };
         let business: cog_core::RuntimeConfig = cfg.into();
         assert_eq!(business.agent_id, "agent-42");

@@ -1584,6 +1584,11 @@ pub mod builtins {
         /// tell "this deployment has no web access" from "this tool does not
         /// exist".
         pub web_search_base: Option<String>,
+        /// Where the page-rendering backend lives. `None` means the fetch reads
+        /// the page in process; `Some` means every fetch is rendered in a
+        /// browser, and a backend that does not answer is reported as such
+        /// rather than quietly replaced by the path that cannot run scripts.
+        pub web_fetch_base: Option<String>,
     }
 
     /// Register every built-in tool into `registry`.
@@ -1634,7 +1639,10 @@ pub mod builtins {
             registry,
             web_search(inputs.http_client.clone(), inputs.web_search_base.clone()),
         );
-        cog_core::ToolRegistry::register(registry, web_fetch(inputs.http_client.clone()));
+        cog_core::ToolRegistry::register(
+            registry,
+            web_fetch(inputs.http_client.clone(), inputs.web_fetch_base.clone()),
+        );
         match (
             inputs.message_backend.clone(),
             inputs.agent_registry.clone(),

@@ -176,6 +176,10 @@ spec:
             # 免费网页检索后端（集群内 SearXNG），与 chart 的 gateway 部署同源。
             - name: COGNEVA_WEB_SEARCH_BASE
               value: "http://searxng:8080"
+            # 网页抓取的渲染后端（集群内 Crawl4AI），与 chart 的 gateway 部署同源。
+            # 缺这个值＝本进程读 HTML，客户端渲染的页面只拿得回空壳。
+            - name: COGNEVA_WEB_FETCH_BASE
+              value: "http://crawl4ai:11235"
             # git 身份自举的基线仓库（owner/name）。自举循环跑在**本进程**：
             # cogneva-secrets 的属主就是这里（WebUI 向导与贡献通道写同一份），
             # 而自举要的正是属主手里的三样东西——Secret 读写、到 GitHub 的

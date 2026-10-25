@@ -83,6 +83,15 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+    # 网页抓取的渲染后端（Crawl4AI，11235）：`web_fetch` 把页面交给它渲染。单列一条
+    # 同检索那条的理由——按 Pod 选，不按端口对本命名空间全开。
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: crawl4ai
+      ports:
+        - protocol: TCP
+          port: 11235
     # 监控栈（9090 / 3100）：infra_watch 按 PromQL 探测节点磁盘 / Pod OOM 等基础设施
     # 信号，查询跨命名空间落到监控命名空间的 Prometheus。podSelector:{} 只
     # 匹配本命名空间，必须显式 namespaceSelector，否则规则求值全部超时失败。

@@ -44,6 +44,7 @@ resources:
   - nats-service.yaml
   - meilisearch.yaml
   - searxng.yaml
+  - crawl4ai.yaml
   - seaweedfs.yaml
   - cluster-registry.yaml
   - backup-pvc.yaml

@@ -77,6 +77,9 @@ pub const AGENT_LOOP_ENV: &[(&str, &str)] = &[
     // 共享端点而不是本节的一个旋钮，所以名字不带 `AGENT_LOOP` 前缀。空表示这个
     // 部署没有接网页检索，工具在调用时报出这个名字，而不是从列表里消失。
     (crate::web::WEB_SEARCH_BASE_ENV, "web_search_base"),
+    // 网页渲染后端：设了就表示这个部署用真浏览器读页面（客户端渲染页与 PDF 才有
+    // 正文），不设就是在进程内抽取。两者不是同一个能力，所以不互相兜底。
+    (crate::web::WEB_FETCH_BASE_ENV, "web_fetch_base"),
 ];
 
 const AGENT_POOL_ENV: &[(&str, &str)] = &[
@@ -133,6 +136,11 @@ pub struct AgentLoopConfig {
     /// which setting is missing, so "no web access here" is not read as "no
     /// such tool".
     pub web_search_base: Option<String>,
+    /// Base URL of the page-rendering backend behind `web_fetch`. Absent means
+    /// pages are read in process, which cannot run scripts; present means the
+    /// fetch is rendered in a real browser, and a backend that does not answer
+    /// is an error rather than a downgrade.
+    pub web_fetch_base: Option<String>,
 }
 
 /// The size at which a fetched response stops being a conversational answer and
@@ -157,6 +165,7 @@ impl Default for AgentLoopConfig {
             memory_api_base: None,
             external_archive_threshold_chars: default_external_archive_threshold_chars(),
             web_search_base: None,
+            web_fetch_base: None,
         }
     }
 }

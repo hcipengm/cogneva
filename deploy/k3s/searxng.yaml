@@ -15,13 +15,18 @@ data:
   settings.yml: |
     # 只留这台主机连得上的引擎：镜像默认开着的 brave / duckduckgo / google cse /
     # startpage / wikidata / wikipedia 在境内都不可达，每次查询各自等满超时后返回
-    # 零条，HTTP 也是 200——那看起来像「网上没有」，其实一条都没问出去。baidu 与
-    # sogou 连得上但一问就撞验证码或撞适配层崩溃，也裁掉。
+    # 零条，HTTP 也是 200——那看起来像「网上没有」，其实一条都没问出去。
+    #
+    # 留下的两家是实测读数：bing 每次 9~10 条、sogou 8~11 条，三条不同查询各约
+    # 1 秒。sogou 能出结果依赖这一版镜像的网络层（curl_cffi，默认 Chrome TLS
+    # 指纹）；换回 httpx 的旧版会重新出现适配层崩溃。baidu 每次都被判 CAPTCHA
+    # （TLS 这一层已解决，卡住它的是出口 IP 信誉），360search 返回零条且不报错，
+    # 两家都不留在表里。
     use_default_settings:
       engines:
         keep_only:
           - bing
-          - 360search
+          - sogou
     engines:
       - name: bing
         disabled: false
@@ -30,7 +35,7 @@ data:
         base_url: https://cn.bing.com
         # 同一地址走 HTTP/3 拿不回可用响应，切回 HTTP/2。
         enable_http3: false
-      - name: 360search
+      - name: sogou
         disabled: false
     general:
       instance_name: "cogneva"

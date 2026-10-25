@@ -73,6 +73,21 @@ const SEARCH_TIMEOUT_SECS: u64 = 20;
 /// than hiding by being absent from the list.
 pub const WEB_SEARCH_BASE_ENV: &str = "COGNEVA_WEB_SEARCH_BASE";
 
+/// The environment variable that names the rendering backend for `web_fetch`.
+///
+/// Empty means "extract in this process", which is the cheaper path and the one
+/// a deployment without a browser gets. Non-empty is a promise: the page is
+/// rendered by a real browser before it is read, so a client-side-rendered page
+/// returns its text instead of an empty shell. The two are not interchangeable
+/// — the in-process path cannot run scripts — so a configured backend that does
+/// not answer is an error naming the backend, never a silent downgrade to the
+/// path that returns nothing for the pages the backend exists for.
+pub const WEB_FETCH_BASE_ENV: &str = "COGNEVA_WEB_FETCH_BASE";
+
+/// How long one rendered fetch may take. A browser has to start, load, run the
+/// page's scripts and settle; the in-process deadline would cut that short.
+const RENDER_TIMEOUT_SECS: u64 = 60;
+
 fn encode_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
@@ -586,15 +601,119 @@ pub fn web_search(client: Option<Arc<dyn HttpClient>>, base: Option<String>) -> 
     }
 }
 
+/// The rendering backend, or `None` when this deployment reads pages in process.
+fn render_base(base: Option<&str>) -> Option<String> {
+    base.map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(|b| b.trim_end_matches('/').to_string())
+}
+
+/// Read one page through the rendering backend and return its Markdown.
+///
+/// The backend is asked for the *filtered* Markdown (`f: fit`): the raw body of
+/// a page includes navigation, cookie banners and footer links, which is the
+/// part readability strips and the part that makes a fetched page cost more
+/// context than the question it was fetched for.
+///
+/// Every way this can fail returns an error that names the backend. A caller
+/// that got a thin answer could not tell "the page is empty" from "the renderer
+/// never ran", and the two call for opposite repairs.
+async fn fetch_rendered(
+    client: &Arc<dyn HttpClient>,
+    base: &str,
+    url: &Url,
+    max_chars: usize,
+) -> SFResult<serde_json::Value> {
+    let endpoint = format!("{base}/md");
+    let body = serde_json::json!({ "url": url.as_str(), "f": "fit" });
+    let mut req = HttpRequest::new("POST", endpoint.clone());
+    req.headers
+        .insert("Content-Type".into(), "application/json".into());
+    req.timeout_secs = Some(RENDER_TIMEOUT_SECS);
+    req.body = Some(serde_json::to_vec(&body).map_err(SFError::Serialization)?);
+    let resp = client.execute(req).await.map_err(|e| {
+        SFError::Agent(format!(
+            "the rendering backend at {base} did not answer ({e}); the page was not read \
+             in process instead, because this deployment asked for rendering"
+        ))
+    })?;
+    if !(200..300).contains(&resp.status) {
+        let detail = String::from_utf8_lossy(&resp.body);
+        return Err(SFError::Agent(format!(
+            "the rendering backend at {base} refused {url} with HTTP {}: {}",
+            resp.status,
+            truncate_chars(&detail, 300).0
+        )));
+    }
+    let mut parsed: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
+        SFError::Agent(format!(
+            "the rendering backend at {base} answered non-JSON: {e}"
+        ))
+    })?;
+    if parsed.get("success").and_then(|s| s.as_bool()) == Some(false) {
+        let detail = parsed
+            .get("detail")
+            .or_else(|| parsed.get("error"))
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(no reason given)".into());
+        return Err(SFError::Agent(format!(
+            "the rendering backend at {base} could not read {url}: {detail}"
+        )));
+    }
+    let markdown = parsed
+        .get("markdown")
+        .and_then(|m| m.as_str())
+        .ok_or_else(|| {
+            SFError::Agent(format!(
+                "the rendering backend at {base} answered without a `markdown` field"
+            ))
+        })?
+        .to_string();
+    let (text, truncated) = truncate_chars(&markdown, max_chars);
+    let mut out = serde_json::json!({
+        "url": url.as_str(),
+        "chars": text.chars().count(),
+        "truncated": truncated,
+        "extraction": "rendered",
+        "format": "markdown",
+        "text": text,
+    });
+    if let Some(title) = markdown_title(&markdown) {
+        out["title"] = serde_json::json!(title);
+        // The title is also a field on the answer, not only a line in the body:
+        // a caller that lists pages should not have to parse Markdown to name
+        // the one it read.
+        parsed["title"] = serde_json::json!(title);
+    }
+    Ok(out)
+}
+
+/// The first ATX heading of a Markdown body, used as the page title.
+fn markdown_title(markdown: &str) -> Option<String> {
+    markdown
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("# ").map(str::trim))
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
 /// Download one page and return its readable text.
-pub fn web_fetch(client: Option<Arc<dyn HttpClient>>) -> Tool {
+///
+/// With `base` set the page is rendered by a real browser first (see
+/// [`fetch_rendered`]); without it the page is read in process. The difference
+/// matters on client-side-rendered pages, where the in-process path returns the
+/// shell of a page whose text arrives only after scripts run.
+pub fn web_fetch(client: Option<Arc<dyn HttpClient>>, base: Option<String>) -> Tool {
     Tool {
         name: "web_fetch".into(),
         description: "Fetch one public web page and return its readable text, with the \
-                      page title. HTML is reduced to its article content; plain text and \
-                      JSON come back as they are. Binary files are reported, not \
-                      returned. Private, loopback and cluster-internal addresses are \
-                      refused."
+                      page title. When this deployment runs a rendering backend the page \
+                      is rendered in a real browser first and returned as filtered \
+                      Markdown, so client-side-rendered pages and PDFs come back with \
+                      their content; otherwise HTML is reduced to its article content in \
+                      process. Plain text and JSON come back as they are. Binary files \
+                      are reported, not returned. Private, loopback and cluster-internal \
+                      addresses are refused."
             .into(),
         parameters: serde_json::json!({
             "type": "object",
@@ -612,6 +731,7 @@ pub fn web_fetch(client: Option<Arc<dyn HttpClient>>) -> Tool {
         }),
         implementation: ToolImplementation::Native(Arc::new(move |args| {
             let client = client.clone();
+            let base = base.clone();
             Box::pin(async move {
                 let raw = args["url"]
                     .as_str()
@@ -627,6 +747,13 @@ pub fn web_fetch(client: Option<Arc<dyn HttpClient>>) -> Tool {
                     .as_u64()
                     .unwrap_or(DEFAULT_FETCH_CHARS)
                     .clamp(1, MAX_FETCH_CHARS) as usize;
+                // Rendering is a property of the deployment, not of the call:
+                // a run that could ask for it would ask for it every time, and
+                // the deployment that has a browser has it for exactly the
+                // pages the cheap path cannot read.
+                if let Some(base) = render_base(base.as_deref()) {
+                    return fetch_rendered(&client, &base, &url, max_chars).await;
+                }
                 let body = fetch_capped(&client, &url, MAX_DOWNLOAD_BYTES)
                     .await
                     .map_err(|e| SFError::Agent(format!("fetching {url} failed: {e}")))?;
@@ -861,7 +988,7 @@ mod tests {
             <p>Invalidation is the clock.</p></article>
             <script>track()</script></body></html>"#;
         let scripted = Scripted::answering(200, "text/html; charset=utf-8", html);
-        let tool = web_fetch(client_of(&scripted));
+        let tool = web_fetch(client_of(&scripted), None);
         let out = call(
             &tool,
             serde_json::json!({"url":"https://example.com/caches"}),
@@ -883,7 +1010,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_refuses_addresses_inside_this_network() {
         let scripted = Scripted::answering(200, "text/html", "secret");
-        let tool = web_fetch(client_of(&scripted));
+        let tool = web_fetch(client_of(&scripted), None);
         for url in [
             "http://127.0.0.1:8080/api/v1/agents",
             "http://169.254.169.254/latest/meta-data/",
@@ -915,7 +1042,7 @@ mod tests {
     async fn fetch_stops_at_the_byte_cap_and_says_so() {
         let big = "a".repeat(MAX_DOWNLOAD_BYTES + 1024);
         let scripted = Scripted::answering(200, "text/html", big);
-        let tool = web_fetch(client_of(&scripted));
+        let tool = web_fetch(client_of(&scripted), None);
         let out = call(&tool, serde_json::json!({"url":"https://example.com/huge"}))
             .await
             .expect("an oversized page is an outcome, not a failure");
@@ -930,7 +1057,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_returns_plain_text_and_reports_binary_as_such() {
         let scripted = Scripted::answering(200, "text/plain", "line one\nline two");
-        let tool = web_fetch(client_of(&scripted));
+        let tool = web_fetch(client_of(&scripted), None);
         let out = call(
             &tool,
             serde_json::json!({"url":"https://example.com/notes.txt"}),
@@ -941,7 +1068,7 @@ mod tests {
         assert!(out["text"].as_str().unwrap().contains("line two"));
 
         let scripted = Scripted::answering(200, "application/pdf", vec![0u8, 1, 2, 3]);
-        let tool = web_fetch(client_of(&scripted));
+        let tool = web_fetch(client_of(&scripted), None);
         let out = call(
             &tool,
             serde_json::json!({"url":"https://example.com/doc.pdf"}),
@@ -956,7 +1083,7 @@ mod tests {
     async fn fetch_truncates_long_text_at_the_requested_size() {
         let body = format!("<html><body><p>{}</p></body></html>", "word ".repeat(200));
         let scripted = Scripted::answering(200, "text/html", body);
-        let tool = web_fetch(client_of(&scripted));
+        let tool = web_fetch(client_of(&scripted), None);
         let out = call(
             &tool,
             serde_json::json!({"url":"https://example.com/long", "max_chars": 50}),
@@ -968,6 +1095,129 @@ mod tests {
             out["text"].as_str().unwrap().chars().count(),
             50,
             "the returned text is exactly the requested size: {out}"
+        );
+    }
+
+    /// A configured rendering backend is used, and what comes back is the
+    /// backend's Markdown rather than a readability pass over it.
+    ///
+    /// The `f: fit` filter is asserted because it is the half of the request
+    /// that decides how much of the page reaches the model: asking for the raw
+    /// body returns navigation and footers, which is exactly what the backend
+    /// exists to strip.
+    #[tokio::test]
+    async fn a_configured_backend_renders_the_page_and_names_the_extraction() {
+        let scripted = Scripted::answering(
+            200,
+            "application/json",
+            serde_json::json!({
+                "url": "https://example.com/article",
+                "filter": "fit",
+                "success": true,
+                "markdown": "# The Rendered Title\n\nBody text from the browser.",
+            })
+            .to_string(),
+        );
+        let tool = web_fetch(
+            client_of(&scripted),
+            Some("http://render.invalid:11235/".into()),
+        );
+        let out = call(
+            &tool,
+            serde_json::json!({"url":"https://example.com/article"}),
+        )
+        .await
+        .expect("a reachable backend renders the page");
+
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 1, "one request, to the backend");
+        assert_eq!(asked[0].method, "POST");
+        assert_eq!(
+            asked[0].url, "http://render.invalid:11235/md",
+            "the trailing slash of the base is dropped and `/md` is appended"
+        );
+        let sent: serde_json::Value =
+            serde_json::from_slice(asked[0].body.as_deref().unwrap_or_default())
+                .expect("the backend is asked in JSON");
+        assert_eq!(sent["url"], "https://example.com/article");
+        assert_eq!(
+            sent["f"], "fit",
+            "the filtered body, not the raw one: {sent}"
+        );
+
+        assert_eq!(out["extraction"], "rendered", "{out}");
+        assert_eq!(out["format"], "markdown", "{out}");
+        assert_eq!(out["title"], "The Rendered Title", "{out}");
+        assert!(out["text"]
+            .as_str()
+            .unwrap()
+            .contains("Body text from the browser."));
+        assert_eq!(out["truncated"], false, "{out}");
+    }
+
+    /// A backend that was asked for and does not answer is an error, not a
+    /// quiet fall back to reading the page in process.
+    ///
+    /// The fallback is the tempting repair and it is the wrong one: the page a
+    /// deployment asked to have rendered is usually the one that reads empty
+    /// without a browser, so a silent in-process read returns a thin answer
+    /// that looks like a thin page. The assertion on the request count is the
+    /// other half — the page itself is never fetched behind the backend's back.
+    #[tokio::test]
+    async fn an_unreachable_backend_fails_naming_it_instead_of_reading_in_process() {
+        let scripted = Arc::new(Scripted::default());
+        let tool = web_fetch(
+            client_of(&scripted),
+            Some("http://render.invalid:11235".into()),
+        );
+        let err = call(&tool, serde_json::json!({"url":"https://example.com/x"}))
+            .await
+            .expect_err("a deployment that asked for rendering must not get a raw read");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("http://render.invalid:11235"),
+            "the error names the backend so the repair is obvious: {msg}"
+        );
+        assert_eq!(
+            scripted.asked().len(),
+            1,
+            "exactly one attempt, to the backend; the page is not fetched directly"
+        );
+    }
+
+    /// A backend that answers but could not read the page carries its reason
+    /// through: `success: false` is a verdict about this page, not a transport
+    /// failure, and the detail is the only thing that says which.
+    #[tokio::test]
+    async fn a_backend_that_could_not_read_the_page_returns_its_reason() {
+        let scripted = Scripted::answering(
+            200,
+            "application/json",
+            serde_json::json!({
+                "url": "https://example.com/paywalled",
+                "success": false,
+                "detail": "navigation timed out after 30s",
+            })
+            .to_string(),
+        );
+        let tool = web_fetch(
+            client_of(&scripted),
+            Some("http://render.invalid:11235".into()),
+        );
+        let err = call(
+            &tool,
+            serde_json::json!({"url":"https://example.com/paywalled"}),
+        )
+        .await
+        .expect_err("a page the backend could not read must not read as an empty page");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("navigation timed out after 30s"),
+            "the backend's own reason reaches the caller: {msg}"
+        );
+        assert!(
+            msg.contains("http://render.invalid:11235"),
+            "and the answer still names who gave it: {msg}"
         );
     }
 

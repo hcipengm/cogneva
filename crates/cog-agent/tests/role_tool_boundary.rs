@@ -137,7 +137,7 @@ fn production_registry() -> ToolRegistry {
     );
     cog_core::ToolRegistry::register(
         &registry,
-        builtins::web_fetch(Some(Arc::new(UnreachableClient))),
+        builtins::web_fetch(Some(Arc::new(UnreachableClient)), None),
     );
     registry
 }

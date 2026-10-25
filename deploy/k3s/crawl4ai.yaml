@@ -1,0 +1,98 @@
+# 网页抓取的渲染后端（Crawl4AI）：`web_fetch` 在配了地址时把页面交给它渲染。
+#
+# 与 chart 的 templates/crawl4ai.yaml 同源，字段级对齐由
+# deploy/scripts/check-deploy-parity.sh 校验。这里只有集群内的面：没有 Ingress，
+# Service 是 ClusterIP，出站面在 network-policy.yaml 里（允许公网、排除集群网段）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crawl4ai
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: crawl4ai
+    app.kubernetes.io/component: fetch
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: crawl4ai
+      app.kubernetes.io/component: fetch
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: crawl4ai
+        app.kubernetes.io/component: fetch
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: crawl4ai
+          image: docker.io/unclecode/crawl4ai:0.7.4
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 11235
+              protocol: TCP
+          volumeMounts:
+            # Chromium 把共享内存当工作区用；默认 64MiB 在中等页面上让渲染进程
+            # 崩掉，从外面看是「抓取超时」。
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 2000m
+              memory: 3Gi
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crawl4ai
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: crawl4ai
+    app.kubernetes.io/component: fetch
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: crawl4ai
+    app.kubernetes.io/component: fetch
+  ports:
+    - name: http
+      port: 11235
+      targetPort: http
+      protocol: TCP
