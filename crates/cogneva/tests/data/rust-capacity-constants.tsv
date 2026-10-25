@@ -21,6 +21,7 @@ crates/cog-agent/src/tools.rs	MEMORY_READ_TIMEOUT_SECS	30	unreviewed
 crates/cog-agent/src/web.rs	FETCH_TIMEOUT_SECS	30	unreviewed	
 crates/cog-agent/src/web.rs	MAX_FETCH_CHARS	200_000	unreviewed	
 crates/cog-agent/src/web.rs	MAX_SEARCH_RESULTS	50	unreviewed	
+crates/cog-agent/src/web.rs	RENDER_CACHE_SECS	60	unreviewed	
 crates/cog-agent/src/web.rs	RENDER_TIMEOUT_SECS	60	unreviewed	
 crates/cog-agent/src/web.rs	SEARCH_TIMEOUT_SECS	20	unreviewed	
 crates/cog-collaboration/src/collaboration_executor.rs	TOKEN_ESTIMATE_CAP	200_000	unreviewed	
