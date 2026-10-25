@@ -60,6 +60,7 @@ fn make_task(id: &str, task_type: TaskType, blocked_by: Vec<String>, workspace: 
         owner_unit: None,
         bound_by_handover_id: None,
         is_executable: true,
+        acceptance: vec![],
     }
 }
 

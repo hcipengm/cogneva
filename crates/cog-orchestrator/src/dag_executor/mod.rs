@@ -1684,6 +1684,7 @@ mod consumer_ack_tests {
             face_id: None,
             owner_unit: None,
             bound_by_handover_id: None,
+            acceptance: vec![],
         }
     }
 
@@ -2052,6 +2053,7 @@ mod consumer_ack_tests {
             face_id: None,
             owner_unit: None,
             bound_by_handover_id: None,
+            acceptance: vec![],
         };
         runtime
             .orchestrator()

@@ -134,13 +134,9 @@ CREATE TABLE IF NOT EXISTS task_plan (
                 planned_end TIMESTAMPTZ,
                 budget_tokens BIGINT NOT NULL,
                 baseline_rev TEXT NOT NULL,
-                acceptance TEXT[] NOT NULL DEFAULT '{}',
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (workspace_id, task_id)
             )
-;
-ALTER TABLE task_plan
-            ADD COLUMN IF NOT EXISTS acceptance TEXT[] NOT NULL DEFAULT '{}'
 ;
 CREATE TABLE IF NOT EXISTS cog_evolution_promotions (
                 id TEXT PRIMARY KEY,
@@ -791,20 +787,18 @@ impl StateBackend for PostgresStateBackend {
         let baseline_rev = plan.baseline_rev.clone();
         let planned_start = plan.planned_start;
         let planned_end = plan.planned_end;
-        let acceptance = plan.acceptance.clone();
         self.retry(|| async {
             sqlx::query(
                 r#"
                 INSERT INTO task_plan
                     (workspace_id, task_id, planned_start, planned_end,
-                     budget_tokens, baseline_rev, acceptance, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                     budget_tokens, baseline_rev, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, NOW())
                 ON CONFLICT (workspace_id, task_id) DO UPDATE SET
                     planned_start = EXCLUDED.planned_start,
                     planned_end = EXCLUDED.planned_end,
                     budget_tokens = EXCLUDED.budget_tokens,
                     baseline_rev = EXCLUDED.baseline_rev,
-                    acceptance = EXCLUDED.acceptance,
                     updated_at = NOW()
                 "#,
             )
@@ -814,7 +808,6 @@ impl StateBackend for PostgresStateBackend {
             .bind(planned_end)
             .bind(budget)
             .bind(&baseline_rev)
-            .bind(&acceptance)
             .execute(&self.pool)
             .await
         })
@@ -832,7 +825,6 @@ impl StateBackend for PostgresStateBackend {
             Option<chrono::DateTime<Utc>>,
             i64,
             String,
-            Vec<String>,
             chrono::DateTime<Utc>,
         );
         let row: Option<Row> = self
@@ -840,7 +832,7 @@ impl StateBackend for PostgresStateBackend {
                 sqlx::query_as(
                     r#"
                     SELECT planned_start, planned_end, budget_tokens, baseline_rev,
-                           acceptance, updated_at
+                           updated_at
                     FROM task_plan
                     WHERE workspace_id = $1 AND task_id = $2
                     "#,
@@ -853,12 +845,12 @@ impl StateBackend for PostgresStateBackend {
             .await?;
         let budget = match row {
             None => return Ok(None),
-            Some((_, _, budget, _, _, _)) if budget < 0 => {
+            Some((_, _, budget, _, _)) if budget < 0 => {
                 return Err(negative_budget(workspace_id, task_id, budget))
             }
             Some(row) => row,
         };
-        let (planned_start, planned_end, budget, baseline_rev, acceptance, updated_at) = budget;
+        let (planned_start, planned_end, budget, baseline_rev, updated_at) = budget;
         Ok(Some(cog_core::TaskPlan {
             workspace_id: workspace_id.to_string(),
             task_id: task_id.to_string(),
@@ -866,7 +858,6 @@ impl StateBackend for PostgresStateBackend {
             planned_end,
             budget_tokens: budget as u64,
             baseline_rev,
-            acceptance,
             updated_at,
         }))
     }
@@ -878,14 +869,13 @@ impl StateBackend for PostgresStateBackend {
             Option<chrono::DateTime<Utc>>,
             i64,
             String,
-            Vec<String>,
             chrono::DateTime<Utc>,
         )> = self
             .retry(|| async {
                 sqlx::query_as(
                     r#"
                     SELECT task_id, planned_start, planned_end, budget_tokens,
-                           baseline_rev, acceptance, updated_at
+                           baseline_rev, updated_at
                     FROM task_plan
                     WHERE workspace_id = $1
                     "#,
@@ -897,15 +887,7 @@ impl StateBackend for PostgresStateBackend {
             .await?;
         rows.into_iter()
             .map(
-                |(
-                    task_id,
-                    planned_start,
-                    planned_end,
-                    budget,
-                    baseline_rev,
-                    acceptance,
-                    updated_at,
-                )| {
+                |(task_id, planned_start, planned_end, budget, baseline_rev, updated_at)| {
                     if budget < 0 {
                         return Err(negative_budget(workspace_id, &task_id, budget));
                     }
@@ -916,7 +898,6 @@ impl StateBackend for PostgresStateBackend {
                         planned_end,
                         budget_tokens: budget as u64,
                         baseline_rev,
-                        acceptance,
                         updated_at,
                     })
                 },
@@ -1574,7 +1555,6 @@ mod plan_schema_tests {
                 "planned_end",
                 "budget_tokens",
                 "baseline_rev",
-                "acceptance",
                 "updated_at",
             ]
         );

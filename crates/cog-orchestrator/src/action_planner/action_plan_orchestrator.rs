@@ -625,6 +625,9 @@ impl ActionPlanOrchestrator {
         let mut task = Task::new(at.id.clone(), task_type, at.input.clone());
         task.blocked_by = at.blocked_by.clone();
         task.blocks = at.blocks.clone();
+        // 验收标准跟着任务行走，不跟着基线行：没有估算的工作包不落基线行，写在
+        // 那里会在入图那一刻丢掉，而重规划正是要读它。
+        task.acceptance = at.acceptance.clone();
         task
     }
 
@@ -706,9 +709,6 @@ impl ActionPlanOrchestrator {
                 },
                 budget_tokens: at.estimated_tokens,
                 baseline_rev: baseline_rev.to_string(),
-                // 验收标准随基线一起存：分解门判过它非空，但门只存在于入图那一刻。
-                // 不写下来，重规划时就没有任何人能读到原来那一片承诺过什么。
-                acceptance: at.acceptance.clone(),
                 updated_at: now,
             });
         }
@@ -3136,6 +3136,48 @@ mod tests {
         assert_eq!(calls[0].1, cog_core::ALERT_RULE_DECOMPOSITION_WBS);
         // 与另外两条分解判退同一形状：不重试，同一组入参问出来的是同一份东西。
         assert_eq!(exec.seen.lock().unwrap().len(), 1);
+    }
+
+    /// 有验收标准、没 token 估算的工作包：它过得了分解门，却落不了一行计划基线
+    /// （基线要一个预算，没有预算就没有基线行）。验收标准若挂在基线行上，它在
+    /// 入图那一刻就丢了，而重规划正是要从这里读「原来那一片承诺过什么」。
+    /// 所以它跟着任务行走——任务行一定在，基线行不一定。
+    #[tokio::test]
+    async fn acceptance_survives_on_a_package_that_has_no_baseline_row() {
+        let dag: Arc<dyn cog_core::DagExecutor> = Arc::new(crate::DagExecutor::new(
+            "ws-acceptance-no-baseline".to_string(),
+        ));
+        let recorder = Arc::new(PlanRecorder::default());
+        let mut package = atomic_task("child-1");
+        package.estimated_tokens = 0;
+        package.estimated_seconds = 0;
+        package.acceptance = vec!["接口对这条请求返回 200".into()];
+
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![package]]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_plan_store(recorder.clone(), "ws-acceptance-no-baseline")
+            .with_decomposition_max_attempts(1);
+
+        let registry = SkillRegistry::new();
+        let ids = planner
+            .process_goal_impl("ship it", vec![hint_task("goal-row")], &registry)
+            .await
+            .expect("没估算的工作包过得了门");
+
+        assert!(ids.contains(&"child-1".to_string()), "{ids:?}");
+        let row = dag.get_task("child-1").await.expect("工作包入图了");
+        assert_eq!(
+            row.acceptance,
+            vec!["接口对这条请求返回 200".to_string()],
+            "验收标准必须跟着任务行走：这张图上没有别的行记得它"
+        );
+        assert!(
+            recorder.plans.lock().unwrap().is_empty(),
+            "没有预算就没有基线行，这正是载体不能选基线的那条理由"
+        );
     }
 
     /// 父指针指向批外的那一片，进图之后不会被任何汇总看见：它照常跑、照常报

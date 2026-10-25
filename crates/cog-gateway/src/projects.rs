@@ -892,7 +892,6 @@ mod tests {
             planned_end: Some(chrono::Utc::now() + chrono::Duration::minutes(10)),
             budget_tokens: tokens,
             baseline_rev: "rev-1".into(),
-            acceptance: vec!["有产出".into()],
             updated_at: chrono::Utc::now(),
         }
     }
@@ -984,7 +983,6 @@ mod tests {
             planned_end: Some(end),
             budget_tokens: tokens,
             baseline_rev: "rev-1".into(),
-            acceptance: vec!["有产出".into()],
             updated_at: start,
         }
     }

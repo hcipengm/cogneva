@@ -722,6 +722,8 @@ fn governance_task(
         face_id: None,
         owner_unit: owner,
         bound_by_handover_id: None,
+        // 治理动作不来自分解，没有人给过验收标准。空着是实话。
+        acceptance: Vec::new(),
     }
 }
 

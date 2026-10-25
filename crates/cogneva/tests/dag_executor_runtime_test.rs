@@ -42,6 +42,7 @@ fn make_test_task(id: &str) -> Task {
         owner_unit: None,
         bound_by_handover_id: None,
         is_executable: true,
+        acceptance: vec![],
     }
 }
 

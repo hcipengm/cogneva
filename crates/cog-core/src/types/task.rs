@@ -71,11 +71,6 @@ pub struct TaskPlan {
     /// 这一版基线是哪一次规划写下的。同一批任务共享一个值；重新规划写入的值
     /// 单调前进，读者据此分辨两版基线，而不是把它们读成同一版的两个部分。
     pub baseline_rev: String,
-    /// 这一片打算以什么算做完。分解门在入图之前判它非空，写在这里是为了让它在
-    /// 入图之后还读得到：重规划要重拆时，得知道原来那一片承诺过什么，否则它
-    /// 悄悄放宽了验收标准，账面上没有任何一行会变。
-    #[serde(default)]
-    pub acceptance: Vec<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -200,6 +195,15 @@ pub struct Task {
     /// 两份快照去猜谁先谁后。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_by_handover_id: Option<String>,
+    /// 这条活包**怎样算做完**，来自分解时给出的验收标准。
+    ///
+    /// 放在任务行上而不是计划基线表里，有两个理由。验收标准是范围（这片活答应
+    /// 交付什么），不是计划（什么时候做、花多少）；计划表只该有可重排的数。
+    /// 更要紧的是：基线行只在有估算时才写，没有估算的工作包不落基线行，验收
+    /// 标准就会在入图那一刻丢掉——而它正是重规划时要读的东西。任务行一定在，
+    /// 它跟着任务走多久就存多久。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -607,6 +611,7 @@ impl Task {
             face_id: None,
             owner_unit: None,
             bound_by_handover_id: None,
+            acceptance: Vec::new(),
         }
     }
 
