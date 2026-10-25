@@ -55,6 +55,8 @@ const TITLES: Record<ActivityId, string> = {
   changes: '变更',
   governance: '治理',
   observability: '观测',
+  resources: '资源',
+  delivery: '构建与部署',
   audit: '审计',
   settings: '设置',
 };
@@ -357,6 +359,48 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             </Note>
           </Section>
           <CrossLinks links={[{ id: 'changes', label: '变更', note: '判词要求的落地' }]} />
+        </>
+      );
+
+    case 'resources':
+      return (
+        <>
+          <Section title="这一面怎么读">
+            <Row label="配额" note="准入前：申请会不会被拒" />
+            <Row label="余量" note="调度时：还能不能再塞一个 Pod" />
+            <Row label="账本" note="事后：盘上真的占了多少" />
+            <Note>
+              三段读的是同一个命名空间在不同时刻的账：配额在准入时决定，余量在调度时决定，
+              账本事后才量得出来。混成一个「资源使用率」会让三种处置看起来一样。
+            </Note>
+          </Section>
+          <CrossLinks
+            links={[
+              { id: 'observability', label: '观测', note: '节点 / Pod 的逐层读数' },
+              { id: 'delivery', label: '构建与部署', note: '谁在吃这些资源' },
+            ]}
+          />
+        </>
+      );
+
+    case 'delivery':
+      return (
+        <>
+          <Section title="这一面怎么读">
+            <Row label="版本" note="Deployment 的 revision 注解" />
+            <Row label="就绪 / 目标" note="滚动还没走完时会差一截" />
+            <Row label="条件" note="Progressing=False 是卡住" />
+            <Note>
+              构建运行与门禁读数还没有服务端来源，这一面只画部署版本。没有数据的那一半写
+              「没有来源」，不画一张空图。
+            </Note>
+          </Section>
+          <CrossLinks
+            links={[
+              { id: 'changes', label: '变更', note: '这些版本由哪些改动推上来' },
+              { id: 'observability', label: '观测', note: '跑起来的副本健康' },
+            ]}
+          />
         </>
       );
 

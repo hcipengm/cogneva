@@ -206,7 +206,7 @@ pub struct TerminationView {
 /// Pod 的各个条件（Scheduled / Initialized / Ready / ContainersReady …）。
 /// `phase` 只给一个总数，条件说清卡在哪一步：卡在 Initialized 是卷挂不上，
 /// 卡在 Ready 是进程起来了但探针不过。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ConditionView {
     pub kind: String,
     pub ok: bool,
@@ -1179,6 +1179,367 @@ fn millicores(text: &str) -> Option<u64> {
     quantity_bytes(text).map(|value| (value * 1000.0).round() as u64)
 }
 
+// ─────────────────── 资源头寸：配额、默认限额、部署版本 ───────────────────
+//
+// 拓扑回答「东西跑在哪、那台机器还剩多少」，这一节回答另一半：「这个命名空间
+// 还剩多少配额、新 Pod 排不排得进来、每个工作负载现在跑的是第几版」。
+//
+// 配额与限额是准入前的账，部署的 revision 是变更落到了第几版。两者都读 apiserver，
+// 不经过任何缓存：一张配额卡上的数如果来自别处，它就和「申请被拒」不是同一个数了。
+
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QuotaEntry {
+    /// 资源名原样来自 apiserver：`requests.cpu`、`limits.memory`、`pods`……
+    pub resource: String,
+    /// hard 与 used 保留 apiserver 的写法（`4`、`500m`、`4Gi`）。换算是读者的事，
+    /// 这一层只多做一件事：给出两者相除的百分比，供界面画进度条。
+    pub hard: String,
+    pub used: String,
+    /// 两边都认得出同一维度才有值。认不出就不填——把 `1` 与 `1Gi` 硬除出来的
+    /// 百分比不是读数，是发明。
+    pub percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QuotaView {
+    pub name: String,
+    pub entries: Vec<QuotaEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LimitEntry {
+    /// `Container` 或 `Pod`。
+    pub kind: String,
+    pub resource: String,
+    pub max: Option<String>,
+    pub min: Option<String>,
+    /// 没写 requests 时准入补上的默认值。
+    pub default: Option<String>,
+    pub default_request: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LimitView {
+    pub name: String,
+    pub entries: Vec<LimitEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResourceReport {
+    pub namespace: String,
+    /// 读不到时写明原因。空列表本身不说明「配额是零」。
+    pub error: Option<String>,
+    pub quotas: Vec<QuotaView>,
+    pub limits: Vec<LimitView>,
+    pub collected_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeploymentView {
+    pub name: String,
+    pub ready_replicas: u32,
+    pub desired_replicas: u32,
+    pub updated_replicas: u32,
+    pub available_replicas: u32,
+    /// `deployment.kubernetes.io/revision`：这一版是第几次改动滚动上去的。
+    pub revision: Option<String>,
+    pub images: Vec<String>,
+    /// 含 `Progressing` / `Available` 与滚动卡住时的 `ProgressDeadlineExceeded`。
+    pub conditions: Vec<ConditionView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeploymentsReport {
+    pub namespace: String,
+    pub error: Option<String>,
+    pub deployments: Vec<DeploymentView>,
+    pub collected_at: DateTime<Utc>,
+}
+
+/// 把 apiserver 的数量写法换算成同一维度的数，只为算「用了百分之几」。
+///
+/// 二进制后缀（`Ki`…`Pi`）、十进制后缀（`k`…`T`）与 milli 三种都要认；认不出就
+/// 返回 None。`500m` 与 `2` 相比是 25%，`1Gi` 与 `4Gi` 相比也是 25%，而 `1` 与
+/// `1Gi` 之间没有比值可言。
+fn quantity_units(text: &str) -> Option<f64> {
+    const BINARY: [(&str, f64); 5] = [
+        ("Ki", 1024.0),
+        ("Mi", 1024.0 * 1024.0),
+        ("Gi", 1024.0 * 1024.0 * 1024.0),
+        ("Ti", 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("Pi", 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0),
+    ];
+    const DECIMAL: [(&str, f64); 4] = [("k", 1e3), ("M", 1e6), ("G", 1e9), ("T", 1e12)];
+
+    let text = text.trim();
+    for (suffix, scale) in BINARY {
+        if let Some(number) = text.strip_suffix(suffix) {
+            return number.trim().parse::<f64>().ok().map(|value| value * scale);
+        }
+    }
+    for (suffix, scale) in DECIMAL {
+        if let Some(number) = text.strip_suffix(suffix) {
+            return number.trim().parse::<f64>().ok().map(|value| value * scale);
+        }
+    }
+    if let Some(number) = text.strip_suffix('m') {
+        return number
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| value / 1000.0);
+    }
+    text.parse::<f64>().ok()
+}
+
+fn quota_percent(hard: &str, used: &str) -> Option<f64> {
+    let hard = quantity_units(hard)?;
+    if hard <= 0.0 {
+        return None;
+    }
+    let used = quantity_units(used)?;
+    // 一位小数：界面上画进度条与写百分比，再多一位也没有人用得到。
+    Some(((used / hard) * 1000.0).round() / 10.0)
+}
+
+fn quotas_from(list: &Value) -> Vec<QuotaView> {
+    let Some(items) = list.get("items").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .map(|item| {
+            let hard = item.pointer("/status/hard").and_then(Value::as_object);
+            let used = item.pointer("/status/used").and_then(Value::as_object);
+            // 取两边的并集：一个刚建出来的配额对象可能只在 hard 里出现，
+            // 只按 used 列会把「已经限住但还没人用」的资源整条漏掉。
+            let mut resources: BTreeMap<&str, ()> = BTreeMap::new();
+            for map in [hard, used].into_iter().flatten() {
+                for resource in map.keys() {
+                    resources.insert(resource.as_str(), ());
+                }
+            }
+            let entries = resources
+                .keys()
+                .map(|resource| {
+                    let hard_text = hard
+                        .and_then(|map| map.get(*resource))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let used_text = used
+                        .and_then(|map| map.get(*resource))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let percent = if hard_text.is_empty() || used_text.is_empty() {
+                        None
+                    } else {
+                        quota_percent(&hard_text, &used_text)
+                    };
+                    QuotaEntry {
+                        resource: (*resource).to_string(),
+                        hard: hard_text,
+                        used: used_text,
+                        percent,
+                    }
+                })
+                .collect();
+            QuotaView {
+                name: item
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                entries,
+            }
+        })
+        .collect()
+}
+
+fn limits_from(list: &Value) -> Vec<LimitView> {
+    let Some(items) = list.get("items").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .map(|item| {
+            // 一个 LimitRange 的一个条目同时带 max / min / default / defaultRequest
+            // 四张表。按 (kind, resource) 并成一行：读的人问的是「内存这一档的上下限
+            // 与默认值是多少」，不是「spec.limits 里有几条」。
+            let mut merged: BTreeMap<(String, String), LimitEntry> = BTreeMap::new();
+            for spec in item
+                .pointer("/spec/limits")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let kind = spec
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                for field in ["max", "min", "default", "defaultRequest"] {
+                    let Some(map) = spec.get(field).and_then(Value::as_object) else {
+                        continue;
+                    };
+                    for (resource, value) in map {
+                        let entry = merged
+                            .entry((kind.clone(), resource.clone()))
+                            .or_insert_with(|| LimitEntry {
+                                kind: kind.clone(),
+                                resource: resource.clone(),
+                                max: None,
+                                min: None,
+                                default: None,
+                                default_request: None,
+                            });
+                        let slot = match field {
+                            "max" => &mut entry.max,
+                            "min" => &mut entry.min,
+                            "default" => &mut entry.default,
+                            _ => &mut entry.default_request,
+                        };
+                        *slot = value.as_str().map(str::to_string);
+                    }
+                }
+            }
+            LimitView {
+                name: item
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                entries: merged.into_values().collect(),
+            }
+        })
+        .collect()
+}
+
+fn deployments_from(list: &Value) -> Vec<DeploymentView> {
+    let Some(items) = list.get("items").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .map(|item| {
+            let count =
+                |pointer: &str| item.pointer(pointer).and_then(Value::as_u64).unwrap_or(0) as u32;
+            DeploymentView {
+                name: item
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                ready_replicas: count("/status/readyReplicas"),
+                // spec.replicas 缺省是 1，不是 0：没写这个字段的 Deployment
+                // 也是要一个副本的。
+                desired_replicas: item
+                    .pointer("/spec/replicas")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1) as u32,
+                updated_replicas: count("/status/updatedReplicas"),
+                available_replicas: count("/status/availableReplicas"),
+                revision: item
+                    .pointer("/metadata/annotations/deployment.kubernetes.io~1revision")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                images: item
+                    .pointer("/spec/template/spec/containers")
+                    .and_then(Value::as_array)
+                    .map(|containers| {
+                        containers
+                            .iter()
+                            .filter_map(|container| container.get("image").and_then(Value::as_str))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                conditions: conditions_of(item),
+            }
+        })
+        .collect()
+}
+
+pub async fn cluster_quota_handler() -> Json<ResourceReport> {
+    let collected_at = Utc::now();
+    let Ok(client) = KubeClient::in_cluster() else {
+        return Json(ResourceReport {
+            namespace: String::new(),
+            error: Some("不在集群里跑，读不到配额".to_string()),
+            quotas: Vec::new(),
+            limits: Vec::new(),
+            collected_at,
+        });
+    };
+
+    let namespace = client.namespace().to_string();
+    let mut error = None;
+
+    let quotas = match client
+        .get_json(&format!("/api/v1/namespaces/{namespace}/resourcequotas"))
+        .await
+    {
+        Ok(list) => quotas_from(&list),
+        Err(e) => {
+            error = Some(format!("读不到 ResourceQuota：{e}"));
+            Vec::new()
+        }
+    };
+
+    let limits = match client
+        .get_json(&format!("/api/v1/namespaces/{namespace}/limitranges"))
+        .await
+    {
+        Ok(list) => limits_from(&list),
+        Err(e) => {
+            error = Some(match error {
+                Some(previous) => format!("{previous}；读不到 LimitRange：{e}"),
+                None => format!("读不到 LimitRange：{e}"),
+            });
+            Vec::new()
+        }
+    };
+
+    Json(ResourceReport {
+        namespace,
+        error,
+        quotas,
+        limits,
+        collected_at,
+    })
+}
+
+pub async fn cluster_deployments_handler() -> Json<DeploymentsReport> {
+    let collected_at = Utc::now();
+    let Ok(client) = KubeClient::in_cluster() else {
+        return Json(DeploymentsReport {
+            namespace: String::new(),
+            error: Some("不在集群里跑，读不到部署".to_string()),
+            deployments: Vec::new(),
+            collected_at,
+        });
+    };
+
+    let namespace = client.namespace().to_string();
+    let (deployments, error) = match client
+        .get_json(&format!("/apis/apps/v1/namespaces/{namespace}/deployments"))
+        .await
+    {
+        Ok(list) => (deployments_from(&list), None),
+        Err(e) => (Vec::new(), Some(format!("读不到 Deployment：{e}"))),
+    };
+
+    Json(DeploymentsReport {
+        namespace,
+        error,
+        deployments,
+        collected_at,
+    })
+}
+
 #[cfg(test)]
 mod topology_tests {
     use super::*;
@@ -1777,5 +2138,119 @@ mod topology_tests {
         assert_eq!(claim.storage_class.as_deref(), Some("local-path"));
         assert_eq!(claim.capacity_bytes, Some(10 * 1024 * 1024 * 1024));
         assert_eq!(claim.access_modes, vec!["ReadWriteOnce"]);
+    }
+
+    #[test]
+    fn a_quota_percentage_needs_two_readable_numbers() {
+        assert_eq!(quantity_units("500m"), Some(0.5));
+        assert_eq!(quantity_units("4Gi"), Some(4.0 * 1024.0 * 1024.0 * 1024.0));
+        assert_eq!(quota_percent("2", "500m"), Some(25.0));
+        assert_eq!(quota_percent("4Gi", "1Gi"), Some(25.0));
+        // 读不出数就不给百分比：宁可缺一格，也不发明一个比值。
+        assert_eq!(quota_percent("4Gi", "lots"), None);
+        assert_eq!(quota_percent("0", "0"), None);
+    }
+
+    #[test]
+    fn quota_entries_keep_resources_that_only_have_a_hard_limit() {
+        let list = json!({"items": [{
+            "metadata": {"name": "compute"},
+            "status": {
+                "hard": {"requests.cpu": "4", "requests.memory": "8Gi", "pods": "20"},
+                "used": {"requests.cpu": "500m", "requests.memory": "2Gi"}
+            }
+        }]});
+
+        let quotas = quotas_from(&list);
+        assert_eq!(quotas.len(), 1);
+        let entries = &quotas[0].entries;
+        assert_eq!(entries.len(), 3, "只出现在 hard 里的 pods 不能被漏掉");
+
+        let pods = entries.iter().find(|e| e.resource == "pods").expect("pods");
+        assert_eq!(pods.hard, "20");
+        assert_eq!(pods.used, "");
+        assert_eq!(pods.percent, None, "还没人用不是一个百分比");
+
+        let memory = entries
+            .iter()
+            .find(|e| e.resource == "requests.memory")
+            .expect("memory");
+        assert_eq!(memory.percent, Some(25.0));
+    }
+
+    #[test]
+    fn a_limit_range_row_joins_its_four_tables() {
+        let list = json!({"items": [{
+            "metadata": {"name": "defaults"},
+            "spec": {"limits": [{
+                "type": "Container",
+                "max": {"memory": "2Gi", "cpu": "1"},
+                "default": {"memory": "512Mi"},
+                "defaultRequest": {"memory": "256Mi"}
+            }]}
+        }]});
+
+        let limits = limits_from(&list);
+        let entries = &limits[0].entries;
+        assert_eq!(entries.len(), 2, "按 (kind, resource) 并成行");
+
+        let memory = entries
+            .iter()
+            .find(|e| e.resource == "memory")
+            .expect("memory");
+        assert_eq!(memory.kind, "Container");
+        assert_eq!(memory.max.as_deref(), Some("2Gi"));
+        assert_eq!(memory.min, None);
+        assert_eq!(memory.default.as_deref(), Some("512Mi"));
+        assert_eq!(memory.default_request.as_deref(), Some("256Mi"));
+
+        let cpu = entries.iter().find(|e| e.resource == "cpu").expect("cpu");
+        assert_eq!(cpu.default, None);
+    }
+
+    #[test]
+    fn a_deployment_carries_its_revision_images_and_rollout_verdict() {
+        let list = json!({"items": [{
+            "metadata": {
+                "name": "cogneva",
+                "annotations": {"deployment.kubernetes.io/revision": "7"}
+            },
+            "spec": {"replicas": 2, "template": {"spec": {"containers": [
+                {"name": "app", "image": "cogneva:abc"},
+                {"name": "sidecar", "image": "proxy:def"}
+            ]}}},
+            "status": {
+                "readyReplicas": 1,
+                "updatedReplicas": 2,
+                "availableReplicas": 1,
+                "conditions": [{
+                    "type": "Progressing",
+                    "status": "False",
+                    "reason": "ProgressDeadlineExceeded"
+                }]
+            }
+        }]});
+
+        let deployments = deployments_from(&list);
+        let deployment = &deployments[0];
+        assert_eq!(deployment.revision.as_deref(), Some("7"));
+        assert_eq!(deployment.desired_replicas, 2);
+        assert_eq!(deployment.ready_replicas, 1);
+        assert_eq!(deployment.available_replicas, 1);
+        assert_eq!(deployment.images, vec!["cogneva:abc", "proxy:def"]);
+        assert!(
+            !deployment.conditions[0].ok,
+            "Progressing=False 是滚动卡住，不是进行中"
+        );
+    }
+
+    #[test]
+    fn a_deployment_without_annotations_still_says_how_many_it_wants() {
+        let list = json!({"items": [{"metadata": {"name": "bare"}, "spec": {}}]});
+
+        let deployments = deployments_from(&list);
+        assert_eq!(deployments[0].desired_replicas, 1, "缺省是 1，不是 0");
+        assert_eq!(deployments[0].revision, None);
+        assert!(deployments[0].images.is_empty());
     }
 }

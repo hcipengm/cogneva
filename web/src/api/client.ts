@@ -1114,6 +1114,68 @@ export async function getClusterTopology(): Promise<ClusterTopology> {
   return api.get<ClusterTopology>('/api/v1/cluster/topology');
 }
 
+export interface QuotaEntry {
+  resource: string;
+  /** apiserver 的原始写法（`4`、`500m`、`4Gi`），换算由界面做。 */
+  hard: string;
+  used: string;
+  /** 两边同维度才有的百分比；null 是「算不出」，不是零。 */
+  percent: number | null;
+}
+
+export interface QuotaView {
+  name: string;
+  entries: QuotaEntry[];
+}
+
+export interface LimitEntry {
+  kind: string;
+  resource: string;
+  max: string | null;
+  min: string | null;
+  default: string | null;
+  default_request: string | null;
+}
+
+export interface LimitView {
+  name: string;
+  entries: LimitEntry[];
+}
+
+export interface ResourceReport {
+  namespace: string;
+  error: string | null;
+  quotas: QuotaView[];
+  limits: LimitView[];
+  collected_at: string;
+}
+
+export async function getResourceReport(): Promise<ResourceReport> {
+  return api.get<ResourceReport>('/api/v1/cluster/quota');
+}
+
+export interface DeploymentView {
+  name: string;
+  ready_replicas: number;
+  desired_replicas: number;
+  updated_replicas: number;
+  available_replicas: number;
+  revision: string | null;
+  images: string[];
+  conditions: TopologyCondition[];
+}
+
+export interface DeploymentsReport {
+  namespace: string;
+  error: string | null;
+  deployments: DeploymentView[];
+  collected_at: string;
+}
+
+export async function getDeployments(): Promise<DeploymentsReport> {
+  return api.get<DeploymentsReport>('/api/v1/cluster/deployments');
+}
+
 export async function getWorkspaceTree(path = ''): Promise<WorkspaceTree> {
   return api.get<WorkspaceTree>(`/api/v1/ide/tree?path=${encodeURIComponent(path)}`);
 }

@@ -536,13 +536,13 @@ function percentOf(part: number, whole: number): string {
   return `${value >= 10 ? Math.round(value) : value.toFixed(1)}%`;
 }
 
-function formatCpu(millicores: number): string {
+export function formatCpu(millicores: number): string {
   if (millicores === 0) return '0';
   if (millicores % 1000 === 0) return `${millicores / 1000} 核`;
   return `${(millicores / 1000).toFixed(1)} 核`;
 }
 
-function formatBytes(bytes: number): string {
+export function formatBytes(bytes: number): string {
   if (bytes === 0) return '0';
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
   let value = bytes;

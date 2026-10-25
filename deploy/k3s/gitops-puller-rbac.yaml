@@ -87,6 +87,14 @@ rules:
   - apiGroups: [""]
     resources: ["nodes/stats"]
     verbs: ["get"]
+  # 资源面：命名空间配额与默认限额，只读。
+  - apiGroups: [""]
+    resources: ["resourcequotas", "limitranges"]
+    verbs: ["get", "list"]
+  # 部署面：全部工作负载的副本、镜像与滚动条件（集合级 list，不是按名读）。
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
 ---
 # 拓扑面在命名空间里额外要的三样：事件、卷声明、Pod 的实际用量。
 # pods 本身已由上面 gitops 看护那条 Role 授权，这里不重复。

@@ -925,6 +925,14 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/cluster/topology",
             get(cluster::cluster_topology_handler),
         )
+        // 资源面要的另一半：配额头寸（准入前的账）与部署版本（变更落到第几版）。
+        // 与拓扑分开是因为两者读的对象不同、读者的动作也不同：拓扑看状态，
+        // 这两面看余量与版本。
+        .route("/api/v1/cluster/quota", get(cluster::cluster_quota_handler))
+        .route(
+            "/api/v1/cluster/deployments",
+            get(cluster::cluster_deployments_handler),
+        )
         .route(
             "/api/v1/tasks/{id}/dependents",
             get(tasks::get_task_dependents_handler),
