@@ -7,6 +7,11 @@ import {
 } from '@/api/client';
 import { CodeEditor } from '@/files/CodeEditor';
 import { findMatches, replaceMatches } from '@/files/highlight';
+import { DocxView, XlsxView } from '@/files/preview/Documents';
+import { Html } from '@/files/preview/Html';
+import { KIND_LABEL, needsBytes, previewKindOf } from '@/files/preview/kind';
+import { Markdown } from '@/files/preview/Markdown';
+import { Tex } from '@/files/preview/Tex';
 import { useDrafts } from '@/files/store';
 import { useShell } from '@/shell/store';
 import { Button, Empty, Loading, ReadError } from '@/ui/primitives';
@@ -52,6 +57,14 @@ export function FilesView() {
   const [gotoInput, setGotoInput] = useState('');
   /** 跳转请求。`serial` 让「同一行再跳一次」也真的发生。 */
   const [goto, setGoto] = useState<{ line: number; serial: number } | null>(null);
+  /**
+   * 打开有排版可言的文档时先给成品，源码在第二栏。
+   *
+   * 一份 md 打开就是一堆井号，读者得自己在脑子里排版——那不是在读文档，是在读
+   * 源码。反过来，只有源码可看时又把排版关起来，想改一个字都做不到。两条都给，
+   * 默认落在成品上。
+   */
+  const [preview, setPreview] = useState(true);
 
   const load = useCallback(async (target: string) => {
     setLoading(true);
@@ -72,9 +85,13 @@ export function FilesView() {
   useEffect(() => {
     if (!path) return;
     setFile(null);
+    setPreview(true);
     void load(path);
   }, [path, load]);
 
+  const kind = path ? previewKindOf(path) : 'text';
+  /** 这一种文件有没有「成品」可看：源码文件没有，它本身就是成品。 */
+  const hasPreview = kind !== 'text';
   const text = draft ?? file?.text ?? '';
   const dirty = draft !== undefined && draft !== file?.text;
   const lines = text ? text.split('\n').length : 0;
@@ -234,9 +251,30 @@ export function FilesView() {
         <span className="text-[11px] text-[var(--muted)]">
           {file ? `${file.size} 字节 · ${lines} 行` : '读取中'}
           {file?.truncated ? ' · 超过上限，只显示前一段' : ''}
-          {file?.binary ? ' · 二进制文件不显示正文' : ''}
+          {file?.binary && !needsBytes(kind) ? ' · 二进制文件不显示正文' : ''}
         </span>
         <div className="ml-auto flex items-center gap-2">
+          {hasPreview && !file?.binary && (
+            <span className="flex items-center border border-[var(--line)]">
+              {(['preview', 'source'] as const).map((mode) => {
+                const active = mode === 'preview' ? preview : !preview;
+                return (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => setPreview(mode === 'preview')}
+                    className="px-2 py-0.5 text-[11px] transition-colors"
+                    style={{
+                      color: active ? 'var(--paper)' : 'var(--muted)',
+                      background: active ? 'var(--ink-700)' : 'transparent',
+                    }}
+                  >
+                    {mode === 'preview' ? KIND_LABEL[kind] : '源码'}
+                  </button>
+                );
+              })}
+            </span>
+          )}
           <Button onClick={() => setFindOpen((open) => !open)}>查找 ⌘F</Button>
           <Button onClick={() => setGotoOpen((open) => !open)}>跳到行 ⌘G</Button>
           <Button onClick={() => void downloadWorkspaceFile(path)}>下载</Button>
@@ -370,8 +408,30 @@ export function FilesView() {
 
       {loading && !file ? (
         <Loading what={path} />
+      ) : file && needsBytes(kind) ? (
+        kind === 'docx' ? (
+          <DocxView path={path} />
+        ) : (
+          <XlsxView path={path} />
+        )
       ) : file?.binary ? (
-        <Empty>这是一个二进制文件（{file.size} 字节），不在编辑器里打开。</Empty>
+        <Empty>
+          这是一个二进制文件（{file.size} 字节）。这里只能读文档与源码，其余的下载后在本机打开。
+        </Empty>
+      ) : preview && kind === 'markdown' ? (
+        <div className="min-h-0 flex-1 overflow-y-auto px-8">
+          <div className="mx-auto max-w-[74ch]">
+            <Markdown source={text} />
+          </div>
+        </div>
+      ) : preview && kind === 'html' ? (
+        <Html source={text} title={path} />
+      ) : preview && kind === 'tex' ? (
+        <div className="min-h-0 flex-1 overflow-y-auto px-8">
+          <div className="mx-auto max-w-[74ch]">
+            <Tex source={text} />
+          </div>
+        </div>
       ) : (
         <CodeEditor
           path={path}

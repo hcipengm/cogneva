@@ -1045,6 +1045,17 @@ export async function uploadWorkspaceFile(
  * 直接写一个 `<a href>` 不行——那条请求不带 Authorization 头，会被鉴权挡下，
  * 而把一个长期有效的令牌塞进 URL 里，等于把它留在浏览历史里。
  */
+/**
+ * 读一份文件的原始字节。
+ *
+ * docx / xlsx 这类容器没有「正文」可读，`/ide/file` 只能回一个「这是二进制」。
+ * 要显示里面的内容就必须拿到字节，在浏览器里自己拆容器——这一条就是那条路。
+ */
+export async function getWorkspaceFileBytes(path: string): Promise<ArrayBuffer> {
+  const blob = await api.getBytes(`/api/v1/ide/raw?path=${encodeURIComponent(path)}`);
+  return blob.arrayBuffer();
+}
+
 export async function downloadWorkspaceFile(path: string): Promise<void> {
   const blob = await api.getBytes(`/api/v1/ide/raw?path=${encodeURIComponent(path)}`);
   const url = URL.createObjectURL(blob);
