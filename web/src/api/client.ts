@@ -989,9 +989,8 @@ export interface WorkspaceFile {
 /**
  * 集群拓扑：集群 → 节点 → Pod → 容器。
  *
- * 量一律是「申报量」而不是「用量」：requests 是调度器排得进去的依据，也是
- * 「这台机器还剩多少」唯一能事先算出来的那部分。真实用掉多少要看指标面，
- * 两者混在一张图上，读者会拿用量去判断还能不能排。
+ * 三个数量级始终并排：申报量决定排不排得进来，上限决定会不会被杀，用量决定这台
+ * 机器累不累。混成一个数，读者会拿其中一个去回答另一个问题。
  */
 export interface TopologyContainer {
   name: string;
@@ -1000,6 +999,60 @@ export interface TopologyContainer {
   restarts: number;
   /** running / waiting:<原因> / terminated:<原因> / unknown */
   state: string;
+  ports: { name: string | null; container_port: number; protocol: string }[];
+  cpu_request_millicores: number | null;
+  memory_request_bytes: number | null;
+  cpu_limit_millicores: number | null;
+  memory_limit_bytes: number | null;
+  /** 上一次是怎么结束的。重启次数只说「几次」，这里才说「为什么」。 */
+  last_termination: TopologyTermination | null;
+  mounts: { name: string; mount_path: string; read_only: boolean }[];
+  /** liveness / readiness / startup 里配了的那些。 */
+  probes: string[];
+  /** 实际用量；null 表示这个集群没有 metrics-server，不是「用了 0」。 */
+  cpu_used_millicores: number | null;
+  memory_used_bytes: number | null;
+}
+
+export interface TopologyTermination {
+  /** Completed / Error / OOMKilled / ContainerCannotRun … */
+  reason: string;
+  exit_code: number;
+  message: string | null;
+  finished_at: string | null;
+}
+
+/** Scheduled / Initialized / Ready / ContainersReady … 卡在哪一步就看这里。 */
+export interface TopologyCondition {
+  kind: string;
+  ok: boolean;
+  reason: string | null;
+  message: string | null;
+}
+
+export interface TopologyClaim {
+  name: string;
+  phase: string;
+  storage_class: string | null;
+  capacity_bytes: number | null;
+  access_modes: string[];
+  volume_name: string | null;
+}
+
+export interface TopologyVolume {
+  name: string;
+  /** configMap / secret / persistentVolumeClaim / emptyDir / hostPath … */
+  kind: string;
+  claim: TopologyClaim | null;
+}
+
+export interface TopologyEvent {
+  /** Normal / Warning */
+  kind: string;
+  reason: string;
+  message: string;
+  count: number;
+  last_seen: string | null;
 }
 
 export interface TopologyPod {
@@ -1011,7 +1064,12 @@ export interface TopologyPod {
   node: string | null;
   cpu_requested_millicores: number;
   memory_requested_bytes: number;
+  cpu_used_millicores: number | null;
+  memory_used_bytes: number | null;
   containers: TopologyContainer[];
+  conditions: TopologyCondition[];
+  volumes: TopologyVolume[];
+  events: TopologyEvent[];
 }
 
 export interface TopologyNode {
@@ -1023,6 +1081,8 @@ export interface TopologyNode {
   pods_allocatable: number | null;
   cpu_requested_millicores: number;
   memory_requested_bytes: number;
+  cpu_used_millicores: number | null;
+  memory_used_bytes: number | null;
   pods: TopologyPod[];
 }
 
@@ -1032,6 +1092,8 @@ export interface TopologyCluster {
   reachable: boolean;
   error: string | null;
   version: string | null;
+  /** 这个集群有没有 metrics-server；false 时所有用量字段都是 null。 */
+  metrics_available: boolean;
   nodes: TopologyNode[];
   unscheduled: TopologyPod[];
 }

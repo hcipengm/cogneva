@@ -25,3 +25,8 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list"]
+  # 节点的实际用量同样来自 metrics-server。它没装时这条规则不会被用到，
+  # 也不会因此报错——读不到用量是「没有数据源」，不是权限问题。
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes"]
+    verbs: ["get", "list"]

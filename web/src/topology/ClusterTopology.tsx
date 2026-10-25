@@ -2,21 +2,25 @@ import { useState } from 'react';
 import {
   getClusterTopology,
   type TopologyCluster,
+  type TopologyContainer,
+  type TopologyEvent,
   type TopologyNode,
   type TopologyPod,
+  type TopologyVolume,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { Empty, Loading, ReadError } from '@/ui/primitives';
 
 /**
- * 集群拓扑：集群 → 节点 → Pod → 容器，逐层点开。
+ * 集群拓扑：集群 → 节点 → Pod → 容器 → 挂载与事件。
  *
- * 三层而不是一张总图，是因为这三种对象回答的是不同的问题：「这台机器还剩多少」
- * 需要可分配量与申报量，「这个 Pod 为什么没就绪」需要容器状态与重启次数。把
- * 它们叠在一张图上，读者只能看到一堆点。
+ * 每多一层，回答的问题就换一个：节点那一层是「这台机器还剩多少」，Pod 那一层是
+ * 「哪个东西没就绪」，容器那一层是「它为什么没就绪」——状态只说它在等，事件才说
+ * 它在等什么。所以最底层放的是事件、挂载与上限，而不是又一个计数。
  *
- * 每个数字都能顺着点到它的来源：Pod 上的申报量加起来就是节点那一行；容器状态
- * 加起来就是 Pod 的就绪与否。点不开的数字不要画在这里——那会变成装饰。
+ * 申报量与用量是两个数，永远并排：申报量决定排不排得进来，用量决定这台机器累不累。
+ * 混成一个数，读者会拿其中一个去回答另一个问题。没有 metrics-server 时用量显示
+ * 「—」并在集群那一行说明，不画一条零线——零用量和没有数据是两件事。
  */
 export function ClusterTopology() {
   const topology = useResource('集群拓扑', getClusterTopology, 10_000);
@@ -66,6 +70,11 @@ function ClusterRow({ cluster, collectedAt }: { cluster: TopologyCluster; collec
           节点 {ready}/{cluster.nodes.length} 就绪 · Pod {pods}
           {cluster.unscheduled.length > 0 && ` · 未落节点 ${cluster.unscheduled.length}`}
         </span>
+        {!cluster.metrics_available && (
+          <span className="text-[11px]" style={{ color: 'var(--muted)' }}>
+            没有 metrics-server：只显示申报量，实际用量未知
+          </span>
+        )}
         <span className="mono ml-auto text-[10px] text-[var(--muted)]">
           {new Date(collectedAt).toLocaleTimeString('zh-CN')} 读
         </span>
@@ -125,13 +134,15 @@ function NodeCard({ node }: { node: TopologyNode }) {
         </span>
         <Bar
           label="CPU"
-          used={node.cpu_requested_millicores}
+          requested={node.cpu_requested_millicores}
+          used={node.cpu_used_millicores}
           total={node.cpu_allocatable_millicores}
           format={formatCpu}
         />
         <Bar
           label="内存"
-          used={node.memory_requested_bytes}
+          requested={node.memory_requested_bytes}
+          used={node.memory_used_bytes}
           total={node.memory_allocatable_bytes}
           format={formatBytes}
         />
@@ -163,7 +174,9 @@ function NodeCard({ node }: { node: TopologyNode }) {
 
 function PodRow({ pod }: { pod: TopologyPod }) {
   const [open, setOpen] = useState(false);
+  const [openContainer, setOpenContainer] = useState<string | null>(null);
   const tone = pod.phase === 'Running' && pod.ready ? 'ok' : pod.phase === 'Running' ? 'warn' : 'danger';
+  const warnings = pod.events.filter((event) => event.kind === 'Warning').length;
 
   return (
     <div className="flex flex-col">
@@ -175,31 +188,236 @@ function PodRow({ pod }: { pod: TopologyPod }) {
       >
         <Dot tone={tone} />
         <span className="mono min-w-0 flex-1 truncate text-[11px] text-[var(--paper-dim)]">{pod.name}</span>
+        {warnings > 0 && (
+          <span className="mono shrink-0 text-[10px]" style={{ color: 'var(--warn)' }}>
+            {warnings} 条告警事件
+          </span>
+        )}
         <span className="mono shrink-0 text-[10px] text-[var(--muted)]">
           {pod.phase}
           {pod.restarts > 0 && ` · 重启 ${pod.restarts}`}
         </span>
         <span className="mono shrink-0 text-[10px] text-[var(--muted)]">
           {formatCpu(pod.cpu_requested_millicores)} · {formatBytes(pod.memory_requested_bytes)}
+          {pod.cpu_used_millicores != null && (
+            <span style={{ color: 'var(--paper-dim)' }}>
+              {' '}
+              （实 {formatCpu(pod.cpu_used_millicores)} · {formatBytes(pod.memory_used_bytes ?? 0)}）
+            </span>
+          )}
         </span>
       </button>
 
       {open && (
-        <div className="flex flex-col gap-0.5 pb-1.5 pl-8 pr-3">
-          {pod.containers.map((container) => (
-            <div key={container.name} className="flex items-baseline gap-2">
-              <Dot tone={container.ready ? 'ok' : container.state.startsWith('waiting') ? 'warn' : 'danger'} />
-              <span className="mono text-[11px] text-[var(--paper-dim)]">{container.name}</span>
-              <span className="mono truncate text-[10px] text-[var(--muted)]" title={container.image}>
-                {container.image}
-              </span>
-              <span className="mono ml-auto shrink-0 text-[10px] text-[var(--muted)]">
-                {container.state}
-                {container.restarts > 0 && ` · 重启 ${container.restarts}`}
-              </span>
-            </div>
-          ))}
+        <div className="flex flex-col gap-2 pb-2 pl-6 pr-3">
+          {pod.conditions.some((condition) => !condition.ok) && (
+            <section className="flex flex-col gap-0.5">
+              <h4 className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">没成立的条件</h4>
+              {pod.conditions
+                .filter((condition) => !condition.ok)
+                .map((condition) => (
+                  <div key={condition.kind} className="flex items-baseline gap-2 text-[10.5px]">
+                    <Dot tone="warn" />
+                    <span className="mono shrink-0" style={{ color: 'var(--warn)' }}>
+                      {condition.kind}
+                    </span>
+                    <span className="min-w-0 flex-1 text-[var(--muted)]">
+                      {[condition.reason, condition.message].filter(Boolean).join('：')}
+                    </span>
+                  </div>
+                ))}
+              <p className="text-[10px] text-[var(--muted)]">
+                其余 {pod.conditions.filter((condition) => condition.ok).length} 项条件成立。
+              </p>
+            </section>
+          )}
+
+          <section className="flex flex-col gap-0.5">
+            <h4 className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">容器</h4>
+            {pod.containers.map((container) => (
+              <ContainerRow
+                key={container.name}
+                container={container}
+                open={openContainer === container.name}
+                onToggle={() =>
+                  setOpenContainer((current) => (current === container.name ? null : container.name))
+                }
+              />
+            ))}
+          </section>
+
+          {pod.volumes.length > 0 && (
+            <section className="flex flex-col gap-0.5">
+              <h4 className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">卷</h4>
+              {pod.volumes.map((volume) => (
+                <VolumeRow key={volume.name} volume={volume} />
+              ))}
+            </section>
+          )}
+
+          {pod.events.length > 0 && (
+            <section className="flex flex-col gap-0.5">
+              <h4 className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">最近事件</h4>
+              {pod.events.map((event, index) => (
+                <EventRow key={`${event.reason}-${index}`} event={event} />
+              ))}
+            </section>
+          )}
         </div>
+      )}
+    </div>
+  );
+}
+
+function ContainerRow({
+  container,
+  open,
+  onToggle,
+}: {
+  container: TopologyContainer;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const tone = container.ready ? 'ok' : container.state.startsWith('waiting') ? 'warn' : 'danger';
+
+  return (
+    <div className="flex flex-col">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        className="flex w-full items-baseline gap-2 py-0.5 text-left transition-colors hover:bg-[var(--ink-800)]"
+      >
+        <Dot tone={tone} />
+        <span className="mono text-[11px] text-[var(--paper-dim)]">{container.name}</span>
+        <span className="mono ml-auto shrink-0 text-[10px] text-[var(--muted)]">
+          {container.state}
+          {container.restarts > 0 && ` · 重启 ${container.restarts}`}
+        </span>
+      </button>
+
+      {open && (
+        <dl className="mb-1 ml-3 grid grid-cols-[7rem_1fr] gap-x-2 gap-y-0.5 border-l border-[var(--line)] pl-3 text-[10.5px]">
+          <dt className="text-[var(--muted)]">镜像</dt>
+          <dd className="mono break-all text-[var(--paper-dim)]">{container.image}</dd>
+
+          <dt className="text-[var(--muted)]">申报</dt>
+          <dd className="mono text-[var(--paper-dim)]">
+            {container.cpu_request_millicores == null && container.memory_request_bytes == null
+              ? '没有申报：调度器按 0 算，这台机器会超卖'
+              : `CPU ${container.cpu_request_millicores != null ? formatCpu(container.cpu_request_millicores) : '未申报'} · 内存 ${
+                  container.memory_request_bytes != null ? formatBytes(container.memory_request_bytes) : '未申报'
+                }`}
+          </dd>
+
+          <dt className="text-[var(--muted)]">上限</dt>
+          <dd className="mono text-[var(--paper-dim)]">
+            {container.cpu_limit_millicores == null && container.memory_limit_bytes == null
+              ? '没有设上限：节点还剩多少它就能吃多少'
+              : `CPU ${container.cpu_limit_millicores != null ? formatCpu(container.cpu_limit_millicores) : '未设'} · 内存 ${
+                  container.memory_limit_bytes != null ? formatBytes(container.memory_limit_bytes) : '未设'
+                }`}
+          </dd>
+
+          {container.cpu_used_millicores != null && (
+            <>
+              <dt className="text-[var(--muted)]">实际用量</dt>
+              <dd className="mono text-[var(--paper-dim)]">
+                {formatCpu(container.cpu_used_millicores)} · {formatBytes(container.memory_used_bytes ?? 0)}
+                {container.memory_limit_bytes != null && (
+                  <span className="text-[var(--muted)]">
+                    {' '}
+                    （占上限 {percentOf(container.memory_used_bytes ?? 0, container.memory_limit_bytes)}）
+                  </span>
+                )}
+              </dd>
+            </>
+          )}
+
+          {container.last_termination && (
+            <>
+              <dt className="text-[var(--muted)]">上次退出</dt>
+              <dd className="mono" style={{ color: container.last_termination.exit_code === 0 ? 'var(--paper-dim)' : 'var(--danger)' }}>
+                {container.last_termination.reason} · 退出码 {container.last_termination.exit_code}
+                {container.last_termination.finished_at && (
+                  <span className="text-[var(--muted)]">
+                    {' '}
+                    · {new Date(container.last_termination.finished_at).toLocaleTimeString('zh-CN')}
+                  </span>
+                )}
+                {container.last_termination.message && (
+                  <span className="block text-[var(--muted)]">{container.last_termination.message}</span>
+                )}
+              </dd>
+            </>
+          )}
+
+          {container.ports.length > 0 && (
+            <>
+              <dt className="text-[var(--muted)]">端口</dt>
+              <dd className="mono text-[var(--paper-dim)]">
+                {container.ports
+                  .map((port) => `${port.name ? `${port.name}:` : ''}${port.container_port}/${port.protocol}`)
+                  .join(' · ')}
+              </dd>
+            </>
+          )}
+
+          {container.mounts.length > 0 && (
+            <>
+              <dt className="text-[var(--muted)]">挂载</dt>
+              <dd className="mono flex flex-col text-[var(--paper-dim)]">
+                {container.mounts.map((mount) => (
+                  <span key={`${mount.name}:${mount.mount_path}`}>
+                    {mount.mount_path} ← {mount.name}
+                    {mount.read_only ? '（只读）' : ''}
+                  </span>
+                ))}
+              </dd>
+            </>
+          )}
+
+          {container.probes.length > 0 && (
+            <>
+              <dt className="text-[var(--muted)]">探针</dt>
+              <dd className="text-[var(--paper-dim)]">{container.probes.join(' · ')}</dd>
+            </>
+          )}
+        </dl>
+      )}
+    </div>
+  );
+}
+
+function VolumeRow({ volume }: { volume: TopologyVolume }) {
+  return (
+    <div className="flex items-baseline gap-2 text-[10.5px]">
+      <span className="mono text-[var(--paper-dim)]">{volume.name}</span>
+      <span className="mono text-[var(--muted)]">{volume.kind}</span>
+      {volume.claim && (
+        <span className="mono min-w-0 flex-1 truncate text-[var(--muted)]" title={volume.claim.volume_name ?? ''}>
+          {volume.claim.name} · {volume.claim.phase}
+          {volume.claim.capacity_bytes != null && ` · ${formatBytes(volume.claim.capacity_bytes)}`}
+          {volume.claim.storage_class && ` · ${volume.claim.storage_class}`}
+          {volume.claim.access_modes.length > 0 && ` · ${volume.claim.access_modes.join('/')}`}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function EventRow({ event }: { event: TopologyEvent }) {
+  const warning = event.kind === 'Warning';
+  return (
+    <div className="flex items-baseline gap-2 text-[10.5px]">
+      <Dot tone={warning ? 'warn' : 'ok'} />
+      <span className="mono shrink-0 text-[var(--paper-dim)]">{event.reason}</span>
+      <span className="min-w-0 flex-1 text-[var(--muted)]">{event.message}</span>
+      {event.count > 1 && <span className="mono shrink-0 text-[var(--muted)]">×{event.count}</span>}
+      {event.last_seen && (
+        <span className="mono shrink-0 text-[var(--muted)]">
+          {new Date(event.last_seen).toLocaleTimeString('zh-CN')}
+        </span>
       )}
     </div>
   );
@@ -207,30 +425,52 @@ function PodRow({ pod }: { pod: TopologyPod }) {
 
 function Bar({
   label,
+  requested,
   used,
   total,
   format,
 }: {
   label: string;
-  used: number;
+  requested: number;
+  used: number | null;
   total: number | null;
   format: (value: number) => string;
 }) {
-  const percent = ratio(used, total);
-  const shown = total == null ? `${format(used)}（不知道上限）` : `${format(used)} / ${format(total)}`;
+  const percent = ratio(requested, total);
+  const usedPercent = used == null ? null : ratio(used, total);
+  // 用量条压在申报条上面：申报量是「预留」，用量是「真在用」。两条一个颜色分不出
+  // 谁是谁，所以用量用实心、申报用同一色的半透明底。
   return (
     <span className="flex items-center gap-2">
       <span className="mono w-8 shrink-0 text-[10px] text-[var(--muted)]">{label}</span>
-      <span className="relative h-1 flex-1 overflow-hidden bg-[var(--ink-700)]">
+      <span className="relative h-1.5 flex-1 overflow-hidden bg-[var(--ink-700)]">
         <span
           className="absolute inset-y-0 left-0"
           style={{
             width: `${Math.min(100, Math.round(percent * 100))}%`,
-            background: percent >= 0.9 ? 'var(--danger)' : percent >= 0.75 ? 'var(--warn)' : 'var(--live)',
+            background:
+              percent >= 0.9
+                ? 'color-mix(in srgb, var(--danger) 45%, transparent)'
+                : percent >= 0.75
+                  ? 'color-mix(in srgb, var(--warn) 45%, transparent)'
+                  : 'color-mix(in srgb, var(--live) 45%, transparent)',
           }}
         />
+        {usedPercent != null && (
+          <span
+            className="absolute inset-y-0 left-0 opacity-90"
+            style={{
+              width: `${Math.min(100, Math.round(usedPercent * 100))}%`,
+              background: usedPercent >= 0.9 ? 'var(--danger)' : 'var(--live)',
+            }}
+          />
+        )}
       </span>
-      <span className="mono shrink-0 text-[10px] text-[var(--muted)]">{shown}</span>
+      <span className="mono shrink-0 text-[10px] text-[var(--muted)]">
+        {total == null
+          ? `${format(requested)}（不知道上限）`
+          : `${format(requested)} / ${format(total)}${used != null ? ` · 实 ${format(used)}` : ''}`}
+      </span>
     </span>
   );
 }
@@ -243,6 +483,12 @@ function Dot({ tone }: { tone: 'ok' | 'warn' | 'danger' }) {
 function ratio(used: number, total: number | null): number {
   if (total == null || total <= 0) return 0;
   return used / total;
+}
+
+function percentOf(part: number, whole: number): string {
+  if (whole <= 0) return '—';
+  const value = (part / whole) * 100;
+  return `${value >= 10 ? Math.round(value) : value.toFixed(1)}%`;
 }
 
 function formatCpu(millicores: number): string {

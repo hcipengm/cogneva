@@ -212,6 +212,47 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list"]
+  # 节点的实际用量同样来自 metrics-server。它没装时这条规则不会被用到，
+  # 也不会因此报错——读不到用量是「没有数据源」，不是权限问题。
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+# 拓扑面在命名空间里额外要的三样东西：事件（这个 Pod 为什么没起来）、
+# 卷声明（持久卷绑到了哪块盘）、Pod 的实际用量。pods 本身已由上面那条
+# gitops 看护的 Role 授权，这里不重复。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cogneva-topology-reader
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+rules:
+  - apiGroups: [""]
+    resources: ["events", "persistentvolumeclaims"]
+    verbs: ["get", "list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cogneva-topology-reader
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+subjects:
+  - kind: ServiceAccount
+    name: cogneva
+    namespace: {{ include "cogneva.namespace" . }}
+roleRef:
+  kind: Role
+  name: cogneva-topology-reader
+  apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
