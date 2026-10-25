@@ -27,14 +27,14 @@ crates/cog-agent/src/web.rs	MAX_SEARCH_RESULTS	50	bound	ceiling on hits; every h
 crates/cog-agent/src/web.rs	RENDER_TIMEOUT_SECS	60	bound	room for a browser to start, run scripts and settle; the fetch deadline is too short
 crates/cog-agent/src/web.rs	SEARCH_TIMEOUT_SECS	20	bound	the point past which the slowest metasearch engine is not worth the turn
 crates/cog-auth/src/keycloak.rs	JWKS_CACHE_TTL	300s	bound	how long a fetched key set is reused; bounds how long a rotated-away key is still accepted
-crates/cog-collaboration/src/collaboration_executor.rs	TOKEN_ESTIMATE_CAP	200_000	unreviewed	
-crates/cog-collaboration/src/config.rs	DEFAULT_LOCAL_REPAIR_MAX	2	unreviewed	
-crates/cog-collaboration/src/profile.rs	DEEP_MIN_FILES	4	unreviewed	
-crates/cog-collaboration/src/profile.rs	DEEP_MIN_LINES	120	unreviewed	
-crates/cog-collaboration/src/profile.rs	PIPELINE_SCORE_THRESHOLD	0.4	unreviewed	
-crates/cog-collaboration/src/profile.rs	SHORTCUT_MAX_FILES	3	unreviewed	
-crates/cog-collaboration/src/profile.rs	SHORTCUT_MAX_LINES	40	unreviewed	
-crates/cog-collaboration/src/squad/ralph/ralph_loop.rs	PACED_SLEEP_MAX_SECS	60	unreviewed	
+crates/cog-collaboration/src/collaboration_executor.rs	TOKEN_ESTIMATE_CAP	200_000	derived	twice the largest TokenBudget threshold the shipped configurations declare (100000 in all three carriers); the estimator saturates here, and a gate test keeps every declared threshold below it
+crates/cog-collaboration/src/config.rs	DEFAULT_LOCAL_REPAIR_MAX	2	bound	the first repair is what lets feedback be acted on at all, the second absorbs a first rewrite that was itself rejected; past that the feedback is unchanged, so repeating it cannot buy another outcome
+crates/cog-collaboration/src/profile.rs	DEEP_MIN_FILES	4	bound	declared file count at which a change is too big for the lightest topology — one above the shortcut's ceiling of 3
+crates/cog-collaboration/src/profile.rs	DEEP_MIN_LINES	120	bound	declared diff size at which a change is too big for the lightest topology; three times the shortcut's 40 leaves a band where declared size alone does not decide
+crates/cog-collaboration/src/profile.rs	PIPELINE_SCORE_THRESHOLD	0.4	bound	design rule with nothing measured yet: score below it takes the cheaper decomposition, and on the boundary the roundtable wins because the decision is uncertain
+crates/cog-collaboration/src/profile.rs	SHORTCUT_MAX_FILES	3	bound	files a request may name and still be the shortcut's own work
+crates/cog-collaboration/src/profile.rs	SHORTCUT_MAX_LINES	40	bound	diff lines an attached change may declare and still be the shortcut's own work
+crates/cog-collaboration/src/squad/ralph/ralph_loop.rs	PACED_SLEEP_MAX_SECS	60	bound	ceiling on the paced backoff so a paused squad is not silent longer than a minute; the known cost of the last paced round is recorded above it rather than folded into the number
 crates/cog-core/src/admission.rs	LATENCY_MIN_SAMPLES	5	bound	floor before a median is this workload's history rather than noise
 crates/cog-core/src/build_cache.rs	CACHE_LAYER_DEPTH	2	bound	cargo's profile level, then the deps/incremental level that can be dropped
 crates/cog-core/src/build_cache.rs	DEFAULT_CACHE_MAX_BYTES	3_221_225_472	bound	a 5 GiB claim less the co-tenants measured by hand; the auto cap can replace it
@@ -52,17 +52,17 @@ crates/cog-core/src/config.rs	DEFAULT_REDIS_READ_RESUME_BLOCK_MS	1000	bound	a dr
 crates/cog-core/src/config.rs	DEFAULT_TASK_LEASE_SECS	120	bound	three renewal ticks at lease/3, so two may be missed before another process judges it gone
 crates/cog-core/src/config_sections.rs	MAX_MESSAGE_CHARS	600	bound	character ceiling because names come from the document and multiply the length
 crates/cog-core/src/config_sections.rs	MAX_NAMES_PER_LIST	6	bound	names spelled out before the rest are counted; keeps one alert row readable
-crates/cog-core/src/contract/alerts.rs	ALERT_LABEL_VALUE_MAX_CHARS	1024	unreviewed	
-crates/cog-core/src/contract/event.rs	DEFAULT_STREAM_CAPACITY	256	unreviewed	
-crates/cog-core/src/contract/face_registry.rs	OWNER_IDLE_AFTER_SECS	600	unreviewed	
-crates/cog-core/src/contract/governance_acts.rs	SIGNED_UNAPPLIED_LIMIT_SECS	900	unreviewed	
-crates/cog-core/src/contract/memory.rs	RAW_ID_SLUG_MAX	64	unreviewed	
-crates/cog-core/src/contract/reflection.rs	GOAL_PATH_EXT_MAX	6	unreviewed	
-crates/cog-core/src/contract/reflection.rs	GOAL_PATH_EXT_MIN	2	unreviewed	
-crates/cog-core/src/contract/taste.rs	TASTE_EVIDENCE_MAX_REFS	32	unreviewed	
-crates/cog-core/src/contract/taste.rs	TASTE_REFERENCE_MAX_CHARS	2_048	unreviewed	
-crates/cog-core/src/contract/taste.rs	TASTE_SUBJECT_MAX_CHARS	512	unreviewed	
-crates/cog-core/src/contract/taste.rs	TASTE_TEXT_MAX_CHARS	2_000	unreviewed	
+crates/cog-core/src/contract/alerts.rs	ALERT_LABEL_VALUE_MAX_CHARS	1024	bound	long enough for a path or an upstream message to survive truncation, short enough that a label value stays a label value
+crates/cog-core/src/contract/event.rs	DEFAULT_STREAM_CAPACITY	256	bound	depth at which a bounded event stream pushes back; a default, not a measured queue length
+crates/cog-core/src/contract/face_registry.rs	OWNER_IDLE_AFTER_SECS	600	bound	ten minutes covers a build or a long model call and still shows a stopped owner inside the same working session
+crates/cog-core/src/contract/governance_acts.rs	SIGNED_UNAPPLIED_LIMIT_SECS	900	bound	fifteen minutes is enough for the two parties to finish the move they signed, short enough that a signature nobody applied is visible inside the same session
+crates/cog-core/src/contract/memory.rs	RAW_ID_SLUG_MAX	64	bound	with the timestamp and random segments alongside it the whole raw id stays far below NAME_MAX, while the prefix still shows where an entry came from
+crates/cog-core/src/contract/reflection.rs	GOAL_PATH_EXT_MAX	6	bound	past six characters a trailing .foo reads as a sentence fragment rather than a file type
+crates/cog-core/src/contract/reflection.rs	GOAL_PATH_EXT_MIN	2	bound	one letter is the shape of an abbreviation (e.g, i.e), not of a file type anybody ships
+crates/cog-core/src/contract/taste.rs	TASTE_EVIDENCE_MAX_REFS	32	bound	a judgement is made against a handful of artifacts; a longer list is a corpus, and a corpus belongs on the material side where it can be paged
+crates/cog-core/src/contract/taste.rs	TASTE_REFERENCE_MAX_CHARS	2_048	bound	fits a URI with a query string, not a document in the field whose job is to point at one
+crates/cog-core/src/contract/taste.rs	TASTE_SUBJECT_MAX_CHARS	512	bound	a subject line; over-length is refused at submission rather than truncated, because a cut subject is the submitter's words with the reason removed
+crates/cog-core/src/contract/taste.rs	TASTE_TEXT_MAX_CHARS	2_000	bound	these fields are inlined into the goal and copied into every later change, so the bound is on the submission, not on the row as stored
 crates/cog-eval/src/adapters/swe_pro.rs	MAX	5	bound	at most five test names in a verdict; the rest are counted, not listed
 crates/cog-eval/src/backoff.rs	ATTEMPTS_PER_MINUTE	600	bound	a gate two orders above normal call density; it only bites in a refusal storm
 crates/cog-eval/src/backoff.rs	DEFAULT_REFUSAL_BACKOFF	1s	bound	floor when a refusal states no wait; three orders above the measured 0.7ms fast failure
@@ -87,55 +87,55 @@ crates/cog-extension/src/workdir.rs	MIN_FETCH_INTERVAL_SECS	30	bound	below this 
 crates/cog-extension/src/workdir.rs	MIN_GC_INTERVAL_SECS	30	bound	floor under the pass-duration derivation; also the pace the loop wakes and beats at
 crates/cog-extension/src/workdir.rs	MIN_TTL_SECS	3600	bound	floor under the arrival-rate derivation, before two trees exist
 crates/cog-extension/src/workdir.rs	WORKSPACE_DISK_HEADROOM_PERCENT	15	bound	room the git commands writing while the cap is reached need
-crates/cog-gateway/src/a2a.rs	LIST_PAGE_DEFAULT	50	unreviewed	
-crates/cog-gateway/src/a2a.rs	LIST_PAGE_MAX	100	unreviewed	
-crates/cog-gateway/src/agents.rs	CONVERSATION_DEFAULT_LIMIT	100	unreviewed	
-crates/cog-gateway/src/agents.rs	MAX_WAIT_SECS	120	unreviewed	
-crates/cog-gateway/src/auth/mod.rs	LOGIN_MAX_ATTEMPTS	5	unreviewed	
-crates/cog-gateway/src/auth/mod.rs	LOGIN_WINDOW_SECONDS	300	unreviewed	
-crates/cog-gateway/src/chat.rs	CLASSIFY_TIMEOUT_SECS	20	unreviewed	
-crates/cog-gateway/src/chat.rs	CONNECT_TIMEOUT_SECS	30	unreviewed	
-crates/cog-gateway/src/chat.rs	SESSION_HISTORY_CAP	40	unreviewed	
-crates/cog-gateway/src/chat.rs	STREAM_IDLE_TIMEOUT_SECS	180	unreviewed	
-crates/cog-gateway/src/eval_reports.rs	DEFAULT_LIST_LIMIT	200	unreviewed	
-crates/cog-gateway/src/git_mirror.rs	DEFAULT_MIRROR_OP_TIMEOUT_SECS	1800	unreviewed	
-crates/cog-gateway/src/git_mirror.rs	DEFAULT_MIRROR_STALL_SECS	180	unreviewed	
-crates/cog-gateway/src/git_mirror.rs	HTTPS_PROBE_INTERVAL_SECS	60	unreviewed	
-crates/cog-gateway/src/git_mirror.rs	MIRROR_FRESHNESS_SECS	30	unreviewed	
-crates/cog-gateway/src/git_mirror.rs	MIRROR_OP_TIMEOUT_FLOOR_SECS	60	unreviewed	
-crates/cog-gateway/src/git_mirror.rs	MIRROR_STALL_FLOOR_SECS	30	unreviewed	
-crates/cog-gateway/src/git_mirror.rs	RESIDUE_MIN_AGE_SECS	60	unreviewed	
-crates/cog-gateway/src/git_routing.rs	HANDSHAKE_TIMEOUT	20s	unreviewed	
-crates/cog-gateway/src/git_routing.rs	MEASURE_FRESHNESS_SECS	600	unreviewed	
-crates/cog-gateway/src/git_routing.rs	SIGNAL_PROBE_TIMEOUT	5s	unreviewed	
-crates/cog-gateway/src/github_app.rs	JWT_CLOCK_SKEW_SECS	60	unreviewed	
-crates/cog-gateway/src/github_app.rs	REFRESH_MARGIN_SECS	120	unreviewed	
-crates/cog-gateway/src/governance.rs	OUTSTANDING_PAGE	100	unreviewed	
-crates/cog-gateway/src/governance.rs	REFUSED_PAGE	50	unreviewed	
-crates/cog-gateway/src/governance.rs	REFUSED_READ_CAP	10_000	unreviewed	
-crates/cog-gateway/src/governance.rs	TIMELINE_MAX	200	unreviewed	
-crates/cog-gateway/src/governance.rs	TIMELINE_PAGE	50	unreviewed	
-crates/cog-gateway/src/ide.rs	BINARY_PROBE_BYTES	8192	unreviewed	
-crates/cog-gateway/src/ide.rs	MAX_TREE_ENTRIES	2000	unreviewed	
-crates/cog-gateway/src/ide.rs	SEARCH_DEFAULT_LIMIT	100	unreviewed	
-crates/cog-gateway/src/ide.rs	SEARCH_MAX_FILES	5_000	unreviewed	
-crates/cog-gateway/src/ide.rs	SEARCH_MAX_LIMIT	500	unreviewed	
-crates/cog-gateway/src/knowledge.rs	MAX_TOP_K	100	unreviewed	
-crates/cog-gateway/src/memory.rs	DEFAULT_RAW_LIST_LIMIT	100	unreviewed	
-crates/cog-gateway/src/memory.rs	EXPIRY_SECS	300	unreviewed	
-crates/cog-gateway/src/observability.rs	FIRING_PROBE_LIMIT	1	unreviewed	
-crates/cog-gateway/src/readings.rs	QUERY_TIMEOUT_SECS	5	unreviewed	
-crates/cog-gateway/src/scm.rs	GIT_TIMEOUT	20s	unreviewed	
-crates/cog-gateway/src/scm.rs	LOG_MAX	200	unreviewed	
-crates/cog-gateway/src/scm.rs	MAX_CHANGES	500	unreviewed	
-crates/cog-gateway/src/scm.rs	MAX_DIFF_LINES	20_000	unreviewed	
-crates/cog-gateway/src/scm.rs	MAX_MESSAGE_CHARS	4000	unreviewed	
-crates/cog-gateway/src/scm.rs	MAX_PATHS	500	unreviewed	
-crates/cog-gateway/src/security_gateway.rs	FACE_ANSWER_TTL_SECS	1800	unreviewed	
-crates/cog-gateway/src/security_gateway.rs	MAX_CHARS	512	unreviewed	
-crates/cog-gateway/src/security_gateway.rs	WINDOW_PACE_RESERVE_DAYS	30	unreviewed	
-crates/cog-gateway/src/security_gateway.rs	WINDOW_PACE_RESERVE_QUANTILE	0.75	unreviewed	
-crates/cog-gateway/src/spend_reading.rs	SECONDS_PER_DAY	86_400	unreviewed	
+crates/cog-gateway/src/a2a.rs	LIST_PAGE_DEFAULT	50	bound	the A2A specification's default page_size when the caller names none
+crates/cog-gateway/src/a2a.rs	LIST_PAGE_MAX	100	bound	the A2A specification's page_size ceiling
+crates/cog-gateway/src/agents.rs	CONVERSATION_DEFAULT_LIMIT	100	bound	one default page of conversation lines; the store keeps far more and the caller may ask for it
+crates/cog-gateway/src/agents.rs	MAX_WAIT_SECS	120	bound	longest a request may hold a connection waiting for an agent's answer, set below the idle bound of the proxies in front
+crates/cog-gateway/src/auth/mod.rs	LOGIN_MAX_ATTEMPTS	5	bound	failed attempts per identifier inside the window before the endpoint answers 429
+crates/cog-gateway/src/auth/mod.rs	LOGIN_WINDOW_SECONDS	300	bound	the sliding window the failed-attempt count is kept in, so an attacker's budget is per five minutes
+crates/cog-gateway/src/chat.rs	CLASSIFY_TIMEOUT_SECS	20	bound	intent classification is a one-word answer; past this the backend is struggling and the plain chat path takes over
+crates/cog-gateway/src/chat.rs	CONNECT_TIMEOUT_SECS	30	bound	connecting is fast or the backend is the problem, and the failover pool is what handles a slow one
+crates/cog-gateway/src/chat.rs	SESSION_HISTORY_CAP	40	bound	how many turns fit in one request, not how many are stored — the record is trimmed by its own bound in the store
+crates/cog-gateway/src/chat.rs	STREAM_IDLE_TIMEOUT_SECS	180	bound	matches the upstream's own in-stream cap; only an idle gap beyond it aborts a reasoning turn
+crates/cog-gateway/src/eval_reports.rs	DEFAULT_LIST_LIMIT	200	bound	each listed report costs one body read to name its dataset, so the cap bounds the reads; the untrimmed total is reported so the caller sees a prefix
+crates/cog-gateway/src/git_mirror.rs	DEFAULT_MIRROR_OP_TIMEOUT_SECS	1800	bound	total wall for one clone/fetch/push; the stall judgement cannot catch a remote that keeps printing progress and never ends
+crates/cog-gateway/src/git_mirror.rs	DEFAULT_MIRROR_STALL_SECS	180	bound	silence that marks a transfer dead; --progress writes at second granularity, so silence is no progress, while a slow link still makes progress
+crates/cog-gateway/src/git_mirror.rs	HTTPS_PROBE_INTERVAL_SECS	60	bound	base of the circuit-breaker probe backoff: consecutive failures retreat exponentially from this cadence
+crates/cog-gateway/src/git_mirror.rs	MIRROR_FRESHNESS_SECS	30	bound	a mirror's last successful fetch must be this recent to serve as a baseline; the same number is the oldest a fallback baseline may be
+crates/cog-gateway/src/git_mirror.rs	MIRROR_OP_TIMEOUT_FLOOR_SECS	60	bound	lowest the deployment may set the operation timeout to; below it a large legitimate fetch is cut
+crates/cog-gateway/src/git_mirror.rs	MIRROR_STALL_FLOOR_SECS	30	bound	lowest the deployment may set the stall judgement to, so a healthy transfer is never killed for being quiet
+crates/cog-gateway/src/git_mirror.rs	RESIDUE_MIN_AGE_SECS	60	bound	newer residue may belong to a live transfer (progress updates by the second, locks live less than a request); only clearly stale files are a dead process's
+crates/cog-gateway/src/git_routing.rs	HANDSHAKE_TIMEOUT	20s	bound	probe budget for one channel's handshake, not a channel's request budget — exceeding it means the channel is unavailable now
+crates/cog-gateway/src/git_routing.rs	MEASURE_FRESHNESS_SECS	600	bound	how long a measured channel verdict stands: longer than the circuit-breaker probe cadence, short enough that a torn-down wall shows within minutes
+crates/cog-gateway/src/git_routing.rs	SIGNAL_PROBE_TIMEOUT	5s	bound	one network-profile signal probe, at the same order as the bootstrap's short probes: reachable, not how fast
+crates/cog-gateway/src/github_app.rs	JWT_CLOCK_SKEW_SECS	60	bound	issued-at is backdated by a minute so clock drift against GitHub cannot make the token not-yet-valid
+crates/cog-gateway/src/github_app.rs	REFRESH_MARGIN_SECS	120	bound	installation token is refreshed this long before its expiry, so a request never carries one about to lapse
+crates/cog-gateway/src/governance.rs	OUTSTANDING_PAGE	100	bound	one page of outstanding rows; the total comes from the census, not from the page
+crates/cog-gateway/src/governance.rs	REFUSED_PAGE	50	bound	refused principles returned by one read; both totals are taken before the truncation, so the page never doubles as the count
+crates/cog-gateway/src/governance.rs	REFUSED_READ_CAP	10_000	bound	rows read to compute the totals, bounded by how many principles one deployment could ever have refused
+crates/cog-gateway/src/governance.rs	TIMELINE_MAX	200	bound	widest history a caller may ask for in one read
+crates/cog-gateway/src/governance.rs	TIMELINE_PAGE	50	bound	moves returned by one history; they come newest first, so the bound drops the oldest and the question is how this got here
+crates/cog-gateway/src/ide.rs	BINARY_PROBE_BYTES	8192	bound	prefix examined before a file is called binary, and the same files are never returned in full
+crates/cog-gateway/src/ide.rs	MAX_TREE_ENTRIES	2000	bound	one directory listing; a tree of millions of files must not fill a response
+crates/cog-gateway/src/ide.rs	SEARCH_DEFAULT_LIMIT	100	bound	matches returned when the caller names no limit
+crates/cog-gateway/src/ide.rs	SEARCH_MAX_FILES	5_000	bound	search answers synchronously, so it walks a bounded number of files before it stops looking
+crates/cog-gateway/src/ide.rs	SEARCH_MAX_LIMIT	500	bound	widest page of matches a caller may ask for
+crates/cog-gateway/src/knowledge.rs	MAX_TOP_K	100	bound	widest answer assembled over HTTP rather than an internal candidate window; the same ceiling the wiki search applies
+crates/cog-gateway/src/memory.rs	DEFAULT_RAW_LIST_LIMIT	100	bound	a listing costs one store read per id, so the cap bounds the reads; the untrimmed total is reported so a prefix is visible
+crates/cog-gateway/src/memory.rs	EXPIRY_SECS	300	bound	lifetime of the signed URL for stored bytes: long enough for the request that asked, short enough that a working link does not circulate
+crates/cog-gateway/src/observability.rs	FIRING_PROBE_LIMIT	1	bound	the cluster verdict only asks whether anything fires, so one row settles it however much is firing
+crates/cog-gateway/src/readings.rs	QUERY_TIMEOUT_SECS	5	bound	a reading that cannot answer in five seconds is already the answer; a failed query reads as no reading and never as zero
+crates/cog-gateway/src/scm.rs	GIT_TIMEOUT	20s	bound	one git action on a small local repository; slower than a poll cycle means it is wedged
+crates/cog-gateway/src/scm.rs	LOG_MAX	200	bound	most log rows returned
+crates/cog-gateway/src/scm.rs	MAX_CHANGES	500	bound	changes returned by one status read
+crates/cog-gateway/src/scm.rs	MAX_DIFF_LINES	20_000	bound	keeps a pathological line count from filling the byte cap with tiny lines; the byte cap is the primary bound
+crates/cog-gateway/src/scm.rs	MAX_MESSAGE_CHARS	4000	bound	wider than a changelog line and narrower than an article; the byte cap beside it is what really bounds a diff
+crates/cog-gateway/src/scm.rs	MAX_PATHS	500	bound	paths one commit may name
+crates/cog-gateway/src/security_gateway.rs	FACE_ANSWER_TTL_SECS	1800	bound	a face probe is a max_tokens=1 ping, and losing a face is a slow event; this interval is also the eligibility window, so a ten-day-old answer cannot admit traffic today
+crates/cog-gateway/src/security_gateway.rs	MAX_CHARS	512	bound	upstream error excerpt: the truncation point is chosen so the vendor's own error-type marker (access_terminated_error) survives, because termination classification reads it
+crates/cog-gateway/src/security_gateway.rs	WINDOW_PACE_RESERVE_DAYS	30	bound	a month of history: shorter is skewed by one unusually cheap batch, longer carries shapes from before a config or prompt change
+crates/cog-gateway/src/security_gateway.rs	WINDOW_PACE_RESERVE_QUANTILE	0.75	bound	median would leave half the tasks unable to reserve for themselves, which is the shape of opening a window and cutting it in two; the 75th percentile fits most tasks whole
+crates/cog-gateway/src/spend_reading.rs	SECONDS_PER_DAY	86_400	bound	a definition, not a measurement: 24x3600, with the day boundary being UTC's rather than this deployment's
 crates/cog-github/src/ci_refusals.rs	MAX_FILES_READ	16	bound	a cap on git-show subprocesses per red revision; the logs named two or three paths in practice
 crates/cog-github/src/conversation.rs	MAX_MEDIA_PER_INTENT	6	bound	only the six newest attachments per intent reach the judge
 crates/cog-github/src/discovery_loop.rs	ASSESS_POLL_INTERVAL_MS	500	bound	how often the wait loop re-asks for the verdict; a cadence, not a reading
@@ -150,18 +150,18 @@ crates/cog-llm/src/observed.rs	FORWARD_CAPACITY	64	bound	the forward channel's d
 crates/cog-memory/src/config.rs	DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS	64_000	bound	one deployed 64k agent window of transcript; the raw layer no longer trims to it
 crates/cog-memory/src/vector_summary_backend.rs	CREATE_COLLECTION_BACKOFF_DOUBLINGS	4	bound	four doublings from 500 ms cap the wait at 8 s inside the 120 s retry window
 crates/cog-memory/src/vector_summary_backend.rs	CREATE_COLLECTION_BACKOFF_MS	500	bound	the first retry delay; doubling from here keeps asking during a create storm
-crates/cog-observability/src/claim_store.rs	DEFAULT_INTERVAL_SECS	300	unreviewed	
-crates/cog-observability/src/claim_store.rs	MIN_INTERVAL_SECS	30	unreviewed	
-crates/cog-observability/src/config.rs	MIN_HOLD_SECS	60	unreviewed	
-crates/cog-observability/src/config.rs	MIN_POLL_INTERVAL_SECS	30	unreviewed	
-crates/cog-observability/src/config.rs	MIN_SETTLE_SECS	10	unreviewed	
-crates/cog-observability/src/image_store.rs	DEFAULT_INTERVAL_SECS	900	unreviewed	
-crates/cog-observability/src/image_store.rs	MIN_INTERVAL_SECS	60	unreviewed	
-crates/cog-observability/src/infra_watch.rs	MAX_CHARS	300	unreviewed	
-crates/cog-observability/src/llm_usage_rollup.rs	WINDOW_SECS	3600	unreviewed	
-crates/cog-observability/src/plugin.rs	ALERT_BELL_INTERVAL_SECS	60	unreviewed	
-crates/cog-observability/src/process_zombies.rs	SWEEP_INTERVAL	15s	unreviewed	
-crates/cog-observability/src/spend_verdict.rs	WINDOW_SECS	3600	unreviewed	
+crates/cog-observability/src/claim_store.rs	DEFAULT_INTERVAL_SECS	300	bound	the same 300 as cog-core's DEFAULT_SCAN_INTERVAL_SECS, so two processes reporting one claim are equally fresh and the older one's number does not read as growth
+crates/cog-observability/src/claim_store.rs	MIN_INTERVAL_SECS	30	bound	a scan walks every directory below the root, so a faster cadence only keeps the disk busy
+crates/cog-observability/src/config.rs	MIN_HOLD_SECS	60	bound	below the settle floor the hold only re-reads one window, while the pod replacement it waits out takes minutes
+crates/cog-observability/src/config.rs	MIN_POLL_INTERVAL_SECS	30	bound	scrape intervals dominate freshness, so a faster poll burns Prometheus CPU without showing anything sooner
+crates/cog-observability/src/config.rs	MIN_SETTLE_SECS	10	bound	kubelet refreshes the mounted document on its own sync period; a shorter window would read the same stale document twice and call a rollout a permanent gap
+crates/cog-observability/src/image_store.rs	DEFAULT_INTERVAL_SECS	900	bound	slower than the claim scan because an image tree is much larger and changes on the scale of pulls, not of a workload writing a file
+crates/cog-observability/src/image_store.rs	MIN_INTERVAL_SECS	60	bound	fastest re-walk a deployment may ask for, bounded because the walk costs what the node holds
+crates/cog-observability/src/infra_watch.rs	MAX_CHARS	300	bound	enough of a Prometheus message to recognise the cause, not enough to flood an alert row; a Prometheus message embeds the whole match group
+crates/cog-observability/src/llm_usage_rollup.rs	WINDOW_SECS	3600	bound	a property of the reading rather than a knob: one hour keeps a quiet window a meaningful rate and a shift in where tokens go visible the same day, and a different window would be a different series
+crates/cog-observability/src/plugin.rs	ALERT_BELL_INTERVAL_SECS	60	bound	the same 60 seconds the WebUI's useNotifications polls at: faster is spin because the browser cannot see it sooner, slower lights the bell a full tick late
+crates/cog-observability/src/process_zombies.rs	SWEEP_INTERVAL	15s	bound	long enough that an owner collecting through a blocking wait() always wins the race, short enough that a wedged sweep is visible within one scrape interval
+crates/cog-observability/src/spend_verdict.rs	WINDOW_SECS	3600	bound	the same closed hour the usage rollup folds, so a verdict cell and the spend it judges are keyed identically and need no mapping
 crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs	DEFAULT_MAX_PATTERN_AGE_DAYS	30	bound	patterns older than a month are expired even under the size cap
 crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs	DEFAULT_MAX_PATTERN_DB_SIZE	256	bound	the table is truncated at this many patterns after sorting by success and recency
 crates/cog-orchestrator/src/backup_runs.rs	BACKUP_RUNS_PASS_INTERVAL	300s	bound	slow enough for a table that changes a few times a day; the liveness alert uses 6x this period
@@ -203,15 +203,15 @@ crates/cog-reflection/src/change_pipeline.rs	TEST_BUDGET_RUNS_PER_CHANGE	3	bound
 crates/cog-reflection/src/config.rs	MIN_INTERVAL_SECS	60	bound	floor on the convergence cadence; below it an apply has not landed before the next round
 crates/cog-reflection/src/evolution_build_readings.rs	BUILD_RUN_WINDOW	64	bound	in-process attempt window; it answers for this process's life, not for all of history
 crates/cog-reflection/src/lib.rs	CHANGE_EVIDENCE_BUDGET	2000	bound	how much evidence a learning may carry; a spend for the next attempt, not a storage limit
-crates/cog-reflection/src/mainline_deployer.rs	JUDGEMENT_POLL_SECS	15	unreviewed	
-crates/cog-reflection/src/mainline_deployer.rs	STRIP_WALL_SECS	60	unreviewed	
-crates/cog-reflection/src/mainline_deployer.rs	SUPPORT_CAUSE_MESSAGE_CHARS	200	unreviewed	
-crates/cog-reflection/src/mainline_rollout.rs	CI_ASK_BUDGET_SECS	180	unreviewed	
-crates/cog-reflection/src/mainline_rollout.rs	CONTAINER_STARTUP_ALLOWANCE_SECS	15	unreviewed	
-crates/cog-reflection/src/mainline_rollout.rs	DIAGNOSIS_EVENT_LIMIT	3	unreviewed	
-crates/cog-reflection/src/mainline_rollout.rs	ROLLOUT_POLL_SECS	5	unreviewed	
-crates/cog-reflection/src/mainline_rollout.rs	SUPPORT_CAUSE_CONTAINER_LIMIT	4	unreviewed	
-crates/cog-reflection/src/mainline_rollout.rs	SUPPORT_CAUSE_POD_LIMIT	3	unreviewed	
+crates/cog-reflection/src/mainline_deployer.rs	JUDGEMENT_POLL_SECS	15	bound	how soon the end of a Job is seen, not how long it is waited for; against a judgement that already runs minutes this buys a conclusion without waiting out a whole tick
+crates/cog-reflection/src/mainline_deployer.rs	STRIP_WALL_SECS	60	bound	wall for the strip hop inside the build stage; it is a separate hop so hitting it is not fatal to the build next to it
+crates/cog-reflection/src/mainline_deployer.rs	SUPPORT_CAUSE_MESSAGE_CHARS	200	bound	the text comes from the cluster, so its length cannot be the cluster's to decide: it ends up in logs, termination messages and failure records
+crates/cog-reflection/src/mainline_rollout.rs	CI_ASK_BUDGET_SECS	180	bound	one budget used at both ends — the ask's own timeout here and the Job's activeDeadlineSeconds there — because bounding only one end leaves the other nominal
+crates/cog-reflection/src/mainline_rollout.rs	CONTAINER_STARTUP_ALLOWANCE_SECS	15	bound	slack added above the probe cycle, which is computed from the live probe config, never from the chart: it covers starting a process to first listen (measured at about 4 seconds on this host) before any probe has judged
+crates/cog-reflection/src/mainline_rollout.rs	DIAGNOSIS_EVENT_LIMIT	3	bound	an error record is not a log dump; enough events to name the cause
+crates/cog-reflection/src/mainline_rollout.rs	ROLLOUT_POLL_SECS	5	bound	one cadence shared by the probe, the fatal-state recheck and the deploy-state read, so the three never disagree about when they looked
+crates/cog-reflection/src/mainline_rollout.rs	SUPPORT_CAUSE_CONTAINER_LIMIT	4	bound	companion to the pod limit: a pod's containers are bounded so one verbose pod cannot crowd out the rest
+crates/cog-reflection/src/mainline_rollout.rs	SUPPORT_CAUSE_POD_LIMIT	3	bound	the field readings that follow a verdict are not a dump: pods and containers are bounded so the record points at a cause
 crates/cog-reflection/src/promotion_eval.rs	DEFAULT_EVAL_POLL_INTERVAL_SECS	5	bound	poll period for an A/B task; baseline_port's poll_interval_secs default spells the same 5
 crates/cog-reflection/src/promotion_eval.rs	DEFAULT_EVAL_TIMEOUT_SECS	3600	bound	ceiling for a worktree build plus the fixed eval set; baseline_port's constructor spells the same 3600
 crates/cog-reflection/src/promotion_trend.rs	MIN_WEEK_SAMPLES	2	bound	fewer than two decided changes in a week cannot carry a rate
