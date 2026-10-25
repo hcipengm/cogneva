@@ -18,7 +18,7 @@ metadata:
   namespace: cogneva
   # 运行期自建 Pod（评测台、验收演练）的额度预算，与 chart 的
   # resourceGovernance.runtimePods 逐字段相等。渲染期门禁读这两个注解，
-  # 核「声明和 + 判据 Job + 预算 ≤ 额度」；缺注解报错，不当作 0。
+  # 核「声明和 + 判据 Job + 预算 + 替换重叠 ≤ 额度」；缺注解报错，不当作 0。
   annotations:
     cogneva.io/runtime-pods-limits-cpu: "3"
     cogneva.io/runtime-pods-limits-memory: 3.75Gi
@@ -29,18 +29,22 @@ spec:
   hard:
     requests.cpu: "6"
     requests.memory: 12Gi
-    limits.cpu: "32"
-    # 56Gi：稳态 47.8Gi（渲染期门禁自报 45.8Gi，实测 2026-10-23；含 gateway 上限
-    # 6Gi → 8Gi 抬的 2Gi）+ 判据 Job 512Mi + 运行期自建临时 Pod 3.75Gi（实测
-    # 2026-10-23：eval 表 3Gi + 验收演练 768Mi）+ 替换重叠 3.4Gi（实测 2026-10-19）
-    # = 55.45Gi（实测 2026-10-23 按上面几项相加）。
+    limits.cpu: "36"
+    # 内存与 CPU 同一条算式：稳态 48.8Gi（渲染期门禁自报）+ 判据 Job 512Mi +
+    # 运行期自建 Pod 预算 3.75Gi + 替换重叠 8Gi（主应用 maxSurge 1，见下）。
     # 2026-10-24：新增 SearXNG 检索 Pod（limits 1000m / 1Gi），两维一起抬到 32 核 /
     # 57Gi（额度算式见 chart values 的 resourceGovernance 段，实测 2026-10-24）——只加
     # 工作负载不抬额度，准入会先拒掉下一次滚动 Job，而不是这个 Pod。
+    # 2026-10-25：上面那笔只抬到"稳态装得下"，没算替换重叠，于是这条配额从 10-24
+    # 起就滚不动主应用（maxSurge 1 / maxUnavailable 0，滚动时多占 4 核 / 8Gi）。
+    # 实机判词：`limits.cpu: this rollout surges, so the new pod is admitted beside
+    # the old one and charged 4 on top of 28900m used, which passes the enforced 32`.
+    # 上限的判据改成**稳态 + 判据 Job + 运行期预算 + 最大一份替换重叠**，两维一起
+    # 抬到 36 核 / 62Gi。
     # 运行期自建 Pod 不是渲染集里的工作负载，但它们的预算写在上面的注解里，
     # 渲染期门禁把预算加进同一条不等式；留不够就在渲染期红，而不是等到准入被拒、
     # 部署器每轮空转。完整算式见 chart values 的 resourceGovernance 段。
-    limits.memory: "57Gi"
+    limits.memory: "62Gi"
     pods: "40"
     requests.storage: 480Gi
 ---

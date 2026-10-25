@@ -357,10 +357,91 @@ for face, quota_key, unit in (('requests', 'requests.cpu', 'cpu'),
                     f"{shown(totals + job_extra + budget)} vs 配额 {hard[quota_key]}，"
                     f"头寸 {shown(covered)}（仍不含替换重叠）")
 
+    # 再一截：替换重叠。一个 `maxSurge ≥ 1` 的 Deployment 在滚动那一刻会多一个
+    # Pod 进准入，而旧 Pod 还没删，两者同时记在这只配额的 used 上。取各工作负载
+    # 里的最大值而不是求和：部署器一次只滚一个。
+    # 与 `check-cross-layer-reconcile.sh` 判据 3 是同一条判据，区别只在**问的时机**：
+    # 那一条问的是此刻的集群，这一条问的是声明自己。少了这一条，一份「稳态恰好装
+    # 得下」的声明照样渲染通过、照样过 CI，然后在准入处把每一次滚动都拒掉；被拒的
+    # 是**新** Pod，旧 Pod 继续服役，于是读起来是「这一版永远滚不上去」而不是
+    # 「配额不够」。2026-10-24 抬额度只抬了稳态那一份，10-25 主应用就卡在这里，
+    # 最后一个滚上去的版本停在 05:15。
+    if face == 'limits':
+        def surge_of(doc, unit):
+            spec = doc.get('spec') or {}
+            strategy = spec.get('strategy') or {}
+            if strategy.get('type', 'RollingUpdate') != 'RollingUpdate':
+                return 0.0, ''
+            replicas = spec.get('replicas', 1)
+            replicas = 1 if not isinstance(replicas, int) else replicas
+            raw = (strategy.get('rollingUpdate') or {}).get('maxSurge', '25%')
+            if isinstance(raw, int):
+                extra = raw
+            elif isinstance(raw, str) and raw.endswith('%'):
+                try:
+                    # 与 kube-controller-manager 同一个取整方向：向上。
+                    extra = int(-(-(float(raw[:-1]) * replicas) // 100))
+                except ValueError:
+                    extra = 0
+            elif isinstance(raw, str):
+                try:
+                    extra = int(raw)
+                except ValueError:
+                    extra = 0
+            else:
+                extra = 0
+            if extra <= 0:
+                return 0.0, ''
+            pod = spec.get('template', {}).get('spec', {})
+            per = 0.0
+            for c in pod.get('containers', []) + pod.get('initContainers', []):
+                declared = ((c.get('resources') or {}).get('limits') or {}).get(unit)
+                if declared is not None:
+                    per += qty(declared)
+                elif lr_container:
+                    fallback = (lr_container.get('default') or {}).get(unit)
+                    if fallback is not None:
+                        per += qty(fallback)
+            return extra * per, f"{doc['metadata']['name']}(+{extra})"
+
+        overlap = 0.0
+        overlap_who = ''
+        for doc in workloads:
+            if doc.get('kind') != 'Deployment':
+                continue
+            add, who = surge_of(doc, unit)
+            if add > overlap:
+                overlap, overlap_who = add, who
+        if overlap > 0:
+            job_extra = 0.0
+            if runtime_job is not None and runtime_job.get(quota_key) is not None:
+                job_extra = qty(runtime_job[quota_key])
+            budget = 0.0
+            if isinstance(runtime_pods, dict) and unit in runtime_pods:
+                budget = qty(runtime_pods[unit])
+            rolled = ceiling - totals - job_extra - budget - overlap
+            if rolled < 0:
+                errors.append(
+                    f"工作负载单副本{face}.{unit} 下限和 {shown(totals)} + 判据 Job "
+                    f"{shown(job_extra)} + 运行期预算 {shown(budget)} + 替换重叠 "
+                    f"{shown(overlap)}（{overlap_who}）= "
+                    f"{shown(totals + job_extra + budget + overlap)} 已超过配额 "
+                    f"{quota_key} = {hard[quota_key]}：滚动那一刻新旧两个 Pod 同时在"
+                    f"准入里，这条声明**滚不动**自己最大的那份工作负载；不越界的是稳态，"
+                    f"被拒的是新 Pod，读起来是「这一版永远滚不上去」而不是「配额不够」")
+            else:
+                notes.append(
+                    f"  └ 再计入替换重叠 {shown(overlap)}（{overlap_who}）："
+                    f"{shown(totals)} + 判据 Job {shown(job_extra)} + 预算 "
+                    f"{shown(budget)} + 重叠 {shown(overlap)} = "
+                    f"{shown(totals + job_extra + budget + overlap)} vs 配额 "
+                    f"{hard[quota_key]}，头寸 {shown(rolled)}")
+
 notes.append(
     "limits 两维的头寸算的是声明的工作负载 + 部署器自己创建的判据 Job + 注解声明的"
-    "运行期自建 Pod 预算；它仍不是准入余量——替换重叠与负载波动没有承保，"
-    "那一条硬判据看 check-cross-layer-reconcile.sh 的判据 3")
+    "运行期自建 Pod 预算 + 最大一份替换重叠：这四项加起来才是一次滚动真正需要的准入"
+    "余量。负载波动仍不在这条不等式里，此刻集群装不装得下由运行期判词回答"
+    "（check-cross-layer-reconcile.sh 判据 3）")
 
 if errors:
     print(f"GOVERNANCE 校验失败 [{PROFILE}]：")
