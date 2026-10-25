@@ -100,10 +100,17 @@ const MIN_FETCH_INTERVAL_SECS: u64 = 30;
 /// configuration. Without it the configured number is the only one anyone can
 /// see, and the loop silently stopping to use it would be invisible.
 const FETCH_INTERVAL_METRIC: &str = "sandbox_repo_fetch_interval_seconds";
-const FETCH_INTERVAL_SOURCE_LABEL: &str = "source";
+
+/// The label saying which input set a published period -- configuration, floor
+/// or measurement. Without it the configured number is the only one anyone can
+/// see, and the loop silently stopping to use it would be invisible.
+const SOURCE_LABEL: &str = "source";
 
 /// The published name of the idle TTL the reclamation pass is using.
 const TTL_METRIC: &str = "sandbox_workspace_ttl_seconds";
+
+/// The published name of the wait the volume walk is currently keeping.
+const VOLUME_WALK_INTERVAL_METRIC: &str = "sandbox_volume_walk_interval_seconds";
 
 /// How long the fetch loop should wait, given how long `main` was still before
 /// it last moved.
@@ -188,14 +195,46 @@ fn ttl_from(capacity: usize, trees: usize, span_secs: u64) -> Option<Duration> {
 /// the executor rebuilds trees it has just finished with.
 const MIN_TTL_SECS: u64 = 3600;
 
+/// Which of the three inputs set the period in force.
+///
+/// A rule reading the published interval has to be able to tell "the loop is
+/// keeping the number the chart wrote" from "the loop is running at a floor it
+/// may not go below" from "the loop slowed to a share of what it costs" -- the
+/// three say different things about the machine, and one `measured` value would
+/// let the first two read the same.
+fn period_source(pass_millis: u64, derived: Duration, floor: Duration) -> &'static str {
+    if pass_millis == 0 {
+        "configured"
+    } else if derived < floor {
+        "floor"
+    } else {
+        "measured"
+    }
+}
+
+/// How often to measure the volumes this executor writes.
+///
+/// The configured interval is the floor here rather than a seed: walking a
+/// claim costs I/O on the same disk the tasks are building on, so a walk is
+/// never worth running more often than the chart said, and is worth running
+/// less often once the tree it walks takes a real share of that interval.
+fn volume_walk_interval_from(pass_millis: u64, configured: Duration) -> Duration {
+    paced_interval(
+        pass_millis,
+        configured,
+        configured.as_secs(),
+        MAINTENANCE_OVERHEAD_MULTIPLE,
+    )
+}
+
 /// How often to reclaim, from how long a pass costs.
 ///
 /// The loop's own work is the thing that must stay cheap, so the interval is a
 /// multiple of the measured pass duration rather than a period chosen once. A
 /// pass that took half a second with a 600s interval was 0.08% of the process;
 /// one that takes 40s on a full volume would be 6.7% of it, and the fixed
-/// interval would keep paying that. `None` before any pass has been timed --
-/// there is nothing to scale from and the configured interval stands.
+/// interval would keep paying that. Before any pass has been timed the
+/// configured interval stands: there is nothing to scale from.
 fn gc_interval_from(pass_millis: u64, configured: Duration) -> Duration {
     paced_interval(
         pass_millis,
@@ -223,8 +262,16 @@ fn paced_interval(
     if pass_millis == 0 {
         return configured;
     }
-    let derived = (pass_millis / 1000).saturating_mul(multiple);
-    Duration::from_secs(derived.max(floor_secs))
+    scaled(pass_millis, multiple).max(Duration::from_secs(floor_secs))
+}
+
+/// The period a pass of `pass_millis` buys at a given share, before any floor.
+///
+/// Split out because the published reading has to say which input set the
+/// number in force, and that answer is "the measurement" only when this figure
+/// is the one above the floor.
+fn scaled(pass_millis: u64, multiple: u64) -> Duration {
+    Duration::from_secs((pass_millis / 1000).saturating_mul(multiple))
 }
 
 #[derive(Debug, Clone)]
@@ -391,6 +438,8 @@ pub struct WorkdirMetrics {
     ttl_seconds: GaugeVec,
     /// The reclamation interval in force, labelled the same way.
     gc_interval_seconds: GaugeVec,
+    /// The volume walk's interval in force, labelled the same way.
+    volume_walk_interval_seconds: GaugeVec,
 }
 
 impl WorkdirMetrics {
@@ -456,7 +505,7 @@ impl WorkdirMetrics {
                 FETCH_INTERVAL_METRIC,
                 "Seconds the background fetch loop is currently waiting between upstream fetches",
             ),
-            &[FETCH_INTERVAL_SOURCE_LABEL],
+            &[SOURCE_LABEL],
         )?;
         registry.register(Box::new(fetch_interval.clone()))?;
         let ttl_seconds = GaugeVec::new(
@@ -464,7 +513,7 @@ impl WorkdirMetrics {
                 TTL_METRIC,
                 "Seconds an idle task worktree is held before reclamation",
             ),
-            &[FETCH_INTERVAL_SOURCE_LABEL],
+            &[SOURCE_LABEL],
         )?;
         registry.register(Box::new(ttl_seconds.clone()))?;
         let gc_interval_seconds = GaugeVec::new(
@@ -472,9 +521,17 @@ impl WorkdirMetrics {
                 GC_INTERVAL_METRIC,
                 "Seconds between reclamation passes of the task worktrees",
             ),
-            &[FETCH_INTERVAL_SOURCE_LABEL],
+            &[SOURCE_LABEL],
         )?;
         registry.register(Box::new(gc_interval_seconds.clone()))?;
+        let volume_walk_interval_seconds = GaugeVec::new(
+            Opts::new(
+                VOLUME_WALK_INTERVAL_METRIC,
+                "Seconds between walks of the volumes this executor writes",
+            ),
+            &[SOURCE_LABEL],
+        )?;
+        registry.register(Box::new(volume_walk_interval_seconds.clone()))?;
         Ok(Self {
             registry,
             workspaces,
@@ -489,6 +546,7 @@ impl WorkdirMetrics {
             fetch_interval,
             ttl_seconds,
             gc_interval_seconds,
+            volume_walk_interval_seconds,
         })
     }
 
@@ -613,6 +671,9 @@ pub struct WorkdirRouter {
     /// The same two for the build-cache walk.
     cache_pass_millis: AtomicU64,
     last_cache_walk_unix: AtomicI64,
+    /// The same two for the walk over the volumes this executor writes.
+    volume_pass_millis: AtomicU64,
+    last_volume_walk_unix: AtomicI64,
 }
 
 impl WorkdirRouter {
@@ -659,6 +720,8 @@ impl WorkdirRouter {
             last_gc_unix: AtomicI64::new(0),
             cache_pass_millis: AtomicU64::new(0),
             last_cache_walk_unix: AtomicI64::new(0),
+            volume_pass_millis: AtomicU64::new(0),
+            last_volume_walk_unix: AtomicI64::new(0),
         }))
     }
 
@@ -1046,11 +1109,11 @@ impl WorkdirRouter {
     fn fetch_due(&self) -> bool {
         let stillness = self.stillness_secs.load(Ordering::Relaxed);
         let wait = fetch_interval_from(stillness, self.cfg.fetch_interval);
-        let source = if stillness == 0 {
-            "configured"
-        } else {
-            "measured"
-        };
+        let source = period_source(
+            stillness,
+            Duration::from_secs(stillness / 2),
+            Duration::from_secs(MIN_FETCH_INTERVAL_SECS),
+        );
         self.metrics
             .fetch_interval
             .with_label_values(&[source])
@@ -1078,13 +1141,14 @@ impl WorkdirRouter {
         let pass_millis = self.gc_pass_millis.load(Ordering::Relaxed);
         let wait = self.gc_interval();
         // Before the first timed pass there is nothing to scale from, and the
-        // configured interval is what stands -- labelled as such so a chart
-        // number and a measured one never read the same.
-        let source = if pass_millis == 0 {
-            "configured"
-        } else {
-            "measured"
-        };
+        // configured interval is what stands. When the twenty-times figure is
+        // under the floor it is the floor that is in force, and saying
+        // "measured" there would credit a measurement that decided nothing.
+        let source = period_source(
+            pass_millis,
+            scaled(pass_millis, MAINTENANCE_OVERHEAD_MULTIPLE),
+            Duration::from_secs(MIN_GC_INTERVAL_SECS),
+        );
         self.metrics
             .gc_interval_seconds
             .with_label_values(&[source])
@@ -1117,6 +1181,38 @@ impl WorkdirRouter {
             return true;
         }
         unix_now() - last >= wait.as_secs() as i64
+    }
+
+    /// Whether the volume walk is due, and if so, the interval it is keeping.
+    ///
+    /// Walks of a claim read the same disk the commands build on, so the
+    /// configured number is a floor: the walk never runs more often than that,
+    /// and runs less often once a walk costs a real share of the interval it is
+    /// scheduled at. Published with the label saying which input set it.
+    fn volume_walk_due(&self) -> bool {
+        let pass_millis = self.volume_pass_millis.load(Ordering::Relaxed);
+        let wait = volume_walk_interval_from(pass_millis, self.cfg.data_volume_interval);
+        let source = period_source(
+            pass_millis,
+            scaled(pass_millis, MAINTENANCE_OVERHEAD_MULTIPLE),
+            self.cfg.data_volume_interval,
+        );
+        self.metrics
+            .volume_walk_interval_seconds
+            .with_label_values(&[source])
+            .set(wait.as_secs_f64());
+        let last = self.last_volume_walk_unix.load(Ordering::Relaxed);
+        if last == 0 {
+            return true;
+        }
+        unix_now() - last >= wait.as_secs() as i64
+    }
+
+    fn note_volume_walk(&self, pass_millis: u64) {
+        self.volume_pass_millis
+            .store(pass_millis, Ordering::Relaxed);
+        self.last_volume_walk_unix
+            .store(unix_now(), Ordering::Relaxed);
     }
 
     fn note_cache_walk(&self, pass_millis: u64) {
@@ -1326,7 +1422,16 @@ impl WorkdirRouter {
                             // start rather than one scan interval later.
                             beat.beat();
                             ticker.tick().await;
+                            if !walker.volume_walk_due() {
+                                continue;
+                            }
+                            let started = std::time::Instant::now();
                             walker.measure_volumes_once().await;
+                            // The walk alone is timed: the waiting it is
+                            // scheduled by is not part of what the next period
+                            // has to cover, so there is no path from the
+                            // interval back into the measurement that sets it.
+                            walker.note_volume_walk(started.elapsed().as_millis() as u64);
                         }
                     }
                 },
@@ -2659,6 +2764,90 @@ pub(crate) mod tests {
                 MIN_GC_INTERVAL_SECS,
                 MAINTENANCE_OVERHEAD_MULTIPLE
             )
+        );
+    }
+
+    /// The walk over the executor's own volumes costs I/O on the same disk the
+    /// tasks build on, so its period is the configured interval as a floor and
+    /// a share of the walk above it -- and the published reading says which of
+    /// the three inputs set the number in force.
+    #[test]
+    fn the_volume_walk_never_runs_faster_than_the_chart_and_slows_with_its_cost() {
+        let configured = Duration::from_secs(300);
+        // Nothing walked yet: the configured interval is all there is.
+        assert_eq!(volume_walk_interval_from(0, configured), configured);
+        // A one-second walk buys twenty seconds, under the floor: the floor is
+        // what is in force, and `period_source` says so rather than crediting
+        // the measurement.
+        assert_eq!(volume_walk_interval_from(1_000, configured), configured);
+        assert_eq!(
+            period_source(
+                1_000,
+                scaled(1_000, MAINTENANCE_OVERHEAD_MULTIPLE),
+                configured
+            ),
+            "floor"
+        );
+        // A twenty-second walk buys 400s, above the floor: now the measurement
+        // is what set the period.
+        assert_eq!(
+            volume_walk_interval_from(20_000, configured),
+            Duration::from_secs(400)
+        );
+        assert_eq!(
+            period_source(
+                20_000,
+                scaled(20_000, MAINTENANCE_OVERHEAD_MULTIPLE),
+                configured
+            ),
+            "measured"
+        );
+        // Nothing timed: configuration.
+        assert_eq!(period_source(0, Duration::ZERO, configured), "configured");
+        // Ten times the walk, ten times the period: the share is held constant.
+        assert_eq!(
+            volume_walk_interval_from(200_000, configured),
+            Duration::from_secs(4000)
+        );
+    }
+
+    /// The loop itself uses that law and publishes the interval it is keeping:
+    /// a walk that just ran is not due again, and the reading moves from the
+    /// configured number to the measured one.
+    #[test]
+    fn the_volume_walk_publishes_the_interval_it_keeps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = router(
+            tmp.path(),
+            &tmp.path().join("repo.git"),
+            8,
+            Duration::from_secs(3600),
+        );
+        // Nothing walked yet: due at once, and the reading says why.
+        assert!(r.volume_walk_due());
+        let first = r.metrics().render();
+        assert!(
+            first.contains(&format!(
+                "{}{{{}=\"configured\"}} 30",
+                VOLUME_WALK_INTERVAL_METRIC, SOURCE_LABEL
+            )),
+            "{first}"
+        );
+
+        // A walk that took twenty seconds buys 400s at the configured 30s
+        // floor, so the next one is not due and the reading says measured.
+        r.note_volume_walk(20_000);
+        assert!(
+            !r.volume_walk_due(),
+            "a walk that just finished read as due again"
+        );
+        let after = r.metrics().render();
+        assert!(
+            after.contains(&format!(
+                "{}{{{}=\"measured\"}} 400",
+                VOLUME_WALK_INTERVAL_METRIC, SOURCE_LABEL
+            )),
+            "{after}"
         );
     }
 

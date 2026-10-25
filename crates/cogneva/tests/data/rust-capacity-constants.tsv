@@ -42,7 +42,7 @@ crates/cog-core/src/build_cache.rs	MAX_PUBLISHED_LAYERS	12	bound	series cap; eve
 crates/cog-core/src/build_cache.rs	MIN_SCAN_INTERVAL_SECS	60	bound	floor; a metadata walk over hundreds of thousands of entries gains nothing fresher
 crates/cog-core/src/build_cache.rs	REWRITE_WINDOW_SECS	3600	bound	an hour, matching the hand readings on record and the length of a real build
 crates/cog-core/src/build_cache_readings.rs	CAP_HEADROOM_PERCENT	120	bound	headroom over the measured peak so the next repeat build is not instantly over cap
-crates/cog-core/src/claim_footprint.rs	DEFAULT_SCAN_INTERVAL_SECS	300	bound	shared cadence so readings from different walkers stay comparable
+crates/cog-core/src/claim_footprint.rs	DEFAULT_SCAN_INTERVAL_SECS	300	bound	shared cadence while every walker keeps a fixed period; the sandbox executor's volume walk now takes it as the floor and paces above it
 crates/cog-core/src/claim_footprint.rs	MIN_SCAN_INTERVAL_SECS	30	bound	no fresher than the 30s scrape interval; a cheap metadata walk gains nothing
 crates/cog-core/src/config.rs	DEFAULT_ACCESS_TOKEN_TTL_MINUTES	15	bound	the token lifetime's default; cog-auth's JwtConfig::default spells the same 15 separately
 crates/cog-core/src/config.rs	DEFAULT_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS	3600	bound	hourly against a 24h Gitee token, leaving room for several failed renewals
