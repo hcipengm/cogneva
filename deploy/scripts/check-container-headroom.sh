@@ -19,6 +19,12 @@
 #      分开记，因为两者的修法不同——判据 2 红说明已经付过代价，判据 1 红说明正在逼近。
 #      陈旧的终止记录不算：终止时刻落在窗口之外就是历史，不是当前状态。
 #
+# 另外列一行**窗口内重启过的容器**（不判红）。判据 2 只能看见还活着的 Pod：Pod 一删，
+# 那条 `last_terminated_reason` 就跟着序列一起消失，于是一次 OOM 在滚动之后读出来是
+# 全绿。重启计数是计数器，Pod 删了历史样本仍在窗口里，`increase` 仍算得出它重启过几
+# 次——这是「那一代已经被换掉」唯一留下的痕迹。它不判红，是因为重启的成因分不开
+# 被杀、探针失败与节点重启；判红要原因，而原因只跟着活着的 Pod 存在。
+#
 # 上游读数读不到与不成立是两种退出码。Prometheus 里整族指标为空（cAdvisor 没采到、
 # namespace 写错、kube-state-metrics 没起）报 2，不报绿：没有序列的容器在这条读数里
 # 与「余量充足」长得一模一样，而它们要修的地方完全不同。
@@ -133,6 +139,13 @@ prom "kube_pod_container_status_last_terminated_reason{namespace=\"${NS}\",reaso
 # 判词这一侧对起来；时刻本身在这里先算成「距今多少秒」。
 prom "time() - kube_pod_container_status_last_terminated_timestamp{namespace=\"${NS}\"}" \
     "${work}/oom_age.json"
+# 「那一代已经被换掉」的唯一痕迹。判据 2 读的是还活着的 Pod 的 last_terminated_reason：
+# Pod 一删（滚动、重建、被驱逐），那条序列跟着消失，于是一次 OOM 杀的现场在 30 分钟后
+# 读出来就是全绿。重启计数是**计数器**，Pod 删了它的历史样本还在窗口里，`increase`
+# 仍算得出它这一窗口里重启过几次。它只列进判词、不判红：重启的成因分不开「被杀」
+# 「探针失败」与「节点重启」，判红要原因，而原因只跟着活着的 Pod 存在。
+prom "sum by (pod, container) (increase(kube_pod_container_status_restarts_total{namespace=\"${NS}\"}[${WINDOW}])) > 0" \
+    "${work}/restarts.json"
 
 if [ "${record}" = 1 ]; then
     export CONTAINER_HEADROOM_RECORD_FILE="${SERIES}"
@@ -202,6 +215,7 @@ init_info = vector('init_info.json')
 pods = vector('pods.json')
 oom_reason = vector('oom_reason.json')
 oom_age = vector('oom_age.json')
+restarts = vector('restarts.json')
 
 # 整族为空不是「都余量充足」：cAdvisor 没采到 / namespace 写错 / KSM 没起，在这里
 # 与一个空 namespace 同形，而它们要修的地方完全不同。
@@ -297,6 +311,21 @@ if unlimited:
                       + "、".join(name(*k) for k in unlimited)
                       + "——它们不会被自己的上限杀，但会去争节点的那一份")
 
+# 窗口内重启过、此刻可能已经不在了的容器。判据 2 只看得见活着的 Pod：Pod 一删，
+# last_terminated_reason 那条序列就没了，一次 OOM 在半小时后读出来是全绿。重启计数
+# 是计数器，Pod 删了它的样本仍留在窗口里，所以它是「换掉过几代」唯一留下的痕迹。
+# 只列不判红：它分不开被杀、探针失败与节点重启。
+restarts_note = ''
+if restarts:
+    rows = sorted(restarts.items(), key=lambda kv: (-kv[1], kv[0]))
+    shown = "、".join(f"{name(*k)} {int(v) if v >= 1 else '<1'}"
+                     for k, v in rows[:5])
+    more = f" 等 {len(rows)} 个" if len(rows) > 5 else ""
+    restarts_note = (f"\n  窗口 {window} 内重启过的容器 {len(rows)} 个"
+                     f"（最多 {int(rows[0][1])} 次）：{shown}{more}"
+                     "——重启计数是「那一代已经被换掉」的唯一痕迹；"
+                     "成因（被杀／探针失败／节点重启）只跟着还活着的 Pod 存在，所以只列不判红")
+
 if problems:
     record('broken', max_ratio if max_ratio is not None else '-',
            str(ratio_hits), str(oom_hits), str(judged))
@@ -304,13 +333,13 @@ if problems:
     for p in problems:
         print(f"  {p}")
     print(f"  窗口 {window}、红线 {ratio_limit:.2f}；判过 {judged} 个带上限的容器"
-          f"{unlimited_note}")
+          f"{unlimited_note}{restarts_note}")
     print(f"  最高三笔：{'；'.join(head)}")
     sys.exit(1)
 
 record('ok', max_ratio if max_ratio is not None else '-', '0', '0', str(judged))
 print(f"CONTAINER-HEADROOM 绿：判过 {judged} 个带上限的容器，窗口 {window}、红线 {ratio_limit:.2f}"
-      f"{unlimited_note}")
+      f"{unlimited_note}{restarts_note}")
 print(f"  最高三笔：{'；'.join(head)}")
 print("  读法：峰值 RSS 问的是「这段时间里它最多要过多少」，不是此刻；"
       "与上限之间留的是被杀掉的那一瞬间抓不到的那一段。")

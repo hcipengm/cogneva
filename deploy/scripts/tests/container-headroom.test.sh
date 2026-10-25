@@ -22,7 +22,9 @@
 #  15. 没有 kube_pod_info -> 2；
 #  16. init 容器的上限在另一族：有上限的 init 容器要被判，不能被读成「无上限」；
 #  17. 真没有上限的 init 容器仍列出来，不判红；
-#  18. 看得到 init 容器、看不到它们的上限族 -> 2（与第 9 条同一条道理）。
+#  18. 看得到 init 容器、看不到它们的上限族 -> 2（与第 9 条同一条道理）；
+#  19. 窗口内重启过的容器要点名（哪怕那一代已经被删掉），但不判红；
+#  20. 没有重启样本 -> 判词里没有那一行（缺席不印成 0）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,7 +66,8 @@ for needle, key in (("max_over_time", "rss"),
                     ("kube_pod_container_resource_limits", "limit"),
                     ("kube_pod_info", "pods"),
                     ("last_terminated_reason", "oom_reason"),
-                    ("last_terminated_timestamp", "oom_age")):
+                    ("last_terminated_timestamp", "oom_age"),
+                    ("restarts_total", "restarts")):
     if needle in q:
         print(json.dumps({"status": "success",
                           "data": {"resultType": "vector", "result": table.get(key, [])}}))
@@ -102,6 +105,8 @@ state = {
              series("kube_pod_info", "redis-0", "", 1)],
     "oom_reason": [],
     "oom_age": [],
+    # 窗口内重启计数：判词里那一行「这一代已经被换掉」的痕迹。
+    "restarts": [],
     # init 容器的上限是另一族；默认没有 init 容器时两族都为空。
     "init_limit": [],
     "init_info": [],
@@ -255,4 +260,16 @@ state["init_info"] = [series("kube_pod_init_container_info", "sandbox-abc", "see
 out="$(status_of "${work}/init_family_absent")" && fail "18 上限族缺席应退出 2"
 case "${out}" in *"kube_pod_init_container_resource_limits"*) ;; *) fail "18 判词没有点名缺席的指标族：${out}" ;; esac
 
-echo "container-headroom: 18 组用例通过"
+# 19. 窗口内重启过、且那一代已被删掉（pods 里没有它）：判据 2 看不见它，重启计数还看得见
+make_scenario restarted 'state["restarts"] = [series("kube_pod_container_status_restarts_total",
+        "cogneva-old", "cogneva", 3)]'
+out="$(status_of "${work}/restarted")" || fail "19 重启过不是红：${out}"
+case "${out}" in *"重启过的容器 1 个"*"cogneva-old/cogneva 3"*) ;;
+    *) fail "19 判词没有点名窗口内重启过的容器：${out}" ;; esac
+case "${out}" in *"只列不判红"*) ;; *) fail "19 判词没说清这一行不判红：${out}" ;; esac
+
+# 20. 没有重启样本：判词里不出现那一行
+out="$(status_of "${work}/healthy")" || fail "20 健康场景应退出 0：${out}"
+case "${out}" in *"重启过的容器"*) fail "20 没有样本却印出了重启那一行：${out}" ;; esac
+
+echo "container-headroom: 20 组用例通过"
