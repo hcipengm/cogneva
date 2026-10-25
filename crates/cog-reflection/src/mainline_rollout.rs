@@ -1105,11 +1105,18 @@ pub(crate) fn pod_template_limits(doc: &serde_yaml::Value) -> Option<BTreeMap<St
 /// would pass an enforced ceiling, if any, named with the numbers that decided
 /// it.
 ///
-/// The check is one pod's worth of difference: a deployment is rolled a pod at a
-/// time, so the highest the counted usage reaches is the current usage plus the
-/// new pod's limits minus the old pod's (`used - old + new`), and that is what
-/// has to stay at or under `hard`. A resource this rollout does not raise never
-/// trips it.
+/// How much the new pod is charged depends on whether the old one is still
+/// there when it is admitted, and that is what `surges` says:
+///
+/// - `false` — the replacement is admitted only after the old pod is gone, so
+///   the highest counted usage is `used - old + new`. This is the shape of
+///   `maxSurge: 0`, and only a resource the rollout *raises* can trip it.
+/// - `true` — the new pod is admitted beside the old one (`maxSurge ≥ 1`), so
+///   the peak is `used + new`, and even an unchanged pod can pass the ceiling
+///   because the pair is counted twice. Reading the delta here answers a
+///   question nobody asked: it reports headroom for a pod that will never be
+///   admitted alone, and the rollout stalls on a refusal whose cause is the
+///   surge it was configured with.
 ///
 /// `None` is returned both for "fits" and for "one of the three numbers could
 /// not be read": an unreadable figure is not a figure that fits, but it is also
@@ -1120,12 +1127,18 @@ pub(crate) fn admission_shortfall(
     usage: &crate::governance_drift::QuotaUsage,
     old_limits: &BTreeMap<String, f64>,
     new_limits: &BTreeMap<String, f64>,
+    surges: bool,
 ) -> Option<String> {
     let mut resources: Vec<&String> = new_limits.keys().collect();
     resources.sort();
     for resource in resources {
-        let increase = new_limits[resource] - old_limits.get(resource).copied().unwrap_or(0.0);
-        if increase <= 0.0 {
+        let old = old_limits.get(resource).copied().unwrap_or(0.0);
+        let charged = if surges {
+            new_limits[resource]
+        } else {
+            new_limits[resource] - old
+        };
+        if charged <= 0.0 {
             continue;
         }
         let Some(hard_text) = usage.hard.get(resource) else {
@@ -1140,14 +1153,61 @@ pub(crate) fn admission_shortfall(
         ) else {
             continue;
         };
-        if used + increase > hard {
-            return Some(format!(
-                "{object} {resource}: the new pod raises it by {increase}, and {used_text} used \
-                 + that passes the enforced {hard_text}"
-            ));
+        if used + charged > hard {
+            return Some(if surges {
+                format!(
+                    "{object} {resource}: this rollout surges, so the new pod is admitted beside \
+                     the old one and charged {charged} on top of {used_text} used, which passes \
+                     the enforced {hard_text}"
+                )
+            } else {
+                format!(
+                    "{object} {resource}: the new pod raises it by {charged}, and {used_text} used \
+                     + that passes the enforced {hard_text}"
+                )
+            });
         }
     }
     None
+}
+
+/// Whether a live deployment admits its replacement beside the old pod, i.e.
+/// `maxSurge` resolves to more than zero. A `RollingUpdate` that does not state
+/// one surges by a quarter of the replicas (rounded up), which is what the
+/// controller does, so an unstated `maxSurge` reads as a surge rather than as
+/// none.
+pub(crate) fn deployment_surges(live: &serde_json::Value) -> bool {
+    let strategy = live.get("spec").and_then(|s| s.get("strategy"));
+    let kind = strategy
+        .and_then(|s| s.get("type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("RollingUpdate");
+    if kind != "RollingUpdate" {
+        return false;
+    }
+    let replicas = live
+        .get("spec")
+        .and_then(|s| s.get("replicas"))
+        .and_then(|r| r.as_u64())
+        .unwrap_or(1);
+    let raw = strategy
+        .and_then(|s| s.get("rollingUpdate"))
+        .and_then(|r| r.get("maxSurge"));
+    let extra = match raw {
+        Some(v) => match v.as_u64() {
+            Some(n) => n as i64,
+            None => match v.as_str().and_then(|t| t.trim().strip_suffix('%')) {
+                Some(pct) => match pct.trim().parse::<f64>() {
+                    Ok(p) => (p * replicas as f64 / 100.0).ceil() as i64,
+                    Err(_) => return true,
+                },
+                None => return true,
+            },
+        },
+        // Unstated: the controller's own default is 25% of the replicas.
+        None => ((replicas as f64) * 0.25).ceil() as i64,
+    };
+    extra > 0
 }
 
 /// 支撑清单里可能被 apply 动到的工作负载（后端与集群内 registry）。apply 只改
@@ -1714,6 +1774,7 @@ impl RolloutExecutor {
             .await
             .ok()?;
         let live_json: serde_json::Value = serde_json::from_str(&live_text).ok()?;
+        let surges = deployment_surges(&live_json);
         let live_doc = serde_yaml::to_value(&live_json).ok()?;
         let old_limits = pod_template_limits(&live_doc)?;
 
@@ -1723,7 +1784,9 @@ impl RolloutExecutor {
             .ok()?;
         let quotas = crate::governance_drift::live_quota_usage(&quota_text).ok()?;
         for (object, usage) in &quotas {
-            if let Some(reason) = admission_shortfall(object, usage, &old_limits, &new_limits) {
+            if let Some(reason) =
+                admission_shortfall(object, usage, &old_limits, &new_limits, surges)
+            {
                 return Some(reason);
             }
         }

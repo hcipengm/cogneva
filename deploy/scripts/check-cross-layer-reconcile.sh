@@ -306,7 +306,72 @@ for res, total in (('cpu', sum_cpu), ('memory', sum_mem)):
         print(f"  判据1 {key}: used {show(res, u)} ≤ allocatable {show(res, total)}  ✓"
               f"（配额 {show(res, h)}，{'比机器大' if h > total else '在机器之内'}）")
 
-# ---- 判据 3：准入余量 ≥ 部署器下一次滚动 Job ----
+# ---- 判据 3 的第二个加数：滚动重叠 ----
+# 一个 `maxSurge ≥ 1` 的 Deployment 在滚动时会多一个副本进准入：新 Pod 被记账的
+# 那一刻旧 Pod 还没删，两者同时占着配额的同一维。不把这笔算进来，「余量装得下滚动
+# Job」只问了一半——真滚动时撞的是配额，被拒的是**新** Pod，旧 Pod 继续服役，
+# 于是读起来是「这一版永远滚不上去」，而不是「配额不够」。取各工作负载里的最大值
+# 而不是求和：部署器一次只滚一个，求和会把并发当常态，把余量报得比真实的小。
+surge_overlap = {}
+surge_actor = {}
+try:
+    import glob
+    import yaml
+except ImportError:
+    yaml = None
+if yaml is None:
+    unreadable.append("没有 PyYAML：判据 3 读不出滚动重叠")
+else:
+    try:
+        for path in sorted(glob.glob(os.path.join(declared_dir, '*.yaml'))):
+            with open(path, encoding='utf-8') as f:
+                for d in yaml.safe_load_all(f):
+                    if not d or d.get('kind') != 'Deployment':
+                        continue
+                    spec = d.get('spec') or {}
+                    strategy = spec.get('strategy') or {}
+                    if strategy.get('type', 'RollingUpdate') != 'RollingUpdate':
+                        continue
+                    repl = spec.get('replicas', 1)
+                    repl = 1 if not isinstance(repl, int) else repl
+                    raw = (strategy.get('rollingUpdate') or {}).get('maxSurge', '25%')
+                    if isinstance(raw, int):
+                        extra = raw
+                    elif isinstance(raw, str) and raw.endswith('%'):
+                        try:
+                            pct = float(raw[:-1])
+                        except ValueError:
+                            extra = 0
+                        else:
+                            # 与 kube-controller-manager 同一个取整方向：向上。
+                            extra = int(-(-(pct * repl) // 100))
+                    else:
+                        extra = 0
+                    if extra <= 0:
+                        continue
+                    pod = (spec.get('template') or {}).get('spec') or {}
+                    for res in ('cpu', 'memory'):
+                        per = 0.0
+                        for c in pod.get('containers') or []:
+                            lim = ((c.get('resources') or {}).get('limits') or {}).get(res)
+                            if lim is not None:
+                                per += qty(lim)
+                        init = [
+                            qty(lim)
+                            for c in pod.get('initContainers') or []
+                            for lim in [((c.get('resources') or {}).get('limits') or {}).get(res)]
+                            if lim is not None
+                        ]
+                        if init:
+                            per += max(init)
+                        add = extra * per
+                        if add > surge_overlap.get(res, 0.0):
+                            surge_overlap[res] = add
+                            surge_actor[res] = f"{d['metadata']['name']}(+{extra})"
+    except (OSError, ValueError) as e:
+        unreadable.append(f"读不出树内声明里的滚动重叠（{declared_dir}）：{e}")
+
+# ---- 判据 3：准入余量 ≥ 部署器下一次滚动 Job ＋ 滚动重叠 ----
 # used 记的是所有非终态 Pod（含运行时按需建的那些），所以这个差问的是「下一次要建
 # 的 Pod 进不进得来」；渲染期门禁问的是「声明和装不装得进配额」，两个问题的答案
 # 可以相反，而只有前者决定闭环能不能继续落地。
@@ -335,14 +400,19 @@ else:
             unreadable.append(f"判据 3 的数量解析不了：{e}")
             continue
         rollout_job[label] = job
-        if h - u < job:
+        surge = surge_overlap.get(res, 0.0)
+        surge_who = surge_actor.get(res, '')
+        surge_note = f" + 滚动重叠 {show(res, surge)}（{surge_who}）" if surge else ''
+        if h - u < job + surge:
             problems.append(
-                f"判据3 {label}：used {show(res, u)} + 部署器滚动 Job {show(res, job)} "
-                f"> 配额 {show(res, h)}——下一次滚动 Job 在准入就被拒，部署器每轮空转；"
-                f"used 含渲染期清单之外的运行期自建 Pod，所以只查声明和的门禁看不见它")
+                f"判据3 {label}：used {show(res, u)} + 部署器滚动 Job {show(res, job)}"
+                f"{surge_note} > 配额 {show(res, h)}——下一次滚动在准入就被拒，"
+                f"部署器每轮空转；used 含渲染期清单之外的运行期自建 Pod，"
+                f"滚动重叠按 maxSurge 声明推，两者都是只查声明和的门禁看不见的")
         else:
-            print(f"  判据3 {label}: used {show(res, u)} + 滚动 Job {show(res, job)} "
-                  f"≤ 配额 {show(res, h)}  ✓（准入余量 {show(res, h - u)}）")
+            print(f"  判据3 {label}: used {show(res, u)} + 滚动 Job {show(res, job)}"
+                  f"{surge_note} ≤ 配额 {show(res, h)}  ✓"
+                  f"（装下这两笔之后的余量 {show(res, h - u - job - surge)}）")
 
 # 有 anon 或 file 样本、但 node-exporter 没报这个节点 MemTotal 的：判据 2 的分母不在，
 # 这个节点会被下面的循环整个跳过 —— 跳过与成立在读出来的那一行上长得一样，所以在这里点名。

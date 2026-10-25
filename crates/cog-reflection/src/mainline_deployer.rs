@@ -9561,8 +9561,8 @@ mod tests {
     use crate::mainline_rollout::{
         admission_rejection, admission_shortfall, bundle_declared_containers, changed_configmaps,
         changed_workloads, classify_before_any_change, config_change_needs_restart,
-        config_consumers, defined_objects, environment_class, image_pull_blocked,
-        is_admission_denied, is_image_source_unavailable, is_placement_blocked,
+        config_consumers, defined_objects, deployment_surges, environment_class,
+        image_pull_blocked, is_admission_denied, is_image_source_unavailable, is_placement_blocked,
         locate_before_any_change, normalize_placement_shape, parse_rollout_args, pod_samples,
         pod_selector, pod_template_limits, pod_waiting_states, readiness_overdue,
         replicaset_failures, rollout_converged, rollout_pods_fatal, rollout_pods_ready,
@@ -22899,19 +22899,77 @@ exit 0
         let old = BTreeMap::from([("limits.cpu".to_string(), 4.0)]);
         // 4 -> 4.5 核：18.5 + 0.5 = 19 <= 23，放行。
         let fits = BTreeMap::from([("limits.cpu".to_string(), 4.5)]);
-        assert!(admission_shortfall("resourcequota/q", &usage, &old, &fits).is_none());
+        assert!(admission_shortfall("resourcequota/q", &usage, &old, &fits, false).is_none());
         // 4 -> 6 核：18.5 + 2 = 20.5 <= 23，仍放行。
         let raised = BTreeMap::from([("limits.cpu".to_string(), 6.0)]);
-        assert!(admission_shortfall("resourcequota/q", &usage, &old, &raised).is_none());
+        assert!(admission_shortfall("resourcequota/q", &usage, &old, &raised, false).is_none());
         // 用量已经贴顶时再抬：18.5 -> 22.5，+2 到 24.5 > 23，扣住。
         let near = crate::governance_drift::QuotaUsage {
             hard: BTreeMap::from([("limits.cpu".to_string(), "23".to_string())]),
             used: BTreeMap::from([("limits.cpu".to_string(), "22.5".to_string())]),
             annotations: BTreeMap::new(),
         };
-        let hold = admission_shortfall("resourcequota/q", &near, &old, &raised);
+        let hold = admission_shortfall("resourcequota/q", &near, &old, &raised, false);
         assert!(hold.is_some(), "22.5 + 2 应当越过 23");
         assert!(hold.unwrap().contains("limits.cpu"));
+    }
+
+    /// 滚动的形状决定新 Pod 记多少账：不 surge 时旧 Pod 先走，只算增量；surge
+    /// 时新旧同时在场，新 Pod 全额记。
+    ///
+    /// 差一档就是一次永远滚不上去的发布：声明里开着 maxSurge，而预检按增量放行，
+    /// 真到准入那一刻配额拒绝的是**新** Pod，旧 Pod 继续服役——读数上像「这一版
+    /// 有问题」，实际是「两个 Pod 一起装不下」。
+    #[test]
+    fn a_surging_rollout_is_charged_for_the_whole_pod_not_the_difference() {
+        let usage = crate::governance_drift::QuotaUsage {
+            hard: BTreeMap::from([("limits.memory".to_string(), "57Gi".to_string())]),
+            used: BTreeMap::from([("limits.memory".to_string(), "54Gi".to_string())]),
+            annotations: BTreeMap::new(),
+        };
+        let pod = 4.0 * 1024.0 * 1024.0 * 1024.0;
+        let old = BTreeMap::from([("limits.memory".to_string(), pod)]);
+        // 镜像换了、资源一个字没动。
+        let same = BTreeMap::from([("limits.memory".to_string(), pod)]);
+        assert!(
+            admission_shortfall("resourcequota/q", &usage, &old, &same, false).is_none(),
+            "旧 Pod 先走：54Gi - 4Gi + 4Gi 仍是 54Gi，装得下"
+        );
+        let hold = admission_shortfall("resourcequota/q", &usage, &old, &same, true);
+        let hold = hold.expect("两个 4Gi 的 Pod 同时在 57Gi 的天花板下装不下");
+        assert!(
+            hold.contains("surges"),
+            "扣住的理由要说清是 surge 那笔账：{hold}"
+        );
+    }
+
+    /// surge 的判断来自集群上那份对象自己在说什么：显式的 `maxSurge: 0` 不是
+    /// surge，没写的 `RollingUpdate` 按控制器的 25% 算，`Recreate` 从不 surge。
+    #[test]
+    fn whether_a_deployment_surges_comes_from_its_own_strategy() {
+        let doc = |strategy: &str| -> serde_json::Value {
+            serde_json::from_str(&format!(
+                r#"{{"spec":{{"replicas":1,"strategy":{strategy}}}}}"#
+            ))
+            .unwrap()
+        };
+        assert!(!deployment_surges(&doc(
+            r#"{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}"#
+        )));
+        assert!(deployment_surges(&doc(
+            r#"{"type":"RollingUpdate","rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}"#
+        )));
+        assert!(
+            deployment_surges(&doc(r#"{"type":"RollingUpdate"}"#)),
+            "没写 maxSurge 的 RollingUpdate 按 25% 向上取整，就是 surge"
+        );
+        assert!(!deployment_surges(&doc(r#"{"type":"Recreate"}"#)));
+        assert!(deployment_surges(&doc(
+            r#"{"type":"RollingUpdate","rollingUpdate":{"maxSurge":"25%"}}"#
+        )));
+        assert!(!deployment_surges(&doc(
+            r#"{"type":"RollingUpdate","rollingUpdate":{"maxSurge":"0%"}}"#
+        )));
     }
 
     /// 没抬的资源、读不到的用量都不该扣住一次滚动。
@@ -22925,7 +22983,7 @@ exit 0
             used: BTreeMap::from([("limits.cpu".to_string(), "5".to_string())]),
             annotations: BTreeMap::new(),
         };
-        assert!(admission_shortfall("resourcequota/q", &low, &old, &unchanged).is_none());
+        assert!(admission_shortfall("resourcequota/q", &low, &old, &unchanged, false).is_none());
         // 用量读不出来：不判，放行。
         let unreadable = crate::governance_drift::QuotaUsage {
             hard: BTreeMap::from([("limits.cpu".to_string(), "23".to_string())]),
@@ -22933,7 +22991,9 @@ exit 0
             annotations: BTreeMap::new(),
         };
         let raised = BTreeMap::from([("limits.cpu".to_string(), 9.0)]);
-        assert!(admission_shortfall("resourcequota/q", &unreadable, &old, &raised).is_none());
+        assert!(
+            admission_shortfall("resourcequota/q", &unreadable, &old, &raised, false).is_none()
+        );
     }
 
     /// 进程起来时 main 已经部署过 ⇒ 它没组过包，声明侧必须自己从被跟踪 rev 的

@@ -8,14 +8,26 @@ metadata:
     app.kubernetes.io/component: gateway
 spec:
   replicas: {{ .Values.gateway.replicas }}
-  # No surge: every profile runs a single replica on a single node, so a surging
-  # pod has nowhere to be scheduled and the rollout times out. Terminating the
-  # old pod first frees its request, at the cost of a brief restart window.
+  # Surge by one, keep both ready during the handoff: the old pod serves until
+  # the new one has passed its probes, so a rollout has no HTTP gap.
+  #
+  # The old shape (maxSurge 0, maxUnavailable 1) took the only pod down before
+  # starting its replacement, and its reason — "a surging pod has nowhere to be
+  # scheduled" — was the 4C/7.5G host this ran on before 2026-09-24. The node is
+  # 24C/62GiB now and asks for 3.6 of 23.8 cores, so the request fits. Measured
+  # cost of the old shape on 2026-10-25: the replacement crash-looped twice on a
+  # cold vector store and the whole HTTP surface was gone for about five
+  # minutes — the old pod would have served throughout.
+  #
+  # The overlap is a rollout window, not a second replica on duty: the acting
+  # background loops (discovery, memory decay, reflection, backups, ledger
+  # close) take their role from an owner lease in the shared database, so the
+  # second process stands by rather than repeating their work.
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 0
-      maxUnavailable: 1
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: cogneva
