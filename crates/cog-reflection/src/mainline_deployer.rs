@@ -9600,28 +9600,57 @@ mod tests {
         assert_eq!(rev12("short"), "short");
     }
 
-    /// kubectl 自己的死线必须排在外层兜底之前，否则到点被杀的总是子进程，
-    /// 它写出来的原因一起丢掉。
+    /// kubectl 的调用不许带那个会毁掉它自己配置加载的旗标：外侧那层兜底可以等，
+    /// 但加旗标把集群配置弄丢，比一次说不清原因的超时更糟。
     #[test]
-    fn kubectl_gets_its_own_deadline_just_under_the_outer_backstop() {
-        assert_eq!(crate::mainline_rollout::kubectl_request_timeout(30), 27);
-        assert_eq!(crate::mainline_rollout::kubectl_request_timeout(60), 55);
-        assert_eq!(crate::mainline_rollout::kubectl_request_timeout(300), 295);
-        for budget in [1u64, 2, 3, 10, 60, 300, 3600] {
-            let child = crate::mainline_rollout::kubectl_request_timeout(budget);
-            assert!(child >= 1, "budget {budget} produced a zero deadline");
-            assert!(
-                child <= budget,
-                "budget {budget} -> child {child} outlives it"
-            );
-        }
+    fn no_kubectl_flag_is_added_that_would_break_its_config_loading() {
+        // 2026-10-25 现场：这个 k3s 编出来的 kubectl 只要带上 `--request-timeout`
+        // （`=` 形式与空格形式、放在动词前与后都一样）就不再读 in-cluster 配置，
+        // 直接去连 `http://localhost:8080`，而环境变量与投影令牌都在。两趟主线
+        // 滚动就是因此各烧掉三百秒并判成"集群不可达"。所以这条断言断的是**旗标
+        // 集合**：动词之外只许出现命名空间。
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let log = dir.join("kubectl.log");
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> '{log}'\necho 'deployment.apps/cogneva'\n",
+            log = log.display()
+        );
+        write_fake_bin(&dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            300,
+            900,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            executor
+                .run_kubectl(&["get", "deployment", "-o", "json"], 30)
+                .await
+                .unwrap();
+        });
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !argv.contains("--request-timeout"),
+            "this flag makes kubectl ignore the in-cluster config: {argv}"
+        );
+        assert!(
+            argv.trim_end().ends_with("get deployment -o json"),
+            "the verb and its arguments stay the tail of the argv: {argv}"
+        );
     }
 
     /// 2026-10-24 那次滚动失败留下的是一句 `timed out after 30s (attempts=9 over
     /// 310s)`，没有一个字来自 kubectl——九次都被外层定时器杀掉，事后判不出是
-    /// apiserver 卡住还是 Pod 自己的网络栈坏了。这条用例断的是：kubectl 自己到点
-    /// 退出时说的那句话（"dial tcp …: i/o timeout"）要一路活到终止判词里，
-    /// 并且仍然能被归成"集群连不上"这一类。
+    /// apiserver 卡住还是 Pod 自己的网络栈坏了。这条用例断的是：kubectl 自己退出
+    /// 时说的那句话（"dial tcp …: i/o timeout"）要一路活到终止判词里，并且仍然
+    /// 能被归成"集群连不上"这一类。
     #[tokio::test]
     async fn the_cause_kubectl_reports_itself_survives_into_the_verdict() {
         let tmp = tempfile::tempdir().unwrap();
@@ -9660,8 +9689,49 @@ exit 1
         );
         let argv = std::fs::read_to_string(&log).unwrap();
         assert!(
-            argv.contains("--request-timeout=27s"),
-            "kubectl must carry a deadline of its own, not only the outer kill: {argv}"
+            argv.trim_end().ends_with("get deployment cogneva -o json"),
+            "the verb and its arguments stay the tail of the argv: {argv}"
+        );
+    }
+
+    /// 被我们自己的定时器杀掉的那一支：kubectl 到点还没退出，但它**已经写下的**
+    /// 那句原因必须留下。这正是 2026-10-24 那次黑箱失败的对偶——那一版用管道收
+    /// 输出，进程一死管道就断，写了的字跟着丢。
+    #[tokio::test]
+    async fn what_kubectl_wrote_before_the_backstop_killed_it_survives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let script = r#"#!/bin/sh
+echo 'Unable to connect to the server: dial tcp 10.43.0.1:443: i/o timeout' >&2
+sleep 10
+exit 1
+"#;
+        write_fake_bin(&dir, "fake-kubectl", script);
+        let executor = RolloutExecutor::new(
+            dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            300,
+            900,
+        );
+        let started = std::time::Instant::now();
+        let err = executor
+            .run_kubectl(&["get", "deployment", "cogneva"], 1)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("i/o timeout"),
+            "the words written before the kill have to reach the verdict: {msg}"
+        );
+        assert!(
+            msg.contains("timed out after 1s"),
+            "the verdict still has to say who ended it: {msg}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(6),
+            "the backstop has to kill the child, not wait it out"
         );
     }
 

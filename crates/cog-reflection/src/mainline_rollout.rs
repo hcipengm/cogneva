@@ -407,14 +407,19 @@ fn is_new_revision_never_ran(msg: &str) -> bool {
 /// 与 [`CLUSTER_UNREACHABLE_MARKER`] 分成两条判据：那一条说的是**集群那边**此刻
 /// 不可达（apiserver 抖动、握手超时），按轮询节拍在预算内重试是真有可能等到的；
 /// 这一条说的是本进程拿不出任何凭据——kubectl 于是回落到自己的默认端点
-/// `http://localhost:8080`，每一次查询都在本机回环上被拒。重试换不来凭据：现场
-/// 一次 300 秒的预算里它跑了 59 次，把一次诊断挤成了一段时间，而判词写的是「集群
-/// 不可达」——读到它的人去看 apiserver，真相在 Pod 自己的凭据面上。
+/// `http://localhost:8080`，每一次查询都在本机回环上被拒。重试换不来凭据：一次
+/// 300 秒的预算里它会跑几十次，把一次诊断挤成一段时间，而判词写的是「集群不可达」
+/// ——读到它的人去看 apiserver，真相在 Pod 自己的凭据面上。
 ///
-/// 判据不靠 kubectl 的措辞：两种情况（没有配置 / 配置齐了而集群没通）在它的原文里
-/// 同形（都带 `connection refused`）。本进程在第一次查询之前自己把四处来源看一遍，
-/// 全无时就地判死；有则照常往下走，而一旦回落到 `localhost:8080`，那四处来源的
-/// 读数会附在失败的判词里——读的人不必再进一次 Pod 才知道该补哪一处。
+/// 判据不靠 kubectl 的措辞：配置根本没读进来、配置齐了而集群没通、配置指向的就是
+/// 本机回环，三种情形在它的原文里同形（都带 `connection refused`）。所以本进程在
+/// 第一次查询之前自己把四处来源看一遍，全无时就地判死；其余情形照常往下走，而一旦
+/// 回落到 `localhost:8080`，那四处来源的读数会附在失败的判词里。
+///
+/// 那份读数不是装饰。2026-10-25 两趟滚动各烧掉三百秒之后，判词里第一次写明「四处
+/// 来源都在、令牌也读得到」，嫌疑才从凭据面挪开，找到真正的原因是调用时多带的一个
+/// 旗标（见 `RolloutExecutor::run_kubectl` 的注释）。没有那行读数，同一个问题只能
+/// 靠再进一次 Pod 去猜，而那时 Pod 已经不在了。
 pub(crate) const CLUSTER_CONFIG_MISSING_MARKER: &str = "no cluster config in this process";
 
 pub(crate) fn is_cluster_config_missing(msg: &str) -> bool {
@@ -423,7 +428,8 @@ pub(crate) fn is_cluster_config_missing(msg: &str) -> bool {
 
 /// kubectl 一份配置都没读到时的默认端点。只用来决定要不要把配置读数附上判词，
 /// 不用来改类别：真有 kubeconfig 指向 `127.0.0.1:8080`（本地 preload 那一档）时
-/// 同一行也会这么写，而那是"端点没起"而不是"没有配置"。
+/// 同一行也会这么写，而那是"端点没起"而不是"没有配置"；命令行多带了东西让它不读
+/// 配置时更会这么写，而那时配置明明都在。
 ///
 /// 只认 `host:port` 不认带 scheme 的那一整串：kubectl 一次失败会写好几行，请求那
 /// 行带 `http://`，而最后那句总结（`The connection to the server localhost:8080 was
@@ -1762,24 +1768,43 @@ pub(crate) fn config_change_needs_restart(
     }
 }
 
-/// 交给 kubectl 自己的死线，比外层预算短一截。
+/// 一次 kubectl 调用的输出落点：临时目录下两个唯一名字。
 ///
-/// 外层定时器到点是**杀**进程：它已经写出来的东西（尤其 stderr 上那句原因）
-/// 随进程一起丢掉，留下的只有一句"timed out after Ns"。2026-10-24 那次滚动就是
-/// 这样败的——九次、三百多秒，一次也没留下 kubectl 说的字，事后翻集群日志也判
-/// 不出是 apiserver 卡住还是 Pod 自己的网络栈坏了，同一类失败下一次还会是黑箱。
+/// 名字里带进程 id、一个进程内自增号与纳秒时间戳：同一进程里 `probe` 与预热那几条
+/// 路径都可能并发起子进程，只按 pid 命名会让两次调用写同一份文件。
+fn kubectl_output_paths() -> (PathBuf, PathBuf) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let base = std::env::temp_dir().join(format!(
+        "cogneva-kubectl-{}-{seq}-{stamp}",
+        std::process::id()
+    ));
+    let out = base.with_extension("out");
+    let err = base.with_extension("err");
+    (out, err)
+}
+
+/// 子进程被杀之前写下的话，取最后一段。
 ///
-/// `--request-timeout` 让 kubectl 先到点、先退出、先说话：它自己的失败文本里有
-/// `dial tcp …: i/o timeout`、`TLS handshake timeout`、`Client.Timeout` 这类
-/// 形状，既够分类（`is_cluster_unreachable` 认的就是这些），也够事后判断。
-/// 外层超时退回纯兜底：只在 kubectl 连自己的死线都没守住（DNS 卡死、exec 插件
-/// 挂住）时才轮得到它。
-///
-/// 余量随预算缩放（十分之一，1–5 秒）：够 kubectl 把话写完，又不至于把一条本来
-/// 能在预算内返回的慢查询截断在它自己手里。
-pub(crate) fn kubectl_request_timeout(timeout_secs: u64) -> u64 {
-    let headroom = (timeout_secs / 10).clamp(1, 5);
-    timeout_secs.saturating_sub(headroom).max(1)
+/// 外层定时器到点是**杀**进程：输出经管道交回时，进程一死管道就断，已经写出来的
+/// 那句原因跟着丢，留下的只有一句"timed out after Ns"。2026-10-24 那次滚动就是
+/// 这样败的——九次、三百多秒，一次也没留下 kubectl 说的字，事后翻集群日志也判不出
+/// 是 apiserver 卡住还是 Pod 自己的网络栈坏了。所以输出落到文件而不是管道：文件在
+/// 进程死后仍然可读，判词于是能带上它自己的诊断。
+const STDERR_TAIL_CHARS: usize = 600;
+
+fn stderr_tail(text: &str) -> String {
+    let trimmed = text.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= STDERR_TAIL_CHARS {
+        return trimmed.to_string();
+    }
+    let tail: String = chars[chars.len() - STDERR_TAIL_CHARS..].iter().collect();
+    format!("…{tail}")
 }
 
 pub struct RolloutExecutor {
@@ -1841,40 +1866,77 @@ impl RolloutExecutor {
 
     pub(crate) async fn run_kubectl(&self, args: &[&str], timeout_secs: u64) -> SFResult<String> {
         let cmdline = format!("kubectl {}", args.join(" "));
-        let request_timeout = format!(
-            "--request-timeout={}s",
-            kubectl_request_timeout(timeout_secs)
-        );
-        // 全局旗标放在动词**前面**：kubectl 两种都收，而把动词与它的实参原样留在
-        // 尾部，任何按 argv 尾比对的夹具（以及真要在日志里读这行的人）看到的仍是
-        // 原来那条命令。
-        let mut full: Vec<&str> = vec!["-n", &self.ns, &request_timeout];
-        // kubectl 自己带的死线排在外层兜底之前：到点由它退出并说明原因（连不上
-        // apiserver、握手超时、某个请求慢），而不是被外层定时器杀掉。
+        // 动词与实参之外只加命名空间。**不加 `--request-timeout`**：实测这个
+        // k3s 编出来的 kubectl（宿主 `/usr/local/bin/k3s` 挂进来的那一份）一旦
+        // 带上这个旗标——`=` 形式或空格形式、放在动词前后都一样——就不再读
+        // in-cluster 配置，直接回落到 `http://localhost:8080`，而环境变量与投影
+        // 令牌都好好地在（见 [`CLUSTER_CONFIG_MISSING_MARKER`] 记的那一段）。
+        // 同一条命令去掉旗标就正常。于是"子进程自己带死线"这条路在这个二进制上
+        // 走不通，改用下面的输出落盘：外层定时器照样兜底，但子进程在死之前写下
+        // 的话不会再跟着它一起消失。
+        let mut full: Vec<&str> = vec!["-n", &self.ns];
         full.extend_from_slice(args);
-        let fut = tokio::process::Command::new(&self.kubectl)
-            .args(&full)
-            .kill_on_drop(true)
-            .output();
-        let output = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
-            .await
-            .map_err(|_| {
-                SFError::IO(format!(
-                    "{cmdline} timed out after {timeout_secs}s (backstop: kubectl was killed \
-                     before its own {request_timeout} deadline could report a cause)"
-                ))
-            })?
-            .map_err(|e| {
-                SFError::IO(format!(
+        let (out_path, err_path) = kubectl_output_paths();
+        let spawned = (|| -> std::io::Result<tokio::process::Child> {
+            let out = std::fs::File::create(&out_path)?;
+            let err = std::fs::File::create(&err_path)?;
+            tokio::process::Command::new(&self.kubectl)
+                .args(&full)
+                .stdout(out)
+                .stderr(err)
+                .kill_on_drop(true)
+                .spawn()
+        })();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = std::fs::remove_file(&out_path);
+                let _ = std::fs::remove_file(&err_path);
+                return Err(SFError::IO(format!(
                     "{OBSERVATION_TOOL_MARKER}: cannot run {}: {e}",
                     self.kubectl
-                ))
-            })?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // 回落到 localhost:8080 说明这个进程一份配置都没读到（或那份配置指的就是
-            // 本机回环）。把四处来源的读数附在后面：判词要能自己回答"该补哪一处"，
-            // 否则读的人还得进一次 Pod，而 Pod 那时已经没了。
+                )));
+            }
+        };
+        let waited = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
+        let timed_out = waited.is_err();
+        if timed_out {
+            // 先杀再读：让它停手，否则读到的是一份还在长的文件。
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
+        let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&out_path);
+        let _ = std::fs::remove_file(&err_path);
+        let status = match waited {
+            Ok(Ok(status)) => status,
+            Ok(Err(e)) => {
+                return Err(SFError::IO(format!(
+                    "{OBSERVATION_TOOL_MARKER}: cannot run {}: {e}",
+                    self.kubectl
+                )))
+            }
+            // 到点被杀：把子进程已经写下的话带上。这正是这条路径存在的理由——
+            // 一次九次尝试、三百多秒的停摆如果只留一句「超时」，事后没人说得清
+            // 是 apiserver 卡住、Pod 的网络栈坏了，还是配置根本没读进来。
+            Err(_) => {
+                return Err(SFError::IO(format!(
+                    "{cmdline} timed out after {timeout_secs}s (kubectl was killed{}): {}",
+                    if stderr.trim().is_empty() {
+                        " before it wrote anything"
+                    } else {
+                        ""
+                    },
+                    stderr_tail(&stderr),
+                )))
+            }
+        };
+        if !status.success() {
+            // 回落到 localhost:8080 说明 kubectl 这回一份配置都没读到：可能是这个
+            // 进程手里真的没有、可能是那份配置指的就是本机回环、也可能是命令行上多了
+            // 个让它不读配置的东西。把四处来源的读数附在后面，判词才有机会自己把这三
+            // 种分开——否则读的人还得进一次 Pod，而 Pod 那时已经没了。
             let note = if stderr.contains(LOCALHOST_FALLBACK_ADDRESS) {
                 format!(" ({})", ClusterConfigSources::observe().describe())
             } else {
@@ -1882,7 +1944,7 @@ impl RolloutExecutor {
             };
             return Err(SFError::IO(format!("{cmdline} failed: {stderr}{note}")));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(stdout.trim().to_string())
     }
 
     /// 落一份清单文件（支撑集、目标部署清单）——走**服务端** apply，与发布那一步
