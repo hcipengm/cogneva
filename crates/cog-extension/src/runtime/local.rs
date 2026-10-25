@@ -53,7 +53,7 @@ fn signal_name(sig: i32) -> &'static str {
 /// places that need different responses -- the cgroup memory limit, an outside
 /// kill, a crash -- and only the counter in the command's cgroup can say which,
 /// so the memory cause is named only when that counter rose across the command.
-fn signal_death_note(sig: i32, facts: &super::cgroup::MemoryFacts, oom: bool) -> String {
+fn signal_death_note(sig: i32, facts: &super::cgroup::CgroupFacts, oom: bool) -> String {
     let named = signal_name(sig);
     let signal = if named.is_empty() {
         format!("signal {sig}")
@@ -179,7 +179,7 @@ pub(crate) fn spawn_command(
                 (Some(c), _) => c,
                 (None, Some(sig)) => {
                     let facts = super::cgroup::read();
-                    let oom = super::cgroup::MemoryFacts::oom_kill_between(&memory_before, &facts);
+                    let oom = super::cgroup::CgroupFacts::oom_kill_between(&memory_before, &facts);
                     if oom {
                         super::cgroup::record_oom_kill(facts.limit_bytes, facts.peak_bytes);
                     }
@@ -363,10 +363,11 @@ mod tests {
     /// leaves the reader unable to tell a too-small limit from a bad change.
     #[test]
     fn a_memory_limit_kill_names_the_ceiling_and_nothing_else_claims_one() {
-        let facts = super::super::cgroup::MemoryFacts {
+        let facts = super::super::cgroup::CgroupFacts {
             limit_bytes: Some(1073741824),
             peak_bytes: Some(1073741824),
             oom_kills: Some(7),
+            ..Default::default()
         };
         let oom = signal_death_note(9, &facts, true);
         assert!(oom.contains("signal 9 (SIGKILL)"), "{oom}");
@@ -383,7 +384,7 @@ mod tests {
         // just without a number to quote.
         let unmeasured = signal_death_note(
             9,
-            &super::super::cgroup::MemoryFacts {
+            &super::super::cgroup::CgroupFacts {
                 oom_kills: Some(1),
                 ..Default::default()
             },

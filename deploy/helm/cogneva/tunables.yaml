@@ -1158,16 +1158,20 @@ rows:
     source: override
     why: >-
       Sized to the resident draw; this is a bursty workload, and a higher request
-      would only pin it to the node. The working-set reading exists and is not
-      fed back.
+      would only pin it to the node. The peak is published as
+      sandbox_memory_peak_bytes, and nothing turns that reading into the request:
+      a request set from a peak would pin a bursty workload to the node for the
+      rest of its life.
 
   - key: sandboxExecutor.resources.limits.cpu
     source: override
     why: >-
       Deliberately untouched when the memory limit moved: CFS throttling in the
       window was 918 of 5012 periods and was not the cause of the OOM kills. The
-      throttle count is the measurement a derived limit would read; it is not
-      read back.
+      container now publishes that measurement itself, as
+      sandbox_cpu_throttle_events and sandbox_cpu_throttled_seconds from its own
+      cpu.stat; a derived limit would be set from those, and nothing does, so
+      this stays a stated policy ceiling with a reading that can falsify it.
 
   - key: sandboxExecutor.resources.limits.memory
     source: override
@@ -1175,7 +1179,9 @@ rows:
       3 GiB, after one build was measured at 1.685 GiB of unreclaimable anon and
       2 GiB left almost no growth room; the falsifier is the outcome reading
       sandbox_oom_kills_total staying at zero, which a human judges against a
-      window. That is a decision procedure, not a loop that sets the value.
+      window. sandbox_memory_peak_bytes is published beside it, so a peak that
+      walks up to the limit is visible before the kills start. That is a
+      decision procedure, not a loop that sets the value.
 
   - key: sandboxExecutor.storage
     source: override
