@@ -119,4 +119,21 @@ fi
 grep -q "duplicate key 'app.kubernetes.io/name'" <<<"${out}" \
   || fail "红了，但没报出重复的那个键：${out}"
 
-echo "OK: render freshness 门禁在两种漂移上都红，在干净树上绿；模板写重键时渲染拒绝写出"
+# 用例 5：容器端口名超过 15 字符 -> 渲染直接拒绝写产物。
+#
+# 名字的合法性是 API server 的判据：`postgres-metrics` 有 16 个字符，yaml 层面
+# 完全合法，CI 也全绿，直到部署器把这批清单 apply 上去时整份 StatefulSet 被拒
+# ——落地通道为此停了 12 小时。所以写出点把 API server 会拒的形状先判一遍。
+d="$(case_dir long-port-name)"
+edit_once "${d}/deploy/helm/cogneva/templates/postgres.yaml" \
+  '            - name: pg-metrics
+' \
+  '            - name: postgres-metrics
+'
+if out="$(bash "${d}/${gate_rel}" 2>&1)"; then
+  fail "端口名超过 15 字符，渲染仍然写出了产物（apply 会整份拒掉）：${out}"
+fi
+grep -q "超过 15 的上限" <<<"${out}" \
+  || fail "红了，但没报出超长的是哪个端口：${out}"
+
+echo "OK: render freshness 门禁在两种漂移上都红，在干净树上绿；模板写重键、端口名超长时渲染拒绝写出"

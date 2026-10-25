@@ -139,6 +139,31 @@ for doc in docs:
         continue
     kind = parsed["kind"]
     name = parsed["metadata"]["name"]
+    # 名字是 API server 的判据，不是渲染的：容器名要走 DNS-1123（不许下划线、
+    # 不许大写），端口名还多一条 15 字符的上限。两边都不在 yaml 层面报错，整份
+    # 对象在 apply 时被拒——落地通道为这一条停了 12 小时，而 CI 是绿的。
+    label = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+    for section in ("containers", "initContainers"):
+        for c in parsed.get("spec", {}).get("template", {}).get("spec", {}).get(section, []) or []:
+            cname = c.get("name", "")
+            if not label.match(cname):
+                sys.exit(
+                    f"{profile}: {kind}/{name} 的容器名 {cname!r} 不是 DNS-1123 标签"
+                    f"（小写字母数字与 `-`，首尾不能是 `-`）——apply 会拒整份对象"
+                )
+            for p in c.get("ports", []) or []:
+                pname = p.get("name")
+                if pname is None:
+                    continue
+                if not label.match(pname):
+                    sys.exit(
+                        f"{profile}: {kind}/{name} 容器 {cname} 的端口名 {pname!r} 不是 DNS-1123 标签"
+                    )
+                if len(pname) > 15:
+                    sys.exit(
+                        f"{profile}: {kind}/{name} 容器 {cname} 的端口名 {pname!r} 有 {len(pname)} 个字符，"
+                        f"超过 15 的上限——apply 会拒整份对象"
+                    )
     prefix = order.get(kind, "90")
     fname = f"{prefix}-{kind.lower()}-{name}.yaml"
     with open(os.path.join(out_dir, fname), "w") as f:

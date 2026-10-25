@@ -82,11 +82,11 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-        - name: postgres_exporter
+        - name: postgres-exporter
           image: prometheuscommunity/postgres-exporter:v0.15.0
           imagePullPolicy: IfNotPresent
           ports:
-            - name: postgres-metrics
+            - name: pg-metrics
               containerPort: 9187
               protocol: TCP
           env:
@@ -115,14 +115,14 @@ spec:
           readinessProbe:
             httpGet:
               path: /metrics
-              port: postgres-metrics
+              port: pg-metrics
             periodSeconds: 10
             timeoutSeconds: 10
             failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /metrics
-              port: postgres-metrics
+              port: pg-metrics
             periodSeconds: 20
             timeoutSeconds: 10
             failureThreshold: 6

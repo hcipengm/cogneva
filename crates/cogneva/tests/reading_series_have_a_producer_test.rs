@@ -30,7 +30,7 @@ fn postgres_exporter_args() -> Vec<String> {
     for line in text.lines() {
         let trimmed = line.trim();
         if container_indent.is_none() {
-            if trimmed == "- name: postgres_exporter" {
+            if trimmed == "- name: postgres-exporter" {
                 container_indent = Some(indent_of(line));
             }
             continue;

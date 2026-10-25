@@ -71,7 +71,7 @@ spec:
         # 只抓这几族判词用得上的读数：连接数对上限、最老事务年龄、锁等待数、
         # 事务提交/回滚、库与盘的大小。抓默认全量会在每次抓取时多跑几十条只有
         # 偶尔才有用的查询，把「观测」变成数据库自己的负载。
-        - name: postgres_exporter
+        - name: postgres-exporter
           image: {{ .Values.backends.postgres.exporterImage }}
           imagePullPolicy: IfNotPresent
           env:
@@ -100,7 +100,7 @@ spec:
           args:
             - "--collector.stat_activity"
           ports:
-            - name: postgres-metrics
+            - name: pg-metrics
               containerPort: 9187
               protocol: TCP
           # 探针的数值只从 .Values.healthProbes 来：写死在这里，改配置面与改
@@ -108,12 +108,12 @@ spec:
           readinessProbe:
             httpGet:
               path: /metrics
-              port: postgres-metrics
+              port: pg-metrics
 {{ toYaml .Values.healthProbes.readiness | indent 12 }}
           livenessProbe:
             httpGet:
               path: /metrics
-              port: postgres-metrics
+              port: pg-metrics
 {{ toYaml .Values.healthProbes.liveness | indent 12 }}
           resources:
 {{ toYaml .Values.backends.postgres.exporterResources | indent 12 }}

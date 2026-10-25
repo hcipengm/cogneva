@@ -25,7 +25,7 @@ spec:
       app.kubernetes.io/name: postgres
       app.kubernetes.io/component: database
   podMetricsEndpoints:
-    - port: postgres-metrics
+    - port: pg-metrics
       path: /metrics
       interval: 30s
       scrapeTimeout: 10s
