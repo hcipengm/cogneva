@@ -1848,9 +1848,12 @@ mod consumer_ack_tests {
 
     /// 只留计数器的 metrics 后端：这里要看的读数是「谁被上限拦了」，gauge 与
     /// 查询都不参与。
+    /// 一次计数写入：指标名、值、标签集。
+    type Write = (String, f64, HashMap<String, String>);
+
     #[derive(Default)]
     struct Counters {
-        writes: std::sync::Mutex<Vec<(String, f64, HashMap<String, String>)>>,
+        writes: std::sync::Mutex<Vec<Write>>,
     }
 
     #[async_trait::async_trait]

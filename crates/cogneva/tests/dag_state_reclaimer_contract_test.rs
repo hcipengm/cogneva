@@ -70,8 +70,11 @@ const REVISITED: &[Revisited] = &[
         // The publisher's read is the reviser, and it is the same read that
         // carries the owed counts the admission bound compares against — one
         // pass of the graph, so a task cannot be judged ready against one
-        // snapshot and admitted against another.
-        reviser: "ready_tasks_and_in_flight",
+        // snapshot and admitted against another. That read is `ready_work`:
+        // `ready_tasks_and_in_flight` is the same scan in the shape its callers
+        // ask for it, so naming the wrapper would pin this row to a delegation
+        // rather than to the scan that revisits `Pending`.
+        reviser: "ready_work",
         defined_in: "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",
         called_from: "crates/cog-orchestrator/src/dag_executor/mod.rs",
         reason: "waits for a worker to be handed the task; the publisher's tick scans Pending \
