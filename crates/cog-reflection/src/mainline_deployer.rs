@@ -20268,6 +20268,74 @@ exit 0
         }
     }
 
+    /// 一版声明低于集群里正举着的天花板时，落地的那份取高的那一维。
+    ///
+    /// 版外的 Pod 抬高了额度还没放回去的窗口里，按低的那版 apply 会被
+    /// apiserver 以「hard 低于当前用量」拒掉——支撑包在一个镜像都没动时失败，
+    /// 而那次失败会被读成「这一版不好」。抬高的那一维留着，其余维度照常收敛。
+    #[test]
+    fn a_declared_ceiling_below_the_one_in_force_is_not_applied_lower() {
+        use crate::governance_drift::QuotaUsage;
+        let text = "kind: ResourceQuota\nmetadata:\n  name: cogneva-quota\nspec:\n  hard:\n    limits.cpu: \"34\"\n    limits.memory: 58Gi\n    pods: \"34\"\n";
+        let pairs = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<String, String>>()
+        };
+        let mut live = BTreeMap::new();
+        live.insert(
+            "resourcequota/cogneva-quota".to_string(),
+            QuotaUsage {
+                hard: pairs(&[
+                    ("limits.cpu", "38000m"),
+                    ("limits.memory", "58Gi"),
+                    ("pods", "34"),
+                ]),
+                used: pairs(&[("limits.cpu", "35500m"), ("pods", "33")]),
+                annotations: BTreeMap::new(),
+            },
+        );
+        let out = crate::mainline_rollout::keep_raised_ceilings(text, "support.yaml", &live)
+            .expect("the quota parses");
+        assert!(
+            out.contains("38000m"),
+            "the raised dimension is kept: {out}"
+        );
+        assert!(
+            !out.contains("limits.cpu: 34"),
+            "the declared number must not overwrite the raised one: {out}"
+        );
+
+        // 集群那版更低（或一样）时不动：收敛仍然往树里那个数走。
+        let mut low = BTreeMap::new();
+        low.insert(
+            "resourcequota/cogneva-quota".to_string(),
+            QuotaUsage {
+                hard: pairs(&[("limits.cpu", "20"), ("limits.memory", "40Gi")]),
+                used: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+        );
+        let out = crate::mainline_rollout::keep_raised_ceilings(text, "support.yaml", &low)
+            .expect("the quota parses");
+        assert!(out.contains("34") && out.contains("58Gi"), "{out}");
+
+        // 两侧都读不成数量时按原样：这一步只会比较，不会拿文本差异去抬。
+        let mut odd = BTreeMap::new();
+        odd.insert(
+            "resourcequota/cogneva-quota".to_string(),
+            QuotaUsage {
+                hard: pairs(&[("limits.cpu", "lots")]),
+                used: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+        );
+        let out = crate::mainline_rollout::keep_raised_ceilings(text, "support.yaml", &odd)
+            .expect("the quota parses");
+        assert!(!out.contains("lots"), "{out}");
+    }
+
     #[test]
     fn namespace_docs_skips_install_surface_kinds_and_rejects_secret() {
         // 多文档：Namespace（集群级）、Role/RoleBinding（权限面）与

@@ -1139,6 +1139,80 @@ pub(crate) fn bundle_declared_containers(yaml_text: &str) -> SFResult<Vec<Declar
     Ok(out)
 }
 
+/// 绝不把集群正举着的天花板按回树里那个数。
+///
+/// 版外那台 Pod（评测台按题起的那台）会按自己的清单把额度抬到装得下，跑完
+/// 再放回去；在它抬起到放回之间，集群里的 `hard` 高于树里的声明。这段时间里
+/// 把这版声明 apply 下去不是「收敛」：apiserver 拒收一条 `hard` 低于当前用量的
+/// 更新，支撑包在**一个镜像都没动**的时候失败，而这次失败会被读成「这一版不
+/// 好」。所以按维度取两者之大——被抬高那一维留在集群里，其余维度照常收敛，
+/// 两个面不一致这件事由漂移读数说出来，而不是由一次假失败说出来。
+///
+/// 抬起来的那一维由谁放回去：抬它的那台 Pod 自己（`remove()` 里恢复），以及
+/// 它跑完之后第一次没有抬升的交付。所以这里是「不抢」，不是「永不收敛」。
+pub(crate) fn keep_raised_ceilings(
+    text: &str,
+    origin: &str,
+    live: &BTreeMap<String, crate::governance_drift::QuotaUsage>,
+) -> SFResult<String> {
+    use cog_core::claim_footprint::quantity_bytes;
+    let mut docs = split_docs(text, origin)?;
+    let mut raised: Vec<String> = Vec::new();
+    for doc in docs.iter_mut() {
+        if doc.get("kind").and_then(|k| k.as_str()) != Some("ResourceQuota") {
+            continue;
+        }
+        let Some(name) = doc
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(live_hard) = live.get(&format!("resourcequota/{name}")).map(|q| &q.hard) else {
+            continue;
+        };
+        let Some(hard) = doc
+            .get_mut("spec")
+            .and_then(|s| s.get_mut("hard"))
+            .and_then(|h| h.as_mapping_mut())
+        else {
+            continue;
+        };
+        for (resource, declared) in hard.iter_mut() {
+            let Some(key) = resource.as_str() else {
+                continue;
+            };
+            let Some(live_text) = live_hard.get(key) else {
+                continue;
+            };
+            // A dimension that does not parse on either side is left exactly as
+            // declared: this step only knows how to compare, and comparing by
+            // text would keep a raised ceiling forever on a spelling difference.
+            let (Some(declared_bytes), Some(live_bytes)) = (
+                declared.as_str().and_then(quantity_bytes),
+                quantity_bytes(live_text),
+            ) else {
+                continue;
+            };
+            if live_bytes > declared_bytes {
+                *declared = serde_yaml::Value::String(live_text.clone());
+                raised.push(format!("{name}.{key}: {declared_bytes} -> {live_bytes}"));
+            }
+        }
+    }
+    if !raised.is_empty() {
+        tracing::info!(
+            raised = %raised.join(", "),
+            "rollout: the cluster holds a ceiling above this revision's declaration (a pod \
+             outside the release widened it); keeping the higher number so the support apply \
+             is not refused for lowering it"
+        );
+    }
+    render_docs(&docs)
+}
+
 /// 下发包在**消费侧**的复核：把包里不属于滚动面的文档（安装面 kind，判定见
 /// [`namespace_docs`]）摘掉后写到 `out`，返回可 apply 的路径；全被摘掉时返回
 /// None（没有属于滚动面的对象可 apply）。支撑包与目标清单都走这里——它们同源。
@@ -3476,6 +3550,21 @@ impl RolloutExecutor {
                     .await
                     .map_err(|e| SFError::IO(format!("read {}: {e}", support.display())))
                     .map_err(|e| classify_before_any_change("support", "", e))?;
+                // 集群此刻举着的天花板可能高于这一版声明的（版外的 Pod 抬起
+                // 来还没放回去）。先读一眼再落地，否则这次 apply 会因为「把
+                // hard 降到当前用量以下」被拒，而挡住的是一条本该成功的滚动。
+                // 读不到就照原样 apply——老行为，不因为一次读数失败而改道。
+                let text = match self
+                    .run_kubectl(&["get", "resourcequota", "-o", "json"], 60)
+                    .await
+                {
+                    Ok(live) => match crate::governance_drift::live_quota_usage(&live) {
+                        Ok(live) => keep_raised_ceilings(&text, "support.yaml", &live)
+                            .map_err(|e| classify_before_any_change("support", "", e))?,
+                        Err(_) => text,
+                    },
+                    Err(_) => text,
+                };
                 let staged =
                     stage_rollout_manifest(&text, "support.yaml", &staged_manifest_path("support"))
                         .map_err(|e| classify_before_any_change("support", "", e))?;
