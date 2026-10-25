@@ -44,3 +44,7 @@
 15-prometheusrule-host-readings.yaml deliver # 读宿主侧序列的全部规则：通道自身（生产者死了／读不到输入／整条抓不到）与各面读完自己那几格判词后要人动手的那几条；同一条规则里不合并修法不同的两态，逐组注释写明哪一格归谁。告警镜像那四条的四格判词另有夹具让 Prometheus 规则引擎真跑一遍（deploy/scripts/tests/alert-mirror-alert-rules.test.sh）
 16-recordingrules-face-first-readings.yaml deliver # 面表里「按名字取、且名字本身就是一条能算出来的 PromQL」的第一条读数，由 Prometheus 自己算出来发布（`资源管理` 的 buildgate_refused_by_what）；宿主脚本那条只留细节
 17-prometheusrule-acceptance-census.yaml deliver # 验收普查的消费者：stale>0、读数整条不见、读数停更三条分开；夹具让 Prometheus 规则引擎真跑一遍（deploy/scripts/test-acceptance-census-alert-rules.sh）
+18-podmonitor-postgres.yaml deliver # postgres 读数边车的抓取目标：数据库是唯一独占盘又能把所有面一起拖慢的组件，此前一条读数都没有
+18-servicemonitor-storage.yaml deliver # 向量库自身的 /metrics（qdrant 自带端点，不为读它再装 exporter 进程）
+18-servicemonitor-ingress.yaml deliver # 入口代理的 /metrics：traefik 与 ingress-nginx 两份选择器都交付，匹配不到时不产生目标（见文件头注），因此同一份清单在两种入口形态上都安全
+19-blackbox-exporter.yaml deliver # 可达性探针本体（ConfigMap + Deployment + Service）：入口、代码托管 API 与证书剩余天数在这里才有读数

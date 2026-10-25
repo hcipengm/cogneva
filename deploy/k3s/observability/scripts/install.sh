@@ -282,6 +282,32 @@ mirror_clickhouse_password() {
     log_info "ClickHouse 密码已镜像到 cogneva-secrets-oob"
 }
 
+# ─── 入口形态决定可达性探针探哪里 ────────────────────────────────
+# 探针目标有一半由入口形态决定（traefik 还是 ingress-nginx），而 Prometheus 的
+# 静态目标不会判断"这个地址在我这台机器上该不该存在"：选错就是一条
+# probe_success=0，与真断线同形。所以这里按 IngressClass 选，**认不出来就不加**，
+# 由调用方明说"入口可达性没有目标"——少一条读数看得见，错的读数看不见。
+#
+# 优先用默认 IngressClass：同时装着两个 controller 时，"默认"才是入口实际走的
+# 那一条；没有标默认才退回任意一个。
+resolve_reachability_values() {
+    local ctrl=""
+    local classes
+    classes="$(kubectl get ingressclass -o jsonpath='{range .items[*]}{.metadata.annotations.ingressclass\.kubernetes\.io/is-default-class}{"|"}{.spec.controller}{"\n"}{end}' 2>/dev/null)"
+    ctrl="$(printf '%s\n' "${classes}" | awk -F'|' '$1=="true"{print $2; exit}')"
+    if [ -z "${ctrl}" ]; then
+        ctrl="$(printf '%s\n' "${classes}" | awk -F'|' 'NF>1 && $2!=""{print $2; exit}')"
+    fi
+    case "${ctrl}" in
+        *traefik.io/ingress-controller*)
+            printf '%s' "${HELM_DIR}/kube-prometheus-stack-values-reachability-traefik.yaml" ;;
+        *k8s.io/ingress-nginx*|*nginx.org/ingress-controller*)
+            printf '%s' "${HELM_DIR}/kube-prometheus-stack-values-reachability-nginx.yaml" ;;
+        *)
+            return 1 ;;
+    esac
+}
+
 # ─── 部署 kube-prometheus-stack ───────────────────────────────────
 deploy_prometheus_stack() {
     if [ "${PROFILE}" = "full" ]; then
@@ -292,10 +318,22 @@ deploy_prometheus_stack() {
         log_info "部署 kube-prometheus-stack 缩配档（Prometheus + Grafana + node-exporter + kube-state-metrics）..."
     fi
 
+    # 可达性探针的目标按入口形态二选一；认不出来就不加（见
+    # resolve_reachability_values 里的理由），并在这里明说。
+    local reach_args=()
+    local reach=""
+    if reach="$(resolve_reachability_values)"; then
+        reach_args=(--values "${reach}")
+        log_info "可达性探针目标：$(basename "${reach}")"
+    else
+        log_warn "认不出入口形态（IngressClass），本次不装可达性探针：入口与外网可达性不会有读数"
+    fi
+
     helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
         --namespace "${NAMESPACE}" \
         --create-namespace \
         --values "${VALUES_FILE}" \
+        ${reach_args[@]+"${reach_args[@]}"} \
         --wait \
         --timeout 600s
 
@@ -313,6 +351,27 @@ deploy_jaeger() {
         --timeout 300s
 
     log_info "Jaeger 部署完成 ✓"
+}
+
+# ─── 打开 k3s 自带 traefik 的指标端点 ─────────────────────────────
+# 为什么不由收敛循环管：这个对象是 k3s 的集群级配置（namespace kube-system），
+# 而循环的 Role 只覆盖 monitoring；放进去会让它每轮报一次权限被拒，而那条拒绝
+# 在日志里看起来像"清单本身有问题"。
+#
+# 只在 k3s 上做：别的发行版没有 helm-controller 的 traefik chart，apply 一个
+# 没人认领的 HelmChartConfig 只会留下一个永远不生效的对象。
+enable_traefik_metrics() {
+    local cfg="${SCRIPT_DIR}/../traefik-metrics-helmchartconfig.yaml"
+    if [ ! -f "${cfg}" ]; then
+        log_warn "找不到 ${cfg}，跳过入口代理指标开关；入口 5xx 率将没有数据"
+        return 0
+    fi
+    if ! kubectl -n kube-system get helmchart traefik >/dev/null 2>&1; then
+        log_info "不是 k3s 自带 traefik 的形态，跳过入口代理指标开关"
+        return 0
+    fi
+    log_info "打开 traefik 指标端点（会触发一次入口滚动，几秒钟）..."
+    kubectl apply -f "${cfg}"
 }
 
 # ─── 验证部署 ─────────────────────────────────────────────────────
@@ -342,7 +401,8 @@ verify_deployment() {
 main() {
     echo "═══════════════════════════════════════════════════════════════"
     echo "  SF-Network 可观测性栈 — K3s 生产环境部署"
-    echo "  覆盖 16 项 DevOps 组件"
+    echo "  采集（Prometheus/Node/K3s/Redis/Postgres/Qdrant/Traefik）＋ 分析（Grafana）"
+    echo "  ＋ 可达性（Blackbox）＋ 日志（Loki，BACKENDS 开关）"
     echo "═══════════════════════════════════════════════════════════════"
     echo ""
 
@@ -351,6 +411,9 @@ main() {
     validate_dispositions
     add_helm_repos
     deploy_manifests
+    # 入口代理的指标端点是 k3s 集群级配置，只能在安装面打开（循环没有那份权）。
+    # 它要在 chart 之前：抓取目标引用的是它开出来的那个端口。
+    enable_traefik_metrics
     deploy_prometheus_stack
     # ServiceMonitor 依赖 chart 带来的 CRD，只能排在 chart 之后。
     deploy_crd_dependent_manifests

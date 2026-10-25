@@ -433,3 +433,59 @@ fn yaml_block(text: &str, header: &str) -> BTreeMap<String, String> {
     }
     out
 }
+
+/// 可达性探针的两份值域文件：与入口形态无关的那一半必须逐字相同。
+///
+/// 这两份是二选一的（traefik / ingress-nginx），由安装面按 IngressClass 挑一份。
+/// 它们各自要带的两件事里，只有"入口探谁"随形态变；"代码托管 API 通不通"与形态
+/// 无关，两边必须一模一样。抄成两种写法不会有任何报错：一台机器会少一条探测，而
+/// 少的那条在面板上就是不存在，与"这条探测从没配过"同形——没有任何读数会说它少了。
+///
+/// 判的是块本身逐字相等，不是"两边都有 github"。前者在有人改了其中一份的模块名、
+/// 抓取间隔或重标签链时会红；后者只在一整块被删掉时红。
+#[test]
+fn the_reachability_profiles_share_one_external_probe_block() {
+    const DIR: &str = "deploy/k3s/observability/helm";
+    let read = |name: &str| -> String {
+        let path = repo_root().join(DIR).join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
+    };
+    let block_of = |text: &str, job: &str| -> String {
+        let marker = format!("- job_name: {job}");
+        let start = text
+            .find(&marker)
+            .unwrap_or_else(|| panic!("找不到作业 {job}——这一份探针文件少了一半"));
+        let rest = &text[start..];
+        let end = rest[marker.len()..]
+            .find("      - job_name:")
+            .map(|i| i + marker.len())
+            .unwrap_or(rest.len());
+        // 去掉缩进与空行：判的是内容，不是排版。
+        rest[..end]
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let traefik = read("kube-prometheus-stack-values-reachability-traefik.yaml");
+    let nginx = read("kube-prometheus-stack-values-reachability-nginx.yaml");
+
+    let a = block_of(&traefik, "blackbox-external");
+    let b = block_of(&nginx, "blackbox-external");
+    assert_eq!(
+        a, b,
+        "两份可达性值域文件的 blackbox-external 块不一致：与入口形态无关的那一半\
+         抄成了两种写法，两个平台上会少掉不同的探测"
+    );
+
+    // 随形态变的那一半必须真的不同——两份一模一样说明有一份只是复制了 traefik。
+    let ia = block_of(&traefik, "blackbox-ingress");
+    let ib = block_of(&nginx, "blackbox-ingress");
+    assert_ne!(
+        ia, ib,
+        "两份文件里的入口探针完全相同：其中一份没有真的指向它自己的入口形态"
+    );
+}

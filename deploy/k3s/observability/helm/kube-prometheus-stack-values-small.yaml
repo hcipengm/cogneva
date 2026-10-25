@@ -48,6 +48,12 @@ prometheus:
     # 拾取任意命名空间的 ServiceMonitor / PodMonitor / PrometheusRule
     serviceMonitorSelectorNilUsesHelmValues: false
     serviceMonitorSelector: {}
+
+    # 可达性探针的抓取配置不在这里，而在 `kube-prometheus-stack-values-reachability-*.yaml`
+    # 两份二选一的文件里：探针目标有一半由入口形态决定（traefik 还是 ingress-nginx），
+    # 而静态目标不会判断"这个地址在我这台机器上该不该存在"——选错就是一条 probe_success=0，
+    # 与真断线同形。选哪一份由安装面按 IngressClass 决定（install.sh 的
+    # resolve_reachability_values）；认不出来时不加，并明说入口可达性没有目标。
     serviceMonitorNamespaceSelector: {}
     podMonitorSelectorNilUsesHelmValues: false
     podMonitorSelector: {}
@@ -94,6 +100,21 @@ grafana:
     existingSecret: "grafana-admin-credentials"
     userKey: admin-user
     passwordKey: admin-password
+
+  # 匿名只读：WebUI 的每张读数卡都要能"点开看这一段是怎么来的"，而点过去撞登录
+  # 墙等于这条链接不存在——读者要么放弃，要么被引导去记一个管理员口令，后者更糟。
+  #
+  # 只给 Viewer：匿名看得见图，改不了任何东西。登录表单保留，编辑仍要账号。这是
+  # 一份取舍，不是默认值：匿名可读意味着任何能到达入口的人都能读集群指标，所以
+  # 入口本身按内网对待；如果将来这个入口对外，这一条要连同入口一起重新决定，
+  # 而不是只把这里关掉。
+  grafana.ini:
+    auth.anonymous:
+      enabled: true
+      org_name: 'Main Org.'
+      org_role: 'Viewer'
+    auth:
+      disable_login_form: false
 
   ingress:
     enabled: false

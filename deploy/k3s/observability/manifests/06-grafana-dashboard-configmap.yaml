@@ -2665,3 +2665,359 @@ data:
         ]
       }
     }
+  # ── 数据库：这一面的每块面板都对着一个会拖慢全平台的判词 ──────────────
+  #
+  # uid 是 WebUI 的深链接目标，改名等于所有指向它的链接一起失效——所以它按
+  # 「回答哪一面的问题」命名，不按版本或日期命名。
+  cogneva-postgres.json: |
+    {
+      "id": null,
+      "uid": "cogneva-postgres",
+      "title": "Cogneva Postgres",
+      "tags": [
+        "cogneva",
+        "postgres"
+      ],
+      "timezone": "browser",
+      "schemaVersion": 36,
+      "refresh": "30s",
+      "panels": [
+        {
+          "id": 1,
+          "title": "连接数（cogneva 库）",
+          "type": "stat",
+          "gridPos": {
+            "h": 6,
+            "w": 6,
+            "x": 0,
+            "y": 0
+          },
+          "targets": [
+            {
+              "expr": "sum(pg_stat_database_numbackends{datname=\"cogneva\"})",
+              "legendFormat": "连接数",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "title": "最老事务（秒）",
+          "type": "stat",
+          "gridPos": {
+            "h": 6,
+            "w": 6,
+            "x": 6,
+            "y": 0
+          },
+          "targets": [
+            {
+              "expr": "max(pg_stat_activity_max_tx_duration{datname=\"cogneva\"})",
+              "legendFormat": "最老事务",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "title": "事务提交与回滚",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 0
+          },
+          "targets": [
+            {
+              "expr": "rate(pg_stat_database_xact_commit{datname=\"cogneva\"}[5m])",
+              "legendFormat": "提交/s",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "rate(pg_stat_database_xact_rollback{datname=\"cogneva\"}[5m])",
+              "legendFormat": "回滚/s",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "title": "库大小",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 8
+          },
+          "targets": [
+            {
+              "expr": "pg_database_size_bytes{datname=\"cogneva\"}",
+              "legendFormat": "库大小",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes"
+            }
+          }
+        }
+      ],
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": {
+              "text": "Prometheus",
+              "value": "Prometheus"
+            }
+          }
+        ]
+      }
+    }
+  # ── 向量库：检索变慢会被读成"模型变笨" ────────────────────────────
+  cogneva-storage.json: |
+    {
+      "id": null,
+      "uid": "cogneva-storage",
+      "title": "Cogneva Storage",
+      "tags": [
+        "cogneva",
+        "qdrant"
+      ],
+      "timezone": "browser",
+      "schemaVersion": 36,
+      "refresh": "30s",
+      "panels": [
+        {
+          "id": 1,
+          "title": "向量总数",
+          "type": "stat",
+          "gridPos": {
+            "h": 6,
+            "w": 8,
+            "x": 0,
+            "y": 0
+          },
+          "targets": [
+            {
+              "expr": "sum(collections_vector_total)",
+              "legendFormat": "向量数",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "title": "常驻内存",
+          "type": "stat",
+          "gridPos": {
+            "h": 6,
+            "w": 8,
+            "x": 8,
+            "y": 0
+          },
+          "targets": [
+            {
+              "expr": "sum(memory_resident_bytes)",
+              "legendFormat": "常驻内存",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes"
+            }
+          }
+        },
+        {
+          "id": 3,
+          "title": "检索（gRPC）平均耗时与失败率",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 16,
+            "x": 0,
+            "y": 6
+          },
+          "targets": [
+            {
+              "expr": "grpc_responses_avg_duration_seconds",
+              "legendFormat": "平均耗时",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "rate(grpc_responses_fail_total[5m])",
+              "legendFormat": "失败/s",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ]
+        }
+      ],
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": {
+              "text": "Prometheus",
+              "value": "Prometheus"
+            }
+          }
+        ]
+      }
+    }
+  # ── 可达性：从集群里面看，这些地址现在通不通 ──────────────────────
+  #
+  # 这一面回答的是别处读不到的东西：入口代理后面的某个 Host 断了、代码托管
+  # API 从这台机器不可达、证书还有几天到期——这三种坏法在别的面板上都读作
+  # 健康，因为进程都活着、队列都在动。
+  cogneva-reachability.json: |
+    {
+      "id": null,
+      "uid": "cogneva-reachability",
+      "title": "Cogneva Reachability",
+      "tags": [
+        "cogneva",
+        "blackbox"
+      ],
+      "timezone": "browser",
+      "schemaVersion": 36,
+      "refresh": "30s",
+      "panels": [
+        {
+          "id": 1,
+          "title": "现在不通的目标数",
+          "type": "stat",
+          "gridPos": {
+            "h": 6,
+            "w": 6,
+            "x": 0,
+            "y": 0
+          },
+          "targets": [
+            {
+              "expr": "sum(probe_success == 0)",
+              "legendFormat": "不通目标",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "title": "通不通（1 通 / 0 不通）",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 18,
+            "x": 6,
+            "y": 0
+          },
+          "targets": [
+            {
+              "expr": "probe_success",
+              "legendFormat": "{{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "title": "证书剩余天数",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 8
+          },
+          "targets": [
+            {
+              "expr": "(probe_ssl_earliest_cert_expiry - time()) / 86400",
+              "legendFormat": "{{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "d"
+            }
+          }
+        },
+        {
+          "id": 4,
+          "title": "入口 5xx / 秒",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 8
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(traefik_service_requests_total{code=~\"5..\"}[5m]))",
+              "legendFormat": "5xx/s",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ]
+        }
+      ],
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": {
+              "text": "Prometheus",
+              "value": "Prometheus"
+            }
+          }
+        ]
+      }
+    }

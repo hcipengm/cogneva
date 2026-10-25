@@ -1,0 +1,33 @@
+# 打开 k3s 自带 traefik 的指标端点。
+#
+# k3s 装的 traefik 默认既不暴露 /metrics、也不在 Service 上开这个端口，所以
+# `../manifests/18-servicemonitor-storage.yaml` 里那份 traefik 抓取目标在应用
+# 本文件之前指向一个不存在的端口——而"抓不到"在面板上与"没有请求"同形：
+# 入口 5xx 率会画成一条零线，看着像一切正常。
+#
+# 为什么放在这个目录、而不是 manifests/：HelmChartConfig 是 k3s 的集群级配置
+# （namespace kube-system），收敛循环的 Role 只管 monitoring 命名空间。放进去
+# 会让循环每一轮报一次权限被拒，而那条拒绝在日志里看起来像"清单有问题"。
+# 因此它由安装面在 k3s 上一并应用（install.sh 的 enable_traefik_metrics），
+# 并由这里的注释说明为什么它不走收敛面。
+#
+# 应用它会触发 helm-controller 重新部署 traefik —— 入口会有几秒钟的滚动切换。
+# 这不是可以随时做的事，所以它不在收敛循环里每轮对比。
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    metrics:
+      prometheus:
+        addEntryPointsLabels: true
+        addServicesLabels: true
+        addRoutersLabels: true
+        buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]
+    ports:
+      metrics:
+        expose: true
+        port: 9100
+        protocol: TCP

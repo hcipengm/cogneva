@@ -916,6 +916,36 @@ const FOREIGN: &[(&str, &str)] = &[
         "cogneva_mainline_behind_verdict_judged",
         "宿主读数生产者（同上）",
     ),
+    // The database's own readings. Their producer is the exporter sidecar, not
+    // this workspace: what they say is what the database says about itself, and
+    // no process of ours could publish them without asking the database anyway.
+    // Filed here rather than claimed as produced, so that an exporter version
+    // that renames a series shows up as a blank panel instead of as a contract
+    // that quietly stopped being true.
+    ("pg_stat_database_numbackends", "postgres_exporter 边车"),
+    ("pg_stat_activity_max_tx_duration", "postgres_exporter 边车"),
+    ("pg_stat_database_xact_commit", "postgres_exporter 边车"),
+    ("pg_stat_database_xact_rollback", "postgres_exporter 边车"),
+    ("pg_database_size_bytes", "postgres_exporter 边车"),
+    // The vector store publishes its own runtime readings; a dedicated exporter
+    // for it (or for a store we do not run) would be a second process reading
+    // one endpoint that already exists.
+    ("collections_vector_total", "qdrant 自身的 /metrics"),
+    ("grpc_responses_avg_duration_seconds", "qdrant 自身的 /metrics"),
+    ("grpc_responses_fail_total", "qdrant 自身的 /metrics"),
+    ("memory_resident_bytes", "qdrant 自身的 /metrics"),
+    // Reachability is asked by the prober, not by any process of ours: a
+    // success value published by the thing being probed would be its own
+    // opinion of itself.
+    ("probe_success", "blackbox-exporter"),
+    ("probe_ssl_earliest_cert_expiry", "blackbox-exporter"),
+    // The ingress controller's own counters. k3s ships traefik with the metrics
+    // endpoint closed; the HelmChartConfig next to the manifests is what opens
+    // it, and a series that never arrives reads exactly like no traffic.
+    (
+        "traefik_service_requests_total",
+        "traefik 自身的 /metrics（k3s 自带，由 HelmChartConfig 打开）",
+    ),
 ];
 
 /// Label names a legend template asks for: every `{{...}}` in the format.

@@ -1,0 +1,32 @@
+# PodMonitor — 抓 postgres Pod 里的读数边车。
+#
+# 数据库是这台机器上唯一独占盘、又能把所有面一起拖慢的组件。在此之前「连接
+# 耗尽」「最老事务一直在长」「锁等待堆着」「盘写满」这四件事，全都只表现为
+# 「平台到处都慢」，没有一处能指回数据库。这份抓取目标就是那处。
+#
+# 按 Pod 抓、不经 Service：postgres 的 Service 是 headless 且只有 5432 一个
+# 端口，为了抓读数去改它对所有写入方的连接面没有好处——而这份读数本来就是
+# Pod 级事实（边车与数据库同生同死）。端口名必须与 StatefulSet 里边车声明
+# 的端口名一致；两侧写同一个名字，改一侧而漏另一侧时，这个目标会在每条查询
+# 里都不存在，而"不存在"看起来和"数据库没连接"一样。
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: postgres-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: cog-observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - cogneva
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+      app.kubernetes.io/component: database
+  podMetricsEndpoints:
+    - port: postgres-metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      honorLabels: true

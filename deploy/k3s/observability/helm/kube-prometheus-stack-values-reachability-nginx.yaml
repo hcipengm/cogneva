@@ -1,0 +1,68 @@
+# 可达性探针的目标 — 入口是 ingress-nginx 的集群（标准 k8s 形态）。
+#
+# 与 `kube-prometheus-stack-values-reachability-traefik.yaml` 是二选一的两份：目标
+# 地址与探哪个端点由入口形态决定，而这份差异不能写成运行时判断——Prometheus 的
+# 静态目标不会判断"这个地址在我这台机器上该不该存在"，抓不到就是 probe_success=0，
+# 与真断线同形。所以由安装面按 IngressClass 选一份（install.sh 的
+# resolve_reachability_values），没认出来就不加，并明说"入口可达性没有目标"。
+#
+# 两份文件里的 `blackbox-external` 作业必须逐字相同：它是与入口形态无关的一半
+# （代码托管 API 在这台机器上能不能到），抄成两种写法就会有一台机器少了其中一条
+# 探测而没人会注意到。这条一致性有判据看着（crates/cogneva/tests/
+# observability_stack_convergence_test.rs）。
+
+prometheus:
+  prometheusSpec:
+    additionalScrapeConfigs:
+      - job_name: blackbox-external
+        metrics_path: /probe
+        scrape_interval: 60s
+        scrape_timeout: 10s
+        static_configs:
+          - targets: ['https://github.com']
+            labels:
+              module: http_2xx
+              target_class: code-host
+          - targets: ['https://gitee.com']
+            labels:
+              module: http_2xx
+              target_class: code-host
+        relabel_configs:
+          - source_labels: [module]
+            target_label: __param_module
+          - source_labels: [__address__]
+            target_label: __param_target
+          - source_labels: [__param_target]
+            target_label: instance
+          - target_label: __address__
+            replacement: blackbox-exporter.monitoring.svc.cluster.local:9115
+
+      # 入口本身：探的是"请求能不能走到后端"，不是"DNS 配没配"。两个
+      # grafana/prometheus 的域名在集群内解析不到（它们由宿主的 hosts 或上游
+      # DNS 提供），所以直接连入口代理的 Service，用 Host 头表达"我要那个站"。
+      #
+      # ingress-nginx 按 chart 默认落在 ingress-nginx 命名空间；装到别处时这一份
+      # 探不到，读数会报目标不通——这正是要看见的（选了错的入口形态），而不是
+      # 把它藏成一条零线。
+      - job_name: blackbox-ingress
+        metrics_path: /probe
+        scrape_interval: 60s
+        scrape_timeout: 10s
+        static_configs:
+          - targets: ['http://ingress-nginx-controller.ingress-nginx.svc.cluster.local/']
+            labels:
+              module: http_ingress_grafana
+              target_class: ingress
+          - targets: ['http://ingress-nginx-controller.ingress-nginx.svc.cluster.local/']
+            labels:
+              module: http_ingress_prometheus
+              target_class: ingress
+        relabel_configs:
+          - source_labels: [module]
+            target_label: __param_module
+          - source_labels: [__address__]
+            target_label: __param_target
+          - source_labels: [__param_target]
+            target_label: instance
+          - target_label: __address__
+            replacement: blackbox-exporter.monitoring.svc.cluster.local:9115

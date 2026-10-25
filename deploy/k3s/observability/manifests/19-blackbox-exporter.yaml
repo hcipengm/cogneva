@@ -1,0 +1,148 @@
+# blackbox exporter — 「从集群里面看，这些地址现在通不通」。
+#
+# 这是全套观测里唯一回答可达性的组件。别的读数都在说"进程活着、队列在动"，
+# 而下面的四种坏法在那些读数里全都读作健康：
+#   - 入口代理能连上、但某个 Host 的后端不通（集群内每一块面板都还是绿的）；
+#   - 代码托管 API 从这台机器不可达（构建与进化静默地一轮轮失败）；
+#   - 证书还剩几天（到期那天所有 https 目标一起断，此前没有任何征兆）；
+#   - 探测路径本身坏了（那是"没有人问"与"问了没通"的区别）。
+#
+# 探测目标不写在 Deployment 里，写在 kube-prometheus-stack 的 values
+# （additionalScrapeConfigs）：目标是一项采集配置，不是 exporter 自己的配置，
+# 而且探针必须由 Prometheus 发起才有时序。这里只提供 exporter 与模块定义。
+#
+# 两个 ingress 的目标不写 https://grafana.cogneva.local：那个域名在集群内解析
+# 不到（它靠宿主的 hosts 或上游 DNS），而探针在集群里跑。改成直接连入口代理的
+# Service，用 Host 头表达"我要那个站"——判据要的是"请求能不能走到后端"，不是
+# "DNS 配没配对"。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blackbox-exporter-config
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: cog-observability
+    app.kubernetes.io/component: reachability
+data:
+  config.yml: |
+    modules:
+      # 外部目标：只问"通不通、证书到哪天"。允许 3xx：github.com 与 gitee.com
+      # 都会用重定向把匿名请求带到别处，拒绝 3xx 会把"能访问"读成"不可达"。
+      http_2xx:
+        prober: http
+        timeout: 8s
+        http:
+          valid_status_codes: [200, 204, 301, 302]
+          follow_redirects: false
+          preferred_ip_protocol: ip4
+      # 入口后面是 Grafana：未登录的 GET / 会 302 到 /login，这不是故障。
+      http_ingress_grafana:
+        prober: http
+        timeout: 5s
+        http:
+          valid_status_codes: [200, 204, 301, 302]
+          follow_redirects: false
+          preferred_ip_protocol: ip4
+          headers:
+            Host: grafana.cogneva.local
+      # Prometheus 的根路径同样是重定向。
+      http_ingress_prometheus:
+        prober: http
+        timeout: 5s
+        http:
+          valid_status_codes: [200, 204, 301, 302]
+          follow_redirects: false
+          preferred_ip_protocol: ip4
+          headers:
+            Host: prometheus.cogneva.local
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blackbox-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: blackbox-exporter
+    app.kubernetes.io/component: reachability
+    app.kubernetes.io/part-of: cog-observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: blackbox-exporter
+      app.kubernetes.io/component: reachability
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: blackbox-exporter
+        app.kubernetes.io/component: reachability
+        app.kubernetes.io/part-of: cog-observability
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: blackbox-exporter
+          image: prom/blackbox-exporter:v0.25.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/blackbox_exporter/config.yml
+            - --web.listen-address=:9115
+          ports:
+            - name: http
+              containerPort: 9115
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/blackbox_exporter
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: blackbox-exporter-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blackbox-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: blackbox-exporter
+    app.kubernetes.io/component: reachability
+    app.kubernetes.io/part-of: cog-observability
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: blackbox-exporter
+    app.kubernetes.io/component: reachability
+  ports:
+    - name: http
+      port: 9115
+      targetPort: http
+      protocol: TCP
