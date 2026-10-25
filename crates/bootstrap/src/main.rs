@@ -3849,9 +3849,21 @@ mod install_trace_tests {
     use super::{first_cogneva_trace, TRACE_KINDS};
     use serde::Deserialize;
 
-    /// 发布树里出现、但 `kubectl -n cogneva get` 读不到的种类：集群级对象与不是
-    /// k8s 对象的清单文件。它们不该进痕迹探测面。
-    const NOT_NAMESPACED: [&str; 3] = ["Namespace", "StorageClass", "Kustomization"];
+    /// 发布树里出现、但**不能**这样读的种类：集群级对象与不是 k8s 对象的清单文件。
+    ///
+    /// 集群级对象不是「读不到」，而是「读出来不是这一命名空间的」：`-n cogneva` 对
+    /// ClusterRole / ClusterRoleBinding 不起作用，命令会把 `cluster-admin`、
+    /// `system:*` 与别的软件装的权限一并印出来——探针按「有没有输出」判痕迹，于是
+    /// **任何一台崭新的集群都会被读成已经装过 cogneva**，投递永远停在 apply，拿不到
+    /// helm 的升级与回滚管理。所以它们既不能进 TRACE_KINDS，也不能只是"没登记就跳过"：
+    /// 交付了就必须在这张表上写明理由，这张表本身就是判据。
+    const NOT_NAMESPACED: [&str; 5] = [
+        "Namespace",
+        "StorageClass",
+        "Kustomization",
+        "ClusterRole",
+        "ClusterRoleBinding",
+    ];
 
     /// 交付了、`kubectl get` 也读得到、但**仍然不进痕迹探测面**的种类：CRD 支持的
     /// 第三方对象。
