@@ -33,14 +33,17 @@ export function TasksView() {
   const [mode, setMode] = useState<Mode>('list');
   const [selected, setSelected] = useState<string | null>(null);
 
+  // 过滤词进 `what`：这个 hook 按 `what` 重开读取，而过滤词写在闭包里时它看不见
+  // 变化——点了「失败」，屏上还是上一次那批行，标题却已经是新的过滤词，最久要等
+  // 一次轮询才对上。
   const summary = useResource('任务汇总', getTaskSummary, 15_000);
   const list = useResource(
-    '任务列表',
+    filter === '全部' ? '任务列表' : `任务列表（${filter}）`,
     () => listTasks(filter === '全部' ? { limit: 300 } : { status: filter, limit: 300 }),
     15_000
   );
   const graph = useResource(
-    '任务图',
+    filter === '全部' ? '任务图' : `任务图（${filter}）`,
     () => getTaskGraph(filter === '全部' ? {} : { status: filter }),
     15_000,
     mode === 'graph'
