@@ -144,28 +144,54 @@ fn walk_rs(dir: &Path) -> Vec<PathBuf> {
 
 fn parse_const(line: &str, file: &str) -> Option<Row> {
     let line = line.trim_start();
-    let line = line.strip_prefix("pub ").unwrap_or(line);
+    let line = line
+        .strip_prefix("pub(crate) ")
+        .or_else(|| line.strip_prefix("pub "))
+        .unwrap_or(line);
     let line = line.strip_prefix("const ")?;
     let (name, rest) = line.split_once(':')?;
     let name = name.trim();
     let rest = rest.trim_start();
     let ty = rest.split('=').next()?.trim();
-    if !matches!(
-        ty,
-        "u64" | "u32" | "u16" | "usize" | "i64" | "i32" | "f64" | "f32"
-    ) {
-        return None;
-    }
     let value = rest.split_once('=')?.1.trim().trim_end_matches(';').trim();
-    // Only a literal. Anything with an operator, a call or a cast is a number
-    // computed at compile time from other values, which is the shape this
-    // registry is trying to move towards rather than police.
-    if !value
-        .chars()
-        .all(|c| c.is_ascii_digit() || c == '_' || c == '.')
-    {
-        return None;
-    }
+    let value = match ty {
+        "u64" | "u32" | "u16" | "usize" | "i64" | "i32" | "f64" | "f32" => {
+            // Only a literal. Anything with an operator, a call or a cast is a
+            // number computed at compile time from other values, which is the
+            // shape this registry is trying to move towards rather than police.
+            if !value
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '_' || c == '.')
+            {
+                return None;
+            }
+            value.to_string()
+        }
+        // A cadence written as `Duration::from_secs(120)` is the same kind of
+        // number as `120` in a `u64`, and reading only the integers left the
+        // most common spelling of a period outside the registry altogether.
+        "Duration" => {
+            let unit = ["secs", "millis", "hours", "mins"].iter().find_map(|u| {
+                let inner = value
+                    .strip_prefix(&format!("Duration::from_{u}("))?
+                    .strip_suffix(')')?
+                    .trim();
+                let literal = inner
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '_')
+                    .then(|| inner.to_string())?;
+                let suffix = match *u {
+                    "secs" => "s",
+                    "millis" => "ms",
+                    "hours" => "h",
+                    _ => "m",
+                };
+                Some(format!("{literal}{suffix}"))
+            })?;
+            unit
+        }
+        _ => return None,
+    };
     if value
         .trim_matches(|c| c == '_' || c == '.' || c == '0')
         .is_empty()
