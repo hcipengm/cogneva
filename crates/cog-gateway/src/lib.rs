@@ -75,6 +75,7 @@ pub mod supervisor_status;
 pub mod takeover;
 pub mod tasks;
 pub mod taste;
+pub mod trace_fanout;
 pub mod upstream_pool;
 pub mod websocket;
 pub mod websocket_protocol;
@@ -1061,6 +1062,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/traces", get(traces_list_handler))
         .route("/api/v1/traces/{id}", get(trace_get_handler))
         .route("/api/v1/traces/{id}/replay", post(trace_replay_handler))
+        .route(
+            "/api/v1/traces/{id}/fanout",
+            get(trace_fanout::trace_fanout_handler),
+        )
         .route(
             "/api/v1/raw_logs/index",
             get(observability::raw_log_index_handler),

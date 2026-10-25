@@ -1193,6 +1193,10 @@ pub struct RolloutPlan {
     /// 新镜像引用（节点 pull 端点，kubelet 经 NodePort 拉取）。
     pub tag: String,
     pub targets: Vec<RolloutTarget>,
+    /// 这一次滚动的因果 id（W3C `traceparent`）。派发侧生成并写进 Job 注解，
+    /// Job 里再交回这里：两处不是各写各的值，而是同一个字符串，否则同一条链在
+    /// 派发与执行之间断成两条。
+    pub traceparent: Option<String>,
     /// 随镜像下发的发布清单目录（Job 挂载点，可选）。目录在时：先 apply
     /// support.yaml，目标存在 `deploy-<deployment>.yaml` 则 apply 整份清单
     /// （镜像已改写为 tag），否则回落 set image。缺省走纯 set image 旧路
@@ -1215,6 +1219,7 @@ impl RolloutPlan {
         Self {
             tag,
             targets,
+            traceparent: None,
             manifests_dir: None,
         }
     }
@@ -4036,6 +4041,7 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = MainlineDeployerConfig::default();
     let mut plan = RolloutPlan::from_config(&cfg, parsed.tag.clone());
     plan.manifests_dir = parsed.manifests_dir.clone();
+    plan.traceparent = parsed.traceparent.clone();
     let executor = RolloutExecutor::new(
         parsed.kubectl.clone(),
         parsed.ns.clone(),
@@ -4098,6 +4104,8 @@ pub(crate) struct RolloutCliArgs {
     pub startup_timeout: u64,
     pub kubectl: String,
     pub manifests_dir: Option<String>,
+    /// 派发侧写进 Job 注解的那一个 traceparent。
+    pub traceparent: Option<String>,
     /// 要问 CI 的这一版。空 = 不提问（没有随 Job 带过来的上游清单）。
     pub rev: String,
     pub ci_upstreams: Vec<UpstreamCiTarget>,
@@ -4120,6 +4128,7 @@ pub(crate) fn parse_rollout_args(
         startup_timeout: 900,
         kubectl: "kubectl".to_string(),
         manifests_dir: None,
+        traceparent: None,
         rev: String::new(),
         ci_upstreams: Vec::new(),
     };
@@ -4161,6 +4170,10 @@ pub(crate) fn parse_rollout_args(
             }
             "--manifests-dir" => {
                 out.manifests_dir = Some(value(i)?);
+                i += 2;
+            }
+            "--traceparent" => {
+                out.traceparent = Some(value(i)?);
                 i += 2;
             }
             "--rev" => {

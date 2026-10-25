@@ -6678,8 +6678,17 @@ impl MainlineDeployer {
                     .await?;
             }
         }
+        // 这一次滚动的因果 id：同一条链上的下一段。滚动 Job 自己也是一个进程，
+        // 它做的事（apply、等就绪、必要时回滚）与构建那一段属于同一条链，只有把
+        // id 写进它派发的对象里，事后才能把两段接起来——构建段的注解只说明这次
+        // 构建是哪条链上的，说明不了紧接着的那次滚动。
+        let traceparent = cog_core::TraceContext::generate()
+            .to_traceparent()
+            .unwrap_or_default();
         let mut args: Vec<String> = vec![
             "mainline-rollout".into(),
+            "--traceparent".into(),
+            traceparent.clone(),
             "--tag".into(),
             new_tag.to_string(),
             "--ns".into(),
@@ -6766,6 +6775,9 @@ impl MainlineDeployer {
                     "app.kubernetes.io/name": "cogneva",
                     "app.kubernetes.io/component": "mainline-rollout",
                 },
+                // 注解而不是 label：traceparent 里带连字符，label 取值规则会拒掉
+                // 其中一部分，被拒绝的值只会让这一段的 id 消失。
+                "annotations": { "cogneva.ai/traceparent": traceparent },
             },
             "spec": {
                 "backoffLimit": 0,
@@ -14152,6 +14164,30 @@ exec {real} "$@"
             .is_empty());
     }
 
+    /// 滚动 Job 的因果 id 过参数面：派发侧写进 Job 注解的那个值，Job 里必须
+    /// 读到同一个，否则同一条链在派发与执行之间断成两条。
+    #[test]
+    fn the_rollout_cli_carries_the_trace_parent_verbatim() {
+        let argv = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let parsed = parse_rollout_args(&argv(&["--tag", "t", "--traceparent", tp])).unwrap();
+        assert_eq!(parsed.traceparent.as_deref(), Some(tp));
+
+        // 旧派发侧不传这一项：滚动照样能跑，只是这一段没有链上的名字。
+        let legacy = parse_rollout_args(&argv(&["--tag", "t"])).unwrap();
+        assert!(legacy.traceparent.is_none());
+
+        // Job 里重建的 plan 必须带着它，否则参数解析对了也传不到执行侧。
+        let plan = crate::mainline_rollout::RolloutPlan::from_config(
+            &MainlineDeployerConfig::default(),
+            "reg/cog:t".into(),
+        );
+        assert!(
+            plan.traceparent.is_none(),
+            "from_config leaves it to the dispatcher"
+        );
+    }
+
     /// check run 本身不带工作流字段，身份只能从链接里那个运行 id 追。
     #[test]
     fn a_check_run_link_carries_the_workflow_run_id() {
@@ -17913,6 +17949,7 @@ exit 0
                 component: "sandbox-executor".into(),
                 name: "cogneva".into(),
             }],
+            traceparent: None,
             manifests_dir: Some(manifests.to_string_lossy().to_string()),
         };
         let err = executor.run(&plan).await.unwrap_err();
@@ -19398,6 +19435,7 @@ exit 0
                 component: "sandbox-executor".into(),
                 name: "cogneva".into(),
             }],
+            traceparent: None,
             manifests_dir: None,
         }
     }
