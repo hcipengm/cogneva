@@ -59,11 +59,23 @@ const DEFAULT_GC_INTERVAL_SECS: u64 = 600;
 const DEFAULT_FETCH_INTERVAL_SECS: u64 = 300;
 const DEFAULT_MAX_WORKSPACES: usize = 8;
 
-const GIT_TIMEOUT_SECS: u64 = 120;
+/// The shortest a git command is allowed to run before it is killed.
+///
+/// The timeout itself is derived: ten times the slowest command that has
+/// completed on this volume, never below this. A clone on a fresh volume takes
+/// as long as the network and the disk make it take, and a fixed number is
+/// either shorter than that (a healthy command killed as if it had hung) or
+/// longer than any real command needs (a genuine hang waited out). The slowest
+/// completed command is the measurement that separates the two, and a hung
+/// command never contributes to it -- it never completes.
+const GIT_TIMEOUT_FLOOR_SECS: u64 = 120;
+/// How many times the slowest completed command the timeout allows before
+/// calling the current one hung.
+const GIT_TIMEOUT_MULTIPLE: u64 = 10;
 const META_DIR_NAME: &str = ".meta";
 
 /// Killed git processes (OOM, node restart) leave stale `.lock` files behind;
-/// every git write in this process is bounded by [`GIT_TIMEOUT_SECS`] and
+/// every git write in this process is bounded by the derived timeout and
 /// kill-on-drop, so a lock older than this can only be a corpse.
 const STALE_GIT_LOCK_AGE: Duration = Duration::from_secs(600);
 
@@ -148,6 +160,12 @@ fn workspace_cap(disk: DiskReading, trees_bytes: u64, trees: usize) -> Option<us
         .saturating_mul(100 - WORKSPACE_DISK_HEADROOM_PERCENT)
         / 100;
     Some(trees + (room / per_tree) as usize)
+}
+
+/// How long a git command may run, from the slowest one that has completed.
+fn git_timeout_from(slowest_ms: u64) -> Duration {
+    let measured = (slowest_ms / 1000).saturating_mul(GIT_TIMEOUT_MULTIPLE);
+    Duration::from_secs(measured.max(GIT_TIMEOUT_FLOOR_SECS))
 }
 
 #[derive(Debug, Clone)]
@@ -504,6 +522,9 @@ pub struct WorkdirRouter {
     last_move_unix: AtomicI64,
     stillness_secs: AtomicU64,
     last_fetch_unix: AtomicI64,
+    /// The longest git command that has completed here, in milliseconds. What
+    /// the timeout is a multiple of; see [`GIT_TIMEOUT_FLOOR_SECS`].
+    git_slowest_ms: AtomicU64,
 }
 
 impl WorkdirRouter {
@@ -545,6 +566,7 @@ impl WorkdirRouter {
             last_move_unix: AtomicI64::new(0),
             stillness_secs: AtomicU64::new(0),
             last_fetch_unix: AtomicI64::new(0),
+            git_slowest_ms: AtomicU64::new(0),
         }))
     }
 
@@ -1420,16 +1442,30 @@ impl WorkdirRouter {
         }
     }
 
+    /// How long a git command may run here: a multiple of the slowest one that
+    /// has completed on this volume, floored. Recomputed per call so a volume
+    /// that got slower (a bigger repository, a busier disk) is allowed the time
+    /// it now needs, rather than being killed at a number written elsewhere.
+    fn git_timeout(&self) -> Duration {
+        git_timeout_from(self.git_slowest_ms.load(Ordering::Relaxed))
+    }
+
     async fn run_git_once(&self, args: &[&str], workdir: Option<&Path>) -> SFResult<String> {
         let mut cmd = tokio::process::Command::new("git");
         cmd.args(args).kill_on_drop(true);
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
         }
-        let out = tokio::time::timeout(Duration::from_secs(GIT_TIMEOUT_SECS), cmd.output())
+        let started = std::time::Instant::now();
+        let out = tokio::time::timeout(self.git_timeout(), cmd.output())
             .await
             .map_err(|_| SFError::IO(format!("git {} timed out", args.join(" "))))?
             .map_err(|e| SFError::IO(format!("failed to run git: {e}")))?;
+        // Only completed commands are recorded, whatever their exit code: a
+        // command that failed fast is still evidence of how fast git is here,
+        // and one that never returns must not raise the bar for the next.
+        self.git_slowest_ms
+            .fetch_max(started.elapsed().as_millis() as u64, Ordering::Relaxed);
         if !out.status.success() {
             return Err(SFError::IO(format!(
                 "git {} failed: {}{}",
@@ -2350,6 +2386,23 @@ pub(crate) mod tests {
         assert_eq!(
             fetch_interval_from(10, configured),
             Duration::from_secs(MIN_FETCH_INTERVAL_SECS)
+        );
+    }
+
+    /// A command is called hung relative to what commands here actually cost.
+    #[test]
+    fn the_git_timeout_follows_the_slowest_command_that_finished() {
+        // Nothing has completed yet: the floor is the only evidence available.
+        assert_eq!(
+            git_timeout_from(0),
+            Duration::from_secs(GIT_TIMEOUT_FLOOR_SECS)
+        );
+        // A clone that took 40s makes the allowance 400s, not 120.
+        assert_eq!(git_timeout_from(40_000), Duration::from_secs(400));
+        // A fast volume never gets an allowance below the floor.
+        assert_eq!(
+            git_timeout_from(1_500),
+            Duration::from_secs(GIT_TIMEOUT_FLOOR_SECS)
         );
     }
 

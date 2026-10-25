@@ -74,7 +74,8 @@ crates/cog-extension/src/workdir.rs	DEFAULT_FETCH_INTERVAL_SECS	300	unreviewed
 crates/cog-extension/src/workdir.rs	DEFAULT_GC_INTERVAL_SECS	600	unreviewed	
 crates/cog-extension/src/workdir.rs	DEFAULT_MAX_WORKSPACES	8	unreviewed	
 crates/cog-extension/src/workdir.rs	DEFAULT_TTL_SECS	21600	unreviewed	
-crates/cog-extension/src/workdir.rs	GIT_TIMEOUT_SECS	120	unreviewed	
+crates/cog-extension/src/workdir.rs	GIT_TIMEOUT_FLOOR_SECS	120	unreviewed	
+crates/cog-extension/src/workdir.rs	GIT_TIMEOUT_MULTIPLE	10	unreviewed	
 crates/cog-extension/src/workdir.rs	MAX_TASK_ID_LEN	128	unreviewed	
 crates/cog-extension/src/workdir.rs	MIN_FETCH_INTERVAL_SECS	30	unreviewed	
 crates/cog-extension/src/workdir.rs	WORKSPACE_DISK_HEADROOM_PERCENT	15	unreviewed	
