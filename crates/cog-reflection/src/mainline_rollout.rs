@@ -402,11 +402,162 @@ fn is_new_revision_never_ran(msg: &str) -> bool {
     msg.contains(NEW_REVISION_NEVER_RAN_MARKER)
 }
 
-/// 镜像一次都还没动时的落点。快照阶段只有这四类非版本失败会出现——调度器判决
+/// 「这个进程手里一份集群配置都没有」的标记。
+///
+/// 与 [`CLUSTER_UNREACHABLE_MARKER`] 分成两条判据：那一条说的是**集群那边**此刻
+/// 不可达（apiserver 抖动、握手超时），按轮询节拍在预算内重试是真有可能等到的；
+/// 这一条说的是本进程拿不出任何凭据——kubectl 于是回落到自己的默认端点
+/// `http://localhost:8080`，每一次查询都在本机回环上被拒。重试换不来凭据：现场
+/// 一次 300 秒的预算里它跑了 59 次，把一次诊断挤成了一段时间，而判词写的是「集群
+/// 不可达」——读到它的人去看 apiserver，真相在 Pod 自己的凭据面上。
+///
+/// 判据不靠 kubectl 的措辞：两种情况（没有配置 / 配置齐了而集群没通）在它的原文里
+/// 同形（都带 `connection refused`）。本进程在第一次查询之前自己把四处来源看一遍，
+/// 全无时就地判死；有则照常往下走，而一旦回落到 `localhost:8080`，那四处来源的
+/// 读数会附在失败的判词里——读的人不必再进一次 Pod 才知道该补哪一处。
+pub(crate) const CLUSTER_CONFIG_MISSING_MARKER: &str = "no cluster config in this process";
+
+pub(crate) fn is_cluster_config_missing(msg: &str) -> bool {
+    msg.contains(CLUSTER_CONFIG_MISSING_MARKER)
+}
+
+/// kubectl 一份配置都没读到时的默认端点。只用来决定要不要把配置读数附上判词，
+/// 不用来改类别：真有 kubeconfig 指向 `127.0.0.1:8080`（本地 preload 那一档）时
+/// 同一行也会这么写，而那是"端点没起"而不是"没有配置"。
+///
+/// 只认 `host:port` 不认带 scheme 的那一整串：kubectl 一次失败会写好几行，请求那
+/// 行带 `http://`，而最后那句总结（`The connection to the server localhost:8080 was
+/// refused`）不带——按整串比对会漏掉真实的那一半。
+const LOCALHOST_FALLBACK_ADDRESS: &str = "localhost:8080";
+
+/// k3s 编译出来的 kubectl 会读的那份 kubeconfig。它只对 k3s 那一版二进制有效，
+/// 所以它出现在这里只会让检查**更宽**（少判一次死），不会把一个能用的进程判死。
+pub(crate) const K3S_KUBECONFIG: &str = "/etc/rancher/k3s/k3s.yaml";
+
+/// 投影进 Pod 的服务账号令牌：in-cluster 配置的另一半（另一半是环境变量里的端点）。
+pub(crate) const SERVICE_ACCOUNT_TOKEN: &str =
+    "/var/run/secrets/kubernetes.io/serviceaccount/token";
+
+/// 这个进程能不能指望 `kubectl` 读到集群：kubeconfig 的三处来源与 in-cluster 的
+/// 两件套，一处都没有时谁也别怪集群。
+///
+/// 字段是"看到的样子"，判据是纯函数（[`Self::check`]），真值表因此可以在不碰进程
+/// 环境的前提下逐行断言——这份检查一旦误判就会把一个好好的滚动判死，所以它自己
+/// 必须能被测出每一行。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ClusterConfigSources {
+    /// `KUBECONFIG` 指向的、确实存在的文件（可以多个，冒号分隔）。
+    pub kubeconfig_files: Vec<String>,
+    /// `$HOME/.kube/config` 在不在。
+    pub home_config: bool,
+    /// k3s 自带的那份 kubeconfig 在不在。
+    pub k3s_config: bool,
+    /// `KUBERNETES_SERVICE_HOST` / `_PORT`：in-cluster 的端点。
+    pub in_cluster_host: Option<String>,
+    pub in_cluster_port: Option<String>,
+    /// 投影进来的服务账号令牌在不在。
+    pub service_account_token: bool,
+    /// `$HOME` 本身；读不到时用它解释"为什么没查那一条"。
+    pub home: Option<String>,
+}
+
+impl ClusterConfigSources {
+    /// 读这个进程与它所在的 Pod 此刻的样子。只读，不改任何东西。
+    pub(crate) fn observe() -> Self {
+        let env = |key: &str| {
+            std::env::var(key)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let home = env("HOME");
+        let kubeconfig_files = env("KUBECONFIG")
+            .map(|v| {
+                v.split(':')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty() && Path::new(p).is_file())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            kubeconfig_files,
+            home_config: home
+                .as_deref()
+                .map(|h| Path::new(h).join(".kube/config").is_file())
+                .unwrap_or(false),
+            k3s_config: Path::new(K3S_KUBECONFIG).is_file(),
+            in_cluster_host: env("KUBERNETES_SERVICE_HOST"),
+            in_cluster_port: env("KUBERNETES_SERVICE_PORT"),
+            service_account_token: Path::new(SERVICE_ACCOUNT_TOKEN).is_file(),
+            home,
+        }
+    }
+
+    /// `Ok` = 至少有一条路能让 kubectl 读到集群；`Err` = 四处全无，一行说清缺哪。
+    pub(crate) fn check(&self) -> Result<(), String> {
+        let kubeconfig = !self.kubeconfig_files.is_empty() || self.home_config || self.k3s_config;
+        let in_cluster = self.in_cluster_host.is_some()
+            && self.in_cluster_port.is_some()
+            && self.service_account_token;
+        if kubeconfig || in_cluster {
+            return Ok(());
+        }
+        Err(format!(
+            "{CLUSTER_CONFIG_MISSING_MARKER}: kubectl would fall back to \
+             {LOCALHOST_FALLBACK_ADDRESS} and every query would be refused there. {}",
+            self.describe()
+        ))
+    }
+
+    /// 四处来源各是什么样子，一句话。判词里带上它，读的人就不必再进一次 Pod 才能
+    /// 分清"没有配置"与"配置齐了而集群没通"——两者在 kubectl 的原文里同形。
+    pub(crate) fn describe(&self) -> String {
+        let kubeconfig = if self.kubeconfig_files.is_empty() {
+            "KUBECONFIG unset or pointing at no existing file".to_string()
+        } else {
+            format!("KUBECONFIG → {}", self.kubeconfig_files.join(", "))
+        };
+        let home = match &self.home {
+            Some(h) => format!(
+                "{h}/.kube/config {}",
+                if self.home_config {
+                    "present"
+                } else {
+                    "missing"
+                }
+            ),
+            None => "HOME unset so $HOME/.kube/config was not looked for".to_string(),
+        };
+        format!(
+            "{kubeconfig}; {home}; {K3S_KUBECONFIG} {}; \
+             KUBERNETES_SERVICE_HOST {}, KUBERNETES_SERVICE_PORT {}, \
+             {SERVICE_ACCOUNT_TOKEN} {}",
+            if self.k3s_config {
+                "present"
+            } else {
+                "missing"
+            },
+            self.in_cluster_host.as_deref().unwrap_or("unset"),
+            self.in_cluster_port.as_deref().unwrap_or("unset"),
+            if self.service_account_token {
+                "readable"
+            } else {
+                "missing"
+            },
+        )
+    }
+}
+
+/// 镜像一次都还没动时的落点。快照阶段只有这几类非版本失败会出现——调度器判决
 /// 得等新 Pod 出现，这里还没有新 Pod。
 pub(crate) fn locate_before_any_change(msg: &str) -> FailureLocus {
     let msg = primary_message(msg);
-    if is_cluster_unreachable(msg) {
+    // 配置缺失排在不可达之前：它自己的措辞里也可能带着 `connection refused`
+    // （判词是 us 拼的，但我们同时把 kubectl 原文附在后面），而两者修法不同。
+    if is_cluster_config_missing(msg) {
+        FailureLocus::ClusterConfig
+    } else if is_cluster_unreachable(msg) {
         FailureLocus::Unreachable
     } else if is_observation_tool_failure(msg) {
         FailureLocus::Tool
@@ -1720,10 +1871,16 @@ impl RolloutExecutor {
                 ))
             })?;
         if !output.status.success() {
-            return Err(SFError::IO(format!(
-                "{cmdline} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // 回落到 localhost:8080 说明这个进程一份配置都没读到（或那份配置指的就是
+            // 本机回环）。把四处来源的读数附在后面：判词要能自己回答"该补哪一处"，
+            // 否则读的人还得进一次 Pod，而 Pod 那时已经没了。
+            let note = if stderr.contains(LOCALHOST_FALLBACK_ADDRESS) {
+                format!(" ({})", ClusterConfigSources::observe().describe())
+            } else {
+                String::new()
+            };
+            return Err(SFError::IO(format!("{cmdline} failed: {stderr}{note}")));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
@@ -3828,7 +3985,19 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
             upstreams: parsed.ci_upstreams,
         })
     };
-    match executor.run(&plan).await {
+    // 第一件事是问自己够不够格提问：一处集群配置都没有时，后面每一次查询都只会
+    // 在 localhost:8080 上被拒，而 `probe` 会把"连接被拒"当成集群抖动重试到预算
+    // 耗尽（现场 59 次 / 303 秒），最后落一条指向 apiserver 的判词。凭据重试换
+    // 不来，所以就地判死，并把缺的是哪一处写进判词。
+    let outcome = match ClusterConfigSources::observe().check() {
+        Err(note) => Err(classify_before_any_change(
+            ROLLOUT_PRECHECK_STAGE,
+            "",
+            SFError::IO(note),
+        )),
+        Ok(()) => executor.run(&plan).await,
+    };
+    match outcome {
         // 成功也留下读数：这一轮跑得离上限有多近，只有跑完的这一刻在同一个进程里
         // 对照得出来（上限写在 Job 清单里，用掉的量在这个容器自己的 cgroup 里）。
         Ok(()) => {

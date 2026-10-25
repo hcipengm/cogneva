@@ -1117,6 +1117,17 @@ pub(crate) enum FailureLocus {
     Placement,
     /// 观测工具本身起不来：一次查询都没发出去。
     Tool,
+    /// 观测工具能起来，但**这个进程手里一份集群配置都没有**：kubectl 回落到
+    /// `http://localhost:8080`，每一次查询都在本机回环上被拒。
+    ///
+    /// 与 [`FailureLocus::Tool`] 分开，因为修法不同：那一处要修的是二进制本身
+    /// （没挂上、没有可执行位），这一处要修的是 Pod 的凭据面（投影令牌、in-cluster
+    /// 环境变量）。与 [`FailureLocus::Unreachable`] 分开，因为那一处的重试**有可能
+    /// 等到**（apiserver 抖动），这一处重试多少次都是同一份答案——它说的不是集群
+    /// 此刻怎样，而是本进程缺东西。两者在 kubectl 的原文里同形（都带
+    /// `connection refused`），所以判据不靠措辞：本进程在第一次查询之前自己看过
+    /// 那四处来源，缺了就地判死并带上 `no cluster config in this process`。
+    ClusterConfig,
     /// 授权被拒：读不到要看的东西。
     AuthDenied,
     /// 镜像源没供上镜像：新副本卡在拉取上，一次都没跑起来。
@@ -1172,12 +1183,13 @@ impl KilledReason {
 
 impl FailureLocus {
     /// 全部落点，供读回签名时校验值域用。
-    const ALL: [FailureLocus; 14] = [
+    const ALL: [FailureLocus; 15] = [
         FailureLocus::Unreachable,
         FailureLocus::Admission,
         FailureLocus::Reference,
         FailureLocus::Placement,
         FailureLocus::Tool,
+        FailureLocus::ClusterConfig,
         FailureLocus::AuthDenied,
         FailureLocus::ImageSource,
         FailureLocus::NeverRan,
@@ -1196,6 +1208,7 @@ impl FailureLocus {
             FailureLocus::Reference => "reference",
             FailureLocus::Placement => "placement",
             FailureLocus::Tool => "tool",
+            FailureLocus::ClusterConfig => "cluster-config",
             FailureLocus::AuthDenied => "auth",
             FailureLocus::ImageSource => "image-source",
             FailureLocus::NeverRan => "never-ran",
@@ -1217,6 +1230,10 @@ impl FailureLocus {
     ///
     /// "新版本一个 Pod 都没建成"同理：控制器建 Pod 发生在新版本的任何容器跑起来
     /// 之前，所以它连"没跑起来"都不是——是**还没轮到它**。
+    ///
+    /// 本进程没有集群配置同理，且**两个阶段都是环境类**：它说的既不是这一版的好坏，
+    /// 也不是集群此刻好不好，而是这个判定进程的凭据面。回滚退的是镜像，修不好一份
+    /// 没投影进来的令牌。
     ///
     /// 被杀这一档**两个阶段都按版本类**，尽管它同样是"说不出新版本好坏"。理由是
     /// 上限里装的可能是新版本自己的二进制：容器吃爆上限时，说不清是上限太小还是
@@ -1242,6 +1259,7 @@ impl FailureLocus {
                     | FailureLocus::Reference
                     | FailureLocus::Placement
                     | FailureLocus::Tool
+                    | FailureLocus::ClusterConfig
                     | FailureLocus::ImageSource
                     | FailureLocus::NeverRan
             )
@@ -9562,16 +9580,18 @@ mod tests {
         admission_rejection, admission_shortfall, bundle_declared_containers, changed_configmaps,
         changed_workloads, classify_before_any_change, config_change_needs_restart,
         config_consumers, defined_objects, deployment_surges, environment_class,
-        image_pull_blocked, is_admission_denied, is_image_source_unavailable, is_placement_blocked,
-        locate_before_any_change, normalize_placement_shape, parse_rollout_args, pod_samples,
-        pod_selector, pod_template_limits, pod_waiting_states, readiness_overdue,
-        replicaset_failures, rollout_converged, rollout_pods_fatal, rollout_pods_ready,
-        stage_rollout_manifest, staged_manifest_path, summarize_events, summarize_pod_states,
-        support_pod_causes, support_pod_selector, support_settled, unresolved_configmaps,
-        unschedulable_pods, write_termination_message, ProbeCycle, RefSnapshots, ReplicaSetFailure,
-        RewrittenRef, RolloutExecutor, RolloutPlan, SupportCause, SupportWorkload, UpstreamCiAsk,
-        UpstreamCiTarget, ADMISSION_DENIED_MARKER, IMAGE_PULL_WAITING_REASONS,
-        NEW_REVISION_NEVER_RAN_MARKER, PLACEMENT_BLOCKED_MARKER, SUPPORT_CAUSE_POD_LIMIT,
+        image_pull_blocked, is_admission_denied, is_cluster_config_missing,
+        is_image_source_unavailable, is_placement_blocked, locate_before_any_change,
+        normalize_placement_shape, parse_rollout_args, pod_samples, pod_selector,
+        pod_template_limits, pod_waiting_states, readiness_overdue, replicaset_failures,
+        rollout_converged, rollout_pods_fatal, rollout_pods_ready, stage_rollout_manifest,
+        staged_manifest_path, summarize_events, summarize_pod_states, support_pod_causes,
+        support_pod_selector, support_settled, unresolved_configmaps, unschedulable_pods,
+        write_termination_message, ClusterConfigSources, ProbeCycle, RefSnapshots,
+        ReplicaSetFailure, RewrittenRef, RolloutExecutor, RolloutPlan, SupportCause,
+        SupportWorkload, UpstreamCiAsk, UpstreamCiTarget, ADMISSION_DENIED_MARKER,
+        IMAGE_PULL_WAITING_REASONS, K3S_KUBECONFIG, NEW_REVISION_NEVER_RAN_MARKER,
+        PLACEMENT_BLOCKED_MARKER, SERVICE_ACCOUNT_TOKEN, SUPPORT_CAUSE_POD_LIMIT,
     };
 
     #[test]
@@ -9643,6 +9663,161 @@ exit 1
             argv.contains("--request-timeout=27s"),
             "kubectl must carry a deadline of its own, not only the outer kill: {argv}"
         );
+    }
+
+    /// 配置预检的真值表。四条来源里任意一条成立就不许判死——这份检查一旦误判，
+    /// 一个好好的滚动会在第一个动作之前被它自己挡下来。
+    #[test]
+    fn cluster_config_is_judged_by_the_sources_that_are_actually_there() {
+        let nothing = ClusterConfigSources::default();
+        let err = nothing.check().unwrap_err();
+        assert!(is_cluster_config_missing(&err), "{err}");
+        // 缺什么要能读出来，否则读判词的人还得进一次 Pod。
+        for needle in [
+            "KUBECONFIG",
+            "/.kube/config",
+            K3S_KUBECONFIG,
+            "KUBERNETES_SERVICE_HOST",
+            SERVICE_ACCOUNT_TOKEN,
+        ] {
+            assert!(err.contains(needle), "the note must name {needle}: {err}");
+        }
+        assert!(
+            nothing.describe().contains("HOME unset"),
+            "{}",
+            nothing.describe()
+        );
+
+        // 四条来源各自单独成立时都必须放行。
+        let cases: [(&str, ClusterConfigSources); 4] = [
+            (
+                "KUBECONFIG",
+                ClusterConfigSources {
+                    kubeconfig_files: vec!["/tmp/kubeconfig".into()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "$HOME/.kube/config",
+                ClusterConfigSources {
+                    home: Some("/home/x".into()),
+                    home_config: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "k3s kubeconfig",
+                ClusterConfigSources {
+                    k3s_config: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "in-cluster",
+                ClusterConfigSources {
+                    in_cluster_host: Some("10.43.0.1".into()),
+                    in_cluster_port: Some("443".into()),
+                    service_account_token: true,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (label, sources) in cases {
+            assert!(
+                sources.check().is_ok(),
+                "{label} alone must be enough to start asking the cluster: {sources:?}"
+            );
+        }
+
+        // 现场那一份：端点有、令牌没有（或反过来）都不算 in-cluster 配置——
+        // 半个 in-cluster 比没有更容易被读成"集群连不上"。
+        for half in [
+            ClusterConfigSources {
+                in_cluster_host: Some("10.43.0.1".into()),
+                in_cluster_port: Some("443".into()),
+                ..Default::default()
+            },
+            ClusterConfigSources {
+                in_cluster_host: Some("10.43.0.1".into()),
+                in_cluster_port: Some("443".into()),
+                service_account_token: false,
+                ..Default::default()
+            },
+        ] {
+            assert!(half.check().is_err(), "half an in-cluster config: {half:?}");
+        }
+        // `HOME` 有值但没有 `$HOME/.kube/config`：这是 Job Pod 的常态形状，不是
+        // 一条来源。`KUBECONFIG` 指向不存在的文件同理——`observe` 只收下存在的
+        // 文件，kubectl 也会去查下一处。
+        let home_without_config = ClusterConfigSources {
+            home: Some("/root".into()),
+            ..Default::default()
+        };
+        let err = home_without_config.check().unwrap_err();
+        assert!(
+            err.contains("/root/.kube/config missing"),
+            "the note must say the file was looked for and not found: {err}"
+        );
+    }
+
+    /// 预检判死落在哪个类别上：环境类（不回滚、不占尝试预算），落点单列，
+    /// 这样读判词的人不会去看 apiserver，也不会去翻二进制。
+    #[test]
+    fn a_process_with_no_cluster_config_is_an_environment_finding_of_its_own_kind() {
+        let note = ClusterConfigSources::default().check().unwrap_err();
+        let failure =
+            classify_before_any_change(ROLLOUT_PRECHECK_STAGE, "", SFError::IO(note.clone()));
+        assert_eq!(failure.class, FailureClass::Environment);
+        assert_eq!(
+            failure.signature,
+            format!("environment:{ROLLOUT_PRECHECK_STAGE}::cluster-config"),
+            "signature: {}",
+            failure.signature
+        );
+        // 落点要认得自己的标记，而不是靠措辞去猜。
+        assert_eq!(locate_before_any_change(&note), FailureLocus::ClusterConfig);
+        // 两个阶段的类别一致：它说的既不是这一版的好坏，也不是集群此刻好不好。
+        assert_eq!(
+            FailureLocus::ClusterConfig.class(true),
+            FailureClass::Environment
+        );
+        assert_eq!(
+            FailureLocus::ClusterConfig.class(false),
+            FailureClass::Environment
+        );
+        assert!(FailureLocus::ALL.contains(&FailureLocus::ClusterConfig));
+    }
+
+    /// 真回落到 localhost:8080 时（配置齐了而集群没通，或配置指的就是本机回环），
+    /// 判词里要带上四处来源的读数——那时 Pod 已经没了，读的人打不开它。
+    #[tokio::test]
+    async fn the_config_reading_rides_along_when_kubectl_falls_back_to_localhost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let script = r#"#!/bin/sh
+echo 'The connection to the server localhost:8080 was refused - did you specify the right host or port?' >&2
+exit 1
+"#;
+        write_fake_bin(&dir, "fake-kubectl", script);
+        let executor = RolloutExecutor::new(
+            dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            300,
+            900,
+        );
+        let err = executor
+            .probe(&["get", "deployment", "cogneva", "-o", "json"], 30, 0)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        for needle in ["KUBECONFIG", K3S_KUBECONFIG, SERVICE_ACCOUNT_TOKEN] {
+            assert!(
+                msg.contains(needle),
+                "the verdict must say which sources were looked at ({needle}): {msg}"
+            );
+        }
     }
 
     /// 名字不带前导斜杠，目录名前后多余的斜杠由这里收掉。
