@@ -71,12 +71,26 @@ export function TitleBar() {
         >
           <Icon name="settings" size={14} />
         </button>
-        <span
-          className="mono ml-1 flex h-5 w-5 items-center justify-center border border-[var(--line-strong)] text-[10px] text-[var(--paper-dim)]"
-          title={username ?? '未登录'}
+        <button
+          type="button"
+          onClick={() => setPalette('help')}
+          title="去哪找什么"
+          aria-label="帮助：去哪找什么"
+          className="flex h-6 w-6 items-center justify-center text-[var(--muted)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
+        >
+          <Icon name="help" size={14} />
+        </button>
+        {/* 账号位以前是一个不可点的方块：读者点它，什么都问不出来。它现在是
+            通往账号与凭据那一页的入口——上面写着谁登录了，点开就是那一页。 */}
+        <button
+          type="button"
+          onClick={() => setActivity('settings')}
+          title={username ? `${username} · 账号与凭据` : '还没登录 · 去设置'}
+          aria-label="账号与凭据"
+          className="mono ml-1 flex h-5 w-5 items-center justify-center border border-[var(--line-strong)] text-[10px] text-[var(--paper-dim)] transition-colors hover:border-[var(--brass)] hover:text-[var(--paper)]"
         >
           {initial}
-        </span>
+        </button>
       </div>
     </header>
   );

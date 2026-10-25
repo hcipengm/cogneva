@@ -14,7 +14,7 @@ import { THEMES } from '@/styles/themes';
  */
 interface Command {
   id: string;
-  group: '前往' | '动作' | '主题';
+  group: '前往' | '动作' | '主题' | '帮助';
   title: string;
   hint?: string;
   run: () => void;
@@ -35,6 +35,7 @@ function matches(text: string, query: string): boolean {
 
 export function Palette() {
   const mode = useShell((s) => s.palette);
+  const seed = useShell((s) => s.paletteSeed);
   const setPalette = useShell((s) => s.setPalette);
   const setActivity = useShell((s) => s.setActivity);
   const toggleSidebar = useShell((s) => s.toggleSidebar);
@@ -53,12 +54,12 @@ export function Palette() {
 
   useEffect(() => {
     if (mode === 'closed') return;
-    setQuery('');
+    setQuery(seed);
     setIndex(0);
     // 浮层刚挂上时输入框还没焦点；下一帧再抓，否则打出来的第一个字落空。
     const frame = requestAnimationFrame(() => inputRef.current?.focus());
     return () => cancelAnimationFrame(frame);
-  }, [mode]);
+  }, [mode, seed]);
 
   useEffect(() => {
     setIndex(0);
@@ -159,9 +160,46 @@ export function Palette() {
     setTheme,
   ]);
 
+  /**
+   * 帮助不是一段说明，是一张「问一句 → 去一处」的表。
+   *
+   * 每一条都以人真正会问的那句话开头，落到一个真的能打开的地方。写成「点击左侧
+   * 观测图标进入观测面板」那种句子，界面一改版它就开始说假话；写成去处，它随
+   * 界面一起对。
+   */
+  const help = useMemo<Command[]>(() => {
+    const go = (id: ActivityId, title: string, hint: string): Command => ({
+      id: `help:${id}`,
+      group: '帮助',
+      title,
+      hint,
+      run: () => setActivity(id),
+    });
+    return [
+      {
+        id: 'help:llm',
+        group: '帮助',
+        title: '模型上游在哪配？接哪一个模型、密钥放哪',
+        hint: '只在安全网关里配',
+        run: openLlmSetup,
+      },
+      go('observability', '集群现在什么状态？机器、负载、资源', VIEW_TITLES.observability),
+      go('agents', '谁在替我干活？在岗的智能体与它们的上下文', VIEW_TITLES.agents),
+      go('tasks', '这件事排到哪一步了？', VIEW_TITLES.tasks),
+      go('changes', '我提的改动是怎么进到集群里的？', VIEW_TITLES.changes),
+      go('governance', '哪条规则把我挡下来了？', VIEW_TITLES.governance),
+      go('audit', '这一屏的数字能追到源头吗？', VIEW_TITLES.audit),
+      go('alerts', '现在有什么在报警？', VIEW_TITLES.alerts),
+      go('inbox', '有没有人找我？', VIEW_TITLES.inbox),
+      go('files', '代码和文档在哪看、在哪改？', VIEW_TITLES.files),
+      go('settings', '账号、主题、模型入口', VIEW_TITLES.settings),
+    ];
+  }, [openLlmSetup, setActivity]);
+
+  const source = mode === 'help' ? help : commands;
   const visible = useMemo(
-    () => commands.filter((c) => matches(`${c.title} ${c.hint ?? ''}`, query)),
-    [commands, query]
+    () => source.filter((c) => matches(`${c.title} ${c.hint ?? ''}`, query)),
+    [source, query]
   );
 
   if (mode === 'closed') return null;
@@ -206,11 +244,21 @@ export function Palette() {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={onKeyDown}
-            placeholder={mode === 'commands' ? '输入命令…' : '打开哪一页…'}
+            placeholder={
+              mode === 'commands'
+                ? '输入命令…'
+                : mode === 'help'
+                  ? '你想找什么…'
+                  : '打开哪一页…'
+            }
             className="mono flex-1 bg-transparent text-[13px] text-[var(--paper)] outline-none placeholder:text-[var(--muted)]"
-            aria-label="命令面板"
+            aria-label={mode === 'help' ? '帮助' : '命令面板'}
           />
-          <span className="text-[10px] text-[var(--muted)]">esc 关闭 · ↑↓ 选择 · ↵ 执行</span>
+          <span className="text-[10px] text-[var(--muted)]">
+            {mode === 'help'
+              ? '⌘K 命令 · ⌘P 打开页 · ⌘B 侧栏 · ⌘J 面板'
+              : 'esc 关闭 · ↑↓ 选择 · ↵ 执行'}
+          </span>
         </div>
         <div className="max-h-[52vh] overflow-y-auto">
           {visible.length === 0 && (

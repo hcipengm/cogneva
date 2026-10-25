@@ -58,8 +58,17 @@ interface ShellState {
   activeTabId: string;
   panelOpen: boolean;
   panelTab: PanelTab;
-  /** 命令面板与快速打开共用一个浮层，`mode` 决定它问的是什么。 */
-  palette: 'closed' | 'commands' | 'open';
+  /**
+   * 命令面板、快速打开、帮助共用一个浮层，`mode` 决定它问的是什么。
+   * `help` 是「这个界面去哪找什么」：问号按钮打开它，答案是一条条能走到的去处，
+   * 而不是一段说明文字——说明书和界面一旦分开，界面改版时说明书永远落后。
+   */
+  palette: 'closed' | 'commands' | 'open' | 'help';
+  /**
+   * 打开面板时预填的查询。问号按钮与「这一页有哪些动作」这类入口要落到一个
+   * 已经缩小过的列表上——面板打开后一片空白，读者还得自己想搜什么。
+   */
+  paletteSeed: string;
   /** 底部输出格的累积行。命令与失败都写在这里，读者不必打开控制台。 */
   output: string[];
   /**
@@ -76,7 +85,7 @@ interface ShellState {
   activateTab: (id: string) => void;
   togglePanel: () => void;
   setPanelTab: (tab: PanelTab) => void;
-  setPalette: (mode: ShellState['palette']) => void;
+  setPalette: (mode: ShellState['palette'], seed?: string) => void;
   appendOutput: (line: string) => void;
   clearOutput: () => void;
   setReveal: (reveal: ShellState['reveal']) => void;
@@ -96,6 +105,7 @@ export const useShell = create<ShellState>((set, get) => ({
   panelOpen: false,
   panelTab: 'problems',
   palette: 'closed',
+  paletteSeed: '',
   output: [],
   reveal: null,
 
@@ -159,7 +169,7 @@ export const useShell = create<ShellState>((set, get) => ({
 
   togglePanel: () => set((state) => ({ panelOpen: !state.panelOpen })),
   setPanelTab: (panelTab) => set({ panelTab, panelOpen: true }),
-  setPalette: (palette) => set({ palette }),
+  setPalette: (palette, seed = '') => set({ palette, paletteSeed: seed }),
   appendOutput: (line) =>
     set((state) => ({
       // 输出格是「刚刚发生了什么」的读面，不是历史档案：保留最后 500 行，
