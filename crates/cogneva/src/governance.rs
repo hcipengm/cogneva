@@ -1189,7 +1189,7 @@ mod tests {
     fn a_standing_row_written_before_the_owner_moved_follows_the_face() {
         let mut stale = Task::new(
             "face-work-~901a~4fe1",
-            TaskType::DagNode,
+            cog_core::TaskType::DagNode,
             serde_json::json!({
                 "goal": "keep the face in the target state",
                 "face": "通信",
