@@ -60,6 +60,7 @@ const TITLES: Record<ActivityId, string> = {
   resources: '资源',
   storage: '存储',
   eval: '评测',
+  timeline: '时间轴',
   delivery: '构建与部署',
   audit: '审计',
   settings: '设置',
@@ -467,6 +468,26 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             links={[
               { id: 'changes', label: '变更', note: '这次改动凭什么进集群' },
               { id: 'storage', label: '存储', note: '数据目录里还有什么' },
+            ]}
+          />
+        </>
+      );
+
+    case 'timeline':
+      return (
+        <>
+          <Section title="这一面怎么读">
+            <Row label="轨迹" note="一次执行落盘的一份" />
+            <Row label="拖动" note="拖到哪一帧就是那时的样子" />
+            <Note>
+              这里拖的是真的记下来的帧，不是动画重演；没有补帧。刷新不丢——它来自采集器的
+              存储，不是这台浏览器收到的流。
+            </Note>
+          </Section>
+          <CrossLinks
+            links={[
+              { id: 'agents', label: '智能体', note: '现在谁在跑' },
+              { id: 'tasks', label: '任务', note: '这件事的结局' },
             ]}
           />
         </>

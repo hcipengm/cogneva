@@ -25,6 +25,7 @@ export type ActivityId =
   | 'resources'
   | 'storage'
   | 'eval'
+  | 'timeline'
   | 'delivery'
   | 'audit'
   | 'settings';
@@ -46,6 +47,7 @@ export const VIEW_TITLES: Record<ActivityId, string> = {
   resources: '资源',
   storage: '存储',
   eval: '评测',
+  timeline: '时间轴',
   delivery: '构建与部署',
   audit: '审计',
   settings: '设置',

@@ -16,6 +16,7 @@ import { SettingsView } from '@/views/SettingsView';
 import { SourceControlView } from '@/views/SourceControlView';
 import { StorageView } from '@/views/StorageView';
 import { TasksView } from '@/views/TasksView';
+import { TimelineView } from '@/views/TimelineView';
 import { WorkspaceView } from '@/views/WorkspaceView';
 import { Empty } from '@/ui/primitives';
 
@@ -62,6 +63,8 @@ export function ViewFor({ view }: { view: string }) {
       return <StorageView />;
     case 'eval':
       return <EvalView />;
+    case 'timeline':
+      return <TimelineView />;
     case 'delivery':
       return <DeliveryView />;
     case 'audit':

@@ -873,6 +873,55 @@ export async function getTaskCollaboration(taskId: string): Promise<TaskCollabor
   );
 }
 
+/** 一份被采集下来的执行轨迹的元数据。 */
+export interface TraceMeta {
+  trace_id: string;
+  agent_id: string;
+  task_id: string;
+  event_count: number;
+  created_at: string;
+  tier: string;
+}
+
+export async function listTraces(limit = 50): Promise<TraceMeta[]> {
+  const page = await api.get<{ traces: TraceMeta[] }>(`/api/v1/traces?limit=${limit}`);
+  return page.traces ?? [];
+}
+
+/**
+ * 一份轨迹里的一帧。
+ *
+ * 服务端把变体的字段平铺在 `type` 旁边，没有第二层信封——所以这里除 `type` 与
+ * `timestamp` 之外的一切都属于这一帧自己。
+ */
+export interface WireFrame {
+  type: string;
+  timestamp: string;
+  [field: string]: unknown;
+}
+
+export interface AgentTrace {
+  trace_id: string;
+  session_id?: string | null;
+  task_id: string;
+  agent_id: string;
+  created_at: string;
+  event_count: number;
+  byte_size: number;
+  version: string;
+  tier: string;
+  compression: number;
+  checksum: string;
+  events: WireFrame[];
+  llm_requests?: unknown[];
+  llm_responses?: unknown[];
+  tool_calls?: unknown[];
+}
+
+export async function getTrace(traceId: string): Promise<AgentTrace> {
+  return api.get<AgentTrace>(`/api/v1/traces/${encodeURIComponent(traceId)}`);
+}
+
 export interface BackendHealth {
   name: string;
   status: 'up' | 'down' | 'degraded' | 'unknown' | string;

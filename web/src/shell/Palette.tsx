@@ -192,6 +192,7 @@ export function Palette() {
       go('audit', '这一屏的数字能追到源头吗？', VIEW_TITLES.audit),
       go('alerts', '现在有什么在报警？', VIEW_TITLES.alerts),
       go('inbox', '有没有人找我？', VIEW_TITLES.inbox),
+      go('timeline', '那一次到底发生了什么？倒回去看一帧一帧', VIEW_TITLES.timeline),
       go('eval', '这东西测得出来吗？跑过几次、结论是什么？', VIEW_TITLES.eval),
       go('storage', '平台自己存了些什么？占多大？', VIEW_TITLES.storage),
       go('files', '代码和文档在哪看、在哪改？', VIEW_TITLES.files),
