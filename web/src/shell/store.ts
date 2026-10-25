@@ -17,6 +17,7 @@ export type ActivityId =
   | 'agents'
   | 'tasks'
   | 'flow'
+  | 'comms'
   | 'alerts'
   | 'changes'
   | 'governance'
@@ -35,6 +36,7 @@ export const VIEW_TITLES: Record<ActivityId, string> = {
   agents: '智能体',
   tasks: '任务',
   flow: '流程',
+  comms: '通信',
   alerts: '告警',
   changes: '变更',
   governance: '治理',

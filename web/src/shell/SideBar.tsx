@@ -52,6 +52,7 @@ const TITLES: Record<ActivityId, string> = {
   agents: '智能体',
   tasks: '任务',
   flow: '流程',
+  comms: '通信',
   alerts: '告警',
   changes: '变更',
   governance: '治理',
@@ -380,6 +381,28 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             links={[
               { id: 'tasks', label: '任务', note: '依赖与归属的细节' },
               { id: 'agents', label: '智能体', note: '执行者自己的读数' },
+            ]}
+          />
+        </>
+      );
+
+    case 'comms':
+      return (
+        <>
+          <Section title="边的四种">
+            <Row label="交接" note="跑完了，下游被放出来" tone="var(--paper-dim)" />
+            <Row label="重试" note="失败，还会再跑一次" tone="var(--warn)" />
+            <Row label="死信" note="失败，不再重试" tone="var(--danger)" />
+            <Row label="重启" note="这一格没有写入者" />
+            <Note>
+              图在网关进程的内存里，重启即空。空图是「这个进程还没见过一次完成」，
+              不是「没有过交接」。
+            </Note>
+          </Section>
+          <CrossLinks
+            links={[
+              { id: 'tasks', label: '任务', note: '依赖与结局的细节' },
+              { id: 'flow', label: '流程', note: '停在哪一段' },
             ]}
           />
         </>

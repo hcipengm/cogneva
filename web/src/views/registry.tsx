@@ -2,6 +2,7 @@ import { AgentsView } from '@/views/AgentsView';
 import { AlertsView } from '@/views/AlertsView';
 import { AuditView } from '@/views/AuditView';
 import { ChangesView } from '@/views/ChangesView';
+import { CommsView } from '@/views/CommsView';
 import { DeliveryView } from '@/views/DeliveryView';
 import { DiffView } from '@/views/DiffView';
 import { FilesView } from '@/views/FilesView';
@@ -43,6 +44,8 @@ export function ViewFor({ view }: { view: string }) {
       return <TasksView />;
     case 'flow':
       return <FlowView />;
+    case 'comms':
+      return <CommsView />;
     case 'agents':
       return <AgentsView />;
     case 'changes':

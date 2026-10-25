@@ -826,6 +826,53 @@ export async function listTasks(params: {
   return params.limit ? rows.slice(0, params.limit) : rows;
 }
 
+/** 一条交接边：`source` 的结局引出了 `target`。 */
+export type CollaborationLinkType = 'hand_off' | 'retry' | 'dead_letter' | 'respawn';
+
+export interface CollaborationLink {
+  source_task_id: string;
+  target_task_id: string;
+  link_type: CollaborationLinkType;
+  agent_id?: string;
+  timestamp: string;
+}
+
+export interface CollaborationStats {
+  total_links: number;
+  handoffs: number;
+  retries: number;
+  dead_letters: number;
+  respawns: number;
+}
+
+/**
+ * 智能体之间的交接图。
+ *
+ * 它由网关里那条任务事件监听器喂出来，只存在那个进程的内存里：重启之后从空开始。
+ * 空的图不读作「没有过交接」，读作「这个进程还没见过一次完成或失败」。
+ */
+export interface CollaborationGraph {
+  links: CollaborationLink[];
+  stats: CollaborationStats;
+}
+
+export interface TaskCollaboration {
+  task_id: string;
+  upstream: CollaborationLink[];
+  downstream: CollaborationLink[];
+}
+
+export async function getCollaborationGraph(): Promise<CollaborationGraph> {
+  return api.get<CollaborationGraph>('/api/v1/collaboration/graph');
+}
+
+/** 一个任务的上游与下游。读的是同一张内存图，所以它的空与整图的空是同一件事。 */
+export async function getTaskCollaboration(taskId: string): Promise<TaskCollaboration> {
+  return api.get<TaskCollaboration>(
+    `/api/v1/collaboration/links/${encodeURIComponent(taskId)}`
+  );
+}
+
 export interface BackendHealth {
   name: string;
   status: 'up' | 'down' | 'degraded' | 'unknown' | string;

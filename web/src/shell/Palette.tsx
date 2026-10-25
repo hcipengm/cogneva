@@ -186,6 +186,7 @@ export function Palette() {
       go('observability', '集群现在什么状态？机器、负载、资源', VIEW_TITLES.observability),
       go('agents', '谁在替我干活？在岗的智能体与它们的上下文', VIEW_TITLES.agents),
       go('tasks', '这件事排到哪一步了？', VIEW_TITLES.tasks),
+      go('comms', '谁把活交给了谁？断在哪一环？', VIEW_TITLES.comms),
       go('changes', '我提的改动是怎么进到集群里的？', VIEW_TITLES.changes),
       go('governance', '哪条规则把我挡下来了？', VIEW_TITLES.governance),
       go('audit', '这一屏的数字能追到源头吗？', VIEW_TITLES.audit),
