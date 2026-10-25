@@ -159,6 +159,9 @@ pub struct EvmAttribution {
     /// 有基线预算、账上却一条花销都没有的任务条数。它不是「免费」，是这笔账
     /// 上看不到它——两个都不该被读成省下来的钱。
     pub baselined_tasks_without_cost: usize,
+    /// 项目里没有基线的任务条数：它们的预算不在挣值里，所以挣值必然少于项目
+    /// 的全部工作量。不报这个数，读者会把「挣值还小」读成「干得少」。
+    pub tasks_outside_baseline: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,24 +171,31 @@ pub struct EvmResponse {
     pub unit: &'static str,
     pub planned_value: EvmReading,
     pub earned_value: EvmReading,
+    /// 整个项目的花销。它不是成本绩效的分母——分母只取有基线的那一部分，
+    /// 见 [`EvmResponse::baselined_actual_cost`]。
     pub actual_cost: EvmReading,
-    /// 成本绩效指数 = 挣值 / 实际成本。两者任一量不出来时为 `None`。
+    /// 有基线的那些任务花掉的 token。**与挣值覆盖同一批任务**，所以它才是
+    /// 成本绩效的分母。
+    ///
+    /// 拿项目总花销当分母会把两个总体相除：一条基线加一百条没基线的任务时，
+    /// 挣值只认那一条，成本认全部——比值被没参与挣值的那部分压低，看起来像
+    /// 「花得多挣得少」，而没有任何一项测量支持这个结论。
+    pub baselined_actual_cost: EvmReading,
+    /// 成本绩效指数 = 挣值 / 有基线任务的实际成本。任一量不出来时为 `None`。
     pub cost_performance_index: Option<f64>,
     /// 进度绩效指数 = 挣值 / 计划价值。
     pub schedule_performance_index: Option<f64>,
     /// 同一窗口里**没有**任务身份的用量。
     ///
-    /// 它不属于任何一个项目，所以不并进上面的成本；它也不折成 0，因为那样
-    /// 成本绩效会把归因缺口读成省钱。`None` 表示这笔账读不到。
-    pub unattributed_tokens: Option<u64>,
-    /// 上面那个数的统计窗口**起点**，终点就是 `source.read_at`。
+    /// 它不属于任何一个项目，所以不并进上面的成本，也不折成 0——那样成本绩效
+    /// 会把归因缺口读成省钱。`None` 表示这笔账读不到。
     ///
-    /// 少了它，那个数会被当成常数带走：同一个部署换个窗口量出来是另一个数，
-    /// 而读面只有比值时读者无法知道自己手上的比值属于哪一窗。
+    /// 这里**只报数，不报比例**：这条账没有项目维度，任何「本项目 X% 的成本
+    /// 看不到出处」的分母都是本项目而分子是全平台，项目越小越接近 100%。
+    pub unattributed_tokens: Option<u64>,
+    /// 上面那个数的统计窗口**起点**，终点就是 `source.read_at`。少了它，这个数
+    /// 会被当成常数带走。
     pub unattributed_window_start: Option<String>,
-    /// 归因缺口占这个窗口花费的比例（无归因 /（无归因 + 本项目有归因））。
-    /// 分母写在 `assumption` 里：口径不写清的比例，下一个读者会按别的分母复算。
-    pub unattributed_share: Option<f64>,
     pub attribution: EvmAttribution,
     /// 算这三个量时用的假设，明写出来。
     pub assumption: String,
@@ -543,13 +553,15 @@ fn build_evm_response(
     unattributed: Option<u64>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> EvmResponse {
-    let (planned_value, earned_value, attribution) = match plans {
+    let (planned_value, earned_value, baselined, attribution) = match plans {
         None => (
             EvmReading::unmeasurable("计划基线读不到：这一部署回答不了「本来该完成多少」"),
             EvmReading::unmeasurable("计划基线读不到：挣值没有分母可比"),
+            Vec::new(),
             EvmAttribution {
                 tasks_with_cost: 0,
                 baselined_tasks_without_cost: 0,
+                tasks_outside_baseline: rows.len(),
             },
         ),
         Some(plans) => {
@@ -557,15 +569,18 @@ fn build_evm_response(
                 .iter()
                 .filter_map(|t| plans.get(&t.id).map(|p| (*t, p)))
                 .collect();
+            let outside = rows.len() - baselined.len();
             if baselined.is_empty() {
                 (
                     EvmReading::unmeasurable(
                         "这个项目里没有一条任务有基线：不是进度为零，是没排过期",
                     ),
                     EvmReading::unmeasurable("没有基线就没有可挣的计划价值"),
+                    baselined,
                     EvmAttribution {
                         tasks_with_cost: 0,
                         baselined_tasks_without_cost: 0,
+                        tasks_outside_baseline: outside,
                     },
                 )
             } else {
@@ -590,18 +605,20 @@ fn build_evm_response(
                     EvmReading::measured(
                         ev,
                         format!(
-                            "{completed} 条已完成任务的基线预算之和，共 {} 条有基线",
+                            "{completed} 条已完成任务的基线预算之和，共 {} 条有基线；\
+                             另外 {outside} 条没有基线，不在挣值里",
                             baselined.len()
                         ),
                     ),
+                    baselined.clone(),
                     {
                         let spent: std::collections::BTreeSet<&str> = spends
                             .map(|s| s.keys().map(String::as_str).collect())
                             .unwrap_or_default();
                         EvmAttribution {
-                            tasks_with_cost: baselined
+                            tasks_with_cost: rows
                                 .iter()
-                                .filter(|(t, _)| spent.contains(t.id.as_str()))
+                                .filter(|t| spent.contains(t.id.as_str()))
                                 .count(),
                             baselined_tasks_without_cost: baselined
                                 .iter()
@@ -610,6 +627,7 @@ fn build_evm_response(
                                         && t.status == TaskStatus::Completed
                                 })
                                 .count(),
+                            tasks_outside_baseline: outside,
                         }
                     },
                 )
@@ -626,19 +644,37 @@ fn build_evm_response(
             EvmReading::measured(
                 total,
                 format!(
-                    "{} 条任务在 `{USAGE_TABLE}` 上按 task_id 聚合的花销；失败调用也计（token 已经烧掉）",
+                    "整个项目 {} 条任务在 `{USAGE_TABLE}` 上按 task_id 聚合的花销；\
+                     失败调用也计（token 已经烧掉）",
                     spends.len()
                 ),
             )
         }
     };
 
-    let cost_performance_index = ratio(earned_value.value, actual_cost.value);
-    let schedule_performance_index = ratio(earned_value.value, planned_value.value);
-    let unattributed_share = match (unattributed, actual_cost.value) {
-        (Some(u), Some(a)) => ratio(Some(u), Some(u.saturating_add(a))),
-        _ => None,
+    // 分母与挣值覆盖同一批任务。项目总花销里有一部分买了没有预算的活，把它算进
+    // 分母就是这样两个总体相除，比值被没参与挣值的那部分压低。
+    let baselined_actual_cost = match spends {
+        None => EvmReading::unmeasurable(format!(
+            "逐笔 token 账读不到（`{USAGE_TABLE}` 没有接上这一部署）：成本量不出来"
+        )),
+        Some(spends) => {
+            let total: u64 = baselined
+                .iter()
+                .filter_map(|(t, _)| spends.get(&t.id).copied())
+                .sum();
+            EvmReading::measured(
+                total,
+                format!(
+                    "有基线的 {} 条任务的花销，与挣值覆盖同一批任务（整个项目的花销见 actual_cost）",
+                    baselined.len()
+                ),
+            )
+        }
     };
+
+    let cost_performance_index = ratio(earned_value.value, baselined_actual_cost.value);
+    let schedule_performance_index = ratio(earned_value.value, planned_value.value);
 
     EvmResponse {
         project_id,
@@ -646,17 +682,18 @@ fn build_evm_response(
         planned_value,
         earned_value,
         actual_cost,
+        baselined_actual_cost,
         cost_performance_index,
         schedule_performance_index,
         unattributed_tokens: unattributed,
         // 只在真读到缺口时给窗口：量不出来的时候给一个窗口，会让读者以为
         // 「这个窗口里一条无归因用量都没有」。
         unattributed_window_start: unattributed.map(|_| evm_window_start(rows, plans).to_rfc3339()),
-        unattributed_share,
         attribution,
         assumption: "计划价值按「已过时间 / 计划总时长」线性折算，没有工作日历；\
-                     挣值只认已完成任务；实际成本取 token 账上按 task_id 聚合的花销；\
-                     归因缺口的分母是「缺口 + 本项目有归因的花销」，不是全平台花销"
+                     挣值只认已完成且有基线的任务；成本绩效的分子分母都是这批有基线的任务\
+                     （实际成本另报整个项目的花销）；无归因用量只报数：这条账没有项目维度，\
+                     拿它比本项目的花销得到的是一个反向比例"
             .to_string(),
         source: Source {
             table: EVM_TABLE,
@@ -1044,14 +1081,9 @@ mod tests {
             1120,
             "两个数加起来才是这个窗口的全部花销"
         );
-        let share = reading.unattributed_share.expect("缺口要有比例");
-        assert!(
-            (share - 120.0 / 1120.0).abs() < 1e-9,
-            "分母是「缺口 + 本项目有归因」，口径写在 assumption 里"
-        );
         assert!(
             reading.unattributed_window_start.is_some(),
-            "不带窗口起点的比例会被下一个读者当成常数带走"
+            "不带窗口起点的数会被下一个读者当成常数带走"
         );
         assert_eq!(reading.attribution.tasks_with_cost, 2);
         assert_eq!(
@@ -1061,6 +1093,59 @@ mod tests {
         assert!(
             EVM_TABLE.contains(USAGE_TABLE),
             "成本那一列的出处必须点名逐笔 token 账"
+        );
+    }
+
+    /// 成本绩效的分子分母必须覆盖同一批任务。一条基线加一百条没基线的任务时，
+    /// 拿项目总花销当分母会把比值压到接近 0——读作「花得多挣得少」，而没有任何
+    /// 一项测量支持这个结论：那些钱买的是没参与挣值的活。
+    #[test]
+    fn cost_performance_divides_two_quantities_measured_over_the_same_tasks() {
+        let now = chrono::Utc::now();
+        let mut a = task("a", Some("g1"));
+        a.status = TaskStatus::Completed;
+        // 没有基线的任务：花了很多钱，但不在挣值里。
+        let unbudgeted = task("u", Some("g1"));
+        let window = (
+            now - chrono::Duration::minutes(5),
+            now + chrono::Duration::minutes(5),
+        );
+        let plans: BTreeMap<String, cog_core::TaskPlan> =
+            [("a".to_string(), plan_between("a", 1000, window.0, window.1))]
+                .into_iter()
+                .collect();
+        let spends: BTreeMap<String, u64> = [("a".to_string(), 500u64), ("u".to_string(), 9000u64)]
+            .into_iter()
+            .collect();
+
+        let reading = build_evm_response(
+            "g1".into(),
+            &[&a, &unbudgeted],
+            Some(&plans),
+            Some(&spends),
+            None,
+            now,
+        );
+
+        assert_eq!(reading.earned_value.value, Some(1000));
+        assert_eq!(reading.actual_cost.value, Some(9500), "项目总花销照报");
+        assert_eq!(
+            reading.baselined_actual_cost.value,
+            Some(500),
+            "分母只取有基线的那一条"
+        );
+        assert_eq!(
+            reading.cost_performance_index,
+            Some(2.0),
+            "1000 挣值 / 500 同批成本；用 9500 会算出 0.105，读作「花得多挣得少」"
+        );
+        assert_eq!(
+            reading.attribution.tasks_outside_baseline, 1,
+            "读者要知道挣值少算了多少条"
+        );
+        assert_eq!(
+            reading.attribution.tasks_with_cost, 2,
+            "账上有花销的是两条，与挣值覆盖的那一批不是一个数"
         );
     }
 

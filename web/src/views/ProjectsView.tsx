@@ -551,6 +551,7 @@ function EarnedValuePanel({
   const pv = evmCell(data.planned_value);
   const ev = evmCell(data.earned_value);
   const ac = evmCell(data.actual_cost);
+  const baselinedAc = evmCell(data.baselined_actual_cost);
   const unit = data.unit;
 
   return (
@@ -580,13 +581,19 @@ function EarnedValuePanel({
             note={ac.note}
           />
           <Reading
+            label={`有基线的成本（${unit}）`}
+            value={baselinedAc.text}
+            tone={baselinedAc.tone}
+            note={baselinedAc.note}
+          />
+          <Reading
             label="成本绩效"
             value={indexText(data.cost_performance_index)}
             tone={indexTone(data.cost_performance_index)}
             note={
               data.cost_performance_index === null
-                ? '挣值或实际成本量不出来，指数就给不出——不是 1.0'
-                : '挣值 / 实际成本；大于 1 是省'
+                ? '挣值或有基线成本量不出来，指数就给不出——不是 1.0'
+                : '挣值 / 有基线任务的实际成本；大于 1 是省。分母与分子覆盖同一批任务'
             }
           />
           <Reading
@@ -610,11 +617,6 @@ function EarnedValuePanel({
             {data.unattributed_tokens === null
               ? '量不了'
               : `${data.unattributed_tokens.toLocaleString()} ${unit}`}
-            {data.unattributed_share !== null && (
-              <span className="ml-2 text-[var(--muted)]">
-                （占本窗 {(data.unattributed_share * 100).toFixed(1)}%）
-              </span>
-            )}
           </span>
         </div>
         <p className="mt-1 text-[var(--muted)]">
@@ -624,12 +626,14 @@ function EarnedValuePanel({
                 data.unattributed_window_start
                   ? new Date(data.unattributed_window_start).toLocaleString()
                   : '起点未知'
-              } 起至本次读取；换个窗口这个比例就变，别把它当常数。`}
+              } 起至本次读取；换个窗口这个数就变，别把它当常数。这里只报数不报比例：
+              这条账没有项目维度，拿它除本项目的花销，项目越小算出的比例越大。`}
         </p>
         <p className="mt-1 text-[var(--muted)]">
           账上有花销的任务 {data.attribution.tasks_with_cost} 条；有基线预算但账上一条花销
           都没有的已完成任务 {data.attribution.baselined_tasks_without_cost} 条——那不是
-          「免费」，是这笔账上看不到它。
+          「免费」，是这笔账上看不到它。另有 {data.attribution.tasks_outside_baseline} 条
+          任务没有基线，它们的预算不在挣值里。
         </p>
         <p className="mt-1 text-[var(--muted)]">{data.assumption}</p>
       </div>

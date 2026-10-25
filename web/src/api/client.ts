@@ -945,6 +945,8 @@ export interface EvmReading {
 export interface EvmAttribution {
   tasks_with_cost: number;
   baselined_tasks_without_cost: number;
+  /** 项目里没有基线的任务条数：它们的预算不在挣值里。 */
+  tasks_outside_baseline: number;
 }
 
 export interface ProjectEvmReading {
@@ -952,17 +954,20 @@ export interface ProjectEvmReading {
   unit: string;
   planned_value: EvmReading;
   earned_value: EvmReading;
+  /** 整个项目的花销。它不是成本绩效的分母。 */
   actual_cost: EvmReading;
+  /** 有基线任务的花销，与挣值覆盖同一批任务——成本绩效的分母。 */
+  baselined_actual_cost: EvmReading;
   cost_performance_index: number | null;
   schedule_performance_index: number | null;
   /**
    * 同一窗口里没有任务身份的用量。它不属于任何项目，所以不进实际成本；
-   * 也不折成 0，那样会把归因缺口读成省钱。
+   * 也不折成 0，那样会把归因缺口读成省钱。只有数、没有比例——这条账没有
+   * 项目维度，拿它比本项目的花销会得到反向比例。
    */
   unattributed_tokens: number | null;
-  /** 上面那个数的窗口起点；终点是 `source.read_at`。不带它，比例会被当常数。 */
+  /** 上面那个数的窗口起点；终点是 `source.read_at`。 */
   unattributed_window_start: string | null;
-  unattributed_share: number | null;
   attribution: EvmAttribution;
   /** 算这三个量用的假设，明写在响应里。 */
   assumption: string;
