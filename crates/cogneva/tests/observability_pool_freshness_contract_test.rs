@@ -164,6 +164,7 @@ const EXEMPT: &[(&str, &str)] = &[
 #[test]
 fn every_rule_that_reads_a_durable_pool_gauge_reads_its_writer_too() {
     let durable = durable_pool_gauges();
+    let heartbeat = cog_gateway::security_gateway::DURABLE_GAUGE_HEARTBEAT.as_secs();
 
     let shipped = shipped_rules();
     // Every exemption has to name a rule that is still shipped: a rename would
@@ -190,7 +191,26 @@ fn every_rule_that_reads_a_durable_pool_gauge_reads_its_writer_too() {
             continue;
         }
         reading_rules += 1;
-        let found = unguarded_store_reading_complaints(&expr, &durable);
+        let mut found = unguarded_store_reading_complaints(&expr, &durable);
+        // A leg whose bound is no longer than the heartbeat is not a leg: a
+        // healthy writer that publishes on the heartbeat sits at exactly that
+        // age between two of its own writes, so the rule drops a live reading
+        // and reports it as a stopped writer. The bound has to be strictly
+        // greater, and it is the heartbeat that decides how much greater.
+        for name in promql::metric_names_in(&expr) {
+            if !durable.contains(&name) {
+                continue;
+            }
+            let Some(bound) = promql::companion_age_bound(&expr, &name) else {
+                continue;
+            };
+            if bound <= heartbeat {
+                found.push(format!(
+                    "`{name}` 的新鲜界 {bound}s 不长于心跳 {heartbeat}s——\
+                     健康的写者在两次自己的发布之间正好是这个年龄，会被读成「写者停了」"
+                ));
+            }
+        }
         if found.is_empty() {
             guarded_rules += 1;
             continue;

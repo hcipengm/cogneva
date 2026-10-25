@@ -541,6 +541,47 @@ tests:
         alertname: llm_pool_open_but_idle
         exp_alerts: []
 
+  # 写者**恰好晚一个周期**（30 分钟），而池真的不可用、一家上游在额度周期里：亮。
+  # 这一格守的是新鲜界的**下限**——界若取成心跳本身（1800s），健康写者在两次发布之间
+  # 正好是这个年龄，会被读成「写者停了」，一条真故障在这里被静音。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_refusal_kind{upstream="u1",kind="quota_cycle"}'
+        values: '1x60'
+      - series: 'llm_upstream_refusal_kind_observed_timestamp_seconds{upstream="u1",kind="quota_cycle"}'
+        values: '3500x60'
+      - series: 'llm_pool_available'
+        values: '0x60'
+      # 60m 那一拍上 age = 3600 - 1800 = 1800：正好一个发布周期。
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '1800x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_down_on_a_quota_cycle
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              upstream: u1
+
+  # 同一个形状，但池级读数的写者已经停满两个周期（60 分钟）：静。
+  # 过期的读数不再算证据；「写者停了」是 `gateway_durable_writes_failing` 的题目，
+  # 两条规则各答各的，不在这条里互相冒充。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_refusal_kind{upstream="u1",kind="quota_cycle"}'
+        values: '1x60'
+      - series: 'llm_upstream_refusal_kind_observed_timestamp_seconds{upstream="u1",kind="quota_cycle"}'
+        values: '3500x60'
+      - series: 'llm_pool_available'
+        values: '0x60'
+      # 60m 那一拍上 age = 3600 - 0 = 3600，不小于界。
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_down_on_a_quota_cycle
+        exp_alerts: []
+
   # 同一家上游同样在额度周期里，但**池是活的**（其余成员还在供）：新的那条静——
   # 有活干的时候不该有人被告知池掉了；而 idle 那条照旧亮，因为「开着却一小时没人
   # 用」在池能接活时仍然是个真问题。这一格守的是新规则的第二条腿（池不可用），
