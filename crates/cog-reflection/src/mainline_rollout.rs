@@ -1611,6 +1611,26 @@ pub(crate) fn config_change_needs_restart(
     }
 }
 
+/// 交给 kubectl 自己的死线，比外层预算短一截。
+///
+/// 外层定时器到点是**杀**进程：它已经写出来的东西（尤其 stderr 上那句原因）
+/// 随进程一起丢掉，留下的只有一句"timed out after Ns"。2026-10-24 那次滚动就是
+/// 这样败的——九次、三百多秒，一次也没留下 kubectl 说的字，事后翻集群日志也判
+/// 不出是 apiserver 卡住还是 Pod 自己的网络栈坏了，同一类失败下一次还会是黑箱。
+///
+/// `--request-timeout` 让 kubectl 先到点、先退出、先说话：它自己的失败文本里有
+/// `dial tcp …: i/o timeout`、`TLS handshake timeout`、`Client.Timeout` 这类
+/// 形状，既够分类（`is_cluster_unreachable` 认的就是这些），也够事后判断。
+/// 外层超时退回纯兜底：只在 kubectl 连自己的死线都没守住（DNS 卡死、exec 插件
+/// 挂住）时才轮得到它。
+///
+/// 余量随预算缩放（十分之一，1–5 秒）：够 kubectl 把话写完，又不至于把一条本来
+/// 能在预算内返回的慢查询截断在它自己手里。
+pub(crate) fn kubectl_request_timeout(timeout_secs: u64) -> u64 {
+    let headroom = (timeout_secs / 10).clamp(1, 5);
+    timeout_secs.saturating_sub(headroom).max(1)
+}
+
 pub struct RolloutExecutor {
     kubectl: String,
     ns: String,
@@ -1668,9 +1688,18 @@ impl RolloutExecutor {
         self
     }
 
-    async fn run_kubectl(&self, args: &[&str], timeout_secs: u64) -> SFResult<String> {
+    pub(crate) async fn run_kubectl(&self, args: &[&str], timeout_secs: u64) -> SFResult<String> {
         let cmdline = format!("kubectl {}", args.join(" "));
-        let mut full: Vec<&str> = vec!["-n", &self.ns];
+        let request_timeout = format!(
+            "--request-timeout={}s",
+            kubectl_request_timeout(timeout_secs)
+        );
+        // 全局旗标放在动词**前面**：kubectl 两种都收，而把动词与它的实参原样留在
+        // 尾部，任何按 argv 尾比对的夹具（以及真要在日志里读这行的人）看到的仍是
+        // 原来那条命令。
+        let mut full: Vec<&str> = vec!["-n", &self.ns, &request_timeout];
+        // kubectl 自己带的死线排在外层兜底之前：到点由它退出并说明原因（连不上
+        // apiserver、握手超时、某个请求慢），而不是被外层定时器杀掉。
         full.extend_from_slice(args);
         let fut = tokio::process::Command::new(&self.kubectl)
             .args(&full)
@@ -1678,7 +1707,12 @@ impl RolloutExecutor {
             .output();
         let output = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
             .await
-            .map_err(|_| SFError::IO(format!("{cmdline} timed out after {timeout_secs}s")))?
+            .map_err(|_| {
+                SFError::IO(format!(
+                    "{cmdline} timed out after {timeout_secs}s (backstop: kubectl was killed \
+                     before its own {request_timeout} deadline could report a cause)"
+                ))
+            })?
             .map_err(|e| {
                 SFError::IO(format!(
                     "{OBSERVATION_TOOL_MARKER}: cannot run {}: {e}",
@@ -2284,7 +2318,12 @@ impl RolloutExecutor {
     /// 后者（查询成功但输出表明版本有问题）立即返回，那是真的版本结论。
     /// 非集群访问类的失败（选择器非法、资源不存在）同样立即返回——它们也是
     /// 明确的观测结果，不该被静默重试吞掉。
-    async fn probe(&self, args: &[&str], timeout_secs: u64, budget_secs: u64) -> SFResult<String> {
+    pub(crate) async fn probe(
+        &self,
+        args: &[&str],
+        timeout_secs: u64,
+        budget_secs: u64,
+    ) -> SFResult<String> {
         let deadline = std::time::Instant::now() + Duration::from_secs(budget_secs);
         // The attempt count and the elapsed time go into the error because the
         // reading has to outlive the process that produced it: one attempt that

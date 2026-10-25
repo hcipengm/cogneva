@@ -9580,6 +9580,71 @@ mod tests {
         assert_eq!(rev12("short"), "short");
     }
 
+    /// kubectl 自己的死线必须排在外层兜底之前，否则到点被杀的总是子进程，
+    /// 它写出来的原因一起丢掉。
+    #[test]
+    fn kubectl_gets_its_own_deadline_just_under_the_outer_backstop() {
+        assert_eq!(crate::mainline_rollout::kubectl_request_timeout(30), 27);
+        assert_eq!(crate::mainline_rollout::kubectl_request_timeout(60), 55);
+        assert_eq!(crate::mainline_rollout::kubectl_request_timeout(300), 295);
+        for budget in [1u64, 2, 3, 10, 60, 300, 3600] {
+            let child = crate::mainline_rollout::kubectl_request_timeout(budget);
+            assert!(child >= 1, "budget {budget} produced a zero deadline");
+            assert!(
+                child <= budget,
+                "budget {budget} -> child {child} outlives it"
+            );
+        }
+    }
+
+    /// 2026-10-24 那次滚动失败留下的是一句 `timed out after 30s (attempts=9 over
+    /// 310s)`，没有一个字来自 kubectl——九次都被外层定时器杀掉，事后判不出是
+    /// apiserver 卡住还是 Pod 自己的网络栈坏了。这条用例断的是：kubectl 自己到点
+    /// 退出时说的那句话（"dial tcp …: i/o timeout"）要一路活到终止判词里，
+    /// 并且仍然能被归成"集群连不上"这一类。
+    #[tokio::test]
+    async fn the_cause_kubectl_reports_itself_survives_into_the_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let log = dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+echo 'Unable to connect to the server: dial tcp 10.43.0.1:443: i/o timeout' >&2
+exit 1
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            300,
+            900,
+        );
+        // 预算 0：第一次尝试败了就到点，不走重试节拍。
+        let err = executor
+            .probe(&["get", "deployment", "cogneva", "-o", "json"], 30, 0)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("i/o timeout"),
+            "kubectl's own words must reach the verdict: {msg}"
+        );
+        assert!(
+            msg.contains(CLUSTER_UNREACHABLE_MARKER),
+            "an unreachable apiserver still has to be classified as one: {msg}"
+        );
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            argv.contains("--request-timeout=27s"),
+            "kubectl must carry a deadline of its own, not only the outer kill: {argv}"
+        );
+    }
+
     /// 名字不带前导斜杠，目录名前后多余的斜杠由这里收掉。
     #[test]
     fn tree_ish_dir_names_a_directory_inside_the_rev() {
