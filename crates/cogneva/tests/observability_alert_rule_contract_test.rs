@@ -1337,6 +1337,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "同上（生产者跑成了，却一条序列都没发）。它与 `up` 必须分成两条：脚本崩了与输入读不到修法不同，合成一格就指不出该改哪边",
     ),
     (
+        "reading_producer_absent",
+        "宿主生产者 `scripts/host/cogneva-reading-producer-reading.sh`（不在本仓），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 印出。它判的是抓取面而不是树：`crates/cog-gateway/src/readings.rs` 里每条读数点名的指标，在 Prometheus 里至少有一条样本吗。这一格与上面两条分工相反——那两条问「宿主脚本跑没跑成」，它问「读数点名的指标有没有人发」。0 条缺席才是健康；缺席的那几条由同族的 `reading_producer_missing` 按读数 id 与指标名点名，所以这一格只给判据、不给成因",
+    ),
+    (
         "helm_release_revision_vs_workload_rev",
         "宿主生产者 `scripts/host/cogneva-upgrade-path-reading.sh`（不在本仓），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出。值说的是「helm release 与现网工作负载是不是同一版」：1 是同版且 release 为 deployed，0 是不是。0 里混着两种成因（修订号不同、或 release 本身不是 deployed），所以这一格只给判据，成因由 `release_revision`/`workload_rev`/`status` 三个标签分开读；`state=\"no-release\"` 是走 apply 投递、本来就没有 release 的集群，按构造不参与判定。读不到时它整条序列都不印而不是印 0——「这台上没有 release」「两边不同版」与「生产者死了」是三个不同的修法，合成一个空集会指错方向",
     ),

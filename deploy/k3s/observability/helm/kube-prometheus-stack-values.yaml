@@ -80,50 +80,22 @@ prometheus:
     podMonitorSelector: {}
     podMonitorNamespaceSelector: {}
 
-    # 额外 scrape 配置（cogneva 自身 + Blackbox）
-    additionalScrapeConfigs:
-      - job_name: 'cogneva'
-        kubernetes_sd_configs:
-          - role: pod
-            namespaces:
-              names:
-                - default
-        relabel_configs:
-          - source_labels: [__meta_kubernetes_pod_label_app]
-            action: keep
-            regex: cogneva
-          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
-            action: keep
-            regex: "true"
-          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
-            action: replace
-            target_label: __metrics_path__
-            regex: (.+)
-          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
-            action: replace
-            regex: ([^:]+)(?::\d+)?;(\d+)
-            replacement: $1:$2
-            target_label: __address__
-          - action: labelmap
-            regex: __meta_kubernetes_pod_label_(.+)
-
-      - job_name: 'blackbox-http'
-        metrics_path: /probe
-        params:
-          module: [http_2xx]
-        kubernetes_sd_configs:
-          - role: ingress
-        relabel_configs:
-          - source_labels: [__meta_kubernetes_ingress_scheme, __address__, __meta_kubernetes_ingress_path]
-            regex: (.+);(.+);(.+)
-            replacement: ${1}://${2}${3}
-            target_label: __param_target
-          - target_label: __address__
-            replacement: cog-observability-blackbox-exporter:9115
-          - source_labels: [__param_target]
-            target_label: instance
-          - action: labelmap
-            regex: __meta_kubernetes_ingress_label_(.+)
+    # 这里**不再**写 `additionalScrapeConfigs`。
+    #
+    # 两处曾经写在这里、现在各有正经载体，留着第二份只会悄悄指错地方：
+    #   - `cogneva` 那份按 `namespaces: [default]` + `app=cogneva` 挑 Pod，而本平台
+    #     的网关与进化 Pod 在 `cogneva` 命名空间，指标由 `manifests/04-servicemonitor-cogneva.yaml`
+    #     与 `08-servicemonitor-gateway.yaml` 抓。照这份作业装出来的集群，一条
+    #     `cogneva_*` 序列都不会有。
+    #   - `blackbox-http` 那份把探测地址写成 `cog-observability-blackbox-exporter:9115`，
+    #     而清单里那个 Service 叫 `blackbox-exporter`（`manifests/19-blackbox-exporter.yaml`）。
+    #     它只在安装面认不出入口形态时才生效——也就是最没人盯着的那台机器上——
+    #     届时每一次探测都抓成 DNS 失败：`probe_success` 一条都不产生，而「没有
+    #     序列」与「没有断线」在面板上同形。
+    #
+    # 可达性探针的目标由 `kube-prometheus-stack-values-reachability-<ingress>.yaml`
+    # 提供，安装脚本按入口形态二选一，认不出来就不加并明说。那份文件里的探测
+    # 地址与模块名有判据盯着（`crates/cogneva/tests/observability_reachability_probe_wiring_test.rs`）。
 
     # Alertmanager 配置
     alerting:

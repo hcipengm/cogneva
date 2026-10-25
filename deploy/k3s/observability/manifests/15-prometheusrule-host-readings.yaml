@@ -65,6 +65,21 @@ spec:
             summary: "宿主读数生产者 {{ $labels.producer }} 读不到输入"
             description: "它跑得成，但没有发出任何序列：上游读不到，别去改生产者的代码。"
 
+        # 读数有了判据、抓取面上却一条序列都没有。这一格与上面两条不同：那两条
+        # 判的是「宿主脚本跑没跑成」，这一条判的是「读数点名的指标，抓取面上一
+        # 条样本都没有」——对象在、配置也在，就是没人发。面板上它是一条空白，
+        # 空白与「一切正常」同形，所以必须由规则替它喊。
+        - alert: CognevaReadingProducerAbsent
+          expr: reading_producer_absent > 0
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "读数正确性"
+            severity: warning
+          annotations:
+            summary: "有 {{ $value }} 条读数在抓取面上没有生产者"
+            description: "`reading_producer_missing` 按读数 id 与指标名点名是哪几条。修法是给它接一条抓取（或把读数指到一条真有生产者的指标上），不是改这条规则。"
+
         # 整条通道死了：上面两条都没有样本可判，所以这里必单独判 `up`。
         - alert: CognevaHostReadingsEndpointDown
           expr: up{job="cogneva-host-readings"} == 0
