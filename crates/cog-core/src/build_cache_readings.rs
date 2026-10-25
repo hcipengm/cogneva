@@ -247,7 +247,10 @@ pub struct BuildCacheReadings {
     /// busiest, not what it holds right now, or every walk would lower the cap
     /// onto a cache that is merely between builds and reclaim it for no reason.
     peak: Mutex<Peak>,
-    scan_interval_secs: u64,
+    /// The cadence the loop calling this is keeping. Written by that loop:
+    /// what a pass costs is the measurement an interval should follow, and
+    /// only the loop that runs the passes has it.
+    scan_interval_secs: AtomicU64,
     /// Where the cap came from, or `None` to read it as the deployment's.
     ///
     /// A cap in force that nothing said otherwise about is one the deployment
@@ -284,7 +287,7 @@ impl BuildCacheReadings {
             derived_cap: AtomicU64::new(0),
             cap_ceiling: AtomicU64::new(NO_CEILING),
             peak: Mutex::new(Peak::default()),
-            scan_interval_secs: 0,
+            scan_interval_secs: AtomicU64::new(0),
             cap_source: None,
             reclaim: Mutex::new(ReclaimState::default()),
             reclaimed_bytes: AtomicU64::new(0),
@@ -305,7 +308,8 @@ impl BuildCacheReadings {
         } else {
             CacheCapSetting::Fixed(max_bytes)
         };
-        self.scan_interval_secs = scan_interval_secs;
+        self.scan_interval_secs
+            .store(scan_interval_secs, Ordering::Release);
         self
     }
 
@@ -320,7 +324,8 @@ impl BuildCacheReadings {
     /// exists to prevent, and the one a fixed number cannot notice.
     pub fn with_auto_cap(mut self, scan_interval_secs: u64) -> Self {
         self.cap = CacheCapSetting::Auto;
-        self.scan_interval_secs = scan_interval_secs;
+        self.scan_interval_secs
+            .store(scan_interval_secs, Ordering::Release);
         self
     }
 
@@ -429,7 +434,19 @@ impl BuildCacheReadings {
 
     /// How long between walks.
     pub fn scan_interval_secs(&self) -> u64 {
-        self.scan_interval_secs.max(MIN_SCAN_INTERVAL_SECS)
+        self.scan_interval_secs
+            .load(Ordering::Acquire)
+            .max(MIN_SCAN_INTERVAL_SECS)
+    }
+
+    /// State the cadence the loop is keeping, once it has timed a pass.
+    ///
+    /// The published interval is the one in force, not the one the deployment
+    /// named: a number that describes the loop while the loop runs at another
+    /// cadence is worse than no number, because a rule comparing a pass
+    /// against it would be comparing against something nothing runs at.
+    pub fn set_scan_interval_secs(&self, secs: u64) {
+        self.scan_interval_secs.store(secs, Ordering::Release);
     }
 
     /// Record one completed walk.
@@ -898,6 +915,22 @@ pub fn spawn_build_cache_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The published interval is the one the loop keeps, not the one the
+    /// deployment named: the loop times its passes and states the period it
+    /// settles on, and a reader comparing a pass against the cadence has to see
+    /// that number. The floor still applies to whatever is stated.
+    #[test]
+    fn a_stated_interval_is_the_one_published() {
+        let readings = BuildCacheReadings::new("/nonexistent-cache").with_auto_cap(300);
+        assert_eq!(readings.scan_interval_secs(), 300);
+        readings.set_scan_interval_secs(900);
+        assert_eq!(readings.scan_interval_secs(), 900);
+        // Below the shared floor, the published number is the floor -- a
+        // cadence nothing runs at is not a reading.
+        readings.set_scan_interval_secs(1);
+        assert_eq!(readings.scan_interval_secs(), MIN_SCAN_INTERVAL_SECS);
+    }
 
     /// The derived cap is a function of two inputs and of nothing else: what the
     /// walk saw the cache hold at its busiest, and what the volume has free.

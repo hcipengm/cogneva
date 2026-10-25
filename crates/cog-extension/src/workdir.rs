@@ -78,11 +78,12 @@ const WORKSPACE_DISK_HEADROOM_PERCENT: u64 = 15;
 /// a pass is not.
 const MIN_GC_INTERVAL_SECS: u64 = 30;
 
-/// How many times a pass's own duration the interval must cover, so a pass
+/// How many times a pass's own duration the interval must cover, so maintenance
 /// costs at most one this-many-th of the process's time. A ratio rather than a
 /// period: the pass gets slower as the volume fills, and the interval has to
-/// follow it or reclamation becomes the load.
-const GC_OVERHEAD_MULTIPLE: u64 = 20;
+/// follow it or the upkeep becomes the load. Shared by reclamation and the
+/// build-cache walk -- one control law, one number.
+const MAINTENANCE_OVERHEAD_MULTIPLE: u64 = 20;
 
 /// The published name of the interval the reclamation loop is keeping.
 const GC_INTERVAL_METRIC: &str = "sandbox_workspace_gc_interval_seconds";
@@ -196,11 +197,34 @@ const MIN_TTL_SECS: u64 = 3600;
 /// interval would keep paying that. `None` before any pass has been timed --
 /// there is nothing to scale from and the configured interval stands.
 fn gc_interval_from(pass_millis: u64, configured: Duration) -> Duration {
+    paced_interval(
+        pass_millis,
+        configured,
+        MIN_GC_INTERVAL_SECS,
+        MAINTENANCE_OVERHEAD_MULTIPLE,
+    )
+}
+
+/// How often to run something whose cost grows with what it walks, from how
+/// long the last run took.
+///
+/// Both loops here -- reclaiming the task worktrees and re-walking the build
+/// cache -- have the same control law: their own work may take one
+/// this-many-th of the process, so the period is a multiple of the work, never
+/// below a floor. A fixed period silently spends a growing share as the volume
+/// fills, which is the failure that looks like "the executor got slow" rather
+/// than "the executor is reclaiming".
+fn paced_interval(
+    pass_millis: u64,
+    configured: Duration,
+    floor_secs: u64,
+    multiple: u64,
+) -> Duration {
     if pass_millis == 0 {
         return configured;
     }
-    let derived = (pass_millis / 1000).saturating_mul(GC_OVERHEAD_MULTIPLE);
-    Duration::from_secs(derived.max(MIN_GC_INTERVAL_SECS))
+    let derived = (pass_millis / 1000).saturating_mul(multiple);
+    Duration::from_secs(derived.max(floor_secs))
 }
 
 #[derive(Debug, Clone)]
@@ -586,6 +610,9 @@ pub struct WorkdirRouter {
     /// started. What the interval is a multiple of.
     gc_pass_millis: AtomicU64,
     last_gc_unix: AtomicI64,
+    /// The same two for the build-cache walk.
+    cache_pass_millis: AtomicU64,
+    last_cache_walk_unix: AtomicI64,
 }
 
 impl WorkdirRouter {
@@ -630,6 +657,8 @@ impl WorkdirRouter {
             git_slowest_ms: AtomicU64::new(0),
             gc_pass_millis: AtomicU64::new(0),
             last_gc_unix: AtomicI64::new(0),
+            cache_pass_millis: AtomicU64::new(0),
+            last_cache_walk_unix: AtomicI64::new(0),
         }))
     }
 
@@ -1067,6 +1096,35 @@ impl WorkdirRouter {
         unix_now() - last >= wait.as_secs() as i64
     }
 
+    /// Whether the build-cache walk is due, and if so, the interval it is
+    /// keeping.
+    ///
+    /// The reading this process publishes is written here rather than left at
+    /// the configured seed: the number in force is the one a rule comparing a
+    /// pass against its cadence has to see, and before the first timed pass the
+    /// configured interval is what is in force.
+    fn cache_walk_due(&self, cache: &cog_core::build_cache_readings::BuildCacheReadings) -> bool {
+        let pass_millis = self.cache_pass_millis.load(Ordering::Relaxed);
+        let wait = paced_interval(
+            pass_millis,
+            self.cfg.build_cache.scan_interval,
+            cog_core::build_cache::MIN_SCAN_INTERVAL_SECS,
+            MAINTENANCE_OVERHEAD_MULTIPLE,
+        );
+        cache.set_scan_interval_secs(wait.as_secs());
+        let last = self.last_cache_walk_unix.load(Ordering::Relaxed);
+        if last == 0 {
+            return true;
+        }
+        unix_now() - last >= wait.as_secs() as i64
+    }
+
+    fn note_cache_walk(&self, pass_millis: u64) {
+        self.cache_pass_millis.store(pass_millis, Ordering::Relaxed);
+        self.last_cache_walk_unix
+            .store(unix_now(), Ordering::Relaxed);
+    }
+
     /// Take this fetch's view of `main` and, when it differs from the previous
     /// one, record how long the head had been still before it moved. That
     /// stillness is the only measurement anyone here has of how often the
@@ -1315,7 +1373,12 @@ impl WorkdirRouter {
         // can make, and the size is the reading that says when to make it.
         let cache = Arc::clone(&self.build_cache);
         let slot = self.build_cache_slot();
-        let cache_interval = Duration::from_secs(cache.scan_interval_secs());
+        // Waking is cheap and a pass is not: the loop wakes on the shared floor
+        // and beats on every waking, and the interval it actually walks a pass
+        // at follows what the pass costs. The cadence declared here is the one
+        // the loop really wakes on, so a longer interval is not read as a stall.
+        let cache_wake = Duration::from_secs(cog_core::build_cache::MIN_SCAN_INTERVAL_SECS);
+        let cache_router = Arc::clone(self);
         // The claim this cache shares, and the walker already measuring it: the
         // ceiling is that claim's declared size minus what its co-tenants hold,
         // and both halves come from readings this process takes anyway. Nothing
@@ -1333,25 +1396,31 @@ impl WorkdirRouter {
         // that is not growing.
         drop(cog_core::loop_health::spawn_unstoppable(
             SANDBOX_BUILD_CACHE_LOOP,
-            cog_core::loop_health::Cadence::Periodic(cache_interval),
+            cog_core::loop_health::Cadence::Periodic(cache_wake),
             // Rebuilt per attempt, so everything the body consumes is cloned here.
             move |beat| {
                 let cache = Arc::clone(&cache);
                 let slot = Arc::clone(&slot);
+                let router = Arc::clone(&cache_router);
                 let ceiling_cfg = ceiling_cfg.clone();
                 let ceiling_footprint = ceiling_footprint.clone();
                 async move {
-                    let mut ticker = tokio::time::interval(cache_interval);
+                    let mut ticker = tokio::time::interval(cache_wake);
                     loop {
                         // The first tick of a fresh interval completes at once, so
                         // the deployment has a size reading from the start rather
                         // than one interval later.
-                        beat.beat();
                         ticker.tick().await;
+                        beat.beat();
+                        if !router.cache_walk_due(&cache) {
+                            continue;
+                        }
                         cache.set_cap_ceiling(
                             ceiling_cfg.measured_ceiling(ceiling_footprint.as_deref(), &cache),
                         );
+                        let started = std::time::Instant::now();
                         cache.measure_and_enforce(Some(slot.as_ref())).await;
+                        router.note_cache_walk(started.elapsed().as_millis() as u64);
                     }
                 }
             },
@@ -2553,6 +2622,43 @@ pub(crate) mod tests {
         assert_eq!(
             fetch_interval_from(10, configured),
             Duration::from_secs(MIN_FETCH_INTERVAL_SECS)
+        );
+    }
+
+    /// The same law paces the cache walk, at its own floor: a walk that costs
+    /// N seconds buys twenty times that period, never less than the shared
+    /// floor. Both loops take their multiple from one constant, so tuning the
+    /// share tunes both rather than letting one drift.
+    #[test]
+    fn the_cache_walk_interval_follows_the_slowest_pass() {
+        let configured = Duration::from_secs(300);
+        let walk = |pass_millis: u64| {
+            paced_interval(
+                pass_millis,
+                configured,
+                cog_core::build_cache::MIN_SCAN_INTERVAL_SECS,
+                MAINTENANCE_OVERHEAD_MULTIPLE,
+            )
+        };
+        // Before any walk has been timed the configured interval stands.
+        assert_eq!(walk(0), configured);
+        // A ten-second walk over a large cache buys 200s, under the 300s seed:
+        // the seed was chosen for a cache that walked faster than this.
+        assert_eq!(walk(10_000), Duration::from_secs(200));
+        // A walk faster than the floor warrants is served at the floor.
+        assert_eq!(
+            walk(500),
+            Duration::from_secs(cog_core::build_cache::MIN_SCAN_INTERVAL_SECS)
+        );
+        // The share is shared with reclamation, not restated for this loop.
+        assert_eq!(
+            gc_interval_from(10_000, configured),
+            paced_interval(
+                10_000,
+                configured,
+                MIN_GC_INTERVAL_SECS,
+                MAINTENANCE_OVERHEAD_MULTIPLE
+            )
         );
     }
 

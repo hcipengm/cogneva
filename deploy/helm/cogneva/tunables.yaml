@@ -1086,11 +1086,25 @@ rows:
   # `cogneva_build_target_bytes_cap{source}` 上，读得出来源是 override。
 
   - key: sandboxExecutor.buildCacheScanIntervalSecs
-    source: override
+    source: derived
     why: >-
-      How often this executor's cache size is re-read. A derived interval would
-      follow the cost of one walk and the write rate between walks; the process
-      has a floor and takes the floor below it.
+      How often this executor's cache is re-walked and its cap re-enforced. The
+      loop times each walk and keeps the period at twenty times the last walk's
+      cost, so the walk stays one twentieth of the process as the cache grows,
+      floored at the shared minimum. That floor also paces the loop's waking,
+      and the loop beats on every waking, so a longer interval is not read as a
+      stalled loop. The published interval is the one in force rather than this
+      seed. `the_cache_walk_interval_follows_the_slowest_pass` holds the share.
+    published:
+      # The walk is run by the sandbox executor; the reading it states its
+      # cadence on belongs to the shared readings type.
+      owner: crates/cog-extension/src/workdir.rs
+      file: crates/cog-core/src/build_cache_readings.rs
+      metric: BUILD_TARGET_SCAN_INTERVAL_METRIC
+      label: dir
+    proof:
+      file: crates/cog-extension/src/workdir.rs
+      test: the_cache_walk_interval_follows_the_slowest_pass
 
   - key: sandboxExecutor.maxTaskWorkspaces
     source: override
