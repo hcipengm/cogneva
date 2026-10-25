@@ -1193,11 +1193,11 @@ use std::collections::BTreeMap;
 pub struct QuotaEntry {
     /// 资源名原样来自 apiserver：`requests.cpu`、`limits.memory`、`pods`……
     pub resource: String,
-    /// hard 与 used 保留 apiserver 的写法（`4`、`500m`、`4Gi`）。换算是读者的事，
+    /// hard 与 used 保留 apiserver 的写法（milli 与二进制后缀都原样）。换算是读者的事，
     /// 这一层只多做一件事：给出两者相除的百分比，供界面画进度条。
     pub hard: String,
     pub used: String,
-    /// 两边都认得出同一维度才有值。认不出就不填——把 `1` 与 `1Gi` 硬除出来的
+    /// 两边都认得出同一维度才有值。认不出就不填——两个不同维度的数硬除出来的
     /// 百分比不是读数，是发明。
     pub percent: Option<f64>,
 }
@@ -1260,9 +1260,8 @@ pub struct DeploymentsReport {
 
 /// 把 apiserver 的数量写法换算成同一维度的数，只为算「用了百分之几」。
 ///
-/// 二进制后缀（`Ki`…`Pi`）、十进制后缀（`k`…`T`）与 milli 三种都要认；认不出就
-/// 返回 None。`500m` 与 `2` 相比是 25%，`1Gi` 与 `4Gi` 相比也是 25%，而 `1` 与
-/// `1Gi` 之间没有比值可言。
+/// 二进制后缀、十进制后缀与 milli 三种都要认；认不出就返回 None。同一维度的两个数
+/// （核数与毫核、GiB 与 MiB）才有比值，跨维度的两个数之间没有比值可言。
 fn quantity_units(text: &str) -> Option<f64> {
     const BINARY: [(&str, f64); 5] = [
         ("Ki", 1024.0),
