@@ -197,37 +197,57 @@ pub fn prometheus_base() -> String {
 
 /// The client these queries go through.
 ///
-/// Built from `cog-net`'s single definition of timeouts, pool and proxy rather
-/// than here: a second set of numbers in this file would keep its own default
-/// long after the shared one was judged, and the two would be discovered only
-/// by a query that hangs in one place and not the other. Both deadlines are
-/// five seconds because a dashboard reading that cannot answer in five seconds
-/// is already the answer.
-fn prometheus_client() -> Result<reqwest::Client, String> {
-    let config = cog_net::HttpClientConfig {
-        timeout_secs: 5,
-        connect_timeout_secs: 5,
-        ..Default::default()
-    };
-    cog_net::build_client(&config).map_err(|e| e.to_string())
+/// The process-wide one the assembly layer injected, not one built here: this
+/// crate does not own the implementation — timeouts, pool and proxy have one
+/// definition and it lives where the client is constructed. A second client
+/// built inside a handler would carry its own numbers and be discovered only by
+/// a query that hangs in one place and not another. When nothing was injected
+/// the answer says so instead of quietly falling back, because a self-built
+/// client reads exactly like the configured one from here.
+fn query_client() -> Result<std::sync::Arc<dyn cog_core::HttpClient>, String> {
+    crate::contribution_admin::http_client()
 }
 
+/// The deadline for one query. A reading that cannot answer in five seconds is
+/// already the answer; a failed query is reported as "no reading", never as 0.
+const QUERY_TIMEOUT_SECS: u64 = 5;
+
 /// Ask Prometheus for one query.
-async fn ask(client: &reqwest::Client, base: &str, query: &str) -> Result<Option<f64>, String> {
-    let resp = client
-        .get(format!("{base}/api/v1/query"))
-        .query(&[("query", query)])
-        .send()
+async fn ask(
+    client: &std::sync::Arc<dyn cog_core::HttpClient>,
+    base: &str,
+    query: &str,
+) -> Result<Option<f64>, String> {
+    let url = format!("{base}/api/v1/query?query={}", percent_encode(query));
+    let request = cog_core::HttpRequest::get(url).timeout(QUERY_TIMEOUT_SECS);
+    let response = client
+        .execute(request)
         .await
         .map_err(|e| format!("prometheus unreachable: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("prometheus answered {}", resp.status()));
+    if !response.is_success() {
+        return Err(format!("prometheus answered {}", response.status));
     }
-    let body: serde_json::Value = resp
-        .json()
-        .await
+    let body: serde_json::Value = serde_json::from_slice(&response.body)
         .map_err(|e| format!("prometheus response is not JSON: {e}"))?;
     Ok(parse_scalar(&body))
+}
+
+/// Percent-encode a PromQL expression for a query string.
+///
+/// PromQL is mostly punctuation — braces, quotes, `=~`, brackets — so a query
+/// pasted into a URL unencoded arrives as something else entirely. Only the
+/// unreserved set passes through; everything else becomes `%XX`.
+fn percent_encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() * 3);
+    for byte in raw.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Every reading, with its verdict. Queries run concurrently: six serial round
@@ -237,14 +257,16 @@ pub async fn observability_readings_handler() -> axum::response::Response {
     use axum::Json;
 
     let base = prometheus_base();
-    let client = match prometheus_client() {
+    let client = match query_client() {
         Ok(c) => c,
         Err(e) => {
+            // 装配层没交进客户端：说出来，而不是临时造一个让「漏了装配」看起来像
+            // 「装配好了」。
             return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "http_client", "message": e})),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "http_client_not_wired", "message": e})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -358,6 +380,20 @@ mod tests {
         .unwrap();
         assert!(wire["warn"].is_null());
         assert!(wire["crit"].is_null());
+    }
+
+    #[test]
+    fn a_promql_expression_survives_being_put_in_a_url() {
+        // 大括号、引号、`=~` 原样塞进查询串会被读成别的表达式；未保留字符以外的
+        // 一律转义，运算符本身必须原样到达 Prometheus。
+        assert_eq!(percent_encode("up"), "up");
+        assert_eq!(
+            percent_encode(r#"sum(x{a="b"})"#),
+            "sum%28x%7Ba%3D%22b%22%7D%29"
+        );
+        assert_eq!(percent_encode(r#"a=~"5..""#), "a%3D~%225..%22");
+        // 空格是 PromQL 的分隔符，绝不能变成 `+`。
+        assert_eq!(percent_encode("a b"), "a%20b");
     }
 
     #[test]
