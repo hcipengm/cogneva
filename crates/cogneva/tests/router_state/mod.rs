@@ -131,7 +131,7 @@ pub fn stateless() -> Arc<GatewayState> {
 pub fn stateless_with_datasets(
     datasets: Option<Arc<cog_storage::DatasetStore>>,
 ) -> Arc<GatewayState> {
-    build(datasets, None, None, None)
+    build(datasets, None, None, None, None, "/tmp".into())
 }
 
 /// The same state, with a queue and a roster behind it.
@@ -144,7 +144,14 @@ pub fn with_messaging(
     backend: Arc<dyn cog_core::MessageBackend>,
     registry: Arc<dyn cog_core::AgentRegistry>,
 ) -> Arc<GatewayState> {
-    build(None, Some(backend), Some(registry), None)
+    build(
+        None,
+        Some(backend),
+        Some(registry),
+        None,
+        None,
+        "/tmp".into(),
+    )
 }
 
 /// The same state, with somewhere to keep what was said to an agent.
@@ -157,7 +164,27 @@ pub fn with_messaging_and_transcript(
     registry: Arc<dyn cog_core::AgentRegistry>,
     transcript: Arc<dyn cog_storage::AgentMessageStore>,
 ) -> Arc<GatewayState> {
-    build(None, Some(backend), Some(registry), Some(transcript))
+    build(
+        None,
+        Some(backend),
+        Some(registry),
+        Some(transcript),
+        None,
+        "/tmp".into(),
+    )
+}
+
+/// The same state, with an eval service and its own data directory.
+///
+/// The two travel together on purpose: an eval run writes its report under the
+/// state's data directory, so a suite that judges what a run leaves behind must
+/// name the directory it will read back, and must get one of its own -- a shared
+/// `/tmp` would let one suite see another's reports.
+pub fn with_eval_service(
+    eval_service: Arc<dyn cog_core::EvalService>,
+    data_dir: String,
+) -> Arc<GatewayState> {
+    build(None, None, None, None, Some(eval_service), data_dir)
 }
 
 fn build(
@@ -165,6 +192,8 @@ fn build(
     message_backend: Option<Arc<dyn cog_core::MessageBackend>>,
     agent_registry: Option<Arc<dyn cog_core::AgentRegistry>>,
     agent_messages: Option<Arc<dyn cog_storage::AgentMessageStore>>,
+    eval_service: Option<Arc<dyn cog_core::EvalService>>,
+    data_dir: String,
 ) -> Arc<GatewayState> {
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
@@ -173,7 +202,7 @@ fn build(
     let orchestrator = Arc::new(cog_orchestrator::OrchestratorControlImpl::new(dag_executor));
 
     Arc::new(GatewayState {
-        data_dir: "/tmp".into(),
+        data_dir,
         config: std::sync::RwLock::new(GatewayConfig {
             http_port: 0,
             ws_port: 0,
@@ -235,7 +264,7 @@ fn build(
         sandbox_backend: None,
         plugin_registry: None,
         guardrail: None,
-        eval_service: None,
+        eval_service,
         observables: Vec::new(),
         metrics_dimensions: Vec::new(),
         mcp_client: None,

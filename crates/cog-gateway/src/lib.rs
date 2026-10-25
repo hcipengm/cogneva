@@ -38,6 +38,7 @@ pub mod dashboard;
 pub mod datasets;
 pub mod document_egress;
 pub mod error;
+pub mod eval_reports;
 pub mod evolution;
 pub mod executor;
 pub mod files;
@@ -731,6 +732,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/eval/run", post(eval_run_handler))
         .route("/api/v1/eval/compare", post(eval_compare_handler))
         .route("/api/v1/eval/datasets", get(eval_list_datasets_handler))
+        .route(
+            "/api/v1/eval/reports",
+            get(eval_reports::list_eval_reports_handler),
+        )
         .route(
             "/api/v1/eval/report/{report_id}",
             get(eval_get_report_handler),
@@ -3030,13 +3035,54 @@ struct EvalRunRequest {
     max_concurrency: Option<usize>,
 }
 
+/// 把一次评测的报告写进报告目录，返回它在目录里的 id。
+///
+/// id 里带着数据集名：磁盘上翻目录的人不必打开每一份就知道这是哪一次评测。落盘
+/// 放这里而不是评测服务里，是因为目录属于网关这个进程的 `data_dir`，服务只该管
+/// 「怎么算」，不该知道「算完放哪」。
+fn store_eval_report(state: &GatewayState, report: &serde_json::Value) -> Result<String, String> {
+    let dataset_name = report
+        .get("dataset_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("eval");
+    let dir = eval_reports::reports_dir(&state.data_dir);
+    let id = eval_reports::new_report_id(dataset_name, chrono::Utc::now());
+    let body = serde_json::to_string_pretty(report).map_err(|e| e.to_string())?;
+    let (id, _path) = eval_reports::store_report(&dir, &id, &body).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
 async fn eval_run_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<EvalRunRequest>,
 ) -> Response {
     match state.eval_service {
         Some(ref service) => match service.run_eval(&req.dataset_path).await {
-            Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+            Ok(report) => {
+                // 跑完的这一份要落盘。读面读的是 `{data_dir}/eval/reports/{id}.json`，
+                // 只把报告塞进响应就等于这次评测只活到响应结束：目录永远空着，读面
+                // 永远 404，而「没跑过」与「读不通」在界面上长得一样。
+                //
+                // 落盘失败不当成评测失败，也不静默放过：这一份结果确实没了，回一个
+                // 说清原因的错，比回 200 让人事后去猜为什么列表里没有它要好。
+                match store_eval_report(&state, &report) {
+                    Ok(id) => {
+                        tracing::info!(report_id = %id, "eval report stored");
+                        (StatusCode::OK, Json(report)).into_response()
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "eval report could not be stored");
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({
+                                "error": "report_not_stored",
+                                "message": e.to_string(),
+                            })),
+                        )
+                            .into_response()
+                    }
+                }
+            }
             Err(e) => (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "eval_failed", "message": e.to_string()})),
