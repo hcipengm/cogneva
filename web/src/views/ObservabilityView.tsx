@@ -6,6 +6,7 @@ import {
   getTokenUsage,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { TokenShare } from '@/observability/TokenShare';
 import { ClusterTopology } from '@/topology/ClusterTopology';
 import { Empty, Loading, Moment, ReadError, Reading, Status, Table, ViewFrame } from '@/ui/primitives';
 
@@ -170,6 +171,7 @@ export function ObservabilityView() {
         )}
         {usage.data && usage.data.actors.length > 0 && (
           <>
+            <TokenShare actors={usage.data.actors} />
             <Table
               columns={[
                 { key: 'actor', title: '执行者', width: '180px', render: (a) => (
