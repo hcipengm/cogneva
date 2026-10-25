@@ -9,6 +9,7 @@ pub mod config_sections;
 pub mod contract;
 pub mod error;
 pub mod fs_size;
+pub mod git_budget;
 pub mod loop_health;
 pub mod observability_text;
 pub mod secrets;

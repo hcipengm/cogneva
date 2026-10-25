@@ -63,6 +63,8 @@ crates/cog-core/src/contract/taste.rs	TASTE_EVIDENCE_MAX_REFS	32	bound	a judgeme
 crates/cog-core/src/contract/taste.rs	TASTE_REFERENCE_MAX_CHARS	2_048	bound	fits a URI with a query string, not a document in the field whose job is to point at one
 crates/cog-core/src/contract/taste.rs	TASTE_SUBJECT_MAX_CHARS	512	bound	a subject line; over-length is refused at submission rather than truncated, because a cut subject is the submitter's words with the reason removed
 crates/cog-core/src/contract/taste.rs	TASTE_TEXT_MAX_CHARS	2_000	bound	these fields are inlined into the goal and copied into every later change, so the bound is on the submission, not on the row as stored
+crates/cog-core/src/git_budget.rs	GIT_TIMEOUT_FLOOR_SECS	120	bound	the ceiling before any git command here has completed; only this is available
+crates/cog-core/src/git_budget.rs	GIT_TIMEOUT_MULTIPLE	10	derived	multiple of the slowest git command that has completed; the corpse age is twice it
 crates/cog-eval/src/adapters/swe_pro.rs	MAX	5	bound	at most five test names in a verdict; the rest are counted, not listed
 crates/cog-eval/src/backoff.rs	ATTEMPTS_PER_MINUTE	600	bound	a gate two orders above normal call density; it only bites in a refusal storm
 crates/cog-eval/src/backoff.rs	DEFAULT_REFUSAL_BACKOFF	1s	bound	floor when a refusal states no wait; three orders above the measured 0.7ms fast failure
@@ -80,8 +82,6 @@ crates/cog-extension/src/workdir.rs	DEFAULT_GC_INTERVAL_SECS	600	bound	seed; app
 crates/cog-extension/src/workdir.rs	DEFAULT_MAX_WORKSPACES	8	bound	policy ceiling when the deployment names none; the disk measurement can still lower it
 crates/cog-extension/src/workdir.rs	DEFAULT_TTL_SECS	21600	bound	seed; applies only until two trees exist to give an arrival interval
 crates/cog-extension/src/workdir.rs	GC_OVERHEAD_MULTIPLE	20	derived	one over the share of the process a reclamation pass may take, times the pass duration
-crates/cog-extension/src/workdir.rs	GIT_TIMEOUT_FLOOR_SECS	120	bound	the floor before any git command here has completed
-crates/cog-extension/src/workdir.rs	GIT_TIMEOUT_MULTIPLE	10	derived	multiple of the slowest git command that has completed here
 crates/cog-extension/src/workdir.rs	MAX_TASK_ID_LEN	128	bound	a directory-name limit, not a capacity of this machine
 crates/cog-extension/src/workdir.rs	MIN_FETCH_INTERVAL_SECS	30	bound	below this every fetch asks for the same commit
 crates/cog-extension/src/workdir.rs	MIN_GC_INTERVAL_SECS	30	bound	floor under the pass-duration derivation; also the pace the loop wakes and beats at
@@ -222,8 +222,6 @@ crates/cog-reflection/src/volume_capacity.rs	HEADROOM_PERCENT	120	bound	the grow
 crates/cog-reflection/src/volume_capacity.rs	MIN_INTERVAL_SECS	300	bound	floor on the cadence; re-deciding faster than the volume changes is only busier
 crates/cog-reflection/src/volume_capacity.rs	REFUSAL_COOLDOWN_SECS	3600	bound	an API refusal is a property of the StorageClass, so an hour before asking again
 crates/cog-reflection/src/workspace.rs	DEFAULT_EPHEMERAL_TTL	21600s	bound	fallback when no config supplies one; cog-core's ephemeral_ttl_secs and cog-extension spell the same 6h
-crates/cog-reflection/src/workspace.rs	GIT_TIMEOUT_FLOOR_SECS	120	bound	the floor before any git command here has completed
-crates/cog-reflection/src/workspace.rs	GIT_TIMEOUT_MULTIPLE	10	derived	multiple of the slowest git command that has completed here
 crates/cog-reflection/src/workspace.rs	ORPHAN_MIN_AGE	900s	bound	several multiples of the default termination grace; under RWO+Recreate the real overlap is near zero
 crates/cog-skill/src/registry.rs	COUNT	12	bound	test fixture: enough synthetic skills that a lucky cache order is negligible
 crates/cog-storage/src/backends/file_trace_store.rs	MAX_SAFE_LEN	180	bound	well under the filesystem's 255-byte name limit, leaving room for .trace and .meta.json

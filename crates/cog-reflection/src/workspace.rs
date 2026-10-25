@@ -78,25 +78,6 @@ fn index_sample_needs_write(
 /// 工作树默认根目录（沙盒 PVC 内，与 bin/backups/changes/mainline 同级）。
 pub const DEFAULT_WORKSPACES_ROOT: &str = "/opt/cogneva/sandbox/workspaces";
 
-/// git 子命令超时的地板：在还没有任何命令跑完之前，只有这个数可用。
-const GIT_TIMEOUT_FLOOR_SECS: u64 = 120;
-
-/// 超时是这条 git 命令实际耗时的多少倍。倍数而不是周期：仓库会长大、卷会变慢，
-/// 同一个周期在慢下来的卷上会把合法的命令杀在半路。
-const GIT_TIMEOUT_MULTIPLE: u64 = 10;
-
-/// 从这条卷上跑完过的最慢一条 git 命令，算出超时。
-fn git_timeout_from(slowest_ms: u64) -> Duration {
-    let measured = (slowest_ms / 1000).saturating_mul(GIT_TIMEOUT_MULTIPLE);
-    Duration::from_secs(measured.max(GIT_TIMEOUT_FLOOR_SECS))
-}
-
-/// 陈旧锁的判定年龄：超时的两倍。超时是杀进程的界，锁的年龄超过它两倍时，
-/// 造出这把锁的命令必然已经被杀了——多一倍是因为命令可能刚在这轮取锁时被看表。
-fn stale_lock_age_from(timeout: Duration) -> Duration {
-    timeout * 2
-}
-
 /// 工作树仓库里上游主线的引用名（`local` 远程的 `main`）。与
 /// `change_pipeline::sync_with_upstream_in` 对齐到的那个引用是同一个。
 const MAINLINE_REF: &str = "local/main";
@@ -1032,12 +1013,12 @@ impl WorkspaceManager {
     /// 锁的判定年龄：默认是 git 超时的两倍，见 [`stale_lock_age_from`]。
     fn stale_lock_age(&self) -> Duration {
         self.stale_lock_age
-            .unwrap_or_else(|| stale_lock_age_from(self.git_timeout()))
+            .unwrap_or_else(|| cog_core::git_budget::stale_lock_age_from(self.git_timeout()))
     }
 
     /// 这条卷上一条 git 命令能跑多久：跑完过的最慢那条的倍数，带地板。
     fn git_timeout(&self) -> Duration {
-        git_timeout_from(self.git_slowest_ms.load(Ordering::Relaxed))
+        cog_core::git_budget::git_timeout_from(self.git_slowest_ms.load(Ordering::Relaxed))
     }
 
     async fn run_git_once(&self, args: &[&str], workdir: Option<&Path>) -> SFResult<String> {
@@ -1998,31 +1979,6 @@ mod tests {
         assert_eq!(sanitize_id("evol/quinn-33b30bf1"), "evol-quinn-33b30bf1");
         assert_eq!(sanitize_id("porter::local"), "porter--local");
         assert_eq!(sanitize_id("///"), "ws");
-    }
-
-    /// 超时跟着这条卷上跑完过的最慢一条命令走，而不是一个写在代码里的周期：
-    /// 仓库长大、卷变慢之后，同一个周期会把合法的 checkout 杀在半路；反过来，
-    /// 快卷也不该一直等两分钟。锁的判定年龄又跟着超时走，所以两者一起动。
-    #[test]
-    fn the_git_timeout_follows_the_slowest_command_that_finished() {
-        // 还没有命令跑完：地板是唯一可用的依据。
-        assert_eq!(
-            git_timeout_from(0),
-            Duration::from_secs(GIT_TIMEOUT_FLOOR_SECS)
-        );
-        // 41 秒的 checkout 之后，界是它的十倍。
-        assert_eq!(git_timeout_from(41_000), Duration::from_secs(410));
-        // 慢到超过地板时，地板不再是约束。
-        assert_eq!(git_timeout_from(120_000), Duration::from_secs(1200));
-        // 锁的年龄是超时的两倍，所以它随卷一起变，而不是另一个手写数。
-        assert_eq!(
-            stale_lock_age_from(Duration::from_secs(410)),
-            Duration::from_secs(820)
-        );
-        assert_eq!(
-            stale_lock_age_from(git_timeout_from(0)),
-            Duration::from_secs(GIT_TIMEOUT_FLOOR_SECS * 2)
-        );
     }
 
     /// 锁路径只从 git 的固定报错措辞里提取，且必须真是 .lock 文件——

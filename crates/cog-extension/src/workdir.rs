@@ -59,19 +59,6 @@ const DEFAULT_GC_INTERVAL_SECS: u64 = 600;
 const DEFAULT_FETCH_INTERVAL_SECS: u64 = 300;
 const DEFAULT_MAX_WORKSPACES: usize = 8;
 
-/// The shortest a git command is allowed to run before it is killed.
-///
-/// The timeout itself is derived: ten times the slowest command that has
-/// completed on this volume, never below this. A clone on a fresh volume takes
-/// as long as the network and the disk make it take, and a fixed number is
-/// either shorter than that (a healthy command killed as if it had hung) or
-/// longer than any real command needs (a genuine hang waited out). The slowest
-/// completed command is the measurement that separates the two, and a hung
-/// command never contributes to it -- it never completes.
-const GIT_TIMEOUT_FLOOR_SECS: u64 = 120;
-/// How many times the slowest completed command the timeout allows before
-/// calling the current one hung.
-const GIT_TIMEOUT_MULTIPLE: u64 = 10;
 const META_DIR_NAME: &str = ".meta";
 
 /// Maximum task id length, keeps the on-disk directory name clear of
@@ -214,12 +201,6 @@ fn gc_interval_from(pass_millis: u64, configured: Duration) -> Duration {
     }
     let derived = (pass_millis / 1000).saturating_mul(GC_OVERHEAD_MULTIPLE);
     Duration::from_secs(derived.max(MIN_GC_INTERVAL_SECS))
-}
-
-/// How long a git command may run, from the slowest one that has completed.
-fn git_timeout_from(slowest_ms: u64) -> Duration {
-    let measured = (slowest_ms / 1000).saturating_mul(GIT_TIMEOUT_MULTIPLE);
-    Duration::from_secs(measured.max(GIT_TIMEOUT_FLOOR_SECS))
 }
 
 #[derive(Debug, Clone)]
@@ -599,7 +580,7 @@ pub struct WorkdirRouter {
     stillness_secs: AtomicU64,
     last_fetch_unix: AtomicI64,
     /// The longest git command that has completed here, in milliseconds. What
-    /// the timeout is a multiple of; see [`GIT_TIMEOUT_FLOOR_SECS`].
+    /// the timeout is a multiple of; see [`cog_core::git_budget`].
     git_slowest_ms: AtomicU64,
     /// The last reclamation pass's duration, in milliseconds, and when it
     /// started. What the interval is a multiple of.
@@ -1619,7 +1600,7 @@ impl WorkdirRouter {
     /// that got slower (a bigger repository, a busier disk) is allowed the time
     /// it now needs, rather than being killed at a number written elsewhere.
     fn git_timeout(&self) -> Duration {
-        git_timeout_from(self.git_slowest_ms.load(Ordering::Relaxed))
+        cog_core::git_budget::git_timeout_from(self.git_slowest_ms.load(Ordering::Relaxed))
     }
 
     /// How old a git lock has to be before it can only be a corpse.
@@ -2604,27 +2585,6 @@ pub(crate) mod tests {
             gc_interval_from(400_000, configured),
             Duration::from_secs(8000)
         );
-    }
-
-    /// A command is called hung relative to what commands here actually cost.
-    #[test]
-    fn the_git_timeout_follows_the_slowest_command_that_finished() {
-        // Nothing has completed yet: the floor is the only evidence available.
-        assert_eq!(
-            git_timeout_from(0),
-            Duration::from_secs(GIT_TIMEOUT_FLOOR_SECS)
-        );
-        // A clone that took 40s makes the allowance 400s, not 120.
-        assert_eq!(git_timeout_from(40_000), Duration::from_secs(400));
-        // A fast volume never gets an allowance below the floor.
-        assert_eq!(
-            git_timeout_from(1_500),
-            Duration::from_secs(GIT_TIMEOUT_FLOOR_SECS)
-        );
-        // A lock is a corpse once no live command could still hold it, which is
-        // the timeout doubled -- so the lock age follows the same measurement
-        // instead of being a second number kept in step by hand.
-        assert_eq!(git_timeout_from(40_000) * 2, Duration::from_secs(800));
     }
 
     /// The TTL is set by how fast trees arrive and how many fit -- never by how
