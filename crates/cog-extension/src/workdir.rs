@@ -2284,7 +2284,9 @@ pub(crate) mod tests {
         assert_eq!(r.list_task_trees().await.len(), 1);
     }
 
-    pub(crate) const DEFAULT_TTL_SECS_FALLBACK: Duration = Duration::from_secs(21600);
+    /// 测试里的默认 TTL：从生产那个数算出来，别再写一遍——写两遍的六小时会漂。
+    pub(crate) const DEFAULT_TTL_SECS_FALLBACK: Duration =
+        Duration::from_secs(super::DEFAULT_TTL_SECS);
 
     #[tokio::test]
     async fn tasks_are_isolated_and_keep_their_own_files() {
