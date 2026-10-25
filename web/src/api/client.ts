@@ -1561,8 +1561,10 @@ export interface TopologyNode {
 }
 
 export interface TopologyCluster {
+  /** 接口给这个连接的编号（`in-cluster`），不是集群的名字——Kubernetes 里没有这一项。 */
   id: string;
-  name: string;
+  /** 这一面读的是这一个命名空间里的 Pod；节点是整台机器的。 */
+  namespace: string;
   reachable: boolean;
   error: string | null;
   version: string | null;
@@ -1572,7 +1574,10 @@ export interface TopologyCluster {
    */
   usage_source: 'metrics-server' | 'kubelet-summary' | null;
   nodes: TopologyNode[];
+  /** Pod 自己说没被调度到任何节点上。 */
   unscheduled: TopologyPod[];
+  /** Pod 说在某台节点上，但这次没读到那台节点——不是「没被调度」。 */
+  unplaced: TopologyPod[];
 }
 
 export interface ClusterTopology {

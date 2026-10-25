@@ -108,9 +108,13 @@ pub struct Topology {
 
 #[derive(Debug, Serialize)]
 pub struct ClusterView {
-    /// 稳定标识，前端用它做选中态。
+    /// 稳定标识，前端用它做选中态。这是接口给这个连接的编号（`in-cluster`），
+    /// 不是集群的名字——Kubernetes 的 API 里没有「集群叫什么」这一项。
     pub id: String,
-    pub name: String,
+    /// 这一面读的是**这一个命名空间**里的 Pod：节点是整台机器的，Pod 只取平台自己的
+    /// 那一个。界面要把这句说出来，否则「Pod 37」会被读成「集群里一共 37 个 Pod」，
+    /// 而 `kubectl get pods -A` 会给出另一个数。
+    pub namespace: String,
     /// 这次读取有没有真的读到集群。`false` 时 `error` 说明为什么。
     pub reachable: bool,
     pub error: Option<String>,
@@ -119,9 +123,12 @@ pub struct ClusterView {
     /// 或者 `None`（两个来源都读不到，界面要说明白「只有申报量」，不能画一条零线）。
     pub usage_source: Option<String>,
     pub nodes: Vec<NodeView>,
-    /// 没有落到任何节点上的 Pod（待调度、或节点被删）。它们不出现在任何节点下，
-    /// 但还是集群里的事实，不能因为画不出来就消失。
+    /// Pod 自己说它没有被调度到任何节点上（`spec.nodeName` 空）。这是调度器的事实。
     pub unscheduled: Vec<PodView>,
+    /// Pod 说自己落在某台节点上，但这次**没有读到那台节点**——节点列表读失败（权限、
+    /// apiserver 出错），或者节点刚被删。它们不是「没有被调度」，把它们画进
+    /// `unscheduled` 就是一句假话：节点读失败时整屏的 Pod 都会变成「未调度」。
+    pub unplaced: Vec<PodView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -271,13 +278,14 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
 
     let mut view = ClusterView {
         id: "in-cluster".to_string(),
-        name: client.namespace().to_string(),
+        namespace: client.namespace().to_string(),
         reachable: true,
         error: None,
         version: None,
         usage_source: None,
         nodes: Vec::new(),
         unscheduled: Vec::new(),
+        unplaced: Vec::new(),
     };
 
     match client.get_json("/version").await {
@@ -681,26 +689,32 @@ async fn measured_claim_bytes(
     measured
 }
 
-/// 把 Pod 挂到它所在的节点上，剩下的进 `unscheduled`。
+/// 把 Pod 挂到它所在的节点上，挂不上的按**为什么挂不上**分两栏。
 ///
-/// 单独成一个函数是因为这条映射是这一面唯一会错的地方：节点名对不上（节点刚被
-/// 删、Pod 刚从别处搬来）、Pod 还没被调度、命名空间里读到的 Pod 落在不归这一面
-/// 管的节点上——三种都要落到看得见的位置，而不是静默消失。
+/// 单独成一个函数是因为这条映射是这一面唯一会错的地方，而且错法不止一种：
+/// - Pod 自己没有节点（`spec.nodeName` 空）：调度器的事实，进 `unscheduled`；
+/// - Pod 写着在某台节点上，但这台节点不在这次读到的节点列表里：节点读失败或者
+///   节点刚被删，进 `unplaced`。
+///
+/// 两种合成一栏会让节点读失败时的整屏 Pod 都变成「没有被调度」——那不是少一点
+/// 信息，那是一句假话，而它恰好出现在最需要看清集群的时候。
 fn place_pods(cluster: &mut ClusterView, pods: Vec<PodView>) {
     for pod in pods {
-        let placed = pod.node.as_ref().and_then(|node| {
-            cluster
-                .nodes
-                .iter_mut()
-                .find(|candidate| &candidate.name == node)
-        });
+        let Some(node_name) = pod.node.clone() else {
+            cluster.unscheduled.push(pod);
+            continue;
+        };
+        let placed = cluster
+            .nodes
+            .iter_mut()
+            .find(|candidate| candidate.name == node_name);
         match placed {
             Some(node) => {
                 node.cpu_requested_millicores += pod.cpu_requested_millicores;
                 node.memory_requested_bytes += pod.memory_requested_bytes;
                 node.pods.push(pod);
             }
-            None => cluster.unscheduled.push(pod),
+            None => cluster.unplaced.push(pod),
         }
     }
     for node in &mut cluster.nodes {
@@ -708,6 +722,7 @@ fn place_pods(cluster: &mut ClusterView, pods: Vec<PodView>) {
             .sort_by(|a, b| a.name.cmp(&b.name).then(a.namespace.cmp(&b.namespace)));
     }
     cluster.unscheduled.sort_by(|a, b| a.name.cmp(&b.name));
+    cluster.unplaced.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
 fn node_view(node: &Value) -> NodeView {
@@ -1589,13 +1604,14 @@ mod topology_tests {
     fn cluster_with(nodes: Vec<serde_json::Value>) -> ClusterView {
         ClusterView {
             id: "in-cluster".to_string(),
-            name: "cogneva".to_string(),
+            namespace: "cogneva".to_string(),
             reachable: true,
             error: None,
             version: None,
             usage_source: None,
             nodes: nodes.iter().map(node_view).collect(),
             unscheduled: Vec::new(),
+            unplaced: Vec::new(),
         }
     }
 
@@ -1647,14 +1663,47 @@ mod topology_tests {
             3 * 1024 * 1024 * 1024
         );
         assert_eq!(cluster.nodes[1].cpu_requested_millicores, 250);
-        // 名字对不上节点的 Pod 与没被调度的 Pod 都是集群里的事实，不能消失。
-        assert_eq!(cluster.unscheduled.len(), 2);
-        let names: Vec<&str> = cluster
+        // 没被调度的 Pod 与「写着在某台节点上、但那台节点这次没读到」的 Pod 都在，
+        // 但不能混成一栏：前者是调度器的事实，后者是这次读取的缺口。
+        let unscheduled: Vec<&str> = cluster
             .unscheduled
             .iter()
             .map(|p| p.name.as_str())
             .collect();
-        assert_eq!(names, vec!["orphan-1", "waiting-1"]);
+        assert_eq!(unscheduled, vec!["waiting-1"]);
+        let unplaced: Vec<&str> = cluster.unplaced.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(unplaced, vec!["orphan-1"]);
+    }
+
+    /// 节点列表读失败（权限不够、apiserver 报错）时，节点是空的，但 Pod 全都写着
+    /// 自己在 `cogneva` 上。这时候把它们叫「没有被调度」是整屏的假话——而这一屏
+    /// 恰恰是集群出问题时最该看的那一屏。
+    #[test]
+    fn a_pod_on_a_node_that_was_not_read_is_not_called_unscheduled() {
+        let mut cluster = cluster_with(Vec::new());
+        place_pods(
+            &mut cluster,
+            vec![
+                pod_view(
+                    &pod("api-1", Some("cogneva"), "500m", "1Gi"),
+                    &Sources::default(),
+                ),
+                pod_view(
+                    &pod("api-2", Some("cogneva"), "500m", "1Gi"),
+                    &Sources::default(),
+                ),
+            ],
+        );
+
+        assert!(
+            cluster.unscheduled.is_empty(),
+            "这两个 Pod 都写着在 cogneva 节点上，不该被叫作未调度"
+        );
+        assert_eq!(
+            cluster.unplaced.len(),
+            2,
+            "读不到节点时 Pod 要落到「节点没读到」这一栏"
+        );
     }
 
     #[test]

@@ -263,7 +263,7 @@ function collectClaims(cluster: TopologyCluster | null): TopologyClaim[] {
       }
     }
   }
-  for (const pod of cluster?.unscheduled ?? []) {
+  for (const pod of [...(cluster?.unscheduled ?? []), ...(cluster?.unplaced ?? [])]) {
     for (const volume of pod.volumes) {
       if (volume.claim && !claims.has(volume.claim.name)) {
         claims.set(volume.claim.name, volume.claim);

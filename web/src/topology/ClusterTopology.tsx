@@ -57,24 +57,35 @@ export function ClusterTopology() {
 function ClusterRow({ cluster, collectedAt }: { cluster: TopologyCluster; collectedAt: string }) {
   const pods = cluster.nodes.reduce((sum, node) => sum + node.pods.length, 0);
   const ready = cluster.nodes.filter((node) => node.ready).length;
+  const placed = cluster.nodes.flatMap((node) => node.pods);
+  const counts = tally(placed);
 
   return (
     <div className="flex flex-col">
       <header className="flex flex-wrap items-baseline gap-x-4 gap-y-1 px-4 py-2">
         <span className="flex items-center gap-1.5">
           <Dot tone={cluster.reachable ? 'ok' : 'danger'} />
-          <span className="mono text-[12px] text-[var(--paper)]">{cluster.id}</span>
+          <span className="text-[12px] text-[var(--paper)]" title={`接口标识 ${cluster.id}`}>
+            本集群
+          </span>
         </span>
         {cluster.version && <span className="mono text-[11px] text-[var(--muted)]">{cluster.version}</span>}
+        <span className="mono text-[11px] text-[var(--muted)]">命名空间 {cluster.namespace}</span>
         <span className="text-[11px] text-[var(--paper-dim)]">
           节点 {ready}/{cluster.nodes.length} 就绪 · Pod {pods}
-          {cluster.unscheduled.length > 0 && ` · 未落节点 ${cluster.unscheduled.length}`}
+          {counts.finished > 0 && `（已完成 ${counts.finished}）`}
         </span>
         <UsageSourceNote source={cluster.usage_source} />
         <span className="mono ml-auto text-[10px] text-[var(--muted)]">
           {new Date(collectedAt).toLocaleTimeString('zh-CN')} 读
         </span>
       </header>
+
+      <p className="px-4 pb-1 text-[10px] text-[var(--muted)]">
+        这一面读的是<span className="mono"> {cluster.namespace} </span>
+        这一个命名空间里的 Pod；节点是整台机器的。别的命名空间（系统组件、监控）要在
+        <span className="mono"> kubectl </span>里看，这里不装作读过。
+      </p>
 
       {cluster.error && (
         <p className="mono px-4 pb-2 text-[11px]" style={{ color: 'var(--warn)' }}>
@@ -93,7 +104,7 @@ function ClusterRow({ cluster, collectedAt }: { cluster: TopologyCluster; collec
       {cluster.unscheduled.length > 0 && (
         <div className="border-t border-[var(--line)] px-4 py-2">
           <h3 className="mb-1 text-[10px] uppercase tracking-[0.14em]" style={{ color: 'var(--warn)' }}>
-            没有落在任何节点上的 Pod
+            调度器还没给它节点（Pending / 没有 nodeName）
           </h3>
           <div className="flex flex-col gap-0.5">
             {cluster.unscheduled.map((pod) => (
@@ -102,8 +113,56 @@ function ClusterRow({ cluster, collectedAt }: { cluster: TopologyCluster; collec
           </div>
         </div>
       )}
+
+      {cluster.unplaced.length > 0 && (
+        <div className="border-t border-[var(--line)] px-4 py-2">
+          <h3 className="mb-1 text-[10px] uppercase tracking-[0.14em]" style={{ color: 'var(--warn)' }}>
+            在节点上，但这次没读到那台节点（{cluster.unplaced.length} 个）
+          </h3>
+          <p className="mb-1 text-[10px] text-[var(--muted)]">
+            {cluster.reachable
+              ? '这些 Pod 写着自己在某台节点上，那台节点不在这次的节点列表里：可能是刚被删，也可能是这次只读到了一部分节点。不是「没有被调度」。'
+              : '这次没读到节点列表（见上面的错误），所以它们挂不到任何节点下——它们写着自己在哪台机器上，只是这一面看不见那台机器。'}
+          </p>
+          <div className="flex flex-col gap-0.5">
+            {cluster.unplaced.map((pod) => (
+              <PodRow key={`${pod.namespace}/${pod.name}`} pod={pod} />
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
+}
+
+/**
+ * 一个阶段该是什么颜色。
+ *
+ * `Succeeded` 不是失败：Job 跑完了，它就该是这个样子，把它画成红点是这一面最容易
+ * 犯的错——一次部署里十几个 Job 跑完，整屏都是红的，真正 Failed 的那两个就淹了。
+ */
+function phaseTone(pod: TopologyPod): 'ok' | 'warn' | 'danger' | 'idle' {
+  if (pod.phase === 'Succeeded') return 'idle';
+  if (pod.phase === 'Failed') return 'danger';
+  if (pod.phase === 'Running') return pod.ready ? 'ok' : 'warn';
+  if (pod.phase === 'Pending') return 'warn';
+  return 'danger';
+}
+
+/** 跑完的排最后，其余按名字。 */
+function byLiveness(a: TopologyPod, b: TopologyPod): number {
+  const finished = (pod: TopologyPod) => (pod.phase === 'Succeeded' ? 1 : 0);
+  return finished(a) - finished(b) || a.name.localeCompare(b.name);
+}
+
+/** 运行中、未就绪、已完成、失败。四个数分开，合起来才是「Pod 有多少」。 */
+function tally(pods: TopologyPod[]) {
+  return {
+    running: pods.filter((pod) => pod.phase === 'Running' && pod.ready).length,
+    unfinished: pods.filter((pod) => pod.phase === 'Running' && !pod.ready).length,
+    finished: pods.filter((pod) => pod.phase === 'Succeeded').length,
+    failed: pods.filter((pod) => pod.phase === 'Failed' || pod.phase === 'Unknown').length,
+  };
 }
 
 /**
@@ -188,7 +247,9 @@ function NodeCard({ node }: { node: TopologyNode }) {
               这个命名空间里没有 Pod 排在这台机器上。
             </p>
           ) : (
-            node.pods.map((pod) => (
+            // 已经跑完的 Job 排在最后：它们还占着 Pod 名额，但没有人要在这一屏上
+            // 找它们，而活着的那几个应该在上面。
+            [...node.pods].sort(byLiveness).map((pod) => (
               <div key={`${pod.namespace}/${pod.name}`} className="bg-[var(--ink-900)]">
                 <PodRow pod={pod} />
               </div>
@@ -213,7 +274,7 @@ function NodeCard({ node }: { node: TopologyNode }) {
 function PodRow({ pod }: { pod: TopologyPod }) {
   const [open, setOpen] = useState(false);
   const [openContainer, setOpenContainer] = useState<string | null>(null);
-  const tone = pod.phase === 'Running' && pod.ready ? 'ok' : pod.phase === 'Running' ? 'warn' : 'danger';
+  const tone = phaseTone(pod);
   const warnings = pod.events.filter((event) => event.kind === 'Warning').length;
 
   return (
@@ -225,6 +286,7 @@ function PodRow({ pod }: { pod: TopologyPod }) {
         className="flex w-full items-baseline gap-2 px-3 py-1 text-left transition-colors hover:bg-[var(--ink-800)]"
       >
         <Dot tone={tone} />
+        <span className="mono shrink-0 text-[10px] text-[var(--muted)]">{pod.namespace}/</span>
         <span className="mono min-w-0 flex-1 truncate text-[11px] text-[var(--paper-dim)]">{pod.name}</span>
         {warnings > 0 && (
           <span className="mono shrink-0 text-[10px]" style={{ color: 'var(--warn)' }}>
@@ -520,8 +582,15 @@ function Bar({
   );
 }
 
-function Dot({ tone }: { tone: 'ok' | 'warn' | 'danger' }) {
-  const color = tone === 'ok' ? 'var(--ok)' : tone === 'warn' ? 'var(--warn)' : 'var(--danger)';
+function Dot({ tone }: { tone: 'ok' | 'warn' | 'danger' | 'idle' }) {
+  const color =
+    tone === 'ok'
+      ? 'var(--ok)'
+      : tone === 'warn'
+        ? 'var(--warn)'
+        : tone === 'idle'
+          ? 'var(--muted)'
+          : 'var(--danger)';
   return <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: color }} />;
 }
 

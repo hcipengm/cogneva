@@ -647,6 +647,13 @@ jobs:
       - name: Check the audit panel opens, filters, and stays read-only
         run: bash deploy/scripts/check-web-audit-panel.sh
 
+      # 拓扑面的成品是「从集群点到节点、再点到 Pod 和容器」，不是 `/api/v1/cluster/topology`
+      # 那份 JSON。这一面坏起来不出声：数据全、组件在，只是把话说错了——节点读失败时
+      # 把整屏 Pod 说成「没有落在任何节点上」、把跑完的 Job 画成红点、不显示命名空间
+      # 让人以为这屏是整台集群。门把这三件事与服务端的 unplaced 分流一起判。
+      - name: Check the topology screen tells the truth about what it read
+        run: bash deploy/scripts/check-web-topology-panel.sh
+
   # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读
   # 覆盖端点），它结构上证明不了 `web/` 编得过：类型错、装不上的依赖、打包不进
   # bundle，三条它一条也看不见。构建这一半必须自己有一个作业，否则「新增功能不得
