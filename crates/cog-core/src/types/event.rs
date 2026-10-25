@@ -372,6 +372,13 @@ pub enum AgentEvent {
     },
     /// A ReAct (Reasoning + Acting) step started.
     /// Emitted at the beginning of each Think->Act->Observe cycle.
+    ///
+    /// The wire name is pinned: `rename_all` splits `ReAct` into `re_act`,
+    /// while the name this event is stored and filtered under is
+    /// `react_step_start`. One event with two names is invisible to half its
+    /// readers — a client that subscribes by the stored name never sees the
+    /// live frame, and nothing on either side looks broken.
+    #[serde(rename = "react_step_start")]
     ReActStepStart {
         agent_id: String,
         iteration: u32,
@@ -380,6 +387,7 @@ pub enum AgentEvent {
     },
     /// A ReAct (Reasoning + Acting) step completed.
     /// Emitted after the Observation phase of each cycle.
+    #[serde(rename = "react_step_end")]
     ReActStepEnd {
         agent_id: String,
         iteration: u32,

@@ -121,3 +121,178 @@ pub fn event_type_name(event: &AgentEvent) -> &str {
         AgentEvent::CheckpointSaved { .. } => "checkpoint_saved",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::event_type_name;
+    use chrono::Utc;
+    use cog_core::{AgentEvent, AssistantMessageEvent, ErrorSeverity, Message, ToolCall};
+    use serde_json::json;
+
+    /// One of every variant. Kept as a plain function rather than a list of
+    /// literals so the compiler catches a variant added without a specimen.
+    fn one_of_each() -> Vec<AgentEvent> {
+        let now = Utc::now();
+        let message = Message::user("x");
+        vec![
+            AgentEvent::AgentStart {
+                agent_id: "a".into(),
+                crew_id: None,
+                squad_id: None,
+                timestamp: now,
+            },
+            AgentEvent::AgentEnd {
+                agent_id: "a".into(),
+                messages: vec![message.clone()],
+                crew_id: None,
+                squad_id: None,
+                timestamp: now,
+            },
+            AgentEvent::TurnStart {
+                agent_id: "a".into(),
+                timestamp: now,
+            },
+            AgentEvent::TurnEnd {
+                agent_id: "a".into(),
+                message: message.clone(),
+                tool_results: vec![],
+                timestamp: now,
+            },
+            AgentEvent::MessageStart {
+                agent_id: "a".into(),
+                message: message.clone(),
+                timestamp: now,
+            },
+            AgentEvent::MessageUpdate {
+                agent_id: "a".into(),
+                assistant_event: AssistantMessageEvent::TextDelta {
+                    delta: "d".into(),
+                    content_index: 0,
+                    timestamp: now,
+                },
+                timestamp: now,
+            },
+            AgentEvent::MessageEnd {
+                agent_id: "a".into(),
+                message: message.clone(),
+                timestamp: now,
+            },
+            AgentEvent::ToolExecutionStart {
+                agent_id: "a".into(),
+                tool_call_id: "c".into(),
+                tool_name: "t".into(),
+                args: json!({}),
+                timestamp: now,
+            },
+            AgentEvent::ToolExecutionUpdate {
+                agent_id: "a".into(),
+                tool_call_id: "c".into(),
+                partial_result: json!({}),
+                timestamp: now,
+            },
+            AgentEvent::ToolExecutionEnd {
+                agent_id: "a".into(),
+                tool_call_id: "c".into(),
+                result: json!({}),
+                is_error: false,
+                timestamp: now,
+            },
+            AgentEvent::StateChange {
+                agent_id: "a".into(),
+                from: "x".into(),
+                to: "y".into(),
+                crew_id: None,
+                squad_id: None,
+                timestamp: now,
+            },
+            AgentEvent::TaskStatusChange {
+                task_id: "t".into(),
+                status: "running".into(),
+                agent_id: None,
+                crew_id: None,
+                squad_id: None,
+                timestamp: now,
+            },
+            AgentEvent::SelfReview {
+                agent_id: "a".into(),
+                status: "PASS".into(),
+                score: 1.0,
+                summary: None,
+                critique: None,
+                suggestions: None,
+                timestamp: now,
+            },
+            AgentEvent::ReActStepStart {
+                agent_id: "a".into(),
+                iteration: 1,
+                timestamp: now,
+            },
+            AgentEvent::ReActStepEnd {
+                agent_id: "a".into(),
+                iteration: 1,
+                thought: "t".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c".into(),
+                    name: "n".into(),
+                    arguments: json!({}),
+                }],
+                observations: vec![],
+                timestamp: now,
+            },
+            AgentEvent::AgentError {
+                agent_id: "a".into(),
+                error_code: "E".into(),
+                severity: ErrorSeverity::Warning,
+                details: "d".into(),
+                crew_id: None,
+                squad_id: None,
+                timestamp: now,
+            },
+            AgentEvent::ResourceAlert {
+                agent_id: "a".into(),
+                metric: "m".into(),
+                threshold: 1.0,
+                current: 2.0,
+                crew_id: None,
+                squad_id: None,
+                timestamp: now,
+            },
+            AgentEvent::Heartbeat {
+                agent_id: "a".into(),
+                timestamp: now,
+            },
+            AgentEvent::CheckpointSaved {
+                agent_id: "a".into(),
+                checkpoint_id: "c".into(),
+                task_id: "t".into(),
+                crew_id: None,
+                squad_id: None,
+                timestamp: now,
+            },
+        ]
+    }
+
+    /// The name on the wire and the name in storage are one name.
+    ///
+    /// `AgentEvent` derives `rename_all = "snake_case"`, which splits `ReAct`
+    /// into `re_act`, while `event_type_name` — the name written to the event
+    /// table and matched by every filter — says `react_step_start`. A client
+    /// subscribing to the stored name therefore never saw a live ReAct frame,
+    /// and neither side looked wrong on its own. Pinning the two together here
+    /// is what makes that class of drift fail a build instead of a demo.
+    #[test]
+    fn the_wire_name_of_every_event_equals_its_stored_name() {
+        for event in one_of_each() {
+            let wire = serde_json::to_value(&event).expect("event serializes");
+            let wire_name = wire
+                .get("type")
+                .and_then(|v| v.as_str())
+                .expect("every variant tags itself with a type");
+            assert_eq!(
+                wire_name,
+                event_type_name(&event),
+                "wire name and stored name disagree for {event:?}"
+            );
+        }
+    }
+}

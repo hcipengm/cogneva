@@ -167,24 +167,78 @@ pub async fn delete_session_handler(
         .into_response()
 }
 
+/// The lines of one conversation, oldest first.
+///
+/// This used to answer `items: []` unconditionally while the chat socket was
+/// happily streaming deltas: the transcript existed in `chat_turns` and the one
+/// endpoint named "message history" could not see it. A reopened page showed an
+/// empty conversation and the platform looked like it had forgotten what it was
+/// told. The rows are read here instead of answered from a canned body.
+///
+/// `failure` rides on the row rather than being folded into `content`: a turn
+/// whose answer never arrived is still a turn, and a reader that cannot tell
+/// "no answer yet" from "no answer ever" re-asks a question that already failed.
 pub async fn list_messages_handler(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     Path(session_id): Path<String>,
-    Query(_q): Query<ListMessagesQuery>,
+    Query(q): Query<ListMessagesQuery>,
 ) -> Response {
-    (
-        StatusCode::OK,
-        Json(json!({
-            "code": "ok",
-            "data": {
-                "session_id": session_id,
-                "items": [],
-                "next_cursor": null,
-                "has_more": false,
-            }
-        })),
-    )
-        .into_response()
+    let limit = q.limit.unwrap_or(200).clamp(1, 500) as usize;
+    let Some(store) = state.chat_turns.as_ref() else {
+        // No transcript store in this deployment: an empty list is the truthful
+        // answer, and the client still has the live socket.
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "code": "ok",
+                "data": {
+                    "session_id": session_id,
+                    "items": [],
+                    "next_cursor": null,
+                    "has_more": false,
+                }
+            })),
+        )
+            .into_response();
+    };
+
+    match store.transcript(&session_id, limit).await {
+        Ok(turns) => {
+            let items: Vec<serde_json::Value> = turns
+                .into_iter()
+                .map(|turn| {
+                    json!({
+                        "id": format!("turn-{}", turn.id),
+                        "role": turn.role.as_str(),
+                        "content": turn.content,
+                        "failure": turn.failure,
+                        "created_at": turn.created_at,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "code": "ok",
+                    "data": {
+                        "session_id": session_id,
+                        "items": items,
+                        "next_cursor": null,
+                        "has_more": false,
+                    }
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "code": "error",
+                "message": format!("读不到这段对话的记录：{e}"),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn send_message_handler(

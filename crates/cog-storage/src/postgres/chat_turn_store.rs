@@ -68,7 +68,24 @@ pub struct ChatTurn {
     pub content: String,
 }
 
-/// The transcript's two operations.
+/// One line of the transcript as a reader shows it: with the row's identity, its
+/// time, and the reason it has no answer when it has none.
+///
+/// [`ChatTurn`] is what a prompt is built from and therefore deliberately
+/// forgets all three: the model is shown who said what, not when it was said.
+/// A reader reopening a conversation needs the parts the prompt drops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatTurnRecord {
+    pub id: i64,
+    pub role: ChatTurnRole,
+    pub content: String,
+    /// Why this line never got an answer. Both halves of an unanswered exchange
+    /// carry the same reason, so a reader that finds either end can say why.
+    pub failure: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The transcript's three operations.
 ///
 /// A trait rather than the concrete store because the gateway must keep
 /// answering when the database is not reachable: the turn still streams, the
@@ -106,6 +123,16 @@ pub trait ChatTurnStore: Send + Sync {
     /// in the model's mouth that the user never received as an answer. They
     /// stay readable in the table itself.
     async fn history(&self, session_id: &str, limit: usize) -> SFResult<Vec<ChatTurn>>;
+
+    /// The last `limit` lines of a session as a reader shows them, oldest first,
+    /// unanswered exchanges included.
+    ///
+    /// The difference from [`Self::history`] is the whole point: a conversation
+    /// that is only visible while the socket is open is not a record, it is a
+    /// live view. Reload the page and the transcript must still be there,
+    /// including the turns whose answer never arrived -- those are the ones a
+    /// person most needs to find again.
+    async fn transcript(&self, session_id: &str, limit: usize) -> SFResult<Vec<ChatTurnRecord>>;
 }
 
 /// PostgreSQL chat transcript.
@@ -208,6 +235,17 @@ SELECT role, content FROM ( \
 ) newest \
 ORDER BY id";
 
+/// The same window as [`HISTORY_SQL`], with the columns a reader needs and none
+/// of the `failure IS NULL` filter: the unanswered half is exactly what a
+/// reopened conversation has to show.
+const TRANSCRIPT_SQL: &str = "\
+SELECT id, role, content, failure, created_at FROM ( \
+    SELECT id, role, content, failure, created_at FROM chat_turns \
+    WHERE session_id = $1 \
+    ORDER BY id DESC LIMIT $2 \
+) newest \
+ORDER BY id";
+
 #[async_trait]
 impl ChatTurnStore for PostgresChatTurnStore {
     async fn record_turn(&self, session_id: &str, user: &str, assistant: &str) -> SFResult<()> {
@@ -241,6 +279,40 @@ impl ChatTurnStore for PostgresChatTurnStore {
                     ))
                 })?;
                 Ok(ChatTurn { role, content })
+            })
+            .collect()
+    }
+
+    async fn transcript(&self, session_id: &str, limit: usize) -> SFResult<Vec<ChatTurnRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(
+            i64,
+            String,
+            String,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+        )> = sqlx::query_as(TRANSCRIPT_SQL)
+            .bind(session_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("read the chat transcript: {e}")))?;
+        rows.into_iter()
+            .map(|(id, role, content, failure, created_at)| {
+                let role = ChatTurnRole::parse(&role).ok_or_else(|| {
+                    SFError::Database(format!(
+                        "chat transcript holds a role this build cannot name: {role:?}"
+                    ))
+                })?;
+                Ok(ChatTurnRecord {
+                    id,
+                    role,
+                    content,
+                    failure,
+                    created_at,
+                })
             })
             .collect()
     }
