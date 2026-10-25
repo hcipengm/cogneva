@@ -435,6 +435,41 @@ pub struct RolledSpend {
     pub rows: Vec<ActorSpend>,
 }
 
+/// One window of one `(actor, origin, upstream, protocol)` line, unsplit from
+/// its window.
+///
+/// The same columns [`ActorSpend`] carries, plus the window they happened in.
+/// Kept as its own type rather than as a tuple so that a caller cannot pair one
+/// window's counts with another's timestamps by position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendWindowRow {
+    pub window_start: DateTime<Utc>,
+    pub window_end: DateTime<Utc>,
+    pub actor: String,
+    pub origin: String,
+    pub upstream: String,
+    pub api_style: String,
+    pub calls: i64,
+    pub failed_calls: i64,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+    pub tokens_cached: i64,
+}
+
+/// One rolled read left at window granularity: the rows, and the range the
+/// windows they came from cover.
+#[derive(Debug, Clone)]
+pub struct WindowSeries {
+    /// Oldest window start and newest window end present in the rows. Both are
+    /// `None` — never one without the other — when no closed window fell inside
+    /// the requested range, for the reason [`RolledSpend`] gives: an empty list
+    /// answers "no spend" and "not covered yet" alike, and only the range tells
+    /// them apart.
+    pub covered_since: Option<DateTime<Utc>>,
+    pub covered_until: Option<DateTime<Utc>>,
+    pub rows: Vec<SpendWindowRow>,
+}
+
 /// One closed accounting window, `[start, end)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RollupWindow {
@@ -1419,6 +1454,72 @@ impl LlmUsageStore {
             rows,
         })
     }
+
+    /// The same fold, one row per window per `(actor, origin, upstream,
+    /// protocol)` instead of one row per combination.
+    ///
+    /// Ordered by window so that a reader plotting an axis never has to sort:
+    /// the fold's primary key already starts with `window_start`, and the one
+    /// the reader plots is the one the fold wrote. Ties inside a window are
+    /// ordered by the same columns the summed read orders by, so two readers of
+    /// the same window see the same rows in the same places.
+    pub async fn usage_series(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> anyhow::Result<WindowSeries> {
+        let scanned = sqlx::query(&format!(
+            "SELECT MIN(window_start) AS covered_since, MAX(window_end) AS covered_until \
+             FROM {ROLLUP_TABLE} \
+             WHERE window_start >= $1 AND window_end <= $2"
+        ))
+        .bind(since)
+        .bind(until)
+        .fetch_one(&self.pool)
+        .await?;
+        let covered_since = scanned.get::<Option<DateTime<Utc>>, _>("covered_since");
+        let covered_until = scanned.get::<Option<DateTime<Utc>>, _>("covered_until");
+        let (Some(covered_since), Some(covered_until)) = (covered_since, covered_until) else {
+            return Ok(WindowSeries {
+                covered_since: None,
+                covered_until: None,
+                rows: Vec::new(),
+            });
+        };
+        let rows = sqlx::query(&format!(
+            "SELECT window_start, window_end, actor, origin, upstream, api_style, \
+                    calls, failed_calls, tokens_input, tokens_output, tokens_cached \
+             FROM {ROLLUP_TABLE} \
+             WHERE window_start >= $1 AND window_end <= $2 \
+             ORDER BY window_start, (tokens_input + tokens_output) DESC, \
+                      actor, origin, upstream, api_style"
+        ))
+        .bind(covered_since)
+        .bind(covered_until)
+        .fetch_all(&self.pool)
+        .await?;
+        let rows = rows
+            .iter()
+            .map(|r| SpendWindowRow {
+                window_start: r.get::<DateTime<Utc>, _>("window_start"),
+                window_end: r.get::<DateTime<Utc>, _>("window_end"),
+                actor: r.get::<String, _>("actor"),
+                origin: r.get::<String, _>("origin"),
+                upstream: r.get::<String, _>("upstream"),
+                api_style: r.get::<String, _>("api_style"),
+                calls: r.get::<i64, _>("calls"),
+                failed_calls: r.get::<i64, _>("failed_calls"),
+                tokens_input: r.get::<i64, _>("tokens_input"),
+                tokens_output: r.get::<i64, _>("tokens_output"),
+                tokens_cached: r.get::<i64, _>("tokens_cached"),
+            })
+            .collect();
+        Ok(WindowSeries {
+            covered_since: Some(covered_since),
+            covered_until: Some(covered_until),
+            rows,
+        })
+    }
 }
 
 /// The publishing handle for [`cog_core::LlmUsageReader`]: presents the rolled
@@ -1465,6 +1566,38 @@ impl cog_core::LlmUsageReader for RolledUsageReader {
                     tokens_output: s.tokens_output,
                     tokens_cached: s.tokens_cached,
                     avg_latency_ms: s.avg_latency_ms,
+                })
+                .collect(),
+        })
+    }
+
+    async fn usage_series(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> cog_core::SFResult<cog_core::UsageSeries> {
+        let series =
+            self.store.usage_series(since, until).await.map_err(|e| {
+                cog_core::SFError::Database(format!("usage series read failed: {e}"))
+            })?;
+        Ok(cog_core::UsageSeries {
+            covered_since: series.covered_since,
+            covered_until: series.covered_until,
+            rows: series
+                .rows
+                .into_iter()
+                .map(|s| cog_core::WindowSpend {
+                    window_start: s.window_start,
+                    window_end: s.window_end,
+                    actor: s.actor,
+                    origin: s.origin,
+                    upstream: s.upstream,
+                    api_style: s.api_style,
+                    calls: s.calls,
+                    failed_calls: s.failed_calls,
+                    tokens_input: s.tokens_input,
+                    tokens_output: s.tokens_output,
+                    tokens_cached: s.tokens_cached,
                 })
                 .collect(),
         })

@@ -21,6 +21,11 @@
 #      折叠每整点落一行，没折的区间与没花销的区间给出同一个答案（空列表）；
 #      不读端点的那一屏会把「没读到」显示成「没花钱」。
 #
+# 同一本折叠账有两个粒度，两条读面各自过一遍上面四条，谁也不替谁作证：
+#   `/token-usage`        按执行者合并——答「谁花的」；
+#   `/token-usage/series` 按窗口分行  ——答「什么时候花的」。
+# 只判第一条时，画时间轴的那一屏可以整块消失而门全绿：它的一条也不在被判的路径上。
+#
 # 用法：bash deploy/scripts/check-web-token-panel.sh [仓库根目录]
 set -euo pipefail
 
@@ -36,22 +41,21 @@ ROOT = sys.argv[1]
 WEB = os.path.join(ROOT, "web/src")
 CLIENT = "api/client.ts"
 ENTRY = "main.tsx"
-ROUTE = "/api/v1/observability/token-usage"
-FETCHER = "getTokenUsage"
 COVERAGE = ("covered_since", "covered_until")
+
+# 一本账的两个粒度：(请求路径, 取它的函数)。
+READS = [
+    ("/api/v1/observability/token-usage", "getTokenUsage"),
+    ("/api/v1/observability/token-usage/series", "getTokenUsageSeries"),
+]
 
 if not os.path.isdir(WEB):
     sys.exit(f"读不到前端源码目录：{WEB}")
 
-# ── 1. 路由路径与取它的函数 ──
 client = os.path.join(WEB, CLIENT)
 if not os.path.isfile(client):
     sys.exit(f"读不到 {CLIENT}——没有它，「谁在读这条路由」无从问起")
 client_src = open(client, encoding="utf-8").read()
-if ROUTE not in client_src:
-    sys.exit(f"{CLIENT} 里没有 {ROUTE}：前端这一侧没有声明这条读面的路径")
-if not re.search(rf"export\s+(?:async\s+)?function\s+{FETCHER}\b", client_src):
-    sys.exit(f"{CLIENT} 没有导出 {FETCHER}：路径在了，但没有人能取它")
 
 # ── import 图 ──
 IMPORT = re.compile(r"""^\s*(?:import|export)\b[^'"]*?from\s+['"]([^'"]+)['"]""", re.M)
@@ -88,19 +92,7 @@ def reachable():
 
 graph = reachable()
 
-# ── 2. 可达的消费者 ──
-callers = [
-    rel
-    for rel in sorted(graph)
-    if rel != CLIENT and re.search(rf"\b{FETCHER}\s*\(", read(rel))
-]
-if not callers:
-    sys.exit(
-        f"从 {ENTRY} 可达的源码里没有任何一处调用 {FETCHER}："
-        "读面没有活的外部消费者（死文件里的调用点不算，它不可达）"
-    )
 
-# ── 3、4. 有渲染出来的读者，且那一屏读了覆盖端点 ──
 def direct_imports(rel):
     out = set()
     for spec in IMPORT.findall(read(rel)):
@@ -133,27 +125,55 @@ screens = [
 ]
 
 problems = []
-for rel in callers:
-    readers = [s for s in screens if imported_by([s[0]], rel)]
-    if not readers:
+summary = []
+
+for ROUTE, FETCHER in READS:
+    # ── 1. 路由路径与取它的函数 ──
+    # 按字面量判，不按裸子串：`/token-usage` 是 `/token-usage/series` 的前缀，
+    # 子串判法会让「基础读面的声明被删掉」在还留着 series 那条时照样通过。
+    # 两端各要一个定界符，收尾允许 `${`（模板串里接查询参数的那种写法）。
+    if not re.search(r"""['"`]""" + re.escape(ROUTE) + r"""(?:['"`]|\$\{)""", client_src):
+        problems.append(f"{CLIENT} 里没有 {ROUTE}：前端这一侧没有声明这条读面的路径")
+        continue
+    if not re.search(rf"export\s+(?:async\s+)?function\s+{FETCHER}\b", client_src):
+        problems.append(f"{CLIENT} 没有导出 {FETCHER}：路径在了，但没有人能取它")
+        continue
+
+    # ── 2. 可达的消费者 ──
+    callers = [
+        rel
+        for rel in sorted(graph)
+        if rel != CLIENT and re.search(rf"\b{FETCHER}\s*\(", read(rel))
+    ]
+    if not callers:
         problems.append(
-            f"{rel}: 调用了 {FETCHER}，但可达图里没有一格渲染出来的组件用到它"
-            "（只有 import、没有渲染不算读者）"
+            f"{FETCHER}：从 {ENTRY} 可达的源码里没有任何一处调用它——"
+            "读面没有活的外部消费者（死文件里的调用点不算，它不可达）"
         )
         continue
-    screen_files = {s[0] for s in readers} | {rel}
-    shown = "".join(read(f) for f in screen_files)
-    if not any(f in shown for f in COVERAGE):
-        problems.append(
-            f"{rel}: 那一屏（{', '.join(sorted(screen_files))}）没有读覆盖端点"
-            f"（{COVERAGE[0]}/{COVERAGE[1]}）——"
-            "不读端点的屏会把「这段没折叠」显示成「这期间没花销」"
-        )
+
+    # ── 3、4. 有渲染出来的读者，且那一屏读了覆盖端点 ──
+    for rel in callers:
+        readers = [s for s in screens if imported_by([s[0]], rel)]
+        if not readers:
+            problems.append(
+                f"{rel}: 调用了 {FETCHER}，但可达图里没有一格渲染出来的组件用到它"
+                "（只有 import、没有渲染不算读者）"
+            )
+            continue
+        screen_files = {s[0] for s in readers} | {rel}
+        shown = "".join(read(f) for f in screen_files)
+        if not any(f in shown for f in COVERAGE):
+            problems.append(
+                f"{rel}: 那一屏（{', '.join(sorted(screen_files))}）没有读覆盖端点"
+                f"（{COVERAGE[0]}/{COVERAGE[1]}）——"
+                "不读端点的屏会把「这段没折叠」显示成「这期间没花销」"
+            )
+        else:
+            summary.append(f"{FETCHER}: " + ", ".join(f"{s[0]} ← {s[1]}" for s in readers))
 
 if problems:
     sys.exit("令牌花销读面的消费者不合格：\n  " + "\n  ".join(problems))
 
-shown = ", ".join(f"{rel} ← {name}" for rel, name in screens if any(
-    imported_by([rel], c) for c in callers))
-print(f"ok：{len(callers)} 处可达调用点，渲染在 {shown or '（无）'}")
+print("ok：" + "；".join(summary))
 PYEOF

@@ -411,6 +411,41 @@ export async function getTokenUsage(hours?: number): Promise<TokenUsage> {
   return api.get<TokenUsage>(`/api/v1/observability/token-usage${query}`);
 }
 
+/**
+ * 折叠账的一个窗口里的一行：某个 `(执行者, 来源, 上游, 协议)` 在那个整点
+ * 窗口上花了多少。
+ *
+ * 与 `ActorUsage` 同轴不同粒度：那一行是整个区间加起来的，这一行只算一个
+ * 窗口。把窗口加起来得到前者，而前者抹掉的正是尖峰。
+ */
+export interface WindowSpend {
+  window_start: string;
+  window_end: string;
+  actor: string;
+  origin: string;
+  upstream: string;
+  api_style: string;
+  calls: number;
+  failed_calls: number;
+  tokens_input: number;
+  tokens_output: number;
+  tokens_cached: number;
+}
+
+/** 按窗口分行的折叠账，连同它覆盖到的区间（同 `TokenUsage` 的端点语义）。 */
+export interface UsageSeries {
+  covered_since: string | null;
+  covered_until: string | null;
+  /** 一个窗口 × 一个执行者组合一行，不在这里相加。 */
+  rows: WindowSpend[];
+}
+
+/** 过去 `hours` 小时按窗口分行的令牌花销。端点语义与 `getTokenUsage` 相同。 */
+export async function getTokenUsageSeries(hours?: number): Promise<UsageSeries> {
+  const query = hours === undefined ? '' : `?hours=${hours}`;
+  return api.get<UsageSeries>(`/api/v1/observability/token-usage/series${query}`);
+}
+
 // ── 活跃告警（内存事件 + 耐久表合并） ──
 
 /** 一条正在 firing 的告警。 */

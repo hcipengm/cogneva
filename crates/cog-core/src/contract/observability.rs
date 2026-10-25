@@ -494,6 +494,40 @@ pub struct RolledUsage {
     pub actors: Vec<ActorUsage>,
 }
 
+/// One fold row left at its own window's granularity: what a single
+/// `(actor, origin, upstream, protocol)` spent inside one accounting window.
+///
+/// Same axes as [`ActorUsage`], different granularity. Neither can be derived
+/// from the other: summing these rows gives that one, and what that one erases
+/// — that a day's spend happened in one hour — is exactly what this answers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowSpend {
+    pub window_start: DateTime<Utc>,
+    pub window_end: DateTime<Utc>,
+    pub actor: String,
+    pub origin: String,
+    pub upstream: String,
+    pub api_style: String,
+    pub calls: i64,
+    pub failed_calls: i64,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+    pub tokens_cached: i64,
+}
+
+/// The fold read window by window rather than summed, with the range it covers.
+///
+/// The endpoints carry the same meaning as [`RolledUsage`]'s and are present or
+/// absent as a pair: they name the windows actually returned, never the range
+/// the caller asked for, so an uncovered request reads as an empty range rather
+/// than as an idle platform.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageSeries {
+    pub covered_since: Option<DateTime<Utc>>,
+    pub covered_until: Option<DateTime<Utc>>,
+    pub rows: Vec<WindowSpend>,
+}
+
 /// Reader of the durable token-spend rollup.
 ///
 /// Implemented by `cog-observability`, which owns the ledger and its fold, and
@@ -525,6 +559,18 @@ pub trait LlmUsageReader: Send + Sync {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> SFResult<RolledUsage>;
+
+    /// The same fold, one row per window instead of one row per actor.
+    ///
+    /// A separate read rather than a flag on the summed one: "who spent the
+    /// most over this range" and "when did it spike" are different questions,
+    /// and a caller that asked the first has no use for the second's row count
+    /// — nor does it want the fold to return a day of rows to answer it.
+    async fn usage_series(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> SFResult<UsageSeries>;
 }
 
 /// One LLM call a call site decided not to make, and the recorded reason.

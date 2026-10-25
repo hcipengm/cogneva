@@ -13,7 +13,8 @@
 # 判据：
 #   1. `client.ts` 声明了 `/api/v1/audit/events` 并导出 `listAuditEvents`；
 #   2. 从 `main.tsx` 可达的源码里有一处调用它，且这一处把筛选条件传进了请求
-#      （`trigger_type`/`agent_id`/`since` 至少出现在调用点所在的文件里）；
+#      （`trigger_type`/`agent_id`/`since` 出现在调用点括号里的那一段；参数写成
+#      同文件一处对象字面量的裸名字时跟一层，由函数拼出来的对象不跟）；
 #   3. 这一面在四个登记处都齐：`ActivityId` 联合类型、`VIEW_TITLES`、
 #      活动栏的 `ITEMS`、`registry.tsx` 的 `case`；
 #   4. 网关登记了 `/api/v1/audit/events`，且 handler 把四个筛选参数都交给了归档层；
@@ -122,10 +123,39 @@ def call_args(src, name):
     return out
 
 
+def resolve_binding(src, arg):
+    """
+    参数写成裸标识符时，顺着同文件里那一处 `const 名字 = {...}` 找回来，只跟一层。
+
+    不问「文件里出现过没有」——那正是这道门原来要挡的偷懒问法。这里跟的是**同一个
+    调用点传进去的那个对象**：名字对得上、同文件、初始值必须是对象字面量。写成
+    `const query = buildQuery(filters)` 这种由函数拼出来的对象跟不到，门照样红——
+    那种写法里筛选条件有没有真的进请求，读这段文本谁也说不准。
+    """
+    name = arg.strip()
+    # `call_args` 给的是带括号的整段；只有一个参数时括号里就是那个名字。
+    if name.startswith("(") and name.endswith(")"):
+        name = name[1:-1].strip()
+    if not re.fullmatch(r"[A-Za-z_$][\w$]*", name):
+        return arg
+    match = re.search(rf"(?:const|let|var)\s+{re.escape(name)}\s*(?::[^=]+)?=\s*\{{", src)
+    if not match:
+        return arg
+    depth, start = 0, match.end() - 1
+    for index in range(start, len(src)):
+        if src[index] == "{":
+            depth += 1
+        elif src[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start : index + 1]
+    return arg
+
+
 unwired = []
 for rel in callers:
     src = read(rel)
-    args = call_args(src, FETCHER)
+    args = [resolve_binding(src, arg) for arg in call_args(src, FETCHER)]
     if not any(all(name in arg for name in filters) for arg in args):
         unwired.append(rel)
 if unwired:

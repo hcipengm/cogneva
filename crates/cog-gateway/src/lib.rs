@@ -1033,6 +1033,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/observability/token-usage",
             get(observability::token_usage_by_actor_handler),
         )
+        // 同一本折叠账的另一个粒度：按窗口分行，给时间轴用。合计那一读
+        // 答的是「谁花得多」，这一读答的是「什么时候花的」，互相推不出来。
+        .route(
+            "/api/v1/observability/token-usage/series",
+            get(observability::token_series_handler),
+        )
         .route(
             "/api/v1/tasks/{id}/logs",
             get(observability::task_logs_handler),

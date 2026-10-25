@@ -57,6 +57,7 @@ const TITLES: Record<ActivityId, string> = {
   changes: '变更',
   governance: '治理',
   observability: '观测',
+  token: 'Token',
   resources: '资源',
   storage: '存储',
   eval: '评测',
@@ -410,6 +411,28 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             links={[
               { id: 'tasks', label: '任务', note: '依赖与结局的细节' },
               { id: 'flow', label: '流程', note: '停在哪一段' },
+            ]}
+          />
+        </>
+      );
+
+    case 'token':
+      return (
+        <>
+          <Section title="两个粒度">
+            <Row label="柱" note="按窗口分行：什么时候烧的" />
+            <Row label="表" note="按执行者合并：谁烧的" />
+            <Row label="覆盖" note="折过的窗口才算" />
+            <Row label="协议" note="缓存比只在同一协议内可比" />
+            <Note>
+              读的都是同一本折叠账，只是粒度不同：合计抹掉尖峰，逐窗口看不出总量。
+              最近那一小时通常还没折，所以它不在「覆盖」里——那不是没花。
+            </Note>
+          </Section>
+          <CrossLinks
+            links={[
+              { id: 'settings', label: '设置', note: 'LLM 上游配在哪' },
+              { id: 'observability', label: '观测', note: '模型池与后端健康' },
             ]}
           />
         </>

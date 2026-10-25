@@ -311,6 +311,60 @@ fn token_usage_response(rolled: cog_core::RolledUsage) -> TokenUsageResponse {
     }
 }
 
+/// Query parameters for [`token_series_handler`]. Same window, same cap.
+#[derive(Debug, Deserialize)]
+pub struct TokenSeriesQuery {
+    #[serde(default = "default_usage_hours")]
+    pub hours: i64,
+}
+
+/// The fold left at window granularity: what was spent in each closed window,
+/// per `(actor, origin, upstream, protocol)`, over the range the fold covered.
+///
+/// The rows travel unsplit — one per window and combination, not summed into
+/// either — because the face that reads this draws a time axis, and a sum here
+/// would leave the reader with a single point and no way to recover the
+/// intermediate ones.
+#[derive(Debug, serde::Serialize)]
+pub struct TokenSeriesResponse {
+    pub covered_since: Option<String>,
+    pub covered_until: Option<String>,
+    pub rows: Vec<cog_core::WindowSpend>,
+}
+
+/// Token spend per window per actor × upstream × protocol over the trailing
+/// window, read from the durable rollup rather than the per-call ledger.
+pub async fn token_series_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(q): Query<TokenSeriesQuery>,
+) -> Result<Json<TokenSeriesResponse>, ApiError> {
+    let reader = state
+        .llm_usage_reader
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("token usage reader not configured"))?;
+    let hours = q.hours.clamp(1, MAX_USAGE_HOURS);
+    let until = chrono::Utc::now();
+    let since = until - chrono::Duration::hours(hours);
+    let series = reader
+        .usage_series(since, until)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to read usage series: {e}")))?;
+    Ok(Json(token_series_response(series)))
+}
+
+/// Project a series read onto the response face.
+///
+/// Same rule as [`token_usage_response`]: the range is the one the fold named,
+/// never the one the request asked for. Rows are passed through one for one —
+/// the projection's only job is the endpoint format.
+fn token_series_response(series: cog_core::UsageSeries) -> TokenSeriesResponse {
+    TokenSeriesResponse {
+        covered_since: series.covered_since.map(|t| t.to_rfc3339()),
+        covered_until: series.covered_until.map(|t| t.to_rfc3339()),
+        rows: series.rows,
+    }
+}
+
 // ─── Task Metrics ───
 
 pub async fn task_metrics_handler(
@@ -809,6 +863,108 @@ mod tests {
         );
         assert!(
             !handler.contains("to_rfc3339") && !handler.contains("TokenUsageResponse {"),
+            "the handler builds the response itself; the range it echoes would be its own request \
+             window, which is not the range the rollup answered for"
+        );
+    }
+
+    fn spend_row(
+        actor: &str,
+        window_start: chrono::DateTime<chrono::Utc>,
+        input: i64,
+    ) -> cog_core::WindowSpend {
+        cog_core::WindowSpend {
+            window_start,
+            window_end: window_start + chrono::Duration::hours(1),
+            actor: actor.into(),
+            origin: "resident_worker".into(),
+            upstream: "pool".into(),
+            api_style: "openai".into(),
+            calls: 1,
+            failed_calls: 0,
+            tokens_input: input,
+            tokens_output: 0,
+            tokens_cached: 0,
+        }
+    }
+
+    /// The series' endpoints come from the read, exactly as the summed read's
+    /// do — the two faces answer different questions but cover the same range.
+    #[test]
+    fn the_series_endpoints_are_the_range_the_read_covered() {
+        let covered_since = chrono::Utc::now() - chrono::Duration::hours(5);
+        let covered_until = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let response = token_series_response(cog_core::UsageSeries {
+            covered_since: Some(covered_since),
+            covered_until: Some(covered_until),
+            rows: vec![],
+        });
+        assert_eq!(
+            response.covered_since.as_deref(),
+            Some(covered_since.to_rfc3339().as_str())
+        );
+        assert_eq!(
+            response.covered_until.as_deref(),
+            Some(covered_until.to_rfc3339().as_str())
+        );
+    }
+
+    /// Two actors in the same window stay two rows.
+    ///
+    /// The defect this rules out is silent: summing here would answer the
+    /// question the *other* endpoint exists for, and the face drawing a time
+    /// axis would lose every intermediate point while still looking plausible —
+    /// one row per window, all correct totals.
+    #[test]
+    fn a_series_keeps_one_row_per_actor_within_a_window() {
+        let window = chrono::Utc::now() - chrono::Duration::hours(2);
+        let response = token_series_response(cog_core::UsageSeries {
+            covered_since: Some(window),
+            covered_until: Some(window + chrono::Duration::hours(1)),
+            rows: vec![
+                spend_row("self_review", window, 10),
+                spend_row("agent:dev", window, 90),
+            ],
+        });
+        assert_eq!(
+            response.rows.len(),
+            2,
+            "rows from one window must not be merged into a single line"
+        );
+        assert_eq!(
+            response.rows.iter().map(|r| r.tokens_input).sum::<i64>(),
+            100,
+            "the projection passes the counts through unchanged"
+        );
+        assert!(
+            response.rows.iter().all(|r| r.window_start == window),
+            "each row keeps the window it was folded in"
+        );
+    }
+
+    /// The series handler, like the summed one, cannot echo its own request
+    /// window: it hands the read to the single place that builds the response.
+    #[test]
+    fn the_series_handler_answers_from_the_read_not_from_its_own_window() {
+        let src = include_str!("observability.rs");
+        let production = match src.rfind("\n#[cfg(test)]") {
+            Some(at) => &src[..at],
+            None => src,
+        };
+        let handler_start = production
+            .find("pub async fn token_series_handler")
+            .expect("the series handler is in this file");
+        let handler = &production[handler_start..];
+        let handler = match handler.find("\n}\n") {
+            Some(end) => &handler[..end],
+            None => handler,
+        };
+        assert!(
+            handler.contains("token_series_response(series)"),
+            "the handler must project the read through the one place that builds the response"
+        );
+        assert!(
+            !handler.contains("to_rfc3339") && !handler.contains("TokenSeriesResponse {"),
             "the handler builds the response itself; the range it echoes would be its own request \
              window, which is not the range the rollup answered for"
         );

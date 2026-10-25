@@ -40,22 +40,30 @@ export default function App() {
 }
 EOF
   cat >"${work}/web/src/overlay/TokenPanel.tsx" <<'EOF'
-import { useUsage } from '@/hooks/useUsage';
+import { useUsage, useSeries } from '@/hooks/useUsage';
 export function TokenPanel() {
   const { usage } = useUsage();
-  return <div>{usage?.covered_since}</div>;
+  const series = useSeries();
+  return <div>{usage?.covered_since}{series?.covered_until}</div>;
 }
 EOF
   cat >"${work}/web/src/hooks/useUsage.ts" <<'EOF'
-import { getTokenUsage } from '@/api/client';
+import { getTokenUsage, getTokenUsageSeries } from '@/api/client';
 export function useUsage() {
   return getTokenUsage(24);
+}
+export function useSeries() {
+  return getTokenUsageSeries(24);
 }
 EOF
   cat >"${work}/web/src/api/client.ts" <<'EOF'
 export const PATH = '/api/v1/observability/token-usage';
+export const SERIES = '/api/v1/observability/token-usage/series';
 export async function getTokenUsage(hours: number) {
   return fetch(`${PATH}?hours=${hours}`);
+}
+export async function getTokenUsageSeries(hours: number) {
+  return fetch(`${SERIES}?hours=${hours}`);
 }
 EOF
 }
@@ -115,9 +123,9 @@ EOF
 confirm "${work}/web/src/App.tsx" "return <div />"
 expect_red "只 import 不渲染" "没有一格渲染出来的组件用到它"
 
-# 4. 剪掉覆盖端点（取数与显示两处都没有）。
+# 4. 剪掉覆盖端点（两条读面那两格都拿掉：任何一处读到它都会让这一门绿）。
 fixture
-sed -i 's/{usage?.covered_since}/花销/' "${work}/web/src/overlay/TokenPanel.tsx"
+sed -i 's/{usage?.covered_since}{series?.covered_until}/花销/' "${work}/web/src/overlay/TokenPanel.tsx"
 confirm "${work}/web/src/overlay/TokenPanel.tsx" "花销"
 expect_red "没读覆盖端点" "没有读覆盖端点"
 
@@ -143,6 +151,21 @@ fixture
 printf 'export const nothing = 1;\n' >"${work}/web/src/main.tsx"
 confirm "${work}/web/src/main.tsx" 'export const nothing'
 expect_red "入口不接任何东西" "没有活的外部消费者"
+
+# 7. 第二条读面（按窗口分行）被剪掉，第一条还在：整块时间轴可以不留痕迹地消失，
+#    而第一条读面一律绿。这一条判的是「两条各判一遍」这件事本身。
+fixture
+cat >"${work}/web/src/hooks/useUsage.ts" <<'EOF'
+import { getTokenUsage } from '@/api/client';
+export function useUsage() {
+  return getTokenUsage(24);
+}
+export function useSeries() {
+  return null;
+}
+EOF
+confirm "${work}/web/src/hooks/useUsage.ts" "return null"
+expect_red "只剩第一条读面" "getTokenUsageSeries"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
