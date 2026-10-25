@@ -27,6 +27,7 @@
 //! about a hundred lines of that semantics apply here.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,6 +78,36 @@ const MAX_TASK_ID_LEN: usize = 128;
 /// A percentage rather than a byte figure, so it follows whatever volume the
 /// executor is given instead of assuming one.
 const WORKSPACE_DISK_HEADROOM_PERCENT: u64 = 15;
+
+/// The shortest wait between two upstream fetches. Below this the loop would be
+/// asking the mirror for the same commit faster than a push can arrive, and the
+/// cost of the git round trip stops being paid for by anything. A floor rather
+/// than a period: the period itself follows how often `main` is observed to
+/// move.
+const MIN_FETCH_INTERVAL_SECS: u64 = 30;
+
+/// The published name of the wait the fetch loop is currently keeping, and the
+/// label saying whether that number came from a measurement or from the
+/// configuration. Without it the configured number is the only one anyone can
+/// see, and the loop silently stopping to use it would be invisible.
+const FETCH_INTERVAL_METRIC: &str = "sandbox_repo_fetch_interval_seconds";
+const FETCH_INTERVAL_SOURCE_LABEL: &str = "source";
+
+/// How long the fetch loop should wait, given how long `main` was still before
+/// it last moved.
+///
+/// Half the observed stillness, so the worktrees are at most half a push
+/// behind: an upstream that moves every ten minutes is polled every five, and
+/// one that moves hourly is polled every half hour instead of every five
+/// minutes for nothing. `observed` is zero until a move has been seen -- then
+/// there is nothing to follow and the configured period stands, which is the
+/// only role that number keeps.
+fn fetch_interval_from(observed_stillness_secs: u64, configured: Duration) -> Duration {
+    if observed_stillness_secs == 0 {
+        return configured;
+    }
+    Duration::from_secs((observed_stillness_secs / 2).max(MIN_FETCH_INTERVAL_SECS))
+}
 
 /// What the filesystem under the workspaces root reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +305,11 @@ pub struct WorkdirMetrics {
     /// second name for it would leave the rule that compares it against the
     /// declared size reading only the half that happens to be spelled its way.
     data_volume_used: GaugeVec,
+    /// The fetch wait in force, labelled by where it came from. A derived
+    /// number that is not published is indistinguishable from a configured
+    /// one, and the loop quietly going back to the configured value would
+    /// read as if nothing had changed.
+    fetch_interval: GaugeVec,
 }
 
 impl WorkdirMetrics {
@@ -334,6 +370,14 @@ impl WorkdirMetrics {
         registry.register(Box::new(disk_total_bytes.clone()))?;
         registry.register(Box::new(disk_avail_bytes.clone()))?;
         registry.register(Box::new(data_volume_used.clone()))?;
+        let fetch_interval = GaugeVec::new(
+            Opts::new(
+                FETCH_INTERVAL_METRIC,
+                "Seconds the background fetch loop is currently waiting between upstream fetches",
+            ),
+            &[FETCH_INTERVAL_SOURCE_LABEL],
+        )?;
+        registry.register(Box::new(fetch_interval.clone()))?;
         Ok(Self {
             registry,
             workspaces,
@@ -345,6 +389,7 @@ impl WorkdirMetrics {
             disk_total_bytes,
             disk_avail_bytes,
             data_volume_used,
+            fetch_interval,
         })
     }
 
@@ -451,6 +496,14 @@ pub struct WorkdirRouter {
     /// guard. Held across a command's whole life on purpose -- a client that
     /// disconnects mid-command leaves it running.
     command_lock: Arc<RwLock<()>>,
+    /// The upstream head this process last saw, and when it moved before that.
+    /// The fetch period is a reading of how often the repository actually
+    /// changes: polling a mirror every fixed number of seconds either watches
+    /// a head that has not moved or trails one that moved several times.
+    last_head: std::sync::Mutex<Option<String>>,
+    last_move_unix: AtomicI64,
+    stillness_secs: AtomicU64,
+    last_fetch_unix: AtomicI64,
 }
 
 impl WorkdirRouter {
@@ -488,6 +541,10 @@ impl WorkdirRouter {
             footprints,
             build_cache,
             command_lock: Arc::new(RwLock::new(())),
+            last_head: std::sync::Mutex::new(None),
+            last_move_unix: AtomicI64::new(0),
+            stillness_secs: AtomicU64::new(0),
+            last_fetch_unix: AtomicI64::new(0),
         }))
     }
 
@@ -845,7 +902,59 @@ impl WorkdirRouter {
     /// against the single configured host failed outright — so stopping at the
     /// first failure left the worktrees on a stale baseline with nothing but a
     /// warning to show for it.
+    /// Whether enough time has passed since the last fetch for another one to
+    /// be worth its round trip.
+    fn fetch_due(&self) -> bool {
+        let stillness = self.stillness_secs.load(Ordering::Relaxed);
+        let wait = fetch_interval_from(stillness, self.cfg.fetch_interval);
+        let source = if stillness == 0 {
+            "configured"
+        } else {
+            "measured"
+        };
+        self.metrics
+            .fetch_interval
+            .with_label_values(&[source])
+            .set(wait.as_secs() as f64);
+        let last = self.last_fetch_unix.load(Ordering::Relaxed);
+        if last == 0 {
+            return true;
+        }
+        unix_now() - last >= wait.as_secs() as i64
+    }
+
+    /// Take this fetch's view of `main` and, when it differs from the previous
+    /// one, record how long the head had been still before it moved. That
+    /// stillness is the only measurement anyone here has of how often the
+    /// repository changes, and it is what the fetch period follows.
+    async fn note_head_move(&self) {
+        let head = match self.git_bare(&["rev-parse", "main"]).await {
+            Ok(out) => out.trim().to_string(),
+            Err(_) => return,
+        };
+        let now = unix_now();
+        let mut last = match self.last_head.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match last.as_deref() {
+            Some(previous) if previous != head => {
+                let still_since = self.last_move_unix.swap(now, Ordering::Relaxed);
+                if still_since > 0 {
+                    self.stillness_secs
+                        .store((now - still_since).max(1) as u64, Ordering::Relaxed);
+                }
+            }
+            Some(_) => {}
+            None => {
+                self.last_move_unix.store(now, Ordering::Relaxed);
+            }
+        }
+        *last = Some(head);
+    }
+
     pub async fn fetch_once(&self) {
+        self.last_fetch_unix.store(unix_now(), Ordering::Relaxed);
         if self
             .git_bare(&["remote", "get-url", "upstream"])
             .await
@@ -906,6 +1015,7 @@ impl WorkdirRouter {
             {
                 Ok(_) => {
                     info!(mirror = %mirror, "sandbox bare repo fetched from upstream");
+                    self.note_head_move().await;
                     return;
                 }
                 Err(e) => {
@@ -1015,28 +1125,37 @@ impl WorkdirRouter {
             ));
         }
         let fetch = Arc::clone(self);
-        let fetch_interval = fetch.cfg.fetch_interval;
+        // The loop wakes on a floor, and each waking decides whether a fetch is
+        // due. The declared cadence is that floor, which the loop really does
+        // keep; the interval between fetches is a separate, measured number, so
+        // a repository that moves hourly is not polled every five minutes and
+        // one that moves every minute is not left an hour behind.
+        let floor = Duration::from_secs(MIN_FETCH_INTERVAL_SECS);
         drop(cog_core::loop_health::spawn_unstoppable(
             WORKTREE_FETCH_LOOP,
-            cog_core::loop_health::Cadence::Periodic(fetch_interval),
+            cog_core::loop_health::Cadence::Periodic(floor),
             // Rebuilt per attempt, so everything the body consumes is cloned here.
             move |beat| {
                 let fetch = Arc::clone(&fetch);
                 async move {
-                    let mut ticker = tokio::time::interval(fetch_interval);
-                    // The first tick of a fresh interval completes at once, and it
-                    // is consumed here rather than in the loop: the refresh is the
-                    // one that is supposed to happen immediately.
+                    // Refresh immediately rather than on the startup critical
+                    // path: a hung offline fetch must never delay the HTTP
+                    // listener past the liveness grace window (which would
+                    // crash-loop the pod). Failure only records a metric and
+                    // retries when the next fetch is due.
+                    beat.beat();
+                    fetch.fetch_once().await;
+                    let mut ticker = tokio::time::interval(floor);
                     ticker.tick().await;
                     loop {
-                        // Refresh immediately rather than on the startup critical
-                        // path: a hung offline fetch must never delay the HTTP
-                        // listener past the liveness grace window (which would
-                        // crash-loop the pod). Failure only records a metric and
-                        // retries next tick.
-                        beat.beat();
-                        fetch.fetch_once().await;
                         ticker.tick().await;
+                        // A beat per waking, not per fetch: this loop's health
+                        // is about whether it is running, and it is running
+                        // whether or not upstream had anything for it.
+                        beat.beat();
+                        if fetch.fetch_due() {
+                            fetch.fetch_once().await;
+                        }
                     }
                 }
             },
@@ -2213,6 +2332,24 @@ pub(crate) mod tests {
         // Nothing measured yet: no per-tree figure, so no invented cap.
         assert_eq!(workspace_cap(disk_with(4096), 0, 0), None);
         assert_eq!(workspace_cap(disk_with(4096), 0, 4), None);
+    }
+
+    /// Polling is paid for by how often the thing being polled changes.
+    #[test]
+    fn the_fetch_period_follows_how_long_main_was_still() {
+        let configured = Duration::from_secs(300);
+        // Nothing observed yet: the configured period is all there is.
+        assert_eq!(fetch_interval_from(0, configured), configured);
+        // A head that moves every 30 minutes is polled every 15, not every 5.
+        assert_eq!(
+            fetch_interval_from(1800, configured),
+            Duration::from_secs(900)
+        );
+        // A busy repository is polled no faster than a push can arrive.
+        assert_eq!(
+            fetch_interval_from(10, configured),
+            Duration::from_secs(MIN_FETCH_INTERVAL_SECS)
+        );
     }
 
     #[test]

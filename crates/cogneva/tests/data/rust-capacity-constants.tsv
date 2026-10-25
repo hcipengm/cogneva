@@ -75,6 +75,7 @@ crates/cog-extension/src/workdir.rs	DEFAULT_MAX_WORKSPACES	8	unreviewed
 crates/cog-extension/src/workdir.rs	DEFAULT_TTL_SECS	21600	unreviewed	
 crates/cog-extension/src/workdir.rs	GIT_TIMEOUT_SECS	120	unreviewed	
 crates/cog-extension/src/workdir.rs	MAX_TASK_ID_LEN	128	unreviewed	
+crates/cog-extension/src/workdir.rs	MIN_FETCH_INTERVAL_SECS	30	unreviewed	
 crates/cog-extension/src/workdir.rs	WORKSPACE_DISK_HEADROOM_PERCENT	15	unreviewed	
 crates/cog-gateway/src/a2a.rs	LIST_PAGE_DEFAULT	50	unreviewed	
 crates/cog-gateway/src/a2a.rs	LIST_PAGE_MAX	100	unreviewed	
@@ -110,6 +111,7 @@ crates/cog-gateway/src/knowledge.rs	MAX_TOP_K	100	unreviewed
 crates/cog-gateway/src/memory.rs	DEFAULT_RAW_LIST_LIMIT	100	unreviewed	
 crates/cog-gateway/src/memory.rs	EXPIRY_SECS	300	unreviewed	
 crates/cog-gateway/src/observability.rs	FIRING_PROBE_LIMIT	1	unreviewed	
+crates/cog-gateway/src/readings.rs	QUERY_TIMEOUT_SECS	5	unreviewed	
 crates/cog-gateway/src/scm.rs	LOG_MAX	200	unreviewed	
 crates/cog-gateway/src/scm.rs	MAX_CHANGES	500	unreviewed	
 crates/cog-gateway/src/scm.rs	MAX_DIFF_LINES	20_000	unreviewed	
