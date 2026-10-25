@@ -1511,6 +1511,21 @@ fn normalize_deployed(deployed: &DeployedState, has_in_flight: bool) -> Deployed
     }
 }
 
+/// 在飞的记录是不是一次**已经交给集群**的滚动。
+///
+/// 只有 [`Phase::Dispatched`] 那一档在集群上动过镜像；更早的三档（源码就绪、镜像
+/// 建好、已推送）全是本地动作，集群此刻的形态与它们无关。归一化要问的是"混合态会
+/// 不会是上一个滚动的中途形态"，那就只有 Dispatched 算数。
+///
+/// 按 `in_flight.is_some()` 判的代价是**永久停摆**：一次在构建中途重启的进程会在
+/// 记录里留下某一版 @SourceReady，而那一版早被上游超车；混合态于是永远归不了
+/// Legacy，`Mixed` 又不许推进，每一拍只剩一行 INFO——2026-10-25 实测部署器这样停了
+/// 一小时以上，落地的最后两版停在两个不同的 rev 上，而 `mainline_not_progressing`
+/// 是唯一读得出这件事的地方。
+fn rollout_is_dispatched(in_flight: Option<&InFlight>) -> bool {
+    matches!(in_flight, Some(f) if f.phase == Phase::Dispatched)
+}
+
 /// 已经付过构建钱之后，还要不要把这一版丢掉。
 ///
 /// 两个祖先判定分开传进来，是为了让调用方短路那两次 git 读；这里只命名规则：
@@ -5541,7 +5556,8 @@ impl MainlineDeployer {
             // 再派 Job 把四部署 pin 回 `main-<rev>`。
         }
 
-        let normalized = normalize_deployed(&deployed, state.in_flight.is_some());
+        let normalized =
+            normalize_deployed(&deployed, rollout_is_dispatched(state.in_flight.as_ref()));
         if normalized != deployed {
             warn!(
                 images = ?images,
@@ -13363,6 +13379,63 @@ exit 0
         assert!(
             buildah_calls.contains("from --tls-verify=false reg.local:5000/cogneva:local"),
             "{buildah_calls}"
+        );
+    }
+
+    /// 构建中途重启留下的在飞记录，不许把混合态永久钉住。
+    ///
+    /// 记录里写着某一版源码就绪，而那一版早被上游超车、Job 从未派出；集群上停着的
+    /// 是两个不同的主线 rev（上一轮滚动只落了一半）。按"有在飞记录"判，混合态归不
+    /// 了 Legacy，而 `Mixed` 又不许推进——每一拍只有一行 INFO，落地的活体停在原地。
+    /// 只有已派出那一档在集群上动过镜像，更早的档不许替集群此刻的形态说话。
+    #[tokio::test]
+    async fn poll_once_does_not_let_an_abandoned_build_hold_the_mixed_state() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, rev12(&rev_b));
+        // 上一轮滚动只落了一半：两个部署停在旧主线 rev 上，另外两个在新 rev 上。
+        let kubectl = fake_kubectl_per_deployment(
+            &bin_dir,
+            &main_image("localhost:30500", &rev_a),
+            &main_image("localhost:30500", &rev_b),
+        );
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer = MainlineDeployer::new(cfg, ws);
+        let state_path = seed_state(
+            root,
+            MainlineState {
+                in_flight: Some(InFlight {
+                    rev: rev_a.clone(),
+                    phase: Phase::SourceReady,
+                }),
+                ..Default::default()
+            },
+        );
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        deployer.poll_once().await.unwrap();
+        std::env::set_var("PATH", old_path);
+
+        let kubectl_calls = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        assert!(
+            kubectl_calls.contains(&job_name(&rev_b)),
+            "a record from a build that never reached the cluster must not hold the \
+             mixed state: {kubectl_calls}"
+        );
+        let state = read_state(&state_path);
+        assert_eq!(
+            state.in_flight.as_ref().map(|f| f.rev.clone()),
+            Some(rev_b.clone()),
+            "the abandoned record is replaced by the revision this round aims at"
         );
     }
 
