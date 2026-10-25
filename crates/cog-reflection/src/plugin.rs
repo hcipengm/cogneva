@@ -1807,7 +1807,17 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             None => info!("no reflection engine published; skill effectiveness actions disabled"),
         }
 
+        // 这道门跳过的比它自己的名字多：可观测性栈的收敛也挂在下半段，而它自己那份
+        // 配置默认是 enabled——那份配置在门后面才被读，所以只读代码的人看到的是
+        // 「开着」。短路处不说话时，「循环没起」与「循环起了但找不到活」在日志里
+        // 逐字同形（两边都不写一行），只能到集群里逐个点对象才分得开。说一句，
+        // 不改变行为。
         if !self.porter_armed {
+            warn!(
+                "executor not armed: skipping the mainline deployer and the observability \
+                 stack convergence loop too (their own config is read below the gate and \
+                 would read as enabled); nothing will be delivered while this lasts"
+            );
             return Ok(());
         }
         let Ok(project_root) = std::env::current_dir() else {

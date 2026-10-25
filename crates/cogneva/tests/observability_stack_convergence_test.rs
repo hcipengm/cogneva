@@ -231,6 +231,36 @@ fn the_convergence_loop_is_wired_and_persists_its_verdict() {
     );
 }
 
+/// 短路门得说出它把谁一起没起。
+///
+/// 收敛循环挂在 `porter_armed` 这道门的下半段，而它自己那份 `enabled: true`
+/// 默认值在门**之后**才被读——读代码的人因此看到的是「开着」。门短路时若不
+/// 说话，「循环没起」与「循环起了但找不到活」在读数上逐字同形：两边都不写
+/// 任何一行，只能到集群里逐个点对象才分得开。这一格钉的是「短路时说一句话，
+/// 且那句话点名被一起跳过的收敛面」；不要求把门挪走，只要求这两种状态在日志
+/// 里分得开。
+#[test]
+fn the_short_circuit_names_the_convergence_it_also_skips() {
+    let plugin = read(PLUGIN_RS);
+    let start = plugin
+        .find("if !self.porter_armed")
+        .expect("plugin.rs 里没有 porter_armed 那道短路门");
+    let end = plugin[start..]
+        .find("let Ok(project_root)")
+        .map(|i| start + i)
+        .expect("短路门后面找不到界定它范围的下一句");
+    let block = &plugin[start..end];
+    assert!(
+        block.contains("warn!"),
+        "短路时什么也不印：循环没起与循环起了找不到活因此同形"
+    );
+    assert!(
+        block.contains("convergence"),
+        "短路时印的那句没有点名收敛面——被跳过的是主线部署器与可观测性栈收敛两件事，\n\
+         只提部署器的话，读日志的人仍然不知道清单为什么一个都没交付"
+    );
+}
+
 /// 授权面必须恰好等于交付面。
 ///
 /// 交付面按与循环同一个归置函数算：清单声明的 kind 里，`classify_doc` 判为交付
