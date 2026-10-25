@@ -58,6 +58,35 @@ pub fn spawn_timeout_checker(
     )
 }
 
+/// 等一条监管者事件；这个部署没有监管者时永远等下去。
+///
+/// `select!` 的两支必须是同一类 future，而没有监管者的部署不该因此退出循环——
+/// 交接与死信仍然要记。用一个永不就绪的分支表达「这条流不存在」，比在循环里
+/// 复制一份没有监管者的版本干净。
+async fn recv_supervisor(
+    rx: &mut Option<tokio::sync::broadcast::Receiver<cog_core::SupervisorEvent>>,
+) -> Result<cog_core::SupervisorEvent, tokio::sync::broadcast::error::RecvError> {
+    match rx.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// 一次重启打断了哪些执行：这个执行者手上**仍在跑**的任务。
+///
+/// 只算 `Running`。待执行、已排期的任务没被这次重启打断，给它们记一条「重启」
+/// 会把「这个任务被重来过」说成一件没发生的事；也正因为只算 Running，一个空转
+/// 的执行者被重启不会产生边——界面上「重启」为 0 说的是「没有在跑的任务被重启
+/// 打断」，不是「没有重启过执行者」。
+pub fn tasks_interrupted_by_restart(tasks: &[cog_core::Task], agent_id: &str) -> Vec<String> {
+    tasks
+        .iter()
+        .filter(|task| task.status == cog_core::TaskStatus::Running)
+        .filter(|task| task.agent_id.as_deref() == Some(agent_id))
+        .map(|task| task.id.clone())
+        .collect()
+}
+
 /// Spawns the collaboration graph listener background task.
 pub fn spawn_collaboration_listener(
     state: Arc<crate::GatewayState>,
@@ -76,6 +105,15 @@ pub fn spawn_collaboration_listener(
         // link whose TaskCompleted/TaskFailed arrived while the loop was dead
         // would never be added. This lock has one holder.
         let task_event_rx = Arc::new(tokio::sync::Mutex::new(state.subscribe_task_events()));
+        // 第二条事件流：执行者被重启。协作图的第四类边（重启）此前没有任何写入者，
+        // 计数恒为 0 而界面上分不清「没发生过」与「没人写」。与任务事件同样只订一次：
+        // 重订会落在通道当前尾巴上，重启期间发生的重启就丢了。
+        let supervisor_rx = Arc::new(tokio::sync::Mutex::new(
+            state
+                .supervisor
+                .as_ref()
+                .map(|supervisor| supervisor.subscribe()),
+        ));
         // Seeded after the graph check, so a deployment without this loop seeds
         // nothing, and before the first event, so the series is present at 0
         // from the first scrape: the rule pairing this counter with the
@@ -113,11 +151,13 @@ pub fn spawn_collaboration_listener(
                 let graph = graph.clone();
                 let state = Arc::clone(&state);
                 let task_event_rx = Arc::clone(&task_event_rx);
+                let supervisor_rx = Arc::clone(&supervisor_rx);
                 let shutdown = shutdown.clone();
                 async move {
                     loop {
                         beat.beat();
                         let mut task_event_rx = task_event_rx.lock().await;
+                        let mut supervisor_rx = supervisor_rx.lock().await;
                         tokio::select! {
                             biased;
                             _ = shutdown.wait() => return,
@@ -197,6 +237,40 @@ pub fn spawn_collaboration_listener(
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                     warn!("task event channel closed; collaboration listener exiting");
                                     return;
+                                }
+                            },
+                            event = recv_supervisor(&mut supervisor_rx) => match event {
+                                Ok(cog_core::SupervisorEvent::AgentRestarted { agent_id, timestamp, .. }) => {
+                                    // 执行者被重启时手上还在跑的任务，它的执行被打断了，
+                                    // 重启后接着做——这正是「重启」这条边要说的事。
+                                    let interrupted: Vec<String> = {
+                                        let (tasks, _edges) = state.orchestrator.get_graph().await;
+                                        tasks_interrupted_by_restart(&tasks, &agent_id)
+                                    };
+                                    for task_id in interrupted {
+                                        graph.add_link(crate::collaboration::CollaborationLink {
+                                            source_task_id: task_id.clone(),
+                                            target_task_id: task_id,
+                                            link_type: crate::collaboration::CollaborationLinkType::Respawn,
+                                            // 四类边里唯一带执行者的一类：重启的是谁，
+                                            // 加边的那一刻就知道。
+                                            agent_id: Some(agent_id.clone()),
+                                            timestamp,
+                                        }).await;
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                    // 不并进任务事件那个 lag 计数：两条通道的落后不是同
+                                    // 一件事，合成一个数会让「任务事件被丢」与「重启事件被
+                                    // 丢」看起来一样。这些边由「此刻手上有什么」推出来，
+                                    // 丢掉的几环不会留下错边。
+                                    warn!(skipped, "collaboration listener fell behind on supervisor events");
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    // 监管者没了，重启边从此不会再有。任务事件那条通道还
+                                    // 活着的话，交接与死信照旧要记——所以这里不退出。
+                                    warn!("supervisor event channel closed; respawn links stop here");
                                 }
                             },
                         }
@@ -291,5 +365,43 @@ impl cog_core::TaskExecutionCallback for GatewayTaskRunner {
                 cog_core::HookEvent::new(cog_core::HookTrigger::OnAgentEnd).with_task_id(&task_id),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod restart_interrupts_tests {
+    use super::tasks_interrupted_by_restart;
+    use cog_core::{Task, TaskStatus, TaskType};
+
+    fn task(id: &str, status: TaskStatus, agent: Option<&str>) -> Task {
+        let mut task = Task::new(id, TaskType::Custom("probe".into()), serde_json::json!({}));
+        task.status = status;
+        task.agent_id = agent.map(str::to_string);
+        task
+    }
+
+    #[test]
+    fn a_restart_interrupts_only_the_running_tasks_of_that_agent() {
+        let tasks = vec![
+            task("running-held", TaskStatus::Running, Some("a1")),
+            task("queued-held", TaskStatus::Pending, Some("a1")),
+            task("running-other", TaskStatus::Running, Some("a2")),
+            task("running-unclaimed", TaskStatus::Running, None),
+            task("done-held", TaskStatus::Completed, Some("a1")),
+        ];
+        assert_eq!(
+            tasks_interrupted_by_restart(&tasks, "a1"),
+            vec!["running-held".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_idle_agent_restart_interrupts_nothing() {
+        // 空转的执行者被重启不产生边：它的任务要么没开始，要么已经收口。
+        let tasks = vec![
+            task("done", TaskStatus::Completed, Some("idle")),
+            task("queued", TaskStatus::Scheduled, Some("idle")),
+        ];
+        assert!(tasks_interrupted_by_restart(&tasks, "idle").is_empty());
     }
 }

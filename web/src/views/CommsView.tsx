@@ -187,8 +187,8 @@ export function CommsView() {
           <Reading
             label="重启"
             value={stats.respawns}
-            note="没有任何一处在写这个计数"
-            caveat="这个计数没有任何写入者，读到的 0 说的是「没人写」，不是「没有重启过」。"
+            note="执行者被重启时手上有任务"
+            caveat="只数「手上仍有在跑的任务的执行者被重启」：空转的执行者被重启不产生边，所以 0 说的是「没有在跑的任务被打断」，不是「没有重启过执行者」。"
           />
         </div>
         </Readings>
@@ -197,12 +197,14 @@ export function CommsView() {
         <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">边的来路</h2>
         <p className="px-4 pb-3 text-[11px] text-[var(--muted)]">
           一次任务完成，会给它的每个下游各加一条交接边；一次任务失败，会给它自己加一条
-          重试边或死信边。除此之外没有别的写入者——所以「重启」那一格永远是 0，那是没人在
-          写，不是没有重启。
+          重试边或死信边；一个执行者被重启且手上还有在跑的任务，会给那个任务加一条指向自己的
+          重启边——被打断的是这个任务的执行，重启后接着做，所以两端是同一行。空转的执行者
+          被重启不产生边。
         </p>
         <p className="px-4 pb-3 text-[11px] text-[var(--muted)]">
           这张图存在网关进程的内存里：重启之后从空开始。空图不读作「没有过交接」，读作
           「这个进程还没见过一次完成或失败」。要跨重启看交接，得看任务自己的结局与任务图。
+          「智能体」那一列只有重启边有值：前三类边在加边时手上没有执行者。
         </p>
       </section>
       {graph.error ? (
@@ -249,8 +251,9 @@ export function CommsView() {
       )}
       {picked && <TaskLinks taskId={picked} onClose={() => setPicked(null)} />}
       <p className="px-4 py-3 text-[11px] text-[var(--muted)]">
-        智能体那一列永远是空的：网关加边的时候没有把「谁干的」带上，这一格现在没有来路。
-        要知道某个任务归谁，去任务面按任务 id 看它自己的行。
+        智能体那一列只有重启边有值——加边的时候只有「谁被重启」是手上就有的；交接、重试、
+        死信三类边加边时没有执行者可带，那几行的这一格是空的，不是「没人干」。要知道某个
+        任务归谁，去任务面按任务 id 看它自己的行。
       </p>
       {stats && stats.total_links > 0 && (
         <p className="px-4 pb-3 text-[11px] text-[var(--muted)]">

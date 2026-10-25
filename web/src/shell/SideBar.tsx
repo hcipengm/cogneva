@@ -396,10 +396,11 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             <Row label="交接" note="跑完了，下游被放出来" tone="var(--paper-dim)" />
             <Row label="重试" note="失败，还会再跑一次" tone="var(--warn)" />
             <Row label="死信" note="失败，不再重试" tone="var(--danger)" />
-            <Row label="重启" note="这一格没有写入者" />
+            <Row label="重启" note="执行者被重启时手上有任务" />
             <Note>
               图在网关进程的内存里，重启即空。空图是「这个进程还没见过一次完成」，
-              不是「没有过交接」。
+              不是「没有过交接」。空转的执行者被重启不产生边，所以「重启」为 0 不是
+              「没重启过」。
             </Note>
           </Section>
           <CrossLinks
