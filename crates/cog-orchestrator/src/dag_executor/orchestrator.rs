@@ -1832,7 +1832,7 @@ impl DagExecutor {
         let mut ready: Vec<Task> = tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Pending)
-            .filter(|t| t.is_executable)
+            .filter(|t| crate::ready_queue::is_dispatchable_work(t))
             // 退避未到期的重试不是"就绪"，重投它等于取消退避。周期性发布者每次
             // 都会扫到这里，所以这个过滤同时也是退避到点后的重新投递者。
             .filter(|t| t.retry_not_before.is_none_or(|due| due <= now))
@@ -4860,6 +4860,47 @@ mod tests {
         assert_eq!(
             dag.get_task(&task_id).await.unwrap().status,
             TaskStatus::Failed
+        );
+    }
+
+    /// 面行的常驻职责不被派发器接手，同一份图里的普通工作照常就绪。
+    ///
+    /// 这一行是可执行的（漂移读数只把可执行行算作「owner 有开口的工作」），
+    /// 所以只按 `is_executable` 过滤会让派发器把它当活接走：跑满整轮预算、
+    /// 一事无成、按退化循环判死，面的唯一在场证据随之消失，而没有任何路径
+    /// 重建这一行。
+    #[tokio::test]
+    async fn a_faces_standing_duty_is_never_dispatched() {
+        let dag = DagExecutor::new("ws-face-duty".into());
+        let duty = Task::new(
+            "face-work-x",
+            TaskType::Custom(crate::governance_acts::FACE_DUTY_TASK_TYPE.into()),
+            serde_json::json!({}),
+        );
+        let duty_id = duty.id.clone();
+        dag.add_task(duty).await.unwrap();
+        assert!(
+            duty_id.starts_with("face-work-"),
+            "the fixture is shaped like the row the duty constructor writes"
+        );
+
+        let work = Task::new("work-x", TaskType::DagNode, serde_json::json!({}));
+        let work_id = work.id.clone();
+        dag.add_task(work).await.unwrap();
+
+        let ready: Vec<String> = dag
+            .find_ready_tasks()
+            .await
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(
+            !ready.contains(&duty_id),
+            "the dispatcher took a standing duty as work: {ready:?}"
+        );
+        assert!(
+            ready.contains(&work_id),
+            "ordinary work must stay ready or the exclusion is too wide: {ready:?}"
         );
     }
 

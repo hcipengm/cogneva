@@ -47,6 +47,26 @@ pub fn carries_an_owner(task: &Task) -> bool {
     task.owner_unit.is_some()
 }
 
+/// Whether a task is work the dispatcher may start as a run.
+///
+/// Everything executable is, with one exception: a face's standing duty row.
+/// That row carries the pair (face, who is answerable for it) and is what the
+/// drift reading counts as the owner being on the face; it has no body to run.
+/// Started as a run it burns its whole budget, is failed on the degenerate-loop
+/// rule, and takes the face's only evidence of staffing with it -- the face
+/// then reads idle and nothing recreates the row. It stays executable so the
+/// owner's own session can still take it from its queue; only the dispatcher
+/// is told to leave it alone.
+pub fn is_dispatchable_work(task: &Task) -> bool {
+    task.is_executable && !is_face_duty(task)
+}
+
+/// Whether a row is a face's standing duty marker.
+pub fn is_face_duty(task: &Task) -> bool {
+    matches!(&task.task_type, cog_core::TaskType::Custom(kind)
+        if kind == crate::governance_acts::FACE_DUTY_TASK_TYPE)
+}
+
 /// The queue a ready task is published to. One definition, because the
 /// publisher and the consumer must answer the same question the same way.
 pub fn ready_stream_for(task: &Task, workspace_id: &str) -> String {
@@ -330,6 +350,30 @@ mod tests {
 
     fn task(id: &str, ty: TaskType, input: serde_json::Value) -> Task {
         Task::new(id, ty, input)
+    }
+
+    /// The duty exclusion has to be about the type and nothing else: the row
+    /// is executable by design (the drift reading counts only executable rows),
+    /// so a predicate that stopped at `is_executable` would let the dispatcher
+    /// start it again.
+    #[test]
+    fn a_face_duty_is_never_dispatchable_but_ordinary_work_is() {
+        let duty = task(
+            "face-work-x",
+            TaskType::Custom(crate::governance_acts::FACE_DUTY_TASK_TYPE.into()),
+            serde_json::json!({}),
+        );
+        assert!(
+            duty.is_executable,
+            "the reading counts only executable work"
+        );
+        assert!(!is_dispatchable_work(&duty));
+
+        let work = task("work-x", TaskType::DagNode, serde_json::json!({}));
+        assert!(
+            is_dispatchable_work(&work),
+            "the exclusion must not swallow ordinary work"
+        );
     }
 
     #[test]

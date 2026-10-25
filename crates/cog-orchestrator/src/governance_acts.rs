@@ -56,18 +56,24 @@ pub fn face_work_id(face_id: &str) -> String {
     format!("face-work-{}", task_id_segment(face_id))
 }
 
+/// The task type that marks a row as a face's standing duty.
+///
+/// Its own type rather than a plain `dag_node`, because two readers ask two
+/// different questions of the same row. The drift reading asks whether the
+/// owner has open work on the face and counts only executable rows, so the duty
+/// has to stay executable. The dispatcher asks what it may start as a run, and
+/// must never start this: the duty has no body, so a run of it spends its whole
+/// budget on nothing and is failed on the degenerate-loop rule, which takes the
+/// face's only evidence of staffing with it and leaves the face reading idle.
+pub const FACE_DUTY_TASK_TYPE: &str = "face-duty";
+
 /// The standing duty row a face's owner works from, as one shape written once.
 ///
-/// The row is a marker, not work: it carries the face's id and the name of the
-/// unit answerable for it, and that pair is what the drift reading measures when
-/// it asks whether anybody is on the face. So it is written with
-/// `is_executable = false`, the same way a goal row is: every dispatcher --
-/// the DAG executor's ready queue and the unit-facing queue alike -- hands out
-/// only executable rows, and a standing duty has no body to run. Left
-/// executable, the row was picked up by the executor, burned its whole budget
-/// on nothing, and was failed on the degenerate-loop rule; the face then had no
-/// open task bound to its owner, read `no_bound_task`, and stayed that way
-/// because nothing recreates a standing row.
+/// The row carries the face's id and the name of the unit answerable for it,
+/// and that pair is what the drift reading measures when it asks whether
+/// anybody is on the face. It is executable so that reading can see it, and
+/// typed as a face duty so the dispatcher leaves it alone; see
+/// [`FACE_DUTY_TASK_TYPE`].
 ///
 /// The owner is written three times for the same reason `rebind` writes it
 /// three times: the reading takes the row's own binding, the dispatcher reads
@@ -89,7 +95,7 @@ pub fn standing_row(face: &Face, workspace: &str) -> Task {
     );
     let mut task = Task::new(
         face_work_id(&face.face_id),
-        TaskType::DagNode,
+        TaskType::Custom(FACE_DUTY_TASK_TYPE.to_string()),
         serde_json::json!({
             "goal": goal,
             "face": face.face_id,
@@ -99,7 +105,6 @@ pub fn standing_row(face: &Face, workspace: &str) -> Task {
     task.face_id = Some(face.face_id.clone());
     task.owner_unit = face.owner_unit.clone();
     task.workspace_id = Some(workspace.to_string());
-    task.is_executable = false;
     task
 }
 
@@ -1526,21 +1531,31 @@ mod tests {
         }
     }
 
-    /// The standing duty row carries who is answerable for the face; it is not
-    /// a unit of work, and every dispatcher hands out only executable rows.
+    /// The standing duty row carries who is answerable for the face, and the
+    /// dispatcher must leave it alone while the drift reading still counts it.
     ///
-    /// Left executable -- which is what `Task::new` gives you -- the executor
-    /// took the row, spent its whole budget on it, and failed it on the
-    /// degenerate-loop rule. The face then had no open task bound to its owner
-    /// and read `no_bound_task`, and nothing recreates a standing row, so the
-    /// face stayed idle until somebody ran the assignment command by hand.
+    /// Both halves are load-bearing and they pull in opposite directions: the
+    /// reading counts only executable rows as open work, so a duty that is not
+    /// executable makes the face read `no_bound_task` even though the row is
+    /// right there; a duty that is executable and untyped is what the executor
+    /// took before this, spending the whole budget on a row with no body and
+    /// failing it -- which removes the face's only evidence of staffing.
     #[test]
-    fn the_standing_row_is_a_marker_not_work() {
+    fn the_standing_row_is_a_duty_the_dispatcher_leaves_alone() {
         let row = standing_row(&face(Some("worker")), "default");
 
+        assert_eq!(
+            row.task_type,
+            TaskType::Custom(FACE_DUTY_TASK_TYPE.to_string()),
+            "a duty that is a plain dag node is work the dispatcher will start"
+        );
         assert!(
-            !row.is_executable,
-            "a standing duty has no body to run; an executable one is eaten by the executor"
+            row.is_executable,
+            "the drift reading counts only executable rows as open work on the face"
+        );
+        assert!(
+            !crate::ready_queue::is_dispatchable_work(&row),
+            "the dispatcher started this row once and failed the face's only binding"
         );
         assert_eq!(row.id, face_work_id("变更管理"));
         assert_eq!(row.face_id.as_deref(), Some("变更管理"));
