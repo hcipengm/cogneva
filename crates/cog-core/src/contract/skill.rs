@@ -675,6 +675,8 @@ mod tests {
             input: serde_json::Value::Null,
             output_entities: output_entities.into_iter().map(String::from).collect(),
             estimated_seconds: seconds,
+            parent_id: None,
+            acceptance: vec![],
         }
     }
 

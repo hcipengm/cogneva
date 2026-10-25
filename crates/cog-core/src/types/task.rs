@@ -71,6 +71,11 @@ pub struct TaskPlan {
     /// 这一版基线是哪一次规划写下的。同一批任务共享一个值；重新规划写入的值
     /// 单调前进，读者据此分辨两版基线，而不是把它们读成同一版的两个部分。
     pub baseline_rev: String,
+    /// 这一片打算以什么算做完。分解门在入图之前判它非空，写在这里是为了让它在
+    /// 入图之后还读得到：重规划要重拆时，得知道原来那一片承诺过什么，否则它
+    /// 悄悄放宽了验收标准，账面上没有任何一行会变。
+    #[serde(default)]
+    pub acceptance: Vec<String>,
     pub updated_at: DateTime<Utc>,
 }
 

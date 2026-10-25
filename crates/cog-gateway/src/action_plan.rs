@@ -278,6 +278,8 @@ mod tests {
             input: serde_json::Value::Null,
             output_entities: vec![],
             estimated_seconds: 0,
+            parent_id: None,
+            acceptance: vec![],
         }
     }
 

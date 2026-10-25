@@ -706,6 +706,9 @@ impl ActionPlanOrchestrator {
                 },
                 budget_tokens: at.estimated_tokens,
                 baseline_rev: baseline_rev.to_string(),
+                // 验收标准随基线一起存：分解门判过它非空，但门只存在于入图那一刻。
+                // 不写下来，重规划时就没有任何人能读到原来那一片承诺过什么。
+                acceptance: at.acceptance.clone(),
                 updated_at: now,
             });
         }
@@ -957,6 +960,30 @@ impl ActionPlanOrchestrator {
         }
         let sink_id = sinks.into_iter().next().expect("checked exactly one");
 
+        // 一处结构缺陷就整份打回：父指针挂空、父子成环、工作包没有验收标准、
+        // 声明的子节点不存在。这几种任务入图之后都长得像正常任务——会被调度、
+        // 会跑完、会报 Completed——而它们缺的那一件（谁属于谁、怎样算做完）事后
+        // 没有任何读面补得回来。与上面两条判退同一个形状：不重试、不降级，判词
+        // 逐条点名是哪一片、差在哪。
+        let defects = crate::wbs::check(&plan.tasks);
+        if !defects.is_empty() {
+            let reason = crate::wbs::summary(&defects);
+            return self
+                .fail_submission(
+                    cog_core::ALERT_RULE_DECOMPOSITION_WBS,
+                    &goal_id,
+                    attempts_used,
+                    tasks,
+                    reason,
+                )
+                .await;
+        }
+        // 子任务在计划内部的父指针，映射到这一批的 id 上；计划没给父指针的挂在
+        // 承载目标答案的那一行下面（一层）。两种都落在同一批注入里，所以父节点
+        // 一定存在——这正是结构门判过的那一条。
+        let plan_ids: std::collections::BTreeSet<&str> =
+            plan.tasks.iter().map(|t| t.id.as_str()).collect();
+
         // Inject placeholders + children as ONE idempotent batch so a
         // partial write / crash is compensable on redelivery: originals are
         // non-executable hierarchy markers only when at least one child
@@ -1019,9 +1046,12 @@ impl ActionPlanOrchestrator {
                     task.face_id = face_id.clone();
                     task.owner_unit = owner_unit.clone();
                 }
-                if let Some(first_original) = all_injected_ids.first() {
-                    task.parent_task_id = Some(first_original.clone());
-                }
+                task.parent_task_id = match at.parent_id.as_deref() {
+                    Some(parent) if plan_ids.contains(parent) => Some(parent.to_string()),
+                    // 计划内部的父指针指向批外已由结构门判退，走不到这里；没给父
+                    // 指针的顶层工作包挂在目标行下面，读面才有一棵树可看。
+                    _ => all_injected_ids.first().cloned(),
+                };
                 task.action_planner_meta = Some(cog_core::ActionPlannerMeta {
                     verified: true,
                     version: Some("1.0.0".into()),
@@ -1853,6 +1883,9 @@ mod tests {
             input: serde_json::json!({}),
             output_entities: vec![],
             estimated_seconds: 600,
+            parent_id: None,
+            // 工作包要带验收标准，分解门才会放行：这条夹具走的是同一条入图路径。
+            acceptance: vec!["有产出".into()],
         };
         Arc::new(MockTaskExecutor {
             atomic_tasks: vec![task],
@@ -2345,6 +2378,9 @@ mod tests {
             input: serde_json::json!({}),
             output_entities: vec![],
             estimated_seconds: 600,
+            parent_id: None,
+            // 叶子工作包带验收标准：分解门会拒没有判据的叶子，夹具按合规的造。
+            acceptance: vec!["有产出".into()],
         }
     }
 
@@ -3045,6 +3081,132 @@ mod tests {
         // 判退不接重试：下一轮拿不到这一轮的判词，同一组入参问出来的是同一份东西，
         // 所以判退发生在取出计划之后、规划器只被问了一次。
         assert_eq!(exec.seen.lock().unwrap().len(), 1);
+    }
+
+    /// 收口唯一的分解也可能是坏的：工作包没有验收标准，它会被调度、会跑完、会报
+    /// Completed，而「做完了没有」没有任何判据。这种计划必须在入图之前打回——进了
+    /// 图之后它长得和正常任务一模一样，读面事后补不出判据从哪来。
+    #[tokio::test]
+    async fn a_work_package_without_acceptance_never_enters_the_graph() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-wbs-acceptance".to_string()));
+        let mut parent = atomic_task("child-1");
+        parent.blocks = vec!["child-2".into()];
+        let mut leaf = atomic_task("child-2");
+        leaf.blocked_by = vec!["child-1".into()];
+        leaf.acceptance.clear();
+        let exec = Arc::new(RecordingAtomicExecutor {
+            replies: std::sync::Mutex::new(vec![vec![parent, leaf]]),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let sink: Arc<RecordingAlertSink> = Arc::new(RecordingAlertSink::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(exec.clone())
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(2);
+        planner.attach_alert_sink(sink.clone()).await;
+
+        let registry = SkillRegistry::new();
+        let ids = planner
+            .process_goal_impl("do one thing well", vec![hint_task("goal-row")], &registry)
+            .await
+            .unwrap();
+
+        // 判退：没有降级放行，两片都没进图，只有目标行落下来。
+        assert_eq!(ids, vec!["goal-row".to_string()]);
+        assert!(dag.get_task("child-1").await.is_none());
+        assert!(dag.get_task("child-2").await.is_none());
+
+        let original = dag.get_task("goal-row").await.unwrap();
+        assert_eq!(original.status, cog_core::TaskStatus::Failed);
+        assert!(!original.is_executable);
+        let error = original.error.as_deref().expect("判词要落下来");
+        assert!(error.contains("wbs_violation"), "{error}");
+        assert!(
+            error.contains("child-2"),
+            "判词要点名是哪一片没有判据：{error}"
+        );
+        assert!(
+            !error.contains("child-1"),
+            "有人挂在它下面的是汇总节点，不该被要求自己写判据：{error}"
+        );
+
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, cog_core::ALERT_RULE_DECOMPOSITION_WBS);
+        // 与另外两条分解判退同一形状：不重试，同一组入参问出来的是同一份东西。
+        assert_eq!(exec.seen.lock().unwrap().len(), 1);
+    }
+
+    /// 父指针指向批外的那一片，进图之后不会被任何汇总看见：它照常跑、照常报
+    /// Completed，而树上的位置是空的。判词要说出它指向的是谁。
+    #[tokio::test]
+    async fn a_parent_pointer_outside_the_plan_is_refused_with_the_orphan_named() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-wbs-orphan".to_string()));
+        let mut parent = atomic_task("child-1");
+        parent.blocks = vec!["child-2".into()];
+        let mut orphan = atomic_task("child-2");
+        orphan.blocked_by = vec!["child-1".into()];
+        orphan.parent_id = Some("ghost-parent".into());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(RecordingAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![parent, orphan]]),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+
+        let registry = SkillRegistry::new();
+        let ids = planner
+            .process_goal_impl("reparent this", vec![hint_task("goal-row")], &registry)
+            .await
+            .unwrap();
+
+        assert_eq!(ids, vec!["goal-row".to_string()]);
+        assert!(dag.get_task("child-2").await.is_none());
+        let original = dag.get_task("goal-row").await.unwrap();
+        assert_eq!(original.status, cog_core::TaskStatus::Failed);
+        let error = original.error.as_deref().expect("判词要落下来");
+        assert!(error.contains("wbs_orphan"), "{error}");
+        assert!(error.contains("child-2"), "{error}");
+        assert!(
+            error.contains("ghost-parent"),
+            "要点出挂到哪儿去了：{error}"
+        );
+    }
+
+    /// 合规的分解：计划内部的父子关系原样映射到任务图上。以前所有子任务一律挂在
+    /// 目标行下面，于是三层计划在图里被压平成一棵扇——读面看不出谁属于谁，
+    /// 汇总节点的完成也汇不上来。
+    #[tokio::test]
+    async fn a_plans_internal_hierarchy_survives_into_the_task_graph() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-wbs-map".to_string()));
+        let mut parent = atomic_task("child-1");
+        parent.blocks = vec!["child-2".into()];
+        let mut leaf = atomic_task("child-2");
+        leaf.blocked_by = vec!["child-1".into()];
+        leaf.parent_id = Some("child-1".into());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(RecordingAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![parent, leaf]]),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+
+        let registry = SkillRegistry::new();
+        planner
+            .process_goal_impl("keep the tree", vec![hint_task("goal-row")], &registry)
+            .await
+            .unwrap();
+
+        let leaf_row = dag.get_task("child-2").await.expect("leaf injected");
+        assert_eq!(leaf_row.parent_task_id.as_deref(), Some("child-1"));
+        // 计划没给父指针的顶层工作包挂在目标行下面，读面才只有一个根。
+        let parent_row = dag.get_task("child-1").await.expect("parent injected");
+        assert_eq!(parent_row.parent_task_id.as_deref(), Some("goal-row"));
     }
 
     /// 非可执行的 goal 行不是 hint：它只是这次目标的标记，不该进规划输入。

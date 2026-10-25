@@ -93,6 +93,19 @@ pub struct AtomicTask {
     pub output_entities: Vec<String>,
     #[serde(default)]
     pub estimated_seconds: u64,
+    /// 这一片挂在分解里的哪一片下面。`None` 是顶层工作包。
+    ///
+    /// 与 `blocked_by` 是两件事：依赖说「谁等谁才能跑」，这里说「谁属于谁」。
+    /// 一片可以依赖另一棵子树里的产物而不属于它。分解不带这个指针时，所有子任务
+    /// 都挂在目标行下面（一层），带了才是真正的多层 WBS。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// 工作包的验收标准。
+    ///
+    /// 叶子节点没有它，这一片做完了没有就没有判据——分解门会因此把整份计划打回。
+    /// 非叶子（有人挂在它下面）不要求填：它的完成是由子节点汇上来的。
+    #[serde(default)]
+    pub acceptance: Vec<String>,
 }
 
 /// The complete action plan produced by Stage 1 decomposition.
@@ -383,6 +396,8 @@ mod tests {
             input: serde_json::Value::Null,
             output_entities: vec![],
             estimated_seconds: 0,
+            parent_id: None,
+            acceptance: vec![],
         }
     }
 

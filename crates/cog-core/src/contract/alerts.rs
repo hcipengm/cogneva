@@ -363,6 +363,14 @@ pub const ALERT_RULE_DECOMPOSITION_ORPHANED: &str = "decomposition_orphaned";
 /// "the planner produced nothing", and a plan with pieces but no single closing
 /// task is a different condition with a different answer.
 pub const ALERT_RULE_DECOMPOSITION_SINK_COUNT: &str = "decomposition_sink_count";
+/// Rule name for alerts raised when a decomposition is structurally not a work
+/// breakdown: a parent pointer naming a task outside the plan, a parent cycle, a
+/// work package with no acceptance criteria, or a declared child that does not
+/// exist. Separate from [`ALERT_RULE_DECOMPOSITION_EMPTY`] and
+/// [`ALERT_RULE_DECOMPOSITION_SINK_COUNT`] because the repair is different:
+/// those two ask for another decomposition, this one names the pieces that are
+/// wrong and what is wrong with them, which a re-ask does not get from "empty".
+pub const ALERT_RULE_DECOMPOSITION_WBS: &str = "decomposition_wbs";
 /// Rule name for alerts raised when the promotion ledger has gone whole weeks
 /// without a single promotion. Distinct from the trend rule: a flat zero has no
 /// decided samples, so every success-rate comparison skips it and the loudest

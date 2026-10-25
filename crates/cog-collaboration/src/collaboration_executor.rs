@@ -1351,6 +1351,10 @@ impl CollaborationExecutor {
             input: spec.input.clone(),
             output_entities: vec![],
             estimated_seconds: Self::estimate_seconds(&spec.name, &spec.input),
+            // 这一段来自协作分配而不是目标分解，没有 WBS 可挂，也没有人给出验收
+            // 标准。空着是实话：分解门只判分解产出的计划，不判这一条路。
+            parent_id: None,
+            acceptance: vec![],
         }
     }
 

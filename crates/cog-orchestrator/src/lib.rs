@@ -15,6 +15,7 @@ pub mod ready_queue;
 pub mod resource_ledger;
 pub mod sop;
 pub mod task_executor_router;
+pub mod wbs;
 
 pub use action_planner::ActionPlanOrchestrator;
 pub use dag_executor::task_phase::{ExitCriteria, PhaseTransitionRules, PhasedTask, TaskPhase};
