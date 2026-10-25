@@ -9193,10 +9193,12 @@ pub fn build_rollout_bundle(
     let repo = image_repository(image);
     let mut patched: BTreeMap<String, String> = BTreeMap::new();
     let mut support_docs: Vec<serde_yaml::Value> = Vec::new();
-    // Governance declarations are collected independently of where a document is
-    // delivered: they do not go into the bundle in the first place
-    // (`namespace_docs` skips them), so this reads the other face of the same
-    // text and has nothing to do with what either branch above does.
+    // Governance declarations are read for two different questions from the
+    // same text: the drift check wants what this revision *declares*, and the
+    // bundle wants what it *ships*. Both are answers about the same documents,
+    // so the set is collected once, here, rather than inside either branch
+    // above -- a branch that only ever runs for delivered documents would go
+    // blind the moment one of them stops travelling.
     let mut governance: Vec<crate::governance_drift::GovernanceDeclaration> = Vec::new();
     for res in &set.resources {
         let content = set.content(res)?;

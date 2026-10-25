@@ -29,12 +29,12 @@ pub enum Command {
     /// Apply the rendered ResourceQuota/LimitRange to the cluster, installing
     /// nothing else.
     ///
-    /// The rollout loop skips governance kinds on purpose (replaying a committed
-    /// default every revision would overwrite a ceiling someone tuned), and the
-    /// install face applies them only while installing. A ceiling raised in the
-    /// tree therefore has no carrier between installs: the cluster keeps
-    /// admitting against the old number. This command is that carrier, and it
-    /// takes the number from the rendered artifacts rather than from any
+    /// The rollout loop delivers these kinds like any other manifest (the
+    /// ceiling travels with the revision that declares workloads under it), so
+    /// this is not their only carrier -- it is the one that works when no
+    /// rollout is running: a host between installs, or a ceiling raised in the
+    /// tree that someone wants in the cluster without waiting for a delivery.
+    /// It takes the number from the rendered artifacts rather than from any
     /// environment variable, so what lands is the tree's own copy.
     Governance,
     Help,
@@ -66,11 +66,11 @@ Cogneva 元启动引导器
 装任何东西；`COGNEVA_NODE_IO_*` 五个变量在这里全部必需。
 
 `governance` 只做一件事：从 `deploy/rendered/<profile>/` 里挑出 `ResourceQuota` 与
-`LimitRange` 两份多文档清单，原样 `kubectl apply`。部署循环有意不投射这两类对象（每
-rev 重放会把有人调过的天花板覆盖回去），安装面又只在装的时候 apply 一次，所以树里
-抬高的额度在两次安装之间没有任何载体；这条子命令就是那个载体。profile 默认按当前
-集群探测，可用 `COGNEVA_GOVERNANCE_PROFILE` 指定；治理面关掉的 profile 没有可 apply
-的对象，这时它以非零退出，而不是报一个「空的成功」。
+`LimitRange` 两份多文档清单，原样 `kubectl apply`。这两类对象**随每次滚动一起下发**
+（滚动前先 apply 支撑包），所以这条子命令不是它们唯一的载体，而是不等一轮滚动就能把
+树里的数落到集群的那条路：没有滚动在跑的宿主、或者刚在树里抬了额度想立刻生效时用它。
+profile 默认按当前集群探测，可用 `COGNEVA_GOVERNANCE_PROFILE` 指定；治理面关掉的
+profile 没有可 apply 的对象，这时它以非零退出，而不是报一个「空的成功」。
 
     COGNEVA_CN_MIRROR=1              强制国内镜像路径（0 强制海外），缺省自动探测
     COGNEVA_BOOTSTRAP_NONINTERACTIVE=1   全程不提问（无人值守）
