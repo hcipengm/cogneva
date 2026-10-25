@@ -28,3 +28,39 @@ body {
 canvas {
   display: block;
 }
+
+/*
+ * 对话面：一条正在流的消息末尾的落点。
+ *
+ * 光标是「这里还在长」的唯一指示。用闪烁而不是旋转图标：文字在长，读者要看的
+ * 是长到哪儿了，一个转圈只说明「忙」，说不出进度。尊重 reduced-motion 时改为
+ * 常亮——动画去掉，位置信息保留。
+ */
+@keyframes chat-caret {
+  0%, 45% { opacity: 1; }
+  55%, 100% { opacity: 0.15; }
+}
+
+.chat-caret {
+  display: inline-block;
+  width: 0.5em;
+  height: 1em;
+  margin-left: 1px;
+  vertical-align: -0.15em;
+  background: var(--brass);
+  animation: chat-caret 1.1s steps(1, end) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-caret { animation: none; opacity: 1; }
+}
+
+/* 回合之间的分隔靠留白与左侧那条细线，不靠卡片。 */
+.chat-turn-rule {
+  background: var(--line);
+}
+
+.chat-turn-rule[data-streaming='true'] {
+  background: var(--brass);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--brass) 45%, transparent);
+}

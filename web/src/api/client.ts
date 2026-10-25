@@ -290,6 +290,33 @@ export async function sendMessage(
   });
 }
 
+/** 一段对话里的一行，读回来的形状。 */
+export interface ChatTranscriptLine {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  /** 这一轮没有答案的原因。有值就是「问过，但没答上来」。 */
+  failure: string | null;
+  created_at: string;
+}
+
+/**
+ * 读回一段对话说过的话。
+ *
+ * 这是「关掉页面再打开，那段对话还在」的那条腿。不带 `failure` 的那个选择
+ * 会让没答上来的那一轮凭空消失——读者会以为那句话从没说过。
+ */
+export async function getSessionMessages(
+  sessionId: string
+): Promise<ChatTranscriptLine[]> {
+  const res = await api.get<{
+    code: string;
+    data?: { items?: ChatTranscriptLine[] };
+    message?: string;
+  }>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`);
+  return res.data?.items ?? [];
+}
+
 export interface LlmBackend {
   provider: string;
   base_url: string;

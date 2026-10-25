@@ -1,18 +1,4 @@
-import type { Message } from '@/store/streamStore';
-import {
-  drawMessageBubble,
-  prepareMessage,
-  measureMessageBubble,
-  GAP_BETWEEN_MESSAGES,
-  type RenderMessage,
-} from './messagePainter';
-import { drawTopology } from './topologyPainter';
-import { drawPipeline } from './pipelinePainter';
-import { drawToolCallCard } from './toolCallPainter';
-import { drawThinkingBlock } from './thinkingPainter';
-import type { TopologyNode, TopologyEdge } from './topologyPainter';
-import type { PipelineStage } from './pipelinePainter';
-import { font, token, tokenAlpha } from './theme';
+import { token, tokenAlpha } from './theme';
 
 export interface Viewport {
   width: number;
@@ -22,28 +8,31 @@ export interface Viewport {
 }
 
 export interface RenderFrame {
-  messages: Message[];
   connectionStatus: string;
   viewport: Viewport;
   autoScroll: boolean;
 }
 
-interface LayoutItem {
-  message: RenderMessage;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-const PANEL_WIDTH = 280;
-const PANEL_MARGIN = 24;
-
+/**
+ * 工作台的底。只画底，不画内容。
+ *
+ * 这个画布以前画的是三样东西：一条栅格、一段气泡对话、两个写死的可视化面板
+ * （拓扑与流水线）。三样都在说同一类谎——它们看起来在讲集群里发生的事，实际
+ * 上一个像素与集群无关：面板上的节点是字面量，流水线永远停在「K3s Deploy」，
+ * 画出来的气泡与服务端真正流回来的消息是两套数据。读者分不出哪一块是读数、
+ * 哪一块是装饰，而一块分不出真假的读数比没有更坏。
+ *
+ * 所以内容搬走了：对话是 DOM 里的回合，拓扑与流水线等真实端点接上之后再画。
+ * 这里只剩一层底——主题纯色，外加极低频、极低对比的粒子，让一屏静止的界面不
+ * 那么像一张截图。粒子的位移不携带任何信息，因此它不冒充读数；`prefers-reduced-
+ * motion` 打开时连它也不动。
+ */
 export class CanvasRenderer {
   private ctx: CanvasRenderingContext2D;
   private viewport: Viewport = { width: 0, height: 0, dpr: 1, scrollY: 0 };
-  private cache = new Map<string, RenderMessage>();
-  private contentHeight = 0;
+  private particles: { x: number; y: number; vx: number; vy: number; r: number }[] = [];
+  private lastFrameAt = 0;
+  private still = false;
 
   constructor(canvas: HTMLCanvasElement) {
     const ctx = canvas.getContext('2d', { alpha: false });
@@ -51,247 +40,96 @@ export class CanvasRenderer {
       throw new Error('Failed to get Canvas 2D context');
     }
     this.ctx = ctx;
+    this.still =
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   }
 
   resize(width: number, height: number, dpr: number): void {
-    this.viewport = {
-      ...this.viewport,
-      width,
-      height,
-      dpr,
-    };
+    const first = this.viewport.width === 0;
+    this.viewport = { ...this.viewport, width, height, dpr };
+    if (first || this.particles.length === 0) this.seedParticles();
   }
 
   getViewport(): Viewport {
     return { ...this.viewport };
   }
 
-  setScrollY(scrollY: number): void {
-    const maxScroll = Math.max(
-      0,
-      this.contentHeight - this.viewport.height + 120
-    );
-    this.viewport.scrollY = Math.max(0, Math.min(scrollY, maxScroll));
-  }
-
-  render(frame: RenderFrame): void {
-    const { ctx, viewport } = this;
-
-    // Background
-    this.drawBackground();
-
-    // Prepare messages with caching
-    const renderMessages = frame.messages.map((message) => {
-      const cacheKey = `${message.id}:${message.text.length}:${message.status}`;
-      const cached = this.cache.get(cacheKey);
-      if (cached && cached.text === message.text) {
-        return cached;
-      }
-      const prepared = prepareMessage({
-        id: message.id,
-        role: message.role,
-        text: message.text,
-      });
-      this.cache.set(cacheKey, prepared);
-      return prepared;
-    });
-
-    // Layout messages in the left area
-    const contentWidth = viewport.width - PANEL_WIDTH - PANEL_MARGIN * 2;
-    const marginX = 28;
-    const startY = 28;
-    const layoutItems: LayoutItem[] = [];
-    let currentY = startY;
-
-    renderMessages.forEach((message) => {
-      const { width: bubbleWidth, height: bubbleHeight } = measureMessageBubble(
-        message,
-        contentWidth
-      );
-
-      const bubbleX =
-        message.role === 'user'
-          ? contentWidth - marginX - bubbleWidth
-          : marginX;
-
-      layoutItems.push({
-        message,
-        x: bubbleX,
-        y: currentY,
-        width: bubbleWidth,
-        height: bubbleHeight,
-      });
-
-      currentY += bubbleHeight + GAP_BETWEEN_MESSAGES;
-    });
-
-    this.contentHeight = currentY;
-
-    // Auto-scroll to bottom when streaming
-    if (frame.autoScroll && this.contentHeight > viewport.height) {
-      const targetScrollY = this.contentHeight - viewport.height + 120;
-      this.viewport.scrollY = Math.max(0, targetScrollY);
-    }
-
-    const offsetY = -this.viewport.scrollY;
-
-    // Draw messages
-    let lastAssistantY = 0;
-    layoutItems.forEach((item) => {
-      drawMessageBubble(ctx, item.message, item.x, item.y + offsetY, contentWidth);
-      if (item.message.role === 'assistant') {
-        lastAssistantY = item.y + offsetY + item.height + 12;
-      }
-    });
-
-    // Draw thinking block and tool calls during streaming
-    const lastMessage = frame.messages[frame.messages.length - 1];
-    if (lastMessage?.role === 'assistant' && lastMessage.status === 'streaming') {
-      const cardX = marginX;
-      const cardWidth = Math.min(400, contentWidth - marginX * 2);
-      let cardY = lastAssistantY;
-
-      if (cardY > 0) {
-        cardY += drawThinkingBlock(ctx, '分析意图并规划工具调用...', cardX, cardY, cardWidth);
-        cardY += 10;
-        cardY += drawToolCallCard(ctx, { id: '1', name: 'health_latency_profiler', status: 'running' }, cardX, cardY, cardWidth);
-      }
-    }
-
-    // Draw right-side visualization panels
-    this.drawVisualizationPanels();
-
-    // Draw connection status indicator
-    this.drawConnectionStatus(frame.connectionStatus);
-  }
+  /** 内容不再滚动：对话由 DOM 自己滚。留着这个接口，画布这一侧不必再有特例。 */
+  setScrollY(_scrollY: number): void {}
 
   getContentHeight(): number {
-    return this.contentHeight;
+    return 0;
   }
 
-  private drawBackground(): void {
-    const { ctx, viewport } = this;
+  clearCache(): void {}
 
-    // Base gradient
-    const gradient = ctx.createRadialGradient(
-      viewport.width / 2,
-      viewport.height / 2,
-      0,
-      viewport.width / 2,
-      viewport.height / 2,
-      viewport.width * 0.8
+  render(frame: RenderFrame): void {
+    const now = performance.now();
+    const delta = this.lastFrameAt ? Math.min(64, now - this.lastFrameAt) : 0;
+    this.lastFrameAt = now;
+
+    this.drawGround();
+
+    if (this.still) {
+      this.drawParticles();
+      return;
+    }
+
+    // 粒子的速度是「每分钟几像素」量级：看得见在呼吸，盯着看不出在动。
+    for (const p of this.particles) {
+      p.x += (p.vx * delta) / 1000;
+      p.y += (p.vy * delta) / 1000;
+      const w = this.viewport.width;
+      const h = this.viewport.height;
+      if (p.x < -20) p.x = w + 20;
+      if (p.x > w + 20) p.x = -20;
+      if (p.y < -20) p.y = h + 20;
+      if (p.y > h + 20) p.y = -20;
+    }
+    this.drawParticles();
+    void frame;
+  }
+
+  private seedParticles(): void {
+    const count = Math.max(
+      18,
+      Math.min(64, Math.round((this.viewport.width * this.viewport.height) / 42000))
     );
-    gradient.addColorStop(0, token('ink-900'));
-    gradient.addColorStop(1, token('ink-1000'));
-    ctx.fillStyle = gradient;
+    this.particles = Array.from({ length: count }, () => ({
+      x: Math.random() * this.viewport.width,
+      y: Math.random() * this.viewport.height,
+      // 每秒 −6 到 +6 像素的漂移。
+      vx: (Math.random() - 0.5) * 12,
+      vy: (Math.random() - 0.5) * 12,
+      r: 0.6 + Math.random() * 1.1,
+    }));
+  }
+
+  /** 底：主题纯色。不铺栅格——栅格是「这里可以拖东西」的暗示，而这里不能。 */
+  private drawGround(): void {
+    const { ctx, viewport } = this;
+    ctx.fillStyle = token('ink-1000');
     ctx.fillRect(0, 0, viewport.width, viewport.height);
 
-    // Subtle grid
-    ctx.strokeStyle = tokenAlpha('line', 0.35);
-    ctx.lineWidth = 1;
-
-    const gridSize = 48;
-    const offsetY = -this.viewport.scrollY % gridSize;
-
-    ctx.beginPath();
-    for (let x = 0; x < viewport.width; x += gridSize) {
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, viewport.height);
-    }
-    for (let y = offsetY; y < viewport.height; y += gridSize) {
-      ctx.moveTo(0, y);
-      ctx.lineTo(viewport.width, y);
-    }
-    ctx.stroke();
-
-    // Top fade for input area
-    const topFade = ctx.createLinearGradient(0, 0, 0, 80);
-    topFade.addColorStop(0, tokenAlpha('ink-1000', 0.7));
-    topFade.addColorStop(1, tokenAlpha('ink-1000', 0));
-    ctx.fillStyle = topFade;
-    ctx.fillRect(0, 0, viewport.width, 80);
+    // 顶部一道极淡的渐变，把标题行与内容区分开，不靠一条实线。
+    const gradient = ctx.createLinearGradient(0, 0, 0, 160);
+    gradient.addColorStop(0, tokenAlpha('ink-800', 0.55));
+    gradient.addColorStop(1, tokenAlpha('ink-800', 0));
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, viewport.width, 160);
   }
 
-  private drawVisualizationPanels(): void {
-    const { ctx, viewport } = this;
-    const panelX = viewport.width - PANEL_WIDTH - PANEL_MARGIN;
-    const panelY = 28;
-
-    // Topology panel
-    const topologyNodes: TopologyNode[] = [
-      { id: 'gateway', label: 'Gateway', x: 140, y: 70, status: 'healthy', type: 'gateway' },
-      { id: 'core', label: 'Cogneva Core', x: 80, y: 130, status: 'running', type: 'core' },
-      { id: 'agent1', label: 'Agent Alpha', x: 180, y: 180, status: 'running', type: 'agent' },
-      { id: 'agent2', label: 'Agent Beta', x: 60, y: 220, status: 'idle', type: 'agent' },
-      { id: 'sandbox', label: 'Sandbox', x: 130, y: 270, status: 'healthy', type: 'sandbox' },
-    ];
-    const topologyEdges: TopologyEdge[] = [
-      { from: 'gateway', to: 'core', active: true },
-      { from: 'core', to: 'agent1', active: true },
-      { from: 'core', to: 'agent2', active: false },
-      { from: 'agent1', to: 'sandbox', active: true },
-    ];
-
-    drawTopology(
-      ctx,
-      topologyNodes,
-      topologyEdges,
-      panelX,
-      panelY,
-      PANEL_WIDTH,
-      320
-    );
-
-    // Pipeline panel
-    const pipelineStages: PipelineStage[] = [
-      { id: 'bootstrap', label: 'Bootstrap', status: 'done' },
-      { id: 'probe', label: 'Environment Probe', status: 'done' },
-      { id: 'deploy', label: 'K3s Deploy', status: 'running' },
-      { id: 'evolve', label: 'Self Evolution', status: 'pending' },
-      { id: 'handoff', label: 'WebUI Handoff', status: 'pending' },
-    ];
-
-    drawPipeline(
-      ctx,
-      pipelineStages,
-      panelX,
-      panelY + 340,
-      PANEL_WIDTH,
-      240
-    );
-  }
-
-  private drawConnectionStatus(status: string): void {
-    const { ctx, viewport } = this;
-    const x = viewport.width - 28;
-    const y = 28;
-
-    const colors: Record<string, string> = {
-      open: token('ok'),
-      connecting: token('warn'),
-      closed: token('muted'),
-      error: token('danger'),
-    };
-
-    const color = colors[status] ?? token('muted');
-
+  private drawParticles(): void {
+    const { ctx } = this;
     ctx.save();
-    ctx.shadowColor = color;
-    ctx.shadowBlur = 10;
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.arc(x, y, 5, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.fillStyle = tokenAlpha('line-strong', 0.35);
+    for (const p of this.particles) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
     ctx.restore();
-
-    ctx.fillStyle = tokenAlpha('paper', 0.7);
-    ctx.font = `11px ${font('mono')}`;
-    ctx.textAlign = 'right';
-    ctx.fillText(status, x - 14, y + 4);
-    ctx.textAlign = 'left';
-  }
-
-  clearCache(): void {
-    this.cache.clear();
   }
 }

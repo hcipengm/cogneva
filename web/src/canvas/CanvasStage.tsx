@@ -58,15 +58,11 @@ export function CanvasStage() {
 
     const loop = () => {
       const state = useStreamStore.getState();
-      const lastMessage = state.messages[state.messages.length - 1];
-      const isStreaming = lastMessage?.status === 'streaming';
-      const autoScroll = isStreaming && !isUserScrollingRef.current;
 
       renderer.render({
-        messages: state.messages,
         connectionStatus: state.connectionStatus,
         viewport: renderer.getViewport(),
-        autoScroll,
+        autoScroll: false,
       });
       rafRef.current = requestAnimationFrame(loop);
     };

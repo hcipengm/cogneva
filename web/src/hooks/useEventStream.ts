@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import { EventStreamClient } from '@/transport/websocket';
 import { MockEventStreamClient } from '@/transport/mockStream';
 import { describeEvent, useStreamStore, type MessageRole } from '@/store/streamStore';
+import { useChatStore } from '@/store/chatStore';
 import type { AgentEvent } from '@/types/events';
 import type { NotificationItem } from '@/api/client';
 
@@ -78,6 +79,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     (state) => state.setConnectionStatus
   );
   const recordActivity = useStreamStore((state) => state.recordActivity);
+  const ingestChatFrame = useChatStore((state) => state.ingestFrame);
   /** 每个 agent 正在流的那一条消息（agent_id → 画布上的消息 id）。 */
   const streaming = useRef(new Map<string, string>());
 
@@ -159,12 +161,14 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     const client = options.mock
       ? new MockEventStreamClient({
           onEvent: handleEvent,
+          onChatFrame: ingestChatFrame,
           onStatusChange: (status) => setConnectionStatus(status),
         })
       : new EventStreamClient({
           url: options.url ?? '',
           channels,
           onEvent: handleEvent,
+          onChatFrame: ingestChatFrame,
           onNotification: (notification) =>
             notificationHandler.current?.(notification),
           onStatusChange: (status) => setConnectionStatus(status),
@@ -191,6 +195,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     setTaskProgress,
     setConnectionStatus,
     recordActivity,
+    ingestChatFrame,
   ]);
 
   return { clientRef };

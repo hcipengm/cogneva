@@ -1,4 +1,9 @@
-import { isEventType, type AgentEvent } from '@/types/events';
+import {
+  isEventType,
+  normalizeChatFrame,
+  type AgentEvent,
+  type ChatFrame,
+} from '@/types/events';
 import type { NotificationItem } from '@/api/client';
 
 export type ConnectionStatus = 'connecting' | 'open' | 'closed' | 'error';
@@ -15,6 +20,11 @@ export interface WebSocketOptions {
    * 而它恰恰是站内通信唯一的实时到达路径。
    */
   onNotification?: (notification: NotificationItem) => void;
+  /**
+   * 聊天帧。它不经过 `onEvent`：聊天流的名字自成一族，混进 agent 事件的
+   * 分派里只会被当成不认识的事件丢掉。
+   */
+  onChatFrame?: (frame: ChatFrame) => void;
   onStatusChange?: (status: ConnectionStatus) => void;
   onError?: (error: Error) => void;
 }
@@ -165,6 +175,18 @@ export class EventStreamClient {
     }
 
     if (message.type === 'agent_event' && message.payload) {
+      // 聊天帧与 agent 事件共用这一层信封，内层的名字不同。先问聊天那一族：
+      // 它的名字（`message.start`）不在 agent 事件的已知表里，交给下面那个
+      // 归一函数只会被当成不认识的事件丢掉——回复于是永远上不了屏。
+      const chat = normalizeChatFrame(
+        message.payload,
+        message.session_id,
+        message.event_id ?? (message.payload.id as string)
+      );
+      if (chat) {
+        this.options.onChatFrame?.(chat);
+        return;
+      }
       const event = normalizeAgentEvent(message.payload, message.event_id ?? message.payload.id as string);
       if (event) {
         this.options.onEvent(event);

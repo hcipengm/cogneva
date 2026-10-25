@@ -6,11 +6,10 @@ import { useEventStream } from '@/hooks/useEventStream';
 import { useLlmStatus } from '@/hooks/useLlmStatus';
 import { useNotifications } from '@/hooks/useNotifications';
 import { useResource } from '@/hooks/useResource';
+import { USE_MOCK } from '@/runtime';
 import { AuthOverlay } from '@/overlay/AuthOverlay';
 import { ShellServicesProvider, type ShellServices } from '@/shell/context';
 import { Shell } from '@/shell/Shell';
-
-const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true';
 
 /**
  * 入口：先判身份，再把跨面共用的读数装进工作台。

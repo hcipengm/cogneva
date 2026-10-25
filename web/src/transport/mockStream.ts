@@ -1,7 +1,9 @@
-import type { AgentEvent } from '@/types/events';
+import type { AgentEvent, ChatFrame } from '@/types/events';
 
 export interface MockStreamOptions {
   onEvent: (event: AgentEvent) => void;
+  /** 聊天帧走自己那一路，与真后端一致：它们不是 agent 事件的变体。 */
+  onChatFrame?: (frame: ChatFrame) => void;
   onStatusChange?: (status: 'connecting' | 'open' | 'closed' | 'error') => void;
 }
 
@@ -42,13 +44,41 @@ export class MockEventStreamClient {
   }
 
   simulateUserMessage(text: string): void {
-    this.emit('message_start', { role: 'user', content: [{ type: 'text', text }] });
-    this.emit('message_end', { role: 'user', content: [{ type: 'text', text }] });
+    // 与服务端同形：先回声用户那一句（三帧），再流助手的。
+    const userMid = `user-${Math.random().toString(36).slice(2, 10)}`;
+    this.chat('start', userMid, { role: 'user' });
+    this.chat('text_delta', userMid, { delta: text });
+    this.chat('end', userMid);
 
     this.timer = setTimeout(() => {
       this.simulateAssistantReply();
     }, 400);
   }
+
+  /** 一帧聊天。名字带点，与 `crates/cog-gateway/src/chat.rs` 发的一致。 */
+  private chat(
+    kind: 'start' | 'text_delta' | 'end',
+    messageId: string,
+    fields: Record<string, unknown> = {}
+  ): void {
+    if (!this.connected) return;
+    this.options.onChatFrame?.({
+      id: `chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      sessionId: this.sessionId,
+      messageId,
+      kind,
+      role: (fields.role as 'user' | 'assistant' | null) ?? null,
+      delta: (fields.delta as string | null) ?? null,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /** 演示流只服务一段对话；多段由界面自己开，连上真后端时才有各自的流。 */
+  setSession(sessionId: string): void {
+    this.sessionId = sessionId;
+  }
+
+  private sessionId = 'main';
 
   private emit(type: AgentEvent['type'], fields: Record<string, unknown>): void {
     if (!this.connected) return;
@@ -66,18 +96,14 @@ export class MockEventStreamClient {
 
     this.emit('agent_start', {});
     this.emit('state_change', { from: 'idle', to: 'thinking' });
-    this.emit('message_start', { message: { role: 'assistant', content: [] } });
+    const replyMid = `assistant-${Math.random().toString(36).slice(2, 10)}`;
+    this.chat('start', replyMid, { role: 'assistant' });
 
     let index = 0;
     const stream = () => {
       if (!this.connected) return;
       if (index >= replyText.length) {
-        this.emit('message_end', {
-          message: {
-            role: 'assistant',
-            content: [{ type: 'text', text: replyText }],
-          },
-        });
+        this.chat('end', replyMid);
         // 回话之后调一次工具：活动面板要能看见「读了哪个文件」，而不是只有
         // 一段文字流过去。
         this.emit('tool_execution_start', {
@@ -99,9 +125,7 @@ export class MockEventStreamClient {
 
       const chunkSize = Math.floor(Math.random() * 4) + 1;
       const chunk = replyText.slice(index, index + chunkSize);
-      this.emit('message_update', {
-        assistant_event: { type: 'text_delta', content_index: 0, delta: chunk },
-      });
+      this.chat('text_delta', replyMid, { delta: chunk });
       index += chunkSize;
       this.timer = setTimeout(stream, 30);
     };
