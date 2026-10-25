@@ -106,6 +106,11 @@ const FETCH_INTERVAL_METRIC: &str = "sandbox_repo_fetch_interval_seconds";
 /// see, and the loop silently stopping to use it would be invisible.
 const SOURCE_LABEL: &str = "source";
 
+/// Every value [`SOURCE_LABEL`] may take. Published together, exactly one of
+/// them at 1; see [`PeriodGauge`] for why the state cannot be a label on the
+/// number itself.
+const SOURCES: [&str; 3] = ["configured", "floor", "measured"];
+
 /// The published name of the idle TTL the reclamation pass is using.
 const TTL_METRIC: &str = "sandbox_workspace_ttl_seconds";
 
@@ -209,6 +214,62 @@ fn period_source(pass_millis: u64, derived: Duration, floor: Duration) -> &'stat
         "floor"
     } else {
         "measured"
+    }
+}
+
+/// A period this process keeps, published as the number in force plus a one-hot
+/// family naming the input set that chose it.
+///
+/// The state cannot be a label on the number itself: a Prometheus client keeps
+/// every label set it has been handed for the life of the process, so the first
+/// pass writing `source="configured"` and the next writing `source="measured"`
+/// leaves both published forever -- two series, each claiming to be the period
+/// in force, and a rule selecting either one reads a wait the loop stopped
+/// keeping. Measured on the cluster: `sandbox_volume_walk_interval_seconds`
+/// carried `source="configured"` and `source="floor"` at 300 side by side, with
+/// nothing saying which one was current. Publishing all three sources with
+/// exactly one at 1 says the same thing and leaves nothing behind.
+#[derive(Clone)]
+struct PeriodGauge {
+    seconds: Gauge,
+    source: GaugeVec,
+}
+
+impl PeriodGauge {
+    /// Register the number at the configured period, which is what is in force
+    /// before the first timed pass -- a zero there would read as a loop about
+    /// to spin, not as a period that has not been derived yet.
+    fn new(
+        registry: &Registry,
+        name: &str,
+        help: &str,
+        configured: Duration,
+    ) -> Result<Self, prometheus::Error> {
+        let seconds = Gauge::new(name, help)?;
+        // Named off the number it belongs to, so the pair cannot be registered
+        // under names that drift apart.
+        let source = GaugeVec::new(
+            Opts::new(
+                format!("{}_source", name.strip_suffix("_seconds").unwrap_or(name)),
+                "Which input set chose the period in force: 1 for that one, 0 for the others",
+            ),
+            &[SOURCE_LABEL],
+        )?;
+        registry.register(Box::new(seconds.clone()))?;
+        registry.register(Box::new(source.clone()))?;
+        let published = Self { seconds, source };
+        published.set(configured.as_secs_f64(), "configured");
+        Ok(published)
+    }
+
+    /// Publish `seconds` as the period in force, chosen by `source`.
+    fn set(&self, seconds: f64, source: &str) {
+        self.seconds.set(seconds);
+        for candidate in SOURCES {
+            self.source
+                .with_label_values(&[candidate])
+                .set(if candidate == source { 1.0 } else { 0.0 });
+        }
     }
 }
 
@@ -429,21 +490,23 @@ pub struct WorkdirMetrics {
     /// second name for it would leave the rule that compares it against the
     /// declared size reading only the half that happens to be spelled its way.
     data_volume_used: GaugeVec,
-    /// The fetch wait in force, labelled by where it came from. A derived
+    /// The fetch wait in force, and the input set that chose it. A derived
     /// number that is not published is indistinguishable from a configured
     /// one, and the loop quietly going back to the configured value would
     /// read as if nothing had changed.
-    fetch_interval: GaugeVec,
-    /// The idle TTL in force, labelled by whether it came from a measurement.
-    ttl_seconds: GaugeVec,
-    /// The reclamation interval in force, labelled the same way.
-    gc_interval_seconds: GaugeVec,
-    /// The volume walk's interval in force, labelled the same way.
-    volume_walk_interval_seconds: GaugeVec,
+    fetch_interval: PeriodGauge,
+    /// The idle TTL in force, published the same way.
+    ttl_seconds: PeriodGauge,
+    /// The reclamation interval in force, published the same way.
+    gc_interval_seconds: PeriodGauge,
+    /// The volume walk's interval in force, published the same way.
+    volume_walk_interval_seconds: PeriodGauge,
 }
 
 impl WorkdirMetrics {
-    fn new() -> Result<Self, prometheus::Error> {
+    /// Built from the configuration because the periods in force are its
+    /// numbers until a pass has been timed.
+    fn new(cfg: &WorkdirConfig) -> Result<Self, prometheus::Error> {
         let registry = Registry::new();
         let workspaces = Gauge::new(
             "sandbox_workspaces",
@@ -500,38 +563,30 @@ impl WorkdirMetrics {
         registry.register(Box::new(disk_total_bytes.clone()))?;
         registry.register(Box::new(disk_avail_bytes.clone()))?;
         registry.register(Box::new(data_volume_used.clone()))?;
-        let fetch_interval = GaugeVec::new(
-            Opts::new(
-                FETCH_INTERVAL_METRIC,
-                "Seconds the background fetch loop is currently waiting between upstream fetches",
-            ),
-            &[SOURCE_LABEL],
+        let fetch_interval = PeriodGauge::new(
+            &registry,
+            FETCH_INTERVAL_METRIC,
+            "Seconds the background fetch loop is currently waiting between upstream fetches",
+            cfg.fetch_interval,
         )?;
-        registry.register(Box::new(fetch_interval.clone()))?;
-        let ttl_seconds = GaugeVec::new(
-            Opts::new(
-                TTL_METRIC,
-                "Seconds an idle task worktree is held before reclamation",
-            ),
-            &[SOURCE_LABEL],
+        let ttl_seconds = PeriodGauge::new(
+            &registry,
+            TTL_METRIC,
+            "Seconds an idle task worktree is held before reclamation",
+            cfg.ttl,
         )?;
-        registry.register(Box::new(ttl_seconds.clone()))?;
-        let gc_interval_seconds = GaugeVec::new(
-            Opts::new(
-                GC_INTERVAL_METRIC,
-                "Seconds between reclamation passes of the task worktrees",
-            ),
-            &[SOURCE_LABEL],
+        let gc_interval_seconds = PeriodGauge::new(
+            &registry,
+            GC_INTERVAL_METRIC,
+            "Seconds between reclamation passes of the task worktrees",
+            cfg.gc_interval,
         )?;
-        registry.register(Box::new(gc_interval_seconds.clone()))?;
-        let volume_walk_interval_seconds = GaugeVec::new(
-            Opts::new(
-                VOLUME_WALK_INTERVAL_METRIC,
-                "Seconds between walks of the volumes this executor writes",
-            ),
-            &[SOURCE_LABEL],
+        let volume_walk_interval_seconds = PeriodGauge::new(
+            &registry,
+            VOLUME_WALK_INTERVAL_METRIC,
+            "Seconds between walks of the volumes this executor writes",
+            cfg.data_volume_interval,
         )?;
-        registry.register(Box::new(volume_walk_interval_seconds.clone()))?;
         Ok(Self {
             registry,
             workspaces,
@@ -679,8 +734,8 @@ pub struct WorkdirRouter {
 impl WorkdirRouter {
     pub fn new(cfg: WorkdirConfig) -> SFResult<Arc<Self>> {
         let meta_dir = cfg.workspaces_root.join(META_DIR_NAME);
-        let metrics =
-            WorkdirMetrics::new().map_err(|e| SFError::IO(format!("workdir metrics init: {e}")))?;
+        let metrics = WorkdirMetrics::new(&cfg)
+            .map_err(|e| SFError::IO(format!("workdir metrics init: {e}")))?;
         if let Some(reason) = &cfg.data_volume_declaration_error {
             // Nothing below this point can measure those volumes, so the loss is
             // reported where it happens rather than left to be inferred from a
@@ -989,15 +1044,11 @@ impl WorkdirRouter {
             )
         });
         if let Some(d) = derived {
-            self.metrics
-                .ttl_seconds
-                .with_label_values(&["measured"])
-                .set(d.as_secs() as f64);
+            self.metrics.ttl_seconds.set(d.as_secs() as f64, "measured");
         } else {
             self.metrics
                 .ttl_seconds
-                .with_label_values(&["configured"])
-                .set(self.cfg.ttl.as_secs() as f64);
+                .set(self.cfg.ttl.as_secs() as f64, "configured");
         }
         let ttl = derived.unwrap_or(self.cfg.ttl).as_secs() as i64;
         let mut reclaimed = 0u64;
@@ -1116,8 +1167,7 @@ impl WorkdirRouter {
         );
         self.metrics
             .fetch_interval
-            .with_label_values(&[source])
-            .set(wait.as_secs() as f64);
+            .set(wait.as_secs() as f64, source);
         let last = self.last_fetch_unix.load(Ordering::Relaxed);
         if last == 0 {
             return true;
@@ -1151,8 +1201,7 @@ impl WorkdirRouter {
         );
         self.metrics
             .gc_interval_seconds
-            .with_label_values(&[source])
-            .set(wait.as_secs_f64());
+            .set(wait.as_secs_f64(), source);
         let last = self.last_gc_unix.load(Ordering::Relaxed);
         if last == 0 {
             return true;
@@ -1199,8 +1248,7 @@ impl WorkdirRouter {
         );
         self.metrics
             .volume_walk_interval_seconds
-            .with_label_values(&[source])
-            .set(wait.as_secs_f64());
+            .set(wait.as_secs_f64(), source);
         let last = self.last_volume_walk_unix.load(Ordering::Relaxed);
         if last == 0 {
             return true;
@@ -2811,6 +2859,42 @@ pub(crate) mod tests {
         );
     }
 
+    /// Every published series of one metric in a rendered scrape, as
+    /// `(the series' `source` label or the empty string, sample value)`.
+    fn published(rendered: &str, metric: &str) -> Vec<(String, f64)> {
+        let labelled = format!("{metric}{{");
+        let bare = format!("{metric} ");
+        let mut out = Vec::new();
+        for line in rendered.lines() {
+            let (source, value) = if let Some(rest) = line.strip_prefix(&labelled) {
+                let source = rest.split('"').nth(1).unwrap_or_default().to_string();
+                (source, rest)
+            } else if let Some(rest) = line.strip_prefix(&bare) {
+                (String::new(), rest)
+            } else {
+                continue;
+            };
+            let value: f64 = value
+                .rsplit(' ')
+                .next()
+                .unwrap_or_default()
+                .parse()
+                .unwrap_or(f64::NAN);
+            out.push((source, value));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The source family a period's name derives to, by the same rule
+    /// [`PeriodGauge::new`] registers it under.
+    fn source_metric(metric: &str) -> String {
+        format!(
+            "{}_source",
+            metric.strip_suffix("_seconds").unwrap_or(metric)
+        )
+    }
+
     /// The loop itself uses that law and publishes the interval it is keeping:
     /// a walk that just ran is not due again, and the reading moves from the
     /// configured number to the measured one.
@@ -2826,11 +2910,18 @@ pub(crate) mod tests {
         // Nothing walked yet: due at once, and the reading says why.
         assert!(r.volume_walk_due());
         let first = r.metrics().render();
-        assert!(
-            first.contains(&format!(
-                "{}{{{}=\"configured\"}} 30",
-                VOLUME_WALK_INTERVAL_METRIC, SOURCE_LABEL
-            )),
+        assert_eq!(
+            published(&first, VOLUME_WALK_INTERVAL_METRIC),
+            vec![(String::new(), 30.0)],
+            "{first}"
+        );
+        assert_eq!(
+            published(&first, &source_metric(VOLUME_WALK_INTERVAL_METRIC)),
+            vec![
+                ("configured".to_string(), 1.0),
+                ("floor".to_string(), 0.0),
+                ("measured".to_string(), 0.0),
+            ],
             "{first}"
         );
 
@@ -2842,12 +2933,81 @@ pub(crate) mod tests {
             "a walk that just finished read as due again"
         );
         let after = r.metrics().render();
-        assert!(
-            after.contains(&format!(
-                "{}{{{}=\"measured\"}} 400",
-                VOLUME_WALK_INTERVAL_METRIC, SOURCE_LABEL
-            )),
+        assert_eq!(
+            published(&after, VOLUME_WALK_INTERVAL_METRIC),
+            vec![(String::new(), 400.0)],
             "{after}"
+        );
+        assert_eq!(
+            published(&after, &source_metric(VOLUME_WALK_INTERVAL_METRIC)),
+            vec![
+                ("configured".to_string(), 0.0),
+                ("floor".to_string(), 0.0),
+                ("measured".to_string(), 1.0),
+            ],
+            "{after}"
+        );
+    }
+
+    /// A period whose source moved must not leave the old one published. When
+    /// the state rode on the number as a label, every source the loop had ever
+    /// used stayed in the scrape at its last value -- measured on the cluster
+    /// as `sandbox_volume_walk_interval_seconds{source="configured"} 300` next
+    /// to `{source="floor"} 300`, two numbers both claiming to be the wait in
+    /// force and nothing saying which was current. One number in force, one
+    /// one-hot family, nothing left behind.
+    #[test]
+    fn a_period_that_moved_leaves_one_number_and_no_stale_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = router(
+            tmp.path(),
+            &tmp.path().join("repo.git"),
+            8,
+            Duration::from_secs(3600),
+        );
+        let sources = source_metric(VOLUME_WALK_INTERVAL_METRIC);
+        // Configured, then floor, then measured: all three states in turn, so a
+        // stale series would have had two chances to appear. Each call publishes
+        // before it decides, so a pass that is not due still sets the reading.
+        assert!(r.volume_walk_due());
+        // A 1-second walk buys 20s, under the configured 30s floor.
+        r.note_volume_walk(1_000);
+        assert!(
+            !r.volume_walk_due(),
+            "a walk that just ran came due at once"
+        );
+        // A 20-second walk buys 400s, above it.
+        r.note_volume_walk(20_000);
+        assert!(!r.volume_walk_due(), "a 400s walk came due after 30s");
+
+        let rendered = r.metrics().render();
+        let numbers = published(&rendered, VOLUME_WALK_INTERVAL_METRIC);
+        assert_eq!(
+            numbers.len(),
+            1,
+            "one period is in force at a time, so one series has to publish it: {rendered}"
+        );
+        assert_eq!(numbers[0].1, 400.0, "{rendered}");
+
+        let states = published(&rendered, &sources);
+        assert_eq!(
+            states.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+            vec!["configured", "floor", "measured"],
+            "all three sources are published on every scrape, so a reader does not \
+             have to guess a missing one: {rendered}"
+        );
+        assert_eq!(
+            states.iter().filter(|(_, v)| *v == 1.0).count(),
+            1,
+            "exactly the source that chose the period in force is set: {rendered}"
+        );
+        assert_eq!(
+            states
+                .iter()
+                .find(|(s, _)| s == "measured")
+                .map(|(_, v)| *v),
+            Some(1.0),
+            "{rendered}"
         );
     }
 
