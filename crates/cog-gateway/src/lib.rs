@@ -62,6 +62,7 @@ pub mod processes;
 pub mod prometheus_render;
 pub mod promotion_gate;
 pub mod raw_logs;
+pub mod readings;
 pub mod scm;
 pub mod secret_layout;
 pub mod secret_write;
@@ -1065,6 +1066,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/traces/{id}/fanout",
             get(trace_fanout::trace_fanout_handler),
+        )
+        .route(
+            "/api/v1/observability/readings",
+            get(readings::observability_readings_handler),
         )
         .route(
             "/api/v1/raw_logs/index",

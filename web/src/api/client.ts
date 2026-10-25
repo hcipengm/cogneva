@@ -975,6 +975,36 @@ export async function getBackendHealth(): Promise<BackendHealthMatrix> {
 }
 
 /**
+ * 六条观测读数。`value` 为空是「问不到 / 没有样本」，与读到 0 不是一回事；
+ * `dashboard_uid` 为空是「这条读数没有面板」，界面据此说明为什么点不过去。
+ */
+export interface ObservabilityReading {
+  id: string;
+  title: string;
+  query: string;
+  unit: string;
+  /** 阈值为空＝这条读数没有阈值，只能报值、不能报警。 */
+  warn: number | null;
+  crit: number | null;
+  higher_is_worse: boolean;
+  series: string;
+  produced_by: string;
+  dashboard_uid: string | null;
+  value: number | null;
+  verdict: 'ok' | 'warning' | 'critical' | 'unknown' | string;
+  unavailable_because?: string;
+}
+
+export interface ObservabilityReadings {
+  prometheus: string;
+  readings: ObservabilityReading[];
+}
+
+export async function getObservabilityReadings(): Promise<ObservabilityReadings> {
+  return api.get<ObservabilityReadings>('/api/v1/observability/readings');
+}
+
+/**
  * 监管者当前一轮健康巡检的结论。
  *
  * 四个数分开给而不是一个「健康度」：健康、失联、可疑、卡住是四种不同的

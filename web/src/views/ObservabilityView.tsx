@@ -5,6 +5,7 @@ import { EventsBoard } from '@/observability/EventsBoard';
 import { LogsBoard } from '@/observability/LogsBoard';
 import { MetricsBoard } from '@/observability/MetricsBoard';
 import { ProbesBoard } from '@/observability/ProbesBoard';
+import { ReadingsBoard } from '@/observability/ReadingsBoard';
 import { TracesBoard } from '@/observability/TracesBoard';
 import { ClusterTopology } from '@/topology/ClusterTopology';
 import { useShell } from '@/shell/store';
@@ -20,10 +21,19 @@ import { Button, Empty, Loading, ReadError, Reading, Readings, Status, Table, Vi
  * 它们刻意不合成为一个健康分：后端挂了、监管者停了、模型池没快照、任务全失败，
  * 是四种不同的处置，加权成一个数字之后读者还得再拆一次。
  */
-type BoardId = 'overview' | 'topology' | 'metrics' | 'logs' | 'traces' | 'events' | 'probes';
+type BoardId =
+  | 'overview'
+  | 'readings'
+  | 'topology'
+  | 'metrics'
+  | 'logs'
+  | 'traces'
+  | 'events'
+  | 'probes';
 
 const BOARDS: { id: BoardId; label: string; what: string }[] = [
   { id: 'overview', label: '概况', what: '集群判词、监管者、工作负载' },
+  { id: 'readings', label: '读数', what: '六条要动手的数，各带来源与 Grafana 深链' },
   { id: 'topology', label: '拓扑', what: '集群 → 节点 → Pod → 容器 → 卷与事件' },
   { id: 'metrics', label: '指标', what: '平台自己登记的累计计数' },
   { id: 'logs', label: '日志', what: '归档索引（正文在存储面）' },
@@ -70,6 +80,7 @@ export function ObservabilityView() {
       </nav>
 
       {board === 'overview' && <OverviewBoard overview={overview} />}
+      {board === 'readings' && <ReadingsBoard />}
       {board === 'topology' && <ClusterTopology />}
       {board === 'metrics' && <MetricsBoard />}
       {board === 'logs' && <LogsBoard />}

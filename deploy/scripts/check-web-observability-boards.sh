@@ -7,7 +7,7 @@
 # 和没有通路是一回事。
 #
 # 判据：
-#   1. 观测面有一条板条（`BOARDS`），七块板都在里面，且每块都真的被渲染
+#   1. 观测面有一条板条（`BOARDS`），八块板都在里面，且每块都真的被渲染
 #      （`{board === '…' && <XBoard />}`）——写在名单里而没人渲染，等于没有这块板；
 #   2. 每块板从 `main.tsx` 可达，并且它读自己的路由：client.ts 里有那个取数函数、
 #      有那条路径；
@@ -39,6 +39,7 @@ VIEW = "views/ObservabilityView.tsx"
 # 板 id → (组件名, 模块, 取数函数, 路由)
 BOARDS = {
     "overview": ("OverviewBoard", "views/ObservabilityView.tsx", "getClusterOverview", "/api/v1/cluster/overview"),
+    "readings": ("ReadingsBoard", "observability/ReadingsBoard.tsx", "getObservabilityReadings", "/api/v1/observability/readings"),
     "topology": ("ClusterTopology", "topology/ClusterTopology.tsx", "getClusterTopology", "/api/v1/cluster/topology"),
     "metrics": ("MetricsBoard", "observability/MetricsBoard.tsx", "getEvolutionMetrics", "/api/v1/evolution/metrics"),
     "logs": ("LogsBoard", "observability/LogsBoard.tsx", "listRawLogs", "/api/v1/raw_logs"),
@@ -145,6 +146,30 @@ if not re.search(r"trace\.events\.length\s*<\s*trace\.event_count", traces):
         "少读了帧却按全量展示，分布就是编的"
     )
 
+# ── 3b. 读数板：每条注明来源，深链拼不出来要说原因 ──
+readings = read(BOARDS["readings"][1])
+for needle, why in (
+    (
+        "produced_by",
+        "没有把 series/produced_by 显示出来——读数不注明谁产出它，序列消失时没人知道该找谁",
+    ),
+    (
+        "unavailable_because",
+        "没有显示 unavailable_because——「问不到」与「读数是 0」在屏上长得一样",
+    ),
+    (
+        "deepLink",
+        "深链不是经 deepLink 拼的——前端自己拼地址，换了 Grafana 地址后链接指向不存在的面板",
+    ),
+):
+    if needle not in readings:
+        problems.append(f"{BOARDS['readings'][1]}: {why}")
+if "why" not in read("observability/deepLink.ts"):
+    problems.append(
+        "observability/deepLink.ts: 拼不出链接时没有给出原因——"
+        "点下去什么也不发生的链接，比没有链接更让人以为是漏做了"
+    )
+
 # ── 4. 模型花销不在这一面再算一遍 ──
 if "getTokenUsage" in view_src:
     problems.append(
@@ -156,8 +181,9 @@ if problems:
     sys.exit("观测面的工具板不合格：\n  " + "\n  ".join(problems))
 
 print(
-    "ok：观测面是七块工具板（"
+    "ok：观测面是八块工具板（"
     + "、".join(BOARDS)
-    + "），每块从入口可达、读自己的路由，事件回放写明 24 小时 / 1000 条上限并走同一个帧归一函数"
+    + "），每块从入口可达、读自己的路由；事件回放写明 24 小时 / 1000 条上限并走同一个帧归一函数；"
+    "读数板每条注明序列与产出方，深链经 deepLink 拼、拼不出来说出原因"
 )
 PYEOF
