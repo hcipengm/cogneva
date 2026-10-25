@@ -30,7 +30,8 @@ const REGISTRY: &str = "crates/cogneva/tests/data/rust-capacity-constants.tsv";
 /// The words that make a constant's subject a quantity rather than a value.
 ///
 /// Matched against the constant's name: `MAX_BYTES`, `SCAN_INTERVAL_SECS`,
-/// `ASSESS_TASK_TIMEOUT`, `CACHE_HEADROOM_PERCENT`. Anything else -- a port, a
+/// `ASSESS_TASK_TIMEOUT`, `CACHE_HEADROOM_PERCENT`, `GC_OVERHEAD_MULTIPLE`.
+/// Anything else -- a port, a
 /// protocol version, a channel count -- is not a statement about capacity.
 const QUANTITY_WORDS: &[&str] = &[
     "SECS",
@@ -67,6 +68,7 @@ const QUANTITY_WORDS: &[&str] = &[
     "WINDOW",
     "WEIGHT",
     "RATIO",
+    "MULTIPLE",
     "FRACTION",
     "PERCENT",
 ];

@@ -1171,10 +1171,21 @@ rows:
       against the volume's free space; nothing does.
 
   - key: sandboxExecutor.workspaceGcIntervalSecs
-    source: override
+    source: derived
     why: >-
-      How often idle worktrees are collected. A derived interval would follow the
-      observed creation rate; nothing measures it.
+      How long goes by between reclamation passes. The value the loop acts on is
+      a multiple of the last pass's own duration, so the walk's cost stays a
+      fixed share of the process as the volume fills and the pass gets slower;
+      the floor is the pace the loop wakes at. This number is the seed used
+      until a pass has been timed.
+    published:
+      owner: crates/cog-extension/src/workdir.rs
+      file: crates/cog-extension/src/workdir.rs
+      metric: GC_INTERVAL_METRIC
+      label: source
+    proof:
+      file: crates/cog-extension/src/workdir.rs
+      test: the_gc_interval_follows_the_slowest_pass_not_a_written_period
 
   - key: sandboxExecutor.workspaceTtlSecs
     source: derived

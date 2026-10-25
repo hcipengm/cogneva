@@ -73,12 +73,14 @@ crates/cog-extension/src/workdir.rs	DEFAULT_FETCH_INTERVAL_SECS	300	unreviewed
 crates/cog-extension/src/workdir.rs	DEFAULT_GC_INTERVAL_SECS	600	unreviewed	
 crates/cog-extension/src/workdir.rs	DEFAULT_MAX_WORKSPACES	8	unreviewed	
 crates/cog-extension/src/workdir.rs	DEFAULT_TTL_SECS	21600	unreviewed	
-crates/cog-extension/src/workdir.rs	GIT_TIMEOUT_FLOOR_SECS	120	unreviewed	
-crates/cog-extension/src/workdir.rs	GIT_TIMEOUT_MULTIPLE	10	unreviewed	
+crates/cog-extension/src/workdir.rs	GC_OVERHEAD_MULTIPLE	20	derived	one over the share of the process a reclamation pass may take, times the pass duration
+crates/cog-extension/src/workdir.rs	GIT_TIMEOUT_FLOOR_SECS	120	bound	the floor before any git command here has completed
+crates/cog-extension/src/workdir.rs	GIT_TIMEOUT_MULTIPLE	10	derived	multiple of the slowest git command that has completed here
 crates/cog-extension/src/workdir.rs	MAX_TASK_ID_LEN	128	unreviewed	
-crates/cog-extension/src/workdir.rs	MIN_FETCH_INTERVAL_SECS	30	unreviewed	
-crates/cog-extension/src/workdir.rs	MIN_TTL_SECS	3600	unreviewed	
-crates/cog-extension/src/workdir.rs	WORKSPACE_DISK_HEADROOM_PERCENT	15	unreviewed	
+crates/cog-extension/src/workdir.rs	MIN_FETCH_INTERVAL_SECS	30	bound	below this every fetch asks for the same commit
+crates/cog-extension/src/workdir.rs	MIN_GC_INTERVAL_SECS	30	bound	floor under the pass-duration derivation; also the pace the loop wakes and beats at
+crates/cog-extension/src/workdir.rs	MIN_TTL_SECS	3600	bound	floor under the arrival-rate derivation, before two trees exist
+crates/cog-extension/src/workdir.rs	WORKSPACE_DISK_HEADROOM_PERCENT	15	bound	room the git commands writing while the cap is reached need
 crates/cog-gateway/src/a2a.rs	LIST_PAGE_DEFAULT	50	unreviewed	
 crates/cog-gateway/src/a2a.rs	LIST_PAGE_MAX	100	unreviewed	
 crates/cog-gateway/src/agents.rs	CONVERSATION_DEFAULT_LIMIT	100	unreviewed	

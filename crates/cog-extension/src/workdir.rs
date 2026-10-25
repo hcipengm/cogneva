@@ -86,6 +86,20 @@ const MAX_TASK_ID_LEN: usize = 128;
 /// executor is given instead of assuming one.
 const WORKSPACE_DISK_HEADROOM_PERCENT: u64 = 15;
 
+/// The shortest time between two reclamation passes, and the pace the loop
+/// wakes at whatever the derived interval turns out to be -- waking is cheap,
+/// a pass is not.
+const MIN_GC_INTERVAL_SECS: u64 = 30;
+
+/// How many times a pass's own duration the interval must cover, so a pass
+/// costs at most one this-many-th of the process's time. A ratio rather than a
+/// period: the pass gets slower as the volume fills, and the interval has to
+/// follow it or reclamation becomes the load.
+const GC_OVERHEAD_MULTIPLE: u64 = 20;
+
+/// The published name of the interval the reclamation loop is keeping.
+const GC_INTERVAL_METRIC: &str = "sandbox_workspace_gc_interval_seconds";
+
 /// The shortest wait between two upstream fetches. Below this the loop would be
 /// asking the mirror for the same commit faster than a push can arrive, and the
 /// cost of the git round trip stops being paid for by anything. A floor rather
@@ -185,6 +199,22 @@ fn ttl_from(capacity: usize, trees: usize, span_secs: u64) -> Option<Duration> {
 /// The shortest an idle tree is held, whatever the arithmetic says: below this
 /// the executor rebuilds trees it has just finished with.
 const MIN_TTL_SECS: u64 = 3600;
+
+/// How often to reclaim, from how long a pass costs.
+///
+/// The loop's own work is the thing that must stay cheap, so the interval is a
+/// multiple of the measured pass duration rather than a period chosen once. A
+/// pass that took half a second with a 600s interval was 0.08% of the process;
+/// one that takes 40s on a full volume would be 6.7% of it, and the fixed
+/// interval would keep paying that. `None` before any pass has been timed --
+/// there is nothing to scale from and the configured interval stands.
+fn gc_interval_from(pass_millis: u64, configured: Duration) -> Duration {
+    if pass_millis == 0 {
+        return configured;
+    }
+    let derived = (pass_millis / 1000).saturating_mul(GC_OVERHEAD_MULTIPLE);
+    Duration::from_secs(derived.max(MIN_GC_INTERVAL_SECS))
+}
 
 /// How long a git command may run, from the slowest one that has completed.
 fn git_timeout_from(slowest_ms: u64) -> Duration {
@@ -354,6 +384,8 @@ pub struct WorkdirMetrics {
     fetch_interval: GaugeVec,
     /// The idle TTL in force, labelled by whether it came from a measurement.
     ttl_seconds: GaugeVec,
+    /// The reclamation interval in force, labelled the same way.
+    gc_interval_seconds: GaugeVec,
 }
 
 impl WorkdirMetrics {
@@ -430,6 +462,14 @@ impl WorkdirMetrics {
             &[FETCH_INTERVAL_SOURCE_LABEL],
         )?;
         registry.register(Box::new(ttl_seconds.clone()))?;
+        let gc_interval_seconds = GaugeVec::new(
+            Opts::new(
+                GC_INTERVAL_METRIC,
+                "Seconds between reclamation passes of the task worktrees",
+            ),
+            &[FETCH_INTERVAL_SOURCE_LABEL],
+        )?;
+        registry.register(Box::new(gc_interval_seconds.clone()))?;
         Ok(Self {
             registry,
             workspaces,
@@ -443,6 +483,7 @@ impl WorkdirMetrics {
             data_volume_used,
             fetch_interval,
             ttl_seconds,
+            gc_interval_seconds,
         })
     }
 
@@ -560,6 +601,10 @@ pub struct WorkdirRouter {
     /// The longest git command that has completed here, in milliseconds. What
     /// the timeout is a multiple of; see [`GIT_TIMEOUT_FLOOR_SECS`].
     git_slowest_ms: AtomicU64,
+    /// The last reclamation pass's duration, in milliseconds, and when it
+    /// started. What the interval is a multiple of.
+    gc_pass_millis: AtomicU64,
+    last_gc_unix: AtomicI64,
 }
 
 impl WorkdirRouter {
@@ -602,6 +647,8 @@ impl WorkdirRouter {
             stillness_secs: AtomicU64::new(0),
             last_fetch_unix: AtomicI64::new(0),
             git_slowest_ms: AtomicU64::new(0),
+            gc_pass_millis: AtomicU64::new(0),
+            last_gc_unix: AtomicI64::new(0),
         }))
     }
 
@@ -836,7 +883,19 @@ impl WorkdirRouter {
 
     /// Reap trees idle past the TTL, then enforce the LRU cap. Returns the
     /// number of reclaimed trees.
+    ///
+    /// Times the pass on the way out: how long reclamation costs is what the
+    /// interval follows, and a failed pass cost what it cost.
     pub async fn gc_once(&self) -> SFResult<u64> {
+        let started = std::time::Instant::now();
+        let reaped = self.gc_pass().await;
+        self.gc_pass_millis
+            .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.last_gc_unix.store(unix_now(), Ordering::Relaxed);
+        reaped
+    }
+
+    async fn gc_pass(&self) -> SFResult<u64> {
         let _g = self.create_lock.lock().await;
         let now = unix_now();
         let trees = self.list_task_trees().await;
@@ -993,6 +1052,40 @@ impl WorkdirRouter {
         unix_now() - last >= wait.as_secs() as i64
     }
 
+    /// How often to reclaim: a multiple of the last pass's own duration, so
+    /// the loop's work stays a fixed share of the process however big the
+    /// volume it walks gets. Recomputed per call, for the same reason the git
+    /// timeout is.
+    fn gc_interval(&self) -> Duration {
+        gc_interval_from(
+            self.gc_pass_millis.load(Ordering::Relaxed),
+            self.cfg.gc_interval,
+        )
+    }
+
+    /// Whether the interval since the last pass has elapsed.
+    fn gc_due(&self) -> bool {
+        let pass_millis = self.gc_pass_millis.load(Ordering::Relaxed);
+        let wait = self.gc_interval();
+        // Before the first timed pass there is nothing to scale from, and the
+        // configured interval is what stands -- labelled as such so a chart
+        // number and a measured one never read the same.
+        let source = if pass_millis == 0 {
+            "configured"
+        } else {
+            "measured"
+        };
+        self.metrics
+            .gc_interval_seconds
+            .with_label_values(&[source])
+            .set(wait.as_secs_f64());
+        let last = self.last_gc_unix.load(Ordering::Relaxed);
+        if last == 0 {
+            return true;
+        }
+        unix_now() - last >= wait.as_secs() as i64
+    }
+
     /// Take this fetch's view of `main` and, when it differs from the previous
     /// one, record how long the head had been still before it moved. That
     /// stillness is the only measurement anyone here has of how often the
@@ -1143,21 +1236,27 @@ impl WorkdirRouter {
     /// [`Self::recover`].
     pub fn spawn_maintenance(self: &Arc<Self>) {
         let gc = Arc::clone(self);
-        let gc_interval = gc.cfg.gc_interval;
+        // The interval a pass may run at follows the pass; the pace the loop
+        // wakes at does not, because a wake with nothing due costs nothing and
+        // a declared cadence has to be the period the loop really wakes on.
+        let gc_wake = Duration::from_secs(MIN_GC_INTERVAL_SECS);
         // No stop signal and no exit of its own: ending means worktrees stop
         // being reclaimed, which fills the volume the tasks run on.
         drop(cog_core::loop_health::spawn_unstoppable(
             WORKTREE_GC_LOOP,
-            cog_core::loop_health::Cadence::Periodic(gc_interval),
+            cog_core::loop_health::Cadence::Periodic(gc_wake),
             // Rebuilt per attempt, so everything the body consumes is cloned here.
             move |beat| {
                 let gc = Arc::clone(&gc);
                 async move {
-                    let mut ticker = tokio::time::interval(gc_interval);
+                    let mut ticker = tokio::time::interval(gc_wake);
                     ticker.tick().await;
                     loop {
                         beat.beat();
                         ticker.tick().await;
+                        if !gc.gc_due() {
+                            continue;
+                        }
                         if let Err(e) = gc.gc_once().await {
                             warn!(error = %e, "task worktree GC failed");
                         }
@@ -2471,6 +2570,37 @@ pub(crate) mod tests {
         assert_eq!(
             fetch_interval_from(10, configured),
             Duration::from_secs(MIN_FETCH_INTERVAL_SECS)
+        );
+    }
+
+    /// Reclamation's own cost is what the interval covers, so a volume that
+    /// fills and makes the pass slower moves the interval with it instead of
+    /// letting the loop's share of the process grow. The pass is timed as the
+    /// work alone -- the waiting it is scheduled by is not part of it -- so
+    /// there is no path from the interval back into the measurement that sets
+    /// it.
+    #[test]
+    fn the_gc_interval_follows_the_slowest_pass_not_a_written_period() {
+        let configured = Duration::from_secs(600);
+        // No pass timed yet: the configured interval is all there is.
+        assert_eq!(gc_interval_from(0, configured), configured);
+        // A pass that took one second gets a twenty-second interval, which the
+        // floor raises to the pace the loop wakes at.
+        assert_eq!(
+            gc_interval_from(1_000, configured),
+            Duration::from_secs(MIN_GC_INTERVAL_SECS)
+        );
+        // A pass that took forty seconds -- a full volume, many trees -- gets
+        // twenty times that, so reclamation stays at one twentieth of the time.
+        assert_eq!(
+            gc_interval_from(40_000, configured),
+            Duration::from_secs(800)
+        );
+        // Ten times the pass, ten times the interval: the share is what is
+        // held constant, not the period.
+        assert_eq!(
+            gc_interval_from(400_000, configured),
+            Duration::from_secs(8000)
         );
     }
 
