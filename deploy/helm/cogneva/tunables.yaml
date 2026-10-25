@@ -1085,9 +1085,17 @@ rows:
   - key: sandboxExecutor.maxTaskWorkspaces
     source: override
     why: >-
-      How many task worktrees may exist at once, with LRU eviction past the cap.
-      A derived cap would follow the measured concurrent demand; the executor
-      does not publish it.
+      A policy ceiling -- how many task worktrees this executor serves at once
+      -- not a statement about the machine. The effective cap is the lower of
+      this and what the volume is measured to hold: on every GC pass the
+      executor reads `df` available bytes on the workspaces root, divides by
+      the size of one tree measured in that same pass, and keeps 15% of the
+      room free for git writes. Trees growing with the repository and
+      co-tenants filling the volume both lower that reading, so the disk stops
+      this ceiling from outliving the volume.
+      `the_worktree_cap_follows_the_volume_and_the_measured_tree_size` shows
+      the reading following both inputs; the executor logs `declared` beside
+      `measured` whenever the volume is the tighter of the two.
 
   - key: sandboxExecutor.repoFetchIntervalSecs
     source: override

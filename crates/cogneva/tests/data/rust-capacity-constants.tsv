@@ -21,6 +21,7 @@ crates/cog-agent/src/tools.rs	MEMORY_READ_TIMEOUT_SECS	30	unreviewed
 crates/cog-agent/src/web.rs	FETCH_TIMEOUT_SECS	30	unreviewed	
 crates/cog-agent/src/web.rs	MAX_FETCH_CHARS	200_000	unreviewed	
 crates/cog-agent/src/web.rs	MAX_SEARCH_RESULTS	50	unreviewed	
+crates/cog-agent/src/web.rs	RENDER_TIMEOUT_SECS	60	unreviewed	
 crates/cog-agent/src/web.rs	SEARCH_TIMEOUT_SECS	20	unreviewed	
 crates/cog-collaboration/src/collaboration_executor.rs	TOKEN_ESTIMATE_CAP	200_000	unreviewed	
 crates/cog-collaboration/src/config.rs	DEFAULT_LOCAL_REPAIR_MAX	2	unreviewed	
@@ -74,6 +75,7 @@ crates/cog-extension/src/workdir.rs	DEFAULT_MAX_WORKSPACES	8	unreviewed
 crates/cog-extension/src/workdir.rs	DEFAULT_TTL_SECS	21600	unreviewed	
 crates/cog-extension/src/workdir.rs	GIT_TIMEOUT_SECS	120	unreviewed	
 crates/cog-extension/src/workdir.rs	MAX_TASK_ID_LEN	128	unreviewed	
+crates/cog-extension/src/workdir.rs	WORKSPACE_DISK_HEADROOM_PERCENT	15	unreviewed	
 crates/cog-gateway/src/a2a.rs	LIST_PAGE_DEFAULT	50	unreviewed	
 crates/cog-gateway/src/a2a.rs	LIST_PAGE_MAX	100	unreviewed	
 crates/cog-gateway/src/agents.rs	CONVERSATION_DEFAULT_LIMIT	100	unreviewed	

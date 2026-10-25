@@ -71,6 +71,54 @@ const STALE_GIT_LOCK_AGE: Duration = Duration::from_secs(600);
 /// `ralph-roundtable-<uuid>`.
 const MAX_TASK_ID_LEN: usize = 128;
 
+/// Headroom kept free on the volume. A cap that fills the disk leaves no room
+/// for the git commands that have to write while the cap is being reached, and
+/// the failure that produces is a command failing, not a tree being reclaimed.
+/// A percentage rather than a byte figure, so it follows whatever volume the
+/// executor is given instead of assuming one.
+const WORKSPACE_DISK_HEADROOM_PERCENT: u64 = 15;
+
+/// What the filesystem under the workspaces root reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskReading {
+    total_bytes: u64,
+    avail_bytes: u64,
+}
+
+/// Read `df -PB1 <dir>`: the header, then one row per filesystem in blocks of
+/// one byte, so the size and available columns are already bytes.
+fn parse_df(stdout: &str) -> Option<DiskReading> {
+    let line = stdout.lines().nth(1)?;
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    Some(DiskReading {
+        total_bytes: cols.get(1)?.parse().ok()?,
+        avail_bytes: cols.get(3)?.parse().ok()?,
+    })
+}
+
+/// How many task trees the volume can hold: the ones already there, plus the
+/// ones its remaining room buys at the size a tree actually measures.
+///
+/// Both inputs are readings, which is the point. A repository that grows makes
+/// every tree larger, so the cap falls on the next pass; so does anything else
+/// filling the volume. `None` when no tree has been measured yet: there is no
+/// per-tree figure to divide by, and a cap invented without one would be the
+/// written number wearing a measurement's clothes.
+fn workspace_cap(disk: DiskReading, trees_bytes: u64, trees: usize) -> Option<usize> {
+    if trees == 0 || trees_bytes == 0 {
+        return None;
+    }
+    let per_tree = trees_bytes / trees as u64;
+    if per_tree == 0 {
+        return None;
+    }
+    let room = disk
+        .avail_bytes
+        .saturating_mul(100 - WORKSPACE_DISK_HEADROOM_PERCENT)
+        / 100;
+    Some(trees + (room / per_tree) as usize)
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkdirConfig {
     pub workspaces_root: PathBuf,
@@ -724,8 +772,31 @@ impl WorkdirRouter {
     /// rather than silently dropped. Caller must hold [`Self::create_lock`]
     /// semantics (route and gc_once take it; this fn assumes exclusion).
     async fn enforce_cap(&self, incoming: usize) {
-        let max = self.cfg.max_workspaces;
         let mut trees = self.list_task_trees().await;
+        // Two different numbers, and the lower one wins: the configured value is
+        // a policy ceiling (how many trees this executor is meant to serve at
+        // once), while the measured one is what the volume can actually hold at
+        // the size these trees are. A policy ceiling on its own cannot stop the
+        // disk filling up -- the trees grow with the repository -- and a disk
+        // reading on its own cannot stop inotify watches and git processes
+        // multiplying. Which one applied is logged whenever the measurement is
+        // the tighter of the two, because a cap that quietly stopped being the
+        // configured one reads exactly like a cap that was never reached.
+        let declared = self.cfg.max_workspaces;
+        let max = match self.measured_cap(&trees).await {
+            Some(measured) => {
+                if measured < declared {
+                    info!(
+                        declared,
+                        measured,
+                        trees = trees.len(),
+                        "task worktree cap lowered to what the volume holds"
+                    );
+                }
+                measured.min(declared)
+            }
+            None => declared,
+        };
         if trees.len() + incoming <= max {
             return;
         }
@@ -1168,27 +1239,42 @@ impl WorkdirRouter {
 
     /// Filesystem capacity via `df` (the runtime image carries coreutils).
     async fn refresh_disk_metric(&self) {
+        if let Some(disk) = self.read_disk().await {
+            self.metrics.disk_total_bytes.set(disk.total_bytes as f64);
+            self.metrics.disk_avail_bytes.set(disk.avail_bytes as f64);
+        }
+    }
+
+    /// What the filesystem under the workspaces root reports. One reading feeds
+    /// both the panel and the cap, so the number the cap follows is the number
+    /// an operator can see.
+    async fn read_disk(&self) -> Option<DiskReading> {
         let out = tokio::process::Command::new("df")
             .arg("-PB1")
             .arg(&self.cfg.workspaces_root)
             .output()
-            .await;
-        if let Ok(out) = out {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout);
-                if let Some(line) = text.lines().nth(1) {
-                    let cols: Vec<&str> = line.split_whitespace().collect();
-                    if cols.len() >= 4 {
-                        if let Ok(total) = cols[1].parse::<f64>() {
-                            self.metrics.disk_total_bytes.set(total);
-                        }
-                        if let Ok(avail) = cols[3].parse::<f64>() {
-                            self.metrics.disk_avail_bytes.set(avail);
-                        }
-                    }
-                }
-            }
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
         }
+        parse_df(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// What the volume and the trees say it can hold. `None` when neither has
+    /// been measured yet: the caller then has only the configured ceiling to go
+    /// on, and says so by not lowering it.
+    async fn measured_cap(&self, trees: &[(String, PathBuf)]) -> Option<usize> {
+        if trees.is_empty() {
+            return None;
+        }
+        let disk = self.read_disk().await?;
+        let root = self.cfg.workspaces_root.clone();
+        let bytes =
+            tokio::task::spawn_blocking(move || cog_core::fs_size::dir_size_bytes(&root, &[]).ok())
+                .await
+                .ok()??;
+        workspace_cap(disk, bytes, trees.len())
     }
 
     async fn run_git(&self, args: &[&str], workdir: Option<&Path>) -> SFResult<String> {
@@ -2104,5 +2190,39 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(!lock.exists());
+    }
+
+    /// The cap is a reading, not a setting: it says what this volume holds at
+    /// the size these trees measure, and it moves when either input moves.
+    #[test]
+    fn the_worktree_cap_follows_the_volume_and_the_measured_tree_size() {
+        const MIB: u64 = 1024 * 1024;
+        let disk_with = |avail_mib: u64| DiskReading {
+            total_bytes: 5 * 1024 * MIB,
+            avail_bytes: avail_mib * MIB,
+        };
+        // Four trees of 100 MiB each on a volume with 4 GiB free: 15% of the
+        // free space stays free, so the 3.4 GiB left buys 34 more at 100 MiB.
+        assert_eq!(workspace_cap(disk_with(4096), 4 * 100 * MIB, 4), Some(38));
+        // The same four trees, with the volume nearly full: the cap is smaller
+        // than the number of trees that already exist, so the next pass
+        // reclaims rather than grows.
+        assert_eq!(workspace_cap(disk_with(300), 4 * 100 * MIB, 4), Some(6));
+        // Trees that grew (the repository added a large file) shrink it too.
+        assert_eq!(workspace_cap(disk_with(4096), 4 * 400 * MIB, 4), Some(12));
+        // Nothing measured yet: no per-tree figure, so no invented cap.
+        assert_eq!(workspace_cap(disk_with(4096), 0, 0), None);
+        assert_eq!(workspace_cap(disk_with(4096), 0, 4), None);
+    }
+
+    #[test]
+    fn the_df_row_is_read_as_bytes() {
+        let out = "Filesystem     1B-blocks        Used   Available Capacity Mounted on\n\
+                   /dev/sda1    5368709120  1073741824  4294967296      20% /data\n";
+        let disk = parse_df(out).unwrap();
+        assert_eq!(disk.total_bytes, 5_368_709_120);
+        assert_eq!(disk.avail_bytes, 4_294_967_296);
+        // A failed `df` prints a diagnostic instead of a row.
+        assert_eq!(parse_df("df: /nope: No such file or directory\n"), None);
     }
 }
