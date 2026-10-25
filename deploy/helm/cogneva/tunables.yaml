@@ -44,14 +44,24 @@ rows:
 
   # --- application data -------------------------------------------------------
   - key: appData.storage
-    source: override
+    source: derived
     why: >-
-      A full day of trace writing measured about 19 GiB on this host, so 24Gi.
-      The application already publishes the used bytes as
-      cogneva_data_volume_used_bytes and a rule compares them against this
-      declaration; nothing writes that comparison back into the number, so a
-      declaration that fell behind the writing stays behind until a human reads
-      the alert.
+      The declaration the install starts from. The volume-capacity loop walks
+      the claim, compares the peak of `cogneva_data_volume_used_bytes` over its
+      recent rounds against this request with the same headroom the chart's
+      declarations are sized by, and patches the claim up to it when the peak
+      no longer fits -- bounded by the LimitRange's per-claim maximum and by
+      quota room, and reporting a clamp instead of churning when either is in
+      the way. A declaration that falls behind the writing therefore catches up
+      on its own; this number is what it starts from, not what it stays at.
+    published:
+      owner: crates/cog-reflection/src/volume_capacity.rs
+      file: crates/cog-reflection/src/volume_capacity.rs
+      metric: BYTES_METRIC
+      label: state
+    proof:
+      file: crates/cog-reflection/src/volume_capacity.rs
+      test: a_declaration_below_the_peak_is_raised_to_the_headroom_rounded_up
 
   # --- optional backends ------------------------------------------------------
   - key: backends.meilisearch.storage
