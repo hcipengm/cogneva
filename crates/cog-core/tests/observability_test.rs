@@ -102,3 +102,74 @@ fn test_cluster_overview_serialization() {
     assert_eq!(recovered.avg_task_duration_ms, None);
     assert_ne!(recovered.total_tasks, Some(0));
 }
+
+// ─── traceparent: the id that survives a process boundary ──────────────────
+
+#[test]
+fn a_trace_context_survives_a_process_boundary_as_a_traceparent_header() {
+    // The whole point of the carrier is that the receiving process can join
+    // the same chain: a context rendered to headers, shipped, and read back
+    // must name the same trace and the same span.
+    let ctx = cog_core::TraceContext::generate();
+    let headers = ctx.to_headers();
+    let tp = headers
+        .get("traceparent")
+        .expect("a freshly generated context must be renderable");
+    assert_eq!(tp.split('-').count(), 4);
+
+    let back = cog_core::TraceContext::from_headers(&headers).expect("headers must parse");
+    assert_eq!(back.trace_id, ctx.trace_id);
+    assert_eq!(back.span_id, ctx.span_id);
+    assert_eq!(back.sampled, ctx.sampled);
+}
+
+#[test]
+fn a_traceparent_from_another_process_is_read_before_the_bare_id() {
+    // Two hops, each writing its own bare x-trace-id, is exactly how a chain
+    // splits: the header written by the far process has to win, or the id that
+    // arrives is the local one and the remote half becomes unreachable.
+    let mut headers = std::collections::HashMap::new();
+    headers.insert(
+        "traceparent".to_string(),
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+    );
+    headers.insert("x-trace-id".to_string(), "local-only".to_string());
+    headers.insert("x-span-id".to_string(), "local-span".to_string());
+
+    let ctx = cog_core::TraceContext::from_headers(&headers).unwrap();
+    assert_eq!(ctx.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_eq!(ctx.span_id, "00f067aa0ba902b7");
+    assert!(ctx.sampled);
+}
+
+#[test]
+fn a_malformed_traceparent_is_refused_rather_than_half_read() {
+    // Each of these is a header a lenient parser would accept and then key a
+    // trace on — an id nobody else can join, or the all-zero id the spec
+    // forbids. Refusing sends the caller down the generate-a-new-trace path,
+    // which is visible; accepting produces a silently orphaned chain.
+    for bad in [
+        "",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7", // no flags
+        "00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01", // short trace
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b-01", // short span
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01", // zero trace
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01", // zero span
+        "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", // future version
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+    ] {
+        assert!(
+            cog_core::TraceContext::from_traceparent(bad).is_none(),
+            "accepted malformed traceparent: {bad}"
+        );
+    }
+}
+
+#[test]
+fn a_context_whose_ids_are_the_wrong_width_emits_no_traceparent() {
+    // Emitting a header a spec-compliant receiver rejects splits the chain at
+    // that hop with no error; emitting nothing is the visible failure.
+    let ctx = cog_core::TraceContext::new("a".repeat(32), "b".repeat(32));
+    assert!(ctx.to_traceparent().is_none());
+    assert!(!ctx.to_headers().contains_key("traceparent"));
+}

@@ -131,7 +131,14 @@ pub struct SquadState {
 /// Carried through the async call stack and injected into:
 /// - AgentEvent metadata
 /// - RawEnvelope meta.trace_id / meta.span_id
-/// - HTTP headers (x-trace-id)
+/// - HTTP headers (`traceparent`, plus the bare x-trace-id / x-span-id)
+///
+/// `traceparent` is the carrier that survives a process boundary without a
+/// shared code base: it is a plain header every hop can copy verbatim, so a
+/// request that starts at the gateway and ends in a build Job can be read back
+/// as one chain. The bare `x-trace-id` pair stays because in-process readers
+/// (event metadata, raw records) already key on the id alone; both are written
+/// from this one struct so they cannot name different traces.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TraceContext {
     pub trace_id: String,
@@ -150,10 +157,15 @@ impl TraceContext {
         }
     }
 
+    /// Mint a context whose ids are legal in a `traceparent` header: 16 bytes
+    /// (32 hex) for the trace, 8 bytes (16 hex) for the span. A span id of the
+    /// wrong width is not a cosmetic detail — every hop that copies this pair
+    /// into a header would be copying something a W3C parser rejects, and the
+    /// chain would break exactly where it crosses a process boundary.
     pub fn generate() -> Self {
         Self {
             trace_id: uuid::Uuid::new_v4().to_string().replace("-", ""),
-            span_id: uuid::Uuid::new_v4().to_string().replace("-", ""),
+            span_id: uuid::Uuid::new_v4().to_string().replace("-", "")[..16].to_string(),
             parent_span_id: None,
             sampled: true,
         }
@@ -164,17 +176,86 @@ impl TraceContext {
         self
     }
 
+    /// Render the W3C `traceparent` value: `00-<trace32>-<span16>-<flags>`.
+    ///
+    /// Returns `None` when this context's ids are not the widths the format
+    /// allows (an id minted by an older path can be 32 hex). Emitting a header
+    /// a spec-compliant receiver would reject is worse than emitting nothing:
+    /// the downstream hop generates a fresh trace, and the chain splits with no
+    /// error anywhere. The caller can see the `None` and decide.
+    pub fn to_traceparent(&self) -> Option<String> {
+        if !is_lower_hex(&self.trace_id, 32) || !is_lower_hex(&self.span_id, 16) {
+            return None;
+        }
+        if is_all_zero(&self.trace_id) || is_all_zero(&self.span_id) {
+            return None;
+        }
+        Some(format!(
+            "00-{}-{}-{}",
+            self.trace_id,
+            self.span_id,
+            if self.sampled { "01" } else { "00" }
+        ))
+    }
+
+    /// Parse a W3C `traceparent` value received from another process.
+    ///
+    /// Ids are normalised to lowercase: the format is lowercase-only, and a
+    /// peer that sends uppercase is still naming the same trace, so rejecting
+    /// it would split the chain over a case difference. Everything else that
+    /// does not match the shape is rejected, because a malformed id accepted
+    /// here becomes a trace nobody can join later.
+    pub fn from_traceparent(value: &str) -> Option<Self> {
+        let mut parts = value.trim().split('-');
+        let version = parts.next()?;
+        let trace_id = parts.next()?;
+        let span_id = parts.next()?;
+        let flags = parts.next()?;
+        if parts.next().is_some() || version != "00" {
+            return None;
+        }
+        if !is_hex(trace_id, 32) || !is_hex(span_id, 16) || !is_hex(flags, 2) {
+            return None;
+        }
+        let trace_id = trace_id.to_ascii_lowercase();
+        let span_id = span_id.to_ascii_lowercase();
+        if is_all_zero(&trace_id) || is_all_zero(&span_id) {
+            return None;
+        }
+        let sampled = u8::from_str_radix(flags, 16).map(|f| f & 0x01 == 1).ok()?;
+        Some(Self {
+            trace_id,
+            span_id,
+            parent_span_id: None,
+            sampled,
+        })
+    }
+
     pub fn to_headers(&self) -> HashMap<String, String> {
         let mut h = HashMap::new();
         h.insert("x-trace-id".into(), self.trace_id.clone());
         h.insert("x-span-id".into(), self.span_id.clone());
+        if let Some(tp) = self.to_traceparent() {
+            h.insert("traceparent".into(), tp);
+        }
         if let Some(ref p) = self.parent_span_id {
             h.insert("x-parent-span-id".into(), p.clone());
         }
         h
     }
 
+    /// Read a context out of inbound headers.
+    ///
+    /// `traceparent` wins when present: it is the header another process
+    /// wrote, so it names the trace this request belongs to. The bare
+    /// `x-trace-id` pair is the in-house fallback for hops that predate it.
     pub fn from_headers(headers: &HashMap<String, String>) -> Option<Self> {
+        if let Some(tp) = headers.get("traceparent") {
+            if let Some(mut ctx) = Self::from_traceparent(tp) {
+                ctx.parent_span_id = headers.get("x-parent-span-id").cloned();
+                return Some(ctx);
+            }
+        }
         let trace_id = headers.get("x-trace-id")?;
         let span_id = headers.get("x-span-id")?;
         Some(Self {
@@ -184,6 +265,21 @@ impl TraceContext {
             sampled: true,
         })
     }
+}
+
+/// True when `s` is exactly `len` ASCII hex digits.
+fn is_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// True when `s` is exactly `len` lowercase ASCII hex digits — the only form
+/// the W3C header allows on the wire.
+fn is_lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn is_all_zero(s: &str) -> bool {
+    s.bytes().all(|b| b == b'0')
 }
 
 /// Prometheus-compatible metrics exporter.

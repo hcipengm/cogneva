@@ -1309,6 +1309,19 @@ where
                         .headers_mut()
                         .insert(axum::http::header::HeaderName::from_static("x-span-id"), hv);
                 }
+                // Echo the W3C id back so the caller (a browser, a build Job
+                // shelling out with curl) gets a value to quote when asking
+                // why something happened. Without it the trace id only exists
+                // inside our logs, and the person holding a failed request has
+                // no handle to the chain it belongs to.
+                if let Some(tp) = trace_ctx.to_traceparent() {
+                    if let Ok(hv) = axum::http::HeaderValue::from_str(&tp) {
+                        response.headers_mut().insert(
+                            axum::http::header::HeaderName::from_static("traceparent"),
+                            hv,
+                        );
+                    }
+                }
 
                 if !infra {
                     let record = cog_core::RawRecord {
@@ -1391,6 +1404,10 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
                 header::HeaderName::from_static("x-trace-id"),
                 header::HeaderName::from_static("x-span-id"),
                 header::HeaderName::from_static("x-parent-span-id"),
+                // Without this the WebUI can see the header in devtools but
+                // cannot read it from fetch(), which is the only place a
+                // support report gets its trace id from.
+                header::HeaderName::from_static("traceparent"),
             ])
     }
 }

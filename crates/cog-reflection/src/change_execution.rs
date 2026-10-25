@@ -171,6 +171,7 @@ impl ChangeExecutionWorld {
             base: base.into(),
             world: self.clone(),
             intent,
+            traceparent: None,
         }
     }
 
@@ -201,6 +202,13 @@ pub struct ChangeExecutionRequest {
     /// 这条变更来自哪个入口。
     #[serde(default)]
     pub intent: Option<EvolutionIntent>,
+    /// 派发这一条变更时所在的因果链（W3C `traceparent`）。
+    ///
+    /// 它随请求文件进执行进程，也写进 Job 的注解：前者让构建段的读数落回同一条
+    /// 链，后者让人在集群里 `kubectl get job -o yaml` 就能读出来，不需要任何进程
+    /// 还活着。调用方没带时由派发侧生成——一次派发有两个名字等于这条链断在边界上。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
 }
 
 /// 判词。与执行侧内部的 `ChangeVerdict` 一一对应，只是可序列化。
@@ -293,6 +301,12 @@ pub struct ChangeExecutionOutcome {
     pub test: RunReading,
     #[serde(default)]
     pub build: RunReading,
+    /// 执行进程这一段（构建与验证）在链上的位置：父上下文下的一个新 span。
+    ///
+    /// 回传它而不是回传父上下文，是因为这一侧要能回答「构建那一段是哪一个 span」；
+    /// 只回传 trace id 的话，四段归并时构建段与派发段会挤在同一个 span 上。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
 }
 
 impl ChangeExecutionOutcome {
@@ -314,6 +328,7 @@ impl ChangeExecutionOutcome {
             held_for_approval: false,
             test: RunReading::default(),
             build: RunReading::default(),
+            traceparent: None,
         }
     }
 
@@ -510,6 +525,25 @@ pub fn change_job_name(change_id: &str) -> String {
     }
 }
 
+/// 执行进程这一段的 `traceparent`：父上下文下的一个新 span；没有父上下文时
+/// 生成一整条新链。
+fn build_segment_traceparent(request: &ChangeExecutionRequest) -> Option<String> {
+    let child = match request
+        .traceparent
+        .as_deref()
+        .and_then(cog_core::TraceContext::from_traceparent)
+    {
+        Some(parent) => cog_core::TraceContext {
+            trace_id: parent.trace_id,
+            span_id: uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string(),
+            parent_span_id: Some(parent.span_id),
+            sampled: parent.sampled,
+        },
+        None => cog_core::TraceContext::generate(),
+    };
+    child.to_traceparent()
+}
+
 /// 执行一条变更：建树、应用、验证、提交、构建、暂存，然后把判定写回调用方。
 ///
 /// 这里不做任何策略判断：拒了就是拒了，环境坏了就是坏了，退休与记账留给调用方
@@ -518,6 +552,10 @@ pub async fn execute(request: &ChangeExecutionRequest) -> (i32, ChangeExecutionO
     let change_id = request.change.artifact_id.clone();
     let world = &request.world;
     let mut outcome = ChangeExecutionOutcome::empty(&change_id);
+    // 这一段（验证与构建）在链上的位置。父上下文随请求带来；没有父上下文时也
+    // 要有一个名字——构建段的读数归不回任何一条链，与「这条变更没被构建过」是
+    // 两件事，读的人必须分得开。
+    outcome.traceparent = build_segment_traceparent(request);
 
     // 构建闸门装在本进程里：执行方也是一个构建方，槽位文件在共享文件系统上，与
     // 常驻进程用的是同一个目录。不装的话「宿主同时只跑一个构建」就退化成每个进程
@@ -1032,6 +1070,9 @@ pub struct ChangeJobPlan {
     pub request_path: PathBuf,
     pub outcome_path: PathBuf,
     pub manifest: serde_json::Value,
+    /// 这次派发实际使用的因果 id（调用方带来的或这里生成的），请求文件与 Job
+    /// 注解都写它。
+    pub traceparent: String,
 }
 
 /// 定下一次派发的落点与清单。
@@ -1055,6 +1096,20 @@ pub fn plan_change_job(
                 .into(),
         ));
     }
+
+    // 因果 id：调用方带来的就用它（同一条链上的下一段），没带或带来的是个解析
+    // 不了的形状就此刻生成。解析不了的值不能透传——它会被下游当成一条链去接，
+    // 而那条链上不会有别人。
+    let traceparent = request
+        .traceparent
+        .as_deref()
+        .filter(|tp| cog_core::TraceContext::from_traceparent(tp).is_some())
+        .map(|tp| tp.to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            cog_core::TraceContext::generate()
+                .to_traceparent()
+                .unwrap_or_default()
+        });
 
     let name = change_job_name(&request.change.artifact_id);
     let dir = delivery_dir.join(&name);
@@ -1140,7 +1195,14 @@ pub fn plan_change_job(
     let manifest = serde_json::json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": { "name": name, "namespace": namespace, "labels": labels },
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": labels,
+            // 注解而不是 label：值里带连字符与十六进制串，label 的取值规则会拒掉
+            // 一部分，而这条链宁可存不下也不该被悄悄截断成另一个 id。
+            "annotations": { "cogneva.ai/traceparent": traceparent },
+        },
         "spec": {
             // 0：重试的代价是一次重复的构建与一次重复的提交，而「这条变更要不要再试」
             // 是常驻进程按队列与账本决定的，不是 Job 控制器按次数决定的。
@@ -1157,6 +1219,7 @@ pub fn plan_change_job(
         request_path,
         outcome_path,
         manifest,
+        traceparent,
     })
 }
 
@@ -1460,7 +1523,11 @@ async fn dispatch_fresh_job(
             )));
         }
     }
-    write_json_atomic(&plan.request_path, request)?;
+    // 请求文件里写的必须是 Job 注解上的那一个：两个值各写各的，执行进程读到的
+    // 就是一次派发的第二个名字。
+    let mut request = request.clone();
+    request.traceparent = Some(plan.traceparent.clone());
+    write_json_atomic(&plan.request_path, &request)?;
     let body = serde_json::to_vec_pretty(&plan.manifest)
         .map_err(|e| SFError::IO(format!("serialize job manifest: {e}")))?;
     kubectl_apply_stdin(kubectl, &plan.namespace, &body, &plan.name).await
@@ -2184,6 +2251,57 @@ mod tests {
         assert!(
             plan_change_job(&deployed_request("change-1"), &broken, "cogneva", &facts).is_err()
         );
+    }
+
+    const SENT_TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    #[test]
+    fn one_dispatch_names_one_trace_in_the_job_and_in_the_request() {
+        // 派发侧生成的那个 id 必须同时出现在 Job 注解与请求文件里。注解进集群、
+        // 请求进执行进程，两处各写各的值就是一次派发有两个名字，而构建段的读数
+        // 归到哪一个都只是猜。
+        let plan = plan("change-1");
+        assert_eq!(
+            plan.manifest["metadata"]["annotations"]["cogneva.ai/traceparent"].as_str(),
+            Some(plan.traceparent.as_str())
+        );
+        // 形状要能被子进程接上：解析不了的值等于这条链在边界上断掉。
+        let ctx = cog_core::TraceContext::from_traceparent(&plan.traceparent)
+            .expect("the generated id must be a legal traceparent");
+        assert_eq!(ctx.span_id.len(), 16);
+    }
+
+    #[test]
+    fn a_caller_supplied_trace_is_continued_not_replaced() {
+        // 同一条链上的下一段：调用方带来的 id 要沿用，否则上游那几段与本段
+        // 永远归并不到一起。
+        let facts = parent_pod_facts(&parent_pod(DIGEST), PARENT_CONTAINER).unwrap();
+        let mut request = deployed_request("change-2");
+        request.traceparent = Some(SENT_TRACEPARENT.to_string());
+        let plan =
+            plan_change_job(&request, &ChangeJobConfig::default(), "cogneva", &facts).unwrap();
+        assert_eq!(plan.traceparent, SENT_TRACEPARENT);
+
+        let child = build_segment_traceparent(&request).expect("a child span is minted");
+        let parent = cog_core::TraceContext::from_traceparent(SENT_TRACEPARENT).unwrap();
+        let child = cog_core::TraceContext::from_traceparent(&child).unwrap();
+        assert_eq!(child.trace_id, parent.trace_id);
+        assert_ne!(child.span_id, parent.span_id);
+        // `traceparent` 里没有父 span 这一格，所以回程能证明的是「同一棵树上的
+        // 另一个 span」，不是「谁是谁的子节点」。段的先后由时间给，父子关系由
+        // 派发那一刻的上下文给——两者都不指望这个头。
+    }
+
+    #[test]
+    fn a_malformed_caller_trace_is_replaced_rather_than_forwarded() {
+        // 透传一个解析不了的值，下游会把它当一条链去接，而那条链上不会有别人。
+        let facts = parent_pod_facts(&parent_pod(DIGEST), PARENT_CONTAINER).unwrap();
+        let mut request = deployed_request("change-3");
+        request.traceparent = Some("not-a-traceparent".into());
+        let plan =
+            plan_change_job(&request, &ChangeJobConfig::default(), "cogneva", &facts).unwrap();
+        assert_ne!(plan.traceparent, "not-a-traceparent");
+        assert!(cog_core::TraceContext::from_traceparent(&plan.traceparent).is_some());
     }
 
     #[test]

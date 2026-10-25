@@ -170,6 +170,17 @@ pub struct HierarchicalMessage {
     /// Optional cross-component trace id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// The W3C `traceparent` this message was sent under, verbatim.
+    ///
+    /// `trace_id` alone says which trace a message belongs to but loses the
+    /// span it hung off, so a consumer cannot continue the chain — it can only
+    /// invent a new span under an old trace. Carrying the header itself is
+    /// what lets the receiving agent continue the same chain it was sent in.
+    /// Both fields are written together by [`Self::with_trace`]; a message
+    /// built field by field can carry one without the other, which is why that
+    /// constructor exists rather than callers setting each.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
 }
 
 impl HierarchicalMessage {
@@ -189,6 +200,7 @@ impl HierarchicalMessage {
             payload,
             timestamp: Utc::now(),
             trace_id: None,
+            traceparent: None,
         }
     }
 
@@ -196,6 +208,34 @@ impl HierarchicalMessage {
     pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
         self.trace_id = Some(trace_id.into());
         self
+    }
+
+    /// Attach a full trace context: the bare id and the `traceparent` header
+    /// are written from the same value, so a message cannot claim one trace by
+    /// id and another by header.
+    pub fn with_trace(mut self, ctx: &cog_core::TraceContext) -> Self {
+        self.trace_id = Some(ctx.trace_id.clone());
+        self.traceparent = ctx.to_traceparent();
+        self
+    }
+
+    /// Read the sending context back.
+    ///
+    /// `traceparent` is authoritative when present; the bare id is the fallback
+    /// for messages published before this field existed, and yields a context
+    /// with no span — enough to group events under one trace, not enough to
+    /// continue the chain. That difference is the reason both are checked here
+    /// rather than at each consumer.
+    pub fn trace_context(&self) -> Option<cog_core::TraceContext> {
+        if let Some(tp) = self.traceparent.as_deref() {
+            if let Some(ctx) = cog_core::TraceContext::from_traceparent(tp) {
+                return Some(ctx);
+            }
+        }
+        self.trace_id.as_deref().map(|id| {
+            let span = uuid::Uuid::new_v4().to_string().replace('-', "");
+            cog_core::TraceContext::new(id.to_string(), span[..16].to_string())
+        })
     }
 }
 
@@ -214,6 +254,11 @@ pub struct InterSquadMessage {
     pub timestamp: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// The `traceparent` this envelope was published under; see
+    /// [`HierarchicalMessage::traceparent`] for why the header travels
+    /// alongside the bare id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
 }
 
 impl InterSquadMessage {
@@ -233,6 +278,7 @@ impl InterSquadMessage {
             payload,
             timestamp: Utc::now(),
             trace_id: None,
+            traceparent: None,
         }
     }
 
@@ -251,7 +297,29 @@ impl InterSquadMessage {
             payload,
             timestamp: Utc::now(),
             trace_id: None,
+            traceparent: None,
         }
+    }
+
+    /// Attach a full trace context (id and header written from one value).
+    pub fn with_trace(mut self, ctx: &cog_core::TraceContext) -> Self {
+        self.trace_id = Some(ctx.trace_id.clone());
+        self.traceparent = ctx.to_traceparent();
+        self
+    }
+
+    /// Read the publishing context back; `traceparent` wins, the bare id is
+    /// the pre-existing fallback. See [`HierarchicalMessage::trace_context`].
+    pub fn trace_context(&self) -> Option<cog_core::TraceContext> {
+        if let Some(tp) = self.traceparent.as_deref() {
+            if let Some(ctx) = cog_core::TraceContext::from_traceparent(tp) {
+                return Some(ctx);
+            }
+        }
+        self.trace_id.as_deref().map(|id| {
+            let span = uuid::Uuid::new_v4().to_string().replace('-', "");
+            cog_core::TraceContext::new(id.to_string(), span[..16].to_string())
+        })
     }
 }
 
@@ -722,6 +790,52 @@ mod tests {
         assert_eq!(msg.sender_id, "supervisor");
         assert_eq!(msg.scope, BroadcastScope::Global);
         assert_eq!(msg.trace_id.as_deref(), Some("trace-xyz"));
+    }
+
+    #[test]
+    fn a_message_carries_the_trace_it_was_sent_under_across_the_wire() {
+        // The bus is the boundary where a chain is most likely to be lost: the
+        // sender has a context, the receiver has only bytes. Serialising the
+        // message and reading it back must give the receiver the sender's span,
+        // not merely its trace id — with only the id it can group events but
+        // cannot continue the chain.
+        let ctx = cog_core::TraceContext::generate();
+        let msg = HierarchicalMessage::new(
+            "msg-1",
+            BroadcastScope::Global,
+            "task_start",
+            "squad:task-1:0",
+            serde_json::json!({}),
+        )
+        .with_trace(&ctx);
+        assert_eq!(msg.trace_id.as_deref(), Some(ctx.trace_id.as_str()));
+        assert!(msg.traceparent.is_some());
+
+        let wire = serde_json::to_string(&msg).unwrap();
+        let got: HierarchicalMessage = serde_json::from_str(&wire).unwrap();
+        let back = got
+            .trace_context()
+            .expect("the receiver must recover a context");
+        assert_eq!(back.trace_id, ctx.trace_id);
+        assert_eq!(back.span_id, ctx.span_id);
+
+        // The pre-existing shape — a bare id and no header — still yields a
+        // context, so old messages keep grouping under their trace.
+        let legacy = HierarchicalMessage::new(
+            "msg-2",
+            BroadcastScope::Global,
+            "task_start",
+            "squad:task-1:0",
+            serde_json::json!({}),
+        )
+        .with_trace_id("trace-legacy");
+        let legacy_wire = serde_json::to_string(&legacy).unwrap();
+        assert!(!legacy_wire.contains("traceparent"));
+        let got: HierarchicalMessage = serde_json::from_str(&legacy_wire).unwrap();
+        assert_eq!(
+            got.trace_context().map(|c| c.trace_id),
+            Some("trace-legacy".to_string())
+        );
     }
 
     #[test]

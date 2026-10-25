@@ -113,7 +113,7 @@ pub fn start_span(name: impl Into<String>, ctx: &TraceContext) -> OtlpSpan {
     OtlpSpan {
         name: name.into(),
         trace_id: ctx.trace_id.clone(),
-        span_id: uuid::Uuid::new_v4().to_string().replace("-", ""),
+        span_id: uuid::Uuid::new_v4().to_string().replace("-", "")[..16].to_string(),
         parent_span_id: Some(ctx.span_id.clone()),
         attributes: HashMap::new(),
     }
@@ -454,7 +454,7 @@ pub fn init_tracer(
 pub fn child_context(parent: &TraceContext) -> TraceContext {
     TraceContext {
         trace_id: parent.trace_id.clone(),
-        span_id: uuid::Uuid::new_v4().to_string().replace("-", ""),
+        span_id: uuid::Uuid::new_v4().to_string().replace("-", "")[..16].to_string(),
         parent_span_id: Some(parent.span_id.clone()),
         sampled: parent.sampled,
     }
