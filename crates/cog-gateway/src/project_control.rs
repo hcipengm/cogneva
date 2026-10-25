@@ -158,32 +158,34 @@ async fn breaches_this_pass(state: &Arc<GatewayState>) -> (Vec<BreachReport>, Ve
     };
     let tasks = state.orchestrator.get_all_tasks().await;
     // 一轮问一次账，不是每个项目问一次：账里已经有 task_id，按项目切是本地的事。
-    let spends = spends_of(state, &tasks).await;
-    if spends.is_none() {
-        return (
-            breaches_of(&tasks, &plans, None, Utc::now()),
-            vec![Blind::CostUnreadable],
-        );
+    match spends_of(state.llm_usage.as_ref(), &tasks).await {
+        Ok(spends) => (
+            breaches_of(&tasks, &plans, Some(&spends), Utc::now()),
+            Vec::new(),
+        ),
+        Err(blind) => (breaches_of(&tasks, &plans, None, Utc::now()), vec![blind]),
     }
-    (
-        breaches_of(&tasks, &plans, spends.as_ref(), Utc::now()),
-        Vec::new(),
-    )
 }
 
-/// 一轮的全部花销，按 task_id 聚合。账读不到时 `None`——与「一条都没花过」同形，
-/// 而成本绩效会因此量不出来。那正是实话。
-async fn spends_of(state: &Arc<GatewayState>, tasks: &[Task]) -> Option<BTreeMap<String, u64>> {
-    let Some(store) = state.llm_usage.as_ref() else {
+/// 一轮的全部花销，按 task_id 聚合。
+///
+/// 两种量不成要分开报：进程里根本没有账，与账在但这一下读不出来。它们的修法不同
+/// （前一个是装配，后一个是存储），而读数上合成一格会让第二种盖住第一种——「没接
+/// 账」是这个进程永久的状态，恰恰需要一眼看见。
+async fn spends_of(
+    ledger: Option<&Arc<cog_observability::usage_store::LlmUsageStore>>,
+    tasks: &[Task],
+) -> Result<BTreeMap<String, u64>, Blind> {
+    let Some(store) = ledger else {
         warn!("project control: no token ledger in this process; cost is never measured");
-        return None;
+        return Err(Blind::NoLedger);
     };
     let ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
     match store.spend_by_task(&ids).await {
-        Ok(rows) => Some(rows.into_iter().collect()),
+        Ok(rows) => Ok(rows.into_iter().collect()),
         Err(e) => {
             warn!(error = %e, "project control: task spend is not readable from the ledger");
-            None
+            Err(Blind::CostUnreadable)
         }
     }
 }
@@ -201,10 +203,23 @@ pub enum Outcome {
     /// 越界变成了一条图上的活。
     Minted = 0,
     /// 这一版基线已经有一条还在跑的，等它。
+    ///
+    /// 它的斜率不是故障：一条越界在它那条重规划走完之前，每一轮都会在这里加一，
+    /// 所以一块停滞的项目每 600 秒稳定贡献一条。按「非零」给它定红会天天响——这是
+    /// 回路正常工作的样子。
     AlreadyOpen = 1,
-    /// 这一版基线的那一条已经走完了：它的结论去读，不再造。
+    /// 图里已经有一条同 id 的行，而它已经走完：结论去读它，不再造。
+    ///
+    /// 只剩一条路能到这里：造任务那一侧算出的 id 与图里某一行相同、那一行已终态，
+    /// 于是入图被当重复行跳过。基线版本上的去重是它之前的一道门，走到这里说明这一
+    /// 行的 id 不是从当前版本算出来的，读它自己的状态比猜它的来历可靠。
     AlreadyClosed = 2,
     /// 生成处拒绝了，判词在日志里。
+    ///
+    /// **只能当存在性读，不能当斜率读**：拒绝的理由有六种，其中「这一版已经试满三
+    /// 次」是终局——一条越界一旦走到那里，它此后每一轮都贡献一条拒绝。`rate()` 上
+    /// 它是一条常开的线，任何按斜率定的阈值都会恒红。理由要分得开，得让造任务那一
+    /// 侧把闭集理由交出来，目前它交的是一段给人读的句子。
     Refused = 3,
     /// 交给造任务那一侧时整体失败：这一轮什么都没落定。
     DispatchFailed = 4,
@@ -795,6 +810,20 @@ mod tests {
             Some(1)
         );
         assert_eq!(Blind::NoLedger.label(), "no_ledger");
+    }
+
+    /// 「这个进程没接账」这一格必须由**真实的那条路**产生，不是由测试自己写进去。
+    ///
+    /// 合成一格「成本读不到」时，这一格恒零：装配错了的部署看起来与账读坏了的一模
+    /// 一样，而这正是它唯一该说话的时刻。
+    #[tokio::test]
+    async fn a_process_with_no_ledger_says_which_of_the_two_failures_it_hit() {
+        let tasks = vec![task("t1", "p", TaskStatus::Completed)];
+        assert_eq!(
+            spends_of(None, &tasks).await.unwrap_err(),
+            Blind::NoLedger,
+            "no ledger in this process is its own reading, not an unreadable one"
+        );
     }
 
     /// 一个只记下被问了什么的造任务侧。
