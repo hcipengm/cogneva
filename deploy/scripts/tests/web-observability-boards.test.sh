@@ -42,11 +42,13 @@ import { EventsBoard } from '@/observability/EventsBoard';
 import { LogsBoard } from '@/observability/LogsBoard';
 import { MetricsBoard } from '@/observability/MetricsBoard';
 import { ProbesBoard } from '@/observability/ProbesBoard';
+import { ReadingsBoard } from '@/observability/ReadingsBoard';
 import { TracesBoard } from '@/observability/TracesBoard';
 import { ClusterTopology } from '@/topology/ClusterTopology';
 
 const BOARDS = [
   { id: 'overview' },
+  { id: 'readings' },
   { id: 'topology' },
   { id: 'metrics' },
   { id: 'logs' },
@@ -60,6 +62,7 @@ export function ObservabilityView() {
   return (
     <div>
       {board === 'overview' && <OverviewBoard />}
+      {board === 'readings' && <ReadingsBoard />}
       {board === 'topology' && <ClusterTopology />}
       {board === 'metrics' && <MetricsBoard />}
       {board === 'logs' && <LogsBoard />}
@@ -121,6 +124,30 @@ export function ProbesBoard() {
   return <span>{getBackendHealth.name}</span>;
 }
 EOF
+  cat >"${work}/web/src/observability/ReadingsBoard.tsx" <<'EOF'
+import { getObservabilityReadings } from '@/api/client';
+import { deepLink } from '@/observability/deepLink';
+export function ReadingsBoard() {
+  const readings = getObservabilityReadings();
+  return (
+    <ul>
+      {readings.map((r) => (
+        <li key={r.id}>
+          {r.title} {r.value ?? '无读数'} 产出方：{r.produced_by}
+          {r.unavailable_because && <span>{r.unavailable_because}</span>}
+          {deepLink(r.dashboard_uid).href ?? deepLink(r.dashboard_uid).why}
+        </li>
+      ))}
+    </ul>
+  );
+}
+EOF
+  cat >"${work}/web/src/observability/deepLink.ts" <<'EOF'
+export function deepLink(uid: string | null) {
+  if (!uid) return { href: null, why: '这条读数没有对应的面板' };
+  return { href: `/d/${uid}`, why: null };
+}
+EOF
   cat >"${work}/web/src/api/client.ts" <<'EOF'
 export async function getClusterOverview() { return fetch('/api/v1/cluster/overview'); }
 export async function getClusterTopology() { return fetch('/api/v1/cluster/topology'); }
@@ -129,6 +156,7 @@ export async function listRawLogs() { return fetch('/api/v1/raw_logs'); }
 export async function listTraces() { return fetch('/api/v1/traces'); }
 export async function listEvents() { return fetch('/api/v1/events'); }
 export async function getBackendHealth() { return fetch('/api/v1/health/backends'); }
+export async function getObservabilityReadings() { return fetch('/api/v1/observability/readings'); }
 EOF
 }
 
@@ -267,6 +295,32 @@ sed -i "s#from '@/observability/ProbesBoard'#from '@/observability/LogsBoard'#" 
   "${work}/web/src/views/ObservabilityView.tsx"
 confirm "${work}/web/src/views/ObservabilityView.tsx" "import { ProbesBoard } from '@/observability/LogsBoard'"
 expect_red "板不可达" "ProbesBoard.tsx: 从 main.tsx 不可达"
+
+# 12. 读数板不注明来源。
+fixture
+sed -i 's/产出方：{r.produced_by}//' "${work}/web/src/observability/ReadingsBoard.tsx"
+if grep -q "produced_by" "${work}/web/src/observability/ReadingsBoard.tsx"; then fail "来源没被剪掉"; fi
+expect_red "读数不注明来源" "没有把 series/produced_by 显示出来"
+
+# 13. 深链自己拼地址，不经 deepLink。
+fixture
+python3 - "${work}/web/src/observability/ReadingsBoard.tsx" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+src = src.replace("{deepLink(r.dashboard_uid).href ?? deepLink(r.dashboard_uid).why}",
+                  "{`/d/${r.dashboard_uid}`}")
+src = src.replace("import { deepLink } from '@/observability/deepLink';\n", "")
+open(path, "w", encoding="utf-8").write(src)
+PY
+if grep -q "deepLink" "${work}/web/src/observability/ReadingsBoard.tsx"; then fail "deepLink 没被剪掉"; fi
+expect_red "深链自己拼" "深链不是经 deepLink 拼的"
+
+# 14. 拼不出链接时不给原因。
+fixture
+sed -i "s/why:/reason:/g" "${work}/web/src/observability/deepLink.ts"
+if grep -q "why" "${work}/web/src/observability/deepLink.ts"; then fail "why 没被剪掉"; fi
+expect_red "深链不说原因" "拼不出链接时没有给出原因"
 
 # 真树：今天必须绿。
 got=0
