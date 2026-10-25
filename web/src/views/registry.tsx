@@ -11,6 +11,7 @@ import { FlowView } from '@/views/FlowView';
 import { GovernanceView } from '@/views/GovernanceView';
 import { InboxView } from '@/views/InboxView';
 import { ObservabilityView } from '@/views/ObservabilityView';
+import { ProjectsView } from '@/views/ProjectsView';
 import { ResourcesView } from '@/views/ResourcesView';
 import { SettingsView } from '@/views/SettingsView';
 import { SourceControlView } from '@/views/SourceControlView';
@@ -46,6 +47,8 @@ export function ViewFor({ view }: { view: string }) {
       return <AlertsView />;
     case 'tasks':
       return <TasksView />;
+    case 'projects':
+      return <ProjectsView />;
     case 'flow':
       return <FlowView />;
     case 'comms':

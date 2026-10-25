@@ -51,6 +51,7 @@ const TITLES: Record<ActivityId, string> = {
   inbox: '收件箱',
   agents: '智能体',
   tasks: '任务',
+  projects: '项目',
   flow: '流程',
   comms: '通信',
   alerts: '告警',
@@ -292,6 +293,28 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
         </>
       );
     }
+
+    case 'projects':
+      return (
+        <>
+          <Section title="四个视图读同一张图">
+            <Row label="范围" note="按 parent_task_id 拼树；父在图外的行会被标出来" />
+            <Row label="看板" note="六个状态各堆多少；上限没配就写没配" />
+            <Row label="甘特" note="画的是实际起止；计划基线还没有出处" />
+            <Row label="挣值" note="还没接入，接通前不给数字" />
+          </Section>
+          <Note>
+            一个项目就是一个 goal 根连同它的后代。没有 goal_id 的任务落在「未分组」这个具名桶里，
+            不是被丢掉——丢掉会让所有项目加起来小于总数。
+          </Note>
+          <CrossLinks
+            links={[
+              { id: 'tasks', label: '任务', note: '逐条看状态与依赖' },
+              { id: 'flow', label: '流程', note: '一次意图被拆成了哪几块' },
+            ]}
+          />
+        </>
+      );
 
     case 'tasks':
       return (

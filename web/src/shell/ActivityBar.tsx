@@ -15,6 +15,7 @@ const ITEMS: { id: ActivityId; label: string; icon: IconName }[] = [
   { id: 'inbox', label: '收件箱', icon: 'inbox' },
   { id: 'alerts', label: '告警', icon: 'alerts' },
   { id: 'tasks', label: '任务', icon: 'tasks' },
+  { id: 'projects', label: '项目', icon: 'projects' },
   { id: 'flow', label: '流程', icon: 'flow' },
   { id: 'comms', label: '通信', icon: 'comms' },
   { id: 'agents', label: '智能体', icon: 'agents' },

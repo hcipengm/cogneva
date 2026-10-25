@@ -840,6 +840,90 @@ export async function getTaskGraph(
   return api.get<TaskGraph>(`/api/v1/tasks/graph${suffix}`);
 }
 
+/** 一份读数从哪来：读的哪张表、哪个读者、哪一刻读的。 */
+export interface ReadingSource {
+  table: string;
+  reader: string;
+  read_at: string;
+}
+
+export interface ProjectStatusCount {
+  status: string;
+  count: number;
+}
+
+export interface ProjectRow {
+  id: string;
+  /** `goal` 或 `ungrouped`。后者是没有 goal 的任务的具名桶，不是一个真项目。 */
+  kind: 'goal' | 'ungrouped';
+  tasks: number;
+  /** 可被调度的任务数。与 `tasks` 的差是只做层级与查询的占位行。 */
+  executables: number;
+  by_status: ProjectStatusCount[];
+  blocked: number;
+  first_created_at: string | null;
+  last_updated_at: string | null;
+  /** 有没有计划基线。基线表还没落地，今天是恒 false——读作「排期这一件还读不到」。 */
+  planned: boolean;
+}
+
+export interface ProjectsReading {
+  projects: ProjectRow[];
+  total_tasks: number;
+  source: ReadingSource;
+}
+
+/** 项目清单：任务图按 goal 根折出来的行。 */
+export async function getProjects(): Promise<ProjectsReading> {
+  return api.get<ProjectsReading>('/api/v1/projects');
+}
+
+export interface BoardColumn {
+  status: string;
+  count: number;
+  /**
+   * 这一列的通行上限。`null` 是「没配」，不是「不限」也不是「没超」——界面必须
+   * 把这三件事分开写，否则一个不拦派发的列会看起来像在拦。
+   */
+  wip_limit: number | null;
+  over_limit: boolean | null;
+}
+
+export interface ProjectBoardReading {
+  project_id: string;
+  columns: BoardColumn[];
+  total: number;
+  source: ReadingSource;
+}
+
+export async function getProjectBoard(id: string): Promise<ProjectBoardReading> {
+  return api.get<ProjectBoardReading>(`/api/v1/projects/${encodeURIComponent(id)}/board`);
+}
+
+export interface GanttRow {
+  id: string;
+  title: string;
+  status: string;
+  created_at: string;
+  started_at: string | null;
+  updated_at: string;
+  /** 计划基线。两头都是 `null` 时 `unplanned` 为真，不许画成零长度条。 */
+  planned_start: string | null;
+  planned_end: string | null;
+  unplanned: boolean;
+}
+
+export interface ProjectGanttReading {
+  project_id: string;
+  has_plan: boolean;
+  rows: GanttRow[];
+  source: ReadingSource;
+}
+
+export async function getProjectGantt(id: string): Promise<ProjectGanttReading> {
+  return api.get<ProjectGanttReading>(`/api/v1/projects/${encodeURIComponent(id)}/gantt`);
+}
+
 /**
  * 任务行。过滤条件只有服务端认的三个：`goal_id`、`agent_id`、`status`。
  *

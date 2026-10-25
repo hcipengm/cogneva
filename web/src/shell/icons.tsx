@@ -15,6 +15,12 @@ const PATHS: Record<string, string[]> = {
     'M9 3v3.5M15 3v3.5M9 17.5V21M15 17.5V21M3 9h3.5M3 15h3.5M17.5 9H21M17.5 15H21',
   ],
   tasks: ['M11 7h9M11 12h9M11 17h9', 'M4 7l1.6 1.6L8.7 5.5', 'M4 17l1.6 1.6L8.7 15.5'],
+  projects: [
+    'M9.5 4.5h5v3.5h-5z',
+    'M3.5 16h5v3.5h-5z',
+    'M15.5 16h5v3.5h-5z',
+    'M12 8v4M6 16v-4h12v4',
+  ],
   alerts: ['M12 4a5 5 0 0 0-5 5v4l-1.5 3h13L17 13V9a5 5 0 0 0-5-5z', 'M10 19a2 2 0 0 0 4 0'],
   changes: [
     'M6.5 8v8',

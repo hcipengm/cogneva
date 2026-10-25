@@ -59,6 +59,7 @@ pub mod observability;
 pub mod observable;
 pub mod plugin;
 pub mod processes;
+pub mod projects;
 pub mod prometheus_render;
 pub mod promotion_gate;
 pub mod raw_logs;
@@ -926,6 +927,17 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/tasks/ready", get(tasks::get_ready_tasks_handler))
         .route("/api/v1/tasks/status", get(tasks::task_summary_handler))
         .route("/api/v1/tasks/graph", get(tasks::get_task_graph_handler))
+        // 项目面：任务图按 goal 根折成项目后的三个读面。它们不建第二张表，
+        // 读到的是同一个任务图；分开成三个端点是因为读者要回答的问题不同。
+        .route("/api/v1/projects", get(projects::list_projects_handler))
+        .route(
+            "/api/v1/projects/{id}/board",
+            get(projects::project_board_handler),
+        )
+        .route(
+            "/api/v1/projects/{id}/gantt",
+            get(projects::project_gantt_handler),
+        )
         .route(
             "/api/v1/processes",
             get(processes::process_overview_handler),

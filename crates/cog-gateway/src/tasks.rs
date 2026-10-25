@@ -383,7 +383,7 @@ fn matches_query(query: &TaskQuery, task: &Task) -> bool {
 /// with no workspace is one submitted before the field was recorded -- hiding
 /// those would make them disappear from every scoped reader without making
 /// them safer, since no workspace owns them.
-fn visible_to_claims(claims: Option<&cog_core::Claims>, task: &Task) -> bool {
+pub(crate) fn visible_to_claims(claims: Option<&cog_core::Claims>, task: &Task) -> bool {
     let Some(claims) = claims else { return true };
     if claims.workspace_ids.is_empty() {
         return true;
