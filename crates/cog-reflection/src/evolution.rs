@@ -1624,3 +1624,142 @@ mod agent_default_exemption_carries_its_own_witness {
         })
     }
 }
+
+#[cfg(test)]
+mod a_declarations_identity_is_its_scope_and_prose_cannot_widen_it {
+    //! principle: feedback_a_declarations_identity_is_its_scope_and_prose_cannot_widen_it
+    //!
+    //! A change declaration's identity is its `kind`, its `scope` and its
+    //! `literal`, and nothing else. The judge that answers for `kind = grep`
+    //! walks the files under `scope` and matches `literal`; the declaration's
+    //! trailing description column is prose a person reads, and no sentence in
+    //! it -- however wide the surfaces it names -- adds a file to the set the
+    //! grep matched. This is the gate that rule is owed: it runs the
+    //! declaration as written, a grep over `crates/` for this principle's own
+    //! literal in this tree at one revision, and asserts the match set is
+    //! exactly what kind, scope and literal produce.
+
+    use std::path::{Path, PathBuf};
+
+    /// The declaration's literal column, as the intake wrote it.
+    const LITERAL: &str = "feedback_a_declarations_identity_is_its_scope_and_prose_cannot_widen_it";
+
+    /// The declaration's scope column: the judge walks this root and no other.
+    const SCOPE: &str = "crates";
+
+    #[test]
+    fn the_greps_match_set_is_what_kind_scope_and_literal_produce() {
+        let scope_root =
+            std::fs::canonicalize(concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates"))
+                .unwrap_or_else(|e| panic!("the declared scope `{SCOPE}` must resolve: {e}"));
+        let mut files = Vec::new();
+        collect_rust_files(&scope_root, &mut files);
+        assert!(
+            !files.is_empty(),
+            "{} must hold the sources this gate greps",
+            scope_root.display()
+        );
+
+        // The judge's whole reading of the declaration: the files under the
+        // scope whose text carries the literal. Nothing below this line reads
+        // the declaration's prose, which is the point the gate exists to pin.
+        let mut hits = Vec::new();
+        for file in &files {
+            let text =
+                std::fs::read_to_string(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+            for (lineno, line) in text.lines().enumerate() {
+                if line.contains(LITERAL) {
+                    hits.push((file.clone(), lineno + 1, line.trim().to_string()));
+                }
+            }
+        }
+
+        // Every hit stays inside the declared scope by construction of the
+        // walk; assert it anyway, because the declaration's description column
+        // names surfaces outside `crates/` and prose cannot widen the scope.
+        for (file, _, _) in &hits {
+            assert!(
+                file.starts_with(&scope_root),
+                "{} matched the literal while lying outside the declared scope `{SCOPE}`",
+                file.display()
+            );
+        }
+
+        // The literal's only carrier under the scope is this gate: its header
+        // declaration and its own references. A second carrier would be part
+        // of the declaration's match set that this gate answers for nowhere.
+        let this_file = scope_root.join("cog-reflection/src/evolution.rs");
+        let mut outside: Vec<String> = hits
+            .iter()
+            .filter(|(file, _, _)| file != &this_file)
+            .map(|(file, lineno, _)| format!("{}:{lineno}", file.display()))
+            .collect();
+        outside.sort();
+        assert!(
+            outside.is_empty(),
+            "literal matched outside the gate that carries it; kind + scope + literal is the \
+             whole identity, so these carriers are the declaration's and this gate answers for \
+             none of them:\n{}",
+            outside.join("\n")
+        );
+
+        // The carrying declaration is itself among the hits: a gate whose own
+        // header the grep cannot find answers for a different literal.
+        let declared = hits.iter().any(|(file, _, line)| {
+            file == &this_file && line.starts_with("//! principle:") && line.contains(LITERAL)
+        });
+        assert!(
+            declared,
+            "no `//! principle: {LITERAL}` line matched in {}: a gate whose own header the grep \
+             cannot find answers for a different literal",
+            this_file.display()
+        );
+    }
+
+    /// The kind column means what the vocabulary says, not what prose says:
+    /// `grep` is a judgeable presence kind in `change-kinds.tsv`, so carrying
+    /// it asks for a grep over the scope whatever the description column adds.
+    #[test]
+    fn the_kind_column_means_what_the_vocabulary_says() {
+        let vocabulary =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../cogneva/contracts/change-kinds.tsv");
+        let text = std::fs::read_to_string(&vocabulary)
+            .unwrap_or_else(|e| panic!("{}: {e}", vocabulary.display()));
+        let mut found = None;
+        for line in text.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.first() == Some(&"grep") {
+                found = Some((
+                    cols.get(1).copied().unwrap_or(""),
+                    cols.get(2).copied().unwrap_or(""),
+                ));
+                break;
+            }
+        }
+        let (direction, state) = found.unwrap_or_else(|| {
+            panic!(
+                "{} holds no row for `grep`, the kind this declaration carries",
+                vocabulary.display()
+            )
+        });
+        assert_eq!(
+            (direction, state),
+            ("present", "judgeable"),
+            "kind `grep` no longer names a presence grep a new declaration may carry"
+        );
+    }
+
+    fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rust_files(&path, out);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+}
