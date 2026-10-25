@@ -61,3 +61,35 @@ roleRef:
   kind: Role
   name: cogneva-gitops-puller
   apiGroup: rbac.authorization.k8s.io
+---
+# 拓扑面的节点读权限：集群作用域，因为节点不属于任何命名空间。
+# 这一面要读的是节点的就绪条件、角色标签与可分配量（status.allocatable）；
+# Pod 一层仍由上面那条命名空间 Role 授权，不跟着扩到集群作用域。
+# 只要 get 与 list：拓扑按轮询读，不 watch，也没有任何写。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cogneva-topology-reader
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: gateway
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cogneva-topology-reader
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: gateway
+subjects:
+  - kind: ServiceAccount
+    name: cogneva
+    namespace: cogneva
+roleRef:
+  kind: ClusterRole
+  name: cogneva-topology-reader
+  apiGroup: rbac.authorization.k8s.io

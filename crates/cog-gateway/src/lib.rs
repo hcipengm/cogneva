@@ -919,6 +919,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/cluster/components",
             get(cluster::cluster_components_handler),
         )
+        // 拓扑：集群 → 节点 → Pod → 容器。与 components 分开是因为两者的读者不同：
+        // 那张卡片答「三个进程活着吗」，这一面答「东西跑在哪、那台机器还剩多少」。
+        .route(
+            "/api/v1/cluster/topology",
+            get(cluster::cluster_topology_handler),
+        )
         .route(
             "/api/v1/tasks/{id}/dependents",
             get(tasks::get_task_dependents_handler),

@@ -704,6 +704,35 @@ mod tests {
             }
             Ok(self.turns.lock().await.clone())
         }
+
+        /// 读回整段会话（含失败轮），按时间正序截取最后 `limit` 条。
+        ///
+        /// 与 `history` 的差别只在「失败轮算不算」：上下文里不放它们，屏幕上要放。
+        async fn transcript(
+            &self,
+            _session_id: &str,
+            limit: usize,
+        ) -> cog_core::SFResult<Vec<cog_storage::ChatTurnRecord>> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(cog_core::SFError::Database("unreachable".into()));
+            }
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let turns = self.turns.lock().await;
+            let start = turns.len().saturating_sub(limit);
+            Ok(turns[start..]
+                .iter()
+                .enumerate()
+                .map(|(offset, turn)| cog_storage::ChatTurnRecord {
+                    id: (start + offset) as i64 + 1,
+                    role: turn.role,
+                    content: turn.content.clone(),
+                    failure: None,
+                    created_at: chrono::Utc::now(),
+                })
+                .collect())
+        }
     }
 
     #[test]

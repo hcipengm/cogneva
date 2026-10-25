@@ -61,8 +61,8 @@ pub use mem::{
 
 #[cfg(feature = "postgres")]
 pub use postgres::{
-    sha256_of, AgentMessage, AgentMessageStore, ChatTurn, ChatTurnRole, ChatTurnStore,
-    DatasetCatalog, DatasetEntry, HookArchiveRow, NewAgentMessage, NewDataset,
+    sha256_of, AgentMessage, AgentMessageStore, ChatTurn, ChatTurnRecord, ChatTurnRole,
+    ChatTurnStore, DatasetCatalog, DatasetEntry, HookArchiveRow, NewAgentMessage, NewDataset,
     PostgresAgentMessageStore, PostgresAuditRecorder, PostgresBackupRunStore,
     PostgresChangeLedgerStore, PostgresChatTurnStore, PostgresDatasetCatalog,
     PostgresDecisionStatsStore, PostgresGovernanceStore, PostgresHookArchive,

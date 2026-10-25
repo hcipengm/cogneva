@@ -26,7 +26,8 @@ pub use audit_recorder::PostgresAuditRecorder;
 pub use backup_run_store::PostgresBackupRunStore;
 pub use change_ledger_store::PostgresChangeLedgerStore;
 pub use chat_turn_store::{
-    ChatTurn, ChatTurnRole, ChatTurnStore, PostgresChatTurnStore, ROWS_KEPT_PER_SESSION,
+    ChatTurn, ChatTurnRecord, ChatTurnRole, ChatTurnStore, PostgresChatTurnStore,
+    ROWS_KEPT_PER_SESSION,
 };
 pub use dataset_catalog::{
     sha256_of, DatasetCatalog, DatasetEntry, NewDataset, PostgresDatasetCatalog,
