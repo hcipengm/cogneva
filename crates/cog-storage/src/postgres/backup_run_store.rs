@@ -181,9 +181,10 @@ INSERT INTO backup_drills ( \
     generated_columns_recomputed, artifacts_expected, artifacts_restored, \
     artifact_readings, artifact_errors, offsite_observed_at, offsite_remote_newest_at, offsite_key_created_at, \
     segment_skew_seconds, segment_skew_bound_seconds, offsite_missing_packages, \
-    credential_violations_backup_pvc, credential_violations_offsite, credential_violations_state_dir \
+    credential_violations_backup_pvc, credential_violations_offsite, credential_violations_state_dir, \
+    tables_without_a_home \
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31) \
+          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32) \
 ON CONFLICT (drill_id) DO NOTHING";
 
 /// The newest drill, failed or not.
@@ -199,7 +200,8 @@ SELECT drill_id, started_at, finished_at, outcome, package, package_written_at, 
        generated_columns_recomputed, artifacts_expected, artifacts_restored, \
        artifact_readings, artifact_errors, offsite_observed_at, offsite_remote_newest_at, offsite_key_created_at, \
        segment_skew_seconds, segment_skew_bound_seconds, offsite_missing_packages, \
-       credential_violations_backup_pvc, credential_violations_offsite, credential_violations_state_dir \
+       credential_violations_backup_pvc, credential_violations_offsite, credential_violations_state_dir, \
+       tables_without_a_home \
 FROM backup_drills \
 ORDER BY finished_at DESC, drill_id DESC \
 LIMIT 1";
@@ -424,6 +426,7 @@ impl BackupRunStore for PostgresBackupRunStore {
             .bind(drill.credential_violations_backup_pvc)
             .bind(drill.credential_violations_offsite)
             .bind(drill.credential_violations_state_dir)
+            .bind(&drill.tables_without_a_home)
             .execute(&self.pool)
             .await
             .map_err(|e| {
@@ -492,6 +495,9 @@ impl BackupRunStore for PostgresBackupRunStore {
             generated_columns_recomputed: row.try_get("generated_columns_recomputed").map_err(
                 |e| SFError::Database(format!("drill generated_columns_recomputed: {e}")),
             )?,
+            tables_without_a_home: row
+                .try_get("tables_without_a_home")
+                .map_err(|e| SFError::Database(format!("drill tables_without_a_home: {e}")))?,
             artifacts_expected: row
                 .try_get("artifacts_expected")
                 .map_err(|e| SFError::Database(format!("drill artifacts_expected: {e}")))?,

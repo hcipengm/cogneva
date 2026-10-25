@@ -297,6 +297,62 @@ async fn pg_restore_loads_a_package_that_still_carries_the_generated_column() {
         .unwrap();
 }
 
+/// 一次删表的迁移之后，旧包点出了一张今天的结构里已经不存在的表。
+///
+/// 现场：`085_drop_tables_no_code_names` 删掉了 `agent_performance`，而保留窗口里
+/// 有它之前写出的包。恢复按包里的 CSV 逐表 TRUNCATE，第一句就撞上「关系不存在」，
+/// 整个包被判不可恢复——那张表的数据早已没有任何读者，代价却是同一个包里其余
+/// 66 张表也一并退回去。这条路径必须跳过它并把名字带回去：静默跳过会让装回来的
+/// 表数与行数与清单完全一致，读起来像一份完整的恢复。
+#[tokio::test]
+#[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
+async fn pg_restore_skips_a_table_the_schema_no_longer_has_and_names_it() {
+    const KEPT: &str = "backup_probe_kept";
+    let (pool, _url) = own_database("gone").await;
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {KEPT} CASCADE"),
+        format!("CREATE TABLE {KEPT} (id BIGSERIAL PRIMARY KEY, label TEXT NOT NULL)"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let pg_dir = dir.path().join("pg");
+    std::fs::create_dir_all(&pg_dir).unwrap();
+    std::fs::write(
+        pg_dir.join(format!("public.{KEPT}.csv")),
+        "id,label\n1,alpha\n2,beta\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pg_dir.join("public.agent_performance.csv"),
+        "id,agent_id\n1,a\n",
+    )
+    .unwrap();
+
+    let restored = restore_postgres(&pool, &pg_dir).await.unwrap();
+    assert_eq!(
+        restored.tables,
+        vec![KEPT.to_string()],
+        "装回去的只有目标结构还记得的那张表"
+    );
+    assert_eq!(
+        restored.tables_without_a_home,
+        vec!["agent_performance".to_string()],
+        "被跳过的表必须点名：不点名，这份包读起来与完整恢复一模一样"
+    );
+    assert_eq!(
+        count_in(&pool, KEPT).await,
+        2,
+        "跳掉一张表不能连累同一个包里其余的表的行"
+    );
+
+    sqlx::query(&format!("DROP TABLE IF EXISTS {KEPT} CASCADE"))
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 /// 用保留窗口里**真实存在**的一份包验收恢复路径。
 ///
 /// 上面那个用例的包是我自己按旧形状写出来的，它只证明「这条路径认得这个形状」，
@@ -472,6 +528,7 @@ async fn pg_a_drill_row_keeps_the_columns_the_target_recomputed() {
         rows_expected: Some(1),
         source_runs_matched: Some(true),
         generated_columns_recomputed: vec!["raw_log_index.is_hot".into()],
+        tables_without_a_home: vec!["agent_performance".into()],
         artifacts_expected: 0,
         artifacts_restored: 0,
         artifact_readings: Vec::new(),
@@ -486,7 +543,15 @@ async fn pg_a_drill_row_keeps_the_columns_the_target_recomputed() {
         vec!["raw_log_index.is_hot".to_string()],
         "由目标重算的列必须原样回来：这一格丢了，改表达式就会被装成一次静默改写"
     );
-    assert!(read.ok(), "算回来的列不进成败判决");
+    assert!(
+        read.ok(),
+        "算回来的列与被迁移删掉的表都不进成败判决：判决问的是装回来的那批对不对"
+    );
+    assert_eq!(
+        read.tables_without_a_home,
+        vec!["agent_performance".to_string()],
+        "被跳过的表名必须原样回来：这一格丢了，一份缺表的包读起来就是完整恢复"
+    );
 
     // 三格相邻的新列各自带回自己那个数。写成三个不同的值是有意的：绑定顺序若
     // 与列清单错开一格，NULL 与 NULL 之间换不出声，而 12 / 300 / 3 会立刻对不上。

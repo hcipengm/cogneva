@@ -466,6 +466,20 @@ fn columns_without_a_home<'a>(package: &'a [String], current: &[String]) -> Vec<
         .collect()
 }
 
+/// 包里有、当前 schema 里已经没有的表。
+///
+/// 迁移可以删表，而保留窗口里的包会跨过那一次迁移。删掉的表在新结构里没有名字，
+/// 它的行恢复时无处可放；但**拒绝整包**同样不行——同一个包里其余的表此刻正是
+/// 要恢复的那批数据，为一张已经作废的表把它们一起退回去，等于让一次删表把整个
+/// 保留窗口变成「不可恢复」。所以跳过它们，把名字带回去记账：沉默地跳过是另一
+/// 种谎，装回来的表数与行数会全部显得与清单一致。
+fn tables_without_a_home<'a>(package: &'a [String], current: &[String]) -> Vec<&'a String> {
+    package
+        .iter()
+        .filter(|table| !current.contains(*table))
+        .collect()
+}
+
 /// 包里的列中，目标表接受写入的那些：生成列由目标自己算，不在这份名单里。
 fn writable_columns<'a>(package: &'a [String], computed: &[String]) -> Vec<&'a String> {
     package
@@ -623,13 +637,16 @@ pub async fn backup_postgres(
 /// 恢复做了什么。
 ///
 /// `tables` 是装回去的表；`recomputed` 是包里有值、装载时却由目标自己算回来的
-/// 列，记作 `表.列`。后者不进成败判决——值由同一行的其它列算出，不搬不丢数据
-/// ——但必须被写下来：生成表达式一旦改动，旧包会被装成「当时不曾有过」的值，
-/// 而表数、行数、源库比对三项全都照旧是全绿，这一格是唯一会露出来的地方。
+/// 列，记作 `表.列`；`tables_without_a_home` 是包里有、当前 schema 已经没有的
+/// 表。后两者都不进成败判决——生成列的值由同一行的其它列算出，不搬不丢数据；
+/// 被迁移删掉的表在新结构里没有任何读者——但都必须被写下来：生成表达式一旦改动，
+/// 旧包会被装成「当时不曾有过」的值，而表数、行数、源库比对三项全都照旧是全绿；
+/// 被跳过的表同理，若不留名字，一次删表会让旧包读起来像「完整恢复了」。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoreReport {
     pub tables: Vec<String>,
     pub recomputed: Vec<String>,
+    pub tables_without_a_home: Vec<String>,
 }
 
 /// PG 恢复：整包表一次性 TRUNCATE ... RESTART IDENTITY CASCADE，
@@ -652,6 +669,30 @@ pub async fn restore_postgres(
         }
     }
     tables.sort_unstable();
+
+    // 包里这批表在当前 schema 里还剩几张：一次删表的迁移会把保留窗口里的旧包
+    // 推到「装不回去」的那一侧，而它丢掉的只是已经没人读的那张表。整包拒绝等于
+    // 让那一次迁移顺手作废整个窗口，所以按名字跳过并带回去记账；名字是必须的，
+    // 否则跳过之后表数与行数会与清单完全一致，读起来像一份完整的恢复。
+    let current_tables: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname::text FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND c.relname = ANY($1)",
+    )
+    .bind(&tables)
+    .fetch_all(pool)
+    .await?;
+    let tables_without_a_home: Vec<String> = tables_without_a_home(&tables, &current_tables)
+        .into_iter()
+        .cloned()
+        .collect();
+    if !tables_without_a_home.is_empty() {
+        tracing::warn!(
+            tables = %tables_without_a_home.join(","),
+            "restore: package carries tables the current schema no longer has; their rows are not restored"
+        );
+        tables.retain(|table| !tables_without_a_home.contains(table));
+    }
 
     if !tables.is_empty() {
         let mut tx = pool.begin().await?;
@@ -749,7 +790,11 @@ pub async fn restore_postgres(
             sqlx::query(line).execute(pool).await?;
         }
     }
-    Ok(RestoreReport { tables, recomputed })
+    Ok(RestoreReport {
+        tables,
+        recomputed,
+        tables_without_a_home,
+    })
 }
 
 /// Secret 卷（只读挂载，key 一文件）打成 apply-able manifest。
@@ -2563,6 +2608,13 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
             recomputed = report.recomputed.len(),
             "postgres restored"
         );
+        if !report.tables_without_a_home.is_empty() {
+            // 恢复进程的日志是操作者唯一的现场：这些表的数据没有回来，说清是哪几张。
+            tracing::warn!(
+                tables = %report.tables_without_a_home.join(","),
+                "these package tables no longer exist in this schema and their rows were not restored"
+            );
+        }
     }
 
     let qdrant_dir = pkg_dir.join("qdrant");
@@ -3751,6 +3803,7 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         rows_expected: None,
         source_runs_matched: None,
         generated_columns_recomputed: Vec::new(),
+        tables_without_a_home: Vec::new(),
         artifacts_expected: 0,
         artifacts_restored: 0,
         artifact_readings: Vec::new(),
@@ -4274,21 +4327,46 @@ async fn restore_and_compare(
     // 装回来的列清单要跟着这一行一起留在账上：一份按旧导出写的包被装回时，
     // 生成列的值不是包里的、是目标此刻算出来的。表数与行数看不见这件事。
     drill.generated_columns_recomputed = restored.recomputed.clone();
+    // 包里那些当前 schema 已经没有的表：它们的行没有装回来，因此也不进行数比对。
+    // 名字留在这一行上——否则这份包读起来与一份各表齐全的包一模一样。
+    drill.tables_without_a_home = restored.tables_without_a_home.clone();
     tracing::info!(
         tables = restored.tables.len(),
         recomputed = restored.recomputed.len(),
+        gone = restored.tables_without_a_home.len(),
         "drill: postgres segment restored"
     );
+    if !manifest.postgres.tables.is_empty() && restored.tables.is_empty() {
+        return Err(format!(
+            "包里 {} 张表在当前 schema 里一张都没有了（{}），这一份没有可恢复的数据",
+            manifest.postgres.tables.len(),
+            restored.tables_without_a_home.join("；")
+        )
+        .into());
+    }
 
-    // 逐表把「装回来几行」与清单声明比。清单里的表在当前 schema 上缺一张，
-    // 下面的 count 会直接报错——那也是一次真实的失败：这个包装不回今天的结构。
+    // 逐表把「装回来几行」与清单声明比。比对的是**这个镜像的结构装得下的那批表**：
+    // 被迁移删掉的表由上面的读数点名，它们的行数无从比，也不该被算成"没装上"。
+    let without_a_home: std::collections::HashSet<&str> = restored
+        .tables_without_a_home
+        .iter()
+        .map(|t| t.as_str())
+        .collect();
     let mut conn = scratch.acquire().await?;
-    let expected_tables = manifest.postgres.tables.len() as i32;
+    let expected_tables = manifest
+        .postgres
+        .tables
+        .iter()
+        .filter(|t| !without_a_home.contains(t.name.as_str()))
+        .count() as i32;
     let mut matched_tables = 0i32;
     let mut rows_restored = 0i64;
     let mut rows_expected = 0i64;
     let mut disagreements = Vec::new();
     for table in &manifest.postgres.tables {
+        if without_a_home.contains(table.name.as_str()) {
+            continue;
+        }
         validate_table_name(&table.name)?;
         let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{}\"", table.name))
             .fetch_one(&mut *conn)
@@ -5013,6 +5091,27 @@ mod tests {
     }
 
     #[test]
+    fn a_table_the_schema_dropped_is_skipped_and_named_rather_than_condemning_the_package() {
+        // 一次删表的迁移之后，保留窗口里的旧包会点出一张今天不存在的表。整包拒绝
+        // 等于让那次迁移作废整个窗口；静默跳过则让这份包读起来与完整恢复一模一样。
+        // 两条都不是答案：跳过它，并把名字带回去。
+        let package = vec![
+            "agent_performance".to_string(),
+            "messages".to_string(),
+            "users".to_string(),
+        ];
+        let current = vec!["messages".to_string(), "users".to_string()];
+        assert_eq!(
+            tables_without_a_home(&package, &current),
+            vec![&"agent_performance".to_string()]
+        );
+
+        // 包里没被删过表时这一格必须是空的，否则每一份包都会背着一份"跳过"的记录。
+        let intact = vec!["messages".to_string(), "users".to_string()];
+        assert!(tables_without_a_home(&intact, &current).is_empty());
+    }
+
+    #[test]
     fn retention_keeps_newest_n_and_ignores_foreign_files() {
         let dir = tempfile::tempdir().unwrap();
         let mut names = Vec::new();
@@ -5112,6 +5211,7 @@ mod tests {
             rows_expected: Some(1),
             source_runs_matched: Some(true),
             generated_columns_recomputed: Vec::new(),
+            tables_without_a_home: Vec::new(),
             artifacts_expected: 0,
             artifacts_restored: 0,
             artifact_readings: Vec::new(),

@@ -404,6 +404,22 @@ pub struct BackupDrillRecord {
     /// only place that rewrite would show, so a row without them would say
     /// "restorable" about data that came back different.
     pub generated_columns_recomputed: Vec<String>,
+    /// Tables the package carried that the schema no longer has, because a
+    /// migration dropped them after the package was written.
+    ///
+    /// Their rows are not restored and not counted: there is no name to put them
+    /// under. That is not a reason to refuse the package -- the other tables in
+    /// it are exactly the data the restore exists for, and a retention window
+    /// that one dropped table can invalidate is not a retention window. It is
+    /// also not a reason to stay silent: with the names absent, a package whose
+    /// tables have partly vanished restores to counts that agree with its
+    /// manifest, which reads exactly like a complete restore. So the names are
+    /// stored and kept out of [`Self::ok`], the same way the recomputed columns
+    /// are: the verdict is about the data that came back, and this field is the
+    /// record of what could not.
+    ///
+    /// Empty means every table the package declared still has a home.
+    pub tables_without_a_home: Vec<String>,
     /// How many artifact-layer units the package's manifest promised, and how
     /// many the drill actually read back. A unit is one policy store (versions,
     /// head and active) or one `decision_stats.json` (groups and trials).
@@ -570,6 +586,7 @@ mod tests {
             rows_expected: Some(1000),
             source_runs_matched: Some(true),
             generated_columns_recomputed: Vec::new(),
+            tables_without_a_home: Vec::new(),
             artifacts_expected: 0,
             artifacts_restored: 0,
             artifact_readings: Vec::new(),
@@ -596,6 +613,16 @@ mod tests {
         assert!(
             d.ok(),
             "a target-recomputed column is not a missing measurement"
+        );
+
+        // 包里有一张当前结构已经没有的表：那张表的行恢复时无处可放，但同一份包
+        // 其余的表就是这次恢复存在的原因。判决看的是「装回来的那批对不对」，名字
+        // 是给读数看的那一格——所以它能 ok，却绝不能是空的。
+        let mut d = agreeing_drill();
+        d.tables_without_a_home = vec!["agent_performance".into()];
+        assert!(
+            d.ok(),
+            "a table the schema dropped does not make the rest unrestorable"
         );
 
         let mut d = agreeing_drill();
