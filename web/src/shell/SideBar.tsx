@@ -58,6 +58,7 @@ const TITLES: Record<ActivityId, string> = {
   governance: '治理',
   observability: '观测',
   resources: '资源',
+  storage: '存储',
   delivery: '构建与部署',
   audit: '审计',
   settings: '设置',
@@ -424,6 +425,27 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             links={[
               { id: 'observability', label: '观测', note: '节点 / Pod 的逐层读数' },
               { id: 'delivery', label: '构建与部署', note: '谁在吃这些资源' },
+            ]}
+          />
+        </>
+      );
+
+    case 'storage':
+      return (
+        <>
+          <Section title="三层记忆">
+            <Row label="原始来源" note="工具输出原样归档，不带字节列举" />
+            <Row label="schema" note="从原始来源抽出来的结构" />
+            <Row label="summary" note="压过一遍的摘要" />
+            <Note>
+              上面的计数从网关进程启动算起，重启归零；存着多少看下面的列表，那是盘上的。
+              资源面看的是盘还剩多少空，这一面看的是盘里有什么。
+            </Note>
+          </Section>
+          <CrossLinks
+            links={[
+              { id: 'resources', label: '资源', note: '盘还有多少空' },
+              { id: 'observability', label: '观测', note: '归档循环在不在跑' },
             ]}
           />
         </>

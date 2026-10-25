@@ -192,6 +192,7 @@ export function Palette() {
       go('audit', '这一屏的数字能追到源头吗？', VIEW_TITLES.audit),
       go('alerts', '现在有什么在报警？', VIEW_TITLES.alerts),
       go('inbox', '有没有人找我？', VIEW_TITLES.inbox),
+      go('storage', '平台自己存了些什么？占多大？', VIEW_TITLES.storage),
       go('files', '代码和文档在哪看、在哪改？', VIEW_TITLES.files),
       go('settings', '账号、主题、模型入口', VIEW_TITLES.settings),
     ];

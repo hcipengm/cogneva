@@ -13,6 +13,7 @@ import { ObservabilityView } from '@/views/ObservabilityView';
 import { ResourcesView } from '@/views/ResourcesView';
 import { SettingsView } from '@/views/SettingsView';
 import { SourceControlView } from '@/views/SourceControlView';
+import { StorageView } from '@/views/StorageView';
 import { TasksView } from '@/views/TasksView';
 import { WorkspaceView } from '@/views/WorkspaceView';
 import { Empty } from '@/ui/primitives';
@@ -56,6 +57,8 @@ export function ViewFor({ view }: { view: string }) {
       return <ObservabilityView />;
     case 'resources':
       return <ResourcesView />;
+    case 'storage':
+      return <StorageView />;
     case 'delivery':
       return <DeliveryView />;
     case 'audit':

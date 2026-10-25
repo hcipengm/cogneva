@@ -939,6 +939,121 @@ export async function listEvalDatasets(): Promise<EvalDatasetInfo[]> {
   return page.datasets ?? [];
 }
 
+/**
+ * 记忆后端自己数的六个计数。
+ *
+ * 它们是这个进程启动以来发生过多少次，不是现在存着多少条——重启归零。要问「现在存着
+ * 多少」，读原始来源的列表，那才是盘上的东西。
+ */
+export interface MemoryStats {
+  raw_archived: number;
+  raw_retrieved: number;
+  schema_stored: number;
+  schema_searched: number;
+  summary_stored: number;
+  summary_searched: number;
+}
+
+export async function getMemoryStats(): Promise<MemoryStats> {
+  return api.get<MemoryStats>('/api/v1/memory/stats');
+}
+
+export interface RawMetadata {
+  id: string;
+  content_type: string;
+  payload_length: number;
+  created_at: string;
+}
+
+/**
+ * 一次原始来源的列举。
+ *
+ * `total` 只在列表被 `limit` 截短时出现，且是截短**之前**的条数。它缺席就是
+ * 「这一次列全了」；它出现就是「你看到的是前缀」——两种情形在界面上必须分开说。
+ */
+export interface RawListing {
+  items: RawMetadata[];
+  total?: number;
+}
+
+export async function listMemoryRaw(
+  params: { prefix?: string; limit?: number } = {}
+): Promise<RawListing> {
+  const query = new URLSearchParams();
+  if (params.prefix) query.set('prefix', params.prefix);
+  if (params.limit !== undefined) query.set('limit', String(params.limit));
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return api.get<RawListing>(`/api/v1/memory/raw${suffix}`);
+}
+
+/** 一份原始来源的字节。`encoding` 说这是 UTF-8 文本还是 base64。 */
+export interface RawContent {
+  id: string;
+  namespace: string;
+  content_type: string;
+  payload_length: number;
+  encoding: 'utf8' | 'base64';
+  payload: string;
+  created_at: string;
+}
+
+export async function getMemoryRawContent(id: string): Promise<RawContent> {
+  return api.get<RawContent>(`/api/v1/memory/raw/${encodeURIComponent(id)}/content`);
+}
+
+/** 日志归档的一条索引：一天一个流可能有多份文件，`format` 也是键的一部分。 */
+export interface RawLogEntry {
+  hour: number;
+  stream_name: string;
+  log_date: string;
+  format: string;
+  file_path: string;
+  tier: string;
+  size_bytes: number;
+  event_count: number;
+  checksum: string;
+  start_time: string;
+  end_time: string;
+  created_at: string;
+}
+
+export async function listRawLogs(
+  params: { stream?: string; tier?: string; limit?: number } = {}
+): Promise<{ count: number; entries: RawLogEntry[] }> {
+  const query = new URLSearchParams();
+  if (params.stream) query.set('stream', params.stream);
+  if (params.tier) query.set('tier', params.tier);
+  if (params.limit !== undefined) query.set('limit', String(params.limit));
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return api.get<{ count: number; entries: RawLogEntry[] }>(`/api/v1/raw_logs${suffix}`);
+}
+
+/** 结构化记忆：schema 与 summary 两层各自的全量列举。 */
+export interface SchemaEntry {
+  id: string;
+  kind: string;
+  name: string;
+  key: string;
+  confidence: number;
+}
+
+export interface SummaryEntry {
+  id: string;
+  text: string;
+  score: number;
+  confidence: number;
+}
+
+export async function listMemorySchema(): Promise<SchemaEntry[]> {
+  const page = await api.get<{ results: SchemaEntry[] }>('/api/v1/memory/schema/list');
+  return page.results ?? [];
+}
+
+export async function listMemorySummary(): Promise<SummaryEntry[]> {
+  const page = await api.get<{ results: SummaryEntry[] }>('/api/v1/memory/summary/list');
+  return page.results ?? [];
+}
+
 
 /** 集群里三个固定工作负载各自的存活读数。 */
 export interface ClusterComponent {

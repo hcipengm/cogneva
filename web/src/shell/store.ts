@@ -23,6 +23,7 @@ export type ActivityId =
   | 'governance'
   | 'observability'
   | 'resources'
+  | 'storage'
   | 'delivery'
   | 'audit'
   | 'settings';
@@ -42,6 +43,7 @@ export const VIEW_TITLES: Record<ActivityId, string> = {
   governance: '治理',
   observability: '观测',
   resources: '资源',
+  storage: '存储',
   delivery: '构建与部署',
   audit: '审计',
   settings: '设置',
