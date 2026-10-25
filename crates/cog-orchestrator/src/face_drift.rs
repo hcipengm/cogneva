@@ -37,7 +37,8 @@ use tracing::{info, warn};
 
 use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::{
-    AgentRegistry, FaceDriftReading, GovernanceStore, OrchestratorControl, SFResult, Task,
+    AgentRegistry, DriftState, FaceDriftReading, GovernanceStore, OrchestratorControl, OwnerSource,
+    SFResult, Task,
 };
 
 /// The loop's name in the health registry.
@@ -192,7 +193,8 @@ pub fn placement_for(preferred: Option<&str>, live: &[String]) -> WorkPlacement 
     WorkPlacement::Release
 }
 
-/// Put each face's unstarted work back where it can be picked up.
+/// Put each face's unstarted work back where it can be picked up, and give it
+/// back to the owner once that owner is present again.
 ///
 /// Only unstarted rows move; a run in flight belongs to the session holding
 /// its lease, and taking it away would leave two units claiming one run. The
@@ -201,6 +203,20 @@ pub fn placement_for(preferred: Option<&str>, live: &[String]) -> WorkPlacement 
 /// and a departed unit cannot sign. The declared owner stays on the face node,
 /// so the reading still says who the face was meant for while the work itself
 /// is available to whoever is running.
+///
+/// The two directions are one rule, not two: a row with no owner is right only
+/// while the unit named on the face is gone. Carrying out the release and not
+/// its return makes a single lapse in the owner's presence permanent -- the
+/// row goes back to the shared queue, nothing binds it again, and the face
+/// reads `no_bound_task` for the rest of its life even though the owner came
+/// back minutes later. The return names the face's *declared* owner, not a
+/// name picked from the registry, so it is not the re-addressing that was
+/// measured to strand rows: that guess lands on a unit with no reason to hold
+/// this face, while the declared owner is the unit the face row already
+/// answers to.
+///
+/// A measured owner is skipped: it was read off the very rows this would
+/// rewrite, so writing it back says nothing the rows do not already say.
 async fn reassign_faces(
     store: &dyn GovernanceStore,
     readings: &[FaceDriftReading],
@@ -215,22 +231,60 @@ async fn reassign_faces(
         return;
     }
     for reading in readings {
-        if placement_for(reading.owner.as_deref(), live) != WorkPlacement::Release {
-            continue;
-        }
-        match store.release_face_work(&reading.face_id).await {
-            Ok(0) => {}
-            Ok(released) => info!(
-                face = %reading.face_id,
-                owner = reading.owner.as_deref().unwrap_or("nobody"),
-                rows = released,
-                "face work released to the shared queue; the unit it named is gone"
-            ),
-            Err(e) => warn!(
-                face = %reading.face_id,
-                error = %e,
-                "face work could not be released; the reading still reports the face as it stands"
-            ),
+        match placement_for(reading.owner.as_deref(), live) {
+            WorkPlacement::Release => match store.release_face_work(&reading.face_id).await {
+                Ok(0) => {}
+                Ok(released) => info!(
+                    face = %reading.face_id,
+                    owner = reading.owner.as_deref().unwrap_or("nobody"),
+                    rows = released,
+                    "face work released to the shared queue; the unit it named is gone"
+                ),
+                Err(e) => warn!(
+                    face = %reading.face_id,
+                    error = %e,
+                    "face work could not be released; the reading still reports the face \
+                     as it stands"
+                ),
+            },
+            // Give the rows back only to an owner that is here *now*: a
+            // registration whose heartbeat has gone stale is still in the
+            // registry but is not working the face, and binding rows to it
+            // takes them off the queue for nobody -- the same strand the
+            // release exists to prevent. `unknown_unit` cannot reach here with
+            // a declared owner, but the two are read together everywhere else.
+            WorkPlacement::Keep
+                if reading.owner_source == OwnerSource::Declared
+                    && matches!(
+                        reading.state,
+                        DriftState::OwnerIdle | DriftState::DriftedBinding
+                    )
+                    && !matches!(
+                        reading.cause.as_deref(),
+                        Some("heartbeat_old") | Some("unknown_unit")
+                    ) =>
+            {
+                let Some(owner) = reading.owner.as_deref() else {
+                    continue;
+                };
+                match store.reassign_face_work(&reading.face_id, owner).await {
+                    Ok(0) => {}
+                    Ok(rows) => info!(
+                        face = %reading.face_id,
+                        owner = %owner,
+                        rows = rows,
+                        "a present owner took its face's released rows back"
+                    ),
+                    Err(e) => warn!(
+                        face = %reading.face_id,
+                        owner = %owner,
+                        error = %e,
+                        "the face's rows could not be given back to its owner; the reading \
+                         still reports the face as it stands"
+                    ),
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -638,16 +692,56 @@ mod tests {
         );
     }
 
-    /// A face whose seat is filled by a unit that answers is left alone, even
-    /// though every other face in the same pass is released.
+    /// A face whose seat is filled by a unit that answers is not released --
+    /// its rows are given back to it instead.
+    ///
+    /// The release is only half the rule. A row with no owner is right while
+    /// the unit named on the face is gone; once that unit answers again the
+    /// row belongs to it, and nothing but this pass can put the name back
+    /// (the assignment pass is a command somebody has to type). Without the
+    /// return, one lapse in presence leaves the face reading `no_bound_task`
+    /// for the rest of its life -- which is exactly how it was found: a
+    /// standing row released during a restart, the owner back within minutes,
+    /// and the face still idle hours later.
     #[tokio::test]
-    async fn a_present_owners_rows_are_never_released() {
+    async fn a_present_owner_is_given_its_released_rows_back() {
         let store = RecordingStore::default();
-        let readings = vec![reading(Some("present-unit"))];
+        let mut idle = reading(Some("present-unit"));
+        idle.state = DriftState::OwnerIdle;
+        idle.cause = Some("no_bound_task".into());
+        let readings = vec![idle];
 
         reassign_faces(&store, &readings, &["present-unit".to_string()]).await;
-        assert!(store.released.lock().expect("lock").is_empty());
-        assert!(store.adopted.lock().expect("lock").is_empty());
+        assert!(
+            store.released.lock().expect("lock").is_empty(),
+            "a unit that answers is not a departed one; its rows stay addressed to it"
+        );
+        assert_eq!(
+            store.adopted.lock().expect("lock").clone(),
+            vec![("task-management".to_string(), "present-unit".to_string())],
+            "the rows go back to the owner the face row names"
+        );
+    }
+
+    /// A registry record whose heartbeat went stale is not presence: binding
+    /// the rows to it takes them off the shared queue and gives them to a unit
+    /// that has not shown up, which is the strand the release prevents.
+    #[tokio::test]
+    async fn a_stale_heartbeat_does_not_get_the_rows_back() {
+        let store = RecordingStore::default();
+        let mut stale = reading(Some("present-unit"));
+        stale.state = DriftState::OwnerIdle;
+        stale.cause = Some("heartbeat_old".into());
+
+        reassign_faces(&store, &[stale], &["present-unit".to_string()]).await;
+        assert!(
+            store.adopted.lock().expect("lock").is_empty(),
+            "a name whose heartbeat is old is not somebody to hand work to"
+        );
+        assert!(
+            store.released.lock().expect("lock").is_empty(),
+            "the row is neither released nor rebound: the registry answered, it just is not there"
+        );
     }
 
     #[test]

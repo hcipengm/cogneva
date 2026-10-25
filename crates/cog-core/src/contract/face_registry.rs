@@ -818,7 +818,18 @@ pub trait GovernanceStore: Send + Sync {
     /// leaves it: its lease is what makes it executable, and moving the owner
     /// under a lease would give two units a claim on the same run.
     ///
+    /// Rows that name nobody move too. Those are what [`release_face_work`]
+    /// leaves behind, and the release is right only while the unit named on
+    /// the face is gone -- so the pass that carries it out has to carry out
+    /// its return as well, or one lapse in presence becomes permanent. That
+    /// makes the caller's choice of `to_unit` the whole safety of this call:
+    /// it must be the unit the face row names and must be present *now*, never
+    /// a name picked from the registry. Binding rows to a guess takes them off
+    /// the shared queue and gives them to a unit with no reason to hold them.
+    ///
     /// Returns how many rows moved.
+    ///
+    /// [`release_face_work`]: Self::release_face_work
     async fn reassign_face_work(&self, face_id: &str, to_unit: &str) -> SFResult<usize>;
 
     /// Give a face's unstarted work back to the shared queue.

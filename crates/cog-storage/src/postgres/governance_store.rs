@@ -148,7 +148,11 @@ UPDATE cog_dag_tasks \
 ///
 /// `$3` is compared before writing, so a face whose rows already belong to the
 /// present unit matches nothing and the pass reports zero rows moved rather
-/// than rewriting rows every two minutes.
+/// than rewriting rows every two minutes. The comparison is `IS DISTINCT FROM`
+/// because the rows this is for are the ones a release left behind, and those
+/// name nobody: plain `<>` answers NULL against a missing key, which is not
+/// true, so the row is silently skipped and the face keeps reading idle while
+/// the pass reports that it looked.
 const REASSIGN_FACE_WORK_SQL: &str = "\
 UPDATE cog_dag_tasks \
    SET task = (task - 'agent_id' - 'lease_owner') || jsonb_build_object( \
@@ -160,7 +164,7 @@ UPDATE cog_dag_tasks \
        updated_at = NOW() \
  WHERE workspace_id <> $1 \
    AND task ->> 'face_id' = $2 \
-   AND task ->> 'owner_unit' <> $3 \
+   AND task ->> 'owner_unit' IS DISTINCT FROM $3 \
    AND status IN ('pending', 'scheduled')";
 
 /// Give one face's unstarted work back to the shared queue.

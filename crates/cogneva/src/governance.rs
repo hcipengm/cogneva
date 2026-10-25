@@ -27,7 +27,6 @@ use chrono::{DateTime, Utc};
 
 use cog_core::{
     Face, FaceImportOutcome, FaceKind, FaceSpec, GovernanceStore, StateBackend, Task, TaskStatus,
-    TaskType,
 };
 use cog_storage::{PostgresGovernanceStore, PostgresStateBackend, RedisAgentRegistry};
 
@@ -839,31 +838,7 @@ async fn assign(
                 }
             }
         }
-        let reading = face
-            .spec
-            .first_reading
-            .as_deref()
-            .unwrap_or("本面的判据读数");
-        let gap = face.spec.gap_task_id.as_deref().unwrap_or("-");
-        let goal = format!(
-            "以生产商用为唯一目标，保持「{}」这一面在目标态。\n\
-             本轮判据读数：{}（必须有新的读取时刻与值，只刷新 updated_at 不算）。\n\
-             缺口任务：{}。\n\
-             完成条件：读数可读、任务归属与面一致；不属于本面的工作转给该面的 owner。",
-            face.face_id, reading, gap
-        );
-        let mut task = Task::new(
-            id.clone(),
-            TaskType::DagNode,
-            serde_json::json!({
-                "goal": goal,
-                "face": face.face_id,
-                "owner_unit": owner,
-            }),
-        );
-        task.face_id = Some(face.face_id.clone());
-        task.owner_unit = Some(owner.clone());
-        task.workspace_id = Some(workspace.to_string());
+        let task = cog_orchestrator::governance_acts::standing_row(&face, workspace);
         backend.dag_set_task(workspace, &id, &task).await?;
         assigned += 1;
     }
@@ -952,6 +927,12 @@ fn rebind_standing_row(mut row: Task, face_id: &str, owner: &str, workspace: &st
     row.face_id = Some(face_id.to_string());
     row.owner_unit = Some(owner.to_string());
     row.workspace_id = Some(workspace.to_string());
+    // A row written before the standing shape was settled is still executable,
+    // and an executable marker is exactly the row the executor picks up, burns
+    // its budget on, and fails -- taking the face's binding with it. Re-binding
+    // is the pass that already has the row in hand, so it is also the pass that
+    // puts the shape right.
+    row.is_executable = false;
     match row.input.as_object_mut() {
         Some(input) => {
             input.insert("face".into(), face_id.into());

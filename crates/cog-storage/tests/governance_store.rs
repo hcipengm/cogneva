@@ -509,7 +509,14 @@ async fn applying_a_handover_moves_the_face_and_the_unstarted_work_only() {
 
 /// A face whose unit left keeps its unstarted work: the rows move to a unit
 /// that is present, in both the row's binding and the goal the claimer reads,
-/// while a run in flight and an ownerless row stay where they are.
+/// while a run in flight stays where it is.
+///
+/// An ownerless row moves as well, and that half was learned the hard way: the
+/// release path leaves rows with no owner, and while this method skipped them
+/// nothing could put a face's duty back once its owner returned -- the face
+/// read `no_bound_task` for the rest of its life. What makes taking them safe
+/// is not the row's state but the caller's target, which is why the contract
+/// says it must be the unit the face names and one that is present now.
 ///
 /// The two copies of the owner are the failure this test exists for. The
 /// reading takes the row's binding and the executor hands the claimer the goal
@@ -555,8 +562,8 @@ async fn unstarted_face_work_follows_a_unit_that_is_present() {
         .await
         .expect("move the unstarted work");
     assert_eq!(
-        moved, 1,
-        "only the unstarted row owned by the departed unit moves"
+        moved, 2,
+        "both unstarted rows move: the departed unit's and the ownerless one a release left"
     );
 
     let row = backend
@@ -593,8 +600,17 @@ async fn unstarted_face_work_follows_a_unit_that_is_present() {
         .expect("read the ownerless row")
         .expect("the ownerless row is still there");
     assert_eq!(
-        ownerless_row.owner_unit, None,
-        "a row nobody owns is already claimable and must not be taken: {ownerless_row:?}"
+        ownerless_row.owner_unit.as_deref(),
+        Some("present-unit"),
+        "a released row goes back to the unit the face names: {ownerless_row:?}"
+    );
+    assert_eq!(
+        ownerless_row
+            .input
+            .get("owner_unit")
+            .and_then(|v| v.as_str()),
+        Some("present-unit"),
+        "the claimer is told the same name the row carries: {ownerless_row:?}"
     );
 
     assert_eq!(

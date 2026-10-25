@@ -21,8 +21,8 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use cog_core::{
-    Decision, DecisionMode, DecisionSpec, DecisionState, Handover, HandoverSpec, Task, TaskStatus,
-    TaskType, TieBreak, Vote, VoteSpec, DECISION_INPUT_KEY, DECISION_TASK_TYPE,
+    Decision, DecisionMode, DecisionSpec, DecisionState, Face, Handover, HandoverSpec, Task,
+    TaskStatus, TaskType, TieBreak, Vote, VoteSpec, DECISION_INPUT_KEY, DECISION_TASK_TYPE,
     GOVERNANCE_WORKSPACE, HANDOVER_INPUT_KEY, HANDOVER_TASK_TYPE, VOTE_INPUT_KEY, VOTE_TASK_TYPE,
 };
 
@@ -54,6 +54,53 @@ pub fn task_id_segment(name: &str) -> String {
 /// until somebody re-created its work.
 pub fn face_work_id(face_id: &str) -> String {
     format!("face-work-{}", task_id_segment(face_id))
+}
+
+/// The standing duty row a face's owner works from, as one shape written once.
+///
+/// The row is a marker, not work: it carries the face's id and the name of the
+/// unit answerable for it, and that pair is what the drift reading measures when
+/// it asks whether anybody is on the face. So it is written with
+/// `is_executable = false`, the same way a goal row is: every dispatcher --
+/// the DAG executor's ready queue and the unit-facing queue alike -- hands out
+/// only executable rows, and a standing duty has no body to run. Left
+/// executable, the row was picked up by the executor, burned its whole budget
+/// on nothing, and was failed on the degenerate-loop rule; the face then had no
+/// open task bound to its owner, read `no_bound_task`, and stayed that way
+/// because nothing recreates a standing row.
+///
+/// The owner is written three times for the same reason `rebind` writes it
+/// three times: the reading takes the row's own binding, the dispatcher reads
+/// the struct field, and the executor hands `input` to whoever claims it. A
+/// copy that disagrees is a row that reads as somebody else's work.
+pub fn standing_row(face: &Face, workspace: &str) -> Task {
+    let reading = face
+        .spec
+        .first_reading
+        .as_deref()
+        .unwrap_or("本面的判据读数");
+    let gap = face.spec.gap_task_id.as_deref().unwrap_or("-");
+    let goal = format!(
+        "以生产商用为唯一目标，保持「{}」这一面在目标态。\n\
+         本轮判据读数：{}（必须有新的读取时刻与值，只刷新 updated_at 不算）。\n\
+         缺口任务：{}。\n\
+         完成条件：读数可读、任务归属与面一致；不属于本面的工作转给该面的 owner。",
+        face.face_id, reading, gap
+    );
+    let mut task = Task::new(
+        face_work_id(&face.face_id),
+        TaskType::DagNode,
+        serde_json::json!({
+            "goal": goal,
+            "face": face.face_id,
+            "owner_unit": face.owner_unit,
+        }),
+    );
+    task.face_id = Some(face.face_id.clone());
+    task.owner_unit = face.owner_unit.clone();
+    task.workspace_id = Some(workspace.to_string());
+    task.is_executable = false;
+    task
 }
 
 /// Build a handover row in its draft state.
@@ -1466,6 +1513,54 @@ mod tests {
             cog_core::decision_events(&store, "d").await.unwrap().len(),
             1,
             "the refused append writes nothing"
+        );
+    }
+
+    fn face(owner: Option<&str>) -> Face {
+        Face {
+            face_id: "变更管理".into(),
+            owner_unit: owner.map(str::to_string),
+            bound_by_handover_id: None,
+            spec: cog_core::FaceSpec::first("变更管理", cog_core::FaceKind::Face),
+            updated_at: at(0),
+        }
+    }
+
+    /// The standing duty row carries who is answerable for the face; it is not
+    /// a unit of work, and every dispatcher hands out only executable rows.
+    ///
+    /// Left executable -- which is what `Task::new` gives you -- the executor
+    /// took the row, spent its whole budget on it, and failed it on the
+    /// degenerate-loop rule. The face then had no open task bound to its owner
+    /// and read `no_bound_task`, and nothing recreates a standing row, so the
+    /// face stayed idle until somebody ran the assignment command by hand.
+    #[test]
+    fn the_standing_row_is_a_marker_not_work() {
+        let row = standing_row(&face(Some("worker")), "default");
+
+        assert!(
+            !row.is_executable,
+            "a standing duty has no body to run; an executable one is eaten by the executor"
+        );
+        assert_eq!(row.id, face_work_id("变更管理"));
+        assert_eq!(row.face_id.as_deref(), Some("变更管理"));
+        assert_eq!(row.owner_unit.as_deref(), Some("worker"));
+        assert_eq!(row.workspace_id.as_deref(), Some("default"));
+        assert_eq!(
+            row.input["owner_unit"],
+            serde_json::json!("worker"),
+            "the copy the claimer reads names the same unit as the row"
+        );
+        assert_eq!(
+            row.input["face"],
+            serde_json::json!("变更管理"),
+            "the duty names the face it is for"
+        );
+        assert!(
+            row.input["goal"]
+                .as_str()
+                .is_some_and(|goal| goal.contains("变更管理")),
+            "the goal text is the duty the owner is handed"
         );
     }
 
