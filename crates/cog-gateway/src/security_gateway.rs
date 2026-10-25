@@ -5278,6 +5278,13 @@ async fn stream_forward(
             .body(axum::body::Body::from(
                 serde_json::json!({
                     "error": "所有 LLM 上游当前不可用",
+                    // 机器可读的那一格，给调用侧的故障转移读：这个 503 是**池级
+                    // 熔断**（一个上游都没试），与「试遍了都不行」在状态码与散文上
+                    // 都同形，只有这一格分得开。少了它，配在后面的另一面后端永远
+                    // 用不上——调用侧由状态码只能翻出 `ServerError`，「换个上游能不
+                    // 能解决」在这一档上答不出来。取值与判据同源：常量定义在
+                    // cog-llm 的路由里，读写两侧认的是同一个字面量。
+                    "reason": cog_llm::routing::FACE_WITHOUT_A_MEMBER,
                     // 被拒的是哪一个协议面。加在正文字段里而不是只写进日志：
                     // 调用侧唯一能看见的就是这段正文，而池里另一面还有健康成员时，
                     // 「所有上游不可用」这句话本身不足以让读者判断该换面还是该等。
@@ -9933,6 +9940,25 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             .and_then(|v| v.parse().ok())
             .expect("必须带 Retry-After");
         assert!((1_100..=1_200).contains(&retry_after));
+
+        // 正文里那两格是**调用侧唯一能看见**的东西：`reason` 让它的故障转移
+        // 认出「这一面空着，换另一面的后端」（状态码只有 503，翻出来是
+        // ServerError，不足以换），`face` 让人看出被拒的是哪一面。少一格，另一面
+        // 配着健康后端也用不上，而且报出来的是「服务端故障」而不是「这一面空着」。
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("正文要读得出来：按它判该不该换后端");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("正文是 JSON");
+        assert_eq!(
+            body.get("reason").and_then(|v| v.as_str()),
+            Some(cog_llm::routing::FACE_WITHOUT_A_MEMBER),
+            "熔断 503 少了机器可读的原因，调用侧换不了面：{body}"
+        );
+        assert_eq!(
+            body.get("face").and_then(|v| v.as_str()),
+            Some("openai"),
+            "熔断 503 要说清被拒的是哪一面：{body}"
+        );
     }
 
     #[tokio::test]

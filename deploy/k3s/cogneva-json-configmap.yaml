@@ -186,11 +186,21 @@ data:
             "backends": [
               {
                 "provider": "gateway",
-                "_comment": "主应用与沙盒一致零凭证零上游知识：api_key 是写死的非敏感占位串（后端构建要求非空），流量经安全网关 8081 透传，真 key 只在网关 Pod。api_style 钉 openai 匹配透传面；model 同样是占位，网关透传时改写为向导配置的真实模型。多 LLM 故障转移（429/402 切上游）由安全网关的上游池承担，主应用这里只保留网关一个后端。LLM 平等：业务侧配置不出现任何厂商名。",
+                "_comment": "主应用与沙盒一致零凭证零上游知识：api_key 是写死的非敏感占位串（后端构建要求非空），流量经安全网关 8081 透传，真 key 只在网关 Pod。api_style 钉 openai 匹配透传面；model 同样是占位，网关透传时改写为向导配置的真实模型。多 LLM 故障转移（429/402 切上游）由安全网关的上游池承担。LLM 平等：业务侧配置不出现任何厂商名。",
                 "api_key": "via-security-gateway",
                 "base_url": "http://cogneva-security-gateway:8081/v1",
                 "model": "via-security-gateway",
                 "api_style": "openai",
+                "weight": 1,
+                "enabled": true
+              },
+              {
+                "provider": "gateway",
+                "_comment": "同一条网关、另一个协议面（/v1/messages），排在上面那条之后：openai 面在网关池里一个能接的成员都没有时（池级熔断 503，正文带 reason=face_has_no_serving_member），路由换到这一条继续走，而不是把 503 交给调用方。每次请求仍从索引 0 起试，所以那一面一旦重新有成员就自然切回，不需要谁改配置。两个面都是网关的，所以这里同样零厂商名、零凭证；model 仍是占位。",
+                "api_key": "via-security-gateway",
+                "base_url": "http://cogneva-security-gateway:8081/v1",
+                "model": "via-security-gateway",
+                "api_style": "anthropic",
                 "weight": 1,
                 "enabled": true
               }

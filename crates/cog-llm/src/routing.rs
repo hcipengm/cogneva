@@ -26,6 +26,34 @@ fn status_from_own_message(msg: &str) -> Option<u16> {
     rest[..end].trim().parse().ok()
 }
 
+/// 网关在「这个请求面上一个能接的上游都没有」时写进 503 正文里的机器可读原因。
+///
+/// 这个量与「试遍了都不行」在状态码上是同一个 503，在正文的散文上也同形（两句话
+/// 都说得通），只有这一格能把它们分开。写在这里而不是照着正文那句中文判：那句话
+/// 是给人看的，会随措辞改，而改的人不会知道有一层故障转移在认它。
+pub const FACE_WITHOUT_A_MEMBER: &str = "face_has_no_serving_member";
+
+/// 这段错误文本是不是在说「这一面一个能接的成员都没有」。
+///
+/// 按 JSON 键值判，不认裸子串：正文是网关自己用 `serde_json` 拼的对象，键名与
+/// 取值的形状是它控制的；拿裸词去命中，命中率取决于有没有别处刚好写到这个词。
+/// 前缀（`API error (HTTP 503): `）由 provider 加在同一行里，所以从第一个 `{` 起
+/// 取；取不到合法 JSON 就是没这句话。
+fn names_a_face_without_a_member(msg: &str) -> bool {
+    let Some(start) = msg.find('{') else {
+        return false;
+    };
+    let body = &msg[start..];
+    let parsed = serde_json::from_str::<serde_json::Value>(body).or_else(|_| {
+        // 后面可能还跟着别的散文；取到最后一个 `}` 为止。
+        match body.rfind('}') {
+            Some(end) => serde_json::from_str::<serde_json::Value>(&body[..=end]),
+            None => serde_json::from_str::<serde_json::Value>(body),
+        }
+    });
+    parsed.is_ok_and(|v| v.get("reason").and_then(|r| r.as_str()) == Some(FACE_WITHOUT_A_MEMBER))
+}
+
 /// 既没有类型化原因、也取不回我们自己的代号时，退到上游惯用的措辞上认。
 ///
 /// 这一条是**降级路径**，不是判据的常态：有状态码的地方一律走
@@ -95,7 +123,19 @@ impl RoutingProvider {
     ///
     /// 判据的优先序是定的：有类型化原因就只认它；没有类型、但我们自己的错误
     /// 文本里带着状态码代号，就从代号翻出原因再判；两者都没有才退到认词。
+    ///
+    /// 唯一排在类型化原因之前的是一条**比状态码更具体**的声明：网关说「这一面
+    /// 一个能接的成员都没有」。那个 503 是池级熔断——网关**一个上游都没试**，
+    /// 所以换一条落在另一面上的后端不是重试同一件事，而是换了一件事；而 503 翻
+    /// 出来的是 [`UpstreamFailure::ServerError`]，那一档在「换一个上游能解决吗」
+    /// 上答的是「不知道」，正因如此它不能盖住这条更具体的声明。不挂
+    /// `retry_on_429` / `retry_on_402` 两个开关：它们管的是「上游已经拒过一次，
+    /// 要不要再花一次配额」，而这里一次都没发出去，换面的代价只是多一跳。
+    /// `max_failover_attempts` 仍然是上界。
     fn should_failover(&self, failure: Option<UpstreamFailure>, message: Option<&str>) -> bool {
+        if message.is_some_and(names_a_face_without_a_member) {
+            return true;
+        }
         if let Some(cause) = failure {
             return self.allows_failover(cause);
         }
@@ -664,6 +704,118 @@ mod tests {
         );
         assert!(router.should_failover(None, Some("API error (HTTP 429): slow down")));
         assert!(router.should_failover(None, Some("API error (HTTP 402): pay up")));
+    }
+
+    /// 网关说「这一面一个能接的成员都没有」时，正文里那一格是**比 503 更具体**
+    /// 的声明，必须盖过由 503 翻出来的 `ServerError`。
+    ///
+    /// 不判这一格时，这个 503 走的是类型化那条路：`from_status(503)` 是
+    /// `ServerError`，而它在「换一个上游能解决吗」上答「不知道」，于是整个平台的
+    /// 请求面在另一面还健康时照样失败——一条 anthropic 面的后端配在后面也用不上。
+    #[test]
+    fn a_face_without_a_member_is_worth_the_next_backend() {
+        let router = RoutingProvider::new(Vec::new(), 3, true, true);
+        let body = serde_json::json!({
+            "error": "所有 LLM 上游当前不可用",
+            "reason": FACE_WITHOUT_A_MEMBER,
+            "face": "openai",
+            "retry_after_seconds": 20044u64,
+            "quota_window_secs": 2592000u64,
+        })
+        .to_string();
+
+        // 真实形状：provider 把正文拼在状态码后面，类型化原因是 ServerError。
+        assert!(router.should_failover(
+            Some(UpstreamFailure::ServerError),
+            Some(&format!("API error (HTTP 503): {body}"))
+        ));
+        // 没有类型化原因时也要认。
+        assert!(router.should_failover(None, Some(&format!("API error (HTTP 503): {body}"))));
+
+        // 同样一个 503、同样是「上游不可用」，但没有这一格 ⇒ 不换：那是真的
+        // 服务端故障，换面的依据不在。
+        assert!(!router.should_failover(
+            Some(UpstreamFailure::ServerError),
+            Some("API error (HTTP 503): {\"error\":\"所有 LLM 上游当前不可用\"}")
+        ));
+        // `reason` 是别的值（或不是 JSON）同样不换——判的是这一个值，不是有没
+        // 有一个叫 reason 的键。
+        assert!(!router.should_failover(
+            None,
+            Some("API error (HTTP 503): {\"reason\":\"upstream_overloaded\"}")
+        ));
+        assert!(!router.should_failover(
+            None,
+            Some(&format!("upstream said {FACE_WITHOUT_A_MEMBER}"))
+        ));
+    }
+
+    /// 两个后端、索引 0 那一面空着：`chat()` 必须落到索引 1 上。
+    #[tokio::test]
+    async fn chat_fails_over_from_an_empty_face_to_the_next_backend() {
+        let body = serde_json::json!({
+            "error": "所有 LLM 上游当前不可用",
+            "reason": FACE_WITHOUT_A_MEMBER,
+            "face": "openai",
+            "retry_after_seconds": 20044u64,
+            "quota_window_secs": 2592000u64,
+        })
+        .to_string();
+        let primary = Arc::new(MockProvider {
+            response_text: String::new(),
+            error_msg: Some(format!("API error (HTTP 503): {body}")),
+            mid_stream_error: false,
+            upstream_failure: Some(UpstreamFailure::ServerError),
+            retry_after_secs: Some(20044),
+        });
+        let secondary = Arc::new(MockProvider {
+            response_text: "hello from the other face".into(),
+            error_msg: None,
+            mid_stream_error: false,
+            upstream_failure: None,
+            retry_after_secs: None,
+        });
+
+        let router = RoutingProvider::new(vec![primary, secondary], 3, true, true);
+        let response = router
+            .chat(&[Message::user("hi")], &ChatOptions::default())
+            .await
+            .expect("索引 0 那一面空着时，索引 1 上的后端必须被用上");
+        let text: String = response
+            .content
+            .iter()
+            .filter_map(|b| b.as_text())
+            .collect();
+        assert_eq!(text, "hello from the other face");
+    }
+
+    /// 换无可换时，回来的仍是那次 503 的原始原因与等待，不是「所有后端都拒了」
+    /// 之类另造的一句：下游要据此决定等多久。
+    #[tokio::test]
+    async fn an_empty_face_with_no_next_backend_reports_the_original_refusal() {
+        let body = serde_json::json!({
+            "error": "所有 LLM 上游当前不可用",
+            "reason": FACE_WITHOUT_A_MEMBER,
+            "face": "openai",
+            "retry_after_seconds": 20044u64,
+            "quota_window_secs": serde_json::Value::Null,
+        })
+        .to_string();
+        let only = Arc::new(MockProvider {
+            response_text: String::new(),
+            error_msg: Some(format!("API error (HTTP 503): {body}")),
+            mid_stream_error: false,
+            upstream_failure: Some(UpstreamFailure::ServerError),
+            retry_after_secs: Some(20044),
+        });
+
+        let router = RoutingProvider::new(vec![only], 3, true, true);
+        let err = router
+            .chat(&[Message::user("hi")], &ChatOptions::default())
+            .await
+            .expect_err("只有一条后端时，这个 503 必须原样出去");
+        assert_eq!(err.upstream_failure(), Some(UpstreamFailure::ServerError));
+        assert_eq!(err.retry_after_secs(), Some(20044));
     }
 
     /// 两个开关各自管一档；关掉的那档不换后端。
