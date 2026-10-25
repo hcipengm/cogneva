@@ -1,0 +1,127 @@
+# 项目控制回路那四条规则的单测夹具：一个把越界变活的回路，自己死了有没有人知道。
+#
+# 四条规则读的是这条回路自己的两条系列：`cogneva_project_control_outcomes_total`（每交出去
+# 一条越界的结局）与 `cogneva_project_control_unmeasured_total`（每一轮量不出来的原因）。
+# 它们的共同形状是「坏掉时一切安静」：回路没在跑、账没接、基线读不到，面板上都是没有新告警。
+# 所以这一族最需要的是「会不会响」的证明，而不是又一条结构门。
+#
+# 规则在部署配置的进程内 watcher 那一库，不在 PrometheusRule 清单里，所以这里点名规则名，
+# 由跑者从 `deploy/helm/cogneva/files/cogneva.json` 按名字取正文（连同它自己的 `condition`）：
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-project-control.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: project_control_dispatch_failing
+# rule: project_control_has_no_ledger
+# rule: project_control_cannot_read_the_ledger
+# rule: project_control_has_no_baseline
+
+evaluation_interval: 1m
+
+tests:
+  # 回路在跑、量得着、也交得出去：四条都必须安静。这是「不会白红」的那一半——四格里
+  # 任何一条对着一片零也要响，那它响的时候就没有人再看了。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_outcomes_total{outcome="dispatch_failed",pod="cogneva-0"}'
+        values: '0x70'
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_ledger",pod="cogneva-0"}'
+        values: '0x70'
+      - series: 'cogneva_project_control_unmeasured_total{reading="cost_unreadable",pod="cogneva-0"}'
+        values: '0x70'
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_baseline",pod="cogneva-0"}'
+        values: '0x70'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: project_control_dispatch_failing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: project_control_has_no_ledger
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: project_control_cannot_read_the_ledger
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: project_control_has_no_baseline
+        exp_alerts: []
+
+  # 每一格各自坏掉，四条各自响，标签各自说出是哪一格：
+  #   - 交出去整一小时每一拍都失败 ⇒ 判送不出去的那条响（`outcome` 留着，读的人知道是哪一格）；
+  #   - 进程里没有账、基线读不到 ⇒ 按存在判的两条响，`reading` 留着，它们把读者送去不同的表；
+  #   - 账在但读不出来 ⇒ 按窗口判的那条响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_outcomes_total{outcome="dispatch_failed",pod="cogneva-0"}'
+        values: '0+1x70'
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_ledger",pod="cogneva-0"}'
+        values: '0x5 1x65'
+      - series: 'cogneva_project_control_unmeasured_total{reading="cost_unreadable",pod="cogneva-0"}'
+        values: '0+1x70'
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_baseline",pod="cogneva-0"}'
+        values: '0x5 1x65'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: project_control_dispatch_failing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outcome: dispatch_failed
+      - eval_time: 30m
+        alertname: project_control_has_no_ledger
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reading: no_ledger
+      - eval_time: 30m
+        alertname: project_control_cannot_read_the_ledger
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reading: cost_unreadable
+      - eval_time: 30m
+        alertname: project_control_has_no_baseline
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reading: no_baseline
+
+  # 界下面一点：两条按窗口判的规则，恰好差一格就是不许亮。
+  #   - 一小时里五次交不出去（六拍里少一拍）⇒ 不响。这条守的是「六」这个数：把它写成
+  #     「有一次就响」，一次数据库抖动就会天天响；
+  #   - 一小时里两次读不出账 ⇒ 不响。守的是「三是三次，不是一次」。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_outcomes_total{outcome="dispatch_failed",pod="cogneva-0"}'
+        values: '0+1x5 5x65'
+      - series: 'cogneva_project_control_unmeasured_total{reading="cost_unreadable",pod="cogneva-0"}'
+        values: '0+1x2 2x68'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: project_control_dispatch_failing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: project_control_cannot_read_the_ledger
+        exp_alerts: []
+
+  # 「这个进程没接账」与「账这一下读不出来」是两格：只坏后一格时，前一条不许跟着响。
+  # 这一格守的是两条规则各自的 `reading=` 选择器——少了它，任意一格量不出来都会让
+  # 「这个部署的装配错了」这条线跟着亮，而那是最该只在那件事发生时亮的一条。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_unmeasured_total{reading="cost_unreadable",pod="cogneva-0"}'
+        values: '0+1x70'
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_ledger",pod="cogneva-0"}'
+        values: '0x70'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: project_control_cannot_read_the_ledger
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reading: cost_unreadable
+      - eval_time: 30m
+        alertname: project_control_has_no_ledger
+        exp_alerts: []

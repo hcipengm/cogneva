@@ -2063,6 +2063,46 @@ data:
               "face": "token 管理"
             },
             {
+              "name": "project_control_dispatch_failing",
+              "promql": "max without (pod, container, instance, job) (increase(cogneva_project_control_outcomes_total{outcome=\"dispatch_failed\"}[1h]))",
+              "condition": {
+                "greater_than": 5.0
+              },
+              "severity": "warning",
+              "summary": "The loop that turns a performance breach into a task found a breach and could not hand it to the minting side {value} time(s) in the last hour. Read that number against the loop's own cadence rather than as a count of incidents: the minting side is called only on a pass that found a breach, so the loop cannot run more than six times an hour, and six here means every pass in the hour found a breach and not one of them got through. A single failed hand-off is a database that blinked -- the next pass re-reads the same breach and tries again -- so an event-shaped rule would page on a recovery that has already happened. The window is twice a round trip and an hour is six of them, which is why the bound is six and not one. What this does not say is why the hand-off failed: the error is in the gateway log on the same key, and the two series beside it say whether the loop could measure at all (cogneva_project_control_unmeasured_total, one cell per reason the measurement was impossible). Two outcome cells on the same counter are read for their existence and never for their slope, and this is the place to say it because this is the rule a reader arrives from: already_open climbs once every 600 seconds for as long as a project stays breached, which is the loop working, and refused climbs once every 600 seconds forever after a breach has spent its three attempts on one baseline -- a rate over refused is a line that never comes down, so a threshold on it is red from the first structural refusal onward. Neither cell has an alert on purpose. This counter is per process and restarts with the pod, which is right for counting what a loop did: a rolled gateway loses the count, and a rule over a window that outlives the process reads the increment after the restart rather than a total.",
+              "face": "变更管理"
+            },
+            {
+              "name": "project_control_has_no_ledger",
+              "promql": "max without (pod, container, instance, job) (cogneva_project_control_unmeasured_total{reading=\"no_ledger\"})",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The gateway's project-control loop ran a pass and there was no token ledger in the process to read costs from, so not one project's cost could be judged: schedule breaches still surface and cost breaches cannot, and a project overrunning its budget looks exactly like one inside it. This is a fact about how this deployment is assembled, not an event: it holds on every pass until the process is rebuilt with a ledger wired, so it is read as presence -- any value above zero -- and not as a rate. It is a separate cell from cost_unreadable beside it on the same series, and the split is the repair: this one is answered by the deployment, that one by the store. Zero here while the loop is running means the loop did measure, not that the deployment is right; an absent series means the loop has not published yet, which is what a gateway carrying no project-control loop looks like.",
+              "face": "变更管理"
+            },
+            {
+              "name": "project_control_cannot_read_the_ledger",
+              "promql": "max without (pod, container, instance, job) (increase(cogneva_project_control_unmeasured_total{reading=\"cost_unreadable\"}[1h]))",
+              "condition": {
+                "greater_than": 2.0
+              },
+              "severity": "warning",
+              "summary": "The token ledger was there but would not answer the project-control loop's cost question on {value} pass(es) in the last hour, so cost was not judged on those passes -- and an unmeasured cost is admitted as no breach rather than read as zero, which is why this must page instead of silently holding a project at its budget. Three in an hour is the bound and it is a third of the loop's own cadence: one failed read is the store having a moment and the next pass retries, while three inside six passes is a store that is not answering this question -- a lock, a saturated connection pool, a query the current schema cannot serve. It is the event-shaped sibling of the no_ledger cell beside it: that one is a deployment fact read as presence, this one is a store fact read over a window.",
+              "face": "变更管理"
+            },
+            {
+              "name": "project_control_has_no_baseline",
+              "promql": "max without (pod, container, instance, job) (cogneva_project_control_unmeasured_total{reading=\"no_baseline\"})",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The gateway's project-control loop tried to read the plan baselines and could not, so it judged no project at all: schedule and cost both start from the baseline, and a pass with no baseline reports no breach for every project at once -- the reading a deployment with nothing wrong and a deployment that cannot see its plans produce is the same picture. Read as presence, not as a rate: this is the shape of the plan table missing (the process is running a build whose migration has not created it) or of the store refusing the query, and neither clears by waiting one more pass. It is a distinct cell from no_ledger because the repairs are in different tables -- this one is the plan baseline that earn-value arithmetic starts from, that one is the per-call token ledger its cost half is read against.",
+              "face": "变更管理"
+            },
+            {
               "name": "llm_usage_upstream_silent",
               "promql": "sum by (upstream) (increase(llm_usage_readings_total{outcome=\"absent\"}[1h])) > 0",
               "condition": {
