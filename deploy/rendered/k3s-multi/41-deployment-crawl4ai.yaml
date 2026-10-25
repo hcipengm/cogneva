@@ -53,7 +53,8 @@ spec:
           volumeMounts:
             # Chromium 把共享内存当工作区用。默认的 64MiB 在中等页面上就会让渲染
             # 进程崩掉，而崩掉从外面看是「抓取超时」——读起来像对面站点慢。给
-            # 1Gi 的 tmpfs，随 Pod 走，不需要活过重启。
+            # 一块 tmpfs（大小取 values 的 shmSize，默认 1Gi），随 Pod 走，不需要
+            # 活过重启。
             - name: shm
               mountPath: /dev/shm
           securityContext:

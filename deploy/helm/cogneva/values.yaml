@@ -1205,7 +1205,7 @@ webFetch:
   replicas: 1
   # Chromium 把共享内存当工作区用：默认的 64MiB /dev/shm 在中等页面上就会让
   # 渲染进程崩掉，而崩掉的表现是抓取超时，不是「这一页读不了」。一个页面的
-  # 内存峰值 = 浏览器 + 这份 shm，limits 因此要比 shm 至少多出 1Gi。
+  # 内存峰值 = 浏览器 + 这份 shm，limits 因此要比 shm 多出一份浏览器峰值。
   shmSize: 1Gi
   resources:
     requests:

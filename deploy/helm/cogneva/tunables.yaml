@@ -1098,10 +1098,30 @@ rows:
       `measured` whenever the volume is the tighter of the two.
 
   - key: sandboxExecutor.repoFetchIntervalSecs
-    source: override
+    source: derived
     why: >-
-      How often the bare repository's main is fetched. A derived interval would
-      follow the observed push rate; nothing reads it.
+      How often the bare repository's main is fetched. The executor measures
+      how long `main` stayed still before its last move -- the only reading
+      anyone here has of the upstream push rate -- and polls at half that
+      stillness, floored at 30s. The configured number is the seed: it applies
+      until the first move is observed, and only then.
+      `the_fetch_period_follows_how_long_main_was_still` drives the pure
+      function with a busy repository, a quiet one, and no reading at all. The
+      loop still wakes on a fixed floor and reports a beat on every waking, so
+      a longer fetch interval is not reported as a stalled loop.
+    published:
+      # The executor publishes the wait it is actually keeping, labelled by
+      # whether a measurement decided it: a configured number and a measured
+      # one must not read the same on the panel.
+      owner: crates/cog-extension/src/workdir.rs
+      file: crates/cog-extension/src/workdir.rs
+      metric: FETCH_INTERVAL_METRIC
+      label: source
+    proof:
+      # Drives the observed stillness and the configured period and reads the
+      # wait back: those two inputs are the whole of what it may depend on.
+      file: crates/cog-extension/src/workdir.rs
+      test: the_fetch_period_follows_how_long_main_was_still
 
   - key: sandboxExecutor.resources.requests.cpu
     source: override
@@ -1275,6 +1295,55 @@ rows:
       from a reading. This number and the namespace quota are one knob in two
       places: the governance check refuses a ceiling the quota cannot admit, so
       raising it alone stops the next rollout rather than this Pod.
+
+  # --- 网页抓取（渲染后端，Crawl4AI）------------------------------------------
+  - key: webFetch.replicas
+    source: fixed
+    why: >-
+      One instance renders every page web_fetch asks for. A second replica would
+      add capacity nothing measures: the tool renders one page per call and no
+      reading of render queue depth or page latency is fed back into this number.
+      A deployment that runs it hot raises this by hand.
+
+  - key: webFetch.shmSize
+    source: override
+    why: >-
+      The size of the tmpfs mounted at /dev/shm. It is a dial, not a protocol
+      constant: Chromium dies on the 64MiB default and reports it as a timeout,
+      so it has to be given room. Sized from the page sizes this backend is
+      expected to render; nothing reads a renderer's actual shared-memory use
+      back into this number. Raising it alone widens the Pod, so it moves with
+      webFetch.resources.limits.memory.
+
+  - key: webFetch.resources.requests.cpu
+    source: override
+    why: >-
+      A request, not a measurement: without one the scheduler treats the Pod as
+      BestEffort and evicts it first, and an evicted renderer turns every
+      web_fetch into an error rather than a page. Sized from an idle serving cost
+      when the backend was added; nothing reads that cost back.
+
+  - key: webFetch.resources.requests.memory
+    source: override
+    why: >-
+      The resident cost of an idle browser-control server before any page is
+      rendered. A derived value would read the measured working set; nothing
+      does.
+
+  - key: webFetch.resources.limits.cpu
+    source: override
+    why: >-
+      Burst room for a page render, which is several requests and a layout pass.
+      No reading of render latency or concurrency is fed back into this number.
+
+  - key: webFetch.resources.limits.memory
+    source: override
+    why: >-
+      Browser plus the tmpfs above: the limit has to stay at least one GiB above
+      webFetch.shmSize, because the shared-memory pages count against this Pod.
+      This number and the namespace quota are one knob in two places: the
+      governance check refuses a ceiling the quota cannot admit, so raising it
+      alone stops the next rollout rather than this Pod.
 
   # --- platform webhook -------------------------------------------------------
   - key: webhook.nodePort
