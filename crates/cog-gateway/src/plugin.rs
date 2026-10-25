@@ -437,6 +437,19 @@ impl cog_core::SystemPlugin for GatewayPlugin {
                 (*shutdown_signal).clone(),
                 ctx.config().system.timeout_checker_interval_secs,
             );
+            // 绩效越界的回注。造任务的那一侧必须已经发布出来，否则这一环没有图
+            // 可以放活——缺席就是这套部署没有编排侧，那时候不跑比空转更诚实。
+            if let Some(minter) = ctx.consume_service::<dyn cog_core::ReplanMinter>() {
+                let _project_control = crate::project_control::spawn_project_control(
+                    state.clone(),
+                    minter,
+                    (*shutdown_signal).clone(),
+                );
+            } else {
+                tracing::debug!(
+                    "no ReplanMinter published: performance breaches stay readings, not tasks"
+                );
+            }
             // Gitee OAuth token refresher: no-ops unless OAuth-mode material
             // is present in the Secret.
             let gateway_cfg = &ctx.config().gateway;

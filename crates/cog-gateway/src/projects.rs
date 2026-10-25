@@ -244,7 +244,7 @@ async fn visible_tasks(state: &Arc<GatewayState>, claims: Option<&cog_core::Clai
 ///
 /// 空表的意思是「这些任务都没排过期」，读不到的意思是「没人问得出」。两个都
 /// 折成空表，甘特与项目列表就会把整个部署的排期状态报成一片空白。
-async fn readable_plans(
+pub(crate) async fn readable_plans(
     orchestrator: &Arc<dyn cog_core::OrchestratorControl>,
 ) -> Option<BTreeMap<String, cog_core::TaskPlan>> {
     match orchestrator.task_plans().await {
@@ -565,7 +565,7 @@ fn evm_window_start(
 
 /// 挣值响应的拼装与 handler 分开：三个量的算法是这一面唯一的实质，而它只有在
 /// 能被直接喂数据时才验得了。
-fn build_evm_response(
+pub(crate) fn build_evm_response(
     project_id: String,
     rows: &[&Task],
     plans: Option<&BTreeMap<String, cog_core::TaskPlan>>,

@@ -157,6 +157,30 @@ pub fn check(tasks: &[AtomicTask]) -> Vec<WbsDefect> {
     defects
 }
 
+/// 判一份单独造出来的工作包：没有父、没有人挂在它下面，所以它就是叶子。
+///
+/// 给「不是分解出来的、而是别处生成的一条活」用（比如绩效越界时造的那条重规划
+/// 任务）。它读的是与分解同一份判据——在这里另写一遍「叶子必须有验收标准」，
+/// 两处就会各自漂，而漂掉的那一处安静地放行没有验收标准的活。
+pub fn check_work_package(id: &str, acceptance: &[String]) -> Vec<WbsDefect> {
+    let package = AtomicTask {
+        id: id.to_string(),
+        name: id.to_string(),
+        skill_id: None,
+        description: None,
+        estimated_tokens: 0,
+        skill_gap: false,
+        blocked_by: Vec::new(),
+        blocks: Vec::new(),
+        input: serde_json::Value::Null,
+        output_entities: Vec::new(),
+        estimated_seconds: 0,
+        parent_id: None,
+        acceptance: acceptance.to_vec(),
+    };
+    check(&[package])
+}
+
 /// 把判词折成一句能写进判退原因的话。
 ///
 /// 逐条点名而不是只报条数：判退之后要重拆，重拆的人得知道是哪一片错了、错在哪。

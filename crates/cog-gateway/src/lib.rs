@@ -59,6 +59,7 @@ pub mod observability;
 pub mod observable;
 pub mod plugin;
 pub mod processes;
+pub mod project_control;
 pub mod projects;
 pub mod prometheus_render;
 pub mod promotion_gate;

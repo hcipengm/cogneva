@@ -45,6 +45,7 @@ pub mod prompt;
 pub mod protocol;
 pub mod quota;
 pub mod reflection;
+pub mod replan;
 pub mod reranker;
 pub mod resilience;
 pub mod resource_ledger;

@@ -198,3 +198,121 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.replay_dlq(task_id).await
     }
 }
+
+// ─── 绩效越界的回注 ───────────────────────────────────────────────────────
+
+/// 读得到逐笔 token 账的那一侧判出越界，能在图上造活的是这一侧；两件事各在一
+/// 地，所以回注走这个 trait，而不是让判定侧自己拼一条任务行塞进图里（那样判据
+/// 与去重会各演一遍，而两边都不知道对方演了一遍）。
+#[async_trait]
+impl cog_core::ReplanMinter for OrchestratorControlImpl {
+    async fn mint_replans(
+        &self,
+        breaches: &[cog_core::BreachReport],
+    ) -> SFResult<Vec<cog_core::ReplanMinting>> {
+        if breaches.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 一轮只扫一遍图：判定侧报上来的是一批越界，不是一条。
+        let tasks = self.get_all_tasks().await;
+        // 基线读不到时一条也不造：没有版本就没有去重键，硬造会让每一轮都多一条
+        // 一模一样的活。这个错误往上抛，判成「这一轮判不了」，而不是「没有越界」。
+        let plans = self.task_plans().await.map_err(|e| {
+            SFError::Database(format!(
+                "mint_replans: plan baselines are not readable, so which revision a breach \
+                 belongs to cannot be named: {e}"
+            ))
+        })?;
+        let revision_of = current_revisions(&tasks, &plans);
+        let now = chrono::Utc::now();
+
+        let mut minted = Vec::with_capacity(breaches.len());
+        let mut batch: Vec<Task> = Vec::new();
+        let mut batch_at: Vec<usize> = Vec::new();
+        for breach in breaches {
+            let Some(revision) = revision_of.get(&breach.project) else {
+                minted.push(cog_core::ReplanMinting {
+                    project: breach.project.clone(),
+                    index: breach.index,
+                    outcome: cog_core::ReplanOutcome::Refused {
+                        reason: format!(
+                            "项目 {} 没有任何计划基线：没有版本可挂，越界也就无从比对",
+                            breach.project
+                        ),
+                    },
+                });
+                continue;
+            };
+            match crate::replan::replan_task(breach, revision, &tasks, now) {
+                crate::replan::Decision::Mint(task) => {
+                    batch_at.push(minted.len());
+                    minted.push(cog_core::ReplanMinting {
+                        project: breach.project.clone(),
+                        index: breach.index,
+                        outcome: cog_core::ReplanOutcome::Minted {
+                            task_id: task.id.clone(),
+                        },
+                    });
+                    batch.push(*task);
+                }
+                other => minted.push(cog_core::ReplanMinting {
+                    project: breach.project.clone(),
+                    index: breach.index,
+                    outcome: other.into(),
+                }),
+            }
+        }
+
+        // 一批一起入图：同一轮里两处越界各自判过之后才写，写的时候不再重判。
+        // 入图返回的是**真正进了图**的 id——一个被同 id 顶掉的行不是新活，按
+        // 「造出来了」报出去，读面会去找一条自己看得到的活却什么都没有。
+        if !batch.is_empty() {
+            let added = self.dag_executor.add_tasks_batch(batch).await?;
+            for &at in &batch_at {
+                let cog_core::ReplanOutcome::Minted { task_id } = &minted[at].outcome else {
+                    continue;
+                };
+                if !added.contains(task_id) {
+                    minted[at].outcome = cog_core::ReplanOutcome::AlreadyMinted {
+                        task_id: task_id.clone(),
+                        open: true,
+                    };
+                }
+            }
+        }
+        Ok(minted)
+    }
+}
+
+/// 每个项目当前的基线版本：这个项目的计划行里 `updated_at` 最新的那一行说的那一版。
+///
+/// 取最新而不是取最早的：重规划写下的是一版新基线，判「这一版有没有过重规划」
+/// 要问的是最新那一版。按 `updated_at` 而不是按 `baseline_rev` 的字符串比——
+/// 后者是时间戳文本，字符串序只在同一格式同一时区下才对得上。
+fn current_revisions(
+    tasks: &[Task],
+    plans: &[cog_core::TaskPlan],
+) -> std::collections::BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+    let project_of: BTreeMap<&str, &str> = tasks
+        .iter()
+        .map(|t| (t.id.as_str(), t.project_key()))
+        .collect();
+    let mut latest: BTreeMap<String, (&chrono::DateTime<chrono::Utc>, &str)> = BTreeMap::new();
+    for plan in plans {
+        let Some(project) = project_of.get(plan.task_id.as_str()) else {
+            // 计划行比任务行活得久（任务归档了），它说不出这个项目现在是哪一版。
+            continue;
+        };
+        let entry = latest
+            .entry(project.to_string())
+            .or_insert((&plan.updated_at, plan.baseline_rev.as_str()));
+        if plan.updated_at >= *entry.0 {
+            *entry = (&plan.updated_at, plan.baseline_rev.as_str());
+        }
+    }
+    latest
+        .into_iter()
+        .map(|(project, (_, rev))| (project, rev.to_string()))
+        .collect()
+}
