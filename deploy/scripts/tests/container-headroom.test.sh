@@ -17,7 +17,12 @@
 #  10. Prometheus 返回 error -> 2；
 #  11. 一个容器没有上限 -> 0，但把它列出来（它不会被自己的上限杀，会去争节点的）；
 #  12. --record 在绿、红、读不到三种结局下都落一行；
-#  13. 红线与窗口写错 -> 2。
+#  13. 红线与窗口写错 -> 2；
+#  14. 窗口里留着样本、此刻已不存在的 Pod 不参与判定；
+#  15. 没有 kube_pod_info -> 2；
+#  16. init 容器的上限在另一族：有上限的 init 容器要被判，不能被读成「无上限」；
+#  17. 真没有上限的 init 容器仍列出来，不判红；
+#  18. 看得到 init 容器、看不到它们的上限族 -> 2（与第 9 条同一条道理）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,6 +59,8 @@ if table.get("__error__"):
     print(json.dumps({"status": "error", "error": table["__error__"]}))
     sys.exit(0)
 for needle, key in (("max_over_time", "rss"),
+                    ("kube_pod_init_container_resource_limits", "init_limit"),
+                    ("kube_pod_init_container_info", "init_info"),
                     ("kube_pod_container_resource_limits", "limit"),
                     ("kube_pod_info", "pods"),
                     ("last_terminated_reason", "oom_reason"),
@@ -95,6 +102,9 @@ state = {
              series("kube_pod_info", "redis-0", "", 1)],
     "oom_reason": [],
     "oom_age": [],
+    # init 容器的上限是另一族；默认没有 init 容器时两族都为空。
+    "init_limit": [],
+    "init_info": [],
 }
 exec(mutation)
 
@@ -220,4 +230,29 @@ make_scenario no_pods 'state["pods"] = []'
 out="$(status_of "${work}/no_pods")" && fail "15 没有 Pod 序列应退出 2"
 case "${out}" in *"没有 kube_pod_info"*) ;; *) fail "15 判词没有点名缺席的指标族：${out}" ;; esac
 
-echo "container-headroom: 15 组用例通过"
+# 16. init 容器的上限在另一族：有上限就该被判，不该被读成「无内存上限」
+make_scenario init_limited 'state["rss"].append(series("container_memory_rss", "sandbox-abc", "seed-sandbox", int(0.1 * Gi)))
+state["pods"].append(series("kube_pod_info", "sandbox-abc", "", 1))
+state["init_info"] = [series("kube_pod_init_container_info", "sandbox-abc", "seed-sandbox", 1)]
+state["init_limit"] = [series("kube_pod_init_container_resource_limits", "sandbox-abc", "seed-sandbox", int(0.5 * Gi))]'
+out="$(status_of "${work}/init_limited")" || fail "16 init 容器有余量应退出 0：${out}"
+case "${out}" in *"判过 3 个"*) ;; *) fail "16 有上限的 init 容器没有被判：${out}" ;; esac
+case "${out}" in *"无内存上限"*) fail "16 有上限的 init 容器被读成了无上限：${out}" ;; esac
+
+# 17. init 容器真的没有上限（KSM 报得出它、上限族里没有它）-> 仍列出来，不判红
+make_scenario init_unlimited 'state["rss"].append(series("container_memory_rss", "sandbox-abc", "seed-sandbox", int(0.1 * Gi)))
+state["pods"].append(series("kube_pod_info", "sandbox-abc", "", 1))
+state["init_info"] = [series("kube_pod_init_container_info", "sandbox-abc", "seed-sandbox", 1),
+                      series("kube_pod_init_container_info", "sandbox-abc", "tighten", 1)]
+state["init_limit"] = [series("kube_pod_init_container_resource_limits", "sandbox-abc", "tighten", int(0.5 * Gi))]'
+out="$(status_of "${work}/init_unlimited")" || fail "17 无上限的 init 容器不是红：${out}"
+case "${out}" in *"无内存上限的容器 1 个"*"seed-sandbox"*) ;; *) fail "17 没有点名无上限的 init 容器：${out}" ;; esac
+
+# 18. 看得到 init 容器、却看不到它们的上限族 -> 判不了，不是「它们都没有上限」
+make_scenario init_family_absent 'state["rss"].append(series("container_memory_rss", "sandbox-abc", "seed-sandbox", int(0.1 * Gi)))
+state["pods"].append(series("kube_pod_info", "sandbox-abc", "", 1))
+state["init_info"] = [series("kube_pod_init_container_info", "sandbox-abc", "seed-sandbox", 1)]'
+out="$(status_of "${work}/init_family_absent")" && fail "18 上限族缺席应退出 2"
+case "${out}" in *"kube_pod_init_container_resource_limits"*) ;; *) fail "18 判词没有点名缺席的指标族：${out}" ;; esac
+
+echo "container-headroom: 18 组用例通过"

@@ -310,18 +310,18 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 10
             failureThreshold: 6
-          # 内存这一档是按**量出来的**本地权重占用定的（实测进程峰值 RSS：嵌入的
-          # dense+sparse 两个 session 一起 1.67GiB，重排单 session 1.67GiB——两个
-          # session 读同一份权重文件，加第二个几乎不涨）。按三个 session 都给足来定：
-          # 嵌入的两半（混合检索）与重排都是本部署的终局能力。这些页是私有匿名页，
-          # 容器里不可回收，所以 limit 要真装得下。
+          # 内存这一档按**量出来的**占用给：实测三份权重各建一个 session 之后
+          # 实测进程以 4.52GiB 开始服务，跑几轮真实取数后稳定在 6.46GiB 上下，
+          # 并发高峰再往上要。只按出生那一下定的档装不下后段——实测每一代都在
+          # 贴住上限时被 OOMKilled。这些页是私有匿名页，容器里不可回收，所以
+          # limit 要真装得下而不是靠回收兜底。
           resources:
             requests:
               cpu: 500m
-              memory: 2Gi
+              memory: 6Gi
             limits:
               cpu: 4000m
-              memory: 8Gi
+              memory: 12Gi
           volumeMounts:
             - name: data
               mountPath: /var/lib/sf-data

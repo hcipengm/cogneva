@@ -308,10 +308,10 @@ spec:
           resources:
             limits:
               cpu: 4000m
-              memory: 8Gi
+              memory: 12Gi
             requests:
               cpu: 500m
-              memory: 2Gi
+              memory: 6Gi
           volumeMounts:
             - name: data
               mountPath: /var/lib/sf-data

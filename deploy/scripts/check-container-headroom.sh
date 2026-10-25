@@ -115,6 +115,14 @@ prom "max by (pod, container) (max_over_time(container_memory_rss{namespace=\"${
     "${work}/rss.json"
 prom "max by (pod, container) (kube_pod_container_resource_limits{namespace=\"${NS}\",resource=\"memory\"})" \
     "${work}/limit.json"
+# init 容器是另一族：kube-state-metrics 把应用容器与 init 容器的上限分在
+# `kube_pod_container_resource_limits` 与 `kube_pod_init_container_resource_limits`
+# 两条指标上，而 cAdvisor 的 RSS 不分——只读前一族时，每个有上限的 init 容器
+# 都会被读成「无内存上限」。实测踩过：sandbox 执行器的 seed-sandbox 有 LimitRange
+# 注入的内存上限，却被列进无上限名单。
+prom "max by (pod, container) (kube_pod_init_container_resource_limits{namespace=\"${NS}\",resource=\"memory\"})" \
+    "${work}/init_limit.json"
+prom "kube_pod_init_container_info{namespace=\"${NS}\"}" "${work}/init_info.json"
 # 窗口内的 RSS 会把**已经删掉的 Pod** 一起带回来（range 选择器只要窗口里有样本就算，
 # 不受 instant 查询的 5 分钟回看限制）。不按「此刻存在的 Pod」过滤的话，它们会因为没有
 # 上限序列被读成「无内存上限的容器」——那是把历史读成了现状。
@@ -189,6 +197,8 @@ def name(pod, container):
 
 rss = vector('rss.json')
 limits = vector('limit.json')
+init_limits = vector('init_limit.json')
+init_info = vector('init_info.json')
 pods = vector('pods.json')
 oom_reason = vector('oom_reason.json')
 oom_age = vector('oom_age.json')
@@ -215,6 +225,18 @@ if not limits:
     record('unreadable')
     raise SystemExit(f"CONTAINER-HEADROOM: 判不了：namespace {ns} 下没有 kube_pod_container_resource_limits"
                      "（kube-state-metrics 没起，或者所有容器都没写内存上限——这两种要修的地方不同，先查前者）")
+# init 容器的上限在另一族。这一族的缺席不能当「它们的上限是零」：与上面同一条道理，
+# 先看得到 init 容器的存在（kube_pod_init_container_info）、又看不到它们的上限，说明
+# 是 KSM 少给了这一族，不是这些容器真的没写上限。一个 init 容器都没有时这一族本就为空，
+# 那种情况 `init_info` 也为空，不判读不到。
+if init_info and not init_limits:
+    record('unreadable')
+    raise SystemExit(f"CONTAINER-HEADROOM: 判不了：namespace {ns} 下 kube-state-metrics 报得出 "
+                     "init 容器（kube_pod_init_container_info），却没有它们的上限序列"
+                     "（kube_pod_init_container_resource_limits）")
+# 名字撞车时以应用容器为准：RSS 那一族按 (pod, container) 本来也分不开两者，
+# 真的撞了名字，这一对读数在源头上就是一回事。
+limits = {**init_limits, **limits}
 
 secs = window_seconds(window)
 problems = []
