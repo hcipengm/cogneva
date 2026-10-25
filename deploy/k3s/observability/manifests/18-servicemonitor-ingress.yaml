@@ -16,8 +16,15 @@
 # 端口名都按各自 chart 的默认值写：traefik 的 `metrics`（k3s 自带的安装里默认
 # 不暴露，由 ../traefik-metrics-helmchartconfig.yaml 打开）、ingress-nginx 的
 # `metrics`（chart 默认开）。
+#
+# traefik 这份是 **PodMonitor**，不是 ServiceMonitor：k3s 自带 chart 的
+# `svc/traefik` 只暴露 `web`（80）与 `websecure`（443），9100 的 `metrics`
+# **只在 Pod 上**（chart 把 `--entryPoints.metrics.address=:9100/tcp` 落在容器
+# 端口表里，Service 不转它）。ServiceMonitor 的 `endpoints[].port` 必须对上
+# Service 的端口名，对不上时 Prometheus Operator 不产生目标、也不报错——面板上
+# 就是一条零线，与「入口没有请求」同形。PodMonitor 按 Pod 端口抓，才抓得到。
 apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
+kind: PodMonitor
 metadata:
   name: cogneva-ingress-traefik
   namespace: monitoring
@@ -30,7 +37,7 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: traefik
-  endpoints:
+  podMetricsEndpoints:
     - port: metrics
       path: /metrics
       interval: 30s

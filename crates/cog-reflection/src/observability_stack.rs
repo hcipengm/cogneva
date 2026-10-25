@@ -18,6 +18,11 @@
 //! 读不出来，于是告警永远解除不了，理由也变成了工具内部的补丁算法。见
 //! [`DiffOutcome`]。
 //!
+//! **逐文件交付，不是整批**：一份清单被拒只封住它自己，同一轮里其余该修的
+//! 照修，结论两边都说出来（见 [`obstructed_after_partial`]）。整批一起交的
+//! 代价是实测过的：`01-namespace.yaml` 里一条 `resourcequotas` 的授权缺口让
+//! 排在它后面的每一份都没被比过——外观上读作「这个循环什么都没做」。
+//!
 //! 交付对象由 `git ls-tree` **枚举**，跳过与否由清单目录里那张处置表
 //! （`delivery-dispositions.txt`）说了算——安装脚本读同一张表。两处各留一份
 //! 名单必然分叉，分叉的样子是"装的时候跳过、收敛的时候照做"。
@@ -279,6 +284,20 @@ pub enum Obstacle {
 }
 
 impl Obstacle {
+    /// 同一个成因、换一句更长的正文（带上文件名与这一轮的份数）。
+    ///
+    /// 成因的种类决定 severity 与 advice，这两样不该因为「顺便说清是哪份文件」
+    /// 而变；所以只换正文，不换种类。
+    pub fn with_detail(&self, detail: String) -> Obstacle {
+        match self {
+            Obstacle::NamespaceAbsent(_) => Obstacle::NamespaceAbsent(detail),
+            Obstacle::CrdAbsent(_) => Obstacle::CrdAbsent(detail),
+            Obstacle::Forbidden(_) => Obstacle::Forbidden(detail),
+            Obstacle::SecretRefused(_) => Obstacle::SecretRefused(detail),
+            Obstacle::Unusable(_) => Obstacle::Unusable(detail),
+        }
+    }
+
     pub fn detail(&self) -> &str {
         match self {
             Obstacle::NamespaceAbsent(d)
@@ -339,6 +358,41 @@ pub fn classify_obstacle(stderr: &str, namespace: &str) -> Option<Obstacle> {
         return Some(Obstacle::Forbidden(first_error_line(text)));
     }
     Some(Obstacle::Unusable(first_error_line(text)))
+}
+
+/// 一轮里既有交付成功的、也有被拒的时候，结论仍是「没收敛」，但要把两边都说出来。
+///
+/// 只报第一条成因会让人以为整轮白跑；只报修好的份数会把一次没收敛说成收敛。
+/// 严重度取最重的那条（命名空间整个不在时，其余每份都会陪报一次，不该让一条
+/// 授权缺口把它盖过去）；成因正文带上份数与文件名，这也是 [`Obstacle::Unusable`]
+/// 之外唯一能承载「一份文件」这个粒度的位置。
+pub fn obstructed_after_partial(
+    obstacles: &[(String, Obstacle)],
+    repaired: usize,
+) -> ConvergenceVerdict {
+    let worst = obstacles
+        .iter()
+        .map(|(_, o)| o)
+        .find(|o| o.severity() == "critical")
+        .or_else(|| obstacles.first().map(|(_, o)| o));
+    let Some(worst) = worst else {
+        return ConvergenceVerdict::Converged { resources: 0 };
+    };
+    let names: Vec<&str> = obstacles.iter().map(|(f, _)| f.as_str()).collect();
+    let mut detail = if names.len() == 1 {
+        format!("{}（{}）", worst.detail(), names[0])
+    } else {
+        format!(
+            "{}（本轮共 {} 份没能交付：{}）",
+            worst.detail(),
+            names.len(),
+            names.join(", ")
+        )
+    };
+    if repaired > 0 {
+        detail.push_str(&format!("；另有 {repaired} 份已按声明修回，这一轮不是白跑"));
+    }
+    ConvergenceVerdict::Obstructed(worst.with_detail(detail))
 }
 
 fn first_error_line(text: &str) -> String {
@@ -636,6 +690,11 @@ impl StackConvergence {
             tokio::time::Instant::now() + Duration::from_secs(self.cfg.apply_timeout_secs);
         let mut readings: Vec<(String, DiffOutcome)> = Vec::with_capacity(per_file.len());
         let mut line_counts: BTreeMap<String, usize> = BTreeMap::new();
+        // 一份文件被拒**不再作废整轮**。代价是实测过的：`01-namespace.yaml` 里那条
+        // `ResourceQuota` 因为 Role 少一条 `resourcequotas` 而被拒，而它按文件名排
+        // 最前，于是每一轮都在第一份上返回，后面十几份根本没被比过、也没被交付——
+        // 外观上读作「收敛循环什么都没做」。一份清单的授权缺口只该封住它自己。
+        let mut obstacles: Vec<(String, Obstacle)> = Vec::new();
         for (file, body) in &per_file {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             if left.is_zero() {
@@ -655,7 +714,12 @@ impl StackConvergence {
             let outcome = classify_diff(code, &stderr);
             if let DiffOutcome::Failed(_) = &outcome {
                 if let Some(obstacle) = classify_obstacle(&stderr, &self.cfg.namespace) {
-                    return ConvergenceVerdict::Obstructed(obstacle);
+                    warn!(
+                        file = %file,
+                        reason = %obstacle.detail(),
+                        "observability stack: this file cannot be compared this round; the rest are still compared and delivered"
+                    );
+                    obstacles.push((file.clone(), obstacle));
                 }
             }
             if !diff.trim().is_empty() {
@@ -712,44 +776,69 @@ impl StackConvergence {
             }
         }
 
-        let drifted = match drifted_files(&readings) {
+        // 比不出来的那份不进 `drifted_files`：它既不是"一致"也不是"不一致"，
+        // 是这一次没问到。它已经记在 `obstacles` 里，结论会带着它出去。
+        let comparable: Vec<(String, DiffOutcome)> = readings
+            .iter()
+            .filter(|(_, outcome)| !matches!(outcome, DiffOutcome::Failed(_)))
+            .cloned()
+            .collect();
+        let drifted = match drifted_files(&comparable) {
             Ok(drifted) => drifted,
             Err(detail) => return ConvergenceVerdict::NoEvidence(detail),
         };
         if drifted.is_empty() {
-            return ConvergenceVerdict::Converged {
-                resources: deliverable_docs,
-            };
+            if obstacles.is_empty() {
+                return ConvergenceVerdict::Converged {
+                    resources: deliverable_docs,
+                };
+            }
+            return obstructed_after_partial(&obstacles, 0);
         }
 
-        let (ok, stdout, stderr) = match self
-            .deployer
-            .apply_capture(
-                &self.cfg.namespace,
-                deliverable.as_bytes(),
-                self.cfg.apply_timeout_secs,
-            )
-            .await
-        {
-            Ok(out) => out,
-            Err(e) => return ConvergenceVerdict::NoEvidence(format!("apply 没能执行: {e}")),
-        };
-        if !ok {
-            if let Some(obstacle) = classify_obstacle(&stderr, &self.cfg.namespace) {
-                return ConvergenceVerdict::Obstructed(obstacle);
+        // 逐文件交付，而不是把整批拼成一份 blob：一份被拒时把整批一起拖下来，
+        // 是这条路上实测过的形状（一条配额授权缺口封掉了排在它后面的所有清单）。
+        let mut repaired: Vec<String> = Vec::new();
+        for file in &drifted {
+            let Some((_, body)) = per_file.iter().find(|(f, _)| f == file) else {
+                continue;
+            };
+            let (ok, stdout, stderr) = match self
+                .deployer
+                .apply_capture(
+                    &self.cfg.namespace,
+                    body.as_bytes(),
+                    self.cfg.apply_timeout_secs,
+                )
+                .await
+            {
+                Ok(out) => out,
+                Err(e) => return ConvergenceVerdict::NoEvidence(format!("{file} 的 apply: {e}")),
+            };
+            if !ok {
+                let obstacle = classify_obstacle(&stderr, &self.cfg.namespace)
+                    .unwrap_or_else(|| Obstacle::Unusable(first_error_line(&stderr)));
+                warn!(
+                    file = %file,
+                    reason = %obstacle.detail(),
+                    "observability stack: this file was not delivered this round"
+                );
+                obstacles.push((file.clone(), obstacle));
+                continue;
             }
-            return ConvergenceVerdict::NoEvidence(format!(
-                "apply 失败但没有可辨认的成因: {}",
-                first_error_line(&stderr)
-            ));
+            // apply 自己的输出只当交付细节记一行：`configured` 不是漂移读数（见
+            // [`DiffOutcome`]），写在这里是为了出事时能看见它到底写了哪些对象。
+            info!(
+                file = %file,
+                applied = %clip(&stdout, DIFF_LOG_CHARS),
+                "observability stack: drifted manifest re-applied"
+            );
+            repaired.push(file.clone());
         }
-        // apply 自己的输出只当交付细节记一行：`configured` 不是漂移读数（见
-        // [`DiffOutcome`]），写在这里是为了出事时能看见它到底写了哪些对象。
-        info!(
-            applied = %clip(&stdout, DIFF_LOG_CHARS),
-            "observability stack: drifted manifests re-applied"
-        );
-        ConvergenceVerdict::DriftRepaired { repaired: drifted }
+        if !obstacles.is_empty() {
+            return obstructed_after_partial(&obstacles, repaired.len());
+        }
+        ConvergenceVerdict::DriftRepaired { repaired }
     }
 
     /// 把结论送进持久化告警面（恢复时同一调用解除）。
@@ -855,6 +944,72 @@ pub fn validate_config(cfg: &ObservabilityStackConfig) -> SFResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 一份文件被拒，不该把整轮的结论说成「什么都没发生」。
+    ///
+    /// 实测过的形状：`01-namespace.yaml` 里那条 `ResourceQuota` 因为 Role 少一条
+    /// `resourcequotas` 被拒，而它按文件名排最前——整轮中止，排在它后面的十几份
+    /// 连比都没比过，读起来像「收敛循环什么都没做」。这一格钉的是：那份被拒的
+    /// 要点名，同一轮里修好的那些也要说出来，两者都不能被吞掉。
+    #[test]
+    fn a_refused_file_does_not_erase_what_the_same_round_did_deliver() {
+        let obstacles = vec![(
+            "01-namespace.yaml".to_string(),
+            Obstacle::Forbidden("resourcequotas \"monitoring-quota\" is forbidden".into()),
+        )];
+        let verdict = obstructed_after_partial(&obstacles, 3);
+        assert!(verdict.is_firing(), "有文件没交付，结论必须是没收敛");
+        let message = verdict.message("0123456789abcdef", 8);
+        assert!(
+            message.contains("01-namespace.yaml"),
+            "结论没说清是哪一份被拒：{message}"
+        );
+        assert!(
+            message.contains("3 份"),
+            "同一轮修好的那几份被吞掉了——读起来会像整轮白跑：{message}"
+        );
+    }
+
+    /// 多份被拒时点名到份数，而不是只报第一条成因。
+    #[test]
+    fn several_refusals_are_counted_not_collapsed_into_the_first() {
+        let obstacles = vec![
+            (
+                "01-namespace.yaml".to_string(),
+                Obstacle::Forbidden("a".into()),
+            ),
+            (
+                "04-servicemonitor-cogneva.yaml".to_string(),
+                Obstacle::Forbidden("b".into()),
+            ),
+        ];
+        let message = obstructed_after_partial(&obstacles, 0).message("0123456789abcdef", 8);
+        assert!(
+            message.contains("2 份"),
+            "只报了第一条，份数丢了：{message}"
+        );
+        assert!(
+            message.contains("04-servicemonitor-cogneva.yaml"),
+            "点名只点到第一份：{message}"
+        );
+    }
+
+    /// 严重度取最重的那条：命名空间整个不在时其余每份都会陪报一次，
+    /// 一条授权缺口不该把「栈根本没装」压成 warning。
+    #[test]
+    fn the_round_takes_the_heaviest_obstacle_not_the_first_one() {
+        let obstacles = vec![
+            ("a.yaml".to_string(), Obstacle::Forbidden("x".into())),
+            (
+                "b.yaml".to_string(),
+                Obstacle::NamespaceAbsent("monitoring 不存在".into()),
+            ),
+        ];
+        assert_eq!(
+            obstructed_after_partial(&obstacles, 1).severity(),
+            "critical"
+        );
+    }
 
     /// 可观测栈没收敛那一行要说得出该谁动。这条规则按设计不在规则库里（配置没到的
     /// 时候正是它要说话），所以面没有配置可申报，只有这一格写着——删掉它，行照 firing，

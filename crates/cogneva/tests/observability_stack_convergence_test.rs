@@ -198,6 +198,34 @@ fn the_install_script_consults_the_table_instead_of_carrying_its_own_list() {
     );
 }
 
+/// traefik 那份抓取目标按 **Pod 端口**抓，不是按 Service 端口。
+///
+/// k3s 自带 chart 的 `svc/traefik` 只转 `web` 与 `websecure`，9100 的 `metrics`
+/// 只在 Pod 上。ServiceMonitor 的 `endpoints[].port` 对不上 Service 的端口名时，
+/// Prometheus Operator **不产生目标也不报错**——面板上是一条零线，与「入口没有
+/// 请求」逐字同形。这一格钉住形状：名字还是那个名字，kind 必须按 Pod 抓。
+#[test]
+fn the_traefik_scrape_target_follows_the_pod_port_because_the_service_has_none() {
+    let text = read(&format!("{MANIFEST_DIR}/18-servicemonitor-ingress.yaml"));
+    let traefik = text
+        .split("---\n")
+        .find(|doc| doc.contains("name: cogneva-ingress-traefik"))
+        .expect("入口抓取清单里没有 traefik 那一份");
+    assert!(
+        traefik.contains("kind: PodMonitor"),
+        "traefik 那份回到了 ServiceMonitor：svc/traefik 不暴露 metrics 端口，\n\
+         这样写出来的目标不会被产生，而读数面读作「入口没有流量」"
+    );
+    assert!(
+        traefik.contains("podMetricsEndpoints"),
+        "PodMonitor 没有按 Pod 端口写端点"
+    );
+    assert!(
+        traefik.contains("port: metrics"),
+        "端点没有点名 chart 默认的 metrics 端口"
+    );
+}
+
 /// 循环得真被挂上，结论得进持久化告警面。
 #[test]
 fn the_convergence_loop_is_wired_and_persists_its_verdict() {
