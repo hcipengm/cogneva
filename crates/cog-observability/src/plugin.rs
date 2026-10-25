@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::alert_store::{NewAlert, PostgresAlertStore};
+use crate::alert_store::{AlertRowStore, NewAlert, PostgresAlertStore};
 use crate::bell::InAppNotifier;
 use crate::usage_store::LlmUsageStore;
 
@@ -1359,11 +1359,11 @@ const ALERT_BELL_BATCH: i64 = 200;
 // 参数多是因为这一环的每个入参都来自不同的插件服务，把它们捆成一个结构体只是把
 // 「谁给了什么」藏进构造点；这里逐个点名反而更好读。
 #[allow(clippy::too_many_arguments)]
-fn spawn_alert_bridge(
+fn spawn_alert_bridge<S>(
     channels: Vec<AlertChannel>,
     timeout_secs: u64,
     http_client: Option<Arc<dyn cog_core::HttpClient>>,
-    store: Option<Arc<PostgresAlertStore>>,
+    store: Option<Arc<S>>,
     supervisor: &Arc<dyn cog_core::Supervisor>,
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     // How long a firing row of a per-process rule may go unrefreshed before
@@ -1371,7 +1371,10 @@ fn spawn_alert_bridge(
     // beats it to the row.
     row_stale_after: std::time::Duration,
     stop: cog_core::ShutdownSignal,
-) -> Option<Arc<crate::alerts::AlertManager>> {
+) -> Option<Arc<crate::alerts::AlertManager>>
+where
+    S: AlertRowStore + 'static,
+{
     let manager = alert_manager(
         Vec::new(),
         &channels,
@@ -1383,6 +1386,10 @@ fn spawn_alert_bridge(
     // 环死期间到达的事件就再也补不回来——而那正是它最该补上的那一段。
     let alert_rx = Arc::new(tokio::sync::Mutex::new(supervisor.subscribe()));
     let manager_for_task = manager.clone();
+    // 桥只认这张表要的两件事，不认它是谁实现的：它到底按不按节拍去收，得能在没有
+    // 数据库的地方量出来。
+    let store: Option<Arc<dyn AlertRowStore>> = store.map(|s| s as Arc<dyn AlertRowStore>);
+    let sweep_every = sweep_period(row_stale_after);
     // 这条桥以前是个裸 `tokio::spawn`：它退出之后读数面上什么都没有——**告警从此
     // 不再落库**，而数据库里那张表看起来与「这段时间没有告警」同形。登记之后，
     // 它的退出落进 `cogneva_loop_deaths_total`。
@@ -1391,114 +1398,190 @@ fn spawn_alert_bridge(
         cog_core::loop_health::Cadence::EventDriven,
         stop.clone(),
         move |beat| {
-            let alert_rx = Arc::clone(&alert_rx);
-            let manager_for_task = manager_for_task.clone();
-            let store = store.clone();
-            let metrics = metrics.clone();
-            let stop = stop.clone();
-            async move {
-                // 先收掉上一个进程留下的按进程告警行。
-                //
-                // `agent_unhealthy` 说的是「本进程的注册表多久没听见这个 agent」：注册表在
-                // 内存里，进程重启后它从空开始，于是重启前那一批 id 再也不会被谁提起，它们
-                // 的行就永远停在 firing。2026-10-24 实测 3992 行，最老的一行从当天 08:40 起
-                // 没人刷新过，而活着的 16 个 agent 每十秒刷新一次。判据是**存活钟**而不是
-                // 规则名：一条 `last_seen_at` 好几个健康周期没动过的行，说的就是这个进程
-                // 没在看它。收掉它只在一个方向上可能猜错——真的还不健康的 agent 会在下一拍
-                // 用同一个 dedup 键重新点亮，一个周期内自愈。
-                if let Some(store) = store.clone() {
-                    let stale_before = chrono::Utc::now()
-                        - chrono::Duration::from_std(row_stale_after)
-                            .unwrap_or_else(|_| chrono::Duration::seconds(600));
-                    match store
-                        .resolve_unrefreshed("agent_unhealthy", stale_before)
-                        .await
-                    {
-                        Ok(0) => {}
-                        Ok(n) => warn!(
-                            resolved = n,
-                            "closed unhealthy-agent rows that no live health pass has \
-                             refreshed; they belong to a previous life of this process \
-                             and nothing would ever have moved them again"
-                        ),
-                        Err(e) => warn!(
-                            error = %e,
-                            "could not close the unhealthy-agent rows left unrefreshed; \
-                             the alert surface keeps showing them as live"
-                        ),
-                    }
-                }
-                // 三种结局分开写：`Lagged` 也是一个 `Err`，`while let Ok(..)` 会把它读成
-                // 「订阅结束」，于是这条桥静静退出——告警**从此不再落库**，而数据库里那张
-                // 表看起来与「这段时间没有告警」一模一样。这条桥没有别的存活读数。
-                loop {
-                    // 每一轮都盖一次章，无论队列里有没有东西：事件驱动的环大部分时间
-                    // 停在空队列上，只在有事件时才盖，报出来的是队列的安静。
-                    beat.beat();
-                    let received = {
-                        let mut rx = alert_rx.lock().await;
-                        tokio::select! {
-                            biased;
-                            _ = stop.wait() => return,
-                            received = rx.recv() => received,
-                        }
-                    };
-                    let event = match received {
-                        Ok(event) => event,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!(skipped, "alert bridge fell behind; it keeps consuming");
-                            if let Some(backend) = metrics.as_ref() {
-                                let mut labels = std::collections::HashMap::new();
-                                labels.insert(
-                                    "consumer".to_string(),
-                                    LAG_CONSUMER_ALERT_BRIDGE.to_string(),
-                                );
-                                if let Err(e) = backend
-                                    .record_counter(
-                                        cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL,
-                                        skipped as f64,
-                                        labels,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(error = %e, "alert bridge: could not record the events it missed");
-                                }
-                            }
-                            continue;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                    };
-                    let alerts = supervisor_event_to_alert_events(&event);
-                    if alerts.is_empty() {
-                        continue;
-                    }
-                    // Persist first: the row is what the in-app surface shows,
-                    // so whether it was written decides whether this batch
-                    // reached anybody when no external channel exists. The bell
-                    // reads the same table on its own cadence; writing here is
-                    // what makes an alert visible there at all.
-                    let persisted = match &store {
-                        Some(store) => persist_alerts(store, &alerts).await,
-                        None => false,
-                    };
-                    match &manager_for_task {
-                        Some(manager) => manager.notify(&alerts).await,
-                        None if persisted => {
-                            crate::alerts::record_delivered_in_app(metrics.as_ref(), alerts.len())
-                                .await
-                        }
-                        // Neither an external outlet nor a row: nobody can be
-                        // told, and without this cell that absence is on no
-                        // series at all.
-                        None => {
-                            crate::alerts::record_undelivered(metrics.as_ref(), alerts.len()).await
-                        }
-                    }
-                }
-            }
+            run_alert_bridge(
+                store.clone(),
+                manager_for_task.clone(),
+                metrics.clone(),
+                Arc::clone(&alert_rx),
+                row_stale_after,
+                sweep_every,
+                beat,
+                stop.clone(),
+            )
         },
     );
     manager
+}
+
+/// 这条桥负责收的、由**本进程自己的内存记账**维持的规则。
+///
+/// `agent_unhealthy` 点名的是「本进程的注册表多久没听见这个 agent」：注册表在内存里，
+/// 只有同一个进程的下一拍会再提起它。进程重启后它从空开始，于是重启前那一批 id 再也
+/// 不会被谁提起，它们的行就永远停在 firing。2026-10-24 实测 3992 行；2026-10-26 又是
+/// 一个两天的窗口里两万行，当下 firing 的 754 行全部由早就离开舰队的短命 squad 成员
+/// 撑着，而真正的舰队只有个位数。判据是**存活钟**而不是规则名：一条 `last_seen_at`
+/// 好几个健康周期没动过的行，说的就是这个进程没在看它。收掉它只在一个方向上可能猜错
+/// ——真的还不健康的 agent 会在下一拍用同一个 dedup 键重新点亮，一个周期内自愈。
+const PER_PROCESS_RULES: &[&str] = &["agent_unhealthy"];
+
+/// 多久收一次「没人再刷新」的行。
+///
+/// 取判据的一半：收得比判据慢，一条死掉的行在表上多挂的时长就是这段节拍；取一半让
+/// 最坏滞后不超过判据本身的一倍半。下限只管住「判据被配得极短」时不要把它变成对着表
+/// 打的热循环。
+fn sweep_period(row_stale_after: std::time::Duration) -> std::time::Duration {
+    (row_stale_after / 2).max(std::time::Duration::from_secs(30))
+}
+
+/// 收掉 [`PER_PROCESS_RULES`] 里 `row_stale_after` 这么久没人刷新的行，回答收了几行。
+async fn close_unrefreshed_rows(
+    store: &dyn AlertRowStore,
+    row_stale_after: std::time::Duration,
+    phase: &'static str,
+) -> u64 {
+    let stale_before = chrono::Utc::now()
+        - chrono::Duration::from_std(row_stale_after)
+            .unwrap_or_else(|_| chrono::Duration::seconds(600));
+    let mut closed = 0u64;
+    for rule in PER_PROCESS_RULES {
+        match store.resolve_unrefreshed(rule, stale_before).await {
+            Ok(0) => {}
+            Ok(n) => {
+                closed += n;
+                warn!(
+                    rule = %rule,
+                    phase,
+                    resolved = n,
+                    "closed rows that no live health pass has refreshed; they belong to \
+                     a previous life of this process, or to an id the fleet has since \
+                     dropped, and nothing would ever have moved them again"
+                );
+            }
+            Err(e) => warn!(
+                rule = %rule,
+                phase,
+                error = %e,
+                "could not close the rows left unrefreshed; the alert surface keeps \
+                 showing them as live"
+            ),
+        }
+    }
+    closed
+}
+
+/// 一次唤醒的原因。分成两支而不是把两支的代码并进 `select!`：收行要在**放下**订阅锁
+/// 之后做（它是一次数据库往返），而事件那一支必须拿着锁读下一帧。
+///
+/// 事件带一个盒子：`SupervisorEvent` 是这一层最大的枚举，不装盒子时每轮循环都要按
+/// 它的大小过一遍栈，而这条环在事件风暴里是最紧的那条。
+enum BridgeWake {
+    Sweep,
+    Event(Box<Result<cog_core::SupervisorEvent, tokio::sync::broadcast::error::RecvError>>),
+}
+
+/// 告警桥的循环体。
+///
+/// 从 [`spawn_alert_bridge`] 里拆出来只为可测：它只认一个接收端和一张表，不需要
+/// supervisor，所以「它到底按不按节拍去收」可以在没有集群、没有数据库的地方量出来。
+#[allow(clippy::too_many_arguments)]
+async fn run_alert_bridge(
+    store: Option<Arc<dyn AlertRowStore>>,
+    manager: Option<Arc<crate::alerts::AlertManager>>,
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    alert_rx: Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<cog_core::SupervisorEvent>>>,
+    row_stale_after: std::time::Duration,
+    sweep_every: std::time::Duration,
+    beat: cog_core::loop_health::Beat,
+    stop: cog_core::ShutdownSignal,
+) {
+    // 先收掉上一个进程留下的按进程告警行。
+    if let Some(store) = store.as_deref() {
+        close_unrefreshed_rows(store, row_stale_after, "start").await;
+    }
+    // 进程活着的这段时间也要收，而且这才是常态的一半：舰队的名字本来就在轮换（短命
+    // squad 成员、每次进化都换名的 agent）。一个 id 离开注册表之后，它的行既不会被本
+    // 进程再刷新、也不会被谁收掉——只留启动那一收，行数就只在重启时才掉一次，而读数
+    // 面在两班重启之间读到的是一个只涨不落的数。
+    let mut sweep =
+        tokio::time::interval_at(tokio::time::Instant::now() + sweep_every, sweep_every);
+    // 落后时不补打：补打只会在一次长时间停顿之后连着收几遍同一段。
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 三种结局分开写：`Lagged` 也是一个 `Err`，`while let Ok(..)` 会把它读成
+    // 「订阅结束」，于是这条桥静静退出——告警**从此不再落库**，而数据库里那张
+    // 表看起来与「这段时间没有告警」一模一样。这条桥没有别的存活读数。
+    loop {
+        // 每一轮都盖一次章，无论队列里有没有东西：事件驱动的环大部分时间
+        // 停在空队列上，只在有事件时才盖，报出来的是队列的安静。
+        beat.beat();
+        let woken = {
+            let mut rx = alert_rx.lock().await;
+            tokio::select! {
+                biased;
+                _ = stop.wait() => return,
+                // 收排在事件之前：事件风暴里它永远轮不到，而风暴正是行最多的时候。
+                // 它只是一句 UPDATE，插进来的延迟以毫秒计。
+                _ = sweep.tick(), if store.is_some() => BridgeWake::Sweep,
+                received = rx.recv() => BridgeWake::Event(Box::new(received)),
+            }
+        };
+        let received = match woken {
+            BridgeWake::Sweep => {
+                if let Some(store) = store.as_deref() {
+                    close_unrefreshed_rows(store, row_stale_after, "tick").await;
+                }
+                continue;
+            }
+            BridgeWake::Event(received) => *received,
+        };
+        let event = match received {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(skipped, "alert bridge fell behind; it keeps consuming");
+                if let Some(backend) = metrics.as_ref() {
+                    let mut labels = std::collections::HashMap::new();
+                    labels.insert(
+                        "consumer".to_string(),
+                        LAG_CONSUMER_ALERT_BRIDGE.to_string(),
+                    );
+                    if let Err(e) = backend
+                        .record_counter(
+                            cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL,
+                            skipped as f64,
+                            labels,
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %e, "alert bridge: could not record the events it missed");
+                    }
+                }
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        let alerts = supervisor_event_to_alert_events(&event);
+        if alerts.is_empty() {
+            continue;
+        }
+        // Persist first: the row is what the in-app surface shows,
+        // so whether it was written decides whether this batch
+        // reached anybody when no external channel exists. The bell
+        // reads the same table on its own cadence; writing here is
+        // what makes an alert visible there at all.
+        let persisted = match &store {
+            Some(store) => persist_alerts(store.as_ref(), &alerts).await,
+            None => false,
+        };
+        match &manager {
+            Some(manager) => manager.notify(&alerts).await,
+            None if persisted => {
+                crate::alerts::record_delivered_in_app(metrics.as_ref(), alerts.len()).await
+            }
+            // Neither an external outlet nor a row: nobody can be
+            // told, and without this cell that absence is on no
+            // series at all.
+            None => crate::alerts::record_undelivered(metrics.as_ref(), alerts.len()).await,
+        }
+    }
 }
 
 /// Stable dedup key: re-evaluating the same condition must hit the same row in
@@ -1606,7 +1689,7 @@ fn row_labels(inst: &AlertInstance) -> HashMap<String, String> {
 /// extracted here: the bell drains `notified_at IS NULL` rows on its own
 /// cadence, so every writer of this table — including the ones added later —
 /// reaches the same bell without knowing about it.
-async fn persist_alerts(store: &PostgresAlertStore, alerts: &[AlertEvent]) -> bool {
+async fn persist_alerts(store: &dyn AlertRowStore, alerts: &[AlertEvent]) -> bool {
     let mut all_written = true;
     for event in alerts {
         let (condition, inst) = match event {
@@ -2118,5 +2201,118 @@ mod tests {
                 "带实例标签的告警去重键要能区分实例"
             );
         }
+    }
+}
+
+/// 告警桥的收行节拍。这条判据的坏法没有表面：桥停收之后，表里剩下的行与「舰队一直
+/// 安静」同形，事件那一支照常工作，日志里也没有一行异常。
+///
+/// 所以这里量的是「它一直在收」，而不是「收一次对不对」——后者由 `alert_row_sweep`
+/// 对着真库量（判据是存活钟、不是规则名）。
+#[cfg(test)]
+mod bridge_sweep {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// 记下每一次收行：哪条规则、判据截在哪个时刻。
+    #[derive(Default)]
+    struct RecordingStore {
+        sweeps: Mutex<Vec<(String, DateTime<Utc>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AlertRowStore for RecordingStore {
+        async fn set_alert(
+            &self,
+            _condition: bool,
+            _alert: &NewAlert,
+        ) -> anyhow::Result<crate::alert_store::AlertTransition> {
+            panic!("这条测试不发 supervisor 事件，落库那一支不该被走到")
+        }
+
+        async fn resolve_unrefreshed(
+            &self,
+            rule: &str,
+            stale_before: DateTime<Utc>,
+        ) -> anyhow::Result<u64> {
+            self.sweeps
+                .lock()
+                .unwrap()
+                .push((rule.to_string(), stale_before));
+            Ok(1)
+        }
+    }
+
+    fn beat() -> cog_core::loop_health::Beat {
+        cog_core::loop_health::register(
+            "test_alert_bridge_sweep",
+            cog_core::loop_health::Cadence::EventDriven,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_bridge_keeps_closing_rows_while_it_runs() {
+        let store = Arc::new(RecordingStore::default());
+        // 发送端留在这里：接收端看到 `Closed` 时这条桥会退出，退出之后就不再收，
+        // 那样这条测试会以「只收了一次」的方式绿不了也红不了。
+        let (_tx, rx) = tokio::sync::broadcast::channel(8);
+        let stop = cog_core::ShutdownSignal::new();
+        let started = Utc::now();
+        let task = tokio::spawn(run_alert_bridge(
+            Some(store.clone() as Arc<dyn AlertRowStore>),
+            None,
+            None,
+            Arc::new(tokio::sync::Mutex::new(rx)),
+            Duration::from_secs(600),
+            Duration::from_millis(20),
+            beat(),
+            stop.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let sweeps = store.sweeps.lock().unwrap().clone();
+        stop.trigger();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+        assert!(
+            sweeps.len() >= 3,
+            "300ms 里只收了 {} 次：启动那一次之后就没人收了。舰队轮换掉的 id 会一直 \
+             留在 firing 里，直到下一次进程重启",
+            sweeps.len()
+        );
+        for (rule, cutoff) in &sweeps {
+            assert_eq!(rule, "agent_unhealthy");
+            // 每收一次都按「此刻往前推一个窗口」算判据，所以离本次启动刚好差这一个
+            // 窗口，再减去这一收晚于启动的那点时间。
+            let drift = chrono::Duration::seconds(600) - (started - *cutoff);
+            assert!(
+                drift.num_milliseconds().abs() <= 1000,
+                "判据截在 {cutoff}，离启动 {:?}，不是 row_stale_after 之前的 600 秒",
+                started - *cutoff
+            );
+        }
+    }
+
+    #[test]
+    fn the_sweep_comes_round_faster_than_the_window_it_enforces() {
+        for secs in [60u64, 120, 600, 3600] {
+            let window = Duration::from_secs(secs);
+            assert!(
+                sweep_period(window) < window,
+                "{secs}s 的判据配出了 {:?} 的节拍：一条死掉的行会比它自己的证据晚至少 \
+                 一个整窗口才被收掉",
+                sweep_period(window)
+            );
+        }
+        assert_eq!(
+            sweep_period(Duration::from_secs(600)),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            sweep_period(Duration::from_secs(1)),
+            Duration::from_secs(30),
+            "判据被配得极短时节拍要有下限，否则就是对着表打热循环"
+        );
     }
 }

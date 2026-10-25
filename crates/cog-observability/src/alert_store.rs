@@ -162,6 +162,47 @@ pub struct AlertRecord {
     pub acknowledged_by: Option<String>,
 }
 
+/// What the alert bridge needs from the table: light or clear a row, and close
+/// the rows nothing refreshes any more.
+///
+/// It is a trait so that "does the bridge keep closing them?" can be measured
+/// without a database. That question has no other answer on the surface: the
+/// sweep is the only part of the bridge that runs on a clock rather than on an
+/// event, so a bridge that stopped sweeping looks exactly like a quiet fleet.
+#[async_trait::async_trait]
+pub trait AlertRowStore: Send + Sync {
+    /// Write `alert` as firing (`condition`) or resolved.
+    async fn set_alert(&self, condition: bool, alert: &NewAlert)
+        -> anyhow::Result<AlertTransition>;
+
+    /// Close the firing rows of `rule` whose `last_seen_at` is older than
+    /// `stale_before`, answering how many were closed.
+    async fn resolve_unrefreshed(
+        &self,
+        rule: &str,
+        stale_before: DateTime<Utc>,
+    ) -> anyhow::Result<u64>;
+}
+
+#[async_trait::async_trait]
+impl AlertRowStore for PostgresAlertStore {
+    async fn set_alert(
+        &self,
+        condition: bool,
+        alert: &NewAlert,
+    ) -> anyhow::Result<AlertTransition> {
+        PostgresAlertStore::set_alert(self, condition, alert).await
+    }
+
+    async fn resolve_unrefreshed(
+        &self,
+        rule: &str,
+        stale_before: DateTime<Utc>,
+    ) -> anyhow::Result<u64> {
+        PostgresAlertStore::resolve_unrefreshed(self, rule, stale_before).await
+    }
+}
+
 /// PostgreSQL alert store.
 #[derive(Clone)]
 pub struct PostgresAlertStore {
