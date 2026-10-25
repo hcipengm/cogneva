@@ -7,20 +7,22 @@ kind: ResourceQuota
 metadata:
   name: cogneva-quota
   namespace: cogneva
-  # 额度按「声明工作负载 + 部署器判据 Job + 运行期自建 Pod + 替换重叠」定，
-  # 而前两项之外的第三项没有任何声明处：评测台与验收演练的 Pod 是运行时按需
-  # 建的。预算写在这儿，渲染期门禁读它算不等式；缺注解不是零，是门禁报错。
+  # 额度按「声明工作负载 + 部署器判据 Job + 运行期自建 Pod + 替换重叠」定。
+  # 第三项在这里留的是 0：产品自己建的 Pod（评测台）在创建前按自己的清单把额度
+  # 抬到装得下，跑完放回去，所以渲染期不必替它预写一份。`runtimeWorkloads` 里有
+  # 条目时（不由产品创建、也不会自己抬额度的那种），投影把它的形状加进求和，
+  # 这一行随之非零。缺注解不是零，是报错：留空读作"没声明"，不读作"不需要"。
   annotations:
-    cogneva.io/runtime-pods-limits-cpu: "3"
-    cogneva.io/runtime-pods-limits-memory: "3.75Gi"
+    cogneva.io/runtime-pods-limits-cpu: "0"
+    cogneva.io/runtime-pods-limits-memory: "0Gi"
   labels:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: resource-governance
 spec:
   hard:
-    requests.cpu: "6"
-    requests.memory: "11Gi"
-    limits.cpu: "37"
-    limits.memory: "62Gi"
+    requests.cpu: "4"
+    requests.memory: "10Gi"
+    limits.cpu: "34"
+    limits.memory: "58Gi"
     pods: "34"
     requests.storage: "430Gi"

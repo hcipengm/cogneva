@@ -329,7 +329,7 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.yaml"))):
     for d in docs:
         ann = ((d.get("metadata") or {}).get("annotations") or {})
         if "cogneva.io/runtime-pods-limits-cpu" in ann:
-            ann["cogneva.io/runtime-pods-limits-cpu"] = "1.5"
+            ann["cogneva.io/runtime-pods-limits-cpu"] = "0.5"
             hit = True
     if hit:
         with open(path, "w") as fh:
@@ -339,8 +339,8 @@ PYEOF
     || fail "the gate is red on the mutated budget in ${profile}"
   read -r mut_alone _ < <(read_cpu "${work}/budget-mut-${profile}.out")
   mut_covered="$(read_budget_cpu "${work}/budget-mut-${profile}.out")"
-  [ $(( mut_covered - mut_alone )) -eq $(( job_m + 1500 )) ] \
-    || fail "${profile}: setting the budget to 1.5 cores moved the reading to ${mut_covered}m from ${mut_alone}m, not to Job ${job_m}m + 1500m"
+  [ $(( mut_covered - mut_alone )) -eq $(( job_m + 500 )) ] \
+    || fail "${profile}: setting the budget to 0.5 cores moved the reading to ${mut_covered}m from ${mut_alone}m, not to Job ${job_m}m + 500m"
 
   # Absence control: no annotation means no declaration, and that is red. Reading it
   # as 0 would restore the pre-incident illusion of headroom.
@@ -389,8 +389,8 @@ PYEOF
   if bash "${gate}" "${over}" > "${work}/budget-over-${profile}.out" 2>&1; then
     fail "${profile}: the gate stayed green while rendered set + Job + budget passed the ceiling"
   fi
-  grep -q "运行期自建 Pod 预算" "${work}/budget-over-${profile}.out" \
-    || fail "${profile}: the over-budget verdict did not name the runtime-pod budget"
+  grep -q "运行期自建 Pod" "${work}/budget-over-${profile}.out" \
+    || fail "${profile}: the over-budget verdict did not name the runtime-pod term"
   echo "OK: ${profile}: budget ${bud_m}m follows the annotation, absence is red"
 done
 

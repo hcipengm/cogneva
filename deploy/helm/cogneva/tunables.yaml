@@ -1006,8 +1006,11 @@ rows:
   # `values.resource-governance.<profile>.yaml`, which carries a GENERATED header
   # and is re-derived (and compared byte for byte) on every render. So no row here covers
   # them -- a row would be a second source for a number whose whole point is that
-  # nobody writes it. What remains below are the inputs to that projection (the two
-  # terms no manifest can declare) and the policy defaults it copies through.
+  # nobody writes it. What remains below are the inputs to that projection -- the
+  # only terms no rendered manifest can declare -- and the policy defaults it copies
+  # through. The runtime workloads are inputs of the same kind: their shape is a
+  # declaration the pod's own code makes, and the projection sums it like any other
+  # workload rather than trusting a hand-written budget.
   - key: resourceGovernance.clusterNodes
     source: override
     why: >-
@@ -1017,23 +1020,10 @@ rows:
       projection reads it from there -- so a cluster with more nodes is a profile
       edit plus a re-render, not a number typed into the ceiling.
 
-  - key: resourceGovernance.runtimePods.limitsCpu
-    source: override
-    why: >-
-      The CPU-limits budget for pods the operating face creates on demand (the
-      eval table, the drill Job). They are in no rendered workload, yet the quota
-      counts them; nothing else declares their size, so the quota carries it as an
-      annotation and the projection folds it into the headroom arithmetic.
-      Zero is a declaration too -- an absent annotation is an error, not 0.
-
-  - key: resourceGovernance.runtimePods.limitsMemory
-    source: override
-    why: >-
-      The memory-limits budget for the same runtime-created pods. On 2026-10-19
-      their absence from the arithmetic is what let the gate report headroom while
-      admission was already refusing the deployer's rollout Job; the annotation is
-      the declaration that makes the gap checkable.
-
+  # 运行期自建 Pod 那部分额度没有行，因为它没有一个写在 values 里的数：评测台
+  # 创建 Pod 前按自己那份清单算出它占多少、把额度抬到装得下，跑完放回去——尺寸
+  # 的唯一来源是建它的代码，跟着它变，没有第二处可漂。`runtimeWorkloads` 留给
+  # 不由产品创建、也不会自己抬额度的那类 Pod；今天它是空的，所以这里没有行。
   - key: resourceGovernance.limitRange.defaultCpu
     source: override
     why: >-

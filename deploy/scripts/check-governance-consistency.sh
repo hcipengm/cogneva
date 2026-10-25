@@ -14,13 +14,14 @@
 #      LimitRange 自己的 default/defaultRequest 也要在上下限内
 #   4. 工作负载的单副本下限和（副本数 × 每 Pod 请求，DaemonSet 按 1 计），
 #      **加上部署器运行期必然自己创建的判据 Job**，**再加 ResourceQuota 注解
-#      声明的运行期自建 Pod 预算**，≤ quota 的 cpu/memory 额度。
+#      声明的运行期自建 Pod**（注解等于 chart 的 runtimeWorkloads 之和，由投影算），
+#      ≤ quota 的 cpu/memory 额度。
 #      渲染期拿不到节点数，DaemonSet 与滚动期的并发 Job 都按 1 计，所以这是一个
 #      **下限**：下限越界必定越界，下限不越界不等于多节点下也不越界（那是 values
 #      注释里运维 --set 的事）。后两项不是外推的下限——判据 Job 每一次滚动都在，
 #      评测台 / 验收演练的 Pod 按需就在，且它们都记在同一只配额的 used 上；把它们
 #      挡在判词之外，就是让必然到达的量躲在「头寸」那行后面（两次实测都是这么
-#      越界的：判据 Job 一次、运行期自建 Pod 一次）。预算注解缺失报错，不当作 0。
+#      越界的：判据 Job 一次、运行期自建 Pod 一次）。注解缺失报错，不当作 0。
 #
 # 本门读的是**声明值**（渲染产物里的 `spec.hard`），不与 live 集群那只 ResourceQuota
 # 比对。所以本门绿只说「声明的天花板容得下声明的工作负载」——**不等于**「集群此刻装得下」。
@@ -329,9 +330,10 @@ for face, quota_key, unit in (('requests', 'requests.cpu', 'cpu'),
         if isinstance(runtime_pods, dict) and 'error' in runtime_pods:
             msg = (
                 f"ResourceQuota 缺少注解 {runtime_pods['error']}：运行期按需建的 Pod"
-                f"（评测台、验收演练）同样记在这只配额的 used 上，它的预算没有别的"
-                f"声明处；缺了就无从核「额度替它留够没有」。没有这类 Pod 也要写成 0，"
-                f"不要留空——留空在这里读作缺声明，不读作零")
+                f"（不由产品创建的那类）同样记在这只配额的 used 上，只有这一行声明"
+                f"它们；缺了就无从核「额度替它留够没有」。产品自己创建的 Pod（评测台）"
+                f"在创建前按自己的清单把额度抬上去、跑完放回去，不算在这一行里。没有"
+                f"这类 Pod 也要写成 0，不要留空——留空在这里读作缺声明，不读作零")
             if msg not in errors:
                 errors.append(msg)
         elif runtime_pods:
@@ -344,16 +346,16 @@ for face, quota_key, unit in (('requests', 'requests.cpu', 'cpu'),
             if covered < 0:
                 errors.append(
                     f"工作负载单副本{face}.{unit} 下限和 {shown(totals)} + 部署器判据 Job "
-                    f"{shown(job_extra)} + 运行期自建 Pod 预算（注解 {ann_key} = "
+                    f"{shown(job_extra)} + 运行期自建 Pod（注解 {ann_key} = "
                     f"{runtime_pods[unit]}）= {shown(totals + job_extra + budget)} 已超过"
                     f"配额 {quota_key} = {hard[quota_key]}：运行期自建的 Pod 记在同一只"
                     f"配额的 used 上，这一项留不够，准入会先拒掉下一次滚动 Job 而不是"
                     f"等到声明和越界")
             else:
                 notes.append(
-                    f"  └ 再计入运行期自建 Pod 预算（注解 {ann_key} = "
+                    f"  └ 再计入运行期自建 Pod（注解 {ann_key} = "
                     f"{runtime_pods[unit]}）：{shown(totals)} + 判据 Job "
-                    f"{shown(job_extra)} + 预算 {shown(budget)} = "
+                    f"{shown(job_extra)} + 运行期 Pod {shown(budget)} = "
                     f"{shown(totals + job_extra + budget)} vs 配额 {hard[quota_key]}，"
                     f"头寸 {shown(covered)}（仍不含替换重叠）")
 
@@ -423,7 +425,7 @@ for face, quota_key, unit in (('requests', 'requests.cpu', 'cpu'),
             if rolled < 0:
                 errors.append(
                     f"工作负载单副本{face}.{unit} 下限和 {shown(totals)} + 判据 Job "
-                    f"{shown(job_extra)} + 运行期预算 {shown(budget)} + 替换重叠 "
+                    f"{shown(job_extra)} + 运行期 Pod {shown(budget)} + 替换重叠 "
                     f"{shown(overlap)}（{overlap_who}）= "
                     f"{shown(totals + job_extra + budget + overlap)} 已超过配额 "
                     f"{quota_key} = {hard[quota_key]}：滚动那一刻新旧两个 Pod 同时在"
@@ -432,14 +434,14 @@ for face, quota_key, unit in (('requests', 'requests.cpu', 'cpu'),
             else:
                 notes.append(
                     f"  └ 再计入替换重叠 {shown(overlap)}（{overlap_who}）："
-                    f"{shown(totals)} + 判据 Job {shown(job_extra)} + 预算 "
+                    f"{shown(totals)} + 判据 Job {shown(job_extra)} + 运行期 Pod "
                     f"{shown(budget)} + 重叠 {shown(overlap)} = "
                     f"{shown(totals + job_extra + budget + overlap)} vs 配额 "
                     f"{hard[quota_key]}，头寸 {shown(rolled)}")
 
 notes.append(
     "limits 两维的头寸算的是声明的工作负载 + 部署器自己创建的判据 Job + 注解声明的"
-    "运行期自建 Pod 预算 + 最大一份替换重叠：这四项加起来才是一次滚动真正需要的准入"
+    "运行期自建 Pod + 最大一份替换重叠：这四项加起来才是一次滚动真正需要的准入"
     "余量。负载波动仍不在这条不等式里，此刻集群装不装得下由运行期判词回答"
     "（check-cross-layer-reconcile.sh 判据 3）")
 

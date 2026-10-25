@@ -234,6 +234,68 @@ impl PodRuntime {
         })
     }
 
+    /// 这只配额此刻的 `(used, hard)`，两维都只取 limits。
+    ///
+    /// `Ok(None)` ＝ 命名空间里没有这只配额（治理关掉了，或者这不是那套安装）：
+    /// 那时没有额度要抬，Pod 建不建得上由准入自己回答，这里不去替它编一个额度。
+    async fn quota(&self) -> anyhow::Result<Option<(Quota, Quota)>> {
+        let out = self
+            .exec(&[
+                "get".into(),
+                "resourcequota".into(),
+                QUOTA_NAME.into(),
+                "-o".into(),
+                "json".into(),
+            ])
+            .await?;
+        if out.code != Some(0) {
+            return Ok(None);
+        }
+        let doc: serde_json::Value = serde_json::from_str(&out.stdout)
+            .map_err(|e| anyhow::anyhow!("resourcequota {QUOTA_NAME}: {e}"))?;
+        let side = |pointer: &str| {
+            let map = &doc[pointer];
+            Quota {
+                cpu: map["limits.cpu"].as_str().and_then(cpu_millis).unwrap_or(0),
+                memory: map["limits.memory"]
+                    .as_str()
+                    .and_then(mem_bytes)
+                    .unwrap_or(0),
+            }
+        };
+        Ok(Some((side("/status/used"), side("/spec/hard"))))
+    }
+
+    /// 把配额的 limits 两维抬到给的那组数（只抬、不降：降是下一次交付的事，
+    /// 那一次带着投影出来的额度一起落地）。
+    async fn raise_quota(&self, to: Quota) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "spec": { "hard": {
+                "limits.cpu": cpu_text(to.cpu),
+                "limits.memory": mem_text(to.memory),
+            }}
+        });
+        let out = self
+            .exec(&[
+                "patch".into(),
+                "resourcequota".into(),
+                QUOTA_NAME.into(),
+                "--type=merge".into(),
+                "-p".into(),
+                body.to_string(),
+            ])
+            .await?;
+        if out.code != Some(0) {
+            anyhow::bail!(
+                "cannot raise {QUOTA_NAME} to {} / {}: {}",
+                cpu_text(to.cpu),
+                mem_text(to.memory),
+                tail(&out.stderr, 400)
+            );
+        }
+        Ok(())
+    }
+
     /// 一条**长命**的 `kubectl exec -i` 的程序与参数，交给 stdio 传输去起。
     ///
     /// 与 [`Self::exec`] 的差别只在寿命，不在命令：那条等一条命令跑完再把输出取回来，
@@ -450,6 +512,92 @@ fn manifest(pod: &str, pack_image: &str, pg_image: &str, limits: &PodLimits) -> 
     })
 }
 
+/// 命名空间那只额度：评测台的 Pod 与渲染集里的工作负载记在同一只上。
+const QUOTA_NAME: &str = "cogneva-quota";
+
+/// 一道题在额度上占多少。CPU 按千分之一核、内存按字节，都是整数——额度这一维
+/// 只需要比大小，浮点只会在这里制造一次"看起来相等"的误判。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Quota {
+    cpu: u64,
+    memory: u64,
+}
+
+fn cpu_millis(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if let Some(milli) = text.strip_suffix('m') {
+        return milli.parse().ok();
+    }
+    // 不带后缀就是整数核。带小数（`0.5`）也收：kubectl 打印的 used 两种都有。
+    let cores: f64 = text.parse().ok()?;
+    Some((cores * 1000.0).round() as u64)
+}
+
+fn cpu_text(millis: u64) -> String {
+    format!("{millis}m")
+}
+
+fn mem_bytes(text: &str) -> Option<u64> {
+    let text = text.trim();
+    for (suffix, factor) in [
+        ("Ki", 1u64 << 10),
+        ("Mi", 1u64 << 20),
+        ("Gi", 1u64 << 30),
+        ("Ti", 1u64 << 40),
+        ("k", 1_000),
+        ("M", 1_000_000),
+        ("G", 1_000_000_000),
+    ] {
+        if let Some(number) = text.strip_suffix(suffix) {
+            let value: f64 = number.parse().ok()?;
+            return Some((value * factor as f64).round() as u64);
+        }
+    }
+    text.parse().ok()
+}
+
+fn mem_text(bytes: u64) -> String {
+    bytes.to_string()
+}
+
+/// 一台 Pod 的 `spec` 在额度上占多少：业务容器求和，再与 init 取大者——与
+/// kubelet 记账一致（init 容器跑完就没了，同时存在的只有业务容器）。
+///
+/// 只算 limits：这只配额按 limits 记账。数量从**这台 Pod 自己的清单**里读，所以
+/// 它跟着清单走——调用方把 `--pack-cpu` 调大，这里跟着变大，不需要谁再改一个数。
+fn pod_demand(doc: &serde_json::Value) -> Quota {
+    fn tally(items: Option<&Vec<serde_json::Value>>) -> Quota {
+        let mut total = Quota::default();
+        for item in items.into_iter().flatten() {
+            let limits = &item["resources"]["limits"];
+            total.cpu += limits["cpu"].as_str().and_then(cpu_millis).unwrap_or(0);
+            total.memory += limits["memory"].as_str().and_then(mem_bytes).unwrap_or(0);
+        }
+        total
+    }
+
+    let containers = tally(doc["spec"]["containers"].as_array());
+    let init = tally(doc["spec"]["initContainers"].as_array());
+    Quota {
+        cpu: containers.cpu.max(init.cpu),
+        memory: containers.memory.max(init.memory),
+    }
+}
+
+/// 要让这台 Pod 进得去，`hard` 至少要抬到多少；现在的额度已经装得下就返回
+/// `None`——`None` 是"什么都没动"，不是"抬到 0"。
+///
+/// 判据是 `used + 这台 Pod ≤ hard`，每一项都从集群上读：used 是此刻**已经在
+/// 额度里的人**，want 是这台 Pod 自己的清单。写下来的预算做不到这一点——它既
+/// 不知道此刻谁在跑，也不知道调用方把容器的 limits 调成了多少。
+fn widen_needed(used: Quota, hard: Quota, want: Quota) -> Option<Quota> {
+    let target = Quota {
+        cpu: hard.cpu.max(used.cpu.saturating_add(want.cpu)),
+        memory: hard.memory.max(used.memory.saturating_add(want.memory)),
+    };
+    (target != hard).then_some(target)
+}
+
 /// 判分脚本 stdout 里那两种行 → 逐条检查。
 ///
 /// 认的是 `[PASS] <名字>` 与 `[FAIL] <名字>[: 细节]` 两种**形状**，不是「这行里有没有
@@ -529,16 +677,30 @@ impl PodToolathlonBackend {
         let pod = Arc::new(ToolathlonPod {
             runtime: self.runtime.clone(),
             name: name.clone(),
+            raised: std::sync::Mutex::new(None),
         });
         // 同名先清掉：上一次跑留下的半成品会让这一次的 apply 直接失败。
         pod.remove().await;
 
         let path = manifest_path(&name);
-        std::fs::write(
-            &path,
-            manifest(&name, &self.pack_image, &self.pg_image, &self.limits).to_string(),
-        )
-        .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
+        let doc = manifest(&name, &self.pack_image, &self.pg_image, &self.limits);
+        std::fs::write(&path, doc.to_string())
+            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
+        // 这台 Pod 不在渲染集里，额度没替它留位置：按它自己的清单把额度抬到装得
+        // 下，跑完由 `remove()` 放回去。抬不动就当作这一格失败——让 apply 去撞
+        // 准入也能撞出同样的结局，但那时候报的是配额里一个数量，读不出是这一步。
+        if let Some((used, hard)) = self.runtime.quota().await? {
+            if let Some(target) = widen_needed(used, hard, pod_demand(&doc)) {
+                self.runtime.raise_quota(target).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "{} does not fit the namespace ceiling and it cannot be widened \
+                         for this pod: {e}",
+                        name
+                    )
+                })?;
+                *pod.raised.lock().expect("quota guard") = Some(hard);
+            }
+        }
         let out = self
             .runtime
             .exec(&["apply".into(), "-f".into(), path.display().to_string()])
@@ -694,6 +856,10 @@ impl ToolathlonBackend for PodToolathlonBackend {
 pub(crate) struct ToolathlonPod {
     runtime: Arc<PodRuntime>,
     name: String,
+    /// 这台 Pod 为了让额度装下自己而抬上去之前的那组数。`Some` ＝ 额度是这台
+    /// Pod 抬的，它被删掉时要放回去；`None` ＝ 额度没动过（本来就装得下，或者
+    /// 命名空间里没有那只配额）。
+    raised: std::sync::Mutex<Option<Quota>>,
 }
 
 impl ToolathlonPod {
@@ -783,6 +949,7 @@ impl ToolathlonPod {
         Self {
             runtime: Arc::new(PodRuntime::for_test(prefix, namespace)),
             name: name.to_string(),
+            raised: std::sync::Mutex::new(None),
         }
     }
 
@@ -800,6 +967,21 @@ impl ToolathlonPod {
                 "--ignore-not-found".into(),
             ])
             .await;
+        // 额度放回这台 Pod 来之前那一组。它只是为了这一台 Pod 才抬上去的：不
+        // 放回去，一次评测就把命名空间的额度永久放宽，而声明（渲染集投影出来的
+        // 那一份）与集群实际执行的差额会一直留着——那正是治理漂移读数要抓的
+        // 东西，不该由一次评测制造出来。放不回去不是这一格的失败（Pod 已经删了，
+        // 下一次交付会把额度落回投影值），但它是"额度此刻高于声明"的一个来源，
+        // 所以要留一条日志。
+        let before = self.raised.lock().expect("quota guard").take();
+        if let Some(before) = before {
+            if let Err(e) = self.runtime.raise_quota(before).await {
+                tracing::warn!(
+                    pod = %self.name,
+                    "cannot put the namespace ceiling back after the eval pod: {e:#}"
+                );
+            }
+        }
     }
 }
 
@@ -1126,6 +1308,119 @@ mod tests {
             pg["resources"]["limits"]["memory"],
             serde_json::json!("2Gi")
         );
+    }
+
+    /// 这台 Pod 要多少额度，从**它自己的清单**算。
+    ///
+    /// 评测台的 Pod 不在渲染集里，所以命名空间的额度没有替它留位置，建它之前要
+    /// 按它占多少把额度抬上去。占多少不能是写下来的一个数：调用方能把
+    /// `--pack-cpu` 调大，容器也会变——写死的数在那一刻就错了，而错的方向正好是
+    /// 「容得下旧的那台、容不下新的那台」。这里钉的是：数与清单同源。
+    #[test]
+    fn the_demand_is_read_from_the_manifest_this_module_writes() {
+        let defaults = pod_demand(&manifest("ta-x-0", "pack", "pg", &PodLimits::default()));
+        // app 与 postgres 两台的 limits 相加；init 那台比这和小，取大者仍是它。
+        assert_eq!(
+            defaults,
+            Quota {
+                cpu: 3000,
+                memory: 4 * (1 << 30)
+            }
+        );
+
+        // 调用方把上限调大，占用量跟着走，不需要谁去改第二个地方。
+        let bigger = pod_demand(&manifest(
+            "ta-x-0",
+            "pack",
+            "pg",
+            &PodLimits {
+                pack_cpu: "7".into(),
+                pack_memory: "9Gi".into(),
+                pg_cpu: "3".into(),
+                pg_memory: "2Gi".into(),
+            },
+        ));
+        assert_eq!(
+            bigger,
+            Quota {
+                cpu: 10_000,
+                memory: 11 * (1 << 30)
+            }
+        );
+
+        // init 那台比业务容器大时按 init 算：两者从不并存，取大者才是 kubelet 的记账。
+        let mut doc = manifest("ta-x-0", "pack", "pg", &PodLimits::default());
+        doc["spec"]["initContainers"][0]["resources"]["limits"]["cpu"] = serde_json::json!("5");
+        assert_eq!(pod_demand(&doc).cpu, 5000);
+    }
+
+    /// 抬多少：`used + 这台 Pod` 与 `hard` 比，只抬不降。
+    ///
+    /// 三项都是读数——used 是此刻已经在额度里的人，want 是这台 Pod 的清单，hard
+    /// 是集群正在执行的额度。没有一项来自写下来的预算，所以「集群里现在谁在跑」
+    /// 变了，抬出来的数跟着变。
+    #[test]
+    fn the_ceiling_is_widened_to_what_is_running_plus_this_pod() {
+        let want = Quota {
+            cpu: 3000,
+            memory: 4 << 30,
+        };
+
+        // 装得下：一个字节都不动——`None` 是"没动过"，不是"抬到 0"。
+        let used = Quota {
+            cpu: 20_000,
+            memory: 40 << 30,
+        };
+        let hard = Quota {
+            cpu: 30_000,
+            memory: 50 << 30,
+        };
+        assert_eq!(widen_needed(used, hard, want), None);
+
+        // 装不下：抬到 used + want，不多抬一分。
+        let hard = Quota {
+            cpu: 22_000,
+            memory: 44 << 30,
+        };
+        assert_eq!(
+            widen_needed(used, hard, want),
+            Some(Quota {
+                cpu: 23_000,
+                memory: 44 << 30
+            }),
+        );
+
+        // 只抬缺的那一维：CPU 有余、内存不够时，CPU 留在原处。
+        let hard = Quota {
+            cpu: 30_000,
+            memory: 41 << 30,
+        };
+        assert_eq!(
+            widen_needed(used, hard, want),
+            Some(Quota {
+                cpu: 30_000,
+                memory: 44 << 30
+            }),
+        );
+
+        // 已经比抬完还宽（上一次交付或上一次抬过）：不为"对齐"把它降下来。
+        let hard = Quota {
+            cpu: 60_000,
+            memory: 80 << 30,
+        };
+        assert_eq!(widen_needed(used, hard, want), None);
+    }
+
+    #[test]
+    fn quantities_round_trip_through_the_two_unit_spellings() {
+        assert_eq!(cpu_millis("3"), Some(3000));
+        assert_eq!(cpu_millis("250m"), Some(250));
+        assert_eq!(cpu_millis("0.5"), Some(500));
+        assert_eq!(cpu_text(23_000), "23000m");
+        assert_eq!(mem_bytes("4Gi"), Some(4 << 30));
+        assert_eq!(mem_bytes("512Mi"), Some(512 << 20));
+        assert_eq!(mem_bytes("1024"), Some(1024));
+        assert_eq!(mem_text(4 << 30), "4294967296");
     }
 
     #[test]
