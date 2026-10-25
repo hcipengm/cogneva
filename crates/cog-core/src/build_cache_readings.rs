@@ -138,6 +138,14 @@ const PEAK_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 /// busiest walk into an over-cap one every time it repeats.
 const CAP_HEADROOM_PERCENT: u64 = 120;
 
+/// The ceiling slot before any loop has stated one.
+///
+/// Not zero: zero is what a measurement returns when the volume's co-tenants
+/// hold all of it, and treating the unmet case as the same value would drop the
+/// cap to its floor at the one moment the ceiling is doing its job. A maximum
+/// no filesystem reaches is the value that reads as "nothing stated".
+const NO_CEILING: u64 = u64::MAX;
+
 /// The fact that says whether anything is currently building into a cache.
 ///
 /// A passing deletion needs more than a measurement of the cache: it needs
@@ -217,6 +225,22 @@ pub struct BuildCacheReadings {
     /// from the clock would move between the pass that deleted to it and the
     /// scrape that reported it.
     derived_cap: AtomicU64,
+    /// What the volume behind this directory leaves for it, measured by the
+    /// loop that owns the volume; [`NO_CEILING`] when nothing has measured it.
+    ///
+    /// The derivation here can see the cache's own bytes and the filesystem's
+    /// free space, and on a directory-backed volume the free space is the
+    /// **node's** — so a cap derived from it alone is bounded by the disk, not
+    /// by the claim the cache shares with its co-tenants. Only the process that
+    /// knows which claim that is can say what the cache may take of it, and it
+    /// measures that each pass rather than once: the co-tenants grow, and the
+    /// number that was true when someone computed it by hand stops being true
+    /// exactly when the volume is about to run out.
+    ///
+    /// Zero is a **measured** answer here (the co-tenants hold the whole
+    /// claim), so it cannot also mean "not measured": that spelling would turn
+    /// the one moment the ceiling matters most into the moment it disappears.
+    cap_ceiling: AtomicU64,
     /// The pre-reclaim working set's high-water mark and when it was set.
     ///
     /// Kept for derived caps: the cap is what the cache has to hold at its
@@ -258,6 +282,7 @@ impl BuildCacheReadings {
             scanned_at: AtomicU64::new(0),
             cap: CacheCapSetting::Unbounded,
             derived_cap: AtomicU64::new(0),
+            cap_ceiling: AtomicU64::new(NO_CEILING),
             peak: Mutex::new(Peak::default()),
             scan_interval_secs: 0,
             cap_source: None,
@@ -310,6 +335,18 @@ impl BuildCacheReadings {
     pub fn with_cap_source(mut self, source: CapSource) -> Self {
         self.cap_source = Some(source);
         self
+    }
+
+    /// Say how much of the volume the loop that owns it leaves for this cache.
+    ///
+    /// `None` clears it, and a cleared ceiling holds nothing back: a loop that
+    /// could not measure must not silently pin the cap to a guess. It is read
+    /// on every derivation, so the caller states it once per pass with the
+    /// number that pass measured, and the cap follows the co-tenants rather
+    /// than a figure someone computed the day the volume was sized.
+    pub fn set_cap_ceiling(&self, bytes: Option<u64>) {
+        self.cap_ceiling
+            .store(bytes.unwrap_or(NO_CEILING), Ordering::Release);
     }
 
     pub fn dir(&self) -> &Path {
@@ -368,6 +405,18 @@ impl BuildCacheReadings {
         let cap = match free {
             Some(free) => with_headroom.min(free),
             None => with_headroom,
+        };
+        // What the volume leaves after its co-tenants. A ceiling is the one
+        // input this struct cannot measure -- the claim's declared size is the
+        // deployment's, and the bytes its co-tenants hold belong to paths only
+        // the owning loop knows -- so it arrives already measured and wins over
+        // both of the above: a working set that grew past what the volume can
+        // spare is precisely the case the cap exists for.
+        let ceiling = self.cap_ceiling.load(Ordering::Acquire);
+        let cap = if ceiling == NO_CEILING {
+            cap
+        } else {
+            cap.min(ceiling)
         };
         // An empty cache derives 0, which `cap_bytes` reads as "nothing
         // measured yet" and leaves unbounded -- correct, since there is nothing
@@ -881,6 +930,38 @@ mod tests {
         // measured", and a full disk must not read as unbounded.
         readings.derive_cap(2_000, Some(0));
         assert_eq!(readings.cap_bytes(), Some(1));
+    }
+
+    /// A ceiling measured by the loop that owns the volume wins over both
+    /// inputs the cache can see itself: on a directory-backed claim the
+    /// filesystem's free space is the node's, so without it the cap is bounded
+    /// by the disk rather than by the claim the cache shares.
+    #[test]
+    fn a_measured_ceiling_clamps_the_derived_cap() {
+        let readings = BuildCacheReadings::new("/nonexistent-cache").with_auto_cap(300);
+
+        // No ceiling stated: the two inputs decide, as before.
+        readings.derive_cap(10_000, None);
+        assert_eq!(readings.cap_bytes(), Some(12_000));
+
+        // The co-tenants now hold most of the claim, so the loop states what is
+        // left; the working set is irrelevant above it.
+        readings.set_cap_ceiling(Some(4_000));
+        readings.derive_cap(10_000, None);
+        assert_eq!(readings.cap_bytes(), Some(4_000));
+
+        // A ceiling of zero is a measurement -- the co-tenants hold the whole
+        // claim -- and must not read as "nothing stated". It bottoms out at one
+        // byte, the same as a full volume.
+        readings.set_cap_ceiling(Some(0));
+        readings.derive_cap(10_000, None);
+        assert_eq!(readings.cap_bytes(), Some(1));
+
+        // Unmeasured clears it: the cap goes back to what the walk implies
+        // rather than staying pinned to a number no reading supports.
+        readings.set_cap_ceiling(None);
+        readings.derive_cap(10_000, None);
+        assert_eq!(readings.cap_bytes(), Some(12_000));
     }
 
     /// An `auto` cache bounds itself from the walk it is acting on: the first

@@ -976,6 +976,18 @@ impl WorkdirRouter {
         let cache = Arc::clone(&self.build_cache);
         let slot = self.build_cache_slot();
         let cache_interval = Duration::from_secs(cache.scan_interval_secs());
+        // The claim this cache shares, and the walker already measuring it: the
+        // ceiling is that claim's declared size minus what its co-tenants hold,
+        // and both halves come from readings this process takes anyway. Nothing
+        // here computes a number once and keeps it -- the co-tenants grow, and
+        // the pass that notices is this one.
+        let ceiling_cfg = self.cfg.build_cache.clone();
+        let ceiling_footprint = ceiling_cfg.volume_claim.as_ref().and_then(|(claim, _)| {
+            self.footprints
+                .iter()
+                .find(|f| f.claim() == claim.as_str())
+                .cloned()
+        });
         // No stop signal and no exit of its own: ending means the cache stops
         // being measured, and a cache nobody measures reads exactly like one
         // that is not growing.
@@ -986,6 +998,8 @@ impl WorkdirRouter {
             move |beat| {
                 let cache = Arc::clone(&cache);
                 let slot = Arc::clone(&slot);
+                let ceiling_cfg = ceiling_cfg.clone();
+                let ceiling_footprint = ceiling_footprint.clone();
                 async move {
                     let mut ticker = tokio::time::interval(cache_interval);
                     loop {
@@ -994,6 +1008,9 @@ impl WorkdirRouter {
                         // than one interval later.
                         beat.beat();
                         ticker.tick().await;
+                        cache.set_cap_ceiling(
+                            ceiling_cfg.measured_ceiling(ceiling_footprint.as_deref(), &cache),
+                        );
                         cache.measure_and_enforce(Some(slot.as_ref())).await;
                     }
                 }
@@ -1501,6 +1518,7 @@ pub(crate) mod tests {
             build_cache: BuildCacheConfig {
                 cap: cog_core::config::CacheCapSetting::Fixed(3000),
                 scan_interval: Duration::from_secs(300),
+                volume_claim: None,
             },
         };
         let router = WorkdirRouter::new(cfg).unwrap();

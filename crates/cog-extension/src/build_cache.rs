@@ -41,6 +41,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cog_core::build_cache_readings::{BuildCacheReadings, CacheSlot, CapSource};
+use cog_core::claim_footprint::ClaimFootprint;
 use cog_core::config::CacheCapSetting;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -65,6 +66,16 @@ const DEFAULT_SCAN_INTERVAL_SECS: u64 = 300;
 /// deployment that needs another value sets `SANDBOX_BUILD_CACHE_MAX_BYTES`.
 const DEFAULT_MAX_BYTES: u64 = cog_core::build_cache_readings::DEFAULT_CACHE_MAX_BYTES;
 
+/// Deployment variable naming the claim this cache sits on and its declared
+/// size, as `claim=size` (`cogneva-sandbox-pvc=5Gi`).
+///
+/// The declared size is the one input no walk inside the pod can produce: a
+/// directory-backed claim reports the node's filesystem, so the claim's own
+/// number comes from the manifest that declared it. What the cache may take of
+/// it is not stated here -- it is that size minus what the claim's co-tenants
+/// hold, measured on every pass. Stating the size is not stating the cap.
+const CLAIM_ENV: &str = "SANDBOX_VOLUME_CLAIM";
+
 /// How the cache is bounded, and how often it is re-walked.
 #[derive(Debug, Clone)]
 pub struct BuildCacheConfig {
@@ -73,6 +84,8 @@ pub struct BuildCacheConfig {
     pub cap: CacheCapSetting,
     /// How often the cache is re-walked and its cap re-enforced.
     pub scan_interval: Duration,
+    /// The claim under this cache and the size its manifest declares.
+    pub volume_claim: Option<(String, u64)>,
 }
 
 impl Default for BuildCacheConfig {
@@ -80,18 +93,25 @@ impl Default for BuildCacheConfig {
         Self {
             cap: CacheCapSetting::Fixed(DEFAULT_MAX_BYTES),
             scan_interval: Duration::from_secs(DEFAULT_SCAN_INTERVAL_SECS),
+            volume_claim: None,
         }
     }
 }
 
 impl BuildCacheConfig {
     pub fn from_env() -> Self {
+        let volume_claim = Self::claim_from_env();
+        // With the claim stated, a derived cap is the default: the deployment
+        // has said how much room there is, and which part of it this cache may
+        // use is a measurement rather than a second number to keep in step.
+        let unspecified = if volume_claim.is_some() {
+            CacheCapSetting::Auto
+        } else {
+            CacheCapSetting::Fixed(DEFAULT_MAX_BYTES)
+        };
         // Bytes, not a float: a cap read as a float would be rounded to the
         // nearest representable integer, which is a number nobody configured.
-        let cap = Self::env_cap_or(
-            "SANDBOX_BUILD_CACHE_MAX_BYTES",
-            CacheCapSetting::Fixed(DEFAULT_MAX_BYTES),
-        );
+        let cap = Self::env_cap_or("SANDBOX_BUILD_CACHE_MAX_BYTES", unspecified);
         let scan_interval = Self::env_u64_or(
             "SANDBOX_BUILD_CACHE_SCAN_INTERVAL_SECS",
             DEFAULT_SCAN_INTERVAL_SECS,
@@ -105,7 +125,56 @@ impl BuildCacheConfig {
         Self {
             cap,
             scan_interval: Duration::from_secs(scan_interval),
+            volume_claim,
         }
+    }
+
+    /// Read `claim=size` from the deployment.
+    ///
+    /// Anything unreadable is `None` rather than a guess: an unmeasured claim
+    /// leaves the cap where it was, which is visible as a cap that stopped
+    /// moving rather than as a volume that quietly overran.
+    fn claim_from_env() -> Option<(String, u64)> {
+        let raw = std::env::var(CLAIM_ENV).ok()?;
+        let (claim, size) = raw.trim().split_once('=')?;
+        let bytes = cog_core::claim_footprint::quantity_bytes(size.trim())? as u64;
+        if claim.trim().is_empty() || bytes == 0 {
+            return None;
+        }
+        Some((claim.trim().to_string(), bytes))
+    }
+
+    /// What the claim behind this cache leaves for it, from two measurements
+    /// this process already takes: the claim's footprint (the volume walker)
+    /// and the cache's own bytes (this loop's last walk).
+    ///
+    /// `None` whenever either side is missing -- before the first walk, or on a
+    /// volume the deployment did not declare. A cap derived from half a fact is
+    /// a cap nobody can trace back to a reading.
+    pub fn ceiling_bytes(&self, volume_used: Option<u64>, cache_used: Option<u64>) -> Option<u64> {
+        let (_, declared) = self.volume_claim.as_ref()?;
+        let (volume_used, cache_used) = (volume_used?, cache_used?);
+        Some(declared.saturating_sub(volume_used.saturating_sub(cache_used)))
+    }
+
+    /// The same, read off the two live measurements rather than handed in.
+    ///
+    /// The footprint must be the *same claim* this configuration names: a
+    /// walker measuring another volume would answer for room this cache cannot
+    /// use, which reads on the dashboards as a cache that is bounded and on the
+    /// disk as one that is not.
+    pub fn measured_ceiling(
+        &self,
+        footprint: Option<&ClaimFootprint>,
+        cache: &BuildCacheReadings,
+    ) -> Option<u64> {
+        let (claim, _) = self.volume_claim.as_ref()?;
+        let footprint = footprint?;
+        if footprint.claim() != claim.as_str() {
+            return None;
+        }
+        let cache_used: u64 = cache.measured()?.values().sum();
+        self.ceiling_bytes(footprint.value(), Some(cache_used))
     }
 
     /// Read a cap: a number bounds it, `0` measures without bounding, and
@@ -218,6 +287,64 @@ mod tests {
     /// threads.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// The ceiling is the claim's declared size minus what its co-tenants hold,
+    /// both read at the moment the pass runs. Every input moving has to move the
+    /// number, or it is a constant with a story attached.
+    #[test]
+    fn the_ceiling_is_the_claim_minus_what_its_cotenants_hold() {
+        let config = BuildCacheConfig {
+            volume_claim: Some(("cogneva-sandbox-pvc".into(), 5 * (1 << 30))),
+            ..BuildCacheConfig::default()
+        };
+        let footprint = ClaimFootprint::new(
+            "cogneva-sandbox-pvc",
+            std::path::PathBuf::from("/opt/cogneva/sandbox"),
+            vec![],
+        );
+        let cache = BuildCacheReadings::new("/opt/cogneva/sandbox/target");
+        cache.set_layers(
+            std::iter::once(("debug".to_string(), 2 * (1 << 30))).collect(),
+            1_700_000_000,
+        );
+        // The volume holds the cache plus one GiB of co-tenants.
+        footprint.set_used_bytes(3 * (1 << 30));
+        assert_eq!(
+            config.measured_ceiling(Some(&footprint), &cache),
+            Some(4 * (1 << 30)),
+            "5 GiB of claim, 1 GiB held by others, so 4 GiB is the cache's"
+        );
+
+        // The co-tenants grow by a gigabyte: the ceiling follows, without
+        // anyone restating a number.
+        footprint.set_used_bytes(4 * (1 << 30));
+        assert_eq!(
+            config.measured_ceiling(Some(&footprint), &cache),
+            Some(3 * (1 << 30))
+        );
+
+        // A walker measuring another volume answers for room this cache cannot
+        // use, which is worse than no answer.
+        let other = ClaimFootprint::new(
+            "cogneva-data-pvc",
+            std::path::PathBuf::from("/opt/cogneva/data"),
+            vec![],
+        );
+        other.set_used_bytes(1);
+        assert_eq!(config.measured_ceiling(Some(&other), &cache), None);
+
+        // Nothing measured yet: no ceiling rather than one computed from half
+        // a fact.
+        let unmeasured = ClaimFootprint::new(
+            "cogneva-sandbox-pvc",
+            std::path::PathBuf::from("/opt/cogneva/sandbox"),
+            vec![],
+        );
+        assert_eq!(config.measured_ceiling(Some(&unmeasured), &cache), None);
+        assert_eq!(config.measured_ceiling(None, &cache), None);
+        let no_layers = BuildCacheReadings::new("/opt/cogneva/sandbox/target");
+        assert_eq!(config.measured_ceiling(Some(&footprint), &no_layers), None);
+    }
+
     #[test]
     fn the_default_cap_is_enforced_without_deployment_config() {
         let config = BuildCacheConfig::default();
@@ -301,6 +428,7 @@ mod tests {
         let config = BuildCacheConfig {
             cap: CacheCapSetting::Unbounded,
             scan_interval: Duration::from_secs(DEFAULT_SCAN_INTERVAL_SECS),
+            volume_claim: None,
         };
         assert!(
             config.readings("/nonexistent-cache").cap_bytes().is_none(),
@@ -313,6 +441,7 @@ mod tests {
         let config = BuildCacheConfig {
             cap: CacheCapSetting::Fixed(4 * 1024 * 1024 * 1024),
             scan_interval: Duration::from_secs(DEFAULT_SCAN_INTERVAL_SECS),
+            volume_claim: None,
         };
         assert_eq!(
             config.readings("/nonexistent-cache").cap_bytes(),
@@ -377,6 +506,7 @@ mod tests {
         let readings = BuildCacheConfig {
             cap: CacheCapSetting::Fixed(64),
             scan_interval: Duration::from_secs(DEFAULT_SCAN_INTERVAL_SECS),
+            volume_claim: None,
         }
         .readings(dir.path());
         readings.set_layers(fs_size::layer_totals(&files), 1);

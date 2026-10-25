@@ -1070,22 +1070,10 @@ rows:
       from looking intentional; nothing measures it.
 
   # --- sandbox executor -------------------------------------------------------
-  - key: sandboxExecutor.buildCacheMaxBytes
-    source: override
-    why: >-
-      3 GiB, the shared default for an executor that names no cap. The value a
-      derived cap would read is the free space of the volume its own directory
-      sits on, which this process can measure; nothing feeds one back into the
-      number yet. A separate row from the evolution cap rather than one knob
-      spelled twice: the two directories are the same string under two different
-      claims, so a bound that follows the path does not follow the volume.
-    published:
-      # Same reading module as the evolution cap, a different owner: the executor
-      # constructs its own cap for its own volume.
-      owner: crates/cog-extension/src/build_cache.rs
-      file: crates/cog-core/src/build_cache_readings.rs
-      metric: BUILD_TARGET_CAP_METRIC
-      label: source
+  # `sandboxExecutor.buildCacheMaxBytes` 没有行：values 里不再有这个数。上限是
+  # 每轮现算的——这块卷的声明量减同住者的实测占用——所以没有可登记的常量；
+  # 覆盖写法（`--set sandboxExecutor.buildCacheMaxBytes=<字节>`）落在同一个
+  # `cogneva_build_target_bytes_cap{source}` 上，读得出来源是 override。
 
   - key: sandboxExecutor.buildCacheScanIntervalSecs
     source: override
