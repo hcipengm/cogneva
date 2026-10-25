@@ -72,7 +72,11 @@ pub fn spawn_project_control(
 
 /// 一轮：判出所有越界，把它们一起交给编排侧。
 pub async fn run_once(state: &Arc<GatewayState>, minter: &dyn ReplanMinter) {
-    let breaches = breaches_this_pass(state).await;
+    let readings = readings();
+    let (breaches, blind) = breaches_this_pass(state).await;
+    for reason in blind {
+        readings.record_blind(reason);
+    }
     dispatch(&breaches, minter).await;
 }
 
@@ -98,54 +102,82 @@ pub async fn dispatch(breaches: &[BreachReport], minter: &dyn ReplanMinter) {
             }
             for minting in outcomes {
                 match minting.outcome {
-                    ReplanOutcome::Minted { task_id } => info!(
-                        project = %minting.project,
-                        index = minting.index.code(),
-                        task_id = %task_id,
-                        "performance breach turned into a task on the graph"
-                    ),
-                    ReplanOutcome::AlreadyMinted { task_id, open } => debug!(
-                        project = %minting.project,
-                        index = minting.index.code(),
-                        task_id = %task_id,
-                        open,
-                        "this baseline revision already has a replan task"
-                    ),
-                    ReplanOutcome::Refused { reason } => warn!(
-                        project = %minting.project,
-                        index = minting.index.code(),
-                        reason = %reason,
-                        "a performance breach was not turned into a task"
-                    ),
+                    ReplanOutcome::Minted { task_id } => {
+                        readings().record(Outcome::Minted);
+                        info!(
+                            project = %minting.project,
+                            index = minting.index.code(),
+                            task_id = %task_id,
+                            "performance breach turned into a task on the graph"
+                        );
+                    }
+                    ReplanOutcome::AlreadyMinted { task_id, open } => {
+                        readings().record(if open {
+                            Outcome::AlreadyOpen
+                        } else {
+                            Outcome::AlreadyClosed
+                        });
+                        debug!(
+                            project = %minting.project,
+                            index = minting.index.code(),
+                            task_id = %task_id,
+                            open,
+                            "this baseline revision already has a replan task"
+                        );
+                    }
+                    ReplanOutcome::Refused { reason } => {
+                        readings().record(Outcome::Refused);
+                        warn!(
+                            project = %minting.project,
+                            index = minting.index.code(),
+                            reason = %reason,
+                            "a performance breach was not turned into a task"
+                        );
+                    }
                 }
             }
         }
         // 回注失败不是「没有越界」：这一轮什么都没落定，下一轮还会再判一次。
-        Err(e) => warn!(
-            breaches = breaches.len(),
-            error = %e,
-            "performance breaches were measured but not turned into tasks"
-        ),
+        Err(e) => {
+            readings().record(Outcome::DispatchFailed);
+            warn!(
+                breaches = breaches.len(),
+                error = %e,
+                "performance breaches were measured but not turned into tasks"
+            );
+        }
     }
 }
 
-/// 这一轮有哪些项目越界。
-async fn breaches_this_pass(state: &Arc<GatewayState>) -> Vec<BreachReport> {
+/// 这一轮有哪些项目越界，以及这一轮有哪些量**没量成**。
+async fn breaches_this_pass(state: &Arc<GatewayState>) -> (Vec<BreachReport>, Vec<Blind>) {
     // 基线读不到时一个项目也判不了：三个量全靠它。空着回去，而不是把每个项目都
     // 报成不越界——那是两件事。
     let Some(plans) = readable_plans(&state.orchestrator).await else {
-        return Vec::new();
+        return (Vec::new(), vec![Blind::NoBaseline]);
     };
     let tasks = state.orchestrator.get_all_tasks().await;
     // 一轮问一次账，不是每个项目问一次：账里已经有 task_id，按项目切是本地的事。
     let spends = spends_of(state, &tasks).await;
-    breaches_of(&tasks, &plans, spends.as_ref(), Utc::now())
+    if spends.is_none() {
+        return (
+            breaches_of(&tasks, &plans, None, Utc::now()),
+            vec![Blind::CostUnreadable],
+        );
+    }
+    (
+        breaches_of(&tasks, &plans, spends.as_ref(), Utc::now()),
+        Vec::new(),
+    )
 }
 
 /// 一轮的全部花销，按 task_id 聚合。账读不到时 `None`——与「一条都没花过」同形，
 /// 而成本绩效会因此量不出来。那正是实话。
 async fn spends_of(state: &Arc<GatewayState>, tasks: &[Task]) -> Option<BTreeMap<String, u64>> {
-    let store = state.llm_usage.as_ref()?;
+    let Some(store) = state.llm_usage.as_ref() else {
+        warn!("project control: no token ledger in this process; cost is never measured");
+        return None;
+    };
     let ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
     match store.spend_by_task(&ids).await {
         Ok(rows) => Some(rows.into_iter().collect()),
@@ -153,6 +185,164 @@ async fn spends_of(state: &Arc<GatewayState>, tasks: &[Task]) -> Option<BTreeMap
             warn!(error = %e, "project control: task spend is not readable from the ledger");
             None
         }
+    }
+}
+
+// ─── 这条回路自己的读数 ────────────────────────────────────────────────────
+
+/// 这一次判词最后落成了什么。
+///
+/// 与日志同一个封闭词表，但它们是两种载体：日志回答「那一刻发生了什么」，计数器
+/// 回答「到现在为止成了几件」。一条回路只留日志的时候，「这个部署从没造出过一条
+/// 重规划」与「这条回路没在跑」在读数面上同形——而这两件事的修法完全相反。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(usize)]
+pub enum Outcome {
+    /// 越界变成了一条图上的活。
+    Minted = 0,
+    /// 这一版基线已经有一条还在跑的，等它。
+    AlreadyOpen = 1,
+    /// 这一版基线的那一条已经走完了：它的结论去读，不再造。
+    AlreadyClosed = 2,
+    /// 生成处拒绝了，判词在日志里。
+    Refused = 3,
+    /// 交给造任务那一侧时整体失败：这一轮什么都没落定。
+    DispatchFailed = 4,
+}
+
+impl Outcome {
+    /// 每一个取值，按计数器下标排序。顺序由 [`Self::label`] 自己核，不由调用方记。
+    pub const ALL: [Self; 5] = [
+        Self::Minted,
+        Self::AlreadyOpen,
+        Self::AlreadyClosed,
+        Self::Refused,
+        Self::DispatchFailed,
+    ];
+
+    /// `outcome` 标签上的值。
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Minted => "minted",
+            Self::AlreadyOpen => "already_open",
+            Self::AlreadyClosed => "already_closed",
+            Self::Refused => "refused",
+            Self::DispatchFailed => "dispatch_failed",
+        }
+    }
+}
+
+/// 这一轮里没能量出来的那几件。
+///
+/// 三格各自把读者送去不同的地方：没有基线是计划面没写，账读不到是 token 账，
+/// 账没接上是这个进程的装配。合成一格「没量成」会让这三种都去查同一处。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(usize)]
+pub enum Blind {
+    /// 计划基线读不出来：挣值的三个量一个都算不了。
+    NoBaseline = 0,
+    /// 进程里没有 token 账：成本这一项永远量不出来。
+    NoLedger = 1,
+    /// 账在，这一下读不出来。
+    CostUnreadable = 2,
+}
+
+impl Blind {
+    pub const ALL: [Self; 3] = [Self::NoBaseline, Self::NoLedger, Self::CostUnreadable];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NoBaseline => "no_baseline",
+            Self::NoLedger => "no_ledger",
+            Self::CostUnreadable => "cost_unreadable",
+        }
+    }
+}
+
+const OUTCOME_LABEL: &str = "outcome";
+const BLIND_LABEL: &str = "reading";
+
+/// 这条回路从本进程起来到现在，落成了多少条、有多少轮没量成。
+///
+/// 进程级累计，随生产者一起消失：它是「这条回路在这一版部署上做了什么事」，
+/// 不是平台的历史，所以不进库、没有需要退役的行。
+#[derive(Default)]
+pub struct Readings {
+    outcomes: [std::sync::atomic::AtomicU64; Outcome::ALL.len()],
+    blindsight: [std::sync::atomic::AtomicU64; Blind::ALL.len()],
+}
+
+impl Readings {
+    pub fn record(&self, outcome: Outcome) {
+        self.outcomes[outcome as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_blind(&self, blind: Blind) {
+        self.blindsight[blind as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn counts(&self) -> [(Outcome, u64); Outcome::ALL.len()] {
+        Outcome::ALL.map(|o| {
+            (
+                o,
+                self.outcomes[o as usize].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+    }
+
+    pub fn blind_counts(&self) -> [(Blind, u64); Blind::ALL.len()] {
+        Blind::ALL.map(|b| {
+            (
+                b,
+                self.blindsight[b as usize].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+    }
+}
+
+/// 本进程的那一份。做成进程级而不是挂在状态上的一个字段，与后台循环的注册表
+/// 同一个理由：它是这个进程自己的累计读数，没有第二个读者会拿它去判别的进程。
+pub fn readings() -> Arc<Readings> {
+    static READINGS: std::sync::OnceLock<Arc<Readings>> = std::sync::OnceLock::new();
+    Arc::clone(READINGS.get_or_init(|| Arc::new(Readings::default())))
+}
+
+pub const OUTCOMES_TOTAL: &str = "cogneva_project_control_outcomes_total";
+pub const UNMEASURED_TOTAL: &str = "cogneva_project_control_unmeasured_total";
+
+#[async_trait::async_trait]
+impl cog_core::Observable for Readings {
+    async fn collect_metrics(
+        &self,
+        _dimension: &str,
+    ) -> cog_core::SFResult<Vec<cog_core::observability::RawMetric>> {
+        // 零值也发：一格还没发生过是这一版部署的读数，缺一格则什么都不是。
+        let mut readings = Vec::with_capacity(Outcome::ALL.len() + Blind::ALL.len());
+        for (outcome, count) in self.counts() {
+            readings.push(
+                cog_core::observability::RawMetric::new(OUTCOMES_TOTAL, count as f64)
+                    .with_label(OUTCOME_LABEL, outcome.label()),
+            );
+        }
+        for (blind, count) in self.blind_counts() {
+            readings.push(
+                cog_core::observability::RawMetric::new(UNMEASURED_TOTAL, count as f64)
+                    .with_label(BLIND_LABEL, blind.label()),
+            );
+        }
+        Ok(readings)
+    }
+
+    async fn collect_trace(
+        &self,
+        _task_id: &str,
+    ) -> cog_core::SFResult<Vec<cog_core::observability::TraceFragment>> {
+        Ok(Vec::new())
+    }
+
+    /// 进程级累计，哪个维度问都是同一个数。
+    fn available_dimensions(&self) -> Vec<cog_core::observability::DimensionSpec> {
+        Vec::new()
     }
 }
 
@@ -452,6 +642,159 @@ mod tests {
         runtime.block_on(dispatch(&batch, &minter));
         assert_eq!(seen.lock().unwrap().len(), 1, "一轮一批，不是一条一调");
         assert_eq!(seen.lock().unwrap()[0], batch);
+    }
+
+    /// 一个把结局照脚本交回来的造任务侧，用来验这条回路自己的读数。
+    struct Answering {
+        outcome: ReplanOutcome,
+        fails: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ReplanMinter for Answering {
+        async fn mint_replans(
+            &self,
+            breaches: &[BreachReport],
+        ) -> cog_core::SFResult<Vec<cog_core::ReplanMinting>> {
+            if self.fails {
+                return Err(cog_core::SFError::Agent("minting side is down".into()));
+            }
+            Ok(breaches
+                .iter()
+                .map(|b| cog_core::ReplanMinting {
+                    project: b.project.clone(),
+                    index: b.index,
+                    outcome: self.outcome.clone(),
+                })
+                .collect())
+        }
+    }
+
+    fn one_breach() -> BreachReport {
+        BreachReport {
+            project: "g1".into(),
+            index: PerformanceIndex::Schedule,
+            measured: 0.5,
+            earned: 1,
+            against: 2,
+        }
+    }
+
+    fn outcome_count(outcome: Outcome) -> u64 {
+        readings()
+            .counts()
+            .into_iter()
+            .find(|(o, _)| *o == outcome)
+            .map(|(_, n)| n)
+            .unwrap_or(0)
+    }
+
+    /// 这条回路自己的读数：每种结局各自一格，回注整体失败单独一格——它既不是
+    /// 「没有越界」也不是任何一条判词，读成前两者都会让人以为事情有结论。
+    ///
+    /// 区分在 `dispatch_failed` 那格上：只记日志的话，造任务侧挂掉与这一轮没
+    /// 有越界在读数面上同形。
+    #[test]
+    fn every_dispatch_outcome_is_counted_under_its_own_word() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cases = [
+            (
+                ReplanOutcome::Minted {
+                    task_id: "replan-a".into(),
+                },
+                Outcome::Minted,
+            ),
+            (
+                ReplanOutcome::AlreadyMinted {
+                    task_id: "replan-b".into(),
+                    open: true,
+                },
+                Outcome::AlreadyOpen,
+            ),
+            (
+                ReplanOutcome::AlreadyMinted {
+                    task_id: "replan-c".into(),
+                    open: false,
+                },
+                Outcome::AlreadyClosed,
+            ),
+            (
+                ReplanOutcome::Refused {
+                    reason: "no root row".into(),
+                },
+                Outcome::Refused,
+            ),
+        ];
+        for (outcome, counted) in cases {
+            let before = outcome_count(counted);
+            let minter = Answering {
+                outcome: outcome.clone(),
+                fails: false,
+            };
+            runtime.block_on(dispatch(&[one_breach()], &minter));
+            assert_eq!(outcome_count(counted), before + 1, "{outcome:?} 这一格没动");
+        }
+
+        let before = outcome_count(Outcome::DispatchFailed);
+        let minter = Answering {
+            outcome: ReplanOutcome::Minted {
+                task_id: "unused".into(),
+            },
+            fails: true,
+        };
+        runtime.block_on(dispatch(&[one_breach()], &minter));
+        assert_eq!(outcome_count(Outcome::DispatchFailed), before + 1);
+    }
+
+    /// 每一格都发，零值也发：一格还没发生过是这一版部署的读数，缺一格则什么都
+    /// 不是——少一格会让「从没造出过」与「这一版不认识这个结局」同形。
+    #[test]
+    fn the_reading_publishes_every_cell_including_the_zeros() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let readings = Readings::default();
+        let published = runtime
+            .block_on(cog_core::Observable::collect_metrics(&readings, ""))
+            .unwrap();
+        for outcome in Outcome::ALL {
+            assert!(
+                published.iter().any(|m| m.name == OUTCOMES_TOTAL
+                    && m.labels.get(OUTCOME_LABEL).map(String::as_str) == Some(outcome.label())),
+                "少了 {} 这一格：{published:?}",
+                outcome.label()
+            );
+        }
+        for blind in Blind::ALL {
+            assert!(
+                published.iter().any(|m| m.name == UNMEASURED_TOTAL
+                    && m.labels.get(BLIND_LABEL).map(String::as_str) == Some(blind.label())),
+                "少了 {} 这一格：{published:?}",
+                blind.label()
+            );
+        }
+        assert!(published.iter().all(|m| m.value == 0.0), "新起的一份全是零");
+    }
+
+    /// 量不出来与量出来是零是两件事：账没接上时成本绩效永远算不出来，这时
+    /// 「没有成本越界」不能悄悄成立——它要被记进 `reading=no_ledger` 那一格。
+    #[test]
+    fn a_pass_that_could_not_measure_its_cost_says_so_in_the_reading() {
+        let readings = Readings::default();
+        readings.record_blind(Blind::NoLedger);
+        let counts = readings.blind_counts();
+        assert_eq!(
+            counts
+                .into_iter()
+                .find(|(b, _)| *b == Blind::NoLedger)
+                .map(|(_, n)| n),
+            Some(1)
+        );
+        assert_eq!(Blind::NoLedger.label(), "no_ledger");
     }
 
     /// 一个只记下被问了什么的造任务侧。

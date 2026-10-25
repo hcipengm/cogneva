@@ -7320,6 +7320,14 @@ async fn metrics_handler(State(state): State<AppState>) -> axum::response::Respo
             Err(e) => tracing::warn!(error = %e, "durable write failures unavailable this scrape"),
         }
     }
+    // 项目控制回路这一版部署做成了几件事。它只有日志的时候，「从没造出过一条
+    // 重规划」与「这条回路没在跑」在读数面上同形——而这两件事的修法相反。
+    match cog_core::Observable::collect_metrics(crate::project_control::readings().as_ref(), "")
+        .await
+    {
+        Ok(readings) => body.push_str(&crate::prometheus_render::render_raw_metrics(&readings)),
+        Err(e) => tracing::warn!(error = %e, "project control readings unavailable this scrape"),
+    }
     // The volumes this pod writes are readable from nowhere else — the kubelet's
     // per-volume number for a directory-backed volume is the node's filesystem —
     // so a scrape of this process is the only place the deployment can find out
