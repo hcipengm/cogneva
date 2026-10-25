@@ -1,6 +1,7 @@
 ---
-name: 前端设计
-description: 做界面时的设计规程：把每一单当成设计工作室接的一单，先定设计计划（色／字／布局／一条原则）再检查它是不是这类页面的默认长相，最后才写代码；含排版、结构即信息、动效、文案、克制与自审，以及 cogneva WebUI 的令牌约束。适用于新增视图、重做页面、调整配色排版、做可视化，以及任何「让它好看好用」的请求。
+name: frontend-design
+description: Guidance for distinctive, intentional visual design when building new UI or reshaping an existing one. Helps with aesthetic direction, typography, and making choices that don't read as templated defaults.
+license: Complete terms in LICENSE.txt
 ---
 
 # Frontend Design
@@ -68,43 +69,3 @@ Use active voice as default. A CTA says exactly what happens when it is used: "S
 Treat failure and emptiness as moments for direction, not mood. Explain what went wrong and how to fix it, in the interface's voice rather than a person's. Errors don't apologize, and they are never vague about what happened. An empty screen is an invitation to act.
 
 Keep the tone conversational: plain verbs, sentence case, no filler, with tone matched to the brand and the audience. Let each written element do exactly one job.
-
----
-
-# 本仓库的落点（cogneva 补充）
-
-上面的正文是通用规程，逐条适用。这一节只写「在这棵树里，那几条落在哪里」，
-因为规程里说的「先定调色板」在这里已经有答案了。
-
-## 颜色与字阶不是每单重定，是从令牌表里取
-
-`web/src/styles/tokens.css` 是唯一的令牌表，`web/src/styles/themes.ts` 是换主题的
-地方。各面里不写死颜色，全部读 `--x`；画布上的自绘部分（`web/src/renderer/`）读的
-也是同一套，否则换主题后会在一屏里留下第二种风格。
-
-令牌的角色是固定的：
-
-- `ink-1000…600`：从最深的底到最浅的表面。
-- `paper` / `paper-dim`：文字与次要文字；`--muted` 是更次一级。
-- `--brass`：唯一的强调色，只标「这里需要你动手」。它不是装饰色，用满一屏就等于没用。
-- `--live` / `--ok` / `--warn` / `--danger`：状态，只在状态为真时出现。
-
-要加颜色，先回答「哪一条现有令牌的角色不对」。答不出来才加，而且按同一套角色命名，
-不要加一个只有这一处知道含义的 `--purple-accent`。
-
-字阶只有四档（11 / 12 / 13 / 15）。密度是这一面的功能：同一屏里要多看几行日志、
-多扫几行状态，字号就不可能照营销页的排法来。数字与标识符用等宽体并带
-`font-variant-numeric: tabular-nums`，否则数字一多就左右跳。
-
-## 需求里点名的东西优先，其余按通用规程办
-
-工作台的底是主题纯色，不铺栅格（栅格是「这里能拖东西」的暗示）；与数据无关的
-动效不进背景，粒子只做极低频的呼吸感，`prefers-reduced-motion` 打开时连它也不动。
-
-状态的四种画面必须区分得出来：加载中、空、读失败、离线。混成一片空白，读者看到
-的会是「一切正常」。
-
-## 自审的落点
-
-改完之后自己读一遍：这个界面的每一个数字，能不能点开看到它由什么算出来？点不开
-的那些如果长得像读数，就是装饰——装饰冒充读数，比空白更坏。

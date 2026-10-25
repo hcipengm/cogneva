@@ -104,7 +104,7 @@ async fn web_research_skill_tells_the_model_how_to_search_without_paid_apis() {
     }
 }
 
-/// 设计规程只有一个家，而且它指向的令牌表还在。
+/// 设计规程只有一个家，而且原文是原文、本仓库的落点是另一份。
 ///
 /// 这份规程原先躺在 `.claude/skills/` 里——那是给某个编辑器会话读的目录，
 /// 不是平台的技能目录：镜像不复制它，注册表不扫描它，模型在选择技能时看不到
@@ -112,10 +112,17 @@ async fn web_research_skill_tells_the_model_how_to_search_without_paid_apis() {
 /// 技能的正本在 `skills/`，`Dockerfile` 把它整棵复制进 `/opt/cogneva/skills`，
 /// 系统提示里按 description 列出，任何一次前端改动都读得到同一份。
 ///
-/// 规程里点名了令牌表的位置。路径会漂——表搬了、规程没跟上，它教的就是一个
-/// 不存在的文件，而读者只会以为是自己找不到。所以这里把两边钉在一起。
+/// 正文是 Anthropic 的 `frontend-design` 原文，逐字保留。它被改写过一次：
+/// 转成中文、压成要点、删掉一整节——每一处单看都像整理，合起来就是把唯一
+/// 经过验证的部分换成了一份没有人验证过的转述。所以这里钉的是指纹，不是要点：
+/// 少一个字、多一句本地补充，都会红。
+///
+/// 本仓库自己的落点写在同目录的 `COGNEVA.md`，不并进原文。上游更新时整篇
+/// 替换 `SKILL.md` 即可，两件事不会互相绊住。
 #[tokio::test]
-async fn the_design_guidance_has_one_home_and_points_at_the_live_token_table() {
+async fn the_design_skill_is_the_upstream_text_verbatim_and_the_local_notes_live_beside_it() {
+    use sha2::{Digest, Sha256};
+
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
 
     let stray = root.join(".claude/skills");
@@ -126,33 +133,23 @@ async fn the_design_guidance_has_one_home_and_points_at_the_live_token_table() {
     );
 
     let path = root.join("skills/frontend-design");
-    let def = cog_skill::loader::load_skill(&path)
-        .await
-        .expect("skills/frontend-design 装不起来");
+    let skill_md = std::fs::read_to_string(path.join("SKILL.md"))
+        .expect("skills/frontend-design/SKILL.md 不在");
 
-    assert!(
-        def.frontmatter.description.contains("界面"),
-        "description 里没有「界面」：模型按它判断该不该用这个技能，读不出来就不会用"
-    );
-
-    let tokens = root.join("web/src/styles/tokens.css");
-    assert!(
-        tokens.is_file(),
-        "规程指向的令牌表不在：{}",
-        tokens.display()
-    );
-    assert!(
-        def.skill_md.contains("web/src/styles/tokens.css"),
-        "规程没有点名令牌表的路径，读者只能自己猜颜色该从哪儿取"
-    );
-    assert!(
-        def.skill_md.contains("--brass"),
-        "规程没有点名唯一的强调色：不写清楚，每个视图都会自己造一个强调色"
+    // 上游 anthropics/skills 的 frontend-design/SKILL.md 的 sha256。改它之前先问：
+    // 这是上游真的更新了，还是有人在原文里改了几笔？后者就在这里改回去。
+    const UPSTREAM_SHA256: &str =
+        "d91970639e9f5c37682ac7ab60094d35f1c7c1f38d731bd56396563aee10c1d3";
+    let digest = format!("{:x}", Sha256::digest(skill_md.as_bytes()));
+    assert_eq!(
+        digest, UPSTREAM_SHA256,
+        "skills/frontend-design/SKILL.md 与上游原文不一致。上游更新了就把这个\n\
+         指纹一起改掉并说明；只是本地编辑的话，请改回原文——本仓库的补充写进\n\
+         同目录的 COGNEVA.md。"
     );
 
-    // 正文是上游 anthropics/skills 的 frontend-design 原文，逐字保留。它被
-    // 删节过一次——「压缩成要点」看着像整理，实际是把唯一经过验证的部分换成
-    // 了转述，而转述没有人验证过。这几节是它的骨架，缺一节就是删节而不是编辑。
+    // 指纹之外再按形状钉一道：指纹挡住的是「改了」，这几条挡住的是「改得看起来
+    // 像原文」——一次中文改写可以被指纹拦下，但下次换个方式压缩就又得靠人看。
     for section in [
         "## Ground your designs in the subject matter",
         "## Design principles",
@@ -161,8 +158,31 @@ async fn the_design_guidance_has_one_home_and_points_at_the_live_token_table() {
         "## More on writing in design",
     ] {
         assert!(
-            def.skill_md.contains(section),
+            skill_md.contains(section),
             "skills/frontend-design/SKILL.md 少了上游的一节：{section}"
         );
     }
+
+    let def = cog_skill::loader::load_skill(&path)
+        .await
+        .expect("skills/frontend-design 装不起来");
+    assert_eq!(def.metadata.id, "frontend-design", "技能 id 必须等于目录名");
+
+    let notes = std::fs::read_to_string(path.join("COGNEVA.md"))
+        .expect("skills/frontend-design/COGNEVA.md 不在：本仓库的落点没有载体");
+
+    let tokens = root.join("web/src/styles/tokens.css");
+    assert!(
+        tokens.is_file(),
+        "落点指向的令牌表不在：{}（表搬了，落点没跟上，读者只会以为是自己找不到）",
+        tokens.display()
+    );
+    assert!(
+        notes.contains("web/src/styles/tokens.css"),
+        "COGNEVA.md 没有点名令牌表的路径，读者只能自己猜颜色该从哪儿取"
+    );
+    assert!(
+        notes.contains("--brass"),
+        "COGNEVA.md 没有点名唯一的强调色：不写清楚，每个视图都会自己造一个强调色"
+    );
 }
