@@ -1037,6 +1037,8 @@ export interface TopologyClaim {
   capacity_bytes: number | null;
   access_modes: string[];
   volume_name: string | null;
+  /** 盘上实际占用，来自平台自己的走查端；null 是这个卷还没被量到，不是空的。 */
+  measured_bytes: number | null;
 }
 
 export interface TopologyVolume {

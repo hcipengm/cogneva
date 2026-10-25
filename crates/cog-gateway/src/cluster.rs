@@ -232,7 +232,7 @@ pub struct VolumeView {
     pub claim: Option<ClaimView>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ClaimView {
     pub name: String,
     /// Pending / Bound / Lost
@@ -241,6 +241,9 @@ pub struct ClaimView {
     pub capacity_bytes: Option<u64>,
     pub access_modes: Vec<String>,
     pub volume_name: Option<String>,
+    /// 盘上实际占了多少，来自平台自己的走查端；`None` 是这个卷还没被量到，
+    /// 不是「空的」——声明多大在上一个字段里，两者本来就不是一个数。
+    pub measured_bytes: Option<u64>,
 }
 
 /// 这个对象最近发生过什么。事件是 Kubernetes 里唯一会说出「为什么」的地方：
@@ -353,15 +356,20 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
     let pods_path = format!("/api/v1/namespaces/{}/pods", client.namespace());
     match client.get_json(&pods_path).await {
         Ok(pods) => {
+            // 卷的实际占用来自平台自己的走查端：每台节点上都有一个 claim-store，
+            // 它量的是节点磁盘上每个卷的真实字节数。这条不经过 metrics-server，
+            // 也不经过 kubelet——它读的是这个平台自己记的账。
+            let measured = measured_claim_bytes(pods.get("items"), &claims).await;
+            let sources = Sources {
+                events,
+                usage,
+                claims,
+                measured,
+            };
             let parsed: Vec<PodView> = pods
                 .get("items")
                 .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .map(|pod| pod_view(pod, &events, &usage, &claims))
-                        .collect()
-                })
+                .map(|items| items.iter().map(|pod| pod_view(pod, &sources)).collect())
                 .unwrap_or_default();
             place_pods(&mut view, parsed);
         }
@@ -583,10 +591,92 @@ fn claims_by_name(list: &Value) -> std::collections::HashMap<String, ClaimView> 
                     .pointer("/spec/volumeName")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                measured_bytes: None,
             },
         );
     }
     claims
+}
+
+/// 组装一个 Pod 读数要用到的四份外部读数。分成一个结构体是因为它们各自的缺失
+/// 含义不同，但拼装方式一样：缺哪一份，就少那一层，别的层照旧。
+#[derive(Debug, Default)]
+struct Sources {
+    events: std::collections::HashMap<String, Vec<EventView>>,
+    usage: std::collections::HashMap<String, PodUsage>,
+    claims: std::collections::HashMap<String, ClaimView>,
+    /// 卷的实际占用，按声明名索引，来自平台自己的走查端。
+    measured: std::collections::HashMap<String, u64>,
+}
+
+/// 每个节点上都有一个 claim-store，它走查节点存储根，把每个卷的真实字节数发布在
+/// `/metrics` 上。这一面直接读那些端点：声明写了多大、盘上真的占了多少，两个数
+/// 并排才是「资源账本」。
+///
+/// 走 Pod IP 而不是 Service 名：那个 Service 是 headless 的，一条 DNS 查询会得到
+/// 每台节点一个地址，随便取一个就只看到一台机器的卷。走查端只认自己的节点，所以
+/// 这里把每个端点的页都读一遍再合并——同一个声明出现在两台机器上是不可能的
+/// （local-path 的卷只在一块盘上），后读到的不会盖掉先读到的另一个值。
+///
+/// 读不到就是读不到：端点没起来、端口换了、页面里没有这个声明，都只让这一格是
+/// `None`，不拿声明量去填——那是另一个数。
+async fn measured_claim_bytes(
+    pods: Option<&Value>,
+    claims: &std::collections::HashMap<String, ClaimView>,
+) -> std::collections::HashMap<String, u64> {
+    let mut measured = std::collections::HashMap::new();
+    if claims.is_empty() {
+        return measured;
+    }
+    let Some(items) = pods.and_then(Value::as_array) else {
+        return measured;
+    };
+    // 超时压得很短：这一面是轮询的，一个不响的走查端不能把整次读取拖住。
+    let Ok(http) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    else {
+        return measured;
+    };
+    for pod in items {
+        let is_scanner = pod
+            .pointer("/metadata/labels/app.kubernetes.io~1component")
+            .and_then(Value::as_str)
+            == Some("claim-store");
+        if !is_scanner {
+            continue;
+        }
+        let Some(ip) = pod.pointer("/status/podIP").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(port) = pod
+            .pointer("/spec/containers/0/ports")
+            .and_then(Value::as_array)
+            .and_then(|ports| {
+                ports
+                    .iter()
+                    .find(|port| port.get("name").and_then(Value::as_str) == Some("http"))
+                    .and_then(|port| port.get("containerPort"))
+                    .and_then(Value::as_u64)
+            })
+        else {
+            continue;
+        };
+        let url = format!("http://{ip}:{port}/metrics");
+        let Ok(response) = http.get(&url).send().await else {
+            continue;
+        };
+        let Ok(text) = response.text().await else {
+            continue;
+        };
+        for claim in claims.keys() {
+            if let Some(bytes) = cog_core::claim_footprint::used_bytes_from_exposition(&text, claim)
+            {
+                measured.insert(claim.clone(), bytes);
+            }
+        }
+    }
+    measured
 }
 
 /// 把 Pod 挂到它所在的节点上，剩下的进 `unscheduled`。
@@ -684,12 +774,9 @@ fn node_view(node: &Value) -> NodeView {
     }
 }
 
-fn pod_view(
-    pod: &Value,
-    events: &std::collections::HashMap<String, Vec<EventView>>,
-    usage: &std::collections::HashMap<String, PodUsage>,
-    claims: &std::collections::HashMap<String, ClaimView>,
-) -> PodView {
+fn pod_view(pod: &Value, sources: &Sources) -> PodView {
+    let usage = &sources.usage;
+    let events = &sources.events;
     let namespace = pod
         .pointer("/metadata/namespace")
         .and_then(Value::as_str)
@@ -795,7 +882,7 @@ fn pod_view(
         .max()
         .unwrap_or(0);
 
-    let volumes = pod_volumes(pod, claims);
+    let volumes = pod_volumes(pod, sources);
     let pod_events = events.get(&name).cloned().unwrap_or_default();
     let conditions = conditions_of(pod);
 
@@ -922,10 +1009,7 @@ fn container_mounts(spec: &Value) -> Vec<MountView> {
 
 /// 卷的类型就是除 `name` 之外那个键。读不出来（投影卷、CSI 内联卷等）时写 `other`，
 /// 不猜一个名字——猜出来的类型会让读者去改错的东西。
-fn pod_volumes(
-    pod: &Value,
-    claims: &std::collections::HashMap<String, ClaimView>,
-) -> Vec<VolumeView> {
+fn pod_volumes(pod: &Value, sources: &Sources) -> Vec<VolumeView> {
     pod.pointer("/spec/volumes")
         .and_then(Value::as_array)
         .map(|volumes| {
@@ -943,7 +1027,7 @@ fn pod_volumes(
                         .get("persistentVolumeClaim")
                         .and_then(|claim| claim.get("claimName"))
                         .and_then(Value::as_str)
-                        .and_then(|claim_name| claims.get(claim_name))
+                        .and_then(|claim_name| sources.claims.get(claim_name))
                         .map(|claim| ClaimView {
                             name: claim.name.clone(),
                             phase: claim.phase.clone(),
@@ -951,6 +1035,7 @@ fn pod_volumes(
                             capacity_bytes: claim.capacity_bytes,
                             access_modes: claim.access_modes.clone(),
                             volume_name: claim.volume_name.clone(),
+                            measured_bytes: sources.measured.get(&claim.name).copied(),
                         });
                     Some(VolumeView { name, kind, claim })
                 })
@@ -1139,18 +1224,6 @@ mod topology_tests {
         })
     }
 
-    fn none() -> std::collections::HashMap<String, Vec<EventView>> {
-        std::collections::HashMap::new()
-    }
-
-    fn no_usage() -> std::collections::HashMap<String, PodUsage> {
-        std::collections::HashMap::new()
-    }
-
-    fn no_claims() -> std::collections::HashMap<String, ClaimView> {
-        std::collections::HashMap::new()
-    }
-
     fn cluster_with(nodes: Vec<serde_json::Value>) -> ClusterView {
         ClusterView {
             id: "in-cluster".to_string(),
@@ -1186,34 +1259,21 @@ mod topology_tests {
             vec![
                 pod_view(
                     &pod("api-1", Some("cogneva-01"), "500m", "1Gi"),
-                    &none(),
-                    &no_usage(),
-                    &no_claims(),
+                    &Sources::default(),
                 ),
                 pod_view(
                     &pod("worker-1", Some("cogneva-01"), "1500m", "2Gi"),
-                    &none(),
-                    &no_usage(),
-                    &no_claims(),
+                    &Sources::default(),
                 ),
                 pod_view(
                     &pod("cache-1", Some("cogneva-02"), "250m", "512Mi"),
-                    &none(),
-                    &no_usage(),
-                    &no_claims(),
+                    &Sources::default(),
                 ),
-                pod_view(
-                    &pod("waiting-1", None, "100m", "64Mi"),
-                    &none(),
-                    &no_usage(),
-                    &no_claims(),
-                ),
+                pod_view(&pod("waiting-1", None, "100m", "64Mi"), &Sources::default()),
                 // 节点刚被删：Pod 上还写着那个名字，但它已经不在任何节点下。
                 pod_view(
                     &pod("orphan-1", Some("cogneva-gone"), "100m", "64Mi"),
-                    &none(),
-                    &no_usage(),
-                    &no_claims(),
+                    &Sources::default(),
                 ),
             ],
         );
@@ -1298,7 +1358,7 @@ mod topology_tests {
             },
             "status": { "phase": "Running", "containerStatuses": [] }
         });
-        let view = pod_view(&pod, &none(), &no_usage(), &no_claims());
+        let view = pod_view(&pod, &Sources::default());
         let container = &view.containers[0];
         assert_eq!(container.ports[0].container_port, 8080);
         assert_eq!(container.cpu_limit_millicores, Some(2000));
@@ -1356,7 +1416,7 @@ mod topology_tests {
             "status": { "phase": "Running", "containerStatuses": [] }
         });
 
-        let without = pod_view(&pod, &none(), &no_usage(), &no_claims());
+        let without = pod_view(&pod, &Sources::default());
         assert_eq!(
             without.cpu_used_millicores, None,
             "没有数据源时是「不知道」，不是 0"
@@ -1367,7 +1427,13 @@ mod topology_tests {
             "containers": [{ "name": "api", "usage": { "cpu": "120m", "memory": "300Mi" } }]
         }]});
         let usage = usage_by_pod(&metrics);
-        let with = pod_view(&pod, &none(), &usage, &no_claims());
+        let with = pod_view(
+            &pod,
+            &Sources {
+                usage,
+                ..Sources::default()
+            },
+        );
         assert_eq!(with.cpu_used_millicores, Some(120));
         assert_eq!(with.memory_used_bytes, Some(300 * 1024 * 1024));
         assert_eq!(
@@ -1398,7 +1464,7 @@ mod topology_tests {
                 }]
             }
         });
-        let view = pod_view(&pod, &none(), &no_usage(), &no_claims());
+        let view = pod_view(&pod, &Sources::default());
         let termination = view.containers[0]
             .last_termination
             .as_ref()
@@ -1416,11 +1482,9 @@ mod topology_tests {
             "spec": { "containers": [{ "name": "api" }] },
             "status": { "containerStatuses": [{ "name": "api", "state": { "running": {} } }] }
         });
-        assert!(
-            pod_view(&fresh, &none(), &no_usage(), &no_claims()).containers[0]
-                .last_termination
-                .is_none()
-        );
+        assert!(pod_view(&fresh, &Sources::default()).containers[0]
+            .last_termination
+            .is_none());
     }
 
     #[test]
@@ -1445,7 +1509,7 @@ mod topology_tests {
             }]},
             "status": { "phase": "Running", "containerStatuses": [] }
         });
-        let container = &pod_view(&pod, &none(), &no_usage(), &no_claims()).containers[0];
+        let container = &pod_view(&pod, &Sources::default()).containers[0];
         assert_eq!(container.cpu_request_millicores, Some(500));
         assert_eq!(container.memory_request_bytes, Some(1024 * 1024 * 1024));
         assert_eq!(container.cpu_limit_millicores, Some(2000));
@@ -1469,7 +1533,7 @@ mod topology_tests {
                 "containerStatuses": []
             }
         });
-        let conditions = pod_view(&pod, &none(), &no_usage(), &no_claims()).conditions;
+        let conditions = pod_view(&pod, &Sources::default()).conditions;
         let names: Vec<&str> = conditions.iter().map(|c| c.kind.as_str()).collect();
         assert_eq!(names, vec!["PodScheduled", "Initialized", "Ready"]);
         assert!(conditions[0].ok);
@@ -1492,7 +1556,7 @@ mod topology_tests {
             "spec": { "containers": [{ "name": "api" }] },
             "status": { "phase": "Unknown", "conditions": [{ "type": "Ready" }] }
         });
-        let conditions = pod_view(&pod, &none(), &no_usage(), &no_claims()).conditions;
+        let conditions = pod_view(&pod, &Sources::default()).conditions;
         assert!(
             !conditions[0].ok,
             "缺 status 字段按没成立算：读成成立会把卡住的 Pod 画成正常"
@@ -1591,6 +1655,97 @@ mod topology_tests {
     }
 
     #[test]
+    fn a_claim_carries_the_bytes_the_platform_measured_beside_the_bytes_it_declared() {
+        let pod = json!({
+            "metadata": { "name": "api-1", "namespace": "cogneva" },
+            "spec": {
+                "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "app-data" } }],
+                "containers": [{ "name": "api" }]
+            },
+            "status": { "phase": "Running", "containerStatuses": [] }
+        });
+        let claims = claims_by_name(&json!({ "items": [{
+            "metadata": { "name": "app-data" },
+            "spec": { "storageClassName": "local-path" },
+            "status": { "phase": "Bound", "capacity": { "storage": "10Gi" }, "accessModes": ["ReadWriteOnce"] }
+        }]}));
+        let mut measured = std::collections::HashMap::new();
+        measured.insert("app-data".to_string(), 3_221_225_472u64);
+        let sources = Sources {
+            claims,
+            measured,
+            ..Sources::default()
+        };
+        let claim = pod_view(&pod, &sources).volumes[0]
+            .claim
+            .clone()
+            .expect("持久卷要带上声明");
+        assert_eq!(claim.capacity_bytes, Some(10 * 1024 * 1024 * 1024));
+        assert_eq!(
+            claim.measured_bytes,
+            Some(3_221_225_472),
+            "盘上真的占了多少"
+        );
+
+        // 走查端没量到这一个：留空，不拿声明量去填——两个数不是一回事。
+        let unmeasured = pod_view(
+            &pod,
+            &Sources {
+                claims: claims_by_name(&json!({ "items": [{
+                    "metadata": { "name": "app-data" },
+                    "status": { "phase": "Pending" }
+                }]})),
+                ..Sources::default()
+            },
+        );
+        assert_eq!(
+            unmeasured.volumes[0].claim.as_ref().unwrap().measured_bytes,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scanner_with_no_address_or_no_http_port_is_skipped_not_requested() {
+        // 夹具里给不出地址与端口：这条路径必须不发请求就返回空，否则一次轮询会
+        // 卡在一个连不上的地址上。测试能跑完本身就是这条断言。
+        let mut claims = std::collections::HashMap::new();
+        claims.insert(
+            "app-data".to_string(),
+            ClaimView {
+                name: "app-data".to_string(),
+                phase: "Bound".to_string(),
+                storage_class: None,
+                capacity_bytes: None,
+                access_modes: Vec::new(),
+                volume_name: None,
+                measured_bytes: None,
+            },
+        );
+        let no_ip = json!([{
+            "metadata": { "name": "cogneva-claim-store-x", "labels": { "app.kubernetes.io/component": "claim-store" } },
+            "spec": { "containers": [{ "ports": [{ "name": "http", "containerPort": 9100 }] }] },
+            "status": {}
+        }]);
+        assert!(measured_claim_bytes(Some(&no_ip), &claims).await.is_empty());
+
+        let no_port = json!([{
+            "metadata": { "name": "cogneva-claim-store-x", "labels": { "app.kubernetes.io/component": "claim-store" } },
+            "spec": { "containers": [{ "ports": [{ "name": "metrics-admin", "containerPort": 9100 }] }] },
+            "status": { "podIP": "127.0.0.1" }
+        }]);
+        assert!(measured_claim_bytes(Some(&no_port), &claims)
+            .await
+            .is_empty());
+
+        // 没有声明要量，就不必去敲任何端点。
+        assert!(
+            measured_claim_bytes(Some(&no_port), &std::collections::HashMap::new())
+                .await
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn a_persistent_volume_names_the_claim_it_binds_to() {
         let pod = json!({
             "metadata": { "name": "api-1", "namespace": "cogneva" },
@@ -1610,7 +1765,13 @@ mod topology_tests {
             }
         }]}));
 
-        let view = pod_view(&pod, &none(), &no_usage(), &claims);
+        let view = pod_view(
+            &pod,
+            &Sources {
+                claims,
+                ..Sources::default()
+            },
+        );
         let claim = view.volumes[0].claim.as_ref().expect("持久卷要带上声明");
         assert_eq!(claim.phase, "Bound");
         assert_eq!(claim.storage_class.as_deref(), Some("local-path"));
