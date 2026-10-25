@@ -95,10 +95,13 @@ const RENDER_TIMEOUT_SECS: u64 = 60;
 /// its default revision is one bucket for the life of the process. A render
 /// that caught a client-rendered page before its scripts ran is then handed to
 /// every later call for that URL: the caller gets the shell again and again,
-/// with nothing in the answer that says it is stale. A bucket that moves on its
-/// own keeps a repeat fetch inside the minute cheap while letting a thin render
-/// expire instead of sticking to the URL.
-const RENDER_CACHE_SECS: u64 = 60;
+/// with nothing in the answer that says it is stale.
+///
+/// The window is one render's own deadline, not a number of its own: a render
+/// may run that long (measured 3s on a plain page, the whole budget on a heavy
+/// one), so a shorter window could never be hit by the next render and a longer
+/// one would keep an answer alive past the budget that produced it.
+const RENDER_CACHE_SECS: u64 = RENDER_TIMEOUT_SECS;
 
 /// How many times a page the backend failed on is asked for again.
 ///
@@ -1310,19 +1313,20 @@ mod tests {
     #[test]
     fn a_renders_cache_revision_moves_on_its_own() {
         let at = |secs: u64| UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let window = RENDER_CACHE_SECS;
         assert_eq!(
-            render_cache_revision(at(600)),
-            render_cache_revision(at(659)),
+            render_cache_revision(at(10 * window)),
+            render_cache_revision(at(10 * window + window - 1)),
             "within one bucket the revision is stable, so repeat fetches stay cheap"
         );
         assert_ne!(
-            render_cache_revision(at(600)),
-            render_cache_revision(at(660)),
-            "a minute later it is a different revision, so a stale render expires"
+            render_cache_revision(at(10 * window)),
+            render_cache_revision(at(11 * window)),
+            "one window later it is a different revision, so a stale render expires"
         );
         assert_ne!(
             render_cache_revision(UNIX_EPOCH),
-            render_cache_revision(at(60)),
+            render_cache_revision(at(window)),
             "the first bucket is not the empty string the backend treats as unset"
         );
     }
