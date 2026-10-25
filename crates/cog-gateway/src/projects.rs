@@ -110,12 +110,22 @@ pub struct GanttResponse {
     /// 这个项目有没有任何一条带基线的任务。全都没有时界面直接说「未排期」，
     /// 而不是把一屏空白当成正常。
     pub has_plan: bool,
+    /// 读计划基线失败时的原因；读到了就是 `None`。
+    ///
+    /// 它存在是因为「读不到」和「没排期」在行上长得一模一样（都是两个计划字段
+    /// 为空、`unplanned` 为真）。不给这个字段，一个存储读不了基线的部署会把整屏
+    /// 画成「都还没排期」，而真相是没人问得出。判读顺序：先看这里，再看行。
+    pub plan_error: Option<String>,
     pub rows: Vec<GanttRow>,
     pub source: Source,
 }
 
 /// 任务图的正本表名。项目面自己不带表，读的就是它。
 const TASK_TABLE: &str = "cog_dag_tasks";
+
+/// 甘特面要多读一张：计划基线。两个表名一起写进 `source`，读者才知道这一屏
+/// 是「现状 + 当初的计划」两份读数拼出来的。
+const GANTT_TABLE: &str = "cog_dag_tasks + task_plan";
 
 fn now_source(reader: &'static str) -> Source {
     Source {
@@ -135,6 +145,22 @@ async fn visible_tasks(state: &Arc<GatewayState>, claims: Option<&cog_core::Clai
         .into_iter()
         .filter(|t| visible_to_claims(claims, t))
         .collect()
+}
+
+/// 读这个部署里的全部计划基线，读不到时返回 `None` 而不是空表。
+///
+/// 空表的意思是「这些任务都没排过期」，读不到的意思是「没人问得出」。两个都
+/// 折成空表，甘特与项目列表就会把整个部署的排期状态报成一片空白。
+async fn readable_plans(
+    orchestrator: &Arc<dyn cog_core::OrchestratorControl>,
+) -> Option<BTreeMap<String, cog_core::TaskPlan>> {
+    match orchestrator.task_plans().await {
+        Ok(v) => Some(v.into_iter().map(|p| (p.task_id.clone(), p)).collect()),
+        Err(e) => {
+            tracing::warn!(error = %e, "plan baselines are not readable on this deployment");
+            None
+        }
+    }
 }
 
 fn project_key(task: &Task) -> &str {
@@ -175,7 +201,12 @@ fn status_counts(tasks: &[&Task]) -> Vec<StatusCount> {
 
 /// 把一批任务折成项目行。与 handler 分开是为了能被测试直接喂数据——一个只能
 /// 通过起整套网关才能验证的投影，实际上不会被验证。
-fn build_project_rows(tasks: &[Task]) -> Vec<ProjectRow> {
+/// `plans` 为 `None` 表示这一部署读不到基线，此时每行的 `planned` 只能是
+/// `false`——与「确实没排期」同形，所以调用方要在响应头把原因写出来。
+fn build_project_rows(
+    tasks: &[Task],
+    plans: Option<&BTreeMap<String, cog_core::TaskPlan>>,
+) -> Vec<ProjectRow> {
     // 谁已经完成，用来判「这条任务的依赖都满足了吗」。判据与 `Task::is_ready`
     // 同一套：每条依赖都完成才放开，依赖不在这一批里也算没放开——看不到的依赖
     // 不能当成已完成，那会把一条卡住的任务读成可以开跑。
@@ -227,7 +258,9 @@ fn build_project_rows(tasks: &[Task]) -> Vec<ProjectRow> {
                 blocked: blocked_count(rows),
                 first_created_at: first.map(|d| d.to_rfc3339()),
                 last_updated_at: last.map(|d| d.to_rfc3339()),
-                planned: false,
+                planned: plans
+                    .map(|p| rows.iter().any(|t| p.contains_key(&t.id)))
+                    .unwrap_or(false),
             }
         })
         .collect();
@@ -244,8 +277,9 @@ pub async fn list_projects_handler(
     let claims = claims.as_ref().map(|Extension(c)| c);
     let tasks = visible_tasks(&state, claims).await;
     let total_tasks = tasks.len();
+    let plans = readable_plans(&state.orchestrator).await;
     Ok(Json(ProjectsResponse {
-        projects: build_project_rows(&tasks),
+        projects: build_project_rows(&tasks, plans.as_ref()),
         total_tasks,
         source: now_source("in-memory task graph"),
     }))
@@ -269,19 +303,29 @@ fn build_board_columns(rows: &[&Task]) -> Vec<BoardColumn> {
         .collect()
 }
 
-fn build_gantt_rows(rows: &[&Task]) -> Vec<GanttRow> {
+fn build_gantt_rows(
+    rows: &[&Task],
+    plans: Option<&BTreeMap<String, cog_core::TaskPlan>>,
+) -> Vec<GanttRow> {
     let mut out: Vec<GanttRow> = rows
         .iter()
-        .map(|t| GanttRow {
-            id: t.id.clone(),
-            title: task_title(t),
-            status: t.status.as_str().to_string(),
-            created_at: t.created_at.to_rfc3339(),
-            started_at: t.started_at.map(|d| d.to_rfc3339()),
-            updated_at: t.updated_at.to_rfc3339(),
-            planned_start: None,
-            planned_end: None,
-            unplanned: true,
+        .map(|t| {
+            // 基线按 (workspace, task) 存的，任务行这边只按 id 取：同一个 id 在同一
+            // 张任务图里唯一，而读面只看得到这一张图。
+            let plan = plans.and_then(|p| p.get(&t.id));
+            GanttRow {
+                id: t.id.clone(),
+                title: task_title(t),
+                status: t.status.as_str().to_string(),
+                created_at: t.created_at.to_rfc3339(),
+                started_at: t.started_at.map(|d| d.to_rfc3339()),
+                updated_at: t.updated_at.to_rfc3339(),
+                planned_start: plan.and_then(|p| p.planned_start).map(|d| d.to_rfc3339()),
+                planned_end: plan.and_then(|p| p.planned_end).map(|d| d.to_rfc3339()),
+                // 有没有这一行基线，就是「排没排期」。只有一端有估算的基线仍然算
+                // 排过期：起算时刻是知道的，止期未知不等于没有计划。
+                unplanned: plan.is_none(),
+            }
         })
         .collect();
     out.sort_by(|a, b| {
@@ -330,12 +374,36 @@ pub async fn project_gantt_handler(
         return Err(ApiError::not_found(format!("project {id}")));
     }
 
-    Ok(Json(GanttResponse {
-        project_id: id,
-        has_plan: false,
-        rows: build_gantt_rows(&rows),
-        source: now_source("in-memory task graph"),
-    }))
+    // 基线读不到时不是「没有基线」：把原因带回去，行才不会被整屏读成未排期。
+    let plans = readable_plans(&state.orchestrator).await;
+    Ok(Json(build_gantt_response(id, &rows, plans.as_ref())))
+}
+
+/// 甘特响应的拼装与 handler 分开，好让「读不到基线」这一态能直接被测到——
+/// 只能靠起整套网关才验得到的读面，实际上不会被验。
+fn build_gantt_response(
+    project_id: String,
+    rows: &[&Task],
+    plans: Option<&BTreeMap<String, cog_core::TaskPlan>>,
+) -> GanttResponse {
+    let has_plan = plans
+        .map(|p| rows.iter().any(|t| p.contains_key(&t.id)))
+        .unwrap_or(false);
+    GanttResponse {
+        project_id,
+        has_plan,
+        plan_error: plans.is_none().then(|| {
+            "plan baselines could not be read on this deployment; the unplanned marks below \
+             mean unreadable, not unscheduled"
+                .to_string()
+        }),
+        rows: build_gantt_rows(rows, plans),
+        source: Source {
+            table: GANTT_TABLE,
+            reader: "in-memory task graph + plan baselines",
+            read_at: chrono::Utc::now().to_rfc3339(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -359,7 +427,7 @@ mod tests {
             task("c", None),
             task("d", Some("")),
         ];
-        let rows = build_project_rows(&tasks);
+        let rows = build_project_rows(&tasks, None);
 
         let summed: usize = rows.iter().map(|r| r.tasks).sum();
         assert_eq!(
@@ -388,7 +456,7 @@ mod tests {
         placeholder.is_executable = false;
 
         let tasks = vec![goal_row, child, placeholder];
-        let rows = build_project_rows(&tasks);
+        let rows = build_project_rows(&tasks, None);
         let row = rows.iter().find(|r| r.id == "g1").expect("g1 要有一行");
         assert_eq!(row.tasks, 3);
         assert_eq!(row.executables, 1);
@@ -412,7 +480,7 @@ mod tests {
         let mut unknown = task("c", Some("g1"));
         unknown.blocked_by = vec!["not-in-this-batch".into()];
 
-        let rows = build_project_rows(&[satisfied, waiting, dep_done, dep_open, unknown]);
+        let rows = build_project_rows(&[satisfied, waiting, dep_done, dep_open, unknown], None);
         let row = rows.iter().find(|r| r.id == "g1").expect("g1 要有一行");
         assert_eq!(
             row.blocked, 2,
@@ -424,7 +492,7 @@ mod tests {
     /// 是同一件事，都不该进积压数。
     #[test]
     fn a_task_without_edges_is_never_counted_as_blocked() {
-        let rows = build_project_rows(&[task("a", Some("g1"))]);
+        let rows = build_project_rows(&[task("a", Some("g1"))], None);
         assert_eq!(rows[0].blocked, 0);
     }
 
@@ -433,11 +501,59 @@ mod tests {
     #[test]
     fn gantt_rows_without_a_baseline_are_marked_unplanned_not_zero_length() {
         let t = task("a", Some("g1"));
-        let rows = build_gantt_rows(&[&t]);
+        let rows = build_gantt_rows(&[&t], None);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].unplanned);
         assert_eq!(rows[0].planned_start, None);
         assert_eq!(rows[0].planned_end, None);
+    }
+
+    fn plan(task_id: &str, tokens: u64) -> cog_core::TaskPlan {
+        cog_core::TaskPlan {
+            workspace_id: "default".into(),
+            task_id: task_id.into(),
+            planned_start: Some(chrono::Utc::now()),
+            planned_end: Some(chrono::Utc::now() + chrono::Duration::minutes(10)),
+            budget_tokens: tokens,
+            baseline_rev: "rev-1".into(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// 有基线的行要按基线画，没基线的行仍然是未排期。两件事必须在一屏里同时
+    /// 成立：把有基线的行也标成未排期，计划就白写了；把没基线的行按零长度画，
+    /// 读者会以为计划已经完成。
+    #[test]
+    fn a_baselined_row_is_planned_and_an_unbaselined_one_stays_unplanned() {
+        let planned = task("a", Some("g1"));
+        let unbaselined = task("b", Some("g1"));
+        let plans: BTreeMap<String, cog_core::TaskPlan> =
+            [("a".to_string(), plan("a", 10_000))].into_iter().collect();
+
+        let rows = build_gantt_rows(&[&planned, &unbaselined], Some(&plans));
+        let a = rows.iter().find(|r| r.id == "a").unwrap();
+        let b = rows.iter().find(|r| r.id == "b").unwrap();
+
+        assert!(!a.unplanned, "有基线就是排过期了");
+        assert!(a.planned_start.is_some(), "基线给了起期");
+        assert!(a.planned_end.is_some(), "基线给了止期");
+        assert!(b.unplanned, "没有基线行的任务仍然是未排期");
+        assert_eq!(b.planned_start, None);
+        assert_eq!(b.planned_end, None);
+    }
+
+    /// 读不到基线时的行与「没排期」在行上完全一样，唯一区分它们的是响应级的
+    /// `plan_error`。少了它，一个读不了基线的部署会把整屏报成未排期。
+    #[test]
+    fn an_unreadable_plan_store_is_reported_above_the_rows_not_as_unplanned() {
+        let t = task("a", Some("g1"));
+        let response = build_gantt_response("g1".into(), &[&t], None);
+        assert!(response.plan_error.is_some(), "读不到要说读不到");
+        assert!(!response.has_plan);
+
+        let read_ok = build_gantt_response("g1".into(), &[&t], Some(&BTreeMap::new()));
+        assert!(read_ok.plan_error.is_none(), "读到了、只是空的，不是读不到");
+        assert!(!read_ok.has_plan, "一条基线都没有，界面仍要说未排期");
     }
 
     /// 标题取不到就露出 id，不编一个名字：编出来的名字读者会当成真的。
@@ -445,7 +561,7 @@ mod tests {
     fn gantt_title_falls_back_to_the_id_instead_of_inventing_one() {
         let mut t = task("task-42", Some("g1"));
         t.input = serde_json::json!({ "unrelated": 1 });
-        let rows = build_gantt_rows(&[&t]);
+        let rows = build_gantt_rows(&[&t], None);
         assert_eq!(rows[0].title, "task-42");
     }
 
@@ -487,8 +603,8 @@ mod tests {
             task("b", Some("g1")),
             task("c", Some("g2")),
         ];
-        let first = build_project_rows(&tasks);
-        let second = build_project_rows(&tasks);
+        let first = build_project_rows(&tasks, None);
+        let second = build_project_rows(&tasks, None);
         let ids: Vec<&str> = first.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["g2", "g1"], "任务多的在前，同数按 id 升序");
         assert_eq!(

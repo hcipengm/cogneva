@@ -190,6 +190,9 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             }
         };
 
+        // 计划基线按 workspace 分区存，而 `workspace_id` 在上面已经被移进执行器
+        // 配置里了，所以在那之前留一份给读面用。
+        let plan_workspace_id = workspace_id.clone();
         let decomposition_max_attempts =
             ctx.config().dag_executor.decomposition_max_attempts.max(1);
         let mut action_plan_orchestrator = crate::ActionPlanOrchestrator::new()
@@ -198,6 +201,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             .with_max_pattern_age_days(pattern_max_age_days)
             .with_task_executor(exec_loop_arc.clone())
             .with_dag_executor(shared_orchestrator.clone())
+            .with_plan_store(state_backend.clone(), plan_workspace_id.clone())
             .with_decomposition_max_attempts(decomposition_max_attempts)
             .with_self_evolution_timeout_secs(
                 ctx.config().dag_executor.self_evolution_timeout_secs,
@@ -278,7 +282,8 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
         let control: Arc<dyn cog_core::OrchestratorControl> = Arc::new(
             crate::OrchestratorControlImpl::new(shared_orchestrator.clone())
                 .with_action_planner(planner.clone())
-                .with_skill_registry(skill_registry.clone()),
+                .with_skill_registry(skill_registry.clone())
+                .with_plan_store(state_backend.clone(), plan_workspace_id.clone()),
         );
         ctx.publish_service(control);
         info!("OrchestratorPlugin DAG executor control published");

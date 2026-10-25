@@ -66,6 +66,11 @@ pub struct ActionPlanOrchestrator {
     /// Optional persistent alert port for decomposition failures. Attached
     /// after plugin init (the store is published by another plugin).
     alert_sink: tokio::sync::RwLock<Option<Arc<dyn cog_core::PersistentAlertSink>>>,
+    /// 和 `dag_executor` 同一个存储后端：分解产出的计划基线写在任务行的旁边，
+    /// 两个库分开就不是「这条任务的计划」了。
+    state_backend: Option<Arc<dyn cog_core::StateBackend>>,
+    /// 计划基线所属的 workspace，与任务行的 `workspace_id` 同一来源。
+    workspace_id: String,
 }
 
 impl std::fmt::Debug for ActionPlanOrchestrator {
@@ -112,7 +117,24 @@ impl ActionPlanOrchestrator {
             decomposition_max_attempts: 2,
             self_evolution_timeout_secs: 3600,
             alert_sink: tokio::sync::RwLock::new(None),
+            state_backend: None,
+            workspace_id: "default".into(),
         }
+    }
+
+    /// 把计划基线和任务行写进同一个后端。
+    ///
+    /// `workspace_id` 必须与这些任务所在的那张任务表一致：基线的主键是
+    /// `(workspace_id, task_id)`，按另一个 workspace 读就一条也对不上，
+    /// 而读出来的样子与「这些任务从来没排过期」一模一样。
+    pub fn with_plan_store(
+        mut self,
+        backend: Arc<dyn cog_core::StateBackend>,
+        workspace_id: impl Into<String>,
+    ) -> Self {
+        self.state_backend = Some(backend);
+        self.workspace_id = workspace_id.into();
+        self
     }
 
     pub fn with_patterns(mut self, patterns: Vec<DecompositionPattern>) -> Self {
@@ -606,6 +628,90 @@ impl ActionPlanOrchestrator {
         task
     }
 
+    /// 从分解给出的估算推出每条子任务的计划起止。
+    ///
+    /// 只用分解已经给过的两个数：`blocked_by`（谁等谁）与 `estimated_seconds`
+    /// （干多久）。这里再估一次就会变成第二个估算器，两个估算器给出的预算迟早
+    /// 对不上，而挣值整个建立在「计划就是这一个数」上。
+    ///
+    /// 一个任务从「它等的所有任务都结束」起算，没有一个依赖在这一批里就按此刻起算：
+    /// 这一批之外的依赖要么已经结束（结束时刻不晚于此刻），要么根本没在图里，
+    /// 两种情况下「此刻」都是不早于它结束的时间。
+    ///
+    /// 没有 token 估算的任务不落基线。0 不是「花不了什么」，是「没说花多少」，
+    /// 写成 0 会让挣值把它算成免费；不落行则读面说它未排期，那才是实话。
+    /// 有 token 估算但没有时长估算的落行，止期留空——时长未知不等于零时长。
+    fn plan_baselines(
+        workspace_id: &str,
+        tasks: &[AtomicTask],
+        baseline_rev: &str,
+        now: DateTime<Utc>,
+    ) -> Vec<cog_core::TaskPlan> {
+        use std::collections::HashMap;
+
+        let index: HashMap<&str, usize> = tasks
+            .iter()
+            .enumerate()
+            .map(|(i, at)| (at.id.as_str(), i))
+            .collect();
+        // 每个下标的 (起, 止)，算过就存下来：一个被多个下游依赖的任务只该按
+        // 自己的时长算一次；环按此刻断开——图本身会拒环，这条递推只求不死循环。
+        let mut spans: Vec<Option<(DateTime<Utc>, DateTime<Utc>)>> = vec![None; tasks.len()];
+        let mut on_stack: Vec<bool> = vec![false; tasks.len()];
+
+        fn span_of(
+            i: usize,
+            tasks: &[AtomicTask],
+            index: &HashMap<&str, usize>,
+            spans: &mut Vec<Option<(DateTime<Utc>, DateTime<Utc>)>>,
+            on_stack: &mut Vec<bool>,
+            now: DateTime<Utc>,
+        ) -> (DateTime<Utc>, DateTime<Utc>) {
+            if let Some(span) = spans[i] {
+                return span;
+            }
+            if on_stack[i] {
+                return (now, now);
+            }
+            on_stack[i] = true;
+            let mut start = now;
+            for dep in &tasks[i].blocked_by {
+                let dep_end = match index.get(dep.as_str()) {
+                    Some(&j) => span_of(j, tasks, index, spans, on_stack, now).1,
+                    None => now,
+                };
+                start = start.max(dep_end);
+            }
+            on_stack[i] = false;
+            let end = start + chrono::Duration::seconds(tasks[i].estimated_seconds as i64);
+            spans[i] = Some((start, end));
+            (start, end)
+        }
+
+        let mut out = Vec::new();
+        for i in 0..tasks.len() {
+            let at = &tasks[i];
+            if at.estimated_tokens == 0 {
+                continue;
+            }
+            let (start, end) = span_of(i, tasks, &index, &mut spans, &mut on_stack, now);
+            out.push(cog_core::TaskPlan {
+                workspace_id: workspace_id.to_string(),
+                task_id: at.id.clone(),
+                planned_start: Some(start),
+                planned_end: if at.estimated_seconds == 0 {
+                    None
+                } else {
+                    Some(end)
+                },
+                budget_tokens: at.estimated_tokens,
+                baseline_rev: baseline_rev.to_string(),
+                updated_at: now,
+            });
+        }
+        out
+    }
+
     /// High-level entry point: process a goal with optional pre-existing tasks.
     /// 1. If all `tasks` have `action_planner_meta.verified == true`, inject them
     ///    directly into the attached [`cog_core::DagExecutor`] (skip decomposition).
@@ -931,6 +1037,39 @@ impl ActionPlanOrchestrator {
                 batch.push(task);
             }
             let queued = dag.add_tasks_batch(batch).await?;
+            let child_ids = &all_injected_ids[placeholder_ids.len()..];
+            // 计划基线紧跟在入图之后写，而且只写真正进了图的那几条：被同 id 顶掉的
+            // 子任务是别人已经排好期的活，替它重写基线就是把别人那份计划覆盖掉。
+            //
+            // 写失败不回滚入图——任务已经在跑了，为了一行计划把工作撤回去是更坏的
+            // 结果；留一条具名告警，读面那边这些任务显示成未排期，说实话。
+            if let Some(backend) = self.state_backend.as_ref() {
+                let placed: Vec<&AtomicTask> = plan
+                    .tasks
+                    .iter()
+                    .filter(|at| child_ids.contains(&at.id) && queued.contains(&at.id))
+                    .collect();
+                if !placed.is_empty() {
+                    let baseline_rev = now.to_rfc3339();
+                    let plans = Self::plan_baselines(
+                        &self.workspace_id,
+                        &placed.iter().map(|at| (*at).clone()).collect::<Vec<_>>(),
+                        &baseline_rev,
+                        now,
+                    );
+                    for plan_row in &plans {
+                        if let Err(e) = backend.save_task_plan(plan_row).await {
+                            tracing::warn!(
+                                task_id = %plan_row.task_id,
+                                workspace_id = %plan_row.workspace_id,
+                                error = %e,
+                                "decomposed task queued but its plan baseline was not stored; \
+                                 the gantt will read it as unplanned"
+                            );
+                        }
+                    }
+                }
+            }
             for held in all_injected_ids.iter().filter(|id| !queued.contains(id)) {
                 let status = dag.get_task(held).await.map(|t| t.status);
                 tracing::warn!(
@@ -946,7 +1085,6 @@ impl ActionPlanOrchestrator {
             // orphan reconciler only finds after the stall threshold. Check
             // real DAG state (not the returned queued list): a child that
             // was already there keeps an idempotent replay a no-op.
-            let child_ids = &all_injected_ids[placeholder_ids.len()..];
             let mut parented: HashSet<String> = HashSet::new();
             for child_id in child_ids {
                 if let Some(child) = dag.get_task(child_id).await {
@@ -2275,6 +2413,86 @@ mod tests {
         }
     }
 
+    /// 只记计划基线的最小 [`cog_core::StateBackend`]：这个测试要问的是「分解有没有
+    /// 把预算写进基线」，其余方法一律返回空。
+    #[derive(Default)]
+    struct PlanRecorder {
+        plans: std::sync::Mutex<Vec<cog_core::TaskPlan>>,
+        fail_writes: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::StateBackend for PlanRecorder {
+        async fn get_agent_state(&self, _agent_id: &str) -> SFResult<Option<cog_core::AgentState>> {
+            Ok(None)
+        }
+        async fn set_agent_state(
+            &self,
+            _agent_id: &str,
+            _state: &cog_core::AgentState,
+        ) -> SFResult<()> {
+            Ok(())
+        }
+        async fn cas_agent_state(
+            &self,
+            _agent_id: &str,
+            _expected: &cog_core::AgentState,
+            _new: &cog_core::AgentState,
+        ) -> SFResult<bool> {
+            Ok(true)
+        }
+        async fn save_task_plan(&self, plan: &cog_core::TaskPlan) -> SFResult<()> {
+            if self.fail_writes {
+                return Err(SFError::Database("plan store down".into()));
+            }
+            self.plans.lock().unwrap().push(plan.clone());
+            Ok(())
+        }
+        async fn task_plans(&self, _workspace_id: &str) -> SFResult<Vec<cog_core::TaskPlan>> {
+            Ok(self.plans.lock().unwrap().clone())
+        }
+        async fn get_checkpoint(
+            &self,
+            _task_id: &str,
+        ) -> SFResult<Option<cog_core::TaskCheckpoint>> {
+            Ok(None)
+        }
+        async fn save_checkpoint(&self, _c: &cog_core::TaskCheckpoint) -> SFResult<()> {
+            Ok(())
+        }
+        async fn append_event(&self, _task_id: &str, _event: &cog_core::Event) -> SFResult<u64> {
+            Ok(0)
+        }
+        async fn get_events(
+            &self,
+            _task_id: &str,
+            _offset: u64,
+            _limit: usize,
+        ) -> SFResult<Vec<cog_core::Event>> {
+            Ok(Vec::new())
+        }
+        async fn get_board(&self, _task_id: &str) -> SFResult<Option<cog_core::ContextBoard>> {
+            Ok(None)
+        }
+        async fn set_board_field(
+            &self,
+            _task_id: &str,
+            _field: &str,
+            _value: &str,
+        ) -> SFResult<()> {
+            Ok(())
+        }
+        async fn delete_checkpoint(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn delete_board(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn remove_board_field(&self, _task_id: &str, _field: &str) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
     /// 同 `ScriptedAtomicExecutor`，但记下每次被交进来的规划任务（id + input），
     /// 好断言「哪些行被当成了 planner 的 hint、分解 id 用了什么身份」。
     #[derive(Default)]
@@ -2510,6 +2728,143 @@ mod tests {
         // 声明落在子任务的回指那一行上：读面正是从这一行取答案。
         let child = dag.get_task("child-2").await.unwrap();
         assert_eq!(child.parent_task_id.as_deref(), Some("goal-row"));
+    }
+
+    /// 分解给出的估算必须落成计划基线，且预算是同一个数。分解已经把每片的
+    /// token 估算算出来了，丢掉它，甘特面就只剩「不知道什么时候做什么」。
+    #[tokio::test]
+    async fn a_decomposed_task_carries_its_estimate_into_the_plan_baseline() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-plan-baseline".to_string()));
+        let recorder = Arc::new(PlanRecorder::default());
+
+        let mut first = atomic_task("child-1");
+        first.estimated_tokens = 12_000;
+        first.estimated_seconds = 600;
+        let mut second = atomic_task("child-2");
+        second.estimated_tokens = 5_000;
+        second.estimated_seconds = 900;
+        second.blocked_by = vec!["child-1".into()];
+
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![first, second]]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_plan_store(recorder.clone(), "ws-plan-baseline")
+            .with_decomposition_max_attempts(1);
+
+        let registry = SkillRegistry::new();
+        planner
+            .process_goal_impl("先算再写", vec![hint_task("goal-row")], &registry)
+            .await
+            .unwrap();
+
+        let plans = recorder.plans.lock().unwrap().clone();
+        let by_id = |id: &str| {
+            plans
+                .iter()
+                .find(|p| p.task_id == id)
+                .unwrap_or_else(|| panic!("{id} 要有基线, 实际 {plans:?}"))
+                .clone()
+        };
+        assert_eq!(
+            by_id("child-1").budget_tokens,
+            12_000,
+            "预算就是分解给出的 estimated_tokens，不许另估一次"
+        );
+        assert_eq!(by_id("child-2").budget_tokens, 5_000);
+        assert_eq!(
+            by_id("child-1").workspace_id,
+            "ws-plan-baseline",
+            "基线与任务行同一个 workspace，否则读面按 id 一条也对不上"
+        );
+        assert_eq!(
+            by_id("child-1").baseline_rev,
+            by_id("child-2").baseline_rev,
+            "一次分解是一版基线"
+        );
+        // 依赖决定先后：等别人的那一片不能在别人结束之前开始。
+        assert!(
+            by_id("child-2").planned_start.unwrap() >= by_id("child-1").planned_end.unwrap(),
+            "child-2 等 child-1 做完才能开始"
+        );
+    }
+
+    /// 没有 token 估算的任务不落基线。写一个 `budget_tokens = 0` 的基线，挣值会
+    /// 把它算成「免费」；不落行，读面说它未排期，那才是实话。
+    #[tokio::test]
+    async fn a_task_without_an_estimate_gets_no_baseline_rather_than_a_free_one() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-no-estimate".to_string()));
+        let recorder = Arc::new(PlanRecorder::default());
+
+        let mut unestimated = atomic_task("child-x");
+        unestimated.estimated_tokens = 0;
+        unestimated.estimated_seconds = 0;
+        unestimated.blocks = vec!["child-y".into()];
+        let mut estimated = atomic_task("child-y");
+        estimated.estimated_tokens = 4_000;
+        estimated.estimated_seconds = 0;
+        estimated.blocked_by = vec!["child-x".into()];
+
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![unestimated, estimated]]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_plan_store(recorder.clone(), "ws-no-estimate")
+            .with_decomposition_max_attempts(1);
+
+        let registry = SkillRegistry::new();
+        planner
+            .process_goal_impl("估不了的也做", vec![hint_task("goal-row")], &registry)
+            .await
+            .unwrap();
+
+        let plans = recorder.plans.lock().unwrap().clone();
+        assert!(
+            !plans.iter().any(|p| p.task_id == "child-x"),
+            "没估算就没有基线：{plans:?}"
+        );
+        let y = plans
+            .iter()
+            .find(|p| p.task_id == "child-y")
+            .expect("有估算");
+        assert!(y.planned_start.is_some(), "起期是知道的");
+        assert_eq!(y.planned_end, None, "时长未知不等于零时长");
+    }
+
+    /// 基线写失败不能把已经入图的任务撤回来：任务在图里跑着，为了一行计划把
+    /// 工作停掉是更坏的结果。这里钉住「写失败后任务仍在图里」这一半。
+    #[tokio::test]
+    async fn a_plan_write_failure_does_not_take_the_queued_task_with_it() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-plan-down".to_string()));
+        let recorder = Arc::new(PlanRecorder {
+            plans: std::sync::Mutex::new(Vec::new()),
+            fail_writes: true,
+        });
+
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![atomic_task("child-1")]]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_plan_store(recorder.clone(), "ws-plan-down")
+            .with_decomposition_max_attempts(1);
+
+        let registry = SkillRegistry::new();
+        planner
+            .process_goal_impl("计划库挂了也要干", vec![hint_task("goal-row")], &registry)
+            .await
+            .expect("plan store 写失败不该让整次提交失败");
+
+        assert!(
+            dag.get_task("child-1").await.is_some(),
+            "任务已经在图里了，不因为基线没写成就消失"
+        );
+        assert!(recorder.plans.lock().unwrap().is_empty());
     }
 
     /// 提交方声明的优先级要跟着分解走：分解出来的每一片都是这道目标的一部分，

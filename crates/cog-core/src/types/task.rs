@@ -45,6 +45,35 @@ pub enum ActionPlannerSource {
     Decomposed,
 }
 
+/// 一条计划基线：这条任务「打算怎么做」。
+///
+/// 单独一行的理由不是分层好看，而是**打算**与**做成**会朝不同方向变：
+/// 任务图上的行每次状态迁移都要重写，而计划一旦排定就不该跟着动——把两者放进
+/// 同一张表，后续每一次状态迁移都会顺带改写计划的证据，事后没人分得清哪一版是
+/// 当初排的。所以这张表**没有状态列**：状态的唯一正本在任务图（`cog_dag_tasks`），
+/// 两张表各存一份状态就是两份真值。
+///
+/// 预算与工期用的是分解器已经算出来的那两个数（`AtomicTask::estimated_tokens` /
+/// `estimated_seconds`），不是在这里另估一遍：估算器的正本只有一处，读者要问的是
+/// 「当初按什么排的」。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskPlan {
+    pub workspace_id: String,
+    pub task_id: String,
+    /// 计划起止。分解没给出工期时两者都是 `None`：预算已知、排期未知——
+    /// 这与「计划长度为零」是两件事，编一个零长度条会让甘特面把它画成已完成。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_start: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_end: Option<DateTime<Utc>>,
+    /// 计划花掉的 token。与 token 账同一把尺子（`gateway_llm_usage`）。
+    pub budget_tokens: u64,
+    /// 这一版基线是哪一次规划写下的。同一批任务共享一个值；重新规划写入的值
+    /// 单调前进，读者据此分辨两版基线，而不是把它们读成同一版的两个部分。
+    pub baseline_rev: String,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// DagExecutor 任务类型
 /// 标记任务是否经过 ActionPlanner 验证/分解。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

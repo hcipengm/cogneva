@@ -119,6 +119,25 @@ CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_face
 CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_owner_unit
             ON cog_dag_tasks(workspace_id, owner_unit, status)
 ;
+-- 一条任务的计划基线：它「打算怎么做」。
+--
+-- 与 cog_dag_tasks 并排而不是加列进去：后者每次状态流转都要整行重写，
+-- 基线在分解那一刻就定了、之后不改，混在一张表里会让「计划」跟着
+-- 「现状」一起被覆盖，甘特面就再也画不出偏差。
+--
+-- 这里**没有状态列**，这是刻意的：状态的唯一正本在上面的表里，
+-- 两边各存一份就是两份真值，迟早互相矛盾。
+CREATE TABLE IF NOT EXISTS task_plan (
+                workspace_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                planned_start TIMESTAMPTZ,
+                planned_end TIMESTAMPTZ,
+                budget_tokens BIGINT NOT NULL,
+                baseline_rev TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (workspace_id, task_id)
+            )
+;
 CREATE TABLE IF NOT EXISTS cog_evolution_promotions (
                 id TEXT PRIMARY KEY,
                 change_id TEXT NOT NULL,
@@ -201,6 +220,15 @@ impl PostgresStateBackend {
 /// 去数另一套拼写写下的行。
 fn status_str(status: &cog_core::TaskStatus) -> &'static str {
     status.as_str()
+}
+
+/// 一行负预算不是「零预算」，也不是可以顺手取绝对值的怪值：写入侧从不产生它，
+/// 读到了就说明这一行是别人写坏的，报出来比折算成 0 更接近事实。
+fn negative_budget(workspace_id: &str, task_id: &str, budget: i64) -> SFError {
+    SFError::Database(format!(
+        "task_plan row {workspace_id}/{task_id} holds a negative budget ({budget}); \
+         a plan that never spent anything is 0, not below it"
+    ))
 }
 
 #[async_trait]
@@ -739,6 +767,140 @@ impl StateBackend for PostgresStateBackend {
             .await?;
         rows.into_iter()
             .map(|(v,)| serde_json::from_value(v).map_err(SFError::Serialization))
+            .collect()
+    }
+
+    // ─── 计划基线（task_plan）───
+
+    async fn save_task_plan(&self, plan: &cog_core::TaskPlan) -> SFResult<()> {
+        // Postgres 没有无符号整数，而预算在类型上是 u64。超界的数绑进去会被
+        // 静默折成一个错误的值，所以在这里拒绝而不是让它绕过去：一份读回来
+        // 是负数的预算是比没有预算更坏的事。
+        let budget = i64::try_from(plan.budget_tokens).map_err(|_| {
+            SFError::Validation(format!(
+                "task plan budget {} does not fit the BIGINT column that holds it",
+                plan.budget_tokens
+            ))
+        })?;
+        let workspace_id = plan.workspace_id.clone();
+        let task_id = plan.task_id.clone();
+        let baseline_rev = plan.baseline_rev.clone();
+        let planned_start = plan.planned_start;
+        let planned_end = plan.planned_end;
+        self.retry(|| async {
+            sqlx::query(
+                r#"
+                INSERT INTO task_plan
+                    (workspace_id, task_id, planned_start, planned_end,
+                     budget_tokens, baseline_rev, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                ON CONFLICT (workspace_id, task_id) DO UPDATE SET
+                    planned_start = EXCLUDED.planned_start,
+                    planned_end = EXCLUDED.planned_end,
+                    budget_tokens = EXCLUDED.budget_tokens,
+                    baseline_rev = EXCLUDED.baseline_rev,
+                    updated_at = NOW()
+                "#,
+            )
+            .bind(&workspace_id)
+            .bind(&task_id)
+            .bind(planned_start)
+            .bind(planned_end)
+            .bind(budget)
+            .bind(&baseline_rev)
+            .execute(&self.pool)
+            .await
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn task_plan(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+    ) -> SFResult<Option<cog_core::TaskPlan>> {
+        type Row = (
+            Option<chrono::DateTime<Utc>>,
+            Option<chrono::DateTime<Utc>>,
+            i64,
+            String,
+            chrono::DateTime<Utc>,
+        );
+        let row: Option<Row> = self
+            .retry(|| async {
+                sqlx::query_as(
+                    r#"
+                    SELECT planned_start, planned_end, budget_tokens, baseline_rev, updated_at
+                    FROM task_plan
+                    WHERE workspace_id = $1 AND task_id = $2
+                    "#,
+                )
+                .bind(workspace_id)
+                .bind(task_id)
+                .fetch_optional(&self.pool)
+                .await
+            })
+            .await?;
+        let budget = match row {
+            None => return Ok(None),
+            Some((_, _, budget, _, _)) if budget < 0 => {
+                return Err(negative_budget(workspace_id, task_id, budget))
+            }
+            Some(row) => row,
+        };
+        let (planned_start, planned_end, budget, baseline_rev, updated_at) = budget;
+        Ok(Some(cog_core::TaskPlan {
+            workspace_id: workspace_id.to_string(),
+            task_id: task_id.to_string(),
+            planned_start,
+            planned_end,
+            budget_tokens: budget as u64,
+            baseline_rev,
+            updated_at,
+        }))
+    }
+
+    async fn task_plans(&self, workspace_id: &str) -> SFResult<Vec<cog_core::TaskPlan>> {
+        let rows: Vec<(
+            String,
+            Option<chrono::DateTime<Utc>>,
+            Option<chrono::DateTime<Utc>>,
+            i64,
+            String,
+            chrono::DateTime<Utc>,
+        )> = self
+            .retry(|| async {
+                sqlx::query_as(
+                    r#"
+                    SELECT task_id, planned_start, planned_end, budget_tokens,
+                           baseline_rev, updated_at
+                    FROM task_plan
+                    WHERE workspace_id = $1
+                    "#,
+                )
+                .bind(workspace_id)
+                .fetch_all(&self.pool)
+                .await
+            })
+            .await?;
+        rows.into_iter()
+            .map(
+                |(task_id, planned_start, planned_end, budget, baseline_rev, updated_at)| {
+                    if budget < 0 {
+                        return Err(negative_budget(workspace_id, &task_id, budget));
+                    }
+                    Ok(cog_core::TaskPlan {
+                        workspace_id: workspace_id.to_string(),
+                        task_id,
+                        planned_start,
+                        planned_end,
+                        budget_tokens: budget as u64,
+                        baseline_rev,
+                        updated_at,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -1330,5 +1492,70 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
         .map_err(|e| SFError::Database(e.to_string()))?;
 
         Ok(rows.into_iter().map(promotion_record).collect())
+    }
+}
+
+#[cfg(test)]
+mod plan_schema_tests {
+    use super::DDL;
+
+    /// `task_plan` 建表语句里第一层括号之间的那一截。
+    fn task_plan_columns(ddl: &str) -> Vec<String> {
+        let start = ddl
+            .find("CREATE TABLE IF NOT EXISTS task_plan (")
+            .expect("task_plan 的建表语句在 DDL 里");
+        let body = &ddl[start..];
+        let open = body.find('(').expect("建表语句有列清单");
+        let rest = &body[open + 1..];
+        // 列清单以单独一行 `)` 收口。
+        let close = rest
+            .lines()
+            .scan(0usize, |offset, line| {
+                let at = *offset;
+                *offset += line.len() + 1;
+                Some((at, line))
+            })
+            .find(|(_, line)| line.trim() == ")")
+            .map(|(at, _)| at)
+            .expect("列清单有收口");
+        rest[..close]
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            // 列清单最后那条约束不是列。
+            .filter(|l| !l.starts_with("PRIMARY KEY"))
+            .map(|l| l.split_whitespace().next().unwrap().to_string())
+            .collect()
+    }
+
+    /// 状态列的唯一正本在任务图上。计划表再存一份状态，两份就会各自演化，
+    /// 而读的人永远不知道自己看的是哪一份——所以这条必须是红的。
+    #[test]
+    fn the_plan_table_holds_no_status_column() {
+        let columns = task_plan_columns(DDL);
+        for forbidden in ["status", "state", "task_status"] {
+            assert!(
+                !columns.iter().any(|c| c == forbidden),
+                "task_plan 不许有状态列（found {forbidden}）: {columns:?}"
+            );
+        }
+    }
+
+    /// 列集合钉死，免得有人顺手加一列「当前进度」之类的派生值：派生值一旦落列，
+    /// 它就有自己的更新时间，读面再也分不清它是算出来的还是喂进来的。
+    #[test]
+    fn the_plan_table_column_set_is_exactly_the_plan() {
+        assert_eq!(
+            task_plan_columns(DDL),
+            vec![
+                "workspace_id",
+                "task_id",
+                "planned_start",
+                "planned_end",
+                "budget_tokens",
+                "baseline_rev",
+                "updated_at",
+            ]
+        );
     }
 }

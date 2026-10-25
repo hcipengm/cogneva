@@ -412,10 +412,24 @@ function GanttPanel({ project }: { project: ProjectRow }) {
       </Readings>
       <Provenance source={data.source} />
 
-      {!data.has_plan && (
+      {data.plan_error && (
+        <div className="border-b border-[var(--line)] px-4 py-2 text-[11px] text-[var(--warn)]">
+          读不到计划基线：{data.plan_error}。因此下面每行的「未排期」可能是**读不到**，
+          不是没排期——这两件事在这一屏上分不开，所以先说这一句。
+        </div>
+      )}
+
+      {!data.plan_error && !data.has_plan && (
         <div className="border-b border-[var(--line)] px-4 py-2 text-[11px] text-[var(--warn)]">
           这个项目还没有计划基线：下面的条画的是**实际**起止（创建到最近一次更新），
           不是计划。缺计划的一头留空，不画成零长度——零长度的条会被读成「计划已完成」。
+        </div>
+      )}
+
+      {data.has_plan && (
+        <div className="border-b border-[var(--line)] px-4 py-2 text-[11px] text-[var(--muted)]">
+          每行两条：上面细的是**计划**（基线给的起止），下面粗的是**实际**
+          （创建到最近一次更新）。两条一起看才看得出偏差。
         </div>
       )}
 
@@ -437,26 +451,47 @@ function GanttPanel({ project }: { project: ProjectRow }) {
 function timeSpan(rows: GanttRow[]): { start: number; end: number } | null {
   let start = Number.POSITIVE_INFINITY;
   let end = Number.NEGATIVE_INFINITY;
+  // 计划的那一头也要算进来：只按实际算时间轴，计划条会被裁到画布外面，
+  // 而裁掉的样子（一根短条）看起来像是计划本来就这么短。
+  const consider = (v: string | null | undefined) => {
+    if (!v) return;
+    const t = Date.parse(v);
+    if (Number.isFinite(t)) {
+      start = Math.min(start, t);
+      end = Math.max(end, t);
+    }
+  };
   for (const r of rows) {
-    const a = Date.parse(r.created_at);
-    const b = Date.parse(r.updated_at);
-    if (Number.isFinite(a)) start = Math.min(start, a);
-    if (Number.isFinite(b)) end = Math.max(end, b);
+    consider(r.created_at);
+    consider(r.updated_at);
+    consider(r.planned_start);
+    consider(r.planned_end);
   }
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
   return { start, end };
 }
 
+/** 把两个时刻换成时间轴上的百分比区间；缺一头就返回 null（不画零长度条）。 */
+function barSpan(
+  from: string | null,
+  to: string | null,
+  span: { start: number; end: number } | null,
+): { left: number; width: number } | null {
+  if (!span || !from || !to) return null;
+  const a = Date.parse(from);
+  const b = Date.parse(to);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+  const total = span.end - span.start;
+  return {
+    left: ((a - span.start) / total) * 100,
+    width: Math.max(((b - a) / total) * 100, 0.4),
+  };
+}
+
 function GanttBar({ row, span }: { row: GanttRow; span: { start: number; end: number } | null }) {
-  const a = Date.parse(row.created_at);
-  const b = Date.parse(row.updated_at);
-  let left = 0;
-  let width = 100;
-  if (span && Number.isFinite(a) && Number.isFinite(b)) {
-    const total = span.end - span.start;
-    left = ((a - span.start) / total) * 100;
-    width = Math.max(((b - a) / total) * 100, 0.4);
-  }
+  const actual = barSpan(row.created_at, row.updated_at, span);
+  const planned = barSpan(row.planned_start, row.planned_end, span);
+
   return (
     <div className="flex items-center gap-2 border-b border-[var(--line)] py-0.5">
       <span className="mono w-40 shrink-0 truncate text-[10px] text-[var(--paper-dim)]" title={row.id}>
@@ -465,22 +500,35 @@ function GanttBar({ row, span }: { row: GanttRow; span: { start: number; end: nu
       <span className="min-w-0 flex-1 truncate text-[10px] text-[var(--muted)]" title={row.title}>
         {row.title}
       </span>
-      <div className="relative h-2.5 w-64 shrink-0 bg-[var(--line)]">
-        <div
-          className="absolute top-0 h-full"
-          style={{
-            left: `${left}%`,
-            width: `${width}%`,
-            background: row.unplanned ? 'var(--brass-dim)' : 'var(--brass)',
-          }}
-          title={`实际 ${row.created_at} → ${row.updated_at}`}
-        />
+      <div className="relative h-4 w-64 shrink-0">
+        {/* 上轨：计划。没有基线就没有这一条——不画一根零长度的，那会被读成「计划已完成」。 */}
+        {planned && (
+          <div
+            className="absolute top-0 h-1"
+            style={{ left: `${planned.left}%`, width: `${planned.width}%`, background: 'var(--brass)' }}
+            title={`计划 ${row.planned_start} → ${row.planned_end ?? '（时长未知）'}`}
+          />
+        )}
+        {/* 下轨：实际。 */}
+        <div className="absolute bottom-0 h-2.5 w-full bg-[var(--line)]">
+          {actual && (
+            <div
+              className="absolute top-0 h-full"
+              style={{
+                left: `${actual.left}%`,
+                width: `${actual.width}%`,
+                background: row.unplanned ? 'var(--brass-dim)' : 'var(--brass)',
+              }}
+              title={`实际 ${row.created_at} → ${row.updated_at}`}
+            />
+          )}
+        </div>
       </div>
       <span className="w-20 shrink-0 text-right">
         <Status value={row.status} />
       </span>
       <span className="mono w-12 shrink-0 text-right text-[10px] text-[var(--muted)]">
-        {row.unplanned ? '未排期' : '有计划'}
+        {row.unplanned ? '未排期' : row.planned_end ? '有计划' : '有起期'}
       </span>
     </div>
   );

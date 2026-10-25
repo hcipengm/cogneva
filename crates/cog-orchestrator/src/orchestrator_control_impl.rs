@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use cog_core::{OrchestratorControl, SFResult, Task, UpstreamFailure};
+use cog_core::{OrchestratorControl, SFError, SFResult, Task, UpstreamFailure};
 use std::sync::Arc;
 
 /// High-level orchestrator control that composes a [`cog_core::DagExecutor`]
@@ -13,6 +13,12 @@ pub struct OrchestratorControlImpl {
     dag_executor: Arc<dyn cog_core::DagExecutor>,
     action_planner: Option<Arc<dyn cog_core::ActionPlanner>>,
     skill_registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>>,
+    /// 计划基线所在的后端与它所属的 workspace。与 `dag_executor` 用的是同一份
+    /// 存储——基线和任务行分家，读面就会拿 A 库的现状去配 B 库的计划。
+    /// 没接时 [`OrchestratorControl::task_plans`] 返回 `NotImplemented`，
+    /// 而不是一个空集合冒充「都没排期」。
+    state_backend: Option<Arc<dyn cog_core::StateBackend>>,
+    workspace_id: String,
 }
 
 impl OrchestratorControlImpl {
@@ -21,7 +27,19 @@ impl OrchestratorControlImpl {
             dag_executor,
             action_planner: None,
             skill_registry: None,
+            state_backend: None,
+            workspace_id: "default".into(),
         }
+    }
+
+    pub fn with_plan_store(
+        mut self,
+        backend: Arc<dyn cog_core::StateBackend>,
+        workspace_id: impl Into<String>,
+    ) -> Self {
+        self.state_backend = Some(backend);
+        self.workspace_id = workspace_id.into();
+        self
     }
 
     pub fn with_action_planner(mut self, planner: Arc<dyn cog_core::ActionPlanner>) -> Self {
@@ -82,6 +100,17 @@ impl OrchestratorControl for OrchestratorControlImpl {
 
     async fn get_all_tasks(&self) -> Vec<Task> {
         self.dag_executor.get_all_tasks().await
+    }
+
+    async fn task_plans(&self) -> SFResult<Vec<cog_core::TaskPlan>> {
+        match self.state_backend.as_ref() {
+            Some(backend) => backend.task_plans(&self.workspace_id).await,
+            None => Err(SFError::NotImplemented(
+                "task_plans: this orchestrator holds no plan store, so whether a task was \
+                 ever planned cannot be read here"
+                    .into(),
+            )),
+        }
     }
 
     async fn push_to_dlq(&self, task_id: &str, error: String) -> SFResult<bool> {

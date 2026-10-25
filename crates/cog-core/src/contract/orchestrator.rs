@@ -1,5 +1,5 @@
 use crate::contract::llm::UpstreamFailure;
-use crate::{SFResult, Task};
+use crate::{SFError, SFResult, Task, TaskPlan};
 use async_trait::async_trait;
 
 /// Abstract interface for orchestrating tasks without hard-coupling to
@@ -47,6 +47,16 @@ pub trait OrchestratorControl: Send + Sync {
 
     /// Return every task currently in the graph.
     async fn get_all_tasks(&self) -> Vec<Task>;
+
+    /// 这个 workspace 里每条任务的计划基线。
+    ///
+    /// 与 [`Self::get_all_tasks`] 成对存在：任务图回答「现在是什么样」，基线回答
+    /// 「当初打算怎么做」，读面要把两者并排才画得出甘特。返回 `Err` 与返回空集合
+    /// 不是一回事——前者说这个部署读不到基线，后者说这些任务都没排过期，而一个
+    /// 把前者读成后者的读面会把整屏画成「未排期」。
+    async fn task_plans(&self) -> SFResult<Vec<TaskPlan>> {
+        Err(SFError::NotImplemented("task_plans".into()))
+    }
 
     /// Push a failed task to the dead-letter queue.
     async fn push_to_dlq(&self, task_id: &str, error: String) -> SFResult<bool>;

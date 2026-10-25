@@ -524,6 +524,37 @@ pub trait StateBackend: Send + Sync {
     async fn delete_board(&self, task_id: &str) -> SFResult<()>;
     async fn remove_board_field(&self, task_id: &str, field: &str) -> SFResult<()>;
 
+    // ─── 计划基线（task_plan）───
+    //
+    // 一张只含计划列的独立表：任务「打算怎么做」。它没有状态列——状态的唯一
+    // 正本在任务图上，两张表各存一份状态就是两份真值。
+    //
+    // 默认实现是 `NotImplemented` 而不是空集合：一个读不出基线、却回答「没有
+    // 基线」的后端，会把「这个部署没有计划面」与「这些都还没排期」读成同一件
+    // 事，而后者会让甘特面画满一屏「未排期」，看着像计划没填，其实是没人问。
+
+    /// 写入（或推进）一条任务的计划基线。
+    async fn save_task_plan(&self, plan: &crate::TaskPlan) -> SFResult<()> {
+        let _ = plan;
+        Err(SFError::NotImplemented("save_task_plan".into()))
+    }
+
+    /// 一条任务的计划基线；从未排过期时为 `None`。
+    async fn task_plan(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+    ) -> SFResult<Option<crate::TaskPlan>> {
+        let _ = (workspace_id, task_id);
+        Err(SFError::NotImplemented("task_plan".into()))
+    }
+
+    /// 这个 workspace 里全部的计划基线。
+    async fn task_plans(&self, workspace_id: &str) -> SFResult<Vec<crate::TaskPlan>> {
+        let _ = workspace_id;
+        Err(SFError::NotImplemented("task_plans".into()))
+    }
+
     /// Save the full DAG executor state for a workspace.
     async fn save_dag_state(&self, workspace_id: &str, state: &serde_json::Value) -> SFResult<()> {
         let _ = workspace_id;

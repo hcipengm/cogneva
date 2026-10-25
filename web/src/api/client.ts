@@ -916,6 +916,13 @@ export interface GanttRow {
 export interface ProjectGanttReading {
   project_id: string;
   has_plan: boolean;
+  /**
+   * 读不到计划基线时的原因；读到了是 `null`。
+   *
+   * 它必须与行一起读：读不到时每行的 `unplanned` 也是真，与「确实没排期」同形。
+   * 先看这里，再说行。
+   */
+  plan_error: string | null;
   rows: GanttRow[];
   source: ReadingSource;
 }

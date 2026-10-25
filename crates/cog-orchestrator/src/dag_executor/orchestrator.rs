@@ -544,6 +544,16 @@ impl DagExecutor {
         self
     }
 
+    /// 这个执行器据以持久化的后端，没有配置时为 `None`。
+    ///
+    /// 给需要跟着任务图一起写同一后端的调用点用（计划基线写在任务行旁边，
+    /// 两者必须落在同一个部署上，否则甘特面会把一个库的任务配上另一个库的
+    /// 基线）。返回克隆的 `Arc` 而不是引用，调用方要在 `&self` 的读方法里跨
+    /// `await` 持着它。
+    pub fn state_backend(&self) -> Option<Arc<dyn cog_core::StateBackend>> {
+        self.state_backend.clone()
+    }
+
     pub fn with_batch_persistence(
         mut self,
         enabled: bool,
