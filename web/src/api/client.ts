@@ -932,6 +932,48 @@ export async function getProjectGantt(id: string): Promise<ProjectGanttReading> 
 }
 
 /**
+ * 挣值的一个量。`value` 与 `unmeasurable` 互斥：量不出来时 `value` 是 `null`
+ * 而 `unmeasurable` 说明为什么。**不要**把 `null` 当 0 显示——计划价值为 0 是
+ * 还没开工、成本为 0 是一分没花，两者都与「算不出来」差得很远。
+ */
+export interface EvmReading {
+  value: number | null;
+  unmeasurable: string | null;
+  basis: string;
+}
+
+export interface EvmAttribution {
+  tasks_with_cost: number;
+  baselined_tasks_without_cost: number;
+}
+
+export interface ProjectEvmReading {
+  project_id: string;
+  unit: string;
+  planned_value: EvmReading;
+  earned_value: EvmReading;
+  actual_cost: EvmReading;
+  cost_performance_index: number | null;
+  schedule_performance_index: number | null;
+  /**
+   * 同一窗口里没有任务身份的用量。它不属于任何项目，所以不进实际成本；
+   * 也不折成 0，那样会把归因缺口读成省钱。
+   */
+  unattributed_tokens: number | null;
+  /** 上面那个数的窗口起点；终点是 `source.read_at`。不带它，比例会被当常数。 */
+  unattributed_window_start: string | null;
+  unattributed_share: number | null;
+  attribution: EvmAttribution;
+  /** 算这三个量用的假设，明写在响应里。 */
+  assumption: string;
+  source: ReadingSource;
+}
+
+export async function getProjectEvm(id: string): Promise<ProjectEvmReading> {
+  return api.get<ProjectEvmReading>(`/api/v1/projects/${encodeURIComponent(id)}/evm`);
+}
+
+/**
  * 任务行。过滤条件只有服务端认的三个：`goal_id`、`agent_id`、`status`。
  *
  * `limit` 在本地截：端点不认它，发过去也会被忽略——带着一个看着生效、实际

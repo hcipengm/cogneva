@@ -288,6 +288,13 @@ pub struct GatewayState {
     /// 问题（"昨天这些令牌花哪了"）会被反复问，不能让每次读都扫一遍只增不减的
     /// 明细表。缺席时读路由显式报「未配置」，而不是回一笔空账。
     pub llm_usage_reader: Option<Arc<dyn cog_core::LlmUsageReader>>,
+    /// 逐笔 token 账（`gateway_llm_usage`）的读口，给需要**按任务**取花销的读面用。
+    ///
+    /// 与上面那个 `llm_usage_reader` 不是一回事：那个读折叠过的窗口，按
+    /// actor×上游×协议汇总，答不了「这条任务花了多少」。挣值问的正是后者。
+    /// 缺席时读面显式报「量不了」，不把缺账读成零花销。借的是库里已有的池，
+    /// 不为这一次读新开一套连接。
+    pub llm_usage: Option<Arc<cog_observability::usage_store::LlmUsageStore>>,
     /// Observables — 各业务 crate 暴露的系统级指标（D5/D8/D9）。
     pub observables: Vec<Arc<dyn cog_core::Observable>>,
     /// 抓取维度集合的可选收窄项；空 = 不收窄，采每个 observable 自己声明的有界维度。
@@ -937,6 +944,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/projects/{id}/gantt",
             get(projects::project_gantt_handler),
+        )
+        // 挣值：计划价值、挣值、实际成本三个量每次现算，不落表也不缓存成列。
+        // 一旦缓存，读的人就分不出这个数是此刻算的还是上一拍留下的。
+        .route(
+            "/api/v1/projects/{id}/evm",
+            get(projects::project_evm_handler),
         )
         .route(
             "/api/v1/processes",

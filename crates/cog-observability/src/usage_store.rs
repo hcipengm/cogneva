@@ -746,6 +746,12 @@ impl LlmUsageStore {
         Ok(Self { pool })
     }
 
+    /// 借一个已经连上的池。同一个库上再开一个池只为了读一张表，等于给一次
+    /// 读配一套连接预算——调用方手里已经有池时就该用这一条。
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
     /// Auto-create every table, column and index this store owns.
     ///
     /// The statements themselves are [`DDL`]: a restore replays that same list
@@ -1113,6 +1119,61 @@ impl LlmUsageStore {
             by_actor.insert(row.get::<String, _>("actor"), tokens);
         }
         Ok((total, by_actor))
+    }
+
+    /// 一组任务各自花了多少 token。
+    ///
+    /// 按任务取而不是按窗口取：挣值的实际成本问的是「这些活一共花了多少」，
+    /// 与它们横跨几个窗口无关。没花过钱的任务不出现在结果里（不是 0），调用方
+    /// 因此能分开「花了 0」与「这笔账上看不到它」——后者是归因缺口，不是省下来的。
+    ///
+    /// `result` 不过滤：失败的上游调用照样烧掉了输入 token，把它排除会让实际
+    /// 成本偏低，而成本绩效只会在这一侧虚高。
+    pub async fn spend_by_task(&self, task_ids: &[String]) -> anyhow::Result<Vec<(String, u64)>> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(&format!(
+            "SELECT task_id, COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT AS tokens
+               FROM {LEDGER_TABLE}
+              WHERE task_id = ANY($1)
+              GROUP BY task_id
+              ORDER BY task_id"
+        ))
+        .bind(task_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("task_id"),
+                    row.get::<i64, _>("tokens").max(0) as u64,
+                )
+            })
+            .collect())
+    }
+
+    /// 同一窗口里**没有**任务身份的用量合计。
+    ///
+    /// 这个数不属于任何一个项目，所以它不能并进哪个项目的成本；它要报出来，
+    /// 是因为它量的是「成本里有多少看不到出处」。折成 0，成本绩效会把归因缺口
+    /// 读成省钱。
+    pub async fn unattributed_between(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> anyhow::Result<u64> {
+        let row = sqlx::query(&format!(
+            "SELECT COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT AS tokens
+               FROM {LEDGER_TABLE}
+              WHERE task_id IS NULL AND ts >= $1 AND ts < $2"
+        ))
+        .bind(since)
+        .bind(until)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("tokens").max(0) as u64)
     }
 
     /// Whether a job has already put anything on the wire under this identity.

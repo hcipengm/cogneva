@@ -85,6 +85,7 @@ pub async fn build_gateway_state(
     audit_stream: &Option<Arc<dyn cog_core::AuditStream>>,
     taste_intent_sink: &Option<Arc<dyn cog_core::TasteIntentSink>>,
     llm_usage_reader: &Option<Arc<dyn cog_core::LlmUsageReader>>,
+    pg_pool_explain: &Option<sqlx::PgPool>,
     governance_store: &Option<Arc<dyn cog_core::GovernanceStore>>,
     principle_ledger: &Option<Arc<dyn cog_core::PrincipleLedgerStore>>,
     change_ledger: &Option<Arc<dyn cog_core::ChangeLedgerStore>>,
@@ -178,6 +179,13 @@ pub async fn build_gateway_state(
         audit_stream: audit_stream.clone(),
         taste_intent_sink: taste_intent_sink.clone(),
         llm_usage_reader: llm_usage_reader.clone(),
+        // 同一个库、同一个池：逐笔 token 账就落在这一库里，没有池时读面报
+        // 「量不了」而不是零。
+        llm_usage: pg_pool_explain.clone().map(|pool| {
+            Arc::new(cog_observability::usage_store::LlmUsageStore::from_pool(
+                pool,
+            ))
+        }),
         llm_client: Arc::new(std::sync::RwLock::new(None)),
         chat_turns: chat_turns.clone(),
         agent_messages: agent_messages.clone(),

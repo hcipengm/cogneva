@@ -120,8 +120,86 @@ pub struct GanttResponse {
     pub source: Source,
 }
 
+/// 挣值的一个量。
+///
+/// `value` 与 `unmeasurable` 是互斥的两态，不是「有值 + 备注」：一个量不出来
+/// 的绩效如果印成 0，读者会把它当成「绩效为零」——成本为零是好消息，计划价值
+/// 为零是没开工，两者都与「还没法算」差得很远。
+#[derive(Debug, Serialize, PartialEq)]
+pub struct EvmReading {
+    pub value: Option<u64>,
+    pub unmeasurable: Option<String>,
+    /// 这个数怎么来的，一句给人读的话。
+    pub basis: String,
+}
+
+impl EvmReading {
+    fn measured(value: u64, basis: impl Into<String>) -> Self {
+        Self {
+            value: Some(value),
+            unmeasurable: None,
+            basis: basis.into(),
+        }
+    }
+
+    fn unmeasurable(reason: impl Into<String>) -> Self {
+        Self {
+            value: None,
+            unmeasurable: Some(reason.into()),
+            basis: String::new(),
+        }
+    }
+}
+
+/// 实际成本的归因面：成本只在账上带任务身份的那些行里，剩下的单独报。
+#[derive(Debug, Serialize, PartialEq)]
+pub struct EvmAttribution {
+    /// 这些任务里，账上有花销记录的条数。
+    pub tasks_with_cost: usize,
+    /// 有基线预算、账上却一条花销都没有的任务条数。它不是「免费」，是这笔账
+    /// 上看不到它——两个都不该被读成省下来的钱。
+    pub baselined_tasks_without_cost: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EvmResponse {
+    pub project_id: String,
+    /// 成本的单位。三个量同一把尺子，不引入第二套计价。
+    pub unit: &'static str,
+    pub planned_value: EvmReading,
+    pub earned_value: EvmReading,
+    pub actual_cost: EvmReading,
+    /// 成本绩效指数 = 挣值 / 实际成本。两者任一量不出来时为 `None`。
+    pub cost_performance_index: Option<f64>,
+    /// 进度绩效指数 = 挣值 / 计划价值。
+    pub schedule_performance_index: Option<f64>,
+    /// 同一窗口里**没有**任务身份的用量。
+    ///
+    /// 它不属于任何一个项目，所以不并进上面的成本；它也不折成 0，因为那样
+    /// 成本绩效会把归因缺口读成省钱。`None` 表示这笔账读不到。
+    pub unattributed_tokens: Option<u64>,
+    /// 上面那个数的统计窗口**起点**，终点就是 `source.read_at`。
+    ///
+    /// 少了它，那个数会被当成常数带走：同一个部署换个窗口量出来是另一个数，
+    /// 而读面只有比值时读者无法知道自己手上的比值属于哪一窗。
+    pub unattributed_window_start: Option<String>,
+    /// 归因缺口占这个窗口花费的比例（无归因 /（无归因 + 本项目有归因））。
+    /// 分母写在 `assumption` 里：口径不写清的比例，下一个读者会按别的分母复算。
+    pub unattributed_share: Option<f64>,
+    pub attribution: EvmAttribution,
+    /// 算这三个量时用的假设，明写出来。
+    pub assumption: String,
+    pub source: Source,
+}
+
 /// 任务图的正本表名。项目面自己不带表，读的就是它。
 const TASK_TABLE: &str = "cog_dag_tasks";
+
+/// 实际成本的出处：逐笔 token 账。与配额、告警读的是同一张，所以三个量同一把尺子。
+const USAGE_TABLE: &str = "gateway_llm_usage";
+
+/// 挣值一次要读三张表，`source.table` 把三张都写出来。
+const EVM_TABLE: &str = "cog_dag_tasks + task_plan + gateway_llm_usage";
 
 /// 甘特面要多读一张：计划基线。两个表名一起写进 `source`，读者才知道这一屏
 /// 是「现状 + 当初的计划」两份读数拼出来的。
@@ -379,6 +457,258 @@ pub async fn project_gantt_handler(
     Ok(Json(build_gantt_response(id, &rows, plans.as_ref())))
 }
 
+pub async fn project_evm_handler(
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<Extension<cog_core::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<EvmResponse>, ApiError> {
+    let claims = claims.as_ref().map(|Extension(c)| c);
+    let tasks = visible_tasks(&state, claims).await;
+    let rows = tasks_of_project(&tasks, &id);
+
+    if rows.is_empty() && id != UNGROUPED {
+        return Err(ApiError::not_found(format!("project {id}")));
+    }
+
+    let plans = readable_plans(&state.orchestrator).await;
+    let now = chrono::Utc::now();
+
+    // 成本从逐笔账按任务取。账没接上时 `spends` 与 `unattributed` 都是 `None`，
+    // 于是成本这一列写「量不了」——比 0 诚实：0 会让成本绩效好看得不像真的。
+    let (spends, unattributed) = match state.llm_usage.as_ref() {
+        Some(store) => {
+            let ids: Vec<String> = rows.iter().map(|t| t.id.clone()).collect();
+            let spends = match store.spend_by_task(&ids).await {
+                Ok(v) => Some(v.into_iter().collect::<BTreeMap<String, u64>>()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "evm: task spend is not readable from the ledger");
+                    None
+                }
+            };
+            // 归因缺口的窗口：从这些任务最早的那一刻（有基线就用计划起点）到现在。
+            // 账上没有任务身份的行无法归属到任何项目，只能报这个窗口里的总量。
+            let since = evm_window_start(&rows, plans.as_ref());
+            let unattributed = match store.unattributed_between(since, now).await {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(error = %e, "evm: unattributed spend is not readable");
+                    None
+                }
+            };
+            (spends, unattributed)
+        }
+        None => (None, None),
+    };
+
+    Ok(Json(build_evm_response(
+        id,
+        &rows,
+        plans.as_ref(),
+        spends.as_ref(),
+        unattributed,
+        now,
+    )))
+}
+
+/// 归因缺口的统计窗口起点：这一批任务里最早的那一刻。
+///
+/// 有基线时用计划起点（这批活「本来」从那时开始），没有就用创建时刻。比这个
+/// 更早的无归因用量与这个项目无关，算进来只会把缺口报大。
+fn evm_window_start(
+    rows: &[&Task],
+    plans: Option<&BTreeMap<String, cog_core::TaskPlan>>,
+) -> chrono::DateTime<chrono::Utc> {
+    let mut start = rows
+        .iter()
+        .map(|t| t.created_at)
+        .min()
+        .unwrap_or_else(chrono::Utc::now);
+    if let Some(plans) = plans {
+        for t in rows {
+            if let Some(planned) = plans.get(&t.id).and_then(|p| p.planned_start) {
+                start = start.min(planned);
+            }
+        }
+    }
+    start
+}
+
+/// 挣值响应的拼装与 handler 分开：三个量的算法是这一面唯一的实质，而它只有在
+/// 能被直接喂数据时才验得了。
+fn build_evm_response(
+    project_id: String,
+    rows: &[&Task],
+    plans: Option<&BTreeMap<String, cog_core::TaskPlan>>,
+    spends: Option<&BTreeMap<String, u64>>,
+    unattributed: Option<u64>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> EvmResponse {
+    let (planned_value, earned_value, attribution) = match plans {
+        None => (
+            EvmReading::unmeasurable("计划基线读不到：这一部署回答不了「本来该完成多少」"),
+            EvmReading::unmeasurable("计划基线读不到：挣值没有分母可比"),
+            EvmAttribution {
+                tasks_with_cost: 0,
+                baselined_tasks_without_cost: 0,
+            },
+        ),
+        Some(plans) => {
+            let baselined: Vec<(&Task, &cog_core::TaskPlan)> = rows
+                .iter()
+                .filter_map(|t| plans.get(&t.id).map(|p| (*t, p)))
+                .collect();
+            if baselined.is_empty() {
+                (
+                    EvmReading::unmeasurable(
+                        "这个项目里没有一条任务有基线：不是进度为零，是没排过期",
+                    ),
+                    EvmReading::unmeasurable("没有基线就没有可挣的计划价值"),
+                    EvmAttribution {
+                        tasks_with_cost: 0,
+                        baselined_tasks_without_cost: 0,
+                    },
+                )
+            } else {
+                let (pv, with_duration, without_duration) = planned_value_at(&baselined, now);
+                let ev: u64 = baselined
+                    .iter()
+                    .filter(|(t, _)| t.status == TaskStatus::Completed)
+                    .map(|(_, p)| p.budget_tokens)
+                    .sum();
+                let completed = baselined
+                    .iter()
+                    .filter(|(t, _)| t.status == TaskStatus::Completed)
+                    .count();
+                (
+                    EvmReading::measured(
+                        pv,
+                        format!(
+                            "{with_duration} 条带时长的基线按线性比例折算到此刻\
+                             （无工作日历）；{without_duration} 条只有起期、时长未知，不计入"
+                        ),
+                    ),
+                    EvmReading::measured(
+                        ev,
+                        format!(
+                            "{completed} 条已完成任务的基线预算之和，共 {} 条有基线",
+                            baselined.len()
+                        ),
+                    ),
+                    {
+                        let spent: std::collections::BTreeSet<&str> = spends
+                            .map(|s| s.keys().map(String::as_str).collect())
+                            .unwrap_or_default();
+                        EvmAttribution {
+                            tasks_with_cost: baselined
+                                .iter()
+                                .filter(|(t, _)| spent.contains(t.id.as_str()))
+                                .count(),
+                            baselined_tasks_without_cost: baselined
+                                .iter()
+                                .filter(|(t, _)| {
+                                    !spent.contains(t.id.as_str())
+                                        && t.status == TaskStatus::Completed
+                                })
+                                .count(),
+                        }
+                    },
+                )
+            }
+        }
+    };
+
+    let actual_cost = match spends {
+        None => EvmReading::unmeasurable(format!(
+            "逐笔 token 账读不到（`{USAGE_TABLE}` 没有接上这一部署）：成本量不出来"
+        )),
+        Some(spends) => {
+            let total: u64 = rows.iter().filter_map(|t| spends.get(&t.id).copied()).sum();
+            EvmReading::measured(
+                total,
+                format!(
+                    "{} 条任务在 `{USAGE_TABLE}` 上按 task_id 聚合的花销；失败调用也计（token 已经烧掉）",
+                    spends.len()
+                ),
+            )
+        }
+    };
+
+    let cost_performance_index = ratio(earned_value.value, actual_cost.value);
+    let schedule_performance_index = ratio(earned_value.value, planned_value.value);
+    let unattributed_share = match (unattributed, actual_cost.value) {
+        (Some(u), Some(a)) => ratio(Some(u), Some(u.saturating_add(a))),
+        _ => None,
+    };
+
+    EvmResponse {
+        project_id,
+        unit: "token",
+        planned_value,
+        earned_value,
+        actual_cost,
+        cost_performance_index,
+        schedule_performance_index,
+        unattributed_tokens: unattributed,
+        // 只在真读到缺口时给窗口：量不出来的时候给一个窗口，会让读者以为
+        // 「这个窗口里一条无归因用量都没有」。
+        unattributed_window_start: unattributed.map(|_| evm_window_start(rows, plans).to_rfc3339()),
+        unattributed_share,
+        attribution,
+        assumption: "计划价值按「已过时间 / 计划总时长」线性折算，没有工作日历；\
+                     挣值只认已完成任务；实际成本取 token 账上按 task_id 聚合的花销；\
+                     归因缺口的分母是「缺口 + 本项目有归因的花销」，不是全平台花销"
+            .to_string(),
+        source: Source {
+            table: EVM_TABLE,
+            reader: "task graph + plan baselines + per-call token ledger",
+            read_at: now.to_rfc3339(),
+        },
+    }
+}
+
+/// 除法的三个拒绝：分母缺失、分母为零、以及结果没有意义的情形。全部返回
+/// `None` 而不是 0——一个 0 的绩效指数读起来像「一样快」，而真相是算不出来。
+fn ratio(numerator: Option<u64>, denominator: Option<u64>) -> Option<f64> {
+    match (numerator, denominator) {
+        (Some(n), Some(d)) if d > 0 => Some(n as f64 / d as f64),
+        _ => None,
+    }
+}
+
+/// 到此刻按基线本该完成多少，返回 (计划价值, 计入的条数, 时长未知的条数)。
+///
+/// 线性折算：`已过 / 计划总时长`。没有工作日历，所以这是唯一诚实的算法——
+/// 一个「按工作日」算出来的数在这里没有任何来源。
+fn planned_value_at(
+    baselined: &[(&Task, &cog_core::TaskPlan)],
+    now: chrono::DateTime<chrono::Utc>,
+) -> (u64, usize, usize) {
+    let mut pv = 0f64;
+    let mut with_duration = 0usize;
+    let mut without_duration = 0usize;
+    for (_, plan) in baselined {
+        let Some(start) = plan.planned_start else {
+            without_duration += 1;
+            continue;
+        };
+        let Some(end) = plan.planned_end else {
+            without_duration += 1;
+            continue;
+        };
+        // 零长度的计划不是「立刻完成」：没有时长就折不出比例，按未知计。
+        if end <= start {
+            without_duration += 1;
+            continue;
+        }
+        let total = (end - start).num_milliseconds().max(1) as f64;
+        let elapsed = (now - start).num_milliseconds() as f64;
+        let fraction = (elapsed / total).clamp(0.0, 1.0);
+        pv += plan.budget_tokens as f64 * fraction;
+        with_duration += 1;
+    }
+    (pv.round() as u64, with_duration, without_duration)
+}
+
 /// 甘特响应的拼装与 handler 分开，好让「读不到基线」这一态能直接被测到——
 /// 只能靠起整套网关才验得到的读面，实际上不会被验。
 fn build_gantt_response(
@@ -592,6 +922,166 @@ mod tests {
             1,
             "只有一列有任务，其余列必须显式为 0"
         );
+    }
+
+    fn plan_between(
+        task_id: &str,
+        tokens: u64,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> cog_core::TaskPlan {
+        cog_core::TaskPlan {
+            workspace_id: "default".into(),
+            task_id: task_id.into(),
+            planned_start: Some(start),
+            planned_end: Some(end),
+            budget_tokens: tokens,
+            baseline_rev: "rev-1".into(),
+            updated_at: start,
+        }
+    }
+
+    /// 三个量都量不出来的时候必须说「量不了」，不能填 0。0 在这三个位置上各有
+    /// 各的误读：计划价值 0 读作「还没开工」，挣值 0 读作「一点没干成」，成本 0
+    /// 读作「一分钱没花」；而真相是这个部署回答不了这个问题。
+    #[test]
+    fn without_a_baseline_all_three_quantities_read_unmeasurable_not_zero() {
+        let mut done = task("a", Some("g1"));
+        done.status = TaskStatus::Completed;
+        let now = chrono::Utc::now();
+
+        // 基线读不到、账也读不到：三个量全是「量不了」。
+        let blind = build_evm_response("g1".into(), &[&done], None, None, None, now);
+        assert_eq!(blind.planned_value.value, None);
+        assert_eq!(blind.earned_value.value, None);
+        assert_eq!(blind.actual_cost.value, None);
+        assert!(blind.planned_value.unmeasurable.is_some());
+        assert!(blind.earned_value.unmeasurable.is_some());
+        assert!(blind.actual_cost.unmeasurable.is_some());
+        assert_eq!(blind.unattributed_tokens, None, "读不到不等于零");
+        assert_eq!(blind.unattributed_window_start, None, "没量就没有窗口");
+        assert_eq!(blind.cost_performance_index, None, "分母量不出来就没有指数");
+        assert_eq!(blind.schedule_performance_index, None);
+
+        // 基线读到了、这个项目一条都没有：进度不是零，是没排过期。
+        let empty = build_evm_response(
+            "g1".into(),
+            &[&done],
+            Some(&BTreeMap::new()),
+            None,
+            None,
+            now,
+        );
+        assert_eq!(empty.planned_value.value, None);
+        assert_eq!(empty.earned_value.value, None);
+        assert!(empty.planned_value.unmeasurable.is_some());
+        assert!(empty.earned_value.unmeasurable.is_some());
+
+        // 只有账读不到时，成本单独是「量不了」，另两个照常给数。
+        let plans: BTreeMap<String, cog_core::TaskPlan> = [(
+            "a".to_string(),
+            plan_between(
+                "a",
+                1000,
+                now - chrono::Duration::minutes(5),
+                now + chrono::Duration::minutes(5),
+            ),
+        )]
+        .into_iter()
+        .collect();
+        let half = build_evm_response("g1".into(), &[&done], Some(&plans), None, None, now);
+        assert_eq!(
+            half.earned_value.value,
+            Some(1000),
+            "已完成任务的预算全额计入"
+        );
+        assert_eq!(half.planned_value.value, Some(500), "过了半个计划时长");
+        assert_eq!(half.actual_cost.value, None);
+        assert!(half.actual_cost.unmeasurable.is_some());
+        assert_eq!(half.cost_performance_index, None);
+        assert!(half.schedule_performance_index.is_some());
+    }
+
+    /// 账上不带任务身份的花销不属于任何项目，所以单独成字段、不并进成本。
+    /// 折进成本会把「归因缺口」读成「这个项目很贵」，折成 0 又会读成「省钱」。
+    #[test]
+    fn unattributed_spend_is_reported_separately_and_never_folded_into_actual_cost() {
+        let now = chrono::Utc::now();
+        let mut a = task("a", Some("g1"));
+        a.status = TaskStatus::Completed;
+        let b = task("b", Some("g1"));
+        let window = (
+            now - chrono::Duration::minutes(5),
+            now + chrono::Duration::minutes(5),
+        );
+        let plans: BTreeMap<String, cog_core::TaskPlan> = [
+            ("a".to_string(), plan_between("a", 1000, window.0, window.1)),
+            ("b".to_string(), plan_between("b", 400, window.0, window.1)),
+        ]
+        .into_iter()
+        .collect();
+        let spends: BTreeMap<String, u64> = [("a".to_string(), 700u64), ("b".to_string(), 300u64)]
+            .into_iter()
+            .collect();
+
+        let reading = build_evm_response(
+            "g1".into(),
+            &[&a, &b],
+            Some(&plans),
+            Some(&spends),
+            Some(120),
+            now,
+        );
+
+        assert_eq!(
+            reading.actual_cost.value,
+            Some(1000),
+            "成本只算账上带任务身份的行"
+        );
+        assert_eq!(reading.unattributed_tokens, Some(120));
+        assert_eq!(
+            reading.actual_cost.value.unwrap() + reading.unattributed_tokens.unwrap(),
+            1120,
+            "两个数加起来才是这个窗口的全部花销"
+        );
+        let share = reading.unattributed_share.expect("缺口要有比例");
+        assert!(
+            (share - 120.0 / 1120.0).abs() < 1e-9,
+            "分母是「缺口 + 本项目有归因」，口径写在 assumption 里"
+        );
+        assert!(
+            reading.unattributed_window_start.is_some(),
+            "不带窗口起点的比例会被下一个读者当成常数带走"
+        );
+        assert_eq!(reading.attribution.tasks_with_cost, 2);
+        assert_eq!(
+            reading.attribution.baselined_tasks_without_cost, 0,
+            "两条都在账上找到了"
+        );
+        assert!(
+            EVM_TABLE.contains(USAGE_TABLE),
+            "成本那一列的出处必须点名逐笔 token 账"
+        );
+    }
+
+    /// 计划只有起期、没有时长时，折不出比例，只能算作「时长未知」而不是
+    /// 「已经全部完成」——后者会让计划价值凭空涨一截，进度看起来超前。
+    #[test]
+    fn a_baseline_without_a_duration_is_left_out_of_planned_value_not_counted_as_done() {
+        let mut t = task("a", Some("g1"));
+        t.status = TaskStatus::Completed;
+        let now = chrono::Utc::now();
+        let mut zero_length = plan_between("a", 1000, now, now);
+        let (pv, counted, unknown) = planned_value_at(&[(&t, &zero_length)], now);
+        assert_eq!(pv, 0);
+        assert_eq!(counted, 0);
+        assert_eq!(unknown, 1);
+
+        zero_length.planned_end = None;
+        let (pv, counted, unknown) = planned_value_at(&[(&t, &zero_length)], now);
+        assert_eq!(pv, 0);
+        assert_eq!(counted, 0);
+        assert_eq!(unknown, 1, "只有起期也算不出比例");
     }
 
     /// 两次读同一份数据，行序必须逐行相同：顺序不稳定，界面每次刷新都在跳，

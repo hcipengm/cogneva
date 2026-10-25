@@ -1,9 +1,11 @@
 import { useMemo, useState } from 'react';
 import {
   getProjectBoard,
+  getProjectEvm,
   getProjectGantt,
   getProjects,
   getTaskGraph,
+  type EvmReading,
   type GanttRow,
   type ProjectRow,
   type ReadingSource,
@@ -82,7 +84,7 @@ export function ProjectsView() {
         <>
           <ProjectStrip rows={rows} selected={selected} onSelect={setPicked} />
           {current && (
-            <ProjectPanel mode={mode} project={current} source={projects.data?.source ?? null} />
+            <ProjectPanel mode={mode} project={current} />
           )}
         </>
       )}
@@ -141,15 +143,7 @@ function ProjectStrip({
   );
 }
 
-function ProjectPanel({
-  mode,
-  project,
-  source,
-}: {
-  mode: Mode;
-  project: ProjectRow;
-  source: ReadingSource | null;
-}) {
+function ProjectPanel({ mode, project }: { mode: Mode; project: ProjectRow }) {
   switch (mode) {
     case 'wbs':
       return <ScopePanel project={project} />;
@@ -158,7 +152,7 @@ function ProjectPanel({
     case 'gantt':
       return <GanttPanel project={project} />;
     default:
-      return <EarnedValuePanel project={project} source={source} />;
+      return <EarnedValuePanel project={project} />;
   }
 }
 
@@ -535,43 +529,137 @@ function GanttBar({ row, span }: { row: GanttRow; span: { start: number; end: nu
 }
 
 /**
- * 挣值：还没接上。
+ * 挣值：三个量都现算，不落表。
  *
- * 三个量（计划价值、挣值、实际成本）都要有两点才能算：计划基线给出每个任务的
- * token 预算，token 账按 task_id 给出实际花销。基线表还没落，所以这里显式说
- * 「还没接」并写清接上之后读哪两处——留一屏空白会被读成「绩效良好」。
+ * 「量不了」与「是零」必须分开写：计划价值为 0 是还没开工、成本为 0 是一分没花，
+ * 而量不出来是这一部署回答不了。把后者印成 0，读者会当成好消息。
  */
 function EarnedValuePanel({
   project,
-  source,
 }: {
   project: ProjectRow;
-  source: ReadingSource | null;
 }) {
+  const evm = useResource(`挣值（${project.id}）`, () => getProjectEvm(project.id), 15_000);
+
+  if (evm.error) {
+    return <ReadError what="挣值" error={evm.error} onRetry={evm.refresh} />;
+  }
+  if (!evm.data && evm.loading) return <Loading what="挣值" />;
+  const data = evm.data;
+  if (!data) return <Empty>读不到这个项目的挣值。</Empty>;
+
+  const pv = evmCell(data.planned_value);
+  const ev = evmCell(data.earned_value);
+  const ac = evmCell(data.actual_cost);
+  const unit = data.unit;
+
   return (
     <>
-      <Provenance source={source} />
-      <div className="px-4 py-3 text-[11px] text-[var(--paper-dim)]">
-        <p className="mb-2">挣值这一面还没接入。它要两个东西，现在一个都没到位：</p>
-        <ul className="mb-3 list-disc pl-5 text-[var(--muted)]">
-          <li>
-            计划基线：每个任务的 token 预算与计划起止。今天这个项目
-            {project.planned ? '已有' : '没有'}基线。
-          </li>
-          <li>
-            成本归因：token 账里带 <span className="mono">task_id</span> 的那部分用量。
-            没有归因的用量必须单列报出，不并进成本、也不当零。
-          </li>
-        </ul>
-        <p className="text-[var(--muted)]">
-          接上之后，计划价值、挣值、实际成本三量都现算（不落表），成本单位是 token——
-          与平台的 token 账同一把尺子，不引入第二套计价。成本绩效＝挣值/实际成本，
-          进度绩效＝挣值/计划价值。
+      <Readings
+        from={evm}
+        source={`GET /api/v1/projects/${project.id}/evm`}
+        caveat={data.assumption}
+      >
+        <div className="flex flex-wrap border-b border-[var(--line)] py-2">
+          <Reading
+            label={`计划价值（${unit}）`}
+            value={pv.text}
+            tone={pv.tone}
+            note={pv.note}
+          />
+          <Reading
+            label={`挣值（${unit}）`}
+            value={ev.text}
+            tone={ev.tone}
+            note={ev.note}
+          />
+          <Reading
+            label={`实际成本（${unit}）`}
+            value={ac.text}
+            tone={ac.tone}
+            note={ac.note}
+          />
+          <Reading
+            label="成本绩效"
+            value={indexText(data.cost_performance_index)}
+            tone={indexTone(data.cost_performance_index)}
+            note={
+              data.cost_performance_index === null
+                ? '挣值或实际成本量不出来，指数就给不出——不是 1.0'
+                : '挣值 / 实际成本；大于 1 是省'
+            }
+          />
+          <Reading
+            label="进度绩效"
+            value={indexText(data.schedule_performance_index)}
+            tone={indexTone(data.schedule_performance_index)}
+            note={
+              data.schedule_performance_index === null
+                ? '挣值或计划价值量不出来，指数就给不出——不是 1.0'
+                : '挣值 / 计划价值；大于 1 是快'
+            }
+          />
+        </div>
+      </Readings>
+      <Provenance source={data.source} />
+
+      <div className="border-b border-[var(--line)] px-4 py-2 text-[11px]">
+        <div className="flex items-baseline justify-between">
+          <span className="text-[var(--paper-dim)]">无归因用量</span>
+          <span className="mono">
+            {data.unattributed_tokens === null
+              ? '量不了'
+              : `${data.unattributed_tokens.toLocaleString()} ${unit}`}
+            {data.unattributed_share !== null && (
+              <span className="ml-2 text-[var(--muted)]">
+                （占本窗 {(data.unattributed_share * 100).toFixed(1)}%）
+              </span>
+            )}
+          </span>
+        </div>
+        <p className="mt-1 text-[var(--muted)]">
+          {data.unattributed_tokens === null
+            ? '逐笔 token 账读不到，归因缺口也量不出来。'
+            : `账上没有 task_id 的用量，不并进实际成本（它不属于任何项目），也不折成 0。窗口 ${
+                data.unattributed_window_start
+                  ? new Date(data.unattributed_window_start).toLocaleString()
+                  : '起点未知'
+              } 起至本次读取；换个窗口这个比例就变，别把它当常数。`}
         </p>
-        <p className="mt-3 text-[var(--warn)]">
-          现在读不到这两个量，所以不给任何数字。给一个 0 或一个「—」都会被读成「算过了，是零」。
+        <p className="mt-1 text-[var(--muted)]">
+          账上有花销的任务 {data.attribution.tasks_with_cost} 条；有基线预算但账上一条花销
+          都没有的已完成任务 {data.attribution.baselined_tasks_without_cost} 条——那不是
+          「免费」，是这笔账上看不到它。
         </p>
+        <p className="mt-1 text-[var(--muted)]">{data.assumption}</p>
       </div>
     </>
   );
+}
+
+/** 一个量的三种印法：有数、量不了、以及有数但读法要跟着说明走。 */
+function evmCell(reading: EvmReading): {
+  text: string;
+  tone: 'ok' | 'warn' | 'plain';
+  note: string;
+} {
+  if (reading.value === null) {
+    return {
+      text: '量不了',
+      tone: 'warn',
+      note: reading.unmeasurable ?? '这一部署回答不了这个量',
+    };
+  }
+  return { text: reading.value.toLocaleString(), tone: 'plain', note: reading.basis };
+}
+
+/** 指数只印两位；量不出来时印破折号之外还要在 note 里说清为什么。 */
+function indexText(v: number | null): string {
+  return v === null ? '—' : v.toFixed(2);
+}
+
+function indexTone(v: number | null): 'ok' | 'warn' | 'danger' | 'plain' {
+  if (v === null) return 'warn';
+  if (v >= 1) return 'ok';
+  return v >= 0.8 ? 'warn' : 'danger';
 }

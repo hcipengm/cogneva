@@ -275,6 +275,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &audit_stream,
             &taste_intent_sink,
             &llm_usage_reader,
+            &pg_pool_explain,
             &ctx.consume_service::<dyn cog_core::GovernanceStore>(),
             // 原则台账由持有共用库的存储插件发布。它写面归演化的常驻租约，
             // 这里只借读面：属主要在同一个界面里看见语料判成了什么、哪几条
