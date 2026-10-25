@@ -20,14 +20,54 @@ RENDERED_DIR="$REPO_ROOT/deploy/rendered"
 
 PROFILES=(k3s-single k3s-multi k8s-standard)
 
+# 额度是投影出来的产物，不是 values 里手写的一段：见 project-resource-governance.py
+# 的头部。它单独成文件，是因为 values.yaml 里全是人写的注释，而投影要整份重写；
+# 又按 profile 各一份，因为同一份清单在不同拓扑下声明的卷与副本并不相同（生产
+# profile 不建本地 Retain StorageClass，卷就少一条），投影也就不是同一个数。
+generated_values() { echo "$CHART_DIR/values.resource-governance.$1.yaml"; }
+# deploy/k3s 的配额清单是 parity 基线兼 GitOps 消费物，与 k3s-single 的投影同源。
+QUOTA_BASELINE="$REPO_ROOT/deploy/k3s/resource-quota.yaml"
+
+# `raw` 是"先渲染一遍好让投影有输入"的那一遍：额度还没有，模板里的 required
+# 会报错，所以整段治理关掉（额度与 LimitRange 上限都不在工作负载声明里，投影
+# 读的东西一分不少）。正式那一遍带 -f 投影产物。
+helm_render() {
+  local profile="$1" out="$2" mode="${3:-governed}"
+  local extra=()
+  if [ "$mode" = raw ]; then
+    extra=(--set resourceGovernance.enabled=false)
+  else
+    local gen; gen="$(generated_values "$profile")"
+    [ -f "$gen" ] && extra=(-f "$gen")
+  fi
+  helm template cogneva "$CHART_DIR" \
+    -f "$PROFILES_DIR/$profile.yaml" \
+    ${extra[@]+"${extra[@]}"} \
+    --namespace cogneva \
+    > "$out"
+}
+
+# 从一次渲染里投影出额度并写回（或只核对）。读的只有工作负载自己的声明与
+# chart values 里那两项算不出来的输入。
+project_governance() {
+  local profile="$1" raw="$2" values_out="$3" quota_out="$4"
+  shift 4
+  local quota_args=()
+  [ -n "$quota_out" ] && quota_args=(--write-quota "$quota_out")
+  python3 "$SCRIPT_DIR/project-resource-governance.py" \
+    --rendered "$raw" \
+    --values "$CHART_DIR/values.yaml" \
+    --profile "$PROFILES_DIR/$profile.yaml" \
+    --write-values "$values_out" \
+    ${quota_args[@]+"${quota_args[@]}"} \
+    "$@"
+}
+
 render_profile() {
   local profile="$1" out_dir="$2"
   mkdir -p "$out_dir"
   find "$out_dir" -name '*.yaml' -delete
-  helm template cogneva "$CHART_DIR" \
-    -f "$PROFILES_DIR/$profile.yaml" \
-    --namespace cogneva \
-    > "$out_dir/.rendered.yaml"
+  helm_render "$profile" "$out_dir/.rendered.yaml"
   python3 - "$out_dir/.rendered.yaml" "$out_dir" "$profile" <<'PY'
 import os, re, sys
 
@@ -83,6 +123,17 @@ PY
 if [[ "${1:-}" == "--check" ]]; then
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
+  # 先核投影：额度文件与 deploy/k3s 基线必须等于「从渲染集重算一遍」的结果。
+  # 手改了数值、或改了工作负载没重新投影，都在这里红——它比重新渲染更早说明
+  # 问题出在数上还是出在模板上。
+  for p in "${PROFILES[@]}"; do
+    helm_render "$p" "$tmp/raw-$p.yaml"
+    if [ "$p" = k3s-single ]; then
+      project_governance "$p" "$tmp/raw-$p.yaml" "$(generated_values "$p")" "$QUOTA_BASELINE" --check
+    else
+      project_governance "$p" "$tmp/raw-$p.yaml" "$(generated_values "$p")" "" --check
+    fi
+  done
   for p in "${PROFILES[@]}"; do
     render_profile "$p" "$tmp/$p"
     if ! diff -r "$tmp/$p" "$RENDERED_DIR/$p" >/dev/null 2>&1; then
@@ -94,6 +145,18 @@ if [[ "${1:-}" == "--check" ]]; then
   done
   echo "RENDER FRESHNESS OK：deploy/rendered/ 与 chart/profiles 一致"
 else
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  # 投影要一次渲染当输入，而渲染又要读投影产物。先渲染一遍（额度那时是上一版
+  # 或空，而额度不影响任何工作负载的声明），算出这一版，再渲染正式产物。
+  for p in "${PROFILES[@]}"; do
+    helm_render "$p" "$tmp/raw-$p.yaml"
+    if [ "$p" = k3s-single ]; then
+      project_governance "$p" "$tmp/raw-$p.yaml" "$(generated_values "$p")" "$QUOTA_BASELINE"
+    else
+      project_governance "$p" "$tmp/raw-$p.yaml" "$(generated_values "$p")" ""
+    fi
+  done
   for p in "${PROFILES[@]}"; do
     render_profile "$p" "$RENDERED_DIR/$p"
   done

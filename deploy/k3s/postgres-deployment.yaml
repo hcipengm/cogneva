@@ -82,6 +82,50 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+        - name: postgres_exporter
+          image: prometheuscommunity/postgres-exporter:v0.15.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres-metrics
+              containerPort: 9187
+              protocol: TCP
+          env:
+            - name: DATA_SOURCE_URI
+              value: "127.0.0.1:5432/cogneva?sslmode=disable"
+            - name: DATA_SOURCE_USER
+              value: "cog_user"
+            - name: DATA_SOURCE_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: pg-password
+            - name: PG_EXPORTER_AUTO_DISCOVER_DATABASES
+              value: "false"
+            - name: PG_EXPORTER_DISABLE_SETTINGS_METRICS
+              value: "false"
+            - name: PG_EXPORTER_INCLUDE_DATABASES
+              value: "cogneva"
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: postgres-metrics
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: postgres-metrics
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
   volumeClaimTemplates:
     - metadata:
         name: data

@@ -55,9 +55,13 @@ kubectl kustomize deploy/k3s > "$TMP/k3s.yaml"
 # **不是** deploy/rendered/k3s-single 的渲染上，于是「静态清单与 profile 渲染对齐」
 # 这句话对那一项恒真而两边其实不同——两个都叫 k3s 单节点的产物分叉，没有任何
 # 门禁会响。profile 文件是声明差异的唯一处（render-deploy.sh 也从它渲染）。
+# 额度是投影产物，不是 values.yaml 里的一段（见 project-resource-governance.py）：
+# 不带上它，这一侧渲染出的 ResourceQuota/LimitRange 是空的，而 deploy/k3s 里那份
+# 是有数的——差值会全部记在"k3s 有、helm 没有"上，读起来像静态清单多写了东西。
 helm template cogneva deploy/helm/cogneva \
   --namespace cogneva \
   -f deploy/helm/cogneva/profiles/k3s-single.yaml \
+  -f deploy/helm/cogneva/values.resource-governance.k3s-single.yaml \
   > "$TMP/helm.yaml"
 
 python3 - "$TMP/k3s.yaml" "$TMP/helm.yaml" <<'PYEOF'

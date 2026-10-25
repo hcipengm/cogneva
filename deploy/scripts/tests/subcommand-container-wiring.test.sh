@@ -35,7 +35,10 @@ command -v python3 >/dev/null || { echo "missing dependency: python3" >&2; exit 
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
-helm template cogneva "${chart}" --set secrets.create=false > "${work}/chart.yaml"
+# 额度是渲染集投影出来的（见 templates/resource-quota.yaml），这里不核治理，
+# 所以关掉它而不是传一份没有的投影产物。
+helm template cogneva "${chart}" --set secrets.create=false \
+  --set resourceGovernance.enabled=false > "${work}/chart.yaml"
 
 # The subcommand names are the ones the binary actually dispatches on
 # (crates/cogneva/src/cli.rs SUBCOMMANDS); reading them from there keeps this gate

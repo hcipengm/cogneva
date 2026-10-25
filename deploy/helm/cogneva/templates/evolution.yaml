@@ -113,17 +113,20 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
-  # 治理面漂移读数：把「仓库声明的上限」与「集群真正在执行的」比一比，而集群侧
-  # 就是 `get resourcequota -o json`。只读——上限自身不由部署面交付（见资源配额
-  # 清单，由安装面 apply），所以这里不授权写。
+  # 资源治理面：上限与默认限额是这套清单自己声明的，随发布集一起到达集群。
+  # 不给写权就等于要求每次工作负载变大时有人手工抬一次天花板；那个人不在时，
+  # 每一次滚动都在准入被拒，而现场读起来是"这一版永远滚不上去"。缩小的方向
+  # 由 apiserver 自己兜住：一份低于当前用量的上限，更新请求直接被拒，所以这条
+  # 授权抬得动天花板，却挤不扁正在里面跑的工作负载。
+  #
+  # 另外两个读动词服务的是治理漂移读数（`get resourcequota -o json` 那一侧）；
+  # `LimitRange` 是它的另一半——只看命名空间总和会把两侧读成相等，而每个容器的
+  # 上限在树里可以各不相同。
+  {{- if .Values.resourceGovernance.enabled }}
   - apiGroups: [""]
-    resources: ["resourcequotas"]
-    verbs: ["get", "list", "watch"]
-  # 同一条读数的另一半：`LimitRange` 限制的是每个容器，只看命名空间总和会把两侧
-  # 读成相等，而每个容器的上限在树里可以各不相同。同样只读。
-  - apiGroups: [""]
-    resources: ["limitranges"]
-    verbs: ["get", "list", "watch"]
+    resources: ["resourcequotas", "limitranges"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  {{- end }}
   # 变更部署的回滚：`kubectl rollout undo` 在打补丁之前要先经 ReplicaSet 找到
   # 上一版 pod 模板，所以上面那条覆盖 deployments 的授权不够。缺它时的现场读数：
   # 「failed to retrieve replica sets from deployment cogneva: replicasets.apps is

@@ -49,20 +49,22 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
-  # Governance drift reading: the deployer compares the ceilings the repository
-  # declares against the ones the cluster enforces, and the cluster side of that
-  # comparison is `get resourcequota -o json`. Read-only -- the ceiling itself is
-  # not delivered by this path (the install face applies it), so nothing here
-  # lets the loop write one.
+  # Resource governance: the namespace ceiling and the per-container defaults are
+  # declared by this same release set, so they reach the cluster with it. Without
+  # the write, every workload that grows needs someone to raise the boundary by
+  # hand, and while nobody does, every rollout is refused at admission -- read on
+  # the spot as "this revision never rolls" rather than "the ceiling is small".
+  # The narrowing direction needs no rule: the API server rejects hard below
+  # current usage, so this grant can raise a ceiling but cannot squeeze the
+  # workloads already running under it.
+  #
+  # The read verbs serve the governance drift reading, whose cluster side is
+  # `get resourcequota -o json`. A LimitRange is the other half of that
+  # comparison: a table holding only the namespace sum would call the two sides
+  # equal while every per-container ceiling in the tree could be different.
   - apiGroups: [""]
-    resources: ["resourcequotas"]
-    verbs: ["get", "list", "watch"]
-  # The second half of the same reading: a LimitRange bounds each container, and a
-  # table holding only the namespace sum would call the two sides equal while
-  # every per-container ceiling in the tree could be different. Read-only too.
-  - apiGroups: [""]
-    resources: ["limitranges"]
-    verbs: ["get", "list", "watch"]
+    resources: ["resourcequotas", "limitranges"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
   # Rollback of a change deploy: `kubectl rollout undo` resolves the previous
   # pod template through the deployment's ReplicaSets before it patches
   # anything, so the apps rule above (which covers deployments) is not enough.

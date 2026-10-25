@@ -2873,6 +2873,15 @@ async fn deploy_via_helm(profile: Profile) -> Result<()> {
 /// `deploy/k3s` 里的 `COGNEVA_MAINLINE_DEPLOYER_ENABLED=true` 打开，那条链上
 /// 只有 kubectl apply 一个写者。
 fn helm_common_args(chart: &Path, values: &Path, overrides: &[(String, String)]) -> Vec<String> {
+    // 额度产物按 profile 各一份（同一份清单在不同拓扑下声明的卷不同，投影也就
+    // 不是同一个数），文件名的主干与 profile values 相同。
+    let governed_values = chart.join(format!(
+        "values.resource-governance.{}.yaml",
+        values
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
     let mut out: Vec<String> = vec![
         "cogneva".into(),
         chart.to_string_lossy().into_owned(),
@@ -2880,6 +2889,11 @@ fn helm_common_args(chart: &Path, values: &Path, overrides: &[(String, String)])
         "cogneva".into(),
         "-f".into(),
         values.to_string_lossy().into_owned(),
+        // 额度不写在 values.yaml 里，它是渲染集的投影产物（见
+        // deploy/scripts/project-resource-governance.py）。两条投递路径读同一个
+        // 文件，否则 helm 装出来的命名空间没有额度，而 apply 装出来的有。
+        "-f".into(),
+        governed_values.to_string_lossy().into_owned(),
         "--set".into(),
         "secrets.create=true".into(),
         "--set".into(),
@@ -3023,6 +3037,14 @@ fn collect_image_refs(value: &serde_yaml::Value, path: &str, out: &mut Vec<(Stri
                         }
                         _ => {}
                     },
+                    // `<某某>Image` 是本 chart 给「不是工作负载自己的那个镜像」起的
+                    // 名字（容器边车、导出器）。同一个收集器要认它们：漏一个的后果不
+                    // 是少一行日志，而是这个 Pod 在 CN 安装里直连 docker.io 拉到超时。
+                    k if k.ends_with("Image") => {
+                        if let serde_yaml::Value::String(s) = v {
+                            out.push((child, s.clone()));
+                        }
+                    }
                     _ => collect_image_refs(v, &child, out),
                 }
             }

@@ -75,8 +75,11 @@ PYEOF
 )"
 echo "own image repository: ${own_csv}"
 
+# 额度是渲染集投影出来的（见 templates/resource-quota.yaml），这里不核治理，
+# 所以关掉它而不是传一份没有的投影产物。
 for profile in k3s-single k3s-multi k8s-standard; do
   helm template cogneva "${chart}" -f "${chart}/profiles/${profile}.yaml" \
+    --set resourceGovernance.enabled=false \
     --namespace cogneva > "${work}/chart-${profile}.yaml"
 done
 

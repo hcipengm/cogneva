@@ -8402,15 +8402,14 @@ pub struct RolloutBundle {
     pub support_yaml: String,
     pub targets: Vec<TargetManifest>,
     /// The resource governance ceilings this revision declares in the published
-    /// set. The loop does not deliver them (`GOVERNANCE_KINDS` carries that
-    /// reasoning: a ceiling is tuned by the operator, and replaying a pinned
-    /// default every revision would overwrite it), but they are read out and
-    /// carried along when a bundle is assembled: the rollout side uses them to
-    /// compare against what the cluster actually enforces. Without that, "the
-    /// repository raised the ceiling" and "the cluster already admits against
-    /// the new one" look the same from both readings, until it surfaces as pods
-    /// refused by a stale quota -- and that reads as an admission error, not as
-    /// an expired ceiling.
+    /// set. They travel in `support_yaml` with everything else the release
+    /// declares -- a ceiling only a human may raise would hold every rollout
+    /// hostage to that human's availability -- and are also read out here so
+    /// the rollout side can compare the declaration against what the cluster
+    /// actually enforces. Without that, "the repository raised the ceiling" and
+    /// "the cluster already admits against the new one" look the same from both
+    /// readings, until it surfaces as pods refused by a stale quota -- and that
+    /// reads as an admission error, not as an expired ceiling.
     pub governance: Vec<crate::governance_drift::GovernanceDeclaration>,
 }
 
@@ -8505,13 +8504,6 @@ fn parse_kustomization_resources(text: &str) -> SFResult<Vec<String>> {
 /// 变更必须走安装面/人工核准（bootstrap 以管理员身份 apply 全量清单）。
 const RBAC_KINDS: &[&str] = &["Role", "RoleBinding"];
 
-/// 资源治理 kind：与权限面同路，不经循环面下发。它们的数值由 chart values 与
-/// 操作面标定（profile 决定开关与上限），而发布集是从提交好的静态清单组包的——
-/// 那是一份钉死的默认值。让循环每 rev 下发它，等于用这份默认值覆盖运维调过的
-/// 天花板：调高就是自治系统给自己抬资源上限，调低就是把不认识的运维标定打回去。
-/// 创建归安装面（helm / 预渲染 apply），调整归 values 或人工。
-pub(crate) const GOVERNANCE_KINDS: &[&str] = &["ResourceQuota", "LimitRange"];
-
 /// 卷声明 kind：创建与调整都归安装面，不进循环面。绑定后的 PVC spec 除了
 /// `resources.requests` 之外不可变，而那个例外还要 StorageClass 支持扩容
 /// （local-path 不支持）；StorageClass 一旦绑定更是永远改不回来。所以循环
@@ -8538,9 +8530,6 @@ pub enum DocFate {
     ClusterScoped,
     /// 权限面 kind：一份清单能长出权限就等于权限可以自我扩张。
     Rbac,
-    /// 治理 kind：上限是运维标定的，循环每 rev 重放一份钉死的默认值就是拿它
-    /// 覆盖运维调过的天花板。
-    Governance,
     /// 卷声明 kind：绑定后的 spec 除扩容外不可变，声明与历史不一致会被拒，
     /// 而那不是"新版本不好"。
     StorageClaim,
@@ -8557,9 +8546,6 @@ pub fn classify_doc(kind: &str) -> DocFate {
     }
     if RBAC_KINDS.contains(&kind) {
         return DocFate::Rbac;
-    }
-    if GOVERNANCE_KINDS.contains(&kind) {
-        return DocFate::Governance;
     }
     if STORAGE_CLAIM_KINDS.contains(&kind) {
         return DocFate::StorageClaim;
@@ -8579,9 +8565,9 @@ pub fn classify_doc(kind: &str) -> DocFate {
 /// equal to nothing. A kind this does not know also cannot be granted, so a
 /// `None` here is the end of the check either way.
 ///
-/// `Secret` is absent on purpose, as are the role, governance, claim and
-/// cluster-scoped kinds: they never travel through the loop, so no grant can
-/// be their answer.
+/// `Secret` is absent on purpose, as are the role, claim and cluster-scoped
+/// kinds: they never travel through the loop, so no grant can be their answer.
+/// `ResourceQuota` and `LimitRange` are here because they do travel.
 ///
 /// The workload kinds are answered from [`WORKLOAD_KINDS`], where their group
 /// and plural are written down with the rest of what this crate knows about
@@ -8598,6 +8584,8 @@ pub fn api_resource_of(kind: &str) -> Option<(&'static str, &'static str)> {
         "Service" => ("", "services"),
         "ServiceAccount" => ("", "serviceaccounts"),
         "Job" => ("batch", "jobs"),
+        "ResourceQuota" => ("", "resourcequotas"),
+        "LimitRange" => ("", "limitranges"),
         "NetworkPolicy" => ("networking.k8s.io", "networkpolicies"),
         "Ingress" => ("networking.k8s.io", "ingresses"),
         "ServiceMonitor" => ("monitoring.coreos.com", "servicemonitors"),
@@ -8676,10 +8664,16 @@ pub(crate) fn split_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_ya
 }
 
 /// 拆分多文档 YAML 并过滤进支撑包：Secret 硬报错（零带外凭证红线，密钥
-/// 永不进清单链路）；集群级 kind、权限面 kind（Role/RoleBinding）、治理
-/// kind（ResourceQuota/LimitRange）与卷声明 kind（PersistentVolumeClaim）
-/// 跳过并记日志（由安装面管理，理由见 [`RBAC_KINDS`]、[`GOVERNANCE_KINDS`]
-/// 与 [`STORAGE_CLAIM_KINDS`]）；空文档（`---` 分隔产生）跳过。
+/// 永不进清单链路）；集群级 kind、权限面 kind（Role/RoleBinding）与卷声明
+/// kind（PersistentVolumeClaim）跳过并记日志（由安装面管理，理由见
+/// [`RBAC_KINDS`] 与 [`STORAGE_CLAIM_KINDS`]）；空文档（`---` 分隔产生）跳过。
+///
+/// 资源治理 kind（ResourceQuota/LimitRange）**在交付面里**：它们是这套清单
+/// 自己声明的上限，随版本一起到达集群。不给自治系统这条通路，等于要求有人
+/// 在每次工作负载变大时手工抬一次天花板——而那个人不存在时，每一次滚动都会
+/// 被准入拒绝，读起来却是"这一版滚不上去"。缩小的方向由 apiserver 自己兜：
+/// 一份低于当前用量的上限，更新请求会被拒，所以这套清单抬得动自己的天花板，
+/// 却挤不扁正在里面跑的工作负载。
 pub(crate) fn namespace_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Value>> {
     let mut docs = Vec::new();
     for v in split_docs(yaml_text, origin)? {
@@ -8696,9 +8690,6 @@ pub(crate) fn namespace_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serd
             }
             DocFate::Rbac => {
                 warn!(origin = %origin, kind = %kind, "manifest bundle: skipping RBAC kind; permission changes must be applied out-of-band")
-            }
-            DocFate::Governance => {
-                warn!(origin = %origin, kind = %kind, "manifest bundle: skipping resource governance kind; the ceiling is the operator's and is applied at install time, not by the loop")
             }
             DocFate::StorageClaim => {
                 warn!(origin = %origin, kind = %kind, "manifest bundle: skipping volume claim; a bound claim's spec is immutable and is created at install time, not by the loop")
@@ -9024,10 +9015,6 @@ fn patch_deployment_image(
         }
         if RBAC_KINDS.contains(&kind) {
             warn!(origin = %origin, kind = %kind, "manifest bundle: skipping RBAC kind; permission changes must be applied out-of-band");
-            continue;
-        }
-        if GOVERNANCE_KINDS.contains(&kind) {
-            warn!(origin = %origin, kind = %kind, "manifest bundle: skipping resource governance kind; the ceiling is the operator's and is applied at install time, not by the loop");
             continue;
         }
         if STORAGE_CLAIM_KINDS.contains(&kind) {
@@ -20243,16 +20230,21 @@ exit 0
 
     #[test]
     fn namespace_docs_skips_install_surface_kinds_and_rejects_secret() {
-        // 多文档：Namespace（集群级）、Role/RoleBinding（权限面）、
-        // ResourceQuota/LimitRange（治理面）与 PersistentVolumeClaim（卷声明面）
-        // 跳过，ConfigMap/Service 保留，空文档跳过。
+        // 多文档：Namespace（集群级）、Role/RoleBinding（权限面）与
+        // PersistentVolumeClaim（卷声明面）跳过；ConfigMap/Service 保留；
+        // ResourceQuota/LimitRange **保留**——上限是这套清单自己声明的，
+        // 随版本到达集群，否则每次工作负载变大都要有人手工抬一次天花板，
+        // 而滚动会被准入拒绝。空文档跳过。
         let yaml = "---\nkind: Namespace\nmetadata:\n  name: x\n---\nkind: ConfigMap\nmetadata:\n  name: c\n---\nkind: Role\nmetadata:\n  name: r\nrules: []\n---\nkind: RoleBinding\nmetadata:\n  name: rb\n---\nkind: ResourceQuota\nmetadata:\n  name: cogneva-quota\n---\nkind: LimitRange\nmetadata:\n  name: cogneva-limits\n---\nkind: PersistentVolumeClaim\nmetadata:\n  name: cogneva-data-pvc\nspec:\n  resources:\n    requests:\n      storage: 24Gi\n---\nkind: Service\nmetadata:\n  name: svc\n---\n";
         let docs = namespace_docs(yaml, "mixed.yaml").unwrap();
         let kinds: Vec<&str> = docs
             .iter()
             .filter_map(|d| d.get("kind").and_then(|k| k.as_str()))
             .collect();
-        assert_eq!(kinds, vec!["ConfigMap", "Service"]);
+        assert_eq!(
+            kinds,
+            vec!["ConfigMap", "ResourceQuota", "LimitRange", "Service"]
+        );
         // Secret 混入是硬错误（零带外凭证红线）。
         let secret = "kind: Secret\nmetadata:\n  name: s\n";
         let err = namespace_docs(secret, "secret.yaml").unwrap_err();
@@ -20449,11 +20441,13 @@ exit 0
         }
     }
 
-    /// 治理对象就在发布集里（元启动的自建集群走 `kubectl apply -k deploy/k3s`，
-    /// 该文件必须留在 `resources` 里），但一份都不许进支撑包：数值来自 chart
-    /// values，随包下发就是拿静态清单里的默认值覆盖运维调过的天花板。
+    /// 治理对象在发布集里，也**随包到达集群**。上限是这套清单从自己的工作负载
+    /// 声明里投影出来的（见 deploy/scripts/project-resource-governance.py），
+    /// 与版本同生共死：把它挡在包外，等于要求每次工作负载变大时有人手工抬一次
+    /// 天花板，而没人抬的那一刻，每一次滚动都在准入被拒，读起来却是"这一版永远
+    /// 滚不上去"。缩小的方向由 apiserver 自己兜：低于当前用量的上限会被拒绝更新。
     #[test]
-    fn build_rollout_bundle_drops_resource_governance_from_support() {
+    fn build_rollout_bundle_carries_resource_governance_to_the_cluster() {
         let mut files = BTreeMap::new();
         files.insert(
             "deployment.yaml".to_string(),
@@ -20480,14 +20474,17 @@ exit 0
         )
         .unwrap();
         assert!(bundle.support_yaml.contains("kind: ConfigMap"));
+        // 上限随版本到达集群：它是这套清单自己声明的，不是运维手里的一份授权。
+        // 不给这条路，工作负载一变就得有人手工抬天花板，而那个人不在时每一次
+        // 滚动都在准入被拒——现场读起来却是"这一版永远滚不上去"。
         assert!(
-            !bundle.support_yaml.contains("ResourceQuota"),
-            "quota must not travel with the rollout: {}",
+            bundle.support_yaml.contains("kind: ResourceQuota"),
+            "quota must travel with the rollout: {}",
             bundle.support_yaml
         );
         assert!(
-            !bundle.support_yaml.contains("LimitRange"),
-            "limits must not travel with the rollout: {}",
+            bundle.support_yaml.contains("kind: LimitRange"),
+            "limits must travel with the rollout: {}",
             bundle.support_yaml
         );
     }

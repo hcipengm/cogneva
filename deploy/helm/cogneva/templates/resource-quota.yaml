@@ -1,7 +1,17 @@
 {{- if .Values.resourceGovernance.enabled }}
-{{- $q := .Values.resourceGovernance.quota }}
+{{- /* 额度不是在这里标定的：全部由 deploy/scripts/project-resource-governance.py
+       从渲染集投影出来，落在 values.resource-governance.<profile>.yaml。
+       `required` 不是防御性编程：这份文件缺了，渲染出来就是一条空额度的
+       ResourceQuota（`requests.cpu: ""`），提交时才被 apiserver 以"数量非法"
+       拒掉——那句话不会告诉任何人去跑投影脚本。所以缺了就在渲染期报错，并把
+       该跑的脚本写进错误里。渲染器自己那遍"先渲染再投影"的原始渲染用
+       `--set resourceGovernance.enabled=false` 关掉这一段，不走这条路径。 */}}
+{{- $q := required "resourceGovernance.quota is missing: the ceiling is projected from the rendered set, never written in values. Run deploy/scripts/render-deploy.sh and pass -f deploy/helm/cogneva/values.resource-governance.<profile>.yaml" .Values.resourceGovernance.quota }}
 {{- $l := .Values.resourceGovernance.limitRange }}
-{{- $r := .Values.resourceGovernance.runtimePods }}
+{{- $r := .Values.resourceGovernance.runtimePods | default dict }}
+{{- $maxCpu := required "resourceGovernance.limitRange.maxCpu is projected: run deploy/scripts/render-deploy.sh" $l.maxCpu }}
+{{- $maxMemory := required "resourceGovernance.limitRange.maxMemory is projected: run deploy/scripts/render-deploy.sh" $l.maxMemory }}
+{{- $pvcMax := required "resourceGovernance.limitRange.pvcMaxStorage is projected: run deploy/scripts/render-deploy.sh" $l.pvcMaxStorage }}
 apiVersion: v1
 kind: ResourceQuota
 metadata:

@@ -1,15 +1,15 @@
 //! What the repository declares the resource ceilings to be, against what the
 //! cluster is enforcing right now.
 //!
-//! Resource governance kinds are the operator's: the rollout loop never
-//! delivers them, because replaying a committed default every revision would
-//! overwrite a ceiling someone tuned (the deployer's `GOVERNANCE_KINDS` carries
-//! that reasoning). Raising a limit in the repository therefore does not move
-//! the object in the cluster until the next install-time apply runs, and
-//! between those two moments the two sides hold different numbers with nothing
-//! on the runtime side saying so: kube-state-metrics reports what the cluster
-//! enforces, and what the repository declares is visible only to whoever goes
-//! and reads the repository.
+//! Resource governance kinds travel with the release set like any other
+//! declaration: the ceiling a revision declares is the ceiling the loop
+//! delivers, so a workload that grows can raise the bound that has to admit it
+//! without waiting for someone to apply it by hand. That makes the two sides
+//! coincide only after a delivery has landed, and between a revision landing
+//! and its declaration reaching the cluster they hold different numbers with
+//! nothing on the runtime side saying so: kube-state-metrics reports what the
+//! cluster enforces, and what the repository declares is visible only to
+//! whoever goes and reads the repository.
 //!
 //! A change that has landed and a change that has taken effect therefore look
 //! the same from every existing reading -- until the difference surfaces as a
@@ -23,9 +23,9 @@
 //! revision are compared field by field against the objects the cluster is
 //! enforcing, and the number of fields that differ is published per object.
 //!
-//! It reports a difference and does not judge it. A ceiling the operator
-//! deliberately tuned in the cluster and a ceiling the repository raised that no
-//! install has applied yet read identically here; telling them apart needs a
+//! It reports a difference and does not judge it. A ceiling a manual apply put
+//! in the cluster and a ceiling the repository raised that no delivery has
+//! carried yet read identically here; telling them apart needs a
 //! fact this side does not hold, so the reading states the difference and the
 //! rule around it says the same. Zero is a reading of its own, and so is a
 //! comparison that could not be made: "the two sides agree" and "nobody looked"
@@ -45,13 +45,13 @@ pub const GOVERNANCE_DRIFT_METRIC: &str = "cogneva_governance_drift_fields";
 
 /// How many lines of one delivered observability manifest disagree (gauge).
 ///
-/// The second object class on the same spine. A resource ceiling belongs to the
-/// operator and is applied at install time; the observability stack's manifests
-/// belong to the installer and are delivered only by the install script. Both
-/// therefore sit in the repository at the revision being tracked while the
-/// cluster holds whatever the last install left there, and in both cases a
-/// change that has landed and a change that has taken effect look the same from
-/// every reading that already exists.
+/// The second object class on the same spine. Both classes are declared in the
+/// repository at the revision being tracked and reach the cluster on their own
+/// path -- the ceiling with the release set, the observability manifests with
+/// the install script -- so between a change landing and its path delivering it
+/// the cluster holds whatever the previous delivery left there, and a change
+/// that has landed and a change that has taken effect look the same from every
+/// reading that already exists.
 ///
 /// The two are two series rather than two label values on one because neither
 /// the objects nor the counts are the same kind. The ceilings come back from the
@@ -76,7 +76,7 @@ pub const OBSERVABILITY_DRIFT_METRIC: &str = "cogneva_observability_drift_lines"
 /// look.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DriftClass {
-    /// The resource ceilings the operator owns.
+    /// The resource ceilings the tracked revision declares.
     Governance,
     /// The observability stack's own manifests, keyed by file.
     Observability,

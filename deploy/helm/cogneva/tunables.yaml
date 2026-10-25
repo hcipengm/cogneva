@@ -132,6 +132,37 @@ rows:
     source: override
     why: >-
       Sized for the database already carried (962 MB on 2026-10-18) plus WAL and connections; no loop re-measures it.
+
+  # The metrics sidecar's own bounds. A sidecar in the same Pod is charged to the
+  # namespace ceiling like any other container, so these are part of the sum the
+  # projection reads -- they are not free because they are small.
+  - key: backends.postgres.exporterResources.requests.cpu
+    source: override
+    why: >-
+      A scheduling claim sized for a handful of read-only queries per scrape; no
+      measurement feeds back into it.
+
+  - key: backends.postgres.exporterResources.requests.memory
+    source: override
+    why: >-
+      Small enough that a tight node still schedules the sidecar; the working set
+      it needs over a scrape is carried by the limit.
+
+  - key: backends.postgres.exporterResources.limits.cpu
+    source: override
+    why: >-
+      A burst bound for a scrape over many tables; the steady rate sits far below
+      it and no measurement of the burst feeds back into it.
+
+  - key: backends.postgres.exporterResources.limits.memory
+    source: override
+    why: >-
+      Has to cover the exporter's heap after the table count and scrape history
+      have grown it: pinned at the steady average it is OOM-killed after a run of
+      scrapes, and a restarting sidecar reads exactly like a database with no
+      connections. No loop measures that growth today, so the bound is named here
+      rather than derived.
+
   - key: backends.qdrant.storage
     source: override
     why: >-
@@ -970,45 +1001,21 @@ rows:
       measured clone time; the seed's duration is not published.
 
   # --- resource governance ----------------------------------------------------
-  # These are the literals whose invariants a render-time gate recomputes: the
-  # declared sums fit the quota, the per-container maximum covers the largest
-  # declaration, the per-PVC maximum covers the largest claim. The gate checks the
-  # inequality, not the value -- it stays green when a workload declaration moves
-  # and the number beside it should have moved too. That is the debt each row
-  # below names.
-  - key: resourceGovernance.quota.requestsCpu
+  # The ceiling numbers are not chart values: they are projected from the rendered
+  # declarations by `deploy/scripts/project-resource-governance.py` into
+  # `values.resource-governance.<profile>.yaml`, which carries a GENERATED header
+  # and is re-derived (and compared byte for byte) on every render. So no row here covers
+  # them -- a row would be a second source for a number whose whole point is that
+  # nobody writes it. What remains below are the inputs to that projection (the two
+  # terms no manifest can declare) and the policy defaults it copies through.
+  - key: resourceGovernance.clusterNodes
     source: override
     why: >-
-      The namespace's total CPU request ceiling. The render-time gate recomputes
-      the sum of the workloads' requests and checks it fits; when a request moves,
-      the gate only speaks if this becomes too small, never if it has become
-      needlessly large.
-
-  - key: resourceGovernance.quota.requestsMemory
-    source: override
-    why: >-
-      The namespace's total memory request ceiling, checked by the same
-      inequality. A value derived from the declarations would make the gate
-      tautological; today the number and the gate are independent, which is why
-      the gate can still fail.
-
-  - key: resourceGovernance.quota.limitsCpu
-    source: override
-    why: >-
-      Steady-state limits plus the judging Job, plus the declared budget for pods
-      created at runtime outside the declared workloads (resourceGovernance.runtimePods),
-      plus room for overlap during a replacement; recomputed by hand at each
-      re-sizing (the arithmetic is beside the chart field). The render-time gate
-      recomputes the declared sum plus the Job plus that budget, so it now covers
-      the term it used to be blind to; the overlap slack is still uncovered.
-
-  - key: resourceGovernance.quota.limitsMemory
-    source: override
-    why: >-
-      The same sum for memory, including the same declared runtime-pod budget.
-      The gate checks declared + judging Job + budget against this ceiling, so a
-      resizing that leaves the runtime-born pods out goes red in the render rather
-      than in admission; the replacement-overlap component remains hand-judged.
+      How many nodes the DaemonSets spread over, which is how many Pods the quota
+      must admit per DaemonSet. No manifest can say it: the same tree is applied
+      to a one-node K3s and to a production cluster. The profile names it, and the
+      projection reads it from there -- so a cluster with more nodes is a profile
+      edit plus a re-render, not a number typed into the ceiling.
 
   - key: resourceGovernance.runtimePods.limitsCpu
     source: override
@@ -1016,7 +1023,7 @@ rows:
       The CPU-limits budget for pods the operating face creates on demand (the
       eval table, the drill Job). They are in no rendered workload, yet the quota
       counts them; nothing else declares their size, so the quota carries it as an
-      annotation and the render-time gate folds it into the headroom inequality.
+      annotation and the projection folds it into the headroom arithmetic.
       Zero is a declaration too -- an absent annotation is an error, not 0.
 
   - key: resourceGovernance.runtimePods.limitsMemory
@@ -1027,82 +1034,44 @@ rows:
       admission was already refusing the deployer's rollout Job; the annotation is
       the declaration that makes the gap checkable.
 
-  - key: resourceGovernance.quota.pods
-    source: override
-    why: >-
-      The namespace's Pod ceiling. It has to cover the four deployments, the
-      DaemonSets, rollout Jobs and transient sandbox Pods; the per-node ledger
-      Pods are known to consume from it. Nothing counts the population and sets
-      this.
-
-  - key: resourceGovernance.quota.requestsStorage
-    source: override
-    why: >-
-      The ceiling on the sum of all PVC declarations in the namespace, not a
-      per-volume capacity: directory-backed volumes do not enforce
-      requests.storage, so its only job is to refuse a manifest whose total is
-      out of bounds. The render-time gate recomputes the declared sum and checks
-      it fits; the number does not follow the sum.
-
   - key: resourceGovernance.limitRange.defaultCpu
     source: override
     why: >-
-      The default for a container that declares no CPU. It is a hand-set
-      fallback; a derived value would follow the measured draw of the containers
-      that omit resources, and the render-time gate checks bounds, not this.
+      The default for a container that declares no CPU. It is a hand-set practice:
+      low enough that a forgotten declaration is visible in the totals, high
+      enough that it does not throttle an idle sidecar. The projection copies it
+      through unchanged.
 
   - key: resourceGovernance.limitRange.defaultMemory
     source: override
     why: >-
-      The default for a container that declares no memory; same reasoning as the
-      CPU default.
+      The memory default for the same containers; same reasoning as the CPU
+      default, and likewise copied through by the projection.
 
   - key: resourceGovernance.limitRange.defaultRequestCpu
     source: override
     why: >-
-      The default request for a container that declares none; same reasoning as
-      the other defaults.
+      The request a container gets when it declares none. A practice rather than a
+      measurement: the scheduler needs some number, and a small one keeps a
+      forgotten declaration out of the reserved total.
 
   - key: resourceGovernance.limitRange.defaultRequestMemory
     source: override
     why: >-
-      The default memory request for a container that declares none; same
-      reasoning as the other defaults.
-
-  - key: resourceGovernance.limitRange.maxCpu
-    source: override
-    why: >-
-      The admission ceiling for one container. It must stay at or above the
-      largest declared container limit, and the render-time gate checks exactly
-      that. A derived value would be that maximum; right now a human copies it.
-
-  - key: resourceGovernance.limitRange.maxMemory
-    source: override
-    why: >-
-      The admission ceiling for one container, currently set exactly at the
-      largest declaration (the evolution Pod's 16Gi, which the build gate's
-      cgroup_memory dimension needs). The render-time gate checks the invariant;
-      the number is copied by hand.
+      The memory request for the same containers; same reasoning as the CPU
+      request default.
 
   - key: resourceGovernance.limitRange.minCpu
     source: override
     why: >-
-      The admission floor for one container. It exists so a manifest cannot ask
-      for a token amount; no measurement moves it.
+      The admission floor for one container's CPU: below it a workload is almost
+      certainly a typo, and the scheduler cannot do anything useful with it.
 
   - key: resourceGovernance.limitRange.minMemory
     source: override
     why: >-
       The admission floor for one container's memory; same reasoning as the CPU
       floor.
-
-  - key: resourceGovernance.limitRange.pvcMaxStorage
-    source: override
-    why: >-
-      The largest single PVC. It must cover the largest volume declaration (the
-      192Gi source volume), and the render-time gate checks each declaration
-      against it. A derived value would be that maximum; a human keeps the two in
-      step.
 
   - key: resourceGovernance.limitRange.pvcMinStorage
     source: override

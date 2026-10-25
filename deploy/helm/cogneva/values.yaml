@@ -19,161 +19,39 @@ storage:
 # 缺了前者，一次失控的沙盒任务就能占满节点；缺了后者，没写 resources 的容器
 # （安全网关就没写）按**无限**算，配额也就形同虚设。
 #
-# 常设镜像分发开销（image-server 100m/64Mi + 每节点 importer 200m/1Gi）已计入，
-# 并留出滚动期的瞬时增量（主线滚动 Job 2000m/512Mi；四个业务部署都是单副本且
-# maxSurge=0，滚动靠先删旧 Pod 再建新 Pod 腾位，不额外占位）。多节点每增一个节点
-# 按 +200m limits.cpu / +1Gi limits.memory 上调——**渲染期拿不到节点数**，所以这是
-# 由元启动/运维按集群规模经 --set 覆盖的项，不是自动伸缩。
+# **本段不写额度数值。** 额度不是环境参数，是这套清单自己的函数：容器声明了多大、
+# 副本有几个、滚动时同时存在几个 Pod、PVC 声明了多少——额度必须装得下这些，多
+# 一个字节都是浪费，少一个字节则下一次滚动在准入被拒。所以它由
+# `deploy/scripts/project-resource-governance.py` 从渲染集投影出来，每个 profile
+# 落一份 `values.resource-governance.<profile>.yaml`（带 GENERATED 头，不要手改），
+# 渲染新鲜度门禁核「文件 == 重新投影」。手写过的那份数在历史上漂过不止一次，形态
+# 都一样：工作负载长大了、额度没跟，而现场读起来是"这一版永远滚不上去"。
 #
-# 尺寸按现网实测重新标定（2026-10-21，参考宿主 24C/62GiB）：本命名空间稳态容器
-# `limits` 合计 **22.2 核 / 42.2Gi**、`requests` 合计 **2.4 核 / 6.7Gi**；装了监控栈
-# 再加 5.0 核 / 8.9Gi。所以「能跑起来」的线由 requests 决定（连同监控约 3.3 核 /
-# 10Gi），「声明的上限是真的」那条线由最大那份容器决定——进化 Pod 一份就是
-# 8 核 / 16Gi，宿主得容得下它独占地跑。**最低 8C/32GiB**；低于这个数时上限定性为
-# 假设而不是承诺，`node_capacity_overcommitted` 会常年亮着（它量的正是这件事）。
-# 2026-10-23 修了一处「表达式与这段话对不上」：这条规则此前量的是**所有容器上限
-# 之和**除 allocatable，而本段写的一直是「最大那份容器」。两者在这台 24C/62GiB 上
-# 给出相反的答案——和 1.20 / 1.01（常年为真，因为上限是按周期发的突发额度，不是
-# 预留），最大那份 0.34 / 0.30（健康）。按上面这段的意图改成 max 之后，红的判据
-# 回到「某个容器自己的天花板超过整台机器，它永远够不到」，和 1.20 这一事实的后果
-# 交给真正量后果的规则（container_cpu_throttled、node_memory_pressure、
-# node_scheduling_requests_high）。
-# 上一版这里写的是「≥4C8G 空白机」，那是在进化 Pod 只要 4 核 / 8Gi 时候的数，
-# 2026-10-18 抬到 8 核 / 16Gi 之后它就不成立了。
-#
-# 上面那句"留出滚动期的瞬时增量"就是 limitsCpu 的算式，它是算出来的不是拍出来的：
-# 稳态 Pod 的 limits.cpu 合计 15000m，加判据 Job 2000m = 17000m，再留 1500m 给
-# 替换期的重叠，故旧口径取 18.5（**已被下面的 2026-10-10 重算取代，现行值是 23**）。
-# 滚动 Job 的限额此前从 1 core 抬到 2（实测 1 core 时
-# 限流 nr_throttled 261/509、36.3 秒里削掉 4.85 秒，判据更容易撞超时），这一处
-# 跟着 +1500m 而算式没重算，于是稳态加判据恰好等于旧的 hard 17、零余量：额度按
-# **非终态** Pod 记账，一个卡在 Terminating 的旧 Pod 仍占着它的位，替换的新 Pod
-# 就被拒（FailedCreate … requested: limits.cpu=400m, used: 17, limited: 17），
-# 而它落地时读到的判词是超时不是资源，症状与病因隔两层。
-# 动滚动 Job 的资源面就必须重算这个数（渲染期门禁把两者一起打出来）。
-#
-# 2026-10-10 重算：主应用 Pod 抬到 4000m/6Gi（装载本地嵌入权重，见 gateway.resources
-# 的实测读数），两档额度各跟着 +3000m / +4Gi。
-#   limitsCpu 18.5 → 23：稳态合计 15000m 里主应用从 1000m 变 4000m ⇒ 18000m，
-#     加判据 Job 2000m = 20000m，再留 3000m 给替换期重叠（比原来那 1500m 宽，
-#     因为这一档的 Pod 内存与 CPU 都是尖峰型：装载时会跑满 intra-threads）。
-#   limitsMemory 34Gi → 38Gi：原 30.1Gi 里主应用 2Gi 变 6Gi ⇒ 34.1Gi，加判据 Job
-#     的 512Mi = 34.6Gi，头寸 3.4Gi（与上一版同口径）。这一档是**三个 session 都给足**
-#     的结果，不是按当天加载了几个来定的（多出来的两个今天还没打开，理由见
-#     gateway.resources）。
-#
-# 2026-10-11 重算：进化 Pod 抬到 4000m/16Gi（宿主级构建闸门的 cgroup_memory 维要它
-# 所在 cgroup 容得下两个并发构建，推导见 evolution.resources 旁）。
-#   limitsMemory 38Gi → 46Gi：34.1Gi 里进化从 8Gi 变 16Gi ⇒ 42.1Gi，加判据 Job 的
-#     512Mi = 42.6Gi，头寸 3.4Gi（与前两版同口径）。
-#   limitsCpu 不变：这一次只动内存。
-#   单容器上限（limitRange.maxMemory）同批 8Gi → 16Gi。它是**准入面**而不是策略偏
-#   好：不跟着抬，这份 16Gi 的声明在准入就被拒，报出来的是"超过单容器上限"，与
-#   "闸门能不能并发"看起来毫无关系。渲染期门禁第 3 条核的就是这条不变式。
-#
-# 2026-10-18 重算：进化 Pod 的构建配额 4000m → 8000m（理由见 evolution.resources
-# 旁：一轮主线构建在自己的 4 核配额上连续跑了 60 分钟、撞 3600s 上限被杀，而同一
-# 时刻这一格被 CFS 限流 44% 的周期）。
-#   稳态合计（渲染期门禁自报，不手抄）里进化 +4000m；加判据 Job 2000m 后仍须留
-#   替换期重叠的头寸，故 limitsCpu 23 → 27（与 10-10 那档同口径：需求 + 1500m）。
-#   **这两个数一起报**：只抬容器不抬配额，Pod 在准入就被拒；只抬配额不抬
-#   limitRange.maxCpu，容器声明本身进不来——三条是一对耦合，少一条就换一种方式
-#   失败（见 memory 里那条"有准入上限约束的旋钮是一对不是一个数"）。
-#
-# 2026-10-19 重算：运营面自己拉起的一次性 Pod 不在渲染期门禁的和里——门禁只读
-# 声明的工作负载，而 eval 表（3Gi/2 核）、验收演练（768Mi/1 核）这类探针是运行时
-# 按需建的。两者同时在场时额度用量 45.94Gi/24800m，部署器下一次主线滚动 Job
-# （512Mi/2000m）在准入就被拒（`exceeded quota: cogneva-quota, limited:
-# limits.memory=46Gi`），部署器从此每轮空转。额度必须把这一类"运行期自建 Pod"
-# 也记进预算，否则「稳态 + 判据 Job + 替换重叠」这套算式永远比实际少一截：
-#   limitsCpu 27 → 30：稳态 23500m + 判据 Job 2000m + 运行期自建 3000m
-#     + 替换重叠 1500m = 30000m。
-#   limitsMemory 46Gi → 52Gi：稳态 43.7Gi + 判据 Job 512Mi + 运行期自建 3.75Gi
-#     + 替换重叠 3.4Gi = 51.35Gi，取整 52Gi。
-#   稳态那两个数由渲染期门禁自报，不手抄——重算时先跑它。
-#
-# 2026-10-23 重算（gateway 上限 6Gi → 8Gi 的同一笔，两个数是一对）：稳态由门禁自报
-# 45.8Gi 起算（实测 2026-10-23 渲染期门禁的输出），只抬容器那份就是 47.8Gi；再加判据
-# Job 512Mi、运行期自建 3.75Gi 与替换重叠 3.4Gi（实测 2026-10-19 一次滚动重叠）得
-# 55.45Gi，取整 56Gi。只抬容器不抬额度的话，门禁在渲染期就红——实测 2026-10-23 的算式
-# 47.8 + 0.5 + 3.75 = 52.05Gi（实测）撞上 52Gi 的旧额度。这正是「有准入上限约束的旋钮
-# 是一对」。
-#
-# 2026-10-24 再算一次（新增 SearXNG 检索 Pod 的同一笔，两个数仍是**一对**）：声明和
-# 加上检索 Pod 的 limits（cpu +1000m、内存 +1Gi），实测 2026-10-24 的算式是
-# 26600m + 2000m（判据 Job）+ 3000m（运行期预算）= 31600m 撞上 31000m；内存同理，
-# 实测 2026-10-24 为 55.45Gi + 1Gi = 56.45Gi 撞上 56Gi。两个额度因此一起抬：实测
-# 2026-10-24 抬到 32 核 / 57Gi。只加工作负载不抬额度的后果不是这一个 Pod 起不来，
-# 而是**准入先拒掉下一次滚动 Job**——这正是「有准入上限约束的旋钮是一对」说的形状。
-#
-# 运行期自建 Pod 的预算单独声明（下条），不留在上面那段散文里：散文里的数只有
-# 人记得，声明出来的数门禁才核得到。上面那两个额度按「声明和 + 判据 Job + 本预算
-# ≤ 额度」重算，任一项变了而额度没跟，渲染期门禁当场红。
+# 只有两项由人声明，因为没有任何清单能告诉渲染器它们是多少：
+#   - runtimePods：运行期按需建、不在渲染集里的 Pod 占多少额度（评测台、验收演练）；
+#   - clusterNodes：DaemonSet 逐节点铺开后有几分 Pod。它随拓扑变，所以由 profile
+#     给（单节点 profile 就是 1），投影按 profile 里的这个数算。多节点时把它改成
+#     实际节点数并重跑 render-deploy.sh——**两个数必须同一次改**：只改 profile 不
+#     重跑投影，额度仍是单节点的，多出来的节点上的 DaemonSet Pod 会在准入被拒。
 resourceGovernance:
   enabled: true
-  # 运行时按需建、不在渲染集任何工作负载里的 Pod 占多少额度（limits 面）：
-  # 评测台（`cogneva eval-table --admission`）与验收演练各一份。它们的大小没有
-  # 第二个声明处——评测台由命令参数给，演练 Job 由运行方给——所以只能在这里
-  # 写死一份预算，由门禁加进不等式。写成 0 也要写出来（空着＝门禁读不到，
-  # 报错而不是当作 0）。见 resource-quota.yaml 的两个注解。
+  clusterNodes: 1
+  # 渲染集之外的 Pod，没有第二个声明处（评测台由命令参数给，演练 Job 由运行方给），
+  # 所以只能在这里声明一份预算，由投影加进同一条不等式。写成 0 也要写出来：空着
+  # 等于门禁读不到，报错而不是当作 0。见 resource-quota.yaml 的两个注解。
   runtimePods:
     limitsCpu: "3"
     limitsMemory: 3.75Gi
-  quota:
-    requestsCpu: "6"
-    requestsMemory: 12Gi
-    # 声明工作负载的 limits.cpu 之和 + 部署器判据 Job（2）+ 运行期预算（3）
-    # + 替换重叠（见下）必须 ≤ 这个数，渲染期门禁逐 profile 现算。2026-10-23 抬 1 核：
-    # redis-info-exporter 从 100m 到 500m（它被自己的 CFS 配额限掉 57% 的周期），
-    # 声明和也随之 +400m，而旧上限恰好贴着旧的声明和——这正是「有准入上限约束的
-    # 旋钮是一对」的那种：只抬容器那份，准入会先把下一次滚动 Job 拒掉。
-    #
-    # 2026-10-25 再抬：上面那笔只抬到"稳态装得下"，没算**替换重叠**。主应用是
-    # maxSurge: 1 / maxUnavailable: 0，滚动那一刻新 Pod 与旧 Pod 同时在准入里，
-    # 多占它的 4 核 / 8Gi。稳态 26.6 核 + 判据 Job 2 + 预算 3 已经到 31.6，再要
-    # 4 核就是 35.6 > 32：这条配额**永远滚不动主应用**，部署器每轮在准入被拒。
-    # 实机读数（2026-10-25T11:58Z）：`resourcequota/cogneva-quota limits.cpu: this
-    # rollout surges, so the new pod is admitted beside the old one and charged 4 on
-    # top of 28900m used, which passes the enforced 32`——最后一个滚上去的版本停在
-    # 05:15，此后 40 个 commit 的镜像都进不了集群。
-    # 所以上限的判据是**稳态 + 判据 Job + 运行期预算 + 最大一份替换重叠**，
-    # 不是稳态本身：叠加上限 36 核 / 62Gi（内存同一算式：48.8 + 0.5 + 3.75 + 8）。
-    # 只改稳态那份，下一次滚动照样被拒，而且拒的是新 Pod、旧 Pod 继续服役——
-    # 读起来是"这一版永远滚不上去"，不是"配额不够"。
-    limitsCpu: "36"
-    limitsMemory: 62Gi
-    pods: "40"
-    # 存储声明是**命名空间内全部 PVC 之和的上限**，不是某个卷的容量：目录型卷
-    # 不强制 requests.storage，写多少都不影响落盘，它唯一的作用是拒绝一份声明
-    # 总量越界的清单。所以它必须 ≥ 本 chart 自己声明的和，否则这套清单装不进
-    # 自己的命名空间（实机事故：声明和 188Gi vs 上限 110Gi，PVC 全被拒，落地
-    # 通道断了整天）；而它也不能远高于声明和，否则这个上限就失去意义。
-    # **这里不写声明和与头寸**：会随工作负载增减而漂，写死了必然过期（本字段
-    # 旁就发生过一次，还带着一句"忘记同步会失败"的假兜底——门禁校验的是
-    # "声明和 ≤ 本上限"这条不变式，不读注释里的散文数字）。要看当前和与头寸，
-    # 跑渲染期门禁 `deploy/scripts/check-governance-consistency.sh`，它按渲染
-    # 产物现算现印；每个卷声明的推导在各自字段旁，改声明时改的是那些字段。
-    requestsStorage: 480Gi
   limitRange:
+    # 下面四项是**策略**而不是投影：它们管的是"没有声明 resources 的容器按什么
+    # 算"。上限（max）与单卷上限由投影给，因为它们必须 ≥ 渲染集里最大的那份声明，
+    # 低了那份声明在准入就被拒——那不是"更安全"，是那句话根本进不来。
     defaultCpu: 500m
     defaultMemory: 512Mi
     defaultRequestCpu: 50m
     defaultRequestMemory: 64Mi
-    # 与 maxMemory 同一条耦合：它是**准入面**，任何一份容器 limits.cpu 高过它，
-    # 那份声明就在 apiserver 被拒（新 Pod 建不出来，旧 Pod 已被滚动删）。所以它随
-    # 进化 Pod 的构建配额一起抬，抬哪个都必须同批抬这一个。
-    maxCpu: "8"
-    # 单容器上限必须 ≥ 本 chart 自己声明的最大那份容器 limits.memory：它是准入
-    # 面，低了不是"更安全"，是那份声明根本进不来（渲染期门禁第 3 条核这条）。
-    # 当前最大的是进化 Pod（16Gi，构建闸门的 cgroup_memory 维要它的 cgroup 容得
-    # 下两个并发构建），所以这里取 16Gi——恰好贴着最大声明，不额外放宽。
-    maxMemory: 16Gi
     minCpu: 10m
     minMemory: 16Mi
-    # 单个 PVC 的上限：必须 ≥ 本 chart 最大的那份卷声明（当前是进化源码卷
-    # 192Gi）。定小了不是"更安全"——同一份声明在安装面直接被拒，装不进来；
-    # 渲染期门禁对每条声明逐个核这个上限。
-    pvcMaxStorage: 200Gi
     pvcMinStorage: 1Gi
 
 # 应用数据目录根（/var/lib/cogneva-data）：实例身份 identity.json、学习数仓
@@ -769,8 +647,9 @@ hostLedger:
   # 控制器经 apiserver 在该命名空间里建的，配额满时新节点上的账本 Pod 会 Pending，
   # 那个节点于是静默地没有账本（tolerations 挡不住这件事）。当前选择：接受，并让
   # host_ledger_node_unreported 报「有节点、没账本」。不给它 priorityClassName——
-  # 为了报一条读数去抢占工作负载，代价比它大。配额本身是另一件事：它现在是从这台
-  # 机器的读数导出的，换一台机器要重推（见 resourceGovernance.quota）。
+  # 为了报一条读数去抢占工作负载，代价比它大。Pod 额度本身是另一件事：它由渲染集
+  # 投影出来（见 resourceGovernance 段），这个 DaemonSet 的副本随 clusterNodes 进
+  # 算式，所以多一个节点不是"配额要人重推"，是投影自己变大。
 
 # 卷账的全集面（claim-store DaemonSet）：每节点一个进程，走查本节点存储根下的每个
 # claim 目录，把每个目录占的字节发布成 `cogneva_data_volume_used_bytes`
@@ -963,6 +842,8 @@ backends:
   postgres:
     enabled: true
     image: postgres:16-alpine
+    # 读数边车与数据库同 Pod：抓数据库的读数要库口令，独立进程就得再存一份。
+    exporterImage: prometheuscommunity/postgres-exporter:v0.15.0
     storage: 10Gi
     # Resource bounds live here, not in the template, so the tunables registry can
     # see them (it enumerates the numeric leaves of this file only).
@@ -973,6 +854,17 @@ backends:
       limits:
         cpu: 1000m
         memory: 2Gi
+    # 边车只跑十来条只读查询，用量按抓取间隔计量；上限要覆盖的是 exporter 的
+    # Go 堆随抓取次数与库表数增长后的规模，而不是稳态均值——上限压得太贴近
+    # 均值，它会在连续抓取后被 OOM 重启，而重启的边车读数看起来和「数据库
+    # 没有连接」一样。
+    exporterResources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
   redis:
     enabled: true
     image: redis:7-alpine

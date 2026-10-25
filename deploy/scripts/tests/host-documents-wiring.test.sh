@@ -18,7 +18,10 @@ chart="${repo}/deploy/helm/cogneva"
 fail() { echo "FAIL: $*"; exit 1; }
 
 render() {
-  helm template cogneva "${chart}" --set secrets.create=false "$@"
+  # 额度是渲染集投影出来的（见 templates/resource-quota.yaml），这里不核治理，
+  # 所以关掉它而不是传一份没有的投影产物。
+  helm template cogneva "${chart}" --set secrets.create=false \
+    --set resourceGovernance.enabled=false "$@"
 }
 
 work="$(mktemp -d)"

@@ -22,10 +22,12 @@ ingress:
   className: traefik
 
 resourceGovernance:
-  # 沿用 chart 默认的单节点标定值。多节点每增一个节点要按
-  # +200m limits.cpu / +1Gi limits.memory 上调（分发器 DaemonSet 逐节点常驻），
-  # 渲染期拿不到节点数，由元启动按探测到的节点数经 --set 覆盖。
+  # 额度本身不用在这里给：它由渲染集投影出来（容器声明、副本数、滚动重叠），
+  # 唯一跟节点数有关的是 DaemonSet 逐节点铺开后有几分 Pod，那由 clusterNodes 说。
+  # 投影按这里的数算，所以真到 N 节点时把下面这个 1 改成 N 并重跑
+  # deploy/scripts/render-deploy.sh；只改这里不重跑，产出物仍是单节点的额度。
   enabled: true
+  clusterNodes: 1
 
 evolution:
   gitRemote:

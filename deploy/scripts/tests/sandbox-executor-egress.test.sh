@@ -33,8 +33,11 @@ trap 'rm -rf "${work}"' EXIT
 # read the same value, so it is taken from the render here too -- change the port
 # and the policy follows (getting it wrong is what fails).
 audited_port=8083
+# 额度是渲染集投影出来的（见 templates/resource-quota.yaml），这里不核治理，
+# 所以关掉它而不是传一份没有的投影产物。
 helm template cogneva "${chart}" --set secrets.create=false \
-  --set securityGateway.auditedLlmPort="${audited_port}" > "${work}/rendered.yaml"
+  --set securityGateway.auditedLlmPort="${audited_port}" \
+  --set resourceGovernance.enabled=false > "${work}/rendered.yaml"
 
 check_file() {
   python3 - "${1}" "${audited_port}" <<'PYEOF'

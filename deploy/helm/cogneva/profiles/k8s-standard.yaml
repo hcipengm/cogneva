@@ -22,13 +22,18 @@ secrets:
   create: false
 
 resourceGovernance:
-  # 生产集群默认不开：配额是**天花板**，数值按单节点 K3s 标定，直接套到规模未知的
-  # 生产集群上，会在扩容时静默拒绝新 Pod（`FailedCreate: exceeded quota`），
-  # 代价比"暂时没有天花板"更大。本 profile 的定位就是"按集群规模上调"（元启动
-  # 第三步原文），所以这里要求运维/元启动显式给出数值后启用：
-  #   --set resourceGovernance.enabled=true --set resourceGovernance.quota.limitsCpu=...
-  # K3s 两个 profile 保持默认开启（数值即按其标定）。
+  # 生产集群默认不开。这不代表"配额只能给 K3s 用"——额度由渲染集投影出来
+  # （见 deploy/scripts/project-resource-governance.py），同一套清单在任何规模的
+  # 集群上都算得出自己的额度。不开的理由是另一条：生产集群上还会有人往这个命名
+  # 空间里放不在渲染集里的东西，而一份人没复核过的天花板在被撞到时，症状是
+  # `FailedCreate: exceeded quota`，比"暂时没有天花板"更难查。要开就先把节点数
+  # 声明对（DaemonSet 逐节点进算式），再把下面两行改成
+  #   enabled: true / clusterNodes: <N>
+  # 然后重跑 deploy/scripts/render-deploy.sh —— 额度是按这两个数投影出来的，
+  # 只用 --set 打开等于让集群收到一份没算过这份拓扑的产物。
+  # K3s 两个 profile 默认开启。
   enabled: false
+  clusterNodes: 1
 
 storage:
   localRetainClass:

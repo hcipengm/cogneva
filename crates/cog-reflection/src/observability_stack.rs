@@ -597,7 +597,6 @@ impl StackConvergence {
                         let class = match other {
                             DocFate::ClusterScoped => "集群级",
                             DocFate::Rbac => "授权面",
-                            DocFate::Governance => "配额/上限",
                             DocFate::StorageClaim => "卷声明",
                             DocFate::Deliver | DocFate::ForbiddenSecret => unreachable!(),
                         };

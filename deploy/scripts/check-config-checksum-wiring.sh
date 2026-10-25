@@ -129,7 +129,18 @@ def render(chart, profile, extra):
         "helm", "template", "cogneva", chart,
         "--namespace", "cogneva",
         "-f", profile,
-    ] + extra
+    ]
+    # 额度不是 chart values，是按 profile 从渲染集投影出来的产物（见
+    # project-resource-governance.py）。模板缺了它会直接报错——那是故意的，
+    # 免得渲染出一条空额度的 ResourceQuota。这一段判的是注解跟随，不是额度，
+    # 但渲染得过去才判得了。
+    governed = os.path.join(
+        chart,
+        f"values.resource-governance.{os.path.splitext(os.path.basename(profile))[0]}.yaml",
+    )
+    if os.path.isfile(governed):
+        cmd += ["-f", governed]
+    cmd += extra
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         sys.exit(f"渲染失败（{' '.join(cmd)}）：\n{proc.stderr}")

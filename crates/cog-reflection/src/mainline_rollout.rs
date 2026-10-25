@@ -1997,14 +1997,19 @@ impl RolloutExecutor {
     /// Whether this target's new pod would fail admission against the ceilings
     /// the cluster enforces right now, judged before anything is applied.
     ///
-    /// A resource governance object is not delivered by the rollout (see
-    /// [`GOVERNANCE_KINDS`]): a ceiling raised in the repository moves in the
-    /// cluster only when the install face applies it, and in the window between
-    /// the two the workload half can land against a ceiling still at its old
-    /// value. With a rolling strategy that takes the old pod down first, that
-    /// window is an outage. This is the gate the drift reading is not: it holds
-    /// the rollout -- the old pod stays -- while the new pod would not fit, and
-    /// lets it through once the ceiling catches up.
+    /// A resource governance object travels in the support bundle and is applied
+    /// before any target, so the ceiling this revision declares is in the
+    /// cluster by the time this runs. That is why the check reads the live
+    /// quota rather than the declaration: it answers "does the workload fit
+    /// what is enforced now", which is the question admission asks. Two
+    /// failures still land here -- a revision that declares a workload larger
+    /// than the ceiling it ships alongside itself, and a support apply that was
+    /// skipped or refused (a ceiling below current usage is rejected by the API
+    /// server, and the support apply fails before anything rolls). With a
+    /// rolling strategy that takes the old pod down first, either would be an
+    /// outage. This is the gate the drift reading is not: it holds the rollout
+    /// -- the old pod stays -- while the new pod would not fit, and lets it
+    /// through once the ceiling catches up.
     ///
     /// `Some(reason)` is a positive finding, named for the object and resource
     /// that decided it. `None` means it fits, no quota constrains the raised
