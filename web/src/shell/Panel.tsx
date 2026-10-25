@@ -6,15 +6,17 @@ import { useShell, type PanelTab } from '@/shell/store';
 import { useStreamStore } from '@/store/streamStore';
 
 /**
- * 底部面板：问题、输出、日志。
+ * 底部面板：问题、输出、日志、原文。
  *
- * 三格回答三个不同的问题——「有什么需要人处理」「我刚才点的那个动作结果如何」
- * 「总线上真的在跑什么」。合成一格会让最要紧的那类被最多的那类淹没。
+ * 四格回答四个不同的问题——「有什么需要人处理」「我刚才点的那个动作结果如何」
+ * 「总线上真的在跑什么」「智能体正在说什么」。合成一格会让最要紧的那类被最多的
+ * 那类淹没。
  */
 const TABS: { key: PanelTab; label: string }[] = [
   { key: 'problems', label: '问题' },
   { key: 'output', label: '输出' },
   { key: 'logs', label: '日志' },
+  { key: 'text', label: '原文' },
 ];
 
 const MIN_HEIGHT = 120;
@@ -29,6 +31,7 @@ export function Panel() {
   const setActivity = useShell((s) => s.setActivity);
   const { overview, alerts, llm } = useServices();
   const logs = useStreamStore((s) => s.activity);
+  const messages = useStreamStore((s) => s.messages);
 
   const problems = deriveProblems({
     overview: { data: overview.data, error: overview.error },
@@ -72,6 +75,7 @@ export function Panel() {
     problems: problems.length,
     output: output.length,
     logs: logs.length,
+    text: messages.length,
   };
 
   return (
@@ -204,6 +208,38 @@ export function Panel() {
                 </li>
               ))}
             </ul>
+          )
+        )}
+
+        {tab === 'text' && (
+          messages.length === 0 ? (
+            <p className="px-3 py-3 text-[11px] text-[var(--muted)]">
+              窗口内还没有消息帧。这里记的是智能体运行推回来的原文（`message_start` /
+              `message_update` / `message_end`），与工作台上那几列会话对话是两条通路：
+              会话走聊天帧，这一格走 agent 事件。
+            </p>
+          ) : (
+            <ol className="px-3 py-1 text-[11px] leading-relaxed">
+              {messages.map((m) => (
+                <li key={m.id} className="border-b border-[color-mix(in_srgb,var(--line)_55%,transparent)] py-1">
+                  <div className="flex items-baseline gap-3">
+                    <span className="mono w-32 shrink-0 truncate text-[var(--live)]" title={m.agent ?? ''}>
+                      {m.agent ?? '—'}
+                    </span>
+                    <span className="mono w-16 shrink-0 text-[var(--muted)]">{m.role}</span>
+                    <span
+                      className="mono w-16 shrink-0"
+                      style={{ color: m.status === 'streaming' ? 'var(--brass)' : 'var(--muted)' }}
+                    >
+                      {m.status === 'streaming' ? '生成中' : m.status === 'error' ? '出错' : '完成'}
+                    </span>
+                    <span className="min-w-0 flex-1 whitespace-pre-wrap break-words text-[var(--paper-dim)]">
+                      {m.text || '（还没有正文）'}
+                    </span>
+                  </div>
+                </li>
+              ))}
+            </ol>
           )
         )}
       </div>

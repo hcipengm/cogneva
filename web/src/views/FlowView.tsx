@@ -1,5 +1,7 @@
-import { getProcessOverview, type GoalGroup } from '@/api/client';
+import { useMemo } from 'react';
+import { getProcessOverview, type GoalGroup, type ProcessTask } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { frameIsNewer, liveIndex, useStreamStore } from '@/store/streamStore';
 import { Empty, Loading, Moment, ReadError, Reading, Table, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -16,12 +18,24 @@ export function FlowView() {
   const overview = processes.data;
 
   const tasks = overview?.goals.flatMap((goal) => goal.tasks) ?? [];
+
+  // 帧补在快照之后：总览带自己的采集时刻，晚于它的帧比整份快照新。分段计数用
+  // 补过的状态，否则一条刚被领走的任务在这一面上仍算「就绪待领」，下一面（任务
+  // 面）却已经算「执行中」——同一批行两个口径。
+  const liveTasks = useStreamStore((s) => s.liveTasks);
+  const live = useMemo(() => liveIndex(liveTasks), [liveTasks]);
+  const statusOf = (t: ProcessTask): string => {
+    const frame = live[t.id];
+    return frame && frameIsNewer(frame, overview?.timestamp ?? '') ? frame.status : t.status;
+  };
+  const fromFrame = tasks.filter((t) => statusOf(t) !== t.status).length;
+
   const planned = tasks.length;
-  const blocked = tasks.filter((t) => t.blocked_by.length > 0 && isOpen(t.status)).length;
-  const ready = tasks.filter((t) => t.blocked_by.length === 0 && isOpen(t.status)).length;
-  const running = tasks.filter((t) => t.status.toLowerCase() === 'running').length;
-  const completed = tasks.filter((t) => t.status.toLowerCase() === 'completed').length;
-  const failed = tasks.filter((t) => t.status.toLowerCase() === 'failed').length;
+  const blocked = tasks.filter((t) => t.blocked_by.length > 0 && isOpen(statusOf(t))).length;
+  const ready = tasks.filter((t) => t.blocked_by.length === 0 && isOpen(statusOf(t))).length;
+  const running = tasks.filter((t) => statusOf(t).toLowerCase() === 'running').length;
+  const completed = tasks.filter((t) => statusOf(t).toLowerCase() === 'completed').length;
+  const failed = tasks.filter((t) => statusOf(t).toLowerCase() === 'failed').length;
 
   return (
     <ViewFrame
@@ -56,6 +70,12 @@ export function FlowView() {
               <Arrow />
               <Reading label="已收口" value={completed} />
               <Reading label="失败" value={failed} tone={failed > 0 ? 'danger' : 'plain'} />
+              <Reading
+                label="帧里更新过"
+                value={fromFrame}
+                tone={fromFrame > 0 ? 'warn' : 'plain'}
+                note="比这份快照新"
+              />
               {overview.dlq_len > 0 && (
                 <Reading
                   label="死信队列"
@@ -78,7 +98,9 @@ export function FlowView() {
             {overview.goals.length === 0 ? (
               <Empty>现在没有目标在跑。这一面读的是任务图，不是一张心跳图。</Empty>
             ) : (
-              overview.goals.map((goal) => <GoalBlock key={goal.goal_id} goal={goal} />)
+              overview.goals.map((goal) => (
+                <GoalBlock key={goal.goal_id} goal={goal} statusOf={statusOf} />
+              ))
             )}
           </section>
 
@@ -160,7 +182,13 @@ export function FlowView() {
 }
 
 /** 一个意图：进度、计数，以及它分解出的那批原子任务。 */
-function GoalBlock({ goal }: { goal: GoalGroup }) {
+function GoalBlock({
+  goal,
+  statusOf,
+}: {
+  goal: GoalGroup;
+  statusOf: (task: ProcessTask) => string;
+}) {
   return (
     <div className="border-t border-[var(--line)] first:border-t-0">
       <div className="flex flex-wrap items-center gap-3 px-4 py-1.5">
@@ -176,9 +204,17 @@ function GoalBlock({ goal }: { goal: GoalGroup }) {
             <span className="mono text-[11px]">{t.id.slice(0, 22)}</span>
           ) },
           { key: 'type', title: '类型', width: '120px', render: (t) => t.task_type },
-          { key: 'status', title: '状态', width: '100px', render: (t) => (
-            <span className="text-[11px]" style={{ color: statusColor(t.status) }}>{t.status}</span>
-          ) },
+          { key: 'status', title: '状态', width: '120px', render: (t) => {
+            const live = statusOf(t);
+            return (
+              <span className="inline-flex items-baseline gap-1.5">
+                <span className="text-[11px]" style={{ color: statusColor(live) }}>{live}</span>
+                {live !== t.status && (
+                  <span className="mono text-[10px] text-[var(--brass)]" title="比这份快照新">帧</span>
+                )}
+              </span>
+            );
+          } },
           { key: 'agent', title: '执行者', width: '150px', render: (t) => (
             <span className="mono text-[11px] text-[var(--muted)]">{t.agent_id ?? '未认领'}</span>
           ) },

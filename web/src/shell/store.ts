@@ -46,7 +46,7 @@ export const VIEW_TITLES: Record<ActivityId, string> = {
 };
 
 /** 底部面板的四格：问题、输出、日志、终端。 */
-export type PanelTab = 'problems' | 'output' | 'logs';
+export type PanelTab = 'problems' | 'output' | 'logs' | 'text';
 
 /** 编辑器里的一页。`view` 是视图注册表里的键，`id` 是这一页自己的身份。 */
 export interface EditorTab {

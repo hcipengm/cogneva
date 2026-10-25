@@ -6,6 +6,12 @@ import {
   type TaskRow,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import {
+  effectiveStatus,
+  liveIndex,
+  useStreamStore,
+  type LiveTaskStatus,
+} from '@/store/streamStore';
 import { Empty, Loading, Moment, ReadError, Reading, Status, Table, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -43,6 +49,12 @@ export function TasksView() {
   const tasks = list.data ?? [];
   const nodes = graph.data?.nodes ?? [];
   const counts = summary.data;
+
+  // 帧是轮询快照之间的补丁：`task_status_change` 一到，这一行就不必再等下一次
+  // 轮询。没有它，画面上最久会停在十几秒前的状态上——而总线上的状态早就变了。
+  const liveTasks = useStreamStore((s) => s.liveTasks);
+  const live = useMemo(() => liveIndex(liveTasks), [liveTasks]);
+  const fromFrame = tasks.filter((t) => effectiveStatus(t, live).fromFrame).length;
   const picked = useMemo(
     () => tasks.find((t) => t.id === selected) ?? nodes.find((t) => t.id === selected) ?? null,
     [tasks, nodes, selected]
@@ -94,6 +106,12 @@ export function TasksView() {
           <Reading label="就绪待领" value={counts.ready} tone={counts.ready > 0 ? 'warn' : 'plain'} />
           <Reading label="已完成" value={counts.completed} />
           <Reading label="失败" value={counts.failed} tone={counts.failed > 0 ? 'danger' : 'plain'} />
+          <Reading
+            label="帧里更新过"
+            value={fromFrame}
+            tone={fromFrame > 0 ? 'warn' : 'plain'}
+            note="比这次轮询新"
+          />
         </div>
       )}
 
@@ -116,7 +134,7 @@ export function TasksView() {
                 </button>
               ) },
               { key: 'type', title: '类型', width: '130px', render: (t) => t.task_type },
-              { key: 'status', title: '状态', width: '110px', render: (t) => <Status value={t.status} /> },
+              { key: 'status', title: '状态', width: '130px', render: (t) => <LiveStatus row={t} live={live} /> },
               { key: 'owner', title: '归属', width: '150px', render: (t) => (
                 <span className="mono text-[11px] text-[var(--muted)]">{t.owner_unit ?? t.agent_id ?? '—'}</span>
               ) },
@@ -150,11 +168,19 @@ export function TasksView() {
         <TaskGraphPanel
           nodes={nodes}
           selected={selected}
+          live={live}
           onSelect={(id) => setSelected(id === selected ? null : id)}
         />
       )}
 
-      {picked && <TaskDetail task={picked} onSelect={setSelected} onClose={() => setSelected(null)} />}
+      {picked && (
+        <TaskDetail
+          task={picked}
+          live={live}
+          onSelect={setSelected}
+          onClose={() => setSelected(null)}
+        />
+      )}
     </ViewFrame>
   );
 }
@@ -175,10 +201,12 @@ const PAD = 18;
 function TaskGraphPanel({
   nodes,
   selected,
+  live,
   onSelect,
 }: {
   nodes: TaskRow[];
   selected: string | null;
+  live: Record<string, LiveTaskStatus>;
   onSelect: (id: string) => void;
 }) {
   const layout = useMemo(() => computeLayout(nodes), [nodes]);
@@ -234,7 +262,8 @@ function TaskGraphPanel({
             const at = position.get(task.id);
             if (!at) return null;
             const active = task.id === selected;
-            const color = statusColor(task.status);
+            const eff = effectiveStatus(task, live);
+            const color = statusColor(eff.status);
             return (
               <g key={task.id} onClick={() => onSelect(task.id)} style={{ cursor: 'pointer' }}>
                 <rect
@@ -256,7 +285,8 @@ function TaskGraphPanel({
                 <text x={at.x + 12} y={at.y + 49} fontSize={10} fill="var(--muted)">
                   {task.owner_unit ?? task.agent_id ?? '未归属'}
                   {' · '}
-                  {task.status}
+                  {eff.status}
+                  {eff.fromFrame ? '（帧）' : ''}
                   {task.face_id ? ` · ${task.face_id}` : ''}
                 </text>
               </g>
@@ -275,10 +305,12 @@ function TaskGraphPanel({
 /** 一条任务的全貌。字段分组按读者的问题排：它是什么、谁负责、等谁、为什么失败、执行到哪。 */
 function TaskDetail({
   task,
+  live,
   onSelect,
   onClose,
 }: {
   task: TaskRow;
+  live: Record<string, LiveTaskStatus>;
   onSelect: (id: string) => void;
   onClose: () => void;
 }) {
@@ -289,7 +321,7 @@ function TaskDetail({
     <section className="border-t border-[var(--line)]">
       <div className="flex items-center px-4 py-2">
         <span className="mono text-[11px] text-[var(--paper-dim)]">{task.id}</span>
-        <Status value={task.status} />
+        <LiveStatus row={task} live={live} />
         <button onClick={onClose} className="ml-auto text-[11px] text-[var(--muted)] hover:text-[var(--paper)]">
           收起
         </button>
@@ -402,6 +434,32 @@ function Json({ value }: { value: Record<string, unknown> }) {
 
 function fmt(iso: string): string {
   return new Date(iso).toLocaleString('zh-CN');
+}
+
+/**
+ * 状态：快照与帧取新的那个，并标出它是从哪儿读来的。
+ *
+ * 标记不是装饰：读者要能分清「这是刚才那帧说的」与「这是十几秒前那次轮询说的」，
+ * 否则一个比快照新的值会被当成快照的一部分，下一帧把它改掉时看着像读数在跳。
+ */
+function LiveStatus({
+  row,
+  live,
+}: {
+  row: { id: string; status: string; updated_at: string };
+  live: Record<string, LiveTaskStatus>;
+}) {
+  const eff = effectiveStatus(row, live);
+  return (
+    <span className="inline-flex items-baseline gap-1.5">
+      <Status value={eff.status} />
+      {eff.fromFrame && (
+        <span className="mono text-[10px] text-[var(--brass)]" title="比这次轮询读到的更新">
+          帧
+        </span>
+      )}
+    </span>
+  );
 }
 
 function statusColor(status: string): string {

@@ -57,6 +57,15 @@ export function describeEvent(event: AgentEvent): ActivityEntry {
         detail: preview(p.args),
         failed: false,
       };
+    case 'tool_execution_update':
+      // 工具跑起来之后的中途输出：它不是「又调了一次」，印成一次新的调用会让
+      // 一次长工具在活动流里叠出十几行一模一样的开头。
+      return {
+        ...base,
+        summary: `工具 ${text(p.tool_name) || text(p.tool_call_id)} 输出中`,
+        detail: preview(p.chunk ?? p.delta ?? p.output),
+        failed: false,
+      };
     case 'tool_execution_end':
       return {
         ...base,
@@ -141,20 +150,41 @@ export function describeEvent(event: AgentEvent): ActivityEntry {
 
 export interface Message {
   id: string;
+  /** 谁在说。总线上的消息按 agent 分，少了这一列就没法把它归到某一次运行。 */
+  agent: string | null;
   role: MessageRole;
   text: string;
   status: 'streaming' | 'done' | 'error';
 }
 
-export interface TaskProgress {
+/** 原文保留条数。面板是「刚才流过来了什么」，不是转录存档。 */
+export const MESSAGE_LIMIT = 200;
+
+/**
+ * 一条任务在帧里的状态。
+ *
+ * 它是轮询读数的补丁，不是第二本账：轮询每十几秒给一次快照，帧在快照之间到，
+ * 读者看的是「比快照新的那一个」。所以带着到达时刻，读的时候比新旧。
+ */
+export interface LiveTaskStatus {
   taskId: string;
-  progress: number;
-  step: string;
+  status: string;
+  at: string;
 }
+
+/** 帧里记住的任务状态条数。超过就丢最老的，没人会翻几百条前的状态变迁。 */
+export const LIVE_TASK_LIMIT = 200;
 
 export interface StreamState {
   messages: Message[];
-  taskProgress: TaskProgress | null;
+  /**
+   * 帧里读到的任务状态，新的在前，一条任务只留最新那一次。
+   *
+   * 任务面与流程面拿它去补轮询快照：快照说 `pending`、帧刚说 `running`，画面上
+   * 就该是 `running`。没有这一列的时候，`task_status_change` 每一条都到了、都进了
+   * 活动流，而所有任务视图仍停在最多十几秒前的快照上。
+   */
+  liveTasks: LiveTaskStatus[];
   connectionStatus: 'connecting' | 'open' | 'closed' | 'error';
   /**
    * 最近活动，新的在前。
@@ -166,23 +196,57 @@ export interface StreamState {
   activity: ActivityEntry[];
   recordActivity: (entry: ActivityEntry) => void;
   clearActivity: () => void;
-  startMessage: (id: string, role: MessageRole) => void;
+  startMessage: (id: string, agent: string | null, role: MessageRole) => void;
   appendDelta: (messageId: string, delta: string) => void;
   endMessage: (messageId: string) => void;
   /**
    * 收尾时用整条消息补一次正文。
    *
    * 只有助手的话是逐段流出来的；用户发的、工具回的都是整条到达。不收尾时
-   * 补一次，画布上那条就是空的——读者会以为这句话没说出来。
+   * 补一次，原文格里那条就是空的——读者会以为这句话没说出来。
    */
   finishMessage: (messageId: string, fullText: string) => void;
-  setTaskProgress: (progress: TaskProgress) => void;
+  noteTaskStatus: (entry: LiveTaskStatus) => void;
   setConnectionStatus: (status: StreamState['connectionStatus']) => void;
+}
+
+/** 帧里那一列折成按任务 id 取的表。折叠只有一处，读者不必各自建一遍。 */
+export function liveIndex(rows: LiveTaskStatus[]): Record<string, LiveTaskStatus> {
+  const index: Record<string, LiveTaskStatus> = {};
+  for (const row of rows) index[row.taskId] = row;
+  return index;
+}
+
+/**
+ * 快照与帧之间取新的那个。
+ *
+ * 只有帧确实晚于这一行快照的更新时间才算数：重连后服务端会把窗口内的帧重放一遍，
+ * 一串旧帧若盖在刚读到的快照上，画面就会从 `running` 倒退回 `pending`——一次
+ * 从未发生的回退，比慢十几秒更坏。
+ */
+export function frameIsNewer(frame: LiveTaskStatus | undefined, snapshotAt: string): boolean {
+  if (!frame) return false;
+  const frameAt = Date.parse(frame.at);
+  if (!Number.isFinite(frameAt)) return false;
+  const snapshot = Date.parse(snapshotAt);
+  if (!Number.isFinite(snapshot)) return true;
+  return frameAt > snapshot;
+}
+
+export function effectiveStatus(
+  row: { id: string; status: string; updated_at: string },
+  live: Record<string, LiveTaskStatus>
+): { status: string; fromFrame: boolean } {
+  const frame = live[row.id];
+  if (!frame || !frameIsNewer(frame, row.updated_at)) {
+    return { status: row.status, fromFrame: false };
+  }
+  return { status: frame.status, fromFrame: true };
 }
 
 export const useStreamStore = create<StreamState>((set) => ({
   messages: [],
-  taskProgress: null,
+  liveTasks: [],
   connectionStatus: 'connecting',
   activity: [],
 
@@ -197,13 +261,14 @@ export const useStreamStore = create<StreamState>((set) => ({
 
   clearActivity: () => set({ activity: [] }),
 
-  startMessage: (id, role) =>
-    set((state) => ({
-      messages: [
+  startMessage: (id, agent, role) =>
+    set((state) => {
+      const next = [
         ...state.messages,
-        { id, role, text: '', status: 'streaming' },
-      ],
-    })),
+        { id, agent, role, text: '', status: 'streaming' as const },
+      ];
+      return { messages: next.length > MESSAGE_LIMIT ? next.slice(-MESSAGE_LIMIT) : next };
+    }),
 
   appendDelta: (messageId, delta) =>
     set((state) => ({
@@ -232,7 +297,12 @@ export const useStreamStore = create<StreamState>((set) => ({
       ),
     })),
 
-  setTaskProgress: (progress) => set({ taskProgress: progress }),
+  noteTaskStatus: (entry) =>
+    set((state) => {
+      const rest = state.liveTasks.filter((row) => row.taskId !== entry.taskId);
+      const next = [entry, ...rest];
+      return { liveTasks: next.length > LIVE_TASK_LIMIT ? next.slice(0, LIVE_TASK_LIMIT) : next };
+    }),
 
   setConnectionStatus: (status) => set({ connectionStatus: status }),
 }));
