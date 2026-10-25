@@ -74,7 +74,11 @@ SUBCOMMANDS:
                            owned by the face's owner and carrying its face id,
                            so the owner's queue is that row and the reading
                            can tell an idle face from a face nobody gave work
-                           to. Idempotent per face: an open row is kept.
+                           to. Idempotent per face: an open row is kept, a row
+                           the drift pass released is taken back once its owner
+                           answers to the heartbeat store again, and a face
+                           whose owner has no heartbeat key is counted as
+                           absent instead of being given a row it cannot hold.
 
 OPTIONS:
     --database-url <url>   Override the graph's URL. Default: COGNEVA_DATABASE_URL,
@@ -277,7 +281,21 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         } => import_faces(&*store, &from, keep_ownership).await?,
         Action::Assign { face, workspace } => {
             let workspace = workspace.unwrap_or_else(|| config.dag_executor.workspace_id.clone());
-            assign(&*store, &assign_pool, &workspace, face.as_deref()).await?;
+            let (registry, note) = agent_registry(redis_url.as_deref()).await;
+            if let Some(note) = note {
+                eprintln!("cogneva governance: {note}");
+            }
+            let presence = registry.map(RedisPresenceProbe);
+            assign(
+                &*store,
+                &assign_pool,
+                &workspace,
+                face.as_deref(),
+                presence
+                    .as_ref()
+                    .map(|p| p as &dyn crate::governance_acts::PresenceProbe),
+            )
+            .await?;
         }
         Action::Act(act) => {
             // The heartbeat store is what an exit handover's apply step
@@ -704,11 +722,21 @@ pub fn parse_roster(text: &str) -> Result<Vec<RosterRow>, String> {
 ///
 /// The id is derived from the face, so running this twice keeps the open row
 /// instead of blaming somebody for not having started the second copy.
+///
+/// A face whose owner the heartbeat registry does not know gets no row. The row
+/// would be released on the next drift pass, because an owner that is not there
+/// cannot hold work, so writing it buys one rewrite and one release -- and if
+/// the shared queue claims it in between, the row comes out running with nobody
+/// named, which the verdict reads as `drifted_binding`: red, a louder fault than
+/// the yellow the row was written to clear. An absent owner is counted by name
+/// instead, and the reading says the same thing once the cause is decided by
+/// repair order rather than by which condition is cheapest to test.
 async fn assign(
     store: &dyn GovernanceStore,
     pool: &sqlx::PgPool,
     workspace: &str,
     only: Option<&str>,
+    presence: Option<&dyn crate::governance_acts::PresenceProbe>,
 ) -> Result<(), Box<dyn Error>> {
     if workspace.trim().is_empty() {
         return Err("no workspace to assign work in: pass --workspace or set \
@@ -749,6 +777,7 @@ async fn assign(
     let mut kept = 0usize;
     let mut released = 0usize;
     let mut vacant = 0usize;
+    let mut absent: Vec<String> = Vec::new();
     for face in selected {
         let Some(owner) = face.owner_unit.clone() else {
             vacant += 1;
@@ -758,13 +787,36 @@ async fn assign(
             );
             continue;
         };
+        // Keep `assign` and the drift pass from undoing each other: see the
+        // doc comment above. A registry that cannot be read is not evidence of
+        // absence, so the row is written and the note says why.
+        let mut owner_present = None;
+        if let Some(probe) = presence {
+            match absence_of(probe.presence_ttl_secs(&owner).await) {
+                Ok(true) => {
+                    absent.push(format!("{}:{}", face.face_id, owner));
+                    continue;
+                }
+                Ok(false) => owner_present = Some(true),
+                Err(e) => eprintln!(
+                    "{}: the owner's presence could not be read ({e}); writing the row anyway",
+                    face.face_id
+                ),
+            }
+        }
         let id = cog_orchestrator::governance_acts::face_work_id(&face.face_id);
         if let Some(existing) = backend.dag_get_task(workspace, &id).await? {
             if !matches!(
                 existing.status,
                 TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
             ) {
-                match standing_row_disposition(existing.owner_unit.as_deref(), &owner) {
+                let running = existing.status == TaskStatus::Running;
+                match standing_row_disposition(
+                    existing.owner_unit.as_deref(),
+                    &owner,
+                    owner_present == Some(true),
+                    running,
+                ) {
                     StandingRow::Keep => {
                         kept += 1;
                         continue;
@@ -817,9 +869,29 @@ async fn assign(
     }
     println!(
         "assigned {assigned}, rebound {rebound}, kept {kept}, released {released}, \
-         vacant {vacant} (workspace {workspace})"
+         vacant {vacant}, absent {} (workspace {workspace})",
+        absent.len()
     );
+    // Named, not just counted: the repair is somebody bringing that unit back
+    // or a signed handover moving the face, and neither can start from a number.
+    for entry in &absent {
+        eprintln!("{entry}: the owner has no heartbeat key; no standing row written");
+    }
     Ok(())
+}
+
+/// What a presence answer means for writing a standing row.
+///
+/// Only a positive "there is no such key" refuses the row. A store that could
+/// not be read says nothing about who is there, and reading it as an absence
+/// would stop staffing every face the first time Redis blinked -- a repair that
+/// takes hold of the whole graph on the strength of one failed GET.
+fn absence_of(answer: Result<Option<u64>, String>) -> Result<bool, String> {
+    match answer {
+        Ok(Some(_left)) => Ok(false),
+        Ok(None) => Ok(true),
+        Err(e) => Err(e),
+    }
 }
 
 /// What `assign` does with an open standing work row it already found.
@@ -834,18 +906,37 @@ enum StandingRow {
     /// The row names nobody, which is the state the drift pass leaves behind
     /// when the unit it named stopped answering to the registry. Clearing the
     /// owner is the only move that puts the work back in front of every
-    /// executor -- the shared queue hands out unowned work only -- so giving
-    /// the row an owner again would take it off the queue and hand it to the
-    /// same absent name. `assign` and the drift pass would then undo each
-    /// other for as long as both ran, while the face read as staffed the whole
-    /// time.
+    /// executor -- the shared queue hands out unowned work only -- so while
+    /// that name is still absent, giving the row an owner again takes it off
+    /// the queue and hands it to nobody. `assign` and the drift pass would then
+    /// undo each other for as long as both ran, while the face read as staffed
+    /// the whole time.
     LeaveReleased,
 }
 
-fn standing_row_disposition(existing_owner: Option<&str>, face_owner: &str) -> StandingRow {
+/// Which of the three dispositions an open standing row gets.
+///
+/// A row with no owner is left released only while its unit is still gone.
+/// Once the unit answers to the registry again the reason `LeaveReleased`
+/// exists is gone: the row can be held, the face can read as staffed, and the
+/// duty goes back to the unit whose name is on the face. Without that, the
+/// release is one-way -- a face whose owner blinked once would read
+/// `no_bound_task` for the rest of its life, and no later `assign` could ever
+/// put work back in front of it.
+///
+/// A running row is never rebound. It belongs to whoever holds its lease; the
+/// release path only moves unstarted rows, and re-owning a run in flight would
+/// name a unit that is not the one executing it.
+fn standing_row_disposition(
+    existing_owner: Option<&str>,
+    face_owner: &str,
+    face_owner_present: bool,
+    running: bool,
+) -> StandingRow {
     match existing_owner {
         Some(owner) if owner == face_owner => StandingRow::Keep,
         Some(_) => StandingRow::Rebind,
+        None if face_owner_present && !running => StandingRow::Rebind,
         None => StandingRow::LeaveReleased,
     }
 }
@@ -1153,7 +1244,8 @@ mod tests {
     }
 
     /// A row the drift pass released must not be handed back to the absent
-    /// name by the next `assign`.
+    /// name by the next `assign` -- and must be handed back once that name
+    /// answers again.
     ///
     /// The two passes have opposite jobs on the same row: the drift pass
     /// clears the owner when the unit it names stops answering, `assign`
@@ -1162,24 +1254,65 @@ mod tests {
     /// runnable, and because it is owned again the face stops reading as
     /// drifted. Measured on the live cluster: eighteen face rows stayed
     /// unstarted for five days this way. Leaving a released row alone is
-    /// what breaks the loop: the shared queue runs it, and a returning owner
-    /// gets the duty back through a signed handover.
+    /// what breaks the loop while the owner is away.
+    ///
+    /// Leaving it alone forever would be a different fault: the release is
+    /// only meant to last as long as the absence does. Seventeen faces whose
+    /// owner had no heartbeat key were released, the owner came back, and
+    /// every later `assign` reported `released` and wrote nothing -- the faces
+    /// had no standing row left to hold and no pass that would ever give them
+    /// one, so their idle reading could not change again.
     #[test]
-    fn a_released_standing_row_is_not_re_owned_by_the_next_assign() {
+    fn a_released_standing_row_comes_back_when_its_owner_does() {
         assert_eq!(
-            standing_row_disposition(None, "f5"),
+            standing_row_disposition(None, "f5", false, false),
             StandingRow::LeaveReleased,
-            "a row with no owner was released on purpose; re-owning it takes it off the queue"
+            "while the owner is gone, re-owning the row takes it off the queue"
         );
         assert_eq!(
-            standing_row_disposition(Some("f5"), "f5"),
+            standing_row_disposition(None, "f5", true, false),
+            StandingRow::Rebind,
+            "an owner that answers again can hold the duty, and the loop is why it was released"
+        );
+        assert_eq!(
+            standing_row_disposition(None, "f5", true, true),
+            StandingRow::LeaveReleased,
+            "a run in flight belongs to whoever holds its lease, not to the face's owner"
+        );
+        assert_eq!(
+            standing_row_disposition(Some("f5"), "f5", true, false),
             StandingRow::Keep,
             "a row that already names the face's owner is kept as it is"
         );
         assert_eq!(
-            standing_row_disposition(Some("c2"), "f5"),
+            standing_row_disposition(Some("c2"), "f5", true, false),
             StandingRow::Rebind,
             "a face that changed hands moves its open row with it"
+        );
+    }
+
+    /// A face whose owner has no heartbeat key gets no standing row at all.
+    ///
+    /// `assign` used to write the row and leave the drift pass to release it one
+    /// pass later. Measured on the live cluster with seventeen faces owned by a
+    /// unit that had no key: the rows went out, the pass cleared them, and the
+    /// shared queue claimed four inside that window -- each a running row naming
+    /// nobody, which the verdict reads as `drifted_binding`. Assigning work to
+    /// those faces is what turned four of them from yellow into red.
+    #[test]
+    fn a_face_whose_owner_is_absent_gets_no_standing_row() {
+        assert!(
+            absence_of(Ok(None)).unwrap(),
+            "no key is the absence: nothing else in the tree writes it"
+        );
+        assert!(
+            !absence_of(Ok(Some(1))).unwrap(),
+            "a key with a second left is still a unit that is here"
+        );
+        assert!(
+            absence_of(Err("redis timed out".into())).is_err(),
+            "a GET that failed is not evidence the owner is gone; reading it as one \
+             would stop staffing every face on one blink"
         );
     }
 
