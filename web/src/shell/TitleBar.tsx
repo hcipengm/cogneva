@@ -11,11 +11,20 @@ import { useShell } from '@/shell/store';
 export function TitleBar() {
   const setPalette = useShell((s) => s.setPalette);
   const setActivity = useShell((s) => s.setActivity);
-  const { alerts, notifications, username } = useServices();
+  const { alerts, notifications, llm, overlays, username } = useServices();
 
   const firing = alerts.alerts?.count ?? 0;
   const unread = notifications.unreadCount;
   const initial = (username ?? '?').slice(0, 1).toUpperCase();
+
+  // 模型状态在顶栏只用一个点说三种事，每种都写出来源：配了、没配、还没读到。
+  // 「还没读到」不能画成「没配」——那会让人去重配一条已经配好的上游。
+  const configured = llm.status?.configured;
+  const modelTone =
+    configured == null ? 'var(--muted)' : configured ? 'var(--ok)' : 'var(--warn)';
+  const modelLabel =
+    configured == null ? '模型状态还没读到' : configured ? '模型已配置' : '模型未配置';
+  const readAt = llm.at ? new Date(llm.at).toLocaleTimeString('zh-CN') : '从没读到过';
 
   return (
     <header className="flex h-9 shrink-0 items-center gap-3 border-b border-[var(--line)] bg-[var(--ink-800)] px-3">
@@ -62,6 +71,23 @@ export function TitleBar() {
         >
           <Icon name="inbox" size={14} />
           {notifications.error ? '?' : unread}
+        </button>
+        {/* 模型入口：顶栏直达配置，不必先进设置再找那一格。状态点与设置页读的是
+            同一份读数（Shell 里那一份 useLlmStatus），所以两处不会各说一套。 */}
+        <button
+          type="button"
+          onClick={overlays.openLlmSetup}
+          title={`${modelLabel} · GET /api/v1/llm/status · 读于 ${readAt} · 点开配置（保存时服务端会按双协议各探测一次）`}
+          aria-label={`${modelLabel}，点开配置模型`}
+          className="flex h-6 items-center gap-1.5 px-2 text-[11px] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
+          style={{ color: modelTone }}
+        >
+          <span
+            className="inline-block h-1.5 w-1.5 rounded-full"
+            style={{ background: modelTone }}
+            aria-hidden="true"
+          />
+          模型
         </button>
         <button
           type="button"

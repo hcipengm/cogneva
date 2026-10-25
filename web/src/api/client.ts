@@ -1159,6 +1159,28 @@ export async function getMemoryRawContent(id: string): Promise<RawContent> {
   return api.get<RawContent>(`/api/v1/memory/raw/${encodeURIComponent(id)}/content`);
 }
 
+/**
+ * 历史事件查询。
+ *
+ * 两件事是这一面的窗口，读的人必须知道：服务端把 `since` 钉在「最近 24 小时」，
+ * 并且一次最多读 1000 条（读满就停）。于是它回答的是「这一天的头一千条里有什么」，
+ * 不是「这一天一共发生过多少件事」——把上限读成总数，是这一面最容易说的假话。
+ *
+ * 返回的是变体字段平铺的原始事件（没有 `payload` 这一层，也没有 `id`），交给
+ * `normalizeAgentEvent` 归一——与实时流走同一个函数，两条路不会把同一帧说成两件事。
+ */
+export async function listEvents(
+  params: { agentId?: string; taskId?: string; squadId?: string; eventTypes?: string[] } = {}
+): Promise<Record<string, unknown>[]> {
+  const query = new URLSearchParams();
+  if (params.agentId) query.set('agent_id', params.agentId);
+  if (params.taskId) query.set('task_id', params.taskId);
+  if (params.squadId) query.set('squad_id', params.squadId);
+  if (params.eventTypes?.length) query.set('event_types', params.eventTypes.join(','));
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return api.get<Record<string, unknown>[]>(`/api/v1/events${suffix}`);
+}
+
 /** 日志归档的一条索引：一天一个流可能有多份文件，`format` 也是键的一部分。 */
 export interface RawLogEntry {
   hour: number;

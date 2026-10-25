@@ -277,7 +277,11 @@ function normalizeNotification(
   };
 }
 
-function normalizeAgentEvent(
+/**
+ * 线上的一条帧 → 界面认得的形状。实时流与历史事件查询共用这一个函数：
+ * 两处各写一份映射，同一帧在直播和回放里会被说成两件事（也曾经被丢过一次）。
+ */
+export function normalizeAgentEvent(
   payload: Record<string, unknown>,
   fallbackId: string
 ): AgentEvent | null {

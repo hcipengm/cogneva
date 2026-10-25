@@ -654,6 +654,18 @@ jobs:
       - name: Check the topology screen tells the truth about what it read
         run: bash deploy/scripts/check-web-topology-panel.sh
 
+      # 观测面的成品是一排各有读者的工具板，不是一张从上滚到下的大表。这一面
+      # 坏起来也不出声：板条上写着「事件回放」却没人渲染、`/api/v1/events` 这条
+      # 历史查询有了通路没有消费者、读满 1000 条被当成总数、日志的分页数被当成
+      # 归档总量、轨迹少读了帧却按全量展示、模型花销在两个面各算一遍。
+      - name: Check the observability face is boards with readers, not one long table
+        run: bash deploy/scripts/check-web-observability-boards.sh
+
+      # 问号、模型、设置三条路：图标在、位置对、点下去什么都不发生，是这一面最安静的坏法。
+      # 门判的是它们真的通到哪儿，以及模型入口有没有说「这是哪一刻读到的」。
+      - name: Check the help, model and settings entries actually lead somewhere
+        run: bash deploy/scripts/check-web-shell-entries.sh
+
   # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读
   # 覆盖端点），它结构上证明不了 `web/` 编得过：类型错、装不上的依赖、打包不进
   # bundle，三条它一条也看不见。构建这一半必须自己有一个作业，否则「新增功能不得
