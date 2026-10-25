@@ -51,7 +51,7 @@ export function ObservabilityView() {
 
       <section className="border-b border-[var(--line)]">
         <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
-          拓扑 · 集群 → 节点 → Pod → 容器
+          拓扑 · 集群 → 节点 → Pod → 容器 → 卷与事件
         </h2>
         <ClusterTopology />
       </section>
