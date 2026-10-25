@@ -3,11 +3,15 @@ import { useResource } from '@/hooks/useResource';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 /**
- * 构建与部署面：谁在跑第几版、滚动到哪一步。
+ * 构建与部署面：谁在跑第几版、滚动到哪一步；这轮构建过什么、每条怎么结束的。
  *
- * 数据只来自 apiserver 的 Deployment 对象：revision 注解就是「这是第几次改动滚上来
- * 的」，条件里 `Progressing=False` 是滚动卡住而不是进行中。工作负载的名字就是平台
+ * 上半页只来自 apiserver 的 Deployment 对象：revision 注解就是「这是第几次改动滚上
+ * 来的」，条件里 `Progressing=False` 是滚动卡住而不是进行中。工作负载的名字就是平台
  * 自己的组件名，不另编一套漂亮的名字——运维要能把它和 `kubectl` 的输出对上。
+ *
+ * 下半页是另一种东西：它来自演进进程自己的内存窗口，重启清零，所以回答的是「这一轮」
+ * 而不是历史。两半的出处不同，读数也各自带着出处——上半页的 0 是集群里真的没有,
+ * 下半页的 0 可能是没人报。
  */
 export function DeliveryView() {
   const deployments = useResource('部署版本', getDeployments, 15_000);
