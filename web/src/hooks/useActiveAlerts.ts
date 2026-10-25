@@ -16,6 +16,8 @@ export interface AckOutcome {
  */
 export function useActiveAlerts(enabled: boolean, pollMs = 30_000) {
   const [alerts, setAlerts] = useState<ActiveAlerts | null>(null);
+  /** 最近一次读成功的时刻。界面上的数因此能说清「这是什么时候的那个数」。 */
+  const [at, setAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [ackError, setAckError] = useState<string | null>(null);
@@ -26,6 +28,7 @@ export function useActiveAlerts(enabled: boolean, pollMs = 30_000) {
     setError(null);
     try {
       setAlerts(await getActiveAlerts());
+      setAt(new Date().toISOString());
     } catch (e) {
       const err = e as { status?: number; message?: string };
       setAlerts(null);
@@ -90,5 +93,17 @@ export function useActiveAlerts(enabled: boolean, pollMs = 30_000) {
     return () => window.clearInterval(timer);
   }, [enabled, refresh, pollMs]);
 
-  return { alerts, loading, error, ackError, pendingAck, acknowledge, refresh };
+  return {
+    alerts,
+    loading,
+    error,
+    ackError,
+    pendingAck,
+    acknowledge,
+    refresh,
+    /** 这一份读数是谁给的：读的是哪个端点。 */
+    what: '活跃告警',
+    /** 最近一次读成功的时刻；没成功过就是 null，那几格不点开。 */
+    at,
+  };
 }

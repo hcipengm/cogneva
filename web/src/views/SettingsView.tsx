@@ -53,6 +53,11 @@ export function SettingsView() {
           <Empty>读不到模型状态。这一格空着，不代表没有配置。</Empty>
         ) : (
           <>
+            <Readings
+              from={{ what: llm.what, at: llm.at }}
+              source="GET /api/v1/llm/status"
+              caveat="这一格是网关问自己登记表得到的那一份：它说「配了没有、钥匙在不在」，不说「上游通不通」——通不通要真发一次请求才知道。"
+            >
             <div className="flex flex-wrap py-2">
               <Reading
                 label="已配置上游"
@@ -61,6 +66,7 @@ export function SettingsView() {
               />
               <Reading label="共登记" value={status.backends.length} />
             </div>
+            </Readings>
             {backend ? (
               <Table
                 columns={[

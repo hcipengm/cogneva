@@ -1,7 +1,7 @@
 import type { ActiveAlert } from '@/api/client';
 import { useServices } from '@/shell/context';
 import { useShell } from '@/shell/store';
-import { Button, Empty, Loading, Moment, ReadError, Reading, Status, Table, ViewFrame } from '@/ui/primitives';
+import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 
 /**
  * 告警面：正在 firing 的条件，以及「有人看过没有」。
@@ -53,6 +53,11 @@ export function AlertsView() {
         <Loading what="活跃告警" />
       ) : (
         <>
+          <Readings
+            from={{ what: reader.what, at: reader.at }}
+            source="GET /api/v1/alerts/active"
+            caveat="这一份按 30 秒重读：两格之间不会自己变。耐久源读失败时列表只剩进程内事件，那时的数回答的是「这一进程见过什么」。"
+          >
           <div className="flex flex-wrap border-b border-[var(--line)] py-2">
             <Reading label="在 firing" value={list.length} tone={list.length ? 'danger' : 'ok'} />
             <Reading label="critical" value={list.filter((a) => a.severity === 'critical').length} />
@@ -69,6 +74,7 @@ export function AlertsView() {
               tone={data?.durable_alerts_read === false ? 'warn' : 'plain'}
             />
           </div>
+          </Readings>
           {reader.ackError && (
             <div className="border-b border-[var(--line)] px-4 py-2 text-[11px] text-[var(--danger)]">
               {reader.ackError}

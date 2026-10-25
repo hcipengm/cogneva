@@ -2,10 +2,13 @@ import { useState } from 'react';
 import {
   getCollaborationGraph,
   getTaskCollaboration,
+  listTasks,
   type CollaborationLink,
   type CollaborationLinkType,
+  type TaskRow,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { openExplain } from '@/ui/explain';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 const LINK_LABELS: Record<CollaborationLinkType, string> = {
@@ -59,6 +62,84 @@ function TwoEnds({ link, onPick }: { link: CollaborationLink; onPick: (id: strin
           {link.target_task_id}
         </button>
       )}
+    </span>
+  );
+}
+
+/**
+ * 一条边的「智能体」：谁干的。
+ *
+ * 三种来路，各说各的，因为它们是三件事：
+ * - 边上记着（重启边，以及新的交接/重试/死信边）：加边那一刻谁干的。之后任务换了
+ *   人，这一格不变。
+ * - 边没记（这条边是写入者补上之前加的）：退回任务行现在的归属——交过结果的人优先，
+ *   其次是被指定的人。它答的是「这条任务现在归谁」，不是「当时谁干的」。
+ * - 都查不到：任务不在这一页的列表里，或者从没被指派。写「不知道」，不做成按钮——
+ *   点开只能说「不知道」的格子比不点更坏。
+ */
+function AgentCell({
+  link,
+  owners,
+  tasksAt,
+}: {
+  link: CollaborationLink;
+  owners: Map<string, TaskRow>;
+  tasksAt: string | null;
+}) {
+  const buttonClass =
+    'mono text-[11px] text-[var(--paper-dim)] underline decoration-dotted decoration-transparent underline-offset-4 transition-colors hover:decoration-[var(--muted)]';
+
+  if (link.agent_id) {
+    return (
+      <button
+        type="button"
+        className={buttonClass}
+        onClick={() =>
+          openExplain({
+            label: '智能体',
+            value: link.agent_id as string,
+            source: 'GET /api/v1/collaboration/graph',
+            computedAt: link.timestamp,
+            caveat:
+              '这个执行者是加边那一刻记在边上的：之后任务换了人，这一格不变。重启边记的是「谁被重启」，交接与失败边记的是「结果是谁交的／谁指定来做」。',
+          })
+        }
+      >
+        {link.agent_id}
+      </button>
+    );
+  }
+
+  const row = owners.get(link.source_task_id);
+  const current = row?.agent_id ?? row?.owner_unit ?? null;
+  if (current) {
+    return (
+      <button
+        type="button"
+        className={buttonClass}
+        onClick={() =>
+          openExplain({
+            label: '智能体（任务现在的归属）',
+            value: current,
+            source: 'GET /api/v1/tasks/list',
+            computedAt: tasksAt,
+            caveat:
+              '这条边加的时候没有带执行者（那时还没有写入者）。这里显示的是任务行现在的归属：交过结果的人优先，其次是被指定的人。任务换过人，这一格会跟着变。',
+          })
+        }
+      >
+        <span className="mr-1 text-[10px] text-[var(--muted)]">现</span>
+        {current}
+      </button>
+    );
+  }
+
+  return (
+    <span
+      className="mono text-[11px] text-[var(--muted)]"
+      title="边和它的任务都不知道执行者：任务不在这一页的列表里，或者从没被指派"
+    >
+      —
     </span>
   );
 }
@@ -153,6 +234,9 @@ function TaskLinks({ taskId, onClose }: { taskId: string; onClose: () => void })
  */
 export function CommsView() {
   const graph = useResource('交接图', getCollaborationGraph, 15_000);
+  // 任务行是「谁干的」的正本：边上有执行者就用边上的，边上没有就退回这里。
+  const tasks = useResource('任务归属', () => listTasks({ limit: 500 }), 60_000);
+  const owners = new Map((tasks.data ?? []).map((task) => [task.id, task]));
   const [picked, setPicked] = useState<string | null>(null);
 
   const stats = graph.data?.stats;
@@ -204,7 +288,9 @@ export function CommsView() {
         <p className="px-4 pb-3 text-[11px] text-[var(--muted)]">
           这张图存在网关进程的内存里：重启之后从空开始。空图不读作「没有过交接」，读作
           「这个进程还没见过一次完成或失败」。要跨重启看交接，得看任务自己的结局与任务图。
-          「智能体」那一列只有重启边有值：前三类边在加边时手上没有执行者。
+          「智能体」那一列记的是加边那一刻谁干的：重启边记「谁被重启」，交接边记「结果
+          是谁交的」，失败边记「谁把它跑挂的」。写入者补上之前加的老边没有这一格，退回任务
+          行看到的是「这条任务现在归谁」，那一格标着「现」。
         </p>
       </section>
       {graph.error ? (
@@ -225,9 +311,7 @@ export function CommsView() {
               key: 'agent',
               title: '智能体',
               width: '150px',
-              render: (l) => (
-                <span className="mono text-[11px] text-[var(--paper-dim)]">{l.agent_id ?? '—'}</span>
-              ),
+              render: (l) => <AgentCell link={l} owners={owners} tasksAt={tasks.at} />,
             },
             { key: 'at', title: '时刻', width: '110px', render: (l) => <Moment iso={l.timestamp} /> },
             {
@@ -251,9 +335,10 @@ export function CommsView() {
       )}
       {picked && <TaskLinks taskId={picked} onClose={() => setPicked(null)} />}
       <p className="px-4 py-3 text-[11px] text-[var(--muted)]">
-        智能体那一列只有重启边有值——加边的时候只有「谁被重启」是手上就有的；交接、重试、
-        死信三类边加边时没有执行者可带，那几行的这一格是空的，不是「没人干」。要知道某个
-        任务归谁，去任务面按任务 id 看它自己的行。
+        智能体那一列：边上有值的，是加边那一刻的「谁干的」；标着「现」的，是这条边没记执行者
+        时退回任务行看到的归属——交过结果的人优先，其次是被指定的人。两件事不一样，所以写法
+        不一样：前者不会因为任务后来换人而变，后者会。两者都查不到的那一格写「—」，它说的是
+        「这条边和它的任务都不知道」，不是「没人干」。
       </p>
       {stats && stats.total_links > 0 && (
         <p className="px-4 pb-3 text-[11px] text-[var(--muted)]">

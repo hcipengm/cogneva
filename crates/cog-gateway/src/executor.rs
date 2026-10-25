@@ -78,6 +78,26 @@ async fn recv_supervisor(
 /// 会把「这个任务被重来过」说成一件没发生的事；也正因为只算 Running，一个空转
 /// 的执行者被重启不会产生边——界面上「重启」为 0 说的是「没有在跑的任务被重启
 /// 打断」，不是「没有重启过执行者」。
+/// 一条边的「谁干的」：结果是谁交的（`agent_id`），没有就用「谁被指定来做」
+/// （`owner_unit`）。
+///
+/// 两列答的不是同一个问题，所以按这个顺序取：交过结果的人一定经手过，被指定的人
+/// 可能还没开工。都空就留空——把「没人指定、也没人交」写成某个默认值，会把一条
+/// 无主的边说成有主，而那一列存在的全部意义就是回答谁干的。
+pub fn owner_of_task(tasks: &[cog_core::Task], task_id: &str) -> Option<String> {
+    tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .and_then(|task| task.agent_id.clone().or_else(|| task.owner_unit.clone()))
+}
+
+/// 同一条规则，从编排器现读一遍任务图。任务行是这条信息的正本：加边的时候去读，
+/// 而不是在边上留一个空位等人事后猜。
+async fn owner_from_graph(state: &crate::GatewayState, task_id: &str) -> Option<String> {
+    let (tasks, _edges) = state.orchestrator.get_graph().await;
+    owner_of_task(&tasks, task_id)
+}
+
 pub fn tasks_interrupted_by_restart(tasks: &[cog_core::Task], agent_id: &str) -> Vec<String> {
     tasks
         .iter()
@@ -189,12 +209,16 @@ pub fn spawn_collaboration_listener(
                                                 .map(|deps| deps.into_iter().map(|t| t.id.clone()).collect())
                                                 .unwrap_or_default()
                                         };
+                                        // 交接边记的是「谁交出来的」：任务结果是谁交的
+                                        // 就写在它自己那一行上，加边时去读，而不是让
+                                        // 这一列永远是空的。
+                                        let agent_id = owner_from_graph(&state, &task_id).await;
                                         for dependent in dependents {
                                             graph.add_link(crate::collaboration::CollaborationLink {
                                                 source_task_id: task_id.clone(),
                                                 target_task_id: dependent,
                                                 link_type: crate::collaboration::CollaborationLinkType::HandOff,
-                                                agent_id: None,
+                                                agent_id: agent_id.clone(),
                                                 timestamp,
                                             }).await;
                                         }
@@ -205,11 +229,14 @@ pub fn spawn_collaboration_listener(
                                         } else {
                                             crate::collaboration::CollaborationLinkType::DeadLetter
                                         };
+                                        // 失败边记的是「谁把它跑挂的」：同一条任务行上
+                                        // 交结果的人和被指定的人，取得到哪个算哪个。
+                                        let agent_id = owner_from_graph(&state, &task_id).await;
                                         graph.add_link(crate::collaboration::CollaborationLink {
                                             source_task_id: task_id.clone(),
                                             target_task_id: task_id.clone(),
                                             link_type,
-                                            agent_id: None,
+                                            agent_id,
                                             timestamp,
                                         }).await;
                                     }
@@ -370,7 +397,7 @@ impl cog_core::TaskExecutionCallback for GatewayTaskRunner {
 
 #[cfg(test)]
 mod restart_interrupts_tests {
-    use super::tasks_interrupted_by_restart;
+    use super::{owner_of_task, tasks_interrupted_by_restart};
     use cog_core::{Task, TaskStatus, TaskType};
 
     fn task(id: &str, status: TaskStatus, agent: Option<&str>) -> Task {
@@ -393,6 +420,24 @@ mod restart_interrupts_tests {
             tasks_interrupted_by_restart(&tasks, "a1"),
             vec!["running-held".to_string()]
         );
+    }
+
+    /// 交过结果的人优先于被指定的人：两列答的不是同一个问题，而边上那一格问的是
+    /// 「谁干的」。
+    #[test]
+    fn an_edge_names_the_deliverer_before_the_designee() {
+        let mut delivered = task("done", TaskStatus::Completed, Some("deliverer"));
+        delivered.owner_unit = Some("designee".to_string());
+        let mut designated = task("queued", TaskStatus::Pending, None);
+        designated.owner_unit = Some("designee".to_string());
+        let unowned = task("unowned", TaskStatus::Pending, None);
+        let tasks = vec![delivered, designated, unowned];
+
+        assert_eq!(owner_of_task(&tasks, "done").as_deref(), Some("deliverer"));
+        assert_eq!(owner_of_task(&tasks, "queued").as_deref(), Some("designee"));
+        // 既没人指定也没人交：边上是空的，不是某个默认的「某个人」。
+        assert_eq!(owner_of_task(&tasks, "unowned"), None);
+        assert_eq!(owner_of_task(&tasks, "not-in-the-graph"), None);
     }
 
     #[test]

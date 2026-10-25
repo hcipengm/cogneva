@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { listAuditEvents, type AuditEvent } from '@/api/client';
-import { Button, Empty, Loading, Moment, ReadError, Reading, Table, ViewFrame } from '@/ui/primitives';
+import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 /**
  * 审计面：归档表里都留了什么。
@@ -26,6 +26,16 @@ function sinceIso(hours: number | null): string | undefined {
   return new Date(Date.now() - hours * 3600_000).toISOString();
 }
 
+/** 这一次查询到底是什么，写成一行给人看：端点加上真的发出去的那几个参数。 */
+function sourceOf(query: { agent_id?: string; trigger_type?: string; since?: string; limit: number }): string {
+  const params = new URLSearchParams();
+  if (query.agent_id) params.set('agent_id', query.agent_id);
+  if (query.trigger_type) params.set('trigger_type', query.trigger_type);
+  if (query.since) params.set('since', query.since);
+  params.set('limit', String(query.limit));
+  return `GET /api/v1/audit/events?${params.toString()}`;
+}
+
 function summarise(payload: unknown): string {
   if (payload === null || payload === undefined) return '—';
   if (typeof payload === 'string') return payload;
@@ -46,18 +56,30 @@ export function AuditView() {
   const [windowIndex, setWindowIndex] = useState(1);
   const [limit, setLimit] = useState<number>(100);
   const [open, setOpen] = useState<number | null>(null);
+  /** 最近一次读成功的时刻。 */
+  const [at, setAt] = useState<string | null>(null);
+  /**
+   * 屏幕上这几行是哪一次查询带回来的。
+   *
+   * 与输入框分开存：改了筛选却没按「重读」时，框里是新条件、屏上是旧结果。拿框里
+   * 的值去说这批行的来路，会把另一份读数的出处贴在这一份上。
+   */
+  const [applied, setApplied] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
+    const query = {
+      agent_id: agentId.trim() || undefined,
+      trigger_type: triggerType.trim() || undefined,
+      since: sinceIso(WINDOWS[windowIndex].hours),
+      limit,
+    };
     try {
-      const rows = await listAuditEvents({
-        agent_id: agentId.trim() || undefined,
-        trigger_type: triggerType.trim() || undefined,
-        since: sinceIso(WINDOWS[windowIndex].hours),
-        limit,
-      });
+      const rows = await listAuditEvents(query);
       setEvents(rows);
       setError(null);
+      setAt(new Date().toISOString());
+      setApplied(sourceOf(query));
     } catch (e) {
       setError((e as { message?: string }).message ?? '读取失败');
       setEvents(null);
@@ -89,12 +111,18 @@ export function AuditView() {
         </Button>
       }
     >
+      <Readings
+        from={{ what: '审计归档', at }}
+        source={applied ?? 'GET /api/v1/audit/events'}
+        caveat="这几格只数这一次查询带回来的行：窗口与条数是筛选条件，换一个窗口就是另一批行，不是「更多」。到条数上限时更早的行没读进来。"
+      >
       <div className="flex flex-wrap border-b border-[var(--line)] py-2">
         <Reading label="这一段留档" value={rows.length} />
         <Reading label="触发类型" value={triggers.length} note={triggers.slice(0, 3).join(' · ')} />
         <Reading label="带智能体的" value={rows.filter((row) => row.agent_id).length} />
         <Reading label="带任务的" value={rows.filter((row) => row.task_id).length} />
       </div>
+      </Readings>
 
       <div className="flex flex-wrap items-center gap-2 border-b border-[var(--line)] px-4 py-2">
         <input

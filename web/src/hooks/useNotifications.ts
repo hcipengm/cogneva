@@ -22,6 +22,8 @@ const MAX_ITEMS = 200;
  */
 export function useNotifications(enabled: boolean, pollMs = 60_000) {
   const [page, setPage] = useState<NotificationPage | null>(null);
+  /** 最近一次读成功的时刻；推送进来的增量不移动它，它说的是「列表这一份」的出处。 */
+  const [at, setAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const seenIds = useRef<Set<string>>(new Set());
@@ -33,6 +35,7 @@ export function useNotifications(enabled: boolean, pollMs = 60_000) {
       const next = await listNotifications();
       seenIds.current = new Set(next.items.map((n) => n.id));
       setPage(next);
+      setAt(new Date().toISOString());
     } catch (e) {
       const err = e as { status?: number; message?: string };
       setPage(null);
@@ -108,6 +111,10 @@ export function useNotifications(enabled: boolean, pollMs = 60_000) {
     receive,
     markRead,
     markAllRead,
+    /** 这一份读数是谁给的：读的是哪个端点。 */
+    what: '通知',
+    /** 列表这一份最近一次读成功的时刻；推送进来的增量不移动它。 */
+    at,
   };
 }
 

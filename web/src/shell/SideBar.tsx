@@ -397,10 +397,13 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             <Row label="重试" note="失败，还会再跑一次" tone="var(--warn)" />
             <Row label="死信" note="失败，不再重试" tone="var(--danger)" />
             <Row label="重启" note="执行者被重启时手上有任务" />
+            <Row label="智能体" note="交接/失败边记谁干的，重启边记谁被重启" />
             <Note>
               图在网关进程的内存里，重启即空。空图是「这个进程还没见过一次完成」，
               不是「没有过交接」。空转的执行者被重启不产生边，所以「重启」为 0 不是
-              「没重启过」。
+              「没重启过」。智能体那一格标「现」的，是这条边没记执行者时退回任务行
+              看到的归属——它答「现在归谁」，不是「当时谁干的」，点开能看到这一格的
+              来路与边界。
             </Note>
           </Section>
           <CrossLinks

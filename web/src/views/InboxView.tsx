@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { NotificationItem } from '@/api/client';
 import { useServices } from '@/shell/context';
 import { useShell } from '@/shell/store';
-import { Button, Empty, Loading, Moment, ReadError, Reading, ViewFrame } from '@/ui/primitives';
+import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, ViewFrame } from '@/ui/primitives';
 
 /**
  * 收件箱：平台发给你的话。
@@ -56,6 +56,11 @@ export function InboxView() {
         <Loading what="通知" />
       ) : (
         <>
+          <Readings
+            from={{ what: notifications.what, at: notifications.at }}
+            source="GET /api/v1/notifications"
+            caveat="列表这一份按 60 秒重读，推送进来的增量不等轮询；这一格的时刻是列表那一次读的，不是最后一条到达的时刻。"
+          >
           <div className="flex flex-wrap border-b border-[var(--line)] py-2">
             <Reading
               label="未读"
@@ -65,6 +70,7 @@ export function InboxView() {
             <Reading label="已收" value={notifications.items.length} />
             <Reading label="这一屏" value={items.length} note={unreadOnly ? '只看未读' : '全部'} />
           </div>
+          </Readings>
           <InboxList
             items={items}
             unreadCount={notifications.unreadCount}
