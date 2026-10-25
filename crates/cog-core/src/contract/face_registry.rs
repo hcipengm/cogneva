@@ -610,23 +610,38 @@ pub fn observe(observation: FaceObservation<'_>) -> FaceDriftReading {
         // to `on_target` whenever the owner held work -- a green verdict for an
         // owner nobody can see. All three stay in the closed set, and `detail`
         // says which one fired.
-        if !working {
+        //
+        // Which one is named is decided by repair order, not by which test is
+        // cheapest to reach. A standing work row whose owner the registry does
+        // not know is released on the next drift pass -- an owner that is gone
+        // cannot keep work -- so "no open task is bound to the owner" is what
+        // an absent owner looks like one pass later. Naming that first sends
+        // the reader to assign work, the next pass takes the row away again,
+        // and the one repair that holds (bring the owner back, or move the
+        // face) is never printed. So the absence goes first, and
+        // `no_bound_task` keeps exactly the meaning that is actionable on its
+        // own: the owner is here and has nothing to do.
+        let stale_heartbeat = match observation.owner_liveness {
+            OwnerLiveness::Seen(seen) => (now - seen).num_seconds() >= OWNER_IDLE_AFTER_SECS,
+            _ => false,
+        };
+        if observation.owner_liveness == OwnerLiveness::Unknown {
             yellow.push(DriftState::OwnerIdle.as_str().to_string());
-            detail = Some("no open task on this face is bound to its owner".into());
-            cause = Some("no_bound_task".into());
-        } else if let OwnerLiveness::Seen(seen) = observation.owner_liveness {
-            if (now - seen).num_seconds() >= OWNER_IDLE_AFTER_SECS {
-                yellow.push(DriftState::OwnerIdle.as_str().to_string());
+            detail = Some("the owner is not a unit the heartbeat registry knows".into());
+            cause = Some("unknown_unit".into());
+        } else if stale_heartbeat {
+            yellow.push(DriftState::OwnerIdle.as_str().to_string());
+            if let OwnerLiveness::Seen(seen) = observation.owner_liveness {
                 detail = Some(format!(
                     "the owner's last heartbeat is {}s old",
                     (now - seen).num_seconds()
                 ));
-                cause = Some("heartbeat_old".into());
             }
-        } else if observation.owner_liveness == OwnerLiveness::Unknown {
+            cause = Some("heartbeat_old".into());
+        } else if !working {
             yellow.push(DriftState::OwnerIdle.as_str().to_string());
-            detail = Some("the owner is not a unit the heartbeat registry knows".into());
-            cause = Some("unknown_unit".into());
+            detail = Some("no open task on this face is bound to its owner".into());
+            cause = Some("no_bound_task".into());
         }
     }
 
@@ -1376,6 +1391,42 @@ mod tests {
             .unwrap_or_default()
             .contains("heartbeat"));
         assert_eq!(reading.cause.as_deref(), Some("heartbeat_old"));
+    }
+
+    #[test]
+    fn an_absent_owner_is_named_even_when_no_work_is_bound_to_the_face() {
+        // The drift pass releases a standing row whose owner the registry does
+        // not know, so "no open task is bound to the owner" is what an absent
+        // owner looks like one pass later. Reporting that there instead of the
+        // absence sends the reader to assign work, which the next pass takes
+        // away again, and keeps `owner_idle_stuck` -- the reader's escalation
+        // for exactly this -- from ever starting its clock.
+        let face = face(Some("unit-operator"));
+        for (liveness, expected) in [
+            (OwnerLiveness::Unknown, "unknown_unit"),
+            (
+                OwnerLiveness::Seen(
+                    Utc::now() - chrono::Duration::seconds(OWNER_IDLE_AFTER_SECS + 1),
+                ),
+                "heartbeat_old",
+            ),
+        ] {
+            let reading = observe(FaceObservation {
+                face_id: "task-management",
+                face: Some(&face),
+                open_tasks: &[],
+                signed_handovers: &[],
+                measured_owner: None,
+                owner_liveness: liveness,
+                now: Utc::now(),
+            });
+            assert_eq!(reading.state, DriftState::OwnerIdle);
+            assert_eq!(
+                reading.cause.as_deref(),
+                Some(expected),
+                "with no bound work, an absent owner still has to be named"
+            );
+        }
     }
 
     #[test]
