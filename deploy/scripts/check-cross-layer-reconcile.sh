@@ -23,7 +23,12 @@
 #      部署器要建的那个 Job 的声明上限（从 live 的 evolution ConfigMap 读）。`used`
 #      记的是**所有非终态 Pod**，包括渲染期清单之外、运行时按需建的那些（评测表、
 #      验收演练）；渲染期门禁只把声明的工作负载加进它的和，所以它能一路绿着而准入
-#      已经在拒人。这一条就是把那个差摆出来。
+#      已经在拒人。这一条就是把那个差摆出来。第二个加数是滚动重叠（`maxSurge ≥ 1`
+#      时新旧 Pod 同时占着配额），但**只有还没飞的那几份要加**：一次在飞的滚动已经
+#      把多出来的 Pod 记进了 `used`，再加一遍就会在每次滚动的头几分钟里报「下一次
+#      滚动会被拒」——而那一次恰恰刚被准入。在飞几份是沿 Pod → ReplicaSet →
+#      Deployment 的所有者链数出来的（正被删除、仍占着配额的 Pod 也算），读不到就
+#      按未滚动计并在判词里点名。
 #   4. live 的治理对象 == 树内声明的那一份：ResourceQuota 的 `spec.hard` 与
 #      LimitRange 的上下限逐字段相等，声明里 `cogneva.io/*` 的注解在 live 上同名同值。
 #      这一条不是「装得下」，是「集群上跑的到底是不是这棵树」——前三条可以在
@@ -136,11 +141,14 @@ DECLARED_DIR="${COGNEVA_RECONCILE_DECLARED:-${REPO_ROOT}/deploy/rendered/${COGNE
 # 准入面上另一只治理对象。读不到时判据 4 点名，不在这里整条退出。
 ${KUBECTL} -n "${NS}" get limitrange -o json \
     >"${work}/limitranges.json" 2>"${work}/limitranges.err" || true
-# --converge 的第二个测量输入：正在跑的 Pod。只在要写集群的那条路径上读它——
-# 只读模式不需要，而多一次集群读就是多一次可能失败的东西。
-if [ "${converge}" = 1 ]; then
-    ${KUBECTL} -n "${NS}" get pods -o json >"${work}/pods.json" 2>"${work}/pods.err" || true
-fi
+# 正在跑的 Pod 与它们的所有者链。两个用处：`--converge` 用它判「收窄之后还装不装得下
+# 在跑的容器」；判据 3 用它判「此刻有没有一次滚动正飞着」——一次在飞的滚动已经把多出来
+# 的那个 Pod 记进了配额的 used，再按声明把整份滚动的重叠加一遍就会在每次滚动的头几分钟
+# 里报「下一次滚动会被拒」，而那一次恰恰已经被准入。读不到不在整条退出：判据 3 退回
+# 「按未滚动计」（那个方向偏红，不偏绿），并在判词上点名退回了。
+${KUBECTL} -n "${NS}" get pods -o json >"${work}/pods.json" 2>"${work}/pods.err" || true
+${KUBECTL} -n "${NS}" get replicasets -o json \
+    >"${work}/replicasets.json" 2>"${work}/replicasets.err" || true
 
 # ---- 物理面：Prometheus 端点 ----
 PROM_URL="${COGNEVA_PROMETHEUS_URL:-}"
@@ -314,6 +322,10 @@ for res, total in (('cpu', sum_cpu), ('memory', sum_mem)):
 # 而不是求和：部署器一次只滚一个，求和会把并发当常态，把余量报得比真实的小。
 surge_overlap = {}
 surge_actor = {}
+# 每个资源那一份重叠是谁出的、出几份、每份多大：判据 3 要拿它去问「这几份此刻是不是
+# 已经在 used 里了」。只留最大值是因为一次只滚一个工作负载。
+surge_detail = {}
+declared_replicas = {}
 try:
     import glob
     import yaml
@@ -334,6 +346,7 @@ else:
                         continue
                     repl = spec.get('replicas', 1)
                     repl = 1 if not isinstance(repl, int) else repl
+                    declared_replicas[d['metadata']['name']] = repl
                     raw = (strategy.get('rollingUpdate') or {}).get('maxSurge', '25%')
                     if isinstance(raw, int):
                         extra = raw
@@ -368,8 +381,39 @@ else:
                         if add > surge_overlap.get(res, 0.0):
                             surge_overlap[res] = add
                             surge_actor[res] = f"{d['metadata']['name']}(+{extra})"
+                            surge_detail[res] = (d['metadata']['name'], extra, per)
     except (OSError, ValueError) as e:
         unreadable.append(f"读不出树内声明里的滚动重叠（{declared_dir}）：{e}")
+
+# 此刻每个 Deployment 名下有几个非终态 Pod（含正被删除、仍占着配额的那一个）。
+# 「比它要的副本多几个」＝这几份重叠已经在 used 里，判据 3 不该再加一遍。
+# 所有者链是 Pod → ReplicaSet → Deployment：Pod 直接挂的是 ReplicaSet，所以要多读一族。
+def live_pod_counts():
+    try:
+        pods_doc = read('pods.json')
+        rs_doc = read('replicasets.json')
+    except (OSError, ValueError):
+        return None
+    rs_owner = {}
+    for rs in rs_doc.get('items') or []:
+        rs_name = (rs.get('metadata') or {}).get('name')
+        for ref in (rs.get('metadata') or {}).get('ownerReferences') or []:
+            if ref.get('kind') == 'Deployment' and rs_name:
+                rs_owner[rs_name] = ref.get('name')
+    counts = {}
+    for pod in pods_doc.get('items') or []:
+        if (pod.get('status') or {}).get('phase') in ('Succeeded', 'Failed'):
+            continue
+        for ref in (pod.get('metadata') or {}).get('ownerReferences') or []:
+            if ref.get('kind') != 'ReplicaSet':
+                continue
+            dep = rs_owner.get(ref.get('name'))
+            if dep:
+                counts[dep] = counts.get(dep, 0) + 1
+    return counts
+
+
+live_counts = live_pod_counts()
 
 # ---- 判据 3：准入余量 ≥ 部署器下一次滚动 Job ＋ 滚动重叠 ----
 # used 记的是所有非终态 Pod（含运行时按需建的那些），所以这个差问的是「下一次要建
@@ -402,8 +446,26 @@ else:
         rollout_job[label] = job
         surge = surge_overlap.get(res, 0.0)
         surge_who = surge_actor.get(res, '')
-        surge_note = f" + 滚动重叠 {show(res, surge)}（{surge_who}）" if surge else ''
-        if h - u < job + surge:
+        # 声明里那份重叠有多少此刻已经在飞：在飞的那几份已经记在 used 里了。
+        # 读不到 Pod 的归属就按「一份都还没飞」计——照旧把整份重叠加满，偏红不偏绿。
+        actor, extra, per = surge_detail.get(res, ('', 0, 0.0))
+        present = 0
+        if actor and live_counts is not None:
+            present = max(0, live_counts.get(actor, 0) - declared_replicas.get(actor, 0))
+            present = min(present, extra)
+        charged = (extra - present) * per if actor else 0.0
+        surge_note = ''
+        if charged:
+            surge_note = f" + 滚动重叠 {show(res, charged)}（{surge_who}"
+            if present:
+                surge_note += f"，其中 {present} 份已在 used 里"
+            if live_counts is None:
+                surge_note += "，读不到 Pod 的归属，按未滚动计"
+            surge_note += "）"
+        elif surge and present:
+            surge_note = (f"（滚动重叠 {show(res, surge)} 已在 used 里：{surge_who} 的"
+                          f" {present} 份正飞着，不再加一遍）")
+        if h - u < job + charged:
             problems.append(
                 f"判据3 {label}：used {show(res, u)} + 部署器滚动 Job {show(res, job)}"
                 f"{surge_note} > 配额 {show(res, h)}——下一次滚动在准入就被拒，"
@@ -412,7 +474,7 @@ else:
         else:
             print(f"  判据3 {label}: used {show(res, u)} + 滚动 Job {show(res, job)}"
                   f"{surge_note} ≤ 配额 {show(res, h)}  ✓"
-                  f"（装下这两笔之后的余量 {show(res, h - u - job - surge)}）")
+                  f"（装下这两笔之后的余量 {show(res, h - u - job - charged)}）")
 
 # 有 anon 或 file 样本、但 node-exporter 没报这个节点 MemTotal 的：判据 2 的分母不在，
 # 这个节点会被下面的循环整个跳过 —— 跳过与成立在读出来的那一行上长得一样，所以在这里点名。

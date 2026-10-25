@@ -26,7 +26,12 @@
 #  19. --converge 但树内声明低于此刻用量 -> 1，不写；
 #  20. --converge 但 LimitRange 上限低于在跑 Pod 的 limit -> 1，不写；
 #  21. --converge 但本拍有判据读不到 -> 2，不写；
-#  22. 不带 --converge -> 1，只报差、不写（默认只读）。
+#  22. 不带 --converge -> 1，只报差、不写（默认只读）；
+#  24. maxSurge=1 的工作负载、此刻没有在飞的滚动 -> 1，整份重叠加进去装不下；
+#  23. 同一条声明、live 上已经两个 Pod（一个正被删除、仍占配额）-> 0，那份重叠
+#      已经记在 used 里，不再加一遍（否则每次滚动的头几分钟都在报「会被拒」）；
+#  25. ReplicaSet 那族读不到 -> 1 且点名「读不到 Pod 的归属」：退回按未滚动计，
+#      偏红不偏绿，缺席读不成「一份都没飞」。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,6 +65,7 @@ case " $* " in
             cat "${scen}/limitranges.json"
         fi ;;
     *" get pods "*)          cat "${scen}/pods.json" ;;
+    *" get replicasets "*)   cat "${scen}/replicasets.json" ;;
     *" get nodes "*)         cat "${scen}/nodes.json" ;;
     *" get configmap "*)     cat "${scen}/evcfg.json" ;;
     *" get svc "*)           echo "10.0.0.1" ;;
@@ -161,6 +167,8 @@ state = {
     # --converge 的第二个测量输入。默认没有还在跑的 Pod：LimitRange 的最大/最小
     # 对空集总是成立，所以「装不下」的用例必须自己放一个 Pod 进来。
     "pods": {"items": []},
+    # 判据 3 数「在飞几份」要 Pod → ReplicaSet → Deployment 的所有者链。
+    "replicasets": {"items": []},
     "prom": {
         "anon": [{"metric": {"node": "cogneva", "slice": "user.slice"},
                   "value": [0, str(int(4.31 * Gi))]},
@@ -178,7 +186,7 @@ state = {
 
 exec(mutation, {"state": state, "Gi": Gi, "Mi": Mi})
 
-for key in ("quota", "nodes", "prom", "evcfg", "limitranges", "pods"):
+for key in ("quota", "nodes", "prom", "evcfg", "limitranges", "pods", "replicasets"):
     with open(os.path.join(out, key + ".json"), "w", encoding="utf-8") as f:
         json.dump(state[key], f)
 
@@ -519,4 +527,47 @@ COGNEVA_RECONCILE_DECLARED="${scen}/declared" \
 [ ! -e "${rec}" ] || fail "record-off: 没带 --record 却写了序列：$(cat "${rec}")"
 echo "ok   record-off：不带 --record 时一个字节也不写"
 
-echo "cross-layer-reconcile: 27 passed"
+# 23/24. 判据 3 的滚动重叠只加「还没飞的那几份」。
+# 一个 maxSurge=1 的单副本工作负载，一次滚动要一整份上限的重叠（例如 12Gi）；
+# 配额余量装得下它、
+# 装不下「再叠一次」。区别只在 live 上此刻是不是已经有两个 Pod。
+DEPLOY_SURGE='
+state["declared"]["Deployment"] = {
+    "apiVersion": "apps/v1", "kind": "Deployment",
+    "metadata": {"name": "cogneva", "namespace": "cogneva"},
+    "spec": {"replicas": 1,
+             "strategy": {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 1}},
+             "template": {"spec": {"containers": [{
+                 "name": "cogneva",
+                 "resources": {"limits": {"cpu": "4", "memory": "12Gi"}}}]}}}}
+'
+# 24. 没有在飞的滚动：整份重叠都要加，装不下 -> 红。
+expect surge-not-inflight 1 "滚动重叠" "${DEPLOY_SURGE}"
+# 23. 同一条声明，live 上已经有两个 Pod（一个正被删除、仍占着配额）：那份重叠已经
+#     记在 used 里，再加一遍就是把自己刚通过的准入报成「会被拒」-> 绿，并点名它已计入。
+expect surge-inflight 0 "已在 used 里" "${DEPLOY_SURGE}"'
+deploy = state["declared"]["Deployment"]["metadata"]["name"]
+state["replicasets"]["items"] = [{"metadata": {"name": "cogneva-abc",
+                                               "namespace": "cogneva",
+                                               "ownerReferences": [
+                                                   {"kind": "Deployment", "name": deploy}]}}]
+for suffix, phase in (("old", "Running"), ("new", "Running")):
+    state["pods"]["items"].append({
+        "metadata": {"name": "cogneva-abc-" + suffix, "namespace": "cogneva",
+                     "ownerReferences": [{"kind": "ReplicaSet", "name": "cogneva-abc"}]},
+        "status": {"phase": phase}})
+'
+printf '%s' "${LAST_OUT}" | grep -Fq "滚动重叠 12.00Gi 已在 used 里" \
+    || fail "surge-inflight: 判词没说清那 12Gi 已在 used 里；输出：${LAST_OUT}"
+
+# 25. 读不到所有者链（ReplicaSet 那族读不到）：退回「按未滚动计」，照旧加满重叠、
+#     偏红不偏绿，并在判词里点名退回了——缺席不能读成「一份都没飞」的绿。
+scen="$(make_scenario surge-unreadable "${DEPLOY_SURGE}")"
+rm -f "${scen}/replicasets.json"
+run_gate "${scen}"
+[ "${RC}" -eq 1 ] || fail "surge-unreadable: 期望退出码 1，实得 ${RC}；输出：${LAST_OUT}"
+printf '%s' "${LAST_OUT}" | grep -Fq "读不到 Pod 的归属" \
+    || fail "surge-unreadable: 判词没有点名退回；输出：${LAST_OUT}"
+echo "ok   surge-unreadable：所有者链读不到时按未滚动计，并点名退回了"
+
+echo "cross-layer-reconcile: 30 passed"
