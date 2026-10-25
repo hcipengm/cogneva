@@ -17,7 +17,8 @@ spec:
   # The old shape (maxSurge 0, maxUnavailable 1) took the only pod down before
   # starting its replacement, and its reason — "a surging pod has nowhere to be
   # scheduled" — was the 4C/7.5G host this ran on before 2026-09-24. The node is
-  # 24C/62GiB now and asks for 3.6 of 23.8 cores, so the request fits. Measured
+  # 24C/62GiB on this host (measured 2026-10-25) and asks for 3.6 of 23.8 cores,
+  # so the request fits. Measured
   # cost of the old shape on 2026-10-25: the replacement crash-looped twice on a
   # cold vector store and the whole HTTP surface was gone for about five
   # minutes — the old pod would have served throughout.
