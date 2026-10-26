@@ -2407,6 +2407,10 @@ fn wal_record_to_agent_event(
             "resource_alert" => "resource_alert",
             "heartbeat" => "heartbeat",
             "checkpoint_saved" => "checkpoint_saved",
+            // 这一种到今天仍然按自定义名字写盘：一次资源改动没有 agent、没有 task，
+            // `WalEventType` 里也没有对应变体。名字不在这张表上，写进去的每一行
+            // 都会在重放时被当成坏记录跳过——巡检看不见「这个前缀什么时候被改过」。
+            "resource_changed" => "resource_changed",
             _ => {
                 return Err(serde::de::Error::custom(format!(
                     "cannot replay custom WAL event: {name}"

@@ -31,6 +31,11 @@ use std::time::Duration;
 /// 「短间隔 × 多次」而不是一个总墙。
 const KUBECONFIG_READY_ATTEMPTS: usize = 30;
 
+/// 引导器据以定位仓库根的变量名。三条子命令各读一次，名字写在这里一次：
+/// 写两遍时改一处不会报错，另一处会读到一个再没人设置的名字，然后退回 `.`，
+/// 读出来的是进程当前目录而不是仓库。
+const REPO_ROOT_ENV: &str = "COGNEVA_REPO_ROOT";
+
 /// 上面那组里的间隔：2s 一次，短到快机器不必为这一次探测多等。
 const KUBECONFIG_READY_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -644,7 +649,7 @@ async fn node_io_subcommand() -> Result<()> {
 /// disabled renders no such object, so "nothing to apply" and "applied" would
 /// otherwise print the same success while the cluster stayed untouched.
 async fn governance_subcommand() -> Result<()> {
-    let repo_root = std::env::var("COGNEVA_REPO_ROOT").unwrap_or_else(|_| ".".into());
+    let repo_root = std::env::var(REPO_ROOT_ENV).unwrap_or_else(|_| ".".into());
     let profile = match std::env::var("COGNEVA_GOVERNANCE_PROFILE") {
         Ok(name) if !name.trim().is_empty() => name.trim().to_string(),
         _ => {
@@ -1284,7 +1289,7 @@ fn rendered_manifest_dir(profile: Profile) -> PathBuf {
 }
 
 fn repo_root() -> PathBuf {
-    PathBuf::from(std::env::var("COGNEVA_REPO_ROOT").unwrap_or_else(|_| ".".to_string()))
+    PathBuf::from(std::env::var(REPO_ROOT_ENV).unwrap_or_else(|_| ".".to_string()))
 }
 
 /// 探测集群是否 K3s 发行版：节点 label node.kubernetes.io/instance-type=k3s
@@ -3599,7 +3604,7 @@ async fn main() -> Result<()> {
     // 预编译路径：引导器自带全部部署资产，解包后把 repo_root 指向解包目录。
     // 两种情况保持磁盘源码树优先：bootstrap.sh 源码构建会显式 export
     // COGNEVA_REPO_ROOT；开发者在仓库根直接运行时 cwd 下就是 deploy/。
-    if std::env::var("COGNEVA_REPO_ROOT").is_err()
+    if std::env::var(REPO_ROOT_ENV).is_err()
         && !Path::new("deploy/helm/cogneva/Chart.yaml").is_file()
     {
         let assets = materialize_assets()?;
@@ -3660,7 +3665,7 @@ async fn main() -> Result<()> {
 
     // k8m 管理计划（审计 2.5.2/2.5.3）：统一声明式部署计划 + backend 自动选择。
     let plan = cogneva_bootstrap::ManagementPlan::for_environment(
-        std::env::var("COGNEVA_ENV").unwrap_or_else(|_| "default".into()),
+        std::env::var(cog_core::env::RUN_ENV).unwrap_or_else(|_| "default".into()),
         &cogneva_bootstrap::HardwareProfile {
             memory_gb: (hw.mem_total_mb / 1024).max(1),
             cpu_cores: hw.cpu_cores as u32,

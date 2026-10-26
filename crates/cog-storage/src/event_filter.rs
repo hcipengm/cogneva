@@ -133,8 +133,14 @@ mod tests {
     use cog_core::{AgentEvent, AssistantMessageEvent, ErrorSeverity, Message, ToolCall};
     use serde_json::json;
 
-    /// One of every variant. Kept as a plain function rather than a list of
-    /// literals so the compiler catches a variant added without a specimen.
+    /// One of every variant.
+    ///
+    /// Nothing here makes the compiler notice a variant added without a
+    /// specimen — this list sat at nineteen of twenty for as long as
+    /// `ResourceChanged` has existed, so the "every event" test below never
+    /// actually covered it. What does catch it is the exhaustive `match` in
+    /// `event_type_name`, which refuses to compile until a new variant has an
+    /// arm; the moment someone adds that arm, add the line here too.
     fn one_of_each() -> Vec<AgentEvent> {
         let now = Utc::now();
         let message = Message::user("x");
@@ -271,6 +277,10 @@ mod tests {
                 task_id: "t".into(),
                 crew_id: None,
                 squad_id: None,
+                timestamp: now,
+            },
+            AgentEvent::ResourceChanged {
+                domain: "settings".into(),
                 timestamp: now,
             },
         ]
