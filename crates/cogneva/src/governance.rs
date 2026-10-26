@@ -26,7 +26,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use cog_core::{
-    Face, FaceImportOutcome, FaceKind, FaceSpec, GovernanceStore, StateBackend, Task, TaskStatus,
+    Face, FaceImportOutcome, FaceKind, FaceSpec, GovernanceStore, Handover, StateBackend, Task,
+    TaskStatus, HANDOVER_TASK_TYPE,
 };
 use cog_storage::{PostgresGovernanceStore, PostgresStateBackend, RedisAgentRegistry};
 
@@ -551,7 +552,37 @@ async fn project(
         })
         .collect();
 
+    // An owner that neither the roster nor a signed move accounts for is the
+    // one thing this file could show and would otherwise hide. The column
+    // holds a bare unit name, so a reader comparing it with the roster sees a
+    // difference with no reason beside it, and the graph cannot be asked --
+    // only the pair (what the file said, which handover moved it) can answer.
+    // Written into the header rather than a column because it is a statement
+    // about the set of rows, not about any one of them.
+    let handovers: Vec<Handover> = store
+        .governance_nodes(HANDOVER_TASK_TYPE)
+        .await?
+        .iter()
+        .filter_map(Handover::from_task)
+        .collect();
+    let unexplained = cog_orchestrator::face_drift::owners_no_act_explains(
+        &faces,
+        &cog_orchestrator::face_drift::RecordedMove::from_handovers(&handovers),
+    );
+
     let mut faces_tsv = String::from(&stamp);
+    faces_tsv.push_str(&format!(
+        "# owners_no_act_explains: {}\n",
+        unexplained.len()
+    ));
+    for row in &unexplained {
+        faces_tsv.push_str(&format!(
+            "# unexplained_owner: face={} owner={} roster_said={}\n",
+            row.face_id,
+            row.owner_unit,
+            row.roster_said.as_deref().unwrap_or("-"),
+        ));
+    }
     faces_tsv.push_str(&render_roster(&projected));
 
     let mut drift_tsv = String::from(&stamp);
@@ -624,12 +655,14 @@ async fn project(
     std::fs::write(out.join("tasks.tsv"), tasks_tsv)?;
     println!(
         "wrote faces.tsv, drift.tsv, decisions.tsv and tasks.tsv at {} \
-         (faces={}, decisions={}, open_tasks={}, source_revision={})",
+         (faces={}, decisions={}, open_tasks={}, source_revision={}, \
+         owners_no_act_explains={})",
         now.to_rfc3339(),
         faces.len(),
         decisions.len(),
         open_tasks.len(),
-        revision
+        revision,
+        unexplained.len()
     );
     Ok(())
 }

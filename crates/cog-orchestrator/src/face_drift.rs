@@ -37,8 +37,8 @@ use tracing::{info, warn};
 
 use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::{
-    AgentRegistry, DriftState, FaceDriftReading, GovernanceStore, OrchestratorControl, OwnerSource,
-    SFResult, Task,
+    AgentRegistry, DriftState, Face, FaceDriftReading, GovernanceStore, Handover, HandoverState,
+    OrchestratorControl, OwnerSource, SFResult, Task,
 };
 
 /// The loop's name in the health registry.
@@ -191,6 +191,95 @@ pub fn placement_for(preferred: Option<&str>, live: &[String]) -> WorkPlacement 
         return WorkPlacement::Stranded;
     }
     WorkPlacement::Release
+}
+
+/// One handover reduced to the three facts this rule reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedMove {
+    pub face_id: String,
+    pub to_unit: String,
+    pub state: HandoverState,
+}
+
+impl RecordedMove {
+    /// Every handover row, as moves. Nothing is filtered here: whether a state
+    /// can explain an owner is the rule's question, not the caller's, and a
+    /// caller that filtered would be a second copy of the rule.
+    pub fn from_handovers(handovers: &[Handover]) -> Vec<Self> {
+        handovers
+            .iter()
+            .map(|handover| Self {
+                face_id: handover.spec.face_id.clone(),
+                to_unit: handover.spec.to_unit.clone(),
+                state: handover.state(),
+            })
+            .collect()
+    }
+}
+
+/// A face whose owner neither the roster nor any signed move accounts for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnexplainedOwner {
+    pub face_id: String,
+    pub owner_unit: String,
+    /// What the roster recorded the last time the row was imported. `None`
+    /// when it recorded nothing, which is itself a gap and not an excuse.
+    pub roster_said: Option<String>,
+}
+
+/// Faces whose owner came from neither the roster nor a signed handover.
+///
+/// The graph stores an owner as a bare unit name, and every reader of it --
+/// the projection, the face reading, a person comparing the two trees -- has
+/// to answer "why this unit" from the name alone. Two things can put a name
+/// there legitimately: an import that applied the roster, which leaves its own
+/// copy of what the file said in `source_fronts`, and a handover that moved
+/// the face, which leaves a row naming the unit it moved to. A row that
+/// matches neither is a move nobody recorded: the shape a name written
+/// straight into the graph has, and the one shape no other reading can tell
+/// apart from a legitimate one.
+///
+/// Which handover counts is part of the rule, not a detail for the caller:
+/// same face, `to_unit` equal to the owner, and a state that is signed or
+/// applied. A withdrawn or expired row explains nothing even though it still
+/// exists, and a draft explains nothing because nobody has agreed to it yet.
+///
+/// Revision is deliberately not consulted. A row at revision one whose owner
+/// matches nothing looks exactly like one whose owner was set by an import,
+/// and using revision as an exemption would read every direct write as green
+/// the moment it stayed at revision one -- which is what a direct write does.
+pub fn owners_no_act_explains(faces: &[Face], moves: &[RecordedMove]) -> Vec<UnexplainedOwner> {
+    let agreed: std::collections::HashSet<(&str, &str)> = moves
+        .iter()
+        .filter(|mov| matches!(mov.state, HandoverState::Signed | HandoverState::Applied))
+        .map(|mov| (mov.face_id.as_str(), mov.to_unit.as_str()))
+        .collect();
+    let mut out: Vec<UnexplainedOwner> = faces
+        .iter()
+        .filter_map(|face| {
+            let owner = face.owner_unit.as_deref()?;
+            let roster_said = face
+                .spec
+                .source_fronts
+                .as_deref()
+                .and_then(|fronts| fronts.split('/').next())
+                .map(str::trim)
+                .filter(|unit| !unit.is_empty() && *unit != "-");
+            if roster_said == Some(owner) {
+                return None;
+            }
+            if agreed.contains(&(face.face_id.as_str(), owner)) {
+                return None;
+            }
+            Some(UnexplainedOwner {
+                face_id: face.face_id.clone(),
+                owner_unit: owner.to_string(),
+                roster_said: roster_said.map(str::to_string),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.face_id.cmp(&b.face_id));
+    out
 }
 
 /// Put each face's unstarted work back where it can be picked up, and give it
@@ -477,7 +566,7 @@ impl Observable for FaceDriftObservable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cog_core::{DriftState, TaskStatus};
+    use cog_core::{DriftState, FaceKind, FaceSpec, TaskStatus};
 
     #[test]
     fn the_goal_id_is_stable_within_a_day_and_changes_with_it() {
@@ -762,5 +851,93 @@ mod tests {
         assert!(text.contains("security"));
         assert!(text.contains("vacancy_expired"));
         assert!(text.contains("on_target"));
+    }
+
+    /// A face node as the graph holds it: an owner, and the roster's own copy
+    /// of what it said the last time the row was imported.
+    fn owned(face_id: &str, owner: Option<&str>, roster_said: Option<&str>) -> Face {
+        let mut spec = FaceSpec::first(face_id, FaceKind::Face);
+        spec.source_fronts = roster_said.map(str::to_string);
+        Face {
+            face_id: face_id.to_string(),
+            owner_unit: owner.map(str::to_string),
+            bound_by_handover_id: None,
+            spec,
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn mov(face_id: &str, to_unit: &str, state: HandoverState) -> RecordedMove {
+        RecordedMove {
+            face_id: face_id.to_string(),
+            to_unit: to_unit.to_string(),
+            state,
+        }
+    }
+
+    /// The shape measured on 2026-10-26: three faces whose owner matches
+    /// neither the roster's copy nor any handover, sitting beside a face that
+    /// moved by signed handover. All four have a name in the owner column, so
+    /// nothing else in the reading tells them apart.
+    #[test]
+    fn an_owner_no_act_explains_is_named_and_a_handed_over_one_is_not() {
+        let faces = vec![
+            owned("任务管理", Some("f5"), Some("operator/8b2")),
+            owned("写操作窗口", Some("f5"), None),
+            owned("可评估", Some("f5"), None),
+            owned("通信", Some("f5"), Some("worker/-")),
+        ];
+        let moves = vec![mov("通信", "f5", HandoverState::Applied)];
+
+        let unexplained = owners_no_act_explains(&faces, &moves);
+
+        assert_eq!(
+            unexplained
+                .iter()
+                .map(|row| row.face_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["任务管理", "写操作窗口", "可评估"],
+            "the three faces no record explains are exactly the ones reported"
+        );
+        assert_eq!(unexplained[0].roster_said.as_deref(), Some("operator"));
+        assert_eq!(
+            unexplained[1].roster_said, None,
+            "a roster that recorded nothing is a gap to report, not an excuse"
+        );
+    }
+
+    /// The reverse control: without it, a rule that reported every face whose
+    /// owner differs from the roster would pass the test above while crying
+    /// wolf on every ordinary import.
+    #[test]
+    fn an_owner_the_roster_itself_names_is_explained() {
+        let faces = vec![owned("变更管理", Some("worker"), Some("worker/-"))];
+        assert!(owners_no_act_explains(&faces, &[]).is_empty());
+    }
+
+    /// The second reverse control, and the one that keeps the rule from being
+    /// satisfied by counting rows: a handover that was withdrawn still exists
+    /// in the graph, and it explains nothing. A draft is the same -- nobody
+    /// agreed to it -- so a face carrying one is still reported.
+    #[test]
+    fn a_withdrawn_or_draft_handover_explains_no_owner() {
+        let faces = vec![
+            owned("token 管理", Some("f5"), Some("worker/-")),
+            owned("资源管理", Some("f5"), Some("operator/-")),
+        ];
+        let moves = vec![
+            mov("token 管理", "f5", HandoverState::Withdrawn),
+            mov("资源管理", "f5", HandoverState::Draft),
+        ];
+        assert_eq!(owners_no_act_explains(&faces, &moves).len(), 2);
+    }
+
+    /// A handover that moved the face to some *other* unit does not explain
+    /// the owner it has now: the rule matches the pair, not the face.
+    #[test]
+    fn a_handover_to_another_unit_leaves_the_current_owner_unexplained() {
+        let faces = vec![owned("通信", Some("f5"), Some("worker/-"))];
+        let moves = vec![mov("通信", "operator", HandoverState::Applied)];
+        assert_eq!(owners_no_act_explains(&faces, &moves).len(), 1);
     }
 }
