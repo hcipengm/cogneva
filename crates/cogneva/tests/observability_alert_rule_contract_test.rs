@@ -1385,6 +1385,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "宿主侧生产者 `scripts/host/cogneva-acceptance-census-reading.sh`（不在本仓，登记行 `acceptance_census`），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出。年龄由生产者自己算：快照里的 `taken_at` 是同一台机上跑完那一趟普查时写的，减它的是同一台机的钟；把 `taken_at` 当序列交给 Prometheus 再减 `time()`，减的是另一台机的钟，两边时钟源不同时，「普查停了多久」会随漂移假响或假静。这一格是 `CognevaAcceptanceCensusOld` 唯一能问的问题：判词那一族只说得清这一趟判了什么，说不清这一趟是多久以前的——而一份停在三天前的 all-ok 与一份刚跑完的 all-ok 在判词上是同一句话",
     ),
     (
+        "cogneva_acceptance_refresh_running_seconds",
+        "同一生产者（此刻正在跑的那一趟已经跑了多少秒，没人跑时为 0）。年龄一格分不出「正在跑一趟慢的」与「刷新没跑成」：一趟合法的普查可以比年龄的界还长，那时年龄照旧在涨，而它涨的原因恰恰是普查在干正事。所以 `CognevaAcceptanceCensusOld` 有两个数：年龄超过界、且没有一趟在跑（或那一趟自己跑得太久，5400 秒＝90 分钟就不再豁免——一把卡死的锁会一直「正在跑」，豁免没有上界就等于把这条规则永久关掉）。生产这一格漏发时，`unless` 的左边不受影响，代价是多响一次，不是永久静音",
+    ),
+    (
         "cogneva_acceptance_landed_unjudgeable",
         "同一生产者（最新一趟普查里，状态写着「已落」、而判据跑不出判词的条数，只含 `unjudged`／`no-command`／`missing-script` 三种）。`cogneva_acceptance_items` 答不了这一问，因为它的标签只有 `verdict`、没有「这一行自己说没说已落」那一维：一条 check 写成散文却声明已落，与一条还没开工的条目在那一族里同样落在 `unjudged` 里，于是「规格在说谎」被读成「活还没干完」。反过来也不能拿 `unjudged` 整体当这一问的分母——多数 unjudged 是未落条目的正常形态，把它们算进去这条规则会天天响。三种成因（散文／没给命令／点名的脚本不存在）合成一格，因为修法都在那一条判据自己身上；`missing-binary` 与 `timeout` 不进这一问（前者归装置、后者是判据该拆）。旧快照没有这一格时序列不出现，而不是印 0——缺字段与「查过、一条都没有」不是同一个事实",
     ),
