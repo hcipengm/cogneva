@@ -2935,12 +2935,18 @@ async fn restore_retired(
 /// Nothing here is raised: this is a maintenance tick, the next tick is the retry,
 /// and a pass that could not take the reading leaves a line saying so rather than
 /// leaving a count that reads as zero.
+///
+/// The answer is how long the oldest held row has been landed without running,
+/// in seconds, or `None` when nothing is held or no held revision can be placed.
+/// It is returned as well as logged because it is the one number that separates
+/// a rollout that is behind from a rollout that has stopped, and a caller that
+/// wants to publish it should not have to re-derive it.
 async fn live_revision_pass(
     store: &dyn ChangeLedgerStore,
     tree: &CheckTree,
     source: &dyn LiveRevisionSource,
     out_of_effect: &mut HashMap<ChangeIdentity, String>,
-) {
+) -> Option<i64> {
     let live = match source.live_revision().await {
         LiveRevision::Known(rev) => rev,
         LiveRevision::Unmeasurable(gap) => {
@@ -2951,7 +2957,7 @@ async fn live_revision_pass(
                  landed row was checked against it this pass -- which is not the same as a pass \
                  that found nothing out of effect"
             );
-            return;
+            return None;
         }
     };
     // A revision the tree cannot place is the third fault, and it belongs with
@@ -2970,7 +2976,7 @@ async fn live_revision_pass(
                  tree, so no landed row was checked against it this pass -- a revision this tree \
                  cannot place is not a row that is out of effect"
             );
-            return;
+            return None;
         }
     };
     let landed = match store.census().await {
@@ -2985,7 +2991,7 @@ async fn live_revision_pass(
                 "change ledger: the landed count could not be read, so no landed row was checked \
                  against the revision the workloads are running"
             );
-            return;
+            return None;
         }
     };
     // The bound is the population itself rather than a number chosen for it. The
@@ -3003,7 +3009,7 @@ async fn live_revision_pass(
                 "change ledger: the landed rows could not be read, so nothing was checked against \
                  the revision the workloads are running"
             );
-            return;
+            return None;
         }
     };
 
@@ -3044,7 +3050,12 @@ async fn live_revision_pass(
         if arrived {
             out_of_effect.insert(row.identity.clone(), measured.to_string());
             entered += 1;
-            warn!(
+            // A row entering this set during a rollout is the ordinary state of
+            // a line that lands faster than it ships, and one line per row puts
+            // hundreds of them between a reader and the pass that can say how
+            // far behind the image is. The name is kept, one level down, for the
+            // reader who already knows there is a lag and is asking which rows.
+            debug!(
                 change = %row.identity,
                 measured_rev = %measured,
                 live_rev = reach.head(),
@@ -3058,6 +3069,33 @@ async fn live_revision_pass(
     // the same identity an arrival rather than a state it was already in.
     out_of_effect.retain(|identity, _| still_landed.contains(identity));
 
+    // How long the oldest of these has been landed without running is the fact
+    // a reader acts on; the names answer "which", which is the follow-up. Taken
+    // on the landing commit's own clock rather than on when this pass first saw
+    // the row, so a process that started an hour ago reports the lag and not its
+    // own uptime. Reading it costs one `git` call per distinct revision, and the
+    // set holds a handful of those however many rows are in it.
+    let mut seen_revs: HashSet<&str> = HashSet::new();
+    let mut landing_times: Vec<i64> = Vec::new();
+    for measured in out_of_effect.values() {
+        if !seen_revs.insert(measured.as_str()) {
+            continue;
+        }
+        match tree.commit_unix(measured).await {
+            Ok(unix) => landing_times.push(unix),
+            // A revision this tree cannot place has no age to report. Counting
+            // it as zero would say it landed this second, which is the one thing
+            // it certainly did not do here.
+            Err(why) => debug!(
+                measured_rev = %measured,
+                why = %why,
+                "change ledger: a held revision's landing time cannot be read, so it does not \
+                 enter the age of the oldest"
+            ),
+        }
+    }
+    let oldest_seconds = oldest_landing_age(chrono::Utc::now().timestamp(), landing_times);
+
     info!(
         landed_rows = landed,
         checked,
@@ -3066,10 +3104,27 @@ async fn live_revision_pass(
         entered,
         back_in_effect = recovered,
         no_revision,
+        out_of_effect_oldest_seconds = oldest_seconds,
         live_rev = reach.head(),
         "change ledger: checked the account's landed rows against the revision the workloads are \
          running"
     );
+    oldest_seconds
+}
+
+/// How long the oldest of these landings has been waiting to run.
+///
+/// `None` when nothing is waiting: an empty set has no oldest, and a zero would
+/// read as "a landing arrived this second", which is a different fact from a
+/// line that is fully shipped. A landing stamped after `now` -- a clock that
+/// disagrees with this host's -- is dropped rather than read as a negative age,
+/// which would sort ahead of every real one and become the answer.
+fn oldest_landing_age(now_unix: i64, landing_times: impl IntoIterator<Item = i64>) -> Option<i64> {
+    landing_times
+        .into_iter()
+        .filter_map(|unix| now_unix.checked_sub(unix))
+        .filter(|age| *age >= 0)
+        .max()
 }
 
 /// The rows a pass hands over: the ones still owed that this pass has not just
@@ -6994,6 +7049,39 @@ mod tests {
         (dir, first, second)
     }
 
+    /// Commit whatever the work tree holds, stamped at `unix` rather than at the
+    /// host's clock, and name the revision it made.
+    ///
+    /// The stamp is the fixture: a test about how long something has been
+    /// waiting cannot be written against commits that were all made this second.
+    fn commit_all_at(bare: &str, work: &str, message: &str, unix: i64) -> String {
+        git_ok(&["--git-dir", bare, "--work-tree", work, "add", "--all"]);
+        let stamp = format!("@{unix} +0000");
+        let out = std::process::Command::new("git")
+            .args([
+                "--git-dir",
+                bare,
+                "--work-tree",
+                work,
+                "commit",
+                "-q",
+                "-m",
+                message,
+            ])
+            .env("GIT_AUTHOR_DATE", &stamp)
+            .env("GIT_COMMITTER_DATE", &stamp)
+            .output()
+            .expect("git on the test host");
+        assert!(
+            out.status.success(),
+            "git commit at {stamp} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        git_ok(&["--git-dir", bare, "rev-parse", "HEAD"])
+            .trim()
+            .to_string()
+    }
+
     /// A repository in which one file was present and then deleted, returning
     /// the revision the deletion was recorded in.
     ///
@@ -7599,6 +7687,81 @@ mod tests {
         assert!(
             out_of_effect.is_empty(),
             "a row that is no longer landed is not held as out of effect: {out_of_effect:?}"
+        );
+    }
+
+    /// The age this pass reports is the distance from the landing commit, not
+    /// from the moment the process first looked.
+    ///
+    /// Both are "an age", and only one of them answers the question a reader
+    /// has. A process that started a minute ago and finds a change that landed
+    /// two hours ago has a two-hour lag to report; the uptime would say a
+    /// minute, and the number would shrink every time the deployment restarted
+    /// -- exactly when a reader is most likely to be looking.
+    #[tokio::test]
+    async fn the_age_of_a_landed_row_is_taken_from_its_landing_commit() {
+        let now = chrono::Utc::now().timestamp();
+        let (dir, bare, work) = scratch_repo();
+        std::fs::write(std::path::Path::new(&work).join("file"), "first")
+            .expect("the fixture file");
+        let first = commit_all_at(&bare, &work, "fixture", now - 8000);
+        std::fs::write(std::path::Path::new(&work).join("file"), "second")
+            .expect("the fixture file");
+        // The row being held is the one measured at this commit, so this is the
+        // clock its age is read from: two hours before the pass looks.
+        let second = commit_all_at(&bare, &work, "fixture", now - 7200);
+
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let store = FakeLedger {
+            rows: vec![landed_row("crates/undeployed", Some(&second))],
+            ..Default::default()
+        };
+        let mut out_of_effect = HashMap::new();
+
+        let age = live_revision_pass(
+            &store,
+            &tree,
+            &FixedLive(LiveRevision::Known(first.clone())),
+            &mut out_of_effect,
+        )
+        .await;
+        let age = age.expect("a row is held, so there is an age to report");
+        assert!(
+            (7100..=7300).contains(&age),
+            "the row landed two hours before the pass, so the pass reports about that: {age}"
+        );
+
+        // Against a revision that carries it, nothing is held and there is no
+        // age -- not zero, which would read as a landing this very second.
+        let age = live_revision_pass(
+            &store,
+            &tree,
+            &FixedLive(LiveRevision::Known(second)),
+            &mut out_of_effect,
+        )
+        .await;
+        assert_eq!(age, None, "nothing is out of effect, so nothing is old");
+    }
+
+    /// A landing this host's clock has not reached yet is dropped rather than
+    /// read as a negative age: `max` over signed distances would let a clock
+    /// that disagrees with the repository become the answer for the whole set.
+    #[test]
+    fn an_age_is_never_negative_and_an_empty_set_has_none() {
+        assert_eq!(
+            oldest_landing_age(1000, []),
+            None,
+            "nothing waiting, no age"
+        );
+        assert_eq!(
+            oldest_landing_age(1000, [1200, 1300]),
+            None,
+            "landings stamped after now are not an age"
+        );
+        assert_eq!(
+            oldest_landing_age(1000, [900, 990, 1200]),
+            Some(100),
+            "the oldest real one is the answer, and the future stamp is dropped"
         );
     }
 

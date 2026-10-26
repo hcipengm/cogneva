@@ -664,6 +664,28 @@ impl CheckTree {
         Ok(Reach { head, ancestors })
     }
 
+    /// When the commit `revision` names was written, in unix seconds.
+    ///
+    /// This is the clock a "landed but not running" reading is taken on: how
+    /// long a change has been on the line without being in the image is the
+    /// distance from the commit that carries it, not from the pass that first
+    /// noticed it. A process that started late would otherwise report a lag of
+    /// its own uptime.
+    ///
+    /// A revision this repository cannot place is an error rather than a zero:
+    /// a zero age reads as "landed just now", which is the opposite of what an
+    /// unplaceable row actually says.
+    pub async fn commit_unix(&self, revision: &str) -> Result<i64, String> {
+        let spec = format!("{revision}^{{commit}}");
+        let out = self
+            .git(&["show", "-s", "--format=%ct", spec.as_str()])
+            .await
+            .map_err(|e| format!("the commit time of {revision} cannot be read: {e}"))?;
+        out.trim()
+            .parse::<i64>()
+            .map_err(|e| format!("the commit time of {revision} is not a number: {e}"))
+    }
+
     /// One check, against the snapshot [`Self::snapshot`] returned.
     pub async fn judge(&self, snapshot: &Snapshot, identity: &ChangeIdentity) -> CheckOutcome {
         let scope = scope_of(identity);
