@@ -30,7 +30,7 @@ metadata:
     app.kubernetes.io/name: nats
     app.kubernetes.io/component: event-bus
 spec:
-  replicas: 1
+  replicas: {{ .Values.backends.nats.replicas }}
   strategy:
     type: Recreate
   selector:
@@ -51,13 +51,13 @@ spec:
             - "--jetstream"
             - "--store_dir=/data"
             - "--server_name=cogneva-nats"
-            - "--http_port=8222"
+            - {{ printf "--http_port=%d" (int .Values.backends.nats.monitorPort) | quote }}
           ports:
             - name: client
-              containerPort: 4222
+              containerPort: {{ .Values.backends.nats.port }}
               protocol: TCP
             - name: monitor
-              containerPort: 8222
+              containerPort: {{ .Values.backends.nats.monitorPort }}
               protocol: TCP
           startupProbe:
             httpGet:
@@ -99,11 +99,11 @@ spec:
     app.kubernetes.io/component: event-bus
   ports:
     - name: client
-      port: 4222
+      port: {{ .Values.backends.nats.port }}
       targetPort: client
       protocol: TCP
     - name: monitor
-      port: 8222
+      port: {{ .Values.backends.nats.monitorPort }}
       targetPort: monitor
       protocol: TCP
 {{- end }}

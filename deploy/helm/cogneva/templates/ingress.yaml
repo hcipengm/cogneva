@@ -13,8 +13,8 @@ metadata:
     traefik.ingress.kubernetes.io/router.middlewares: "{{ include "cogneva.namespace" . }}-websocket-headers@kubernetescrd"
   {{- else }}
     # nginx 原生支持 WebSocket Upgrade，加长读写超时避免长连接被掐断
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: {{ .Values.ingress.proxyTimeoutSecs | int | quote }}
+    nginx.ingress.kubernetes.io/proxy-send-timeout: {{ .Values.ingress.proxyTimeoutSecs | int | quote }}
     nginx.ingress.kubernetes.io/proxy-body-size: 64m
   {{- end }}
 spec:
@@ -31,7 +31,7 @@ spec:
               service:
                 name: cogneva
                 port:
-                  number: 8080
+                  number: {{ .Values.gateway.httpPort }}
 {{- if eq .Values.ingress.className "traefik" }}
 ---
 # traefik 专用：WebSocket/帧头与安全响应头。nginx ingress 原生支持

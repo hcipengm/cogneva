@@ -27,7 +27,7 @@ metadata:
     app.kubernetes.io/name: qdrant
     app.kubernetes.io/component: vector-db
 spec:
-  replicas: 1
+  replicas: {{ .Values.backends.qdrant.replicas }}
   strategy:
     type: Recreate
   selector:
@@ -46,10 +46,10 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
-              containerPort: 6333
+              containerPort: {{ .Values.backends.qdrant.port }}
               protocol: TCP
             - name: grpc
-              containerPort: 6334
+              containerPort: {{ .Values.backends.qdrant.grpcPort }}
               protocol: TCP
           # timeoutSeconds 必须显式给：Kubernetes 默认 1 秒，而 Qdrant 在段合并
           # 或大查询期间响应会超过 1 秒——默认值下探针连续失败会判活失败并重启
@@ -94,11 +94,11 @@ spec:
     app.kubernetes.io/component: vector-db
   ports:
     - name: http
-      port: 6333
+      port: {{ .Values.backends.qdrant.port }}
       targetPort: http
       protocol: TCP
     - name: grpc
-      port: 6334
+      port: {{ .Values.backends.qdrant.grpcPort }}
       targetPort: grpc
       protocol: TCP
 {{- end }}

@@ -34,7 +34,7 @@ metadata:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: sandbox-executor
 spec:
-  replicas: 1
+  replicas: {{ .Values.sandboxExecutor.replicas }}
   # No surge: every profile runs a single replica on a single node, so a surging
   # pod has nowhere to be scheduled and the rollout times out. Terminating the
   # old pod first frees its request, at the cost of a brief restart window.
@@ -93,7 +93,7 @@ spec:
                 # 但连接超时与低速阈值管不住"带宽很低但在动"的传输：实测一次
                 # fetch 跑了 14 分钟没完，把整段启动预算吃光、Pod 被判启动超时
                 # （一次网络慢被记成版本缺陷）。所以每个走公网的 git 调用再加
-                # 一层挂钟上界：单次尝试最多 240 秒（实测正常读数秒级到几十秒，
+                # 一层挂钟上界：单次尝试最多 `workspaceFetch.timeoutSecs` 秒（实测正常读数秒级到几十秒，
                 # 取数倍余量）。超了就当这个镜像不可用、走下面已有的失败分支，
                 # 语义不变。代价：真的很大的传输可能一次传不完而被放弃，下一轮
                 # 从零再来（被杀掉的 fetch 不落 refs），极端网络下裸仓会停在旧
@@ -101,14 +101,14 @@ spec:
                 for m in $(echo "$mirrors" | tr ',' ' '); do
                   echo "sandbox volume empty; seeding bare repo from $m ..."
                   rc=0
-                  /usr/bin/timeout 240 git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 clone --bare "$m" /tmp/seed.git || rc=$?
+                  /usr/bin/timeout {{ .Values.workspaceFetch.timeoutSecs }} git -c http.connectTimeout={{ .Values.workspaceFetch.connectTimeoutSecs }} -c http.lowSpeedLimit={{ .Values.workspaceFetch.lowSpeedLimitBytesPerSec }} -c http.lowSpeedTime={{ .Values.workspaceFetch.lowSpeedSecs }} clone --bare "$m" /tmp/seed.git || rc=$?
                   if [ "$rc" = 0 ]; then
                     cp -a /tmp/seed.git/. "$root/repo.git/"
                     rm -rf /tmp/seed.git
                     break
                   fi
                   if [ "$rc" = 124 ]; then
-                    echo "WARN: sandbox bare repo seed from $m gave up after the 240s bound (transfer slower than the bound, or the mirror never answered)"
+                    echo "WARN: sandbox bare repo seed from $m gave up after the {{ .Values.workspaceFetch.timeoutSecs }}s bound (transfer slower than the bound, or the mirror never answered)"
                   else
                     echo "WARN: sandbox bare repo seed from $m failed (rc=$rc)"
                   fi
@@ -123,12 +123,12 @@ spec:
                   # +main:main advances the local main that task worktrees are cut
                   # from; a plain fetch would only update remote-tracking refs.
                   rc=0
-                  /usr/bin/timeout 240 git --git-dir="$root/repo.git" -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch upstream --tags --force '+main:main' || rc=$?
+                  /usr/bin/timeout {{ .Values.workspaceFetch.timeoutSecs }} git --git-dir="$root/repo.git" -c http.connectTimeout={{ .Values.workspaceFetch.connectTimeoutSecs }} -c http.lowSpeedLimit={{ .Values.workspaceFetch.lowSpeedLimitBytesPerSec }} -c http.lowSpeedTime={{ .Values.workspaceFetch.lowSpeedSecs }} fetch upstream --tags --force '+main:main' || rc=$?
                   if [ "$rc" = 0 ]; then
                     break
                   fi
                   if [ "$rc" = 124 ]; then
-                    echo "WARN: sandbox seed fetch from $m gave up after the 240s bound (transfer slower than the bound, or the mirror never answered); trying the next mirror"
+                    echo "WARN: sandbox seed fetch from $m gave up after the {{ .Values.workspaceFetch.timeoutSecs }}s bound (transfer slower than the bound, or the mirror never answered); trying the next mirror"
                   else
                     echo "WARN: sandbox seed fetch from $m failed (rc=$rc); trying the next mirror"
                   fi
@@ -146,7 +146,7 @@ spec:
           args: ["sandbox-executor"]
           ports:
             - name: executor
-              containerPort: 9090
+              containerPort: {{ .Values.sandboxExecutor.metricsPort }}
               protocol: TCP
           envFrom:
             - configMapRef:
@@ -159,7 +159,7 @@ spec:
             - name: COGNEVA_LLM_ORIGIN
               value: sandbox
             - name: SANDBOX_EXECUTOR_PORT
-              value: "9090"
+              value: {{ .Values.sandboxExecutor.metricsPort | int | quote }}
             # 每任务工作树路由：真实 task id 锚定命令 cwd 与相对文件路径。
             - name: SANDBOX_WORKSPACES_ROOT
               value: /opt/cogneva/sandbox/workspaces
@@ -326,7 +326,7 @@ spec:
   # 产出却从没被采集过。targetPort 仍指向容器的 executor 端口名。
   ports:
     - name: http
-      port: 9090
+      port: {{ .Values.sandboxExecutor.metricsPort }}
       targetPort: executor
       protocol: TCP
 {{- end }}

@@ -72,6 +72,47 @@ rows:
       test: a_declaration_below_the_peak_is_raised_to_the_headroom_rounded_up
 
   # --- optional backends ------------------------------------------------------
+  - key: backends.meilisearch.replicas
+    source: fixed
+    why: >-
+      One instance: the index is a projection of the shared database, so a
+      second copy would ingest the same rows again. Nothing measures query
+      load on this store, so no loop moves this number.
+
+  - key: backends.postgres.replicas
+    source: fixed
+    why: >-
+      One instance: the database is single-writer in this chart, so a second
+      copy would be a second dataset rather than a replica. Failover is not
+      configured here, and no reading moves this number.
+
+  - key: backends.redis.replicas
+    source: fixed
+    why: >-
+      One instance, and its name redis-0 is written into several DSNs. A
+      second copy needs sentinels or cluster mode, which this chart does not
+      configure; no reading moves this number.
+
+  - key: backends.qdrant.replicas
+    source: fixed
+    why: >-
+      One instance: sharding and replication are a cluster mode this chart
+      does not configure, and nothing measures vector-store load.
+
+  - key: backends.nats.replicas
+    source: fixed
+    why: >-
+      One instance: the bus carries process-to-process messages rather than a
+      durable queue, so a second node needs cluster routing and stream
+      replication. Not a reading.
+
+  - key: backends.seaweedfs.replicas
+    source: fixed
+    why: >-
+      One instance: master, volume, filer and S3 run in one pod, and scaling
+      them is a cluster deployment of those roles rather than a replica
+      count. Not a reading.
+
   - key: backends.meilisearch.storage
     source: override
     why: >-
@@ -381,6 +422,43 @@ rows:
       bound a restore that hangs, not to track a normal one -- with Forbid, a
       stuck drill would otherwise block every drill after it.
 
+  - key: backup.startingDeadlineSeconds
+    source: override
+    why: >-
+      How late a missed backup or drill run may still be started. A derived value
+      would follow the observed lateness of past runs; the CronJob controller does
+      not record why a run was missed, so there is no reading to close over.
+
+  - key: backup.successfulJobsHistoryLimit
+    source: override
+    why: >-
+      How many finished Job objects stay for inspection. It would be derived from
+      how often somebody reads a past Job, and nothing measures that.
+
+  - key: backup.failedJobsHistoryLimit
+    source: override
+    why: >-
+      The same count for failures, kept one higher so that two consecutive nights
+      can be compared. Nothing measures how often a failure is looked at.
+
+  - key: backup.ttlSecondsAfterFinished
+    source: override
+    why: >-
+      A day before a finished Job and its Pod are collected: long enough to read
+      the day's failure, short enough not to accumulate objects. Not a reading.
+
+  - key: backup.backoffLimit
+    source: override
+    why: >-
+      One retry for the backup, none for the drill. A derived value would read how
+      often a retry succeeds; the ledger records outcomes, not retries.
+
+  - key: backup.drillBackoffLimit
+    source: override
+    why: >-
+      Zero: a failed drill has already written its answer to backup_drills, so a
+      retry produces no new information. Not a reading.
+
   - key: backup.storage
     source: override
     why: >-
@@ -461,6 +539,20 @@ rows:
       build gate measures something adjacent (concurrent builds), not this.
 
   # --- in-cluster registry ----------------------------------------------------
+  - key: clusterRegistry.replicas
+    source: fixed
+    why: >-
+      One registry: it caches this cluster's image layers on one volume, and a
+      second writer would interleave two layer layouts on it. Nothing measures
+      push or pull pressure, so no loop moves this number.
+
+  - key: clusterRegistry.port
+    source: override
+    why: >-
+      The registry's service port, read by the Service, the container port, the
+      deployer's Service DNS and the network policy. A derived value would read the
+      port the registry actually bound; the process reports no such reading.
+
   - key: clusterRegistry.nodePort
     source: fixed
     why: >-
@@ -536,6 +628,33 @@ rows:
       Room for one full walk of the store. The walk's peak is not published.
 
   # --- evolution worker -------------------------------------------------------
+  - key: evolution.replicas
+    source: fixed
+    why: >-
+      One evolution worker: a second copy would contend for the same build
+      slot rather than add throughput, because the slot is the shared
+      resource. Not a reading.
+
+  - key: evolution.pollIntervalSecs
+    source: override
+    why: >-
+      How often the self-evolution loop looks for new work. It would be derived
+      from the observed arrival interval of changes; nothing records that
+      interval today.
+
+  - key: evolution.testTimeoutSecs
+    source: override
+    why: >-
+      The wall-clock cap on one verification run. It would be derived from the
+      measured duration of past runs, which the ledger does not keep.
+
+  - key: evolution.buildTimeoutSecs
+    source: override
+    why: >-
+      The wall-clock cap on one build. A derived value would read the build
+      gate's measured build durations; the gate records concurrency and wait, not
+      duration.
+
   - key: evolution.buildGate.maxConcurrent
     source: derived
     why: >-
@@ -1093,6 +1212,13 @@ rows:
   # 覆盖写法（`--set sandboxExecutor.buildCacheMaxBytes=<字节>`）落在同一个
   # `cogneva_build_target_bytes_cap{source}` 上，读得出来源是 override。
 
+  - key: sandboxExecutor.replicas
+    source: fixed
+    why: >-
+      One executor: each task's worktree lives on this pod's volume, so a
+      second copy would see a different volume and "who owns this worktree"
+      would stop meaning anything. Not a reading.
+
   - key: sandboxExecutor.buildCacheScanIntervalSecs
     source: derived
     why: >-
@@ -1327,6 +1453,36 @@ rows:
       means unlimited and is a deliberate deployment choice, not a missing
       value.
 
+  # --- workspace fetch bounds (evolution and sandbox share one) ---------------
+  - key: workspaceFetch.timeoutSecs
+    source: override
+    why: >-
+      One wall-clock bound on a public-git clone or fetch of the workspace repo.
+      Both workers read this one number because they share the same outbound
+      path, and a per-worker copy would leave one side on an old bound. A derived
+      value would read the transfer-time distribution; the failure branch records
+      no duration, so nothing feeds one back.
+
+  - key: workspaceFetch.connectTimeoutSecs
+    source: override
+    why: >-
+      How long git may wait for the mirror to answer at all, so an unreachable
+      mirror does not consume the whole wall-clock bound. Nothing records the
+      observed connect latency, so no reading closes over it.
+
+  - key: workspaceFetch.lowSpeedLimitBytesPerSec
+    source: override
+    why: >-
+      The throughput floor below which a transfer counts as dead. It would be
+      derived from measured mirror throughput; no reading of bytes per second is
+      recorded today.
+
+  - key: workspaceFetch.lowSpeedSecs
+    source: override
+    why: >-
+      How long a transfer may stay under the floor before git gives up. Same
+      missing reading as the floor: nothing records sustained throughput.
+
   # --- web search (SearXNG) ---------------------------------------------------
   - key: webSearch.replicas
     source: fixed
@@ -1422,3 +1578,174 @@ rows:
       The cluster entry point for the GitHub and Gitee webhooks, forwarded to the
       gateway's 8082. An address that outside senders are configured against; a
       measurement must not move it.
+
+  # --- listening ports --------------------------------------------------------
+  # Every port a workload listens on is an address, not a dial: nothing measures
+  # it, and the only thing a measurement could say about it is "the process bound
+  # what it was told". They are values all the same, because the number is written
+  # in four to seven places per port -- container port, Service, the process's own
+  # config file, the env layer that overrides it, the network policy on both
+  # sides, the ingress, and the deployment notes -- and a port that moves in one
+  # of them reads as a dead backend, not as a half-finished edit.
+  - key: gateway.httpPort
+    source: fixed
+    why: >-
+      The app's main HTTP port. An address: the Service, the ingress backend,
+      the network policy, the port-forward note and the process's own
+      cogneva.json all carry it.
+
+  - key: gateway.wsPort
+    source: fixed
+    why: >-
+      The WebSocket face. An address, kept apart from httpPort so the ingress can
+      give long connections their own timeout.
+
+  - key: gateway.internalPort
+    source: fixed
+    why: >-
+      The zero-credential in-cluster face (memory archive writes and Raw reads).
+      An address: what makes it a separate face is the network policy that
+      decides who may reach it, not the number.
+
+  - key: gateway.webhookPort
+    source: fixed
+    why: >-
+      The webhook forward entry the security gateway hands verified platform
+      events to. An address.
+
+  - key: gateway.metricsPort
+    source: fixed
+    why: >-
+      The port the process is told to expose metrics on, through the env layer
+      and cogneva.json. An address; the scrape itself goes to httpPort/metrics,
+      which is why the two must be read from one file.
+
+  - key: sandboxExecutor.metricsPort
+    source: fixed
+    why: >-
+      The executor's one outward face: it holds no credentials, so its readings
+      are all it publishes. An address.
+
+  - key: securityGateway.egressProxyPort
+    source: fixed
+    why: >-
+      The gateway's egress proxy (container port name egress-proxy): git
+      transport and platform API passthrough. An address.
+
+  - key: securityGateway.llmProxyPort
+    source: fixed
+    why: >-
+      The gateway's LLM proxy (container port name llm-proxy), which also
+      carries the /github, /gitee, /git and /search-fallback routes. An address,
+      written into nine base URLs across the app and evolution pods.
+
+  - key: securityGateway.webhookPort
+    source: fixed
+    why: >-
+      The gateway's platform webhook entry (container port name webhook), where
+      GitHub and Gitee signatures are verified before anything is forwarded. An
+      address.
+
+  - key: backends.postgres.port
+    source: fixed
+    why: >-
+      The database's port, carried by the container port, the Service and five
+      DSNs in four workloads plus the app's own config file. An address.
+
+  - key: backends.postgres.exporterPort
+    source: fixed
+    why: >-
+      The metrics sidecar's port beside the database. An address the scraper
+      names.
+
+  - key: backends.redis.port
+    source: fixed
+    why: >-
+      The store's port, carried by the container port, the Service, four DSNs
+      and the WAL census script that polls INFO from beside it. An address.
+
+  - key: backends.redis.aofReportExporter.port
+    source: fixed
+    why: >-
+      The node-exporter sidecar's port that serves the AOF repair verdict
+      textfile. An address.
+
+  - key: backends.qdrant.port
+    source: fixed
+    why: >-
+      Qdrant's REST port, the one the backup snapshots and the network policy
+      use; gRPC has no snapshot API. An address.
+
+  - key: backends.qdrant.grpcPort
+    source: fixed
+    why: >-
+      Qdrant's gRPC port, which the app's QDRANT_URL points at for batch writes.
+      An address.
+
+  - key: backends.nats.port
+    source: fixed
+    why: >-
+      The bus's client port, used for inter-process delivery. An address.
+
+  - key: backends.nats.monitorPort
+    source: fixed
+    why: >-
+      The bus's monitoring endpoint (--http_port), carried in both the args and
+      the container port. An address.
+
+  - key: backends.meilisearch.port
+    source: fixed
+    why: >-
+      Meilisearch's HTTP port, which the evolution pod health-checks at startup
+      and the app reads the wiki index from. An address.
+
+  - key: backends.seaweedfs.masterPort
+    source: fixed
+    why: >-
+      The master's port in the four-process single pod (it allocates volumes).
+      An address, written in both the args and the container port.
+
+  - key: backends.seaweedfs.volumePort
+    source: fixed
+    why: >-
+      The volume server's port, where objects actually live. An address.
+
+  - key: backends.seaweedfs.filerPort
+    source: fixed
+    why: >-
+      The filer's port: the directory-shaped view over the volumes. An address.
+
+  - key: backends.seaweedfs.s3Port
+    source: fixed
+    why: >-
+      The S3 gateway's port, the one the app signs requests against and the
+      readiness probe waits on. An address.
+
+  - key: webSearch.port
+    source: fixed
+    why: >-
+      The self-hosted SearXNG port: the derived base URL, the container port,
+      the Service and the egress rule all read it. An address.
+
+  - key: webFetch.port
+    source: fixed
+    why: >-
+      The render backend's port, read the same way as webSearch.port. An
+      address.
+
+  - key: webSearch.safeSearch
+    source: override
+    why: >-
+      A policy, not an address: 0/1/2 is the operator's call on how much search
+      filtering this deployment wants. The default is off because a filtered
+      result leaves no trace in the tool's return value, so it reads exactly like
+      "the page does not exist". Nothing measures whether the level is right, so
+      no loop moves it.
+
+  - key: ingress.proxyTimeoutSecs
+    source: override
+    why: >-
+      Sized for the long-lived event stream and the WebSocket face, not measured
+      from them: nothing on this side observes how long a connection actually
+      lived, and nginx's 60 s default severs an idle long connection in a way the
+      browser reports only as a reconnect.

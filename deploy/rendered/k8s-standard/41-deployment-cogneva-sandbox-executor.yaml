@@ -35,7 +35,7 @@ spec:
       annotations:
         # 本 Pod 经 envFrom 取 cogneva-config，理由同安全网关：env 只在启动时读一次，
         # 配置变了模板得跟着变，RollingUpdate 才会真的换掉它。
-        checksum/config: 1f037019f687a4b30cbd23fc4682b8123eeb6a9e781515d31ea8692d4aac0482
+        checksum/config: b521c36c1de32a4fb2332d7eb1e3e19a97c870234e0f2f1d8cb96b437b6ae686
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: sandbox-executor
@@ -76,7 +76,7 @@ spec:
                 # 但连接超时与低速阈值管不住"带宽很低但在动"的传输：实测一次
                 # fetch 跑了 14 分钟没完，把整段启动预算吃光、Pod 被判启动超时
                 # （一次网络慢被记成版本缺陷）。所以每个走公网的 git 调用再加
-                # 一层挂钟上界：单次尝试最多 240 秒（实测正常读数秒级到几十秒，
+                # 一层挂钟上界：单次尝试最多 `workspaceFetch.timeoutSecs` 秒（实测正常读数秒级到几十秒，
                 # 取数倍余量）。超了就当这个镜像不可用、走下面已有的失败分支，
                 # 语义不变。代价：真的很大的传输可能一次传不完而被放弃，下一轮
                 # 从零再来（被杀掉的 fetch 不落 refs），极端网络下裸仓会停在旧

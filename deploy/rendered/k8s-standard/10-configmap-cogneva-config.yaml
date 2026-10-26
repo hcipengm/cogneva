@@ -44,6 +44,9 @@ data:
   # running：pending 的限额会拦住唯一能腾空它的那一步，终态列只增不减。
   COGNEVA_BOARD_WIP_LIMITS: ""
 
+  # 进程被告知的三个端口，与容器实际监听的那三个同源（values 的 gateway.*Port，
+  # 也与 files/cogneva.json 里的 gateway.*_port 同源）：env 层覆盖 JSON，两处
+  # 各写一个数时，覆盖生效的那次会悄悄把进程挪到另一个端口，而 Service 没动。
   COGNEVA_HTTP_PORT: "8080"
   COGNEVA_WS_PORT: "8081"
   COGNEVA_METRICS_PORT: "9090"

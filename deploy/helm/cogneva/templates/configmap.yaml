@@ -19,7 +19,7 @@ data:
   COGNEVA_DB_PROVIDER: "mysql"
   COGNEVA_PG_PROVIDER: "postgres"
   COGNEVA_VECTOR_PROVIDER: "qdrant"
-  QDRANT_URL: "http://qdrant.{{ include "cogneva.namespace" . }}.svc.cluster.local:6334"
+  QDRANT_URL: {{ printf "http://qdrant.%s.svc.cluster.local:%d" (include "cogneva.namespace" .) (int .Values.backends.qdrant.grpcPort) | quote }}
   COGNEVA_MEDIA_PROVIDER: "local-sfu"
   COGNEVA_STORAGE_PROVIDER: "local-fs"
 
@@ -37,9 +37,12 @@ data:
   # running：pending 的限额会拦住唯一能腾空它的那一步，终态列只增不减。
   COGNEVA_BOARD_WIP_LIMITS: {{ .Values.board.wipLimits | quote }}
 
-  COGNEVA_HTTP_PORT: "8080"
-  COGNEVA_WS_PORT: "8081"
-  COGNEVA_METRICS_PORT: "9090"
+  # 进程被告知的三个端口，与容器实际监听的那三个同源（values 的 gateway.*Port，
+  # 也与 files/cogneva.json 里的 gateway.*_port 同源）：env 层覆盖 JSON，两处
+  # 各写一个数时，覆盖生效的那次会悄悄把进程挪到另一个端口，而 Service 没动。
+  COGNEVA_HTTP_PORT: {{ .Values.gateway.httpPort | int | quote }}
+  COGNEVA_WS_PORT: {{ .Values.gateway.wsPort | int | quote }}
+  COGNEVA_METRICS_PORT: {{ .Values.gateway.metricsPort | int | quote }}
 
   # 告警通知出口地址。出口机制四类 dispatcher 都在代码里，缺的只是地址；空值
   # 不建出口（与 cogneva.json 的 null 等价）。地址只由集群侧 values / --set 给，

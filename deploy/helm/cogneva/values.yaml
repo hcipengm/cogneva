@@ -124,6 +124,21 @@ backup:
   # 运行、落在外面的那次是卡死了——而卡死的那次不杀掉，Forbid 会让后面每
   # 一次都不再开始。
   runDeadlineSeconds: 3600
+  # 一个周期错过了多久还算数（秒）：控制器在错过起点后这段时间内仍会补跑一次，
+  # 更早就直接放弃。两个 CronJob 读同一个数——它们错过的原因是同一类（节点忙、
+  # Pod 排不上、前一次还没结束），一边宽一边窄只会让两种作业的漏跑时机不同。
+  startingDeadlineSeconds: 1800
+  # 留几份成功 / 失败的 Job 供翻现场：失败的多留一份，连挂两晚才看得出是不是
+  # 同一个原因，只留一份时第二晚的诊断对象已经被回收。
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  # 跑完的 Job 与它的 Pod 多久后清掉（秒）：一天，够把当天的现场翻完，
+  # 又不至于让对象和日志一直攒在 etcd 里。
+  ttlSecondsAfterFinished: 86400
+  # 失败重试几次：备份一次（下一晚自然再来，连着重试只会在同一个原因上撞几次），
+  # 演练零次（答案已经落进 backup_drills 了，重试没有新信息）。
+  backoffLimit: 1
+  drillBackoffLimit: 0
   # 备份与演练都是流式作业（COPY→文件、tar.zst 流式压缩），常驻内存极小；
   # 请求按实耗定低，免得在资源紧张的小节点上调度不出来。两个 Job 各一份界，
   # 写在 values 里才进得了登记表（登记表只枚举本文件的数值叶子）。
@@ -206,6 +221,25 @@ image:
 gateway:
   # 单副本：单节点集群双副本无可用性收益，只放大内存与凭证副本；多节点后调回 2
   replicas: 1
+  # 主应用的五个端口。这五个数此前各写三到六遍：容器端口、Service、configmap 里的
+  # env、files/cogneva.json（进程真正按它监听的那一份）、网络策略、ingress、
+  # NOTES.txt 里的 port-forward。改一个端口要手工改七处，漏一处只在真流量上现形
+  # ——Service 与容器端口不一致时 Endpoints 照建、连接全被拒，读起来像"进程挂了"。
+  # 现在只有这一份，模板与 JSON 都从它取。
+  httpPort: 8080
+  # WebSocket 面：WebUI 的长连接。与 httpPort 分开是为了让 ingress 能只把长连接
+  # 那条路单独放行/加超时。
+  wsPort: 8081
+  # 零凭证的集群内面：只挂 memory 的工具输出归档与 Raw 读。它与 httpPort 分开不是
+  # 为了换路径，是为了换判据——主 API 的 memory 路由按角色判，跑 squad 的 Pod 零
+  # 凭证恒吃 401，所以判据改成"按网络事实"，挂在网络策略上。0＝不开这个监听。
+  internalPort: 8085
+  # 平台 webhook 的转发入口：安全网关验签之后才递进来，因此它自己不再判签名。
+  webhookPort: 9091
+  # 进程被告知的指标端口（cogneva.json 的 gateway.metrics_port，经 configmap 的
+  # COGNEVA_METRICS_PORT 注入同一份配置）。抓取侧走 httpPort 的 /metrics，所以
+  # 这两个数必须同源：改一处而漏另一处，只会让两边各说一半。
+  metricsPort: 9090
   # 内存这一档按**量出来的**占用给，不按权重文件大小推。进程自己报出生占用
   # （`cogneva_boot_rss_bytes`，按启动阶段各一拍，值是那一刻整进程的 VmRSS）：
   # 实测 2026-10-26，三份权重各建一个 session 后进程以 4.52GiB 开始服务（三个
@@ -252,6 +286,19 @@ gitIdentity:
 securityGateway:
   enabled: true
   replicas: 1
+  # 网关的三个监听面，与容器里的端口名一一对应（名字不改，Service 的 targetPort
+  # 按名字引用它们）。这三个数此前写满整棵 chart：容器端口、Service、网络策略的
+  # 两侧放行、webhook Service，以及主应用与进化 Pod 里九个指向
+  # `http://cogneva-security-gateway:8081/...` 的地址——改端口时漏掉任何一处，
+  # 症状都是「凭证代持面不可达」，而它读起来像上游平台挂了。
+  #
+  # 出站代理（名称 egress-proxy）：git 传输与平台 API 透传走它。
+  egressProxyPort: 8080
+  # LLM 代理（名称 llm-proxy）：全部上游模型调用与 /github、/gitee、/git、
+  # /search-fallback 这些透传路由都在这个端口上——业务侧那九个 URL 写的就是它。
+  llmProxyPort: 8081
+  # 平台 webhook 入口（名称 webhook）：GitHub/Gitee 回调进来先在这里验签。
+  webhookPort: 8082
   # 网关在全部调用链最前面（LLM 与 git 透传的唯一凭证出口）：没有 request 时
   # 调度器按 BestEffort 处理，节点一有压力先驱逐它，而被驱逐的 Pod 正是调用方
   # 的直接下游；request 按常驻实耗给，limit 留突发余量。
@@ -328,9 +375,33 @@ securityGateway:
       table: "llm_events"
       username: "cogneva"
 
+# 公网 git 取数的一道上界，两个 worker 共用。
+#
+# 进化侧与沙盒侧的 init 脚本都有一处「从镜像 seed/更新裸仓」的 clone 与 fetch，
+# 走的是同一条集群出网链路、同一个墙钟预算。上界写在这里由两边一起读：分成两份
+# 就会在调大一侧时把另一侧留在旧界上，而同一个传输配两个界，短的先杀、长的白等。
+# 语义见各模板里的注释——超时当作该镜像不可用、走已有的失败分支，失败不阻塞启动。
+workspaceFetch:
+  # 单次 clone/fetch 的挂钟上界（秒）。正常读数秒级到几十秒，取数倍余量。
+  timeoutSecs: 240
+  # git 的 TCP 连接超时（秒）：镜像根本不答时别等满整个墙钟。
+  connectTimeoutSecs: 15
+  # 低于这个速率（字节/秒）持续 lowSpeedSecs 秒即判定传输已死。
+  lowSpeedLimitBytesPerSec: 1000
+  lowSpeedSecs: 20
+
 # 自进化 worker（特权容器 = 文件系统沙盒边界；接 image-based 滚动更新后可关特权）
 evolution:
   enabled: true
+  # 自进化循环自己的三个运行参数。它们此前写死在进化 Pod 的 ConfigMap 里：
+  # 轮询间隔决定「主线动到被发现」的延迟，两个超时决定一次构建/一次验证最多跑多久。
+  # 三者都是随部署规格变的数（节点多快、镜像多大），所以走 values。
+  # 一个进化 worker：它按 Hold 那把构建槽的锁干活，第二个副本争的是同一把锁，
+  # 收益是多一份排队而不是多一份吞吐。
+  replicas: 1
+  pollIntervalSecs: 300
+  testTimeoutSecs: 3600
+  buildTimeoutSecs: 3600
   # fail-closed 身份门禁：进化 Pod 的 Shell 类工具只接受带 DAG task 身份的
   # 调用（prompt_for_task），无身份的命令直接拒绝，不许以伪造身份进 executor。
   requireToolIdentity: true
@@ -457,6 +528,12 @@ evolution:
 # 不挂 Secret、不挂 ServiceAccount token；关掉后主应用/进化的工具调用将无执行面。
 sandboxExecutor:
   enabled: true
+  # 执行器的指标面：主应用与进化 Pod 都按它取执行器的读数。该 Pod 零凭证，
+  # 指标面是它唯一对外的面。
+  metricsPort: 9090
+  # 一个执行器：每任务工作树都在这一个 Pod 的卷上，第二个副本看的是另一份卷，
+  # 于是「谁持有这个任务的工作树」失去意义。
+  replicas: 1
   # 执行器专属持久卷：自有裸仓库 + 每任务工作树 + 共享 CARGO_TARGET_DIR，
   # 与进化侧卷物理分离，互不共享工作树。
   storage: 5Gi
@@ -785,7 +862,15 @@ claimStore:
 # 外部仓库形态改配 COGNEVA_GITOPS_REGISTRY（跨集群生产），可置 enabled:false。
 clusterRegistry:
   enabled: true
+  # 一个仓库：它缓存的是这一簇的镜像层，第二个副本写同一张卷只会让两层布局互相踩。
+  replicas: 1
   image: registry:2
+  # 仓库在集群内的服务端口：Service、containerPort、部署器拼的 Service DNS、以及
+  # network-policy 里放行的那条都读这一个值。四处各写 5000 时，改一处就有一条路径
+  # 静默指向不存在的端口——push 报连接拒绝、或者更糟，策略放行了一个没人听的端口。
+  port: 5000
+  # 节点上以 localhost:<nodePort> pull（containerd 对 localhost 默认 http 免 TLS），
+  # 部署器拼的 COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY 也读它。
   nodePort: 30500
   # 这张卷的名字声明一次，PVC 与"谁去量它"两处都从这里取：盘上占用由本 Pod 里
   # 那个只读走查边车量（第三方 registry 进程不发布指标，而它是这张卷唯一的写者），
@@ -860,6 +945,13 @@ healthProbes:
 backends:
   postgres:
     enabled: true
+    # 一个实例。库是单写的，多副本要么是主从（要另一套切换机制，不在这里）要么是
+    # 两份互不相干的数据；声明成值是为了让「要不要两个」成为部署问题而不是改模板。
+    replicas: 1
+    # 库的服务端口。写在这里而不是各清单各写一遍：DSN 分散在四个工作负载的 env、
+    # Service、容器端口与网络策略里，五处各写一个数时，改端口的那个部署会得到
+    # "连接被拒"与"策略丢包"两种都读起来像宕机的症状。
+    port: 5432
     image: postgres:16-alpine
     # 读数边车与数据库同 Pod：抓数据库的读数要库口令，独立进程就得再存一份。
     # 这个 tag 是读数的生产者，不是实现细节：最老事务年龄那条读数读的
@@ -867,6 +959,8 @@ backends:
     # opt-in collector，默认集不在那张名单里，所以它看起来像是「没有旗标能打开」）。
     # 换 tag 要重抓一次序列表 `deploy/images/postgres-exporter.series.yaml`。
     exporterImage: prometheuscommunity/postgres-exporter:v0.15.0
+    # 边车自己监听的那个端口：抓取端的 ServiceMonitor/抓取注解按它取数。
+    exporterPort: 9187
     storage: 10Gi
     # Resource bounds live here, not in the template, so the tunables registry can
     # see them (it enumerates the numeric leaves of this file only).
@@ -890,6 +984,12 @@ backends:
         memory: 256Mi
   redis:
     enabled: true
+    # 一个实例，且它的名字 redis-0 写进了几处 DSN：多副本要连的是一组哨兵或
+    # 一个 Cluster，不是把这个数改大。
+    replicas: 1
+    # 服务端口。它同时出现在容器端口、Service、网络策略与三个 DSN（主应用、进化、
+    # 安全网关）里；分成四份写就是四次机会让其中一处先动。
+    port: 6379
     image: redis:7-alpine
     storage: 5Gi
     # 内存上限走 values，不再写死在模板里：数据集本身就有 485MB（启动日志里的
@@ -922,6 +1022,8 @@ backends:
     # is the only way a one-shot container's reading can reach a scraper.
     aofReportExporter:
       image: quay.io/prometheus/node-exporter:v1.12.1-distroless
+      # 边车暴露 textfile 目录的那个端口：抓取端按它取回 AOF 修复的判词。
+      port: 9100
       resources:
         requests:
           cpu: 10m
@@ -951,7 +1053,13 @@ backends:
           memory: 64Mi
   qdrant:
     enabled: true
+    # 一个实例。分片与副本要另配集群模式，这个数不是那条路。
+    replicas: 1
     image: qdrant/qdrant:v1.13.4
+    # REST 与 gRPC 两个面：REST 是主应用与备份用的那个，gRPC 只给批量写入，
+    # 两者端口由 qdrant 自己定义、由 chart 声明，所以两个都在这里，不各写一份。
+    port: 6333
+    grpcPort: 6334
     storage: 10Gi
     resources:
       requests:
@@ -962,7 +1070,13 @@ backends:
         memory: 4Gi
   nats:
     enabled: true
+    # 单节点总线：消息是进程间投递用的，不靠它做持久化队列，多副本要的是集群
+    # 路由与流复制，不是把这个数加一。
+    replicas: 1
     image: nats:2.10-alpine
+    # 客户端端口（进程间投递走它）与监控端口（/varz 一类的运维读数）。
+    port: 4222
+    monitorPort: 8222
     storage: 10Gi
     resources:
       requests:
@@ -973,7 +1087,11 @@ backends:
         memory: 1Gi
   meilisearch:
     enabled: true
+    # 一个实例：索引来自共享库的投影，多个副本要各自灌一遍同一份索引。
+    replicas: 1
     image: getmeili/meilisearch:v1.10.3
+    # HTTP 端口：主应用的 wiki 检索与进化 Pod 的启动健康检查都按它取地址。
+    port: 7700
     storage: 5Gi
     resources:
       requests:
@@ -987,7 +1105,18 @@ backends:
   # 指向外部 S3 兼容端点（MinIO / 云对象存储，代码路径相同）。
   seaweedfs:
     enabled: true
+    # 一个实例：master、volume、filer、s3 四个进程同 Pod，多副本要的是它们各自
+    # 的集群部署，不是把这个数加一。
+    replicas: 1
     image: chrislusf/seaweedfs:3.71
+    # 四个进程同 Pod，四个端口各是一个面：master 管卷的分配，volume 存实际对象，
+    # filer 是带目录结构的视图，s3 是主应用读写 Raw 层走的那一个。它们必须与
+    # 启动参数里传给各进程的端口一致，所以参数也从这里取——写两份的话，改一处的
+    # 那次里 s3 客户端连的是一个没人听的端口。
+    masterPort: 9333
+    volumePort: 8080
+    filerPort: 8888
+    s3Port: 8333
     # 承载永久记忆的 Raw 层与冷层：只增不减，实测已 15Gi，取 20Gi。
     storage: 20Gi
     resources:
@@ -1170,6 +1299,9 @@ ingress:
   className: nginx
   # 空 = 兜底路由（任意 Host 头进主应用）；设值后按 host 匹配。
   host: ""
+  # 读写超时（秒）。WebSocket 与 SSE 走这条路由：nginx 的默认 60s 会把一条空闲
+  # 超过一分钟的长连接掐掉，而掐断在浏览器侧只表现为"重连"，看不出是入口干的。
+  proxyTimeoutSecs: 3600
 
 # 免费网页检索：集群内自建的 SearXNG，`web_search` 的后端。
 #
@@ -1204,7 +1336,16 @@ board:
 
 webSearch:
   enabled: true
-  base: "http://searxng:8080"
+  # 检索后端的端口：`base` 里的地址、容器端口、Service 与 egree 放行都按它取，
+  # 而 base 与策略各写一个字面量时，改一处的那次查询被策略静默丢弃。
+  port: 8080
+  # SearXNG 的 safe_search 档位（0 关 / 1 中等 / 2 严格）。默认关：这一层是给
+  # agent 取事实用的，过滤掉的结果在 tools 返回值里不留痕，读起来像"没有这一页"。
+  safeSearch: 0
+  # 空 = 从 port 与 Service 名派生（http://searxng:<port>）。设值则整条地址由
+  # 运维给——那时端口也跟着这条地址走，`port` 只再决定容器/Service/策略三处。
+  # 默认不写字面量：同一个端口在一份文件里写两遍，就是两次机会让它们分家。
+  base: ""
   # 后备检索端点：`POST {fallbackBase}/search`，只在自建的 SearXNG **一个引擎都没
   # 应答**时才问它（结果为空且 `unresponsive_engines` 非空，重试一次仍如此）。
   # 那一刻自建那层什么都没答，所以这里不放弃任何它握着的东西；出网的就是 query
@@ -1234,8 +1375,12 @@ webSearch:
 # 每回合都可能调的动作，按次计费的服务端抓取工具会把「读一下这一页」变成账单。
 webFetch:
   enabled: true
-  # 空值＝这个部署不接渲染后端，`web_fetch` 回落到本进程读。
-  base: "http://crawl4ai:11235"
+  # 渲染后端的端口：与 webSearch.port 同一处置——地址、容器端口、Service、egress
+  # 放行四处同源，否则改一处等于换了一条没人放行的路。
+  port: 11235
+  # 空值＋enabled=false＝这个部署不接渲染后端，`web_fetch` 回落到本进程读；
+  # enabled=true 且 base 为空时从 port 与 Service 名派生，理由同 webSearch.base。
+  base: ""
   image: docker.io/unclecode/crawl4ai:0.7.4
   replicas: 1
   # Chromium 把共享内存当工作区用：默认的 64MiB /dev/shm 在中等页面上就会让

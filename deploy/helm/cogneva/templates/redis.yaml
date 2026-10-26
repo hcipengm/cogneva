@@ -9,7 +9,7 @@ metadata:
     app.kubernetes.io/component: message-queue
 spec:
   serviceName: redis
-  replicas: 1
+  replicas: {{ .Values.backends.redis.replicas }}
   selector:
     matchLabels:
       app.kubernetes.io/name: redis
@@ -69,7 +69,7 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - name: redis
-              containerPort: 6379
+              containerPort: {{ .Values.backends.redis.port }}
               protocol: TCP
           env:
             - name: REDIS_PASSWORD
@@ -152,14 +152,14 @@ spec:
               line() { sed -n "$2p" "$1" 2>/dev/null | head -n 1; }
               scanned=0
               while true; do
-                if redis-cli -h 127.0.0.1 -p 6379 -a "$REDIS_PASSWORD" --no-auth-warning INFO \
+                if redis-cli -h 127.0.0.1 -p {{ .Values.backends.redis.port }} -a "$REDIS_PASSWORD" --no-auth-warning INFO \
                     > "$props" 2>/dev/null && grep -q '^used_memory:' "$props"; then
                   now=$(date +%s)
                   # The census writes its own file and is read back from it, so a
                   # failed scan leaves the last pair and an ageing timestamp
                   # rather than dropping the series out of the exposition.
                   if [ $((now - scanned)) -ge "$wal_interval" ]; then
-                    census=$(redis-cli -h 127.0.0.1 -p 6379 -a "$REDIS_PASSWORD" --no-auth-warning \
+                    census=$(redis-cli -h 127.0.0.1 -p {{ .Values.backends.redis.port }} -a "$REDIS_PASSWORD" --no-auth-warning \
                       EVAL "$wal_census" 0 2>/dev/null)
                     wal_keys=$(printf '%s\n' "$census" | sed -n '1p')
                     wal_max=$(printf '%s\n' "$census" | sed -n '2p')
@@ -213,7 +213,7 @@ spec:
             - --collector.textfile.directory=/report
           ports:
             - name: aof-metrics
-              containerPort: 9100
+              containerPort: {{ .Values.backends.redis.aofReportExporter.port }}
               protocol: TCP
           resources:
 {{ toYaml .Values.backends.redis.aofReportExporter.resources | indent 12 }}
@@ -254,7 +254,7 @@ spec:
     app.kubernetes.io/component: message-queue
   ports:
     - name: redis
-      port: 6379
+      port: {{ .Values.backends.redis.port }}
       targetPort: redis
       protocol: TCP
 {{- end }}

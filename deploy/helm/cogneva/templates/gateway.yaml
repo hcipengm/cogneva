@@ -67,17 +67,17 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
-              containerPort: 8080
+              containerPort: {{ .Values.gateway.httpPort }}
               protocol: TCP
             # 网关验签后的 webhook 转发入口（cogneva.json github_integration.webhook.port）
             - name: webhook
-              containerPort: 9091
+              containerPort: {{ .Values.gateway.webhookPort }}
               protocol: TCP
             # 零凭证的集群内面（cogneva.json gateway.internal_port）：只挂 memory 的
             # 归档写与 Raw 读。跑 squad 的 Pod 手里没有凭证，主 API 上那几条按角色判
             # 它永远进不来，所以这几条另挂一个端口，判据交给网络策略。
             - name: internal
-              containerPort: 8085
+              containerPort: {{ .Values.gateway.internalPort }}
               protocol: TCP
           envFrom:
             - configMapRef:
@@ -96,7 +96,7 @@ spec:
                   name: cogneva-secrets
                   key: redis-password
             - name: COGNEVA_DATABASE_URL
-              value: "postgres://cog_user:$(PG_PASSWORD)@postgres.{{ include "cogneva.namespace" . }}.svc.cluster.local:5432/cogneva"
+              value: {{ printf "postgres://cog_user:$(PG_PASSWORD)@postgres.%s.svc.cluster.local:%d/cogneva" (include "cogneva.namespace" .) (int .Values.backends.postgres.port) | quote }}
             # 引导管理员（admin）的登录口令：装机时随机生成、只从 Secret 注入。
             # optional：这份清单先于 Secret 键存在时也要能起；缺键等于「没开这扇门」，
             # 登录退回用户库，而不是把 Pod 卡在 ContainerCreating。
@@ -136,15 +136,15 @@ spec:
             # GitHub/Gitee API 与 git 传输走安全网关透传（凭证网关注入，本 Pod 零 token）。
             # 缺这三个 env 时 Provider 直连公网平台——集群仅网关在 egress 白名单内，直连必败。
             - name: COGNEVA_GITHUB_API_BASE
-              value: "http://cogneva-security-gateway:8081/github"
+              value: {{ printf "http://cogneva-security-gateway:%d/github" (int .Values.securityGateway.llmProxyPort) | quote }}
             - name: COGNEVA_GITEE_API_BASE
-              value: "http://cogneva-security-gateway:8081/gitee"
+              value: {{ printf "http://cogneva-security-gateway:%d/gitee" (int .Values.securityGateway.llmProxyPort) | quote }}
             # 通知机器人签名借用面：机器人报文要签名时向安全网关借一对
             # (timestamp, sign)，平台密钥不出网关。未配置＝这个部署不签名。
             - name: COGNEVA_NOTIFICATION_SIGN_BASE
-              value: "http://cogneva-security-gateway:8081"
+              value: {{ printf "http://cogneva-security-gateway:%d" (int .Values.securityGateway.llmProxyPort) | quote }}
             - name: COGNEVA_GIT_PROXY_BASE
-              value: "http://cogneva-security-gateway:8081/git"
+              value: {{ printf "http://cogneva-security-gateway:%d/git" (int .Values.securityGateway.llmProxyPort) | quote }}
             # 要按文档持续排产的那些面：值是一个 face 列表（id/repo/sop_path/
             # cadence_secs），它逐个说清去哪里读哪份文档。只认这个 Secret 键，值
             # 带外写入清单——面名与仓名是部署自己的事，公开树里一个都不出现。
@@ -163,11 +163,11 @@ spec:
             # 与本调用无关。缺这个值＝归档未配置，截断的尾巴无处可存，读数里带
             # unconfigured 的原因。
             - name: COGNEVA_MEMORY_API_BASE
-              value: "http://127.0.0.1:8085"
+              value: {{ printf "http://127.0.0.1:%d" (int .Values.gateway.internalPort) | quote }}
             # 免费网页检索的后端（集群内 SearXNG）：本进程里的 agent 循环用它，
             # 与进化 Pod 同源同名，少一条就有一面的 `web_search` 用不了。
             - name: COGNEVA_WEB_SEARCH_BASE
-              value: {{ .Values.webSearch.base | quote }}
+              value: {{ include "cogneva.searxngBase" . | quote }}
             # 检索的后备端点（安全网关的 /search-fallback 透传）：只在自建 SearXNG 一个
             # 引擎都没应答时才问。空值＝查询永不外发，这个部署选择的是「没有
             # 答案」而不是用别处冒充。
@@ -179,7 +179,7 @@ spec:
             # 空值＝本进程读 HTML，客户端渲染的页面只能拿回空壳。
             {{- if .Values.webFetch.enabled }}
             - name: COGNEVA_WEB_FETCH_BASE
-              value: {{ .Values.webFetch.base | quote }}
+              value: {{ include "cogneva.crawl4aiBase" . | quote }}
             {{- end }}
             # git 身份自举的基线仓库（owner/name）。自举循环跑在**本进程**：
             # cogneva-secrets 的属主就是这里（WebUI 向导与贡献通道写同一份），
@@ -250,7 +250,7 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             - name: COGNEVA_OAUTH_GATEWAY_URL
-              value: "http://cogneva-security-gateway:8081"
+              value: {{ printf "http://cogneva-security-gateway:%d" (int .Values.securityGateway.llmProxyPort) | quote }}
             {{- with .Values.contribution.giteeOauthRedirectUri }}
             - name: COGNEVA_GITEE_OAUTH_REDIRECT_URI
               value: {{ . | quote }}
@@ -264,7 +264,7 @@ spec:
             - name: COGNEVA_CLUSTER_NAME
               value: {{ .Values.gitops.clusterName | quote }}
             - name: COGNEVA_GITOPS_METRICS_URL
-              value: "http://localhost:8080/metrics"
+              value: {{ printf "http://localhost:%d/metrics" (int .Values.gateway.httpPort) | quote }}
             # 数据卷占用只由写它的进程量得出来：目录型卷的"容量"是整个节点文件系统，
             # 声明量与实际占用之间没有任何东西对账。进程知道自己写哪个目录、不知道
             # 目录背后是哪张 PVC，所以由部署侧指名（与上面挂载的 claimName 同一个）。
@@ -423,16 +423,16 @@ spec:
     app.kubernetes.io/component: gateway
   ports:
     - name: http
-      port: 8080
+      port: {{ .Values.gateway.httpPort }}
       targetPort: http
       protocol: TCP
     - name: webhook
-      port: 9091
-      targetPort: 9091
+      port: {{ .Values.gateway.webhookPort }}
+      targetPort: webhook
       protocol: TCP
     # 零凭证的集群内面：只开给本命名空间里的工作负载（谁可连接见 network-policy
     # 里挂在主应用 Pod 上的 ingress 规则）。
     - name: internal
-      port: 8085
+      port: {{ .Values.gateway.internalPort }}
       targetPort: internal
       protocol: TCP

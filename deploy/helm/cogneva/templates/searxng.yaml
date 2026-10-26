@@ -58,7 +58,7 @@ data:
       # JSON 默认不开。`web_search` 读的就是这一面——少了这行，工具每次拿回 403，
       # 错误里会点名这一项。
     search:
-      safe_search: 0
+      safe_search: {{ .Values.webSearch.safeSearch }}
       formats:
         - html
         - json
@@ -103,7 +103,7 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
-              containerPort: 8080
+              containerPort: {{ .Values.webSearch.port }}
               protocol: TCP
           env:
             # 配置从这里读，不打进镜像；容器内路径由镜像的 entrypoint 认。
@@ -159,7 +159,7 @@ spec:
     app.kubernetes.io/component: search
   ports:
     - name: http
-      port: 8080
+      port: {{ .Values.webSearch.port }}
       targetPort: http
       protocol: TCP
 {{- end }}

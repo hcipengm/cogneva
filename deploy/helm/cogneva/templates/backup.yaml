@@ -35,19 +35,19 @@ spec:
   schedule: {{ .Values.backup.schedule | quote }}
   timeZone: {{ .Values.backup.timeZone | quote }}
   concurrencyPolicy: Forbid
-  startingDeadlineSeconds: 1800
-  successfulJobsHistoryLimit: 2
-  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: {{ .Values.backup.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ .Values.backup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.backup.failedJobsHistoryLimit }}
   jobTemplate:
     spec:
       # 备份失败不重试成串：下一个周期自然再来，连续失败由 history 留证。
-      backoffLimit: 1
+      backoffLimit: {{ .Values.backup.backoffLimit }}
       # 卡死的运行必须有人来杀。concurrencyPolicy 是 Forbid，一次挂住的运行会
       # 让它之后每一次都不再开始——备份停掉，连「谁来给挂住那笔收尾」也一起停。
       # 这个界杀的是容器，同一个值经 env 进运行自己写的账本行，判超期用的是那一
       # 行上的数（见 backup.rs 的 run_deadline_seconds）。
       activeDeadlineSeconds: {{ .Values.backup.runDeadlineSeconds }}
-      ttlSecondsAfterFinished: 86400
+      ttlSecondsAfterFinished: {{ .Values.backup.ttlSecondsAfterFinished }}
       template:
         metadata:
           labels:
@@ -115,10 +115,10 @@ spec:
                       name: cogneva-secrets
                       key: pg-password
                 - name: COGNEVA_DATABASE_URL
-                  value: "postgres://cog_user:$(PG_PASSWORD)@postgres.{{ include "cogneva.namespace" . }}.svc.cluster.local:5432/cogneva"
+                  value: {{ printf "postgres://cog_user:$(PG_PASSWORD)@postgres.%s.svc.cluster.local:%d/cogneva" (include "cogneva.namespace" .) (int .Values.backends.postgres.port) | quote }}
                 # 快照 API 只在 Qdrant REST 端口（6333），gRPC（6334）没有。
                 - name: COGNEVA_QDRANT_HTTP_URL
-                  value: "http://qdrant.{{ include "cogneva.namespace" . }}.svc.cluster.local:6333"
+                  value: {{ printf "http://qdrant.%s.svc.cluster.local:%d" (include "cogneva.namespace" .) (int .Values.backends.qdrant.port) | quote }}
                 - name: COGNEVA_BACKUP_KEEP
                   value: {{ .Values.backup.keepCount | quote }}
                 # 与 jobTemplate 的 activeDeadlineSeconds 是同一个值的两个载体：
@@ -262,15 +262,15 @@ spec:
   timeZone: {{ .Values.backup.timeZone | quote }}
   # 同备份：两次演练同时在跑只会在同一个库名上互相删库。
   concurrencyPolicy: Forbid
-  startingDeadlineSeconds: 1800
-  successfulJobsHistoryLimit: 2
-  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: {{ .Values.backup.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ .Values.backup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.backup.failedJobsHistoryLimit }}
   jobTemplate:
     spec:
       # 演练失败不重试成串：答案已经落进 backup_drills 了，下一晚自然再来。
-      backoffLimit: 0
+      backoffLimit: {{ .Values.backup.drillBackoffLimit }}
       activeDeadlineSeconds: {{ .Values.backup.drillDeadlineSeconds }}
-      ttlSecondsAfterFinished: 86400
+      ttlSecondsAfterFinished: {{ .Values.backup.ttlSecondsAfterFinished }}
       template:
         metadata:
           labels:
@@ -329,7 +329,7 @@ spec:
                 # 账行与源库那几行逐格比。这不违反「不在源库上做演练」——遍历的
                 # 是另一个数据库名，源 schema 只被读。
                 - name: COGNEVA_DATABASE_URL
-                  value: "postgres://cog_user:$(PG_PASSWORD)@postgres.{{ include "cogneva.namespace" . }}.svc.cluster.local:5432/cogneva"
+                  value: {{ printf "postgres://cog_user:$(PG_PASSWORD)@postgres.%s.svc.cluster.local:%d/cogneva" (include "cogneva.namespace" .) (int .Values.backends.postgres.port) | quote }}
                 {{- with .Values.backup.packageKeySecret.name }}
                 # 读包要同一份口令：加密包在演练里解不开会让当晚 outcome=failed，
                 # 所以写包、演练、恢复三处的注入必须同一步上线。

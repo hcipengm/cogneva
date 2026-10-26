@@ -19,7 +19,7 @@ spec:
     app.kubernetes.io/component: security-gateway
   ports:
     - name: webhook
-      port: 8082
-      targetPort: 8082
+      port: {{ .Values.securityGateway.webhookPort }}
+      targetPort: webhook
       nodePort: {{ .Values.webhook.nodePort }}
 {{- end }}

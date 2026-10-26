@@ -45,3 +45,27 @@ containerd 那一条恒在（它就是 `imageStoreMountPath`），其余来自
 {{- end -}}
 {{- join "," $pairs -}}
 {{- end -}}
+
+{{/*
+网页检索与渲染后端的地址：`webSearch.base` / `webFetch.base` 留空时按 port 与
+Service 名派生。
+
+地址与容器端口分两处写时，改端口的那个部署会拿到一条指向旧端口的地址，症状是
+查询/抓取超时——读起来像后端挂了，真因是两个数已经分家。所以缺省不写字面量，
+端口只出现在 values 的 `port` 一处。
+*/}}
+{{- define "cogneva.searxngBase" -}}
+{{- if .Values.webSearch.base -}}
+{{- .Values.webSearch.base -}}
+{{- else -}}
+{{- printf "http://searxng:%d" (int .Values.webSearch.port) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cogneva.crawl4aiBase" -}}
+{{- if .Values.webFetch.base -}}
+{{- .Values.webFetch.base -}}
+{{- else -}}
+{{- printf "http://crawl4ai:%d" (int .Values.webFetch.port) -}}
+{{- end -}}
+{{- end -}}

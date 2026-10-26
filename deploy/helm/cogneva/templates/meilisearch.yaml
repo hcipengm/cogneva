@@ -26,7 +26,7 @@ metadata:
     app.kubernetes.io/name: meilisearch
     app.kubernetes.io/component: search
 spec:
-  replicas: 1
+  replicas: {{ .Values.backends.meilisearch.replicas }}
   strategy:
     type: Recreate
   selector:
@@ -45,7 +45,7 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
-              containerPort: 7700
+              containerPort: {{ .Values.backends.meilisearch.port }}
               protocol: TCP
           env:
             # production 模式强制要求主密钥；监听地址必须显式放开到 0.0.0.0，
@@ -53,7 +53,7 @@ spec:
             - name: MEILI_ENV
               value: production
             - name: MEILI_HTTP_ADDR
-              value: 0.0.0.0:7700
+              value: {{ printf "0.0.0.0:%d" (int .Values.backends.meilisearch.port) }}
             - name: MEILI_NO_ANALYTICS
               value: "true"
             - name: MEILI_MASTER_KEY
@@ -101,7 +101,7 @@ spec:
     app.kubernetes.io/component: search
   ports:
     - name: http
-      port: 7700
+      port: {{ .Values.backends.meilisearch.port }}
       targetPort: http
       protocol: TCP
 {{- end }}

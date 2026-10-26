@@ -46,10 +46,10 @@ spec:
           port: 4222
         - protocol: TCP
           port: 6333
-        # Meilisearch（7700）：wiki 检索后端，进化 Pod 启动即健康检查该地址。
+        # Meilisearch：wiki 检索后端，进化 Pod 启动即健康检查该地址。
         - protocol: TCP
           port: 7700
-        # 沙箱执行器（9090）：主应用与进化共用的零凭证工具执行面
+        # 沙箱执行器：主应用与进化共用的零凭证工具执行面
         # （run_command/read_file/write_file），该 Pod 不持有任何 Secret。
         - protocol: TCP
           port: 9090
@@ -64,7 +64,7 @@ spec:
         # 具名的消费者了；留着一条说不出谁在用的放行，等于把"最小授权"改成"历史遗留"。
         - protocol: TCP
           port: 8085
-        # 集群内镜像仓库（5000）：publisher push 金丝雀 overlay / 主线 overlay 镜像
+        # 集群内镜像仓库：publisher push 金丝雀 overlay / 主线 overlay 镜像
         - protocol: TCP
           port: 5000
         # 同一张卷的走查读数（9100）：容量回收判的是

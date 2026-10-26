@@ -18,8 +18,9 @@
 //!   agreement, because "fixed by agreement" and "nobody has looked at this" are
 //!   the same number on the page.
 //! - `dial`: a number a deployment may want to change, which the chart has not
-//!   given a home in `values.yaml` yet. These are the debt: every one of them
-//!   says what the fix is, and the ceiling is where the count stands today.
+//!   given a home in `values.yaml`. This is the debt, and the ceiling is zero:
+//!   the ports, timeouts and replica counts that used to live here now read a
+//!   `values.yaml` key, so a new `dial` row is a red test rather than a budget.
 //!
 //! What is deliberately not counted, because it is not a number anybody chose:
 //! numbers inside `{{ }}` (that is a value being read, not written), numbers
@@ -42,10 +43,11 @@ const REGISTRY: &str = "deploy/helm/cogneva/template-literals.tsv";
 /// Hardcoded dials still in the templates, counted as sites rather than rows so
 /// that a number written eight times costs what it costs.
 ///
-/// The number is the population measured when the register was written; the goal
-/// is zero, and it only ever goes down. Raising it is a decision to ship a new
-/// hardcoded dial, which is the thing this test exists to make visible.
-const DIAL_SITE_CEILING: usize = 156;
+/// Zero: every dial the register once carried now reads from `values.yaml`, and
+/// the register keeps only `fixed` rows. Raising this number is a decision to
+/// ship a new hardcoded dial -- the thing this test exists to make visible -- so
+/// it stays at zero and a new dial means a new `values.yaml` key, not a new row.
+const DIAL_SITE_CEILING: u64 = 0;
 
 /// Which of the two things a registered number is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,7 +404,7 @@ fn the_hardcoded_dials_do_not_grow() {
         .map(|row| row.sites)
         .sum();
     assert!(
-        dial_sites <= DIAL_SITE_CEILING,
+        dial_sites as u64 <= DIAL_SITE_CEILING,
         "{dial_sites} numbers are written straight into chart templates with no \
          home in values.yaml, and the ceiling is {DIAL_SITE_CEILING}. A deployment \
          cannot change any of them without editing the chart, and two files that \

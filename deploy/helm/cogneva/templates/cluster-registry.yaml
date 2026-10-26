@@ -34,7 +34,7 @@ metadata:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: cluster-registry
 spec:
-  replicas: 1
+  replicas: {{ .Values.clusterRegistry.replicas }}
   strategy:
     type: Recreate
   selector:
@@ -98,7 +98,7 @@ spec:
               value: "true"
           ports:
             - name: registry
-              containerPort: 5000
+              containerPort: {{ .Values.clusterRegistry.port }}
               protocol: TCP
           startupProbe:
             httpGet:
@@ -207,7 +207,7 @@ spec:
     app.kubernetes.io/component: cluster-registry
   ports:
     - name: registry
-      port: 5000
+      port: {{ .Values.clusterRegistry.port }}
       targetPort: registry
       nodePort: {{ .Values.clusterRegistry.nodePort }}
       protocol: TCP

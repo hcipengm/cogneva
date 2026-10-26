@@ -47,13 +47,13 @@ spec:
           args: ["security-gateway"]
           ports:
             - name: egress-proxy
-              containerPort: 8080
+              containerPort: {{ .Values.securityGateway.egressProxyPort }}
               protocol: TCP
             - name: llm-proxy
-              containerPort: 8081
+              containerPort: {{ .Values.securityGateway.llmProxyPort }}
               protocol: TCP
             - name: webhook
-              containerPort: 8082
+              containerPort: {{ .Values.securityGateway.webhookPort }}
               protocol: TCP
             - name: metrics
               containerPort: {{ .Values.securityGateway.metricsPort }}
@@ -256,9 +256,9 @@ spec:
                   name: cogneva-secrets
                   key: redis-password
             - name: COGNEVA_DATABASE_URL
-              value: "postgres://cog_user:$(PG_PASSWORD)@postgres.{{ include "cogneva.namespace" . }}.svc.cluster.local:5432/cogneva"
+              value: {{ printf "postgres://cog_user:$(PG_PASSWORD)@postgres.%s.svc.cluster.local:%d/cogneva" (include "cogneva.namespace" .) (int .Values.backends.postgres.port) | quote }}
             - name: COGNEVA_REDIS_URL
-              value: "redis://:$(REDIS_PASSWORD)@redis-0.redis.{{ include "cogneva.namespace" . }}.svc.cluster.local:6379"
+              value: {{ printf "redis://:$(REDIS_PASSWORD)@redis-0.redis.%s.svc.cluster.local:%d" (include "cogneva.namespace" .) (int .Values.backends.redis.port) | quote }}
             # 日志→Loki、时序明细→ClickHouse、告警→Alertmanager；端点随观测栈，
             # 未启用时对应导出静默降级（池自愈主链不受影响）。
             - name: COGNEVA_LOKI_ENABLED
@@ -389,11 +389,11 @@ spec:
     app.kubernetes.io/component: security-gateway
   ports:
     - name: egress-proxy
-      port: 8080
+      port: {{ .Values.securityGateway.egressProxyPort }}
       targetPort: egress-proxy
       protocol: TCP
     - name: llm-proxy
-      port: 8081
+      port: {{ .Values.securityGateway.llmProxyPort }}
       targetPort: llm-proxy
       protocol: TCP
     - name: metrics

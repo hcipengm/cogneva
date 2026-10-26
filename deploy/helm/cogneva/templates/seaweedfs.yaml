@@ -32,7 +32,7 @@ metadata:
     app.kubernetes.io/name: seaweedfs
     app.kubernetes.io/component: objectstore
 spec:
-  replicas: 1
+  replicas: {{ .Values.backends.seaweedfs.replicas }}
   strategy:
     # RWO 卷不能两个 Pod 同时挂，滚动更新必须先退旧再起新。
     type: Recreate
@@ -53,25 +53,25 @@ spec:
           args:
             - server
             - -dir=/data
-            - -master.port=9333
-            - -volume.port=8080
+            - -master.port={{ .Values.backends.seaweedfs.masterPort }}
+            - -volume.port={{ .Values.backends.seaweedfs.volumePort }}
             - -filer
-            - -filer.port=8888
+            - -filer.port={{ .Values.backends.seaweedfs.filerPort }}
             - -s3
-            - -s3.port=8333
+            - -s3.port={{ .Values.backends.seaweedfs.s3Port }}
             # 身份文件由 cogneva-secrets 提供：网关按它校验 SigV4，主应用按
             # 同一份凭证签名。缺省无此文件时网关放开匿名访问，等于对象存储
             # 无鉴权，故这里是必需挂载。
             - -s3.config=/etc/seaweedfs/s3.json
           ports:
             - name: s3
-              containerPort: 8333
+              containerPort: {{ .Values.backends.seaweedfs.s3Port }}
               protocol: TCP
             - name: master
-              containerPort: 9333
+              containerPort: {{ .Values.backends.seaweedfs.masterPort }}
               protocol: TCP
             - name: filer
-              containerPort: 8888
+              containerPort: {{ .Values.backends.seaweedfs.filerPort }}
               protocol: TCP
           # 主进程含四个角色，探针分开测：存活看 master 的 HTTP 接口（未鉴权、
           # 恒 200），就绪额外确认 S3 网关真的在应答——端口被 bind 不等于网关
@@ -91,7 +91,7 @@ spec:
               command:
                 - /bin/sh
                 - -c
-                - wget -qS -O /dev/null http://127.0.0.1:8333/ 2>&1 | grep -q 'HTTP/1.1'
+                - wget -qS -O /dev/null http://127.0.0.1:{{ .Values.backends.seaweedfs.s3Port }}/ 2>&1 | grep -q 'HTTP/1.1'
 {{ toYaml .Values.healthProbes.readiness | indent 12 }}
           resources:
 {{ toYaml .Values.backends.seaweedfs.resources | indent 12 }}
@@ -128,7 +128,7 @@ spec:
     app.kubernetes.io/component: objectstore
   ports:
     - name: s3
-      port: 8333
+      port: {{ .Values.backends.seaweedfs.s3Port }}
       targetPort: s3
       protocol: TCP
 {{- end }}

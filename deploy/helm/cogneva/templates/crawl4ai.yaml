@@ -45,7 +45,7 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
-              containerPort: 11235
+              containerPort: {{ .Values.webFetch.port }}
               protocol: TCP
           volumeMounts:
             # Chromium 把共享内存当工作区用。默认的 64MiB 在中等页面上就会让渲染
@@ -98,7 +98,7 @@ spec:
     app.kubernetes.io/component: fetch
   ports:
     - name: http
-      port: 11235
+      port: {{ .Values.webFetch.port }}
       targetPort: http
       protocol: TCP
 {{- end }}

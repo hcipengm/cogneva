@@ -26,5 +26,5 @@ spec:
   ports:
     - name: webhook
       port: 8082
-      targetPort: 8082
+      targetPort: webhook
       nodePort: 30991

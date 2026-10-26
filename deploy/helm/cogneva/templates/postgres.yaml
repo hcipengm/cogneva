@@ -9,7 +9,7 @@ metadata:
     app.kubernetes.io/component: database
 spec:
   serviceName: postgres
-  replicas: 1
+  replicas: {{ .Values.backends.postgres.replicas }}
   selector:
     matchLabels:
       app.kubernetes.io/name: postgres
@@ -26,7 +26,7 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - name: postgres
-              containerPort: 5432
+              containerPort: {{ .Values.backends.postgres.port }}
               protocol: TCP
           env:
             - name: POSTGRES_USER
@@ -76,7 +76,7 @@ spec:
           imagePullPolicy: IfNotPresent
           env:
             - name: DATA_SOURCE_URI
-              value: "127.0.0.1:5432/cogneva?sslmode=disable"
+              value: {{ printf "127.0.0.1:%d/cogneva?sslmode=disable" (int .Values.backends.postgres.port) | quote }}
             - name: DATA_SOURCE_USER
               value: "cog_user"
             - name: DATA_SOURCE_PASS
@@ -103,7 +103,7 @@ spec:
           # 那条门记录下你量到的镜像（`deploy/images/postgres-exporter.series.yaml`）。
           ports:
             - name: pg-metrics
-              containerPort: 9187
+              containerPort: {{ .Values.backends.postgres.exporterPort }}
               protocol: TCP
           # 探针的数值只从 .Values.healthProbes 来：写死在这里，改配置面与改
           # 部署就成了两件事，两侧必然漂移（probe-budget 门禁查这一条）。
@@ -151,7 +151,7 @@ spec:
     app.kubernetes.io/component: database
   ports:
     - name: postgres
-      port: 5432
+      port: {{ .Values.backends.postgres.port }}
       targetPort: postgres
       protocol: TCP
 {{- end }}

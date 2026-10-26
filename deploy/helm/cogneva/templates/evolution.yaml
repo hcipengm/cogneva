@@ -178,7 +178,7 @@ metadata:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: evolution
 spec:
-  replicas: 1
+  replicas: {{ .Values.evolution.replicas }}
   strategy:
     type: Recreate
   selector:
@@ -220,7 +220,7 @@ spec:
               # 但连接超时与低速阈值管不住"带宽很低但在动"的传输：实测一次
               # fetch 跑了 14 分钟没完，把整段启动预算吃光、Pod 被判启动超时
               # （一次网络慢被记成版本缺陷）。所以每个走公网的 git 调用再加一层
-              # 挂钟上界：单次尝试最多 240 秒（实测正常读数秒级到几十秒，取数倍
+              # 挂钟上界：单次尝试最多 `workspaceFetch.timeoutSecs` 秒（实测正常读数秒级到几十秒，取数倍
               # 余量）。超了就当这个镜像不可用、走下面已有的失败分支，语义不变。
               # 代价：真的很大的传输可能一次传不完而被放弃，下一轮从零再来（被杀
               # 掉的 fetch 不落 refs），极端网络下裸仓会停在旧 main——启动可用性
@@ -233,14 +233,14 @@ spec:
                 for m in $(echo "$mirrors" | tr ',' ' '); do
                   echo "git-remote is empty; seeding bare repo from $m ..."
                   rc=0
-                  /usr/bin/timeout 240 git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 clone --bare "$m" /tmp/seed.git || rc=$?
+                  /usr/bin/timeout {{ .Values.workspaceFetch.timeoutSecs }} git -c http.connectTimeout={{ .Values.workspaceFetch.connectTimeoutSecs }} -c http.lowSpeedLimit={{ .Values.workspaceFetch.lowSpeedLimitBytesPerSec }} -c http.lowSpeedTime={{ .Values.workspaceFetch.lowSpeedSecs }} clone --bare "$m" /tmp/seed.git || rc=$?
                   if [ "$rc" = 0 ]; then
                     cp -a /tmp/seed.git/. /host-git/
                     rm -rf /tmp/seed.git
                     break
                   fi
                   if [ "$rc" = 124 ]; then
-                    echo "WARN: git-remote seed from $m gave up after the 240s bound (transfer slower than the bound, or the mirror never answered)"
+                    echo "WARN: git-remote seed from $m gave up after the {{ .Values.workspaceFetch.timeoutSecs }}s bound (transfer slower than the bound, or the mirror never answered)"
                   else
                     echo "WARN: git-remote seed from $m failed (rc=$rc)"
                   fi
@@ -256,12 +256,12 @@ spec:
                   git --git-dir=/host-git remote remove upstream 2>/dev/null || true
                   git --git-dir=/host-git remote add upstream "$m"
                   rc=0
-                  /usr/bin/timeout 240 git --git-dir=/host-git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch upstream --tags --force || rc=$?
+                  /usr/bin/timeout {{ .Values.workspaceFetch.timeoutSecs }} git --git-dir=/host-git -c http.connectTimeout={{ .Values.workspaceFetch.connectTimeoutSecs }} -c http.lowSpeedLimit={{ .Values.workspaceFetch.lowSpeedLimitBytesPerSec }} -c http.lowSpeedTime={{ .Values.workspaceFetch.lowSpeedSecs }} fetch upstream --tags --force || rc=$?
                   if [ "$rc" = 0 ]; then
                     break
                   fi
                   if [ "$rc" = 124 ]; then
-                    echo "WARN: fetch upstream tags from $m gave up after the 240s bound (transfer slower than the bound, or the mirror never answered); trying the next mirror"
+                    echo "WARN: fetch upstream tags from $m gave up after the {{ .Values.workspaceFetch.timeoutSecs }}s bound (transfer slower than the bound, or the mirror never answered); trying the next mirror"
                   else
                     echo "WARN: fetch upstream tags from $m failed (rc=$rc); trying the next mirror"
                   fi
@@ -381,30 +381,30 @@ spec:
                   name: cogneva-secrets
                   key: redis-password
             - name: COGNEVA_DATABASE_URL
-              value: "postgres://cog_user:$(PG_PASSWORD)@postgres.{{ include "cogneva.namespace" . }}.svc.cluster.local:5432/cogneva"
+              value: {{ printf "postgres://cog_user:$(PG_PASSWORD)@postgres.%s.svc.cluster.local:%d/cogneva" (include "cogneva.namespace" .) (int .Values.backends.postgres.port) | quote }}
             - name: COGNEVA_GITHUB_API_BASE
-              value: "http://cogneva-security-gateway:8081/github"
+              value: {{ printf "http://cogneva-security-gateway:%d/github" (int .Values.securityGateway.llmProxyPort) | quote }}
             - name: COGNEVA_GITEE_API_BASE
-              value: "http://cogneva-security-gateway:8081/gitee"
+              value: {{ printf "http://cogneva-security-gateway:%d/gitee" (int .Values.securityGateway.llmProxyPort) | quote }}
             # 通知机器人签名借用面：机器人报文要签名时向安全网关借一对
             # (timestamp, sign)，平台密钥不出网关。本 Pod 跑的是同一个二进制、
             # 装的是同一套插件，所以这条与主应用那份必须同源——少一条，这个
             # 进程发出的通知就退回未签名，而平台会以「签名校验失败」拒收。
             - name: COGNEVA_NOTIFICATION_SIGN_BASE
-              value: "http://cogneva-security-gateway:8081"
+              value: {{ printf "http://cogneva-security-gateway:%d" (int .Values.securityGateway.llmProxyPort) | quote }}
             - name: COGNEVA_GIT_PROXY_BASE
-              value: "http://cogneva-security-gateway:8081/git"
+              value: {{ printf "http://cogneva-security-gateway:%d/git" (int .Values.securityGateway.llmProxyPort) | quote }}
             # 内存 Raw 层的面（归档工具的巨量输出 + 取引用读回），零凭证。指向主应用
             # 的**内部端口** 8085，不是主 API 的 8080：8080 上那几条按角色判，本 Pod
             # 零凭证恒吃 401。本 Pod 的 egress 是白名单，少了 network-policy 里那一条
             # 端口放行，归档请求会被静默丢弃。与主应用那份同源。
             - name: COGNEVA_MEMORY_API_BASE
-              value: "http://cogneva:8085"
+              value: {{ printf "http://cogneva:%d" (int .Values.gateway.internalPort) | quote }}
             # 免费网页检索的后端（集群内 SearXNG）。这一条把 `web_search` 从「注册了
             # 但每次调用都报没配地址」变成可用；它不走安全网关——本 Pod 零凭证，而
             # 检索面本来就是无凭证的集群内服务。空值＝这个部署不接网页检索。
             - name: COGNEVA_WEB_SEARCH_BASE
-              value: {{ .Values.webSearch.base | quote }}
+              value: {{ include "cogneva.searxngBase" . | quote }}
             # 检索的后备端点：这一条走安全网关，理由与上面那条不同——自建那层是
             # 无凭证的集群内服务所以不必绕网关，而后备要带 key 时 key 只住在网关
             # 里，本 Pod 仍然零持有。只在自建 SearXNG 一个引擎都没应答时才问：
@@ -418,7 +418,7 @@ spec:
             # 表现是每次抓取都超时。空值＝这个部署不接渲染，`web_fetch` 回落到本进程。
             {{- if .Values.webFetch.enabled }}
             - name: COGNEVA_WEB_FETCH_BASE
-              value: {{ .Values.webFetch.base | quote }}
+              value: {{ include "cogneva.crawl4aiBase" . | quote }}
             {{- end }}
             # 实例身份指纹：身份的规范来源，安装期生成、升级复用。身份决定
             # `evol/<id>` 分支名与按实例命名的常驻工作树，必须跨重启与重装稳定。
@@ -463,7 +463,7 @@ spec:
                     git config --global --add safe.directory /opt/cogneva/sandbox/workspaces
           ports:
             - name: http
-              containerPort: 8080
+              containerPort: {{ .Values.gateway.httpPort }}
               protocol: TCP
           volumeMounts:
             - name: sandbox-data
@@ -573,7 +573,7 @@ spec:
     app.kubernetes.io/component: evolution
   ports:
     - name: http
-      port: 8080
+      port: {{ .Values.gateway.httpPort }}
       targetPort: http
       protocol: TCP
 {{- if eq .Values.evolution.gitRemote.mode "pvc" }}

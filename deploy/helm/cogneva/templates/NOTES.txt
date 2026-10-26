@@ -2,7 +2,7 @@ Cogneva 已部署到命名空间 {{ .Values.global.namespace }}。
 
 验证：
   kubectl -n {{ .Values.global.namespace }} get pods
-  kubectl -n {{ .Values.global.namespace }} port-forward svc/cogneva 8080:8080
+  kubectl -n {{ .Values.global.namespace }} port-forward svc/cogneva {{ .Values.gateway.httpPort }}:{{ .Values.gateway.httpPort }}
 
 {{- if .Values.ingress.enabled }}
 入口：http://{{ .Values.ingress.host }}
