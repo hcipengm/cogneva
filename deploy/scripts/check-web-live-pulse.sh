@@ -2,7 +2,7 @@
 # 「连接开着」不等于「总线在说话」——状态条那一格的消费者门禁。
 #
 # 状态条过去只写「实时流 已连接」。断开看得见，可**连着而一帧都不来**看不见：平台
-# 停摆的时候屏幕上一切都是静止的，而没有任何一格说「总线已经十分钟没推来东西了」，
+# 停摆的时候屏幕上一切都是静止的，而没有任何一格说「总线已经很久没推来东西了」，
 # 读者的结论会是「平台很闲」，不是「发帧的那一端停了」。这两个状态在画面上完全
 # 一样，没有一格区分，等于把判断交给了猜。
 #
@@ -170,11 +170,24 @@ if (!none.text.includes('还没有一帧')) fail(`一帧没到时应说「还没
 if (!none.title) fail('一帧没到时没有解释');
 if (!colorMatches(none)) fail(`一帧没到时的颜色与判词对不上：${none.tone} / ${none.color}`);
 
+// 阈值本身也得判：这个数是照实测静默定的，不是拍的。24 小时落库事件流（742808 帧）
+// 里最长的一次正常静默 700 秒，超过两分钟的有 21 次——按两分钟判，这套平台每天会亮
+// 二十来次「流断了」，把真断的那一次淹掉。所以门槛不能低于实测静默的上沿。
+const MEASURED_QUIET_MS = 700_000;
+if (PULSE_STALE_MS <= MEASURED_QUIET_MS) {
+  fail(
+    `报警阈值 ${PULSE_STALE_MS / 1000} 秒不高于实测最长正常静默 ` +
+      `${MEASURED_QUIET_MS / 1000} 秒：正常静默会被读成断流`
+  );
+}
+
 const stale = v(p, 200_000 + PULSE_STALE_MS, 'open');
 if (stale.tone !== 'warn') fail('超时无帧时该报警色');
 if (!stale.text.includes('最近一帧在')) fail(`超时无帧应说清多久了：${stale.text}`);
-if (!stale.text.includes('2 分前')) fail(`两分钟没帧应读成「2 分前」：${stale.text}`);
-if (!stale.title.includes('2 分前')) fail('超时无帧的解释里没说多久');
+// 时长说法由阈值推出来，不钉死成一个字面量：改阈值那天，钉死的那句会红在与判据无关的地方。
+const staleAge = humanAge(PULSE_STALE_MS);
+if (!stale.text.includes(staleAge)) fail(`超时无帧应读成「${staleAge}」：${stale.text}`);
+if (!stale.title.includes(staleAge)) fail('超时无帧的解释里没说多久');
 if (!colorMatches(stale)) fail(`超时无帧的颜色与判词对不上：${stale.tone} / ${stale.color}`);
 
 const live = v(p, 200_000 + PULSE_STALE_MS - 1, 'open');
