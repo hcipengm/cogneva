@@ -9,6 +9,7 @@ import {
   type TopologyVolume,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { BreathingTopology } from '@/topology/BreathingTopology';
 import { Empty, Loading, ReadError } from '@/ui/primitives';
 
 /**
@@ -47,6 +48,9 @@ export function ClusterTopology() {
 
   return (
     <div className="flex flex-col divide-y divide-[var(--line)]">
+      {/* 先给图，再给表：图回答「谁在动、哪里坏了」，读到这里的人接着往下才看得懂
+          每一行的数为什么是那个数。 */}
+      <BreathingTopology data={data} />
       {data.clusters.map((cluster) => (
         <ClusterRow key={cluster.id} cluster={cluster} collectedAt={data.collected_at} />
       ))}

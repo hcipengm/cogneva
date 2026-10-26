@@ -55,6 +55,58 @@ canvas {
   .chat-caret { animation: none; opacity: 1; }
 }
 
+/*
+ * 集群图上的呼吸：一个环从紧到松再回来。
+ *
+ * 周期由组件按读数写成行内 `animation-duration`——「多快」是数据，不是样式。
+ * 尊重 reduced-motion 时完全停住：这一面停住也仍然读得出谁是谁，因为它不靠
+ * 动画表达状态，动画只是把真实用量画成一眼能看出的节奏。
+ */
+@keyframes topology-breathe {
+  0%, 100% { transform: scale(1); opacity: 0.55; }
+  50% { transform: scale(1.35); opacity: 0.08; }
+}
+
+.topology-pulse {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: topology-breathe 3s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .topology-pulse { animation: none; opacity: 0.35; }
+}
+
+/*
+ * 流程图：在跑的那条链上，箭头往前走、节点亮着；停下来的链完全静止。
+ *
+ * 「在动」本身就是读数：一条任务从 pending 走到 running，帧一到，这一笔就动起来，
+ * 不用等下一拍轮询把整张图重画。静止的链不动，正好让「哪儿在跑」一眼可辨。
+ */
+@keyframes flow-dash {
+  to { stroke-dashoffset: -16; }
+}
+
+.flow-edge-active {
+  stroke-dasharray: 4 4;
+  animation: flow-dash 1s linear infinite;
+  stroke: var(--ok);
+}
+
+@keyframes flow-glow {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+.flow-node-active {
+  animation: flow-glow 2.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flow-edge-active { animation: none; }
+  .flow-node-active { animation: none; opacity: 1; }
+}
+
 /* 回合之间的分隔靠留白与左侧那条细线，不靠卡片。 */
 .chat-turn-rule {
   background: var(--line);

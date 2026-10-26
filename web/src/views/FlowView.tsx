@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import { getProcessOverview, type GoalGroup, type ProcessTask } from '@/api/client';
+import { FlowGraph } from '@/views/FlowGraph';
 import { Strip } from '@/ui/plots';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
@@ -125,6 +126,21 @@ export function FlowView() {
             <p className="px-4 pb-2 text-[11px] text-[var(--muted)]">
               评测与落地不在这条线上：它们的读数在评测面与变更面。把它们画进这一段，
               会让「没有来源」看起来像「这一段没活」。
+            </p>
+          </section>
+
+          <section className="border-b border-[var(--line)]">
+            <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
+              流程图 · 谁等谁，现在走到哪一列
+            </h2>
+            {overview.goals.length === 0 ? (
+              <Empty>现在没有目标在跑，所以没有可画的流程。</Empty>
+            ) : (
+              <FlowGraph goals={overview.goals} statusOf={statusOf} />
+            )}
+            <p className="px-4 pb-2 text-[10px] text-[var(--muted)]">
+              一列是这个任务在依赖链上的深度：它等的那几条里最长的那条再加一。在跑的那一列，
+              箭头会往前走、节点会亮；停住的地方完全静止——形状本身就是「卡在哪儿」。
             </p>
           </section>
 

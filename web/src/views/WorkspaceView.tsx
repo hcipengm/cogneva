@@ -4,6 +4,7 @@ import { CanvasStage } from '@/canvas/CanvasStage';
 import { ConversationPane } from '@/conversation/ConversationPane';
 import { goalLiveIndex } from '@/conversation/dispatch';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { useServices } from '@/shell/context';
 import { resourceKey } from '@/store/frameTick';
 import { useShell } from '@/shell/store';
@@ -36,11 +37,10 @@ export function WorkspaceView() {
 
   // 每段对话交出去的目标现在做到哪儿了。对话面自己画不出「交给谁了」——那部分
   // 在任务图上，所以这一段总览由这一层读一次、折成一张表给所有窗格共用。
-  const processes = useResource('流程总览', getProcessOverview, 10_000, !USE_MOCK, [
-    'tasks',
-    'agents',
-    resourceKey('processes'),
-  ]);
+  const processes = useResource('流程总览', getProcessOverview, 10_000, !USE_MOCK);
+  // 任务换态、执行者换态、流程面自己报了一次改写，都会让这道目标的进度变。总览
+  // 每 10 秒才重读一次；不订这几帧，「跑 1」要等下一拍才变成「跑 0」。
+  useKindTickedRefresh(['tasks', 'agents', resourceKey('processes')], processes.refresh);
   const goalLive = useMemo(() => goalLiveIndex(processes.data), [processes.data]);
 
   const order = useChatStore((s) => s.order);
