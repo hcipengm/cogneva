@@ -195,6 +195,12 @@ fn register() -> Vec<(String, String)> {
         .collect()
 }
 
+// The cap below is a ratchet and a paid-up one reads zero, which folds the
+// comparison to `len() == 0` and makes clippy call the `<=` half absurd. It is
+// written against the constant anyway: raising the cap is how a literal that the
+// manifest genuinely cannot declare gets registered, and an `==` would silently
+// turn "at most" into "exactly".
+#[allow(clippy::absurd_extreme_comparisons)]
 #[test]
 fn every_cluster_address_in_the_code_is_a_registered_decision() {
     let found = census();
