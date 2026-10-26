@@ -6809,8 +6809,8 @@ impl MainlineDeployer {
                 "name": job_name(rev),
                 "namespace": self.cfg.namespace,
                 "labels": {
-                    "app.kubernetes.io/name": "cogneva",
-                    "app.kubernetes.io/component": "mainline-rollout",
+                    (cog_core::topology::LABEL_NAME): cog_core::topology::WORKLOAD_NAME,
+                    (cog_core::topology::LABEL_COMPONENT): MAINLINE_ROLLOUT_COMPONENT,
                 },
                 // 注解而不是 label：traceparent 里带连字符，label 取值规则会拒掉
                 // 其中一部分，被拒绝的值只会让这一段的 id 消失。
@@ -6843,8 +6843,8 @@ impl MainlineDeployer {
                 "template": {
                     "metadata": {
                         "labels": {
-                            "app.kubernetes.io/name": "cogneva",
-                            "app.kubernetes.io/component": "mainline-rollout",
+                            (cog_core::topology::LABEL_NAME): cog_core::topology::WORKLOAD_NAME,
+                            (cog_core::topology::LABEL_COMPONENT): MAINLINE_ROLLOUT_COMPONENT,
                         },
                     },
                     "spec": {
@@ -7347,8 +7347,8 @@ impl MainlineDeployer {
                 "name": manifests_configmap_name(rev),
                 "namespace": self.cfg.namespace,
                 "labels": {
-                    "app.kubernetes.io/name": "cogneva",
-                    "app.kubernetes.io/component": "mainline-manifests",
+                    (cog_core::topology::LABEL_NAME): cog_core::topology::WORKLOAD_NAME,
+                    (cog_core::topology::LABEL_COMPONENT): MAINLINE_MANIFESTS_COMPONENT,
                 },
             },
             "data": serde_json::Value::Object(data),
@@ -7381,7 +7381,7 @@ impl MainlineDeployer {
                     "get",
                     "configmap",
                     "-l",
-                    "app.kubernetes.io/component=mainline-manifests",
+                    &format!("{COMPONENT_LABEL}={MAINLINE_MANIFESTS_COMPONENT}"),
                     "-o",
                     "json",
                 ],
@@ -8775,8 +8775,16 @@ fn image_repository(reference: &str) -> &str {
 /// maintenance round, which must restart *this* workload to make its garbage
 /// collection run. Spelling the label twice would let the two sides drift, and
 /// the drift would be invisible until someone reads a warning.
-const COMPONENT_LABEL: &str = "app.kubernetes.io/component";
-const CLUSTER_REGISTRY_COMPONENT: &str = "cluster-registry";
+const COMPONENT_LABEL: &str = cog_core::topology::LABEL_COMPONENT;
+const CLUSTER_REGISTRY_COMPONENT: &str = cog_core::topology::COMPONENT_REGISTRY;
+/// The component labels this deployer puts on the objects it creates itself (the
+/// rollout Job, its Pod template, the manifest bundle ConfigMap). Nothing
+/// outside this file reads them, so they are declared here rather than next to
+/// the platform workloads' labels — but they are still declared once: the
+/// selector that collects the bundles back and the label that was written on
+/// them have to be the same string.
+const MAINLINE_ROLLOUT_COMPONENT: &str = "mainline-rollout";
+const MAINLINE_MANIFESTS_COMPONENT: &str = "mainline-manifests";
 
 /// The label selector that names the workload serving the delivered images.
 ///

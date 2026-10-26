@@ -1177,8 +1177,8 @@ pub fn plan_change_job(
     }
 
     let labels = serde_json::json!({
-        "app.kubernetes.io/name": "cogneva",
-        "app.kubernetes.io/component": "change-execution",
+        (cog_core::topology::LABEL_NAME): cog_core::topology::WORKLOAD_NAME,
+        (cog_core::topology::LABEL_COMPONENT): "change-execution",
     });
     let mut spec = serde_json::json!({
         // 这个 Job 不做任何 API 调用（派发、等待、读退出码都在常驻进程那一侧），

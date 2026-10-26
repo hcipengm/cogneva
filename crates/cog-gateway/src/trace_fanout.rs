@@ -436,7 +436,7 @@ pub fn parse_job_stages(body: &serde_json::Value) -> Vec<JobStage> {
             let component = job
                 .get("metadata")
                 .and_then(|m| m.get("labels"))
-                .and_then(|l| l.get("app.kubernetes.io/component"))
+                .and_then(|l| l.get(cog_core::topology::LABEL_COMPONENT))
                 .and_then(|c| c.as_str())?;
             if component != "change-execution" && component != "mainline-rollout" {
                 return None;

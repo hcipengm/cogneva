@@ -69,6 +69,37 @@ pub const QUOTA: &str = "cogneva-quota";
 /// the real value and hands it to every command it runs.
 pub const DEFAULT_NAMESPACE: &str = "cogneva";
 
+/// The label keys, and the values the workloads' pods answer to.
+///
+/// Code that asks "are the gateway's pods ready" or "restart the workload that
+/// serves the images" selects by these two labels. A selector naming a value no
+/// manifest carries matches nothing, and `kubectl get -l` treats an empty list
+/// as an ordinary answer: the health reading says "no pods yet", the restart
+/// says it succeeded, and neither one distinguishes a workload that has not
+/// started from a label that was renamed in the chart. The name label is shared
+/// by the main app, the gateway and the executor, so it takes the component
+/// label as well — one label alone crosses deployments.
+pub const LABEL_NAME: &str = "app.kubernetes.io/name";
+/// See [`LABEL_NAME`].
+pub const LABEL_COMPONENT: &str = "app.kubernetes.io/component";
+/// The `LABEL_NAME` value of the workloads [`MAIN_DEPLOYMENT`],
+/// [`SECURITY_GATEWAY`] and [`SANDBOX_EXECUTOR`] all answer to.
+pub const WORKLOAD_NAME: &str = "cogneva";
+/// The main application's `LABEL_COMPONENT` value (its Deployment is
+/// [`MAIN_DEPLOYMENT`], which is why the value and the name differ).
+pub const COMPONENT_GATEWAY: &str = "gateway";
+/// The credential gateway's `LABEL_COMPONENT` value.
+pub const COMPONENT_SECURITY_GATEWAY: &str = "security-gateway";
+/// The sandbox executor's `LABEL_COMPONENT` value.
+pub const COMPONENT_SANDBOX_EXECUTOR: &str = "sandbox-executor";
+/// The evolution loop's `LABEL_COMPONENT` value; its name label is
+/// [`EVOLUTION`], not [`WORKLOAD_NAME`].
+pub const COMPONENT_EVOLUTION: &str = "evolution";
+/// The cluster registry's `LABEL_COMPONENT` value. The restart that makes its
+/// garbage collection run selects by this, so a rename in the chart turns the
+/// reclaim into a no-op that reports success.
+pub const COMPONENT_REGISTRY: &str = "cluster-registry";
+
 /// The directory every pod's service account is mounted at.
 ///
 /// It is the platform's name rather than this deployment's, and it is declared

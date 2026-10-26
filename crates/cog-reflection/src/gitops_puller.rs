@@ -1291,7 +1291,7 @@ impl GitOpsPuller {
                     "get",
                     "pods",
                     "-l",
-                    &format!("app.kubernetes.io/name={}", self.config.deployment),
+                    &format!("{}={}", cog_core::topology::LABEL_NAME, self.config.deployment),
                     "-o",
                     // 行分隔必须是 {"\n"} 双引号转义形式——单引号里放真实
                     // 换行符 kubectl jsonpath 直接解析失败（unterminated
@@ -1410,7 +1410,7 @@ impl GitOpsPuller {
                     "get",
                     "pods",
                     "-l",
-                    &format!("app.kubernetes.io/name={}", self.config.deployment),
+                    &format!("{}={}", cog_core::topology::LABEL_NAME, self.config.deployment),
                     "-o",
                     "jsonpath={range .items[*]}{.metadata.name}{\" \"}{.status.podIP}{\"\\n\"}{end}",
                 ],

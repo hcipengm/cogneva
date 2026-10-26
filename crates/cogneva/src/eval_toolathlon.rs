@@ -496,8 +496,8 @@ fn manifest(pod: &str, pack_image: &str, pg_image: &str, limits: &PodLimits) -> 
         // 一个新 component：现网那 5 条 NetworkPolicy 全部按这个键收窄，所以这台 Pod
         // **一条都不被选中**——同命名空间内的默认放行就是它要的网。这不是绕过策略，
         // 是策略本来就没打算管这一族。
-        "app.kubernetes.io/component": "eval-toolathlon",
-        "app.kubernetes.io/name": pod,
+        (cog_core::topology::LABEL_COMPONENT): "eval-toolathlon",
+        (cog_core::topology::LABEL_NAME): pod,
     });
     serde_json::json!({
         "apiVersion": "v1",

@@ -880,8 +880,11 @@ fn updated_pod_count(out: &str) -> u32 {
 /// 单标签会跨部署误判（gitops puller 旧代码只用 name= 的同源缺陷）。
 pub(crate) fn pod_selector(name: &str, component: &str) -> String {
     format!(
-        "app.kubernetes.io/name={},app.kubernetes.io/component={}",
-        name, component
+        "{}={},{}={}",
+        cog_core::topology::LABEL_NAME,
+        name,
+        cog_core::topology::LABEL_COMPONENT,
+        component
     )
 }
 
