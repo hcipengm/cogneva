@@ -55,14 +55,49 @@ PKG_REV="$(sed -n 's/^[[:space:]]*"revision":[[:space:]]*"\([^"]*\)".*/\1/p' "$P
 
 echo "==> 1/4 创建命名空间并恢复实例身份（Secret 先行，init-secrets.sh 幂等跳过）"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
-# 按包内文件逐个 apply，不写死对象名：包里有几片密钥对象就恢复几片。写死一份
-# 会让另一份（带外凭证：平台 token、git 身份私钥）静默留在包里没被恢复，而集群
-# 看起来一切正常——直到需要推送代码或访问上游时才发现身份是空的。
-for f in "$PKG_DIR"/secrets/*.yaml; do
-    [ -f "$f" ] || { echo "包内没有密钥清单（$PKG_DIR/secrets/*.yaml）" >&2; exit 1; }
-    echo "    apply $(basename "$f")"
-    kubectl apply -f "$f"
-done
+# secret-restore: start
+# 包里的密钥清单是**条件面**：写端只在「包本身是密文」时才把两片 Secret 导进包，
+# 明文包里没有它们，manifest 的 lossy_surfaces 会记一条 name=credentials。恢复端
+# 因此不能把「没有清单」一律读成坏包——那会把写端刻意不做的事读成损坏；反过来也
+# 不能悄悄跳过：跳过等于换了实例身份还照常报成功。
+#
+# 判据只看这两件事，不看包名也不看环境变量：
+#   包里有两片清单            → 逐个 apply；对象名不写死，带外那片也在包里。
+#   没清单 + manifest 认领了   → 不 apply，把这处损失念出来：内部那片由安装器重新
+#                                生成（实例指纹随之是新的一份），带外那片重进向导。
+#   没清单 + manifest 没认领   → 退出。清单缺席而账上没有这一笔，就是包不完整。
+secret_manifest_files() { compgen -G "$1/secrets/*.yaml" || true; }
+manifest_names_credentials_loss() {
+    # lossy_surfaces 是数组；按 name 定位那一条，不读整段 JSON 文本（lost 的措辞会变）。
+    sed -n '/"lossy_surfaces"/,/^[[:space:]]*]/p' "$1" \
+        | grep -q '"name"[[:space:]]*:[[:space:]]*"credentials"'
+}
+restore_secret_manifests() {
+    local pkg_dir="$1" files f
+    files="$(secret_manifest_files "$pkg_dir")"
+    if [ -n "$files" ]; then
+        # 不写死对象名：包里有几片就恢复几片。写死一份会让另一份（带外凭证：平台
+        # token、git 身份私钥）静默留在包里没被恢复，而集群看起来一切正常——直到
+        # 需要推送代码或访问上游时才发现身份是空的。
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            echo "    apply $(basename "$f")"
+            kubectl apply -f "$f"
+        done <<<"$files"
+        return 0
+    fi
+    if manifest_names_credentials_loss "$pkg_dir/manifest.json"; then
+        echo "    包内没有密钥清单，manifest 认领了这处损失（lossy_surfaces: credentials）：" >&2
+        echo "    内部那片（pg/redis/jwt/实例指纹）由安装器重新生成——实例指纹是新的；" >&2
+        echo "    带外那片（LLM 上游、平台 token、git 私钥）要重进向导写回网关。" >&2
+        return 0
+    fi
+    echo "包内没有密钥清单（$pkg_dir/secrets/*.yaml），manifest 也没有把这件事记成有损面：" \
+        "这不是一份完整的包，恢复它等于悄悄丢掉实例身份" >&2
+    return 1
+}
+# secret-restore: end
+restore_secret_manifests "$PKG_DIR" || exit 1
 
 echo "==> 2/4 等待正常安装就绪（postgres / qdrant）"
 if ! kubectl -n "$NS" get deployment cogneva >/dev/null 2>&1; then
