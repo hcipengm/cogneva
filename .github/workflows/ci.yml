@@ -734,6 +734,11 @@ jobs:
       # 这一步同时验接线（四条路都要接上）与寿命算术（编译出纯函数在 node 里跑）。
       - name: Check the web renews its token before it dies
         run: bash deploy/scripts/check-web-token-refresh.sh
+      # 「这一面是事件流的回音」不是「总线上有帧」：帧到了、没人折、没人画，名单
+      # 仍然每 15 秒拍一张照片，而它看上去完全正常。这一步判三处接线（折叠是纯的、
+      # 分派真的写、画面真的读），并把折叠语义编译出来在 node 里按判据跑。
+      - name: Check the agents face moves with the frames, not only with the poll
+        run: bash deploy/scripts/check-web-live-frames.sh
 
   entry-scripts:
     name: Entry Scripts Lint

@@ -8,6 +8,8 @@ import {
   type MessageRole,
 } from '@/store/streamStore';
 import { useChatStore } from '@/store/chatStore';
+import { agentFrame } from '@/store/liveAgents';
+import { useLiveAgentStore } from '@/store/liveAgentStore';
 import type { AgentEvent } from '@/types/events';
 import type { NotificationItem } from '@/api/client';
 
@@ -77,6 +79,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
   const noteFrame = useStreamStore((state) => state.noteFrame);
   const noteUnrecorded = useStreamStore((state) => state.noteUnrecorded);
   const ingestChatFrame = useChatStore((state) => state.ingestFrame);
+  const noteAgentFrame = useLiveAgentStore((state) => state.noteFrame);
   /** 每个 agent 正在流的那一条消息（agent_id → 画布上的消息 id）。 */
   const streaming = useRef(new Map<string, string>());
 
@@ -94,6 +97,17 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       // 时间轴上那条「态」徽记是读者判断「这帧改了东西吗」的唯一依据，估着置位
       // 就变成了替这一帧编一个它没做过的改动。
       let changedState = false;
+
+      // 执行者这一面：状态帧改状态、心跳只推「还在」的那一刻（两件不同的事，
+      // 见 store/liveAgents.ts）。名单面每 15 秒才重读一次快照，没有这一折，
+      // 一个刚起来的执行者要等下一拍才出现在「在岗名单」上。
+      const liveAgent = agentFrame(event);
+      if (liveAgent) {
+        noteAgentFrame(liveAgent);
+        // 心跳按构造不入账（下面会提前返回），它的「改了态」不落在时间轴上，
+        // 所以这里只给会落点的那几类置位。
+        if (event.type !== 'heartbeat' && liveAgent.state !== null) changedState = true;
+      }
 
       switch (event.type) {
         case 'message_start': {
@@ -213,6 +227,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     noteFrame,
     noteUnrecorded,
     ingestChatFrame,
+    noteAgentFrame,
   ]);
 
   return { clientRef };
