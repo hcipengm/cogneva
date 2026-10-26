@@ -95,24 +95,3 @@ impl AgentBudget {
         )
     }
 }
-
-/// 预定义预算模板
-pub struct BudgetTemplates;
-
-impl BudgetTemplates {
-    pub fn code_fix() -> AgentBudget {
-        AgentBudget::new(3, 10, Duration::from_secs(30), Duration::from_secs(300))
-    }
-
-    pub fn doc_update() -> AgentBudget {
-        AgentBudget::new(2, 20, Duration::from_secs(20), Duration::from_secs(180))
-    }
-
-    pub fn refactor() -> AgentBudget {
-        AgentBudget::new(5, 5, Duration::from_secs(60), Duration::from_secs(600))
-    }
-
-    pub fn hotfix() -> AgentBudget {
-        AgentBudget::new(1, 3, Duration::from_secs(10), Duration::from_secs(120))
-    }
-}

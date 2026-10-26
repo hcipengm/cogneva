@@ -24,6 +24,36 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+/// 装完 K3s 之后等 kubeconfig 能用的次数与间隔：30 × 2s = 60s。
+///
+/// 计时要覆盖「进程起来了但 apiserver 还没应答」这一段，而这一段在 NVMe 上是
+/// 几秒、在慢盘上接近一分钟；改成一次性的长 sleep 会让快机器白等，所以是
+/// 「短间隔 × 多次」而不是一个总墙。
+const KUBECONFIG_READY_ATTEMPTS: usize = 30;
+
+/// 上面那组里的间隔：2s 一次，短到快机器不必为这一次探测多等。
+const KUBECONFIG_READY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// 等全部节点 Ready 的次数与间隔：60 × 5s = 5 分钟。
+///
+/// 多节点装机的最后一步是 kubelet 拉镜像，最慢的节点决定整条链路；5 分钟是
+/// 慢盘 + 冷镜像缓存的实测上界，超时后的报错文案与这个墙一致。
+const NODES_READY_ATTEMPTS: usize = 60;
+
+/// 上面那组里的间隔：5s 一次，够一个节点把镜像拉完一层。
+const NODES_READY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// 集群内 registry 播种基镜像失败后的重试间隔。
+///
+/// 播种走的是节点上的 containerd，失败通常是对方刚启动还没准备好；10s 够一次
+/// 重启，且三次重试的总等待仍在整条装机链路的预算里。
+const REGISTRY_SEED_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 最佳努力的新版本探测单次上限。
+///
+/// 这一步只提示、绝不阻塞命门链路：3s 之后就当官方没有新版本，静默返回。
+const OUTDATED_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// 在 /var/tmp 下创建 0700 随机工作目录。/var/tmp 全局可写，固定文件名会被
 /// symlink 抢跑（root 写文件时被重定向到任意路径），故目录名带 urandom 熵
 /// 且用 create_dir 独占创建（已存在即失败，不跟随符号链接）。
@@ -724,12 +754,12 @@ async fn install_k3s(hw: &Hardware) -> Result<()> {
     };
     run_k3s_install_script(env).await?;
     // 等待 kubeconfig 就绪
-    for _ in 0..30 {
+    for _ in 0..KUBECONFIG_READY_ATTEMPTS {
         if cluster_ready().await {
             write_kubeconfig()?;
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(KUBECONFIG_READY_INTERVAL).await;
     }
     bail!("K3s 安装后集群未就绪");
 }
@@ -1066,7 +1096,7 @@ fn image_gc_remote_write() -> String {
 
 async fn wait_all_nodes_ready(expected: usize) -> Result<()> {
     info!("等待 {expected} 个节点全部 Ready...");
-    for _ in 0..60 {
+    for _ in 0..NODES_READY_ATTEMPTS {
         let out = Command::new("kubectl")
             .args(["get", "nodes", "--no-headers"])
             .stdin(Stdio::null())
@@ -1085,7 +1115,7 @@ async fn wait_all_nodes_ready(expected: usize) -> Result<()> {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(NODES_READY_INTERVAL).await;
     }
     bail!("agent 节点未在 5 分钟内全部 Ready，请检查各节点安装日志")
 }
@@ -1843,7 +1873,7 @@ async fn seed_cluster_registry() -> Result<()> {
             }
             Err(e) if attempt < 3 => {
                 warn!("registry 播种第 {attempt} 次失败（重试）: {e:#}");
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                tokio::time::sleep(REGISTRY_SEED_RETRY_INTERVAL).await;
             }
             Err(e) => {
                 bail!(
@@ -3236,7 +3266,7 @@ fn version_lt(a: &str, b: &str) -> bool {
 async fn maybe_warn_outdated() {
     let current = env!("CARGO_PKG_VERSION");
     let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(OUTDATED_PROBE_TIMEOUT)
         .build()
     else {
         return;
@@ -3533,6 +3563,20 @@ mod profile_tests {
         // 段数不齐补 0、非数字后缀按 0 处理
         assert!(super::version_lt("0.5", "0.5.1"));
         assert!(super::version_lt("0.5.7", "0.6.0-rc1"));
+    }
+
+    #[test]
+    fn the_polls_still_add_up_to_the_wall_the_errors_promise() {
+        // 报错文案许诺的是总墙（1 分钟、5 分钟）；次数与间隔各自可调，但两者
+        // 相乘必须还是那个墙，否则「等 5 分钟」这句话就从某一版起变成了别的数。
+        assert_eq!(
+            super::KUBECONFIG_READY_ATTEMPTS as u64 * super::KUBECONFIG_READY_INTERVAL.as_secs(),
+            60
+        );
+        assert_eq!(
+            super::NODES_READY_ATTEMPTS as u64 * super::NODES_READY_INTERVAL.as_secs(),
+            5 * 60
+        );
     }
 
     #[test]

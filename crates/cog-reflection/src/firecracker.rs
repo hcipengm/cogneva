@@ -18,6 +18,17 @@ use cog_core::{MicroVmConfig, SFError, SFResult};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
+/// 等 firecracker 的 API socket 出现：5s。
+///
+/// 进程一起来就 bind，这个等待只覆盖 exec 到 bind 之间的那几毫秒加上调度抖动；
+/// 5s 之后还没出现，说明它已经在启动里退出了，再等只是拖住调用方。
+const SOCKET_APPEAR_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 等 socket 出现时的轮询间隔：50ms。
+///
+/// 比预期出现时间（毫秒级）长一个量级，既不会漏掉，也不会把这条等待变成忙等。
+const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Firecracker 实例句柄。
 pub struct MicroVm {
     pub id: String,
@@ -91,7 +102,7 @@ impl FirecrackerSandbox {
             .map_err(|e| SFError::IO(format!("spawn {}: {e}", self.config.firecracker_bin)))?;
 
         // 等 API socket 出现（firecracker 启动即建）
-        let socket_ready = wait_for_path(&socket_path, Duration::from_secs(5)).await;
+        let socket_ready = wait_for_path(&socket_path, SOCKET_APPEAR_TIMEOUT).await;
         if !socket_ready {
             return Err(SFError::IO(format!(
                 "firecracker API socket 未就绪: {}",
@@ -230,7 +241,7 @@ async fn wait_for_path(path: &Path, timeout: Duration) -> bool {
         if path.exists() {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(SOCKET_POLL_INTERVAL).await;
     }
     false
 }

@@ -479,7 +479,7 @@ impl EvolutionAdminService {
             // 场空出来再切；等不到就当切换失败，让这一版留在暂存处。
             let _switch_field = match crate::build_gate::await_exclusive(
                 "self-exec switch",
-                std::time::Duration::from_secs(3600),
+                crate::build_gate::SWITCH_FIELD_WAIT,
             )
             .await
             {

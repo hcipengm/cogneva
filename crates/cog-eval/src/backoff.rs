@@ -23,6 +23,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cog_core::contract::llm::retry_after_hint_in;
+
+/// 「每分钟 N 次」里的一分钟就是窗口长度。
+///
+/// 单位已经写在名字里；窗口再另立一个数，就会出现「每分钟 3 次、窗口 90 秒」
+/// 这种自相矛盾的组合。
+const PER_MINUTE_WINDOW: Duration = Duration::from_secs(60);
 use cog_core::{
     AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, LlmClient, Message,
     SFError, SFResult, UpstreamFailure,
@@ -111,7 +117,7 @@ pub struct RefusalBackoff {
 
 impl RefusalBackoff {
     pub fn new(per_minute: usize) -> Self {
-        Self::with_window(per_minute, Duration::from_secs(60))
+        Self::with_window(per_minute, PER_MINUTE_WINDOW)
     }
 
     /// 同 [`Self::new`]，但窗口可换。只给测试用：真实调用的窗口就是一分钟，

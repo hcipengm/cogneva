@@ -15,6 +15,12 @@ use std::path::{Path, PathBuf};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// 重放一条原始流时每次从盘上读多少：64 KiB。
+///
+/// 一条帧是一行 JSON，远小于这个数；整块读让大帧也不必多次系统调用，而
+/// 64 KiB 是页缓存里「一次读一次拷贝」的量级。
+const COPY_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Unified writer for all 7 raw streams.
 /// Thread-safe via internal locking. Each write appends to the
 /// appropriate per-stream file in the hot directory, using
@@ -162,7 +168,7 @@ impl RawStreamReader {
     {
         let mut file = tokio::fs::File::open(path).await?;
         let mut count = 0u64;
-        let mut buf = BytesMut::with_capacity(64 * 1024);
+        let mut buf = BytesMut::with_capacity(COPY_CHUNK_BYTES);
 
         loop {
             let n = file.read_buf(&mut buf).await?;

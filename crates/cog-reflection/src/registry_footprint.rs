@@ -162,7 +162,7 @@ impl RegistryClient {
         let req =
             format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{accepted}Connection: close\r\n\r\n");
         let mut stream = tokio::time::timeout(
-            Duration::from_secs(30),
+            crate::platform_http::CONNECT_TIMEOUT,
             tokio::net::TcpStream::connect((host, port)),
         )
         .await
@@ -173,10 +173,13 @@ impl RegistryClient {
             .await
             .map_err(|e| SFError::IO(format!("registry request write failed: {e}")))?;
         let mut raw = Vec::new();
-        tokio::time::timeout(Duration::from_secs(60), stream.read_to_end(&mut raw))
-            .await
-            .map_err(|_| SFError::IO("registry read timed out".into()))?
-            .map_err(|e| SFError::IO(format!("registry read failed: {e}")))?;
+        tokio::time::timeout(
+            crate::platform_http::READ_TIMEOUT,
+            stream.read_to_end(&mut raw),
+        )
+        .await
+        .map_err(|_| SFError::IO("registry read timed out".into()))?
+        .map_err(|e| SFError::IO(format!("registry read failed: {e}")))?;
         let (status, body) = parse_http_response(&raw)
             .ok_or_else(|| SFError::IO("registry returned a malformed HTTP response".into()))?;
         if status != 200 {

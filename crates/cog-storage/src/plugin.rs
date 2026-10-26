@@ -5,6 +5,12 @@ use tracing::{info, warn};
 
 use crate::pools::{ConfigPool, ExplainPool, MessagesPool, RedisClient, UsersPool};
 
+/// 读服务端连接数时拿一条连接的等待上限：5s。
+///
+/// 这条探针用的是单连接池，只跑一句 SHOW；池被占满说明数据库已经吃紧，
+/// 5s 拿不到就按「读不到」处理，而不是跟着一起排队。
+const CONNECTION_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Storage plugin that creates and publishes PostgreSQL pools and Redis client.
 pub struct StoragePlugin {
     initialized: bool,
@@ -1447,7 +1453,7 @@ const NOTIFICATION_KEEP_DAYS: i64 = 90;
 async fn server_connection_ceiling(url: &str) -> Option<(u32, u32)> {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
-        .acquire_timeout(std::time::Duration::from_secs(5))
+        .acquire_timeout(CONNECTION_ACQUIRE_TIMEOUT)
         .connect(url)
         .await
         .ok()?;

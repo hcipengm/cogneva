@@ -1089,7 +1089,7 @@ impl DagExecutorRuntime {
                                     tracing::warn!("result stream subscribe failed, retrying: {e}");
                                     tokio::select! {
                                         _ = shutdown.wait() => break 'subscribe,
-                                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue 'subscribe,
+                                        _ = tokio::time::sleep(crate::subscribe_backoff::SUBSCRIBE_RETRY_BACKOFF) => continue 'subscribe,
                                     }
                                 }
                             };
@@ -1119,7 +1119,7 @@ impl DagExecutorRuntime {
 
                         tokio::select! {
                             _ = shutdown.wait() => break 'subscribe,
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                            _ = tokio::time::sleep(crate::subscribe_backoff::SUBSCRIBE_RETRY_BACKOFF) => {}
                         }
                     }
                 }
@@ -1371,7 +1371,7 @@ impl DagExecutorRuntime {
                     tracing::warn!("goal stream subscribe failed, retrying: {e}");
                     tokio::select! {
                         _ = shutdown.wait() => break 'subscribe,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue 'subscribe,
+                        _ = tokio::time::sleep(crate::subscribe_backoff::SUBSCRIBE_RETRY_BACKOFF) => continue 'subscribe,
                     }
                 }
             };
@@ -1492,7 +1492,7 @@ impl DagExecutorRuntime {
 
             tokio::select! {
                 _ = shutdown.wait() => break 'subscribe,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                _ = tokio::time::sleep(crate::subscribe_backoff::SUBSCRIBE_RETRY_BACKOFF) => {}
             }
         }
                 }

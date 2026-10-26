@@ -43,6 +43,12 @@ const OUTCOME_FAILED: &str = "failed";
 const OUTCOME_PENDING: &str = "pending";
 const OUTCOME_AWAITING_REVIEW: &str = "awaiting_review";
 
+/// 趋势生成循环的最小周期：60s。
+///
+/// 防的是配置错误：周期被填成 0 或 1 会让这条循环对着表打热循环，而趋势读数
+/// 本身的粒度就是分钟级，更密不会让曲线更准。
+const MIN_TREND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// 从台账记录聚合周报。纯函数，便于测试。
 pub fn aggregate(
     records: &[cog_core::PromotionRecord],
@@ -312,7 +318,7 @@ impl PromotionTrendReporter {
     /// 后台循环：立即生成一次，之后按间隔周期生成。
     pub async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         // 防御配置错误导致的 busy-loop：最小周期 60 秒。
-        let interval = self.interval.max(std::time::Duration::from_secs(60));
+        let interval = self.interval.max(MIN_TREND_INTERVAL);
         loop {
             if let Err(e) = self.generate_once().await {
                 error!(error = %e, "Promotion trend report generation failed");

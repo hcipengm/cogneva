@@ -21,12 +21,24 @@ pub struct LongRunConfig {
     pub checkpoint_interval: Duration,
 }
 
+/// 一次长跑评测持续多久：7 天。
+///
+/// 长跑要看的是「一周之后系统还在不在正常工作」，短于一周就看不到周末的负载
+/// 形态与几轮滚动发布。
+const DEFAULT_LONG_RUN_DURATION: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// 长跑中途落检查点的间隔：6 小时。
+///
+/// 一周跑崩一次要能从最近的点续上；6 小时是「最多重跑多久」与「落点开销」
+/// 之间的取舍。
+const DEFAULT_LONG_RUN_CHECKPOINT: Duration = Duration::from_secs(6 * 3600);
+
 impl Default for LongRunConfig {
     fn default() -> Self {
         Self {
-            duration: Duration::from_secs(7 * 24 * 3600),
+            duration: DEFAULT_LONG_RUN_DURATION,
             task_injection_rate: 10.0,
-            checkpoint_interval: Duration::from_secs(6 * 3600),
+            checkpoint_interval: DEFAULT_LONG_RUN_CHECKPOINT,
         }
     }
 }

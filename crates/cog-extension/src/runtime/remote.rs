@@ -2,6 +2,12 @@
 //! pod over HTTP and streams output back as NDJSON [`CommandEvent`] lines.
 
 use async_trait::async_trait;
+
+/// 连远端运行时（沙盒执行器）的墙：10s。
+///
+/// 连不上通常是被网络策略挡住或对端没起，这两种都不靠等解决；10s 让调用方
+/// 快速失败，而不是卡在 SYN 重传里。
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 use cog_core::{
     CommandEvent, CommandEventStream, SFResult, SandboxBackend, SandboxPayload, SandboxRequest,
     SandboxResult,
@@ -24,7 +30,7 @@ impl RemoteExecutor {
             // down or unreachable (e.g. blocked by network policy), fail fast
             // in 10s instead of leaving the caller hanging on SYN retries.
             http: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(CONNECT_TIMEOUT)
                 .build()
                 .map_err(|e| {
                     cog_core::SFError::Agent(format!("sandbox executor client init failed: {}", e))

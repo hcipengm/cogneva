@@ -715,6 +715,12 @@ async fn verify_ssh(config: &IdentityConfig, private_key: &str) -> SshProbe {
 /// 但要留出"密钥被接受、仓库可读"这一段真实往返的余量。
 const SSH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// 登记部署密钥那次调用（GitHub API）的单次上限：15s。
+///
+/// 这一步在交互式向导里同步等待，超过十几秒用户已经在怀疑卡死了；而一次
+/// 创建 deploy key 的请求本身很小，慢到 15s 基本就是网络或上游不可用。
+const DEPLOY_KEY_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// 把私钥写到临时文件（0600）供 git 使用。私钥不进命令行、不进环境变量，
 /// 只以一个权限受限的临时文件存在，用完随 TempDir 一起消失。
 ///
@@ -764,7 +770,7 @@ fn set_owner_only_dir(_path: &Path) -> Result<(), String> {
 /// 而不是 token 持有人名下的全部仓库。
 async fn register_deploy_key(token: &str, repo: &str, public_line: &str) -> Result<(), String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(DEPLOY_KEY_REQUEST_TIMEOUT)
         .build()
         .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
     let resp = client

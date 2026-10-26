@@ -13,6 +13,11 @@ use cog_core::{MemoryBackend, MessageBackend, RawSource};
 
 use crate::isolation::{BenchmarkIsolation, BenchmarkRefusal};
 use crate::IngestConfig;
+
+/// 订阅失败后的重试间隔：5s。
+///
+/// 与其它消费者同一个节拍：总线要么回来要么不回来。
+const SUBSCRIBE_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 /// Loop name reported through the background-loop liveness family.
 pub const MEMORY_RECONCILE_LOOP: &str = "memory_ingest_reconcile";
 /// Loop name reported through the background-loop liveness family.
@@ -1154,10 +1159,11 @@ impl MemoryIngestor {
                                 Ok(s) => s,
                                 Err(e) => {
                                     warn!(
-                                        "Memory ingest bus subscribe failed: {e}; retrying in 5s"
+                                        backoff_secs = SUBSCRIBE_RETRY_BACKOFF.as_secs(),
+                                        "Memory ingest bus subscribe failed: {e}; retrying"
                                     );
                                     tokio::select! {
-                                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                                        _ = tokio::time::sleep(SUBSCRIBE_RETRY_BACKOFF) => {}
                                         _ = stop.wait() => { break; }
                                     }
                                     continue;

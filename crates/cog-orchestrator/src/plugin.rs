@@ -5,6 +5,30 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Loop name reported through the background-loop liveness family.
+/// 整轮预算里留给下一拍启动的余量。
+///
+/// 检查点整轮（枚举全部在跑任务并逐个落点）必须在下一拍到来之前交还控制权，
+/// 否则 beat 停一次、告警就把这条循环记成卡住。余量是「一拍要留多久给节拍本身」
+/// 的取值：小于一个 DB 往返的抖动就会误判，大过一拍就没有轮次可跑。
+const CHECKPOINT_ROUND_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 整轮预算的下限：节拍再密，也要给一轮留出这么久。
+///
+/// 没有这个下限时，节拍小于余量的部署会得到「零预算」——每轮都被判超时，
+/// 循环看上去永远在超支。10s 是一轮落点在健康集群里的实测耗时上限。
+const MIN_CHECKPOINT_ROUND_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 一轮检查点允许占用的时间，由它自己的节拍推出。
+///
+/// 随节拍动而不是写死：部署把间隔调大，这条界跟着放大；调小到下限以下，
+/// 由下限兜住。返回值恒小于 `cadence`，所以 beat 之间总有空隙。
+fn checkpoint_round_budget(cadence: std::time::Duration) -> std::time::Duration {
+    std::cmp::max(
+        cadence.saturating_sub(CHECKPOINT_ROUND_MARGIN),
+        MIN_CHECKPOINT_ROUND_BUDGET,
+    )
+}
+
 pub const DAG_CHECKPOINT_LOOP: &str = "orchestrator_dag_checkpoint";
 /// Loop name reported through the background-loop liveness family.
 pub const READY_TASK_PUBLISHER_LOOP: &str = "orchestrator_ready_task_publisher";
@@ -376,40 +400,50 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                 // was dead, and would then keep checkpointing for a process on
                 // its way out. This lock has one holder.
                 let shutdown_rx = std::sync::Arc::new(tokio::sync::Mutex::new(shutdown_rx));
-                drop(cog_core::loop_health::spawn(
-                    DAG_CHECKPOINT_LOOP,
-                    cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(30)),
-                    checkpoint_guard,
-                    // Rebuilt per attempt, so everything the body consumes is cloned here.
-                    move |beat| {
-                        let orch = orch.clone();
-                        let shutdown_rx = std::sync::Arc::clone(&shutdown_rx);
-                        let checkpoint_stop = checkpoint_stop.clone();
-                        async move {
-                            let mut interval =
-                                tokio::time::interval(std::time::Duration::from_secs(30));
-                            interval
-                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                            loop {
-                                beat.beat();
-                                let mut shutdown_rx = shutdown_rx.lock().await;
-                                tokio::select! {
-                                    _ = interval.tick() => {
-                                        orch.force_checkpoint().await;
-                                        tracing::debug!("DagExecutor periodic checkpoint saved");
-                                    }
-                                    _ = shutdown_rx.recv() => {
-                                        // The broadcast is this loop's own stop event, so
-                                        // it must also mark the exit as intended.
-                                        checkpoint_stop.trigger();
-                                        tracing::info!("DagExecutor checkpoint task shutting down gracefully");
-                                        break;
+                // 同一个节拍只写一处：任务级检查点循环读的就是这个数，而这条
+                // DAG 级循环曾经自己写着 30，部署把间隔调大时两条循环就各走
+                // 各的——读数说一个墙，实际睡眠是另一个。
+                let dag_checkpoint_secs = ctx.config().dag_executor.task_checkpoint_interval_secs;
+                if dag_checkpoint_secs > 0 {
+                    drop(cog_core::loop_health::spawn(
+                        DAG_CHECKPOINT_LOOP,
+                        cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(
+                            dag_checkpoint_secs,
+                        )),
+                        checkpoint_guard,
+                        // Rebuilt per attempt, so everything the body consumes is cloned here.
+                        move |beat| {
+                            let orch = orch.clone();
+                            let shutdown_rx = std::sync::Arc::clone(&shutdown_rx);
+                            let checkpoint_stop = checkpoint_stop.clone();
+                            async move {
+                                let mut interval = tokio::time::interval(
+                                    std::time::Duration::from_secs(dag_checkpoint_secs),
+                                );
+                                interval.set_missed_tick_behavior(
+                                    tokio::time::MissedTickBehavior::Skip,
+                                );
+                                loop {
+                                    beat.beat();
+                                    let mut shutdown_rx = shutdown_rx.lock().await;
+                                    tokio::select! {
+                                        _ = interval.tick() => {
+                                            orch.force_checkpoint().await;
+                                            tracing::debug!("DagExecutor periodic checkpoint saved");
+                                        }
+                                        _ = shutdown_rx.recv() => {
+                                            // The broadcast is this loop's own stop event, so
+                                            // it must also mark the exit as intended.
+                                            checkpoint_stop.trigger();
+                                            tracing::info!("DagExecutor checkpoint task shutting down gracefully");
+                                            break;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                ));
+                        },
+                    ));
+                }
             }
         }
 
@@ -707,10 +741,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                 // 的节拍推导（留 5s 余量、至少 10s），不是写死的
                                 // 常量；节拍调大，这条判断跟着走。名册再大、下游再
                                 // 慢，控制权也会在节拍内回到循环顶部，beat 不会停。
-                                let round_budget = std::cmp::max(
-                                    cadence.saturating_sub(std::time::Duration::from_secs(5)),
-                                    std::time::Duration::from_secs(10),
-                                );
+                                let round_budget = checkpoint_round_budget(cadence);
                                 // 申报 = 推导自施加方：工期界取施加它的对象
                                 // （整轮预算），节拍取循环真正睡眠的等待，所以
                                 // 告警的墙随二者一起动，而不是一个会过时的整数。
@@ -1102,3 +1133,22 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     ],
     factory: || Box::new(OrchestratorPlugin::new()),
 };
+
+#[cfg(test)]
+mod round_budget_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_longer_cadence_lengthens_the_round_and_a_short_one_is_floored() {
+        let base = Duration::from_secs(60);
+        let doubled = checkpoint_round_budget(base + base);
+        assert_eq!(doubled - checkpoint_round_budget(base), base);
+
+        assert_eq!(
+            checkpoint_round_budget(Duration::from_secs(2)),
+            MIN_CHECKPOINT_ROUND_BUDGET
+        );
+        assert!(checkpoint_round_budget(base) < base);
+    }
+}

@@ -57,7 +57,7 @@ const REGISTRY: &str = "crates/cogneva/tests/data/rust-capacity-constants.tsv";
 /// constant without deciding what it is would go unnoticed, because the file
 /// would simply grow. Pinning the count means the next one arrives with an
 /// answer, and paying a debt is the only thing that makes room.
-const DEBT_CEILING: usize = 159;
+const DEBT_CEILING: usize = 136;
 
 /// One line of the registry.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -164,6 +164,14 @@ fn has_inline_module_body(line: &str, any_name: bool) -> bool {
     }
     let opens_body = name[ident_end..].trim_start().starts_with('{');
     opens_body && (any_name || ["tests", "test_support"].contains(&&name[..ident_end]))
+}
+
+/// `COGNEVA_BARE_LITERAL_SITES=1` prints every counted site as `file:line`.
+///
+/// A register of counts says how many are left and not where they are, which is
+/// enough to hold a ratchet and not enough to pay it down.
+fn sites_wanted() -> bool {
+    std::env::var_os("COGNEVA_BARE_LITERAL_SITES").is_some()
 }
 
 fn walk_rs(dir: &Path) -> Vec<PathBuf> {
@@ -458,7 +466,7 @@ const BARE_BYTES: &str = "bytes";
 /// row is a number a deployment's behaviour depends on and no caller can move;
 /// the ceiling exists so the next one arrives with a decision, which is what
 /// makes this a ratchet rather than a count.
-const BARE_LITERAL_CEILING: usize = 101;
+const BARE_LITERAL_CEILING: usize = 11;
 
 /// `Duration::from_*(<literal>)` and byte multipliers, per file and shape.
 ///
@@ -487,15 +495,15 @@ fn scan_bare_literals(root: &Path) -> BTreeMap<(String, String), usize> {
         // literal below it would then be invisible while the register still
         // read as complete -- an unread byte that reads as a decision.
         let mut depth: i32 = 0;
-        let mut defaults: Option<i32> = None;
         let mut fixtures: Option<i32> = None;
         let mut expecting_test_module = false;
-        for line in lines.iter() {
+        let mut raw: Option<usize> = None;
+        for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
-            let code = code_only(line);
-            // `#[cfg(test)]` guards the module that follows it, but attributes
-            // and doc comments may sit in between, so the guard waits for the
-            // next line that is code.
+            let code = code_only(line, &mut raw);
+            // `#[cfg(test)]` guards whatever follows it -- a module, or a single
+            // `fn for_test` -- but attributes and doc comments may sit in
+            // between, so the guard waits for the next line that is code.
             let opens_tests = if trimmed.starts_with("//") {
                 false
             } else if trimmed.starts_with("#[") {
@@ -505,7 +513,10 @@ fn scan_bare_literals(root: &Path) -> BTreeMap<(String, String), usize> {
                 false
             } else if expecting_test_module {
                 expecting_test_module = false;
-                has_inline_module_body(line, true)
+                // A guarded module is a fixture block; a guarded item is one
+                // fixture whose body the braces bound. A guarded one-liner has
+                // no body to bound and only its own line is skipped.
+                has_inline_module_body(line, true) || code.contains('{')
             } else {
                 has_inline_module_body(line, false)
             };
@@ -529,32 +540,19 @@ fn scan_bare_literals(root: &Path) -> BTreeMap<(String, String), usize> {
             if in_fixtures || opens_tests || declares_a_const(&code) {
                 continue;
             }
-            // A `Default` impl writes the same thing down in a function instead
-            // of in a `const`, and the census reaches it the same way, so its
-            // numbers are declarations too.
-            let opens_defaults = code.contains("fn default(");
-            let declared = defaults.is_some() || opens_defaults;
-            let opened_defaults = opens_defaults && defaults.is_none();
-            if opened_defaults {
-                defaults = Some(depth_before);
-            }
-            if !opened_defaults {
-                if let Some(entry_depth) = defaults {
-                    if depth <= entry_depth {
-                        defaults = None;
-                    }
-                }
-            }
-            if declared {
-                continue;
-            }
             let cadence = cadence_literals(&code);
             if cadence > 0 {
+                if sites_wanted() {
+                    eprintln!("{rel}:{} {BARE_CADENCE} x{cadence}", i + 1);
+                }
                 *out.entry((rel.clone(), BARE_CADENCE.to_string()))
                     .or_default() += cadence;
             }
             let bytes = byte_literals(&code);
             if bytes > 0 {
+                if sites_wanted() {
+                    eprintln!("{rel}:{} {BARE_BYTES} x{bytes}", i + 1);
+                }
                 *out.entry((rel.clone(), BARE_BYTES.to_string()))
                     .or_default() += bytes;
             }
@@ -571,45 +569,80 @@ fn scan_bare_literals(root: &Path) -> BTreeMap<(String, String), usize> {
 /// production. A number inside a message is not a dial either, so the same pass
 /// serves both readers. Approximate on purpose: a raw string spanning lines is
 /// not tracked, and every line starts outside one.
-fn code_only(line: &str) -> String {
+fn code_only(line: &str, raw: &mut Option<usize>) -> String {
+    let chars: Vec<char> = line.chars().collect();
     let mut out = String::new();
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some(hashes) = *raw {
+            let closes = chars[i] == '"' && (0..hashes).all(|k| chars.get(i + 1 + k) == Some(&'#'));
+            if closes {
+                i += 1 + hashes;
+                *raw = None;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        let c = chars[i];
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            break;
+        }
+        // Raw and byte strings open with `r#*"` (`br#*"`); the hash count has to
+        // survive across lines, because a shell script in a fixture is very
+        // likely to hold an unbalanced brace.
+        let mut j = i;
+        if c == 'b' {
+            j += 1;
+        }
+        if chars.get(j) == Some(&'r') {
+            let mut hashes = 0;
+            let mut k = j + 1;
+            while chars.get(k) == Some(&'#') {
+                hashes += 1;
+                k += 1;
+            }
+            if chars.get(k) == Some(&'"') {
+                *raw = Some(hashes);
+                i = k + 1;
+                continue;
+            }
+        }
         match c {
-            '/' if chars.peek() == Some(&'/') => break,
             '"' => {
-                while let Some(c) = chars.next() {
-                    match c {
-                        '\\' => {
-                            chars.next();
+                i += 1;
+                while i < chars.len() {
+                    match chars[i] {
+                        '\\' => i += 2,
+                        '"' => {
+                            i += 1;
+                            break;
                         }
-                        '"' => break,
-                        _ => {}
+                        _ => i += 1,
                     }
                 }
             }
             '\'' => {
-                let mut probe = chars.clone();
-                match (probe.next(), probe.next()) {
-                    (Some(inner), Some('\'')) if inner != '\\' => {
-                        chars.next();
-                        chars.next();
-                    }
+                let three = (chars.get(i + 1), chars.get(i + 2));
+                match three {
+                    (Some(inner), Some('\'')) if *inner != '\\' => i += 2 + 1,
                     (Some('\\'), _) => {
-                        // `'\n'`, `'\''` and friends: consume to the closing quote.
-                        chars.next();
-                        for _ in 0..2 {
-                            match chars.next() {
-                                Some('\'') => break,
-                                Some(_) => {}
-                                None => break,
-                            }
+                        let mut k = i + 2;
+                        while k < chars.len() && chars[k] != '\'' {
+                            k += 1;
                         }
+                        i = k + 1;
                     }
-                    _ => out.push(c),
+                    _ => {
+                        out.push(c);
+                        i += 1;
+                    }
                 }
             }
-            _ => out.push(c),
+            _ => {
+                out.push(c);
+                i += 1;
+            }
         }
     }
     out
@@ -694,17 +727,21 @@ fn byte_literals(code: &str) -> usize {
         let Some(head) = head.strip_suffix('*') else {
             continue;
         };
-        let number: String = head
+        // The whole token, not just its digits: `1024u64 * 1024` has `u64`
+        // where a multiplier goes, and reading only the digits turned the type
+        // suffix into a `64`. A token with letters in it is not a literal.
+        let token: String = head
             .trim_end()
             .chars()
             .rev()
-            .take_while(|c| c.is_ascii_digit() || *c == '_' || *c == '.')
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
             .collect();
-        let plain = number.replace('_', "");
-        if !number.is_empty() && plain != "1024" && plain != "1024.0" && plain != "1" {
+        let plain = token.replace('_', "");
+        let numeric = plain.chars().all(|c| c.is_ascii_digit() || c == '.');
+        if numeric && plain != "1024" && plain != "1024.0" && plain != "1" {
             count += 1;
         }
     }
@@ -797,30 +834,59 @@ fn a_number_at_the_point_of_use_is_counted_where_it_is_used() {
 }
 
 /// The use-site scan's failures also read as green, so both directions are
-/// pinned: it must find the shape it exists for, and it must not read a
-/// fixture's durations as production hardcoding.
+/// pinned on a tree written for the purpose: a number above and below a
+/// fixture block is counted, the declared one and the fixture's are not, and a
+/// brace inside a fixture's raw string does not end that block early.
+///
+/// It is a tree of its own rather than `crates/` because the population is
+/// coming down to zero: an assertion that the real scan finds more than N would
+/// fail exactly when the work succeeds.
 #[test]
 fn the_use_site_scan_sees_production_and_not_fixtures() {
-    let root = workspace_root();
+    let root = std::env::temp_dir().join(format!("cog-bare-literals-{}", std::process::id()));
+    let src = root.join("crates/probe/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("production.rs"),
+        r##"
+const DECLARED: Duration = Duration::from_secs(7);
+
+fn wait() {
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    fn shell() -> &'static str {
+        r#"if [ -f x ]; then echo }"#
+    }
+
+    fn fixture() -> Duration {
+        Duration::from_secs(9)
+    }
+}
+
+fn below_the_module() -> Duration {
+    Duration::from_secs(11)
+}
+"##,
+    )
+    .unwrap();
     let scanned = scan_bare_literals(&root);
-    let total: usize = scanned.values().sum();
-    assert!(
-        total > 50,
-        "the use-site scan found {total} numbers, far below what crates/*/src holds: the \
-         walk or the shape match is broken, not the tree"
+    let row = scanned
+        .get(&(
+            "crates/probe/src/production.rs".to_string(),
+            BARE_CADENCE.to_string(),
+        ))
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        row, 2,
+        "expected the two production numbers (above and below the fixture block) and          neither the declared one nor the fixture's; the scan found {row}"
     );
     assert!(
         scanned.keys().all(|(file, _)| file.contains("/src/")),
         "a test or fixture file was counted as production hardcoding"
     );
-    // A number inside a declaration is the census's row, not this one's: the
-    // shared heartbeat is declared as a `const`, so this scan must be silent
-    // about it even though the file holds a `from_secs` call.
-    assert!(
-        !scanned.contains_key(&(
-            "crates/cog-core/src/reading_cadence.rs".to_string(),
-            BARE_CADENCE.to_string()
-        )),
-        "a number in a `const` declaration was counted as a use-site number"
-    );
+    std::fs::remove_dir_all(&root).ok();
 }

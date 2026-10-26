@@ -634,7 +634,7 @@ impl LLMProvider for OpenAIProvider {
             // indefinitely. The per-event timeout resets after the first event so
             // that long initial reasoning windows are tolerated without masking
             // mid-stream stalls.
-            let total_timeout = Duration::from_secs(600);
+            let total_timeout = crate::provider::STREAM_TOTAL_TIMEOUT;
             // Before the first event, tolerate long reasoning windows up to the
             // total cap; tightened to 60s once bytes start flowing.
             let mut event_timeout = total_timeout;
@@ -705,7 +705,7 @@ impl LLMProvider for OpenAIProvider {
                     first_event_logged = true;
                     // After the first event we can use a stricter per-event
                     // timeout to detect mid-stream stalls.
-                    event_timeout = Duration::from_secs(60);
+                    event_timeout = crate::provider::STREAM_EVENT_TIMEOUT;
                 }
 
                 let line = line.trim();
@@ -1174,7 +1174,7 @@ impl LLMProvider for OpenAIProvider {
         //
         // A hard timeout protects the caller from providers (e.g. kimi-k2.6)
         // that open the SSE stream and then stall without closing it.
-        let chat_timeout = Duration::from_secs(180);
+        let chat_timeout = crate::provider::CHAT_CONSUME_TIMEOUT;
         let consume_result = tokio::time::timeout(chat_timeout, async {
             let mut final_message: Option<Message> = None;
             while let Some(event) = stream.next().await {

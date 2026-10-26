@@ -427,7 +427,7 @@ impl LLMProvider for OpenAIResponsesProvider {
             let mut thinking_pos: Option<usize> = None;
             let mut tool_accs: BTreeMap<String, ToolAcc> = BTreeMap::new();
 
-            let total_timeout = Duration::from_secs(600);
+            let total_timeout = crate::provider::STREAM_TOTAL_TIMEOUT;
             let mut event_timeout = total_timeout;
             let stream_start = std::time::Instant::now();
             let mut first_event_logged = false;
@@ -465,7 +465,7 @@ impl LLMProvider for OpenAIResponsesProvider {
 
                 if !first_event_logged {
                     first_event_logged = true;
-                    event_timeout = Duration::from_secs(60);
+                    event_timeout = crate::provider::STREAM_EVENT_TIMEOUT;
                 }
 
                 let line = line.trim();
@@ -885,7 +885,7 @@ impl LLMProvider for OpenAIResponsesProvider {
 
     async fn chat(&self, messages: &[Message], options: &ChatOptions) -> SFResult<ChatResponse> {
         let mut stream = self.chat_stream(messages, options).await?;
-        let chat_timeout = Duration::from_secs(180);
+        let chat_timeout = crate::provider::CHAT_CONSUME_TIMEOUT;
         let consume_result = tokio::time::timeout(chat_timeout, async {
             let mut final_message: Option<Message> = None;
             while let Some(event) = stream.next().await {

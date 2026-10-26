@@ -187,11 +187,17 @@ pub struct HookDef {
     pub timeout_ms: Option<u64>,
 }
 
+/// 没写 `timeout_ms` 的钩子跑多久：30s。
+///
+/// 钩子是任务路径上的同步点，默认值必须短到「卡住的钩子」不会把一次任务拖成
+/// 超时；而一个正常的钩子（写一条记忆、发一次通知）远在秒级内完成。
+const DEFAULT_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl HookDef {
     pub fn timeout(&self) -> std::time::Duration {
         self.timeout_ms
             .map(std::time::Duration::from_millis)
-            .unwrap_or_else(|| std::time::Duration::from_secs(30))
+            .unwrap_or(DEFAULT_HOOK_TIMEOUT)
     }
 }
 

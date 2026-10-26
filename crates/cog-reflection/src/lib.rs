@@ -27,6 +27,13 @@
 /// 它要防的那种静默假阴性。
 pub const REFLECTION_NAMESPACE: &str = "reflection";
 
+/// 自我评审循环的间隔：1 小时。
+///
+/// 评审读的是这一小时的产出与记忆，比它更密只会把同一批证据再读一遍；更长
+/// 则让一次跑偏的产出等到下一轮才被看见。这是 `SelfEvolution` 引擎的节拍，
+/// 与「一轮评审能跑多久」无关。
+pub const SELF_REVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 pub mod auto_promoter;
 pub mod baseline_port;
 // The readings and the rules of the shared build cache live in cog-core: two
@@ -158,6 +165,7 @@ pub use squad::DefaultSquadReflection;
 pub use store_readouts::{ExpectedStore, RestoreExpectation, StoreReadouts, META_LEARNING_POLICY};
 pub use types::*;
 
+pub mod platform_http;
 pub mod plugin;
 
 use std::sync::Arc;

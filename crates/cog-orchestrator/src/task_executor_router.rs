@@ -296,7 +296,7 @@ impl TaskExecutorRouter {
                                 tracing::warn!("ready stream subscribe failed, retrying: {e}");
                                 tokio::select! {
                                     _ = shutdown.wait() => break 'subscribe,
-                                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue 'subscribe,
+                                    _ = tokio::time::sleep(crate::subscribe_backoff::SUBSCRIBE_RETRY_BACKOFF) => continue 'subscribe,
                                 }
                             }
                         };
@@ -350,7 +350,7 @@ impl TaskExecutorRouter {
 
                         tokio::select! {
                             _ = shutdown.wait() => break 'subscribe,
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                            _ = tokio::time::sleep(crate::subscribe_backoff::SUBSCRIBE_RETRY_BACKOFF) => {}
                         }
                     }
                 }

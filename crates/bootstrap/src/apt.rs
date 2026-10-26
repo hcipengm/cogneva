@@ -13,6 +13,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{info, warn};
 
+/// 探测发行版镜像站可达性的墙：5s。
+///
+/// 这一步只决定用不用得上镜像；等不到就当它不可用、换下一个候选，拖久了会让
+/// 整条装机链路在探测上多花掉几分钟。
+const MIRROR_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 国内 apt 镜像候选。与 bootstrap.sh 的候选表同源（同样由测试盯着）。
 pub const APT_MIRROR_HOSTS: &[&str] = &[
     "https://mirrors.tuna.tsinghua.edu.cn",
@@ -71,7 +77,7 @@ fn distro_id_and_codename() -> (String, String) {
 async fn pick_mirror() -> Option<String> {
     let (id, codename) = distro_id_and_codename();
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(MIRROR_PROBE_TIMEOUT)
         .build()
         .ok()?;
     for host in APT_MIRROR_HOSTS {

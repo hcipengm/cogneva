@@ -19,6 +19,17 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+
+/// 给文件算 sha256 时一次读多少：64 KiB。
+///
+/// 整块读让哈希只受磁盘顺序读限制，64 KiB 是页缓存友好的块大小。
+const HASH_CHUNK_BYTES: usize = 64 * 1024;
+
+/// 抓一次 /metrics 的墙：5s。
+///
+/// 这是评测里的一条读数，抓不到按缺读数处理；等更久只会让一条评测卡在别人的
+/// 观测面上。
+const METRICS_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 use cog_core::{
     AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, HttpClient, LlmClient,
     Message, SFResult, LLM_ACTOR_HEADER, LLM_ORIGIN_HEADER,
@@ -746,7 +757,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("cannot open {} to hash it", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = [0u8; HASH_CHUNK_BYTES];
     loop {
         let read = file.read(&mut buf)?;
         if read == 0 {
@@ -852,7 +863,7 @@ async fn read_pool(http: &Arc<dyn HttpClient>, base_url: &str) -> Option<PoolRea
     let url = metrics_url(base_url);
     let mut req = cog_core::HttpRequest::get(url);
     req.timeout_secs = Some(3);
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), http.execute(req))
+    let resp = tokio::time::timeout(METRICS_FETCH_TIMEOUT, http.execute(req))
         .await
         .ok()?
         .ok()?;

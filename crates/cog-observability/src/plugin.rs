@@ -12,6 +12,12 @@ use crate::alert_store::{AlertRowStore, NewAlert, PostgresAlertStore};
 use crate::bell::InAppNotifier;
 use crate::usage_store::LlmUsageStore;
 
+/// 一次巡检的最小周期：30s。
+///
+/// 判据被配得极短时，这条界保证巡检不会变成对着表打的热循环；正常配置下巡检
+/// 周期是判据的一半，远大于这个下限。
+const MIN_SWEEP_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Loop name reported through the background-loop liveness family.
 pub const TRACE_TIER_MIGRATION_LOOP: &str = "observability_trace_tier_migration";
 
@@ -1430,7 +1436,7 @@ const PER_PROCESS_RULES: &[&str] = &["agent_unhealthy"];
 /// 最坏滞后不超过判据本身的一倍半。下限只管住「判据被配得极短」时不要把它变成对着表
 /// 打的热循环。
 fn sweep_period(row_stale_after: std::time::Duration) -> std::time::Duration {
-    (row_stale_after / 2).max(std::time::Duration::from_secs(30))
+    (row_stale_after / 2).max(MIN_SWEEP_PERIOD)
 }
 
 /// 收掉 [`PER_PROCESS_RULES`] 里 `row_stale_after` 这么久没人刷新的行，回答收了几行。

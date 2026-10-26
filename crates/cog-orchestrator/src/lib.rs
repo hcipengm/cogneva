@@ -15,6 +15,7 @@ pub mod ready_queue;
 pub mod replan;
 pub mod resource_ledger;
 pub mod sop;
+pub mod subscribe_backoff;
 pub mod task_executor_router;
 pub mod wbs;
 

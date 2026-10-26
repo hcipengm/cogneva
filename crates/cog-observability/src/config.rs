@@ -160,10 +160,16 @@ pub struct TraceCollectorConfig {
     pub buffer_max_bytes: usize,
 }
 
+/// trace 收集缓冲的上限：默认 16 MiB。
+///
+/// 缓冲吸收的是「导出端比产生端慢」的那一段；超过它就丢最旧的 span，而不是
+/// 让进程内存跟着涨。这是代码自己选的界，不是量出来的容量。
+const DEFAULT_TRACE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
 impl Default for TraceCollectorConfig {
     fn default() -> Self {
         Self {
-            buffer_max_bytes: 16 * 1024 * 1024,
+            buffer_max_bytes: DEFAULT_TRACE_BUFFER_BYTES,
         }
     }
 }

@@ -18,6 +18,12 @@ use std::sync::Arc;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
+/// Loki 推送失败后的退避基数：100ms，按尝试次数翻倍。
+///
+/// 第一次失败几乎都是对端刚重启，100ms 后重试就是一次正常写入；翻倍让连续
+/// 失败退到秒级，不会在 Loki 长时间不可用时把它压死。
+const BACKOFF_BASE_MS: u64 = 100;
+
 pub type LogFilterHandle =
     tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
@@ -493,7 +499,10 @@ impl LokiPushClient {
                 }
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_millis(100 * (1u64 << attempt))).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                BACKOFF_BASE_MS * (1u64 << attempt),
+            ))
+            .await;
         }
     }
 

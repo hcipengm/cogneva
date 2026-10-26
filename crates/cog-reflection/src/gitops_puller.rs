@@ -62,6 +62,12 @@ const WHOLE_WATCH_GATE: &str = "watch";
 /// as the other's.
 pub const CLUSTER_LABEL: &str = "cluster";
 
+/// 等一次滚动发布完成的轮询间隔：10s。
+///
+/// Pod 重建本身以十秒计，更密的轮询只会多打几次 kubectl 而不会让发布更早
+/// 完成；10s 也是这条循环在发布期间的全部负载。
+const ROLLOUT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
 /// 一次待处理的晋级（从 release 分支 HEAD + promote tag 解析出来）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromotionCandidate {
@@ -986,7 +992,7 @@ impl GitOpsPuller {
                         rolled_out = true;
                         break;
                     }
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    tokio::time::sleep(ROLLOUT_POLL_INTERVAL).await;
                 }
                 if !rolled_out {
                     // 看护通过但全量滚动失败（新副本后续拉不到镜像/不起）：

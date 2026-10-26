@@ -4,6 +4,12 @@ use cog_core::{AgentEvent, MessageBackend};
 use futures::StreamExt;
 use tokio::sync::broadcast;
 
+/// 主后端订阅失败后隔多久再订：5s。
+///
+/// 与就绪队列、事件流同一个节拍：后端要么回来要么不回来，更快的重试只会在
+/// 集群已经不健康时成倍放大告警。
+const SUBSCRIBE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Consumes AgentEvents from multiple message backends with automatic fallback.
 /// Primary backend (e.g. Redis Streams) is polled continuously.
 /// If the primary fails, the consumer automatically switches to the fallback
@@ -108,7 +114,7 @@ impl MultiBackendEventConsumer {
                     Err(e) => {
                         tracing::warn!("MultiBackendEventConsumer: subscribe failed: {}", e);
                         using_primary = false;
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        tokio::time::sleep(SUBSCRIBE_RETRY_BACKOFF).await;
                     }
                 }
             }

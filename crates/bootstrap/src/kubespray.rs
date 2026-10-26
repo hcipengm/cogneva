@@ -25,6 +25,12 @@ use tracing::{info, warn};
 
 use super::{cn_mirror, command_exists, docker_mirror_host, download, probe_alive, run};
 
+/// kubespray 收尾后等节点注册的停顿：5s。
+///
+/// kubelet 报 Ready 与 apiserver 把它算进 node 列表之间有一个传播窗口；不等
+/// 这一下，紧接着的 wait_all_nodes_ready 会先数到一个缺了节点的集群。
+const NODE_REGISTRATION_SETTLE: Duration = Duration::from_secs(5);
+
 /// kubespray 容器镜像 tag（跟随官方稳定版，它钉住经测试的 K8s 版本矩阵）。
 pub(crate) const KUBESPRAY_TAG: &str = "v2.31.0";
 
@@ -526,7 +532,7 @@ pub(crate) async fn run_kubespray(workers: &[String]) -> Result<()> {
     wire_kubeconfig().await?;
     info!("标准 Kubernetes 集群就绪（kubespray），kubeconfig 已接 /root/.kube/config");
     // 给节点一点时间注册，main.rs 随后会 wait_all_nodes_ready。
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(NODE_REGISTRATION_SETTLE).await;
     Ok(())
 }
 

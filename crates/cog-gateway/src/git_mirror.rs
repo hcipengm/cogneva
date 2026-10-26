@@ -89,6 +89,8 @@ const MIRROR_OP_TIMEOUT_FLOOR_SECS: u64 = 60;
 /// 看门狗巡检间隔的上限；实际间隔按静默窗的四分之一取（见
 /// [`GitTransport::watchdog_interval`]），这样测试里把窗口压到秒级仍然判得准。
 const MIRROR_WATCHDOG_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// 巡检间隔的下限：静默窗压到毫秒级（测试）时，别让巡检变成忙等。
+const MIRROR_WATCHDOG_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 /// 失败信息里保留的 stderr 尾巴长度：传输失败的**原因在最后几行**，而前几千行
 /// 是进度刷屏。留尾部才留得住原因，同时也别让一条日志带上几 MB。
 const STDERR_TAIL_CHARS: usize = 600;
@@ -719,10 +721,7 @@ impl GitExec {
     /// 另立一个旋钮——两个独立旋钮必然会出现"窗口 30s、巡检 60s"这种判据比
     /// 被判断的对象还粗的组合；测试里把窗口压到秒级时它也跟着变细。
     fn watchdog_interval(&self) -> std::time::Duration {
-        (self.cfg.stall / 4).clamp(
-            std::time::Duration::from_millis(50),
-            MIRROR_WATCHDOG_MAX_INTERVAL,
-        )
+        (self.cfg.stall / 4).clamp(MIRROR_WATCHDOG_MIN_INTERVAL, MIRROR_WATCHDOG_MAX_INTERVAL)
     }
 
     /// 跑一条 git 命令，并把它的执行**封顶**。

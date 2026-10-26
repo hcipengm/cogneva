@@ -3,6 +3,12 @@
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
+/// 等 gRPC server 优雅退出的上限：5s。
+///
+/// 关停时先让在飞的调用收尾；5s 之后还没停就交给进程退出——把停机拖到编排器
+/// 的宽限期用完，才是真正难看的结局。
+const GRPC_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Protocol plugin that provides MCP, A2A, and gRPC lifecycle services.
 pub struct ProtocolPlugin {
     mcp_client: Option<Arc<dyn cog_core::McpClient>>,
@@ -194,7 +200,7 @@ impl cog_core::SystemPlugin for ProtocolPlugin {
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
             if let Some(serve) = serve {
-                match tokio::time::timeout(std::time::Duration::from_secs(5), serve).await {
+                match tokio::time::timeout(GRPC_SHUTDOWN_TIMEOUT, serve).await {
                     Ok(Ok(())) => info!("gRPC server stopped"),
                     Ok(Err(e)) => warn!("gRPC server task ended with error: {e}"),
                     Err(_) => {

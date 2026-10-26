@@ -18,6 +18,12 @@ use crate::dataset::EvalCase;
 use crate::exec_seam::ExecSeam;
 use crate::metric::StepRecord;
 
+/// 默认的上下文窗口：512K tokens。
+///
+/// 逐类比照公开模型值，不额外放宽；上下文是评测里最容易被「给多一点」吃掉
+/// 可变性的地方——同一道题给不同流派不同的窗口，读数就不可比了。
+const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 512 * 1024;
+
 /// 外壳跑完一题交回来的东西。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentOutput {
@@ -70,7 +76,7 @@ impl Default for Budget {
         // 逐类比照公开值，不额外加工具、不放松上限。
         Self {
             max_steps: 500,
-            max_context_tokens: 512 * 1024,
+            max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
             temperature: 1.0,
         }
     }

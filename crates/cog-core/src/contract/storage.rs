@@ -1194,14 +1194,23 @@ pub struct TierPolicy {
     pub cold_key_prefix: String,
 }
 
+/// 默认热层保留 7 天：最近一周的原始流是排障与评测最常回看的那一段。
+const DEFAULT_HOT_DURATION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// 默认温层保留 90 天：超过一个季度的事件已经属于归档，但仍要能查。
+const DEFAULT_WARM_DURATION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
+/// 默认每小时扫一次分层：分层是按时间的判据，密到分钟级只会重复搬同一批对象。
+const DEFAULT_TIER_SCAN_INTERVAL: Duration = Duration::from_secs(3600);
+
 impl Default for TierPolicy {
     fn default() -> Self {
         Self {
-            hot_duration: Duration::from_secs(7 * 24 * 60 * 60), // 7 d
-            warm_duration: Duration::from_secs(90 * 24 * 60 * 60), // 90 d
+            hot_duration: DEFAULT_HOT_DURATION,
+            warm_duration: DEFAULT_WARM_DURATION,
             warm_compression_level: 3,
             cold_compression_level: 9,
-            scan_interval: Duration::from_secs(3600), // hourly
+            scan_interval: DEFAULT_TIER_SCAN_INTERVAL,
             cold_key_prefix: "raw".into(),
         }
     }

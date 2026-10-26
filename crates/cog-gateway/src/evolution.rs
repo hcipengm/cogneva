@@ -175,6 +175,12 @@ pub async fn build_runs_handler(State(state): State<Arc<crate::GatewayState>>) -
 /// 而不是「只要最新的这么多」。
 const BUILD_RUN_ROWS_ASKED: usize = 200;
 
+/// 演进事件流的保活间隔：15s。
+///
+/// 流要穿过 ingress 与各种中间代理，它们的空闲上限普遍按 30s～60s 设；保活
+/// 比最短的那个更密，才不会被当成空闲连接掐掉。
+const SSE_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Return the current self-evolution counters from the D5 observable metrics.
 pub async fn metrics_handler(State(state): State<Arc<crate::GatewayState>>) -> Response {
     let mut snapshot = EvolutionMetricsSnapshot {
@@ -293,7 +299,7 @@ pub async fn stream_handler(
     Sse::new(stream)
         .keep_alive(
             KeepAlive::new()
-                .interval(std::time::Duration::from_secs(15))
+                .interval(SSE_KEEP_ALIVE_INTERVAL)
                 .text("ping"),
         )
         .into_response()

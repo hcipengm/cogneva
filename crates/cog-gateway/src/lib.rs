@@ -503,10 +503,17 @@ fn memory_raw_routes() -> Router<Arc<GatewayState>> {
 ///
 /// 不挂 CORS / 安全响应头 / 压缩：这条面只对集群内的程序开放，没有浏览器来读它，
 /// 响应体直接进 agent 的 HTTP 客户端。
+/// 请求体上限：默认取 10 MiB。
+///
+/// 记忆写入与原始流上传是这里唯一的批量入口，两条路由面（对外与集群内）共用
+/// 这一个数——各写一份时，改一处就有一个面静默地留着旧上限。这是这段代码自己
+/// 选的界，不是量出来的容量。
+const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 pub fn create_internal_router(state: Arc<GatewayState>) -> Router {
     memory_ingest_routes()
         .merge(memory_raw_routes())
-        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(from_fn({
@@ -1254,7 +1261,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
     transport_observability(public.merge(protected), state.clone())
         .layer(from_fn(security_headers_middleware))
         .layer(cors_layer)
-        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(from_fn({
             let state = state.clone();
             move |req: Request, next: Next| {

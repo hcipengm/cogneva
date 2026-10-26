@@ -6,13 +6,21 @@
 # COGNEVA_CAPACITY_REGISTRY_WRITE=1 cargo test -p cogneva --test
 # rust_capacity_constants_registry_test
 file	name	value	source	note
+crates/bootstrap/src/apt.rs	MIRROR_PROBE_TIMEOUT	5s	bound	探测发行版镜像站可达性的墙：5s。
 crates/bootstrap/src/download.rs	PROBE	5s	unreviewed	
+crates/bootstrap/src/kubespray.rs	NODE_REGISTRATION_SETTLE	5s	bound	kubespray 收尾后等节点注册的停顿：5s。
 crates/bootstrap/src/lib.rs	DIRTY_BACKGROUND_FLOOR_BYTES	32 * 1024 * 1024	unreviewed	
 crates/bootstrap/src/lib.rs	DIRTY_BACKGROUND_SECONDS	2	bound	seconds of the device's own write allowed to pile before background writeback starts
 crates/bootstrap/src/lib.rs	DIRTY_CEILING_BYTES	1024 * 1024 * 1024	unreviewed	
 crates/bootstrap/src/lib.rs	DIRTY_FLOOR_BYTES	64 * 1024 * 1024	unreviewed	
 crates/bootstrap/src/lib.rs	DIRTY_FORCE_SECONDS	5	bound	seconds of unflushed write before a writer is made to wait for its own writeback
 crates/bootstrap/src/lib.rs	DIRTY_MAX_RAM_DIVISOR	20	bound	a cap on the derived watermarks; keeps a fast device from holding the whole node's RAM dirty
+crates/bootstrap/src/main.rs	KUBECONFIG_READY_ATTEMPTS	30	bound	装完 K3s 之后等 kubeconfig 能用的次数与间隔：30 × 2s = 60s。
+crates/bootstrap/src/main.rs	KUBECONFIG_READY_INTERVAL	2s	bound	the poll interval of the 30 x 2s wall above; short so a fast host does not wait on the probe
+crates/bootstrap/src/main.rs	NODES_READY_ATTEMPTS	60	bound	等全部节点 Ready 的次数与间隔：60 × 5s = 5 分钟。
+crates/bootstrap/src/main.rs	NODES_READY_INTERVAL	5s	bound	the poll interval of the 60 x 5s wall above; long enough for one image layer to land
+crates/bootstrap/src/main.rs	OUTDATED_PROBE_TIMEOUT	3s	bound	最佳努力的新版本探测单次上限。
+crates/bootstrap/src/main.rs	REGISTRY_SEED_RETRY_INTERVAL	10s	bound	集群内 registry 播种基镜像失败后的重试间隔。
 crates/cog-agent/src/archive.rs	ARCHIVE_TIMEOUT_SECS	20	bound	one turn's share: long enough to store a payload, short enough not to wedge the turn
 crates/cog-agent/src/consumer.rs	INBOX_RECLAIM_BATCH	64	unreviewed	
 crates/cog-agent/src/consumer.rs	INBOX_RECLAIM_MIN_IDLE_MS	60_000	bound	safety threshold so a still-draining process is not robbed; nothing waits on it
@@ -40,6 +48,7 @@ crates/cog-agent/src/web.rs	RENDER_ATTEMPTS	2	unreviewed
 crates/cog-agent/src/web.rs	RENDER_TIMEOUT_SECS	60	bound	room for a browser to start, run scripts and settle; the fetch deadline is too short
 crates/cog-agent/src/web.rs	SEARCH_ATTEMPTS	2	unreviewed	
 crates/cog-agent/src/web.rs	SEARCH_TIMEOUT_SECS	20	bound	the point past which the slowest metasearch engine is not worth the turn
+crates/cog-auth/src/keycloak.rs	DEFAULT_JWKS_TTL	3600s	bound	默认的 JWKS 缓存时长：1 小时。
 crates/cog-auth/src/keycloak.rs	JWKS_CACHE_TTL	300s	bound	how long a fetched key set is reused; bounds how long a rotated-away key is still accepted
 crates/cog-auth/src/session.rs	SESSION_TTL_SECONDS	7 * 24 * 60 * 60	unreviewed	
 crates/cog-collaboration/src/collaboration_executor.rs	TOKEN_ESTIMATE_CAP	200_000	derived	twice the largest TokenBudget threshold the shipped configurations declare (100000 in all three carriers); the estimator saturates here, and a gate test keeps every declared threshold below it
@@ -51,12 +60,15 @@ crates/cog-collaboration/src/profile.rs	SHORTCUT_MAX_FILES	3	bound	files a reque
 crates/cog-collaboration/src/profile.rs	SHORTCUT_MAX_LINES	40	bound	diff lines an attached change may declare and still be the shortcut's own work
 crates/cog-collaboration/src/squad/executor.rs	PIPELINE_FAILURES_BEFORE_UPGRADE	2	unreviewed	
 crates/cog-collaboration/src/squad/ralph/ralph_loop.rs	PACED_SLEEP_MAX_SECS	60	bound	ceiling on the paced backoff so a paused squad is not silent longer than a minute; the known cost of the last paced round is recorded above it rather than folded into the number
+crates/cog-core/src/admission.rs	ADMISSION_RECOMPUTE_WINDOW	60s	bound	重新算一次界的最小间隔：60s。
 crates/cog-core/src/admission.rs	LATENCY_MIN_SAMPLES	5	bound	floor before a median is this workload's history rather than noise
-crates/cog-core/src/admission.rs	LATENCY_RED_FACTOR	2.0	unreviewed	
-crates/cog-core/src/admission.rs	MEM_FLOOR_BYTES	44 * 1024 * 1024 * 1024	unreviewed	
-crates/cog-core/src/admission.rs	MEM_GREEN_MIN_BYTES	46 * 1024 * 1024 * 1024	unreviewed	
-crates/cog-core/src/admission.rs	PSI_GREEN_AVG60	5.0	unreviewed	
-crates/cog-core/src/admission.rs	PSI_RED_AVG10	20.0	unreviewed	
+crates/cog-core/src/admission.rs	LATENCY_RED_FACTOR	2.0	bound	判定「这一例偏慢」的倍数：比自己的历史中位数慢这么多倍才算红灯。
+crates/cog-core/src/admission.rs	MEM_FLOOR_BYTES	44 * 1024 * 1024 * 1024	bound	可用内存的地板，低于它减半。
+crates/cog-core/src/admission.rs	MEM_GREEN_MIN_BYTES	46 * 1024 * 1024 * 1024	bound	绿灯的可用内存线：高于它才加一。
+crates/cog-core/src/admission.rs	PSI_GREEN_AVG60	5.0	bound	绿灯：PSI 三项的 `avg60` 全在这条线以下才加一。
+crates/cog-core/src/admission.rs	PSI_RED_AVG10	20.0	bound	红灯：PSI 任一项的 `avg10` 越过这个百分比就减半。
+crates/cog-core/src/admission.rs	UNMEASURED_CEILING	4	bound	未实测的上界：4，取的是驱动原先写死的并发数。
+crates/cog-core/src/admission.rs	UNMEASURED_FLOOR	1	bound	未实测的下界：1，只是「不许是零」的形式下界。
 crates/cog-core/src/build_cache.rs	CACHE_LAYER_DEPTH	2	bound	cargo's profile level, then the deps/incremental level that can be dropped
 crates/cog-core/src/build_cache.rs	DEFAULT_CACHE_MAX_BYTES	3_221_225_472	bound	a 5 GiB claim less the co-tenants measured by hand; the auto cap can replace it
 crates/cog-core/src/build_cache.rs	MAX_PUBLISHED_LAYERS	12	bound	series cap; everything past it is folded into one other series by size
@@ -93,6 +105,7 @@ crates/cog-core/src/contract/reflection.rs	HASH_LEN	16	unreviewed
 crates/cog-core/src/contract/reflection.rs	PANIC_LINES	8	unreviewed	
 crates/cog-core/src/contract/resilience.rs	DEFAULT_HIGH_WATERMARK	0	unreviewed	
 crates/cog-core/src/contract/resilience.rs	DEFAULT_LOW_WATERMARK	0	unreviewed	
+crates/cog-core/src/contract/storage.rs	DEFAULT_TIER_SCAN_INTERVAL	3600s	bound	默认每小时扫一次分层：分层是按时间的判据，密到分钟级只会重复搬同一批对象。
 crates/cog-core/src/contract/storage.rs	RRF_K	60.0	unreviewed	
 crates/cog-core/src/contract/taste.rs	TASTE_EVIDENCE_MAX_REFS	32	bound	a judgement is made against a handful of artifacts; a longer list is a corpus, and a corpus belongs on the material side where it can be paged
 crates/cog-core/src/contract/taste.rs	TASTE_REFERENCE_MAX_CHARS	2_048	bound	fits a URI with a query string, not a document in the field whose job is to point at one
@@ -107,6 +120,11 @@ crates/cog-eval/src/adapters/swe_pro.rs	MAX	5	bound	at most five test names in a
 crates/cog-eval/src/backoff.rs	ATTEMPTS_PER_MINUTE	600	bound	a gate two orders above normal call density; it only bites in a refusal storm
 crates/cog-eval/src/backoff.rs	DEFAULT_REFUSAL_BACKOFF	1s	bound	floor when a refusal states no wait; three orders above the measured 0.7ms fast failure
 crates/cog-eval/src/backoff.rs	DEFAULT_REFUSAL_WAIT_CAP	600s	bound	above the ~4min window flip seen and below a 45min pod's life; past it the call is refused, not waited
+crates/cog-eval/src/backoff.rs	PER_MINUTE_WINDOW	60s	bound	「每分钟 N 次」里的一分钟就是窗口长度。
+crates/cog-eval/src/exec_seam.rs	DEFAULT_CPUS	2.0	bound	默认给外部流派几个核：2。
+crates/cog-eval/src/exec_seam.rs	DEFAULT_MEMORY_BYTES	4 * 1024 * 1024 * 1024	bound	默认给外部流派多少内存：4 GiB。
+crates/cog-eval/src/exec_seam.rs	DEFAULT_WALL_CLOCK	600s	bound	一次外部流派评测的默认墙钟：10 分钟。
+crates/cog-eval/src/scaffold.rs	DEFAULT_MAX_CONTEXT_TOKENS	512 * 1024	bound	默认的上下文窗口：512K tokens。
 crates/cog-eval/src/scaffolds/mod.rs	DATA_URL_MIN_LEN	1024	bound	below this a `data:` string is prose mentioning the word, not an attachment
 crates/cog-eval/src/trend.rs	MARGIN	50	unreviewed	
 crates/cog-eval/src/trend.rs	SVG_HEIGHT	400	unreviewed	
@@ -143,16 +161,16 @@ crates/cog-gateway/src/chat.rs	SESSION_HISTORY_CAP	40	bound	how many turns fit i
 crates/cog-gateway/src/chat.rs	STREAM_IDLE_TIMEOUT_SECS	180	bound	matches the upstream's own in-stream cap; only an idle gap beyond it aborts a reasoning turn
 crates/cog-gateway/src/document_egress.rs	DEFAULT_MAX_AUDITED_BODY_BYTES	8 * 1024 * 1024	unreviewed	
 crates/cog-gateway/src/eval_reports.rs	DEFAULT_LIST_LIMIT	200	bound	each listed report costs one body read to name its dataset, so the cap bounds the reads; the untrimmed total is reported so the caller sees a prefix
-crates/cog-gateway/src/evolution.rs	BUILD_RUN_ROWS_ASKED	200	unreviewed	
+crates/cog-gateway/src/evolution.rs	BUILD_RUN_ROWS_ASKED	200	bound	这一面一次要多少行。窗口本身比较浅，这个数比窗口大，意思是「把整个窗口都给我」，
 crates/cog-gateway/src/git_mirror.rs	DEFAULT_MIRROR_OP_TIMEOUT_SECS	1800	bound	total wall for one clone/fetch/push; the stall judgement cannot catch a remote that keeps printing progress and never ends
 crates/cog-gateway/src/git_mirror.rs	DEFAULT_MIRROR_STALL_SECS	180	bound	silence that marks a transfer dead; --progress writes at second granularity, so silence is no progress, while a slow link still makes progress
 crates/cog-gateway/src/git_mirror.rs	HTTPS_PROBE_INTERVAL_SECS	60	bound	base of the circuit-breaker probe backoff: consecutive failures retreat exponentially from this cadence
-crates/cog-gateway/src/git_mirror.rs	MAX_MIRROR_BODY	256 * 1024 * 1024	unreviewed	
+crates/cog-gateway/src/git_mirror.rs	MAX_MIRROR_BODY	256 * 1024 * 1024	bound	镜像单次响应体上限，与透传路径的 256MB 缓冲约定一致。
 crates/cog-gateway/src/git_mirror.rs	MIRROR_FRESHNESS_SECS	30	bound	a mirror's last successful fetch must be this recent to serve as a baseline; the same number is the oldest a fallback baseline may be
 crates/cog-gateway/src/git_mirror.rs	MIRROR_OP_TIMEOUT_FLOOR_SECS	60	bound	lowest the deployment may set the operation timeout to; below it a large legitimate fetch is cut
 crates/cog-gateway/src/git_mirror.rs	MIRROR_STALL_FLOOR_SECS	30	bound	lowest the deployment may set the stall judgement to, so a healthy transfer is never killed for being quiet
 crates/cog-gateway/src/git_mirror.rs	RESIDUE_MIN_AGE_SECS	60	bound	newer residue may belong to a live transfer (progress updates by the second, locks live less than a request); only clearly stale files are a dead process's
-crates/cog-gateway/src/git_mirror.rs	STDERR_TAIL_CHARS	600	unreviewed	
+crates/cog-gateway/src/git_mirror.rs	STDERR_TAIL_CHARS	600	bound	失败信息里保留的 stderr 尾巴长度：传输失败的**原因在最后几行**，而前几千行
 crates/cog-gateway/src/git_routing.rs	HANDSHAKE_TIMEOUT	20s	bound	probe budget for one channel's handshake, not a channel's request budget — exceeding it means the channel is unavailable now
 crates/cog-gateway/src/git_routing.rs	MEASURE_FRESHNESS_SECS	600	bound	how long a measured channel verdict stands: longer than the circuit-breaker probe cadence, short enough that a torn-down wall shows within minutes
 crates/cog-gateway/src/git_routing.rs	SIGNAL_PROBE_TIMEOUT	5s	bound	one network-profile signal probe, at the same order as the bootstrap's short probes: reachable, not how fast
@@ -175,6 +193,7 @@ crates/cog-gateway/src/ide.rs	SEARCH_MAX_FILES	5_000	bound	search answers synchr
 crates/cog-gateway/src/ide.rs	SEARCH_MAX_LIMIT	500	bound	widest page of matches a caller may ask for
 crates/cog-gateway/src/ide.rs	TRANSFER_MAX_BYTES	8 * 1024 * 1024	unreviewed	
 crates/cog-gateway/src/knowledge.rs	MAX_TOP_K	100	bound	widest answer assembled over HTTP rather than an internal candidate window; the same ceiling the wiki search applies
+crates/cog-gateway/src/lib.rs	MAX_REQUEST_BODY_BYTES	10 * 1024 * 1024	bound	零凭证的集群内面：只挂 Pod 侧要走的 memory 路由，不挂认证/会话/配额。
 crates/cog-gateway/src/memory.rs	DEFAULT_RAW_LIST_LIMIT	100	bound	a listing costs one store read per id, so the cap bounds the reads; the untrimmed total is reported so a prefix is visible
 crates/cog-gateway/src/memory.rs	EXPIRY_SECS	300	bound	lifetime of the signed URL for stored bytes: long enough for the request that asked, short enough that a working link does not circulate
 crates/cog-gateway/src/observability.rs	FIRING_PROBE_LIMIT	1	bound	the cluster verdict only asks whether anything fires, so one row settles it however much is firing
@@ -216,17 +235,22 @@ crates/cog-github/src/provider/github.rs	MAX_JOB_LOG_BYTES	16 * 1024	unreviewed
 crates/cog-github/src/provider/github.rs	MAX_TOTAL_LOG_BYTES	80 * 1024	unreviewed	
 crates/cog-github/src/provider/mod.rs	MAX_ATTACHMENT_BYTES	20 * 1024 * 1024	unreviewed	
 crates/cog-llm/src/observed.rs	FORWARD_CAPACITY	64	bound	the forward channel's depth; routing.rs holds a second copy of the same 64
+crates/cog-llm/src/provider/mod.rs	CHAT_CONSUME_TIMEOUT	180s	bound	`chat()` 消费一条流的上限：3 分钟。
+crates/cog-llm/src/provider/mod.rs	STREAM_EVENT_TIMEOUT	60s	bound	首个事件之后，两次事件之间允许的最大间隔：60s。
+crates/cog-llm/src/provider/mod.rs	STREAM_TOTAL_TIMEOUT	600s	bound	一条流式响应从头到尾的硬上限：10 分钟。
 crates/cog-memory/src/config.rs	DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS	64_000	bound	one deployed 64k agent window of transcript; the raw layer no longer trims to it
 crates/cog-memory/src/extractor.rs	ENTITY	6	unreviewed	
 crates/cog-memory/src/extractor.rs	EVENT	8	unreviewed	
 crates/cog-memory/src/extractor.rs	RELATION	7	unreviewed	
 crates/cog-memory/src/extractor.rs	SUMMARY	5	unreviewed	
+crates/cog-memory/src/ingestor.rs	SUBSCRIBE_RETRY_BACKOFF	5s	bound	订阅失败后的重试间隔：5s。
 crates/cog-memory/src/maintenance.rs	DECAY_ARCHIVE_FLOOR	0.02	unreviewed	
 crates/cog-memory/src/maintenance.rs	DECAY_IMPORTANCE_FACTOR	0.5	unreviewed	
 crates/cog-memory/src/vector_summary_backend.rs	CREATE_COLLECTION_BACKOFF_DOUBLINGS	4	bound	four doublings from 500 ms cap the wait at 8 s inside the 120 s retry window
 crates/cog-memory/src/vector_summary_backend.rs	CREATE_COLLECTION_BACKOFF_MS	500	bound	the first retry delay; doubling from here keeps asking during a create storm
 crates/cog-observability/src/claim_store.rs	DEFAULT_INTERVAL_SECS	300	bound	the same 300 as cog-core's DEFAULT_SCAN_INTERVAL_SECS, so two processes reporting one claim are equally fresh and the older one's number does not read as growth
 crates/cog-observability/src/claim_store.rs	MIN_INTERVAL_SECS	30	bound	a scan walks every directory below the root, so a faster cadence only keeps the disk busy
+crates/cog-observability/src/config.rs	DEFAULT_TRACE_BUFFER_BYTES	16 * 1024 * 1024	bound	trace 收集缓冲的上限：默认 16 MiB。
 crates/cog-observability/src/config.rs	MIN_HOLD_SECS	60	bound	below the settle floor the hold only re-reads one window, while the pod replacement it waits out takes minutes
 crates/cog-observability/src/config.rs	MIN_POLL_INTERVAL_SECS	30	bound	scrape intervals dominate freshness, so a faster poll burns Prometheus CPU without showing anything sooner
 crates/cog-observability/src/config.rs	MIN_SETTLE_SECS	10	bound	kubelet refreshes the mounted document on its own sync period; a shorter window would read the same stale document twice and call a rollout a permanent gap
@@ -237,9 +261,12 @@ crates/cog-observability/src/infra_watch.rs	MAX_CHARS	300	bound	enough of a Prom
 crates/cog-observability/src/llm_usage_rollup.rs	LOOKBACK_SECS	7 * 24 * 3600	unreviewed	
 crates/cog-observability/src/llm_usage_rollup.rs	PERIOD	600s	unreviewed	
 crates/cog-observability/src/llm_usage_rollup.rs	WINDOW_SECS	3600	bound	a property of the reading rather than a knob: one hour keeps a quiet window a meaningful rate and a shift in where tokens go visible the same day, and a different window would be a different series
-crates/cog-observability/src/plugin.rs	ALERT_BELL_BATCH	200	unreviewed	
+crates/cog-observability/src/logs.rs	BACKOFF_BASE_MS	100	bound	Loki 推送失败后的退避基数：100ms，按尝试次数翻倍。
+crates/cog-observability/src/plugin.rs	ALERT_BELL_BATCH	200	bound	一轮最多发多少条。存量补发时不要一次写几千行把这一轮的墙钟撑破。
 crates/cog-observability/src/plugin.rs	ALERT_BELL_INTERVAL_SECS	60	bound	the same 60 seconds the WebUI's useNotifications polls at: faster is spin because the browser cannot see it sooner, slower lights the bell a full tick late
+crates/cog-observability/src/probes.rs	DEFAULT_PROBE_TIMEOUT	5s	bound	HTTP 探针默认的超时：5s。
 crates/cog-observability/src/process_zombies.rs	SWEEP_INTERVAL	15s	bound	long enough that an owner collecting through a blocking wait() always wins the race, short enough that a wedged sweep is visible within one scrape interval
+crates/cog-observability/src/raw_stream.rs	COPY_CHUNK_BYTES	64 * 1024	bound	重放一条原始流时每次从盘上读多少：64 KiB。
 crates/cog-observability/src/spend_verdict.rs	LOOKBACK_SECS	0	unreviewed	
 crates/cog-observability/src/spend_verdict.rs	PERIOD	600s	unreviewed	
 crates/cog-observability/src/spend_verdict.rs	WINDOW_SECS	3600	bound	the same closed hour the usage rollup folds, so a verdict cell and the spend it judges are keyed identically and need no mapping
@@ -281,6 +308,7 @@ crates/cog-orchestrator/src/resource_ledger.rs	CARRY_CAPACITY	1024	bound	four 25
 crates/cog-orchestrator/src/resource_ledger.rs	FOLD_PER_PASS	500	unreviewed	
 crates/cog-orchestrator/src/resource_ledger.rs	RECENT_PEEK	5	unreviewed	
 crates/cog-orchestrator/src/resource_ledger.rs	RESOURCE_LEDGER_PASS_INTERVAL	10s	bound	a wide margin under the ring depth: more than 25 events/s would be needed to overflow between passes
+crates/cog-orchestrator/src/subscribe_backoff.rs	SUBSCRIBE_RETRY_BACKOFF	5s	bound	一次失败的订阅在这个间隔后重试。
 crates/cog-orchestrator/src/task_executor_router.rs	CLAIM_BATCH	16	unreviewed	
 crates/cog-orchestrator/src/task_executor_router.rs	CLAIM_CONCURRENCY	4	bound	a process-wide in-flight ceiling; enough that a 90-minute task cannot stall recovery
 crates/cog-orchestrator/src/task_executor_router.rs	CLAIM_INTERVAL	60s	bound	sweeper poll period; PENDING_IDLE_MS is the claim threshold, this only sets how late a stuck message is seen
@@ -293,12 +321,14 @@ crates/cog-redis/src/lib.rs	MIN_BUDGET_MS	100	bound	below it a momentary refusal
 crates/cog-redis/src/lib.rs	MIN_RESPONSE_TIMEOUT_MS	100	bound	below it the timeout races the round trip itself
 crates/cog-reflection/src/auto_promoter.rs	APPROVAL_SWEEP_LIMIT	1000	bound	one page of waiting approvals per round; the backlog advances a page at a time
 crates/cog-reflection/src/auto_promoter.rs	LEDGER_LOOKBACK	50	unreviewed	
+crates/cog-reflection/src/baseline_port.rs	GIT_COMMAND_TIMEOUT	120s	bound	一条 git 命令（取基线、摘文件）的墙：120s。
 crates/cog-reflection/src/baseline_port.rs	MIN_POLL_INTERVAL_SECS	60	bound	floor under the configured poll interval; the loop never polls faster than this
 crates/cog-reflection/src/build_gate/arming.rs	WAIT_RELEASE_MARGIN_SECS	600	bound	margin over the longest legal build or test hold, so a legal wait is never refused
 crates/cog-reflection/src/build_gate/mod.rs	EVENT_RING_CAPACITY	256	bound	ring depth for a consumer ticking every few minutes; drops are counted, not lost
-crates/cog-reflection/src/build_gate/mod.rs	GATE_DIR_MODE	0o1777	unreviewed	
+crates/cog-reflection/src/build_gate/mod.rs	GATE_DIR_MODE	0o1777	bound	Modes that make the gate directory usable by every builder on the host.
 crates/cog-reflection/src/build_gate/mod.rs	GATE_FILE_MODE	0o666	unreviewed	
 crates/cog-reflection/src/build_gate/mod.rs	POLL_INTERVAL	500ms	bound	how promptly a waiter rechecks a freed slot; builds last minutes, so this is only responsiveness
+crates/cog-reflection/src/build_gate/mod.rs	SWITCH_FIELD_WAIT	3600s	bound	等构建场空出来再做进程切换的上限：1 小时。
 crates/cog-reflection/src/build_gate/mod.rs	TURN_STAND_DOWN_SECS	3600	bound	longer than any asker's own round, so a grievance outlives the call that raised it
 crates/cog-reflection/src/build_gate/mod.rs	WALK_YIELD_LIMIT	2	bound	turns a walk stands down before taking the field; a policy for two failure directions
 crates/cog-reflection/src/change_execution.rs	EXIT_PASSED	0	unreviewed	
@@ -315,17 +345,22 @@ crates/cog-reflection/src/change_pipeline.rs	FMT_RUNS_PER_CHANGE	2	unreviewed
 crates/cog-reflection/src/change_pipeline.rs	TEST_BUDGET_RUNS_PER_CHANGE	3	bound	clippy plus two test runs spend the test budget; a test holds the call-site count
 crates/cog-reflection/src/config.rs	MIN_INTERVAL_SECS	60	bound	floor on the convergence cadence; below it an apply has not landed before the next round
 crates/cog-reflection/src/evolution_build_readings.rs	BUILD_RUN_WINDOW	64	bound	in-process attempt window; it answers for this process's life, not for all of history
+crates/cog-reflection/src/firecracker.rs	SOCKET_APPEAR_TIMEOUT	5s	bound	等 firecracker 的 API socket 出现：5s。
+crates/cog-reflection/src/firecracker.rs	SOCKET_POLL_INTERVAL	50ms	bound	等 socket 出现时的轮询间隔：50ms。
+crates/cog-reflection/src/gitops_puller.rs	ROLLOUT_POLL_INTERVAL	10s	bound	等一次滚动发布完成的轮询间隔：10s。
 crates/cog-reflection/src/lib.rs	CHANGE_EVIDENCE_BUDGET	2000	bound	how much evidence a learning may carry; a spend for the next attempt, not a storage limit
-crates/cog-reflection/src/mainline_deployer.rs	ADVANCE_BUILD_WAIT	60s	unreviewed	
-crates/cog-reflection/src/mainline_deployer.rs	ADVANCE_CLAIM_AFTER_DEFERRALS	3	unreviewed	
-crates/cog-reflection/src/mainline_deployer.rs	ADVANCE_WAIT_KEEP	16	unreviewed	
-crates/cog-reflection/src/mainline_deployer.rs	BUILDAH_RMI_BATCHES_PER_ROUND	2	unreviewed	
-crates/cog-reflection/src/mainline_deployer.rs	BUILDAH_RMI_BATCH_CHUNK	32	unreviewed	
-crates/cog-reflection/src/mainline_deployer.rs	CI_HOLD_END_KEEP	16	unreviewed	
+crates/cog-reflection/src/mainline_deployer.rs	ADVANCE_BUILD_WAIT	60s	bound	主线在构建闸前排队等多久，秒。
+crates/cog-reflection/src/mainline_deployer.rs	ADVANCE_CLAIM_AFTER_DEFERRALS	3	bound	推进连输几轮之后，这一方就去**认领下一个构建名额**（见
+crates/cog-reflection/src/mainline_deployer.rs	ADVANCE_WAIT_KEEP	16	bound	盘上保留多少段等槽的结局。与 [`CI_HOLD_END_KEEP`] 同尺度：这里答的是"最近几段
+crates/cog-reflection/src/mainline_deployer.rs	BUILDAH_RMI_BATCHES_PER_ROUND	2	bound	一轮里最多回收几批镜像库里的老镜像（每批 [`BUILDAH_RMI_BATCH_CHUNK`] 张）。
+crates/cog-reflection/src/mainline_deployer.rs	BUILDAH_RMI_BATCH_CHUNK	32	bound	回收那一轮里每批删几张。与 [`BUILDAH_RMI_BATCHES_PER_ROUND`] 一起构成这一段
+crates/cog-reflection/src/mainline_deployer.rs	CI_HOLD_END_KEEP	16	bound	盘上保留多少次扣住的结局。扣住是被上游 CI 挡住的那几次，不是每一轮都会发生；
 crates/cog-reflection/src/mainline_deployer.rs	JUDGEMENT_POLL_SECS	15	bound	how soon the end of a Job is seen, not how long it is waited for; against a judgement that already runs minutes this buys a conclusion without waiting out a whole tick
-crates/cog-reflection/src/mainline_deployer.rs	MANIFEST_BUNDLES_KEPT	5	unreviewed	
-crates/cog-reflection/src/mainline_deployer.rs	PREFLIGHT_RETRYING_READS	3	unreviewed	
-crates/cog-reflection/src/mainline_deployer.rs	ROLLOUT_EXIT_ENVIRONMENT	75	unreviewed	
+crates/cog-reflection/src/mainline_deployer.rs	KUBECTL_AUTHZ_TIMEOUT	30s	bound	`kubectl auth can-i` 的墙：30s。
+crates/cog-reflection/src/mainline_deployer.rs	KUBECTL_WRITE_TIMEOUT	60s	bound	一次带 stdin 的 `kubectl` 调用的墙：60s。
+crates/cog-reflection/src/mainline_deployer.rs	MANIFEST_BUNDLES_KEPT	5	bound	清单包保留的 rev 数（含刚发布的这一个）。
+crates/cog-reflection/src/mainline_deployer.rs	PREFLIGHT_RETRYING_READS	3	bound	How many read-only pre-flight reads may each spend a whole wait budget
+crates/cog-reflection/src/mainline_deployer.rs	ROLLOUT_EXIT_ENVIRONMENT	75	bound	滚动 Job 的进程退出码里「环境类失败」那一档。Job 内的判定进程按这个码告诉
 crates/cog-reflection/src/mainline_deployer.rs	STRIP_WALL_SECS	60	bound	wall for the strip hop inside the build stage; it is a separate hop so hitting it is not fatal to the build next to it
 crates/cog-reflection/src/mainline_deployer.rs	SUPPORT_CAUSE_MESSAGE_CHARS	200	bound	the text comes from the cluster, so its length cannot be the cluster's to decide: it ends up in logs, termination messages and failure records
 crates/cog-reflection/src/mainline_rollout.rs	CI_ASK_BUDGET_SECS	180	bound	one budget used at both ends — the ask's own timeout here and the Job's activeDeadlineSeconds there — because bounding only one end leaves the other nominal
@@ -338,10 +373,12 @@ crates/cog-reflection/src/mainline_rollout.rs	SUPPORT_CAUSE_POD_LIMIT	3	bound	th
 crates/cog-reflection/src/meta_learning.rs	VERSION	1	unreviewed	
 crates/cog-reflection/src/observability_stack.rs	AT_LEAST_ONE_DIFFERENCE	1	unreviewed	
 crates/cog-reflection/src/observability_stack.rs	DIFF_LOG_CHARS	2000	unreviewed	
+crates/cog-reflection/src/platform_http.rs	CONNECT_TIMEOUT	30s	bound	连上集群内 HTTP 端口的墙：30s。
+crates/cog-reflection/src/platform_http.rs	READ_TIMEOUT	60s	bound	读完整个响应的墙：60s。
 crates/cog-reflection/src/plugin.rs	OUTCOME_QUEUE_MARGIN_ROUNDS	3	unreviewed	
 crates/cog-reflection/src/promotion_eval.rs	DEFAULT_EVAL_POLL_INTERVAL_SECS	5	bound	poll period for an A/B task; baseline_port's poll_interval_secs default spells the same 5
 crates/cog-reflection/src/promotion_eval.rs	DEFAULT_EVAL_TIMEOUT_SECS	3600	bound	ceiling for a worktree build plus the fixed eval set; baseline_port's constructor spells the same 3600
-crates/cog-reflection/src/promotion_trend.rs	DECLINE_RUN	3	unreviewed	
+crates/cog-reflection/src/promotion_trend.rs	DECLINE_RUN	3	bound	判定趋势向下的连续下降周数。
 crates/cog-reflection/src/promotion_trend.rs	MIN_WEEK_SAMPLES	2	bound	fewer than two decided changes in a week cannot carry a rate
 crates/cog-reflection/src/promotion_trend.rs	WINDOW_WEEKS	8	bound	the report's chosen aggregation horizon, not a measurement of a cycle
 crates/cog-reflection/src/registry_footprint.rs	MAX_INDEX_DEPTH	2	bound	an index nested deeper is refused rather than followed; a shape limit, not a size
@@ -365,7 +402,7 @@ crates/cog-storage/src/metrics_sample_cap.rs	MAX_SWEEP_PERIOD	120s	bound	half of
 crates/cog-storage/src/metrics_sample_cap.rs	MIN_SWEEP_PERIOD	1s	bound	floor that keeps a log with nothing to prune from being polled in a spin
 crates/cog-storage/src/partition_maintainer.rs	MONTHS_AHEAD	2	unreviewed	
 crates/cog-storage/src/partition_maintainer.rs	MONTHS_BEHIND	1	unreviewed	
-crates/cog-storage/src/plugin.rs	NOTIFICATION_KEEP_DAYS	90	unreviewed	
+crates/cog-storage/src/plugin.rs	NOTIFICATION_KEEP_DAYS	90	bound	How long a read notification stays in the table.
 crates/cog-storage/src/plugin.rs	POSTGRES_POOL_COUNT	4	bound	the four pools share the server's connection ceiling, so that ceiling is divided by four
 crates/cog-storage/src/postgres/agent_message_store.rs	ROWS_KEPT_PER_PEER	500	unreviewed	
 crates/cog-storage/src/postgres/change_ledger_store.rs	DOC_MAX	512	bound	a writer-side cap on the source document; the row itself keeps the sources in JSONB
@@ -394,10 +431,19 @@ crates/cog-supervisor/src/alert_store.rs	ALERT_HISTORY_MAX	10_000	bound	in-memor
 crates/cog-supervisor/src/autonomous.rs	LOAD_RATIO_THRESHOLD	0.8	bound	pending/ready ratio above which scale-out is recommended; a policy line
 crates/cog-supervisor/src/behavior_monitor.rs	DEFAULT_MAX_HISTORY	20	bound	actions the pattern detector can see; a fixed depth, not a reading
 crates/cog-supervisor/src/event_aggregator.rs	DRAIN_BUDGET	250ms	bound	wall-clock yield so a burst cannot hold the wake-up or delay the stop signal
+crates/cog-supervisor/src/health_checker.rs	DEAD_AFTER	60s	bound	多久没心跳算死亡：60s。
+crates/cog-supervisor/src/health_checker.rs	STUCK_AFTER	600s	bound	多久没有进展算卡住：10 分钟。
+crates/cog-supervisor/src/health_checker.rs	SUSPECT_AFTER	15s	bound	多久没心跳算可疑：15s。
 crates/cog-supervisor/src/registry.rs	DEFAULT_HEARTBEAT_TTL_SECONDS	30	bound	the registry's own default when no config hands it one; config.agent.registration_ttl_secs is the deployment's copy
 crates/cog-supervisor/src/registry.rs	HEARTBEAT_HISTORY_MAX	1000	bound	heartbeat records kept per agent; a ring depth, not a measured history
 crates/cog-supervisor/src/registry.rs	MAX_CREW_RETRIES	3	bound	three crew-level retries before the failure is escalated; a policy cap
-crates/cog-supervisor/src/supervisor.rs	REAP_AFTER_DEAD	1800s	unreviewed	
+crates/cog-supervisor/src/supervisor.rs	CONTROL_PLANE_INTERVAL	30s	bound	控制面巡检周期：30s。
+crates/cog-supervisor/src/supervisor.rs	EVENT_WINDOW	30s	bound	事件窗口：30s。
+crates/cog-supervisor/src/supervisor.rs	HEALTH_INTERVAL	10s	bound	健康巡检周期：10s。
+crates/cog-supervisor/src/supervisor.rs	QUOTA_INTERVAL	60s	bound	配额巡检周期：60s。
+crates/cog-supervisor/src/supervisor.rs	REAP_AFTER_DEAD	1800s	bound	How long an agent whose heartbeat has stopped stays in the registry before
+crates/cog-supervisor/src/supervisor.rs	REBALANCE_INTERVAL	300s	bound	任务再平衡周期：300s。
+crates/cog-supervisor/src/udp_heartbeat.rs	REDUNDANT_PACKETS	3	bound	心跳包发几份：3。
 crates/cog-wiki/src/bounds.rs	WIKI_PAGE_PROMPT_CHARS	2_000	bound	the page ceiling for a prompt; the contradiction scan spells 6,000 separately
 crates/cog-wiki/src/indexer.rs	B	0.75	unreviewed	
 crates/cog-wiki/src/indexer.rs	K1	1.5	unreviewed	
@@ -415,13 +461,17 @@ crates/cogneva/src/backup_crypto.rs	SALT_LEN	16	unreviewed
 crates/cogneva/src/backup_crypto.rs	TAG_LEN	16	unreviewed	
 crates/cogneva/src/claim_store.rs	DEFAULT_PORT	9100	unreviewed	
 crates/cogneva/src/eval_container.rs	DEFAULT_TIMEOUT_SECS	900	bound	a wide safety ceiling over a measured 100-second score plus a 60-second pull
+crates/cogneva/src/eval_container.rs	PROBE_CONTAINER_WAIT	20s	bound	探针容器单次的墙：20s。
 crates/cogneva/src/eval_mcp_in_pod.rs	DEFAULT_SESSION_TIMEOUT	60s	bound	the upstream runner's own default for client_session_timeout_seconds, copied so both sides agree
 crates/cogneva/src/eval_platform.rs	DEFAULT_DEADLINE_SECS	3600	bound	a platform case's wall budget; a case that cannot finish must not be scored
 crates/cogneva/src/eval_platform.rs	POLL_INTERVAL	5s	bound	polling period for a submitted platform case; the wall budget is DEFAULT_DEADLINE_SECS
 crates/cogneva/src/eval_platform.rs	TRACE_LIST_LIMIT	200	bound	the recent-trace page fetched to find this case's own trace
-crates/cogneva/src/eval_table.rs	FAILURE_SAMPLE	3	unreviewed	
+crates/cogneva/src/eval_table.rs	FAILURE_SAMPLE	3	bound	每个格子打印几条失败明细。
+crates/cogneva/src/eval_table.rs	HASH_CHUNK_BYTES	64 * 1024	bound	给文件算 sha256 时一次读多少：64 KiB。
 crates/cogneva/src/eval_toolathlon.rs	DEFAULT_TIMEOUT_SECS	1800	bound	a safety ceiling wide enough for a database import that takes minutes
 crates/cogneva/src/eval_toolathlon.rs	PG_READY_DEADLINE_SECS	300	bound	the wait before "the database never came up" replaces every cell failing
+crates/cogneva/src/eval_toolathlon.rs	POD_READY_POLL_INTERVAL	2s	bound	等 PG Pod Ready 的轮询间隔：2s。
+crates/cogneva/src/eval_toolathlon.rs	PROBE_COMMAND_WAIT	20s	bound	探测一条外部命令的墙：20s。
 crates/cogneva/src/eval_toolathlon_local.rs	PAGE_SIZE	10_000	bound	one page of saved output, mirroring the upstream tool's own page size
 crates/cogneva/src/eval_toolathlon_local.rs	PYTHON_TIMEOUT_CEILING	120	bound	the upstream python tool's own hard ceiling on a requested timeout
 crates/cogneva/src/governance.rs	ROSTER_COLUMNS	13	unreviewed	

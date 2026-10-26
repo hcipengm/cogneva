@@ -30,6 +30,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cog_core::{SFError, SFResult, ToolDefinition, ToolExecutor};
+
+/// 探测一条外部命令的墙：20s。
+///
+/// 这里探的是「这台机器上的运行时认不认某种容器能力」，命令本身是秒级。
+const PROBE_COMMAND_WAIT: Duration = Duration::from_secs(20);
+
+/// 等 PG Pod Ready 的轮询间隔：2s。
+///
+/// 总墙是 [`PG_READY_DEADLINE_SECS`]，这个数决定那个墙里最多问几次。
+const POD_READY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 use cog_eval::{
     tools_bound_to, CaseEnv, EvalCase, ExecSeam, ToolFactory, ToolathlonBackend, ToolathlonCheck,
     ToolathlonReport,
@@ -347,7 +357,7 @@ async fn probe(prefix: &[String], namespace: &str) -> bool {
     let Ok(child) = cmd.kill_on_drop(true).spawn() else {
         return false;
     };
-    match tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await {
+    match tokio::time::timeout(PROBE_COMMAND_WAIT, child.wait_with_output()).await {
         // 有的版本对 `no` 也退 0，所以判输出而不只判退出码；反过来 `yes` 却退非 0
         // 只可能是包装脚本出错，那时也不能算「能建」。
         Ok(Ok(out)) => {
@@ -761,7 +771,7 @@ impl PodToolathlonBackend {
                     tail(&why.stdout, 1200)
                 );
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(POD_READY_POLL_INTERVAL).await;
         }
     }
 }

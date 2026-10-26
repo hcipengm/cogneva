@@ -395,6 +395,12 @@ const WALK_YIELD_LIMIT: u32 = 2;
 /// asking has any claim to a turn it no longer wants.
 const TURN_STAND_DOWN_SECS: u64 = 3600;
 
+/// 等构建场空出来再做进程切换的上限：1 小时。
+///
+/// 构建最长可跑一小时，所以等不到就让这一版留在暂存处——在别人的构建上切一刀
+/// 的代价是一个半完成的部署；而无限期等待会让调用它的管理端永远挂着。
+pub(crate) const SWITCH_FIELD_WAIT: Duration = Duration::from_secs(3600);
+
 static GLOBAL: OnceLock<Arc<BuildGate>> = OnceLock::new();
 
 /// Installs the process-wide gate from configuration.

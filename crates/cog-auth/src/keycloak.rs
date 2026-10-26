@@ -107,9 +107,15 @@ impl JwksCache {
     }
 }
 
+/// 默认的 JWKS 缓存时长：1 小时。
+///
+/// 签名密钥的轮换以小时计，缓存一小时意味着最坏情况下一小时的旧 key 仍被信任；
+/// 更短则每次校验都要回源，把鉴权路径压到 Keycloak 上。
+const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(3600);
+
 impl Default for JwksCache {
     fn default() -> Self {
-        Self::new(Duration::from_secs(3600))
+        Self::new(DEFAULT_JWKS_TTL)
     }
 }
 

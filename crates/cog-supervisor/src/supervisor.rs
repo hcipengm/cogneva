@@ -106,19 +106,48 @@ pub struct SupervisorConfig {
     pub alert_history_max: usize,
 }
 
+/// 健康巡检周期：10s。
+///
+/// 判据（可疑 15s、死亡 60s）都在秒级，巡检必须比它们密，否则判据被巡检自己
+/// 拖粗。
+const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 配额巡检周期：60s。
+///
+/// 配额是按分钟算的额度，一分钟读一次就够；更密只是重复读同一批计数。
+const QUOTA_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 任务再平衡周期：300s。
+///
+/// 再平衡会挪动在跑的任务，代价远高于一次巡检；五分钟一拍让舰队形状稳定下来，
+/// 而不是跟着一次抖动来回搬。
+const REBALANCE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// 事件窗口：30s。
+///
+/// 告警去重与突发判定都看这个窗口；它要长到能盖住一次真实的故障脉冲，短到
+/// 不会把两次独立故障并成一条。
+const EVENT_WINDOW: Duration = Duration::from_secs(30);
+
+/// 控制面巡检周期：30s。
+///
+/// 控制面地址是可选的外部依赖，读它的代价在网络往返上；30s 一拍足够发现
+/// 「控制面不在了」，而不会把监控面变成对它的压力源。
+const CONTROL_PLANE_INTERVAL: Duration = Duration::from_secs(30);
+
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
-            health_interval: Duration::from_secs(10),
-            quota_interval: Duration::from_secs(60),
-            rebalance_interval: Duration::from_secs(300),
-            event_window: Duration::from_secs(30),
+            health_interval: HEALTH_INTERVAL,
+            quota_interval: QUOTA_INTERVAL,
+            rebalance_interval: REBALANCE_INTERVAL,
+            event_window: EVENT_WINDOW,
             broadcast_capacity: 256,
             health_checker: HealthCheckerConfig::default(),
             task_rebalancer: TaskRebalancerConfig::default(),
             autonomous: AutonomousConfig::default(),
             quota_threshold: 1_000,
-            control_plane_interval: Duration::from_secs(30),
+            control_plane_interval: CONTROL_PLANE_INTERVAL,
             control_plane_url: None,
             behavior_history_max: 20,
             heartbeat_history_max: 1_000,

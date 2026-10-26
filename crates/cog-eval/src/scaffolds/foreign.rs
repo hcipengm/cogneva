@@ -126,7 +126,6 @@ impl AgentScaffold for ForeignFlow {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     use cog_core::ToolExecutor;
 
@@ -205,11 +204,7 @@ mod tests {
     }
 
     fn limits() -> ExecLimits {
-        ExecLimits {
-            wall_clock: Duration::from_secs(600),
-            cpus: 2.0,
-            memory_bytes: 4 * 1024 * 1024 * 1024,
-        }
+        ExecLimits::default()
     }
 
     fn ctx(env: Arc<dyn CaseEnv>) -> SolveContext {

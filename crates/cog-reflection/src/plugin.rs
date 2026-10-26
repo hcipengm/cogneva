@@ -418,7 +418,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             crate::ReflectionEngine::new_self_evolution(
                 skill_registry.clone(),
                 llm.clone(),
-                std::time::Duration::from_secs(3600),
+                crate::SELF_REVIEW_INTERVAL,
                 mb.clone(),
                 Some(prompt_manager.clone()),
                 Some(hook_tx),
@@ -4327,7 +4327,7 @@ async fn consume_executed_change(
         // 当切换失败：让调用方记一笔失败，比在别人的构建上切一刀要好。
         let _switch_field = match crate::build_gate::await_exclusive(
             "self-exec switch",
-            std::time::Duration::from_secs(3600),
+            crate::build_gate::SWITCH_FIELD_WAIT,
         )
         .await
         {

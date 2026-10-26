@@ -41,7 +41,7 @@ pub mod observable;
 pub mod quota;
 mod store;
 
-pub use agent_budget::{AgentBudget, BudgetAction, BudgetResult, BudgetTemplates};
+pub use agent_budget::{AgentBudget, BudgetAction, BudgetResult};
 pub use billing::{BillingRecord, BillingRepository, RechargeRecord};
 pub use budget_manager::ContextBudgetManager;
 pub use day::{day_start_unix, seconds_to_next_day};

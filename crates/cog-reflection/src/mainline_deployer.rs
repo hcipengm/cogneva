@@ -276,6 +276,18 @@ const ADVANCE_CLAIM_AFTER_DEFERRALS: u32 = 3;
 /// 被拒处理（计数、起点、认领名额都不变），下一拍重新排队。
 const ADVANCE_BUILD_WAIT: Duration = Duration::from_secs(60);
 
+/// `kubectl auth can-i` 的墙：30s。
+///
+/// 这一步只问一句权限，正常是百毫秒级；30s 是「apiserver 正忙但仍然活着」与
+/// 「叫不动了」之间的分界，报错文案跟着这个数走。
+const KUBECTL_AUTHZ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 一次带 stdin 的 `kubectl` 调用的墙：60s。
+///
+/// 这里跑的是 apply/create 这类会写进 apiserver 的动作，慢在一次提交的落库与
+/// admission 链；比只读多给一倍，是因为超时后的重试会留下半完成的资源。
+const KUBECTL_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// 稳定叠层基底的 tag：`<registry>/cogneva:seed`。
 ///
 /// overlay 的基底不该是"上一个 rev 的镜像"。基于它时每张新镜像都**包含着
@@ -2741,9 +2753,9 @@ impl MainlineDeployer {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| SFError::IO(format!("spawn kubectl auth can-i: {e}")))?;
-        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        let output = tokio::time::timeout(KUBECTL_AUTHZ_TIMEOUT, child.wait_with_output())
             .await
-            .map_err(|_| SFError::IO("kubectl auth can-i timed out after 30s".into()))?
+            .map_err(|_| SFError::IO("kubectl auth can-i timed out".into()))?
             .map_err(|e| SFError::IO(format!("kubectl auth can-i: {e}")))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         match stdout.trim() {
@@ -3302,7 +3314,7 @@ impl MainlineDeployer {
             "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{accepted}{typed}Connection: close\r\n\r\n"
         );
         let mut stream = tokio::time::timeout(
-            Duration::from_secs(30),
+            crate::platform_http::CONNECT_TIMEOUT,
             tokio::net::TcpStream::connect((host, port)),
         )
         .await
@@ -3319,10 +3331,13 @@ impl MainlineDeployer {
                 .map_err(|e| SFError::IO(format!("{host}:{port} body write failed: {e}")))?;
         }
         let mut raw = Vec::new();
-        tokio::time::timeout(Duration::from_secs(60), stream.read_to_end(&mut raw))
-            .await
-            .map_err(|_| SFError::IO(format!("{host}:{port} read timed out")))?
-            .map_err(|e| SFError::IO(format!("{host}:{port} read failed: {e}")))?;
+        tokio::time::timeout(
+            crate::platform_http::READ_TIMEOUT,
+            stream.read_to_end(&mut raw),
+        )
+        .await
+        .map_err(|_| SFError::IO(format!("{host}:{port} read timed out")))?
+        .map_err(|e| SFError::IO(format!("{host}:{port} read failed: {e}")))?;
         parse_http_response_parts(&raw)
             .ok_or_else(|| SFError::IO(format!("{host}:{port} returned a malformed HTTP response")))
     }
@@ -3375,7 +3390,7 @@ impl MainlineDeployer {
              User-Agent: cogneva-mainline-deployer\r\nConnection: close\r\n\r\n"
         );
         let mut stream = tokio::time::timeout(
-            Duration::from_secs(30),
+            crate::platform_http::CONNECT_TIMEOUT,
             tokio::net::TcpStream::connect((host.as_str(), port)),
         )
         .await
@@ -3386,10 +3401,13 @@ impl MainlineDeployer {
             .await
             .map_err(|_| PlatformReadFailure::Transport)?;
         let mut raw = Vec::new();
-        tokio::time::timeout(Duration::from_secs(60), stream.read_to_end(&mut raw))
-            .await
-            .map_err(|_| PlatformReadFailure::Transport)?
-            .map_err(|_| PlatformReadFailure::Transport)?;
+        tokio::time::timeout(
+            crate::platform_http::READ_TIMEOUT,
+            stream.read_to_end(&mut raw),
+        )
+        .await
+        .map_err(|_| PlatformReadFailure::Transport)?
+        .map_err(|_| PlatformReadFailure::Transport)?;
         let (status, body) = parse_http_response(&raw).ok_or(PlatformReadFailure::UnusableBody)?;
         if status != 200 {
             return Err(PlatformReadFailure::Http(status));
@@ -6904,7 +6922,7 @@ impl MainlineDeployer {
             stdin.write_all(body).await?;
             stdin.shutdown().await?;
         }
-        let output = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
+        let output = tokio::time::timeout(KUBECTL_WRITE_TIMEOUT, child.wait_with_output())
             .await
             .map_err(|_| SFError::IO("kubectl apply timed out".into()))?
             .map_err(|e| SFError::IO(format!("kubectl apply: {e}")))?;

@@ -626,6 +626,21 @@ struct Sources {
 /// 这里把每个端点的页都读一遍再合并——同一个声明出现在两台机器上是不可能的
 /// （local-path 的卷只在一块盘上），后读到的不会盖掉先读到的另一个值。
 ///
+/// 走查端轮询单次的上限：2s。
+///
+/// 这一面是轮询的，一个不响的走查端不能把整次读取拖住；共用客户端的默认期限
+/// 是给 apiserver 往返的，套在这里会把一次前端刷新拖到那个数。
+const WALKTHROUGH_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 每个节点上都有一个 claim-store，它走查节点存储根，把每个卷的真实字节数发布在
+/// `/metrics` 上。这一面直接读那些端点：声明写了多大、盘上真的占了多少，两个数
+/// 并排才是「资源账本」。
+///
+/// 走 Pod IP 而不是 Service 名：那个 Service 是 headless 的，一条 DNS 查询会得到
+/// 每台节点一个地址，随便取一个就只看到一台机器的卷。走查端只认自己的节点，所以
+/// 这里把每个端点的页都读一遍再合并——同一个声明出现在两台机器上是不可能的
+/// （local-path 的卷只在一块盘上），后读到的不会盖掉先读到的另一个值。
+///
 /// 读不到就是读不到：端点没起来、端口换了、页面里没有这个声明，都只让这一格是
 /// `None`，不拿声明量去填——那是另一个数。
 async fn measured_claim_bytes(
@@ -670,7 +685,7 @@ async fn measured_claim_bytes(
         // 会把一次前端刷新拖到那个数。
         let Ok(response) = http
             .get(&url)
-            .timeout(std::time::Duration::from_secs(2))
+            .timeout(WALKTHROUGH_POLL_TIMEOUT)
             .send()
             .await
         else {

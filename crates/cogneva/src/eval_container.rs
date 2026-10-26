@@ -24,6 +24,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cog_core::{SFError, SFResult, ToolExecutor};
+
+/// 探针容器单次的墙：20s。
+///
+/// 这些探测只判「这台机器能不能建」，命令本身是秒级；20s 还没结束就说明守护
+/// 进程不在，与「不能建」是同一个结论。
+const PROBE_CONTAINER_WAIT: Duration = Duration::from_secs(20);
 use cog_eval::{
     parse_test_list, swe_pro_tool_definitions, tools_bound_to, CaseEnv, EvalCase, ExecLimits,
     ExecOutcome, ExecRequest, ExecRunner, ExecSeam, FinishReason, SweProBackend, SweProTestReport,
@@ -424,15 +430,14 @@ async fn probe(prefix: &[String]) -> bool {
         let Ok(child) = spawn(&["from", "--name", &name, "scratch"]) else {
             return false;
         };
-        started =
-            match tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await {
-                Ok(Ok(out)) => out.status.success(),
-                _ => false,
-            };
+        started = match tokio::time::timeout(PROBE_CONTAINER_WAIT, child.wait_with_output()).await {
+            Ok(Ok(out)) => out.status.success(),
+            _ => false,
+        };
         // 探针容器不管成没成都收掉：留下一个同名容器会让下一次 `from` 直接失败
         // （重试那一次也走这条清理，否则第二次会撞上自己）。
         if let Ok(mut cleanup) = spawn(&["rm", &name]) {
-            let _ = tokio::time::timeout(Duration::from_secs(20), cleanup.wait()).await;
+            let _ = tokio::time::timeout(PROBE_CONTAINER_WAIT, cleanup.wait()).await;
         }
         if started {
             break;

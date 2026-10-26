@@ -12,6 +12,12 @@ use tracing::{info, warn};
 
 use crate::provider::CodePlatformProvider;
 
+/// 暂存变更的排空循环周期：300s。
+///
+/// 排空要看的是外部平台侧「合并了没有」，这个数决定「合并到看见它走完」的最长
+/// 滞后；一拍的代价是几次查询，密到分钟级没有收益。
+const STAGED_CHANGE_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Background loop state, held behind a mutex because [`SystemPlugin::start`]
 /// takes `&self`.
 struct LoopState {
@@ -130,7 +136,7 @@ fn spawn_staged_drain(
     let stop = shutdown.clone();
     cog_core::loop_health::spawn(
         STAGED_CHANGE_DRAIN_LOOP,
-        cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(300)),
+        cog_core::loop_health::Cadence::Periodic(STAGED_CHANGE_DRAIN_INTERVAL),
         shutdown,
         // The body is rebuilt per attempt, so handles are cloned in the closure;
         // see spawn_polling_loop.
@@ -139,7 +145,7 @@ fn spawn_staged_drain(
             let channel = Arc::clone(&channel);
             let controller = Arc::clone(&controller);
             async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+                let mut interval = tokio::time::interval(STAGED_CHANGE_DRAIN_INTERVAL);
                 interval.tick().await; // 消费立即触发的首拍，让启动 drain 先跑
                 loop {
                     beat.beat();

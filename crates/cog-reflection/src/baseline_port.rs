@@ -365,9 +365,14 @@ impl BaselinePorter {
             .current_dir(&self.repo_dir)
             .kill_on_drop(true)
             .output();
-        let output = tokio::time::timeout(Duration::from_secs(120), fut)
+        let output = tokio::time::timeout(GIT_COMMAND_TIMEOUT, fut)
             .await
-            .map_err(|_| SFError::IO(format!("{cmdline} timed out after 120s")))?
+            .map_err(|_| {
+                SFError::IO(format!(
+                    "{cmdline} timed out after {}s",
+                    GIT_COMMAND_TIMEOUT.as_secs()
+                ))
+            })?
             .map_err(|e| SFError::IO(format!("failed to run git: {e}")))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1515,6 +1520,12 @@ pub const BASELINE_PORT_LOOP: &str = "baseline_port";
 /// up, so a reader measuring its cadence against `poll_interval_secs` alone
 /// measures a number the loop does not keep whenever this floor binds.
 pub const MIN_POLL_INTERVAL_SECS: u64 = 60;
+
+/// 一条 git 命令（取基线、摘文件）的墙：120s。
+///
+/// 这些命令偶尔要走网络拉一个大仓，慢在别处而不在本机；120s 是「远端在吐数据」
+/// 与「远端不应答」的分界，超时读作基线不可得，而不是基线是空的。
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 基线移植触发循环。第一轮立即执行（启动即对齐新基线，不等一个
 /// 轮询周期），之后按 `poll_interval_secs` 周期运行直到 shutdown。

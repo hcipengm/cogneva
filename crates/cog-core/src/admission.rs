@@ -313,13 +313,25 @@ pub struct AdmissionConfig {
     pub window: Duration,
 }
 
+/// 未实测的下界：1，只是「不许是零」的形式下界。
+const UNMEASURED_FLOOR: usize = 1;
+
+/// 未实测的上界：4，取的是驱动原先写死的并发数。
+const UNMEASURED_CEILING: usize = 4;
+
+/// 重新算一次界的最小间隔：60s。
+///
+/// 界要跟着实测走，而一次实测本身就是一份读数；比一分钟更密的窗口会让界在
+/// 噪声里来回跳，反而压不住并行度。
+const ADMISSION_RECOMPUTE_WINDOW: Duration = Duration::from_secs(60);
+
 impl AdmissionConfig {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
-            floor_unmeasured: 1,
-            ceiling_unmeasured: 4,
-            window: Duration::from_secs(60),
+            floor_unmeasured: UNMEASURED_FLOOR,
+            ceiling_unmeasured: UNMEASURED_CEILING,
+            window: ADMISSION_RECOMPUTE_WINDOW,
         }
     }
 }

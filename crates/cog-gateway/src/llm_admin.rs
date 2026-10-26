@@ -30,6 +30,19 @@ const SECRET_UPSTREAMS_KEY: &str = "llm-upstreams";
 const SECRET_MIN_HEALTHY_KEY: &str = "llm-pool-min-healthy";
 const GATEWAY_DEPLOYMENT: &str = "cogneva-security-gateway";
 
+/// 上游能力探测单次最多等多久。
+///
+/// 探测发的是一个最小 chat 请求，30s 覆盖跨区上游的建连加排队；等更久不会让
+/// 判定更准，只会让一次配置写入卡住管理端。超时在这里读作「能力未知」，与
+/// 探测失败同一个结局。
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 协议形态探测（anthropic / openai 两种线格式）单次上限。
+///
+/// 比能力探测紧，因为它要串着试两种形态，墙就是两倍；8s 是健康上游往返的
+/// 量级，超时读作「这一种不通」，直接换下一种。
+const STYLE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 #[derive(Debug, Deserialize)]
 pub struct LlmUpstreamRequest {
     pub base_url: String,
@@ -405,7 +418,7 @@ pub(crate) async fn detect_temperature_constraint(
     api_key: &str,
 ) -> Option<bool> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(PROBE_TIMEOUT)
         .build()
         .ok()?;
     let resp = client
@@ -479,7 +492,7 @@ pub(crate) async fn detect_usage_in_streaming(
     api_key: &str,
 ) -> Option<bool> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(PROBE_TIMEOUT)
         .build()
         .ok()?;
     let resp = client
@@ -525,7 +538,7 @@ pub(crate) async fn detect_tool_call_support(
     api_key: &str,
 ) -> Option<bool> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(PROBE_TIMEOUT)
         .build()
         .ok()?;
     let resp = client
@@ -645,7 +658,7 @@ async fn detect_api_style(
     style_hint: Option<&str>,
 ) -> ApiStyleProbe {
     let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
+        .timeout(STYLE_PROBE_TIMEOUT)
         .build()
     {
         Ok(client) => client,
