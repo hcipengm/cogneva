@@ -381,9 +381,12 @@ mod tests {
     #[tokio::test]
     async fn a_stated_wait_is_waited_out_before_the_next_call() {
         let backoff = RefusalBackoff::new(ATTEMPTS_PER_MINUTE);
+        // 时钟先于期限起算。期限是 `note_refusal` 那一刻加上去的一个绝对时刻，而
+        // 这两行之间被调度走的时间会从「等了多久」里扣掉：机器忙的时候实测只剩
+        // 306ms，等待其实一次没少——读短的会被读成「后来的零把期限撤了」。
+        let before = Instant::now();
         let applied = backoff.note_refusal(Some(1), "");
         assert_eq!(applied, Duration::from_secs(1));
-        let before = Instant::now();
         backoff
             .before_call()
             .await
@@ -399,9 +402,10 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_with_no_stated_wait_still_waits() {
         let backoff = RefusalBackoff::new(ATTEMPTS_PER_MINUTE);
+        // 时钟先于期限起算，理由同 `a_stated_wait_is_waited_out_before_the_next_call`。
+        let before = Instant::now();
         let applied = backoff.note_refusal(None, "API error (HTTP 503): no hint here");
         assert_eq!(applied, DEFAULT_REFUSAL_BACKOFF);
-        let before = Instant::now();
         backoff
             .before_call()
             .await
@@ -419,15 +423,17 @@ mod tests {
     async fn the_attempt_window_bounds_a_burst() {
         let window = Duration::from_millis(200);
         let backoff = RefusalBackoff::with_window(2, window);
-        backoff
-            .before_call()
-            .await
-            .expect("the waits these cases set are inside the cap");
-        backoff
-            .before_call()
-            .await
-            .expect("the waits these cases set are inside the cap");
+        // 第三拍要等的是**第一拍**老出窗口，所以时钟从第一拍之前起算：从第二拍之后
+        // 起算，会把两拍之间被调度走的时间算成等待，机器忙的时候读短。
         let before = Instant::now();
+        backoff
+            .before_call()
+            .await
+            .expect("the waits these cases set are inside the cap");
+        backoff
+            .before_call()
+            .await
+            .expect("the waits these cases set are inside the cap");
         backoff
             .before_call()
             .await
@@ -443,9 +449,11 @@ mod tests {
     #[tokio::test]
     async fn a_later_short_hint_does_not_reset_a_long_one() {
         let backoff = RefusalBackoff::new(ATTEMPTS_PER_MINUTE);
+        // 时钟先于两次提示起算：两次之间被调度走的时间会从读数里扣掉，而这正是
+        // 这条判据在树外实测红过一次的形状（306ms vs 一秒）。
+        let before = Instant::now();
         backoff.note_refusal(Some(1), "");
         backoff.note_refusal(Some(0), "");
-        let before = Instant::now();
         backoff
             .before_call()
             .await
@@ -621,8 +629,9 @@ mod tests {
     #[tokio::test]
     async fn without_a_cap_a_long_stated_wait_is_still_waited_out() {
         let backoff = RefusalBackoff::new(ATTEMPTS_PER_MINUTE).with_wait_cap(None);
-        backoff.note_refusal(Some(2), "");
+        // 时钟先于期限起算，理由同 `a_stated_wait_is_waited_out_before_the_next_call`。
         let before = Instant::now();
+        backoff.note_refusal(Some(2), "");
         backoff
             .before_call()
             .await
