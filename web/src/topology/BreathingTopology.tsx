@@ -469,10 +469,10 @@ function NodeDetail({ node, onPick }: { node: TopologyNode; onPick: (next: Picke
 
       <section className="flex flex-col gap-0.5">
         <h4 className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">
-          排在这台机器上的 Pod（点一个看它下面）
+          调度在这台机器上的 Pod（点一个看它的容器与卷）
         </h4>
         {node.pods.length === 0 ? (
-          <p className="text-[10.5px] text-[var(--muted)]">这一拍没有 Pod 排在这台机器上。</p>
+          <p className="text-[10.5px] text-[var(--muted)]">这一拍没有 Pod 被调度到这台机器上。</p>
         ) : (
           node.pods.map((pod) => (
             <button
