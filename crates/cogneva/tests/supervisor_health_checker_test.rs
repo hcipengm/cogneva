@@ -313,6 +313,12 @@ async fn without_a_shared_registry_a_silent_agent_is_never_forgotten() {
     for round in 0..3 {
         let report = checker.check().await.unwrap();
         assert_eq!(report.dead.len(), 1, "第 {round} 拍：{report:?}");
+        assert!(
+            report.departed.is_empty(),
+            "第 {round} 拍：没有名单就没有「离开」。把读不到名单读成「名单上谁都没有」，\
+             会让每一拍判过的 id 全部变成 departed，整条规则静音——而它看起来仍然在工作，\
+             因为判决照旧写在 dead 里：{report:?}"
+        );
         assert!(has_agent(&reg, "a-1"), "第 {round} 拍：不该忘");
     }
 }
