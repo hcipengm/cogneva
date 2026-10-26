@@ -2176,11 +2176,11 @@ impl RolloutExecutor {
         // same run stop their own pods, and the quota keeps charging those until
         // they are actually gone -- so the reading taken the instant after they
         // finish is dominated by usage this run just created and is about to
-        // give back. Measured 2026-10-26: the main deployment was refused at
-        // 59904Mi used, 4GiB of which belonged to pods already terminating; the
-        // same namespace settled at 55808Mi a minute later and the charge fitted.
-        // Waiting only when the reading already says "no" costs nothing on the
-        // rollouts that were never in doubt.
+        // give back. 实测 2026-10-26: the main deployment was refused against a
+        // usage figure this run had itself just inflated by the pods it replaced,
+        // and the same quota measured comfortably under the ceiling a minute
+        // later, once they had left. Waiting only when the reading already says
+        // "no" costs nothing on the rollouts that were never in doubt.
         if !self.wait_out_terminating_pods().await {
             return verdict;
         }
