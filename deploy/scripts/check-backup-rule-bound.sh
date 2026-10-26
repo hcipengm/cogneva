@@ -7,8 +7,11 @@
 # **没有任何测试或脚本读过它**。于是那句承诺靠人记得。它推自的两个操作数都在别处，
 # 而且两个都改得动：
 #   - 排班周期：`values.yaml` 的 `backup.schedule`（cron 串，`17 3 * * *`）；
-#   - 迟到宽限：`templates/backup.yaml` 的 `startingDeadlineSeconds`（**模板里的字面量，
-#     连 values 口都没有**，`values.yaml` 的 `backup:` 块里没有这一项）；
+#   - 迟到宽限：`values.yaml` 的 `backup.startingDeadlineSeconds`。它曾经是
+#     `templates/backup.yaml` 里的字面量、连 values 口都没有，门禁那时去扒模板；现在
+#     模板只引用这个键，数在 values 里。两个地方都读得到时必须选对：模板里若又写了
+#     字面量，生效的是它而 values 里那个成了摆设，所以先断言模板引用这个键、再回
+#     values 取数——核的数必须就是生效的那个；
 #   - 运行时长：`values.yaml` 的 `backup.runDeadlineSeconds`——健康的一次运行最长能跑
 #     这么久才被 kubelet 杀掉，所以它进「最坏健康年龄」。**摘要里那句「实测 41 秒」
 #     不是这个操作数**：41 是某一次测量的结果（最新一次实测 72 秒，见下），会随包变大
@@ -168,10 +171,24 @@ if dom != "*" or dow != "*" or not minute.isdigit() or not hour.isdigit():
 period = 24 * 60 * 60
 
 template_text = open(template_path, encoding="utf-8").read()
-deadline = re.search(r"^\s*startingDeadlineSeconds:\s*(\d+)\s*$", template_text, re.MULTILINE)
-if deadline is None:
-    fail(f"{template_path} 里没有 `startingDeadlineSeconds: <数字>`，读不到迟到宽限")
-grace = int(deadline.group(1))
+# 迟到宽限与另外两个操作数一样住在 values 的 `backup:` 块里。读它之前先确认模板
+# 要的是**这一个**键：模板里若还写着字面量，装进集群的是那个数，而门禁算的是
+# values 里这个——两边各走各的，界被核的是一份没人用的数。
+ref = re.compile(r"startingDeadlineSeconds:\s*\{\{\s*\.Values\.backup\.startingDeadlineSeconds\s*\}\}")
+stated = [line.strip() for line in template_text.splitlines() if line.strip().startswith("startingDeadlineSeconds:")]
+if not stated:
+    fail(f"{template_path} 里没有 startingDeadlineSeconds，读不到迟到宽限")
+wrong = [line for line in stated if not ref.fullmatch(line)]
+if wrong:
+    fail(
+        f"{template_path} 有 {len(wrong)} 处 startingDeadlineSeconds 不是从 "
+        f"`backup.startingDeadlineSeconds` 取的（{wrong[0]}）：模板写死一个字面量时，"
+        f"生效的是它，而本门禁核的是 values 里那个数——两个数就此各走各的"
+    )
+grace_field = re.search(r"^\s+startingDeadlineSeconds:\s*(\d+)\s*(?:#.*)?$", block.group(1), re.MULTILINE)
+if grace_field is None:
+    fail(f"{values_path} 的 `backup:` 块里没有 startingDeadlineSeconds，读不到迟到宽限")
+grace = int(grace_field.group(1))
 
 # 第三个操作数：一次运行被允许跑多久。它也在同一个 `backup:` 块里，读得到。
 run_deadline = re.search(r"^\s+runDeadlineSeconds:\s*(\d+)\s*(?:#.*)?$", block.group(1), re.MULTILINE)

@@ -32,7 +32,9 @@
 #      「headroom is 1800 seconds」没跟着改 -> 红，点名那条规则与对不上的派生数
 #      （只 sed 数字串换不到这两个散文里的数，正是缺口所在）；
 #  12. 负对照：摘要改写措辞、但说的派生数仍是门算出的那两个，且写进被否掉的
-#      48 小时替代方案 -> 仍绿（判据是「指界的那个数对不对」，48 那个数不属本族）。
+#      48 小时替代方案 -> 仍绿（判据是「指界的那个数对不对」，48 那个数不属本族）；
+#  13. 模板把迟到宽限写死回去 -> 红，并点名模板与它该引用的那个键
+#      （模板里的字面量才是装进集群的那个数，届时门禁核的 values 那份是摆设）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -161,8 +163,11 @@ PYEOF
 
 # 排班改成每天两次（每 12 小时一次）：周期不再是 86400，界必须重推。
 sed 's/^  schedule: .*/  schedule: "17 3,15 * * *"/' "${values}" >"${work}/values-notdaily.yaml"
-# 迟到宽限抬到 3 小时：一天 ＋ 宽限 = 97200，已高过 93600。
-sed 's/^  startingDeadlineSeconds: .*/  startingDeadlineSeconds: 10800/' "${template}" >"${work}/backup-wide-grace.yaml"
+# 迟到宽限抬到 3 小时：一天 ＋ 宽限 ＋ 运行时长 = 100800，已高过 93600。
+# 改的是 values 里那个数：模板只引用它，改模板不改变装进集群的那个值。
+sed 's/^  startingDeadlineSeconds: .*/  startingDeadlineSeconds: 10800/' "${values}" >"${work}/values-wide-grace.yaml"
+# 模板改回写死一个字面量：生效的成了它，values 里那个数没人用。
+sed 's/^  startingDeadlineSeconds: .*/  startingDeadlineSeconds: 1800/' "${template}" >"${work}/backup-literal-grace.yaml"
 # 界整体抬到 95400：把配置里所有 `93600` 数字串换掉（四者一致、仍在带内）。
 # 这一格正是工单 110 的复现——只 sed 数字串，摘要里「the 26 hours」「1800 seconds」
 # 这类**不带数字串的散文**换不到，于是界动了、散文没动。
@@ -201,7 +206,7 @@ fi
 grep -q '17 3,15 \* \* \*' <<<"${out}" || fail "红的时候没念出那条排班：${out}"
 
 # 4. 迟到宽限抬高到界之下：红，并点名 startingDeadlineSeconds。
-if out="$(run_gate "${config}" "${values}" "${work}/backup-wide-grace.yaml")"; then
+if out="$(run_gate "${config}" "${work}/values-wide-grace.yaml" "${template}")"; then
     fail "一天 + 宽限已经高过界了，这条门禁还是绿的"
 fi
 grep -q 'startingDeadlineSeconds' <<<"${out}" || fail "红的时候没点名宽限这一项：${out}"
@@ -281,6 +286,17 @@ if ! out="$(run_gate "${work}/summary-derived-reworded.json" "${values}" "${temp
     printf '%s\n' "${out}" >&2
     fail "摘要改写了措辞但仍说对数，这条门禁红了——判据滑成了逐字比对，或把 48 小时也当成了本族的界"
 fi
+
+# 13. 模板不再引用 values 里那个数、自己写死一个 -> 红，并点名模板。
+#     这一格是本门禁坏了没症状的那种形状：values 里数没动、界仍落在带内、parity 照样
+#     绿，而装进集群的是模板里那个字面量——门禁核的数与生效的数成了两份。它同时是
+#     第 4 格的另一半：那一格证明改 values 会被看见，这一格证明只有模板引用这个键时
+#     改 values 才真的改得动集群。
+if out="$(run_gate "${config}" "${values}" "${work}/backup-literal-grace.yaml")"; then
+    fail "模板写死了迟到宽限，values 里那个数已经不是生效的那个了，这条门禁还是绿的"
+fi
+grep -q 'backup-literal-grace.yaml' <<<"${out}" || fail "红的时候没点名是模板不再引用那个键：${out}"
+grep -q 'backup.startingDeadlineSeconds' <<<"${out}" || fail "红的时候没说出该引用哪个键：${out}"
 
 # 自报的格数**从本文件里数出来**，不手写：手写的数会在加了一格之后仍旧印旧值，
 # 而「少了一格」正是这个数唯一要提醒的事。标记＝正文里 `# <数字>. ` 开头的注释行
