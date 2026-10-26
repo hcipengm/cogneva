@@ -74,6 +74,26 @@ run "${work}/m4.yaml"
 [ "$rc" -eq 1 ] && ok "landed_unjudgeable 写成 >= 0：单测红（新规则也有负对照）" \
     || bad "landed_unjudgeable 写成 >= 0 应红" "1" "$rc"
 
+# 4b) 把「正在跑」那段豁免去掉（退回按年龄一个数判）：判「正在跑不算停更」的那一格必须红。
+#     没有这一格，豁免写不写、写没写对，单测都绿——那正是这条规则今天误响的形状。
+python3 - "$manifest" "${work}/m4b.yaml" <<'PY'
+import sys
+src, out = sys.argv[1], sys.argv[2]
+s = open(src, encoding="utf-8").read()
+i = s.index("                unless (max (cogneva_acceptance_refresh_running_seconds)")
+j = s.index("< 5400)", i) + len("< 5400)\n")
+open(out, "w", encoding="utf-8").write(s[:i] + s[j:])
+PY
+run "${work}/m4b.yaml"
+[ "$rc" -eq 1 ] && ok "去掉「正在跑」的豁免：单测红（跑着不再被误判成停更）" \
+    || bad "去掉豁免应红" "1" "$rc"
+
+# 4c) 豁免的上界改成几乎无穷：一把卡死的锁会把这条规则永久关掉，那一格必须红。
+sed 's/< 5400)/< 999999999)/' "$manifest" >"${work}/m4c.yaml"
+run "${work}/m4c.yaml"
+[ "$rc" -eq 1 ] && ok "豁免上界写成无穷：单测红（卡死的锁不会永久静音）" \
+    || bad "豁免上界无穷应红" "1" "$rc"
+
 # 5) 拿不到 promtool：必须退 3，不许报绿。
 PROMTOOL=/nonexistent/promtool bash "$runner" >"${work}/out4" 2>&1; rc=$?
 [ "$rc" -eq 3 ] && ok "拿不到 promtool：退 3（看不了 ≠ 一致）" || bad "拿不到 promtool 应退 3" "3" "$rc"

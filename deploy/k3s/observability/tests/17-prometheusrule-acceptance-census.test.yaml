@@ -148,3 +148,48 @@ tests:
       - eval_time: 55m
         alertname: CognevaAcceptanceLandedUnjudgeable
         exp_alerts: []
+
+  # 七、`CognevaAcceptanceCensusOld` 要分得清「正在跑」与「没跑成」。一趟普查现在可以
+  # 合法地跑一个多小时（2026-10-27 实测 3623 秒，历史最长 2593），年龄越过 1800 秒时
+  # 刷新**正在跑**不许响——不修这一格，每一趟合法的普查都会自己叫一次（00:08 真响过）。
+  # 反向证据在同一格里：年龄一样、`running` 为 0 的那一刻必须仍然 firing。
+  # 第四条用例（上面那格）没有 `running` 这条序列，它同样必须 firing——生产者漏发新格时
+  # 的代价只能是多响一次，不是永久静音。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_items{verdict="stale"}'
+        values: '0x60'
+      - series: 'cogneva_acceptance_age_seconds'
+        values: '2000x60'
+      - series: 'cogneva_acceptance_refresh_running_seconds'
+        values: '0x20 2400x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaAcceptanceCensusOld
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "落地≠生效"
+      - eval_time: 45m
+        alertname: CognevaAcceptanceCensusOld
+        exp_alerts: []
+
+  # 八、豁免必须有上界：一把卡死的锁会一直「正在跑」，没有上界时这套豁免会顺便把这条
+  # 规则永久关掉。超过 5400 秒（90 分钟）就不再豁免。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_items{verdict="stale"}'
+        values: '0x60'
+      - series: 'cogneva_acceptance_age_seconds'
+        values: '2000x60'
+      - series: 'cogneva_acceptance_refresh_running_seconds'
+        values: '6000x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaAcceptanceCensusOld
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "落地≠生效"
