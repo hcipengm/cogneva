@@ -21,6 +21,7 @@ import {
   type LiveTaskRow,
 } from '@/store/liveProjects';
 import { useLiveProjectStore } from '@/store/liveProjectStore';
+import { STRIP_CAP, visibleProjects } from '@/views/projectStrip';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -101,7 +102,14 @@ export function ProjectsView() {
   );
 }
 
-/** 项目一览。条数、可执行数、积压分开写：混成一个数读者读不出「有没有活可干」。 */
+/**
+ * 项目一览。条数、可执行数、积压分开写：混成一个数读者读不出「有没有活可干」。
+ *
+ * 默认只铺前几行：goal 与任务在这里常常是一比一（实测 3831 条任务上有 3726 个
+ * goal），全铺出来就是几万像素的一墙 UUID，而下面的范围、看板、甘特、挣值四张屏
+ * 正好被推到墙后面——视图全在，读者却停在第一屏。剩下多少没列出由数字说清楚，
+ * 过滤与展开都由读者决定。
+ */
 function ProjectStrip({
   rows,
   selected,
@@ -111,9 +119,29 @@ function ProjectStrip({
   selected: string | null;
   onSelect: (id: string) => void;
 }) {
+  const [query, setQuery] = useState('');
+  const [expanded, setExpanded] = useState(false);
+  const view = visibleProjects(rows, { query, expanded, selected });
+
   return (
     <div className="border-b border-[var(--line)]">
-      {rows.map((r) => {
+      <div className="flex items-baseline gap-2 border-b border-[var(--line)] px-4 py-1.5">
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder={`按 goal 过滤（共 ${rows.length} 个）`}
+          className="mono min-w-0 flex-1 border px-1.5 py-0.5 text-[11px]"
+          style={{ background: 'transparent', borderColor: 'var(--line)', color: 'var(--paper)' }}
+        />
+        <button
+          onClick={() => setExpanded((v) => !v)}
+          className="mono shrink-0 border px-1.5 py-0.5 text-[11px]"
+          style={{ borderColor: 'var(--line)', color: 'var(--paper-dim)' }}
+        >
+          {expanded ? `只看前 ${STRIP_CAP} 个` : `显示全部 ${rows.length} 个`}
+        </button>
+      </div>
+      {view.shown.map((r) => {
         const active = r.id === selected;
         const ungrouped = r.kind === 'ungrouped';
         return (
@@ -148,6 +176,14 @@ function ProjectStrip({
           </button>
         );
       })}
+      {(view.hidden > 0 || view.filteredOut > 0) && (
+        <div className="px-4 py-1 text-[10px] text-[var(--muted)]">
+          {view.hidden > 0 && (
+            <>还有 {view.hidden} 个没列出（按任务数从多到少排，上面是最大的那些）。</>
+          )}
+          {view.filteredOut > 0 && <>过滤词筛掉了 {view.filteredOut} 个。</>}
+        </div>
+      )}
     </div>
   );
 }

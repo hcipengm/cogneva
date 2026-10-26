@@ -73,6 +73,26 @@ for pattern, why in (
         sys.exit(f"views/ProjectsView.tsx 缺 {pattern}：{why}")
 
 print("ok   - 折叠、分派、画面三处接线齐全")
+
+# ---- 5. 四张屏没被一墙项目埋掉 ------------------------------------------------
+#
+# 一览与四张屏在同一个滚动面里：一览铺满，四张屏就在几万像素之外。任务图里 goal
+# 与任务常常一比一（2026-10-26 实测 3831 条任务上有 3726 个 goal），所以「全铺」
+# 不是罕见情况，是常态。这一条判两处：一览必须先经 `visibleProjects` 折叠再画，
+# 四张屏必须紧接在折叠后的一览之下。
+strip = read("views/projectStrip.ts")
+if re.search(r"^\s*import\b", strip, re.M):
+    sys.exit("views/projectStrip.ts 有 import：它必须能单文件编译，否则第 5 段的判据跑不起来")
+for pattern, why in (
+    (r"visibleProjects\(rows,", "一览没有经 visibleProjects 折叠：几千个 goal 会原样铺开，四张屏被推到墙后面"),
+    (r"view\.shown\.map\(", "折叠算出来了却不按它画：铺开的仍然是全部行"),
+):
+    if not re.search(pattern, view):
+        sys.exit(f"views/ProjectsView.tsx 缺 {pattern}：{why}")
+if not re.search(r"<ProjectStrip rows=\{rows\}", view):
+    sys.exit("views/ProjectsView.tsx 没有把一览接上：折叠函数成了一个没人用的东西")
+
+print("ok   - 一览经折叠后再画，四张屏不被几千行推走")
 PYEOF
 
 TSC="$ROOT/web/node_modules/.bin/tsc"
@@ -188,6 +208,63 @@ if (changedSinceSnapshot('不是时间', mine).length !== 1) {
 }
 
 console.log('ok   - 身份、hook_event 不折、重放不回退、裁剪、归属、版本号、来路判据都成立');
+JS
+
+"$TSC" "$ROOT/web/src/views/projectStrip.ts" --target es2020 --module es2020 \
+    --outDir "$TMP" >/dev/null 2>&1 || {
+    echo "web/src/views/projectStrip.ts 编译不过：一览折叠的判据无从检查" >&2
+    exit 1
+}
+mv "$TMP/projectStrip.js" "$TMP/projectStrip.mjs"
+
+node --input-type=module - "$TMP/projectStrip.mjs" <<'JS'
+const { visibleProjects, STRIP_CAP } = await import(process.argv[2]);
+const fail = (msg) => {
+  console.error(`项目一览折叠不对：${msg}`);
+  process.exit(1);
+};
+
+// 实测尺度：3726 个 goal，服务端已按任务数从多到少排好。
+const rows = Array.from({ length: 3726 }, (_, i) => ({ id: `goal-${i}` }));
+
+// 1. 默认只铺前几行，其余用一个数说清楚
+let v = visibleProjects(rows, { selected: null });
+if (v.shown.length !== STRIP_CAP) fail(`默认铺了 ${v.shown.length} 行，应只有 ${STRIP_CAP} 行`);
+if (v.hidden !== rows.length - STRIP_CAP) fail(`没列出的数不对：${v.hidden}`);
+if (v.filteredOut !== 0) fail('没输过滤词却报了被筛掉的行');
+
+// 2. 顺序就是服务端给的那个（任务多的在前），不许在这里重排
+if (v.shown[0].id !== 'goal-0' || v.shown[STRIP_CAP - 1].id !== `goal-${STRIP_CAP - 1}`) {
+  fail(`铺出来的顺序变了：${JSON.stringify(v.shown.map((r) => r.id))}`);
+}
+
+// 3. 选中行永远在场：它在折叠线以下时也要补进来，否则一览与面板说的不是一个项目
+v = visibleProjects(rows, { selected: 'goal-3000' });
+if (!v.shown.some((r) => r.id === 'goal-3000')) fail('选中的项目被折叠掉了');
+if (v.shown.length !== STRIP_CAP + 1) fail(`补选中行补多了：${v.shown.length}`);
+
+// 4. 过滤词说了算：铺满相符的那些，并分别报「筛掉」与「没列出」
+v = visibleProjects(rows, { query: 'goal-12' });
+const want = rows.filter((r) => r.id.includes('goal-12')).length;
+if (v.shown.length !== want) fail(`过滤后铺了 ${v.shown.length} 行，相符的有 ${want} 行`);
+if (v.hidden !== 0) fail('过滤之后仍有没列出的行：读者已经在缩小范围，不该再替他砍一刀');
+if (v.filteredOut !== rows.length - want) fail(`被筛掉的数不对：${v.filteredOut}`);
+
+// 5. 过滤词大小写不敏感，两侧空白不吃人
+if (visibleProjects(rows, { query: '  GOAL-7 ' }).shown.length === 0) {
+  fail('过滤词大小写或空白一碰就查不到');
+}
+
+// 6. 展开就是全铺
+v = visibleProjects(rows, { expanded: true });
+if (v.shown.length !== rows.length) fail(`展开了却只铺了 ${v.shown.length} 行`);
+if (v.hidden !== 0) fail('展开之后仍报有没列出的行');
+
+// 7. 空名单不出错，也不编一行出来
+v = visibleProjects([], { selected: 'goal-1' });
+if (v.shown.length !== 0) fail('空名单里凭空补出了一行');
+
+console.log('ok   - 折叠、选中行在场、过滤、展开、空名单都按判据');
 JS
 
 echo "check-web-live-projects: 通过"
