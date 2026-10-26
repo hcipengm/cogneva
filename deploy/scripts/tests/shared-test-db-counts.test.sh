@@ -191,5 +191,35 @@ else
     bad "10 a missing tree should exit 3, got rc=${rc}: ${out}"
 fi
 
+# 11. a #[cfg(test)] module under src/ is in the population and judged
+# `crates/*/tests/*.rs` is a directory, not a definition of "a test": the file
+# this glob used to miss was the 35th of 35 shared-database files, and it
+# printed nothing at all -- not even a denominator it was absent from.
+tree "$(shared_file '    let rows = probe.catalog.list(&probe.name, 10).await.expect("list");
+    assert_eq!(rows.len(), 1);')"
+mkdir -p "${root}/crates/cog-observability/src"
+cat >"${root}/crates/cog-observability/src/infra_watch.rs" <<'EOF'
+//! no database here in the non-test build
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+    async fn the_case() {
+        let all = store.load_all().await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+}
+EOF
+out="$(run)"; rc=$?
+if [ "$rc" -eq 1 ] \
+    && grep -q 'RED  crates/cog-observability/src/infra_watch.rs:1[0-9]' < <(printf '%s' "$out") \
+    && grep -q 'src_test_modules=1 ' < <(printf '%s' "$out"); then
+    ok "11 a cfg(test) module under src/ is counted and judged"
+else
+    bad "11 a src test module should be judged and counted, got rc=${rc}: ${out}"
+fi
+
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [ "${fail}" -eq 0 ]

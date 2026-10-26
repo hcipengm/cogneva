@@ -25,10 +25,18 @@ What is judged, by shape rather than by method or table name:
     the 81 otherwise identical `.len()` assertions are all outside them
     (`read_since("sess-1", 0)` takes this run's own key as an argument).
 
+  * The population is not `crates/*/tests/*.rs`, which is a directory and not a
+    definition of a test. A `#[cfg(test)]` module under `src/` runs on the same
+    database, and one of them does: it was the 35th of 35 shared-database files
+    and the check printed nothing about it -- not even a denominator it was
+    absent from. Those files are read only when they name the database, so the
+    wider glob costs a filename scan and nothing else; `src_test_modules` in the
+    summary line keeps the class in the count.
+
   * Files that build and drop their own schema are exempt as a whole: `CREATE
     SCHEMA` together with `DROP SCHEMA` (or a `search_path` pointed into it)
-    means every table in the read is this run's own. Measured 2026-10-26: 5 of
-    the 34 do this. The exemption was measured, not assumed -- without it the
+    means every table in the read is this run's own. Measured 2026-10-26: 6 of
+    the 35 do this. The exemption was measured, not assumed -- without it the
     first version of this check went red on 8 assertions across 2 of those 5
     files, every one of them a false red. The exempted files are printed on
     every run: a population that widens in silence is read next time as "the
@@ -109,6 +117,7 @@ CLEAN = re.compile(r"\bcleanup\s*\(|\bDELETE\s+FROM\b|\bTRUNCATE\b")
 OWN_SCHEMA = re.compile(r"\bCREATE\s+SCHEMA\b")
 OWN_SCHEMA_END = re.compile(r"\bDROP\s+SCHEMA\b|\bsearch_path\b")
 NARROW = re.compile(r"\.(?:filter|retain)\s*\(")
+CFG_TEST = re.compile(r"#!?\[cfg\(test\)\]")
 FN = re.compile(r"\bfn\s+(\w+)")
 
 
@@ -247,6 +256,18 @@ def main(argv):
 
     files = sorted(crates.glob("*/tests/*.rs"))
     texts = {p: p.read_text(encoding="utf-8", errors="replace") for p in files}
+    # A `#[cfg(test)]` module under src/ runs on the same database and was not in
+    # the population at all until this became visible: `crates/*/tests/*.rs` is a
+    # directory, not a definition of "a test", and the shared-database file it
+    # missed was the 35th of 35. Only src files that name the database are read,
+    # so the glob can be wide without paying for the whole tree.
+    src_modules = []
+    for p in sorted(crates.glob("*/src/**/*.rs")):
+        t = p.read_text(encoding="utf-8", errors="replace")
+        if SHARED in t and CFG_TEST.search(t):
+            src_modules.append(p)
+            texts[p] = t
+    files = files + src_modules
     shared = [p for p in files if SHARED in texts[p]]
     if not shared:
         print(
@@ -279,7 +300,8 @@ def main(argv):
     for p in own:
         print(f"CENSUS exempt {p.relative_to(root)}: builds and drops its own schema")
     print(
-        f"check-shared-test-db-counts: test_files={len(files)} shared={len(shared)} "
+        f"check-shared-test-db-counts: test_files={len(files) - len(src_modules)} "
+        f"src_test_modules={len(src_modules)} shared={len(shared)} "
         f"own_schema={len(own)} judged={len(shared) - len(own)} "
         f"narrowed={len(narrowed)} violations={len(reds)}"
     )
