@@ -36,7 +36,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{MainlineDeployerConfig, RolloutTargetConfig};
 use crate::mainline_deployer::{
-    bounded, config_consumer_jsonpath, exit_code, failure_signature, field,
+    bounded, carries_deployment, config_consumer_jsonpath, exit_code, failure_signature, field,
     is_admission_policy_denied, is_authorization_denied, is_cluster_unreachable,
     is_observation_tool_failure, namespace_docs, primary_message, render_docs, sample_fields,
     split_docs, target_manifest_key, workload_kind, workload_kind_of_resource, ConfigConsumer,
@@ -1513,6 +1513,64 @@ impl SupportWorkload {
     }
 }
 
+/// 这个工作负载是不是本次滚动要逐个滚的目标之一。
+///
+/// 目标的 Pod 由逐目标循环自己重启：替它再重启一次，就是同一台工作负载同时
+/// 叠两份 surge，而准入判据按「一次只有一台在 surge」算账——2026-10-26 实测，
+/// 配置效果滚动先给 `deployment/cogneva` 起了一个新 Pod（旧 Pod 因
+/// `maxUnavailable: 0` 还留着），逐目标循环再要一份 4 核，预检看到 35100m
+/// 之上再加 4000m 撞上 38 核天花板，整轮被判环境类失败、退出码 75。
+///
+/// 词表只有一处：`kind` 是 kubectl 的资源词，`targets` 里存的是 Deployment 的
+/// 对象名，两处各写一遍比较就会在某次改名后静默不匹配。等支撑与被配置滚动
+/// 跳过这两条路都走这一个判据。
+pub(crate) fn is_rollout_target(kind: &str, name: &str, targets: &[RolloutTarget]) -> bool {
+    names_a_deployment(kind) && targets.iter().any(|t| t.deployment == name)
+}
+
+/// 这个工作负载的目标清单会不会在这次 apply 里真的落到集群上。
+///
+/// 配置效果滚动只对"清单在手"的目标让路：那种目标被逐目标循环 apply 之后，
+/// 清单里的 `checksum/config` 注解随内容一起变，它自己的滚动就把新文档读进去了。
+/// 退化成 `set image` 的目标没有这层保证——Pod 模板上唯一会变的是镜像，只改配置
+/// 的那一版里镜像没变，让它自己滚等于什么都不发生，配置就没人读。
+pub(crate) fn is_manifest_carried(kind: &str, name: &str, carried: &[String]) -> bool {
+    names_a_deployment(kind) && carried.iter().any(|d| d == name)
+}
+
+/// `kind` 这个词指的是不是一个 Deployment。上面两条判据共用它，好让"目标"
+/// 在两张名单里的解释不会分叉。
+fn names_a_deployment(kind: &str) -> bool {
+    workload_kind_of_resource(kind).map(|k| k.kind) == Some("Deployment")
+}
+
+/// 本次滚动的目标里，哪些的清单会在 `apply_target` 里被 apply —— 也就是说，
+/// 哪些目标的滚动会自己带上新的 `checksum/config` 注解。
+///
+/// 判据与 `apply_target` 那一路同源：清单目录里有 `deploy-<name>.yaml`，且它
+/// 确实带着这个 Deployment。只判"文件在不在"会把一份只有 Service 的清单也算成
+/// "apply 了"（那一路 apply 完根本不会滚目标），于是配置改动静默丢失。
+pub(crate) async fn manifest_carried_targets(plan: &RolloutPlan) -> Vec<String> {
+    let Some(dir) = plan.manifests_dir.as_deref() else {
+        return Vec::new();
+    };
+    let mut carried = Vec::new();
+    for t in &plan.targets {
+        let key = target_manifest_key(&t.deployment);
+        let path = Path::new(dir).join(&key);
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(text) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        if carries_deployment(&text, &key, &t.deployment).unwrap_or(false) {
+            carried.push(t.deployment.clone());
+        }
+    }
+    carried
+}
+
 /// 这次 apply 真的动过哪些支撑工作负载：代数变了，或 apply 之前根本不在（新增
 /// 的工作负载一样要等到就绪）。目标部署不在此列——它们的滚动由逐目标等待负责，
 /// 判据与预算都是另一套，在这里再等一遍会让同一件事有两个判据。
@@ -1523,17 +1581,10 @@ pub(crate) fn changed_workloads(
 ) -> Vec<SupportWorkload> {
     after
         .iter()
-        .filter(|w| {
-            // A rollout target is a Deployment of its own, so the ones it names
-            // are not "some support workload this apply restarted" -- they are
-            // waited for one by one. The word is the table's, not a literal:
-            // the target's own name is compared next to it, and two spellings
-            // of one resource here would silently stop matching.
-            !targets.iter().any(|t| {
-                workload_kind_of_resource(w.kind).map(|k| k.kind) == Some("Deployment")
-                    && t.deployment == w.name
-            })
-        })
+        // A rollout target is a Deployment of its own, so the ones it names
+        // are not "some support workload this apply restarted" -- they are
+        // waited for one by one.
+        .filter(|w| !is_rollout_target(w.kind, &w.name, targets))
         .filter(
             |w| match before.iter().find(|b| b.kind == w.kind && b.name == w.name) {
                 Some(b) => b.generation != w.generation,
@@ -2407,10 +2458,19 @@ impl RolloutExecutor {
     /// （Pod 模板变了才会滚出新副本），返回滚动名单。
     ///
     /// 读不到内容（None）时按"每份都变了"处理：说不清就有多滚一次，不留静默失效。
+    ///
+    /// `carried` 里的工作负载不在这里滚：它们的目标清单这次 apply 会落到集群上，
+    /// 清单里带着与本次 ConfigMap 内容对应的 `checksum/config` 注解，被逐目标
+    /// 循环滚起来时自然读到新配置；替它先滚一遍则会在准入账上多叠一份 surge
+    /// （见 [`is_manifest_carried`]）。
+    ///
+    /// 清单没到手的目标不在 `carried` 里，照旧在这里滚：它们只会走 `set image`，
+    /// Pod 模板上唯一变的是镜像，只改配置的那一版里镜像没变，靠它自己什么都不会发生。
     pub(crate) async fn roll_config_change_consumers(
         &self,
         before: Option<&BTreeMap<String, serde_json::Value>>,
         after: Option<&BTreeMap<String, serde_json::Value>>,
+        carried: &[String],
     ) -> SFResult<Vec<String>> {
         let empty = BTreeMap::new();
         let before = before.unwrap_or(&empty);
@@ -2492,8 +2552,13 @@ impl RolloutExecutor {
                 if !kind.long_lived_pods {
                     continue;
                 }
+                // 目标自己的滚动会带上新的 checksum/config 注解，替它先滚一遍
+                // 只是同一台工作负载叠两份 surge，准入账按「一次只滚一台」算。
+                if is_manifest_carried(&consumer.kind, &consumer.name, carried) {
+                    continue;
+                }
                 // 打在 apply 之后的支撑快照之前：这样它是"这次 apply 动过的工作负载"
-                // 之一，非目标的那几个由既有的支撑等待一并等它回就绪。
+                // 之一，由紧跟着的支撑等待一并等它回就绪。
                 self.run_kubectl(
                     &[
                         "patch",
@@ -3726,7 +3791,6 @@ impl RolloutExecutor {
                         // 回收方认得它们。失败那一路也删——它派生自包里那份清单，包还在。
                         let _ = tokio::fs::remove_file(&path).await;
                         outcome.map_err(|e| classify_before_any_change("support", "", e))?;
-                        let configs_after = self.configmap_contents().await;
                         // 支撑清单里除了 ConfigMap/Service，还有后端与集群内
                         // registry 这些工作负载，而目标部署的镜像要从这个 registry
                         // 拉、启动要连这些后端。apply 只改动的那些会滚动重启几秒到
@@ -3737,29 +3801,18 @@ impl RolloutExecutor {
                         // 变更，四个后端与 registry 一起重启，目标在 4 秒后被判
                         // ErrImagePull 版本类失败并回滚。
                         //
-                        // 配置改动走不了"按代数认人"这条路：apply 一份 ConfigMap 不改
-                        // 任何工作负载的 spec，代数不动，逐目标滚动与支撑等待都不会碰
-                        // 它的消费者——只改配置的 rev（镜像 tag 与上一版相同时连目标都
-                        // 不会滚）就这么静默停用。所以这里按内容差自己判一份该滚的名单，
-                        // 滚在拍代数快照之前，让下面的等待一并等它。
-                        let config_rolled = self
-                            .roll_config_change_consumers(
-                                configs_before.as_ref(),
-                                configs_after.as_ref(),
-                            )
-                            .await
-                            .map_err(|e| classify_before_any_change("config-effect", "", e))?;
-                        if !config_rolled.is_empty() {
-                            info!(
-                                workloads = %config_rolled.join(","),
-                                "mainline rollout: rolled the workloads whose configuration is only read at startup"
-                            );
-                        }
-                        let after = self
+                        // 这一步排在配置效果滚动**之前**，不是它之后：配置效果滚动
+                        // 会重启目标自己，而目标启动时要连的正是这批后端。2026-10-26
+                        // 实测，配置效果滚动先重启了 `deployment/cogneva`（19:11:12Z），
+                        // 而它要连的 `redis-0` 19:11:36Z 才起，`redis` 又是 headless
+                        // Service、没有就绪后端时名字根本解析不出来，于是新 Pod 连炸
+                        // 三次（`failed to lookup address information: Name or service
+                        // not known`）才自己缓过来。先等后端、再滚消费者。
+                        let after_support = self
                             .support_workloads()
                             .await
                             .map_err(|e| classify_before_any_change("support-snapshot", "", e))?;
-                        let restarted = changed_workloads(&before, &after, &plan.targets);
+                        let restarted = changed_workloads(&before, &after_support, &plan.targets);
                         if !restarted.is_empty() {
                             info!(
                                 workloads = %restarted
@@ -3772,6 +3825,48 @@ impl RolloutExecutor {
                             self.wait_support_settled(&restarted)
                                 .await
                                 .map_err(|e| classify_before_any_change("support-settle", "", e))?;
+                        }
+                        // 配置改动走不了"按代数认人"这条路：apply 一份 ConfigMap 不改
+                        // 任何工作负载的 spec，代数不动，逐目标滚动与支撑等待都不会碰
+                        // 它的消费者——只改配置的 rev（镜像 tag 与上一版相同时连目标都
+                        // 不会滚）就这么静默停用。所以这里按内容差自己判一份该滚的名单。
+                        // 名单里不含"清单在手"的目标：它们被逐目标循环 apply 时带着
+                        // 新的 `checksum/config` 注解，自己那次滚动就把新配置读进去了。
+                        let carried = manifest_carried_targets(plan).await;
+                        let configs_after = self.configmap_contents().await;
+                        let config_rolled = self
+                            .roll_config_change_consumers(
+                                configs_before.as_ref(),
+                                configs_after.as_ref(),
+                                &carried,
+                            )
+                            .await
+                            .map_err(|e| classify_before_any_change("config-effect", "", e))?;
+                        if !config_rolled.is_empty() {
+                            info!(
+                                workloads = %config_rolled.join(","),
+                                "mainline rollout: rolled the workloads whose configuration is only read at startup"
+                            );
+                            // 这些是自己刚重启的，也要等它们回就绪：不等就进逐目标
+                            // 循环，目标启动时连的正是它们。
+                            let after_config = self.support_workloads().await.map_err(|e| {
+                                classify_before_any_change("support-snapshot", "", e)
+                            })?;
+                            let config_restarted =
+                                changed_workloads(&after_support, &after_config, &plan.targets);
+                            if !config_restarted.is_empty() {
+                                info!(
+                                    workloads = %config_restarted
+                                        .iter()
+                                        .map(SupportWorkload::display)
+                                        .collect::<Vec<_>>()
+                                        .join(","),
+                                    "mainline rollout: waiting for the workloads the configuration roll restarted"
+                                );
+                                self.wait_support_settled(&config_restarted).await.map_err(
+                                    |e| classify_before_any_change("support-settle", "", e),
+                                )?;
+                            }
                         }
                     }
                     None => warn!(

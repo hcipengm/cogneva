@@ -9369,7 +9369,11 @@ fn resolve_target_manifest(
 
 /// 这份清单里是否有一个名为 `deployment` 的 Deployment 文档。多文档文件按
 /// 文档逐个判：预渲染目录里一个文件一份清单，但发布集目录形态没有这个约束。
-fn carries_deployment(yaml_text: &str, origin: &str, deployment: &str) -> SFResult<bool> {
+pub(crate) fn carries_deployment(
+    yaml_text: &str,
+    origin: &str,
+    deployment: &str,
+) -> SFResult<bool> {
     Ok(split_docs(yaml_text, origin)?.iter().any(|v| {
         v.get("kind").and_then(|k| k.as_str()) == Some("Deployment")
             && v.get("metadata")
@@ -9629,15 +9633,15 @@ mod tests {
         changed_workloads, classify_before_any_change, config_change_needs_restart,
         config_consumers, defined_objects, deployment_surges, environment_class,
         image_pull_blocked, is_admission_denied, is_cluster_config_missing,
-        is_image_source_unavailable, is_placement_blocked, locate_before_any_change,
-        normalize_placement_shape, parse_rollout_args, pod_samples, pod_selector,
-        pod_template_limits, pod_waiting_states, readiness_overdue, replicaset_failures,
-        rollout_converged, rollout_pods_fatal, rollout_pods_ready, stage_rollout_manifest,
-        staged_manifest_path, summarize_events, summarize_pod_states, support_pod_causes,
-        support_pod_selector, support_settled, terminating_pods, unresolved_configmaps,
-        unschedulable_pods, write_termination_message, ClusterConfigSources, ProbeCycle,
-        RefSnapshots, ReplicaSetFailure, RewrittenRef, RolloutExecutor, RolloutPlan, SupportCause,
-        SupportWorkload, UpstreamCiAsk, UpstreamCiTarget, ADMISSION_DENIED_MARKER,
+        is_image_source_unavailable, is_placement_blocked, is_rollout_target,
+        locate_before_any_change, normalize_placement_shape, parse_rollout_args, pod_samples,
+        pod_selector, pod_template_limits, pod_waiting_states, readiness_overdue,
+        replicaset_failures, rollout_converged, rollout_pods_fatal, rollout_pods_ready,
+        stage_rollout_manifest, staged_manifest_path, summarize_events, summarize_pod_states,
+        support_pod_causes, support_pod_selector, support_settled, terminating_pods,
+        unresolved_configmaps, unschedulable_pods, write_termination_message, ClusterConfigSources,
+        ProbeCycle, RefSnapshots, ReplicaSetFailure, RewrittenRef, RolloutExecutor, RolloutPlan,
+        SupportCause, SupportWorkload, UpstreamCiAsk, UpstreamCiTarget, ADMISSION_DENIED_MARKER,
         IMAGE_PULL_WAITING_REASONS, K3S_KUBECONFIG, NEW_REVISION_NEVER_RAN_MARKER,
         PLACEMENT_BLOCKED_MARKER, SERVICE_ACCOUNT_TOKEN, SUPPORT_CAUSE_POD_LIMIT,
     };
@@ -18391,6 +18395,28 @@ echo "||1"
         );
     }
 
+    /// 目标名单里存的是 Deployment 的对象名。同名的 StatefulSet 是另一个对象，
+    /// 既不该被当成目标跳过等待，也不该被配置滚动跳过。
+    ///
+    /// 这条守的是判据的**形状**而不是当下的数据：两侧一旦按裸名字比较，
+    /// 一个与目标同名的 StatefulSet 就会被当成目标——它自己的 Pod 没人等、
+    /// 配置也没人替它滚，而两条路都会安静地什么都不做。
+    #[test]
+    fn a_statefulset_sharing_a_targets_name_is_not_that_target() {
+        let targets = vec![RolloutTarget {
+            deployment: "postgres".into(),
+            container: "postgres".into(),
+            component: "postgres".into(),
+            name: "postgres".into(),
+        }];
+        assert!(is_rollout_target("deployment", "postgres", &targets));
+        assert!(
+            !is_rollout_target("statefulset", "postgres", &targets),
+            "a StatefulSet that happens to share a target's name is a different object"
+        );
+        assert!(!is_rollout_target("deployment", "redis", &targets));
+    }
+
     #[test]
     fn support_settled_requires_observed_generation_and_new_replicas() {
         // generation|observed|want|ready|updated|running
@@ -22591,13 +22617,45 @@ exit 0
             900,
         );
 
+        // A target whose manifest this rollout applies is a consumer this call
+        // must leave alone: that manifest carries the new `checksum/config`
+        // annotation, so the target's own roll reads the new document --
+        // stamping it here as well puts two surges of the same workload
+        // against a quota that only budgets for one.
+        let carried = vec!["app-deploy".to_string()];
+
         // No reading on either side of the apply: every consumer of every
         // document it reads is a consumer this call has to decide about, which
         // is the widest this decision ever gets.
         let mut rolled = executor
-            .roll_config_change_consumers(None, None)
+            .roll_config_change_consumers(None, None, &carried)
             .await
             .expect("the roll decides for itself and does not fail on a cronjob");
+        rolled.sort();
+        assert_eq!(
+            rolled,
+            vec!["app-ds".to_string(), "app-sts".to_string()],
+            "a consumer whose pods are created per run reads the new document on its next run \
+             and must not be stamped; a target whose manifest is applied is stamped by its own \
+             roll and must not be stamped twice; every other one has to be"
+        );
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("patch deployment app-deploy"),
+            "the target was patched anyway: the skip has to happen before the patch, not after"
+        );
+
+        // The same target without a manifest to apply is NOT covered by that
+        // reasoning: it falls back to `set image`, and on a revision that only
+        // changes configuration the image does not move either, so nothing in
+        // its pod template changes and nothing would ever read the new
+        // document. Leaving it out of the list here is what keeps a
+        // configuration-only change from going silently stale.
+        let mut rolled = executor
+            .roll_config_change_consumers(None, None, &[])
+            .await
+            .expect("an unreadable package is not a reason to skip the roll");
         rolled.sort();
         assert_eq!(
             rolled,
@@ -22606,8 +22664,14 @@ exit 0
                 "app-ds".to_string(),
                 "app-sts".to_string()
             ],
-            "a consumer whose pods are created per run reads the new document on its next run \
-             and must not be stamped; every other one has to be"
+            "a target with no manifest of its own has to be stamped -- its own roll only \
+             changes an image tag"
+        );
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("patch deployment app-deploy"),
+            "a target with no manifest of its own was skipped, so nothing reads the new document"
         );
 
         let calls = std::fs::read_to_string(&log).unwrap();
@@ -22626,7 +22690,7 @@ exit 0
             );
         }
         assert!(
-            calls.contains("patch deployment app-deploy")
+            calls.contains("patch statefulset app-sts")
                 && !calls.contains("patch cronjob app-cron"),
             "the roll has to address the kind the reading reported: {calls}"
         );
