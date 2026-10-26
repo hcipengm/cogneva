@@ -767,3 +767,161 @@ fn a_port_the_gateway_listens_on_is_told_to_the_process_and_not_only_opened() {
     );
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// The profile values files: what each deployment形态 changes relative to the
+/// chart's defaults.
+const PROFILES: &str = "deploy/helm/cogneva/profiles";
+
+/// Where a values leaf may be read from when no template names it: the scripts
+/// that project the chart's numbers (the resource governance projection reads
+/// `resourceGovernance.clusterNodes`, and no manifest can).
+const DEPLOY_SCRIPTS: &str = "deploy/scripts";
+
+/// Every dotted path a template reads through `.Values.`.
+fn paths_the_templates_read() -> BTreeSet<String> {
+    fn walk(dir: &Path, out: &mut BTreeSet<String>) {
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        for entry in entries {
+            let entry = entry.expect("a template directory entry");
+            let path = entry.path();
+            if entry.file_type().expect("a file type").is_dir() {
+                walk(&path, out);
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find(".Values.") {
+                rest = &rest[at + ".Values.".len()..];
+                let path: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                    .collect();
+                let path = path.trim_end_matches('.').to_string();
+                if !path.is_empty() {
+                    out.insert(path);
+                }
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(&repo_root().join("deploy/helm/cogneva/templates"), &mut out);
+    out
+}
+
+/// Every leaf path of a parsed values document, empty mappings included.
+fn leaf_paths(value: &serde_yaml::Value, prefix: &mut Vec<String>, out: &mut BTreeSet<String>) {
+    match value {
+        serde_yaml::Value::Mapping(map) => {
+            if map.is_empty() && !prefix.is_empty() {
+                out.insert(prefix.join("."));
+            }
+            for (key, child) in map {
+                let key = match key {
+                    serde_yaml::Value::String(s) => s.clone(),
+                    other => format!("{other:?}"),
+                };
+                prefix.push(key);
+                leaf_paths(child, prefix, out);
+                prefix.pop();
+            }
+        }
+        _ => {
+            if !prefix.is_empty() {
+                out.insert(prefix.join("."));
+            }
+        }
+    }
+}
+
+/// The text of the scripts that may read a chart value the templates do not.
+fn deploy_scripts_text() -> String {
+    let mut out = String::new();
+    let dir = repo_root().join(DEPLOY_SCRIPTS);
+    let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    for entry in entries {
+        let entry = entry.expect("a script directory entry");
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if !matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("sh" | "py" | "bash")
+        ) {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            out.push_str(&text);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// A profile's job is to say what changes; a key nothing reads changes nothing.
+///
+/// Helm is silent about this in both directions: a `--set` of a path no template
+/// reads creates the path and renders as if it had not been given, and a profile
+/// carrying a stale key is simply carried. The deployment then reads as
+/// configured ("we set the address, the logs must be going there") while the
+/// value sits in the merge result and moves nothing.
+///
+/// Templates are the readers here, matched by path prefix so that a `toYaml` of
+/// a parent covers its subtree. The projection scripts are the other reader: a
+/// number that sizes a quota is not in any manifest and cannot be read by one,
+/// so a leaf whose last segment a script names by hand counts as read.
+#[test]
+fn a_profile_leaf_nobody_reads_is_a_knob_the_deployment_cannot_turn() {
+    let read_ = paths_the_templates_read();
+    let scripts = deploy_scripts_text();
+    assert!(
+        !read_.is_empty() && !scripts.is_empty(),
+        "nothing was read from the chart templates or the deploy scripts, so this \
+         test would pass on any profile -- the paths moved"
+    );
+
+    let dir = repo_root().join(PROFILES);
+    let mut unread = Vec::new();
+    let mut checked = 0;
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.expect("a profile directory entry").path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("yaml"))
+        .collect();
+    files.sort();
+    for file in files {
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display())),
+        )
+        .unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        let mut leaves = BTreeSet::new();
+        leaf_paths(&parsed, &mut Vec::new(), &mut leaves);
+        for leaf in leaves {
+            checked += 1;
+            let read_by_template = read_
+                .iter()
+                .any(|read| leaf == *read || leaf.starts_with(&format!("{read}.")));
+            let last = leaf.rsplit('.').next().unwrap_or(&leaf);
+            let read_by_script = ["\"", "'"]
+                .iter()
+                .any(|quote| scripts.contains(&format!("{quote}{last}{quote}")));
+            if !read_by_template && !read_by_script {
+                unread.push(format!("{name}: {leaf}"));
+            }
+        }
+    }
+
+    assert!(checked > 0, "{PROFILES} holds no key at all");
+    assert!(
+        unread.is_empty(),
+        "these profile keys are set by a deployment and read by nothing -- no \
+         template, no projection script -- so the value is carried in the merge \
+         result and changes nothing while the deployment reads as configured: \
+         {unread:#?}"
+    );
+}
