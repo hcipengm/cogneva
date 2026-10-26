@@ -527,6 +527,14 @@ jobs:
         run: cargo test -p cog-storage --test task_status_counts -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Whether a ledger row that names something counts as attributed is a
+      # `NOT EXISTS` against the task graph, so only a server can answer it. It
+      # writes its rows into 2001 and deletes them, so it neither reads nor
+      # disturbs what the steps above leave behind.
+      - name: Live-DB unattributed spend
+        run: cargo test -p cog-observability --test usage_unattributed -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
 
   fmt:
     name: Format

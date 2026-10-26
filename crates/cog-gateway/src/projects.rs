@@ -190,7 +190,8 @@ pub struct EvmResponse {
     pub cost_performance_index: Option<f64>,
     /// 进度绩效指数 = 挣值 / 计划价值。
     pub schedule_performance_index: Option<f64>,
-    /// 同一窗口里**没有**任务身份的用量。
+    /// 同一窗口里**归不到任何一件任务**的用量：账上没写身份，或者写的是一次
+    /// 运行的 id 而任务图里没有这件活。
     ///
     /// 它不属于任何一个项目，所以不并进上面的成本，也不折成 0——那样成本绩效
     /// 会把归因缺口读成省钱。`None` 表示这笔账读不到。
@@ -546,7 +547,7 @@ pub async fn project_evm_handler(
                 }
             };
             // 归因缺口的窗口：从这些任务最早的那一刻（有基线就用计划起点）到现在。
-            // 账上没有任务身份的行无法归属到任何项目，只能报这个窗口里的总量。
+            // 账上归不到任何一件任务的行无法归属到任何项目，只能报这个窗口里的总量。
             let since = evm_window_start(&rows, plans.as_ref());
             let unattributed = match store.unattributed_between(since, now).await {
                 Ok(v) => Some(v),

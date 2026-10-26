@@ -56,6 +56,11 @@ pub const LEDGER_TABLE: &str = "gateway_llm_usage";
 /// The durable per-window fold of [`LEDGER_TABLE`].
 pub const ROLLUP_TABLE: &str = "cog_llm_usage_rollup";
 
+/// 任务图的正本表。账上写了一个身份，这个身份是不是平台认得的一件活，只有
+/// 这张表能回答——账本自己没有「哪些 id 是任务」的名单，也不该抄一份：抄来的
+/// 名单会在第一次删任务的那天开始说谎。
+const TASK_GRAPH_TABLE: &str = "cog_dag_tasks";
+
 /// The last measured quota window per upstream.
 ///
 /// A measurement is not a usage row, so it does not belong in the ledger; but
@@ -1154,20 +1159,31 @@ impl LlmUsageStore {
             .collect())
     }
 
-    /// 同一窗口里**没有**任务身份的用量合计。
+    /// 同一窗口里**归不到任何一件任务**的用量合计。
     ///
     /// 这个数不属于任何一个项目，所以它不能并进哪个项目的成本；它要报出来，
     /// 是因为它量的是「成本里有多少看不到出处」。折成 0，成本绩效会把归因缺口
     /// 读成省钱。
+    ///
+    /// 「没有出处」有两种写法，两种都要算：
+    ///
+    /// - `task_id` 为空：调用方压根没声明在为谁干活；
+    /// - `task_id` 写的是一次运行的 id（2026-10-26 之前全是 `ralph-pipeline-*`），
+    ///   这个 id 在任务图里找不到对应的活。它看着像有身份，实际指向的是执行
+    ///   这件事的那次运行，不是它花掉的钱该记的那件活——按「有 id」就当成已
+    ///   归属，这些行会同时从项目成本和缺口里消失，而它们当时是全部花销的大头。
     pub async fn unattributed_between(
         &self,
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> anyhow::Result<u64> {
         let row = sqlx::query(&format!(
-            "SELECT COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT AS tokens
-               FROM {LEDGER_TABLE}
-              WHERE task_id IS NULL AND ts >= $1 AND ts < $2"
+            "SELECT COALESCE(SUM(u.tokens_input + u.tokens_output), 0)::BIGINT AS tokens
+               FROM {LEDGER_TABLE} u
+              WHERE u.ts >= $1 AND u.ts < $2
+                AND (u.task_id IS NULL
+                     OR NOT EXISTS (SELECT 1 FROM {TASK_GRAPH_TABLE} t
+                                     WHERE t.task_id = u.task_id))"
         ))
         .bind(since)
         .bind(until)
