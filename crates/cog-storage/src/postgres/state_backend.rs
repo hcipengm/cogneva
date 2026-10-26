@@ -917,6 +917,15 @@ impl StateBackend for PostgresStateBackend {
         // 是同一把尺子（自定义取 `custom`，其余取变体名），分叉的那天这里读成
         // 空，表现是「没有样本」而不是报错——所以两处必须一起改。
         //
+        // 工时的两端是 `started_at` 与最近一次更新，不是创建与最新更新：创建到
+        // 开工之间的那段是**排队时间**，不是工期。这条差别不是小数点上的：现网
+        // 五条 change_ledger 样本创建于 10-18、10-25 才被拾取，按创建量是 7.7 天，
+        // 按开工量是 7 分钟——前者排出来的甘特条，会让 2354 条待办每一行都画成
+        // 一周长，而它们实际各跑几分钟。没有开始时刻的行不贡献时长样本（它的
+        // 工时从没被量过），所以 `samples` 数的是「量过工时的那些」，不是「跑完的
+        // 那些」：两处都算的话，一个一条都没量过工时的种类也会拿到一行时长中位 0
+        // 的记录，读起来像「量过了，是 0」。
+        //
         // 花销取清点表里那件任务自己的累计数，中位而不是均值：一件跑了三小时的
         // 活能把均值拉走一个量级，而排期要的是一个典型的量。
         //
@@ -941,14 +950,14 @@ impl StateBackend for PostgresStateBackend {
                                    'other') AS kind,
                                task_id,
                                EXTRACT(EPOCH FROM ((task->>'updated_at')::timestamptz
-                                                 - (task->>'created_at')::timestamptz)) AS dur
+                                                 - NULLIF(task->>'started_at', '')::timestamptz)) AS dur
                           FROM cog_dag_tasks
                          WHERE workspace_id = $1
                            AND status = 'completed'
                            AND updated_at > NOW() - INTERVAL '30 days'
                     )
                     SELECT d.kind,
-                           COUNT(DISTINCT d.task_id)::BIGINT AS samples,
+                           COUNT(DISTINCT d.task_id) FILTER (WHERE d.dur IS NOT NULL)::BIGINT AS samples,
                            COALESCE(percentile_cont(0.5) WITHIN GROUP (
                                         ORDER BY m.total_tokens)::BIGINT, 0) AS med_tokens,
                            COALESCE(percentile_cont(0.5) WITHIN GROUP (
@@ -956,7 +965,7 @@ impl StateBackend for PostgresStateBackend {
                       FROM done d
                       LEFT JOIN cog_observability_metrics m ON m.task_id = d.task_id
                      GROUP BY d.kind
-                    HAVING COUNT(DISTINCT d.task_id) >= $2
+                    HAVING COUNT(DISTINCT d.task_id) FILTER (WHERE d.dur IS NOT NULL) >= $2
                     "#,
                 )
                 .bind(workspace_id)
