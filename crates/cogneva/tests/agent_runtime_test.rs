@@ -21,6 +21,7 @@ async fn test_agent_loop_completes_without_tools() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     );
@@ -67,6 +68,7 @@ async fn test_agent_loop_state_transitions() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     );
@@ -94,6 +96,7 @@ async fn test_agent_loop_steps_recorded() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     );
@@ -122,6 +125,7 @@ async fn test_agent_loop_max_iterations() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     );
@@ -163,6 +167,7 @@ async fn test_agent_loop_chat_stream_returns_raw_stream() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     );
@@ -205,6 +210,7 @@ async fn test_agent_loop_checkpoint() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     );
@@ -237,6 +243,7 @@ async fn test_react_loop_wraps_agent_loop() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     );
@@ -261,6 +268,7 @@ async fn test_react_loop_emits_react_events() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     );
@@ -316,6 +324,7 @@ async fn test_react_loop_steps_extracted_correctly() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     );
@@ -368,6 +377,7 @@ async fn test_agent_runtime_discovers_dynamically_registered_tool() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     )
@@ -438,6 +448,7 @@ fn runtime_with_one_tool(
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     )

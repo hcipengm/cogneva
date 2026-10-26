@@ -677,6 +677,8 @@ async fn test_agent_loop_runs_correctly() {
         skill_cache_ttl_secs: 30,
         think_stall_timeout_secs: 240,
         final_draft_timeout_secs: 300,
+        // 这条测的是运行循环与自审，不关心这次运行替谁干活。
+        owner_task_id: None,
     };
 
     let mut agent_loop = AgentRuntime::new(config, event_tx);

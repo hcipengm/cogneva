@@ -25,6 +25,7 @@ async fn test_agent_loop_restore_preserves_context() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     );
@@ -59,6 +60,7 @@ async fn test_agent_loop_restore_preserves_context() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx2,
     );
@@ -88,6 +90,7 @@ async fn test_agent_loop_restore_changes_role_and_state() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     );
@@ -108,6 +111,7 @@ async fn test_agent_loop_restore_changes_role_and_state() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx2,
     );
@@ -132,6 +136,7 @@ async fn test_agent_snapshot_and_restore() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -178,6 +183,7 @@ async fn test_agent_restore_allows_continue() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         Arc::new(MockProvider::new("acknowledged")),
     );
@@ -230,6 +236,7 @@ async fn test_snapshot_event_replay_with_wal() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     )
@@ -267,6 +274,7 @@ async fn test_snapshot_event_replay_with_wal() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx2,
     )
@@ -310,6 +318,7 @@ async fn test_snapshot_without_wal_has_zero_offset() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     );
@@ -333,6 +342,7 @@ async fn test_restore_resets_steps() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         event_tx,
     );

@@ -23,6 +23,7 @@ async fn test_agent_prompt_completes() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -53,6 +54,7 @@ async fn test_agent_subscribe_receives_events() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -91,6 +93,7 @@ async fn test_agent_state_transitions() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -121,6 +124,7 @@ async fn test_agent_abort_resets_to_idle() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         Arc::new(MockProvider::new("slow result")),
     );
@@ -157,6 +161,7 @@ async fn test_agent_reset_clears_state() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -182,6 +187,7 @@ async fn test_agent_continue_preserves_context() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         Arc::new(MockProvider::new("acknowledged")),
     );
@@ -216,6 +222,7 @@ async fn test_agent_wait_for_idle() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         Arc::new(MockProvider::new("result")),
     );
@@ -249,6 +256,7 @@ async fn test_agent_chat_stream_bypasses_loop() {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         },
         Arc::new(MockProvider::new("hello stream")),
     );

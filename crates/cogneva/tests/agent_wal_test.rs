@@ -427,6 +427,8 @@ async fn test_agent_loop_with_wal_persists_events() {
         skill_config: None,
         crew_id: None,
         squad_id: None,
+        // 这一条测的是 WAL 往返，不关心这次运行替谁干活。
+        owner_task_id: None,
     };
     let mut agent_loop = AgentRuntime::new(config, event_tx).with_wal(wal);
 
