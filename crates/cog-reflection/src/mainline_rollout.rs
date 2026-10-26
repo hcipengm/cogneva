@@ -1360,6 +1360,53 @@ pub(crate) fn pod_template_limits(doc: &serde_yaml::Value) -> Option<BTreeMap<St
 /// not be read": an unreadable figure is not a figure that fits, but it is also
 /// not grounds to hold a rollout, and holding a good rollout is the failure this
 /// must not introduce.
+/// The first enforced ceiling any of these quotas would have this target's new
+/// pod pass, if any -- the same walk [`admission_shortfall`] does, kept apart so
+/// the reading can be taken twice without the loop being written twice.
+fn first_admission_shortfall(
+    quotas: &std::collections::BTreeMap<String, crate::governance_drift::QuotaUsage>,
+    old_limits: &BTreeMap<String, f64>,
+    new_limits: &BTreeMap<String, f64>,
+    surges: bool,
+) -> Option<String> {
+    for (object, usage) in quotas {
+        if let Some(reason) = admission_shortfall(object, usage, old_limits, new_limits, surges) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+/// Names of the pods that are still being charged while they shut down.
+///
+/// A pod with a deletion timestamp is gone from nobody's accounting yet: the
+/// quota keeps charging it until it actually leaves. That is what makes an
+/// admission reading taken immediately after this run stopped its own pods say
+/// less than it looks like it says.
+///
+/// `None` when the listing cannot be parsed -- an unreadable figure is not a
+/// figure that fits, but it is not grounds to hold a rollout either, which is
+/// the discipline the admission judgement itself follows.
+pub(crate) fn terminating_pods(pods_json: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(pods_json).ok()?;
+    let items = v.get("items")?.as_array()?;
+    Some(
+        items
+            .iter()
+            .filter(|p| {
+                p.pointer("/metadata/deletionTimestamp")
+                    .and_then(|d| d.as_str())
+                    .is_some()
+            })
+            .filter_map(|p| {
+                p.pointer("/metadata/name")
+                    .and_then(|n| n.as_str())
+                    .map(str::to_owned)
+            })
+            .collect(),
+    )
+}
+
 pub(crate) fn admission_shortfall(
     object: &str,
     usage: &crate::governance_drift::QuotaUsage,
@@ -2122,14 +2169,71 @@ impl RolloutExecutor {
             .await
             .ok()?;
         let quotas = crate::governance_drift::live_quota_usage(&quota_text).ok()?;
-        for (object, usage) in &quotas {
-            if let Some(reason) =
-                admission_shortfall(object, usage, &old_limits, &new_limits, surges)
-            {
-                return Some(reason);
-            }
+        let verdict = first_admission_shortfall(&quotas, &old_limits, &new_limits, surges);
+        verdict.as_ref()?;
+        // A refusal is only news if the usage behind it is the usage that will
+        // still be there when the new pod is admitted. Earlier targets in this
+        // same run stop their own pods, and the quota keeps charging those until
+        // they are actually gone -- so the reading taken the instant after they
+        // finish is dominated by usage this run just created and is about to
+        // give back. Measured 2026-10-26: the main deployment was refused at
+        // 59904Mi used, 4GiB of which belonged to pods already terminating; the
+        // same namespace settled at 55808Mi a minute later and the charge fitted.
+        // Waiting only when the reading already says "no" costs nothing on the
+        // rollouts that were never in doubt.
+        if !self.wait_out_terminating_pods().await {
+            return verdict;
         }
-        None
+        let Ok(quota_text) = self
+            .run_kubectl(&["get", "resourcequota", "-o", "json"], 60)
+            .await
+        else {
+            return verdict;
+        };
+        let Ok(quotas) = crate::governance_drift::live_quota_usage(&quota_text) else {
+            return verdict;
+        };
+        first_admission_shortfall(&quotas, &old_limits, &new_limits, surges)
+    }
+
+    /// Wait, up to a minute, for pods that are already shutting down to leave.
+    ///
+    /// Returns whether the wait happened at all: `true` means the namespace had
+    /// pods with a deletion timestamp and some of them went away, so the caller
+    /// should read its figures again. `false` covers both "nothing was
+    /// terminating" and "they were still there when the budget ran out" -- in
+    /// the second case the reading is the same one that was already taken.
+    ///
+    /// Bounded on purpose: a pod that never leaves must not turn into a rollout
+    /// that never starts. Unreadable listings return immediately, the same way
+    /// an unreadable figure holds nothing back elsewhere in this judgement.
+    async fn wait_out_terminating_pods(&self) -> bool {
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+        const POLL: std::time::Duration = std::time::Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let mut waited = false;
+        loop {
+            let Ok(text) = self.run_kubectl(&["get", "pods", "-o", "json"], 30).await else {
+                return waited;
+            };
+            let Some(names) = terminating_pods(&text) else {
+                return waited;
+            };
+            if names.is_empty() {
+                return waited;
+            }
+            if started.elapsed() >= BUDGET {
+                tracing::warn!(
+                    still_terminating = names.len(),
+                    waited_secs = started.elapsed().as_secs(),
+                    "pods were still terminating when the admission reading was due; judging on \
+                     the usage the namespace still charges for them"
+                );
+                return waited;
+            }
+            waited = true;
+            tokio::time::sleep(POLL).await;
+        }
     }
 
     /// 这次 apply 会引用的 ConfigMap，必须要么随本次 apply 一起来，要么集群里已经在；

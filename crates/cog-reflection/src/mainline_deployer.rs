@@ -9603,9 +9603,9 @@ mod tests {
         pod_template_limits, pod_waiting_states, readiness_overdue, replicaset_failures,
         rollout_converged, rollout_pods_fatal, rollout_pods_ready, stage_rollout_manifest,
         staged_manifest_path, summarize_events, summarize_pod_states, support_pod_causes,
-        support_pod_selector, support_settled, unresolved_configmaps, unschedulable_pods,
-        write_termination_message, ClusterConfigSources, ProbeCycle, RefSnapshots,
-        ReplicaSetFailure, RewrittenRef, RolloutExecutor, RolloutPlan, SupportCause,
+        support_pod_selector, support_settled, terminating_pods, unresolved_configmaps,
+        unschedulable_pods, write_termination_message, ClusterConfigSources, ProbeCycle,
+        RefSnapshots, ReplicaSetFailure, RewrittenRef, RolloutExecutor, RolloutPlan, SupportCause,
         SupportWorkload, UpstreamCiAsk, UpstreamCiTarget, ADMISSION_DENIED_MARKER,
         IMAGE_PULL_WAITING_REASONS, K3S_KUBECONFIG, NEW_REVISION_NEVER_RAN_MARKER,
         PLACEMENT_BLOCKED_MARKER, SERVICE_ACCOUNT_TOKEN, SUPPORT_CAUSE_POD_LIMIT,
@@ -24513,5 +24513,40 @@ exit 0
             "清单读不到时删了东西：{calls}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 已经在退场的 Pod 仍然被配额计着，所以一份「它们还在」的用量读数不是
+    /// 「装不下」的证据。这一条只问「哪些名字带删除时间戳」，不问配额。
+    #[test]
+    fn only_pods_with_a_deletion_timestamp_are_on_their_way_out() {
+        let listing = r#"{"items":[
+            {"metadata":{"name":"cogneva-abc"}},
+            {"metadata":{"name":"cogneva-sandbox-executor-old","deletionTimestamp":"2026-10-26T02:54:07Z"}},
+            {"metadata":{"name":"redis-0","deletionTimestamp":null}},
+            {"metadata":{"name":"cogneva-security-gateway-old","deletionTimestamp":"2026-10-26T02:53:58Z"}}
+        ]}"#;
+        let mut names = terminating_pods(listing).expect("读得出来的清单");
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "cogneva-sandbox-executor-old".to_string(),
+                "cogneva-security-gateway-old".to_string()
+            ],
+            "退场中的 Pod 被数错或数漏：{names:?}"
+        );
+    }
+
+    /// 读不出来是 `None`，不是空表：空表会让调用方读成「已经清干净了」，
+    /// 而这一段的全部意义就是不把读不到当读数。
+    #[test]
+    fn an_unreadable_pod_listing_is_not_an_empty_one() {
+        assert!(terminating_pods("not json").is_none());
+        assert!(terminating_pods(r#"{"items":"nope"}"#).is_none());
+        assert_eq!(
+            terminating_pods(r#"{"items":[]}"#),
+            Some(Vec::<String>::new()),
+            "空清单要读成空表"
+        );
     }
 }
