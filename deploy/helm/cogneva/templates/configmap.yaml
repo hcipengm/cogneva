@@ -53,6 +53,12 @@ data:
   # 同源——规则求值读的是 cogneva.json 的 infra_watch.prometheus_url，两者问的
   # 是同一台机器，各写一个地址就等于允许它们分开。
   COGNEVA_PROMETHEUS_URL: {{ .Values.observability.infraWatch.prometheusUrl | quote }}
+  # 集群内 registry 的两条访问端点：Pod 内 buildah 用 Service DNS，节点上 kubelet
+  # 用 localhost:NodePort。两者都是 `clusterRegistry.port` / `nodePort` 的投影，
+  # 放在共用 env 里而不是只给进化 Pod：晋级镜像的引用由主应用的拉取端产出，它同样
+  # 要读这两条。代码那侧没有默认值可退（缺了报错），所以这里必须两份形态都给。
+  COGNEVA_MAINLINE_DEPLOYER_REGISTRY: {{ printf "cogneva-registry.%s.svc.cluster.local:%d" (include "cogneva.namespace" .) (int .Values.clusterRegistry.port) | quote }}
+  COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY: {{ printf "localhost:%d" (int .Values.clusterRegistry.nodePort) | quote }}
 
   # 告警通知出口地址。出口机制四类 dispatcher 都在代码里，缺的只是地址；空值
   # 不建出口（与 cogneva.json 的 null 等价）。地址只由集群侧 values / --set 给，

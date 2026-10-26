@@ -1043,3 +1043,56 @@ fn a_profile_leaf_nobody_reads_is_a_knob_the_deployment_cannot_turn() {
          {unread:#?}"
     );
 }
+
+/// The registry endpoints the deployer pushes to and the node pulls from are
+/// one pair of facts, declared from `clusterRegistry.port` / `nodePort`. Both
+/// halves have to be on both paths: code reads them through
+/// `registry_endpoint`, treats a missing one as an error when the deployer is
+/// enabled, and the static file is what the plain-apply path installs.
+#[test]
+fn the_registry_endpoints_the_code_reads_are_declared_on_both_paths() {
+    const CODE: &str = "crates/cog-reflection/src/registry_endpoint.rs";
+    // 共用 env：镜像引用的产出端在主应用 Pod，只有进化 Pod 能读到的那份够不着它。
+    const CHART: &str = "deploy/helm/cogneva/templates/configmap.yaml";
+    const STATIC: &str = "deploy/k3s/configmap.yaml";
+    const DECLARED: &[(&str, &str)] = &[
+        ("COGNEVA_MAINLINE_DEPLOYER_REGISTRY", "clusterRegistry.port"),
+        (
+            "COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY",
+            "clusterRegistry.nodePort",
+        ),
+    ];
+
+    let code = read(&repo_root().join(CODE));
+    let chart = read(&repo_root().join(CHART));
+    let statically = read(&repo_root().join(STATIC));
+
+    let mut wrong = Vec::new();
+    for (env, leaf) in DECLARED {
+        if !code.contains(&format!("\"{env}\"")) {
+            wrong.push(format!(
+                "{CODE} no longer reads {env}: is it still declared anywhere the process can see?"
+            ));
+        }
+        let Some(line) = configmap_value(&chart, env) else {
+            wrong.push(format!(
+                "{CHART} never passes {env}: the process reads it, so a Pod without it \
+                 fails its registry step instead of using a guessed address"
+            ));
+            continue;
+        };
+        if !line.contains(&format!(".Values.{leaf}")) {
+            wrong.push(format!(
+                "{CHART}: {env} is `{line}` rather than a read of `{leaf}` -- the \
+                 registry's port would then live in two places"
+            ));
+        }
+        if configmap_value(&statically, env).is_none() {
+            wrong.push(format!(
+                "{STATIC} never passes {env}, so the apply path leaves the deployer \
+                 without an endpoint while the chart path has one"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

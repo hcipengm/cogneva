@@ -1244,9 +1244,15 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // 挂载表里；kubelet 那条 per-volume 序列对目录型卷报的是节点
                 // 盘（本集群实测 12 块卷全读 689GB，10Gi 的声明量在里面）。
                 // 读数因此从 registry 自己的 API 取，按声明挂到那张卷上。
+                // 端点取部署面的那一份（配置或环境里声明的；两条来源指同一个值），
+                // 走查函数自己不读环境，缺了就把这条读数报成「没有声明」。
+                let registry_endpoint = if ml_config.registry.trim().is_empty() {
+                    crate::registry_endpoint::declared().unwrap_or_default()
+                } else {
+                    ml_config.registry.clone()
+                };
                 let (registry_footprint, footprint_problems) = crate::registry_footprint::from_env(
-                    &ml_config.registry,
-                    &ml_config.namespace,
+                    &registry_endpoint,
                     std::env::var(crate::registry_footprint::CLAIM_ENV)
                         .ok()
                         .as_deref(),

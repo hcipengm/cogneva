@@ -509,18 +509,21 @@ pub fn spawn_watch(
 /// the series and a pod that measures nothing look identical from outside.
 pub fn from_env(
     endpoint: &str,
-    namespace: &str,
     claim: Option<&str>,
 ) -> (Option<Arc<RegistryFootprint>>, Vec<String>) {
     let mut problems = Vec::new();
     let Some(claim) = claim.map(str::trim).filter(|c| !c.is_empty()) else {
         return (None, problems);
     };
-    let endpoint = if endpoint.trim().is_empty() {
-        crate::registry_endpoint::in_cluster(namespace)
-    } else {
-        endpoint.trim_end_matches('/').to_string()
-    };
+    // 端点必须是声明来的：一个按约定拼出来的地址如果猜错，走查会连到别的仓库
+    // （或连不上），而两种结局在读数面上都是「这张卷没有数据」。
+    let endpoint = endpoint.trim().trim_end_matches('/').to_string();
+    if endpoint.is_empty() {
+        problems.push(format!(
+            "no registry endpoint is declared; the store behind claim {claim} will not be measured"
+        ));
+        return (None, problems);
+    }
     if endpoint_host_port(&endpoint).is_none() {
         problems.push(format!(
             "registry endpoint {endpoint:?} is not host:port; the store behind claim {claim} will not be measured"
@@ -898,29 +901,29 @@ mod tests {
     /// reported rather than left looking like a store nobody measures.
     #[test]
     fn the_declaration_gates_the_reading() {
-        let (none, problems) = from_env("reg:5000", "cogneva", None);
+        let (none, problems) = from_env("reg:5000", None);
         assert!(none.is_none());
         assert!(problems.is_empty(), "no declaration is not a problem");
-        let (none, problems) = from_env("reg:5000", "cogneva", Some("  "));
+        let (none, problems) = from_env("reg:5000", Some("  "));
         assert!(none.is_none());
         assert!(problems.is_empty());
 
-        let (some, problems) = from_env("reg:5000", "cogneva", Some("cogneva-registry-pvc"));
+        let (some, problems) = from_env("reg:5000", Some("cogneva-registry-pvc"));
         assert!(problems.is_empty());
         let footprint = some.expect("a declared claim is measured");
         assert_eq!(footprint.claim(), "cogneva-registry-pvc");
         assert_eq!(footprint.endpoint(), "reg:5000");
 
-        // An empty endpoint falls back to the service name the deployer pushes to.
-        let (some, _) = from_env("", "cogneva", Some("claim"));
-        assert_eq!(
-            some.unwrap().endpoint(),
-            "cogneva-registry.cogneva.svc.cluster.local:5000"
-        );
+        // An empty endpoint is a missing declaration, not a cue to compose one:
+        // a guessed address reaches another store, and that looks exactly like a
+        // store with nothing in it.
+        let (none, problems) = from_env("  ", Some("claim"));
+        assert!(none.is_none());
+        assert_eq!(problems.len(), 1, "{problems:?}");
 
         // An endpoint that is not host:port would fail every walk; saying so now
         // is the difference between a broken declaration and an unfilled one.
-        let (none, problems) = from_env("https://reg/", "cogneva", Some("claim"));
+        let (none, problems) = from_env("https://reg/", Some("claim"));
         assert!(none.is_none());
         assert_eq!(problems.len(), 1);
     }

@@ -3208,22 +3208,23 @@ impl MainlineDeployer {
     }
 
     /// buildah 在 Pod 内 push/from 的端点（集群 DNS，http）。
+    ///
+    /// 只回声明值：`apply_env_with` 在启用部署器时就要求它非空，这里不再拼兜底地址
+    /// ——拼出来的那份不会跟着 `clusterRegistry.port` 走。
     fn push_endpoint(&self) -> String {
-        if self.cfg.registry.trim().is_empty() {
-            crate::registry_endpoint::in_cluster(&self.cfg.namespace)
-        } else {
-            self.cfg.registry.trim_end_matches('/').to_string()
-        }
+        self.cfg.registry.trim().trim_end_matches('/').to_string()
     }
 
     /// kubelet 在节点上 pull 的镜像引用端点（NodePort localhost；节点不解析
     /// 集群 DNS）。Job manifest 镜像与 set image 引用必须用这个端点。
+    ///
+    /// 与 `push_endpoint` 同一处置：只回声明值，NodePort 由部署面给出。
     fn pull_endpoint(&self) -> String {
-        if self.cfg.local_registry.trim().is_empty() {
-            "localhost:30500".to_string()
-        } else {
-            self.cfg.local_registry.trim_end_matches('/').to_string()
-        }
+        self.cfg
+            .local_registry
+            .trim()
+            .trim_end_matches('/')
+            .to_string()
     }
 
     /// 四个 deployment 当前在跑的镜像（按 cfg.targets 顺序）。

@@ -583,6 +583,7 @@ pub struct GitOpsConfig {
     pub registry: Option<String>,
     /// 集群内 registry 的节点侧 pull 引用（拉取端 set image 用）：
     /// kubelet/containerd 在节点上经 localhost NodePort pull，http 免 TLS。
+    /// 由部署面声明（`COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY`），代码不给默认值。
     pub local_registry: String,
     /// 拉取端工作目录（checkout / 构建）。
     pub work_dir: String,
@@ -618,7 +619,7 @@ impl Default for GitOpsConfig {
             branch: "evolution-release".into(),
             poll_interval_secs: 120,
             registry: None,
-            local_registry: "localhost:30500".into(),
+            local_registry: String::new(),
             work_dir: "/opt/cogneva/gitops".into(),
             kubectl_bin: "kubectl".into(),
             builder_bin: "buildah".into(),
@@ -718,10 +719,16 @@ pub struct MainlineDeployerConfig {
     pub upstream_fetch_timeout_secs: u64,
     /// buildah 在进化 Pod 内 push/from 的 registry 端点（集群 DNS，http）：
     /// Pod 内可解析 svc 名，配合 --tls-verify=false。
+    ///
+    /// 由部署面声明（`COGNEVA_MAINLINE_DEPLOYER_REGISTRY`），代码不给默认值：拼一个
+    /// 兜底地址等于把 `clusterRegistry.port` 抄成第二份，改 values 时它留在旧端口上。
+    /// 启用部署器却没声明，`apply_env_with` 直接报错。
     pub registry: String,
     /// kubelet 在节点上 pull 镜像的引用端点（NodePort localhost，http 免 TLS）：
     /// 节点 containerd 不解析集群 DNS，Job manifest 与 set image 的镜像引用
     /// 必须用这个端点；与 registry 指向同一个 registry 的两条访问路径。
+    ///
+    /// 与 `registry` 同一处置：由 `COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY` 声明。
     pub local_registry: String,
     pub namespace: String,
     pub builder_bin: String,
@@ -826,8 +833,8 @@ impl Default for MainlineDeployerConfig {
             upstreams: Vec::new(),
             git_proxy_base: String::new(),
             upstream_fetch_timeout_secs: 300,
-            registry: crate::registry_endpoint::in_cluster("cogneva"),
-            local_registry: "localhost:30500".into(),
+            registry: String::new(),
+            local_registry: String::new(),
             namespace: "cogneva".into(),
             builder_bin: "buildah".into(),
             kubectl_bin: "kubectl".into(),
@@ -1178,6 +1185,26 @@ impl MainlineDeployerConfig {
                 "COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_COOLDOWN_SECS",
                 &v,
             )?;
+        }
+        // 启用部署器就必须知道往哪推、节点从哪拉。两条端点都是部署面的事实
+        // （chart 从 clusterRegistry.port / nodePort 渲染），代码里没有默认值可退：
+        // 缺一条时拒绝启动，比推到 `/{repo}:{tag}` 这种不合法引用上、或推到猜出来
+        // 的旧端口上，都要早一步说清楚。
+        if self.enabled {
+            for (key, value) in [
+                ("COGNEVA_MAINLINE_DEPLOYER_REGISTRY", &self.registry),
+                (
+                    "COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY",
+                    &self.local_registry,
+                ),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(SFError::Config(format!(
+                        "{key} 没声明：部署器已启用，registry 端点由部署面给出，\
+                         代码不拼集群内地址"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -1548,6 +1575,7 @@ mod tests {
             &path,
             r#"{"self_evolution": {"mainline_deployer": {
                 "enabled": true, "poll_interval_secs": 42,
+                "registry": "reg.local:5000", "local_registry": "localhost:30500",
                 "targets": [{"deployment": "d1", "container": "c1", "component": "gateway", "name": "cogneva"}]
             }}}"#,
         )
@@ -1563,6 +1591,10 @@ mod tests {
             ("COGNEVA_MAINLINE_DEPLOYER_ENABLED", "true"),
             ("COGNEVA_MAINLINE_DEPLOYER_POLL_INTERVAL_SECS", "30"),
             ("COGNEVA_MAINLINE_DEPLOYER_REGISTRY", "reg.local:5000"),
+            (
+                "COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY",
+                "localhost:30500",
+            ),
             ("COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS", "1"),
             ("COGNEVA_MAINLINE_DEPLOYER_HEARTBEAT_LOG_SECS", "120"),
         ]
@@ -1585,6 +1617,30 @@ mod tests {
         assert!(cfg
             .apply_env_with(|k| bad.get(k).map(|s| s.to_string()))
             .is_err());
+    }
+
+    #[test]
+    fn an_enabled_deployer_without_a_declared_registry_refuses_to_start() {
+        let env: HashMap<&str, &str> = [
+            ("COGNEVA_MAINLINE_DEPLOYER_ENABLED", "true"),
+            ("COGNEVA_MAINLINE_DEPLOYER_REGISTRY", "reg.local:5000"),
+        ]
+        .into_iter()
+        .collect();
+        let mut cfg = MainlineDeployerConfig::default();
+        let err = cfg
+            .apply_env_with(|k| env.get(k).map(|s| s.to_string()))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY"),
+            "缺的那条要点名，否则部署器跑起来才在拉镜像时现形：{err}"
+        );
+
+        // 停用的部署器不需要端点：没声明不等于错，只等于这条路径不跑。
+        let mut cfg = MainlineDeployerConfig::default();
+        cfg.apply_env_with(|_| None).unwrap();
+        assert!(cfg.registry.is_empty());
     }
 
     #[test]

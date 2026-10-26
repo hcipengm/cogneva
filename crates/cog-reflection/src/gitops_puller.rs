@@ -1098,9 +1098,19 @@ impl GitOpsPuller {
     /// 分发），镜像由推送端 buildah push 就位，pull 秒级。
     async fn obtain_image(&self, candidate: &PromotionCandidate) -> SFResult<String> {
         let tag = format!("cogneva:promote-{}", sanitize(&candidate.change_id));
+        // 集群内形态只回声明值：NodePort 由部署面给出（`clusterRegistry.nodePort`），
+        // 代码里没有默认值可退——猜一个端口拉到的是一条永远不 Ready 的引用。
         let endpoint = match &self.config.registry {
-            Some(registry) => registry.trim_end_matches('/'),
-            None => self.config.local_registry.trim_end_matches('/'),
+            Some(registry) if !registry.trim().is_empty() => {
+                registry.trim().trim_end_matches('/').to_string()
+            }
+            _ => crate::registry_endpoint::declared_local().ok_or_else(|| {
+                SFError::Config(
+                    "没有声明节点侧 registry 端点（COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY）：\
+                     镜像引用要用的 NodePort 由部署面给出，代码不拼"
+                        .into(),
+                )
+            })?,
         };
         Ok(format!("{endpoint}/{tag}"))
     }
@@ -2861,6 +2871,7 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
     /// 端到端（git 层）：publisher 推、puller 拉，候选解析正确。
     #[tokio::test]
     async fn puller_discovers_published_candidate() {
+        crate::test_support::declare_cluster_registry();
         let central = tempfile::tempdir().unwrap();
         git(central.path(), &["init", "--bare"]).await;
 

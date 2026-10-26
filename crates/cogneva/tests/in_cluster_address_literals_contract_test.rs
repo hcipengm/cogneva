@@ -30,16 +30,14 @@ use std::path::{Path, PathBuf};
 /// The register this census is read against.
 const REGISTER: &str = "crates/cogneva/tests/data/in-cluster-address-literals.tsv";
 
-/// How many registered literals the code may carry. Zero: the last one, the
-/// `base_image` default in `cog-core`, was removed rather than registered --
-/// the reason it carried ("the chart overrides it") turned out to name an
-/// environment variable nothing in `deploy/` sets, so it was the only source.
-/// `ImageRollout` now refuses before it writes a Containerfile.
+/// How many registered literals the code may carry. Zero, and nothing is
+/// exempt: the two that used to live here are gone rather than registered.
+/// The `base_image` default in `cog-core` claimed the chart overrode it, and
+/// the variable it named is set nowhere -- so it was the only source, and
+/// `ImageRollout` now refuses before it writes a Containerfile. The registry
+/// convention that had a home in `cog-reflection` was a fifth copy of
+/// `clusterRegistry.port`; the endpoint is now read from the declaration too.
 const DEBT_CEILING: usize = 0;
-
-/// The one file allowed to name the in-cluster registry without registering:
-/// it *is* the convention, and a convention with copies is not one.
-const CONVENTION_HOME: &str = "crates/cog-reflection/src/registry_endpoint.rs";
 
 /// The suffix every cluster-DNS address ends with before its port.
 const SUFFIX: &str = ".svc.cluster.local";
@@ -216,9 +214,6 @@ fn every_cluster_address_in_the_code_is_a_registered_decision() {
 
     let mut unregistered = Vec::new();
     for hit in &found {
-        if hit.file == CONVENTION_HOME {
-            continue;
-        }
         if !registered.contains(&(hit.file.clone(), hit.address.clone())) {
             unregistered.push(hit);
         }

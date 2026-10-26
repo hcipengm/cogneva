@@ -216,7 +216,13 @@ impl GitOpsPublisher {
         let (endpoint, insecure) = match &self.config.registry {
             Some(ext) => (ext.trim_end_matches('/').to_string(), false),
             None => (
-                crate::registry_endpoint::in_cluster(&self.config.namespace),
+                crate::registry_endpoint::declared().ok_or_else(|| {
+                    SFError::Config(
+                        "没有声明集群内 registry 端点（COGNEVA_MAINLINE_DEPLOYER_REGISTRY）：\
+                         晋级镜像推到哪里由部署面决定，代码不拼集群内地址"
+                            .into(),
+                    )
+                })?,
                 true,
             ),
         };
@@ -437,6 +443,7 @@ mod tests {
     }
 
     async fn setup_repo() -> (tempfile::TempDir, tempfile::TempDir) {
+        crate::test_support::declare_cluster_registry();
         let central = tempfile::tempdir().unwrap();
         git(central.path(), &["init", "--bare"]).await;
 
@@ -466,6 +473,7 @@ mod tests {
     /// L1 发布者：staged 二进制 + 假构建器齐备。kubectl 指向不存在的路径，
     /// 金丝雀基底解析必然回退 :local（测试不碰真实集群）。
     fn l1_publisher(central: &std::path::Path, work: &std::path::Path) -> GitOpsPublisher {
+        crate::test_support::declare_cluster_registry();
         std::fs::write(work.join("cogneva"), b"staged-binary").unwrap();
         let builder = make_fake_builder(work);
         GitOpsPublisher::new(
@@ -586,14 +594,11 @@ mod tests {
         // overlay 基镜像必须是正式 cogneva 镜像（不是 debian 裸基底），
         // 缺省（无外部 registry）推集群内 registry 且走 http。
         let cf = std::fs::read_to_string(work.path().join("Containerfile.promote")).unwrap();
-        assert!(
-            cf.contains("FROM cogneva-registry.cogneva.svc.cluster.local:5000/cogneva:local"),
-            "{cf}"
-        );
+        assert!(cf.contains("FROM registry.test:5000/cogneva:local"), "{cf}");
         assert!(cf.contains("COPY cogneva /opt/cogneva/cogneva"));
         let calls = std::fs::read_to_string(work.path().join("builder.log")).unwrap();
         assert!(
-            calls.contains("cogneva-registry.cogneva.svc.cluster.local:5000/cogneva:promote-p-1"),
+            calls.contains("registry.test:5000/cogneva:promote-p-1"),
             "{calls}"
         );
         assert!(calls.contains("--tls-verify=false"), "{calls}");
@@ -682,9 +687,7 @@ mod tests {
 
         let cf = std::fs::read_to_string(work.path().join("Containerfile.promote")).unwrap();
         assert!(
-            cf.contains(
-                "FROM cogneva-registry.cogneva.svc.cluster.local:5000/cogneva:main-abcdef012345"
-            ),
+            cf.contains("FROM registry.test:5000/cogneva:main-abcdef012345"),
             "canary base must follow deployed main tag: {cf}"
         );
 
@@ -733,7 +736,7 @@ mod tests {
 
         let cf = std::fs::read_to_string(work.path().join("Containerfile.promote")).unwrap();
         assert!(
-            cf.contains("FROM cogneva-registry.cogneva.svc.cluster.local:5000/cogneva:local"),
+            cf.contains("FROM registry.test:5000/cogneva:local"),
             "一个名字读不出来时必须退回浮动 tag：{cf}"
         );
         assert!(

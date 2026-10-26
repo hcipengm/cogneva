@@ -41,6 +41,25 @@ pub fn write_executable(dir: &Path, name: &str, script: &str) -> PathBuf {
     path
 }
 
+/// Declare the in-cluster registry endpoints for a test process.
+///
+/// These two are deployment facts (`clusterRegistry.port` / `nodePort`, rendered
+/// by the chart); the code reads them and refuses to compose a guess. Tests that
+/// exercise a path reaching a registry therefore have to declare them — every
+/// caller writes the same pair, so parallel tests overwrite each other with
+/// identical bytes and the value is not a race.
+pub fn declare_cluster_registry() {
+    // Deliberately not the cluster's own names: a fixture that spells out
+    // `*.svc.cluster.local` is a specimen of a deployment fact, and the census
+    // that keeps those out of the crates would have to carve an exemption for
+    // it. `registry.test` is obviously a fixture to a human reader too.
+    std::env::set_var("COGNEVA_MAINLINE_DEPLOYER_REGISTRY", "registry.test:5000");
+    std::env::set_var(
+        "COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY",
+        "localhost:30500",
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

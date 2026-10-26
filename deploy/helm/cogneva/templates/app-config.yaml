@@ -192,8 +192,8 @@ data:
   # localhost:30500 滚动四部署。回滚目标由 Job 启动时快照，不在此配置。
   COGNEVA_MAINLINE_DEPLOYER_ENABLED: "true"
   COGNEVA_MAINLINE_DEPLOYER_POLL_INTERVAL_SECS: {{ .Values.mainlineDeployer.pollIntervalSecs | int | quote }}
-  COGNEVA_MAINLINE_DEPLOYER_REGISTRY: {{ printf "cogneva-registry.%s.svc.cluster.local:%d" (include "cogneva.namespace" .) (int .Values.clusterRegistry.port) | quote }}
-  COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY: {{ printf "localhost:%d" (int .Values.clusterRegistry.nodePort) | quote }}
+  # 两条 registry 端点（Service DNS / 节点 NodePort）在共用的 cogneva-config 里：
+  # 拉取端在主应用 Pod，推给进化 Pod 的一份够不着它。
   COGNEVA_MAINLINE_DEPLOYER_NAMESPACE: {{ include "cogneva.namespace" . | quote }}
   COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS: {{ .Values.mainlineDeployer.soakSecs | int | quote }}
   COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS: {{ .Values.mainlineDeployer.failureCooldownSecs | int | quote }}
