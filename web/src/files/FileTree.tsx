@@ -12,8 +12,10 @@ import {
   getWorkspaceTree,
   renameWorkspaceEntry,
   uploadWorkspaceFile,
+  type FileSource,
   type WorkspaceEntry,
 } from '@/api/client';
+import { SOURCE_HINT, SOURCE_LABEL, fileTabId, parseFileTab } from '@/files/source';
 import { Icon } from '@/shell/icons';
 import { useShell } from '@/shell/store';
 
@@ -31,6 +33,12 @@ import { useShell } from '@/shell/store';
  * 刷新出新的样子，要么把失败原文贴出来——静默失败在这里等于「我的文件去哪了」。
  */
 export function FileTree() {
+  /**
+   * 看哪一棵树。切换时把已列出来的那几层清掉：两棵树的同一个相对路径是两份不同
+   * 的字节，留着上一棵的缓存会把项目里的 `src/` 画成工作区里的 `src/`。
+   */
+  const [source, setSource] = useState<FileSource>('workspace');
+  const readOnly = source === 'project';
   const [children, setChildren] = useState<Record<string, WorkspaceEntry[]>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({ '': true });
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -51,10 +59,10 @@ export function FileTree() {
     [appendOutput]
   );
 
-  const load = useCallback(async (path: string) => {
+  const load = useCallback(async (path: string, from: FileSource) => {
     setLoading((prev) => ({ ...prev, [path]: true }));
     try {
-      const page = await getWorkspaceTree(path);
+      const page = await getWorkspaceTree(path, from);
       setChildren((prev) => ({ ...prev, [path]: page.entries }));
       setTruncated((prev) => ({ ...prev, [path]: page.truncated }));
       setErrors((prev) => {
@@ -72,8 +80,16 @@ export function FileTree() {
   }, []);
 
   useEffect(() => {
-    void load('');
-  }, [load]);
+    void load('', source);
+  }, [load, source]);
+
+  // 换树就换干净：上一棵列出来的那几层属于另一份字节。
+  useEffect(() => {
+    setChildren({});
+    setExpanded({ '': true });
+    setErrors({});
+    setTruncated({});
+  }, [source]);
 
   const reload = useCallback(
     (path: string) => {
@@ -82,9 +98,9 @@ export function FileTree() {
         delete next[path];
         return next;
       });
-      void load(path);
+      void load(path, source);
     },
-    [load]
+    [load, source]
   );
 
   const refreshAll = () => {
@@ -92,7 +108,7 @@ export function FileTree() {
     setExpanded({ '': true });
     setErrors({});
     setTruncated({});
-    void load('');
+    void load('', source);
   };
 
   const toggle = (entry: WorkspaceEntry) => {
@@ -100,13 +116,13 @@ export function FileTree() {
     const open = !expanded[path];
     setExpanded((prev) => ({ ...prev, [path]: open }));
     if (open && children[path] === undefined && !loading[path]) {
-      void load(path);
+      void load(path, source);
     }
   };
 
   const openFile = (entry: WorkspaceEntry) => {
     openTab({
-      id: `file:${entry.path}`,
+      id: fileTabId(source, entry.path),
       title: entry.name,
       view: 'files',
       hint: entry.path,
@@ -214,7 +230,7 @@ export function FileTree() {
       );
     } else {
       for (const entry of entries) {
-        const active = activeTabId === `file:${entry.path}`;
+        const active = activeTabId === fileTabId(source, entry.path);
         const isOpen = !!expanded[entry.path];
         items.push(
           <div
@@ -248,26 +264,28 @@ export function FileTree() {
               style={{ color: entry.dir ? 'var(--brass)' : 'var(--muted)' }}
             />
             <span className="truncate">{entry.name}</span>
-            <span className="ml-auto hidden shrink-0 items-center gap-1 group-hover:flex">
-              <InlineAction
-                title="改名 / 移动"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  void rename(entry);
-                }}
-              >
-                <span className="mono text-[10px]">改</span>
-              </InlineAction>
-              <InlineAction
-                title="删除"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  void remove(entry);
-                }}
-              >
-                <Icon name="close" size={10} />
-              </InlineAction>
-            </span>
+            {!readOnly && (
+              <span className="ml-auto hidden shrink-0 items-center gap-1 group-hover:flex">
+                <InlineAction
+                  title="改名 / 移动"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void rename(entry);
+                  }}
+                >
+                  <span className="mono text-[10px]">改</span>
+                </InlineAction>
+                <InlineAction
+                  title="删除"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void remove(entry);
+                  }}
+                >
+                  <Icon name="close" size={10} />
+                </InlineAction>
+              </span>
+            )}
           </div>
         );
         if (entry.dir && isOpen) {
@@ -293,18 +311,49 @@ export function FileTree() {
   return (
     <section className="pb-2">
       <div className="flex items-center px-3 py-1.5">
-        <h2 className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">工作区</h2>
+        <h2 className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">文件</h2>
         <span className="ml-auto flex items-center gap-1">
-          <IconButton title="新建目录" onClick={() => void newFolder()} disabled={busy}>
-            <Icon name="plus" size={12} />
-          </IconButton>
-          <IconButton title="上传文件到根目录" onClick={() => uploadRef.current?.click()} disabled={busy}>
-            <Icon name="save" size={12} />
-          </IconButton>
+          {!readOnly && (
+            <>
+              <IconButton title="新建目录" onClick={() => void newFolder()} disabled={busy}>
+                <Icon name="plus" size={12} />
+              </IconButton>
+              <IconButton
+                title="上传文件到根目录"
+                onClick={() => uploadRef.current?.click()}
+                disabled={busy}
+              >
+                <Icon name="save" size={12} />
+              </IconButton>
+            </>
+          )}
           <IconButton title="重新读取" onClick={refreshAll} disabled={busy}>
             <Icon name="refresh" size={12} />
           </IconButton>
         </span>
+      </div>
+      <div className="flex items-center gap-1 px-3 pb-1.5" role="tablist" aria-label="文件来源">
+        {(['workspace', 'project'] as const).map((option) => {
+          const active = option === source;
+          return (
+            <button
+              key={option}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              title={SOURCE_HINT[option]}
+              onClick={() => setSource(option)}
+              className="border px-2 py-0.5 text-[11px] transition-colors"
+              style={{
+                borderColor: active ? 'var(--brass)' : 'var(--line)',
+                color: active ? 'var(--paper)' : 'var(--muted)',
+                background: active ? 'var(--ink-700)' : 'transparent',
+              }}
+            >
+              {SOURCE_LABEL[option]}
+            </button>
+          );
+        })}
       </div>
       <input
         ref={uploadRef}
@@ -365,7 +414,7 @@ function InlineAction({
   );
 }
 
-/** 页签 id 形如 `file:<路径>`；不是文件页时返回空串。 */
+/** 页签 id 形如 `file:<路径>` 或 `file@project:<路径>`；不是文件页时返回空串。 */
 function activePathOf(tabId: string): string {
-  return tabId.startsWith('file:') ? tabId.slice('file:'.length) : '';
+  return parseFileTab(tabId)?.path ?? '';
 }

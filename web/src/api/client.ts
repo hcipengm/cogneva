@@ -1960,12 +1960,36 @@ export async function getDeployments(): Promise<DeploymentsReport> {
   return api.get<DeploymentsReport>('/api/v1/cluster/deployments');
 }
 
-export async function getWorkspaceTree(path = ''): Promise<WorkspaceTree> {
-  return api.get<WorkspaceTree>(`/api/v1/ide/tree?path=${encodeURIComponent(path)}`);
+/**
+ * 文件面的两个根。
+ *
+ * `workspace` 是读者自己的可写目录；`project` 是这个部署正在演化的那份源码，
+ * 只读。分开是因为它们答的是两个不同的问题：「我的东西放哪」与「这棵树现在长
+ * 什么样、某个实现怎么写的」。一个只有新建的编辑器答不了第二个，而第二棵树的
+ * 字节由部署器与智能体改，一条网页里的保存会绕过这两条路。
+ */
+export type FileSource = 'workspace' | 'project';
+
+function sourceQuery(source: FileSource): string {
+  return source === 'workspace' ? '' : `&source=${source}`;
 }
 
-export async function getWorkspaceFile(path: string): Promise<WorkspaceFile> {
-  return api.get<WorkspaceFile>(`/api/v1/ide/file?path=${encodeURIComponent(path)}`);
+export async function getWorkspaceTree(
+  path = '',
+  source: FileSource = 'workspace'
+): Promise<WorkspaceTree> {
+  return api.get<WorkspaceTree>(
+    `/api/v1/ide/tree?path=${encodeURIComponent(path)}${sourceQuery(source)}`
+  );
+}
+
+export async function getWorkspaceFile(
+  path: string,
+  source: FileSource = 'workspace'
+): Promise<WorkspaceFile> {
+  return api.get<WorkspaceFile>(
+    `/api/v1/ide/file?path=${encodeURIComponent(path)}${sourceQuery(source)}`
+  );
 }
 
 /**
@@ -2030,8 +2054,13 @@ export async function getWorkspaceFileBytes(path: string): Promise<ArrayBuffer> 
   return blob.arrayBuffer();
 }
 
-export async function downloadWorkspaceFile(path: string): Promise<void> {
-  const blob = await api.getBytes(`/api/v1/ide/raw?path=${encodeURIComponent(path)}`);
+export async function downloadWorkspaceFile(
+  path: string,
+  source: FileSource = 'workspace'
+): Promise<void> {
+  const blob = await api.getBytes(
+    `/api/v1/ide/raw?path=${encodeURIComponent(path)}${sourceQuery(source)}`
+  );
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
   anchor.href = url;

@@ -3,6 +3,7 @@ import {
   downloadWorkspaceFile,
   getWorkspaceFile,
   saveWorkspaceFile,
+  type FileSource,
   type WorkspaceFile,
 } from '@/api/client';
 import { CodeEditor } from '@/files/CodeEditor';
@@ -12,6 +13,7 @@ import { Html } from '@/files/preview/Html';
 import { KIND_LABEL, needsBytes, previewKindOf } from '@/files/preview/kind';
 import { Markdown } from '@/files/preview/Markdown';
 import { Tex } from '@/files/preview/Tex';
+import { SOURCE_HINT, SOURCE_LABEL, parseFileTab } from '@/files/source';
 import { useDrafts } from '@/files/store';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
@@ -36,9 +38,11 @@ export function FilesView() {
   const openTab = useShell((s) => s.openTab);
 
   const active = tabs.find((tab) => tab.id === activeTabId);
-  const path = active && active.view === 'files' && active.id.startsWith('file:')
-    ? active.id.slice('file:'.length)
-    : null;
+  const opened = active && active.view === 'files' ? parseFileTab(active.id) : null;
+  const path = opened?.path ?? null;
+  /** 项目面只读：它的字节由部署器建镜像、由智能体改，一条网页里的保存会绕过这两条路。 */
+  const source = opened?.source ?? 'workspace';
+  const readOnly = source === 'project';
 
   const reveal = useShell((s) => s.reveal);
   const setReveal = useShell((s) => s.setReveal);
@@ -71,11 +75,11 @@ export function FilesView() {
    */
   const [preview, setPreview] = useState(true);
 
-  const load = useCallback(async (target: string) => {
+  const load = useCallback(async (target: string, from: FileSource) => {
     setLoading(true);
     setError(null);
     try {
-      const page = await getWorkspaceFile(target);
+      const page = await getWorkspaceFile(target, from);
       setFile(page);
       // 重读之后手里的底稿就是盘上这一份：冲突已经处理过，条子该收了。
       setConflict(null);
@@ -91,14 +95,14 @@ export function FilesView() {
     if (!path) return;
     setFile(null);
     setPreview(true);
-    void load(path);
-  }, [path, load]);
+    void load(path, source);
+  }, [path, source, load]);
 
   // 盘上这个文件被别处改过——另一个面保存、一次提交、一次外部写——就落在 ide 前缀
   // 下。不订这一族的话，别人改完之后这一页要关掉重开才看得见新内容，而「刚才那笔
   // 提交改了什么」正是这一页要答的问题。
   useKindTickedRefresh([resourceKey('ide')], () => {
-    if (path) void load(path);
+    if (path) void load(path, source);
   });
 
   const kind = path ? previewKindOf(path) : 'text';
@@ -134,7 +138,7 @@ export function FilesView() {
    */
   const save = useCallback(
     async (force = false) => {
-      if (!path || !dirty || saving) return;
+      if (!path || !dirty || saving || readOnly) return;
       setSaving(true);
       try {
         const saved = await saveWorkspaceFile(path, text, force ? null : file?.hash);
@@ -157,7 +161,7 @@ export function FilesView() {
         setSaving(false);
       }
     },
-    [path, dirty, saving, text, file, clearDraft, appendOutput]
+    [path, dirty, saving, readOnly, text, file, clearDraft, appendOutput]
   );
 
   /**
@@ -252,10 +256,21 @@ export function FilesView() {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <header className="flex shrink-0 items-center gap-3 border-b border-[var(--line)] px-4 py-2">
+        <span
+          title={SOURCE_HINT[source]}
+          className="shrink-0 border px-1.5 py-0.5 text-[10px]"
+          style={{
+            borderColor: readOnly ? 'var(--warn)' : 'var(--line)',
+            color: readOnly ? 'var(--warn)' : 'var(--muted)',
+          }}
+        >
+          {SOURCE_LABEL[source]}
+          {readOnly ? ' · 只读' : ''}
+        </span>
         <h1 className="mono text-[13px] font-medium tracking-tight" title={path}>
           {path}
         </h1>
-        {dirty && (
+        {dirty && !readOnly && (
           <span className="text-[10px] uppercase tracking-[0.14em]" style={{ color: 'var(--warn)' }}>
             未保存
           </span>
@@ -289,11 +304,13 @@ export function FilesView() {
           )}
           <Button onClick={() => setFindOpen((open) => !open)}>查找 ⌘F</Button>
           <Button onClick={() => setGotoOpen((open) => !open)}>跳到行 ⌘G</Button>
-          <Button onClick={() => void downloadWorkspaceFile(path)}>下载</Button>
-          <Button onClick={() => void load(path)}>重读</Button>
-          <Button onClick={() => void save()} tone={dirty ? 'accent' : undefined}>
-            {saving ? '保存中…' : '保存 ⌘S'}
-          </Button>
+          <Button onClick={() => void downloadWorkspaceFile(path, source)}>下载</Button>
+          <Button onClick={() => void load(path, source)}>重读</Button>
+          {!readOnly && (
+            <Button onClick={() => void save()} tone={dirty ? 'accent' : undefined}>
+              {saving ? '保存中…' : '保存 ⌘S'}
+            </Button>
+          )}
         </div>
       </header>
 
@@ -311,7 +328,7 @@ export function FilesView() {
             </Button>
             <Button
               onClick={() => {
-                if (path) void load(path);
+                if (path) void load(path, source);
                 setConflict(null);
               }}
             >
@@ -326,7 +343,7 @@ export function FilesView() {
           <ReadError
             what={path}
             error={error.message}
-            onRetry={() => void load(path)}
+            onRetry={() => void load(path, source)}
           />
         </div>
       )}
@@ -448,10 +465,12 @@ export function FilesView() {
         <CodeEditor
           path={path}
           text={text}
+          readOnly={readOnly}
           findQuery={findOpen ? findQuery : undefined}
           findIndex={findIndex}
           goto={goto}
           onChange={(next) => {
+            if (readOnly) return;
             setDraft(path, next);
           }}
         />

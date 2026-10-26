@@ -61,11 +61,45 @@ const DEFAULT_WORKSPACE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 pub struct TreeQuery {
     #[serde(default)]
     pub path: String,
+    /// 看哪一棵树：`workspace`（默认，自己的可写目录）或 `project`（这个部署正在
+    /// 演化的那份源码，只读）。两棵树的路径宇宙一样，靠这个字段分开。
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct FileQuery {
     pub path: String,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// 文件面的两个根。
+///
+/// 他们不是同一件东西的两份拷贝：工作区是**用户自己的**可写目录，跨 Pod 重启
+/// 存活、按用户隔离；项目是**这个部署正在演化的那份源码**，读者要能在里面找到
+/// 并打开已存在的文件——一个只有「新建」的编辑器，面对「这棵树长什么样、某个
+/// 实现现在怎么写的」这两个问题一个字都答不了。
+///
+/// 项目那一棵只读：它的字节由部署器建镜像、由智能体改，一条网页里的保存会绕过
+/// 这两条路。想改就改到工作区，或走变更流程。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileSource {
+    Workspace,
+    Project,
+}
+
+impl FileSource {
+    fn parse(raw: Option<&str>) -> Result<Self, ApiError> {
+        match raw.unwrap_or("workspace").trim() {
+            "" | "workspace" => Ok(Self::Workspace),
+            "project" => Ok(Self::Project),
+            other => Err(ApiError::bad_request(format!(
+                "未知的文件来源 `{other}`：可取的只有 `workspace`（自己的可写目录）与 \
+                 `project`（这个部署正在演化的源码，只读）"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -399,6 +433,259 @@ async fn read_file(path: &Path, rel: &str) -> Result<FileResponse, ApiError> {
         } else {
             Some(content_hash(&bytes))
         },
+    })
+}
+
+/// 项目源码那一棵树的仓库位置。
+///
+/// 不新开一个配置键：这个部署已经在 `COGNEVA_GITOPS_REPO_URL` 上声明了它拉取与
+/// 推送的那个仓（裸仓路径，网关按卷挂进来）。它指向一个 URL 而不是本地路径时，
+/// 这个部署的网关手里没有那份字节，项目面就明确地说「没挂进来」，而不是回一棵空
+/// 树——空树会被读成「仓库里一个文件都没有」。
+const PROJECT_REPO_ENV: &str = "COGNEVA_GITOPS_REPO_URL";
+
+fn project_repo() -> Result<PathBuf, ApiError> {
+    project_repo_from(non_empty_env(PROJECT_REPO_ENV))
+}
+
+fn project_repo_from(raw: Option<String>) -> Result<PathBuf, ApiError> {
+    let raw = raw.ok_or_else(|| {
+        ApiError::not_found(format!(
+            "这个部署没有声明项目仓库（{PROJECT_REPO_ENV}），项目源码面没有可读的字节"
+        ))
+    })?;
+    if !raw.starts_with('/') {
+        return Err(ApiError::not_found(format!(
+            "这个部署的项目仓库是 `{raw}`，不是一份挂进网关的本地仓，项目源码面读不到它"
+        )));
+    }
+    let path = PathBuf::from(&raw);
+    if !path.exists() {
+        return Err(ApiError::not_found(format!(
+            "项目仓库 `{raw}` 不在这个容器里：卷没有挂进来，项目源码面没有可读的字节"
+        )));
+    }
+    Ok(git_dir_of(&path))
+}
+
+/// 从一个仓的位置找出真正的 git 目录。
+///
+/// 部署可能挂进来的是裸仓（`HEAD`、`objects`、`refs` 就在根下），也可能是一份
+/// 检出（那下面有 `.git`）。两者都是「这个部署的仓库」，所以这里认两种形状，
+/// 而不是要求部署方改挂法——挂载方式是部署的事，不是这一面的。
+fn git_dir_of(path: &Path) -> PathBuf {
+    let dot_git = path.join(".git");
+    if dot_git.is_dir() {
+        return dot_git;
+    }
+    // 工作副本被删掉、只剩 `.git` 文件的那种形状：文件里一行 `gitdir: <路径>`。
+    if let Ok(text) = std::fs::read_to_string(&dot_git) {
+        if let Some(rest) = text.trim().strip_prefix("gitdir:") {
+            let target = PathBuf::from(rest.trim());
+            return if target.is_absolute() {
+                target
+            } else {
+                path.join(target)
+            };
+        }
+    }
+    path.to_path_buf()
+}
+
+/// 项目面看的那一版。
+///
+/// `main` 是这个平台的主线：部署器建的镜像、智能体改的树，都是它。没有 `main`
+/// 分支持时才退到 `HEAD`——那是一个还没有主线的仓（刚初始化、或者只有一条别的
+/// 分支），此时 `HEAD` 是唯一说得出的答案。
+async fn project_rev(repo: &Path) -> Result<String, ApiError> {
+    for want in ["refs/heads/main", "HEAD"] {
+        let out = git_run(repo, &["rev-parse", "--verify", "--quiet", want]).await?;
+        let rev = String::from_utf8_lossy(&out).trim().to_string();
+        if !rev.is_empty() {
+            return Ok(rev);
+        }
+    }
+    Err(ApiError::not_found(
+        "项目仓库里既没有 main 也没有 HEAD：没有可读的那一版".to_string(),
+    ))
+}
+
+/// 跑一条 git。退出码非零不在这里判成内部错误——`ls-tree` 与 `show` 对「没有这个
+/// 路径」的回答就是非零加一句 stderr，那是 404，不是 500。
+async fn git_run(repo: &Path, args: &[&str]) -> Result<Vec<u8>, ApiError> {
+    let out = tokio::process::Command::new("git")
+        .arg("--no-pager")
+        .arg(format!("--git-dir={}", repo.display()))
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| ApiError::internal(format!("cannot run git: {e}")))?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(ApiError::not_found(format!("项目仓库读不到这一条：{why}")));
+    }
+    Ok(out.stdout)
+}
+
+/// 项目面里的一个相对路径，判据与工作区那条一样：只认根之下的相对路径。
+fn project_rel(path: &str) -> Result<String, ApiError> {
+    let raw = path.trim();
+    if raw.starts_with('/') {
+        return Err(ApiError::bad_request(format!(
+            "项目源码面只认仓库里的相对路径：`{path}` 是一条绝对路径"
+        )));
+    }
+    let rel = raw.trim_end_matches('/').replace('\\', "/");
+    if rel.is_empty() {
+        return Ok(String::new());
+    }
+    for part in rel.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(ApiError::bad_request(format!(
+                "项目源码面只认仓库里的相对路径：`{path}` 里有空段、`.` 或 `..`"
+            )));
+        }
+    }
+    Ok(rel)
+}
+
+/// 列项目树的一层。
+///
+/// 走 `git ls-tree` 而不是读盘：项目面看的是**某一版**的字节，不是某个容器里的
+/// 工作副本。同一个 rev 在部署器与网关两边读出来必须一样，而工作副本是随时会被
+/// 构建写脏的东西。
+async fn read_project_tree(repo: &Path, rev: &str, rel: &str) -> Result<TreeResponse, ApiError> {
+    let target = if rel.is_empty() {
+        rev.to_string()
+    } else {
+        format!("{rev}:{rel}")
+    };
+    let out = git_run(repo, &["ls-tree", "-z", "-l", &target]).await?;
+
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    for record in out.split(|b| *b == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        if entries.len() >= MAX_TREE_ENTRIES {
+            truncated = true;
+            break;
+        }
+        // `<mode> SP <type> SP <object> SP <size> TAB <name>`；`-l` 把 size 补齐到
+        // 定宽，blob 有数字、tree 是 `-`。
+        let text = String::from_utf8_lossy(record);
+        let Some((meta, name)) = text.split_once('\t') else {
+            continue;
+        };
+        let fields: Vec<&str> = meta.split_whitespace().collect();
+        if fields.len() < 4 {
+            continue;
+        }
+        let kind = fields[1];
+        if kind == "commit" {
+            // 子模块：它的内容不在这个仓里，展开它只会回一条看不懂的错误。
+            continue;
+        }
+        let dir = kind == "tree";
+        let size = if dir {
+            0
+        } else {
+            fields[3].parse::<u64>().unwrap_or(0)
+        };
+        let child = if rel.is_empty() {
+            name.to_string()
+        } else {
+            format!("{rel}/{name}")
+        };
+        entries.push(TreeEntry {
+            path: to_response_path(&child),
+            name: name.to_string(),
+            dir,
+            size,
+            // 一条 blob 没有自己的时间：它的寿命属于写它的那些提交。这里回
+            // `None`，而不是拿仓库的 mtime 冒充每一个文件的时间。
+            modified_ms: None,
+        });
+    }
+
+    // 与工作区那一棵同一个规矩：目录在前，同类按名字。
+    entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.cmp(&b.name)));
+
+    Ok(TreeResponse {
+        path: to_response_path(rel),
+        entries,
+        truncated,
+    })
+}
+
+/// 读项目树里的一个文件，形状与工作区那一份完全一致：二进制与超限都写进响应，
+/// 不报错。`hash` 恒为 `None`——项目面只读，没有「写回时拿它当底稿」这件事。
+async fn read_project_file(repo: &Path, rev: &str, rel: &str) -> Result<FileResponse, ApiError> {
+    let spec = format!("{rev}:{rel}");
+    let size_out = git_run(repo, &["cat-file", "-s", &spec]).await?;
+    let size = String::from_utf8_lossy(&size_out)
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+
+    // 只读到编辑器用得上的那一段就停：`git show` 会把整条 blob 吐出来，而一个
+    // 几百兆的 blob 读进内存只为截前两兆，是没有理由付的代价。
+    let want = (size.min(MAX_FILE_BYTES + 1)) as usize;
+    let bytes = {
+        use tokio::io::AsyncReadExt;
+        let mut child = tokio::process::Command::new("git")
+            .arg("--no-pager")
+            .arg(format!("--git-dir={}", repo.display()))
+            .arg("show")
+            .arg(&spec)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| ApiError::internal(format!("cannot run git: {e}")))?;
+        let mut out = Vec::with_capacity(want.min(MAX_FILE_BYTES as usize));
+        if let Some(stdout) = child.stdout.as_mut() {
+            let mut buf = [0u8; 64 * 1024];
+            while out.len() < want {
+                let n = stdout
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| ApiError::internal(format!("cannot read git show: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+        }
+        // 读够了就不等它写完：剩下的字节这一页用不上。
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        out
+    };
+
+    let probe_len = bytes.len().min(BINARY_PROBE_BYTES);
+    if bytes[..probe_len].contains(&0) {
+        return Ok(FileResponse {
+            path: to_response_path(rel),
+            size,
+            binary: true,
+            truncated: false,
+            text: None,
+            modified_ms: None,
+            hash: None,
+        });
+    }
+
+    let truncated = bytes.len() as u64 > MAX_FILE_BYTES;
+    let shown = &bytes[..(bytes.len().min(MAX_FILE_BYTES as usize))];
+    Ok(FileResponse {
+        path: to_response_path(rel),
+        size,
+        binary: false,
+        truncated,
+        text: Some(String::from_utf8_lossy(shown).to_string()),
+        modified_ms: None,
+        hash: None,
     })
 }
 
@@ -814,13 +1101,47 @@ pub async fn raw_handler(
 ) -> Result<axum::response::Response, ApiError> {
     use axum::response::IntoResponse;
 
-    let root = ensure_user_root(&claims).await?;
-    let (path, bytes) = read_raw(&root, &query.path).await?;
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("download")
-        .replace('"', "");
+    let (name, bytes) = match FileSource::parse(query.source.as_deref())? {
+        FileSource::Workspace => {
+            let root = ensure_user_root(&claims).await?;
+            let (path, bytes) = read_raw(&root, &query.path).await?;
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("download")
+                .replace('"', "");
+            (name, bytes)
+        }
+        FileSource::Project => {
+            let repo = project_repo()?;
+            let rev = project_rev(&repo).await?;
+            let rel = project_rel(&query.path)?;
+            if rel.is_empty() {
+                return Err(ApiError::bad_request(
+                    "项目源码面的根是一个目录，没有可下载的文件".to_string(),
+                ));
+            }
+            // 下载是一次把整份读进内存的请求：先问大小，超了就在读之前拒。
+            let spec = format!("{rev}:{rel}");
+            let size_out = git_run(&repo, &["cat-file", "-s", &spec]).await?;
+            let size = String::from_utf8_lossy(&size_out)
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(0);
+            if size > TRANSFER_MAX_BYTES as u64 {
+                return Err(ApiError::bad_request(format!(
+                    "{rel} 有 {size} 字节，超过一次搬运的上限 {TRANSFER_MAX_BYTES} 字节"
+                )));
+            }
+            let bytes = git_run(&repo, &["show", &spec]).await?;
+            let name = rel
+                .rsplit('/')
+                .next()
+                .unwrap_or("download")
+                .replace('"', "");
+            (name, bytes)
+        }
+    };
     Ok((
         [
             ("content-type", "application/octet-stream".to_string()),
@@ -895,18 +1216,43 @@ pub async fn tree_handler(
     Extension(claims): Extension<Claims>,
     Query(query): Query<TreeQuery>,
 ) -> Result<Json<TreeResponse>, ApiError> {
-    let root = ensure_user_root(&claims).await?;
-    let dir = resolve_under(&root, &query.path)?;
-    Ok(Json(read_tree(&dir, &query.path).await?))
+    match FileSource::parse(query.source.as_deref())? {
+        FileSource::Workspace => {
+            let root = ensure_user_root(&claims).await?;
+            let dir = resolve_under(&root, &query.path)?;
+            Ok(Json(read_tree(&dir, &query.path).await?))
+        }
+        FileSource::Project => {
+            let repo = project_repo()?;
+            let rev = project_rev(&repo).await?;
+            let rel = project_rel(&query.path)?;
+            Ok(Json(read_project_tree(&repo, &rev, &rel).await?))
+        }
+    }
 }
 
 pub async fn file_handler(
     Extension(claims): Extension<Claims>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<FileResponse>, ApiError> {
-    let root = ensure_user_root(&claims).await?;
-    let path = resolve_under(&root, &query.path)?;
-    Ok(Json(read_file(&path, &query.path).await?))
+    match FileSource::parse(query.source.as_deref())? {
+        FileSource::Workspace => {
+            let root = ensure_user_root(&claims).await?;
+            let path = resolve_under(&root, &query.path)?;
+            Ok(Json(read_file(&path, &query.path).await?))
+        }
+        FileSource::Project => {
+            let repo = project_repo()?;
+            let rev = project_rev(&repo).await?;
+            let rel = project_rel(&query.path)?;
+            if rel.is_empty() {
+                return Err(ApiError::bad_request(
+                    "项目源码面的根是一个目录：用 tree 接口列它".to_string(),
+                ));
+            }
+            Ok(Json(read_project_file(&repo, &rev, &rel).await?))
+        }
+    }
 }
 
 /// 读过的这一份还是不是盘上那一份。
@@ -1438,5 +1784,109 @@ mod tests {
             .expect_err("目录要单独报");
         assert_eq!(err.error, "BadRequest");
         assert!(err.message.contains("directory"));
+    }
+
+    /// 在 `root` 里跑一条 git，失败就让这条测试红。
+    async fn git_in(root: &Path, args: &[&str]) {
+        let out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .await
+            .expect("git 起得来");
+        assert!(
+            out.status.success(),
+            "git {args:?} 失败：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// 建一个最小的仓库：一条 `main`、一个目录、两份文件。
+    async fn seeded_repo() -> tempfile::TempDir {
+        let dir = tempdir();
+        let root = dir.path();
+        git_in(root, &["init", "-q", "-b", "main"]).await;
+        git_in(root, &["config", "user.email", "gate@example.invalid"]).await;
+        git_in(root, &["config", "user.name", "gate"]).await;
+        tokio::fs::create_dir_all(root.join("src")).await.unwrap();
+        tokio::fs::write(root.join("src/main.rs"), "fn main() {}\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("README.md"), "# 项目\n")
+            .await
+            .unwrap();
+        git_in(root, &["add", "-A"]).await;
+        git_in(root, &["commit", "-q", "-m", "seed"]).await;
+        dir
+    }
+
+    /// 项目源码面要能列出并打开**已存在**的文件。
+    ///
+    /// 这一条在没有项目面时是红不了的——那时整个面只有一棵空的工作区树，一个
+    /// 读者看到「零文件」只会以为目录是空的。它要钉住的是三件事：树读的是仓库
+    /// 里那一版（目录在前、文件在后）、文件读得回原文、以及没挂仓的部署答的是
+    /// 「没挂进来」而不是一棵空树。
+    #[tokio::test]
+    async fn the_project_source_lists_and_opens_the_files_the_repository_has() {
+        let dir = seeded_repo().await;
+        let repo = project_repo_from(Some(dir.path().to_string_lossy().into_owned()))
+            .expect("本地路径的仓要认得");
+        let rev = project_rev(&repo).await.expect("main 要读得到真的一版");
+
+        let top = read_project_tree(&repo, &rev, "").await.expect("列根目录");
+        let names: Vec<(&str, bool)> = top
+            .entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.dir))
+            .collect();
+        assert_eq!(
+            names,
+            vec![("src", true), ("README.md", false)],
+            "根目录要列出仓库里真实的两条，且目录在前"
+        );
+
+        let inner = read_project_tree(&repo, &rev, "src")
+            .await
+            .expect("列子目录");
+        assert_eq!(inner.entries.len(), 1);
+        assert_eq!(inner.entries[0].path, "src/main.rs");
+
+        let file = read_project_file(&repo, &rev, "src/main.rs")
+            .await
+            .expect("读一个已存在的文件");
+        assert_eq!(file.text.as_deref(), Some("fn main() {}\n"));
+        assert!(!file.binary);
+        assert!(!file.truncated);
+        assert!(
+            file.hash.is_none(),
+            "项目面只读：没有「写回时拿它当底稿」这件事"
+        );
+    }
+
+    /// 没挂仓的部署要明说没挂，而不是回一棵空树：空树会被读成「仓库里一个文件
+    /// 都没有」，而这两种情况该做的下一件事完全不同。
+    #[test]
+    fn a_deployment_without_a_mounted_repository_says_so() {
+        let missing = project_repo_from(None).expect_err("没声明就没有字节");
+        assert_eq!(missing.error, "NotFound");
+        let not_a_path = project_repo_from(Some("https://example.invalid/repo.git".into()))
+            .expect_err("URL 不是挂进来的仓");
+        assert_eq!(not_a_path.error, "NotFound");
+        let no_such_dir =
+            project_repo_from(Some("/nonexistent/repo".into())).expect_err("路径不在容器里");
+        assert_eq!(no_such_dir.error, "NotFound");
+    }
+
+    /// 项目面的路径判据：只认仓库里的相对路径。
+    #[test]
+    fn project_paths_stay_relative_to_the_repository() {
+        assert_eq!(project_rel("").unwrap(), "");
+        assert_eq!(project_rel("crates/a.rs").unwrap(), "crates/a.rs");
+        assert_eq!(project_rel("crates/").unwrap(), "crates");
+        for bad in ["/etc/passwd", "../escape", "a/../../b", "a//b"] {
+            let err = project_rel(bad).expect_err(bad);
+            assert_eq!(err.error, "BadRequest", "{bad} 必须被拒绝");
+        }
     }
 }
