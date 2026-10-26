@@ -955,11 +955,12 @@ healthProbes:
     periodSeconds: 5
     timeoutSeconds: 5
     failureThreshold: 60
-  # claim-store 自己有更长的一档：它在开监听之前先把存储根与三个镜像库各走一遍
-  # （首拍不能是空的），所以启动耗时等于这台节点上那些树的规模，而不是进程起来的
-  # 时间。本机实测 3m35s（containerd 60.5 GB + podman 55 GB + buildah 11 GB，
-  # 200m 配额下），上面那档 60×5s=300s 只剩不到两成余量，而库只会随镜像拉取与
-  # 构建变大——撞破就是 CrashLoopBackOff，且每次重启都要再走一遍。600s 是实测两倍。
+  # claim-store 那一档现在只是兜底：监听先起来，首趟走查（存储根 + 三个镜像库）
+  # 跑在它后面，等待由 /health/ready 承担——走查跑完之前抓取端点不存在，
+  # 首拍同样不会是空的，但「监听还没起」不再等于「进程没起来」。这一档留着是因为
+  # 绑定本身应当是瞬时的；真撞破它说明有别的东西挡住了 bind，那确实该重启。
+  # 走查本身的耗时没变：本机实测 3m35s（containerd 60.5 GB + podman 55 GB +
+  # buildah 11 GB，200m 配额下），2026-10-26 那次 4m12s。
   claimStoreStartup:
     periodSeconds: 5
     timeoutSeconds: 5

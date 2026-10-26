@@ -10,17 +10,26 @@
 //! process cannot even list as an unprivileged user, so a mount the one needs is
 //! a privilege the other does not.
 //!
-//! Both probes answer with the health of the listener, and stay green when the
-//! root is unreadable. That is deliberate, for the same reason as the host
-//! ledger's: the pod behind them has no data plane, so a failing probe would not
-//! restart it into a working state -- the mount is either there or it is not --
-//! and an endpoint whose readiness gates it out is dropped from the target list,
-//! which removes the scrape rather than reporting the misconfiguration. A root
-//! that cannot be read is reported where readings are: the scan's age keeps
-//! growing, and a rule over that age names the node.
+//! Liveness answers as soon as the listener exists, and readiness answers once
+//! the first sweep has finished trying. Readiness is deliberately not "the
+//! readings are good": the pod behind these probes has no data plane, so a
+//! probe that failed over an unreadable root would restart it into the same
+//! failure -- the mount is either there or it is not -- and an endpoint held
+//! out of the target list removes the scrape instead of reporting the
+//! misconfiguration. What readiness waits for is only that a walk has been
+//! *attempted*; a node whose root could not be read is ready and says so
+//! through `claim_scan_readable`, and the scan's age keeps growing.
+//!
+//! The listener opens before that walk rather than after it. The walk measures
+//! this node's whole storage root and every image store it holds, which is
+//! minutes on a node with a real image history (2026-10-26: four minutes and
+//! twelve seconds), and an unbounded walk that had to finish before `bind`
+//! could not be told apart from a process that never started: the only answer
+//! the platform has for that is a restart, which begins the same walk again.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -191,18 +200,50 @@ fn parse_cadence(raw: Option<&str>, default: u64, floor: u64) -> u64 {
 struct StoreState {
     observable: Arc<ClaimStoreObservable>,
     images: Vec<Arc<ImageStoreObservable>>,
+    /// Whether the first sweep has finished *trying*. Kept out of the
+    /// observables on purpose: it is a fact about this process's start-up, not
+    /// about the node's disk, and a reading that has not been taken yet is not
+    /// a zero.
+    first_sweep: Arc<AtomicBool>,
 }
 
-async fn health() -> Response {
+fn text(status: StatusCode, body: &str) -> Response {
     Response::builder()
-        .status(StatusCode::OK)
-        .body(Body::from("ok"))
+        .status(status)
+        .body(Body::from(body.to_string()))
         .expect("static response")
+}
+
+const SWEEP_PENDING: &str =
+    "the first sweep of this node's stores is still running; readings taken now would be zeros \
+     that mean not measured rather than nothing there\n";
+
+/// The process is up and serving. This says nothing about the readings: before
+/// the first sweep they are not there yet, and that is what readiness is for.
+async fn live() -> Response {
+    text(StatusCode::OK, "ok")
+}
+
+/// Ready only once a walk has been attempted -- succeeded or not.
+async fn ready(State(state): State<StoreState>) -> Response {
+    if state.first_sweep.load(Ordering::Relaxed) {
+        text(StatusCode::OK, "ok")
+    } else {
+        text(StatusCode::SERVICE_UNAVAILABLE, SWEEP_PENDING)
+    }
 }
 
 /// The scan runs on its own cadence and this handler renders the last result, so
 /// a scrape does not pay for a walk of everything the node holds.
 async fn metrics(State(state): State<StoreState>) -> Response {
+    // Before the first sweep this process holds an empty store, and an empty
+    // store renders as zeros: a reader cannot tell "nothing is mounted here"
+    // from "this node has not looked yet". Answering nothing at all is the one
+    // answer that does not lie, and the scrape target does not exist until
+    // readiness turns, so this only reaches a reader who came looking directly.
+    if !state.first_sweep.load(Ordering::Relaxed) {
+        return text(StatusCode::SERVICE_UNAVAILABLE, SWEEP_PENDING);
+    }
     // Two walks, one endpoint: both are readings of this node's disk taken by
     // this same privileged process, and a second listener would be a second
     // scrape target to keep in the target list for no gain.
@@ -233,12 +274,17 @@ async fn metrics(State(state): State<StoreState>) -> Response {
 pub fn router(
     observable: Arc<ClaimStoreObservable>,
     images: Vec<Arc<ImageStoreObservable>>,
+    first_sweep: Arc<AtomicBool>,
 ) -> Router {
     Router::new()
-        .route("/health/live", get(health))
-        .route("/health/ready", get(health))
+        .route("/health/live", get(live))
+        .route("/health/ready", get(ready))
         .route("/metrics", get(metrics))
-        .with_state(StoreState { observable, images })
+        .with_state(StoreState {
+            observable,
+            images,
+            first_sweep,
+        })
 }
 
 /// Entry point for the `claim-store` subcommand.
@@ -259,69 +305,85 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .map(|(name, root)| Arc::new(ImageStoreObservable::new(root, node.clone(), name)))
         .collect();
-    // One scan before the listener opens: a node whose first scrape carries no
+    // The listener opens before the sweep below, not after it. The sweep walks
+    // this node's storage root and every image store on it, which is minutes
+    // once a node has a real image history, and for that whole time a listener
+    // that waited for it would answer nothing -- to a liveness probe that is
+    // indistinguishable from a process that never started, and the only answer
+    // the platform has for that is a restart, which begins the same walk again.
+    // Readiness carries the wait instead: it stays unavailable until a walk has
+    // been attempted, and the scrape target does not exist before then either.
+    let first_sweep = Arc::new(AtomicBool::new(false));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port_from_env()));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(addr = %addr, "claim store listening; the first sweep runs before readings");
+
+    // One scan before the readings open: a node whose first scrape carries no
     // claim at all is indistinguishable from a node with no claims, and the
     // process would have to be scraped for a full cadence before it said
     // anything.
-    match observable.scan_blocking().await {
-        Scan::Completed(report) => tracing::info!(
-            root = %observable.root().display(),
-            node = observable.node(),
-            dirs = report.dirs,
-            readable = report.readable,
-            skipped = report.skipped,
-            "claim store scanned the node's storage root"
-        ),
-        Scan::RootUnreadable => tracing::error!(
-            env = claim_store::ROOT_ENV,
-            node = observable.node(),
-            root = %observable.root().display(),
-            "no storage root readable; this process will serve coverage without any claim"
-        ),
-    }
-
-    // The image store is walked once before the listener opens for the same
-    // reason: a first scrape with no part in it is indistinguishable from a node
-    // whose store is empty, and the walk that would tell them apart is minutes
-    // away.
-    for images in &images {
-        match images.scan_blocking().await {
-            image_store::Scan::Completed(report) => tracing::info!(
-                store = images.name(),
-                root = %images.root().display(),
-                parts = report.parts,
+    let sweeping = Arc::clone(&observable);
+    let sweeping_images = images.clone();
+    let done = Arc::clone(&first_sweep);
+    tokio::spawn(async move {
+        match sweeping.scan_blocking().await {
+            Scan::Completed(report) => tracing::info!(
+                root = %sweeping.root().display(),
+                node = sweeping.node(),
+                dirs = report.dirs,
                 readable = report.readable,
-                files = report.files,
-                "image store walked"
+                skipped = report.skipped,
+                "claim store scanned the node's storage root"
             ),
-            image_store::Scan::RootUnreadable => tracing::error!(
-                env = image_store::ROOTS_ENV,
-                store = images.name(),
-                root = %images.root().display(),
-                "no image store root readable; this process will serve coverage without any part"
+            Scan::RootUnreadable => tracing::error!(
+                env = claim_store::ROOT_ENV,
+                node = sweeping.node(),
+                root = %sweeping.root().display(),
+                "no storage root readable; this process will serve coverage without any claim"
             ),
         }
-    }
 
-    let shutdown = ShutdownSignal::default();
-    tokio::spawn(claim_store::run_claim_store_scan(
-        Arc::clone(&observable),
-        interval_from_env(),
-        shutdown.clone(),
-    ));
-    tokio::spawn(image_store::run_image_store_scan(
-        images.iter().map(Arc::clone).collect(),
-        image_interval_from_env(),
-        shutdown,
-    ));
+        // The image store is walked once for the same reason: a first scrape
+        // with no part in it is indistinguishable from a node whose store is
+        // empty, and the walk that would tell them apart is minutes away.
+        for store in &sweeping_images {
+            match store.scan_blocking().await {
+                image_store::Scan::Completed(report) => tracing::info!(
+                    store = store.name(),
+                    root = %store.root().display(),
+                    parts = report.parts,
+                    readable = report.readable,
+                    files = report.files,
+                    "image store walked"
+                ),
+                image_store::Scan::RootUnreadable => tracing::error!(
+                    env = image_store::ROOTS_ENV,
+                    store = store.name(),
+                    root = %store.root().display(),
+                    "no image store root readable; this process will serve coverage without any part"
+                ),
+            }
+        }
+        // Every store has been walked, readable or not. That is what readiness
+        // was waiting for: the readings that follow are measurements, and a
+        // node whose root could not be read says so through its coverage
+        // series rather than by withholding the target.
+        done.store(true, Ordering::Relaxed);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port_from_env()));
-    tracing::info!(addr = %addr, "claim store listening");
-    axum::serve(
-        tokio::net::TcpListener::bind(addr).await?,
-        router(observable, images),
-    )
-    .await?;
+        let shutdown = ShutdownSignal::default();
+        tokio::spawn(claim_store::run_claim_store_scan(
+            Arc::clone(&sweeping),
+            interval_from_env(),
+            shutdown.clone(),
+        ));
+        tokio::spawn(image_store::run_image_store_scan(
+            sweeping_images.iter().map(Arc::clone).collect(),
+            image_interval_from_env(),
+            shutdown,
+        ));
+    });
+
+    axum::serve(listener, router(observable, images, first_sweep)).await?;
     Ok(())
 }
 
@@ -356,6 +418,16 @@ mod tests {
             "node-a",
             image_store::DEFAULT_STORE,
         ))]
+    }
+
+    /// A router whose first sweep has already finished -- the state every
+    /// reading below is taken in, and the one `run_from_env` reaches once its
+    /// own walk is done.
+    fn served(
+        observable: Arc<ClaimStoreObservable>,
+        images: Vec<Arc<ImageStoreObservable>>,
+    ) -> Router {
+        router(observable, images, Arc::new(AtomicBool::new(true)))
     }
 
     async fn scrape(app: Router, path: &str) -> (StatusCode, String) {
@@ -471,7 +543,7 @@ mod tests {
 
         let observable = Arc::new(ClaimStoreObservable::new(&root, "node-a"));
         observable.scan();
-        let app = router(observable, empty_images());
+        let app = served(observable, empty_images());
 
         let (status, body) = scrape(app, "/metrics").await;
         assert_eq!(status, StatusCode::OK);
@@ -518,7 +590,7 @@ mod tests {
             image_store::DEFAULT_STORE,
         ));
         images.scan();
-        let app = router(observable, vec![images]);
+        let app = served(observable, vec![images]);
 
         let (status, body) = scrape(app, "/metrics").await;
         assert_eq!(status, StatusCode::OK);
@@ -532,6 +604,49 @@ mod tests {
         }
     }
 
+    /// Before the first sweep the listener is up and nothing else is. Liveness
+    /// has to answer there: the walk takes minutes on a node with a real image
+    /// history, and a listener that waited for it looked exactly like a process
+    /// that never started -- which the platform answers with a restart, and a
+    /// restart begins the same walk. Readiness and the readings carry the wait
+    /// instead, because an empty store renders as zeros, which a reader cannot
+    /// tell from "nothing is mounted here".
+    #[tokio::test]
+    async fn liveness_answers_before_the_first_sweep_while_readings_wait_for_it() {
+        let root = scratch("before-first-sweep");
+        let first_sweep = Arc::new(AtomicBool::new(false));
+        let app = router(
+            Arc::new(ClaimStoreObservable::new(&root, "node-a")),
+            empty_images(),
+            Arc::clone(&first_sweep),
+        );
+
+        let (status, body) = scrape(app.clone(), "/health/live").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "liveness must answer with the listener alone, not wait for a walk: {body}"
+        );
+        for path in ["/health/ready", "/metrics"] {
+            let (status, body) = scrape(app.clone(), path).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path} answered before this node had looked at anything: {body}"
+            );
+            assert!(
+                body.contains("still running"),
+                "{path} said the wrong thing about why it is unavailable: {body}"
+            );
+        }
+
+        first_sweep.store(true, Ordering::Relaxed);
+        for path in ["/health/ready", "/metrics"] {
+            let (status, body) = scrape(app.clone(), path).await;
+            assert_eq!(status, StatusCode::OK, "{path} stayed unavailable: {body}");
+        }
+    }
+
     /// An unreadable root still leaves a live endpoint: the service is not taken
     /// out of the target list over a missing reading, and what it must not answer
     /// with is silence about itself -- the coverage series is there so a node the
@@ -539,7 +654,7 @@ mod tests {
     #[tokio::test]
     async fn an_unmounted_root_serves_a_live_endpoint_that_says_it_saw_nothing() {
         let missing = scratch("unmounted").join("not-a-storage-root");
-        let app = router(
+        let app = served(
             Arc::new(ClaimStoreObservable::new(missing, "node-a")),
             empty_images(),
         );
