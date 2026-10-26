@@ -1,0 +1,124 @@
+# One row per (file, value) pair a chart template writes literally: the census
+# in chart_template_literals_contract_test.rs reads every number outside {{ }}
+# actions and comments, counts its occurrences, and holds the set to these rows.
+#
+#   file<TAB>value<TAB>sites<TAB>kind<TAB>why
+#
+# kind is fixed (an identity that is not a dial: a protocol port, a UID, a file
+# mode, a shell exit status) or dial (a number a deployment may want to change
+# that has no home in values.yaml yet -- the debt, whose ceiling only goes down).
+# A dial row names the values.yaml key the number is going to move to.
+
+NOTES.txt	8080	2	dial	the port-forward of the app's Service; it has to follow that Service's port once the port is a chart value in values.yaml
+app-config.yaml	0	2	dial	zero switches the metrics sample cap off; the cap is a deployment choice and belongs in values.yaml
+app-config.yaml	300	1	dial	the self-evolution poll interval; declare evolution.pollIntervalSecs in values.yaml and read it here
+app-config.yaml	30500	1	dial	the local registry's NodePort; clusterRegistry.nodePort already carries this number in values.yaml
+app-config.yaml	3600	2	dial	the self-evolution test and build timeouts; declare both in values.yaml
+app-config.yaml	5000	1	dial	the in-cluster registry's Service port; cluster-registry.yaml declares the same number, so both must read one values.yaml key
+backup.yaml	0	3	fixed	the backup Job runs as root because it writes hostPath archives; the image ships no other user that can
+backup.yaml	0700	2	fixed	file mode for the archives: owner-only, by intent
+backup.yaml	1	1	dial	one retry for a failed backup Job; declare backup.backoffLimit in values.yaml
+backup.yaml	1001	8	fixed	the runtime UID/GID the images are built with; every workload pins the same pair
+backup.yaml	1800	2	dial	the CronJob's starting deadline; declare backup.startingDeadlineSeconds in values.yaml
+backup.yaml	2	2	dial	how many successful Jobs stay for inspection; declare backup.successfulJobsHistoryLimit in values.yaml
+backup.yaml	3	2	dial	how many failed Jobs stay for inspection; declare backup.failedJobsHistoryLimit in values.yaml
+backup.yaml	5432	2	dial	the postgres port inside the DSN; postgres.yaml declares the same number, so one values.yaml key has to feed both
+backup.yaml	6333	1	dial	the qdrant REST port inside the endpoint URL; declare qdrant.restPort in values.yaml and read the URL and qdrant.yaml from it
+backup.yaml	86400	2	dial	a finished backup Job's TTL; declare backup.ttlSecondsAfterFinished in values.yaml
+claim-store.yaml	0	2	fixed	the reading pods run as root to walk host paths
+cluster-registry.yaml	0	1	fixed	a shell exit status in the init script, not a number anybody chose
+cluster-registry.yaml	1	1	dial	one registry per cluster because it caches that cluster's layers; declare clusterRegistry.replicas in values.yaml
+cluster-registry.yaml	5000	2	dial	the registry's own Service port; declare clusterRegistry.port in values.yaml and read it from app-config too
+configmap.yaml	6334	1	dial	the qdrant gRPC port inside the URL; declare qdrant.grpcPort in values.yaml and read the URL and qdrant.yaml from it
+configmap.yaml	8080	1	dial	the app's main HTTP port; the app workload declares the same number, so both must read one values.yaml key
+configmap.yaml	8081	1	dial	the app's WebSocket port; declare gateway.wsPort in values.yaml and read it here and in the workload
+configmap.yaml	9090	1	dial	the app's metrics port; securityGateway.metricsPort already carries it in values.yaml
+crawl4ai.yaml	11235	2	dial	the browser service's port; declare webFetch.port in values.yaml and read it in network-policy too
+evolution.yaml	0	8	fixed	the evolution workload runs as root to drive host-path workspaces
+evolution.yaml	1	1	dial	one evolution deployment; declare evolution.replicas in values.yaml
+evolution.yaml	1000	2	dial	git's low-speed byte limit when fetching a workspace repo; the same four numbers are repeated in sandbox.yaml, so declare them once in values.yaml
+evolution.yaml	124	2	fixed	coreutils timeout's exit status; a shell contract, not a dial
+evolution.yaml	15	2	dial	git's connect timeout for a workspace fetch; repeated in sandbox.yaml, declare it in values.yaml
+evolution.yaml	20	2	dial	git's low-speed time for a workspace fetch; repeated in sandbox.yaml, declare it in values.yaml
+evolution.yaml	240	2	dial	the wall-clock cap on a workspace fetch; repeated in sandbox.yaml, declare it in values.yaml
+evolution.yaml	5432	1	dial	the postgres port inside the DSN; declare postgres.port in values.yaml and read all five DSNs and postgres.yaml from it
+evolution.yaml	8080	2	dial	the evolution workload's HTTP port, declared here and again in its Service; declare evolution.httpPort in values.yaml
+evolution.yaml	8081	4	dial	the security gateway's port inside four base URLs; declare securityGateway.proxyPort in values.yaml and read all five sites from it
+evolution.yaml	8085	1	dial	the app's internal face; declare gateway.internalPort in values.yaml and read all three sites from it
+gateway.yaml	0	1	fixed	maxUnavailable 0 with maxSurge 1: a rollout may not drop a pod that is serving
+gateway.yaml	1	1	fixed	maxSurge 1: one extra pod at a time is this rollout's shape
+gateway.yaml	100	1	fixed	a single backend carries all the traffic, so there is no split to tune
+gateway.yaml	1001	2	fixed	the runtime UID/GID the images are built with; every workload pins the same pair
+gateway.yaml	5432	1	dial	the postgres port inside the DSN; declare postgres.port in values.yaml and read all five DSNs and postgres.yaml from it
+gateway.yaml	8080	3	dial	the app's main HTTP port, declared here and again in its Service; declare gateway.httpPort in values.yaml
+gateway.yaml	8081	5	dial	the security gateway's port inside five base URLs; declare securityGateway.proxyPort in values.yaml and read all five sites from it
+gateway.yaml	8085	3	dial	the app's internal face, declared here and again in its Service; declare gateway.internalPort in values.yaml
+gateway.yaml	9091	3	dial	the app's webhook port, declared here and again in its Service; declare gateway.webhookPort in values.yaml
+host-ledger.yaml	65534	2	fixed	nobody: the host reader needs no privilege of its own
+ingress.yaml	3600	2	dial	the proxy read timeout, sized for the long-lived event stream; declare ingress.proxyReadTimeoutSecs in values.yaml
+ingress.yaml	8080	1	dial	the backend Service port the ingress forwards to; it has to follow the app's HTTP port from values.yaml
+meilisearch.yaml	1	1	dial	one search instance; declare webSearch.replicas in values.yaml
+meilisearch.yaml	7700	3	dial	meilisearch's HTTP port; declare webSearch.port in values.yaml and read it in network-policy too
+nats.yaml	1	1	dial	one bus instance; declare nats.replicas in values.yaml
+nats.yaml	4222	2	dial	the bus's client port; declare nats.port in values.yaml and read it in network-policy too
+nats.yaml	8222	3	dial	the bus's monitoring port, carried both in args and in the container port; declare nats.monitorPort in values.yaml
+network-policy.yaml	1	1	fixed	part of the loopback address ::1/128, not a number of its own
+network-policy.yaml	11235	2	dial	egress to the browser service; it has to follow crawl4ai.yaml's port from values.yaml
+network-policy.yaml	3100	1	fixed	loki's default port on an operator-provided endpoint; the endpoint's own URL carries the same number
+network-policy.yaml	3306	1	fixed	mysql's default port on an operator-provided endpoint; the endpoint's own URL carries the same number
+network-policy.yaml	4222	1	dial	the bus's client port; it has to follow nats.yaml's port from values.yaml
+network-policy.yaml	443	4	fixed	https itself: the port the protocol is defined on, which no deployment renames
+network-policy.yaml	5000	1	dial	the in-cluster registry's port; it has to follow cluster-registry.yaml's port from values.yaml
+network-policy.yaml	53	8	fixed	dns itself: the port the protocol is defined on, which no deployment renames
+network-policy.yaml	5432	1	dial	postgres's port; it has to follow postgres.yaml's port from values.yaml
+network-policy.yaml	6333	1	dial	qdrant's REST port; it has to follow qdrant.yaml's port from values.yaml
+network-policy.yaml	6379	1	dial	redis's port; it has to follow redis.yaml's port from values.yaml
+network-policy.yaml	6443	2	fixed	the kubernetes API server's port, defined by the apiserver's own flags
+network-policy.yaml	7700	1	dial	meilisearch's port; it has to follow meilisearch.yaml's port from values.yaml
+network-policy.yaml	80	1	fixed	http itself: the port the protocol is defined on, which no deployment renames
+network-policy.yaml	8080	4	dial	the app's main HTTP port; it has to follow the app Service's port from values.yaml
+network-policy.yaml	8081	3	dial	the security gateway's platform-proxy port; it has to follow security-gateway.yaml from values.yaml
+network-policy.yaml	8082	1	dial	the security gateway's webhook port; it has to follow security-gateway.yaml from values.yaml
+network-policy.yaml	8085	2	dial	the app's internal face; it has to follow the app Service's port from values.yaml
+network-policy.yaml	9090	2	dial	the metrics port on the app and on the sandbox; both have to follow values.yaml
+network-policy.yaml	9091	1	dial	the app's webhook port; it has to follow the app Service's port from values.yaml
+postgres.yaml	1	1	dial	one database instance; declare postgres.replicas in values.yaml
+postgres.yaml	5432	3	dial	postgres's port, declared here and again in five DSNs; declare postgres.port in values.yaml and read it everywhere
+postgres.yaml	9187	1	dial	the exporter's port; whoever scrapes it names the same number, so declare it in values.yaml
+qdrant.yaml	1	1	dial	one vector store; declare qdrant.replicas in values.yaml
+qdrant.yaml	6333	2	dial	the REST port, declared here and again in the endpoint URLs; declare qdrant.restPort in values.yaml
+qdrant.yaml	6334	2	dial	the gRPC port, declared here and again in the endpoint URL; declare qdrant.grpcPort in values.yaml
+redis.yaml	0	9	fixed	shell and Lua statuses inside the AOF repair script, not numbers anybody chose
+redis.yaml	1	8	dial	one redis replica, and the master's name redis-0 is written into the DSNs; declare redis.replicas in values.yaml
+redis.yaml	1000	1	dial	the batch size of the WAL census SCAN; a batch size is a dial, so declare redis.walScanCount in values.yaml and template the script
+redis.yaml	2	3	fixed	part of the Lua scan loop's own arithmetic, not a dial
+redis.yaml	3	1	fixed	`line 3` reads the third field of a kubectl property line
+redis.yaml	6379	4	dial	redis's port, declared here and again in the DSNs; declare redis.port in values.yaml
+redis.yaml	9100	1	dial	the exporter sidecar's port; declare backends.redis.exporterPort in values.yaml and read it where it is scraped
+sandbox.yaml	0	5	fixed	maxSurge 0: a sandbox pod holds a workspace and must not be doubled during a rollout
+sandbox.yaml	1	2	dial	one sandbox executor; declare sandboxExecutor.replicas in values.yaml
+sandbox.yaml	1000	2	dial	git's low-speed byte limit for a workspace fetch; the same four numbers are in evolution.yaml, so declare them once in values.yaml
+sandbox.yaml	1001	2	fixed	the UID/GID the sandbox image runs as
+sandbox.yaml	124	2	fixed	coreutils timeout's exit status; a shell contract, not a dial
+sandbox.yaml	15	2	dial	git's connect timeout for a workspace fetch; repeated in evolution.yaml, declare it in values.yaml
+sandbox.yaml	20	2	dial	git's low-speed time for a workspace fetch; repeated in evolution.yaml, declare it in values.yaml
+sandbox.yaml	240	2	dial	the wall-clock cap on a workspace fetch; repeated in evolution.yaml, declare it in values.yaml
+sandbox.yaml	9090	3	dial	the sandbox's metrics port, declared here and again in its Service; declare sandboxExecutor.metricsPort in values.yaml
+searxng.yaml	0	1	dial	safe search off; a policy dial, declare webSearch.safeSearch in values.yaml
+searxng.yaml	8080	2	dial	searxng's HTTP port; declare webSearch.searxngPort in values.yaml and read it in network-policy too
+searxng.yaml	977	3	fixed	the UID the searxng image runs as
+seaweedfs.yaml	1	2	dial	one object store; declare replicas in values.yaml
+seaweedfs.yaml	8080	1	dial	the volume server's port; declare it in values.yaml and read it in network-policy too
+seaweedfs.yaml	8333	4	dial	the S3 port; declare it in values.yaml and read it in network-policy too
+seaweedfs.yaml	8888	2	dial	the filer port; declare it in values.yaml and read it in network-policy too
+seaweedfs.yaml	9333	2	dial	the master port; declare it in values.yaml
+security-gateway.yaml	0	1	fixed	maxSurge 0: a gateway pod holds in-flight proxied bodies and a rollout may not double it
+security-gateway.yaml	1	1	fixed	maxUnavailable 1: one gateway pod at a time is this rollout's shape
+security-gateway.yaml	1001	2	fixed	the runtime UID/GID the images are built with; every workload pins the same pair
+security-gateway.yaml	256	1	fixed	defaultMode 256 is 0400: readable by its owner only
+security-gateway.yaml	5432	1	dial	the postgres port inside the DSN; declare postgres.port in values.yaml and read all five DSNs and postgres.yaml from it
+security-gateway.yaml	6379	1	dial	the redis port inside the DSN; declare redis.port in values.yaml and read the DSN and redis.yaml from it
+security-gateway.yaml	8080	2	dial	the gateway's main listening port; declare securityGateway.port in values.yaml
+security-gateway.yaml	8081	2	dial	the gateway's platform-proxy port, written into four base URLs elsewhere; declare securityGateway.proxyPort in values.yaml
+security-gateway.yaml	8082	1	dial	the gateway's webhook port; declare securityGateway.webhookPort in values.yaml and read it here and in webhook-service.yaml
+webhook-service.yaml	8082	2	dial	the webhook Service port; security-gateway.yaml declares the same number, so both must read one values.yaml key
