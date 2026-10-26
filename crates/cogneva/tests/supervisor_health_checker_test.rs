@@ -322,3 +322,50 @@ async fn without_a_shared_registry_a_silent_agent_is_never_forgotten() {
         assert!(has_agent(&reg, "a-1"), "第 {round} 拍：不该忘");
     }
 }
+
+/// 外面写进来的在场记录，不由这一拍判。
+///
+/// 属主按需触发的心跳用它来回答「属主在不在」，写在同一个注册表里，但声明的是
+/// 一个远长于两次触发间隔的寿命。用这一拍的 `dead_after` 去判它，两次触发之间
+/// 每一拍都判死、每一拍又刷新同一条告警——那一行结构上永远解析不掉，而一条永不
+/// 熄灭的告警会把整条规则的信号磨掉。实测 2026-10-26：规则从 145 行修到 1 行，
+/// 剩下的那 1 行就是它，`last_seen_at` 每拍刷新。
+///
+/// 同一拍里放一个真死的平台内 agent：不然「什么都不报」也能让上面那三句断言全绿。
+#[tokio::test]
+async fn an_external_units_stale_presence_is_not_a_verdict_of_this_pass() {
+    let reg = fresh_registry();
+    let mut external = make_agent("worker", 900);
+    external.role = Some(cog_supervisor::registry::EXTERNAL_WORKER_ROLE.into());
+    reg.register_agent(external);
+    reg.register_agent(make_agent("a-dead", 90));
+
+    let checker = HealthChecker::new(
+        Arc::clone(&reg),
+        fresh_backend(),
+        HealthCheckerConfig::default(),
+    );
+    let report = checker.check().await.unwrap();
+
+    for (branch, ids) in [
+        ("dead", report.dead_ids()),
+        (
+            "suspect",
+            report.suspect.iter().map(|(id, _)| id.clone()).collect(),
+        ),
+        (
+            "stuck",
+            report.stuck.iter().map(|(id, _)| id.clone()).collect(),
+        ),
+    ] {
+        assert!(
+            !ids.contains(&"worker".to_string()),
+            "外面写进来的在场记录被这一拍判进了 {branch}：{report:?}"
+        );
+    }
+    assert_eq!(
+        report.dead_ids(),
+        vec!["a-dead".to_string()],
+        "真死的那个还得照报，否则这条测试是被「整拍什么都不报」满足的：{report:?}"
+    );
+}

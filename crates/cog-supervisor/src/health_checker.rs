@@ -6,7 +6,7 @@ use chrono::Utc;
 use cog_core::{AgentState, StateBackend};
 
 use crate::error::SupervisorResult;
-use crate::registry::{AgentInfo, AgentRegistry};
+use crate::registry::{AgentInfo, AgentRegistry, EXTERNAL_WORKER_ROLE};
 use cog_core::HealthIssue;
 
 /// Aggregate result of a single health-check pass.
@@ -28,8 +28,10 @@ pub struct HealthReport {
     ///
     /// 实测 2026-10-26：`agent_unhealthy` 当下 firing 的 233 行里，222 行的 id 连
     /// 索引条目都没有（正常注销过），只有 3 行还有活记录。也就是说这条规则报的
-    /// 几乎全是「已经走了」，而不是「还挂着但不说话」——真正需要人看的那条常驻
-    /// `worker` 行被埋在中间 40 分钟。
+    /// 几乎全是「已经走了」，而不是「还挂着但不说话」。同一晚把这条规则从 145 行
+    /// 修到 1 行之后，剩下那 1 行就是外面写进来的那条 `worker` 记录——它不是
+    /// 「还挂着但不说话」，而是被别人的钟判的（见循环入口对 `EXTERNAL_WORKER_ROLE`
+    /// 的跳过），所以「有活记录」本身也不等于「该报」。
     pub departed: Vec<String>,
 }
 
@@ -145,6 +147,20 @@ impl HealthChecker {
         let agents = self.registry.agents();
 
         for agent in &agents {
+            // A unit that writes its presence from outside the platform is not
+            // supervised by it: it registers when its owner asks it to act and
+            // declares a lifetime longer than the beats between those asks, so
+            // judging it by heartbeat staleness marks it dead in every gap and
+            // lights the same alert row on every pass. Measured 2026-10-26:
+            // `agent_unhealthy` came down to one firing row and that row was
+            // exactly this one, refreshed every pass and never able to resolve
+            // -- a permanently lit row costs the rule the signal it exists for.
+            // "Is the owner here" is the roster's question, answered by the
+            // record's own lifetime, not by a verdict from this pass.
+            if agent.role.as_deref() == Some(EXTERNAL_WORKER_ROLE) {
+                continue;
+            }
+
             // 1. Check the durable state first — explicit Dead beats heartbeat.
             let backend_state = self
                 .state_backend

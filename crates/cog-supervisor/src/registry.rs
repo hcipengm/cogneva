@@ -15,6 +15,14 @@ use crate::error::{SupervisorError, SupervisorResult};
 /// Redis and etcd agent registries (30 seconds) so the Supervisor's view
 /// of liveness matches the Agent's self-registered TTL.
 pub const DEFAULT_HEARTBEAT_TTL_SECONDS: u64 = 30;
+
+/// The role a unit takes when it writes its presence from outside the platform.
+///
+/// Such a unit registers on demand -- when its owner asks it to act -- and
+/// declares a lifetime longer than any interval a person would keep between
+/// those asks. Its record is the answer to "is the owner here", read as a
+/// timestamp, so it is not evidence about whether a supervised agent is alive.
+pub const EXTERNAL_WORKER_ROLE: &str = "external-worker";
 pub const HEARTBEAT_HISTORY_MAX: usize = 1000;
 
 /// Self-reported health status for a heartbeat.
