@@ -56,7 +56,7 @@ pub use dataset_catalog::{
 pub use decision_stats_store::PostgresDecisionStatsStore;
 pub use governance_store::PostgresGovernanceStore;
 pub use hook_archive::{HookArchiveRow, PostgresHookArchive};
-pub use metrics_backend::{PostgresMetricsBackend, GAUGE_LATEST_SQL};
+pub use metrics_backend::{gauge_latest_sql, PostgresMetricsBackend};
 pub use notification_store::PostgresNotificationStore;
 pub use observability_gateway::PostgresObservabilityGateway;
 pub use principle_ledger_store::PostgresPrincipleLedgerStore;

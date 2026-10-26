@@ -16,7 +16,13 @@ use cog_core::{
 };
 
 /// This store's schema, and the one a restore replays.
-pub const DDL: &str = r#"
+///
+/// The two closed sets the table enforces -- account status and tier -- are
+/// written from their enums rather than copied beside them. A CHECK listing
+/// words the enum no longer produces would still be created, and it would then
+/// refuse exactly the values the writer sends: the first login after a rename
+/// fails, and the schema reads as if it were the current one.
+pub const DDL_TEMPLATE: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
                 id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
                 phone VARCHAR(20) UNIQUE,
@@ -24,8 +30,8 @@ CREATE TABLE IF NOT EXISTS users (
                 username VARCHAR(64) NOT NULL UNIQUE,
                 display_name VARCHAR(128),
                 avatar_url VARCHAR(512),
-                status VARCHAR(16) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'disabled', 'locked')),
-                user_type VARCHAR(16) NOT NULL DEFAULT 'standard' CHECK (user_type IN ('admin', 'standard', 'guest')),
+                status VARCHAR(16) NOT NULL DEFAULT '{status:active}' CHECK (status IN ('{status:active}', '{status:inactive}', '{status:disabled}', '{status:locked}')),
+                user_type VARCHAR(16) NOT NULL DEFAULT '{user_type:standard}' CHECK (user_type IN ('{user_type:admin}', '{user_type:standard}', '{user_type:guest}')),
                 password_hash VARCHAR(255),
                 token_quota_daily BIGINT DEFAULT 0,
                 token_used_today BIGINT DEFAULT 0,
@@ -49,6 +55,18 @@ CREATE TABLE IF NOT EXISTS platform_identities (
 ;
 CREATE INDEX IF NOT EXISTS idx_platform_identities_user ON platform_identities(user_id);
 "#;
+
+/// The schema with both closed sets filled from their enums.
+pub fn ddl() -> String {
+    let mut slots: Vec<(&str, &str)> = Vec::new();
+    for status in UserStatus::ALL {
+        slots.push(("status", status.as_str()));
+    }
+    for tier in UserType::ALL {
+        slots.push(("user_type", tier.as_str()));
+    }
+    super::fill_slots(DDL_TEMPLATE, &slots)
+}
 
 pub struct PostgresUserStore {
     pool: PgPool,
@@ -114,7 +132,7 @@ impl PostgresUserStore {
     /// Auto-create the tables. Matches migrations 001_users plus the
     /// platform_identities table (tokens stay out — references only).
     pub async fn init_schema(&self) -> SFResult<()> {
-        crate::schema_ddl::apply(&self.pool, DDL).await
+        crate::schema_ddl::apply(&self.pool, &ddl()).await
     }
 
     async fn fetch_user(&self, clause: &str, bind: Bind<'_>) -> SFResult<Option<User>> {
@@ -234,8 +252,9 @@ impl UserStore for PostgresUserStore {
         // to stay right. `created_at` decides only which admin, if an instance
         // ever ends up with more than one.
         let row: Option<UserRow> = sqlx::query_as(&format!(
-            "SELECT {USER_COLS} FROM users WHERE user_type = 'admin' \
-             ORDER BY created_at ASC, id ASC LIMIT 1"
+            "SELECT {USER_COLS} FROM users WHERE user_type = '{}' \
+             ORDER BY created_at ASC, id ASC LIMIT 1",
+            UserType::Admin.as_str()
         ))
         .fetch_optional(&self.pool)
         .await
@@ -386,5 +405,34 @@ impl PostgresUserStore {
             access_token_ref: r.4,
             refresh_token_ref: r.5,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The table's closed sets come from the enums, so what the schema accepts
+    /// and what the writer sends cannot be two lists. Rendered rather than
+    /// asserted on the template: a slot left behind is DDL the database refuses
+    /// at install time, and it is the enum that has to reach the artifact.
+    #[test]
+    fn the_schema_names_every_status_and_tier_the_enums_declare() {
+        let ddl = ddl();
+        assert!(!ddl.contains('{'), "槽没填完：{ddl}");
+        for status in UserStatus::ALL {
+            assert!(
+                ddl.contains(&format!("'{}'", status.as_str())),
+                "users.status 的闭集里没有 {}：{ddl}",
+                status.as_str()
+            );
+        }
+        for tier in UserType::ALL {
+            assert!(
+                ddl.contains(&format!("'{}'", tier.as_str())),
+                "users.user_type 的闭集里没有 {}：{ddl}",
+                tier.as_str()
+            );
+        }
     }
 }

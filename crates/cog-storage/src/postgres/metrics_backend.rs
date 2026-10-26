@@ -52,14 +52,14 @@ fn series_key(labels: &HashMap<String, String>) -> String {
 /// scrape, to return 32 rows -- index present and unused. Cost here is bounded
 /// by the answer whatever the planner believes about the index, because no node
 /// in this plan can see more rows than there are series.
-pub const GAUGE_LATEST_SQL: &str = r#"
+pub const GAUGE_LATEST_SQL_TEMPLATE: &str = r#"
             WITH RECURSIVE series(labels) AS (
                 SELECT (SELECT s.labels FROM cog_metrics_samples s
-                        WHERE s.metric_type = 'gauge' AND s.name = $1
+                        WHERE s.metric_type = '{metric:gauge}' AND s.name = $1
                         ORDER BY s.labels LIMIT 1)
               UNION ALL
                 SELECT (SELECT s.labels FROM cog_metrics_samples s
-                        WHERE s.metric_type = 'gauge' AND s.name = $1
+                        WHERE s.metric_type = '{metric:gauge}' AND s.name = $1
                           AND s.labels > series.labels
                         ORDER BY s.labels LIMIT 1)
                 FROM series WHERE series.labels IS NOT NULL
@@ -68,11 +68,25 @@ pub const GAUGE_LATEST_SQL: &str = r#"
             FROM series
             CROSS JOIN LATERAL (
                 SELECT s.value, s.timestamp FROM cog_metrics_samples s
-                WHERE s.metric_type = 'gauge' AND s.name = $1 AND s.labels = series.labels
+                WHERE s.metric_type = '{metric:gauge}' AND s.name = $1 AND s.labels = series.labels
                 ORDER BY s.timestamp DESC LIMIT 1
             ) AS latest
             WHERE series.labels IS NOT NULL
             "#;
+
+/// The newest sample per label set, with the kind word filled in.
+///
+/// `gauge` is a word [`MetricType::as_str`] decides, and the samples table is
+/// read back by kind. A predicate that spells the kind itself keeps matching
+/// the old value after a rename and returns no rows -- which every caller reads
+/// as "this series has no samples yet", the one answer a metrics reader is
+/// least likely to question.
+pub fn gauge_latest_sql() -> String {
+    super::fill_slots(
+        GAUGE_LATEST_SQL_TEMPLATE,
+        &[("metric", MetricType::Gauge.as_str())],
+    )
+}
 
 /// This store's schema, and the one a restore replays.
 pub const DDL: &str = r#"
@@ -213,7 +227,7 @@ impl PostgresMetricsBackend {
 
     async fn record(
         &self,
-        metric_type: &str,
+        metric_type: MetricType,
         name: &str,
         value: f64,
         labels: HashMap<String, String>,
@@ -226,7 +240,7 @@ impl PostgresMetricsBackend {
             VALUES ($1, $2, $3, $4, NOW())
             "#,
         )
-        .bind(metric_type)
+        .bind(metric_type.as_str())
         .bind(name)
         .bind(value)
         .bind(labels_json)
@@ -239,7 +253,7 @@ impl PostgresMetricsBackend {
 
     async fn query_range(
         &self,
-        metric_type: &str,
+        metric_type: MetricType,
         name: &str,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
@@ -252,7 +266,7 @@ impl PostgresMetricsBackend {
             ORDER BY timestamp ASC
             "#,
         )
-        .bind(metric_type)
+        .bind(metric_type.as_str())
         .bind(name)
         .bind(start)
         .bind(end)
@@ -282,7 +296,8 @@ impl MetricsBackend for PostgresMetricsBackend {
         value: f64,
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
-        self.record("gauge", name.as_str(), value, labels).await
+        self.record(MetricType::Gauge, name.as_str(), value, labels)
+            .await
     }
 
     async fn record_counter(
@@ -295,7 +310,8 @@ impl MetricsBackend for PostgresMetricsBackend {
         // range queries, the total answers the scrape endpoint, and callers of
         // either must keep working.
         let name = name.as_str();
-        self.record("counter", name, value, labels.clone()).await?;
+        self.record(MetricType::Counter, name, value, labels.clone())
+            .await?;
         self.increment_counter_total(name, value, &labels).await
     }
 
@@ -306,7 +322,7 @@ impl MetricsBackend for PostgresMetricsBackend {
         labels: HashMap<String, String>,
     ) -> SFResult<()> {
         let name = name.as_str();
-        self.record("histogram", name, value, labels.clone())
+        self.record(MetricType::Histogram, name, value, labels.clone())
             .await?;
         self.increment_histogram_bucket(name, value, &labels).await
     }
@@ -316,12 +332,13 @@ impl MetricsBackend for PostgresMetricsBackend {
         // the index and probes each one for its newest sample, so what it reads
         // is one row per series rather than the history behind it. The index
         // that carries both probes is created in `init_schema`, and
-        // `GAUGE_LATEST_SQL` is the statement the two are held together by.
-        let rows: Vec<(f64, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(GAUGE_LATEST_SQL)
-            .bind(name)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))?;
+        // [`gauge_latest_sql`] is the statement the two are held together by.
+        let rows: Vec<(f64, serde_json::Value, DateTime<Utc>)> =
+            sqlx::query_as(&gauge_latest_sql())
+                .bind(name)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| SFError::Database(e.to_string()))?;
 
         let mut samples = Vec::with_capacity(rows.len());
         for (value, labels_json, timestamp) in rows {
@@ -342,7 +359,7 @@ impl MetricsBackend for PostgresMetricsBackend {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> SFResult<Vec<MetricSample>> {
-        self.query_range("gauge", name, start, end).await
+        self.query_range(MetricType::Gauge, name, start, end).await
     }
 
     async fn query_counter_range(
@@ -351,7 +368,8 @@ impl MetricsBackend for PostgresMetricsBackend {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> SFResult<Vec<MetricSample>> {
-        self.query_range("counter", name, start, end).await
+        self.query_range(MetricType::Counter, name, start, end)
+            .await
     }
 
     async fn query_counter_totals(&self, name: &str) -> SFResult<Vec<MetricSample>> {
@@ -460,7 +478,8 @@ impl MetricsBackend for PostgresMetricsBackend {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> SFResult<Vec<MetricSample>> {
-        self.query_range("histogram", name, start, end).await
+        self.query_range(MetricType::Histogram, name, start, end)
+            .await
     }
 
     async fn list_metric_names(&self, metric_type: MetricType) -> SFResult<Vec<String>> {
@@ -509,6 +528,25 @@ impl MetricsBackend for PostgresMetricsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kind word is filled, not copied, and nothing is left for the database
+    /// to trip over: a template whose slot nobody fills is a parse error at the
+    /// scrape, which is the moment a reader is least able to do without it.
+    #[test]
+    fn the_gauge_reading_is_rendered_from_the_declaration() {
+        let sql = gauge_latest_sql();
+        assert!(!sql.contains('{'), "槽没填完：{sql}");
+        let gauge = MetricType::Gauge.as_str();
+        assert_eq!(
+            sql.matches(&format!("metric_type = '{gauge}'")).count(),
+            3,
+            "三处探针都要按 kind 选行：{sql}"
+        );
+        assert!(
+            !sql.contains("'counter'") && !sql.contains("'histogram'"),
+            "gauge 读数里出现了别的 kind：{sql}"
+        );
+    }
 
     /// 一个标签集的每一行都由它自己那份 map 承载，而迭代顺序是按实例取的，
     /// 与内容无关。键若取自 map 本身（或它的序列化文本），同一个序列就会按

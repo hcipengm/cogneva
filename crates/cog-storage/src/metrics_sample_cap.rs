@@ -595,13 +595,18 @@ async fn publish_pass_outcome(
 /// `$1` is the batch size. Rows go oldest first, and a gauge row is skipped when
 /// it is the newest row of its own series — the one row every reader of that
 /// series reaches it through.
+///
+/// The kind is filled from [`cog_core::MetricType::as_str`] rather than spelled
+/// here: a stale word would make every row look like a non-gauge row, and the
+/// sweep would then delete the newest sample of every series — emptying exactly
+/// the readings the scrape serves, with no error to show for it.
 pub fn delete_surplus_sql(table: &str) -> String {
     format!(
         "DELETE FROM {table} WHERE id IN (
              SELECT c.id FROM {table} c
-             WHERE c.metric_type <> 'gauge'
+             WHERE c.metric_type <> '{gauge}'
                 OR c.id <> (SELECT g.id FROM {table} g
-                            WHERE g.metric_type = 'gauge'
+                            WHERE g.metric_type = '{gauge}'
                               AND g.name = c.name
                               AND g.labels = c.labels
                             ORDER BY g.timestamp DESC, g.id DESC
@@ -610,6 +615,7 @@ pub fn delete_surplus_sql(table: &str) -> String {
              LIMIT $1
          )",
         table = crate::partition_maintainer::quote_ident(table),
+        gauge = cog_core::MetricType::Gauge.as_str(),
     )
 }
 

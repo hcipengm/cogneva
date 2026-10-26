@@ -15,10 +15,10 @@ use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
 use cog_core::{
-    BlockCensus, BlockingHolder, BlockingSurface, ChangeBlock, ChangeIdentity, ChangeLedgerEvent,
-    ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangePriority, ChangeReading,
-    ChangeReopen, ChangeSource, ChangeState, DemandClosure, DispatchState, RetireReason, SFError,
-    SFResult, WriteWindow,
+    BlockCensus, BlockedReason, BlockingHolder, BlockingSurface, ChangeBlock, ChangeIdentity,
+    ChangeLedgerEvent, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangePriority,
+    ChangeReading, ChangeReopen, ChangeSource, ChangeState, DemandClosure, DispatchState,
+    RetireReason, SFError, SFResult, WriteWindow,
 };
 
 /// Resolve the state and reason words a query template names.
@@ -35,6 +35,10 @@ use cog_core::{
 /// fills them. The slot is named after the value it resolves, and the list is
 /// the enum's own `ALL`, so a variant added to the set is fillable without
 /// anyone extending a second table here.
+///
+/// The blocked reason is the same shape on an orthogonal axis: `{blocked:...}`
+/// names the wait, and a stale spelling there would make the stamp overwrite a
+/// block somebody else set, or the clear miss the rows it was meant to release.
 fn fill_vocabulary(template: &str) -> String {
     let mut slots: Vec<(&str, &str)> = Vec::new();
     for state in ChangeState::ALL {
@@ -42,6 +46,9 @@ fn fill_vocabulary(template: &str) -> String {
     }
     for reason in RetireReason::ALL {
         slots.push(("reason", reason.as_str()));
+    }
+    for blocked in BlockedReason::ALL {
+        slots.push(("blocked", blocked.as_str()));
     }
     super::fill_slots(template, &slots)
 }
@@ -536,18 +543,18 @@ UPDATE change_ledger SET delivered_rev = $4
 /// which is the whole point of the column.
 const STAMP_POOL_BLOCK_SQL_TEMPLATE: &str = "\
 UPDATE change_ledger
-   SET blocked_reason = 'pool_unavailable',
+   SET blocked_reason = '{blocked:pool_unavailable}',
        unblock_condition = $1,
        blocked_since = COALESCE(blocked_since, now())
  WHERE state = '{state:pending}'
-   AND (blocked_reason IS NULL OR blocked_reason = 'pool_unavailable')";
+   AND (blocked_reason IS NULL OR blocked_reason = '{blocked:pool_unavailable}')";
 
 /// Take the pool block back off. Keyed on the reason, not on "blocked": the
 /// pool coming back says nothing about a row waiting on an owner.
-const CLEAR_POOL_BLOCK_SQL: &str = "\
+const CLEAR_POOL_BLOCK_SQL_TEMPLATE: &str = "\
 UPDATE change_ledger
    SET blocked_reason = NULL, unblock_condition = NULL, blocked_since = NULL
- WHERE blocked_reason = 'pool_unavailable'";
+ WHERE blocked_reason = '{blocked:pool_unavailable}'";
 
 /// Append one dispatch pass's own reading.
 ///
@@ -1338,7 +1345,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
     }
 
     async fn clear_pool_block(&self) -> SFResult<u64> {
-        let result = sqlx::query(CLEAR_POOL_BLOCK_SQL)
+        let result = sqlx::query(&fill_vocabulary(CLEAR_POOL_BLOCK_SQL_TEMPLATE))
             .execute(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("clear pool block: {e}")))?;
@@ -1671,5 +1678,58 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             });
         }
         Ok(Some(windows))
+    }
+}
+
+#[cfg(test)]
+mod templates {
+    use super::*;
+
+    /// Every template a statement is built from, so a new one is added here
+    /// rather than skipped.
+    const TEMPLATES: &[(&str, &str)] = &[
+        ("RECORD_READING", RECORD_READING_SQL_TEMPLATE),
+        ("APPLY_MEASUREMENT", APPLY_MEASUREMENT_SQL_TEMPLATE),
+        ("DEMAND_CLOSURE", DEMAND_CLOSURE_SQL_TEMPLATE),
+        ("BLOCKING_SURFACE", BLOCKING_SURFACE_SQL_TEMPLATE),
+        ("BLOCKING_HOLDERS", BLOCKING_HOLDERS_SQL_TEMPLATE),
+        ("BLOCK_CENSUS", BLOCK_CENSUS_SQL_TEMPLATE),
+        ("STAMP_POOL_BLOCK", STAMP_POOL_BLOCK_SQL_TEMPLATE),
+        ("CLEAR_POOL_BLOCK", CLEAR_POOL_BLOCK_SQL_TEMPLATE),
+    ];
+
+    /// A slot nobody fills is not a missing word, it is a statement the database
+    /// refuses to parse -- at the moment the ledger is written, not before.
+    #[test]
+    fn every_template_renders_without_a_slot_left_behind() {
+        for (name, template) in TEMPLATES {
+            let sql = fill_vocabulary(template);
+            assert!(
+                !sql.contains('{'),
+                "{name} 还有没填的槽，这条语句发到数据库会被拒：{sql}"
+            );
+        }
+    }
+
+    /// The block statements name the pool wait and nothing else: the stamp must
+    /// not relabel a block somebody else set, and the clear must not release it.
+    #[test]
+    fn the_pool_block_statements_name_the_pool_reason() {
+        let pool = BlockedReason::PoolUnavailable.as_str();
+        let stamp = fill_vocabulary(STAMP_POOL_BLOCK_SQL_TEMPLATE);
+        let clear = fill_vocabulary(CLEAR_POOL_BLOCK_SQL_TEMPLATE);
+        assert!(
+            stamp.contains(&format!("SET blocked_reason = '{pool}'")),
+            "{stamp}"
+        );
+        assert!(
+            stamp.contains(&format!("blocked_reason = '{pool}'")),
+            "the stamp stopped leaving other people's blocks alone: {stamp}"
+        );
+        assert!(
+            clear.contains(&format!("blocked_reason = '{pool}'")),
+            "the clear stopped selecting on the reason: {clear}"
+        );
+        assert!(clear.contains("blocked_reason = NULL"));
     }
 }

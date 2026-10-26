@@ -6673,12 +6673,19 @@ mod tests {
                 match blocked.get(&row.identity).map(String::as_str) {
                     // Unblocked: this pass is the one that finds it stuck.
                     None => {
-                        blocked.insert(row.identity.clone(), "pool_unavailable".to_string());
+                        blocked.insert(
+                            row.identity.clone(),
+                            cog_core::BlockedReason::PoolUnavailable
+                                .as_str()
+                                .to_string(),
+                        );
                         touched += 1;
                     }
                     // Already waiting on the pool: the statement matches the row
                     // again (it is a row of the update), but the start stays put.
-                    Some("pool_unavailable") => touched += 1,
+                    Some(pool) if pool == cog_core::BlockedReason::PoolUnavailable.as_str() => {
+                        touched += 1
+                    }
                     // Somebody else's block is not this pass's to overwrite.
                     Some(_) => {}
                 }
@@ -6688,7 +6695,8 @@ mod tests {
         async fn clear_pool_block(&self) -> SFResult<u64> {
             let mut blocked = self.blocked.lock().unwrap();
             let before = blocked.len();
-            blocked.retain(|_, reason| reason != "pool_unavailable");
+            let pool = cog_core::BlockedReason::PoolUnavailable.as_str();
+            blocked.retain(|_, reason| reason != pool);
             Ok((before - blocked.len()) as u64)
         }
         async fn declare(&self, _readings: &[ChangeReading]) -> SFResult<usize> {

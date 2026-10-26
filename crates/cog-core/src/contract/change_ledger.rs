@@ -236,6 +236,74 @@ impl std::str::FromStr for RetireReason {
     }
 }
 
+/// Why an outstanding change is not being worked on.
+///
+/// A state answers whether the tree satisfies the demand; it cannot answer "what
+/// is this row waiting for". The two are orthogonal -- a row can be outstanding
+/// and blocked at the same time -- so the wait is a flag beside the state, and
+/// this is the closed set of answers it can carry.
+///
+/// Closed for a reason a free-text reason could not give: the column is grouped
+/// and counted, and a reason per row would produce as many categories as there
+/// are rows. The table refuses a value outside the set, which is what makes the
+/// set real rather than merely written down here.
+///
+/// Every word below is also spelled by queries -- the stamp that blocks a row
+/// on a pool, the clear that takes that block back, the reads that count what is
+/// waiting. A query that spells one of them itself agrees with this enum only
+/// until someone renames a variant, and then it matches nothing and answers
+/// exactly like a table with no blocked rows: "nothing is waiting on a pool"
+/// while the rows sit there. `as_str` is the only place these words are decided;
+/// the queries fill them from `ALL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockedReason {
+    /// No configured upstream can serve: the pool is down, and nothing about
+    /// this row is what holds it.
+    PoolUnavailable,
+    /// Waiting on a reading only a run can produce -- a measurement that has
+    /// not come back yet, not one this pass could take itself.
+    UpstreamReading,
+    /// Waiting on a decision this platform does not make.
+    OwnerDecision,
+    /// Waiting on an input from outside the account.
+    ExternalInput,
+    /// Waiting on another change to land first.
+    Dependency,
+}
+
+impl BlockedReason {
+    /// Every reason, in the order the readings group them.
+    pub const ALL: [BlockedReason; 5] = [
+        BlockedReason::PoolUnavailable,
+        BlockedReason::UpstreamReading,
+        BlockedReason::OwnerDecision,
+        BlockedReason::ExternalInput,
+        BlockedReason::Dependency,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockedReason::PoolUnavailable => "pool_unavailable",
+            BlockedReason::UpstreamReading => "upstream_reading",
+            BlockedReason::OwnerDecision => "owner_decision",
+            BlockedReason::ExternalInput => "external_input",
+            BlockedReason::Dependency => "dependency",
+        }
+    }
+}
+
+impl std::str::FromStr for BlockedReason {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|reason| reason.as_str() == s)
+            .ok_or_else(|| format!("unknown blocked reason: {s}"))
+    }
+}
+
 /// How urgent the document that asked for a change said that change was.
 ///
 /// Only a document can answer this. Nothing measures urgency: there is no tree

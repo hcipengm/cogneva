@@ -13,6 +13,19 @@ pub enum UserStatus {
 }
 
 impl UserStatus {
+    /// Every status, for readers that have to enumerate the set.
+    ///
+    /// The column's closed set and every query over it read from here: a
+    /// predicate that spells `active` itself agrees with the enum only until a
+    /// variant is renamed, and then it matches no rows -- which reads as "no
+    /// user is active" rather than as an error.
+    pub const ALL: [UserStatus; 4] = [
+        UserStatus::Active,
+        UserStatus::Inactive,
+        UserStatus::Disabled,
+        UserStatus::Locked,
+    ];
+
     /// Canonical storage representation (matches the `users.status` column).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -44,6 +57,14 @@ pub enum UserType {
 }
 
 impl UserType {
+    /// Every tier, for readers that have to enumerate the set.
+    ///
+    /// The column's closed set and every query over it read from here. The
+    /// owner is found by asking for `admin`, and a query that spells that
+    /// itself would keep matching a word the enum no longer produces -- an
+    /// empty answer to "who owns this instance", not an error.
+    pub const ALL: [UserType; 3] = [UserType::Admin, UserType::Standard, UserType::Guest];
+
     /// Canonical storage representation (matches the `users.user_type` column).
     pub fn as_str(self) -> &'static str {
         match self {

@@ -43,7 +43,7 @@ use sqlx::{Executor, PgPool};
 use std::collections::HashMap;
 
 use cog_core::MetricsBackend;
-use cog_storage::{PostgresMetricsBackend, GAUGE_LATEST_SQL};
+use cog_storage::{gauge_latest_sql, PostgresMetricsBackend};
 
 const METRIC: &str = "probe_gauge_latest";
 /// Label sets, and rows each — enough history that a sort of it cannot stay in
@@ -167,7 +167,7 @@ async fn the_newest_sample_of_each_series_is_read_without_sorting_the_log() {
     // runs, on one connection, because a prepared statement does not outlive
     // its session.
     let mut conn = pool.acquire().await.unwrap();
-    let prepare = format!("PREPARE probe_latest(text) AS {GAUGE_LATEST_SQL}");
+    let prepare = format!("PREPARE probe_latest(text) AS {}", gauge_latest_sql());
     conn.execute(prepare.as_str()).await.unwrap();
     // `EXPLAIN EXECUTE` takes the arguments as literals rather than as binds;
     // the statement being explained is still the backend's own text.

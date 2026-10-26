@@ -260,6 +260,19 @@ pub enum MetricType {
 }
 
 impl MetricType {
+    /// Every kind, for readers that have to enumerate the set.
+    ///
+    /// The stored name is decided by [`Self::as_str`] and nowhere else; a
+    /// query that spells `gauge` itself is a second copy of the word, and the
+    /// two agree only until one is renamed. A reader that fills its predicate
+    /// from this list cannot drift, and a kind added here reaches it without an
+    /// edit anywhere else.
+    pub const ALL: [MetricType; 3] = [
+        MetricType::Gauge,
+        MetricType::Counter,
+        MetricType::Histogram,
+    ];
+
     /// The string this kind is stored under in `cog_metrics_samples`.
     pub fn as_str(self) -> &'static str {
         match self {

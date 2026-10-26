@@ -61,6 +61,28 @@ fn parses_as_principle_check_kind(word: &str) -> bool {
     cog_core::PrincipleCheckKind::parse(word).is_some()
 }
 
+fn parses_as_blocked_reason(word: &str) -> bool {
+    word.parse::<cog_core::BlockedReason>().is_ok()
+}
+
+fn parses_as_user_status(word: &str) -> bool {
+    cog_core::UserStatus::ALL
+        .iter()
+        .any(|status| status.as_str() == word)
+}
+
+fn parses_as_user_type(word: &str) -> bool {
+    cog_core::UserType::ALL
+        .iter()
+        .any(|tier| tier.as_str() == word)
+}
+
+fn parses_as_metric_type(word: &str) -> bool {
+    cog_core::MetricType::ALL
+        .iter()
+        .any(|kind| kind.as_str() == word)
+}
+
 /// One closed set of words and the columns a query asks about it with.
 struct Vocabulary {
     /// The column names this vocabulary is stored under. The subject is the
@@ -120,6 +142,39 @@ const VOCABULARIES: &[Vocabulary] = &[
         subjects: &["check_kind"],
         parses: parses_as_principle_check_kind,
         home: "cog_core::PrincipleCheckKind",
+        except_in: &[],
+    },
+    Vocabulary {
+        // The wait beside the state. A stale spelling here does not fail the
+        // write: the stamp overwrites a block somebody else set, and the clear
+        // releases rows it was never meant to touch.
+        subjects: &["blocked_reason"],
+        parses: parses_as_blocked_reason,
+        home: "cog_core::BlockedReason",
+        except_in: &[],
+    },
+    Vocabulary {
+        // Two sets share the `status` column name: a task's progress and an
+        // account's standing. The words do not overlap, so each parser accepts
+        // its own and the file-level exemption the two `state` columns needed
+        // is not needed here.
+        subjects: &["status"],
+        parses: parses_as_user_status,
+        home: "cog_core::UserStatus",
+        except_in: &[],
+    },
+    Vocabulary {
+        subjects: &["user_type"],
+        parses: parses_as_user_type,
+        home: "cog_core::UserType",
+        except_in: &[],
+    },
+    Vocabulary {
+        // The samples table is read back by kind, so a stale kind word answers
+        // "this series has no samples yet".
+        subjects: &["metric_type"],
+        parses: parses_as_metric_type,
+        home: "cog_core::MetricType",
         except_in: &[],
     },
 ];
@@ -458,4 +513,21 @@ fn each_vocabulary_reads_its_own_declaration() {
     for kind in cog_core::PrincipleCheckKind::ALL {
         assert!(parses_as_principle_check_kind(kind.as_str()));
     }
+    for reason in cog_core::BlockedReason::ALL {
+        assert!(parses_as_blocked_reason(reason.as_str()));
+    }
+    for status in cog_core::UserStatus::ALL {
+        assert!(parses_as_user_status(status.as_str()));
+    }
+    for tier in cog_core::UserType::ALL {
+        assert!(parses_as_user_type(tier.as_str()));
+    }
+    for kind in cog_core::MetricType::ALL {
+        assert!(parses_as_metric_type(kind.as_str()));
+    }
+    // A word from another set is not this set's: the judge has to be a set, not
+    // a shape.
+    assert!(!parses_as_user_status("pending"));
+    assert!(!parses_as_metric_type("landed"));
+    assert!(!parses_as_blocked_reason("superseded"));
 }
