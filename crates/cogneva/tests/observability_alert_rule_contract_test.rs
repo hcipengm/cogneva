@@ -1160,7 +1160,7 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "cogneva_alert_bound_band_birth_max_bytes",
-        "宿主读数 `scripts/host/cogneva-alert-bound-band-reading.sh`（不在本仓，登记行 `alert_bound_band`）：每一代应用 Pod **稳定之后**（跳过开头几个采样点）的 rss，取窗口里的最大值。它是「告警界脚下的那条带」的上沿——界是按「带上沿 ＋ 代内涨幅」定的，带往上漂而界不动，界就会开始把新常态报成压力。取稳定之后而不是第一次抓到的值：刚起的 Pod 第一次被采到时可能只有几 MiB，拿它当出生值会把代内涨幅读成整个进程那么大",
+        "宿主读数 `scripts/host/cogneva-alert-bound-band-reading.sh`（不在本仓，登记行 `alert_bound_band`）：每一代应用 Pod **稳定之后**（它这一代最早那 15 分钟之后，按时间跳、不按采样点个数）的 rss，取窗口里的最大值。它是「告警界脚下的那条带」的上沿——界是按「带上沿 ＋ 代内涨幅」定的，带往上漂而界不动，界就会开始把新常态报成压力。取稳定之后而不是第一次抓到的值：刚起的 Pod 第一次被采到时可能只有几 MiB，拿它当出生值会把代内涨幅读成整个进程那么大。跳过的长度按时间算而不是按点数算，是因为查询步长可调：按点数算时同一步在 300 秒步长下覆盖 15 分钟、在 60 秒步长下只有 3 分钟，同一代会被在启动途中取出生值",
     ),
     (
         "cogneva_alert_bound_band_move_max_bytes",
