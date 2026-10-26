@@ -28,9 +28,17 @@ export function StatusBar() {
 
   // 这一格要能说出「已经多久没有帧」，就不能只靠帧来重渲染——帧不来的时候它
   // 一次都不会重渲染，读数会停在「刚刚」。所以它有自己的钟。
+  //
+  // 「没有帧」还要跟「有没有活」一起才成句：有活而全静是断流，没活而静是空闲。
+  // 这一份读数来自轮询而不是帧，正是为了在帧全无的时候还有话可说——两样都取自
+  // 总线，总线一停就什么都判不了。
   const pulse = useLivePulseStore((s) => s.pulse);
   const now = useNow(5_000);
-  const stream = pulseVerdict(pulse, now, connectionStatus);
+  const inflight =
+    o && (o.active_tasks !== null || o.queued_tasks !== null)
+      ? (o.active_tasks ?? 0) + (o.queued_tasks ?? 0)
+      : null;
+  const stream = pulseVerdict(pulse, now, connectionStatus, inflight);
 
   return (
     <footer

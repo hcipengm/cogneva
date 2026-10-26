@@ -116,14 +116,20 @@ export function humanAge(ms: number): string {
 /**
  * 这一格该说什么。
  *
- * 四种情形分开说，因为读者要做的事各不一样：没连上（去查连接）、连上了但一帧都
- * 没到（去查订阅与发帧的那一端）、连上了但已经很久没有帧（平台可能停了）、有帧
- * （这一格是活的，读数可以信它「此刻」）。
+ * 没有帧时的两种「静」不是一回事：平台上有活没干完却一帧都没有，那是发帧的那一端
+ * 停了；平台上本来就没有活，那静得对。只看帧分不开这两件——断流与空闲在画面上完全
+ * 一样——所以判词还要一个来源：`inflight` 是还没做完的任务数，由状态条从它自己的
+ * 那一份读数里传进来（`null`＝那一份没读到，这时不替它猜，按「可能停了」说）。
+ *
+ * 五种情形分开说，因为读者要做的事各不一样：没连上（去查连接）、连上了但一帧都
+ * 没到（有活就先去查订阅与发帧的那一端）、连上了但已经很久没有帧（有活＝断流，
+ * 没活＝空闲）、有帧（这一格是活的，读数可以信它「此刻」）。
  */
 export function pulseVerdict(
   pulse: Pulse,
   nowMs: number,
-  connected: string
+  connected: string,
+  inflight: number | null = null
 ): PulseVerdict {
   if (connected !== 'open') {
     return {
@@ -136,24 +142,61 @@ export function pulseVerdict(
     };
   }
   if (pulse.total === 0 || pulse.lastAtMs === null) {
+    if (inflight !== null && inflight > 0) {
+      // 一帧都没到，而平台上有活：这不可能是「平台没事」，只能是没送到。
+      return {
+        tone: 'warn',
+        color: TONE_COLOR.warn,
+        text: `已连接 · ${inflight} 条活没干完，一帧都没到`,
+        title:
+          `连接开着，平台上也还有 ${inflight} 条活没干完，可总线一帧都没推来。` +
+          '有活而全静，先查订阅的那几族与发帧的那一端——它不该是静的。',
+      };
+    }
     return {
       tone: 'mute',
       color: TONE_COLOR.mute,
       text: '已连接 · 还没有一帧',
       title:
         '连接开着，但总线一帧都没推来。可能是平台此刻真的没事，也可能是订阅的那几族没送到——' +
-        '两种在画面上完全一样，所以这一格只报「一帧都没到」，不替它猜是哪一种。',
+        (inflight === 0
+          ? '平台上此刻一条没做完的活都没有，所以这更像真的没事。'
+          : '两种在画面上完全一样，所以这一格只报「一帧都没到」，不替它猜是哪一种。'),
     };
   }
   const idle = nowMs - pulse.lastAtMs;
   if (idle >= PULSE_STALE_MS) {
+    const age = humanAge(idle);
+    if (inflight === 0) {
+      // 没有活，也没有帧：两件「静」是同一件，不是故障。这一格不该报警色——
+      // 报久了读者就不再信它，真断的那一次会被淹掉。
+      return {
+        tone: 'mute',
+        color: TONE_COLOR.mute,
+        text: `已连接 · 平台空闲 · 最近一帧在 ${age}`,
+        title:
+          `路连着，最近一帧在 ${age}（连上以后一共 ${pulse.total} 帧）。` +
+          '平台此刻没有没做完的活，所以这一段静得对。要判的是反过来的那种：有活没干完却没有帧。',
+      };
+    }
+    if (inflight !== null) {
+      return {
+        tone: 'warn',
+        color: TONE_COLOR.warn,
+        text: `已连接 · ${inflight} 条活没干完 · 最近一帧在 ${age}`,
+        title:
+          `平台上有 ${inflight} 条活没干完，总线却已经 ${age}没有一帧（连上以后一共 ${pulse.total} 帧）。` +
+          '有活而没有帧是断流的判据，不是平台空闲。各面的读数仍按自己的间隔轮询，屏幕不会自己变。',
+      };
+    }
     return {
       tone: 'warn',
       color: TONE_COLOR.warn,
-      text: `已连接 · 最近一帧在 ${humanAge(idle)}`,
+      text: `已连接 · 最近一帧在 ${age}`,
       title:
-        `路还连着，但已经 ${humanAge(idle)}没有一帧（连上以后一共 ${pulse.total} 帧）。` +
-        '平台可能停了，也可能发帧的那一端停了。各面的读数仍按自己的间隔轮询，屏幕不会自己变。',
+        `路还连着，但已经 ${age}没有一帧（连上以后一共 ${pulse.total} 帧）。` +
+        '平台可能停了，也可能发帧的那一端停了——没读到在飞的活，所以这一格不替它分是哪一种。' +
+        '各面的读数仍按自己的间隔轮询，屏幕不会自己变。',
     };
   }
   const perMinute = framesPerMinute(pulse, nowMs);

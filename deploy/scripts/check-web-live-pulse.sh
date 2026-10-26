@@ -19,8 +19,13 @@
 #      `pulseVerdict(pulse, now, connectionStatus)` 决定那一格的颜色、正文与悬停
 #      解释，`now` 来自 `useNow(`——只靠帧触发的重渲染，在帧不来的时候一次都不
 #      重渲染，读数会永远停在「刚刚」，而它正是用来说「已经很久没有帧了」的。
-#   5. 四种情形分开说：没连上、连上但一帧没到、连上但超时无帧、有帧；每种都要带
+#   5. 情形分开说：没连上、连上但一帧没到、连上但超时无帧、有帧；每种都要带
 #      一句解释，判词与读数对不上时读者至少知道该去查哪一头。
+#   6. **没有帧要和「有没有活」一起判**：有活没干完却一帧没有＝断流（查发帧的那
+#      一端），没活而静＝空闲（什么都不用做）。两件事在线路上完全一样，处置相反；
+#      只看帧分不开，而写成同一个报警色的代价是：平台闲下来时这一格天天亮，真断
+#      的那一次就淹在里面。判据要的那一份「有没有活」必须来自轮询，不能也取自
+#      总线——两样同源，总线一停就什么都判不了。
 #
 # 用法：bash deploy/scripts/check-web-live-pulse.sh [仓库根目录]
 set -euo pipefail
@@ -79,10 +84,18 @@ if arrive.start() > quiet.start():
 bar = read("shell/StatusBar.tsx")
 for pattern, why in (
     (r"useLivePulseStore\(\(", "状态条没有从 live store 取到达记录：记了没人读"),
-    (r"pulseVerdict\(pulse, now, connectionStatus\)", "那一格没有按判据算颜色与正文"),
+    (
+        r"pulseVerdict\(pulse, now, connectionStatus, inflight\)",
+        "那一格没有按判据算颜色与正文，或者没有把「有没有活」传进去——"
+        "断流与平台空闲就会写成同一句",
+    ),
     (r"useNow\(", "那一格没有自己的钟：帧不来时它一次都不重渲染，读数永远停在「刚刚」"),
     (r"stream\.text", "算出判词却不显示"),
     (r"tone=\{stream\.color\}", "判词的颜色没接到那一格上：超时无帧与有帧会同色"),
+    (
+        r"active_tasks \?\? 0\) \+ \(o\.queued_tasks",
+        "「有没有活」不是从轮询读数算出来的：两样都取自帧，总线一停就什么都判不了",
+    ),
 ):
     if not re.search(pattern, bar):
         sys.exit(f"shell/StatusBar.tsx 缺 {pattern}：{why}")
@@ -152,7 +165,8 @@ if (humanAge(1_000) !== '1 秒前') fail(`一秒应说「1 秒前」：${humanAg
 if (humanAge(125_000) !== '2 分前') fail(`两分多应说「2 分前」：${humanAge(125_000)}`);
 
 // 8. 四种情形分开说
-const v = (state, now, connected) => pulseVerdict(state, now, connected);
+const v = (state, now, connected, inflight) =>
+  pulseVerdict(state, now, connected, inflight);
 const colorMatches = (verdict) =>
   verdict.color ===
   { ok: 'var(--ok)', warn: 'var(--warn)', mute: 'var(--muted)' }[verdict.tone];
@@ -201,7 +215,32 @@ const fresh = v(foldArrival(EMPTY_PULSE, 100_000), 110_000, 'open');
 if (fresh.text.includes('帧/分')) fail(`刚连上就报「帧/分」是把十秒的帧数说成一分钟的：${fresh.text}`);
 if (!fresh.text.includes('刚 10 秒来了 1 帧')) fail(`刚连上该报实数：${fresh.text}`);
 
-console.log('ok   - 到达口径、窗口、回拨、四种判词与阈值边界都成立');
+// 10. 没有帧要跟「有没有活」一起才成句。两种情况在线路面上完全一样，处置相反：
+//     有活而全静＝断流（查发帧的那一端），没活而静＝空闲（什么都不用做）。
+const quietFor = 200_000 + PULSE_STALE_MS;
+const busy = v(p, quietFor, 'open', 7);
+if (busy.tone !== 'warn') fail('有活没干完却没有帧，不该是绿的或灰的：那是断流');
+if (!busy.text.includes('7 条活没干完')) fail(`有活而全静要说清有几条活：${busy.text}`);
+if (!busy.title.includes('断流')) fail('有活而全静的解释里该点名这是断流');
+
+const free = v(p, quietFor, 'open', 0);
+if (free.tone !== 'mute') fail('平台没有活、也没有帧，不该报警色：那会把空闲说成故障');
+if (!free.text.includes('平台空闲')) fail(`没活而静应说「平台空闲」：${free.text}`);
+if (!colorMatches(free)) fail(`空闲那一格的颜色与判词对不上：${free.tone} / ${free.color}`);
+
+const unknownLoad = v(p, quietFor, 'open', null);
+if (unknownLoad.tone !== 'warn') fail('不知道有没有活时按「可能停了」说，别默认空闲');
+if (unknownLoad.text.includes('条活没干完')) fail('没读到在飞的活，不能编一个数出来');
+
+// 11. 连上了但一帧都没到，也要分有活 / 没活
+const coldBusy = v(EMPTY_PULSE, 200_000, 'open', 3);
+if (coldBusy.tone !== 'warn') fail('有活而一帧都没到，该报警色：这不可能是「平台没事」');
+if (!coldBusy.text.includes('3 条活没干完，一帧都没到')) fail(`一帧没到而平台有活要说清：${coldBusy.text}`);
+const coldFree = v(EMPTY_PULSE, 200_000, 'open', 0);
+if (coldFree.tone !== 'mute') fail('没活而一帧都没到，不该报警色');
+if (!coldFree.title.includes('一条没做完的活都没有')) fail(`没活而一帧没到该说清依据：${coldFree.title}`);
+
+console.log('ok   - 到达口径、窗口、回拨、五种判词、有活与没活的分界、阈值边界都成立');
 JS
 
 echo "check-web-live-pulse: 通过"
