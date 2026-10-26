@@ -24,6 +24,40 @@ use cog_core::{
     PrincipleRow, PrincipleState, SFError, SFResult,
 };
 
+/// Resolve the state and tier words a query template names.
+///
+/// A query that spells `enforced` is a second copy of a word
+/// [`PrincipleState::as_str`] already decides, and the two agree only until one
+/// is renamed. The failure is quiet: a predicate matching the old spelling
+/// returns no rows, and no rows is what this ledger returns when every principle
+/// is settled -- the debt reading answers "nothing is ungated" while the rows sit
+/// right there. The tier column drifts the same way, and a lost tier turns every
+/// principle a person holds into a debt no machine can ever clear.
+///
+/// The slot is named after the value it resolves, and the words come from each
+/// enum's own `ALL`, so a variant added to either set is fillable without anyone
+/// extending a second table here.
+fn fill_vocabulary(template: &str) -> String {
+    let mut slots: Vec<(&str, &str)> = Vec::new();
+    for state in PrincipleState::ALL {
+        slots.push(("state", state.as_str()));
+    }
+    for kind in PrincipleCheckKind::ALL {
+        slots.push(("kind", kind.as_str()));
+    }
+    super::fill_slots(template, &slots)
+}
+
+/// A read over the ledger's own columns, with every state word filled in.
+///
+/// The column list is interpolated once here rather than in each statement, so a
+/// reader cannot come back with a different column order -- and the statements
+/// below stay plain string literals, which is what lets them name `{state:...}`
+/// slots without doubling every brace for `format!`.
+fn read_sql(rest: &str) -> String {
+    fill_vocabulary(&format!("SELECT {ROW_COLUMNS} {rest}"))
+}
+
 /// Every read returns these, in one place so no two readers can come back with
 /// differently ordered columns.
 const ROW_COLUMNS: &str = "slug, lead, carrier_path, carrier_sha256, host_gate, where_red, \
@@ -367,18 +401,18 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         // with no gate named, because the state itself is the evidence that has
         // to be re-read. It sorts first: a wrong verdict is worse than a stamp
         // nobody has written yet.
-        let rows = sqlx::query(&format!(
-            "SELECT {ROW_COLUMNS} FROM principle_ledger \
-             WHERE (state IS NULL OR state = 'unenforced') \
-               AND check_kind = 'judgement' \
+        let rows = sqlx::query(&read_sql(
+            "FROM principle_ledger \
+             WHERE (state IS NULL OR state = '{state:unenforced}') \
+               AND check_kind = '{kind:judgement}' \
                AND (host_gate IS NULL OR host_gate NOT LIKE 'retired:%') \
-               AND (state = 'unenforced' \
+               AND (state = '{state:unenforced}' \
                     OR measured_at IS NULL \
                     OR (COALESCE(host_gate, '') NOT IN ('', '-') \
                         AND host_gate NOT LIKE 'stale:%')) \
-             ORDER BY (state = 'unenforced') DESC, \
+             ORDER BY (state = '{state:unenforced}') DESC, \
                       (measured_at IS NOT NULL) ASC, first_seen_at ASC, slug ASC \
-             LIMIT $1"
+             LIMIT $1",
         ))
         .bind(limit as i64)
         .fetch_all(&self.pool)
@@ -442,19 +476,19 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         // readings do: the debt runs deeper than one pass takes, and a row that
         // was measured once sorts behind every row that was never measured. They
         // clear as the look is written, so the head is spent on work that ends.
-        let rows = sqlx::query(&format!(
-            "SELECT {ROW_COLUMNS} FROM principle_ledger \
-             WHERE (state IS DISTINCT FROM 'enforced' \
+        let rows = sqlx::query(&read_sql(
+            "FROM principle_ledger \
+             WHERE (state IS DISTINCT FROM '{state:enforced}' \
                     OR (COALESCE(host_gate, '-') IN ('-', '') \
                         AND COALESCE(platform_gate, '-') IN ('-', ''))) \
-               AND (state IS DISTINCT FROM 'retired' \
+               AND (state IS DISTINCT FROM '{state:retired}' \
                     OR host_gate IS NULL \
                     OR host_gate NOT LIKE 'retired:%') \
              ORDER BY (COALESCE(host_gate, '') LIKE 'retired:%') DESC, \
-                      (state IS NOT DISTINCT FROM 'enforced') DESC, \
-                      (check_kind IS NOT DISTINCT FROM 'judgement') ASC, \
+                      (state IS NOT DISTINCT FROM '{state:enforced}') DESC, \
+                      (check_kind IS NOT DISTINCT FROM '{kind:judgement}') ASC, \
                       measured_at ASC NULLS FIRST, first_seen_at ASC \
-             LIMIT $1"
+             LIMIT $1",
         ))
         .bind(limit as i64)
         .fetch_all(&self.pool)
@@ -478,9 +512,9 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         // gate, it does not stop a declaration from settling one. Leaving them
         // out here would let a declaration that was later removed keep the row
         // reported as enforced for good.
-        let settled: Vec<(String, Option<String>)> = sqlx::query(
-            "SELECT slug, platform_gate FROM principle_ledger WHERE state = 'enforced'",
-        )
+        let settled: Vec<(String, Option<String>)> = sqlx::query(&fill_vocabulary(
+            "SELECT slug, platform_gate FROM principle_ledger WHERE state = '{state:enforced}'",
+        ))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| SFError::Database(e.to_string()))?
@@ -509,10 +543,10 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         // be this statement deciding what the next pass is for. `measured_at`
         // clears with it so the row sorts with the other unmeasured ones rather
         // than looking freshly looked at.
-        sqlx::query(
+        sqlx::query(&fill_vocabulary(
             "UPDATE principle_ledger SET state = NULL, measured_at = NULL \
-             WHERE slug = ANY($1) AND state = 'enforced'",
-        )
+                 WHERE slug = ANY($1) AND state = '{state:enforced}'",
+        ))
         .bind(&moved)
         .execute(&self.pool)
         .await

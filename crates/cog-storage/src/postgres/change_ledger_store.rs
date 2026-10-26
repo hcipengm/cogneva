@@ -21,6 +21,41 @@ use cog_core::{
     SFResult, WriteWindow,
 };
 
+/// Resolve the state and reason words a query template names.
+///
+/// A query that spells a state is a second copy of a word
+/// [`ChangeState::as_str`] already decides, and the two agree only until one is
+/// renamed. The failure is quiet in the way that matters for a ledger: a
+/// predicate matching the old spelling returns no rows, and no rows is what a
+/// ledger with nothing outstanding returns -- `outstanding` reports an empty
+/// queue, `demand_closure` reports every demand satisfied or every demand owed
+/// depending on which half drifted, and neither is an error anyone sees.
+///
+/// So the templates write `{state:landed}` or `{reason:surface_moved}` and this
+/// fills them. The slot is named after the value it resolves, and the list is
+/// the enum's own `ALL`, so a variant added to the set is fillable without
+/// anyone extending a second table here.
+fn fill_vocabulary(template: &str) -> String {
+    let mut slots: Vec<(&str, &str)> = Vec::new();
+    for state in ChangeState::ALL {
+        slots.push(("state", state.as_str()));
+    }
+    for reason in RetireReason::ALL {
+        slots.push(("reason", reason.as_str()));
+    }
+    super::fill_slots(template, &slots)
+}
+
+/// A read over the ledger's own columns, with every state word filled in.
+///
+/// The column list is interpolated once here rather than in each statement, so a
+/// reader cannot come back with a different column order -- and the templates
+/// below stay plain string literals, which is what lets them name `{state:...}`
+/// slots without doubling every brace for `format!`.
+fn read_sql(rest: &str) -> String {
+    fill_vocabulary(&format!("SELECT {ROW_COLUMNS} {rest}"))
+}
+
 /// Every read returns these, in one place so no two readers can come back with
 /// differently ordered columns.
 const ROW_COLUMNS: &str = "kind, scope, literal, state, title, assertion, sources, \
@@ -242,9 +277,9 @@ impl PostgresChangeLedgerStore {
 /// after the revision made the band column hold a revision, and nothing but a
 /// live database reading the row back could tell. The parameter list is written
 /// here, next to the statement, because the numbering is not the column order.
-const RECORD_READING_SQL: &str = "\
+const RECORD_READING_SQL_TEMPLATE: &str = "\
 INSERT INTO change_ledger (kind, scope, literal, state, title, assertion, sources, first_seen_rev)
-VALUES ($1, $2, $3, 'pending', $4, $5, jsonb_build_array(jsonb_build_object('doc', $6, 'verdict', $7, 'priority', $8, 'block', $9)), $10)
+VALUES ($1, $2, $3, '{state:pending}', $4, $5, jsonb_build_array(jsonb_build_object('doc', $6, 'verdict', $7, 'priority', $8, 'block', $9)), $10)
 ON CONFLICT (kind, scope, literal) DO UPDATE SET
     title = COALESCE(EXCLUDED.title, change_ledger.title),
     assertion = COALESCE(EXCLUDED.assertion, change_ledger.assertion),
@@ -327,7 +362,7 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
 /// and writing that over the arrival reading would say this row entered from a
 /// tree it was never absent from. Only a row that re-enters `landed` after
 /// being reopened has no earlier reading, and takes the new one.
-const APPLY_MEASUREMENT_SQL: &str = "\
+const APPLY_MEASUREMENT_SQL_TEMPLATE: &str = "\
 WITH prior AS (
     SELECT state AS before FROM change_ledger
      WHERE kind = $1 AND scope = $2 AND literal = $3
@@ -343,8 +378,8 @@ WITH prior AS (
         $8,
         $5,
         now(),
-        CASE WHEN $4 = 'landed' THEN now() ELSE NULL END,
-        CASE WHEN $4 = 'retired' THEN now() ELSE NULL END
+        CASE WHEN $4 = '{state:landed}' THEN now() ELSE NULL END,
+        CASE WHEN $4 = '{state:retired}' THEN now() ELSE NULL END
     )
     ON CONFLICT (kind, scope, literal) DO UPDATE SET
         state = EXCLUDED.state,
@@ -355,11 +390,11 @@ WITH prior AS (
                                       EXCLUDED.parent_observation),
         measured_at = now(),
         landed_at = CASE
-            WHEN EXCLUDED.state = 'landed' THEN COALESCE(change_ledger.landed_at, now())
+            WHEN EXCLUDED.state = '{state:landed}' THEN COALESCE(change_ledger.landed_at, now())
             ELSE NULL
         END,
         retired_at = CASE
-            WHEN EXCLUDED.state = 'retired' THEN COALESCE(change_ledger.retired_at, now())
+            WHEN EXCLUDED.state = '{state:retired}' THEN COALESCE(change_ledger.retired_at, now())
             ELSE NULL
         END
     RETURNING state, measured_rev, retire_reason, unsettled_reason
@@ -384,9 +419,9 @@ SELECT 1";
 /// and a plain comparison against NULL matches nothing -- which would file the
 /// most-owed demand there is as neither owed nor satisfied and quietly lose it
 /// from both halves of the reading.
-const DEMAND_CLOSURE_SQL: &str = "\
-SELECT count(*) FILTER (WHERE l.state = 'landed') AS satisfied, \
-       count(*) FILTER (WHERE l.state IS DISTINCT FROM 'landed') AS owed \
+const DEMAND_CLOSURE_SQL_TEMPLATE: &str = "\
+SELECT count(*) FILTER (WHERE l.state = '{state:landed}') AS satisfied, \
+       count(*) FILTER (WHERE l.state IS DISTINCT FROM '{state:landed}') AS owed \
   FROM change_ledger_declared d \
   LEFT JOIN change_ledger l \
     ON (l.kind, l.scope, l.literal) = (d.kind, d.scope, d.literal)";
@@ -409,10 +444,10 @@ SELECT count(*) FILTER (WHERE l.state = 'landed') AS satisfied, \
 /// it folds both "nobody named a face" and "two documents named different
 /// faces" to `none`, and a reader that saw only the column would read a
 /// disagreement as silence.
-const BLOCKING_SURFACE_SQL: &str = "\
+const BLOCKING_SURFACE_SQL_TEMPLATE: &str = "\
 WITH holder AS ( \
     SELECT kind, scope, literal, delivered_rev FROM change_ledger \
-     WHERE delivered_rev IS NOT NULL AND state NOT IN ('landed', 'retired') \
+     WHERE delivered_rev IS NOT NULL AND state NOT IN ('{state:landed}', '{state:retired}') \
 ), held AS ( \
     SELECT DISTINCT l.kind, l.scope, l.literal \
       FROM change_ledger l JOIN holder h ON l.measured_rev = h.delivered_rev \
@@ -421,7 +456,7 @@ WITH holder AS ( \
 SELECT (SELECT count(*) FROM holder) AS holders, \
        (SELECT count(*) FROM held) AS held_landings, \
        (SELECT count(*) FROM change_ledger l \
-         WHERE l.state NOT IN ('landed', 'retired') \
+         WHERE l.state NOT IN ('{state:landed}', '{state:retired}') \
            AND (SELECT count(DISTINCT entry->>'block') \
                   FROM jsonb_array_elements(l.sources) AS entry \
                  WHERE entry->>'block' IS NOT NULL \
@@ -439,7 +474,7 @@ SELECT (SELECT count(*) FROM holder) AS holders, \
 /// alone. A row that has never been measured is not ageless -- it has been
 /// waiting since it entered -- and taking `NULL` as the answer would let a face
 /// full of never-measured rows report no wait at all.
-const BLOCKING_HOLDERS_SQL: &str = "\
+const BLOCKING_HOLDERS_SQL_TEMPLATE: &str = "\
 SELECT h.kind, h.scope, h.literal, \
        (SELECT count(DISTINCT (l.kind, l.scope, l.literal)) \
           FROM change_ledger l \
@@ -447,12 +482,13 @@ SELECT h.kind, h.scope, h.literal, \
            AND (l.kind, l.scope, l.literal) IS DISTINCT FROM (h.kind, h.scope, h.literal)) \
          AS held \
   FROM change_ledger h \
- WHERE h.delivered_rev IS NOT NULL AND h.state NOT IN ('landed', 'retired') \
+ WHERE h.delivered_rev IS NOT NULL AND h.state NOT IN ('{state:landed}', '{state:retired}') \
  ORDER BY held DESC, h.kind, h.scope, h.literal";
 
-const BLOCK_CENSUS_SQL: &str = "\
+const BLOCK_CENSUS_SQL_TEMPLATE: &str = "\
 SELECT block, \
-       CASE state WHEN 'landed' THEN 'landed' WHEN 'retired' THEN 'retired' \
+       CASE state WHEN '{state:landed}' THEN '{state:landed}' \
+                  WHEN '{state:retired}' THEN '{state:retired}' \
                   ELSE 'owed' END AS state, \
        count(*) AS n, \
        max(EXTRACT(EPOCH FROM (now() - COALESCE(measured_at, first_seen_at))))::float8 \
@@ -498,12 +534,12 @@ UPDATE change_ledger SET delivered_rev = $4
 /// of their own is not this pass's to relabel -- overwriting it would erase the
 /// one fact that distinguished "waiting on a person" from "waiting on a pool",
 /// which is the whole point of the column.
-const STAMP_POOL_BLOCK_SQL: &str = "\
+const STAMP_POOL_BLOCK_SQL_TEMPLATE: &str = "\
 UPDATE change_ledger
    SET blocked_reason = 'pool_unavailable',
        unblock_condition = $1,
        blocked_since = COALESCE(blocked_since, now())
- WHERE state = 'pending'
+ WHERE state = '{state:pending}'
    AND (blocked_reason IS NULL OR blocked_reason = 'pool_unavailable')";
 
 /// Take the pool block back off. Keyed on the reason, not on "blocked": the
@@ -612,7 +648,7 @@ fn check_measurement(m: &ChangeMeasurement) -> Result<(), String> {
 /// was narrower and is fixed where it happened: the corrected declaration reached
 /// the ledger and the ledger went on citing the verdict the document made first,
 /// because the reading path kept a cited document's entry as it was. See
-/// [`RECORD_READING_SQL`].
+/// [`RECORD_READING_SQL_TEMPLATE`].
 const DECLARE_SQL: &str = "\
 INSERT INTO change_ledger_declared (kind, scope, literal, doc, title, assertion, verdict, priority, block)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -693,7 +729,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         let mut stored = 0usize;
         for reading in readings {
             check_reading(reading).map_err(SFError::Validation)?;
-            sqlx::query(RECORD_READING_SQL)
+            sqlx::query(&fill_vocabulary(RECORD_READING_SQL_TEMPLATE))
                 .bind(&reading.identity.kind)
                 .bind(&reading.identity.scope)
                 .bind(&reading.identity.literal)
@@ -874,7 +910,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
 
     async fn apply_measurement(&self, measurement: &ChangeMeasurement) -> SFResult<()> {
         check_measurement(measurement).map_err(SFError::Validation)?;
-        sqlx::query(APPLY_MEASUREMENT_SQL)
+        sqlx::query(&fill_vocabulary(APPLY_MEASUREMENT_SQL_TEMPLATE))
             .bind(&measurement.identity.kind)
             .bind(&measurement.identity.scope)
             .bind(&measurement.identity.literal)
@@ -950,8 +986,8 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // fixture identity back to the tree, whose check would only overwrite the
         // retirement with the unsettled answer it was retired to stop repeating.
         Self::entries(
-            sqlx::query(&format!(
-                "SELECT {ROW_COLUMNS} FROM (\
+            sqlx::query(&read_sql(
+                "FROM (\
                      SELECT ranked.*, \
                             row_number() OVER (\
                                 PARTITION BY (ranked.by_age <= $2::bigint) \
@@ -967,12 +1003,12 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                                                  l.measured_at ASC NULLS FIRST, \
                                                  l.first_seen_at ASC) AS by_band \
                                FROM change_ledger l \
-                              WHERE l.state NOT IN ('landed', 'retired')\
+                              WHERE l.state NOT IN ('{state:landed}', '{state:retired}')\
                        ) ranked \
                  ) t \
                  WHERE t.by_age <= $2::bigint \
                     OR t.of_rest <= $1::bigint - $2::bigint \
-                 ORDER BY t.by_band"
+                 ORDER BY t.by_band",
             ))
             .bind(limit as i64)
             .bind((limit / 2) as i64)
@@ -1055,14 +1091,15 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // than dropped, which is the same direction the generated column takes
         // them: a count that vanished would make the five cells stop adding up to
         // the owed set, and that sum is a reader's only check on the split.
-        let counted: Vec<(i16, i64)> = sqlx::query_as(
+        let owed_by_band_sql = fill_vocabulary(
             "SELECT priority_rank, count(*) FROM change_ledger \
-             WHERE state NOT IN ('landed', 'retired') \
+             WHERE state NOT IN ('{state:landed}', '{state:retired}') \
              GROUP BY priority_rank",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(format!("count the owed set by band: {e}")))?;
+        );
+        let counted: Vec<(i16, i64)> = sqlx::query_as(&owed_by_band_sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("count the owed set by band: {e}")))?;
         Ok(ChangePriority::ALL
             .into_iter()
             .map(|band| {
@@ -1092,11 +1129,11 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // different callers -- a bound wide enough to sweep the work would put a
         // day-old landed row at the head of this one.
         Self::entries(
-            sqlx::query(&format!(
-                "SELECT {ROW_COLUMNS} FROM change_ledger \
-                 WHERE state = 'landed' \
+            sqlx::query(&read_sql(
+                "FROM change_ledger \
+                 WHERE state = '{state:landed}' \
                  ORDER BY measured_at ASC NULLS FIRST, first_seen_at ASC \
-                 LIMIT $1"
+                 LIMIT $1",
             ))
             .bind(limit as i64)
             .fetch_all(&self.pool)
@@ -1122,19 +1159,19 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // a revision touched, which is what keeps a wide commit from making the
         // statement's parameter count depend on the tree.
         Self::entries(
-            sqlx::query(&format!(
-                "SELECT {ROW_COLUMNS} FROM change_ledger c \
+            sqlx::query(&read_sql(
+                "FROM change_ledger c \
                  CROSS JOIN LATERAL ( \
                      SELECT rtrim(regexp_replace(c.scope, '^\\./', ''), '/') AS s \
                  ) n \
-                 WHERE c.state = 'landed' AND ( \
+                 WHERE c.state = '{state:landed}' AND ( \
                      n.s = '' OR n.s = '.' OR EXISTS ( \
                          SELECT 1 FROM unnest($1::text[]) AS p(path) \
                          WHERE p.path = n.s OR p.path LIKE n.s || '/%' \
                      ) \
                  ) \
                  ORDER BY c.measured_at ASC NULLS FIRST, c.first_seen_at ASC \
-                 LIMIT $2"
+                 LIMIT $2",
             ))
             .bind(paths.to_vec())
             .bind(limit as i64)
@@ -1157,19 +1194,19 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // predates the event log, and `measured_rev` is the only revision they
         // carry, which after any re-check is a revision their check was *not*
         // done at. Those rows stay `unmeasured`, which is the truth about them.
-        let rows = sqlx::query(
+        let rows = sqlx::query(&fill_vocabulary(
             "SELECT c.kind, c.scope, c.literal, l.measured_rev \
              FROM change_ledger c \
              JOIN LATERAL ( \
                  SELECT e.measured_rev FROM change_ledger_event e \
                  WHERE e.kind = c.kind AND e.scope = c.scope AND e.literal = c.literal \
-                   AND e.to_state = 'landed' AND e.measured_rev IS NOT NULL \
+                   AND e.to_state = '{state:landed}' AND e.measured_rev IS NOT NULL \
                  ORDER BY e.observed_at ASC, e.id ASC LIMIT 1 \
              ) l ON TRUE \
-             WHERE c.state = 'landed' AND c.parent_observation IS NULL \
+             WHERE c.state = '{state:landed}' AND c.parent_observation IS NULL \
              ORDER BY c.measured_at ASC NULLS FIRST, c.first_seen_at ASC \
              LIMIT $1",
-        )
+        ))
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await
@@ -1231,11 +1268,11 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // rows advances. An order by anything else would leave a bounded caller
         // re-reading the same head of the set.
         Self::entries(
-            sqlx::query(&format!(
-                "SELECT {ROW_COLUMNS} FROM change_ledger \
-                 WHERE state = 'retired' AND retire_reason = 'surface_moved' \
+            sqlx::query(&read_sql(
+                "FROM change_ledger \
+                 WHERE state = '{state:retired}' AND retire_reason = '{reason:surface_moved}' \
                  ORDER BY retired_at ASC NULLS FIRST, first_seen_at ASC \
-                 LIMIT $1"
+                 LIMIT $1",
             ))
             .bind(limit as i64)
             .fetch_all(&self.pool)
@@ -1253,11 +1290,11 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // Ordered by `retired_at`: a retirement that still holds has no
         // measurement to advance, so nothing else in this order moves.
         Self::entries(
-            sqlx::query(&format!(
-                "SELECT {ROW_COLUMNS} FROM change_ledger \
-                 WHERE state = 'retired' AND retire_reason = 'answered_elsewhere' \
+            sqlx::query(&read_sql(
+                "FROM change_ledger \
+                 WHERE state = '{state:retired}' AND retire_reason = '{reason:answered_elsewhere}' \
                  ORDER BY retired_at ASC NULLS FIRST, first_seen_at ASC \
-                 LIMIT $1"
+                 LIMIT $1",
             ))
             .bind(limit as i64)
             .fetch_all(&self.pool)
@@ -1292,7 +1329,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
     }
 
     async fn stamp_pool_block(&self, unblock_condition: &str) -> SFResult<u64> {
-        let result = sqlx::query(STAMP_POOL_BLOCK_SQL)
+        let result = sqlx::query(&fill_vocabulary(STAMP_POOL_BLOCK_SQL_TEMPLATE))
             .bind(unblock_condition)
             .execute(&self.pool)
             .await
@@ -1374,7 +1411,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // The outer join is what keeps a declaration whose change never entered
         // the account counted as owed instead of dropped: it is a demand nobody
         // has measured yet, which is the most owed a demand can be.
-        let row = sqlx::query(DEMAND_CLOSURE_SQL)
+        let row = sqlx::query(&fill_vocabulary(DEMAND_CLOSURE_SQL_TEMPLATE))
             .fetch_one(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("read demand closure: {e}")))?;
@@ -1400,7 +1437,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // The `DISTINCT` is the difference between "how much is behind this"
         // and "how many pairs": a row measured at a revision two holders both
         // delivered is one row held, not two.
-        let row = sqlx::query(BLOCKING_SURFACE_SQL)
+        let row = sqlx::query(&fill_vocabulary(BLOCKING_SURFACE_SQL_TEMPLATE))
             .fetch_one(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("read blocking surface: {e}")))?;
@@ -1426,7 +1463,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // purpose -- the counts have to come from one snapshot to agree, and a
         // per-holder list is not something the totals can be recovered from
         // because a landing two holders stand on is one landing, not two.
-        let rows = sqlx::query(BLOCKING_HOLDERS_SQL)
+        let rows = sqlx::query(&fill_vocabulary(BLOCKING_HOLDERS_SQL_TEMPLATE))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("read blocking holders: {e}")))?;
@@ -1473,7 +1510,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // while. Measured here rather than counted by the pass, because a
         // counter would be forgotten by a restart and would count ticks rather
         // than time.
-        let rows = sqlx::query(BLOCK_CENSUS_SQL)
+        let rows = sqlx::query(&fill_vocabulary(BLOCK_CENSUS_SQL_TEMPLATE))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("read block census: {e}")))?;
@@ -1506,29 +1543,34 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         if !names.contains(&ChangeBlock::NONE.as_str()) {
             names.insert(0, ChangeBlock::NONE.as_str());
         }
+        // 这三处比的是查询返回的桶名，而桶名就是 `as_str` 写进去的那个词：比作
+        // 字面量的话，改一位枚举的名字，写进去的词变了、这里没变，每一行都会被
+        // 读成「还没落地」。
+        let landed_word = ChangeState::Landed.as_str();
+        let retired_word = ChangeState::Retired.as_str();
         let mut census = Vec::with_capacity(names.len());
         for name in names {
             let landed = counted
                 .iter()
-                .filter(|(found, state, _, _, _)| found == name && state == "landed")
+                .filter(|(found, state, _, _, _)| found == name && state == landed_word)
                 .map(|(_, _, n, _, _)| *n)
                 .sum::<i64>();
             let owed = counted
                 .iter()
                 .filter(|(found, state, _, _, _)| {
-                    found == name && state != "landed" && state != "retired"
+                    found == name && state != landed_word && state != retired_word
                 })
                 .map(|(_, _, n, _, _)| *n)
                 .sum::<i64>();
             let retired = counted
                 .iter()
-                .filter(|(found, state, _, _, _)| found == name && state == "retired")
+                .filter(|(found, state, _, _, _)| found == name && state == retired_word)
                 .map(|(_, _, n, _, _)| *n)
                 .sum::<i64>();
             let oldest = counted
                 .iter()
                 .filter(|(found, state, _, _, _)| {
-                    found == name && state != "landed" && state != "retired"
+                    found == name && state != landed_word && state != retired_word
                 })
                 .filter_map(|(_, _, _, secs, _)| *secs)
                 .fold(None::<f64>, |acc, secs| {
