@@ -66,6 +66,14 @@ const FETCH_TIMEOUT_SECS: u64 = 30;
 /// slowest is not worth the turn.
 const SEARCH_TIMEOUT_SECS: u64 = 20;
 
+/// How many times a search whose engines all stayed silent is asked again.
+///
+/// Only that one outcome is repeated: an engine that timed out once often
+/// answers the next request, while a non-200 or a body that is not JSON is a
+/// verdict about the request itself and asking again returns the same verdict
+/// for the same wait.
+const SEARCH_ATTEMPTS: u32 = 2;
+
 /// The environment variable that names the SearXNG base URL.
 ///
 /// Named here, next to the tool that reads it, so the deployment's env table and
@@ -554,75 +562,142 @@ pub fn web_search(client: Option<Arc<dyn HttpClient>>, base: Option<String>) -> 
                     .unwrap_or("general");
                 url.push_str(&format!("&categories={}", encode_component(categories)));
 
-                let mut req = HttpRequest::new("GET", url.clone());
-                req.timeout_secs = Some(SEARCH_TIMEOUT_SECS);
-                req.headers
-                    .insert("Accept".into(), "application/json".into());
-                let resp = client.execute(req).await.map_err(|e| {
-                    SFError::Agent(format!("web search backend at {base} is unreachable: {e}"))
-                })?;
-                if !resp.is_success() {
-                    let body = String::from_utf8_lossy(&resp.body);
-                    let hint = if resp.status == 403 || body.contains("format") {
-                        " -- SearXNG refuses JSON by default; add `json` to `search.formats` \
-                         in its settings"
-                    } else {
-                        ""
-                    };
+                // A search that came back empty because the engines were
+                // silent is asked again, because that is the one failure here
+                // with a good chance of not repeating: measured on this
+                // deployment, one query returned zero hits with the engine
+                // timing out and the very next query answered normally. One
+                // extra request buys the caller an answer instead of a "the web
+                // has nothing on this" that is wrong. Everything else -- a
+                // non-200, a body that is not JSON -- is a verdict about the
+                // request and is not repeated.
+                let mut attempt = 0;
+                let answer = loop {
+                    attempt += 1;
+                    let mut req = HttpRequest::new("GET", url.clone());
+                    req.timeout_secs = Some(SEARCH_TIMEOUT_SECS);
+                    req.headers
+                        .insert("Accept".into(), "application/json".into());
+                    let resp = client.execute(req).await.map_err(|e| {
+                        SFError::Agent(format!("web search backend at {base} is unreachable: {e}"))
+                    })?;
+                    let answer = search_answer(&resp, &base, limit)?;
+                    if !answer.results.is_empty()
+                        || answer.broken.is_empty()
+                        || attempt >= SEARCH_ATTEMPTS
+                    {
+                        break answer;
+                    }
+                };
+                // Zero hits means two different things depending on who is
+                // reporting it. From an engine that answered, it says the query
+                // was asked and nothing matched -- paraphrasing is the right
+                // next move. From a fan-out where every engine that could have
+                // answered went silent, it says the query was never asked --
+                // retrying is the right next move, and rewriting the question
+                // throws away the one thing that was working. Returning both as
+                // `count: 0` leaves the caller to pick between those without
+                // the fact it needs, so the silent one is an error that names
+                // the engines instead of a result set.
+                if answer.results.is_empty() && !answer.broken.is_empty() {
+                    let names: Vec<String> = answer.broken.iter().map(|e| e.to_string()).collect();
                     return Err(SFError::Agent(format!(
-                        "web search backend answered {}{hint}: {}",
-                        resp.status,
-                        body.chars().take(300).collect::<String>()
+                        "web search came back empty after {attempt} attempt(s) because no \
+                         engine answered, which is not the same answer as 'nothing \
+                         matched': the query was never put to anything. Engines that \
+                         stayed silent: {}. Retry the same query rather than rephrasing \
+                         it",
+                        names.join(", ")
                     )));
                 }
-                let body: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
-                    SFError::Agent(format!(
-                        "web search backend at {base} did not answer with JSON ({e}); a \
-                         backend serving HTML only needs `json` added to its `search.formats`",
-                    ))
-                })?;
-                let results: Vec<serde_json::Value> = body["results"]
-                    .as_array()
-                    .map(Vec::as_slice)
-                    .unwrap_or_default()
-                    .iter()
-                    .take(limit as usize)
-                    .map(|hit| {
-                        serde_json::json!({
-                            "title": hit["title"],
-                            "url": hit["url"],
-                            "snippet": hit["content"],
-                            "engine": hit["engine"],
-                            "published": hit["publishedDate"],
-                        })
-                    })
-                    .collect();
                 let mut out = serde_json::json!({
                     "query": query,
                     "limit": limit,
-                    "count": results.len(),
-                    "results": results,
+                    "count": answer.results.len(),
+                    "results": answer.results,
                 });
                 // Answers and suggestions come from the engines' own knowledge
-                // cards; when present they answer without a second fetch.
-                for key in ["answers", "suggestions", "infoboxes"] {
-                    if let Some(value) = body
-                        .get(key)
-                        .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
-                    {
-                        out[key] = value.clone();
-                    }
+                // cards; when present they answer without a second fetch. They
+                // are kept out of an empty answer: a card-only reply would read
+                // as a result set that happens to have no hits.
+                for (key, value) in answer.extras {
+                    out[key] = value;
                 }
-                if let Some(broken) = body
-                    .get("unresponsive_engines")
-                    .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
-                {
-                    out["unresponsive_engines"] = broken.clone();
+                if !answer.broken.is_empty() {
+                    out["unresponsive_engines"] = serde_json::Value::Array(answer.broken);
                 }
                 Ok(out)
             })
         })),
     }
+}
+
+/// One answer from the search backend, split into what the caller acts on.
+///
+/// The three parts are kept apart because they mean different things: `results`
+/// is what the engines found, `broken` is which of them never answered, and
+/// `extras` are the knowledge cards that answer without a second fetch. Folding
+/// `broken` into `results` is what makes an outage read as an empty web.
+struct SearchAnswer {
+    results: Vec<serde_json::Value>,
+    broken: Vec<serde_json::Value>,
+    extras: Vec<(String, serde_json::Value)>,
+}
+
+fn search_answer(resp: &cog_core::HttpResponse, base: &str, limit: u64) -> SFResult<SearchAnswer> {
+    if !resp.is_success() {
+        let body = String::from_utf8_lossy(&resp.body);
+        let hint = if resp.status == 403 || body.contains("format") {
+            " -- SearXNG refuses JSON by default; add `json` to `search.formats` in its settings"
+        } else {
+            ""
+        };
+        return Err(SFError::Agent(format!(
+            "web search backend answered {}{hint}: {}",
+            resp.status,
+            body.chars().take(300).collect::<String>()
+        )));
+    }
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
+        SFError::Agent(format!(
+            "web search backend at {base} did not answer with JSON ({e}); a \
+             backend serving HTML only needs `json` added to its `search.formats`",
+        ))
+    })?;
+    let results: Vec<serde_json::Value> = body["results"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .take(limit as usize)
+        .map(|hit| {
+            serde_json::json!({
+                "title": hit["title"],
+                "url": hit["url"],
+                "snippet": hit["content"],
+                "engine": hit["engine"],
+                "published": hit["publishedDate"],
+            })
+        })
+        .collect();
+    let broken: Vec<serde_json::Value> = body
+        .get("unresponsive_engines")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let extras: Vec<(String, serde_json::Value)> = ["answers", "suggestions", "infoboxes"]
+        .into_iter()
+        .filter_map(|key| {
+            body.get(key)
+                .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+                .map(|v| (key.to_string(), v.clone()))
+        })
+        .collect();
+    Ok(SearchAnswer {
+        results,
+        broken,
+        extras,
+    })
 }
 
 /// The rendering backend, or `None` when this deployment reads pages in process.
@@ -1025,6 +1100,132 @@ mod tests {
         assert!(
             out.get("answers").is_none(),
             "an empty list is left out rather than shown as an empty answer: {out}"
+        );
+    }
+
+    /// A fan-out where nothing answered is a failed lookup, not an empty web.
+    ///
+    /// The backend reports both the same way -- HTTP 200 and a `results` array
+    /// -- and only `unresponsive_engines` says which of the two happened. A
+    /// caller that reads `count: 0` as "nothing matched" rephrases a question
+    /// that was never asked, and the retry that would have worked never
+    /// happens. This is the reading a single-engine deployment produces every
+    /// time that engine times out, which is exactly how it looked in
+    /// production.
+    #[tokio::test]
+    async fn search_says_nothing_answered_rather_than_nothing_matched() {
+        let silent = r#"{"query":"rust lang","results":[],"answers":[],"suggestions":[],
+               "unresponsive_engines":[["bing","timeout"]]}"#
+            .to_string();
+        let scripted = Scripted::answering_in_order(vec![
+            (200, "application/json", silent.clone()),
+            (200, "application/json", silent),
+        ]);
+        let tool = web_search(client_of(&scripted), Some("http://searxng:8080".into()));
+        let err = call(&tool, serde_json::json!({"query":"rust lang"}))
+            .await
+            .expect_err("an empty answer from silent engines is not a result set");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bing") && msg.contains("timeout"),
+            "the error has to name the engine and its own reason, otherwise the caller \
+             cannot tell a dead engine from a reachable one that found nothing: {msg}"
+        );
+        assert!(
+            msg.contains("Retry"),
+            "the error has to say what to do instead, because the move that looks \
+             obvious (rephrase) is the wrong one here: {msg}"
+        );
+        assert_eq!(
+            scripted.asked().len(),
+            SEARCH_ATTEMPTS as usize,
+            "the silence has to be re-asked before it is reported: one timed-out engine \
+             often answers the next request, and this deployment has only one engine"
+        );
+    }
+
+    /// Silence that clears on the second ask is an answer, not an error.
+    ///
+    /// This is the case the retry exists for and the one measured on the
+    /// deployment: the first query came back empty with the engine timing out,
+    /// and the request right after it returned the hits. Reporting the first
+    /// one would hand the caller an outage it would then have to retry itself,
+    /// through a model turn, at the cost of a whole turn.
+    #[tokio::test]
+    async fn search_asks_again_when_the_first_ask_found_nothing_and_nobody_answered() {
+        let scripted = Scripted::answering_in_order(vec![
+            (
+                200,
+                "application/json",
+                r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string(),
+            ),
+            (
+                200,
+                "application/json",
+                r#"{"results":[{"title":"Rust","url":"https://rust-lang.org/","content":"fast",
+                     "engine":"bing"}],"unresponsive_engines":[]}"#
+                    .to_string(),
+            ),
+        ]);
+        let tool = web_search(client_of(&scripted), Some("http://searxng:8080".into()));
+        let out = call(&tool, serde_json::json!({"query":"rust"}))
+            .await
+            .expect("the second ask answered, so this is a hit and not an outage");
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["results"][0]["url"], "https://rust-lang.org/");
+        assert_eq!(
+            scripted.asked().len(),
+            2,
+            "exactly one extra ask: the retry is not a loop that keeps the caller waiting"
+        );
+    }
+
+    /// One engine down but another one answering is still an answer.
+    ///
+    /// The distinction above must not swallow this case: hits arrived, so the
+    /// query was asked and the caller can act on what came back. The dead
+    /// engine rides along as a field rather than turning a usable answer into
+    /// an error.
+    #[tokio::test]
+    async fn search_returns_hits_when_one_engine_failed_and_another_answered() {
+        let scripted = Scripted::answering(
+            200,
+            "application/json",
+            r#"{"results":[
+                 {"title":"Rust","url":"https://rust-lang.org/","content":"fast","engine":"bing"}],
+               "unresponsive_engines":[["sogou","crash"]]}"#,
+        );
+        let tool = web_search(client_of(&scripted), Some("http://searxng:8080".into()));
+        let out = call(&tool, serde_json::json!({"query":"rust"}))
+            .await
+            .expect("an engine answered, so the query was asked");
+        assert_eq!(out["count"], 1);
+        assert_eq!(
+            out["unresponsive_engines"][0][0], "sogou",
+            "the dead engine is still reported next to the usable answer: {out}"
+        );
+    }
+
+    /// Engines that answered and found nothing is a real empty result.
+    ///
+    /// Without this case the rule above could be written as "an empty list is
+    /// always an error", which would turn a legitimate no-match into a retry
+    /// loop.
+    #[tokio::test]
+    async fn search_reports_an_empty_list_when_every_engine_answered() {
+        let scripted = Scripted::answering(
+            200,
+            "application/json",
+            r#"{"query":"q","results":[],"unresponsive_engines":[]}"#,
+        );
+        let tool = web_search(client_of(&scripted), Some("http://searxng:8080".into()));
+        let out = call(&tool, serde_json::json!({"query":"q"}))
+            .await
+            .expect("engines answered; the web simply had nothing");
+        assert_eq!(out["count"], 0);
+        assert!(
+            out.get("unresponsive_engines").is_none(),
+            "an empty list is left out rather than reported as an outage: {out}"
         );
     }
 
