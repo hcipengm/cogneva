@@ -15,6 +15,7 @@
 #   - 服务端把「节点没匹配上」并入 unscheduled → 整屏 Pod 变成「没被调度」
 #   - 服务端那条测试被删掉          → 上面这条分流可以被人改回去而不让任何东西红
 #   - 把 clusters 折成 clusters[0]  → 接上第二个集群那天，它在屏上根本不存在
+#   - 把卷与事件排进容器下面         → 屏上说的包含关系是 Kubernetes 里没有的
 # 每段改动都先确认**落到了文件上**（否则「改动没生效」与「门没抓住」不可区分）。
 #
 # 最后一条断言是在**真树**上跑：夹具全绿而真树红，说明这条门只是在测自己。
@@ -244,6 +245,12 @@ sed -i 's/return topology.data?.clusters ?? \[\];/return topology.data?.clusters
   "${work}/web/src/hooks/useTopology.ts"
 confirm "${work}/web/src/hooks/useTopology.ts" "clusters[0]"
 expect_red "只读第一个集群" "把集群列表折成了第一个"
+
+# 12. 把卷与事件画成容器的下一级：箭头链在断言一条并不存在的包含关系。
+fixture
+printf '// 集群 → 节点 → Pod → 容器 → 卷与事件\n' >>"${work}/web/src/topology/TopologyPanel.tsx"
+confirm "${work}/web/src/topology/TopologyPanel.tsx" "容器 → 卷与事件"
+expect_red "把卷与事件排进容器下面" "写成了容器的下一级"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0

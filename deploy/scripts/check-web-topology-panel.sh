@@ -24,7 +24,10 @@
 #   6. 完成的与失败的分开数；
 #   7. 服务端 `place_pods` 真的把「写着在节点上、但没匹配到节点」的 Pod 放进
 #      `unplaced`，且有一条按名字守这件事的测试；
-#   8. 集群列表被遍历过（`clusters.map`），且没有任何一处把整份列表折成第一个。
+#   8. 集群列表被遍历过（`clusters.map`），且没有任何一处把整份列表折成第一个；
+#   9. 没有把卷 / 挂载 / 事件画成容器的下一级——箭头链是在断言包含关系，而这三样
+#      不是容器的下级（卷定义在 Pod 上，容器只是挂进来；事件是独立对象，按
+#      `involvedObject` 关联）。
 #
 # 用法：bash deploy/scripts/check-web-topology-panel.sh [仓库根目录]
 set -euo pipefail
@@ -232,6 +235,30 @@ if folders:
 if not re.search(r"\bclusters\b[^\n]*\.map\s*\(", shown):
     problems.append(
         f"{where}: 没有一个面遍历 clusters——集群列表拿在手里却只渲染其中一个"
+    )
+
+# ── 9. 卷与事件不是容器的下级 ──
+# 一条箭头链是在断言包含关系。卷写在 Pod 的 `spec.volumes` 里，容器用
+# `volumeMounts` 把其中一卷挂进自己的文件系统；事件是独立对象，靠 `involvedObject`
+# 关联到 Pod 或节点。把任何一个排进容器的下一级，读者就会以为卷跟着容器走、
+# Pod 删了事件就没了，而屏上没有任何东西会因此显得不对。
+ARROW = re.compile(r"\s*(?:→|->)\s*")
+BELOW_CONTAINER = re.compile(r"^(?:挂载|卷|事件)")
+misplaced = []
+for root, _dirs, names in os.walk(WEB):
+    for name in names:
+        if not name.endswith((".ts", ".tsx", ".md")):
+            continue
+        path = os.path.join(root, name)
+        for lineno, line in enumerate(open(path, encoding="utf-8"), 1):
+            parts = [part for part in ARROW.split(line.rstrip("\n")) if part.strip()]
+            arrows = len(parts) - 1
+            if arrows >= 2 and BELOW_CONTAINER.match(parts[-1].strip()):
+                misplaced.append(f"{os.path.relpath(path, WEB)}:{lineno}")
+if misplaced:
+    problems.append(
+        f"{', '.join(misplaced)}: 箭头链以挂载/卷/事件收尾，把它们写成了容器的下一级——"
+        "卷定义在 Pod 上、容器只是挂进来，事件是独立对象按 involvedObject 关联"
     )
 
 if problems:

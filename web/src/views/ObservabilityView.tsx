@@ -37,7 +37,7 @@ type BoardId =
 const BOARDS: { id: BoardId; label: string; what: string }[] = [
   { id: 'overview', label: '概况', what: '集群判词、监管者、工作负载' },
   { id: 'readings', label: '读数', what: '六条要动手的数，各带来源与 Grafana 深链' },
-  { id: 'topology', label: '拓扑', what: '集群 → 节点 → Pod → 容器 → 卷与事件' },
+  { id: 'topology', label: '拓扑', what: '集群 → 节点 → Pod → 容器；卷与事件并列在 Pod 上' },
   { id: 'metrics', label: '指标', what: '平台自己登记的累计计数' },
   { id: 'logs', label: '日志', what: '归档索引（正文在存储面）' },
   { id: 'traces', label: 'trace', what: '执行轨迹的形状' },
