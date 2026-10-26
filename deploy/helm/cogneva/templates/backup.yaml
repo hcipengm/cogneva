@@ -135,6 +135,15 @@ spec:
                       name: {{ . | quote }}
                       key: {{ $.Values.backup.packageKeySecret.key | quote }}
                 {{- end }}
+                # 实例身份：包里记的「这份字节出自哪个实例」就靠它。只取这一个键，
+                # 不挂整片——这一片里其余键都是凭证，而这个 Pod 不需要它们。少了
+                # 它，manifest 那一格会写成 unknown，换机后两份包分不出谁是谁。
+                - name: COGNEVA_INSTANCE_FINGERPRINT
+                  valueFrom:
+                    secretKeyRef:
+                      name: cogneva-secrets
+                      key: instance-fingerprint
+                      optional: true
                 - name: COGNEVA_NAMESPACE
                   valueFrom:
                     fieldRef:
