@@ -230,3 +230,63 @@ async fn lifecycle_event_broadcasted() {
          overwrites the health-check cycle with 0"
     );
 }
+
+/// 离队的 id 在这一条路上也不许发事件。
+///
+/// 这条通道有两个写者：监督自己收尾时的 `announce_verdicts`，和这里的生命周期
+/// 协调器，而这里**先跑**。只在收尾那处加过滤器，等于给一条有两扇门的路只锁了
+/// 一扇——现网读数会一动不动。两处读同一个 `HealthReport::announces`。
+///
+/// 门的两半：事件一条都不许出来（判决不算「不健康」），而状态迁移照旧（离队的
+/// agent 的任务还要有人接手，走了不等于不用管）。
+#[tokio::test]
+async fn a_departed_id_emits_no_lifecycle_event_but_still_transitions() {
+    let backend = mk_backend();
+    backend
+        .set_agent_state("squad:one-shot-planner", &AgentState::Active)
+        .await
+        .unwrap();
+    let registry = mk_registry();
+    registry.register_agent(AgentInfo {
+        agent_id: "squad:one-shot-planner".into(),
+        role: None,
+        crew_id: None,
+        squad_id: None,
+        task_ids: vec![],
+        last_heartbeat: Utc::now(),
+        state_since: Utc::now(),
+        registered_at: Utc::now(),
+    });
+
+    let (coord, mut rx) = mk_coordinator(registry, Arc::clone(&backend));
+    let report = HealthReport {
+        dead: vec![(
+            "squad:one-shot-planner".into(),
+            cog_core::HealthIssue::Dead {
+                last_seen: Utc::now(),
+            },
+        )],
+        departed: vec!["squad:one-shot-planner".into()],
+        ..Default::default()
+    };
+
+    let result = coord.handle_health_report(&report).await.unwrap();
+
+    assert!(
+        rx.try_recv().is_err(),
+        "名单里已经没有它了：这条判决不是「不健康的 agent」"
+    );
+    assert_eq!(result.events_emitted, 0);
+    assert_eq!(
+        result.transitioned.len(),
+        1,
+        "迁移照旧：离队的 agent 的任务还要有人接手"
+    );
+    assert_eq!(
+        backend
+            .get_agent_state("squad:one-shot-planner")
+            .await
+            .unwrap(),
+        Some(AgentState::Dead)
+    );
+}

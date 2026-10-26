@@ -46,7 +46,7 @@ fn announceable(
         .chain(report.dead.iter())
         .chain(report.stuck.iter())
         .filter_map(move |(agent_id, issue)| {
-            (!report.departed.contains(agent_id)).then_some((agent_id, issue))
+            report.announces(agent_id).then_some((agent_id, issue))
         })
 }
 

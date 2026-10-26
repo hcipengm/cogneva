@@ -16,23 +16,34 @@ pub struct HealthReport {
     pub suspect: Vec<(String, HealthIssue)>,
     pub dead: Vec<(String, HealthIssue)>,
     pub stuck: Vec<(String, HealthIssue)>,
-    /// 这一拍判过、而舰队名单里已经没有的 id。
+    /// 这一拍判过、而共享注册表的名单里已经没有的 id。
+    ///
+    /// 「名单」是 `list()` 的返回值，也就是**还有活记录**的 id，不是索引
+    /// 集合的成员——索引只增不减，今天 283 个成员里只有 20 个 key 还活着。
     ///
     /// 判决本身留在上面三栏：要动手的一方（回收、重试、续跑）仍然需要知道「这个
-    /// agent 不出声了」，走了不等于不用管。但「离开舰队」与「掉线」不是同一件事，
-    /// 而名单是这里唯一能区分它们的东西——一次性角色干完活会自己注销，注册记录
-    /// 到期也会从名单里消失，两者对读者都是「名单里没有它」。
+    /// agent 不出声了」，走了不等于不用管。但「离开舰队」与「掉线」不是同一件事：
+    /// 一次性角色干完活会自己注销，注册记录到期也会从名单里消失，两者对读者都是
+    /// 「名单里没有它」。
     ///
-    /// 实测 2026-10-26：`agent_unhealthy` 当下 firing 的 233 行里 222 行的 id 已经
-    /// 不在注册表的索引里（正常注销过），只有 11 行是到期消失、3 行还有活记录。
-    /// 也就是说这条规则报的几乎全是「已经走了」，而不是「还挂着但不说话」——真正
-    /// 需要人看的那条常驻 `worker` 行被埋在中间 40 分钟。
+    /// 实测 2026-10-26：`agent_unhealthy` 当下 firing 的 233 行里，222 行的 id 连
+    /// 索引条目都没有（正常注销过），只有 3 行还有活记录。也就是说这条规则报的
+    /// 几乎全是「已经走了」，而不是「还挂着但不说话」——真正需要人看的那条常驻
+    /// `worker` 行被埋在中间 40 分钟。
     pub departed: Vec<String>,
 }
 
 impl HealthReport {
     pub fn is_clean(&self) -> bool {
         self.suspect.is_empty() && self.dead.is_empty() && self.stuck.is_empty()
+    }
+
+    /// 这一拍允许不允许把关于 `agent_id` 的判决当成「它不健康」报出去。
+    ///
+    /// 判据只有这一份，因为发射口有两个（监督自己的收尾、生命周期协调器），
+    /// 各写一份 `contains` 就会有一个先漂。两处读同一个答案，别再复制。
+    pub fn announces(&self, agent_id: &str) -> bool {
+        !self.departed.iter().any(|id| id == agent_id)
     }
 
     pub fn unhealthy_total(&self) -> usize {

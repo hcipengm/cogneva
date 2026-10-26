@@ -68,6 +68,16 @@ impl LifecycleCoordinator {
 
     /// Process a [`HealthReport`] and drive state transitions + checkpoint
     /// recovery for every unhealthy agent.
+    ///
+    /// The events emitted here share the supervisor's channel, so this is a
+    /// second writer of `AgentUnhealthy` and it runs *before* the supervisor
+    /// announces its own: an announcement filter that lives only at the
+    /// supervisor's tail is no filter at all. Both read
+    /// [`HealthReport::announces`] instead of each keeping their own copy.
+    ///
+    /// Only the announcement is gated. The state transitions and the checkpoint
+    /// recovery below stay unconditional -- an agent that has left the fleet
+    /// still needs its tasks picked up, it just is not unhealthy news.
     pub async fn handle_health_report(
         &self,
         report: &HealthReport,
@@ -89,8 +99,10 @@ impl LifecycleCoordinator {
                         .unwrap_or(AgentState::Active),
                     AgentState::Suspect,
                 ));
-                self.emit_lifecycle_event(agent_id, "suspect", issue).await;
-                out.events_emitted += 1;
+                if report.announces(agent_id) {
+                    self.emit_lifecycle_event(agent_id, "suspect", issue).await;
+                    out.events_emitted += 1;
+                }
             }
         }
 
@@ -136,8 +148,10 @@ impl LifecycleCoordinator {
                     }
                 }
 
-                self.emit_lifecycle_event(agent_id, "dead", issue).await;
-                out.events_emitted += 1;
+                if report.announces(agent_id) {
+                    self.emit_lifecycle_event(agent_id, "dead", issue).await;
+                    out.events_emitted += 1;
+                }
             }
         }
 
@@ -156,8 +170,10 @@ impl LifecycleCoordinator {
             } else {
                 out.transitioned
                     .push((agent_id.clone(), prev, AgentState::Suspect));
-                self.emit_lifecycle_event(agent_id, "stuck", issue).await;
-                out.events_emitted += 1;
+                if report.announces(agent_id) {
+                    self.emit_lifecycle_event(agent_id, "stuck", issue).await;
+                    out.events_emitted += 1;
+                }
             }
         }
 
