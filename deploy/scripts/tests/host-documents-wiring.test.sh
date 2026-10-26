@@ -89,9 +89,13 @@ for env_name in HOST_DOCS_SCOPES HOST_DOCS_JOURNAL_DIR HOST_DOCS_MAX_WRITE_BYTES
 done
 # The journal has to outlive the process that wrote it, otherwise a rollback
 # after a restart restores nothing: the default path must be on the executor
-# volume, which the pod mounts at /opt/cogneva/sandbox.
-grep -q 'const DEFAULT_JOURNAL_DIR: &str = "/opt/cogneva/sandbox' "${executor_rs}" \
-  || fail "the rollback journal defaults off the executor volume; a restart would lose it"
+# volume, which the pod mounts at /opt/cogneva/sandbox. That root is declared
+# once (cog_core::paths::APP_DIR) and the path is built from it, so the reading
+# here is the segment under the root -- the same `sandbox/` the mount carries.
+# A literal `/opt/cogneva/...` in the executor would be the second declaration
+# the layout contract test reddens on.
+grep -q 'app_path("sandbox/' "${executor_rs}" \
+  || fail "the rollback journal defaults off the executor volume; a restart would lose it (it must be app_path(\"sandbox/...\"), the directory the executor pod mounts)"
 
 # --- 5) the egress switch: off by default, carried to the side that can refuse --
 # The switch has a second half that no single side can check: the manifest decides
