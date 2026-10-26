@@ -139,6 +139,55 @@ pub(crate) async fn forward(fields: Value, b64: bool, restart: bool) -> Result<R
     })
 }
 
+/// 主应用侧：向网关的任意内部端点发一次签名请求，返回响应 JSON。
+///
+/// 每个「把读点搬进网关」的端点都要自己拼地址、自己签名、自己判状态码；三段
+/// 抄在四处时，漏掉的那一处（不签、或者只在有体的时候签）不会有编译错误——
+/// 只有网关那边 401。放在这里，签名覆盖什么就只由这一个函数决定。
+pub(crate) async fn forward_internal(path: &str, body: Vec<u8>) -> Result<Value, String> {
+    let (status, value) = forward_internal_raw(path, body).await?;
+    if !(200..300).contains(&status) {
+        return Err(format!("安全网关返回 {status}: {value}"));
+    }
+    Ok(value)
+}
+
+/// 同上，但把状态码也交回来。
+///
+/// 有些内部操作的结果本身就带状态（「App 还没创建」是 409、「还没安装」是 404），
+/// 主应用要做的是原样转给页面——把 409 压成一个 `Err` 字符串，页面上就只剩下
+/// 「网关返回 409: {...}」，而那条提示本来是说给运营者听的。
+pub(crate) async fn forward_internal_raw(
+    path: &str,
+    body: Vec<u8>,
+) -> Result<(u16, Value), String> {
+    let base = crate::contribution_admin::security_gateway_base()?;
+    let secret = std::env::var("COGNEVA_WEBHOOK_INTERNAL_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "主应用未配置内部转发凭证（COGNEVA_WEBHOOK_INTERNAL_SECRET），无法向安全网关询问"
+                .to_string()
+        })?;
+    // 空体也要签：签名覆盖的是字节，不是「有没有内容」。网关那边同样按空体验。
+    let request = cog_core::HttpRequest::post(format!("{}{}", base.trim_end_matches('/'), path))
+        .header("Content-Type", "application/json")
+        .header(SIGNATURE_HEADER, sign(&secret, &body))
+        .body(body);
+    let resp = crate::contribution_admin::http_client()?
+        .execute(request)
+        .await
+        .map_err(|e| format!("转发安全网关失败: {e}"))?;
+    let status = resp.status;
+    // 响应不是 JSON 时（例如通道被中间件挡下）也要能读出内容：错误信息本身是
+    // 排查线索，而"解析失败"会把它丢掉。
+    let value = match resp.json::<Value>() {
+        Ok(v) => v,
+        Err(_) => Value::String(resp.text().unwrap_or_default()),
+    };
+    Ok((status, value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

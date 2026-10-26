@@ -209,27 +209,23 @@ async fn login_with_platform_token(
 
     // Dual-use: the same token opens the contribution channel. Best-effort —
     // outside a cluster (dev runs) there is no Secret to write.
-    let mut contribution_synced = false;
-    if let Ok(kube) = crate::llm_admin::KubeClient::in_cluster() {
-        let resp = contrib::persist_connected(
-            &kube,
-            provider,
-            access_token,
-            &profile.login,
-            gitee_refresh
-                .map(|r| contrib::GiteeTokenSet {
-                    access_token: access_token.to_string(),
-                    refresh_token: Some(r.to_string()),
-                    expires_in: 0,
-                    obtained_at: 0,
-                })
-                .as_ref(),
-        )
-        .await;
-        contribution_synced = resp.status().is_success();
-        if !contribution_synced {
-            warn!("platform login: contribution secret persist failed for {provider}");
-        }
+    let resp = contrib::persist_connected(
+        provider,
+        access_token,
+        &profile.login,
+        gitee_refresh
+            .map(|r| contrib::GiteeTokenSet {
+                access_token: access_token.to_string(),
+                refresh_token: Some(r.to_string()),
+                expires_in: 0,
+                obtained_at: 0,
+            })
+            .as_ref(),
+    )
+    .await;
+    let contribution_synced = resp.status().is_success();
+    if !contribution_synced {
+        warn!("platform login: contribution secret persist failed for {provider}");
     }
 
     info!(
@@ -610,13 +606,9 @@ pub async fn oauth_callback_handler(
                         .into_response()
                 }
             };
-            if let Ok(kube) = crate::llm_admin::KubeClient::in_cluster() {
-                let resp =
-                    contrib::persist_connected(&kube, &provider, &token, &profile.login, None)
-                        .await;
-                if !resp.status().is_success() {
-                    warn!("platform login callback: contribution secret persist failed");
-                }
+            let resp = contrib::persist_connected(&provider, &token, &profile.login, None).await;
+            if !resp.status().is_success() {
+                warn!("platform login callback: contribution secret persist failed");
             }
             info!(provider, login = %profile.login, created, "platform login (callback)");
             login_landing_page(&json!({

@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-const SA_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+const SA_DIR: &str = cog_core::topology::SERVICE_ACCOUNT_DIR;
 const API_BASE: &str = "https://kubernetes.default.svc";
 /// 上游池条目：JSON 数组，每元素 {api_style, base_url, model, api_key}。
 /// 它住带外片——这个键只被安全网关读，放内部片等于铺给持那一份的每个业务 Pod
@@ -85,11 +85,10 @@ pub struct LlmConfigRequest {
 /// credential-free); outside the cluster we fall back to inspecting local
 /// cogneva.json.
 pub async fn llm_status_handler(State(_state): State<Arc<crate::GatewayState>>) -> Response {
-    // 先问网关：池的真值只注入它那个 Deployment（`llm-upstreams` 在带外那一片，
-    // 主应用按 RBAC 已经读不到它了）。网关答不上来再退回本进程直读——那是迁移窗
-    // 里的旧路，等这一面在主应用里彻底关掉之后，下面这段读 Secret 的分支随之删掉。
-    if let Ok((configured, pool)) = forwarded_llm_status().await {
-        return (
+    // 池的真值只注入安全网关那个 Deployment（`llm-upstreams` 在带外那一片），
+    // 主应用没有读它的权限，也不该有。所以这一屏只有一条来源：问网关要派生读数。
+    match forwarded_llm_status().await {
+        Ok((configured, pool)) => (
             StatusCode::OK,
             Json(json!({
                 "configured": configured,
@@ -98,31 +97,21 @@ pub async fn llm_status_handler(State(_state): State<Arc<crate::GatewayState>>) 
                 "source": "security-gateway",
             })),
         )
-            .into_response();
+            .into_response(),
+        // 问不到网关时不能拿"本进程读到的"顶上去：主应用读到的是空，而空会被
+        // 页面读成"没配"。这里如实报不知道，并把原因带上。
+        Err(e) => (
+            StatusCode::OK,
+            Json(json!({
+                "configured": false,
+                "unknown": true,
+                "read_error": e,
+                "backends": local_backends(),
+                "source": "unavailable",
+            })),
+        )
+            .into_response(),
     }
-    if let Ok(kube) = KubeClient::in_cluster() {
-        if let Ok(configured) = kube.secret_has_key().await {
-            let pool = kube.secret_pool_policy().await.ok().flatten();
-            return (
-                StatusCode::OK,
-                Json(json!({
-                    "configured": configured,
-                    "backends": local_backends(),
-                    "pool": pool,
-                })),
-            )
-                .into_response();
-        }
-    }
-    let backends = local_backends();
-    let configured = backends
-        .iter()
-        .any(|b| b["enabled"] == json!(true) && b["has_key"] == json!(true));
-    (
-        StatusCode::OK,
-        Json(json!({ "configured": configured, "backends": backends })),
-    )
-        .into_response()
 }
 
 /// 池的声明面：三个数一起印。
@@ -145,40 +134,11 @@ pub(crate) fn pool_policy_json(upstreams: usize, declared: Option<usize>) -> ser
 /// 带一把 key，把它回传给零凭证的进程等于把刚搬走的凭证又发回去。签名用与
 /// `secret-patch` 同一条内部 HMAC——两个进程之间本来只有这一条信任边界。
 pub(crate) async fn forwarded_llm_status() -> Result<(bool, serde_json::Value), String> {
-    let base = crate::contribution_admin::security_gateway_base()?;
-    let secret = std::env::var("COGNEVA_WEBHOOK_INTERNAL_SECRET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            "主应用未配置内部转发凭证（COGNEVA_WEBHOOK_INTERNAL_SECRET），无法向安全网关询问池状态"
-                .to_string()
-        })?;
-    // 空体也要签：签名覆盖的是字节，不是「有没有内容」。网关那边同样按空体验。
-    let body: Vec<u8> = Vec::new();
-    let request = cog_core::HttpRequest::post(format!(
-        "{}{}",
-        base.trim_end_matches('/'),
-        crate::security_gateway::INTERNAL_LLM_STATUS_PATH
-    ))
-    .header(
-        crate::secret_write::SIGNATURE_HEADER,
-        crate::secret_write::sign(&secret, &body),
+    let body = crate::secret_write::forward_internal(
+        crate::security_gateway::INTERNAL_LLM_STATUS_PATH,
+        Vec::new(),
     )
-    .body(body);
-    let resp = crate::contribution_admin::http_client()?
-        .execute(request)
-        .await
-        .map_err(|e| format!("询问安全网关失败: {e}"))?;
-    if !resp.is_success() {
-        return Err(format!(
-            "安全网关返回 {}: {}",
-            resp.status,
-            resp.text().unwrap_or_default()
-        ));
-    }
-    let body: serde_json::Value = resp
-        .json()
-        .map_err(|e| format!("安全网关响应解析失败: {e}"))?;
+    .await?;
     let configured = body
         .get("configured")
         .and_then(|v| v.as_bool())
@@ -971,36 +931,6 @@ impl KubeClient {
         Ok(())
     }
 
-    /// 上游池是否已写入集群 Secret（网关凭证的唯一事实源）。
-    async fn secret_has_key(&self) -> Result<bool, String> {
-        // 只探带外那一片：这个键不可能住别处，读两片只会把"带外那份读不到"
-        // 变成一次多余的失败请求。
-        let resp = self
-            .http
-            .get(format!(
-                "{API_BASE}{}",
-                crate::secret_layout::oob_secret_api_path(&self.namespace)
-            ))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|e| format!("读取 secret 失败: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("读取 secret 返回 {}", resp.status()));
-        }
-        let secret: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("secret 响应解析失败: {e}"))?;
-        let has = secret
-            .get("data")
-            .and_then(|d| d.get(SECRET_UPSTREAMS_KEY))
-            .and_then(|v| v.as_str())
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
-        Ok(has)
-    }
-
     /// 池的声明面：池里有几家、声明的冗余下限是几、以及这个值是从哪来的。
     ///
     /// 三个数一起给，因为「界」这个读数的全部意义就在这三个数的关系上：只有池的
@@ -1014,7 +944,7 @@ impl KubeClient {
     ///
     /// 读不到 Secret 时返回 `Ok(None)` 而不是一个默认值：这一面无话可说与「池里
     /// 一家都没有」是两件事，把前者印成后者等于替一次读失败编一个池。
-    async fn secret_pool_policy(&self) -> Result<Option<serde_json::Value>, String> {
+    pub(crate) async fn secret_pool_policy(&self) -> Result<Option<serde_json::Value>, String> {
         let resp = self
             .http
             .get(format!(

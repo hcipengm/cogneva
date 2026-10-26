@@ -196,6 +196,15 @@ pub struct SecurityGatewayConfig {
     /// 池状态发布/判定间隔秒数（COGNEVA_LLM_POOL_CHECK_SECS，默认 30，下限 5）：
     /// 指标刷新、共享键续期、告警状态机推进的统一节拍。
     pub pool_check_secs: u64,
+    /// 贡献通道 OAuth 续期循环的拍长与续期阈值（`COGNEVA_CONTRIBUTION_OAUTH_
+    /// REFRESH_{INTERVAL,THRESHOLD}_SECS`，0 = 内置默认）。名字与主应用配置面
+    /// 同一套：这是同一个旋钮，只是读它的进程换了一个。
+    ///
+    /// 这两个值住在本进程里，因为循环本身就住在这里——它要读 `gitee-refresh-token`
+    /// 再把轮换后的那一对写回去，而 Secret 只有本进程读得到；同一枚 refresh
+    /// token 单次有效，所以起两份的进程会互相把对方的 token 用掉。
+    pub contribution_oauth_refresh_interval_secs: u64,
+    pub contribution_oauth_refresh_threshold_secs: u64,
     /// PostgreSQL 连接串（COGNEVA_DATABASE_URL）：告警状态机落盘。缺省则
     /// 只在日志/指标里可见，不写库（不破坏无 PG 的部署）。
     pub database_url: Option<String>,
@@ -217,6 +226,27 @@ impl SecurityGatewayConfig {
             return None;
         }
         Some((id, secret))
+    }
+
+    /// 贡献通道 OAuth 续期循环的实际拍长；0 在配置面上是"没写"，不是"不刷"。
+    /// 与 [`cog_core::config::GatewayConfig`] 的同名方法同一口径，两处各写一遍
+    /// 会出现"配置写 0、一处按默认跑、另一处按 0 跑"的分叉。
+    pub fn effective_contribution_oauth_refresh_interval_secs(&self) -> u64 {
+        if self.contribution_oauth_refresh_interval_secs == 0 {
+            cog_core::config::DEFAULT_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS
+        } else {
+            self.contribution_oauth_refresh_interval_secs
+        }
+    }
+
+    /// 续期阈值：剩余寿命低于它才换新。0 同样是"没写"——阈值取 0 等于等 token
+    /// 过期之后才续，那不是快一点，是不再刷新。
+    pub fn effective_contribution_oauth_refresh_threshold_secs(&self) -> u64 {
+        if self.contribution_oauth_refresh_threshold_secs == 0 {
+            cog_core::config::DEFAULT_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS
+        } else {
+            self.contribution_oauth_refresh_threshold_secs
+        }
     }
 
     /// 贡献通道 GitHub OAuth 应用凭证，判据与 Gitee 同形：缺一即未配置。
@@ -287,6 +317,16 @@ impl SecurityGatewayConfig {
             webhook_forward_url: std::env::var("COGNEVA_WEBHOOK_FORWARD_URL")
                 .unwrap_or_else(|_| "http://cogneva:9091".into()),
             pool_check_secs: env_u64("COGNEVA_LLM_POOL_CHECK_SECS", 30).max(5),
+            // 同一个 env 名，读它的进程从主应用换成了这里：清单里那一行没动，
+            // 而循环跟着 Secret 的读权走。
+            contribution_oauth_refresh_interval_secs: env_u64(
+                "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS",
+                0,
+            ),
+            contribution_oauth_refresh_threshold_secs: env_u64(
+                "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS",
+                0,
+            ),
             database_url: token("COGNEVA_DATABASE_URL"),
             redis_url: token("COGNEVA_REDIS_URL"),
             // 配置文件缺失即默认全关，env 覆盖在 load() 内完成。
@@ -7851,6 +7891,169 @@ fn llm_channel_router() -> Router<AppState> {
             post(secret_patch_handler),
         )
         .route(INTERNAL_LLM_STATUS_PATH, post(internal_llm_status_handler))
+        .route(
+            INTERNAL_SEARCH_FALLBACK_STATUS_PATH,
+            post(internal_search_fallback_status_handler),
+        )
+        .route(
+            INTERNAL_SEARCH_FALLBACK_CONFIG_PATH,
+            post(internal_search_fallback_config_handler),
+        )
+        .route(
+            INTERNAL_CONTRIBUTION_STATUS_PATH,
+            post(internal_contribution_status_handler),
+        )
+        .route(
+            INTERNAL_CONTRIBUTION_CONNECT_PATH,
+            post(internal_contribution_connect_handler),
+        )
+        .route(
+            INTERNAL_CONTRIBUTION_POLICY_PATH,
+            post(internal_contribution_policy_handler),
+        )
+        .route(
+            INTERNAL_CONTRIBUTION_POLICY_READ_PATH,
+            post(internal_contribution_policy_read_handler),
+        )
+        .route(
+            INTERNAL_GITHUB_APP_DISCOVER_PATH,
+            post(internal_github_app_discover_handler),
+        )
+}
+
+/// 贡献通道设置面的内部路径。
+///
+/// 这一面过去由主应用自己读那两片 Secret 拼出来、自己读-改-写配置文档、自己用
+/// App 私钥签 JWT。把读点搬进网关之后，主应用只经这几条路径拿派生读数与结论，
+/// 它那一侧就再也不需要 Secret 的 get 权限。
+pub(crate) const INTERNAL_CONTRIBUTION_STATUS_PATH: &str = "/internal/contribution-status";
+pub(crate) const INTERNAL_CONTRIBUTION_CONNECT_PATH: &str = "/internal/contribution-connect";
+pub(crate) const INTERNAL_CONTRIBUTION_POLICY_PATH: &str = "/internal/contribution-policy";
+pub(crate) const INTERNAL_CONTRIBUTION_POLICY_READ_PATH: &str =
+    "/internal/contribution-policy/read";
+pub(crate) const INTERNAL_GITHUB_APP_DISCOVER_PATH: &str = "/internal/github-app-discover";
+
+async fn internal_contribution_status_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if let Some(refusal) = internal_caller_refusal(&state, &headers, &body) {
+        return refusal;
+    }
+    (
+        StatusCode::OK,
+        Json(crate::contribution_admin::status_block_json().await),
+    )
+        .into_response()
+}
+
+async fn internal_contribution_connect_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if let Some(refusal) = internal_caller_refusal(&state, &headers, &body) {
+        return refusal;
+    }
+    let (status, value) = crate::contribution_admin::connect_from_json(&body).await;
+    (status, Json(value)).into_response()
+}
+
+async fn internal_contribution_policy_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if let Some(refusal) = internal_caller_refusal(&state, &headers, &body) {
+        return refusal;
+    }
+    let (status, value) = crate::contribution_admin::set_policy_from_json(&body).await;
+    (status, Json(value)).into_response()
+}
+
+/// 读存着的策略。读不到时 200 + `read: false`：那是「不知道」，不是「默认值」——
+/// 主应用据此别把活档覆盖成 auto 却宣称恢复成功。
+async fn internal_contribution_policy_read_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if let Some(refusal) = internal_caller_refusal(&state, &headers, &body) {
+        return refusal;
+    }
+    match crate::contribution_admin::stored_policy().await {
+        Some(policy) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"read": true, "policy": policy.as_str()})),
+        )
+            .into_response(),
+        None => (
+            StatusCode::OK,
+            Json(serde_json::json!({"read": false, "policy": null})),
+        )
+            .into_response(),
+    }
+}
+
+async fn internal_github_app_discover_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if let Some(refusal) = internal_caller_refusal(&state, &headers, &body) {
+        return refusal;
+    }
+    let (status, value) = crate::contribution_admin::discover_github_app().await;
+    (status, Json(value)).into_response()
+}
+
+/// 主应用读 / 写检索后备池的内部路径。
+///
+/// 池里每一条都可能带一把带外 key，它只注入网关。主应用要显示"配了哪几家"与
+/// 接受用户改配置，但不该为了这件事握一个能读整片 Secret 的对象级权限。所以
+/// 读的是网关折出来的派生读数（只给 `has_key`，没有 key），写的是网关代为落盘
+/// ——合并要读旧 key，那一步也只能在这里做。
+pub(crate) const INTERNAL_SEARCH_FALLBACK_STATUS_PATH: &str = "/internal/search-fallback-status";
+pub(crate) const INTERNAL_SEARCH_FALLBACK_CONFIG_PATH: &str = "/internal/search-fallback-config";
+
+async fn internal_search_fallback_status_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if let Some(refusal) = internal_caller_refusal(&state, &headers, &body) {
+        return refusal;
+    }
+    (
+        StatusCode::OK,
+        Json(crate::search_admin::pool_status_json().await),
+    )
+        .into_response()
+}
+
+async fn internal_search_fallback_config_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if let Some(refusal) = internal_caller_refusal(&state, &headers, &body) {
+        return refusal;
+    }
+    let req: crate::search_admin::SearchFallbackRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid_body", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    match crate::search_admin::save_pool(&req.upstreams).await {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err((status, value)) => (status, Json(value)).into_response(),
+    }
 }
 
 /// 主应用问「这一侧的上游池配好了没有」的路径。
@@ -7913,13 +8116,31 @@ async fn internal_llm_status_handler(
     if let Some(refusal) = internal_caller_refusal(&state, &headers, &body) {
         return refusal;
     }
-    let upstreams = state.config.llm_upstreams.len();
+    // 读落盘的那一份，不是本进程的环境快照：设置页要能看见「已保存、还没滚」。
+    // 本进程的 `llm_upstreams` 是上次启动时的值，刚保存完它会落后于页面。
+    let from_file = match crate::llm_admin::KubeClient::in_cluster() {
+        Ok(kube) => kube.secret_pool_policy().await.ok().flatten(),
+        Err(_) => None,
+    };
+    let (upstreams, declared) = match from_file {
+        Some(pool) => (
+            pool.get("upstreams").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            pool.get("min_healthy")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
+        ),
+        // 读不到文件就报本进程正在用的那份：那不是「没配」，那是「正在用的」。
+        None => (
+            state.config.llm_upstreams.len(),
+            state.config.llm_pool_min_healthy,
+        ),
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "configured": upstreams > 0,
             "upstreams": upstreams,
-            "min_healthy": state.config.llm_pool_min_healthy,
+            "min_healthy": declared,
         })),
     )
         .into_response()
@@ -8402,6 +8623,16 @@ pub async fn run(
     // 停机信号与卷走查同源：网关的五个监听面不设优雅停机，进程退出即结束。
     drop(crate::git_identity::spawn_git_identity_bootstrap(
         cog_core::ShutdownSignal::default(),
+    ));
+    // Gitee OAuth 续期循环：与上一条同源的理由——它要读 `gitee-refresh-token`
+    // 再把轮换后的那一对写回同一片 Secret，而那片 Secret 只有本进程读得到。
+    // 主应用里同一个二进制起这一份只会每一次都 403，还会与本进程抢同一枚单次
+    // 有效的 refresh token，所以它在那里被删掉、在这里接上；两处的读数一起消失
+    // 时，"没东西可刷"与"循环死了"就同形了。
+    drop(crate::contribution_admin::spawn_gitee_token_refresher(
+        cog_core::ShutdownSignal::default(),
+        config.effective_contribution_oauth_refresh_interval_secs(),
+        config.effective_contribution_oauth_refresh_threshold_secs(),
     ));
     // Nothing hands these a stop signal either: the reading belongs to the pod,
     // and a walker that stopped would leave its last measurement in place, which
@@ -9440,6 +9671,167 @@ mod tests {
         );
     }
 
+    /// 检索后备池的两条内部路径：没有签名一律拒，答出来的那份不能带一把 key。
+    ///
+    /// 这两条搬的是「读 / 写一片带外 Secret」的能力。验签只是形式时，任何能到达
+    /// 8081 的 Pod 都能把带外池读走——而这会读作「池配好了」，没有别处会红。
+    #[tokio::test]
+    async fn the_internal_search_fallback_paths_need_the_internal_hmac_and_return_no_key() {
+        use tower::ServiceExt as _;
+
+        let mut state = test_state(Vec::new());
+        state.config.webhook_internal_secret = Some("internal-secret".into());
+        let app = router(state, true);
+
+        let call = |path: &'static str, signature: Option<String>, body: &'static str| {
+            let mut builder = axum::extract::Request::builder()
+                .uri(path)
+                .method("POST")
+                .header("Content-Type", "application/json");
+            if let Some(sig) = signature {
+                builder = builder.header(crate::secret_write::SIGNATURE_HEADER, sig);
+            }
+            app.clone()
+                .oneshot(builder.body(axum::body::Body::from(body)).unwrap())
+        };
+
+        for (path, body) in [
+            (INTERNAL_SEARCH_FALLBACK_STATUS_PATH, ""),
+            (
+                INTERNAL_SEARCH_FALLBACK_CONFIG_PATH,
+                r#"{"upstreams":[{"shape":"tavily","base_url":"https://api.tavily.com","api_key":"sk-live"}]}"#,
+            ),
+        ] {
+            let resp = call(path, None, body).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} 没有签名也答了：这条路径读写的是带外池"
+            );
+            let resp = call(
+                path,
+                Some(crate::secret_write::sign("别的口令", body.as_bytes())),
+                body,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} 收了错签名：内部 HMAC 只是形式"
+            );
+        }
+
+        let resp = call(
+            INTERNAL_SEARCH_FALLBACK_STATUS_PATH,
+            Some(crate::secret_write::sign("internal-secret", b"")),
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !text.contains("api_key") && !text.contains("sk-live"),
+            "池状态里回了凭证：把 key 发给零凭证的进程等于把搬走的凭证又发回去：{text}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // 读不到 Secret 时要自报读不到，而不是装作池是空的——空池与读失败在页面
+        // 上是两种不同的补救（去配一家 / 去看 RBAC）。
+        assert!(
+            parsed["read_error"].is_string() || parsed["configured"] == serde_json::json!(true),
+            "池状态既没说读失败、也没说配好了：{text}"
+        );
+    }
+
+    /// 贡献通道的内部路径：读点搬进网关之后，这几条就是主应用碰 Secret 的唯一
+    /// 通道，所以每一条都必须验签；答出来的也必须是派生读数，不是 key。
+    #[tokio::test]
+    async fn the_internal_contribution_paths_need_the_internal_hmac_and_return_no_key() {
+        use tower::ServiceExt as _;
+
+        let mut state = test_state(Vec::new());
+        state.config.webhook_internal_secret = Some("internal-secret".into());
+        let app = router(state, true);
+
+        let call = |path: &'static str, signature: Option<String>, body: &'static str| {
+            let mut builder = axum::extract::Request::builder()
+                .uri(path)
+                .method("POST")
+                .header("Content-Type", "application/json");
+            if let Some(sig) = signature {
+                builder = builder.header(crate::secret_write::SIGNATURE_HEADER, sig);
+            }
+            app.clone()
+                .oneshot(builder.body(axum::body::Body::from(body)).unwrap())
+        };
+
+        let paths = [
+            (INTERNAL_CONTRIBUTION_STATUS_PATH, ""),
+            (
+                INTERNAL_CONTRIBUTION_CONNECT_PATH,
+                r#"{"provider":"gitee","token":"tok-live","account":"someone"}"#,
+            ),
+            (INTERNAL_CONTRIBUTION_POLICY_PATH, r#"{"policy":"ask"}"#),
+            (INTERNAL_CONTRIBUTION_POLICY_READ_PATH, ""),
+            (INTERNAL_GITHUB_APP_DISCOVER_PATH, ""),
+        ];
+        for (path, body) in paths {
+            let resp = call(path, None, body).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} 没有签名也答了：这条路径读写的是凭证"
+            );
+            let resp = call(
+                path,
+                Some(crate::secret_write::sign("别的口令", body.as_bytes())),
+                body,
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path} 收了错签名");
+        }
+
+        // 验过签的那一份：设置屏的派生读数里不许出现密钥字段。
+        let resp = call(
+            INTERNAL_CONTRIBUTION_STATUS_PATH,
+            Some(crate::secret_write::sign("internal-secret", b"")),
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        for forbidden in ["api_key", "private", "-----BEGIN", "\"token\""] {
+            assert!(
+                !text.contains(forbidden),
+                "设置屏的读数里出现了 {forbidden}，那是凭证而不是「配没配」：{text}"
+            );
+        }
+
+        // 策略面的准入与设置页同一条：认不出的写法不能落盘。
+        let bad = r#"{"policy":"whatever"}"#;
+        let resp = call(
+            INTERNAL_CONTRIBUTION_POLICY_PATH,
+            Some(crate::secret_write::sign("internal-secret", bad.as_bytes())),
+            bad,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "认不出的策略被写成了一条，而活档与文档会各说一套"
+        );
+    }
+
     fn cfg(allow: &[&str], deny: &[&str]) -> SecurityGatewayConfig {
         SecurityGatewayConfig {
             egress_port: 8080,
@@ -9471,6 +9863,9 @@ mod tests {
             host_docs_body_egress: false,
             audited_max_body_bytes: crate::document_egress::DEFAULT_MAX_AUDITED_BODY_BYTES,
             pool_check_secs: 30,
+            // 0 = 没写，取内置默认；要试拍长与阈值的用例自己覆写这两个字段。
+            contribution_oauth_refresh_interval_secs: 0,
+            contribution_oauth_refresh_threshold_secs: 0,
             database_url: None,
             redis_url: None,
             observability: ObservabilityExportersConfig::default(),

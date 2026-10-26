@@ -1,18 +1,15 @@
-# LLM 设置界面（WebUI 系统设置）所需的最小权限：**只读**两个 Secret 对象。
+# LLM 设置界面（WebUI 系统设置）所需的最小权限：**只碰工作负载，不碰 Secret 对象**。
 #
 # 写入不经过这个主体。主应用把要写的字段转发给安全网关的内部端点
-# （`secret_write::forward`），由网关用自己的 SA 落盘。因此这里只有 get——
-# patch 在代码里已经没有调用点，留着等于把「代持带外凭证」复制一份到零凭证的
-# 进程里，而清单上看不出它没人在用。
+# （`secret_write::forward`），由网关用自己的 SA 落盘。
 #
-# 仍需要 get，是因为三个读点今天还跑在主应用进程里：LLM 状态
-# （`llm_admin::llm_status_handler`）、贡献配置（`contribution_admin::read_contrib_config`）、
-# gitee 续期循环（`contribution_admin::spawn_gitee_token_refresher`，起在 `plugin.rs`）。
+# 读取也不经过它了。迁移窗里的三个读点——LLM 状态、贡献配置、gitee 续期循环——
+# 已全部搬进网关进程：主应用按 `/internal/*` 拿派生读数（家数、布尔位、策略名），
+# 拿不到任何一把 key。带 out-of-band 凭证的那两片，这个身份不再有 get。
 #
-# 关闭条件（门要能判）：这三个读点搬进网关进程后——plugin 不再给主应用挂网关路由、
-# 不再起续期循环——本条 secrets 规则整条删掉。登记表
-# （deploy/credential-holders.tsv）把这一点写成 closes-when 指针；凭证持有面门禁在
-# 指针指向的符号消失时报红。
+# 删掉这条规则之后，主应用那一侧任何一处 Secret 读都会 403，而它不该有读点——
+# `deploy/credential-holders.tsv` 里只留网关那两行，凭证持有面门禁按渲染产物
+# 反查，多一个能读的主体就报。
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -31,10 +28,6 @@ metadata:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: gateway
 rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    resourceNames: ["cogneva-secrets", "cogneva-secrets-oob"]
-    verbs: ["get"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     resourceNames: ["cogneva-security-gateway"]

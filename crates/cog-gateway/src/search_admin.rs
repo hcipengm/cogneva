@@ -36,7 +36,7 @@ const SECRET_KEY: &str = "search-fallback-upstreams";
 /// 显示出来——它们的值不在这里，也写不进来（见 [`crate::search_fallback::from_live_llm`]）。
 const LLM_UPSTREAMS_ENV: &str = "COGNEVA_LLM_UPSTREAMS";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, serde::Serialize, Deserialize)]
 pub struct SearchUpstreamRequest {
     /// 报给调用方与日志的名字。缺省取形状名；重名整单拒绝。
     pub id: Option<String>,
@@ -53,7 +53,7 @@ pub struct SearchUpstreamRequest {
     pub capability: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, serde::Serialize, Deserialize)]
 pub struct SearchFallbackRequest {
     pub upstreams: Vec<SearchUpstreamRequest>,
 }
@@ -66,10 +66,27 @@ pub struct SearchFallbackRequest {
 pub async fn search_fallback_status_handler(
     State(_state): State<Arc<crate::GatewayState>>,
 ) -> Response {
-    let raw = match KubeClient::in_cluster() {
-        Ok(kube) => read_secret(&kube).await,
-        Err(e) => Err(e),
-    };
+    // 池里每一条都可能带一把 key，而它只注入网关那个 Deployment：这份读数是
+    // 网关折好的，`has_key` 是它愿意说的全部。
+    match forwarded_status().await {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        // 问不到就说问不到。回一份空池会被读成「一条都没配」，而那是另一种补救。
+        Err(e) => (
+            StatusCode::OK,
+            Json(json!({
+                "configured": false,
+                "unknown": true,
+                "read_error": e,
+                "upstreams": [],
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// 把「读到的池」折成给页面看的那份 JSON。两个来源（网关转发与本地直读）共用
+/// 它：各写一份时，页面上会出现两套字段，而哪一套是真的取决于请求走了哪条路。
+pub(crate) fn status_json(raw: Result<Option<String>, String>, from_llm: Vec<Value>) -> Value {
     let (upstreams, configured, read_error) = match raw {
         Ok(Some(text)) => {
             let parsed = parse_upstreams(&text);
@@ -106,29 +123,25 @@ pub async fn search_fallback_status_handler(
         Ok(None) => (Vec::new(), false, None),
         Err(e) => (Vec::new(), false, Some(e)),
     };
-    (
-        StatusCode::OK,
-        Json(json!({
-            "configured": configured,
-            "upstreams": upstreams,
-            // 这两层不是配置出来的，页面只展示、不可编辑：它们跟着现网在用的
-            // LLM（同一台主机、同一把 key、同一个轮换）。
-            "from_llm": llm_shaped_entries(),
-            "read_error": read_error,
-            // 页面能选的两列都从枚举自己的表里取：写面收哪些形状 / 哪些能力由
-            // `ResponseShape::parse` 与 `Capability::parse` 决定，回包里手抄一份
-            // 就等于给同一件事留了第二个答案，而两个答案只在加分项的那天才对不上。
-            "shapes": ResponseShape::CONFIGURABLE
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>(),
-            "capabilities": Capability::ALL
-                .iter()
-                .map(|c| c.as_str())
-                .collect::<Vec<_>>(),
-        })),
-    )
-        .into_response()
+    json!({
+        "configured": configured,
+        "upstreams": upstreams,
+        // 这两层不是配置出来的，页面只展示、不可编辑：它们跟着现网在用的
+        // LLM（同一台主机、同一把 key、同一个轮换）。
+        "from_llm": from_llm,
+        "read_error": read_error,
+        // 页面能选的两列都从枚举自己的表里取：写面收哪些形状 / 哪些能力由
+        // `ResponseShape::parse` 与 `Capability::parse` 决定，回包里手抄一份
+        // 就等于给同一件事留了第二个答案，而两个答案只在加分项的那天才对不上。
+        "shapes": ResponseShape::CONFIGURABLE
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>(),
+        "capabilities": Capability::ALL
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// 现网 LLM 池里那些带上网工具的上游，按它们在池里的顺序。
@@ -168,6 +181,35 @@ pub async fn search_fallback_config_handler(
     State(_state): State<Arc<crate::GatewayState>>,
     Json(req): Json<SearchFallbackRequest>,
 ) -> Response {
+    // 合并要读落盘那份里的 key（页面不回声，缺席的条目靠它保住凭证），而那份
+    // 只在网关进程里。所以整单转发给网关做——主应用这一侧连旧 key 都看不见。
+    match crate::secret_write::forward_internal_raw(
+        crate::security_gateway::INTERNAL_SEARCH_FALLBACK_CONFIG_PATH,
+        serde_json::to_vec(&req).unwrap_or_default(),
+    )
+    .await
+    {
+        Ok((status, value)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(value),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "security_gateway_unreachable", "message": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// 合并并校验整份池，返回要落盘的 JSON 文本。
+///
+/// 两个执行者（网关自己落盘 / 迁移窗里的主应用转发）共用这一段：合并规则与
+/// 「存进去的必须与运行期读出来的一致」这条准入各写一份时，两条路会保住不同的
+/// 条目，而两边的保存都自报成功。
+pub(crate) async fn merged_pool_json(
+    requested: &[SearchUpstreamRequest],
+) -> Result<String, (StatusCode, Value)> {
     // 现有的那把 key 要在合并时读到：页面不回声，所以缺席的那几条必须从落盘的
     // 那份里取回自己的凭证。读不到落盘那份也没关系——那不是"没有 key"，而是
     // "没有旧值可保留"，两件事的结局都由下面那一行决定。
@@ -177,68 +219,92 @@ pub async fn search_fallback_config_handler(
     };
     let existing = existing.as_deref().map(parse_upstreams).unwrap_or_default();
 
-    let merged = match merge_with_existing(&req.upstreams, &existing) {
-        Ok(list) => list,
-        Err(message) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid_request", "message": message })),
-            )
-                .into_response()
-        }
-    };
+    let merged = merge_with_existing(requested, &existing).map_err(|message| {
+        (
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "invalid_request", "message": message }),
+        )
+    })?;
 
-    let raw = match serde_json::to_string(&merged) {
-        Ok(text) => text,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "serialize_failed", "message": e.to_string()})),
-            )
-                .into_response()
-        }
-    };
+    let raw = serde_json::to_string(&merged).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "serialize_failed", "message": e.to_string()}),
+        )
+    })?;
 
     // 存进去的那份必须与运行期读出来的那份逐条相同：解析器丢掉的每一条，都是
     // 用户以为保存了、网关却不认的一条。
     let accepted = parse_upstreams(&raw);
     if accepted.len() != merged.len() {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({
+            json!({
                 "error": "not_accepted_by_the_runtime",
                 "message": format!(
                     "这份配置有 {} 条，网关只会认其中 {} 条；被丢掉的那几条的运行期理由见网关日志",
                     merged.len(),
                     accepted.len()
                 ),
-            })),
-        )
-            .into_response();
+            }),
+        ));
     }
+    Ok(raw)
+}
 
-    if let Err(e) = crate::secret_write::forward(json!({ SECRET_KEY: raw }), false, true).await {
-        return (
+/// 保存成功之后回给页面的那份 JSON。两个执行者共用，字段才不会分叉。
+pub(crate) fn saved_json(accepted: usize, from_llm: usize) -> Value {
+    json!({
+        "ok": true,
+        "restarted": [cog_core::topology::SECURITY_GATEWAY],
+        "upstreams": accepted,
+        "from_llm": from_llm,
+        "message": format!(
+            "配置已保存，安全网关正在滚动重启，约一分钟后生效；另有 {from_llm} 条跟着现网在用的 LLM 走，不在这次配置里"
+        ),
+    })
+}
+
+/// 网关侧：池的现状。读 Secret 与折出「跟着 LLM 走」的那几条都要在本进程里做
+/// ——池只注入网关，`COGNEVA_LLM_UPSTREAMS` 也只有它有。
+pub(crate) async fn pool_status_json() -> Value {
+    let raw = match KubeClient::in_cluster() {
+        Ok(kube) => read_secret(&kube).await,
+        Err(e) => Err(e),
+    };
+    status_json(raw, llm_shaped_entries())
+}
+
+/// 网关侧：合并、校验、落盘，然后滚动自己。
+pub(crate) async fn save_pool(
+    requested: &[SearchUpstreamRequest],
+) -> Result<Value, (StatusCode, Value)> {
+    let raw = merged_pool_json(requested).await?;
+    let accepted = parse_upstreams(&raw).len();
+    match crate::secret_write::apply(json!({ SECRET_KEY: raw }), false, true).await {
+        Ok(restart) => {
+            // 写成功就是成功：值已落盘。滚动失败只影响"什么时候生效"，把它报成
+            // 保存失败会让用户重填一遍已经存进去的池。
+            let mut out = saved_json(accepted, llm_shaped_entries().len());
+            if let crate::secret_write::Restart::Failed(e) = restart {
+                out["restart_error"] = json!(e);
+            }
+            Ok(out)
+        }
+        Err(e) => Err((
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "secret_patch_failed", "message": e})),
-        )
-            .into_response();
+            json!({"error": "secret_patch_failed", "message": e}),
+        )),
     }
+}
 
-    let from_llm = llm_shaped_entries().len();
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "restarted": [cog_core::topology::SECURITY_GATEWAY],
-            "upstreams": accepted.len(),
-            "from_llm": from_llm,
-            "message": format!(
-                "配置已保存，安全网关正在滚动重启，约一分钟后生效；另有 {from_llm} 条跟着现网在用的 LLM 走，不在这次配置里"
-            ),
-        })),
+/// 主应用侧：问网关要池的现状。
+pub(crate) async fn forwarded_status() -> Result<Value, String> {
+    crate::secret_write::forward_internal(
+        crate::security_gateway::INTERNAL_SEARCH_FALLBACK_STATUS_PATH,
+        Vec::new(),
     )
-        .into_response()
+    .await
 }
 
 /// 把请求里的条目并进池里，缺席的 key 从同名的旧条目取回。

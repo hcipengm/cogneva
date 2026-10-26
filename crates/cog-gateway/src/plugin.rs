@@ -318,33 +318,29 @@ impl cog_core::SystemPlugin for GatewayPlugin {
 
     async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
         let state = self.state.clone().expect("gateway state not initialized");
-        // 进程重启后把 Secret 里持久化的回流策略灌回控制器（best-effort；
-        // 网关持有 Secret 访问权，平台插件进程内只留活档）。
+        // 进程重启后把持久化的回流策略灌回控制器（活档留在本进程，而存着的
+        // 文档由网关读——主应用不持有 Secret 的读权）。
+        //
+        // 要重试：两个 Deployment 同时滚动时，网关可能比本进程晚几十秒才应答，
+        // 而这一次没读到就把活档留在默认的 auto 上——属主设的 local/ask 会被
+        // 静默抬成自动回流，直到下一次重启才恢复。重试有上限，退避到最后仍读不到
+        // 才报「没恢复」。
         if let Some(control) = state.contribution_control.clone() {
             tokio::spawn(async move {
-                // 只有读得到 Secret 的那个进程才是属主。其余部署（进化 / 沙盒 /
-                // 网关）同一个二进制同样会走到这里，读不到却照旧宣称「已从集群
-                // Secret 恢复」——把一次读不到说成了成功。
-                if !crate::contribution_admin::is_contribution_secret_owner().await {
-                    return;
-                }
-                let Ok(kube) = crate::llm_admin::KubeClient::in_cluster() else {
-                    warn!("contribution policy not restored: no in-cluster client");
-                    return;
-                };
-                match crate::contribution_admin::read_contrib_config(&kube).await {
-                    Some(config) => {
-                        let policy = crate::contribution_admin::policy_from_config(&config);
+                for attempt in 1..=10u32 {
+                    if let Some(policy) = crate::contribution_admin::forwarded_policy().await {
                         control.set_policy(policy);
                         info!(
                             policy = policy.as_str(),
-                            "contribution policy restored from cluster secret"
+                            attempt, "contribution policy restored from the stored config"
                         );
+                        return;
                     }
-                    None => warn!(
-                        "contribution policy not restored: the stored config could not be read"
-                    ),
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 }
+                warn!(
+                    "contribution policy not restored: the stored config could not be read through the gateway"
+                );
             });
         }
         let app = crate::create_router(state.clone());
@@ -450,18 +446,10 @@ impl cog_core::SystemPlugin for GatewayPlugin {
                     "no ReplanMinter published: performance breaches stay readings, not tasks"
                 );
             }
-            // Gitee OAuth token refresher: no-ops unless OAuth-mode material
-            // is present in the Secret.
-            let gateway_cfg = &ctx.config().gateway;
-            let _gitee_refresh = crate::contribution_admin::spawn_gitee_token_refresher(
-                (*shutdown_signal).clone(),
-                gateway_cfg.effective_contribution_oauth_refresh_interval_secs(),
-                gateway_cfg.effective_contribution_oauth_refresh_threshold_secs(),
-            );
-            // git 身份自举：网关自己得有上游身份，否则装完机没人给它配密钥。
-            // 有 token 全自动登记部署密钥；没有则把公钥挂出来等 WebUI 收 token。
-            let _git_identity =
-                crate::git_identity::spawn_git_identity_bootstrap((*shutdown_signal).clone());
+            // Gitee OAuth 续期循环与 git 身份自举都不在这里：两者都要读 / 写
+            // 那两片 Secret，由安全网关进程自己起（见 `security_gateway::run`）。
+            // 主应用同一个二进制起一份也只是每小时 403 一次，并可能与本进程抢
+            // 同一枚单次有效的 refresh token。
         }
 
         Ok(())

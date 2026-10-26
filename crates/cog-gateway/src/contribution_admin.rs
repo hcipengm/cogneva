@@ -390,7 +390,8 @@ pub(crate) fn decode_secret_key(secret: &serde_json::Value, key: &str) -> Option
 /// collapsed: a writer that reads "could not read" as "empty" overwrites every
 /// field it did not set itself, and a reader that does so reports a restored
 /// policy it never saw.
-pub(crate) async fn read_contrib_config(kube: &KubeClient) -> Option<serde_json::Value> {
+pub(crate) async fn read_contrib_config() -> Option<serde_json::Value> {
+    let kube = KubeClient::in_cluster().ok()?;
     // 这份文档只住内部片，读一片就够；合成视图在这里只会多一次可能失败的请求，
     // 而"读不到"与"读到空的"在这里是两件事（见上面）。
     let secret = kube
@@ -780,15 +781,120 @@ async fn upload_public_key(provider: &str, token: &str, public_line: &str) -> Re
     }
 }
 
-/// Persist a connected token (plus an Ed25519 SSH keypair) to the gateway
-/// Secret and roll the gateway so it picks the new credentials up.
+/// 重新连接：把一枚新令牌（连同新生成的 SSH 密钥对）落进网关 Secret 并滚动。
+///
+/// 整个动作在网关进程里做。它要读既有配置里的 policy（重连不该把属主设的
+/// local/ask 退回 auto）、要生成并上传一对 SSH 密钥，最后写的是两片 Secret——
+/// 这些都是「凭证持有者」的事，而主应用只是把用户刚交的令牌递过去。
 pub(crate) async fn persist_connected(
-    kube: &KubeClient,
     provider: &str,
     token: &str,
     account: &str,
     oauth: Option<&GiteeTokenSet>,
 ) -> Response {
+    let body = json!({
+        "provider": provider,
+        "token": token,
+        "account": account,
+        "oauth": oauth.map(|set| json!({
+            "obtained_at": set.obtained_at,
+            "expires_in": set.expires_in,
+            "refresh_token": set.refresh_token,
+        })),
+    });
+    match crate::secret_write::forward_internal_raw(
+        crate::security_gateway::INTERNAL_CONTRIBUTION_CONNECT_PATH,
+        serde_json::to_vec(&body).unwrap_or_default(),
+    )
+    .await
+    {
+        Ok((status, value)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(value),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "security_gateway_unreachable", "message": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// 网关侧：解析主应用转来的连接请求并执行。
+///
+/// 令牌与 OAuth 三件套走这条请求体——它们本来就要交给网关落盘，这里只是把
+/// 「谁写」与「写什么」放在同一侧，免得主应用为了合并旧策略先去读一遍 Secret。
+pub(crate) async fn connect_from_json(body: &[u8]) -> (StatusCode, serde_json::Value) {
+    #[derive(serde::Deserialize)]
+    struct OAuthPayload {
+        obtained_at: u64,
+        expires_in: u64,
+        #[serde(default)]
+        refresh_token: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ConnectRequest {
+        provider: String,
+        token: String,
+        account: String,
+        #[serde(default)]
+        oauth: Option<OAuthPayload>,
+    }
+    let req: ConnectRequest = match serde_json::from_slice(body) {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                json!({"error": "invalid_body", "message": e.to_string()}),
+            );
+        }
+    };
+    let oauth = req.oauth.map(|o| GiteeTokenSet {
+        // access_token 只在 refresh 那条路径上用；连接时它就在请求体里，
+        // 而落盘用的是上面的 token 字段。
+        access_token: String::new(),
+        refresh_token: o.refresh_token,
+        expires_in: o.expires_in,
+        obtained_at: o.obtained_at,
+    });
+    connect_contribution(&req.provider, &req.token, &req.account, oauth.as_ref()).await
+}
+
+/// 网关侧：解析并落盘一次策略变更。
+pub(crate) async fn set_policy_from_json(body: &[u8]) -> (StatusCode, serde_json::Value) {
+    #[derive(serde::Deserialize)]
+    struct PolicyRequest {
+        policy: String,
+    }
+    let req: PolicyRequest = match serde_json::from_slice(body) {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                json!({"error": "invalid_body", "message": e.to_string()}),
+            );
+        }
+    };
+    let Some(policy) = cog_core::ContributionPolicy::parse(req.policy.trim()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "invalid_policy",
+                "message": "policy 必须是 auto（自动回流）/ ask（每次问我）/ local（只在本地）",
+            }),
+        );
+    };
+    (StatusCode::OK, persist_policy(policy).await)
+}
+
+/// 网关侧：连接动作本体。参数是操作者刚交付的令牌与它验证出的账号名。
+pub(crate) async fn connect_contribution(
+    provider: &str,
+    token: &str,
+    account: &str,
+    oauth: Option<&GiteeTokenSet>,
+) -> (StatusCode, serde_json::Value) {
     let keypair = generate_ssh_keypair("cogneva-contribution");
     let ssh_result = upload_public_key(provider, token, &keypair.public_line).await;
 
@@ -804,7 +910,7 @@ pub(crate) async fn persist_connected(
     });
     // 重新连接不清空属主的回流策略：从既有配置继承 policy 字段。读不到就只剩
     // 默认值，所以这次降级必须留痕——重连会顺手把属主设的 local/ask 退回 auto。
-    let existing_policy = match read_contrib_config(kube).await {
+    let existing_policy = match read_contrib_config().await {
         Some(config) => config
             .get("policy")
             .and_then(|v| v.as_str())
@@ -833,12 +939,11 @@ pub(crate) async fn persist_connected(
     string_data[SECRET_CONTRIB_CONFIG] =
         json!(serde_json::to_string(&config_json_val).unwrap_or_else(|_| "{}".to_string()));
 
-    if let Err(e) = crate::secret_write::forward(string_data, false, true).await {
+    if let Err(e) = crate::secret_write::apply(string_data, false, true).await {
         return (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "secret_patch_failed", "message": e})),
-        )
-            .into_response();
+            json!({"error": "secret_patch_failed", "message": e}),
+        );
     }
 
     let ssh_note = match ssh_result {
@@ -847,16 +952,15 @@ pub(crate) async fn persist_connected(
     };
     (
         StatusCode::OK,
-        Json(json!({
+        json!({
             "ok": true,
             "status": "connected",
             "provider": provider,
             "account": account,
             "ssh": ssh_note,
             "message": "贡献通道已连接，安全网关正在滚动重启，约一分钟后生效",
-        })),
+        }),
     )
-        .into_response()
 }
 
 /// GET /api/v1/admin/contribution-status — whether a contribution token is
@@ -869,85 +973,194 @@ pub async fn contribution_status_handler(
         Some(control) => control.pending().await.map(|v| v.len()).unwrap_or(0),
         None => 0,
     };
-    if let Ok(kube) = KubeClient::in_cluster() {
-        // 这一屏同时报两片的键：token/App 私钥在带外片，配置文档与公钥在内部片。
-        // 分开读会让其中一半恒报未配置，而面板上看不出是"没配"还是"读错了片"。
-        if let Ok(secret) = crate::secret_layout::load_data_view(&kube).await {
-            let has = |key: &str| {
-                secret
-                    .get("data")
-                    .and_then(|d| d.get(key))
-                    .and_then(|v| v.as_str())
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false)
-            };
-            let github = has(SECRET_GITHUB_TOKEN);
-            let gitee = has(SECRET_GITEE_TOKEN);
-            let ssh = has(SECRET_SSH_KEY);
-            // App 三件套齐全才算配置好；只读布尔位，私钥绝不回传。
-            let github_app = has(SECRET_GITHUB_APP_ID)
-                && has(SECRET_GITHUB_APP_INSTALLATION_ID)
-                && has(SECRET_GITHUB_APP_KEY);
-            let provider = if github {
-                "github"
-            } else if gitee {
-                "gitee"
-            } else {
-                "none"
-            };
-            let config = decode_secret_key(&secret, SECRET_CONTRIB_CONFIG)
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-                .unwrap_or_else(|| json!({}));
-            let policy = policy_from_config(&config);
-            return (
-                StatusCode::OK,
-                Json(json!({
-                    "configured": github || gitee,
-                    "provider": provider,
-                    "github": {"configured": github},
-                    "gitee": {"configured": gitee},
-                    "ssh": {"key_present": ssh},
-                    // 网关自己的 git 身份：装机时没人给它配密钥，所以它自举；
-                    // 这一块告诉面板走到了哪一步、缺什么。
-                    "git_identity": crate::git_identity::status_block(&secret),
-                    "github_app_configured": github_app,
-                    "policy": policy.as_str(),
-                    "pending_count": pending_count,
-                    "device_flow_available": oauth_client_id(None).is_some(),
-                    "gitee_oauth_available": gitee_oauth_available().await,
-                    // 授权码通道要 client_id 与 client_secret 两件都齐；前者是
-                    // 公开标识（随清单走），后者只能由向导投递，所以分开报。
-                    "gitee_oauth_secret_configured": has(SECRET_GITEE_OAUTH_CLIENT_SECRET),
-                    "github_oauth_secret_configured": has(SECRET_GITHUB_OAUTH_CLIENT_SECRET),
-                })),
-            )
-                .into_response();
+    // 这一屏的每一个布尔位都来自那两片 Secret，而 Secret 只该由网关读。主应用
+    // 保留的是它自己才知道的那几格（待回流条数、本进程的授权码能力），其余由
+    // 网关折好送过来。
+    let mut reading = match forwarded_contribution_status().await {
+        Ok(value) => value,
+        Err(e) => unreachable_status_json(&state, &e),
+    };
+    reading["pending_count"] = json!(pending_count);
+    reading["device_flow_available"] = json!(oauth_client_id(None).is_some());
+    reading["gitee_oauth_available"] = json!(gitee_oauth_available().await);
+    (StatusCode::OK, Json(reading)).into_response()
+}
+
+/// 网关侧：设置屏要的那份派生读数。
+///
+/// 只给布尔位与策略名——私钥、token 一个字都不回传。这一屏以前由主应用自己读
+/// Secret 拼出来，那要求零凭证的进程对整个对象有 get；把折好的读数搬进网关之后
+/// 那条授权才删得掉。
+pub(crate) async fn status_block_json() -> serde_json::Value {
+    let kube = match KubeClient::in_cluster() {
+        Ok(kube) => kube,
+        Err(e) => {
+            return json!({
+                "configured": false,
+                "provider": "none",
+                "note": "not_in_cluster",
+                // 读不到 Secret 时身份状态是**未知**，不是"没配"：在集群外跑的面板
+                // 不该据此说"网关没有身份"。
+                "git_identity": {"state": "unknown", "note": "not_in_cluster"},
+                "read_error": e,
+                "github_app_configured": false,
+                // 读不到 Secret 就不知道密钥在不在，报 false 而不是"没配"的措辞。
+                "gitee_oauth_secret_configured": false,
+                "github_oauth_secret_configured": false,
+                "policy": cog_core::ContributionPolicy::default().as_str(),
+            });
         }
-    }
-    (
-        StatusCode::OK,
-        Json(json!({
-            "configured": false,
-            "provider": "none",
-            "note": "not_in_cluster",
-            // 读不到 Secret 时身份状态是**未知**，不是"没配"：在集群外跑的面板
-            // 不该据此说"网关没有身份"。
-            "git_identity": {"state": "unknown", "note": "not_in_cluster"},
-            "github_app_configured": false,
-            // 读不到 Secret 就不知道密钥在不在，报 false 而不是"没配"的措辞。
-            "gitee_oauth_secret_configured": false,
-            "github_oauth_secret_configured": false,
-            "policy": state
-                .contribution_control
-                .as_ref()
-                .map(|c| c.policy().as_str())
-                .unwrap_or("auto"),
-            "pending_count": pending_count,
-            "device_flow_available": oauth_client_id(None).is_some(),
-            "gitee_oauth_available": gitee_oauth_available().await,
-        })),
+    };
+    let secret = match crate::secret_layout::load_data_view(&kube).await {
+        Ok(secret) => secret,
+        Err(e) => {
+            return json!({
+                "configured": false,
+                "provider": "none",
+                "note": "secret_read_failed",
+                "git_identity": {"state": "unknown", "note": "secret_read_failed"},
+                "read_error": e,
+                "github_app_configured": false,
+                "gitee_oauth_secret_configured": false,
+                "github_oauth_secret_configured": false,
+                "policy": cog_core::ContributionPolicy::default().as_str(),
+            });
+        }
+    };
+    let has = |key: &str| {
+        secret
+            .get("data")
+            .and_then(|d| d.get(key))
+            .and_then(|v| v.as_str())
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+    };
+    let github = has(SECRET_GITHUB_TOKEN);
+    let gitee = has(SECRET_GITEE_TOKEN);
+    let ssh = has(SECRET_SSH_KEY);
+    // App 三件套齐全才算配置好；只读布尔位，私钥绝不回传。
+    let github_app = has(SECRET_GITHUB_APP_ID)
+        && has(SECRET_GITHUB_APP_INSTALLATION_ID)
+        && has(SECRET_GITHUB_APP_KEY);
+    let provider = if github {
+        "github"
+    } else if gitee {
+        "gitee"
+    } else {
+        "none"
+    };
+    let config = decode_secret_key(&secret, SECRET_CONTRIB_CONFIG)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    let policy = policy_from_config(&config);
+    json!({
+        "configured": github || gitee,
+        "provider": provider,
+        "github": {"configured": github},
+        "gitee": {"configured": gitee},
+        "ssh": {"key_present": ssh},
+        // 网关自己的 git 身份：装机时没人给它配密钥，所以它自举；
+        // 这一块告诉面板走到了哪一步、缺什么。
+        "git_identity": crate::git_identity::status_block(&secret),
+        "github_app_configured": github_app,
+        "policy": policy.as_str(),
+        // 授权码通道要 client_id 与 client_secret 两件都齐；前者是公开标识
+        // （随清单走），后者只能由向导投递，所以分开报。
+        "gitee_oauth_secret_configured": has(SECRET_GITEE_OAUTH_CLIENT_SECRET),
+        "github_oauth_secret_configured": has(SECRET_GITHUB_OAUTH_CLIENT_SECRET),
+    })
+}
+
+/// 主应用侧：读到那一份派生读数，读不到就把原因写进去。
+pub(crate) async fn forwarded_contribution_status() -> Result<serde_json::Value, String> {
+    crate::secret_write::forward_internal(
+        crate::security_gateway::INTERNAL_CONTRIBUTION_STATUS_PATH,
+        Vec::new(),
     )
-        .into_response()
+    .await
+}
+
+/// 网关侧：把一次性存取的回流策略并进既有文档落盘。
+///
+/// 读不到既有文档就不写：这次写入是整文档覆盖，`{}` 打底会把 provider /
+/// account / token 时效一起抹掉，刷新循环随后静默失效。
+pub(crate) async fn persist_policy(policy: cog_core::ContributionPolicy) -> serde_json::Value {
+    let (persisted, persist_error) = match read_contrib_config().await {
+        None => (
+            false,
+            Some("读不到现有贡献配置，未写入以免覆盖其余字段".to_string()),
+        ),
+        Some(config) => match merge_policy(Some(config), policy) {
+            None => (false, Some("既有贡献配置不是对象，未写入".to_string())),
+            Some(merged) => {
+                let raw = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".to_string());
+                match crate::secret_write::apply(
+                    json!({ SECRET_CONTRIB_CONFIG: raw }),
+                    false,
+                    false,
+                )
+                .await
+                {
+                    Ok(_) => (true, None),
+                    Err(e) => (false, Some(e)),
+                }
+            }
+        },
+    };
+    json!({
+        "policy": policy.as_str(),
+        "persisted": persisted,
+        "persist_error": persist_error,
+    })
+}
+
+/// 网关侧：读出存着的回流策略。`None` 表示读不到（不是「没设过」）。
+pub(crate) async fn stored_policy() -> Option<cog_core::ContributionPolicy> {
+    read_contrib_config()
+        .await
+        .map(|config| policy_from_config(&config))
+}
+
+/// 主应用侧：从网关要存着的回流策略。
+///
+/// 主应用进程启动时要把策略灌回活档，而这份文档住在 Secret 里。读不到的两种
+/// 情形（网关不可达 / 文档读不出）在这里都返回 `None`，调用方按「没恢复」留痕。
+pub(crate) async fn forwarded_policy() -> Option<cog_core::ContributionPolicy> {
+    let value = crate::secret_write::forward_internal(
+        crate::security_gateway::INTERNAL_CONTRIBUTION_POLICY_READ_PATH,
+        Vec::new(),
+    )
+    .await
+    .ok()?;
+    if value.get("read").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    value
+        .get("policy")
+        .and_then(|v| v.as_str())
+        .and_then(cog_core::ContributionPolicy::parse)
+}
+
+/// 主应用问不到网关时的那份读数。
+///
+/// 它说的是「不知道」，不是「没配」：两者在页面上是两种不同的补救（去接通道 /
+/// 去看网关）。策略取本进程活档里的值——那一格不来自 Secret。
+fn unreachable_status_json(state: &crate::GatewayState, error: &str) -> serde_json::Value {
+    json!({
+        "configured": false,
+        "provider": "none",
+        "note": "security_gateway_unreachable",
+        "read_error": error,
+        "git_identity": {"state": "unknown", "note": "security_gateway_unreachable"},
+        "github_app_configured": false,
+        "gitee_oauth_secret_configured": false,
+        "github_oauth_secret_configured": false,
+        "policy": state
+            .contribution_control
+            .as_ref()
+            .map(|c| c.policy().as_str())
+            .unwrap_or("auto"),
+    })
 }
 
 /// GitHub App 凭证配置请求（运营者通道：手动粘贴或 Manifest 流回填共用）。
@@ -1160,14 +1373,36 @@ pub async fn github_app_manifest_handler(
 pub async fn github_app_discover_handler(
     State(_state): State<Arc<crate::GatewayState>>,
 ) -> Response {
+    // 这一步要拿 App 私钥签 JWT。私钥只注入网关，所以签名与调用都在网关里做；
+    // 主应用只转达结论（安装 ID 与账号名，两者都不是凭证）。
+    match crate::secret_write::forward_internal_raw(
+        crate::security_gateway::INTERNAL_GITHUB_APP_DISCOVER_PATH,
+        Vec::new(),
+    )
+    .await
+    {
+        Ok((status, value)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(value),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "security_gateway_unreachable", "message": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// 网关侧：用已存的 App 私钥签 JWT、列出安装、把首个安装 ID 补进 Secret。
+pub(crate) async fn discover_github_app() -> (StatusCode, serde_json::Value) {
     let kube = match KubeClient::in_cluster() {
         Ok(k) => k,
         Err(e) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "not_in_cluster", "message": e})),
-            )
-                .into_response();
+                json!({"error": "not_in_cluster", "message": e}),
+            );
         }
     };
     let secret = match crate::secret_layout::load_data_view(&kube).await {
@@ -1175,9 +1410,8 @@ pub async fn github_app_discover_handler(
         Err(e) => {
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": "secret_read_failed", "message": e})),
-            )
-                .into_response();
+                json!({"error": "secret_read_failed", "message": e}),
+            );
         }
     };
     let app_id_raw = decode_secret_key(&secret, SECRET_GITHUB_APP_ID);
@@ -1185,28 +1419,25 @@ pub async fn github_app_discover_handler(
     let (Some(app_id_raw), Some(pem)) = (app_id_raw, pem) else {
         return (
             StatusCode::CONFLICT,
-            Json(json!({
+            json!({
                 "error": "app_not_created",
                 "message": "尚未创建/配置 GitHub App：请先一键注册或手动粘贴 App 凭证",
-            })),
-        )
-            .into_response();
+            }),
+        );
     };
     let Ok(app_id_num) = app_id_raw.trim().parse::<u64>() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "app_id_invalid", "message": "Secret 中的 App ID 不是数字"})),
-        )
-            .into_response();
+            json!({"error": "app_id_invalid", "message": "Secret 中的 App ID 不是数字"}),
+        );
     };
     let jwt = match crate::github_app::mint_app_jwt(app_id_num, &pem) {
         Ok(j) => j,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "jwt_failed", "message": e})),
-            )
-                .into_response();
+                json!({"error": "jwt_failed", "message": e}),
+            );
         }
     };
     let client = match http_client() {
@@ -1214,9 +1445,8 @@ pub async fn github_app_discover_handler(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "installations_lookup_failed", "message": e})),
-            )
-                .into_response();
+                json!({"error": "installations_lookup_failed", "message": e}),
+            );
         }
     };
     let request = HttpRequest::get(format!("{GITHUB_API}/app/installations"))
@@ -1228,9 +1458,8 @@ pub async fn github_app_discover_handler(
         Err(e) => {
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": "installations_lookup_failed", "message": format!("请求 GitHub 失败: {e}")})),
-            )
-                .into_response();
+                json!({"error": "installations_lookup_failed", "message": format!("请求 GitHub 失败: {e}")}),
+            );
         }
     };
     let status = resp.status;
@@ -1239,36 +1468,32 @@ pub async fn github_app_discover_handler(
         let body: String = body.chars().take(300).collect();
         return (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "installations_lookup_failed", "message": format!("GitHub 返回 {status}: {body}")})),
-        )
-            .into_response();
+            json!({"error": "installations_lookup_failed", "message": format!("GitHub 返回 {status}: {body}")}),
+        );
     }
     let installs: Vec<serde_json::Value> = match resp.json() {
         Ok(v) => v,
         Err(e) => {
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": "installations_lookup_failed", "message": format!("解析响应失败: {e}")})),
-            )
-                .into_response();
+                json!({"error": "installations_lookup_failed", "message": format!("解析响应失败: {e}")}),
+            );
         }
     };
     let Some(first) = installs.first() else {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({
+            json!({
                 "error": "no_installation",
                 "message": "GitHub 上还没有任何安装：请先在 App 安装页把它装到仓库（可只选公版仓库），再回来点发现",
-            })),
-        )
-            .into_response();
+            }),
+        );
     };
     let Some(installation_id) = first.get("id").and_then(|x| x.as_u64()) else {
         return (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "installations_lookup_failed", "message": "安装记录缺少 id"})),
-        )
-            .into_response();
+            json!({"error": "installations_lookup_failed", "message": "安装记录缺少 id"}),
+        );
     };
     let account = first
         .get("account")
@@ -1276,7 +1501,7 @@ pub async fn github_app_discover_handler(
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    if let Err(e) = crate::secret_write::forward(
+    if let Err(e) = crate::secret_write::apply(
         json!({ SECRET_GITHUB_APP_INSTALLATION_ID: installation_id.to_string() }),
         false,
         true,
@@ -1285,21 +1510,19 @@ pub async fn github_app_discover_handler(
     {
         return (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "secret_patch_failed", "message": e})),
-        )
-            .into_response();
+            json!({"error": "secret_patch_failed", "message": e}),
+        );
     }
     (
         StatusCode::OK,
-        Json(json!({
+        json!({
             "ok": true,
             "installation_id": installation_id,
             "account": account,
             "installation_count": installs.len(),
             "message": "已发现 GitHub App 安装，安全网关重启后出口以 App bot 身份发出",
-        })),
+        }),
     )
-        .into_response()
 }
 
 /// POST /api/v1/admin/contribution-config — connect via a manually pasted
@@ -1340,17 +1563,7 @@ pub async fn contribution_config_handler(
         }
     };
 
-    let kube = match KubeClient::in_cluster() {
-        Ok(k) => k,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "not_in_cluster", "message": e})),
-            )
-                .into_response();
-        }
-    };
-    persist_connected(&kube, provider, &token, &account, None).await
+    persist_connected(provider, &token, &account, None).await
 }
 
 /// POST /api/v1/admin/contribution/device/start — begin the GitHub device
@@ -1501,17 +1714,7 @@ pub async fn device_poll_handler(
                         .into_response();
                 }
             };
-            let kube = match KubeClient::in_cluster() {
-                Ok(k) => k,
-                Err(e) => {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({"error": "not_in_cluster", "message": e})),
-                    )
-                        .into_response();
-                }
-            };
-            persist_connected(&kube, "github", &token, &account, None).await
+            persist_connected("github", &token, &account, None).await
         }
         DevicePoll::Pending(interval) => (
             StatusCode::OK,
@@ -1604,16 +1807,15 @@ pub async fn gitee_oauth_start_handler(
 }
 
 /// Shared tail of both Gitee OAuth entry points: consume the state, exchange
-/// the code, verify the token, and prepare the cluster client for persisting.
-type GiteeOAuthMaterial = (KubeClient, GiteeTokenSet, String);
+/// the code and verify the token.
+type GiteeOAuthMaterial = (GiteeTokenSet, String);
 
 async fn complete_gitee_oauth(state: &str, code: &str) -> Result<GiteeOAuthMaterial, String> {
     let redirect_uri =
         take_oauth_state(state).ok_or("授权链接已过期或已使用，请回到接管台重新发起授权")?;
     let set = exchange_gitee_code(code, &redirect_uri).await?;
     let account = verify_token("gitee", &set.access_token).await?;
-    let kube = KubeClient::in_cluster()?;
-    Ok((kube, set, account))
+    Ok((set, account))
 }
 
 /// POST /api/v1/admin/contribution/gitee/oauth/exchange — finish the flow
@@ -1631,8 +1833,8 @@ pub async fn gitee_oauth_exchange_handler(
             .into_response();
     };
     match complete_gitee_oauth(&req.state, &code).await {
-        Ok((kube, set, account)) => {
-            persist_connected(&kube, "gitee", &set.access_token, &account, Some(&set)).await
+        Ok((set, account)) => {
+            persist_connected("gitee", &set.access_token, &account, Some(&set)).await
         }
         Err(message) => (
             StatusCode::BAD_GATEWAY,
@@ -1682,9 +1884,8 @@ pub async fn gitee_oauth_callback_handler(Query(q): Query<GiteeOAuthCallbackQuer
             .into_response();
     };
     match complete_gitee_oauth(&state, &code).await {
-        Ok((kube, set, account)) => {
-            let resp =
-                persist_connected(&kube, "gitee", &set.access_token, &account, Some(&set)).await;
+        Ok((set, account)) => {
+            let resp = persist_connected("gitee", &set.access_token, &account, Some(&set)).await;
             if resp.status().is_success() {
                 oauth_result_page(
                     "授权成功",
@@ -1732,30 +1933,23 @@ pub async fn contribution_policy_set_handler(
     if let Some(control) = &state.contribution_control {
         control.set_policy(policy);
     }
-    let (persisted, persist_error) = match KubeClient::in_cluster() {
-        Ok(kube) => {
-            // 读不到既有文档就不写：这次写入是整文档覆盖，`{}` 打底会把
-            // provider / account / token 时效一起抹掉，刷新循环随后静默失效。
-            match merge_policy(read_contrib_config(&kube).await, policy) {
-                None => (
-                    false,
-                    Some("读不到现有贡献配置，未写入以免覆盖其余字段".to_string()),
-                ),
-                Some(config) => {
-                    let raw = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
-                    match crate::secret_write::forward(
-                        json!({ SECRET_CONTRIB_CONFIG: raw }),
-                        false,
-                        false,
-                    )
-                    .await
-                    {
-                        Ok(_) => (true, None),
-                        Err(e) => (false, Some(e)),
-                    }
-                }
-            }
-        }
+    // 活档已经在上一步改过了；落盘这一步交给网关——它读得到既有文档、也持有写权。
+    let (persisted, persist_error) = match crate::secret_write::forward_internal(
+        crate::security_gateway::INTERNAL_CONTRIBUTION_POLICY_PATH,
+        serde_json::to_vec(&json!({ "policy": policy.as_str() })).unwrap_or_default(),
+    )
+    .await
+    {
+        Ok(value) => (
+            value
+                .get("persisted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            value
+                .get("persist_error")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        ),
         Err(e) => (false, Some(e)),
     };
     (
@@ -2063,8 +2257,10 @@ fn declared_credential_loop_owner() -> bool {
 /// caller passes the effective values so the loop and the line that reports it
 /// cannot disagree about what is running.
 ///
-/// Spawned from the gateway plugin, which every deployment of the binary loads:
-/// only the process that can read the contribution secret runs the loop.
+/// Spawned from the security gateway itself: the loop reads the refresh token out
+/// of the Secret and writes the rotated pair back, so it can only run where the
+/// Secret is readable — and only one process may run it, because every refresh
+/// rotates a single-use token.
 pub fn spawn_gitee_token_refresher(
     shutdown: cog_core::shutdown::ShutdownSignal,
     interval_secs: u64,
@@ -2072,39 +2268,22 @@ pub fn spawn_gitee_token_refresher(
 ) -> tokio::task::JoinHandle<()> {
     // The task below is the deployment gate, not the loop: it ends by starting
     // the loop, so a caller must not read its completion as the loop's fate.
-    // The gate cannot be asked at plugin init instead — one of its two inputs is
+    // The gate cannot be asked at process init instead — one of its two inputs is
     // an HTTP call to the security gateway, which would both block startup and
     // read "not reachable yet" as "not configured".
     tokio::spawn(async move {
-        // 属主判定放在最前，且每条退出路径都带原因。只报「起来了」是不够的：
-        // 属主拿 OAuth App 配置当门时，App 被撤掉那一支会静默返回，于是
-        // 「属主、有轮换材料、但不再刷新」与「属主、没东西可刷」在日志上同形，
-        // 只有 24h 后 egress 开始 401 才区分得开。先问属主，再逐支报原因，
-        // 全部署就恰好只有一台进程说话，且它每次都说清自己为什么跑或不跑。
-        //
-        // 不做属主判定就起循环是不行的：非属主每小时都会以 403 失败一次，
-        // 永远不成功；更糟的是一旦有人给它补上权限，两个进程就会拿同一个单次
-        // 有效的 refresh token 互相抢（token 每次使用都轮换）。
-        if !is_contribution_secret_owner().await {
-            // 非属主只在真的有事可做时才出声。没配 Gitee OAuth App 的安装里
-            // 它本就不该参与，再报一行「没起来」只会把「谁在说话」搅浑。
-            if gitee_oauth_available().await {
-                tracing::info!(
-                    "gitee token refresher not started: this process cannot read the contribution secret"
-                );
-            }
-            return;
-        }
+        // 每一支退出都带原因。只报「起来了」是不够的：拿 OAuth App 配置当门时，
+        // App 被撤掉那一支会静默返回，于是「有轮换材料、但不再刷新」与「没东西
+        // 可刷」在日志上同形，只有 24h 后 egress 开始 401 才区分得开。
         if !gitee_oauth_available().await {
             tracing::info!(
                 "gitee token refresher not started: no Gitee OAuth app is configured for the security gateway"
             );
             return;
         }
-        // 属主这一侧必须自报。只靠非属主的「not started」，部署里就没有任何一行
-        // 说得出「刷新循环正在跑」——属主消失时两侧都静默（非属主不再出现是因为
-        // 它本来就不该出现，属主不再出现是因为它没了），要等 24h 后 token 过期、
-        // egress 开始 401 才知道。周期与阈值一起报出来，读数才有决定面。
+        // 起循环的进程必须自报。少了这一行，部署里就没有任何一行说得出「刷新
+        // 循环正在跑」——它消失时要等 24h 后 token 过期、egress 开始 401 才
+        // 知道。周期与阈值一起报出来，读数才有决定面。
         tracing::info!(
             interval_secs,
             refresh_threshold_secs,
@@ -2194,7 +2373,7 @@ async fn gitee_refresh_tick(refresh_threshold_secs: u64) -> Result<(), String> {
     }
     // The gateway reads the token from env at pod start; roll it so egress
     // picks up the fresh pair. The new pod sees a young token and idles.
-    crate::secret_write::forward(string_data, false, true)
+    crate::secret_write::apply(string_data, false, true)
         .await
         .map(|_| ())
 }
