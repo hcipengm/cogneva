@@ -942,6 +942,12 @@ impl AgentRuntime {
         let outcome = self.run_turns(input, llm, run_task_id).await;
         self.report_run_census(run_task_id, started.elapsed()).await;
         self.report_skill_outcome(started.elapsed()).await;
+        // 一跑以错误收场，就在这一处报出去：`run_turns` 的三个出口都汇到这里，
+        // 逐出口去报就得在每一处重写一遍「报过没有」，而漏掉的那一处正好是
+        // 读者最想知道的那一种结局。
+        if let Err(ref e) = outcome {
+            self.note_run_failure(e).await;
+        }
         self.run_task_id = None;
         outcome
     }
@@ -2219,6 +2225,45 @@ impl AgentRuntime {
         }
     }
 
+    /// 报一次「这一跑以错误收场」。
+    ///
+    /// 执行者面上那一格读的就是这条帧：它把「这个人刚才报错了」写在名单上。
+    /// 在那之前，这条帧在整棵树里没有一个生产者——失败只进日志和任务行，名单上
+    /// 一格都不变，于是「执行者一个接一个失败」与「平台很安静」在屏幕上同形。
+    ///
+    /// 分类只用手上已有的判据，不另写一张 21 个变体的对照表：那一张表是 core 的
+    /// 知识，抄一份到 agent 里，两边迟早各说各的。四个类各对应一种处置，
+    /// 这正是读者要分的：环境（等一会儿）、规则拒绝（换个做法）、输入本身不合法
+    /// （改输入）、其余（我们的缺陷）。
+    ///
+    /// 只报一次：一次运行只有一个结局，而这条帧是从那个唯一的出口发出去的，
+    /// 没有第二个地方会替同一跑再发一条。
+    async fn note_run_failure(&self, error: &SFError) {
+        let (error_code, severity) = failure_class(error);
+        let mut details = error.to_string();
+        // 这一帧没有任务字段，而「谁失败了」在名单之外还要落到哪条活上。任务
+        // 身份挂在正文里，读的人看得见，也没有谁去解析它。
+        if let Some(task_id) = self.run_task_id.as_ref() {
+            details.push_str(&format!(" (task {task_id})"));
+        }
+        let event = AgentEvent::AgentError {
+            agent_id: self.config.agent_id.clone(),
+            error_code: error_code.to_string(),
+            severity,
+            details,
+            crew_id: self.config.crew_id.clone(),
+            squad_id: self.config.squad_id.clone(),
+            timestamp: chrono::Utc::now(),
+        };
+        if let Err(e) = self.emit_event(event).await {
+            tracing::warn!(
+                agent_id = %self.config.agent_id,
+                error = %e,
+                "run failure could not be announced on the bus"
+            );
+        }
+    }
+
     async fn emit_event(&self, event: AgentEvent) -> SFResult<()> {
         // Raw logging for agent/tool events
         if let Some(ref logger) = self.raw_logger {
@@ -2292,6 +2337,22 @@ impl AgentRuntime {
         }
 
         Ok(())
+    }
+}
+
+/// 一次失败的结局该怎么写进执行者面：一个机器读的类名，一个给人看的严重度。
+///
+/// 四个类用的是 core 已经定好的类型化判据（环境 / 规则拒绝 / 输入不合法 / 其余），
+/// 不按错误文本猜：文本随上游改写，而这里的分类要决定读者先看哪一行。规则拒绝
+/// 是**判决**不是故障——同一条调用再试一次还是同一个答复，把它写成 error 会让
+/// 「守住了」在名单上与「坏了」同形。
+fn failure_class(error: &SFError) -> (&'static str, cog_core::ErrorSeverity) {
+    use cog_core::ErrorSeverity;
+    match error {
+        SFError::Blocked { .. } => ("guardrail_blocked", ErrorSeverity::Warning),
+        other if other.is_permanent_rejection() => ("input_rejected", ErrorSeverity::Warning),
+        other if other.is_environment_failure() => ("environment", ErrorSeverity::Critical),
+        _ => ("internal", ErrorSeverity::Critical),
     }
 }
 
@@ -3624,6 +3685,88 @@ mod tests {
             runtime.run_usage.llm_calls, 2,
             "the reformat fallback is a billed call and must be counted"
         );
+    }
+
+    /// A run that ends on an error says so once on the bus, and says which task
+    /// it was working on.
+    ///
+    /// Without this the roster is a table of agents that never look wrong: a
+    /// failure reached the log and the task row, never the screen, so a fleet
+    /// failing one agent after another and a quiet platform drew the same
+    /// picture. The frame is the only place that cell can come from.
+    #[tokio::test]
+    async fn a_failed_run_is_announced_on_the_bus_exactly_once() {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        let config = RuntimeConfig {
+            agent_id: "failing".into(),
+            max_iterations: 1,
+            think_stall_timeout_secs: 5,
+            final_draft_timeout_secs: 300,
+            ..Default::default()
+        };
+        let mut runtime = AgentRuntime::new(config, tx);
+        let llm = CensusLlm {
+            text: "",
+            stream_usage: cog_core::Usage::default(),
+            chat_usage: cog_core::Usage::default(),
+            error: true,
+        };
+
+        runtime
+            .run_scoped(serde_json::json!({"task": "x"}), &llm, Some("task-9"))
+            .await
+            .expect_err("the stream error propagates");
+
+        let mut failures = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, AgentEvent::AgentError { .. }) {
+                failures.push(event);
+            }
+        }
+        assert_eq!(failures.len(), 1, "one run has one ending: one report");
+        match &failures[0] {
+            AgentEvent::AgentError {
+                agent_id,
+                error_code,
+                severity,
+                details,
+                ..
+            } => {
+                assert_eq!(agent_id, "failing");
+                // 上游没给类型化原因时，这一跑归「我们的缺陷」那一类，不是环境类：
+                // 把说不清原因的失败记成外部故障，等于替上游免责。
+                assert_eq!(*error_code, "internal");
+                assert_eq!(*severity, cog_core::ErrorSeverity::Critical);
+                assert!(
+                    details.contains("task task-9"),
+                    "这条帧要说明是哪条活失败了，实际是：{details}"
+                );
+            }
+            other => panic!("the failure was announced as something else: {other:?}"),
+        }
+    }
+
+    /// A guardrail refusal is a verdict, not a fault: the same call would be
+    /// refused the same way, so it must not be announced as an error.
+    #[test]
+    fn a_guardrail_refusal_is_announced_as_a_warning() {
+        let (code, severity) = failure_class(&SFError::Blocked {
+            tool: "write_file".into(),
+            reason: "path outside the worktree".into(),
+            rule: "write-scope".into(),
+        });
+        assert_eq!(code, "guardrail_blocked");
+        assert_eq!(severity, cog_core::ErrorSeverity::Warning);
+
+        // 环境类与内容类分开：前者等一会儿再试，后者改输入。
+        let (code, severity) = failure_class(&SFError::ResourceExhausted("no build slot".into()));
+        assert_eq!(code, "environment");
+        assert_eq!(severity, cog_core::ErrorSeverity::Critical);
+        let (code, _) = failure_class(&SFError::PayloadTooLarge {
+            size: 9,
+            limit: Some(8),
+        });
+        assert_eq!(code, "input_rejected");
     }
 
     /// A run that fails still reports what it spent before it failed: the runs
