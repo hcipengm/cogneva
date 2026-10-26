@@ -9670,13 +9670,14 @@ mod tests {
         is_rollout_target, locate_before_any_change, normalize_placement_shape, parse_rollout_args,
         pod_samples, pod_selector, pod_template_limits, pod_waiting_states, readiness_overdue,
         replicaset_failures, rollout_converged, rollout_pods_fatal, rollout_pods_ready,
-        stage_rollout_manifest, staged_manifest_path, summarize_events, summarize_pod_states,
-        support_pod_causes, support_pod_selector, support_settled, terminating_pods,
-        unresolved_configmaps, unschedulable_pods, write_termination_message, ClusterConfigSources,
-        ProbeCycle, RefSnapshots, ReplicaSetFailure, RewrittenRef, RolloutExecutor, RolloutPlan,
-        SupportCause, SupportWorkload, UpstreamCiAsk, UpstreamCiTarget, ADMISSION_DENIED_MARKER,
-        IMAGE_PULL_WAITING_REASONS, K3S_KUBECONFIG, NEW_REVISION_NEVER_RAN_MARKER,
-        PLACEMENT_BLOCKED_MARKER, SERVICE_ACCOUNT_TOKEN, SUPPORT_CAUSE_POD_LIMIT,
+        settle_jsonpath, stage_rollout_manifest, staged_manifest_path, summarize_events,
+        summarize_pod_states, support_pod_causes, support_pod_selector, support_settled,
+        terminating_pods, unresolved_configmaps, unschedulable_pods, write_termination_message,
+        ClusterConfigSources, ProbeCycle, RefSnapshots, ReplicaSetFailure, RewrittenRef,
+        RolloutExecutor, RolloutPlan, SupportCause, SupportWorkload, UpstreamCiAsk,
+        UpstreamCiTarget, ADMISSION_DENIED_MARKER, IMAGE_PULL_WAITING_REASONS, K3S_KUBECONFIG,
+        NEW_REVISION_NEVER_RAN_MARKER, PLACEMENT_BLOCKED_MARKER, SERVICE_ACCOUNT_TOKEN,
+        SUPPORT_CAUSE_POD_LIMIT,
     };
 
     #[test]
@@ -18464,18 +18465,72 @@ echo "||1"
     #[test]
     fn support_settled_requires_observed_generation_and_new_replicas() {
         // generation|observed|want|ready|updated|running
-        assert_eq!(support_settled("2|2|1|1|1|1|"), Some(true));
+        assert_eq!(support_settled("deployment", "2|2|1|1|1|1|"), Some(true));
         // 控制器还没看到这一代 spec：新副本一个都还没起。
-        assert_eq!(support_settled("2|1|1|1|1|1|"), Some(false));
+        assert_eq!(support_settled("deployment", "2|1|1|1|1|1|"), Some(false));
         // 滚动中：就绪副本还没补齐。
-        assert_eq!(support_settled("2|2|3|2|2|3|"), Some(false));
+        assert_eq!(support_settled("deployment", "2|2|3|2|2|3|"), Some(false));
         // 缩到 0 副本：spec 要 0 个，就绪 0 个成立。
-        assert_eq!(support_settled("2|2|0||||"), Some(true));
+        assert_eq!(support_settled("statefulset", "2|2|0||||"), Some(true));
         // replicas 缺省（读作 1）而就绪数读不到：不能当成"不需要就绪"。
-        assert_eq!(support_settled("2|2||"), Some(false));
+        assert_eq!(support_settled("deployment", "2|2||"), Some(false));
         // 读不出来不是"就绪"。
-        assert_eq!(support_settled(""), None);
-        assert_eq!(support_settled("|2|1|1|"), None);
+        assert_eq!(support_settled("deployment", ""), None);
+        assert_eq!(support_settled("deployment", "|2|1|1|"), None);
+    }
+
+    /// DaemonSet 用自己那三个数判，不能用副本那一套。
+    ///
+    /// 实测（2026-10-26T20:52:00Z）：这次 apply 重启了
+    /// `daemonset/cogneva-claim-store`，滚动就在它 `desired 1, ready 0` 的当口宣告
+    /// `Complete`，直到 20:53:14Z 它才重新监听。原因不是判据算错，是这个 kind 根本
+    /// 不在被等的名单里。现在它在名单里，读法按 kind 分派。
+    #[test]
+    fn a_daemonset_is_settled_by_the_node_pair_it_actually_declares() {
+        // generation|observed|desired|ready|updated
+        assert_eq!(support_settled("daemonset", "148|148|1|1|1"), Some(true));
+        // 就是那晚的读数：控制器看过这一代，节点上还没有就绪的 Pod。
+        assert_eq!(support_settled("daemonset", "148|148|1|0|1"), Some(false));
+        // 控制器还没处理这一代 spec。
+        assert_eq!(support_settled("daemonset", "148|147|1|1|1"), Some(false));
+        // 新版本还没铺满每个节点：旧 Pod 还顶着，ready 全程为满也不能放行。
+        assert_eq!(support_settled("daemonset", "148|148|1|1|0"), Some(false));
+        // 一个节点都不匹配：没有东西要等。
+        assert_eq!(support_settled("daemonset", "148|148|0|0|0"), Some(true));
+        // desired 读不到就是没读到答案，不是"不需要就绪"。
+        assert_eq!(support_settled("daemonset", "148|148||1|1"), None);
+        // 判据按 kind 分派是两半：这一半读它自己的三个数，那一半（取读法）也得换。
+        // 只换判据不换读法，拿到的会是两个不存在的字段，而缺省值恰好说「还没就绪」
+        // ——等待永远不成立。所以取读法这一处也点名。
+        let path = settle_jsonpath("daemonset");
+        assert!(path.contains("desiredNumberScheduled"), "{path}");
+        assert!(path.contains("numberReady"), "{path}");
+        assert!(!path.contains("spec.replicas"), "{path}");
+        // 副本族仍旧读副本。
+        assert!(settle_jsonpath("deployment").contains("spec.replicas"));
+    }
+
+    /// 每一种「Pod 一重启就一直不服务」的工作负载都必须被等，名单不许漏。
+    ///
+    /// 这道判据盯着的是名单本身：`WORKLOAD_KINDS` 里 `long_lived_pods` 为真的每一个
+    /// kind，都得在 `SUPPORT_WORKLOAD_KINDS` 里。名单短一个 kind，不是「少等一会儿」，
+    /// 而是这一族工作负载被重启之后可以一直不服务，而滚动照样报成功——2026-10-26
+    /// 的 `daemonset/cogneva-claim-store` 就是这样。往 `WORKLOAD_KINDS` 里加一个新
+    /// kind 的人，会在这里被问一句「它要不要等」。
+    #[test]
+    fn every_long_lived_kind_is_waited_for() {
+        use crate::mainline_rollout::SUPPORT_WORKLOAD_KINDS;
+        for entry in &WORKLOAD_KINDS {
+            if !entry.long_lived_pods {
+                continue;
+            }
+            assert!(
+                SUPPORT_WORKLOAD_KINDS.contains(&entry.resource),
+                "{} is long-lived, so a restarted one serves nothing until its pod is \
+                 ready, but the rollout waits only for {SUPPORT_WORKLOAD_KINDS:?}",
+                entry.kind
+            );
+        }
     }
 
     /// 换掉自己最后一个 Pod 的支撑负载不算就绪。
@@ -18487,13 +18542,13 @@ echo "||1"
     #[test]
     fn a_support_workload_replacing_its_last_pod_is_not_settled() {
         // 旧 Pod 还在（ready=1），新版本的副本 0 个：正在换，只是还没换完。
-        assert_eq!(support_settled("2|2|1|1|0|1|"), Some(false));
+        assert_eq!(support_settled("deployment", "2|2|1|1|0|1|"), Some(false));
         // 新 Pod 起来了（updated=1），但还没过就绪探针。
-        assert_eq!(support_settled("2|2|1|0|1|1|"), Some(false));
+        assert_eq!(support_settled("deployment", "2|2|1|0|1|1|"), Some(false));
         // 新 Pod 就绪，旧版本的副本撤干净。
-        assert_eq!(support_settled("2|2|1|1|1|1|"), Some(true));
+        assert_eq!(support_settled("deployment", "2|2|1|1|1|1|"), Some(true));
         // 两个版本并存：总数超过新版本副本数，说明还有旧的没撤完。
-        assert_eq!(support_settled("2|2|1|1|1|2|"), Some(false));
+        assert_eq!(support_settled("deployment", "2|2|1|1|1|2|"), Some(false));
     }
 
     /// 容器自己写下的死因必须原样进读数。

@@ -66,18 +66,26 @@ pub(crate) const IMAGE_PULL_WAITING_REASONS: &[&str] = &["ErrImagePull", "ImageP
 /// Job 的 `activeDeadlineSeconds`——只封一头，另一头的界就名不副实。
 pub(crate) const CI_ASK_BUDGET_SECS: u64 = 180;
 
-/// The workload kinds this rollout waits for after the apply, and why the list
-/// is shorter than [`WORKLOAD_KINDS`]: settling is read as replicas
-/// (`spec.replicas` against `status.readyReplicas`) and only these two declare
-/// that pair. A DaemonSet folded in here would read a missing `replicas` as its
-/// absent-field default of one and a missing `readyReplicas` as zero, so the
-/// wait would never come true and the rollout would die at the deadline
-/// instead of reporting readiness. Reading a DaemonSet's progress takes its own
-/// pair (`desiredNumberScheduled`/`numberReady`) and is a change to this face,
-/// not to this list.
+/// The workload kinds this rollout waits for after the apply: every kind whose
+/// pods are long-lived, i.e. every kind a restarted pod leaves serving nothing
+/// until the replacement is ready.
 ///
-/// The kinds apply can reach and this list does not cover are a known residue:
-/// a DaemonSet or CronJob this apply restarts is not waited for here.
+/// A DaemonSet is in the list and is read by its own pair. It declares no
+/// `spec.replicas` — the node count is the controller's to work out — so the
+/// replica reading would take the absent field's default of one and compare it
+/// against a `readyReplicas` that does not exist either, a comparison that says
+/// nothing about any DaemonSet. Reading it as
+/// `desiredNumberScheduled`/`numberReady`/`updatedNumberScheduled` is the same
+/// question asked in the vocabulary that kind actually speaks.
+///
+/// Leaving it out was not neutral: 2026-10-26 the rollout reported `Complete`
+/// at 20:52:00Z while `daemonset/cogneva-claim-store` — restarted by that same
+/// apply — was `desired 1, ready 0`, and it did not answer until 20:53:14Z.
+/// Nothing in the release said so, because nothing was reading it.
+///
+/// CronJob is the one kind left out and stays out: its pods are created per run
+/// and vanish, so "wait for the pod that replaces the one I restarted" has no
+/// meaning there.
 ///
 /// The rollout targets are Deployments of their own and are waited for one by
 /// one; they are not covered here either.
@@ -85,9 +93,10 @@ pub(crate) const CI_ASK_BUDGET_SECS: u64 = 180;
 /// The words come from [`workload_resource`] rather than being spelled here:
 /// this list is read and patched through kubectl, and a face that spelled its
 /// own word would name the same object twice under two spellings.
-const SUPPORT_WORKLOAD_KINDS: &[&str] = &[
+pub(crate) const SUPPORT_WORKLOAD_KINDS: &[&str] = &[
     workload_resource("Deployment"),
     workload_resource("StatefulSet"),
+    workload_resource("DaemonSet"),
 ];
 
 /// 支撑工作负载"这次滚动可以往下走了"的读法：代数、观测到的代数、期望副本数、
@@ -97,6 +106,21 @@ const SUPPORT_WORKLOAD_KINDS: &[&str] = &[
 /// 后两个字段是这一条判据的关键，不是陪衬：光看"期望几个、就绪几个"读不出
 /// "旧 Pod 正在被换掉"这件事（见 [`support_settled`]）。
 const SUPPORT_SETTLE_JSONPATH: &str = "jsonpath={.metadata.generation}|{.status.observedGeneration}|{.spec.replicas}|{.status.readyReplicas}|{.status.updatedReplicas}|{.status.replicas}";
+
+/// DaemonSet 的同一问，用它自己的词表：期望节点数、就绪 Pod 数、已换到新版本的
+/// 节点数。它没有 `spec.replicas`，也没有 `status.readyReplicas`——拿上面那份读法
+/// 去读它，读回来的是两个不存在的字段，而缺字段的默认值（1 与 0）恰好构成一句
+/// 「还没就绪」，于是等待要么永远不成立、要么（缺省按 1 读到 zeros 时）什么都不等。
+const DAEMONSET_SETTLE_JSONPATH: &str = "jsonpath={.metadata.generation}|{.status.observedGeneration}|{.status.desiredNumberScheduled}|{.status.numberReady}|{.status.updatedNumberScheduled}";
+
+/// 这个工作负载该用哪份读法。词表只有一处：资源词进 [`workload_kind_of_resource`]
+/// 换出清单 kind，再由清单 kind 选读法，不在这里手写第二张对照表。
+pub(crate) fn settle_jsonpath(kind: &str) -> &'static str {
+    match workload_kind_of_resource(kind).map(|k| k.kind) {
+        Some("DaemonSet") => DAEMONSET_SETTLE_JSONPATH,
+        _ => SUPPORT_SETTLE_JSONPATH,
+    }
+}
 
 /// 现场读数带病因，但长度不能由集群里的内容决定：它进日志、进终止消息、进失败
 /// 记录。Pod 数、每个 Pod 的容器数、单条消息的字符数各设一个界，超界显式写出来。
@@ -1553,11 +1577,11 @@ pub(crate) fn deployment_surges(live: &serde_json::Value) -> bool {
     extra > 0
 }
 
-/// 支撑清单里可能被 apply 动到的工作负载（后端与集群内 registry）。apply 只改
-/// 自己那份 spec：没改动的工作负载原地不动，改动的会滚动重启几秒到几十秒。
+/// 支撑清单里可能被 apply 动到的工作负载（后端、集群内 registry、节点级 DaemonSet）。
+/// apply 只改自己那份 spec：没改动的工作负载原地不动，改动的会滚动重启几秒到几十秒。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SupportWorkload {
-    /// kubectl 子命令用的单数资源名（deploy / statefulset）。
+    /// kubectl 子命令用的单数资源名（deployment / statefulset / daemonset）。
     pub(crate) kind: &'static str,
     pub(crate) name: String,
     pub(crate) generation: i64,
@@ -1670,7 +1694,31 @@ pub(crate) fn changed_workloads(
 /// 算：Deployment/StatefulSet 的缺省都是 1，读成 0 会把一个单副本工作负载判成
 /// "不需要就绪"而直接放行。`updatedReplicas` / `replicas` 缺省按 0 算：这两个字段
 /// 都是 optional，缺省即真的为 0，而 0 在 `updated >= want` 一侧是保守方向。
-pub(crate) fn support_settled(readout: &str) -> Option<bool> {
+///
+/// 读法与判据都按 kind 分派（见 [`settle_jsonpath`]）：上面这一套是副本族的，
+/// DaemonSet 走 [`daemonset_settled`]——它没有 `spec.replicas`，同一句判据在它上面
+/// 读的是两个不存在的字段。
+pub(crate) fn support_settled(kind: &str, readout: &str) -> Option<bool> {
+    match workload_kind_of_resource(kind).map(|k| k.kind) {
+        Some("DaemonSet") => daemonset_settled(readout),
+        _ => replica_settled(readout),
+    }
+}
+
+/// DaemonSet 的判据：控制器看过这一代 spec，且每个该跑的节点上都有一个就绪的
+/// 新版本 Pod。`desiredNumberScheduled` 由控制器按节点选择器数出来，一个节点都
+/// 不匹配时它是 0——那种 DaemonSet 确实没有东西要等。
+fn daemonset_settled(readout: &str) -> Option<bool> {
+    let mut parts = readout.split('|');
+    let generation: i64 = parts.next()?.trim().parse().ok()?;
+    let observed: i64 = parts.next()?.trim().parse().unwrap_or(0);
+    let desired: i32 = parts.next()?.trim().parse().ok()?;
+    let ready: i32 = parts.next()?.trim().parse().unwrap_or(0);
+    let updated: i32 = parts.next()?.trim().parse().unwrap_or(0);
+    Some(observed >= generation && ready >= desired && updated >= desired)
+}
+
+fn replica_settled(readout: &str) -> Option<bool> {
     let mut parts = readout.split('|');
     let generation: i64 = parts.next()?.trim().parse().ok()?;
     let observed: i64 = parts.next()?.trim().parse().unwrap_or(0);
@@ -2700,9 +2748,9 @@ impl RolloutExecutor {
             let mut still: Vec<&SupportWorkload> = Vec::new();
             for w in pending {
                 let readout = self
-                    .run_kubectl(&["get", w.kind, &w.name, "-o", SUPPORT_SETTLE_JSONPATH], 30)
+                    .run_kubectl(&["get", w.kind, &w.name, "-o", settle_jsonpath(w.kind)], 30)
                     .await?;
-                if support_settled(&readout) == Some(true) {
+                if support_settled(w.kind, &readout) == Some(true) {
                     continue;
                 }
                 last = format!(
