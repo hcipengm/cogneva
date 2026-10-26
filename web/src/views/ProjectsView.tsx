@@ -14,6 +14,7 @@ import {
   type TaskRow,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useFrameDrivenRefresh } from '@/hooks/useStreamDrivenRefresh';
 import {
   changedSinceSnapshot,
   projectRevision,
@@ -237,13 +238,12 @@ function useFrameFedFace(
     () => projectRevision(project.id, owned, rows),
     [project.id, owned, rows]
   );
-  useEffect(() => {
-    if (!revision) return;
-    // 一批任务往往一起换状态（同一轮派发、同一批结束）。逐帧重读会把同一份字节
-    // 连取十几遍，而读者要的是它们都到了之后的那一份，所以合并成一次。
-    const timer = window.setTimeout(refresh, 600);
-    return () => window.clearTimeout(timer);
-  }, [revision, refresh]);
+  // 这里以前是一个 600 毫秒的尾随去抖：每来一条属于本项目的帧就把定时器往后推。
+  // 一批任务一起换状态时它确实只读一次，可平台忙起来帧是**连续**的——每推一次，
+  // 这一发的到期时刻就又晚 600 毫秒，于是一面号称「跟着帧走」的视图比纯轮询还旧。
+  // 现在走的是与其余各面同一条调度：前沿立刻读、两读之间至少隔一段地板、地板之内
+  // 的信号合并成到期的那一发，且**不**把已在路上的那一发往后推。
+  useFrameDrivenRefresh(revision, refresh);
   return useMemo(
     () => changedSinceSnapshot(snapshotAt, rowsForProject(project.id, owned, rows)),
     [snapshotAt, project.id, owned, rows]

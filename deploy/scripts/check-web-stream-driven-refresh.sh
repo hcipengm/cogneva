@@ -31,6 +31,9 @@
 #   6. 幅面之外的那块「图上还没有的边」也要收：通信面把比快照新的边单独列出来，
 #      靠的是重读很快把它们并进图里。没有触发重读，这块就成了常驻——轮询一调长，
 #      一条已经进了图的交接会在这一块里一直写着「图上还没有」。
+#   7. 只有一套调度：项目面按「属于本项目的帧」重读，用的是与其余各面同一个
+#      `planRefresh`，不是自己那份尾随去抖。去抖在连续的帧下会被一次次推后，
+#      忙的时候这一面反而最旧——同一棵树里两套间隔策略，长的那个就是错的。
 #
 # 用法：bash deploy/scripts/check-web-stream-driven-refresh.sh [仓库根目录]
 set -euo pipefail
@@ -135,7 +138,24 @@ if not re.search(r"useStreamDrivenRefresh\(\[graph\.refresh, tasks\.refresh\]\)"
         "只有在下一次轮询才收得掉，轮询一调长，已经在图里的交接会一直挂在那里"
     )
 
-print("ok   - 调度是纯的、总线报了到、观测面/任务面/通信面接上了重读")
+# 项目面按自己的信号重读，但用的必须是同一套调度。
+projects = read("views/ProjectsView.tsx")
+if not re.search(r"useFrameDrivenRefresh\(revision, refresh\)", projects):
+    sys.exit(
+        "views/ProjectsView.tsx 没有用共用的调度重读：这一面自己另排一套间隔，"
+        "两套策略里长的那一个就是错的"
+    )
+for path in ("views/ProjectsView.tsx", "hooks/useStreamDrivenRefresh.ts"):
+    src = read(path)
+    if re.search(r"window\.setTimeout\(\s*refresh\s*,", src) or re.search(
+        r"window\.setTimeout\(\s*\(\s*\)\s*=>\s*\{?\s*refresh\(", src
+    ):
+        sys.exit(
+            f"web/src/{path} 里又出现了一发「尾随去抖式」的重读：每来一条信号就把它"
+            "往后推，连续的信号会让它永远到不了点——忙的时候这一面比轮询还旧"
+        )
+
+print("ok   - 调度是纯的、总线报了到、观测面/任务面/通信面/项目面都按同一套调度重读")
 PYEOF
 
 TSC="$ROOT/web/node_modules/.bin/tsc"
