@@ -1786,6 +1786,59 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
 /// Prometheus metrics endpoint — serves memory operation counters,
 /// latency histograms, and task operation counters from the MetricsBackend
 /// in text format, plus prometheus registry metrics from MetricsExporter.
+/// 一个观察者 panic，不能把整页指标一起带走。
+///
+/// 旧实现直接 `await` 那个按维度扇出的采集：任何一个 observable panic，栈就一路
+/// 展开到 handler 之外，抓取拿到 500，其余所有 observable 的读数在这一次抓取里
+/// 一起消失。而且它自己不会恢复——当 panic 发生在被缓存并共享的 future 里
+/// （`futures_util::future::Shared` 会把内层 future 标成 POISONED，之后每次 poll
+/// 都重新 panic），同一个 observable 会在每一次后续抓取里继续 panic，直到进程重启。
+/// 2026-10-26 实测就是这样：`/metrics` 从 16:53:57Z 起一直 500。
+///
+/// 所以每个 observable 各自包一层 `catch_unwind`。panic 掉的那个按它声明的维度
+/// 记进日志——契约里没有名字，声明的维度就是它唯一的身份。
+async fn collect_observables_isolated(
+    observables: &[Arc<dyn cog_core::Observable>],
+    dimensions: &[String],
+) -> Vec<cog_core::RawMetric> {
+    use futures::FutureExt as _;
+    let mut out = Vec::new();
+    for (index, observable) in observables.iter().enumerate() {
+        // 先取维度再采集：采集 panic 之后照样要能说出是哪一个。
+        let declared: Vec<String> = observable
+            .available_dimensions()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        let one = std::slice::from_ref(observable);
+        match std::panic::AssertUnwindSafe(cog_core::collect_metrics_for_dimensions(
+            one, dimensions,
+        ))
+        .catch_unwind()
+        .await
+        {
+            Ok(mut metrics) => out.append(&mut metrics),
+            Err(payload) => tracing::warn!(
+                index,
+                declared = ?declared,
+                panic = %panic_message(payload.as_ref()),
+                "observable panicked while collecting metrics; serving the rest of the page"
+            ),
+        }
+    }
+    out
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> Response {
     let mut body = String::new();
 
@@ -1819,8 +1872,7 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
     // so a dimension left out here is a metric that is counted and exported by
     // nobody, with nothing failing to say so.
     let observable_metrics =
-        cog_core::collect_metrics_for_dimensions(&state.observables, &state.metrics_dimensions)
-            .await;
+        collect_observables_isolated(&state.observables, &state.metrics_dimensions).await;
     if !observable_metrics.is_empty() {
         if !body.is_empty() {
             body.push('\n');
@@ -3442,6 +3494,66 @@ mod metrics_exposition_tests {
         assert!(
             body.contains("some_future_counter_total{} 3"),
             "后端持有的 counter 必须出现在暴露面上: {body}"
+        );
+    }
+
+    /// 一个 observable panic，不能把整页读数一起带走。
+    ///
+    /// 回归的是 `/metrics` 从 16:53:57Z 起一直 500 的那一次：panic 从采集扇出里
+    /// 一路展开到 handler 之外，其余 observable 的读数在这一次抓取里一起消失，
+    /// 而共享 future 中毒之后每次抓取都会再 panic 一次，自己不会恢复。这里两端
+    /// 都钉住：好观察者的读数必须在，坏的那个只影响自己。
+    #[tokio::test]
+    async fn a_panicking_observable_leaves_the_other_readings_on_the_page() {
+        use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
+
+        struct Stub {
+            name: &'static str,
+            panics: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl Observable for Stub {
+            async fn collect_metrics(
+                &self,
+                _dimension: &str,
+            ) -> cog_core::SFResult<Vec<RawMetric>> {
+                if self.panics {
+                    panic!("inner future panicked during poll");
+                }
+                Ok(vec![RawMetric::new(self.name, 1.0)])
+            }
+
+            async fn collect_trace(
+                &self,
+                _task_id: &str,
+            ) -> cog_core::SFResult<Vec<TraceFragment>> {
+                Ok(Vec::new())
+            }
+
+            fn available_dimensions(&self) -> Vec<DimensionSpec> {
+                Vec::new()
+            }
+        }
+
+        let observables: Vec<Arc<dyn Observable>> = vec![
+            Arc::new(Stub {
+                name: "boom",
+                panics: true,
+            }),
+            Arc::new(Stub {
+                name: "survivor",
+                panics: false,
+            }),
+        ];
+
+        let metrics = collect_observables_isolated(&observables, &[]).await;
+        let names: Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec!["survivor"],
+            "panic 掉的那个只该带走自己，其余的读数必须还在: {names:?}"
         );
     }
 
