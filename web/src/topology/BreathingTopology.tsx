@@ -5,7 +5,8 @@ import type {
   TopologyNode,
   TopologyPod,
 } from '@/api/client';
-import { formatBytes, formatCpu } from '@/topology/ClusterTopology';
+import { formatBytes, formatCpu, percentOf } from '@/topology/format';
+import { ContainerRow, Dot, EventRow, VolumeRow } from '@/topology/rows';
 
 /**
  * 集群这一张「活着」的图：节点是心，Pod 绕着它，谁在呼吸由真实用量决定。
@@ -113,7 +114,12 @@ function hasUsage(cluster: TopologyCluster): boolean {
 }
 
 export function BreathingTopology({ data }: { data: ClusterTopologyData }) {
-  const [picked, setPicked] = useState<TopologyPod | null>(null);
+  // 点中的是哪一层，只一个：图上点节点、点 Pod 都落到这里，右侧那一栏跟着换。
+  // 选中态是一个名字而不是一个对象——快照每拍换一份，抓着旧对象不放的详情栏会
+  // 停在上一次读到的数上，而图已经换了一版。
+  const [picked, setPicked] = useState<
+    { kind: 'node'; name: string } | { kind: 'pod'; name: string } | null
+  >(null);
 
   const clusters = data.clusters.filter((cluster) => cluster.nodes.length > 0);
   if (clusters.length === 0) return null;
@@ -172,6 +178,7 @@ export function BreathingTopology({ data }: { data: ClusterTopologyData }) {
               node.cpu_used_millicores != null && node.cpu_allocatable_millicores
                 ? Math.min(1, node.cpu_used_millicores / node.cpu_allocatable_millicores)
                 : null;
+            const nodePicked = picked?.kind === 'node' && picked.name === node.name;
             return (
               <g key={node.name}>
                 {/* 连线先画：线压在节点与 Pod 底下，读者先看到关系，再看到点。 */}
@@ -183,7 +190,9 @@ export function BreathingTopology({ data }: { data: ClusterTopologyData }) {
                     x2={point.x}
                     y2={point.y}
                     stroke="var(--line)"
-                    strokeWidth={picked && picked.name === point.pod.name ? 1.6 : 1}
+                    strokeWidth={
+                      picked?.kind === 'pod' && picked.name === point.pod.name ? 1.6 : 1
+                    }
                     strokeDasharray={point.pod.ready ? undefined : '3 3'}
                   />
                 ))}
@@ -203,7 +212,20 @@ export function BreathingTopology({ data }: { data: ClusterTopologyData }) {
                     animationDuration: cpuUsed == null ? undefined : `${breathSeconds(cpuUsed)}s`,
                   }}
                 />
-                <circle cx={cx} cy={cy} r={40} fill="var(--ink-800)" stroke="var(--line-strong)" />
+                {/* 节点本身也能点：点它是「这台机器怎么了」，点 Pod 是「这个部件
+                    怎么了」。两层问的不是一件事，图上让它们各自可点，省掉一层菜单。 */}
+                <circle
+                  cx={cx}
+                  cy={cy}
+                  r={40}
+                  fill="var(--ink-800)"
+                  stroke={nodePicked ? 'var(--paper)' : 'var(--line-strong)'}
+                  strokeWidth={nodePicked ? 1.6 : 1}
+                  onClick={() => setPicked({ kind: 'node', name: node.name })}
+                  style={{ cursor: 'pointer' }}
+                >
+                  <title>{`${node.name}\n${node.ready ? '就绪' : '未就绪'} · ${node.pods.length} 个 Pod\n点这里看这台机器`}</title>
+                </circle>
                 {/* 申报量是个扇形：它决定「还排不排得进来」。 */}
                 <circle
                   cx={cx}
@@ -236,11 +258,11 @@ export function BreathingTopology({ data }: { data: ClusterTopologyData }) {
 
                 {placed.map((point) => {
                   const tone = podTone(point.pod);
-                  const selected = picked?.name === point.pod.name;
+                  const selected = picked?.kind === 'pod' && picked.name === point.pod.name;
                   return (
                     <g
                       key={point.pod.name}
-                      onClick={() => setPicked(point.pod)}
+                      onClick={() => setPicked({ kind: 'pod', name: point.pod.name })}
                       style={{ cursor: 'pointer' }}
                     >
                       <title>
@@ -295,7 +317,7 @@ export function BreathingTopology({ data }: { data: ClusterTopologyData }) {
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto">
-          <PodDetail pod={picked} />
+          <Detail picked={picked} clusters={clusters} onPick={(next) => setPicked(next)} />
         </div>
       </div>
 
@@ -308,16 +330,173 @@ export function BreathingTopology({ data }: { data: ClusterTopologyData }) {
   );
 }
 
-/** 选中一个 Pod 之后的细节。没选中时给一句怎么用，而不是留一块空白。 */
-function PodDetail({ pod }: { pod: TopologyPod | null }) {
-  if (!pod) {
+type Picked = { kind: 'node'; name: string } | { kind: 'pod'; name: string } | null;
+
+/**
+ * 右侧那一栏：点到了哪一层就讲哪一层。
+ *
+ * 没选中时不留空白——空白会被读成「这里什么都没有」，而这一栏要说的恰恰是「图上
+ * 每一样都能点」。选中时按名字在**这一份**快照里找，找不到就说找不到：抓着上一次
+ * 读到的对象不放，会让详情栏停在一个已经不在的 Pod 上。
+ */
+function Detail({
+  picked,
+  clusters,
+  onPick,
+}: {
+  picked: Picked;
+  clusters: TopologyCluster[];
+  onPick: (next: Picked) => void;
+}) {
+  if (!picked) {
     return (
       <p className="max-w-[52ch] px-1 py-2 text-[11px] leading-relaxed text-[var(--muted)]">
-        点图上的一个点，这里给出它此刻的全部读数：用量、申请、上限、容器、事件。点上是哪一个是
-        你选的，不是它自己跳出来的——一张会自己换内容的细节栏，读者没法拿它对着看。
+        点图上的节点圆，看这台机器还剩多少、有没有压力；点外面的一个小圆点，看这个 Pod
+        的容器、挂载、卷与事件，容器还能再点开一层——镜像、申报、上限、实际用量、上次
+        退出码、端口、探针都在那一层。点上是哪一个是你选的，不是它自己跳出来的：一张
+        会自己换内容的细节栏，读者没法拿它对着看。
       </p>
     );
   }
+
+  if (picked.kind === 'node') {
+    const node = clusters.flatMap((cluster) => cluster.nodes).find((it) => it.name === picked.name);
+    if (!node) {
+      return <Vanished what={`节点 ${picked.name}`} />;
+    }
+    return <NodeDetail node={node} onPick={onPick} />;
+  }
+
+  const pools = clusters.flatMap((cluster) => [
+    ...cluster.nodes.flatMap((node) => node.pods),
+    ...cluster.unscheduled,
+    ...cluster.unplaced,
+  ]);
+  const pod = pools.find((it) => it.name === picked.name);
+  if (!pod) {
+    return <Vanished what={`Pod ${picked.name}`} />;
+  }
+  return <PodDetail pod={pod} />;
+}
+
+/** 选中过的东西不在这一份快照里了：它被删了，或者这一拍没读到它。 */
+function Vanished({ what }: { what: string }) {
+  return (
+    <p className="px-1 py-2 text-[11px] leading-relaxed text-[var(--muted)]">
+      {what} 已经不在这一份读数里：它可能刚被删掉，也可能这一拍没读到。下一次重读若它还在，
+      这里会自己回来。
+    </p>
+  );
+}
+
+/** 一台机器：能吃多少、已经划出去多少、真在用多少，以及它自己在报什么。 */
+function NodeDetail({ node, onPick }: { node: TopologyNode; onPick: (next: Picked) => void }) {
+  const pressures = node.conditions.filter((condition) =>
+    condition.kind === 'Ready' ? !condition.ok : condition.kind.endsWith('Pressure') && condition.ok
+  );
+  const requested = node.cpu_allocatable_millicores
+    ? percentOf(node.cpu_requested_millicores, node.cpu_allocatable_millicores)
+    : '—';
+  const used =
+    node.cpu_used_millicores != null && node.cpu_allocatable_millicores
+      ? percentOf(node.cpu_used_millicores, node.cpu_allocatable_millicores)
+      : null;
+  const memoryUsed =
+    node.memory_used_bytes != null && node.memory_allocatable_bytes
+      ? percentOf(node.memory_used_bytes, node.memory_allocatable_bytes)
+      : null;
+
+  return (
+    <div className="flex flex-col gap-2 px-1 py-2">
+      <div className="flex flex-wrap items-baseline gap-2">
+        <span className="mono text-[12px] text-[var(--paper)]">{node.name}</span>
+        <span className="text-[11px]" style={{ color: node.ready ? 'var(--ok)' : 'var(--danger)' }}>
+          {node.ready ? '就绪' : '未就绪'}
+        </span>
+        {node.roles.length > 0 && (
+          <span className="mono text-[10px] text-[var(--muted)]">{node.roles.join(' · ')}</span>
+        )}
+      </div>
+
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[11px] text-[var(--paper-dim)]">
+        <span>
+          CPU 申报 <span className="mono">{formatCpu(node.cpu_requested_millicores)}</span>
+          <span className="text-[var(--muted)]">（{requested}）</span>
+        </span>
+        <span>
+          CPU 用量{' '}
+          <span className="mono">
+            {node.cpu_used_millicores == null ? '无读数' : formatCpu(node.cpu_used_millicores)}
+          </span>
+          {used && <span className="text-[var(--muted)]">（{used}）</span>}
+        </span>
+        <span>
+          内存申报 <span className="mono">{formatBytes(node.memory_requested_bytes)}</span>
+        </span>
+        <span>
+          内存用量{' '}
+          <span className="mono">
+            {node.memory_used_bytes == null ? '无读数' : formatBytes(node.memory_used_bytes)}
+          </span>
+          {memoryUsed && <span className="text-[var(--muted)]">（{memoryUsed}）</span>}
+        </span>
+        <span>
+          可分配 CPU{' '}
+          <span className="mono">
+            {node.cpu_allocatable_millicores == null ? '—' : formatCpu(node.cpu_allocatable_millicores)}
+          </span>
+        </span>
+        <span>
+          可分配内存{' '}
+          <span className="mono">
+            {node.memory_allocatable_bytes == null ? '—' : formatBytes(node.memory_allocatable_bytes)}
+          </span>
+        </span>
+      </div>
+
+      {pressures.length > 0 && (
+        <p className="text-[10.5px]" style={{ color: 'var(--danger)' }}>
+          {pressures
+            .map((condition) =>
+              condition.kind === 'Ready'
+                ? '节点 NotReady'
+                : `${condition.kind}${condition.reason ? `：${condition.reason}` : ''}`
+            )
+            .join(' · ')}
+          ：这个节点在驱逐 Pod，光看申报量看不出来。
+        </p>
+      )}
+
+      <section className="flex flex-col gap-0.5">
+        <h4 className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">
+          排在这台机器上的 Pod（点一个看它下面）
+        </h4>
+        {node.pods.length === 0 ? (
+          <p className="text-[10.5px] text-[var(--muted)]">这一拍没有 Pod 排在这台机器上。</p>
+        ) : (
+          node.pods.map((pod) => (
+            <button
+              key={pod.name}
+              type="button"
+              onClick={() => onPick({ kind: 'pod', name: pod.name })}
+              className="flex items-baseline gap-2 py-0.5 text-left transition-colors hover:bg-[var(--ink-800)]"
+            >
+              <Dot tone={pod.ready ? 'ok' : pod.phase === 'Succeeded' ? 'idle' : 'warn'} />
+              <span className="mono min-w-0 flex-1 truncate text-[10.5px] text-[var(--paper-dim)]">
+                {pod.name}
+              </span>
+              <span className="mono shrink-0 text-[10px] text-[var(--muted)]">{pod.phase}</span>
+            </button>
+          ))
+        )}
+      </section>
+    </div>
+  );
+}
+
+/** 一个 Pod：它自己、它的容器（可再点开）、它的卷、它的事件。 */
+function PodDetail({ pod }: { pod: TopologyPod }) {
+  const [openContainer, setOpenContainer] = useState<string | null>(null);
   const usedCpu = pod.cpu_used_millicores;
   const usedMemory = pod.memory_used_bytes;
   return (
@@ -350,31 +529,60 @@ function PodDetail({ pod }: { pod: TopologyPod | null }) {
           容器 <span className="mono">{pod.containers.length}</span> 个
         </span>
       </div>
-      {pod.containers.length > 0 && (
-        <ul className="flex flex-col gap-0.5">
-          {pod.containers.map((container) => (
-            <li key={container.name} className="mono text-[10px] text-[var(--muted)]">
-              {container.name} · {container.state}
-              {container.restarts > 0 ? ` · 重启 ${container.restarts}` : ''}
-              {container.cpu_limit_millicores
-                ? ` · 上限 ${formatCpu(container.cpu_limit_millicores)}`
-                : ''}
-            </li>
-          ))}
-        </ul>
+
+      {pod.conditions.some((condition) => !condition.ok) && (
+        <section className="flex flex-col gap-0.5">
+          <h4 className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">没成立的条件</h4>
+          {pod.conditions
+            .filter((condition) => !condition.ok)
+            .map((condition) => (
+              <div key={condition.kind} className="flex items-baseline gap-2 text-[10.5px]">
+                <Dot tone="warn" />
+                <span className="mono shrink-0" style={{ color: 'var(--warn)' }}>
+                  {condition.kind}
+                </span>
+                <span className="min-w-0 flex-1 text-[var(--muted)]">
+                  {[condition.reason, condition.message].filter(Boolean).join('：')}
+                </span>
+              </div>
+            ))}
+        </section>
       )}
-      {pod.events.length > 0 && (
-        <ul className="flex flex-col gap-0.5">
-          {pod.events.slice(0, 4).map((event, index) => (
-            <li
-              key={`${event.reason}-${index}`}
-              className="text-[10px] leading-relaxed"
-              style={{ color: event.kind === 'Warning' ? 'var(--danger)' : 'var(--muted)' }}
-            >
-              {event.kind} · {event.reason}（{event.count} 次）{event.message}
-            </li>
+
+      <section className="flex flex-col gap-0.5">
+        <h4 className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">
+          容器（点开一层：镜像、申报、上限、用量、挂载、探针）
+        </h4>
+        {pod.containers.map((container) => (
+          <ContainerRow
+            key={container.name}
+            container={container}
+            open={openContainer === container.name}
+            onToggle={() =>
+              setOpenContainer((current) => (current === container.name ? null : container.name))
+            }
+          />
+        ))}
+      </section>
+
+      {pod.volumes.length > 0 && (
+        <section className="flex flex-col gap-0.5">
+          <h4 className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">
+            卷（卷声明后面那串是盘上的真实占用）
+          </h4>
+          {pod.volumes.map((volume) => (
+            <VolumeRow key={volume.name} volume={volume} />
           ))}
-        </ul>
+        </section>
+      )}
+
+      {pod.events.length > 0 && (
+        <section className="flex flex-col gap-0.5">
+          <h4 className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">事件</h4>
+          {pod.events.map((event, index) => (
+            <EventRow key={`${event.reason}-${index}`} event={event} />
+          ))}
+        </section>
       )}
     </div>
   );

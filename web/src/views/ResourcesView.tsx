@@ -7,7 +7,7 @@ import {
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
-import { formatBytes, formatCpu } from '@/topology/ClusterTopology';
+import { formatBytes, formatCpu } from '@/topology/format';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 import { BarList } from '@/ui/plots';
 
