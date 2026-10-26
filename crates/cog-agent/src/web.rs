@@ -524,11 +524,12 @@ pub fn web_search(client: Option<Arc<dyn HttpClient>>, base: Option<String>) -> 
 /// to anyone.
 ///
 /// The fallback is consulted in exactly one situation: the self-hosted backend
-/// came back with no hits because every engine behind it stayed silent, twice.
-/// That is not a reading of the web, it is the absence of one, so falling
-/// through costs nothing that was already lost -- while answering from the
-/// first backend whenever it answers keeps the property the self-hosted half
-/// exists for: queries the deployment can answer itself never leave it.
+/// handed back no hits and no knowledge card, whether because every engine
+/// behind it stayed silent (that is not a reading of the web, it is the
+/// absence of one) or because the engines answered and nothing matched (a weak
+/// reading, and the cheapest one to double-check). Answering from the first
+/// backend whenever it hands something back keeps the property the self-hosted
+/// half exists for: queries the deployment can answer itself never leave it.
 ///
 /// `fallback_base` points at a base that speaks the search protocol directly
 /// (`POST {base}/search`), which in this deployment is the security gateway: a
@@ -635,17 +636,35 @@ pub fn web_search_with_fallback(
                 // `count: 0` leaves the caller to pick between those without
                 // the fact it needs, so the silent one is an error that names
                 // the engines instead of a result set.
-                if answer.results.is_empty() && !answer.broken.is_empty() {
-                    let names: Vec<String> = answer.broken.iter().map(|e| e.to_string()).collect();
-                    // The one case a second backend is for: the query was never
-                    // put to anything here, so answering from somewhere else
-                    // gives up nothing the first backend was holding. What it
-                    // does cost is that this query leaves the deployment, so
-                    // the answer says which backend produced it rather than
-                    // letting the two look alike.
+                let names: Vec<String> = answer.broken.iter().map(|e| e.to_string()).collect();
+                // The one thing a second backend is for: the self-hosted layer
+                // handed nothing back. A query it answered itself never leaves
+                // the deployment (that property is why the self-hosted half
+                // exists), and a query it answered with nothing has nothing
+                // left to give up -- so the second backend is asked here and
+                // only here, which is also why this is not the common path:
+                // measured 2026-10-26 over 17 queries on this deployment,
+                // including deliberately unmatchable ones, the engine returned
+                // 9-10 hits with excerpts every time.
+                //
+                // A knowledge card without hits is still an answer -- it is
+                // what the engines know -- so that case stays local too.
+                if answer.results.is_empty() && answer.extras.is_empty() {
+                    let because = if names.is_empty() {
+                        format!(
+                            "the self-hosted engines answered and matched nothing in \
+                             {attempt} attempt(s)"
+                        )
+                    } else {
+                        format!(
+                            "the self-hosted backend answered nothing in {attempt} \
+                             attempt(s); engines that stayed silent: {}",
+                            names.join(", ")
+                        )
+                    };
                     if let Some(fallback) = fallback_base.as_deref() {
-                        let hits = fallback_search(&*client, fallback, &query, limit).await;
-                        match hits {
+                        let outcome = match fallback_search(&*client, fallback, &query, limit).await
+                        {
                             Ok(hits) if !hits.is_empty() => {
                                 return Ok(serde_json::json!({
                                     "query": query,
@@ -653,49 +672,53 @@ pub fn web_search_with_fallback(
                                     "count": hits.len(),
                                     "results": hits,
                                     "source": "fallback",
-                                    // The count is read off the loop rather than
-                                    // written as "twice": the two have to agree
-                                    // after someone changes SEARCH_ATTEMPTS, and a
-                                    // spelled-out number is the copy that goes
-                                    // stale without failing anything.
-                                    "fallback_because": format!(
-                                        "the self-hosted backend answered nothing in \
-                                         {attempt} attempt(s); engines that stayed \
-                                         silent: {}",
-                                        names.join(", ")
-                                    ),
+                                    // The attempt count is read off the loop
+                                    // rather than written as "twice": the two
+                                    // have to agree after someone changes
+                                    // SEARCH_ATTEMPTS, and a spelled-out number
+                                    // is the copy that goes stale without
+                                    // failing anything.
+                                    "fallback_because": because,
                                 }));
                             }
-                            // 后备答了、但一条没找到：这时候说"查询从没被问过"
-                            // 是假的，它被问了。能说的只有"没有一条记录说这个查询
-                            // 没有匹配"。
-                            Ok(_) => {
-                                return Err(SFError::Agent(format!(
-                                    "web search found nothing: the self-hosted backend's \
-                                     engines stayed silent ({}) and the fallback answered \
-                                     with no hits. Neither is a reading that says this \
-                                     query has no matches",
-                                    names.join(", ")
-                                )));
-                            }
-                            Err(e) => {
-                                return Err(SFError::Agent(format!(
-                                    "web search found nothing: the self-hosted backend's \
-                                     engines stayed silent ({}) and the fallback failed \
-                                     too ({e}). Neither is a reading of the web",
-                                    names.join(", ")
-                                )));
-                            }
+                            Ok(_) => "answered with no hits".to_string(),
+                            Err(e) => format!("failed too ({e})"),
+                        };
+                        // The engines did answer, so "nothing matched" is a
+                        // reading -- a weak one, and now one taken twice, but
+                        // still a reading; it is not turned into an error. The
+                        // second backend's outcome is reported next to it so
+                        // the caller knows the empty web was asked twice.
+                        if names.is_empty() {
+                            return Ok(serde_json::json!({
+                                "query": query,
+                                "limit": limit,
+                                "count": 0,
+                                "results": [],
+                                "source": "self_hosted",
+                                "fallback_because": because,
+                                "fallback_outcome": outcome,
+                            }));
                         }
+                        // 后备答了、但一条没找到：这时候说"查询从没被问过"
+                        // 是假的，它被问了。能说的只有"没有一条记录说这个查询
+                        // 没有匹配"。
+                        return Err(SFError::Agent(format!(
+                            "web search found nothing: {because}, and the fallback \
+                             {outcome}. Neither is a reading that says this query has \
+                             no matches"
+                        )));
                     }
-                    return Err(SFError::Agent(format!(
-                        "web search came back empty after {attempt} attempt(s) because no \
-                         engine answered, which is not the same answer as 'nothing \
-                         matched': the query was never put to anything. Engines that \
-                         stayed silent: {}. Retry the same query rather than rephrasing \
-                         it",
-                        names.join(", ")
-                    )));
+                    if !names.is_empty() {
+                        return Err(SFError::Agent(format!(
+                            "web search came back empty after {attempt} attempt(s) because \
+                             no engine answered, which is not the same answer as 'nothing \
+                             matched': the query was never put to anything. Engines that \
+                             stayed silent: {}. Retry the same query rather than rephrasing \
+                             it",
+                            names.join(", ")
+                        )));
+                    }
                 }
                 let mut out = serde_json::json!({
                     "query": query,
@@ -1654,6 +1677,115 @@ mod tests {
             !msg.contains("Retry"),
             "the retry advice belongs to the no-fallback case; here the fallback was \
              tried and came back empty: {msg}"
+        );
+    }
+
+    /// 引擎回答"没有匹配"时，第二层照样问一次。
+    ///
+    /// 这跟"引擎全沉默"是两种不同的零结果，但对调用方是同一件事：手上什么都没有。
+    /// 一次没匹配上不等于网上没有，而第二层存在的理由就是"第一层给不出东西"——
+    /// 恰好这一条不花第一层任何东西（它已经答完了），只在本来会返回空答案的查询上
+    /// 多一次厂商调用。实测 2026-10-26 本部署 17 条查询（含故意无匹配的）都拿到
+    /// 9-10 条带摘要的结果，所以这条不是常见路径。
+    #[tokio::test]
+    async fn search_asks_the_fallback_when_the_engines_answered_and_matched_nothing() {
+        let scripted = Scripted::answering_in_order(vec![
+            (
+                200,
+                "application/json",
+                r#"{"results":[],"unresponsive_engines":[]}"#.to_string(),
+            ),
+            (
+                200,
+                "application/json",
+                r#"{"results":[{"title":"Rust","url":"https://www.rust-lang.org/",
+                     "content":"a language empowering everyone"}]}"#
+                    .to_string(),
+            ),
+        ]);
+        let tool = web_search_with_fallback(
+            client_of(&scripted),
+            Some("http://searxng:8080".into()),
+            Some("http://gateway:8081/search-fallback".into()),
+        );
+        let out = call(&tool, serde_json::json!({"query":"rust"}))
+            .await
+            .expect("the second backend found what the first did not");
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["source"], "fallback");
+        let because = out["fallback_because"].as_str().unwrap_or_default();
+        assert!(
+            because.contains("matched nothing"),
+            "为什么不问自建那层，答案里要说清楚——这里不是沉默，是没匹配上: {out}"
+        );
+        let asked = scripted.asked();
+        assert_eq!(
+            asked.len(),
+            2,
+            "自建那层只问一次（引擎答了，不该重试），然后问一次后备: {asked:?}"
+        );
+        assert_eq!(asked[1].url, "http://gateway:8081/search-fallback/search");
+    }
+
+    /// 两层都说没有匹配时，这仍然是"没有匹配"，不是故障。
+    ///
+    /// 把引擎回答过的空结果改写成错误，会让一次正常的"网上没有这条"变成调用方的
+    /// 重试循环。后备的读数挂在答案旁边，替掉它才是错的。
+    #[tokio::test]
+    async fn a_real_empty_answer_survives_the_fallback_also_finding_nothing() {
+        let scripted = Scripted::answering_in_order(vec![
+            (
+                200,
+                "application/json",
+                r#"{"results":[],"unresponsive_engines":[]}"#.to_string(),
+            ),
+            (200, "application/json", r#"{"results":[]}"#.to_string()),
+        ]);
+        let tool = web_search_with_fallback(
+            client_of(&scripted),
+            Some("http://searxng:8080".into()),
+            Some("http://gateway:8081/search-fallback".into()),
+        );
+        let out = call(&tool, serde_json::json!({"query":"q"}))
+            .await
+            .expect("引擎答过，空结果本身就是一个读数");
+        assert_eq!(out["count"], 0);
+        assert_eq!(out["source"], "self_hosted");
+        assert!(
+            out["fallback_outcome"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no hits"),
+            "调用方要知道这一层也问过了，而不是以为只有自建那层说没有: {out}"
+        );
+    }
+
+    /// 引擎给的是知识卡而不是结果时，不出本部署。
+    ///
+    /// 卡片就是引擎知道的东西，问题已经被它答了；这时再花一次厂商调用去买它已经
+    /// 说过的话，是纯支出。
+    #[tokio::test]
+    async fn a_knowledge_card_without_hits_is_an_answer_and_stays_local() {
+        let scripted = Scripted::answering(
+            200,
+            "application/json",
+            r#"{"results":[],"answers":["Ulaanbaatar"],
+                 "unresponsive_engines":[]}"#,
+        );
+        let tool = web_search_with_fallback(
+            client_of(&scripted),
+            Some("http://searxng:8080".into()),
+            Some("http://gateway:8081/search-fallback".into()),
+        );
+        let out = call(&tool, serde_json::json!({"query":"capital of Mongolia"}))
+            .await
+            .expect("the card answered");
+        assert_eq!(out["answers"][0], "Ulaanbaatar");
+        assert_eq!(out["source"], "self_hosted");
+        assert_eq!(
+            scripted.asked().len(),
+            1,
+            "卡片答了就不该有第二次请求: {out}"
         );
     }
 
