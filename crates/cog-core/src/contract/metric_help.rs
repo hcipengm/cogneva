@@ -272,6 +272,32 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          that failed",
     ),
     (
+        "cogneva_process_report_ingest_total",
+        "Container process self-reports that reached the ingest endpoint, one \
+         per request, by `outcome`: accepted (stored, whether or not the table \
+         differed from the one before it) and refused (the body was unusable -- \
+         no pod or container id, or an empty table). The topology face shows a \
+         container's process table only while that container keeps reporting, \
+         and when it stops the cell says the same sentence it says for a \
+         third-party image, which never reports at all. Those are different \
+         facts with different owners, and the screen cannot separate them: the \
+         container that stopped, the reporter that never started, and the \
+         request that is being dropped on the way in (an address that moved, a \
+         port that was renamed, a policy that stopped admitting this platform's \
+         own pods) all read as one absent table. This counter is the half that \
+         says whether anything is arriving at all. Read it against the panel: \
+         accepted climbing while one container still shows nothing means the \
+         path is fine and the fault is that container's; accepted holding at \
+         zero over a window while containers running this image are up means \
+         nothing is arriving, and the fault is the path, not the workloads. Both \
+         cells are written at zero when the gateway starts, so an absent series \
+         says this process does not publish the reading -- a different fact from \
+         a window in which nothing was accepted. The count is per request, not \
+         per container: a fleet of idle reporters keeps it climbing without \
+         anything on screen changing, so it answers 'is the path carrying \
+         reports' and never 'how many containers are visible'",
+    ),
+    (
         "cogneva_landing_failures_total",
         "Landing calls that failed, one per attempt, by category. A landing \
          failure is otherwise a single log line inside a loop that then moves \

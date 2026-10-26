@@ -890,6 +890,22 @@ metric_names! {
     HTTP_REQUESTS_TOTAL => "http_requests_total",
     HTTP_REQUEST_DURATION_MS => "http_request_duration_ms",
 
+    // cog-gateway — container process self-reports that reached the ingest
+    // endpoint, by `outcome` (accepted / refused).
+    //
+    // The topology face answers "no process table for this container" for three
+    // different facts at once: it is a third-party image that never reports, its
+    // reporter has not run yet, or its reports are being dropped on the way in
+    // (wrong URL, renamed Service port, a network policy that stopped admitting
+    // this platform's own pods). The third is silent in a way the first two are
+    // not -- the request leaves, nothing answers, and no error surfaces -- so
+    // the cell exists to say whether anything is arriving at all. Both cells are
+    // written at zero on startup: absence then means "this process does not
+    // publish the series", while zero means "the channel is here and nothing
+    // came in over this window", which is the reading that points at the path
+    // rather than at the container.
+    PROCESS_REPORT_INGEST_TOTAL => "cogneva_process_report_ingest_total",
+
     // cog-gateway — LLM pool and upstream health.
     LLM_CALLS_TOTAL => "llm_calls_total",
     LLM_CALL_LATENCY_MS => "llm_call_latency_ms",

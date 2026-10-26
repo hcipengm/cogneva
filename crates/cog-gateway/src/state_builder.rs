@@ -102,6 +102,9 @@ pub async fn build_gateway_state(
     // the only source for both.
     let supervisor_event_cache =
         Arc::new(crate::supervisor_control::SupervisorEventCache::default());
+    // 自报端点的两格先在读数面上写 0：不写的话，「一份都没进来」与「这个进程
+    // 根本不发布这条读数」在抓取面上都是缺席，而它们的修法完全不同。
+    crate::process_reports::publish_vocabulary(metrics_backend).await;
     let gateway_state = Arc::new(crate::GatewayState {
         config: std::sync::RwLock::new(config.gateway.clone()),
         data_dir: config.app.data_dir.clone(),

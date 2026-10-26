@@ -1,0 +1,63 @@
+# 容器自报通道还通不通。
+#
+# `process_report_path_silent` 问的是「这一窗里有没有一份自报被收下」。这一族最想抓的
+# 是它**不响**的形状：自报照发、路上被丢掉（地址改了、端口改名、网络策略不放行），
+# 屏上的那一格与第三方镜像不报一模一样，谁也不会红。
+#
+#   - 第一格：计数器每分钟加一 ⇒ 十五分钟里收下过东西 ⇒ 静。它守着规则里那个 `== 0`：
+#     把比较写成恒真（例如拿掉 `== 0` 直接比 `less_than 1`），健康的一窗也会响。
+#   - 第二格：计数器十六分钟没动 ⇒ 一份都没收下 ⇒ 响。它守着窗口那一半：把 `[15m]`
+#     缩到比采集间隔还短，停摆会被读成静。
+#   - 第三格：同一族里 `refused` 在动、`accepted` 不动。收下那一格才是这条规则判的，
+#     `outcome` 筛掉与否在这里分得开——没有这一格，规则漏掉 `outcome="accepted"`
+#     时前两格照样绿，而那时它响的是「有人被拒」。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-process-report.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: process_report_path_silent
+
+evaluation_interval: 1m
+
+tests:
+  # 健康：每分钟都有容器把自己那一份推上来。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_process_report_ingest_total{outcome="accepted"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: process_report_path_silent
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: process_report_path_silent
+        exp_alerts: []
+
+  # 通道死了：计数停在一个值上，十五分钟里一份都没进来。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_process_report_ingest_total{outcome="accepted"}'
+        values: '7x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: process_report_path_silent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 拒绝了东西但一份也没收下：同一族、不同 outcome。规则判的是收下那一格。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_process_report_ingest_total{outcome="accepted"}'
+        values: '3x30'
+      - series: 'cogneva_process_report_ingest_total{outcome="refused"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: process_report_path_silent
+        exp_alerts:
+          - exp_labels:
+              severity: warning

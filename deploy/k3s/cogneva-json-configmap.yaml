@@ -3314,6 +3314,16 @@ data:
                   "severity": "warning",
                   "summary": "No process has published the inbox orphan inventory for an hour. The retirement pass walks every ten minutes, so six walks have come and gone without a reading -- and a walk that never ran and a store with nothing stranded would otherwise look the same, which is exactly what these two series exist to tell apart. This fires after a rollout too, until the first walk lands; that window is the cost of publishing nothing before the first walk rather than a zero that nobody measured",
                   "face": "任务管理"
+                },
+                {
+                  "name": "process_report_path_silent",
+                  "promql": "max(increase(cogneva_process_report_ingest_total{outcome=\"accepted\"}[15m])) == 0",
+                  "condition": {
+                    "less_than": 1.0
+                  },
+                  "severity": "warning",
+                  "summary": "No container has pushed a process table to the gateway in fifteen minutes. Every long-lived subcommand running this image posts its own /proc table once a minute, and the gateway counts each one it takes; a window with nothing accepted means the path carried nothing, whatever the reason -- the reporter never started, the address it posts to moved (a Service port renamed, a path that no longer mounts on the internal router), a network policy stopped admitting this platform's own pods, or the receiving side is gone. All of those are silent: the request leaves, nothing answers, and no error surfaces anywhere. The topology face is where the loss shows up, and there it cannot be told apart from a third-party image that never reports at all -- the cell says the same sentence for both, so a reader looking at one container cannot separate 'that image does not report' from 'reports are being dropped fleet-wide'. Fifteen minutes is the reporter's own minute fifteen times over, which covers a rollout on either end (the gateway re-writes both cells at zero when it starts, so a restart does not leave the counter absent) and still names the fault inside a single scrape interval of most dashboards. The comparison is against zero rather than against any threshold: one accepted report is the path working, and this rule is not asking whether enough containers reported -- a fleet of third-party images reports nothing and that is not a fault. It cannot fire on a deployment that never published the series; an image that predates the counter reads as absent, which is a version fact rather than a path fact",
+                  "face": "可观测与告警"
                 }
               ]
             },

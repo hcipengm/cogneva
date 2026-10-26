@@ -121,6 +121,41 @@ pub struct ReportBody {
     pub processes: Vec<ReportedProcess>,
 }
 
+/// 端点收到一份自报之后在指标上留下的两格。**closed set**，两格都在启动时写 0。
+pub const INGEST_ACCEPTED: &str = "accepted";
+pub const INGEST_REFUSED: &str = "refused";
+
+/// 把一格收口结果写进指标。没有指标后端时什么都不写：这条面本身不依赖它。
+async fn publish_ingest(
+    metrics: &Option<Arc<dyn cog_core::MetricsBackend>>,
+    outcome: &str,
+    value: f64,
+) {
+    let Some(backend) = metrics.as_ref() else {
+        return;
+    };
+    let mut labels = HashMap::new();
+    labels.insert("outcome".to_string(), outcome.to_string());
+    let _ = backend
+        .record_counter(
+            cog_core::metric_names::PROCESS_REPORT_INGEST_TOTAL,
+            value,
+            labels,
+        )
+        .await;
+}
+
+/// 启动时把两格写成 0。
+///
+/// 不做这一步，一个从没收到过自报的网关与一条根本没有这条通道的网关在读数面上
+/// 同形：两格都缺席。写了 0 之后，缺席只意味着「这个进程不发布这条读数」，而 0
+/// 意味着通道在、但这一窗里一份都没进来——那是两种不同的故障，各自的修法也不同。
+pub async fn publish_vocabulary(metrics: &Option<Arc<dyn cog_core::MetricsBackend>>) {
+    for outcome in [INGEST_ACCEPTED, INGEST_REFUSED] {
+        publish_ingest(metrics, outcome, 0.0).await;
+    }
+}
+
 /// `POST /api/v1/cluster/process-report`
 ///
 /// 一个容器把自己这一拍的进程表交上来。收下之后在总线上落一帧「集群这一面变了」，
@@ -129,9 +164,24 @@ pub async fn process_report_handler(
     State(state): State<Arc<GatewayState>>,
     Json(body): Json<ReportBody>,
 ) -> axum::response::Response {
+    ingest(body, &state.event_tx, &state.metrics_backend).await
+}
+
+/// 收口与作答，不碰 `GatewayState`：这样一条自报的完整处理（含它落下的那一格
+/// 读数）在测试里跑得起来。
+///
+/// 指标那一格不是装饰：一条被网络策略丢掉的请求与一个从没启动过的自报循环，在
+/// 屏上都读作「这个容器没有进程表」。有这一格，才分得开「一份都没进来」（通道
+/// 断了）与「别人在报、它不报」（是那个容器的事）。
+async fn ingest(
+    body: ReportBody,
+    events: &tokio::sync::broadcast::Sender<cog_core::AgentEvent>,
+    metrics: &Option<Arc<dyn cog_core::MetricsBackend>>,
+) -> axum::response::Response {
     let pod = body.pod.trim().to_string();
     let container_id = container_id_of(&body.container_id).to_string();
     if pod.is_empty() || container_id.is_empty() || container_id.len() > 128 {
+        publish_ingest(metrics, INGEST_REFUSED, 1.0).await;
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "自报要带 pod 与 container_id" })),
@@ -140,6 +190,7 @@ pub async fn process_report_handler(
     }
     let processes = sanitize(body.processes);
     if processes.is_empty() {
+        publish_ingest(metrics, INGEST_REFUSED, 1.0).await;
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "空的进程表：读 /proc 的进程自己就是一行，一行都没有说明没读成" })),
@@ -155,11 +206,12 @@ pub async fn process_report_handler(
             processes,
         },
     );
+    publish_ingest(metrics, INGEST_ACCEPTED, 1.0).await;
     // 变了才落帧。帧的意思是「屏上该重读了」，而一个安静的容器每拍报的是同一张
     // 表；按拍落帧，屏就按拍重读一次一模一样的快照。
     // 帧里也不带进程表本身：内容由读的一方重读，两处都发一遍，账就有两本了。
     if changed {
-        let _ = state.event_tx.send(cog_core::AgentEvent::ResourceChanged {
+        let _ = events.send(cog_core::AgentEvent::ResourceChanged {
             domain: "cluster".to_string(),
             timestamp: Utc::now(),
         });
@@ -318,5 +370,105 @@ mod tests {
         assert_eq!(container_id_of("docker://abc123"), "abc123");
         assert_eq!(container_id_of("abc123"), "abc123");
         assert_eq!(container_id_of(""), "");
+    }
+
+    // ---- 收口那一格读数 ----
+
+    use cog_core::MetricsBackend as _;
+
+    fn memory_metrics() -> Arc<cog_storage::mem::MemoryMetricsBackend> {
+        Arc::new(cog_storage::mem::MemoryMetricsBackend::new())
+    }
+
+    fn as_backend(
+        metrics: &Arc<cog_storage::mem::MemoryMetricsBackend>,
+    ) -> Option<Arc<dyn cog_core::MetricsBackend>> {
+        Some(metrics.clone())
+    }
+
+    async fn cell(
+        metrics: &Arc<cog_storage::mem::MemoryMetricsBackend>,
+        outcome: &str,
+    ) -> Option<f64> {
+        metrics
+            .query_counter_totals(cog_core::metric_names::PROCESS_REPORT_INGEST_TOTAL.as_str())
+            .await
+            .expect("读得到自己刚写的读数")
+            .iter()
+            .find(|sample| sample.labels.get("outcome").map(String::as_str) == Some(outcome))
+            .map(|sample| sample.value)
+    }
+
+    fn body(pod: &str, container_id: &str, processes: Vec<ReportedProcess>) -> ReportBody {
+        ReportBody {
+            pod: pod.to_string(),
+            container_id: container_id.to_string(),
+            processes,
+        }
+    }
+
+    fn one_process() -> Vec<ReportedProcess> {
+        vec![ReportedProcess {
+            pid: 1,
+            parent_pid: 0,
+            command: "cogneva".to_string(),
+            rss_bytes: 4096,
+        }]
+    }
+
+    #[tokio::test]
+    async fn an_accepted_report_leaves_a_cell_naming_it() {
+        // 没有这次改动就会红：那时到达与没到达在读数面上都缺席，一条被网络策略
+        // 丢掉的请求与一个从没启动过的自报循环同形。
+        let metrics = memory_metrics();
+        let backend = as_backend(&metrics);
+        let (events, _rx) = tokio::sync::broadcast::channel(8);
+
+        let response = ingest(body("pod-a", "aaaa", one_process()), &events, &backend).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(cell(&metrics, INGEST_ACCEPTED).await, Some(1.0));
+        assert_eq!(
+            cell(&metrics, INGEST_REFUSED).await,
+            None,
+            "收下的一份不该同时记在拒绝那一格里"
+        );
+        assert_eq!(latest("pod-a", "aaaa").map(|r| r.processes.len()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_refused_report_leaves_the_other_cell() {
+        let metrics = memory_metrics();
+        let backend = as_backend(&metrics);
+        let (events, _rx) = tokio::sync::broadcast::channel(8);
+
+        let response = ingest(body("pod-b", "bbbb", Vec::new()), &events, &backend).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(cell(&metrics, INGEST_REFUSED).await, Some(1.0));
+        assert_eq!(
+            cell(&metrics, INGEST_ACCEPTED).await,
+            None,
+            "被拒的那一份没有收下，不该记在收下那一格"
+        );
+        assert!(latest("pod-b", "bbbb").is_none(), "拒收不落库");
+    }
+
+    #[tokio::test]
+    async fn the_vocabulary_is_written_at_zero_so_absence_means_no_publisher() {
+        // 0 与缺席是两件事：0 说通道在、这一窗一份都没进来；缺席说这个进程根本
+        // 不发布这条读数。不先写 0，两种故障在读数面上一模一样。
+        let metrics = memory_metrics();
+        publish_vocabulary(&as_backend(&metrics)).await;
+        assert_eq!(cell(&metrics, INGEST_ACCEPTED).await, Some(0.0));
+        assert_eq!(cell(&metrics, INGEST_REFUSED).await, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn without_a_metrics_backend_the_report_still_lands() {
+        // 指标是可选的：没有后端时这一格不存在，但自报照收——读数少一格不该
+        // 变成功能少一格。
+        let (events, _rx) = tokio::sync::broadcast::channel(8);
+        let response = ingest(body("pod-c", "cccc", one_process()), &events, &None).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(latest("pod-c", "cccc").is_some());
     }
 }
