@@ -3,11 +3,13 @@
 //! What this checks is what the database decides: whether a ledger row that
 //! names *something* counts as attributed. Until 2026-10-26 every caller
 //! stamped a run id (`ralph-pipeline-<uuid>`) rather than the task the run
-//! worked for, so 144,805 rows carrying 1.16e8 tokens named identities that
+//! worked for, so 144,819 rows carrying 1.17e8 tokens named identities that
 //! appear nowhere in the task graph. Counting only rows with a null identity
-//! made that the largest group on the ledger read as neither a project's cost
-//! nor as a gap — it vanished from both numbers, which is the shape of "cost
-//! looks lower than it is, so cost performance looks better".
+//! made those 27% of the ledger's tokens read as neither a project's cost nor
+//! as a gap — they vanished from both numbers, which is the shape of "cost
+//! looks lower than it is, so cost performance looks better". They are the
+//! second-largest nameless bucket: the rows naming nothing at all carry 3.10e8
+//! of the ledger's 4.27e8.
 //!
 //! It cannot be checked without a server: the answer is a `NOT EXISTS` join
 //! against the graph, and a DB-free test would only be restating the query.
