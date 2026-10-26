@@ -16,7 +16,8 @@ use async_trait::async_trait;
 use cog_core::observability::TaskMetrics;
 use cog_core::{
     AgentEvent, AgentTrace, AssistantMessageEventStream, ChatOptions, ChatResponse,
-    CompleteOptions, HttpClient, HttpRequest, LlmClient, Message, SFError, SFResult, Usage,
+    CompleteOptions, HttpClient, HttpRequest, LlmClient, Message, SFError, SFResult, TaskStatus,
+    Usage,
 };
 use cog_eval::metric::StepRecord;
 use cog_eval::scaffold::{AgentOutput, FinishReason};
@@ -459,9 +460,10 @@ impl PlatformApiRunner {
         let started = std::time::Instant::now();
         loop {
             let facts = self.fetch_facts(case_id).await?;
-            match facts.status.as_str() {
-                "Completed" | "Failed" | "Cancelled" => return Ok(facts),
-                _ => {}
+            // 终态按声明判，不按拼法判：读面印的是 `TaskStatus::as_str` 的词，写死另一种
+            // 拼法的话这里一个终态都认不出来，那道题会一直轮询到预算耗尽再报「平台没跑完」。
+            if TaskStatus::parse(&facts.status).is_some_and(|status| status.is_terminal()) {
+                return Ok(facts);
             }
             if started.elapsed() >= deadline {
                 anyhow::bail!(
@@ -542,10 +544,11 @@ impl PlatformRunner for PlatformApiRunner {
         } else {
             self.fetch_facts(&answer_row).await?
         };
-        match answer.status.as_str() {
-            "Completed" => {}
-            other => anyhow::bail!(
-                "the platform ended task {answer_row} as {other}: {}",
+        match TaskStatus::parse(&answer.status) {
+            Some(TaskStatus::Completed) => {}
+            _ => anyhow::bail!(
+                "the platform ended task {answer_row} as {}: {}",
+                answer.status,
                 answer.error.as_deref().unwrap_or("it recorded no reason")
             ),
         }
@@ -1060,7 +1063,7 @@ mod tests {
             .await
             .expect_err("a case that cannot finish must not be scored");
         let text = err.to_string();
-        assert!(text.contains("Pending"), "{text}");
+        assert!(text.contains(TaskStatus::Pending.as_str()), "{text}");
         assert!(text.contains("cannot finish"), "{text}");
     }
 

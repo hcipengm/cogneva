@@ -9,23 +9,45 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::{error::ApiError, GatewayState};
-use cog_core::{AgentEvent, Task, TaskType};
+use cog_core::{AgentEvent, Task, TaskFilter, TaskType};
+use std::collections::HashSet;
 
+/// Put a task's new state on the bus.
+///
+/// Takes the state itself, not a word for it: the frame crosses to readers in
+/// other crates and to the browser, and they match on [`TaskStatus::as_str`]'s
+/// spelling -- the level filter marks `failed` as an error, the comms panel
+/// folds `completed`/`failed` into its edges. A literal here was spelled the
+/// other way round, so every one of those comparisons was quietly false and
+/// each of them read as "nothing failed" rather than as a mismatch.
 fn broadcast_task_status(
     state: &GatewayState,
     task_id: &str,
-    status: &str,
+    status: cog_core::TaskStatus,
     agent_id: Option<String>,
 ) {
-    let event = AgentEvent::TaskStatusChange {
+    let _ = state
+        .event_tx
+        .send(task_status_frame(task_id, status, agent_id));
+}
+
+/// The frame a transition puts on the bus.
+///
+/// Split out from the send so the word it carries can be judged without a
+/// gateway state behind it.
+fn task_status_frame(
+    task_id: &str,
+    status: cog_core::TaskStatus,
+    agent_id: Option<String>,
+) -> AgentEvent {
+    AgentEvent::TaskStatusChange {
         task_id: task_id.into(),
-        status: status.into(),
+        status: status.as_str().into(),
         agent_id,
         crew_id: None,
         squad_id: None,
         timestamp: chrono::Utc::now(),
-    };
-    let _ = state.event_tx.send(event);
+    }
 }
 
 fn parse_task_type(s: &str) -> TaskType {
@@ -246,6 +268,9 @@ pub struct FailTaskRequest {
 pub struct TaskView {
     pub id: String,
     pub task_type: String,
+    /// 状态词，取自 `TaskStatus::as_str`：行里存的、总线上的、客户端比的是同一个拼法。
+    /// 读面曾经印 `Debug` 那一种拼法，于是「完成」「失败」这两种读法在客户端并存，
+    /// 谁在哪一边比较，谁就只认得自己那一种。
     pub status: String,
     pub input: serde_json::Value,
     pub result: Option<serde_json::Value>,
@@ -311,7 +336,7 @@ impl From<Task> for TaskView {
         Self {
             id: t.id,
             task_type: task_type_str(&t.task_type),
-            status: format!("{:?}", t.status),
+            status: t.status.as_str().to_string(),
             input: t.input,
             result: t.result,
             error: t.error,
@@ -348,7 +373,8 @@ pub struct TaskQuery {
     pub goal_id: Option<String>,
     /// 只看这个执行者手上的（或声明给它的）任务。
     pub agent_id: Option<String>,
-    /// 只看这个状态的任务，大小写不敏感，值与读面印出来的那个词一致。
+    /// 只看这一类任务：一个状态词，或就绪队列（`ready`，队列本身，不是某行携带的状态）。
+    /// 大小写不敏感，取值就是 [`TaskFilter::ALL`] 印出来的那些词。
     pub status: Option<String>,
 }
 
@@ -360,20 +386,81 @@ fn in_goal(query: &TaskQuery, task: &Task) -> bool {
     }
 }
 
-/// The full query filter: goal, executor, and state. Separate from [`in_goal`]
+/// The goal and executor half of the filter. Separate from [`matches_status`]
 /// because the tests that pin "no goal means everything" are about that one
-/// dimension, and folding three dimensions into it would let a change to either
-/// of the other two turn them red for an unrelated reason.
+/// dimension, and folding the state into it would let a change to either
+/// dimension turn them red for an unrelated reason.
 fn matches_query(query: &TaskQuery, task: &Task) -> bool {
     in_goal(query, task)
         && query
             .agent_id
             .as_deref()
             .is_none_or(|want| task.agent_id.as_deref() == Some(want))
-        && query
-            .status
-            .as_deref()
-            .is_none_or(|want| format!("{:?}", task.status).eq_ignore_ascii_case(want))
+}
+
+/// The state half of the filter, read out of [`TaskFilter`] rather than out of
+/// whatever the caller typed.
+///
+/// An unknown word here would otherwise select nothing, and an empty body is
+/// what an empty state returns too -- a tab whose word no row carries would
+/// report "nothing waiting" instead of "that is not a word I know". So the
+/// caller is told what it can ask for.
+fn status_filter(query: &TaskQuery) -> Result<Option<TaskFilter>, ApiError> {
+    match query.status.as_deref() {
+        None => Ok(None),
+        Some(word) => TaskFilter::parse(word).map(Some).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "unknown status '{word}': expected one of {}",
+                TaskFilter::ALL
+                    .iter()
+                    .map(TaskFilter::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }),
+    }
+}
+
+/// Whether `task` is in the state the query asked for.
+///
+/// `Ready` is the queue, not a state: it matches the ids the orchestrator's own
+/// ready predicate returned, so the tab and the count above it cannot disagree
+/// about what "ready" means -- a second definition here would have them drift
+/// the moment one side changed.
+fn matches_status(
+    filter: Option<TaskFilter>,
+    ready_ids: Option<&HashSet<String>>,
+    task: &Task,
+) -> bool {
+    match filter {
+        None => true,
+        Some(TaskFilter::Status(want)) => task.status == want,
+        Some(TaskFilter::Ready) => ready_ids.is_some_and(|ids| ids.contains(task.id.as_str())),
+    }
+}
+
+/// The ids the ready queue holds, when that is what was asked for.
+///
+/// Read once per request from the orchestrator, not recomputed per row: the
+/// predicate walks the whole graph (it needs the blockers' states), and doing
+/// that once per candidate row would turn a list of a few hundred tasks into a
+/// few hundred graph walks.
+async fn ready_ids(
+    state: &Arc<GatewayState>,
+    filter: Option<TaskFilter>,
+) -> Option<HashSet<String>> {
+    match filter {
+        Some(TaskFilter::Ready) => Some(
+            state
+                .orchestrator
+                .get_ready_tasks()
+                .await
+                .into_iter()
+                .map(|task| task.id)
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// Whether a reader holding `claims` may see `task`.
@@ -757,10 +844,16 @@ pub async fn list_tasks_handler(
     Query(query): Query<TaskQuery>,
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
+    let filter = status_filter(&query)?;
+    let ready = ready_ids(&state, filter).await;
     let tasks = state.orchestrator.get_all_tasks().await;
     let views: Vec<TaskView> = tasks
         .into_iter()
-        .filter(|t| matches_query(&query, t) && visible_to_claims(claims, t))
+        .filter(|t| {
+            matches_query(&query, t)
+                && matches_status(filter, ready.as_ref(), t)
+                && visible_to_claims(claims, t)
+        })
         .map(|t| t.into())
         .collect();
     Ok(Json(views))
@@ -789,7 +882,7 @@ pub async fn schedule_task_handler(
         .schedule_task(&id)
         .await
         .map_err(ApiError::from)?;
-    broadcast_task_status(&state, &id, "Scheduled", None);
+    broadcast_task_status(&state, &id, cog_core::TaskStatus::Scheduled, None);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -802,7 +895,7 @@ pub async fn start_task_handler(
         .start_task(&id)
         .await
         .map_err(ApiError::from)?;
-    broadcast_task_status(&state, &id, "Running", None);
+    broadcast_task_status(&state, &id, cog_core::TaskStatus::Running, None);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -816,7 +909,7 @@ pub async fn complete_task_handler(
         .complete_task(&id, req.result)
         .await
         .map_err(|e| ApiError::internal(format!("complete failed: {}", e)))?;
-    broadcast_task_status(&state, &id, "Completed", None);
+    broadcast_task_status(&state, &id, cog_core::TaskStatus::Completed, None);
     Ok(Json(scheduled))
 }
 
@@ -831,7 +924,7 @@ pub async fn fail_task_handler(
         .fail_task(&id, req.error, None)
         .await
         .map_err(|e| ApiError::internal(format!("fail failed: {}", e)))?;
-    broadcast_task_status(&state, &id, "Failed", None);
+    broadcast_task_status(&state, &id, cog_core::TaskStatus::Failed, None);
     Ok(Json(serde_json::json!({
         "retried": retried,
         "cancelled": cancelled,
@@ -848,7 +941,7 @@ pub async fn cancel_task_handler(
         .cancel_task(&id)
         .await
         .map_err(|e| ApiError::internal(format!("cancel failed: {}", e)))?;
-    broadcast_task_status(&state, &id, "Cancelled", None);
+    broadcast_task_status(&state, &id, cog_core::TaskStatus::Cancelled, None);
     Ok(Json(cancelled))
 }
 
@@ -995,7 +1088,7 @@ pub async fn purge_tasks_handler(
         for task in &matched {
             match state.orchestrator.cancel_task(&task.id).await {
                 Ok(_) => {
-                    broadcast_task_status(&state, &task.id, "Cancelled", None);
+                    broadcast_task_status(&state, &task.id, cog_core::TaskStatus::Cancelled, None);
                     cancelled.push(task.id.clone());
                 }
                 Err(_) => failed.push(task.id.clone()),
@@ -1047,28 +1140,18 @@ pub async fn task_summary_handler(
         && all
             .iter()
             .all(|t| t.status == cog_core::TaskStatus::Completed);
-    let running: Vec<_> = all
-        .iter()
-        .filter(|t| format!("{:?}", t.status) == "Running")
-        .cloned()
-        .collect();
-    let completed: Vec<_> = all
-        .iter()
-        .filter(|t| format!("{:?}", t.status) == "Completed")
-        .cloned()
-        .collect();
-    let failed: Vec<_> = all
-        .iter()
-        .filter(|t| format!("{:?}", t.status) == "Failed")
-        .cloned()
-        .collect();
+    // Counted by comparing states, not their `Debug` spelling: a word retyped
+    // here would keep counting after a rename turned it into a comparison that
+    // is never true, and a column reading zero is the same shape as a column
+    // with nothing in it.
+    let counted = |want: cog_core::TaskStatus| all.iter().filter(|t| t.status == want).count();
 
     Ok(Json(TaskSummary {
         total: all.len(),
         ready: ready.len(),
-        running: running.len(),
-        completed: completed.len(),
-        failed: failed.len(),
+        running: counted(cog_core::TaskStatus::Running),
+        completed: counted(cog_core::TaskStatus::Completed),
+        failed: counted(cog_core::TaskStatus::Failed),
         all_completed,
     }))
 }
@@ -1117,10 +1200,16 @@ pub async fn get_task_graph_handler(
     Query(query): Query<TaskQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
+    let filter = status_filter(&query)?;
+    let ready = ready_ids(&state, filter).await;
     let (tasks, edges) = state.orchestrator.get_graph().await;
     let kept: Vec<Task> = tasks
         .into_iter()
-        .filter(|t| matches_query(&query, t) && visible_to_claims(claims, t))
+        .filter(|t| {
+            matches_query(&query, t)
+                && matches_status(filter, ready.as_ref(), t)
+                && visible_to_claims(claims, t)
+        })
         .collect();
     // 过滤时边跟着节点收口：只留两端都还在的边，否则图里会出现指向已被滤掉节点的悬边，
     // 读的人会以为那条边通向一张没被过滤掉的任务。工作区过滤也会滤掉节点，所以这一段
@@ -1213,6 +1302,123 @@ mod tests {
         t.status = status;
         t.updated_at = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
         t
+    }
+
+    /// 读面印的状态词就是行里携带的那一个。印 `Debug` 的拼法时，客户端按
+    /// `'failed'` 比的那一处永远为假，一张失败的任务于是以「完成」的样子出现。
+    #[test]
+    fn the_task_view_prints_the_status_word_the_row_carries() {
+        for status in cog_core::TaskStatus::ALL {
+            let view: TaskView = task("a", status, "t", 0).into();
+            assert_eq!(
+                view.status,
+                status.as_str(),
+                "the read surface must print the word the row stores, not a formatting of it"
+            );
+        }
+    }
+
+    /// 总线帧里带的是同一个词，而且网关自己的等级过滤器认得它：`failed` 帧要被
+    /// 标成 error。帧里写死另一种拼法时，这一层永远标不出 error，读起来像
+    /// 「没有一次失败」，而不是像一处拼错。
+    #[test]
+    fn the_frame_a_transition_broadcasts_carries_the_declared_word() {
+        let failed = task_status_frame("t-1", cog_core::TaskStatus::Failed, None);
+        let AgentEvent::TaskStatusChange { status, .. } = &failed else {
+            panic!("a task transition produces a status frame");
+        };
+        assert_eq!(status, cog_core::TaskStatus::Failed.as_str());
+        assert_eq!(
+            crate::observability::agent_event_level(&failed),
+            "error",
+            "the gateway's own level filter must recognize the word its own producer writes"
+        );
+
+        let completed = task_status_frame("t-1", cog_core::TaskStatus::Completed, None);
+        assert_eq!(
+            crate::observability::agent_event_level(&completed),
+            "info",
+            "a completed task is not an error"
+        );
+    }
+
+    /// 每个 `TaskFilter` 词都要被自己认下来：客户端标签页按这份声明取词，
+    /// 声明里有一个读不回来的词，就等于那个标签页恒空。
+    #[test]
+    fn every_declared_status_filter_word_parses_back_to_itself() {
+        for filter in TaskFilter::ALL {
+            assert_eq!(
+                TaskFilter::parse(filter.as_str()),
+                Some(filter),
+                "{} is declared but not readable",
+                filter.as_str()
+            );
+            assert_eq!(
+                TaskFilter::parse(&filter.as_str().to_uppercase()),
+                Some(filter),
+                "the parameter always was case-insensitive"
+            );
+        }
+    }
+
+    /// 状态词必须与读面印出来的那个词逐字一致：`TaskFilter` 用 `as_str` 印行，
+    /// 用 serde 送往客户端，两侧拼法一旦分叉，按词取行就再也取不到。
+    #[test]
+    fn a_status_filter_word_is_the_one_the_row_carries() {
+        let row = serde_json::to_value(task("a", cog_core::TaskStatus::Scheduled, "t", 0))
+            .expect("a task serializes");
+        assert_eq!(row["status"], "scheduled");
+        assert_eq!(
+            TaskFilter::parse("scheduled"),
+            Some(TaskFilter::Status(cog_core::TaskStatus::Scheduled))
+        );
+    }
+
+    /// 认不出的词是错误，不是空列表：空列表正是「这个状态没有任务」的同一个身体，
+    /// 于是打错一个词的标签页会读成「一切安静」。错误里要列出能问的词。
+    #[test]
+    fn an_unknown_status_word_is_refused_with_the_words_that_work() {
+        let query = TaskQuery {
+            status: Some("ready_to_run".into()),
+            ..Default::default()
+        };
+        let err = status_filter(&query).expect_err("ready_to_run is not a word the endpoints know");
+        assert_eq!(err.error, "BadRequest");
+        let text = err.message;
+        for word in TaskFilter::ALL {
+            assert!(
+                text.contains(word.as_str()),
+                "the refusal must name {word:?}; got {text}"
+            );
+        }
+    }
+
+    /// `ready` 是队列不是状态：判定按队列给回的那批 id 走，不按行上的状态。
+    /// 拿它跟状态比会一条都匹配不上——那正是修之前标签页恒空的原因。
+    #[test]
+    fn the_ready_filter_selects_the_queue_not_a_status() {
+        let pending = task("queued", cog_core::TaskStatus::Pending, "t", 0);
+        let blocked = task("blocked", cog_core::TaskStatus::Pending, "t", 0);
+        let ready: HashSet<String> = ["queued".to_string()].into_iter().collect();
+
+        assert!(matches_status(
+            Some(TaskFilter::Ready),
+            Some(&ready),
+            &pending
+        ));
+        assert!(
+            !matches_status(Some(TaskFilter::Ready), Some(&ready), &blocked),
+            "pending with an unfinished blocker is not in the queue"
+        );
+        assert!(
+            matches_status(None, Some(&ready), &blocked),
+            "no filter keeps everything, queue or not"
+        );
+        assert!(matches_status(
+            Some(TaskFilter::Status(cog_core::TaskStatus::Pending)),
+            Some(&ready),
+            &blocked
+        ));
     }
 
     #[test]

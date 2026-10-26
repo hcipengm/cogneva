@@ -27,6 +27,10 @@ import { Strip } from '@/ui/plots';
  * 图和列表都能点开一条任务：展开的是它自己的行，不是再发一次请求——图与列表本来
  * 就已经带着完整的一行回来了。
  */
+// 过滤词原样进 query string，服务端按 `TaskFilter` 认识它们：`running` 这些是行上
+// 携带的状态词，`ready` 是就绪队列本身（未开始、阻塞都已完成）——它不是任何一行的
+// 状态，所以由服务端拿队列谓词算，不是按状态比。这里的词与那份声明对不上时，标签
+// 会拿到一张空表，而空表读起来就是「没有任务卡在这一步」。
 const FILTERS = ['全部', 'running', 'ready', 'completed', 'failed'] as const;
 
 type Mode = 'list' | 'graph';

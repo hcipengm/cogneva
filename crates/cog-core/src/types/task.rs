@@ -517,6 +517,54 @@ impl TaskStatus {
     }
 }
 
+/// What the task list and graph endpoints accept in their `status` query.
+///
+/// The status words are the ones [`TaskStatus::as_str`] writes -- the same
+/// spelling a row carries to the reader -- and [`TaskFilter::Ready`] names the
+/// queue instead: never started, every blocker done. `ready` is not a state any
+/// row holds, so a reader that treated it as one selects nothing, and an empty
+/// list reads exactly like "nothing is waiting" -- the reading the tab exists
+/// to give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskFilter {
+    Ready,
+    Status(TaskStatus),
+}
+
+impl TaskFilter {
+    /// Every word the endpoints accept, so a client's tabs and a gate can be
+    /// held to this declaration instead of to whoever typed the list.
+    pub const ALL: [TaskFilter; 7] = [
+        TaskFilter::Ready,
+        TaskFilter::Status(TaskStatus::Pending),
+        TaskFilter::Status(TaskStatus::Scheduled),
+        TaskFilter::Status(TaskStatus::Running),
+        TaskFilter::Status(TaskStatus::Completed),
+        TaskFilter::Status(TaskStatus::Failed),
+        TaskFilter::Status(TaskStatus::Cancelled),
+    ];
+
+    /// The word to send and the word this declaration spells for it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskFilter::Ready => "ready",
+            TaskFilter::Status(status) => status.as_str(),
+        }
+    }
+
+    /// Read back a query word.
+    ///
+    /// Case-insensitive: the parameter always was, and a reader typing `Failed`
+    /// asked for the same rows as one typing `failed`. `None` for a word this
+    /// version does not know -- the caller answers with the words it does
+    /// accept rather than with an empty list.
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|filter| filter.as_str().eq_ignore_ascii_case(word))
+    }
+}
+
 /// The bucket id for tasks that belong to no goal.
 ///
 /// Named rather than dropped: a reading that leaves those rows out makes the
