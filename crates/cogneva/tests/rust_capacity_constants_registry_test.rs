@@ -442,7 +442,7 @@ const BARE_BYTES: &str = "bytes";
 /// row is a number a deployment's behaviour depends on and no caller can move;
 /// the ceiling exists so the next one arrives with a decision, which is what
 /// makes this a ratchet rather than a count.
-const BARE_LITERAL_CEILING: usize = 203;
+const BARE_LITERAL_CEILING: usize = 163;
 
 /// `Duration::from_*(<literal>)` and byte multipliers, per file and shape.
 ///
@@ -459,31 +459,72 @@ fn scan_bare_literals(root: &Path) -> BTreeMap<(String, String), usize> {
             .unwrap_or(&entry)
             .to_string_lossy()
             .to_string();
-        if !rel.contains("/src/") {
+        if !rel.contains("/src/") || DECLARATION_FILES.contains(&rel.as_str()) {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&entry) else {
             continue;
         };
         let lines: Vec<&str> = text.lines().collect();
+        // Two regions are skipped by their braces rather than by a `break`: a
+        // `break` would stop reading the file at the first `mod tests`, and a
+        // literal below it would then be invisible while the register still
+        // read as complete -- an unread byte that reads as a decision.
+        let mut depth: i32 = 0;
+        let mut defaults: Option<i32> = None;
+        let mut fixtures: Option<i32> = None;
         for (i, line) in lines.iter().enumerate() {
             let next = lines[i + 1..]
                 .iter()
                 .find(|l| !l.trim().is_empty())
                 .copied();
-            if opens_inline_test_module(line, next) {
-                break;
+            let code = code_only(line);
+            let opens_tests = opens_inline_test_module(line, next);
+            let in_fixtures = fixtures.is_some();
+            let depth_before = depth;
+            depth += code.matches('{').count() as i32 - code.matches('}').count() as i32;
+            let opened_tests = opens_tests && fixtures.is_none();
+            if opened_tests {
+                fixtures = Some(depth_before);
             }
-            let code = line.split("//").next().unwrap_or("");
-            if declares_a_const(code) {
+            // The opening line itself may carry no brace (an attribute line, or
+            // a signature whose `{` is on the next line), so it must not be the
+            // line that closes the span it just opened.
+            if !opened_tests {
+                if let Some(entry_depth) = fixtures {
+                    if depth <= entry_depth {
+                        fixtures = None;
+                    }
+                }
+            }
+            if in_fixtures || opens_tests || declares_a_const(&code) {
                 continue;
             }
-            let cadence = cadence_literals(code);
+            // A `Default` impl writes the same thing down in a function instead
+            // of in a `const`, and the census reaches it the same way, so its
+            // numbers are declarations too.
+            let opens_defaults = code.contains("fn default(");
+            let declared = defaults.is_some() || opens_defaults;
+            let opened_defaults = opens_defaults && defaults.is_none();
+            if opened_defaults {
+                defaults = Some(depth_before);
+            }
+            if !opened_defaults {
+                if let Some(entry_depth) = defaults {
+                    if depth <= entry_depth {
+                        defaults = None;
+                    }
+                }
+            }
+            if declared {
+                continue;
+            }
+            let cadence = cadence_literals(&code);
             if cadence > 0 {
                 *out.entry((rel.clone(), BARE_CADENCE.to_string()))
                     .or_default() += cadence;
             }
-            let bytes = byte_literals(code);
+            let bytes = byte_literals(&code);
             if bytes > 0 {
                 *out.entry((rel.clone(), BARE_BYTES.to_string()))
                     .or_default() += bytes;
@@ -492,6 +533,67 @@ fn scan_bare_literals(root: &Path) -> BTreeMap<(String, String), usize> {
     }
     out
 }
+
+/// The line's code: string literals, char literals and any `//` comment removed.
+///
+/// Braces inside a string move a depth counter, and one assertion on
+/// `"outcome=\"reclaimed\"} 1"` would then close the scan's notion of the test
+/// module a hundred lines early -- the rest of the module would read as
+/// production. A number inside a message is not a dial either, so the same pass
+/// serves both readers. Approximate on purpose: a raw string spanning lines is
+/// not tracked, and every line starts outside one.
+fn code_only(line: &str) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '/' if chars.peek() == Some(&'/') => break,
+            '"' => {
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            '\'' => {
+                let mut probe = chars.clone();
+                match (probe.next(), probe.next()) {
+                    (Some(inner), Some('\'')) if inner != '\\' => {
+                        chars.next();
+                        chars.next();
+                    }
+                    (Some('\\'), _) => {
+                        // `'\n'`, `'\''` and friends: consume to the closing quote.
+                        chars.next();
+                        for _ in 0..2 {
+                            match chars.next() {
+                                Some('\'') => break,
+                                Some(_) => {}
+                                None => break,
+                            }
+                        }
+                    }
+                    _ => out.push(c),
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Files whose numbers are declarations by construction.
+///
+/// `config.rs` is where a deployment's defaults are written down; a default that
+/// was not a literal somewhere would have to be read from something, and what it
+/// would be read from is a file that has to hold it. The census still reads its
+/// `const`s, so a named number there is not invisible -- it is in the other
+/// register.
+const DECLARATION_FILES: [&str; 1] = ["crates/cog-core/src/config.rs"];
 
 /// A line that declares a constant: its numbers are the census's rows, and
 /// counting them here too would ask the same number for two decisions.
@@ -537,25 +639,36 @@ fn cadence_literals(code: &str) -> usize {
     count
 }
 
-/// Byte sizes written as a multiplier or a shift, per line.
+/// Byte sizes written as a multiple of a kibibyte, per line.
 ///
-/// `1024` and its shift spellings are the one literal that cannot mean anything
-/// but a unit, which is exactly why they are countable and why leaving one in a
-/// call site is a size nobody declared.
+/// The unit itself is not the number: `kb * 1024` and `1024 * 1024 * 1024` say
+/// "these are bytes", and asking them for a declaration would produce names like
+/// `KIBIBYTE`. What is countable is a *quantity* spelled that way -- `24 * 1024`
+/// is twenty-four of something -- so this counts a literal times 1024 and skips
+/// when that literal is itself 1024 or 1. Shifts are unit conversions by
+/// construction and are not counted at all.
 fn byte_literals(code: &str) -> usize {
     let mut count = 0;
     let mut rest = code;
     while let Some(at) = rest.find("1024") {
         let before = &rest[..at];
-        if before.trim_end().ends_with('*') {
-            count += 1;
+        let head = before.trim_end();
+        if let Some(head) = head.strip_suffix('*') {
+            let number: String = head
+                .trim_end()
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_digit() || *c == '_' || *c == '.')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let plain = number.replace('_', "");
+            if !number.is_empty() && plain != "1024" && plain != "1024.0" && plain != "1" {
+                count += 1;
+            }
         }
         rest = &rest[at + 4..];
-    }
-    for shift in [
-        "<< 10", "<< 20", "<< 30", "<< 40", "<<10", "<<20", "<<30", "<<40",
-    ] {
-        count += code.matches(shift).count();
     }
     count
 }
