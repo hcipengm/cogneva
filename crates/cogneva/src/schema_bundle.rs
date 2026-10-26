@@ -37,7 +37,7 @@ pub fn statements() -> Vec<String> {
         cog_storage::postgres::state_backend::DDL.to_string(),
         cog_storage::postgres::observability_gateway::OBSERVABILITY_DDL.to_string(),
         cog_storage::owner_lease::DDL.to_string(),
-        cog_observability::alert_store::DDL.to_string(),
+        cog_observability::alert_store::ddl(),
         cog_observability::skip_store::DDL.to_string(),
         cog_observability::producer_heartbeat::DDL.to_string(),
         cog_observability::spend_verdict::DDL.to_string(),

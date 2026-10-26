@@ -20,6 +20,7 @@ pub mod secrets;
 pub mod token_estimate;
 pub mod topology;
 pub mod types;
+pub mod vocabulary;
 
 pub use audit::{verify_chain, AuditEvent, AuditKind, AuditStream, ChainVerification};
 pub use config::*;
@@ -87,6 +88,7 @@ pub use secrets::{
 };
 pub use token_estimate::estimate_tokens;
 pub use types::*;
+pub use vocabulary::fill_slots;
 
 // Backward-compatible module aliases for old module paths.
 // Prefer `cog_core::ContractType` or `cog_core::contract::<domain>::Type` for new code.

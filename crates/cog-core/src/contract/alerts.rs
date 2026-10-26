@@ -78,6 +78,44 @@ pub enum AlertState {
     Resolved,
 }
 
+impl AlertState {
+    /// Every state, in the order the lifecycle moves through them.
+    ///
+    /// The alert table keeps this set in its `state` column and every query
+    /// over it names one of these words. A query that spells the word itself
+    /// agrees with this enum only until a variant is renamed, and then the
+    /// predicate matches nothing -- which reads as "nothing is firing", the one
+    /// answer an operator is least likely to double-check.
+    pub const ALL: [AlertState; 3] = [
+        AlertState::Pending,
+        AlertState::Firing,
+        AlertState::Resolved,
+    ];
+
+    /// The word this state is stored under.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AlertState::Pending => "pending",
+            AlertState::Firing => "firing",
+            AlertState::Resolved => "resolved",
+        }
+    }
+
+    /// Read one back. A value outside the set is not a state this build can
+    /// reason about, so it is refused rather than mapped to a neighbour.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|state| state.as_str() == s)
+    }
+}
+
+impl std::str::FromStr for AlertState {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| format!("unknown alert state: {s}"))
+    }
+}
+
 /// An active alert instance (one firing occurrence of a rule).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertInstance {

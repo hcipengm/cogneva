@@ -77,6 +77,10 @@ fn parses_as_user_type(word: &str) -> bool {
         .any(|tier| tier.as_str() == word)
 }
 
+fn parses_as_alert_state(word: &str) -> bool {
+    cog_core::AlertState::parse(word).is_some()
+}
+
 fn parses_as_metric_type(word: &str) -> bool {
     cog_core::MetricType::ALL
         .iter()
@@ -167,6 +171,15 @@ const VOCABULARIES: &[Vocabulary] = &[
         subjects: &["user_type"],
         parses: parses_as_user_type,
         home: "cog_core::UserType",
+        except_in: &[],
+    },
+    Vocabulary {
+        // The alert lifecycle. A guard that names a word the enum no longer
+        // produces stops closing rows: the alert stays open, and an operator
+        // reads "nothing to resolve" rather than a stuck row.
+        subjects: &["state"],
+        parses: parses_as_alert_state,
+        home: "cog_core::AlertState",
         except_in: &[],
     },
     Vocabulary {
@@ -525,6 +538,10 @@ fn each_vocabulary_reads_its_own_declaration() {
     for kind in cog_core::MetricType::ALL {
         assert!(parses_as_metric_type(kind.as_str()));
     }
+    for state in cog_core::AlertState::ALL {
+        assert!(parses_as_alert_state(state.as_str()));
+    }
+    assert!(!parses_as_alert_state("landed"));
     // A word from another set is not this set's: the judge has to be a set, not
     // a shape.
     assert!(!parses_as_user_status("pending"));

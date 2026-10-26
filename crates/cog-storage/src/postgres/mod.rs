@@ -1,23 +1,10 @@
 /// Resolve the `<{prefix}:<word>}` slots a query template writes.
 ///
-/// A query that spells a word some enum's `as_str` already decides is a second
-/// copy of that word, and the two agree only until one of them is renamed. The
-/// failure is quiet in the way a store cannot afford: the predicate keeps
-/// matching the old spelling, and a query that matches no rows answers exactly
-/// like a table with nothing in it -- so "nothing is outstanding", "nothing was
-/// retired" and "no work is bound to this face" all read as ordinary states.
-///
-/// The slot is named after the value it resolves (`{state:landed}`), so the
-/// template says what will be written and the caller only has to offer the
-/// enum's own words. One function, so a store that fixes a bug here does not
-/// leave the other copy broken.
-pub(crate) fn fill_slots(template: &str, slots: &[(&str, &str)]) -> String {
-    let mut sql = template.to_string();
-    for (prefix, word) in slots {
-        sql = sql.replace(&format!("{{{prefix}:{word}}}"), word);
-    }
-    sql
-}
+/// See [`cog_core::fill_slots`] for why a query may not spell a closed set's
+/// word itself. Re-exported rather than reimplemented: the alert store fills
+/// the same kind of slot from its own enum, and two copies of this rule would
+/// be the very thing it exists to prevent.
+pub(crate) use cog_core::fill_slots;
 
 pub mod agent_message_store;
 pub mod audit_recorder;

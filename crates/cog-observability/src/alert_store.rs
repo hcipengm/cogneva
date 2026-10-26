@@ -8,11 +8,31 @@
 //! still see what is currently firing.
 
 use chrono::{DateTime, Utc};
+use cog_core::{fill_slots, AlertState};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 
+/// Resolve the `{state:...}` slots a statement names from [`AlertState`].
+///
+/// The alert table's `state` column holds this set and every query over it
+/// names one of its words. Spelled here instead of read from the declaration,
+/// the two agree only until a variant is renamed -- and then the guard reads
+/// "no row is firing", which an operator is least likely to question.
+fn alert_sql(template: &str) -> String {
+    let mut slots: Vec<(&str, &str)> = Vec::new();
+    for state in AlertState::ALL {
+        slots.push(("state", state.as_str()));
+    }
+    fill_slots(template, &slots)
+}
+
 /// This store's schema, and the one a restore replays.
-pub const DDL: &str = r#"
+///
+/// The partial index names the firing state, and the table's `state` column
+/// holds a closed set, so the word is a slot here rather than a copy of
+/// [`AlertState::as_str`]: a partial index on a spelling no row carries is a
+/// valid index that never holds a row, which reads as "nothing is firing".
+pub const DDL_TEMPLATE: &str = r#"
 CREATE TABLE IF NOT EXISTS alerts (
                 id          TEXT PRIMARY KEY,
                 rule        TEXT        NOT NULL,
@@ -37,8 +57,13 @@ ALTER TABLE alerts ADD COLUMN IF NOT EXISTS acknowledged_by TEXT
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ
 ;
 CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts(state, fired_at DESC);
-CREATE INDEX IF NOT EXISTS idx_alerts_unnotified ON alerts(fired_at) WHERE state = 'firing' AND notified_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_alerts_unnotified ON alerts(fired_at) WHERE state = '{state:firing}' AND notified_at IS NULL;
 "#;
+
+/// The schema with the state words filled from [`AlertState`].
+pub fn ddl() -> String {
+    alert_sql(DDL_TEMPLATE)
+}
 
 /// A new alert condition to raise (or close).
 #[derive(Debug, Clone)]
@@ -78,7 +103,7 @@ pub struct StoredAlert {
 
 impl StoredAlert {
     fn is_firing(&self) -> bool {
-        self.state == "firing"
+        self.state == AlertState::Firing.as_str()
     }
 }
 
@@ -242,7 +267,7 @@ impl PostgresAlertStore {
     }
 
     pub async fn init_schema(&self) -> anyhow::Result<()> {
-        sqlx::raw_sql(DDL).execute(&self.pool).await?;
+        sqlx::raw_sql(&ddl()).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -285,15 +310,15 @@ impl PostgresAlertStore {
         match decide(condition, stored.as_ref()) {
             AlertTransition::Fired => {
                 let now = Utc::now();
-                sqlx::query(
+                sqlx::query(&alert_sql(
                     r#"
                     INSERT INTO alerts
                         (id, rule, dedup_key, severity, state, message, labels,
                          fired_at, resolved_at, updated_at, last_seen_at)
-                    VALUES ($1, $2, $3, $4, 'firing', $5, $6, $7, NULL, $7, $7)
+                    VALUES ($1, $2, $3, $4, '{state:firing}', $5, $6, $7, NULL, $7, $7)
                     ON CONFLICT (dedup_key) DO UPDATE SET
                         severity   = EXCLUDED.severity,
-                        state      = 'firing',
+                        state      = '{state:firing}',
                         message    = EXCLUDED.message,
                         labels     = EXCLUDED.labels,
                         fired_at   = EXCLUDED.fired_at,
@@ -312,7 +337,7 @@ impl PostgresAlertStore {
                         -- condition that just started again.
                         notified_at = NULL
                     "#,
-                )
+                ))
                 .bind(uuid::Uuid::new_v4().to_string())
                 .bind(&alert.rule)
                 .bind(&alert.dedup_key)
@@ -326,10 +351,10 @@ impl PostgresAlertStore {
             }
             AlertTransition::Resolved => {
                 let now = Utc::now();
-                sqlx::query(
-                    "UPDATE alerts SET state = 'resolved', resolved_at = $2, updated_at = $2 \
-                     WHERE dedup_key = $1 AND state = 'firing'",
-                )
+                sqlx::query(&alert_sql(
+                    "UPDATE alerts SET state = '{state:resolved}', resolved_at = $2, updated_at = $2 \
+                     WHERE dedup_key = $1 AND state = '{state:firing}'",
+                ))
                 .bind(&alert.dedup_key)
                 .bind(now)
                 .execute(&self.pool)
@@ -344,20 +369,20 @@ impl PostgresAlertStore {
                     // and a clock that only moves when the payload moves is
                     // not one.
                     if plan.advance_last_seen {
-                        sqlx::query(
+                        sqlx::query(&alert_sql(
                             "UPDATE alerts SET last_seen_at = $2 \
-                             WHERE dedup_key = $1 AND state = 'firing'",
-                        )
+                             WHERE dedup_key = $1 AND state = '{state:firing}'",
+                        ))
                         .bind(&alert.dedup_key)
                         .bind(now)
                         .execute(&self.pool)
                         .await?;
                     }
                     if plan.rewrite_payload {
-                        sqlx::query(
+                        sqlx::query(&alert_sql(
                             "UPDATE alerts SET severity = $2, message = $3, labels = $4, \
-                             updated_at = $5 WHERE dedup_key = $1 AND state = 'firing'",
-                        )
+                             updated_at = $5 WHERE dedup_key = $1 AND state = '{state:firing}'",
+                        ))
                         .bind(&alert.dedup_key)
                         .bind(&alert.severity)
                         .bind(&alert.message)
@@ -399,11 +424,11 @@ impl PostgresAlertStore {
         stale_before: DateTime<Utc>,
     ) -> anyhow::Result<u64> {
         let now = Utc::now();
-        let closed = sqlx::query(
-            "UPDATE alerts SET state = 'resolved', resolved_at = $1, updated_at = $1 \
-             WHERE rule = $2 AND state = 'firing' \
+        let closed = sqlx::query(&alert_sql(
+            "UPDATE alerts SET state = '{state:resolved}', resolved_at = $1, updated_at = $1 \
+             WHERE rule = $2 AND state = '{state:firing}' \
                AND (last_seen_at IS NULL OR last_seen_at < $3)",
-        )
+        ))
         .bind(now)
         .bind(rule)
         .bind(stale_before)
@@ -420,10 +445,10 @@ impl PostgresAlertStore {
     /// there to refresh — `false` is the caller's signal that this process's
     /// judgement no longer owns a row, and that it has nothing left to sight.
     pub async fn refresh_firing(&self, dedup_key: &str) -> anyhow::Result<bool> {
-        let touched = sqlx::query(
+        let touched = sqlx::query(&alert_sql(
             "UPDATE alerts SET last_seen_at = $2 \
-             WHERE dedup_key = $1 AND state = 'firing'",
-        )
+             WHERE dedup_key = $1 AND state = '{state:firing}'",
+        ))
         .bind(dedup_key)
         .bind(Utc::now())
         .execute(&self.pool)
@@ -445,10 +470,10 @@ impl PostgresAlertStore {
         by: &str,
     ) -> anyhow::Result<Option<DateTime<Utc>>> {
         let now = Utc::now();
-        let written = sqlx::query(
+        let written = sqlx::query(&alert_sql(
             "UPDATE alerts SET acknowledged_at = $2, acknowledged_by = $3 \
-             WHERE dedup_key = $1 AND state = 'firing'",
-        )
+             WHERE dedup_key = $1 AND state = '{state:firing}'",
+        ))
         .bind(dedup_key)
         .bind(now)
         .bind(by)
@@ -469,10 +494,10 @@ impl PostgresAlertStore {
     /// it did not open, instead of either leaving it firing forever or minting
     /// a second row for an event already in progress.
     pub async fn firing_key_for_rule(&self, rule: &str) -> anyhow::Result<Option<String>> {
-        let row = sqlx::query(
-            "SELECT dedup_key FROM alerts WHERE rule = $1 AND state = 'firing' \
+        let row = sqlx::query(&alert_sql(
+            "SELECT dedup_key FROM alerts WHERE rule = $1 AND state = '{state:firing}' \
              ORDER BY fired_at DESC LIMIT 1",
-        )
+        ))
         .bind(rule)
         .fetch_optional(&self.pool)
         .await?;
@@ -486,11 +511,11 @@ impl PostgresAlertStore {
     /// started a moment ago — the person opening the bell reads the list the
     /// way it happened.
     pub async fn unnotified_firing(&self, limit: i64) -> anyhow::Result<Vec<NewAlert>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&alert_sql(
             "SELECT rule, dedup_key, severity, message, labels FROM alerts \
-             WHERE state = 'firing' AND notified_at IS NULL \
+             WHERE state = '{state:firing}' AND notified_at IS NULL \
              ORDER BY fired_at ASC LIMIT $1",
-        )
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -512,10 +537,10 @@ impl PostgresAlertStore {
     /// an edge, not a timer: a row resolved in the meantime must not receive a
     /// mark that would suppress the notice of its next episode.
     pub async fn mark_notified(&self, dedup_key: &str) -> anyhow::Result<bool> {
-        let result = sqlx::query(
+        let result = sqlx::query(&alert_sql(
             "UPDATE alerts SET notified_at = NOW() \
-             WHERE dedup_key = $1 AND state = 'firing' AND notified_at IS NULL",
-        )
+             WHERE dedup_key = $1 AND state = '{state:firing}' AND notified_at IS NULL",
+        ))
         .bind(dedup_key)
         .execute(&self.pool)
         .await?;
@@ -536,10 +561,10 @@ impl PostgresAlertStore {
     /// every row past the cut would be silently skipped, forever, because the
     /// next pass reads the same truncated list.
     pub async fn firing_keys_from_source(&self, source: &str) -> anyhow::Result<Vec<String>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&alert_sql(
             "SELECT dedup_key FROM alerts \
-             WHERE state = 'firing' AND labels->>'source' = $1",
-        )
+             WHERE state = '{state:firing}' AND labels->>'source' = $1",
+        ))
         .bind(source)
         .fetch_all(&self.pool)
         .await?;
@@ -548,12 +573,12 @@ impl PostgresAlertStore {
 
     /// Alerts currently in the `firing` state, newest first.
     pub async fn list_active(&self, limit: i64) -> anyhow::Result<Vec<AlertRecord>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&alert_sql(
             "SELECT id, rule, dedup_key, severity, state, message, labels, \
              fired_at, resolved_at, updated_at, last_seen_at, \
              acknowledged_at, acknowledged_by FROM alerts \
-             WHERE state = 'firing' ORDER BY fired_at DESC LIMIT $1",
-        )
+             WHERE state = '{state:firing}' ORDER BY fired_at DESC LIMIT $1",
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -579,12 +604,12 @@ impl PostgresAlertStore {
         if rules.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(
+        let rows = sqlx::query(&alert_sql(
             "SELECT id, rule, dedup_key, severity, state, message, labels, \
              fired_at, resolved_at, updated_at, last_seen_at, \
              acknowledged_at, acknowledged_by FROM alerts \
-             WHERE state = 'firing' AND rule = ANY($1)",
-        )
+             WHERE state = '{state:firing}' AND rule = ANY($1)",
+        ))
         .bind(rules)
         .fetch_all(&self.pool)
         .await?;
@@ -593,12 +618,12 @@ impl PostgresAlertStore {
 
     /// Full alert history (firing and resolved), newest first.
     pub async fn list_history(&self, limit: i64) -> anyhow::Result<Vec<AlertRecord>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&alert_sql(
             "SELECT id, rule, dedup_key, severity, state, message, labels, \
              fired_at, resolved_at, updated_at, last_seen_at, \
              acknowledged_at, acknowledged_by FROM alerts \
              ORDER BY fired_at DESC LIMIT $1",
-        )
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -724,6 +749,31 @@ impl cog_core::PersistentAlertSink for PostgresAlertStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every statement this store builds is rendered here, not in the database:
+    /// a slot left behind is a parse error at the moment an operator needs the
+    /// alert, and a guard that names the wrong state word is a guard that
+    /// matches nothing.
+    #[test]
+    fn the_statements_name_the_states_the_enum_declares() {
+        let firing = AlertState::Firing.as_str();
+        let resolved = AlertState::Resolved.as_str();
+        let schema = ddl();
+        // `'{}'::jsonb` 是列默认值，不是槽：只认 `{name:word}` 那种形状。
+        assert!(!schema.contains("{state:"), "DDL 还有没填的槽：{schema}");
+        assert!(schema.contains(&format!("state = '{firing}'")), "{schema}");
+        for state in AlertState::ALL {
+            assert!(AlertState::parse(state.as_str()) == Some(state));
+        }
+        let close = alert_sql(
+            "UPDATE alerts SET state = '{state:resolved}' \
+             WHERE dedup_key = $1 AND state = '{state:firing}'",
+        );
+        assert!(!close.contains('{'), "{close}");
+        assert!(close.contains(&format!("state = '{resolved}'")), "{close}");
+        assert!(close.contains(&format!("state = '{firing}'")), "{close}");
+        assert_eq!(AlertState::parse("recovered"), None);
+    }
 
     /// The state machine is the part worth pinning down; `set_alert` is pure
     /// decision logic over the stored state. Exercise it against the same
