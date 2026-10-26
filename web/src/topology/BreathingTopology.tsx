@@ -354,6 +354,7 @@ export function BreathingTopology({ data }: { data: ClusterTopologyData }) {
                           `（申请 ${formatCpu(point.pod.cpu_requested_millicores)}）` +
                           `\n内存 ${point.pod.memory_used_bytes == null ? '无读数' : formatBytes(point.pod.memory_used_bytes)}` +
                           `\n重启 ${point.pod.restarts} 次 · 容器 ${point.pod.containers.length} 个` +
+                          `\n进程 ${point.pod.processes == null ? '无读数' : point.pod.processes}` +
                           (point.warnings > 0 ? `\nWarning 事件 ${point.warnings} 条` : '')}
                       </title>
                       {/* 呼吸环：快慢来自这个 Pod 真实用掉的 CPU。没有读数就没有环。 */}
@@ -789,6 +790,12 @@ function PodDetail({ pod }: { pod: TopologyPod }) {
         </span>
         <span>
           容器 <span className="mono">{pod.containers.length}</span> 个
+        </span>
+        {/* 进程只有数：Kubernetes 的读接口不报名字，要名字只能 exec 进容器跑 ps。 */}
+        <span>
+          进程{' '}
+          <span className="mono">{pod.processes == null ? '无读数' : pod.processes}</span>
+          {pod.processes == null ? '' : ' 个'}
         </span>
       </div>
 

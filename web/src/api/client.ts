@@ -2004,6 +2004,12 @@ export interface TopologyPod {
   memory_requested_bytes: number;
   cpu_used_millicores: number | null;
   memory_used_bytes: number | null;
+  /**
+   * 这个 Pod 里跑着几个进程（kubelet 的 `process_stats`）。只有数、没有名字：
+   * 名字要 exec 进容器读，这条读面没有那个权限。`null` 是「这个来源量不到」，
+   * 不是「零个进程」——metrics-server 那条腿不报这个数。
+   */
+  processes: number | null;
   containers: TopologyContainer[];
   conditions: TopologyCondition[];
   volumes: TopologyVolume[];

@@ -162,6 +162,11 @@ pub struct PodView {
     pub memory_requested_bytes: u64,
     pub cpu_used_millicores: Option<u64>,
     pub memory_used_bytes: Option<u64>,
+    /// 这个 Pod 里跑着几个进程，来自 kubelet 的 summary（`process_stats.process_count`）。
+    /// 只有数，没有名字：Kubernetes 的读接口不报进程名单，要看名字只能 exec 进容器
+    /// 跑 `ps`，那是对运行中的业务容器执行命令，不给读面这个权限。metrics-server
+    /// 那条腿不报这个数，所以 `None` 说的是「这个来源量不到」，不是「没有进程」。
+    pub processes: Option<u64>,
     pub containers: Vec<ContainerView>,
     pub conditions: Vec<ConditionView>,
     pub volumes: Vec<VolumeView>,
@@ -458,6 +463,11 @@ fn usage_from_summary(summary: &Value, namespace: &str) -> Vec<(String, PodUsage
         let mut usage = PodUsage {
             cpu: nanocores_millicores(pod.pointer("/cpu/usageNanoCores")),
             memory: bytes_at(pod.pointer("/memory/workingSetBytes")),
+            // 进程数只在 Pod 这一级有：summary 不给每个容器分进程，给了也没有名字
+            // 可拼成一个说得通的行。读不到就是 `None`，不写 0——0 是一句「没有进程」。
+            processes: pod
+                .pointer("/process_stats/process_count")
+                .and_then(Value::as_u64),
             containers: std::collections::HashMap::new(),
         };
         for container in pod
@@ -515,6 +525,8 @@ fn bytes_at(value: Option<&Value>) -> u64 {
 struct PodUsage {
     cpu: u64,
     memory: u64,
+    /// kubelet summary 独有：这个 Pod 的进程数。metrics-server 不报，`None` 即读不到。
+    processes: Option<u64>,
     containers: std::collections::HashMap<String, (u64, u64)>,
 }
 
@@ -931,6 +943,7 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
         conditions,
         cpu_used_millicores: pod_usage.map(|pod| pod.cpu),
         memory_used_bytes: pod_usage.map(|pod| pod.memory),
+        processes: pod_usage.and_then(|pod| pod.processes),
         volumes,
         events: pod_events,
     }
@@ -1997,6 +2010,7 @@ mod topology_tests {
             "pods": [
                 {
                     "podRef": { "name": "api-1", "namespace": "cogneva" },
+                    "process_stats": { "process_count": 3u64 },
                     "cpu": { "usageNanoCores": 250_000_000u64 },
                     "memory": { "workingSetBytes": 734_003_200u64, "rssBytes": 700_000_000u64 },
                     "containers": [
@@ -2023,6 +2037,11 @@ mod topology_tests {
         assert_eq!(pod.memory, 734_003_200, "取工作集，不取 RSS");
         assert_eq!(pod.containers["api"], (200, 600_000_000));
         assert_eq!(pod.containers["sidecar"], (50, 134_003_200));
+        assert_eq!(
+            pod.processes,
+            Some(3),
+            "进程数在 Pod 这一级，summary 报多少就是多少"
+        );
     }
 
     #[test]

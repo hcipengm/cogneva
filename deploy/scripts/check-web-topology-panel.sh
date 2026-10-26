@@ -27,7 +27,9 @@
 #   8. 集群列表被遍历过（`clusters.map`），且没有任何一处把整份列表折成第一个；
 #   9. 没有把卷 / 挂载 / 事件画成容器的下一级——箭头链是在断言包含关系，而这三样
 #      不是容器的下级（卷定义在 Pod 上，容器只是挂进来；事件是独立对象，按
-#      `involvedObject` 关联）。
+#      `involvedObject` 关联）；
+#   10. 服务端量到的进程数（kubelet `process_stats`）在屏上出现过——量到不显示，
+#      这个数就只是 JSON 里的一格，没有一处会红，也没有一个人看得见。
 #
 # 用法：bash deploy/scripts/check-web-topology-panel.sh [仓库根目录]
 set -euo pipefail
@@ -259,6 +261,18 @@ if misplaced:
     problems.append(
         f"{', '.join(misplaced)}: 箭头链以挂载/卷/事件收尾，把它们写成了容器的下一级——"
         "卷定义在 Pod 上、容器只是挂进来，事件是独立对象按 involvedObject 关联"
+    )
+
+# ── 10. 量到的进程数要上屏 ──
+# 进程名字读不到（要 exec 进容器），但数读得到：kubelet 的 summary 每个 Pod 给一个
+# `process_stats.process_count`。后端既然把它读出来了，屏上就得有——否则「容器里还有
+# 东西在跑」这件事只活在 JSON 里。
+server_path = os.path.join(ROOT, SERVER)
+server_src = open(server_path, encoding="utf-8").read() if os.path.isfile(server_path) else ""
+measures = "process_count" in server_src and re.search(r"pub\s+processes\s*:", server_src)
+if measures and "processes" not in shown:
+    problems.append(
+        f"{where}: 服务端从 kubelet 的 summary 读到了 Pod 的进程数，读面没有一处显示它"
     )
 
 if problems:

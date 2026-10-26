@@ -323,6 +323,7 @@ function PodRow({ pod }: { pod: TopologyPod }) {
         <span className="mono shrink-0 text-[10px] text-[var(--muted)]">
           {pod.phase}
           {pod.restarts > 0 && ` · 重启 ${pod.restarts}`}
+          {pod.processes != null && ` · ${pod.processes} 个进程`}
         </span>
         <span className="mono shrink-0 text-[10px] text-[var(--muted)]">
           {formatCpu(pod.cpu_requested_millicores)} · {formatBytes(pod.memory_requested_bytes)}

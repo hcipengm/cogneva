@@ -16,6 +16,7 @@
 #   - 服务端那条测试被删掉          → 上面这条分流可以被人改回去而不让任何东西红
 #   - 把 clusters 折成 clusters[0]  → 接上第二个集群那天，它在屏上根本不存在
 #   - 把卷与事件排进容器下面         → 屏上说的包含关系是 Kubernetes 里没有的
+#   - 服务端量到进程数而不上屏       → 读到的数活在 JSON 里，没有人看得见
 # 每段改动都先确认**落到了文件上**（否则「改动没生效」与「门没抓住」不可区分）。
 #
 # 最后一条断言是在**真树**上跑：夹具全绿而真树红，说明这条门只是在测自己。
@@ -251,6 +252,29 @@ fixture
 printf '// 集群 → 节点 → Pod → 容器 → 卷与事件\n' >>"${work}/web/src/topology/TopologyPanel.tsx"
 confirm "${work}/web/src/topology/TopologyPanel.tsx" "容器 → 卷与事件"
 expect_red "把卷与事件排进容器下面" "写成了容器的下一级"
+
+# 13. 服务端量到进程数，读面却不显示。
+fixture
+python3 - "${work}/crates/cog-gateway/src/cluster.rs" <<'FIXPATCH'
+import sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+src = src.replace(
+    "    pub namespace: String,",
+    "    pub namespace: String,\n    pub processes: Option<u64>,",
+    1,
+)
+src = src.replace(
+    "fn place_pods(",
+    "fn processes_of(summary: &Value) -> Option<u64> {\n"
+    '    summary.pointer("/process_stats/process_count").and_then(|v| v.as_u64())\n'
+    "}\n\nfn place_pods(",
+    1,
+)
+open(path, "w", encoding="utf-8").write(src)
+FIXPATCH
+confirm "${work}/crates/cog-gateway/src/cluster.rs" "process_count"
+expect_red "量到进程数不上屏" "读面没有一处显示它"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
