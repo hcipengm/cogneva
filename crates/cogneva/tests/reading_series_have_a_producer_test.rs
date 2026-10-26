@@ -245,3 +245,215 @@ fn the_board_names_the_same_producer_for_its_postgres_panels() {
         "no postgres series found in the board contract — this gate would be vacuous"
     );
 }
+
+/// The dashboards the deploy manifests provision, as uid -> the file and key
+/// that carry it. Read off the ConfigMap rather than listed here, because a
+/// list written here would be a second copy of the same names: renaming a
+/// dashboard would then have to be done twice, and the copy nobody edits is the
+/// one that decides whether the link works.
+fn provisioned_dashboards() -> std::collections::BTreeMap<String, String> {
+    fn manifests(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                manifests(&path, out);
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("yaml" | "yml")
+            ) {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut paths = Vec::new();
+    manifests(&repo_root().join("deploy"), &mut paths);
+    assert!(
+        !paths.is_empty(),
+        "no manifests found under deploy/ — this gate would be vacuous"
+    );
+
+    let mut dashboards = std::collections::BTreeMap::new();
+    for path in paths {
+        let text = read_file(&path);
+        // Grafana's file provisioning picks up any ConfigMap carrying this
+        // label; a dashboard outside one is a dashboard nobody sees.
+        if !text.contains("grafana_dashboard:") {
+            continue;
+        }
+        let (keys, found) = dashboards_in(&text);
+        // A block whose first literal `uid` is not there means the shape this
+        // gate reads is no longer the shape the dashboards are written in. That
+        // is not a reason to pass: every deep-link would go on being unchecked.
+        assert_eq!(
+            keys,
+            found.len(),
+            "{} provisions {keys} dashboard(s), but this gate read a uid out of \
+             only {} of them — the block shape changed and the deep-links in the \
+             readings would pass unread",
+            path.display(),
+            found.len()
+        );
+        for (key, uid) in found {
+            dashboards.insert(uid, format!("{} ({key})", path.display()));
+        }
+    }
+    dashboards
+}
+
+/// One ConfigMap's dashboards: how many `.json` blocks it carries, and the uid
+/// each block starts with, paired with its key. `data:` holds one `<name>.json`
+/// key per dashboard and the uid is the first literal `"uid"` under it — the
+/// panel queries further down carry datasource references (`${datasource}`),
+/// which are variables and not dashboard uids.
+fn dashboards_in(text: &str) -> (usize, Vec<(String, String)>) {
+    let mut block: Option<(String, bool)> = None;
+    let mut keys = 0;
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if indent == 2 {
+            block = trimmed
+                .strip_suffix(": |")
+                .filter(|key| key.ends_with(".json"))
+                .map(|key| {
+                    keys += 1;
+                    (key.to_string(), false)
+                });
+            continue;
+        }
+        let Some((key, taken)) = block.as_mut() else {
+            continue;
+        };
+        if *taken {
+            continue;
+        }
+        // The uid may sit on its own line or on the opening brace's line; a
+        // reader that only took the first form would find no uid in a
+        // dashboard written the other way and go blind to it.
+        const UID: &str = "\"uid\": \"";
+        let Some(at) = trimmed.find(UID) else {
+            continue;
+        };
+        let uid = trimmed[at + UID.len()..]
+            .split('"')
+            .next()
+            .unwrap_or_default();
+        if uid.is_empty() || uid.contains("${") {
+            continue;
+        }
+        *taken = true;
+        found.push((key.clone(), uid.to_string()));
+    }
+    (keys, found)
+}
+
+/// A reading's deep-link names a dashboard by uid. If that dashboard is not one
+/// the manifests provision, the operator follows a link that lands on Grafana's
+/// "Dashboard not found" page — and the reading they were looking at still
+/// shows a number, so nothing about the page says the follow-up question is
+/// unanswerable. Renaming or dropping a dashboard is exactly how that happens,
+/// and it is silent from the reading's side: the uid is just a string in a
+/// struct nobody re-reads.
+#[test]
+fn every_dashboard_a_reading_links_to_is_one_the_manifests_provision() {
+    let dashboards = provisioned_dashboards();
+    let missing = links_without_a_dashboard(&cog_gateway::readings::READINGS, &dashboards);
+    assert!(
+        missing.is_empty(),
+        "these readings send the operator to a dashboard nothing under deploy/ \
+         provisions, so the link lands on \"Dashboard not found\" while the \
+         reading itself still looks healthy: {missing:?}. Provisioned now: {:?}",
+        dashboards.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        cog_gateway::readings::READINGS
+            .iter()
+            .any(|spec| spec.dashboard_uid.is_some()),
+        "no reading carries a dashboard link — this gate would be vacuous"
+    );
+}
+
+/// The links that lead nowhere, as `(reading id, uid)`.
+fn links_without_a_dashboard<'a>(
+    readings: &[&'a cog_gateway::readings::ReadingSpec],
+    dashboards: &std::collections::BTreeMap<String, String>,
+) -> Vec<(&'a str, &'a str)> {
+    readings
+        .iter()
+        .filter_map(|spec| {
+            let uid = spec.dashboard_uid?;
+            (!dashboards.contains_key(uid)).then_some((spec.id, uid))
+        })
+        .collect()
+}
+
+/// A link to a dashboard nobody provisions has to come back as a finding, or
+/// the gate above would pass by reading nothing. The case fed here is the one
+/// that actually happens: a dashboard gets renamed and the reading keeps
+/// pointing at the old uid.
+#[test]
+fn a_link_to_a_dashboard_nobody_provisions_is_reported() {
+    let mut renamed = cog_gateway::readings::DISK_FREE.clone();
+    renamed.dashboard_uid = Some("cogneva-storage-old");
+    let dashboards = provisioned_dashboards();
+    assert_eq!(
+        links_without_a_dashboard(&[&renamed], &dashboards),
+        vec![("disk_free_ratio", "cogneva-storage-old")]
+    );
+}
+
+/// The reader above is the half of this gate that can go blind: if the
+/// dashboards stop being written in the shape it splits on, it reads no uid at
+/// all and every link passes. So it is exercised on text that is not the
+/// manifest — one block where the uid comes first, one where a datasource
+/// variable comes first and must not be taken for a uid.
+#[test]
+fn the_reader_takes_the_dashboard_uid_and_not_a_datasource_variable() {
+    let text = "\
+data:
+  one.json: |
+    {
+      \"uid\": \"alpha\",
+      \"panels\": [{\"datasource\": {\"uid\": \"${datasource}\"}}]
+    }
+  two.json: |
+    {
+      \"panels\": [{\"datasource\": {\"uid\": \"${datasource}\"}}],
+      \"uid\": \"beta\"
+    }
+";
+    let (keys, found) = dashboards_in(text);
+    assert_eq!(keys, 2);
+    assert_eq!(
+        found,
+        vec![
+            ("one.json".to_string(), "alpha".to_string()),
+            ("two.json".to_string(), "beta".to_string()),
+        ]
+    );
+}
+
+/// A dashboard block the reader cannot find a uid in still counts as a block,
+/// so the count check in `provisioned_dashboards` reddens instead of quietly
+/// checking fewer dashboards than the manifest provisions.
+#[test]
+fn a_block_with_no_uid_is_visible_as_a_key_without_a_dashboard() {
+    let text = "\
+data:
+  one.json: |
+    {\"uid\": \"alpha\"}
+  two.json: |
+    {\"title\": \"a wrapper the reader does not know how to open\"}
+";
+    let (keys, found) = dashboards_in(text);
+    assert_eq!(
+        (keys, found.len()),
+        (2, 1),
+        "the caller counts blocks against uids read; this is the shape that makes it red"
+    );
+}
