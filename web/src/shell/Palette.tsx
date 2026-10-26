@@ -44,7 +44,7 @@ export function Palette() {
   const appendOutput = useShell((s) => s.appendOutput);
   const clearOutput = useShell((s) => s.clearOutput);
   const { alerts, notifications, overlays, signOut } = useServices();
-  const { openConversations, openLlmSetup, openWebSearch } = overlays;
+  const { openConversations, openLlmSetup, openWebSearch, openCredentials } = overlays;
   const theme = useTheme((s) => s.theme);
   const setTheme = useTheme((s) => s.setTheme);
 
@@ -95,6 +95,13 @@ export function Palette() {
         title: '配置上网检索与抓取',
         hint: '本机两层之后的第三方后备池',
         run: openWebSearch,
+      },
+      {
+        id: 'action:credentials',
+        group: '动作',
+        title: '连接代码平台（GitHub / Gitee）',
+        hint: '令牌与 SSH 身份；三条路：设备码、授权码、粘贴令牌',
+        run: openCredentials,
       },
       {
         id: 'action:alerts-refresh',
@@ -156,6 +163,7 @@ export function Palette() {
     openConversations,
     openLlmSetup,
     openWebSearch,
+    openCredentials,
     alerts,
     notifications,
     appendOutput,
@@ -198,6 +206,13 @@ export function Palette() {
         hint: '本机 SearXNG / crawl4ai → 第三方池 → 现网 LLM 自带工具',
         run: openWebSearch,
       },
+      {
+        id: 'help:credentials',
+        group: '帮助',
+        title: 'GitHub / Gitee 的令牌和 SSH 钥匙在哪配？凭据存在哪',
+        hint: '只进安全网关；设备码 / 授权码 / 粘贴令牌三条路',
+        run: openCredentials,
+      },
       go('observability', '集群现在什么状态？机器、负载、资源', VIEW_TITLES.observability),
       go('agents', '谁在替我干活？在岗的智能体与它们的上下文', VIEW_TITLES.agents),
       go('tasks', '这件事排到哪一步了？', VIEW_TITLES.tasks),
@@ -213,7 +228,7 @@ export function Palette() {
       go('files', '代码和文档在哪看、在哪改？', VIEW_TITLES.files),
       go('settings', '账号、主题、模型入口', VIEW_TITLES.settings),
     ];
-  }, [openLlmSetup, openWebSearch, setActivity]);
+  }, [openLlmSetup, openWebSearch, openCredentials, setActivity]);
 
   const source = mode === 'help' ? help : commands;
   const visible = useMemo(

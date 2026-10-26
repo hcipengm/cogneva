@@ -36,12 +36,16 @@ export interface ShellOverlays {
   llmSetup: boolean;
   /** 上网检索与抓取的后备池设置 */
   webSearch: boolean;
+  /** 代码平台（GitHub / Gitee）令牌与 SSH 身份 */
+  credentials: boolean;
   openConversations: () => void;
   closeConversations: () => void;
   openLlmSetup: () => void;
   closeLlmSetup: () => void;
   openWebSearch: () => void;
   closeWebSearch: () => void;
+  openCredentials: () => void;
+  closeCredentials: () => void;
 }
 
 const ShellServicesContext = createContext<ShellServices | null>(null);

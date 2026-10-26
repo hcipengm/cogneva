@@ -56,6 +56,7 @@ export default function App() {
   const [conversations, setConversations] = useState(false);
   const [llmSetup, setLlmSetup] = useState(false);
   const [webSearch, setWebSearch] = useState(false);
+  const [credentials, setCredentials] = useState(false);
 
   const openConversations = useCallback(() => setConversations(true), []);
   const closeConversations = useCallback(() => setConversations(false), []);
@@ -63,6 +64,8 @@ export default function App() {
   const closeLlmSetup = useCallback(() => setLlmSetup(false), []);
   const openWebSearch = useCallback(() => setWebSearch(true), []);
   const closeWebSearch = useCallback(() => setWebSearch(false), []);
+  const openCredentials = useCallback(() => setCredentials(true), []);
+  const closeCredentials = useCallback(() => setCredentials(false), []);
 
   const services = useMemo<ShellServices>(
     () => ({
@@ -77,12 +80,15 @@ export default function App() {
         conversations,
         llmSetup,
         webSearch,
+        credentials,
         openConversations,
         closeConversations,
         openLlmSetup,
         closeLlmSetup,
         openWebSearch,
         closeWebSearch,
+        openCredentials,
+        closeCredentials,
       },
     }),
     [
@@ -96,12 +102,15 @@ export default function App() {
       conversations,
       llmSetup,
       webSearch,
+      credentials,
       openConversations,
       closeConversations,
       openLlmSetup,
       closeLlmSetup,
       openWebSearch,
       closeWebSearch,
+      openCredentials,
+      closeCredentials,
     ]
   );
 

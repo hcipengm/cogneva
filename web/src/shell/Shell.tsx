@@ -12,6 +12,7 @@ import { useShell } from '@/shell/store';
 import { AgentsOverlay } from '@/overlay/AgentsOverlay';
 import { LlmSetupOverlay } from '@/overlay/LlmSetupOverlay';
 import { SearchFallbackOverlay } from '@/overlay/SearchFallbackOverlay';
+import { ContributionOverlay } from '@/overlay/ContributionOverlay';
 import { ViewFor } from '@/views/registry';
 
 /**
@@ -84,6 +85,10 @@ export function Shell() {
 
       {overlays.webSearch && (
         <SearchFallbackOverlay onClose={overlays.closeWebSearch} />
+      )}
+
+      {overlays.credentials && (
+        <ContributionOverlay onClose={overlays.closeCredentials} />
       )}
 
       {showLlmWizard && (

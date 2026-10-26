@@ -1,4 +1,9 @@
-import { getQuotaUsage, getSearchFallback, listEvalDatasets } from '@/api/client';
+import {
+  getContributionStatus,
+  getQuotaUsage,
+  getSearchFallback,
+  listEvalDatasets,
+} from '@/api/client';
 import { BarList } from '@/ui/plots';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
@@ -30,16 +35,17 @@ function capabilityLabel(capability: string): string {
  */
 export function SettingsView() {
   const { llm, overlays, signOut, username } = useServices();
-  const { openLlmSetup, openWebSearch } = overlays;
+  const { openLlmSetup, openWebSearch, openCredentials } = overlays;
   const datasets = useResource('评估集', listEvalDatasets, 120_000);
   const quota = useResource('额度', getQuotaUsage, 60_000);
   const searchFallback = useResource('上网后备', getSearchFallback, 60_000);
+  const contribution = useResource('代码平台', getContributionStatus, 60_000);
   // 额度跟着花销走：一轮话、一次运行结束就是又花了一笔。评估集只在有人增删时才变
   // ——那是 eval 前缀下的一次写。后备池同理：保存是 admin 前缀下的一次写，之后
   // 网关自己滚动，读回来才是新的那一份。三件事都不是任务状态，不该被任务帧拖着重读。
   useKindTickedRefresh(
     ['usage', resourceKey('quota'), resourceKey('eval'), resourceKey('admin')],
-    [datasets.refresh, quota.refresh, searchFallback.refresh]
+    [datasets.refresh, quota.refresh, searchFallback.refresh, contribution.refresh]
   );
   const sidebarVisible = useShell((s) => s.sidebarVisible);
   const toggleSidebar = useShell((s) => s.toggleSidebar);
@@ -56,6 +62,21 @@ export function SettingsView() {
   const poolWithKey = pool.filter((u) => u.has_key).length;
   // 顺序不是服务端的一条字段，它就是数组下标——数组的顺序就是被问的顺序。
   const poolRows = pool.map((u, i) => ({ ...u, order: i + 1 }));
+
+  const contrib = contribution.data;
+  const identity = contrib?.git_identity;
+  // 身份的三个状态各有各的下一步：ready 是终点，pending 是「密钥在、登记没确认」，
+  // absent 是还没连过。合成一句「已配置/未配置」会把中间那个状态读成终点。
+  const identityLabel =
+    identity === undefined
+      ? '…'
+      : identity.state === 'ready'
+        ? '已就绪'
+        : identity.state === 'pending'
+          ? '未确认'
+          : identity.state === 'unknown'
+            ? '读不到'
+            : '没有密钥';
 
   return (
     <ViewFrame
@@ -205,6 +226,68 @@ export function SettingsView() {
               {fromLlm.length === 0 && (
                 <> 现网在用的 LLM 没有自带的上网工具面，所以最后一层现在也是空的。</>
               )}
+            </p>
+          </>
+        )}
+      </section>
+
+      <section className="border-b border-[var(--line)]">
+        <header className="flex items-center gap-3 px-4 py-2">
+          <h2 className="text-[12px]">代码平台与凭据</h2>
+          <span className="text-[11px] text-[var(--muted)]">
+            GitHub / Gitee 的令牌与 SSH 身份；令牌只进安全网关，这一页读不回它
+          </span>
+          <div className="ml-auto">
+            <Button tone="accent" onClick={openCredentials}>
+              {contrib?.configured ? '管理连接' : '连接代码平台'}
+            </Button>
+          </div>
+        </header>
+        {contribution.error ? (
+          <ReadError what="代码平台" error={contribution.error} onRetry={contribution.refresh} />
+        ) : !contrib ? (
+          <Loading what="代码平台" />
+        ) : (
+          <>
+            <Readings
+              from={{ what: contribution.what, at: contribution.at }}
+              source="GET /api/v1/admin/contribution-status"
+              caveat="这一格说「连上了没有、钥匙停在哪一步」，不说「平台通不通」——通不通要真发一次请求才知道。"
+            >
+              <div className="flex flex-wrap py-2">
+                <Reading
+                  label="已连接平台"
+                  value={contrib.configured ? contrib.provider : '未连接'}
+                  tone={contrib.configured ? 'ok' : 'warn'}
+                />
+                <Reading
+                  label="SSH 身份"
+                  value={identityLabel}
+                  tone={
+                    identity?.state === 'ready'
+                      ? 'ok'
+                      : identity?.state === 'pending'
+                        ? 'warn'
+                        : 'plain'
+                  }
+                />
+                <Reading label="待提交变更" value={contrib.pending_count} />
+                <Reading label="回流策略" value={contrib.policy} />
+              </div>
+            </Readings>
+            {identity?.fingerprint && (
+              <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
+                公钥指纹 <span className="mono">{identity.fingerprint}</span>
+              </p>
+            )}
+            {identity?.note && (
+              <p className="px-4 py-2 text-[11px] text-[var(--warn)]">{identity.note}</p>
+            )}
+            <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
+              GitHub 设备码 {contrib.device_flow_available ? '可用' : '不可用（缺 OAuth App client_id）'}；
+              Gitee 授权码 {contrib.gitee_oauth_available ? '可用' : '不可用（缺 client_secret）'}；
+              两条都不可用时用粘贴令牌。凭据的写入都在浮层里完成，写完之后网关自己滚动，
+              读回来才是新状态。
             </p>
           </>
         )}

@@ -449,6 +449,136 @@ export async function saveSearchFallback(
   });
 }
 
+// ── 代码平台与凭据（GitHub / Gitee 令牌、SSH 身份） ──
+
+/**
+ * 网关的 git 身份。
+ *
+ * `state` 只认三个值加一个 unknown：`ready` 是「密钥在、状态位也是 ready、两半
+ * 对得上」；有私钥却没有状态位是 `pending`——**未确认**，不是已生效；读不到
+ * Secret 的进程（集群外面板）只能报 `unknown`，不能替网关说「没配」。
+ *
+ * 公钥与指纹是公开材料，回读没有风险；私钥与令牌从不回传，所以这里没有它们的
+ * 字段——缺字段就是这条规则，不是漏写。
+ */
+export interface GitIdentityStatus {
+  state: 'ready' | 'pending' | 'absent' | 'unknown';
+  public_key: string | null;
+  fingerprint: string | null;
+  token_present?: boolean;
+  repo_configured?: boolean;
+  needs_token?: boolean;
+  note: string | null;
+}
+
+export interface ContributionStatus {
+  configured: boolean;
+  provider: 'github' | 'gitee' | 'none';
+  github?: { configured: boolean };
+  gitee?: { configured: boolean };
+  ssh?: { key_present: boolean };
+  git_identity: GitIdentityStatus;
+  github_app_configured: boolean;
+  policy: string;
+  pending_count: number;
+  /** GitHub 设备码通道可用（有 OAuth App client_id） */
+  device_flow_available: boolean;
+  /** Gitee 授权码通道可用（有应用 client_id 与 client_secret） */
+  gitee_oauth_available: boolean;
+  gitee_oauth_secret_configured: boolean;
+  github_oauth_secret_configured: boolean;
+  note?: string;
+}
+
+export interface ContributionConnectResult {
+  ok: boolean;
+  status: string;
+  provider?: string;
+  account?: string;
+  ssh?: string;
+  message: string;
+}
+
+/** GitHub 设备码流程的第一步：把 user_code 给人，让他在验证页上填。 */
+export interface DeviceStart {
+  client_id: string;
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  expires_in: number;
+  interval: number;
+}
+
+/**
+ * 轮询的四种结局。`pending`／`slow_down` 是「人还没在浏览器里点完」，`error` 是
+ * 平台自己给的判词（过期、被拒绝），`connected` 是唯一可以停下的那一种。
+ */
+export type DevicePollResult =
+  | { status: 'pending'; interval?: number }
+  | { status: 'slow_down'; interval: number }
+  | { status: 'error'; message: string }
+  | { status: 'connected'; ok?: boolean; account?: string; ssh?: string; message?: string };
+
+export interface GiteeOAuthStart {
+  authorize_url: string;
+  state: string;
+  redirect_uri: string;
+}
+
+export async function getContributionStatus(): Promise<ContributionStatus> {
+  return api.get<ContributionStatus>('/api/v1/admin/contribution-status');
+}
+
+export async function startGithubDevice(): Promise<DeviceStart> {
+  return api.post<DeviceStart>('/api/v1/admin/contribution/device/start', {});
+}
+
+export async function pollGithubDevice(
+  client_id: string,
+  device_code: string
+): Promise<DevicePollResult> {
+  return api.post<DevicePollResult>('/api/v1/admin/contribution/device/poll', {
+    client_id,
+    device_code,
+  });
+}
+
+export async function startGiteeOAuth(redirect_origin: string): Promise<GiteeOAuthStart> {
+  return api.post<GiteeOAuthStart>('/api/v1/admin/contribution/gitee/oauth/start', {
+    redirect_origin,
+  });
+}
+
+/**
+ * 收尾授权码通道。`codeOrUrl` 既可以是裸码，也可以是授权后浏览器地址栏里那一整条
+ * 网址——用户复制哪一种都该能用，判断交服务端。
+ */
+export async function exchangeGiteeOAuth(
+  state: string,
+  codeOrUrl: string
+): Promise<ContributionConnectResult> {
+  const looksLikeUrl = /^https?:\/\//i.test(codeOrUrl.trim());
+  return api.post<ContributionConnectResult>(
+    '/api/v1/admin/contribution/gitee/oauth/exchange',
+    { state, ...(looksLikeUrl ? { redirect_url: codeOrUrl.trim() } : { code: codeOrUrl.trim() }) }
+  );
+}
+
+/** 手动令牌通道：GitHub 没配 OAuth App、或用户手里已经有 PAT 时用。 */
+export async function connectContribution(
+  provider: 'github' | 'gitee',
+  token: string
+): Promise<ContributionConnectResult> {
+  return api.post<ContributionConnectResult>('/api/v1/admin/contribution-config', {
+    provider,
+    token,
+  });
+}
+
+export async function disconnectContribution(): Promise<ContributionConnectResult> {
+  return api.post<ContributionConnectResult>('/api/v1/admin/contribution/disconnect', {});
+}
+
 // ── 令牌花销（按 actor，读耐久 rollup） ──
 
 /** 一条 `(actor, origin, upstream, 协议)` 的花销汇总行。 */
