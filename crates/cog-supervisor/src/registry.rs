@@ -22,6 +22,12 @@ pub const DEFAULT_HEARTBEAT_TTL_SECONDS: u64 = 30;
 /// declares a lifetime longer than any interval a person would keep between
 /// those asks. Its record is the answer to "is the owner here", read as a
 /// timestamp, so it is not evidence about whether a supervised agent is alive.
+///
+/// This role takes a unit out of the health verdict by NAME, not by where it
+/// runs: anything that writes this role leaves supervision entirely, including
+/// a platform-side unit that was given the wrong role. There is one writer
+/// today, which is why that is acceptable; adding another means widening the
+/// hole deliberately, not inheriting it from a harmless-looking `continue`.
 pub const EXTERNAL_WORKER_ROLE: &str = "external-worker";
 pub const HEARTBEAT_HISTORY_MAX: usize = 1000;
 
