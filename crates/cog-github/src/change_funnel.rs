@@ -37,8 +37,10 @@ pub use cog_core::metric_names::CHANGE_FUNNEL as CHANGE_FUNNEL_METRIC;
 ///
 /// The number matches the durable pool gauges' own heartbeat for the same
 /// reason it exists there: one cadence for "unchanged but still observed" is
-/// easier to hold than two, and the readers of both are compared to it.
-pub const CENSUS_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1800);
+/// easier to hold than two, and the readers of both are compared to it. That
+/// is why the value is declared once, in the crate both of them build on,
+/// rather than copied here.
+pub use cog_core::reading_cadence::UNCHANGED_READING_HEARTBEAT as CENSUS_HEARTBEAT;
 
 /// Whether a census cell needs a row now.
 ///

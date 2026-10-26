@@ -12,6 +12,7 @@ pub mod fs_size;
 pub mod git_budget;
 pub mod loop_health;
 pub mod observability_text;
+pub mod reading_cadence;
 pub mod secrets;
 pub mod token_estimate;
 pub mod types;

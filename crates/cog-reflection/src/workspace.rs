@@ -56,8 +56,9 @@ pub use cog_core::metric_names::WORKTREE_INDEX_SAMPLE_INCOMPLETE as WORKTREE_IND
 /// 每天有一两次连着约两个半小时的静默，静默期间当值还在。心跳把这个空档封在写者自己
 /// 的钟上：一轮没动也盖一次章，界于是可以对一条已知的节奏比较，而不是对"没事就不写"猜。
 ///
-/// 值与普查、耐久池两处同拍：一个"没变但仍在被观测"的节奏全系统一个值。
-pub const INDEX_SAMPLE_HEARTBEAT: Duration = Duration::from_secs(1800);
+/// 值与普查、耐久池两处同拍：一个"没变但仍在被观测"的节奏全系统一个值——所以这个值
+/// 只有一处声明，在三处之间搬一份数字就是在等它们漂开。
+pub use cog_core::reading_cadence::UNCHANGED_READING_HEARTBEAT as INDEX_SAMPLE_HEARTBEAT;
 
 /// 这棵常驻工作树的索引现在要不要重采一次。
 ///

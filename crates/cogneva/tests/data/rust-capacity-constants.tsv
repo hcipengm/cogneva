@@ -100,6 +100,7 @@ crates/cog-core/src/contract/taste.rs	TASTE_SUBJECT_MAX_CHARS	512	bound	a subjec
 crates/cog-core/src/contract/taste.rs	TASTE_TEXT_MAX_CHARS	2_000	bound	these fields are inlined into the goal and copied into every later change, so the bound is on the submission, not on the row as stored
 crates/cog-core/src/git_budget.rs	GIT_TIMEOUT_FLOOR_SECS	120	bound	the ceiling before any git command here has completed; only this is available
 crates/cog-core/src/git_budget.rs	GIT_TIMEOUT_MULTIPLE	10	derived	multiple of the slowest git command that has completed; the corpse age is twice it
+crates/cog-core/src/reading_cadence.rs	UNCHANGED_READING_HEARTBEAT	1800s	unreviewed	
 crates/cog-core/src/token_estimate.rs	CHARS_PER_TOKEN	4	unreviewed	
 crates/cog-core/src/token_estimate.rs	ENGLISH_WORD_TOKENS	4	unreviewed	
 crates/cog-eval/src/adapters/swe_pro.rs	MAX	5	bound	at most five test names in a verdict; the rest are counted, not listed
@@ -364,7 +365,6 @@ crates/cog-reflection/src/volume_capacity.rs	MIN_INTERVAL_SECS	300	bound	floor o
 crates/cog-reflection/src/volume_capacity.rs	PEAK_ROUNDS	6	unreviewed	
 crates/cog-reflection/src/volume_capacity.rs	REFUSAL_COOLDOWN_SECS	3600	bound	an API refusal is a property of the StorageClass, so an hour before asking again
 crates/cog-reflection/src/workspace.rs	DEFAULT_EPHEMERAL_TTL	21600s	bound	fallback when no config supplies one; cog-core's ephemeral_ttl_secs and cog-extension spell the same 6h
-crates/cog-reflection/src/workspace.rs	INDEX_SAMPLE_HEARTBEAT	1800s	unreviewed	
 crates/cog-reflection/src/workspace.rs	ORPHAN_MIN_AGE	900s	bound	several multiples of the default termination grace; under RWO+Recreate the real overlap is near zero
 crates/cog-storage/src/backends/file_trace_store.rs	MAX_SAFE_LEN	180	bound	well under the filesystem's 255-byte name limit, leaving room for .trace and .meta.json
 crates/cog-storage/src/backends/object_backends.rs	MAX_PAGES	10_000	bound	a page-count ceiling so a cursor that keeps truncating cannot spin forever

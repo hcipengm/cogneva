@@ -1626,8 +1626,9 @@ struct PoolObservability {
 /// 它是**读者侧窗口的下限**：值不变就不再写，所以"最近 W 内的采样里必有
 /// 一条记录"当且仅当 `W > 这个周期`——W 小于它时，一个健康的网关在两次心跳
 /// 之间就能让这条判据成真。窗口与这个常数的关系由 `cogneva` 的告警规则契约
-/// 测试读这里核对，不靠人记得。
-pub const DURABLE_GAUGE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1800);
+/// 测试读这里核对，不靠人记得。值本身在 `cog_core` 声明一处——普查与工作树索引采样
+/// 两条心跳读的是同一个值，各写一份就是等它们漂开。
+pub use cog_core::reading_cadence::UNCHANGED_READING_HEARTBEAT as DURABLE_GAUGE_HEARTBEAT;
 
 /// 走上面那条心跳门控的序列，按名字列出。
 ///
