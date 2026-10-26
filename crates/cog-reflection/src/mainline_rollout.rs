@@ -2196,7 +2196,8 @@ impl RolloutExecutor {
         first_admission_shortfall(&quotas, &old_limits, &new_limits, surges)
     }
 
-    /// Wait, up to a minute, for pods that are already shutting down to leave.
+    /// Wait, up to a couple of minutes, for pods that are already shutting down
+    /// to leave.
     ///
     /// Returns whether the wait happened at all: `true` means the namespace had
     /// pods with a deletion timestamp and some of them went away, so the caller
@@ -2208,7 +2209,15 @@ impl RolloutExecutor {
     /// that never starts. Unreadable listings return immediately, the same way
     /// an unreadable figure holds nothing back elsewhere in this judgement.
     async fn wait_out_terminating_pods(&self) -> bool {
-        const BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+        // The only thing bounding how long a terminating pod may stay is its own
+        // grace period, which nothing in this tree sets and so is the platform
+        // default of 30s. A budget of a few grace periods outlasts the pods this
+        // is waiting for even when their shutdown runs the clock out. Being
+        // generous is cheap here because the wait is paid at most once and only
+        // on a path that already said "no": if the ceiling really is exceeded,
+        // this attempt is refused anyway, so the wait costs seconds, while
+        // giving up early costs a whole retry round.
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
         const POLL: std::time::Duration = std::time::Duration::from_secs(5);
         let started = std::time::Instant::now();
         let mut waited = false;
