@@ -762,7 +762,7 @@ impl DagExecutorRuntime {
         let Some(&budget) = budgets.and_then(|budgets| budgets.get(&task.id)) else {
             return false;
         };
-        if task.started_at.is_none() && task.retry_count == 1 {
+        if task.started_at.is_none() && task.retry_count == 0 {
             return false;
         }
         let Some(gateway) = self.observability.get() else {
