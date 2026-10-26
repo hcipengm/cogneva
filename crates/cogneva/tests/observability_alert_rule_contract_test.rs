@@ -1385,6 +1385,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "宿主侧生产者 `scripts/host/cogneva-acceptance-census-reading.sh`（不在本仓，登记行 `acceptance_census`），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出。年龄由生产者自己算：快照里的 `taken_at` 是同一台机上跑完那一趟普查时写的，减它的是同一台机的钟；把 `taken_at` 当序列交给 Prometheus 再减 `time()`，减的是另一台机的钟，两边时钟源不同时，「普查停了多久」会随漂移假响或假静。这一格是 `CognevaAcceptanceCensusOld` 唯一能问的问题：判词那一族只说得清这一趟判了什么，说不清这一趟是多久以前的——而一份停在三天前的 all-ok 与一份刚跑完的 all-ok 在判词上是同一句话",
     ),
     (
+        "cogneva_acceptance_landed_unjudgeable",
+        "同一生产者（最新一趟普查里，状态写着「已落」、而判据跑不出判词的条数，只含 `unjudged`／`no-command`／`missing-script` 三种）。`cogneva_acceptance_items` 答不了这一问，因为它的标签只有 `verdict`、没有「这一行自己说没说已落」那一维：一条 check 写成散文却声明已落，与一条还没开工的条目在那一族里同样落在 `unjudged` 里，于是「规格在说谎」被读成「活还没干完」。反过来也不能拿 `unjudged` 整体当这一问的分母——多数 unjudged 是未落条目的正常形态，把它们算进去这条规则会天天响。三种成因（散文／没给命令／点名的脚本不存在）合成一格，因为修法都在那一条判据自己身上；`missing-binary` 与 `timeout` 不进这一问（前者归装置、后者是判据该拆）。旧快照没有这一格时序列不出现，而不是印 0——缺字段与「查过、一条都没有」不是同一个事实",
+    ),
+    (
         "cogneva_backup_package_owner_uid",
         "持久化存储面生产者 `scripts/host/cogneva-backup-package-owner-reading.sh`（不在本仓），经聚合器以 `job=\"cogneva-host-readings\"` 暴露。它读的是账本 `backup_runs` 里最新一行 `outcome='ok'` 点名的那个包在卷上的属主：包是恢复唯一能读的东西，属主决定「谁能读」，而备份面此前所有判据都不读它。裸 gauge，不拿包名当标签——包名一天一条，是标签最不该长的形状",
     ),

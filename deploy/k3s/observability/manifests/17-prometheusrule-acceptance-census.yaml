@@ -1,12 +1,14 @@
-# 验收普查（`cogneva_acceptance_items`）自己的三条告警。
+# 验收普查（`cogneva_acceptance_items`）自己的四条告警。
 #
 # 为什么需要：这条读数生产者、读数面、夹具都有，却没有任何规则读它——普查今天变红
 # 也不会自己叫人。「四环缺一不算打通」缺的就是这一环。
 #
-# 三条**分开写**，因为三种坏的修法完全不同：
+# 四条**分开写**，因为四种坏的修法完全不同：
 #   一、有验收项与它自己的判据不符（规格在说谎）→ 改规格或改代码；
 #   二、读数整条不见了（生产者崩了、快照读不到）→ 修读数通道；
-#   三、读数还在但不再更新（停产的 beat 一直发最后一行）→ 修普查的刷新。
+#   三、读数还在但不再更新（停产的 beat 一直发最后一行）→ 修普查的刷新；
+#   四、规格说这一条已经落了，而它的判据跑不出判词（散文／没有命令／路径不存在）
+#       → 改那一条的判据，或者把它的状态改回未落。
 # 前两条合成一条会栽在同一个形状上：生产者整个停掉时，`stale` 那条表达式返回空集、
 # 不响——「缺席」被读成「干净」。这个形状今天已经在别处栽过三次。
 #
@@ -14,7 +16,7 @@
 # 规则单测里的 `time()` 是真实钟，夹具写不出「已经停了 40 分钟」，测试会在半小时后
 # 自己变红。年龄由生产者按自己的钟算好发布，夹具就能钉住。
 #
-# 三条都带 `cogneva_io_managed`（抄进 `alerts` 表）与 `cogneva_io_face`（响了归哪个面）。
+# 四条都带 `cogneva_io_managed`（抄进 `alerts` 表）与 `cogneva_io_face`（响了归哪个面）。
 # 面是规则自己的性质，随告警行流进 `alerts.labels`；「面 → 人」那一跳不在这里，由读的人
 # 在面主表上 join——面主换人时不该有任何一条规则需要改。
 apiVersion: monitoring.coreos.com/v1
@@ -78,3 +80,26 @@ spec:
           annotations:
             summary: "验收普查最后一趟在 {{ $value | humanizeDuration }} 以前，读数不再更新"
             description: "刷新没跑成：看 `journalctl --user -u cogneva-host-readings -n 100` 里的 `refresh=` 行——`refresh=failed` 带原因，`refresh=skipped reason=in_progress` 说明两拍在抢同一把锁。此刻看到的判词是上一趟的，不是现在。"
+
+        # 四、规格说这一条已经落了，而它的判据跑不出判词。只收三种成因：判据是散文
+        # （unjudged）、判据没给出命令（no-command）、判据点名的脚本不存在（missing-script）。
+        # 这三种的修法都在**那一条判据自己身上**，所以合成一问。`missing-binary`（这台机器
+        # 没装那件工具，归装置）、`timeout`（判据本身太重，要拆）、`error`（文件模式）不进这一问。
+        #
+        # 为什么 `stale` 覆盖不了它：`stale` 要判据**跑起来并判红**；判据压根跑不起来时，
+        # 这一项既不进 `stale` 也不进 `ok`，会一直躲在 `unjudged` 里——验收表看上去只是
+        # 「还有些没收尾」，看不出有条目已经声称落地却没人能验证。前者是「判据说不过」，
+        # 这一条是「判据说不出话」。
+        #
+        # 30 分钟＝两拍普查（刷新预算 900 秒）：把一条 check 从散文改成命令的编辑期间会
+        # 短暂落进这一问，界比一次编辑长、比一次巡检短。
+        - alert: CognevaAcceptanceLandedUnjudgeable
+          expr: max (cogneva_acceptance_landed_unjudgeable) > 0
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "落地≠生效"
+            severity: warning
+          annotations:
+            summary: "有 {{ $value }} 条验收项，规格说它已经落了，而它的判据跑不出判词"
+            description: "判据自身的问题，不是代码：散文当判据（unjudged）、判据没给出命令（no-command）、或判据点名的脚本不存在（missing-script）。跑 `bash scripts/host/cogneva-acceptance-census-reading.sh` 看 `landed_unjudgeable` 那一格，再按普查快照里 `verdict` 为这三种的条目逐条点名；修法是把那一条的 check 写成能跑的命令，或者把它的状态改回未落。"

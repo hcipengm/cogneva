@@ -1,4 +1,4 @@
-# promtool 规则单测：验收普查那三条告警**真的会 firing**，不是「表达式算出来非零」。
+# promtool 规则单测：验收普查那四条告警**真的会 firing**，不是「表达式算出来非零」。
 #
 # 为什么必须有这一层：两条结构门（subjects / join-shape）只看表达式的形状，一条把
 # `for:` 写成 `for: 15y` 或者把窗口写成 `[0m]` 的规则在它们眼里完全合法，而它永远不会
@@ -109,3 +109,42 @@ tests:
               severity: warning
               cogneva_io_managed: "true"
               cogneva_io_face: "落地≠生效"
+
+  # 五、规格说它已落、判据却说不出话：`landed_unjudgeable` 从 0 跳到 3，`for: 30m` 之前
+  # 必须是空，之后必须 firing。反向证据在这一格里有两条：20m 时还空（不是一有数就响），
+  # 以及同一份输入下 `stale` 不许跟着响（判据说不出话不是判据说不过）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_landed_unjudgeable'
+        values: '0x10 3x40'
+      - series: 'cogneva_acceptance_items{verdict="ok"}'
+        values: '80x50'
+      - series: 'cogneva_acceptance_age_seconds'
+        values: '30x50'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaAcceptanceLandedUnjudgeable
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: CognevaAcceptanceLandedUnjudgeable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "落地≠生效"
+      - eval_time: 45m
+        alertname: CognevaAcceptanceSpecStale
+        exp_alerts: []
+
+  # 六、负对照：`landed_unjudgeable` 一直是 0，这条规则全程不许响。
+  # 没有这一格，把表达式写成 `>= 0` 也能过上面那一格。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_landed_unjudgeable'
+        values: '0x60'
+      - series: 'cogneva_acceptance_age_seconds'
+        values: '30x60'
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: CognevaAcceptanceLandedUnjudgeable
+        exp_alerts: []
