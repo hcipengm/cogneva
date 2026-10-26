@@ -380,9 +380,11 @@ mod tests {
         }
     }
 
-    struct CaptureOverBudget(Arc<Mutex<Vec<OverBudgetFields>>>);
+    /// 每一行事件都先收下来，判定留给 `capture`：那一层只认得被测那一句时，
+    /// 就看不出「这一趟到底有没有收全」。
+    struct CaptureAll(Arc<Mutex<Vec<OverBudgetFields>>>);
 
-    impl<S: tracing::Subscriber> Layer<S> for CaptureOverBudget {
+    impl<S: tracing::Subscriber> Layer<S> for CaptureAll {
         fn on_event(
             &self,
             event: &tracing::Event<'_>,
@@ -390,14 +392,101 @@ mod tests {
         ) {
             let mut seen = OverBudgetFields::default();
             event.record(&mut seen);
-            if seen
-                .message
-                .as_deref()
-                .is_some_and(|m| m.starts_with("the context window goes out over budget"))
-            {
+            if seen.message.is_some() {
                 self.0.lock().unwrap().push(seen);
             }
         }
+    }
+
+    /// 被测那句话的开头：超预算那一条唯一的价值是指出例外，按它取出来。
+    const OVER_BUDGET: &str = "the context window goes out over budget";
+
+    /// 哨兵：跟被测那句一样走「按级别过滤」的采集面，所以它收得到，才说明这一趟
+    /// 的采集面是通的。
+    const SENTINEL: &str = "cog-agent context capture sentinel";
+
+    /// 一个什么都不做、但对每个调用点都答「也许」的订阅者，测试进程里只装一次。
+    ///
+    /// tracing 把「这个调用点要不要发」按调用点缓存成全进程的兴趣位，而这个位是
+    /// 由当时在场的订阅者算出来的：本库很多用例都会经过同一个调用点，它们在没有
+    /// 订阅者的线程上先经过一次，就把它写死成「不要」；之后这两条用例再装一层
+    /// 按级别过滤的订阅者，也是一条都收不到——实测并行跑 0 条、单跑 2 条，红的
+    /// 是调度顺序，不是被测的行为。装一次「也许」的全局订阅者，把那个位钉在
+    /// 「也许」上，之后就只由线程自己的层决定发不发。
+    struct AlwaysMaybe;
+
+    impl tracing::Subscriber for AlwaysMaybe {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, _event: &tracing::Event<'_>) {}
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    fn pin_interest() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // 装不上（别的用例先装了全局订阅者）不是这里的失败：那时兴趣位由
+            // 那个订阅者决定，哨兵会立刻把「收不收得到」说清楚。
+            let _ = tracing::subscriber::set_global_default(AlwaysMaybe);
+        });
+    }
+
+    /// 装订阅者这件事是全进程的：两条用例同时装层时，一边的注册会重算另一边的
+    /// 兴趣位。串行起来，顺带让「一次一条」的读数不被另一条的层读走。
+    static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 在「按级别过滤」的订阅者下跑一次 `body`，返回这一趟收到的超预算事件与
+    /// `body` 的返回值。
+    ///
+    /// 每趟先发一条哨兵，跟被测那句走同一道按级别过滤的闸：哨兵收得到才认这一趟
+    /// 的读数。收不到就再试一趟（兴趣位刚被别的线程改写时，这一趟的层还没被问
+    /// 到）；20 趟都不通就响——那时是采集面真装不上，既不该判绿，也不该把红挂在
+    /// 被测的那一行上。
+    fn capture<T>(body: impl Fn() -> T) -> (Vec<OverBudgetFields>, T) {
+        pin_interest();
+        for _ in 0..20 {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            // 装一层**按级别过滤**的订阅者：采集面装的就是 `COGNEVA_LOG_LEVEL`
+            // 那一级（部署里是 info），所以断言必须经过同一道闸——不然把它写回
+            // `debug!`（今天那行就是这么被挡在采集面之外的）这条用例照样绿。
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::INFO)
+                .with(CaptureAll(captured.clone()));
+            let value = tracing::subscriber::with_default(subscriber, || {
+                tracing::info!("{SENTINEL}");
+                body()
+            });
+            let seen = captured.lock().unwrap().clone();
+            if !seen
+                .iter()
+                .any(|ev| ev.message.as_deref() == Some(SENTINEL))
+            {
+                continue;
+            }
+            let over_budget = seen
+                .into_iter()
+                .filter(|ev| {
+                    ev.message
+                        .as_deref()
+                        .is_some_and(|m| m.starts_with(OVER_BUDGET))
+                })
+                .collect();
+            return (over_budget, value);
+        }
+        panic!("采集面 20 趟都没收到哨兵：过滤订阅者没装上，这一趟判不了被测的那一行");
     }
 
     /// 裁到底仍超预算时，这一轮必须**被自己报出来**，且报的是能拿去对账的三个数。
@@ -408,14 +497,8 @@ mod tests {
     /// 「预算该不该抬」——那是另一条。
     #[test]
     fn a_window_that_cannot_trim_to_budget_reports_its_excess() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        // 装一层**按级别过滤**的订阅者：采集面装的就是 `COGNEVA_LOG_LEVEL`
-        // 那一级（部署里是 info），所以断言必须经过同一道闸——不然把它写回
-        // `debug!`（今天那行就是这么被挡在采集面之外的）这条用例照样绿。
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::filter::LevelFilter::INFO)
-            .with(CaptureOverBudget(captured.clone()));
-        let observed = tracing::subscriber::with_default(subscriber, || {
+        let _serial = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (seen, observed) = capture(|| {
             // 地板本身就超预算：两条消息，循环的 `len() > 2` 立刻为假。
             let mut ctx = ContextWindow::new(10);
             ctx.add_message(Message::system("系统提示词 很长 ".repeat(4)));
@@ -428,7 +511,6 @@ mod tests {
             ctx.token_count()
         });
 
-        let seen = captured.lock().unwrap().clone();
         // 一次 `add_message` 报一条（每条消息加进来都各裁一次），所以条数对得上
         // 「结束在预算之外的那几次调用」；这里两条都对得上，没多报也没漏报。
         assert_eq!(seen.len(), 2, "每条落在预算外的入队各报一条：{seen:?}");
@@ -452,14 +534,8 @@ mod tests {
     /// 而它唯一的价值就是指出例外。
     #[test]
     fn a_window_that_trims_to_budget_reports_no_excess() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        // 装一层**按级别过滤**的订阅者：采集面装的就是 `COGNEVA_LOG_LEVEL`
-        // 那一级（部署里是 info），所以断言必须经过同一道闸——不然把它写回
-        // `debug!`（今天那行就是这么被挡在采集面之外的）这条用例照样绿。
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::filter::LevelFilter::INFO)
-            .with(CaptureOverBudget(captured.clone()));
-        let over = tracing::subscriber::with_default(subscriber, || {
+        let _serial = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (over_budget, over) = capture(|| {
             let mut ctx = ContextWindow::new(200);
             ctx.add_message(Message::system("系统提示词"));
             ctx.add_message(Message::user("任务输入"));
@@ -482,9 +558,8 @@ mod tests {
         });
         assert!(over <= 200);
         assert!(
-            captured.lock().unwrap().is_empty(),
-            "裁得下来的窗口报了超额：{:?}",
-            captured.lock().unwrap()
+            over_budget.is_empty(),
+            "裁得下来的窗口报了超额：{over_budget:?}"
         );
     }
 
