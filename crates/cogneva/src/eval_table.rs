@@ -20,9 +20,9 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 
-/// 给文件算 sha256 时一次读多少：64 KiB。
+/// 给文件算 sha256 时一次读多少：默认 64 KiB。
 ///
-/// 整块读让哈希只受磁盘顺序读限制，64 KiB 是页缓存友好的块大小。
+/// 整块读让哈希只受磁盘顺序读限制，默认的 64 KiB 是页缓存友好的块大小。
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
 
 /// 抓一次 /metrics 的墙：5s。
