@@ -253,6 +253,22 @@ export function SearchFallbackOverlay({ onClose }: { onClose: () => void }) {
 
   const fromLlm = status?.from_llm ?? [];
 
+  /**
+   * 能点出来的那几家，由服务器说了算。
+   *
+   * `PRESETS` 只是这几家的展示信息（名字、默认地址、能力、说明），**不是**「能配哪
+   * 几种形状」的声明——那张表在服务端，写面收什么由它决定。在这里按自己那份名单
+   * 画按钮的话，两边会各自自报成功一次：页面上点得出来、保存被拒；或者服务端加了
+   * 一种形状、页面上永远点不到。读回来的 `shapes` 有就用它，没有（老网关或读取
+   * 失败）才退回本地那三家，免得页面整个空掉。
+   */
+  const offered = (
+    status?.shapes?.length ? status.shapes : PRESETS.map((p) => p.shape)
+  ).map(
+    (shape) =>
+      presetOf(shape) ?? { shape, label: shape, base_url: '', capability: 'search', note: '' }
+  );
+
   return (
     <div className="absolute inset-0 z-50 flex items-center justify-center bg-slate-950/90 backdrop-blur-sm">
       <form
@@ -296,7 +312,7 @@ export function SearchFallbackOverlay({ onClose }: { onClose: () => void }) {
           <div className="mb-2 flex items-center justify-between">
             <h2 className="text-sm font-medium text-slate-300">第三方后备（按顺序问）</h2>
             <div className="flex gap-2">
-              {PRESETS.map((p) => (
+              {offered.map((p) => (
                 <button
                   key={p.shape}
                   type="button"
