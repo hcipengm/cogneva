@@ -91,6 +91,14 @@ What this deliberately does not catch:
   * Sharing some other service (a Redis, a queue) without saying
     `COGNEVA_TEST_DATABASE_URL` is out of scope: the population is decided by
     what the file itself declares, not guessed.
+  * The population condition is "these bytes appear in this file". A test that
+    takes its pool from a shared helper -- `tests/common/`, a crate-local
+    fixture -- without naming the variable drops out of the population, and
+    nothing in the summary would show it: `test_files` and `src_test_modules`
+    count what the globs found, not what they missed. Today every shared-database
+    file names the variable itself, so the count is whole; the trigger for
+    widening the rule is the second test that gets its pool by inheritance, not
+    the first.
 
 Exit codes: 0 nothing to report; 1 violations named one by one; 3 nothing was
 judged (no test files, or no shared-database file among them).
