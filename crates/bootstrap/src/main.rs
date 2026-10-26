@@ -1814,50 +1814,43 @@ async fn render_distributor_manifest() -> Result<String> {
         .replace("__IMAGE_TAG__", env!("CARGO_PKG_VERSION")))
 }
 
-/// 集群内 registry 的节点端口，读自清单刚 apply 出来的那个 Service。
+/// 一只 Service 上某个具名端口的字段，读自清单刚 apply 出来的那只对象。
 ///
-/// 端口名取 `registry` 而不是取第一个：同一个 Service 上还挂着监控抓取面
-/// （`http`），序号是排版，名字才是声明。
-async fn registry_node_port() -> Result<u16> {
+/// 端口名取名字而不取第一个：同一个 Service 上挂着好几个端口，序号是排版，名字
+/// 才是声明。`field` 是 `nodePort` 或 `port`——读哪个由调用方决定，怎么读只有一份。
+async fn declared_service_port(service: &str, port_name: &str, field: &str) -> Result<u16> {
+    let selector = format!("jsonpath={{.spec.ports[?(@.name==\"{port_name}\")].{field}}}");
     let out = Command::new("kubectl")
-        .args([
-            "-n",
-            "cogneva",
-            "get",
-            "svc",
-            "cogneva-registry",
-            "-o",
-            "jsonpath={.spec.ports[?(@.name==\"registry\")].nodePort}",
-        ])
+        .args(["-n", "cogneva", "get", "svc", service, "-o", &selector])
         .stdin(Stdio::null())
         .output()
         .await
-        .context("无法执行 kubectl get svc cogneva-registry")?;
+        .with_context(|| format!("无法执行 kubectl get svc {service}"))?;
     if !out.status.success() {
         bail!(
-            "读不到集群内 registry 的 Service（kubectl 退出码 {:?}）：{}",
+            "读不到 Service {service}（kubectl 退出码 {:?}）：{}",
             out.status.code(),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    parse_registry_node_port(&String::from_utf8_lossy(&out.stdout))
+    let what = format!("Service {service} 的 `{port_name}` 端口的 {field}");
+    parse_declared_port(&String::from_utf8_lossy(&out.stdout), &what)
 }
 
 /// 把那条读数判成一个端口，或者带着它读到的原样报错。
 ///
-/// 空串是「Service 在、那个端口却没有 nodePort」，与「读不到 Service」是两回事，
-/// 但两者都必须响：给一个默认端口，播种就送进一个没人拨的地址，而它自己会报成功。
-fn parse_registry_node_port(reading: &str) -> Result<u16> {
+/// 空串是「Service 在、那个端口却没有这个字段」，与「读不到 Service」是两回事，
+/// 但两者都必须响：给一个默认端口，调用方就送进一个没人拨的地址，而它自己会报成功。
+fn parse_declared_port(reading: &str, what: &str) -> Result<u16> {
     let text = reading.trim();
     let port: u16 = text.parse().with_context(|| {
         format!(
-            "集群内 registry 的 Service 没给出节点端口（读到 {text:?}）：清单里的 registry \
-             不是 NodePort 形态，或 chart 的 clusterRegistry.nodePort 没渲染进 Service；\
-             四部署 pin 的就是这个端口，播种不能猜"
+            "{what}没读出来（读到 {text:?}）：清单里这个 Service 不是那个形态，或者对应的 \
+             values 没渲染进它；这一路不能猜一个数往下走"
         )
     })?;
     if port == 0 {
-        bail!("集群内 registry 的节点端口读成 0（读到 {text:?}）：这不是一个能拨的端口");
+        bail!("{what}读成 0（读到 {text:?}）：这不是一个能拨的端口");
     }
     Ok(port)
 }
@@ -1905,7 +1898,7 @@ async fn seed_cluster_registry() -> Result<()> {
     // 抄下来的数写在今天是对的，chart 改了 `clusterRegistry.nodePort` 之后就把基镜像
     // 推进一个没人听的端口，而四部署 pin 的还是清单里那个新数——播种报成功、Pod 一直
     // ImagePullBackOff。读的是 kubelet 将要拨的同一个 Service，两处不可能分开。
-    let node_port = registry_node_port().await?;
+    let node_port = declared_service_port("cogneva-registry", "registry", "nodePort").await?;
     let remote = format!("localhost:{node_port}/cogneva:local");
     let object = "localhost/cogneva:local";
     for attempt in 1..=3 {
@@ -3400,11 +3393,22 @@ async fn open_browser(url: &str) {
 /// 到达宿主浏览器；裸 Linux 上则直接对外提供 WebUI 入口。
 /// 端口已在监听则跳过；失败仅告警并打印手动命令，不影响自毁退出。
 async fn ensure_port_forward(webui: &str) {
+    // 宿主这一侧监听哪个端口取自 WebUI 地址（操作者要看的那条 URL），Service 那一侧
+    // 的端口取自 Service 自己：`8080` 曾经写死在这里，等于把 `gateway.httpPort` 抄了
+    // 一份——values 挪了端口之后，port-forward 把浏览器转到 Service 上没有的端口，
+    // 而这条命令自己报「已建立」。
+    let target = match declared_service_port("cogneva", "http", "port").await {
+        Ok(port) => port,
+        Err(e) => {
+            warn!("读不到 svc/cogneva 的 http 端口，这次不建 port-forward：{e:#}");
+            return;
+        }
+    };
     let port = webui
         .rsplit(':')
         .next()
         .and_then(|s| s.trim_end_matches('/').parse::<u16>().ok())
-        .unwrap_or(8080);
+        .unwrap_or(target);
     if tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .is_ok()
@@ -3412,7 +3416,7 @@ async fn ensure_port_forward(webui: &str) {
         info!("端口 {port} 已在监听，跳过 port-forward");
         return;
     }
-    let spec = format!("{port}:8080");
+    let spec = format!("{port}:{target}");
     match Command::new("kubectl")
         .args([
             "-n",
@@ -3428,7 +3432,7 @@ async fn ensure_port_forward(webui: &str) {
         .stderr(Stdio::null())
         .spawn()
     {
-        Ok(_) => info!("已后台建立 port-forward: 0.0.0.0:{port} → svc/cogneva:8080"),
+        Ok(_) => info!("已后台建立 port-forward: 0.0.0.0:{port} → svc/cogneva:{target}"),
         Err(e) => warn!(
             "自动 port-forward 失败（{e}），请手动执行: \
              kubectl -n cogneva port-forward --address 0.0.0.0 svc/cogneva {spec}"
@@ -4400,15 +4404,27 @@ mod registry_port_tests {
     /// 而播种自己报成功。所以读不到端口时必须是错误——不是回落到那个旧数。
     #[test]
     fn a_missing_node_port_is_an_error_not_a_default() {
+        let what = "Service cogneva-registry 的 `registry` 端口的 nodePort";
         for reading in ["", "  ", "0", "abc"] {
-            let err = parse_registry_node_port(reading)
+            let err = parse_declared_port(reading, what)
                 .expect_err(&format!("{reading:?} 不该判出一个端口"))
                 .to_string();
             assert!(
-                err.contains("节点端口"),
-                "报错要点名端口，读到 {reading:?} 时是：{err}"
+                err.contains("nodePort"),
+                "报错要点名读的是哪个字段，读到 {reading:?} 时是：{err}"
             );
         }
-        assert_eq!(parse_registry_node_port("30500\n").unwrap(), 30500);
+        assert_eq!(parse_declared_port("30500\n", what).unwrap(), 30500);
+    }
+
+    /// port-forward 的目标端口同样只有一条来源：`svc/cogneva` 上那个具名端口。
+    ///
+    /// 这里曾经写死 `:8080`（chart 的 `gateway.httpPort`）：values 挪了端口之后，
+    /// port-forward 把宿主浏览器转到 Service 上没有的端口，而这条命令自己报「已建立」。
+    #[test]
+    fn the_port_forward_target_is_read_from_the_service_not_written_down() {
+        let what = "Service cogneva 的 `http` 端口的 port";
+        assert_eq!(parse_declared_port("8080", what).unwrap(), 8080);
+        assert!(parse_declared_port("", what).is_err());
     }
 }
