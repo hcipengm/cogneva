@@ -1160,7 +1160,39 @@ rows:
   # 运行期自建 Pod 那部分额度没有行，因为它没有一个写在 values 里的数：评测台
   # 创建 Pod 前按自己那份清单算出它占多少、把额度抬到装得下，跑完放回去——尺寸
   # 的唯一来源是建它的代码，跟着它变，没有第二处可漂。`runtimeWorkloads` 留给
-  # 不由产品创建、也不会自己抬额度的那类 Pod；今天它是空的，所以这里没有行。
+  # 不由产品创建、也不会自己抬额度的那类 Pod：其中的形状在这里有行（见下）。
+  #
+  # 这一族没有测量面可跟：那台 Pod 由宿主脚本 `scripts/host/eval-registered-rerun.sh`
+  # 直接 apply，它不认识命名空间额度，也不会把自己的占用报给任何人。所以四个数
+  # 只能登记成 override——写的是"谁定的"，不是"谁会让它动"。两处不许单独漂：
+  # `scripts/host/eval-registered-rerun.test.sh` 逐字比对这里的形状与脚本那份清单。
+  - key: resourceGovernance.runtimeWorkloads.0.cpuLimit
+    source: override
+    why: >-
+      The CPU ceiling of the registered-eval rerun pod, which a host script
+      creates and the product never sees. No reading can move it: the pod is
+      outside the process that would publish one. The host script's manifest
+      names the same number and a test compares the two.
+
+  - key: resourceGovernance.runtimeWorkloads.0.cpuRequest
+    source: override
+    why: >-
+      The CPU request of the same pod. It is what the projection adds to the
+      quota's reserved total, so it is pinned next to the limit rather than
+      derived: a request nobody declared would be scheduled from a default.
+
+  - key: resourceGovernance.runtimeWorkloads.0.memoryLimit
+    source: override
+    why: >-
+      The memory ceiling of the rerun pod; when the ceiling it is counted into
+      is too small, the rollout holds and no revision lands, which is why this
+      one is declared rather than left to borrow the surge reserve.
+
+  - key: resourceGovernance.runtimeWorkloads.0.memoryRequest
+    source: override
+    why: >-
+      The memory request of the same pod, counted into the reserved total the
+      way the limit is counted into the ceiling.
   - key: resourceGovernance.limitRange.defaultCpu
     source: override
     why: >-
