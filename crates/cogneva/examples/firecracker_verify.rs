@@ -49,9 +49,21 @@ async fn main() {
     let cfg = MicroVmConfig {
         enabled: true,
         firecracker_bin: arg_value(&args, "--firecracker-bin", "firecracker"),
-        kernel_image: arg_value(&args, "--kernel", "/opt/cogneva/microvm/vmlinux"),
-        rootfs_image: arg_value(&args, "--rootfs", "/opt/cogneva/microvm/rootfs.ext4"),
-        pv_image: arg_value(&args, "--pv", "/opt/cogneva/microvm/evolution-pv.ext4"),
+        kernel_image: arg_value(
+            &args,
+            "--kernel",
+            &cog_core::paths::app_path_str("microvm/vmlinux"),
+        ),
+        rootfs_image: arg_value(
+            &args,
+            "--rootfs",
+            &cog_core::paths::app_path_str("microvm/rootfs.ext4"),
+        ),
+        pv_image: arg_value(
+            &args,
+            "--pv",
+            &cog_core::paths::app_path_str("microvm/evolution-pv.ext4"),
+        ),
         instance_root: arg_value(&args, "--instance-root", "/tmp/cogneva-microvm"),
         exec_timeout_secs: arg_value(&args, "--timeout", "300").parse().unwrap_or(300),
         ..Default::default()
