@@ -498,6 +498,12 @@ pub struct OAuthCallbackQuery {
 
 /// Render the post-login landing page: stash the tokens where the web app
 /// reads them, then jump back to the app root.
+///
+/// Both halves of the pair land: the access token lives 15 minutes, so a
+/// session that starts here needs the refresh token too -- the web app renews
+/// with it before expiry, and a landing page that hands over only the access
+/// token leaves that session unable to do anything but be signed out a
+/// quarter of an hour later.
 fn login_landing_page(payload: &serde_json::Value) -> Html<String> {
     let data = serde_json::to_string(payload).unwrap_or_else(|_| "{}".into());
     Html(format!(
@@ -509,6 +515,7 @@ fn login_landing_page(payload: &serde_json::Value) -> Html<String> {
          <body><div class=\"card\"><h1>登录成功</h1><p>正在回到 Cogneva…</p></div>\
          <script>try {{ const d = {data}; \
          localStorage.setItem('cogneva_token', d.auth.access_token); \
+         if (d.auth.refresh_token) {{ localStorage.setItem('cogneva_refresh_token', d.auth.refresh_token); }} \
          localStorage.setItem('cogneva_user', JSON.stringify(d.auth.user)); \
          if (window.opener) {{ window.opener.postMessage({{ type: 'cogneva-login', data: d }}, location.origin); window.close(); }} \
          else {{ window.location.href = '/'; }} }} catch (e) {{ document.querySelector('p').textContent = '登录状态写入失败：' + e; }}</script>\
@@ -616,6 +623,26 @@ pub async fn oauth_callback_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_landing_page_hands_over_the_refresh_token_too() {
+        let html = login_landing_page(&serde_json::json!({
+            "auth": {
+                "access_token": "header.payload.signature",
+                "refresh_token": "refresh.payload.signature",
+                "token_type": "Bearer",
+                "expires_in": 900,
+                "user": {"id": "00000000-0000-0000-0000-000000000000", "username": "admin"}
+            },
+            "account_created": false,
+        }))
+        .0;
+        assert!(html.contains("localStorage.setItem('cogneva_token', d.auth.access_token)"));
+        assert!(
+            html.contains("localStorage.setItem('cogneva_refresh_token', d.auth.refresh_token)"),
+            "落地页只交出访问令牌：从这条入口进来的会话 15 分钟后没有可续期的凭据，界面只能停在一格都读不到的壳上"
+        );
+    }
 
     #[test]
     fn parse_profile_full_github_shape() {

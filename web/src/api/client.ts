@@ -105,6 +105,13 @@ export const api = new ApiClient();
 
 export interface LoginResponse {
   token: string;
+  /**
+   * 续期凭据。服务端在登录响应里一直给了它，界面以前直接丢掉——丢掉的代价
+   * 是访问令牌 15 分钟一到，事件流每拍重连都被判 `Token expired`，而界面
+   * 只把状态条写成 closed，什么都不说。`null` 表示这次登录没有拿到续期凭据
+   * （形状不同的入口），那时到期只能登出，不能假装还连着。
+   */
+  refreshToken: string | null;
   user: {
     id: string;
     username: string;
@@ -200,9 +207,30 @@ export async function login(
 ): Promise<LoginResponse> {
   const res = await api.post<{
     access_token: string;
+    refresh_token?: string;
     user: { id: string; username: string };
   }>('/api/v1/auth/login', { username, password });
-  return { token: res.access_token, user: res.user };
+  return {
+    token: res.access_token,
+    refreshToken: res.refresh_token ?? null,
+    user: res.user,
+  };
+}
+
+/**
+ * 用续期凭据换一枚新访问令牌。
+ *
+ * 走请求体而不是登录时那枚 HttpOnly cookie：cookie 写着 `Secure`，而现网入口
+ * 只有 80 口（明文 http），浏览器根本不存它；就算存了，服务端也不读它——续期
+ * 处理只从 JSON 体里取 `refresh_token`。所以唯一通的这条路是把 body 里那枚
+ * 凭据留下来。
+ */
+export async function refreshSession(refreshToken: string): Promise<string> {
+  const res = await api.post<{ access_token: string }>(
+    '/api/v1/auth/refresh',
+    { refresh_token: refreshToken }
+  );
+  return res.access_token;
 }
 
 // ── Platform-account login (connect GitHub/Gitee = sign in) ──
@@ -212,13 +240,18 @@ export type PlatformProvider = 'github' | 'gitee';
 export interface PlatformAuthPayload {
   auth: {
     access_token: string;
+    refresh_token?: string;
     user: { id: string; username: string };
   };
   account_created: boolean;
 }
 
 function toLoginResponse(p: PlatformAuthPayload): LoginResponse {
-  return { token: p.auth.access_token, user: p.auth.user };
+  return {
+    token: p.auth.access_token,
+    refreshToken: p.auth.refresh_token ?? null,
+    user: p.auth.user,
+  };
 }
 
 /** PAT / manual token login — also the offline escape hatch. */

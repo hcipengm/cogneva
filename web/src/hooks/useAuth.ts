@@ -3,28 +3,41 @@ import {
   api,
   login,
   platformLogin,
+  refreshSession,
   type LoginResponse,
   type PlatformProvider,
 } from '@/api/client';
+import { nextRefreshDelayMs, tokenExpiryMs } from '@/auth/tokenLifecycle';
 
 const TOKEN_KEY = 'cogneva_token';
+const REFRESH_KEY = 'cogneva_refresh_token';
 
 export interface AuthState {
   token: string | null;
+  refreshToken: string | null;
   username: string | null;
   isAuthenticated: boolean;
   isLoading: boolean;
   error: string | null;
 }
 
+/** 两份凭据总是一起读、一起写：只留下其中一份，到期那一刻的行为就说不清了。 */
+function readStored(): { token: string | null; refreshToken: string | null } {
+  return {
+    token: localStorage.getItem(TOKEN_KEY),
+    refreshToken: localStorage.getItem(REFRESH_KEY),
+  };
+}
+
 export function useAuth() {
   const [state, setState] = useState<AuthState>(() => {
-    const token = localStorage.getItem(TOKEN_KEY);
+    const { token, refreshToken } = readStored();
     if (token) {
       api.setToken(token);
     }
     return {
       token,
+      refreshToken,
       username: null,
       isAuthenticated: !!token,
       isLoading: false,
@@ -33,24 +46,52 @@ export function useAuth() {
   });
 
   useEffect(() => {
-    const token = localStorage.getItem(TOKEN_KEY);
+    const { token, refreshToken } = readStored();
     if (token) {
       api.setToken(token);
-      setState((prev) => ({ ...prev, token, isAuthenticated: true }));
+      setState((prev) => ({ ...prev, token, refreshToken, isAuthenticated: true }));
     }
   }, []);
 
-  const applyLogin = useCallback((response: LoginResponse) => {
-    localStorage.setItem(TOKEN_KEY, response.token);
-    api.setToken(response.token);
-    setState({
-      token: response.token,
-      username: response.user.username,
+  /**
+   * 换一枚新的访问令牌。**令牌变了 `App` 才会重新渲染，WebSocket 的地址才会
+   * 跟着变**（`/ws?token=…` 就是从它拼的），所以这一步同时是「续期」与「重连」。
+   */
+  const applyToken = useCallback((token: string, refreshToken: string | null) => {
+    localStorage.setItem(TOKEN_KEY, token);
+    if (refreshToken) localStorage.setItem(REFRESH_KEY, refreshToken);
+    else localStorage.removeItem(REFRESH_KEY);
+    api.setToken(token);
+    setState((prev) => ({
+      ...prev,
+      token,
+      refreshToken,
       isAuthenticated: true,
       isLoading: false,
       error: null,
-    });
+    }));
   }, []);
+
+  const applyLogin = useCallback(
+    (response: LoginResponse) => {
+      localStorage.setItem(TOKEN_KEY, response.token);
+      if (response.refreshToken) {
+        localStorage.setItem(REFRESH_KEY, response.refreshToken);
+      } else {
+        localStorage.removeItem(REFRESH_KEY);
+      }
+      api.setToken(response.token);
+      setState({
+        token: response.token,
+        refreshToken: response.refreshToken,
+        username: response.user.username,
+        isAuthenticated: true,
+        isLoading: false,
+        error: null,
+      });
+    },
+    []
+  );
 
   const signIn = useCallback(
     async (username: string, password: string) => {
@@ -88,13 +129,19 @@ export function useAuth() {
       if (e.origin !== window.location.origin) return;
       const data = (e.data ?? {}) as {
         type?: string;
-        data?: { auth?: { access_token?: string; user?: { id: string; username: string } } };
+        data?: {
+          auth?: {
+            access_token?: string;
+            refresh_token?: string;
+            user?: { id: string; username: string };
+          };
+        };
       };
       if (data.type !== 'cogneva-login') return;
       const token = data.data?.auth?.access_token;
       const user = data.data?.auth?.user;
       if (!token || !user) return;
-      applyLogin({ token, user });
+      applyLogin({ token, refreshToken: data.data?.auth?.refresh_token ?? null, user });
     };
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
@@ -102,15 +149,58 @@ export function useAuth() {
 
   const signOut = useCallback(() => {
     localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(REFRESH_KEY);
     api.clearToken();
     setState({
       token: null,
+      refreshToken: null,
       username: null,
       isAuthenticated: false,
       isLoading: false,
       error: null,
     });
   }, []);
+
+  const { token, refreshToken } = state;
+
+  /**
+   * 到期前换一枚新的访问令牌；换不到就登出。
+   *
+   * 登出是刻意的：没有这一句，界面会停在一个「状态条写着 closed、每一格 REST
+   * 都 401」的壳上——它看起来完全像「实时流没实现」，而不是「凭据过期了」。
+   */
+  const renew = useCallback(async () => {
+    if (!refreshToken) {
+      signOut();
+      return;
+    }
+    try {
+      applyToken(await refreshSession(refreshToken), refreshToken);
+    } catch {
+      signOut();
+    }
+  }, [refreshToken, applyToken, signOut]);
+
+  useEffect(() => {
+    if (!token) return;
+    const delay = nextRefreshDelayMs(tokenExpiryMs(token), Date.now());
+    const timer = window.setTimeout(() => {
+      void renew();
+    }, delay);
+    // 后台标签页的定时器会被浏览器节流到一分钟一拍甚至更久，机器睡眠期间干脆
+    // 不走。回到前台时按同一个判据再问一次：已经进入提前量就当场续。
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (nextRefreshDelayMs(tokenExpiryMs(token), Date.now()) === 0) {
+        void renew();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [token, renew]);
 
   return { ...state, signIn, signInPlatformToken, signOut };
 }

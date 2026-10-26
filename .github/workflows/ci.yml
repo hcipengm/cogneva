@@ -728,6 +728,12 @@ jobs:
       # 编译出来按判据跑，再查接线有没有把它们接进编辑器。
       - name: Check the editor indents, pairs brackets, and lands the caret
         run: bash deploy/scripts/check-web-editing.sh
+      # 登录可用不等于这一屏还在动：访问令牌只活 15 分钟，界面若不拿登录响应里
+      # 的续期凭据去续，到期后事件流每一拍重连都被判 `Token expired`，而界面只
+      # 把状态条写成 closed——所有 REST 读数 401，看起来像实时流根本没实现。
+      # 这一步同时验接线（四条路都要接上）与寿命算术（编译出纯函数在 node 里跑）。
+      - name: Check the web renews its token before it dies
+        run: bash deploy/scripts/check-web-token-refresh.sh
 
   entry-scripts:
     name: Entry Scripts Lint
