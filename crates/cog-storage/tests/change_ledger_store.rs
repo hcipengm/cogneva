@@ -2019,6 +2019,104 @@ async fn a_pool_block_lands_only_on_the_owed_rows_and_the_clear_takes_back_only_
     cleanup(&pool, &marker).await;
 }
 
+/// A wait goes away with the work it described.
+///
+/// The three blocked columns are what every by-reason census counts, and a row
+/// that lands or retires is not waiting for anything. Left behind, the row keeps
+/// counting: measured on the live account on 2026-10-26, `--blocked` read 2067
+/// rows while 2066 were pending, and the extra one was a row retired minutes
+/// earlier that still carried the pool's reason. The count looked like a wait
+/// somebody had to answer, and there was nobody.
+///
+/// A measurement that still says `pending` keeps the wait it found -- the stamp
+/// and the clear are the passes that decide those, and re-measuring a row is not
+/// one of them.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_row_that_leaves_the_account_takes_its_wait_with_it() {
+    let (store, pool, marker) = store().await;
+    let landed = identity(&marker, "wait-lands");
+    let retired = identity(&marker, "wait-retires");
+    let still_owed = identity(&marker, "wait-stays");
+    for id in [&landed, &retired, &still_owed] {
+        store
+            .apply_measurement(&ChangeMeasurement::new(id.clone(), ChangeState::Pending))
+            .await
+            .expect("write a pending measurement");
+    }
+    store
+        .stamp_pool_block("an upstream the pool can reach")
+        .await
+        .expect("stamp the pool block");
+
+    let blocked = |id: ChangeIdentity| {
+        let pool = pool.clone();
+        async move {
+            let (reason, condition, since) = sqlx::query_as::<
+                _,
+                (
+                    Option<String>,
+                    Option<String>,
+                    Option<chrono::DateTime<chrono::Utc>>,
+                ),
+            >(
+                "SELECT blocked_reason, unblock_condition, blocked_since FROM change_ledger \
+                 WHERE kind = $1 AND scope = $2 AND literal = $3",
+            )
+            .bind(&id.kind)
+            .bind(&id.scope)
+            .bind(&id.literal)
+            .fetch_one(&pool)
+            .await
+            .expect("read the blocked columns back");
+            (reason, condition, since)
+        }
+    };
+    for id in [&landed, &retired, &still_owed] {
+        assert_eq!(
+            blocked(id.clone()).await.0.as_deref(),
+            Some("pool_unavailable"),
+            "the stamp lands on every owed row"
+        );
+    }
+
+    store
+        .apply_measurement(&ChangeMeasurement::new(landed.clone(), ChangeState::Landed))
+        .await
+        .expect("measure the row landed");
+    assert_eq!(
+        blocked(landed.clone()).await,
+        (None, None, None),
+        "a landed row is owed nothing, so it cannot still be waiting"
+    );
+
+    store
+        .apply_measurement(&ChangeMeasurement::retired(
+            retired.clone(),
+            RetireReason::Superseded,
+        ))
+        .await
+        .expect("retire the row");
+    assert_eq!(
+        blocked(retired.clone()).await,
+        (None, None, None),
+        "a retired row's question is answered, and a wait on it counts forever"
+    );
+
+    let kept = blocked(still_owed.clone()).await;
+    assert_eq!(
+        kept.0.as_deref(),
+        Some("pool_unavailable"),
+        "a row still owed keeps the wait it was in"
+    );
+    assert!(
+        kept.2.is_some(),
+        "and keeps the start of it, not a fresh one"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
 async fn cleanup(pool: &PgPool, marker: &str) {
     // One transaction, and the closure lock first: the deletes below are what a
     // neighbour's two reads of the whole-account closure must not see half of,

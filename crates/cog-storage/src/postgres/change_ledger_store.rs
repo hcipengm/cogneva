@@ -369,6 +369,16 @@ ON CONFLICT (kind, scope, literal) DO UPDATE SET
 /// and writing that over the arrival reading would say this row entered from a
 /// tree it was never absent from. Only a row that re-enters `landed` after
 /// being reopened has no earlier reading, and takes the new one.
+///
+/// The three columns describing a wait -- its reason, its condition and when it
+/// started -- are cleared by any measurement that does not say `pending`. They
+/// describe work still owed, and a row that has landed or retired owes nothing;
+/// left behind they keep counting in every census that groups by reason.
+/// Measured on the live account: a row retired minutes earlier still carried the
+/// pool's reason, and the blocked reading came out one row larger than the
+/// pending set it was describing. A measurement that still says `pending` keeps
+/// the wait it found -- stamping and clearing are the passes that decide those,
+/// and re-measuring a row is not one of them.
 const APPLY_MEASUREMENT_SQL_TEMPLATE: &str = "\
 WITH prior AS (
     SELECT state AS before FROM change_ledger
@@ -402,6 +412,19 @@ WITH prior AS (
         END,
         retired_at = CASE
             WHEN EXCLUDED.state = '{state:retired}' THEN COALESCE(change_ledger.retired_at, now())
+            ELSE NULL
+        END,
+        -- A wait describes work still owed; see the note above this statement.
+        blocked_reason = CASE
+            WHEN EXCLUDED.state = '{state:pending}' THEN change_ledger.blocked_reason
+            ELSE NULL
+        END,
+        unblock_condition = CASE
+            WHEN EXCLUDED.state = '{state:pending}' THEN change_ledger.unblock_condition
+            ELSE NULL
+        END,
+        blocked_since = CASE
+            WHEN EXCLUDED.state = '{state:pending}' THEN change_ledger.blocked_since
             ELSE NULL
         END
     RETURNING state, measured_rev, retire_reason, unsettled_reason
