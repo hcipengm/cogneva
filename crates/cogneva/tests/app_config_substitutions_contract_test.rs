@@ -217,7 +217,7 @@ fn addresses(text: &str) -> BTreeSet<String> {
         }
         let port_len = end - (i + 1);
         let port_boundary = chars.get(end).is_none_or(|c| !c.is_ascii_alphanumeric());
-        if port_len >= 2 && port_len <= 5 && port_boundary && host_start < i {
+        if (2..=5).contains(&port_len) && port_boundary && host_start < i {
             let host: String = chars[host_start..i].iter().collect();
             if host.chars().any(|c| c.is_ascii_alphabetic()) && !is_timestamp_host(&host) {
                 out.insert(chars[host_start..end].iter().collect());
