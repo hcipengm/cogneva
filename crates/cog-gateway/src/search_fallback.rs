@@ -175,7 +175,7 @@ impl SearchUpstream {
     }
 }
 
-/// 一个 LLM 上游主机有没有 `/tools/*` 面，以及面长什么样。
+/// 一个 LLM 上游主机有没有 `/tools/*` 面，面长什么样，以及**问它的根地址**。
 ///
 /// 判据只能是主机名：池条目里没有厂商字段，也不该为这件事加一个——现网在用
 /// 的那条 LLM 上游已经是权威，再加一个字段就等于给"这家是谁"造出第二处可以
@@ -183,15 +183,44 @@ impl SearchUpstream {
 ///
 /// 认主机而不是认域名后缀，是因为部署常常在中间加一层代理，而一个 URL 里
 /// 写着 deepseek 的代理出口确实就是 DeepSeek 面。
-pub fn shape_for_llm_host(base_url: &str) -> Option<ResponseShape> {
+///
+/// 但**根地址要另算，不能直接用聊天那条**。聊天地址的版本前缀是各家自己定的
+/// （`/v1`、`/coding/v1`、`/api/plan/v3`），而工具面挂在平台主机上的固定前缀
+/// `/v1` 下。拿聊天地址直接接 `/tools/search`，只在"聊天地址正好以 `/v1` 结尾"
+/// 时碰巧对：`https://api.kimi.com/coding/v1` 会变成 `/coding/v1/tools/search`。
+/// 2026-10-26 实测这条是 404 `resource_not_found_error`；同一把 key 打
+/// `{base}/chat/completions` 是 429（路径真实存在），所以不是网络或鉴权的问题，
+/// 是路径拼错了。修法是把「问哪台主机」和「问哪个前缀」分开算：主机取聊天地址
+/// 的主机，前缀固定 `/v1`。
+///
+/// 第二个坑：Kimi 的 coding 主机（`api.kimi.com`）是包月编码入口，工具面**不在
+/// 它上面**（`/v1/tools/search` 也是 404），那把订阅 key 在平台主机上也不被接受
+/// （`api.moonshot.cn/v1/tools/search` → 401）。这一层对它就是**没有**：配一条
+/// 必然 404/401 的条目，等于每次查询都要跑完本机两层、池里每家，再多花一次往返
+/// 去问一个已知答不上来的地方，而失败原因还会被读成"这家挂了"。
+pub fn tools_base_for_llm_host(base_url: &str) -> Option<(ResponseShape, String)> {
     let lowered = base_url.trim().to_ascii_lowercase();
-    if lowered.contains("deepseek") {
-        Some(ResponseShape::DeepSeek)
-    } else if lowered.contains("moonshot") || lowered.contains("kimi") {
-        Some(ResponseShape::Kimi)
-    } else {
-        None
+    let (scheme, rest) = lowered.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
     }
+    // 主机只到第一个 `/`：路径里出现 `deepseek` 不算（`/proxy?to=deepseek` 这种
+    // 配置不是主机，拿它推形状就是在猜）。
+    let host = rest.split('/').next().unwrap_or("");
+    if host.is_empty() {
+        return None;
+    }
+    if host == "api.kimi.com" {
+        return None;
+    }
+    let shape = if host.contains("deepseek") {
+        ResponseShape::DeepSeek
+    } else if host.contains("moonshot") {
+        ResponseShape::Kimi
+    } else {
+        return None;
+    };
+    Some((shape, format!("{scheme}://{host}/v1")))
 }
 
 /// 把现网在用的那条 LLM 上游折成一条后备条目——**第三层的全部**。
@@ -201,21 +230,25 @@ pub fn shape_for_llm_host(base_url: &str) -> Option<ResponseShape> {
 /// 去撞 401（那会被读成"这家挂了"，而真正的原因是它在拿旧凭证问）。
 ///
 /// 主机认不出是哪一家时返回 `None`：那一层就是没有，而不是猜一个形状去问。
+/// 认得出是哪一家、但那台主机上根本没有工具面时（Kimi 的 coding 订阅主机），
+/// 同样是 `None`——理由见 [`tools_base_for_llm_host`]。
 pub fn from_live_llm(base_url: &str, api_key: &str) -> Option<SearchUpstream> {
-    let shape = shape_for_llm_host(base_url)?;
     let base_url = base_url.trim();
     let api_key = api_key.trim();
     if base_url.is_empty() || api_key.is_empty() {
         return None;
     }
+    // 工具面的根地址与聊天那条不是同一个字符串（版本前缀不同），所以这里
+    // 拿它算请求地址、拿聊天那条记 key 的来源——两者在状态面上都要能读出来。
+    let (shape, tools_base) = tools_base_for_llm_host(base_url)?;
     Some(SearchUpstream {
         // 名字里带主机：池里可能同时有 deepseek 与 kimi，而 `source` 的全部
         // 用处就是回答"是哪一家答的"。
-        id: format!("llm:{}", host_of(base_url)),
+        id: format!("llm:{}", host_of(&tools_base)),
         shape,
         // 这两家的 `/tools/fetch` 与 `/tools/search` 是同一份文档里的两个面。
         capability: Capability::Both,
-        base_url: base_url.to_string(),
+        base_url: tools_base,
         api_key: api_key.to_string(),
         key_from: Some(base_url.to_string()),
     })
@@ -980,10 +1013,49 @@ mod tests {
 
         let kimi = from_live_llm("https://api.moonshot.cn/v1", "sk-k").expect("kimi 有工具面");
         assert_eq!(kimi.shape, ResponseShape::Kimi);
+        assert_eq!(
+            build_request(&kimi, "qdrant", 3).url,
+            "https://api.moonshot.cn/v1/tools/search"
+        );
         // 主机认不出是哪一家就没有这一层，而不是猜一个形状去问。
         assert!(from_live_llm("https://api.openai.com/v1", "sk-o").is_none());
         // 没有 key 的 LLM 上游也折不出来：那是一次必然 401 的请求。
         assert!(from_live_llm("https://api.deepseek.com/v1", "").is_none());
+    }
+
+    #[test]
+    fn the_tools_face_is_sought_at_its_own_prefix_not_the_chat_prefix() {
+        // 聊天地址的版本前缀是各家自己定的，工具面统一挂在 `/v1` 下。拿聊天字符串
+        // 直接接 `/tools/search`，只有"它正好以 /v1 结尾"时才对——这条判据在旧实现
+        // 上是红的：`/coding/v1/tools/search` 是 404，而那条路径本该是 `/v1/tools/search`。
+        let kimi = from_live_llm("https://api.kimi.com/coding/v1", "sk-k");
+        // 现网在用的就是这一条订阅主机：它没有工具面，所以这一层是空的。
+        // 配一条必然 404 的条目，等于每次查询多花一次往返去问一个已知答不上来的地方。
+        assert!(
+            kimi.is_none(),
+            "coding 订阅主机上没有工具面，不该折出条目：{kimi:?}"
+        );
+        // 同一家的平台主机上有：地址由主机与固定前缀算出，不抄聊天那条的路径。
+        let platform =
+            from_live_llm("https://api.moonshot.cn/v1", "sk-k").expect("平台主机有工具面");
+        assert_eq!(platform.base_url, "https://api.moonshot.cn/v1");
+        assert_eq!(
+            platform.key_from.as_deref(),
+            Some("https://api.moonshot.cn/v1")
+        );
+        // 聊天地址不带 `/v1` 时也一样：前缀是算出来的，不是它带的。
+        let bare = from_live_llm("https://api.deepseek.com", "sk-d").expect("deepseek 有工具面");
+        assert_eq!(bare.base_url, "https://api.deepseek.com/v1");
+        assert_eq!(
+            build_request(&bare, "qdrant", 3).url,
+            "https://api.deepseek.com/v1/tools/search"
+        );
+        // 代理出口：主机里写着 deepseek 也算，但路径里写着不算——路径不是主机，
+        // 认它就是在猜。
+        let proxy = from_live_llm("https://dl.example.com/deepseek", "sk-d");
+        assert!(proxy.is_none(), "路径里的厂商名不构成主机判据：{proxy:?}");
+        // 非 http(s) 的地址不当成可以发请求的地方。
+        assert!(from_live_llm("ftp://api.deepseek.com/v1", "sk-d").is_none());
     }
 
     #[test]

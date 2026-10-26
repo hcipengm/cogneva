@@ -6946,15 +6946,21 @@ async fn search_fallback_outlet(
         let raw = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             let excerpt: String = raw.chars().take(200).collect();
+            // 把**问的是哪个地址**写进判词：同一个主机的 `/v1/...` 与 `/coding/v1/...`
+            // 是两个结局（后者 404），而只写"HTTP 404"的判词读起来像"这家挂了"。
+            // 地址里没有凭证——key 只在请求头里。
             refusals.push(format!(
-                "{}：上游答 HTTP {status}（{excerpt}）",
-                upstream.id
+                "{}：上游答 HTTP {status}（{}）（{excerpt}）",
+                upstream.id, request.url
             ));
             continue;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
             let excerpt: String = raw.chars().take(200).collect();
-            refusals.push(format!("{}：应答不是 JSON（{excerpt}）", upstream.id));
+            refusals.push(format!(
+                "{}：应答不是 JSON（{}）（{excerpt}）",
+                upstream.id, request.url
+            ));
             continue;
         };
         match action {

@@ -458,13 +458,16 @@ export function SearchFallbackOverlay({ onClose }: { onClose: () => void }) {
           {fromLlm.length === 0 ? (
             <p className="text-xs text-slate-500">
               当前 LLM 上游没有自带的上网工具面，这一层是空的。换成带有上网工具的
-              模型（DeepSeek、Kimi 的服务端都提供）后，这一层自动出现。
+              模型（DeepSeek、Kimi 的服务端都提供）后，这一层自动出现。注意包月订阅型
+              的入口（例如 Kimi 的 coding 主机）只有对话面，独立检索接口不在它上面、
+              也不接受那把订阅密钥——这种情况这一层会一直是空的，只能换成平台密钥。
             </p>
           ) : (
             <ul className="space-y-1 text-xs text-slate-400">
               {fromLlm.map((entry) => (
                 <li key={entry.id}>
                   {entry.id} · {entry.capability === 'both' ? '检索与抓取' : entry.capability}
+                  <span className="ml-2 text-slate-500">{entry.base_url}</span>
                 </li>
               ))}
               <li className="pt-1 text-slate-500">
