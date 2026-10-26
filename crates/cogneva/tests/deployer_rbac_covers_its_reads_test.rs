@@ -1040,15 +1040,35 @@ fn the_role_file_is_the_one_the_parity_gate_holds() {
 // The publisher's base read
 // ---------------------------------------------------------------------------
 
-/// `const NAME: &str = "value";` 里的那个字符串。
-fn const_str_value(src: &str, name: &str) -> Option<String> {
-    let needle = format!("const {name}: &str = \"");
-    let start = src.find(&needle)? + needle.len();
-    let end = src[start..].find('"')? + start;
-    Some(src[start..end].to_string())
+/// `cog_core::topology::X` 的取值。
+///
+/// 名字现在声明在一处、由各 crate 引用，判据要读的仍是那个名字本身，只是顺着
+/// 引用去那份声明里取——否则换一次写法，一条「授权面绑的是不是这个身份」的
+/// 判据就会因为读不到字面量而静默变成空读数。
+fn declared_name(reference: &str) -> Option<String> {
+    let name = reference.trim().strip_prefix("cog_core::topology::")?;
+    let topology = read("crates/cog-core/src/topology.rs");
+    let needle = format!("pub const {name}: &str = \"");
+    let start = topology.find(&needle)? + needle.len();
+    let end = topology[start..].find('"')? + start;
+    Some(topology[start..end].to_string())
 }
 
-/// `const NAME: [&str; N] = ["a", "b", …];` 里的那些字符串。
+/// `const NAME: &str = "value";` 里的那个字符串，或它所引用的那份声明里的值。
+fn const_str_value(src: &str, name: &str) -> Option<String> {
+    let needle = format!("const {name}: &str = \"");
+    if let Some(at) = src.find(&needle) {
+        let start = at + needle.len();
+        let end = src[start..].find('"')? + start;
+        return Some(src[start..end].to_string());
+    }
+    let path_needle = format!("const {name}: &str = ");
+    let start = src.find(&path_needle)? + path_needle.len();
+    let end = src[start..].find(';')? + start;
+    declared_name(&src[start..end])
+}
+
+/// `const NAME: [&str; N] = ["a", "b", …];` 里的那些字符串，引用声明的按名字解析。
 fn const_string_list(src: &str, name: &str) -> Vec<String> {
     let needle = format!("const {name}: ");
     let Some(start) = src.find(&needle) else {
@@ -1062,7 +1082,10 @@ fn const_string_list(src: &str, name: &str) -> Vec<String> {
     let Some(close) = body.find(']') else {
         return Vec::new();
     };
-    body[..close].split(',').filter_map(literal).collect()
+    body[..close]
+        .split(',')
+        .filter_map(|element| literal(element).or_else(|| declared_name(element)))
+        .collect()
 }
 
 /// `- name: KEY` 之后、下一个 env 条目之前那段里的 `value: "…"`。
