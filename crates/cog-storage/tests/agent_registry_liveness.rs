@@ -1,3 +1,4 @@
+//! principle: feedback_when_the_behaviour_under_test_is_global_serialize_the_tests_do_not_scope_them
 //! Whether the agent registry tells "registered" apart from "still there",
 //! against a live Redis.
 //!
@@ -27,6 +28,17 @@ use cog_storage::RedisAgentRegistry;
 /// Every name in this file starts here, so a leftover from an interrupted run
 /// is recognisable as one of these tests'.
 const PROBE: &str = "probe_agent_registry_liveness";
+
+/// Every test in this file walks the same two global keys: the roster index
+/// (`orchestrator:agents:index`) and the sweep that `list` runs over it. A
+/// sweep retires exactly the records these tests plant — a three-day-cold one,
+/// an expiring one — so two tests in flight at once read each other's
+/// housekeeping: the planted record is gone before its own TTL is read, and the
+/// assertion that the *fixture* carried no expiry fails on a record that no
+/// longer exists. That is not the behaviour under test being wrong; it is the
+/// behaviour being global while the tests were not. Measured in CI on
+/// 2026-10-26: this file passed alone and failed in the suite.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn redis_url() -> String {
     std::env::var("COGNEVA_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
@@ -81,6 +93,7 @@ async fn ttl_secs(agent_id: &str) -> i64 {
 #[tokio::test]
 #[ignore = "needs a live Redis named by COGNEVA_TEST_REDIS_URL"]
 async fn a_registered_agent_is_live_and_carries_its_own_expiry() {
+    let _serial = SERIAL.lock().await;
     let registry = registry().await;
     let reg = registration("live", Utc::now());
     registry.register(&reg).await.expect("register");
@@ -118,6 +131,7 @@ async fn a_registered_agent_is_live_and_carries_its_own_expiry() {
 #[tokio::test]
 #[ignore = "needs a live Redis named by COGNEVA_TEST_REDIS_URL"]
 async fn a_record_whose_writer_stopped_beating_is_not_live() {
+    let _serial = SERIAL.lock().await;
     let registry = registry().await;
     let cold = Utc::now() - ChronoDuration::seconds(3 * 24 * 60 * 60);
     let reg = registration("cold", cold);
@@ -154,6 +168,7 @@ async fn a_record_whose_writer_stopped_beating_is_not_live() {
 #[tokio::test]
 #[ignore = "needs a live Redis named by COGNEVA_TEST_REDIS_URL"]
 async fn a_fresh_record_is_live_even_before_its_expiry_is_rearmed() {
+    let _serial = SERIAL.lock().await;
     let registry = registry().await;
     // The crash window leaves the beat time current: the writer died *after*
     // writing the payload, so the record still describes an agent that was
@@ -208,6 +223,7 @@ async fn a_record_written_for_a_long_window_is_judged_by_its_own_window() {
     // to apply its own (agent) window to both and delete the slow-beating
     // record well before the writer said it was over -- which is why a face
     // whose owner is present flipped to `unknown_unit` between two beats.
+    let _serial = SERIAL.lock().await;
     let registry = registry().await; // default registration window: 30s
     let slow = Utc::now() - ChronoDuration::seconds(300);
     let reg = registration("long_window", slow);
@@ -232,6 +248,7 @@ async fn a_record_written_for_a_long_window_is_judged_by_its_own_window() {
 #[tokio::test]
 #[ignore = "needs a live Redis named by COGNEVA_TEST_REDIS_URL"]
 async fn a_heartbeat_keeps_an_agent_live_past_its_first_expiry() {
+    let _serial = SERIAL.lock().await;
     let registry = registry().await;
     let mut reg = registration("beating", Utc::now());
     reg.agent_id = format!(
@@ -278,6 +295,7 @@ async fn indexed(agent_id: &str) -> bool {
 #[tokio::test]
 #[ignore = "needs a live Redis named by COGNEVA_TEST_REDIS_URL"]
 async fn a_record_that_lapsed_takes_its_index_entry_with_it() {
+    let _serial = SERIAL.lock().await;
     let registry = registry().await;
     let reg = registration("lapsed", Utc::now());
     plant_with_expiry(&reg, 1).await;
@@ -317,6 +335,7 @@ async fn a_record_that_lapsed_takes_its_index_entry_with_it() {
 #[tokio::test]
 #[ignore = "needs a live Redis named by COGNEVA_TEST_REDIS_URL"]
 async fn a_live_name_keeps_its_index_entry_pass_after_pass() {
+    let _serial = SERIAL.lock().await;
     let registry = registry().await;
     let reg = registration("live_roster", Utc::now());
     registry.register(&reg).await.expect("register");
