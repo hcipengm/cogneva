@@ -36,11 +36,14 @@ WEB = os.path.join(ROOT, "web/src")
 STORE = os.path.join(WEB, "store")
 
 # 每个折叠模块靠哪些帧活。帧类型用线上那串（与 Rust 变体的 snake_case 一致）。
+# 值是 `"*"` 的模块靠**每一帧**活（数到达时刻的那种）：它就要求 App 订阅网关能
+# 路由的每一个族，少一族，这一格就少算那一族上的一切。
 FACES = {
     "liveAgents.ts": ["agent_start", "agent_end", "state_change", "agent_error", "heartbeat"],
     "liveAlerts.ts": ["resource_alert"],
     "liveComms.ts": ["task_status_change"],
     "liveProjects.ts": ["task_status_change"],
+    "livePulse.ts": "*",
 }
 
 # snake_case → 线上变体名。规则的按规则推，不规则的写在这里。
@@ -73,6 +76,8 @@ for name in shipped:
         )
 for name, types in FACES.items():
     source = read(os.path.join(STORE, name), f"web/src/store/{name}")
+    if types == "*":
+        continue  # 靠每一帧活的模块不点名任何类型
     for event_type in types:
         if f"'{event_type}'" not in source and f'"{event_type}"' not in source:
             sys.exit(
@@ -128,6 +133,12 @@ def covers(subscription, family):
 
 missing = []
 for name, types in sorted(FACES.items()):
+    if types == "*":
+        # 数到达的那一格：网关能路由到的每一族都得订，少一族就少算一族上的一切。
+        for family in sorted({f for fams in routes.values() for f in fams}):
+            if not any(covers(s, family) for s in subscribed):
+                missing.append(f"{name} 靠每一帧，`{family}:` 上的一切都要数，而 App 只订了 {subscribed}")
+        continue
     for event_type in types:
         variant = variant_of(event_type)
         families = routes.get(variant)
@@ -144,6 +155,10 @@ if missing:
     sys.exit("订阅覆盖不全（这一族的面会一起哑掉，而屏幕上没有任何一格会显示断了）：\n  - " + "\n  - ".join(missing))
 
 for name, types in sorted(FACES.items()):
+    if types == "*":
+        fams = sorted({f for fams in routes.values() for f in fams})
+        print(f"ok   - store/{name} 靠每一帧 → {', '.join(f + ':' for f in fams)}，App 已订")
+        continue
     for event_type in types:
         fams = sorted(routes[variant_of(event_type)])
         print(f"ok   - store/{name} 靠 `{event_type}` → {', '.join(f + ':' for f in fams)}，App 已订")

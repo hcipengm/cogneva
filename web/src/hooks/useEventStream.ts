@@ -16,6 +16,7 @@ import { useLiveAgentStore } from '@/store/liveAgentStore';
 import { useLiveAlertStore } from '@/store/liveAlertStore';
 import { useLiveCommsStore } from '@/store/liveCommsStore';
 import { useLiveProjectStore } from '@/store/liveProjectStore';
+import { useLivePulseStore } from '@/store/livePulseStore';
 import type { AgentEvent } from '@/types/events';
 import type { NotificationItem } from '@/api/client';
 
@@ -89,6 +90,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
   const noteAlertFrame = useLiveAlertStore((state) => state.noteFrame);
   const noteCommsFrame = useLiveCommsStore((state) => state.noteFrame);
   const noteProjectTaskFrame = useLiveProjectStore((state) => state.noteFrame);
+  const noteArrival = useLivePulseStore((state) => state.noteArrival);
   /** 每个 agent 正在流的那一条消息（agent_id → 画布上的消息 id）。 */
   const streaming = useRef(new Map<string, string>());
 
@@ -101,6 +103,14 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     const handleEvent = (event: AgentEvent) => {
       const p = event.payload as Record<string, unknown>;
       const agentId = typeof p.agent_id === 'string' ? p.agent_id : null;
+
+      // 「这一路还活着吗」先记一笔，再谈这一帧说了什么。
+      //
+      // 记的是**到达**（`Date.now()`），不是帧里的 `timestamp`：重连重放一串旧帧
+      // 时，按帧里那个时间算，状态条会把「刚刚在动」读成「半小时没动」。位置也必须
+      // 在下面那些提前返回之前——心跳与正文增量按构造不入活动流，可它们正是「平台
+      // 在干活」最密的那两种帧，漏掉它们，忙碌与停摆就都是「一帧没有」。
+      noteArrival(Date.now());
 
       // 这一帧有没有真的改动折叠出来的态。由每个分支在确实写完之后自己置位：
       // 时间轴上那条「态」徽记是读者判断「这帧改了东西吗」的唯一依据，估着置位
@@ -268,6 +278,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     noteAlertFrame,
     noteCommsFrame,
     noteProjectTaskFrame,
+    noteArrival,
   ]);
 
   return { clientRef };

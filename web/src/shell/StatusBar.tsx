@@ -4,6 +4,9 @@ import { useShell, type ActivityId } from '@/shell/store';
 import { useTheme } from '@/shell/theme';
 import { themeById } from '@/styles/themes';
 import { useStreamStore } from '@/store/streamStore';
+import { pulseVerdict } from '@/store/livePulse';
+import { useLivePulseStore } from '@/store/livePulseStore';
+import { useNow } from '@/hooks/useNow';
 
 /**
  * 底部状态条：一眼能看到「现在有几件事不对」。
@@ -23,6 +26,12 @@ export function StatusBar() {
   const o = overview.data;
   const firing = alerts.alerts?.count ?? 0;
 
+  // 这一格要能说出「已经多久没有帧」，就不能只靠帧来重渲染——帧不来的时候它
+  // 一次都不会重渲染，读数会停在「刚刚」。所以它有自己的钟。
+  const pulse = useLivePulseStore((s) => s.pulse);
+  const now = useNow(5_000);
+  const stream = pulseVerdict(pulse, now, connectionStatus);
+
   return (
     <footer
       className="flex h-6 shrink-0 items-center border-t border-[var(--line)] bg-[var(--ink-1000)] text-[11px]"
@@ -30,10 +39,10 @@ export function StatusBar() {
     >
       <Cell
         onClick={() => setActivity('workspace')}
-        tone={connectionStatus === 'open' ? 'var(--ok)' : 'var(--warn)'}
-        title="实时事件流。断开时画布与日志格都不会更新，但读数仍在轮询。"
+        tone={stream.color}
+        title={stream.title}
       >
-        实时流 {connectionStatus === 'open' ? '已连接' : connectionStatus}
+        实时流 {stream.text}
       </Cell>
 
       <Cell

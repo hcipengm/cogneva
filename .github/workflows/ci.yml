@@ -760,6 +760,13 @@ jobs:
       # 读出每种帧走哪几族，再查 App 订的频道覆盖每个面依赖的每一族。
       - name: Check every frame a face relies on has a channel the app subscribes to
         run: bash deploy/scripts/check-web-frame-channels.sh
+      # 「已连接」不等于「总线在说话」：连着而一帧都不来时，状态条那一格过去与
+      # 「平台真的没事」长得一模一样，而平台停摆时屏幕上恰好一切都是静止的。这一步
+      # 判那一格数的是**到达**（不是帧里的时间，否则重连重放会把「刚刚在动」读成
+      # 「很久没动」）、在提前返回之前记（心跳与正文增量是最密的那两种帧）、并且
+      # 有自己的一口钟（只靠帧触发重渲染，读数会永远停在「刚刚」）。
+      - name: Check the status bar can tell a stalled bus from a quiet platform
+        run: bash deploy/scripts/check-web-live-pulse.sh
 
   entry-scripts:
     name: Entry Scripts Lint
