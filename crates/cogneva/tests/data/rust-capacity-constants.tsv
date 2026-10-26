@@ -221,6 +221,8 @@ crates/cog-gateway/src/memory.rs	DEFAULT_RAW_LIST_LIMIT	100	bound	a listing cost
 crates/cog-gateway/src/memory.rs	EXPIRY_SECS	300	bound	lifetime of the signed URL for stored bytes: long enough for the request that asked, short enough that a working link does not circulate
 crates/cog-gateway/src/observability.rs	FIRING_PROBE_LIMIT	1	bound	the cluster verdict only asks whether anything fires, so one row settles it however much is firing
 crates/cog-gateway/src/observability.rs	MAX_USAGE_HOURS	24 * 7	bound	Cap on the trailing window one request may ask for.
+crates/cog-gateway/src/plugin.rs	POLICY_RESTORE_ATTEMPTS	10	bound	重试上限拍数：与下面的拍长合成约 30s 的窗口，够两个 Deployment 滚动完；不无限等是因为等不到时留在活档上的是默认的 auto，无限等就等于永远不报「没恢复」
+crates/cog-gateway/src/plugin.rs	POLICY_RESTORE_CADENCE	3s	bound	读回流策略的重试拍长：网关可能比本进程晚几十秒才应答，更短只是空转，更长则属主设的 local/ask 更久地停在默认的 auto 上
 crates/cog-gateway/src/process_reports.rs	FRESH_FOR	120s	derived	two report intervals: a container that stopped stops reporting, and its last table must not keep reading as the current one
 crates/cog-gateway/src/process_reports.rs	MAX_COMMAND_CHARS	64	bound	process names are short; the long string is the command line, which this face does not read
 crates/cog-gateway/src/process_reports.rs	MAX_REPORTS	64	bound	a report is a shape, not a stream: beyond this the list is not something a reader reads, and the receiver caps so a caller cannot grow the store by reporting

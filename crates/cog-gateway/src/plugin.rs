@@ -6,6 +6,15 @@ use tracing::{info, warn};
 
 type ServerHandle = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
 
+/// 两个 Deployment 同时滚动时，网关可能比本进程晚几十秒才应答，所以恢复回流
+/// 策略这一段要重试：3s 一拍、最多 10 拍（约 30s）。拍长与被重启的那一端
+/// 同步起停的时长同量级，更短只是空转，更长则属主设的 local/ask 会更久地
+/// 停在默认的 auto 上。
+const POLICY_RESTORE_CADENCE: std::time::Duration = std::time::Duration::from_secs(3);
+/// 重试上限拍数。退避到最后仍读不到就报「没恢复」，不无限等——留着的默认
+/// 策略是 auto，无限等等于永远不报。
+const POLICY_RESTORE_ATTEMPTS: u32 = 10;
+
 /// Gateway plugin that self-assembles [`crate::GatewayState`] and drives the HTTP server lifecycle.
 pub struct GatewayPlugin {
     state: Option<Arc<crate::GatewayState>>,
@@ -327,7 +336,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         // 才报「没恢复」。
         if let Some(control) = state.contribution_control.clone() {
             tokio::spawn(async move {
-                for attempt in 1..=10u32 {
+                for attempt in 1..=POLICY_RESTORE_ATTEMPTS {
                     if let Some(policy) = crate::contribution_admin::forwarded_policy().await {
                         control.set_policy(policy);
                         info!(
@@ -336,7 +345,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
                         );
                         return;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    tokio::time::sleep(POLICY_RESTORE_CADENCE).await;
                 }
                 warn!(
                     "contribution policy not restored: the stored config could not be read through the gateway"
