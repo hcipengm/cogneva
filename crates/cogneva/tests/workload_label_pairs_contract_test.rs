@@ -11,6 +11,13 @@
 //! The pairs are read from the declaration rather than written into this file: a
 //! list here would be the same kind of second copy, and it would be the copy
 //! nobody updates when a workload is renamed.
+//!
+//! The object keys take the same treatment, and the annotation key is the one
+//! whose rename is quietest: the jobs two crates create carry their trace id in
+//! it, and a key spelled differently at one writer does not error — the stage
+//! simply stops appearing in the trace, so the chain reads as shorter instead of
+//! broken. So a source census keeps every crate typing the label keys and the
+//! annotation key from the declaration.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
