@@ -1092,6 +1092,17 @@ impl LlmHealthTable {
             .is_some_and(|t| now < t)
     }
 
+    /// 这条上游自述过的配额复位时刻，原样返回（过去的也返回）。
+    ///
+    /// 与 `snapshot` 那一格分开的一个读口：探针要问的是"它的话还没到期吗"，
+    /// 而不是"最早的一个是哪天"——两者的取舍不同（后者只报未到期的、且取最早）。
+    /// 有没有到期由调用方判，因为这个数只有一个用处：决定一次最小请求的成功
+    /// 算不算池恢复的凭据。
+    fn quota_reset_statement(&self, u: &LlmUpstream) -> Option<i64> {
+        let states = self.states.lock().unwrap();
+        states.get(&Self::key(u)).and_then(|h| h.quota_reset_unix)
+    }
+
     /// 记录一次失败：仅在"未嫌疑或窗口已到期"时计数并开/加窗——
     /// 窗口内的并发失败突发不重复计（避免一次事故把指数打飞）。
     /// 配额类失败（`quota_reset_unix` 有值）把窗口下限提到恢复时刻，
@@ -1893,6 +1904,33 @@ impl AppState {
     /// 否则池判定只能靠窗口到期推断恢复——而那只是"可以再试"，不是恢复。
     fn note_upstream_success(&self, u: &LlmUpstream) -> bool {
         self.pool_recovered.store(true, Ordering::SeqCst);
+        self.llm_health.note_success(u)
+    }
+
+    /// 记一次**探测**成功：清它自己的嫌疑窗，但只在它的话允许时才留下池恢复凭据。
+    ///
+    /// 探测发的是一条最小请求（`max_tokens: 1`）。它能通只证明这一家还肯回一个
+    /// token，不证明它能承接一件活——配额按量计的账号上，一个 token 落在这窗里、
+    /// 一件活落不进去，就是这个形状。所以上游此前用自己的话说配额要到某个时刻才
+    /// 复位、而那个时刻还没到时，这次成功不能当恢复证据：留了它，池判定会在每个
+    /// 退避窗到期时解除锁存、再被下一条真实请求顶回锁存，一次持续几天的断供就被
+    /// 记成每五分钟一个「事件」——告警按事件分行，于是「池断了多久」只剩最新那一
+    /// 段的长度，而它读起来永远是几十分钟。
+    ///
+    /// 真实请求上的成功不走这里：那条路上的成功本身就是"一件活被承接了"的证据，
+    /// 比上游先前的任何一句话都新。
+    fn note_probe_success(&self, u: &LlmUpstream) -> bool {
+        let standing = self.llm_health.quota_reset_statement(u);
+        if probe_success_is_recovery_evidence(standing, Utc::now().timestamp()) {
+            self.pool_recovered.store(true, Ordering::SeqCst);
+            tracing::info!(upstream = %u.base_url, "LLM 上游探测复通，热恢复进池");
+        } else {
+            tracing::info!(
+                upstream = %u.base_url,
+                quota_reset_unix = standing.unwrap_or(0),
+                "LLM 上游探测通了，但它自述的配额复位时刻还没到；只清嫌疑窗，不作池恢复凭据"
+            );
+        }
         self.llm_health.note_success(u)
     }
 
@@ -5877,6 +5915,18 @@ fn upstreams_due_for_probe(state: &AppState) -> Vec<LlmUpstream> {
         .collect()
 }
 
+/// 一次探测成功算不算池恢复的凭据。
+///
+/// 判据只有一条：上游自述的配额复位时刻还没到，它的话就压过这次成功。抽成纯函数
+/// 是为了让这一条能被单独断言——判据本身在探测那一支里，而"一次最小请求的成功
+/// 不等于一件活能被承接"这句话，只有在这里才说得清。
+fn probe_success_is_recovery_evidence(
+    standing_quota_reset_unix: Option<i64>,
+    now_unix: i64,
+) -> bool {
+    !standing_quota_reset_unix.is_some_and(|reset| reset > now_unix)
+}
+
 /// 单轮探测：对所有"嫌疑窗已到期"的上游各发一次最小复测请求。
 ///
 /// 池判定锁存为不可用时，探测覆盖池内全部上游，而不只看窗口到期的那几个：
@@ -5897,8 +5947,7 @@ async fn probe_suspect_upstreams(state: &AppState) {
         let base = upstream.base_url.trim_end_matches('/');
         match probe_upstream(state, &upstream).await {
             Ok(()) => {
-                if state.note_upstream_success(&upstream) {
-                    tracing::info!(upstream = %base, "LLM 上游探测复通，热恢复进池");
+                if state.note_probe_success(&upstream) {
                     record_upstream_state(state, &upstream, true, 0, None, None, None);
                 }
             }
@@ -11687,6 +11736,72 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(
             !state.llm_health.due_for_probe(&u),
             "已经定性的问号要消掉，别每拍重探"
+        );
+    }
+
+    /// 一个 ping 落得进去，不等于一件活承接得了。
+    ///
+    /// 现场读数（2026-10-26）：上游在拒绝正文里说了"reset at 2026-11-04"，而池
+    /// 每五分钟探通一次——`max_tokens: 1` 落在残量里，一件活落不进去。每次探通都
+    /// 把池锁存解除、把告警当场关掉，紧接着下一条真实请求又被配额顶回去、以新键
+    /// 重开一行。一天记下 105 行「池不可用」，每行活四分半，而那是同一场断供：
+    /// 同期 `llm_pool_available` 只变过两次。「池断了多久」这个数就是这样丢的——
+    /// 剩下的每一行都只答"最近这半小时"。
+    #[tokio::test]
+    async fn a_ping_inside_a_declared_quota_window_is_not_recovery_evidence() {
+        let alive = spawn_stub_upstream(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"pong"}}]}"#,
+        )
+        .await;
+        let state = test_state(vec![stub_upstream(&alive, "m1")]);
+        let u = state.config.llm_upstreams[0].clone();
+
+        // 上游用自己的话说：配额到一小时后才复位。
+        let reset = Utc::now().timestamp() + 3_600;
+        state.llm_health.note_failure(
+            &u,
+            300,
+            Some(reset),
+            Some(30 * 86_400),
+            Some(RefusalKind::QuotaCycle),
+        );
+        refresh_pool_state(&state).await;
+        assert!(
+            state.pool_down.load(Ordering::SeqCst),
+            "一家里零家可用，池先判不可用"
+        );
+
+        // 最小请求落得进去（stub 回 200），但上游的话还没到期。
+        probe_suspect_upstreams(&state).await;
+        refresh_pool_state(&state).await;
+
+        assert!(
+            state.pool_down.load(Ordering::SeqCst),
+            "上游自述的复位时刻还没到，一个 ping 不构成恢复凭据：解了锁存，告警就会被退避窗到期关掉、\n\
+             再被下一条真实请求以新键重开，一场断供被记成几十次「恢复」"
+        );
+        assert!(
+            !state.llm_health.is_suspect(&u),
+            "它确实答了一个 ping，自己的嫌疑窗要清掉——否则退避窗会一直按着它不复测"
+        );
+
+        // 另一半：话到期之后，同一个 ping 就该算恢复凭据了。不然锁存只能靠真实
+        // 请求解除，而池不可用时 LLM 依赖型任务已经暂停，没有真实请求会来。
+        state.llm_health.note_failure(
+            &u,
+            300,
+            Some(Utc::now().timestamp() - 60),
+            None,
+            Some(RefusalKind::QuotaCycle),
+        );
+        refresh_pool_state(&state).await;
+        assert!(state.pool_down.load(Ordering::SeqCst));
+        probe_suspect_upstreams(&state).await;
+        refresh_pool_state(&state).await;
+        assert!(
+            !state.pool_down.load(Ordering::SeqCst),
+            "复位时刻已过，这一次 ping 就是恢复证据；不认它，池会停在不可用上没人能解除"
         );
     }
 
