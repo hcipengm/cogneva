@@ -48,6 +48,7 @@
 use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
+use cog_core::{fill_slots, RefusalKind, UsageResult};
 use sqlx::{PgPool, Row};
 
 /// The ledger's per-call table.
@@ -203,14 +204,15 @@ pub struct LlmUsageRecord {
     pub api_style: String,
     /// Real model name as configured on the upstream.
     pub model: String,
-    /// `ok`, `error`, or `refused_by_circuit` — the last two carry zero tokens
-    /// but keep the attempt visible. The refusal is kept apart from `error`
-    /// because they name opposite repairs: an `error` row is an upstream that
-    /// was tried and did not serve, a refusal row is one that was never tried
-    /// because the whole pool was known unusable, and the second is what makes
-    /// a down window readable instead of reading like a window with no traffic.
-    /// On a refusal row `upstream` and `model` are `-`: no single upstream is
-    /// its subject, so both columns say so rather than naming a candidate.
+    /// One of [`UsageResult`]'s words. The two refusals carry zero tokens but
+    /// keep the attempt visible, and they are kept apart from `error` because
+    /// the words name opposite repairs: an `error` row is an upstream that was
+    /// tried and did not serve, `refused_by_circuit` is a call no upstream was
+    /// ever offered (the pool was known unusable), and `refused_by_pace` is one
+    /// this platform held back on purpose. Each reads as its own state rather
+    /// than as "no traffic". On a refusal row `upstream` and `model` are `-`:
+    /// no single upstream is its subject, so both columns say so rather than
+    /// naming a candidate.
     pub result: String,
     /// Calling component as normalized by the gateway (`self_review`,
     /// `agent:<role>`, `unknown`); lets per-actor token spend be audited.
@@ -535,6 +537,23 @@ pub fn windows_to_roll(
 }
 
 /// PostgreSQL usage store.
+/// 台账的两个闭集，按各自声明的全部取值铺成模板槽位。
+///
+/// 取 `ALL` 而不是只铺用到的那几个词：谓词写成 `{result:ok}` 这样的槽，词本身
+/// 由这里换上。一个模板若不慎写成某个枚举里不存在的词，槽就没人填、语句原样留下
+/// `{`，数据库当场拒解析——比一条永远选不中行的谓词好查得多。
+fn ledger_slots() -> Vec<(&'static str, &'static str)> {
+    UsageResult::ALL
+        .iter()
+        .map(|outcome| ("result", outcome.as_str()))
+        .chain(
+            RefusalKind::ALL
+                .iter()
+                .map(|kind| ("refusal", kind.as_str())),
+        )
+        .collect()
+}
+
 /// This store's schema, and the one a restore replays.
 ///
 /// One text because the list has an order: the ledger's additive columns are
@@ -543,7 +562,12 @@ pub fn windows_to_roll(
 /// const string cannot fold another const into itself — and the test below
 /// keeps those spellings and the [`LEDGER_TABLE`]/[`WINDOW_TABLE`]/
 /// [`ROLLUP_TABLE`] constants from drifting apart.
-pub const DDL: &str = r#"
+///
+/// The two partial indexes name a word from the ledger's closed sets. A partial
+/// index on a spelling no row carries is invisible: it is never chosen, so the
+/// reads it was added to make cheap fall back to a sequential scan, and the only
+/// sign is that a reading got slow again.
+const DDL_TEMPLATE: &str = r#"
 CREATE TABLE IF NOT EXISTS gateway_llm_usage (
     id            UUID PRIMARY KEY,
     ts            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -612,9 +636,9 @@ CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts);
 -- 这两个部分索引时两次取数都是全表顺序扫描：2026-10-22 实测 148k 行 / 34MB，
 -- 一次读数 223ms，且随行数线性变慢。部分索引把谓词写进索引，取数只碰匹配的行。
 CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ok_upstream
-    ON gateway_llm_usage (upstream, ts) WHERE result = 'ok';
+    ON gateway_llm_usage (upstream, ts) WHERE result = '{result:ok}';
 CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_quota_wall
-    ON gateway_llm_usage (upstream, ts) WHERE refusal_kind = 'quota_cycle';
+    ON gateway_llm_usage (upstream, ts) WHERE refusal_kind = '{refusal:quota_cycle}';
 -- One row per upstream **and window length**, not one per measurement: the
 -- pacer only ever acts on the newest window it has an observation for, and a
 -- history of stale boundaries would make "which one is in force" a question the
@@ -740,6 +764,14 @@ CREATE INDEX IF NOT EXISTS idx_gateway_llm_exchange_req ON gateway_llm_exchange 
 CREATE INDEX IF NOT EXISTS idx_gateway_llm_exchange_actor ON gateway_llm_exchange (actor, ts DESC);
 "#;
 
+/// The schema with the ledger's closed sets filled in.
+///
+/// A slot nobody fills stays in the text, which the database refuses on the
+/// first start rather than accepting as an index that never matches.
+pub fn ddl() -> String {
+    fill_slots(DDL_TEMPLATE, &ledger_slots())
+}
+
 #[derive(Clone)]
 pub struct LlmUsageStore {
     pool: PgPool,
@@ -759,10 +791,10 @@ impl LlmUsageStore {
 
     /// Auto-create every table, column and index this store owns.
     ///
-    /// The statements themselves are [`DDL`]: a restore replays that same list
+    /// The statements themselves are [`ddl`]: a restore replays that same list
     /// instead of keeping a second copy of the schema that only it would run.
     pub async fn init_schema(&self) -> anyhow::Result<()> {
-        sqlx::raw_sql(DDL).execute(&self.pool).await?;
+        sqlx::raw_sql(&ddl()).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -896,18 +928,20 @@ impl LlmUsageStore {
         upstream: &str,
         window_secs: u64,
     ) -> anyhow::Result<UpstreamWindowReading> {
+        let ok_word = UsageResult::Ok.as_str();
+        let wall_word = RefusalKind::QuotaCycle.as_str();
         let row = sqlx::query(&format!(
             r#"
             WITH ok AS (
                 SELECT ts, tokens_input + tokens_output AS tokens
                 FROM {LEDGER_TABLE}
-                WHERE upstream = $1 AND result = 'ok'
+                WHERE upstream = $1 AND result = '{ok_word}'
             ),
             last AS (SELECT MAX(ts) AS ts FROM ok),
             walls AS (
                 SELECT ts
                   FROM {LEDGER_TABLE}
-                 WHERE upstream = $1 AND refusal_kind = 'quota_cycle'
+                 WHERE upstream = $1 AND refusal_kind = '{wall_word}'
             ),
             wall AS (SELECT MAX(ts) AS ts FROM walls),
             -- The latest resume is the first success after the newest wall
@@ -990,10 +1024,11 @@ impl LlmUsageStore {
         since_unix: i64,
         until_unix: i64,
     ) -> anyhow::Result<u64> {
+        let ok_word = UsageResult::Ok.as_str();
         let row = sqlx::query(&format!(
             "SELECT COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT AS tokens
                FROM {LEDGER_TABLE}
-              WHERE upstream = $1 AND result = 'ok'
+              WHERE upstream = $1 AND result = '{ok_word}'
                 AND ts > to_timestamp($2::DOUBLE PRECISION)
                 AND ts <= to_timestamp($3::DOUBLE PRECISION)"
         ))
@@ -1073,10 +1108,11 @@ impl LlmUsageStore {
     /// boundary — the same pass cannot answer both without being told a fact it
     /// is the one computing.
     pub async fn spent_since(&self, upstream: &str, since_unix: i64) -> anyhow::Result<u64> {
+        let ok_word = UsageResult::Ok.as_str();
         let row = sqlx::query(&format!(
             "SELECT COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT AS tokens
                FROM {LEDGER_TABLE}
-              WHERE upstream = $1 AND result = 'ok'
+              WHERE upstream = $1 AND result = '{ok_word}'
                 AND ts >= to_timestamp($2::DOUBLE PRECISION)"
         ))
         .bind(upstream)
@@ -1202,10 +1238,12 @@ impl LlmUsageStore {
     /// job starting — nothing was sent — and counting them would let a paced
     /// job slip through on its own second attempt.
     pub async fn task_has_started(&self, task: &str) -> anyhow::Result<bool> {
+        let ok_word = UsageResult::Ok.as_str();
+        let error_word = UsageResult::Error.as_str();
         let row = sqlx::query(&format!(
             "SELECT EXISTS(
                  SELECT 1 FROM {LEDGER_TABLE}
-                  WHERE task_id = $1 AND result IN ('ok', 'error')
+                  WHERE task_id = $1 AND result IN ('{ok_word}', '{error_word}')
              ) AS started"
         ))
         .bind(task)
@@ -1230,13 +1268,14 @@ impl LlmUsageStore {
         days: i64,
         quantile: f64,
     ) -> anyhow::Result<Option<(u64, u64)>> {
+        let ok_word = UsageResult::Ok.as_str();
         let row = sqlx::query(&format!(
             r#"
             SELECT PERCENTILE_CONT($2) WITHIN GROUP (ORDER BY total) AS cost,
                    COUNT(*)::BIGINT AS jobs
               FROM (SELECT task_id, SUM(tokens_input + tokens_output)::BIGINT AS total
                       FROM {LEDGER_TABLE}
-                     WHERE result = 'ok' AND task_id IS NOT NULL
+                     WHERE result = '{ok_word}' AND task_id IS NOT NULL
                        AND ts > NOW() - make_interval(days => $1)
                      GROUP BY task_id) jobs
             "#
@@ -1271,11 +1310,12 @@ impl LlmUsageStore {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> anyhow::Result<Vec<ActorSpend>> {
+        let ok_word = UsageResult::Ok.as_str();
         let rows = sqlx::query(&format!(
             r#"
             SELECT actor, origin, upstream, api_style,
                    COUNT(*) AS calls,
-                   COUNT(*) FILTER (WHERE result <> 'ok') AS failed_calls,
+                   COUNT(*) FILTER (WHERE result <> '{ok_word}') AS failed_calls,
                    COALESCE(SUM(tokens_input), 0)::BIGINT  AS tokens_input,
                    COALESCE(SUM(tokens_output), 0)::BIGINT AS tokens_output,
                    COALESCE(SUM(tokens_cached), 0)::BIGINT AS tokens_cached,
@@ -1736,5 +1776,23 @@ mod tests {
         // also outside the set: "eval-pod-77" was the value the evaluation job
         // declared, and it read as nothing at all.
         assert_eq!(LlmOrigin::declared(Some("eval-pod-77")), LlmOrigin::Unknown);
+    }
+
+    /// 两条部分索引的谓词必须带着枚举声明的词渲染出来。
+    ///
+    /// 一个没填的槽会让整段 DDL 在第一次启动时被数据库拒解析——那时容器已经起来
+    /// 了，失败点在"建表"，而不在这里。所以这里断言渲染后的谓词逐字带着枚举的词，
+    /// 而不是只断言"没有花括号"：后者会把任何一段合法带花括号的 schema 误报成漏填，
+    /// 也会在槽被换成别的形状时照样放绿。
+    #[test]
+    fn the_schema_names_the_two_index_predicates_from_their_enums() {
+        let schema = ddl();
+        assert!(!schema.contains("{result:"), "结果词槽没有填上");
+        assert!(!schema.contains("{refusal:"), "拒绝成因槽没有填上");
+        assert!(schema.contains(&format!("WHERE result = '{}'", UsageResult::Ok.as_str())));
+        assert!(schema.contains(&format!(
+            "WHERE refusal_kind = '{}'",
+            RefusalKind::QuotaCycle.as_str()
+        )));
     }
 }

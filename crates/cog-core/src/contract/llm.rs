@@ -449,6 +449,125 @@ pub struct Usage {
     pub cost: crate::message::Cost,
 }
 
+/// What one attempt ended as, as far as the usage ledger is concerned.
+///
+/// The ledger keeps this in a `result` column and every reader predicates on
+/// one of the four words: the window readers sum the served rows, the failure
+/// readers count everything else, and the rollups split them. The spellings
+/// therefore have to agree between two crates that cannot see each other -- the
+/// gateway writes the rows, the observability crate queries them -- so the set
+/// lives here rather than beside either one.
+///
+/// Two of the four are refusals we made, not answers the upstream gave.
+/// `refused_by_circuit` means no upstream was even tried (the pool was shut),
+/// and `refused_by_pace` means the window's allowance was spent. Recording
+/// either as `error` would read as "the upstream answered wrong" and point the
+/// repair at the wrong place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageResult {
+    /// The call was served.
+    Ok,
+    /// An upstream was tried and the call did not complete.
+    Error,
+    /// The pool circuit refused before any upstream was selected.
+    RefusedByCircuit,
+    /// The window pacer refused before the request was sent.
+    RefusedByPace,
+}
+
+impl UsageResult {
+    /// Every value, in the order a reader lists them.
+    ///
+    /// The ledger's partial indexes and predicates name these words. A query
+    /// that spells one itself agrees with this enum only until a variant is
+    /// renamed, and then it matches no rows -- which reads exactly like a
+    /// ledger with nothing in it.
+    pub const ALL: [UsageResult; 4] = [
+        UsageResult::Ok,
+        UsageResult::Error,
+        UsageResult::RefusedByCircuit,
+        UsageResult::RefusedByPace,
+    ];
+
+    /// The word this outcome is stored under.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UsageResult::Ok => "ok",
+            UsageResult::Error => "error",
+            UsageResult::RefusedByCircuit => "refused_by_circuit",
+            UsageResult::RefusedByPace => "refused_by_pace",
+        }
+    }
+
+    /// Read one back. A value outside the set is refused rather than mapped to
+    /// a neighbour: an unknown word means the row was written by a build that
+    /// disagrees with this one.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|outcome| outcome.as_str() == s)
+    }
+}
+
+impl std::str::FromStr for UsageResult {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| format!("unknown usage result: {s}"))
+    }
+}
+
+/// 一次拒绝的成因，从上游的正文里读出来。
+///
+/// 它落在台账的 `refusal_kind` 列上，而那一列有一个部分索引与一条读数按
+/// `quota_cycle` 取行——写它的与读它的不在同一个 crate，所以这个闭集摆在两者都
+/// 依赖的这一层，而不是摆在写它的那一侧。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalKind {
+    /// 配额／用量类：窗口走完会自己好。
+    QuotaCycle,
+    /// 资格类：这台账号对上游没有使用权。等不会让它好。
+    Entitlement,
+    /// 有拒绝，但正文里读不出成因。
+    Unclassified,
+}
+
+impl RefusalKind {
+    /// 闭集里的全部取值。发布时**每一拍按这三种各发一条**，当前那一种 1、其余 0：
+    /// 只发当前那一种，上一拍那种会永远停在 1 上，而「这条上游是资格类」是一个
+    /// 会结束的状态。
+    pub const ALL: [RefusalKind; 3] = [Self::QuotaCycle, Self::Entitlement, Self::Unclassified];
+
+    /// 这个成因存进台账时用的那个词。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QuotaCycle => "quota_cycle",
+            Self::Entitlement => "entitlement",
+            Self::Unclassified => "unclassified",
+        }
+    }
+
+    /// 从它自己发布出去的名字读回来（跨进程载荷里存的就是这个名字）。
+    ///
+    /// 认不出的一律 `None`，不落到 `Unclassified`：认不出说明写它的那一代与读它的
+    /// 这一代对不齐，那是"这一格没有值"，而 `Unclassified` 是"上游写了话但我们没
+    /// 读懂"——把前者写成后者，会让一次版本错位看起来像上游回答得含糊。
+    pub fn from_name(name: &str) -> Option<Self> {
+        if name.is_empty() {
+            return None;
+        }
+        Self::ALL.into_iter().find(|k| k.as_str() == name)
+    }
+}
+
+impl std::str::FromStr for RefusalKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_name(s).ok_or_else(|| format!("unknown refusal kind: {s}"))
+    }
+}
+
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     async fn chat_stream(

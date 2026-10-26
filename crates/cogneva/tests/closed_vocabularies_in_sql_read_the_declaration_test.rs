@@ -101,6 +101,14 @@ fn parses_as_metric_type(word: &str) -> bool {
         .any(|kind| kind.as_str() == word)
 }
 
+fn parses_as_usage_result(word: &str) -> bool {
+    cog_core::UsageResult::parse(word).is_some()
+}
+
+fn parses_as_refusal_kind(word: &str) -> bool {
+    cog_core::RefusalKind::from_name(word).is_some()
+}
+
 /// One closed set of words and the columns a query asks about it with.
 struct Vocabulary {
     /// The column names this vocabulary is stored under. The subject is the
@@ -230,6 +238,25 @@ const VOCABULARIES: &[Vocabulary] = &[
         home: "cog_core::MetricType",
         except_in: &[],
     },
+    Vocabulary {
+        // The usage ledger's outcome. Two of its four words are refusals we
+        // made rather than answers the upstream gave; a stale word in a
+        // predicate reads as "nothing was refused" against a window that was
+        // nothing but refusals.
+        subjects: &["result"],
+        parses: parses_as_usage_result,
+        home: "cog_core::UsageResult",
+        except_in: &[],
+    },
+    Vocabulary {
+        // Why an upstream refused. The pacing reader selects the quota wall by
+        // this column, so a stale word means the last wall is never found and
+        // the pacer keeps pacing against a window it never saw end.
+        subjects: &["refusal_kind"],
+        parses: parses_as_refusal_kind,
+        home: "cog_core::RefusalKind",
+        except_in: &[],
+    },
 ];
 
 fn is_ident(b: u8) -> bool {
@@ -309,6 +336,13 @@ fn compared_words(b: &[u8], mut i: usize) -> Option<Vec<String>> {
         Some(skip_ws(b, j + 4))
     } else if b.get(i) == Some(&b'=') {
         Some(skip_ws(b, i + 1))
+    } else if b.get(i) == Some(&b'<') && b.get(i + 1) == Some(&b'>') {
+        // `<> 'ok'` names a word just as much as `= 'ok'` does, and the
+        // negative form is the one that goes stale silently: "everything that
+        // is not a success" keeps counting the rows under the old spelling.
+        Some(skip_ws(b, i + 2))
+    } else if b.get(i) == Some(&b'!') && b.get(i + 1) == Some(&b'=') {
+        Some(skip_ws(b, i + 2))
     } else {
         let mut j = i;
         if word_at(b, j, "NOT") {
@@ -488,6 +522,9 @@ fn the_reader_sees_every_shape_a_query_writes_a_word_in() {
         vec!["pending", "scheduled", "running"]
     );
     assert_eq!(words("WHERE status NOT IN ('failed')"), vec!["failed"]);
+    // 否定式与肯定式拼的是同一个词，读的人也只有一双眼。
+    assert_eq!(words("WHERE status <> 'failed'"), vec!["failed"]);
+    assert_eq!(words("WHERE status != 'failed'"), vec!["failed"]);
     assert_eq!(words("WHERE task ->> 'status' = 'failed'"), vec!["failed"]);
     assert_eq!(words("WHERE t.status::text = 'running'"), vec!["running"]);
     assert_eq!(
@@ -591,6 +628,15 @@ fn each_vocabulary_reads_its_own_declaration() {
     for kind in cog_core::NotificationType::ALL {
         assert!(parses_as_notification_type(kind.as_str()));
     }
+    for outcome in cog_core::UsageResult::ALL {
+        assert!(parses_as_usage_result(outcome.as_str()));
+    }
+    for kind in cog_core::RefusalKind::ALL {
+        assert!(parses_as_refusal_kind(kind.as_str()));
+    }
+    assert!(!parses_as_usage_result("completed"));
+    assert!(!parses_as_refusal_kind("retired"));
+    assert!(!parses_as_refusal_kind(""));
     assert!(!parses_as_backup_outcome("firing"));
     assert!(!parses_as_notification_type("promoted"));
     // A word from another set is not this set's: the judge has to be a set, not

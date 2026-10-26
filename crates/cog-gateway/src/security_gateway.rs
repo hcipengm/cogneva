@@ -30,7 +30,7 @@ use cog_core::contract::platform_sign::{
     platform_signature, PlatformOutlet, SignRefusal, SignRequest, SIGN_PATH,
 };
 use cog_core::contract::transport::{Credential, Operation, Transport};
-use cog_core::MetricsBackend;
+use cog_core::{MetricsBackend, RefusalKind, UsageResult};
 use cog_observability::alert_store::{AlertTransition, NewAlert, PostgresAlertStore};
 use cog_observability::analytics::{
     AnalyticsEvent, ClickHouseAnalyticsBackend, ClickHouseEventBuffer,
@@ -698,49 +698,6 @@ fn parse_quota_window_secs(body: &str) -> Option<u64> {
 /// 窗口长度的上界：上游写什么我们都不当"永远不可用"播报，超过一年的数只可能是
 /// 解析错了或上游文案变了，按一年截断并保留"这只是个窗口"的语义。
 const MAX_QUOTA_WINDOW_SECS: u64 = 366 * 86_400;
-
-/// 一条拒绝的可决策归类：**修它的动作**是哪一种。
-///
-/// 为什么要有这一格：上游的拒绝在池的读数面上本来是同一个形状——`llm_upstream_healthy`
-/// 为 0。而该做的动作在成因之间是相反的：配额窗口走完会自己好（等是对的），订阅失效、
-/// 模型未购买、账号被停**再等多少秒都一样**（等就是错的，而且等多久由读的人自己定）。
-/// 一个布尔读不出这个差别。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RefusalKind {
-    /// 配额／用量类：窗口走完会自己好。
-    QuotaCycle,
-    /// 资格类：这台账号对上游没有使用权。等不会让它好。
-    Entitlement,
-    /// 有拒绝，但正文里读不出成因。
-    Unclassified,
-}
-
-impl RefusalKind {
-    /// 闭集里的全部取值。发布时**每一拍按这三种各发一条**，当前那一种 1、其余 0：
-    /// 只发当前那一种，上一拍那种会永远停在 1 上，而「这条上游是资格类」是一个
-    /// 会结束的状态。
-    const ALL: [RefusalKind; 3] = [Self::QuotaCycle, Self::Entitlement, Self::Unclassified];
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::QuotaCycle => "quota_cycle",
-            Self::Entitlement => "entitlement",
-            Self::Unclassified => "unclassified",
-        }
-    }
-
-    /// 从它自己发布出去的名字读回来（跨进程载荷里存的就是这个名字）。
-    ///
-    /// 认不出的一律 `None`，不落到 `Unclassified`：认不出说明写它的那一代与读它的
-    /// 这一代对不齐，那是"这一格没有值"，而 `Unclassified` 是"上游写了话但我们没
-    /// 读懂"——把前者写成后者，会让一次版本错位看起来像上游回答得含糊。
-    fn from_name(name: &str) -> Option<Self> {
-        if name.is_empty() {
-            return None;
-        }
-        Self::ALL.into_iter().find(|k| k.as_str() == name)
-    }
-}
 
 /// 把一条拒绝的正文读成 [`RefusalKind`]。
 ///
@@ -2212,7 +2169,7 @@ fn normalize_actor(raw: Option<&str>) -> String {
 async fn record_llm_call(
     state: &AppState,
     upstream: &LlmUpstream,
-    result: &str,
+    result: UsageResult,
     latency_ms: u64,
     actor: &str,
     origin: &str,
@@ -2228,7 +2185,7 @@ async fn record_llm_call(
     let labels = [
         ("upstream", key.as_str()),
         ("model", upstream.model.as_str()),
-        ("result", result),
+        ("result", result.as_str()),
         ("actor", actor),
     ];
     record_counter(state, cog_core::metric_names::LLM_CALLS_TOTAL, &labels).await;
@@ -2246,7 +2203,7 @@ async fn record_llm_call(
         state,
         AnalyticsEvent::new("llm_call")
             .property("upstream", serde_json::json!(key))
-            .property("result", serde_json::json!(result))
+            .property("result", serde_json::json!(result.as_str()))
             .property("actor", serde_json::json!(actor))
             .property("latency_ms", serde_json::json!(latency_ms)),
     );
@@ -2275,21 +2232,21 @@ async fn record_llm_call(
 /// `record_llm_tokens` 带着真实用量落，所以这里对 `ok` 让位，避免同一次调用两行。
 fn failed_attempt_usage(
     upstream: &LlmUpstream,
-    result: &str,
+    result: UsageResult,
     latency_ms: u64,
     actor: &str,
     origin: &str,
     task: Option<&str>,
     refusal_kind: Option<RefusalKind>,
 ) -> Option<LlmUsageRecord> {
-    if result == "ok" {
+    if result == UsageResult::Ok {
         return None;
     }
     Some(LlmUsageRecord {
         upstream: LlmHealthTable::key(upstream),
         api_style: upstream.api_style.clone(),
         model: upstream.model.clone(),
-        result: result.to_string(),
+        result: result.as_str().to_string(),
         actor: actor.to_string(),
         origin: origin.to_string(),
         tokens_input: 0,
@@ -2318,13 +2275,6 @@ fn failed_attempt_usage(
     })
 }
 
-/// 池级熔断拒绝在台账 `result` 列上的取值。
-///
-/// 它是 `LlmUsageRecord::result` 的第三个值（前两个是 `ok` 与 `error`），因为
-/// 熔断拒的不是一次上游调用：池级判定在**选上游之前**就返回，一个上游都没试。
-/// 记成 `error` 会把"我们拒了"读成"上游答了错"，两者的修复方向正相反。
-pub const REFUSED_BY_CIRCUIT: &str = "refused_by_circuit";
-
 /// 池级拒绝那一行上，没有单一指名的列（`upstream` / `model`，以及在跨协议面
 /// 判定时的 `api_style`）取什么值。
 ///
@@ -2352,7 +2302,7 @@ fn pooled_refusal_usage(
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
         api_style: style.to_string(),
         model: POOLED_REFUSAL_UNNAMED.to_string(),
-        result: REFUSED_BY_CIRCUIT.to_string(),
+        result: UsageResult::RefusedByCircuit.as_str().to_string(),
         actor: actor.to_string(),
         origin: origin.to_string(),
         tokens_input: 0,
@@ -2378,14 +2328,12 @@ fn pooled_refusal_usage(
     }
 }
 
-/// 窗口配速拒绝在台账 `result` 列上的取值。
+/// 窗口配速拒绝的台账落点。与池级拒绝同形：一个上游都没试过，零用量是实情。
 ///
-/// 与 [`REFUSED_BY_CIRCUIT`] 分开是因为修法相反：熔断说"池里没有一家能接"，
-/// 该做的是补上游；配速说"这个窗口的额度摊到今天还不够开一件任务"，该做的
-/// 是等，而**等得越久越该等**——合成一类，读数面就只能看到"被拒了"，看不到
-/// 是被没有产能拒的、还是被我们自己按额度拒的。
-pub const REFUSED_BY_PACE: &str = "refused_by_pace";
-
+/// 与熔断拒绝分开记是因为修法相反：熔断说"池里没有一家能接"，该做的是补上游；
+/// 配速说"这个窗口的额度摊到今天还不够开一件任务"，该做的是等，而**等得越久
+/// 越该等**——合成一类，读数面就只能看到"被拒了"，看不到是被没有产能拒的、
+/// 还是被我们自己按额度拒的。
 /// 配速拒绝的台账落点。与池级拒绝同形：一个上游都没试过，零用量是实情。
 fn paced_refusal_usage(
     style: &str,
@@ -2398,7 +2346,7 @@ fn paced_refusal_usage(
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
         api_style: style.to_string(),
         model: POOLED_REFUSAL_UNNAMED.to_string(),
-        result: REFUSED_BY_PACE.to_string(),
+        result: UsageResult::RefusedByPace.as_str().to_string(),
         actor: actor.to_string(),
         origin: origin.to_string(),
         tokens_input: 0,
@@ -3038,7 +2986,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 async fn record_llm_tokens(
     state: &AppState,
     upstream: &LlmUpstream,
-    result: &str,
+    result: UsageResult,
     reading: UsageReading,
     latency_ms: u64,
     request: &RequestSide,
@@ -3094,7 +3042,7 @@ async fn record_llm_tokens(
         AnalyticsEvent::new("llm_usage")
             .property("upstream", serde_json::json!(key))
             .property("model", serde_json::json!(upstream.model))
-            .property("result", serde_json::json!(result))
+            .property("result", serde_json::json!(result.as_str()))
             .property("actor", serde_json::json!(actor))
             .property("tokens_in", serde_json::json!(reading.input))
             .property("tokens_out", serde_json::json!(reading.output))
@@ -3113,7 +3061,7 @@ async fn record_llm_tokens(
             upstream: key,
             api_style: upstream.api_style.clone(),
             model: upstream.model.clone(),
-            result: result.to_string(),
+            result: result.as_str().to_string(),
             actor: actor.to_string(),
             origin: origin.to_string(),
             tokens_input: reading.input,
@@ -3486,7 +3434,15 @@ impl Drop for UsageRecorder {
         // than a request.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                record_llm_tokens(&state, &upstream, "ok", reading, latency_ms, &request).await;
+                record_llm_tokens(
+                    &state,
+                    &upstream,
+                    UsageResult::Ok,
+                    reading,
+                    latency_ms,
+                    &request,
+                )
+                .await;
                 // 被丢弃的流也要留底：它的正文是"这次调用问到一半没了"的唯一现场，
                 // 而用量行只留下三个计数。
                 record_exchange(
@@ -3549,7 +3505,7 @@ fn wrap_usage_scan(
         record_llm_tokens(
             &recorder.state,
             &recorder.upstream,
-            "ok",
+            UsageResult::Ok,
             reading,
             latency_ms,
             &recorder.request,
@@ -5638,7 +5594,7 @@ async fn stream_forward(
                 record_llm_call(
                     &state,
                     upstream,
-                    "error",
+                    UsageResult::Error,
                     start.elapsed().as_millis() as u64,
                     &actor,
                     &origin,
@@ -5712,7 +5668,7 @@ async fn stream_forward(
             record_llm_call(
                 &state,
                 upstream,
-                "error",
+                UsageResult::Error,
                 start.elapsed().as_millis() as u64,
                 &actor,
                 &origin,
@@ -5752,7 +5708,7 @@ async fn stream_forward(
         record_llm_call(
             &state,
             upstream,
-            "ok",
+            UsageResult::Ok,
             elapsed_ms,
             &actor,
             &origin,
@@ -6270,7 +6226,7 @@ async fn call_llm(
                 record_llm_call(
                     state,
                     upstream,
-                    "ok",
+                    UsageResult::Ok,
                     start.elapsed().as_millis() as u64,
                     actor,
                     origin,
@@ -6286,7 +6242,7 @@ async fn call_llm(
                 record_llm_call(
                     state,
                     upstream,
-                    "error",
+                    UsageResult::Error,
                     start.elapsed().as_millis() as u64,
                     actor,
                     origin,
@@ -6386,7 +6342,7 @@ async fn call_one_upstream(
         record_llm_tokens(
             state,
             upstream,
-            "ok",
+            UsageResult::Ok,
             reading,
             start.elapsed().as_millis() as u64,
             &request_side,
@@ -6448,7 +6404,7 @@ async fn call_one_upstream(
     record_llm_tokens(
         state,
         upstream,
-        "ok",
+        UsageResult::Ok,
         reading,
         start.elapsed().as_millis() as u64,
         &request_side,
@@ -8947,7 +8903,7 @@ mod tests {
         // 失败尝试没有用量可带，于是曾经一条台账都不落，result 列只剩 ok。
         let row = failed_attempt_usage(
             &test_upstream(),
-            "error",
+            UsageResult::Error,
             12,
             "agent:generator",
             "sandbox",
@@ -8955,7 +8911,7 @@ mod tests {
             Some(RefusalKind::QuotaCycle),
         )
         .expect("a failed attempt must be visible in the ledger");
-        assert_eq!(row.result, "error");
+        assert_eq!(row.result, UsageResult::Error.as_str());
         assert_eq!(row.tokens_input, 0);
         assert_eq!(row.tokens_output, 0);
         assert_eq!(row.actor, "agent:generator");
@@ -8964,7 +8920,10 @@ mod tests {
         // The cause travels with the row: without it a spent window and an
         // unpurchased model are the same `error` cell, and they call for
         // opposite repairs.
-        assert_eq!(row.refusal_kind.as_deref(), Some("quota_cycle"));
+        assert_eq!(
+            row.refusal_kind.as_deref(),
+            Some(RefusalKind::QuotaCycle.as_str())
+        );
     }
 
     #[test]
@@ -8972,7 +8931,7 @@ mod tests {
         // 成功那条由 record_llm_tokens 带着真实用量落，这里必须让位。
         assert!(failed_attempt_usage(
             &test_upstream(),
-            "ok",
+            UsageResult::Ok,
             12,
             "agent:generator",
             "sandbox",
@@ -10824,10 +10783,15 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     #[tokio::test]
     async fn a_pooled_refusal_is_one_ledger_row_and_is_not_an_upstream_error() {
         let row = pooled_refusal_usage("openai", "agent:planner", "resident_worker", None, 300);
-        assert_eq!(row.result, REFUSED_BY_CIRCUIT);
-        assert_ne!(row.result, "ok", "记成 ok 就不进 failed_calls");
+        assert_eq!(row.result, UsageResult::RefusedByCircuit.as_str());
         assert_ne!(
-            row.result, "error",
+            row.result,
+            UsageResult::Ok.as_str(),
+            "记成 ok 就不进 failed_calls"
+        );
+        assert_ne!(
+            row.result,
+            UsageResult::Error.as_str(),
             "记成 error 会让读者去修上游，而要修的是池的窗口"
         );
         assert_eq!(
