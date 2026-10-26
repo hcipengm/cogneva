@@ -57,13 +57,7 @@ impl cog_core::SystemPlugin for SkillPlugin {
         };
         self.registry = Some(registry.clone());
 
-        let directories = vec![
-            std::path::PathBuf::from(cog_core::paths::APP_SKILLS_DIR),
-            std::path::PathBuf::from("/var/lib/cogneva/skills"),
-            dirs::home_dir()
-                .map(|h| h.join(".cogneva/skills"))
-                .unwrap_or_else(|| std::path::PathBuf::from("~/.cogneva/skills")),
-        ];
+        let directories = crate::registry::skill_directories();
 
         // 目标分解（action planner 的 decompose_goal）消费这份共享注册表；
         // 把扁平 JSON 技能定义（planner/generator/evaluator 等）装进来，

@@ -21,14 +21,31 @@ pub struct SkillConfig {
     pub hot_reload_interval_secs: u64,
 }
 
+/// The directories skills are read from, in the order they are read.
+///
+/// One list, because it was written in two places and the copies had already
+/// drifted apart: one expanded the home directory and the other handed
+/// `~/.cogneva/skills` on as a literal, which never resolves to anything. The
+/// writable copy sits under the data directory, the one place the process can
+/// write that survives a restart; the path it replaces
+/// (`/var/lib/cogneva/skills`) is mounted by no deployment, so the loader
+/// skipped that entry at every boot without saying so — a missing directory and
+/// a directory with nothing new in it look the same from inside a scan.
+pub fn skill_directories() -> Vec<PathBuf> {
+    let mut directories = vec![
+        PathBuf::from(cog_core::paths::APP_SKILLS_DIR),
+        cog_core::paths::data_path("skills"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        directories.push(home.join(".cogneva").join("skills"));
+    }
+    directories
+}
+
 impl Default for SkillConfig {
     fn default() -> Self {
         Self {
-            directories: vec![
-                PathBuf::from(cog_core::paths::APP_SKILLS_DIR),
-                PathBuf::from("/var/lib/cogneva/skills"),
-                PathBuf::from("~/.cogneva/skills"),
-            ],
+            directories: skill_directories(),
             hot_reload_interval_secs: 30,
         }
     }
