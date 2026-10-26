@@ -7,10 +7,13 @@
 //! value that a deployment can set. That is the shape this test closes: a
 //! workload port, a retention count, a git timeout written twice.
 //!
-//! The census counts every number a template writes outside `{{ }}` actions and
-//! outside comments, and holds it to `deploy/helm/cogneva/template-literals.tsv`,
-//! one row per (file, value) with an occurrence count, so a new site in a file
-//! that already writes that number is a count mismatch rather than an absence.
+//! The census counts every number a template writes outside comments -- in the
+//! document body and inside `{{ }}` actions alike -- and holds it to
+//! `deploy/helm/cogneva/template-literals.tsv`, one row per (file, value) with an
+//! occurrence count, so a new site in a file that already writes that number is a
+//! count mismatch rather than an absence. An action is mostly a value being read,
+//! but `randAlphaNum 32` is a length somebody typed, and a number a template
+//! computes and a number somebody typed are the same number on the page.
 //! Each row says which of two things the number is:
 //!
 //! - `fixed`: an identity that is not a dial -- a protocol port (443, 53), the
@@ -23,13 +26,15 @@
 //!   `values.yaml` key, so a new `dial` row is a red test rather than a budget.
 //!
 //! What is deliberately not counted, because it is not a number anybody chose:
-//! numbers inside `{{ }}` (that is a value being read, not written), numbers
-//! inside `{{/* ... */}}` or a `#` comment (prose), numbers carrying a unit or a
-//! version (e.g. `1000m`, `80Gi`, `v0.5.10`, `apps/v1`), an address or a date
-//! (`10.0.0.5`, `2026-10-20`), a shell file descriptor (`2>/dev/null`), a
-//! positional parameter (`$1`), and a range (`8080-8081`). A number a template
-//! computes and a number somebody typed are the same number on the page, so the
-//! census reads what is written and the register carries the judgement.
+//! anything inside `{{/* ... */}}` or a `#` comment (prose), a width handed to
+//! `indent`/`nindent` (punctuation), a number inside a quoted string in an action
+//! (the content of a string the template compares or prints -- the substitution
+//! table's patterns are exactly that, and the render fails loudly when one stops
+//! matching), numbers carrying a unit or a version (e.g. `1000m`, `80Gi`,
+//! `v0.5.10`, `apps/v1`), an address or a date (`10.0.0.5`, `2026-10-20`), a
+//! shell file descriptor (`2>/dev/null`), a positional parameter (`$1`), and a
+//! range (`8080-8081`). The register carries the judgement; the census only
+//! insists that every number reaches it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -251,12 +256,128 @@ fn literals(text: &str) -> Vec<String> {
     found
 }
 
+/// The numbers written inside `{{ }}` actions, except the two shapes that are
+/// not parameters at all.
+///
+/// An action is mostly a value being read, but not always: `randAlphaNum 32`
+/// asks for a secret of a stated length, and a template that grew
+/// `someHelper 500` would be a dial written where the census used to look away.
+/// Two shapes are skipped because they are not a number anybody chose about the
+/// deployment: a width handed to `indent`/`nindent` is punctuation, and a digit
+/// inside a quoted string is part of a string the template compares or prints
+/// (the substitution table's patterns are exactly that, and the render fails
+/// loudly when one of them stops matching).
+fn literals_in_actions(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut found = Vec::new();
+    let mut in_action = false;
+    let mut in_block_comment = false;
+    let mut quote: Option<char> = None;
+    let mut prev_word = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if !in_action {
+            if starts_with(&chars, i, "{{/*") {
+                in_action = true;
+                in_block_comment = true;
+                i += 4;
+                continue;
+            }
+            if starts_with(&chars, i, "{{") {
+                in_action = true;
+                prev_word.clear();
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            if starts_with(&chars, i, "*/}}") {
+                in_action = false;
+                in_block_comment = false;
+                i += 4;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if starts_with(&chars, i, "*/}}") {
+            in_action = false;
+            in_block_comment = false;
+            i += 4;
+            continue;
+        }
+        // `{{- /*` opens the same comment one dash and a space later.
+        if starts_with(&chars, i, "/*") {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if starts_with(&chars, i, "}}") {
+            in_action = false;
+            prev_word.clear();
+            i += 2;
+            continue;
+        }
+        if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            quote = Some(c);
+            prev_word.clear();
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            let blocked_before = start.checked_sub(1).is_some_and(|at| {
+                let c = chars[at];
+                c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$' || c == '/'
+            });
+            let blocked_after = chars
+                .get(i)
+                .is_some_and(|&c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+            let formatting = prev_word == "indent" || prev_word == "nindent";
+            if !blocked_before && !blocked_after && !formatting {
+                found.push(chars[start..i].iter().collect());
+            }
+            continue;
+        }
+        if c.is_ascii_alphanumeric() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            prev_word = chars[start..i].iter().collect();
+            continue;
+        }
+        if !c.is_whitespace() {
+            prev_word.clear();
+        }
+        i += 1;
+    }
+    found
+}
+
 /// How many times each (file, value) pair is written under [`TEMPLATES`].
 fn census() -> BTreeMap<(String, String), usize> {
     let root = repo_root().join(TEMPLATES);
     let mut out = BTreeMap::new();
     for file in template_files() {
-        for value in literals(&read(&root.join(&file))) {
+        let text = read(&root.join(&file));
+        let written = literals(&text)
+            .into_iter()
+            .chain(literals_in_actions(&text));
+        for value in written {
             *out.entry((file.clone(), value)).or_insert(0) += 1;
         }
     }
@@ -440,4 +561,18 @@ kind: Service
     // `42` is counted: a number inside a quoted value is still a number the
     // template wrote, and `value: "8080"` is exactly the shape that hides one.
     assert_eq!(literals(sample), vec!["8080", "42", "7", "640"]);
+
+    // Inside an action, the number a template writes is the length it asks for
+    // or the fallback it names -- both are typed, and neither can be set. The
+    // width handed to `nindent` is punctuation, a digit inside a quoted string
+    // is that string's content, and a block comment is prose.
+    let actions = "\
+  width: {{ .Values.x | nindent 4 }}
+  entropy: {{ randAlphaNum 32 }}
+  fallback: {{ .Values.port | default 9999 }}
+  pattern: {{ printf \"postgres.%s:5432\" .Values.ns }}
+  prose: {{/* the reading was 42 */}}
+  {{- /* and 43 here */}}
+";
+    assert_eq!(literals_in_actions(actions), vec!["32", "9999"]);
 }

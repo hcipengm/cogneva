@@ -41,6 +41,11 @@ sandbox.yaml	1001	2	fixed	the UID/GID the sandbox image runs as
 sandbox.yaml	124	2	fixed	coreutils timeout's exit status; a shell contract, not a dial
 searxng.yaml	977	3	fixed	the UID the searxng image runs as
 seaweedfs.yaml	1	1	fixed	the shell's stderr-to-stdout redirect (2>&1) in the readiness probe, not a number anybody chose
+secret.yaml	20	1	fixed	randAlphaNum 20 for the S3 access key id: an identifier the store's field sizes, not a bound anybody tunes
+secret.yaml	24	1	fixed	randAlphaNum 24 for the bootstrap admin password: entropy for a credential, not a capacity
+secret.yaml	32	2	fixed	randAlphaNum 32 for the internal database, cache and fingerprint secrets: entropy, not a capacity
+secret.yaml	40	4	fixed	randAlphaNum 40 for the internal signing and store secrets: entropy for a credential, not a capacity
+secret.yaml	48	2	fixed	randAlphaNum 48 for the JWT secrets: entropy for a credential, not a capacity
 security-gateway.yaml	0	1	fixed	maxSurge 0: a gateway pod holds in-flight proxied bodies and a rollout may not double it
 security-gateway.yaml	1	1	fixed	maxUnavailable 1: one gateway pod at a time is this rollout's shape
 security-gateway.yaml	1001	2	fixed	the runtime UID/GID the images are built with; every workload pins the same pair
