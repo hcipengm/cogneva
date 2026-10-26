@@ -114,7 +114,7 @@ pub use arming::{effective_config, effective_gate_for};
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1567,9 +1567,16 @@ pub struct BuildGate {
     /// When the bound was last moved. A build is a tens-of-minutes event, so the
     /// window only has to damp the derivation against its own samples.
     window: Mutex<Option<Instant>>,
-    /// The lock that elects the one process allowed to move the bound, taken
-    /// once and held for the life of the process.
-    controller: OnceLock<bool>,
+    /// Whether this process is the one elected to move the bound. Set once the
+    /// lock is won and never cleared, so the election cannot flap while the
+    /// winner lives; a process that lost keeps the right to ask again, because
+    /// the winner exiting is the one event it cannot otherwise see.
+    controller: AtomicBool,
+    /// When a process that is not the controller last asked again. The retry is
+    /// a failed `flock` rather than a decision, so it is cheap, but it runs on
+    /// the path a build takes to get a slot: once a window is often enough for
+    /// an exit, and keeps a scrape from becoming a lock attempt per request.
+    controller_retry: Mutex<Option<Instant>>,
     in_flight: AtomicU64,
     excluded: AtomicU64,
     waiting: AtomicU64,
@@ -1681,7 +1688,8 @@ impl BuildGate {
             dimension: Mutex::new(DIM_UNMEASURED),
             host: Mutex::new(None),
             window: Mutex::new(None),
-            controller: OnceLock::new(),
+            controller: AtomicBool::new(false),
+            controller_retry: Mutex::new(None),
             in_flight: AtomicU64::new(0),
             excluded: AtomicU64::new(0),
             waiting: AtomicU64::new(0),
@@ -1832,8 +1840,36 @@ impl BuildGate {
     /// election cannot flap: the first builder to start is the controller until
     /// it exits. Anyone else enforces what the controller decided, and holds
     /// back below it when its own reading says the host is worse.
+    ///
+    /// A survivor asks again rather than keeping the answer it got: the
+    /// non-controller enforces the smaller of its own derivation and the file,
+    /// so once nobody is left writing the file the gate admits exactly that
+    /// flat number, however much room the ceiling it keeps publishing reports.
+    /// Nothing else on the family moves -- no refusal is counted, no hold is
+    /// past its budget, the host readings are all arriving -- so the only way
+    /// this is ever noticed is if the survivor eventually takes the field.
     fn is_controller(&self) -> bool {
-        *self.controller.get_or_init(|| self.take_controller_lock())
+        if self.controller.load(Ordering::Relaxed) {
+            return true;
+        }
+        {
+            let mut last = self
+                .controller_retry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(at) = *last {
+                if at.elapsed() < BOUND_WINDOW {
+                    return false;
+                }
+            }
+            *last = Some(Instant::now());
+        }
+        if self.take_controller_lock() {
+            self.controller.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     #[cfg(unix)]
@@ -4435,6 +4471,50 @@ unevictable 28532736
             bound = next_bound(bound, ceiling, false);
         }
         assert_eq!(bound, ceiling);
+    }
+
+    /// A process that lost the election asks again, because the winner exiting
+    /// is not visible to it any other way.
+    ///
+    /// What a non-controller enforces is the smaller of its own derivation and
+    /// the file, so a file nobody writes any more pins the gate at the departed
+    /// controller's last number. The same process keeps publishing a ceiling
+    /// with room in it, and no refusal is counted against a bound that is
+    /// simply flat: every reading on the family looks healthy while fewer
+    /// builds run than the host would take. The answer used to be memoized for
+    /// the life of the process, so the survivor never asked a second time.
+    #[tokio::test]
+    async fn a_survivor_takes_the_field_back_when_the_controller_leaves() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gate");
+        fs::create_dir_all(&path).unwrap();
+
+        // Stand in for another process that won the election: an open file
+        // description holding LOCK_EX is the same fact, and dropping it is that
+        // process exiting.
+        let winner = open_gate_file(&path.join(CONTROLLER_FILE), true).expect("lock file");
+        let rc = unsafe { libc::flock(winner.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "the stand-in controller takes the field");
+
+        let survivor = gate(&path, 1, 0);
+        assert!(
+            !survivor.is_controller(),
+            "a second process does not take the field from a live controller"
+        );
+
+        drop(winner);
+
+        // The retry is damped to a window so a scrape does not become a lock
+        // attempt per request; the test moves the clock instead of waiting.
+        *survivor
+            .controller_retry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        assert!(
+            survivor.is_controller(),
+            "the survivor takes the field once the controller has left"
+        );
     }
 
     /// A host that cannot be read is not a host to size a bound for: the
