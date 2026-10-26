@@ -16,6 +16,10 @@
 
 use std::path::PathBuf;
 
+mod common;
+
+use common::rust_production::production_text;
+
 const DEPLOYER: &str = "crates/cog-reflection/src/mainline_deployer.rs";
 
 fn repo_root() -> PathBuf {
@@ -27,16 +31,34 @@ fn read(relative: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
 }
 
-/// Everything up to the first test-only item: a test may name anything it
-/// likes, and a fixture that dispatches a Job is not a dispatch site.
-fn production_source(text: &str) -> &str {
-    let cut = text
-        .match_indices("#[cfg(test)]")
-        .chain(text.match_indices("mod tests"))
-        .map(|(i, _)| i)
-        .min()
-        .unwrap_or(text.len());
-    &text[..cut]
+/// The shipped half of a file: a fixture that dispatches a Job is not a
+/// dispatch site, and a test may name anything it likes.
+///
+/// It used to end at the first test item, which is wrong for the file this gate
+/// reads: `mainline_deployer.rs` has a `#[cfg(test)]` helper at line 7,812 and
+/// 1,793 lines of production after it, and a dispatch added down there would
+/// have been outside the search while the gate still read as green.
+fn production_source(text: &str) -> String {
+    production_text(text)
+}
+
+/// The search covers the whole shipped file, not the part above its first test
+/// helper. The file this gate reads puts one at line 7,812 of 24,573 and keeps
+/// going, and a call below it is still a call.
+#[test]
+fn the_search_reaches_production_below_a_test_helper() {
+    let text = "fn above() { CALL_ABOVE(); }\n\n#[cfg(test)]\nfn a_fixture() { \
+                CALL_FIXTURE(); }\n\nfn below() { CALL_BELOW(); }\n";
+    let production = production_source(text);
+    assert!(production.contains("CALL_ABOVE"));
+    assert!(
+        production.contains("CALL_BELOW"),
+        "生产代码在测试夹具之后，判据必须读到它"
+    );
+    assert!(
+        !production.contains("CALL_FIXTURE"),
+        "夹具里的一次调用不是一处调用点"
+    );
 }
 
 /// Assembled at compile time so this file never contains the text it forbids.

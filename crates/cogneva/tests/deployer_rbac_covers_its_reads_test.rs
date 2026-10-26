@@ -45,6 +45,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+mod common;
+
+use common::rust_production::production_text;
+
 use cog_reflection::{workload_kind_of_resource, WORKLOAD_KINDS};
 use serde::Deserialize;
 
@@ -118,15 +122,16 @@ fn scanned(relative: &str) -> String {
     read(relative)
 }
 
-/// Everything up to the first test-only item: a fixture that writes an argv is
-/// not a command, and a test may name any resource it likes.
-fn production_source(text: &str) -> &str {
-    let cut = ["\n#[cfg(test)]\n", "\nmod tests {"]
-        .iter()
-        .filter_map(|marker| text.find(marker))
-        .min()
-        .unwrap_or(text.len());
-    &text[..cut]
+/// The shipped half of a file: a fixture that writes an argv is not a command,
+/// and a test may name any resource it likes.
+///
+/// It used to end at the first test item. `mainline_deployer.rs` is on this
+/// gate's list and carries a `#[cfg(test)]` helper at line 7,812 with 1,793
+/// lines of production after it, so a read added down there would have needed a
+/// grant that nothing here asked for -- the shape this whole file exists to
+/// catch, sitting outside the search.
+fn production_source(text: &str) -> String {
+    production_text(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -803,7 +808,7 @@ fn needed_for(file: &'static str, used: &mut BTreeSet<&'static str>) -> Vec<Obli
     let src = read(file);
     let body = production_source(&src);
     let mut needed = Vec::new();
-    for cmd in commands_in(file, body) {
+    for cmd in commands_in(file, &body) {
         if cmd.verb == "apply" {
             assert_eq!(
                 cmd.slot.as_deref().and_then(literal).as_deref(),
@@ -824,7 +829,7 @@ fn needed_for(file: &'static str, used: &mut BTreeSet<&'static str>) -> Vec<Obli
                 cmd.file, cmd.line, cmd.verb
             );
         }
-        let words = slot_words(body, slot, used).unwrap_or_else(|e| {
+        let words = slot_words(&body, slot, used).unwrap_or_else(|e| {
             panic!(
                 "{}:{} {} 的目标槽位 {slot:?}：{e}",
                 cmd.file, cmd.line, cmd.verb
@@ -900,7 +905,7 @@ fn the_scan_sees_the_commands_it_is_supposed_to() {
     for file in SCANNED {
         let src = read(file);
         let body = production_source(&src);
-        for cmd in commands_in(file, body) {
+        for cmd in commands_in(file, &body) {
             *seen.entry(cmd.verb.clone()).or_default() += 1;
         }
         for (group, resource, _) in needed_for(file, &mut used) {
@@ -970,7 +975,7 @@ fn every_file_that_talks_to_the_cluster_is_named() {
                 .expect("crate source below the repo root")
                 .to_string_lossy()
                 .replace('\\', "/");
-            if !commands_in(&rel, production_source(&text)).is_empty() {
+            if !commands_in(&rel, &production_source(&text)).is_empty() {
                 found.insert(rel);
             }
         }
