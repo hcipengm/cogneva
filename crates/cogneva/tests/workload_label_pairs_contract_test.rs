@@ -162,7 +162,7 @@ fn the_deployer_defaults_select_by_the_declared_pairs() {
     }
 }
 
-/// The one file allowed to spell the label keys.
+/// The one file allowed to spell the object keys.
 const DECLARATION: &str = "crates/cog-core/src/topology.rs";
 
 fn offences(text: &str) -> Vec<String> {
@@ -171,6 +171,7 @@ fn offences(text: &str) -> Vec<String> {
         for key in [
             cog_core::topology::LABEL_NAME,
             cog_core::topology::LABEL_COMPONENT,
+            cog_core::topology::TRACEPARENT_ANNOTATION,
         ] {
             if line.contains(key) {
                 hits.push(line.trim().to_string());
@@ -182,7 +183,7 @@ fn offences(text: &str) -> Vec<String> {
 }
 
 #[test]
-fn only_the_declaration_spells_a_label_key() {
+fn only_the_declaration_spells_an_object_key() {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -231,9 +232,10 @@ fn only_the_declaration_spells_a_label_key() {
     }
     assert!(
         hits.is_empty(),
-        "这些地方自己写了一遍标签键，没读 {DECLARATION} 里的声明。\
+        "这些地方自己写了一遍对象键（标签键或 trace 注解键），没读 {DECLARATION} 里的声明。\
          键写错一个字符时选择器只是匹配不到东西：返回空名单、退出码 0，\
-         读出来是「没有这个工作负载」，不是「键写错了」。\n{}",
+         读出来是「没有这个工作负载」；而注解键写错的那一半只是让某一段从追踪链上\
+         消失——两种都不是「键写错了」。\n{}",
         hits.join("\n")
     );
 }
@@ -254,6 +256,13 @@ fn the_census_reddens_on_code_and_ignores_comments_and_fixtures() {
         hits[0].contains("pub fn selector()"),
         "留下的应当是代码行，实得 {hits:?}"
     );
+
+    // 注解键走同一条判据：两个写者在一个 crate 里、读者在另一个 crate 里，
+    // 单改一处不会报错，只会让那一段从链上消失。
+    let annotation = cog_core::topology::TRACEPARENT_ANNOTATION;
+    let text = format!("pub fn annotate() {{ let _ = \"{{}}\"; }}\n// {annotation}\n");
+    let hits = offences(&text.replace("let _ = \"{}\"", &format!("let _ = \"{annotation}\"")));
+    assert_eq!(hits.len(), 1, "注解键也应当留下那行代码，实得 {hits:?}");
 }
 
 #[test]

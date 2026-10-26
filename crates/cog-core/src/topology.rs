@@ -13,8 +13,8 @@
 //! "the chart renamed this workload two commits ago". The rename itself is
 //! silent, because the chart and the code never meet at build time.
 //!
-//! `gate`: `crates/cogneva/tests/workload_names_contract_test.rs` reads the
-//! chart and fails if a constant here names a workload the chart does not
+//! `gate`: `crates/cogneva/tests/deployment_object_names_contract_test.rs` reads
+//! the chart and fails if a constant here names a workload the chart does not
 //! create, or if any other production source writes one of these names.
 //!
 //! The namespace is declared in the same place for the same reason, with one
@@ -99,6 +99,15 @@ pub const COMPONENT_EVOLUTION: &str = "evolution";
 /// garbage collection run selects by this, so a rename in the chart turns the
 /// reclaim into a no-op that reports success.
 pub const COMPONENT_REGISTRY: &str = "cluster-registry";
+
+/// The annotation a dispatched Job carries its trace id in.
+///
+/// Two writers put it on the Jobs they create -- the change job and the rollout
+/// job -- and one reader collects them back into a chain. A key spelled in three
+/// places is three chances to rename one of them, and the result of renaming one
+/// is not an error: a stage simply stops appearing in the trace, so the chain
+/// reads as shorter rather than as broken.
+pub const TRACEPARENT_ANNOTATION: &str = "cogneva.ai/traceparent";
 
 /// The directory every pod's service account is mounted at.
 ///

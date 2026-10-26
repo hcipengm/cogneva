@@ -19,8 +19,10 @@ use cog_core::{AgentTrace, RawRecord};
 
 /// The annotation a dispatched Job carries so its stage can be found by trace
 /// id. Written by both the change job and the rollout job; changing it in one
-/// place only is how a stage silently drops out of the chain.
-pub const TRACEPARENT_ANNOTATION: &str = "cogneva.ai/traceparent";
+/// place only is how a stage silently drops out of the chain. The value is
+/// declared in `cog_core::topology` because those two writers live in a crate
+/// this one does not depend on -- a declaration here had no readers there.
+pub const TRACEPARENT_ANNOTATION: &str = cog_core::topology::TRACEPARENT_ANNOTATION;
 
 /// The stages, in the order a request walks them. The order is fixed by the
 /// pipeline, not by the timestamps: a stage that starts before its predecessor

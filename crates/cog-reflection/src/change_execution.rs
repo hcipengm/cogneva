@@ -1201,7 +1201,9 @@ pub fn plan_change_job(
             "labels": labels,
             // 注解而不是 label：值里带连字符与十六进制串，label 的取值规则会拒掉
             // 一部分，而这条链宁可存不下也不该被悄悄截断成另一个 id。
-            "annotations": { "cogneva.ai/traceparent": traceparent },
+            "annotations": {
+                (cog_core::topology::TRACEPARENT_ANNOTATION): traceparent
+            },
         },
         "spec": {
             // 0：重试的代价是一次重复的构建与一次重复的提交，而「这条变更要不要再试」

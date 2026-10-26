@@ -6814,7 +6814,9 @@ impl MainlineDeployer {
                 },
                 // 注解而不是 label：traceparent 里带连字符，label 取值规则会拒掉
                 // 其中一部分，被拒绝的值只会让这一段的 id 消失。
-                "annotations": { "cogneva.ai/traceparent": traceparent },
+                "annotations": {
+                    (cog_core::topology::TRACEPARENT_ANNOTATION): traceparent
+                },
             },
             "spec": {
                 "backoffLimit": 0,
