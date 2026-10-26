@@ -159,22 +159,36 @@ else
     bad "7 own schema should be exempt and named, got rc=${rc}: ${out}"
 fi
 
-# 8. no shared-database file among the test files -- nothing judged
+# 8. a whole-table read filtered in process before the count -- counted, not red
+# Safe today only because the filter's key is unique per run, which the check
+# cannot read; printing it keeps the shape visible without holding the tree to a
+# semantic question.
+tree "$(shared_file '    let all = probe.catalog.load_all().await.expect("load every row");
+    let mine: Vec<_> = all.iter().filter(|c| c.category == probe.category()).collect();
+    assert_eq!(mine.len(), 1);')"
+out="$(run)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'CENSUS narrowed .*demo.rs' < <(printf '%s' "$out"); then
+    ok "8 in-process narrowing is counted and green, not silent"
+else
+    bad "8 in-process narrowing should print CENSUS and stay green, got rc=${rc}: ${out}"
+fi
+
+# 9. no shared-database file among the test files -- nothing judged
 tree '//! nothing shared here'
 out="$(run)"; rc=$?
 if [ "$rc" -eq 3 ] && grep -q 'judged nothing' < <(printf '%s' "$out"); then
-    ok "8 no shared-database file is exit 3, not zero defects"
+    ok "9 no shared-database file is exit 3, not zero defects"
 else
-    bad "8 should exit 3 and say nothing was judged, got rc=${rc}: ${out}"
+    bad "9 should exit 3 and say nothing was judged, got rc=${rc}: ${out}"
 fi
 
-# 9. no crate tree -- nothing judged
+# 10. no crate tree -- nothing judged
 rm -rf "${root}"
 out="$(run)"; rc=$?
 if [ "$rc" -eq 3 ] && grep -q 'cannot judge' < <(printf '%s' "$out"); then
-    ok "9 a missing crates/ tree is exit 3"
+    ok "10 a missing crates/ tree is exit 3"
 else
-    bad "9 a missing tree should exit 3, got rc=${rc}: ${out}"
+    bad "10 a missing tree should exit 3, got rc=${rc}: ${out}"
 fi
 
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"

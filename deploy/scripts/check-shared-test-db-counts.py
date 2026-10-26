@@ -54,10 +54,20 @@ What is judged, by shape rather than by method or table name:
 All of those together make a red. Each violation is named with `file:line`, so
 the repair is a jump, not a hunt.
 
+Reported, not judged: a whole-table read narrowed in process before the count
+(`load_all().await` then `.filter(|c| c.category == probe.category())`). It is
+safe today only because the filter's key happens to be unique per run; whether
+that stays true is a question about the key's value, which this cannot read. So
+it is counted and printed on every run, with its `file:line`, and it does not
+turn anything red. Measured 2026-10-26: two sites, `decision_stats_store.rs`
+and the repaired `dataset_catalog.rs`, whose filter keys compare against a
+per-run uuid.
+
 What this deliberately does not catch:
 
   * A test that narrows inside the predicate (`assert!(all.iter().all(|r| r.name
-    == own_name))`) is scoped correctly and is not seen as scoped here.
+    == own_name))`) is scoped correctly and is not seen as scoped here — there is
+    no `.filter` to find, so it is not even counted.
   * `assert!(all(0).is_empty())` is not judged: `LIMIT 0` returning no rows is
     the interface's contract and has nothing to do with how full the table is.
     Only "row count equals a literal" is judged.
@@ -144,10 +154,15 @@ def read_call(init):
 
 
 def only_limits(args):
-    """True when every argument is a numeric literal -- the read names no row."""
+    """True when every argument is a numeric literal -- the read names no row.
+
+    No arguments at all counts: `load_all()` is a whole-table read in the
+    strongest form, and treating "takes nothing" as "not a limit" would let the
+    shape through by the most direct route.
+    """
     args = args.strip()
     if not args:
-        return False
+        return True
     for a in args.split(","):
         a = a.strip()
         if not a:
@@ -157,26 +172,63 @@ def only_limits(args):
     return True
 
 
+def awaited_read(body, root):
+    """The awaited read behind `<root>`: (init, end offset) or None.
+
+    One level of indirection is followed, because the shape worth counting is
+    exactly that one: `let cells = store.load_all().await; let mine = cells
+    .into_iter().filter(..).collect(); assert_eq!(mine.len(), 2)` reads the
+    whole table and narrows it in process. Deeper chains are not followed --
+    one hop is where the shape lives, and following more turns this into a data
+    flow analysis that text cannot carry.
+    """
+    init, end = binding(body, root)
+    if init is None:
+        return None
+    if ".await" in init:
+        return init, end
+    for ident in dict.fromkeys(re.findall(r"\b([a-z_]\w*)\b", init)):
+        if ident == root:
+            continue
+        sub, sub_end = binding(body, ident)
+        if sub is not None and ".await" in sub:
+            return sub, sub_end
+    return None
+
+
 def judge(text, shown):
-    """Yield one message per unscoped whole-table count in this file."""
+    """Yield (severity, message) per whole-table count in this file.
+
+    `RED` is a violation. `CENSUS` is the same read narrowed in-process before
+    the count: it is safe today only because the filter's key is unique per run,
+    and nothing here can tell whether that is still true, so it is counted and
+    printed rather than judged.
+    """
     for start, end, _name in fn_bodies(text):
         body = text[start:end]
         for m in LEN_EQ.finditer(body):
             root = m.group("root_a") or m.group("root_b")
-            init, bind_end = binding(body, root)
-            if init is None or ".await" not in init:
+            found = awaited_read(body, root)
+            if found is None:
                 continue  # built here, not read
+            init, read_end = found
             method, args = read_call(init)
             if method is None or not only_limits(args):
                 continue  # the read already names what it wants
-            if NARROW.search(body[bind_end : m.start()]):
-                continue  # narrowed before counting
+            line = text[: start + m.start()].count("\n") + 1
+            where = f"`{root}` comes from `{method}({args.strip()})`"
+            if NARROW.search(body[read_end : m.start()]):
+                yield (
+                    "CENSUS",
+                    f"CENSUS narrowed {shown}:{line} whole-table read, filtered in "
+                    f"process before the count: {where}",
+                )
+                continue
             if CLEAN.search(body[: m.start()]):
                 continue  # emptied first, so the count is this run's own
-            line = text[: start + m.start()].count("\n") + 1
             yield (
-                f"RED  {shown}:{line} whole-table count with nothing narrowing it: "
-                f"`{root}` comes from `{method}({args.strip()})`"
+                "RED",
+                f"RED  {shown}:{line} whole-table count with nothing narrowing it: {where}",
             )
 
 
@@ -206,27 +258,32 @@ def main(argv):
         return 3
 
     own = [p for p in shared if OWN_SCHEMA.search(texts[p]) and OWN_SCHEMA_END.search(texts[p])]
-    violations = []
+    reds = []
+    narrowed = []
     for p in shared:
         if p in own:
             continue
         shown = p.relative_to(root)
-        violations.extend(judge(texts[p], shown))
+        for severity, message in judge(texts[p], shown):
+            (reds if severity == "RED" else narrowed).append(message)
 
-    for v in violations:
+    for v in reds:
         print(v)
         print(
             "     repair: narrow the read to the rows this run wrote (filter on its own "
             "name), or empty the table before counting -- the database is shared with "
             "every other test and with any earlier run that died before its cleanup"
         )
+    for v in narrowed:
+        print(v)
     for p in own:
         print(f"CENSUS exempt {p.relative_to(root)}: builds and drops its own schema")
     print(
         f"check-shared-test-db-counts: test_files={len(files)} shared={len(shared)} "
-        f"own_schema={len(own)} judged={len(shared) - len(own)} violations={len(violations)}"
+        f"own_schema={len(own)} judged={len(shared) - len(own)} "
+        f"narrowed={len(narrowed)} violations={len(reds)}"
     )
-    return 1 if violations else 0
+    return 1 if reds else 0
 
 
 if __name__ == "__main__":
