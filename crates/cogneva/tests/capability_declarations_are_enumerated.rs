@@ -71,6 +71,18 @@ const KNOWN: &[(&str, usize, &str)] = &[
          -- a third one would have to go through the same constructor",
     ),
     (
+        "crates/cog-gateway/src/search_admin.rs",
+        1,
+        "the settings page's own option list, not a promise about what this \
+         process can be asked to do: it names which response shapes and which \
+         capabilities the write side will accept for a fallback upstream. Both \
+         columns are mapped from the enums' own tables (`ResponseShape::\
+         CONFIGURABLE`, `Capability::ALL`) rather than spelled out, so the menu \
+         and the parser cannot drift apart -- an option the writer rejects, or a \
+         value the writer accepts that no page offers, are the two failures this \
+         shares a table to avoid",
+    ),
+    (
         "crates/cog-protocol/src/a2a.rs",
         2,
         "test fixtures: the wire shape a client parses back into an agent card -- \

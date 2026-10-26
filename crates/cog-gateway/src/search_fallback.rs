@@ -71,6 +71,19 @@ impl ResponseShape {
         }
     }
 
+    /// 能从设置面写进来的形状，按页面列出来的顺序。
+    ///
+    /// 这是枚举自己的表，不是页面旁边的第二份：设置面的读面照它列出选项、写面照它
+    /// 判"收不收这个形状"，两处读同一格。抄一份在旁边的话，加一种形状时两边各自
+    /// 都能自报成功——页面上选不到、或者选得到但保存被拒。
+    /// deepseek / kimi 不在这张表里：它们的 key 跟着现网 LLM 走，写进来就是同一把
+    /// key 的第二份副本，轮换之后必然有一份是旧的。
+    pub const CONFIGURABLE: &'static [ResponseShape] = &[
+        ResponseShape::Tavily,
+        ResponseShape::Exa,
+        ResponseShape::Qianfan,
+    ];
+
     /// 没见过的形状返回 `None`，由调用方丢弃**这一个条目**而不是整份配置。
     ///
     /// 丢弃一条与丢弃整份的差别在于可见性：只丢一条时其余几家照常工作，
@@ -101,6 +114,13 @@ pub enum Capability {
 }
 
 impl Capability {
+    /// 写面能收的全部取值，按菜单上的顺序。
+    ///
+    /// 设置面回给页面的那份选项就从这张表来，不在回包旁边再抄一遍：抄的那份会在
+    /// 加一种能力时少一格，而少的那一格表现为"写面收、页面上选不到"，两处都自报成功。
+    pub const ALL: &'static [Capability] =
+        &[Capability::Search, Capability::Fetch, Capability::Both];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Capability::Search => "search",

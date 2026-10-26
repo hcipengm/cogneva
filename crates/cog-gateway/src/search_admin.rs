@@ -115,8 +115,17 @@ pub async fn search_fallback_status_handler(
             // LLM（同一台主机、同一把 key、同一个轮换）。
             "from_llm": llm_shaped_entries(),
             "read_error": read_error,
-            "shapes": ["tavily", "exa", "qianfan"],
-            "capabilities": ["search", "fetch", "both"],
+            // 页面能选的两列都从枚举自己的表里取：写面收哪些形状 / 哪些能力由
+            // `ResponseShape::parse` 与 `Capability::parse` 决定，回包里手抄一份
+            // 就等于给同一件事留了第二个答案，而两个答案只在加分项的那天才对不上。
+            "shapes": ResponseShape::CONFIGURABLE
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+            "capabilities": Capability::ALL
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>(),
         })),
     )
         .into_response()
@@ -334,10 +343,7 @@ async fn read_secret(kube: &KubeClient) -> Result<Option<String>, String> {
 /// 形状名认不认得，供前端在提交前先问一次——与 [`ResponseShape::parse`] 同一条
 /// 判据，所以页面不会在客户端放行一个服务端必然拒绝的值。
 pub fn shape_is_accepted(raw: &str) -> bool {
-    matches!(
-        ResponseShape::parse(raw),
-        Some(ResponseShape::Tavily) | Some(ResponseShape::Exa) | Some(ResponseShape::Qianfan)
-    )
+    ResponseShape::parse(raw).is_some_and(|s| ResponseShape::CONFIGURABLE.contains(&s))
 }
 
 #[cfg(test)]
@@ -518,5 +524,48 @@ mod tests {
         for shape in ["deepseek", "kimi", "serper", ""] {
             assert!(!shape_is_accepted(shape), "{shape}");
         }
+    }
+
+    /// 菜单就是写面能收的那一集，两个方向都要对上。
+    ///
+    /// 少一格的表现是"能存、页面上选不到"；多一格的表现是"页面上能选、保存被拒"。
+    /// 两种都只在用户手里才现形，所以在这里各钉一侧：菜单上的每一项都得真能存进去，
+    /// 而写面拒掉的那种拼法不许出现在菜单上。
+    #[test]
+    fn the_menu_is_exactly_what_the_write_side_accepts() {
+        for shape in ResponseShape::CONFIGURABLE {
+            for capability in Capability::ALL {
+                let saved = merge_with_existing(
+                    &[request(
+                        None,
+                        shape.as_str(),
+                        "https://example.test",
+                        Some("k"),
+                        Some(capability.as_str()),
+                    )],
+                    &[],
+                )
+                .unwrap_or_else(|e| panic!("{} + {}: {e}", shape.as_str(), capability.as_str()));
+                assert_eq!(saved.len(), 1);
+            }
+        }
+        // 写面拒的那一种拼法不许借菜单混进来：它今天恰好不在表上，这条钉住的是
+        // "以后加一项时先想清楚写面收不收"，不是"crawl 这个名字特殊"。
+        let err = merge_with_existing(
+            &[request(
+                None,
+                "tavily",
+                "https://example.test",
+                Some("k"),
+                Some("crawl"),
+            )],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("crawl"), "{err}");
+        assert!(
+            !Capability::ALL.iter().any(|c| c.as_str() == "crawl"),
+            "写面不收的拼法不能出现在菜单上"
+        );
     }
 }
