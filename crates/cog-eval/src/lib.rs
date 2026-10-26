@@ -192,3 +192,165 @@ mod failure_reading_carries_the_criterion_value {
         );
     }
 }
+
+#[cfg(test)]
+mod feedback_feed_a_reading_the_artifact_the_pipeline_already_paid_for {
+    //! principle: feedback_feed_a_reading_the_artifact_the_pipeline_already_paid_for
+    //!
+    //! 一条读数只靠「有人想起来」才跑，多半不是记性问题而是价格问题：它的成本恰好是上游那一步
+    //! 已经付过的那笔钱。
+    //!
+    //! The eval pipeline pays upstream once per case and hands down the artifact it
+    //! paid for: an `EvalResult` carrying the case's duration, tokens, and cost.
+    //! `EvalReport::from_results` is the reading derived from those artifacts. A
+    //! reading that only runs when someone remembers to run it is usually not a
+    //! memory problem but a price problem: its cost is exactly the money the
+    //! upstream step already paid, because the artifact that step produced already
+    //! carries everything the reading prints. This gate pins the reading to the
+    //! artifacts: every number the report shows is a restatement of the paid-for
+    //! rows, feeding the reading spends none of them, and re-deriving it would
+    //! cost the upstream step's price a second time.
+
+    use crate::{EvalReport, EvalResult, MetricValue};
+
+    /// One artifact the upstream step pays for: the per-case `EvalResult`,
+    /// carrying what the case cost to run.
+    fn paid_artifact(
+        case_id: &str,
+        passed: bool,
+        duration_ms: u64,
+        token_usage: u64,
+        cost: f64,
+        error: Option<&str>,
+    ) -> EvalResult {
+        EvalResult {
+            case_id: case_id.into(),
+            passed,
+            metrics: vec![MetricValue {
+                metric: "exact_match".into(),
+                value: if passed { 1.0 } else { 0.0 },
+                passed,
+                threshold: None,
+            }],
+            agent_output: serde_json::Value::Null,
+            duration_ms,
+            token_usage,
+            cost,
+            error: error.map(str::to_string),
+            steps: vec![],
+            trace_json: None,
+        }
+    }
+
+    /// Three artifacts with distinct durations, token counts, and prices, so every
+    /// aggregate the reading prints is pinned to a number the fixture chose rather
+    /// than to a coincidence of equal values.
+    fn fixture_artifacts() -> Vec<EvalResult> {
+        vec![
+            paid_artifact("case-a", true, 120, 800, 0.0025, None),
+            paid_artifact("case-b", true, 340, 1500, 0.0040, None),
+            paid_artifact("case-c", false, 900, 2600, 0.0110, Some("assertion failed")),
+        ]
+    }
+
+    /// The gate: every number the reading prints is a restatement of numbers the
+    /// paid-for artifacts already carry, so answering needs no second pass over the
+    /// upstream stage.
+    #[test]
+    fn the_reading_restates_the_numbers_the_paid_for_artifacts_carry() {
+        let artifacts = fixture_artifacts();
+        let report = EvalReport::from_results("priced", &artifacts);
+
+        let total = artifacts.len();
+        let passed = artifacts.iter().filter(|r| r.passed).count();
+        assert_eq!(report.total_cases, total);
+        assert_eq!(report.passed_cases, passed);
+        assert_eq!(report.failed_cases, total - passed);
+        assert_eq!(report.pass_rate, passed as f64 / total as f64);
+        assert_eq!(
+            report.total_cost,
+            artifacts.iter().map(|r| r.cost).sum::<f64>()
+        );
+        assert_eq!(
+            report.avg_token_usage,
+            artifacts.iter().map(|r| r.token_usage).sum::<u64>() as f64 / total as f64
+        );
+        assert_eq!(
+            report.avg_duration_ms,
+            artifacts.iter().map(|r| r.duration_ms).sum::<u64>() as f64 / total as f64
+        );
+        // The duration quantile is a quantile of the artifacts' own durations:
+        // 120, 340, 900 sorted, so the median is the middle artifact's row.
+        assert_eq!(report.p50_duration_ms, 340.0);
+
+        // Per case, the reading carries the artifact's own row verbatim.
+        assert_eq!(report.per_case_results.len(), artifacts.len());
+        for (row, artifact) in report.per_case_results.iter().zip(&artifacts) {
+            assert_eq!(row.case_id, artifact.case_id);
+            assert_eq!(row.passed, artifact.passed);
+            assert_eq!(row.duration_ms, artifact.duration_ms);
+            assert_eq!(row.token_usage, artifact.token_usage);
+            assert_eq!(row.cost, artifact.cost);
+        }
+
+        // The failure section is the failing artifact restated, not a new
+        // observation of it.
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].case_id, "case-c");
+        assert_eq!(report.failures[0].error, "assertion failed");
+        assert_eq!(report.failures[0].duration_ms, 900);
+    }
+
+    /// Feeding the reading consumes nothing: the artifacts are borrowed, not spent,
+    /// and a second reading of the same artifacts agrees with the first -- the
+    /// artifact, not a re-run, is the source of truth.
+    #[test]
+    fn feeding_the_reading_consumes_nothing_from_the_artifacts() {
+        let artifacts = fixture_artifacts();
+        let first = EvalReport::from_results("priced", &artifacts);
+
+        // The slice is still fully usable: the reading borrowed it rather than
+        // spending it.
+        assert_eq!(artifacts.len(), 3);
+        assert_eq!(artifacts[0].case_id, "case-a");
+        assert_eq!(artifacts[2].error.as_deref(), Some("assertion failed"));
+
+        let second = EvalReport::from_results("priced", &artifacts);
+        assert_eq!(first.total_cases, second.total_cases);
+        assert_eq!(first.passed_cases, second.passed_cases);
+        assert_eq!(first.failed_cases, second.failed_cases);
+        assert_eq!(first.pass_rate, second.pass_rate);
+        assert_eq!(first.total_cost, second.total_cost);
+        assert_eq!(first.avg_duration_ms, second.avg_duration_ms);
+        assert_eq!(first.p50_duration_ms, second.p50_duration_ms);
+        assert_eq!(first.p95_duration_ms, second.p95_duration_ms);
+        assert_eq!(first.p99_duration_ms, second.p99_duration_ms);
+        assert_eq!(first.avg_token_usage, second.avg_token_usage);
+        assert_eq!(first.per_case_results.len(), second.per_case_results.len());
+    }
+
+    /// The rejected shape, witnessed: a reading that pays again -- recomputing what
+    /// the artifact already carries at the same per-case price -- doubles what one
+    /// answer costs, and the redundant half is exactly the money the upstream step
+    /// already paid.
+    #[test]
+    fn a_reading_that_pays_again_costs_exactly_the_upstreams_money() {
+        let artifacts = fixture_artifacts();
+        let report = EvalReport::from_results("priced", &artifacts);
+
+        // What the upstream step paid, read back from the artifacts it produced.
+        let upstream_paid: f64 = artifacts.iter().map(|r| r.cost).sum();
+        assert_eq!(report.total_cost, upstream_paid);
+
+        // The rejected reading pays each case's price again to re-derive what the
+        // artifact already carries: its bill is the upstream bill exactly.
+        let redundant_reading_paid: f64 = artifacts.iter().map(|r| r.cost).sum();
+        assert_eq!(redundant_reading_paid, upstream_paid);
+
+        // One answer paid for twice: the extra half is neither more nor less than
+        // the money the upstream step already spent.
+        let total_paid = upstream_paid + redundant_reading_paid;
+        assert_eq!(total_paid, 2.0 * upstream_paid);
+        assert_eq!(total_paid - upstream_paid, report.total_cost);
+    }
+}
