@@ -212,6 +212,7 @@ crates/cog-gateway/src/ide.rs	SEARCH_MAX_BYTES	64 * 1024 * 1024	bound	一次搜�
 crates/cog-gateway/src/ide.rs	SEARCH_MAX_FILES	5_000	bound	search answers synchronously, so it walks a bounded number of files before it stops looking
 crates/cog-gateway/src/ide.rs	SEARCH_MAX_LIMIT	500	bound	widest page of matches a caller may ask for
 crates/cog-gateway/src/ide.rs	TRANSFER_MAX_BYTES	8 * 1024 * 1024	bound	上传 / 下载的上限。比编辑器那条宽——整份构建产物、一张截图也该能搬进搬出， 但必须落在路由层请求体的封顶之下并留出余量：超过那条线的大请求在到达这里 之前就被拒，本层再给一个更大的数只会让两边说法不一致。
+crates/cog-gateway/src/ide.rs	READ_CHUNK_BYTES	64 * 1024	bound	流式读 `git show` 管道时一次拿多少字节：块越大系统调用越少，但要小到一次读不把这一页用不上的部分也搬进内存；64 KiB 落在这一对之间，且与文件大小无关，所以不随 MAX_FILE_BYTES 变
 crates/cog-gateway/src/knowledge.rs	MAX_TOP_K	100	bound	widest answer assembled over HTTP rather than an internal candidate window; the same ceiling the wiki search applies
 crates/cog-gateway/src/lib.rs	MAX_REQUEST_BODY_BYTES	10 * 1024 * 1024	bound	零凭证的集群内面：只挂 Pod 侧要走的 memory 路由，不挂认证/会话/配额。
 crates/cog-gateway/src/llm_admin.rs	PROBE_TIMEOUT	30s	bound	上游能力探测单次最多等多久。

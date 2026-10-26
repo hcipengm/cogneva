@@ -308,6 +308,17 @@ pub async fn run_chat_turn(
         );
         emit_delta(&out, &session_id, &assistant_mid, &ack).await;
         emit_message_end(&out, &session_id, &assistant_mid).await;
+        // 这一轮已经不再是「一句问答」：它交给编排器了，后面由任务与监督接管。
+        // 目标身份单独发一帧——界面要拿它去接「这个目标下的执行者在做什么」。
+        // 只写在回复正文里的话，界面只能靠解析一句话去认它，而那句话用户随时
+        // 可以让模型改口径。
+        emit(
+            &out,
+            &session_id,
+            "message.goal",
+            serde_json::json!({ "message_id": assistant_mid, "goal_id": goal_id }),
+        )
+        .await;
         // 可执行意图这一支也要留痕：下一次追问「刚才那个目标怎么样了」时，历史里
         // 得有这次提交，否则模型只看见一句没头没尾的追问。
         record_turn(&state.chat_turns, &session_id, &content, &ack).await;
@@ -509,6 +520,27 @@ mod tests {
         assert!(text.contains("分解失败"), "{text}");
         assert!(text.contains("no executable tasks"), "{text}");
         assert!(!text.contains("已受理"), "{text}");
+    }
+
+    /// 目标身份必须走自己的一帧。
+    ///
+    /// 它现在只写在回复正文里也能被读到——但那是让人去解析一句话，而这句话的措辞
+    /// 随提示词改。界面靠名字认这一帧：名字改了，界面不会报错，只是从此再也接不上
+    /// 「这道目标下的执行者在做什么」。所以名字与两个字段一起钉在这里。
+    #[test]
+    fn a_goal_submission_carries_its_identity_in_its_own_frame() {
+        let raw = envelope(
+            "s1",
+            "message.goal",
+            serde_json::json!({ "message_id": "m-1", "goal_id": "goal-9" }),
+        );
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("frame is JSON");
+        let event = &value["payload"];
+        assert_eq!(event["type"], "message.goal");
+        assert_eq!(event["payload"]["goal_id"], "goal-9");
+        assert_eq!(event["payload"]["message_id"], "m-1");
+        // 会话身份在信封上，不在帧体里：界面按它把这一帧落回哪一段对话。
+        assert_eq!(value["session_id"], "s1");
     }
 
     /// 分解成功：行还是 Pending（答案要等收口任务跑完才抄回来），但声明已经在了，

@@ -81,6 +81,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
   const endMessage = useStreamStore((state) => state.endMessage);
   const finishMessage = useStreamStore((state) => state.finishMessage);
   const noteTaskStatus = useStreamStore((state) => state.noteTaskStatus);
+  const noteToolCall = useStreamStore((state) => state.noteToolCall);
   const setConnectionStatus = useStreamStore(
     (state) => state.setConnectionStatus
   );
@@ -234,6 +235,51 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
             }
             streaming.current.delete(agentId);
           }
+          break;
+        }
+        case 'tool_execution_start': {
+          const id = typeof p.tool_call_id === 'string' ? p.tool_call_id : null;
+          if (!id) break;
+          noteToolCall({
+            id,
+            agent: agentId,
+            name: typeof p.tool_name === 'string' ? p.tool_name : '',
+            args: p.args,
+            status: 'running',
+            at: event.timestamp,
+          });
+          changedState = true;
+          break;
+        }
+        case 'tool_execution_update': {
+          const id = typeof p.tool_call_id === 'string' ? p.tool_call_id : null;
+          if (!id) break;
+          // 线上这一族把中途输出放在 `partial_result` 里（`ToolExecutionUpdate`）；
+          // 早先按 `chunk`/`delta`/`output` 去读，读到的一直是空——一次长工具在
+          // 面板上于是只剩「输出中」三个字，没有输出。
+          const chunk = p.partial_result ?? p.chunk ?? p.delta ?? p.output;
+          noteToolCall({
+            id,
+            agent: agentId,
+            name: typeof p.tool_name === 'string' ? p.tool_name : '',
+            progress: typeof chunk === 'string' ? chunk : JSON.stringify(chunk ?? '') ?? '',
+            status: 'running',
+            at: event.timestamp,
+          });
+          break;
+        }
+        case 'tool_execution_end': {
+          const id = typeof p.tool_call_id === 'string' ? p.tool_call_id : null;
+          if (!id) break;
+          noteToolCall({
+            id,
+            agent: agentId,
+            name: typeof p.tool_name === 'string' ? p.tool_name : '',
+            result: p.result,
+            status: p.is_error ? 'error' : 'ok',
+            at: event.timestamp,
+          });
+          changedState = true;
           break;
         }
         case 'task_status_change': {

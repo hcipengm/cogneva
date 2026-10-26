@@ -148,7 +148,8 @@ export type ChatFrameKind =
   | 'end'
   | 'thinking_start'
   | 'thinking_delta'
-  | 'thinking_end';
+  | 'thinking_end'
+  | 'goal';
 
 /** 帧名 → 这一帧在做什么。不在这张表里的名字不是聊天帧。 */
 const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
@@ -158,6 +159,8 @@ const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
   'message.thinking_start': 'thinking_start',
   'message.thinking_delta': 'thinking_delta',
   'message.thinking_end': 'thinking_end',
+  // 这一轮被受理成了一道目标：后面由任务与监督接管，不再是「一句话的问答」。
+  'message.goal': 'goal',
 };
 
 export interface ChatFrame {
@@ -171,6 +174,8 @@ export interface ChatFrame {
   role: 'user' | 'assistant' | 'system' | null;
   /** 只有 `*_delta` 带着增量。 */
   delta: string | null;
+  /** 只有 `goal` 帧带着：这句话被受理成的那道目标。 */
+  goalId: string | null;
   timestamp: string;
 }
 
@@ -204,6 +209,7 @@ export function normalizeChatFrame(
     role:
       role === 'user' || role === 'assistant' || role === 'system' ? role : null,
     delta: typeof inner.delta === 'string' ? inner.delta : null,
+    goalId: typeof inner.goal_id === 'string' ? inner.goal_id : null,
     timestamp:
       (payload.timestamp as string | undefined) ?? new Date().toISOString(),
   };

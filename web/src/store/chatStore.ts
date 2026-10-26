@@ -47,6 +47,33 @@ export interface ChatSession {
   hydrateError: string | null;
   /** 正在流的那一条。 */
   streaming: string | null;
+  /**
+   * 这段对话受理成的目标，带交出时间。空表示它到现在还只是「一问一答」——关掉
+   * 窗口，这一轮就没有下文了。非空表示它有活交给了编排器：后面的分解、调度与
+   * 重试由监督接管，关掉窗口它继续跑，回来接得上。
+   *
+   * 交出的时刻要留着：执行者的工具调用帧只带 `agent_id`，要把它们归到这道目标
+   * 下面，除了「谁」还得知道「从什么时候起」。
+   */
+  goals: GoalRef[];
+}
+
+export interface GoalRef {
+  id: string;
+  at: string;
+}
+
+/**
+ * 一段对话的两种身份，读的是它自己有没有把活交出去。
+ *
+ * 不按「用户勾了常驻吗」判：勾选只是意愿，而界面要说的是这件事**现在**有没有人
+ * 接着做。目标是平台里唯一那种「关掉浏览器还在跑」的东西，所以有目标就是常驻，
+ * 没有就是可下线。
+ */
+export type SessionKind = 'chat' | 'dispatch';
+
+export function sessionKind(session: Pick<ChatSession, 'goals'>): SessionKind {
+  return session.goals.length > 0 ? 'dispatch' : 'chat';
 }
 
 interface ChatState {
@@ -98,6 +125,7 @@ function emptySession(id: string): ChatSession {
     hydrating: false,
     hydrateError: null,
     streaming: null,
+    goals: [],
   };
 }
 
@@ -294,6 +322,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
         case 'thinking_end':
           break;
+
+        case 'goal': {
+          if (!frame.goalId) break;
+          if (!session.goals.some((goal) => goal.id === frame.goalId)) {
+            session = {
+              ...session,
+              goals: [...session.goals, { id: frame.goalId, at: frame.timestamp }],
+            };
+          }
+          break;
+        }
       }
 
       return {

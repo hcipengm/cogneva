@@ -69,6 +69,7 @@ export class MockEventStreamClient {
       kind,
       role: (fields.role as 'user' | 'assistant' | null) ?? null,
       delta: (fields.delta as string | null) ?? null,
+      goalId: (fields.goalId as string | null) ?? null,
       timestamp: new Date().toISOString(),
     });
   }

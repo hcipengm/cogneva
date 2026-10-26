@@ -41,6 +41,10 @@ const BINARY_PROBE_BYTES: usize = 8192;
 /// 但必须落在路由层请求体的封顶之下并留出余量：超过那条线的大请求在到达这里
 /// 之前就被拒，本层再给一个更大的数只会让两边说法不一致。
 const TRANSFER_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// 流式读一次拿多少字节。读的是 `git show` 的管道，块越大系统调用越少，但一块
+/// 得小到一次读不会把这一页用不上的部分也搬进内存——64 KiB 是这两头之间的取法，
+/// 与文件大小无关，所以它单独是一个界，不跟着 `MAX_FILE_BYTES` 变。
+const READ_CHUNK_BYTES: usize = 64 * 1024;
 /// 一次搜索最多走多少个文件、读多少字节：搜索是同步回答的请求，没有一个
 /// 上界时一个装满构建产物的根目录会让这一次请求把连接占满。
 const SEARCH_MAX_FILES: usize = 5_000;
@@ -645,7 +649,7 @@ async fn read_project_file(repo: &Path, rev: &str, rel: &str) -> Result<FileResp
             .map_err(|e| ApiError::internal(format!("cannot run git: {e}")))?;
         let mut out = Vec::with_capacity(want.min(MAX_FILE_BYTES as usize));
         if let Some(stdout) = child.stdout.as_mut() {
-            let mut buf = [0u8; 64 * 1024];
+            let mut buf = [0u8; READ_CHUNK_BYTES];
             while out.len() < want {
                 let n = stdout
                     .read(&mut buf)

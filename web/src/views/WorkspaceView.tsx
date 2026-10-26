@@ -1,7 +1,11 @@
-import { useCallback, useEffect } from 'react';
+import { useCallback, useEffect, useMemo } from 'react';
+import { getProcessOverview } from '@/api/client';
 import { CanvasStage } from '@/canvas/CanvasStage';
 import { ConversationPane } from '@/conversation/ConversationPane';
+import { goalLiveIndex } from '@/conversation/dispatch';
+import { useResource } from '@/hooks/useResource';
 import { useServices } from '@/shell/context';
+import { resourceKey } from '@/store/frameTick';
 import { useShell } from '@/shell/store';
 import { useChatStore } from '@/store/chatStore';
 import { useStreamStore } from '@/store/streamStore';
@@ -29,6 +33,15 @@ export function WorkspaceView() {
   const connectionStatus = useStreamStore((s) => s.connectionStatus);
   const activity = useStreamStore((s) => s.activity);
   const setPanelTab = useShell((s) => s.setPanelTab);
+
+  // 每段对话交出去的目标现在做到哪儿了。对话面自己画不出「交给谁了」——那部分
+  // 在任务图上，所以这一段总览由这一层读一次、折成一张表给所有窗格共用。
+  const processes = useResource('流程总览', getProcessOverview, 10_000, !USE_MOCK, [
+    'tasks',
+    'agents',
+    resourceKey('processes'),
+  ]);
+  const goalLive = useMemo(() => goalLiveIndex(processes.data), [processes.data]);
 
   const order = useChatStore((s) => s.order);
   const active = useChatStore((s) => s.active);
@@ -80,6 +93,7 @@ export function WorkspaceView() {
               closable={order.length > 1}
               historyEnabled={!USE_MOCK}
               clientRef={clientRef}
+              goalLive={goalLive}
             />
           ))}
         </div>

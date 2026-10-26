@@ -1,6 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { callsForGoal, shortGoal, type GoalLive } from '@/conversation/dispatch';
+import { callsignOf } from '@/conversation/callsign';
 import type { StreamClient } from '@/hooks/useEventStream';
-import { useChatStore, type ChatMessage } from '@/store/chatStore';
+import { sessionKind, useChatStore, type ChatMessage, type ChatSession } from '@/store/chatStore';
+import { useStreamStore, type ToolCallRecord } from '@/store/streamStore';
 
 /**
  * 一段对话的窗口。
@@ -75,6 +78,115 @@ function Turn({ message }: { message: ChatMessage }) {
   );
 }
 
+/**
+ * 一次工具调用在对话流里的样子。
+ *
+ * 不是一行日志：它是这一段对话里真的发生过的一件事，要能展开看它传了什么、回了
+ * 什么。收起来时只留一行——工具名、哪个执行者、成没成；展开时给原文。默认收起是
+ * 因为一次运行能调几十次，全展开就把回复挤到屏幕外面去了。
+ */
+function ToolTurn({ call }: { call: ToolCallRecord }) {
+  const [open, setOpen] = useState(false);
+  const tone =
+    call.status === 'error' ? 'var(--danger)' : call.status === 'running' ? 'var(--brass)' : 'var(--ok)';
+  const label = call.status === 'error' ? '失败' : call.status === 'running' ? '进行中' : '返回';
+  return (
+    <article className="group relative pl-4">
+      <span aria-hidden className="absolute left-0 top-1 bottom-1 w-px" style={{ background: 'var(--line)' }} />
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-baseline gap-2 text-left"
+        title="展开这次调用的入参与返回"
+      >
+        <span className="mono text-[11px]" style={{ color: 'var(--paper-dim)' }}>
+          工具
+        </span>
+        <span className="mono text-[11px]" style={{ color: 'var(--paper)' }}>
+          {call.name || '未命名'}
+        </span>
+        <span className="mono text-[10px] text-[var(--muted)]">
+          {call.agent ? call.agent.slice(0, 8) : '未知执行者'}
+        </span>
+        <span className="mono text-[10px]" style={{ color: tone }}>
+          {label}
+        </span>
+        <span className="mono ml-auto text-[10px] text-[var(--muted)]">{stamp(call.startedAt)}</span>
+      </button>
+      {open && (
+        <div className="mt-1 flex flex-col gap-1 border-l border-[var(--line)] pl-2">
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)]">入参</div>
+            <pre className="mono max-h-48 overflow-auto whitespace-pre-wrap break-all text-[11px] text-[var(--paper-dim)]">
+              {call.args || '（没有入参）'}
+            </pre>
+          </div>
+          {call.progress && (
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)]">中途输出</div>
+              <pre className="mono max-h-48 overflow-auto whitespace-pre-wrap break-all text-[11px] text-[var(--muted)]">
+                {call.progress}
+              </pre>
+            </div>
+          )}
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)]">返回</div>
+            <pre
+              className="mono max-h-64 overflow-auto whitespace-pre-wrap break-all text-[11px]"
+              style={{ color: call.status === 'error' ? 'var(--danger)' : 'var(--paper-dim)' }}
+            >
+              {call.result || (call.status === 'running' ? '还在跑' : '（空）')}
+            </pre>
+          </div>
+        </div>
+      )}
+    </article>
+  );
+}
+
+/**
+ * 这段对话是哪种：关掉就断的一问一答，还是已经交给守护接着做的活。
+ *
+ * 判的是它有没有把目标交出去，不是用户勾了什么：勾选是意愿，屏幕上要说的是这件事
+ * 现在有没有人接着做。
+ */
+function KindBadge({ session, live }: { session: ChatSession; live: GoalLive[] }) {
+  const kind = sessionKind(session);
+  if (kind === 'chat') {
+    return (
+      <span
+        className="shrink-0 border border-[var(--line)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]"
+        title="一问一答：回复只走当前这条连接。关掉这一段，这一轮就没有下文了——说过的话仍然记在历史里。"
+      >
+        可下线
+      </span>
+    );
+  }
+  const running = live.reduce((sum, goal) => sum + goal.running, 0);
+  const total = live.reduce((sum, goal) => sum + goal.total, 0);
+  const done = live.reduce((sum, goal) => sum + goal.completed, 0);
+  const failed = live.reduce((sum, goal) => sum + goal.failed, 0);
+  return (
+    <span
+      className="flex shrink-0 items-baseline gap-1.5 border px-1.5 py-0.5 text-[10px]"
+      style={{ borderColor: 'var(--ok)', color: 'var(--ok)' }}
+      title={
+        '已交给编排器：任务由分解、调度与监督接管，关掉这一段它继续跑，回来接得上。' +
+        (total > 0 ? `这道目标下 ${total} 个任务，${done} 个收口、${running} 个在跑。` : '还在分解，子任务尚未落地。')
+      }
+    >
+      <span>常驻 · 守护</span>
+      {total > 0 && (
+        <span className="mono text-[var(--muted)]">
+          {done}/{total}
+          {running > 0 ? ` · 跑 ${running}` : ''}
+          {failed > 0 ? ` · 失败 ${failed}` : ''}
+        </span>
+      )}
+    </span>
+  );
+}
+
 export interface ConversationPaneProps {
   sessionId: string;
   active: boolean;
@@ -89,6 +201,13 @@ export interface ConversationPaneProps {
    * 同一个样子。
    */
   historyEnabled?: boolean;
+  /**
+   * 平台这一拍的流程总览折成的目标表（按 `goal_id`）。
+   *
+   * 这不是给对话面凑一列数字：它决定这一段对话是不是「常驻」，也决定工具调用该
+   * 归到谁名下。没有它的时候两件事都只能猜，而猜出来的「守护中」比不显示更坏。
+   */
+  goalLive?: Record<string, GoalLive>;
 }
 
 export function ConversationPane({
@@ -99,6 +218,7 @@ export function ConversationPane({
   clientRef,
   closable,
   historyEnabled = true,
+  goalLive,
 }: ConversationPaneProps) {
   const session = useChatStore((s) => s.sessions[sessionId]);
   const appendUserTurn = useChatStore((s) => s.appendUserTurn);
@@ -106,6 +226,44 @@ export function ConversationPane({
   const [draft, setDraft] = useState('');
   const scrollerRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
+  /** 这一段交出去的目标，按总览折出来的现状。总览里还没有的那几道如实缺席。 */
+  const live = useMemo(
+    () => (session?.goals ?? []).map((goal) => goalLive?.[goal.id]).filter(Boolean) as GoalLive[],
+    [goalLive, session?.goals]
+  );
+  const toolCalls = useStreamStore((s) => s.toolCalls);
+  /**
+   * 这一段自己的执行者调过的工具，按时间接回对话里。
+   *
+   * 一道目标一个人接：先交出去的那道从自己的时刻起算，后交出去的各自从自己的时刻
+   * 起算——同一段对话交过两次活时，第二次不该把第一次的调用也算成自己的。
+   */
+  const tools = useMemo(() => {
+    const goals = session?.goals ?? [];
+    const collected: ToolCallRecord[] = [];
+    for (const goal of goals) {
+      for (const call of callsForGoal(toolCalls, goalLive?.[goal.id], goal.at)) {
+        if (!collected.some((seen) => seen.id === call.id)) collected.push(call);
+      }
+    }
+    return collected.sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
+  }, [goalLive, session?.goals, toolCalls]);
+  /** 说与做并成一条时间线。时刻读不出来的排在最前——宁可前也不能藏。 */
+  const timeline = useMemo(() => {
+    type Item =
+      | { kind: 'tool'; at: number; call: ToolCallRecord }
+      | { kind: 'message'; at: number; message: ChatMessage };
+    const items: Item[] = (session?.messages ?? []).map((message) => ({
+      kind: 'message' as const,
+      at: Date.parse(message.at),
+      message,
+    }));
+    for (const call of tools) {
+      items.push({ kind: 'tool' as const, at: Date.parse(call.startedAt), call });
+    }
+    const rank = (at: number) => (Number.isFinite(at) ? at : 0);
+    return items.sort((a, b) => rank(a.at) - rank(b.at));
+  }, [session?.messages, tools]);
 
   // 打开就先把历史读回来。读过的不再读：重读会把刚流出来的这一段冲掉。
   useEffect(() => {
@@ -118,7 +276,7 @@ export function ConversationPane({
     const el = scrollerRef.current;
     if (!el || !stickRef.current) return;
     el.scrollTop = el.scrollHeight;
-  }, [session?.messages]);
+  }, [session?.messages, tools.length]);
 
   const onScroll = useCallback(() => {
     const el = scrollerRef.current;
@@ -156,7 +314,7 @@ export function ConversationPane({
       style={{
         borderLeft: active ? '1px solid var(--line-strong)' : '1px solid transparent',
       }}
-      aria-label={`对话 ${session.title}`}
+      aria-label={`对话 ${callsignOf(session.id)}`}
     >
       <header className="flex shrink-0 items-center gap-2 px-4 pt-3 pb-2">
         <span
@@ -167,8 +325,26 @@ export function ConversationPane({
             boxShadow: streaming ? '0 0 8px var(--brass)' : 'none',
           }}
         />
-        <h2 className="truncate text-[12px] font-medium text-[var(--paper)]">{session.title}</h2>
-        <span className="mono text-[10px] text-[var(--muted)]">{sessionId}</span>
+        {/*
+          三行都写「新的对话」时没法指认谁是谁。叫法是这段对话自己的名字，从会话
+          id 折出来——刷新之后还是同一个，换一台机器打开也是同一个；后面那截才是
+          这次聊的内容。
+        */}
+        <span className="mono shrink-0 text-[12px] font-medium" style={{ color: 'var(--brass)' }}>
+          {callsignOf(session.id)}
+        </span>
+        <h2 className="truncate text-[12px] text-[var(--paper-dim)]" title={session.id}>
+          {session.title}
+        </h2>
+        <KindBadge session={session} live={live} />
+        {session.goals.length > 0 && (
+          <span
+            className="mono shrink-0 text-[10px] text-[var(--muted)]"
+            title={`目标 ${session.goals.map((goal) => goal.id).join('、')}`}
+          >
+            目标 {session.goals.map((goal) => shortGoal(goal.id)).join(' ')}
+          </span>
+        )}
         <span className="ml-auto flex items-center gap-3">
           {session.hydrating && (
             <span className="text-[10px] text-[var(--muted)]">正在读回历史…</span>
@@ -202,10 +378,19 @@ export function ConversationPane({
             每一步都会回到这一屏。
           </p>
         )}
+        {/*
+          对话与执行混在一条时间线上：一次运行里「说了什么」和「做了什么」交替
+          发生，分成两栏读的人要自己在两列里对时刻。工具那一行收起来只占一行，
+          展开才是原文——几十次调用全展开会把回复挤到屏幕外。
+        */}
         <div className="flex flex-col gap-4">
-          {session.messages.map((message) => (
-            <Turn key={message.id} message={message} />
-          ))}
+          {timeline.map((item) =>
+            item.kind === 'tool' ? (
+              <ToolTurn key={`tool-${item.call.id}`} call={item.call} />
+            ) : (
+              <Turn key={item.message.id} message={item.message} />
+            )
+          )}
         </div>
       </div>
 

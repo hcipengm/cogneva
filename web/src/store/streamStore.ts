@@ -87,7 +87,7 @@ export function describeEvent(event: AgentEvent): ActivityEntry {
       return {
         ...base,
         summary: `工具 ${text(p.tool_name) || text(p.tool_call_id)} 输出中`,
-        detail: preview(p.chunk ?? p.delta ?? p.output),
+        detail: preview(p.partial_result ?? p.chunk ?? p.delta ?? p.output),
         failed: false,
       };
     case 'tool_execution_end':
@@ -208,6 +208,48 @@ export interface LiveTaskStatus {
 /** 帧里记住的任务状态条数。超过就丢最老的，没人会翻几百条前的状态变迁。 */
 export const LIVE_TASK_LIMIT = 200;
 
+/**
+ * 一次工具调用，按调用身份收成一格。
+ *
+ * 活动流里那是三行（开始 / 输出中 / 返回），一行 180 字——够回答「在干什么」，
+ * 不够回答「它到底传了什么、回了什么」。而一次调用真正能被人复核的就是这两段
+ * 原文：参数说它想做什么，结果说它做成了没有。所以这里按 `tool_call_id` 收成
+ * 一格，参数与结果都留着，只在超过 `TOOL_TEXT_CAP` 时截断并写明截了。
+ */
+export interface ToolCallRecord {
+  id: string;
+  agent: string | null;
+  name: string;
+  /** 入参原文（紧凑 JSON）。 */
+  args: string;
+  /** 返回原文。跑到一半时是空串，不是「返回了空」。 */
+  result: string;
+  /** 中途输出，按到达顺序拼起来；只有这一个工具真的报过进度时才有。 */
+  progress: string;
+  status: 'running' | 'ok' | 'error';
+  startedAt: string;
+  endedAt: string | null;
+}
+
+/** 留多少格。与活动流同量级：读者翻的是「这一轮调了什么」，不是审计。 */
+export const TOOL_CALL_LIMIT = 120;
+
+/** 参数 / 结果各自留多少字符。超过就截断并在原文末尾写明，不假装是全份。 */
+export const TOOL_TEXT_CAP = 8000;
+
+function toolText(value: unknown): string {
+  if (value === undefined || value === null) return '';
+  let out: string;
+  try {
+    out = typeof value === 'string' ? value : JSON.stringify(value) ?? '';
+  } catch {
+    out = String(value);
+  }
+  return out.length > TOOL_TEXT_CAP
+    ? `${out.slice(0, TOOL_TEXT_CAP)}\n…（共 ${out.length} 字符，只留了前 ${TOOL_TEXT_CAP}）`
+    : out;
+}
+
 export interface StreamState {
   messages: Message[];
   /**
@@ -241,6 +283,25 @@ export interface StreamState {
    * 不计的话，它们的缺席就变成「总线上从没有过这些帧」——那是在替数据说谎。
    */
   unrecorded: Record<string, number>;
+  /**
+   * 工具调用，新的在前。
+   *
+   * 与活动流分开：活动流回答「刚才发生了什么」，这里回答「那一次调用到底传了
+   * 什么、回了什么」。合成一格的话，要么活动流里每行都拖着一份长原文，要么
+   * 这里只剩一行摘要。
+   */
+  toolCalls: ToolCallRecord[];
+  /** 记一次工具调用的进展；同一次调用（同 id）收在同一格里。 */
+  noteToolCall: (record: {
+    id: string;
+    agent: string | null;
+    name: string;
+    args?: unknown;
+    result?: unknown;
+    progress?: string;
+    status: ToolCallRecord['status'];
+    at: string;
+  }) => void;
   recordActivity: (entry: ActivityEntry) => void;
   clearActivity: () => void;
   noteFrame: (point: TimelinePoint) => void;
@@ -301,6 +362,37 @@ export const useStreamStore = create<StreamState>((set) => ({
   activity: [],
   timeline: [],
   unrecorded: {},
+  toolCalls: [],
+
+  noteToolCall: (record) =>
+    set((state) => {
+      const index = state.toolCalls.findIndex((call) => call.id === record.id);
+      const base =
+        index >= 0
+          ? state.toolCalls[index]
+          : {
+              id: record.id,
+              agent: record.agent,
+              name: record.name,
+              args: '',
+              result: '',
+              progress: '',
+              status: 'running' as const,
+              startedAt: record.at,
+              endedAt: null,
+            };
+      const merged: ToolCallRecord = {
+        ...base,
+        status: record.status,
+        args: record.args === undefined ? base.args : toolText(record.args),
+        result: record.result === undefined ? base.result : toolText(record.result),
+        progress: record.progress ? `${base.progress}${record.progress}`.slice(-TOOL_TEXT_CAP) : base.progress,
+        endedAt: record.status === 'running' ? base.endedAt : record.at,
+      };
+      const rest = state.toolCalls.filter((call) => call.id !== record.id);
+      const next = [merged, ...rest];
+      return { toolCalls: next.length > TOOL_CALL_LIMIT ? next.slice(0, TOOL_CALL_LIMIT) : next };
+    }),
 
   recordActivity: (entry) =>
     set((state) => {
