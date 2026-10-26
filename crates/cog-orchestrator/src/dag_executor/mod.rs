@@ -21,6 +21,36 @@ pub const ORPHAN_RECONCILER_LOOP: &str = "orchestrator_orphan_reconciler";
 /// 样本」，那是真话。
 pub const MIN_ESTIMATE_SAMPLES: u64 = 5;
 
+/// 估算基线版本串的开头，两种写法共有的那一段：「这一行是估算器按历史写的」。
+///
+/// 分解算出来的、人排的基线写的是别的（有的直接是时刻），它们不是估算，
+/// 估算器不重算也不覆盖。
+const ESTIMATE_REV_PREFIX_ANY: &str = "estimate/";
+
+/// 估算基线版本串的开头，连同量出这条工期的尺子：`estimate/work-time-v1/…`。
+///
+/// 版本串要回答「这一行是谁、按什么算出来的」，因为这个字段也是重算唯一的
+/// 依据：尺子换过以后，按旧尺子写的行止期不再可信，得按新的重写一遍，而
+/// 「哪把尺子」只能从行上读，日志不会留在库里。旧写法
+/// `estimate/<kind>/n<samples>/<rfc3339>` 的第三段就是时刻，没有位置记尺子，
+/// 所以改成把尺子放在种类前面：种类里即便带斜杠，也挤不到它前面去。
+const ESTIMATE_REV_PREFIX: &str = "estimate/work-time-v1/";
+
+/// 从估算器自己写的版本串里取回种类。
+///
+/// 尾两段是样本条数与时刻，中间剩下的全部是种类——种类可能带斜杠，所以两头
+/// 各剥一段，不按位置取。
+fn estimate_rev_kind(rev: &str) -> Option<String> {
+    let rest = rev.strip_prefix(ESTIMATE_REV_PREFIX_ANY)?;
+    let (rest, _written_at) = rest.rsplit_once('/')?;
+    let (kind, _samples) = rest.rsplit_once('/')?;
+    if kind.is_empty() {
+        None
+    } else {
+        Some(kind.to_string())
+    }
+}
+
 pub mod circuit_registry;
 pub mod orchestrator;
 pub mod retry_matrix;
@@ -623,10 +653,10 @@ impl DagExecutorRuntime {
     /// 一次读整张表而不是逐条 `task_plan`：这一拍要判的是全部就绪任务的预算，
     /// 逐条问是每条一次往返，而基线的行数比任务少一个量级。读不到（进程内后端
     /// 没有这个面、或者库这一下不可用）返回 `None`：不设界，但也不假装设了界。
-    /// 给还没有计划基线的就绪任务排一次期。
+    /// 给还没有计划基线的就绪任务排一次期，并把按旧尺子写过期的基线重算一遍。
     ///
     /// 排期用的数是**量出来的**：同一种类已经跑完的任务里，token 清点的中位数
-    /// 当预算、创建到最近一次更新的中位数当时长。样本不够（少于
+    /// 当预算、开工到最近一次更新的中位数当时长。样本不够（少于
     /// [`MIN_ESTIMATE_SAMPLES`] 条，或者那几条一条花销都没记下来）就不排——
     /// 编一个工期会让甘特图把没排期的活画成已排期，而「没排期」正是读者唯一
     /// 能据以去补估算的信号。
@@ -634,15 +664,27 @@ impl DagExecutorRuntime {
     /// 只给**就绪**的任务排：它们的依赖都已经满足，起点就是此刻；给一条还被
     /// 上游挡着的活排「现在开始」会画出一条本来不存在的并行。
     ///
+    /// 重算只碰估算器自己写的行（版本串以 [`ESTIMATE_REV_PREFIX`] 那一路开头），
+    /// 而且只碰尺子已经换过的那一路。为什么必须重算：换尺子之前，按排队时间
+    /// 量出来的中位数写进了每一行，而那些行一旦存在就不再进估算——`planned`
+    /// 里有了它的 id，这条任务在估算器眼里就「已经排过期」了。尺子换了，它们
+    /// 既不会自己变，也不该被删掉：删掉就把起期和预算的来历一起丢了，而这两样
+    /// 当时都是量出来的。原地改写保住起期（那是当时的现场），只按现在的尺子
+    /// 重写止期。分解算出来的、人排的行（版本串不以 `estimate/` 开头）一律不碰：
+    /// 那些是意图，不是估算。
+    ///
     /// 写失败不挡派发：任务照派，这一件在甘特上继续读作未排期，日志里留一行
     /// 具名原因。反过来（为了一行基线把活压住）是拿成本换读数。
     async fn plan_new_work(&self, ready: &[Task]) {
         let Some(backend) = self.orchestrator.state_backend() else {
             return;
         };
-        let planned: std::collections::HashSet<String> =
+        let planned: HashMap<String, cog_core::TaskPlan> =
             match backend.task_plans(&self.config.workspace_id).await {
-                Ok(rows) => rows.into_iter().map(|plan| plan.task_id).collect(),
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|plan| (plan.task_id.clone(), plan))
+                    .collect(),
                 Err(e) => {
                     // 读不到已有的基线就别写：不知道谁已经有基线时补写，等于把
                     // 别人排好的期按估算覆盖掉。
@@ -654,11 +696,41 @@ impl DagExecutorRuntime {
                     return;
                 }
             };
-        let missing: Vec<&Task> = ready
-            .iter()
-            .filter(|task| !planned.contains(&task.id))
-            .collect();
-        if missing.is_empty() {
+        let now = chrono::Utc::now();
+        // 这一拍要写的行，两条来源合成一张单子：起期先定下来，止期与预算随种类
+        // 的读数。第三项是「这条是不是重算」——重算的行即使量出零工期也要写回
+        // 去（止期清空），因为留着的那条止期正是尺子量错的那一条。
+        let mut pending: Vec<(String, String, chrono::DateTime<chrono::Utc>, bool)> = Vec::new();
+        for task in ready {
+            if !planned.contains_key(&task.id) {
+                pending.push((task.id.clone(), task.task_type.kind_key(), now, false));
+            }
+        }
+        // 旧尺子写的行：起期留着当时的现场，止期按现在的尺子重算。它们不必
+        // 就绪——排在后面的活一样有工期要读，而「它什么时候轮得到」不改变
+        // 「它要干多久」这个问题该用哪把尺子答。
+        let mut unreadable_kinds: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut stale_rows = 0usize;
+        for plan in planned
+            .values()
+            .filter(|plan| plan.baseline_rev.starts_with(ESTIMATE_REV_PREFIX_ANY))
+        {
+            if plan.baseline_rev.starts_with(ESTIMATE_REV_PREFIX) {
+                continue;
+            }
+            let Some(kind) = estimate_rev_kind(&plan.baseline_rev) else {
+                continue;
+            };
+            stale_rows += 1;
+            pending.push((
+                plan.task_id.clone(),
+                kind,
+                plan.planned_start.unwrap_or(now),
+                true,
+            ));
+        }
+        if pending.is_empty() {
             return;
         }
         let records = match backend
@@ -679,34 +751,39 @@ impl DagExecutorRuntime {
             .into_iter()
             .map(|record| (record.kind.clone(), record))
             .collect();
-        let now = chrono::Utc::now();
-        for task in missing {
-            let Some(record) = by_kind.get(&task.task_type.kind_key()) else {
+        let mut rewritten = 0usize;
+        for (task_id, kind, start, stale) in pending {
+            let Some(record) = by_kind.get(&kind) else {
+                if stale {
+                    unreadable_kinds.insert(kind);
+                }
                 continue;
             };
             // 两条轴都量不出来才不排：一个中位数是缺的那一半，另一条轴还是
             // 量过的。工时能估、花销估不出时，甘特那一条是真有条子的，而
             // `budget_tokens = 0` 在读者那里读作「没有成本计划」（见
             // [`crate::ready_queue::past_its_budget`]），不是「计划花零个 token」。
-            if record.median_tokens == 0 && record.median_duration_secs == 0 {
+            if record.median_tokens == 0 && record.median_duration_secs == 0 && !stale {
                 continue;
             }
             // 时长中位数为 0 时止期留空：一排零会让甘特把它画成「计划已完成」。
             let planned_end = if record.median_duration_secs == 0 {
                 None
             } else {
-                Some(now + chrono::Duration::seconds(record.median_duration_secs as i64))
+                Some(start + chrono::Duration::seconds(record.median_duration_secs as i64))
             };
             let plan = cog_core::TaskPlan {
                 workspace_id: self.config.workspace_id.clone(),
-                task_id: task.id.clone(),
-                planned_start: Some(now),
+                task_id: task_id.clone(),
+                planned_start: Some(start),
                 planned_end,
                 budget_tokens: record.median_tokens,
-                // 基线版本里同时写着这一版是哪来的：按历史估算，几条样本。
-                // 读者要问「这个预算谁给的」，答案得在行上而不是在日志里。
+                // 基线版本里同时写着这一版是哪来的：按历史估算，几条样本，
+                // 以及量出这条工期的是哪把尺子。读者要问「这个预算谁给的」，
+                // 答案得在行上而不是在日志里；尺子换了以后，这个字段也是
+                // 下一次重算唯一认得出的旧行标记。
                 baseline_rev: format!(
-                    "estimate/{}/n{}/{}",
+                    "{ESTIMATE_REV_PREFIX}{}/n{}/{}",
                     record.kind,
                     record.samples,
                     now.to_rfc3339()
@@ -715,12 +792,27 @@ impl DagExecutorRuntime {
             };
             if let Err(e) = backend.save_task_plan(&plan).await {
                 tracing::warn!(
-                    task_id = %task.id,
+                    task_id = %task_id,
                     kind = %record.kind,
                     error = %e,
                     "task goes out unscheduled: its estimated baseline was not stored"
                 );
+                continue;
             }
+            if stale {
+                rewritten += 1;
+            }
+        }
+        if stale_rows > 0 {
+            // 一次换尺子的迁移，不是每拍都有的读数：名出来是为了让人能对上
+            // 「甘特上那批一周长的条什么时候换成十几分钟的」。
+            tracing::debug!(
+                workspace_id = %self.config.workspace_id,
+                stale_rows,
+                rewritten,
+                unreadable_kinds = %unreadable_kinds.iter().cloned().collect::<Vec<_>>().join(","),
+                "re-measured baselines written by an older ruler"
+            );
         }
     }
 
@@ -2886,7 +2978,9 @@ mod consumer_ack_tests {
     /// 只答计划基线的 StateBackend。其余方法是契约的其余部分，这条路径不读，
     /// 一律返回空——写成 `unimplemented!()` 会让「没读」从事实退化成假设。
     struct PlanBook {
-        plans: Vec<cog_core::TaskPlan>,
+        /// 表里现有的基线。写进去的会落回这里，跟真后端一样是 upsert——读回
+        /// 一份没变的表，会让「写一次就够」这类判据永远看不到第二拍。
+        plans: std::sync::Mutex<Vec<cog_core::TaskPlan>>,
         /// 按种类量过的历史。空表示「这一类还没有样本」。
         records: Vec<cog_core::TaskKindRecord>,
         /// 这一趟写下去的基线。判据看写下去的字节，不看写没写。
@@ -2896,7 +2990,7 @@ mod consumer_ack_tests {
     impl PlanBook {
         fn with_plans(plans: Vec<cog_core::TaskPlan>) -> Self {
             Self {
-                plans,
+                plans: std::sync::Mutex::new(plans),
                 records: Vec::new(),
                 saved: std::sync::Mutex::new(Vec::new()),
             }
@@ -2984,10 +3078,15 @@ mod consumer_ack_tests {
             &self,
             _workspace_id: &str,
         ) -> cog_core::SFResult<Vec<cog_core::TaskPlan>> {
-            Ok(self.plans.clone())
+            Ok(self.plans.lock().unwrap().clone())
         }
         async fn save_task_plan(&self, plan: &cog_core::TaskPlan) -> cog_core::SFResult<()> {
             self.saved.lock().unwrap().push(plan.clone());
+            let mut plans = self.plans.lock().unwrap();
+            match plans.iter_mut().find(|row| row.task_id == plan.task_id) {
+                Some(row) => *row = plan.clone(),
+                None => plans.push(plan.clone()),
+            }
             Ok(())
         }
         /// 与真正的后端同一套语义：样本不够 `min_samples` 的种类不出现。这样
@@ -3337,9 +3436,65 @@ mod consumer_ack_tests {
             "止期 = 起期 + 同类时长中位数"
         );
         assert!(
-            plan.baseline_rev.starts_with("estimate/dag_node/n7/"),
-            "基线版本要写明它是按几条样本估出来的，得到 {}",
             plan.baseline_rev
+                .starts_with("estimate/work-time-v1/dag_node/n7/"),
+            "基线版本要写明它是按几条样本、哪把尺子估出来的，得到 {}",
+            plan.baseline_rev
+        );
+    }
+
+    /// 按旧尺子写过期的估算行会在原地重算：起期留在当时，止期按现在的读数重写。
+    ///
+    /// 不重算的代价是现网实测的：旧尺子把排队时间当工时，五个样本量出 7.66 天，
+    /// 按它排的 1804 行在甘特上各画一周。而这些行一旦被写过就不再进估算——
+    /// `planned` 里有了这条任务的 id，它「已经排过期」了——所以尺子换了它们
+    /// 也不会自己变；删掉又连起期和预算的来历一起没了。
+    ///
+    /// 这一条也同样钉住「不必就绪」：这条任务不在就绪队列里，仍然要重算。
+    #[tokio::test]
+    async fn an_estimate_written_by_an_older_ruler_is_remeasured_in_place() {
+        let start = chrono::Utc::now() - chrono::Duration::days(3);
+        let mut old = plan("task-stale", 0);
+        old.planned_start = Some(start);
+        old.planned_end = Some(start + chrono::Duration::days(7));
+        old.baseline_rev = "estimate/dag_node/n5/2026-10-25T06:00:00+00:00".into();
+        let book = Arc::new(PlanBook {
+            records: vec![record("dag_node", 6, 1_000, 406)],
+            ..PlanBook::with_plans(vec![old])
+        });
+        let runtime = estimate_runtime(book.clone());
+        runtime.publish_ready_tasks().await.unwrap();
+
+        let saved = book.saved();
+        assert_eq!(saved.len(), 1, "旧尺子写的那一行要重算一次：{saved:#?}");
+        let plan = &saved[0];
+        assert_eq!(plan.task_id, "task-stale");
+        assert_eq!(
+            plan.planned_start,
+            Some(start),
+            "起期是当时的现场，重算只换止期"
+        );
+        assert_eq!(
+            plan.planned_end.expect("时长有样本就有止期"),
+            start + chrono::Duration::seconds(406),
+            "止期按现在的时长中位数重写，不再是一周"
+        );
+        assert_eq!(plan.budget_tokens, 1_000, "预算一样按现在的读数重写");
+        assert!(
+            plan.baseline_rev
+                .starts_with("estimate/work-time-v1/dag_node/n6/"),
+            "重算后的版本串要换成新尺子的名字，否则下一拍还会被当成旧行，得到 {}",
+            plan.baseline_rev
+        );
+
+        // 重算过就不再是旧行：同一批行、同一份读数，第二拍什么都不写。没有这
+        // 一条，上面那笔好读数是靠每拍重写 1804 行换来的。
+        runtime.publish_ready_tasks().await.unwrap();
+        assert_eq!(
+            book.saved().len(),
+            1,
+            "换过尺子的行第二拍不该再写一次：{:#?}",
+            book.saved()
         );
     }
 
