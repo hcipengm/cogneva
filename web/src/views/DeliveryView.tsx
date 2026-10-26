@@ -3,6 +3,7 @@ import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
+import { BarList, Strip, type StripSegment } from '@/ui/plots';
 
 /**
  * 构建与部署面：谁在跑第几版、滚动到哪一步；这轮构建过什么、每条怎么结束的。
@@ -102,6 +103,21 @@ export function DeliveryView() {
               rows={rows}
               rowKey={(d) => d.name}
             />
+            {/* 「已经滚到位几个」是一句比例，而表里只有逐行的「3 / 3」。按各自的
+                目标算成百分比画开，谁还差、差多少一眼看见。 */}
+            <BarList
+              label="每个工作负载滚到了几成"
+              note="就绪副本 ÷ 目标副本（GET /api/v1/cluster/deployments）；红的是还没滚到位"
+              max={100}
+              rows={rows.map((d) => ({
+                id: d.name,
+                label: d.name,
+                value: d.desired_replicas > 0 ? Math.round((d.ready_replicas / d.desired_replicas) * 100) : 0,
+                note: `${d.ready_replicas} / ${d.desired_replicas}`,
+                tone: d.ready_replicas >= d.desired_replicas ? undefined : ('warn' as const),
+                detail: d.conditions.filter((c) => !c.ok).map((c) => c.kind).join(' · ') || undefined,
+              }))}
+            />
             <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
               版本号是 Deployment 上的 revision 注解，不是发布记录：平台自己的发布清单在
               变更面，两边对同一个 rev 用的是同一个字符串。
@@ -150,6 +166,14 @@ export function DeliveryView() {
                 />
               </div>
             </Readings>
+            {/* 「成了几个、没成的是哪一种」在表里要一行一行数。四种结局各占一段，
+                比例就是这一轮构建的成败；`timed_out` 与 `failed` 分开着色，因为前者
+                是预算把它杀了、后者是它自己崩了。 */}
+            <Strip
+              label="窗口里这几次构建各是什么结局"
+              note="按 outcome 分组数（GET /api/v1/evolution/builds）；窗口是进程内存里的，重启清零"
+              segments={outcomeSegments(runs)}
+            />
             <Table
               columns={[
                 { key: 'at', title: '结束于', width: '150px', render: (r) => <Moment iso={r.at} /> },
@@ -200,6 +224,17 @@ export function DeliveryView() {
       </section>
     </ViewFrame>
   );
+}
+
+/** 四种结局各几条。名字照抄线上的写法，图上与表里是同一串。 */
+function outcomeSegments(runs: { outcome: string }[]): StripSegment[] {
+  const counted = new Map<string, number>();
+  for (const run of runs) counted.set(run.outcome, (counted.get(run.outcome) ?? 0) + 1);
+  const tone = (outcome: string) =>
+    outcome === 'built' ? 'ok' : outcome === 'timed_out' ? 'warn' : outcome === 'unstarted' ? 'muted' : 'danger';
+  return [...counted.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([outcome, count]) => ({ label: outcome, value: count, tone: tone(outcome) }));
 }
 
 /** 行里那一个词的颜色：成了是绿的，被预算杀的是黄的，其余没成的是红的。 */

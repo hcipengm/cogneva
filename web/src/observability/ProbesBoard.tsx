@@ -1,6 +1,7 @@
 import { getBackendHealth } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { Loading, Moment, ReadError, Status, Table } from '@/ui/primitives';
+import { BarList } from '@/ui/plots';
 
 /**
  * 探测板：后端健康矩阵。
@@ -39,6 +40,24 @@ export function ProbesBoard() {
         rows={data.backends}
         rowKey={(b) => b.name}
       />
+      {/* 延迟这一列逐行看是七八个孤立的毫秒数；排在一起才看得出有没有一个后端
+          一直慢一截。没探出延迟的行按名字写明原因，不画成 0 毫秒。 */}
+      <div className="border-t border-[var(--line)]">
+        <BarList
+          label="每个后端最近一次探测回了多少毫秒"
+          note="长度按最慢的那个归一；没探出延迟的行不占长度，写着它是哪一种没探出来"
+          rows={data.backends
+            .map((b) => ({
+              id: b.name,
+              label: b.name,
+              value: b.latency_ms ?? 0,
+              note: b.latency_ms != null ? `${b.latency_ms} ms` : b.status,
+              tone: b.status === 'up' ? undefined : ('danger' as const),
+              detail: b.status === 'up' ? undefined : '这一行不是通的，延迟读不出来',
+            }))
+            .sort((a, b) => b.value - a.value)}
+        />
+      </div>
     </>
   );
 }

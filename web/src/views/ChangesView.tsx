@@ -11,6 +11,7 @@ import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
+import { Strip } from '@/ui/plots';
 
 /**
  * 一条变更的来路：它入账之后走过哪些状态，每一步由哪一次判读、因为什么。
@@ -123,6 +124,19 @@ export function ChangesView() {
       title="变更"
       meta={page ? `台账 ${page.total} 条 · 欠账 ${page.outstanding_total} · 待声明 ${page.pending_declarations}` : '按 20 秒重读'}
     >
+      {page && page.census.length > 0 && (
+        <div className="border-b border-[var(--line)]">
+          <Strip
+            label="台账里这些变更各处在哪个状态"
+            note="按这次读回来的 census 数（GET /api/v1/governance/changes）；黄的那几段是还要人动手的欠账"
+            segments={page.census.map((cell) => ({
+              label: cell.state,
+              value: cell.rows,
+              tone: cell.outstanding && cell.rows > 0 ? ('warn' as const) : ('magnitude' as const),
+            }))}
+          />
+        </div>
+      )}
       {page && (
         <div className="flex flex-wrap border-b border-[var(--line)] py-2">
           {page.census.map((cell) => (

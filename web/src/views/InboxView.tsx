@@ -3,6 +3,7 @@ import type { NotificationItem } from '@/api/client';
 import { useServices } from '@/shell/context';
 import { useShell } from '@/shell/store';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, ViewFrame } from '@/ui/primitives';
+import { BarList, type BarRow } from '@/ui/plots';
 
 /**
  * 收件箱：平台发给你的话。
@@ -71,6 +72,15 @@ export function InboxView() {
             <Reading label="这一屏" value={items.length} note={unreadOnly ? '只看未读' : '全部'} />
           </div>
           </Readings>
+          {/* 「最近哪天来得多、昨天到今天是不是突然涨起来」在列表里读不出来：列表按
+              时间倒序，一眼只能看见最上面那几条。按天画成条，涨没涨就是一眼的事。 */}
+          <div className="border-b border-[var(--line)]">
+            <BarList
+              label="最近这些天每天收到几条"
+              note="按这一页读回来的条数数（UTC 日期）；更早的那几页不在这一屏里"
+              rows={byDay(items)}
+            />
+          </div>
           <InboxList
             items={items}
             unreadCount={notifications.unreadCount}
@@ -80,6 +90,24 @@ export function InboxView() {
       )}
     </ViewFrame>
   );
+}
+
+/**
+ * 按天收拢这一页的通知。
+ *
+ * 只数读回来的这一页，不假装是全部历史——分页拉过的日子这里没有行，图上就没有
+ * 那一格。缺的那一天画成 0 会把「没读到」说成「那天没有」。
+ */
+function byDay(items: NotificationItem[]): BarRow[] {
+  const counted = new Map<string, number>();
+  for (const item of items) {
+    const day = item.created_at.slice(0, 10);
+    counted.set(day, (counted.get(day) ?? 0) + 1);
+  }
+  return [...counted.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .slice(-14)
+    .map(([day, count]) => ({ id: day, label: day.slice(5), value: count }));
 }
 
 /**

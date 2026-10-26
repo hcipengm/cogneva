@@ -12,6 +12,7 @@ import { TracesBoard } from '@/observability/TracesBoard';
 import { ClusterTopology } from '@/topology/ClusterTopology';
 import { useShell } from '@/shell/store';
 import { Button, Empty, Loading, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
+import { BarList, Strip } from '@/ui/plots';
 
 /**
  * 观测面：一排工具板，不是一张大表。
@@ -166,6 +167,20 @@ function OverviewBoard({ overview }: { overview: Resource<ClusterOverview> }) {
         ) : (
           <Empty>读不到监管者状态。</Empty>
         )}
+        {/* 「健全的占多少」是这一屏最要紧的一句话，而它散在七个格子里的前三格里：
+            三格各是一个数，读者要自己把它们加起来才知道这一池子有几成是好的。 */}
+        {s && (
+          <Strip
+            label="这一池执行者各处在什么状态"
+            note="数与上面那七格同一份快照（GET /api/v1/supervisor/status）；卡住的人仍在池子里，所以单独一段"
+            segments={[
+              { label: '健康', value: s.healthy_agents, tone: 'ok' },
+              { label: '可疑', value: s.suspect_agents, tone: 'warn' },
+              { label: '卡住', value: s.stuck_agents, tone: 'warn' },
+              { label: '失联', value: s.dead_agents, tone: 'danger' },
+            ]}
+          />
+        )}
       </section>
 
       <section className="border-b border-[var(--line)]">
@@ -186,6 +201,28 @@ function OverviewBoard({ overview }: { overview: Resource<ClusterOverview> }) {
           />
         ) : (
           <Loading what="工作负载存活" />
+        )}
+        {/* 副本这一列写成「3 / 3」时读不出差多少：差 1 个和差 3 个在表里一样长。按
+            期望值归一画出来，缺得多长一眼看见；够不够仍是那两列数的判据。 */}
+        {components.data && (
+          <BarList
+            label="每个工作负载起了几个副本"
+            note="长度按各自的期望副本算成百分比（GET /api/v1/cluster/components）；红的是没起够的"
+            max={100}
+            rows={components.data.components.map((c) => {
+              const want = c.desired_replicas ?? null;
+              const have = c.ready_replicas ?? 0;
+              const short = want !== null && have < want;
+              return {
+                id: c.id,
+                label: c.id,
+                value: want !== null && want > 0 ? Math.round((have / want) * 100) : 0,
+                note: want === null ? `${have} / ?` : `${have} / ${want}`,
+                tone: short ? ('danger' as const) : undefined,
+                detail: want === null ? '这一行没报期望副本数，画不出够不够' : undefined,
+              };
+            })}
+          />
         )}
       </section>
 

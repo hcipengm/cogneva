@@ -1,4 +1,5 @@
 import { getQuotaUsage, listEvalDatasets } from '@/api/client';
+import { BarList } from '@/ui/plots';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
@@ -141,6 +142,15 @@ export function SettingsView() {
             ]}
             rows={datasets.data ?? []}
             rowKey={(d) => d.path}
+          />
+        )}
+        {(datasets.data ?? []).length > 0 && (
+          <BarList
+            label="每个评估集有几个用例"
+            note="按磁盘上实际存在的用例数（GET /api/v1/eval/datasets）；用例多不等于覆盖广，覆盖看标签"
+            rows={(datasets.data ?? [])
+              .map((d) => ({ id: d.path, label: d.name, value: d.case_count }))
+              .sort((a, b) => b.value - a.value)}
           />
         )}
       </section>

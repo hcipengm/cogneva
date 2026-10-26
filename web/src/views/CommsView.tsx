@@ -14,6 +14,7 @@ import { outcomesSinceSnapshot, type LiveCommsRow } from '@/store/liveComms';
 import { useLiveCommsStore } from '@/store/liveCommsStore';
 import { openExplain } from '@/ui/explain';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
+import { Strip, type Tone } from '@/ui/plots';
 
 const LINK_LABELS: Record<CollaborationLinkType, string> = {
   hand_off: '交接',
@@ -357,6 +358,22 @@ export function CommsView() {
           行看到的是「这条任务现在归谁」，那一格标着「现」。
         </p>
       </section>
+      {/* 五种计数并排时看不出「这些边里几成是正常交接、几成是出事」。分成几段排开，
+          一眼看见这条进程见过的通信里有多少是坏的。名字照抄线的写法，与表里那一列同一套。 */}
+      {stats && stats.total_links > 0 && (
+        <div className="border-b border-[var(--line)]">
+          <Strip
+            label="这些边各是哪一种"
+            note="按 stats 那一栏数（GET /api/v1/collaboration/graph）；重启边只数「手上还有在跑的任务」的那些"
+            segments={[
+              { label: LINK_LABELS.hand_off, value: stats.handoffs, tone: 'magnitude' as Tone },
+              { label: LINK_LABELS.retry, value: stats.retries, tone: 'warn' as Tone },
+              { label: LINK_LABELS.dead_letter, value: stats.dead_letters, tone: 'danger' as Tone },
+              { label: LINK_LABELS.respawn, value: stats.respawns, tone: 'magnitude' as Tone },
+            ]}
+          />
+        </div>
+      )}
       {fresh.length > 0 && <FreshOutcomes rows={fresh} />}
       {graph.error ? (
         <ReadError what="交接图" error={graph.error} onRetry={graph.refresh} />

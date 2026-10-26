@@ -1,6 +1,7 @@
 import { getEvolutionMetrics } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { Loading, ReadError, Reading, Readings } from '@/ui/primitives';
+import { Meter } from '@/ui/plots';
 
 /**
  * 指标板：平台自己登记的那几个累计计数。
@@ -51,6 +52,16 @@ export function MetricsBoard() {
           />
         </div>
       </Readings>
+      {/* 失败率是这一面唯一带分母的量，也就能画成对着 100% 的一格。它不画成一条
+          曲线：这一面没有采样，只有最近一次的值。 */}
+      <Meter
+        label="变更失败率（失败 ÷（落地 + 失败））"
+        value={failureRate == null ? null : failureRate * 100}
+        max={100}
+        note={failureRate == null ? undefined : `${(failureRate * 100).toFixed(1)}%`}
+        unmeasurable="落地与失败都还是 0，这一率没有分母，不是「零失败」"
+        tone={failureRate != null && failureRate > 0.2 ? 'danger' : 'magnitude'}
+      />
       <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
         想看一条曲线要先有采样：这一面按 30 秒重读一次，但只有最近一次的值被留下来，
         前后两次的差不是「这段时间新增了多少」。构建跑次的来路在变更面。

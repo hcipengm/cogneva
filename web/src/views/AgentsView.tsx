@@ -10,6 +10,7 @@ import {
 } from '@/store/liveAgents';
 import { useLiveAgentStore } from '@/store/liveAgentStore';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
+import { BarList, Strip, type Tone } from '@/ui/plots';
 
 /**
  * 在岗名单。
@@ -63,6 +64,17 @@ const STATE_TONE: Record<string, string> = {
   active: 'var(--ok)',
 };
 
+/** 状态在分布条上的色：与 `STATE_TONE` 同一套词，只是换成图能用的那几种。 */
+const STATE_PLOT_TONE: Record<string, Tone> = {
+  error: 'danger',
+  dead: 'danger',
+  suspect: 'warn',
+  started: 'ok',
+  active: 'ok',
+  ended: 'muted',
+  inactive: 'muted',
+};
+
 /** 状态格：帧说它现在是什么。没有过状态帧时明写「—」，不拿「空闲」去冒充。 */
 function LiveState({ live }: { live: LiveAgentRow | null }) {
   if (!live || !live.state) {
@@ -105,6 +117,22 @@ export function AgentsView() {
   const fromFrame = rows.filter(({ row, live }) =>
     seenAfterSnapshot(row.last_heartbeat, live)
   ).length + unseen.length;
+  // 状态分布只数帧里说过的那几个人：这一列本来就不是快照给的，没有状态帧的行如实
+  // 单独成一段，不并进「空闲」——那是把「不知道」画成「没事」。
+  const states = new Map<string, { label: string; value: number; tone: Tone }>();
+  for (const { live } of rows) {
+    const key = live?.state ?? '';
+    const seen = states.get(key);
+    if (seen) {
+      seen.value += 1;
+    } else {
+      states.set(key, {
+        label: key ? (STATE_LABEL[key] ?? key) : '没有状态帧',
+        value: 1,
+        tone: STATE_PLOT_TONE[key] ?? 'magnitude',
+      });
+    }
+  }
 
   return (
     <ViewFrame
@@ -122,11 +150,32 @@ export function AgentsView() {
         <>
           <Readings from={resources} source="GET /api/v1/agents 按角色数这一页" caveat="数的是这次读回来的名单，心跳过期的注册不在里面。状态一列不是这份快照给的，是总线上的帧折出来的。">
           <div className="flex flex-wrap border-b border-[var(--line)] py-2">
-            {[...roles.entries()].map(([role, count]) => (
-              <Reading key={role} label={role} value={count} />
-            ))}
+            <Reading label="在岗" value={agents.length} />
+            <Reading label="角色" value={roles.size} />
+            <Reading
+              label="比快照新"
+              value={fromFrame}
+              note="帧里见过、这次快照还没轮到"
+            />
           </div>
           </Readings>
+          {/* 名单这一屏要回答的第二问是「这一拨人是怎么构成的」：哪个角色人多、有几个人
+              在跑。角色在表里是一列名字，读不出谁多谁少；状态分散在几十行里，读不出
+              整体的分布——所以这两问画出来，确切的名字仍去表里查。 */}
+          <div className="border-b border-[var(--line)]">
+            <BarList
+              label="每个角色在岗几人"
+              note="按 GET /api/v1/agents 这次读回来的名单数，同一行一个人"
+              rows={[...roles.entries()]
+                .sort((a, b) => b[1] - a[1])
+                .map(([role, count]) => ({ label: role, value: count }))}
+            />
+            <Strip
+              label="这一拨人现在处在哪个状态"
+              note="状态由总线上的帧折出来；「没有状态帧」是这一轮没听到过它，不是它空闲"
+              segments={[...states.values()].sort((a, b) => b.value - a.value)}
+            />
+          </div>
           {unseen.length > 0 && (
             <div className="border-b border-[var(--line)] py-2">
               <div className="mb-1 text-[11px] text-[var(--paper-dim)]">

@@ -11,6 +11,7 @@ import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Table, ViewFrame } from '@/ui/primitives';
+import { BarList } from '@/ui/plots';
 
 const PAGE = 100;
 
@@ -195,6 +196,21 @@ export function EvalView() {
             ]}
             rows={reportList}
             rowKey={(r) => r.id}
+          />
+        )}
+        {reportList.length > 0 && (
+          <BarList
+            label="每个数据集跑过几份报告"
+            note="只数这一页列出来的报告（GET /api/v1/eval/reports）；报告里没有分数，这里也就画不出分数"
+            rows={[...reportList
+              .reduce((byDataset, report) => {
+                const name = report.dataset_name || '（报告里没有数据集名）';
+                byDataset.set(name, (byDataset.get(name) ?? 0) + 1);
+                return byDataset;
+              }, new Map<string, number>())
+              .entries()]
+              .sort((a, b) => b[1] - a[1])
+              .map(([name, count]) => ({ id: name, label: name, value: count }))}
           />
         )}
         {reportTotal > reportList.length && (

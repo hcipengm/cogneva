@@ -25,6 +25,9 @@ import { Button, Empty, Loading, ReadError } from '@/ui/primitives';
  * 编辑中的内容是草稿（`files/store`），保存才写回服务端：每次按键都发一次
  * PUT 会让「盘上的内容」取决于最后一次网络请求有没有成功，而这在编辑器里
  * 是最不该出现的语义。
+ *
+ * 画面：这一面要显示的就是文件本身——源码、排版后的成品、替换命中的那几行。文件
+ * 内容就是画面，任何统计图都只是把读者真正在找的那几行往下挤。
  */
 export function FilesView() {
   const tabs = useShell((s) => s.tabs);

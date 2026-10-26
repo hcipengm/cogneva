@@ -9,6 +9,7 @@ import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { formatBytes, formatCpu } from '@/topology/ClusterTopology';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
+import { BarList } from '@/ui/plots';
 
 /**
  * 资源面：配额、可调度余量、存储账本。
@@ -152,6 +153,31 @@ export function ResourcesView() {
               <Reading label="采集于" value={<Moment iso={topology.data?.collected_at} />} />
             </div>
             </Readings>
+            {/* 配额那一半已在表里逐行画了占比；节点这一半没有：余量是一列孤立的
+                数字，「这台还剩 3 核、那台还剩 4 核」读不出调度器会往哪台放。按可分配
+                量算成百分比排开，谁快满了是第一眼的事。 */}
+            <BarList
+              label="每台节点已申报的 CPU 占可分配量的比例"
+              note="申报量 ÷ 可分配量（GET /api/v1/cluster/topology）；没有可分配量的节点不画长度"
+              max={100}
+              rows={cluster.nodes.map((n) => ({
+                id: n.name,
+                label: n.name,
+                value:
+                  n.cpu_allocatable_millicores && n.cpu_allocatable_millicores > 0
+                    ? Math.round((n.cpu_requested_millicores / n.cpu_allocatable_millicores) * 100)
+                    : 0,
+                note:
+                  n.cpu_allocatable_millicores != null
+                    ? `${formatCpu(n.cpu_requested_millicores)} / ${formatCpu(n.cpu_allocatable_millicores)}`
+                    : '可分配量读不到',
+                tone:
+                  n.cpu_allocatable_millicores != null &&
+                  n.cpu_requested_millicores / n.cpu_allocatable_millicores >= 0.9
+                    ? ('danger' as const)
+                    : undefined,
+              }))}
+            />
             <Table
               columns={[
                 { key: 'node', title: '节点', width: '180px', render: (n) => (

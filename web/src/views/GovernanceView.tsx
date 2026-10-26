@@ -3,6 +3,7 @@ import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
+import { BarList, Strip, type StripSegment, type Tone } from '@/ui/plots';
 
 /**
  * 治理面：哪些面有人在守、哪些面已经过期、原则语料被判成了什么。
@@ -22,7 +23,36 @@ export function GovernanceView() {
   );
 
   const census = faces.data?.census;
-  const driftByFace = new Map((drift.data?.readings ?? []).map((r) => [r.face_id, r]));
+  const readings = drift.data?.readings ?? [];
+  const driftByFace = new Map(readings.map((r) => [r.face_id, r]));
+
+  // 判词各几个：散在表的一列里，读者数不出「十三个面里几个红」，而这一面要回答的
+  // 恰恰是这一句。unread 单独成一段，不并进 on_target——那是把「没人读」画成「没事」。
+  const byState = new Map<string, StripSegment>();
+  for (const reading of readings) {
+    const seen = byState.get(reading.state);
+    if (seen) {
+      seen.value += 1;
+    } else {
+      byState.set(reading.state, { label: reading.state, value: 1, tone: stateTone(reading.state) });
+    }
+  }
+
+  // 规则按名字收拢：一个面红在哪条上是逐行的，看不出这条规则是不是整片都在犯。
+  const byRule = new Map<string, { label: string; value: number; tone: Tone }>();
+  for (const reading of readings) {
+    for (const [rule, tone] of [
+      ...reading.red_rules.map((r) => [r, 'danger'] as const),
+      ...reading.yellow_rules.map((r) => [r, 'warn'] as const),
+    ]) {
+      const seen = byRule.get(rule);
+      if (seen) {
+        seen.value += 1;
+      } else {
+        byRule.set(rule, { label: rule, value: 1, tone });
+      }
+    }
+  }
 
   return (
     <ViewFrame
@@ -58,6 +88,21 @@ export function GovernanceView() {
           )}
         </div>
         </Readings>
+      )}
+      {readings.length > 0 && (
+        <div className="border-b border-[var(--line)]">
+          <Strip
+            label={`这 ${readings.length} 个面现在各判成什么`}
+            note="判词来自 GET /api/v1/governance/drift；「没读到」是这一轮没人读这一面，不是它没问题"
+            segments={[...byState.values()].sort((a, b) => b.value - a.value)}
+          />
+          <BarList
+            label="哪条规则在最多的面上成立"
+            note="同一个面上同一条规则只记一次；红规则挡变更，黄规则只报告"
+            rows={[...byRule.values()].sort((a, b) => b.value - a.value)}
+            empty="这一轮没有任何规则成立"
+          />
+        </div>
       )}
       {faces.error ? (
         <ReadError what="面的清单" error={faces.error} onRetry={faces.refresh} />
@@ -165,6 +210,25 @@ export function GovernanceView() {
       )}
     </ViewFrame>
   );
+}
+
+/**
+ * 判词在分布条上的色，与表里 `Status` 用的是同一套判据：四条红规则占红，三条黄
+ * 规则占黄，`on_target` 是绿的，`unread` 是灰的——灰不是「好」，是「没人读」。
+ */
+function stateTone(state: string): Tone {
+  switch (state) {
+    case 'on_target':
+      return 'ok';
+    case 'owner_idle':
+    case 'witness_is_owner':
+    case 'deputy_overlap':
+      return 'warn';
+    case 'unread':
+      return 'muted';
+    default:
+      return 'danger';
+  }
 }
 
 /** 判读状态的颜色：已强制是好的，未强制要人看，退役只是历史。 */

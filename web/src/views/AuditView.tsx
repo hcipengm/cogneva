@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { listAuditEvents, type AuditEvent } from '@/api/client';
 import { useStreamDrivenRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
+import { BarList } from '@/ui/plots';
 
 /**
  * 审计面：归档表里都留了什么。
@@ -100,6 +101,10 @@ export function AuditView() {
 
   const rows = events ?? [];
   const triggers = Array.from(new Set(rows.map((row) => row.trigger_type))).sort();
+  // 「这一段里哪种事在反复发生」是这一面最常被问的一句，而触发类型在表里是一列
+  // 名字：五十行里同一个名字出现十五次，数不出来。只数这一次查询带回来的行。
+  const byTrigger = new Map<string, number>();
+  for (const row of rows) byTrigger.set(row.trigger_type, (byTrigger.get(row.trigger_type) ?? 0) + 1);
 
   return (
     <ViewFrame
@@ -129,6 +134,18 @@ export function AuditView() {
         <Reading label="带任务的" value={rows.filter((row) => row.task_id).length} />
       </div>
       </Readings>
+
+      {rows.length > 0 && (
+        <div className="border-b border-[var(--line)]">
+          <BarList
+            label="这一段里每种触发各留了几条"
+            note="只数这一次查询带回来的行，窗口与条数上限之外的不在里面"
+            rows={[...byTrigger.entries()]
+              .sort((a, b) => b[1] - a[1])
+              .map(([trigger, count]) => ({ id: trigger, label: trigger, value: count }))}
+          />
+        </div>
+      )}
 
       <div className="flex flex-wrap items-center gap-2 border-b border-[var(--line)] px-4 py-2">
         <input

@@ -4,6 +4,15 @@ import { useShell } from '@/shell/store';
 import { breachesSinceSnapshot, type LiveAlertRow } from '@/store/liveAlerts';
 import { useLiveAlertStore } from '@/store/liveAlertStore';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
+import { BarList } from '@/ui/plots';
+
+/** 分钟数写成「几小时几分」：图上那一列只有十几格宽，写 137 比写「2 小时 17 分」省地方，但读者换算不了。 */
+function howLong(minutes: number): string {
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest === 0 ? `${hours} 小时` : `${hours} 小时 ${rest} 分`;
+}
 
 /**
  * 告警面：正在 firing 的条件，以及「有人看过没有」。
@@ -85,6 +94,32 @@ export function AlertsView() {
             />
           </div>
           </Readings>
+          {/* 这一面第二个问题是「哪一条烧得最久」。表按开始时间排不出这件事——开始
+              得早不等于烧得久，何况表里还混着刚推来、没有开始时间的那几条。时长本身
+              是个量，量就该按长短排开，一眼看出有没有一条一直没人管。 */}
+          <div className="border-b border-[var(--line)]">
+            <BarList
+              label="每条在 firing 的规则已经烧了多久"
+              note="从这一条开始 firing 算到这页渲染的时刻；下一次重读时重新算"
+              rows={list
+                .map((alert) => {
+                  const minutes = Math.max(
+                    0,
+                    Math.round((Date.now() - Date.parse(alert.timestamp)) / 60_000),
+                  );
+                  return {
+                    id: alert.id,
+                    label: alert.event_type,
+                    value: minutes,
+                    note: howLong(minutes),
+                    tone: alert.severity === 'critical' ? ('danger' as const) : undefined,
+                    detail: alert.message,
+                  };
+                })
+                .sort((a, b) => b.value - a.value)}
+              empty="现在没有 firing 的告警，没有时长可画"
+            />
+          </div>
           {reader.ackError && (
             <div className="border-b border-[var(--line)] px-4 py-2 text-[11px] text-[var(--danger)]">
               {reader.ackError}

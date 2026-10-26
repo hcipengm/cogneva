@@ -15,6 +15,7 @@ import {
   type LiveTaskStatus,
 } from '@/store/streamStore';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
+import { Strip } from '@/ui/plots';
 
 /**
  * 任务面：两类问题两个视图。
@@ -141,6 +142,22 @@ export function TasksView() {
           />
         </div>
         </Readings>
+      )}
+      {/* 图上画的是依赖边，画不出「五分之四已经收口」这种比例。同一份 summary 分成
+          几段：这批活是刚开始还是快收尾，是这一面最先被问到的一句。 */}
+      {counts && counts.total > 0 && (
+        <div className="border-b border-[var(--line)]">
+          <Strip
+            label="全部任务各处在什么状态"
+            note="数的是 GET /api/v1/tasks/summary 那一刻的全部任务，不随下面的过滤词变"
+            segments={[
+              { label: '运行中', value: counts.running, tone: 'ok' },
+              { label: '就绪待领', value: counts.ready, tone: 'warn' },
+              { label: '已完成', value: counts.completed, tone: 'muted' },
+              { label: '失败', value: counts.failed, tone: 'danger' },
+            ]}
+          />
+        </div>
       )}
 
       {mode === 'list' ? (

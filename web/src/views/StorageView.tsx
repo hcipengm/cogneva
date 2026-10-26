@@ -14,6 +14,7 @@ import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
+import { BarList } from '@/ui/plots';
 
 const PAGE = 50;
 const PREVIEW_CHARS = 4000;
@@ -141,6 +142,24 @@ export function StorageView() {
           不是「现在存着多少」。现在存着多少看下面两张表，那是盘上的东西。
         </p>
       )}
+      {/* 六个计数器并排成六格时，读不出「写入比读回多出多少」这种失衡。按长短排开，
+          哪一类动作在重复发生就一眼看见——它回答的是动作，不是存量。 */}
+      {stats.data && (
+        <div className="border-b border-[var(--line)]">
+          <BarList
+            label="这六类动作各发生过几次"
+            note="进程启动算起的累计次数（GET /api/v1/memory/stats），重启归零"
+            rows={[
+              { label: '归档来源', value: stats.data.raw_archived },
+              { label: '读回原始来源', value: stats.data.raw_retrieved },
+              { label: '写 schema', value: stats.data.schema_stored },
+              { label: '查 schema', value: stats.data.schema_searched },
+              { label: '写摘要', value: stats.data.summary_stored },
+              { label: '查摘要', value: stats.data.summary_searched },
+            ].sort((a, b) => b.value - a.value)}
+          />
+        </div>
+      )}
       <section className="border-b border-[var(--line)]">
         <div className="flex items-baseline gap-2 px-4 py-2">
           <h2 className="text-[11px] uppercase tracking-wider text-[var(--muted)]">原始来源</h2>
@@ -249,6 +268,18 @@ export function StorageView() {
               ]}
               rows={logEntries}
               rowKey={(e) => `${e.stream_name}:${e.log_date}:${e.hour}:${e.format}:${e.file_path}`}
+            />
+            <BarList
+              label="这一页里每个流各占多少字节"
+              note="按这一页的 size_bytes 汇总（GET /api/v1/memory/raw_logs），不是整个归档的合计"
+              rows={[...logEntries
+                .reduce((byStream, entry) => {
+                  byStream.set(entry.stream_name, (byStream.get(entry.stream_name) ?? 0) + entry.size_bytes);
+                  return byStream;
+                }, new Map<string, number>())
+                .entries()]
+                .sort((a, b) => b[1] - a[1])
+                .map(([stream, size]) => ({ id: stream, label: stream, value: size, note: bytes(size) }))}
             />
             <p className="px-4 pb-3 pt-2 text-[11px] text-[var(--muted)]">
               上面三个数只算这一页：它不是整个归档的合计，别拿它当总量。

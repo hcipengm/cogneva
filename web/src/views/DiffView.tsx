@@ -21,6 +21,9 @@ import { Button, Empty, Loading, ReadError, ViewFrame } from '@/ui/primitives';
  * 一行之内只画一边的配对（删除行对新增行），多余的删除或新增各自占一行、
  * 另一边留空——这是并排 diff 唯一不会让人读错的对齐方式：按行数硬凑会把
  * 一处改动画成两处无关的改动。
+ *
+ * 画面：并排的两栏 diff 本身就是这一面的画面——它画的是那两个文件的差，一行
+ * 一行对得很齐。再叠一层统计图上去只会挤掉真正要看的那几行。
  */
 export function DiffView() {
   const tabs = useShell((s) => s.tabs);

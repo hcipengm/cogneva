@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import { getProcessOverview, type GoalGroup, type ProcessTask } from '@/api/client';
+import { Strip } from '@/ui/plots';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
@@ -106,6 +107,21 @@ export function FlowView() {
               )}
             </div>
             </Readings>
+            {/* 上面那一排小格是一个漏斗，而漏斗本来是一条：段与段的差就是这一段还
+                卡着多少活。分成几段排开，卡在哪儿是第一眼的事。 */}
+            {planned > 0 && (
+              <Strip
+                label="这批原子任务各卡在哪一段"
+                note="每一段由这一批任务的状态算（与上面那几格同一份读数）；已收口那一段不是「好」，是「走完了」"
+                segments={[
+                  { label: '被依赖挡住', value: blocked, tone: 'warn' },
+                  { label: '就绪待领', value: ready, tone: 'warn' },
+                  { label: '执行中', value: running, tone: 'ok' },
+                  { label: '已收口', value: completed, tone: 'muted' },
+                  { label: '失败', value: failed, tone: 'danger' },
+                ]}
+              />
+            )}
             <p className="px-4 pb-2 text-[11px] text-[var(--muted)]">
               评测与落地不在这条线上：它们的读数在评测面与变更面。把它们画进这一段，
               会让「没有来源」看起来像「这一段没活」。

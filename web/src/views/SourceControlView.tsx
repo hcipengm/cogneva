@@ -14,6 +14,7 @@ import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { useShell } from '@/shell/store';
 import { Button, Empty, Loading, Moment, ReadError, ViewFrame } from '@/ui/primitives';
+import { Strip, type Tone } from '@/ui/plots';
 
 /**
  * 源代码管理：工作区里那本本地 git 历史。
@@ -211,6 +212,17 @@ export function SourceControlView() {
             )}
           </div>
 
+          {/* 两份清单按路径排，读不出「这些改动都是些什么」：改了二十个、删了两个，
+              在列表里一样长。按 git 的代码分段数，一件事的两份清单也就能一起看。 */}
+          {status.staged.length + status.unstaged.length > 0 && (
+            <div className="border-b border-[var(--line)]">
+              <Strip
+                label="这一屏的改动各是哪一种"
+                note="已暂存与未暂存合在一起数（GET /api/v1/ide/scm/status）；同一文件两边都在时算两条"
+                segments={changeSegments(status)}
+              />
+            </div>
+          )}
           <Group
             title="已暂存"
             count={status.staged.length}
@@ -322,6 +334,21 @@ function Group({
 }
 
 /** 状态字到颜色：新增绿、删除红、改与改名取中性强调色。 */
+/** 两种改动各几条，按 git 的代码分段。名字用 `CODE_NAMES`，与列表里那条注脚同一套词。 */
+function changeSegments(status: ScmStatus): { label: string; value: number; tone: Tone }[] {
+  const counted = new Map<string, number>();
+  for (const change of [...status.staged, ...status.unstaged]) {
+    counted.set(change.code, (counted.get(change.code) ?? 0) + 1);
+  }
+  return [...counted.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([code, count]) => ({
+      label: CODE_NAMES[code] ?? code,
+      value: count,
+      tone: code === 'D' ? ('danger' as const) : code === 'U' ? ('warn' as const) : ('magnitude' as const),
+    }));
+}
+
 function codeColor(code: string): string {
   if (code === 'A' || code === '?') return 'var(--ok)';
   if (code === 'D') return 'var(--danger)';

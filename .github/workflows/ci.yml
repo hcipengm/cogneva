@@ -788,6 +788,13 @@ jobs:
       # 既不许一次不读，也不许按帧数读。
       - name: Check the polling faces re-read when a frame says something changed
         run: bash deploy/scripts/check-web-stream-driven-refresh.sh
+      # 帧接上了、重读也对了，画面上还可以全是表格。这一条判的是每**一面**都画得出
+      # 自己那份读数的形状：要么用 `ui/plots.tsx` 那套共用画法（甘特条、花销柱、拓扑
+      # 也算），要么在文件头写明「画面：」——即这一面的内容本身就是画面。画法按出处
+      # 认不按名字认（自己写个同名组件不算），色值只准取主题令牌，且「没量出来」必须
+      # 画成与「零」不同的样子。
+      - name: Check every face draws its own reading
+        run: bash deploy/scripts/check-web-face-visualization.sh
 
   entry-scripts:
     name: Entry Scripts Lint

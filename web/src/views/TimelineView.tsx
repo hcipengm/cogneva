@@ -6,6 +6,7 @@ import { resourceKey } from '@/store/frameTick';
 import { describeEvent, type ActivityEntry } from '@/store/streamStore';
 import type { AgentEvent } from '@/types/events';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
+import { BarList, Strip, type StripSegment } from '@/ui/plots';
 import type { ExplainOrigin } from '@/ui/explain';
 
 /**
@@ -48,6 +49,10 @@ function TraceScrubber({ trace, origin }: { trace: AgentTrace; origin: ExplainOr
   );
   const current = rows[rows.length - 1];
   const failedSoFar = rows.filter((row) => row.failed).length;
+  // 一趟执行的「形状」是它由哪几种帧组成：只有 message_update 的一趟是在说话，
+  // 一堆 tool_call 的一趟在干活。逐行读能看出顺序，看不出构成。
+  const byType = new Map<string, number>();
+  for (const row of rows) byType.set(row.type, (byType.get(row.type) ?? 0) + 1);
   const first = frames[0]?.timestamp;
   const now = frames[Math.min(cursor, frames.length - 1)]?.timestamp;
 
@@ -119,6 +124,15 @@ function TraceScrubber({ trace, origin }: { trace: AgentTrace; origin: ExplainOr
           )}
         </div>
       )}
+      <div className="border-t border-[var(--line)]">
+        <Strip
+          label="拖到的这一格为止，这一趟由哪几种帧组成"
+          note="只数拖到的位置之前那些帧；颜色不表示好坏，这段是构成不是判决"
+          segments={[...byType.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .map(([type, count]): StripSegment => ({ label: type, value: count, tone: 'magnitude' }))}
+        />
+      </div>
       <div className="max-h-72 overflow-auto border-t border-[var(--line)]">
         <ol className="px-4 py-2">
           {rows.map((row, index) => (
@@ -215,6 +229,15 @@ export function TimelineView() {
             ]}
             rows={rows}
             rowKey={(t) => t.trace_id}
+          />
+        )}
+        {rows.length > 0 && (
+          <BarList
+            label="每份轨迹记下了多少帧"
+            note="帧数来自列表这一页（GET /api/v1/traces）；帧多的那一趟不一定跑得久，但一定更值得点开"
+            rows={rows
+              .map((t) => ({ id: t.trace_id, label: t.trace_id, value: t.event_count }))
+              .sort((a, b) => b.value - a.value)}
           />
         )}
       </section>
