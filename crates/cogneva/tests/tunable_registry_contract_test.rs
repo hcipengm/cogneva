@@ -768,6 +768,124 @@ fn a_port_the_gateway_listens_on_is_told_to_the_process_and_not_only_opened() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// An endpoint the process cannot run without, where it is read, and the values
+/// leaf the chart has to fill it from.
+///
+/// These are the envs whose absence is now an error rather than a guess: the code
+/// stopped carrying a default address, because a wrong guess and "nothing there"
+/// answer identically on every surface that reads them. That makes the chart the
+/// only thing that can turn them on -- delete an entry from the ConfigMap and the
+/// board reports `not_configured` in production while every gate stays green.
+const REQUIRED_ENDPOINTS: &[(&str, &str, &str)] = &[
+    (
+        "crates/cog-gateway/src/readings.rs",
+        "COGNEVA_PROMETHEUS_URL",
+        "observability.infraWatch.prometheusUrl",
+    ),
+    (
+        "crates/cog-gateway/src/contribution_admin.rs",
+        "COGNEVA_SECURITY_GATEWAY_BASE",
+        "securityGateway.llmProxyPort",
+    ),
+];
+
+/// The env ConfigMap the workloads take through `envFrom`.
+const ENV_CONFIGMAP: &str = "deploy/helm/cogneva/templates/configmap.yaml";
+
+/// The static copy of that ConfigMap, which is the parity baseline.
+const ENV_CONFIGMAP_K3S: &str = "deploy/k3s/configmap.yaml";
+
+/// The value written for `env` in a ConfigMap whose entries are `KEY: value`.
+fn configmap_value<'a>(text: &'a str, env: &str) -> Option<&'a str> {
+    let needle = format!("{env}:");
+    text.lines()
+        .find(|line| line.trim_start().starts_with(&needle))
+        .map(str::trim)
+}
+
+/// An endpoint with no default in the code has to be declared by the chart, from
+/// a values leaf, and the static baseline has to carry the same address: the two
+/// paths are the same deployment fact, and only one of them is rendered.
+#[test]
+fn an_endpoint_the_code_requires_is_filled_by_the_chart() {
+    let values: serde_yaml::Value = serde_yaml::from_str(&read(&repo_root().join(VALUES)))
+        .unwrap_or_else(|e| panic!("{VALUES} does not parse: {e}"));
+    let template = read(&repo_root().join(ENV_CONFIGMAP));
+    let k3s = read(&repo_root().join(ENV_CONFIGMAP_K3S));
+
+    let mut wrong = Vec::new();
+    for (code_path, env, leaf) in REQUIRED_ENDPOINTS {
+        let code = read(&repo_root().join(code_path));
+        if !code.contains(&format!("env::var(\"{env}\")")) {
+            wrong.push(format!(
+                "{code_path} no longer reads {env}, so this row is stale -- either the \
+                 endpoint is declared somewhere else now (point this table at it) or the \
+                 requirement went away (delete the row)"
+            ));
+            continue;
+        }
+        let Some(value_line) = configmap_value(&template, env) else {
+            wrong.push(format!(
+                "{ENV_CONFIGMAP} never passes {env}: {code_path} treats its absence as an \
+                 error, so every Pod with this ConfigMap answers `not_configured`"
+            ));
+            continue;
+        };
+        if !value_line.contains(&format!(".Values.{leaf}")) {
+            wrong.push(format!(
+                "{ENV_CONFIGMAP}: {env} is `{value_line}` rather than a read of \
+                 `{leaf}` -- moving the values key would then move one reader and not \
+                 the other"
+            ));
+            continue;
+        }
+        let Some(declared) = leaf_at(&values, leaf) else {
+            wrong.push(format!(
+                "{VALUES} has no `{leaf}`, which {ENV_CONFIGMAP} reads for {env}"
+            ));
+            continue;
+        };
+        let Some(static_value) = configmap_value(&k3s, env) else {
+            wrong.push(format!(
+                "{ENV_CONFIGMAP_K3S} never passes {env}, so the static path leaves the \
+                 process with no endpoint at all -- it is the baseline parity compares, \
+                 not a manifest that can skip the key"
+            ));
+            continue;
+        };
+        // The static file carries the value, not an expression: it has to spell out
+        // what the chart computes from the leaf, and a mismatch here is exactly the
+        // drift parity cannot see (it compares the chart to this file).
+        let expected = match declared {
+            serde_yaml::Value::String(url) => url.clone(),
+            serde_yaml::Value::Number(port) => format!(":{port}"),
+            other => {
+                wrong.push(format!(
+                    "{VALUES}: `{leaf}` is {other:?}, which this test does not know how \
+                     to compare with the static manifest"
+                ));
+                continue;
+            }
+        };
+        let trimmed = static_value
+            .trim_start_matches(&format!("{env}:"))
+            .trim()
+            .trim_matches('"');
+        let agrees = match declared {
+            serde_yaml::Value::String(_) => trimmed == expected,
+            _ => trimmed.ends_with(&expected),
+        };
+        if !agrees {
+            wrong.push(format!(
+                "{ENV_CONFIGMAP_K3S}: {env} is `{trimmed}` while {VALUES} gives `{expected}` \
+                 for `{leaf}` -- the static path would point the process somewhere the \
+                 chart does not"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The profile values files: what each deployment形态 changes relative to the
 /// chart's defaults.
 const PROFILES: &str = "deploy/helm/cogneva/profiles";

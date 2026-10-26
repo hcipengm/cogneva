@@ -243,14 +243,13 @@ spec:
                   key: s3-secret-key
             # 贡献通道：GitHub 设备流只用公开的 client_id（本流程无 client_secret）。
             # Gitee 授权码流程的应用凭证由安全网关代持，本进程经
-            # COGNEVA_OAUTH_GATEWAY_URL 借用（授权 URL 与授权码兑换都在网关侧），
-            # 本 Pod 零持有 client_secret。
+            # COGNEVA_SECURITY_GATEWAY_BASE 借用（授权 URL 与授权码兑换都在网关侧），
+            # 本 Pod 零持有 client_secret。那个端点与 Secret 写入的转发共用一条声明，
+            # 都在共用的 cogneva-config 里（一份 env、一个来源），所以这里不再单独给。
             {{- with .Values.contribution.githubOauthClientId }}
             - name: COGNEVA_GITHUB_OAUTH_CLIENT_ID
               value: {{ . | quote }}
             {{- end }}
-            - name: COGNEVA_OAUTH_GATEWAY_URL
-              value: {{ printf "http://cogneva-security-gateway:%d" (int .Values.securityGateway.llmProxyPort) | quote }}
             {{- with .Values.contribution.giteeOauthRedirectUri }}
             - name: COGNEVA_GITEE_OAUTH_REDIRECT_URI
               value: {{ . | quote }}

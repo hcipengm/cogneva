@@ -3210,10 +3210,7 @@ impl MainlineDeployer {
     /// buildah 在 Pod 内 push/from 的端点（集群 DNS，http）。
     fn push_endpoint(&self) -> String {
         if self.cfg.registry.trim().is_empty() {
-            format!(
-                "cogneva-registry.{}.svc.cluster.local:5000",
-                self.cfg.namespace
-            )
+            crate::registry_endpoint::in_cluster(&self.cfg.namespace)
         } else {
             self.cfg.registry.trim_end_matches('/').to_string()
         }

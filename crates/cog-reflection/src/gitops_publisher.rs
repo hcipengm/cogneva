@@ -216,10 +216,7 @@ impl GitOpsPublisher {
         let (endpoint, insecure) = match &self.config.registry {
             Some(ext) => (ext.trim_end_matches('/').to_string(), false),
             None => (
-                format!(
-                    "cogneva-registry.{}.svc.cluster.local:5000",
-                    self.config.namespace
-                ),
+                crate::registry_endpoint::in_cluster(&self.config.namespace),
                 true,
             ),
         };

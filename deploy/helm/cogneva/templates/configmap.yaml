@@ -44,6 +44,16 @@ data:
   COGNEVA_WS_PORT: {{ .Values.gateway.wsPort | int | quote }}
   COGNEVA_METRICS_PORT: {{ .Values.gateway.metricsPort | int | quote }}
 
+  # 安全网关的内部端点：Secret 写入的转发与 Gitee OAuth 的借用都走它。端口与
+  # securityGateway.llmProxyPort 同源——容器的 containerPort、Service 的端口、
+  # files/cogneva.json 里那几处 `cogneva-security-gateway:8081` 的改写读的都是这
+  # 一个数，代码里再留一个默认值就成了第二个数，改 values 挪不动它。
+  COGNEVA_SECURITY_GATEWAY_BASE: {{ printf "http://cogneva-security-gateway:%d" (int .Values.securityGateway.llmProxyPort) | quote }}
+  # Prometheus：读数面查询的那一台。与 observability.infraWatch.prometheusUrl
+  # 同源——规则求值读的是 cogneva.json 的 infra_watch.prometheus_url，两者问的
+  # 是同一台机器，各写一个地址就等于允许它们分开。
+  COGNEVA_PROMETHEUS_URL: {{ .Values.observability.infraWatch.prometheusUrl | quote }}
+
   # 告警通知出口地址。出口机制四类 dispatcher 都在代码里，缺的只是地址；空值
   # 不建出口（与 cogneva.json 的 null 等价）。地址只由集群侧 values / --set 给，
   # 所以这里渲染成空串而不是省略——省略会让"这份清单里没有这个键"与"运维没配"

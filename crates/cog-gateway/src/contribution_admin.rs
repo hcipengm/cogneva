@@ -286,21 +286,35 @@ pub(crate) fn oauth_client_id(explicit: Option<&str>) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-/// 安全网关内部端点基址（同命名空间 Service）。Gitee OAuth 应用凭证与授权码
-/// 兑换都发生在网关进程内，主应用只经此地址借用，本进程零持有 client_secret。
-pub(crate) fn oauth_gateway_base() -> String {
-    std::env::var("COGNEVA_OAUTH_GATEWAY_URL")
+/// 安全网关内部端点基址（同命名空间 Service）。
+///
+/// 这个地址有两个买家：Gitee OAuth 应用凭证与授权码兑换（网关进程内完成，
+/// 主应用只借用，本进程零持有 client_secret），以及 Secret 写入的转发。两处
+/// 各写一个默认值就是同一个事实的第二份副本——网关端口在 values 里挪一次，
+/// 只会挪动其中一条路，另一条继续敲一扇关了的门。
+///
+/// 没声明就报错，不猜集群内地址：猜错的症状是「向导说网关不可达」，而真正
+/// 的原因在清单里，两个面隔着一层，读的人会先去查那个进程。
+pub(crate) fn security_gateway_base() -> Result<String, String> {
+    std::env::var("COGNEVA_SECURITY_GATEWAY_BASE")
         .ok()
         .map(|s| s.trim().trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "http://cogneva-security-gateway:8081".to_string())
+        .ok_or_else(|| {
+            "没有声明安全网关端点（COGNEVA_SECURITY_GATEWAY_BASE）：本进程不猜集群内地址，\
+             猜错读起来像「网关挂了」"
+                .to_string()
+        })
 }
 
 /// 向网关借 Gitee OAuth App 的 client_id（公开标识）。未配置或网关不可达返回
 /// None，调用方据此走"未配置 OAuth App"的引导。判据只有网关这一个来源，
 /// 主应用不另立近似判据。
 pub(crate) async fn gitee_oauth_client_id() -> Option<String> {
-    let url = format!("{}/v1/oauth/gitee/app", oauth_gateway_base());
+    let Ok(base) = security_gateway_base() else {
+        return None;
+    };
+    let url = format!("{base}/v1/oauth/gitee/app");
     // 借不到客户端与网关不可达在返回面上同形（本函数只说"这个来源没给出
     // client_id"），调用方据此走「未配置 OAuth App」的引导。
     let body: serde_json::Value = http_client()
@@ -325,7 +339,7 @@ async fn oauth_gateway_call(
     path: &str,
     payload: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let url = format!("{}{path}", oauth_gateway_base());
+    let url = format!("{}{path}", security_gateway_base()?);
     let request = HttpRequest::post(url)
         .json(&payload)
         .map_err(|e| format!("请求体序列化失败（{e}）"))?;

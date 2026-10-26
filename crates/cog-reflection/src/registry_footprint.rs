@@ -517,7 +517,7 @@ pub fn from_env(
         return (None, problems);
     };
     let endpoint = if endpoint.trim().is_empty() {
-        format!("cogneva-registry.{namespace}.svc.cluster.local:5000")
+        crate::registry_endpoint::in_cluster(namespace)
     } else {
         endpoint.trim_end_matches('/').to_string()
     };

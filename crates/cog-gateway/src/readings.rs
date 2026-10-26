@@ -183,15 +183,34 @@ pub fn parse_scalar(body: &serde_json::Value) -> Option<f64> {
     raw.parse::<f64>().ok()
 }
 
-/// Where Prometheus is. The in-cluster service the small profile installs, with
-/// an override for a host-run gateway.
-pub fn prometheus_base() -> String {
-    std::env::var("COGNEVA_PROMETHEUS_URL")
-        .ok()
-        .map(|s| s.trim().trim_end_matches('/').to_string())
+/// Where Prometheus is, as the deployment declares it.
+///
+/// The chart fills this from the same values leaf that fills the config's
+/// `infra_watch.prometheus_url`, because both ask the same Prometheus: the rule
+/// evaluator and this board must not be the two readers of one fact that can
+/// disagree.
+///
+/// Nothing declared is an error, not a default. A guessed in-cluster address is
+/// the one kind of wrong answer this surface cannot show: a query against a
+/// closed port and a query that matched no series both come back as "no
+/// reading", so a guess that moved with the release reads exactly like a quiet
+/// week.
+pub fn prometheus_base() -> Result<String, String> {
+    let declared = std::env::var("COGNEVA_PROMETHEUS_URL").ok();
+    prometheus_base_from(declared.as_deref())
+}
+
+/// [`prometheus_base`] with the declaration handed in, so the rule about what
+/// counts as declared can be read without an environment to set.
+fn prometheus_base_from(declared: Option<&str>) -> Result<String, String> {
+    declared
+        .map(str::trim)
+        .map(|s| s.trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            "http://cog-observability-prometheus.monitoring.svc.cluster.local:9090".into()
+        .ok_or_else(|| {
+            "没有声明 Prometheus 地址（COGNEVA_PROMETHEUS_URL）：读数面不猜集群内的地址，\
+             猜错与「这条序列没有样本」在读数面上同形"
+                .to_string()
         })
 }
 
@@ -256,7 +275,19 @@ pub async fn observability_readings_handler() -> axum::response::Response {
     use axum::response::IntoResponse;
     use axum::Json;
 
-    let base = prometheus_base();
+    let base = match prometheus_base() {
+        Ok(base) => base,
+        Err(e) => {
+            // 地址没声明与 Prometheus 不可达是两件事：一个要改清单，一个要查
+            // 那台 Prometheus。混成一句「取不到读数」，运维会去查一台根本没被
+            // 指到的机器。
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "prometheus_not_configured", "message": e})),
+            )
+                .into_response();
+        }
+    };
     let client = match query_client() {
         Ok(c) => c,
         Err(e) => {
@@ -323,6 +354,21 @@ pub async fn observability_readings_handler() -> axum::response::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_undeclared_prometheus_is_an_error_not_an_address() {
+        // 猜一个集群内地址的坏处不是「猜错」本身，是猜错后的症状与「这条序列
+        // 没有样本」同形：面板上两格都写着没有读数，一种要改清单、一种要查
+        // Prometheus。
+        assert!(prometheus_base_from(None).is_err());
+        assert!(prometheus_base_from(Some("")).is_err());
+        assert!(prometheus_base_from(Some("   ")).is_err());
+        // 声明了就用它，只做去空白的收尾（末尾斜杠会拼出 `//api/v1/query`）。
+        assert_eq!(
+            prometheus_base_from(Some(" http://prom.monitoring:9090/ ")).unwrap(),
+            "http://prom.monitoring:9090"
+        );
+    }
 
     #[test]
     fn an_empty_prometheus_answer_is_not_zero() {

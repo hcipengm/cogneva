@@ -1,0 +1,17 @@
+# 代码里写死的集群内地址：一行一处，没有登记的就是红。
+#
+# 判据只认**集群 DNS 形状**（`<host>.svc.cluster.local:<port>`）——短名
+# （`cogneva-security-gateway:8081`）与 `localhost:8080` 都可能是本地默认值，
+# 拿它们做判据会先被正当用法撞红；DNS 全名只在集群里成立，写的必然是一个部署事实。
+#
+# 列：`file`  `address`  `reason`（为什么它能留在代码里，而不是由清单声明）。
+# 按 file+address 记，不记行号：行号会随编辑漂移，漂移一次就多一条假红。
+#
+# 2026-10-26：最后一行（`ImageRolloutConfig::default()` 的 `base_image`）已消除，
+# 上限随之落到 0。那一行的理由当时写的是「chart 用 COGNEVA_IMAGE_ROLLOUT_BASE_IMAGE
+# 覆盖」，实测 deploy/ 下没有这个变量——它其实没有任何声明面，是唯一来源。
+# 现在默认值是空串，`ImageRollout` 在写 Containerfile 之前就报错。
+#
+# 上限为 0 时本文件仍留着：它是判据的输入，删掉判据就没了。新增一行要同时抬
+# `DEBT_CEILING` 并写清为什么部署面声明不了它。
+file	address	reason

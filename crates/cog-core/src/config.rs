@@ -1022,6 +1022,9 @@ pub struct ImageRolloutConfig {
     /// 镜像内基础镜像（COPY 已编译二进制）：必须是正式 cogneva 运行镜像
     /// （WebUI/skills/migrations/动态库齐全，glibc 版本匹配），不能用
     /// debian-slim 这类裸基底——二进制启动即缺库崩。
+    ///
+    /// 由部署面声明，代码里不给默认值：默认一个集群内地址等于把一个部署事实
+    /// 抄进二进制，`--set` 改不动它；空串＝没声明，构建前报错。
     pub base_image: String,
     /// 镜像构建器可执行文件：buildah / docker / podman。
     pub builder_bin: String,
@@ -1040,7 +1043,7 @@ impl Default for ImageRolloutConfig {
         Self {
             enabled: false,
             image_repo: "localhost/cogneva".into(),
-            base_image: "cogneva-registry.cogneva.svc.cluster.local:5000/cogneva:local".into(),
+            base_image: String::new(),
             builder_bin: "buildah".into(),
             registry_push: false,
             kubectl_bin: "kubectl".into(),

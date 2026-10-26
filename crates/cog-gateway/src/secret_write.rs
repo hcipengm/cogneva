@@ -82,12 +82,12 @@ pub(crate) async fn apply(fields: Value, b64: bool, restart: bool) -> Result<Res
 
 /// 主应用侧：把写入请求转发给安全网关。
 ///
-/// 地址默认取集群内服务名；`COGNEVA_SECURITY_GATEWAY_BASE` 可覆盖（本地联调）。
-/// 没配内部凭证就拒绝——宁可让向导报错，也不退回本进程直接 patch：那会悄悄
-/// 把权限面又打开，而且没人看得出来今天写的是哪一条路。
+/// 地址由清单声明（`COGNEVA_SECURITY_GATEWAY_BASE`），与其他经网关的调用同一个
+/// 来源，见 [`crate::contribution_admin::security_gateway_base`]。没配内部凭证就
+/// 拒绝——宁可让向导报错，也不退回本进程直接 patch：那会悄悄把权限面又打开，
+/// 而且没人看得出来今天写的是哪一条路。
 pub(crate) async fn forward(fields: Value, b64: bool, restart: bool) -> Result<Restart, String> {
-    let base = std::env::var("COGNEVA_SECURITY_GATEWAY_BASE")
-        .unwrap_or_else(|_| "http://cogneva-security-gateway:8081".to_string());
+    let base = crate::contribution_admin::security_gateway_base()?;
     let secret = std::env::var("COGNEVA_WEBHOOK_INTERNAL_SECRET")
         .ok()
         .filter(|s| !s.is_empty())

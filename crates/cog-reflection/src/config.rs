@@ -826,7 +826,7 @@ impl Default for MainlineDeployerConfig {
             upstreams: Vec::new(),
             git_proxy_base: String::new(),
             upstream_fetch_timeout_secs: 300,
-            registry: "cogneva-registry.cogneva.svc.cluster.local:5000".into(),
+            registry: crate::registry_endpoint::in_cluster("cogneva"),
             local_registry: "localhost:30500".into(),
             namespace: "cogneva".into(),
             builder_bin: "buildah".into(),

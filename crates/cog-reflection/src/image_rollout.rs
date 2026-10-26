@@ -41,6 +41,23 @@ impl ImageRollout {
         format!("{}:change-{}", self.config.image_repo, sanitized)
     }
 
+    /// 镜像基底由部署面声明，这里只负责「没声明就停」。
+    ///
+    /// 空着不当作能用默认值补上：集群内的仓库地址写进代码就再也跟着部署走不动，
+    /// 而错的内容要等镜像构建成功、容器启动时才暴露——失败现场落在滚动更新里，
+    /// 读起来像「新镜像坏了」。在写 Containerfile 之前拒绝，失败点就在配置上。
+    fn base_image(&self) -> SFResult<&str> {
+        let base = self.config.base_image.trim();
+        if base.is_empty() {
+            return Err(SFError::Validation(
+                "没有声明镜像基底（self_evolution.image_rollout.base_image）：本进程不猜\
+                 集群内的仓库地址，猜错要等镜像建完、容器起不来才发现"
+                    .into(),
+            ));
+        }
+        Ok(base)
+    }
+
     async fn run(&self, program: &str, args: &[&str], timeout_secs: u64) -> SFResult<String> {
         let cmdline = format!("{} {}", program, args.join(" "));
         let fut = tokio::process::Command::new(program)
@@ -82,7 +99,8 @@ impl ImageRollout {
 
         let containerfile = format!(
             "FROM {}\nCOPY {} /opt/cogneva/cogneva\nENTRYPOINT [\"/opt/cogneva/cogneva\"]\n",
-            self.config.base_image, binary_name
+            self.base_image()?,
+            binary_name
         );
         let path = context_dir.join("Containerfile.rollout");
         tokio::fs::write(&path, containerfile)
@@ -253,6 +271,27 @@ mod tests {
         assert!(calls.contains("push localhost/cogneva:change-p-1"));
         assert!(calls.contains("set image deployment/cogneva cogneva=localhost/cogneva:change-p-1"));
         assert!(calls.contains("rollout status deployment/cogneva"));
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_base_image_stops_before_anything_is_built() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("fake.log");
+        let mut cfg = rollout_config(tmp.path(), true);
+        cfg.base_image = "   ".into();
+        let r = ImageRollout::new(cfg);
+        let art = artifact(tmp.path());
+
+        let err = r.deploy(&art).await.unwrap_err();
+        assert!(
+            err.to_string().contains("base_image"),
+            "拒绝要说清是哪个字段没声明：{err}"
+        );
+        assert!(
+            !tmp.path().join("Containerfile.rollout").exists(),
+            "拒绝之前不许先落一个 `FROM` 空地址的 Containerfile"
+        );
+        assert!(!log.exists(), "镜像构建器一次都不该被调起");
     }
 
     #[tokio::test]

@@ -88,6 +88,7 @@ pub mod promotion_gate;
 pub mod promotion_switch;
 pub mod promotion_trend;
 pub mod recorder;
+pub(crate) mod registry_endpoint;
 pub mod registry_footprint;
 pub mod reviewer;
 pub mod rollout_resources;
