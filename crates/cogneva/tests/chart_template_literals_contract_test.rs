@@ -24,7 +24,7 @@
 //! What is deliberately not counted, because it is not a number anybody chose:
 //! numbers inside `{{ }}` (that is a value being read, not written), numbers
 //! inside `{{/* ... */}}` or a `#` comment (prose), numbers carrying a unit or a
-//! version (`1000m`, `80Gi`, `v0.5.10`, `apps/v1`), an address or a date
+//! version (e.g. `1000m`, `80Gi`, `v0.5.10`, `apps/v1`), an address or a date
 //! (`10.0.0.5`, `2026-10-20`), a shell file descriptor (`2>/dev/null`), a
 //! positional parameter (`$1`), and a range (`8080-8081`). A number a template
 //! computes and a number somebody typed are the same number on the page, so the
