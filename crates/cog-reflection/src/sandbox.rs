@@ -92,7 +92,7 @@ impl SandboxSignals {
         Self {
             kubernetes_service_host: std::env::var("KUBERNETES_SERVICE_HOST").ok(),
             kubernetes_service_account: std::path::Path::new(
-                "/var/run/secrets/kubernetes.io/serviceaccount",
+                cog_core::topology::SERVICE_ACCOUNT_DIR,
             )
             .exists(),
             dockerenv: std::path::Path::new("/.dockerenv").exists(),

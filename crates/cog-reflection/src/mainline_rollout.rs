@@ -443,8 +443,7 @@ const LOCALHOST_FALLBACK_ADDRESS: &str = "localhost:8080";
 pub(crate) const K3S_KUBECONFIG: &str = "/etc/rancher/k3s/k3s.yaml";
 
 /// 投影进 Pod 的服务账号令牌：in-cluster 配置的另一半（另一半是环境变量里的端点）。
-pub(crate) const SERVICE_ACCOUNT_TOKEN: &str =
-    "/var/run/secrets/kubernetes.io/serviceaccount/token";
+pub(crate) const SERVICE_ACCOUNT_TOKEN: &str = cog_core::topology::SERVICE_ACCOUNT_TOKEN_FILE;
 
 /// 这个进程能不能指望 `kubectl` 读到集群：kubeconfig 的三处来源与 in-cluster 的
 /// 两件套，一处都没有时谁也别怪集群。

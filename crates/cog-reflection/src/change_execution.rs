@@ -1228,7 +1228,7 @@ pub fn plan_change_job(
 /// kubectl 自己的默认命名空间来自 kubeconfig，而这个 Pod 没有 kubeconfig；能回答
 /// 「我在哪个命名空间」的只有服务账号挂载里的那个文件。
 pub fn in_cluster_namespace() -> SFResult<String> {
-    const PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
+    const PATH: &str = cog_core::topology::SERVICE_ACCOUNT_NAMESPACE_FILE;
     let text = std::fs::read_to_string(PATH)
         .map_err(|e| SFError::IO(format!("cannot read {PATH}: {e}")))?;
     let namespace = text.trim().to_string();

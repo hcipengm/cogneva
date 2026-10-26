@@ -69,8 +69,30 @@ pub const QUOTA: &str = "cogneva-quota";
 /// the real value and hands it to every command it runs.
 pub const DEFAULT_NAMESPACE: &str = "cogneva";
 
-/// Where the service account namespace file lives in every pod.
-const SA_NAMESPACE_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
+/// The directory every pod's service account is mounted at.
+///
+/// It is the platform's name rather than this deployment's, and it is declared
+/// here because five places had written it out. A wrong copy does not fail
+/// loudly: the namespace read falls back to the compiled default, and every
+/// list a wrong namespace answers with is empty. The three constants below are
+/// one declaration split by file, so the directory is written once.
+pub const SERVICE_ACCOUNT_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+
+/// A file under [`SERVICE_ACCOUNT_DIR`], spelled as one literal so the path
+/// cannot be built at run time and then forgotten by a census that reads
+/// literals.
+macro_rules! service_account_file {
+    ($file:literal) => {
+        concat!("/var/run/secrets/kubernetes.io/serviceaccount", "/", $file)
+    };
+}
+
+/// The file that answers "which namespace am I in".
+pub const SERVICE_ACCOUNT_NAMESPACE_FILE: &str = service_account_file!("namespace");
+
+/// The projected token: the other half of an in-cluster client config, next to
+/// the API endpoint the environment carries.
+pub const SERVICE_ACCOUNT_TOKEN_FILE: &str = service_account_file!("token");
 
 /// The namespace this process is deployed in.
 ///
@@ -87,7 +109,7 @@ pub fn namespace() -> String {
             return trimmed.to_string();
         }
     }
-    if let Ok(from_file) = std::fs::read_to_string(SA_NAMESPACE_FILE) {
+    if let Ok(from_file) = std::fs::read_to_string(SERVICE_ACCOUNT_NAMESPACE_FILE) {
         let trimmed = from_file.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
