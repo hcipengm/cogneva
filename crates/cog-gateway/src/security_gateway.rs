@@ -127,16 +127,16 @@ pub struct SecurityGatewayConfig {
     /// Gitee API 透传出口注入的 token（COGNEVA_GITEE_TOKEN），以
     /// `access_token` query 参数注入（Gitee API v5 官方认证方式）。
     pub gitee_token: Option<String>,
-    /// 检索后备的带外 key（COGNEVA_SG_SEARCH_FALLBACK_KEY）。未配置时后备走
-    /// keyless 那一档——不需要账号，但额度是与公众共用的一个池，而它恰好会在
-    /// 「自建层全沉默、最需要一条后备」的时候被限流：那种时候全世界都在问。
-    /// 配了 key 就把额度变成这个部署自己的。key 发往哪台主机由
-    /// [`TAVILY_SEARCH_UPSTREAM`] 那一行常量决定，与调用方无关。
+    /// 检索/抓取后备池（COGNEVA_SG_SEARCH_FALLBACK_UPSTREAMS，一个 JSON 数组）。
     ///
-    /// 部署侧的名字是厂商中立的，这一侧的名字不是：清单是**业务侧**配置，
-    /// 它不该点名上游是谁（换上游应当只是网关的一个常量），而挑上游这件事正是
-    /// 在这个文件里发生的，所以身份信息只留在这一侧。
-    pub tavily_api_key: Option<String>,
+    /// 顺序即询问顺序，每条自带形状、地址、能力与凭证；空池是合法部署形态——
+    /// 这个部署选择让查询不出自己这棵树。条目解析与请求构造见
+    /// [`crate::search_fallback`]，这一侧只负责把它们按顺序问一遍。
+    ///
+    /// 部署侧的名字是厂商中立的（`search-fallback-upstreams`），这一侧的名字
+    /// 不是：清单是**业务侧**配置，它不该点名上游是谁，而挑上游这件事正是发生在
+    /// 这个文件里，所以身份信息只留在这一侧。
+    pub search_fallback_upstreams: Vec<crate::search_fallback::SearchUpstream>,
     /// Gitee OAuth App 凭证（COGNEVA_GITEE_OAUTH_CLIENT_ID / _SECRET）：贡献
     /// 通道授权码兑换的唯一起点。业务 Pod 零持有，主应用只经 `/v1/oauth/gitee/*`
     /// 借用；两者缺一即 fail-closed，授权码通道不可用（手动令牌通道不受影响）。
@@ -261,7 +261,7 @@ impl SecurityGatewayConfig {
             llm_health_probe_secs: env_u64("COGNEVA_LLM_HEALTH_PROBE_SECS", 300),
             github_token: token("COGNEVA_GITHUB_TOKEN"),
             gitee_token: token("COGNEVA_GITEE_TOKEN"),
-            tavily_api_key: token("COGNEVA_SG_SEARCH_FALLBACK_KEY"),
+            search_fallback_upstreams: crate::search_fallback::upstreams_from_env(),
             gitee_oauth_client_id: token("COGNEVA_GITEE_OAUTH_CLIENT_ID"),
             gitee_oauth_client_secret: token("COGNEVA_GITEE_OAUTH_CLIENT_SECRET"),
             github_oauth_client_id: token("COGNEVA_GITHUB_OAUTH_CLIENT_ID"),
@@ -6760,59 +6760,91 @@ async fn code_platform_forward(
         .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())))
 }
 
-// ─── 检索后备 ─────────────────────────────────────────────────
+// ─── 检索与抓取的第三方后备 ────────────────────────────────────
 
-/// 检索后备的上游，整个出站 URL 就是这一个字符串。
+/// 一次后备上游的整条墙（建连加读完应答）。
 ///
-/// 这里比 [`code_platform_url`] 还紧一档：那边至少要把调用方给的 path 拼上去，
-/// 这边连 path 都不拼。调用方给的东西只进**请求体**，所以没有任何输入能改变
-/// 出站主机——不是"拼完之后解析出来还是这台主机"，而是这台主机根本没有第二个
-/// 可能的来源。
-const TAVILY_SEARCH_UPSTREAM: &str = "https://api.tavily.com/search";
+/// 它必须小于调用方自己的检索墙（`cog-agent` 的 `SEARCH_TIMEOUT_SECS` 是 20s）：
+/// 池是按顺序问的，一次超过这里就会让「还有第二、第三家可问」在调用方眼里变成
+/// 一次超时——那时换上游这件事根本没有发生，而读起来像「后备全挂了」。
+const SEARCH_FALLBACK_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// 出站认证头：配了 key 就带 key，没配就带 keyless 标记，两者不同时出现。
-///
-/// 两者必须互斥：一条请求上同时挂着两种认证方式，"这条路这次花的是谁的额度"
-/// 在读日志时就没有答案，而额度正是加 key 的唯一理由。
-///
-/// key 只在这一处出现，出站主机由 [`TAVILY_SEARCH_UPSTREAM`] 决定，所以一把
-/// key 加进这个部署，不会多出任何一个可能的接收方。
-fn tavily_auth_headers(key: Option<&str>) -> Vec<(&'static str, String)> {
-    match key.map(str::trim).filter(|k| !k.is_empty()) {
-        Some(key) => vec![("authorization", format!("Bearer {key}"))],
-        None => vec![("x-tavily-access-mode", "keyless".to_string())],
+/// 后备出口的两个动作。路由决定问哪一个，不由请求体决定——请求体是调用方给的，
+/// 路由是这个进程自己的。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FallbackAction {
+    Search,
+    Fetch,
+}
+
+impl FallbackAction {
+    /// 只认归一化之后恰好是 `search` 或 `fetch`。
+    ///
+    /// 归一化的意思是去掉两头的斜杠再比：`/search-fallback//search/` 也算同一个，
+    /// 而 `search/../x` 这类要往上走的不算——规范化规则不归这个仓库管，所以判在
+    /// 这里，在交出去之前。
+    fn parse(upstream_path: &str) -> Option<Self> {
+        match upstream_path.trim_matches('/') {
+            "search" => Some(FallbackAction::Search),
+            "fetch" => Some(FallbackAction::Fetch),
+            _ => None,
+        }
     }
 }
 
-/// 这条路由放不放行。只认 `POST` 且路径归一化后恰好是 `search`。
+/// 池里能承接这个动作的条目，问的顺序就是写下来的顺序。
 ///
-/// 归一化的意思是把两头的斜杠去掉再比：`/search-fallback/search`、`/search-fallback//search`、
-/// `/search-fallback/search/` 都算同一个东西，而 `/search-fallback/search/../x`、`/search-fallback/../x`
-/// 这类要往上走的不算。判据放在这里而不是交给上游，是因为上游的规范化规则
-/// 不归这个仓库管。
-fn tavily_route_allows(method: &axum::http::Method, upstream_path: &str) -> bool {
-    *method == axum::http::Method::POST && upstream_path.trim_matches('/') == "search"
+/// 两段来源合成一条链：配出来的第三方在前，现网在用的那条 LLM 自带的上网工具在
+/// 最后。后者不是配置出来的——它是从那台主机与那把 key 现折出来的，所以 LLM 换了
+/// 一家、key 轮换了一次，这一层跟着换，不需要任何一次配置写入。
+fn fallback_pool(
+    config: &SecurityGatewayConfig,
+    action: FallbackAction,
+) -> Vec<crate::search_fallback::SearchUpstream> {
+    let wanted = |entry: &crate::search_fallback::SearchUpstream| match action {
+        FallbackAction::Search => entry.capability.search(),
+        FallbackAction::Fetch => entry.capability.fetch(),
+    };
+    let mut pool: Vec<_> = config
+        .search_fallback_upstreams
+        .iter()
+        .filter(|entry| wanted(entry))
+        .cloned()
+        .collect();
+    pool.extend(
+        config
+            .llm_upstreams
+            .iter()
+            .filter_map(|upstream| {
+                crate::search_fallback::from_live_llm(&upstream.base_url, &upstream.api_key)
+            })
+            .filter(|entry| wanted(entry)),
+    );
+    pool
 }
 
-/// `POST /search-fallback/search` —— `web_search` 在自建那层一个引擎都没应答时的后备。
+/// `POST /search-fallback/search` 与 `/search-fallback/fetch`：自建那层答不上时
+/// 的后备出口。
 ///
-/// 这条路由只服务一件事，所以只放行 `POST /search`，不是一条通用 Tavily 代理：
-/// 一条被注入的 agent 能拿它做的事，就被这个放行面框住了。
+/// 这条路由只服务这两件事，所以只放行这两个路径，不是一条通用代理：一条被注入的
+/// agent 能拿它做的事，就被这个放行面框住了。入站的认证头与 query 一律丢弃，
+/// 出站凭据只来自池条目——业务 Pod 零持有，所以「网页里一句话让它把凭证发出去」
+/// 在这条路上没有可发的对象。
 ///
-/// 出站认证头只有一种来源（[`tavily_auth_headers`]）：配了带外 key 就发 key，
-/// 没配就发 keyless 标记。**两者都只在网关里**——Pod 零持有，所以"网页里一句
-/// 话让它把凭证发出去"在这条路上没有可发的对象。入站的认证头与 query 一律
-/// 丢弃：后者 Tavily 不需要，留着只会多一个可往里塞东西的口子。
-async fn tavily_search_passthrough(
+/// 三个结局分开报，与自建那层同一条纪律：
+///   - 有结果：200，并把 `source` 写上是**哪一家**答的；
+///   - 所有问到的家都明确说没有：200 + 空列表（那是关于网页的读数）；
+///   - 一家都没答上来：502，并把每一家为什么没答逐条列出来——把这一条压成空
+///     列表，就是把这次要消除的「沉默读成没有」又接回来了。
+async fn search_fallback_outlet(
     State(state): State<AppState>,
     req: axum::extract::Request,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     let path = req.uri().path().to_string();
-    let upstream_path = path
-        .strip_prefix("/search-fallback")
-        .unwrap_or(&path)
-        .to_string();
-    if !tavily_route_allows(req.method(), &upstream_path) {
+    let upstream_path = path.strip_prefix("/search-fallback").unwrap_or(&path);
+    let Some(action) =
+        FallbackAction::parse(upstream_path).filter(|_| *req.method() == axum::http::Method::POST)
+    else {
         let status = if *req.method() == axum::http::Method::POST {
             StatusCode::NOT_FOUND
         } else {
@@ -6821,43 +6853,198 @@ async fn tavily_search_passthrough(
         return Err((
             status,
             format!(
-                "检索后备只转发 POST /search，收到 {} {upstream_path}",
+                "检索/抓取后备只转发 POST /search 与 POST /fetch，收到 {} {upstream_path}",
                 req.method()
             ),
         ));
-    }
+    };
     let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let start = std::time::Instant::now();
-    let mut builder = state
-        .stream_client
-        .post(TAVILY_SEARCH_UPSTREAM)
-        .header("content-type", "application/json")
-        .header("accept", "application/json");
-    for (name, value) in tavily_auth_headers(state.config.tavily_api_key.as_deref()) {
-        builder = builder.header(name, value);
+    let payload: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("请求体不是 JSON: {e}")))?;
+    let text = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let (query, target) = match action {
+        FallbackAction::Search => {
+            let query = text("query");
+            if query.is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "检索请求缺少 query".to_string()));
+            }
+            (query, String::new())
+        }
+        FallbackAction::Fetch => {
+            let target = text("url");
+            if target.is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "抓取请求缺少 url".to_string()));
+            }
+            (String::new(), target)
+        }
+    };
+    // 调用方（`cog-agent` 的 `web_search`）每次都会带上条数；缺省按它自己的默认
+    // 条数走，免得一个只问 query 的调用把厂商那边的不限量接口打开。
+    let limit = payload
+        .get("max_results")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10);
+
+    let pool = fallback_pool(&state.config, action);
+    if pool.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "这个部署没有能承接{}的后备：第三方池是空的，现网在用的 LLM 也没有上网工具面。\
+                 自建那层答不上时，这条路上没有别的东西可问",
+                match action {
+                    FallbackAction::Search => "检索",
+                    FallbackAction::Fetch => "抓取",
+                }
+            ),
+        ));
     }
-    let resp = builder.body(body.to_vec()).send().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("连接检索后备上游失败: {e}"),
-        )
-    })?;
-    state.code_stats.record(start.elapsed().as_millis() as u64);
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    let stream = resp.bytes_stream();
-    Ok(axum::response::Response::builder()
+
+    let mut refusals: Vec<String> = Vec::new();
+    let mut silent: Vec<String> = Vec::new();
+    for upstream in &pool {
+        let request = match action {
+            FallbackAction::Search => Some(crate::search_fallback::build_request(
+                upstream, &query, limit,
+            )),
+            FallbackAction::Fetch => crate::search_fallback::build_fetch_request(upstream, &target),
+        };
+        let Some(request) = request else {
+            // 这一家没有这个动作的面（千帆只有检索面）：跳过它，不猜一条路径。
+            refusals.push(format!("{}：没有这个动作的接口", upstream.id));
+            continue;
+        };
+        let started = std::time::Instant::now();
+        let mut builder = state
+            .stream_client
+            .post(&request.url)
+            .timeout(SEARCH_FALLBACK_ATTEMPT_TIMEOUT);
+        for (name, value) in &request.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        let sent = builder.json(&request.body).send().await;
+        state
+            .code_stats
+            .record(started.elapsed().as_millis() as u64);
+        let resp = match sent {
+            Ok(resp) => resp,
+            Err(e) => {
+                refusals.push(format!("{}：连不上（{e}）", upstream.id));
+                continue;
+            }
+        };
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let excerpt: String = raw.chars().take(200).collect();
+            refusals.push(format!(
+                "{}：上游答 HTTP {status}（{excerpt}）",
+                upstream.id
+            ));
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            let excerpt: String = raw.chars().take(200).collect();
+            refusals.push(format!("{}：应答不是 JSON（{excerpt}）", upstream.id));
+            continue;
+        };
+        match action {
+            FallbackAction::Search => {
+                match crate::search_fallback::parse_response(upstream.shape, &value, limit) {
+                    crate::search_fallback::Answer::Hits(hits) => {
+                        let results: Vec<serde_json::Value> = hits
+                            .iter()
+                            .map(|hit| {
+                                // 折回调用方那一层认的形状：`content` 放摘要、
+                                // `published_date` 放日期。它是自建那层的字段名，
+                                // 所以两个来源在调用方眼里是同一个东西。
+                                serde_json::json!({
+                                    "title": hit.title,
+                                    "url": hit.url,
+                                    "content": hit.snippet,
+                                    "published_date": hit.published,
+                                })
+                            })
+                            .collect();
+                        return Ok(json_response(
+                            StatusCode::OK,
+                            serde_json::json!({
+                                "results": results,
+                                "source": upstream.id,
+                            }),
+                        ));
+                    }
+                    crate::search_fallback::Answer::Empty => silent.push(upstream.id.clone()),
+                    crate::search_fallback::Answer::Broken(reason) => {
+                        refusals.push(format!("{}：{reason}", upstream.id))
+                    }
+                }
+            }
+            FallbackAction::Fetch => {
+                match crate::search_fallback::parse_fetch_response(upstream.shape, &value) {
+                    crate::search_fallback::FetchAnswer::Page(page) => {
+                        return Ok(json_response(
+                            StatusCode::OK,
+                            serde_json::json!({
+                                "url": target,
+                                "title": page.title,
+                                "content": page.content,
+                                "source": upstream.id,
+                            }),
+                        ));
+                    }
+                    crate::search_fallback::FetchAnswer::Empty => silent.push(upstream.id.clone()),
+                    crate::search_fallback::FetchAnswer::Broken(reason) => {
+                        refusals.push(format!("{}：{reason}", upstream.id))
+                    }
+                }
+            }
+        }
+    }
+
+    if silent.len() == pool.len() {
+        // 每一家都明确答了「没有」，而且没有一家报错：这是关于网页的读数。
+        return Ok(json_response(
+            StatusCode::OK,
+            match action {
+                FallbackAction::Search => serde_json::json!({ "results": [] }),
+                FallbackAction::Fetch => serde_json::json!({ "content": "" }),
+            },
+        ));
+    }
+    Err((
+        StatusCode::BAD_GATEWAY,
+        format!(
+            "后备池一家都没答上来。没答的：{}。说了「没有」的：{}",
+            if refusals.is_empty() {
+                "（无）".to_string()
+            } else {
+                refusals.join("；")
+            },
+            if silent.is_empty() {
+                "（无）".to_string()
+            } else {
+                silent.join("、")
+            }
+        ),
+    ))
+}
+
+fn json_response(status: StatusCode, body: serde_json::Value) -> axum::response::Response {
+    axum::response::Response::builder()
         .status(status)
-        .header("content-type", content_type)
-        .body(axum::body::Body::from_stream(stream))
-        .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty()))
 }
 
 // ─── 附件代理（issue/PR 评论里的图/音/视频/PDF）────────────────
@@ -7635,11 +7822,12 @@ fn code_channel_router() -> Router<AppState> {
             axum::routing::any(git_gitee_passthrough),
         )
         .route("/attach", get(attach_proxy))
-        // 检索后备：`web_search` 在自建那层全沉默时的第二个后端。走这条通道
-        // 而不是让每个 Pod 自带一把带外 key —— 与代码平台透传同一条理由。
+        // 检索与抓取的后备出口：`web_search` / `web_fetch` 在自建那层答不上时的
+        // 第二个后端。走这条通道而不是让每个 Pod 自带一把带外 key —— 与代码平台
+        // 透传同一条理由。
         .route(
             "/search-fallback/{*path}",
-            axum::routing::any(tavily_search_passthrough),
+            axum::routing::any(search_fallback_outlet),
         )
         .layer(axum::middleware::from_fn(trace_server_failures))
 }
@@ -9032,70 +9220,104 @@ mod tests {
         );
     }
 
-    /// 检索后备只放行 `POST /search`。
+    /// 后备出口只放行 `POST /search` 与 `POST /fetch`。
     ///
-    /// 那条路由是给一个工具用的，不是一条通用代理；放行面就是这条测试画的那条线。
-    /// 尤其要盯住往上走的形状：`/search/../repos` 拼出去之后主机虽然还是 Tavily，
-    /// 但它已经不是"搜索"这一件事了——判据在这里拒掉，而不是指望上游的规范化。
+    /// 那条路由是给两个工具用的，不是一条通用代理；放行面就是这条测试画的那条
+    /// 线。尤其要盯住往上走的形状：`/search/../repos` 归一化之后虽然不是
+    /// `search`，但判据必须在这里拒掉，而不是指望上游去规范化。
     #[test]
-    fn the_search_fallback_forwards_only_post_search() {
-        use axum::http::Method;
-        assert!(tavily_route_allows(&Method::POST, "/search"));
+    fn the_fallback_outlet_serves_exactly_two_actions() {
+        use FallbackAction::{Fetch, Search};
+        assert_eq!(FallbackAction::parse("/search"), Some(Search));
         // 同一件事的几种写法：两头多余的斜杠不算另一个路径。
-        assert!(tavily_route_allows(&Method::POST, "//search"));
-        assert!(tavily_route_allows(&Method::POST, "/search/"));
+        assert_eq!(FallbackAction::parse("//search"), Some(Search));
+        assert_eq!(FallbackAction::parse("/search/"), Some(Search));
+        assert_eq!(FallbackAction::parse("/fetch"), Some(Fetch));
         // 往上走的不算。
-        assert!(!tavily_route_allows(&Method::POST, "/search/../repos"));
-        assert!(!tavily_route_allows(&Method::POST, "/../search"));
-        assert!(!tavily_route_allows(&Method::POST, "/search/x"));
-        // 别的 Tavily 端点不在这条路由的业务里。
-        assert!(!tavily_route_allows(&Method::POST, "/extract"));
-        assert!(!tavily_route_allows(&Method::POST, ""));
-        // GET 这条路上没有查询可带，放行只会花上游的额度。
-        assert!(!tavily_route_allows(&Method::GET, "/search"));
+        assert_eq!(FallbackAction::parse("/search/../repos"), None);
+        assert_eq!(FallbackAction::parse("/../search"), None);
+        assert_eq!(FallbackAction::parse("/search/x"), None);
+        // 别的厂商端点不在这条路由的业务里。
+        assert_eq!(FallbackAction::parse("/extract"), None);
+        assert_eq!(FallbackAction::parse(""), None);
     }
 
-    /// 后备的认证头要么是 key、要么是 keyless 标记，不会两个都在。
+    /// 池按能力筛，而且顺序就是写下来的顺序。
     ///
-    /// 加 key 的唯一理由是额度：keyless 那一档与公众共用一个池，它恰好会在
-    /// 「自建层全沉默、最需要后备」的时候被限流。但两种认证方式同时挂上去，
-    /// 「这次花的是谁的额度」就读不出来了——而那正是加 key 要回答的问题。
+    /// 「优先用本地的，本地额度用完了才问第三方」这条顺序如果被排序过、被并过、
+    /// 或被按形状去重过，症状是某一家永远不被问到——而它在日志里看起来只是
+    /// 「没有命中」。
     #[test]
-    fn the_search_fallback_carries_a_key_only_when_one_is_configured() {
-        let keyless = tavily_auth_headers(None);
-        assert_eq!(keyless.len(), 1);
-        assert_eq!(keyless[0].0, "x-tavily-access-mode");
-        assert_eq!(keyless[0].1, "keyless");
-        // 空白与空串算"没配"，不算"配了一个空 key"：后者会把 Bearer 发成
-        // 一个空令牌，读日志时看起来像配了却没生效。
-        for blank in ["", "   "] {
-            assert_eq!(
-                tavily_auth_headers(Some(blank))[0].0,
-                "x-tavily-access-mode"
-            );
-        }
+    fn the_pool_keeps_the_written_order_and_drops_what_cannot_do_the_action() {
+        use crate::search_fallback::{Capability, ResponseShape, SearchUpstream};
+        let entry = |id: &str, shape: ResponseShape, capability: Capability| SearchUpstream {
+            id: id.to_string(),
+            shape,
+            capability,
+            base_url: "https://example.test".to_string(),
+            api_key: "k".to_string(),
+            key_from: None,
+        };
+        let mut config = cfg(&[], &[]);
+        config.search_fallback_upstreams = vec![
+            entry("exa", ResponseShape::Exa, Capability::Both),
+            entry("baidu", ResponseShape::Qianfan, Capability::Search),
+            entry("crawl", ResponseShape::Tavily, Capability::Fetch),
+        ];
+        let search: Vec<String> = fallback_pool(&config, FallbackAction::Search)
+            .into_iter()
+            .map(|u| u.id)
+            .collect();
+        assert_eq!(search, ["exa", "baidu"]);
+        let fetch: Vec<String> = fallback_pool(&config, FallbackAction::Fetch)
+            .into_iter()
+            .map(|u| u.id)
+            .collect();
+        assert_eq!(fetch, ["exa", "crawl"]);
+    }
 
-        let keyed = tavily_auth_headers(Some("tvly-abc"));
-        assert_eq!(keyed.len(), 1, "one credential, not two");
-        assert_eq!(keyed[0].0, "authorization");
-        assert_eq!(keyed[0].1, "Bearer tvly-abc");
-        assert!(
-            !keyed.iter().any(|(name, _)| name.contains("access-mode")),
-            "a keyed request does not also ask for keyless mode"
+    /// 现网在用的 LLM 排在最后，而且是从它的那一份配置现折出来的。
+    ///
+    /// 这一层不许配置：配一份就多一把 key 的副本，轮换之后必有一份是旧的，而旧
+    /// 的那份返回 401 会被读成「这家挂了」。折出来的那一条必须带着同一把 key，
+    /// 且排在所有配出来的条目之后——它就是「本地和第三方都答不上」那一层。
+    #[test]
+    fn the_live_llm_comes_last_and_carries_the_key_it_already_has() {
+        use crate::search_fallback::{Capability, ResponseShape, SearchUpstream};
+        let mut config = cfg(&[], &[]);
+        config.search_fallback_upstreams = vec![SearchUpstream {
+            id: "exa".to_string(),
+            shape: ResponseShape::Exa,
+            capability: Capability::Both,
+            base_url: "https://api.exa.ai".to_string(),
+            api_key: "exa-key".to_string(),
+            key_from: None,
+        }];
+        let llm = |base_url: &str, key: &str| LlmUpstream {
+            api_style: "openai".to_string(),
+            base_url: base_url.to_string(),
+            model: "m".to_string(),
+            api_key: key.to_string(),
+            supports_tool_calls: None,
+            requires_temperature_one: None,
+            supports_usage_in_streaming: None,
+        };
+        config.llm_upstreams = vec![
+            llm("https://api.deepseek.com/v1", "sk-live"),
+            // 没有上网工具面的那一家不该出现：折不出来就是折不出来。
+            llm("https://api.openai.com/v1", "sk-other"),
+        ];
+        let pool = fallback_pool(&config, FallbackAction::Search);
+        assert_eq!(pool.len(), 2, "只有一条能折出来：{pool:?}");
+        assert_eq!(pool[0].id, "exa");
+        assert_eq!(pool[1].shape, ResponseShape::DeepSeek);
+        assert_eq!(
+            pool[1].api_key, "sk-live",
+            "用的是 LLM 那把 key，不是第二份"
         );
-    }
-
-    /// 出站地址里没有调用方的一点东西。
-    ///
-    /// 这一点本来由签名保证（常量，拼装点不带参数），这条测试盯的是它别退化成
-    /// `format!` ——退化的那天，"出站主机只有这一个来源"就不再是类型保证的了，
-    /// 而那种退化在评审里看起来只是一次"把地址参数化"的小重构。
-    #[test]
-    fn the_search_fallback_url_has_no_caller_input_in_it() {
-        assert!(TAVILY_SEARCH_UPSTREAM.starts_with("https://api.tavily.com/"));
         assert!(
-            !TAVILY_SEARCH_UPSTREAM.contains('{'),
-            "上游地址一旦带上占位符，主机就不再只由这一行常量决定"
+            pool[1].key_from.is_some(),
+            "来源要能读出来：配上来的与折出来的混在一起时，排查要从这里分辨"
         );
     }
 
@@ -9110,7 +9332,7 @@ mod tests {
             llm_health_probe_secs: 300,
             github_token: None,
             gitee_token: None,
-            tavily_api_key: None,
+            search_fallback_upstreams: Vec::new(),
             gitee_oauth_client_id: None,
             gitee_oauth_client_secret: None,
             github_oauth_client_id: None,

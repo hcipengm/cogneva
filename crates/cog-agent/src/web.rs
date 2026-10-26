@@ -82,13 +82,18 @@ const SEARCH_ATTEMPTS: u32 = 2;
 /// than hiding by being absent from the list.
 pub const WEB_SEARCH_BASE_ENV: &str = "COGNEVA_WEB_SEARCH_BASE";
 
-/// The environment variable that names a second search backend, for the
-/// queries the first one could not put to anyone.
+/// The environment variable that names the second layer of web access, for the
+/// work the self-hosted layer could not do.
 ///
 /// Empty is the default and it means what it says: this deployment has chosen
-/// that no query leaves it. Set, it names a base that speaks `POST {base}/search`
-/// directly -- in this deployment the security gateway, so that a backend
-/// wanting a credential keeps it there rather than in every pod.
+/// that no query and no page leaves it. Set, it names a base that speaks
+/// `POST {base}/search` and `POST {base}/fetch` directly -- in this deployment
+/// the security gateway, so that the backends wanting a credential keep it
+/// there rather than in every pod.
+///
+/// One address for both actions on purpose: whether this deployment may reach
+/// outside its own tree is one decision, and splitting it into two settings
+/// makes it two, each of which can be answered differently by accident.
 pub const WEB_SEARCH_FALLBACK_BASE_ENV: &str = "COGNEVA_WEB_SEARCH_FALLBACK_BASE";
 
 /// The environment variable that names the rendering backend for `web_fetch`.
@@ -981,6 +986,164 @@ fn markdown_title(markdown: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Read one page on this side of the boundary: rendered when the deployment has
+/// a renderer, extracted in process when it does not.
+///
+/// Every failure here is an error, never a thin answer — the caller needs to
+/// know whether the page said little or the reader never ran, because only the
+/// second one has a next layer to try.
+async fn fetch_locally(
+    client: &Arc<dyn HttpClient>,
+    base: Option<&str>,
+    url: &Url,
+    max_chars: usize,
+) -> SFResult<serde_json::Value> {
+    // Rendering is a property of the deployment, not of the call: a run that
+    // could ask for it would ask for it every time, and the deployment that has
+    // a browser has it for exactly the pages the cheap path cannot read.
+    if let Some(base) = render_base(base) {
+        return fetch_rendered(client, &base, url, max_chars).await;
+    }
+    let body = fetch_capped(client, url, MAX_DOWNLOAD_BYTES)
+        .await
+        .map_err(|e| SFError::Agent(format!("fetching {url} failed: {e}")))?;
+    if body.too_large {
+        return Ok(serde_json::json!({
+            "url": url.as_str(),
+            "status": body.status,
+            "content_type": body.content_type,
+            "limit_bytes": MAX_DOWNLOAD_BYTES,
+            "too_large": true,
+        }));
+    }
+    if !(200..300).contains(&body.status) {
+        return Ok(serde_json::json!({
+            "url": url.as_str(),
+            "status": body.status,
+            "content_type": body.content_type,
+            "bytes": body.bytes.len(),
+            "refused": true,
+        }));
+    }
+    let content_type = body.content_type.to_ascii_lowercase();
+    let is_html = content_type.contains("html");
+    let is_textual = is_html
+        || content_type.starts_with("text/")
+        || content_type.contains("json")
+        || content_type.contains("xml");
+    if !is_textual {
+        return Ok(serde_json::json!({
+            "url": url.as_str(),
+            "status": body.status,
+            "content_type": body.content_type,
+            "bytes": body.bytes.len(),
+            "binary": true,
+        }));
+    }
+    let text = String::from_utf8_lossy(&body.bytes).to_string();
+    let extracted = if is_html {
+        extract(&text, url.as_str())
+    } else {
+        Extracted {
+            title: String::new(),
+            text: normalise(&text),
+            byline: None,
+            site_name: None,
+            published: None,
+            how: "plain",
+        }
+    };
+    let (text, truncated) = truncate_chars(&extracted.text, max_chars);
+    let mut out = serde_json::json!({
+        "url": url.as_str(),
+        "status": body.status,
+        "content_type": body.content_type,
+        "chars": text.chars().count(),
+        "truncated": truncated,
+        "extraction": extracted.how,
+        "text": text,
+    });
+    if !extracted.title.is_empty() {
+        out["title"] = serde_json::json!(extracted.title);
+    }
+    for (key, value) in [
+        ("byline", extracted.byline),
+        ("site_name", extracted.site_name),
+        ("published", extracted.published),
+    ] {
+        if let Some(value) = value {
+            out[key] = serde_json::json!(value);
+        }
+    }
+    Ok(out)
+}
+
+/// Ask the fallback outlet for one page: `POST {base}/fetch` with the address
+/// this process already judged public.
+///
+/// The outlet is the only party holding credentials, so the body carries an
+/// address and nothing else. An answer with no text is an error rather than an
+/// empty page: an outlet that opened nothing has not read the web any more than
+/// a silent search engine has searched it.
+async fn fallback_fetch(
+    client: &Arc<dyn HttpClient>,
+    base: &str,
+    url: &Url,
+    max_chars: usize,
+) -> SFResult<serde_json::Value> {
+    let endpoint = format!("{base}/fetch");
+    let body = serde_json::to_vec(&serde_json::json!({ "url": url.as_str() }))
+        .map_err(SFError::Serialization)?;
+    let mut req = HttpRequest::new("POST", endpoint.clone());
+    req.headers
+        .insert("Content-Type".into(), "application/json".into());
+    req.timeout_secs = Some(FETCH_TIMEOUT_SECS);
+    req.body = Some(body);
+    let resp = client.execute(req).await.map_err(|e| {
+        SFError::Agent(format!("the fallback outlet at {base} is unreachable: {e}"))
+    })?;
+    if !(200..300).contains(&resp.status) {
+        let detail = truncate_chars(&String::from_utf8_lossy(&resp.body), 300).0;
+        return Err(SFError::Agent(format!(
+            "the fallback outlet at {base} answered HTTP {}: {detail}",
+            resp.status
+        )));
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
+        SFError::Agent(format!(
+            "the fallback outlet at {base} did not answer with JSON: {e}"
+        ))
+    })?;
+    let content = parsed
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if content.is_empty() {
+        return Err(SFError::Agent(format!(
+            "the fallback outlet at {base} answered with no text for {url}; that is not the \
+             same as the page being empty"
+        )));
+    }
+    let (text, truncated) = truncate_chars(content, max_chars);
+    let mut out = serde_json::json!({
+        "url": url.as_str(),
+        "chars": text.chars().count(),
+        "truncated": truncated,
+        "extraction": "fallback",
+        "source": "fallback",
+        "text": text,
+    });
+    if let Some(title) = parsed
+        .get("title")
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.trim().is_empty())
+    {
+        out["title"] = serde_json::json!(title.trim());
+    }
+    Ok(out)
+}
+
 /// Download one page and return its readable text.
 ///
 /// With `base` set the page is rendered by a real browser first (see
@@ -988,6 +1151,22 @@ fn markdown_title(markdown: &str) -> Option<String> {
 /// matters on client-side-rendered pages, where the in-process path returns the
 /// shell of a page whose text arrives only after scripts run.
 pub fn web_fetch(client: Option<Arc<dyn HttpClient>>, base: Option<String>) -> Tool {
+    web_fetch_with_fallback(client, base, None)
+}
+
+/// `web_fetch`, with the fallback outlet this deployment has, if any.
+///
+/// The order is the same one `web_search_with_fallback` uses and for the same
+/// reason: the local layer answers first, and the outlet is asked only when
+/// that layer *failed*. A page the local layer read and found to be binary,
+/// oversized, or refused is an answer about the page -- asking a vendor would
+/// spend money to learn the same thing, and would report a second opinion as if
+/// it were the first one.
+pub fn web_fetch_with_fallback(
+    client: Option<Arc<dyn HttpClient>>,
+    base: Option<String>,
+    fallback_base: Option<String>,
+) -> Tool {
     Tool {
         name: "web_fetch".into(),
         description: "Fetch one public web page and return its readable text, with the \
@@ -1017,6 +1196,7 @@ pub fn web_fetch(client: Option<Arc<dyn HttpClient>>, base: Option<String>) -> T
         implementation: ToolImplementation::Native(Arc::new(move |args| {
             let client = client.clone();
             let base = base.clone();
+            let fallback_base = fallback_base.clone();
             Box::pin(async move {
                 let raw = args["url"]
                     .as_str()
@@ -1032,85 +1212,31 @@ pub fn web_fetch(client: Option<Arc<dyn HttpClient>>, base: Option<String>) -> T
                     .as_u64()
                     .unwrap_or(DEFAULT_FETCH_CHARS)
                     .clamp(1, MAX_FETCH_CHARS) as usize;
-                // Rendering is a property of the deployment, not of the call:
-                // a run that could ask for it would ask for it every time, and
-                // the deployment that has a browser has it for exactly the
-                // pages the cheap path cannot read.
-                if let Some(base) = render_base(base.as_deref()) {
-                    return fetch_rendered(&client, &base, &url, max_chars).await;
-                }
-                let body = fetch_capped(&client, &url, MAX_DOWNLOAD_BYTES)
-                    .await
-                    .map_err(|e| SFError::Agent(format!("fetching {url} failed: {e}")))?;
-                if body.too_large {
-                    return Ok(serde_json::json!({
-                        "url": url.as_str(),
-                        "status": body.status,
-                        "content_type": body.content_type,
-                        "limit_bytes": MAX_DOWNLOAD_BYTES,
-                        "too_large": true,
-                    }));
-                }
-                if !(200..300).contains(&body.status) {
-                    return Ok(serde_json::json!({
-                        "url": url.as_str(),
-                        "status": body.status,
-                        "content_type": body.content_type,
-                        "bytes": body.bytes.len(),
-                        "refused": true,
-                    }));
-                }
-                let content_type = body.content_type.to_ascii_lowercase();
-                let is_html = content_type.contains("html");
-                let is_textual = is_html
-                    || content_type.starts_with("text/")
-                    || content_type.contains("json")
-                    || content_type.contains("xml");
-                if !is_textual {
-                    return Ok(serde_json::json!({
-                        "url": url.as_str(),
-                        "status": body.status,
-                        "content_type": body.content_type,
-                        "bytes": body.bytes.len(),
-                        "binary": true,
-                    }));
-                }
-                let text = String::from_utf8_lossy(&body.bytes).to_string();
-                let extracted = if is_html {
-                    extract(&text, url.as_str())
-                } else {
-                    Extracted {
-                        title: String::new(),
-                        text: normalise(&text),
-                        byline: None,
-                        site_name: None,
-                        published: None,
-                        how: "plain",
-                    }
+                // The address guard runs before either layer, so no layer can be
+                // pointed at loopback or at a cluster-internal service: the
+                // fallback outlet is handed only addresses this process already
+                // judged public.
+                let local = fetch_locally(&client, base.as_deref(), &url, max_chars).await;
+                let local = match local {
+                    Ok(out) => return Ok(out),
+                    Err(e) => e,
                 };
-                let (text, truncated) = truncate_chars(&extracted.text, max_chars);
-                let mut out = serde_json::json!({
-                    "url": url.as_str(),
-                    "status": body.status,
-                    "content_type": body.content_type,
-                    "chars": text.chars().count(),
-                    "truncated": truncated,
-                    "extraction": extracted.how,
-                    "text": text,
-                });
-                if !extracted.title.is_empty() {
-                    out["title"] = serde_json::json!(extracted.title);
-                }
-                for (key, value) in [
-                    ("byline", extracted.byline),
-                    ("site_name", extracted.site_name),
-                    ("published", extracted.published),
-                ] {
-                    if let Some(value) = value {
-                        out[key] = serde_json::json!(value);
+                let Some(fallback) = render_base(fallback_base.as_deref()) else {
+                    return Err(local);
+                };
+                match fallback_fetch(&client, &fallback, &url, max_chars).await {
+                    Ok(mut out) => {
+                        // Both halves stay readable: the fallback answered, and
+                        // the reason it was asked is the local layer's own
+                        // words, not a summary of them.
+                        out["fallback_because"] = serde_json::json!(local.to_string());
+                        Ok(out)
                     }
+                    Err(e) => Err(SFError::Agent(format!(
+                        "the local layer failed ({local}), and the fallback outlet at \
+                         {fallback} failed too ({e})"
+                    ))),
                 }
-                Ok(out)
             })
         })),
     }

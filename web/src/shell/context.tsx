@@ -34,10 +34,14 @@ export interface ShellServices {
 export interface ShellOverlays {
   conversations: boolean;
   llmSetup: boolean;
+  /** 上网检索与抓取的后备池设置 */
+  webSearch: boolean;
   openConversations: () => void;
   closeConversations: () => void;
   openLlmSetup: () => void;
   closeLlmSetup: () => void;
+  openWebSearch: () => void;
+  closeWebSearch: () => void;
 }
 
 const ShellServicesContext = createContext<ShellServices | null>(null);

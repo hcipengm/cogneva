@@ -52,11 +52,14 @@ export default function App() {
 
   const [conversations, setConversations] = useState(false);
   const [llmSetup, setLlmSetup] = useState(false);
+  const [webSearch, setWebSearch] = useState(false);
 
   const openConversations = useCallback(() => setConversations(true), []);
   const closeConversations = useCallback(() => setConversations(false), []);
   const openLlmSetup = useCallback(() => setLlmSetup(true), []);
   const closeLlmSetup = useCallback(() => setLlmSetup(false), []);
+  const openWebSearch = useCallback(() => setWebSearch(true), []);
+  const closeWebSearch = useCallback(() => setWebSearch(false), []);
 
   const services = useMemo<ShellServices>(
     () => ({
@@ -70,10 +73,13 @@ export default function App() {
       overlays: {
         conversations,
         llmSetup,
+        webSearch,
         openConversations,
         closeConversations,
         openLlmSetup,
         closeLlmSetup,
+        openWebSearch,
+        closeWebSearch,
       },
     }),
     [
@@ -86,10 +92,13 @@ export default function App() {
       llm,
       conversations,
       llmSetup,
+      webSearch,
       openConversations,
       closeConversations,
       openLlmSetup,
       closeLlmSetup,
+      openWebSearch,
+      closeWebSearch,
     ]
   );
 

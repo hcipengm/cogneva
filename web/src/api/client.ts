@@ -391,6 +391,64 @@ export async function saveLlmConfig(
   return api.post<LlmConfigResult>('/api/v1/admin/llm-config', payload);
 }
 
+// ── 上网检索与抓取的后备池 ──
+
+/**
+ * 池里的一家。`has_key` 是服务器愿意说的全部——凭证从不回显，所以页面上
+ * 「已配置」与「未配置」只能从这一格读。
+ */
+export interface SearchUpstream {
+  id: string;
+  /** tavily / exa / qianfan */
+  shape: string;
+  base_url: string;
+  /** search / fetch / both */
+  capability: string;
+  has_key: boolean;
+}
+
+export interface SearchFallbackStatus {
+  configured: boolean;
+  upstreams: SearchUpstream[];
+  /** 跟着现网在用的 LLM 走的那两层：只展示，不可编辑（同一把 key，同一次轮换） */
+  from_llm: SearchUpstream[];
+  read_error: string | null;
+  shapes: string[];
+  capabilities: string[];
+}
+
+export interface SearchFallbackEntryPayload {
+  id?: string;
+  shape: string;
+  base_url: string;
+  /**
+   * 省略 = 保留这一条原来那把；空串 = 明确改成不带凭证。
+   * 这条区分就是「页面不回声凭证」能成立的原因。
+   */
+  api_key?: string;
+  capability?: string;
+}
+
+export interface SearchFallbackResult {
+  ok: boolean;
+  restarted: string[];
+  upstreams: number;
+  from_llm: number;
+  message: string;
+}
+
+export async function getSearchFallback(): Promise<SearchFallbackStatus> {
+  return api.get<SearchFallbackStatus>('/api/v1/admin/search-fallback');
+}
+
+export async function saveSearchFallback(
+  upstreams: SearchFallbackEntryPayload[]
+): Promise<SearchFallbackResult> {
+  return api.post<SearchFallbackResult>('/api/v1/admin/search-fallback', {
+    upstreams,
+  });
+}
+
 // ── 令牌花销（按 actor，读耐久 rollup） ──
 
 /** 一条 `(actor, origin, upstream, 协议)` 的花销汇总行。 */

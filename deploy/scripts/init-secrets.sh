@@ -42,7 +42,7 @@ OOB_KEYS=(
   git-ssh-private-key-pending
   gitee-refresh-token
   clickhouse-password
-  search-fallback-key
+  search-fallback-upstreams
 )
 
 # 生成 48 位十六进制强随机串（纯字母数字，可安全进入连接串/URL）。

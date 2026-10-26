@@ -96,12 +96,13 @@ spec:
             # 代码平台透传凭证：/github/* 出口注入 Bearer token，
             # /gitee/* 出口注入 access_token query 参数；/git/github|gitee/*
             # 出口注入 Basic auth。业务 Pod 只见占位符。
-            # 检索后备的带外 key（可选）：配了按 key 计费，不配走 keyless。
-            - name: COGNEVA_SG_SEARCH_FALLBACK_KEY
+            # 检索/抓取后备池的整份配置（可选）：JSON 数组，顺序即询问顺序；
+            # 不配就是空池。业务 Pod 不持有它。
+            - name: COGNEVA_SG_SEARCH_FALLBACK_UPSTREAMS
               valueFrom:
                 secretKeyRef:
                   name: cogneva-secrets-oob
-                  key: search-fallback-key
+                  key: search-fallback-upstreams
                   optional: true
             - name: COGNEVA_GITHUB_TOKEN
               valueFrom:

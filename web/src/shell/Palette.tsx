@@ -44,7 +44,7 @@ export function Palette() {
   const appendOutput = useShell((s) => s.appendOutput);
   const clearOutput = useShell((s) => s.clearOutput);
   const { alerts, notifications, overlays, signOut } = useServices();
-  const { openConversations, openLlmSetup } = overlays;
+  const { openConversations, openLlmSetup, openWebSearch } = overlays;
   const theme = useTheme((s) => s.theme);
   const setTheme = useTheme((s) => s.setTheme);
 
@@ -88,6 +88,13 @@ export function Palette() {
         title: '配置模型上游',
         hint: '服务端会做双协议探测',
         run: openLlmSetup,
+      },
+      {
+        id: 'action:web-search',
+        group: '动作',
+        title: '配置上网检索与抓取',
+        hint: '本机两层之后的第三方后备池',
+        run: openWebSearch,
       },
       {
         id: 'action:alerts-refresh',
@@ -148,6 +155,7 @@ export function Palette() {
     setActivity,
     openConversations,
     openLlmSetup,
+    openWebSearch,
     alerts,
     notifications,
     appendOutput,
@@ -183,6 +191,13 @@ export function Palette() {
         hint: '只在安全网关里配',
         run: openLlmSetup,
       },
+      {
+        id: 'help:web-search',
+        group: '帮助',
+        title: '联网检索和抓取用的是什么？本地不通时问谁',
+        hint: '本机 SearXNG / crawl4ai → 第三方池 → 现网 LLM 自带工具',
+        run: openWebSearch,
+      },
       go('observability', '集群现在什么状态？机器、负载、资源', VIEW_TITLES.observability),
       go('agents', '谁在替我干活？在岗的智能体与它们的上下文', VIEW_TITLES.agents),
       go('tasks', '这件事排到哪一步了？', VIEW_TITLES.tasks),
@@ -198,7 +213,7 @@ export function Palette() {
       go('files', '代码和文档在哪看、在哪改？', VIEW_TITLES.files),
       go('settings', '账号、主题、模型入口', VIEW_TITLES.settings),
     ];
-  }, [openLlmSetup, setActivity]);
+  }, [openLlmSetup, openWebSearch, setActivity]);
 
   const source = mode === 'help' ? help : commands;
   const visible = useMemo(

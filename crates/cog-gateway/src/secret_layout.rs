@@ -44,10 +44,10 @@ pub(crate) const OOB_SECRET_KEYS: &[&str] = &[
     "git-ssh-private-key-pending",
     "gitee-refresh-token",
     "clickhouse-password",
-    // 检索后备的带外 key。它在带外片而不是内部片，理由与代码平台 token 同一条：
-    // 只有网关的出口注入用到它，业务 Pod 零持有——一条被注入的 agent 手里没有
-    // 可以发出去的东西，比"它答应不发"可靠。
-    "search-fallback-key",
+    // 检索后备池的整份配置（JSON 数组，每条自带凭证）。它在带外片而不是内部片，
+    // 理由与代码平台 token 同一条：只有网关的出口用到它，业务 Pod 零持有——一条
+    // 被注入的 agent 手里没有可以发出去的东西，比"它答应不发"可靠。
+    "search-fallback-upstreams",
 ];
 
 /// 内部片里**本进程会读写的键**。表不必穷举该对象里的每一个键（数据库口令那

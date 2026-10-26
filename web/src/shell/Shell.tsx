@@ -11,6 +11,7 @@ import { TitleBar } from '@/shell/TitleBar';
 import { useShell } from '@/shell/store';
 import { AgentsOverlay } from '@/overlay/AgentsOverlay';
 import { LlmSetupOverlay } from '@/overlay/LlmSetupOverlay';
+import { SearchFallbackOverlay } from '@/overlay/SearchFallbackOverlay';
 import { ViewFor } from '@/views/registry';
 
 /**
@@ -80,6 +81,10 @@ export function Shell() {
       <ExplainDrawer />
 
       {overlays.conversations && <AgentsOverlay onClose={overlays.closeConversations} />}
+
+      {overlays.webSearch && (
+        <SearchFallbackOverlay onClose={overlays.closeWebSearch} />
+      )}
 
       {showLlmWizard && (
         <LlmSetupOverlay

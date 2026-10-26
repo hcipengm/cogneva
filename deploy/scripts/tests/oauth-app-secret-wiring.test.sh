@@ -149,7 +149,7 @@ out_of_band=(
   clickhouse-password
   # 可选的那一个：没配也能跑（后备走 keyless），但配了就与别人手写的值一样，
   # 升级时必须从旧对象里读回来，否则 helm upgrade 会把它静默删掉。
-  search-fallback-key
+  search-fallback-upstreams
 )
 [ "${#out_of_band[@]}" -gt 0 ] || fail "带外凭证清单是空的，这一节会静默变成空转"
 

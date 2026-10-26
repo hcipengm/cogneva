@@ -239,6 +239,7 @@ crates/cog-gateway/src/security_gateway.rs	MAX_CHARS	512	bound	upstream error ex
 crates/cog-gateway/src/security_gateway.rs	MAX_GIT_PACK_BYTES	256 * 1024 * 1024	bound	How much of a git pack transfer this will buffer. The copy is held so that the forwarded request carries a complete Content-Length — git servers disagree about chunked encoding — and cogneva's own repositories sit far below this, so the me…
 crates/cog-gateway/src/security_gateway.rs	MAX_PROXIED_BODY_BYTES	32 * 1024 * 1024	bound	How much of a proxied request body the gateway will hold to forward it.
 crates/cog-gateway/src/security_gateway.rs	MAX_QUOTA_WINDOW_SECS	366 * 86_400	bound	窗口长度的上界：上游写什么我们都不当"永远不可用"播报，超过一年的数只可能是 解析错了或上游文案变了，按一年截断并保留"这只是个窗口"的语义。
+crates/cog-gateway/src/security_gateway.rs	SEARCH_FALLBACK_ATTEMPT_TIMEOUT	8s	bound	一次后备上游的整条墙（含建连与读完应答）。它必须小于调用方自己的检索墙：cog-agent 的 SEARCH_TIMEOUT_SECS 是 20s，池按顺序问，一次超过 8s 就会让「还有第二、三家可问」在调用方眼里变成一次超时。
 crates/cog-gateway/src/security_gateway.rs	SPEND_READ_TIMEOUT	5s	bound	一次账本求和的等待上界。这条路径在池状态发布循环里（不是请求路径），但循环一停 池状态就不再续期，所以等一个不响应的 PG 必须有上限。
 crates/cog-gateway/src/security_gateway.rs	SUSPECT_BACKOFF_CAP_SECS	6 * 60 * 60	derived	the same shape as the caller-side terminal backoff cap: a suspect upstream burns at most one probe per window.
 crates/cog-gateway/src/security_gateway.rs	UPSTREAM_CONNECT_TIMEOUT	10s	bound	Wall for the connection alone. Kept well under the request wall so an unreachable upstream is reported as "cannot connect" quickly instead of being indistinguishable from a slow one.

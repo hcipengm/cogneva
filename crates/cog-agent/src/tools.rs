@@ -566,6 +566,88 @@ mod tests {
         }
     }
 
+    /// 网页抓取这条工具必须接上那条后备出口。
+    ///
+    /// 判据在**注册表**这一层，不在 `web_fetch_with_fallback` 里：函数自己再
+    /// 正确，注册时传的是 `None` 就等于这个部署没有抓取后备，而症状是「本地的
+    /// crawl4ai 一挂，抓取就整个不可用」——那看起来像 crawl4ai 的问题，不像一行
+    /// 漏传的参数。所以这里从一个真的注册表里把工具取出来调用。
+    #[tokio::test]
+    async fn the_registered_fetch_tool_consults_the_fallback_outlet() {
+        #[derive(Debug, Default)]
+        struct Scripted {
+            asked: std::sync::Mutex<Vec<(String, String)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl cog_core::HttpClient for Scripted {
+            async fn execute(
+                &self,
+                req: cog_core::HttpRequest,
+            ) -> SFResult<cog_core::HttpResponse> {
+                self.asked
+                    .lock()
+                    .unwrap()
+                    .push((req.method.clone(), req.url.clone()));
+                // 第一次（本地渲染后端）失败，第二次（后备出口）给出正文。
+                if req.url.contains("/search-fallback/") {
+                    Ok(cog_core::HttpResponse {
+                        status: 200,
+                        headers: Default::default(),
+                        body: br#"{"url":"https://example.com/a","title":"A","content":"the fallback text"}"#
+                            .to_vec(),
+                    })
+                } else {
+                    Ok(cog_core::HttpResponse {
+                        status: 502,
+                        headers: Default::default(),
+                        body: b"renderer down".to_vec(),
+                    })
+                }
+            }
+        }
+
+        let scripted = Arc::new(Scripted::default());
+        let registry = ToolRegistry::new();
+        builtins::register_builtins(
+            &registry,
+            builtins::BuiltinInputs {
+                http_client: Some(scripted.clone() as Arc<dyn cog_core::HttpClient>),
+                metrics: None,
+                memory_api_base: None,
+                external_archive_threshold_chars: 4096,
+                message_backend: None,
+                agent_registry: None,
+                web_search_base: None,
+                web_search_fallback_base: Some("http://gateway:8081/search-fallback".into()),
+                web_fetch_base: Some("http://render:11235".into()),
+            },
+        );
+        let tool = registry.get("web_fetch").expect("web_fetch is a built-in");
+        let cog_core::ToolImplementation::Native(run) = &tool.implementation else {
+            panic!("web_fetch is native");
+        };
+        let out = run(serde_json::json!({"url": "https://example.com/a"}))
+            .await
+            .expect("the fallback outlet answered");
+        assert_eq!(out["text"], "the fallback text");
+        assert_eq!(out["extraction"], "fallback");
+        assert_eq!(
+            out["fallback_because"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("502"),
+            true,
+            "答案里要留下本地那层为什么没答：{out}"
+        );
+        let asked = scripted.asked.lock().unwrap().clone();
+        // 本地那层自己会重试，次数不是这条测试的判据；判据是最后那一次问的是谁。
+        let (last_method, last_url) = asked.last().cloned().expect("至少问过一次");
+        assert_eq!(last_url, "http://gateway:8081/search-fallback/fetch");
+        assert_eq!(last_method, "POST");
+        assert!(asked.len() > 1, "能走到后备，说明本地那层先问过：{asked:?}");
+    }
+
     /// A refusal must be readable as a refusal. Flattened into an ordinary
     /// error it is indistinguishable from a tool that failed, and an agent
     /// loop retries failures — the retries are what cost money for nothing.
@@ -1510,7 +1592,9 @@ pub mod builtins {
     // 网页检索与抓取实现放在 `crate::web`（自带测试与地址守卫），这里只把它们
     // 并进同一张注册表：工具的**清单**仍然只有 `register_builtins` 一处。
     use super::*;
-    pub use crate::web::{web_fetch, web_search, web_search_with_fallback};
+    pub use crate::web::{
+        web_fetch, web_fetch_with_fallback, web_search, web_search_with_fallback,
+    };
 
     pub fn read_file() -> Tool {
         Tool {
@@ -1660,9 +1744,17 @@ pub mod builtins {
                 inputs.web_search_fallback_base.clone(),
             ),
         );
+        // 抓取与检索走同一条后备：本地那层答不上时，问的是同一个出口（第三方池，
+        // 池也答不上才轮到现网在用的 LLM）。`web_search_fallback_base` 这个地址
+        // 同时服务两个动作，路由自己分辨 `/search` 与 `/fetch`——一个部署里
+        // 「允许查询出门」只有一次决定，不该被拆成两次。
         cog_core::ToolRegistry::register(
             registry,
-            web_fetch(inputs.http_client.clone(), inputs.web_fetch_base.clone()),
+            web_fetch_with_fallback(
+                inputs.http_client.clone(),
+                inputs.web_fetch_base.clone(),
+                inputs.web_search_fallback_base.clone(),
+            ),
         );
         match (
             inputs.message_backend.clone(),

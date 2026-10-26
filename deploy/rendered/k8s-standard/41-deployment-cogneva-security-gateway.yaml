@@ -92,15 +92,14 @@ spec:
                   name: cogneva-secrets-oob
                   key: llm-pool-min-healthy
                   optional: true
-            # 检索后备的带外 key（可选）：配了就按 key 计费、额度是这一份的；
-            # 不配则后备走 keyless 那一档——不需要账号，但额度与公众共用一个池，
-            # 而它恰好会在自建检索全沉默、最需要后备的时候被限流。业务 Pod 不
-            # 持有它，出站主机由网关里的常量决定。
-            - name: COGNEVA_SG_SEARCH_FALLBACK_KEY
+            # 检索/抓取后备池的整份配置（可选）：一个 JSON 数组，每条自带 base_url、
+            # 形状与凭证，顺序即询问顺序。设置页写这一格，网关据此按顺序问下去。
+            # 不配就是空池——这个部署选择让查询不出自己这棵树。业务 Pod 不持有它。
+            - name: COGNEVA_SG_SEARCH_FALLBACK_UPSTREAMS
               valueFrom:
                 secretKeyRef:
                   name: cogneva-secrets-oob
-                  key: search-fallback-key
+                  key: search-fallback-upstreams
                   optional: true
             - name: COGNEVA_GITHUB_TOKEN
               valueFrom:

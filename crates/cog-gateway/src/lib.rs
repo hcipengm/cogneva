@@ -66,6 +66,7 @@ pub mod promotion_gate;
 pub mod raw_logs;
 pub mod readings;
 pub mod scm;
+pub mod search_admin;
 pub mod search_fallback;
 pub mod secret_layout;
 pub mod secret_write;
@@ -808,6 +809,14 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/admin/llm-config",
             post(llm_admin::llm_config_handler),
+        )
+        // The search/fetch fallback pool: the page writes keys here, the
+        // gateway patches the out-of-band Secret and rolls itself. Reading
+        // never returns key material.
+        .route(
+            "/api/v1/admin/search-fallback",
+            get(search_admin::search_fallback_status_handler)
+                .post(search_admin::search_fallback_config_handler),
         )
         .route(
             "/api/v1/admin/contribution-status",
