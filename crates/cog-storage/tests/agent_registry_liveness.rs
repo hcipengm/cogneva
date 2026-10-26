@@ -259,3 +259,86 @@ async fn a_heartbeat_keeps_an_agent_live_past_its_first_expiry() {
         .await
         .expect("deregister");
 }
+
+/// Whether a name is on the roster `list` walks.
+async fn indexed(agent_id: &str) -> bool {
+    let client = redis::Client::open(redis_url()).expect("redis url");
+    let mut conn = cog_redis::connect(&client).await.expect("connection");
+    conn.sismember("orchestrator:agents:index", agent_id)
+        .await
+        .expect("sismember")
+}
+
+/// 到期消失的记录把索引条目一起带走。
+///
+/// 到期是**写者**声明、Redis 执行的，记录消失时没有任何读者在场，索引条目就
+/// 永远留着。这不是记分不是脏数据的问题：`list` 问「谁注册着」的方式是对每个
+/// 成员读一次 key，于是每个死名都在每一拍向每个读者收一次往返费，而且只增不减。
+/// 实测 2026-10-26：索引 283 个成员，只有 20 个的 key 还活着。
+#[tokio::test]
+#[ignore = "needs a live Redis named by COGNEVA_TEST_REDIS_URL"]
+async fn a_record_that_lapsed_takes_its_index_entry_with_it() {
+    let registry = registry().await;
+    let reg = registration("lapsed", Utc::now());
+    plant_with_expiry(&reg, 1).await;
+    assert!(
+        indexed(&reg.agent_id).await,
+        "planted as an index member, which is the whole setup"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    assert_eq!(
+        registry.get(&reg.agent_id).await.expect("get"),
+        None,
+        "the record expired, so the name is absent"
+    );
+    assert!(
+        !indexed(&reg.agent_id).await,
+        "a name whose record is gone must not stay on the roster: every member costs \
+         every reader one key lookup on every pass, and this one can never answer"
+    );
+    assert!(
+        !registry
+            .list()
+            .await
+            .expect("list")
+            .iter()
+            .any(|r| r.agent_id == reg.agent_id),
+        "the roster and the index a reader walks must tell the same story"
+    );
+}
+
+/// 还活着的名字不许被这一步误删。
+///
+/// `register` 先写记录、后加成员：在两步之间做判断会看到「没有记录」，把一个
+/// 正在注册的 agent 从名单上删掉——而它的 key 好端端在那儿，于是它在 `list`
+/// 里消失到下一次心跳为止。这是同一条判据的另一半，删早和留久一样是错。
+#[tokio::test]
+#[ignore = "needs a live Redis named by COGNEVA_TEST_REDIS_URL"]
+async fn a_live_name_keeps_its_index_entry_pass_after_pass() {
+    let registry = registry().await;
+    let reg = registration("live_roster", Utc::now());
+    registry.register(&reg).await.expect("register");
+
+    for pass in 0..3 {
+        assert!(
+            registry
+                .list()
+                .await
+                .expect("list")
+                .iter()
+                .any(|r| r.agent_id == reg.agent_id),
+            "a live registration is still on the roster on pass {pass}"
+        );
+        assert!(
+            indexed(&reg.agent_id).await,
+            "and its index entry is still there on pass {pass}"
+        );
+    }
+
+    registry
+        .deregister(&reg.agent_id)
+        .await
+        .expect("deregister");
+}

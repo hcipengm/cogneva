@@ -52,8 +52,9 @@ impl RedisAgentRegistry {
     /// [`AgentRegistry::get`] answers "who is registered with this name" and
     /// collapses "no key" into `None` alongside every other reason a row could
     /// not be read. A caller deciding whether a unit is *still* present has to
-    /// tell a missing key from a live one, and the index is no help: it keeps
-    /// retired names forever, so membership in it is a tombstone, not a
+    /// tell a missing key from a live one, and the index is no help: a retired
+    /// name leaves it only when some reader walks the roster and finds the
+    /// record gone, so membership is "nothing has looked since it went", not a
     /// liveness reading.
     pub async fn ttl_secs(&self, agent_id: &str) -> SFResult<i64> {
         let key = agent_key(agent_id);
@@ -101,6 +102,42 @@ impl RedisAgentRegistry {
         let key = agent_key(agent_id);
         let _: Result<(), RedisError> = conn.del(&key).await;
         let _: Result<(), RedisError> = conn.srem(REGISTRY_INDEX_KEY, agent_id).await;
+    }
+
+    /// Take the index entry off a name whose record has already gone.
+    ///
+    /// The expiry is the writer's, so a record usually disappears without any
+    /// reader being involved: Redis deletes the key, and the name stays an
+    /// index member for good. Membership is what `list` walks, so every such
+    /// name is charged to every reader on every pass — `list` answers "who is
+    /// registered" by reading one key per member, and a name whose key is gone
+    /// can never answer again. Measured 2026-10-26: 283 members, 20 of them
+    /// with a live record.
+    ///
+    /// The check and the removal are one script because `register` writes the
+    /// record *before* it adds the member: a check made outside the script can
+    /// land between those two commands, see no record, and drop the member of
+    /// an agent that is registering at that very moment — a live agent gone
+    /// from the roster while its key is right there. Inside one script the
+    /// interleaving is either "member not yet added" (nothing to remove) or
+    /// "record already there" (left alone).
+    ///
+    /// Best effort, like `forget`: the caller is answering "is this agent
+    /// here", and a failed cleanup must not turn that answer into an error.
+    async fn take_index_entry_if_record_is_gone(&self, agent_id: &str) {
+        let mut conn = self.connection.clone();
+        let script = redis::Script::new(
+            "if redis.call('EXISTS', KEYS[1]) == 0 then \
+                 return redis.call('SREM', KEYS[2], ARGV[1]) \
+             end \
+             return 0",
+        );
+        let _: Result<i64, RedisError> = script
+            .key(agent_key(agent_id))
+            .key(REGISTRY_INDEX_KEY)
+            .arg(agent_id)
+            .invoke_async(&mut conn)
+            .await;
     }
 }
 
@@ -176,10 +213,12 @@ impl AgentRegistry for RedisAgentRegistry {
             .await
             .map_err(|e: RedisError| SFError::Redis(e.to_string()))?;
         let Some(s) = raw else {
+            self.take_index_entry_if_record_is_gone(agent_id).await;
             return Ok(None);
         };
         if ttl == -2 {
             // Expired between the two commands in the pipeline.
+            self.take_index_entry_if_record_is_gone(agent_id).await;
             return Ok(None);
         }
         let reg: AgentRegistration = serde_json::from_str(&s).map_err(SFError::Serialization)?;
