@@ -28,6 +28,9 @@
 #   5. 同一个画面的几份快照一起重读：任务面的行由帧直接改写，表头的计数与图上的
 #      节点却来自各自的快照——只刷列表，表头就会在接下来十几秒里说「运行 3」而
 #      下面三行都已经是完成。三份必须同一次重读。
+#   6. 幅面之外的那块「图上还没有的边」也要收：通信面把比快照新的边单独列出来，
+#      靠的是重读很快把它们并进图里。没有触发重读，这块就成了常驻——轮询一调长，
+#      一条已经进了图的交接会在这一块里一直写着「图上还没有」。
 #
 # 用法：bash deploy/scripts/check-web-stream-driven-refresh.sh [仓库根目录]
 set -euo pipefail
@@ -116,17 +119,23 @@ for pattern, why in (
 
 # 任务面：行由帧改写，计数与图来自快照。三份都交出去，缺一份就是同一屏上两份事实。
 tasks = read("views/TasksView.tsx")
-for pattern, why in (
-    (
-        r"useStreamDrivenRefresh\(\[summary\.refresh, list\.refresh, graph\.refresh\]\)",
-        "任务面的汇总、列表、图没一起接到帧上：行会跟着帧改，表头的「运行 N」和图上"
-        "那条还连着，最久要等下一拍 15 秒才对上——同一屏两份事实",
-    ),
+if not re.search(
+    r"useStreamDrivenRefresh\(\[summary\.refresh, list\.refresh, graph\.refresh\]\)", tasks
 ):
-    if not re.search(pattern, tasks):
-        sys.exit(f"views/TasksView.tsx 缺 {pattern}：{why}")
+    sys.exit(
+        "views/TasksView.tsx 没把汇总、列表、图一起交出去：行会跟着帧改，表头的"
+        "「运行 N」和图上那条还连着，最久要等下一拍 15 秒才对上——同一屏两份事实"
+    )
 
-print("ok   - 调度是纯的、总线报了到、观测面与任务面接上了重读")
+# 通信面：比快照新的边单独列着，等重读把它们并进图。重读没人触发，这块就是常驻。
+comms = read("views/CommsView.tsx")
+if not re.search(r"useStreamDrivenRefresh\(\[graph\.refresh, tasks\.refresh\]\)", comms):
+    sys.exit(
+        "views/CommsView.tsx 没把交接图与任务归属交给帧：那一块「图上还没有的边」"
+        "只有在下一次轮询才收得掉，轮询一调长，已经在图里的交接会一直挂在那里"
+    )
+
+print("ok   - 调度是纯的、总线报了到、观测面/任务面/通信面接上了重读")
 PYEOF
 
 TSC="$ROOT/web/node_modules/.bin/tsc"

@@ -8,6 +8,7 @@ import {
   type TaskRow,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useStreamDrivenRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { outcomesSinceSnapshot, type LiveCommsRow } from '@/store/liveComms';
 import { useLiveCommsStore } from '@/store/liveCommsStore';
 import { openExplain } from '@/ui/explain';
@@ -287,6 +288,12 @@ export function CommsView() {
   const fresh = outcomesSinceSnapshot(graph.at, liveRows);
   // 任务行是「谁干的」的正本：边上有执行者就用边上的，边上没有就退回这里。
   const tasks = useResource('任务归属', () => listTasks({ limit: 500 }), 60_000);
+  // 「重读之后它们自己消失」靠的是一直有重读在发生。以前只有那一拍 15 秒：轮询
+  // 一调长，那条边就会以「图上还没有」的样子留在这一块里，比这一面自己的读数还久。
+  // 交接帧一到就重读，图当场把边收进去，这一块随之清空——这一块本来就是为两拍之间
+  // 的那段时间准备的，不该在停顿里变成常驻。任务归属一并重读：边上要挂的人名，
+  // 常常是和这条边同一个时刻才有的。
+  useStreamDrivenRefresh([graph.refresh, tasks.refresh]);
   const owners = new Map((tasks.data ?? []).map((task) => [task.id, task]));
   const [picked, setPicked] = useState<string | null>(null);
 
