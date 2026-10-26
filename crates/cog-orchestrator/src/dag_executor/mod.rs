@@ -762,7 +762,7 @@ impl DagExecutorRuntime {
         let Some(&budget) = budgets.and_then(|budgets| budgets.get(&task.id)) else {
             return false;
         };
-        if task.started_at.is_none() && task.retry_count == 0 {
+        if task.started_at.is_none() && task.retry_count == 1 {
             return false;
         }
         let Some(gateway) = self.observability.get() else {
@@ -3254,6 +3254,30 @@ mod consumer_ack_tests {
 
     /// 从没跑过的一条不去问清点：问一次就是一趟白跑的库往返，而就绪队列每一拍
     /// 都可能很大。这里让清点里放一个巨大的数——若过滤没在问之前生效，它会被拦下。
+    #[tokio::test]
+    async fn a_task_that_never_ran_does_not_ask_the_census() {
+        let runtime = budget_runtime(
+            Census::with(&[("task-first-run", u64::MAX)]),
+            vec![plan("task-first-run", 100)],
+        );
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-budget",
+                vec![ready_task("task-first-run", serde_json::json!({}))],
+            )
+            .await
+            .unwrap();
+        runtime.publish_ready_tasks().await.unwrap();
+
+        let task = runtime
+            .orchestrator()
+            .get_task("task-first-run")
+            .await
+            .expect("task present");
+        assert_eq!(task.status, cog_core::TaskStatus::Scheduled);
+    }
+
     // ─── 按历史排期：甘特条与挣值的那一头 ───
 
     /// 只有排期这一条腿的运行时。
