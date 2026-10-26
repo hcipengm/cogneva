@@ -370,8 +370,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
           const live = session.messages.filter(
             (m) => m.status !== 'done' || !settled.has(`${m.role}\u0000${m.text}`)
           );
+          // 交出去的目标从记录里读回来，不从内存里读：刷新之后，这段对话是
+          // 「能关掉的问答」还是「还在服务器上跑的目标」，答案只有历史里有。
+          // 本地已经收到的那些排后面去重，同一道目标不重复记。
+          const goals = [...session.goals];
+          for (const line of lines) {
+            if (!line.goal_id) continue;
+            if (goals.some((goal) => goal.id === line.goal_id)) continue;
+            goals.push({ id: line.goal_id, at: line.created_at });
+          }
           return {
             ...session,
+            goals,
             messages: [...remote, ...live],
             hydrated: true,
             hydrating: false,

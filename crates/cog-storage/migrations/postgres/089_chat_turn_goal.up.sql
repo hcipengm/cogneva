@@ -1,0 +1,21 @@
+-- Migration: 089_chat_turn_goal
+-- A turn that handed work to the orchestrator keeps the name of the goal it made.
+--
+-- Until now the goal id existed in two places, both of them momentary: the ack
+-- text of the reply, and one frame on the live socket. Reload the page and the
+-- conversation came back as a plain chat -- the transcript said nothing about a
+-- goal, so the pane had no way to tell a question from a hand-off, and the
+-- answer to "is this a conversation I can close, or one still running on the
+-- server" was wrong for exactly the conversations where it matters. The frame
+-- is not the record: a stream is a view of what happened, and the history is
+-- what survives the view closing.
+--
+-- Null for every turn that was not a hand-off, which is the honest value: a
+-- question answered in this reply has no goal, and a default of '' would make
+-- "no goal" and "a goal with an empty id" the same reading.
+--
+-- Written on the assistant row, not on both rows of the pair: the goal is what
+-- was done about the message, and the reply is where that is said. `failure`
+-- sits on both rows because either half may be the one a reader finds; a goal
+-- is not a property of the question.
+ALTER TABLE chat_turns ADD COLUMN IF NOT EXISTS goal_id TEXT;

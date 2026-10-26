@@ -82,6 +82,14 @@ pub struct ChatTurnRecord {
     /// Why this line never got an answer. Both halves of an unanswered exchange
     /// carry the same reason, so a reader that finds either end can say why.
     pub failure: Option<String>,
+    /// The goal this line handed work to, when it handed work to one.
+    ///
+    /// A conversation that dispatched is not the same thing as one that
+    /// answered: the first keeps running on the server after the page closes,
+    /// the second exists only while the socket is open. A reader that can only
+    /// see the goal on the live frame loses that distinction exactly when it is
+    /// being relied on -- on reopen.
+    pub goal: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -100,6 +108,21 @@ pub trait ChatTurnStore: Send + Sync {
     /// question whose answer is still in flight -- half a turn reads as an
     /// answer that never came.
     async fn record_turn(&self, session_id: &str, user: &str, assistant: &str) -> SFResult<()>;
+
+    /// Record one exchange whose reply handed the work to the orchestrator, and
+    /// the goal it created.
+    ///
+    /// A separate method rather than a longer `record_turn`: the two write
+    /// different shapes, and an implementation that answered this one by
+    /// forwarding to `record_turn` would keep the words and drop the goal --
+    /// which reads, on reopen, as a conversation that never dispatched anything.
+    async fn record_dispatched_turn(
+        &self,
+        session_id: &str,
+        user: &str,
+        assistant: &str,
+        goal_id: &str,
+    ) -> SFResult<()>;
 
     /// Record one exchange whose reply never arrived, and why.
     ///
@@ -157,6 +180,7 @@ impl PostgresChatTurnStore {
         user: &str,
         assistant: Option<&str>,
         failure: Option<&str>,
+        goal: Option<&str>,
     ) -> SFResult<()> {
         if session_id.trim().is_empty() {
             return Err(SFError::Validation(
@@ -169,16 +193,17 @@ impl PostgresChatTurnStore {
             self.pool.begin().await.map_err(|e| {
                 SFError::Database(format!("start the chat turn's transaction: {e}"))
             })?;
-        let mut query = sqlx::query(if assistant.is_some() {
-            INSERT_TURN_SQL
-        } else {
-            INSERT_FAILED_TURN_SQL
+        let mut query = sqlx::query(match (assistant, goal) {
+            (Some(_), Some(_)) => INSERT_DISPATCHED_TURN_SQL,
+            (Some(_), None) => INSERT_TURN_SQL,
+            (None, _) => INSERT_FAILED_TURN_SQL,
         })
         .bind(session_id)
         .bind(user);
-        query = match assistant {
-            Some(reply) => query.bind(reply),
-            None => query.bind(failure.unwrap_or("")),
+        query = match (assistant, goal) {
+            (Some(reply), Some(goal_id)) => query.bind(reply).bind(goal_id),
+            (Some(reply), None) => query.bind(reply),
+            (None, _) => query.bind(failure.unwrap_or("")),
         };
         query
             .execute(&mut *tx)
@@ -205,6 +230,13 @@ impl PostgresChatTurnStore {
 const INSERT_TURN_SQL: &str = "\
 INSERT INTO chat_turns (session_id, role, content) \
 VALUES ($1, 'user', $2), ($1, 'assistant', $3)";
+
+/// The same pair for a turn that handed its work to the orchestrator. The goal
+/// goes on the assistant row only: the reply is where the platform said what it
+/// did with the message, and the question is not what carries a goal.
+const INSERT_DISPATCHED_TURN_SQL: &str = "\
+INSERT INTO chat_turns (session_id, role, content, goal_id) \
+VALUES ($1, 'user', $2, NULL), ($1, 'assistant', $3, $4)";
 
 /// The same pair for an exchange that never got an answer: the reply's content
 /// is empty because nothing was said, and `failure` carries why. Both rows get
@@ -239,8 +271,8 @@ ORDER BY id";
 /// of the `failure IS NULL` filter: the unanswered half is exactly what a
 /// reopened conversation has to show.
 const TRANSCRIPT_SQL: &str = "\
-SELECT id, role, content, failure, created_at FROM ( \
-    SELECT id, role, content, failure, created_at FROM chat_turns \
+SELECT id, role, content, failure, goal_id, created_at FROM ( \
+    SELECT id, role, content, failure, goal_id, created_at FROM chat_turns \
     WHERE session_id = $1 \
     ORDER BY id DESC LIMIT $2 \
 ) newest \
@@ -249,7 +281,26 @@ ORDER BY id";
 #[async_trait]
 impl ChatTurnStore for PostgresChatTurnStore {
     async fn record_turn(&self, session_id: &str, user: &str, assistant: &str) -> SFResult<()> {
-        self.write(session_id, user, Some(assistant), None).await
+        self.write(session_id, user, Some(assistant), None, None)
+            .await
+    }
+
+    async fn record_dispatched_turn(
+        &self,
+        session_id: &str,
+        user: &str,
+        assistant: &str,
+        goal_id: &str,
+    ) -> SFResult<()> {
+        if goal_id.trim().is_empty() {
+            return Err(SFError::Validation(
+                "a dispatched turn cannot be recorded without its goal: the row would say work \
+                 was handed off without saying to what"
+                    .into(),
+            ));
+        }
+        self.write(session_id, user, Some(assistant), None, Some(goal_id))
+            .await
     }
 
     async fn record_failed_turn(
@@ -258,7 +309,8 @@ impl ChatTurnStore for PostgresChatTurnStore {
         user: &str,
         failure: &str,
     ) -> SFResult<()> {
-        self.write(session_id, user, None, Some(failure)).await
+        self.write(session_id, user, None, Some(failure), None)
+            .await
     }
 
     async fn history(&self, session_id: &str, limit: usize) -> SFResult<Vec<ChatTurn>> {
@@ -292,6 +344,7 @@ impl ChatTurnStore for PostgresChatTurnStore {
             String,
             String,
             Option<String>,
+            Option<String>,
             chrono::DateTime<chrono::Utc>,
         )> = sqlx::query_as(TRANSCRIPT_SQL)
             .bind(session_id)
@@ -300,7 +353,7 @@ impl ChatTurnStore for PostgresChatTurnStore {
             .await
             .map_err(|e| SFError::Database(format!("read the chat transcript: {e}")))?;
         rows.into_iter()
-            .map(|(id, role, content, failure, created_at)| {
+            .map(|(id, role, content, failure, goal, created_at)| {
                 let role = ChatTurnRole::parse(&role).ok_or_else(|| {
                     SFError::Database(format!(
                         "chat transcript holds a role this build cannot name: {role:?}"
@@ -311,6 +364,7 @@ impl ChatTurnStore for PostgresChatTurnStore {
                     role,
                     content,
                     failure,
+                    goal,
                     created_at,
                 })
             })

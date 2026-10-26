@@ -330,6 +330,11 @@ export interface ChatTranscriptLine {
   content: string;
   /** 这一轮没有答案的原因。有值就是「问过，但没答上来」。 */
   failure: string | null;
+  /**
+   * 这一轮交出去的那道目标。有值＝这段对话是常驻的（活交给编排器了，关掉页面
+   * 它还在跑）；空＝问答，回复只走当前这条连接。
+   */
+  goal_id?: string | null;
   created_at: string;
 }
 

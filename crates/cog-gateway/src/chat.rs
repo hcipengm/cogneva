@@ -226,6 +226,38 @@ async fn record_turn(store: &crate::ChatTurnHandle, session_id: &str, user: &str
     }
 }
 
+/// 记下这一轮，连同它交出去的那道目标。
+///
+/// 目标身份原本只活在两个瞬间的地方：回复正文里的一句话，和实时流上的一帧。
+/// 关掉页面再打开，这段对话在记录里就成了一段纯问答——「这条能不能关掉」问的
+/// 正是它的反面，而刷新恰好是这个问题最需要答对的时候。帧是「此刻正在发生」的
+/// 视图，记录才是关掉之后仍然成立的那一份。
+async fn record_dispatched_turn(
+    store: &crate::ChatTurnHandle,
+    session_id: &str,
+    user: &str,
+    assistant: &str,
+    goal_id: &str,
+) {
+    let Some(store) = store else {
+        tracing::warn!(
+            session = %session_id,
+            "聊天：这套部署没有聊天记录库，这一轮不会留下记录"
+        );
+        return;
+    };
+    if let Err(e) = store
+        .record_dispatched_turn(session_id, user, assistant, goal_id)
+        .await
+    {
+        tracing::warn!(
+            error = %e,
+            session = %session_id,
+            "聊天：这一轮没写进记录"
+        );
+    }
+}
+
 /// 记下这一轮没答出来的那句话，以及没答出来的原因。
 ///
 /// 答不出来的那一轮同样是用户对这个平台说过话的一轮：什么都不写，用户说的那句
@@ -321,7 +353,7 @@ pub async fn run_chat_turn(
         .await;
         // 可执行意图这一支也要留痕：下一次追问「刚才那个目标怎么样了」时，历史里
         // 得有这次提交，否则模型只看见一句没头没尾的追问。
-        record_turn(&state.chat_turns, &session_id, &content, &ack).await;
+        record_dispatched_turn(&state.chat_turns, &session_id, &content, &ack, &goal_id).await;
 
         let orchestrator = state.orchestrator.clone();
         let out2 = out.clone();
@@ -623,6 +655,30 @@ mod tests {
         );
     }
 
+    /// 交出去的那一轮必须把目标记进记录，而不是只发一帧。
+    ///
+    /// 这一格盯的是刷新之后的那一半：帧只活在连接里，历史从记录里来。记录里没有
+    /// 目标，重新打开这段对话就退化成一段纯问答——界面把「常驻·守护」显示成
+    /// 「可下线」，执行者在做什么也无从接起。所以这里读的不是那一帧，是记录。
+    #[tokio::test]
+    async fn a_dispatched_turn_keeps_its_goal_where_the_history_can_read_it() {
+        let store = std::sync::Arc::new(FakeTurns::default());
+        let handle: crate::ChatTurnHandle = Some(store.clone());
+        record_dispatched_turn(&handle, "s1", "把这件事做了", "已受理", "goal-7").await;
+
+        // 问句与答复照样成对进上下文：交出去不等于这一轮就不用记。
+        let held = store.turns.lock().await.clone();
+        assert_eq!(held.len(), 2, "这一轮要成对落盘：{held:?}");
+        assert_eq!(held[1].content, "已受理");
+
+        let dispatched = store.dispatched.lock().await.clone();
+        assert_eq!(
+            dispatched,
+            vec![("把这件事做了".to_string(), "goal-7".to_string())],
+            "目标身份必须落在记录里，不能只活在回复正文与那一帧上"
+        );
+    }
+
     /// 没答出来的那一轮同样是用户说过的一句话，必须留下。
     ///
     /// 上游不可用的那段时间，这个平台收到的每一句话原本都会消失：记录只在
@@ -676,6 +732,8 @@ mod tests {
         turns: tokio::sync::Mutex<Vec<cog_storage::ChatTurn>>,
         /// 有问无答的那几轮：留在记录里，但不进上下文（`history` 不返回它们）。
         unanswered: tokio::sync::Mutex<Vec<(String, String)>>,
+        /// 交出去的那几轮与它们的目标：(问句, goal_id)。
+        dispatched: tokio::sync::Mutex<Vec<(String, String)>>,
         last_limit: tokio::sync::Mutex<Option<usize>>,
         fail: std::sync::atomic::AtomicBool,
     }
@@ -703,6 +761,35 @@ mod tests {
                 role: cog_storage::ChatTurnRole::Assistant,
                 content: assistant.to_string(),
             });
+            Ok(())
+        }
+
+        async fn record_dispatched_turn(
+            &self,
+            session_id: &str,
+            user: &str,
+            assistant: &str,
+            goal_id: &str,
+        ) -> cog_core::SFResult<()> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(cog_core::SFError::Database("unreachable".into()));
+            }
+            if session_id != "s1" {
+                return Ok(());
+            }
+            let mut held = self.turns.lock().await;
+            held.push(cog_storage::ChatTurn {
+                role: cog_storage::ChatTurnRole::User,
+                content: user.to_string(),
+            });
+            held.push(cog_storage::ChatTurn {
+                role: cog_storage::ChatTurnRole::Assistant,
+                content: assistant.to_string(),
+            });
+            self.dispatched
+                .lock()
+                .await
+                .push((user.to_string(), goal_id.to_string()));
             Ok(())
         }
 
@@ -761,6 +848,7 @@ mod tests {
                     role: turn.role,
                     content: turn.content.clone(),
                     failure: None,
+                    goal: None,
                     created_at: chrono::Utc::now(),
                 })
                 .collect())

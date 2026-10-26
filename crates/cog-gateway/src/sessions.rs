@@ -212,6 +212,10 @@ pub async fn list_messages_handler(
                         "role": turn.role.as_str(),
                         "content": turn.content,
                         "failure": turn.failure,
+                        // 交出去的这一轮带着目标身份回来：重新打开这段对话时，
+                        // 「这条是能关掉的问答，还是一条还在服务器上跑的目标」
+                        // 只能从这一格读——实时流在页面关掉时就断了。
+                        "goal_id": turn.goal,
                         "created_at": turn.created_at,
                     })
                 })

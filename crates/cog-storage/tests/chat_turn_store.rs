@@ -306,6 +306,71 @@ async fn an_unanswered_turn_is_kept_out_of_the_history_but_not_out_of_the_table(
     cleanup(&probe).await;
 }
 
+/// A dispatched exchange keeps the goal it created, where a reopened page can
+/// read it.
+///
+/// The goal used to exist only on the live frame and in the reply's wording, so
+/// reloading the page turned a conversation that was still running on the server
+/// into an ordinary Q&A -- the one reading that is wrong in the direction that
+/// matters, because the user closes the tab believing there was nothing left to
+/// wait for. The column is read directly as well as through `transcript`: the
+/// read side could fill the field from anywhere, and what has to be true is that
+/// the row holds it.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn a_dispatched_turn_keeps_its_goal_on_the_row_the_history_reads() {
+    let probe = probe().await;
+    probe
+        .store
+        .record_dispatched_turn(&probe.session, "把这件事做了", "已受理", "goal-7788")
+        .await
+        .expect("record a dispatched turn");
+    probe
+        .store
+        .record_turn(&probe.session, "那这个呢", "这个直接答")
+        .await
+        .expect("record an answered turn");
+
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT role, goal_id FROM chat_turns WHERE session_id = $1 ORDER BY id")
+            .bind(&probe.session)
+            .fetch_all(&probe.pool)
+            .await
+            .expect("read the rows back");
+    assert_eq!(
+        rows,
+        vec![
+            ("user".to_string(), None),
+            ("assistant".to_string(), Some("goal-7788".to_string())),
+            ("user".to_string(), None),
+            ("assistant".to_string(), None),
+        ],
+        "交出去的那一轮没把目标落在它的答复行上：{rows:?}"
+    );
+
+    let transcript = probe
+        .store
+        .transcript(&probe.session, 40)
+        .await
+        .expect("read the transcript");
+    let goals: Vec<Option<&str>> = transcript.iter().map(|line| line.goal.as_deref()).collect();
+    assert_eq!(
+        goals,
+        vec![None, Some("goal-7788"), None, None],
+        "读回来的每一行都要带着它自己的目标与否：{goals:?}"
+    );
+
+    // 上下文窗口不受影响：目标身份是给读者的，不是给模型的。
+    let history = probe
+        .store
+        .history(&probe.session, 40)
+        .await
+        .expect("read the history");
+    assert_eq!(history.len(), 4, "交出去的那一轮也该进上下文：{history:?}");
+
+    cleanup(&probe).await;
+}
+
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_turn_without_a_session_is_refused_rather_than_filed_under_nothing() {
