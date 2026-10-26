@@ -19,7 +19,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo check --workspace
+      # --all-targets: this job's verdict is the one a person or a script can read
+      # without a token, so it has to be able to go red for the failures the
+      # token-only jobs would otherwise be alone in reporting. A library-only
+      # check stays green when a struct gains a field and an integration test
+      # still spells out the old literals -- Test, Code Coverage and
+      # `clippy --all-targets` fail, this job says "success", and the tree looks
+      # healthy in exactly the reading that is visible from outside.
+      - run: cargo check --workspace --all-targets
 
   test:
     name: Test
