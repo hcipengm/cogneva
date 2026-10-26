@@ -9,7 +9,9 @@ import {
 } from '@/store/streamStore';
 import { useChatStore } from '@/store/chatStore';
 import { agentFrame } from '@/store/liveAgents';
+import { alertFrame } from '@/store/liveAlerts';
 import { useLiveAgentStore } from '@/store/liveAgentStore';
+import { useLiveAlertStore } from '@/store/liveAlertStore';
 import type { AgentEvent } from '@/types/events';
 import type { NotificationItem } from '@/api/client';
 
@@ -80,6 +82,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
   const noteUnrecorded = useStreamStore((state) => state.noteUnrecorded);
   const ingestChatFrame = useChatStore((state) => state.ingestFrame);
   const noteAgentFrame = useLiveAgentStore((state) => state.noteFrame);
+  const noteAlertFrame = useLiveAlertStore((state) => state.noteFrame);
   /** 每个 agent 正在流的那一条消息（agent_id → 画布上的消息 id）。 */
   const streaming = useRef(new Map<string, string>());
 
@@ -107,6 +110,15 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
         // 心跳按构造不入账（下面会提前返回），它的「改了态」不落在时间轴上，
         // 所以这里只给会落点的那几类置位。
         if (event.type !== 'heartbeat' && liveAgent.state !== null) changedState = true;
+      }
+
+      // 告警这一面：活跃告警表每 30 秒才重读一次，而 `resource_alert` 一直在总线上。
+      // 折进来的是「表之外刚越的那一次」（见 store/liveAlerts.ts），它改的是读者
+      // 「现在要不要动手」的判断，所以这一帧算改了态。
+      const liveAlert = alertFrame(event);
+      if (liveAlert) {
+        noteAlertFrame(liveAlert);
+        changedState = true;
       }
 
       switch (event.type) {
@@ -228,6 +240,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     noteUnrecorded,
     ingestChatFrame,
     noteAgentFrame,
+    noteAlertFrame,
   ]);
 
   return { clientRef };

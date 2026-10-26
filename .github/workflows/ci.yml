@@ -739,6 +739,11 @@ jobs:
       # 分派真的写、画面真的读），并把折叠语义编译出来在 node 里按判据跑。
       - name: Check the agents face moves with the frames, not only with the poll
         run: bash deploy/scripts/check-web-live-frames.sh
+      # 告警面是出事时才有人打开的那一面：`resource_alert` 在总线上走，表却每 30
+      # 秒才重读一次，晚一拍就是把这一拍还给出事的那一方。这一步同样判三处接线，
+      # 并把折叠语义编译出来在 node 里跑（重放不清旧、说不清越到哪儿的不折）。
+      - name: Check the alerts face moves with the frames, not only with the poll
+        run: bash deploy/scripts/check-web-live-alerts.sh
 
   entry-scripts:
     name: Entry Scripts Lint

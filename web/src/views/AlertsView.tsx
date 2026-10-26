@@ -1,6 +1,8 @@
 import type { ActiveAlert } from '@/api/client';
 import { useServices } from '@/shell/context';
 import { useShell } from '@/shell/store';
+import { breachesSinceSnapshot, type LiveAlertRow } from '@/store/liveAlerts';
+import { useLiveAlertStore } from '@/store/liveAlertStore';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -8,6 +10,10 @@ import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Status, T
  *
  * 读数由工作台共享，这一面不另开一个轮询：状态条上的数与这一页上的数必须是
  * 同一个数，否则读者得先决定信哪一个。
+ *
+ * 表本身是每 30 秒重读一次的快照，**但它上面那一块不是**：`resource_alert` 帧一直
+ * 在总线上走，帧说「上次读这张表之后又越了什么界」。少了这一块，一次越界要等
+ * 下一拍轮询才出现在告警面上——而告警恰恰是「现在就要知道」的那种读数。
  *
  * `durable_alerts_read` 必须显示出来。它在 false 时意味着这一页只剩进程内事件，
  * 列表变短但没有任何东西被清掉——不写这一句，读者会把「读不到」当成「没事了」。
@@ -17,6 +23,10 @@ export function AlertsView() {
   const appendOutput = useShell((s) => s.appendOutput);
   const data = reader.alerts;
   const list = data?.alerts ?? [];
+  const liveRows = useLiveAlertStore((s) => s.rows);
+  // 帧比这份快照晚，就说明它不可能是这份快照里的：只列那几条，重读之后它们
+  // 自己消失，所以同一件事不会在表里再出现一次。
+  const fresh = breachesSinceSnapshot(reader.at, liveRows);
 
   const acknowledge = async (alert: ActiveAlert) => {
     const outcome = await reader.acknowledge(alert.id);
@@ -34,8 +44,8 @@ export function AlertsView() {
       meta={
         data
           ? `${data.count} 条在 firing${
-              data.durable_alerts_read === false ? ' · 耐久源读失败，列表只剩进程内事件' : ''
-            }`
+              fresh.length > 0 ? ` · ${fresh.length} 次越界刚推到、这张表还没读到` : ''
+            }${data.durable_alerts_read === false ? ' · 耐久源读失败，列表只剩进程内事件' : ''}`
           : reader.error
             ? '读不到'
             : '按 30 秒重读'
@@ -56,7 +66,7 @@ export function AlertsView() {
           <Readings
             from={{ what: reader.what, at: reader.at }}
             source="GET /api/v1/alerts/active"
-            caveat="这一份按 30 秒重读：两格之间不会自己变。耐久源读失败时列表只剩进程内事件，那时的数回答的是「这一进程见过什么」。"
+            caveat="表里这几格按 30 秒重读，两格之间不会自己变；表上面那一块是总线上来的，会在两拍之间自己变。耐久源读失败时列表只剩进程内事件，那时的数回答的是「这一进程见过什么」。"
           >
           <div className="flex flex-wrap border-b border-[var(--line)] py-2">
             <Reading label="在 firing" value={list.length} tone={list.length ? 'danger' : 'ok'} />
@@ -80,10 +90,47 @@ export function AlertsView() {
               {reader.ackError}
             </div>
           )}
+          {fresh.length > 0 && <FreshBreaches rows={fresh} />}
           <AlertTable alerts={list} acknowledge={acknowledge} pending={reader.pendingAck} />
         </>
       )}
     </ViewFrame>
+  );
+}
+
+/**
+ * 总线上推来、而这张表还没读到的越界。
+ *
+ * 这一块不是表的一份更快拷贝：表里的行有 dedup_key、有谁点过确认，帧里只有这一次
+ * 的实测值，两者身份对不上。所以它只说自己能说的——谁、哪项指标、越到哪儿——并且
+ * 明写「表里还没有」，免得读者把它当成一条可以去确认的告警：它背后此刻还没有行。
+ */
+function FreshBreaches({ rows }: { rows: LiveAlertRow[] }) {
+  return (
+    <div className="border-b border-[var(--line)] bg-[color-mix(in_srgb,var(--danger)_8%,transparent)] py-2">
+      <div className="mb-1 text-[11px] text-[var(--paper-dim)]">
+        总线刚推来 {rows.length} 次越界（比这张表更晚，表里还读不到）：
+      </div>
+      {rows.map((row) => (
+        <div key={row.key} className="flex flex-wrap items-baseline gap-2 py-0.5 text-[11px]">
+          <span className="mono text-[var(--paper)]">{row.agentId}</span>
+          <span className="mono text-[var(--muted)]">{row.metric}</span>
+          <span className="mono text-[var(--danger)]">
+            {row.current.toFixed(2)} 越过 {row.threshold.toFixed(2)}
+          </span>
+          {row.crewId && <span className="mono text-[var(--muted)]">crew {row.crewId}</span>}
+          <span className="text-[var(--muted)]">
+            第一次 <Moment iso={row.firstAt} /> · 最近 <Moment iso={row.lastAt} />
+          </span>
+          <span
+            className="mono text-[10px] text-[var(--brass)]"
+            title={`这一格来自 resource_alert 帧（${row.frames} 帧折成一行），不是这次轮询`}
+          >
+            帧
+          </span>
+        </div>
+      ))}
+    </div>
   );
 }
 
