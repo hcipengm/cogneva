@@ -814,6 +814,13 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             ctx.consume_service::<dyn cog_core::HttpClient>(),
             ctx.consume_service::<dyn cog_core::MetricsBackend>(),
         );
+        // 停机信号：拿到就挂在进程的停机信号上，拿不到就得到一个永不触发的信号
+        // ——与告警桥同一条约定。这一支在判词落成 firing 之后会一直按节拍复述，
+        // 没有停机信号它就只在这条进程结束时停。
+        let declaration_stop = ctx
+            .consume::<cog_core::ShutdownSignal>()
+            .map(|s| (*s).clone())
+            .unwrap_or_default();
         tokio::spawn(crate::config_delivery::run_config_declaration_check(
             std::time::Duration::from_secs(
                 obs_cfg
@@ -830,6 +837,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             self.alert_store.clone(),
             declaration_notifier,
             ctx.consume_service::<dyn cog_core::MetricsBackend>(),
+            declaration_stop,
         ));
 
         // ── Infra alert watcher: PromQL rules → persisted alerts ──
@@ -2248,6 +2256,10 @@ mod bridge_sweep {
                 .unwrap()
                 .push((rule.to_string(), stale_before));
             Ok(1)
+        }
+
+        async fn refresh_firing(&self, _dedup_key: &str) -> anyhow::Result<bool> {
+            panic!("这条测试不发 supervisor 事件，落库那一支不该被走到")
         }
     }
 

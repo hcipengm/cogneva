@@ -124,6 +124,36 @@ fn the_plugin_runs_the_check_and_persists_its_verdict() {
     );
 }
 
+/// 判词只说一次，但这一行必须活过判词。
+///
+/// `last_seen_at` 问的不是「这件事还成不成立」，而是「还有没有写者在维持这一行」。
+/// 一条关于「本进程启动时读到的是哪份文档」的判词只有一个答案，于是它把这条行
+/// 留在表上、却再也不喂它一个节拍——十五分钟的窗口一过，这一行与被孤儿化的行在
+/// 读数面上完全同形。实测 2026-10-27：这一行开了 67 分钟，`CognevaAlertUnsighted`
+/// 点名的就是它，而写者一直活着。两段缺一不可：落成 firing 之后接着复述，且这一支
+/// 拿得到停机信号（否则它只能等到进程被杀才停）。
+#[test]
+fn a_firing_verdict_keeps_reporting_itself() {
+    let delivery = read("crates/cog-observability/src/config_delivery.rs");
+    assert!(
+        delivery.contains("keep_the_row_sighted("),
+        "判词落成 firing 之后不再复述：这一行会在十五分钟后被读成没有写者维持"
+    );
+    assert!(
+        delivery.contains("refresh_firing("),
+        "复述要推进存活钟，而不是重写判词（重写会把别人关掉的行重新点亮）"
+    );
+    let plugin = read("crates/cog-observability/src/plugin.rs");
+    let call = plugin
+        .split_once("run_config_declaration_check(")
+        .map(|(_, rest)| rest.split_once("));").map(|(args, _)| args).unwrap_or(rest))
+        .unwrap_or("");
+    assert!(
+        call.contains("declaration_stop"),
+        "投递判据没拿到停机信号：复述那一支只能等进程被杀才停"
+    );
+}
+
 /// The row this check raises is the one the human surface serves.
 ///
 /// The durable rows reach `/api/v1/alerts/active` through the source the alert

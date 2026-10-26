@@ -182,6 +182,24 @@ pub trait AlertRowStore: Send + Sync {
         rule: &str,
         stale_before: DateTime<Utc>,
     ) -> anyhow::Result<u64>;
+
+    /// Move `dedup_key`'s liveness clock forward if the row is still firing,
+    /// answering whether it was.
+    ///
+    /// For the writer whose verdict cannot change while it lives: a judgement
+    /// about the document this process started with is true for the rest of the
+    /// process, so re-evaluating it would produce the same `true` every tick —
+    /// but `last_seen_at` asks a different question, "is anything still holding
+    /// this row up", and a verdict decided once has no second answer to give it.
+    /// Measured 2026-10-27: `config_declaration_mismatch` fired once at boot and
+    /// sat unread for 67 minutes; the sighting reading named it as a row nobody
+    /// was maintaining, which was true and not a defect of the row.
+    ///
+    /// It touches an already-firing row and nothing else: a row closed by
+    /// another process (a newer revision that starts on the corrected document)
+    /// stays closed. Re-asserting the verdict instead would re-open it and page
+    /// someone for something the next tick of a rollout has already fixed.
+    async fn refresh_firing(&self, dedup_key: &str) -> anyhow::Result<bool>;
 }
 
 #[async_trait::async_trait]
@@ -200,6 +218,10 @@ impl AlertRowStore for PostgresAlertStore {
         stale_before: DateTime<Utc>,
     ) -> anyhow::Result<u64> {
         PostgresAlertStore::resolve_unrefreshed(self, rule, stale_before).await
+    }
+
+    async fn refresh_firing(&self, dedup_key: &str) -> anyhow::Result<bool> {
+        PostgresAlertStore::refresh_firing(self, dedup_key).await
     }
 }
 
@@ -388,6 +410,25 @@ impl PostgresAlertStore {
         .execute(&self.pool)
         .await?;
         Ok(closed.rows_affected())
+    }
+
+    /// Move the row's liveness clock forward, if it is still open.
+    ///
+    /// The `state = 'firing'` guard is the whole of it: this writer's verdict is
+    /// fixed for its lifetime, so writing the verdict again would only re-open a
+    /// row someone else has already closed. Answers whether a firing row was
+    /// there to refresh — `false` is the caller's signal that this process's
+    /// judgement no longer owns a row, and that it has nothing left to sight.
+    pub async fn refresh_firing(&self, dedup_key: &str) -> anyhow::Result<bool> {
+        let touched = sqlx::query(
+            "UPDATE alerts SET last_seen_at = $2 \
+             WHERE dedup_key = $1 AND state = 'firing'",
+        )
+        .bind(dedup_key)
+        .bind(Utc::now())
+        .execute(&self.pool)
+        .await?;
+        Ok(touched.rows_affected() > 0)
     }
 
     /// Record that `by` has seen the firing alert under `dedup_key`, answering

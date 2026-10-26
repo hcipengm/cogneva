@@ -30,7 +30,7 @@ use cog_core::config_sections::{self, DocumentDelivery};
 use cog_core::{AlertEvent, AlertInstance, AlertState};
 use tracing::{info, warn};
 
-use crate::alert_store::{NewAlert, PostgresAlertStore};
+use crate::alert_store::{AlertRowStore, AlertTransition, NewAlert, PostgresAlertStore};
 use crate::alerts::AlertManager;
 
 /// Rule name for the delivery self-alert. Kept out of the configured rule set:
@@ -97,6 +97,22 @@ pub fn needs_the_hold(later: &DocumentDelivery) -> bool {
     matches!(later, DocumentDelivery::Differs(_))
 }
 
+/// How often a row this check left firing says so again.
+///
+/// The verdict is a fact about this process — the document it started with is
+/// not the one its revision declares — and it stays true until the process ends,
+/// so the judgement is made once. `last_seen_at` asks a different question,
+/// though: not "is this still true" but "is anything still holding this row
+/// up". A verdict decided once gives it no second answer, and after the sighting
+/// window (15 minutes) the row reads exactly like one whose producer died.
+/// Measured 2026-10-27: this row had been firing for 67 minutes with
+/// `CognevaAlertUnsighted` pointing straight at it, and the writer was alive the
+/// whole time.
+///
+/// A third of the sighting window, so a miss or two of the tick is not what
+/// decides whether the row reads as maintained.
+const REASSERT_PERIOD: Duration = Duration::from_secs(300);
+
 /// Read the document, wait out the settle window, read it again, and act.
 ///
 /// The hold is taken only when the second read still differs, and the verdict is
@@ -104,12 +120,16 @@ pub fn needs_the_hold(later: &DocumentDelivery) -> bool {
 /// was replaced during the hold is gone, so this task dies with it and writes
 /// nothing; a process that outlived its own replacement is the stuck one this
 /// check exists to report.
+///
+/// A verdict that leaves the row firing does not end here: `keep_the_row_sighted`
+/// below says why the writer keeps speaking and what it is allowed to touch.
 pub async fn run_config_declaration_check(
     settle: Duration,
     hold: Duration,
     store: Option<Arc<PostgresAlertStore>>,
     notifier: Option<Arc<AlertManager>>,
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    stop: cog_core::ShutdownSignal,
 ) {
     let path = crate::config::config_path();
     let source = path.display().to_string();
@@ -128,23 +148,84 @@ pub async fn run_config_declaration_check(
     } else {
         (decide(&first, &later, &source), later)
     };
-    act(action, store, notifier, metrics, &source, &seen).await
+    let store = store.map(|s| s as Arc<dyn AlertRowStore>);
+    let firing = act(action, &store, notifier, metrics, &source, &seen).await;
+    if firing {
+        keep_the_row_sighted(store, row_dedup_key(&source), REASSERT_PERIOD, stop).await;
+    }
+}
+
+/// Keep saying the same true thing, until the row is closed or the process ends.
+///
+/// Only the liveness clock moves: the verdict is not re-decided and the payload
+/// is not rewritten, because neither can have changed while this process runs.
+/// The row, however, is keyed by the document rather than by the process, so
+/// another one can close it — a pod that starts on the corrected document
+/// resolves it, and this loop must then let it stay closed instead of re-opening
+/// a row the rollout just fixed.
+///
+/// Exits are silent on purpose: the reading this loop exists to feed,
+/// `cogneva_alert_sighting_*`, is also its watchdog. If the loop stops while the
+/// row is still open, the row stops being refreshed and the sighting judgement
+/// names it within the window — the failure mode reports itself.
+async fn keep_the_row_sighted(
+    store: Option<Arc<dyn AlertRowStore>>,
+    dedup_key: String,
+    period: Duration,
+    stop: cog_core::ShutdownSignal,
+) {
+    let Some(store) = store else { return };
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    loop {
+        tokio::select! {
+            biased;
+            _ = stop.wait() => return,
+            _ = ticker.tick() => match store.refresh_firing(&dedup_key).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    // 行已经不在了：另一个进程按同一把键把它关掉了，而这一份判词
+                    // 说的那件事只对本进程成立。再写就是把它重新点亮。
+                    info!(
+                        dedup_key = %dedup_key,
+                        "the configuration declaration row was closed elsewhere; this process \
+                         no longer holds it open"
+                    );
+                    return;
+                }
+                Err(e) => warn!(
+                    dedup_key = %dedup_key,
+                    error = %e,
+                    "could not move the configuration declaration row's sighting clock; the row \
+                     will read as unmaintained if this keeps failing"
+                ),
+            },
+        }
+    }
+}
+
+/// The row this check owns, by identity rather than by rule: the document path
+/// is what tells one deployment's document from another's.
+fn row_dedup_key(source: &str) -> String {
+    format!("{CONFIG_DECLARATION_RULE}:{source}")
 }
 
 /// Carry out a verdict: raise or close the row, or leave it alone and say why.
+///
+/// Answers whether the row is left firing, which is what decides whether this
+/// writer has anything left to sight.
 async fn act(
     action: DeliveryAction,
-    store: Option<Arc<PostgresAlertStore>>,
+    store: &Option<Arc<dyn AlertRowStore>>,
     notifier: Option<Arc<AlertManager>>,
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     source: &str,
     seen: &DocumentDelivery,
-) {
+) -> bool {
     match action {
         DeliveryAction::Fire(message) => {
             warn!(source = %source, "{}", message);
             set_row(
-                &store,
+                store,
                 &notifier,
                 metrics.as_ref(),
                 CONFIG_DECLARATION_RULE,
@@ -153,6 +234,7 @@ async fn act(
                 &message,
             )
             .await;
+            true
         }
         DeliveryAction::Resolve => {
             info!(
@@ -161,7 +243,7 @@ async fn act(
                 config_sections::describe_delivery(source, seen)
             );
             set_row(
-                &store,
+                store,
                 &notifier,
                 metrics.as_ref(),
                 CONFIG_DECLARATION_RULE,
@@ -170,9 +252,11 @@ async fn act(
                 "",
             )
             .await;
+            false
         }
         DeliveryAction::Silent(reason) => {
             info!(source = %source, "config declaration check concluded nothing: {reason}");
+            false
         }
     }
 }
@@ -372,6 +456,9 @@ pub async fn check_loaded_rule_set(
             return;
         }
     };
+    let store = store
+        .as_ref()
+        .map(|s| Arc::clone(s) as Arc<dyn AlertRowStore>);
     let was_firing = watch.firing;
     let verdict = judge_loaded_rule_set(loaded, document.as_deref());
     record_rule_counts(metrics, &verdict, loaded.len()).await;
@@ -379,7 +466,7 @@ pub async fn check_loaded_rule_set(
         RuleSetAction::Fire(message) => {
             warn!(source = %source, "{}", message);
             set_row(
-                store,
+                &store,
                 notifier,
                 metrics,
                 RULES_NOT_LOADED_RULE,
@@ -394,7 +481,7 @@ pub async fn check_loaded_rule_set(
                 info!(source = %source, "the loaded rule set matches the document again");
             }
             set_row(
-                store,
+                &store,
                 notifier,
                 metrics,
                 RULES_NOT_LOADED_RULE,
@@ -508,7 +595,7 @@ fn row_labels(source: &str) -> serde_json::Value {
 /// multiply one fact by the number of replicas and let them resolve each
 /// other's rows.
 async fn set_row(
-    store: &Option<Arc<PostgresAlertStore>>,
+    store: &Option<Arc<dyn AlertRowStore>>,
     notifier: &Option<Arc<AlertManager>>,
     metrics: Option<&Arc<dyn cog_core::MetricsBackend>>,
     rule: &str,
@@ -521,40 +608,42 @@ async fn set_row(
     };
     let alert = NewAlert {
         rule: rule.to_string(),
-        dedup_key: format!("{rule}:{source}"),
+        dedup_key: row_dedup_key(source),
         severity: if firing { "warning" } else { "info" }.to_string(),
         message: message.to_string(),
         labels: row_labels(source),
     };
     match store.set_alert(firing, &alert).await {
-        Ok(_) => {
-            // Only the firing edge interrupts anyone: a row closing is visible
-            // on the surface people already read.
-            if firing {
-                let now = Utc::now();
-                let labels = HashMap::from([
-                    ("source".to_string(), source.to_string()),
-                    ("message".to_string(), message.to_string()),
-                ]);
-                let events = [AlertEvent::Firing(AlertInstance {
-                    rule_name: rule.to_string(),
-                    labels,
-                    state: AlertState::Firing,
-                    severity: cog_core::AlertSeverity::Warning,
-                    value: 1.0,
-                    starts_at: now,
-                    ends_at: None,
-                    updated_at: now,
-                })];
-                match notifier.as_ref() {
-                    Some(notifier) => notifier.notify(&events).await,
-                    // The row above was written, and that row is what the
-                    // in-app alert surface reads: no external outlet is not the
-                    // same as nobody being able to see it.
-                    None => crate::alerts::record_delivered_in_app(metrics, 1).await,
-                }
+        // Only the firing edge interrupts anyone: a row closing is visible on
+        // the surface people already read, and a row that was already firing is
+        // the same condition being re-asserted -- the store moved its sighting
+        // clock and nothing else. `set_alert` exists to hand back this edge so
+        // that a periodic writer does not page on every tick.
+        Ok(AlertTransition::Fired) => {
+            let now = Utc::now();
+            let labels = HashMap::from([
+                ("source".to_string(), source.to_string()),
+                ("message".to_string(), message.to_string()),
+            ]);
+            let events = [AlertEvent::Firing(AlertInstance {
+                rule_name: rule.to_string(),
+                labels,
+                state: AlertState::Firing,
+                severity: cog_core::AlertSeverity::Warning,
+                value: 1.0,
+                starts_at: now,
+                ends_at: None,
+                updated_at: now,
+            })];
+            match notifier.as_ref() {
+                Some(notifier) => notifier.notify(&events).await,
+                // The row above was written, and that row is what the in-app
+                // alert surface reads: no external outlet is not the same as
+                // nobody being able to see it.
+                None => crate::alerts::record_delivered_in_app(metrics, 1).await,
             }
         }
+        Ok(AlertTransition::Resolved | AlertTransition::NoChange) => {}
         Err(e) => warn!(source = %source, error = %e, "config declaration alert persist failed"),
     }
 }
@@ -1142,6 +1231,154 @@ mod tests {
                 ("document_readable".to_string(), 0.0),
                 ("agrees".to_string(), 0.0),
             ]
+        );
+    }
+
+    // ─── 说一次不够：这一行的生命期比判词长 ────────────────────────────
+    //
+    // `last_seen_at` 问的是「还有没有写者在维持这一行」，而不是「这件事还成不
+    // 成立」。对一条关于「本进程启动时读到的是哪份文档」的判词，后一个问题的
+    // 答案到进程结束都不会变，所以判据只做一次——可前一个问题因此永远没有答案。
+    // 实测 2026-10-27：这一行开出 67 分钟，`CognevaAlertUnsighted`（十五分钟没有
+    // 写者报告过条件仍成立）点名的就是它，而写者一直活着。那不是孤儿行，是把
+    // 一次性的判词喂给了按节拍要读数的判据。
+
+    /// 只数复述、不许改写：判词落成之后这一支只推进存活钟，重写就是重新点亮一行
+    /// 别人已经关掉的告警。
+    #[derive(Default)]
+    struct SightingStore {
+        refreshes: std::sync::atomic::AtomicUsize,
+        firing: std::sync::atomic::AtomicBool,
+    }
+
+    impl SightingStore {
+        fn open() -> Arc<Self> {
+            let store = Self::default();
+            store
+                .firing
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Arc::new(store)
+        }
+
+        fn refreshes(&self) -> usize {
+            self.refreshes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AlertRowStore for SightingStore {
+        async fn set_alert(
+            &self,
+            _condition: bool,
+            _alert: &NewAlert,
+        ) -> anyhow::Result<AlertTransition> {
+            panic!("复述只推进存活钟；重新写一次判词会把别人关掉的行点亮")
+        }
+
+        async fn resolve_unrefreshed(
+            &self,
+            _rule: &str,
+            _stale_before: chrono::DateTime<Utc>,
+        ) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+
+        async fn refresh_firing(&self, _dedup_key: &str) -> anyhow::Result<bool> {
+            self.refreshes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.firing.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    /// 一行开着，就一直说下去：十五分钟的窗口里要有好几次，而不是一次。
+    #[tokio::test]
+    async fn a_row_left_firing_keeps_being_sighted() {
+        let store = SightingStore::open();
+        let stop = cog_core::ShutdownSignal::new();
+        let task = tokio::spawn(keep_the_row_sighted(
+            Some(store.clone() as Arc<dyn AlertRowStore>),
+            row_dedup_key(SOURCE),
+            Duration::from_millis(5),
+            stop.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            store.refreshes() >= 3,
+            "复述没有按节拍发生：{} 次",
+            store.refreshes()
+        );
+
+        stop.trigger();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("停机之后这一支要停")
+            .unwrap();
+    }
+
+    /// 行被别人关掉之后不许再点亮：新版本的进程按同一把键关掉它是修复，而复述
+    /// 用的是旧判词——它说的那件事只对旧进程成立。这条测试同时钉住「退出」：
+    /// 没有行可维持时这一支自己结束，不是空转。
+    #[tokio::test]
+    async fn a_row_closed_elsewhere_stops_being_sighted() {
+        let store = SightingStore::open();
+        let stop = cog_core::ShutdownSignal::new();
+        let task = tokio::spawn(keep_the_row_sighted(
+            Some(store.clone() as Arc<dyn AlertRowStore>),
+            row_dedup_key(SOURCE),
+            Duration::from_millis(5),
+            stop.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        store
+            .firing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("行关掉之后这一支要自己结束")
+            .unwrap();
+        let after = store.refreshes();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(store.refreshes(), after, "行已经关了，还在复述");
+    }
+
+    /// 只有落成 firing 的判词才欠一个节拍。关行与「什么也不说」都不该留下一支
+    /// 空转的复述：`Silent` 恰恰是「这件事不该报警」的那一档。
+    #[tokio::test]
+    async fn only_a_firing_verdict_keeps_speaking() {
+        let no_store: Option<Arc<dyn AlertRowStore>> = None;
+        assert!(
+            act(
+                DeliveryAction::Fire("x".into()),
+                &no_store,
+                None,
+                None,
+                SOURCE,
+                &DocumentDelivery::Matches
+            )
+            .await,
+            "firing 的判词要接着复述"
+        );
+        assert!(
+            !act(
+                DeliveryAction::Silent("nothing to say".into()),
+                &no_store,
+                None,
+                None,
+                SOURCE,
+                &DocumentDelivery::Matches
+            )
+            .await
+        );
+        assert!(
+            !act(
+                DeliveryAction::Resolve,
+                &no_store,
+                None,
+                None,
+                SOURCE,
+                &DocumentDelivery::Matches
+            )
+            .await
         );
     }
 }
