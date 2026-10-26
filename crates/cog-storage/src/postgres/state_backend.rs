@@ -1554,9 +1554,10 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
         let row: (i64,) = sqlx::query_as(
             r#"
             SELECT COUNT(*) FROM cog_evolution_promotions
-            WHERE status = 'promoted' AND updated_at >= $1
+            WHERE status = $1 AND updated_at >= $2
             "#,
         )
+        .bind(cog_core::PromotionStatus::Promoted.as_str())
         .bind(since)
         .fetch_one(&self.pool)
         .await
@@ -1592,12 +1593,13 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
             SELECT id, change_id, level, gate_kind, decision_reason, cluster, status,
                    outcome, eval_summary, created_at, updated_at
             FROM cog_evolution_promotions
-            WHERE cluster = $1 AND status = 'awaiting_approval'
+            WHERE cluster = $1 AND status = $2
             ORDER BY updated_at ASC
-            LIMIT $2
+            LIMIT $3
             "#,
         )
         .bind(cluster)
+        .bind(cog_core::PromotionStatus::AwaitingApproval.as_str())
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await

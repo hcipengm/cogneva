@@ -77,6 +77,20 @@ fn parses_as_user_type(word: &str) -> bool {
         .any(|tier| tier.as_str() == word)
 }
 
+fn parses_as_backup_outcome(word: &str) -> bool {
+    cog_core::BackupOutcome::parse(word).is_some()
+}
+
+fn parses_as_promotion_status(word: &str) -> bool {
+    cog_core::PromotionStatus::parse(word).is_some()
+}
+
+fn parses_as_notification_type(word: &str) -> bool {
+    cog_core::NotificationType::ALL
+        .iter()
+        .any(|kind| kind.as_str() == word)
+}
+
 fn parses_as_alert_state(word: &str) -> bool {
     cog_core::AlertState::parse(word).is_some()
 }
@@ -146,6 +160,32 @@ const VOCABULARIES: &[Vocabulary] = &[
         subjects: &["check_kind"],
         parses: parses_as_principle_check_kind,
         home: "cog_core::PrincipleCheckKind",
+        except_in: &[],
+    },
+    Vocabulary {
+        // The backup account is read by counting this column's values, so a
+        // stale word makes one count read zero: "no run ever ended that way".
+        subjects: &["outcome"],
+        parses: parses_as_backup_outcome,
+        home: "cog_core::BackupOutcome",
+        except_in: &[],
+    },
+    Vocabulary {
+        // A third set under the `status` column name. `pending` and `failed`
+        // belong to both this one and `TaskStatus`; neither is spelled in a
+        // query today, and if one comes back the hit is a real one either way.
+        subjects: &["status"],
+        parses: parses_as_promotion_status,
+        home: "cog_core::PromotionStatus",
+        except_in: &[],
+    },
+    Vocabulary {
+        // The closed set the table's own constraint lists. A constraint that
+        // drifts from the enum refuses the writer's rows on the first
+        // notification after a rename.
+        subjects: &["ntype"],
+        parses: parses_as_notification_type,
+        home: "cog_core::NotificationType",
         except_in: &[],
     },
     Vocabulary {
@@ -542,6 +582,17 @@ fn each_vocabulary_reads_its_own_declaration() {
         assert!(parses_as_alert_state(state.as_str()));
     }
     assert!(!parses_as_alert_state("landed"));
+    for outcome in cog_core::BackupOutcome::ALL {
+        assert!(parses_as_backup_outcome(outcome.as_str()));
+    }
+    for status in cog_core::PromotionStatus::ALL {
+        assert!(parses_as_promotion_status(status.as_str()));
+    }
+    for kind in cog_core::NotificationType::ALL {
+        assert!(parses_as_notification_type(kind.as_str()));
+    }
+    assert!(!parses_as_backup_outcome("firing"));
+    assert!(!parses_as_notification_type("promoted"));
     // A word from another set is not this set's: the judge has to be a set, not
     // a shape.
     assert!(!parses_as_user_status("pending"));

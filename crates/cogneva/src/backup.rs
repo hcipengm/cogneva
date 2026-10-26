@@ -4548,9 +4548,13 @@ async fn restore_and_compare(
     // 账表的逐格比对：只在**装回来之后就是终局**的行上比。包是在它自己那一行
     // 还开着的时候打出来的，那一行随后由运行自己收尾——拿它去比，比到的是
     // 「备份之后发生的事」，不是恢复对不对。
+    // 终局的两个结局由枚举自己定：拼在 SQL 里的副本改了名不会报错，只会让这份
+    // 逐格比对读到零行——零行比零行，比完是「一致」。
     let terminal_ids: Vec<String> = sqlx::query_scalar(
-        "SELECT run_id FROM backup_runs WHERE outcome IN ('ok', 'failed') ORDER BY run_id",
+        "SELECT run_id FROM backup_runs WHERE outcome IN ($1, $2) ORDER BY run_id",
     )
+    .bind(cog_core::BackupOutcome::Ok.as_str())
+    .bind(cog_core::BackupOutcome::Failed.as_str())
     .fetch_all(&scratch)
     .await?;
     let restored_digest: String = sqlx::query_scalar(RUNS_DIGEST_SQL)

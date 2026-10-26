@@ -24,6 +24,19 @@ pub enum NotificationType {
 }
 
 impl NotificationType {
+    /// Every kind, for the schema that has to name the set.
+    ///
+    /// The table's `ntype` column is closed over these values, and the store
+    /// writes the column's own constraint. A constraint listing words this enum
+    /// no longer produces is still a valid table -- it refuses the rows the
+    /// writer sends, on the first notification after a rename.
+    pub const ALL: [NotificationType; 4] = [
+        NotificationType::TaskCompleted,
+        NotificationType::QuotaWarning,
+        NotificationType::Mention,
+        NotificationType::System,
+    ];
+
     /// Canonical storage representation (matches the `notifications.ntype` column).
     pub fn as_str(self) -> &'static str {
         match self {

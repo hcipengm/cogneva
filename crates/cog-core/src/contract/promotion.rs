@@ -115,6 +115,20 @@ pub enum PromotionStatus {
 }
 
 impl PromotionStatus {
+    /// Every status, for readers that have to enumerate the set.
+    ///
+    /// The promotion table's `status` column holds this set and the readings
+    /// count it by value. A query that spells one of them agrees with this
+    /// enum only until a variant is renamed, and then the count reads zero --
+    /// which is what "nothing was ever promoted" looks like.
+    pub const ALL: [PromotionStatus; 5] = [
+        PromotionStatus::Pending,
+        PromotionStatus::Promoted,
+        PromotionStatus::RolledBack,
+        PromotionStatus::Failed,
+        PromotionStatus::AwaitingApproval,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             PromotionStatus::Pending => "pending",

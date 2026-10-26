@@ -178,7 +178,7 @@ fn the_table_requires_only_columns_the_contract_can_supply() {
 fn the_store_creates_the_table_the_migration_describes() {
     let migration = columns();
     let store = column_definitions(
-        cog_storage::postgres::notification_store::CREATE_TABLE_SQL,
+        &cog_storage::postgres::notification_store::create_table_sql(),
         "the notification store's own DDL",
     );
 

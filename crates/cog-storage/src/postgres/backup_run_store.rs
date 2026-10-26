@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use cog_core::{
-    BackupAccountReading, BackupDrillRecord, BackupPackageRecord, BackupRunClosing,
+    BackupAccountReading, BackupDrillRecord, BackupOutcome, BackupPackageRecord, BackupRunClosing,
     BackupRunOpening, BackupRunStore, SFError, SFResult,
 };
 
@@ -40,6 +40,20 @@ impl PostgresBackupRunStore {
     }
 }
 
+/// Resolve the `{outcome:...}` slots a statement names from [`BackupOutcome`].
+///
+/// The run table's `outcome` column holds this set, and the account is read by
+/// counting its values. A statement that spells one of them agrees with the
+/// enum only until a variant is renamed -- and then the count it feeds reads
+/// zero, which is what "no run ever ended that way" looks like.
+fn fill_outcomes(template: &str) -> String {
+    let mut slots: Vec<(&str, &str)> = Vec::new();
+    for outcome in BackupOutcome::ALL {
+        slots.push(("outcome", outcome.as_str()));
+    }
+    super::fill_slots(template, &slots)
+}
+
 /// Open a run. The conflict clause writes nothing, so the statement's own row
 /// count is the answer to "was this row newly written" rather than a second
 /// query that could race with it.
@@ -49,7 +63,7 @@ impl PostgresBackupRunStore {
 /// a start instant that has already been recorded and read.
 const OPEN_RUN_SQL: &str = "\
 INSERT INTO backup_runs (run_id, started_at, outcome, keep_target, run_deadline_seconds) \
-VALUES ($1, $2, 'running', $3, $4) \
+VALUES ($1, $2, '{outcome:running}', $3, $4) \
 ON CONFLICT (run_id) DO NOTHING";
 
 /// Close a run, and only if it is still open. The guard makes the statement a
@@ -60,7 +74,7 @@ const CLOSE_RUN_SQL: &str = "\
 UPDATE backup_runs \
 SET outcome = $2, finished_at = $3, package = $4, bytes = $5, package_checksum = $6, \
     package_coverage = $7, kept_after = $8, oldest_kept_at = $9, error = $10 \
-WHERE run_id = $1 AND outcome = 'running'";
+WHERE run_id = $1 AND outcome = '{outcome:running}'";
 
 /// Conclude every run that has outlived the deadline it was opened under.
 ///
@@ -77,9 +91,9 @@ WHERE run_id = $1 AND outcome = 'running'";
 /// read without knowing the configuration in force that day.
 const ABANDON_OVERDUE_SQL: &str = "\
 UPDATE backup_runs \
-SET outcome = 'abandoned', \
+SET outcome = '{outcome:abandoned}', \
     error = format('%s (the deadline it was opened under is %s s)', $1, run_deadline_seconds) \
-WHERE outcome = 'running' \
+WHERE outcome = '{outcome:running}' \
   AND started_at + make_interval(secs => run_deadline_seconds) <= $2";
 
 /// The whole account in one look.
@@ -107,10 +121,10 @@ WITH snapshot AS MATERIALIZED ( \
     FROM backup_runs \
 ) \
 SELECT \
-    (SELECT count(*) FROM snapshot WHERE outcome = 'running')        AS running, \
-    (SELECT count(*) FROM snapshot WHERE outcome = 'ok')             AS ok_count, \
-    (SELECT count(*) FROM snapshot WHERE outcome = 'failed')         AS failed, \
-    (SELECT count(*) FROM snapshot WHERE outcome = 'abandoned')      AS abandoned, \
+    (SELECT count(*) FROM snapshot WHERE outcome = '{outcome:running}')        AS running, \
+    (SELECT count(*) FROM snapshot WHERE outcome = '{outcome:ok}')             AS ok_count, \
+    (SELECT count(*) FROM snapshot WHERE outcome = '{outcome:failed}')         AS failed, \
+    (SELECT count(*) FROM snapshot WHERE outcome = '{outcome:abandoned}')      AS abandoned, \
     (SELECT max(finished_at) FROM snapshot)                          AS latest_finish_at, \
     open.started_at            AS open_started_at, \
     open.run_deadline_seconds  AS open_run_deadline_seconds, \
@@ -125,10 +139,10 @@ SELECT \
     newest.oldest_kept_at  AS package_oldest_kept_at \
 FROM (SELECT 1) AS one \
 LEFT JOIN LATERAL ( \
-    SELECT * FROM snapshot WHERE outcome = 'running' ORDER BY started_at LIMIT 1 \
+    SELECT * FROM snapshot WHERE outcome = '{outcome:running}' ORDER BY started_at LIMIT 1 \
 ) AS open ON TRUE \
 LEFT JOIN LATERAL ( \
-    SELECT * FROM snapshot WHERE outcome = 'ok' ORDER BY started_at DESC LIMIT 1 \
+    SELECT * FROM snapshot WHERE outcome = '{outcome:ok}' ORDER BY started_at DESC LIMIT 1 \
 ) AS newest ON TRUE";
 
 /// How many packages in the retention window have no successful drill.
@@ -150,7 +164,7 @@ LEFT JOIN LATERAL ( \
 const UNPROVEN_PACKAGES_SQL: &str = "\
 WITH kept AS ( \
     SELECT package FROM backup_runs \
-    WHERE outcome = 'ok' AND package IS NOT NULL \
+    WHERE outcome = '{outcome:ok}' AND package IS NOT NULL \
     ORDER BY started_at DESC \
     LIMIT coalesce((SELECT keep_target FROM backup_runs ORDER BY started_at DESC LIMIT 1), 0) \
 ), latest AS ( \
@@ -216,7 +230,7 @@ impl BackupRunStore for PostgresBackupRunStore {
                     .into(),
             ));
         }
-        let outcome = sqlx::query(OPEN_RUN_SQL)
+        let outcome = sqlx::query(&fill_outcomes(OPEN_RUN_SQL))
             .bind(&opening.run_id)
             .bind(opening.started_at)
             .bind(opening.keep_target)
@@ -235,7 +249,7 @@ impl BackupRunStore for PostgresBackupRunStore {
                 closing.outcome.as_str()
             )));
         }
-        let outcome = sqlx::query(CLOSE_RUN_SQL)
+        let outcome = sqlx::query(&fill_outcomes(CLOSE_RUN_SQL))
             .bind(run_id)
             .bind(closing.outcome.as_str())
             .bind(closing.finished_at)
@@ -253,7 +267,7 @@ impl BackupRunStore for PostgresBackupRunStore {
     }
 
     async fn abandon_overdue(&self, now: DateTime<Utc>) -> SFResult<u64> {
-        let outcome = sqlx::query(ABANDON_OVERDUE_SQL)
+        let outcome = sqlx::query(&fill_outcomes(ABANDON_OVERDUE_SQL))
             .bind(
                 "the run never reported and its deadline has passed, so the account concludes it \
                  here: the process that opened this row was killed or wedged and cannot close it",
@@ -266,7 +280,7 @@ impl BackupRunStore for PostgresBackupRunStore {
     }
 
     async fn read_account(&self) -> SFResult<BackupAccountReading> {
-        let row = sqlx::query(READ_ACCOUNT_SQL)
+        let row = sqlx::query(&fill_outcomes(READ_ACCOUNT_SQL))
             .fetch_one(&self.pool)
             .await
             .map_err(|e| SFError::Database(format!("read the backup account: {e}")))?;
@@ -346,10 +360,13 @@ impl BackupRunStore for PostgresBackupRunStore {
         // same as one no drill ever opened -- both leave the package unproven,
         // and the difference between them is the drill's own row, not this
         // count.
-        let drill_unproven_packages: i64 = sqlx::query_scalar(UNPROVEN_PACKAGES_SQL)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| SFError::Database(format!("count the window's unproven packages: {e}")))?;
+        let drill_unproven_packages: i64 =
+            sqlx::query_scalar(&fill_outcomes(UNPROVEN_PACKAGES_SQL))
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| {
+                    SFError::Database(format!("count the window's unproven packages: {e}"))
+                })?;
 
         Ok(BackupAccountReading {
             running: row
@@ -545,5 +562,44 @@ impl BackupRunStore for PostgresBackupRunStore {
                 .try_get("error")
                 .map_err(|e| SFError::Database(format!("drill error: {e}")))?,
         }))
+    }
+}
+
+#[cfg(test)]
+mod templates {
+    use super::*;
+
+    /// Every statement built from a template, so a new one is added here rather
+    /// than skipped: an unfilled slot is a statement the database refuses at
+    /// the moment a run opens or a reading is taken.
+    const TEMPLATES: &[(&str, &str)] = &[
+        ("OPEN_RUN", OPEN_RUN_SQL),
+        ("CLOSE_RUN", CLOSE_RUN_SQL),
+        ("ABANDON_OVERDUE", ABANDON_OVERDUE_SQL),
+        ("READ_ACCOUNT", READ_ACCOUNT_SQL),
+        ("UNPROVEN_PACKAGES", UNPROVEN_PACKAGES_SQL),
+    ];
+
+    #[test]
+    fn every_template_renders_without_a_slot_left_behind() {
+        for (name, template) in TEMPLATES {
+            let sql = fill_outcomes(template);
+            assert!(!sql.contains('{'), "{name} 还有没填的槽：{sql}");
+        }
+    }
+
+    /// The account counts one column per outcome, and each count has to be the
+    /// word the enum declares -- a renamed variant would leave that count at
+    /// zero, which reads as "no run ever ended that way".
+    #[test]
+    fn the_account_counts_each_outcome_by_its_declared_word() {
+        let sql = fill_outcomes(READ_ACCOUNT_SQL);
+        for outcome in BackupOutcome::ALL {
+            assert!(
+                sql.contains(&format!("outcome = '{}'", outcome.as_str())),
+                "账户里没有 {} 这一格：{sql}",
+                outcome.as_str()
+            );
+        }
     }
 }

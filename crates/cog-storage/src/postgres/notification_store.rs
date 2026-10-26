@@ -24,11 +24,11 @@ use cog_core::{
 /// every start. That leaves one shape written twice, so
 /// `notification_contract_matches_its_schema` reads both this constant and the
 /// migration file and asserts they still describe the same columns.
-pub const CREATE_TABLE_SQL: &str = r#"
+const CREATE_TABLE_SQL_TEMPLATE: &str = r#"
 CREATE TABLE IF NOT EXISTS notifications (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    ntype VARCHAR(32) NOT NULL CHECK (ntype IN ('task_completed', 'quota_warning', 'mention', 'system')),
+    ntype VARCHAR(32) NOT NULL CHECK (ntype IN ('{ntype:task_completed}', '{ntype:quota_warning}', '{ntype:mention}', '{ntype:system}')),
     title VARCHAR(256) NOT NULL,
     body TEXT,
     data JSONB NOT NULL DEFAULT '{}',
@@ -36,6 +36,21 @@ CREATE TABLE IF NOT EXISTS notifications (
     read_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )"#;
+
+/// The table statement, with the closed set of kinds filled from
+/// [`NotificationType`].
+///
+/// The constraint and the enum are two spellings of one set, and a table whose
+/// constraint no longer matches what the writer sends refuses the write rather
+/// than mis-filing it -- the failure lands on the first notification after a
+/// rename, which is a person's message going missing.
+pub fn create_table_sql() -> String {
+    let mut slots: Vec<(&str, &str)> = Vec::new();
+    for ntype in NotificationType::ALL {
+        slots.push(("ntype", ntype.as_str()));
+    }
+    super::fill_slots(CREATE_TABLE_SQL_TEMPLATE, &slots)
+}
 
 /// Indexes for the two queries this store runs: one user's list, newest first,
 /// and that user's unread count.
@@ -110,7 +125,7 @@ impl PostgresNotificationStore {
     /// Statements run one at a time: the driver prepares each, and a prepared
     /// statement is one statement.
     pub async fn init_schema(&self) -> SFResult<()> {
-        sqlx::query(CREATE_TABLE_SQL)
+        sqlx::query(&create_table_sql())
             .execute(&self.pool)
             .await
             .map_err(to_sf)?;

@@ -28,7 +28,7 @@ pub fn statements() -> Vec<String> {
     let mut statements = vec![
         // The user tables first: two later tables carry foreign keys onto them.
         cog_storage::postgres::user_store::ddl(),
-        cog_storage::postgres::notification_store::CREATE_TABLE_SQL.to_string(),
+        cog_storage::postgres::notification_store::create_table_sql(),
         cog_storage::postgres::snapshot_store::DDL.to_string(),
         cog_storage::postgres::hook_archive::DDL.to_string(),
         cog_storage::postgres::audit_recorder::DDL.to_string(),
