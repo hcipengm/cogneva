@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   getProjectBoard,
   getProjectEvm,
@@ -14,6 +14,13 @@ import {
   type TaskRow,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import {
+  changedSinceSnapshot,
+  projectRevision,
+  rowsForProject,
+  type LiveTaskRow,
+} from '@/store/liveProjects';
+import { useLiveProjectStore } from '@/store/liveProjectStore';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -170,6 +177,76 @@ function Provenance({ source }: { source: ReadingSource | null }) {
 }
 
 /**
+ * 这一面跟着事件流走的那一半。
+ *
+ * 四个视图都是定时重读的快照，而 `task_status_change` 一直在总线上走。帧到了就
+ * 立刻重读这一面，让服务端按新状态把四张屏一起重算——帧是触发，不是真值：帧里
+ * 只有「这条任务现在是什么状态」，没有基线、没有预算，拿它去改服务端的数，两份
+ * 账就写成了一本。
+ *
+ * 定时轮询照旧留着当兜底：连接断了、帧丢了，读数仍然会靠它追上来，只是慢一拍。
+ *
+ * 返回的是「比手上这份快照更晚」的那几条，交给画面标出来。重读成功之后快照时刻
+ * 越过它们，这块自己就空了——所以它显示的永远是表里还没有的，不是表里也有、
+ * 这里再抄一遍。
+ */
+function useFrameFedFace(
+  project: ProjectRow,
+  snapshotAt: string | null,
+  refresh: () => void
+): LiveTaskRow[] {
+  const rows = useLiveProjectStore((s) => s.rows);
+  const owned = useLiveProjectStore((s) => s.owned);
+  const revision = useMemo(
+    () => projectRevision(project.id, owned, rows),
+    [project.id, owned, rows]
+  );
+  useEffect(() => {
+    if (!revision) return;
+    // 一批任务往往一起换状态（同一轮派发、同一批结束）。逐帧重读会把同一份字节
+    // 连取十几遍，而读者要的是它们都到了之后的那一份，所以合并成一次。
+    const timer = window.setTimeout(refresh, 600);
+    return () => window.clearTimeout(timer);
+  }, [revision, refresh]);
+  return useMemo(
+    () => changedSinceSnapshot(snapshotAt, rowsForProject(project.id, owned, rows)),
+    [snapshotAt, project.id, owned, rows]
+  );
+}
+
+/** 总线上比这一拍更晚的状态变化。表里不可能有这几条，所以单列出来并标来路。 */
+function FreshNodeChanges({ rows, what }: { rows: LiveTaskRow[]; what: string }) {
+  if (rows.length === 0) return null;
+  const shown = rows.slice(0, 8);
+  return (
+    <div className="border-b border-[var(--line)] px-4 py-2">
+      <div className="mb-1 text-[10px] text-[var(--muted)]">
+        总线上比这张{what}更晚，表里还读不到——正在重读这一面
+      </div>
+      {shown.map((r) => (
+        <div key={r.taskId} className="flex items-baseline gap-2 text-[11px]">
+          <span
+            className="mono w-40 shrink-0 truncate text-[var(--paper-dim)]"
+            title={r.taskId}
+          >
+            {r.taskId.slice(0, 20)}
+          </span>
+          <Status value={r.status} />
+          <span className="text-[10px] text-[var(--muted)]">
+            <Moment iso={r.lastAt} />
+          </span>
+        </div>
+      ))}
+      {rows.length > shown.length && (
+        <div className="text-[10px] text-[var(--muted)]">
+          还有 {rows.length - shown.length} 条
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
  * 范围：一条任务挂在谁下面。
  *
  * 树按 `parent_task_id` 现拼。父指针指向这一批里不存在的行时，那一行仍然画出来，
@@ -191,6 +268,16 @@ function ScopePanel({ project }: { project: ProjectRow }) {
   }, [graph.data, ungrouped]);
 
   const tree = useMemo(() => buildTree(nodes), [nodes]);
+
+  // 这一面是唯一知道「哪条任务归这个项目」的地方，其余三面据此判断一帧要不要
+  // 惊动自己。登记只增不删：归属不随状态变化而变。
+  const own = useLiveProjectStore((s) => s.own);
+  useEffect(() => {
+    if (nodes.length > 0) own(project.id, nodes.map((n) => n.id));
+  }, [own, project.id, nodes]);
+
+  const fresh = useFrameFedFace(project, graph.at, graph.refresh);
+  const live = useMemo(() => new Map(fresh.map((r) => [r.taskId, r])), [fresh]);
 
   if (graph.error) {
     return <ReadError what="范围树" error={graph.error} onRetry={graph.refresh} />;
@@ -225,6 +312,8 @@ function ScopePanel({ project }: { project: ProjectRow }) {
         </div>
       </Readings>
 
+      <FreshNodeChanges rows={fresh} what="范围树" />
+
       <div className="overflow-auto">
         {tree.flattened.map(({ node, depth, orphan }) => (
           <div
@@ -246,8 +335,11 @@ function ScopePanel({ project }: { project: ProjectRow }) {
               <span className="mono text-[10px] text-[var(--muted)]">占位</span>
             )}
             <span className="w-24 shrink-0 text-right">
-              <Status value={node.status} />
+              <Status value={live.get(node.id)?.status ?? node.status} />
             </span>
+            {live.has(node.id) && (
+              <span className="mono w-12 shrink-0 text-[10px] text-[var(--brass)]">刚变</span>
+            )}
           </div>
         ))}
       </div>
@@ -322,6 +414,7 @@ function titleOf(t: TaskRow): string {
 /** 看板：六个状态各堆了多少，以及每一列的上限拦没拦住新活。 */
 function BoardPanel({ project }: { project: ProjectRow }) {
   const board = useResource(`看板（${project.id}）`, () => getProjectBoard(project.id), 15_000);
+  const fresh = useFrameFedFace(project, board.at, board.refresh);
 
   if (board.error) {
     return <ReadError what="看板" error={board.error} onRetry={board.refresh} />;
@@ -342,6 +435,7 @@ function BoardPanel({ project }: { project: ProjectRow }) {
         </div>
       </Readings>
       <Provenance source={data.source} />
+      <FreshNodeChanges rows={fresh} what="看板" />
       <div className="grid grid-cols-6 gap-px border-b border-[var(--line)] p-2">
         {data.columns.map((c) => (
           <div key={c.status} className="border border-[var(--line)] p-2">
@@ -373,6 +467,8 @@ const GANTT_LIMIT = 200;
 /** 甘特：计划与实际情况各画一条；缺计划基线的那一行留空，不画成零长度。 */
 function GanttPanel({ project }: { project: ProjectRow }) {
   const gantt = useResource(`甘特（${project.id}）`, () => getProjectGantt(project.id), 15_000);
+  const fresh = useFrameFedFace(project, gantt.at, gantt.refresh);
+  const live = useMemo(() => new Map(fresh.map((r) => [r.taskId, r])), [fresh]);
 
   if (gantt.error) {
     return <ReadError what="甘特" error={gantt.error} onRetry={gantt.refresh} />;
@@ -408,6 +504,7 @@ function GanttPanel({ project }: { project: ProjectRow }) {
         </div>
       </Readings>
       <Provenance source={data.source} />
+      <FreshNodeChanges rows={fresh} what="甘特" />
 
       {data.plan_error && (
         <div className="border-b border-[var(--line)] px-4 py-2 text-[11px] text-[var(--warn)]">
@@ -432,7 +529,7 @@ function GanttPanel({ project }: { project: ProjectRow }) {
 
       <div className="px-4 py-2">
         {drawn.map((r) => (
-          <GanttBar key={r.id} row={r} span={span} />
+          <GanttBar key={r.id} row={r} span={span} live={live.get(r.id)?.status} />
         ))}
       </div>
 
@@ -485,7 +582,19 @@ function barSpan(
   };
 }
 
-function GanttBar({ row, span }: { row: GanttRow; span: { start: number; end: number } | null }) {
+/**
+ * 一行甘特。`live` 是总线上比这份快照更晚的那个状态：有它就显示它并标「刚变」，
+ * 条形仍按快照的时刻画——帧里没有时刻线，拿它去改条长就是编一根没发生过的条。
+ */
+function GanttBar({
+  row,
+  span,
+  live,
+}: {
+  row: GanttRow;
+  span: { start: number; end: number } | null;
+  live?: string;
+}) {
   const actual = barSpan(row.created_at, row.updated_at, span);
   const planned = barSpan(row.planned_start, row.planned_end, span);
 
@@ -522,8 +631,11 @@ function GanttBar({ row, span }: { row: GanttRow; span: { start: number; end: nu
         </div>
       </div>
       <span className="w-20 shrink-0 text-right">
-        <Status value={row.status} />
+        <Status value={live ?? row.status} />
       </span>
+      {live !== undefined && live !== row.status && (
+        <span className="mono w-10 shrink-0 text-[10px] text-[var(--brass)]">刚变</span>
+      )}
       <span className="mono w-12 shrink-0 text-right text-[10px] text-[var(--muted)]">
         {row.unplanned ? '未排期' : row.planned_end ? '有计划' : '有起期'}
       </span>
@@ -543,6 +655,7 @@ function EarnedValuePanel({
   project: ProjectRow;
 }) {
   const evm = useResource(`挣值（${project.id}）`, () => getProjectEvm(project.id), 15_000);
+  const fresh = useFrameFedFace(project, evm.at, evm.refresh);
 
   if (evm.error) {
     return <ReadError what="挣值" error={evm.error} onRetry={evm.refresh} />;
@@ -612,6 +725,7 @@ function EarnedValuePanel({
         </div>
       </Readings>
       <Provenance source={data.source} />
+      <FreshNodeChanges rows={fresh} what="挣值" />
 
       <NodeList
         title="超支的节点"

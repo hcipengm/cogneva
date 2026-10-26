@@ -749,6 +749,11 @@ jobs:
       # 帧说不出会加几条边，所以这一块只写「图上马上要多出边」，不画边。
       - name: Check the comms face moves with the frames, not only with the poll
         run: bash deploy/scripts/check-web-live-comms.sh
+      # 项目面的四张屏（范围、看板、甘特、挣值）都是每 15 秒重读一次的快照，而任务
+      # 状态帧一直在总线上。这一面回答的是「这活现在到哪一步了」，晚一拍就是把刚跑
+      # 完的任务还挂在「执行中」列里。帧只当触发器：到了就重读，数仍由服务端现算。
+      - name: Check the projects face moves with the frames, not only with the poll
+        run: bash deploy/scripts/check-web-live-projects.sh
 
   entry-scripts:
     name: Entry Scripts Lint
