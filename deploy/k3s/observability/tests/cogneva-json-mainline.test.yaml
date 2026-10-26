@@ -26,6 +26,7 @@ rule_files:
 # rule: mainline_delivery_preflight_refused
 # rule: mainline_kubectl_refused
 # rule: mainline_rollout_refused
+# rule: mainline_admission_held
 # rule: mainline_rollout_never_lands
 # rule: mainline_build_slow
 # rule: mainline_ci_hold_too_long
@@ -57,6 +58,8 @@ tests:
       - series: 'cogneva_mainline_kubectl_refused_total{verb="apply",resource="deployments"}'
         values: '0x60'
       - series: 'cogneva_mainline_rollout_refused_total{reason="not_ready"}'
+        values: '0x60'
+      - series: 'cogneva_mainline_admission_held_total{resource="cpu"}'
         values: '0x60'
       - series: 'cogneva_mainline_build_seconds{outcome="ok"}'
         values: '900x60'
@@ -94,6 +97,9 @@ tests:
         exp_alerts: []
       - eval_time: 60m
         alertname: mainline_rollout_refused
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_admission_held
         exp_alerts: []
       - eval_time: 60m
         alertname: mainline_rollout_never_lands
@@ -312,4 +318,25 @@ tests:
     alert_rule_test:
       - eval_time: 240m
         alertname: mainline_progress_verdict_mute
+        exp_alerts: []
+
+  # 部署器自己把一轮滚回扣住了一小时，差的是内存：这一格里集群谁也没拒绝，
+  # `cogneva_mainline_rollout_refused_total` 一条都没长，只有部署器的预检说装不下。
+  # 规则必须亮，且标签说出「差在哪一维」——标签读不成维度，修法就落到别的天花板
+  # 上去。删掉这条规则、或把它并进 `mainline_rollout_refused`，这一格都会红。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_mainline_admission_held_total{resource="memory"}'
+        values: '0x5 2x55'
+      - series: 'cogneva_mainline_rollout_refused_total{reason="not_ready"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: mainline_admission_held
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              resource: memory
+      - eval_time: 60m
+        alertname: mainline_rollout_refused
         exp_alerts: []

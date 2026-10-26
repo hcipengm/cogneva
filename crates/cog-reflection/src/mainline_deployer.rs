@@ -2728,6 +2728,33 @@ impl MainlineDeployer {
             .await;
     }
 
+    /// 一次滚动被部署器自己提前扣住，按「差在哪一维」落一条。
+    ///
+    /// 与 [`Self::record_rollout_refused`] 不是同一件事的两半，而是两个事实：那一条是
+    /// **集群把交付的 Pod 挡在创建之外**（Job 建了、Pod 没建），这一条是**部署器量到
+    /// 新 Pod 装不下、决定先不交付**（Job 建了、进程自己退出 75、旧 Pod 留在原地）。
+    /// 前者的修法是给那份 Role / 那份配额动手术，后者往往只是天花板要等这一轮的重叠
+    /// 退掉——把它们并成一格，读数面就会把一个"等一轮"的事件写成一次拒绝。
+    ///
+    /// 维度取自 Job 自己的终止消息（[`crate::mainline_rollout::admission_hold_dimension`]）：
+    /// 那是唯一过得了 Job 边界的一格，也是唯一说得出「CPU 还是内存」的一格。实测
+    /// 2026-10-27：主应用与 evolution 因 `limits.cpu` 的滚动求和短差被扣住一整轮，
+    /// 而查清这一点要把那个 Job 的日志翻出来——记成计数之后，规则一句话就能点名。
+    async fn record_admission_held(&self, dimension: &str) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("resource".to_string(), dimension.to_string());
+        let _ = metrics
+            .record_counter(
+                cog_core::metric_names::MAINLINE_ADMISSION_HELD_TOTAL,
+                1.0,
+                labels,
+            )
+            .await;
+    }
+
     /// 问集群「本进程这个身份有没有这个动词」，把 `kubectl auth can-i` 的
     /// yes / no 读成一个 bool。
     ///
@@ -7567,6 +7594,12 @@ impl MainlineDeployer {
                 killed = Some(reason);
                 continue;
             }
+            // 被提前扣住时，Job 在终止消息里多写一行「差在哪一维」。签名只说得出
+            // 「precheck 的准入这一处」，说不出 CPU 还是内存；那一维只有这里读得到，
+            // 所以在这里落成计数。读不懂的行不记（见 `admission_hold_dimension`）。
+            if let Some(dimension) = crate::mainline_rollout::admission_hold_dimension(message) {
+                self.record_admission_held(dimension).await;
+            }
             if let Some(code) = code {
                 class = Some(if code == ROLLOUT_EXIT_ENVIRONMENT {
                     FailureClass::Environment
@@ -9629,13 +9662,13 @@ mod tests {
     // 把它们带进来。产出面两个模块互不调用这一点不为此放宽——这里带进来的每一项，
     // 在产出面都只有那一侧在用。
     use crate::mainline_rollout::{
-        admission_rejection, admission_shortfall, bundle_declared_containers, changed_configmaps,
-        changed_workloads, classify_before_any_change, config_change_needs_restart,
-        config_consumers, defined_objects, deployment_surges, environment_class,
-        image_pull_blocked, is_admission_denied, is_cluster_config_missing,
-        is_image_source_unavailable, is_placement_blocked, is_rollout_target,
-        locate_before_any_change, normalize_placement_shape, parse_rollout_args, pod_samples,
-        pod_selector, pod_template_limits, pod_waiting_states, readiness_overdue,
+        admission_hold_dimension, admission_rejection, admission_shortfall,
+        bundle_declared_containers, changed_configmaps, changed_workloads,
+        classify_before_any_change, config_change_needs_restart, config_consumers, defined_objects,
+        deployment_surges, environment_class, image_pull_blocked, is_admission_denied,
+        is_cluster_config_missing, is_image_source_unavailable, is_placement_blocked,
+        is_rollout_target, locate_before_any_change, normalize_placement_shape, parse_rollout_args,
+        pod_samples, pod_selector, pod_template_limits, pod_waiting_states, readiness_overdue,
         replicaset_failures, rollout_converged, rollout_pods_fatal, rollout_pods_ready,
         stage_rollout_manifest, staged_manifest_path, summarize_events, summarize_pod_states,
         support_pod_causes, support_pod_selector, support_settled, terminating_pods,
@@ -18409,12 +18442,23 @@ echo "||1"
             component: "postgres".into(),
             name: "postgres".into(),
         }];
-        assert!(is_rollout_target("deployment", "postgres", &targets));
+        let target_like = |kind: &'static str, name: &str| SupportWorkload {
+            kind,
+            name: name.to_string(),
+            generation: 1,
+        };
+        assert!(is_rollout_target(
+            &target_like("deployment", "postgres"),
+            &targets
+        ));
         assert!(
-            !is_rollout_target("statefulset", "postgres", &targets),
+            !is_rollout_target(&target_like("statefulset", "postgres"), &targets),
             "a StatefulSet that happens to share a target's name is a different object"
         );
-        assert!(!is_rollout_target("deployment", "redis", &targets));
+        assert!(!is_rollout_target(
+            &target_like("deployment", "redis"),
+            &targets
+        ));
     }
 
     #[test]
@@ -23170,6 +23214,7 @@ exit 0
             &path,
             Some("version:wait:cogneva-web:observed"),
             Some(&reading),
+            None,
         )
         .unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
@@ -23187,14 +23232,14 @@ exit 0
         );
 
         // 成功那一轮没有落点，只有读数：那段文本不能被读成一条签名。
-        write_termination_message(&path, None, Some(&reading)).unwrap();
+        write_termination_message(&path, None, Some(&reading), None).unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body.lines().count(), 1);
         assert_eq!(parse_failure_signature(&body), None);
         assert_eq!(RolloutResourceReading::from_line(&body), Some(reading));
 
         // 进程被杀得连读数都没读到：空消息，不是一行空文本。
-        write_termination_message(&path, None, None).unwrap();
+        write_termination_message(&path, None, None, None).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
     }
 
@@ -23497,8 +23542,12 @@ exit 0
             annotations: BTreeMap::new(),
         };
         let hold = admission_shortfall("resourcequota/q", &near, &old, &raised, false);
-        assert!(hold.is_some(), "22.5 + 2 应当越过 23");
-        assert!(hold.unwrap().contains("limits.cpu"));
+        let hold = hold.expect("22.5 + 2 应当越过 23");
+        assert!(hold.text.contains("limits.cpu"));
+        assert_eq!(
+            hold.dimension, "cpu",
+            "扣住时要带上是哪一维：CPU 与内存的短差修法不同"
+        );
     }
 
     /// 滚动的形状决定新 Pod 记多少账：不 surge 时旧 Pod 先走，只算增量；surge
@@ -23525,9 +23574,93 @@ exit 0
         let hold = admission_shortfall("resourcequota/q", &usage, &old, &same, true);
         let hold = hold.expect("两个 4Gi 的 Pod 同时在 57Gi 的天花板下装不下");
         assert!(
-            hold.contains("surges"),
-            "扣住的理由要说清是 surge 那笔账：{hold}"
+            hold.text.contains("surges"),
+            "扣住的理由要说清是 surge 那笔账：{}",
+            hold.text
         );
+        assert_eq!(hold.dimension, "memory", "这一维是内存，不是别的");
+    }
+
+    /// 扣住的维度按**资源本身**归一，不按它记在哪一栏：`limits.cpu` 与
+    /// `requests.cpu` 是同一次修复（改天花板），落成两行会把一个墙写成两个。
+    /// 认不出的名字是真答案 `other`，不是退回某一维——把没见过的那一维折进已知的
+    /// 一维，读数的修法就是错的。
+    #[test]
+    fn the_dimension_folds_the_column_away_and_keeps_unknown_names_apart() {
+        use crate::mainline_rollout::shortfall_dimension;
+        assert_eq!(shortfall_dimension("limits.cpu"), "cpu");
+        assert_eq!(shortfall_dimension("requests.cpu"), "cpu");
+        assert_eq!(shortfall_dimension("cpu"), "cpu");
+        assert_eq!(shortfall_dimension("limits.memory"), "memory");
+        assert_eq!(shortfall_dimension("requests.memory"), "memory");
+        assert_eq!(shortfall_dimension("pods"), "pods");
+        assert_eq!(shortfall_dimension("requests.storage"), "storage");
+        assert_eq!(shortfall_dimension("limits.ephemeral-storage"), "other");
+        assert_eq!(shortfall_dimension("limits.nvidia.com/gpu"), "other");
+        assert_eq!(shortfall_dimension(""), "other");
+        // 空格是清单里常见的写法，不能因此掉到 other。
+        assert_eq!(shortfall_dimension(" limits.cpu "), "cpu");
+    }
+
+    /// 维度过 Job 边界只剩那行终止消息，读回来必须与写出去的一一对应：认得出前缀
+    /// 加闭集里的值，认不出的一律不记——读不懂的行记成一个维度，比不记更坏，
+    /// 它会把一次真实的扣住算到错的修法上。
+    #[test]
+    fn the_held_dimension_survives_the_job_boundary_or_is_not_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("termination-log");
+
+        write_termination_message(
+            &path,
+            Some("version:precheck:web:admission"),
+            None,
+            Some("cpu"),
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            crate::mainline_rollout::admission_hold_dimension(&body),
+            Some("cpu"),
+            "落点、读数、维度三行各读各的"
+        );
+        // 落点仍在第一行：维度这一行没有动到读落点的那一端。
+        assert_eq!(
+            parse_failure_signature(&body).as_deref(),
+            Some("version:precheck:web:admission")
+        );
+
+        // 不扣住的那一轮不带这一行，读回来是 None，不是把落点读成维度。
+        write_termination_message(&path, Some("version:wait:web:observed"), None, None).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            crate::mainline_rollout::admission_hold_dimension(&body),
+            None
+        );
+
+        assert_eq!(admission_hold_dimension("admission_held:cpu"), Some("cpu"));
+        assert_eq!(
+            admission_hold_dimension("admission_held:memory"),
+            Some("memory")
+        );
+        assert_eq!(
+            admission_hold_dimension("admission_held:pods"),
+            Some("pods")
+        );
+        assert_eq!(
+            admission_hold_dimension("admission_held:storage"),
+            Some("storage")
+        );
+        assert_eq!(
+            admission_hold_dimension("admission_held:other"),
+            Some("other")
+        );
+        assert_eq!(
+            admission_hold_dimension("admission_held:gpu"),
+            None,
+            "闭集之外的值不记：写错的维度会把一次扣住算到错的修法上"
+        );
+        assert_eq!(admission_hold_dimension("admission_held:"), None);
+        assert_eq!(admission_hold_dimension("dimension:cpu"), None);
     }
 
     /// surge 的判断来自集群上那份对象自己在说什么：显式的 `maxSurge: 0` 不是

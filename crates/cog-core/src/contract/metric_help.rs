@@ -688,6 +688,28 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          two and a half hours with nothing on any scraped surface saying why",
     ),
     (
+        "cogneva_mainline_admission_held_total",
+        "Times the deployer held a rollout back before delivering it, because its \
+         own preflight measured that the surge would not fit under the enforced \
+         ceiling, by the resource it was short of: cpu, memory, pods, storage, or \
+         other when the shortfall named a resource outside that set. This is not \
+         the counter above and not half of it: that one counts the cluster \
+         refusing a Pod the deployer already delivered, this one counts the \
+         deployer deciding not to deliver at all. Both leave mainline without a \
+         new revision, so neither can be inferred from the other, and the \
+         observed run that motivated this one produced only the first kind of \
+         evidence -- the shortfall lived in a round's log, which is deleted with \
+         the Job. The dimension is the label rather than the quota object's name \
+         because the repair differs by dimension (a ceiling is raised in memory \
+         units, a pod count in a different field) and the object name changes \
+         with the workload; a dimension outside the set is recorded as other \
+         rather than guessed. Absent does not mean nothing was held: with no \
+         attribution it reads as never measured -- read it against \
+         cogneva_mainline_rollout_attempts_total over the same window, where a \
+         run of attempts with no completed round and no hold is the third \
+         possibility this pair does not cover",
+    ),
+    (
         "cogneva_mainline_supersession_checks_total",
         "Times the deployer's guard put the overtaken question, counted whether \
          the answer was yes or no. Counted rather than inferred from the skips, \

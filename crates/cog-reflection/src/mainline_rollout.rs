@@ -597,6 +597,12 @@ pub struct RolloutFailure {
     pub signature: String,
     /// 原始错误，措辞与判据都不变（Job 日志、错误文本原样保留）。
     pub error: SFError,
+    /// 提前扣住这一轮时，是哪个维度装不下（[`AdmissionShortfall::dimension`]）。
+    ///
+    /// 只有准入预检那一处填，其余失败为 `None`。签名说「坏在 precheck 的准入这一处」，
+    /// 说不出「差在哪一维」，而 CPU 与内存的两条短差修法不同。它经终止消息过 Job 边界，
+    /// 部署器读回来记成计数。
+    pub admission_hold: Option<&'static str>,
 }
 
 impl RolloutFailure {
@@ -614,6 +620,7 @@ impl RolloutFailure {
             class,
             signature: failure_signature(class, stage, target, locus),
             error,
+            admission_hold: None,
         }
     }
 }
@@ -1370,7 +1377,7 @@ fn first_admission_shortfall(
     old_limits: &BTreeMap<String, f64>,
     new_limits: &BTreeMap<String, f64>,
     surges: bool,
-) -> Option<String> {
+) -> Option<AdmissionShortfall> {
     for (object, usage) in quotas {
         if let Some(reason) = admission_shortfall(object, usage, old_limits, new_limits, surges) {
             return Some(reason);
@@ -1409,13 +1416,58 @@ pub(crate) fn terminating_pods(pods_json: &str) -> Option<Vec<String>> {
     )
 }
 
+/// A ceiling this target's new pod would pass, and which dimension it is in.
+///
+/// The dimension rides along from the loop that found it rather than being read
+/// back out of [`Self::text`]: the sentence is written for a person and its
+/// wording is free to change, while `resource` is the quota key the ceiling is
+/// keyed by. A caller that needs "was it cpu or memory" is asking about the key,
+/// and re-parsing prose to answer it would break the first time the sentence is
+/// reworded -- silently, because a parser that finds nothing answers "other".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdmissionShortfall {
+    /// The dimension, in a closed set: `cpu`, `memory`, `pods`, `storage`, `other`.
+    ///
+    /// The repair differs per dimension -- a tight `limits.cpu` is raised in a
+    /// different place than `limits.memory` -- and it is the one thing the
+    /// failure signature cannot carry (`...:precheck:<target>:admission` says
+    /// where it broke, not which ceiling ran out).
+    pub dimension: &'static str,
+    /// The sentence an operator reads: which object, which resource, by how much.
+    pub text: String,
+}
+
+/// Which dimension a quota key stands for.
+///
+/// Keys are `limits.cpu`, `requests.memory`, `pods`, `requests.storage`, ...
+/// The prefix (`limits`/`requests`) is not the dimension: the same shortfall in
+/// the same resource is repaired in the same place whether it is charged
+/// against limits or requests, and splitting them would put two rows on one
+/// wall. `other` is a real answer, not a fallback to hide: a name this build has
+/// not seen is still a hold, and folding it into a known dimension would name
+/// the wrong repair.
+pub(crate) fn shortfall_dimension(resource: &str) -> &'static str {
+    let resource = resource.trim();
+    if resource.ends_with(".cpu") || resource == "cpu" {
+        "cpu"
+    } else if resource.ends_with(".memory") || resource == "memory" {
+        "memory"
+    } else if resource == "pods" {
+        "pods"
+    } else if resource.ends_with(".storage") || resource == "storage" {
+        "storage"
+    } else {
+        "other"
+    }
+}
+
 pub(crate) fn admission_shortfall(
     object: &str,
     usage: &crate::governance_drift::QuotaUsage,
     old_limits: &BTreeMap<String, f64>,
     new_limits: &BTreeMap<String, f64>,
     surges: bool,
-) -> Option<String> {
+) -> Option<AdmissionShortfall> {
     let mut resources: Vec<&String> = new_limits.keys().collect();
     resources.sort();
     for resource in resources {
@@ -1441,7 +1493,7 @@ pub(crate) fn admission_shortfall(
             continue;
         };
         if used + charged > hard {
-            return Some(if surges {
+            let text = if surges {
                 format!(
                     "{object} {resource}: this rollout surges, so the new pod is admitted beside \
                      the old one and charged {charged} on top of {used_text} used, which passes \
@@ -1452,6 +1504,10 @@ pub(crate) fn admission_shortfall(
                     "{object} {resource}: the new pod raises it by {charged}, and {used_text} used \
                      + that passes the enforced {hard_text}"
                 )
+            };
+            return Some(AdmissionShortfall {
+                dimension: shortfall_dimension(resource),
+                text,
             });
         }
     }
@@ -1524,8 +1580,13 @@ impl SupportWorkload {
 /// 词表只有一处：`kind` 是 kubectl 的资源词，`targets` 里存的是 Deployment 的
 /// 对象名，两处各写一遍比较就会在某次改名后静默不匹配。等支撑与被配置滚动
 /// 跳过这两条路都走这一个判据。
-pub(crate) fn is_rollout_target(kind: &str, name: &str, targets: &[RolloutTarget]) -> bool {
-    names_a_deployment(kind) && targets.iter().any(|t| t.deployment == name)
+///
+/// 词表读取必须留在取值的这一行（`workload_kind_of_resource(w.kind)`），不能收进
+/// 一层只收 `kind` 的 helper：授权面是按这一行的字面量判定「这次 `get` 取的是哪一族
+/// 资源」的，藏进 helper，那个普查就读不到这句，判不了这个身份缺不缺那份授权。
+pub(crate) fn is_rollout_target(w: &SupportWorkload, targets: &[RolloutTarget]) -> bool {
+    workload_kind_of_resource(w.kind).map(|k| k.kind) == Some("Deployment")
+        && targets.iter().any(|t| t.deployment == w.name)
 }
 
 /// 这个工作负载的目标清单会不会在这次 apply 里真的落到集群上。
@@ -1535,13 +1596,8 @@ pub(crate) fn is_rollout_target(kind: &str, name: &str, targets: &[RolloutTarget
 /// 退化成 `set image` 的目标没有这层保证——Pod 模板上唯一会变的是镜像，只改配置
 /// 的那一版里镜像没变，让它自己滚等于什么都不发生，配置就没人读。
 pub(crate) fn is_manifest_carried(kind: &str, name: &str, carried: &[String]) -> bool {
-    names_a_deployment(kind) && carried.iter().any(|d| d == name)
-}
-
-/// `kind` 这个词指的是不是一个 Deployment。上面两条判据共用它，好让"目标"
-/// 在两张名单里的解释不会分叉。
-fn names_a_deployment(kind: &str) -> bool {
     workload_kind_of_resource(kind).map(|k| k.kind) == Some("Deployment")
+        && carried.iter().any(|d| d == name)
 }
 
 /// 本次滚动的目标里，哪些的清单会在 `apply_target` 里被 apply —— 也就是说，
@@ -1584,7 +1640,7 @@ pub(crate) fn changed_workloads(
         // A rollout target is a Deployment of its own, so the ones it names
         // are not "some support workload this apply restarted" -- they are
         // waited for one by one.
-        .filter(|w| !is_rollout_target(w.kind, &w.name, targets))
+        .filter(|w| !is_rollout_target(w, targets))
         .filter(
             |w| match before.iter().find(|b| b.kind == w.kind && b.name == w.name) {
                 Some(b) => b.generation != w.generation,
@@ -2196,7 +2252,11 @@ impl RolloutExecutor {
     /// that decided it. `None` means it fits, no quota constrains the raised
     /// resource, or a side could not be read -- an unreadable figure holds
     /// nothing back.
-    async fn admission_would_fail(&self, plan: &RolloutPlan, t: &RolloutTarget) -> Option<String> {
+    async fn admission_would_fail(
+        &self,
+        plan: &RolloutPlan,
+        t: &RolloutTarget,
+    ) -> Option<AdmissionShortfall> {
         // The set-image fallback leaves the pod's resources as they are, so
         // there is nothing to compare; only a manifest that rewrites the
         // workload can move its limits.
@@ -3930,21 +3990,29 @@ impl RolloutExecutor {
             // 旧 Pod 留着、应用不断——这是量到了漂移却没有任何门去拦的那一处，
             // 补成门。装不下是集群此刻的事，不是这一版的结论，所以判环境类、
             // 不回滚，下一轮天花板跟上了自己会继续。
-            if let Some(reason) = self.admission_would_fail(plan, target).await {
+            if let Some(shortfall) = self.admission_would_fail(plan, target).await {
                 warn!(
                     deployment = %target.deployment,
-                    shortfall = %reason,
+                    dimension = shortfall.dimension,
+                    shortfall = %shortfall.text,
                     "mainline rollout: holding this rollout before it starts; the new pod would \
                      not admit against the ceiling the cluster enforces right now, so the old pod \
                      stays and the next round retries"
                 );
-                return Err(RolloutFailure::at(
+                let mut failure = RolloutFailure::at(
                     "precheck",
                     &target.deployment,
                     FailureLocus::Admission,
                     done.is_empty(),
-                    SFError::Config(reason),
-                ));
+                    SFError::Config(shortfall.text),
+                );
+                // 扣住是**部署器自己决定先不交付**，不是集群拒了交付物：那一条
+                // （`mainline_rollout_refused_total`）的标签是集群挡下 Pod 的那堵墙，
+                // 这一条是我方量到装不下就停手。两个事实，两条修法，各自一格。维度
+                // 随终止消息过 Job 边界，部署器读回来记成计数——于是「部署器被准入
+                // 扣住、差在 CPU」在读数面上有名字，不必去翻这个 Job 的日志。
+                failure.admission_hold = Some(shortfall.dimension);
+                return Err(failure);
             }
             if let Err(e) = self.apply_target(plan, target).await {
                 return self
@@ -4378,7 +4446,7 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
         // 成功也留下读数：这一轮跑得离上限有多近，只有跑完的这一刻在同一个进程里
         // 对照得出来（上限写在 Job 清单里，用掉的量在这个容器自己的 cgroup 里）。
         Ok(()) => {
-            report_termination_message(None);
+            report_termination_message(None, None);
             Ok(())
         }
         // 失败分两条通道过 Job 边界：类别走退出码（环境类用独立的 75，让部署器
@@ -4387,7 +4455,7 @@ pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
         // "这个容器为什么死"留的窄通道，读出端按结构化字段取，不解析日志。
         // `process::exit` 不走返回路径，因为 Box<dyn Error> 出去一律是 1。
         Err(f) => {
-            report_termination_message(Some(&f.signature));
+            report_termination_message(Some(&f.signature), f.admission_hold);
             if f.class == FailureClass::Environment {
                 tracing::error!(error = %f, exit_code = ROLLOUT_EXIT_ENVIRONMENT, "mainline rollout failed for environment reasons");
                 std::process::exit(ROLLOUT_EXIT_ENVIRONMENT);
@@ -4529,7 +4597,7 @@ const TERMINATION_LOG: &str = "/dev/termination-log";
 /// 写不进去不能影响失败本身的交付：类别还走退出码，落点没了只是让部署器少一份证据
 /// （它会往"停下"的一侧取，不会因此多滚一轮）。读数同理由：它是这一轮跑得怎么样的一份
 /// 证据，不是这一轮成败的判据。
-fn report_termination_message(signature: Option<&str>) {
+fn report_termination_message(signature: Option<&str>, admission_hold: Option<&str>) {
     let reading = RolloutResourceReading::read_from(
         Path::new(rollout_resources::CGROUP_ROOT),
         chrono::Utc::now().timestamp().max(0) as u64,
@@ -4541,9 +4609,12 @@ fn report_termination_message(signature: Option<&str>) {
             "no cgroup to read this run's resource use from; the deployer will see this run without a resource reading"
         ),
     }
-    if let Err(e) =
-        write_termination_message(Path::new(TERMINATION_LOG), signature, reading.as_ref())
-    {
+    if let Err(e) = write_termination_message(
+        Path::new(TERMINATION_LOG),
+        signature,
+        reading.as_ref(),
+        admission_hold,
+    ) {
         tracing::warn!(
             path = TERMINATION_LOG,
             error = %e,
@@ -4556,13 +4627,14 @@ fn report_termination_message(signature: Option<&str>) {
 /// 终止消息的行布局：**落点必须在第一行**。
 ///
 /// 部署器读落点时只认第一行（`parse_failure_signature` 取 `lines().next()`）：这条通道
-/// 上可能有别的进程写过东西，位置固定才谈得上"这是我们写的形状"。读数排在后面，于是它
-/// 的增删永远不动落点的位置——反过来放，第一行就会变成一段陌生文本，那一轮失败从此判不出
-/// 落点。kubelet 按 4KiB 截断，两行远在截断线之内。
+/// 上可能有别的进程写过东西，位置固定才谈得上"这是我们写的形状"。读数与扣住的维度排在
+/// 后面，于是它们的增删永远不动落点的位置——反过来放，第一行就会变成一段陌生文本，那一轮
+/// 失败从此判不出落点。kubelet 默认按 4KiB 截断，三行远在截断线之内。
 pub(crate) fn write_termination_message(
     path: &Path,
     signature: Option<&str>,
     reading: Option<&RolloutResourceReading>,
+    admission_hold: Option<&str>,
 ) -> std::io::Result<()> {
     let mut body = String::new();
     if let Some(signature) = signature {
@@ -4573,7 +4645,39 @@ pub(crate) fn write_termination_message(
         body.push_str(&reading.to_line());
         body.push('\n');
     }
+    if let Some(dimension) = admission_hold {
+        body.push_str(&format!("{ADMISSION_HOLD_PREFIX}{dimension}"));
+        body.push('\n');
+    }
     std::fs::write(path, body)
+}
+
+/// 扣住那一行的前缀，与它读回时认的前缀是同一个常量。
+///
+/// 值域是 [`shortfall_dimension`] 的闭集。读回的一端只认这个前缀 + 闭集里的值：这条
+/// 通道上也可能写着别的东西，把一段陌生文本当成"差在 CPU"会让读数指错修法。
+pub(crate) const ADMISSION_HOLD_PREFIX: &str = "admission_held:";
+
+/// 从终止消息里读回扣住的那一维。
+///
+/// `None` 既是"这一轮不是被准入扣住的"，也是"这一行读不懂"——两者都不该落成一条计数：
+/// 前者无事可记，后者记下来就是把一段陌生文本写成一条资源事实。前缀对上、值不在闭集里
+/// 的那一行按读不懂处理。
+pub(crate) fn admission_hold_dimension(message: &str) -> Option<&'static str> {
+    for line in message.lines() {
+        let Some(rest) = line.trim().strip_prefix(ADMISSION_HOLD_PREFIX) else {
+            continue;
+        };
+        return match rest.trim() {
+            "cpu" => Some("cpu"),
+            "memory" => Some("memory"),
+            "pods" => Some("pods"),
+            "storage" => Some("storage"),
+            "other" => Some("other"),
+            _ => None,
+        };
+    }
+    None
 }
 
 // 这一侧的用例在 `crate::mainline_deployer::tests` 里，不在本模块。它们是搬迁前那唯一

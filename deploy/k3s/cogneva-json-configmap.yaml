@@ -2453,6 +2453,16 @@ data:
                   "face": "CI/构建/部署"
                 },
                 {
+                  "name": "mainline_admission_held",
+                  "promql": "max by (resource) (increase(cogneva_mainline_admission_held_total[1h])) > 0",
+                  "condition": {
+                    "greater_than": 0.0
+                  },
+                  "severity": "warning",
+                  "summary": "The deployer held {value} rollouts back before delivering them in the last hour, and what it was short of is {resource}. This is not mainline_rollout_refused and not half of it. That one counts the cluster refusing a Pod the deployer already delivered: the Job is created, no Pod is, and the sentence in its Failed condition is the only surviving observation. This one counts the deployer measuring, in its own preflight, that the new Pod would not fit under the enforced ceiling and deciding not to deliver at all -- the Job is created and exits 75 before any workload is touched, so the old Pods stay where they are and nothing is refused by anyone. One asks for a grant or a policy to be changed, the other usually asks for the ceiling to be raised or for the overlap a previous round created to be given back; folding them into one cell would write a round that waited as a refusal. Both leave mainline without a new revision and both make mainline_rollout_never_lands fire, so the pair is read together: that rule says nothing landed, this one says which dimension was short. The label is the dimension rather than the quota object's name because the repair differs by dimension -- a CPU ceiling and a memory ceiling are raised in different keys of the same object, and the object name changes with the workload -- and the column a resource is charged under (limits or requests) is not a second dimension, since the same shortfall is repaired in the same place. A name outside the set is recorded as other rather than guessed into a known one: naming the wrong repair is worse than naming none. One hold is enough to fire, and that is the point rather than an oversight: a ceiling does not raise itself by being retried, and a round that waits for the previous overlap to be released is exactly the round that has already been waiting. Absent does not mean nothing was held -- a deployer that never reaches its preflight writes nothing here, so a quiet stretch is read against cogneva_mainline_rollout_attempts_total over the same window rather than on its own. Measured on 2026-10-27: the main workload and evolution were held for a full round on limits.cpu, the reading existed only in that round's Job log, and the slot was repaired by hand once it was found. Read the label rather than only the value: the value says a rollout was held, the label says which ceiling.",
+                  "face": "CI/构建/部署"
+                },
+                {
                   "name": "mainline_rollout_never_lands",
                   "promql": "(max without (pod, container, instance, job) (increase(cogneva_mainline_rollout_attempts_total[1h])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_mainline_rollout_completed_total[1h])) > 0)",
                   "condition": {

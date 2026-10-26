@@ -729,6 +729,33 @@ metric_names! {
     // two and a half hours, and `mainline_rollout_never_lands` reported the
     // stall without being able to say what was holding it.
     MAINLINE_ROLLOUT_REFUSED_TOTAL => "cogneva_mainline_rollout_refused_total",
+    // Rounds the deployer held a rollout back on its own judgement, by which
+    // dimension of the ceiling the new pod would have crossed: `cpu`, `memory`,
+    // `pods`, `storage`, or `other`.
+    //
+    // The sibling above counts the other half of the same stall and the two are
+    // not interchangeable. That one is the cluster refusing the delivered
+    // object: the Job exists, its Pod is never created, and the wall is named in
+    // the Job's Failed condition. This one is the deployer reading the ceiling
+    // itself before it touches anything -- the Job runs, decides the new pod
+    // would not be admitted beside the old one, and exits 75 leaving the old pod
+    // serving. The repair differs: a refusal is a Role, a LimitRange or a
+    // PodSecurity policy that has to change; a hold is usually a ceiling that
+    // has to drain, and it heals by itself on a later round.
+    //
+    // The label is the dimension rather than the quota object because that is
+    // the part the failure signature cannot carry: `...:precheck:<target>:admission`
+    // says where it broke, not whether `limits.cpu` or `limits.memory` ran out,
+    // and raising one does nothing for the other. `other` is a real answer -- a
+    // quota key this build has not seen is still a hold, and folding it into a
+    // known dimension would name the wrong repair.
+    //
+    // Measured 2026-10-27: the main deployment and evolution were held while
+    // three other workloads of the same round sat in their own surges, and the
+    // only way to learn it was `limits.cpu` was to read the rollout Job's log
+    // before it was collected. `mainline_rollout_never_lands` reported the stall
+    // and could not name the wall.
+    MAINLINE_ADMISSION_HELD_TOTAL => "cogneva_mainline_admission_held_total",
     // Times the deployer's guard put the overtaken question, counted whether
     // the answer was yes or no.
     //

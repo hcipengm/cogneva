@@ -1046,6 +1046,17 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_mainline_rollout_refused_total",
         "crates/cog-reflection/src/mainline_deployer.rs",
     ),
+    // 部署器自己量到新 Pod 装不下、决定**先不交付**，按差在哪一维记一条。与上面那条
+    // 不是一半的关系：那条是集群把已交付的 Pod 挡在创建之外（Job 建了、Pod 没建），
+    // 这条是 Job 建了自己退出 75、旧 Pod 原封不动（集群谁也没拒）。两者都让主干没有新
+    // rev，所以谁都不能从上一条推出来。维度取的是资源而不是配额对象名：CPU 与内存的
+    // 修法不同（同一个对象的不同键），对象名又随工作负载变。2026-10-27 实测：主应用与
+    // evolution 因 `limits.cpu` 的滚动求和短差被扣住一整轮，这件事当时只活在那一轮 Job
+    // 的日志里，Job 一结束就没了——翻日志才知道差的是 CPU 还是内存。
+    (
+        "cogneva_mainline_admission_held_total",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
     // 轮询循环每一轮的结果。循环自己的存活读数（`loop_tick_age_seconds`）在每拍开头
     // 盖章，量的是「它醒了」，量不到这一轮干了什么；而这一轮里别的读数（版本契约、
     // CI 判词、那对越权计数）全写在会失败的那一步**之前**。2026-10-08 实测：发布那
