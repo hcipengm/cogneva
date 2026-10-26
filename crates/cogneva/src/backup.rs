@@ -482,6 +482,18 @@ fn tables_without_a_home<'a>(package: &'a [String], current: &[String]) -> Vec<&
 }
 
 /// 包里的列中，目标表接受写入的那些：生成列由目标自己算，不在这份名单里。
+/// `SELECT setval('name', …)` 里那个序列名。认不出返回 `None`，调用方按原样执行。
+///
+/// 只认导出端自己写的那种形状（`setval('{seq}', {last_value}, {is_called})`）；
+/// 认不出就不猜——猜错的代价是把一句无关的 SQL 当成序列语句跳过。
+fn sequence_named_in_setval(line: &str) -> Option<&str> {
+    let start = line.find("setval('")? + "setval('".len();
+    let rest = &line[start..];
+    let end = rest.find('\'')?;
+    let name = &rest[..end];
+    (!name.is_empty()).then_some(name)
+}
+
 fn writable_columns<'a>(package: &'a [String], computed: &[String]) -> Vec<&'a String> {
     package
         .iter()
@@ -648,6 +660,11 @@ pub struct RestoreReport {
     pub tables: Vec<String>,
     pub recomputed: Vec<String>,
     pub tables_without_a_home: Vec<String>,
+    /// 包里的 `setval` 指向、而目标结构已经没有的序列。它们与被跳过的表是同一件事
+    /// 的两种落点：表没了，它的序列也一起被迁移删掉；包里的 `sequences.sql` 却还
+    /// 按旧导出点名它。跳过它必须留名字——静默跳过会让「装回去的序列数」看起来与
+    /// 清单一致，而实际上少的那一条正是被删表的自增计数器。
+    pub sequences_without_a_home: Vec<String>,
 }
 
 /// PG 恢复：整包表一次性 TRUNCATE ... RESTART IDENTITY CASCADE，
@@ -785,16 +802,53 @@ pub async fn restore_postgres(
     }
 
     let seq_path = pkg_pg_dir.join("sequences.sql");
+    let mut sequences_without_a_home = Vec::new();
     if seq_path.exists() {
         let sql = std::fs::read_to_string(seq_path)?;
+        // 序列跟着表一起被迁移删掉，而 `sequences.sql` 是按出包那一刻的
+        // `pg_sequences` 写的：里面还留着已删表的自增计数器。整句执行会在
+        // 「关系不存在」上失败，把整个包判成不可恢复——它丢掉的只是一条已经没有
+        // 列在用的计数器。所以先问目标哪些序列还在，再只跑活着的那些。
+        let mut names = Vec::new();
         for line in sql.lines().filter(|l| !l.trim().is_empty()) {
-            sqlx::query(line).execute(pool).await?;
+            if let Some(name) = sequence_named_in_setval(line) {
+                names.push(name.to_string());
+            }
+        }
+        let living: Vec<String> = if names.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_scalar(
+                "SELECT c.relname::text FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = 'public' AND c.relkind = 'S' AND c.relname = ANY($1)",
+            )
+            .bind(&names)
+            .fetch_all(pool)
+            .await?
+        };
+        for line in sql.lines().filter(|l| !l.trim().is_empty()) {
+            match sequence_named_in_setval(line) {
+                Some(name) if !living.iter().any(|l| l == name) => {
+                    sequences_without_a_home.push(name.to_string());
+                }
+                _ => {
+                    sqlx::query(line).execute(pool).await?;
+                }
+            }
+        }
+        if !sequences_without_a_home.is_empty() {
+            tracing::warn!(
+                sequences = %sequences_without_a_home.join(","),
+                "restore: package carries sequences the current schema no longer has; their values are not restored"
+            );
         }
     }
     Ok(RestoreReport {
         tables,
         recomputed,
         tables_without_a_home,
+        sequences_without_a_home,
     })
 }
 

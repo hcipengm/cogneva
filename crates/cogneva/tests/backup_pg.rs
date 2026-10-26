@@ -297,6 +297,69 @@ async fn pg_restore_loads_a_package_that_still_carries_the_generated_column() {
         .unwrap();
 }
 
+/// 一次删表的迁移之后，旧包的 `sequences.sql` 还点名着那张表的自增计数器。
+///
+/// 与上面那条是同一件事的第二个落点：`085_drop_tables_no_code_names` 删掉
+/// `agent_performance` 时，它的序列一起消失；保留窗口里的包写在那之前，
+/// `sequences.sql` 里仍有一句 `setval('agent_performance_id_seq', …)`。恢复端整句
+/// 执行会在「关系不存在」上失败，整个包被判成不可恢复——代价是同一个包里其余
+/// 66 张表和活着的序列一起退回去。判据与跳表那条相同：跳过并在账上留名字，
+/// 静默跳过会让装回去的序列数看起来与清单完全一致。
+#[tokio::test]
+#[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
+async fn pg_restore_skips_a_sequence_the_schema_no_longer_has_and_names_it() {
+    const KEPT: &str = "backup_probe_seq_kept";
+    let (pool, _url) = own_database("seq").await;
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {KEPT} CASCADE"),
+        format!("CREATE TABLE {KEPT} (id BIGSERIAL PRIMARY KEY, label TEXT NOT NULL)"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let pg_dir = dir.path().join("pg");
+    std::fs::create_dir_all(&pg_dir).unwrap();
+    std::fs::write(
+        pg_dir.join(format!("public.{KEPT}.csv")),
+        "id,label\n7,alpha\n8,beta\n",
+    )
+    .unwrap();
+    // 已删表的 CSV 一起在包里：真包就是这个形状，跳表与跳序列发生在同一份包上。
+    std::fs::write(
+        pg_dir.join("public.agent_performance.csv"),
+        "id,agent_id\n1,a\n",
+    )
+    .unwrap();
+    // 导出端写下的两种序列名：一个活着，一个随表一起没了。
+    std::fs::write(
+        pg_dir.join("sequences.sql"),
+        format!(
+            "SELECT setval('{KEPT}_id_seq', 8, true);\n\
+             SELECT setval('agent_performance_id_seq', 42, true);\n"
+        ),
+    )
+    .unwrap();
+
+    let restored = restore_postgres(&pool, &pg_dir).await.unwrap();
+    assert_eq!(
+        restored.sequences_without_a_home,
+        vec!["agent_performance_id_seq".to_string()],
+        "被跳过的序列必须点名：不点名，装回去的序列数会与清单一致，读起来像完整恢复"
+    );
+    // 活着的那个序列要真被 setval 到包内的值；跳过一条不能连累其余。
+    let next: i64 = sqlx::query_scalar(&format!("SELECT nextval('{KEPT}_id_seq')"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(next, 9, "包内 setval 没有生效：下一行会与包里的 id 撞主键");
+
+    sqlx::query(&format!("DROP TABLE IF EXISTS {KEPT} CASCADE"))
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 /// 一次删表的迁移之后，旧包点出了一张今天的结构里已经不存在的表。
 ///
 /// 现场：`085_drop_tables_no_code_names` 删掉了 `agent_performance`，而保留窗口里
