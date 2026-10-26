@@ -383,7 +383,7 @@ data:
               }
             },
             {
-              "expr": "llm_pool_quota_window_secs",
+              "expr": "llm_pool_quota_window_secs and ((time() - llm_pool_quota_window_secs_observed_timestamp_seconds) < 3600)",
               "legendFormat": "window an upstream stated",
               "datasource": {
                 "type": "prometheus",
@@ -414,7 +414,7 @@ data:
           },
           "targets": [
             {
-              "expr": "llm_upstream_quota_window_secs",
+              "expr": "llm_upstream_quota_window_secs and ((time() - llm_upstream_quota_window_secs_observed_timestamp_seconds) < 3600)",
               "legendFormat": "window stated: {{upstream}}",
               "datasource": {
                 "type": "prometheus",
@@ -453,7 +453,7 @@ data:
           },
           "targets": [
             {
-              "expr": "llm_upstream_consecutive_failures",
+              "expr": "llm_upstream_consecutive_failures and ((time() - llm_upstream_consecutive_failures_observed_timestamp_seconds) < 3600)",
               "legendFormat": "{{upstream}}",
               "datasource": {
                 "type": "prometheus",
