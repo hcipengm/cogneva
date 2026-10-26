@@ -253,6 +253,34 @@ async fn an_agent_still_in_the_fleet_keeps_its_dead_verdict_pass_after_pass() {
 // 于是这一拍要把两者分开：判决照旧给回收方（走了不等于不用管），但只有「还挂在
 // 名单上」的那一份才算不健康。
 
+/// 按需派生的 squad 成员：判决照旧，但「它不健康」这句话不报。
+///
+/// 一个任务在飞才有一个 squad，成员在派发时登记一次，之后没有任何东西替它们刷心跳
+/// ——它们干的是一步几分钟的活。于是派发 15 秒后每一个成员在判据上都是「可疑」，
+/// 而同一时刻它正在正常干活：实测 2026-10-27 一小时 91 个 change-ledger 轮次、513 行、
+/// 每轮约 5.6 个成员，每行活到 124 秒（中位）。这不是偶发抖动，是这条规则当时的
+/// 全部产出，而它想说的是「某个常驻 agent 不出声了」。
+///
+/// 两半都要：判决留在报告里（生命周期迁移与回收要它），事件流里不许有它。
+#[tokio::test]
+async fn a_demand_shaped_member_is_judged_but_not_announced() {
+    let reg = fresh_registry();
+    reg.register_agent(make_agent("squad:task-1-planner", 90));
+    reg.register_agent(make_agent("resident", 90));
+    let checker = HealthChecker::new(reg, fresh_backend(), HealthCheckerConfig::default());
+
+    let report = checker.check().await.unwrap();
+    assert_eq!(report.dead.len(), 2, "判决照旧要给回收方：{report:?}");
+    assert!(
+        !report.announces("squad:task-1-planner"),
+        "squad 成员没有心跳可错过，静默是它的常态：{report:?}"
+    );
+    assert!(
+        report.announces("resident"),
+        "常驻 agent 不出声就是这一条要报的事：{report:?}"
+    );
+}
+
 /// 还挂在名单里、心跳停了：判死，且不是离队——这一条必须报出去。
 #[tokio::test]
 async fn a_listed_agent_that_stops_beating_is_not_called_a_departure() {
