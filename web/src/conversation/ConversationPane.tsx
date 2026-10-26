@@ -145,6 +145,48 @@ function ToolTurn({ call }: { call: ToolCallRecord }) {
 }
 
 /**
+ * 一个执行者说的话。
+ *
+ * 与「你」和「这段对话的回复」分开画：它是目标下面的某一个人在汇报，不是平台在
+ * 回答你。混成一个样子，读者会以为这些字是说给自己听的，于是把「第 3 轮用了
+ * read_file」当成一次正式答复。
+ */
+function AgentTurn({ turn }: { turn: { agent: string; text: string; at: number } }) {
+  const [open, setOpen] = useState(false);
+  const long = turn.text.length > 400;
+  const shown = long && !open ? `${turn.text.slice(0, 400)}…` : turn.text;
+  return (
+    <article className="group relative pl-4">
+      <span
+        aria-hidden
+        className="absolute left-0 top-1 bottom-1 w-px"
+        style={{ background: 'var(--line)' }}
+      />
+      <header className="mb-1 flex items-baseline gap-2">
+        <span className="mono text-[11px]" style={{ color: 'var(--live)' }}>
+          执行者 {turn.agent.slice(0, 8)}
+        </span>
+        <span className="mono text-[10px] text-[var(--muted)]">
+          {new Date(turn.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+        </span>
+        {long && (
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            className="text-[10px] text-[var(--muted)] transition-colors hover:text-[var(--paper-dim)]"
+          >
+            {open ? '收起' : `全文（${turn.text.length} 字）`}
+          </button>
+        )}
+      </header>
+      <p className="whitespace-pre-wrap break-words text-[12px] leading-[1.7] text-[var(--paper-dim)]">
+        {shown}
+      </p>
+    </article>
+  );
+}
+
+/**
  * 这段对话是哪种：关掉就断的一问一答，还是已经交给守护接着做的活。
  *
  * 判的是它有没有把目标交出去，不是用户勾了什么：勾选是意愿，屏幕上要说的是这件事
@@ -232,6 +274,7 @@ export function ConversationPane({
     [goalLive, session?.goals]
   );
   const toolCalls = useStreamStore((s) => s.toolCalls);
+  const agentMessages = useStreamStore((s) => s.messages);
   /**
    * 这一段自己的执行者调过的工具，按时间接回对话里。
    *
@@ -248,10 +291,37 @@ export function ConversationPane({
     }
     return collected.sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
   }, [goalLive, session?.goals, toolCalls]);
+  /**
+   * 这道目标名下的执行者自己说的话。
+   *
+   * 与上面的工具调用同一条归属规则：按「这道活派给过谁」加「什么时候交出去的」
+   * 一起判。它们是执行者的正文，不是这段对话的回复——混成一个样子，读者会以为
+   * 平台在直接回答他。所以单独一支、标着谁说的。
+   */
+  const agentTurns = useMemo(() => {
+    const goals = session?.goals ?? [];
+    const out: { id: string; agent: string; text: string; at: number }[] = [];
+    for (const goal of goals) {
+      const goalState = goalLive?.[goal.id];
+      if (!goalState || goalState.agents.length === 0) continue;
+      const agents = new Set(goalState.agents);
+      const from = Date.parse(goal.at);
+      for (const message of agentMessages) {
+        if (!message.agent || !agents.has(message.agent)) continue;
+        // 消息 id 形如 `<agent>:<iso 时刻>`：那一刻是这条消息开始流的时候。
+        const at = Date.parse(message.id.split(':').slice(1).join(':'));
+        if (Number.isFinite(from) && Number.isFinite(at) && at < from) continue;
+        if (out.some((seen) => seen.id === message.id)) continue;
+        out.push({ id: message.id, agent: message.agent, text: message.text, at });
+      }
+    }
+    return out;
+  }, [agentMessages, goalLive, session?.goals]);
   /** 说与做并成一条时间线。时刻读不出来的排在最前——宁可前也不能藏。 */
   const timeline = useMemo(() => {
     type Item =
       | { kind: 'tool'; at: number; call: ToolCallRecord }
+      | { kind: 'agent'; at: number; agent: { id: string; agent: string; text: string; at: number } }
       | { kind: 'message'; at: number; message: ChatMessage };
     const items: Item[] = (session?.messages ?? []).map((message) => ({
       kind: 'message' as const,
@@ -261,9 +331,12 @@ export function ConversationPane({
     for (const call of tools) {
       items.push({ kind: 'tool' as const, at: Date.parse(call.startedAt), call });
     }
+    for (const turn of agentTurns) {
+      items.push({ kind: 'agent' as const, at: turn.at, agent: turn });
+    }
     const rank = (at: number) => (Number.isFinite(at) ? at : 0);
     return items.sort((a, b) => rank(a.at) - rank(b.at));
-  }, [session?.messages, tools]);
+  }, [session?.messages, tools, agentTurns]);
 
   // 打开就先把历史读回来。读过的不再读：重读会把刚流出来的这一段冲掉。
   useEffect(() => {
@@ -387,6 +460,8 @@ export function ConversationPane({
           {timeline.map((item) =>
             item.kind === 'tool' ? (
               <ToolTurn key={`tool-${item.call.id}`} call={item.call} />
+            ) : item.kind === 'agent' ? (
+              <AgentTurn key={`agent-${item.agent.id}`} turn={item.agent} />
             ) : (
               <Turn key={item.message.id} message={item.message} />
             )
