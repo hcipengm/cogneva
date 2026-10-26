@@ -34,6 +34,7 @@ rule_files:
 # rule: llm_usage_ledger_incomplete
 # rule: llm_call_without_declared_actor
 # rule: llm_cached_tokens_exceed_input
+# rule: llm_upstream_reading_outlives_its_pool_entry
 
 evaluation_interval: 1m
 
@@ -825,4 +826,68 @@ tests:
     alert_rule_test:
       - eval_time: 480m
         alertname: llm_upstream_declared_face_missing
+        exp_alerts: []
+
+  # 一户走了、池级的计数还在写：这条序列一小时多没有写者，而池自己每一拍都在
+  # 出声，所以不是写者停了，是配置里没有这一家了。亮，并点名是哪一家。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_healthy{upstream="gone"}'
+        values: '0x120'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{upstream="gone"}'
+        values: '3500x120'
+      - series: 'llm_upstream_healthy{upstream="live"}'
+        values: '1x120'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{upstream="live"}'
+        values: '7100x120'
+      - series: 'llm_pool_face_upstreams_observed_timestamp_seconds{face="anthropic"}'
+        values: '7100x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: llm_upstream_reading_outlives_its_pool_entry
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              upstream: gone
+
+  # 两家都在写：没有走的人，静。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_healthy{upstream="u1"}'
+        values: '1x120'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{upstream="u1"}'
+        values: '7100x120'
+      - series: 'llm_pool_face_upstreams_observed_timestamp_seconds{face="anthropic"}'
+        values: '7100x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: llm_upstream_reading_outlives_its_pool_entry
+        exp_alerts: []
+
+  # 写者整个停了：逐上游与池级一起冻住。那种静是另一条规则的事（池那一族自己会说），
+  # 在这里说「它离池了」指错修法 —— 所以这条合取腿就是为此存在的，静。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_healthy{upstream="u1"}'
+        values: '1x120'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{upstream="u1"}'
+        values: '3500x120'
+      - series: 'llm_pool_face_upstreams_observed_timestamp_seconds{face="anthropic"}'
+        values: '3500x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: llm_upstream_reading_outlives_its_pool_entry
+        exp_alerts: []
+
+  # 池级的计数根本不在这份抓取里：判不了，不是「都还在」。空集不许读成 0 —— 新生
+  # 进程还没发过池级那一格时就是这一形状，那时把逐上游判成离池等于凭空造一次离开。
+  - interval: 1m
+    input_series:
+      - series: 'llm_upstream_healthy{upstream="u1"}'
+        values: '1x120'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{upstream="u1"}'
+        values: '3500x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: llm_upstream_reading_outlives_its_pool_entry
         exp_alerts: []

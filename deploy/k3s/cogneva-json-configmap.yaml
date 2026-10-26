@@ -2143,6 +2143,16 @@ data:
                   "face": "token 管理"
                 },
                 {
+                  "name": "llm_upstream_reading_outlives_its_pool_entry",
+                  "promql": "((time() - max by (upstream) (llm_upstream_healthy_observed_timestamp_seconds)) > 3600) and on () (count(llm_upstream_healthy_observed_timestamp_seconds) > 0) and on () (count(llm_pool_face_upstreams_observed_timestamp_seconds and ((time() - llm_pool_face_upstreams_observed_timestamp_seconds) < 3600)) > 0)",
+                  "condition": {
+                    "greater_than": 0.0
+                  },
+                  "severity": "info",
+                  "summary": "This upstream's healthy reading is still on the surface and nothing has written it for over an hour, while the pool-level count is being written in the same tick: that pair says the entry was taken out of the configuration rather than the writer stopping. The store serves a gauge's newest row forever, so a removed upstream goes on answering in the present tense with its last value, and a reader counting the upstream series on this surface counts the pool that used to be there. Measured on this deployment on 2026-10-26: the family carried five upstreams while the configuration held two, and the three that had been removed had not been written for 7.7 days. {value} is how many seconds ago the last write was, which is also the answer to when it left. Why it left is on the refusal family the same last pass wrote: {upstream} carries a kind there -- entitlement for an account that waiting cannot repair, quota_cycle for a window that expires -- and those two call for different people, one to fix the account and one to wait. This names the entry that stayed, not the departure: the tick that dropped it published nothing to say so, so the surface carries it and this reading is taken an hour later. A rename is one departure and not two: the old key stops being written while the new one starts in the same tick, and only the old one ages out here. When the pool's own count stops being written as well the last conjunct fails and this falls quiet -- that is a writer that stopped, which the pool rules beside this one already report, and saying 'it left the pool' about it would be the wrong repair. A pool this process has never published at all produces no series, so this cannot fire on a fresh deployment: absence is not a departure, and the count being absent leaves the conjunction empty rather than true.",
+                  "face": "读数正确性"
+                },
+                {
                   "name": "metrics_log_at_floor_capacity",
                   "promql": "(max without (pod, container, instance) (max_over_time(metrics_samples_over_capacity[30m]) and ((time() - metrics_samples_over_capacity_observed_timestamp_seconds) < 1800))) > 0",
                   "condition": {
