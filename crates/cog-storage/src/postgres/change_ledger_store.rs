@@ -488,6 +488,31 @@ const RECORD_DELIVERY_SQL: &str = "\
 UPDATE change_ledger SET delivered_rev = $4
  WHERE kind = $1 AND scope = $2 AND literal = $3 AND delivered_rev IS NULL";
 
+/// Say why the outstanding queue is not moving: the pool has no upstream that
+/// can serve.
+///
+/// `COALESCE` keeps the first moment the row was found stuck rather than the
+/// latest pass that found it again, because the reading a person acts on is
+/// "waiting since", not "still waiting as of the last four minutes". The `OR`
+/// clause is what keeps this write narrow: a row somebody blocked for a reason
+/// of their own is not this pass's to relabel -- overwriting it would erase the
+/// one fact that distinguished "waiting on a person" from "waiting on a pool",
+/// which is the whole point of the column.
+const STAMP_POOL_BLOCK_SQL: &str = "\
+UPDATE change_ledger
+   SET blocked_reason = 'pool_unavailable',
+       unblock_condition = $1,
+       blocked_since = COALESCE(blocked_since, now())
+ WHERE state = 'pending'
+   AND (blocked_reason IS NULL OR blocked_reason = 'pool_unavailable')";
+
+/// Take the pool block back off. Keyed on the reason, not on "blocked": the
+/// pool coming back says nothing about a row waiting on an owner.
+const CLEAR_POOL_BLOCK_SQL: &str = "\
+UPDATE change_ledger
+   SET blocked_reason = NULL, unblock_condition = NULL, blocked_since = NULL
+ WHERE blocked_reason = 'pool_unavailable'";
+
 /// Append one dispatch pass's own reading.
 ///
 /// Plain insert, no conflict clause: the row is an observation of a moment, and
@@ -1264,6 +1289,23 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .await
             .map_err(|e| SFError::Database(format!("record delivery: {e}")))?;
         Ok(())
+    }
+
+    async fn stamp_pool_block(&self, unblock_condition: &str) -> SFResult<u64> {
+        let result = sqlx::query(STAMP_POOL_BLOCK_SQL)
+            .bind(unblock_condition)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("stamp pool block: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn clear_pool_block(&self) -> SFResult<u64> {
+        let result = sqlx::query(CLEAR_POOL_BLOCK_SQL)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("clear pool block: {e}")))?;
+        Ok(result.rows_affected())
     }
 
     async fn get(&self, identity: &ChangeIdentity) -> SFResult<Option<ChangeLedgerRow>> {

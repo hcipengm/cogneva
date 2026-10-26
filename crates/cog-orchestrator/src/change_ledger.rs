@@ -152,6 +152,17 @@ pub const CHANGE_LEDGER_ROLE: &str = "change_ledger";
 /// threshold.
 pub const CHANGE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(300);
 
+/// What a reader of a blocked row is told ends the wait.
+///
+/// Written into `change_ledger.unblock_condition`, so it has to be readable
+/// without a meeting and phrased as a condition rather than as a status: the
+/// column exists so a later pass -- not the person who declared the block -- can
+/// decide the wait is over. The database refuses anything shorter than eight
+/// characters, which is the migration saying the same thing.
+const POOL_BLOCK_CONDITION: &str = "\
+网关至少有一个上游能被池读到：之后任何一拍 change_dispatch_state.decision 为 proceed，\
+这一批行就自己解开，不需要有人逐条来清";
+
 /// How many firing alerts one pass reads when it counts the ones no face owns.
 ///
 /// A bound is needed because the read returns the rows themselves; it is set
@@ -3404,6 +3415,36 @@ async fn dispatch_pass(
     // would be a reading face that is blind where it is read.
     let pausing = verdict.decision == DispatchDecision::PausedLlmPoolUnavailable;
 
+    // Written on the pass's own verdict rather than inside the row loop: the
+    // block is a statement about the queue, and the loop's `continue`s skip rows
+    // for reasons that have nothing to do with the pool. Without this write the
+    // only record of the pause is the pass table, and nobody reads a pass table
+    // to decide whether one change should be chased: a row waiting for an
+    // upstream that is down and a row nobody has reached read identically on the
+    // account, while the two want different actions. The clear runs on every
+    // pass that could hand work over -- the same statement that proves the pool
+    // serves is the one that releases the wait.
+    match if pausing {
+        store.stamp_pool_block(POOL_BLOCK_CONDITION).await
+    } else {
+        store.clear_pool_block().await
+    } {
+        Ok(0) => {}
+        Ok(rows) if pausing => info!(
+            rows,
+            "change ledger: the outstanding queue is marked as waiting on the pool"
+        ),
+        Ok(rows) => info!(
+            rows,
+            "change ledger: the pool serves again, the wait on it is cleared"
+        ),
+        Err(e) => warn!(
+            error = %e,
+            "change ledger: the blocked columns could not be written, so the account \
+             reads as though nothing were waiting on the pool"
+        ),
+    }
+
     // The batch this pass may hand over: the tick's own ceiling, lowered by what
     // the window left when the snapshot measured one. Derived once, from the same
     // verdict the pass writes down, so the row and the batch cannot disagree about
@@ -6553,11 +6594,28 @@ mod tests {
         /// under test would be indistinguishable from one that ran them the
         /// other way round.
         settled: std::sync::Mutex<std::collections::HashSet<ChangeIdentity>>,
+        /// Why a row is not being worked on. Seeded by a test that wants a block
+        /// somebody else declared, and written by the pass under test.
+        blocked: std::sync::Mutex<std::collections::HashMap<ChangeIdentity, String>>,
     }
 
     impl FakeLedger {
         fn written(&self) -> Vec<DispatchState> {
             self.written.lock().unwrap().clone()
+        }
+
+        /// Every block the double holds, by scope, so a test compares a list
+        /// rather than a hash map's iteration order.
+        fn blocks(&self) -> Vec<(String, String)> {
+            let mut held: Vec<(String, String)> = self
+                .blocked
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(identity, reason)| (identity.scope.clone(), reason.clone()))
+                .collect();
+            held.sort();
+            held
         }
 
         fn parent_observations(&self) -> Vec<(ChangeIdentity, String)> {
@@ -6599,6 +6657,39 @@ mod tests {
                 .unwrap()
                 .push((identity.clone(), rev.to_string()));
             Ok(())
+        }
+        // The three blocked columns travel together by the migration's own
+        // CHECK, so the double tracks the one that says which wait it is: a
+        // reason present is a block, and the condition and the start are carried
+        // beside it or not at all.
+        async fn stamp_pool_block(&self, _unblock_condition: &str) -> SFResult<u64> {
+            let settled = self.settled.lock().unwrap().clone();
+            let mut blocked = self.blocked.lock().unwrap();
+            let mut touched = 0;
+            for row in &self.rows {
+                if !row.state.is_outstanding() || settled.contains(&row.identity) {
+                    continue;
+                }
+                match blocked.get(&row.identity).map(String::as_str) {
+                    // Unblocked: this pass is the one that finds it stuck.
+                    None => {
+                        blocked.insert(row.identity.clone(), "pool_unavailable".to_string());
+                        touched += 1;
+                    }
+                    // Already waiting on the pool: the statement matches the row
+                    // again (it is a row of the update), but the start stays put.
+                    Some("pool_unavailable") => touched += 1,
+                    // Somebody else's block is not this pass's to overwrite.
+                    Some(_) => {}
+                }
+            }
+            Ok(touched)
+        }
+        async fn clear_pool_block(&self) -> SFResult<u64> {
+            let mut blocked = self.blocked.lock().unwrap();
+            let before = blocked.len();
+            blocked.retain(|_, reason| reason != "pool_unavailable");
+            Ok((before - blocked.len()) as u64)
         }
         async fn declare(&self, _readings: &[ChangeReading]) -> SFResult<usize> {
             Ok(0)
@@ -6915,6 +7006,21 @@ mod tests {
         }
         async fn replay_dlq(&self, _task_id: &str) -> SFResult<bool> {
             Ok(false)
+        }
+    }
+
+    /// A pool whose configured upstreams can serve: the reading that ends a
+    /// wait declared on the pool's account.
+    struct ServingPool;
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmPoolStatusSource for ServingPool {
+        async fn status(&self) -> Option<LlmPoolStatus> {
+            Some(LlmPoolStatus {
+                unavailable: false,
+                pool_size: 1,
+                ..Default::default()
+            })
         }
     }
 
@@ -8203,6 +8309,86 @@ mod tests {
         assert!(
             read_back.is_none(),
             "an absent reading is not the posture to carry into the next pass"
+        );
+    }
+
+    /// A paused pass says on the rows themselves why they are not moving, and
+    /// the pass that can hand over again takes that wait back off -- while a
+    /// block somebody else declared survives both.
+    ///
+    /// The account could not answer "why is this row not being worked on" before:
+    /// two thousand rows nobody had reached and two thousand rows waiting on a
+    /// pool with no reachable upstream read exactly alike off the state columns,
+    /// and the two want different actions. The pass table held the pause, but
+    /// nobody reads a pass table to decide whether one change should be chased,
+    /// and a pending set that nothing is acting on reads the same as one nobody
+    /// has reached. The reason lives on the row for that: a reader asking which
+    /// work to send someone after can tell the two apart without correlating two
+    /// tables, and the condition column says when the wait ends by itself.
+    ///
+    /// Both directions are here because each is a way to get this wrong: a clear
+    /// written over every blocked row reports the person-blocked row as free the
+    /// moment the pool comes back, and a stamp that overwrote whatever reason it
+    /// found erases that same row on the way in.
+    #[tokio::test]
+    async fn a_paused_pass_marks_the_queue_as_waiting_on_the_pool_and_a_serving_pass_takes_it_back()
+    {
+        let waiting_on_a_person = pending_row("crates/b");
+        let store = FakeLedger {
+            rows: vec![pending_row("crates/a"), waiting_on_a_person.clone()],
+            ..Default::default()
+        };
+        store.blocked.lock().unwrap().insert(
+            waiting_on_a_person.identity.clone(),
+            "owner_decision".to_string(),
+        );
+
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            Some(&DeadPool),
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            store.blocks(),
+            vec![
+                ("crates/a".to_string(), "pool_unavailable".to_string()),
+                ("crates/b".to_string(), "owner_decision".to_string()),
+            ],
+            "a pass that withheld the queue on the pool's account has to say so on the rows, \
+             and a block somebody else declared is not its to relabel"
+        );
+
+        // The pool serves again. The wait this pass declared ends; the wait a
+        // person owns does not, and nothing about a serving pool says it does.
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            Some(&ServingPool),
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            store.blocks(),
+            vec![("crates/b".to_string(), "owner_decision".to_string())],
+            "a clear keyed on 'blocked at all' would report the person-blocked row as free"
         );
     }
 

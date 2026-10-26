@@ -205,6 +205,14 @@ impl ChangeLedgerStore for FakeLedger {
         unimplemented!("the read route does not record deliveries")
     }
 
+    async fn stamp_pool_block(&self, _unblock_condition: &str) -> SFResult<u64> {
+        unimplemented!("the read route does not write blocks")
+    }
+
+    async fn clear_pool_block(&self) -> SFResult<u64> {
+        unimplemented!("the read route does not write blocks")
+    }
+
     async fn get(&self, identity: &ChangeIdentity) -> SFResult<Option<ChangeLedgerRow>> {
         Ok(self
             .rows

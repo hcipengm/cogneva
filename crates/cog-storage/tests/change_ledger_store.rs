@@ -1903,6 +1903,122 @@ async fn a_landings_parent_reading_is_written_once_and_the_backfill_answers_with
     cleanup(&pool, &marker).await;
 }
 
+/// The pool block is written narrow and released narrow: it lands only on the
+/// rows still owed and unblocked, keeps the start the first pass gave it, leaves
+/// a wait somebody else declared alone on the way in, and the clear takes back
+/// only the wait the pool declared.
+///
+/// None of this can be read off the SQL text. The `COALESCE` keeps the start,
+/// the `OR` clause is what refuses to relabel a person's block, and the clear's
+/// key is the difference between "the pool serves again" and "every row is
+/// free" -- a reader acting on the second would stop chasing rows nobody ever
+/// unblocked. The row also has to be `pending`: a landed row has no work to wait
+/// for, and a block left on it would count in a by-reason census forever.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_pool_block_lands_only_on_the_owed_rows_and_the_clear_takes_back_only_it() {
+    let (store, pool, marker) = store().await;
+    let unblocked = identity(&marker, "unblocked");
+    let person = identity(&marker, "person");
+    let settled = identity(&marker, "settled");
+    for (id, state) in [
+        (&unblocked, ChangeState::Pending),
+        (&person, ChangeState::Pending),
+        (&settled, ChangeState::Landed),
+    ] {
+        store
+            .apply_measurement(&ChangeMeasurement::new(id.clone(), state))
+            .await
+            .expect("write a measurement");
+    }
+    // A block a person owns, already on one of the rows.
+    sqlx::query(
+        "UPDATE change_ledger \
+            SET blocked_reason = 'owner_decision', \
+                unblock_condition = 'a person decides this one', \
+                blocked_since = now() \
+          WHERE kind = $1 AND scope = $2 AND literal = $3",
+    )
+    .bind(&person.kind)
+    .bind(&person.scope)
+    .bind(&person.literal)
+    .execute(&pool)
+    .await
+    .expect("seed the person's block");
+
+    let reading = |pool: PgPool, id: ChangeIdentity| async move {
+        sqlx::query_as::<
+            _,
+            (
+                Option<String>,
+                Option<String>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ),
+        >(
+            "SELECT blocked_reason, unblock_condition, blocked_since FROM change_ledger \
+             WHERE kind = $1 AND scope = $2 AND literal = $3",
+        )
+        .bind(&id.kind)
+        .bind(&id.scope)
+        .bind(&id.literal)
+        .fetch_one(&pool)
+        .await
+        .expect("read the blocked columns back")
+    };
+
+    store
+        .stamp_pool_block("an upstream the pool can reach")
+        .await
+        .expect("stamp the pool block");
+    let (reason, condition, since) = reading(pool.clone(), unblocked.clone()).await;
+    assert_eq!(
+        reason.as_deref(),
+        Some("pool_unavailable"),
+        "an owed, unblocked row is what the pass withheld"
+    );
+    assert_eq!(condition.as_deref(), Some("an upstream the pool can reach"));
+    let since = since.expect("a block carries the moment it started");
+    assert_eq!(
+        reading(pool.clone(), person.clone()).await.0.as_deref(),
+        Some("owner_decision"),
+        "a block a person declared is not this pass's to relabel"
+    );
+    assert_eq!(
+        reading(pool.clone(), settled.clone()).await.0,
+        None,
+        "a landed row has no work to wait for"
+    );
+
+    // Stamping again is what a second paused pass does; the wait it reports
+    // started when it was first found, not when it was last noticed.
+    store
+        .stamp_pool_block("an upstream the pool can reach")
+        .await
+        .expect("stamp the pool block again");
+    assert_eq!(
+        reading(pool.clone(), unblocked.clone()).await.2,
+        Some(since),
+        "the start of the wait must not move with every pass that finds it"
+    );
+
+    store
+        .clear_pool_block()
+        .await
+        .expect("clear the pool block");
+    assert_eq!(
+        reading(pool.clone(), unblocked.clone()).await,
+        (None, None, None),
+        "the row the pool was holding is free again"
+    );
+    assert_eq!(
+        reading(pool.clone(), person.clone()).await.0.as_deref(),
+        Some("owner_decision"),
+        "a serving pool says nothing about a row waiting on a person"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
 async fn cleanup(pool: &PgPool, marker: &str) {
     // One transaction, and the closure lock first: the deletes below are what a
     // neighbour's two reads of the whole-account closure must not see half of,

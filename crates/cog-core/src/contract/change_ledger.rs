@@ -1189,6 +1189,35 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// a reader asking "when did this reach the line" wants.
     async fn record_delivery(&self, identity: &ChangeIdentity, rev: &str) -> SFResult<()>;
 
+    /// Mark the outstanding queue as waiting on the LLM pool, with the fact that
+    /// ends the wait.
+    ///
+    /// A block is not a state: the row is still owed and still measured, and
+    /// nothing about the tree is said by this write. What it says is why nobody
+    /// can act on the row *now* -- and that is the one thing a reader of the
+    /// account could not get before. "Two thousand rows nobody has reached" and
+    /// "two thousand rows waiting for an upstream the gateway can reach" read
+    /// identically off the state columns, and the two want different actions:
+    /// sending someone after the first is wasted work, and only the second can
+    /// say what it is waiting for and when it ends by itself.
+    ///
+    /// Scoped to the rows that are still owed and either unblocked or blocked for
+    /// this same reason: a block somebody else declared is not this pass's to
+    /// overwrite, and clearing it by stamping over it would erase the one fact
+    /// that made the row wait on a person rather than on the pool. Stamping again
+    /// leaves the start where it was, so "waiting since" keeps meaning the first
+    /// pass that found it stuck rather than the latest one.
+    async fn stamp_pool_block(&self, unblock_condition: &str) -> SFResult<u64>;
+
+    /// Clear the pool block from every row carrying it.
+    ///
+    /// Called by a pass that could hand work over again. Deliberately keyed on
+    /// the reason rather than on "every blocked row": a block declared for
+    /// another reason is still true when the pool comes back, and a clear written
+    /// over all of them would report every waiting-on-a-person row as free -- the
+    /// same silent rewrite the writer above avoids, in the other direction.
+    async fn clear_pool_block(&self) -> SFResult<u64>;
+
     /// One row, by the identity that names it.
     async fn get(&self, identity: &ChangeIdentity) -> SFResult<Option<ChangeLedgerRow>>;
 
