@@ -802,13 +802,26 @@ impl AgentRuntime {
         let mut count = 0;
         for record in records {
             // Reconstruct AgentEvent from WalRecord payload
-            if let Ok(event) = wal_record_to_agent_event(&record) {
-                // 重放事件直发 broadcast（本地状态重建），不进运行时 mpsc：
-                // mpsc 下游的总线投递只认活体流量，重放再进总线会被摄取侧
-                // 当成新事件重复建档。无订阅者时 send 报错属正常，不算失败。
-                let _ = sink.send(event);
-                count += 1;
-            }
+            let event = match wal_record_to_agent_event(&record) {
+                Ok(event) => event,
+                Err(e) => {
+                    // 读不回来的记录过去被 `if let Ok` 悄悄跳过：恢复以后少了一段历史，
+                    // 而盘上和日志里都没有痕迹说它丢过。留一行带序号与身份的日志，
+                    // 「重放比 WAL 短」这件事才可归因。
+                    tracing::warn!(
+                        session = %record.session_id,
+                        seq = record.seq,
+                        error = %e,
+                        "WAL replay skipped an undecodable record"
+                    );
+                    continue;
+                }
+            };
+            // 重放事件直发 broadcast（本地状态重建），不进运行时 mpsc：
+            // mpsc 下游的总线投递只认活体流量，重放再进总线会被摄取侧
+            // 当成新事件重复建档。无订阅者时 send 报错属正常，不算失败。
+            let _ = sink.send(event);
+            count += 1;
         }
         Ok(count)
     }
@@ -2256,11 +2269,24 @@ fn wal_record_to_agent_event(
         WalEventType::ResourceAlert => "resource_alert",
         WalEventType::Heartbeat => "heartbeat",
         WalEventType::CheckpointSaved => "checkpoint_saved",
-        WalEventType::Custom { name } => {
-            return Err(serde::de::Error::custom(format!(
-                "cannot replay custom WAL event: {name}"
-            )));
-        }
+        // 写盘那一侧过去把这七种事件写成 `Custom { name }`，而 `WalEventType` 里
+        // 它们各有专用变体。盘上已经躺着这样的记录，重启恢复时按 `Custom` 一律放弃，
+        // 于是报错、心跳、检查点、自审这几类在重放里静默消失（`replay_events` 用
+        // `if let Ok` 跳过，连日志都没有）。这七个名字照旧认回来，老记录才读得回。
+        WalEventType::Custom { name } => match name.as_str() {
+            "self_review" => "self_review",
+            "react_step_start" => "react_step_start",
+            "react_step_end" => "react_step_end",
+            "agent_error" => "agent_error",
+            "resource_alert" => "resource_alert",
+            "heartbeat" => "heartbeat",
+            "checkpoint_saved" => "checkpoint_saved",
+            _ => {
+                return Err(serde::de::Error::custom(format!(
+                    "cannot replay custom WAL event: {name}"
+                )));
+            }
+        },
     };
 
     let mut payload = record.payload.clone();
@@ -2346,6 +2372,7 @@ mod ledger_identity_tests {
 mod tests {
     use super::*;
     use cog_core::SkillConfig;
+    use serde_json::json;
 
     /// A reset clears the run's context and keeps everything the instance was
     /// built with.
@@ -2790,6 +2817,237 @@ mod tests {
         assert!(
             matches!(replayed_events[1], AgentEvent::TurnStart { .. }),
             "second replayed event should be TurnStart"
+        );
+    }
+
+    /// 每一种写进 WAL 的事件，都必须能原样读回来。
+    ///
+    /// 这里盯的是**写盘用了哪种记录类型**，不是读盘能不能兜住：过去七种事件被写成
+    /// `Custom { name }`，而 `WalEventType` 里它们各有专用变体；重放那条路对认不出的
+    /// 记录是 `if let Ok(...)`，于是那些记录重启后既不重放也不报错，盘上没有任何
+    /// 痕迹说它们丢过。七种改成专用变体之后，同一个形状再出现一次（新事件接着写
+    /// `Custom`）就靠这一条红。
+    #[tokio::test]
+    async fn every_written_event_reads_back() {
+        let now = chrono::Utc::now();
+        let agent = "agent-1".to_string();
+        let cases = vec![
+            AgentEvent::AgentStart {
+                agent_id: agent.clone(),
+                crew_id: Some("crew-1".into()),
+                squad_id: None,
+                timestamp: now,
+            },
+            AgentEvent::AgentEnd {
+                agent_id: agent.clone(),
+                messages: vec![Message::user("done")],
+                crew_id: None,
+                squad_id: None,
+                timestamp: now,
+            },
+            AgentEvent::TurnStart {
+                agent_id: agent.clone(),
+                timestamp: now,
+            },
+            AgentEvent::TurnEnd {
+                agent_id: agent.clone(),
+                message: Message::user("turn done"),
+                tool_results: Vec::new(),
+                timestamp: now,
+            },
+            AgentEvent::MessageStart {
+                agent_id: agent.clone(),
+                message: Message::user("hi"),
+                timestamp: now,
+            },
+            AgentEvent::MessageUpdate {
+                agent_id: agent.clone(),
+                assistant_event: AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: "partial".into(),
+                    timestamp: now,
+                },
+                timestamp: now,
+            },
+            AgentEvent::MessageEnd {
+                agent_id: agent.clone(),
+                message: Message::user("hi"),
+                timestamp: now,
+            },
+            AgentEvent::ToolExecutionStart {
+                agent_id: agent.clone(),
+                tool_call_id: "call-1".into(),
+                tool_name: "read_file".into(),
+                args: json!({ "path": "/tmp/x" }),
+                timestamp: now,
+            },
+            AgentEvent::ToolExecutionUpdate {
+                agent_id: agent.clone(),
+                tool_call_id: "call-1".into(),
+                partial_result: json!({ "bytes": 12 }),
+                timestamp: now,
+            },
+            AgentEvent::ToolExecutionEnd {
+                agent_id: agent.clone(),
+                tool_call_id: "call-1".into(),
+                result: json!({ "ok": true }),
+                is_error: false,
+                timestamp: now,
+            },
+            AgentEvent::StateChange {
+                agent_id: agent.clone(),
+                from: "idle".into(),
+                to: "thinking".into(),
+                crew_id: None,
+                squad_id: None,
+                timestamp: now,
+            },
+            AgentEvent::TaskStatusChange {
+                task_id: "task-1".into(),
+                status: "running".into(),
+                agent_id: Some(agent.clone()),
+                crew_id: None,
+                squad_id: None,
+                timestamp: now,
+            },
+            AgentEvent::SelfReview {
+                agent_id: agent.clone(),
+                status: "PASS".into(),
+                score: 0.9,
+                summary: Some("looks right".into()),
+                critique: None,
+                suggestions: Some(vec!["none".into()]),
+                timestamp: now,
+            },
+            AgentEvent::ReActStepStart {
+                agent_id: agent.clone(),
+                iteration: 2,
+                timestamp: now,
+            },
+            AgentEvent::ReActStepEnd {
+                agent_id: agent.clone(),
+                iteration: 2,
+                thought: "read the file".into(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({ "path": "/tmp/x" }),
+                }],
+                observations: vec![json!({ "ok": true })],
+                timestamp: now,
+            },
+            AgentEvent::AgentError {
+                agent_id: agent.clone(),
+                error_code: "llm_upstream".into(),
+                severity: cog_core::ErrorSeverity::Critical,
+                details: "429".into(),
+                crew_id: None,
+                squad_id: None,
+                timestamp: now,
+            },
+            AgentEvent::ResourceAlert {
+                agent_id: agent.clone(),
+                metric: "cpu".into(),
+                threshold: 0.9,
+                current: 0.95,
+                crew_id: None,
+                squad_id: None,
+                timestamp: now,
+            },
+            AgentEvent::Heartbeat {
+                agent_id: agent.clone(),
+                timestamp: now,
+            },
+            AgentEvent::CheckpointSaved {
+                agent_id: agent.clone(),
+                checkpoint_id: "ckpt-1".into(),
+                task_id: "task-1".into(),
+                crew_id: None,
+                squad_id: None,
+                timestamp: now,
+            },
+        ];
+
+        for event in cases {
+            let what = serde_json::to_value(&event).unwrap()["type"]
+                .as_str()
+                .expect("每种事件都带 type 字段")
+                .to_string();
+            let backend = Arc::new(MockWalBackend::default());
+            let wal = crate::wal::AgentWal::new(backend, "s").await.unwrap();
+            wal.append(&event).await.expect("append");
+            let records = wal.read_since(0).await.expect("read_since");
+            assert_eq!(records.len(), 1, "{what} 应该写进一条记录");
+            let record = &records[0];
+            assert!(
+                !matches!(record.event_type, cog_core::WalEventType::Custom { .. }),
+                "{what} 被写成了兜底类型 Custom：读盘那头只认专用变体，\
+                 这条记录会从重放里静默消失"
+            );
+            let decoded = wal_record_to_agent_event(record)
+                .unwrap_or_else(|e| panic!("{what} 读不回来：{e}"));
+            assert_eq!(decoded, event, "{what} 读回来的不是写进去的那条事件");
+        }
+    }
+
+    /// 专用变体之前写下的 `Custom { name }` 记录仍旧读得回来，未知名字仍旧报错。
+    #[test]
+    fn legacy_custom_wal_records_still_decode() {
+        let now = chrono::Utc::now();
+        let cases = vec![
+            (
+                "self_review",
+                json!({"agent_id":"a1","status":"PASS","score":0.9,"timestamp":now}),
+            ),
+            (
+                "react_step_start",
+                json!({"agent_id":"a1","iteration":1,"timestamp":now}),
+            ),
+            (
+                "react_step_end",
+                json!({"agent_id":"a1","iteration":1,"thought":"t","tool_calls":[],"observations":[],"timestamp":now}),
+            ),
+            (
+                "agent_error",
+                json!({"agent_id":"a1","error_code":"e","severity":"critical","details":"d","timestamp":now}),
+            ),
+            (
+                "resource_alert",
+                json!({"agent_id":"a1","metric":"cpu","threshold":0.9,"current":0.95,"timestamp":now}),
+            ),
+            ("heartbeat", json!({"agent_id":"a1","timestamp":now})),
+            (
+                "checkpoint_saved",
+                json!({"agent_id":"a1","checkpoint_id":"c1","task_id":"t1","timestamp":now}),
+            ),
+        ];
+        for (name, payload) in cases {
+            let record = cog_core::WalRecord::new(
+                0,
+                "s",
+                cog_core::WalEventType::Custom { name: name.into() },
+                payload,
+            );
+            let decoded = wal_record_to_agent_event(&record)
+                .unwrap_or_else(|e| panic!("盘上的老记录 {name} 读不回来：{e}"));
+            assert_eq!(
+                serde_json::to_value(&decoded).unwrap()["type"],
+                json!(name),
+                "老记录 {name} 读成了别的事件"
+            );
+        }
+
+        let unknown = cog_core::WalRecord::new(
+            0,
+            "s",
+            cog_core::WalEventType::Custom {
+                name: "no_such_kind".into(),
+            },
+            json!({ "agent_id": "a1" }),
+        );
+        assert!(
+            wal_record_to_agent_event(&unknown).is_err(),
+            "未知的 Custom 名字必须报错——静默返回一个凑合的事件，等于把它记成了没发生过"
         );
     }
 

@@ -61,20 +61,33 @@ fn agent_event_to_wal(event: &AgentEvent) -> (WalEventType, serde_json::Value) {
     match event {
         AgentEvent::AgentStart {
             agent_id,
+            crew_id,
+            squad_id,
             timestamp,
-            ..
         } => (
             WalEventType::AgentStart,
-            json!({ "agent_id": agent_id, "timestamp": timestamp }),
+            json!({
+                "agent_id": agent_id,
+                "crew_id": crew_id,
+                "squad_id": squad_id,
+                "timestamp": timestamp
+            }),
         ),
         AgentEvent::AgentEnd {
             agent_id,
             messages,
+            crew_id,
+            squad_id,
             timestamp,
-            ..
         } => (
             WalEventType::AgentEnd,
-            json!({ "agent_id": agent_id, "messages": messages, "timestamp": timestamp }),
+            json!({
+                "agent_id": agent_id,
+                "messages": messages,
+                "crew_id": crew_id,
+                "squad_id": squad_id,
+                "timestamp": timestamp
+            }),
         ),
         AgentEvent::TurnStart {
             agent_id,
@@ -175,14 +188,17 @@ fn agent_event_to_wal(event: &AgentEvent) -> (WalEventType, serde_json::Value) {
             agent_id,
             from,
             to,
+            crew_id,
+            squad_id,
             timestamp,
-            ..
         } => (
             WalEventType::StateChange,
             json!({
                 "agent_id": agent_id,
                 "from": from,
                 "to": to,
+                "crew_id": crew_id,
+                "squad_id": squad_id,
                 "timestamp": timestamp
             }),
         ),
@@ -190,14 +206,17 @@ fn agent_event_to_wal(event: &AgentEvent) -> (WalEventType, serde_json::Value) {
             task_id,
             status,
             agent_id,
+            crew_id,
+            squad_id,
             timestamp,
-            ..
         } => (
             WalEventType::TaskStatusChange,
             json!({
                 "task_id": task_id,
                 "status": status,
                 "agent_id": agent_id,
+                "crew_id": crew_id,
+                "squad_id": squad_id,
                 "timestamp": timestamp
             }),
         ),
@@ -210,9 +229,7 @@ fn agent_event_to_wal(event: &AgentEvent) -> (WalEventType, serde_json::Value) {
             suggestions,
             timestamp,
         } => (
-            WalEventType::Custom {
-                name: "self_review".into(),
-            },
+            WalEventType::SelfReview,
             json!({
                 "agent_id": agent_id,
                 "status": review_status,
@@ -228,9 +245,7 @@ fn agent_event_to_wal(event: &AgentEvent) -> (WalEventType, serde_json::Value) {
             iteration,
             timestamp,
         } => (
-            WalEventType::Custom {
-                name: "react_step_start".into(),
-            },
+            WalEventType::ReActStepStart,
             json!({
                 "agent_id": agent_id,
                 "iteration": iteration,
@@ -245,9 +260,7 @@ fn agent_event_to_wal(event: &AgentEvent) -> (WalEventType, serde_json::Value) {
             observations,
             timestamp,
         } => (
-            WalEventType::Custom {
-                name: "react_step_end".into(),
-            },
+            WalEventType::ReActStepEnd,
             json!({
                 "agent_id": agent_id,
                 "iteration": iteration,
@@ -266,9 +279,7 @@ fn agent_event_to_wal(event: &AgentEvent) -> (WalEventType, serde_json::Value) {
             squad_id,
             timestamp,
         } => (
-            WalEventType::Custom {
-                name: "agent_error".into(),
-            },
+            WalEventType::AgentError,
             json!({
                 "agent_id": agent_id,
                 "error_code": error_code,
@@ -288,9 +299,7 @@ fn agent_event_to_wal(event: &AgentEvent) -> (WalEventType, serde_json::Value) {
             squad_id,
             timestamp,
         } => (
-            WalEventType::Custom {
-                name: "resource_alert".into(),
-            },
+            WalEventType::ResourceAlert,
             json!({
                 "agent_id": agent_id,
                 "metric": metric,
@@ -305,9 +314,7 @@ fn agent_event_to_wal(event: &AgentEvent) -> (WalEventType, serde_json::Value) {
             agent_id,
             timestamp,
         } => (
-            WalEventType::Custom {
-                name: "heartbeat".into(),
-            },
+            WalEventType::Heartbeat,
             json!({
                 "agent_id": agent_id,
                 "timestamp": timestamp
@@ -321,9 +328,7 @@ fn agent_event_to_wal(event: &AgentEvent) -> (WalEventType, serde_json::Value) {
             squad_id,
             timestamp,
         } => (
-            WalEventType::Custom {
-                name: "checkpoint_saved".into(),
-            },
+            WalEventType::CheckpointSaved,
             json!({
                 "agent_id": agent_id,
                 "checkpoint_id": checkpoint_id,
