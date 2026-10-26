@@ -29,6 +29,7 @@ use cog_core::{
     Face, FaceImportOutcome, FaceKind, FaceSpec, GovernanceStore, Handover, StateBackend, Task,
     TaskStatus, HANDOVER_TASK_TYPE,
 };
+use cog_orchestrator::face_drift::UnexplainedOwner;
 use cog_storage::{PostgresGovernanceStore, PostgresStateBackend, RedisAgentRegistry};
 
 /// Columns of a roster row, in the order the file writes them.
@@ -571,18 +572,7 @@ async fn project(
     );
 
     let mut faces_tsv = String::from(&stamp);
-    faces_tsv.push_str(&format!(
-        "# owners_no_act_explains: {}\n",
-        unexplained.len()
-    ));
-    for row in &unexplained {
-        faces_tsv.push_str(&format!(
-            "# unexplained_owner: face={} owner={} roster_said={}\n",
-            row.face_id,
-            row.owner_unit,
-            row.roster_said.as_deref().unwrap_or("-"),
-        ));
-    }
+    faces_tsv.push_str(&unexplained_owner_lines(&unexplained));
     faces_tsv.push_str(&render_roster(&projected));
 
     let mut drift_tsv = String::from(&stamp);
@@ -665,6 +655,37 @@ async fn project(
         unexplained.len()
     );
     Ok(())
+}
+
+/// The header lines naming faces whose owner nothing on record explains.
+///
+/// Tab-separated because a face id is not: the registry has ids with spaces in
+/// them (`token 管理`) and ids with slashes (`CI/构建/部署`), and a roster value
+/// carries a slash of its own (`operator/8b2`). A line split on whitespace
+/// would turn `token 管理` into a face called `token` plus a stray word, and
+/// the slash would make two different fields read as the same shape -- both
+/// silently, since the reader that guessed wrong still gets a plausible
+/// answer. Tab is what this file already uses between columns, and no id
+/// contains one.
+fn unexplained_owner_lines(rows: &[UnexplainedOwner]) -> String {
+    if rows.is_empty() {
+        return "# owners_no_act_explains: 0\n".to_string();
+    }
+    // The field order is written next to the count rather than in a separate
+    // column header: the two lines are read together or not at all.
+    let mut out = format!(
+        "# owners_no_act_explains: {} (face<TAB>owner<TAB>roster_said)\n",
+        rows.len()
+    );
+    for row in rows {
+        out.push_str(&format!(
+            "# unexplained_owner: {}\t{}\t{}\n",
+            row.face_id,
+            row.owner_unit,
+            row.roster_said.as_deref().unwrap_or("-"),
+        ));
+    }
+    out
 }
 
 /// One parsed roster row.
@@ -1531,6 +1552,70 @@ mod tests {
             summary.line().contains("bindings_erased=0"),
             "the line has to carry the count even when it is zero: a reader that has to tell \
              'absent' from 'zero' cannot do it from a missing cell"
+        );
+    }
+
+    /// The header has to survive the face ids the registry actually has.
+    ///
+    /// Two of them carry a space (`token 管理`) and one carries a slash
+    /// (`CI/构建/部署`), which is also the separator inside a roster value
+    /// (`operator/8b2`). A line split on whitespace reads the first as a face
+    /// called `token` plus a stray word; a line split on slashes reads the
+    /// last as a face called `CI` plus a roster value called `构建`. Both give
+    /// a plausible answer, which is why the check is on the round trip and not
+    /// on the rendering.
+    #[test]
+    fn a_face_id_with_a_space_or_a_slash_survives_the_header() {
+        let rows = vec![
+            UnexplainedOwner {
+                face_id: "token 管理".into(),
+                owner_unit: "f5".into(),
+                roster_said: Some("worker".into()),
+            },
+            UnexplainedOwner {
+                face_id: "CI/构建/部署".into(),
+                owner_unit: "f5".into(),
+                roster_said: Some("operator/8b2".into()),
+            },
+        ];
+        let text = unexplained_owner_lines(&rows);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "one count line and one line per face");
+        assert!(lines[0].contains('2'));
+        assert!(lines[0].contains("face<TAB>owner<TAB>roster_said"));
+
+        let parsed: Vec<(&str, &str, &str)> = lines[1..]
+            .iter()
+            .map(|line| {
+                let fields: Vec<&str> = line.split('\t').collect();
+                assert_eq!(
+                    fields.len(),
+                    3,
+                    "a face id that splits into more fields than the header declares: {line}"
+                );
+                (fields[0], fields[1], fields[2])
+            })
+            .collect();
+        assert!(
+            parsed[0].0.ends_with("token 管理"),
+            "the space in the id belongs to the id: {:?}",
+            parsed[0].0
+        );
+        assert!(
+            parsed[1].0.ends_with("CI/构建/部署"),
+            "the slashes in the id are not field separators: {:?}",
+            parsed[1].0
+        );
+        assert_eq!(parsed[1].2, "operator/8b2");
+    }
+
+    /// Without rows the header still says so, in a form a reader can test
+    /// rather than a line that is simply missing.
+    #[test]
+    fn no_unexplained_owners_still_prints_a_count() {
+        assert_eq!(
+            unexplained_owner_lines(&[]),
+            "# owners_no_act_explains: 0\n"
         );
     }
 }
