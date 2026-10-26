@@ -359,7 +359,7 @@ struct DiscoveryGuardState {
 }
 
 fn discovery_guard_state_path() -> std::path::PathBuf {
-    let dir = std::env::var("COGNEVA_DATA_DIR")
+    let dir = std::env::var(cog_core::paths::DATA_DIR_ENV)
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| default_state_dir());
     dir.join("discovery-guards.json")

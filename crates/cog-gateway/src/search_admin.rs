@@ -34,7 +34,7 @@ const SECRET_KEY: &str = "search-fallback-upstreams";
 
 /// 现网 LLM 上游那一份配置的环境变量。读它只为在页面上把"跟着 LLM 走"的两层
 /// 显示出来——它们的值不在这里，也写不进来（见 [`crate::search_fallback::from_live_llm`]）。
-const LLM_UPSTREAMS_ENV: &str = "COGNEVA_LLM_UPSTREAMS";
+pub(crate) const LLM_UPSTREAMS_ENV: &str = "COGNEVA_LLM_UPSTREAMS";
 
 #[derive(Debug, serde::Serialize, Deserialize)]
 pub struct SearchUpstreamRequest {

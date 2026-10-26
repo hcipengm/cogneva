@@ -327,7 +327,7 @@ impl SecurityGatewayConfig {
                 "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS",
                 0,
             ),
-            database_url: token("COGNEVA_DATABASE_URL"),
+            database_url: token(cog_core::env::DATABASE_URL),
             redis_url: token("COGNEVA_REDIS_URL"),
             // 配置文件缺失即默认全关，env 覆盖在 load() 内完成。
             observability: ObservabilityExportersConfig::load().unwrap_or_else(|e| {
@@ -377,7 +377,7 @@ impl SecurityGatewayConfig {
 /// 上游池唯一来源：COGNEVA_LLM_UPSTREAMS（JSON 数组，由 llm-config 管理
 /// 接口写入 Secret）。单 LLM 即单元素数组，池为空视为未配置。
 fn upstreams_from_env() -> Vec<LlmUpstream> {
-    std::env::var("COGNEVA_LLM_UPSTREAMS")
+    std::env::var(crate::search_admin::LLM_UPSTREAMS_ENV)
         .map(|raw| parse_upstreams(&raw))
         .unwrap_or_default()
 }

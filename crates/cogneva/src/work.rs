@@ -226,7 +226,7 @@ fn endpoints(request: &Request) -> Result<Endpoints, Box<dyn Error>> {
     let database_url = request
         .database_url
         .clone()
-        .or_else(|| std::env::var("COGNEVA_DATABASE_URL").ok())
+        .or_else(|| std::env::var(cog_core::env::DATABASE_URL).ok())
         .or_else(|| {
             config
                 .providers

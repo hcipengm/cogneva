@@ -47,6 +47,14 @@ pub const PACKAGE_PREFIX: &str = "cogneva-backup-";
 pub const PACKAGE_SUFFIX: &str = ".tar.zst";
 const TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 
+/// 打包与还原两侧都读的同几个环境变量。名字在这里写一次：写两遍的时候，改
+/// 一处不会报错，另一处会读到一个再没人设置的名字，而「读不到」在调用点上
+/// 与「没配」同形。
+const BACKUP_DIR_ENV: &str = "COGNEVA_BACKUP_DIR";
+const BACKUP_OFFSITE_DIR_ENV: &str = "COGNEVA_BACKUP_OFFSITE_DIR";
+const QDRANT_HTTP_URL_ENV: &str = "COGNEVA_QDRANT_HTTP_URL";
+const IMAGE_REF_ENV: &str = "COGNEVA_IMAGE_REF";
+
 /// 落库的错误文本上限。错误本身通常只有一行，这个界是为了让一条失控的长错误
 /// （整段响应体、整张表名清单）不至于把行撑成不可读的东西。
 const ERROR_TEXT_MAX_CHARS: usize = 2000;
@@ -318,15 +326,15 @@ pub struct BackupConfig {
 
 impl BackupConfig {
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
-        let database_url = std::env::var("COGNEVA_DATABASE_URL")
+        let database_url = std::env::var(cog_core::env::DATABASE_URL)
             .map_err(|_| "COGNEVA_DATABASE_URL is required for backup")?;
-        let qdrant_http_url = std::env::var("COGNEVA_QDRANT_HTTP_URL")
+        let qdrant_http_url = std::env::var(QDRANT_HTTP_URL_ENV)
             .map_err(|_| "COGNEVA_QDRANT_HTTP_URL is required for backup")?;
         Ok(Self {
             database_url,
             qdrant_http_url,
             backup_dir: PathBuf::from(
-                std::env::var("COGNEVA_BACKUP_DIR").unwrap_or_else(|_| "/backups".into()),
+                std::env::var(BACKUP_DIR_ENV).unwrap_or_else(|_| "/backups".into()),
             ),
             secrets_dir: PathBuf::from(
                 std::env::var("COGNEVA_SECRETS_DIR").unwrap_or_else(|_| "/secrets".into()),
@@ -347,7 +355,7 @@ impl BackupConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_RUN_DEADLINE_SECONDS),
-            offsite_dir: std::env::var("COGNEVA_BACKUP_OFFSITE_DIR")
+            offsite_dir: std::env::var(BACKUP_OFFSITE_DIR_ENV)
                 .ok()
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
@@ -1803,7 +1811,7 @@ async fn run_backup_into(
     // 两边都读不到时记 unknown，manifest 仍然落盘（备份本身不失败）。
     let fingerprint = std::fs::read_to_string(cfg.secrets_dir.join("instance-fingerprint"))
         .ok()
-        .or_else(|| std::env::var("COGNEVA_INSTANCE_FINGERPRINT").ok())
+        .or_else(|| std::env::var(cog_core::env::INSTANCE_FINGERPRINT).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".into());
@@ -1823,7 +1831,7 @@ async fn run_backup_into(
         qdrant: collections,
         objects: ObjectsReport { files, bytes },
         artifacts,
-        image: std::env::var("COGNEVA_IMAGE_REF").unwrap_or_default(),
+        image: std::env::var(IMAGE_REF_ENV).unwrap_or_default(),
         schema_version: current_schema_version(),
         lossy_surfaces: lossy_surfaces(evolution_bundle.is_some(), credentials_present),
         segments,
@@ -2667,7 +2675,7 @@ fn verify_package_against_manifest(
 /// 动手恢复之前先拿 manifest 逐段核包（`verify_package_against_manifest`）：
 /// 内容与清单对不上就退非零，绝不带着分歧走到 `TRUNCATE` 那一步。
 pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let database_url = std::env::var("COGNEVA_DATABASE_URL")
+    let database_url = std::env::var(cog_core::env::DATABASE_URL)
         .map_err(|_| "COGNEVA_DATABASE_URL is required for restore")?;
     let data_dir = PathBuf::from(cog_core::paths::data_dir());
 
@@ -2720,7 +2728,7 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     let qdrant_dir = pkg_dir.join("qdrant");
     if qdrant_dir.exists() {
-        let qdrant_http_url = std::env::var("COGNEVA_QDRANT_HTTP_URL")
+        let qdrant_http_url = std::env::var(QDRANT_HTTP_URL_ENV)
             .map_err(|_| "package has qdrant snapshots but COGNEVA_QDRANT_HTTP_URL is unset")?;
         let qdrant = QdrantHttp::new(&qdrant_http_url);
         for entry in std::fs::read_dir(&qdrant_dir)? {
@@ -3077,7 +3085,7 @@ fn check_provenance_against(
     if !manifest.image.is_empty() {
         tracing::info!(
             package_image = %manifest.image,
-            current_image = %std::env::var("COGNEVA_IMAGE_REF").unwrap_or_default(),
+            current_image = %std::env::var(IMAGE_REF_ENV).unwrap_or_default(),
             "包的镜像引用（只作对照，不拦恢复）"
         );
     }
@@ -3379,16 +3387,16 @@ pub struct DrillConfig {
 
 impl DrillConfig {
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
-        let database_url = std::env::var("COGNEVA_DATABASE_URL")
+        let database_url = std::env::var(cog_core::env::DATABASE_URL)
             .map_err(|_| "COGNEVA_DATABASE_URL is required for backup-drill")?;
         let app_dir = cog_core::paths::app_dir();
         let (package, also_unproven) = requested_package(std::env::args().skip(1))?;
         Ok(Self {
             database_url,
             backup_dir: PathBuf::from(
-                std::env::var("COGNEVA_BACKUP_DIR").unwrap_or_else(|_| "/backups".into()),
+                std::env::var(BACKUP_DIR_ENV).unwrap_or_else(|_| "/backups".into()),
             ),
-            offsite_dir: std::env::var("COGNEVA_BACKUP_OFFSITE_DIR")
+            offsite_dir: std::env::var(BACKUP_OFFSITE_DIR_ENV)
                 .ok()
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),

@@ -28,8 +28,8 @@ use crate::error::ApiError;
 /// 工作区根的父目录；用户子目录建在它下面。
 pub const WORKSPACE_ROOT_ENV: &str = "COGNEVA_WORKSPACE_ROOT";
 
-/// 应用数据目录（与身份文件、数仓同一个卷）。
-const DATA_DIR_ENV: &str = "COGNEVA_DATA_DIR";
+/// 应用数据目录（与身份文件、数仓同一个卷）。变量名与默认值都取自
+/// [`cog_core::paths`]：同一条路径的第二份声明会在有人只改一处时静默分叉。
 const DEFAULT_DATA_DIR: &str = cog_core::paths::DATA_DIR;
 /// 单个文件的上限。编辑器不是上传通道：超过这个量的东西该走附件那条路。
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -221,7 +221,8 @@ fn configured_root() -> PathBuf {
     if let Some(explicit) = non_empty_env(WORKSPACE_ROOT_ENV) {
         return PathBuf::from(explicit);
     }
-    let data = non_empty_env(DATA_DIR_ENV).unwrap_or_else(|| DEFAULT_DATA_DIR.to_string());
+    let data = non_empty_env(cog_core::paths::DATA_DIR_ENV)
+        .unwrap_or_else(|| DEFAULT_DATA_DIR.to_string());
     // 只拼一级：每个用户的 UUID 目录直接落在数据根的 workspace 下，再多一层
     // 就多一个要在数据根台账里登记的子目录，而它并不承载独立语义。
     PathBuf::from(data).join("workspace")

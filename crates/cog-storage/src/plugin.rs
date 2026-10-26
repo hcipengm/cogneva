@@ -71,7 +71,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
             storage_provider_config,
         ) = {
             let config = ctx.config();
-            let db_url = std::env::var("COGNEVA_DATABASE_URL")
+            let db_url = std::env::var(cog_core::env::DATABASE_URL)
                 .ok()
                 .or_else(|| {
                     config

@@ -830,7 +830,7 @@ mod tests {
     fn a_task_agent_registers_under_the_host_it_runs_on() {
         // 环境变量是进程级的：与 identity 的用例抢同一把锁，避免读到别人设的值。
         let _guard = crate::identity::tests::env_lock();
-        let previous = std::env::var("COGNEVA_POD_NAME").ok();
+        let previous = std::env::var(cog_core::env::POD_NAME).ok();
         std::env::set_var("COGNEVA_POD_NAME", "cogneva-647bb49dcd-4cttc");
 
         let reg = task_agent_registration("squad:task-1-planner", "planner");

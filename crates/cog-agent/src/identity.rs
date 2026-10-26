@@ -18,7 +18,10 @@ pub use cog_core::NAME_POOL;
 
 /// 安装期指纹的环境变量名。由 Secret 注入，跨重装可携带；缺失时退回进程自身
 /// 的装配标识（Pod 名 / 主机名），那时名字只能稳定到下一次滚动。
-pub const ENV_FINGERPRINT: &str = "COGNEVA_INSTANCE_FINGERPRINT";
+///
+/// 名字声明在 `cog-core`：读它的不止这一处，身份装配在另一个 crate 里也读
+/// 同一个变量，两处各写一遍时改名只会改到一处。
+pub const ENV_FINGERPRINT: &str = cog_core::env::INSTANCE_FINGERPRINT;
 
 /// 进程分组名。主应用与进化两个进程在同一台机器上各跑一个 worker 池，槽位号
 /// 相同；分组名进名字的哈希材料，两个池才不会同名。分组名是清单里的字面量，
@@ -114,7 +117,7 @@ pub fn worker_name(slot: usize) -> AgentName {
 /// 本进程的装配标识：Pod 名优先，其次主机名。它描述"在哪一个进程里"，不再
 /// 参与名字的稳定性——把 Pod 名写进名字正是滚动就换名的根源。
 pub fn agent_instance() -> String {
-    std::env::var("COGNEVA_POD_NAME")
+    std::env::var(cog_core::env::POD_NAME)
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
         .filter(|s| !s.is_empty())

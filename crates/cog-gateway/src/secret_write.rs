@@ -21,6 +21,8 @@ type HmacSha256 = Hmac<Sha256>;
 pub(crate) const SECRET_PATCH_PATH: &str = "/internal/secret-patch";
 /// 内部请求的签名头，与 webhook 转发同一个形状（`sha256=<hex>`）。
 pub(crate) const SIGNATURE_HEADER: &str = "x-cogneva-signature-256";
+/// 内部转发凭证的变量名。写入的转发与收端的校验各读一次，名字只在这里写。
+const WEBHOOK_INTERNAL_SECRET_ENV: &str = "COGNEVA_WEBHOOK_INTERNAL_SECRET";
 
 pub(crate) fn sign(secret: &str, body: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("hmac accepts any key");
@@ -88,7 +90,7 @@ pub(crate) async fn apply(fields: Value, b64: bool, restart: bool) -> Result<Res
 /// 而且没人看得出来今天写的是哪一条路。
 pub(crate) async fn forward(fields: Value, b64: bool, restart: bool) -> Result<Restart, String> {
     let base = crate::contribution_admin::security_gateway_base()?;
-    let secret = std::env::var("COGNEVA_WEBHOOK_INTERNAL_SECRET")
+    let secret = std::env::var(WEBHOOK_INTERNAL_SECRET_ENV)
         .ok()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
@@ -162,7 +164,7 @@ pub(crate) async fn forward_internal_raw(
     body: Vec<u8>,
 ) -> Result<(u16, Value), String> {
     let base = crate::contribution_admin::security_gateway_base()?;
-    let secret = std::env::var("COGNEVA_WEBHOOK_INTERNAL_SECRET")
+    let secret = std::env::var(WEBHOOK_INTERNAL_SECRET_ENV)
         .ok()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {

@@ -82,8 +82,9 @@ pub const ROOTS_ENV: &str = "COGNEVA_IMAGE_STORE_ROOTS";
 /// Store name used when the deployment names a root without naming the store.
 pub const DEFAULT_STORE: &str = "containerd";
 
-/// Environment variable naming this node.
-pub const NODE_ENV: &str = "COGNEVA_NODE_NAME";
+/// Environment variable naming this node. Declared once for every daemon that
+/// has to label its readings with the node it came from.
+pub use crate::host_ledger::NODE_ENV;
 
 /// Environment variable naming the re-walk cadence.
 pub const INTERVAL_ENV: &str = "COGNEVA_IMAGE_SCAN_INTERVAL_SECS";

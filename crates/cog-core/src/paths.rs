@@ -38,10 +38,17 @@ pub const BUILD_GATE_LOCK_DIR: &str = "/var/lib/cogneva-build-gate";
 /// The host directory the security gateway mirrors git repositories into.
 pub const GIT_MIRROR_ROOT: &str = "/var/lib/cogneva-git-mirror";
 
+/// The chart's name for the data directory override.
+pub const DATA_DIR_ENV: &str = "COGNEVA_DATA_DIR";
+/// The chart's name for the configuration file override.
+pub const CONFIG_PATH_ENV: &str = "COGNEVA_CONFIG_PATH";
+/// The image's name for the installation root override.
+pub const APP_DIR_ENV: &str = "COGNEVA_APP_DIR";
+
 /// The data directory as this process sees it: the chart passes
-/// `COGNEVA_DATA_DIR`, and a host install may point it elsewhere.
+/// [`DATA_DIR_ENV`], and a host install may point it elsewhere.
 pub fn data_dir() -> String {
-    std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| DATA_DIR.to_string())
+    std::env::var(DATA_DIR_ENV).unwrap_or_else(|_| DATA_DIR.to_string())
 }
 
 /// [`data_dir`] joined with a relative path.
@@ -49,11 +56,10 @@ pub fn data_path(relative: &str) -> std::path::PathBuf {
     std::path::Path::new(&data_dir()).join(relative)
 }
 
-/// The configuration file as this process sees it: `COGNEVA_CONFIG_PATH` from
+/// The configuration file as this process sees it: [`CONFIG_PATH_ENV`] from
 /// the chart, [`CONFIG_DIR`]/[`CONFIG_FILE_NAME`] otherwise.
 pub fn config_file() -> String {
-    std::env::var("COGNEVA_CONFIG_PATH")
-        .unwrap_or_else(|_| format!("{CONFIG_DIR}/{CONFIG_FILE_NAME}"))
+    std::env::var(CONFIG_PATH_ENV).unwrap_or_else(|_| format!("{CONFIG_DIR}/{CONFIG_FILE_NAME}"))
 }
 
 /// The installation root, as the image lays it out (`SF_APP_DIR`).
@@ -99,11 +105,11 @@ pub fn app_path_str(relative: &str) -> String {
 }
 
 /// The installation root as this process sees it: the image exports
-/// `COGNEVA_APP_DIR` and the chart's `app.app_dir` maps onto the same variable,
+/// [`APP_DIR_ENV`] and the chart's `app.app_dir` maps onto the same variable,
 /// so a container that was given a different root reads it here. Absent that,
 /// the compiled-in layout is the answer.
 pub fn app_dir() -> String {
-    std::env::var("COGNEVA_APP_DIR").unwrap_or_else(|_| APP_DIR.to_string())
+    std::env::var(APP_DIR_ENV).unwrap_or_else(|_| APP_DIR.to_string())
 }
 
 /// [`app_path`] under the root this process was told to use.

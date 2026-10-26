@@ -51,9 +51,9 @@ fn default_env_mappings() -> HashMap<String, String> {
     m.insert("COGNEVA_APP_NAME".into(), "app.name".into());
     m.insert("COGNEVA_APP_VERSION".into(), "app.version".into());
     m.insert("COGNEVA_LOG_LEVEL".into(), "app.log_level".into());
-    m.insert("COGNEVA_DATA_DIR".into(), "app.data_dir".into());
+    m.insert(cog_core::paths::DATA_DIR_ENV.into(), "app.data_dir".into());
     m.insert("COGNEVA_CONFIG_DIR".into(), "app.config_dir".into());
-    m.insert("COGNEVA_APP_DIR".into(), "app.app_dir".into());
+    m.insert(cog_core::paths::APP_DIR_ENV.into(), "app.app_dir".into());
     // providers
     m.insert("COGNEVA_DB_PROVIDER".into(), "providers.db.provider".into());
     m.insert("COGNEVA_PG_PROVIDER".into(), "providers.pg.provider".into());
@@ -577,7 +577,7 @@ pub fn try_load() -> SFResult<AppConfig> {
     }
 
     // Layer 2: environment-specific config
-    let env = std::env::var("COGNEVA_ENV").unwrap_or_else(|_| "development".into());
+    let env = std::env::var(cog_core::env::RUN_ENV).unwrap_or_else(|_| "development".into());
     let env_path = base_path.replace(".json", &format!(".{env}.json"));
     if env_path != base_path {
         if let Some(env_value) = read_config_layer(&env_path)? {

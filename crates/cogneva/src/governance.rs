@@ -259,7 +259,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
     let config = crate::config_loader::load();
     let database_url = request
         .database_url
-        .or_else(|| std::env::var("COGNEVA_DATABASE_URL").ok())
+        .or_else(|| std::env::var(cog_core::env::DATABASE_URL).ok())
         .or_else(|| {
             config
                 .providers

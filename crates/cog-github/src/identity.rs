@@ -112,7 +112,7 @@ pub fn identity_state_path() -> PathBuf {
 /// veth MAC，两者都随 Pod 生命周期变化——身份于是只能靠"把结果写到持久卷"
 /// 粘住，重装集群或换机器就换名。把指纹变成安装期提供的外部输入之后，身份
 /// 不再依赖任何易失素材，可以随 Secret 备份、迁移，运维也能显式钉住。
-pub const ENV_FINGERPRINT: &str = "COGNEVA_INSTANCE_FINGERPRINT";
+pub const ENV_FINGERPRINT: &str = cog_core::env::INSTANCE_FINGERPRINT;
 
 /// 读取装入期指纹；未设置或全空白视为未提供。
 pub fn fingerprint_from_env() -> Option<String> {

@@ -1245,7 +1245,7 @@ pub fn in_cluster_namespace() -> SFResult<String> {
 /// 没有它就取不到自己的 `imageID`，也就没有可派发的镜像——这时停下并指名缺的是
 /// 哪一条，而不是退回去用一个 tag。
 pub fn parent_pod_name() -> SFResult<String> {
-    let name = std::env::var("COGNEVA_POD_NAME").unwrap_or_default();
+    let name = std::env::var(cog_core::env::POD_NAME).unwrap_or_default();
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err(SFError::IO(

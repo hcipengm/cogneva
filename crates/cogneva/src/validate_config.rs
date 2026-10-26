@@ -52,7 +52,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut report = Report::new();
 
     // 1. 配置文件可发现性
-    let config_path = std::env::var("COGNEVA_CONFIG_PATH")
+    let config_path = std::env::var(cog_core::paths::CONFIG_PATH_ENV)
         .unwrap_or_else(|_| crate::config_loader::default_config_path());
     if std::path::Path::new(&config_path).exists() {
         report.ok(format!("config file found: {config_path}"));

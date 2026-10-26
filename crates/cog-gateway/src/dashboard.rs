@@ -1,6 +1,9 @@
 use axum::response::{Html, IntoResponse, Response};
 use std::path::PathBuf;
 
+/// 面板文档显式路径。`web_dir` 与 `index_path` 两处都读它，名字只在这里写一次。
+const DASHBOARD_PATH_ENV: &str = "COGNEVA_DASHBOARD_PATH";
+
 /// WebUI 静态资源目录（含 index.html 与 assets/）。
 /// 优先级：COGNEVA_WEB_DIR，其次 COGNEVA_DASHBOARD_PATH 的父目录，
 /// 最后运行时自定位（从当前二进制位置向上逐级查找含 index.html 的
@@ -13,7 +16,7 @@ pub fn web_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("COGNEVA_WEB_DIR") {
         return PathBuf::from(dir);
     }
-    if let Ok(path) = std::env::var("COGNEVA_DASHBOARD_PATH") {
+    if let Ok(path) = std::env::var(DASHBOARD_PATH_ENV) {
         if let Some(parent) = PathBuf::from(path).parent() {
             return parent.to_path_buf();
         }
@@ -49,7 +52,7 @@ fn locate_web_dir() -> Option<PathBuf> {
 }
 
 fn index_path() -> PathBuf {
-    if let Ok(path) = std::env::var("COGNEVA_DASHBOARD_PATH") {
+    if let Ok(path) = std::env::var(DASHBOARD_PATH_ENV) {
         return PathBuf::from(path);
     }
     web_dir().join("index.html")

@@ -372,7 +372,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // loop, so that the reading goes quiet with the *producer* rather than
         // with the platform: a loop that reported its own feeder's silence would
         // be reporting it from inside the thing the feeder feeds.
-        match std::env::var("COGNEVA_DATABASE_URL") {
+        match std::env::var(cog_core::env::DATABASE_URL) {
             Ok(url) if !url.trim().is_empty() => {
                 match crate::producer_heartbeat::ProducerHeartbeatStore::connect(&url).await {
                     Ok(store) => match store.init_schema().await {
@@ -399,7 +399,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // Created here (not in start) so the read-side ActiveAlertSource is
         // published before any plugin's start runs — init_all completes
         // before start_all, and self-discovery consumes it in start.
-        self.alert_store = match std::env::var("COGNEVA_DATABASE_URL") {
+        self.alert_store = match std::env::var(cog_core::env::DATABASE_URL) {
             Ok(url) if !url.trim().is_empty() => match PostgresAlertStore::connect(&url).await {
                 Ok(store) => match store.init_schema().await {
                     Ok(()) => {
@@ -433,7 +433,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // pod, and a fold that only worked once the gateway had run would be a
         // fold that silently did nothing on a fresh database. `IF NOT EXISTS`
         // makes the two creators agree rather than race.
-        self.usage_store = match std::env::var("COGNEVA_DATABASE_URL") {
+        self.usage_store = match std::env::var(cog_core::env::DATABASE_URL) {
             Ok(url) if !url.trim().is_empty() => match LlmUsageStore::connect(&url).await {
                 Ok(store) => match store.init_schema().await {
                     Ok(()) => {
@@ -477,7 +477,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // that joins it against the window's spend. Published as a write face
         // for the reason the rolled read face above is published: the call
         // sites hold a contract, never this crate's storage internals.
-        self.skip_store = match std::env::var("COGNEVA_DATABASE_URL") {
+        self.skip_store = match std::env::var(cog_core::env::DATABASE_URL) {
             Ok(url) if !url.trim().is_empty() => {
                 match crate::skip_store::LlmSkipStore::connect(&url).await {
                     Ok(store) => match store.init_schema().await {
@@ -513,7 +513,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // the loop that drives it, and absent when there is no usage ledger to
         // judge.
         if let Some(ledger) = self.usage_store.as_ref() {
-            if let Ok(url) = std::env::var("COGNEVA_DATABASE_URL") {
+            if let Ok(url) = std::env::var(cog_core::env::DATABASE_URL) {
                 if !url.trim().is_empty() {
                     let skips = self.skip_store.as_ref().map(|s| (**s).clone());
                     match crate::spend_verdict::SpendVerdictStore::connect(

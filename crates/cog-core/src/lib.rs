@@ -7,6 +7,7 @@ pub mod claim_footprint;
 pub mod config;
 pub mod config_sections;
 pub mod contract;
+pub mod env;
 pub mod error;
 pub mod fs_size;
 pub mod git_budget;

@@ -97,8 +97,9 @@ pub const SCAN_READABLE_METRIC: &str = "cogneva_claim_scan_readable";
 /// Seconds since the last completed scan, or since process start before one has.
 pub const SCAN_AGE_METRIC: &str = "cogneva_claim_scan_age_seconds";
 
-/// Environment variable naming the node this process runs on.
-pub const NODE_ENV: &str = "COGNEVA_NODE_NAME";
+/// Environment variable naming the node this process runs on. Declared once for
+/// every daemon that has to label its readings with the node it came from.
+pub use crate::host_ledger::NODE_ENV;
 
 /// Environment variable naming the node's storage root, as this process sees it.
 pub const ROOT_ENV: &str = "COGNEVA_CLAIM_STORE_ROOT";

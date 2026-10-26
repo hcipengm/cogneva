@@ -81,9 +81,9 @@ impl ConfigWatcher {
     /// 1. `$COGNEVA_CONFIG_PATH` (default `/etc/cogneva/cogneva.json`, same as the loader)
     /// 2. `cogneva.{env}.json`
     pub fn watch_default() -> SFResult<(Self, notify::RecommendedWatcher)> {
-        let base_path = std::env::var("COGNEVA_CONFIG_PATH")
+        let base_path = std::env::var(cog_core::paths::CONFIG_PATH_ENV)
             .unwrap_or_else(|_| crate::config_loader::default_config_path());
-        let env = std::env::var("COGNEVA_ENV").unwrap_or_else(|_| "development".into());
+        let env = std::env::var(cog_core::env::RUN_ENV).unwrap_or_else(|_| "development".into());
         let env_path = base_path.replace(".json", &format!(".{}.json", env));
 
         let mut paths = vec![PathBuf::from(base_path)];

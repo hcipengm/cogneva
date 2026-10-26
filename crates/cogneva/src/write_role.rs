@@ -52,9 +52,10 @@ use cog_storage::{LeaseRow, PgOwnerLeaseBroker, RedisKeyValueStore};
 /// while the pool is unusable, so the one the out-of-band takes over.
 pub const DEFAULT_ROLE: &str = cog_reflection::plugin::SELF_DISCOVERY_ROLE;
 
-/// Where the arbiter is configured. The name every other one-shot subcommand
-/// reads (`backup`, `restore`), and the one the deployment actually sets.
-const DATABASE_URL_ENV: &str = "COGNEVA_DATABASE_URL";
+/// Where the arbiter is configured: the same name every other one-shot
+/// subcommand reads (`backup`, `restore`) and the one the deployment sets, so it
+/// comes from the one place that declares it.
+const DATABASE_URL_ENV: &str = cog_core::env::DATABASE_URL;
 
 /// Where the pool snapshot's end is configured.
 ///
