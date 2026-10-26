@@ -66,6 +66,7 @@ pub mod promotion_gate;
 pub mod raw_logs;
 pub mod readings;
 pub mod scm;
+pub mod search_fallback;
 pub mod secret_layout;
 pub mod secret_write;
 pub mod security_gateway;
