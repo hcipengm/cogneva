@@ -601,7 +601,15 @@ impl CodePlatformProvider for GitHubProvider {
             "merged".to_string()
         } else {
             pr.state
-                .map(|s| format!("{:?}", s).to_lowercase())
+                // GitHub's own word for the state, read through serde: `Debug`
+                // lowercased happens to agree today, and would stop agreeing
+                // the moment the provider renames a variant.
+                .map(|s| {
+                    serde_json::to_value(s)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default()
+                })
                 .unwrap_or_default()
         };
 

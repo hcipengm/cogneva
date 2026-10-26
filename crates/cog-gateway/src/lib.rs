@@ -2486,7 +2486,7 @@ async fn task_timeline_handler(
     milestones.push(json!({
         "event": "status_changed",
         "timestamp": task.updated_at.to_rfc3339(),
-        "details": { "status": format!("{:?}", task.status) }
+        "details": { "status": task.status.as_str() }
     }));
 
     if let Some(ref error) = task.error {
@@ -2521,7 +2521,7 @@ async fn agent_heartbeats_handler(
                 .map(|record| heartbeat_history::HeartbeatHistoryEntry {
                     agent_id: record.agent_id,
                     timestamp: record.timestamp.to_rfc3339(),
-                    status: format!("{:?}", record.status).to_lowercase(),
+                    status: record.status.as_str().to_string(),
                     load_score: record.load_score,
                     task_count: record.task_count,
                 })
@@ -2853,7 +2853,7 @@ async fn traces_list_handler(
                             "task_id": m.task_id,
                             "event_count": m.event_count,
                             "created_at": m.created_at.to_rfc3339(),
-                            "tier": format!("{:?}", m.tier).to_lowercase(),
+                            "tier": m.tier.as_str(),
                         })
                     })
                     .collect();

@@ -99,8 +99,8 @@ impl From<&User> for UserResponse {
             phone: u.phone.clone(),
             display_name: u.display_name.clone(),
             avatar_url: u.avatar_url.clone(),
-            status: format!("{:?}", u.status).to_lowercase(),
-            user_type: format!("{:?}", u.user_type).to_lowercase(),
+            status: u.status.as_str().to_string(),
+            user_type: u.user_type.as_str().to_string(),
             created_at: u.created_at,
         }
     }

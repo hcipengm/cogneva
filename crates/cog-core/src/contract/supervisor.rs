@@ -17,6 +17,36 @@ pub enum HeartbeatStatus {
     Unhealthy,
 }
 
+impl HeartbeatStatus {
+    /// Every status, so a gate or a reader can cover the set instead of the
+    /// subset someone happened to remember.
+    pub const ALL: [HeartbeatStatus; 3] = [
+        HeartbeatStatus::Healthy,
+        HeartbeatStatus::Degraded,
+        HeartbeatStatus::Unhealthy,
+    ];
+
+    /// The spelling the history endpoint sends and the frames carry.
+    ///
+    /// Printed through this rather than through the derived `Debug`: a
+    /// multi-word variant would leave `Debug` + `to_lowercase` with
+    /// `notresponding` while every other surface says `not_responding`, and the
+    /// two would never match again.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeartbeatStatus::Healthy => "healthy",
+            HeartbeatStatus::Degraded => "degraded",
+            HeartbeatStatus::Unhealthy => "unhealthy",
+        }
+    }
+
+    /// Read a status back from its word. `None` for a word this version does
+    /// not know.
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|status| status.as_str() == word)
+    }
+}
+
 /// One Agent's most recent heartbeat snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HeartbeatRecord {
@@ -27,6 +57,32 @@ pub struct HeartbeatRecord {
     pub load_score: f32,
     /// Number of tasks currently owned by the Agent.
     pub task_count: u32,
+}
+
+impl HeartbeatRecord {
+    /// A `Healthy` record at the current instant.
+    pub fn now(agent_id: impl Into<String>) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            timestamp: Utc::now(),
+            status: HeartbeatStatus::Healthy,
+            load_score: 0.0,
+            task_count: 0,
+        }
+    }
+
+    /// Map the heartbeat status onto an [`AgentState`](crate::AgentState) for
+    /// mirroring into the durable backend. `Healthy` maps to `Active`,
+    /// `Degraded` to `Idle`, `Unhealthy` to `Suspect` -- the supervisor's
+    /// health checker can still escalate to `Dead` once the heartbeat itself
+    /// goes stale.
+    pub fn to_agent_state(&self) -> crate::AgentState {
+        match self.status {
+            HeartbeatStatus::Healthy => crate::AgentState::Active,
+            HeartbeatStatus::Degraded => crate::AgentState::Idle,
+            HeartbeatStatus::Unhealthy => crate::AgentState::Suspect,
+        }
+    }
 }
 
 /// Snapshot of a crew (squad-level execution group) tracked by the supervisor.

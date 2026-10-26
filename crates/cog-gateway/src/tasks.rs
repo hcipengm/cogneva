@@ -68,7 +68,7 @@ fn parse_task_type(s: &str) -> TaskType {
     }
 }
 
-fn task_type_str(tt: &TaskType) -> String {
+pub(crate) fn task_type_str(tt: &TaskType) -> String {
     match tt {
         TaskType::Planner => cog_core::roles::PLANNER.into(),
         TaskType::Generator => cog_core::roles::GENERATOR.into(),
@@ -1018,15 +1018,20 @@ pub struct PurgeTasksRequest {
 /// finished task would rewrite its recorded outcome, and a purge is a
 /// backlog broom, not a history editor.
 fn parse_task_status(s: &str) -> Result<cog_core::TaskStatus, ApiError> {
-    match s.to_ascii_lowercase().as_str() {
-        "pending" => Ok(cog_core::TaskStatus::Pending),
-        "scheduled" => Ok(cog_core::TaskStatus::Scheduled),
-        "running" => Ok(cog_core::TaskStatus::Running),
-        "completed" | "failed" | "cancelled" => Err(ApiError::bad_request(format!(
-            "status {s} is terminal; purge only acts on backlog (pending/scheduled/running)"
-        ))),
-        other => Err(ApiError::bad_request(format!("unknown status: {other}"))),
+    let status = cog_core::TaskStatus::parse(&s.to_ascii_lowercase())
+        .ok_or_else(|| ApiError::bad_request(format!("unknown status: {s}")))?;
+    if status.is_terminal() {
+        return Err(ApiError::bad_request(format!(
+            "status {s} is terminal; purge only acts on backlog ({})",
+            cog_core::TaskStatus::ALL
+                .iter()
+                .filter(|status| !status.is_terminal())
+                .map(|status| status.as_str())
+                .collect::<Vec<_>>()
+                .join("/")
+        )));
     }
+    Ok(status)
 }
 
 /// Pure eligibility predicate for the purge: status set, optional type/id

@@ -518,7 +518,7 @@ pub async fn schema_search_handler(
                 .into_iter()
                 .map(|r| SchemaResult {
                     id: r.entry.id,
-                    kind: format!("{:?}", r.entry.kind).to_lowercase(),
+                    kind: r.entry.kind.as_str().to_string(),
                     name: r.entry.name,
                     key: r.entry.key,
                     confidence: r.entry.confidence,
@@ -680,7 +680,7 @@ pub async fn unified_search_handler(
                     cog_core::UnifiedSearchResult::Schema(s) => {
                         UnifiedResult::Schema(SchemaResult {
                             id: s.entry.id,
-                            kind: format!("{:?}", s.entry.kind).to_lowercase(),
+                            kind: s.entry.kind.as_str().to_string(),
                             name: s.entry.name,
                             key: s.entry.key,
                             confidence: s.entry.confidence,
@@ -732,7 +732,7 @@ pub async fn list_schema_handler(
                 .into_iter()
                 .map(|e| SchemaResult {
                     id: e.id,
-                    kind: format!("{:?}", e.kind).to_lowercase(),
+                    kind: e.kind.as_str().to_string(),
                     name: e.name,
                     key: e.key,
                     confidence: e.confidence,

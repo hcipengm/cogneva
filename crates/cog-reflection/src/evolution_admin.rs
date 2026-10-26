@@ -74,6 +74,21 @@ fn kind_name(kind: &crate::types::EvolutionKind) -> &'static str {
     }
 }
 
+/// The wire word for an evolution status.
+///
+/// Read out of serde -- the same attribute every stored record and every other
+/// response goes through -- rather than out of `Debug`: `CompileChecked` is
+/// `compile_checked` on the wire and `compilechecked` through `Debug`, and a
+/// reader comparing the stored word would find nothing while the panel showed a
+/// status.
+fn status_word(status: crate::types::EvolutionStatus) -> String {
+    serde_json::to_value(status)
+        .expect("a fieldless enum serializes as its word")
+        .as_str()
+        .expect("a fieldless enum serializes as a string")
+        .to_string()
+}
+
 impl EvolutionAdminService {
     pub fn new(
         engine: Arc<crate::ReflectionEngine>,
@@ -329,7 +344,7 @@ impl EvolutionAdminService {
             id: r.artifact_id,
             kind: kind_name(&r.kind).to_string(),
             description: r.description,
-            status: format!("{:?}", r.status).to_lowercase(),
+            status: status_word(r.status),
             created_at: r.created_at,
             diff_summary,
             eval_summary: r.eval_summary.map(|report| report.summary),
@@ -559,7 +574,7 @@ impl EvolutionAdminService {
             serde_json::json!({
                 "test_passed": result.verdict.passed(),
                 "rejection_cause": result.verdict.cause().map(|c| c.as_str()),
-                "new_status": format!("{:?}", result.new_status).to_lowercase(),
+                "new_status": status_word(result.new_status),
                 "reformatted": result.reformatted,
             }),
         )
@@ -570,7 +585,7 @@ impl EvolutionAdminService {
             test_passed: result.verdict.passed(),
             rejection_cause: result.verdict.cause(),
             test_output: result.test_output,
-            new_status: format!("{:?}", result.new_status).to_lowercase(),
+            new_status: status_word(result.new_status),
             files_changed: result
                 .files_changed
                 .into_iter()
@@ -667,7 +682,7 @@ impl EvolutionAdmin for EvolutionAdminService {
             id: artifact_id,
             kind: "policy_update".into(),
             description,
-            status: format!("{:?}", status).to_lowercase(),
+            status: status_word(status),
             created_at,
             diff_summary: Some(diff_summary),
             eval_summary: Some(proposal.eval_summary),
@@ -820,7 +835,7 @@ impl EvolutionAdmin for EvolutionAdminService {
                 id: r.artifact_id,
                 kind: kind_name(&r.kind).to_string(),
                 description: r.description,
-                status: format!("{:?}", r.status).to_lowercase(),
+                status: status_word(r.status),
                 created_at: r.created_at,
             })
             .collect())

@@ -31,62 +31,12 @@ pub const DEFAULT_HEARTBEAT_TTL_SECONDS: u64 = 30;
 pub const EXTERNAL_WORKER_ROLE: &str = "external-worker";
 pub const HEARTBEAT_HISTORY_MAX: usize = 1000;
 
-/// Self-reported health status for a heartbeat.
-/// This is independent of the durable [`AgentState`] which tracks the
-/// lifecycle of the Agent (`Init` -> `Active` -> `Dead`).
-/// `HeartbeatStatus` captures the Agent's instantaneous self-assessment
-/// so the Supervisor can react before the state machine catches up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum HeartbeatStatus {
-    /// Agent is processing tasks normally.
-    #[default]
-    Healthy,
-    /// Agent is alive but reporting elevated load or partial errors.
-    Degraded,
-    /// Agent is alive but unable to make progress.
-    Unhealthy,
-}
-
-/// One Agent's most recent heartbeat snapshot.
-/// Stored in [`AgentRegistry`] and (optionally) mirrored to the durable
-/// [`StateBackend`] via [`AgentRegistry::record_heartbeat`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HeartbeatRecord {
-    pub agent_id: String,
-    pub timestamp: DateTime<Utc>,
-    pub status: HeartbeatStatus,
-    /// Self-reported load, normalised to `0.0` (idle) – `1.0` (saturated).
-    pub load_score: f32,
-    /// Number of tasks currently owned by the Agent.
-    pub task_count: u32,
-}
-
-impl HeartbeatRecord {
-    /// Construct a default `Healthy` record at the current instant.
-    pub fn now(agent_id: impl Into<String>) -> Self {
-        Self {
-            agent_id: agent_id.into(),
-            timestamp: Utc::now(),
-            status: HeartbeatStatus::Healthy,
-            load_score: 0.0,
-            task_count: 0,
-        }
-    }
-
-    /// Map the heartbeat status onto an [`AgentState`] for mirroring
-    /// into the durable backend.  `Healthy` heartbeats map to `Active`,
-    /// `Degraded` to `Idle`, and `Unhealthy` to `Suspect` -- the
-    /// Supervisor's [`crate::HealthChecker`] can still escalate to `Dead` once
-    /// the heartbeat itself goes stale.
-    pub fn to_agent_state(&self) -> AgentState {
-        match self.status {
-            HeartbeatStatus::Healthy => AgentState::Active,
-            HeartbeatStatus::Degraded => AgentState::Idle,
-            HeartbeatStatus::Unhealthy => AgentState::Suspect,
-        }
-    }
-}
+/// The heartbeat vocabulary lives in `cog_core`: the supervisor fills the
+/// record in, the gateway serves the history out of it, and both have to be
+/// talking about the same words. Declared here a second time, the two sets only
+/// stayed in step through a hand-written three-arm translation that had nothing
+/// to go red when a variant was added on one side.
+pub use cog_core::{HeartbeatRecord, HeartbeatStatus};
 
 /// Snapshot of an Agent known to the Supervisor.
 /// The Supervisor keeps its own lightweight registry to track liveness
@@ -664,23 +614,12 @@ impl cog_core::HeartbeatRegistry for AgentRegistry {
             .heartbeat_history
             .read()
             .expect("heartbeat history poisoned");
+        // The ring buffer holds the shared record itself, so nothing is copied
+        // field by field here -- a field-by-field copy was the place a new
+        // column could go missing and read as its default.
         history
             .get(agent_id)
-            .map(|buf| {
-                buf.iter()
-                    .map(|r| cog_core::HeartbeatRecord {
-                        agent_id: r.agent_id.clone(),
-                        timestamp: r.timestamp,
-                        status: match r.status {
-                            HeartbeatStatus::Healthy => cog_core::HeartbeatStatus::Healthy,
-                            HeartbeatStatus::Degraded => cog_core::HeartbeatStatus::Degraded,
-                            HeartbeatStatus::Unhealthy => cog_core::HeartbeatStatus::Unhealthy,
-                        },
-                        load_score: r.load_score,
-                        task_count: r.task_count,
-                    })
-                    .collect()
-            })
+            .map(|buf| buf.iter().cloned().collect())
             .unwrap_or_default()
     }
 

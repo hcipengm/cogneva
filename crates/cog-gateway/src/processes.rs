@@ -79,17 +79,6 @@ pub struct ProcessOverview {
     pub dlq_len: usize,
 }
 
-fn status_str(s: &cog_core::TaskStatus) -> &'static str {
-    match s {
-        cog_core::TaskStatus::Pending => "pending",
-        cog_core::TaskStatus::Scheduled => "scheduled",
-        cog_core::TaskStatus::Running => "running",
-        cog_core::TaskStatus::Completed => "completed",
-        cog_core::TaskStatus::Failed => "failed",
-        cog_core::TaskStatus::Cancelled => "cancelled",
-    }
-}
-
 pub async fn process_overview_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Json<ProcessOverview> {
@@ -105,8 +94,8 @@ pub async fn process_overview_handler(
             .or_default()
             .push(ProcessTask {
                 id: t.id.clone(),
-                task_type: format!("{:?}", t.task_type).to_lowercase(),
-                status: status_str(&t.status).into(),
+                task_type: crate::tasks::task_type_str(&t.task_type),
+                status: t.status.as_str().to_string(),
                 agent_id: t.agent_id.clone(),
                 blocked_by: t.blocked_by.clone(),
                 retry_count: t.retry_count,
