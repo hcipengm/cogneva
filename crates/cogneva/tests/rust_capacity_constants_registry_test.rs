@@ -104,12 +104,23 @@ fn scan(root: &Path) -> Vec<Row> {
             continue;
         };
         let lines: Vec<&str> = text.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            let next = lines[i + 1..]
-                .iter()
-                .find(|l| !l.trim().is_empty())
-                .copied();
-            if opens_inline_test_module(line, next) {
+        let mut expecting_test_module = false;
+        for line in lines.iter() {
+            let trimmed = line.trim();
+            let is_test_module = if trimmed.starts_with("//") {
+                false
+            } else if trimmed.starts_with("#[") {
+                if trimmed.starts_with("#[cfg(test") {
+                    expecting_test_module = true;
+                }
+                false
+            } else if expecting_test_module {
+                expecting_test_module = false;
+                has_inline_module_body(line, true)
+            } else {
+                has_inline_module_body(line, false)
+            };
+            if is_test_module {
                 break;
             }
             let Some(row) = parse_const(line, &rel) else {
@@ -129,25 +140,30 @@ fn scan(root: &Path) -> Vec<Row> {
 /// a declaration whose body lives in another file, and treating that as the end
 /// of production code would silently hide every constant after it -- which is
 /// how the first version of this scan lost one.
-fn opens_inline_test_module(line: &str, next: Option<&str>) -> bool {
-    if has_inline_module_body(line) {
-        return true;
-    }
-    line.trim() == "#[cfg(test)]" && next.is_some_and(has_inline_module_body)
-}
-
-fn has_inline_module_body(line: &str) -> bool {
+///
+/// The name only decides it when nothing guards the module: under
+/// `#[cfg(test)]` the name is the author's (`mod topology_tests`, `mod
+/// byte_units`), and a scan that knows two names read one gateway file's whole
+/// fixture block as production.
+fn has_inline_module_body(line: &str, any_name: bool) -> bool {
     let trimmed = line.trim();
     let after_vis = trimmed
         .strip_prefix("pub(")
         .and_then(|rest| rest.find(')').map(|i| rest[i + 1..].trim_start()))
         .or_else(|| trimmed.strip_prefix("pub ").map(str::trim_start))
         .unwrap_or(trimmed);
-    ["mod tests", "mod test_support"].iter().any(|module| {
-        after_vis
-            .strip_prefix(module)
-            .is_some_and(|rest| rest.trim_start().starts_with('{'))
-    })
+    let Some(rest) = after_vis.strip_prefix("mod ") else {
+        return false;
+    };
+    let name = rest.trim_start();
+    let ident_end = name
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(name.len());
+    if ident_end == 0 {
+        return false;
+    }
+    let opens_body = name[ident_end..].trim_start().starts_with('{');
+    opens_body && (any_name || ["tests", "test_support"].contains(&&name[..ident_end]))
 }
 
 fn walk_rs(dir: &Path) -> Vec<PathBuf> {
@@ -442,7 +458,7 @@ const BARE_BYTES: &str = "bytes";
 /// row is a number a deployment's behaviour depends on and no caller can move;
 /// the ceiling exists so the next one arrives with a decision, which is what
 /// makes this a ratchet rather than a count.
-const BARE_LITERAL_CEILING: usize = 163;
+const BARE_LITERAL_CEILING: usize = 101;
 
 /// `Duration::from_*(<literal>)` and byte multipliers, per file and shape.
 ///
@@ -473,13 +489,26 @@ fn scan_bare_literals(root: &Path) -> BTreeMap<(String, String), usize> {
         let mut depth: i32 = 0;
         let mut defaults: Option<i32> = None;
         let mut fixtures: Option<i32> = None;
-        for (i, line) in lines.iter().enumerate() {
-            let next = lines[i + 1..]
-                .iter()
-                .find(|l| !l.trim().is_empty())
-                .copied();
+        let mut expecting_test_module = false;
+        for line in lines.iter() {
+            let trimmed = line.trim();
             let code = code_only(line);
-            let opens_tests = opens_inline_test_module(line, next);
+            // `#[cfg(test)]` guards the module that follows it, but attributes
+            // and doc comments may sit in between, so the guard waits for the
+            // next line that is code.
+            let opens_tests = if trimmed.starts_with("//") {
+                false
+            } else if trimmed.starts_with("#[") {
+                if trimmed.starts_with("#[cfg(test") {
+                    expecting_test_module = true;
+                }
+                false
+            } else if expecting_test_module {
+                expecting_test_module = false;
+                has_inline_module_body(line, true)
+            } else {
+                has_inline_module_body(line, false)
+            };
             let in_fixtures = fixtures.is_some();
             let depth_before = depth;
             depth += code.matches('{').count() as i32 - code.matches('}').count() as i32;
@@ -651,24 +680,33 @@ fn byte_literals(code: &str) -> usize {
     let mut count = 0;
     let mut rest = code;
     while let Some(at) = rest.find("1024") {
-        let before = &rest[..at];
-        let head = before.trim_end();
-        if let Some(head) = head.strip_suffix('*') {
-            let number: String = head
-                .trim_end()
-                .chars()
-                .rev()
-                .take_while(|c| c.is_ascii_digit() || *c == '_' || *c == '.')
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            let plain = number.replace('_', "");
-            if !number.is_empty() && plain != "1024" && plain != "1024.0" && plain != "1" {
-                count += 1;
-            }
-        }
         rest = &rest[at + 4..];
+        // `1024.0` and `10240` are one number, not a `1024` and a tail: skipping
+        // only the four digits left a ".0" behind that read as a multiplier.
+        let longer = rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit() || c == '_' || c == '.');
+        if longer {
+            continue;
+        }
+        let head = code[..code.len() - rest.len() - 4].trim_end();
+        let Some(head) = head.strip_suffix('*') else {
+            continue;
+        };
+        let number: String = head
+            .trim_end()
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit() || *c == '_' || *c == '.')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let plain = number.replace('_', "");
+        if !number.is_empty() && plain != "1024" && plain != "1024.0" && plain != "1" {
+            count += 1;
+        }
     }
     count
 }
