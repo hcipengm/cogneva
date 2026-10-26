@@ -270,6 +270,13 @@ pub struct AgentRuntime {
     /// — the ending is decided at three different places, and only the exit is
     /// common to all of them.
     run_outcome: Option<crate::observable::RunOutcome>,
+    /// Whether this run has already reported a prompt that did not fit the
+    /// configured context window.
+    ///
+    /// One alert per run: a condition that repeats on every call would turn a
+    /// signal into a hum, and the reader would stop seeing the first one — which
+    /// is the only one that says when it started.
+    context_overrun_reported: bool,
     /// Identity of the run in flight, declared on every LLM call it makes.
     ///
     /// The same id the run reports its own token census under: without it the
@@ -485,6 +492,7 @@ impl AgentRuntime {
             run_task_id: None,
             run_iterations: 0,
             run_outcome: None,
+            context_overrun_reported: false,
         }
     }
 
@@ -923,6 +931,9 @@ impl AgentRuntime {
         // those are the runs a token investigation is about.
         self.run_usage = RunUsage::default();
         self.run_iterations = 0;
+        // 换了一次运行就是一个新的额度：上一轮报过的那次超大 prompt，不能替这一轮
+        // 把嘴堵上，否则第二轮同样的问题会在任何地方都读不到。
+        self.context_overrun_reported = false;
         self.run_outcome = None;
         // Set before the first call and cleared at the only exit, so a run that
         // was started without an identity cannot inherit the previous one.
@@ -2024,6 +2035,7 @@ impl AgentRuntime {
         // billed too -- it consumed the tokens it consumed, and the error path
         // returns from here before anything else could count them.
         self.run_usage.add(&response.usage);
+        self.note_context_overrun(response.usage.input).await;
 
         if let Some(error) = stream_error {
             // A provider that classified the refusal (HTTP status -> a typed
@@ -2126,6 +2138,7 @@ impl AgentRuntime {
                 // out would understate the runs that needed it, which are the
                 // ones whose answer came out of a fallback.
                 self.run_usage.add(&response.usage);
+                self.note_context_overrun(response.usage.input).await;
                 let text: String = response
                     .content
                     .iter()
@@ -2163,6 +2176,46 @@ impl AgentRuntime {
                 );
                 Ok(serde_json::json!({ "result": thought }))
             }
+        }
+    }
+
+    /// 报一次「这一问的 prompt 比配置的上下文窗口还大」。
+    ///
+    /// 上下文在每次调用前都会裁到 `context_window_size` 以内，所以一个超过窗口的
+    /// prompt 说明裁剪没有兑现。这件事不报出来就是隐形的：调用照样成功、答案照样
+    /// 回来，只有账单知道这次送出去的比配置允许的多。它也是告警面上唯一有生产者的
+    /// 那一种读数——没有它，那一面接得再对也永远是空的。
+    ///
+    /// 一次运行只报一次。每调用一次都报的话，读者很快就会把它当背景噪声，而真正
+    /// 有用的恰恰是第一次：它说明从什么时候开始超的。窗口配成 0 当作没配，不判。
+    async fn note_context_overrun(&mut self, prompt_tokens: u32) {
+        if self.context_overrun_reported {
+            return;
+        }
+        let window = self.config.context_window_size as u64;
+        let prompt = u64::from(prompt_tokens);
+        if window == 0 || prompt <= window {
+            return;
+        }
+        self.context_overrun_reported = true;
+        let event = AgentEvent::ResourceAlert {
+            agent_id: self.config.agent_id.clone(),
+            metric: "context_window".into(),
+            threshold: window as f64,
+            current: prompt as f64,
+            crew_id: self.config.crew_id.clone(),
+            squad_id: self.config.squad_id.clone(),
+            timestamp: chrono::Utc::now(),
+        };
+        if let Err(e) = self.emit_event(event).await {
+            // 没发出去就不算报过：下一问再试。这里不算「已报」，否则总线一断，
+            // 这一次超窗就永远没人知道，而它其实是这一整轮里唯一的那次。
+            self.context_overrun_reported = false;
+            tracing::warn!(
+                agent_id = %self.config.agent_id,
+                error = %e,
+                "context overrun alert could not be emitted"
+            );
         }
     }
 
@@ -3619,6 +3672,81 @@ mod tests {
         assert!(
             spy.rows().is_empty(),
             "a run with no task id must not write a task row"
+        );
+    }
+
+    /// A call whose prompt is wider than the configured window is announced once
+    /// per run, and the announcement carries both the configured bound and what
+    /// was actually sent.
+    ///
+    /// Without this the condition is invisible: the call succeeds, the answer
+    /// arrives, and only the bill shows the context was bigger than configured.
+    /// It is also the only reading on the alerts face that has a producer — that
+    /// face's consumers were wired to a frame nothing ever emitted.
+    #[tokio::test]
+    async fn a_prompt_wider_than_the_window_is_reported_once_per_run() {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        let config = RuntimeConfig {
+            agent_id: "overrun".into(),
+            context_window_size: 100,
+            max_iterations: 1,
+            think_stall_timeout_secs: 5,
+            final_draft_timeout_secs: 300,
+            ..Default::default()
+        };
+        let mut runtime = AgentRuntime::new(config, tx);
+
+        // 刚好等于窗口不算越界：窗口说的是「能送多少」，不是「必须少送一个」。
+        runtime.note_context_overrun(100).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a prompt that exactly fills the window is not an overrun"
+        );
+
+        runtime.note_context_overrun(101).await;
+        match rx.try_recv().expect("an overrun has to be announced") {
+            AgentEvent::ResourceAlert {
+                agent_id,
+                metric,
+                threshold,
+                current,
+                ..
+            } => {
+                assert_eq!(agent_id, "overrun");
+                assert_eq!(metric, "context_window");
+                assert_eq!(threshold, 100.0, "the configured window, not a guess");
+                assert_eq!(current, 101.0, "what was actually sent");
+            }
+            other => panic!("the overrun was announced as something else: {other:?}"),
+        }
+
+        // 同一轮再超一次不重复报：第二次是同一件事的更响的说法。
+        runtime.note_context_overrun(5_000).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "one overrun per run: a second one would make the first unreadable"
+        );
+
+        // 换一轮重新有资格报。不重置的话，第一轮超一次，之后每一轮都静默。
+        let llm = CensusLlm {
+            text: r#"{"result":"ok"}"#,
+            stream_usage: usage(400, 10, 410),
+            chat_usage: cog_core::Usage::default(),
+            error: false,
+        };
+        runtime
+            .run_scoped(serde_json::json!({"task": "overrun"}), &llm, Some("task-9"))
+            .await
+            .expect("the run delivers");
+        let mut announced = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, AgentEvent::ResourceAlert { .. }) {
+                announced += 1;
+            }
+        }
+        assert_eq!(
+            announced, 1,
+            "a new run over the same window reports it again; a carried-over flag would hide it"
         );
     }
 
