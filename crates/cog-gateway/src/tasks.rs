@@ -1479,6 +1479,49 @@ mod tests {
         ));
     }
 
+    /// 写出去的拼法与读回来的拼法必须是同一组词：提交时 `parse_task_type`
+    /// 认不出一个词就把它当成自定义类型，于是那道任务以 `Custom("llm-call")`
+    /// 的样子进图，而规划、限流、重试矩阵都按真类型找它——找不到，读作「没有
+    /// 这一类任务」。
+    #[test]
+    fn every_task_type_word_reads_back_as_the_type_that_wrote_it() {
+        let builtin = [
+            TaskType::Planner,
+            TaskType::Generator,
+            TaskType::Evaluator,
+            TaskType::Reviewer,
+            TaskType::LlmCall,
+            TaskType::ToolCall,
+            TaskType::FileOp,
+            TaskType::DbTransaction,
+            TaskType::NetworkRequest,
+            TaskType::WasmSkill,
+            TaskType::Skill,
+            TaskType::DagNode,
+        ];
+        for task_type in builtin {
+            let word = task_type_str(&task_type);
+            assert_eq!(
+                parse_task_type(&word),
+                task_type,
+                "{word:?} does not read back as the type that wrote it"
+            );
+            let serde_word = serde_json::to_value(&task_type)
+                .expect("a task type serializes")
+                .as_str()
+                .expect("a builtin type serializes as a word")
+                .to_string();
+            assert_eq!(
+                word, serde_word,
+                "the read surface and the row must spell the type the same way"
+            );
+        }
+        // 自定义类型原样往返：写出去的是它自己的名字，不是 `custom(\"x\")`。
+        let custom = TaskType::Custom("my_thing".into());
+        assert_eq!(task_type_str(&custom), "my_thing");
+        assert_eq!(parse_task_type("my_thing"), custom);
+    }
+
     #[test]
     fn purge_matches_age_cutoff() {
         let statuses = vec![cog_core::TaskStatus::Pending];
