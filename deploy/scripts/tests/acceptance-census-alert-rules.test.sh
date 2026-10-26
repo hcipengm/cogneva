@@ -9,6 +9,8 @@
 #   3. 删掉 absent 那条规则：缺席那一格必须红——否则「读数停了没人管」也绿；
 #   4. 后加的那条（landed_unjudgeable）同样把 `> 0` 改成 `>= 0`：它自己的负对照
 #      必须红——「新规则配了新夹具」不是自明的事，夹具可以是抄来的、也可以是空的。
+#   5. 把「正在跑」的豁免从 `unless` 改成 `and`：缺席那一格与空闲那一格都必须红——
+#      写法一改，「生产者漏发新格」就从「多响一次」变成「永久静音」。
 # 另有两格证明它**不会**白红：真文件必须绿；拿不到 promtool 时必须退 3（看不了 ≠ 一致），
 # 不许把「没跑」报成「通过」。
 #
@@ -93,6 +95,25 @@ sed 's/< 5400)/< 999999999)/' "$manifest" >"${work}/m4c.yaml"
 run "${work}/m4c.yaml"
 [ "$rc" -eq 1 ] && ok "豁免上界写成无穷：单测红（卡死的锁不会永久静音）" \
     || bad "豁免上界无穷应红" "1" "$rc"
+
+# 4d) 把豁免从 `unless` 改成 `and`（`age > 1800 and running > 0 and running < 5400`）：
+#     「生产者没发这条序列」与「跑着」在 `and` 下都变成不响，读数面新加一格忘了发就等于
+#     把这条告警永久关掉。两格必须红：缺席那一格（四）、空闲那一格（七的前半）。
+#     没有这一格，「规则改个写法」可以把它从「多响一次」变成「永久静音」而没人知道。
+python3 - "$manifest" "${work}/m4d.yaml" <<'PY'
+import sys
+src, out = sys.argv[1], sys.argv[2]
+s = open(src, encoding="utf-8").read()
+i = s.index("          expr: max (cogneva_acceptance_age_seconds) > 1800")
+j = s.index("          for: 10m", i)
+naive = ("          expr: max (cogneva_acceptance_age_seconds) > 1800\n"
+         "                and (max (cogneva_acceptance_refresh_running_seconds) > 0)\n"
+         "                and (max (cogneva_acceptance_refresh_running_seconds) < 5400)\n")
+open(out, "w", encoding="utf-8").write(s[:i] + naive + s[j:])
+PY
+run "${work}/m4d.yaml"
+[ "$rc" -eq 1 ] && ok "豁免改成 and：单测红（缺席不再被读成「正在跑」）" \
+    || bad "豁免改成 and 应红" "1" "$rc"
 
 # 5) 拿不到 promtool：必须退 3，不许报绿。
 PROMTOOL=/nonexistent/promtool bash "$runner" >"${work}/out4" 2>&1; rc=$?
