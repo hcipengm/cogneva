@@ -22,12 +22,14 @@ pub enum PgeRole {
 
 impl std::fmt::Display for PgeRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 名字的唯一声明在 `crate::roles`：这个 `Display` 是它的一个读者，
+        // 不是第二个作者。
         match self {
-            PgeRole::Planner => write!(f, "planner"),
-            PgeRole::Generator => write!(f, "generator"),
-            PgeRole::Evaluator => write!(f, "evaluator"),
-            PgeRole::Moderator => write!(f, "moderator"),
-            PgeRole::Merger => write!(f, "merger"),
+            PgeRole::Planner => f.write_str(crate::roles::PLANNER),
+            PgeRole::Generator => f.write_str(crate::roles::GENERATOR),
+            PgeRole::Evaluator => f.write_str(crate::roles::EVALUATOR),
+            PgeRole::Moderator => f.write_str(crate::roles::MODERATOR),
+            PgeRole::Merger => f.write_str(crate::roles::MERGER),
         }
     }
 }

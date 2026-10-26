@@ -83,7 +83,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             agent_id: "agent".into(),
-            role: "planner".into(),
+            role: crate::roles::PLANNER.into(),
             max_iterations: 10,
             // 32k fallback: 4k windows amputate tool-call history so badly that
             // CJK task prompts alone trigger trimming, leaving the model with

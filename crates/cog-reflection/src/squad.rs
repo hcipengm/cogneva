@@ -88,7 +88,8 @@ impl cog_core::SquadReflection for DefaultSquadReflection {
         for contrib in contributions {
             for learning in &contrib.learnings {
                 let mut l = learning.clone();
-                l.related_tasks.push(format!("squad:{}", squad_id));
+                l.related_tasks
+                    .push(format!("{}{}", cog_core::SQUAD_ID_PREFIX, squad_id));
                 self.matcher.update_recurrence(&mut l).await?;
                 self.recorder.record_learning(l.clone()).await?;
                 all_learnings.push(l);
@@ -102,7 +103,8 @@ impl cog_core::SquadReflection for DefaultSquadReflection {
         // 2. Detect disagreements (Roundtable-specific)
         let disagreements = self.detect_disagreements(contributions).await;
         for mut d in disagreements {
-            d.related_tasks.push(format!("squad:{}", squad_id));
+            d.related_tasks
+                .push(format!("{}{}", cog_core::SQUAD_ID_PREFIX, squad_id));
             self.matcher.update_recurrence(&mut d).await?;
             self.recorder.record_learning(d.clone()).await?;
             all_learnings.push(d);
@@ -115,7 +117,8 @@ impl cog_core::SquadReflection for DefaultSquadReflection {
         let upgrade_recommended = !upgrades.is_empty();
         let upgrade_reason = upgrades.first().map(|u| u.summary.clone());
         for mut u in upgrades {
-            u.related_tasks.push(format!("squad:{}", squad_id));
+            u.related_tasks
+                .push(format!("{}{}", cog_core::SQUAD_ID_PREFIX, squad_id));
             self.matcher.update_recurrence(&mut u).await?;
             self.recorder.record_learning(u.clone()).await?;
             all_learnings.push(u);
@@ -159,15 +162,15 @@ impl cog_core::SquadReflection for DefaultSquadReflection {
         // Find planner and evaluator contributions
         let planner_result = contributions
             .iter()
-            .find(|c| c.role == "planner")
+            .find(|c| c.role == cog_core::roles::PLANNER)
             .and_then(|c| c.result.as_ref());
         let evaluator_result = contributions
             .iter()
-            .find(|c| c.role == "evaluator")
+            .find(|c| c.role == cog_core::roles::EVALUATOR)
             .and_then(|c| c.result.as_ref());
         let generator_result = contributions
             .iter()
-            .find(|c| c.role == "generator")
+            .find(|c| c.role == cog_core::roles::GENERATOR)
             .and_then(|c| c.result.as_ref());
 
         // Detect plan-vs-generation mismatch

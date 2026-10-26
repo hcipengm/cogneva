@@ -615,9 +615,9 @@ impl ActionPlanOrchestrator {
     /// know about.
     fn atomic_task_to_task(at: &AtomicTask) -> Task {
         let task_type = match at.skill_id.as_deref() {
-            Some(id) if id.eq_ignore_ascii_case("planner") => TaskType::Planner,
-            Some(id) if id.eq_ignore_ascii_case("generator") => TaskType::Generator,
-            Some(id) if id.eq_ignore_ascii_case("evaluator") => TaskType::Evaluator,
+            Some(id) if id.eq_ignore_ascii_case(cog_core::roles::PLANNER) => TaskType::Planner,
+            Some(id) if id.eq_ignore_ascii_case(cog_core::roles::GENERATOR) => TaskType::Generator,
+            Some(id) if id.eq_ignore_ascii_case(cog_core::roles::EVALUATOR) => TaskType::Evaluator,
             Some(id) if id.eq_ignore_ascii_case("reviewer") => TaskType::Reviewer,
             Some(other) => TaskType::Custom(other.to_string()),
             None => TaskType::Custom("unknown".to_string()),

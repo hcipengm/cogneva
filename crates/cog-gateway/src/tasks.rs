@@ -30,9 +30,9 @@ fn broadcast_task_status(
 
 fn parse_task_type(s: &str) -> TaskType {
     match s {
-        "planner" => TaskType::Planner,
-        "generator" => TaskType::Generator,
-        "evaluator" => TaskType::Evaluator,
+        cog_core::roles::PLANNER => TaskType::Planner,
+        cog_core::roles::GENERATOR => TaskType::Generator,
+        cog_core::roles::EVALUATOR => TaskType::Evaluator,
         "reviewer" => TaskType::Reviewer,
         "llm_call" => TaskType::LlmCall,
         "tool_call" => TaskType::ToolCall,
@@ -48,9 +48,9 @@ fn parse_task_type(s: &str) -> TaskType {
 
 fn task_type_str(tt: &TaskType) -> String {
     match tt {
-        TaskType::Planner => "planner".into(),
-        TaskType::Generator => "generator".into(),
-        TaskType::Evaluator => "evaluator".into(),
+        TaskType::Planner => cog_core::roles::PLANNER.into(),
+        TaskType::Generator => cog_core::roles::GENERATOR.into(),
+        TaskType::Evaluator => cog_core::roles::EVALUATOR.into(),
         TaskType::Reviewer => "reviewer".into(),
         TaskType::LlmCall => "llm_call".into(),
         TaskType::ToolCall => "tool_call".into(),

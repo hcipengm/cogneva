@@ -322,7 +322,12 @@ impl CollaborationExecutor {
         if let (Some(ref manager), Some(ref llm)) = (&self.agent_manager, &self.llm_provider) {
             // 全进程一个：它不属于任何任务，任何任务的终态都不该把它摘掉。
             match manager
-                .create_agent("mode-selector", "mode_selector", llm.clone(), None)
+                .create_agent(
+                    "mode-selector",
+                    cog_core::roles::MODE_SELECTOR,
+                    llm.clone(),
+                    None,
+                )
                 .await
             {
                 Ok(agent) => ms = ms.with_agent(agent),

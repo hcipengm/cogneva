@@ -217,12 +217,12 @@ pub const REGISTERED_SITES: &[RegisteredSite] = &[
     },
     RegisteredSite {
         actor: "self_review:planner",
-        skip_stage: Some("planner"),
+        skip_stage: Some(cog_core::roles::PLANNER),
         why: "the review of the plan; the site most likely to be skipped deliberately (a self-evolution plan is judged by measurement instead), so with the saved-call ledger in place most of its absent windows should read `documented_skip` — a window that reads `unexpected_absent` here is the review having gone away, which is the expensive direction",
     },
     RegisteredSite {
         actor: "self_review:moderator",
-        skip_stage: Some("moderator"),
+        skip_stage: Some(cog_core::roles::MODERATOR),
         why: "the review of the moderator's verdict, skipped under the same declared reasons as the planner's; 5 stops over 13 spending hours",
     },
 ];
@@ -314,15 +314,15 @@ pub struct UnreadSkipStage {
 /// saving nothing can see.
 pub const UNREAD_SKIP_STAGES: &[UnreadSkipStage] = &[
     UnreadSkipStage {
-        stage: "generator",
+        stage: cog_core::roles::GENERATOR,
         why: "the generator's review has been skipped in every window observed; no spend has ever been recorded under `self_review:generator`, so there is no window in which its silence could be told from its absence",
     },
     UnreadSkipStage {
-        stage: "evaluator",
+        stage: cog_core::roles::EVALUATOR,
         why: "the evaluator's review is skipped by construction when the change-validation path already answers the question, and its own review has never been observed spending",
     },
     UnreadSkipStage {
-        stage: "merger",
+        stage: cog_core::roles::MERGER,
         why: "same shape as the generator's: savings are recorded, no spend under `self_review:merger` has ever been observed to judge them against",
     },
 ];

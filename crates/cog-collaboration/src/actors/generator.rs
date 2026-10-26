@@ -180,7 +180,7 @@ impl GeneratorActor {
                     crate::actors::validate_against_schema(
                         schema,
                         &result.to_string(),
-                        "generator",
+                        cog_core::roles::GENERATOR,
                     );
                 }
                 let output = crate::squad::pge::parse_generator_output(&result);
@@ -234,7 +234,7 @@ impl GeneratorActor {
             self.agent.as_ref(),
             &self.self_review,
             &output_str,
-            "generator",
+            cog_core::roles::GENERATOR,
             review_basis,
         )
         .await

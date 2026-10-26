@@ -171,7 +171,7 @@ impl Default for AgentLoopConfig {
     fn default() -> Self {
         Self {
             agent_id: "agent-001".into(),
-            role: "planner".into(),
+            role: cog_core::roles::PLANNER.into(),
             max_iterations: 10,
             eval_max_iterations: 5,
             context_window_size: 32000,
@@ -234,7 +234,7 @@ impl Default for AgentManagerConfig {
         Self {
             enabled: true,
             worker_count: 0,
-            worker_role: "planner".into(),
+            worker_role: cog_core::roles::PLANNER.into(),
         }
     }
 }

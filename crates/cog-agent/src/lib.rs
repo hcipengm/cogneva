@@ -32,11 +32,14 @@ pub use agent_kernel::{AgentHooks, AgentRuntime, ReActLoop, ReActStep, RuntimeSt
 pub struct AgentRole(pub String);
 
 impl AgentRole {
-    pub const PLANNER: &'static str = "planner";
-    pub const GENERATOR: &'static str = "generator";
-    pub const EVALUATOR: &'static str = "evaluator";
-    pub const MODERATOR: &'static str = "moderator";
-    pub const MODE_SELECTOR: &'static str = "mode_selector";
+    // 名字声明在 `cog_core::roles`；这里只是给本 crate 的老调用点留的别名，
+    // 多了 MERGER 一个，因为角色表是开放的、常被按名字取用。
+    pub const PLANNER: &'static str = cog_core::roles::PLANNER;
+    pub const GENERATOR: &'static str = cog_core::roles::GENERATOR;
+    pub const EVALUATOR: &'static str = cog_core::roles::EVALUATOR;
+    pub const MODERATOR: &'static str = cog_core::roles::MODERATOR;
+    pub const MERGER: &'static str = cog_core::roles::MERGER;
+    pub const MODE_SELECTOR: &'static str = cog_core::roles::MODE_SELECTOR;
 }
 
 impl std::fmt::Display for AgentRole {

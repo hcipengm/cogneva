@@ -249,7 +249,7 @@ impl SquadExecutor {
 
     /// 直接执行一个 Squad，返回执行结果。
     pub async fn execute_squad(&self, task_id: String, config: SquadConfig) -> SquadResult {
-        let squad_id = format!("squad:{}", task_id);
+        let squad_id = cog_core::squad_id_for(&task_id);
         let squad = Squad {
             id: squad_id.clone(),
             task_id: task_id.clone(),
@@ -372,19 +372,19 @@ impl SquadExecutor {
         let planner_skill = crate::actors::resolve_prompt_skill(
             skill_registry.as_ref(),
             squad.config.planner_skill_id.as_deref(),
-            "planner",
+            cog_core::roles::PLANNER,
         )
         .await;
         let generator_skill = crate::actors::resolve_prompt_skill(
             skill_registry.as_ref(),
             squad.config.generator_skill_id.as_deref(),
-            "generator",
+            cog_core::roles::GENERATOR,
         )
         .await;
         let evaluator_skill = crate::actors::resolve_prompt_skill(
             skill_registry.as_ref(),
             squad.config.evaluator_skill_id.as_deref(),
-            "evaluator",
+            cog_core::roles::EVALUATOR,
         )
         .await;
         // 分解路径只跑 Planner：这条路上没有生成器也没有评估器，凭空创建两个
@@ -402,7 +402,7 @@ impl SquadExecutor {
                 llm,
                 deps.state_backend.as_ref(),
                 &squad.task_id,
-                "planner",
+                cog_core::roles::PLANNER,
             )
             .await
             {
@@ -423,7 +423,7 @@ impl SquadExecutor {
             if let Some(ref cfg) = self_review {
                 planner_actor = planner_actor.with_self_review(cfg.clone());
             }
-            if let Some(s) = schema_for("planner") {
+            if let Some(s) = schema_for(cog_core::roles::PLANNER) {
                 planner_actor = planner_actor.with_output_schema(s);
             }
             if let Some(ref sk) = planner_skill {
@@ -454,7 +454,7 @@ impl SquadExecutor {
                 llm,
                 deps.state_backend.as_ref(),
                 &squad.task_id,
-                "generator",
+                cog_core::roles::GENERATOR,
             )
             .await
             {
@@ -473,7 +473,7 @@ impl SquadExecutor {
                 llm,
                 deps.state_backend.as_ref(),
                 &squad.task_id,
-                "evaluator",
+                cog_core::roles::EVALUATOR,
             )
             .await
             {
@@ -497,10 +497,10 @@ impl SquadExecutor {
                 generator_actor = generator_actor.with_self_review(cfg.clone());
                 evaluator_actor = evaluator_actor.with_self_review(cfg.clone());
             }
-            if let Some(s) = schema_for("generator") {
+            if let Some(s) = schema_for(cog_core::roles::GENERATOR) {
                 generator_actor = generator_actor.with_output_schema(s);
             }
-            if let Some(s) = schema_for("evaluator") {
+            if let Some(s) = schema_for(cog_core::roles::EVALUATOR) {
                 evaluator_actor = evaluator_actor.with_output_schema(s);
             }
             if let Some(ref sk) = generator_skill {
@@ -547,7 +547,7 @@ impl SquadExecutor {
                     llm,
                     state,
                     &squad.task_id,
-                    "planner",
+                    cog_core::roles::PLANNER,
                 )
                 .await;
                 let generator = crate::resume::create_role_agent(
@@ -555,7 +555,7 @@ impl SquadExecutor {
                     llm,
                     state,
                     &squad.task_id,
-                    "generator",
+                    cog_core::roles::GENERATOR,
                 )
                 .await;
                 let evaluator = crate::resume::create_role_agent(
@@ -563,7 +563,7 @@ impl SquadExecutor {
                     llm,
                     state,
                     &squad.task_id,
-                    "evaluator",
+                    cog_core::roles::EVALUATOR,
                 )
                 .await;
                 // Moderator is optional — failure to create it is non-fatal.
@@ -572,7 +572,7 @@ impl SquadExecutor {
                     llm,
                     state,
                     &squad.task_id,
-                    "moderator",
+                    cog_core::roles::MODERATOR,
                 )
                 .await
                 .ok();
@@ -633,13 +633,13 @@ impl SquadExecutor {
                             generator_actor = generator_actor.with_self_review(cfg.clone());
                             evaluator_actor = evaluator_actor.with_self_review(cfg.clone());
                         }
-                        if let Some(s) = schema_for("planner") {
+                        if let Some(s) = schema_for(cog_core::roles::PLANNER) {
                             planner_actor = planner_actor.with_output_schema(s);
                         }
-                        if let Some(s) = schema_for("generator") {
+                        if let Some(s) = schema_for(cog_core::roles::GENERATOR) {
                             generator_actor = generator_actor.with_output_schema(s);
                         }
-                        if let Some(s) = schema_for("evaluator") {
+                        if let Some(s) = schema_for(cog_core::roles::EVALUATOR) {
                             evaluator_actor = evaluator_actor.with_output_schema(s);
                         }
                         if let Some(ref sk) = planner_skill {
@@ -684,7 +684,7 @@ impl SquadExecutor {
                         if let Some(ref cfg) = self_review {
                             moderator_actor = moderator_actor.with_self_review(cfg.clone());
                         }
-                        if let Some(s) = schema_for("moderator") {
+                        if let Some(s) = schema_for(cog_core::roles::MODERATOR) {
                             moderator_actor = moderator_actor.with_output_schema(s);
                         }
                         rt_config.moderator = Some(moderator_actor);
@@ -701,7 +701,7 @@ impl SquadExecutor {
                                 llm,
                                 deps.state_backend.as_ref(),
                                 &squad.task_id,
-                                "merger",
+                                cog_core::roles::MERGER,
                             )
                             .await
                             {
@@ -710,7 +710,7 @@ impl SquadExecutor {
                                     if let Some(ref cfg) = self_review {
                                         merger_actor = merger_actor.with_self_review(cfg.clone());
                                     }
-                                    if let Some(s) = schema_for("merger") {
+                                    if let Some(s) = schema_for(cog_core::roles::MERGER) {
                                         merger_actor = merger_actor.with_output_schema(s);
                                     }
                                     rt_config.merger = Some(merger_actor);
@@ -734,13 +734,13 @@ impl SquadExecutor {
                         generator_actor = generator_actor.with_self_review(cfg.clone());
                         evaluator_actor = evaluator_actor.with_self_review(cfg.clone());
                     }
-                    if let Some(s) = schema_for("planner") {
+                    if let Some(s) = schema_for(cog_core::roles::PLANNER) {
                         planner_actor = planner_actor.with_output_schema(s);
                     }
-                    if let Some(s) = schema_for("generator") {
+                    if let Some(s) = schema_for(cog_core::roles::GENERATOR) {
                         generator_actor = generator_actor.with_output_schema(s);
                     }
-                    if let Some(s) = schema_for("evaluator") {
+                    if let Some(s) = schema_for(cog_core::roles::EVALUATOR) {
                         evaluator_actor = evaluator_actor.with_output_schema(s);
                     }
                     if let Some(ref sk) = planner_skill {
@@ -1081,21 +1081,21 @@ fn build_contributions_from_verdict(
         vec![
             cog_core::AgentSquadContribution {
                 agent_id: format!("{}:planner", squad_id),
-                role: "planner".into(),
+                role: cog_core::roles::PLANNER.into(),
                 learnings: Vec::new(),
                 errors: Vec::new(),
                 result: plan,
             },
             cog_core::AgentSquadContribution {
                 agent_id: format!("{}:generator", squad_id),
-                role: "generator".into(),
+                role: cog_core::roles::GENERATOR.into(),
                 learnings,
                 errors,
                 result: generation,
             },
             cog_core::AgentSquadContribution {
                 agent_id: format!("{}:evaluator", squad_id),
-                role: "evaluator".into(),
+                role: cog_core::roles::EVALUATOR.into(),
                 learnings: Vec::new(),
                 errors: Vec::new(),
                 result: evaluation_value,
@@ -1107,21 +1107,21 @@ fn build_contributions_from_verdict(
         vec![
             cog_core::AgentSquadContribution {
                 agent_id: format!("{}:planner", squad_id),
-                role: "planner".into(),
+                role: cog_core::roles::PLANNER.into(),
                 learnings: Vec::new(),
                 errors: Vec::new(),
                 result: rt.clone(),
             },
             cog_core::AgentSquadContribution {
                 agent_id: format!("{}:generator", squad_id),
-                role: "generator".into(),
+                role: cog_core::roles::GENERATOR.into(),
                 learnings,
                 errors,
                 result: rt.clone(),
             },
             cog_core::AgentSquadContribution {
                 agent_id: format!("{}:evaluator", squad_id),
-                role: "evaluator".into(),
+                role: cog_core::roles::EVALUATOR.into(),
                 learnings: Vec::new(),
                 errors: Vec::new(),
                 result: rt,

@@ -428,7 +428,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
             tokio::sync::mpsc::channel::<cog_core::AgentEvent>(128);
         let eval_config = cog_core::RuntimeConfig {
             agent_id: "eval-agent".into(),
-            role: "evaluator".into(),
+            role: cog_core::roles::EVALUATOR.into(),
             max_iterations: agent_loop_config.eval_max_iterations,
             context_window_size: 32000,
             skill_cache_ttl_secs: 30,

@@ -265,7 +265,11 @@ impl PlannerActor {
                         .and_then(|s| s.output_schema.as_ref())
                 });
                 if let Some(schema) = effective_schema {
-                    crate::actors::validate_against_schema(schema, &result.to_string(), "planner");
+                    crate::actors::validate_against_schema(
+                        schema,
+                        &result.to_string(),
+                        cog_core::roles::PLANNER,
+                    );
                 }
                 crate::squad::pge::parse_planner_output(&result, goal)
             }
@@ -308,7 +312,7 @@ impl PlannerActor {
             self.agent.as_ref(),
             &self.self_review,
             &output_str,
-            "planner",
+            cog_core::roles::PLANNER,
             review_basis,
         )
         .await

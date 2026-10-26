@@ -950,7 +950,7 @@ impl PgeRoundtable {
         let planner = manager
             .create_agent(
                 &format!("{}-planner", prefix),
-                "planner",
+                cog_core::roles::PLANNER,
                 llm.clone(),
                 Some(&task.id),
             )
@@ -959,7 +959,7 @@ impl PgeRoundtable {
         let generator = manager
             .create_agent(
                 &format!("{}-generator", prefix),
-                "generator",
+                cog_core::roles::GENERATOR,
                 llm.clone(),
                 Some(&task.id),
             )
@@ -968,7 +968,7 @@ impl PgeRoundtable {
         let evaluator = manager
             .create_agent(
                 &format!("{}-evaluator", prefix),
-                "evaluator",
+                cog_core::roles::EVALUATOR,
                 llm.clone(),
                 Some(&task.id),
             )

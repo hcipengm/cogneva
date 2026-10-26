@@ -111,7 +111,11 @@ impl MergerActor {
         let (mut output, review_basis) = match self.agent.prompt_for_task(&task.id, input).await {
             Ok(result) => {
                 if let Some(ref schema) = self.output_schema {
-                    crate::actors::validate_against_schema(schema, &result.to_string(), "merger");
+                    crate::actors::validate_against_schema(
+                        schema,
+                        &result.to_string(),
+                        cog_core::roles::MERGER,
+                    );
                 }
                 (
                     parse_merge_result(&result, branches),
@@ -133,7 +137,7 @@ impl MergerActor {
             self.agent.as_ref(),
             &self.self_review,
             &output_str,
-            "merger",
+            cog_core::roles::MERGER,
             review_basis,
         )
         .await

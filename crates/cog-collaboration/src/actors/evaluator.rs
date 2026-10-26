@@ -122,7 +122,7 @@ impl EvaluatorActor {
             // reliable answer. Counted, so the calls this early return saves are
             // a reading rather than an absence.
             crate::actors::note_self_review_skip(
-                "evaluator",
+                cog_core::roles::EVALUATOR,
                 crate::observable::SELF_REVIEW_SKIP_SELF_EVOLUTION,
             )
             .await;
@@ -198,7 +198,7 @@ impl EvaluatorActor {
                     crate::actors::validate_against_schema(
                         schema,
                         &result.to_string(),
-                        "evaluator",
+                        cog_core::roles::EVALUATOR,
                     );
                 }
                 let output = crate::squad::pge::parse_evaluation_result(&result);
@@ -236,7 +236,7 @@ impl EvaluatorActor {
             self.agent.as_ref(),
             &self.self_review,
             &output_str,
-            "evaluator",
+            cog_core::roles::EVALUATOR,
             review_basis,
         )
         .await

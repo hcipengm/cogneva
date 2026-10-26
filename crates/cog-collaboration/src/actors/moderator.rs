@@ -173,7 +173,7 @@ impl ModeratorActor {
                     crate::actors::validate_against_schema(
                         schema,
                         &result.to_string(),
-                        "moderator",
+                        cog_core::roles::MODERATOR,
                     );
                 }
                 (
@@ -206,7 +206,7 @@ impl ModeratorActor {
             self.agent.as_ref(),
             &self.self_review,
             &output_str,
-            "moderator",
+            cog_core::roles::MODERATOR,
             review_basis,
         )
         .await
