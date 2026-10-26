@@ -77,6 +77,12 @@ pub const AGENT_LOOP_ENV: &[(&str, &str)] = &[
     // 共享端点而不是本节的一个旋钮，所以名字不带 `AGENT_LOOP` 前缀。空表示这个
     // 部署没有接网页检索，工具在调用时报出这个名字，而不是从列表里消失。
     (crate::web::WEB_SEARCH_BASE_ENV, "web_search_base"),
+    // 检索的后备端点：只在自建的 SearXNG 一个引擎都没应答时才用。不设就是不
+    // 兜底——那不是一个缺省值，而是这个部署选择了让查询不出自己这棵树。
+    (
+        crate::web::WEB_SEARCH_FALLBACK_BASE_ENV,
+        "web_search_fallback_base",
+    ),
     // 网页渲染后端：设了就表示这个部署用真浏览器读页面（客户端渲染页与 PDF 才有
     // 正文），不设就是在进程内抽取。两者不是同一个能力，所以不互相兜底。
     (crate::web::WEB_FETCH_BASE_ENV, "web_fetch_base"),
@@ -136,6 +142,17 @@ pub struct AgentLoopConfig {
     /// which setting is missing, so "no web access here" is not read as "no
     /// such tool".
     pub web_search_base: Option<String>,
+    /// Base URL of a second search backend, used only when the first one did
+    /// not answer at all -- every engine silent, twice. Absent means the
+    /// deployment has chosen that a query never leaves this tree; present
+    /// means an unanswered query is put to somewhere else, and the answer it
+    /// returns says which backend produced it.
+    ///
+    /// It is a fallback rather than a peer on purpose. While the self-hosted
+    /// backend answers, the property "the query stays in this deployment" is
+    /// untouched; the only query that leaves is one that was never asked of
+    /// anything here, so nothing is given up that was being held.
+    pub web_search_fallback_base: Option<String>,
     /// Base URL of the page-rendering backend behind `web_fetch`. Absent means
     /// pages are read in process, which cannot run scripts; present means the
     /// fetch is rendered in a real browser, and a backend that does not answer
@@ -165,6 +182,7 @@ impl Default for AgentLoopConfig {
             memory_api_base: None,
             external_archive_threshold_chars: default_external_archive_threshold_chars(),
             web_search_base: None,
+            web_search_fallback_base: None,
             web_fetch_base: None,
         }
     }
@@ -193,6 +211,7 @@ impl From<AgentLoopConfig> for cog_core::RuntimeConfig {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         }
     }
 }

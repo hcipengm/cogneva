@@ -555,6 +555,21 @@ pub trait StateBackend: Send + Sync {
         Err(SFError::NotImplemented("task_plans".into()))
     }
 
+    /// 按种类统计**已经跑完**的任务：中位花销与中位时长，样本数不足
+    /// `min_samples` 的种类不出现。
+    ///
+    /// 它是排期的唯一估算来源：派发侧给一件还没有基线的新任务排期时读它，读到
+    /// 就用（样本是实测的），读不到就不排——「这一类还没有样本」与「这一类排期
+    /// 是零」在甘特面上必须读起来不一样。
+    async fn task_kind_records(
+        &self,
+        workspace_id: &str,
+        min_samples: u64,
+    ) -> SFResult<Vec<crate::TaskKindRecord>> {
+        let _ = (workspace_id, min_samples);
+        Err(SFError::NotImplemented("task_kind_records".into()))
+    }
+
     /// Save the full DAG executor state for a workspace.
     async fn save_dag_state(&self, workspace_id: &str, state: &serde_json::Value) -> SFResult<()> {
         let _ = workspace_id;

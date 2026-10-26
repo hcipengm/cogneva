@@ -67,6 +67,16 @@ pub struct RuntimeConfig {
     /// Optional Squad identifier — attached to lifecycle events so the hook
     /// engine can route them to Squad scope.
     pub squad_id: Option<String>,
+    /// 这个 agent 是在替哪一件 DAG 任务干活。
+    ///
+    /// 与运行身份是两回事：一次运行有自己的 id（PGE 每轮一个 `ralph-pipeline-*`，
+    /// 工具产物归档、沙箱工作目录都按它命名），而成本与清点要记在**那件任务**上
+    /// ——否则账本与清点表里全是运行 id，按任务 id 去查成本一条都查不到，挣值的
+    /// 实际成本恒为 0、预算闸永远读不到。所以运行 id 照旧，归属性另记。
+    ///
+    /// `None` 表示这个 agent 不属于任何任务（常驻角色、临时评测），它的调用
+    /// 就按运行 id 记——不编一个任务名，编出来的会读成一件真花过钱的任务。
+    pub owner_task_id: Option<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -90,6 +100,7 @@ impl Default for RuntimeConfig {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         }
     }
 }

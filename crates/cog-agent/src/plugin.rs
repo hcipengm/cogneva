@@ -383,6 +383,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
                 message_backend: shared_message_backend.clone(),
                 agent_registry: Some(agent_registry.clone()),
                 web_search_base: agent_loop_config.web_search_base.clone(),
+                web_search_fallback_base: agent_loop_config.web_search_fallback_base.clone(),
                 web_fetch_base: agent_loop_config.web_fetch_base.clone(),
             },
         );
@@ -431,6 +432,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
             skill_config: None,
             crew_id: None,
             squad_id: None,
+            owner_task_id: None,
         };
         let mut eval_runtime = crate::AgentRuntime::new(eval_config, eval_event_tx)
             .with_tools(tool_registry.as_ref().clone());

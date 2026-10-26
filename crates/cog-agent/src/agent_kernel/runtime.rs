@@ -856,7 +856,22 @@ impl AgentRuntime {
         llm.chat_stream(&messages, &options).await
     }
 
-    /// Put the run's identity on a call's headers, when the run has one.
+    /// 这笔花销该记在谁头上：所属的 DAG 任务优先，其次是这次运行的 id。
+    ///
+    /// 两个身份回答两个问题。运行 id 答「这一次跑了什么」（PGE 每轮一个新
+    /// id，工具产物归档与沙箱工作目录按它命名）；所属任务答「这些 token 是
+    /// 哪件活花的」——挣值的实际成本、预算闸、按任务的历史中位数都按后一个
+    /// 查。2026-10-26 实测：账本里 13.7 万条带 id 的用量全是 `ralph-pipeline-*`，
+    /// 与任务图 3831 个 id 交集为 0，于是成本恒读作 0、预算闸永远「读不到」
+    /// 而放行。所以账与清点记所属任务，运行 id 只留在这条运行自己的地方。
+    ///
+    /// 不属于任何任务的 agent（常驻角色、临时评测）没有所属任务，按运行 id
+    /// 记；两样都没有的调用不编一个身份，编出来的会读成一件真花过钱的任务。
+    fn ledger_task_id<'a>(&'a self, run_task_id: Option<&'a str>) -> Option<&'a str> {
+        self.config.owner_task_id.as_deref().or(run_task_id)
+    }
+
+    /// Put the run's identity on a call's headers, when there is one.
     ///
     /// The task identity is known only to whoever started the run; the
     /// transport cannot derive it, and a table mapping components to tasks
@@ -864,7 +879,7 @@ impl AgentRuntime {
     /// without an identity makes unlabelled calls rather than a made-up one,
     /// because a made-up id reads as a real job on the ledger.
     fn stamp_task(&self, options: cog_core::ChatOptions) -> cog_core::ChatOptions {
-        match self.run_task_id.as_deref() {
+        match self.ledger_task_id(self.run_task_id.as_deref()) {
             Some(task) => options.with_task(task),
             None => options,
         }
@@ -1001,7 +1016,10 @@ impl AgentRuntime {
     /// into a failed one. The loss is named rather than swallowed, because a
     /// missing row is indistinguishable from a task that never ran.
     async fn report_run_census(&self, run_task_id: Option<&str>, elapsed: std::time::Duration) {
-        let Some(task_id) = run_task_id else {
+        // 与账本同一个身份（[`Self::ledger_task_id`]）：清点表按任务累加，读者的
+        // 问题是「这件活一共花了多少」，与它分几轮跑无关。记在运行 id 上会让
+        // 按任务查询一条也读不到，而那读起来和「这件活没花过钱」一模一样。
+        let Some(task_id) = self.ledger_task_id(run_task_id) else {
             return;
         };
         let Some(gateway) = self.observability.as_ref() else {
@@ -2266,6 +2284,61 @@ impl cog_core::AgentRuntime for AgentRuntime {
 
     fn role(&self) -> &str {
         self.config.role.as_str()
+    }
+}
+
+#[cfg(test)]
+mod ledger_identity_tests {
+    use super::*;
+
+    /// 一次运行的身份与它归属的任务是两件事，账要记在后者上。
+    ///
+    /// 2026-10-26 的现场：账本里 13.7 万条带 id 的用量全是 `ralph-pipeline-*`，
+    /// 与任务图 3831 个 id 交集为 0，于是挣值的实际成本恒为 0、计划预算那道闸
+    /// 永远「读不到花销」而放行。这条用例把两个身份的优先级钉在这里：有归属
+    /// 就记归属，没有才退回运行 id，两样都没有就不编。
+    #[test]
+    fn a_run_belongs_to_its_task_and_the_ledger_records_the_task() {
+        let config = RuntimeConfig {
+            owner_task_id: Some("change-ledger-abc".into()),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        let runtime = AgentRuntime::new(config, tx);
+        let options = runtime.stamp_task(cog_core::ChatOptions::default());
+        assert_eq!(
+            options
+                .headers
+                .get(cog_core::LLM_TASK_HEADER)
+                .map(String::as_str),
+            Some("change-ledger-abc"),
+            "账本上的任务身份必须是那件 DAG 任务，不是这一次运行的 id"
+        );
+    }
+
+    /// 不属于任何任务的 agent（常驻角色、临时评测）按运行 id 记。
+    #[test]
+    fn a_run_without_an_owning_task_falls_back_to_its_run_id() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut runtime = AgentRuntime::new(RuntimeConfig::default(), tx);
+        runtime.run_task_id = Some("ralph-pipeline-xyz".into());
+        let options = runtime.stamp_task(cog_core::ChatOptions::default());
+        assert_eq!(
+            options
+                .headers
+                .get(cog_core::LLM_TASK_HEADER)
+                .map(String::as_str),
+            Some("ralph-pipeline-xyz")
+        );
+    }
+
+    /// 两样都没有就不写身份头：编一个 id 会读成一件真花过钱的任务。
+    #[test]
+    fn a_run_with_no_identity_at_all_stamps_nothing() {
+        let (tx, _rx) = mpsc::channel(1);
+        let runtime = AgentRuntime::new(RuntimeConfig::default(), tx);
+        let options = runtime.stamp_task(cog_core::ChatOptions::default());
+        assert!(!options.headers.contains_key(cog_core::LLM_TASK_HEADER));
     }
 }
 

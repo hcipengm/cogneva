@@ -13,6 +13,14 @@ pub const GOAL_CONSUMER_LOOP: &str = "orchestrator_goal_consumer";
 /// Loop name reported through the background-loop liveness family.
 pub const ORPHAN_RECONCILER_LOOP: &str = "orchestrator_orphan_reconciler";
 
+/// 按历史给新任务排期，至少要这么多条跑完的样本。
+///
+/// 低于这个数，「中位数」只是最近几次的噪声，而被它排出来的期会被甘特与挣值
+/// 当成计划：一条三小时的任务按两个十分钟的样本排成二十分钟，会让它在计划上
+/// 「早就该完了」——一个凭空造出来的落后。样本不够就不排，读数上读作「还没
+/// 样本」，那是真话。
+pub const MIN_ESTIMATE_SAMPLES: u64 = 5;
+
 pub mod circuit_registry;
 pub mod orchestrator;
 pub mod retry_matrix;
@@ -319,6 +327,9 @@ impl DagExecutorRuntime {
         // 计划预算这一道准入，与列上限、池窗口并列：它判的是「这条任务自己
         // 还能不能再花」。拦在这里而不是派发之后，是因为拦住的那条要留在
         // `Pending`——已经进了 `Scheduled` 的行，就绪扫描不会再回来看它。
+        // 还没有基线的活先排期，再判预算：预算闸读的就是这张表，排在这一步之后
+        // 它才看得到刚写下的那一行。
+        self.plan_new_work(&ready_tasks).await;
         let budgets = self.planned_budgets().await;
         let mut budget_holds: HashMap<&'static str, u64> = HashMap::new();
         for task in ready_tasks {
@@ -612,6 +623,107 @@ impl DagExecutorRuntime {
     /// 一次读整张表而不是逐条 `task_plan`：这一拍要判的是全部就绪任务的预算，
     /// 逐条问是每条一次往返，而基线的行数比任务少一个量级。读不到（进程内后端
     /// 没有这个面、或者库这一下不可用）返回 `None`：不设界，但也不假装设了界。
+    /// 给还没有计划基线的就绪任务排一次期。
+    ///
+    /// 排期用的数是**量出来的**：同一种类已经跑完的任务里，token 清点的中位数
+    /// 当预算、创建到最近一次更新的中位数当时长。样本不够（少于
+    /// [`MIN_ESTIMATE_SAMPLES`] 条，或者那几条一条花销都没记下来）就不排——
+    /// 编一个工期会让甘特图把没排期的活画成已排期，而「没排期」正是读者唯一
+    /// 能据以去补估算的信号。
+    ///
+    /// 只给**就绪**的任务排：它们的依赖都已经满足，起点就是此刻；给一条还被
+    /// 上游挡着的活排「现在开始」会画出一条本来不存在的并行。
+    ///
+    /// 写失败不挡派发：任务照派，这一件在甘特上继续读作未排期，日志里留一行
+    /// 具名原因。反过来（为了一行基线把活压住）是拿成本换读数。
+    async fn plan_new_work(&self, ready: &[Task]) {
+        let Some(backend) = self.orchestrator.state_backend() else {
+            return;
+        };
+        let planned: std::collections::HashSet<String> =
+            match backend.task_plans(&self.config.workspace_id).await {
+                Ok(rows) => rows.into_iter().map(|plan| plan.task_id).collect(),
+                Err(e) => {
+                    // 读不到已有的基线就别写：不知道谁已经有基线时补写，等于把
+                    // 别人排好的期按估算覆盖掉。
+                    tracing::debug!(
+                        workspace_id = %self.config.workspace_id,
+                        error = %e,
+                        "no plan baselines read this pass; nothing is scheduled from history"
+                    );
+                    return;
+                }
+            };
+        let missing: Vec<&Task> = ready
+            .iter()
+            .filter(|task| !planned.contains(&task.id))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let records = match backend
+            .task_kind_records(&self.config.workspace_id, MIN_ESTIMATE_SAMPLES)
+            .await
+        {
+            Ok(records) => records,
+            Err(e) => {
+                tracing::debug!(
+                    workspace_id = %self.config.workspace_id,
+                    error = %e,
+                    "no measured history for any task kind; these tasks stay unscheduled"
+                );
+                return;
+            }
+        };
+        let by_kind: HashMap<String, cog_core::TaskKindRecord> = records
+            .into_iter()
+            .map(|record| (record.kind.clone(), record))
+            .collect();
+        let now = chrono::Utc::now();
+        for task in missing {
+            let Some(record) = by_kind.get(&task.task_type.kind_key()) else {
+                continue;
+            };
+            // 两条轴都量不出来才不排：一个中位数是缺的那一半，另一条轴还是
+            // 量过的。工时能估、花销估不出时，甘特那一条是真有条子的，而
+            // `budget_tokens = 0` 在读者那里读作「没有成本计划」（见
+            // [`crate::ready_queue::past_its_budget`]），不是「计划花零个 token」。
+            if record.median_tokens == 0 && record.median_duration_secs == 0 {
+                continue;
+            }
+            // 时长中位数为 0 时止期留空：一排零会让甘特把它画成「计划已完成」。
+            let planned_end = if record.median_duration_secs == 0 {
+                None
+            } else {
+                Some(now + chrono::Duration::seconds(record.median_duration_secs as i64))
+            };
+            let plan = cog_core::TaskPlan {
+                workspace_id: self.config.workspace_id.clone(),
+                task_id: task.id.clone(),
+                planned_start: Some(now),
+                planned_end,
+                budget_tokens: record.median_tokens,
+                // 基线版本里同时写着这一版是哪来的：按历史估算，几条样本。
+                // 读者要问「这个预算谁给的」，答案得在行上而不是在日志里。
+                baseline_rev: format!(
+                    "estimate/{}/n{}/{}",
+                    record.kind,
+                    record.samples,
+                    now.to_rfc3339()
+                ),
+                updated_at: now,
+            };
+            if let Err(e) = backend.save_task_plan(&plan).await {
+                tracing::warn!(
+                    task_id = %task.id,
+                    kind = %record.kind,
+                    error = %e,
+                    "task goes out unscheduled: its estimated baseline was not stored"
+                );
+            }
+        }
+    }
+
     async fn planned_budgets(&self) -> Option<HashMap<String, u64>> {
         let backend = self.orchestrator.state_backend()?;
         match backend.task_plans(&self.config.workspace_id).await {
@@ -2775,6 +2887,24 @@ mod consumer_ack_tests {
     /// 一律返回空——写成 `unimplemented!()` 会让「没读」从事实退化成假设。
     struct PlanBook {
         plans: Vec<cog_core::TaskPlan>,
+        /// 按种类量过的历史。空表示「这一类还没有样本」。
+        records: Vec<cog_core::TaskKindRecord>,
+        /// 这一趟写下去的基线。判据看写下去的字节，不看写没写。
+        saved: std::sync::Mutex<Vec<cog_core::TaskPlan>>,
+    }
+
+    impl PlanBook {
+        fn with_plans(plans: Vec<cog_core::TaskPlan>) -> Self {
+            Self {
+                plans,
+                records: Vec::new(),
+                saved: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn saved(&self) -> Vec<cog_core::TaskPlan> {
+            self.saved.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -2855,6 +2985,25 @@ mod consumer_ack_tests {
             _workspace_id: &str,
         ) -> cog_core::SFResult<Vec<cog_core::TaskPlan>> {
             Ok(self.plans.clone())
+        }
+        async fn save_task_plan(&self, plan: &cog_core::TaskPlan) -> cog_core::SFResult<()> {
+            self.saved.lock().unwrap().push(plan.clone());
+            Ok(())
+        }
+        /// 与真正的后端同一套语义：样本不够 `min_samples` 的种类不出现。这样
+        /// 一条样本不足的用例验的才是调用方传下去的那个阈值，不是夹具自己
+        /// 记得去过滤。
+        async fn task_kind_records(
+            &self,
+            _workspace_id: &str,
+            min_samples: u64,
+        ) -> cog_core::SFResult<Vec<cog_core::TaskKindRecord>> {
+            Ok(self
+                .records
+                .iter()
+                .filter(|r| r.samples >= min_samples)
+                .cloned()
+                .collect())
         }
     }
 
@@ -2980,7 +3129,7 @@ mod consumer_ack_tests {
             ..DagExecutorConfig::default()
         };
         let orchestrator = DagExecutor::new("ws-budget-test".into())
-            .with_state_backend(Arc::new(PlanBook { plans }));
+            .with_state_backend(Arc::new(PlanBook::with_plans(plans)));
         let runtime = DagExecutorRuntime::new_with_backend(config, ScriptedBackend::default())
             .with_orchestrator(Arc::new(orchestrator));
         runtime.attach_observability(Arc::new(census));
@@ -3105,6 +3254,179 @@ mod consumer_ack_tests {
 
     /// 从没跑过的一条不去问清点：问一次就是一趟白跑的库往返，而就绪队列每一拍
     /// 都可能很大。这里让清点里放一个巨大的数——若过滤没在问之前生效，它会被拦下。
+    // ─── 按历史排期：甘特条与挣值的那一头 ───
+
+    /// 只有排期这一条腿的运行时。
+    fn estimate_runtime(book: Arc<PlanBook>) -> DagExecutorRuntime {
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-budget-test".into(),
+            consumer_group: "grp-budget-test".into(),
+            max_retries: 1,
+            ..DagExecutorConfig::default()
+        };
+        let orchestrator = DagExecutor::new("ws-budget-test".into()).with_state_backend(book);
+        DagExecutorRuntime::new_with_backend(config, ScriptedBackend::default())
+            .with_orchestrator(Arc::new(orchestrator))
+    }
+
+    fn record(kind: &str, samples: u64, tokens: u64, secs: u64) -> cog_core::TaskKindRecord {
+        cog_core::TaskKindRecord {
+            kind: kind.into(),
+            samples,
+            median_tokens: tokens,
+            median_duration_secs: secs,
+        }
+    }
+
+    /// 一件新活按同类历史的中位数排期：预算取 token 中位数，止期取时长中位数。
+    ///
+    /// 这是甘特条与挣值计划价值的唯一来源——没有这一步，任务图里 0 条基线，
+    /// 甘特把每一行都标成未排期，挣值的三个量一个都算不出来。
+    #[tokio::test]
+    async fn a_new_task_is_scheduled_from_what_its_kind_has_measured() {
+        let book = Arc::new(PlanBook {
+            records: vec![record("dag_node", 7, 1_000, 600)],
+            ..PlanBook::with_plans(Vec::new())
+        });
+        let runtime = estimate_runtime(book.clone());
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-estimate",
+                vec![ready_task("task-new", serde_json::json!({}))],
+            )
+            .await
+            .unwrap();
+        runtime.publish_ready_tasks().await.unwrap();
+
+        let saved = book.saved();
+        assert_eq!(saved.len(), 1, "一件没有基线的新活应当被排一次期");
+        let plan = &saved[0];
+        assert_eq!(plan.task_id, "task-new");
+        assert_eq!(plan.budget_tokens, 1_000, "预算取同类 token 中位数");
+        let start = plan.planned_start.expect("排了期就有起期");
+        let end = plan.planned_end.expect("时长有样本就有止期");
+        assert_eq!(
+            (end - start).num_seconds(),
+            600,
+            "止期 = 起期 + 同类时长中位数"
+        );
+        assert!(
+            plan.baseline_rev.starts_with("estimate/dag_node/n7/"),
+            "基线版本要写明它是按几条样本估出来的，得到 {}",
+            plan.baseline_rev
+        );
+    }
+
+    /// 样本不足的种类不排期——但任务照派。排期是读数的一半，不是派发的前置条件：
+    /// 为了补一行基线把活压住，是拿交付换仪表盘。
+    #[tokio::test]
+    async fn a_kind_without_enough_samples_is_left_unscheduled_and_still_dispatched() {
+        let book = Arc::new(PlanBook {
+            records: vec![record("dag_node", 2, 1_000, 600)],
+            ..PlanBook::with_plans(Vec::new())
+        });
+        let runtime = estimate_runtime(book.clone());
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-estimate",
+                vec![ready_task("task-thin", serde_json::json!({}))],
+            )
+            .await
+            .unwrap();
+        runtime.publish_ready_tasks().await.unwrap();
+
+        assert!(
+            book.saved().is_empty(),
+            "两条样本的中位数是噪声，不许写成计划"
+        );
+        let task = runtime
+            .orchestrator()
+            .get_task("task-thin")
+            .await
+            .expect("task present");
+        assert_eq!(
+            task.status,
+            cog_core::TaskStatus::Scheduled,
+            "没排上期不妨碍它被派出去"
+        );
+    }
+
+    /// 已经有基线的任务不重排。那份期可能是分解算出来的、也可能是人排的，
+    /// 拿同类统计量覆盖它，等于用中位数改掉一份意图。
+    #[tokio::test]
+    async fn an_already_planned_task_is_not_rescheduled() {
+        let book = Arc::new(PlanBook {
+            records: vec![record("dag_node", 7, 1_000, 600)],
+            ..PlanBook::with_plans(vec![plan("task-planned", 250)])
+        });
+        let runtime = estimate_runtime(book.clone());
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-estimate",
+                vec![ready_task("task-planned", serde_json::json!({}))],
+            )
+            .await
+            .unwrap();
+        runtime.publish_ready_tasks().await.unwrap();
+
+        assert!(
+            book.saved().is_empty(),
+            "已排期的任务被估算覆盖了：{:#?}",
+            book.saved()
+        );
+    }
+
+    /// 两条轴各自缺各自的：花销量不出来不等于工时也量不出来。
+    ///
+    /// 花销中位数为 0 时写 `budget_tokens = 0`，读者那边读作「没有成本计划」——
+    /// 预算闸只认大于零的行，所以这行不拦任何东西；但止期是真量过的，甘特有
+    /// 那一条。反过来工时中位数为 0 时止期留空、预算照写。两条都量不出来才
+    /// 什么都不写：那才是「这一类还没有样本」。
+    #[tokio::test]
+    async fn the_two_axes_of_a_baseline_are_measured_and_missing_independently() {
+        let book = Arc::new(PlanBook {
+            records: vec![
+                record("dag_node", 7, 0, 600),
+                record("reviewer", 7, 1_000, 0),
+                record("neither", 7, 0, 0),
+            ],
+            ..PlanBook::with_plans(Vec::new())
+        });
+        let runtime = estimate_runtime(book.clone());
+        let mut nocost = ready_task("task-nocost", serde_json::json!({}));
+        nocost.task_type = cog_core::TaskType::DagNode;
+        let mut nodur = ready_task("task-nodur", serde_json::json!({}));
+        nodur.task_type = cog_core::TaskType::Reviewer;
+        let mut neither = ready_task("task-neither", serde_json::json!({}));
+        neither.task_type = cog_core::TaskType::Custom("neither".into());
+        runtime
+            .orchestrator()
+            .submit_goal("goal-estimate", vec![nocost, nodur, neither])
+            .await
+            .unwrap();
+        runtime.publish_ready_tasks().await.unwrap();
+
+        let saved = book.saved();
+        let by_id = |id: &str| saved.iter().find(|plan| plan.task_id == id).cloned();
+        let nocost = by_id("task-nocost").expect("工时量得出来就该排期");
+        assert_eq!(nocost.budget_tokens, 0, "花销没量出来就写 0，不编一个数");
+        assert!(nocost.planned_end.is_some(), "工时量过，止期要写");
+        let nodur = by_id("task-nodur").expect("花销量得出来就该排期");
+        assert_eq!(nodur.budget_tokens, 1_000);
+        assert!(
+            nodur.planned_end.is_none(),
+            "工时没量出来就止期留空，一排零会读成「计划已完成」"
+        );
+        assert!(
+            by_id("task-neither").is_none(),
+            "两条轴都没有样本，写出来只是一行什么都量不出来的基线"
+        );
+    }
+
     #[tokio::test]
     async fn a_task_that_never_ran_is_not_judged_by_a_census_it_cannot_have() {
         let runtime = budget_runtime(

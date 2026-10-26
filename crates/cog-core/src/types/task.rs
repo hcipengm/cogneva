@@ -74,6 +74,24 @@ pub struct TaskPlan {
     pub updated_at: DateTime<Utc>,
 }
 
+/// 一种任务跑完过的样本：中位花销与中位时长。
+///
+/// 它是**测量**而不是估计器的参数表：读的数来自任务图里已完成的行（创建到最近
+/// 一次更新的时长）与 token 清点表（那件任务自己的累计花销）。派发侧拿它给同
+/// 种类的新任务排一次期，前提是样本够——样本不够就没有这一行，没有这一行就不
+/// 排期，而不是拿一个凭空的零充数。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskKindRecord {
+    /// 与 [`TaskType::kind_key`] 同一个拼写，也就是任务 JSON 里那个字符串。
+    pub kind: String,
+    /// 参与计算的已完成任务条数。
+    pub samples: u64,
+    /// 中位花销（token）。0 表示这一类跑完的任务一条带花销的清点都没有。
+    pub median_tokens: u64,
+    /// 中位时长（秒）：从创建到最近一次更新。
+    pub median_duration_secs: u64,
+}
+
 /// DagExecutor 任务类型
 /// 标记任务是否经过 ActionPlanner 验证/分解。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -248,6 +266,24 @@ impl TaskType {
     /// namespace reads back empty with every row still sitting in it.
     pub fn retrieval_class(&self) -> String {
         format!("{self:?}")
+    }
+
+    /// 这一种类在任务 JSON 里的拼写，按样本分组用的那一把尺子。
+    ///
+    /// 读样本的那条 SQL 从 `task->'task_type'` 里取同一个字符串（自定义类型取
+    /// `custom`，其余取变体名本身）。两处必须是同一把尺子：拼写一旦分叉，按种类
+    /// 查出来的样本读成空，于是每一件新任务都排不上期，而读数上只表现成「没有
+    /// 样本」，看不出是拼写对不上。
+    pub fn kind_key(&self) -> String {
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::String(s)) => s,
+            Ok(serde_json::Value::Object(m)) => m
+                .get("custom")
+                .and_then(|v| v.as_str())
+                .unwrap_or("other")
+                .to_string(),
+            _ => "other".to_string(),
+        }
     }
 }
 

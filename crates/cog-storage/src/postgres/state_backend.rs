@@ -905,6 +905,79 @@ impl StateBackend for PostgresStateBackend {
             .collect()
     }
 
+    async fn task_kind_records(
+        &self,
+        workspace_id: &str,
+        min_samples: u64,
+    ) -> SFResult<Vec<cog_core::TaskKindRecord>> {
+        // 三件事一起定：哪些行算样本、按什么分组、中位怎么取。
+        //
+        // 样本只有「跑完的」：跑了一半的任务时长没有意义，失败被重排的那几次会
+        // 把同一条活算成好几个样本。种类拼写与 [`cog_core::TaskType::kind_key`]
+        // 是同一把尺子（自定义取 `custom`，其余取变体名），分叉的那天这里读成
+        // 空，表现是「没有样本」而不是报错——所以两处必须一起改。
+        //
+        // 花销取清点表里那件任务自己的累计数，中位而不是均值：一件跑了三小时的
+        // 活能把均值拉走一个量级，而排期要的是一个典型的量。
+        //
+        // 窗口是最近 30 天：平台上的任务大小随用途变化，五个月前的中位数拿来给
+        // 今天排期，是拿旧世界的地图走新路。窗口内样本不够就不给这一行——没有
+        // 估算比一个有旧估算的更好，前者读作「还没样本」，后者读作「量过了」。
+        //
+        // 两条轴的门槛只压在样本数上，不压在花销上：清点表里没有这一类的行时，
+        // 中位花销是 0，而时长仍然是从任务行自己量出来的——那足以排一条甘特条。
+        // 把「有没有花销样本」也塞进 HAVING，会让整行连同工时一起消失，于是
+        // 清点表按运行 id 记的那些天里，一件活也排不上期。缺哪一条轴由调用方
+        // 按 0 处理（花销 0 读作「没有成本计划」）。
+        let rows: Vec<(String, i64, i64, f64)> = self
+            .retry(|| async {
+                sqlx::query_as(
+                    r#"
+                    WITH done AS (
+                        SELECT COALESCE(
+                                   CASE WHEN jsonb_typeof(task->'task_type') = 'object'
+                                        THEN task->'task_type'->>'custom'
+                                        ELSE task->'task_type'#>>'{}' END,
+                                   'other') AS kind,
+                               task_id,
+                               EXTRACT(EPOCH FROM ((task->>'updated_at')::timestamptz
+                                                 - (task->>'created_at')::timestamptz)) AS dur
+                          FROM cog_dag_tasks
+                         WHERE workspace_id = $1
+                           AND status = 'completed'
+                           AND updated_at > NOW() - INTERVAL '30 days'
+                    )
+                    SELECT d.kind,
+                           COUNT(DISTINCT d.task_id)::BIGINT AS samples,
+                           COALESCE(percentile_cont(0.5) WITHIN GROUP (
+                                        ORDER BY m.total_tokens)::BIGINT, 0) AS med_tokens,
+                           COALESCE(percentile_cont(0.5) WITHIN GROUP (
+                                        ORDER BY d.dur), 0) AS med_secs
+                      FROM done d
+                      LEFT JOIN cog_observability_metrics m ON m.task_id = d.task_id
+                     GROUP BY d.kind
+                    HAVING COUNT(DISTINCT d.task_id) >= $2
+                    "#,
+                )
+                .bind(workspace_id)
+                .bind(min_samples as i64)
+                .fetch_all(&self.pool)
+                .await
+            })
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(kind, samples, med_tokens, med_secs)| cog_core::TaskKindRecord {
+                    kind,
+                    samples: samples.max(0) as u64,
+                    median_tokens: med_tokens.max(0) as u64,
+                    median_duration_secs: med_secs.max(0.0).round() as u64,
+                },
+            )
+            .collect())
+    }
+
     /// Count the stored tasks by state across every workspace.
     ///
     /// Grouped in SQL rather than listed and counted here: the overview asks

@@ -617,7 +617,12 @@ impl cog_core::AgentManager for GlobalAgentManager {
             return Ok(existing);
         }
 
-        let config = self.runtime_config_for(agent_id, role).await;
+        let mut config = self.runtime_config_for(agent_id, role).await;
+        // 这个 agent 是在替哪件 DAG 任务干活，交给运行时记下来：账本与清点按它
+        // 归属，运行自己的 id 只用于这一次执行的归档与沙箱命名。调用方传进来的
+        // 就是这个任务的 id（`create_role_agent` 与 roundtable 的角色都是这么建
+        // 的），所以这里不做推断。
+        config.owner_task_id = task_id.map(str::to_string);
 
         let capabilities = vec![role.to_string()];
         let registration = task_agent_registration(agent_id, role);
