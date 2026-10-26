@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { planRefresh } from '@/store/frameTick';
+import { planRefresh, ticksFor } from '@/store/frameTick';
 import { useFrameTickStore } from '@/store/frameTickStore';
 
 /**
@@ -60,12 +60,33 @@ export function useFrameDrivenRefresh(
 /**
  * 总线说「平台上变了」就重读这一面。
  *
- * 这是全局那条信号：任何一面都可能有东西变了，各自重读自己的那几份。
+ * 这是全局那条信号：任何一面都可能有东西变了，各自重读自己的那几份。精确到种类
+ * 的那一版是 `useKindTickedRefresh`——面越多，把「与我无关的帧」挡在外面越要紧。
  */
 export function useStreamDrivenRefresh(
   refresh: (() => void) | Array<() => void>
 ): void {
   const tick = useFrameTickStore((s) => s.tick);
+  useFrameDrivenRefresh(tick, refresh);
+}
+
+/**
+ * 只在**自己认得的那几种帧**到了的时候才重读。
+ *
+ * 键就是这一面订的那件事：总线原生帧用变体名（`task_status_change`），REST 侧
+ * 一次成功的写用 `resource:<前缀>`（`resourceKey('settings')`）。不订的帧对它等于
+ * 没发生——这正是「屏幕在动」与「屏幕在被别人的轮询拖着动」的区别。
+ *
+ * 订阅本身写在调用点，不写在 store 里：哪个面盯着哪几个前缀，是那一面自己的事，
+ * 收在一张全局表里改一处会悄悄改掉另外十面。
+ */
+export function useKindTickedRefresh(
+  keys: readonly string[],
+  refresh: (() => void) | Array<() => void>
+): void {
+  // 键是调用点写死的字符串字面量，但写成内联数组时每次渲染都是新引用；拼成字符串
+  // 当信号，值没变就不会重排定时器。
+  const tick = useFrameTickStore((s) => ticksFor(s.byKind, keys));
   useFrameDrivenRefresh(tick, refresh);
 }
 

@@ -49,7 +49,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 python3 - "$ROOT" <<'PYEOF'
-import os, re, sys
+import glob, os, re, sys
 
 ROOT = sys.argv[1]
 WEB = os.path.join(ROOT, "web/src")
@@ -80,11 +80,36 @@ if re.search(r"return\s*\(\)\s*=>\s*window\.clearTimeout\(pending\.current\)", h
     )
 
 hook = read("hooks/useEventStream.ts")
-bump = re.search(r"if \(changedPolledFace\) noteFaceTick\(\);", hook)
+# 上报的是**面**，不是一个布尔。一个布尔只能告诉所有人「有东西变了」，于是配额、
+# 花销、设置这些与任务无关的面也被 task_status_change 拖着每两秒重读一次——那不是
+# 事件驱动，是换了个说法的轮询。
+if re.search(r"changedPolledFace", hook):
+    sys.exit(
+        "hooks/useEventStream.ts 又出现了 `changedPolledFace`：所有面共用一个布尔，"
+        "叫醒一个面要连带另外十几面重读，帧的种类就白分了"
+    )
+if not re.search(r"const touched: string\[\] = \[\];", hook):
+    sys.exit("hooks/useEventStream.ts 没有 `touched` 这张面名表：这一帧改动了哪几面无从记起")
+for kind, why in (
+    ("agents", "执行者换态、起来、走了"),
+    ("alerts", "告警越线"),
+    ("comms", "交接推进"),
+    ("projects", "项目面那四条边"),
+    ("tasks", "任务换状态"),
+):
+    if f"touched.push('{kind}')" not in hook:
+        sys.exit(f"hooks/useEventStream.ts 没有记下 `{kind}`：{why}之后，订了它的那一面不会重读")
+# REST 侧那族帧：设置、文件、存储这些面在编排器帧里根本没有对应的事。
+if "event.type === 'resource_changed'" not in hook or "touched.push(resourceKey(domain))" not in hook:
+    sys.exit(
+        "hooks/useEventStream.ts 没有折 `resource_changed`：设置、文件、存储、变更账"
+        "这些面只由一次写改动，而写的那一帧没人接，它们就只能等轮询"
+    )
+bump = re.search(r"for \(const kind of touched\) noteFaceTick\(kind\);", hook)
 if not bump:
     sys.exit(
-        "hooks/useEventStream.ts 没有 `if (changedPolledFace) noteFaceTick();`："
-        "总线上变了而没有任何一面被告知，读快照的那几面要等下一拍轮询"
+        "hooks/useEventStream.ts 没有 `for (const kind of touched) noteFaceTick(kind);`："
+        "记下了哪几面变了却不告诉它们，等于没记"
     )
 quiet = re.search(
     r"if\s*\(event\.type === 'message_update' \|\| event\.type === 'heartbeat'\)", hook
@@ -96,54 +121,54 @@ if not quiet:
     )
 if bump.start() < quiet.start():
     sys.exit(
-        "hooks/useEventStream.ts 的 `noteFaceTick()` 在提前返回之前："
-        "心跳与正文增量每个 token 一帧，它们会把重读打成一种更密的轮询"
-    )
-# 置位点必须与「平台状态变了」那几处同源，不能被画布上正在流的那条消息带起来：
-# 这五处之外的置位，都会让观测面跟着逐帧重读。
-setters = len(re.findall(r"changedPolledFace = true;", hook))
-if setters != 5:
-    sys.exit(
-        f"hooks/useEventStream.ts 里 `changedPolledFace = true;` 有 {setters} 处，判据要 5 处"
-        "（执行者换态、告警越线、交接推进、项目面任务状态、任务状态帧）："
-        "少一处那一面不会重读，多一处则有别的帧带起了重读"
+        "hooks/useEventStream.ts 的上报在提前返回之前：心跳与正文增量每个 token 一帧，"
+        "它们会把重读打成一种更密的轮询"
     )
 
 view = read("views/ObservabilityView.tsx")
 for pattern, why in (
-    (r"useStreamDrivenRefresh\(overview\.refresh\)", "观测面的概况没接到帧上：只靠 20 秒一拍，调成十分钟后这一面就不动了"),
     (
-        r"useStreamDrivenRefresh\(\[supervisor\.refresh, components\.refresh\]\)",
-        "监管者与工作负载两次读没一起接上：分两次读，画面会先变一半再变另一半",
+        r"useKindTickedRefresh\(\s*\[\s*'tasks', 'agents', 'alerts', resourceKey\('cluster'\)\s*\]",
+        "观测面的概况没订任务/执行者/告警/集群那几族帧：只靠 20 秒一拍，调成十分钟后这一面就不动了",
+    ),
+    (
+        r"useKindTickedRefresh\(\s*\[\s*'tasks', 'agents', 'alerts', 'usage', resourceKey\('cluster'\),\s*resourceKey\('supervisor'\)\s*\]",
+        "监管者与工作负载那一屏没订帧，或没把两次读一起接上：分两次读，画面会先变一半再变另一半",
     ),
 ):
-    if not re.search(pattern, view):
+    if not re.search(pattern, view, re.S):
         sys.exit(f"views/ObservabilityView.tsx 缺 {pattern}：{why}")
 
 # 任务面：行由帧改写，计数与图来自快照。三份都交出去，缺一份就是同一屏上两份事实。
 tasks = read("views/TasksView.tsx")
 if not re.search(
-    r"useStreamDrivenRefresh\(\[summary\.refresh, list\.refresh, graph\.refresh\]\)", tasks
+    r"useKindTickedRefresh\(\s*\[\s*'tasks', resourceKey\('tasks'\), resourceKey\('projects'\)\s*\],\s*\[summary\.refresh, list\.refresh, graph\.refresh\]\s*\)",
+    tasks,
+    re.S,
 ):
     sys.exit(
-        "views/TasksView.tsx 没把汇总、列表、图一起交出去：行会跟着帧改，表头的"
+        "views/TasksView.tsx 没把汇总、列表、图一起交给同一族帧：行会跟着帧改，表头的"
         "「运行 N」和图上那条还连着，最久要等下一拍 15 秒才对上——同一屏两份事实"
     )
 
 # 通信面：比快照新的边单独列着，等重读把它们并进图。重读没人触发，这块就是常驻。
 comms = read("views/CommsView.tsx")
-if not re.search(r"useStreamDrivenRefresh\(\[graph\.refresh, tasks\.refresh\]\)", comms):
+if not re.search(
+    r"useKindTickedRefresh\(\s*\[\s*'comms', 'tasks', resourceKey\('collaboration'\), resourceKey\('tasks'\)\s*\]",
+    comms,
+    re.S,
+):
     sys.exit(
         "views/CommsView.tsx 没把交接图与任务归属交给帧：那一块「图上还没有的边」"
         "只有在下一次轮询才收得掉，轮询一调长，已经在图里的交接会一直挂在那里"
     )
 
-# 项目面按自己的信号重读，但用的必须是同一套调度。
+# 项目面按自己的信号重读，但用的必须是同一套调度，且要算上 REST 侧的写。
 projects = read("views/ProjectsView.tsx")
-if not re.search(r"useFrameDrivenRefresh\(revision, refresh\)", projects):
+if not re.search(r"useFrameDrivenRefresh\(revision \+ written, refresh\)", projects):
     sys.exit(
-        "views/ProjectsView.tsx 没有用共用的调度重读：这一面自己另排一套间隔，"
-        "两套策略里长的那一个就是错的"
+        "views/ProjectsView.tsx 没有把「任务帧」与「REST 侧的写」合成一个信号交给共用调度："
+        "只数任务帧，别处对这一面的改要等下一拍才看得见"
     )
 for path in ("views/ProjectsView.tsx", "hooks/useStreamDrivenRefresh.ts"):
     src = read(path)
@@ -155,7 +180,47 @@ for path in ("views/ProjectsView.tsx", "hooks/useStreamDrivenRefresh.ts"):
             "往后推，连续的信号会让它永远到不了点——忙的时候这一面比轮询还旧"
         )
 
-print("ok   - 调度是纯的、总线报了到、观测面/任务面/通信面/项目面都按同一套调度重读")
+# 每一个读 REST 的面都要订帧。这一条是这张门禁的全部意义：不是六个面做到了，
+# 是**所有**面都做到。按「有值导入 api/client」认面——只导类型的那几个面不直接读
+# 服务端，它们读的是 shell 里那几份共用读数，接线在那几个 hook 里。
+SUBSCRIBE = re.compile(r"useKindTickedRefresh\(|useStreamDrivenRefresh\(|useFrameDrivenRefresh\(")
+faces = sorted(glob.glob(os.path.join(WEB, "views", "*.tsx")))
+if not faces:
+    sys.exit("找不到 web/src/views/*.tsx：这一条判据数不出面来")
+unwired = []
+for face in faces:
+    src = open(face, encoding="utf-8").read()
+    m = re.search(r"import\s+(type\s+)?\{[^}]*\}\s*from\s*'@/api/client'", src, re.S)
+    if not m or m.group(1):
+        continue
+    if not SUBSCRIBE.search(src):
+        unwired.append(os.path.basename(face))
+if unwired:
+    sys.exit(
+        "这几面读了服务端的快照却没订任何帧：" + "、".join(unwired)
+        + "。它们什么时候动取决于自己那个定时器——把间隔调成十分钟，帧到了也不动"
+    )
+
+# 服务端那一半：REST 侧一次成功的写要在总线上落一帧，否则前端订什么都等不到。
+CORE = os.path.join(ROOT, "crates/cog-core/src/types/event.rs")
+GW = os.path.join(ROOT, "crates/cog-gateway/src/resource_frames.rs")
+LIB = os.path.join(ROOT, "crates/cog-gateway/src/lib.rs")
+for path in (CORE, GW, LIB):
+    if not os.path.isfile(path):
+        sys.exit(f"读不到 {os.path.relpath(path, ROOT)}：REST 侧那族帧的出处不见了")
+core = open(CORE, encoding="utf-8").read()
+if not re.search(r"^\s*ResourceChanged \{", core, re.M):
+    sys.exit("crates/cog-core 的 AgentEvent 里没有 `ResourceChanged`：一次写改了什么，总线上没有这个词")
+gateway = open(GW, encoding="utf-8").read()
+if "pub fn resource_domain" not in gateway:
+    sys.exit("cog-gateway 没有 `resource_domain`：路径到前缀的映射不是一段能单独验的纯函数")
+if "response.status().is_success()" not in gateway:
+    sys.exit("cog-gateway 的上报不看响应码：一次被拒的写也会叫醒所有面重读同一份字节")
+router = open(LIB, encoding="utf-8").read()
+if "publish_resource_frame" not in router:
+    sys.exit("cog-gateway 的路由没挂 `publish_resource_frame`：请求照收，写的那一帧不发")
+
+print("ok   - 调度是纯的、总线按面报到、每一个读服务端的面都订了帧、服务端也真的在发这帧")
 PYEOF
 
 TSC="$ROOT/web/node_modules/.bin/tsc"

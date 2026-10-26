@@ -65,6 +65,7 @@ pub mod prometheus_render;
 pub mod promotion_gate;
 pub mod raw_logs;
 pub mod readings;
+pub mod resource_frames;
 pub mod scm;
 pub mod search_admin;
 pub mod search_fallback;
@@ -1269,6 +1270,13 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
     );
 
     transport_observability(public.merge(protected), state.clone())
+        // 一次成功的写在总线上落一帧，说它落在哪个前缀下。挂在这里而不是逐个
+        // handler 里：漏掉一个 handler 就是那一面永远不会被帧驱动，而漏掉的
+        // 那个只有靠人读代码才看得出来。
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::resource_frames::publish_resource_frame,
+        ))
         .layer(from_fn(security_headers_middleware))
         .layer(cors_layer)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))

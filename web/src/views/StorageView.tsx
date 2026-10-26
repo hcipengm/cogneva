@@ -11,6 +11,8 @@ import {
   type RawMetadata,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 const PAGE = 50;
@@ -95,6 +97,12 @@ export function StorageView() {
   const logs = useResource('日志索引', () => listRawLogs({ limit: PAGE }), 60_000);
   const schema = useResource('结构化记忆', listMemorySchema, 120_000);
   const summary = useResource('摘要记忆', listMemorySummary, 120_000);
+  // 存进去、清出去都落在 memory 前缀下；原始日志进的是 raw_logs 那一族。五份一起
+  // 重读——上半页的条目与下半页的计数是同一批东西的两个视角，分两次读会自相矛盾。
+  useKindTickedRefresh(
+    [resourceKey('memory'), resourceKey('raw_logs')],
+    [raw.refresh, stats.refresh, logs.refresh, schema.refresh, summary.refresh]
+  );
 
   const listing = raw.data;
   const items = listing?.items ?? [];

@@ -1,6 +1,8 @@
 import { useMemo } from 'react';
 import { getProcessOverview, type GoalGroup, type ProcessTask } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { frameIsNewer, liveIndex, useStreamStore } from '@/store/streamStore';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
@@ -15,6 +17,13 @@ import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame 
  */
 export function FlowView() {
   const processes = useResource('流程总览', getProcessOverview, 10_000);
+  // 这一段一段的计数是从任务行折出来的：任务换态、执行者换态、有人认领，都会让
+  // 某一段的格数变。三件事都在总线上，所以不必等 10 秒那一拍。
+  useKindTickedRefresh(
+    ['tasks', 'agents', 'comms', resourceKey('processes')],
+    processes.refresh
+  );
+
   const overview = processes.data;
 
   const tasks = overview?.goals.flatMap((goal) => goal.tasks) ?? [];

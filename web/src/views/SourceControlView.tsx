@@ -10,6 +10,8 @@ import {
   type ScmStatus,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { useShell } from '@/shell/store';
 import { Button, Empty, Loading, Moment, ReadError, ViewFrame } from '@/ui/primitives';
 
@@ -29,6 +31,12 @@ export function SourceControlView() {
 
   const statusRes = useResource('工作区仓库', getScmStatus, 20_000);
   const logRes = useResource('提交历史', () => getScmLog(20), 60_000);
+  // 暂存、提交、初始化都是 ide 前缀下的写。别处（比如文件面保存）也会落在同一个
+  // 前缀下——同一个工作区的改动就都在这一族帧里，两个面一起重读。
+  useKindTickedRefresh(
+    [resourceKey('ide')],
+    [statusRes.refresh, logRes.refresh]
+  );
 
   const [status, setStatus] = useState<ScmStatus | null>(null);
   const [message, setMessage] = useState('');

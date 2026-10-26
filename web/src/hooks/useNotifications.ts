@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import {
   listNotifications,
   markAllNotificationsRead,
@@ -53,6 +55,11 @@ export function useNotifications(enabled: boolean, pollMs = 60_000) {
     const timer = window.setInterval(refresh, pollMs);
     return () => window.clearInterval(timer);
   }, [enabled, refresh, pollMs]);
+
+  // 别处把一条通知标成已读、或写进来一条，都落在 notifications 前缀下。推送那条
+  // 路只补「新来的这一条」，读没读只有重读列表才追得上——而「谁读了」是别的人、
+  // 别的标签页写下的，推送里没有。
+  useKindTickedRefresh([resourceKey('notifications')], refresh);
 
   /** 把一条推送并进列表；已经出现过（推送与轮询撞车）就原样返回。 */
   const receive = useCallback((notification: NotificationItem) => {

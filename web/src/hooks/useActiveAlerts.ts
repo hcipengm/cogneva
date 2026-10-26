@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { acknowledgeAlert, getActiveAlerts, type ActiveAlerts } from '@/api/client';
 
 /** 一次确认的结局。界面要把它写进输出格，而不是只留一个可能看不见的横幅。 */
@@ -92,6 +94,10 @@ export function useActiveAlerts(enabled: boolean, pollMs = 30_000) {
     const timer = window.setInterval(refresh, pollMs);
     return () => window.clearInterval(timer);
   }, [enabled, refresh, pollMs]);
+
+  // 越线是总线上的一帧（`resource_alert`），确认是 alerts 前缀下的一次写。两种都
+  // 让这张表该重读——只靠 30 秒那一拍，越线之后面板要等半分钟才红。
+  useKindTickedRefresh(['alerts', resourceKey('alerts')], refresh);
 
   return {
     alerts,

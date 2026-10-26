@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { getTokenUsage, getTokenUsageSeries, type ActorUsage } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { SpendBars } from '@/observability/SpendBars';
 import { TokenShare } from '@/observability/TokenShare';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
@@ -21,6 +23,12 @@ export function TokenView() {
   const [hours, setHours] = useState(24);
   const series = useResource(`令牌花销（${hours} 小时）`, () => getTokenUsageSeries(hours), 60_000);
   const usage = useResource(`模型用量（${hours} 小时）`, () => getTokenUsage(hours), 60_000);
+  // 这本账的写者是一轮话、一次运行：`turn_end` 与 `agent_end` 就是那一笔落账的时刻。
+  // 整点折叠改的是同一本账的另一个粒度，落在 observability 前缀下。
+  useKindTickedRefresh(
+    ['usage', resourceKey('observability')],
+    [series.refresh, usage.refresh]
+  );
 
   const rows = series.data?.rows ?? [];
   const actors = usage.data?.actors ?? [];

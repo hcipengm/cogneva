@@ -7,6 +7,9 @@ use cog_core::AgentEvent;
 
 pub const HOOKS_CHANNEL: &str = "hooks";
 
+/// 前缀通道：一次成功的写落在哪个 REST 前缀下，就发到 `resource:<前缀>`。
+pub const RESOURCE_CHANNEL_PREFIX: &str = "resource:";
+
 /// Client → Server WebSocket messages (type-based protocol).
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -435,6 +438,11 @@ pub fn event_channels(event: &cog_core::AgentEvent) -> Vec<String> {
         | AgentEvent::Heartbeat { agent_id, .. }
         | AgentEvent::CheckpointSaved { agent_id, .. } => {
             vec![format!("agent:{}", agent_id)]
+        }
+        // 一次写落在哪个前缀下。挂在它自己的通道上：只订了 `task:*` 的连接不该
+        // 被设置页的保存吵醒，而订了 `resource:*` 的那一面正是为它订的。
+        AgentEvent::ResourceChanged { domain, .. } => {
+            vec![format!("{}{}", RESOURCE_CHANNEL_PREFIX, domain)]
         }
     }
 }

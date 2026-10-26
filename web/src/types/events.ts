@@ -26,7 +26,8 @@ export type EventType =
   | 'agent_error'
   | 'resource_alert'
   | 'heartbeat'
-  | 'checkpoint_saved';
+  | 'checkpoint_saved'
+  | 'resource_changed';
 
 const KNOWN_TYPES: ReadonlySet<string> = new Set<EventType>([
   'agent_start',
@@ -48,6 +49,7 @@ const KNOWN_TYPES: ReadonlySet<string> = new Set<EventType>([
   'resource_alert',
   'heartbeat',
   'checkpoint_saved',
+  'resource_changed',
 ]);
 
 export function isEventType(type: unknown): type is EventType {

@@ -358,6 +358,8 @@ impl TraceCollector {
                                         AgentEvent::AgentError { agent_id, .. } => agent_id.clone(),
                                         AgentEvent::ResourceAlert { agent_id, .. } => agent_id.clone(),
                                         AgentEvent::Heartbeat { agent_id, .. } => agent_id.clone(),
+                                        // 一次写不属于任何一次运行：trace 这一面没有它可归的地方。
+                                        AgentEvent::ResourceChanged { .. } => continue,
                                     };
                                     if let Some(entry) = buffers.get_mut(&agent_id) {
                                         let size = event_size(&event);

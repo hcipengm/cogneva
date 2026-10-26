@@ -21,6 +21,56 @@
  */
 
 /**
+ * 服务端「这个面上的东西被改了」那类帧的键前缀。
+ *
+ * 总线上有两族帧。一族是编排器原生的（`task_status_change`、`agent_end`……），键就
+ * 是帧自己那个变体名。另一族是 REST 侧一次成功的写：改的是哪个前缀下的东西，
+ * 就让哪个前缀下的读数重读。两族共用一个计数表，只靠键区分——多一层类型并不会让
+ * 读者多知道一件事。
+ */
+export const RESOURCE_KEY_PREFIX = 'resource:';
+
+/**
+ * 编排器原生帧折进读数面的那几个种类。
+ *
+ * 名字是**面**不是变体：一帧 `agent_end` 与一帧 `state_change` 都只说明「执行者这一
+ * 面变了」，谁把它们载过来的不是订阅方要知道的事。反过来，用变体名当键会让订阅方
+ * 去猜「交接图那条边是哪一种帧载来的」——猜漏一次，那一面就少一次重读。
+ */
+export type FrameKind =
+  | 'agents'
+  | 'alerts'
+  | 'comms'
+  | 'tasks'
+  | 'projects'
+  /**
+   * 花销动了：一轮话结束、一次运行结束。额度、花销、令牌曲线这几面订它——
+   * 它们与任务状态无关，被 `task_status_change` 拖着重读只是换了个说法的轮询。
+   */
+  | 'usage';
+
+/** 「`domain` 这个面上有东西被改了」在计数表里的键。 */
+export function resourceKey(domain: string): string {
+  return RESOURCE_KEY_PREFIX + domain;
+}
+
+/**
+ * 这一面盯的那几个键，从上次看到现在一共涨了多少。
+ *
+ * 只把**它自己认得的那几种**加起来：`task_status_change` 一刻不停，若它算「有东西
+ * 变了」，配额、花销、设置这些与任务无关的面也会被它拖着每两秒重读一次——那不是
+ * 事件驱动，是换了个说法的轮询。
+ */
+export function ticksFor(
+  byKind: Readonly<Record<string, number>>,
+  keys: readonly string[]
+): number {
+  let total = 0;
+  for (const key of keys) total += byKind[key] ?? 0;
+  return total;
+}
+
+/**
  * 两次重读之间至少隔这么久。
  *
  * 取两秒而不是零：读者看不出 100 毫秒与两秒的差别，接口却看得出——而且一屏上

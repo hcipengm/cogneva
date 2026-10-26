@@ -5,7 +5,8 @@ import {
   type TopologyCluster,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
-import { useStreamDrivenRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { formatBytes, formatCpu } from '@/topology/ClusterTopology';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
@@ -22,7 +23,10 @@ export function ResourcesView() {
   // 这一面的两半都跟着执行者与任务走：一次派发起一批 Pod，一个 agent 收工放掉它
   // 占的额度。总线把这两件事都说出来了（`agent_start` / `agent_end` / 告警越线），
   // 这里只在「说有变化」时重读一次，数仍由服务端从集群现算——帧里没有配额。
-  useStreamDrivenRefresh([topology.refresh, quota.refresh]);
+  useKindTickedRefresh(
+    ['alerts', 'agents', resourceKey('cluster'), resourceKey('quota')],
+    [topology.refresh, quota.refresh]
+  );
 
   const cluster = topology.data?.clusters[0] ?? null;
   const claims = collectClaims(cluster);

@@ -1,5 +1,7 @@
 import { getGovernanceDrift, getGovernanceFaces, getGovernancePrinciples } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -12,6 +14,12 @@ export function GovernanceView() {
   const faces = useResource('面的清单', getGovernanceFaces, 60_000);
   const drift = useResource('面的漂移', getGovernanceDrift, 60_000);
   const principles = useResource('原则语料', getGovernancePrinciples, 120_000);
+  // 「谁在守」这件事由别处的写改动：认领、交还、名册订正都落在 governance 前缀下。
+  // 派活与收尾改动的是任务面，而这一面的漂移读的正是任务账。三份一起重读。
+  useKindTickedRefresh(
+    ['tasks', resourceKey('governance')],
+    [faces.refresh, drift.refresh, principles.refresh]
+  );
 
   const census = faces.data?.census;
   const driftByFace = new Map((drift.data?.readings ?? []).map((r) => [r.face_id, r]));

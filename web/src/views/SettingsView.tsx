@@ -1,5 +1,7 @@
 import { getQuotaUsage, listEvalDatasets } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { useServices } from '@/shell/context';
 import { useShell } from '@/shell/store';
 import { useTheme } from '@/shell/theme';
@@ -19,6 +21,12 @@ export function SettingsView() {
   const { openLlmSetup } = overlays;
   const datasets = useResource('评估集', listEvalDatasets, 120_000);
   const quota = useResource('额度', getQuotaUsage, 60_000);
+  // 额度跟着花销走：一轮话、一次运行结束就是又花了一笔。评估集只在有人增删时才变
+  // ——那是 eval 前缀下的一次写。两件事都不是任务状态，不该被任务帧拖着重读。
+  useKindTickedRefresh(
+    ['usage', resourceKey('quota'), resourceKey('eval'), resourceKey('admin')],
+    [datasets.refresh, quota.refresh]
+  );
   const sidebarVisible = useShell((s) => s.sidebarVisible);
   const toggleSidebar = useShell((s) => s.toggleSidebar);
   const panelOpen = useShell((s) => s.panelOpen);

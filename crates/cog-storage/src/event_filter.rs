@@ -32,6 +32,8 @@ pub fn event_matches(filter: &EventFilter, event: &AgentEvent) -> bool {
                     return false;
                 }
             }
+            // 一次写不属于任何一个执行者：按身份筛的时候它不是任何人的。
+            AgentEvent::ResourceChanged { .. } => return false,
         };
         if ev_agent != agent_id {
             return false;
@@ -88,7 +90,8 @@ pub fn event_matches(filter: &EventFilter, event: &AgentEvent) -> bool {
             | AgentEvent::AgentError { timestamp, .. }
             | AgentEvent::ResourceAlert { timestamp, .. }
             | AgentEvent::Heartbeat { timestamp, .. }
-            | AgentEvent::CheckpointSaved { timestamp, .. } => *timestamp,
+            | AgentEvent::CheckpointSaved { timestamp, .. }
+            | AgentEvent::ResourceChanged { timestamp, .. } => *timestamp,
         };
         if ts < *since {
             return false;
@@ -119,6 +122,7 @@ pub fn event_type_name(event: &AgentEvent) -> &str {
         AgentEvent::ResourceAlert { .. } => "resource_alert",
         AgentEvent::Heartbeat { .. } => "heartbeat",
         AgentEvent::CheckpointSaved { .. } => "checkpoint_saved",
+        AgentEvent::ResourceChanged { .. } => "resource_changed",
     }
 }
 

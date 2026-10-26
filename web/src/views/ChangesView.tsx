@@ -8,6 +8,8 @@ import {
   type ChangeTimelineEvent,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -22,6 +24,12 @@ function ChangeHistory({ row, onClose }: { row: ChangeLedgerRow; onClose: () => 
     `变更时间线 ${row.identity}`,
     () => getChangeTimeline({ kind: row.kind, scope: row.scope, literal: row.literal }),
     30_000
+  );
+  // 一条变更的状态迁移由任务面推着走：判读、落地、回退都是任务换态。历史是服务端
+  // 从账里现读的，帧只说明「该再看一眼了」。
+  useKindTickedRefresh(
+    ['tasks', 'projects', resourceKey('governance'), resourceKey('evolution')],
+    timeline.refresh
   );
   const events = timeline.data?.events ?? [];
 
@@ -98,6 +106,13 @@ export function ChangesView() {
   const ledger = useResource('变更账', getGovernanceChanges, 30_000);
   const queue = useResource('变更队列', getEvolutionChanges, 20_000);
   const metrics = useResource('演化计数', getEvolutionMetrics, 60_000);
+  // 三份账各有各的写者：账本身在 governance 前缀下，队列与计数在 evolution 前缀下，
+  // 而一条变更的进度是任务换态推出来的。三件都订上，且一次触发三份一起重读——
+  // 只刷其中一份，同一屏上就会出现「账说 N 条、计数说 M 条」。
+  useKindTickedRefresh(
+    ['tasks', 'projects', resourceKey('governance'), resourceKey('evolution')],
+    [ledger.refresh, queue.refresh, metrics.refresh]
+  );
   const [picked, setPicked] = useState<ChangeLedgerRow | null>(null);
 
   const page = ledger.data;

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { listAuditEvents, type AuditEvent } from '@/api/client';
+import { useStreamDrivenRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -91,6 +92,11 @@ export function AuditView() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // 这一面答的是「那一刻总线上到底来过什么」，订的是**全部**帧：审计表里多出来的
+  // 一行可能来自任何一种变体，按种类挑就等于先把可能漏掉的那几种排除了。全局那
+  // 一条信号正好是这个意思。
+  useStreamDrivenRefresh(load);
 
   const rows = events ?? [];
   const triggers = Array.from(new Set(rows.map((row) => row.trigger_type))).sort();

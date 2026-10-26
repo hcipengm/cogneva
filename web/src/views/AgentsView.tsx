@@ -1,6 +1,8 @@
 import { useMemo } from 'react';
 import { listAgents, type AgentSummary } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import {
   rosterWithFrames,
   seenAfterSnapshot,
@@ -85,6 +87,10 @@ function LiveState({ live }: { live: LiveAgentRow | null }) {
 
 export function AgentsView() {
   const resources = useResource('在岗名单', listAgents, 15_000);
+  // 名单是每 15 秒一拍读回来的快照；谁起来了、谁换态了、谁走了，都在总线上。
+  // 没有这一行，把间隔一调长，这张表就停在上一次读回来的那一刻——而平台早就
+  // 换了一拨人。
+  useKindTickedRefresh(['agents', resourceKey('agents')], resources.refresh);
   const { data, error, loading, refresh } = resources;
   const agents = data ?? [];
   const liveRows = useLiveAgentStore((s) => s.rows);

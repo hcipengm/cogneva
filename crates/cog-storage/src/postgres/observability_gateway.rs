@@ -838,6 +838,8 @@ fn extract_event_meta(
             squad_id.clone(),
         ),
         AgentEvent::Heartbeat { agent_id, .. } => (Some(agent_id.clone()), None, None, None),
+        // 一次写没有执行者、没有任务：这一行记的是「哪个前缀下的东西被改了」。
+        AgentEvent::ResourceChanged { .. } => (None, None, None, None),
         AgentEvent::CheckpointSaved {
             agent_id,
             task_id,
@@ -875,7 +877,8 @@ fn event_timestamp(event: &AgentEvent) -> DateTime<Utc> {
         | AgentEvent::AgentError { timestamp, .. }
         | AgentEvent::ResourceAlert { timestamp, .. }
         | AgentEvent::Heartbeat { timestamp, .. }
-        | AgentEvent::CheckpointSaved { timestamp, .. } => *timestamp,
+        | AgentEvent::CheckpointSaved { timestamp, .. }
+        | AgentEvent::ResourceChanged { timestamp, .. } => *timestamp,
     }
 }
 

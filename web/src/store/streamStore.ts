@@ -167,6 +167,15 @@ export function describeEvent(event: AgentEvent): ActivityEntry {
     case 'turn_start':
     case 'turn_end':
       return { ...base, summary: event.type, detail: null, failed: false };
+    case 'resource_changed':
+      // 一次成功的写落在哪个前缀下。名字是 REST 的前缀，不是界面上的面名：
+      // 一帧只说事实，怎么叫是各面自己的事。
+      return {
+        ...base,
+        summary: `${text(p.domain) || '某个面'}上有东西被改了`,
+        detail: null,
+        failed: false,
+      };
     default:
       return { ...base, summary: event.type, detail: preview(p), failed: false };
   }

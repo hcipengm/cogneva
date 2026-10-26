@@ -13,6 +13,8 @@ import { KIND_LABEL, needsBytes, previewKindOf } from '@/files/preview/kind';
 import { Markdown } from '@/files/preview/Markdown';
 import { Tex } from '@/files/preview/Tex';
 import { useDrafts } from '@/files/store';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { useShell } from '@/shell/store';
 import { Button, Empty, Loading, ReadError } from '@/ui/primitives';
 
@@ -88,6 +90,13 @@ export function FilesView() {
     setPreview(true);
     void load(path);
   }, [path, load]);
+
+  // 盘上这个文件被别处改过——另一个面保存、一次提交、一次外部写——就落在 ide 前缀
+  // 下。不订这一族的话，别人改完之后这一页要关掉重开才看得见新内容，而「刚才那笔
+  // 提交改了什么」正是这一页要答的问题。
+  useKindTickedRefresh([resourceKey('ide')], () => {
+    if (path) void load(path);
+  });
 
   const kind = path ? previewKindOf(path) : 'text';
   /** 这一种文件有没有「成品」可看：源码文件没有，它本身就是成品。 */

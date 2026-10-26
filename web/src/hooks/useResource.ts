@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 
 /** 一次定时读取的当前读数。三件事分开给：有数据、读失败、还没读到过。 */
 export interface Resource<T> {
@@ -18,8 +19,14 @@ export interface Resource<T> {
   pollMs: number;
 }
 
+/** 不订任何帧时用的空表。写成模块常量，免得每次渲染都是一张新数组。 */
+const NO_KEYS: readonly string[] = [];
+
 /**
- * 读一份远端数据，按固定间隔重读。
+ * 读一份远端数据，按固定间隔重读；`keys` 里那几件事在总线上出现时也立刻重读。
+ *
+ * 定时那一拍是兜底：连接断了、帧丢了，读数仍然会追上来，只是慢一拍。真正让屏幕动
+ * 起来的是 `keys`——不填的话这一面就是纯轮询，间隔调长屏幕就不动。
  *
  * 返回值把「还没有过第一份数据」与「读失败」分开：前者是加载中，后者要连同错误
  * 一起显示——把失败画成空列表，读者看到的会是「一切正常」。
@@ -28,7 +35,8 @@ export function useResource<T>(
   what: string,
   load: () => Promise<T>,
   pollMs = 30_000,
-  enabled = true
+  enabled = true,
+  keys: readonly string[] = NO_KEYS
 ): Resource<T> {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -40,6 +48,10 @@ export function useResource<T>(
   loadRef.current = load;
 
   const refresh = useCallback(() => setRevision((r) => r + 1), []);
+
+  // 订的那几件事一到就重读一次。这一行是「UI 是事件流的回音」在这一份读数上的
+  // 全部实现：帧里没有数，只有「有东西变了」。
+  useKindTickedRefresh(keys, refresh);
 
   useEffect(() => {
     if (!enabled) return;

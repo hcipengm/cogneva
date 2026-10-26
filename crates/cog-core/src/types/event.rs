@@ -445,6 +445,25 @@ pub enum AgentEvent {
         #[serde(default = "Utc::now")]
         timestamp: DateTime<Utc>,
     },
+    /// A write succeeded under one REST prefix; anything reading that prefix is
+    /// now stale.
+    ///
+    /// Orchestrator frames cover agents and tasks. The rest of the platform —
+    /// settings, files, storage, the change account, the governance roster —
+    /// changes only when someone writes, and a write used to leave no trace on
+    /// the bus at all. A reader of these faces could therefore only poll: the
+    /// screen updated on the tick of a timer, not because anything happened.
+    ///
+    /// The frame carries the prefix the write landed under and nothing else.
+    /// It is deliberately not a copy of the write: the reader re-reads the
+    /// snapshot the server computes, so there is exactly one account of what
+    /// the state is.
+    ResourceChanged {
+        /// First path segment under the API version root (e.g. `settings`).
+        domain: String,
+        #[serde(default = "Utc::now")]
+        timestamp: DateTime<Utc>,
+    },
 }
 
 /// Severity level for AgentError events.

@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { getLlmStatus, type LlmStatus } from '@/api/client';
 
 export function useLlmStatus(enabled: boolean) {
@@ -25,6 +27,10 @@ export function useLlmStatus(enabled: boolean) {
       refresh();
     }
   }, [enabled, refresh]);
+
+  // 换模型、换上游、换密钥都落在 admin 前缀下：那是别处的一次写，只有重读才看得见。
+  // 不看 `usage`——花销变了不等于配置变了，拿它拖着这一面重读只是换个说法的轮询。
+  useKindTickedRefresh([resourceKey('admin')], refresh);
 
   return {
     status,

@@ -8,7 +8,8 @@ import {
   type TaskRow,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
-import { useStreamDrivenRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { outcomesSinceSnapshot, type LiveCommsRow } from '@/store/liveComms';
 import { useLiveCommsStore } from '@/store/liveCommsStore';
 import { openExplain } from '@/ui/explain';
@@ -293,7 +294,10 @@ export function CommsView() {
   // 交接帧一到就重读，图当场把边收进去，这一块随之清空——这一块本来就是为两拍之间
   // 的那段时间准备的，不该在停顿里变成常驻。任务归属一并重读：边上要挂的人名，
   // 常常是和这条边同一个时刻才有的。
-  useStreamDrivenRefresh([graph.refresh, tasks.refresh]);
+  useKindTickedRefresh(
+    ['comms', 'tasks', resourceKey('collaboration'), resourceKey('tasks')],
+    [graph.refresh, tasks.refresh]
+  );
   const owners = new Map((tasks.data ?? []).map((task) => [task.id, task]));
   const [picked, setPicked] = useState<string | null>(null);
 

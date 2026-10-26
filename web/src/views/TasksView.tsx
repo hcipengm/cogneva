@@ -6,7 +6,8 @@ import {
   type TaskRow,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
-import { useStreamDrivenRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import {
   effectiveStatus,
   liveIndex,
@@ -54,7 +55,10 @@ export function TasksView() {
   // 之后画面上会同时存在两份事实——行说跑完了，表头还数在「运行」里，图上那条
   // 也还连着。等到下一拍 15 秒，两半才对上。三份都重读，是因为它们必须是同一
   // 时刻的那一份；只刷列表，表头只会更久地站在错的那一边。
-  useStreamDrivenRefresh([summary.refresh, list.refresh, graph.refresh]);
+  useKindTickedRefresh(
+    ['tasks', resourceKey('tasks'), resourceKey('projects')],
+    [summary.refresh, list.refresh, graph.refresh]
+  );
 
   const tasks = list.data ?? [];
   const nodes = graph.data?.nodes ?? [];

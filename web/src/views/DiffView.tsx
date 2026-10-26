@@ -7,6 +7,8 @@ import {
   type FileDiff,
 } from '@/api/client';
 import { pairHunk } from '@/files/diff';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { useShell } from '@/shell/store';
 import { Button, Empty, Loading, ReadError, ViewFrame } from '@/ui/primitives';
 
@@ -32,6 +34,12 @@ export function DiffView() {
   const [diff, setDiff] = useState<FileDiff | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  /** 重读的号码：差异由服务端现算，盘上变了就得重新取一份。 */
+  const [reload, setReload] = useState(0);
+
+  // 另一处暂存、提交、保存都会改动「这一份差异」的前提，而它们都落在 ide 前缀下。
+  // 这里换的是一个号码，取数那一支照旧——差异怎么算仍然只有服务端一处。
+  useKindTickedRefresh([resourceKey('ide')], () => setReload((n) => n + 1));
 
   useEffect(() => {
     if (!parsed) return;
@@ -54,7 +62,7 @@ export function DiffView() {
     return () => {
       cancelled = true;
     };
-  }, [parsed?.path, parsed?.staged]);
+  }, [parsed?.path, parsed?.staged, reload]);
 
   if (!parsed) {
     return (

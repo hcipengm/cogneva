@@ -1,6 +1,8 @@
 import { useMemo, useState } from 'react';
 import { getTrace, listTraces, type AgentTrace, type TraceMeta, type WireFrame } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { describeEvent, type ActivityEntry } from '@/store/streamStore';
 import type { AgentEvent } from '@/types/events';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
@@ -158,6 +160,13 @@ export function TimelineView() {
     async () => (picked ? getTrace(picked.trace_id) : null),
     300_000,
     picked !== null
+  );
+
+  // 一份轨迹是一次运行跑完之后落盘的：总线上那次运行结束的帧就是它的「到货通知」。
+  // 不订 `usage` 也不订 `alerts`——它们启动不了任何一次新的轨迹。
+  useKindTickedRefresh(
+    ['agents', 'tasks', resourceKey('traces')],
+    traces.refresh
   );
 
   const rows = traces.data ?? [];

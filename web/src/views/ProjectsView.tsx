@@ -15,6 +15,8 @@ import {
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { useFrameDrivenRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey, ticksFor } from '@/store/frameTick';
+import { useFrameTickStore } from '@/store/frameTickStore';
 import {
   changedSinceSnapshot,
   projectRevision,
@@ -243,7 +245,13 @@ function useFrameFedFace(
   // 这一发的到期时刻就又晚 600 毫秒，于是一面号称「跟着帧走」的视图比纯轮询还旧。
   // 现在走的是与其余各面同一条调度：前沿立刻读、两读之间至少隔一段地板、地板之内
   // 的信号合并成到期的那一发，且**不**把已在路上的那一发往后推。
-  useFrameDrivenRefresh(revision, refresh);
+  // 任务帧由上面那个 revision 数着。REST 侧对这一面的写（改列、改日期、认领）
+  // 不产生任务状态帧，只落在 `projects` 前缀下——那一族也要算进同一个信号里，
+  // 否则「帧驱动」只对了一半：别处改的东西要等 15 秒那一拍才出现在这一面。
+  const written = useFrameTickStore((s) =>
+    ticksFor(s.byKind, [resourceKey('projects'), resourceKey('tasks')])
+  );
+  useFrameDrivenRefresh(revision + written, refresh);
   return useMemo(
     () => changedSinceSnapshot(snapshotAt, rowsForProject(project.id, owned, rows)),
     [snapshotAt, project.id, owned, rows]

@@ -8,7 +8,8 @@ import {
   type EvalReportSummary,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
-import { useStreamDrivenRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Table, ViewFrame } from '@/ui/primitives';
 
 const PAGE = 100;
@@ -75,7 +76,7 @@ export function EvalView() {
   // 一次评测跑起来就是一条任务，跑完就是一次 `task_status_change`——报告列表在总
   // 线上有对应的事。以前只有「在这个页面点过跑评测」的那一条路会刷，别处跑完的要
   // 等下一拍 30 秒；而这一面答的正是「刚才那一轮做得怎么样」。
-  useStreamDrivenRefresh(reports.refresh);
+  useKindTickedRefresh(['tasks', resourceKey('eval')], [reports.refresh, datasets.refresh]);
   const [picked, setPicked] = useState<EvalReportSummary | null>(null);
   const [running, setRunning] = useState<string | null>(null);
   const [runError, setRunError] = useState<string | null>(null);

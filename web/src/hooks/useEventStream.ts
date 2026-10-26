@@ -18,6 +18,7 @@ import { useLiveCommsStore } from '@/store/liveCommsStore';
 import { useLiveProjectStore } from '@/store/liveProjectStore';
 import { useLivePulseStore } from '@/store/livePulseStore';
 import { useFrameTickStore } from '@/store/frameTickStore';
+import { resourceKey } from '@/store/frameTick';
 import type { AgentEvent } from '@/types/events';
 import type { NotificationItem } from '@/api/client';
 
@@ -119,13 +120,27 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       // 就变成了替这一帧编一个它没做过的改动。
       let changedState = false;
 
-      // 这一帧有没有改动**读快照的那几面**（任务、流程、项目、观测）。
+      // 这一帧改动了**哪几个读快照的面**。
       //
       // 与 `changedState` 分开：那个还包含画布上正在流的那条消息、一次工具调用的
       // 开始与结束——它们改动的是逐帧渲染的面，不该让集群概况跟着每两秒重读一次。
-      // 这里只在「平台的状态真的变了」时置位（执行者换态、告警越线、交接推进、任务
+      // 这里只在「平台的状态真的变了」时记名（执行者换态、告警越线、交接推进、任务
       // 换状态、项目面那四条边），也就是 REST 快照会算得不一样的那几种。
-      let changedPolledFace = false;
+      //
+      // 记的是**面**不是布尔：一个布尔只能告诉所有人「有东西变了」，于是配额、花销、
+      // 设置这些与任务无关的面也被 `task_status_change` 拖着每两秒重读一次——那不是
+      // 事件驱动，是换了个说法的轮询，还把服务端一起拖进去。每一种面只订自己的名字。
+      const touched: string[] = [];
+
+      // REST 侧一次成功的写：改的是哪个前缀下的东西，就让订了那个前缀的面重读。
+      //
+      // 编排器那些变体只覆盖得到智能体与任务；设置、文件、存储、变更流水这些面在
+      // 总线上原本一帧都没有，屏幕要动就只能靠轮询。这一族帧说的是「`domain` 下的
+      // 读数过期了」——它不带内容，也不该带：内容仍然由服务端现算。
+      if (event.type === 'resource_changed') {
+        const domain = typeof p.domain === 'string' ? p.domain : '';
+        if (domain) touched.push(resourceKey(domain));
+      }
 
       // 执行者这一面：状态帧改状态、心跳只推「还在」的那一刻（两件不同的事，
       // 见 store/liveAgents.ts）。名单面每 15 秒才重读一次快照，没有这一折，
@@ -136,8 +151,13 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
         // 心跳按构造不入账（下面会提前返回），它的「改了态」不落在时间轴上，
         // 所以这里只给会落点的那几类置位。
         if (event.type !== 'heartbeat' && liveAgent.state !== null) changedState = true;
-        if (liveAgent.state !== null) changedPolledFace = true;
+        if (liveAgent.state !== null) touched.push('agents');
       }
+
+      // 花销这一面：一轮话、一次运行结束，就是又花掉了一笔。额度与令牌曲线那几面
+      // 与任务状态无关，订的是这两帧——拿 `task_status_change` 去拖它们，拖出来的
+      // 是一份每两秒重读一次的轮询。
+      if (event.type === 'turn_end' || event.type === 'agent_end') touched.push('usage');
 
       // 告警这一面：活跃告警表每 30 秒才重读一次，而 `resource_alert` 一直在总线上。
       // 折进来的是「表之外刚越的那一次」（见 store/liveAlerts.ts），它改的是读者
@@ -146,7 +166,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       if (liveAlert) {
         noteAlertFrame(liveAlert);
         changedState = true;
-        changedPolledFace = true;
+        touched.push('alerts');
       }
 
       // 通信这一面：交接图每 15 秒才重读一次，而让图长出边的那些结局一直在总线上。
@@ -156,7 +176,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       if (liveComms) {
         noteCommsFrame(liveComms);
         changedState = true;
-        changedPolledFace = true;
+        touched.push('comms');
       }
 
       // 项目这一面：范围、看板、甘特、挣值四张屏都是每 15 秒重读一次的快照，而
@@ -167,7 +187,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       if (liveProjectTask) {
         noteProjectTaskFrame(liveProjectTask);
         changedState = true;
-        changedPolledFace = true;
+        touched.push('projects');
       }
 
       switch (event.type) {
@@ -224,7 +244,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
           if (!taskId || status === 'hook_event') break;
           noteTaskStatus({ taskId, status, at: event.timestamp });
           changedState = true;
-          changedPolledFace = true;
+          touched.push('tasks');
           break;
         }
         default:
@@ -247,12 +267,12 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       recordActivity(entry);
       noteFrame({ ...entry, fed });
 
-      // 读快照的那几面在这里被告知「有东西变了」，它们据此立刻重读一次。
+      // 读快照的那几面在这里被告知「你订的那件事变了」，它们据此立刻重读一次。
       //
       // 位置在这三种提前返回之后：心跳与正文增量按构造高频（每个 token 一帧），
       // 让它们触发重读，等于把轮询换成一种更密的轮询，而它们改的是画布上正在流
       // 的那一条消息，那一面本来就是逐帧渲染的。
-      if (changedPolledFace) noteFaceTick();
+      for (const kind of touched) noteFaceTick(kind);
     };
 
     const channels = channelKey ? channelKey.split(',') : [];

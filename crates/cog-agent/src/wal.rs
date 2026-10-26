@@ -320,6 +320,17 @@ fn agent_event_to_wal(event: &AgentEvent) -> (WalEventType, serde_json::Value) {
                 "timestamp": timestamp
             }),
         ),
+        // 一次成功的写没有 agent、没有 task：WAL 里它按自定义名字落一行，重放时
+        // 仍读得出来「这个前缀下的东西在这一刻被改过」。
+        AgentEvent::ResourceChanged { domain, timestamp } => (
+            WalEventType::Custom {
+                name: "resource_changed".to_string(),
+            },
+            json!({
+                "domain": domain,
+                "timestamp": timestamp
+            }),
+        ),
         AgentEvent::CheckpointSaved {
             agent_id,
             checkpoint_id,

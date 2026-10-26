@@ -6,6 +6,7 @@ import { useEventStream } from '@/hooks/useEventStream';
 import { useLlmStatus } from '@/hooks/useLlmStatus';
 import { useNotifications } from '@/hooks/useNotifications';
 import { useResource } from '@/hooks/useResource';
+import { resourceKey } from '@/store/frameTick';
 import { USE_MOCK } from '@/runtime';
 import { AuthOverlay } from '@/overlay/AuthOverlay';
 import { ShellServicesProvider, type ShellServices } from '@/shell/context';
@@ -47,7 +48,9 @@ export default function App() {
     '集群概况',
     getClusterOverview,
     30_000,
-    signedIn && !USE_MOCK
+    signedIn && !USE_MOCK,
+    // 状态条上那几个数是全平台共用的，订的面也宽：任务、执行者、告警都算数。
+    ['tasks', 'agents', 'alerts', resourceKey('cluster')]
   );
 
   const [conversations, setConversations] = useState(false);

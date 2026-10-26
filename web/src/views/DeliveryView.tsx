@@ -1,5 +1,7 @@
 import { getBuildRuns, getDeployments, type DeploymentView } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -19,6 +21,13 @@ export function DeliveryView() {
   const rows = report?.deployments ?? [];
 
   const builds = useResource('构建跑次', getBuildRuns, 20_000);
+  // 两半各有各的帧：部署版本来自集群对象，一次滚动的每一步都是一次写；构建跑次
+  // 来自演进进程，一次跑完就落一条。两张表在同一屏上，一次触发两半一起重读——
+  // 分两次读会让上半页先变、下半页还是上一轮。
+  useKindTickedRefresh(
+    [resourceKey('cluster'), resourceKey('evolution')],
+    [deployments.refresh, builds.refresh]
+  );
   const view = builds.data;
   const runs = view?.runs ?? [];
   // 表要一个稳定 key，而同一变更的两次尝试可能落在同一秒：带上行号，不靠时间戳
