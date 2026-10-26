@@ -8000,6 +8000,13 @@ async fn seed_pool_verdict_from_signal(state: &AppState) -> bool {
     }
     if seed_pool_down(status.as_ref()) {
         state.pool_down.store(true, Ordering::SeqCst);
+        // 一起落下"最后一次被拒是什么时候"。这一格回答的是"刚才有没有人真的被拒"，
+        // 而一个继承来的锁存说的正是"上一任进程看到的最后一次是拒绝"。不落它，
+        // 新进程里它是 0 = 本进程还没见过拒绝，重启后第一拍探测的 200 就会被当成
+        // 恢复凭据，把上一个进程攒下的判定当场推翻——每次滚动都白丢一次判定。
+        state
+            .last_caller_failure_unix
+            .store(Utc::now().timestamp(), Ordering::SeqCst);
         tracing::warn!("池不可用判定沿用上次跨进程信号（重启不凭空清零），待上游实证成功解除");
     }
     true
@@ -11172,6 +11179,64 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert_eq!(pace.reserve_population, 5);
         assert_eq!(pace.window_start_unix, 1_000_000);
         assert_eq!(rate, 1_000.0);
+    }
+
+    /// 重启不是新的一页：上一任进程判定的"池不可用"不能被新进程的第一拍探测推翻。
+    ///
+    /// 这一格测的是**初值**而不是判据。`last_caller_failure_unix` 在新进程里从 0
+    /// 起步，而 0 的字面意思是"本进程还没见过有人被拒"——据此，重启后第一拍探测的
+    /// 200 就是恢复证据，把上一个进程攒下的判定当场推翻，每一次滚动都白丢一次。
+    #[tokio::test]
+    async fn a_latch_inherited_from_the_previous_process_survives_the_first_probe() {
+        let alive = spawn_stub_upstream(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"pong"}}]}"#,
+        )
+        .await;
+        let upstream_cfg = stub_upstream(&alive, "m1");
+        let key = LlmHealthTable::key(&upstream_cfg);
+        let now = Utc::now().timestamp();
+        // 上一任进程留下的判定：池不可用，并带着逐上游证据。
+        let payload = serde_json::to_string(&cog_core::LlmPoolStatus {
+            unavailable: true,
+            evidenced_recovery_unix: 0,
+            next_attempt_unix: now + 300,
+            unavailable_upstreams: vec![key.clone()],
+            pool_size: 1,
+            declared_min_healthy: None,
+            quota_window_secs: 0,
+            upstream_evidence: vec![cog_core::LlmUpstreamEvidence {
+                identity: key.clone(),
+                consecutive_failures: 1,
+                suspect_until_unix: now + 300,
+                ..Default::default()
+            }],
+            last_success_unix: 0,
+            pace: cog_core::LlmWindowPace::default(),
+        })
+        .unwrap();
+        let channel = Arc::new(GatedStore::default());
+        channel.seed(cog_core::LLM_POOL_STATUS_KEY, &payload);
+        channel.open();
+        let mut state = test_state(vec![upstream_cfg.clone()]);
+        state.pool_signal = Some(Arc::clone(&channel) as Arc<dyn cog_core::KeyValueStore>);
+        state.pool_seeded = Arc::new(AtomicBool::new(false));
+
+        refresh_pool_state(&state).await;
+        assert!(state.pool_seeded.load(Ordering::SeqCst), "读到一次就算落地");
+        assert!(state.pool_down.load(Ordering::SeqCst), "沿用上一任的判定");
+
+        // 新进程的第一拍探测通了——它清自己的嫌疑窗，但不推翻上一个进程的判定。
+        probe_suspect_upstreams(&state).await;
+        refresh_pool_state(&state).await;
+        assert!(
+            state.pool_down.load(Ordering::SeqCst),
+            "重启后的第一拍探测不是恢复凭据：新进程还没见过任何真实请求，0 不等于\"没人被拒\""
+        );
+        assert!(
+            !state.llm_health.is_suspect(&upstream_cfg),
+            "它确实答了一个 ping，自己的嫌疑窗要清掉"
+        );
     }
 
     /// "下一次再试"与"读到一次就落地"钉在同一对数上：同一个通道对象，先关后开。
