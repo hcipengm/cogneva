@@ -632,12 +632,11 @@ mod tests {
             .expect("the fallback outlet answered");
         assert_eq!(out["text"], "the fallback text");
         assert_eq!(out["extraction"], "fallback");
-        assert_eq!(
+        assert!(
             out["fallback_because"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("502"),
-            true,
             "答案里要留下本地那层为什么没答：{out}"
         );
         let asked = scripted.asked.lock().unwrap().clone();
