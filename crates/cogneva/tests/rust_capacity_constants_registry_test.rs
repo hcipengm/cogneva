@@ -34,6 +34,12 @@
 //! only comes down: a constant added tomorrow cannot be parked there, because
 //! there is no room, so it has to arrive with a source and a note.
 //!
+//! The other half of the same question is on this file too: a number written at
+//! the point of *use* rather than in a declaration. The census above cannot see
+//! it, and the copies that drifted were exactly that shape -- a literal handed
+//! to `Duration::from_secs` in three call sites, counted by nothing. Those have
+//! their own register and their own ceiling at the bottom of this file.
+//!
 //! Fixtures are not production numbers. Constants inside an inline
 //! `#[cfg(test)] mod tests` are excluded -- the first version counted them,
 //! which asked reviewers to justify test data and inflated the population by
@@ -399,5 +405,271 @@ fn the_scan_sees_production_constants_and_not_fixtures() {
     assert!(
         has("crates/cog-reflection/src/lib.rs", "CHANGE_EVIDENCE_BUDGET"),
         "a constant declared after a one-line `mod test_support;` was skipped"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The other half: numbers written where they are *used*.
+//
+// The census above reads declarations. The shape that actually bit us was not a
+// declaration at all: the same 1800 seconds typed into three call sites, in
+// three crates, where nothing counted it because no `const` was involved. A
+// register of declared numbers cannot see that, so a rule that only counted
+// declarations would have reported a clean tree while the copies drifted.
+//
+// So this half counts two shapes that are unambiguous quantities wherever they
+// appear -- a literal handed to `Duration::from_*`, and a literal multiplying
+// bytes -- anywhere in production code that is not a `const` declaration (those
+// belong to the census above) and not an inline test module. A new one is red;
+// the total is capped by [`BARE_LITERAL_CEILING`] and the cap only comes down.
+//
+// Counted per file and per shape rather than one row each. Four hundred rows of
+// `.../mod.rs 1800` would name the numbers without making them cheaper to find,
+// and the thing a reader needs from this file is which files still hold the
+// hardcoding and how much of it.
+// ---------------------------------------------------------------------------
+
+/// Where the use-site numbers are registered, relative to the workspace root.
+const BARE_LITERALS: &str = "crates/cogneva/tests/data/rust-bare-literals.tsv";
+
+/// The shape names, as they appear in the registry.
+const BARE_CADENCE: &str = "cadence";
+const BARE_BYTES: &str = "bytes";
+
+/// How many use-site literals of both shapes may still exist in total.
+///
+/// The value is the measured population, not a budget somebody chose. Every
+/// row is a number a deployment's behaviour depends on and no caller can move;
+/// the ceiling exists so the next one arrives with a decision, which is what
+/// makes this a ratchet rather than a count.
+const BARE_LITERAL_CEILING: usize = 203;
+
+/// `Duration::from_*(<literal>)` and byte multipliers, per file and shape.
+///
+/// Line-oriented and deliberately crude: a number on the same line as a `//`
+/// comment after it is still counted, because the alternative is half-reading
+/// Rust expressions and a half-read expression in a register reads as a
+/// decision nobody made. What it must not do is count fixtures or declarations,
+/// and both of those exclusions are exact.
+fn scan_bare_literals(root: &Path) -> BTreeMap<(String, String), usize> {
+    let mut out: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for entry in walk_rs(&root.join("crates")) {
+        let rel = entry
+            .strip_prefix(root)
+            .unwrap_or(&entry)
+            .to_string_lossy()
+            .to_string();
+        if !rel.contains("/src/") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&entry) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let next = lines[i + 1..]
+                .iter()
+                .find(|l| !l.trim().is_empty())
+                .copied();
+            if opens_inline_test_module(line, next) {
+                break;
+            }
+            let code = line.split("//").next().unwrap_or("");
+            if declares_a_const(code) {
+                continue;
+            }
+            let cadence = cadence_literals(code);
+            if cadence > 0 {
+                *out.entry((rel.clone(), BARE_CADENCE.to_string()))
+                    .or_default() += cadence;
+            }
+            let bytes = byte_literals(code);
+            if bytes > 0 {
+                *out.entry((rel.clone(), BARE_BYTES.to_string()))
+                    .or_default() += bytes;
+            }
+        }
+    }
+    out
+}
+
+/// A line that declares a constant: its numbers are the census's rows, and
+/// counting them here too would ask the same number for two decisions.
+fn declares_a_const(line: &str) -> bool {
+    let mut rest = line.trim_start();
+    for prefix in ["pub(crate) ", "pub(super) ", "pub(in crate) ", "pub "] {
+        if let Some(tail) = rest.strip_prefix(prefix) {
+            rest = tail.trim_start();
+        }
+    }
+    rest.starts_with("const ") || rest.starts_with("static ")
+}
+
+/// Literals handed straight to a `Duration` constructor, ignoring 0 and 1.
+///
+/// Zero and one are the two numbers that mean a cardinality rather than a
+/// duration: "no wait" and "one tick" say what to do, not how long it is, and
+/// asking for a name for them would produce names like `ONE`.
+fn cadence_literals(code: &str) -> usize {
+    const CONSTRUCTORS: [&str; 6] = [
+        "from_secs(",
+        "from_millis(",
+        "from_micros(",
+        "from_nanos(",
+        "from_secs_f64(",
+        "from_secs_f32(",
+    ];
+    let mut count = 0;
+    for ctor in CONSTRUCTORS {
+        let mut rest = code;
+        while let Some(at) = rest.find(ctor) {
+            let after = &rest[at + ctor.len()..];
+            let digits: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '_')
+                .collect();
+            if !digits.is_empty() && digits != "0" && digits != "1" {
+                count += 1;
+            }
+            rest = after;
+        }
+    }
+    count
+}
+
+/// Byte sizes written as a multiplier or a shift, per line.
+///
+/// `1024` and its shift spellings are the one literal that cannot mean anything
+/// but a unit, which is exactly why they are countable and why leaving one in a
+/// call site is a size nobody declared.
+fn byte_literals(code: &str) -> usize {
+    let mut count = 0;
+    let mut rest = code;
+    while let Some(at) = rest.find("1024") {
+        let before = &rest[..at];
+        if before.trim_end().ends_with('*') {
+            count += 1;
+        }
+        rest = &rest[at + 4..];
+    }
+    for shift in [
+        "<< 10", "<< 20", "<< 30", "<< 40", "<<10", "<<20", "<<30", "<<40",
+    ] {
+        count += code.matches(shift).count();
+    }
+    count
+}
+
+fn read_bare_literals(root: &Path) -> Vec<(String, String, usize)> {
+    let path = root.join(BARE_LITERALS);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.starts_with('#') && !l.starts_with("file\t") && !l.trim().is_empty())
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            Some((
+                f.next()?.to_string(),
+                f.next()?.to_string(),
+                f.next()?.parse().ok()?,
+            ))
+        })
+        .collect()
+}
+
+fn write_bare_literals(root: &Path, scanned: &BTreeMap<(String, String), usize>) {
+    let mut out = String::from(
+        "# Numbers written where they are used rather than declared: a literal handed to a\n\
+         # `Duration` constructor, or a byte multiplier. One row per file and shape; `count`\n\
+         # is how many are still in that file. The const census does not see these, which is\n\
+         # how the same period could be typed into three call sites unnoticed. A new one is\n\
+         # red, and the total is capped in the test that reads this file. Regenerate with\n\
+         # COGNEVA_BARE_LITERAL_REGISTRY_WRITE=1 cargo test -p cogneva --test\n\
+         # rust_capacity_constants_registry_test\n\
+         file\tkind\tcount\n",
+    );
+    for ((file, kind), count) in scanned {
+        out.push_str(&format!("{file}\t{kind}\t{count}\n"));
+    }
+    let path = root.join(BARE_LITERALS);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&path, out).expect("write the bare literal registry");
+}
+
+#[test]
+fn a_number_at_the_point_of_use_is_counted_where_it_is_used() {
+    let root = workspace_root();
+    let scanned = scan_bare_literals(&root);
+    let existing = read_bare_literals(&root);
+    if std::env::var("COGNEVA_BARE_LITERAL_REGISTRY_WRITE").as_deref() == Ok("1") {
+        write_bare_literals(&root, &scanned);
+        return;
+    }
+    let present: BTreeMap<(String, String), usize> = existing
+        .iter()
+        .map(|(f, k, c)| ((f.clone(), k.clone()), *c))
+        .collect();
+    let mut drifted = Vec::new();
+    for ((file, kind), count) in &scanned {
+        match present.get(&(file.clone(), kind.clone())) {
+            None => drifted.push(format!("{file} ({kind}): {count} new, unregistered")),
+            Some(old) if old != count => drifted.push(format!(
+                "{file} ({kind}): {old} -> {count}: say where the new number comes from"
+            )),
+            Some(_) => {}
+        }
+    }
+    for (file, kind, count) in &existing {
+        if !scanned.contains_key(&(file.clone(), kind.clone())) {
+            drifted.push(format!(
+                "{file} ({kind}): {count} gone (regenerate the file)"
+            ));
+        }
+    }
+    assert!(
+        drifted.is_empty(),
+        "use-site numbers moved.\n{}\nRegenerate with COGNEVA_BARE_LITERAL_REGISTRY_WRITE=1 \
+         cargo test -p cogneva --test rust_capacity_constants_registry_test",
+        drifted.join("\n")
+    );
+
+    let total: usize = existing.iter().map(|(_, _, count)| count).sum();
+    assert!(
+        total <= BARE_LITERAL_CEILING,
+        "{total} numbers are still written where they are used and the ceiling is \
+         {BARE_LITERAL_CEILING}. The debt only comes down: give the number a declaration \
+         (a `const` the census asks about) or make it configurable."
+    );
+}
+
+/// The use-site scan's failures also read as green, so both directions are
+/// pinned: it must find the shape it exists for, and it must not read a
+/// fixture's durations as production hardcoding.
+#[test]
+fn the_use_site_scan_sees_production_and_not_fixtures() {
+    let root = workspace_root();
+    let scanned = scan_bare_literals(&root);
+    let total: usize = scanned.values().sum();
+    assert!(
+        total > 50,
+        "the use-site scan found {total} numbers, far below what crates/*/src holds: the \
+         walk or the shape match is broken, not the tree"
+    );
+    assert!(
+        scanned.keys().all(|(file, _)| file.contains("/src/")),
+        "a test or fixture file was counted as production hardcoding"
+    );
+    // A number inside a declaration is the census's row, not this one's: the
+    // shared heartbeat is declared as a `const`, so this scan must be silent
+    // about it even though the file holds a `from_secs` call.
+    assert!(
+        !scanned.contains_key(&(
+            "crates/cog-core/src/reading_cadence.rs".to_string(),
+            BARE_CADENCE.to_string()
+        )),
+        "a number in a `const` declaration was counted as a use-site number"
     );
 }
