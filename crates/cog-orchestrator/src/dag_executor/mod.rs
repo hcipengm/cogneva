@@ -247,6 +247,9 @@ impl DagExecutorRuntime {
     /// 给测试用：一个只能在改环境变量下才验证得了的准入，会和同进程里别的用例
     /// 抢同一份环境。
     pub fn with_board_wip_limits(mut self, limits: cog_core::BoardWipLimits) -> Self {
+        // 同一份上限也推进执行器：发布侧拦「进 scheduled」，执行器拦「进
+        // running」。只喂一边的那天，看板上的上限与真正拦住的那个数就分家了。
+        self.orchestrator.set_board_wip_limits(limits.clone());
         self.board_wip_limits = limits;
         self
     }
@@ -2391,6 +2394,55 @@ mod consumer_ack_tests {
                 "列满了就留在 Pending，等下一轮——放出去才是真的超了"
             );
         }
+    }
+
+    /// `running` 的上限不是发布那一刻的快照：发布侧只判了「发布时这一列空着」，
+    /// 之后 `scheduled` 里攒着的几条一起启动，就能把它顶过上限。
+    ///
+    /// 区分在这一列上：若 `start_task` 不判上限，第二条也会变成 `Running`，
+    /// 而看板那一格仍然印着「1/1 未超」——上限看着在、实际拦不住。
+    #[tokio::test]
+    async fn starting_a_task_respects_the_running_column_limit() {
+        let backend = ScriptedBackend::default();
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-wip-start".into(),
+            consumer_group: "grp-wip-start".into(),
+            max_retries: 1,
+            ..DagExecutorConfig::default()
+        };
+        let (limits, problems) = cog_core::BoardWipLimits::from_spec("running=1");
+        assert!(problems.is_empty(), "{problems:?}");
+        let runtime = test_runtime_with(backend, config).with_board_wip_limits(limits);
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-start",
+                vec![
+                    ready_task("task-a", serde_json::json!({})),
+                    ready_task("task-b", serde_json::json!({})),
+                ],
+            )
+            .await
+            .unwrap();
+        runtime.publish_ready_tasks().await.unwrap();
+
+        runtime.orchestrator().start_task("task-a").await.unwrap();
+        let refused = runtime.orchestrator().start_task("task-b").await;
+        assert!(
+            refused.is_err(),
+            "running 列上限是 1、已经起了一条，第二条不许再进"
+        );
+        assert_eq!(
+            runtime
+                .orchestrator()
+                .get_task("task-b")
+                .await
+                .expect("task-b present")
+                .status,
+            cog_core::TaskStatus::Scheduled,
+            "被拒的那条要留在 Scheduled：拒了还把它移过去就只是没报错"
+        );
     }
 
     /// A task that names its executor must not be offered to the queue every

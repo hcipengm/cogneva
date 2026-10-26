@@ -89,6 +89,20 @@ pub struct DagExecutor {
     /// retires nothing and the roster keeps growing — which is the state this
     /// field exists to end, so it is wired in the same place the pool is.
     agent_manager: std::sync::RwLock<Option<Arc<dyn cog_core::AgentManager>>>,
+    /// 看板每一列的在制品上限。
+    ///
+    /// 发布侧（`DagExecutorRuntime::publish_ready_tasks`）拿它拦「进 `scheduled`」，
+    /// 这里拿它拦「进 `running`」。两处判的是同一列上的同一件事，所以读的是同一个
+    /// 环境变量、同一个解析器（[`cog_core::BoardWipLimits::from_env`]）——两份解析
+    /// 就是两把尺，看板上印的上限迟早不是拦住派发的那个数。
+    ///
+    /// 构造时就从环境读，而不是等谁记得来注入：一个要靠调用方接上才生效的上限，
+    /// 接漏的那天与「这台不限流」在读数上同形，而那正是这个字段要结束的状态。
+    ///
+    /// 一格而不是一个值，是为了让运行时能把它自己那一份推进来：发布侧拦「进
+    /// `scheduled`」，这里拦「进 `running`」，两处必须是**同一个对象**，否则看板
+    /// 上印的上限与真正拦住的那个数会在有人只改了一边的那天分家。
+    board_wip_limits: std::sync::RwLock<cog_core::BoardWipLimits>,
 }
 
 /// 为什么一个 Running 任务需要被回收。
@@ -211,7 +225,14 @@ impl DagExecutor {
             archive_poll_interval_secs: 300,
             metrics: std::sync::RwLock::new(None),
             agent_manager: std::sync::RwLock::new(None),
+            board_wip_limits: std::sync::RwLock::new(cog_core::BoardWipLimits::from_env().0),
         }
+    }
+
+    /// 换一套列上限。生产路径只从环境读（[`Self::new`]），这个入口是运行时把
+    /// 自己那一份推进来的地方——它同时喂着发布侧的拦截，两边必须是同一个数。
+    pub fn set_board_wip_limits(&self, limits: cog_core::BoardWipLimits) {
+        *self.board_wip_limits.write().unwrap() = limits;
     }
 
     /// Attach the pool whose agents this executor retires at a task's terminal
@@ -2251,7 +2272,49 @@ impl DagExecutor {
         Ok(())
     }
 
+    /// `running` 那一列满了就不再放一条进去。
+    ///
+    /// 发布侧已经按项目判过一次（`ready_queue::column_at_limit`），但那一次判的是
+    /// **发布**那一刻的在制品数：一条活要经过「进 scheduled」与「进 running」两步，
+    /// 两步之间别的活可以继续把 `running` 填满。只在发布侧判，上限就只在那一刻成立
+    /// ——`scheduled` 里攒着的几条一起启动，就能把它顶过上限，而看板那一格照样印着
+    /// 「未超」。上限是准入控制，不是某一刻的快照，所以判在真正跨进去的那一步上。
+    ///
+    /// 没配 `running` 上限的进程在这里不读图：这条判据不给所有部署加一次全图读。
+    async fn refuse_when_the_running_column_is_full(&self, task_id: &str) -> SFResult<()> {
+        // 读一格只为拿一个数：守卫在这里就放掉，别让它跨过下面的 await。
+        let limit = self
+            .board_wip_limits
+            .read()
+            .unwrap()
+            .limit_for(TaskStatus::Running.as_str());
+        let Some(limit) = limit else {
+            return Ok(());
+        };
+        // 任务不存在时不在这里抢先判：接下来的转换会给出它自己那条更具体的理由，
+        // 而被这里说成「列满了」只会把人引到错误的方向。
+        let Some(task) = self.get_task(task_id).await else {
+            return Ok(());
+        };
+        let project = task.project_key();
+        let running = self
+            .all_tasks_unified()
+            .await
+            .iter()
+            .filter(|t| t.status == TaskStatus::Running && t.project_key() == project)
+            .count();
+        if running < limit {
+            return Ok(());
+        }
+        Err(cog_core::SFError::Conflict(format!(
+            "任务 {task_id} 进不了 running：项目 {project} 的 running 列已满（{running}/{limit}），\
+             上限是准入控制，不放行第 {} 条",
+            limit + 1
+        )))
+    }
+
     pub async fn start_task(&self, task_id: &str) -> SFResult<()> {
+        self.refuse_when_the_running_column_is_full(task_id).await?;
         if self.fg().is_some() {
             let (owner, lease) = (self.run_id.clone(), self.task_lease);
             return self
