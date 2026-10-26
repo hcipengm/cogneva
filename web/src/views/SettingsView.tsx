@@ -1,4 +1,4 @@
-import { getQuotaUsage, listEvalDatasets } from '@/api/client';
+import { getQuotaUsage, getSearchFallback, listEvalDatasets } from '@/api/client';
 import { BarList } from '@/ui/plots';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
@@ -10,23 +10,36 @@ import { THEMES } from '@/styles/themes';
 import { ThemePicker } from '@/ui/ThemePicker';
 import { Button, Empty, Loading, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
+/** 这一条能用来做什么：说中文，别把服务端的枚举值原样摆在人眼前。 */
+function capabilityLabel(capability: string): string {
+  if (capability === 'both') return '检索与抓取';
+  if (capability === 'fetch') return '只抓取';
+  return '只检索';
+}
+
 /**
- * 设置：模型、评估集、界面。
+ * 设置：模型、上网后备、评估集、界面。
  *
  * 模型那一格只读不写——写入走向导，因为保存时服务端要拿这把钥匙做一次真实
  * 探测；在这里做一个「改 base_url 的输入框」会绕开那次探测，存下一条从没
  * 连通过的配置。
+ *
+ * 上网后备那一格同理：这里只读回「有哪几条、哪条缺钥匙」，写走向导。多一层
+ * 理由——钥匙在网关保存时写进带外 Secret，读面永远不回明文；在这一页塞输入框
+ * 会让人以为填了就等于生效，而真正的生效判据是新 Pod 读回来的那份池变了。
  */
 export function SettingsView() {
   const { llm, overlays, signOut, username } = useServices();
-  const { openLlmSetup } = overlays;
+  const { openLlmSetup, openWebSearch } = overlays;
   const datasets = useResource('评估集', listEvalDatasets, 120_000);
   const quota = useResource('额度', getQuotaUsage, 60_000);
+  const searchFallback = useResource('上网后备', getSearchFallback, 60_000);
   // 额度跟着花销走：一轮话、一次运行结束就是又花了一笔。评估集只在有人增删时才变
-  // ——那是 eval 前缀下的一次写。两件事都不是任务状态，不该被任务帧拖着重读。
+  // ——那是 eval 前缀下的一次写。后备池同理：保存是 admin 前缀下的一次写，之后
+  // 网关自己滚动，读回来才是新的那一份。三件事都不是任务状态，不该被任务帧拖着重读。
   useKindTickedRefresh(
     ['usage', resourceKey('quota'), resourceKey('eval'), resourceKey('admin')],
-    [datasets.refresh, quota.refresh]
+    [datasets.refresh, quota.refresh, searchFallback.refresh]
   );
   const sidebarVisible = useShell((s) => s.sidebarVisible);
   const toggleSidebar = useShell((s) => s.toggleSidebar);
@@ -37,6 +50,12 @@ export function SettingsView() {
 
   const status = llm.status;
   const backend = status?.backends?.[0];
+
+  const pool = searchFallback.data?.upstreams ?? [];
+  const fromLlm = searchFallback.data?.from_llm ?? [];
+  const poolWithKey = pool.filter((u) => u.has_key).length;
+  // 顺序不是服务端的一条字段，它就是数组下标——数组的顺序就是被问的顺序。
+  const poolRows = pool.map((u, i) => ({ ...u, order: i + 1 }));
 
   return (
     <ViewFrame
@@ -108,6 +127,84 @@ export function SettingsView() {
             )}
             <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
               这里的名字与地址只来自网关自己的登记表；真钥匙在网关的库里，这一页读不到它。
+            </p>
+          </>
+        )}
+      </section>
+
+      <section className="border-b border-[var(--line)]">
+        <header className="flex items-center gap-3 px-4 py-2">
+          <h2 className="text-[12px]">上网检索与抓取</h2>
+          <span className="text-[11px] text-[var(--muted)]">
+            本机两层先答，答不上才按下面这个顺序问第三方，全答不上才用现网 LLM 自带的工具
+          </span>
+          <div className="ml-auto">
+            <Button tone="accent" onClick={openWebSearch}>
+              {pool.length > 0 ? '修改后备' : '配置后备'}
+            </Button>
+          </div>
+        </header>
+        {searchFallback.error ? (
+          <ReadError what="上网后备" error={searchFallback.error} onRetry={searchFallback.refresh} />
+        ) : !searchFallback.data ? (
+          <Loading what="上网后备" />
+        ) : (
+          <>
+            <Readings
+              from={{ what: searchFallback.what, at: searchFallback.at }}
+              source="GET /api/v1/admin/search-fallback"
+              caveat="这一格说「配了哪几条、哪条有钥匙」，不说「上游通不通」——通不通要真发一次检索才知道，读它的是 web_search 自己。"
+            >
+              <div className="flex flex-wrap py-2">
+                <Reading label="第三方后备" value={pool.length} />
+                <Reading
+                  label="已配钥匙"
+                  value={poolWithKey}
+                  tone={pool.length === 0 ? 'plain' : poolWithKey === pool.length ? 'ok' : 'warn'}
+                />
+                <Reading
+                  label="现网 LLM 自带工具"
+                  value={fromLlm.length}
+                  tone={fromLlm.length > 0 ? 'ok' : 'plain'}
+                  note="跟着现网 LLM 一起轮换，不在这里配"
+                />
+              </div>
+            </Readings>
+            {pool.length > 0 ? (
+              <Table
+                columns={[
+                  { key: 'order', title: '顺序', width: '56px', render: (u) => (
+                    <span className="mono text-[11px]">{u.order}</span>
+                  ) },
+                  { key: 'id', title: '名字', width: '140px', render: (u) => (
+                    <span className="mono text-[11px]">{u.id}</span>
+                  ) },
+                  { key: 'base', title: '地址', render: (u) => (
+                    <span className="mono text-[11px] text-[var(--paper-dim)]">{u.base_url}</span>
+                  ) },
+                  { key: 'capability', title: '用途', width: '110px', render: (u) => capabilityLabel(u.capability) },
+                  { key: 'key', title: '钥匙', width: '90px', render: (u) => (
+                    <span style={{ color: u.has_key ? 'var(--ok)' : 'var(--warn)' }}>
+                      {u.has_key ? '有' : '缺'}
+                    </span>
+                  ) },
+                ]}
+                rows={poolRows}
+                rowKey={(u) => `${u.order}|${u.id}|${u.base_url}`}
+              />
+            ) : (
+              <Empty>
+                还没有第三方后备：本机 SearXNG / crawl4ai 答不上时，这条路上没有别的东西可问。
+                点右上角「配置后备」开始。
+              </Empty>
+            )}
+            <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
+              顺序就是优先级，而且是一问一答的串行：上一条答出结果就不问下一条，所以后面的
+              不会因为前面的存在而被白花额度。钥匙只写不读——保存时网关把它写进带外 Secret，
+              这一页永远读不回明文；缺钥匙的那一条会被跳过，不会被当成「这家挂了」。
+              {fromLlm.length === 0 && (
+                <> 现网在用的 LLM 没有自带的上网工具面，所以最后一层现在也是空的。</>
+              )}
             </p>
           </>
         )}
