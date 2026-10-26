@@ -13,9 +13,15 @@
 //! `${...}` segment are all one wildcard, and a trailing `${...}` that is not a
 //! path segment (a query suffix) is dropped before comparing.
 //!
-//! 实测（2026-10-27）：客户端 82 条路径形状全部有服务端路由；网关一侧读到
-//! 224 条 `.route(...)`。消融对照：把 `web/src/api/client.ts` 里的
-//! `/api/v1/processes` 改成 `/api/v1/host-processes`，门点名该文件后红，改回即绿。
+//! Two clients ship and both are read: `web/src` (the WebUI) and the operator
+//! page embedded in the gateway binary, which calls the same router from
+//! JavaScript annotated nowhere.
+//!
+//! 实测（2026-10-27）：客户端路径形状全部有服务端路由（WebUI 82 条，内嵌运维页
+//! 另 35 条）；网关一侧读到 224 条 `.route(...)`。消融对照两条，各自点名对应文件
+//! 后红、改回即绿：`web/src/api/client.ts` 的 `/api/v1/processes` 改成
+//! `/api/v1/host-processes`；`crates/cog-gateway/src/takeover.html` 的
+//! `/api/v1/evolution/rollback` 改成 `/api/v1/evolution/rolled-back`。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -108,10 +114,14 @@ fn normalize(raw: &str) -> String {
     out
 }
 
-/// The paths the WebUI asks for, keyed by shape, with the files that ask.
+/// The paths the shipped clients ask for, keyed by shape, with the files that
+/// ask. Two clients ship in the image: the WebUI under `web/src`, and the
+/// operator page embedded in the gateway binary -- both call the same router,
+/// and neither is compiled against it.
 fn client_paths(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
     let mut files = Vec::new();
     walk(&root.join("web/src"), &["ts", "tsx"], &mut files);
+    walk(&root.join("crates/cog-gateway/src"), &["html"], &mut files);
     files.sort();
     let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for path in files {
