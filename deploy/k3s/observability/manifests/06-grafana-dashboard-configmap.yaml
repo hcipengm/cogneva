@@ -367,7 +367,7 @@ data:
           },
           "targets": [
             {
-              "expr": "clamp_min(llm_pool_evidenced_recovery_unix - time(), 0)",
+              "expr": "clamp_min(llm_pool_evidenced_recovery_unix - time(), 0) and ((time() - llm_pool_evidenced_recovery_unix_observed_timestamp_seconds) < 3600)",
               "legendFormat": "reset an upstream reported",
               "datasource": {
                 "type": "prometheus",
@@ -375,7 +375,7 @@ data:
               }
             },
             {
-              "expr": "clamp_min(llm_pool_next_attempt_unix - time(), 0)",
+              "expr": "clamp_min(llm_pool_next_attempt_unix - time(), 0) and ((time() - llm_pool_next_attempt_unix_observed_timestamp_seconds) < 3600)",
               "legendFormat": "when we probe again",
               "datasource": {
                 "type": "prometheus",
@@ -422,7 +422,7 @@ data:
               }
             },
             {
-              "expr": "clamp_min(llm_upstream_quota_reset_unix - time(), 0)",
+              "expr": "clamp_min(llm_upstream_quota_reset_unix - time(), 0) and ((time() - llm_upstream_quota_reset_unix_observed_timestamp_seconds) < 3600)",
               "legendFormat": "reset stated: {{upstream}}",
               "datasource": {
                 "type": "prometheus",
@@ -554,7 +554,7 @@ data:
           },
           "targets": [
             {
-              "expr": "max by (upstream) (llm_upstream_position)",
+              "expr": "max by (upstream) (llm_upstream_position) and on (upstream) ((time() - llm_upstream_position_observed_timestamp_seconds) < 3600)",
               "legendFormat": "{{upstream}}",
               "datasource": {
                 "type": "prometheus",
