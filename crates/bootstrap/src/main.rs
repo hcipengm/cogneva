@@ -314,6 +314,23 @@ async fn run(cmd: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// `run`, with a set of environment variables for that child only. The caller's
+/// environment is the installer's; a sub-script that has to agree with the
+/// manifests gets told what they say instead of inheriting a default.
+async fn run_with_env(cmd: &str, args: &[&str], envs: &[(&str, &str)]) -> Result<()> {
+    let status = Command::new(cmd)
+        .args(args)
+        .envs(envs.iter().copied())
+        .stdin(Stdio::null())
+        .status()
+        .await
+        .with_context(|| format!("无法执行 {cmd}"))?;
+    if !status.success() {
+        bail!("{cmd} {:?} 退出码 {:?}", args, status.code());
+    }
+    Ok(())
+}
+
 /// `run` with a document on stdin: `kubectl apply -f -` reads its objects from
 /// the pipe, so nothing is written to a temporary file whose lifetime or path
 /// could become the thing that is wrong.
@@ -1545,11 +1562,11 @@ async fn ensure_buildah_mirror() -> Result<()> {
 /// 仅 K3s 单节点走本机 `k3s ctr import` 快路径；K3s 多节点与 kubespray 标准
 /// K8s（单/多节点）都没有"本机即唯一节点"的前提，统一经镜像分发器 DaemonSet
 /// 逐节点导入宿主 containerd（分发器自动探测 ctr 二进制与 containerd socket）。
-async fn ensure_runtime_image(distro: Distro, multi: bool) -> Result<()> {
+async fn ensure_runtime_image(distro: Distro, multi: bool, namespace: &str) -> Result<()> {
     const IMAGE: &str = "localhost/cogneva:local";
     let local_fast_path = matches!(distro, Distro::K3s) && !multi;
     if !local_fast_path {
-        return distribute_image_to_nodes(IMAGE).await;
+        return distribute_image_to_nodes(IMAGE, namespace).await;
     }
     let present = Command::new("k3s")
         .args(["ctr", "-n", "k8s.io", "images", "ls", "-q"])
@@ -1707,7 +1724,7 @@ async fn try_import_prebuilt(image: &str) -> Result<()> {
 /// DaemonSet 在每节点用宿主 ctr 二进制导入宿主 containerd，全部就绪后清理。
 /// COGNEVA_IMAGE_REGISTRY 已配置 = 生产仓库供给，直接跳过（清单镜像引用
 /// 由运维自行对齐，见 deploy/k8s/README.md）。
-async fn distribute_image_to_nodes(image: &str) -> Result<()> {
+async fn distribute_image_to_nodes(image: &str, namespace: &str) -> Result<()> {
     if std::env::var("COGNEVA_IMAGE_REGISTRY").is_ok() {
         info!("COGNEVA_IMAGE_REGISTRY 已配置，假定生产仓库供给，跳过逐节点分发");
         return Ok(());
@@ -1720,7 +1737,7 @@ async fn distribute_image_to_nodes(image: &str) -> Result<()> {
             export_image_tar(image).await?
         }
     };
-    let result = distribute_via_daemonset(&tar).await;
+    let result = distribute_via_daemonset(&tar, namespace).await;
     let _ = std::fs::remove_dir_all(&workdir);
     result?;
     info!("镜像已分发到全部节点: {image}");
@@ -1728,8 +1745,8 @@ async fn distribute_image_to_nodes(image: &str) -> Result<()> {
 }
 
 /// 起镜像服务 Deployment → kubectl cp 注入 tar → DaemonSet 逐节点导入 → 清理。
-async fn distribute_via_daemonset(tar: &str) -> Result<()> {
-    let manifest = render_distributor_manifest().await?;
+async fn distribute_via_daemonset(tar: &str, namespace: &str) -> Result<()> {
+    let manifest = render_distributor_manifest(namespace).await?;
     let mdir = make_workdir("distributor")?;
     let mpath = mdir.join("image-distributor.yaml");
     std::fs::write(&mpath, &manifest)?;
@@ -1741,7 +1758,9 @@ async fn distribute_via_daemonset(tar: &str) -> Result<()> {
             "sh",
             &[
                 "-c",
-                "kubectl create namespace cogneva --dry-run=client -o yaml | kubectl apply -f -",
+                &format!(
+                    "kubectl create namespace {namespace} --dry-run=client -o yaml | kubectl apply -f -"
+                ),
             ],
         )
         .await?;
@@ -1754,15 +1773,15 @@ async fn distribute_via_daemonset(tar: &str) -> Result<()> {
         run(
             "kubectl",
             &[
-                "-n", "cogneva", "wait", "--for=condition=Available",
+                "-n", namespace, "wait", "--for=condition=Available",
                 "deployment/cogneva-image-server", "--timeout=600s",
             ],
         )
         .await?;
         let cp_cmd = format!(
-            "POD=$(kubectl -n cogneva get pod -l app=cogneva-image-server \
+            "POD=$(kubectl -n {namespace} get pod -l app=cogneva-image-server \
              -o jsonpath='{{.items[0].metadata.name}}') && \
-             kubectl -n cogneva cp '{tar}' \"$POD\":/share/image.tar.gz"
+             kubectl -n {namespace} cp '{tar}' \"$POD\":/share/image.tar.gz"
         );
         run("sh", &["-c", &cp_cmd]).await?;
         info!("触发/重发分发（rollout restart 保证重跑时重新导入）...");
@@ -1770,7 +1789,7 @@ async fn distribute_via_daemonset(tar: &str) -> Result<()> {
             "kubectl",
             &[
                 "-n",
-                "cogneva",
+                namespace,
                 "rollout",
                 "restart",
                 "daemonset/cogneva-image-distributor",
@@ -1782,7 +1801,7 @@ async fn distribute_via_daemonset(tar: &str) -> Result<()> {
             "kubectl",
             &[
                 "-n",
-                "cogneva",
+                namespace,
                 "rollout",
                 "status",
                 "daemonset/cogneva-image-distributor",
@@ -1802,7 +1821,7 @@ async fn distribute_via_daemonset(tar: &str) -> Result<()> {
 }
 
 /// 渲染镜像分发器清单（busybox 镜像名按网络模式替换后写出）。
-async fn render_distributor_manifest() -> Result<String> {
+async fn render_distributor_manifest(namespace: &str) -> Result<String> {
     let template = include_str!("../../../deploy/k8s/image-distributor.yaml");
     let busybox = if cn_mirror() {
         format!("{}/library/busybox:latest", docker_mirror_host().await)
@@ -1811,17 +1830,84 @@ async fn render_distributor_manifest() -> Result<String> {
     };
     Ok(template
         .replace("__BUSYBOX_IMAGE__", &busybox)
+        .replace("__NAMESPACE__", namespace)
         .replace("__IMAGE_TAG__", env!("CARGO_PKG_VERSION")))
+}
+
+/// 这套部署声明的命名空间，读自 chart 的 `global.namespace`。
+///
+/// 代码不抄这个名字。抄下来的那一份写在今天是对的，因为 `values.yaml` 里现在是
+/// `cogneva`；但它会动——运维把 `global.namespace` 改了、重新渲染之后，清单里的
+/// 对象会全部搬进新名字，而代码里每一处 `-n cogneva` 仍然去旧的名字里建、等、删、
+/// 读。这些命令没有一条会因为"走错了命名空间"报错：`get` 在空的命名空间里读到空集，
+/// `delete` 报 not found 之后照样退出 0，`create namespace` 甚至会顺手把旧名字重新
+/// 建出来。所以名字从声明里读，而且只读这一处。
+///
+/// 读 chart 而不是渲染产物，是因为这一步要在集群存在之前就能跑：管理计划在装机
+/// 之前生成，那时没有节点可供 `detect_profile` 判断 profile。chart 是拓扑的权威源，
+/// 渲染产物由它生成；两者是否一致由 `namespace_tests` 对着三份渲染清单逐个核对，
+/// 不靠这里"应该一样"的假设。
+fn declared_namespace() -> Result<String> {
+    declared_namespace_in(&repo_root())
+}
+
+fn declared_namespace_in(root: &Path) -> Result<String> {
+    let values = root.join("deploy/helm/cogneva/values.yaml");
+    let text = std::fs::read_to_string(&values)
+        .with_context(|| format!("读取 {} 失败", values.display()))?;
+    let parsed: serde_json::Value = serde_yaml::from_str(&text)
+        .with_context(|| format!("{} 不是可读的 YAML", values.display()))?;
+    let name = parsed
+        .pointer("/global/namespace")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .with_context(|| {
+            format!(
+                "{} 没有声明 `global.namespace`：引导器不猜一个命名空间往下走",
+                values.display()
+            )
+        })?;
+    Ok(name.to_string())
+}
+
+/// 清单文本里那个 Namespace 对象的名字。
+///
+/// 坏文档整体失败而不是跳过，理由同 `rendered_object_ids`：`serde_yaml` 出错时交回
+/// 的迭代项不推进游标，一次 `continue` 就是永不返回的循环。
+#[cfg(test)]
+fn namespace_declared_in(text: &str) -> Result<Option<String>> {
+    for doc in serde_yaml::Deserializer::from_str(text) {
+        let doc =
+            serde_yaml::Value::deserialize(doc).with_context(|| "清单里有读不出来的 YAML 文档")?;
+        let desired = serde_json::to_value(&doc)
+            .with_context(|| "清单文档无法表达成 JSON（如非字符串键）")?;
+        if desired.get("kind").and_then(|v| v.as_str()) != Some("Namespace") {
+            continue;
+        }
+        let name = desired
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|v| v.as_str())
+            .with_context(|| "Namespace 对象没有 metadata.name")?;
+        return Ok(Some(name.to_string()));
+    }
+    Ok(None)
 }
 
 /// 一只 Service 上某个具名端口的字段，读自清单刚 apply 出来的那只对象。
 ///
 /// 端口名取名字而不取第一个：同一个 Service 上挂着好几个端口，序号是排版，名字
 /// 才是声明。`field` 是 `nodePort` 或 `port`——读哪个由调用方决定，怎么读只有一份。
-async fn declared_service_port(service: &str, port_name: &str, field: &str) -> Result<u16> {
+async fn declared_service_port(
+    namespace: &str,
+    service: &str,
+    port_name: &str,
+    field: &str,
+) -> Result<u16> {
     let selector = format!("jsonpath={{.spec.ports[?(@.name==\"{port_name}\")].{field}}}");
     let out = Command::new("kubectl")
-        .args(["-n", "cogneva", "get", "svc", service, "-o", &selector])
+        .args(["-n", namespace, "get", "svc", service, "-o", &selector])
         .stdin(Stdio::null())
         .output()
         .await
@@ -1861,7 +1947,7 @@ fn parse_declared_port(reading: &str, what: &str) -> Result<u16> {
 /// 直推 NodePort（localhost http 免 TLS，多节点每节点都通）。
 /// 失败是硬失败：清单 pin 已在 registry，播种不成功四部署拉不到镜像；
 /// 给足重试，仍失败则让引导器带着明确错误退出（可修复后重跑，幂等）。
-async fn seed_cluster_registry() -> Result<()> {
+async fn seed_cluster_registry(namespace: &str) -> Result<()> {
     // This wait asks "has this machine got round to it yet", not "is the
     // registry broken": a blank install has only just finished importing the
     // image and the disk is still writing those pages back, so the registry
@@ -1873,7 +1959,7 @@ async fn seed_cluster_registry() -> Result<()> {
         "kubectl",
         &[
             "-n",
-            "cogneva",
+            namespace,
             "wait",
             "--for=condition=Available",
             "deployment/cogneva-registry",
@@ -1885,7 +1971,7 @@ async fn seed_cluster_registry() -> Result<()> {
         // Print what was on the machine when the budget ran out. Without it the
         // log says only "wait timed out" -- the same words whether the registry
         // is crash-looping or still pulling.
-        let _ = run("kubectl", &["-n", "cogneva", "get", "pods", "-o", "wide"]).await;
+        let _ = run("kubectl", &["-n", namespace, "get", "pods", "-o", "wide"]).await;
         return Err(e).context("等待集群内 registry 就绪超时（上面是超时那一刻的 Pod 现场）");
     }
     // k3s 是多调用二进制（argv0=ctr），标准 containerd 直接用 ctr。
@@ -1898,7 +1984,8 @@ async fn seed_cluster_registry() -> Result<()> {
     // 抄下来的数写在今天是对的，chart 改了 `clusterRegistry.nodePort` 之后就把基镜像
     // 推进一个没人听的端口，而四部署 pin 的还是清单里那个新数——播种报成功、Pod 一直
     // ImagePullBackOff。读的是 kubelet 将要拨的同一个 Service，两处不可能分开。
-    let node_port = declared_service_port("cogneva-registry", "registry", "nodePort").await?;
+    let node_port =
+        declared_service_port(namespace, "cogneva-registry", "registry", "nodePort").await?;
     let remote = format!("localhost:{node_port}/cogneva:local");
     let object = "localhost/cogneva:local";
     for attempt in 1..=3 {
@@ -1936,9 +2023,9 @@ async fn seed_cluster_registry() -> Result<()> {
 /// registry 播种发生在清单 apply 之后：四部署首轮拉取 :local 时镜像可能还没进
 /// registry，kubelet 已进入 ImagePullBackOff 退避（最长数分钟）。播种成功后
 /// 删除卡在镜像拉取失败状态的 Pod，让 ReplicaSet 立即重建并同步拉取，不等退避。
-async fn kick_image_pull_pending() -> Result<()> {
+async fn kick_image_pull_pending(namespace: &str) -> Result<()> {
     let output = Command::new("kubectl")
-        .args(["-n", "cogneva", "get", "pods", "-o", "json"])
+        .args(["-n", namespace, "get", "pods", "-o", "json"])
         .output()
         .await?;
     if !output.status.success() {
@@ -1991,7 +2078,7 @@ async fn kick_image_pull_pending() -> Result<()> {
     for pod in &pending {
         info!("registry 已播种，删除卡在镜像拉取的 Pod {pod} 触发立即重拉");
         let _ = Command::new("kubectl")
-            .args(["-n", "cogneva", "delete", "pod", pod, "--ignore-not-found"])
+            .args(["-n", namespace, "delete", "pod", pod, "--ignore-not-found"])
             .status()
             .await;
     }
@@ -2260,14 +2347,17 @@ async fn build_runtime_image_from_source(image: &str) -> Result<()> {
 /// 内部密钥（PostgreSQL/Redis/内部签名）安装时随机生成：预渲染产物不带
 /// Secret（secrets.create=false，避免每次 apply 轮换密码），这里幂等执行
 /// init-secrets 脚本，已存在的密钥（含带外写入的平台凭证）绝不覆盖。
-async fn ensure_internal_secrets() -> Result<()> {
+async fn ensure_internal_secrets(namespace: &str) -> Result<()> {
     let script = repo_root().join("deploy/scripts/init-secrets.sh");
     if !script.is_file() {
         bail!("密钥初始化脚本缺失: {}", script.display());
     }
     let script = script.to_string_lossy().into_owned();
     info!("初始化内部密钥（幂等，已有值不覆盖）");
-    run("bash", &[script.as_str()]).await
+    // The script defaults `COGNEVA_NS` to a name of its own; telling it what this
+    // deployment declares keeps the Secrets and the workloads they are mounted
+    // into in the same namespace when an operator moves that knob.
+    run_with_env("bash", &[script.as_str()], &[("COGNEVA_NS", namespace)]).await
 }
 
 /// 投递方式：预渲染清单 kubectl apply（引导链零 helm 依赖，命门链路最稳），
@@ -2291,10 +2381,10 @@ enum Delivery {
 ///   回滚管理）；本机没有 helm 就自动装（CN 走国内镜像，见 ensure_helm），
 ///   装不上才回落 apply；
 /// - 元启动自建集群 → 预渲染清单 apply（命门链路零额外下载，最稳）。
-async fn detect_delivery(cluster_existed: bool) -> Delivery {
+async fn detect_delivery(cluster_existed: bool, namespace: &str) -> Delivery {
     let helm = command_exists("helm").await;
     if helm {
-        match helm_release_status().await {
+        match helm_release_status(namespace).await {
             Some(status) if release_authorizes_helm(Some(&status)) => {
                 info!(
                     "投递探测: 检测到既有 helm release cogneva（{status}）→ helm upgrade（保持 release 管理）"
@@ -2311,7 +2401,7 @@ async fn detect_delivery(cluster_existed: bool) -> Delivery {
             None => {}
         }
     }
-    if let Some(found) = existing_cogneva_objects().await {
+    if let Some(found) = existing_cogneva_objects(namespace).await {
         info!(
             "投递探测: 已存在 cogneva 对象（{found}），没有走通的 helm release → 保持 apply（避免资源归属冲突与 tag 翻转）"
         );
@@ -2381,10 +2471,10 @@ fn first_cogneva_trace(listing: &str) -> Option<&str> {
 /// 自己的。所以对象面要从"工作负载"放宽到"这个命名空间里有没有 cogneva 的痕迹"。
 /// 放宽的方式是把 `TRACE_KINDS` 整片一次读回来，而不是手写一串名字：名字错了没人
 /// 报错，种类的键错了 kubectl 会拒（且测试会红）。
-async fn existing_cogneva_objects() -> Option<String> {
+async fn existing_cogneva_objects(namespace: &str) -> Option<String> {
     let kinds = TRACE_KINDS.join(",");
     let out = Command::new("kubectl")
-        .args(["-n", "cogneva", "get", &kinds, "-o", "name"])
+        .args(["-n", namespace, "get", &kinds, "-o", "name"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -2410,11 +2500,11 @@ const HELM_RELEASE_NAME: &str = "cogneva";
 
 /// 归属补标的 merge patch 体。构造与断言都用这几个常量，避免手写 JSON 与常量
 /// 各自漂移（打错了键名 helm 照样拒，而报错只会说"归属校验失败"）。
-fn helm_ownership_patch() -> String {
+fn helm_ownership_patch(namespace: &str) -> String {
     format!(
         "{{\"metadata\":{{\"labels\":{{\"{HELM_MANAGED_BY_KEY}\":\"{HELM_MANAGED_BY_VALUE}\"}},\
          \"annotations\":{{\"{HELM_RELEASE_NAME_KEY}\":\"{HELM_RELEASE_NAME}\",\
-         \"{HELM_RELEASE_NS_KEY}\":\"{HELM_RELEASE_NAME}\"}}}}}}"
+         \"{HELM_RELEASE_NS_KEY}\":\"{namespace}\"}}}}}}"
     )
 }
 
@@ -2444,9 +2534,9 @@ fn helm_ownership_patch() -> String {
 /// Secret 在 `secrets.create=false` 时并不随 chart 走）。渲染拿不到（`None`）时只补
 /// 命名空间——绿地路径本来就一个对象都不存在，其余情况交付自己的报错更准确。
 /// 补标用 merge patch，对象不存在时 kubectl 报 NotFound，按正常路径跳过。
-async fn ensure_helm_ownership(rendered: Option<&str>) -> Result<()> {
-    let patch = helm_ownership_patch();
-    let mut targets: Vec<String> = vec!["namespace/cogneva".to_string()];
+async fn ensure_helm_ownership(rendered: Option<&str>, namespace: &str) -> Result<()> {
+    let patch = helm_ownership_patch(namespace);
+    let mut targets: Vec<String> = vec![format!("namespace/{namespace}")];
     if let Some(text) = rendered {
         for id in rendered_object_ids(text)? {
             if !targets.contains(&id) {
@@ -2457,7 +2547,7 @@ async fn ensure_helm_ownership(rendered: Option<&str>) -> Result<()> {
     let mut targeted = 0;
     for kind in &targets {
         let out = Command::new("kubectl")
-            .args(["patch", kind, "-n", "cogneva", "--type=merge", "-p", &patch])
+            .args(["patch", kind, "-n", namespace, "--type=merge", "-p", &patch])
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .output()
@@ -2584,9 +2674,9 @@ async fn ensure_helm() -> bool {
 /// 用 `-o json` 而不是默认表格：`STATUS` 在表格里按空白列切，而 `UPDATED` 自带空格，
 /// 列位一旦错开就会把一列时间读成状态——判据读错列比读不到更坏，因为它照样给出
 /// 一个像样的字符串。
-async fn helm_release_status() -> Option<String> {
+async fn helm_release_status(namespace: &str) -> Option<String> {
     let out = Command::new("helm")
-        .args(["list", "-n", "cogneva", "-o", "json"])
+        .args(["list", "-n", namespace, "-o", "json"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -2619,16 +2709,16 @@ fn release_authorizes_helm(status: Option<&str>) -> bool {
     status == Some("deployed")
 }
 
-async fn deploy_manifests(cluster_existed: bool) -> Result<()> {
+async fn deploy_manifests(cluster_existed: bool, namespace: &str) -> Result<()> {
     let profile = detect_profile().await?;
     ensure_ingress_class_serves(profile).await?;
-    match detect_delivery(cluster_existed).await {
-        Delivery::Apply => deploy_via_apply(profile).await,
-        Delivery::Helm => deploy_via_helm(profile).await,
+    match detect_delivery(cluster_existed, namespace).await {
+        Delivery::Apply => deploy_via_apply(profile, namespace).await,
+        Delivery::Helm => deploy_via_helm(profile, namespace).await,
     }
 }
 
-async fn deploy_via_apply(profile: Profile) -> Result<()> {
+async fn deploy_via_apply(profile: Profile, namespace: &str) -> Result<()> {
     let dir = rendered_manifest_dir(profile);
     if !dir.is_dir() {
         bail!(
@@ -2636,7 +2726,7 @@ async fn deploy_via_apply(profile: Profile) -> Result<()> {
             dir.display()
         );
     }
-    ensure_internal_secrets().await?;
+    ensure_internal_secrets(namespace).await?;
     let rendered = render_manifests_for_cluster(&dir).await?;
     info!(
         "apply {} profile 清单（已按网络环境适配）",
@@ -2649,7 +2739,9 @@ async fn deploy_via_apply(profile: Profile) -> Result<()> {
         "sh",
         &[
             "-c",
-            "kubectl create namespace cogneva --dry-run=client -o yaml | kubectl apply -f -",
+            &format!(
+                "kubectl create namespace {namespace} --dry-run=client -o yaml | kubectl apply -f -"
+            ),
         ],
     )
     .await?;
@@ -2657,11 +2749,11 @@ async fn deploy_via_apply(profile: Profile) -> Result<()> {
     // apply 的输入集合、保留既有绑定并报出差异，否则一份改过的声明会被准入拒绝，
     // 而 `kubectl apply -f <目录>` 一处失败即中止整批——改过声明量的那几份卷就能
     // 把整套清单的安装一起打停。其余资源不受影响，仍整目录 apply。
-    let kept = retain_existing_claims(&rendered).await?;
+    let kept = retain_existing_claims(&rendered, namespace).await?;
     // 同类问题、另一条判据：清单把某个 env 从字面量改成 valueFrom 后，对象上那份
     // 残留的 value 会让整批 apply 在这一处中止（理由见函数注释）。它和卷声明一样，
     // 必须在交付前处理，改清单本身解决不了。
-    let cleared = clear_superseded_env_values_in_dir(&rendered).await?;
+    let cleared = clear_superseded_env_values_in_dir(&rendered, namespace).await?;
     if cleared > 0 {
         info!(
             count = cleared,
@@ -2689,7 +2781,7 @@ async fn deploy_via_apply(profile: Profile) -> Result<()> {
 /// 贴近事实。
 ///
 /// 返回摘掉（即已存在）的卷声明条数。
-async fn retain_existing_claims(rendered: &Path) -> Result<usize> {
+async fn retain_existing_claims(rendered: &Path, namespace: &str) -> Result<usize> {
     let mut kept = 0usize;
     for entry in std::fs::read_dir(rendered)? {
         let path = entry?.path();
@@ -2702,7 +2794,7 @@ async fn retain_existing_claims(rendered: &Path) -> Result<usize> {
         };
         // 取不到在用值（不存在、查询失败、集群不可达）就当不存在，交给 apply 去
         // 创建：集群真的不可达时后续 apply 会报出真实错误，不在这里吞掉。
-        let Some(live) = live_claim_storage(&name).await else {
+        let Some(live) = live_claim_storage(&name, namespace).await else {
             continue;
         };
         if declared.as_deref().and_then(quantity_bytes) != quantity_bytes(&live) {
@@ -2731,7 +2823,7 @@ async fn retain_existing_claims(rendered: &Path) -> Result<usize> {
 ///
 /// 判据在 `cog_core::contract::env_supersede`（纯函数、带测试）：只有"清单声明
 /// 了 valueFrom、对象上同名条目还带 value"才动手，其余一律不碰。
-async fn clear_superseded_env_values_in_dir(rendered: &Path) -> Result<usize> {
+async fn clear_superseded_env_values_in_dir(rendered: &Path, namespace: &str) -> Result<usize> {
     let mut cleared = 0usize;
     for entry in std::fs::read_dir(rendered)? {
         let path = entry?.path();
@@ -2739,13 +2831,13 @@ async fn clear_superseded_env_values_in_dir(rendered: &Path) -> Result<usize> {
             continue;
         }
         let text = std::fs::read_to_string(&path)?;
-        cleared += clear_superseded_env_values(&text).await?;
+        cleared += clear_superseded_env_values(&text, namespace).await?;
     }
     Ok(cleared)
 }
 
 /// 同上，输入是清单文本（helm template 的整份输出）。返回清掉的字段数。
-async fn clear_superseded_env_values(text: &str) -> Result<usize> {
+async fn clear_superseded_env_values(text: &str, namespace: &str) -> Result<usize> {
     let mut cleared = 0usize;
     for doc in serde_yaml::Deserializer::from_str(text) {
         // 坏文档不许"跳过它继续下一条"：`serde_yaml` 解析出错时交回的迭代项**不推进
@@ -2764,7 +2856,7 @@ async fn clear_superseded_env_values(text: &str) -> Result<usize> {
         let namespace = workload
             .namespace
             .clone()
-            .unwrap_or_else(|| "cogneva".to_string());
+            .unwrap_or_else(|| namespace.to_string());
         // 读不到现状（对象还不存在、查询失败）就什么都不做：首次安装本来就没有残留，
         // 集群不可达时后续交付会报出真实错误，不在这里吞掉。
         let Some(live) = live_object(&kind, &name, &namespace).await else {
@@ -2853,11 +2945,11 @@ fn claim_declaration(text: &str) -> Option<(String, Option<String>)> {
 
 /// 集群里这条卷声明在用的 requests.storage。查不到（不存在、kubectl 失败、
 /// 集群不可达）返回 None——调用方按"不存在"处理，由后续 apply 报出真实错误。
-async fn live_claim_storage(name: &str) -> Option<String> {
+async fn live_claim_storage(name: &str, namespace: &str) -> Option<String> {
     let out = Command::new("kubectl")
         .args([
             "-n",
-            "cogneva",
+            namespace,
             "get",
             "pvc",
             name,
@@ -2883,7 +2975,7 @@ async fn live_claim_storage(name: &str) -> Option<String> {
 /// secrets.create=false，这里改回 true——helm install 时 lookup+randAlphaNum
 /// 安装时生成密钥（升级复用既有 Secret，不轮换），无需 init-secrets.sh。
 /// CN 网络用 --post-renderer 复用与 apply 路径同一张镜像/seed 替换表。
-async fn deploy_via_helm(profile: Profile) -> Result<()> {
+async fn deploy_via_helm(profile: Profile, namespace: &str) -> Result<()> {
     let chart = repo_root().join("deploy/helm/cogneva");
     let values = repo_root().join(format!(
         "deploy/helm/cogneva/profiles/{}.yaml",
@@ -2904,7 +2996,7 @@ async fn deploy_via_helm(profile: Profile) -> Result<()> {
     }
     // 交付与预渲染必须拿到**逐字相同**的入参集合，否则清理所依据的清单不是交付的
     // 那一份（镜像站覆盖差异尤其隐蔽：渲染少一个 --set，对象与清单就对不上）。
-    let common = helm_common_args(&chart, &values, &overrides);
+    let common = helm_common_args(&chart, &values, &overrides, namespace);
     let args = helm_upgrade_args(&common);
 
     // 交付前先渲染一遍：既给残留 env 清理提供"将交付什么"的事实——最典型的是 env
@@ -2917,9 +3009,9 @@ async fn deploy_via_helm(profile: Profile) -> Result<()> {
     }
     // 补归属标记必须在交付**之前**：库里已有、却缺 release 三件套的对象会让 helm
     // 拒绝升级（详见 ensure_helm_ownership）。
-    ensure_helm_ownership(rendered.as_deref().ok()).await?;
+    ensure_helm_ownership(rendered.as_deref().ok(), namespace).await?;
     if let Ok(text) = &rendered {
-        let cleared = clear_superseded_env_values(text).await?;
+        let cleared = clear_superseded_env_values(text, namespace).await?;
         if cleared > 0 {
             info!(
                 count = cleared,
@@ -2948,7 +3040,12 @@ async fn deploy_via_helm(profile: Profile) -> Result<()> {
 /// helm 投递的集群上关掉它，交付路径只剩 helm 一个写者；apply 投递的集群由
 /// `deploy/k3s` 里的 `COGNEVA_MAINLINE_DEPLOYER_ENABLED=true` 打开，那条链上
 /// 只有 kubectl apply 一个写者。
-fn helm_common_args(chart: &Path, values: &Path, overrides: &[(String, String)]) -> Vec<String> {
+fn helm_common_args(
+    chart: &Path,
+    values: &Path,
+    overrides: &[(String, String)],
+    namespace: &str,
+) -> Vec<String> {
     // 额度产物按 profile 各一份（同一份清单在不同拓扑下声明的卷不同，投影也就
     // 不是同一个数），文件名的主干与 profile values 相同。
     let governed_values = chart.join(format!(
@@ -2959,10 +3056,10 @@ fn helm_common_args(chart: &Path, values: &Path, overrides: &[(String, String)])
             .unwrap_or_default()
     ));
     let mut out: Vec<String> = vec![
-        "cogneva".into(),
+        HELM_RELEASE_NAME.into(),
         chart.to_string_lossy().into_owned(),
         "-n".into(),
-        "cogneva".into(),
+        namespace.into(),
         "-f".into(),
         values.to_string_lossy().into_owned(),
         // 额度不写在 values.yaml 里，它是渲染集的投影产物（见
@@ -3235,13 +3332,13 @@ fn chart_values() -> Result<serde_yaml::Value> {
 ///
 /// 对象不存在按"该组件未部署"处理：chart 支持 `securityGateway.enabled=false`，
 /// 而这里拿不到对象时无法区分"被关掉"与"没建出来"。
-async fn wait_ready() -> Result<()> {
+async fn wait_ready(namespace: &str) -> Result<()> {
     let mut not_ready = Vec::new();
     for deploy in ["cogneva", "cogneva-security-gateway"] {
         let out = Command::new("kubectl")
             .args([
                 "-n",
-                "cogneva",
+                namespace,
                 "rollout",
                 "status",
                 &format!("deployment/{deploy}"),
@@ -3270,10 +3367,10 @@ async fn wait_ready() -> Result<()> {
     if !not_ready.is_empty() {
         let hints: Vec<String> = not_ready
             .iter()
-            .map(|d| format!("kubectl -n cogneva logs deploy/{d} --tail=100"))
+            .map(|d| format!("kubectl -n {namespace} logs deploy/{d} --tail=100"))
             .collect();
         bail!(
-            "部署未就绪（{}），装机未完成：kubectl -n cogneva get pods -o wide; {}",
+            "部署未就绪（{}），装机未完成：kubectl -n {namespace} get pods -o wide; {}",
             not_ready.join(", "),
             hints.join("; ")
         );
@@ -3392,12 +3489,12 @@ async fn open_browser(url: &str) {
 /// （--address 0.0.0.0），再经 Lima portForwards / WSL localhostForwarding
 /// 到达宿主浏览器；裸 Linux 上则直接对外提供 WebUI 入口。
 /// 端口已在监听则跳过；失败仅告警并打印手动命令，不影响自毁退出。
-async fn ensure_port_forward(webui: &str) {
+async fn ensure_port_forward(webui: &str, namespace: &str) {
     // 宿主这一侧监听哪个端口取自 WebUI 地址（操作者要看的那条 URL），Service 那一侧
     // 的端口取自 Service 自己：`8080` 曾经写死在这里，等于把 `gateway.httpPort` 抄了
     // 一份——values 挪了端口之后，port-forward 把浏览器转到 Service 上没有的端口，
     // 而这条命令自己报「已建立」。
-    let target = match declared_service_port("cogneva", "http", "port").await {
+    let target = match declared_service_port(namespace, "cogneva", "http", "port").await {
         Ok(port) => port,
         Err(e) => {
             warn!("读不到 svc/cogneva 的 http 端口，这次不建 port-forward：{e:#}");
@@ -3420,7 +3517,7 @@ async fn ensure_port_forward(webui: &str) {
     match Command::new("kubectl")
         .args([
             "-n",
-            "cogneva",
+            namespace,
             "port-forward",
             "--address",
             "0.0.0.0",
@@ -3435,7 +3532,7 @@ async fn ensure_port_forward(webui: &str) {
         Ok(_) => info!("已后台建立 port-forward: 0.0.0.0:{port} → svc/cogneva:{target}"),
         Err(e) => warn!(
             "自动 port-forward 失败（{e}），请手动执行: \
-             kubectl -n cogneva port-forward --address 0.0.0.0 svc/cogneva {spec}"
+             kubectl -n {namespace} port-forward --address 0.0.0.0 svc/cogneva {spec}"
         ),
     }
 }
@@ -3540,6 +3637,13 @@ async fn main() -> Result<()> {
     std::fs::write(&intent_path, serde_yaml::to_string(&intent)?)?;
     info!("已生成 {intent_path}");
 
+    // Settle the namespace here, before anything is written to the cluster: it is
+    // a fact this chart declares, and every kubectl/helm call below reads this
+    // copy instead of one of its own. Reading it needs no cluster, so the
+    // management plan written just below can carry the same name.
+    let namespace = declared_namespace()?;
+    info!("部署命名空间 {namespace}（读自 chart 的 global.namespace）");
+
     // k8m 管理计划（审计 2.5.2/2.5.3）：统一声明式部署计划 + backend 自动选择。
     let plan = cogneva_bootstrap::ManagementPlan::for_environment(
         std::env::var("COGNEVA_ENV").unwrap_or_else(|_| "default".into()),
@@ -3549,6 +3653,7 @@ async fn main() -> Result<()> {
             nodes: hw.nodes as u32,
         },
         decision.distro,
+        namespace.as_str(),
     );
     let plan_path =
         std::env::var("COGNEVA_MANAGEMENT_PLAN").unwrap_or_else(|_| "management_plan.yaml".into());
@@ -3574,12 +3679,12 @@ async fn main() -> Result<()> {
     } else {
         ensure_git_remote().await?;
     }
-    ensure_runtime_image(decision.distro, decision.multi).await?;
-    deploy_manifests(cluster_existed).await?;
+    ensure_runtime_image(decision.distro, decision.multi, &namespace).await?;
+    deploy_manifests(cluster_existed, &namespace).await?;
     // 清单 apply 后 registry 才存在；四部署 pin registry :local，播种是硬依赖。
-    seed_cluster_registry().await?;
-    kick_image_pull_pending().await?;
-    wait_ready().await?;
+    seed_cluster_registry(&namespace).await?;
+    kick_image_pull_pending(&namespace).await?;
+    wait_ready(&namespace).await?;
     // After wait_ready: every node is registered and Running, so a node whose
     // account cannot be read is a broken reading, not a node that has not
     // joined yet.
@@ -3587,7 +3692,7 @@ async fn main() -> Result<()> {
 
     let webui =
         std::env::var("COGNEVA_WEBUI_URL").unwrap_or_else(|_| "http://localhost:8080".into());
-    ensure_port_forward(&webui).await;
+    ensure_port_forward(&webui, &namespace).await;
     info!("部署完成，WebUI 地址: {webui}");
     maybe_warn_outdated().await;
     if !noninteractive {
@@ -3596,6 +3701,124 @@ async fn main() -> Result<()> {
 
     info!("引导器使命完成，退出");
     Ok(())
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    fn tree() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    /// 三条投递路径交付的是同一份声明：每套渲染清单里的 Namespace 对象必须就是
+    /// `declared_namespace()` 读到的那个名字。
+    ///
+    /// 这条断言对着的是"读到的"与"要交付的"之间那一段：profile 覆盖、渲染脚本、
+    /// values 改名，任何一处把名字挪了而另一处没挪，引导器就会去一个清单没写的
+    /// 命名空间里建、等、删、读——每一处都退出 0，没有一处报错。
+    #[test]
+    fn every_rendered_profile_delivers_the_declared_namespace() {
+        let declared = declared_namespace_in(&tree()).unwrap();
+        assert!(!declared.trim().is_empty(), "声明的命名空间是空串");
+        let root = tree().join("deploy/rendered");
+        let mut checked = 0;
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&root)
+            .unwrap_or_else(|e| panic!("{}: {e}", root.display()))
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        entries.sort();
+        for dir in entries {
+            let mut found: Vec<(std::path::PathBuf, String)> = Vec::new();
+            for file in std::fs::read_dir(&dir).unwrap() {
+                let path = file.unwrap().path();
+                if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                if let Some(name) = namespace_declared_in(&text).unwrap() {
+                    found.push((path, name));
+                }
+            }
+            assert_eq!(
+                found.len(),
+                1,
+                "{} 里应当恰好声明一个 Namespace：{found:?}",
+                dir.display()
+            );
+            assert_eq!(
+                found[0].1,
+                declared,
+                "{} 交付的命名空间与 chart 的 global.namespace 不一致",
+                dir.display()
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 3, "三套 profile 都要核对，实际核对了 {checked} 套");
+    }
+
+    /// profile 覆盖不许改命名空间：管理计划在集群存在之前用 chart 的默认值生成，
+    /// 某个 profile 一旦在这里覆盖，计划与真正交付的对象就会落在两个命名空间里。
+    #[test]
+    fn no_profile_overrides_the_declared_namespace() {
+        let root = tree().join("deploy/helm/cogneva/profiles");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&root).unwrap_or_else(|e| panic!("{}: {e}", root.display()))
+        {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let parsed: serde_json::Value = serde_yaml::from_str(&text)
+                .unwrap_or_else(|e| panic!("{} 不是可读的 YAML: {e}", path.display()));
+            assert!(
+                parsed.pointer("/global/namespace").is_none(),
+                "{} 覆盖了 global.namespace：管理计划读的是 chart 默认值，覆盖之后计划与\
+                 交付会分叉",
+                path.display()
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, 3, "三套 profile 都要核对，实际核对了 {seen} 套");
+    }
+
+    /// 多文档一次读：只认 Namespace 那一条。别的 kind 带的 `namespace:` 是对象落在
+    /// 哪里，不是这套部署的落点。
+    #[test]
+    fn the_namespace_is_read_from_the_namespace_object_only() {
+        let text =
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\n  namespace: elsewhere\n\
+                    ---\napiVersion: v1\nkind: Namespace\nmetadata:\n  name: landed\n";
+        assert_eq!(
+            namespace_declared_in(text).unwrap().as_deref(),
+            Some("landed")
+        );
+        assert_eq!(
+            namespace_declared_in("apiVersion: v1\nkind: Service\nmetadata:\n  name: s\n").unwrap(),
+            None
+        );
+    }
+
+    /// 分发器清单是引导器唯一一份运行时替换的 YAML 模板。它的命名空间也必须是
+    /// 占位符：模板里留着字面量时，`-n <declared>` 的那些命令与 `kubectl apply`
+    /// 建出来的对象会分处两个命名空间，而分发器照样启动、只是永远等不到那个 Pod。
+    #[test]
+    fn the_distributor_template_leaves_the_namespace_to_the_installer() {
+        let template = include_str!("../../../deploy/k8s/image-distributor.yaml");
+        let declared = declared_namespace_in(&tree()).unwrap();
+        let literal = format!("namespace: {declared}");
+        assert!(
+            !template.lines().any(|l| l.trim().starts_with(&literal)),
+            "分发器模板里写着 `{literal}`：这份模板由引导器渲染，命名空间要留占位符"
+        );
+        assert!(
+            template.contains("namespace: __NAMESPACE__"),
+            "分发器模板没有 `__NAMESPACE__` 占位符"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3939,7 +4162,8 @@ mod cn_image_tests {
     #[test]
     fn helm_ownership_patch_carries_the_three_marks() {
         let patch: serde_json::Value =
-            serde_json::from_str(&super::helm_ownership_patch()).expect("补标 JSON 不可解析");
+            serde_json::from_str(&super::helm_ownership_patch("cogneva"))
+                .expect("补标 JSON 不可解析");
         let meta = &patch["metadata"];
         assert_eq!(meta["labels"]["app.kubernetes.io/managed-by"], "Helm");
         assert_eq!(meta["annotations"]["meta.helm.sh/release-name"], "cogneva");
@@ -4224,7 +4448,7 @@ mod node_qos_wiring_tests {
             .find("warn_if_nodes_hold_back_nothing().await")
             .expect("main 没有读回节点的内存账");
         let ready_at = body
-            .find("wait_ready().await")
+            .find("wait_ready(&namespace).await")
             .expect("main 没有等待工作负载就绪");
         assert!(
             ready_at < read_at,
@@ -4283,7 +4507,10 @@ mod ingress_preflight_tests {
         let check_at = body
             .find("ensure_ingress_class_serves(profile).await")
             .expect("deploy_manifests 没有做前门校验");
-        for delivery in ["deploy_via_apply(profile)", "deploy_via_helm(profile)"] {
+        for delivery in [
+            "deploy_via_apply(profile, namespace)",
+            "deploy_via_helm(profile, namespace)",
+        ] {
             let at = body
                 .find(delivery)
                 .unwrap_or_else(|| panic!("deploy_manifests 没有调用 {delivery}"));
@@ -4310,6 +4537,7 @@ mod helm_delivery_single_writer_tests {
             Path::new("/repo/deploy/helm/cogneva"),
             Path::new("/repo/deploy/helm/cogneva/profiles/k3s-single.yaml"),
             &[],
+            "cogneva",
         );
         let sets: Vec<&str> = args
             .windows(2)
@@ -4335,6 +4563,7 @@ mod helm_delivery_single_writer_tests {
             Path::new("/repo/deploy/helm/cogneva"),
             Path::new("/repo/deploy/helm/cogneva/profiles/k3s-single.yaml"),
             &[],
+            "cogneva",
         );
         let args = helm_upgrade_args(&common);
         assert_eq!(args[0], "upgrade");

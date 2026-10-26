@@ -76,6 +76,10 @@ pub struct ManagementPlan {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanSpec {
+    /// The namespace the deployment declares. The plan is what the sync path
+    /// hands to helm, so it carries the name the chart declares instead of
+    /// writing one of its own.
+    pub namespace: String,
     pub branch: PlanBranch,
     pub image_tag: String,
     pub gateway_replicas: u32,
@@ -170,6 +174,7 @@ impl ManagementPlan {
         environment: impl Into<String>,
         hw: &HardwareProfile,
         distro: Distro,
+        namespace: impl Into<String>,
     ) -> Self {
         let environment = environment.into();
         let branch = decide_branch(hw, distro);
@@ -181,6 +186,7 @@ impl ManagementPlan {
                 environment,
             },
             spec: PlanSpec {
+                namespace: namespace.into(),
                 branch,
                 image_tag: env!("CARGO_PKG_VERSION").into(),
                 gateway_replicas: match branch {
@@ -246,7 +252,7 @@ impl ManagementPlan {
             self.metadata.name.clone(),
             "deploy/helm/cogneva".to_string(),
             "-n".to_string(),
-            "cogneva".to_string(),
+            self.spec.namespace.clone(),
             "--create-namespace".to_string(),
             "-f".to_string(),
             tmp.to_string_lossy().to_string(),
@@ -873,7 +879,7 @@ mod tests {
 
     #[test]
     fn plan_yaml_roundtrip() {
-        let plan = ManagementPlan::for_environment("prod", &hw(16, 3), Distro::K3s);
+        let plan = ManagementPlan::for_environment("prod", &hw(16, 3), Distro::K3s, "cogneva");
         let yaml = plan.to_yaml().unwrap();
         assert!(yaml.contains("k8m.cogneva/v1alpha1"));
         assert!(yaml.contains("ManagementPlan"));
@@ -884,7 +890,8 @@ mod tests {
 
     #[test]
     fn kubespray_plan_is_k8s_standard() {
-        let plan = ManagementPlan::for_environment("prod", &hw(16, 3), Distro::Kubespray);
+        let plan =
+            ManagementPlan::for_environment("prod", &hw(16, 3), Distro::Kubespray, "cogneva");
         assert_eq!(plan.spec.branch, PlanBranch::K8sStandard);
         assert_eq!(plan.spec.gateway_replicas, 3);
         let yaml = plan.to_yaml().unwrap();
@@ -901,12 +908,13 @@ mod tests {
 
     #[test]
     fn branch_serialization_uses_profile_names() {
-        let single = ManagementPlan::for_environment("edge", &hw(1, 1), Distro::K3s);
-        let multi = ManagementPlan::for_environment("prod", &hw(16, 3), Distro::K3s);
+        let single = ManagementPlan::for_environment("edge", &hw(1, 1), Distro::K3s, "cogneva");
+        let multi = ManagementPlan::for_environment("prod", &hw(16, 3), Distro::K3s, "cogneva");
         assert!(single.to_yaml().unwrap().contains("k3s-single"));
         assert!(multi.to_yaml().unwrap().contains("k3s-multi"));
         // 标准 K8s 形态序列化为 k8s-standard，与 Helm profile 同名。
-        let stdk8s = ManagementPlan::for_environment("prod", &hw(16, 3), Distro::Kubespray);
+        let stdk8s =
+            ManagementPlan::for_environment("prod", &hw(16, 3), Distro::Kubespray, "cogneva");
         assert!(stdk8s.to_yaml().unwrap().contains("k8s-standard"));
     }
 
@@ -1345,7 +1353,7 @@ mod tests {
 
     #[test]
     fn helm_values_reflect_enabled_backends() {
-        let plan = ManagementPlan::for_environment("edge", &hw(1, 1), Distro::K3s);
+        let plan = ManagementPlan::for_environment("edge", &hw(1, 1), Distro::K3s, "cogneva");
         let values = plan.to_helm_values();
         assert_eq!(values["gateway"]["replicas"], serde_json::json!(1));
         assert_eq!(
