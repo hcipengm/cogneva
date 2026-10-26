@@ -76,6 +76,17 @@ What this deliberately does not catch:
   * A test that narrows inside the predicate (`assert!(all.iter().all(|r| r.name
     == own_name))`) is scoped correctly and is not seen as scoped here — there is
     no `.filter` to find, so it is not even counted.
+
+    Widening the judged shape past `.len()` was measured, not waved off. Loose
+    version -- zero-argument read, an assertion anywhere after it: 89 lines
+    across the population. Sharpened to "the assertion itself names that
+    variable and uses `.iter()` / `.is_empty()` / `vec![`": 9 lines, and two of
+    those nine are not reads at all (`to_string()`, `read_latest_drill()`), because
+    "takes no arguments" is not "walks a table". The ones that are reads are
+    already scoped by construction -- `change_ledger_store.rs` narrows through a
+    `marker` prefix inside an `order()` closure before asserting on the `vec!`.
+    A census that prints nine lines of which two are noise is read once and
+    skipped after that, so the shape stays prose.
   * `assert!(all(0).is_empty())` is not judged: `LIMIT 0` returning no rows is
     the interface's contract and has nothing to do with how full the table is.
     Only "row count equals a literal" is judged.
