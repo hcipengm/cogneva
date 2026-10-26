@@ -252,9 +252,23 @@ async fn every_dataset_walks_out_newest_first() {
         .await
         .expect("register");
 
-    let all = probe.catalog.all(10).await.expect("walk every dataset");
-    assert_eq!(all.len(), 2);
-    assert_eq!(all[0].version, "v2", "最新的不在最前：{:?}", all);
+    // A wide walk on purpose: the probe's rows have to be inside it whatever else
+    // the catalog holds, and the limit itself is covered by the `all(0)` below.
+    let all = probe.catalog.all(1000).await.expect("walk every dataset");
+    // `all` answers for the whole catalog, and this database is shared with every
+    // other test that registers a dataset and with whatever an earlier run left
+    // behind when it failed before its cleanup. Counting the walk outright turns
+    // any of those rows into a defect of this test -- measured 2026-10-26 on CI:
+    // "left 4, right 2", and the run that tripped it never reached its own
+    // `cleanup`, so every run after that would have failed the same way. Ask the
+    // question this test can actually answer: are this probe's rows there, and is
+    // the newest of them first.
+    let mine: Vec<_> = all
+        .iter()
+        .filter(|entry| entry.name == probe.name)
+        .collect();
+    assert_eq!(mine.len(), 2, "这次写的两行没都读回来：{all:?}");
+    assert_eq!(mine[0].version, "v2", "最新的不在最前：{:?}", mine);
     let zero = probe.catalog.all(0).await.expect("limit 0");
     assert!(zero.is_empty(), "limit 0 读成了「不限」：{zero:?}");
     cleanup(&probe).await;

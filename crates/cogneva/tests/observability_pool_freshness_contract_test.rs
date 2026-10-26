@@ -181,7 +181,7 @@ fn panel_expressions() -> Vec<(String, String)> {
                         path.display()
                     )
                 });
-                walk_panels(&dashboard_name.to_string(), &dashboard, &mut out);
+                walk_panels(dashboard_name, &dashboard, &mut out);
             }
         }
     }
