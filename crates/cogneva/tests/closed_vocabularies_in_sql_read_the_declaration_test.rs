@@ -113,6 +113,10 @@ fn parses_as_producer_trigger(word: &str) -> bool {
     cog_observability::producer_heartbeat::ProducerTrigger::parse(word).is_some()
 }
 
+fn parses_as_schema_kind(word: &str) -> bool {
+    cog_core::SchemaKind::parse(word).is_some()
+}
+
 /// One closed set of words and the columns a query asks about it with.
 struct Vocabulary {
     /// The column names this vocabulary is stored under. The subject is the
@@ -268,6 +272,14 @@ const VOCABULARIES: &[Vocabulary] = &[
         subjects: &["trigger"],
         parses: parses_as_producer_trigger,
         home: "cog_observability::producer_heartbeat::ProducerTrigger",
+        except_in: &[],
+    },
+    Vocabulary {
+        // The memory schema's row type. A relation query that names an old word
+        // returns no rows, which is what an entity with no relations returns.
+        subjects: &["kind"],
+        parses: parses_as_schema_kind,
+        home: "cog_core::SchemaKind",
         except_in: &[],
     },
 ];
@@ -654,6 +666,10 @@ fn each_vocabulary_reads_its_own_declaration() {
         assert!(parses_as_producer_trigger(trigger.as_str()));
     }
     assert!(!parses_as_producer_trigger("manual_run"));
+    for kind in cog_core::SchemaKind::ALL {
+        assert!(parses_as_schema_kind(kind.as_str()));
+    }
+    assert!(!parses_as_schema_kind("relation_type"));
     assert!(!parses_as_backup_outcome("firing"));
     assert!(!parses_as_notification_type("promoted"));
     // A word from another set is not this set's: the judge has to be a set, not

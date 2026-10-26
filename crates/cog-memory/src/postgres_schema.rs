@@ -13,9 +13,9 @@ use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
 use std::time::Duration;
 
+use cog_core::{fill_slots, SchemaEntry, SchemaKind, SchemaSearchResult, SourceRef};
 use cog_core::{merge_schema_observation, SchemaBackend};
 use cog_core::{SFError, SFResult};
-use cog_core::{SchemaEntry, SchemaKind, SchemaSearchResult, SourceRef};
 
 /// SQL DDL applied by [`PostgresSchemaBackend::init_table`].
 pub const SCHEMA_ENTRIES_DDL: &str = r#"
@@ -72,6 +72,38 @@ const ENTRY_COLUMNS: &str = "namespace, id, kind, name, key, properties, raw_uri
                              extractor_version, extracted_at, confidence, importance, \
                              observed_by, occurrences, first_seen, last_seen, \
                              retrieval_count, last_retrieved_at";
+
+/// The relation query, with a slot per word it says out loud.
+///
+/// The row's kind and the three direction words are declared in cog-core; this
+/// statement only writes them down. Spelled here, a renamed variant would leave
+/// the query matching nothing — which is exactly what an entity with no
+/// relations returns.
+const RELATIONS_SQL_TEMPLATE: &str = r#"
+            SELECT namespace, id, kind, name, key, properties, raw_uri, range_spec,
+                   extractor_version, extracted_at, confidence, importance
+            FROM schema_entries
+            WHERE namespace = $1 AND kind = '{kind:relation}'
+              AND (
+                  ($2 = '{dir:from}' AND properties ->> 'from' = $3)
+                  OR ($2 = '{dir:to}' AND properties ->> 'to' = $3)
+                  OR ($2 = '{dir:both}' AND (properties ->> 'from' = $3 OR properties ->> 'to' = $3))
+              )
+              AND ($4::TEXT IS NULL OR properties ->> 'relation_type' = $4)
+            "#;
+
+/// 关系查询要填的槽：行的 `kind` 与三个方向词。
+///
+/// 两族词都在 cog-core 里声明；这条查询只是把它们写进语句，不再自己拼一遍。
+fn direction_slots() -> Vec<(&'static str, &'static str)> {
+    let mut slots = vec![("kind", SchemaKind::Relation.as_str())];
+    slots.extend(
+        cog_core::RelationDirection::ALL
+            .iter()
+            .map(|direction| ("dir", direction.as_str())),
+    );
+    slots
+}
 
 /// PostgreSQL-backed Schema layer.
 /// Wraps a shared [`PgPool`] so callers can reuse an existing connection pool
@@ -218,19 +250,10 @@ fn schema_kind_str(kind: SchemaKind) -> &'static str {
 
 /// Parse a [`SchemaKind`] from its canonical lowercase string form.
 fn parse_schema_kind(s: &str) -> SFResult<SchemaKind> {
-    match s {
-        "entity" => Ok(SchemaKind::Entity),
-        "relation" => Ok(SchemaKind::Relation),
-        "event" => Ok(SchemaKind::Event),
-        "sentiment" => Ok(SchemaKind::Sentiment),
-        "learning" => Ok(SchemaKind::Learning),
-        "error_pattern" => Ok(SchemaKind::ErrorPattern),
-        "custom" => Ok(SchemaKind::Custom),
-        "skill_effectiveness" => Ok(SchemaKind::SkillEffectiveness),
-        "mode_decision" => Ok(SchemaKind::ModeDecision),
-        "discovery_result" => Ok(SchemaKind::DiscoveryResult),
-        other => Err(SFError::Agent(format!("unknown schema kind: {}", other))),
-    }
+    // One declaration, in the enum: this reader used to carry the ten words a
+    // second time, and a word added to the enum but not here would have read as
+    // "unknown kind" on rows the writer had just stored.
+    SchemaKind::parse(s).ok_or_else(|| SFError::Agent(format!("unknown schema kind: {s}")))
 }
 
 #[async_trait]
@@ -499,32 +522,16 @@ impl SchemaBackend for PostgresSchemaBackend {
         direction: cog_core::RelationDirection,
         relation_type: Option<&str>,
     ) -> SFResult<Vec<SchemaEntry>> {
-        let direction_str = match direction {
-            cog_core::RelationDirection::From => "from",
-            cog_core::RelationDirection::To => "to",
-            cog_core::RelationDirection::Both => "both",
-        };
-        let rows = sqlx::query(
-            r#"
-            SELECT namespace, id, kind, name, key, properties, raw_uri, range_spec,
-                   extractor_version, extracted_at, confidence, importance
-            FROM schema_entries
-            WHERE namespace = $1 AND kind = 'relation'
-              AND (
-                  ($2 = 'from' AND properties ->> 'from' = $3)
-                  OR ($2 = 'to' AND properties ->> 'to' = $3)
-                  OR ($2 = 'both' AND (properties ->> 'from' = $3 OR properties ->> 'to' = $3))
-              )
-              AND ($4::TEXT IS NULL OR properties ->> 'relation_type' = $4)
-            "#,
-        )
-        .bind(namespace)
-        .bind(direction_str)
-        .bind(entity)
-        .bind(relation_type)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| SFError::Agent(format!("query_relations failed: {}", e)))?;
+        let direction_str = direction.as_str();
+        let sql = fill_slots(RELATIONS_SQL_TEMPLATE, &direction_slots());
+        let rows = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(direction_str)
+            .bind(entity)
+            .bind(relation_type)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Agent(format!("query_relations failed: {}", e)))?;
 
         let mut entries = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -626,6 +633,24 @@ mod tests {
             assert!(
                 column.is_empty() || SCHEMA_ENTRIES_DDL.contains(column),
                 "ENTRY_COLUMNS names {column}, which the DDL never creates"
+            );
+        }
+    }
+
+    /// 关系查询里的 kind 与三个方向词必须逐字带着枚举的词。
+    ///
+    /// 一个没填的槽会让这条语句在第一次查询时被数据库拒解析；一个填错的词则更安静
+    /// ——选不中任何行，读起来就是"这个实体没有关系"。
+    #[test]
+    fn the_relation_query_names_its_kind_and_directions() {
+        let sql = fill_slots(RELATIONS_SQL_TEMPLATE, &direction_slots());
+        assert!(!sql.contains('{'), "还有槽没有填：{sql}");
+        assert!(sql.contains(&format!("kind = '{}'", SchemaKind::Relation.as_str())));
+        for direction in cog_core::RelationDirection::ALL {
+            assert!(
+                sql.contains(&format!("= '{}' AND", direction.as_str())),
+                "查询里没有 {} 这个方向",
+                direction.as_str()
             );
         }
     }

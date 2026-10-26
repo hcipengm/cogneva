@@ -387,6 +387,34 @@ pub enum RelationDirection {
     Both,
 }
 
+impl RelationDirection {
+    /// Every direction, in the order the words render.
+    pub const ALL: [RelationDirection; 3] = [
+        RelationDirection::From,
+        RelationDirection::To,
+        RelationDirection::Both,
+    ];
+
+    /// The word this direction is stored and compared under.
+    ///
+    /// The stores' queries select their branch by this word, so it is declared
+    /// here rather than written out where the query is built: a query matching
+    /// an old spelling answers "this entity has no relations", which is what an
+    /// entity with none returns.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelationDirection::From => "from",
+            RelationDirection::To => "to",
+            RelationDirection::Both => "both",
+        }
+    }
+
+    /// Read one back; a word outside the set is refused rather than guessed.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|d| d.as_str() == s)
+    }
+}
+
 /// Types of structured entries in the Schema layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -404,6 +432,24 @@ pub enum SchemaKind {
 }
 
 impl SchemaKind {
+    /// Every kind, in the order the words render.
+    ///
+    /// The stores' `kind` columns hold these words and their queries select by
+    /// one of them; a reader that recovers a kind from a stored word walks this
+    /// list rather than re-typing the words.
+    pub const ALL: [SchemaKind; 10] = [
+        SchemaKind::Entity,
+        SchemaKind::Relation,
+        SchemaKind::Event,
+        SchemaKind::Sentiment,
+        SchemaKind::Learning,
+        SchemaKind::ErrorPattern,
+        SchemaKind::Custom,
+        SchemaKind::SkillEffectiveness,
+        SchemaKind::ModeDecision,
+        SchemaKind::DiscoveryResult,
+    ];
+
     /// The canonical lowercase spelling, shared by the identity key and by
     /// every store's `kind` column.
     pub fn as_str(self) -> &'static str {
@@ -419,6 +465,13 @@ impl SchemaKind {
             SchemaKind::ModeDecision => "mode_decision",
             SchemaKind::DiscoveryResult => "discovery_result",
         }
+    }
+
+    /// Read one back from the word a row stores. A word outside the set is
+    /// refused rather than mapped to a neighbour: it was written by a build
+    /// that disagrees with this one.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == s)
     }
 }
 
