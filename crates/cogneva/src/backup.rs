@@ -6,11 +6,15 @@
 //! （文件级复制）+ 实例身份（Secret 打成 apply-able manifest）。其余状态
 //! （NATS/Redis/Meilisearch/registry/进化克隆）全部可重建，不进包。
 //!
+//! 那两份 Secret 清单**只在包本身是密文时才在**：清单里的值只是 base64，放进明文包
+//! 就等于把凭证抄一份到备份卷与卷外副本上。没有包级口令时这一段缺席，manifest 的
+//! `lossy_surfaces` 点名它。
+//!
 //! 包布局：
 //! ```text
 //! <pkg>/manifest.json                 版本/rev/实例指纹/时间/各段内容清单
-//! <pkg>/secrets/cogneva-secrets.yaml      apply-able Secret（data 为 base64）
-//! <pkg>/secrets/cogneva-secrets-oob.yaml  同上，带外凭证那一份（只被网关读）
+//! <pkg>/secrets/cogneva-secrets.yaml      apply-able Secret（data 为 base64；仅密文包）
+//! <pkg>/secrets/cogneva-secrets-oob.yaml  同上，带外凭证那一份（只被网关读；仅密文包）
 //! <pkg>/pg/public.<table>.csv         COPY ... TO STDOUT CSV（分区父表含全分区）
 //! <pkg>/pg/sequences.sql              全部序列的 setval 语句
 //! <pkg>/qdrant/<collection>.snapshot  服务端一致性快照
