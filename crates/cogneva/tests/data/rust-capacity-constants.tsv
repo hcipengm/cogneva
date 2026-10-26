@@ -100,7 +100,7 @@ crates/cog-core/src/contract/taste.rs	TASTE_SUBJECT_MAX_CHARS	512	bound	a subjec
 crates/cog-core/src/contract/taste.rs	TASTE_TEXT_MAX_CHARS	2_000	bound	these fields are inlined into the goal and copied into every later change, so the bound is on the submission, not on the row as stored
 crates/cog-core/src/git_budget.rs	GIT_TIMEOUT_FLOOR_SECS	120	bound	the ceiling before any git command here has completed; only this is available
 crates/cog-core/src/git_budget.rs	GIT_TIMEOUT_MULTIPLE	10	derived	multiple of the slowest git command that has completed; the corpse age is twice it
-crates/cog-core/src/reading_cadence.rs	UNCHANGED_READING_HEARTBEAT	1800s	unreviewed	
+crates/cog-core/src/reading_cadence.rs	UNCHANGED_READING_HEARTBEAT	1800s	bound	a declared reference point, not a dial: three writers stamp under it and every reader's alert window has to be longer than it, which is a relation between two settings that nothing can check if both can move; the alert-rule contract test in cogneva reads the gateway's name to check the window
 crates/cog-core/src/token_estimate.rs	CHARS_PER_TOKEN	4	unreviewed	
 crates/cog-core/src/token_estimate.rs	ENGLISH_WORD_TOKENS	4	unreviewed	
 crates/cog-eval/src/adapters/swe_pro.rs	MAX	5	bound	at most five test names in a verdict; the rest are counted, not listed
@@ -295,20 +295,10 @@ crates/cog-reflection/src/auto_promoter.rs	APPROVAL_SWEEP_LIMIT	1000	bound	one p
 crates/cog-reflection/src/auto_promoter.rs	LEDGER_LOOKBACK	50	unreviewed	
 crates/cog-reflection/src/baseline_port.rs	MIN_POLL_INTERVAL_SECS	60	bound	floor under the configured poll interval; the loop never polls faster than this
 crates/cog-reflection/src/build_gate/arming.rs	WAIT_RELEASE_MARGIN_SECS	600	bound	margin over the longest legal build or test hold, so a legal wait is never refused
-crates/cog-reflection/src/build_gate/mod.rs	BOUND_WINDOW	60s	bound	damping window so the persisted bound does not chase every sample; a build lasts tens of minutes
-crates/cog-reflection/src/build_gate/mod.rs	BUILD_DEMAND_CORES	4.1	unreviewed	
-crates/cog-reflection/src/build_gate/mod.rs	BUILD_PEAK_RSS_BYTES	4481 * 1024 * 1024	unreviewed	
-crates/cog-reflection/src/build_gate/mod.rs	CPU_CALM_PCT	5.0	unreviewed	
-crates/cog-reflection/src/build_gate/mod.rs	CPU_SAMPLE_GAP	200ms	unreviewed	
 crates/cog-reflection/src/build_gate/mod.rs	EVENT_RING_CAPACITY	256	bound	ring depth for a consumer ticking every few minutes; drops are counted, not lost
 crates/cog-reflection/src/build_gate/mod.rs	GATE_DIR_MODE	0o1777	unreviewed	
 crates/cog-reflection/src/build_gate/mod.rs	GATE_FILE_MODE	0o666	unreviewed	
-crates/cog-reflection/src/build_gate/mod.rs	IO_CALM_PCT	1.0	unreviewed	
-crates/cog-reflection/src/build_gate/mod.rs	IO_STALL_BUDGET_PCT	70.0	bound	sits above the worst one build has measured and below two; a seven-day reading
-crates/cog-reflection/src/build_gate/mod.rs	MEM_CALM_PCT	1.0	unreviewed	
-crates/cog-reflection/src/build_gate/mod.rs	MEM_FLOOR_BYTES	24 * 1024 * 1024 * 1024	unreviewed	
 crates/cog-reflection/src/build_gate/mod.rs	POLL_INTERVAL	500ms	bound	how promptly a waiter rechecks a freed slot; builds last minutes, so this is only responsiveness
-crates/cog-reflection/src/build_gate/mod.rs	RESERVE_FRESH	900s	unreviewed	
 crates/cog-reflection/src/build_gate/mod.rs	TURN_STAND_DOWN_SECS	3600	bound	longer than any asker's own round, so a grievance outlives the call that raised it
 crates/cog-reflection/src/build_gate/mod.rs	WALK_YIELD_LIMIT	2	bound	turns a walk stands down before taking the field; a policy for two failure directions
 crates/cog-reflection/src/change_execution.rs	EXIT_PASSED	0	unreviewed	

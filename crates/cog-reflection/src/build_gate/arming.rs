@@ -120,6 +120,7 @@ mod tests {
             max_concurrent: 1,
             wait_secs,
             lock_dir: "/tmp/build-gate-test".into(),
+            ..BuildGateConfig::default()
         }
     }
 

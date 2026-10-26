@@ -51,7 +51,7 @@ const REGISTRY: &str = "crates/cogneva/tests/data/rust-capacity-constants.tsv";
 /// constant without deciding what it is would go unnoticed, because the file
 /// would simply grow. Pinning the count means the next one arrives with an
 /// answer, and paying a debt is the only thing that makes room.
-const DEBT_CEILING: usize = 168;
+const DEBT_CEILING: usize = 159;
 
 /// One line of the registry.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -385,7 +385,7 @@ fn the_scan_sees_production_constants_and_not_fixtures() {
     assert!(
         has(
             "crates/cog-reflection/src/build_gate/mod.rs",
-            "BUILD_DEMAND_CORES"
+            "EVENT_RING_CAPACITY"
         ),
         "a production constant the whole build gate is built on was not found"
     );

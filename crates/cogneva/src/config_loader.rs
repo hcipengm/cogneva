@@ -326,6 +326,49 @@ fn default_env_mappings() -> HashMap<String, String> {
         "COGNEVA_BUILD_GATE_LOCK_DIR".into(),
         "self_evolution.build_gate.lock_dir".into(),
     );
+    // 闸门推导界的那十个读数：构建吃多少核与内存、宿主要留住多少、多安静
+    // 算安静、两次决定之间隔多久。它们量的是**这台机器**，所以部署能改；
+    // 常量改不了，只会在换一台机器之后照旧成立而变错。
+    m.insert(
+        "COGNEVA_BUILD_GATE_BUILD_DEMAND_CORES".into(),
+        "self_evolution.build_gate.build_demand_cores".into(),
+    );
+    m.insert(
+        "COGNEVA_BUILD_GATE_BUILD_PEAK_RSS_MIB".into(),
+        "self_evolution.build_gate.build_peak_rss_mib".into(),
+    );
+    m.insert(
+        "COGNEVA_BUILD_GATE_MEM_FLOOR_MIB".into(),
+        "self_evolution.build_gate.mem_floor_mib".into(),
+    );
+    m.insert(
+        "COGNEVA_BUILD_GATE_IO_STALL_BUDGET_PCT".into(),
+        "self_evolution.build_gate.io_stall_budget_pct".into(),
+    );
+    m.insert(
+        "COGNEVA_BUILD_GATE_CPU_CALM_PCT".into(),
+        "self_evolution.build_gate.cpu_calm_pct".into(),
+    );
+    m.insert(
+        "COGNEVA_BUILD_GATE_IO_CALM_PCT".into(),
+        "self_evolution.build_gate.io_calm_pct".into(),
+    );
+    m.insert(
+        "COGNEVA_BUILD_GATE_MEM_CALM_PCT".into(),
+        "self_evolution.build_gate.mem_calm_pct".into(),
+    );
+    m.insert(
+        "COGNEVA_BUILD_GATE_BOUND_WINDOW_SECS".into(),
+        "self_evolution.build_gate.bound_window_secs".into(),
+    );
+    m.insert(
+        "COGNEVA_BUILD_GATE_CPU_SAMPLE_GAP_MS".into(),
+        "self_evolution.build_gate.cpu_sample_gap_ms".into(),
+    );
+    m.insert(
+        "COGNEVA_BUILD_GATE_RESERVE_FRESH_SECS".into(),
+        "self_evolution.build_gate.reserve_fresh_secs".into(),
+    );
     // system
     m.insert(
         "COGNEVA_SKILL_HOT_RELOAD_INTERVAL_SECS".into(),

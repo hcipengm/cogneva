@@ -62,6 +62,7 @@ async fn a_refused_slot_leaves_the_tree_uncommitted() {
         max_concurrent: 1,
         wait_secs: 0,
         lock_dir: lock_dir.path().to_string_lossy().into_owned(),
+        ..Default::default()
     });
     let held = gate
         .try_acquire("test holds the only slot")

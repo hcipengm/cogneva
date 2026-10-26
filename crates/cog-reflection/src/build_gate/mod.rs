@@ -128,98 +128,124 @@ use cog_core::contract::observability::{DimensionSpec, Observable, RawMetric, Tr
 use cog_core::contract::resource_ledger::{ResourceEvent, ResourceEventKind, ResourceEventOutcome};
 use cog_core::{SFError, SFResult};
 
-/// How much of one cpu a build of this workspace draws on the host, over its
-/// life.
+/// The host readings a bound is derived from, as this deployment declares them.
 ///
-/// Measured by walking the build's whole process tree — the `cargo` root and
-/// every process whose parent chain reaches it, which is where the parallelism
-/// lives — and dividing the sum of its `utime+stime` deltas by the wall clock
-/// between samples. One release build of this workspace (`cargo build --release
-/// --bin cogneva`, the build a mainline advance runs), sampled every five
-/// seconds for fourteen minutes, 31 samples: median 4.1 cores, peak 4.7. The
-/// median and not the peak, because the ceiling asks how many builds fit
-/// *alongside* each other, and sizing the bound on the burst would refuse builds
-/// the host can in fact run.
+/// Every one of these used to be a `const` sampled off one host, which made a
+/// claim about *that* host and shipped it to every other one: a gate on a
+/// 96-core machine derived its ceiling by dividing by 4.1 cores per build, and a
+/// deployment whose build is heavier than this workspace's was told there was
+/// room for one more than there was. They are this deployment's numbers, so they
+/// are declared where the deployment's other numbers are (`BuildGateConfig`) and
+/// read here. The measurements behind each shipped default are on the field.
 ///
-/// This is what one of *these* builds costs the host, which is the unit the
-/// bound is denominated in. The build runs in a container with a four-core cpu
-/// quota, so `cargo` sizes its job count to that quota and the tree fills it
-/// rather than the whole host; the number is a property of this deployment, and
-/// one that gives its builder a larger share will measure a larger number.
-///
-/// Only this kind of build was sampled. The dev-profile builds (clippy, test)
-/// drive fewer and smaller `rustc` processes over the same tree and no series
-/// for one exists yet, so the first dev-profile series should confirm or correct
-/// this rather than the number standing for all three kinds on faith.
-const BUILD_DEMAND_CORES: f64 = 4.1;
-/// Peak memory one build of this workspace holds, measured the same way: the
-/// high-water mark of summed `VmRSS` over the build's process tree.
-///
-/// The tree and not the `cargo` process: the memory is in the `rustc` children
-/// and in the test binaries, and a build that pages the host is never the
-/// parent. That series peaked at 4481 MiB with a median of 3616 MiB, and the
-/// peak is what is used here because memory is the one dimension where the
-/// failure is not a slowdown: a container that runs out kills the build.
-///
-/// Compared against `MemAvailable` rather than `MemFree`, because the page cache
-/// this build is filling counts as available.
-const BUILD_PEAK_RSS_BYTES: u64 = 4481 * 1024 * 1024;
-/// Memory the rest of the host must keep: what the cluster and the host's own
-/// processes actually occupy, so that a bound spending below it would be
-/// spending memory something else is using.
-///
-/// The number is what the rest of the host holds while nothing is building: the
-/// cluster's working set 19.7 GiB (cogneva 17.4, monitoring 2.1, system 0.2)
-/// plus the host's own processes, about 5 GiB -- 25 GiB, and the line sits just
-/// under it. With two builds at their peak (8.75 GiB) the host still shows at
-/// least 28 GiB available, against a seven-day low of 33.7 GiB.
-///
-/// It used to be the seven-day trough of `MemAvailable` (36 GiB), and that was
-/// circular: a bound that stops spending memory is exactly what lets the host
-/// rest near its own floor, so reading the floor back off `MemAvailable` did not
-/// measure what something else was using -- it measured where this line had
-/// pushed the host. On a host whose trough landed under the line the gate then
-/// derived a ceiling of one from its own constant and never moved.
-const MEM_FLOOR_BYTES: u64 = 24 * 1024 * 1024 * 1024;
-/// Cpu stall, as a percentage, below which the host counts as having room.
-///
-/// `cpu some avg60` over the same seven days had a median of 1.5% and a maximum
-/// of 20%: 5% is a line the host crosses rarely and that a build's own demand
-/// does not sit above, so it does not make the bound a function of itself.
-const CPU_CALM_PCT: f64 = 5.0;
-/// Disk stall, as a percentage, the builds together may cost.
-///
-/// This is the dimension that binds on a host where builds and containers share
-/// one device. What one build costs it depends on what the build is doing: over
-/// a release build of an already-built tree the device read `io some avg10` of
-/// 0.00-0.01%, a build's cold compile phase has been measured driving the same
-/// reading to 30-58%, and the worst episode over seven days reached 87%. The
-/// budget sits above the top of what one build has been seen to cost, so a build
-/// cannot pin the bound by its own noise, and below what two of them have been
-/// seen to cost together. Dividing it by the stall measured now gives how many
-/// builds the device is absorbing.
-const IO_STALL_BUDGET_PCT: f64 = 70.0;
-/// Disk stall below which the device counts as quiet, so the bound may rise.
-/// Over seven days `io some` had a median of 0.1% and the host was quiet for
-/// most of the window: rising is slow and only on a quiet device, because the
-/// cost of being wrong is asymmetric.
-const IO_CALM_PCT: f64 = 1.0;
-/// Memory stall below which the host counts as having room, on the same seven
-/// days (median 0%, worst episode 16%).
-const MEM_CALM_PCT: f64 = 1.0;
-/// How long the control law waits between moves of the persisted bound.
-///
-/// The readings are taken continuously but the decision is not: a bound that
-/// chased every sample would move every time a build's own compile phase pushed
-/// the device, which is the chase the `avg60` window and this one exist to
-/// damp. A build is a tens-of-minutes event, so a minute of lag costs nothing
-/// next to the stability.
-const BOUND_WINDOW: Duration = Duration::from_secs(60);
-/// How long the cpu is sampled to read what it is doing: two reads of the
-/// counters, this far apart. Load average would be the wrong number here — a
-/// host with processes blocked on the disk shows a load of twenty with idle
-/// cores, and this dimension is about cores.
-const CPU_SAMPLE_GAP: Duration = Duration::from_millis(200);
+/// Converted once, at construction, into the units this module works in: the
+/// config speaks MiB and seconds because that is what an operator writes, and
+/// the derivation speaks bytes and `Duration` because that is what it compares.
+#[derive(Debug, Clone, Copy)]
+struct Tuning {
+    build_demand_cores: f64,
+    build_peak_rss_bytes: u64,
+    mem_floor_bytes: u64,
+    io_stall_budget_pct: f64,
+    cpu_calm_pct: f64,
+    io_calm_pct: f64,
+    mem_calm_pct: f64,
+    bound_window: Duration,
+    cpu_sample_gap: Duration,
+    reserve_fresh: Duration,
+}
+
+impl Tuning {
+    /// The declaration as written, in this module's units.
+    fn raw(cfg: &BuildGateConfig) -> Self {
+        Self {
+            build_demand_cores: cfg.build_demand_cores,
+            build_peak_rss_bytes: cfg.build_peak_rss_mib << 20,
+            mem_floor_bytes: cfg.mem_floor_mib << 20,
+            io_stall_budget_pct: cfg.io_stall_budget_pct,
+            cpu_calm_pct: cfg.cpu_calm_pct,
+            io_calm_pct: cfg.io_calm_pct,
+            mem_calm_pct: cfg.mem_calm_pct,
+            bound_window: Duration::from_secs(cfg.bound_window_secs),
+            cpu_sample_gap: Duration::from_millis(cfg.cpu_sample_gap_ms),
+            reserve_fresh: Duration::from_secs(cfg.reserve_fresh_secs),
+        }
+    }
+
+    /// What the deployment declares when nobody says otherwise.
+    ///
+    /// Read out of the config default rather than written again here: two
+    /// declarations of the same reading is how they drift apart.
+    fn shipped() -> Self {
+        Self::raw(&BuildGateConfig::default())
+    }
+
+    /// The declaration with its zeroes read as the shipped value.
+    ///
+    /// Zero is not something an operator can mean in any of these: a build that
+    /// costs no cores, a floor of no memory, a window of no seconds, a claim on
+    /// the next build that is stale the instant it is written. Each of those
+    /// would disable the very thing it is a dial for, and a dial whose zero
+    /// silently turns the gate off is the failure mode a config file is supposed
+    /// to make impossible. A missing value never gets here — the container is
+    /// `serde(default)` — so this is only ever an explicit zero.
+    fn from_config(cfg: &BuildGateConfig) -> Self {
+        let t = Self::raw(cfg);
+        let d = Self::shipped();
+        Self {
+            build_demand_cores: if t.build_demand_cores > 0.0 {
+                t.build_demand_cores
+            } else {
+                d.build_demand_cores
+            },
+            build_peak_rss_bytes: if t.build_peak_rss_bytes > 0 {
+                t.build_peak_rss_bytes
+            } else {
+                d.build_peak_rss_bytes
+            },
+            mem_floor_bytes: if t.mem_floor_bytes > 0 {
+                t.mem_floor_bytes
+            } else {
+                d.mem_floor_bytes
+            },
+            io_stall_budget_pct: if t.io_stall_budget_pct > 0.0 {
+                t.io_stall_budget_pct
+            } else {
+                d.io_stall_budget_pct
+            },
+            cpu_calm_pct: if t.cpu_calm_pct > 0.0 {
+                t.cpu_calm_pct
+            } else {
+                d.cpu_calm_pct
+            },
+            io_calm_pct: if t.io_calm_pct > 0.0 {
+                t.io_calm_pct
+            } else {
+                d.io_calm_pct
+            },
+            mem_calm_pct: if t.mem_calm_pct > 0.0 {
+                t.mem_calm_pct
+            } else {
+                d.mem_calm_pct
+            },
+            bound_window: if !t.bound_window.is_zero() {
+                t.bound_window
+            } else {
+                d.bound_window
+            },
+            cpu_sample_gap: if !t.cpu_sample_gap.is_zero() {
+                t.cpu_sample_gap
+            } else {
+                d.cpu_sample_gap
+            },
+            reserve_fresh: if !t.reserve_fresh.is_zero() {
+                t.reserve_fresh
+            } else {
+                d.reserve_fresh
+            },
+        }
+    }
+}
 
 /// Where the derived bound is persisted, so every process on the host enforces
 /// the same number and a process that just started does not spend its first
@@ -256,17 +282,11 @@ const CLAIM_FILE: &str = "builds.claim";
 /// no more than the window — and it is paid only while some build is turned away
 /// by it, which is the state this exists to end.
 const RESERVE_FILE: &str = "builds.reserve";
-/// How long a claim on the next build is honored after the claim was last
-/// refreshed. Longer than the cycles that refresh it (the deployer's is ten
-/// minutes) so a live waiter does not lose its turn between two asks, and short
-/// enough that a waiter that stops asking gives the field back within the same
-/// order of time.
-const RESERVE_FRESH: Duration = Duration::from_secs(900);
 
 /// Claims on the next build that lapsed before anyone used them, as a counter
 /// carrying the `asker` that made the claim.
 ///
-/// A claim past [`RESERVE_FRESH`] is dropped without a word: the work that asked
+/// A claim past [`BuildGateConfig::reserve_fresh_secs`] is dropped without a word: the work that asked
 /// loses its turn, the field goes to whoever arrives next, and the refusal it
 /// gets afterwards looks exactly like the refusal it got before the claim. That
 /// is how the mainline's 14:55 claim on 2026-10-19 left no trace beyond a log
@@ -292,11 +312,12 @@ pub const BUILD_GATE_RESERVATION_LAPSED_TOTAL: &str = "cogneva_build_gate_reserv
 /// needs somebody to look. A work that renews every ten minutes keeps its claim
 /// alive and still crowds every other builder out, and at zero lapses that is
 /// invisible. This reading is the renewal interval itself: a value approaching
-/// [`RESERVE_FRESH`] is a wake where the claim came close to lapsing, and rows
+/// [`BuildGateConfig::reserve_fresh_secs`] is a wake where the claim came close
+/// to lapsing, and rows
 /// climbing toward it say the renewal cadence, not the build, sets the margin.
 /// A renewal that actually crosses the line is not seen here -- the claim reads
 /// as stale, the reservation is dropped, and the lapse counter takes the count
-/// instead -- so this gauge stays below [`RESERVE_FRESH`] and the pair of
+/// instead -- so this gauge stays below the freshness window and the pair of
 /// readings covers the two sides of the same line.
 ///
 /// Zero is "this work has not rewritten a claim it already held" rather than
@@ -596,6 +617,10 @@ struct HostLoad {
     /// be visible where the decision is made, so an operator reading a bound
     /// that stopped moving can see whether the volume is what stopped it.
     disk_free_bytes: Option<u64>,
+    /// The deployment's declaration of what a build costs and what counts as
+    /// quiet, carried with the sample so a reading and the number derived from
+    /// it are described by one declaration.
+    tuning: Tuning,
 }
 
 /// Free bytes of the filesystem `dir` is on.
@@ -745,10 +770,10 @@ impl BuildBudget {
     /// reclaiming that cache is IO, which the io dimension is the one charged
     /// for — spending only one budget for it is what keeps that charge from
     /// being paid twice.
-    fn ceiling(&self) -> f64 {
+    fn ceiling(&self, build_peak_rss_bytes: u64) -> f64 {
         self.mem_max
             .saturating_sub(self.mem_current.saturating_sub(self.mem_reclaimable)) as f64
-            / BUILD_PEAK_RSS_BYTES as f64
+            / build_peak_rss_bytes as f64
     }
 }
 
@@ -766,12 +791,12 @@ impl HostLoad {
     /// indistinguishable from one that is idle, and a bound derived from a
     /// stand-in would be exactly the kind of number this derivation exists to
     /// stop shipping, so the caller keeps the bound it already has instead.
-    async fn measure(dir: &Path) -> Option<Self> {
+    async fn measure(dir: &Path, tuning: Tuning) -> Option<Self> {
         let pressure = sample(dir)?;
         let (cores, busy, total) = cpu_times()?;
         // Two reads, one gap: the counters are cumulative since boot, so the
         // question "is the cpu busy" is only answered by a difference.
-        tokio::time::sleep(CPU_SAMPLE_GAP).await;
+        tokio::time::sleep(tuning.cpu_sample_gap).await;
         let (_, busy_after, total_after) = cpu_times()?;
         let ticks = total_after.saturating_sub(total);
         if ticks == 0 {
@@ -784,6 +809,7 @@ impl HostLoad {
             cores,
             budget: BuildBudget::read(),
             disk_free_bytes: disk_bytes(dir),
+            tuning,
         })
     }
 
@@ -825,22 +851,26 @@ impl HostLoad {
     /// readings it is chosen from, taken in the same sample.
     fn dimensions(&self) -> [(&'static str, f64); 4] {
         let cores = self.cores.max(1) as f64;
-        let cpu = ((cores - self.busy_cores) / BUILD_DEMAND_CORES).clamp(1.0, cores);
+        let cpu = ((cores - self.busy_cores) / self.tuning.build_demand_cores).clamp(1.0, cores);
         let memory = (self
             .pressure
             .mem_available_bytes
-            .saturating_sub(MEM_FLOOR_BYTES) as f64
-            / BUILD_PEAK_RSS_BYTES as f64)
+            .saturating_sub(self.tuning.mem_floor_bytes) as f64
+            / self.tuning.build_peak_rss_bytes as f64)
             .clamp(1.0, cores);
         // The disk is charged against the stall it is showing now: the builds it
         // is absorbing are the budget divided by that, so the same device reads
         // as room for several builds when it is quiet and for one when a build
         // is already keeping it busy.
-        let io = (IO_STALL_BUDGET_PCT / self.pressure.io_avg60.max(0.01)).clamp(1.0, cores);
+        let io =
+            (self.tuning.io_stall_budget_pct / self.pressure.io_avg60.max(0.01)).clamp(1.0, cores);
         let cgroup_memory = self
             .budget
             .as_ref()
-            .map(|b| b.ceiling().clamp(1.0, cores))
+            .map(|b| {
+                b.ceiling(self.tuning.build_peak_rss_bytes)
+                    .clamp(1.0, cores)
+            })
             .unwrap_or(cores);
         [
             (DIM_CPU, cpu),
@@ -885,7 +915,7 @@ impl HostLoad {
     /// place for the same number to be read from.
     ///
     /// What this costs, measured on the host the constants were sampled from:
-    /// `IO_CALM_PCT` is 1.0 while a single build's cold compile has driven
+    /// `io_calm_pct` is 1.0 while a single build's cold compile has driven
     /// `io some avg10` to 30-58%, so while any build runs the host is not calm
     /// and the bound cannot rise: it rises in the gaps between builds. Those
     /// gaps are not rare -- over seven days all three conditions held 65.5% of
@@ -895,11 +925,14 @@ impl HostLoad {
     /// re-derive them from these numbers, and the ceiling and the bound alone do
     /// not show it.
     fn is_calm(&self) -> bool {
-        self.pressure.cpu_avg60 < CPU_CALM_PCT
-            && self.pressure.io_avg60 < IO_CALM_PCT
-            && self.pressure.mem_avg60 < MEM_CALM_PCT
+        self.pressure.cpu_avg60 < self.tuning.cpu_calm_pct
+            && self.pressure.io_avg60 < self.tuning.io_calm_pct
+            && self.pressure.mem_avg60 < self.tuning.mem_calm_pct
             && self.pressure.mem_available_bytes
-                > MEM_FLOOR_BYTES.saturating_add(BUILD_PEAK_RSS_BYTES)
+                > self
+                    .tuning
+                    .mem_floor_bytes
+                    .saturating_add(self.tuning.build_peak_rss_bytes)
     }
 }
 
@@ -1645,6 +1678,9 @@ pub struct BuildGate {
     /// its whole history at restart, this loses only what it has not yet
     /// handed over).
     events: Mutex<VecDeque<ResourceEvent>>,
+    /// What this deployment declares a build costs the host and what counts as
+    /// quiet. Carried on the gate because every derivation reads it.
+    tuning: Tuning,
     /// Events pushed out of the ring before a consumer took them. Published,
     /// not hidden: a bounded queue that overflows silently turns "the account
     /// is complete" into a claim nobody can check.
@@ -1658,6 +1694,7 @@ impl std::fmt::Debug for BuildGate {
             .field("fixed", &self.fixed)
             .field("wait", &self.wait)
             .field("installed", &self.installed)
+            .field("build_demand_cores", &self.tuning.build_demand_cores)
             .field("derived", &self.derived.load(Ordering::Relaxed))
             .finish()
     }
@@ -1683,6 +1720,7 @@ impl BuildGate {
             wait: Duration::from_secs(cfg.wait_secs),
             installed,
             dir,
+            tuning: Tuning::from_config(cfg),
             derived: AtomicU64::new(0),
             measured_ceiling: AtomicU64::new(0),
             dimension: Mutex::new(DIM_UNMEASURED),
@@ -1858,7 +1896,7 @@ impl BuildGate {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(at) = *last {
-                if at.elapsed() < BOUND_WINDOW {
+                if at.elapsed() < self.tuning.bound_window {
                     return false;
                 }
             }
@@ -1928,12 +1966,12 @@ impl BuildGate {
         {
             let window = self.window.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(last) = *window {
-                if last.elapsed() < BOUND_WINDOW {
+                if last.elapsed() < self.tuning.bound_window {
                     return;
                 }
             }
         }
-        let Some(load) = HostLoad::measure(&self.dir).await else {
+        let Some(load) = HostLoad::measure(&self.dir, self.tuning).await else {
             // No move rather than a move to a default: a host this process
             // cannot read is not a host it may size a bound for.
             tracing::debug!(
@@ -2091,7 +2129,7 @@ impl BuildGate {
                 .as_ref()
                 .map(|(holder, _)| holder.as_str())
                 .unwrap_or("none"),
-            fresh_secs = RESERVE_FRESH.as_secs(),
+            fresh_secs = self.tuning.reserve_fresh.as_secs(),
             dir = %self.dir.display(),
             "claiming the next build: builds stand down until this work gets one"
         );
@@ -2123,7 +2161,7 @@ impl BuildGate {
             return None;
         }
         let age = unix_now().saturating_sub(since);
-        if age > RESERVE_FRESH.as_secs() {
+        if age > self.tuning.reserve_fresh.as_secs() {
             // A claim that is not being refreshed is a work that stopped asking:
             // honoring it would hold builds out for a waiter that is gone.
             // Count it before dropping it: the work that asked loses this turn
@@ -2165,7 +2203,7 @@ impl BuildGate {
     /// finds the field free of its claim and busy with whoever came next, so a
     /// work on a longer cycle than the field's traffic never gets a turn at all.
     /// Its own holder releases it when its ask is answered, and a claim nobody
-    /// refreshes lapses at [`RESERVE_FRESH`].
+    /// refreshes lapses at [`Tuning::reserve_fresh`].
     fn release_reservation(&self, what: &str) {
         if !self.installed {
             return;
@@ -3335,6 +3373,97 @@ impl Observable for BuildGate {
 
 #[cfg(test)]
 mod tests {
+
+    /// 这套部署出厂声明的那份读数。测试拿它当「这台机器」，要证明某个数
+    /// 是被读出来的就换掉其中一项，而不是再写一份同样的数。
+    fn shipped() -> Tuning {
+        Tuning::shipped()
+    }
+
+    /// 一台「什么都不忙、内存充足、没有容器内存上限」的宿主，用给定的那份
+    /// 声明读出来。两个用例拿同一个宿主、只换声明，读数的差就只可能来自
+    /// 声明本身。
+    fn host_with(tuning: Tuning) -> HostLoad {
+        HostLoad {
+            pressure: Pressure {
+                cpu_avg10: 0.0,
+                cpu_avg60: 0.0,
+                io_avg10: 0.0,
+                io_avg60: 0.1,
+                mem_avg10: 0.0,
+                mem_avg60: 0.0,
+                mem_available_bytes: 64 << 30,
+                builds_in_flight: 0,
+            },
+            busy_cores: 0.0,
+            cores: 24,
+            budget: None,
+            disk_free_bytes: None,
+            tuning,
+        }
+    }
+
+    /// 一个构建花宿主多少内存，是这套部署声明的，不是写死在推导里的。
+    ///
+    /// 同一台宿主，只把「一个构建的峰值」翻倍，内存维度就得减半。改动前这
+    /// 个数是 `build_gate` 里的一个 `const`，这条断言无从写起：无论谁来调，
+    /// 读到的都是同一个答案。
+    #[test]
+    fn what_one_build_costs_is_the_deployments_to_declare() {
+        let memory_dimension = |peak_mib: u64| {
+            let cfg = BuildGateConfig {
+                build_peak_rss_mib: peak_mib,
+                ..BuildGateConfig::default()
+            };
+            host_with(Tuning::from_config(&cfg))
+                .dimensions()
+                .into_iter()
+                .find(|(name, _)| *name == DIM_MEMORY)
+                .map(|(_, value)| value)
+                .expect("the memory dimension is always published")
+        };
+        let shipped_peak_mib = shipped().build_peak_rss_bytes >> 20;
+        let base = memory_dimension(shipped_peak_mib);
+        let heavier = memory_dimension(shipped_peak_mib * 2);
+        assert!(
+            (heavier - base / 2.0).abs() < 1e-9,
+            "a build that costs twice the memory leaves room for half as many: {base} -> {heavier}"
+        );
+    }
+
+    /// 声明里的零读作出厂值，而不是把闸门关掉。
+    ///
+    /// 这十个位置上的零各自会把推导弄坏：除以零的维度、永远算「安静」的宿主、
+    /// 一写就过期的预留。配置里一个 0 悄悄关掉闸门，正是配置文件应该让它不可
+    /// 能发生的那类失效。
+    #[test]
+    fn a_zero_declaration_reads_as_the_shipped_reading() {
+        let zeroed = BuildGateConfig {
+            build_demand_cores: 0.0,
+            build_peak_rss_mib: 0,
+            mem_floor_mib: 0,
+            io_stall_budget_pct: 0.0,
+            cpu_calm_pct: 0.0,
+            io_calm_pct: 0.0,
+            mem_calm_pct: 0.0,
+            bound_window_secs: 0,
+            cpu_sample_gap_ms: 0,
+            reserve_fresh_secs: 0,
+            ..BuildGateConfig::default()
+        };
+        let t = Tuning::from_config(&zeroed);
+        let d = shipped();
+        assert_eq!(t.build_demand_cores, d.build_demand_cores);
+        assert_eq!(t.build_peak_rss_bytes, d.build_peak_rss_bytes);
+        assert_eq!(t.mem_floor_bytes, d.mem_floor_bytes);
+        assert_eq!(t.io_stall_budget_pct, d.io_stall_budget_pct);
+        assert_eq!(t.cpu_calm_pct, d.cpu_calm_pct);
+        assert_eq!(t.io_calm_pct, d.io_calm_pct);
+        assert_eq!(t.mem_calm_pct, d.mem_calm_pct);
+        assert_eq!(t.bound_window, d.bound_window);
+        assert_eq!(t.cpu_sample_gap, d.cpu_sample_gap);
+        assert_eq!(t.reserve_fresh, d.reserve_fresh);
+    }
     use super::*;
     use std::fs;
 
@@ -3344,6 +3473,7 @@ mod tests {
             max_concurrent: slots,
             wait_secs,
             lock_dir: dir.to_string_lossy().into_owned(),
+            ..BuildGateConfig::default()
         }))
     }
 
@@ -4032,6 +4162,7 @@ mod tests {
             max_concurrent: 8,
             wait_secs: 0,
             lock_dir: dir.path().to_string_lossy().into_owned(),
+            ..BuildGateConfig::default()
         }));
         let excluding = gate
             .try_acquire_exclusive("restarting the registry")
@@ -4067,35 +4198,42 @@ mod tests {
             cores: 24,
             budget: None,
             disk_free_bytes: None,
+            tuning: shipped(),
         };
         let plenty = 64 * 1024 * 1024 * 1024;
         // Derived rather than written out: this is the cpu dimension's own
         // arithmetic, and a second copy of the answer here would only be a place
         // for it to go stale the next time the per-build demand is re-measured.
-        let cpu_bound = (24.0 / BUILD_DEMAND_CORES).floor() as usize;
+        let cpu_bound = (24.0 / shipped().build_demand_cores).floor() as usize;
 
         assert_eq!(
             load(0.0, 0.1, plenty).ceiling(),
             (cpu_bound, DIM_CPU),
-            "a quiet host is bounded by what its cores can run: 24 cores over {BUILD_DEMAND_CORES} each"
+            "a quiet host is bounded by what its cores can run: 24 cores over {} each",
+            shipped().build_demand_cores
         );
         assert_eq!(
-            load(0.0, IO_STALL_BUDGET_PCT, plenty).ceiling(),
+            load(0.0, shipped().io_stall_budget_pct, plenty).ceiling(),
             (1, DIM_IO),
             "a device showing the whole stall budget absorbs one build"
         );
         assert_eq!(
-            load(0.0, 0.1, MEM_FLOOR_BYTES).ceiling(),
+            load(0.0, 0.1, shipped().mem_floor_bytes).ceiling(),
             (1, DIM_MEMORY),
             "memory down to the floor leaves room for one build, not zero"
         );
         assert_eq!(
-            load(0.0, IO_STALL_BUDGET_PCT * 3.0, MEM_FLOOR_BYTES).ceiling(),
+            load(
+                0.0,
+                shipped().io_stall_budget_pct * 3.0,
+                shipped().mem_floor_bytes
+            )
+            .ceiling(),
             (1, DIM_MEMORY),
             "the floor is a report about memory, not about the disk: whichever is tighter is named"
         );
         assert_eq!(
-            load(0.0, IO_STALL_BUDGET_PCT / 2.0, plenty).ceiling(),
+            load(0.0, shipped().io_stall_budget_pct / 2.0, plenty).ceiling(),
             (2, DIM_IO),
             "half the stall budget spent means the device is absorbing two builds"
         );
@@ -4126,16 +4264,25 @@ mod tests {
             cores: 24,
             budget: None,
             disk_free_bytes: Some(1 << 40),
+            tuning: shipped(),
         };
         let plenty = 64 * 1024 * 1024 * 1024;
         for (busy, io, mem) in [
             (0.0, 0.1, plenty),
-            (0.0, IO_STALL_BUDGET_PCT, plenty),
-            (0.0, 0.1, MEM_FLOOR_BYTES),
-            (0.0, IO_STALL_BUDGET_PCT * 3.0, MEM_FLOOR_BYTES),
-            (0.0, IO_STALL_BUDGET_PCT / 2.0, plenty),
+            (0.0, shipped().io_stall_budget_pct, plenty),
+            (0.0, 0.1, shipped().mem_floor_bytes),
+            (
+                0.0,
+                shipped().io_stall_budget_pct * 3.0,
+                shipped().mem_floor_bytes,
+            ),
+            (0.0, shipped().io_stall_budget_pct / 2.0, plenty),
             (23.0, 0.1, plenty),
-            (12.0, IO_STALL_BUDGET_PCT / 3.0, MEM_FLOOR_BYTES * 2),
+            (
+                12.0,
+                shipped().io_stall_budget_pct / 3.0,
+                shipped().mem_floor_bytes * 2,
+            ),
         ] {
             let host = load(busy, io, mem);
             let (ceiling, dimension) = host.ceiling();
@@ -4286,12 +4433,13 @@ mod tests {
                 mem_reclaimable,
             }),
             disk_free_bytes: None,
+            tuning: shipped(),
         };
         // One build per core the host could run, and then some: a limit this
         // roomy is above the cpu dimension's own answer, so the container is not
         // what is deciding and the reading has to say `cpu`.
-        let cpu_bound = (24.0 / BUILD_DEMAND_CORES).floor() as usize;
-        let roomy = (cpu_bound as u64 + 1) * BUILD_PEAK_RSS_BYTES;
+        let cpu_bound = (24.0 / shipped().build_demand_cores).floor() as usize;
+        let roomy = (cpu_bound as u64 + 1) * shipped().build_peak_rss_bytes;
 
         assert_eq!(
             load(roomy, 0, 0).ceiling(),
@@ -4301,7 +4449,8 @@ mod tests {
         assert_eq!(
             load(8 * gib, 4 * gib, 0).ceiling(),
             (1, DIM_CGROUP_MEMORY),
-            "8 GiB with half of it charged and none of it cache leaves room for one build of {BUILD_PEAK_RSS_BYTES} bytes, not two"
+            "8 GiB with half of it charged and none of it cache leaves room for one build of {} bytes, not two",
+            shipped().build_peak_rss_bytes
         );
         assert_eq!(
             load(20 * gib, 8 * gib, 0).ceiling(),
@@ -4393,7 +4542,7 @@ unevictable 28532736
     /// 中生命期被抬高内存限额（改 manifest、换一台机器）之后，它不该继续被启动那一刻
     /// 的数箍着。**射程说清**：这里钉的是「读这件事本身」每次重新从文件推，它钉不住
     /// 「以后有人在它上面加一层一次性缓存」——两者在读数上同形，隔一层只能靠读代码。
-    /// 另外，`step()` 那条路上真值每 `BOUND_WINDOW` 才动一次，所以中生命期的调整是
+    /// 另外，`step()` 那条路上真值每 `bound_window_secs` 才动一次，所以中生命期的调整是
     /// **一个窗口之内**被看见、不是立刻；那个窗口是有意留的，不在这里判。
     #[test]
     fn a_raised_limit_is_seen_by_the_next_read() {
@@ -4406,13 +4555,13 @@ unevictable 28532736
 
         let before = BuildBudget::read_at(dir.path(), "/kubepods.slice/cogneva")
             .unwrap()
-            .ceiling();
+            .ceiling(shipped().build_peak_rss_bytes);
 
         // 只改限额，别的一个字节不动。
         fs::write(cg.join("memory.max"), "16000000000").unwrap();
         let after = BuildBudget::read_at(dir.path(), "/kubepods.slice/cogneva")
             .unwrap()
-            .ceiling();
+            .ceiling(shipped().build_peak_rss_bytes);
 
         assert!(
             after > before,
@@ -4420,7 +4569,8 @@ unevictable 28532736
         );
         // 抬上来的应当是**整个差**，不是在某个被挑中的数附近晃：高处那 12 GB 全进 ceiling。
         assert!(
-            (after - before - 12_000_000_000f64 / BUILD_PEAK_RSS_BYTES as f64).abs() < 1e-9,
+            (after - before - 12_000_000_000f64 / shipped().build_peak_rss_bytes as f64).abs()
+                < 1e-9,
             "抬高的 12 GB 没有整个进 ceiling：{before} -> {after}"
         );
     }
@@ -4524,11 +4674,11 @@ unevictable 28532736
         let quiet = HostLoad {
             pressure: Pressure {
                 cpu_avg10: 0.0,
-                cpu_avg60: CPU_CALM_PCT - 0.1,
+                cpu_avg60: shipped().cpu_calm_pct - 0.1,
                 io_avg10: 0.0,
-                io_avg60: IO_CALM_PCT - 0.1,
+                io_avg60: shipped().io_calm_pct - 0.1,
                 mem_avg10: 0.0,
-                mem_avg60: MEM_CALM_PCT - 0.1,
+                mem_avg60: shipped().mem_calm_pct - 0.1,
                 mem_available_bytes: 64 * 1024 * 1024 * 1024,
                 builds_in_flight: 0,
             },
@@ -4536,12 +4686,13 @@ unevictable 28532736
             cores: 24,
             budget: None,
             disk_free_bytes: None,
+            tuning: shipped(),
         };
         assert!(quiet.is_calm(), "a quiet host is calm");
 
         let busy_disk = HostLoad {
             pressure: Pressure {
-                io_avg60: IO_CALM_PCT + 0.1,
+                io_avg60: shipped().io_calm_pct + 0.1,
                 ..quiet.pressure
             },
             ..quiet
@@ -4812,7 +4963,7 @@ unevictable 28532736
         let path = dir.path().join(RESERVE_FILE);
         let lapsed = |gate: &BuildGate| gate.counters().lapsed[asker_index("mainline advance")];
 
-        let stale = unix_now().saturating_sub(RESERVE_FRESH.as_secs() + 60);
+        let stale = unix_now().saturating_sub(shipped().reserve_fresh.as_secs() + 60);
         write_gate_file(&path, &format!("mainline advance\t{stale}\n")).unwrap();
         assert!(
             gate.reservation().is_none(),
@@ -5089,7 +5240,7 @@ unevictable 28532736
     async fn a_stale_claim_is_not_honored() {
         let dir = tempfile::tempdir().unwrap();
         let gate = gate(dir.path(), 1, 0);
-        let stale = unix_now() - RESERVE_FRESH.as_secs() - 60;
+        let stale = unix_now() - shipped().reserve_fresh.as_secs() - 60;
         std::fs::write(
             dir.path().join(RESERVE_FILE),
             format!("mainline advance\t{stale}\n"),
@@ -5127,6 +5278,7 @@ unevictable 28532736
             max_concurrent: 0,
             wait_secs,
             lock_dir: dir.to_string_lossy().into_owned(),
+            ..BuildGateConfig::default()
         }))
     }
 
@@ -5463,6 +5615,7 @@ unevictable 28532736
             max_concurrent: 4,
             wait_secs: 30,
             lock_dir: dir.path().to_string_lossy().into_owned(),
+            ..BuildGateConfig::default()
         }));
         assert_eq!(
             reading(&off, BUILD_GATE_WAIT_BUDGET_MS).await,
@@ -5481,6 +5634,7 @@ unevictable 28532736
             max_concurrent: 4,
             wait_secs: 0,
             lock_dir: dir.path().to_string_lossy().into_owned(),
+            ..BuildGateConfig::default()
         }));
         assert!(!disabled.in_force());
 
@@ -5601,6 +5755,7 @@ unevictable 28532736
                 max_concurrent: 4,
                 wait_secs: 0,
                 lock_dir: dir.to_string_lossy().into_owned(),
+                ..BuildGateConfig::default()
             },
             false,
         )
@@ -5910,13 +6065,14 @@ unevictable 28532736
                 io_avg60: 0.5,
                 mem_avg10: 0.0,
                 mem_avg60: 0.0,
-                mem_available_bytes: MEM_FLOOR_BYTES * 2,
+                mem_available_bytes: shipped().mem_floor_bytes * 2,
                 builds_in_flight: 0,
             },
             busy_cores: 1.0,
             cores: 24,
             budget: None,
             disk_free_bytes: Some(1 << 40),
+            tuning: shipped(),
         };
         let base = baseline();
         let base_ceiling = base.ceiling();
@@ -5946,13 +6102,16 @@ unevictable 28532736
             (
                 HOST_MEMORY_AVAILABLE_BYTES,
                 None,
-                |l| l.pressure.mem_available_bytes = MEM_FLOOR_BYTES + BUILD_PEAK_RSS_BYTES * 2,
+                |l| {
+                    l.pressure.mem_available_bytes =
+                        shipped().mem_floor_bytes + shipped().build_peak_rss_bytes * 2
+                },
                 true,
             ),
             (
                 HOST_PRESSURE_AVG60,
                 Some(("resource", "io")),
-                |l| l.pressure.io_avg60 = IO_STALL_BUDGET_PCT,
+                |l| l.pressure.io_avg60 = shipped().io_stall_budget_pct,
                 true,
             ),
             (

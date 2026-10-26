@@ -127,6 +127,7 @@ fn gate(lock_dir: &Path) -> Exclusion {
         max_concurrent: 1,
         wait_secs: 0,
         lock_dir: lock_dir.display().to_string(),
+        ..Default::default()
     })))
 }
 
