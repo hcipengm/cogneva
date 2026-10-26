@@ -60,7 +60,7 @@ const REGISTRY: &str = "crates/cogneva/tests/data/rust-capacity-constants.tsv";
 /// because the debt is paid: every constant in the tree now names either the
 /// reading it follows or the reason its bound should not move, so the next one
 /// written has to decide before it lands.
-const DEBT_CEILING: usize = 0;
+const DEBT_CEILING: u64 = 0;
 
 /// One line of the registry.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -337,6 +337,11 @@ fn write_registry(root: &Path, scanned: &[Row], existing: &[Row]) {
     std::fs::write(&path, out).expect("write the registry");
 }
 
+// The cap below is a ratchet and a paid-up one reads zero, which folds the
+// comparison to `len() == 0` and makes clippy call the `<` half absurd. It is
+// written against the constant anyway: raising the cap is the whole point of the
+// gate, and an `==` would silently turn "at most" into "exactly".
+#[allow(clippy::absurd_extreme_comparisons)]
 #[test]
 fn every_capacity_number_in_rust_says_where_it_comes_from() {
     let root = workspace_root();
@@ -404,7 +409,7 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
         .filter(|r| r.source == "unreviewed")
         .collect();
     assert!(
-        unreviewed.len() <= DEBT_CEILING,
+        (unreviewed.len() as u64) <= DEBT_CEILING,
         "{} constants are registered as `unreviewed` and the ceiling is {DEBT_CEILING}. \
          The debt only comes down: give the new ones a `derived` source naming the reading \
          they follow, or a `bound` source saying why no measurement should move them.\n{}",
@@ -522,7 +527,7 @@ const BARE_BYTES: &str = "bytes";
 /// makes this a ratchet rather than a count. It sits at zero: every use site
 /// now names a constant, so a new literal is a new decision rather than one
 /// more row in a debt nobody is paying.
-const BARE_LITERAL_CEILING: usize = 0;
+const BARE_LITERAL_CEILING: u64 = 0;
 
 /// `Duration::from_*(<literal>)` and byte multipliers, per file and shape.
 ///
@@ -843,6 +848,9 @@ fn write_bare_literals(root: &Path, scanned: &BTreeMap<(String, String), usize>)
     std::fs::write(&path, out).expect("write the bare literal registry");
 }
 
+// Same shape as the reviewed-debt cap above: the ceiling reads zero once the
+// debt is paid, and the comparison has to survive it being raised again.
+#[allow(clippy::absurd_extreme_comparisons)]
 #[test]
 fn a_number_at_the_point_of_use_is_counted_where_it_is_used() {
     let root = workspace_root();
@@ -882,7 +890,7 @@ fn a_number_at_the_point_of_use_is_counted_where_it_is_used() {
 
     let total: usize = existing.iter().map(|(_, _, count)| count).sum();
     assert!(
-        total <= BARE_LITERAL_CEILING,
+        (total as u64) <= BARE_LITERAL_CEILING,
         "{total} numbers are still written where they are used and the ceiling is \
          {BARE_LITERAL_CEILING}. The debt only comes down: give the number a declaration \
          (a `const` the census asks about) or make it configurable."
