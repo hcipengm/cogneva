@@ -22,10 +22,43 @@ import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table, Vi
  * 就成了每 15 秒拍一张照片。
  */
 
+/**
+ * 帧里那串名字怎么念。
+ *
+ * 前三个不是执行者的生命周期状态，是两种帧自己的说法：`agent_start` 说「起来了」、
+ * `agent_end` 说「结束了」、`agent_error` 说「出错了」——它们没有对应的
+ * `AgentState`，所以不能并进下面那张表里假装是同一套词。
+ *
+ * 其余八个是 `AgentState` 的线上写法（serde 的 snake_case），由生命周期的状态转换
+ * 帧直接带过来。这一格照抄而不翻译成别的词：屏幕上写的和总线上流的是同一串，
+ * 排查时才对得上。没有映射的名字（新加的状态、或线上真出现了别的写法）照原样显示，
+ * 不退回一个看着体面的默认值——那会把「不认识」画成「没事」。
+ */
 const STATE_LABEL: Record<string, string> = {
+  // 帧自己的说法
   started: '已启动',
   ended: '已结束',
   error: '出错',
+  // AgentState
+  init: '初始化',
+  registered: '已注册',
+  active: '在跑',
+  idle: '空闲',
+  completing: '收尾中',
+  inactive: '已停用',
+  suspect: '失联',
+  dead: '已判死',
+};
+
+/** 状态的色：同一种处境用同一种色，不靠位次猜。 */
+const STATE_TONE: Record<string, string> = {
+  error: 'var(--danger)',
+  dead: 'var(--danger)',
+  suspect: 'var(--warn)',
+  ended: 'var(--paper-dim)',
+  inactive: 'var(--paper-dim)',
+  started: 'var(--ok)',
+  active: 'var(--ok)',
 };
 
 /** 状态格：帧说它现在是什么。没有过状态帧时明写「—」，不拿「空闲」去冒充。 */
@@ -34,14 +67,7 @@ function LiveState({ live }: { live: LiveAgentRow | null }) {
     return <span className="text-[11px] text-[var(--muted)]">—</span>;
   }
   const label = STATE_LABEL[live.state] ?? live.state;
-  const tone =
-    live.state === 'error'
-      ? 'var(--danger)'
-      : live.state === 'ended'
-        ? 'var(--paper-dim)'
-        : live.state === 'started'
-          ? 'var(--ok)'
-          : 'var(--brass)';
+  const tone = STATE_TONE[live.state] ?? 'var(--brass)';
   return (
     <span className="inline-flex items-baseline gap-1.5">
       <span className="text-[11px]" style={{ color: tone }} title={live.detail ?? undefined}>

@@ -69,6 +69,40 @@ for pattern, why in (
         sys.exit(f"views/AgentsView.tsx 缺 {pattern}：{why}")
 
 print("ok   - 折叠、分派、画面三处接线齐全")
+
+# ---- 5. 生产者送得出来的每一种状态，画面都得会念 -------------------------------
+#
+# 状态格是把帧里的那串名字直接显示出来的：认得的念中文，不认得的照原样印。于是一个
+# 新加的状态（或改过名的写法）在屏幕上就是一行 `dead`、`suspect`——不是空白，也不是
+# 错误，看着像一句没翻完的话。这种缺法不会让任何一处红：折叠照折、分派照调、画面照
+# 画，只是那一格开始用英文单词说话。名单从 `AgentState` 自己读，不手抄：手抄的那份
+# 会在加状态的那天与枚举分叉，而这里照样绿。
+state_src_path = os.path.join(ROOT, "crates/cog-core/src/types/agent_state.rs")
+if not os.path.isfile(state_src_path):
+    sys.exit("读不到 crates/cog-core/src/types/agent_state.rs：状态名单没了依据")
+state_src = open(state_src_path, encoding="utf-8").read()
+enum = re.search(r"pub enum AgentState\s*\{(.*?)\n\}", state_src, re.S)
+if not enum:
+    sys.exit("agent_state.rs 里找不到 `pub enum AgentState {…}`：这个判据读不出状态名单")
+variants = re.findall(r"^\s{4}([A-Z][A-Za-z0-9]*),", enum.group(1), re.M)
+if not variants:
+    sys.exit("AgentState 里一个变体都没读出来：写法变了（换成别名或带字段的变体？）")
+
+def snake(name):
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+labels = re.search(r"const STATE_LABEL: Record<string, string> = \{(.*?)\n\};", view, re.S)
+if not labels:
+    sys.exit("views/AgentsView.tsx 里找不到 `const STATE_LABEL: Record<string, string> = {…}`")
+keys = set(re.findall(r"^\s*([a-z][a-z0-9_]*)\s*:", labels.group(1), re.M))
+missing = [snake(v) for v in variants if snake(v) not in keys]
+if missing:
+    sys.exit(
+        "这些状态会由生命周期转换帧送到画面上，而 views/AgentsView.tsx 的 STATE_LABEL "
+        f"里没有它们的中文：{', '.join(missing)}——读者会在那一格里看到一个英文单词，"
+        "而它既不像状态也不像故障"
+    )
+print(f"ok   - AgentState 的 {len(variants)} 种状态在画面上都念得出来")
 PYEOF
 
 TSC="$ROOT/web/node_modules/.bin/tsc"
