@@ -760,6 +760,12 @@ jobs:
       # 读出每种帧走哪几族，再查 App 订的频道覆盖每个面依赖的每一族。
       - name: Check every frame a face relies on has a channel the app subscribes to
         run: bash deploy/scripts/check-web-frame-channels.sh
+      # 上一关查的是「帧送得到」，这一关查的是「那头真的有人在发」。五个面的门禁
+      # （折叠写了、分派调了、画面读了、频道订了、折叠语义对）可以全绿而屏幕一帧
+      # 不动：那一族的帧在整棵树里没有一个生产者。接了一个从没发过的帧的面不是
+      # 「慢半拍的面」，是永远不动的面，而且屏幕上没有任何一格会说这件事。
+      - name: Check every frame a face folds has a producer on the bus
+        run: bash deploy/scripts/check-live-frames-have-producers.sh
       # 「已连接」不等于「总线在说话」：连着而一帧都不来时，状态条那一格过去与
       # 「平台真的没事」长得一模一样，而平台停摆时屏幕上恰好一切都是静止的。这一步
       # 判那一格数的是**到达**（不是帧里的时间，否则重连重放会把「刚刚在动」读成
