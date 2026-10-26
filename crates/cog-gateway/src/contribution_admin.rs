@@ -1001,7 +1001,7 @@ pub(crate) async fn status_block_json() -> serde_json::Value {
                 "note": "not_in_cluster",
                 // 读不到 Secret 时身份状态是**未知**，不是"没配"：在集群外跑的面板
                 // 不该据此说"网关没有身份"。
-                "git_identity": {"state": "unknown", "note": "not_in_cluster"},
+                "git_identity": {"state": crate::git_identity::IdentityState::Unknown.as_str(), "note": "not_in_cluster"},
                 "read_error": e,
                 "github_app_configured": false,
                 // 读不到 Secret 就不知道密钥在不在，报 false 而不是"没配"的措辞。
@@ -1018,7 +1018,7 @@ pub(crate) async fn status_block_json() -> serde_json::Value {
                 "configured": false,
                 "provider": "none",
                 "note": "secret_read_failed",
-                "git_identity": {"state": "unknown", "note": "secret_read_failed"},
+                "git_identity": {"state": crate::git_identity::IdentityState::Unknown.as_str(), "note": "secret_read_failed"},
                 "read_error": e,
                 "github_app_configured": false,
                 "gitee_oauth_secret_configured": false,
@@ -1151,7 +1151,7 @@ fn unreachable_status_json(state: &crate::GatewayState, error: &str) -> serde_js
         "provider": "none",
         "note": "security_gateway_unreachable",
         "read_error": error,
-        "git_identity": {"state": "unknown", "note": "security_gateway_unreachable"},
+        "git_identity": {"state": crate::git_identity::IdentityState::Unknown.as_str(), "note": "security_gateway_unreachable"},
         "github_app_configured": false,
         "gitee_oauth_secret_configured": false,
         "github_oauth_secret_configured": false,

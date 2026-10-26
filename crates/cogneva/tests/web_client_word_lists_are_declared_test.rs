@@ -1,20 +1,19 @@
 //! principle: feedback_no_hardcoding_config_surface
-//! The task view's tabs carry the words that go onto the query string, and the
-//! endpoint decides which rows those words select. Nothing compares the two at
-//! build time, so a tab can name a word no row carries -- and the empty list it
-//! gets back is the same body an empty state returns. The operator reading it
-//! sees "nothing waiting", which is exactly the reading the tab was opened for.
+//! A word list in the WebUI is a copy of a vocabulary the server declares, and
+//! nothing compares the two at build time: the client ships compiled, the server
+//! answers whatever it is asked. A word the server does not know comes back as
+//! the empty answer, which is what "nothing there" looks like -- so the operator
+//! reads a broken panel as a quiet system.
 //!
-//! So every tab word is checked against [`TaskFilter`], the declaration the
-//! endpoints read their own words from. The one word that is not a filter is
-//! the view's "no filter" tab, and it is identified structurally -- it is the
-//! list's initial selection -- rather than by name, so renaming the label does
-//! not turn this red.
+//! Two lists are checked here against their declarations: the task view's
+//! filter tabs against `cog_core::TaskFilter`, and the git identity state union
+//! against the gateway's `IdentityState`.
 //!
 //! 实测（2026-10-27）：修前 `web/src/views/TasksView.tsx` 的 `ready` 标签把
 //! `status=ready` 发给服务端，而 `TaskStatus` 里没有这个词，标签恒空——表头却
-//! 数着「就绪待领 N」。消融对照：把 `running` 改成 `running_now`，本门红并点名
-//! 该文件与该词；改回即绿。
+//! 数着「就绪待领 N」。消融对照两条：把 `running` 改成 `running_now`，本门红并
+//! 点名该文件与该词；把 `IdentityState::Ready` 的词改成 `configured`，《状态词》
+//! 那条红并点名前端联合类型；各自改回即绿。
 
 use std::path::PathBuf;
 
@@ -105,6 +104,54 @@ fn every_task_view_tab_is_a_word_the_endpoints_accept() {
     }
 }
 
+/// The words of the union type that follows `start`, e.g. `state: 'ready' |
+/// 'pending'`.
+fn union_words(source: &str, start: &str) -> Vec<String> {
+    let from = source
+        .find(start)
+        .unwrap_or_else(|| panic!("{start:?} is gone; this gate reads the state union through it"))
+        + start.len();
+    let rest = &source[from..];
+    let end = rest.find(';').expect("the type alias is not closed");
+    let body = &rest[..end];
+    let mut words = Vec::new();
+    for part in body.split('|') {
+        let part = part.trim();
+        if let Some(word) = part.strip_prefix('\'').and_then(|p| p.strip_suffix('\'')) {
+            words.push(word.to_string());
+        }
+    }
+    words
+}
+
+/// 网关能报的状态与面板认的状态必须是同一组词。少一个：面板把它落到通用分支，
+/// 「读不到」与「没配」看起来一样；多一个：面板为一个永远不会到来的词留着一支
+/// 从没跑过的显示。
+#[test]
+fn the_git_identity_states_the_panel_knows_are_the_ones_the_gateway_reports() {
+    let path = repo_root().join("web/src/api/client.ts");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let mut panel = union_words(&source, "export interface GitIdentityStatus {\n  state:");
+    panel.sort();
+    assert!(
+        panel.len() >= 2,
+        "the state union was read as {panel:?}; a list this short means the parse changed"
+    );
+
+    let mut declared: Vec<String> = cog_gateway::git_identity::IdentityState::ALL
+        .iter()
+        .map(|state| state.as_str().to_string())
+        .collect();
+    declared.sort();
+
+    assert_eq!(
+        panel, declared,
+        "the panel and the gateway must know the same identity states"
+    );
+}
+
 /// 对照：本门的判据认得出一个不是词的东西。少了这条，`TaskFilter::parse` 哪天
 /// 退化成「什么词都收」，上面那条仍然全绿。
 #[test]
@@ -114,6 +161,21 @@ fn the_acceptance_check_rejects_a_word_no_row_carries() {
             cog_core::TaskFilter::parse(word),
             None,
             "{word:?} is not a declared filter word"
+        );
+    }
+    for word in ["configured", "Ready", "unknown ", "missing"] {
+        assert_eq!(
+            cog_gateway::git_identity::IdentityState::parse(word),
+            None,
+            "{word:?} is not a declared identity state"
+        );
+    }
+    for state in cog_gateway::git_identity::IdentityState::ALL {
+        assert_eq!(
+            cog_gateway::git_identity::IdentityState::parse(state.as_str()),
+            Some(state),
+            "{} is declared but not readable",
+            state.as_str()
         );
     }
     for filter in cog_core::TaskFilter::ALL {

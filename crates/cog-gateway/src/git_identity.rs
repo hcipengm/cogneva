@@ -58,7 +58,49 @@ pub(crate) const SECRET_IDENTITY_STATE: &str = "git-identity-state";
 const SECRET_IDENTITY_NOTE: &str = "git-identity-note";
 const SECRET_GITHUB_TOKEN: &str = "github-token";
 
-pub(crate) const STATE_READY: &str = "ready";
+/// The states this surface reports about the gateway's git identity.
+///
+/// `ready` is the one a stored flag can assert, and only when the private key it
+/// names is the one in hand; `pending` is a key that exists but has not been
+/// confirmed, or whose recorded public half is not this key's; `absent` is
+/// nothing written; `unknown` is a reader that cannot see the Secret at all --
+/// a panel outside the cluster must not report that a key is missing.
+///
+/// Declared once because the panel compares these words: a state it does not
+/// recognise falls through to the generic branch, and "unknown" and "not
+/// configured" then read the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityState {
+    Ready,
+    Pending,
+    Absent,
+    Unknown,
+}
+
+impl IdentityState {
+    /// Every state, so a gate or a client can cover the set.
+    pub const ALL: [IdentityState; 4] = [
+        IdentityState::Ready,
+        IdentityState::Pending,
+        IdentityState::Absent,
+        IdentityState::Unknown,
+    ];
+
+    /// The word this surface sends.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdentityState::Ready => "ready",
+            IdentityState::Pending => "pending",
+            IdentityState::Absent => "absent",
+            IdentityState::Unknown => "unknown",
+        }
+    }
+
+    /// Read a state back from its word.
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|state| state.as_str() == word)
+    }
+}
 
 /// 真实上游 API 地址。**不能**取 `COGNEVA_GITHUB_API_BASE`：那个变量让业务 Pod
 /// 把请求发回网关（凭证只留在网关）。网关就是出口，照它取会变成回环。
@@ -135,7 +177,7 @@ pub(crate) fn next_step(
     has_token: bool,
     pair_consistent: bool,
 ) -> Step {
-    if has_live_key && state == Some(STATE_READY) && pair_consistent {
+    if has_live_key && state == Some(IdentityState::Ready.as_str()) && pair_consistent {
         return Step::Settled;
     }
     match (has_live_key || has_candidate_key, has_token) {
@@ -301,13 +343,17 @@ pub(crate) fn status_block(secret: &serde_json::Value) -> serde_json::Value {
         .or_else(|| recorded_line.clone());
     let pair_consistent = pair_matches(live_key.as_deref(), recorded_line.as_deref());
     let note = field(SECRET_IDENTITY_NOTE);
-    let state = match field(SECRET_IDENTITY_STATE).as_deref() {
-        Some(STATE_READY) if has_live && pair_consistent => STATE_READY,
+    // The stored flag is read through the declaration rather than pattern-matched
+    // against a literal: the word it holds is the one `IdentityState::Ready`
+    // spells, or it is a state this version does not know and falls through.
+    let recorded_state = field(SECRET_IDENTITY_STATE).and_then(|word| IdentityState::parse(&word));
+    let state = match recorded_state {
+        Some(IdentityState::Ready) if has_live && pair_consistent => IdentityState::Ready.as_str(),
         // 私钥在但没有状态位：**未确认**。把它读成 ready 会让面板对着一把
         // 还没登记成功的密钥说"配好了"。状态位在、但公钥不是这一对的，同理：
         // 那句 ready 描述的不是手里这把密钥。
-        _ if has_live || field(SECRET_SSH_PENDING_KEY).is_some() => "pending",
-        _ => "absent",
+        _ if has_live || field(SECRET_SSH_PENDING_KEY).is_some() => IdentityState::Pending.as_str(),
+        _ => IdentityState::Absent.as_str(),
     };
     let has_token = field(SECRET_GITHUB_TOKEN).is_some();
     json!({
@@ -317,12 +363,12 @@ pub(crate) fn status_block(secret: &serde_json::Value) -> serde_json::Value {
         "token_present": has_token,
         "repo_configured": !IdentityConfig::from_env().repo.is_empty(),
         // 下一步该谁动手：有 token 的安装会自己走完，没有就需要人给一份。
-        "needs_token": state != STATE_READY && !has_token,
+        "needs_token": state != IdentityState::Ready.as_str() && !has_token,
         // 卡在哪一步。ready 时不该有理由，也不显示上一次的旧理由。两半对不上是唯一
         // 一个不必等自举写下理由就该当场说清的状态：面板判它 pending，理由得同时到位。
         "note": if !pair_consistent {
             Some(NOTE_KEY_PAIR_MISMATCH.to_string())
-        } else if state == STATE_READY {
+        } else if state == IdentityState::Ready.as_str() {
             None
         } else {
             note
@@ -429,7 +475,7 @@ pub(crate) async fn ensure_git_identity(config: &IdentityConfig) -> Outcome {
                 json!({
                     SECRET_SSH_PENDING_KEY: keypair.private_pem,
                     SECRET_SSH_PUBLIC_KEY: keypair.public_line,
-                    SECRET_IDENTITY_STATE: "pending",
+                    SECRET_IDENTITY_STATE: IdentityState::Pending.as_str(),
                 }),
             )
             .await
@@ -592,7 +638,7 @@ async fn promote(
         json!({
             SECRET_SSH_PRIVATE_KEY: private_key,
             SECRET_SSH_PUBLIC_KEY: public_line,
-            SECRET_IDENTITY_STATE: STATE_READY,
+            SECRET_IDENTITY_STATE: IdentityState::Ready.as_str(),
             // 晋级后待确认键位就没有意义了；留着它只会让人以为还有一份候选。
             SECRET_SSH_PENDING_KEY: serde_json::Value::Null,
             // 上一次"卡在哪"的理由同理：身份已经生效，留着它只会让人以为还卡着。
@@ -845,11 +891,17 @@ mod tests {
     fn a_settled_identity_is_left_alone() {
         // 常态：生效键位有私钥 + 状态 ready + 两半成对 → 既不握手也不写 Secret
         assert_eq!(
-            next_step(Some(STATE_READY), true, false, false, true),
+            next_step(
+                Some(IdentityState::Ready.as_str()),
+                true,
+                false,
+                false,
+                true
+            ),
             Step::Settled
         );
         assert_eq!(
-            next_step(Some(STATE_READY), true, false, true, true),
+            next_step(Some(IdentityState::Ready.as_str()), true, false, true, true),
             Step::Settled
         );
     }
@@ -859,12 +911,24 @@ mod tests {
         // 状态位说 ready、私钥也在，但记下来的公钥不是这一对的。此时那句 ready
         // 描述的不是手里这把密钥，而面板与重新登记都会照着错的那半来。
         assert_eq!(
-            next_step(Some(STATE_READY), true, false, true, false),
+            next_step(
+                Some(IdentityState::Ready.as_str()),
+                true,
+                false,
+                true,
+                false
+            ),
             Step::Register,
             "有 token 时重新登记能把公钥那半纠正回来"
         );
         assert_eq!(
-            next_step(Some(STATE_READY), true, false, false, false),
+            next_step(
+                Some(IdentityState::Ready.as_str()),
+                true,
+                false,
+                false,
+                false
+            ),
             Step::AwaitHuman,
             "没有 token 时只能等人，不能当成稳态收工"
         );
@@ -1004,10 +1068,10 @@ mod tests {
         let ready = status_block(&secret(vec![
             (SECRET_SSH_PRIVATE_KEY, "PRIVATE"),
             (SECRET_SSH_PUBLIC_KEY, "ssh-ed25519 AAAA x"),
-            (SECRET_IDENTITY_STATE, STATE_READY),
+            (SECRET_IDENTITY_STATE, IdentityState::Ready.as_str()),
             (SECRET_IDENTITY_NOTE, "旧理由"),
         ]));
-        assert_eq!(ready["state"], STATE_READY);
+        assert_eq!(ready["state"], IdentityState::Ready.as_str());
         assert_eq!(ready["needs_token"], false);
         assert_eq!(ready["public_key"], "ssh-ed25519 AAAA x");
         assert!(ready["note"].is_null());
@@ -1050,7 +1114,10 @@ mod tests {
         let mismatched = status_block(&secret(vec![
             (SECRET_SSH_PRIVATE_KEY, live.private_pem.clone()),
             (SECRET_SSH_PUBLIC_KEY, other.public_line.clone()),
-            (SECRET_IDENTITY_STATE, STATE_READY.to_string()),
+            (
+                SECRET_IDENTITY_STATE,
+                IdentityState::Ready.as_str().to_string(),
+            ),
         ]));
         assert_eq!(
             mismatched["state"], "pending",
@@ -1072,10 +1139,13 @@ mod tests {
         let consistent = status_block(&secret(vec![
             (SECRET_SSH_PRIVATE_KEY, live.private_pem.clone()),
             (SECRET_SSH_PUBLIC_KEY, live.public_line.clone()),
-            (SECRET_IDENTITY_STATE, STATE_READY.to_string()),
+            (
+                SECRET_IDENTITY_STATE,
+                IdentityState::Ready.as_str().to_string(),
+            ),
             (SECRET_IDENTITY_NOTE, "旧理由".to_string()),
         ]));
-        assert_eq!(consistent["state"], STATE_READY);
+        assert_eq!(consistent["state"], IdentityState::Ready.as_str());
         assert!(consistent["note"].is_null());
     }
 
@@ -1086,12 +1156,12 @@ mod tests {
             "data": {
                 SECRET_SSH_PRIVATE_KEY: engine.encode("PRIVATE"),
                 SECRET_SSH_PUBLIC_KEY: engine.encode("ssh-ed25519 AAAA x"),
-                SECRET_IDENTITY_STATE: engine.encode(STATE_READY),
+                SECRET_IDENTITY_STATE: engine.encode(IdentityState::Ready.as_str()),
                 SECRET_GITHUB_TOKEN: engine.encode(""),
             }
         });
         let facts = Facts::from_secret(&secret);
-        assert_eq!(facts.state.as_deref(), Some(STATE_READY));
+        assert_eq!(facts.state.as_deref(), Some(IdentityState::Ready.as_str()));
         assert_eq!(facts.live_key.as_deref(), Some("PRIVATE"));
         // 空字符串等于没有：写成空值的键不该被当成"有 token"
         assert!(facts.token.is_none());
