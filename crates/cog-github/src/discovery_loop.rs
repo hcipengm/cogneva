@@ -367,7 +367,7 @@ fn discovery_guard_state_path() -> std::path::PathBuf {
 
 #[cfg(not(test))]
 fn default_state_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from("/var/lib/cogneva-data")
+    std::path::PathBuf::from(cog_core::paths::data_dir())
 }
 
 // Test builds must never touch the production state dir: run_once loads and
@@ -472,7 +472,7 @@ struct StoredVerdict {
 
 #[cfg_attr(test, allow(dead_code))] // test builds resolve per-instance temp paths instead
 fn assess_verdicts_path() -> std::path::PathBuf {
-    let dir = std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into());
+    let dir = cog_core::paths::data_dir();
     std::path::PathBuf::from(dir).join("assess-verdicts.json")
 }
 

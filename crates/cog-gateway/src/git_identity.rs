@@ -41,7 +41,7 @@ use tracing::{info, warn};
 use crate::contribution_admin::generate_ssh_keypair;
 use crate::llm_admin::KubeClient;
 
-/// 生效私钥的键位。与容器里的挂载点一一对应，见 `git_mirror::DEFAULT_SSH_KEY`。
+/// 生效私钥的键位。与容器里的挂载点一一对应，见 `git_mirror::default_ssh_key`。
 pub(crate) const SECRET_SSH_PRIVATE_KEY: &str = "git-ssh-private-key";
 /// 已生成但尚未确认可用的私钥。
 pub(crate) const SECRET_SSH_PENDING_KEY: &str = "git-ssh-private-key-pending";
@@ -92,7 +92,7 @@ impl IdentityConfig {
                 .to_string(),
             key_path: nonempty("COGNEVA_GATEWAY_GIT_SSH_KEY")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(crate::git_mirror::DEFAULT_SSH_KEY)),
+                .unwrap_or_else(crate::git_mirror::default_ssh_key),
             ssh_base: nonempty("COGNEVA_GATEWAY_GIT_SSH_BASE")
                 .unwrap_or_else(|| crate::git_mirror::DEFAULT_SSH_BASE.to_string()),
             git_bin: crate::git_mirror::git_bin_from_env(),

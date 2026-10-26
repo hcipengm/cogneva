@@ -230,7 +230,7 @@ pub async fn search_fallback_config_handler(
         StatusCode::OK,
         Json(json!({
             "ok": true,
-            "restarted": ["cogneva-security-gateway"],
+            "restarted": [cog_core::topology::SECURITY_GATEWAY],
             "upstreams": accepted.len(),
             "from_llm": from_llm,
             "message": format!(

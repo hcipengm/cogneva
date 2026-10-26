@@ -18,6 +18,11 @@
 //! `global.namespace` moves this gate with it instead of leaving it scanning for
 //! a name nobody uses.
 //!
+//! Two copies are legitimate and both are held to the chart: bootstrap reads
+//! `global.namespace` at install time, and in-pod code carries one compiled
+//! default in `cog_core::topology` because it cannot read the chart. Everything
+//! else reads one of those two.
+//!
 //! Test modules are not scanned: a fixture may name whatever it likes.
 
 use std::path::PathBuf;
@@ -86,7 +91,10 @@ fn rust_sources() -> Vec<PathBuf> {
 /// The shapes a namespace literal takes. `-n <name>` inside a shell string and
 /// `"-n", "<name>"` in an argument list are the same fact written two ways, so
 /// both are asked for; whitespace is stripped before the search, because the
-/// argument pair is usually split across lines.
+/// argument pair is usually split across lines. The last two are the config
+/// defaults (`namespace: "<name>".into()`), which are a second declaration in
+/// exactly the same sense: a default the chart cannot move, and one that is
+/// wrong the moment `global.namespace` is set to something else.
 fn shapes(namespace: &str) -> Vec<String> {
     vec![
         format!("\"-n\",\"{namespace}\""),
@@ -98,8 +106,14 @@ fn shapes(namespace: &str) -> Vec<String> {
         format!("namespace:{namespace}"),
         format!("namespace{namespace}"),
         format!("namespace\":\"{namespace}\""),
+        format!("namespace:\"{namespace}\""),
     ]
 }
+
+/// The one file allowed to carry the name: the in-cluster declaration. In-pod
+/// code cannot read the chart, so it needs a compiled copy; the test below
+/// holds that copy and `global.namespace` to the same value.
+const DECLARATION: &str = "crates/cog-core/src/topology.rs";
 
 /// One hit: where, and the shape that matched. Read only through `Debug` when
 /// the assertion prints them, which is enough for a test-only type.
@@ -121,6 +135,9 @@ fn census() -> Vec<Hit> {
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
+        if rel == DECLARATION {
+            continue;
+        }
         let text =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         // Whitespace out: `"-n",` and the name it belongs to are usually on
@@ -213,4 +230,38 @@ fn the_manifest_bootstrap_renders_leaves_the_namespace_to_the_installer() {
         "{} 没有 __NAMESPACE__ 占位符，引导器渲染时没有地方写它读到的名字",
         path.display()
     );
+}
+
+/// In-pod code cannot read the chart, so it carries one compiled copy of the
+/// name. That is a second declaration of the same fact -- the chart's
+/// `global.namespace` and `cog_core::topology::DEFAULT_NAMESPACE` -- and
+/// nothing at build time compares them, so they are compared here.
+#[test]
+fn the_compiled_default_is_the_namespace_the_chart_declares() {
+    assert_eq!(
+        cog_core::topology::DEFAULT_NAMESPACE,
+        declared_namespace(),
+        "chart 声明的 global.namespace 与 cog_core::topology::DEFAULT_NAMESPACE 不一致：\
+         装机时按前者把对象建在一个命名空间里，进程自己按后者去另一个命名空间找"
+    );
+}
+
+/// The config default is the shape the command shapes would have missed: it is
+/// not a `-n` argument, it is a field the deployers take when nothing overrides
+/// it. It has to be visible to the scanner, or the defaults drift back.
+#[test]
+fn the_scanner_sees_the_config_default_shape() {
+    let namespace = declared_namespace();
+    let wanted = shapes(&namespace);
+    let flat = |s: &str| -> String { s.split_whitespace().collect() };
+    for form in [
+        format!("namespace: \"{namespace}\".into(),"),
+        format!("pub namespace: \"{namespace}\".to_string(),"),
+    ] {
+        let flat = flat(&form);
+        assert!(
+            wanted.iter().any(|s| flat.contains(s.as_str())),
+            "判据没认出配置默认值这个形状：{form}"
+        );
+    }
 }

@@ -1076,7 +1076,7 @@ pub async fn github_app_manifest_handler(
     };
     let request = HttpRequest::post(&url)
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "cogneva-security-gateway");
+        .header("User-Agent", cog_core::topology::SECURITY_GATEWAY);
     let resp = match client.execute(request).await {
         Ok(r) => r,
         Err(e) => {
@@ -1222,7 +1222,7 @@ pub async fn github_app_discover_handler(
     let request = HttpRequest::get(format!("{GITHUB_API}/app/installations"))
         .header("Authorization", format!("Bearer {jwt}"))
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "cogneva-security-gateway");
+        .header("User-Agent", cog_core::topology::SECURITY_GATEWAY);
     let resp = match client.execute(request).await {
         Ok(r) => r,
         Err(e) => {

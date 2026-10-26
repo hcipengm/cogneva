@@ -51,9 +51,6 @@ pub const WORKTREE_FETCH_LOOP: &str = "extension_worktree_fetch";
 /// Loop name of the claim-footprint walk over this executor's own volumes.
 pub const VOLUME_FOOTPRINT_LOOP: &str = "extension_volume_footprint";
 
-const DEFAULT_WORKSPACES_ROOT: &str = "/opt/cogneva/sandbox/workspaces";
-const DEFAULT_BARE_REPO: &str = "/opt/cogneva/sandbox/repo.git";
-const DEFAULT_TARGET_DIR: &str = "/opt/cogneva/sandbox/src/target";
 const DEFAULT_TTL_SECS: u64 = 21600;
 const DEFAULT_GC_INTERVAL_SECS: u64 = 600;
 const DEFAULT_FETCH_INTERVAL_SECS: u64 = 300;
@@ -362,12 +359,12 @@ pub struct WorkdirConfig {
 
 impl WorkdirConfig {
     pub fn from_env() -> Self {
-        let path = |key: &str, default: &str| {
+        let path = |key: &str, default: PathBuf| {
             std::env::var(key)
                 .ok()
                 .filter(|v| !v.trim().is_empty())
                 .map(PathBuf::from)
-                .unwrap_or_else(|| default.into())
+                .unwrap_or(default)
         };
         let secs = |key: &str, default: u64, min: u64| {
             let v = std::env::var(key)
@@ -408,9 +405,18 @@ impl WorkdirConfig {
             );
         }
         Self {
-            workspaces_root: path("SANDBOX_WORKSPACES_ROOT", DEFAULT_WORKSPACES_ROOT),
-            bare_repo: path("SANDBOX_BARE_REPO", DEFAULT_BARE_REPO),
-            target_dir: path("CARGO_TARGET_DIR", DEFAULT_TARGET_DIR),
+            workspaces_root: path(
+                "SANDBOX_WORKSPACES_ROOT",
+                cog_core::paths::app_path("sandbox/workspaces"),
+            ),
+            bare_repo: path(
+                "SANDBOX_BARE_REPO",
+                cog_core::paths::app_path("sandbox/repo.git"),
+            ),
+            target_dir: path(
+                "CARGO_TARGET_DIR",
+                cog_core::paths::app_path("sandbox/src/target"),
+            ),
             // Ordered mirrors, not one URL: reachability is per host and
             // uneven — measured from this pod, one mirror answered in under a
             // second while the other stalled to a 20s timeout — so a single

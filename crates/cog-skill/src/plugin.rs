@@ -58,7 +58,7 @@ impl cog_core::SystemPlugin for SkillPlugin {
         self.registry = Some(registry.clone());
 
         let directories = vec![
-            std::path::PathBuf::from("/opt/cogneva/skills"),
+            std::path::PathBuf::from(cog_core::paths::APP_SKILLS_DIR),
             std::path::PathBuf::from("/var/lib/cogneva/skills"),
             dirs::home_dir()
                 .map(|h| h.join(".cogneva/skills"))

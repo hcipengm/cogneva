@@ -64,8 +64,7 @@ impl PolicyEvolutionConfig {
     /// 叠加 env 覆盖。文件或段缺失时返回 Default；段存在但解析失败、或
     /// env 值非法时返回 Err——配置写错必须响亮失败。
     pub fn load() -> SFResult<Self> {
-        let path = std::env::var("COGNEVA_CONFIG_PATH")
-            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+        let path = cog_core::paths::config_file();
         let mut cfg = match std::fs::read_to_string(&path) {
             Ok(text) => {
                 let root: serde_json::Value = serde_json::from_str(&text)

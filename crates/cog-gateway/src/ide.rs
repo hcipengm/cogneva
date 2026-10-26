@@ -30,7 +30,7 @@ pub const WORKSPACE_ROOT_ENV: &str = "COGNEVA_WORKSPACE_ROOT";
 
 /// 应用数据目录（与身份文件、数仓同一个卷）。
 const DATA_DIR_ENV: &str = "COGNEVA_DATA_DIR";
-const DEFAULT_DATA_DIR: &str = "/var/lib/cogneva-data";
+const DEFAULT_DATA_DIR: &str = cog_core::paths::DATA_DIR;
 /// 单个文件的上限。编辑器不是上传通道：超过这个量的东西该走附件那条路。
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// 一次列目录最多回多少条，防止一个百万文件的目录把响应撑爆。

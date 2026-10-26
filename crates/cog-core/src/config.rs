@@ -70,9 +70,9 @@ pub struct AppInfo {
     pub name: String,
     pub version: String,
     pub log_level: String,
-    pub data_dir: String,   // /var/lib/cogneva-data
-    pub config_dir: String, // /etc/cogneva
-    pub app_dir: String,    // /opt/cogneva
+    pub data_dir: String,   // see cog_core::paths::DATA_DIR
+    pub config_dir: String, // see cog_core::paths::CONFIG_DIR
+    pub app_dir: String,    // see cog_core::paths::APP_DIR
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1047,9 +1047,9 @@ impl Default for ImageRolloutConfig {
             builder_bin: "buildah".into(),
             registry_push: false,
             kubectl_bin: "kubectl".into(),
-            namespace: "cogneva".into(),
-            deployment: "cogneva".into(),
-            container: "cogneva".into(),
+            namespace: crate::topology::namespace(),
+            deployment: crate::topology::MAIN_DEPLOYMENT.into(),
+            container: crate::topology::MAIN_CONTAINER.into(),
             rollout_timeout_secs: 300,
         }
     }
@@ -1086,9 +1086,9 @@ impl Default for MicroVmConfig {
         Self {
             enabled: false,
             firecracker_bin: "firecracker".into(),
-            kernel_image: "/opt/cogneva/microvm/vmlinux".into(),
-            rootfs_image: "/opt/cogneva/microvm/rootfs.ext4".into(),
-            pv_image: "/opt/cogneva/microvm/evolution-pv.ext4".into(),
+            kernel_image: crate::paths::app_path_str("microvm/vmlinux"),
+            rootfs_image: crate::paths::app_path_str("microvm/rootfs.ext4"),
+            pv_image: crate::paths::app_path_str("microvm/evolution-pv.ext4"),
             vcpu_count: 2,
             mem_size_mib: 2048,
             boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/evolution/init".into(),
@@ -1260,8 +1260,8 @@ pub struct SelfEvolutionWorkspaceConfig {
 impl Default for SelfEvolutionWorkspaceConfig {
     fn default() -> Self {
         Self {
-            root: "/opt/cogneva/sandbox/workspaces".into(),
-            target_dir: "/opt/cogneva/sandbox/src/target".into(),
+            root: crate::paths::app_path_str("sandbox/workspaces"),
+            target_dir: crate::paths::app_path_str("sandbox/src/target"),
             ephemeral_ttl_secs: 21600,
             orphan_branch_ttl_secs: 2592000,
             cache_scan_interval_secs: 300,
@@ -1385,7 +1385,7 @@ impl Default for BuildGateConfig {
             // 与部署清单挂的那条 hostPath 同名：哪一层（配置文件、环境变量、
             // 默认值）最后说话，落点都是同一个字符串。默认值本身不保证共享——
             // 目录只有在部署真的把它挂出来时才是同一块。
-            lock_dir: "/var/lib/cogneva-build-gate".into(),
+            lock_dir: crate::paths::BUILD_GATE_LOCK_DIR.into(),
             // 下面十个数是出厂值，不是定律：它们全是这套部署的宿主的读数，
             // 换一台机器就该重量一遍、在这里改掉。写在配置文件里是因为它们
             // 是「这台机器是什么样」的声明——宿主容量、构建开销、多安静算安静
@@ -1598,8 +1598,8 @@ impl Default for SelfEvolutionConfig {
             force_autonomous: false,
             manual_approve: false,
             change_dir: "./evolution-changes".into(),
-            binary_dir: "/opt/cogneva/bin".into(),
-            backup_dir: "/opt/cogneva/bin/backups".into(),
+            binary_dir: crate::paths::app_path_str("bin"),
+            backup_dir: crate::paths::app_path_str("bin/backups"),
             switch_mode: "self_exec".into(),
             health_check_grace_period_secs: 10,
             health_check_interval_secs: 5,

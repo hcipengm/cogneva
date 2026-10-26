@@ -28,14 +28,15 @@ pub struct BinarySwitcherConfig {
 impl Default for BinarySwitcherConfig {
     fn default() -> Self {
         Self {
-            binary_dir: PathBuf::from("/opt/cogneva/bin"),
-            binary_name: "cogneva".to_string(),
+            binary_dir: cog_core::paths::app_path("bin"),
+            binary_name: cog_core::paths::APP_BINARY_NAME.to_string(),
             health_url: "http://127.0.0.1:8080/health".to_string(),
             health_check_grace_period_secs: 10,
             health_check_interval_secs: 5,
             health_check_max_retries: 6,
-            systemd_service_name: "cogneva".to_string(),
-            sidecar_socket_path: PathBuf::from("/run/cogneva/sidecar.sock"),
+            systemd_service_name: cog_core::paths::APP_BINARY_NAME.to_string(),
+            sidecar_socket_path: std::path::Path::new(cog_core::paths::RUN_DIR)
+                .join("sidecar.sock"),
         }
     }
 }

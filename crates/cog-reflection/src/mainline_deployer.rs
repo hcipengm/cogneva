@@ -72,11 +72,11 @@ fn buildah_runroot() -> String {
 /// cargo registry 缓存同样落 PVC：镜像里的 /usr/local/cargo 是容器可写层，
 /// Pod 一重建（主线滚动最后一个目标就是 evolution 自己）索引与 crate 缓存
 /// 全丢，每次构建都要在家庭网络上重拉整个 crates.io 索引。
-const CARGO_HOME_PVC: &str = "/opt/cogneva/sandbox/cargo-home";
+const CARGO_HOME_PVC: &str = cog_core::app_path_literal!("sandbox", "cargo-home");
 
 /// 镜像里那个二进制的落点。overlay 单独替换它，与资产表不同源：
 /// 它来自构建产物目录，不是 rev 检出里的文件。
-const OVERLAY_BINARY_DEST: &str = "/opt/cogneva/cogneva";
+const OVERLAY_BINARY_DEST: &str = cog_core::paths::APP_BINARY;
 
 /// 运行时资产表在检出的位置。真正的表是仓库里的这个文件，见
 /// [`MainlineDeployer::asset_list`]：部署器永远比它正在部署的 rev 旧一代，
@@ -100,7 +100,7 @@ const OVERLAY_UNREFRESHABLE: &[(&str, &str)] = &[];
 /// 与资产表分开：那张表里的每一行都是检出里现存的路径，原样拷就行；这里的前端
 /// 产物在检出里不存在，要先在构建容器里从 `web/` 编出来。门禁对这两类的态度一样：
 /// 每个落点都得有一条说得出理由的刷新路径，否则测试红。
-const OVERLAY_BUILT_ASSETS: &[&str] = &["/opt/cogneva/web"];
+const OVERLAY_BUILT_ASSETS: &[&str] = &[cog_core::paths::APP_WEB_DIR];
 
 /// 构建前端用的镜像：集群 registry 里的 node 构建器。
 ///
@@ -114,7 +114,7 @@ const WEB_BUILDER_TAG: &str = "22-slim";
 /// npm registry 镜像，与 Dockerfile 全量构建用的同一条。
 const WEB_NPM_REGISTRY: &str = "https://registry.npmmirror.com";
 /// 前端产物在运行镜像里的落点。
-const WEB_DIST_DEST: &str = "/opt/cogneva/web";
+const WEB_DIST_DEST: &str = cog_core::paths::APP_WEB_DIR;
 /// 构建容器里放源码的路径。
 const WEB_BUILD_SRC: &str = "/src/web";
 
@@ -182,7 +182,7 @@ const SEED_TAG: &str = "seed";
 
 /// 不可变主线 tag 的前缀（`main-<rev12>`）。带 `main-` 的才是本仓库按 rev 一一
 /// 对应写下的名字，`tag_rev` 与 `main_tag` 两端都取它。
-const MAIN_TAG_PREFIX: &str = "main-";
+pub(crate) const MAIN_TAG_PREFIX: &str = "main-";
 
 /// 一轮里最多回收几批镜像库里的老镜像（每批 [`BUILDAH_RMI_BATCH_CHUNK`] 张）。
 ///
@@ -538,7 +538,7 @@ pub(crate) fn header_value(headers: &[(String, String)], name: &str) -> Option<S
 /// 这些 tag 的镜像内容与 rev 一一对应（不可变），其余（浮动签）不能由
 /// tag 反推 rev——必须问 registry 当前内容是什么版本。
 fn tag_is_immutable_for_rev(tag: &str) -> bool {
-    tag.starts_with("main-")
+    tag.starts_with(MAIN_TAG_PREFIX)
 }
 
 /// 浮动签是否就是目标 rev：仅当 registry 上该 tag 的镜像当前确实构建自
@@ -6252,26 +6252,31 @@ impl MainlineDeployer {
             }
         }
         let mut cmd = tokio::process::Command::new("cargo");
-        cmd.args(["build", "--release", "--bin", "cogneva"])
-            .current_dir(self.workdir())
-            .env("CARGO_BUILD_JOBS", &jobs)
-            .env("CARGO_HOME", CARGO_HOME_PVC)
-            // 拷贝配置依赖镜像里存在 config.toml：基础镜像一换、受限网络注入被
-            // 摘掉，上面整段就静默跳过，cargo 退回默认 git 索引直连 crates.io，
-            // 家庭网络拉取极慢——正是这段注释要防的慢路径。用环境变量钉死
-            // sparse，不依赖那个文件在不在，兜底从「尽量带到 PVC」变「必然成立」。
-            .env("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse")
-            // 工作树只放源码；产物落在共享 target，工作树重建也不用冷编译。
-            .env("CARGO_TARGET_DIR", self.target_dir())
-            // build.rs 回退只嵌 7 位短 sha，叠层后的 --version 校验匹配 12
-            // 位前缀会必败；显式注入完整 rev（与 swap-image 双保险同源）。
-            .env("COGNEVA_GIT_REVISION", rev)
-            // Injected from the same source as the rev: the source tree does have
-            // a .git in the worktree, but passing it explicitly keeps the name
-            // inside the image from depending on whether build.rs can find a tag
-            // at the moment it runs.
-            .env("COGNEVA_VERSION_ID", &version_id)
-            .kill_on_drop(true);
+        cmd.args([
+            "build",
+            "--release",
+            "--bin",
+            cog_core::paths::APP_BINARY_NAME,
+        ])
+        .current_dir(self.workdir())
+        .env("CARGO_BUILD_JOBS", &jobs)
+        .env("CARGO_HOME", CARGO_HOME_PVC)
+        // 拷贝配置依赖镜像里存在 config.toml：基础镜像一换、受限网络注入被
+        // 摘掉，上面整段就静默跳过，cargo 退回默认 git 索引直连 crates.io，
+        // 家庭网络拉取极慢——正是这段注释要防的慢路径。用环境变量钉死
+        // sparse，不依赖那个文件在不在，兜底从「尽量带到 PVC」变「必然成立」。
+        .env("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse")
+        // 工作树只放源码；产物落在共享 target，工作树重建也不用冷编译。
+        .env("CARGO_TARGET_DIR", self.target_dir())
+        // build.rs 回退只嵌 7 位短 sha，叠层后的 --version 校验匹配 12
+        // 位前缀会必败；显式注入完整 rev（与 swap-image 双保险同源）。
+        .env("COGNEVA_GIT_REVISION", rev)
+        // Injected from the same source as the rev: the source tree does have
+        // a .git in the worktree, but passing it explicitly keeps the name
+        // inside the image from depending on whether build.rs can find a tag
+        // at the moment it runs.
+        .env("COGNEVA_VERSION_ID", &version_id)
+        .kill_on_drop(true);
         let fut = cmd.output();
         let output = tokio::time::timeout(Duration::from_secs(self.cfg.build_timeout_secs), fut)
             .await
@@ -6449,7 +6454,7 @@ impl MainlineDeployer {
         let version = self
             .buildah_step(
                 "check-version",
-                &["run", ctr, "--", "/opt/cogneva/cogneva", "--version"],
+                &["run", ctr, "--", OVERLAY_BINARY_DEST, "--version"],
             )
             .await?;
         if !version.contains(rev12(rev)) {
@@ -6849,7 +6854,7 @@ impl MainlineDeployer {
                             "name": "mainline-rollout",
                             "image": new_tag,
                             "imagePullPolicy": "IfNotPresent",
-                            "command": ["/opt/cogneva/cogneva"],
+                            "command": [cog_core::paths::APP_BINARY],
                             "args": args,
                             // 不声明资源时 QoS 是 BestEffort——节点内存压力下最先
                             // 被驱逐的一档，而这个容器偏偏是决定"回滚不回滚"的判定
@@ -8691,7 +8696,7 @@ pub(crate) fn refused_command(error: &str, args: &[&str]) -> Option<(String, Str
 /// 部署器进程与它派出的滚动 Job 共用的身份。Job 以它去 apply，部署器自己的
 /// `auth can-i` 问的也是它——两处必须是同一个字符串，否则预检问的是另一个身份，
 /// 绿灯证明的不是这次投递会不会被拒。
-const EVOLUTION_SERVICE_ACCOUNT: &str = "cogneva-evolution";
+const EVOLUTION_SERVICE_ACCOUNT: &str = cog_core::topology::EVOLUTION;
 
 /// 拆分多文档 YAML（只拆，不过滤）：空文档（`---` 分隔产生）跳过。
 pub(crate) fn split_docs(yaml_text: &str, origin: &str) -> SFResult<Vec<serde_yaml::Value>> {

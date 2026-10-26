@@ -656,9 +656,7 @@ async fn kubectl(args: &[&str], timeout_secs: u64) -> Result<String, String> {
 }
 
 fn namespace() -> String {
-    std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "cogneva".to_string())
+    cog_core::topology::namespace()
 }
 
 /// This loop's name in the process liveness registry, and the value of

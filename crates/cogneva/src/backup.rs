@@ -60,10 +60,10 @@ const ERROR_TEXT_MAX_CHARS: usize = 2000;
 const DEFAULT_RUN_DEADLINE_SECONDS: i32 = 3600;
 
 /// 内部实例密钥对象名：业务 Pod 读的那一份（数据库/缓存/内部签名/S3/邮件）。
-pub const SECRET_NAME_INTERNAL: &str = "cogneva-secrets";
+pub const SECRET_NAME_INTERNAL: &str = cog_core::topology::SECRET_INTERNAL;
 /// 带外凭证对象名：只被安全网关读的那一份（LLM 上游、平台 token、git 身份私钥…）。
 /// 两片是权限边界，不是分类：内部那份是整对象 get，谁持它就读得到里面每一个键。
-pub const SECRET_NAME_OOB: &str = "cogneva-secrets-oob";
+pub const SECRET_NAME_OOB: &str = cog_core::topology::SECRET_OOB;
 
 /// 表发现查询：public schema 的普通表（relkind=r）与分区父表（p），
 /// 排除分区子表（pg_inherits 有登记的就是子表——父子都导会双份）与
@@ -334,10 +334,7 @@ impl BackupConfig {
             oob_secrets_dir: PathBuf::from(
                 std::env::var("COGNEVA_OOB_SECRETS_DIR").unwrap_or_else(|_| "/secrets-oob".into()),
             ),
-            data_dir: PathBuf::from(
-                std::env::var("COGNEVA_DATA_DIR")
-                    .unwrap_or_else(|_| "/var/lib/cogneva-data".into()),
-            ),
+            data_dir: PathBuf::from(cog_core::paths::data_dir()),
             extra_data_roots: parse_extra_data_roots(
                 "COGNEVA_BACKUP_EXTRA_DATA_ROOTS",
                 std::env::var("COGNEVA_BACKUP_EXTRA_DATA_ROOTS").ok(),
@@ -358,7 +355,7 @@ impl BackupConfig {
                 .ok()
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
-            namespace: std::env::var("COGNEVA_NAMESPACE").unwrap_or_else(|_| "cogneva".into()),
+            namespace: cog_core::topology::namespace(),
         })
     }
 
@@ -1784,7 +1781,7 @@ async fn run_backup_into(
 /// 本二进制带的最新 PG 迁移号。读不出来记 0（没声明），不让备份失败：
 /// 迁移目录缺席是打包问题，应当由别处的门去红，不是让这一晚没有备份。
 fn current_schema_version() -> i64 {
-    let app_dir = std::env::var("COGNEVA_APP_DIR").unwrap_or_else(|_| "/opt/cogneva".into());
+    let app_dir = cog_core::paths::app_dir();
     let dir = cog_storage::migrate::migrations_dir(&app_dir);
     match cog_storage::migrate::discover_up_migrations(&dir, cog_storage::migrate::Driver::Postgres)
     {
@@ -1929,7 +1926,11 @@ fn lossy_surfaces(bundle_present: bool, credentials_present: bool) -> Vec<LossyS
     if !credentials_present {
         surfaces.push(LossySurface {
             name: "credentials".to_string(),
-            lost: "两片 Secret 对象清单（`cogneva-secrets` / `cogneva-secrets-oob`）".to_string(),
+            lost: format!(
+                "两片 Secret 对象清单（`{}` / `{}`）",
+                cog_core::topology::SECRET_INTERNAL,
+                cog_core::topology::SECRET_OOB
+            ),
             acceptable_because:
                 "包不是密文时不把凭证抄进包：一份能读文件就拿走全部 token 的明文包，本身就是\
                  新的凭证载体。换机后内部那片由安装脚本重新生成，带外那片（平台 token、\
@@ -2614,9 +2615,7 @@ fn verify_package_against_manifest(
 pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("COGNEVA_DATABASE_URL")
         .map_err(|_| "COGNEVA_DATABASE_URL is required for restore")?;
-    let data_dir = PathBuf::from(
-        std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into()),
-    );
+    let data_dir = PathBuf::from(cog_core::paths::data_dir());
 
     let extract_root = if pkg.is_dir() {
         None
@@ -2727,17 +2726,23 @@ fn seed_evolution_bundle(
         Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
         _ => {
             if std::env::var("COGNEVA_RESTORE_SKIP_GIT_BUNDLE").as_deref() == Ok("1") {
+                let tree = cog_core::paths::TREE_REPO;
                 tracing::warn!(
                     bundle_bytes = report.bytes,
                     refs = report.refs,
-                    "包里有进化 bare 仓的 bundle，但恢复端没有落点且被显式跳过：未推的 rev 留在包里，没有种回 /host-git"
+                    tree,
+                    "包里有进化 bare 仓的 bundle，但恢复端没有落点且被显式跳过：未推的 rev 留在包里，\
+                     没有种回 {tree}"
                 );
                 return Ok(());
             }
-            return Err("包里有进化 bare 仓的 git bundle，但恢复端没有落点：\
-                 设 COGNEVA_RESTORE_GIT_REMOTE_DIR 指向 /host-git 那一卷；\
-                 确认目标不需要进化时显式设 COGNEVA_RESTORE_SKIP_GIT_BUNDLE=1"
-                .into());
+            return Err(format!(
+                "包里有进化 bare 仓的 git bundle，但恢复端没有落点：\
+                 设 COGNEVA_RESTORE_GIT_REMOTE_DIR 指向 {} 那一卷；\
+                 确认目标不需要进化时显式设 COGNEVA_RESTORE_SKIP_GIT_BUNDLE=1",
+                cog_core::paths::TREE_REPO
+            )
+            .into());
         }
     };
     seed_evolution_bundle_into(&bundle, report, &target)
@@ -3322,7 +3327,7 @@ impl DrillConfig {
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
         let database_url = std::env::var("COGNEVA_DATABASE_URL")
             .map_err(|_| "COGNEVA_DATABASE_URL is required for backup-drill")?;
-        let app_dir = std::env::var("COGNEVA_APP_DIR").unwrap_or_else(|_| "/opt/cogneva".into());
+        let app_dir = cog_core::paths::app_dir();
         let (package, also_unproven) = requested_package(std::env::args().skip(1))?;
         Ok(Self {
             database_url,

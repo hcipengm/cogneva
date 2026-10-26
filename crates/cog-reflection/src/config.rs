@@ -118,7 +118,10 @@ impl Default for PromotionGateConfig {
             ],
             config_prefixes: vec![
                 "prompts/".into(),
-                "deploy/k3s/cogneva-json-configmap.yaml".into(),
+                format!(
+                    "deploy/k3s/{}-configmap.yaml",
+                    cog_core::topology::CONFIG_CONFIGMAP
+                ),
             ],
             // Derived, not transcribed: this default used to name four of the
             // contract's nine, so the promotion gate alone would have let a
@@ -148,8 +151,7 @@ impl PromotionGateConfig {
     /// 安全侧）；段存在但解析失败、或 env 值非法时返回 Err——配置写错
     /// 必须响亮失败，不许静默降级成默认。
     pub fn load() -> SFResult<Self> {
-        let path = std::env::var("COGNEVA_CONFIG_PATH")
-            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+        let path = cog_core::paths::config_file();
         Self::load_from(Path::new(&path))
     }
     pub fn load_from(path: &Path) -> SFResult<Self> {
@@ -337,7 +339,7 @@ impl Default for ChangeJobConfig {
             job_cpu_limit: "2000m".into(),
             job_memory_limit: "6Gi".into(),
             image_pull_policy: "IfNotPresent".into(),
-            delivery_dir: "/opt/cogneva/sandbox/change-exec".into(),
+            delivery_dir: cog_core::paths::app_path_str("sandbox/change-exec"),
             kubectl_bin: "kubectl".into(),
         }
     }
@@ -348,8 +350,7 @@ impl ChangeJobConfig {
     /// 文件或段缺失时返回 Default（enabled=false，等于从前）。段存在但解析失败、
     /// 或 env 值非法时返回 Err——配置写错必须响亮失败，不许静默降级成默认。
     pub fn load() -> SFResult<Self> {
-        let path = std::env::var("COGNEVA_CONFIG_PATH")
-            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+        let path = cog_core::paths::config_file();
         Self::load_from(Path::new(&path))
     }
 
@@ -448,8 +449,7 @@ impl GenerationLimits {
     /// env 覆盖。文件或段缺失时返回 Default；段存在但取值不是非负整数时返回
     /// Err——配置写错必须响亮失败，不许静默降级成默认。
     pub fn load() -> SFResult<Self> {
-        let path = std::env::var("COGNEVA_CONFIG_PATH")
-            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+        let path = cog_core::paths::config_file();
         Self::load_from(Path::new(&path))
     }
 
@@ -520,8 +520,7 @@ impl BaselinePortConfig {
     /// env 覆盖。文件或段缺失时返回 Default；段存在但解析失败、或 env
     /// 值非法时返回 Err——配置写错必须响亮失败。
     pub fn load() -> SFResult<Self> {
-        let path = std::env::var("COGNEVA_CONFIG_PATH")
-            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+        let path = cog_core::paths::config_file();
         Self::load_from(Path::new(&path))
     }
 
@@ -620,12 +619,12 @@ impl Default for GitOpsConfig {
             poll_interval_secs: 120,
             registry: None,
             local_registry: String::new(),
-            work_dir: "/opt/cogneva/gitops".into(),
+            work_dir: cog_core::paths::app_path_str("gitops"),
             kubectl_bin: "kubectl".into(),
             builder_bin: "buildah".into(),
-            namespace: "cogneva".into(),
-            deployment: "cogneva".into(),
-            container: "cogneva".into(),
+            namespace: cog_core::topology::namespace(),
+            deployment: cog_core::topology::MAIN_DEPLOYMENT.into(),
+            container: cog_core::topology::MAIN_CONTAINER.into(),
             canary_watch_secs: 600,
             canary_error_rate_multiplier: 1.5,
             canary_p99_multiplier: 1.3,
@@ -828,18 +827,18 @@ impl Default for MainlineDeployerConfig {
         Self {
             enabled: false,
             poll_interval_secs: 600,
-            bare_repo: "/host-git".into(),
+            bare_repo: cog_core::paths::TREE_REPO.into(),
             branch: "main".into(),
             upstreams: Vec::new(),
             git_proxy_base: String::new(),
             upstream_fetch_timeout_secs: 300,
             registry: String::new(),
             local_registry: String::new(),
-            namespace: "cogneva".into(),
+            namespace: cog_core::topology::namespace(),
             builder_bin: "buildah".into(),
             kubectl_bin: "kubectl".into(),
             kubectl_host_path: String::new(),
-            state_dir: "/opt/cogneva/sandbox/mainline".into(),
+            state_dir: cog_core::paths::app_path_str("sandbox/mainline"),
             build_timeout_secs: 3600,
             cargo_build_jobs: 2,
             soak_secs: 120,
@@ -869,31 +868,31 @@ impl Default for MainlineDeployerConfig {
             registry_maintenance_cooldown_secs: 21600,
             targets: vec![
                 RolloutTargetConfig {
-                    deployment: "cogneva-security-gateway".into(),
+                    deployment: cog_core::topology::SECURITY_GATEWAY.into(),
                     container: "security-gateway".into(),
                     component: "security-gateway".into(),
                     name: "cogneva".into(),
                     manifest: Some("gateway-deployment.yaml".into()),
                 },
                 RolloutTargetConfig {
-                    deployment: "cogneva-sandbox-executor".into(),
+                    deployment: cog_core::topology::SANDBOX_EXECUTOR.into(),
                     container: "sandbox-executor".into(),
                     component: "sandbox-executor".into(),
                     name: "cogneva".into(),
                     manifest: Some("sandbox-executor-deployment.yaml".into()),
                 },
                 RolloutTargetConfig {
-                    deployment: "cogneva".into(),
-                    container: "cogneva".into(),
+                    deployment: cog_core::topology::MAIN_DEPLOYMENT.into(),
+                    container: cog_core::topology::MAIN_CONTAINER.into(),
                     component: "gateway".into(),
                     name: "cogneva".into(),
                     manifest: Some("deployment.yaml".into()),
                 },
                 RolloutTargetConfig {
-                    deployment: "cogneva-evolution".into(),
-                    container: "cogneva".into(),
+                    deployment: cog_core::topology::EVOLUTION.into(),
+                    container: cog_core::topology::MAIN_CONTAINER.into(),
                     component: "evolution".into(),
-                    name: "cogneva-evolution".into(),
+                    name: cog_core::topology::EVOLUTION.into(),
                     manifest: Some("evolution-deployment.yaml".into()),
                 },
             ],
@@ -1012,8 +1011,7 @@ impl MainlineDeployerConfig {
     /// env 覆盖。文件或段缺失时返回 Default（enabled=false，安全侧）；
     /// 段存在但解析失败、或 env 值非法时返回 Err——配置写错必须响亮失败。
     pub fn load() -> SFResult<Self> {
-        let path = std::env::var("COGNEVA_CONFIG_PATH")
-            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+        let path = cog_core::paths::config_file();
         Self::load_from(Path::new(&path))
     }
 

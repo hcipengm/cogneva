@@ -24,9 +24,7 @@ pub const DECLARED_CONFIG_JSON: &str =
 /// One resolution for the loader and for the delivery check: two copies of the
 /// path would let a check judge a file the process never reads.
 pub fn config_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(
-        std::env::var("COGNEVA_CONFIG_PATH").unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into()),
-    )
+    std::path::PathBuf::from(cog_core::paths::config_file())
 }
 
 /// Observability exporters configuration (Loki / Jaeger / ClickHouse / Alertmanager).

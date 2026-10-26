@@ -2884,7 +2884,10 @@ async fn plugins_list_handler(State(state): State<Arc<GatewayState>>) -> Respons
     match state.plugin_registry {
         Some(ref registry) => {
             // MVP: list from local dir only. In future support remote registry query.
-            match registry.discover("/opt/cogneva/plugins").await {
+            match registry
+                .discover(&cog_core::paths::app_path_str("plugins"))
+                .await
+            {
                 Ok(manifests) => {
                     (StatusCode::OK, Json(json!({ "plugins": manifests }))).into_response()
                 }

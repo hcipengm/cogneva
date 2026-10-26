@@ -37,7 +37,7 @@ use cog_core::SFResult;
 /// One file at the application root rather than a marker inside each
 /// destination: writing into an asset directory would change the very digest
 /// being recorded, and the asset directories are read back by name elsewhere.
-pub const RUNTIME_ASSET_MANIFEST_DEST: &str = "/opt/cogneva/runtime-assets.json";
+pub const RUNTIME_ASSET_MANIFEST_DEST: &str = cog_core::paths::APP_RUNTIME_ASSET_MANIFEST;
 
 /// The repository's asset list, embedded at build time.
 ///

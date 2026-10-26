@@ -43,8 +43,7 @@ pub(crate) static DATA_DIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::co
 
 /// 交接目录。与其它运行时数据同卷：切换会换掉进程映像，换不掉挂载。
 pub fn dir() -> PathBuf {
-    let root = std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into());
-    PathBuf::from(root).join("pending-promotions")
+    cog_core::paths::data_path("pending-promotions")
 }
 
 /// 文件系统安全的 change id。

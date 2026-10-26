@@ -17,7 +17,10 @@ use std::collections::HashMap;
 use std::ops::Deref;
 
 /// Default system-wide config path (FHS).
-pub const DEFAULT_CONFIG_PATH: &str = "/etc/cogneva/cogneva.json";
+/// 配置文档的默认位置：`COGNEVA_CONFIG_PATH` 没给时读这里。
+pub fn default_config_path() -> String {
+    cog_core::paths::config_file()
+}
 
 // ---------------------------------------------------------------------------
 // AppConfig — thin wrapper around cog-core::Config for the binary layer
@@ -568,8 +571,7 @@ pub fn try_load() -> SFResult<AppConfig> {
     let mut config = AppConfig::default();
 
     // Layer 1: base config file
-    let base_path =
-        std::env::var("COGNEVA_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into());
+    let base_path = cog_core::paths::config_file();
     if let Some(base_value) = read_config_layer(&base_path)? {
         config = apply_config_layer(config, &base_path, base_value)?;
     }

@@ -286,7 +286,7 @@ pub fn sections_missing_from_document(doc: &Value) -> Vec<&'static str> {
 /// mount it whenever a section that only takes effect at startup has changed:
 /// the object moves on, the process keeps the document it read at start, and the
 /// delivery is otherwise reported as applied.
-pub const CONFIG_CONFIGMAP: &str = "cogneva-json";
+pub const CONFIG_CONFIGMAP: &str = crate::topology::CONFIG_CONFIGMAP;
 pub const CONFIG_DOCUMENT_KEY: &str = "cogneva.json";
 
 /// Where the alert rules live inside the document.

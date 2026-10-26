@@ -101,7 +101,7 @@ impl InstanceIdentity {
 /// 身份状态文件落点：`$COGNEVA_DATA_DIR/identity.json`，默认
 /// `/var/lib/cogneva-data/identity.json`。
 pub fn identity_state_path() -> PathBuf {
-    let dir = std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into());
+    let dir = cog_core::paths::data_dir();
     PathBuf::from(dir).join("identity.json")
 }
 

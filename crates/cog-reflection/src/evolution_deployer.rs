@@ -61,7 +61,7 @@ impl EvolutionDeployer {
             project_root: project_root.into(),
             binary_dir: binary_dir.into(),
             backup_dir: backup_dir.into(),
-            binary_name: "cogneva".to_string(),
+            binary_name: cog_core::paths::APP_BINARY_NAME.to_string(),
             build_timeout_secs: 3600,
             git_name: "Cogneva Self-Evolution".to_string(),
             git_email: "self-evolution@cogneva.ai".to_string(),

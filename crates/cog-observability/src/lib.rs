@@ -120,7 +120,7 @@ impl Default for SnapshotConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            storage_directory: PathBuf::from("/var/lib/cogneva-data/snapshots"),
+            storage_directory: cog_core::paths::data_path("snapshots"),
             hot_retention_days: 7,
             warm_retention_days: 90,
             compression_hot: 0,
@@ -144,9 +144,9 @@ impl Default for RawStreamConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            hot_dir: PathBuf::from("/var/lib/cogneva-data/raw-streams/hot"),
-            warm_dir: PathBuf::from("/var/lib/cogneva-data/raw-streams/warm"),
-            cold_dir: PathBuf::from("/var/lib/cogneva-data/raw-streams/cold"),
+            hot_dir: cog_core::paths::data_path("raw-streams/hot"),
+            warm_dir: cog_core::paths::data_path("raw-streams/warm"),
+            cold_dir: cog_core::paths::data_path("raw-streams/cold"),
             max_hot_file_size_mb: 256,
             flush_interval_sec: 30,
         }

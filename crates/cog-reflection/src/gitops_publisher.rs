@@ -204,7 +204,7 @@ impl GitOpsPublisher {
     /// 它基底镜像那一份，只会随 main 的部署器前移，不随本次晋级变化：金丝雀
     /// 验的是二进制，资产面的改动经主线 overlay 到达集群。
     async fn publish_image(&self, change_id: &str) -> SFResult<()> {
-        let binary = self.binary_dir.join("cogneva");
+        let binary = self.binary_dir.join(cog_core::paths::APP_BINARY_NAME);
         if !binary.exists() {
             return Err(SFError::IO(format!(
                 "staged binary not found: {}",
@@ -233,7 +233,8 @@ impl GitOpsPublisher {
         tokio::fs::write(
             &containerfile,
             format!(
-                "FROM {base}\nCOPY cogneva /opt/cogneva/cogneva\nENTRYPOINT [\"/opt/cogneva/cogneva\"]\n"
+                "FROM {base}\nCOPY cogneva {binary}\nENTRYPOINT [\"{binary}\"]\n",
+                binary = cog_core::paths::APP_BINARY
             ),
         )
         .await

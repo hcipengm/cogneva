@@ -18,15 +18,17 @@
 
 use cog_core::{SFError, SFResult};
 
+use crate::mainline_deployer::MAIN_TAG_PREFIX;
+
 /// 主负载：只有它们**全部**跑在同一个 `main-<rev>` tag 上，那个 tag 才是可信的现役版本。
 ///
 /// 名单写在模块作用域、只此一份——按名把集群读回来的那条命令，与按名字过滤出这几行的
 /// 解析函数，共用它。
 pub const BASE_DEPLOYMENTS: [&str; 4] = [
-    "cogneva",
-    "cogneva-security-gateway",
-    "cogneva-sandbox-executor",
-    "cogneva-evolution",
+    cog_core::topology::MAIN_DEPLOYMENT,
+    cog_core::topology::SECURITY_GATEWAY,
+    cog_core::topology::SANDBOX_EXECUTOR,
+    cog_core::topology::EVOLUTION,
 ];
 
 /// 按名读一个 deployment 的输出形状：`<名字>\t<容器>=<image>,…\n`。
@@ -143,7 +145,7 @@ pub fn deployed_main_rev(jsonpath_out: &str) -> Option<String> {
             if let Some(rev) = image
                 .rsplit(':')
                 .next()
-                .and_then(|tag| tag.strip_prefix("main-"))
+                .and_then(|tag| tag.strip_prefix(MAIN_TAG_PREFIX))
             {
                 revs.insert(rev.to_string());
                 on_main += 1;

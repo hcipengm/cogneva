@@ -229,8 +229,7 @@ impl MemoryConfig {
     /// 自读 cogneva.json `memory` 段 + env 覆盖；文件/段缺失回退默认，
     /// 段存在但解析失败响亮报错。
     pub fn load() -> SFResult<Self> {
-        let path = std::env::var("COGNEVA_CONFIG_PATH")
-            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+        let path = cog_core::paths::config_file();
         Self::load_from(std::path::Path::new(&path))
     }
 

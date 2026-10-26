@@ -168,7 +168,7 @@ pub async fn installation_token(
         .post(&url)
         .bearer_auth(jwt)
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "cogneva-security-gateway")
+        .header("User-Agent", cog_core::topology::SECURITY_GATEWAY)
         .send()
         .await
         .map_err(|e| format!("请求 GitHub installation token 失败: {e}"))?;

@@ -2683,7 +2683,7 @@ async fn resolve_port_instance_id() -> String {
             return v.to_string();
         }
     }
-    let dir = std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into());
+    let dir = cog_core::paths::data_dir();
     let path = std::path::PathBuf::from(dir).join("identity.json");
     if let Ok(text) = tokio::fs::read_to_string(&path).await {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -3098,7 +3098,7 @@ async fn ensure_binary_in_place(
     binary_dir: &std::path::Path,
     sandbox_mode: bool,
 ) -> cog_core::SFResult<()> {
-    let expected_binary = binary_dir.join("cogneva");
+    let expected_binary = binary_dir.join(cog_core::paths::APP_BINARY_NAME);
 
     let current_exe = match std::env::current_exe() {
         Ok(p) => p,

@@ -297,10 +297,7 @@ impl GitHubIntegrationConfig {
         if !self.git_workdir.trim().is_empty() {
             return std::path::PathBuf::from(self.git_workdir.trim());
         }
-        let dir = std::env::var("COGNEVA_DATA_DIR")
-            .ok()
-            .filter(|d| !d.trim().is_empty())
-            .unwrap_or_else(|| "/var/lib/cogneva-data".into());
+        let dir = cog_core::paths::data_dir();
         std::path::Path::new(dir.trim()).join("git-workdir")
     }
 }
@@ -513,8 +510,7 @@ impl GitHubIntegrationConfig {
     /// 自读 cogneva.json `github_integration` 段 + env 覆盖。
     /// 文件/段缺失回退默认（enabled=false）；段存在但解析失败响亮报错。
     pub fn load() -> SFResult<Self> {
-        let path = std::env::var("COGNEVA_CONFIG_PATH")
-            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+        let path = cog_core::paths::config_file();
         Self::load_from(std::path::Path::new(&path))
     }
 
@@ -588,8 +584,7 @@ impl GiteeIntegrationConfig {
     /// 自读 cogneva.json `gitee_integration` 段 + env 覆盖，语义同
     /// [`GitHubIntegrationConfig::load`]。
     pub fn load() -> SFResult<Self> {
-        let path = std::env::var("COGNEVA_CONFIG_PATH")
-            .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+        let path = cog_core::paths::config_file();
         Self::load_from(std::path::Path::new(&path))
     }
 

@@ -41,9 +41,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::security_gateway::suspect_backoff_secs;
 
 /// 镜像根目录：`<root>/github/<owner>/<repo>.git`。
-pub(crate) const DEFAULT_MIRROR_ROOT: &str = "/var/lib/cogneva-git-mirror";
+pub(crate) const DEFAULT_MIRROR_ROOT: &str = cog_core::paths::GIT_MIRROR_ROOT;
 /// 私钥挂载点（来自 Secret `cogneva-secrets` 的 `git-ssh-private-key`）。
-pub(crate) const DEFAULT_SSH_KEY: &str = "/etc/cogneva/git-ssh/id_ed25519";
+/// 网关用的 git 私钥：配置目录下 `git-ssh/` 里的那一把。
+pub(crate) fn default_ssh_key() -> std::path::PathBuf {
+    std::path::Path::new(cog_core::paths::CONFIG_DIR).join("git-ssh/id_ed25519")
+}
 /// SSH 目标前缀，拼在 `<owner>/<repo>.git` 前。scp 形式，与
 /// `pull-upstream-main.sh` 里 `git@github.com:hcipengm/cogneva.git` 同款。
 pub(crate) const DEFAULT_SSH_BASE: &str = "git@github.com:";
@@ -142,7 +145,7 @@ impl GitMirrorConfig {
             .unwrap_or(true);
         let key = env_nonempty("COGNEVA_GATEWAY_GIT_SSH_KEY")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_SSH_KEY));
+            .unwrap_or_else(default_ssh_key);
         let ssh_base =
             env_nonempty("COGNEVA_GATEWAY_GIT_SSH_BASE").unwrap_or_else(|| DEFAULT_SSH_BASE.into());
         // 私钥不存在 = 兜底根本没配好。保持"未启用"而不是每次请求都去试一遍

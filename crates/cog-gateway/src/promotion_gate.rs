@@ -17,9 +17,9 @@ use serde_json::json;
 
 use crate::llm_admin::KubeClient;
 
-const CONFIGMAP_NAME: &str = "cogneva-json";
+const CONFIGMAP_NAME: &str = cog_core::topology::CONFIG_CONFIGMAP;
 const CONFIGMAP_KEY: &str = "cogneva.json";
-const MAIN_DEPLOYMENT: &str = "cogneva";
+const MAIN_DEPLOYMENT: &str = cog_core::topology::MAIN_DEPLOYMENT;
 
 #[derive(Debug, Deserialize)]
 pub struct PromotionGateRequest {

@@ -25,7 +25,7 @@ impl Default for SkillConfig {
     fn default() -> Self {
         Self {
             directories: vec![
-                PathBuf::from("/opt/cogneva/skills"),
+                PathBuf::from(cog_core::paths::APP_SKILLS_DIR),
                 PathBuf::from("/var/lib/cogneva/skills"),
                 PathBuf::from("~/.cogneva/skills"),
             ],

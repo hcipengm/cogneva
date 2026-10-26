@@ -8022,7 +8022,7 @@ fn init_gateway_logging(
             LokiPushClient::new(&obs.loki.endpoint)
                 .with_max_retries(obs.loki.max_retries.max(1))
                 .with_timeout(obs.loki.timeout_secs)
-                .with_label("service", "cogneva-security-gateway")
+                .with_label("service", cog_core::topology::SECURITY_GATEWAY)
                 .with_client(http_client.clone()),
         );
         // The loop is started by the caller once the flush loop's metric sink
@@ -8036,7 +8036,12 @@ fn init_gateway_logging(
     } else {
         None
     };
-    init_subscriber_with_pusher(&level, format, pusher.clone(), "cogneva-security-gateway");
+    init_subscriber_with_pusher(
+        &level,
+        format,
+        pusher.clone(),
+        cog_core::topology::SECURITY_GATEWAY,
+    );
     pusher
 }
 

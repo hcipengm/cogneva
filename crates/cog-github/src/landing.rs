@@ -257,9 +257,7 @@ fn redriving_repeats_the_refusal(category: LandingCategory) -> bool {
 
 /// Where the channel keeps everything it has to remember across a restart.
 pub fn data_dir() -> PathBuf {
-    PathBuf::from(
-        std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into()),
-    )
+    PathBuf::from(cog_core::paths::data_dir())
 }
 
 /// Directory holding one `<change_id>.json` file per landing.

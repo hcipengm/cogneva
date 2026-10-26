@@ -16,9 +16,9 @@ use serde_json::{Map, Value};
 use crate::llm_admin::KubeClient;
 
 /// 内部片：业务 Pod 读的键，加上本进程写的非凭证状态键。
-pub(crate) const SECRET_NAME_INTERNAL: &str = "cogneva-secrets";
+pub(crate) const SECRET_NAME_INTERNAL: &str = cog_core::topology::SECRET_INTERNAL;
 /// 带外片：只被安全网关读的键（另见 backup.yaml 的整体导出卷）。
-pub(crate) const SECRET_NAME_OOB: &str = "cogneva-secrets-oob";
+pub(crate) const SECRET_NAME_OOB: &str = cog_core::topology::SECRET_OOB;
 
 /// 带外片装这些键。与 `deploy/scripts/init-secrets.sh` 的 `OOB_KEYS` 同一张表；
 /// 两边都要有是因为一侧在编译期分派、一侧在安装期搬迁，而**安装期那一侧是搬迁

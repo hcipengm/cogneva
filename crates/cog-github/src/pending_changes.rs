@@ -13,7 +13,7 @@ use cog_core::{GeneratedChange, SFResult};
 
 /// Directory holding one `<change_id>.json` file per staged change.
 pub fn pending_dir() -> PathBuf {
-    let dir = std::env::var("COGNEVA_DATA_DIR").unwrap_or_else(|_| "/var/lib/cogneva-data".into());
+    let dir = cog_core::paths::data_dir();
     PathBuf::from(dir).join("pending-changes")
 }
 

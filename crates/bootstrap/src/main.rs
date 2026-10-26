@@ -1196,7 +1196,7 @@ const GIT_MIRROR_GITEE: &str = "https://gitee.com/hcipengm/cogneva.git";
 /// 零历史——进化需要完整历史做 log/blame/tag/基线对齐。节点源码（浅克隆）仍供
 /// 编译引导器与 apply 清单，与进化 bare 解耦。
 async fn ensure_git_remote() -> Result<()> {
-    let remote = Path::new("/var/lib/cogneva-data/git-remote");
+    let remote = Path::new(&cog_core::paths::data_dir()).join("git-remote");
     if remote.join("HEAD").exists() {
         info!("git-remote bare 仓库已存在，跳过");
         return Ok(());
@@ -1774,14 +1774,16 @@ async fn distribute_via_daemonset(tar: &str, namespace: &str) -> Result<()> {
             "kubectl",
             &[
                 "-n", namespace, "wait", "--for=condition=Available",
-                "deployment/cogneva-image-server", "--timeout=600s",
+                &format!("deployment/{}", cog_core::topology::IMAGE_SERVER),
+                "--timeout=600s",
             ],
         )
         .await?;
         let cp_cmd = format!(
-            "POD=$(kubectl -n {namespace} get pod -l app=cogneva-image-server \
+            "POD=$(kubectl -n {namespace} get pod -l app={server} \
              -o jsonpath='{{.items[0].metadata.name}}') && \
-             kubectl -n {namespace} cp '{tar}' \"$POD\":/share/image.tar.gz"
+             kubectl -n {namespace} cp '{tar}' \"$POD\":/share/image.tar.gz",
+            server = cog_core::topology::IMAGE_SERVER
         );
         run("sh", &["-c", &cp_cmd]).await?;
         info!("触发/重发分发（rollout restart 保证重跑时重新导入）...");
@@ -1792,7 +1794,7 @@ async fn distribute_via_daemonset(tar: &str, namespace: &str) -> Result<()> {
                 namespace,
                 "rollout",
                 "restart",
-                "daemonset/cogneva-image-distributor",
+                &format!("daemonset/{}", cog_core::topology::IMAGE_DISTRIBUTOR),
             ],
         )
         .await?;
@@ -1804,7 +1806,7 @@ async fn distribute_via_daemonset(tar: &str, namespace: &str) -> Result<()> {
                 namespace,
                 "rollout",
                 "status",
-                "daemonset/cogneva-image-distributor",
+                &format!("daemonset/{}", cog_core::topology::IMAGE_DISTRIBUTOR),
                 "--timeout=900s",
             ],
         )
@@ -2132,7 +2134,7 @@ async fn ensure_source_tree() -> Result<PathBuf> {
         return Ok(root);
     }
     let dir = make_workdir("src")?;
-    let bare = Path::new("/var/lib/cogneva-data/git-remote");
+    let bare = Path::new(&cog_core::paths::data_dir()).join("git-remote");
     let upstream = if cn_mirror() {
         [GIT_MIRROR_GITEE, GIT_MIRROR_GITHUB]
     } else {
@@ -3334,7 +3336,10 @@ fn chart_values() -> Result<serde_yaml::Value> {
 /// 而这里拿不到对象时无法区分"被关掉"与"没建出来"。
 async fn wait_ready(namespace: &str) -> Result<()> {
     let mut not_ready = Vec::new();
-    for deploy in ["cogneva", "cogneva-security-gateway"] {
+    for deploy in [
+        cog_core::topology::MAIN_DEPLOYMENT,
+        cog_core::topology::SECURITY_GATEWAY,
+    ] {
         let out = Command::new("kubectl")
             .args([
                 "-n",
@@ -3494,10 +3499,11 @@ async fn ensure_port_forward(webui: &str, namespace: &str) {
     // 的端口取自 Service 自己：`8080` 曾经写死在这里，等于把 `gateway.httpPort` 抄了
     // 一份——values 挪了端口之后，port-forward 把浏览器转到 Service 上没有的端口，
     // 而这条命令自己报「已建立」。
-    let target = match declared_service_port(namespace, "cogneva", "http", "port").await {
+    let service = cog_core::topology::MAIN_DEPLOYMENT;
+    let target = match declared_service_port(namespace, service, "http", "port").await {
         Ok(port) => port,
         Err(e) => {
-            warn!("读不到 svc/cogneva 的 http 端口，这次不建 port-forward：{e:#}");
+            warn!("读不到 svc/{service} 的 http 端口，这次不建 port-forward：{e:#}");
             return;
         }
     };
@@ -3514,6 +3520,7 @@ async fn ensure_port_forward(webui: &str, namespace: &str) {
         return;
     }
     let spec = format!("{port}:{target}");
+    let service_ref = format!("svc/{service}");
     match Command::new("kubectl")
         .args([
             "-n",
@@ -3521,7 +3528,7 @@ async fn ensure_port_forward(webui: &str, namespace: &str) {
             "port-forward",
             "--address",
             "0.0.0.0",
-            "svc/cogneva",
+            &service_ref,
             &spec,
         ])
         .stdin(Stdio::null())
@@ -3529,10 +3536,12 @@ async fn ensure_port_forward(webui: &str, namespace: &str) {
         .stderr(Stdio::null())
         .spawn()
     {
-        Ok(_) => info!("已后台建立 port-forward: 0.0.0.0:{port} → svc/cogneva:{target}"),
+        Ok(_) => {
+            info!("已后台建立 port-forward: 0.0.0.0:{port} → {service_ref}:{target}")
+        }
         Err(e) => warn!(
             "自动 port-forward 失败（{e}），请手动执行: \
-             kubectl -n {namespace} port-forward --address 0.0.0.0 svc/cogneva {spec}"
+             kubectl -n {namespace} port-forward --address 0.0.0.0 {service_ref} {spec}"
         ),
     }
 }

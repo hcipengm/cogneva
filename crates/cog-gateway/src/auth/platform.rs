@@ -156,8 +156,16 @@ async fn login_with_platform_token(
         Err(message) => return json_err(StatusCode::BAD_GATEWAY, "token_verify_failed", message),
     };
 
-    let token_ref = format!("secret:cogneva-secrets/{provider}_token");
-    let refresh_ref = gitee_refresh.map(|_| format!("secret:cogneva-secrets/{provider}_refresh"));
+    let token_ref = format!(
+        "secret:{}/{provider}_token",
+        cog_core::topology::SECRET_INTERNAL
+    );
+    let refresh_ref = gitee_refresh.map(|_| {
+        format!(
+            "secret:{}/{provider}_refresh",
+            cog_core::topology::SECRET_INTERNAL
+        )
+    });
     let (user, created) = match store
         .find_or_create_by_identity(
             provider,
@@ -559,8 +567,16 @@ pub async fn oauth_callback_handler(
                         .into_response()
                 }
             };
-            let token_ref = format!("secret:cogneva-secrets/{provider}_token");
-            let refresh_ref = refresh.map(|_| format!("secret:cogneva-secrets/{provider}_refresh"));
+            let token_ref = format!(
+                "secret:{}/{provider}_token",
+                cog_core::topology::SECRET_INTERNAL
+            );
+            let refresh_ref = refresh.map(|_| {
+                format!(
+                    "secret:{}/{provider}_refresh",
+                    cog_core::topology::SECRET_INTERNAL
+                )
+            });
             let (user, created) = match store
                 .find_or_create_by_identity(
                     &provider,

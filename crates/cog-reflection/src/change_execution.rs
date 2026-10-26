@@ -832,7 +832,7 @@ pub async fn run_execute_change_cli() -> Result<(), Box<dyn std::error::Error>> 
 const JOB_CONTAINER: &str = "change-execution";
 /// 父进程容器的名字：镜像摘要与挂载面都从**这个容器**的现场读。写错名字的后果
 /// 是一条指名道姓的拒绝，而不是一个别处的镜像。
-const PARENT_CONTAINER: &str = "cogneva";
+const PARENT_CONTAINER: &str = cog_core::topology::MAIN_CONTAINER;
 
 /// 每次 kubectl 调用的墙钟上界。它是控制面的读，不是构建：超过这个数说明
 /// API 侧已经不正常，再等也只是把常驻进程挂在这里。
@@ -1148,7 +1148,7 @@ pub fn plan_change_job(
         "name": JOB_CONTAINER,
         "image": facts.image,
         "imagePullPolicy": config.image_pull_policy,
-        "command": ["/opt/cogneva/cogneva"],
+        "command": [cog_core::paths::APP_BINARY],
         "args": [
             "execute-change",
             "--request",

@@ -247,13 +247,14 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
         if self_evolution.enabled {
             let switcher_config = crate::binary_switcher::BinarySwitcherConfig {
                 binary_dir: PathBuf::from(&self_evolution.binary_dir),
-                binary_name: "cogneva".into(),
+                binary_name: cog_core::paths::APP_BINARY_NAME.into(),
                 health_url: format!("http://127.0.0.1:{}/health", ctx.config().gateway.http_port),
                 health_check_grace_period_secs: self_evolution.health_check_grace_period_secs,
                 health_check_interval_secs: self_evolution.health_check_interval_secs,
                 health_check_max_retries: self_evolution.health_check_max_retries,
-                systemd_service_name: "cogneva".into(),
-                sidecar_socket_path: PathBuf::from("/run/cogneva/sidecar.sock"),
+                systemd_service_name: cog_core::paths::APP_BINARY_NAME.into(),
+                sidecar_socket_path: std::path::Path::new(cog_core::paths::RUN_DIR)
+                    .join("sidecar.sock"),
             };
             let switcher: Arc<dyn cog_core::BinarySwitcher> =
                 crate::binary_switcher::build_switcher(

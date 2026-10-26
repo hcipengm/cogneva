@@ -9,8 +9,7 @@ use std::path::Path;
 use cog_core::{SFError, SFResult};
 
 fn load_section<T: serde::de::DeserializeOwned + Default>(pointer: &str) -> SFResult<T> {
-    let path =
-        std::env::var("COGNEVA_CONFIG_PATH").unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+    let path = cog_core::paths::config_file();
     load_section_from(Path::new(&path), pointer)
 }
 
@@ -365,9 +364,13 @@ mod tests {
             "cogneva.example.json".to_string(),
             read_config(&root.join("cogneva.example.json")),
         )];
+        let k3s_configmap = format!(
+            "deploy/k3s/{}-configmap.yaml",
+            cog_core::topology::CONFIG_CONFIGMAP
+        );
         for relative in [
             "deploy/helm/cogneva/files/cogneva.json",
-            "deploy/k3s/cogneva-json-configmap.yaml",
+            k3s_configmap.as_str(),
         ] {
             out.push((relative.to_string(), read_config(&root.join(relative))));
         }

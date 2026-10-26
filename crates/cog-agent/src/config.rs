@@ -11,8 +11,7 @@ fn load_section<T: serde::de::DeserializeOwned + Default>(
     pointer: &str,
     env_map: &[(&str, &str)],
 ) -> SFResult<T> {
-    let path =
-        std::env::var("COGNEVA_CONFIG_PATH").unwrap_or_else(|_| "/etc/cogneva/cogneva.json".into());
+    let path = cog_core::paths::config_file();
     load_section_from(Path::new(&path), pointer, env_map)
 }
 

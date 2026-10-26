@@ -36,7 +36,7 @@ pub(crate) const KUBESPRAY_TAG: &str = "v2.31.0";
 
 /// 工作目录：inventory 与 group_vars 落这里，挂载进 kubespray 容器。
 fn work_dir() -> PathBuf {
-    PathBuf::from("/var/lib/cogneva-data/kubespray")
+    cog_core::paths::data_path("kubespray")
 }
 
 /// 解析后的节点 SSH 目标。

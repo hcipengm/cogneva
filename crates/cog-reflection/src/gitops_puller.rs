@@ -671,8 +671,12 @@ impl GitOpsPuller {
         let mut applied = Vec::new();
         let mut prompts_touched = false;
         let mut restart_sections: Vec<String> = Vec::new();
+        let config_manifest = format!(
+            "deploy/k3s/{}-configmap.yaml",
+            cog_core::topology::CONFIG_CONFIGMAP
+        );
         for file in changed.lines() {
-            if file == "deploy/k3s/cogneva-json-configmap.yaml" {
+            if file == config_manifest {
                 let content = self
                     .run("git", &["show", &format!("HEAD:{file}")], Some(&dir), 30)
                     .await?;
@@ -843,7 +847,7 @@ impl GitOpsPuller {
                     &self.config.namespace,
                     "create",
                     "configmap",
-                    "cogneva-prompts",
+                    cog_core::topology::PROMPTS_CONFIGMAP,
                     &format!("--from-file={}", staging.display()),
                     "--dry-run=client",
                     "-o",

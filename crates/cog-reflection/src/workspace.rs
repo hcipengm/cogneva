@@ -76,9 +76,6 @@ fn index_sample_needs_write(
     }
 }
 
-/// 工作树默认根目录（沙盒 PVC 内，与 bin/backups/changes/mainline 同级）。
-pub const DEFAULT_WORKSPACES_ROOT: &str = "/opt/cogneva/sandbox/workspaces";
-
 /// 工作树仓库里上游主线的引用名（`local` 远程的 `main`）。与
 /// `change_pipeline::sync_with_upstream_in` 对齐到的那个引用是同一个。
 const MAINLINE_REF: &str = "local/main";

@@ -14,7 +14,7 @@ impl PlatformPaths {
     pub fn data_dir() -> PathBuf {
         #[cfg(target_os = "linux")]
         {
-            PathBuf::from("/var/lib/cogneva-data")
+            std::path::PathBuf::from(cog_core::paths::data_dir())
         }
         #[cfg(target_os = "macos")]
         {
@@ -34,7 +34,7 @@ impl PlatformPaths {
     pub fn config_dir() -> PathBuf {
         #[cfg(target_os = "linux")]
         {
-            PathBuf::from("/etc/cogneva")
+            std::path::PathBuf::from(cog_core::paths::CONFIG_DIR)
         }
         #[cfg(target_os = "macos")]
         {
@@ -54,7 +54,7 @@ impl PlatformPaths {
     pub fn app_dir() -> PathBuf {
         #[cfg(target_os = "linux")]
         {
-            PathBuf::from("/opt/cogneva")
+            PathBuf::from(cog_core::paths::APP_DIR)
         }
         #[cfg(target_os = "macos")]
         {
@@ -93,7 +93,7 @@ impl PlatformPaths {
     pub fn pid_dir() -> PathBuf {
         #[cfg(target_os = "linux")]
         {
-            PathBuf::from("/run/cogneva")
+            std::path::PathBuf::from(cog_core::paths::RUN_DIR)
         }
         #[cfg(target_os = "macos")]
         {

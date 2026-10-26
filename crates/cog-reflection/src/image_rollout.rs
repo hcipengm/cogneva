@@ -97,8 +97,9 @@ impl ImageRollout {
                 ))
             })?;
 
+        let binary = cog_core::paths::APP_BINARY;
         let containerfile = format!(
-            "FROM {}\nCOPY {} /opt/cogneva/cogneva\nENTRYPOINT [\"/opt/cogneva/cogneva\"]\n",
+            "FROM {}\nCOPY {} {binary}\nENTRYPOINT [\"{binary}\"]\n",
             self.base_image()?,
             binary_name
         );

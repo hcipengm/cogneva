@@ -66,7 +66,6 @@ pub const APPROVAL_TTL_SECS_ENV: &str = "HOST_DOCS_APPROVAL_TTL_SECS";
 /// Largest plan this module will stage for approval.
 pub const MAX_PLAN_BYTES_ENV: &str = "HOST_DOCS_MAX_PLAN_BYTES";
 
-const DEFAULT_JOURNAL_DIR: &str = "/opt/cogneva/sandbox/host-docs-journal";
 /// Default for the body of one host document. Sized for the largest document
 /// this platform writes by hand (a plan or an audit), not to the channel's bound:
 /// a document is stored whole, so the number answers to what a reader can open.
@@ -169,7 +168,7 @@ impl HostDocsConfig {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_JOURNAL_DIR));
+            .unwrap_or_else(|| cog_core::paths::app_path("sandbox/host-docs-journal"));
         let max_doc_bytes = env_positive(MAX_DOC_BYTES_ENV, DEFAULT_MAX_DOC_BYTES);
         let mut cfg = Self::from_spec(
             std::env::var(SCOPES_ENV).ok().as_deref(),

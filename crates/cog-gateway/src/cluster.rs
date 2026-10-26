@@ -70,9 +70,16 @@ pub async fn cluster_components_handler() -> Json<ClusterComponents> {
     }];
 
     if let Ok(client) = KubeClient::in_cluster() {
+        components.push(
+            deployment_status(
+                &client,
+                "security-gateway",
+                cog_core::topology::SECURITY_GATEWAY,
+            )
+            .await,
+        );
         components
-            .push(deployment_status(&client, "security-gateway", "cogneva-security-gateway").await);
-        components.push(deployment_status(&client, "evolution", "cogneva-evolution").await);
+            .push(deployment_status(&client, "evolution", cog_core::topology::EVOLUTION).await);
     } else {
         for id in ["security-gateway", "evolution"] {
             components.push(ComponentStatus {

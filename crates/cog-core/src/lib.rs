@@ -12,9 +12,11 @@ pub mod fs_size;
 pub mod git_budget;
 pub mod loop_health;
 pub mod observability_text;
+pub mod paths;
 pub mod reading_cadence;
 pub mod secrets;
 pub mod token_estimate;
+pub mod topology;
 pub mod types;
 
 pub use audit::{verify_chain, AuditEvent, AuditKind, AuditStream, ChainVerification};

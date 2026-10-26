@@ -2487,10 +2487,14 @@ mod tests {
     #[test]
     fn the_estimator_reaches_every_token_budget_the_shipped_configs_declare() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let k3s_configmap = format!(
+            "deploy/k3s/{}-configmap.yaml",
+            cog_core::topology::CONFIG_CONFIGMAP
+        );
         let carriers = [
             "cogneva.example.json",
             "deploy/helm/cogneva/files/cogneva.json",
-            "deploy/k3s/cogneva-json-configmap.yaml",
+            k3s_configmap.as_str(),
         ];
         let mut declared = Vec::new();
         for carrier in carriers {

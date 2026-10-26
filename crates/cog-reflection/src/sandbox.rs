@@ -37,7 +37,7 @@ impl std::fmt::Display for SandboxKind {
 
 /// Default dedicated sandbox root, matching the K3s evolution pod layout
 /// (`/opt/cogneva/sandbox/src` is the pod working repo).
-pub const DEFAULT_SANDBOX_DIR: &str = "/opt/cogneva/sandbox";
+pub const DEFAULT_SANDBOX_DIR: &str = cog_core::app_path_literal!("sandbox");
 
 /// The buildah store under the sandbox root.
 ///

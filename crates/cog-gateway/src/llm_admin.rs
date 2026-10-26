@@ -28,7 +28,7 @@ const SECRET_UPSTREAMS_KEY: &str = "llm-upstreams";
 /// Secret：声明池需要几家、与声明池里有哪几家是同一件事，分两处写就会有一段时间
 /// 里两边说的不是同一个池。
 const SECRET_MIN_HEALTHY_KEY: &str = "llm-pool-min-healthy";
-const GATEWAY_DEPLOYMENT: &str = "cogneva-security-gateway";
+const GATEWAY_DEPLOYMENT: &str = cog_core::topology::SECURITY_GATEWAY;
 
 /// 上游能力探测单次最多等多久。
 ///
@@ -113,8 +113,7 @@ pub async fn llm_status_handler(State(_state): State<Arc<crate::GatewayState>>) 
 /// Backends declared in the local cogneva.json (informational only — after
 /// credential narrowing the primary backend points at the security gateway).
 fn local_backends() -> Vec<serde_json::Value> {
-    let path = std::env::var("COGNEVA_CONFIG_PATH")
-        .unwrap_or_else(|_| "/etc/cogneva/cogneva.json".to_string());
+    let path = cog_core::paths::config_file();
     match std::fs::read_to_string(&path)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
@@ -808,7 +807,7 @@ impl KubeClient {
         let token = String::from_utf8_lossy(&read("token")?).trim().to_string();
         let namespace = read("namespace")
             .map(|b| String::from_utf8_lossy(&b).trim().to_string())
-            .unwrap_or_else(|_| "cogneva".to_string());
+            .unwrap_or_else(|_| cog_core::topology::namespace());
         let ca = reqwest::Certificate::from_pem(&read("ca.crt")?)
             .map_err(|e| format!("集群 CA 证书解析失败: {e}"))?;
         let http = reqwest::Client::builder()

@@ -46,7 +46,7 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// A default rather than a constant: the mount point is a fact about a
 /// deployment's filesystem, so a deployment that puts it elsewhere says so
 /// through [`TREE_REPO_ENV`] instead of living with the wrong one.
-pub const DEFAULT_TREE_REPO: &str = "/host-git";
+pub const DEFAULT_TREE_REPO: &str = cog_core::paths::TREE_REPO;
 
 /// The revision a check is measured against when the deployment names none.
 ///
