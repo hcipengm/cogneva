@@ -211,8 +211,11 @@ fn row_dedup_key(source: &str) -> String {
 
 /// Carry out a verdict: raise or close the row, or leave it alone and say why.
 ///
-/// Answers whether the row is left firing, which is what decides whether this
-/// writer has anything left to sight.
+/// Answers whether a firing row this process wrote is now standing. That is what
+/// decides whether the writer has anything left to sight, and it takes the write
+/// itself to answer: a verdict that could not be persisted owes no clock, and a
+/// loop that went looking for a row nobody managed to write would exit silently
+/// on its first tick.
 async fn act(
     action: DeliveryAction,
     store: &Option<Arc<dyn AlertRowStore>>,
@@ -233,8 +236,7 @@ async fn act(
                 source,
                 &message,
             )
-            .await;
-            true
+            .await
         }
         DeliveryAction::Resolve => {
             info!(
@@ -602,9 +604,9 @@ async fn set_row(
     firing: bool,
     source: &str,
     message: &str,
-) {
+) -> bool {
     let Some(store) = store else {
-        return;
+        return false;
     };
     let alert = NewAlert {
         rule: rule.to_string(),
@@ -642,9 +644,13 @@ async fn set_row(
                 // nobody being able to see it.
                 None => crate::alerts::record_delivered_in_app(metrics, 1).await,
             }
+            true
         }
-        Ok(AlertTransition::Resolved | AlertTransition::NoChange) => {}
-        Err(e) => warn!(source = %source, error = %e, "config declaration alert persist failed"),
+        Ok(AlertTransition::Resolved | AlertTransition::NoChange) => true,
+        Err(e) => {
+            warn!(source = %source, error = %e, "config declaration alert persist failed");
+            false
+        }
     }
 }
 
@@ -1243,11 +1249,12 @@ mod tests {
     // 写者报告过条件仍成立）点名的就是它，而写者一直活着。那不是孤儿行，是把
     // 一次性的判词喂给了按节拍要读数的判据。
 
-    /// 只数复述、不许改写：判词落成之后这一支只推进存活钟，重写就是重新点亮一行
-    /// 别人已经关掉的告警。
+    /// 只数复述与写判词各几次：判词落成之后这一支只推进存活钟，重写就是重新点亮
+    /// 一行别人已经关掉的告警。
     #[derive(Default)]
     struct SightingStore {
         refreshes: std::sync::atomic::AtomicUsize,
+        writes: std::sync::atomic::AtomicUsize,
         firing: std::sync::atomic::AtomicBool,
     }
 
@@ -1263,6 +1270,10 @@ mod tests {
         fn refreshes(&self) -> usize {
             self.refreshes.load(std::sync::atomic::Ordering::SeqCst)
         }
+
+        fn writes(&self) -> usize {
+            self.writes.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     #[async_trait::async_trait]
@@ -1272,7 +1283,9 @@ mod tests {
             _condition: bool,
             _alert: &NewAlert,
         ) -> anyhow::Result<AlertTransition> {
-            panic!("复述只推进存活钟；重新写一次判词会把别人关掉的行点亮")
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(AlertTransition::Fired)
         }
 
         async fn resolve_unrefreshed(
@@ -1313,6 +1326,7 @@ mod tests {
             .await
             .expect("停机之后这一支要停")
             .unwrap();
+        assert_eq!(store.writes(), 0, "复述重写了判词：那把别人关掉的行点亮");
     }
 
     /// 行被别人关掉之后不许再点亮：新版本的进程按同一把键关掉它是修复，而复述
@@ -1339,6 +1353,7 @@ mod tests {
         let after = store.refreshes();
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert_eq!(store.refreshes(), after, "行已经关了，还在复述");
+        assert_eq!(store.writes(), 0, "复述重写了判词：那把别人关掉的行点亮");
     }
 
     /// 只有落成 firing 的判词才欠一个节拍。关行与「什么也不说」都不该留下一支
@@ -1346,8 +1361,24 @@ mod tests {
     #[tokio::test]
     async fn only_a_firing_verdict_keeps_speaking() {
         let no_store: Option<Arc<dyn AlertRowStore>> = None;
+        let written = SightingStore::open();
+        let stored: Option<Arc<dyn AlertRowStore>> =
+            Some(written.clone() as Arc<dyn AlertRowStore>);
         assert!(
             act(
+                DeliveryAction::Fire("x".into()),
+                &stored,
+                None,
+                None,
+                SOURCE,
+                &DocumentDelivery::Matches
+            )
+            .await,
+            "写进去的 firing 判词要接着复述"
+        );
+        assert_eq!(written.writes(), 1, "那一行得真的写出去");
+        assert!(
+            !act(
                 DeliveryAction::Fire("x".into()),
                 &no_store,
                 None,
@@ -1356,7 +1387,7 @@ mod tests {
                 &DocumentDelivery::Matches
             )
             .await,
-            "firing 的判词要接着复述"
+            "写不进去就没有行可维持：立一支复述只会在第一拍空转着退出"
         );
         assert!(
             !act(
