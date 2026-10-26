@@ -1216,7 +1216,7 @@ async fn ensure_git_remote() -> Result<()> {
     );
     for url in [primary, fallback] {
         // 失败重试前清掉半截 clone 产物，避免下次 clone 因目录非空报错。
-        std::fs::remove_dir_all(remote).ok();
+        std::fs::remove_dir_all(&remote).ok();
         match run("git", &["clone", "--bare", url, &remote.to_string_lossy()]).await {
             Ok(()) => {
                 info!("git-remote bare 已从 {url} seed");
