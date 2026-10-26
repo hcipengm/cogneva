@@ -91,15 +91,254 @@ fn rust_sources() -> Vec<PathBuf> {
     out
 }
 
-/// Whether this line ends the production half of a file: everything after
-/// `#[cfg(test)]` or an inline `mod tests {` is a specimen, not a deployment
-/// fact. The tree puts its test modules last, so the first marker is the
-/// boundary.
+/// Whether this line opens a test-gated item: `#[cfg(test)]` or an inline
+/// `mod tests {`. The item that follows is a specimen, not a deployment fact.
 fn opens_test_module(line: &str) -> bool {
     let trimmed = line.trim_start();
     trimmed.starts_with("#[cfg(test)]")
         || trimmed.starts_with("mod tests")
         || trimmed.starts_with("pub mod tests")
+}
+
+/// One line's brace shape: how the nesting changes, and whether a `{` opened.
+#[derive(Clone, Copy, Default)]
+struct BraceShape {
+    delta: i32,
+    opens: bool,
+}
+
+/// Per-line brace shapes for a whole file, carrying string, character-literal
+/// and comment state across the newlines.
+///
+/// Counting each line on its own is not enough. A fixture string spans lines --
+/// `"suggestions":[]}"#,` closes a raw string opened four lines above -- and the
+/// `}` inside that text would end a skipped item early, after which the rest of
+/// the test module reads as production. Over-reading is noisy; under-reading is
+/// silent, and only one of those is a gate.
+///
+/// Three things that look like nesting and are not: braces inside string or
+/// character literals, and a `'` that is a lifetime (`&'a str`) rather than the
+/// opening of `'{'`. A character literal's closing quote is the next quote
+/// within a few bytes; a lifetime's is not.
+fn brace_shapes(text: &str) -> Vec<BraceShape> {
+    let b = text.as_bytes();
+    let mut out: Vec<BraceShape> = Vec::new();
+    let mut shape = BraceShape::default();
+    let mut i = 0;
+    let mut block_comment = 0usize;
+    let mut string = false;
+    let mut raw_hashes: Option<usize> = None;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\n' {
+            out.push(shape);
+            shape = BraceShape::default();
+            i += 1;
+            continue;
+        }
+        if block_comment > 0 {
+            if c == b'/' && b.get(i + 1) == Some(&b'*') {
+                block_comment += 1;
+                i += 2;
+                continue;
+            }
+            if c == b'*' && b.get(i + 1) == Some(&b'/') {
+                block_comment -= 1;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(hashes) = raw_hashes {
+            if c == b'"' {
+                let mut j = i + 1;
+                let mut seen = 0;
+                while seen < hashes && b.get(j) == Some(&b'#') {
+                    seen += 1;
+                    j += 1;
+                }
+                if seen == hashes {
+                    raw_hashes = None;
+                    i = j;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if string {
+            if c == b'\\' {
+                // A backslash that ends the line continues the string: let the
+                // newline below emit the line boundary, or every later line's
+                // shape is reported one line early.
+                if b.get(i + 1) == Some(&b'\n') || b.get(i + 2) == Some(&b'\n') {
+                    i += 1;
+                } else {
+                    i += 2;
+                }
+                continue;
+            }
+            if c == b'"' {
+                string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                block_comment = 1;
+                i += 2;
+                continue;
+            }
+            b'"' => {
+                string = true;
+                i += 1;
+                continue;
+            }
+            b'\'' => {
+                let mut j = i + 1;
+                if b.get(j) == Some(&b'\\') {
+                    j += 1;
+                }
+                let mut close = None;
+                while j < b.len() && j <= i + 5 {
+                    if b[j] == b'\'' {
+                        close = Some(j);
+                        break;
+                    }
+                    j += 1;
+                }
+                i = match close {
+                    Some(at) => at + 1,
+                    None => i + 1,
+                };
+                continue;
+            }
+            b'r' | b'b' | b'c' => {
+                let mut j = i + 1;
+                if b.get(j) == Some(&b'"') {
+                    string = true;
+                    i = j + 1;
+                    continue;
+                }
+                if c == b'b' || c == b'c' {
+                    if b.get(j) != Some(&b'r') {
+                        i += 1;
+                        continue;
+                    }
+                    j += 1;
+                }
+                let mut hashes = 0;
+                while b.get(j) == Some(&b'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'"') {
+                    raw_hashes = Some(hashes);
+                    i = j + 1;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            b'{' => {
+                shape.delta += 1;
+                shape.opens = true;
+            }
+            b'}' => shape.delta -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(shape);
+    out
+}
+
+/// One line's brace delta, for the scanner's own tests.
+fn brace_delta(line: &str) -> i32 {
+    brace_shapes(line)
+        .first()
+        .copied()
+        .unwrap_or_default()
+        .delta
+}
+
+/// The production half of one source file, in order.
+///
+/// The boundary is per item, not "everything after the first test module":
+/// `mainline_deployer.rs` carries a `#[cfg(test)] fn` about a third of the way
+/// in and roughly two thousand lines of production after it. Cutting at the
+/// first marker leaves that tail unread while the census still reads clean --
+/// which is the one failure a gate cannot have, because "I never looked there"
+/// and "I looked and found nothing" are the same reading.
+fn production_lines(text: &str) -> Vec<&str> {
+    let lines: Vec<&str> = text.lines().collect();
+    let shapes = brace_shapes(text);
+    let mut out = Vec::new();
+    let mut gated = false;
+    let mut skipping: Option<(i32, bool)> = None;
+    let mut waiting = 0usize;
+    for (index, line) in lines.iter().copied().enumerate() {
+        let shape = shapes.get(index).copied().unwrap_or_default();
+        let trimmed = line.trim_start();
+        if skipping.is_none() {
+            if opens_test_module(line) {
+                // `#[cfg(test)]` decorates the next item; `mod tests {` *is* the
+                // item and opens a body on this very line.
+                gated = !shape.opens;
+                if shape.opens {
+                    skipping = Some((shape.delta, true));
+                }
+                waiting = 0;
+                continue;
+            }
+            if gated {
+                // Blanks, comments and further attributes still belong to the
+                // item the gate decorates.
+                if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("#[") {
+                    continue;
+                }
+                gated = false;
+                skipping = Some((0, false));
+                waiting = 0;
+            } else {
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                out.push(line);
+                continue;
+            }
+        }
+        // Inside a skipped item, or starting one on this line.
+        let (depth, opened) = skipping.take().unwrap_or((0, false));
+        let next = depth + shape.delta;
+        let opened = opened || shape.opens;
+        let ended = (opened && next <= 0) || (!opened && trimmed.ends_with(';'));
+        if ended {
+            waiting = 0;
+        } else if !opened {
+            // An item whose body never opens is a parse this scanner does not
+            // understand; after a while it gives up and reads the lines as
+            // production. Reading too much shows up as a red gate; reading too
+            // little shows up as nothing at all.
+            waiting += 1;
+            if waiting > 50 {
+                waiting = 0;
+            } else {
+                skipping = Some((next.max(0), opened));
+            }
+        } else {
+            skipping = Some((next.max(0), opened));
+        }
+    }
+    out
 }
 
 /// The cluster-DNS addresses written on one line.
@@ -144,8 +383,8 @@ fn addresses_on(line: &str) -> Vec<String> {
     out
 }
 
-/// Every in-cluster address the production half of the tree writes down.
-fn census() -> BTreeSet<Found> {
+/// Every hit of one predicate in the production half of the tree.
+fn census_with(scan: fn(&str) -> Vec<String>) -> BTreeSet<Found> {
     let mut out = BTreeSet::new();
     for path in rust_sources() {
         let rel = path
@@ -155,14 +394,8 @@ fn census() -> BTreeSet<Found> {
             .replace('\\', "/");
         let text =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        for line in text.lines() {
-            if opens_test_module(line) {
-                break;
-            }
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
-            for address in addresses_on(line) {
+        for line in production_lines(&text) {
+            for address in scan(line) {
                 out.insert(Found {
                     file: rel.clone(),
                     address,
@@ -171,6 +404,11 @@ fn census() -> BTreeSet<Found> {
         }
     }
     out
+}
+
+/// Every in-cluster address the production half of the tree writes down.
+fn census() -> BTreeSet<Found> {
+    census_with(addresses_on)
 }
 
 /// The register's rows, as `(file, address)`.
@@ -262,6 +500,132 @@ fn the_scanner_reads_the_dns_form_and_nothing_else() {
     );
 }
 
+/// 判据的边界必须按条目切，不能按「第一个测试标记」切。
+///
+/// 这一段是照着树里真实出现的形状写的：一个 `#[cfg(test)] fn`（测试夹具）夹在
+/// 两段生产代码中间。按第一个标记截断的扫法会把后面那段生产代码整段跳过，而读数
+/// 仍然是绿的——「没看」和「看了没有」读出来一模一样，这是门最不能有的失效方式。
+#[test]
+fn the_census_reads_on_after_a_test_helper_that_sits_before_production() {
+    let text = r#"
+fn before() {
+    let a = "cogneva-registry.cogneva.svc.cluster.local:5000";
+}
+
+#[cfg(test)]
+fn a_fixture() -> String {
+    let t = "localhost:30500/cogneva:local";
+    format!("{t}{}")
+}
+
+fn after() {
+    let b = "prom.monitoring.svc.cluster.local:9090";
+}
+"#;
+    let read: Vec<&str> = production_lines(text)
+        .into_iter()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            "fn before() {",
+            r#"let a = "cogneva-registry.cogneva.svc.cluster.local:5000";"#,
+            "}",
+            "fn after() {",
+            r#"let b = "prom.monitoring.svc.cluster.local:9090";"#,
+            "}",
+        ],
+        "夹具那一项要跳过，它后面的生产代码要接着读"
+    );
+}
+
+/// 同一个判据：整块 `#[cfg(test)] mod tests { … }` 跳过，模块关掉之后生产代码
+/// 重新算数；`format!` 里的花括号是文本，不能把跳过的地方算错。
+#[test]
+fn a_test_module_is_skipped_and_production_after_it_is_not() {
+    let text = r#"
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_case() {
+        let s = format!("{}", "{");
+        assert_eq!(s, "{");
+    }
+}
+
+fn production() {
+    let a = "prom.monitoring.svc.cluster.local:9090";
+}
+"#;
+    let read: Vec<&str> = production_lines(text)
+        .into_iter()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            "fn production() {",
+            r#"let a = "prom.monitoring.svc.cluster.local:9090";"#,
+            "}",
+        ],
+        "测试模块整块不算生产面，它后面那段算"
+    );
+}
+
+/// 夹具字符串跨行时，它里面的 `}` 不能把测试模块提前收掉。
+///
+/// 这一段是照 `cog-agent/src/web.rs` 的真实形状抄的：`mod tests` 里一个
+/// `r#"…"#` 跨了四行，正文里有个 `}`。按行数括号会在那里把模块判成结束、
+/// 把后面整段测试读成生产面——反过来也一样容易：漏读一段生产代码，读数还是绿的。
+#[test]
+fn a_fixture_string_that_spans_lines_does_not_end_the_module() {
+    let text = r##"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_case() {
+        let body = r#"[
+            {"answers":[],"suggestions":["rust async"]}"#;
+        assert!(!body.is_empty());
+    }
+}
+
+fn production() {
+    let a = "prom.monitoring.svc.cluster.local:9090";
+}
+"##;
+    let read: Vec<&str> = production_lines(text)
+        .into_iter()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            "fn production() {",
+            r#"let a = "prom.monitoring.svc.cluster.local:9090";"#,
+            "}",
+        ],
+        "跨行夹具里的 `}}` 是文本，模块在那里没结束"
+    );
+}
+
+/// 花括号只在代码里配对：字面量里的 `{` `}` 是文本，字符字面量 `'{'` 也不是嵌套。
+#[test]
+fn braces_inside_literals_do_not_nest() {
+    assert_eq!(brace_delta(r##"let s = format!("{rev}");"##), 0);
+    assert_eq!(brace_delta(r#"let c = '{';"#), 0);
+    assert_eq!(brace_delta(r#"let c = '}';"#), 0);
+    assert_eq!(brace_delta("fn f(&'a self) -> &'a str {"), 1);
+    assert_eq!(brace_delta("// }{}{"), 0);
+    assert_eq!(brace_delta("}"), -1);
+}
+
 /// 第二张登记表：以节点端口当 registry 的镜像引用。
 ///
 /// 判据与 DNS 那一条是两回事。`localhost:8080` 是本地跑与 port-forward 都在用的
@@ -293,31 +657,7 @@ fn node_port_registries_on(line: &str) -> Vec<String> {
 
 /// 生产半边里所有以节点端口当 registry 的镜像引用。
 fn node_port_census() -> BTreeSet<Found> {
-    let mut out = BTreeSet::new();
-    for path in rust_sources() {
-        let rel = path
-            .strip_prefix(repo_root())
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let text =
-            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        for line in text.lines() {
-            if opens_test_module(line) {
-                break;
-            }
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
-            for address in node_port_registries_on(line) {
-                out.insert(Found {
-                    file: rel.clone(),
-                    address,
-                });
-            }
-        }
-    }
-    out
+    census_with(node_port_registries_on)
 }
 
 // Same ratchet arithmetic as the DNS census above, and the same reason for

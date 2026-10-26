@@ -106,34 +106,72 @@ fn scan(root: &Path) -> Vec<Row> {
         let Ok(text) = std::fs::read_to_string(&entry) else {
             continue;
         };
-        let lines: Vec<&str> = text.lines().collect();
-        let mut expecting_test_module = false;
-        for line in lines.iter() {
-            let trimmed = line.trim();
-            let is_test_module = if trimmed.starts_with("//") {
-                false
-            } else if trimmed.starts_with("#[") {
-                if trimmed.starts_with("#[cfg(test") {
-                    expecting_test_module = true;
-                }
-                false
-            } else if expecting_test_module {
-                expecting_test_module = false;
-                has_inline_module_body(line, true)
-            } else {
-                has_inline_module_body(line, false)
-            };
-            if is_test_module {
-                break;
-            }
-            let Some(row) = parse_const(line, &rel) else {
-                continue;
-            };
-            rows.push(row);
-        }
+        rows.extend(production_rows(&text, &rel));
     }
     rows.sort();
     rows.dedup();
+    rows
+}
+
+/// One file's constants, with fixture bodies skipped by their braces.
+///
+/// A `break` at the first test module is what the literal scan used to do, and
+/// the comment there records what it cost: a number below the module read as
+/// invisible while the register still read as complete. The same hole is silent
+/// here -- a constant after a mid-file `mod tests` would be missing from the
+/// scan *and* from the register, so neither side of the comparison names it.
+///
+/// The name only decides the module when nothing guards it: under
+/// `#[cfg(test)]` the name is the author's.
+fn production_rows(text: &str, rel: &str) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let mut depth: i32 = 0;
+    let mut fixtures: Option<i32> = None;
+    let mut expecting_test_module = false;
+    let mut raw: Option<usize> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let code = code_only(line, &mut raw);
+        // `#[cfg(test)]` guards whatever comes next -- a module, or a single
+        // `fn for_test` -- but attributes and doc comments may sit in between,
+        // so the guard waits for the next line that is code.
+        let opens_tests = if trimmed.starts_with("//") {
+            false
+        } else if trimmed.starts_with("#[") {
+            if trimmed.starts_with("#[cfg(test") {
+                expecting_test_module = true;
+            }
+            false
+        } else if expecting_test_module {
+            expecting_test_module = false;
+            has_inline_module_body(line, true) || code.contains('{')
+        } else {
+            has_inline_module_body(line, false)
+        };
+        let in_fixtures = fixtures.is_some();
+        let depth_before = depth;
+        depth += code.matches('{').count() as i32 - code.matches('}').count() as i32;
+        let opened_tests = opens_tests && fixtures.is_none();
+        if opened_tests {
+            fixtures = Some(depth_before);
+        }
+        // The opening line may carry no brace of its own, so it must not be the
+        // line that closes the span it just opened.
+        if !opened_tests {
+            if let Some(entry_depth) = fixtures {
+                if depth <= entry_depth {
+                    fixtures = None;
+                }
+            }
+        }
+        if in_fixtures || opens_tests {
+            continue;
+        }
+        let Some(row) = parse_const(line, rel) else {
+            continue;
+        };
+        rows.push(row);
+    }
     rows
 }
 
@@ -488,6 +526,44 @@ const PLAIN: u64 = 30;
     assert_eq!(value_of("BARE").as_deref(), Some("7s"));
     assert_eq!(value_of("QUALIFIED").as_deref(), Some("250ms"));
     assert_eq!(value_of("PLAIN").as_deref(), Some("30"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A constant declared after an inline test module is production, and the scan
+/// has to read on past the module to find it.
+///
+/// Stopping at the first module is the cheap version of this rule, and it fails
+/// in the one direction a register cannot afford: the number is missing from the
+/// scan *and* from the register, so neither side of the comparison names it and
+/// the gate reads clean. `mainline_deployer.rs` carries a `#[cfg(test)]` item a
+/// third of the way in with production below it; the same shape with a module
+/// would have hidden every constant under it.
+#[test]
+fn a_constant_after_a_test_module_is_still_counted() {
+    let root = std::env::temp_dir().join(format!("cog-after-module-{}", std::process::id()));
+    let src = root.join("crates/probe/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("dials.rs"),
+        r#"
+const BEFORE: u64 = 30;
+
+#[cfg(test)]
+mod tests {
+    const FIXTURE: usize = 12;
+
+    #[test]
+    fn a_case() {
+        assert_eq!(super::BEFORE, 30);
+    }
+}
+
+const AFTER: u64 = 45;
+"#,
+    )
+    .unwrap();
+    let names: Vec<String> = scan(&root).into_iter().map(|row| row.name).collect();
+    assert_eq!(names, vec!["AFTER".to_string(), "BEFORE".to_string()]);
     std::fs::remove_dir_all(&root).ok();
 }
 
