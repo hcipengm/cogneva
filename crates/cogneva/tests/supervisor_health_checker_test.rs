@@ -242,6 +242,63 @@ async fn an_agent_still_in_the_fleet_keeps_its_dead_verdict_pass_after_pass() {
     }
 }
 
+// ─── 离队不是掉线 ────────────────────────────────────────────────────
+//
+// 一次性角色干完活会自己注销，注册记录到期也会从名单里消失——两者对健康检查都
+// 只是「名单里没有它」，区别只在它还有没有被人认领。实测（2026-10-26）：这条规则
+// firing 的 233 行里 222 行的 id 已经不在注册表索引里，只剩 11 行是到期消失的；
+// 也就是说它报的几乎全是「已经走了」，而真正还挂在名单上、只是不出声的那条常驻
+// `worker` 行被埋了四十分钟。
+//
+// 于是这一拍要把两者分开：判决照旧给回收方（走了不等于不用管），但只有「还挂在
+// 名单上」的那一份才算不健康。
+
+/// 还挂在名单里、心跳停了：判死，且不是离队——这一条必须报出去。
+#[tokio::test]
+async fn a_listed_agent_that_stops_beating_is_not_called_a_departure() {
+    let shared = ListingRegistry::with(&[("resident", 90)]);
+    let reg = Arc::new(AgentRegistry::new().with_agent_registry(shared));
+    let checker = HealthChecker::new(
+        Arc::clone(&reg),
+        fresh_backend(),
+        HealthCheckerConfig::default(),
+    );
+
+    let report = checker.check().await.unwrap();
+    assert_eq!(report.dead.len(), 1, "{report:?}");
+    assert!(
+        report.departed.is_empty(),
+        "名单里还认它，它是不出声，不是走了：{report:?}"
+    );
+}
+
+/// 一次性角色注销之后停拍：判决照旧（回收要用），但不许算作掉线的常驻 agent。
+#[tokio::test]
+async fn a_one_shot_that_left_the_fleet_is_marked_departed() {
+    let shared = ListingRegistry::with(&[("squad:one-shot-planner", 90)]);
+    let reg = Arc::new(AgentRegistry::new().with_agent_registry(shared.clone()));
+    let checker = HealthChecker::new(
+        Arc::clone(&reg),
+        fresh_backend(),
+        HealthCheckerConfig::default(),
+    );
+
+    // 还在名单里的一拍：它只是静了，判决进去、离队那栏不许有它。
+    let first = checker.check().await.unwrap();
+    assert_eq!(first.dead.len(), 1, "{first:?}");
+    assert!(first.departed.is_empty(), "{first:?}");
+
+    // 注销之后：本进程还留着它（回收窗口没到），但舰队已经不认领它了。
+    shared.forget("squad:one-shot-planner");
+    let second = checker.check().await.unwrap();
+    assert_eq!(second.dead.len(), 1, "判决照旧要给回收方：{second:?}");
+    assert_eq!(
+        second.departed,
+        vec!["squad:one-shot-planner".to_string()],
+        "名单里没有它了，这一份不许报成掉线：{second:?}"
+    );
+}
+
 /// 没挂共享注册表时不判「离队」：那个空名单说的是「本进程没有意见」，不是「舰队空了」。
 #[tokio::test]
 async fn without_a_shared_registry_a_silent_agent_is_never_forgotten() {

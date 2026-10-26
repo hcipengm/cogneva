@@ -16,6 +16,18 @@ pub struct HealthReport {
     pub suspect: Vec<(String, HealthIssue)>,
     pub dead: Vec<(String, HealthIssue)>,
     pub stuck: Vec<(String, HealthIssue)>,
+    /// 这一拍判过、而舰队名单里已经没有的 id。
+    ///
+    /// 判决本身留在上面三栏：要动手的一方（回收、重试、续跑）仍然需要知道「这个
+    /// agent 不出声了」，走了不等于不用管。但「离开舰队」与「掉线」不是同一件事，
+    /// 而名单是这里唯一能区分它们的东西——一次性角色干完活会自己注销，注册记录
+    /// 到期也会从名单里消失，两者对读者都是「名单里没有它」。
+    ///
+    /// 实测 2026-10-26：`agent_unhealthy` 当下 firing 的 233 行里 222 行的 id 已经
+    /// 不在注册表的索引里（正常注销过），只有 11 行是到期消失、3 行还有活记录。
+    /// 也就是说这条规则报的几乎全是「已经走了」，而不是「还挂着但不说话」——真正
+    /// 需要人看的那条常驻 `worker` 行被埋在中间 40 分钟。
+    pub departed: Vec<String>,
 }
 
 impl HealthReport {
@@ -182,6 +194,21 @@ impl HealthChecker {
             }
 
             report.healthy.push(agent.agent_id.clone());
+        }
+
+        // 判过的 id 里，哪些已经不在名单上了。名单不可读时（`listed` 为 None）这
+        // 一格留空：没有名单就没有「离开」，把一个读不到名单的一拍读成「全体离队」
+        // 会把整条规则静音。
+        if let Some(listed) = &listed {
+            report.departed = report
+                .suspect
+                .iter()
+                .chain(report.dead.iter())
+                .chain(report.stuck.iter())
+                .map(|(id, _)| id)
+                .filter(|id| !listed.contains(*id))
+                .cloned()
+                .collect();
         }
 
         // 退休：舰队名单里已经没有、而它的死亡已经有机会被报出去的 id，从本进程的

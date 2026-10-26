@@ -21,6 +21,50 @@ pub const SUPERVISOR_LOOP: &str = "supervisor_main";
 /// bring the crew back was still running; reaping later costs nothing but the
 /// announcement each pass makes about an agent that is already gone.
 const REAP_AFTER_DEAD: Duration = Duration::from_secs(1800);
+
+/// The verdicts a pass may announce as an unhealthy agent.
+///
+/// A verdict about an id the fleet no longer lists is a departure, not an
+/// unhealthy agent. Both look the same from the registry's side -- a one-shot
+/// role that finishes deregisters itself, and a record that stops being renewed
+/// expires -- so the distinction cannot be recovered afterwards; it has to be
+/// applied where the pass still knows whether the id was listed.
+///
+/// Announcing departures was the rule's whole output: measured 2026-10-26, 222
+/// of the 233 ids `agent_unhealthy` held firing had already left the registry's
+/// index (orderly deregistrations), leaving the one resident row that had been
+/// firing for forty minutes buried under them. What a departure loses by not
+/// being announced here is covered where the work itself is: a one-shot that
+/// dies mid-task leaves its DAG task stalled (`dag_task_stalled_after_ready`
+/// fires on it), and a resident process that dies is a pod event.
+fn announceable(
+    report: &crate::HealthReport,
+) -> impl Iterator<Item = (&String, &cog_core::HealthIssue)> {
+    report
+        .suspect
+        .iter()
+        .chain(report.dead.iter())
+        .chain(report.stuck.iter())
+        .filter_map(move |(agent_id, issue)| {
+            (!report.departed.contains(agent_id)).then_some((agent_id, issue))
+        })
+}
+
+/// Publish one `AgentUnhealthy` event per verdict the pass may announce.
+///
+/// Kept as its own function so the question "does a departure reach the event
+/// stream?" can be asked of a real channel instead of a hand-built report: the
+/// events are what the alert bridge turns into rows, and a filter that only
+/// exists in a report field is a filter no reader ever sees.
+fn announce_verdicts(report: &crate::HealthReport, event_tx: &broadcast::Sender<SupervisorEvent>) {
+    for (agent_id, issue) in announceable(report) {
+        let _ = event_tx.send(SupervisorEvent::AgentUnhealthy {
+            agent_id: agent_id.clone(),
+            issue: issue.clone(),
+            timestamp: Utc::now(),
+        });
+    }
+}
 use crate::control_plane::{ControlPlaneClient, HttpControlPlaneClient, SupervisorStatus};
 use crate::error::SupervisorResult;
 use crate::event_aggregator::{EventAggregator, EVENT_AGGREGATOR_LOOP};
@@ -402,19 +446,7 @@ impl Supervisor {
 
         // Legacy event emission for backward compatibility with subscribers
         // that expect AgentUnhealthy events from the Supervisor directly.
-        for (agent_id, issue) in report
-            .suspect
-            .iter()
-            .chain(report.dead.iter())
-            .chain(report.stuck.iter())
-        {
-            let event = SupervisorEvent::AgentUnhealthy {
-                agent_id: agent_id.clone(),
-                issue: issue.clone(),
-                timestamp: Utc::now(),
-            };
-            let _ = self.event_tx.send(event);
-        }
+        announce_verdicts(&report, &self.event_tx);
 
         if !report.dead.is_empty() {
             let dead_ids = report.dead_ids();
@@ -1033,5 +1065,73 @@ impl cog_core::Supervisor for Supervisor {
                 timestamp: chrono::Utc::now(),
             });
         Ok(checkpoint_id)
+    }
+}
+
+#[cfg(test)]
+mod announceable_tests {
+    //! 「离队」不进事件流：一条已经不在舰队名单上的判决不许报成「这个 agent 不健康」。
+    //! 门的另一半在 `cogneva/tests/supervisor_health_checker_test.rs`（谁进 `departed`）。
+
+    use super::*;
+    use cog_core::HealthIssue;
+
+    fn dead(id: &str) -> (String, HealthIssue) {
+        (
+            id.to_string(),
+            HealthIssue::Dead {
+                last_seen: Utc::now(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_departure_is_not_announced() {
+        let mut report = crate::HealthReport::default();
+        report.dead.push(dead("squad:one-shot-planner"));
+        report.departed.push("squad:one-shot-planner".into());
+        assert_eq!(
+            announceable(&report).count(),
+            0,
+            "注销过的一次性角色已经走了，不是掉线的常驻 agent"
+        );
+    }
+
+    #[test]
+    fn a_verdict_about_a_listed_agent_is_announced() {
+        let mut report = crate::HealthReport::default();
+        report.dead.push(dead("worker"));
+        assert_eq!(announceable(&report).count(), 1);
+    }
+
+    #[test]
+    fn a_departure_does_not_swallow_the_rest_of_the_pass() {
+        let mut report = crate::HealthReport::default();
+        report.dead.push(dead("squad:one-shot-planner"));
+        report
+            .suspect
+            .push(("worker".into(), HealthIssue::Suspect { missed_beats: 3 }));
+        report.departed.push("squad:one-shot-planner".into());
+        let announced: Vec<&str> = announceable(&report).map(|(id, _)| id.as_str()).collect();
+        assert_eq!(announced, vec!["worker"]);
+    }
+
+    /// 同一件事，问的是真正被读走的那一头：告警桥把事件变成行，所以「离队不报」
+    /// 必须落在事件流上，不能只落在一个没人读的字段里。
+    #[test]
+    fn a_departure_never_reaches_the_event_stream() {
+        let (tx, mut rx) = broadcast::channel::<SupervisorEvent>(16);
+        let mut report = crate::HealthReport::default();
+        report.dead.push(dead("squad:one-shot-planner"));
+        report.dead.push(dead("resident"));
+        report.departed.push("squad:one-shot-planner".into());
+
+        announce_verdicts(&report, &tx);
+
+        let mut announced = Vec::new();
+        while let Ok(SupervisorEvent::AgentUnhealthy { agent_id, .. }) = rx.try_recv() {
+            announced.push(agent_id);
+        }
+        assert_eq!(announced, vec!["resident".to_string()]);
     }
 }
