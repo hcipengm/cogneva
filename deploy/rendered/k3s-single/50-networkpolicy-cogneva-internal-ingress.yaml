@@ -35,12 +35,17 @@ spec:
           port: 8080
         - protocol: TCP
           port: 9091
-    # 内部端口：只对跑 agent 循环、真的会归档的那几个工作负载开放。主应用自己
-    # 那一份从 127.0.0.1 走回环，不经过这里。
+    # 内部端口：只对本平台自己的工作负载开放——跑 agent 循环、真的会归档的那几个，
+    # 加上每一个跑本平台镜像、要把自己容器里的进程表推上来的容器（`process-report`）。
+    # 第三方镜像的 Pod 挂的是别的 `name` 标签（postgres / nats / …），不在这条里。
+    # 主应用自己那一份从 127.0.0.1 走回环，不经过这里。
     - from:
         - podSelector:
             matchLabels:
               app.kubernetes.io/component: evolution
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cogneva
       ports:
         - protocol: TCP
           port: 8085

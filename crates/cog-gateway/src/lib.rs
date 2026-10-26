@@ -58,6 +58,7 @@ pub mod notifications;
 pub mod observability;
 pub mod observable;
 pub mod plugin;
+pub mod process_reports;
 pub mod processes;
 pub mod project_control;
 pub mod projects;
@@ -516,6 +517,15 @@ const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 pub fn create_internal_router(state: Arc<GatewayState>) -> Router {
     memory_ingest_routes()
         .merge(memory_raw_routes())
+        // 容器的进程自报：容器把自己那一份 `/proc` 推上来，进程表就成了事件流
+        // 里的一帧。挂在零凭证面上而不是登录后面，是因为跑在集群里的业务 Pod
+        // 本身就零凭证（红线）——要让它们带上平台令牌才能报，等于为一个只读
+        // 展示面给每个容器发一个身份。这条面的边界由网络策略给：只有本命名
+        // 空间的工作负载连得进来；进来的字节按条数与名字长度收口。
+        .route(
+            "/api/v1/cluster/process-report",
+            post(process_reports::process_report_handler),
+        )
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -598,6 +608,8 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/auth/platform/callback/{provider}",
             get(auth::platform::oauth_callback_handler),
         )
+        // 容器的进程自报不在这里：它走 8085 那个零凭证的集群内面（见
+        // `create_internal_router`），这条面是浏览器能到的。
         // WebUI 单页应用：根路径直接给 index.html，/assets 给构建产物，
         // 浏览器打开即用（一键拉起场景没有独立前端服务）
         .route("/", get(dashboard::dashboard_handler))

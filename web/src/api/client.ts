@@ -1948,6 +1948,19 @@ export interface TopologyContainer {
   /** 实际用量；null 表示这个集群没有 metrics-server，不是「用了 0」。 */
   cpu_used_millicores: number | null;
   memory_used_bytes: number | null;
+  /**
+   * 容器自己推上来的进程表。只有跑我们镜像的容器会报；`null` 是「这个容器不报」
+   * 或「这一拍还没到」，不是「里面没有进程」。
+   */
+  processes: TopologyProcess[] | null;
+}
+
+/** 容器里的一行进程。列表按 PID 排，只读得到我们自己那一份 `/proc`。 */
+export interface TopologyProcess {
+  pid: number;
+  parent_pid: number;
+  command: string;
+  rss_bytes: number;
 }
 
 export interface TopologyTermination {
@@ -2005,9 +2018,9 @@ export interface TopologyPod {
   cpu_used_millicores: number | null;
   memory_used_bytes: number | null;
   /**
-   * 这个 Pod 里跑着几个进程（kubelet 的 `process_stats`）。只有数、没有名字：
-   * 名字要 exec 进容器读，这条读面没有那个权限。`null` 是「这个来源量不到」，
-   * 不是「零个进程」——metrics-server 那条腿不报这个数。
+   * 这个 Pod 里跑着几个进程（kubelet 的 `process_stats`）。这是 Pod 级的数，
+   * 名字在它下面每个容器的 `processes` 里——进程属于容器，不属于 Pod。
+   * `null` 是「这个来源量不到」，不是「零个进程」。
    */
   processes: number | null;
   containers: TopologyContainer[];

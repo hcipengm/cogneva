@@ -29,6 +29,7 @@ pub mod pidfile;
 pub mod pin_census;
 pub mod platform;
 pub mod plugin_registry;
+pub mod process_report;
 pub mod schema_bundle;
 pub mod scraper_endpoint;
 pub mod shutdown_coordinator;

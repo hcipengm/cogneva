@@ -276,6 +276,43 @@ FIXPATCH
 confirm "${work}/crates/cog-gateway/src/cluster.rs" "process_count"
 expect_red "量到进程数不上屏" "读面没有一处显示它"
 
+# 14. 服务端收下了容器自报的进程表，读面只显示 Pod 级的计数。
+fixture
+cat >"${work}/crates/cog-gateway/src/process_reports.rs" <<'EOF'
+pub async fn process_report_handler() {}
+EOF
+python3 - "${work}/crates/cog-gateway/src/cluster.rs" <<'FIXPATCH'
+import sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+src = src.replace(
+    "pub struct ClusterView {",
+    "pub struct ContainerView {\n    pub processes: Option<Vec<ReportedProcess>>,\n}\n\npub struct ClusterView {",
+    1,
+)
+open(path, "w", encoding="utf-8").write(src)
+FIXPATCH
+confirm "${work}/crates/cog-gateway/src/cluster.rs" "pub processes: Option<Vec<ReportedProcess>>"
+expect_red "容器进程表不上屏" "没有一处遍历它"
+
+# 14b. 同一份夹具，读面开始遍历容器上的进程表 → 必须绿。
+python3 - "${work}/web/src/topology/TopologyPanel.tsx" <<'FIXPATCH'
+import sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+src = src.replace(
+    "{counts.finished} / {counts.failed}",
+    "{counts.finished} / {counts.failed}\n"
+    "      {container.processes?.map((process) => (\n"
+    "        <span key={process.pid}>{process.command}</span>\n"
+    "      ))}",
+    1,
+)
+open(path, "w", encoding="utf-8").write(src)
+FIXPATCH
+confirm "${work}/web/src/topology/TopologyPanel.tsx" "container.processes"
+expect_green "容器进程表上屏"
+
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
 bash "${checker}" "${repo}" >"${work}/real.out" 2>&1 || got=$?

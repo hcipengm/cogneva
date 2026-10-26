@@ -39,6 +39,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // 常驻模式把自己的进程表推给网关：屏上那一格「容器里跑着什么」只有容器自己
+    // 答得上来（见 `process_report` 模块头注）。一次性的子命令不报——它们还没报完
+    // 就退出了，报上去的是一张已经过时的表。
+    //
+    // 沙箱执行器不报：它的出站面是收紧过的（只够到安全网关、集群 DNS 与 443），
+    // 要让它报就得给那个 Pod 加一条到主应用内部面的放行——那是给跑不可信代码的
+    // 容器开一条写路径，比屏上少一格读数贵得多。它的容器在屏上显示「不报」。
+    if matches!(
+        command,
+        Command::Run
+            | Command::SecurityGateway
+            | Command::VolumeWalker
+            | Command::HostLedger
+            | Command::ClaimStore
+    ) {
+        cogneva::process_report::spawn();
+    }
+
     match command {
         // 完整应用（无参数时的默认行为）。
         //

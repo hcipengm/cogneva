@@ -31,6 +31,9 @@
 #   10. 服务端量到的进程数（kubelet `process_stats`）在屏上出现过——量到不显示，
 #      这个数就只是 JSON 里的一格，没有一处会红，也没有一个人看得见。
 #
+#   11. 容器自报的进程表要显示出名字——那一份是容器自己推上来的 `/proc`，它答的是
+#       「这个容器里跑着什么」，只显示 Pod 级的计数等于把它收下又扔掉。
+#
 # 用法：bash deploy/scripts/check-web-topology-panel.sh [仓库根目录]
 set -euo pipefail
 
@@ -273,6 +276,24 @@ measures = "process_count" in server_src and re.search(r"pub\s+processes\s*:", s
 if measures and "processes" not in shown:
     problems.append(
         f"{where}: 服务端从 kubelet 的 summary 读到了 Pod 的进程数，读面没有一处显示它"
+    )
+
+# ── 11. 容器自报的进程表要显示出名字 ──
+# 进程属于容器：每个容器有自己的 PID 命名空间，Pod 级的数是加总，回答不了「里面跑着
+# 什么」。容器自己把 `/proc` 推上来（网关的 process-report 端点），服务端把它挂在
+# ContainerView 上；屏上如果只显示 Pod 级的计数，这一份名单就只是 JSON 里的一格。
+CONTAINER_PROCESSES = re.search(r"pub\s+processes:\s*Option<\s*Vec<", server_src)
+reports_path = os.path.join(ROOT, "crates/cog-gateway/src/process_reports.rs")
+reports_processes = os.path.isfile(reports_path) and "process_report_handler" in open(
+    reports_path, encoding="utf-8"
+).read()
+shows_container_processes = any(
+    re.search(r"\bcontainer\.processes\b", read(rel)) for rel in graph
+)
+if CONTAINER_PROCESSES and reports_processes and not shows_container_processes:
+    problems.append(
+        f"{where}: 服务端收到了容器自报的进程表并挂在每个容器上，"
+        "读面没有一处遍历它——「容器里跑着什么」仍然只有数、没有名字"
     )
 
 if problems:

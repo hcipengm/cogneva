@@ -9,7 +9,8 @@ import { formatBytes, formatCpu, percentOf } from '@/topology/format';
  * 「上次退出码 0 不算坏消息」，另一边没有，而读者分不出自己看到的是哪一版。
  *
  * 每一行都能再点开一层：容器点开是镜像、申报、上限、用量、上次退出、端口、挂载、
- * 探针；这些正是「它为什么没就绪」的答案，状态词只说它在等。
+ * 探针、进程；这些正是「它为什么没就绪」的答案，状态词只说它在等。进程表最下面，
+ * 因为它是唯一由容器自己推上来的一格（其余都来自 Pod 状态与指标面）。
  */
 
 export function Dot({ tone }: { tone: 'ok' | 'warn' | 'danger' | 'idle' }) {
@@ -48,6 +49,7 @@ export function ContainerRow({
         <span className="mono ml-auto shrink-0 text-[10px] text-[var(--muted)]">
           {container.state}
           {container.restarts > 0 && ` · 重启 ${container.restarts}`}
+          {container.processes != null && ` · ${container.processes.length} 个进程`}
         </span>
       </button>
 
@@ -144,6 +146,28 @@ export function ContainerRow({
               <dd className="text-[var(--paper-dim)]">{container.probes.join(' · ')}</dd>
             </>
           )}
+
+          {/* 进程属于容器：它跑在自己的 PID 命名空间里，这一份 `/proc` 就是全部。
+              名字是容器自己推上来的——伸手进去读要一项执行命令的权限，而容器本来
+              就知道自己里面跑着什么。 */}
+          <dt className="text-[var(--muted)]">进程</dt>
+          <dd className="mono flex max-h-40 flex-col overflow-y-auto text-[var(--paper-dim)]">
+            {container.processes == null ? (
+              <span className="text-[var(--muted)]">
+                没有自报的进程表：只有跑本平台镜像的容器会报（第三方镜像不会），或者它刚起来还没报上来。
+              </span>
+            ) : (
+              container.processes.map((process) => (
+                <span key={process.pid} className="break-all">
+                  {process.command}
+                  <span className="text-[var(--muted)]">
+                    {' '}
+                    · pid {process.pid} · 父 {process.parent_pid} · {formatBytes(process.rss_bytes)}
+                  </span>
+                </span>
+              ))
+            )}
+          </dd>
         </dl>
       )}
     </div>

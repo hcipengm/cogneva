@@ -204,6 +204,10 @@ pub struct ContainerView {
     /// 实际用量。没有 metrics-server 时是 `None`——与「用了 0」不是一回事。
     pub cpu_used_millicores: Option<u64>,
     pub memory_used_bytes: Option<u64>,
+    /// 容器自己报上来的进程表。只有跑我们镜像的容器会报；`None` 是「这个容器
+    /// 不报」或「这一拍还没到」，不是「里面没有进程」。进程属于容器而不属于
+    /// Pod：同一个 Pod 的两个容器各有各的 PID 命名空间。
+    pub processes: Option<Vec<crate::process_reports::ReportedProcess>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -922,6 +926,13 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
                 memory_used_bytes: container_usage
                     .get(container_name)
                     .map(|(_, memory)| *memory),
+                processes: status
+                    .and_then(|status| status.get("containerID"))
+                    .and_then(Value::as_str)
+                    .map(crate::process_reports::container_id_of)
+                    .filter(|id| !id.is_empty())
+                    .and_then(|id| crate::process_reports::latest(&name, id))
+                    .map(|report| report.processes),
             }
         })
         .collect();
@@ -1648,6 +1659,116 @@ mod topology_tests {
             unscheduled: Vec::new(),
             unplaced: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_container_gets_the_process_table_its_own_instance_reported() {
+        // 进程属于容器：同一个 Pod 的两个容器各有各的 PID 命名空间。按 Pod 名归档
+        // 会把两份表混成一份，按容器名归档则对不上——报上来的那一方只读得到自己
+        // 的 cgroup（容器 id），读不到自己叫什么名字。这里两头都对上才算数。
+        let pod = json!({
+            "metadata": { "name": "stack", "namespace": "cogneva" },
+            "spec": {
+                "nodeName": "cogneva-01",
+                "containers": [
+                    { "name": "app", "image": "localhost:30500/cogneva:x" },
+                    { "name": "sidecar", "image": "localhost:30500/cogneva:x" }
+                ]
+            },
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                    {
+                        "name": "app",
+                        "ready": true,
+                        "restartCount": 0,
+                        "containerID": "containerd://aaaa",
+                        "state": { "running": {} }
+                    },
+                    {
+                        "name": "sidecar",
+                        "ready": true,
+                        "restartCount": 0,
+                        "containerID": "containerd://bbbb",
+                        "state": { "running": {} }
+                    }
+                ]
+            }
+        });
+        let report = |command: &str| crate::process_reports::Report {
+            reported_at: Utc::now(),
+            processes: vec![crate::process_reports::ReportedProcess {
+                pid: 1,
+                parent_pid: 0,
+                command: command.to_string(),
+                rss_bytes: 1024,
+            }],
+        };
+        crate::process_reports::record("stack", "aaaa", report("cogneva-app"));
+        crate::process_reports::record("stack", "bbbb", report("cogneva-sidecar"));
+
+        let view = pod_view(&pod, &Sources::default());
+        let app = view
+            .containers
+            .iter()
+            .find(|container| container.name == "app")
+            .expect("app");
+        let sidecar = view
+            .containers
+            .iter()
+            .find(|container| container.name == "sidecar")
+            .expect("sidecar");
+        assert_eq!(
+            app.processes.as_ref().map(|p| p[0].command.as_str()),
+            Some("cogneva-app"),
+            "app 容器拿到的是它自己那一份"
+        );
+        assert_eq!(
+            sidecar.processes.as_ref().map(|p| p[0].command.as_str()),
+            Some("cogneva-sidecar"),
+            "边车拿到的是它自己那一份，不是同 Pod 另一个容器的"
+        );
+    }
+
+    #[test]
+    fn a_container_that_never_reported_has_no_process_table() {
+        // 第三方镜像不会报。这一格必须是「没有自报」，不是空数组——空数组在屏上
+        // 会读成「里面没有进程」。
+        crate::process_reports::record(
+            "quiet",
+            "cccc",
+            crate::process_reports::Report {
+                reported_at: Utc::now(),
+                processes: vec![crate::process_reports::ReportedProcess {
+                    pid: 1,
+                    parent_pid: 0,
+                    command: "x".to_string(),
+                    rss_bytes: 0,
+                }],
+            },
+        );
+        let pod = json!({
+            "metadata": { "name": "quiet", "namespace": "cogneva" },
+            "spec": {
+                "nodeName": "cogneva-01",
+                "containers": [{ "name": "db", "image": "postgres:16" }]
+            },
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [{
+                    "name": "db",
+                    "ready": true,
+                    "restartCount": 0,
+                    // 状态里还没拿到 containerID：这一拍没有可对的实例。
+                    "state": { "running": {} }
+                }]
+            }
+        });
+        let view = pod_view(&pod, &Sources::default());
+        assert!(
+            view.containers[0].processes.is_none(),
+            "没有自报就不是一张空表"
+        );
     }
 
     #[test]
