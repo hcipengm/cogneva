@@ -236,7 +236,7 @@ pub fn judge_loaded_rule_set(loaded: &[String], document: Option<&str>) -> Loade
         Err(e) => return LoadedRuleSet::Unknown(format!("document did not parse: {e}")),
     };
     let Some(rules) = parsed
-        .pointer("/observability/infra_watch/rules")
+        .pointer(cog_core::config_sections::ALERT_RULES_POINTER)
         .and_then(|rules| rules.as_array())
     else {
         return LoadedRuleSet::Unknown("document declares no rule array".into());

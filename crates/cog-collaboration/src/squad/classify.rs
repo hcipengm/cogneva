@@ -18,16 +18,20 @@ use cog_core::contract::outcome::{
     DEGENERATE_LOOP_PREFIX, TERMINAL_ENV_FAILURE_PREFIX, UPSTREAM_UNAVAILABLE_PREFIX,
 };
 
-/// 终止性环境/协议故障的分类标签，与 [`TERMINAL_ENV_FAILURE_PREFIX`] 配对。
-pub const TERMINAL_ENV_FAILURE_CLASS: &str = "terminal_env_failure";
+/// 终止性环境/协议故障的分类标签。
+///
+/// 就是那一个前缀本身：这一格记下的标签与产生端写进 reason 的前缀必须是同一个
+/// 字符串，否则改名只改到一侧时，指标序列换了标签、而看板仍按旧标签筛——那条
+/// 曲线会变成空的，空与「这类失败没有发生」在图上同形。写成别名，改名就只有一处。
+pub const TERMINAL_ENV_FAILURE_CLASS: &str = TERMINAL_ENV_FAILURE_PREFIX;
 
-/// 上游拒绝但环境自己会清掉的分类标签，与 [`UPSTREAM_UNAVAILABLE_PREFIX`] 配对。
+/// 上游拒绝但环境自己会清掉的分类标签，也就是那个前缀本身。
 ///
 /// 这一格存在的理由是**它以前被记错了**：这类原因原先套的是终止性前缀，
 /// 于是同一次终止在两处读出相反的话——`ralph_terminations_total` 说
 /// 「终态」、而重试梯子（读 typed 因）当场排了下一次尝试。分类只能有一个
 /// 答案，答案由原因自己带的那个前缀给出。
-pub const UPSTREAM_UNAVAILABLE_CLASS: &str = "upstream_unavailable";
+pub const UPSTREAM_UNAVAILABLE_CLASS: &str = UPSTREAM_UNAVAILABLE_PREFIX;
 
 /// Class for a refusal whose wall is a rate: the call was not served because
 /// some window's allowance is used up, and the same call before that window
@@ -49,8 +53,8 @@ pub const UPSTREAM_UNAVAILABLE_CLASS: &str = "upstream_unavailable";
 /// the two faces.
 pub const PACED_CLASS: &str = "paced";
 
-/// 退化环（花费买不到进展）的分类标签，与 [`DEGENERATE_LOOP_PREFIX`] 配对。
-pub const DEGENERATE_LOOP_CLASS: &str = "degenerate_loop";
+/// 退化环（花费买不到进展）的分类标签，也就是那个前缀本身。
+pub const DEGENERATE_LOOP_CLASS: &str = DEGENERATE_LOOP_PREFIX;
 
 /// 兜底分类：没有声明前缀的不可恢复失败（重复同一失败、无可行动输出等）。
 /// 它不对应任何前缀，因此不参与可达性比对——没有声明就谈不上"声明丢了"。

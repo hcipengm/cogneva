@@ -18,7 +18,7 @@ use serde_json::json;
 use crate::llm_admin::KubeClient;
 
 const CONFIGMAP_NAME: &str = cog_core::topology::CONFIG_CONFIGMAP;
-const CONFIGMAP_KEY: &str = "cogneva.json";
+const CONFIGMAP_KEY: &str = cog_core::config_sections::CONFIG_DOCUMENT_KEY;
 const MAIN_DEPLOYMENT: &str = cog_core::topology::MAIN_DEPLOYMENT;
 
 #[derive(Debug, Deserialize)]

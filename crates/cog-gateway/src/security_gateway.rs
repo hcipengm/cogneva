@@ -5390,7 +5390,7 @@ async fn stream_forward(
         );
         return Ok(axum::response::Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header("retry-after", retry_after.to_string())
+            .header(cog_core::RETRY_AFTER_HEADER, retry_after.to_string())
             .header("content-type", "application/json")
             .body(axum::body::Body::from(
                 serde_json::json!({
@@ -5443,7 +5443,7 @@ async fn stream_forward(
         };
         return Ok(axum::response::Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)
-            .header("retry-after", retry_after.to_string())
+            .header(cog_core::RETRY_AFTER_HEADER, retry_after.to_string())
             .header("content-type", "application/json")
             .body(axum::body::Body::from(
                 serde_json::json!({

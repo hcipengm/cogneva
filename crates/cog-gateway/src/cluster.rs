@@ -61,6 +61,25 @@ async fn deployment_status(client: &KubeClient, id: &str, deployment: &str) -> C
     }
 }
 
+/// 这一面要读 Deployment 的组件：面板上的 id，以及读哪个 Deployment。
+///
+/// id 不是另起一套名字，就是工作负载上的组件标签值：同一台 Gateway 在面板上叫
+/// 一个名字、平台选中它时叫另一个名字，读的人就要自己在脑子里对齐两张表，而对
+/// 不齐时两边都不报错——一边少一行、一边选了空集。
+///
+/// 读不到集群的分支走同一张表：两个分支各写一份，加一个组件时只会改到其中一份，
+/// 而少的那一行读出来正是「这台没部署」，不是「没读到集群」。
+const READ_COMPONENTS: &[(&str, &str)] = &[
+    (
+        cog_core::topology::COMPONENT_SECURITY_GATEWAY,
+        cog_core::topology::SECURITY_GATEWAY,
+    ),
+    (
+        cog_core::topology::COMPONENT_EVOLUTION,
+        cog_core::topology::EVOLUTION,
+    ),
+];
+
 pub async fn cluster_components_handler() -> Json<ClusterComponents> {
     let mut components = vec![ComponentStatus {
         id: "main".to_string(),
@@ -69,25 +88,21 @@ pub async fn cluster_components_handler() -> Json<ClusterComponents> {
         desired_replicas: None,
     }];
 
-    if let Ok(client) = KubeClient::in_cluster() {
-        components.push(
-            deployment_status(
-                &client,
-                "security-gateway",
-                cog_core::topology::SECURITY_GATEWAY,
-            )
-            .await,
-        );
-        components
-            .push(deployment_status(&client, "evolution", cog_core::topology::EVOLUTION).await);
-    } else {
-        for id in ["security-gateway", "evolution"] {
-            components.push(ComponentStatus {
-                id: id.to_string(),
-                status: "unknown".to_string(),
-                ready_replicas: None,
-                desired_replicas: None,
-            });
+    match KubeClient::in_cluster() {
+        Ok(client) => {
+            for (id, deployment) in READ_COMPONENTS {
+                components.push(deployment_status(&client, id, deployment).await);
+            }
+        }
+        Err(_) => {
+            for (id, _) in READ_COMPONENTS {
+                components.push(ComponentStatus {
+                    id: id.to_string(),
+                    status: "unknown".to_string(),
+                    ready_replicas: None,
+                    desired_replicas: None,
+                });
+            }
         }
     }
 

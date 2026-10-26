@@ -735,7 +735,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             post(memory::batch_ingest_handler),
         )
         .route(
-            "/api/v1/memory/raw/{id}",
+            cog_core::MEMORY_RAW_ITEM_PATH,
             axum::routing::delete(memory::delete_raw_handler),
         )
         .route(
