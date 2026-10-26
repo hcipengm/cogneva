@@ -261,3 +261,137 @@ fn the_scanner_reads_the_dns_form_and_nothing_else() {
         "测试模块往后都不算生产面"
     );
 }
+
+/// 第二张登记表：以节点端口当 registry 的镜像引用。
+///
+/// 判据与 DNS 那一条是两回事。`localhost:8080` 是本地跑与 port-forward 都在用的
+/// 形状，做判据会先红在正当代码上；`localhost:<port>/<repo>` 是镜像引用，那个端口
+/// 只可能是 `clusterRegistry.nodePort` 在这一套部署上渲染出来的数——把它写进代码，
+/// 就是把这个集群的端口抄进二进制。带协议的行不算：那是 URL，不是镜像。
+const NODE_PORT_REGISTER: &str = "crates/cogneva/tests/data/node-port-registry-literals.tsv";
+
+/// 这一行里以节点端口当 registry 的镜像引用，端点原样（`localhost:30500`）。
+fn node_port_registries_on(line: &str) -> Vec<String> {
+    // 一条 URL 里也有同样的子串，而 registry 端点从来不带协议。
+    if line.contains("http://") || line.contains("https://") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(at) = rest.find("localhost:") {
+        let after = &rest[at + "localhost:".len()..];
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let tail = &after[digits.len()..];
+        // 端口后面紧跟 `/` 才是镜像引用；`localhost:8080"` 这类是别的地址。
+        if !digits.is_empty() && tail.starts_with('/') {
+            out.push(format!("localhost:{digits}"));
+        }
+        rest = &after[digits.len()..];
+    }
+    out
+}
+
+/// 生产半边里所有以节点端口当 registry 的镜像引用。
+fn node_port_census() -> BTreeSet<Found> {
+    let mut out = BTreeSet::new();
+    for path in rust_sources() {
+        let rel = path
+            .strip_prefix(repo_root())
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        for line in text.lines() {
+            if opens_test_module(line) {
+                break;
+            }
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for address in node_port_registries_on(line) {
+                out.insert(Found {
+                    file: rel.clone(),
+                    address,
+                });
+            }
+        }
+    }
+    out
+}
+
+// Same ratchet arithmetic as the DNS census above, and the same reason for
+// writing it against the constant: raising the cap is how a literal that the
+// manifest genuinely cannot declare gets registered.
+#[allow(clippy::absurd_extreme_comparisons)]
+#[test]
+fn every_image_pulled_from_a_node_port_is_a_registered_decision() {
+    let found = node_port_census();
+    let rows: Vec<(String, String)> = read(NODE_PORT_REGISTER)
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
+        .filter(|line| !line.starts_with("file\t"))
+        .map(|line| {
+            let mut columns = line.split('\t');
+            let file = columns.next().unwrap_or_default().trim().to_string();
+            let address = columns.next().unwrap_or_default().trim().to_string();
+            let reason = columns.next().unwrap_or_default().trim();
+            assert!(
+                !reason.is_empty(),
+                "{NODE_PORT_REGISTER} 的 {file} / {address} 没写理由：没有理由的行就是一张白名单"
+            );
+            (file, address)
+        })
+        .collect();
+    let registered: BTreeSet<(String, String)> = rows.iter().cloned().collect();
+
+    assert!(
+        rows.len() <= DEBT_CEILING,
+        "登记表有 {} 行，上限是 {DEBT_CEILING}：镜像的 registry 端点由部署面声明，\
+         代码读它，不抄它",
+        rows.len()
+    );
+
+    let unregistered: Vec<&Found> = found
+        .iter()
+        .filter(|hit| !registered.contains(&(hit.file.clone(), hit.address.clone())))
+        .collect();
+    let stale: Vec<&(String, String)> = rows
+        .iter()
+        .filter(|(file, address)| {
+            !found.contains(&Found {
+                file: file.clone(),
+                address: address.clone(),
+            })
+        })
+        .collect();
+    assert!(
+        unregistered.is_empty() && stale.is_empty(),
+        "代码里以节点端口当 registry 的引用与登记表对不上。\n\
+         没登记的（改成从 Service 读那个端口，或登记并写清理由）：{unregistered:#?}\n\
+         登记了但代码里已经没有的（删掉那一行）：{stale:#?}"
+    );
+}
+
+#[test]
+fn the_node_port_scanner_reads_image_references_and_nothing_else() {
+    assert_eq!(
+        node_port_registries_on(r#"let remote = format!("localhost:{port}/cogneva:local");"#),
+        Vec::<String>::new(),
+        "端口是运行时读出来的，代码里没有写死的数"
+    );
+    assert_eq!(
+        node_port_registries_on(r#"const I: &str = "localhost:30500/cogneva:local";"#),
+        vec!["localhost:30500".to_string()]
+    );
+    // A URL's port is not a registry endpoint: the scheme is the tell.
+    assert_eq!(
+        node_port_registries_on(r#"let u = "http://localhost:8080/api/v1";"#),
+        Vec::<String>::new()
+    );
+    // A bare port with nothing after it is some other address.
+    assert_eq!(
+        node_port_registries_on(r#"let h = "localhost:8080";"#),
+        Vec::<String>::new()
+    );
+}

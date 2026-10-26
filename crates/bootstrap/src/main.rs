@@ -1814,6 +1814,54 @@ async fn render_distributor_manifest() -> Result<String> {
         .replace("__IMAGE_TAG__", env!("CARGO_PKG_VERSION")))
 }
 
+/// 集群内 registry 的节点端口，读自清单刚 apply 出来的那个 Service。
+///
+/// 端口名取 `registry` 而不是取第一个：同一个 Service 上还挂着监控抓取面
+/// （`http`），序号是排版，名字才是声明。
+async fn registry_node_port() -> Result<u16> {
+    let out = Command::new("kubectl")
+        .args([
+            "-n",
+            "cogneva",
+            "get",
+            "svc",
+            "cogneva-registry",
+            "-o",
+            "jsonpath={.spec.ports[?(@.name==\"registry\")].nodePort}",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("无法执行 kubectl get svc cogneva-registry")?;
+    if !out.status.success() {
+        bail!(
+            "读不到集群内 registry 的 Service（kubectl 退出码 {:?}）：{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    parse_registry_node_port(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// 把那条读数判成一个端口，或者带着它读到的原样报错。
+///
+/// 空串是「Service 在、那个端口却没有 nodePort」，与「读不到 Service」是两回事，
+/// 但两者都必须响：给一个默认端口，播种就送进一个没人拨的地址，而它自己会报成功。
+fn parse_registry_node_port(reading: &str) -> Result<u16> {
+    let text = reading.trim();
+    let port: u16 = text.parse().with_context(|| {
+        format!(
+            "集群内 registry 的 Service 没给出节点端口（读到 {text:?}）：清单里的 registry \
+             不是 NodePort 形态，或 chart 的 clusterRegistry.nodePort 没渲染进 Service；\
+             四部署 pin 的就是这个端口，播种不能猜"
+        )
+    })?;
+    if port == 0 {
+        bail!("集群内 registry 的节点端口读成 0（读到 {text:?}）：这不是一个能拨的端口");
+    }
+    Ok(port)
+}
+
 /// 把基镜像 localhost/cogneva:local 播种进集群内 registry：四部署清单统一
 /// pin localhost:30500/cogneva:local，自进化金丝雀/mainline overlay 也 FROM
 /// 该基镜像，缺失则工作负载只能 ImagePullBackOff。经宿主 containerd 客户端
@@ -1853,7 +1901,12 @@ async fn seed_cluster_registry() -> Result<()> {
     } else {
         ("ctr", &[][..])
     };
-    let remote = "localhost:30500/cogneva:local";
+    // 节点端口是部署面的事实，从清单刚建出来的那个 Service 上读，不在这里再抄一份：
+    // 抄下来的数写在今天是对的，chart 改了 `clusterRegistry.nodePort` 之后就把基镜像
+    // 推进一个没人听的端口，而四部署 pin 的还是清单里那个新数——播种报成功、Pod 一直
+    // ImagePullBackOff。读的是 kubelet 将要拨的同一个 Service，两处不可能分开。
+    let node_port = registry_node_port().await?;
+    let remote = format!("localhost:{node_port}/cogneva:local");
     let object = "localhost/cogneva:local";
     for attempt in 1..=3 {
         let mut args: Vec<&str> = ctr_prefix.to_vec();
@@ -1863,7 +1916,7 @@ async fn seed_cluster_registry() -> Result<()> {
             "images",
             "push",
             "--plain-http",
-            remote,
+            remote.as_str(),
             object,
         ]);
         match run(program, &args).await {
@@ -4333,5 +4386,29 @@ mod helm_delivery_single_writer_tests {
         assert_eq!(release_status_from_list_json(other), None);
         assert_eq!(release_status_from_list_json(b"[]"), None);
         assert_eq!(release_status_from_list_json(b"not json"), None);
+    }
+}
+
+#[cfg(test)]
+mod registry_port_tests {
+    use super::*;
+
+    /// 播种用的节点端口只有一条来源：清单刚建出来的那个 Service。
+    ///
+    /// 这条测试是因为 `30500` 曾经被抄进 `seed_cluster_registry`：副本写在今天是对的，
+    /// chart 改了 `clusterRegistry.nodePort` 之后，播种推进旧端口、四部署 pin 新端口，
+    /// 而播种自己报成功。所以读不到端口时必须是错误——不是回落到那个旧数。
+    #[test]
+    fn a_missing_node_port_is_an_error_not_a_default() {
+        for reading in ["", "  ", "0", "abc"] {
+            let err = parse_registry_node_port(reading)
+                .expect_err(&format!("{reading:?} 不该判出一个端口"))
+                .to_string();
+            assert!(
+                err.contains("节点端口"),
+                "报错要点名端口，读到 {reading:?} 时是：{err}"
+            );
+        }
+        assert_eq!(parse_registry_node_port("30500\n").unwrap(), 30500);
     }
 }

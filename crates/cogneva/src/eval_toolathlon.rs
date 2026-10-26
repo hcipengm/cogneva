@@ -87,9 +87,16 @@ const PG_DATABASE: &str = "toolathlon_gym";
 const PG_USER: &str = "eigent";
 const PG_PASSWORD: &str = "camel";
 
-/// pack 镜像的 ref。默认写成 registry 里那个名字——镜像进集群的正路是
-/// `buildah push … localhost:30500/<repo>:<tag>`，集群里的 Pod 直接按这个名字拉。
-const DEFAULT_PACK_IMAGE: &str = "localhost:30500/toolathlon-pack:latest";
+/// pack 镜像在集群内 registry 上的仓库名与标签。镜像进集群的正路是
+/// `buildah push … <registry>/toolathlon-pack:<tag>`，集群里的 Pod 按同一个名字拉。
+///
+/// 只有这两个是这一列的命名，端点不是：端口取自 `clusterRegistry.nodePort` 声明在
+/// Service 上的那个数，写进代码就成了第二个副本——chart 挪了端口之后，Pod 去拉一个
+/// 没人听的地址，读起来像「镜像没推上去」。
+const PACK_IMAGE_REPO: &str = "toolathlon-pack";
+const PACK_IMAGE_TAG: &str = "latest";
+/// 声明节点端口的那只 Service。端口名与 bootstrap 播种时读的是同一个。
+const REGISTRY_SERVICE: &str = "cogneva-registry";
 /// postgres sidecar 的镜像。compose 写的是 `postgres:15`。
 const DEFAULT_PG_IMAGE: &str = "docker.io/library/postgres:15";
 
@@ -242,6 +249,44 @@ impl PodRuntime {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             code: out.status.code(),
         })
+    }
+
+    /// 集群内 registry 的节点端口，读自清单声明它的那只 Service。
+    ///
+    /// 端口名取 `registry` 而不是序号：同一个 Service 上还挂着监控抓取面，序号是
+    /// 排版，名字才是声明。读不到就报错，不退回任何写死的端口——那一退，Pod 会去拉
+    /// 一个没人听的地址，报的是 ImagePullBackOff，看着像镜像没推上去。
+    async fn registry_node_port(&self) -> anyhow::Result<u16> {
+        let out = self
+            .exec(&[
+                "get".into(),
+                "service".into(),
+                REGISTRY_SERVICE.into(),
+                "-o".into(),
+                "jsonpath={.spec.ports[?(@.name==\"registry\")].nodePort}".into(),
+            ])
+            .await?;
+        if out.code != Some(0) {
+            anyhow::bail!(
+                "读不到 {REGISTRY_SERVICE} 这只 Service（kubectl 退出码 {:?}）：{}。\
+                 起 Pod 的镜像名用它在节点上声明的那个端口，设 {ENV_PACK_IMAGE} 可以直接给名字",
+                out.code,
+                out.stderr.trim()
+            );
+        }
+        let text = out.stdout.trim();
+        let port: u16 = text.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "{REGISTRY_SERVICE} 没给出节点端口（读到 {text:?}）：这不是 NodePort 形态，\
+                 或者 clusterRegistry.nodePort 没渲染进 Service；设 {ENV_PACK_IMAGE} 可以直接给名字"
+            )
+        })?;
+        if port == 0 {
+            anyhow::bail!(
+                "{REGISTRY_SERVICE} 的节点端口读成 0（读到 {text:?}），这不是一个能拨的端口"
+            );
+        }
+        Ok(port)
     }
 
     /// 这只配额此刻的 `(used, hard)`，两维都只取 limits。
@@ -655,7 +700,8 @@ pub struct PodToolathlonBackend {
 }
 
 impl PodToolathlonBackend {
-    /// 按环境接上这台机器。镜像名也从环境读，默认是 registry 里那两个名字。
+    /// 按环境接上这台机器。镜像名也从环境读：pack 的默认值由集群自己给的节点端口
+    /// 拼出来，postgres 那个是公开镜像。
     pub async fn detect() -> anyhow::Result<Option<Self>> {
         let Some(runtime) = PodRuntime::detect().await? else {
             return Ok(None);
@@ -667,10 +713,23 @@ impl PodToolathlonBackend {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| fallback.to_string())
         };
+        // pack 镜像落在集群内 registry 的节点端口上，那个端口是部署面声明的：
+        // 环境里没直接给名字时读 Service，读不到就报错（见 registry_node_port）。
+        let declared_pack = std::env::var(ENV_PACK_IMAGE)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let pack_image = match declared_pack {
+            Some(image) => image,
+            None => format!(
+                "localhost:{}/{PACK_IMAGE_REPO}:{PACK_IMAGE_TAG}",
+                runtime.registry_node_port().await?
+            ),
+        };
         let defaults = PodLimits::default();
         Ok(Some(Self {
             runtime: Arc::new(runtime),
-            pack_image: image_or(ENV_PACK_IMAGE, DEFAULT_PACK_IMAGE),
+            pack_image,
             pg_image: image_or(ENV_PG_IMAGE, DEFAULT_PG_IMAGE),
             limits: PodLimits {
                 pack_cpu: image_or(ENV_PACK_CPU_LIMIT, &defaults.pack_cpu),
