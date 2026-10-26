@@ -202,9 +202,39 @@ pub struct EvmResponse {
     /// 会被当成常数带走。
     pub unattributed_window_start: Option<String>,
     pub attribution: EvmAttribution,
+    /// 超支的节点：花销已经超过基线预算的那些。
+    ///
+    /// `None` 表示三张表里有一张读不到（基线或逐笔账），此时**不能**给一个空
+    /// 列表：空读作「一条也没超支」，那是另一个结论。
+    pub overruns: Option<Vec<OverrunRow>>,
+    /// 已经过了计划止期、却还没跑完的节点。
+    ///
+    /// 只数还在等或在跑的：失败与取消的不算「落后」，它们各有各的回路（重规划、
+    /// 放弃），把结局算成进度会让落后这一列永远清不掉。
+    pub behind_schedule: Option<Vec<BehindRow>>,
     /// 算这三个量时用的假设，明写出来。
     pub assumption: String,
     pub source: Source,
+}
+
+/// 一条超支的节点。预算与花销一起给：只报差额，读者还得回去找那两行。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OverrunRow {
+    pub task_id: String,
+    pub title: String,
+    pub budget_tokens: u64,
+    pub spent_tokens: u64,
+}
+
+/// 一条过了计划止期还没跑完的节点。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BehindRow {
+    pub task_id: String,
+    pub title: String,
+    pub status: String,
+    pub planned_end: String,
+    /// 过了止期多久。差三分钟与差三天是两件事，只给止期这个数读者得自己减。
+    pub overdue_secs: i64,
 }
 
 /// 任务图的正本表名。项目面自己不带表，读的就是它。
@@ -709,6 +739,8 @@ pub(crate) fn build_evm_response(
         baselined_actual_cost,
         cost_performance_index,
         schedule_performance_index,
+        overruns: overruns(rows, plans, spends),
+        behind_schedule: behind_schedule(rows, plans, now),
         unattributed_tokens: unattributed,
         // 只在真读到缺口时给窗口：量不出来的时候给一个窗口，会让读者以为
         // 「这个窗口里一条无归因用量都没有」。
@@ -725,6 +757,82 @@ pub(crate) fn build_evm_response(
             read_at: now.to_rfc3339(),
         },
     }
+}
+
+/// 哪些节点超支了，按超出的量从大到小。
+///
+/// 三个「不算」各自有原因：预算为 0 的行读作「没有成本计划」（不是「计划花零个
+/// token」），谈不上超支；账上没有这条任务的行是**没记到**而不是花了 0，把它当 0
+/// 会漏掉真正超支的那条；超过而没有到（`spent > budget`）才算，到线不算超。
+fn overruns(
+    rows: &[&Task],
+    plans: Option<&BTreeMap<String, cog_core::TaskPlan>>,
+    spends: Option<&BTreeMap<String, u64>>,
+) -> Option<Vec<OverrunRow>> {
+    let plans = plans?;
+    let spends = spends?;
+    let mut out: Vec<OverrunRow> = rows
+        .iter()
+        .filter_map(|t| {
+            let plan = plans.get(&t.id)?;
+            if plan.budget_tokens == 0 {
+                return None;
+            }
+            let spent = spends.get(&t.id).copied()?;
+            (spent > plan.budget_tokens).then(|| OverrunRow {
+                task_id: t.id.clone(),
+                title: task_title(t),
+                budget_tokens: plan.budget_tokens,
+                spent_tokens: spent,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        (b.spent_tokens - b.budget_tokens)
+            .cmp(&(a.spent_tokens - a.budget_tokens))
+            .then_with(|| a.task_id.cmp(&b.task_id))
+    });
+    Some(out)
+}
+
+/// 哪些节点已经过了计划止期还没跑完，按过了多久从大到小。
+///
+/// 没有基线的任务不进这张表——它们不是准时，是没排过期。止期相等的两条按 id
+/// 排，好让两次读取给出同一个顺序。
+fn behind_schedule(
+    rows: &[&Task],
+    plans: Option<&BTreeMap<String, cog_core::TaskPlan>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Vec<BehindRow>> {
+    let plans = plans?;
+    let mut out: Vec<BehindRow> = rows
+        .iter()
+        .filter_map(|t| {
+            let end = plans.get(&t.id)?.planned_end?;
+            if end >= now {
+                return None;
+            }
+            if matches!(
+                t.status,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+            ) {
+                return None;
+            }
+            Some(BehindRow {
+                task_id: t.id.clone(),
+                title: task_title(t),
+                status: t.status.as_str().to_string(),
+                planned_end: end.to_rfc3339(),
+                overdue_secs: (now - end).num_seconds(),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.overdue_secs
+            .cmp(&a.overdue_secs)
+            .then_with(|| a.task_id.cmp(&b.task_id))
+    });
+    Some(out)
 }
 
 /// 除法的三个拒绝：分母缺失、分母为零、以及结果没有意义的情形。全部返回
@@ -1226,6 +1334,111 @@ mod tests {
         assert_eq!(pv, 0);
         assert_eq!(counted, 0);
         assert_eq!(unknown, 1, "只有起期也算不出比例");
+    }
+
+    /// 超支与落后是两张逐节点的表。指数只说「整体偏了」，而修法要知道是哪一条：
+    /// 超支的那条要重排预算，落后的那条要看依赖。
+    ///
+    /// 三条边界也钉在这里：花销到线不算超（`>` 不是 `>=`）；没有基线的任务不进
+    /// 超支表（没有预算就谈不上超）；过了止期但已经失败的不算落后（那走重规划，
+    /// 不是进度问题）。
+    #[test]
+    fn overruns_and_behind_name_the_nodes_that_are_actually_over() {
+        let now = chrono::Utc::now();
+        let mut over = task("over", Some("g1"));
+        over.status = TaskStatus::Running;
+        let mut exact = task("exact", Some("g1"));
+        exact.status = TaskStatus::Running;
+        let unplanned = task("unplanned", Some("g1"));
+        let mut late = task("late", Some("g1"));
+        late.status = TaskStatus::Pending;
+        let mut failed = task("failed", Some("g1"));
+        failed.status = TaskStatus::Failed;
+
+        let window = (
+            now - chrono::Duration::minutes(5),
+            now + chrono::Duration::minutes(5),
+        );
+        let plans: BTreeMap<String, cog_core::TaskPlan> = [
+            (
+                "over".to_string(),
+                plan_between("over", 100, window.0, window.1),
+            ),
+            (
+                "exact".to_string(),
+                plan_between("exact", 100, window.0, window.1),
+            ),
+            (
+                "late".to_string(),
+                plan_between(
+                    "late",
+                    100,
+                    now - chrono::Duration::minutes(10),
+                    now - chrono::Duration::minutes(5),
+                ),
+            ),
+            (
+                "failed".to_string(),
+                plan_between(
+                    "failed",
+                    100,
+                    now - chrono::Duration::minutes(10),
+                    now - chrono::Duration::minutes(5),
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let spends: BTreeMap<String, u64> = [
+            ("over".to_string(), 150u64),
+            ("exact".to_string(), 100u64),
+            ("unplanned".to_string(), 999_999u64),
+        ]
+        .into_iter()
+        .collect();
+
+        let reading = build_evm_response(
+            "g1".into(),
+            &[&over, &exact, &unplanned, &late, &failed],
+            Some(&plans),
+            Some(&spends),
+            None,
+            now,
+        );
+
+        let overruns = reading.overruns.expect("两条账都读到了");
+        assert_eq!(overruns.len(), 1, "只报真超了的那一条：{overruns:?}");
+        assert_eq!(overruns[0].task_id, "over");
+        assert_eq!(overruns[0].budget_tokens, 100);
+        assert_eq!(overruns[0].spent_tokens, 150);
+
+        let behind = reading.behind_schedule.expect("基线读到了");
+        assert_eq!(behind.len(), 1, "只报过了止期还在等的那一条：{behind:?}");
+        assert_eq!(behind[0].task_id, "late");
+        assert_eq!(behind[0].status, "pending");
+        assert!(behind[0].overdue_secs >= 300, "要带上过了多久");
+    }
+
+    /// 读不到的时候两张表都是 `None`。给空表读作「一条也没超、一条也没落后」，
+    /// 而真相是这一屏回答不了这个问题。
+    #[test]
+    fn unreadable_inputs_leave_the_two_node_lists_unmeasured_not_empty() {
+        let now = chrono::Utc::now();
+        let t = task("a", Some("g1"));
+        let blind = build_evm_response("g1".into(), &[&t], None, None, None, now);
+        assert!(blind.overruns.is_none());
+        assert!(blind.behind_schedule.is_none());
+
+        // 基线读得到、账读不到：超支表量不了，落后表照给。
+        let plans: BTreeMap<String, cog_core::TaskPlan> = [(
+            "a".to_string(),
+            plan_between("a", 100, now - chrono::Duration::minutes(9), now),
+        )]
+        .into_iter()
+        .collect();
+        let no_ledger = build_evm_response("g1".into(), &[&t], Some(&plans), None, None, now);
+        assert!(no_ledger.overruns.is_none(), "账读不到就不知道谁超了");
+        assert!(no_ledger.behind_schedule.is_some(), "止期是本地读到的");
     }
 
     /// 两次读同一份数据，行序必须逐行相同：顺序不稳定，界面每次刷新都在跳，

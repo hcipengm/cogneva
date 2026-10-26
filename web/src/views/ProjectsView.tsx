@@ -5,8 +5,10 @@ import {
   getProjectGantt,
   getProjects,
   getTaskGraph,
+  type BehindRow,
   type EvmReading,
   type GanttRow,
+  type OverrunRow,
   type ProjectRow,
   type ReadingSource,
   type TaskRow,
@@ -317,7 +319,7 @@ function titleOf(t: TaskRow): string {
   return t.id;
 }
 
-/** 看板：六个状态各堆了多少。列上限还没有出处，所以显式写「没配上限」。 */
+/** 看板：六个状态各堆了多少，以及每一列的上限拦没拦住新活。 */
 function BoardPanel({ project }: { project: ProjectRow }) {
   const board = useResource(`看板（${project.id}）`, () => getProjectBoard(project.id), 15_000);
 
@@ -368,7 +370,7 @@ function BoardPanel({ project }: { project: ProjectRow }) {
 /** 图上最多画多少行。超出的行数写在下面，不做静默截断。 */
 const GANTT_LIMIT = 200;
 
-/** 甘特：实际时间线画得出来，计划基线还没有出处。缺的那一头必须说出来。 */
+/** 甘特：计划与实际情况各画一条；缺计划基线的那一行留空，不画成零长度。 */
 function GanttPanel({ project }: { project: ProjectRow }) {
   const gantt = useResource(`甘特（${project.id}）`, () => getProjectGantt(project.id), 15_000);
 
@@ -611,6 +613,29 @@ function EarnedValuePanel({
       </Readings>
       <Provenance source={data.source} />
 
+      <NodeList
+        title="超支的节点"
+        empty="一条也没超预算"
+        unmeasured="基线或逐笔账读不到，谁超了量不出来"
+        rows={nodeRows<OverrunRow>(data.overruns, (row) => ({
+          id: row.task_id,
+          headline: row.title,
+          detail: `超出 ${(row.spent_tokens - row.budget_tokens).toLocaleString()} ${unit}`,
+          note: `花 ${row.spent_tokens.toLocaleString()} / 预算 ${row.budget_tokens.toLocaleString()}`,
+        }))}
+      />
+      <NodeList
+        title="过了计划止期还没跑完的节点"
+        empty="没有节点过了止期还在等或在跑"
+        unmeasured="计划基线读不到，落后量不出来"
+        rows={nodeRows<BehindRow>(data.behind_schedule, (row) => ({
+          id: row.task_id,
+          headline: row.title,
+          detail: `过了 ${formatOverdue(row.overdue_secs)}`,
+          note: `${row.status} · 计划止期 ${new Date(row.planned_end).toLocaleString()}`,
+        }))}
+      />
+
       <div className="border-b border-[var(--line)] px-4 py-2 text-[11px]">
         <div className="flex items-baseline justify-between">
           <span className="text-[var(--paper-dim)]">无归因用量</span>
@@ -641,6 +666,62 @@ function EarnedValuePanel({
       </div>
     </>
   );
+}
+
+/**
+ * 一张逐节点表。`null` 与空表是两件事：前者是这一屏回答不了「谁」，后者是
+ * 回答得出、答案就是一条也没有。把两者印成同一句，读者会以为系统查过了。
+ */
+function NodeList({
+  title,
+  empty,
+  unmeasured,
+  rows,
+}: {
+  title: string;
+  empty: string;
+  unmeasured: string;
+  rows: { id: string; headline: string; detail: string; note: string }[] | null;
+}) {
+  return (
+    <div className="border-b border-[var(--line)] px-4 py-2 text-[11px]">
+      <div className="flex items-baseline justify-between">
+        <span className="text-[var(--paper-dim)]">{title}</span>
+        <span className="mono">{rows === null ? '量不了' : `${rows.length} 条`}</span>
+      </div>
+      {rows === null ? (
+        <p className="mt-1 text-[var(--muted)]">{unmeasured}</p>
+      ) : rows.length === 0 ? (
+        <p className="mt-1 text-[var(--muted)]">{empty}</p>
+      ) : (
+        <ul className="mt-1 space-y-1">
+          {rows.map((row) => (
+            <li key={row.id} className="flex flex-wrap items-baseline gap-x-2">
+              <span className="truncate">{row.headline}</span>
+              <span className="mono text-[var(--warn)]">{row.detail}</span>
+              <span className="text-[var(--muted)]">{row.note}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/** 把服务端那两张表翻成一行行字；`null` 原样传下去，别折成空表。 */
+function nodeRows<T>(
+  rows: T[] | null,
+  map: (row: T) => { id: string; headline: string; detail: string; note: string },
+): { id: string; headline: string; detail: string; note: string }[] | null {
+  return rows === null ? null : rows.map(map);
+}
+
+/** 过了多久：秒级到天级，读者一眼能分出「差几分钟」和「差几天」。 */
+function formatOverdue(secs: number): string {
+  if (secs < 60) return `${secs} 秒`;
+  if (secs < 3600) return `${Math.round(secs / 60)} 分钟`;
+  if (secs < 86400) return `${Math.round(secs / 3600)} 小时`;
+  return `${Math.round(secs / 86400)} 天`;
 }
 
 /**

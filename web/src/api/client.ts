@@ -985,6 +985,24 @@ export interface EvmAttribution {
   tasks_outside_baseline: number | null;
 }
 
+/** 一条超支的节点。预算与花销一起给：只给差额，读者还得自己去找那两行。 */
+export interface OverrunRow {
+  task_id: string;
+  title: string;
+  budget_tokens: number;
+  spent_tokens: number;
+}
+
+/** 一条过了计划止期还没跑完的节点。 */
+export interface BehindRow {
+  task_id: string;
+  title: string;
+  status: string;
+  planned_end: string;
+  /** 过了止期多久：差三分钟与差三天是两件事。 */
+  overdue_secs: number;
+}
+
 export interface ProjectEvmReading {
   project_id: string;
   unit: string;
@@ -1005,6 +1023,13 @@ export interface ProjectEvmReading {
   /** 上面那个数的窗口起点；终点是 `source.read_at`。 */
   unattributed_window_start: string | null;
   attribution: EvmAttribution;
+  /**
+   * 超支的节点。`null` 是「量不了」（基线或逐笔账读不到），空数组才是
+   * 「一条也没超」——两者印成同一句，读者会以为系统查过了。
+   */
+  overruns: OverrunRow[] | null;
+  /** 过了计划止期还没跑完的节点。`null` 同上。 */
+  behind_schedule: BehindRow[] | null;
   /** 算这三个量用的假设，明写在响应里。 */
   assumption: string;
   source: ReadingSource;
