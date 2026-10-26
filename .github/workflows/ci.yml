@@ -754,6 +754,12 @@ jobs:
       # 完的任务还挂在「执行中」列里。帧只当触发器：到了就重读，数仍由服务端现算。
       - name: Check the projects face moves with the frames, not only with the poll
         run: bash deploy/scripts/check-web-live-projects.sh
+      # 四条面门禁各自绿，也不等于屏幕会动：帧还要送到那个页面上。网关按频道族
+      # （agent: / task: / hooks）分发，App 少订一族，那一族的面就一起哑掉——四条
+      # 全绿、屏幕也没有任何一格显示「断了」。这一步从 event_channels 的 match 臂
+      # 读出每种帧走哪几族，再查 App 订的频道覆盖每个面依赖的每一族。
+      - name: Check every frame a face relies on has a channel the app subscribes to
+        run: bash deploy/scripts/check-web-frame-channels.sh
 
   entry-scripts:
     name: Entry Scripts Lint
