@@ -7,7 +7,7 @@ import {
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { BreathingTopology } from '@/topology/BreathingTopology';
-import { formatBytes, formatCpu } from '@/topology/format';
+import { clusterName, formatBytes, formatCpu } from '@/topology/format';
 import { ContainerRow, Dot, EventRow, VolumeRow } from '@/topology/rows';
 import { Empty, Loading, ReadError } from '@/ui/primitives';
 
@@ -50,14 +50,30 @@ export function ClusterTopology() {
       {/* 先给图，再给表：图回答「谁在动、哪里坏了」，读到这里的人接着往下才看得懂
           每一行的数为什么是那个数。 */}
       <BreathingTopology data={data} />
-      {data.clusters.map((cluster) => (
-        <ClusterRow key={cluster.id} cluster={cluster} collectedAt={data.collected_at} />
+      {data.clusters.map((cluster, index) => (
+        <ClusterRow
+          key={`${cluster.id}-${index}`}
+          cluster={cluster}
+          index={index}
+          total={data.clusters.length}
+          collectedAt={data.collected_at}
+        />
       ))}
     </div>
   );
 }
 
-function ClusterRow({ cluster, collectedAt }: { cluster: TopologyCluster; collectedAt: string }) {
+function ClusterRow({
+  cluster,
+  index,
+  total,
+  collectedAt,
+}: {
+  cluster: TopologyCluster;
+  index: number;
+  total: number;
+  collectedAt: string;
+}) {
   const pods = cluster.nodes.reduce((sum, node) => sum + node.pods.length, 0);
   const ready = cluster.nodes.filter((node) => node.ready).length;
   const placed = cluster.nodes.flatMap((node) => node.pods);
@@ -69,7 +85,7 @@ function ClusterRow({ cluster, collectedAt }: { cluster: TopologyCluster; collec
         <span className="flex items-center gap-1.5">
           <Dot tone={cluster.reachable ? 'ok' : 'danger'} />
           <span className="text-[12px] text-[var(--paper)]" title={`接口标识 ${cluster.id}`}>
-            本集群
+            {clusterName(index, total)}
           </span>
         </span>
         {cluster.version && <span className="mono text-[11px] text-[var(--muted)]">{cluster.version}</span>}

@@ -1,13 +1,14 @@
 import {
   getClusterTopology,
   getResourceReport,
+  type ClusterTopology,
   type TopologyClaim,
   type TopologyCluster,
 } from '@/api/client';
-import { useResource } from '@/hooks/useResource';
+import { useResource, type Resource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
-import { formatBytes, formatCpu } from '@/topology/format';
+import { clusterName, formatBytes, formatCpu } from '@/topology/format';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 import { BarList } from '@/ui/plots';
 
@@ -29,8 +30,10 @@ export function ResourcesView() {
     [topology.refresh, quota.refresh]
   );
 
-  const cluster = topology.data?.clusters[0] ?? null;
-  const claims = collectClaims(cluster);
+  // 每个集群各算各的账。以前这里写死 `clusters[0]`：多集群时第二、第三个集群的
+  // 余量与存储账本根本不会出现在这一面，而读者看不出少了谁——一张只有一半机器的
+  // 账看起来和一张完整的账一模一样。
+  const clusters = topology.data?.clusters ?? [];
   const report = quota.data;
 
   return (
@@ -120,23 +123,78 @@ export function ResourcesView() {
         )}
       </section>
 
-      <section className="border-b border-[var(--line)]">
-        <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
-          节点可调度余量 · 调度时的账
-        </h2>
-        {topology.error ? (
-          <ReadError what="集群读数" error={topology.error} onRetry={topology.refresh} />
-        ) : !cluster ? (
-          <Loading what="集群读数" />
-        ) : !cluster.reachable ? (
-          <Empty>{cluster.error ?? '读不到集群。'}</Empty>
-        ) : (
-          <>
-            <Readings
-              from={topology}
-              source="GET /api/v1/cluster/topology（与观测面共用的同一份集群读数）"
-              caveat="「用量来源」说的是实际用量从哪儿来：没有 metrics-server 时只有申报量，实际用量是空的，不是 0。"
-            >
+      {clusters.length === 0 ? (
+        <section className="border-b border-[var(--line)]">
+          <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
+            节点可调度余量 · 调度时的账
+          </h2>
+          {topology.error ? (
+            <ReadError what="集群读数" error={topology.error} onRetry={topology.refresh} />
+          ) : (
+            <Loading what="集群读数" />
+          )}
+        </section>
+      ) : (
+        clusters.map((cluster, index) => (
+          <NodeBudget
+            key={`budget-${cluster.id}-${index}`}
+            cluster={cluster}
+            index={index}
+            total={clusters.length}
+            source={topology}
+          />
+        ))
+      )}
+
+      {clusters.map((cluster, index) => (
+        <StorageLedger
+          key={`storage-${cluster.id}-${index}`}
+          cluster={cluster}
+          index={index}
+          total={clusters.length}
+        />
+      ))}
+    </ViewFrame>
+  );
+}
+
+/**
+ * 一个集群的调度余量。
+ *
+ * 每个集群单开一节，标题写清是哪一个：多集群时把这些数加在一起是没有意义的——
+ * 「还剩 3 核」说的是哪台机器上的 3 核，加总之后的数不描述任何一个可以调度的地方。
+ */
+function NodeBudget({
+  cluster,
+  index,
+  total,
+  source,
+}: {
+  cluster: TopologyCluster;
+  index: number;
+  total: number;
+  source: Resource<ClusterTopology>;
+}) {
+  return (
+    <section className="border-b border-[var(--line)]">
+      <h2 className="flex flex-wrap items-baseline gap-x-3 px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
+        <span>节点可调度余量 · 调度时的账</span>
+        <span className="mono normal-case tracking-normal text-[var(--paper-dim)]">
+          {clusterName(index, total)} · {cluster.namespace}
+        </span>
+      </h2>
+      {!cluster.reachable ? (
+        <Empty>
+          {cluster.error ?? '读不到这个集群。'}
+          {' '}它的余量这一拍没有数，不是「还剩很多」。
+        </Empty>
+      ) : (
+        <>
+          <Readings
+            from={source}
+            source="GET /api/v1/cluster/topology（与观测面共用的同一份集群读数）"
+            caveat="「用量来源」说的是实际用量从哪儿来：没有 metrics-server 时只有申报量，实际用量是空的，不是 0。"
+          >
             <div className="flex flex-wrap py-2">
               <Reading label="节点" value={cluster.nodes.length} note={`未调度 Pod ${cluster.unscheduled.length}`} />
               <Reading
@@ -150,146 +208,166 @@ export function ResourcesView() {
                 }
                 tone={cluster.usage_source ? 'ok' : 'warn'}
               />
-              <Reading label="采集于" value={<Moment iso={topology.data?.collected_at} />} />
+              <Reading label="采集于" value={<Moment iso={source.data?.collected_at} />} />
             </div>
-            </Readings>
-            {/* 配额那一半已在表里逐行画了占比；节点这一半没有：余量是一列孤立的
-                数字，「这台还剩 3 核、那台还剩 4 核」读不出调度器会往哪台放。按可分配
-                量算成百分比排开，谁快满了是第一眼的事。 */}
-            <BarList
-              label="每台节点已申报的 CPU 占可分配量的比例"
-              note="申报量 ÷ 可分配量（GET /api/v1/cluster/topology）；没有可分配量的节点不画长度"
-              max={100}
-              rows={cluster.nodes.map((n) => ({
-                id: n.name,
-                label: n.name,
-                value:
-                  n.cpu_allocatable_millicores && n.cpu_allocatable_millicores > 0
-                    ? Math.round((n.cpu_requested_millicores / n.cpu_allocatable_millicores) * 100)
-                    : 0,
-                note:
-                  n.cpu_allocatable_millicores != null
-                    ? `${formatCpu(n.cpu_requested_millicores)} / ${formatCpu(n.cpu_allocatable_millicores)}`
-                    : '可分配量读不到',
-                tone:
-                  n.cpu_allocatable_millicores != null &&
-                  n.cpu_requested_millicores / n.cpu_allocatable_millicores >= 0.9
-                    ? ('danger' as const)
-                    : undefined,
-              }))}
-            />
-            <Table
-              columns={[
-                { key: 'node', title: '节点', width: '180px', render: (n) => (
-                  <span className="mono text-[11px]">{n.name}</span>
-                ) },
-                { key: 'cpu', title: 'CPU（已申报 / 可分配）', width: '230px', render: (n) => (
-                  <span className="mono text-[11px]">
-                    {formatCpu(n.cpu_requested_millicores)} /{' '}
-                    {n.cpu_allocatable_millicores != null ? formatCpu(n.cpu_allocatable_millicores) : '—'}
-                  </span>
-                ) },
-                { key: 'cpu_left', title: 'CPU 余量', width: '90px', render: (n) => (
-                  <Left
-                    left={
-                      n.cpu_allocatable_millicores != null
-                        ? n.cpu_allocatable_millicores - n.cpu_requested_millicores
-                        : null
-                    }
-                    low={500}
-                  />
-                ) },
-                { key: 'memory', title: '内存（已申报 / 可分配）', width: '250px', render: (n) => (
-                  <span className="mono text-[11px]">
-                    {formatBytes(n.memory_requested_bytes)} /{' '}
-                    {n.memory_allocatable_bytes != null ? formatBytes(n.memory_allocatable_bytes) : '—'}
-                  </span>
-                ) },
-                { key: 'memory_left', title: '内存余量', width: '100px', render: (n) => (
-                  <Left
-                    left={
-                      n.memory_allocatable_bytes != null
-                        ? n.memory_allocatable_bytes - n.memory_requested_bytes
-                        : null
-                    }
-                    format={formatBytes}
-                    low={1024 * 1024 * 1024}
-                  />
-                ) },
-                { key: 'pods', title: 'Pod 数', width: '90px', render: (n) => (
-                  <span className="mono text-[11px]">
-                    {n.pods.length} / {n.pods_allocatable ?? '—'}
-                  </span>
-                ) },
-              ]}
-              rows={cluster.nodes}
-              rowKey={(n) => n.name}
-            />
-            <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
-              余量按申报量算，不按实际用量：调度器只看申报。实际用量低于申报时，节点看着忙
-              其实有空间——要不要压缩申报是另一个决定，不在这里猜。
-            </p>
-          </>
-        )}
-      </section>
+          </Readings>
+          {/* 配额那一半已在表里逐行画了占比；节点这一半没有：余量是一列孤立的
+              数字，「这台还剩 3 核、那台还剩 4 核」读不出调度器会往哪台放。按可分配
+              量算成百分比排开，谁快满了是第一眼的事。 */}
+          <BarList
+            label="每台节点已申报的 CPU 占可分配量的比例"
+            note="申报量 ÷ 可分配量（GET /api/v1/cluster/topology）；没有可分配量的节点不画长度"
+            max={100}
+            rows={cluster.nodes.map((n) => ({
+              id: n.name,
+              label: n.name,
+              value:
+                n.cpu_allocatable_millicores && n.cpu_allocatable_millicores > 0
+                  ? Math.round((n.cpu_requested_millicores / n.cpu_allocatable_millicores) * 100)
+                  : 0,
+              note:
+                n.cpu_allocatable_millicores != null
+                  ? `${formatCpu(n.cpu_requested_millicores)} / ${formatCpu(n.cpu_allocatable_millicores)}`
+                  : '可分配量读不到',
+              tone:
+                n.cpu_allocatable_millicores != null &&
+                n.cpu_requested_millicores / n.cpu_allocatable_millicores >= 0.9
+                  ? ('danger' as const)
+                  : undefined,
+            }))}
+          />
+          <Table
+            columns={[
+              { key: 'node', title: '节点', width: '180px', render: (n) => (
+                <span className="mono text-[11px]">{n.name}</span>
+              ) },
+              { key: 'cpu', title: 'CPU（已申报 / 可分配）', width: '230px', render: (n) => (
+                <span className="mono text-[11px]">
+                  {formatCpu(n.cpu_requested_millicores)} /{' '}
+                  {n.cpu_allocatable_millicores != null ? formatCpu(n.cpu_allocatable_millicores) : '—'}
+                </span>
+              ) },
+              { key: 'cpu_left', title: 'CPU 余量', width: '90px', render: (n) => (
+                <Left
+                  left={
+                    n.cpu_allocatable_millicores != null
+                      ? n.cpu_allocatable_millicores - n.cpu_requested_millicores
+                      : null
+                  }
+                  low={500}
+                />
+              ) },
+              { key: 'memory', title: '内存（已申报 / 可分配）', width: '250px', render: (n) => (
+                <span className="mono text-[11px]">
+                  {formatBytes(n.memory_requested_bytes)} /{' '}
+                  {n.memory_allocatable_bytes != null ? formatBytes(n.memory_allocatable_bytes) : '—'}
+                </span>
+              ) },
+              { key: 'memory_left', title: '内存余量', width: '100px', render: (n) => (
+                <Left
+                  left={
+                    n.memory_allocatable_bytes != null
+                      ? n.memory_allocatable_bytes - n.memory_requested_bytes
+                      : null
+                  }
+                  format={formatBytes}
+                  low={1024 * 1024 * 1024}
+                />
+              ) },
+              { key: 'pods', title: 'Pod 数', width: '90px', render: (n) => (
+                <span className="mono text-[11px]">
+                  {n.pods.length} / {n.pods_allocatable ?? '—'}
+                </span>
+              ) },
+            ]}
+            rows={cluster.nodes}
+            rowKey={(n) => n.name}
+          />
+          <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
+            余量按申报量算，不按实际用量：调度器只看申报。实际用量低于申报时，节点看着忙
+            其实有空间——要不要压缩申报是另一个决定，不在这里猜。
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
 
-      <section>
-        <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
-          存储账本 · 声明 vs 实测
-        </h2>
-        {claims.length === 0 ? (
-          <Empty>这一面没读到卷声明：不是「没有数据」，是这个命名空间里没有挂卷的 Pod。</Empty>
-        ) : (
-          <>
-            <Table
-              columns={[
-                { key: 'name', title: '卷声明', width: '200px', render: (c) => (
-                  <span className="mono text-[11px]">{c.name}</span>
-                ) },
-                { key: 'phase', title: '状态', width: '100px', render: (c) => (
-                  <span className="text-[11px]">{c.phase}</span>
-                ) },
-                { key: 'class', title: '存储类', width: '130px', render: (c) => (
-                  <span className="mono text-[11px] text-[var(--muted)]">{c.storage_class ?? '—'}</span>
-                ) },
-                { key: 'capacity', title: '声明', width: '100px', render: (c) => (
-                  <span className="mono text-[11px]">
-                    {c.capacity_bytes != null ? formatBytes(c.capacity_bytes) : '—'}
-                  </span>
-                ) },
-                { key: 'measured', title: '盘上占用', width: '110px', render: (c) => (
-                  <span className="mono text-[11px]">
-                    {c.measured_bytes != null ? formatBytes(c.measured_bytes) : '—'}
-                  </span>
-                ) },
-                { key: 'fill', title: '占用', width: '160px', render: (c) => (
-                  <Meter
-                    percent={
-                      c.measured_bytes != null && c.capacity_bytes
-                        ? Math.round((c.measured_bytes / c.capacity_bytes) * 1000) / 10
-                        : null
-                    }
-                  />
-                ) },
-              ]}
-              rows={claims}
-              rowKey={(c) => c.name}
-            />
-            <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
-              「声明」是准入时写下的数字，「盘上占用」是平台自己的走查端量出来的字节。两个
-              都空才说明这一卷没有被量到；只画声明量会让一块写满的盘看起来只用了三成。
-            </p>
-          </>
-        )}
-      </section>
-    </ViewFrame>
+/** 一个集群的存储账本：卷声明是准入时写下的，盘上占用是平台自己量出来的。 */
+function StorageLedger({
+  cluster,
+  index,
+  total,
+}: {
+  cluster: TopologyCluster;
+  index: number;
+  total: number;
+}) {
+  const claims = collectClaims(cluster);
+  return (
+    <section className="border-b border-[var(--line)]">
+      <h2 className="flex flex-wrap items-baseline gap-x-3 px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
+        <span>存储账本 · 声明 vs 实测</span>
+        <span className="mono normal-case tracking-normal text-[var(--paper-dim)]">
+          {clusterName(index, total)} · {cluster.namespace}
+        </span>
+      </h2>
+      {claims.length === 0 ? (
+        <Empty>
+          {cluster.reachable
+            ? '这个集群里没有挂卷的 Pod：不是「没有数据」，是这一拍没有卷声明可读。'
+            : '这个集群这次读不到，卷声明也就无从谈起。'}
+        </Empty>
+      ) : (
+        <>
+          <Table
+            columns={[
+              { key: 'name', title: '卷声明', width: '200px', render: (c) => (
+                <span className="mono text-[11px]">{c.name}</span>
+              ) },
+              { key: 'phase', title: '状态', width: '100px', render: (c) => (
+                <span className="text-[11px]">{c.phase}</span>
+              ) },
+              { key: 'class', title: '存储类', width: '130px', render: (c) => (
+                <span className="mono text-[11px] text-[var(--muted)]">{c.storage_class ?? '—'}</span>
+              ) },
+              { key: 'capacity', title: '声明', width: '100px', render: (c) => (
+                <span className="mono text-[11px]">
+                  {c.capacity_bytes != null ? formatBytes(c.capacity_bytes) : '—'}
+                </span>
+              ) },
+              { key: 'measured', title: '盘上占用', width: '110px', render: (c) => (
+                <span className="mono text-[11px]">
+                  {c.measured_bytes != null ? formatBytes(c.measured_bytes) : '—'}
+                </span>
+              ) },
+              { key: 'fill', title: '占用', width: '160px', render: (c) => (
+                <Meter
+                  percent={
+                    c.measured_bytes != null && c.capacity_bytes
+                      ? Math.round((c.measured_bytes / c.capacity_bytes) * 1000) / 10
+                      : null
+                  }
+                />
+              ) },
+            ]}
+            rows={claims}
+            rowKey={(c) => c.name}
+          />
+          <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
+            「声明」是准入时写下的数字，「盘上占用」是平台自己的走查端量出来的字节。两个
+            都空才说明这一卷没有被量到；只画声明量会让一块写满的盘看起来只用了三成。
+          </p>
+        </>
+      )}
+    </section>
   );
 }
 
 /** 从拓扑里收齐卷声明。同一个声明被多个 Pod 挂着时只算一行：它是一块盘。 */
-function collectClaims(cluster: TopologyCluster | null): TopologyClaim[] {
+function collectClaims(cluster: TopologyCluster): TopologyClaim[] {
   const claims = new Map<string, TopologyClaim>();
-  for (const node of cluster?.nodes ?? []) {
+  for (const node of cluster.nodes) {
     for (const pod of node.pods) {
       for (const volume of pod.volumes) {
         if (volume.claim && !claims.has(volume.claim.name)) {
@@ -298,7 +376,7 @@ function collectClaims(cluster: TopologyCluster | null): TopologyClaim[] {
       }
     }
   }
-  for (const pod of [...(cluster?.unscheduled ?? []), ...(cluster?.unplaced ?? [])]) {
+  for (const pod of [...cluster.unscheduled, ...cluster.unplaced]) {
     for (const volume of pod.volumes) {
       if (volume.claim && !claims.has(volume.claim.name)) {
         claims.set(volume.claim.name, volume.claim);

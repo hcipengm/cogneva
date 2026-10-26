@@ -26,6 +26,16 @@ export function formatBytes(bytes: number): string {
   return `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
 }
 
+/**
+ * 一个集群叫它什么。
+ *
+ * 只有一个时叫「本集群」——写「集群 1」会让读者以为还有第二个。多于一个时按位置
+ * 编号：Kubernetes 的接口里没有「集群叫什么」这一项，我不替它编一个。
+ */
+export function clusterName(index: number, total: number): string {
+  return total === 1 ? '本集群' : `集群 ${index + 1}`;
+}
+
 /** 占比写成百分比。分母为零时是「算不出」，不是「用了 0%」。 */
 export function percentOf(part: number, whole: number): string {
   if (whole <= 0) return '—';

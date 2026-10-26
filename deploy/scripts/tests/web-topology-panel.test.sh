@@ -14,6 +14,7 @@
 #   - 完成与失败不分开数            → 「Pod N」把两类混成一个数
 #   - 服务端把「节点没匹配上」并入 unscheduled → 整屏 Pod 变成「没被调度」
 #   - 服务端那条测试被删掉          → 上面这条分流可以被人改回去而不让任何东西红
+#   - 把 clusters 折成 clusters[0]  → 接上第二个集群那天，它在屏上根本不存在
 # 每段改动都先确认**落到了文件上**（否则「改动没生效」与「门没抓住」不可区分）。
 #
 # 最后一条断言是在**真树**上跑：夹具全绿而真树红，说明这条门只是在测自己。
@@ -47,12 +48,16 @@ EOF
   cat >"${work}/web/src/topology/TopologyPanel.tsx" <<'EOF'
 import { useTopology } from '@/hooks/useTopology';
 export function TopologyPanel() {
-  const cluster = useTopology();
+  const clusters = useTopology();
   return (
     <div>
-      <span>{cluster.namespace}</span>
-      {cluster.unplaced.map((pod) => (
-        <span key={pod.name}>{pod.namespace}/{pod.name}</span>
+      {clusters.map((cluster) => (
+        <div key={cluster.id}>
+          <span>{cluster.namespace}</span>
+          {cluster.unplaced.map((pod) => (
+            <span key={pod.name}>{pod.namespace}/{pod.name}</span>
+          ))}
+        </div>
       ))}
       {counts.finished} / {counts.failed}
     </div>
@@ -70,7 +75,7 @@ EOF
 import { getClusterTopology } from '@/api/client';
 export function useTopology() {
   const topology = useResource('集群拓扑', getClusterTopology, 10_000);
-  return topology.data?.clusters[0];
+  return topology.data?.clusters ?? [];
 }
 EOF
   cat >"${work}/web/src/api/client.ts" <<'EOF'
@@ -232,6 +237,13 @@ if grep -q "a_pod_on_a_node_that_was_not_read" "${work}/crates/cog-gateway/src/c
   fail "测试名没被删掉"
 fi
 expect_red "没有测试守着" "没有测试 a_pod_on_a_node_that_was_not_read_is_not_called_unscheduled"
+
+# 11. 把集群列表折成第一个：屏上照样有节点、有 Pod，只是少了别的集群。
+fixture
+sed -i 's/return topology.data?.clusters ?? \[\];/return topology.data?.clusters[0];/' \
+  "${work}/web/src/hooks/useTopology.ts"
+confirm "${work}/web/src/hooks/useTopology.ts" "clusters[0]"
+expect_red "只读第一个集群" "把集群列表折成了第一个"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0

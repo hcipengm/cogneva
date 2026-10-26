@@ -9,7 +9,10 @@
 #   2. Job 跑完了是 Succeeded，旧写法按「不是 Running 就是红点」，十几个完成的 Job
 #      把真正 Failed 的那两个淹掉；
 #   3. Pod 行不显示命名空间，读的人以为这一屏是整台集群（它其实只读一个命名空间）；
-#   4. 集群那一行的名字是接口占位 `in-cluster`。
+#   4. 集群那一行的名字是接口占位 `in-cluster`；
+#   5. 拓扑接口给的是一个集群数组，而读面把 `clusters[0]` 当成整个列表——接上第二个
+#      集群那天，它在屏上不存在，而没有一处会因此变红：一个只画了一半机器的读面，
+#      看起来和一张完整的读面一模一样。
 #
 # 判据：
 #   1. `client.ts` 声明 `/api/v1/cluster/topology` 并导出 `getClusterTopology`；
@@ -20,7 +23,8 @@
 #   5. 那一屏按阶段判颜色，且 `Succeeded` 被单独判过（不是「非 Running 即红」）；
 #   6. 完成的与失败的分开数；
 #   7. 服务端 `place_pods` 真的把「写着在节点上、但没匹配到节点」的 Pod 放进
-#      `unplaced`，且有一条按名字守这件事的测试。
+#      `unplaced`，且有一条按名字守这件事的测试；
+#   8. 集群列表被遍历过（`clusters.map`），且没有任何一处把整份列表折成第一个。
 #
 # 用法：bash deploy/scripts/check-web-topology-panel.sh [仓库根目录]
 set -euo pipefail
@@ -204,6 +208,30 @@ elif not re.search(r"unplaced\s*\.\s*push", place.group(0)):
 if SERVER_TEST not in server_src:
     problems.append(
         f"{SERVER}: 没有测试 {SERVER_TEST}——这条分流可以被人改回去而不让任何东西红"
+    )
+
+# ── 8. 每个集群都要上屏：列表被遍历过，且没有人把它折成第一个 ──
+# 「折成第一个」不是少画一个点，是把「还有几个集群」这件事整块抹掉：屏上照样有节点、
+# 有 Pod、有事件，读者没有任何线索能看出自己看到的不是全部。
+FIRST_ONLY = re.compile(r"data\s*\??\.clusters\s*\[\s*0\s*\]")
+folders = []
+mapped = False
+for root, _dirs, names in os.walk(WEB):
+    for name in names:
+        if not name.endswith((".ts", ".tsx")):
+            continue
+        path = os.path.join(root, name)
+        src = open(path, encoding="utf-8").read()
+        if FIRST_ONLY.search(src):
+            folders.append(os.path.relpath(path, WEB))
+if folders:
+    problems.append(
+        f"{', '.join(folders)}: 把集群列表折成了第一个（`data.clusters[0]`）——"
+        "接上第二个集群那天，它在屏上不存在，而没有任何东西会变红"
+    )
+if not re.search(r"\bclusters\b[^\n]*\.map\s*\(", shown):
+    problems.append(
+        f"{where}: 没有一个面遍历 clusters——集群列表拿在手里却只渲染其中一个"
     )
 
 if problems:
