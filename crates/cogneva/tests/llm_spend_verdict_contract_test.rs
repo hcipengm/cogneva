@@ -19,6 +19,11 @@
 //!   are enumerated here too, and a new one has to be registered or declared
 //!   unread.
 //!
+//! A stage named through `cog_core::roles` is resolved from that declaration
+//! before it is counted, because the call sites spell the role once and read it
+//! here, and a census that only understood string literals would go on passing
+//! while measuring nothing.
+//!
 //! What it cannot judge, in the open: a stage passed as a variable rather than
 //! a literal is invisible to a text census, and so is a call site that reaches
 //! `record_self_review_skip` with a name built at run time. Both are readable
@@ -194,10 +199,11 @@ fn every_stage_a_call_site_records_is_read_or_declared_unread() {
     );
 }
 
-/// The stage literals the collaboration call sites pass, read out of the
-/// source. Non-literals are skipped rather than guessed at; see the module doc.
+/// The stage the collaboration call sites name, read out of the source. A
+/// variable is skipped rather than guessed at; see the module doc.
 fn stages_recorded_in_source(root: &std::path::Path) -> BTreeSet<String> {
     let mut stages = BTreeSet::new();
+    let roles = role_constants(root);
     let actors_dir = root.join("crates/cog-collaboration/src/actors");
     let Ok(entries) = std::fs::read_dir(&actors_dir) else {
         panic!("{} is not readable", actors_dir.display());
@@ -215,6 +221,20 @@ fn stages_recorded_in_source(root: &std::path::Path) -> BTreeSet<String> {
                 };
                 if let Some(lit) = arg.strip_prefix('"').and_then(|a| a.split('"').next()) {
                     stages.insert(lit.to_string());
+                } else if let Some(name) = role_constant_name(arg) {
+                    // A role is spelled as a constant since the names moved to
+                    // one declaration. Resolving it rather than skipping it is
+                    // what keeps this a census: the five production call sites
+                    // all pass a constant now, so skipping them would leave the
+                    // set empty and every undeclared stage invisible.
+                    let value = roles.get(name).unwrap_or_else(|| {
+                        panic!(
+                            "the call sites name cog_core::roles::{name}, which \
+                             crates/cog-core/src/roles.rs does not declare in the shape \
+                             this census reads -- fix the read rather than the call site"
+                        )
+                    });
+                    stages.insert(value.clone());
                 }
             }
         }
@@ -225,6 +245,53 @@ fn stages_recorded_in_source(root: &std::path::Path) -> BTreeSet<String> {
          rather than the tree being empty"
     );
     stages
+}
+
+/// Every role `cog_core::roles` declares, by name.
+///
+/// Read from the declaration rather than restated here: a second list would be
+/// the fourth home this module's own doc says not to keep, and it would answer
+/// "what the roles are" with what someone typed in a test.
+fn role_constants(root: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let path = root.join("crates/cog-core/src/roles.rs");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} is not readable: {e}", path.display()));
+    let mut roles = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("pub const ") else {
+            continue;
+        };
+        let Some((name, value)) = rest.split_once(':') else {
+            continue;
+        };
+        let Some(value) = value.split_once('=').map(|(_, v)| v.trim()) else {
+            continue;
+        };
+        if let Some(lit) = value
+            .strip_suffix(';')
+            .and_then(|v| v.trim().strip_prefix('"'))
+            .and_then(|v| v.split('"').next())
+        {
+            roles.insert(name.trim().to_string(), lit.to_string());
+        }
+    }
+    assert!(
+        !roles.is_empty(),
+        "{} declares no `pub const NAME: &str = \"...\"`, so this census would \
+         resolve no stage at all",
+        path.display()
+    );
+    roles
+}
+
+/// The role a stage argument names, when it names one by constant.
+///
+/// Both spellings the call sites use: the fully qualified path, and the module
+/// path a `use` would let them write.
+fn role_constant_name(arg: &str) -> Option<&str> {
+    arg.strip_prefix("cog_core::roles::")
+        .or_else(|| arg.strip_prefix("roles::"))
+        .map(str::trim)
 }
 
 /// The top-level comma-separated arguments of every call to `call` in `text`.

@@ -291,6 +291,7 @@ crates/cog-observability/src/config.rs	DEFAULT_TRACE_BUFFER_BYTES	16 * 1024 * 10
 crates/cog-observability/src/config.rs	MIN_HOLD_SECS	60	bound	below the settle floor the hold only re-reads one window, while the pod replacement it waits out takes minutes
 crates/cog-observability/src/config.rs	MIN_POLL_INTERVAL_SECS	30	bound	scrape intervals dominate freshness, so a faster poll burns Prometheus CPU without showing anything sooner
 crates/cog-observability/src/config.rs	MIN_SETTLE_SECS	10	bound	kubelet refreshes the mounted document on its own sync period; a shorter window would read the same stale document twice and call a rollout a permanent gap
+crates/cog-observability/src/config_delivery.rs	REASSERT_PERIOD	300s	bound	a third of the 15-minute sighting window, so a tick or two missed does not make a firing row read as nobody maintaining it
 crates/cog-observability/src/host_ledger.rs	HOST_SLICE_ANON_FLOOR_BYTES	8 * 1024 * 1024 * 1024	bound	The floor the anon rule compares `user.slice` against, in bytes.
 crates/cog-observability/src/image_store.rs	DEFAULT_INTERVAL_SECS	900	bound	slower than the claim scan because an image tree is much larger and changes on the scale of pulls, not of a workload writing a file
 crates/cog-observability/src/image_store.rs	MIN_INTERVAL_SECS	60	bound	fastest re-walk a deployment may ask for, bounded because the walk costs what the node holds
