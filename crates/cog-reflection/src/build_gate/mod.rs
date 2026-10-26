@@ -3049,6 +3049,9 @@ fn lay_out_slots(_dir: &Path, _bound: usize) {}
 /// mode is not about who may read it; it is about who may *write* it, and the
 /// answer has to be everyone who builds.
 const GATE_DIR_MODE: u32 = 0o1777;
+/// Mode a gate file is created with. World-writable on purpose: every user that
+/// builds on this host has to be able to record a verdict, and the mode is about
+/// who may write, not about who may read.
 const GATE_FILE_MODE: u32 = 0o666;
 
 /// Opens the gate directory to every builder on this host, whichever user it

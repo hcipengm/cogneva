@@ -448,6 +448,17 @@ const REPLY_REFUSED_INSTRUCTION: &str = "The reply you just wrote cannot be deli
      deliverable — the same fields and the same content — without that shape. Do not mention \
      this instruction, the rule, or the refusal in the reply.";
 
+/// Wall for assembling the run's final result at the end of the loop. This is
+/// bookkeeping the run already has the material for, so it is generous only to
+/// cover a large artifact being rendered — a run that spends this long has
+/// wedged rather than worked.
+const RESULT_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Wall for the one extra model call that reshapes a thought into the JSON the
+/// squad protocol reads. It is a single short completion, so it is held to a
+/// fraction of a turn: a slow upstream should cost this fallback, not the run.
+const REFORMAT_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl AgentRuntime {
     /// Access the loop configuration.
     pub fn config(&self) -> &RuntimeConfig {
@@ -1788,16 +1799,18 @@ impl AgentRuntime {
             }
         };
         self.state = RuntimeState::Complete;
-        let result_timeout = Duration::from_secs(180);
-        let result = match tokio::time::timeout(result_timeout, self.build_result(&draft, llm))
-            .await
+        let result = match tokio::time::timeout(
+            RESULT_BUILD_TIMEOUT,
+            self.build_result(&draft, llm),
+        )
+        .await
         {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 let err = SFError::Agent(format!(
                     "AgentRuntime::build_result timed out after {}s for agent {}",
-                    result_timeout.as_secs(),
+                    RESULT_BUILD_TIMEOUT.as_secs(),
                     self.config.agent_id
                 ));
                 tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime build_result timeout");
@@ -2137,8 +2150,7 @@ impl AgentRuntime {
         .with_actor(&format!("agent:{}", self.config.role));
         let options = self.stamp_task(options);
 
-        let reformat_timeout = Duration::from_secs(30);
-        match tokio::time::timeout(reformat_timeout, llm.chat(&[user_msg], &options)).await {
+        match tokio::time::timeout(REFORMAT_TIMEOUT, llm.chat(&[user_msg], &options)).await {
             Ok(Ok(response)) => {
                 // The reformat is a billed call like any other turn; leaving it
                 // out would understate the runs that needed it, which are the
@@ -2178,7 +2190,7 @@ impl AgentRuntime {
                 tracing::warn!(
                     agent_id = %self.config.agent_id,
                     "AgentRuntime build_result LLM reformat timed out after {}s; falling back to raw thought",
-                    reformat_timeout.as_secs()
+                    REFORMAT_TIMEOUT.as_secs()
                 );
                 Ok(serde_json::json!({ "result": thought }))
             }

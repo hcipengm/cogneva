@@ -44,6 +44,8 @@ const TRANSFER_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// 一次搜索最多走多少个文件、读多少字节：搜索是同步回答的请求，没有一个
 /// 上界时一个装满构建产物的根目录会让这一次请求把连接占满。
 const SEARCH_MAX_FILES: usize = 5_000;
+/// 一次搜索最多读多少字节：与上面的文件数同一个界的字节侧，定在扫一份仓库的文本
+/// 仍能在一次请求里答完的位置。
 const SEARCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// 一次搜索默认回多少条匹配，以及调用方能要到多少。
 const SEARCH_DEFAULT_LIMIT: usize = 100;
@@ -51,6 +53,8 @@ const SEARCH_MAX_LIMIT: usize = 500;
 /// 每个用户工作区的容量上限（字节）。取一个部署能改的默认值：编辑器与上传是同一块
 /// 持久卷，没有上限时一个用户把卷写满，代价由同一卷上的其他状态一起付。
 const WORKSPACE_MAX_BYTES_ENV: &str = "COGNEVA_WORKSPACE_MAX_BYTES";
+/// 一个工作区默认能占多少字节：一份源码加它自己的构建产物的量级，
+/// 不是一个按租户量出来的容量，所以它是个部署可改的默认值。
 const DEFAULT_WORKSPACE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]

@@ -38,6 +38,10 @@ struct AppState {
 
 /// Hard ceiling on command duration regardless of what the client asks for.
 const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+/// Wall for a command whose caller named none. Long enough for an interactive
+/// command to finish, short enough that a caller which stopped listening does not
+/// hold the executor; a caller that needs longer asks for it, up to the ceiling
+/// above.
 const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Port the executor listens on when `SANDBOX_EXECUTOR_PORT` names none.

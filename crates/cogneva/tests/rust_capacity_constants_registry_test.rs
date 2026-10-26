@@ -56,8 +56,11 @@ const REGISTRY: &str = "crates/cogneva/tests/data/rust-capacity-constants.tsv";
 /// The ceiling is the gate's teeth: with a finitely large debt, adding a
 /// constant without deciding what it is would go unnoticed, because the file
 /// would simply grow. Pinning the count means the next one arrives with an
-/// answer, and paying a debt is the only thing that makes room.
-const DEBT_CEILING: usize = 136;
+/// answer, and paying a debt is the only thing that makes room. It sits at zero
+/// because the debt is paid: every constant in the tree now names either the
+/// reading it follows or the reason its bound should not move, so the next one
+/// written has to decide before it lands.
+const DEBT_CEILING: usize = 0;
 
 /// One line of the registry.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -190,6 +193,17 @@ fn walk_rs(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Drop the module path a type or an initializer may carry, leaving the name
+/// the registry reads: `std::time::Duration` and `Duration` are one type, and
+/// only the bare spelling used to be matched, so the qualified one read as a
+/// constant holding no number.
+fn strip_qualified(text: &str) -> &str {
+    match text.find("Duration") {
+        Some(at) if text[..at].ends_with("::") => &text[at..],
+        _ => text,
+    }
+}
+
 fn parse_const(line: &str, file: &str) -> Option<Row> {
     let line = line.trim_start();
     let line = match line.strip_prefix("pub(") {
@@ -210,10 +224,16 @@ fn parse_const(line: &str, file: &str) -> Option<Row> {
         return None;
     }
     let rest = rest.trim_start();
-    let ty = rest.split('=').next()?.trim();
+    // The type and the initializer are both spelled fully qualified about as
+    // often as not (`std::time::Duration`), and reading only the bare name made
+    // those constants look like they held no number at all: the declaration was
+    // invisible here and the call site had already been given the name, so the
+    // number left both registers at once.
+    let ty = strip_qualified(rest.split('=').next()?.trim());
     // One line, one constant: the initializer has to close on the same line.
     let value = rest.split_once('=')?.1.trim();
     let value = value.strip_suffix(';')?.trim();
+    let value = strip_qualified(value);
     let value = match ty {
         // Any initializer that starts with a number is a written number,
         // arithmetic included: `4096 * 1024` is two typed digits and no
@@ -432,6 +452,40 @@ fn the_scan_sees_production_constants_and_not_fixtures() {
     );
 }
 
+/// A constant whose type and initializer are written fully qualified holds a
+/// number like any other, and the census has to read it.
+///
+/// Matching only the bare `Duration` spelling made every `std::time::Duration`
+/// declaration look like a type the census does not know, so those constants
+/// appeared in neither half: not here, and no longer at the call site either,
+/// once the call sites were given the name. The number then had no row anywhere
+/// -- not an unreviewed one, not a reviewed one, nothing to be red about.
+#[test]
+fn a_fully_qualified_duration_is_still_a_number() {
+    let root = std::env::temp_dir().join(format!("cog-qualified-{}", std::process::id()));
+    let src = root.join("crates/probe/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("dials.rs"),
+        r#"
+const BARE: Duration = Duration::from_secs(7);
+const QUALIFIED: std::time::Duration = std::time::Duration::from_millis(250);
+const PLAIN: u64 = 30;
+"#,
+    )
+    .unwrap();
+    let value_of = |name: &str| {
+        scan(&root)
+            .into_iter()
+            .find(|r| r.name == name)
+            .map(|r| r.value)
+    };
+    assert_eq!(value_of("BARE").as_deref(), Some("7s"));
+    assert_eq!(value_of("QUALIFIED").as_deref(), Some("250ms"));
+    assert_eq!(value_of("PLAIN").as_deref(), Some("30"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
 // ---------------------------------------------------------------------------
 // The other half: numbers written where they are *used*.
 //
@@ -465,8 +519,10 @@ const BARE_BYTES: &str = "bytes";
 /// The value is the measured population, not a budget somebody chose. Every
 /// row is a number a deployment's behaviour depends on and no caller can move;
 /// the ceiling exists so the next one arrives with a decision, which is what
-/// makes this a ratchet rather than a count.
-const BARE_LITERAL_CEILING: usize = 11;
+/// makes this a ratchet rather than a count. It sits at zero: every use site
+/// now names a constant, so a new literal is a new decision rather than one
+/// more row in a debt nobody is paying.
+const BARE_LITERAL_CEILING: usize = 0;
 
 /// `Duration::from_*(<literal>)` and byte multipliers, per file and shape.
 ///

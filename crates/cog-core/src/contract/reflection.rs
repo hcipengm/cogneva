@@ -2515,6 +2515,8 @@ fn test_binary_of(line: &str) -> Option<String> {
 /// wrong length is left alone: a name cargo did not decorate is better kept
 /// intact than truncated on a guess.
 fn without_metadata_hash(stem: &str) -> String {
+    /// How many hex digits cargo appends to a binary name's stem: sixteen, the
+    /// truncated metadata hash.
     const HASH_LEN: usize = 16;
     match stem.rsplit_once('-') {
         Some((name, hash))

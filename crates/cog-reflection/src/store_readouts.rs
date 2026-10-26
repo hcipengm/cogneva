@@ -46,6 +46,8 @@ pub struct ExpectedStore {
 }
 
 impl RestoreExpectation {
+    /// 交接单的落盘形状的版本。读侧遇到不认识的版本一律不猜：形状变了才动这个数，
+    /// 它标的是「这份文件按哪种形状写的」，不是容量。
     pub const VERSION: u32 = 1;
 
     /// 交接单在数据根里的位置。放在 `meta_learning/` 而不是数据根顶层：那一层已经

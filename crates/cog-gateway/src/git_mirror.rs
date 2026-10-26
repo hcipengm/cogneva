@@ -56,6 +56,8 @@ const HTTPS_PROBE_INTERVAL_SECS: u64 = 60;
 /// pack 计算 + 传输，给足时间。**这两个值判的是"是不是进了黑洞"，不是给正常
 /// 请求设预算**——透传路径原本没有任何总超时，加它就是为了让降级判据存在。
 const HTTPS_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// post 的判据与 get 同形，只是量级不同：一次 post 要把整包算完再传出去，
+/// 所以在正常仓库上它本来就以分钟计；这个界判的仍是「是不是进了黑洞」。
 const HTTPS_POST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// 镜像单次响应体上限，与透传路径的 256MB 缓冲约定一致。
 const MAX_MIRROR_BODY: usize = 256 * 1024 * 1024;

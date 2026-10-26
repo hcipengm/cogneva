@@ -21,6 +21,8 @@ use std::time::Duration;
 // the first copy is still on its way.
 const PENDING_IDLE_MS: u64 = cog_core::config::DEFAULT_READY_CLAIM_IDLE_SECS * 1000;
 const CLAIM_INTERVAL: Duration = Duration::from_secs(60);
+/// 一次认领要多少条：够把下一次醒来之前的工作铺在 executor 前面，也小到一次认领
+/// 本身跨不过两轮之间的间隔。
 const CLAIM_BATCH: usize = 16;
 /// 认领消息的执行并发上限。tick 只负责认领和派发，不能在某条认领
 /// 消息的执行上 await：agent 任务可能跑几十分钟，串行处理会让整个

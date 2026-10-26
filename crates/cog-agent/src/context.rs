@@ -226,9 +226,6 @@ impl ContextWindow {
 /// 窗口配大了，允许的单条结果跟着变大，两者不会各自漂移。
 const TOOL_RESULT_WINDOW_SHARE_DIVISOR: usize = 2;
 
-/// 估算口径里一个 token 折算的字符数，与 `estimate_tokens` 的英文分支同源。
-const CHARS_PER_ESTIMATED_TOKEN: usize = 4;
-
 /// The number of characters one tool result may occupy before it is cut.
 ///
 /// The tool-return path reads this to decide whether a result needs archiving,
@@ -239,7 +236,7 @@ const CHARS_PER_ESTIMATED_TOKEN: usize = 4;
 pub fn tool_result_budget_chars(max_tokens: usize) -> usize {
     (max_tokens / TOOL_RESULT_WINDOW_SHARE_DIVISOR)
         .max(1)
-        .saturating_mul(CHARS_PER_ESTIMATED_TOKEN)
+        .saturating_mul(cog_core::token_estimate::CHARS_PER_TOKEN)
 }
 
 /// 把超出窗口份额的单条工具结果截断到预算内，其余消息原样返回。
@@ -251,7 +248,7 @@ pub fn tool_result_budget_chars(max_tokens: usize) -> usize {
 /// 界数的是字符不是估算 token：这道界要在消息被记账**之前**生效，手里是原文，
 /// 而工具返回点（决定要不要归档）与这里共用同一个 [`tool_result_budget_chars`]。
 /// 两处不同源会让同一条结果按两个边界各裁一次，第二次连截断标记一起砍掉。
-/// 折算用的是估算英文那一档（[`CHARS_PER_TOKEN`] 字符 1 token）。
+/// 折算用的是估算英文那一档（[`CHARS_PER_TOKEN`](cog_core::token_estimate::CHARS_PER_TOKEN) 字符 1 token）。
 ///
 /// 这里丢掉 [`Truncation::dropped_chars`] 而不发读数，是因为这条路径本就不该
 /// 对工具结果生效：返回点用的是同一个预算，已经按它裁过一次并用带引用的标记

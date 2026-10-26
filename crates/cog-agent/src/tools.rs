@@ -32,6 +32,18 @@ const DEFAULT_RAW_FETCH_BUDGET_BYTES: u64 = 262_144;
 const ASK_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const ASK_MAX_TIMEOUT_MS: u64 = 600_000;
 
+/// Default wall for one WASM tool call. The guest is somebody else's code: a
+/// module that never returns has to come back to the caller as a failure, so
+/// the bound is short — a compute-shaped tool that legitimately needs longer
+/// asks for it instead of raising this.
+const DEFAULT_WASM_TIMEOUT_SECS: u64 = 30;
+
+/// Default wall for one shell tool call. An order of magnitude above the WASM
+/// bound because the thing being timed is a build or a test run, which is
+/// expected to take minutes; what this catches is a command that wedged, not a
+/// command that works.
+const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 600;
+
 /// Real execution identity of one agent run. Carried explicitly from the
 /// actor (which knows the DAG task) through the runtime into sandbox requests,
 /// so the executor pod can attribute and route work per task.
@@ -129,8 +141,8 @@ impl ToolRegistry {
             sandbox_backend: None,
             guardrail: None,
             plugin_registry: None,
-            wasm_timeout: Duration::from_secs(30),
-            shell_timeout: Duration::from_secs(600),
+            wasm_timeout: Duration::from_secs(DEFAULT_WASM_TIMEOUT_SECS),
+            shell_timeout: Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
             require_identity: false,
         }
     }

@@ -28,7 +28,11 @@ pub fn estimate_tokens(text: &str) -> usize {
 }
 
 /// 非 CJK 字符每多少个算一个 token（英文约 4 字符 1 token）。
-const CHARS_PER_TOKEN: usize = 4;
+///
+/// 公开是因为别的 crate 里也有按这一档算字符预算的地方：估算口径一处写死、
+/// 别处各写一份 4，剪裁与估算就会按两个比例走，同一段文本两处算出来的窗口占用
+/// 对不上。
+pub const CHARS_PER_TOKEN: usize = 4;
 
 /// 一个英文词的代价，也是任何一个词的下限。
 ///

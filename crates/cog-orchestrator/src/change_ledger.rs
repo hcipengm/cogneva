@@ -4409,6 +4409,9 @@ async fn record_dispatch_state(
             // Bounded on purpose: one line is an annotation, and an account that
             // came to hold thousands of rows would otherwise turn this into a
             // dump. The remainder is a count, not silence.
+            /// Rows one account line names before it summarises the rest as a count: a line
+            /// is an annotation, and an account that came to hold thousands of rows would
+            /// otherwise turn it into a dump.
             const NAMED: usize = 20;
             let named: Vec<String> = holders
                 .iter()

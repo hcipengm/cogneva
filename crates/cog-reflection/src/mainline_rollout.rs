@@ -2217,6 +2217,9 @@ impl RolloutExecutor {
         // on a path that already said "no": if the ceiling really is exceeded,
         // this attempt is refused anyway, so the wait costs seconds, while
         // giving up early costs a whole retry round.
+        /// How long one attempt waits for a full ceiling to drain, and how often it looks
+        /// while waiting. Waiting on a path that already said no costs seconds; giving up
+        /// early costs a whole retry round.
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
         const POLL: std::time::Duration = std::time::Duration::from_secs(5);
         let started = std::time::Instant::now();

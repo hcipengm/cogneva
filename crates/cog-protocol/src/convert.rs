@@ -12,6 +12,9 @@ use cog_core::{SFError, SFResult};
 use super::raw;
 use super::wal as wal_proto;
 
+/// The level zstd itself calls its default. Picked so compression costs little
+/// enough to sit on the write path: the codec is buying bytes cheaply, not
+/// trading the writer's time for the smallest possible frame.
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
 // ─── RawRecord ↔ raw::RawRecord conversions ───

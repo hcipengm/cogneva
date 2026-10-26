@@ -4,7 +4,6 @@
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// Loop name reported through the background-loop liveness family.
 /// 整轮预算里留给下一拍启动的余量。
 ///
 /// 检查点整轮（枚举全部在跑任务并逐个落点）必须在下一拍到来之前交还控制权，

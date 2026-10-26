@@ -67,6 +67,9 @@ pub const APPROVAL_TTL_SECS_ENV: &str = "HOST_DOCS_APPROVAL_TTL_SECS";
 pub const MAX_PLAN_BYTES_ENV: &str = "HOST_DOCS_MAX_PLAN_BYTES";
 
 const DEFAULT_JOURNAL_DIR: &str = "/opt/cogneva/sandbox/host-docs-journal";
+/// Default for the body of one host document. Sized for the largest document
+/// this platform writes by hand (a plan or an audit), not to the channel's bound:
+/// a document is stored whole, so the number answers to what a reader can open.
 const DEFAULT_MAX_DOC_BYTES: usize = 8 * 1024 * 1024;
 /// A full-size body. **Deliberately not tied to the audited channel's bound**: that one
 /// is another process's quantity, bounding the text one request sends out, while this

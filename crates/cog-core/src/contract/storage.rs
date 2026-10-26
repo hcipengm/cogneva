@@ -918,6 +918,9 @@ pub trait VectorBackend: Send + Sync {
         }
 
         // RRF fusion (k=60).
+        /// The damping constant of reciprocal rank fusion as the literature defines it
+        /// (k = 60): it holds the weight of the lowest ranks near the weight of the
+        /// highest instead of letting one list's top hit decide the fusion.
         const RRF_K: f32 = 60.0;
         let mut fused_scores: std::collections::HashMap<String, f32> =
             std::collections::HashMap::new();

@@ -33,7 +33,26 @@ use cog_orchestrator::face_drift::UnexplainedOwner;
 use cog_storage::{PostgresGovernanceStore, PostgresStateBackend, RedisAgentRegistry};
 
 /// Columns of a roster row, in the order the file writes them.
-const ROSTER_COLUMNS: usize = 13;
+///
+/// One list, so the header the projection writes and the position the import
+/// reads cannot come apart: a column added on either side is added here once,
+/// and the arity check below is the list's own length rather than a second
+/// number that has to be kept equal by hand.
+const ROSTER_COLUMNS: &[&str] = &[
+    "face",
+    "kind",
+    "owner",
+    "deputy",
+    "witness",
+    "time_share",
+    "vacancy_until",
+    "vacancy_assigner",
+    "gap_task",
+    "first_reading",
+    "entry_path",
+    "updated_at",
+    "source_fronts",
+];
 
 pub const USAGE: &str = "\
 cogneva governance <SUBCOMMAND> [OPTIONS]
@@ -481,31 +500,34 @@ fn join_or_dash(items: &[String]) -> String {
 /// date for a declared vacancy, which is the difference between a staffed face
 /// and `no_owner`.
 fn render_roster(faces: &[Face]) -> String {
-    let mut out = String::from(
-        "# face\tkind\towner\tdeputy\twitness\ttime_share\tvacancy_until\t\
-         vacancy_assigner\tgap_task\tfirst_reading\tentry_path\tupdated_at\t\
-         source_fronts\n",
-    );
+    let mut out = format!("# {}\n", ROSTER_COLUMNS.join("\t"));
     for face in faces {
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            face.face_id,
-            face.spec.kind.as_str(),
-            face.owner_unit.as_deref().unwrap_or("-"),
-            face.spec.deputy_unit.as_deref().unwrap_or("-"),
-            face.spec.witness_unit.as_deref().unwrap_or("-"),
-            face.spec.time_share.as_deref().unwrap_or("-"),
-            face.spec
-                .vacancy_until
-                .map(|t| t.to_rfc3339())
-                .unwrap_or_else(|| "-".into()),
-            face.spec.vacancy_assigner.as_deref().unwrap_or("-"),
-            face.spec.gap_task_id.as_deref().unwrap_or("-"),
-            face.spec.first_reading.as_deref().unwrap_or("-"),
-            face.spec.entry_path.as_deref().unwrap_or("-"),
+        let or_dash = |v: Option<&str>| v.unwrap_or("-").to_string();
+        let fields = [
+            face.face_id.clone(),
+            face.spec.kind.as_str().to_string(),
+            or_dash(face.owner_unit.as_deref()),
+            or_dash(face.spec.deputy_unit.as_deref()),
+            or_dash(face.spec.witness_unit.as_deref()),
+            or_dash(face.spec.time_share.as_deref()),
+            or_dash(face.spec.vacancy_until.map(|t| t.to_rfc3339()).as_deref()),
+            or_dash(face.spec.vacancy_assigner.as_deref()),
+            or_dash(face.spec.gap_task_id.as_deref()),
+            or_dash(face.spec.first_reading.as_deref()),
+            or_dash(face.spec.entry_path.as_deref()),
             face.updated_at.to_rfc3339(),
-            face.spec.source_fronts.as_deref().unwrap_or("-"),
-        ));
+            or_dash(face.spec.source_fronts.as_deref()),
+        ];
+        // The row and the header come from the same list, so a field added to
+        // one side fails here instead of writing a file the import rejects
+        // line by line.
+        assert_eq!(
+            fields.len(),
+            ROSTER_COLUMNS.len(),
+            "a roster row and its header must carry the same fields"
+        );
+        out.push_str(&fields.join("\t"));
+        out.push('\n');
     }
     out
 }
@@ -708,10 +730,11 @@ pub fn parse_roster(text: &str) -> Result<Vec<RosterRow>, String> {
             continue;
         }
         let columns: Vec<&str> = line.split('\t').collect();
-        if columns.len() != ROSTER_COLUMNS {
+        if columns.len() != ROSTER_COLUMNS.len() {
             return Err(format!(
-                "line {}: expected {ROSTER_COLUMNS} columns, found {}",
+                "line {}: expected {} columns, found {}",
                 index + 1,
+                ROSTER_COLUMNS.len(),
                 columns.len()
             ));
         }

@@ -28,6 +28,9 @@ pub struct Bm25Index {
 }
 
 impl Bm25Index {
+    /// BM25's saturation (k1 = 1.5) and length-normalisation (b = 0.75) parameters,
+    /// at the values the literature reports for short passages. They are retrieval
+    /// defaults, not readings taken from this corpus.
     const K1: f32 = 1.5;
     const B: f32 = 0.75;
 

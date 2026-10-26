@@ -102,6 +102,8 @@ pub fn analyze_convergence(
     not_converged(&series)
 }
 
+/// 画布尺寸与留白。这是呈现面的几何：选的是一条曲线与它前后的读数能一眼看清，
+/// 不是从数据里量出来的量，也没有别的代码依赖这几个数。
 const SVG_WIDTH: u32 = 800;
 const SVG_HEIGHT: u32 = 400;
 const MARGIN: u32 = 50;

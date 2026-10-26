@@ -33,23 +33,11 @@ use cog_observability::host_ledger::{self, HostLedgerObservable};
 /// Port this mode serves on.
 pub const PORT_ENV: &str = "COGNEVA_HOST_LEDGER_PORT";
 
-/// Port used when the deployment names none.
-///
-/// Nothing else in the pod this runs in listens here; the Service that exposes
-/// it names the endpoint `http`, which is the name the scraper discovers by.
-pub const DEFAULT_PORT: u16 = 9100;
+pub use crate::scraper_endpoint::DEFAULT_PORT;
 
 /// Port this mode should listen on, from the environment.
 pub fn port_from_env() -> u16 {
-    parse_port(std::env::var(PORT_ENV).ok().as_deref()).unwrap_or(DEFAULT_PORT)
-}
-
-/// Pure half of [`port_from_env`], so the default is testable without touching
-/// a process-wide variable other tests share.
-fn parse_port(raw: Option<&str>) -> Option<u16> {
-    raw.map(str::trim)
-        .filter(|value| !value.is_empty())
-        .and_then(|value| value.parse().ok())
+    crate::scraper_endpoint::port_from_env(PORT_ENV)
 }
 
 /// The host cgroup root this process reads, from the environment.
@@ -196,18 +184,6 @@ mod tests {
         let status = response.status();
         let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
         (status, String::from_utf8(body.to_vec()).unwrap())
-    }
-
-    /// The default is only used when the deployment names no port, so it must be
-    /// reachable without a name and a malformed value must not silently become
-    /// port 0 (which binds a random port the Service could never target).
-    #[test]
-    fn a_named_port_wins_and_anything_unusable_falls_back_to_the_default() {
-        assert_eq!(parse_port(Some("9101")), Some(9101));
-        assert_eq!(parse_port(Some(" 9101 ")), Some(9101));
-        assert_eq!(parse_port(None), None);
-        assert_eq!(parse_port(Some("")), None);
-        assert_eq!(parse_port(Some("nine thousand")), None);
     }
 
     /// A blank root must not resolve to the working directory: the process would

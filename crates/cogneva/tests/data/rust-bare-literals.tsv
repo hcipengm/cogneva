@@ -6,9 +6,3 @@
 # COGNEVA_BARE_LITERAL_REGISTRY_WRITE=1 cargo test -p cogneva --test
 # rust_capacity_constants_registry_test
 file	kind	count
-crates/cog-agent/src/agent.rs	cadence	1
-crates/cog-agent/src/agent_kernel/runtime.rs	cadence	2
-crates/cog-agent/src/plugin.rs	cadence	1
-crates/cog-agent/src/tools.rs	cadence	2
-crates/cog-gateway/src/security_gateway.rs	bytes	3
-crates/cog-gateway/src/security_gateway.rs	cadence	2

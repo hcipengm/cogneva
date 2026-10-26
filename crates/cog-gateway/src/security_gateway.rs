@@ -2903,6 +2903,28 @@ struct RequestSide {
     request_body: Option<Arc<Vec<u8>>>,
 }
 
+/// How much of a proxied request body the gateway will hold to forward it.
+/// Generous because the bodies crossing here are whole LLM contexts and
+/// code-platform payloads, and the gateway has to have the whole thing before
+/// it can decide whether to send it; it is still a bound, so a caller streaming
+/// without end fails here instead of in memory.
+const MAX_PROXIED_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// How much of a git pack transfer this will buffer. The copy is held so that
+/// the forwarded request carries a complete Content-Length — git servers
+/// disagree about chunked encoding — and cogneva's own repositories sit far
+/// below this, so the memory is spent on the header rather than the payload.
+const MAX_GIT_PACK_BYTES: usize = 256 * 1024 * 1024;
+
+/// Wall for one outbound call to an upstream. Sized for a non-streaming
+/// completion, which is the slowest non-stream thing this process asks for.
+const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wall for the connection alone. Kept well under the request wall so an
+/// unreachable upstream is reported as "cannot connect" quickly instead of
+/// being indistinguishable from a slow one.
+const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// 留底表的单边上限。流式响应的原文扫描本来就只留 1 MiB（见 [`UsageScanner::feed`]），
 /// 请求侧对齐同一个界：两边都是"一次调用的规模"，而把它调大只会让一张诊断表变成
 /// 库里最大的一张。
@@ -5228,7 +5250,7 @@ async fn stream_forward(
             "LLM 代理收到未声明身份的调用：账本上它只会落在 unknown 格，日志是唯一能点名调用者的地方"
         );
     }
-    let body = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
+    let body = axum::body::to_bytes(req.into_body(), MAX_PROXIED_BODY_BYTES)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
@@ -6695,7 +6717,7 @@ async fn code_platform_forward(
     let upstream_path = path.strip_prefix(&prefix).unwrap_or(&path).to_string();
     let query = req.uri().query().map(|q| q.to_string());
     let headers = req.headers().clone();
-    let body = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
+    let body = axum::body::to_bytes(req.into_body(), MAX_PROXIED_BODY_BYTES)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
@@ -6895,6 +6917,8 @@ async fn attach_proxy(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
+    /// 附件的上限，与 GitHub 附件面那条界同值：一个平台接受的附件，在网关这一侧和
+    /// 在代码平台那一侧必须是同一个规摸。
     const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
     let raw = params
@@ -7050,9 +7074,7 @@ async fn git_forward(
         .get("git-protocol")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    // pack 数据带 256MB 上限缓冲：cogneva 仓库量级下远低于此，
-    // 缓冲换取 Content-Length 完整（git 服务器对 chunked 支持不一）。
-    let body = axum::body::to_bytes(req.into_body(), 256 * 1024 * 1024)
+    let body = axum::body::to_bytes(req.into_body(), MAX_GIT_PACK_BYTES)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
@@ -8083,11 +8105,11 @@ pub async fn run(
     }
     let state = AppState {
         client: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(UPSTREAM_REQUEST_TIMEOUT)
             .default_headers(identity_headers.clone())
             .build()?,
         stream_client: reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
             .default_headers(identity_headers.clone())
             .build()?,
         outbound_identity: identity,

@@ -16,6 +16,11 @@ pub const POOL_SIZING_LOOP: &str = "agent_pool_sizing";
 /// pool and regrow it between two tasks without either reading being wrong.
 const POOL_SIZING_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How often this agent says it is alive to the control plane. Short enough
+/// that a restarted control plane re-learns its agents without a redeploy, long
+/// enough that the heartbeat is not the busiest thing on the channel.
+const HEARTBEAT_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Keep the pool's concurrency equal to what the container can carry.
 ///
 /// The declared worker count is the ceiling this moves under, never above: a
@@ -605,7 +610,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
         // ── gRPC control plane heartbeat + command subscription ──
         if let Some(client) = self.lifecycle_client.clone() {
             let agent_id = format!("cogneva-agent-{}", std::process::id());
-            let heartbeat_period = std::time::Duration::from_secs(5);
+            let heartbeat_period = HEARTBEAT_PERIOD;
             let hb_client = client.clone();
             let hb_agent_id = agent_id.clone();
             // No stop signal and no exit of its own: ending means this agent
