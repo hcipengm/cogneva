@@ -533,6 +533,13 @@ impl ChangePipeline {
     /// deployment whose reading said 3600 while its runs were being killed at
     /// 1800 would be an observation surface that disagrees with the decision it
     /// is supposed to explain.
+    ///
+    /// The field this sets is the fallback for a pipeline with no sink attached.
+    /// A pipeline that has one reads the budget at every run (see
+    /// [`Self::test_budget_secs`]), because the sink's number moves: a run that
+    /// came within the headroom of the pin raises the budget for the next one,
+    /// and a pipeline holding a copy taken at construction would keep enforcing
+    /// the old wall while the reading advertised the new one.
     pub fn with_verification_budget(
         mut self,
         budget: Arc<crate::verification_budget::VerificationBudget>,
@@ -540,6 +547,19 @@ impl ChangePipeline {
         self.test_timeout_secs = budget.timeout_secs(crate::verification_budget::KIND_TEST);
         self.budget = Some(budget);
         self
+    }
+
+    /// The test budget this run is held to.
+    ///
+    /// Read at the moment of the run, not at wiring time: the sink derives it
+    /// from the runs that already happened, so the number that applies to this
+    /// change is the one as of now. Without a sink the pipeline keeps the value
+    /// it was configured with.
+    fn test_budget_secs(&self) -> u64 {
+        match &self.budget {
+            Some(budget) => budget.timeout_secs(crate::verification_budget::KIND_TEST),
+            None => self.test_timeout_secs,
+        }
     }
 
     pub fn with_target_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -2473,10 +2493,9 @@ impl ChangePipeline {
         self.apply_verification_env(&mut cmd);
 
         let started = Instant::now();
+        let budget_secs = self.test_budget_secs();
         let output =
-            match tokio::time::timeout(Duration::from_secs(self.test_timeout_secs), cmd.output())
-                .await
-            {
+            match tokio::time::timeout(Duration::from_secs(budget_secs), cmd.output()).await {
                 Ok(result) => {
                     let output = result.map_err(|e| {
                         SFError::IO(format!("Failed to run {}: {}", self.test_command_line(), e))
@@ -2496,7 +2515,7 @@ impl ChangePipeline {
                     return Err(SFError::IO(format!(
                         "{} exceeded the {}s verification budget and was killed",
                         self.test_command_line(),
-                        self.test_timeout_secs
+                        budget_secs
                     )));
                 }
             };
@@ -2556,7 +2575,7 @@ impl ChangePipeline {
     async fn run_cargo_clippy(&self, workdir: &Path) -> SFResult<(bool, String)> {
         let argv: Vec<String> = BUILTIN_LINT.iter().map(|arg| (*arg).to_string()).collect();
         info!(command = %argv.join(" "), "Running the built-in linter");
-        self.run_verification_command(workdir, &argv, self.test_timeout_secs)
+        self.run_verification_command(workdir, &argv, self.test_budget_secs())
             .await
     }
 
@@ -2605,7 +2624,7 @@ impl ChangePipeline {
                 let line = argv.join(" ");
                 info!(command = %line, "Running the linter this deployment declares");
                 let (passed, output) = self
-                    .run_verification_command(workdir, argv, self.test_timeout_secs)
+                    .run_verification_command(workdir, argv, self.test_budget_secs())
                     .await?;
                 (line, passed, output)
             }

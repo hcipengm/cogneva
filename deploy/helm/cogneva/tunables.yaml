@@ -1,5 +1,13 @@
 # The tunable registry: one row per numeric leaf `values.yaml` carries.
 #
+# The Rust half of the same account lives in
+# `crates/cogneva/tests/data/rust-capacity-constants.tsv`, judged by
+# `crates/cogneva/tests/rust_capacity_constants_registry_test.rs`: a numeric
+# `const` in production code with no row there is red the same way a chart leaf
+# with no row here is. The two are split by what they enumerate, not by who owns
+# them — a dial that reaches the cluster through `values.yaml` is accounted here,
+# and one that never leaves the process is accounted there.
+#
 # A number a deployment ships is one of three things, and the page shows all
 # three as the same number:
 #

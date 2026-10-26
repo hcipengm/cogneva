@@ -1,19 +1,30 @@
-//! The two budgets that bound a self-evolution run, and what they did.
+//! The two budgets that bound a self-evolution run, what they did, and what the
+//! runs themselves say the budget has to be.
 //!
-//! `test_timeout_secs` and `build_timeout_secs` are the knobs that decide when a
-//! verification or a deployment run is killed. Both were, until recently, fields
-//! nothing read; both now wrap the child in a timeout. What stayed missing is
-//! any reading of the two facts that matter to whoever has to set them:
+//! `test_timeout_secs` and `build_timeout_secs` are the knobs the deployment
+//! pins. They are read here as a **floor**, not as the answer: a budget that is
+//! only ever the pinned number is a number no reading can move, so the same
+//! wall clock that retires one change at 3600 retires the next one, and the only
+//! thing that changes is how many were lost. The two facts this module measures
+//! are what close that loop:
 //!
-//! - what the effective budget is, and
-//! - how close real runs come to it, and whether any has been killed by it.
+//! - how long runs that finished on their own took, and
+//! - whether any run was killed by the budget.
 //!
-//! Without the second, the only way a run's budget shows up is as an error the
-//! caller never sees: a bounded run that exceeds its budget is retired with a
-//! reason, and the reason lives in one log line inside one pod's cycle. The
-//! aggregate is what says whether the budget is the thing standing in the way —
-//! a host that got slower turns every change into a timeout, and that looks
-//! exactly like a pipeline with nothing to do.
+//! The highest duration ever observed for a kind is a lower bound on what the
+//! work needs; the budget is that bound with headroom over it, clamped between
+//! the pinned value (a budget never shrinks below what the deployment asked
+//! for, so this loop can only ever cause fewer timeouts) and a hard multiple of
+//! it (a run cannot overshoot the budget it was killed at by an unbounded
+//! amount, so one pathological measurement must not buy an arbitrarily loose
+//! budget). A kill is evidence too: the run exceeded the budget it was held to,
+//! so that budget becomes the observed lower bound and the next run gets the
+//! headroom.
+//!
+//! Which side set the number is published with it. A pinned 3600 and a derived
+//! 3600 are the same digit and completely different facts, and the reader who
+//! has to decide whether to raise the pin needs to know which one it is looking
+//! at.
 //!
 //! The elapsed reading is not decoration on the counter. A budget that is about
 //! to bind is visible in the elapsed time of the runs that still pass, and the
@@ -63,6 +74,43 @@ pub const KIND_BUILD: &str = "build";
 /// value is `u64::MAX` because no run can have taken it.
 const NO_RUN: u64 = u64::MAX;
 
+/// Which side set the budget a run was held to. Published with the budget so a
+/// pinned number and a measured one never read the same.
+pub const BUDGET_SOURCE_LABEL: &str = "source";
+
+/// The budget is the number the deployment pinned; no run has needed more.
+pub const SOURCE_CONFIGURED: &str = "configured";
+
+/// A run needed more than the pin and the budget is that measurement with
+/// headroom over it.
+pub const SOURCE_DERIVED: &str = "derived";
+
+/// The measurement asked for more than the hard multiple of the pin, and the
+/// budget stopped there. A run killed at a ceiling is the case where the loop
+/// has run out of room and a human has to look.
+pub const SOURCE_CEILING: &str = "ceiling";
+
+/// Headroom over the slowest run of this kind that finished on its own, as the
+/// fraction `NUM / DEN` of its duration. Three halves leaves a third of the
+/// budget empty at the observed maximum: enough that a run merely a little
+/// slower than the slowest one so far still finishes, small enough that a
+/// budget which keeps getting killed still escapes in a few steps rather than
+/// in one jump that makes the next failure take hours to surface.
+const BUDGET_HEADROOM_NUM: u64 = 3;
+
+/// The denominator of the headroom fraction.
+const BUDGET_HEADROOM_DEN: u64 = 2;
+
+/// The hardest the derived budget may go: this many times the pinned value.
+///
+/// A run cannot exceed the budget it was killed at, so each kill can only raise
+/// the observed lower bound by the headroom factor; without a stop the budget
+/// would climb by that factor per kill for as long as the host stayed slow. Four
+/// is the point where one bad measurement can no longer cost the pipeline hours
+/// of wall clock before the next change gets judged — past it, the honest answer
+/// is that the pin is wrong, and a name on the reading says so.
+const MAX_BUDGET_MULTIPLE: u64 = 4;
+
 /// What the two budgets are set to and what runs have done against them.
 ///
 /// One instance is shared by the verification side and the deployment side: they
@@ -70,8 +118,18 @@ const NO_RUN: u64 = u64::MAX;
 /// the pipeline is being starved of time wants both in one scrape.
 #[derive(Debug)]
 pub struct VerificationBudget {
-    test_timeout_secs: u64,
-    build_timeout_secs: u64,
+    configured_test: u64,
+    configured_build: u64,
+    /// The longest a run of this kind has been observed to take, starting at
+    /// zero for "none yet": the derivation must not start from a mark it never
+    /// measured.
+    /// Monotone, because the question is what the work *needs*, and one fast
+    /// run does not make the slow ones need less. A slow run is the only thing
+    /// that raises it, and nothing lowers it — a budget that shrinks the moment
+    /// the next run is quick would oscillate around the very durations that
+    /// keep being killed.
+    test_high_water: AtomicU64,
+    build_high_water: AtomicU64,
     test_timeouts: AtomicU64,
     build_timeouts: AtomicU64,
     last_test_secs: AtomicU64,
@@ -81,8 +139,10 @@ pub struct VerificationBudget {
 impl VerificationBudget {
     pub fn new(test_timeout_secs: u64, build_timeout_secs: u64) -> Self {
         Self {
-            test_timeout_secs,
-            build_timeout_secs,
+            configured_test: test_timeout_secs,
+            configured_build: build_timeout_secs,
+            test_high_water: AtomicU64::new(0),
+            build_high_water: AtomicU64::new(0),
             test_timeouts: AtomicU64::new(0),
             build_timeouts: AtomicU64::new(0),
             last_test_secs: AtomicU64::new(NO_RUN),
@@ -90,13 +150,65 @@ impl VerificationBudget {
         }
     }
 
+    /// The number the deployment pinned, the floor of the derivation.
+    pub fn configured_secs(&self, kind: &str) -> u64 {
+        match kind {
+            KIND_BUILD => self.configured_build,
+            _ => self.configured_test,
+        }
+    }
+
     /// The budget that kind is allowed, for the caller that is about to enforce
     /// it. Reading it from here rather than from the knob keeps one source for
-    /// "what the run was actually held to".
+    /// "what the run was actually held to", and reading it at the moment of the
+    /// run rather than when the pipeline was built is what lets a measurement
+    /// from an earlier run apply to this one.
+    ///
+    /// A pin of zero stays zero. Zero is not a budget the work can run inside —
+    /// it would kill every run on the first poll — so it can only mean the
+    /// deployment has not set one, and inventing a budget out of a measurement
+    /// in that state would start enforcing a bound nobody asked for.
     pub fn timeout_secs(&self, kind: &str) -> u64 {
-        match kind {
-            KIND_BUILD => self.build_timeout_secs,
-            _ => self.test_timeout_secs,
+        let configured = self.configured_secs(kind);
+        if configured == 0 {
+            return 0;
+        }
+        let observed = self.high_water(kind);
+        if observed == 0 {
+            return configured;
+        }
+        let derived = observed
+            .saturating_mul(BUDGET_HEADROOM_NUM)
+            .saturating_add(BUDGET_HEADROOM_DEN - 1)
+            / BUDGET_HEADROOM_DEN;
+        derived
+            .max(configured)
+            .min(configured.saturating_mul(MAX_BUDGET_MULTIPLE))
+    }
+
+    /// Which side set the number [`Self::timeout_secs`] returns.
+    pub fn budget_source(&self, kind: &str) -> &'static str {
+        let configured = self.configured_secs(kind);
+        let effective = self.timeout_secs(kind);
+        if configured == 0 || effective <= configured {
+            return SOURCE_CONFIGURED;
+        }
+        if effective >= configured.saturating_mul(MAX_BUDGET_MULTIPLE) {
+            return SOURCE_CEILING;
+        }
+        SOURCE_DERIVED
+    }
+
+    /// The longest run of this kind seen so far, or `None` before the first.
+    ///
+    /// A run that measured zero and a run that never happened both read as
+    /// `None`: neither can move a budget in any direction, since the derivation
+    /// floors at the pinned value either way. The elapsed reading on the metric
+    /// is where a real zero is still visible as a zero.
+    pub fn high_water_secs(&self, kind: &str) -> Option<u64> {
+        match self.high_water(kind) {
+            0 => None,
+            secs => Some(secs),
         }
     }
 
@@ -104,6 +216,7 @@ impl VerificationBudget {
     /// `elapsed_secs`.
     pub fn record_run(&self, kind: &str, elapsed_secs: u64) {
         self.last_slot(kind).store(elapsed_secs, Ordering::Relaxed);
+        raise(self.high_water_slot(kind), elapsed_secs);
     }
 
     /// Record a run the budget killed.
@@ -113,8 +226,14 @@ impl VerificationBudget {
     /// of the work — publishing it as "how long the last run took" would say
     /// the work finishes exactly at the limit, and a reader checking whether the
     /// budget has headroom would take that as headroom of zero every time.
+    ///
+    /// The high-water mark is a different question and does take the kill: the
+    /// run needed at least the budget it was killed at, so that budget is the
+    /// lower bound the next one derives from. The elapsed reading stays absent
+    /// because the run has no duration of its own to report.
     pub fn record_timeout(&self, kind: &str) {
         self.timeout_counter(kind).fetch_add(1, Ordering::Relaxed);
+        raise(self.high_water_slot(kind), self.timeout_secs(kind));
     }
 
     fn last_slot(&self, kind: &str) -> &AtomicU64 {
@@ -122,6 +241,22 @@ impl VerificationBudget {
             &self.last_build_secs
         } else {
             &self.last_test_secs
+        }
+    }
+
+    fn high_water_slot(&self, kind: &str) -> &AtomicU64 {
+        if kind == KIND_BUILD {
+            &self.build_high_water
+        } else {
+            &self.test_high_water
+        }
+    }
+
+    fn high_water(&self, kind: &str) -> u64 {
+        if kind == KIND_BUILD {
+            self.build_high_water.load(Ordering::Relaxed)
+        } else {
+            self.test_high_water.load(Ordering::Relaxed)
         }
     }
 
@@ -138,6 +273,15 @@ impl Default for VerificationBudget {
     fn default() -> Self {
         Self::new(0, 0)
     }
+}
+
+/// Keep the larger of the slot's value and `value`.
+///
+/// `fetch_max` rather than a load-and-store: several runs of one kind can be
+/// recording into the same slot from different tasks, and a compare-and-store
+/// written by hand loses the larger reading when the two interleave.
+fn raise(slot: &AtomicU64, value: u64) {
+    slot.fetch_max(value, Ordering::Relaxed);
 }
 
 impl VerificationBudget {
@@ -188,7 +332,8 @@ impl Observable for VerificationBudget {
         for kind in BUDGET_KINDS {
             out.push(
                 RawMetric::new(BUDGET_SECONDS_METRIC, self.timeout_secs(kind) as f64)
-                    .with_label(KIND_LABEL, *kind),
+                    .with_label(KIND_LABEL, *kind)
+                    .with_label(BUDGET_SOURCE_LABEL, self.budget_source(kind)),
             );
             out.push(
                 RawMetric::new(
@@ -231,6 +376,24 @@ mod tests {
                 m.name == metric && m.labels.get(KIND_LABEL).map(String::as_str) == Some(kind)
             })
             .map(|m| m.value)
+    }
+
+    /// The value of one label on the budget reading of one kind.
+    async fn label(
+        budget: &VerificationBudget,
+        metric: &str,
+        kind: &str,
+        name: &str,
+    ) -> Option<String> {
+        budget
+            .collect_metrics("")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| {
+                m.name == metric && m.labels.get(KIND_LABEL).map(String::as_str) == Some(kind)
+            })
+            .and_then(|m| m.labels.get(name).cloned())
     }
 
     /// Both budgets reach the scrape under their own kind, and neither is
@@ -304,6 +467,128 @@ mod tests {
         assert_eq!(
             reading(&budget, TIMEOUTS_TOTAL_METRIC, KIND_TEST).await,
             Some(0.0)
+        );
+    }
+
+    /// A run that took most of its budget moves the next budget above it. This
+    /// is the whole point of the loop: the reading existed before, the number
+    /// did not follow it, and the change that was 30% away from the wall was
+    /// followed by another change at the same wall.
+    #[tokio::test]
+    async fn a_run_that_nearly_fills_the_budget_raises_it() {
+        let budget = VerificationBudget::new(3600, 1800);
+        budget.record_run(KIND_TEST, 3000);
+        // Three halves of the observed maximum, still above the pin.
+        assert_eq!(budget.timeout_secs(KIND_TEST), 4500);
+        assert_eq!(budget.high_water_secs(KIND_TEST), Some(3000));
+        // The build kind has its own scale and its own reading: a slow test run
+        // says nothing about how long a release build needs.
+        assert_eq!(budget.timeout_secs(KIND_BUILD), 1800);
+    }
+
+    /// A run well inside the pin leaves it exactly where the deployment put it.
+    /// The loop widens a budget; it does not take a budget away.
+    #[tokio::test]
+    async fn a_run_inside_the_pin_leaves_it_alone() {
+        let budget = VerificationBudget::new(3600, 1800);
+        budget.record_run(KIND_TEST, 1200);
+        assert_eq!(budget.timeout_secs(KIND_TEST), 3600);
+        assert_eq!(budget.budget_source(KIND_TEST), SOURCE_CONFIGURED);
+    }
+
+    /// A kill is evidence: the run needed more than the budget it was held to,
+    /// so that budget becomes the lower bound and the next run gets the
+    /// headroom. Each further kill steps up again, and the last step stops at
+    /// the hard multiple of the pin instead of climbing forever.
+    #[tokio::test]
+    async fn each_kill_steps_the_budget_up_to_the_cap() {
+        let budget = VerificationBudget::new(3600, 1800);
+
+        budget.record_timeout(KIND_TEST);
+        assert_eq!(budget.timeout_secs(KIND_TEST), 5400);
+        assert_eq!(budget.budget_source(KIND_TEST), SOURCE_DERIVED);
+
+        budget.record_timeout(KIND_TEST);
+        assert_eq!(budget.timeout_secs(KIND_TEST), 8100);
+
+        budget.record_timeout(KIND_TEST);
+        assert_eq!(budget.timeout_secs(KIND_TEST), 12150);
+
+        budget.record_timeout(KIND_TEST);
+        assert_eq!(budget.timeout_secs(KIND_TEST), 14400);
+        assert_eq!(
+            budget.budget_source(KIND_TEST),
+            SOURCE_CEILING,
+            "a budget held at the hard multiple has to say so: at that point the \
+             pin is wrong and the reading is the only thing that can say it"
+        );
+        // The build kind is untouched by any of it.
+        assert_eq!(budget.timeout_secs(KIND_BUILD), 1800);
+        assert_eq!(budget.timeouts(KIND_TEST), 4);
+    }
+
+    /// A fast run after a slow one does not take back what the slow one proved.
+    /// Otherwise the budget would oscillate around the durations that keep
+    /// getting killed, spending most of its time on the wrong side of them.
+    #[tokio::test]
+    async fn a_fast_run_after_a_slow_one_does_not_lower_the_budget() {
+        let budget = VerificationBudget::new(3600, 1800);
+        budget.record_run(KIND_TEST, 3000);
+        budget.record_run(KIND_TEST, 100);
+        assert_eq!(budget.timeout_secs(KIND_TEST), 4500);
+        assert_eq!(budget.high_water_secs(KIND_TEST), Some(3000));
+        assert_eq!(budget.last_run_secs(KIND_TEST), Some(100));
+    }
+
+    /// A deployment that pinned no budget keeps none. Zero is not a budget the
+    /// work fits inside, it is the absence of one, and a measurement must not
+    /// quietly start enforcing a bound nobody asked for.
+    #[tokio::test]
+    async fn an_unset_pin_stays_unset() {
+        let budget = VerificationBudget::new(0, 0);
+        budget.record_run(KIND_TEST, 9000);
+        assert_eq!(budget.timeout_secs(KIND_TEST), 0);
+        assert_eq!(budget.budget_source(KIND_TEST), SOURCE_CONFIGURED);
+    }
+
+    /// The budget reading carries which side set it. A pinned 3600 and a
+    /// derived 3600 are the same digit and different facts, and the reader that
+    /// has to decide whether to raise the pin is the one that needs the
+    /// difference.
+    #[tokio::test]
+    async fn the_budget_reading_says_which_side_set_it() {
+        let budget = VerificationBudget::new(3600, 1800);
+        assert_eq!(
+            label(
+                &budget,
+                BUDGET_SECONDS_METRIC,
+                KIND_TEST,
+                BUDGET_SOURCE_LABEL
+            )
+            .await,
+            Some(SOURCE_CONFIGURED.to_string())
+        );
+        budget.record_run(KIND_TEST, 3000);
+        assert_eq!(
+            label(
+                &budget,
+                BUDGET_SECONDS_METRIC,
+                KIND_TEST,
+                BUDGET_SOURCE_LABEL
+            )
+            .await,
+            Some(SOURCE_DERIVED.to_string())
+        );
+        assert_eq!(
+            label(
+                &budget,
+                BUDGET_SECONDS_METRIC,
+                KIND_BUILD,
+                BUDGET_SOURCE_LABEL
+            )
+            .await,
+            Some(SOURCE_CONFIGURED.to_string()),
+            "the build kind did not move and must not claim a measurement it never saw"
         );
     }
 

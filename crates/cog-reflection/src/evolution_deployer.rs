@@ -74,6 +74,12 @@ impl EvolutionDeployer {
 
     /// Attach the observation sink and take the budget from it, for the same
     /// reason the pipeline does: one number enforced and reported, not two.
+    ///
+    /// The field this sets is the fallback for a deployer with no sink. With one
+    /// attached the budget is read at every build (see
+    /// [`Self::build_budget_secs`]): the sink's number moves as runs are
+    /// measured, and a copy taken here would keep killing at a wall the reading
+    /// no longer reports.
     pub fn with_verification_budget(
         mut self,
         budget: Arc<crate::verification_budget::VerificationBudget>,
@@ -81,6 +87,14 @@ impl EvolutionDeployer {
         self.build_timeout_secs = budget.timeout_secs(crate::verification_budget::KIND_BUILD);
         self.budget = Some(budget);
         self
+    }
+
+    /// The build budget this run is held to, as of now.
+    fn build_budget_secs(&self) -> u64 {
+        match &self.budget {
+            Some(budget) => budget.timeout_secs(crate::verification_budget::KIND_BUILD),
+            None => self.build_timeout_secs,
+        }
     }
 
     /// Attach the sink the builds report their cost to. One instance is shared
@@ -315,10 +329,9 @@ impl EvolutionDeployer {
             cmd.env("CARGO_TARGET_DIR", target);
         }
         let started = Instant::now();
+        let budget_secs = self.build_budget_secs();
         let output =
-            match tokio::time::timeout(Duration::from_secs(self.build_timeout_secs), cmd.output())
-                .await
-            {
+            match tokio::time::timeout(Duration::from_secs(budget_secs), cmd.output()).await {
                 Ok(result) => {
                     let output = match result {
                         Ok(output) => output,
@@ -351,11 +364,11 @@ impl EvolutionDeployer {
                     self.record_build(
                         change_id,
                         intent,
-                        BuildEnding::TimedOut(Duration::from_secs(self.build_timeout_secs)),
+                        BuildEnding::TimedOut(Duration::from_secs(budget_secs)),
                     );
                     return Err(SFError::IO(format!(
                         "cargo build --release exceeded the {}s deployment budget and was killed",
-                        self.build_timeout_secs
+                        budget_secs
                     )));
                 }
             };

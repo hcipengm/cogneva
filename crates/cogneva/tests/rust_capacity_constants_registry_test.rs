@@ -1,5 +1,5 @@
-//! Every capacity or cadence number written in Rust has to say where it comes
-//! from, and a new one fails this test until it does.
+//! Every number written into a Rust constant has to say where it comes from,
+//! and a new one fails this test until it does.
 //!
 //! The chart has had `deploy/helm/cogneva/tunables.yaml` for this: one row per
 //! numeric leaf, each row either naming the reading the value is derived from
@@ -15,11 +15,29 @@
 //! governed). `COGNEVA_CAPACITY_REGISTRY_WRITE=1` rewrites the file from the
 //! tree, so maintaining it is one command and never hand-editing.
 //!
-//! The names it looks for are the ones whose subject *is* a quantity: bytes,
-//! sizes, caps, intervals, timeouts, budgets. Restricting the scan this way is
-//! the difference between a registry and a lint that everyone disables: a
-//! `u64` holding a protocol version or a bit width is not a number about this
-//! machine.
+//! **It enumerates every written number, not only the ones whose name reads
+//! like a quantity.** The first version filtered by name -- bytes, sizes, caps,
+//! intervals -- on the argument that a `u64` holding a protocol version is not
+//! a number about this machine. The argument was about half right and cost more
+//! than it saved: the filter is a guess about a name, and the numbers it guessed
+//! wrong are exactly the ones nobody then looks at (`RENDER_ATTEMPTS`,
+//! `DEFAULT_SEARCH_RESULTS`, `CHARS_PER_ESTIMATED_TOKEN`). A number a
+//! deployment's behaviour depends on does not become harmless because its name
+//! does not contain `LIMIT`. So the population is now every `const` of a numeric
+//! type or `Duration` whose initializer starts with a digit, and the judgement
+//! that a given one is not a dial belongs in the `source` column, where it is
+//! read by a person, rather than in a name filter, where it is made by a string
+//! match.
+//!
+//! The rows that have not been judged carry `source = unreviewed`, which is debt
+//! and not an answer. Their number is capped by [`DEBT_CEILING`] and the cap
+//! only comes down: a constant added tomorrow cannot be parked there, because
+//! there is no room, so it has to arrive with a source and a note.
+//!
+//! Fixtures are not production numbers. Constants inside an inline
+//! `#[cfg(test)] mod tests` are excluded -- the first version counted them,
+//! which asked reviewers to justify test data and inflated the population by
+//! exactly the rows that were never dials.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,51 +45,13 @@ use std::path::{Path, PathBuf};
 /// Where the registry lives, relative to the workspace root.
 const REGISTRY: &str = "crates/cogneva/tests/data/rust-capacity-constants.tsv";
 
-/// The words that make a constant's subject a quantity rather than a value.
+/// How many rows may still be `unreviewed`.
 ///
-/// Matched against the constant's name: `MAX_BYTES`, `SCAN_INTERVAL_SECS`,
-/// `ASSESS_TASK_TIMEOUT`, `CACHE_HEADROOM_PERCENT`, `GC_OVERHEAD_MULTIPLE`.
-/// Anything else -- a port, a
-/// protocol version, a channel count -- is not a statement about capacity.
-const QUANTITY_WORDS: &[&str] = &[
-    "SECS",
-    "SECONDS",
-    "MS",
-    "MILLIS",
-    "INTERVAL",
-    "TIMEOUT",
-    "TTL",
-    "BACKOFF",
-    "BYTES",
-    "MB",
-    "MIB",
-    "GB",
-    "GIB",
-    "KIB",
-    "LIMIT",
-    "MAX",
-    "MIN",
-    "CAP",
-    "SIZE",
-    "COUNT",
-    "CONCURREN",
-    "REPLICA",
-    "WORKSPACE",
-    "THRESHOLD",
-    "RETENTION",
-    "BUDGET",
-    "QUOTA",
-    "PARALLEL",
-    "HEADROOM",
-    "DEPTH",
-    "AGE",
-    "WINDOW",
-    "WEIGHT",
-    "RATIO",
-    "MULTIPLE",
-    "FRACTION",
-    "PERCENT",
-];
+/// The ceiling is the gate's teeth: with a finitely large debt, adding a
+/// constant without deciding what it is would go unnoticed, because the file
+/// would simply grow. Pinning the count means the next one arrives with an
+/// answer, and paying a debt is the only thing that makes room.
+const DEBT_CEILING: usize = 168;
 
 /// One line of the registry.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -93,28 +73,39 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Every `const NAME: integer-or-float = <literal>;` whose name says it is a
-/// quantity.
+/// Every `const NAME: <numeric type> = <initializer starting with a digit>;`.
 ///
-/// Deliberately syntactic: an initializer that is an expression is already a
-/// computed value, and that is the shape this registry wants more of, so it is
-/// not an entry. Only a bare numeric literal is a written number.
+/// Deliberately syntactic. A number computed from other constants at compile
+/// time (`const SIXTY: u64 = SECS * 60;`) is not a written number and is not an
+/// entry; `const LIMIT: u64 = 4096 * 1024;` is, because the 4096 is typed in and
+/// no measurement will move it. The initializer's first character is the whole
+/// test -- parsing expressions would mean half-reading them, and a half-read
+/// expression in a registry reads as a decision.
 fn scan(root: &Path) -> Vec<Row> {
     let mut rows = Vec::new();
-    let crates = root.join("crates");
-    for entry in walk_rs(&crates) {
+    for entry in walk_rs(&root.join("crates")) {
         let rel = entry
             .strip_prefix(root)
             .unwrap_or(&entry)
             .to_string_lossy()
             .to_string();
-        if rel.contains("/tests/") {
+        // A crate's own `tests/`, `benches/` and `examples/` are not shipped
+        // bounds: a fixture's numbers are the fixture's business.
+        if !rel.contains("/src/") {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&entry) else {
             continue;
         };
-        for line in text.lines() {
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let next = lines[i + 1..]
+                .iter()
+                .find(|l| !l.trim().is_empty())
+                .copied();
+            if opens_inline_test_module(line, next) {
+                break;
+            }
             let Some(row) = parse_const(line, &rel) else {
                 continue;
             };
@@ -124,6 +115,33 @@ fn scan(root: &Path) -> Vec<Row> {
     rows.sort();
     rows.dedup();
     rows
+}
+
+/// Whether this line opens an inline module whose contents are fixtures.
+///
+/// Inline test modules carry a body (`mod tests {`); a one-line `mod tests;` is
+/// a declaration whose body lives in another file, and treating that as the end
+/// of production code would silently hide every constant after it -- which is
+/// how the first version of this scan lost one.
+fn opens_inline_test_module(line: &str, next: Option<&str>) -> bool {
+    if has_inline_module_body(line) {
+        return true;
+    }
+    line.trim() == "#[cfg(test)]" && next.is_some_and(has_inline_module_body)
+}
+
+fn has_inline_module_body(line: &str) -> bool {
+    let trimmed = line.trim();
+    let after_vis = trimmed
+        .strip_prefix("pub(")
+        .and_then(|rest| rest.find(')').map(|i| rest[i + 1..].trim_start()))
+        .or_else(|| trimmed.strip_prefix("pub ").map(str::trim_start))
+        .unwrap_or(trimmed);
+    ["mod tests", "mod test_support"].iter().any(|module| {
+        after_vis
+            .strip_prefix(module)
+            .is_some_and(|rest| rest.trim_start().starts_with('{'))
+    })
 }
 
 fn walk_rs(dir: &Path) -> Vec<PathBuf> {
@@ -144,25 +162,39 @@ fn walk_rs(dir: &Path) -> Vec<PathBuf> {
 
 fn parse_const(line: &str, file: &str) -> Option<Row> {
     let line = line.trim_start();
-    let line = line
-        .strip_prefix("pub(crate) ")
-        .or_else(|| line.strip_prefix("pub "))
-        .unwrap_or(line);
+    let line = match line.strip_prefix("pub(") {
+        Some(rest) => rest[rest.find(')')? + 1..].trim_start(),
+        None => line
+            .strip_prefix("pub ")
+            .map(str::trim_start)
+            .unwrap_or(line),
+    };
     let line = line.strip_prefix("const ")?;
     let (name, rest) = line.split_once(':')?;
     let name = name.trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        return None;
+    }
     let rest = rest.trim_start();
     let ty = rest.split('=').next()?.trim();
-    let value = rest.split_once('=')?.1.trim().trim_end_matches(';').trim();
+    // One line, one constant: the initializer has to close on the same line.
+    let value = rest.split_once('=')?.1.trim();
+    let value = value.strip_suffix(';')?.trim();
     let value = match ty {
-        "u64" | "u32" | "u16" | "usize" | "i64" | "i32" | "f64" | "f32" => {
-            // Only a literal. Anything with an operator, a call or a cast is a
-            // number computed at compile time from other values, which is the
-            // shape this registry is trying to move towards rather than police.
-            if !value
-                .chars()
-                .all(|c| c.is_ascii_digit() || c == '_' || c == '.')
-            {
+        // Any initializer that starts with a number is a written number,
+        // arithmetic included: `4096 * 1024` is two typed digits and no
+        // measurement, and calling it "computed" is what let the class hide.
+        "u64" | "u32" | "u16" | "u8" | "usize" | "u128" | "i64" | "i32" | "i16" | "i8" | "i128"
+        | "f64" | "f32" => {
+            let mut chars = value.chars();
+            let first = chars.next()?;
+            let numeric = first.is_ascii_digit()
+                || ((first == '-' || first == '+') && chars.next()?.is_ascii_digit());
+            if !numeric {
                 return None;
             }
             value.to_string()
@@ -170,39 +202,25 @@ fn parse_const(line: &str, file: &str) -> Option<Row> {
         // A cadence written as `Duration::from_secs(120)` is the same kind of
         // number as `120` in a `u64`, and reading only the integers left the
         // most common spelling of a period outside the registry altogether.
-        "Duration" => {
-            let unit = ["secs", "millis", "hours", "mins"].iter().find_map(|u| {
-                let inner = value
-                    .strip_prefix(&format!("Duration::from_{u}("))?
-                    .strip_suffix(')')?
-                    .trim();
-                let literal = inner
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || c == '_')
-                    .then(|| inner.to_string())?;
-                let suffix = match *u {
-                    "secs" => "s",
-                    "millis" => "ms",
-                    "hours" => "h",
-                    _ => "m",
-                };
-                Some(format!("{literal}{suffix}"))
-            })?;
-            unit
-        }
+        "Duration" => ["secs", "millis", "hours", "mins"].iter().find_map(|u| {
+            let inner = value
+                .strip_prefix(&format!("Duration::from_{u}("))?
+                .strip_suffix(')')?
+                .trim();
+            let literal = inner
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '_')
+                .then(|| inner.to_string())?;
+            let suffix = match *u {
+                "secs" => "s",
+                "millis" => "ms",
+                "hours" => "h",
+                _ => "m",
+            };
+            Some(format!("{literal}{suffix}"))
+        })?,
         _ => return None,
     };
-    if value
-        .trim_matches(|c| c == '_' || c == '.' || c == '0')
-        .is_empty()
-    {
-        // Zero is the "unset" sentinel far more often than it is a capacity,
-        // and a registry that lists every zero buries the ones that matter.
-        return None;
-    }
-    if !QUANTITY_WORDS.iter().any(|w| name.contains(w)) {
-        return None;
-    }
     Some(Row {
         file: file.to_string(),
         name: name.to_string(),
@@ -240,10 +258,13 @@ fn write_registry(root: &Path, scanned: &[Row], existing: &[Row]) {
         .map(|r| ((r.file.as_str(), r.name.as_str()), r))
         .collect();
     let mut out = String::from(
-        "# Capacity and cadence numbers written in Rust. `source` is either the reading the\n\
-         # value is derived from or the reason it is a bound; `unreviewed` is debt, not an\n\
-         # answer. Regenerate with COGNEVA_CAPACITY_REGISTRY_WRITE=1 cargo test -p cogneva\n\
-         # --test rust_capacity_constants_registry_test\n\
+        "# Every number written into a Rust constant: one row per `const`, so a number that\n\
+         # arrives without a decision about it is red rather than invisible. `source` is\n\
+         # either the reading the value is derived from (`derived`) or the reason it is a\n\
+         # bound (`bound`); `unreviewed` is debt, not an answer, and its row count is capped\n\
+         # in the test that reads this file. Regenerate with\n\
+         # COGNEVA_CAPACITY_REGISTRY_WRITE=1 cargo test -p cogneva --test\n\
+         # rust_capacity_constants_registry_test\n\
          file\tname\tvalue\tsource\tnote\n",
     );
     for row in scanned {
@@ -321,5 +342,62 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
          rust_capacity_constants_registry_test",
         missing.join("\n"),
         stale.join("\n")
+    );
+
+    // The ceiling is what makes a row an answer rather than a place to park a
+    // number: regeneration writes new rows as `unreviewed`, so without a cap the
+    // file would absorb any new constant and every later reader would see a
+    // green gate. With the cap the regeneration step succeeds and the next run
+    // says how many decisions are owed.
+    let unreviewed: Vec<&Row> = existing
+        .iter()
+        .filter(|r| r.source == "unreviewed")
+        .collect();
+    assert!(
+        unreviewed.len() <= DEBT_CEILING,
+        "{} constants are registered as `unreviewed` and the ceiling is {DEBT_CEILING}. \
+         The debt only comes down: give the new ones a `derived` source naming the reading \
+         they follow, or a `bound` source saying why no measurement should move them.\n{}",
+        unreviewed.len(),
+        unreviewed
+            .iter()
+            .map(|r| format!("{}:{} = {}", r.file, r.name, r.value))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// The scan's two easy failures both read as green, so both are pinned: a scan
+/// that matches nothing makes every later comparison vacuous, and a scan that
+/// ignores the `#[cfg(test)]` rule turns fixture data into debt somebody has to
+/// pay.
+#[test]
+fn the_scan_sees_production_constants_and_not_fixtures() {
+    let root = workspace_root();
+    let scanned = scan(&root);
+    assert!(
+        scanned.len() > 100,
+        "the scan found {} constants, far below what crates/*/src holds: the walk is \
+         broken, not the tree",
+        scanned.len()
+    );
+    let has = |file: &str, name: &str| scanned.iter().any(|r| r.file == file && r.name == name);
+    assert!(
+        has(
+            "crates/cog-reflection/src/build_gate/mod.rs",
+            "BUILD_DEMAND_CORES"
+        ),
+        "a production constant the whole build gate is built on was not found"
+    );
+    assert!(
+        !has("crates/cog-core/src/admission.rs", "GB"),
+        "a constant inside an inline test module was counted as a production dial"
+    );
+    // A one-line `mod tests;` declares a module whose body is another file; it
+    // is not the end of this file's production code. Treating it as one hid
+    // every constant after it in a file that has one near the top.
+    assert!(
+        has("crates/cog-reflection/src/lib.rs", "CHANGE_EVIDENCE_BUDGET"),
+        "a constant declared after a one-line `mod test_support;` was skipped"
     );
 }

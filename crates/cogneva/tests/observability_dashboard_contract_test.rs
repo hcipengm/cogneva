@@ -157,7 +157,7 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     ),
     (
         "cogneva_verification_budget_seconds",
-        &["kind"],
+        &["kind", "source"],
         "crates/cog-reflection/src/verification_budget.rs",
     ),
     (
