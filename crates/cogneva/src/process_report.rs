@@ -40,16 +40,42 @@ struct ReportBody {
     processes: Vec<ReportedProcess>,
 }
 
+/// 这条循环在 `loop_health` 里的名字。
+pub const LOOP_NAME: &str = "process-report";
+
 /// 从本容器启动一条自报循环。返回它一眼，不挡调用方。
+///
+/// 走 `loop_health::spawn_unstoppable` 而不是裸 spawn：这条循环死掉时，屏上那一格
+/// 会停在上一份自报上，而「没有新读数」与「容器里一直就这些进程」从外面看一模一样。
+/// 注册之后它每拍盖一次章，停了就是一条断掉的活体序列，panic 也会被重新拉起。
 pub fn spawn() {
-    tokio::spawn(async move {
-        let Ok(pod) = std::env::var("HOSTNAME") else {
-            // 没有主机名就不是在 Pod 里（本地跑、测试里跑）。这一格不存在，也就
-            // 没有可报的东西——安静地不报，比报一个「pod 名未知」的假格子好。
-            return;
-        };
+    cog_core::loop_health::spawn_unstoppable(
+        LOOP_NAME,
+        cog_core::loop_health::Cadence::Periodic(REPORT_INTERVAL),
+        |beat| async move {
+            let Some(reporter) = Reporter::from_env() else {
+                // 没有主机名 / 没有 `/proc` / 客户端造不出来：这一格在本进程里
+                // 不存在，没有可报的东西。安静地不报，比报一个「pod 名未知」的
+                // 假格子好。循环本身还在，只是每拍什么都不做。
+                return;
+            };
+            reporter.run(beat).await;
+        },
+    );
+}
+
+/// 一次自报需要的三样东西：报给谁、以什么身份、用什么发。
+struct Reporter {
+    pod: String,
+    url: String,
+    client: reqwest::Client,
+}
+
+impl Reporter {
+    fn from_env() -> Option<Self> {
+        let pod = std::env::var("HOSTNAME").ok()?;
         if !std::path::Path::new("/proc/self/cgroup").exists() {
-            return;
+            return None;
         }
         let url = std::env::var(REPORT_URL_ENV)
             .ok()
@@ -64,30 +90,38 @@ pub fn spawn() {
             proxy_url: None,
             ..Default::default()
         };
-        let Ok(client) = cog_net::build_client(&config) else {
-            return;
-        };
+        let client = cog_net::build_client(&config).ok()?;
+        Some(Self { pod, url, client })
+    }
+
+    async fn run(self, beat: cog_core::loop_health::Beat) {
         let mut ticker = tokio::time::interval(REPORT_INTERVAL);
         loop {
             ticker.tick().await;
-            // 容器 id 每一拍重读：Pod 重启之后是新的实例，报在旧 id 下面的读数
-            // 不属于这一份进程表。
-            let Some(container_id) = own_container_id() else {
-                continue;
-            };
-            let processes = scan_proc();
-            if processes.is_empty() {
-                continue;
-            }
-            let body = ReportBody {
-                pod: pod.clone(),
-                container_id,
-                processes,
-            };
-            // 报不上去不是这个进程的事：下一拍再说。
-            let _ = client.post(&url).json(&body).send().await;
+            // 每一拍盖章：报不上去也是这一拍发生了，断章要说的是「循环停了」。
+            beat.beat();
+            self.report_once().await;
         }
-    });
+    }
+
+    async fn report_once(&self) {
+        // 容器 id 每一拍重读：Pod 重启之后是新的实例，报在旧 id 下面的读数
+        // 不属于这一份进程表。
+        let Some(container_id) = own_container_id() else {
+            return;
+        };
+        let processes = scan_proc();
+        if processes.is_empty() {
+            return;
+        }
+        let body = ReportBody {
+            pod: self.pod.clone(),
+            container_id,
+            processes,
+        };
+        // 报不上去不是这个进程的事：下一拍再说。
+        let _ = self.client.post(&self.url).json(&body).send().await;
+    }
 }
 
 /// 本容器的实例 id：cgroup 路径末段里那串容器 id。

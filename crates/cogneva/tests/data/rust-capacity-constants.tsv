@@ -207,12 +207,12 @@ crates/cog-gateway/src/ide.rs	BINARY_PROBE_BYTES	8192	bound	prefix examined befo
 crates/cog-gateway/src/ide.rs	DEFAULT_WORKSPACE_MAX_BYTES	1024 * 1024 * 1024	bound	一个工作区默认能占多少字节：一份源码加它自己的构建产物的量级， 不是一个按租户量出来的容量，所以它是个部署可改的默认值。
 crates/cog-gateway/src/ide.rs	MAX_FILE_BYTES	2 * 1024 * 1024	bound	单个文件的上限。编辑器不是上传通道：超过这个量的东西该走附件那条路。
 crates/cog-gateway/src/ide.rs	MAX_TREE_ENTRIES	2000	bound	one directory listing; a tree of millions of files must not fill a response
+crates/cog-gateway/src/ide.rs	READ_CHUNK_BYTES	64 * 1024	bound	流式读 `git show` 管道时一次拿多少字节：块越大系统调用越少，但要小到一次读不把这一页用不上的部分也搬进内存；64 KiB 落在这一对之间，且与文件大小无关，所以不随 MAX_FILE_BYTES 变
 crates/cog-gateway/src/ide.rs	SEARCH_DEFAULT_LIMIT	100	bound	matches returned when the caller names no limit
 crates/cog-gateway/src/ide.rs	SEARCH_MAX_BYTES	64 * 1024 * 1024	bound	一次搜索最多读多少字节：与上面的文件数同一个界的字节侧，定在扫一份仓库的文本 仍能在一次请求里答完的位置。
 crates/cog-gateway/src/ide.rs	SEARCH_MAX_FILES	5_000	bound	search answers synchronously, so it walks a bounded number of files before it stops looking
 crates/cog-gateway/src/ide.rs	SEARCH_MAX_LIMIT	500	bound	widest page of matches a caller may ask for
 crates/cog-gateway/src/ide.rs	TRANSFER_MAX_BYTES	8 * 1024 * 1024	bound	上传 / 下载的上限。比编辑器那条宽——整份构建产物、一张截图也该能搬进搬出， 但必须落在路由层请求体的封顶之下并留出余量：超过那条线的大请求在到达这里 之前就被拒，本层再给一个更大的数只会让两边说法不一致。
-crates/cog-gateway/src/ide.rs	READ_CHUNK_BYTES	64 * 1024	bound	流式读 `git show` 管道时一次拿多少字节：块越大系统调用越少，但要小到一次读不把这一页用不上的部分也搬进内存；64 KiB 落在这一对之间，且与文件大小无关，所以不随 MAX_FILE_BYTES 变
 crates/cog-gateway/src/knowledge.rs	MAX_TOP_K	100	bound	widest answer assembled over HTTP rather than an internal candidate window; the same ceiling the wiki search applies
 crates/cog-gateway/src/lib.rs	MAX_REQUEST_BODY_BYTES	10 * 1024 * 1024	bound	零凭证的集群内面：只挂 Pod 侧要走的 memory 路由，不挂认证/会话/配额。
 crates/cog-gateway/src/llm_admin.rs	PROBE_TIMEOUT	30s	bound	上游能力探测单次最多等多久。
@@ -221,6 +221,9 @@ crates/cog-gateway/src/memory.rs	DEFAULT_RAW_LIST_LIMIT	100	bound	a listing cost
 crates/cog-gateway/src/memory.rs	EXPIRY_SECS	300	bound	lifetime of the signed URL for stored bytes: long enough for the request that asked, short enough that a working link does not circulate
 crates/cog-gateway/src/observability.rs	FIRING_PROBE_LIMIT	1	bound	the cluster verdict only asks whether anything fires, so one row settles it however much is firing
 crates/cog-gateway/src/observability.rs	MAX_USAGE_HOURS	24 * 7	bound	Cap on the trailing window one request may ask for.
+crates/cog-gateway/src/process_reports.rs	FRESH_FOR	120s	derived	two report intervals: a container that stopped stops reporting, and its last table must not keep reading as the current one
+crates/cog-gateway/src/process_reports.rs	MAX_COMMAND_CHARS	64	bound	process names are short; the long string is the command line, which this face does not read
+crates/cog-gateway/src/process_reports.rs	MAX_REPORTS	64	bound	a report is a shape, not a stream: beyond this the list is not something a reader reads, and the receiver caps so a caller cannot grow the store by reporting
 crates/cog-gateway/src/project_control.rs	CADENCE	600s	bound	一轮之间隔多久。
 crates/cog-gateway/src/readings.rs	QUERY_TIMEOUT_SECS	5	bound	a reading that cannot answer in five seconds is already the answer; a failed query reads as no reading and never as zero
 crates/cog-gateway/src/scm.rs	GIT_TIMEOUT	20s	bound	one git action on a small local repository; slower than a poll cycle means it is wedged
@@ -523,6 +526,8 @@ crates/cogneva/src/eval_toolathlon_local.rs	PAGE_SIZE	10_000	bound	one page of s
 crates/cogneva/src/eval_toolathlon_local.rs	PYTHON_TIMEOUT_CEILING	120	bound	the upstream python tool's own hard ceiling on a requested timeout
 crates/cogneva/src/health_check.rs	PROBE_TIMEOUT	3s	bound	read/write timeout on a loopback readiness probe; waiting longer only delays the verdict
 crates/cogneva/src/health_check.rs	STATUS_LINE_LIMIT	512	bound	a status line longer than this is not a status line; stop reading
+crates/cogneva/src/process_report.rs	MAX_PROCESSES	64	bound	the same bound the gateway's MAX_REPORTS enforces, so the reporter never sends what the receiver truncates
+crates/cogneva/src/process_report.rs	REPORT_INTERVAL	60s	bound	a cadence, not a measurement: short enough that a stopped process is gone from the next table, long enough that an idle container does not republish the same table every second
 crates/cogneva/src/scraper_endpoint.rs	DEFAULT_PORT	9100	bound	Port served when the deployment names none.
 crates/cogneva/src/startup_guard.rs	MESSAGE_CHARS	1500	bound	well under the termination message cap, and the cut is stated when it happens
 crates/cogneva/src/write_role.rs	EXIT_ARBITER_SILENT	3	bound	The arbiter could not be read. Not a verdict about the role: an unreachable arbiter and a role someone else holds are different facts.
