@@ -8,6 +8,8 @@ import {
   type TaskRow,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { outcomesSinceSnapshot, type LiveCommsRow } from '@/store/liveComms';
+import { useLiveCommsStore } from '@/store/liveCommsStore';
 import { openExplain } from '@/ui/explain';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
@@ -226,6 +228,51 @@ function TaskLinks({ taskId, onClose }: { taskId: string; onClose: () => void })
 }
 
 /**
+ * 总线刚说有了结局、而交接图还没画出来的那几个任务。
+ *
+ * 这一块不是边的一份更快拷贝：帧能说「这个任务完成了，图要给它的每个下游各加一条
+ * 交接边」，却说不出它当时有几个下游；失败时也分不清是重试边还是死信边——那位
+ * `retried` 标志在线上被抹掉了。所以这里只写自己知道的：谁、什么结局、会带出哪一类
+ * 边，并且明写「表里还没有」，免得读者去数一个帧报不出的条数。
+ */
+function FreshOutcomes({ rows }: { rows: LiveCommsRow[] }) {
+  return (
+    <section className="border-b border-[var(--line)] bg-[color-mix(in_srgb,var(--brass)_8%,transparent)]">
+      <div className="px-4 py-2 text-[11px] text-[var(--paper-dim)]">
+        总线刚说 {rows.length} 个任务有了结局（比这张图更晚，图还没画）：
+      </div>
+      <ul className="px-4 pb-2">
+        {rows.map((row) => (
+          <li key={row.key} className="flex flex-wrap items-baseline gap-2 py-0.5 text-[11px]">
+            <span className="mono text-[var(--paper)]">{row.taskId}</span>
+            <span
+              className={row.status === 'failed' ? 'text-[var(--danger)]' : 'text-[var(--ok)]'}
+            >
+              {row.status === 'failed' ? '失败' : '完成'}
+            </span>
+            <span className="text-[var(--muted)]">
+              {row.edge === 'handoff'
+                ? '图上要给它每个下游各加一条交接边（几条这一帧没说）'
+                : '图上要给它自己加一条重试边或死信边（哪一种这一帧没说）'}
+            </span>
+            {row.agentId && <span className="mono text-[var(--muted)]">agent {row.agentId}</span>}
+            <span className="text-[var(--muted)]">
+              最近 <Moment iso={row.lastAt} />
+            </span>
+            <span
+              className="mono text-[10px] text-[var(--brass)]"
+              title={`这一格来自 task_status_change 帧（${row.frames} 帧折成一行），不是这次轮询`}
+            >
+              帧
+            </span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/**
  * 通信面：任务之间的交接是怎么发生的，以及这条链断在哪里。
  *
  * 这张图不是依赖图的副本。任务图记的是「谁该在谁之后跑」——排程靠它；这里记的是
@@ -234,6 +281,10 @@ function TaskLinks({ taskId, onClose }: { taskId: string; onClose: () => void })
  */
 export function CommsView() {
   const graph = useResource('交接图', getCollaborationGraph, 15_000);
+  const liveRows = useLiveCommsStore((s) => s.rows);
+  // 帧比这份图晚，就说明它的边不可能是这份图里的：只列那几条，重读之后它们自己
+  // 消失，所以同一条交接不会在表和这一块各出现一次。
+  const fresh = outcomesSinceSnapshot(graph.at, liveRows);
   // 任务行是「谁干的」的正本：边上有执行者就用边上的，边上没有就退回这里。
   const tasks = useResource('任务归属', () => listTasks({ limit: 500 }), 60_000);
   const owners = new Map((tasks.data ?? []).map((task) => [task.id, task]));
@@ -249,7 +300,9 @@ export function CommsView() {
       title="通信"
       meta={
         stats
-          ? `${stats.total_links} 条边 · 按 15 秒重读`
+          ? `${stats.total_links} 条边${
+              fresh.length > 0 ? ` · ${fresh.length} 个结局刚推到、图还没画` : ''
+            } · 按 15 秒重读`
           : '任务之间的交接 · 按 15 秒重读'
       }
     >
@@ -293,6 +346,7 @@ export function CommsView() {
           行看到的是「这条任务现在归谁」，那一格标着「现」。
         </p>
       </section>
+      {fresh.length > 0 && <FreshOutcomes rows={fresh} />}
       {graph.error ? (
         <ReadError what="交接图" error={graph.error} onRetry={graph.refresh} />
       ) : !graph.data && graph.loading ? (

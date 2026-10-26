@@ -10,8 +10,12 @@ import {
 import { useChatStore } from '@/store/chatStore';
 import { agentFrame } from '@/store/liveAgents';
 import { alertFrame } from '@/store/liveAlerts';
+import { commsFrame } from '@/store/liveComms';
+import { taskStatusFrame } from '@/store/liveProjects';
 import { useLiveAgentStore } from '@/store/liveAgentStore';
 import { useLiveAlertStore } from '@/store/liveAlertStore';
+import { useLiveCommsStore } from '@/store/liveCommsStore';
+import { useLiveProjectStore } from '@/store/liveProjectStore';
 import type { AgentEvent } from '@/types/events';
 import type { NotificationItem } from '@/api/client';
 
@@ -83,6 +87,8 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
   const ingestChatFrame = useChatStore((state) => state.ingestFrame);
   const noteAgentFrame = useLiveAgentStore((state) => state.noteFrame);
   const noteAlertFrame = useLiveAlertStore((state) => state.noteFrame);
+  const noteCommsFrame = useLiveCommsStore((state) => state.noteFrame);
+  const noteProjectTaskFrame = useLiveProjectStore((state) => state.noteFrame);
   /** 每个 agent 正在流的那一条消息（agent_id → 画布上的消息 id）。 */
   const streaming = useRef(new Map<string, string>());
 
@@ -118,6 +124,25 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       const liveAlert = alertFrame(event);
       if (liveAlert) {
         noteAlertFrame(liveAlert);
+        changedState = true;
+      }
+
+      // 通信这一面：交接图每 15 秒才重读一次，而让图长出边的那些结局一直在总线上。
+      // 折进来的是「图上马上要多出边」的那几个任务（见 store/liveComms.ts），读者
+      // 据此知道这条链刚往前走了，不必等下一拍。
+      const liveComms = commsFrame(event);
+      if (liveComms) {
+        noteCommsFrame(liveComms);
+        changedState = true;
+      }
+
+      // 项目这一面：范围、看板、甘特、挣值四张屏都是每 15 秒重读一次的快照，而
+      // `task_status_change` 一直在总线上。折进来的是「这一面该重读了」的那几条
+      // （见 store/liveProjects.ts），帧只是触发器，四张屏的数仍然由服务端重算——
+      // 拿帧去改服务端的数，就是两份账写成一本。
+      const liveProjectTask = taskStatusFrame(event);
+      if (liveProjectTask) {
+        noteProjectTaskFrame(liveProjectTask);
         changedState = true;
       }
 
@@ -241,6 +266,8 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     ingestChatFrame,
     noteAgentFrame,
     noteAlertFrame,
+    noteCommsFrame,
+    noteProjectTaskFrame,
   ]);
 
   return { clientRef };

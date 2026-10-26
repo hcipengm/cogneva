@@ -744,6 +744,11 @@ jobs:
       # 并把折叠语义编译出来在 node 里跑（重放不清旧、说不清越到哪儿的不折）。
       - name: Check the alerts face moves with the frames, not only with the poll
         run: bash deploy/scripts/check-web-live-alerts.sh
+      # 交接图的长边动作全在总线上（任务完成、任务失败），图却每 15 秒才重读一次。
+      # 这一面问的正是「这条链现在走到哪了」，晚一拍就是把刚交出去的活显示成还没交。
+      # 帧说不出会加几条边，所以这一块只写「图上马上要多出边」，不画边。
+      - name: Check the comms face moves with the frames, not only with the poll
+        run: bash deploy/scripts/check-web-live-comms.sh
 
   entry-scripts:
     name: Entry Scripts Lint
