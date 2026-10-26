@@ -231,9 +231,14 @@ impl Supervisor {
         quota: Arc<dyn WorkspaceQuotaSource>,
         gateway: Arc<dyn ObservabilityGateway>,
         gate: Arc<SchedulerGate>,
-        agent_event_rx: broadcast::Receiver<AgentEvent>,
+        agent_events: broadcast::Sender<AgentEvent>,
         meta_learning: Option<Arc<dyn cog_core::MetaLearning>>,
     ) -> Self {
+        // Subscribed here rather than by the caller: the supervisor needs the
+        // sender anyway -- the lifecycle coordinator announces state
+        // transitions on this bus, and a caller that only ever hands over a
+        // receiver cannot give it one.
+        let agent_event_rx = agent_events.subscribe();
         let health = HealthChecker::new(
             registry.clone(),
             state_backend.clone(),
@@ -270,7 +275,8 @@ impl Supervisor {
         let autonomous = Arc::new(autonomous_builder);
 
         let lifecycle =
-            LifecycleCoordinator::new(registry.clone(), state_backend, event_tx.clone());
+            LifecycleCoordinator::new(registry.clone(), state_backend, event_tx.clone())
+                .with_agent_events(agent_events);
 
         let control_plane: Option<Arc<dyn ControlPlaneClient>> =
             config.control_plane_url.as_ref().map(|url| {

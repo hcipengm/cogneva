@@ -182,7 +182,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
             quota_manager,
             gateway,
             scheduler_gate.clone(),
-            event_tx.subscribe(),
+            event_tx.clone(),
             meta_learning,
         )
         .with_config_watch(supervisor_config_rx)

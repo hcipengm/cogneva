@@ -76,7 +76,7 @@ fn build_supervisor_with_config_rx(
         alert_history_max: 10_000,
     };
 
-    let (_agent_event_tx, agent_event_rx) = broadcast::channel(64);
+    let (agent_event_tx, _agent_event_rx) = broadcast::channel(64);
     let mut supervisor = Supervisor::new(
         config,
         registry,
@@ -85,7 +85,7 @@ fn build_supervisor_with_config_rx(
         quota_source,
         gateway,
         gate,
-        agent_event_rx,
+        agent_event_tx,
         None,
     );
     if let Some(rx) = config_rx {
@@ -378,7 +378,7 @@ fn build_measured_supervisor(
         heartbeat_history_max: 1_000,
         alert_history_max: 10_000,
     };
-    let (_agent_event_tx, agent_event_rx) = broadcast::channel(64);
+    let (agent_event_tx, _agent_event_rx) = broadcast::channel(64);
     Arc::new(
         Supervisor::new(
             config,
@@ -388,7 +388,7 @@ fn build_measured_supervisor(
             quota_source,
             gateway,
             gate,
-            agent_event_rx,
+            agent_event_tx,
             None,
         )
         .with_metrics(Some(metrics as Arc<dyn MetricsBackend>)),

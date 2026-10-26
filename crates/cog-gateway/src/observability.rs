@@ -624,8 +624,15 @@ pub fn agent_event_level(event: &cog_core::AgentEvent) -> &'static str {
             cog_core::ErrorSeverity::Critical | cog_core::ErrorSeverity::Fatal => "error",
         },
         AgentEvent::ResourceAlert { .. } => "warn",
-        AgentEvent::StateChange { to, .. } if to == "Dead" => "error",
-        AgentEvent::TaskStatusChange { status, .. } if status == "Failed" => "error",
+        // Both comparisons read the wire spelling: the values in these frames
+        // are the snake_case names (`AgentState` and `TaskStatus` are both
+        // `#[serde(rename_all = "snake_case")]`, and every producer writes
+        // them that way), so a PascalCase literal here matches nothing and the
+        // filter quietly stops marking the one level it exists to mark. The
+        // tests below derive both spellings from the enums instead of
+        // restating them.
+        AgentEvent::StateChange { to, .. } if to == "dead" => "error",
+        AgentEvent::TaskStatusChange { status, .. } if status == "failed" => "error",
         _ => "info",
     }
 }
@@ -968,5 +975,45 @@ mod tests {
             "the handler builds the response itself; the range it echoes would be its own request \
              window, which is not the range the rollup answered for"
         );
+    }
+
+    /// The two states this filter calls "error" are matched by the spelling the
+    /// frame carries, and that spelling comes from the enum's serde name --
+    /// not from `Debug`. Deriving the expected string here means a change to
+    /// either convention fails this test instead of leaving a comparison that
+    /// matches nothing: nothing about a literal that never matches is visible
+    /// at runtime, the filter just stops marking the level it exists for.
+    #[test]
+    fn the_error_levels_are_matched_by_the_spelling_the_frames_carry() {
+        let dead = serde_json::to_value(cog_core::AgentState::Dead)
+            .expect("plain enum")
+            .as_str()
+            .expect("unit variant")
+            .to_string();
+        let failed = serde_json::to_value(cog_core::TaskStatus::Failed)
+            .expect("plain enum")
+            .as_str()
+            .expect("unit variant")
+            .to_string();
+
+        let dead_frame = cog_core::AgentEvent::StateChange {
+            agent_id: "a-1".into(),
+            from: "active".into(),
+            to: dead,
+            crew_id: None,
+            squad_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let failed_frame = cog_core::AgentEvent::TaskStatusChange {
+            task_id: "t-1".into(),
+            status: failed,
+            agent_id: None,
+            crew_id: None,
+            squad_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        assert_eq!(agent_event_level(&dead_frame), "error");
+        assert_eq!(agent_event_level(&failed_frame), "error");
     }
 }

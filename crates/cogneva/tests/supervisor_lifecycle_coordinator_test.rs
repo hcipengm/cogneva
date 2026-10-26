@@ -55,10 +55,118 @@ async fn suspect_agent_transitioned_to_suspect() {
 
     let result = coord.handle_health_report(&report).await.unwrap();
     assert_eq!(result.transitioned.len(), 1);
+    // "From" is read before the CAS; read after and it is already the target,
+    // so every row of this log would read Suspect -> Suspect and the frame on
+    // the bus would report a transition out of a state the agent never held.
+    assert_eq!(result.transitioned[0].1, AgentState::Active);
     assert_eq!(result.transitioned[0].2, AgentState::Suspect);
 
     let state = backend.get_agent_state("a-1").await.unwrap();
     assert_eq!(state, Some(AgentState::Suspect));
+}
+
+/// The roster's state cell has no source but frames -- `AgentInfo` carries no
+/// state -- and nothing in the tree ever built a `StateChange`. So this is the
+/// one place that turns a stored transition into something a screen can move
+/// on, and the values it writes are what the gateway's level filter and the
+/// roster's label compare against.
+#[tokio::test]
+async fn a_transition_that_landed_is_announced_on_the_agent_bus() {
+    let backend = mk_backend();
+    backend
+        .set_agent_state("a-1", &AgentState::Active)
+        .await
+        .unwrap();
+    let registry = mk_registry();
+    registry.register_agent(AgentInfo {
+        agent_id: "a-1".into(),
+        role: None,
+        crew_id: Some("c-1".into()),
+        squad_id: Some("s-1".into()),
+        task_ids: vec![],
+        last_heartbeat: Utc::now(),
+        state_since: Utc::now(),
+        registered_at: Utc::now(),
+    });
+
+    let (agent_tx, mut agent_rx) = broadcast::channel(64);
+    let (supervisor_tx, _supervisor_rx) = broadcast::channel(64);
+    let coord = LifecycleCoordinator::new(registry, backend.clone(), supervisor_tx)
+        .with_agent_events(agent_tx);
+
+    let report = HealthReport {
+        dead: vec![(
+            "a-1".into(),
+            cog_core::HealthIssue::Dead {
+                last_seen: Utc::now(),
+            },
+        )],
+        ..Default::default()
+    };
+    coord.handle_health_report(&report).await.unwrap();
+
+    match agent_rx
+        .try_recv()
+        .expect("the transition was not announced")
+    {
+        cog_core::AgentEvent::StateChange {
+            agent_id,
+            from,
+            to,
+            crew_id,
+            squad_id,
+            ..
+        } => {
+            assert_eq!(agent_id, "a-1");
+            assert_eq!(from, "active");
+            assert_eq!(to, "dead");
+            assert_eq!(crew_id.as_deref(), Some("c-1"));
+            assert_eq!(squad_id.as_deref(), Some("s-1"));
+        }
+        other => panic!("expected a state change, got {other:?}"),
+    }
+}
+
+/// A refused transition is not announced: the store still holds the old state,
+/// and a frame saying otherwise would make the screen the optimistic reader.
+#[tokio::test]
+async fn a_refused_transition_is_not_announced() {
+    let backend = mk_backend();
+    backend
+        .set_agent_state("a-1", &AgentState::Dead)
+        .await
+        .unwrap();
+    let registry = mk_registry();
+    registry.register_agent(AgentInfo {
+        agent_id: "a-1".into(),
+        role: None,
+        crew_id: None,
+        squad_id: None,
+        task_ids: vec![],
+        last_heartbeat: Utc::now(),
+        state_since: Utc::now(),
+        registered_at: Utc::now(),
+    });
+
+    let (agent_tx, mut agent_rx) = broadcast::channel(64);
+    let (supervisor_tx, _supervisor_rx) = broadcast::channel(64);
+    let coord = LifecycleCoordinator::new(registry, backend.clone(), supervisor_tx)
+        .with_agent_events(agent_tx);
+
+    let report = HealthReport {
+        suspect: vec![(
+            "a-1".into(),
+            cog_core::HealthIssue::Suspect { missed_beats: 2 },
+        )],
+        ..Default::default()
+    };
+    let result = coord.handle_health_report(&report).await.unwrap();
+
+    assert_eq!(result.transitioned.len(), 0);
+    assert!(
+        agent_rx.try_recv().is_err(),
+        "a refused transition was announced"
+    );
 }
 
 #[tokio::test]
