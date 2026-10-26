@@ -2540,6 +2540,92 @@ fn the_capacity_subject_gate_catches_a_summed_fleet_and_allows_a_single_containe
     );
 }
 
+/// 拿申请量与节点可分配量相比的规则，只能数还占着位的 Pod。
+///
+/// `kube_pod_container_resource_requests` 对 API 里还在的**每个** Pod 都出样本，
+/// 已经结束的也在：Pod 结束时 `nodeName` 与申请量都留在对象上，kube-state-metrics
+/// 照读不误。于是「节点上被申请了多少」这句话，如果不按 Pod 的 phase 过滤，数的
+/// 是「曾经来过多少」，而这一族容器每次发布留下的 Job Pod 都在往里加分。
+///
+/// 实测 2026-10-27：36 个结束的 `cogneva-mainline-*` Pod 占着 11.2 核里的 6.9 核，
+/// 比值读到 0.470；只数还占着位的，是 0.181。三十天里不带这条腿的读数在 0.286 到
+/// 0.470 之间随死 Pod 的多少摆动，带这条腿的从 0.146 走到 0.181——一条随发布次数
+/// 上涨的读数，响的时候说的是部署器的历史，不是节点。
+///
+/// 门只拦「与可分配量相比」的那一类：单纯成篇记账（没有分母）不做这个联接也说得通，
+/// 而这个库与这些清单里今天只有前一类（反例普查：全库只有这条规则读这个指标）。
+fn unphased_request_ratio_complaints(rules: &[(String, String)]) -> Vec<String> {
+    const REQUESTS: &str = "kube_pod_container_resource_requests";
+    const CAPACITY: &str = "kube_node_status_allocatable";
+    let mut complaints = Vec::new();
+    for (rule, promql) in rules {
+        if !promql.contains(REQUESTS) || !promql.contains(CAPACITY) {
+            continue;
+        }
+        let live_phase = promql.contains("kube_pod_status_phase")
+            && (promql.contains(r#"phase=~"Pending|Running""#)
+                || promql.contains(r#"phase="Running""#));
+        if !live_phase {
+            complaints.push(format!(
+                "{rule}: 把申请量除以节点可分配量，却没按 Pod 的 phase 过滤，于是数的是\
+                 「曾经来过多少」而不是「现在占着多少」——结束的 Pod 仍带着 nodeName 与\
+                 申请量，发布留下的 Job Pod 会一直加分\n    {promql}"
+            ));
+        }
+    }
+    complaints
+}
+
+#[test]
+fn a_request_ratio_counts_only_the_pods_that_still_hold_their_request() {
+    let complaints = unphased_request_ratio_complaints(&shipped_rules());
+    assert!(
+        complaints.is_empty(),
+        "这些规则把申请量除以节点可分配量，却把已经结束的 Pod 也算进去了：\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// 上面那条门抓的是它想抓的形状，且放行另一种。
+#[test]
+fn the_request_ratio_gate_catches_the_unfiltered_sum_and_allows_the_phase_join() {
+    let with_phase = |phase: &str| {
+        (
+            "requests_under_test".to_string(),
+            format!(
+                r#"max by (node, resource) (sum by (node, resource) (kube_pod_container_resource_requests and on (namespace, pod) kube_pod_status_phase{{{phase}}} == 1) / on(node, resource) kube_node_status_allocatable)"#
+            ),
+        )
+    };
+    let unfiltered = (
+        "requests_under_test".to_string(),
+        "max by (node, resource) (sum by (node, resource) (kube_pod_container_resource_requests) / on(node, resource) kube_node_status_allocatable)".to_string(),
+    );
+
+    assert_eq!(
+        unphased_request_ratio_complaints(&[unfiltered]).len(),
+        1,
+        "不按 phase 过滤应当被抓住"
+    );
+    for live in [r#"phase=~"Pending|Running""#, r#"phase="Running""#] {
+        assert!(
+            unphased_request_ratio_complaints(&[with_phase(live)]).is_empty(),
+            "{live} 是这条门要的形状"
+        );
+    }
+    assert_eq!(
+        unphased_request_ratio_complaints(&[with_phase(r#"phase="Succeeded""#)]).len(),
+        1,
+        "按结束态过滤是把整条读数清零，不算过滤"
+    );
+    // 没有分母的那一类不在这条门的射程里：纯记账不按 phase 切也说得通。
+    let accounting = (
+        "accounting_under_test".to_string(),
+        "sum by (namespace) (kube_pod_container_resource_requests)".to_string(),
+    );
+    assert!(unphased_request_ratio_complaints(&[accounting]).is_empty());
+}
+
 /// A guard that reads the very series it guards never lets the rule through.
 ///
 /// `L unless on () R` drops every `L` that has a matching `R`, and an empty `on ()`

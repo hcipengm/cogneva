@@ -10,6 +10,9 @@
 #   - 脏页那条是**一个比值**，分母是设备此刻的写速，于是它有两个各自能坏的半边：写速
 #     正常时比值要跟着脏页走（一格安静、一格该响），而设备完全不写时比值会**只靠除**
 #     变大——那是分母下限那一格在守的东西，把它去掉这一格就响。三格各证一半。
+#   - `scheduling_requests` 只数还占着位的 Pod：结束的 Pod 仍带着 nodeName 与申请量，
+#     算进去这一族容器每次发布留下的 Job Pod 都在加分，读数随发布次数单调上涨。
+#     另有一格专证这一腿（死的 Pod 加起来越过界、活的远没到，结果必须静）。
 #
 #   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
 #   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-node.test.yaml \
@@ -48,7 +51,7 @@ tests:
         values: '0x60'
       - series: 'kube_node_status_condition{node="n1",condition="MemoryPressure",status="true"}'
         values: '0x60'
-      - series: 'kube_pod_container_resource_requests{node="n1",resource="cpu"}'
+      - series: 'kube_pod_container_resource_requests{namespace="cogneva",pod="p1",container="app",node="n1",resource="cpu"}'
         values: '4x60'
       - series: 'kube_node_status_allocatable{node="n1",resource="cpu"}'
         values: '10x60'
@@ -108,7 +111,7 @@ tests:
         values: '1x60'
       - series: 'kube_node_status_condition{node="n1",condition="MemoryPressure",status="true"}'
         values: '1x60'
-      - series: 'kube_pod_container_resource_requests{node="n1",resource="cpu"}'
+      - series: 'kube_pod_container_resource_requests{namespace="cogneva",pod="p1",container="app",node="n1",resource="cpu"}'
         values: '9x60'
       - series: 'kube_node_status_allocatable{node="n1",resource="cpu"}'
         values: '4x40 8x20'
@@ -190,6 +193,37 @@ tests:
           - exp_labels:
               severity: warning
               node: n1
+
+  # 一台节点上躺着一堆已经结束的 Job Pod：一个活着的 Pod 只申请了十分之一，两个
+  # Succeeded/Failed 的 Pod 各申请四成。把它们算进去比值是 0.9，越过界；只算还占着
+  # 位的，是 0.1。静——这一格证明的是「只数还占着位的 Pod」那条腿：删掉
+  # `kube_pod_status_phase{phase=~"Pending|Running"}` 这个联接，它会响。
+  #
+  # 为什么这条腿承重：`kube_pod_container_resource_requests` 对 API 里还在的**每个**
+  # Pod 都出样本，结束的 Pod 也带着原来的 nodeName 与申请量，于是这一族容器每次发布
+  # 留下的 Job Pod 都在给这个比值加分——实测 2026-10-27 有 36 个结束的
+  # cogneva-mainline-* Pod 占着 11.2 核里的 6.9 核（同一刻比值 0.470，只数还占着位的
+  # 是 0.181），而截至那天的七天里这些死 Pod 单独给 cpu 加了 0.115 到 0.321。
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_container_resource_requests{namespace="cogneva",pod="live",container="app",node="n1",resource="cpu"}'
+        values: '1x60'
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="live",phase="Running"}'
+        values: '1x60'
+      - series: 'kube_pod_container_resource_requests{namespace="cogneva",pod="job-done",container="app",node="n1",resource="cpu"}'
+        values: '4x60'
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="job-done",phase="Succeeded"}'
+        values: '1x60'
+      - series: 'kube_pod_container_resource_requests{namespace="cogneva",pod="job-failed",container="app",node="n1",resource="cpu"}'
+        values: '4x60'
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="job-failed",phase="Failed"}'
+        values: '1x60'
+      - series: 'kube_node_status_allocatable{node="n1",resource="cpu"}'
+        values: '10x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: node_scheduling_requests_high
+        exp_alerts: []
 
   # 一个十五分钟前才起来的 Pod 申请了四倍的可分配 CPU：它还在启动期，调度器自己会把它
   # 挪走，不归「超卖」问。删掉 `time() - start > 900` 那条腿，这一格会响。
