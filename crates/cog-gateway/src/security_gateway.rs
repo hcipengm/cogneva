@@ -7850,6 +7850,79 @@ fn llm_channel_router() -> Router<AppState> {
             crate::secret_write::SECRET_PATCH_PATH,
             post(secret_patch_handler),
         )
+        .route(INTERNAL_LLM_STATUS_PATH, post(internal_llm_status_handler))
+}
+
+/// 主应用问「这一侧的上游池配好了没有」的路径。
+///
+/// 池的真值只注入网关这一个 Deployment，而设置页要把「配了没有、声明了几家」显示
+/// 出来。所以答案由持有者给，且只给派生读数——家数与声明的下限，没有一把 key 随
+/// 响应回去；否则刚搬进网关的凭证又被发回零凭证的进程。
+pub(crate) const INTERNAL_LLM_STATUS_PATH: &str = "/internal/llm-status";
+
+/// 内部调用者的验签：拒绝时返回一句能进日志的话，放行返回 `None`。
+///
+/// 两个内部端点共用这一份判据，分开写就会有一处漏验——而漏验的那一处读起来
+/// 与「已验证」完全一样。请求体也一起验：签名覆盖的是字节，不是「有没有内容」。
+fn internal_caller_refusal(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Option<axum::response::Response> {
+    let Some(secret) = state.config.webhook_internal_secret.as_deref() else {
+        return Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "internal_credential_missing",
+                    "message": "网关未配置内部转发凭证（COGNEVA_WEBHOOK_INTERNAL_SECRET）",
+                })),
+            )
+                .into_response(),
+        );
+    };
+    let Some(header) = headers
+        .get(crate::secret_write::SIGNATURE_HEADER)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "signature_missing"})),
+            )
+                .into_response(),
+        );
+    };
+    if !crate::secret_write::signature_matches(secret, body, header) {
+        return Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "signature_mismatch"})),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
+async fn internal_llm_status_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if let Some(refusal) = internal_caller_refusal(&state, &headers, &body) {
+        return refusal;
+    }
+    let upstreams = state.config.llm_upstreams.len();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "configured": upstreams > 0,
+            "upstreams": upstreams,
+            "min_healthy": state.config.llm_pool_min_healthy,
+        })),
+    )
+        .into_response()
 }
 
 /// 主应用把要落盘的 Secret 字段转发到这里；写入由本进程的 ServiceAccount 执行。
@@ -7862,32 +7935,8 @@ async fn secret_patch_handler(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
-    let Some(secret) = state.config.webhook_internal_secret.as_deref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "internal_credential_missing",
-                "message": "网关未配置内部转发凭证（COGNEVA_WEBHOOK_INTERNAL_SECRET）",
-            })),
-        )
-            .into_response();
-    };
-    let Some(header) = headers
-        .get(crate::secret_write::SIGNATURE_HEADER)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "signature_missing"})),
-        )
-            .into_response();
-    };
-    if !crate::secret_write::signature_matches(secret, &body, header) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "signature_mismatch"})),
-        )
-            .into_response();
+    if let Some(refusal) = internal_caller_refusal(&state, &headers, &body) {
+        return refusal;
     }
     #[derive(serde::Deserialize)]
     struct PatchRequest {
@@ -9329,6 +9378,65 @@ mod tests {
         assert!(
             pool[1].key_from.is_some(),
             "来源要能读出来：配上来的与折出来的混在一起时，排查要从这里分辨"
+        );
+    }
+
+    /// 主应用问池状态这一面：只回派生读数，且必须带着内部 HMAC 才回。
+    ///
+    /// 两件事都要钉住。少了验签，这条路径就成了「集群里谁都能读池的配置」；
+    /// 少了「不回 key」，主应用刚从 RBAC 上放掉的凭证又被这条响应送回去——
+    /// 而两次都长得像一次成功的转发。
+    #[tokio::test]
+    async fn the_internal_llm_status_needs_the_internal_hmac_and_returns_no_key() {
+        use tower::ServiceExt as _;
+
+        let mut state = test_state(vec![stub_upstream("https://api.example.com", "m1")]);
+        state.config.llm_pool_min_healthy = Some(2);
+        state.config.webhook_internal_secret = Some("internal-secret".into());
+        let app = router(state, true);
+
+        let call = |signature: Option<String>| {
+            let mut builder = axum::extract::Request::builder()
+                .uri(INTERNAL_LLM_STATUS_PATH)
+                .method("POST");
+            if let Some(sig) = signature {
+                builder = builder.header(crate::secret_write::SIGNATURE_HEADER, sig);
+            }
+            app.clone()
+                .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+        };
+
+        let resp = call(None).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "没有签名的内部调用必须被拒：这条路径答的是池的配置"
+        );
+
+        let resp = call(Some(crate::secret_write::sign("别的口令", b"")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "签名不对的内部调用必须被拒，否则内部 HMAC 只是形式"
+        );
+
+        let resp = call(Some(crate::secret_write::sign("internal-secret", b"")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["configured"], serde_json::json!(true));
+        assert_eq!(parsed["upstreams"], serde_json::json!(1));
+        assert_eq!(parsed["min_healthy"], serde_json::json!(2));
+        assert!(
+            !text.contains("stub-key") && !text.contains("api_key"),
+            "池状态里回了凭证：把 key 发给零凭证的进程等于把搬走的凭证又发回去：{text}"
         );
     }
 

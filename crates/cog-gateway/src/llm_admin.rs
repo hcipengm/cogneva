@@ -85,6 +85,21 @@ pub struct LlmConfigRequest {
 /// credential-free); outside the cluster we fall back to inspecting local
 /// cogneva.json.
 pub async fn llm_status_handler(State(_state): State<Arc<crate::GatewayState>>) -> Response {
+    // 先问网关：池的真值只注入它那个 Deployment（`llm-upstreams` 在带外那一片，
+    // 主应用按 RBAC 已经读不到它了）。网关答不上来再退回本进程直读——那是迁移窗
+    // 里的旧路，等这一面在主应用里彻底关掉之后，下面这段读 Secret 的分支随之删掉。
+    if let Ok((configured, pool)) = forwarded_llm_status().await {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "configured": configured,
+                "backends": local_backends(),
+                "pool": pool,
+                "source": "security-gateway",
+            })),
+        )
+            .into_response();
+    }
     if let Ok(kube) = KubeClient::in_cluster() {
         if let Ok(configured) = kube.secret_has_key().await {
             let pool = kube.secret_pool_policy().await.ok().flatten();
@@ -108,6 +123,72 @@ pub async fn llm_status_handler(State(_state): State<Arc<crate::GatewayState>>) 
         Json(json!({ "configured": configured, "backends": backends })),
     )
         .into_response()
+}
+
+/// 池的声明面：三个数一起印。
+///
+/// 这一格有两个来源——本进程直读 Secret（迁移窗里的旧路）与网关转发的派生读数
+/// （目标态）。两处各拼一遍 JSON 就会漂：页面读得出一个界、判定面读不出，而两边
+/// 都自报成功。所以形状只在这里定义，两个来源都经过它。
+pub(crate) fn pool_policy_json(upstreams: usize, declared: Option<usize>) -> serde_json::Value {
+    json!({
+        "upstreams": upstreams,
+        "min_healthy": declared,
+        "min_healthy_source": cog_core::min_healthy_source(declared),
+        "min_healthy_in_force": cog_core::pool_floor(upstreams, declared),
+    })
+}
+
+/// 主应用侧：问安全网关要池的状态。
+///
+/// 返回的是派生读数（家数、声明下限），不是上游池本身：`llm-upstreams` 里每条都
+/// 带一把 key，把它回传给零凭证的进程等于把刚搬走的凭证又发回去。签名用与
+/// `secret-patch` 同一条内部 HMAC——两个进程之间本来只有这一条信任边界。
+pub(crate) async fn forwarded_llm_status() -> Result<(bool, serde_json::Value), String> {
+    let base = crate::contribution_admin::security_gateway_base()?;
+    let secret = std::env::var("COGNEVA_WEBHOOK_INTERNAL_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "主应用未配置内部转发凭证（COGNEVA_WEBHOOK_INTERNAL_SECRET），无法向安全网关询问池状态"
+                .to_string()
+        })?;
+    // 空体也要签：签名覆盖的是字节，不是「有没有内容」。网关那边同样按空体验。
+    let body: Vec<u8> = Vec::new();
+    let request = cog_core::HttpRequest::post(format!(
+        "{}{}",
+        base.trim_end_matches('/'),
+        crate::security_gateway::INTERNAL_LLM_STATUS_PATH
+    ))
+    .header(
+        crate::secret_write::SIGNATURE_HEADER,
+        crate::secret_write::sign(&secret, &body),
+    )
+    .body(body);
+    let resp = crate::contribution_admin::http_client()?
+        .execute(request)
+        .await
+        .map_err(|e| format!("询问安全网关失败: {e}"))?;
+    if !resp.is_success() {
+        return Err(format!(
+            "安全网关返回 {}: {}",
+            resp.status,
+            resp.text().unwrap_or_default()
+        ));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .map_err(|e| format!("安全网关响应解析失败: {e}"))?;
+    let configured = body
+        .get("configured")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| "安全网关的池状态里没有 configured".to_string())?;
+    let upstreams = body.get("upstreams").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let declared = body
+        .get("min_healthy")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    Ok((configured, pool_policy_json(upstreams, declared)))
 }
 
 /// Backends declared in the local cogneva.json (informational only — after
@@ -972,12 +1053,7 @@ impl KubeClient {
         let declared = decode(SECRET_MIN_HEALTHY_KEY)
             .as_deref()
             .and_then(crate::security_gateway::parse_min_healthy);
-        Ok(Some(json!({
-            "upstreams": upstreams,
-            "min_healthy": declared,
-            "min_healthy_source": cog_core::min_healthy_source(declared),
-            "min_healthy_in_force": cog_core::pool_floor(upstreams, declared),
-        })))
+        Ok(Some(pool_policy_json(upstreams, declared)))
     }
 
     /// 滚动重启安全网关：上游池整体在 Secret 里（env 引用 Secret 条目，
