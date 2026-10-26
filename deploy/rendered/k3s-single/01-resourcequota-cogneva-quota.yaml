@@ -13,16 +13,16 @@ metadata:
   # 条目时（不由产品创建、也不会自己抬额度的那种），投影把它的形状加进求和，
   # 这一行随之非零。缺注解不是零，是报错：留空读作"没声明"，不读作"不需要"。
   annotations:
-    cogneva.io/runtime-pods-limits-cpu: "0"
-    cogneva.io/runtime-pods-limits-memory: "0Gi"
+    cogneva.io/runtime-pods-limits-cpu: "2"
+    cogneva.io/runtime-pods-limits-memory: "3Gi"
   labels:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: resource-governance
 spec:
   hard:
-    requests.cpu: "4"
-    requests.memory: "18Gi"
-    limits.cpu: "36"
-    limits.memory: "69Gi"
-    pods: "36"
+    requests.cpu: "5"
+    requests.memory: "19Gi"
+    limits.cpu: "38"
+    limits.memory: "72Gi"
+    pods: "38"
     requests.storage: "430Gi"

@@ -45,7 +45,25 @@ resourceGovernance:
   # 不会错位。这个键留给**不由产品创建、也不会自己抬额度**的那类 Pod：那样一台
   # Pod 只能在这儿声明整台的形状，由投影加进同一条求和。空列表不是省略，是"没有
   # 这一类"；投影读不到这个键要报错，而不是当作 0。
-  runtimeWorkloads: []
+  #
+  # 现在列表里只有一台：宿主侧注册评测的补跑（宿主的
+  # `scripts/host/eval-registered-rerun.sh` 直接 `kubectl apply` 一台 Pod）。它由
+  # 宿主脚本建、不是产品建的，也不认识额度——所以它要么在下面声明，要么就**从别的
+  # 用途的预留里借地方**。2026-10-26 实测借走的是滚动那份额度：这台 3Gi 的 Pod 在跑
+  # 时，`cogneva` 那一笔滚动的 surge 需要一个完整的新 Pod（12Gi），准入算出来
+  # `58Gi + 12Gi > 69Gi`，部署器按设计扣住不动，连续两轮 mainline 一个 rev 都没上去
+  # （16:54:17Z 与 17:09:40Z 两次，`limits.memory` 同一条短差）。**滚动的重叠额度不是
+  # 余量**：它已经被算进天花板，任何第三方 Pod 吃掉的都是它。所以这台 Pod 的形状在
+  # 这里声明一次，天花板按它加发一份，surge 那份就不再被借。
+  #
+  # 三个数必须与那份脚本里写出的清单逐字相同（limits 与 requests 都算），改一边就得
+  # 改另一边；`scripts/host/eval-registered-rerun.test.sh` 比对这两处，单独改哪边都红。
+  runtimeWorkloads:
+    - name: eval-registered-rerun
+      cpuLimit: "2"
+      memoryLimit: 3Gi
+      cpuRequest: 500m
+      memoryRequest: 1Gi
   limitRange:
     # 下面四项是**策略**而不是投影：它们管的是"没有声明 resources 的容器按什么
     # 算"。上限（max）与单卷上限由投影给，因为它们必须 ≥ 渲染集里最大的那份声明，

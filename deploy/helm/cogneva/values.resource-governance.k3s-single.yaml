@@ -4,15 +4,15 @@
 #       自己留出的额度。换一套工作负载，这份数跟着变——它不描述任何一台机器。
 resourceGovernance:
   quota:
-    requestsCpu: "4"
-    requestsMemory: 18Gi
-    limitsCpu: "36"
-    limitsMemory: 69Gi
-    pods: "36"
+    requestsCpu: "5"
+    requestsMemory: 19Gi
+    limitsCpu: "38"
+    limitsMemory: 72Gi
+    pods: "38"
     requestsStorage: 430Gi
   runtimeSum:
-    limitsCpu: "0"
-    limitsMemory: 0Gi
+    limitsCpu: "2"
+    limitsMemory: 3Gi
   limitRange:
     maxCpu: "8"
     maxMemory: 16Gi
