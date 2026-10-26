@@ -215,13 +215,15 @@ fn served_paths(root: &Path) -> BTreeSet<String> {
                 continue;
             }
             // A route registered from a declaration resolves through that
-            // declaration; an unresolvable one is reported by the caller.
-            let name: String = argument
-                .trim_start_matches("cog_core::")
+            // declaration. Only a bare or module-qualified name is read; a call
+            // of any other shape contributes no route, which shows up as a
+            // client path with nothing serving it rather than as a quiet pass.
+            let qualified: String = argument
                 .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
                 .collect();
-            if let Some(value) = constants.get(&name) {
+            let name = qualified.rsplit("::").next().unwrap_or(qualified.as_str());
+            if let Some(value) = constants.get(name) {
                 served.insert(normalize(value));
             }
         }
