@@ -29,9 +29,21 @@
 //!    and asks the question at the moment it is cheap to answer: does it read
 //!    `announces` first?
 //! 2. Every file that constructs the event also contains a call to
-//!    `announces(`. Deleting a guard while leaving its writer behind -- the
-//!    exact shape of the bug above -- turns this red even though leg 1 still
-//!    matches.
+//!    `announces(`. This is a file-level check and its reach is exactly that:
+//!    it fires when a file loses the judgement *entirely*, which is the shape
+//!    of the bug above -- one writer guarded, the other file's writer never
+//!    asking at all.
+//!
+//!    It does not fire when one of several guards inside the same file is
+//!    deleted, and it must not be read as if it did. The coordinator guards
+//!    three branches separately; with two deleted, the survivor still names
+//!    `announces(`. Per-site coverage therefore lives where it can actually see
+//!    a branch: the behavioural tests in
+//!    `supervisor_lifecycle_coordinator_test.rs` hold one leg per branch (each
+//!    ablation turns exactly its own test red), and the supervisor's own
+//!    event-stream test holds its single site. A textual test cannot stand in
+//!    for those, and pretending it does would make this file's silence mean
+//!    more than it does.
 //!
 //! The ceiling: this parses source, so a writer built through a macro, an
 //! `include!`, or a helper that takes the event as an argument has no

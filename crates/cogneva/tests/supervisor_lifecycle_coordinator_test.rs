@@ -290,3 +290,119 @@ async fn a_departed_id_emits_no_lifecycle_event_but_still_transitions() {
         Some(AgentState::Dead)
     );
 }
+
+/// The three branches that emit `AgentUnhealthy` are three separate guards, so
+/// each needs its own leg. A file-level test would stay green while two of the
+/// three were deleted, because the surviving one still names the judgement.
+#[tokio::test]
+async fn a_departed_suspect_emits_no_lifecycle_event_but_still_transitions() {
+    let backend = mk_backend();
+    backend
+        .set_agent_state("squad:one-shot-suspect", &AgentState::Active)
+        .await
+        .unwrap();
+
+    let (coord, mut rx) = mk_coordinator(mk_registry(), Arc::clone(&backend));
+    let report = HealthReport {
+        suspect: vec![(
+            "squad:one-shot-suspect".into(),
+            cog_core::HealthIssue::Suspect { missed_beats: 3 },
+        )],
+        departed: vec!["squad:one-shot-suspect".into()],
+        ..Default::default()
+    };
+
+    let result = coord.handle_health_report(&report).await.unwrap();
+
+    assert!(
+        rx.try_recv().is_err(),
+        "名单里已经没有它了：suspect 那一支也不能报"
+    );
+    assert_eq!(result.events_emitted, 0);
+    assert_eq!(result.transitioned.len(), 1);
+    assert_eq!(
+        backend
+            .get_agent_state("squad:one-shot-suspect")
+            .await
+            .unwrap(),
+        Some(AgentState::Suspect)
+    );
+}
+
+#[tokio::test]
+async fn a_departed_stuck_agent_emits_no_lifecycle_event_but_still_transitions() {
+    let backend = mk_backend();
+    backend
+        .set_agent_state("squad:one-shot-stuck", &AgentState::Active)
+        .await
+        .unwrap();
+
+    let (coord, mut rx) = mk_coordinator(mk_registry(), Arc::clone(&backend));
+    let report = HealthReport {
+        stuck: vec![(
+            "squad:one-shot-stuck".into(),
+            cog_core::HealthIssue::Stuck { stuck_seconds: 900 },
+        )],
+        departed: vec!["squad:one-shot-stuck".into()],
+        ..Default::default()
+    };
+
+    let result = coord.handle_health_report(&report).await.unwrap();
+
+    assert!(
+        rx.try_recv().is_err(),
+        "名单里已经没有它了：stuck 那一支也不能报"
+    );
+    assert_eq!(result.events_emitted, 0);
+    assert_eq!(result.transitioned.len(), 1);
+    assert_eq!(
+        backend
+            .get_agent_state("squad:one-shot-stuck")
+            .await
+            .unwrap(),
+        Some(AgentState::Suspect)
+    );
+}
+
+/// The other half, so the three above are not passed by silencing every
+/// branch: an agent that is still on the roster must still be announced.
+#[tokio::test]
+async fn a_listed_agent_in_any_branch_is_still_announced() {
+    let backend = mk_backend();
+    for id in ["a-suspect", "a-dead", "a-stuck"] {
+        backend
+            .set_agent_state(id, &AgentState::Active)
+            .await
+            .unwrap();
+    }
+
+    let (coord, mut rx) = mk_coordinator(mk_registry(), Arc::clone(&backend));
+    let report = HealthReport {
+        suspect: vec![(
+            "a-suspect".into(),
+            cog_core::HealthIssue::Suspect { missed_beats: 3 },
+        )],
+        dead: vec![(
+            "a-dead".into(),
+            cog_core::HealthIssue::Dead {
+                last_seen: Utc::now(),
+            },
+        )],
+        stuck: vec![(
+            "a-stuck".into(),
+            cog_core::HealthIssue::Stuck { stuck_seconds: 900 },
+        )],
+        departed: vec![],
+        ..Default::default()
+    };
+
+    let result = coord.handle_health_report(&report).await.unwrap();
+
+    let mut announced = Vec::new();
+    while let Ok(SupervisorEvent::AgentUnhealthy { agent_id, .. }) = rx.try_recv() {
+        announced.push(agent_id);
+    }
+    announced.sort();
+    assert_eq!(announced, vec!["a-dead", "a-stuck", "a-suspect"]);
+    assert_eq!(result.events_emitted, 3);
+}
