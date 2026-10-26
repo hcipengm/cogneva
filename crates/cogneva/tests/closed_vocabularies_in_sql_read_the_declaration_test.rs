@@ -109,6 +109,10 @@ fn parses_as_refusal_kind(word: &str) -> bool {
     cog_core::RefusalKind::from_name(word).is_some()
 }
 
+fn parses_as_producer_trigger(word: &str) -> bool {
+    cog_observability::producer_heartbeat::ProducerTrigger::parse(word).is_some()
+}
+
 /// One closed set of words and the columns a query asks about it with.
 struct Vocabulary {
     /// The column names this vocabulary is stored under. The subject is the
@@ -255,6 +259,15 @@ const VOCABULARIES: &[Vocabulary] = &[
         subjects: &["refusal_kind"],
         parses: parses_as_refusal_kind,
         home: "cog_core::RefusalKind",
+        except_in: &[],
+    },
+    Vocabulary {
+        // What started a producer's heartbeat row. The stalled-producer rule
+        // selects the timer's row by this word; a row the table accepts under a
+        // word the rule does not select reads as a producer that never ran.
+        subjects: &["trigger"],
+        parses: parses_as_producer_trigger,
+        home: "cog_observability::producer_heartbeat::ProducerTrigger",
         except_in: &[],
     },
 ];
@@ -637,6 +650,10 @@ fn each_vocabulary_reads_its_own_declaration() {
     assert!(!parses_as_usage_result("completed"));
     assert!(!parses_as_refusal_kind("retired"));
     assert!(!parses_as_refusal_kind(""));
+    for trigger in cog_observability::producer_heartbeat::ProducerTrigger::ALL {
+        assert!(parses_as_producer_trigger(trigger.as_str()));
+    }
+    assert!(!parses_as_producer_trigger("manual_run"));
     assert!(!parses_as_backup_outcome("firing"));
     assert!(!parses_as_notification_type("promoted"));
     // A word from another set is not this set's: the judge has to be a set, not

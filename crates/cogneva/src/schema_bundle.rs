@@ -39,7 +39,7 @@ pub fn statements() -> Vec<String> {
         cog_storage::owner_lease::DDL.to_string(),
         cog_observability::alert_store::ddl(),
         cog_observability::skip_store::DDL.to_string(),
-        cog_observability::producer_heartbeat::DDL.to_string(),
+        cog_observability::producer_heartbeat::ddl(),
         cog_observability::spend_verdict::DDL.to_string(),
         cog_observability::usage_store::ddl(),
         // The analytics table's name is a setting, so its schema comes from the

@@ -54,7 +54,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
-use cog_core::{SFError, SFResult};
+use cog_core::{fill_slots, SFError, SFResult};
 
 /// The table the heartbeats are kept in: one row per producer and trigger,
 /// rewritten in place.
@@ -71,8 +71,36 @@ pub const HEARTBEAT_TABLE: &str = "principle_producer_pushes";
 /// The values are a closed set because the rules select on the column: a typo
 /// would not fail anything, it would create a third trigger whose rows no rule
 /// reads -- a producer that looks alive only to itself.
-pub const TRIGGER_TIMER: &str = "timer";
-pub const TRIGGER_MANUAL: &str = "manual";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProducerTrigger {
+    /// The producer's own schedule.
+    Timer,
+    /// A person ran the producer by hand.
+    Manual,
+}
+
+impl ProducerTrigger {
+    /// Every trigger, in the order the schema names them.
+    ///
+    /// The table's `DEFAULT` and its `CHECK` both spell one of these words. A
+    /// default on a word the enum no longer produces writes rows under a
+    /// trigger nobody selects, which reads as a producer whose timer stopped.
+    pub const ALL: [ProducerTrigger; 2] = [ProducerTrigger::Timer, ProducerTrigger::Manual];
+
+    /// The word this trigger is stored under.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProducerTrigger::Timer => "timer",
+            ProducerTrigger::Manual => "manual",
+        }
+    }
+
+    /// Read one back. A value outside the set is refused rather than mapped to
+    /// a neighbour: an unknown word means the writer and this build disagree.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.as_str() == s)
+    }
+}
 
 /// The name the principle ledger's producer gives itself in the row it writes.
 ///
@@ -95,16 +123,29 @@ pub const PRODUCER_LAST_PUSH_TIMESTAMP: &str =
 pub const PRODUCER_PUSH_PERIOD: &str = "cogneva_principle_producer_push_period_seconds";
 
 /// This store's schema, and the one a restore replays.
-pub const DDL: &str = r#"
+///
+/// The `DEFAULT` and the `CHECK` are rendered from [`ProducerTrigger`] rather
+/// than written out: the table is created by this store on first start, so a
+/// stale word here refuses the producer's own rows on its next delivery, and
+/// the rules that read them select by the word the enum declares.
+const DDL_TEMPLATE: &str = r#"
 CREATE TABLE IF NOT EXISTS principle_producer_pushes (
                 source         TEXT NOT NULL,
-                trigger        TEXT NOT NULL DEFAULT 'timer'
-                               CHECK (trigger IN ('timer', 'manual')),
+                trigger        TEXT NOT NULL DEFAULT '{trigger:timer}'
+                               CHECK (trigger IN ('{trigger:timer}', '{trigger:manual}')),
                 pushed_at      TIMESTAMPTZ NOT NULL,
                 period_seconds BIGINT NOT NULL,
                 PRIMARY KEY (source, trigger)
             );
 "#;
+
+/// The schema with the trigger words filled in from the declaration.
+pub fn ddl() -> String {
+    fill_slots(
+        DDL_TEMPLATE,
+        &ProducerTrigger::ALL.map(|trigger| ("trigger", trigger.as_str())),
+    )
+}
 
 /// The row as the reader sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,7 +182,7 @@ impl ProducerHeartbeatStore {
     /// startup. A fresh database gets the final shape from here, and an existing
     /// one gets it from there; neither path drops a row.
     pub async fn init_schema(&self) -> anyhow::Result<()> {
-        sqlx::raw_sql(DDL).execute(&self.pool).await?;
+        sqlx::raw_sql(&ddl()).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -271,7 +312,11 @@ mod tests {
     /// rule can subtract it from the platform's own `time()`.
     #[test]
     fn the_moment_is_served_as_the_instant_and_the_period_beside_it() {
-        let out = readings(vec![stamped(TRIGGER_TIMER, 1_760_000_000, 1_832)]);
+        let out = readings(vec![stamped(
+            ProducerTrigger::Timer.as_str(),
+            1_760_000_000,
+            1_832,
+        )]);
         let by_name = |name: &str| {
             out.iter()
                 .find(|m| m.name == name)
@@ -288,7 +333,7 @@ mod tests {
             );
             assert_eq!(
                 metric.labels.get("trigger").map(String::as_str),
-                Some(TRIGGER_TIMER),
+                Some(ProducerTrigger::Timer.as_str()),
                 "{} carries no trigger label",
                 metric.name
             );
@@ -309,7 +354,7 @@ mod tests {
     /// moment leaves it with nothing to measure.
     #[test]
     fn the_pair_is_never_split() {
-        let out = readings(vec![stamped(TRIGGER_TIMER, 1, 1)]);
+        let out = readings(vec![stamped(ProducerTrigger::Timer.as_str(), 1, 1)]);
         assert_eq!(out.len(), 2);
         assert!(readings(Vec::new()).is_empty());
     }
@@ -321,8 +366,8 @@ mod tests {
     #[test]
     fn a_manual_delivery_stands_beside_the_timers_instead_of_replacing_it() {
         let out = readings(vec![
-            stamped(TRIGGER_TIMER, 1_000, 1_800),
-            stamped(TRIGGER_MANUAL, 2_000, 1_800),
+            stamped(ProducerTrigger::Timer.as_str(), 1_000, 1_800),
+            stamped(ProducerTrigger::Manual.as_str(), 2_000, 1_800),
         ]);
         assert_eq!(out.len(), 4, "both rows must be served");
         let mut timed: Vec<(String, f64)> = out
@@ -344,5 +389,24 @@ mod tests {
             ],
             "the timer's moment must survive a later manual push"
         );
+    }
+
+    /// 建表语句里的默认值与 CHECK 必须逐字带着枚举声明的词。
+    ///
+    /// 这一句由本进程在首次启动时执行：写着一个不再产出的词，生产的第一次投递
+    /// 就被自己的表拒掉；而默认值写错的后果更安静——行落在一个没人选的 trigger
+    /// 上，判停摆的规则查那个词，读到的是"定时器停了"。槽没填则整段 DDL 拒解析。
+    #[test]
+    fn the_schema_names_the_triggers_the_enum_declares() {
+        let schema = ddl();
+        assert!(!schema.contains("{trigger:"), "trigger 槽没有填上");
+        for trigger in ProducerTrigger::ALL {
+            assert!(
+                schema.contains(&format!("'{}'", trigger.as_str())),
+                "建表语句里没有 {} 这个词",
+                trigger.as_str()
+            );
+        }
+        assert!(schema.contains(&format!("DEFAULT '{}'", ProducerTrigger::Timer.as_str())));
     }
 }
