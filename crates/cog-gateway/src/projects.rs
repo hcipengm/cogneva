@@ -654,37 +654,60 @@ pub(crate) fn build_evm_response(
                     .iter()
                     .filter(|(t, _)| t.status == TaskStatus::Completed)
                     .count();
-                (
-                    EvmReading::measured(
-                        pv,
-                        format!(
-                            "{with_duration} 条带时长的基线按线性比例折算到此刻\
-                             （无工作日历）；{without_duration} 条只有起期、时长未知，不计入"
+                let attribution = EvmAttribution {
+                    tasks_with_cost,
+                    baselined_tasks_without_cost: spent.as_ref().map(|spent| {
+                        baselined
+                            .iter()
+                            .filter(|(t, _)| {
+                                !spent.contains(t.id.as_str()) && t.status == TaskStatus::Completed
+                            })
+                            .count()
+                    }),
+                    tasks_outside_baseline: Some(outside),
+                };
+                // 一条预算都没量出来时，这两个量不是 0 而是量不出来。基线上的
+                // `budget_tokens = 0` 写的是「这件活没有成本计划」——估算器要等同类
+                // 任务量出过花销才写得下预算，而一次都没跑完过的那种还写不下。把
+                // 它折成 `measured(0)` 与「一条都没量出来」在屏幕上是一模一样的
+                // 两个 0，读者却会读成「计划价值是零」「一条活都没挣到」，再往下
+                // 把「没量过」当成「没干活」。时长那一列的情形不同：`planned_end`
+                // 由时长中位数给，缺时长的行止期本来就空着，折比例时会被数成
+                // 「时长未知」而不是零。
+                if baselined.iter().all(|(_, p)| p.budget_tokens == 0) {
+                    let reason = format!(
+                        "这个项目 {} 条基线一条也没带预算：估算器要等同类任务量出过花销才写\
+                         得下预算，所以这两个量是量不出来，不是 0（时长那一列仍按 \
+                         {with_duration} 条基线折算到此刻，见 `behind_schedule`）",
+                        baselined.len()
+                    );
+                    (
+                        EvmReading::unmeasurable(reason.clone()),
+                        EvmReading::unmeasurable(reason),
+                        baselined,
+                        attribution,
+                    )
+                } else {
+                    (
+                        EvmReading::measured(
+                            pv,
+                            format!(
+                                "{with_duration} 条带时长的基线按线性比例折算到此刻\
+                                 （无工作日历）；{without_duration} 条只有起期、时长未知，不计入"
+                            ),
                         ),
-                    ),
-                    EvmReading::measured(
-                        ev,
-                        format!(
-                            "{completed} 条已完成任务的基线预算之和，共 {} 条有基线；\
-                             另外 {outside} 条没有基线，不在挣值里",
-                            baselined.len()
+                        EvmReading::measured(
+                            ev,
+                            format!(
+                                "{completed} 条已完成任务的基线预算之和，共 {} 条有基线；\
+                                 另外 {outside} 条没有基线，不在挣值里",
+                                baselined.len()
+                            ),
                         ),
-                    ),
-                    baselined.clone(),
-                    EvmAttribution {
-                        tasks_with_cost,
-                        baselined_tasks_without_cost: spent.as_ref().map(|spent| {
-                            baselined
-                                .iter()
-                                .filter(|(t, _)| {
-                                    !spent.contains(t.id.as_str())
-                                        && t.status == TaskStatus::Completed
-                                })
-                                .count()
-                        }),
-                        tasks_outside_baseline: Some(outside),
-                    },
-                )
+                        baselined,
+                        attribution,
+                    )
+                }
             }
         }
     };
@@ -1334,6 +1357,58 @@ mod tests {
         assert_eq!(pv, 0);
         assert_eq!(counted, 0);
         assert_eq!(unknown, 1, "只有起期也算不出比例");
+    }
+
+    /// 基线一条预算都没带时，计划价值与挣值都是「量不出来」，不是 0。
+    ///
+    /// 基线上的 `budget_tokens = 0` 写的是「这件活没有成本计划」，不是「计划花零个
+    /// token」：估算器要等同类任务量出过花销才写得下预算。折成 `measured(0)` 之后，
+    /// 「一条都没量出来」与「计划价值真的是零」在屏幕上是一模一样的两个 0，而下一句
+    /// 推论就是「一条活都没挣到」。现网 2026-10-26 实测：有基线的项目 2348 个，预算
+    /// 全是 0——这两个格子原来就是这么显示的。
+    #[test]
+    fn baselines_carrying_no_budget_make_the_token_quantities_unmeasurable() {
+        let now = chrono::Utc::now();
+        let mut done = task("a", Some("g1"));
+        done.status = TaskStatus::Completed;
+        let window = (
+            now - chrono::Duration::minutes(5),
+            now + chrono::Duration::minutes(5),
+        );
+        let plans: BTreeMap<String, cog_core::TaskPlan> =
+            [("a".to_string(), plan_between("a", 0, window.0, window.1))]
+                .into_iter()
+                .collect();
+        let spends: BTreeMap<String, u64> = [("a".to_string(), 0u64)].into_iter().collect();
+
+        let reading = build_evm_response(
+            "g1".into(),
+            &[&done],
+            Some(&plans),
+            Some(&spends),
+            None,
+            now,
+        );
+
+        assert_eq!(reading.planned_value.value, None, "没有预算就不是 0");
+        assert_eq!(reading.earned_value.value, None);
+        assert!(
+            reading
+                .planned_value
+                .unmeasurable
+                .as_deref()
+                .is_some_and(|reason| reason.contains("预算")),
+            "要说清为什么量不出来，得到 {:?}",
+            reading.planned_value.unmeasurable
+        );
+        assert!(reading.earned_value.unmeasurable.is_some());
+        assert_eq!(reading.schedule_performance_index, None);
+
+        // 花销那一列不受影响：一条都没花过钱是量得出来的 0，而它照样进不了超支表。
+        assert_eq!(reading.actual_cost.value, Some(0));
+        assert_eq!(reading.cost_performance_index, None);
+        assert!(reading.overruns.expect("两张表都读得到").is_empty());
+        assert_eq!(reading.attribution.tasks_outside_baseline, Some(0));
     }
 
     /// 超支与落后是两张逐节点的表。指数只说「整体偏了」，而修法要知道是哪一条：
