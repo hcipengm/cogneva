@@ -25,6 +25,9 @@
 #   4. 调度按判据跑：第一帧立刻读、间隔内合并、到点读、在途不重排、时钟回拨不许
 #      把这一面静默停住；连打十秒 100 毫秒一帧的突发，既不许一次不读（饿死），也
 #      不许按帧数读（风暴）。
+#   5. 同一个画面的几份快照一起重读：任务面的行由帧直接改写，表头的计数与图上的
+#      节点却来自各自的快照——只刷列表，表头就会在接下来十几秒里说「运行 3」而
+#      下面三行都已经是完成。三份必须同一次重读。
 #
 # 用法：bash deploy/scripts/check-web-stream-driven-refresh.sh [仓库根目录]
 set -euo pipefail
@@ -111,7 +114,19 @@ for pattern, why in (
     if not re.search(pattern, view):
         sys.exit(f"views/ObservabilityView.tsx 缺 {pattern}：{why}")
 
-print("ok   - 调度是纯的、总线报了到、观测面接上了重读")
+# 任务面：行由帧改写，计数与图来自快照。三份都交出去，缺一份就是同一屏上两份事实。
+tasks = read("views/TasksView.tsx")
+for pattern, why in (
+    (
+        r"useStreamDrivenRefresh\(\[summary\.refresh, list\.refresh, graph\.refresh\]\)",
+        "任务面的汇总、列表、图没一起接到帧上：行会跟着帧改，表头的「运行 N」和图上"
+        "那条还连着，最久要等下一拍 15 秒才对上——同一屏两份事实",
+    ),
+):
+    if not re.search(pattern, tasks):
+        sys.exit(f"views/TasksView.tsx 缺 {pattern}：{why}")
+
+print("ok   - 调度是纯的、总线报了到、观测面与任务面接上了重读")
 PYEOF
 
 TSC="$ROOT/web/node_modules/.bin/tsc"
