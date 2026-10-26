@@ -41,7 +41,12 @@ JSON 不经过 Helm 渲染（文件里的双花括号是应用自己的 prompt �
 照绿、Pod 照起，端口留在了旧值上。所以每一条替换都先 `contains` 一次，缺了就 `fail`。
 
 `"port": 9091` 只在 webhook 段出现；其余带端口的地址按主机名整条替换，因为 URL 里的
-端口是拼在主机名后面的。新增一个带端口的地址时，这里必须跟着加一行。
+端口是拼在主机名后面的。新增一个带端口的地址时，这里必须跟着加一行——没有加的那一行
+不会红，它只会让文件里那个地址留在旧值上，所以另有一条测试把 JSON 里出现的每个
+`主机:端口` 与本表对一遍。
+
+观测栈的三条同理，只是它们不是本 chart 起的服务：Loki 与 Prometheus 住在观测栈自己的
+命名空间里，地址同样是集群事实，改一处不能留下另一处。
 */ -}}
 {{- $portage := dict
       "\"http_port\": 8080" (printf "\"http_port\": %d" (int .Values.gateway.httpPort))
@@ -58,6 +63,9 @@ JSON 不经过 Helm 渲染（文件里的双花括号是应用自己的 prompt �
       "cogneva-sandbox-executor:9090" (printf "cogneva-sandbox-executor:%d" (int .Values.sandboxExecutor.metricsPort))
       "nats-service:4222" (printf "nats-service:%d" (int .Values.backends.nats.port))
       "cogneva-security-gateway:8081" (printf "cogneva-security-gateway:%d" (int .Values.securityGateway.llmProxyPort))
+      "http://loki.monitoring.svc.cluster.local:3100" (printf "%s" .Values.observability.loki.endpoint)
+      "http://cog-observability-prometheus.monitoring:9090" (printf "%s" .Values.observability.infraWatch.prometheusUrl)
+      "localhost:8080/metrics" (printf "localhost:%d/metrics" (int .Values.gateway.httpPort))
 -}}
 {{- range $from, $to := $portage }}{{ if not (contains $from $json) }}{{ fail (printf "app-config.yaml: %q is no longer written in files/cogneva.json, so this replacement would silently keep the old port -- update the pattern here to the file's new form" $from) }}{{ end }}{{ $json = replace $from $to $json }}{{ end }}
 apiVersion: v1

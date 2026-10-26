@@ -358,22 +358,36 @@ securityGateway:
   # （证据优先于部署时的猜测）。用途是让首批 git 请求不必先撞一次已知会挂的
   # 通道——那类网络里探测本身就要几十秒才有结论。
   netProfile: ""
-  # 上游池可观测导出端点。四种体裁各落各的后端：日志→Loki、时序明细
-  # →ClickHouse、告警状态机→PostgreSQL（复用 cogneva 自身 PG，无需配置）、
-  # 指标→Prometheus（ServiceMonitor 已抓取）。默认开启：观测栈的安装脚本
-  # 默认就带上这两个后端（BACKENDS=1）；端点不通时网关只降级告警，池自愈
-  # 主链（Redis 跨进程信号 + PG 告警）不依赖它们。只要指标栈时设 BACKENDS=0
-  # 并把这两项置 false。
-  observability:
-    loki:
-      enabled: true
-      endpoint: "http://loki.monitoring.svc.cluster.local:3100"
-    clickhouse:
-      enabled: true
-      baseUrl: "http://clickhouse.monitoring.svc.cluster.local:8123"
-      database: "cogneva"
-      table: "llm_events"
-      username: "cogneva"
+
+# 观测栈的地址，两个进程共用：网关的上游池导出（cog-gateway，经 COGNEVA_LOKI_* /
+# COGNEVA_CLICKHOUSE_* env 读）与主应用、进化进程的 tracing 导出（cog-observability，
+# 读 files/cogneva.json 的 observability 段——那几行由 app-config.yaml 在渲染时
+# 用这里的值改写，所以地址仍然只有这一份）。
+#
+# 四种体裁各落各的后端：日志→Loki、时序明细→ClickHouse、告警状态机→PostgreSQL
+# （复用 cogneva 自身 PG，无需配置）、指标→Prometheus（ServiceMonitor 已抓取）。
+# 默认开启：观测栈的安装脚本默认就带上这两个后端（BACKENDS=1）；端点不通时网关只
+# 降级告警，池自愈主链（Redis 跨进程信号 + PG 告警）不依赖它们。只要指标栈时设
+# BACKENDS=0 并把这两项置 false。
+#
+# 这一块此前挂在 securityGateway 下：同一台 Loki 于是在 values 里写一份、在
+# files/cogneva.json 里又写一份。搬观测栈时改一处、另一处留在旧地址，症状是主应用
+# 那侧「日志不再落地」——没有任何报错，只是日志面上少了一个进程。
+observability:
+  loki:
+    enabled: true
+    endpoint: "http://loki.monitoring.svc.cluster.local:3100"
+  clickhouse:
+    enabled: true
+    baseUrl: "http://clickhouse.monitoring.svc.cluster.local:8123"
+    database: "cogneva"
+    table: "llm_events"
+    username: "cogneva"
+  # 基础设施告警的读面（Prometheus 的 API）：主应用按 poll 间隔拉一次规则与序列，
+  # 判断「进程手里的规则集与 ConfigMap 声明的是不是同一份」。这条地址同样只有这
+  # 一份，JSON 里那行由渲染改写。
+  infraWatch:
+    prometheusUrl: "http://cog-observability-prometheus.monitoring:9090"
 
 # 公网 git 取数的一道上界，两个 worker 共用。
 #
