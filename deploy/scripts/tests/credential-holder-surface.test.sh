@@ -64,7 +64,11 @@ mirror
 run_gate() { bash "${gate}" "${work}/root" 2>&1; }
 
 APP_DEPLOY="deploy/rendered/k3s-single/41-deployment-cogneva.yaml"
-LLM_ADMIN_BINDING="deploy/rendered/k3s-single/17-rolebinding-cogneva-llm-admin.yaml"
+# 用例 7 要删的那条 RoleBinding。绑的是**唯一一个今天还有 Secret 权限的角色**：
+# llm-admin 那条曾经是它，但读到主应用的那三个读点搬进网关后，它不再授 Secret，
+# 再拿它做用例等于删一条本来就不带权限的绑定——门没东西可报，用例就从红变绿。
+# 用例本身仍然成立，变的是它必须绑在一个真授了 Secret 的角色上。
+SECRETS_ROLE_BINDING="deploy/rendered/k3s-single/17-rolebinding-cogneva-security-gateway.yaml"
 
 # 1) 真树绿，且读数是真读数
 out="$(run_gate)" || fail "真树应当绿，实际红：${out}"
@@ -194,9 +198,9 @@ grep -q "Deployment/cogneva/.*按名读 cogneva-secrets/smtp-password" <<<"${out
 
 # 7) 授了 Secret 的 Role 没有 RoleBinding
 mirror
-rm -f "${work}/root/${LLM_ADMIN_BINDING}"
+rm -f "${work}/root/${SECRETS_ROLE_BINDING}"
 out="$(run_gate)" && fail "授权没有持有者时应当红，实际绿：${out}"
-grep -q "Role/cogneva-llm-admin 授了 Secret 的 read，却没有 RoleBinding" <<<"${out}" \
+grep -q "Role/cogneva-security-gateway 授了 Secret 的 read,write，却没有 RoleBinding" <<<"${out}" \
   || fail "没报出谁也用不到的授权：${out}"
 
 # 8) Role 的动词里 patch 被去掉（三种形态都改，落到登记表那一侧）
