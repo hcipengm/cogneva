@@ -143,15 +143,12 @@ spec:
                   readOnly: true
                 # 身份导出：Secret 以只读卷进 Pod，打成 apply-able manifest，
                 # 不为备份单独扩 RBAC。
-                - name: secrets
-                  mountPath: /secrets
-                  readOnly: true
-                # 带外那一份同挂：平台 token、git 身份私钥都只在这里，不导就等于
-                # 换机后要回平台后台重新签发一遍。两片分开导出、分开恢复——它们
-                # 是两个对象，权限面也是按对象划的。
-                - name: secrets-oob
-                  mountPath: /secrets-oob
-                  readOnly: true
+                #
+                # **只在包是密文时才挂**：包里那份清单只是 base64，卷上与卷外各躺
+                # 一份就是两处新的凭证载体，能读文件的人拿走全部 token。没有包级
+                # 口令时导出端本来就不导这两片（它会点名成有损面），那么这里的挂载
+                # 就只剩一个作用：让备份 Pod 读得到它根本不会用到的凭证。凭证只在
+                # 安全网关里，是从「挂不挂」这一层就开始算的。
                 - name: backup
                   mountPath: /backups
                 - name: offsite
@@ -169,15 +166,6 @@ spec:
               hostPath:
                 path: "/var/lib/cogneva-data/git-remote"
                 type: Directory
-            - name: secrets
-              secret:
-                secretName: cogneva-secrets
-            - name: secrets-oob
-              secret:
-                secretName: cogneva-secrets-oob
-                # 全新安装、向导还没跑过时这个对象可能没有键，但对象本身由
-                # init-secrets.sh 建了出来；optional 让"还没配"不等于"备份跑不起来"。
-                optional: true
             - name: backup
               persistentVolumeClaim:
                 claimName: cogneva-backup-pvc

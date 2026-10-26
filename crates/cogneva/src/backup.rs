@@ -841,6 +841,63 @@ pub fn build_secret_manifest(
     Ok((yaml, keys))
 }
 
+/// 把两片 Secret 卷导出成 apply-able 清单，返回进包键名的全表。
+///
+/// **只在包本身是密文时才导**。包里的 Secret 清单只是 base64，能读文件就等于持有
+/// 全部凭证：卷上一份、卷外副本一份、宿主状态目录一份，0600 挡住同机别的账号，挡不住
+/// 拿到盘的人，也挡不住把 PVC 快照拷走的人。没口令时把凭证写进明文包，等于把「凭证
+/// 只住在安全网关里」这句话当场作废——那两份清单躺的每一个位置都是新的凭证载体。
+///
+/// 不导的代价要写清楚，所以它不是静默跳过：manifest 的 `lossy_surfaces` 会点名这一格
+/// （换机后内部那片由安装脚本重新生成、带外那片由向导重新签发）。拦整趟备份换不到更好
+/// 的东西：没凭证的包仍然救得回全部业务状态。
+fn export_secret_manifests(
+    internal_dir: &Path,
+    oob_dir: &Path,
+    namespace: &str,
+    out_dir: &Path,
+    sealed: bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if !sealed {
+        tracing::warn!(
+            env = crate::backup_crypto::KEY_ENV,
+            "没有配置包级加密口令：这一份包以明文落盘，两片 Secret 清单**不进包**"
+        );
+        return Ok(Vec::new());
+    }
+    std::fs::create_dir_all(out_dir)?;
+    // 两片各出一份 apply-able manifest。键名带上对象前缀：只列裸键名的话，
+    // 包清单读起来像"这些键都在一个对象里"，而恢复端是按对象 apply 的——
+    // 那句误读会在换机时才暴露。
+    let mut keys = Vec::new();
+    for (dir, object_name) in [
+        (internal_dir, SECRET_NAME_INTERNAL),
+        (oob_dir, SECRET_NAME_OOB),
+    ] {
+        let (yaml, object_keys) = match build_secret_manifest(dir, namespace, object_name) {
+            Ok(v) => v,
+            // 带外那份可能还没被创建过（全新安装、向导还没跑）：那不是备份失败，
+            // 包里少一份空对象而已。内部那份缺失是真问题（含实例指纹）。
+            Err(e) if object_name == SECRET_NAME_OOB => {
+                tracing::warn!(dir = %dir.display(), error = %e, "备份：带外凭证对象读不到，跳过该片");
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let secret_file = out_dir.join(format!("{object_name}.yaml"));
+        std::fs::write(&secret_file, yaml)?;
+        // 打包沿用的是这个文件的权限，所以这里定成 0600：解包出来的那份清单
+        // 也就不会对别人可读，而不是只靠外面那层目录挡着。
+        restrict_to_owner(&secret_file, 0o600)?;
+        keys.extend(
+            object_keys
+                .into_iter()
+                .map(|k| format!("{object_name}/{k}")),
+        );
+    }
+    Ok(keys)
+}
+
 /// 递归复制目录树，返回（文件数， 总字节）。源不存在时记 0——新装实例
 /// 可能还没有任何 raw 对象，这不是错误。
 pub fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<(u64, u64)> {
@@ -1141,21 +1198,9 @@ fn restrict_to_owner(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-fn tar_package(staging: &Path, staging_name: &str, out: &Path) -> std::io::Result<()> {
-    let key = crate::backup_crypto::PackageKey::from_env();
-    if key.is_none() {
-        // 没口令就只能写明文包：不拦（拦的代价是当晚没有备份），但每一趟都要留痕，
-        // 否则「我们的包是密文」会变成一句没人量的口号。
-        tracing::warn!(
-            env = crate::backup_crypto::KEY_ENV,
-            "没有配置包级加密口令，这一份包以明文落盘"
-        );
-    }
-    tar_package_with_key(staging, staging_name, out, key.as_ref())
-}
-
-/// 打包主体。口令从参数进来而不是在函数里读环境变量，测试才能在不改进程环境的
-/// 前提下同时验证「有钥匙」和「没钥匙」两条路。
+/// 打包主体。口令从参数进来而不是在函数里读环境变量：同一趟里「凭证要不要进包」
+/// 与「包是不是密文」必须由同一个答案决定，而两次读环境变量之间插进来的差异，会让
+/// 凭证躺进一个明文包里；测试也才能在不改进程环境的前提下同时验证两条路。
 fn tar_package_with_key(
     staging: &Path,
     staging_name: &str,
@@ -1566,7 +1611,10 @@ async fn finish_backup(
     staging: &Path,
     staging_name: &str,
 ) -> Result<LeftBehind, Box<dyn std::error::Error>> {
-    match run_backup_into(cfg, staging).await {
+    // 口令读**一次**，这一趟的两个决定都由它回答：凭证进不进包、包是不是密文。
+    // 分两处各读一次环境变量，两次之间插进来的差异会让凭证躺进一个明文包。
+    let key = crate::backup_crypto::PackageKey::from_env();
+    match run_backup_into(cfg, staging, key.is_some()).await {
         Ok(manifest) => {
             // 覆盖清单在打包之前算：它说的是「这个包**该有**什么」，而清单是包内
             // 唯一那份声明。打包之后就算不出来了——staging 已经删掉。
@@ -1574,7 +1622,7 @@ async fn finish_backup(
             let manifest_json = serde_json::to_string_pretty(&manifest)?;
             std::fs::write(staging.join("manifest.json"), format!("{manifest_json}\n"))?;
             let package = cfg.backup_dir.join(package_name(now));
-            tar_package(staging, staging_name, &package)?;
+            tar_package_with_key(staging, staging_name, &package, key.as_ref())?;
             std::fs::remove_dir_all(staging)?;
             let deleted = enforce_retention(&cfg.backup_dir, cfg.keep_count);
             if let Some(dir) = &cfg.offsite_dir {
@@ -1630,38 +1678,15 @@ async fn finish_backup(
 async fn run_backup_into(
     cfg: &BackupConfig,
     staging: &Path,
+    sealed: bool,
 ) -> Result<BackupManifest, Box<dyn std::error::Error>> {
-    let secrets_dir = staging.join("secrets");
-    std::fs::create_dir_all(&secrets_dir)?;
-    // 两片各出一份 apply-able manifest。键名带上对象前缀：只列裸键名的话，
-    // 包清单读起来像"这些键都在一个对象里"，而恢复端是按对象 apply 的——
-    // 那句误读会在换机时才暴露。
-    let mut keys = Vec::new();
-    for (dir, object_name) in [
-        (&cfg.secrets_dir, SECRET_NAME_INTERNAL),
-        (&cfg.oob_secrets_dir, SECRET_NAME_OOB),
-    ] {
-        let (yaml, object_keys) = match build_secret_manifest(dir, &cfg.namespace, object_name) {
-            Ok(v) => v,
-            // 带外那份可能还没被创建过（全新安装、向导还没跑）：那不是备份失败，
-            // 包里少一份空对象而已。内部那份缺失是真问题（含实例指纹）。
-            Err(e) if object_name == SECRET_NAME_OOB => {
-                tracing::warn!(dir = %dir.display(), error = %e, "备份：带外凭证对象读不到，跳过该片");
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        let secret_file = secrets_dir.join(format!("{object_name}.yaml"));
-        std::fs::write(&secret_file, yaml)?;
-        // 打包沿用的是这个文件的权限，所以这里定成 0600：解包出来的那份清单
-        // 也就不会对别人可读，而不是只靠外面那层目录挡着。
-        restrict_to_owner(&secret_file, 0o600)?;
-        keys.extend(
-            object_keys
-                .into_iter()
-                .map(|k| format!("{object_name}/{k}")),
-        );
-    }
+    let keys = export_secret_manifests(
+        &cfg.secrets_dir,
+        &cfg.oob_secrets_dir,
+        &cfg.namespace,
+        &staging.join("secrets"),
+        sealed,
+    )?;
 
     // 每一段取完就盖一个时刻。写在每段之后而不是统一在开头取：要量的是「这段
     // 数据是什么时候被取走的」，不是「这一跑什么时候开始」。
@@ -1728,6 +1753,10 @@ async fn run_backup_into(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".into());
 
+    // 进包了没有，由导出的结果说，不由「有没有口令」再推一遍：带外那片可能还没
+    // 建过，那一趟虽然带着钥匙，包里也确实没有它的键。
+    let credentials_present = !keys.is_empty();
+
     Ok(BackupManifest {
         version: env!("CARGO_PKG_VERSION").to_string(),
         revision: env!("COGNEVA_GIT_REVISION").to_string(),
@@ -1741,7 +1770,7 @@ async fn run_backup_into(
         artifacts,
         image: std::env::var("COGNEVA_IMAGE_REF").unwrap_or_default(),
         schema_version: current_schema_version(),
-        lossy_surfaces: lossy_surfaces(evolution_bundle.is_some()),
+        lossy_surfaces: lossy_surfaces(evolution_bundle.is_some(), credentials_present),
         segments,
         max_segment_skew_seconds: bound,
         evolution_bundle,
@@ -1841,7 +1870,11 @@ fn check_segment_skew(manifest: &BackupManifest) -> Result<(), String> {
 ///
 /// `bundle_present` 是包里到底有没有那份进化 bare 仓的 git bundle：带了就不该
 /// 再把它列成损失，没带才是。这一格由出包时实测决定，不由这张表自己声称。
-fn lossy_surfaces(bundle_present: bool) -> Vec<LossySurface> {
+///
+/// `credentials_present` 同理：没有包级口令时两片 Secret 清单根本不进包（凭证
+/// 不往明文里抄），那就必须有一行说清换机后少了什么、怎么补回来——否则恢复端
+/// 只会看到 `secrets_keys` 是空的，而那和「老包当年没声明」是两种事。
+fn lossy_surfaces(bundle_present: bool, credentials_present: bool) -> Vec<LossySurface> {
     let mut surfaces: Vec<LossySurface> = [
         (
             "nats",
@@ -1888,6 +1921,17 @@ fn lossy_surfaces(bundle_present: bool) -> Vec<LossySurface> {
                         .to_string(),
             },
         );
+    }
+    if !credentials_present {
+        surfaces.push(LossySurface {
+            name: "credentials".to_string(),
+            lost: "两片 Secret 对象清单（`cogneva-secrets` / `cogneva-secrets-oob`）".to_string(),
+            acceptable_because:
+                "包不是密文时不把凭证抄进包：一份能读文件就拿走全部 token 的明文包，本身就是\
+                 新的凭证载体。换机后内部那片由安装脚本重新生成，带外那片（平台 token、\
+                 LLM 上游钥匙、git 私钥）由向导重新写入网关"
+                    .to_string(),
+        });
     }
     surfaces
 }
@@ -3919,6 +3963,42 @@ fn newest_package_key_mismatch(newest: &Path, keyed: bool) -> std::io::Result<Op
         .map(|reason| format!("{reason}（最新一份：{}）", newest.display())))
 }
 
+/// 明文包里有没有那两份 Secret 清单。
+///
+/// 加密包不问：解开它就要口令，能解的人本来就拿得到全部内容。这个问题只在明文包上
+/// 有意义，而且它判的是**载体身份**——包里的清单只是 base64，等于把「凭证只住在安全
+/// 网关里」这句话按盘上现存的字节推翻。写端没口令就不再导那两片，这条挡的是更早的
+/// 代码写下的、还在保留窗口里的那几份。
+fn plaintext_package_carrying_credentials(pkg: &Path) -> std::io::Result<Option<String>> {
+    if crate::backup_crypto::package_is_encrypted(pkg)? {
+        return Ok(None);
+    }
+    let file = std::fs::File::open(pkg)?;
+    let decoder = zstd::Decoder::new(file)?;
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let path = entry.path()?;
+        let in_secrets_dir = path
+            .components()
+            .any(|c| c.as_os_str() == std::ffi::OsStr::new("secrets"));
+        let is_manifest = path
+            .extension()
+            .is_some_and(|e| e == std::ffi::OsStr::new("yaml"));
+        if in_secrets_dir && is_manifest {
+            return Ok(Some(format!(
+                "卷上最新那份包是明文，里面带着 Secret 清单（{}）：能读这个文件的人就能拿走全部凭证。\
+                 写端现在没口令就不导这两片，盘上这一份是更早的代码写的——要么配 \
+                 COGNEVA_BACKUP_PACKAGE_KEY 让新包成为密文并清掉旧明文包，要么把这些凭证按已泄漏处理、\
+                 重新签发（最新一份：{}）",
+                path.display(),
+                pkg.display()
+            )));
+        }
+    }
+    Ok(None)
+}
+
 async fn drill_once(
     cfg: &DrillConfig,
     live: &PgPool,
@@ -3937,6 +4017,12 @@ async fn drill_once(
         // 而是要么读不了（报成「包坏了」），要么在 root 上照样读得动、永远沉默。
         // 所以这里把它判成红，阈值就是「最新那份的属主 = 此刻读它的 uid」。
         if let Some(reason) = package_owner_violation(newest) {
+            return Err(reason.into());
+        }
+        // 明文包里带着凭证清单 ＝ 卷上有一份能读文件就拿走全部 token 的副本。
+        // 写端已经不再这么写（没口令就不导那两片），这条判的是**盘上现存的**包：
+        // 改之前写出来的那几份还在窗口里，它们的载体身份不会因为写端改了而消失。
+        if let Some(reason) = plaintext_package_carrying_credentials(newest)? {
             return Err(reason.into());
         }
     }
@@ -5279,7 +5365,13 @@ mod tests {
         let pkg = out_dir
             .path()
             .join("cogneva-backup-20260914T000000Z.tar.zst");
-        tar_package(staging.path(), "cogneva-backup-20260914T000000Z", &pkg).unwrap();
+        tar_package_with_key(
+            staging.path(),
+            "cogneva-backup-20260914T000000Z",
+            &pkg,
+            None,
+        )
+        .unwrap();
 
         let extract = tempfile::tempdir().unwrap();
         let root = untar_package(&pkg, extract.path()).unwrap();
@@ -5288,6 +5380,113 @@ mod tests {
             b"a,b\n1,2\n"
         );
         assert!(root.join("manifest.json").exists());
+    }
+
+    /// 凭证只住在安全网关里，这条是从「包这个载体」这一侧守的：包不是密文，两片
+    /// Secret 清单就根本不进包。
+    ///
+    /// 没有这条时发生的事不是「少导出一份」，而是**多出两处凭证载体**：卷上一份、
+    /// 卷外副本一份，两份都只是 base64，能读文件的人拿走全部 token。0600 与 0700
+    /// 挡同机别的账号，挡不住拿到盘的人和 PVC 快照。清单里必须有对应的有损面，
+    /// 否则恢复端只会看到 `secrets_keys` 空着，把它读成「老包当年没声明」。
+    #[test]
+    fn credentials_stay_out_of_a_package_that_is_not_sealed() {
+        let internal = tempfile::tempdir().unwrap();
+        std::fs::write(internal.path().join("pg-password"), b"hunter2").unwrap();
+        std::fs::write(internal.path().join("jwt-secret"), b"jwt").unwrap();
+        let oob = tempfile::tempdir().unwrap();
+        std::fs::write(oob.path().join("github-token"), b"ghp_x").unwrap();
+
+        let plain = tempfile::tempdir().unwrap();
+        let out = plain.path().join("secrets");
+        let keys =
+            export_secret_manifests(internal.path(), oob.path(), "cogneva", &out, false).unwrap();
+        assert!(keys.is_empty(), "没加密就不该声明带了任何键：{keys:?}");
+        assert!(
+            !out.exists(),
+            "连那两行都不该落：一个空的 secrets/ 目录会读成「这一趟确实导过，只是没键」"
+        );
+        let surfaces = lossy_surfaces(true, false);
+        assert!(
+            surfaces.iter().any(|s| s.name == "credentials"),
+            "不导凭证必须被点名成有损面"
+        );
+
+        // 有口令时照常导出，两条路不能只有拦的那一半。
+        let sealed = tempfile::tempdir().unwrap();
+        let out = sealed.path().join("secrets");
+        let keys =
+            export_secret_manifests(internal.path(), oob.path(), "cogneva", &out, true).unwrap();
+        assert!(
+            keys.contains(&"cogneva-secrets/pg-password".to_string()),
+            "{keys:?}"
+        );
+        assert!(
+            keys.contains(&"cogneva-secrets-oob/github-token".to_string()),
+            "{keys:?}"
+        );
+        let yaml = std::fs::read_to_string(out.join("cogneva-secrets-oob.yaml")).unwrap();
+        assert!(yaml.contains("github-token: "), "{yaml}");
+    }
+
+    /// 明文包里带着凭证清单就是一份可读的凭证副本——判它的人得能从字节里看出来。
+    ///
+    /// 这条挡的是写端改动**之前**已经在盘上的那几份：它们的载体身份不会因为写端改了
+    /// 而消失，而保留窗口让它们再躺七晚。
+    #[test]
+    fn a_plaintext_package_carrying_credential_manifests_is_reported() {
+        use crate::backup_crypto::PackageKey;
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(staging.path().join("secrets")).unwrap();
+        std::fs::write(
+            staging.path().join("secrets/cogneva-secrets-oob.yaml"),
+            b"apiVersion: v1\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(staging.path().join("pg")).unwrap();
+        std::fs::write(staging.path().join("pg/public.t.csv"), b"a,b\n").unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        let plain = out.path().join("cogneva-backup-20261019T000000Z.tar.zst");
+        tar_package_with_key(
+            staging.path(),
+            "cogneva-backup-20261019T000000Z",
+            &plain,
+            None,
+        )
+        .unwrap();
+        let reason = plaintext_package_carrying_credentials(&plain)
+            .unwrap()
+            .expect("明文包里有 Secret 清单，必须报出来");
+        assert!(reason.contains("cogneva-secrets-oob.yaml"), "{reason}");
+
+        // 同一个 staging 打成密文包就不再是「可读的副本」：判据是包的形式，不是内容。
+        let sealed = out.path().join("cogneva-backup-20261020T000000Z.tar.zst");
+        let key = PackageKey::from_passphrase(b"a passphrase kept off this machine");
+        tar_package_with_key(
+            staging.path(),
+            "cogneva-backup-20261020T000000Z",
+            &sealed,
+            Some(&key),
+        )
+        .unwrap();
+        assert!(plaintext_package_carrying_credentials(&sealed)
+            .unwrap()
+            .is_none());
+
+        // 明文的业务包（没有凭证可抄）不该被这条拦：判据是「带着凭证」，不是「明文」。
+        std::fs::remove_dir_all(staging.path().join("secrets")).unwrap();
+        let clean = out.path().join("cogneva-backup-20261021T000000Z.tar.zst");
+        tar_package_with_key(
+            staging.path(),
+            "cogneva-backup-20261021T000000Z",
+            &clean,
+            None,
+        )
+        .unwrap();
+        assert!(plaintext_package_carrying_credentials(&clean)
+            .unwrap()
+            .is_none());
     }
 
     #[cfg(unix)]
@@ -5308,7 +5507,13 @@ mod tests {
         let pkg = out_dir
             .path()
             .join("cogneva-backup-20260914T000000Z.tar.zst");
-        tar_package(staging.path(), "cogneva-backup-20260914T000000Z", &pkg).unwrap();
+        tar_package_with_key(
+            staging.path(),
+            "cogneva-backup-20260914T000000Z",
+            &pkg,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             mode_of(&pkg),
             0o600,
@@ -5399,7 +5604,13 @@ mod tests {
         let pkg = out_dir
             .path()
             .join("cogneva-backup-20260914T000000Z.tar.zst");
-        tar_package(staging.path(), "cogneva-backup-20260914T000000Z", &pkg).unwrap();
+        tar_package_with_key(
+            staging.path(),
+            "cogneva-backup-20260914T000000Z",
+            &pkg,
+            None,
+        )
+        .unwrap();
 
         // zstd frame: 4 字节 magic，第 5 字节是 Frame_Header_Descriptor，其
         // bit2(0x04) 即 Content_Checksum_flag。默认不写，这里必须为 1——否则
@@ -5522,7 +5733,7 @@ mod tests {
             artifacts: Vec::new(),
             image: "registry.example/cogneva:test".into(),
             schema_version: 1,
-            lossy_surfaces: lossy_surfaces(false),
+            lossy_surfaces: lossy_surfaces(false, true),
             segments: stamps(&[
                 ("postgres", "2026-10-19T00:00:00Z"),
                 ("artifacts", "2026-10-19T00:00:10Z"),
@@ -5911,21 +6122,28 @@ mod tests {
     /// 问题留给下一个读包的人。
     #[test]
     fn every_lossy_surface_says_what_is_lost_and_why_it_is_ok() {
-        // 两种包都要说得清：带了 bundle 就不该再把进化仓列成损失，没带才是。
+        // 两种取值都要说得清：带了就不该再把那一格列成损失，没带才是。
         for bundle_present in [false, true] {
-            let surfaces = lossy_surfaces(bundle_present);
-            assert!(!surfaces.is_empty());
-            for s in &surfaces {
-                assert!(!s.name.is_empty());
-                assert!(!s.lost.is_empty(), "{} 没写丢了什么", s.name);
-                assert!(
-                    !s.acceptable_because.is_empty(),
-                    "{} 没写为什么可丢",
-                    s.name
+            for credentials_present in [false, true] {
+                let surfaces = lossy_surfaces(bundle_present, credentials_present);
+                assert!(!surfaces.is_empty());
+                for s in &surfaces {
+                    assert!(!s.name.is_empty());
+                    assert!(!s.lost.is_empty(), "{} 没写丢了什么", s.name);
+                    assert!(
+                        !s.acceptable_because.is_empty(),
+                        "{} 没写为什么可丢",
+                        s.name
+                    );
+                }
+                let named = surfaces.iter().any(|s| s.name == "evolution-bare-repo");
+                assert_eq!(named, !bundle_present, "bundle_present={bundle_present}");
+                let named = surfaces.iter().any(|s| s.name == "credentials");
+                assert_eq!(
+                    named, !credentials_present,
+                    "credentials_present={credentials_present}"
                 );
             }
-            let named = surfaces.iter().any(|s| s.name == "evolution-bare-repo");
-            assert_eq!(named, !bundle_present, "bundle_present={bundle_present}");
         }
     }
 
