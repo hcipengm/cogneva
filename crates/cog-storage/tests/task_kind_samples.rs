@@ -147,5 +147,111 @@ async fn the_duration_a_baseline_inherits_is_the_time_the_task_worked() {
     sqlx::query("DELETE FROM cog_dag_tasks")
         .execute(&pool)
         .await
-        .expect("leave the table as it was found");
+        .expect("leave the task table as it was found");
+    sqlx::query("DELETE FROM cog_observability_metrics")
+        .execute(&pool)
+        .await
+        .expect("leave the census as it was found");
+}
+
+/// A per-task cumulative census row: what this task has spent so far.
+async fn spent(pool: &PgPool, id: &str, total_tokens: i64) {
+    sqlx::query(
+        "INSERT INTO cog_observability_metrics
+             (task_id, total_tokens, prompt_tokens, completion_tokens,
+              tool_calls, iterations, duration_ms, timestamp)
+         VALUES ($1, $2, $2, 0, 0, 1, 0, NOW())
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(id)
+    .bind(total_tokens)
+    .execute(pool)
+    .await
+    .expect("write a census row");
+}
+
+/// The token axis counts its own samples; the duration axis counts its own.
+///
+/// A finished task with no census row is not a task that spent zero -- it is a
+/// task whose spend was recorded under an identity the graph never saw (the run
+/// id, before callers started stamping the owning task). Folding those into the
+/// token median as zeros would drag every kind's budget down, and taking the
+/// median over whatever few rows happen to carry a cost would set a whole
+/// kind's budget from one task. Both are the wrong number for a gate that
+/// refuses dispatch.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_budget_needs_its_own_samples_not_the_ones_that_finished() {
+    let pool = PgPool::connect(&database_url())
+        .await
+        .expect("connect to the test database");
+    let backend = PostgresStateBackend::new(pool.clone());
+    backend.init_schema().await.expect("create the task schema");
+    PostgresObservabilityGateway::new(pool.clone())
+        .init_schema()
+        .await
+        .expect("create the observability schema");
+    sqlx::query("DELETE FROM cog_dag_tasks")
+        .execute(&pool)
+        .await
+        .expect("clear the task table");
+    sqlx::query("DELETE FROM cog_observability_metrics")
+        .execute(&pool)
+        .await
+        .expect("clear the census");
+
+    // Five finished tasks of one kind, only one of which carries a cost.
+    for i in 0..5 {
+        finished(
+            &pool,
+            "ws-samples",
+            &format!("partly-costed-{i}"),
+            "partly_costed",
+            0,
+            600,
+            true,
+        )
+        .await;
+    }
+    spent(&pool, "partly-costed-0", 900_000).await;
+
+    // Five finished tasks of another kind, all costed.
+    for (i, tokens) in [100, 200, 300, 400, 500].into_iter().enumerate() {
+        let id = format!("costed-{i}");
+        finished(&pool, "ws-samples", &id, "costed", 0, 600, true).await;
+        spent(&pool, &id, tokens).await;
+    }
+
+    let records = backend
+        .task_kind_records("ws-samples", 5)
+        .await
+        .expect("read the samples");
+
+    let partly = records
+        .iter()
+        .find(|record| record.kind == "partly_costed")
+        .expect("五条量过工时的任务仍然给这一行：没有花销样本不等于没有工期");
+    assert_eq!(partly.samples, 5);
+    assert_eq!(
+        partly.median_tokens, 0,
+        "一条带账的样本不足以给整类定预算：预算是拿一件活的账当一整类的计划"
+    );
+
+    let costed = records
+        .iter()
+        .find(|record| record.kind == "costed")
+        .expect("五条带账的样本");
+    assert_eq!(
+        costed.median_tokens, 300,
+        "五条带账样本取中位，不是把没有账的那些折成 0 再取"
+    );
+
+    sqlx::query("DELETE FROM cog_dag_tasks")
+        .execute(&pool)
+        .await
+        .expect("leave the task table as it was found");
+    sqlx::query("DELETE FROM cog_observability_metrics")
+        .execute(&pool)
+        .await
+        .expect("leave the census as it was found");
 }

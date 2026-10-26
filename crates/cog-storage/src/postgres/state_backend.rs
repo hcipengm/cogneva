@@ -929,15 +929,23 @@ impl StateBackend for PostgresStateBackend {
         // 花销取清点表里那件任务自己的累计数，中位而不是均值：一件跑了三小时的
         // 活能把均值拉走一个量级，而排期要的是一个典型的量。
         //
+        // 两条轴各自数自己的样本，因为「跑完了」与「这件活花了多少」是两件事。
+        // 时长是从任务行自己量出来的，几乎每条跑完的行都有；花销要清点表里
+        // 有这件任务的一行，而那一行取决于调用方有没有把任务身份贴到请求上。
+        // 2026-10-26 之前的调用贴的是运行 id，于是 10.4 万行清点里只有 767 行
+        // 对得上任务图。如果只按「跑完了」的条数放行，一条带花销的样本就足以
+        // 给整类任务定预算——那是拿一件活的账去当一整类的计划，而预算闸会照
+        // 这个数把同类任务拦下。所以花销中位数要自己凑够 `$2` 条带账的样本，
+        // 凑不够时给 0，调用方按 0 读作「没有成本计划」。
+        //
         // 窗口是最近 30 天：平台上的任务大小随用途变化，五个月前的中位数拿来给
         // 今天排期，是拿旧世界的地图走新路。窗口内样本不够就不给这一行——没有
         // 估算比一个有旧估算的更好，前者读作「还没样本」，后者读作「量过了」。
         //
-        // 两条轴的门槛只压在样本数上，不压在花销上：清点表里没有这一类的行时，
-        // 中位花销是 0，而时长仍然是从任务行自己量出来的——那足以排一条甘特条。
-        // 把「有没有花销样本」也塞进 HAVING，会让整行连同工时一起消失，于是
-        // 清点表按运行 id 记的那些天里，一件活也排不上期。缺哪一条轴由调用方
-        // 按 0 处理（花销 0 读作「没有成本计划」）。
+        // 缺花销不让整行消失：清点表里没有这一类的行时，中位花销是 0，而时长
+        // 仍然是从任务行自己量出来的——那足以排一条甘特条。把「有没有花销样本」
+        // 也塞进 HAVING，会让整行连同工时一起消失，于是账本按运行 id 记的那些
+        // 天里，一件活也排不上期。
         let rows: Vec<(String, i64, i64, f64)> = self
             .retry(|| async {
                 sqlx::query_as(
@@ -955,17 +963,35 @@ impl StateBackend for PostgresStateBackend {
                          WHERE workspace_id = $1
                            AND status = 'completed'
                            AND updated_at > NOW() - INTERVAL '30 days'
+                    ),
+                    joined AS (
+                        SELECT d.kind,
+                               d.task_id,
+                               d.dur,
+                               m.total_tokens,
+                               (m.task_id IS NOT NULL) AS costed
+                          FROM done d
+                          LEFT JOIN cog_observability_metrics m ON m.task_id = d.task_id
+                    ),
+                    tally AS (
+                        SELECT kind,
+                               COUNT(DISTINCT task_id) FILTER (WHERE dur IS NOT NULL)::BIGINT AS samples,
+                               COUNT(DISTINCT task_id) FILTER (WHERE costed)::BIGINT AS cost_samples
+                          FROM joined
+                         GROUP BY kind
                     )
-                    SELECT d.kind,
-                           COUNT(DISTINCT d.task_id) FILTER (WHERE d.dur IS NOT NULL)::BIGINT AS samples,
+                    SELECT t.kind,
+                           t.samples,
+                           COALESCE((percentile_cont(0.5) WITHIN GROUP (
+                                         ORDER BY j.total_tokens)
+                                     FILTER (WHERE j.costed AND t.cost_samples >= $2))::BIGINT, 0)
+                               AS med_tokens,
                            COALESCE(percentile_cont(0.5) WITHIN GROUP (
-                                        ORDER BY m.total_tokens)::BIGINT, 0) AS med_tokens,
-                           COALESCE(percentile_cont(0.5) WITHIN GROUP (
-                                        ORDER BY d.dur), 0) AS med_secs
-                      FROM done d
-                      LEFT JOIN cog_observability_metrics m ON m.task_id = d.task_id
-                     GROUP BY d.kind
-                    HAVING COUNT(DISTINCT d.task_id) FILTER (WHERE d.dur IS NOT NULL) >= $2
+                                        ORDER BY j.dur), 0) AS med_secs
+                      FROM tally t
+                      JOIN joined j ON j.kind = t.kind
+                     GROUP BY t.kind, t.samples, t.cost_samples
+                    HAVING t.samples >= $2
                     "#,
                 )
                 .bind(workspace_id)
