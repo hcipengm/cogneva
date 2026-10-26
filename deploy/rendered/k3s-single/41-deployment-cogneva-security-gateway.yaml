@@ -282,6 +282,17 @@ spec:
                   name: cogneva-secrets-oob
                   key: clickhouse-password
                   optional: true
+            # 三个面真正**监听**的端口。进程只从这几个 env 取端口（缺省是代码里
+            # 的 8080/8081/8082），所以只改 values 而不传 env，挪动的就只有
+            # Service 与网络策略——进程仍停在旧端口上，Service 那头连过去的每一
+            # 个请求都被拒，读起来像网关挂了。容器端口、Service、策略与进程四者
+            # 同源，是这四条 env 存在的全部理由。
+            - name: COGNEVA_SG_EGRESS_PORT
+              value: "8080"
+            - name: COGNEVA_SG_LLM_PORT
+              value: "8081"
+            - name: COGNEVA_SG_WEBHOOK_PORT
+              value: "8082"
             # 观测通道监听端口；与容器端口同源 values，避免两处漂移。
             - name: COGNEVA_SG_METRICS_PORT
               value: "9090"

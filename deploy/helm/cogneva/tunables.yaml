@@ -1630,21 +1630,26 @@ rows:
     source: fixed
     why: >-
       The gateway's egress proxy (container port name egress-proxy): git
-      transport and platform API passthrough. An address.
+      transport and platform API passthrough. An address, and a listened-on one:
+      the process takes it from COGNEVA_SG_EGRESS_PORT, so the chart passes that
+      env from this same key -- without it a moved value would move the Service
+      and leave the process on the old port.
 
   - key: securityGateway.llmProxyPort
     source: fixed
     why: >-
       The gateway's LLM proxy (container port name llm-proxy), which also
       carries the /github, /gitee, /git and /search-fallback routes. An address,
-      written into nine base URLs across the app and evolution pods.
+      written into nine base URLs across the app and evolution pods, and the
+      port the process itself binds (COGNEVA_SG_LLM_PORT, passed from here).
 
   - key: securityGateway.webhookPort
     source: fixed
     why: >-
       The gateway's platform webhook entry (container port name webhook), where
       GitHub and Gitee signatures are verified before anything is forwarded. An
-      address.
+      address, and the port the process binds (COGNEVA_SG_WEBHOOK_PORT, passed
+      from here).
 
   - key: backends.postgres.port
     source: fixed

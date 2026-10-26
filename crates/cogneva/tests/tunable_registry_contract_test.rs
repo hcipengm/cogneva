@@ -596,3 +596,174 @@ async fn every_reading_a_tunable_lands_on_says_where_its_value_came_from() {
         "no row lands on a published reading, so this test checked nothing"
     );
 }
+
+/// Ports a script outside the chart names, and where the chart keeps the same
+/// number.
+///
+/// `restore-from-package.sh` builds a Job of its own rather than rendering the
+/// chart, so it carries the data-plane ports a second time. A deployment that
+/// moves postgres's port leaves this path dialling the old one, and the failure
+/// it gets -- connection refused -- reads the same as a broken backup package.
+/// The script takes the port from an env var with the chart's value as the
+/// default; this test reads both so the default cannot drift away from the
+/// chart while every other gate stays green.
+#[test]
+fn a_script_outside_the_chart_defaults_to_the_charts_port() {
+    const SCRIPT: &str = "deploy/scripts/restore-from-package.sh";
+    let values: serde_yaml::Value = serde_yaml::from_str(&read(&repo_root().join(VALUES)))
+        .unwrap_or_else(|e| panic!("{VALUES} does not parse: {e}"));
+    let script = read(&repo_root().join(SCRIPT));
+
+    // The env var the script reads, and the chart leaf holding the same port.
+    let pairs = [
+        ("COGNEVA_PG_PORT", "backends.postgres.port"),
+        ("COGNEVA_QDRANT_PORT", "backends.qdrant.port"),
+    ];
+    let mut wrong = Vec::new();
+    for (var, key) in pairs {
+        let Some(expected) = leaf_at(&values, key).and_then(serde_yaml::Value::as_u64) else {
+            wrong.push(format!("{key} is not a numeric leaf of {VALUES}"));
+            continue;
+        };
+        // `VAR="${VAR:-5432}"` in any formatting: the default is what has to
+        // agree, and the script is free to write the assignment its own way.
+        let marker = format!("{var}:-");
+        let default = script.lines().find_map(|line| {
+            let rest = line.split(marker.as_str()).nth(1)?;
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<u64>().ok()
+        });
+        match default {
+            Some(port) if port == expected => {}
+            Some(port) => wrong.push(format!(
+                "{SCRIPT}: {var} defaults to {port} while {key} is {expected} -- a \
+                 deployment that moves the port would restore through the old one"
+            )),
+            None => wrong.push(format!(
+                "{SCRIPT}: {var} no longer reads a `${{VAR:-<port>}}` default, so \
+                 nothing here can tell whether it still points at {key} ({expected})"
+            )),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The three places a listened-on port has to agree: the process that binds it,
+/// the chart that opens it, and the static manifests that mirror the chart.
+const GATEWAY_CODE: &str = "crates/cog-gateway/src/security_gateway.rs";
+const GATEWAY_TEMPLATE: &str = "deploy/helm/cogneva/templates/security-gateway.yaml";
+const GATEWAY_K3S: &str = "deploy/k3s/gateway-deployment.yaml";
+
+/// The value written on the line after `- name: <env>` in `text`, if the entry
+/// reads a chart key. `None` means the entry is absent or writes a literal.
+fn env_value_line<'a>(text: &'a str, env: &str) -> Option<&'a str> {
+    let needle = format!("- name: {env}");
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() != needle {
+            continue;
+        }
+        // `value:`, `valueFrom:`, or a comment above the value: the entry is a
+        // handful of lines at most, and reading further would let a neighbouring
+        // entry answer for this one.
+        return lines
+            .by_ref()
+            .take(3)
+            .find(|candidate| candidate.trim_start().starts_with("value:"));
+    }
+    None
+}
+
+/// The dotted `values.yaml` path an env entry reads, e.g. `.Values.gateway.httpPort`.
+fn values_path(value_line: &str) -> Option<String> {
+    let rest = value_line.split(".Values.").nth(1)?;
+    let path: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+        .collect();
+    let path = path.trim_end_matches('.').to_string();
+    (!path.is_empty()).then_some(path)
+}
+
+/// A port the process listens on is opened by the chart and bound by the
+/// process, and those are two different numbers in two different places: the
+/// container port, the Service and the network policy are chart facts, while the
+/// binding is whatever the process is told. Moving the chart side alone leaves
+/// every connection refused by a gateway that is running perfectly -- the
+/// failure reads as "the gateway is down", and nothing on the page says the
+/// process never heard about the move.
+///
+/// So: every port the security gateway can be told about has to be told about,
+/// from a `values.yaml` key -- a literal in the template would just move the
+/// disagreement inside the chart -- and the static manifest has to carry the
+/// same number, because it is the parity baseline.
+#[test]
+fn a_port_the_gateway_listens_on_is_told_to_the_process_and_not_only_opened() {
+    let values: serde_yaml::Value = serde_yaml::from_str(&read(&repo_root().join(VALUES)))
+        .unwrap_or_else(|e| panic!("{VALUES} does not parse: {e}"));
+    let code = read(&repo_root().join(GATEWAY_CODE));
+    let template = read(&repo_root().join(GATEWAY_TEMPLATE));
+    let k3s = read(&repo_root().join(GATEWAY_K3S));
+
+    // Every port the process reads from the environment, with the default it
+    // falls back to when the chart says nothing.
+    let mut wrong = Vec::new();
+    let mut seen = 0;
+    for line in code.lines() {
+        let Some(rest) = line.split("env_u16(\"").nth(1) else {
+            continue;
+        };
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.starts_with("COGNEVA_") {
+            continue;
+        }
+        seen += 1;
+        let Some(value_line) = env_value_line(&template, &name) else {
+            wrong.push(format!(
+                "{GATEWAY_TEMPLATE} never passes {name}: the process binds its code \
+                 default, so a values key that moves this port moves the Service and \
+                 the policy and leaves the listener behind"
+            ));
+            continue;
+        };
+        let Some(key) = values_path(value_line) else {
+            wrong.push(format!(
+                "{GATEWAY_TEMPLATE}: {name} is passed as the literal `{}` rather than \
+                 read from {VALUES} -- the chart would then disagree with itself, \
+                 opening the container port from a key and binding a different number",
+                value_line.trim()
+            ));
+            continue;
+        };
+        let Some(port) = leaf_at(&values, &key).and_then(serde_yaml::Value::as_u64) else {
+            wrong.push(format!(
+                "{GATEWAY_TEMPLATE}: {name} reads `{key}`, which is not a numeric leaf \
+                 of {VALUES}"
+            ));
+            continue;
+        };
+        match env_value_line(&k3s, &name) {
+            Some(line) if line.trim() == format!("value: \"{port}\"") => {}
+            Some(line) => wrong.push(format!(
+                "{GATEWAY_K3S}: {name} is `{}` while {key} is {port} -- the parity \
+                 baseline would deploy a gateway listening somewhere else",
+                line.trim()
+            )),
+            None => wrong.push(format!(
+                "{GATEWAY_K3S} never passes {name}, so the static manifests bind \
+                 whatever the image defaults to while the chart binds {key}"
+            )),
+        }
+    }
+
+    assert!(
+        seen > 0,
+        "{GATEWAY_CODE} no longer reads a port from the environment, so this test \
+         stopped reading anything -- check that the ports are still env-driven \
+         before deleting it"
+    );
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

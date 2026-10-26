@@ -12,6 +12,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PKG="${1:-}"
 NS="${2:-cogneva}"
+# 数据面端口：与 chart 的 backends.*.port 是同一个事实。默认值就是 chart 的默认值；
+# 部署把端口挪过之后，恢复这条路要跟着挪——写死一个数时它会去连一个没人听的端口，
+# 而「连不上」与「包坏了」在恢复日志里读起来一样。
+PG_PORT="${COGNEVA_PG_PORT:-5432}"
+QDRANT_PORT="${COGNEVA_QDRANT_PORT:-6333}"
 if [ -z "$PKG" ] || [ ! -f "$PKG" ]; then
     echo "用法: $0 <cogneva-backup-*.tar.zst> [命名空间，默认 cogneva]" >&2
     exit 2
@@ -311,9 +316,9 @@ $EVOLUTION_AFFINITY
                   name: cogneva-secrets
                   key: pg-password
             - name: COGNEVA_DATABASE_URL
-              value: "postgres://cog_user:\$(PG_PASSWORD)@postgres.$NS.svc.cluster.local:5432/cogneva"
+              value: "postgres://cog_user:\$(PG_PASSWORD)@postgres.$NS.svc.cluster.local:$PG_PORT/cogneva"
             - name: COGNEVA_QDRANT_HTTP_URL
-              value: "http://qdrant.$NS.svc.cluster.local:6333"
+              value: "http://qdrant.$NS.svc.cluster.local:$QDRANT_PORT"
             # 出包那一代的镜像引用，只作对照：同一个 rev 可以有多个构建产物，
             # 拿它当身份会拦住合法恢复。
             - name: COGNEVA_IMAGE_REF
