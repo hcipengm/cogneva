@@ -1964,7 +1964,7 @@ async fn seed_cluster_registry(namespace: &str) -> Result<()> {
             namespace,
             "wait",
             "--for=condition=Available",
-            "deployment/cogneva-registry",
+            &format!("deployment/{}", cog_core::topology::REGISTRY),
             "--timeout=900s",
         ],
     )
@@ -1986,8 +1986,13 @@ async fn seed_cluster_registry(namespace: &str) -> Result<()> {
     // 抄下来的数写在今天是对的，chart 改了 `clusterRegistry.nodePort` 之后就把基镜像
     // 推进一个没人听的端口，而四部署 pin 的还是清单里那个新数——播种报成功、Pod 一直
     // ImagePullBackOff。读的是 kubelet 将要拨的同一个 Service，两处不可能分开。
-    let node_port =
-        declared_service_port(namespace, "cogneva-registry", "registry", "nodePort").await?;
+    let node_port = declared_service_port(
+        namespace,
+        cog_core::topology::REGISTRY,
+        "registry",
+        "nodePort",
+    )
+    .await?;
     let remote = format!("localhost:{node_port}/cogneva:local");
     let object = "localhost/cogneva:local";
     for attempt in 1..=3 {

@@ -40,6 +40,10 @@ pub const EVOLUTION: &str = "cogneva-evolution";
 pub const IMAGE_SERVER: &str = "cogneva-image-server";
 /// The DaemonSet that imports the image on every node.
 pub const IMAGE_DISTRIBUTOR: &str = "cogneva-image-distributor";
+/// The in-cluster container registry the base workloads pin their image to. Its
+/// Deployment and its Service carry the same name; the installer waits on the
+/// Deployment and reads the node port off the Service.
+pub const REGISTRY: &str = "cogneva-registry";
 
 /// The ConfigMap the running configuration is mounted from (`cogneva.json`).
 pub const CONFIG_CONFIGMAP: &str = "cogneva-json";
@@ -56,6 +60,9 @@ pub const SECRET_INTERNAL: &str = "cogneva-secrets";
 /// The out-of-band Secret: the only object carrying real upstream credentials,
 /// and the only one mounted into the security gateway alone.
 pub const SECRET_OOB: &str = "cogneva-secrets-oob";
+/// The namespace's ResourceQuota. The eval bench's Pods are written into it, so
+/// the name is one the code has to know rather than one it merely observes.
+pub const QUOTA: &str = "cogneva-quota";
 
 /// The namespace the chart declares (`global.namespace`). In-cluster code
 /// cannot read the chart, so this is the compiled-in copy; the installer reads

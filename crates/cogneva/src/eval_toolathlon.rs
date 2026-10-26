@@ -96,7 +96,7 @@ const PG_PASSWORD: &str = "camel";
 const PACK_IMAGE_REPO: &str = "toolathlon-pack";
 const PACK_IMAGE_TAG: &str = "latest";
 /// 声明节点端口的那只 Service。端口名与 bootstrap 播种时读的是同一个。
-const REGISTRY_SERVICE: &str = "cogneva-registry";
+const REGISTRY_SERVICE: &str = cog_core::topology::REGISTRY;
 /// postgres sidecar 的镜像。compose 写的是 `postgres:15`。
 const DEFAULT_PG_IMAGE: &str = "docker.io/library/postgres:15";
 
@@ -568,7 +568,7 @@ fn manifest(pod: &str, pack_image: &str, pg_image: &str, limits: &PodLimits) -> 
 }
 
 /// 命名空间那只额度：评测台的 Pod 与渲染集里的工作负载记在同一只上。
-const QUOTA_NAME: &str = "cogneva-quota";
+const QUOTA_NAME: &str = cog_core::topology::QUOTA;
 
 /// 一道题在额度上占多少。CPU 按千分之一核、内存按字节，都是整数——额度这一维
 /// 只需要比大小，浮点只会在这里制造一次"看起来相等"的误判。

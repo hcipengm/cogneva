@@ -49,12 +49,14 @@ fn declared() -> Vec<(&'static str, &'static str)> {
         ("Deployment", cog_core::topology::EVOLUTION),
         ("Deployment", cog_core::topology::IMAGE_SERVER),
         ("DaemonSet", cog_core::topology::IMAGE_DISTRIBUTOR),
+        ("Deployment", cog_core::topology::REGISTRY),
         ("ConfigMap", cog_core::topology::CONFIG_CONFIGMAP),
         ("ConfigMap", cog_core::topology::PROMPTS_CONFIGMAP),
         ("ConfigMap", cog_core::topology::EVOLUTION_CONFIG_CONFIGMAP),
         ("ConfigMap", cog_core::topology::ENV_CONFIGMAP),
         ("Secret", cog_core::topology::SECRET_INTERNAL),
         ("Secret", cog_core::topology::SECRET_OOB),
+        ("ResourceQuota", cog_core::topology::QUOTA),
     ]
 }
 
@@ -112,6 +114,7 @@ fn workloads_in(text: &str) -> Vec<(String, String)> {
         "Service",
         "ConfigMap",
         "Secret",
+        "ResourceQuota",
     ];
     let lines: Vec<&str> = text.lines().collect();
     for (i, line) in lines.iter().enumerate() {
