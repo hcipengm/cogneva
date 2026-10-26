@@ -31,21 +31,26 @@ import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, ViewFrame
  * 项目面：一个项目 ＝ 任务图里的一个 goal 根连同它的后代。
  *
  * 四个视图读的是同一族端点，回答四个不同的问题：
- *   范围：这活被拆成了什么形状；
- *   看板：这些活现在堆在哪个状态上；
- *   甘特：各自什么时候开始、什么时候动过，有没有计划可以对照；
- *   挣值：做得比计划的快还是慢、比预算的省还是费。
+ *   范围（WBS，工作分解结构）：这活被拆成了什么形状、挂在谁下面；
+ *   看板（Kanban）：这些活现在堆在哪个状态上、每列的上限拦没拦住新活；
+ *   甘特图（Gantt）：各自什么时候开始、什么时候动过，有没有计划可以对照；
+ *   挣值（EVM，挣值管理）：做得比计划的快还是慢、比预算的省还是费。
+ *
+ * 中文名是意译，认不出这是行业里哪张图；英文名是通用叫法，认不出这页在说什么。
+ * 两个都写。
  *
  * 没有第二个任务清单。这里的每个数都是任务图的一个投影，现读现算——另存一份
  * 派生值，两份迟早不一致，而读面上分不出哪一份是错的。
  */
 type Mode = 'wbs' | 'board' | 'gantt' | 'evm';
 
+// 四个按钮各带原本的英文名。中文名是意译，靠它认不出这是行业里那张图；英文名是
+// 通用叫法，靠它认不出这页在说什么。两个一起写，读者才不用先在脑子里做一次翻译。
 const MODES: { id: Mode; label: string }[] = [
-  { id: 'wbs', label: '范围' },
-  { id: 'board', label: '看板' },
-  { id: 'gantt', label: '甘特' },
-  { id: 'evm', label: '挣值' },
+  { id: 'wbs', label: '范围 WBS' },
+  { id: 'board', label: '看板 Kanban' },
+  { id: 'gantt', label: '甘特图 Gantt' },
+  { id: 'evm', label: '挣值 EVM' },
 ];
 
 export function ProjectsView() {
@@ -300,7 +305,7 @@ function FreshNodeChanges({ rows, what }: { rows: LiveTaskRow[]; what: string })
 function ScopePanel({ project }: { project: ProjectRow }) {
   const ungrouped = project.kind === 'ungrouped';
   const graph = useResource(
-    ungrouped ? '未分组的任务' : `范围树（${project.id}）`,
+    ungrouped ? '未分组的任务' : `范围树 WBS（${project.id}）`,
     () => getTaskGraph(ungrouped ? {} : { goal_id: project.id }),
     15_000
   );
