@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { getClusterComponents, getClusterOverview, getSupervisorStatus, type ClusterOverview } from '@/api/client';
 import { useResource, type Resource } from '@/hooks/useResource';
+import { useStreamDrivenRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { EventsBoard } from '@/observability/EventsBoard';
 import { LogsBoard } from '@/observability/LogsBoard';
 import { MetricsBoard } from '@/observability/MetricsBoard';
@@ -45,6 +46,12 @@ const BOARDS: { id: BoardId; label: string; what: string }[] = [
 export function ObservabilityView() {
   const [board, setBoard] = useState<BoardId>('overview');
   const overview = useResource('集群概况', getClusterOverview, 20_000);
+  // 这一面的数（在岗智能体、活动任务、失败数）全是总线上那几种帧算出来的：执行者
+  // 一起来、一停，任务一换状态，告警一越线，这里就该变。只靠 20 秒一拍，把间隔
+  // 调成十分钟后，屏幕上「在岗 3」会一直是 3，而平台早就换了一拨人。
+  //
+  // 帧只是触发器：重读的是服务端现算的那一份，不是拿帧去改数。
+  useStreamDrivenRefresh(overview.refresh);
   const o = overview.data;
 
   return (
@@ -101,6 +108,9 @@ function OverviewBoard({ overview }: { overview: Resource<ClusterOverview> }) {
   const setActivity = useShell((s) => s.setActivity);
   const supervisor = useResource('监管者状态', getSupervisorStatus, 20_000);
   const components = useResource('工作负载存活', getClusterComponents, 30_000);
+  // 三块并排，变的原因常常是同一件事（一次派发让监管者多了一批要管的、让工作负载
+  // 多起一个 Pod），所以一起重读——分两次读，画面会先变一半再变另一半。
+  useStreamDrivenRefresh([supervisor.refresh, components.refresh]);
 
   const o = overview.data;
   const s = supervisor.data;

@@ -17,6 +17,7 @@ import { useLiveAlertStore } from '@/store/liveAlertStore';
 import { useLiveCommsStore } from '@/store/liveCommsStore';
 import { useLiveProjectStore } from '@/store/liveProjectStore';
 import { useLivePulseStore } from '@/store/livePulseStore';
+import { useFrameTickStore } from '@/store/frameTickStore';
 import type { AgentEvent } from '@/types/events';
 import type { NotificationItem } from '@/api/client';
 
@@ -91,6 +92,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
   const noteCommsFrame = useLiveCommsStore((state) => state.noteFrame);
   const noteProjectTaskFrame = useLiveProjectStore((state) => state.noteFrame);
   const noteArrival = useLivePulseStore((state) => state.noteArrival);
+  const noteFaceTick = useFrameTickStore((state) => state.note);
   /** 每个 agent 正在流的那一条消息（agent_id → 画布上的消息 id）。 */
   const streaming = useRef(new Map<string, string>());
 
@@ -117,6 +119,14 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       // 就变成了替这一帧编一个它没做过的改动。
       let changedState = false;
 
+      // 这一帧有没有改动**读快照的那几面**（任务、流程、项目、观测）。
+      //
+      // 与 `changedState` 分开：那个还包含画布上正在流的那条消息、一次工具调用的
+      // 开始与结束——它们改动的是逐帧渲染的面，不该让集群概况跟着每两秒重读一次。
+      // 这里只在「平台的状态真的变了」时置位（执行者换态、告警越线、交接推进、任务
+      // 换状态、项目面那四条边），也就是 REST 快照会算得不一样的那几种。
+      let changedPolledFace = false;
+
       // 执行者这一面：状态帧改状态、心跳只推「还在」的那一刻（两件不同的事，
       // 见 store/liveAgents.ts）。名单面每 15 秒才重读一次快照，没有这一折，
       // 一个刚起来的执行者要等下一拍才出现在「在岗名单」上。
@@ -126,6 +136,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
         // 心跳按构造不入账（下面会提前返回），它的「改了态」不落在时间轴上，
         // 所以这里只给会落点的那几类置位。
         if (event.type !== 'heartbeat' && liveAgent.state !== null) changedState = true;
+        if (liveAgent.state !== null) changedPolledFace = true;
       }
 
       // 告警这一面：活跃告警表每 30 秒才重读一次，而 `resource_alert` 一直在总线上。
@@ -135,6 +146,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       if (liveAlert) {
         noteAlertFrame(liveAlert);
         changedState = true;
+        changedPolledFace = true;
       }
 
       // 通信这一面：交接图每 15 秒才重读一次，而让图长出边的那些结局一直在总线上。
@@ -144,6 +156,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       if (liveComms) {
         noteCommsFrame(liveComms);
         changedState = true;
+        changedPolledFace = true;
       }
 
       // 项目这一面：范围、看板、甘特、挣值四张屏都是每 15 秒重读一次的快照，而
@@ -154,6 +167,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       if (liveProjectTask) {
         noteProjectTaskFrame(liveProjectTask);
         changedState = true;
+        changedPolledFace = true;
       }
 
       switch (event.type) {
@@ -210,6 +224,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
           if (!taskId || status === 'hook_event') break;
           noteTaskStatus({ taskId, status, at: event.timestamp });
           changedState = true;
+          changedPolledFace = true;
           break;
         }
         default:
@@ -231,6 +246,13 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
       if (changedState) fed.push('state');
       recordActivity(entry);
       noteFrame({ ...entry, fed });
+
+      // 读快照的那几面在这里被告知「有东西变了」，它们据此立刻重读一次。
+      //
+      // 位置在这三种提前返回之后：心跳与正文增量按构造高频（每个 token 一帧），
+      // 让它们触发重读，等于把轮询换成一种更密的轮询，而它们改的是画布上正在流
+      // 的那一条消息，那一面本来就是逐帧渲染的。
+      if (changedPolledFace) noteFaceTick();
     };
 
     const channels = channelKey ? channelKey.split(',') : [];
@@ -279,6 +301,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
     noteCommsFrame,
     noteProjectTaskFrame,
     noteArrival,
+    noteFaceTick,
   ]);
 
   return { clientRef };

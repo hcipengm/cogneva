@@ -780,6 +780,14 @@ jobs:
       # 有自己的一口钟（只靠帧触发重渲染，读数会永远停在「刚刚」）。
       - name: Check the status bar can tell a stalled bus from a quiet platform
         run: bash deploy/scripts/check-web-live-pulse.sh
+      # 上面几条判的是「某一面折了帧、画了帧」。这一条判的是**读快照的那几面**
+      # （观测面的概况、监管者、工作负载）：它们一直只靠 20 秒一拍，帧到了也不重读，
+      # 把间隔调成十分钟，屏幕上「在岗 3」就一直是 3。接法有三种，两种坏——每帧都读
+      # （忙时同一份字节连取几十遍）与纯尾随去抖（帧不停则定时器永不到点，比轮询
+      # 还旧）。这一步判调度是前沿 + 地板，并把「十秒突发里读了几次」编译出来实跑：
+      # 既不许一次不读，也不许按帧数读。
+      - name: Check the polling faces re-read when a frame says something changed
+        run: bash deploy/scripts/check-web-stream-driven-refresh.sh
 
   entry-scripts:
     name: Entry Scripts Lint
