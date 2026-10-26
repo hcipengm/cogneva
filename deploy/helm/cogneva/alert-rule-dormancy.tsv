@@ -17,6 +17,15 @@
 #   exporter_version  the source binary's version does not expose the family
 #   series_renamed    upstream renamed/removed the series; the rule needs a fix
 #   known_defect      a defect that is declared, with the fix named in why
+#   lazy_counter      the counter is created on the first bad event; empty means
+#                     none happened, not that the rule is dead
+#   error_only_state  the family is exported only while the bad state exists
+#   code_not_deployed the code that emits it is newer than the running image;
+#                     the family appears with the next roll
+#
+# The last three are shared by every layer the witness reads (Prometheus, the
+# in-process `infra_watch` rules); the seven above them are the ones a single
+# layer can tell apart on its own.
 #
 # The witness reading (`scripts/host/cogneva-alert-rule-witness-reading.sh` in
 # the private companion repository) treats an absent series without a row here as red.
@@ -67,3 +76,6 @@ NodeRAIDDegraded	node_md_disks,node_md_disks_required	object_absent	The mdadm co
 NodeRAIDDiskFailure	node_md_disks	object_absent	Same collector and same reason as NodeRAIDDegraded: mdadm runs (success=1) and exports per-disk state once an array exists; this host has none.
 NodeSystemdServiceCrashlooping	node_systemd_service_restart_total	collector_off	The systemd collector is the one opt-in collector among the three: node_scrape_collector_success has no series for it at all, and enabling it needs --collector.systemd plus the host dbus socket mounted into the pod. Turning it on can make node-exporter fail to start, so it is a deployment decision, not a flip.
 NodeSystemdServiceFailed	node_systemd_unit_state	collector_off	Same opt-in collector as NodeSystemdServiceCrashlooping; absent from node_scrape_collector_success means it was never asked to run.
+
+# --- error_only_state (1 rule): the family exists only while the state does --
+KubeNodeUnreachable	kube_node_spec_taint	error_only_state	kube-state-metrics exports one series per taint, so this family is empty while no node carries one -- and the exporter is demonstrably up, because kube_node_spec_unschedulable from the same node spec collector reads 1 here. Absent is the state, not the collector: the taint that makes a node unreachable is what creates the series, and the rule reads it from that moment.
