@@ -561,6 +561,14 @@ jobs:
       # 新写的一条要么说清是谁的数（实测／本机／默认／例如），要么写机制与比例。
       - name: Check comments state whose capacity they quote
         run: bash deploy/scripts/check-comment-capacity-figures.sh
+      # 跑在共享测试库上的测试，不许把整张表数一遍。`COGNEVA_TEST_DATABASE_URL`
+      # 把整个套件指向同一份库，整表数行数等于断言「别的测试此刻有没有行」；
+      # 而且踩中的那一跑常常 panic 在自己的 cleanup 之前，把它写的行留在库里，
+      # 之后每一跑都红成同一个数（2026-10-26 实测 `left: 4, right: 2`）。
+      # 判的是形状不是方法名：读的是整表、数的是行数、收窄与清表都没有。
+      # 白名单只有一条且是被测出来的：每一跑自建自拆 schema 的文件（实测 5 个）。
+      - name: Check shared-database tests do not count the whole table
+        run: python3 deploy/scripts/check-shared-test-db-counts.py
       # README 里点名的源码路径必须存在。死在正文里的路径不会让任何东西失败——
       # 文件搬了家，正文照常渲染成一句看着完整的说明，只有读者照着去开文件才发现
       # 是个死指针。判的是反引号括起来、带扩展名的串（口径见脚本头部）。
