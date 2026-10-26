@@ -127,6 +127,27 @@ pub struct SquadState {
     pub updated_at: DateTime<Utc>,
 }
 
+/// The header a hop copies verbatim so the next process continues the trace.
+///
+/// Spelled here rather than at each writer: this crate stamps it on outbound
+/// calls, the gateway stamps it on its own, and the trace store reads it back
+/// off the wire. A hop that renames one copy writes a header nobody reads, and
+/// the chain simply ends there -- what the operator sees is a shorter trace,
+/// which is exactly what a request that never left would look like. Nothing
+/// errors, so the three sides only move together if they share a name.
+pub const TRACEPARENT_HEADER: &str = "traceparent";
+
+/// See [`TRACEPARENT_HEADER`]. The in-house pair below carries the same ids for
+/// hops that predate `traceparent`; they are read as a fallback, in the same
+/// way, so a rename is equally silent.
+pub const TRACE_ID_HEADER: &str = "x-trace-id";
+
+/// See [`TRACEPARENT_HEADER`].
+pub const SPAN_ID_HEADER: &str = "x-span-id";
+
+/// See [`TRACEPARENT_HEADER`].
+pub const PARENT_SPAN_ID_HEADER: &str = "x-parent-span-id";
+
 /// Active trace context for a single request/task.
 /// Carried through the async call stack and injected into:
 /// - AgentEvent metadata
@@ -233,13 +254,13 @@ impl TraceContext {
 
     pub fn to_headers(&self) -> HashMap<String, String> {
         let mut h = HashMap::new();
-        h.insert("x-trace-id".into(), self.trace_id.clone());
-        h.insert("x-span-id".into(), self.span_id.clone());
+        h.insert(TRACE_ID_HEADER.into(), self.trace_id.clone());
+        h.insert(SPAN_ID_HEADER.into(), self.span_id.clone());
         if let Some(tp) = self.to_traceparent() {
-            h.insert("traceparent".into(), tp);
+            h.insert(TRACEPARENT_HEADER.into(), tp);
         }
         if let Some(ref p) = self.parent_span_id {
-            h.insert("x-parent-span-id".into(), p.clone());
+            h.insert(PARENT_SPAN_ID_HEADER.into(), p.clone());
         }
         h
     }
@@ -250,18 +271,18 @@ impl TraceContext {
     /// wrote, so it names the trace this request belongs to. The bare
     /// `x-trace-id` pair is the in-house fallback for hops that predate it.
     pub fn from_headers(headers: &HashMap<String, String>) -> Option<Self> {
-        if let Some(tp) = headers.get("traceparent") {
+        if let Some(tp) = headers.get(TRACEPARENT_HEADER) {
             if let Some(mut ctx) = Self::from_traceparent(tp) {
-                ctx.parent_span_id = headers.get("x-parent-span-id").cloned();
+                ctx.parent_span_id = headers.get(PARENT_SPAN_ID_HEADER).cloned();
                 return Some(ctx);
             }
         }
-        let trace_id = headers.get("x-trace-id")?;
-        let span_id = headers.get("x-span-id")?;
+        let trace_id = headers.get(TRACE_ID_HEADER)?;
+        let span_id = headers.get(SPAN_ID_HEADER)?;
         Some(Self {
             trace_id: trace_id.clone(),
             span_id: span_id.clone(),
-            parent_span_id: headers.get("x-parent-span-id").cloned(),
+            parent_span_id: headers.get(PARENT_SPAN_ID_HEADER).cloned(),
             sampled: true,
         })
     }

@@ -532,10 +532,19 @@ macro_rules! evaluate_span {
 /// Callers (e.g. cog-gateway) apply these to their HTTP client.
 pub fn trace_headers(ctx: &TraceContext) -> HashMap<String, String> {
     let mut h = HashMap::new();
-    h.insert("x-trace-id".into(), ctx.trace_id.clone());
-    h.insert("x-span-id".into(), ctx.span_id.clone());
+    h.insert(
+        cog_core::contract::observability::TRACE_ID_HEADER.into(),
+        ctx.trace_id.clone(),
+    );
+    h.insert(
+        cog_core::contract::observability::SPAN_ID_HEADER.into(),
+        ctx.span_id.clone(),
+    );
     if let Some(ref parent) = ctx.parent_span_id {
-        h.insert("x-parent-span-id".into(), parent.clone());
+        h.insert(
+            cog_core::contract::observability::PARENT_SPAN_ID_HEADER.into(),
+            parent.clone(),
+        );
     }
     h
 }
