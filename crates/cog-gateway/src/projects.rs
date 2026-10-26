@@ -86,7 +86,70 @@ pub struct BoardResponse {
     pub project_id: String,
     pub columns: Vec<BoardColumn>,
     pub total: usize,
+    /// 这一台进程的上限是从哪来的。
+    ///
+    /// 每列的 `wip_limit` 全是 `null` 时，只看看板分不出两件事：「这台按设计
+    /// 不限流」与「这台上限没接上」。两者对读者的下一步完全相反——前者不用动，
+    /// 后者要去查部署——而 `null` 那一格把它们的形状抹成了同一个。所以把变量的
+    /// 原文带回来，让「没声明」自己说出来。
+    pub wip_limits: WipLimitsReading,
     pub source: Source,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WipLimitsReading {
+    /// 变量名。读者要拿它去查自己的部署，所以它不是文档里的一句话，是读数。
+    pub variable: String,
+    /// 这一台进程读到的原文；没设这个变量时是 `null`。
+    pub declared: Option<String>,
+    /// 声明了却用不上的条目，一条一行。它们不出现在任何一列的 `wip_limit`
+    /// 上，不点名就等于「配了、没生效、没人知道」。
+    pub refused: Vec<String>,
+    /// 一句话讲清现状：读者可能只看这一句。
+    pub basis: String,
+}
+
+impl WipLimitsReading {
+    /// `declared` 由调用方从环境读出后传进来，不在这里读：这一句判词的三档要
+    /// 能被逐档验，而一个只能靠设进程环境变量才验得了的判据，会和同进程里别的
+    /// 用例抢同一份环境。
+    fn read(
+        declared: Option<String>,
+        limits: &cog_core::BoardWipLimits,
+        refused: Vec<String>,
+    ) -> Self {
+        let variable = cog_core::config::BOARD_WIP_LIMITS_ENV.to_string();
+        let usable = limits.iter().count();
+        let basis = match &declared {
+            // 没声明与「声明了但一条都用不上」必须分开说：后者的看板与前者
+            // 逐格同形，而它是一次失败的配置，不是一次决定。
+            None => format!(
+                "没声明 {variable}：这台没有列上限，六列都不拦人。看板上的 `null` 是「没配」，不是「不限」也不是「没超」"
+            ),
+            Some(raw) if usable == 0 => format!(
+                "声明了 {variable}=`{raw}`，但一条都用不上{}：这台事实上没有列上限",
+                if refused.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{} 条被拒，见 refused）", refused.len())
+                }
+            ),
+            Some(raw) => format!(
+                "由 {variable}=`{raw}` 声明，其中 {usable} 条生效{}",
+                if refused.is_empty() {
+                    String::new()
+                } else {
+                    format!("、{} 条被拒（见 refused）", refused.len())
+                }
+            ),
+        };
+        Self {
+            variable,
+            declared,
+            refused,
+            basis,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -483,7 +546,7 @@ pub async fn project_board_handler(
     // 上限是本进程的环境配置，与发布侧读的是同一个变量、同一个解析：看板上
     // 写着的上限，就是拦住派发的那个数。
     let (limits, problems) = cog_core::BoardWipLimits::from_env();
-    for problem in problems {
+    for problem in &problems {
         tracing::warn!(
             variable = cog_core::config::BOARD_WIP_LIMITS_ENV,
             problem = %problem,
@@ -496,6 +559,11 @@ pub async fn project_board_handler(
         project_id: id,
         columns,
         total: rows.len(),
+        wip_limits: WipLimitsReading::read(
+            std::env::var(cog_core::config::BOARD_WIP_LIMITS_ENV).ok(),
+            &limits,
+            problems,
+        ),
         source: now_source("in-memory task graph"),
     }))
 }
@@ -1029,6 +1097,50 @@ mod tests {
         assert!(rows[0].unplanned);
         assert_eq!(rows[0].planned_start, None);
         assert_eq!(rows[0].planned_end, None);
+    }
+
+    /// 六列全是 `null` 有两种意思，读面必须分得开。
+    ///
+    /// 「这台没声明上限」与「这台声明了但一条都没接上」在每一格上逐字同形，
+    /// 前者不用动、后者要去查部署。哪一档被抹成另一档都不行：把没声明读成
+    /// 配好了，读的人会以为上限正在生效；把配坏了读成没声明，那一行错配置
+    /// 就永远没人看见。
+    #[test]
+    fn an_undeclared_limit_and_a_declaration_that_parsed_to_nothing_read_differently() {
+        // 一档：环境变量没设。
+        let (limits, refused) = cog_core::BoardWipLimits::from_spec("");
+        let unset = WipLimitsReading::read(None, &limits, refused);
+        assert_eq!(unset.declared, None);
+        assert!(
+            unset.basis.contains("没声明") && unset.basis.contains("六列都不拦人"),
+            "没设变量要自己说出来：{}",
+            unset.basis
+        );
+
+        // 另一档：设了，但四个条目一条都用不上（0 不许、pending 不许、终态不许、
+        // 拼错的列名不许）。
+        let raw = "running=0,pending=4,completed=9,runnning=2";
+        let (limits, refused) = cog_core::BoardWipLimits::from_spec(raw);
+        assert_eq!(limits.iter().count(), 0, "这一档要真的解析不出任何上限");
+        assert_eq!(refused.len(), 4);
+        let broken = WipLimitsReading::read(Some(raw.into()), &limits, refused);
+        assert_eq!(broken.declared.as_deref(), Some(raw));
+        assert!(
+            broken.basis.contains("一条都用不上") && !broken.basis.contains("没声明"),
+            "配坏了不能读成没声明：{}",
+            broken.basis
+        );
+        assert_eq!(
+            broken.refused.len(),
+            4,
+            "被拒的条目要点名，否则「配了、没生效」不可见"
+        );
+
+        // 第三档：声明生效。这一档不许带「都用不上」或「没声明」的措辞。
+        let (limits, refused) = cog_core::BoardWipLimits::from_spec("running=4");
+        let live = WipLimitsReading::read(Some("running=4".into()), &limits, refused);
+        assert!(live.basis.contains("1 条生效"), "{}", live.basis);
+        assert!(live.refused.is_empty());
     }
 
     fn plan(task_id: &str, tokens: u64) -> cog_core::TaskPlan {

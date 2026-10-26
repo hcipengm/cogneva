@@ -501,6 +501,25 @@ function BoardPanel({ project }: { project: ProjectRow }) {
           </div>
         ))}
       </div>
+      {/* 六列全写「没配上限」时，这两件事在格子里逐字同形：这一台按设计不限流，
+          与这一台的上限没接上。前者不用动，后者要去查部署，所以让来源自己说话。 */}
+      <div className="border-b border-[var(--line)] px-4 py-2 text-[11px]">
+        <span className="text-[var(--muted)]">上限来源：</span>
+        <span
+          className={
+            data.wip_limits.refused.length > 0 ? 'text-[var(--danger)]' : 'text-[var(--paper-dim)]'
+          }
+        >
+          {data.wip_limits.basis}
+        </span>
+        {data.wip_limits.refused.length > 0 && (
+          <ul className="mt-1 list-disc pl-5 text-[10px] text-[var(--danger)]">
+            {data.wip_limits.refused.map((p) => (
+              <li key={p}>{p}</li>
+            ))}
+          </ul>
+        )}
+      </div>
       <div className="px-4 py-2 text-[11px] text-[var(--muted)]">
         上限是准入控制，不是画在列头的红字：到达上限时，这一列的活不再派发，任务留在
         待办里等下一轮，所以「已超限」是这一列正在拦住新活的读数。上限由部署配置给出

@@ -1115,10 +1115,29 @@ export interface BoardColumn {
   over_limit: boolean | null;
 }
 
+/**
+ * 这一台进程的列上限是从哪来的。
+ *
+ * 六列的 `wip_limit` 全是 `null` 时，看板分不出「这台按设计不限流」与「这台上限
+ * 没接上」——两者对读者的下一步正相反。所以服务端把变量的原文带回来，让「没声明」
+ * 自己说出来，而不是留一格空白让人猜。
+ */
+export interface BoardWipLimitsReading {
+  /** 变量名。读者要拿它去查自己的部署。 */
+  variable: string;
+  /** 这一台读到的原文；没设这个变量时是 `null`。 */
+  declared: string | null;
+  /** 声明了却用不上的条目。它们不出现在任何一列上，不点名就等于「配了没人知道」。 */
+  refused: string[];
+  /** 一句话讲清现状。 */
+  basis: string;
+}
+
 export interface ProjectBoardReading {
   project_id: string;
   columns: BoardColumn[];
   total: number;
+  wip_limits: BoardWipLimitsReading;
   source: ReadingSource;
 }
 
