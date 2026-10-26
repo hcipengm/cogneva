@@ -1205,6 +1205,18 @@ board:
 webSearch:
   enabled: true
   base: "http://searxng:8080"
+  # 后备检索端点：`POST {fallbackBase}/search`，只在自建的 SearXNG **一个引擎都没
+  # 应答**时才问它（结果为空且 `unresponsive_engines` 非空，重试一次仍如此）。
+  # 那一刻自建那层什么都没答，所以这里不放弃任何它握着的东西；出网的就是 query
+  # 文本本身，没有第二样东西跟着出去。
+  #
+  # 空串＝这个部署选择让查询永不外发。那时全沉默的结局是「没有答案」，而不是一个
+  # 用别处的检索冒充的答案——两种结局在读数上不同，选哪种是运营者的决定。
+  #
+  # 指向安全网关而不是公网：后备要带 key 时，key 只住在网关里（业务 Pod 零持有），
+  # 且网关的出站主机是一个常量，调用方给的路径拼不进去。keyless 档不需要账号，
+  # 代价是额度与公众共用——它恰好会在最需要一条后备的时候被限流。
+  fallbackBase: "http://cogneva-security-gateway:8081/search-fallback"
   image: docker.io/searxng/searxng:2026.9.8-3fdc6d753
   replicas: 1
   resources:

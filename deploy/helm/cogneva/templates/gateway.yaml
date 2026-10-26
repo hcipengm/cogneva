@@ -168,6 +168,13 @@ spec:
             # 与进化 Pod 同源同名，少一条就有一面的 `web_search` 用不了。
             - name: COGNEVA_WEB_SEARCH_BASE
               value: {{ .Values.webSearch.base | quote }}
+            # 检索的后备端点（安全网关的 /search-fallback 透传）：只在自建 SearXNG 一个
+            # 引擎都没应答时才问。空值＝查询永不外发，这个部署选择的是「没有
+            # 答案」而不是用别处冒充。
+            {{- if .Values.webSearch.fallbackBase }}
+            - name: COGNEVA_WEB_SEARCH_FALLBACK_BASE
+              value: {{ .Values.webSearch.fallbackBase | quote }}
+            {{- end }}
             # 网页抓取的渲染后端（集群内 Crawl4AI）：本进程里的 agent 循环用它。
             # 空值＝本进程读 HTML，客户端渲染的页面只能拿回空壳。
             {{- if .Values.webFetch.enabled }}

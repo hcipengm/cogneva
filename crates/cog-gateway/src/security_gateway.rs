@@ -127,6 +127,16 @@ pub struct SecurityGatewayConfig {
     /// Gitee API 透传出口注入的 token（COGNEVA_GITEE_TOKEN），以
     /// `access_token` query 参数注入（Gitee API v5 官方认证方式）。
     pub gitee_token: Option<String>,
+    /// 检索后备的带外 key（COGNEVA_SG_SEARCH_FALLBACK_KEY）。未配置时后备走
+    /// keyless 那一档——不需要账号，但额度是与公众共用的一个池，而它恰好会在
+    /// 「自建层全沉默、最需要一条后备」的时候被限流：那种时候全世界都在问。
+    /// 配了 key 就把额度变成这个部署自己的。key 发往哪台主机由
+    /// [`TAVILY_SEARCH_UPSTREAM`] 那一行常量决定，与调用方无关。
+    ///
+    /// 部署侧的名字是厂商中立的，这一侧的名字不是：清单是**业务侧**配置，
+    /// 它不该点名上游是谁（换上游应当只是网关的一个常量），而挑上游这件事正是
+    /// 在这个文件里发生的，所以身份信息只留在这一侧。
+    pub tavily_api_key: Option<String>,
     /// Gitee OAuth App 凭证（COGNEVA_GITEE_OAUTH_CLIENT_ID / _SECRET）：贡献
     /// 通道授权码兑换的唯一起点。业务 Pod 零持有，主应用只经 `/v1/oauth/gitee/*`
     /// 借用；两者缺一即 fail-closed，授权码通道不可用（手动令牌通道不受影响）。
@@ -251,6 +261,7 @@ impl SecurityGatewayConfig {
             llm_health_probe_secs: env_u64("COGNEVA_LLM_HEALTH_PROBE_SECS", 300),
             github_token: token("COGNEVA_GITHUB_TOKEN"),
             gitee_token: token("COGNEVA_GITEE_TOKEN"),
+            tavily_api_key: token("COGNEVA_SG_SEARCH_FALLBACK_KEY"),
             gitee_oauth_client_id: token("COGNEVA_GITEE_OAUTH_CLIENT_ID"),
             gitee_oauth_client_secret: token("COGNEVA_GITEE_OAUTH_CLIENT_SECRET"),
             github_oauth_client_id: token("COGNEVA_GITHUB_OAUTH_CLIENT_ID"),
@@ -6727,6 +6738,106 @@ async fn code_platform_forward(
         .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())))
 }
 
+// ─── 检索后备 ─────────────────────────────────────────────────
+
+/// 检索后备的上游，整个出站 URL 就是这一个字符串。
+///
+/// 这里比 [`code_platform_url`] 还紧一档：那边至少要把调用方给的 path 拼上去，
+/// 这边连 path 都不拼。调用方给的东西只进**请求体**，所以没有任何输入能改变
+/// 出站主机——不是"拼完之后解析出来还是这台主机"，而是这台主机根本没有第二个
+/// 可能的来源。
+const TAVILY_SEARCH_UPSTREAM: &str = "https://api.tavily.com/search";
+
+/// 出站认证头：配了 key 就带 key，没配就带 keyless 标记，两者不同时出现。
+///
+/// 两者必须互斥：一条请求上同时挂着两种认证方式，"这条路这次花的是谁的额度"
+/// 在读日志时就没有答案，而额度正是加 key 的唯一理由。
+///
+/// key 只在这一处出现，出站主机由 [`TAVILY_SEARCH_UPSTREAM`] 决定，所以一把
+/// key 加进这个部署，不会多出任何一个可能的接收方。
+fn tavily_auth_headers(key: Option<&str>) -> Vec<(&'static str, String)> {
+    match key.map(str::trim).filter(|k| !k.is_empty()) {
+        Some(key) => vec![("authorization", format!("Bearer {key}"))],
+        None => vec![("x-tavily-access-mode", "keyless".to_string())],
+    }
+}
+
+/// 这条路由放不放行。只认 `POST` 且路径归一化后恰好是 `search`。
+///
+/// 归一化的意思是把两头的斜杠去掉再比：`/search-fallback/search`、`/search-fallback//search`、
+/// `/search-fallback/search/` 都算同一个东西，而 `/search-fallback/search/../x`、`/search-fallback/../x`
+/// 这类要往上走的不算。判据放在这里而不是交给上游，是因为上游的规范化规则
+/// 不归这个仓库管。
+fn tavily_route_allows(method: &axum::http::Method, upstream_path: &str) -> bool {
+    *method == axum::http::Method::POST && upstream_path.trim_matches('/') == "search"
+}
+
+/// `POST /search-fallback/search` —— `web_search` 在自建那层一个引擎都没应答时的后备。
+///
+/// 这条路由只服务一件事，所以只放行 `POST /search`，不是一条通用 Tavily 代理：
+/// 一条被注入的 agent 能拿它做的事，就被这个放行面框住了。
+///
+/// 出站认证头只有一种来源（[`tavily_auth_headers`]）：配了带外 key 就发 key，
+/// 没配就发 keyless 标记。**两者都只在网关里**——Pod 零持有，所以"网页里一句
+/// 话让它把凭证发出去"在这条路上没有可发的对象。入站的认证头与 query 一律
+/// 丢弃：后者 Tavily 不需要，留着只会多一个可往里塞东西的口子。
+async fn tavily_search_passthrough(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let path = req.uri().path().to_string();
+    let upstream_path = path
+        .strip_prefix("/search-fallback")
+        .unwrap_or(&path)
+        .to_string();
+    if !tavily_route_allows(req.method(), &upstream_path) {
+        let status = if *req.method() == axum::http::Method::POST {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::METHOD_NOT_ALLOWED
+        };
+        return Err((
+            status,
+            format!(
+                "检索后备只转发 POST /search，收到 {} {upstream_path}",
+                req.method()
+            ),
+        ));
+    }
+    let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let start = std::time::Instant::now();
+    let mut builder = state
+        .stream_client
+        .post(TAVILY_SEARCH_UPSTREAM)
+        .header("content-type", "application/json")
+        .header("accept", "application/json");
+    for (name, value) in tavily_auth_headers(state.config.tavily_api_key.as_deref()) {
+        builder = builder.header(name, value);
+    }
+    let resp = builder.body(body.to_vec()).send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("连接检索后备上游失败: {e}"),
+        )
+    })?;
+    state.code_stats.record(start.elapsed().as_millis() as u64);
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let stream = resp.bytes_stream();
+    Ok(axum::response::Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())))
+}
+
 // ─── 附件代理（issue/PR 评论里的图/音/视频/PDF）────────────────
 
 /// 附件下载允许的平台 host 白名单（防 SSRF）。GitHub 截图首跳常在
@@ -7502,6 +7613,12 @@ fn code_channel_router() -> Router<AppState> {
             axum::routing::any(git_gitee_passthrough),
         )
         .route("/attach", get(attach_proxy))
+        // 检索后备：`web_search` 在自建那层全沉默时的第二个后端。走这条通道
+        // 而不是让每个 Pod 自带一把带外 key —— 与代码平台透传同一条理由。
+        .route(
+            "/search-fallback/{*path}",
+            axum::routing::any(tavily_search_passthrough),
+        )
         .layer(axum::middleware::from_fn(trace_server_failures))
 }
 
@@ -8886,6 +9003,73 @@ mod tests {
         );
     }
 
+    /// 检索后备只放行 `POST /search`。
+    ///
+    /// 那条路由是给一个工具用的，不是一条通用代理；放行面就是这条测试画的那条线。
+    /// 尤其要盯住往上走的形状：`/search/../repos` 拼出去之后主机虽然还是 Tavily，
+    /// 但它已经不是"搜索"这一件事了——判据在这里拒掉，而不是指望上游的规范化。
+    #[test]
+    fn the_search_fallback_forwards_only_post_search() {
+        use axum::http::Method;
+        assert!(tavily_route_allows(&Method::POST, "/search"));
+        // 同一件事的几种写法：两头多余的斜杠不算另一个路径。
+        assert!(tavily_route_allows(&Method::POST, "//search"));
+        assert!(tavily_route_allows(&Method::POST, "/search/"));
+        // 往上走的不算。
+        assert!(!tavily_route_allows(&Method::POST, "/search/../repos"));
+        assert!(!tavily_route_allows(&Method::POST, "/../search"));
+        assert!(!tavily_route_allows(&Method::POST, "/search/x"));
+        // 别的 Tavily 端点不在这条路由的业务里。
+        assert!(!tavily_route_allows(&Method::POST, "/extract"));
+        assert!(!tavily_route_allows(&Method::POST, ""));
+        // GET 这条路上没有查询可带，放行只会花上游的额度。
+        assert!(!tavily_route_allows(&Method::GET, "/search"));
+    }
+
+    /// 后备的认证头要么是 key、要么是 keyless 标记，不会两个都在。
+    ///
+    /// 加 key 的唯一理由是额度：keyless 那一档与公众共用一个池，它恰好会在
+    /// 「自建层全沉默、最需要后备」的时候被限流。但两种认证方式同时挂上去，
+    /// 「这次花的是谁的额度」就读不出来了——而那正是加 key 要回答的问题。
+    #[test]
+    fn the_search_fallback_carries_a_key_only_when_one_is_configured() {
+        let keyless = tavily_auth_headers(None);
+        assert_eq!(keyless.len(), 1);
+        assert_eq!(keyless[0].0, "x-tavily-access-mode");
+        assert_eq!(keyless[0].1, "keyless");
+        // 空白与空串算"没配"，不算"配了一个空 key"：后者会把 Bearer 发成
+        // 一个空令牌，读日志时看起来像配了却没生效。
+        for blank in ["", "   "] {
+            assert_eq!(
+                tavily_auth_headers(Some(blank))[0].0,
+                "x-tavily-access-mode"
+            );
+        }
+
+        let keyed = tavily_auth_headers(Some("tvly-abc"));
+        assert_eq!(keyed.len(), 1, "one credential, not two");
+        assert_eq!(keyed[0].0, "authorization");
+        assert_eq!(keyed[0].1, "Bearer tvly-abc");
+        assert!(
+            !keyed.iter().any(|(name, _)| name.contains("access-mode")),
+            "a keyed request does not also ask for keyless mode"
+        );
+    }
+
+    /// 出站地址里没有调用方的一点东西。
+    ///
+    /// 这一点本来由签名保证（常量，拼装点不带参数），这条测试盯的是它别退化成
+    /// `format!` ——退化的那天，"出站主机只有这一个来源"就不再是类型保证的了，
+    /// 而那种退化在评审里看起来只是一次"把地址参数化"的小重构。
+    #[test]
+    fn the_search_fallback_url_has_no_caller_input_in_it() {
+        assert!(TAVILY_SEARCH_UPSTREAM.starts_with("https://api.tavily.com/"));
+        assert!(
+            !TAVILY_SEARCH_UPSTREAM.contains('{'),
+            "上游地址一旦带上占位符，主机就不再只由这一行常量决定"
+        );
+    }
+
     fn cfg(allow: &[&str], deny: &[&str]) -> SecurityGatewayConfig {
         SecurityGatewayConfig {
             egress_port: 8080,
@@ -8897,6 +9081,7 @@ mod tests {
             llm_health_probe_secs: 300,
             github_token: None,
             gitee_token: None,
+            tavily_api_key: None,
             gitee_oauth_client_id: None,
             gitee_oauth_client_secret: None,
             github_oauth_client_id: None,

@@ -23,6 +23,7 @@ OOB_SECRET=cogneva-secrets-oob
 # 带外半的键表。列出而不按"内部表之外的都搬"来推断：后者会把运维用 kubectl
 # 刚写进内部对象的新键也搬走，而那种搬移不报错、只在读它的那个进程那里变成
 # 空值。多列一个不存在的键是无害的空操作，少列一个才会留下残留副本。
+# 检索后备的带外 key 是可选的一个键：没配时后备走 keyless 那一档（与公众共用额度）。
 OOB_KEYS=(
   llm-upstreams
   llm-pool-min-healthy
@@ -41,6 +42,7 @@ OOB_KEYS=(
   git-ssh-private-key-pending
   gitee-refresh-token
   clickhouse-password
+  search-fallback-key
 )
 
 # 生成 48 位十六进制强随机串（纯字母数字，可安全进入连接串/URL）。

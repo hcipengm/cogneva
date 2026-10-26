@@ -239,6 +239,12 @@ spec:
             # 检索面本来就是无凭证的集群内服务。空值＝这个部署不接网页检索。
             - name: COGNEVA_WEB_SEARCH_BASE
               value: "http://searxng:8080"
+            # 检索的后备端点：这一条走安全网关，理由与上面那条不同——自建那层是
+            # 无凭证的集群内服务所以不必绕网关，而后备要带 key 时 key 只住在网关
+            # 里，本 Pod 仍然零持有。只在自建 SearXNG 一个引擎都没应答时才问：
+            # 出网的是 query 文本，没有第二样东西跟着出去。空值＝查询永不外发。
+            - name: COGNEVA_WEB_SEARCH_FALLBACK_BASE
+              value: "http://cogneva-security-gateway:8081/search-fallback"
             # 网页抓取的渲染后端（集群内 Crawl4AI）。它是零凭证的集群内服务，不走
             # 安全网关；egress 白名单里那一条（11235）少了，抓取会被策略静默丢弃，
             # 表现是每次抓取都超时。空值＝这个部署不接渲染，`web_fetch` 回落到本进程。

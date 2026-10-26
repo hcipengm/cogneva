@@ -1498,7 +1498,7 @@ pub mod builtins {
     // 网页检索与抓取实现放在 `crate::web`（自带测试与地址守卫），这里只把它们
     // 并进同一张注册表：工具的**清单**仍然只有 `register_builtins` 一处。
     use super::*;
-    pub use crate::web::{web_fetch, web_search};
+    pub use crate::web::{web_fetch, web_search, web_search_with_fallback};
 
     pub fn read_file() -> Tool {
         Tool {
@@ -1584,6 +1584,11 @@ pub mod builtins {
         /// tell "this deployment has no web access" from "this tool does not
         /// exist".
         pub web_search_base: Option<String>,
+        /// A second search backend, consulted only when the first put the query
+        /// to nobody. `None` means this deployment keeps every query inside its
+        /// own tree, which is the default and not a degradation: the fallback
+        /// only ever answers a query that was never asked of anything here.
+        pub web_search_fallback_base: Option<String>,
         /// Where the page-rendering backend lives. `None` means the fetch reads
         /// the page in process; `Some` means every fetch is rendered in a
         /// browser, and a backend that does not answer is reported as such
@@ -1637,7 +1642,11 @@ pub mod builtins {
         // 在调用者眼里不是同一个答案。
         cog_core::ToolRegistry::register(
             registry,
-            web_search(inputs.http_client.clone(), inputs.web_search_base.clone()),
+            web_search_with_fallback(
+                inputs.http_client.clone(),
+                inputs.web_search_base.clone(),
+                inputs.web_search_fallback_base.clone(),
+            ),
         );
         cog_core::ToolRegistry::register(
             registry,

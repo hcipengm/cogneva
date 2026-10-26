@@ -77,6 +77,7 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
             message_backend: None,
             agent_registry: None,
             web_search_base: agent_loop.web_search_base.clone(),
+            web_search_fallback_base: agent_loop.web_search_fallback_base.clone(),
             web_fetch_base: agent_loop.web_fetch_base.clone(),
         },
     );

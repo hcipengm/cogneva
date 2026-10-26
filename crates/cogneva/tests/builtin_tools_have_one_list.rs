@@ -97,6 +97,7 @@ fn names_with(client: Option<Arc<dyn HttpClient>>, messaging: bool) -> Vec<Strin
             message_backend,
             agent_registry,
             web_search_base: Some("http://searxng.invalid:8080".into()),
+            web_search_fallback_base: Some("http://gateway.invalid/search-fallback".into()),
             web_fetch_base: Some("http://render.invalid:11235".into()),
         },
     );

@@ -82,6 +82,15 @@ const SEARCH_ATTEMPTS: u32 = 2;
 /// than hiding by being absent from the list.
 pub const WEB_SEARCH_BASE_ENV: &str = "COGNEVA_WEB_SEARCH_BASE";
 
+/// The environment variable that names a second search backend, for the
+/// queries the first one could not put to anyone.
+///
+/// Empty is the default and it means what it says: this deployment has chosen
+/// that no query leaves it. Set, it names a base that speaks `POST {base}/search`
+/// directly -- in this deployment the security gateway, so that a backend
+/// wanting a credential keeps it there rather than in every pod.
+pub const WEB_SEARCH_FALLBACK_BASE_ENV: &str = "COGNEVA_WEB_SEARCH_FALLBACK_BASE";
+
 /// The environment variable that names the rendering backend for `web_fetch`.
 ///
 /// Empty means "extract in this process", which is the cheaper path and the one
@@ -503,6 +512,27 @@ fn truncate_chars(text: &str, max_chars: usize) -> (String, bool) {
 
 /// Search the open web through the deployment's own SearXNG instance.
 pub fn web_search(client: Option<Arc<dyn HttpClient>>, base: Option<String>) -> Tool {
+    web_search_with_fallback(client, base, None)
+}
+
+/// `web_search`, with a second backend for the queries the first could not put
+/// to anyone.
+///
+/// The fallback is consulted in exactly one situation: the self-hosted backend
+/// came back with no hits because every engine behind it stayed silent, twice.
+/// That is not a reading of the web, it is the absence of one, so falling
+/// through costs nothing that was already lost -- while answering from the
+/// first backend whenever it answers keeps the property the self-hosted half
+/// exists for: queries the deployment can answer itself never leave it.
+///
+/// `fallback_base` points at a base that speaks the search protocol directly
+/// (`POST {base}/search`), which in this deployment is the security gateway: a
+/// backend that needs a credential keeps it there, out of every pod.
+pub fn web_search_with_fallback(
+    client: Option<Arc<dyn HttpClient>>,
+    base: Option<String>,
+    fallback_base: Option<String>,
+) -> Tool {
     Tool {
         name: "web_search".into(),
         description: "Search the open web and return ranked results with title, URL and \
@@ -536,6 +566,7 @@ pub fn web_search(client: Option<Arc<dyn HttpClient>>, base: Option<String>) -> 
         implementation: ToolImplementation::Native(Arc::new(move |args| {
             let client = client.clone();
             let base = base.clone();
+            let fallback_base = fallback_base.clone();
             Box::pin(async move {
                 let query = args["query"]
                     .as_str()
@@ -601,6 +632,57 @@ pub fn web_search(client: Option<Arc<dyn HttpClient>>, base: Option<String>) -> 
                 // the engines instead of a result set.
                 if answer.results.is_empty() && !answer.broken.is_empty() {
                     let names: Vec<String> = answer.broken.iter().map(|e| e.to_string()).collect();
+                    // The one case a second backend is for: the query was never
+                    // put to anything here, so answering from somewhere else
+                    // gives up nothing the first backend was holding. What it
+                    // does cost is that this query leaves the deployment, so
+                    // the answer says which backend produced it rather than
+                    // letting the two look alike.
+                    if let Some(fallback) = fallback_base.as_deref() {
+                        let hits = fallback_search(&*client, fallback, &query, limit).await;
+                        match hits {
+                            Ok(hits) if !hits.is_empty() => {
+                                return Ok(serde_json::json!({
+                                    "query": query,
+                                    "limit": limit,
+                                    "count": hits.len(),
+                                    "results": hits,
+                                    "source": "fallback",
+                                    // The count is read off the loop rather than
+                                    // written as "twice": the two have to agree
+                                    // after someone changes SEARCH_ATTEMPTS, and a
+                                    // spelled-out number is the copy that goes
+                                    // stale without failing anything.
+                                    "fallback_because": format!(
+                                        "the self-hosted backend answered nothing in \
+                                         {attempt} attempt(s); engines that stayed \
+                                         silent: {}",
+                                        names.join(", ")
+                                    ),
+                                }));
+                            }
+                            // 后备答了、但一条没找到：这时候说"查询从没被问过"
+                            // 是假的，它被问了。能说的只有"没有一条记录说这个查询
+                            // 没有匹配"。
+                            Ok(_) => {
+                                return Err(SFError::Agent(format!(
+                                    "web search found nothing: the self-hosted backend's \
+                                     engines stayed silent ({}) and the fallback answered \
+                                     with no hits. Neither is a reading that says this \
+                                     query has no matches",
+                                    names.join(", ")
+                                )));
+                            }
+                            Err(e) => {
+                                return Err(SFError::Agent(format!(
+                                    "web search found nothing: the self-hosted backend's \
+                                     engines stayed silent ({}) and the fallback failed \
+                                     too ({e}). Neither is a reading of the web",
+                                    names.join(", ")
+                                )));
+                            }
+                        }
+                    }
                     return Err(SFError::Agent(format!(
                         "web search came back empty after {attempt} attempt(s) because no \
                          engine answered, which is not the same answer as 'nothing \
@@ -615,6 +697,7 @@ pub fn web_search(client: Option<Arc<dyn HttpClient>>, base: Option<String>) -> 
                     "limit": limit,
                     "count": answer.results.len(),
                     "results": answer.results,
+                    "source": "self_hosted",
                 });
                 // Answers and suggestions come from the engines' own knowledge
                 // cards; when present they answer without a second fetch. They
@@ -630,6 +713,70 @@ pub fn web_search(client: Option<Arc<dyn HttpClient>>, base: Option<String>) -> 
             })
         })),
     }
+}
+
+/// Search a fallback backend that speaks `POST {base}/search` directly.
+///
+/// The base is whatever this deployment points at -- in practice the security
+/// gateway, so that a backend needing a credential can keep it there. The
+/// request carries no credential of its own: what it sends is the query and how
+/// many hits to bring back.
+async fn fallback_search(
+    client: &dyn HttpClient,
+    base: &str,
+    query: &str,
+    limit: u64,
+) -> SFResult<Vec<serde_json::Value>> {
+    let url = format!("{}/search", base.trim_end_matches('/'));
+    let mut req = HttpRequest::new("POST", url.clone());
+    req.timeout_secs = Some(SEARCH_TIMEOUT_SECS);
+    req.headers
+        .insert("Content-Type".into(), "application/json".into());
+    req.headers
+        .insert("Accept".into(), "application/json".into());
+    req.body = Some(
+        serde_json::json!({
+            "query": query,
+            "max_results": limit,
+            "search_depth": "basic",
+        })
+        .to_string()
+        .into_bytes(),
+    );
+    let resp = client.execute(req).await.map_err(|e| {
+        SFError::Agent(format!(
+            "fallback search backend at {base} is unreachable: {e}"
+        ))
+    })?;
+    if !resp.is_success() {
+        let body = String::from_utf8_lossy(&resp.body);
+        return Err(SFError::Agent(format!(
+            "fallback search backend answered {}: {}",
+            resp.status,
+            body.chars().take(300).collect::<String>()
+        )));
+    }
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
+        SFError::Agent(format!(
+            "fallback search backend at {base} did not answer with JSON: {e}"
+        ))
+    })?;
+    Ok(body["results"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .take(limit as usize)
+        .map(|hit| {
+            serde_json::json!({
+                "title": hit["title"],
+                "url": hit["url"],
+                "snippet": hit["content"],
+                "engine": "fallback",
+                "published": hit["published_date"],
+            })
+        })
+        .collect())
 }
 
 /// One answer from the search backend, split into what the caller acts on.
@@ -1226,6 +1373,161 @@ mod tests {
         assert!(
             out.get("unresponsive_engines").is_none(),
             "an empty list is left out rather than reported as an outage: {out}"
+        );
+    }
+
+    /// 自建那层答得出来时，后备一次都不碰。
+    ///
+    /// 这是这条后备存在的**代价**那一面：查询不出本部署。它在什么时候成立，取决
+    /// 于后备只在一种情况下被问——自建层的引擎全沉默、重试之后仍然全沉默。这条
+    /// 测试就是那条线：有一次正常的应答，就一次 POST 都不该发生。
+    #[tokio::test]
+    async fn the_fallback_is_never_asked_when_the_self_hosted_backend_answers() {
+        let scripted = Scripted::answering(
+            200,
+            "application/json",
+            r#"{"results":[{"title":"Rust","url":"https://rust-lang.org/","content":"fast",
+                 "engine":"bing"}],"unresponsive_engines":[]}"#,
+        );
+        let tool = web_search_with_fallback(
+            client_of(&scripted),
+            Some("http://searxng:8080".into()),
+            Some("http://gateway:8081/search-fallback".into()),
+        );
+        let out = call(&tool, serde_json::json!({"query":"rust"}))
+            .await
+            .expect("the self-hosted backend answered");
+        assert_eq!(out["source"], "self_hosted");
+        let asked = scripted.asked();
+        assert_eq!(
+            asked.len(),
+            1,
+            "one GET to the self-hosted backend, and nothing else: {asked:?}"
+        );
+        assert_eq!(
+            asked[0].method, "GET",
+            "the fallback speaks POST; a GET here would mean the self-hosted path \
+             went somewhere else"
+        );
+    }
+
+    /// 全沉默之后由后备作答，答案里说清是哪一条路给的。
+    ///
+    /// 两条路的答案不能长得一样：一条的查询没出本部署，另一条出去了。调用方
+    /// （和事后读日志的人）要能从答案本身分辨这一点。
+    #[tokio::test]
+    async fn the_fallback_answers_a_query_the_self_hosted_backend_never_asked() {
+        let silent = r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string();
+        let scripted = Scripted::answering_in_order(vec![
+            (200, "application/json", silent.clone()),
+            (200, "application/json", silent),
+            (
+                200,
+                "application/json",
+                r#"{"results":[{"title":"Rust","url":"https://www.rust-lang.org/",
+                     "content":"a language empowering everyone"}]}"#
+                    .to_string(),
+            ),
+        ]);
+        let tool = web_search_with_fallback(
+            client_of(&scripted),
+            Some("http://searxng:8080".into()),
+            Some("http://gateway:8081/search-fallback".into()),
+        );
+        let out = call(&tool, serde_json::json!({"query":"rust lang"}))
+            .await
+            .expect("the fallback answered");
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["source"], "fallback");
+        assert_eq!(out["results"][0]["url"], "https://www.rust-lang.org/");
+        assert_eq!(
+            out["results"][0]["snippet"],
+            "a language empowering everyone"
+        );
+        assert!(
+            out["fallback_because"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("bing"),
+            "the answer says why it went elsewhere, naming the engines that stayed \
+             silent: {out}"
+        );
+        let asked = scripted.asked();
+        assert_eq!(
+            asked.len(),
+            3,
+            "two asks of the self-hosted layer, then one of the fallback"
+        );
+        assert_eq!(asked[2].method, "POST");
+        assert_eq!(asked[2].url, "http://gateway:8081/search-fallback/search");
+        let sent = String::from_utf8(asked[2].body.clone().unwrap_or_default()).unwrap();
+        assert!(
+            sent.contains("rust lang"),
+            "the query travels in the body, not in a URL the caller can point elsewhere: {sent}"
+        );
+    }
+
+    /// 两条路都没给出答案时，错误把两件事都说出来。
+    ///
+    /// 只说"什么都没有"会把一次双重故障说成一次空结果；只报后备的错又会把自建
+    /// 那层的沉默藏起来，而沉默才是下一次该先修的东西。
+    #[tokio::test]
+    async fn two_failed_backends_are_both_named_in_the_error() {
+        let silent = r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string();
+        let scripted = Scripted::answering_in_order(vec![
+            (200, "application/json", silent.clone()),
+            (200, "application/json", silent),
+            (
+                503,
+                "application/json",
+                r#"{"detail":"rate limited"}"#.to_string(),
+            ),
+        ]);
+        let tool = web_search_with_fallback(
+            client_of(&scripted),
+            Some("http://searxng:8080".into()),
+            Some("http://gateway:8081/search-fallback".into()),
+        );
+        let err = call(&tool, serde_json::json!({"query":"rust"}))
+            .await
+            .expect_err("neither backend is a reading of the web");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bing") && msg.contains("503"),
+            "the error names the silent engines and the fallback's own failure: {msg}"
+        );
+    }
+
+    /// 后备答了但一条没找到，仍然是"没问成"，不是"没有匹配"。
+    ///
+    /// 否则一条把查询送出去的后备，会在它自己也没结果时把整条路的故障翻译成
+    /// `count: 0`——正是这次要防的那个混淆，绕一圈又回来了。
+    #[tokio::test]
+    async fn an_empty_fallback_answer_does_not_become_an_empty_web() {
+        let silent = r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string();
+        let scripted = Scripted::answering_in_order(vec![
+            (200, "application/json", silent.clone()),
+            (200, "application/json", silent),
+            (200, "application/json", r#"{"results":[]}"#.to_string()),
+        ]);
+        let tool = web_search_with_fallback(
+            client_of(&scripted),
+            Some("http://searxng:8080".into()),
+            Some("http://gateway:8081/search-fallback".into()),
+        );
+        let err = call(&tool, serde_json::json!({"query":"rust"}))
+            .await
+            .expect_err("nothing was asked of anything that could answer");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bing") && msg.contains("fallback answered with no hits"),
+            "the error names the silent engines and what the fallback actually did, \
+             rather than claiming the query was never asked: {msg}"
+        );
+        assert!(
+            !msg.contains("Retry"),
+            "the retry advice belongs to the no-fallback case; here the fallback was \
+             tried and came back empty: {msg}"
         );
     }
 
