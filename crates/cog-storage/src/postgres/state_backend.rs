@@ -961,7 +961,7 @@ impl StateBackend for PostgresStateBackend {
                                                  - NULLIF(task->>'started_at', '')::timestamptz)) AS dur
                           FROM cog_dag_tasks
                          WHERE workspace_id = $1
-                           AND status = 'completed'
+                           AND status = $3
                            AND updated_at > NOW() - INTERVAL '30 days'
                     ),
                     joined AS (
@@ -996,6 +996,9 @@ impl StateBackend for PostgresStateBackend {
                 )
                 .bind(workspace_id)
                 .bind(min_samples as i64)
+                // 状态词由 `TaskStatus::as_str` 决定：写进 SQL 的副本改了名不会
+                // 报错，只会让这条查询一条也匹配不到，读起来像「还没有跑完的活」。
+                .bind(cog_core::TaskStatus::Completed.as_str())
                 .fetch_all(&self.pool)
                 .await
             })

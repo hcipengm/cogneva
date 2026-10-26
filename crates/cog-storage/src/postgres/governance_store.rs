@@ -52,9 +52,9 @@ ORDER BY task_id";
 /// field, and those rows are executable. Reading the missing value as false
 /// would drop every older task from the reading and make the platform look
 /// idle.
-const OPEN_FACE_BOUND_SQL: &str = "\
+const OPEN_FACE_BOUND_SQL_TEMPLATE: &str = "\
 SELECT task FROM cog_dag_tasks \
-WHERE status IN ('pending', 'scheduled', 'running') \
+WHERE status IN ('{pending}', '{scheduled}', '{running}') \
   AND task ->> 'face_id' IS NOT NULL \
   AND workspace_id <> $1 \
   AND COALESCE((task->>'is_executable')::boolean, true) \
@@ -106,10 +106,10 @@ UPDATE cog_dag_tasks \
  WHERE workspace_id = $1 AND task_id = $2 AND status = ANY($5)";
 
 /// Move a signed handover to its applied state, but only from `scheduled`.
-const APPLY_HANDOVER_ROW_SQL: &str = "\
+const APPLY_HANDOVER_ROW_SQL_TEMPLATE: &str = "\
 UPDATE cog_dag_tasks \
    SET task = $3, status = $4, updated_at = NOW() \
- WHERE workspace_id = $1 AND task_id = $2 AND status = 'scheduled'";
+ WHERE workspace_id = $1 AND task_id = $2 AND status = '{scheduled}'";
 
 /// Hand the outgoing unit's unstarted work for one face to the incoming unit.
 ///
@@ -122,7 +122,7 @@ UPDATE cog_dag_tasks \
 /// worker. Keeping them would hand the new unit a row it cannot execute (the
 /// router checks the owner) while the row claims a worker that belongs to
 /// somebody else.
-const REBIND_FACE_TASKS_SQL: &str = "\
+const REBIND_FACE_TASKS_SQL_TEMPLATE: &str = "\
 UPDATE cog_dag_tasks \
    SET task = (task - 'agent_id' - 'lease_owner') || jsonb_build_object( \
                 'owner_unit', $3::text, \
@@ -135,7 +135,7 @@ UPDATE cog_dag_tasks \
  WHERE workspace_id <> $1 \
    AND task ->> 'face_id' = $2 \
    AND task ->> 'owner_unit' = $5 \
-   AND status IN ('pending', 'scheduled')";
+   AND status IN ('{pending}', '{scheduled}')";
 
 /// Hand one face's unstarted work to a unit that is present.
 ///
@@ -153,7 +153,7 @@ UPDATE cog_dag_tasks \
 /// name nobody: plain `<>` answers NULL against a missing key, which is not
 /// true, so the row is silently skipped and the face keeps reading idle while
 /// the pass reports that it looked.
-const REASSIGN_FACE_WORK_SQL: &str = "\
+const REASSIGN_FACE_WORK_SQL_TEMPLATE: &str = "\
 UPDATE cog_dag_tasks \
    SET task = (task - 'agent_id' - 'lease_owner') || jsonb_build_object( \
                 'owner_unit', $3::text, \
@@ -165,7 +165,7 @@ UPDATE cog_dag_tasks \
  WHERE workspace_id <> $1 \
    AND task ->> 'face_id' = $2 \
    AND task ->> 'owner_unit' IS DISTINCT FROM $3 \
-   AND status IN ('pending', 'scheduled')";
+   AND status IN ('{pending}', '{scheduled}')";
 
 /// Give one face's unstarted work back to the shared queue.
 ///
@@ -174,7 +174,7 @@ UPDATE cog_dag_tasks \
 /// still names a unit tells the executor it is working for somebody the queue
 /// never routed it from. `owner_unit` is removed rather than set to a name,
 /// which is what puts the rows back in front of every worker.
-const RELEASE_FACE_WORK_SQL: &str = "\
+const RELEASE_FACE_WORK_SQL_TEMPLATE: &str = "\
 UPDATE cog_dag_tasks \
    SET task = (task - 'agent_id' - 'lease_owner' - 'owner_unit') || jsonb_build_object( \
                 'input', CASE WHEN jsonb_typeof(task -> 'input') = 'object' \
@@ -184,7 +184,34 @@ UPDATE cog_dag_tasks \
  WHERE workspace_id <> $1 \
    AND task ->> 'face_id' = $2 \
    AND task ->> 'owner_unit' IS NOT NULL \
-   AND status IN ('pending', 'scheduled')";
+   AND status IN ('{pending}', '{scheduled}')";
+
+/// The status words a template may ask for, and the variant each stands for.
+///
+/// The left column is a label the template writes; the right is the variant
+/// whose spelling [`TaskStatus::as_str`] decides. They are deliberately two
+/// different strings: the placeholder names a slot, the constant decides what
+/// goes in it.
+const STATUS_PLACEHOLDERS: &[(&str, TaskStatus)] = &[
+    ("pending", TaskStatus::Pending),
+    ("scheduled", TaskStatus::Scheduled),
+    ("running", TaskStatus::Running),
+];
+
+/// Fill a query template's status placeholders from [`TaskStatus`].
+///
+/// A status written straight into a query is a second spelling of a word
+/// `as_str` already decides. Rename a variant there and the predicate keeps
+/// matching the old spelling, which is not an error: a query matching no rows
+/// answers the same as one over an empty table, so the face would read as
+/// having no open work rather than as broken.
+fn fill_statuses(template: &str) -> String {
+    let mut sql = template.to_string();
+    for (name, status) in STATUS_PLACEHOLDERS {
+        sql = sql.replace(&format!("{{{name}}}"), status.as_str());
+    }
+    sql
+}
 
 /// PostgreSQL governance store.
 #[derive(Clone)]
@@ -222,7 +249,7 @@ impl GovernanceStore for PostgresGovernanceStore {
     }
 
     async fn open_face_bound_tasks(&self) -> SFResult<Vec<Task>> {
-        let rows = sqlx::query(OPEN_FACE_BOUND_SQL)
+        let rows = sqlx::query(&fill_statuses(OPEN_FACE_BOUND_SQL_TEMPLATE))
             .bind(GOVERNANCE_WORKSPACE)
             .fetch_all(&self.pool)
             .await
@@ -360,7 +387,7 @@ impl GovernanceStore for PostgresGovernanceStore {
             .await
             .map_err(|e| SFError::Database(format!("governance apply handover: {e}")))?;
 
-        let moved_handover = sqlx::query(APPLY_HANDOVER_ROW_SQL)
+        let moved_handover = sqlx::query(&fill_statuses(APPLY_HANDOVER_ROW_SQL_TEMPLATE))
             .bind(GOVERNANCE_WORKSPACE)
             .bind(&handover.id)
             .bind(handover_value)
@@ -389,7 +416,7 @@ impl GovernanceStore for PostgresGovernanceStore {
 
         // Nothing to follow when the face was vacant: no unit held its work.
         let rebound = match spec.from_unit.as_deref() {
-            Some(from) => sqlx::query(REBIND_FACE_TASKS_SQL)
+            Some(from) => sqlx::query(&fill_statuses(REBIND_FACE_TASKS_SQL_TEMPLATE))
                 .bind(GOVERNANCE_WORKSPACE)
                 .bind(&spec.face_id)
                 .bind(&spec.to_unit)
@@ -417,7 +444,7 @@ impl GovernanceStore for PostgresGovernanceStore {
                     .into(),
             ));
         }
-        let moved = sqlx::query(REASSIGN_FACE_WORK_SQL)
+        let moved = sqlx::query(&fill_statuses(REASSIGN_FACE_WORK_SQL_TEMPLATE))
             .bind(GOVERNANCE_WORKSPACE)
             .bind(face_id)
             .bind(to_unit)
@@ -429,7 +456,7 @@ impl GovernanceStore for PostgresGovernanceStore {
     }
 
     async fn release_face_work(&self, face_id: &str) -> SFResult<usize> {
-        let released = sqlx::query(RELEASE_FACE_WORK_SQL)
+        let released = sqlx::query(&fill_statuses(RELEASE_FACE_WORK_SQL_TEMPLATE))
             .bind(GOVERNANCE_WORKSPACE)
             .bind(face_id)
             .execute(&self.pool)
@@ -437,5 +464,51 @@ impl GovernanceStore for PostgresGovernanceStore {
             .map_err(|e| SFError::Database(format!("governance release face work: {e}")))?
             .rows_affected() as usize;
         Ok(released)
+    }
+}
+
+#[cfg(test)]
+mod status_templates {
+    use super::*;
+
+    /// Every query that names a state has it filled in, from the declaration.
+    #[test]
+    fn every_template_fills_its_state_placeholders() {
+        let templates = [
+            OPEN_FACE_BOUND_SQL_TEMPLATE,
+            APPLY_HANDOVER_ROW_SQL_TEMPLATE,
+            REBIND_FACE_TASKS_SQL_TEMPLATE,
+            REASSIGN_FACE_WORK_SQL_TEMPLATE,
+            RELEASE_FACE_WORK_SQL_TEMPLATE,
+        ];
+        let mut filled = 0;
+        for template in templates {
+            let sql = fill_statuses(template);
+            for (name, _) in STATUS_PLACEHOLDERS {
+                let slot = format!("{{{name}}}");
+                filled += template.matches(&slot).count();
+                assert!(
+                    !sql.contains(&slot),
+                    "模板里还有没填上的状态占位符 {slot}：{sql}"
+                );
+            }
+        }
+        // 少到这一步说明有人把模板改回了直接拼状态词，或者换了占位符的名字
+        // 却没登记；两种都让下面那几条查询读一个不存在的状态。
+        assert!(
+            filled >= 5,
+            "五条模板里一共只有 {filled} 个状态占位符，比应有的少"
+        );
+    }
+
+    /// The word that lands in the query is the one `as_str` decides.
+    #[test]
+    fn the_filled_word_is_the_spelling_as_str_decides() {
+        for (name, status) in STATUS_PLACEHOLDERS {
+            let sql = fill_statuses(&format!("status = '{{{name}}}'"));
+            assert_eq!(sql, format!("status = '{}'", status.as_str()));
+        }
+        // 没登记的槽不会被悄悄当成空串填掉。
+        assert!(fill_statuses("status = '{nope}'").contains("{nope}"));
     }
 }
