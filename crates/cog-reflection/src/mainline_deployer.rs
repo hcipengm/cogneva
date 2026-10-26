@@ -18221,11 +18221,15 @@ echo "||1"
             ..Default::default()
         };
         let deployer = MainlineDeployer::new(cfg, test_workspaces(&bin_dir, &bin_dir));
+        // The budget has to outlast more than one ask on a loaded host: each
+        // ask spawns the kubectl stand-in, and one spawn on a busy machine can
+        // take longer than a 30ms budget, which made `asked >= 2` a reading of
+        // the host's load rather than of this loop.
         let exited = deployer
             .await_judgement(
                 "job-running",
                 Duration::from_millis(1),
-                Duration::from_millis(30),
+                Duration::from_millis(300),
             )
             .await
             .unwrap();

@@ -4666,12 +4666,31 @@ unevictable 28532736
 
         // The retry is damped to a window so a scrape does not become a lock
         // attempt per request; the test moves the clock instead of waiting.
-        *survivor
-            .controller_retry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+        //
+        // Dropping the descriptor is not the same instant as the lock being
+        // gone in *this* process: the lock belongs to the open file
+        // description, and a builder spawned on another thread forks while
+        // this one is open, so the forked child carries a duplicate until it
+        // execs. Production has two processes here and no such window; a test
+        // binary runs the whole suite in one, so the retry is bounded rather
+        // than a single attempt. A memoized answer still fails it: that one
+        // never asks again, and the loop times out.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let taken = loop {
+            *survivor
+                .controller_retry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            if survivor.is_controller() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
         assert!(
-            survivor.is_controller(),
+            taken,
             "the survivor takes the field once the controller has left"
         );
     }
