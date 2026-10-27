@@ -1,0 +1,105 @@
+# promtool 规则单测：变更账本停摆那一条**真的会 firing**，而且只在「有活被卡住」时响。
+#
+# 这一条与前面几条不同，它判的是两个读数取合取：待派发条数 > 0，以及派发 pass 当前那一
+# 格是 `paused_llm_pool_unavailable`。合取是最容易被改松的形状——把 `and on()` 换成
+# `or`、把待派发那一半去掉、把 `== 1` 写成 `>= 0`（六格里那一半一直是 0，于是恒真），
+# 三种改法在结构门眼里全都合法，而它们分别意思是「账本空着也报」「池子好好的也报」
+# 「永远报」。这份夹具的每一格都带反向证据，正是为了挡住这三种。
+#
+# 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh \
+#         deploy/k3s/observability/manifests/23-prometheusrule-change-dispatch.yaml \
+#         deploy/k3s/observability/tests/23-prometheusrule-change-dispatch.test.yaml
+rule_files:
+  - ../manifests/23-prometheusrule-change-dispatch.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 一、真停摆：2110 条在等、派发那一格连续判 paused。`for: 6h` 之前空、之后 firing。
+  # 前半格是反向证据——刚判一次 paused 就响，等于把一次退避报成停摆。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_dispatch_readouts{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
+        values: '2110x400'
+      - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '1x400'
+      - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="proceed",pool_reading="available"}'
+        values: '0x400'
+    alert_rule_test:
+      - eval_time: 359m
+        alertname: CognevaChangeLedgerStoppedMoving
+        exp_alerts: []
+      - eval_time: 361m
+        alertname: CognevaChangeLedgerStoppedMoving
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"
+
+  # 二、池子好好的：那一格一直是 0、`proceed` 一直是 1，账本再多也不许响。
+  # 没有这一格，判据写成「只看待派发条数」也能过第一格。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_dispatch_readouts{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
+        values: '2110x720'
+      - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '0x721'
+      - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="proceed",pool_reading="available"}'
+        values: '1x721'
+    alert_rule_test:
+      - eval_time: 12h
+        alertname: CognevaChangeLedgerStoppedMoving
+        exp_alerts: []
+
+  # 三、账本空着：待派发为 0，池子确实不可用，12 小时也不许响。这一格钉的是**合取**——
+  # 把两个读数换成 `or`、或者干脆删掉待派发那一半，这一格立刻亮，而那种亮是在替一件
+  # 不欠任何人的事报警，只会训练读者忽略这一条。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_dispatch_readouts{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
+        values: '0x721'
+      - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '1x721'
+    alert_rule_test:
+      - eval_time: 12h
+        alertname: CognevaChangeLedgerStoppedMoving
+        exp_alerts: []
+
+  # 四、停摆两小时之后池子回来了：第 100 分钟（还在停摆里）不许响，第 12 小时也不许响。
+  # 前半格钉的是 `for:` 本身（去掉它第 1 分钟就亮），后半格钉的是「恢复之后要自己安静
+  # 下来」——一条响了就不再回落的规则，读者第二次看见它就不会再看。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_dispatch_readouts{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
+        values: '2110x721'
+      - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '1x121 0x600'
+    alert_rule_test:
+      - eval_time: 100m
+        alertname: CognevaChangeLedgerStoppedMoving
+        exp_alerts: []
+      - eval_time: 12h
+        alertname: CognevaChangeLedgerStoppedMoving
+        exp_alerts: []
+
+  # 五、两个副本读数不同：一个判 paused、一个判 proceed。判据必须取最坏的那一个——
+  # 写成 `min` 的话，只要还有一个副本读得过来就永远安静，而那个副本可能根本没在派发。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_dispatch_readouts{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
+        values: '0x400'
+      - series: 'cogneva_change_dispatch_readouts{instance="10.42.0.45:8080",readout="change_ledger_pending"}'
+        values: '2110x400'
+      - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '0x400'
+      - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.45:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '1x400'
+    alert_rule_test:
+      - eval_time: 361m
+        alertname: CognevaChangeLedgerStoppedMoving
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"

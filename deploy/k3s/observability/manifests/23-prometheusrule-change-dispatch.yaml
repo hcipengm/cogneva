@@ -1,0 +1,52 @@
+# 变更账本停止向前走的告警。
+#
+# 为什么需要：池子那几条规则（`llm_upstream_pool_down` 等）说的是**原因**，不是后果。
+# 后果这一端只有一格读数在答——`cogneva_change_dispatch_verdict{decision,pool_reading}`，
+# 每一次派发 pass 把两种决定 × 三种池读数共六格全写一遍，当前那一格为 1——而它此前只被
+# 一块面板读（`06-grafana-dashboard-configmap.yaml`），没有任何规则读。面板与「有人看」
+# 之间没有关系：2026-10-27 20:41 UTC 起这一格一直是
+# `decision="paused_llm_pool_unavailable", pool_reading="unavailable"`，2110 条待派发的变更
+# 一条都没动，而在告警面上只看得见池子自己在响。
+#
+# 它不能靠池子那条规则代替，因为两者判的不是同一件事：
+#
+#   - 池子响说的是「现在没有可用上游」；这一条说的是「账本已经六个小时没动」。
+#   - 池子恢复之后，这一格仍可能停在 paused：`LlmPoolStatus` 的判词是**跨重启闩住**的
+#     （`contract/supervisor.rs` 里写着这条：闩住的判词配上已经不在的输入，会让池子读成
+#     不可用而每个上游读成健康）。那种情形下池子那条规则是 resolved，只有这一条会亮，
+#     它亮的时候第一步就是去比这两格。
+#
+# 界取 6 小时：派发 pass 自己的退避是分钟级的（实测 2026-10-27 一整段里两次 pass 之间
+# 隔 2 到 14 分钟），一次真实的池子中断从没有把两次 pass 隔开一小时过。所以「连续六小时
+# 都判 paused」不再是「等下一次探测」，而是「今天这笔账不会动了」。
+#
+# 与待派发条数取合取，是为了让这一条只说「有活被卡住」：账本空着的时候池子不可用不欠
+# 谁的账，那种状态下报警只会训练人忽略它。左式是条数，所以 `{{ $value }}` 就是被卡住的
+# 那笔账有多少行——读者不用再查一次。
+#
+# 为什么不一起读 `cogneva_change_dispatch_readouts{readout="held_back"}`：那是这一趟自己
+# 让出去的行数，随 pass 的切片大小变，与「账本动不动」不是一个问题。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cogneva-change-dispatch
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: cogneva-change-dispatch
+      rules:
+        - alert: CognevaChangeLedgerStoppedMoving
+          expr: |
+            max (cogneva_change_dispatch_readouts{readout="change_ledger_pending"}) > 0
+              and on()
+            max (cogneva_change_dispatch_verdict{decision="paused_llm_pool_unavailable"}) == 1
+          for: 6h
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "变更管理"
+            severity: warning
+          annotations:
+            summary: "变更账本已经 6 小时没有派发任何一条，还有 {{ $value }} 条在等"
+            description: "派发 pass 连续判 `paused_llm_pool_unavailable`。先比两格：`llm_pool_available` 为 0 是真的没有可用上游（看 `llm_upstream_healthy`、`llm_upstream_refusal_kind`：`quota_cycle` 等上游自己声明的重置时刻 `llm_upstream_quota_reset_unix`，`entitlement` 要换凭证），为 1 则是闩住的判词与已恢复的池子分家了，那条路要清 latch 而不是等。两种情况都别逐条去动账本里的行：行上的 `blocked_reason` 是这一层写上去的，池子恢复后的下一趟 pass 会自己清。"
