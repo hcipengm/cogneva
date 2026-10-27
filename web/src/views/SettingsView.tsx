@@ -1,4 +1,6 @@
+import { useState } from 'react';
 import {
+  connectContribution,
   getContributionStatus,
   getQuotaUsage,
   getSearchFallback,
@@ -14,6 +16,84 @@ import { useTheme } from '@/shell/theme';
 import { THEMES } from '@/styles/themes';
 import { ThemePicker } from '@/ui/ThemePicker';
 import { Button, Empty, Loading, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
+
+/**
+ * 粘贴令牌一行：先选平台，再贴令牌，写进网关。
+ *
+ * 下拉选平台而不是给两个输入框：一段令牌属于哪一家是它自己的事，是人在贴之前就知道
+ * 的那一个选择；两个框并排只会让人把 Gitee 的令牌贴进 GitHub 那格。
+ *
+ * 写完只报「写入被接受」——这一页的判据是上面那张表在读回来的状态里变成「已连接」，
+ * 而那是网关滚动换 Pod 之后的事。把「写入成功」当成「已生效」，人会以为没变化的
+ * 那张表是坏的。
+ */
+function PatRow({ onSaved }: { onSaved: () => void }) {
+  const [platform, setPlatform] = useState<'github' | 'gitee'>('github');
+  const [token, setToken] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const save = async () => {
+    setBusy(true);
+    setResult(null);
+    try {
+      const r = await connectContribution(platform, token.trim());
+      setResult({
+        ok: r.ok,
+        text: r.ok
+          ? `${r.message || '已写入'}。账号 ${r.account ?? '未回报'}。写入 ≠ 生效：网关滚动换 Pod 之后，上面那张表读回来的才是新状态。`
+          : r.message || '网关拒绝了这次写入。',
+      });
+      if (r.ok) {
+        setToken('');
+        onSaved();
+      }
+    } catch (e) {
+      const err = e as { status?: number; message?: string };
+      setResult({
+        ok: false,
+        text: err?.message?.trim() || `写入失败（HTTP ${err?.status ?? '?'}）`,
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-t border-[var(--line)] px-4 py-2">
+      <span className="text-[11px] text-[var(--muted)]">粘贴令牌</span>
+      <select
+        value={platform}
+        onChange={(event) => setPlatform(event.target.value === 'gitee' ? 'gitee' : 'github')}
+        className="border border-[var(--line)] bg-[var(--ink-900)] px-2 py-1 text-[11px] outline-none focus:border-[var(--brass)]"
+        style={{ color: 'var(--paper)' }}
+      >
+        <option value="github">GitHub</option>
+        <option value="gitee">Gitee</option>
+      </select>
+      <input
+        type="password"
+        value={token}
+        onChange={(event) => setToken(event.target.value)}
+        placeholder="平台访问令牌；只写不读，这一页不会回显"
+        autoComplete="off"
+        className="mono w-72 border border-[var(--line)] bg-[var(--ink-900)] px-2 py-1 text-[11px] outline-none focus:border-[var(--brass)]"
+        style={{ color: 'var(--paper)' }}
+      />
+      <Button tone="accent" onClick={() => void save()} disabled={!token.trim() || busy}>
+        {busy ? '写入中…' : '写入'}
+      </Button>
+      {result && (
+        <span
+          className="w-full text-[11px]"
+          style={{ color: result.ok ? 'var(--paper-dim)' : 'var(--warn)' }}
+        >
+          {result.text}
+        </span>
+      )}
+    </div>
+  );
+}
 
 /** 这一条能用来做什么：说中文，别把服务端的枚举值原样摆在人眼前。 */
 function capabilityLabel(capability: string): string {
@@ -77,6 +157,23 @@ export function SettingsView() {
           : identity.state === 'unknown'
             ? '读不到'
             : '没有密钥';
+
+  // 一个平台一行。读的是服务端按平台各给的那一份，不是把自己拼出来的
+  // `provider` 反推另一家：两家都连上时 `provider` 只报得下其中一个。
+  const platforms = [
+    {
+      id: 'github',
+      label: 'GitHub',
+      connected: contrib?.github?.configured ?? false,
+      channel: contrib?.device_flow_available ? '设备码 · 粘贴令牌' : '粘贴令牌',
+    },
+    {
+      id: 'gitee',
+      label: 'Gitee',
+      connected: contrib?.gitee?.configured ?? false,
+      channel: contrib?.gitee_oauth_available ? '授权码 · 粘贴令牌' : '粘贴令牌',
+    },
+  ];
 
   return (
     <ViewFrame
@@ -252,14 +349,9 @@ export function SettingsView() {
             <Readings
               from={{ what: contribution.what, at: contribution.at }}
               source="GET /api/v1/admin/contribution-status"
-              caveat="这一格说「连上了没有、钥匙停在哪一步」，不说「平台通不通」——通不通要真发一次请求才知道。"
+              caveat="这一格说「连上了没有、钥匙停在哪一步」，不说「平台通不通」——通不通要真发一次请求才知道。两个平台各给一行，一个连上一个没连上也照样看得出是哪一个。"
             >
               <div className="flex flex-wrap py-2">
-                <Reading
-                  label="已连接平台"
-                  value={contrib.configured ? contrib.provider : '未连接'}
-                  tone={contrib.configured ? 'ok' : 'warn'}
-                />
                 <Reading
                   label="SSH 身份"
                   value={identityLabel}
@@ -275,6 +367,34 @@ export function SettingsView() {
                 <Reading label="回流策略" value={contrib.policy} />
               </div>
             </Readings>
+            {/* 一行一个平台。以前这里只有一格「已连接平台」，两个平台只报得下其中一个：
+                另一家连没连、能走哪条通道，在这一页上是看不出来的。 */}
+            <Table
+              columns={[
+                { key: 'platform', title: '平台', width: '110px', render: (p) => (
+                  <span className="mono text-[11px]">{p.label}</span>
+                ) },
+                { key: 'state', title: '连接', width: '110px', render: (p) => (
+                  <span style={{ color: p.connected ? 'var(--ok)' : 'var(--muted)' }}>
+                    {p.connected ? '已连接' : '未连接'}
+                  </span>
+                ) },
+                { key: 'channel', title: '可走的通道', render: (p) => (
+                  <span className="text-[11px] text-[var(--paper-dim)]">{p.channel}</span>
+                ) },
+              ]}
+              rows={platforms}
+              rowKey={(p) => p.id}
+            />
+            <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
+              令牌只写不读：保存时网关把它写进带外 Secret，这一页永远读不回明文。设备码与授权码
+              两条通道要网关自己配好 OAuth 应用才可用，都不可用时用下面的粘贴令牌。
+            </p>
+            <PatRow
+              onSaved={() => {
+                contribution.refresh();
+              }}
+            />
             {identity?.fingerprint && (
               <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
                 公钥指纹 <span className="mono">{identity.fingerprint}</span>
@@ -283,12 +403,6 @@ export function SettingsView() {
             {identity?.note && (
               <p className="px-4 py-2 text-[11px] text-[var(--warn)]">{identity.note}</p>
             )}
-            <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
-              GitHub 设备码 {contrib.device_flow_available ? '可用' : '不可用（缺 OAuth App client_id）'}；
-              Gitee 授权码 {contrib.gitee_oauth_available ? '可用' : '不可用（缺 client_secret）'}；
-              两条都不可用时用粘贴令牌。凭据的写入都在浮层里完成，写完之后网关自己滚动，
-              读回来才是新状态。
-            </p>
           </>
         )}
       </section>

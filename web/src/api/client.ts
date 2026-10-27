@@ -133,8 +133,13 @@ export interface ClusterOverview {
   queued_tasks: number | null;
   failed_tasks: number | null;
   avg_task_duration_ms: number | null;
-  /** 告警面的判词：有东西在 firing 就是 degraded，没有来源答话就是 unknown。 */
-  cluster_health: string;
+  /**
+   * 告警面的判词：有东西在 firing 就是 degraded，没有来源答话就是 unknown。
+   *
+   * 闭集而不是 `string`：界面按这几个词选颜色、决定要不要报一条问题，多写的
+   * 那个值不会报错，只会让行画成默认色——读起来正好是「一切正常」。
+   */
+  cluster_health: 'healthy' | 'degraded' | 'unknown';
   timestamp: string;
   total_squads: number | null;
   active_squads: number | null;
@@ -1368,16 +1373,21 @@ export async function getTrace(traceId: string): Promise<AgentTrace> {
   return api.get<AgentTrace>(`/api/v1/traces/${encodeURIComponent(traceId)}`);
 }
 
+/**
+ * 每一行是一次探测的结论。`status` 是网关 `BackendState` 声明的那几个词，
+ * 面板按它选颜色，所以这里是闭集：多写一个 `| string` 就等于说「随便什么词
+ * 我都收」，而收下之后落进的那一支正是「没探出结论」那一支。
+ */
 export interface BackendHealth {
   name: string;
-  status: 'up' | 'down' | 'degraded' | 'unknown' | string;
+  status: 'up' | 'down' | 'degraded' | 'unknown';
   latency_ms: number | null;
   last_checked: string | null;
   error: string | null;
 }
 
 export interface BackendHealthMatrix {
-  overall: string;
+  overall: 'up' | 'down' | 'degraded' | 'unknown';
   backends: BackendHealth[];
 }
 
@@ -2114,26 +2124,34 @@ export async function getResourceReport(): Promise<ResourceReport> {
   return api.get<ResourceReport>('/api/v1/cluster/quota');
 }
 
-export interface DeploymentView {
+/**
+ * 命名空间里的一个工作负载，不分工种。
+ *
+ * `kind` 是工种（Deployment / StatefulSet / DaemonSet / CronJob / Job）。一部分
+ * 字段只对某些工种有意义，别的工种给 `null` 而不是 0——屏幕上「不适用」和「零个
+ * 就绪」是两件事，写成 0 就把没这个概念读成了坏状态。
+ */
+export interface WorkloadView {
+  kind: string;
   name: string;
-  ready_replicas: number;
-  desired_replicas: number;
-  updated_replicas: number;
-  available_replicas: number;
+  ready: number | null;
+  desired: number | null;
+  updated: number | null;
+  available: number | null;
   revision: string | null;
   images: string[];
   conditions: TopologyCondition[];
 }
 
-export interface DeploymentsReport {
+export interface WorkloadsReport {
   namespace: string;
   error: string | null;
-  deployments: DeploymentView[];
+  workloads: WorkloadView[];
   collected_at: string;
 }
 
-export async function getDeployments(): Promise<DeploymentsReport> {
-  return api.get<DeploymentsReport>('/api/v1/cluster/deployments');
+export async function getWorkloads(): Promise<WorkloadsReport> {
+  return api.get<WorkloadsReport>('/api/v1/cluster/deployments');
 }
 
 /**

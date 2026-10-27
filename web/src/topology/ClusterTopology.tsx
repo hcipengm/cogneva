@@ -1,11 +1,12 @@
 import { useState } from 'react';
 import {
   getClusterTopology,
+  type ClusterTopology as ClusterTopologyData,
   type TopologyCluster,
   type TopologyNode,
   type TopologyPod,
 } from '@/api/client';
-import { useResource } from '@/hooks/useResource';
+import { useResource, type Resource } from '@/hooks/useResource';
 import { BreathingTopology } from '@/topology/BreathingTopology';
 import { clusterName, formatBytes, formatCpu } from '@/topology/format';
 import { ContainerRow, Dot, EventRow, VolumeRow } from '@/topology/rows';
@@ -30,8 +31,11 @@ import { Empty, Loading, ReadError } from '@/ui/primitives';
  * 混成一个数，读者会拿其中一个去回答另一个问题。没有 metrics-server 时用量显示
  * 「—」并在集群那一行说明，不画一条零线——零用量和没有数据是两件事。
  */
-export function ClusterTopology() {
-  const topology = useResource('集群拓扑', getClusterTopology, 10_000);
+export function ClusterTopology({ reading }: { reading?: Resource<ClusterTopologyData> } = {}) {
+  // 调用方已经读着同一份读数时（资源页把它挂在顶上，下面还要用自己的那份算余量），
+  // 这里就不再单开一条轮询：同一个接口一屏问两次，两个数还会各自按自己的间隔跳。
+  const own = useResource('集群拓扑', getClusterTopology, 10_000, reading === undefined);
+  const topology = reading ?? own;
   const data = topology.data;
 
   if (topology.error && !data) {

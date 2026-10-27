@@ -36,7 +36,7 @@ trap 'rm -rf "${work}"' EXIT
 fixture() {
   rm -rf "${work}/web" "${work}/crates"
   mkdir -p "${work}/web/src/api" "${work}/web/src/hooks" "${work}/web/src/topology" \
-    "${work}/crates/cog-gateway/src"
+    "${work}/web/src/views" "${work}/crates/cog-gateway/src"
   cat >"${work}/web/src/main.tsx" <<'EOF'
 import App from './App';
 render(<App />);
@@ -79,6 +79,14 @@ export function useTopology() {
   const topology = useResource('集群拓扑', getClusterTopology, 10_000);
   return topology.data?.clusters ?? [];
 }
+EOF
+  # 资源页也挂着这棵树，且把读数递进去（不自己再读一条）。
+  cat >"${work}/web/src/views/ResourcesView.tsx" <<'EOF'
+import { ClusterTopology } from '@/topology/ClusterTopology';
+export function ResourcesView() {
+  return <ClusterTopology reading={reading} />;
+}
+const reading = useResource('集群读数', getClusterTopology, 15_000);
 EOF
   cat >"${work}/web/src/api/client.ts" <<'EOF'
 export async function getClusterTopology() {
@@ -312,6 +320,22 @@ open(path, "w", encoding="utf-8").write(src)
 FIXPATCH
 confirm "${work}/web/src/topology/TopologyPanel.tsx" "container.processes"
 expect_green "容器进程表上屏"
+
+# 15. 资源页没挂这棵树：打开「资源」的人只看得到一堆数，不知道这些数说的是谁。
+fixture
+cat >"${work}/web/src/views/ResourcesView.tsx" <<'EOF'
+export function ResourcesView() {
+  return <div />;
+}
+EOF
+confirm "${work}/web/src/views/ResourcesView.tsx" "return <div />"
+expect_red "资源页没挂拓扑树" "没有挂拓扑树"
+
+# 15b. 挂了但自己再读一条：同一屏上同一个接口问两次，两处的数各按各的间隔跳。
+fixture
+sed -i 's/ reading={reading}//' "${work}/web/src/views/ResourcesView.tsx"
+confirm "${work}/web/src/views/ResourcesView.tsx" "<ClusterTopology />"
+expect_red "挂了但没递读数" "没把读数递进去"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0

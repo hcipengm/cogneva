@@ -1314,14 +1314,30 @@ pub struct ResourceReport {
     pub collected_at: DateTime<Utc>,
 }
 
+/// 命名空间里的一个工作负载，不分工种。
+///
+/// 这一面原先只读 Deployment，理由是版本号与滚动进度只有它有。但「这一版滚到第几步」
+/// 只是这一面要答的一半问题，另一半是「这个命名空间里到底跑着什么」——只列
+/// Deployment 会让 postgres（StatefulSet）、三个常驻采集器（DaemonSet）、每次主线与
+/// 演练各一个 Job 从页面上消失，而页面看起来是完整的。
+///
+/// 副本那四格按工种各自的读法填：Deployment / StatefulSet 读 status 的四个计数，
+/// DaemonSet 读 desiredNumberScheduled / numberReady 那组，Job 的「到位」是
+/// succeeded，CronJob 没有副本概念、只有在跑的 Job 数。**某个工种没有的读法一律给
+/// None，不给 0**：0 是一个读数，None 是「这个工种没有这一格」，混成一个数读者就
+/// 会拿「0 个新版本」去回答「没滚上去」。
 #[derive(Debug, Clone, Serialize)]
-pub struct DeploymentView {
+pub struct WorkloadView {
+    /// 工种：Deployment / StatefulSet / DaemonSet / CronJob / Job。
+    pub kind: String,
     pub name: String,
-    pub ready_replicas: u32,
-    pub desired_replicas: u32,
-    pub updated_replicas: u32,
-    pub available_replicas: u32,
-    /// `deployment.kubernetes.io/revision`：这一版是第几次改动滚动上去的。
+    pub ready: Option<u32>,
+    pub desired: Option<u32>,
+    pub updated: Option<u32>,
+    pub available: Option<u32>,
+    /// `deployment.kubernetes.io/revision`：这一版是第几次改动滚动上去的。只有
+    /// Deployment 用这个数字；StatefulSet 的历史是 ControllerRevision 对象，不是
+    /// 一个可以印在行上的序号。
     pub revision: Option<String>,
     pub images: Vec<String>,
     /// 含 `Progressing` / `Available` 与滚动卡住时的 `ProgressDeadlineExceeded`。
@@ -1329,10 +1345,10 @@ pub struct DeploymentView {
 }
 
 #[derive(Debug, Serialize)]
-pub struct DeploymentsReport {
+pub struct WorkloadsReport {
     pub namespace: String,
     pub error: Option<String>,
-    pub deployments: Vec<DeploymentView>,
+    pub workloads: Vec<WorkloadView>,
     pub collected_at: DateTime<Utc>,
 }
 
@@ -1495,49 +1511,144 @@ fn limits_from(list: &Value) -> Vec<LimitView> {
         .collect()
 }
 
-fn deployments_from(list: &Value) -> Vec<DeploymentView> {
+/// 这一面认的五个工种，顺序就是它们在页面上的顺序。
+///
+/// 常驻的排在前面、一次性的排在后面：Job 一天能攒几十个（每次主线部署、每次备份演练
+/// 各一个），排在后面才不会把「谁在跑第几版」淹掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadKind {
+    Deployment,
+    StatefulSet,
+    DaemonSet,
+    CronJob,
+    Job,
+}
+
+impl WorkloadKind {
+    pub const ALL: [WorkloadKind; 5] = [
+        WorkloadKind::Deployment,
+        WorkloadKind::StatefulSet,
+        WorkloadKind::DaemonSet,
+        WorkloadKind::CronJob,
+        WorkloadKind::Job,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkloadKind::Deployment => "Deployment",
+            WorkloadKind::StatefulSet => "StatefulSet",
+            WorkloadKind::DaemonSet => "DaemonSet",
+            WorkloadKind::CronJob => "CronJob",
+            WorkloadKind::Job => "Job",
+        }
+    }
+
+    /// apiserver 上取这一工种列表的路径。
+    ///
+    /// Deployment / StatefulSet / DaemonSet 在 apps/v1，CronJob / Job 在 batch/v1：
+    /// 分组不是可以统一拼出来的，写成分支。
+    fn list_path(self, namespace: &str) -> String {
+        match self {
+            WorkloadKind::Deployment => {
+                format!("/apis/apps/v1/namespaces/{namespace}/deployments")
+            }
+            WorkloadKind::StatefulSet => {
+                format!("/apis/apps/v1/namespaces/{namespace}/statefulsets")
+            }
+            WorkloadKind::DaemonSet => format!("/apis/apps/v1/namespaces/{namespace}/daemonsets"),
+            WorkloadKind::CronJob => format!("/apis/batch/v1/namespaces/{namespace}/cronjobs"),
+            WorkloadKind::Job => format!("/apis/batch/v1/namespaces/{namespace}/jobs"),
+        }
+    }
+
+    /// 容器声明在对象里的位置。CronJob 的模板套在 jobTemplate 里，比别的工种深一层。
+    fn containers(self) -> &'static str {
+        match self {
+            WorkloadKind::CronJob => "/spec/jobTemplate/spec/template/spec/containers",
+            _ => "/spec/template/spec/containers",
+        }
+    }
+}
+
+fn workloads_from(kind: WorkloadKind, list: &Value) -> Vec<WorkloadView> {
     let Some(items) = list.get("items").and_then(Value::as_array) else {
         return Vec::new();
     };
     items
         .iter()
-        .map(|item| {
-            let count =
-                |pointer: &str| item.pointer(pointer).and_then(Value::as_u64).unwrap_or(0) as u32;
-            DeploymentView {
-                name: item
-                    .pointer("/metadata/name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                ready_replicas: count("/status/readyReplicas"),
-                // spec.replicas 缺省是 1，不是 0：没写这个字段的 Deployment
-                // 也是要一个副本的。
-                desired_replicas: item
-                    .pointer("/spec/replicas")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1) as u32,
-                updated_replicas: count("/status/updatedReplicas"),
-                available_replicas: count("/status/availableReplicas"),
-                revision: item
-                    .pointer("/metadata/annotations/deployment.kubernetes.io~1revision")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                images: item
-                    .pointer("/spec/template/spec/containers")
-                    .and_then(Value::as_array)
-                    .map(|containers| {
-                        containers
-                            .iter()
-                            .filter_map(|container| container.get("image").and_then(Value::as_str))
-                            .map(str::to_string)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                conditions: conditions_of(item),
-            }
-        })
+        .filter_map(|item| workload_from(kind, item))
         .collect()
+}
+
+fn workload_from(kind: WorkloadKind, item: &Value) -> Option<WorkloadView> {
+    let name = item.pointer("/metadata/name").and_then(Value::as_str)?;
+    let count = |pointer: &str| {
+        item.pointer(pointer)
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+    };
+    let (ready, desired, updated, available) = match kind {
+        // spec.replicas 缺省是 1，不是 0：没写这个字段的 Deployment 与 StatefulSet
+        // 也是要一个副本的。写成 0 会把它们读成「缩到零」。
+        WorkloadKind::Deployment | WorkloadKind::StatefulSet => (
+            count("/status/readyReplicas"),
+            count("/spec/replicas").or(Some(1)),
+            count("/status/updatedReplicas"),
+            count("/status/availableReplicas"),
+        ),
+        // DaemonSet 的「要几个」由节点数决定，写在 status 里而不在 spec 里。
+        WorkloadKind::DaemonSet => (
+            count("/status/numberReady"),
+            count("/status/desiredNumberScheduled"),
+            count("/status/updatedNumberScheduled"),
+            count("/status/numberAvailable"),
+        ),
+        // Job 的「到位」是成功跑完的次数；它没有滚动，也没有「可用副本」。
+        WorkloadKind::Job => (
+            count("/status/succeeded"),
+            count("/spec/completions").or(Some(1)),
+            None,
+            None,
+        ),
+        // CronJob 没有副本：能读的只有此刻有几个 Job 在跑，以及下一次排在什么时候
+        // （后者在 spec.schedule 上，不在这一行）。
+        WorkloadKind::CronJob => (
+            item.pointer("/status/active")
+                .and_then(Value::as_array)
+                .map(|active| active.len() as u32),
+            None,
+            None,
+            None,
+        ),
+    };
+
+    Some(WorkloadView {
+        kind: kind.as_str().to_string(),
+        name: name.to_string(),
+        ready,
+        desired,
+        updated,
+        available,
+        revision: match kind {
+            WorkloadKind::Deployment => item
+                .pointer("/metadata/annotations/deployment.kubernetes.io~1revision")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        },
+        images: item
+            .pointer(kind.containers())
+            .and_then(Value::as_array)
+            .map(|containers| {
+                containers
+                    .iter()
+                    .filter_map(|container| container.get("image").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        conditions: conditions_of(item),
+    })
 }
 
 pub async fn cluster_quota_handler() -> Json<ResourceReport> {
@@ -1589,30 +1700,58 @@ pub async fn cluster_quota_handler() -> Json<ResourceReport> {
     })
 }
 
-pub async fn cluster_deployments_handler() -> Json<DeploymentsReport> {
+pub async fn cluster_deployments_handler() -> Json<WorkloadsReport> {
     let collected_at = Utc::now();
     let Ok(client) = KubeClient::in_cluster() else {
-        return Json(DeploymentsReport {
+        return Json(WorkloadsReport {
             namespace: String::new(),
-            error: Some("不在集群里跑，读不到部署".to_string()),
-            deployments: Vec::new(),
+            error: Some("不在集群里跑，读不到工作负载".to_string()),
+            workloads: Vec::new(),
             collected_at,
         });
     };
 
     let namespace = client.namespace().to_string();
-    let (deployments, error) = match client
-        .get_json(&format!("/apis/apps/v1/namespaces/{namespace}/deployments"))
-        .await
-    {
-        Ok(list) => (deployments_from(&list), None),
-        Err(e) => (Vec::new(), Some(format!("读不到 Deployment：{e}"))),
-    };
+    let paths: Vec<String> = WorkloadKind::ALL
+        .iter()
+        .map(|kind| kind.list_path(&namespace))
+        .collect();
+    // 五个工种互不依赖，一起问。先后问的话一次页面刷新要串五次 apiserver，
+    // 其中 Job 那一列还是全命名空间最大的一列。
+    let (deployment, statefulset, daemonset, cronjob, job) = tokio::join!(
+        client.get_json(&paths[0]),
+        client.get_json(&paths[1]),
+        client.get_json(&paths[2]),
+        client.get_json(&paths[3]),
+        client.get_json(&paths[4]),
+    );
 
-    Json(DeploymentsReport {
+    let mut workloads = Vec::new();
+    let mut errors = Vec::new();
+    let results = [
+        (WorkloadKind::Deployment, deployment),
+        (WorkloadKind::StatefulSet, statefulset),
+        (WorkloadKind::DaemonSet, daemonset),
+        (WorkloadKind::CronJob, cronjob),
+        (WorkloadKind::Job, job),
+    ];
+    for (kind, result) in results {
+        match result {
+            Ok(list) => workloads.extend(workloads_from(kind, &list)),
+            // 一种读不到不该把另外四种也吞掉：报出是哪种，其余照列，
+            // 让人分得清「集群里没有 StatefulSet」和「StatefulSet 没读到」。
+            Err(e) => errors.push(format!("读不到 {}：{e}", kind.as_str())),
+        }
+    }
+
+    Json(WorkloadsReport {
         namespace,
-        error,
-        deployments,
+        error: if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("；"))
+        },
+        workloads,
         collected_at,
     })
 }
@@ -2462,12 +2601,13 @@ mod topology_tests {
             }
         }]});
 
-        let deployments = deployments_from(&list);
+        let deployments = workloads_from(WorkloadKind::Deployment, &list);
         let deployment = &deployments[0];
+        assert_eq!(deployment.kind, "Deployment");
         assert_eq!(deployment.revision.as_deref(), Some("7"));
-        assert_eq!(deployment.desired_replicas, 2);
-        assert_eq!(deployment.ready_replicas, 1);
-        assert_eq!(deployment.available_replicas, 1);
+        assert_eq!(deployment.desired, Some(2));
+        assert_eq!(deployment.ready, Some(1));
+        assert_eq!(deployment.available, Some(1));
         assert_eq!(deployment.images, vec!["cogneva:abc", "proxy:def"]);
         assert!(
             !deployment.conditions[0].ok,
@@ -2479,9 +2619,103 @@ mod topology_tests {
     fn a_deployment_without_annotations_still_says_how_many_it_wants() {
         let list = json!({"items": [{"metadata": {"name": "bare"}, "spec": {}}]});
 
-        let deployments = deployments_from(&list);
-        assert_eq!(deployments[0].desired_replicas, 1, "缺省是 1，不是 0");
+        let deployments = workloads_from(WorkloadKind::Deployment, &list);
+        assert_eq!(deployments[0].desired, Some(1), "缺省是 1，不是 0");
         assert_eq!(deployments[0].revision, None);
         assert!(deployments[0].images.is_empty());
+    }
+
+    /// 这一面的清单只读 Deployment 时，页面上就只剩 Deployment：postgres / redis
+    /// 是 StatefulSet，claim-store / host-ledger / buildah 是 DaemonSet，备份是
+    /// CronJob，主线部署是 Job——它们在集群里跑着而页面说「没有」，是最坏的一种
+    /// 读法，因为空白读起来像「本来就没有」。
+    #[test]
+    fn the_other_four_kinds_are_counted_by_their_own_status_fields() {
+        let statefulset = json!({"items": [{
+            "metadata": {"name": "postgres"},
+            "spec": {"replicas": 1, "template": {"spec": {"containers": [
+                {"name": "postgres", "image": "postgres:16"}
+            ]}}},
+            "status": {"readyReplicas": 1, "updatedReplicas": 1}
+        }]});
+        let statefulset = &workloads_from(WorkloadKind::StatefulSet, &statefulset)[0];
+        assert_eq!(statefulset.kind, "StatefulSet");
+        assert_eq!(statefulset.desired, Some(1));
+        assert_eq!(statefulset.ready, Some(1));
+        assert_eq!(
+            statefulset.revision, None,
+            "revision 注解是 Deployment 的滚动版本，别的工种没有"
+        );
+        assert_eq!(statefulset.images, vec!["postgres:16"]);
+
+        let daemonset = json!({"items": [{
+            "metadata": {"name": "claim-store"},
+            "spec": {"template": {"spec": {"containers": [{"name": "app", "image": "cog:1"}]}}},
+            "status": {
+                "desiredNumberScheduled": 1,
+                "numberReady": 1,
+                "updatedNumberScheduled": 1,
+                "numberAvailable": 1
+            }
+        }]});
+        let daemonset = &workloads_from(WorkloadKind::DaemonSet, &daemonset)[0];
+        assert_eq!(daemonset.desired, Some(1), "「要几个」由节点数决定");
+        assert_eq!(daemonset.ready, Some(1));
+        assert_eq!(daemonset.available, Some(1));
+
+        let job = json!({"items": [{
+            "metadata": {"name": "cogneva-mainline-4bce6962bc33"},
+            "spec": {"completions": 1, "template": {"spec": {"containers": [
+                {"name": "mainline", "image": "cogneva:main-1"}
+            ]}}},
+            "status": {"succeeded": 1}
+        }]});
+        let job = &workloads_from(WorkloadKind::Job, &job)[0];
+        assert_eq!(job.kind, "Job");
+        assert_eq!(job.ready, Some(1), "Job 的到位是「跑完了」");
+        assert_eq!(job.desired, Some(1));
+        assert_eq!(
+            (job.updated, job.available),
+            (None, None),
+            "Job 不滚动，这两个数对它没有意义；给 0 会被读成「零个就绪」"
+        );
+        assert_eq!(job.images, vec!["cogneva:main-1"]);
+
+        // CronJob 的容器声明套在 jobTemplate 里，比别的工种深一层；读错位置就
+        // 只能读到空镜像列表，而那读起来像「这个 CronJob 没有容器」。
+        let cronjob = json!({"items": [{
+            "metadata": {"name": "cogneva-backup"},
+            "spec": {"schedule": "0 3 * * *", "jobTemplate": {"spec": {"template": {"spec": {
+                "containers": [{"name": "backup", "image": "cogneva:main-1"}]
+            }}}}},
+            "status": {"active": [{"name": "cogneva-backup-29000000"}]}
+        }]});
+        let cronjob = &workloads_from(WorkloadKind::CronJob, &cronjob)[0];
+        assert_eq!(cronjob.kind, "CronJob");
+        assert_eq!(cronjob.ready, Some(1), "此刻有一个 Job 在跑");
+        assert_eq!(
+            (cronjob.desired, cronjob.updated, cronjob.available),
+            (None, None, None)
+        );
+        assert_eq!(cronjob.images, vec!["cogneva:main-1"]);
+    }
+
+    /// 每个工种问的是自己那一组接口，路径不是拼出来的。
+    #[test]
+    fn every_kind_lists_its_own_resource() {
+        let paths: Vec<String> = WorkloadKind::ALL
+            .iter()
+            .map(|kind| kind.list_path("cogneva"))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/apis/apps/v1/namespaces/cogneva/deployments",
+                "/apis/apps/v1/namespaces/cogneva/statefulsets",
+                "/apis/apps/v1/namespaces/cogneva/daemonsets",
+                "/apis/batch/v1/namespaces/cogneva/cronjobs",
+                "/apis/batch/v1/namespaces/cogneva/jobs",
+            ]
+        );
     }
 }

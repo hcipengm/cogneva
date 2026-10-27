@@ -34,6 +34,11 @@
 #   11. 容器自报的进程表要显示出名字——那一份是容器自己推上来的 `/proc`，它答的是
 #       「这个容器里跑着什么」，只显示 Pod 级的计数等于把它收下又扔掉。
 #
+#   12. 资源页顶部也挂这棵树。资源这一面回答的是「这些东西分别占了什么」，而最自然的
+#       读法是从最大的包含关系往下读；只在观测面的拓扑板里的话，打开「资源」的人看到
+#       的是一堆数，而不知道这些数说的是谁。两处必须是同一个组件、同一份读数——
+#       各画一份的那天，同一台节点的 CPU 会在两页上给出两个数。
+#
 # 用法：bash deploy/scripts/check-web-topology-panel.sh [仓库根目录]
 set -euo pipefail
 
@@ -295,6 +300,26 @@ if CONTAINER_PROCESSES and reports_processes and not shows_container_processes:
         f"{where}: 服务端收到了容器自报的进程表并挂在每个容器上，"
         "读面没有一处遍历它——「容器里跑着什么」仍然只有数、没有名字"
     )
+
+# ── 12. 资源页顶部也挂这棵树，且是同一个组件 ──
+# 资源页自己已经读着 `/api/v1/cluster/topology`（它算节点余量要用），所以这里额外要求
+# 读数是从外面递进去的：再开一条自己的轮询，同一屏上同一个接口会问两次，两处的数按
+# 各自的间隔跳。
+RESOURCES = os.path.join(WEB, "views/ResourcesView.tsx")
+if not os.path.isfile(RESOURCES):
+    problems.append("读不到 web/src/views/ResourcesView.tsx——资源页在不在都没人问")
+else:
+    resources = open(RESOURCES, encoding="utf-8").read()
+    if not re.search(r"from\s+'@/topology/ClusterTopology'", resources):
+        problems.append(
+            "ResourcesView: 没有挂拓扑树（`@/topology/ClusterTopology`）——资源页只给数，"
+            "不给人「这些东西分别是谁」"
+        )
+    elif not re.search(r"<ClusterTopology\b[^>]*\breading=", resources):
+        problems.append(
+            "ResourcesView: 挂了拓扑树但没把读数递进去——它会自己再读一条，"
+            "同一屏上同一个接口问两次，两处的数各按各的间隔跳"
+        )
 
 if problems:
     sys.exit("拓扑读面的消费者不合格：\n  " + "\n  ".join(problems))

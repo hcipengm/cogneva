@@ -1,19 +1,24 @@
 import {
   getClusterTopology,
   getResourceReport,
-  type ClusterTopology,
+  type ClusterTopology as ClusterTopologyData,
   type TopologyClaim,
   type TopologyCluster,
 } from '@/api/client';
 import { useResource, type Resource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
+import { ClusterTopology } from '@/topology/ClusterTopology';
 import { clusterName, formatBytes, formatCpu } from '@/topology/format';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 import { BarList } from '@/ui/plots';
 
 /**
- * 资源面：配额、可调度余量、存储账本。
+ * 资源面：拓扑树、配额、可调度余量、存储账本。
+ *
+ * 顶上是「集群 ⊃ 节点 ⊃ Pod ⊃ 容器（展开到容器里的进程）」那棵树：资源这一面回答的
+ * 就是「这些东西分别占了什么」，从最大的包含关系往下读，比先读配额再倒推谁在占它更
+ * 自然。这棵树与观测面的拓扑板是同一个组件、同一份读数，不是两套画法。
  *
  * 与拓扑面共用同一份集群读数（`/api/v1/cluster/topology`），不另取一套：同一台
  * 节点的 CPU 在两张页上必须是同一个数，否则「余量不够」和「节点空着」会同时成立。
@@ -45,6 +50,15 @@ export function ResourcesView() {
           : '按 30 秒重读'
       }
     >
+      <section className="border-b border-[var(--line)]">
+        <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
+          集群 → 节点 → Pod → 容器 → 进程 · 包含关系
+        </h2>
+        {/* 读数由这一面自己的那一份给进去（下面节点余量表算的是同一份），不在这里
+            再读一遍：同一屏上同一个接口问两次，两处的数会各自按自己的间隔跳。 */}
+        <ClusterTopology reading={topology} />
+      </section>
+
       <section className="border-b border-[var(--line)]">
         <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
           配额与默认限额 · 准入前的账
@@ -173,7 +187,7 @@ function NodeBudget({
   cluster: TopologyCluster;
   index: number;
   total: number;
-  source: Resource<ClusterTopology>;
+  source: Resource<ClusterTopologyData>;
 }) {
   return (
     <section className="border-b border-[var(--line)]">
