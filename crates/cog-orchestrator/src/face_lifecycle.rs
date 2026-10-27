@@ -288,7 +288,7 @@ pub async fn dispatch_face_lifecycle(
     if plan.nominate.is_none() && plan.retire.is_empty() {
         return;
     }
-    let day = now.format("%Y-%m-%d").to_string();
+    let day = now.format(cog_core::DAY_KEY_FORMAT).to_string();
     if let Some(ref nomination) = plan.nominate {
         let id = propose_goal_id(&day);
         submit(

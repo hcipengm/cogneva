@@ -3800,7 +3800,10 @@ impl MainlineDeployer {
         let Some(orchestrator) = self.orchestrator.as_ref() else {
             return;
         };
-        let id = ci_hold_goal_id(rev, &Utc::now().format("%Y-%m-%d").to_string());
+        let id = ci_hold_goal_id(
+            rev,
+            &Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string(),
+        );
         let goal = ci_hold_goal_text(rev, failed_checks);
         let mut row = cog_core::Task::goal_row(id.clone(), &goal);
         // The row is the goal's identity marker and is never executed: the

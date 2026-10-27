@@ -58,7 +58,10 @@ impl FileSystemIpc {
 
     /// Current date-stamped filename.
     fn current_file() -> String {
-        chrono::Utc::now().format("%Y-%m-%d").to_string() + ".jsonl"
+        chrono::Utc::now()
+            .format(cog_core::DAY_KEY_FORMAT)
+            .to_string()
+            + ".jsonl"
     }
 
     /// Write a message to the given squad channel.

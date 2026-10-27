@@ -116,16 +116,12 @@ pub mod plugin;
 #[cfg(feature = "redis")]
 pub use dlq::RedisDeadLetterQueue;
 
-/// The date form a rotating raw log file is named with, and the only one a
-/// reader may assume.
+/// The day key, declared where every crate can read it.
 ///
-/// It is written twice by necessity — once to build the file name and once to
-/// parse it back — and those two are never in the same function. Change the
-/// writer and the migrator goes on looking for names that are no longer
-/// produced: it finds nothing, which it reports exactly the way it reports a
-/// day with no traffic, so the logs stop being migrated and stop being
-/// compacted while every reading still looks normal.
-pub const DAY_KEY_FORMAT: &str = "%Y-%m-%d";
+/// Re-exported rather than declared here: the same form also names the
+/// day-scoped goal ids, and those are built by crates that do not depend on
+/// storage. Two declarations would agree until one of them moved.
+pub use cog_core::DAY_KEY_FORMAT;
 
 /// The stem a raw log file written on `day` is named with.
 ///
@@ -133,5 +129,5 @@ pub const DAY_KEY_FORMAT: &str = "%Y-%m-%d";
 /// formatting the date themselves, so a change of form cannot land on one side
 /// only.
 pub fn log_file_stem(day: chrono::NaiveDate) -> String {
-    day.format(DAY_KEY_FORMAT).to_string()
+    cog_core::day_key(day)
 }

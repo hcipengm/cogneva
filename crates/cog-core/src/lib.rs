@@ -7,6 +7,7 @@ pub mod claim_footprint;
 pub mod config;
 pub mod config_sections;
 pub mod contract;
+pub mod day_key;
 pub mod env;
 pub mod error;
 pub mod fs_size;
@@ -81,6 +82,7 @@ pub use contract::task::*;
 pub use contract::taste::*;
 pub use contract::tool::*;
 pub use contract::wiki::*;
+pub use day_key::{day_key, DAY_KEY_FORMAT};
 pub use error::{SFError, SFResult};
 pub use secrets::{
     redact_json_secrets, redact_secrets, ChainedSecretProvider, EnvSecretProvider,

@@ -384,7 +384,7 @@ async fn dispatch_red_faces(
     orchestrator: &dyn OrchestratorControl,
     now: DateTime<Utc>,
 ) {
-    let day = now.format("%Y-%m-%d").to_string();
+    let day = now.format(cog_core::DAY_KEY_FORMAT).to_string();
     for reading in readings.iter().filter(|r| r.state.is_red()) {
         let id = gap_goal_id(&reading.face_id, reading.state.as_str(), &day);
         let goal = gap_goal_text(reading);

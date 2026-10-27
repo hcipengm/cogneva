@@ -7,7 +7,7 @@
 //! longer written, and every one of those readers answers an absence the same
 //! way it answers "nothing happened".
 //!
-//! So the values are read out of the declaration crate at test time and every
+//! So the values are read out of the declaring crates at test time and every
 //! other crate's production code is searched for them. A site that legitimately
 //! names a *different* thing with the same spelling is listed below with the
 //! reason; a listed site that stops existing is reported too, because an
@@ -27,9 +27,30 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Where the shared strings are declared. Not searched for retypes: this is the
-/// one place they are supposed to be written.
-const DECLARATION_DIR: &str = "crates/cog-core/src";
+/// Where the shared strings are declared.
+///
+/// The contract crate is the usual home, but not the only one: a crate that
+/// owns a format gives it one declaration and lets everyone else read it from
+/// there — the day key a rotating log file is named with is declared in the
+/// storage crate, beside the writer and the parser that had to agree on it.
+/// Any crate that declares a value is skipped *for that value only*: it is the
+/// owner, so it may write the word; the rest of the workspace may not.
+const DECLARATION_DIRS: &[&str] = &["crates/cog-core/src", "crates/cog-storage/src"];
+
+/// The crate a repo-relative path belongs to (`crates/cog-core/src/x.rs` ->
+/// `crates/cog-core`).
+fn owning_crate(file: &str) -> &str {
+    match file.split_once('/') {
+        Some((_, rest)) => match rest.split_once('/') {
+            Some((krate, _)) => {
+                let end = "crates/".len() + krate.len();
+                &file[..end]
+            }
+            None => file,
+        },
+        None => file,
+    }
+}
 
 /// One production-code line that spells a declared value.
 #[derive(Debug, PartialEq, Eq)]
@@ -94,6 +115,16 @@ const EXEMPT: &[Exempt] = &[
         value: "cluster-registry",
         why: "换机损失清单里的一行，写的是这一行的主题而不是选择器",
     },
+    Exempt {
+        file: "crates/cog-gateway/src/security_gateway.rs",
+        value: "%Y-%m-%d",
+        why: "解析调用方送进来的时间戳，是接受两种外部写法，不是我们自己写出去的名字",
+    },
+    Exempt {
+        file: "crates/cog-wiki/src/llm_maintainer.rs",
+        value: "%Y-%m-%d",
+        why: "给人看的页面日期，读它的是人不是解析器：改格式不产生「找不到」",
+    },
 ];
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -127,7 +158,7 @@ fn structural(value: &str) -> bool {
             .any(|c| matches!(c, '/' | ':' | '.' | '_' | '-'))
 }
 
-/// One `pub const NAME: &str = "value"` in the contract crate, with the file
+/// One `pub const NAME: &str = "value"` in a declaring crate, with the file
 /// that writes it.
 struct Declaration {
     file: String,
@@ -135,10 +166,12 @@ struct Declaration {
     value: String,
 }
 
-/// The `pub const NAME: &str = "value"` declarations in the contract crate.
+/// The `pub const NAME: &str = "value"` declarations in the declaring crates.
 fn declarations(root: &Path) -> Vec<Declaration> {
     let mut files = Vec::new();
-    walk(&root.join(DECLARATION_DIR), &mut files);
+    for dir in DECLARATION_DIRS {
+        walk(&root.join(dir), &mut files);
+    }
     files.sort();
     let mut out = Vec::new();
     for path in files {
@@ -226,7 +259,7 @@ fn literals(line: &str) -> Vec<&str> {
 /// Lines that write a declared marker as the head of a literal of their own.
 ///
 /// The declaring file itself is skipped -- it is where the value is supposed to
-/// be written -- but the rest of the declaration crate is not: a marker
+/// be written -- but the rest of the declaring crate is not: a marker
 /// declared in the contract module is still retyped when the error that carries
 /// it spells the word again.
 fn marker_hits(root: &Path) -> Vec<Hit> {
@@ -289,13 +322,26 @@ fn retyped_value<'a>(line: &str, quoted: &'a [(&'a String, String)]) -> Option<&
         .map(|(value, _)| *value)
 }
 
-/// Every production line in a crate outside the declaration one that spells one
-/// of these values as a whole string literal.
+/// Every production line outside a value's declaring crate that spells that
+/// value as a whole string literal.
 fn retypes(root: &Path, values: &BTreeMap<String, BTreeSet<String>>) -> Vec<Hit> {
     let quoted: Vec<(&String, String)> = values
         .keys()
         .map(|value| (value, format!("\"{value}\"")))
         .collect();
+    // The crate that owns each value, so that it may spell its own word while
+    // every other crate has to read it.
+    let mut declaring: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for declaration in declarations(root) {
+        if !values.contains_key(&declaration.value) {
+            continue;
+        }
+        declaring
+            .entry(declaration.value.clone())
+            .or_default()
+            .insert(owning_crate(&declaration.file).to_string());
+    }
+
     let mut crates: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
         .expect("crates/ 不在仓库里")
         .flatten()
@@ -315,11 +361,15 @@ fn retypes(root: &Path, values: &BTreeMap<String, BTreeSet<String>>) -> Vec<Hit>
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             let file = relative(root, &path);
-            if file.starts_with(DECLARATION_DIR) {
-                continue;
-            }
+            let krate_dir = owning_crate(&file);
             for line in production_lines(&text) {
                 if let Some(value) = retyped_value(line, &quoted) {
+                    let owned_here = declaring
+                        .get(value)
+                        .is_some_and(|crates| crates.contains(krate_dir));
+                    if owned_here {
+                        continue;
+                    }
                     hits.push(Hit {
                         file: file.clone(),
                         value: value.clone(),
@@ -352,7 +402,7 @@ fn every_shared_string_is_spelled_in_the_place_it_is_declared() {
     let unexpected: Vec<&Hit> = hits.iter().filter(|hit| exempted(hit).is_none()).collect();
     assert!(
         unexpected.is_empty(),
-        "这些地方重写了一遍 cog_core 里声明过的字符串。只改一处时不会报错：\
+        "这些地方重写了一遍声明过的字符串。只改一处时不会报错：\
          读旧字符串的那一侧照旧去找一个再也不出现的东西，而「没找到」与\
          「本来就没有」在读数上同形。要么改成读声明，要么在 EXEMPT 里写清为什么\
          这里的同一个拼写指的是另一件事：\n{}",
@@ -504,6 +554,11 @@ const SAME_WORD_DIFFERENT_THING: &[(&str, &str)] = &[
     (
         "decision_event",
         "同上：任务类型与载荷键是两个通道，不是同一个词",
+    ),
+    (
+        "empty",
+        "两族读数各自的「空」：检索结果落在 empty 格，收件箱孤儿状态也落在 empty 格。\
+         它们是两个指标家族里的标签值，谁也不读对方的",
     ),
 ];
 
