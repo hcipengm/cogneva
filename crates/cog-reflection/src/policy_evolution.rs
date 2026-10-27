@@ -36,6 +36,11 @@ pub struct PolicyEvolutionConfig {
     /// 相邻两轮之间的间隔（秒），下限 60。
     pub interval_secs: u64,
     /// 演化的策略名。参数语义由该策略的读取方决定，换名字等于换策略。
+    ///
+    /// 缺省值取自 [`META_LEARNING_POLICY`](crate::META_LEARNING_POLICY)：引擎
+    /// 挂载策略库时用的是那个常量，推荐路径从它名下取 active 版本。驱动若写在
+    /// 另一个名字下，两边都不报错——`load_active` 读不到就退回构造参数，参数
+    /// 搜索赢了也从不生效。所以这个名字不是自由旋钮，它必须与引擎挂的那个同值。
     pub policy_name: String,
     /// 一条参数只有在能落到这么多条已观测结果上时才参与比较。低于这个
     /// 量，两比例检验不可能显著，硬比只会让搜索被噪声主导。
@@ -51,7 +56,7 @@ impl Default for PolicyEvolutionConfig {
         Self {
             enabled: true,
             interval_secs: 3600,
-            policy_name: "meta_learning.mode".into(),
+            policy_name: crate::META_LEARNING_POLICY.into(),
             min_trials: 40,
             min_samples_grid: vec![2, 3, 5, 8],
             margin_grid: vec![0.0, 0.05, 0.1, 0.15, 0.2, 0.3],

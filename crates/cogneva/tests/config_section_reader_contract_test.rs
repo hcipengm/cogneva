@@ -407,6 +407,42 @@ fn every_key_a_shipped_document_writes_is_read_by_something() {
     }
 }
 
+/// The tuned policy's name is one word written in two places, and the two are
+/// read by different sides of the same loop.
+///
+/// The driver writes a winning parameter set under
+/// `self_evolution.artifact_evolution.policy_name`; the recommendation path
+/// reads its active version out of [`cog_reflection::META_LEARNING_POLICY`],
+/// because that is the name the engine mounts the store under. When the two
+/// disagree nothing fails: the driver stores a version, logs that it was
+/// activated, `load_active` on the other name answers `Ok(None)`, and
+/// `tuned_params` falls back to the constructor defaults. Both sides report
+/// success and the search never takes effect — a knob whose value equals a
+/// typo.
+///
+/// So this is not a free knob to be spelled independently: any document that
+/// writes the key must write the constant. A document that leaves the key out
+/// is fine — serde then uses `Default`, which is the same constant.
+#[test]
+fn the_tuned_policy_name_is_the_name_the_recommendation_path_reads() {
+    let mut seen = 0usize;
+    for (file, doc) in shipped_configs(&repo_root()) {
+        let Some(name) = doc.pointer("/self_evolution/artifact_evolution/policy_name") else {
+            continue;
+        };
+        seen += 1;
+        assert_eq!(
+            name.as_str(),
+            Some(cog_reflection::META_LEARNING_POLICY),
+            "{file} writes {name} as the tuned policy's name; the engine mounts the store \
+             under {} and the recommendation path reads only that name — the winning \
+             parameters would be stored where nothing looks",
+            cog_reflection::META_LEARNING_POLICY
+        );
+    }
+    println!("config surface: {seen} shipped documents name the tuned policy");
+}
+
 #[derive(Default)]
 struct Readings {
     sections: usize,
