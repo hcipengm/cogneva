@@ -103,5 +103,12 @@ checkpoint_store_over_capacity	cogneva_checkpoints_over_capacity,cogneva_checkpo
 checkpoint_store_unpruned	cogneva_checkpoints_rows,cogneva_checkpoints_rows_observed_timestamp_seconds,cogneva_checkpoints_budget_rows	code_not_deployed	The row count, its companion and the budget are all emitted by the same sweep; the budget carries no companion in this expression, so none is declared here.
 checkpoint_store_sweep_failed	cogneva_checkpoint_sweep_failed,cogneva_checkpoint_sweep_failed_observed_timestamp_seconds	code_not_deployed	The pass-outcome cell is written by the same sweep, only in git today.
 
+# --- code_not_deployed: the prompt-and-response archive's retention of 2026-10-27 ---
+# The retention loop and its five cells are in git and not in the running image
+# yet, so neither rule can fire: the archive's readings have no publisher until
+# the next rollout. These rows go with the same pass that deletes the ones above.
+llm_exchange_retention_behind	gateway_llm_exchange_oldest_age_seconds,gateway_llm_exchange_oldest_age_seconds_observed_timestamp_seconds,gateway_llm_exchange_keep_seconds,gateway_llm_exchange_keep_seconds_observed_timestamp_seconds	code_not_deployed	Both sides of the comparison come from the retention loop, which is only in git today -- the age of the oldest row and the retention the process enforces are published by the same pass, each with its own companion clock.
+llm_exchange_retention_pass_failed	gateway_llm_exchange_sweep_failed,gateway_llm_exchange_sweep_failed_observed_timestamp_seconds	code_not_deployed	The pass-outcome cell is written by the same retention loop, only in git today.
+
 # --- lazy_counter ---------------------------------------------------------
 mainline_admission_held	cogneva_mainline_admission_held_total	lazy_counter	cog-reflection/src/mainline_deployer.rs records this labelled counter only on a pass where admission actually held the rollout, so the family is created by the first hold. A deployment that never waited has no series, and the rule fires the moment one appears.

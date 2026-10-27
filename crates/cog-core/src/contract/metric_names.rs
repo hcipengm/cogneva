@@ -191,6 +191,28 @@ metric_names! {
     CHECKPOINTS_BYTES => "cogneva_checkpoints_bytes",
     CHECKPOINT_SWEEP_FAILED => "cogneva_checkpoint_sweep_failed",
 
+    // cog-observability — the prompt-and-response archive's retention.
+    //
+    // `gateway_llm_exchange` keeps the bodies of what the platform sent
+    // upstream and what came back, so the size of the archive is set by what
+    // people paste into a prompt rather than by how often they call. Its
+    // retention was enforced only at the gateway's startup — a bound on a row's
+    // life while the gateway is rolled more often than the retention is wide,
+    // which is an assumption about deployment habits and not something the
+    // table can state. Measured on 2026-10-27, on this deployment: 307 MB at
+    // 9,680 rows inside a thirty-day window.
+    //
+    // The age of the oldest row is the retention seen from the reader's side,
+    // and the retention the process enforces is published beside it so the rule
+    // compares two readings instead of a constant written into the rules file.
+    // The bytes are what the nightly backup pays for; they are not a bound,
+    // because PostgreSQL returns a DELETE's space only when it vacuums.
+    LLM_EXCHANGE_ROWS => "gateway_llm_exchange_rows",
+    LLM_EXCHANGE_OLDEST_AGE_SECONDS => "gateway_llm_exchange_oldest_age_seconds",
+    LLM_EXCHANGE_KEEP_SECONDS => "gateway_llm_exchange_keep_seconds",
+    LLM_EXCHANGE_BYTES => "gateway_llm_exchange_bytes",
+    LLM_EXCHANGE_SWEEP_FAILED => "gateway_llm_exchange_sweep_failed",
+
     // cog-storage — the monthly partition maintenance loop's per-round outcome.
     //
     // The loop keeps every time-series parent's window open ahead of the clock

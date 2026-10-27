@@ -2918,10 +2918,6 @@ const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// 库里最大的一张。
 const EXCHANGE_BODY_CAP: usize = 1024 * 1024;
 
-/// 留底保留天数。定在 30 天：足够跨过"改完之后等一次滚动再看效果"的周期，也让表
-/// 的体积有个上界（按今天 425 次成功调用约 26 MB/天算，满打满算不到 1 GB）。
-const EXCHANGE_KEEP_DAYS: i64 = 30;
-
 /// 留底开关。默认开，`COGNEVA_GATEWAY_EXCHANGE_STORE=0` 关——关掉之后台账照写，
 /// 只是正文不落库；这是给"这台部署不该把提示词写进数据库"的准备，而不是故障开关。
 fn exchange_store_enabled() -> bool {
@@ -8333,21 +8329,12 @@ async fn build_pool_observability(
             Ok(store) => match store.init_schema().await {
                 Ok(()) => {
                     tracing::info!("LLM token 计量明细已落 PostgreSQL");
-                    // 留底表的体积由正文长度决定，不由调用数决定；不设保留期，它会
-                    // 长成库里最大的一张。启动时清一次：进程滚得勤，漏一拍只少清一天。
-                    match store.prune_exchanges(EXCHANGE_KEEP_DAYS).await {
-                        Ok(removed) if removed > 0 => {
-                            tracing::info!(
-                                removed,
-                                days = EXCHANGE_KEEP_DAYS,
-                                "LLM 调用留底过期行已清理"
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(error = %e, "LLM 调用留底清理失败（不影响启动）");
-                        }
-                    }
+                    // 留底表（含正文）的保留期不在这里管：它由主应用里的
+                    // `observability_exchange_retention` 循环按同一个库定期清，
+                    // 并且把"最老一行多老 / 保留期是多少 / 占多少字节"发布成读数。
+                    // 放在启动时清一次等于把"一行能活多久"绑在网关的滚动频率上——
+                    // 那是关于部署习惯的假设，不是这张表能陈述的边界；滚动比保留期
+                    // 稀时的后果（表长成库里最大的一张）也没有任何读数会说出来。
                     Some(Arc::new(store))
                 }
                 Err(e) => {

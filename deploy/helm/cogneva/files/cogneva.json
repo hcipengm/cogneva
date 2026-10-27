@@ -2253,6 +2253,26 @@
           "face": "可观测与告警"
         },
         {
+          "name": "llm_exchange_retention_behind",
+          "promql": "min_over_time(((max without (pod, container, instance) (gateway_llm_exchange_oldest_age_seconds)) and ((time() - (max without (pod, container, instance) (gateway_llm_exchange_oldest_age_seconds_observed_timestamp_seconds))) < 1800))[30m:1m]) > 2 * max without (pod, container, instance) (gateway_llm_exchange_keep_seconds and ((time() - gateway_llm_exchange_keep_seconds_observed_timestamp_seconds) < 1800))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The prompt-and-response archive reaches back {value} second(s), more than twice the retention the publishing process says it enforces, so the bodies are not being retired at the age this deployment promises. The archive keeps what was sent upstream and what came back so a later question about one call is answerable without buying it again; what it costs is set by how large the bodies are rather than by how many calls there were, which is why it is bounded by age and not by a row count. Both sides of this comparison are the loop's own readings rather than numbers written here, so a deployment that shortens what it keeps moves its own judgement with it. Twice rather than once because the sweep runs on a period and a healthy archive is allowed to sit at its retention between two passes; only a lag that has survived many of them says the retirement is not happening. The causes worth checking, in order: the loop is not running at all (background_loop_stalled on observability_exchange_retention says so, and it is the faster reading), every pass is failing (llm_exchange_retention_pass_failed names that), or the deletes cannot keep up with what the gateway writes, in which case the row count is rising while this one is over the wall. A frozen reading answers zero and this rule goes quiet by construction: the moment the process stops publishing, its age stops growing too -- so this is the reading for a retention that runs and does not work, and the loop's own liveness readings are what cover a retention that stopped.",
+          "face": "资源泄漏与长稳"
+        },
+        {
+          "name": "llm_exchange_retention_pass_failed",
+          "promql": "(max without (pod, container, instance) (max_over_time(gateway_llm_exchange_sweep_failed[30m]) and ((time() - gateway_llm_exchange_sweep_failed_observed_timestamp_seconds) < 1800))) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The prompt-and-response archive's retention pass could not be completed at some attempt in the last half hour, {value} being the highest outcome those attempts recorded. A pass deletes what is older than the retention in batches and then measures what is left; the row count, the age of the oldest row and the bytes are stamped only once it returns, so a pass that fails leaves all three at their last values and the rule beside this one keeps reading a frozen archive until its own half hour age bound closes it -- a sweep that cannot run and one that is not keeping up then look the same. This is the reading that says the pass itself did not answer, and it is written on every pass rather than only the failed ones. The cause is the delete or the measure that refused, in that container's log. Read it together with the age rule rather than instead of it: this one says the retirement is not running, so nothing is being retired at all, while a pass that returns and still leaves the archive too deep is a different fault and names itself there.",
+          "face": "资源泄漏与长稳"
+        },
+        {
           "name": "memory_decay_passes_all_failed",
           "promql": "(max without (pod, container, instance, job) (increase(cogneva_memory_decay_total{outcome=\"failed\"}[6h])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_memory_decay_total{outcome!=\"failed\"}[6h])) > 0)",
           "condition": {

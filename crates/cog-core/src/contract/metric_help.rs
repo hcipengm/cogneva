@@ -1497,6 +1497,47 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          growing look the same. Written on every pass",
     ),
     (
+        "gateway_llm_exchange_rows",
+        "Rows currently held in the prompt-and-response archive, one per call \
+         whose bodies were kept. The archive is bounded by age rather than by a \
+         row count, because what it costs is set by how large the bodies are \
+         rather than by how many calls there were: read it beside \
+         gateway_llm_exchange_keep_seconds to see the retention this deployment \
+         is actually holding",
+    ),
+    (
+        "gateway_llm_exchange_oldest_age_seconds",
+        "Age of the oldest row in the archive, in seconds; zero for an empty \
+         archive. This is the retention seen from the reader's side: whatever \
+         the policy says, this is how far back the bodies actually reach. An \
+         empty archive reads zero rather than being absent, so a rule comparing \
+         this to the retention is silent about a clean table and never about a \
+         missing series",
+    ),
+    (
+        "gateway_llm_exchange_keep_seconds",
+        "The retention the publishing process enforces, in seconds. Published so \
+         the rule comparing the archive's age to it derives its threshold from \
+         the loop's own declaration rather than from a constant written into the \
+         rules file -- a deployment that shortens what it keeps moves its own \
+         judgement with it",
+    ),
+    (
+        "gateway_llm_exchange_bytes",
+        "On-disk bytes the prompt-and-response archive occupies, including \
+         indexes and TOAST. Lags the row count, since PostgreSQL frees deleted \
+         space only when it vacuums, so it is a reading and never the retention \
+         criterion",
+    ),
+    (
+        "gateway_llm_exchange_sweep_failed",
+        "Whether the last retention pass could not be completed, 1 or 0. The row \
+         count, the age and the bytes are stamped only once a pass returns, so a \
+         pass that fails leaves every one of them at its last value -- an \
+         archive that cannot be swept and one that is not growing look the same. \
+         Written on every pass",
+    ),
+    (
         "metrics_retired_rows_removed",
         "Rows of retired metric names the last release pass deleted, labelled \
          by the table they came from and by the deployment that ran the pass. \

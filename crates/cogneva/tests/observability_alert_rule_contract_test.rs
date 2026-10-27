@@ -4190,6 +4190,10 @@ const UNREAD: &[(&str, Unread)] = &[
         Unread::NotAReading("on-disk size of the checkpoint store, and it lags the row count for the same reason the other two do -- PostgreSQL returns the space a DELETE freed only when it vacuums -- so a bound here would fire on the volume doing its job. The capacity verdict is the reading with a criterion; the bytes are what the backup the drill restores is actually paying for"),
     ),
     (
+        "gateway_llm_exchange_bytes",
+        Unread::NotAReading("on-disk size of the prompt-and-response archive, and it lags what the retention deletes for the same reason the other three do -- PostgreSQL returns the space a DELETE freed only when it vacuums -- so a bound here would fire on the volume doing its job. The age rule is the reading with a criterion; the bytes say what the bodies are actually costing, which is why the archive is bounded by age rather than by a row count"),
+    ),
+    (
         "tier_migration_total",
         Unread::Elsewhere {
             readers: &[

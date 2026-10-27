@@ -1877,6 +1877,24 @@ rows:
       derives it: the live set is how many tasks the fleet has run, which is an
       operator's expectation rather than a measurement of this pass.
 
+  - key: llmExchangeRetention.keepDays
+    source: override
+    why: >-
+      Days the prompt-and-response archive keeps a body. The table holds what was
+      sent upstream and what came back so a later question about one call is
+      answerable without buying it again; what it costs is set by how large the
+      bodies are rather than by how many calls there were, which is why it is
+      bounded by age rather than by a row count -- 9,680 rows over 30 days came
+      to 307 MB on 2026-10-27, measured on this deployment. Nothing measures how
+      long a reader would want to look back, so the ceiling is the operator's
+      call, and the loop publishes it as gateway_llm_exchange_keep_seconds:
+      llm_exchange_retention_behind compares the archive's oldest row against
+      twice this reading, so shortening it moves the judgement with it instead
+      of leaving a constant in the rules file. The sweep runs in the main
+      application rather than the gateway, because the gateway restarts on every
+      rollout and a delete at its startup is a bound on a row's age only while
+      rollouts are more frequent than the retention is wide.
+
   - key: checkpointStore.readWindowSeconds
     source: override
     why: >-

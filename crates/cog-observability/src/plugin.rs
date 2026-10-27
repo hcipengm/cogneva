@@ -609,6 +609,30 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             drop(crate::llm_usage_rollup::spawn(store, shutdown));
         }
 
+        // ── Prompt-and-response archive retention ──
+        // Here rather than in the gateway, which is where the archive is
+        // written: the gateway restarts on every rollout, and a retention that
+        // only runs at startup bounds a row's life only while rollouts are more
+        // frequent than the retention is wide. Runs beside the rollup on the
+        // same store, and publishes what it retired so the promise is
+        // checkable rather than merely declared.
+        if let Some(store) = self.usage_store.clone() {
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or_default();
+            let keep = std::time::Duration::from_secs(
+                crate::exchange_retention::keep_days_from_env() as u64 * 86_400,
+            );
+            let mut sweep =
+                crate::exchange_retention::ExchangeRetention::new(store.pool().clone(), keep)
+                    .with_deployment(crate::exchange_retention::deployment_name());
+            if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                sweep = sweep.with_metrics(mb);
+            }
+            drop(Arc::new(sweep).spawn(shutdown));
+        }
+
         // ── Spend verdict fold ──
         // Runs here for the same reason the fold above does, and after it in
         // the same process: a verdict is read against the ledger directly

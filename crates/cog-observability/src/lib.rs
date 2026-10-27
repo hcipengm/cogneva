@@ -7,6 +7,7 @@ pub mod claim_store;
 pub mod config;
 pub mod config_delivery;
 pub mod data_volume;
+pub mod exchange_retention;
 pub mod explainability;
 pub mod explainability_pg;
 pub mod host_ledger;

@@ -789,6 +789,12 @@ impl LlmUsageStore {
         Self { pool }
     }
 
+    /// 借出池本身，给同一个库上另一件要写/删的事用（保留期清扫就是一件）：
+    /// 再开一个池等于给一件事配一套连接预算。
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Auto-create every table, column and index this store owns.
     ///
     /// The statements themselves are [`ddl`]: a restore replays that same list
@@ -878,21 +884,6 @@ impl LlmUsageStore {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    /// Drop exchanges older than `keep_days`. Bodies are the only part of the
-    /// ledger whose size is set by the caller rather than by the request count,
-    /// so leaving them unbounded turns a diagnostic table into the largest one
-    /// in the database. Run at startup: the process is rolled often, and a
-    /// missed pass costs rows, not correctness.
-    pub async fn prune_exchanges(&self, keep_days: i64) -> anyhow::Result<u64> {
-        let done = sqlx::query(
-            "DELETE FROM gateway_llm_exchange WHERE ts < NOW() - ($1::bigint * INTERVAL '1 day')",
-        )
-        .bind(keep_days)
-        .execute(&self.pool)
-        .await?;
-        Ok(done.rows_affected())
     }
 
     /// Everything a window pacer needs about one upstream, read in one pass.

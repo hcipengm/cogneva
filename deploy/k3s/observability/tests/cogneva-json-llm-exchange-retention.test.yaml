@@ -1,0 +1,176 @@
+# 提示词留底（`gateway_llm_exchange`）保留期那两条规则的单测夹具。
+#
+# 两条各证一次「会响」，也各证一次「只在它该响的时候响」：
+#
+#   * `llm_exchange_retention_behind` 读的是「最老的一行比这个进程自己声明的
+#     保留期还老一倍以上」。第二格用 61 天的留底对 30 天的保留期让它响；第四格把
+#     保留期收到 8 天、留底不动，证明这个界是读数推出来的而不是写死在规则里的——
+#     同一个 20 天的表在第三格（保留 30 天）是静，在第四格是响。第五格把两条读数的
+#     时间戳钉在 0，证明新鲜度腿真的在起作用：删掉那半，这一格会响。
+#   * `llm_exchange_retention_pass_failed` 与另三张表的同名规则同形：写的是「这一趟
+#     没跑完」。第一格给健康的 0，第六格给半小时间窗里的一次 1，证明它只在那一趟
+#     失败时响；那一次刻意放在 20 分钟处，落在 30 分钟窗之外，证明它有窗口而不是
+#     一见 1 就永远亮。
+#
+# 告警标签只留 `deployment` 和 `severity`：两条都用 `without (pod, container,
+# instance)` 把进程维度的标签收掉，部署维度是「这是哪一本账」的身份。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-llm-exchange-retention.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: llm_exchange_retention_behind
+# rule: llm_exchange_retention_pass_failed
+
+evaluation_interval: 1m
+
+tests:
+  # 一切正常：留底 20 天、保留期 30 天、每一趟都跑完。两条全静。
+  - interval: 1m
+    input_series:
+      - series: 'gateway_llm_exchange_oldest_age_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '1728000x60'
+      - series: 'gateway_llm_exchange_oldest_age_seconds_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'gateway_llm_exchange_keep_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '2592000x60'
+      - series: 'gateway_llm_exchange_keep_seconds_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'gateway_llm_exchange_sweep_failed{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+      - series: 'gateway_llm_exchange_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_exchange_retention_behind
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_exchange_retention_pass_failed
+        exp_alerts: []
+
+  # 坏消息：留底最老一行 61 天，而保留期 30 天 —— 保留已经一个月没生效。
+  - interval: 1m
+    input_series:
+      - series: 'gateway_llm_exchange_oldest_age_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '5270400x60'
+      - series: 'gateway_llm_exchange_oldest_age_seconds_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'gateway_llm_exchange_keep_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '2592000x60'
+      - series: 'gateway_llm_exchange_keep_seconds_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'gateway_llm_exchange_sweep_failed{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+      - series: 'gateway_llm_exchange_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_exchange_retention_behind
+        exp_alerts:
+          - exp_labels:
+              deployment: cogneva
+              severity: warning
+      - eval_time: 60m
+        alertname: llm_exchange_retention_pass_failed
+        exp_alerts: []
+
+  # 同一个 20 天的留底，保留期没变：仍然静。这是第四格的反面。
+  - interval: 1m
+    input_series:
+      - series: 'gateway_llm_exchange_oldest_age_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '1728000x60'
+      - series: 'gateway_llm_exchange_oldest_age_seconds_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'gateway_llm_exchange_keep_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '2592000x60'
+      - series: 'gateway_llm_exchange_keep_seconds_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'gateway_llm_exchange_sweep_failed{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+      - series: 'gateway_llm_exchange_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_exchange_retention_behind
+        exp_alerts: []
+
+  # 同一张 20 天的表，但这个部署把保留期改成 8 天：界跟着声明走，于是响。
+  # 删掉「界由读数推出来」这半条，这一格就是错的（30 天的常量不会对 20 天响）。
+  - interval: 1m
+    input_series:
+      - series: 'gateway_llm_exchange_oldest_age_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '1728000x60'
+      - series: 'gateway_llm_exchange_oldest_age_seconds_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'gateway_llm_exchange_keep_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '691200x60'
+      - series: 'gateway_llm_exchange_keep_seconds_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'gateway_llm_exchange_sweep_failed{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+      - series: 'gateway_llm_exchange_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_exchange_retention_behind
+        exp_alerts:
+          - exp_labels:
+              deployment: cogneva
+              severity: warning
+
+  # 两条读数都冻结（时间戳钉在 0）：留底明明 61 天，但新鲜度腿把两条都关掉。
+  # 删掉那半，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'gateway_llm_exchange_oldest_age_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '5270400x60'
+      - series: 'gateway_llm_exchange_oldest_age_seconds_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+      - series: 'gateway_llm_exchange_keep_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '2592000x60'
+      - series: 'gateway_llm_exchange_keep_seconds_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+      - series: 'gateway_llm_exchange_sweep_failed{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+      - series: 'gateway_llm_exchange_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_exchange_retention_behind
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_exchange_retention_pass_failed
+        exp_alerts: []
+
+  # 半小时间窗里有一趟删除没跑完：pass_failed 响，保留期那条仍按自己的读数判
+  # （这里健康，静）。那一次放在 20 分钟处，到 60 分钟时已经出了 30 分钟窗，
+  # 所以同一份输入在 40 分钟处响、在 60 分钟处静 —— 窗口真的在滚。
+  - interval: 1m
+    input_series:
+      - series: 'gateway_llm_exchange_oldest_age_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '1728000x60'
+      - series: 'gateway_llm_exchange_oldest_age_seconds_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'gateway_llm_exchange_keep_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '2592000x60'
+      - series: 'gateway_llm_exchange_keep_seconds_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'gateway_llm_exchange_sweep_failed{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '_x20 1x1 0x39'
+      - series: 'gateway_llm_exchange_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: llm_exchange_retention_pass_failed
+        exp_alerts:
+          - exp_labels:
+              deployment: cogneva
+              severity: warning
+      - eval_time: 60m
+        alertname: llm_exchange_retention_pass_failed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: llm_exchange_retention_behind
+        exp_alerts: []
