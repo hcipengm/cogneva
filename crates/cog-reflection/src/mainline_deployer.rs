@@ -20931,6 +20931,62 @@ exit 0
         assert!(!rollout_converged("1|1|1"));
     }
 
+    /// 三份「竖线读数」的字段顺序，就是查询串与解析器之间的全部约定。
+    ///
+    /// 读取端一律按下标读（`parts[2]`、`nth(3)`），查询串却写在另一处；两边分开
+    /// 写的时候挪一个字段不会报错——kubectl 照常返回六个数，解析器照常给出一个
+    /// 布尔，只是读的不再是那一格。把 `readyReplicas` 与 `updatedReplicas` 换个
+    /// 位置，「新副本建成了」与「新副本就绪了」当场互换，判据在谁都没看的地方
+    /// 改了意思。所以顺序在这里被点名：改查询串的人会在这里被问一句「解析器跟上了
+    /// 吗」。
+    ///
+    /// 判不了什么：它只钉查询串这一侧；解析器自己按下标取哪一格，靠上面两条
+    /// 行为测试（`convergence_needs_ready_replicas_and_no_unavailable_ones` 与
+    /// `support_settled_requires_observed_generation_and_new_replicas`）的读数
+    /// 标本钉住。
+    #[test]
+    fn the_line_readings_walk_their_fields_in_the_order_their_readers_do() {
+        fn fields(jsonpath: &str) -> Vec<&str> {
+            jsonpath
+                .trim_start_matches("jsonpath=")
+                .split('|')
+                .map(|part| part.trim().trim_start_matches('{').trim_end_matches('}'))
+                .collect()
+        }
+        assert_eq!(
+            fields(settle_jsonpath("deployment")),
+            [
+                ".metadata.generation",
+                ".status.observedGeneration",
+                ".spec.replicas",
+                ".status.readyReplicas",
+                ".status.updatedReplicas",
+                ".status.replicas",
+            ]
+        );
+        assert_eq!(
+            fields(settle_jsonpath("daemonset")),
+            [
+                ".metadata.generation",
+                ".status.observedGeneration",
+                ".status.desiredNumberScheduled",
+                ".status.numberReady",
+                ".status.updatedNumberScheduled",
+            ]
+        );
+        assert_eq!(
+            fields(crate::mainline_rollout::ROLLOUT_STATUS_JSONPATH),
+            [
+                ".metadata.generation",
+                ".status.observedGeneration",
+                ".spec.replicas",
+                ".status.updatedReplicas",
+                ".status.readyReplicas",
+                ".status.unavailableReplicas",
+            ]
+        );
+    }
+
     /// 假 kubectl：观测类查询（generation）在前 `blind_queries` 次以集群不可达
     /// 失败，之后正常收敛；其余查询一律正常。用来区分「看不到集群」与
     /// 「看清楚了这个版本有问题」。

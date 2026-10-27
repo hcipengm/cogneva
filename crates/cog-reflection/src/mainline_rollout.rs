@@ -168,6 +168,15 @@ const SUPPORT_SETTLE_JSONPATH: &str = "jsonpath={.metadata.generation}|{.status.
 /// 「还没就绪」，于是等待要么永远不成立、要么（缺省按 1 读到 zeros 时）什么都不等。
 const DAEMONSET_SETTLE_JSONPATH: &str = "jsonpath={.metadata.generation}|{.status.observedGeneration}|{.status.desiredNumberScheduled}|{.status.numberReady}|{.status.updatedNumberScheduled}";
 
+/// 四个目标部署自己的读数：代数、观测到的代数、期望副本数、新版本副本数、
+/// 就绪副本数、不可用副本数。
+///
+/// 竖线显式占位：缺失字段（omitempty 的 `updatedReplicas` 等）不能顶掉后续字段
+/// 的位置。顺序就是 [`rollout_converged`] 那一族按下标读的顺序——查询串在读取端
+/// 之外，两边分开写，所以挪字段不会报错，只会在谁也看不见的地方换掉判据读的是
+/// 哪一格；把顺序钉住的是 `the_line_readings_walk_their_fields_in_the_order_their_readers_do`。
+pub(crate) const ROLLOUT_STATUS_JSONPATH: &str = "jsonpath={.metadata.generation}|{.status.observedGeneration}|{.spec.replicas}|{.status.updatedReplicas}|{.status.readyReplicas}|{.status.unavailableReplicas}";
+
 /// 这个工作负载该用哪份读法。词表只有一处：资源词进 [`workload_kind_of_resource`]
 /// 换出清单 kind，再由清单 kind 选读法，不在这里手写第二张对照表。
 pub(crate) fn settle_jsonpath(kind: &str) -> &'static str {
@@ -3100,9 +3109,7 @@ impl RolloutExecutor {
                         "deployment",
                         &t.deployment,
                         "-o",
-                        // 竖线显式占位：缺失字段（omitempty 的 updatedReplicas
-                        // 等）不能顶掉后续字段的位置。
-                        "jsonpath={.metadata.generation}|{.status.observedGeneration}|{.spec.replicas}|{.status.updatedReplicas}|{.status.readyReplicas}|{.status.unavailableReplicas}",
+                        ROLLOUT_STATUS_JSONPATH,
                     ],
                     30,
                 )
@@ -3138,9 +3145,8 @@ impl RolloutExecutor {
                                 if let Some(cycle) = readiness_probe {
                                     let budget = cycle.budget();
                                     if readiness_overdue(&samples, budget, Utc::now()) {
-                                        let err = self
-                                            .readiness_gate_error(t, budget.as_secs())
-                                            .await;
+                                        let err =
+                                            self.readiness_gate_error(t, budget.as_secs()).await;
                                         return Err(err);
                                     }
                                 }
