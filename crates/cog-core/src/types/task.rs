@@ -294,7 +294,13 @@ impl TaskType {
 /// different pieces of evidence about the same string, and the second one is
 /// the shape a missing producer takes — the retrieval still answers, under a
 /// class that names the run instead of the work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// No serde form: this value never travels. Its only outward word is the metric
+/// label [`Self::as_str`] produces, and a derived spelling would have been a
+/// second one the compiler keeps in step with the variants but nothing keeps in
+/// step with the label — `Carried` next to `carried`, read on a face that
+/// selects by the label and finds nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalClassSource {
     /// The goal carried it: whoever re-hosted the goal named the class.
     Carried,
@@ -1195,6 +1201,36 @@ mod tests {
         }
 
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// 每个来源都发布在自己的标签上，且都在 `ALL` 上。
+    ///
+    /// 下面这个 match 是刻意穷尽的：新增一个来源会让它编译不过，逼着人回到这
+    /// 份断言，而不是只加变体、让 `ALL` 少一格——指标面发布的是 `ALL` 上每一格
+    /// 的计数，少的那一格永远是零，读起来与"没有任何来源走过这条路"一样，而它
+    /// 真正的意思是"这个来源从来没有被发布过"。
+    #[test]
+    fn every_goal_class_source_is_published_under_its_own_label() {
+        let mut labels = std::collections::BTreeSet::new();
+        for source in [GoalClassSource::Carried, GoalClassSource::HostType] {
+            match source {
+                GoalClassSource::Carried | GoalClassSource::HostType => {}
+            }
+            assert!(
+                GoalClassSource::ALL.contains(&source),
+                "{source:?} 不在 ALL 上，指标面永远不会发布这一格"
+            );
+            assert!(
+                !source.as_str().is_empty(),
+                "{source:?} 的标签是空串，按标签取值的读者找不到它"
+            );
+            assert!(
+                labels.insert(source.as_str()),
+                "两个来源渲染成同一个标签 {:?}，两格会在指标面上合并成一格",
+                source.as_str()
+            );
+        }
+        assert_eq!(labels.len(), GoalClassSource::ALL.len());
     }
 
     /// 目标行的形状由这一个构造定死：读面靠这几个字段认它，任一处漂了都会让
