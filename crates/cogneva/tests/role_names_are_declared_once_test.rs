@@ -82,6 +82,23 @@ fn declared() -> Vec<&'static str> {
     cog_core::roles::ALL.to_vec()
 }
 
+/// A site that spells a role name for a reason of its own.
+///
+/// The same word can name two unrelated things. Registering one of those as an
+/// exemption is a claim someone had to look at; without it the gate would
+/// report a true statement about the wrong thing.
+const SAME_WORD_DIFFERENT_THING: &[(&str, &str, &str)] = &[(
+    "crates/cogneva/src/work.rs",
+    "external-worker",
+    "`HOSTNAME` 读不到时的单元显示名，不是注册用的角色字段——那条构造里角色读的是常量",
+)];
+
+fn registered_elsewhere(file: &str, value: &str) -> bool {
+    SAME_WORD_DIFFERENT_THING
+        .iter()
+        .any(|(exempt_file, exempt_value, _)| *exempt_file == file && *exempt_value == value)
+}
+
 fn sites(root: &Path, names: &[&str]) -> BTreeMap<String, Vec<String>> {
     let mut crates: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
         .expect("crates/ 不在仓库里")
@@ -114,7 +131,7 @@ fn sites(root: &Path, names: &[&str]) -> BTreeMap<String, Vec<String>> {
                     if is_debug_label(before) {
                         continue;
                     }
-                    if names.contains(&quote) {
+                    if names.contains(&quote) && !registered_elsewhere(&file, quote) {
                         found
                             .entry(quote.to_string())
                             .or_default()
@@ -158,6 +175,29 @@ fn every_role_name_is_spelled_in_the_place_it_is_declared() {
          那一侧拿到 `None`，按旧名字找 checkpoint 的那一侧什么也找不到，两者\
          都不算失败。改成读 `cog_core::roles` 里的声明：\n{}",
         rendered.join("\n")
+    );
+}
+
+/// 豁免留着而现场没了，就是一张通行证留在没人走的路口：同一个词下次真的
+/// 被写成第二处拼写时，没有人拦。
+#[test]
+fn an_exemption_that_no_longer_matches_a_site_is_stale() {
+    let root = repo_root();
+    let mut absent = Vec::new();
+    for (file, value, why) in SAME_WORD_DIFFERENT_THING {
+        let text =
+            std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let still_there = production_lines(&text)
+            .into_iter()
+            .any(|line| literals(line).into_iter().any(|(quote, _)| quote == *value));
+        if !still_there {
+            absent.push(format!("  {file}: {value}（{why}）"));
+        }
+    }
+    assert!(
+        absent.is_empty(),
+        "这些豁免已经不指向任何一处拼写了：\n{}",
+        absent.join("\n")
     );
 }
 

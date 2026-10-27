@@ -28,7 +28,10 @@ pub const DEFAULT_HEARTBEAT_TTL_SECONDS: u64 = 30;
 /// a platform-side unit that was given the wrong role. There is one writer
 /// today, which is why that is acceptable; adding another means widening the
 /// hole deliberately, not inheriting it from a harmless-looking `continue`.
-pub const EXTERNAL_WORKER_ROLE: &str = "external-worker";
+/// Declared in `cog_core::roles`: the staffing pass hands faces by the same
+/// word, and a second spelling would leave one side unable to recognise the
+/// units the other one registered.
+pub const EXTERNAL_WORKER_ROLE: &str = cog_core::roles::EXTERNAL_WORKER;
 pub const HEARTBEAT_HISTORY_MAX: usize = 1000;
 
 /// The heartbeat vocabulary lives in `cog_core`: the supervisor fills the

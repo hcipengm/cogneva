@@ -41,8 +41,23 @@ pub const MODE_SELECTOR: &str = "mode_selector";
 
 /// Every role this module declares, in the order a run meets them.
 ///
+/// The role a unit registers under when it holds presence through the slow
+/// heartbeat instead of running as an in-process agent.
+///
+/// Two crates read this word and neither can be derived from the other: the
+/// supervisor takes a unit out of its health verdict by this name, and the
+/// staffing pass hands a face only to a unit that registered under it. Spelled
+/// twice, a rename leaves every present unit unrecognisable — the pass drafts
+/// nothing, the faces of a departed owner stay with a name nobody answers, and
+/// "nobody to hand it to" is an ordinary state that reads the same as no work
+/// being due.
+pub const EXTERNAL_WORKER: &str = "external-worker";
+
 /// Consumers that need "a valid role" read this rather than writing their own
 /// list; a list kept separately is a fourth home that agrees only by luck.
+///
+/// The squad actors come first, in the order a run meets them; the roles the
+/// platform registers for itself close the list.
 pub const ALL: &[&str] = &[
     PLANNER,
     GENERATOR,
@@ -50,4 +65,5 @@ pub const ALL: &[&str] = &[
     MODERATOR,
     MERGER,
     MODE_SELECTOR,
+    EXTERNAL_WORKER,
 ];

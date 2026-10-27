@@ -61,7 +61,11 @@ pub const STAFFING_SOURCE: &str = "presence-loop";
 /// any other role is an in-process agent whose registration lasts as long as
 /// the run it was created for; handing it a face would move the face again
 /// when that run ends.
-pub const FACE_HOLDER_ROLE: &str = "external-worker";
+///
+/// Declared in `cog_core::roles`: the supervisor exempts the same word from its
+/// health verdict, and a second spelling would leave every present unit
+/// unrecognisable to one side or the other without anything failing.
+pub const FACE_HOLDER_ROLE: &str = cog_core::roles::EXTERNAL_WORKER;
 
 /// How long an owner must be gone before its face moves.
 ///
