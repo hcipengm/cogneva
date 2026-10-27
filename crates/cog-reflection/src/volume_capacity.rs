@@ -101,7 +101,7 @@ pub const BOUND_LIMIT_RANGE: &str = "limit_range";
 pub const BOUND_QUOTA: &str = "quota";
 
 /// The label naming what became of a claim this round.
-pub const OUTCOME_LABEL: &str = "outcome";
+pub const OUTCOME_LABEL: &str = crate::LABEL_OUTCOME;
 
 /// The request already covers the peak with its headroom; nothing was written.
 pub const OUTCOME_AT_TARGET: &str = "at_target";

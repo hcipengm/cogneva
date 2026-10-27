@@ -3395,7 +3395,7 @@ impl DagExecutor {
         outcome: &str,
         value: f64,
     ) {
-        let labels = HashMap::from([("outcome".to_string(), outcome.to_string())]);
+        let labels = HashMap::from([(crate::LABEL_OUTCOME.to_string(), outcome.to_string())]);
         if let Err(e) = backend
             .record_counter(cog_core::metric_names::TASK_CHECKPOINT, value, labels)
             .await
@@ -6061,7 +6061,7 @@ mod tests {
             .map(|sample| {
                 sample
                     .labels
-                    .get("outcome")
+                    .get(crate::LABEL_OUTCOME)
                     .map(String::as_str)
                     .unwrap_or("")
             })

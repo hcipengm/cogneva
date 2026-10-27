@@ -1767,6 +1767,15 @@ pub const GITHUB_PLATFORM: &str = "github";
 /// The word the gateway calls Gitee by. See [`GITHUB_PLATFORM`].
 pub const GITEE_PLATFORM: &str = "gitee";
 
+/// The label naming how a reading ended.
+///
+/// Several families here carry it, and the readers that count one ending
+/// select by it. The name is declared once per crate that writes it, under the
+/// same identifier, and a gate compares the spellings: one edited copy
+/// publishes a family under a name every existing selector reads as empty,
+/// which is what "this family never ran" looks like.
+pub const LABEL_OUTCOME: &str = "outcome";
+
 /// The series name the held-out reading is published under.
 ///
 /// It is declared here rather than in the registry: the reading is rendered

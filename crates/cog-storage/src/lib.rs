@@ -119,6 +119,13 @@ pub use partition_maintainer::PartitionMaintainer;
 pub use task_event_retention::{TaskEventRetention, TaskEventRetentionOutcome};
 
 pub mod plugin;
+
+/// The label naming where a reading's value came from.
+///
+/// The storage plugin publishes readings per source, and the panels that count
+/// one source select by this label. Declared once per crate that writes it,
+/// under the same identifier, with a gate comparing the spellings.
+pub const LABEL_SOURCE: &str = "source";
 #[cfg(feature = "redis")]
 pub use dlq::RedisDeadLetterQueue;
 

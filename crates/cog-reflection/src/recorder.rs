@@ -388,7 +388,7 @@ impl MemoryBackendRecorder {
         };
         let cell = outcome.map_or("failed", SchemaRepairRound::as_cell);
         let mut labels = HashMap::new();
-        labels.insert("outcome".to_string(), cell.to_string());
+        labels.insert(crate::LABEL_OUTCOME.to_string(), cell.to_string());
         if let Err(e) = metrics
             .record_counter(
                 cog_core::metric_names::MEMORY_SCHEMA_REPAIR_TOTAL,
@@ -1241,7 +1241,7 @@ mod tests {
         let cell = |name: &str| {
             totals
                 .iter()
-                .find(|s| s.labels.get("outcome").map(String::as_str) == Some(name))
+                .find(|s| s.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(name))
                 .map(|s| s.value)
         };
         assert_eq!(cell("repaired"), Some(1.0));

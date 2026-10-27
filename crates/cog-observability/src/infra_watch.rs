@@ -762,7 +762,7 @@ async fn mirror_report(alert: &MirroredAlert, key: &str, outlets: &InfraWatchOut
         labels.insert(ALERT_FACE_LABEL.into(), face.clone());
     }
     labels.insert("message".into(), alert.message.clone());
-    labels.insert("source".into(), MIRROR_SOURCE.into());
+    labels.insert(crate::alerts::LABEL_SOURCE.into(), MIRROR_SOURCE.into());
     let row = NewAlert {
         rule: alert.rule.clone(),
         dedup_key: key.to_string(),
@@ -1038,7 +1038,7 @@ fn alert_labels(sample: &SeriesSample, message: &str, face: &str) -> HashMap<Str
         labels.insert(ALERT_FACE_LABEL.into(), face.to_string());
     }
     labels.insert("message".into(), message.to_string());
-    labels.insert("source".into(), "infra_watch".into());
+    labels.insert(crate::alerts::LABEL_SOURCE.into(), "infra_watch".into());
     labels
 }
 
@@ -1900,7 +1900,7 @@ mod tests {
             Some("backlog aged out")
         );
         assert_eq!(
-            labels.get("source").map(String::as_str),
+            labels.get(crate::alerts::LABEL_SOURCE).map(String::as_str),
             Some("infra_watch")
         );
         for gone in ["job", "service", "endpoint", "prometheus", "__name__"] {

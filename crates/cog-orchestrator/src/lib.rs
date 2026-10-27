@@ -31,6 +31,15 @@ pub mod wbs;
 /// never having run.
 pub const LABEL_READOUT: &str = "readout";
 
+/// The label naming how a reading ended.
+///
+/// Several families here carry it, and the readers that count one ending
+/// select by it. The name is declared once per crate that writes it, under the
+/// same identifier, and a gate compares the spellings: one edited copy
+/// publishes a family under a name every existing selector reads as empty,
+/// which is what "this family never ran" looks like.
+pub const LABEL_OUTCOME: &str = "outcome";
+
 pub use action_planner::ActionPlanOrchestrator;
 pub use dag_executor::task_phase::{ExitCriteria, PhaseTransitionRules, PhasedTask, TaskPhase};
 pub use dag_executor::{

@@ -101,7 +101,7 @@ pub const SIGNAL_GUARD_ENTRIES_METRIC: &str = "cogneva_signal_watcher_guard_entr
 pub const SIGNAL_GUARD_RECLAIMED_METRIC: &str = "cogneva_signal_watcher_guard_reclaimed_total";
 
 /// The label naming what became of a signal.
-pub const OUTCOME_LABEL: &str = "outcome";
+pub const OUTCOME_LABEL: &str = crate::LABEL_OUTCOME;
 
 /// A new task was created for the signal.
 pub const OUTCOME_REGISTERED: &str = "registered";

@@ -375,7 +375,7 @@ impl Supervisor {
         let mut labels = std::collections::HashMap::new();
         labels.insert("pass".to_string(), pass.as_cell().to_string());
         labels.insert(
-            "outcome".to_string(),
+            crate::LABEL_OUTCOME.to_string(),
             if ok { "ok" } else { "failed" }.to_string(),
         );
         if let Err(e) = metrics

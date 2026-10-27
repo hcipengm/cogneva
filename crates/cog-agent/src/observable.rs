@@ -753,7 +753,7 @@ impl Observable for AgentObservable {
                         "agent_inbox_ask_total",
                         asks.get(outcome).copied().unwrap_or(0) as f64,
                     )
-                    .with_label("outcome", outcome),
+                    .with_label(crate::LABEL_OUTCOME, outcome),
                 );
             }
         }
@@ -1369,7 +1369,7 @@ mod tests {
         for outcome in INBOX_ASK_OUTCOMES {
             let found = metrics.iter().find(|m| {
                 m.name == "agent_inbox_ask_total"
-                    && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+                    && m.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(outcome)
             });
             assert_eq!(found.map(|m| m.value), Some(0.0), "outcome={outcome}");
         }
@@ -1393,7 +1393,7 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.name == "agent_inbox_ask_total"
-                        && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+                        && m.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(outcome)
                 })
                 .map(|m| m.value)
         };

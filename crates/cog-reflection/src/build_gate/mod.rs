@@ -1225,7 +1225,7 @@ fn readings(
                     c.walk_yield[asker][outcome.index()] as f64,
                 ))
                 .with_label("asker", asker_label(asker).to_string())
-                .with_label("outcome", outcome.as_str().to_string()),
+                .with_label(crate::LABEL_OUTCOME, outcome.as_str().to_string()),
             );
         }
     }
@@ -3881,7 +3881,7 @@ mod tests {
                 .find(|m| {
                     m.name == BUILD_GATE_WALK_YIELD_TOTAL
                         && m.labels.get("asker").map(String::as_str) == Some(asker)
-                        && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+                        && m.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(outcome)
                 })
                 .map(|m| m.value)
         };

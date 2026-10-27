@@ -274,7 +274,7 @@ impl Blind {
     }
 }
 
-const OUTCOME_LABEL: &str = "outcome";
+const OUTCOME_LABEL: &str = crate::LABEL_OUTCOME;
 const BLIND_LABEL: &str = "reading";
 
 /// 这条回路从本进程起来到现在，落成了多少条、有多少轮没量成。

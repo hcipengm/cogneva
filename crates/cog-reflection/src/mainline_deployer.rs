@@ -3105,7 +3105,7 @@ impl MainlineDeployer {
             let _ = metrics
                 .record_gauge(VERSION_CONTRACT_VIOLATIONS, count as f64, labels.clone())
                 .await;
-            labels.insert("outcome".to_string(), outcome.to_string());
+            labels.insert(crate::LABEL_OUTCOME.to_string(), outcome.to_string());
             let _ = metrics
                 .record_counter(VERSION_CONTRACT_CHECKS_TOTAL, 1.0, labels.clone())
                 .await;
@@ -4211,7 +4211,7 @@ impl MainlineDeployer {
         };
         let mut labels = std::collections::HashMap::new();
         labels.insert(
-            "outcome".to_string(),
+            crate::LABEL_OUTCOME.to_string(),
             if ok { "ok" } else { "failed" }.to_string(),
         );
         let _ = metrics
@@ -5312,7 +5312,10 @@ impl MainlineDeployer {
         };
         use cog_core::metric_names;
         let mut labels = std::collections::HashMap::new();
-        labels.insert("outcome".to_string(), outcome.as_str().to_string());
+        labels.insert(
+            crate::LABEL_OUTCOME.to_string(),
+            outcome.as_str().to_string(),
+        );
         let _ = metrics
             .record_counter(metric_names::BUILDAH_STORE_ROUNDS_TOTAL, 1.0, labels)
             .await;
@@ -6544,7 +6547,7 @@ impl MainlineDeployer {
         };
         let mut labels = std::collections::HashMap::new();
         labels.insert(
-            "outcome".to_string(),
+            crate::LABEL_OUTCOME.to_string(),
             if ok { "ok" } else { "failed" }.to_string(),
         );
         let _ = metrics
@@ -23626,7 +23629,7 @@ exit 0
             let sample = outcome(clause);
             assert_eq!(sample.value, 1.0, "{clause}");
             assert_eq!(
-                sample.labels.get("outcome").map(String::as_str),
+                sample.labels.get(crate::LABEL_OUTCOME).map(String::as_str),
                 Some(expected_outcome),
                 "{clause}"
             );
@@ -24681,9 +24684,12 @@ exit 0
             .await
             .unwrap();
         assert!(
-            outcomes.iter().any(
-                |s| s.labels.get("outcome").map(String::as_str) == Some("pruned") && s.value == 1.0
-            ),
+            outcomes
+                .iter()
+                .any(
+                    |s| s.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some("pruned")
+                        && s.value == 1.0
+                ),
             "{outcomes:?}"
         );
         let kept = metrics
@@ -24750,7 +24756,7 @@ exit 0
             .unwrap();
         assert!(
             outcomes.iter().any(|s| {
-                s.labels.get("outcome").map(String::as_str) == Some("store_unreadable")
+                s.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some("store_unreadable")
                     && s.value == 1.0
             }),
             "{outcomes:?}"
@@ -24860,7 +24866,7 @@ exit 0
             .unwrap();
         assert!(
             outcomes.iter().any(|s| {
-                s.labels.get("outcome").map(String::as_str) == Some("keep_unreadable")
+                s.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some("keep_unreadable")
                     && s.value == 1.0
             }),
             "{outcomes:?}"
@@ -24905,7 +24911,7 @@ exit 0
             .await
             .unwrap()
             .into_iter()
-            .find(|s| s.labels.get("outcome").map(String::as_str) == Some(outcome))
+            .find(|s| s.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(outcome))
             .map(|s| s.value)
             .unwrap_or(0.0)
     }

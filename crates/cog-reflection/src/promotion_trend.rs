@@ -29,7 +29,7 @@ const MIN_WEEK_SAMPLES: u64 = 2;
 
 /// 抓取面上这一族的两个标签。
 const WEEK_LABEL: &str = "week";
-const OUTCOME_LABEL: &str = "outcome";
+const OUTCOME_LABEL: &str = crate::LABEL_OUTCOME;
 
 /// `outcome` 的取值闭集：一条变更在一个 ISO 周里能落进的那几档，两两不交。
 ///

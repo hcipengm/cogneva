@@ -180,6 +180,19 @@ pub const GITHUB_PLATFORM: &str = "github";
 /// The word this crate calls Gitee by. See [`GITHUB_PLATFORM`].
 pub const GITEE_PLATFORM: &str = "gitee";
 
+/// The label naming how a reading ended.
+///
+/// Several families here carry it, and the readers that count one ending
+/// select by it. The name is declared once per crate that writes it, under the
+/// same identifier, and a gate compares the spellings: one edited copy
+/// publishes a family under a name every existing selector reads as empty,
+/// which is what "this family never ran" looks like.
+pub const LABEL_OUTCOME: &str = "outcome";
+
+/// The label naming where a reading's value came from. See [`LABEL_OUTCOME`]
+/// for why the name is declared here rather than spelled at each site.
+pub const LABEL_SOURCE: &str = "source";
+
 pub mod platform_http;
 pub mod plugin;
 

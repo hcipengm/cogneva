@@ -69,7 +69,7 @@ impl ChangeReworkOutcome {
 pub const CHANGE_REWORK_METRIC: &str = "self_evolution_change_rework_total";
 
 /// 归宿所在的那一维。
-pub const OUTCOME_LABEL: &str = "outcome";
+pub const OUTCOME_LABEL: &str = crate::LABEL_OUTCOME;
 
 /// 提交权与编排器句柄。
 ///

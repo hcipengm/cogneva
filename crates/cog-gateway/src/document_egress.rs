@@ -207,8 +207,10 @@ impl AuditedGate {
     /// Record one cell. A failed write degrades to debug: the reading channel
     /// breaking must not take the request path down with it.
     async fn record(&self, outcome: &str, value: f64) {
-        let labels =
-            std::collections::HashMap::from([("outcome".to_string(), outcome.to_string())]);
+        let labels = std::collections::HashMap::from([(
+            crate::LABEL_OUTCOME.to_string(),
+            outcome.to_string(),
+        )]);
         if let Err(e) = self
             .metrics
             .record_counter(AUDITED_REQUESTS, value, labels)
@@ -427,7 +429,12 @@ mod tests {
             .expect("published counter reading");
         let published: BTreeSet<&str> = totals
             .iter()
-            .map(|s| s.labels.get("outcome").map(String::as_str).unwrap_or(""))
+            .map(|s| {
+                s.labels
+                    .get(crate::LABEL_OUTCOME)
+                    .map(String::as_str)
+                    .unwrap_or("")
+            })
             .collect();
         let expected: BTreeSet<&str> = AUDITED_OUTCOMES.iter().copied().collect();
         assert_eq!(published, expected, "every outcome is a series of its own");
@@ -508,7 +515,7 @@ mod tests {
                 .await
                 .expect("published counter reading")
                 .iter()
-                .find(|s| s.labels.get("outcome").map(String::as_str) == Some(outcome))
+                .find(|s| s.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(outcome))
                 .map(|s| s.value)
         }
 
@@ -654,7 +661,7 @@ mod tests {
                 .expect("published counter reading")
                 .into_iter()
                 .filter(|s| s.value > 0.0)
-                .filter_map(|s| s.labels.get("outcome").cloned())
+                .filter_map(|s| s.labels.get(crate::LABEL_OUTCOME).cloned())
                 .collect();
             assert_eq!(
                 nonzero.len(),
@@ -803,7 +810,7 @@ mod tests {
         let value = |outcome: &str| {
             totals
                 .iter()
-                .find(|s| s.labels.get("outcome").map(String::as_str) == Some(outcome))
+                .find(|s| s.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(outcome))
                 .map(|s| s.value)
         };
         assert_eq!(value("released"), Some(2.0));

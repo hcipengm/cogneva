@@ -253,7 +253,7 @@ fn readings(rows: Vec<ProducerHeartbeat>) -> Vec<RawMetric> {
         ] {
             out.push(
                 RawMetric::new(name, value)
-                    .with_label("source", row.source.clone())
+                    .with_label(crate::alerts::LABEL_SOURCE, row.source.clone())
                     .with_label("trigger", row.trigger.clone()),
             );
         }
@@ -326,7 +326,10 @@ mod tests {
         assert_eq!(by_name(PRODUCER_PUSH_PERIOD).value, 1_832.0);
         for metric in &out {
             assert_eq!(
-                metric.labels.get("source").map(String::as_str),
+                metric
+                    .labels
+                    .get(crate::alerts::LABEL_SOURCE)
+                    .map(String::as_str),
                 Some(PRINCIPLE_PRODUCER_SOURCE),
                 "{} carries no source label",
                 metric.name

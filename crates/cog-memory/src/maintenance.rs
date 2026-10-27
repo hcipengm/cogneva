@@ -198,7 +198,10 @@ async fn run_pass(
 /// 把一格结局写进闭集计数器。写不进去只 warn：读数失败不该拖垮维护循环。
 async fn record_pass(metrics: &Arc<dyn MetricsBackend>, pass: DecayPass) {
     let mut labels = HashMap::new();
-    labels.insert("outcome".to_string(), pass.cell().to_string());
+    labels.insert(
+        crate::observable::OUTCOME_LABEL.to_string(),
+        pass.cell().to_string(),
+    );
     if let Err(e) = metrics
         .record_counter(cog_core::metric_names::MEMORY_DECAY_TOTAL, 1.0, labels)
         .await

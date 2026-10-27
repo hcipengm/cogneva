@@ -360,7 +360,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
             for pool in ["users", "messages", "config", "explain"] {
                 let mut labels = std::collections::HashMap::new();
                 labels.insert("pool".to_string(), pool.to_string());
-                labels.insert("source".to_string(), source.to_string());
+                labels.insert(crate::LABEL_SOURCE.to_string(), source.to_string());
                 if let Err(e) = metrics_backend
                     .record_gauge(
                         cog_core::metric_names::PG_POOL_MAX_CONNECTIONS,

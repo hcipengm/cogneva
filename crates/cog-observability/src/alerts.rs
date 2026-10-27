@@ -27,6 +27,10 @@ pub const LABEL_OUTCOME: &str = "outcome";
 /// identifier and a gate compares the spellings.
 pub const LABEL_READOUT: &str = "readout";
 
+/// The label naming where a reading's value came from. See [`LABEL_OUTCOME`]
+/// for why the name is declared here rather than spelled at each site.
+pub const LABEL_SOURCE: &str = "source";
+
 /// The closed set of ways one dispatch to one channel can end, as recorded on
 /// [`cog_core::metric_names::ALERT_NOTIFICATIONS_TOTAL`]'s `outcome` label.
 pub const OUTCOME_DELIVERED: &str = "delivered";

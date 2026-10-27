@@ -1082,7 +1082,7 @@ impl Observable for CollaborationObservable {
                 metrics.push(
                     RawMetric::new("self_review_revision_total", *count as f64)
                         .with_label("stage", stage)
-                        .with_label("outcome", outcome),
+                        .with_label(crate::LABEL_OUTCOME, outcome),
                 );
             }
 
@@ -1099,7 +1099,7 @@ impl Observable for CollaborationObservable {
                 let count = independent.get(outcome).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("pge_independent_review_total", count as f64)
-                        .with_label("outcome", outcome),
+                        .with_label(crate::LABEL_OUTCOME, outcome),
                 );
             }
 
@@ -1115,7 +1115,7 @@ impl Observable for CollaborationObservable {
                 let count = moderators.get(outcome).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("pge_moderator_consulted_total", count as f64)
-                        .with_label("outcome", outcome),
+                        .with_label(crate::LABEL_OUTCOME, outcome),
                 );
             }
 
@@ -1133,7 +1133,7 @@ impl Observable for CollaborationObservable {
                 let count = consensus_floors.get(outcome).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("pge_consensus_floor_total", count as f64)
-                        .with_label("outcome", outcome),
+                        .with_label(crate::LABEL_OUTCOME, outcome),
                 );
             }
 
@@ -1254,7 +1254,7 @@ impl Observable for CollaborationObservable {
                 let count = sources.get(source.as_str()).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("collab_goal_class_source_total", count as f64)
-                        .with_label("source", source.as_str()),
+                        .with_label(crate::LABEL_SOURCE, source.as_str()),
                 );
             }
 
@@ -1280,7 +1280,7 @@ impl Observable for CollaborationObservable {
                 let count = verdicts.get(outcome).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("collab_boundary_evaluation_total", count as f64)
-                        .with_label("outcome", outcome),
+                        .with_label(crate::LABEL_OUTCOME, outcome),
                 );
             }
             let violations = self
@@ -1306,7 +1306,7 @@ impl Observable for CollaborationObservable {
                 let count = resumes.get(outcome).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("collab_task_resume_total", count as f64)
-                        .with_label("outcome", outcome),
+                        .with_label(crate::LABEL_OUTCOME, outcome),
                 );
             }
 
@@ -1654,7 +1654,7 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.labels.get("stage").map(String::as_str) == Some(stage)
-                        && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+                        && m.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(outcome)
                 })
                 .map(|m| m.value)
                 .unwrap_or_else(|| panic!("{stage}/{outcome} 这一格要在"))
@@ -1700,10 +1700,10 @@ mod tests {
                 continue;
             }
             assert!(
-                !written
-                    .iter()
-                    .any(|(_, _, labels)| labels.get("outcome").map(String::as_str)
-                        == Some(outcome.as_str())),
+                !written.iter().any(|(_, _, labels)| labels
+                    .get(crate::LABEL_OUTCOME)
+                    .map(String::as_str)
+                    == Some(outcome.as_str())),
                 "{} must not be written before it happens",
                 outcome.as_str()
             );
@@ -2212,7 +2212,7 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.name == "pge_independent_review_total"
-                        && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+                        && m.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(outcome)
                 })
                 .map(|m| m.value)
                 .unwrap_or_else(|| {
@@ -2266,7 +2266,7 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.name == "pge_moderator_consulted_total"
-                        && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+                        && m.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(outcome)
                 })
                 .map(|m| m.value)
                 .unwrap_or_else(|| {
@@ -2312,7 +2312,7 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.name == "pge_consensus_floor_total"
-                        && m.labels.get("outcome").map(String::as_str) == Some(outcome)
+                        && m.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(outcome)
                 })
                 .map(|m| m.value)
                 .unwrap_or_else(|| {

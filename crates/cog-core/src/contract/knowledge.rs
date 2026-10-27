@@ -232,7 +232,10 @@ pub async fn record_retrieval_cell(
 ) {
     let mut labels = HashMap::new();
     labels.insert("layer".to_string(), layer.to_string());
-    labels.insert("outcome".to_string(), outcome.to_string());
+    labels.insert(
+        crate::build_cache::OUTCOME_LABEL.to_string(),
+        outcome.to_string(),
+    );
     if let Err(e) = metrics
         .record_counter(
             crate::metric_names::KNOWLEDGE_RETRIEVAL_TOTAL,

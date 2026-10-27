@@ -56,7 +56,7 @@ pub const BUILD_OUTCOMES_TOTAL_METRIC: &str = "cogneva_evolution_build_outcomes_
 pub const INTENT_LABEL: &str = "intent";
 
 /// The outcome label.
-pub const OUTCOME_LABEL: &str = "outcome";
+pub const OUTCOME_LABEL: &str = crate::LABEL_OUTCOME;
 
 /// The outcome a build that never reached cargo carries.
 ///

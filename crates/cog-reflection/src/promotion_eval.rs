@@ -110,7 +110,10 @@ pub(crate) async fn report_eval_gate_outcome(
         return;
     };
     let mut labels = HashMap::new();
-    labels.insert("outcome".to_string(), outcome.as_cell().to_string());
+    labels.insert(
+        crate::LABEL_OUTCOME.to_string(),
+        outcome.as_cell().to_string(),
+    );
     labels.insert("site".to_string(), site.as_cell().to_string());
     if let Err(e) = metrics
         .record_counter(
@@ -143,7 +146,10 @@ pub(crate) async fn seed_eval_gate_site(
     };
     for outcome in EvalGateOutcome::ALL {
         let mut labels = HashMap::new();
-        labels.insert("outcome".to_string(), outcome.as_cell().to_string());
+        labels.insert(
+            crate::LABEL_OUTCOME.to_string(),
+            outcome.as_cell().to_string(),
+        );
         labels.insert("site".to_string(), site.as_cell().to_string());
         if let Err(e) = metrics
             .record_counter(

@@ -326,7 +326,7 @@ async fn publish_ingest(
         return;
     };
     let mut labels = HashMap::new();
-    labels.insert("outcome".to_string(), outcome.to_string());
+    labels.insert(crate::LABEL_OUTCOME.to_string(), outcome.to_string());
     labels.insert("node".to_string(), node.trim().to_string());
     let _ = backend
         .record_counter(
@@ -742,7 +742,7 @@ mod tests {
             .expect("读得到自己刚写的读数")
             .iter()
             .find(|sample| {
-                sample.labels.get("outcome").map(String::as_str) == Some(outcome)
+                sample.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(outcome)
                     && sample.labels.get("node").map(String::as_str) == Some(node)
             })
             .map(|sample| sample.value)

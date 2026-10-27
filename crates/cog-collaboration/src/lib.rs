@@ -13,6 +13,23 @@ pub mod profile;
 pub mod resume;
 pub mod squad;
 
+/// The label naming how a reading ended.
+///
+/// Every family here with more than one ending carries this label, and the
+/// readers that count one ending select by it. It is declared once per crate
+/// that writes it, under the same identifier, and a gate compares the
+/// spellings: one edited copy publishes a family under a name every existing
+/// selector reads as empty, which is what "this family never ran" looks like.
+pub const LABEL_OUTCOME: &str = "outcome";
+
+/// The label naming where a reading's value came from.
+///
+/// The same label carries the source of a build cap, of an upstream mirror and
+/// of a configured period, so the name is one word across those families.
+/// Declared here under the same identifier the other writers use, with a gate
+/// comparing the spellings.
+pub const LABEL_SOURCE: &str = "source";
+
 pub use actors::{ModeratorDecision, ModeratorOutput};
 pub use collaboration_executor::CollaborationExecutor;
 pub use config::{

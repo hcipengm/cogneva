@@ -1804,7 +1804,7 @@ impl ChangePipeline {
                 for source in cog_core::ProjectKindSource::ALL {
                     let mut labels = std::collections::HashMap::new();
                     labels.insert("kind".to_string(), kind.as_str().to_string());
-                    labels.insert("source".to_string(), source.as_str().to_string());
+                    labels.insert(crate::LABEL_SOURCE.to_string(), source.as_str().to_string());
                     if let Err(e) = metrics
                         .record_counter(cog_core::metric_names::PROJECT_KIND_TOTAL, 0.0, labels)
                         .await
@@ -1816,7 +1816,7 @@ impl ChangePipeline {
         }
         let mut labels = std::collections::HashMap::new();
         labels.insert("kind".to_string(), project_kind.as_str().to_string());
-        labels.insert("source".to_string(), source.as_str().to_string());
+        labels.insert(crate::LABEL_SOURCE.to_string(), source.as_str().to_string());
         if let Err(e) = metrics
             .record_counter(cog_core::metric_names::PROJECT_KIND_TOTAL, 1.0, labels)
             .await
