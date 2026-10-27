@@ -292,7 +292,12 @@ pub struct BackupConfig {
     /// 恢复时按对象名逐个 apply——合并成一份会让恢复把一个对象写回成两个的
     /// 内容，而权限面正是按对象划的。
     pub oob_secrets_dir: PathBuf,
-    /// cogneva-data-pvc 挂载根；对象子树取其下 `storage/`。
+    /// cogneva-data-pvc 挂载根；对象子树按约定取其下 `storage/`。
+    ///
+    /// 「按约定」是因为这一侧只拿得到数据根：`providers.storage.options.base_path`
+    /// 在应用进程的配置里，备份进程读不到。部署把对象放到别处时（chart 默认的
+    /// seaweedfs 有自己那块卷），`storage/` 不存在，包里就不带对象——这件事由
+    /// 清单里那张 `objects` 有损面点名，见 [`local_objects_dir`]。
     pub data_dir: PathBuf,
     /// 主数据根之外、也要取产物层的数据根，形如 `evolution=/var/lib/...`。
     ///
@@ -1837,10 +1842,16 @@ async fn run_backup_into(
     }
     segments.push(segment_stamp("qdrant"));
 
-    let (files, bytes) = copy_tree(
-        &cfg.data_dir.join("storage"),
-        &staging.join("objects").join("storage"),
-    )?;
+    // 对象层：备份进程只拿到 `data_dir`，读不到 `providers.storage.options.base_path`，
+    // 所以按约定找 `<data_dir>/storage`。约定之外的部署——chart 默认的 seaweedfs 把对象
+    // 放在它自己的卷里——这一棵根本不存在，而 `copy_tree` 对不存在的源返回 `(0, 0)`：
+    // 「一个对象都没带」与「本来就没有对象」在清单上同形。所以缺席要落进
+    // `lossy_surfaces` 点名，不能安静地记成 0 个文件。
+    let objects_dir = local_objects_dir(&cfg.data_dir);
+    let (files, bytes) = match &objects_dir {
+        Some(src) => copy_tree(src, &staging.join("objects").join("storage"))?,
+        None => (0, 0),
+    };
     segments.push(segment_stamp("objects"));
     let artifacts = collect_artifacts(cfg, staging, Some(&pool)).await?;
     segments.push(segment_stamp("artifacts"));
@@ -1903,11 +1914,26 @@ async fn run_backup_into(
         artifacts,
         image: std::env::var(IMAGE_REF_ENV).unwrap_or_default(),
         schema_version: current_schema_version(),
-        lossy_surfaces: lossy_surfaces(evolution_bundle.is_some(), credentials_present),
+        lossy_surfaces: lossy_surfaces(
+            evolution_bundle.is_some(),
+            credentials_present,
+            objects_dir.is_none(),
+        ),
         segments,
         max_segment_skew_seconds: bound,
         evolution_bundle,
     })
+}
+
+/// 对象层的本地子树，**只有它真在盘上**才算这个包该带走的东西。
+///
+/// 备份进程只拿得到数据根，读不到 `providers.storage.options.base_path`，所以按
+/// 约定找 `<data_dir>/storage`。约定之外的部署里这一棵不存在，而 `copy_tree` 对
+/// 不存在的源返回 `(0, 0)`——「一个对象都没带」与「本来就没有对象」在清单上同形，
+/// 所以缺席要进 `lossy_surfaces`，不在这里安静地返回一个空结果。
+fn local_objects_dir(data_dir: &Path) -> Option<PathBuf> {
+    let dir = data_dir.join("storage");
+    dir.is_dir().then_some(dir)
 }
 
 /// 本二进制带的最新 PG 迁移号。读不出来记 0（没声明），不让备份失败：
@@ -2007,7 +2033,11 @@ fn check_segment_skew(manifest: &BackupManifest) -> Result<(), String> {
 /// `credentials_present` 同理：没有包级口令时两片 Secret 清单根本不进包（凭证
 /// 不往明文里抄），那就必须有一行说清换机后少了什么、怎么补回来——否则恢复端
 /// 只会看到 `secrets_keys` 是空的，而那和「老包当年没声明」是两种事。
-fn lossy_surfaces(bundle_present: bool, credentials_present: bool) -> Vec<LossySurface> {
+fn lossy_surfaces(
+    bundle_present: bool,
+    credentials_present: bool,
+    objects_absent: bool,
+) -> Vec<LossySurface> {
     let mut surfaces: Vec<LossySurface> = [
         (
             "nats",
@@ -2054,6 +2084,19 @@ fn lossy_surfaces(bundle_present: bool, credentials_present: bool) -> Vec<LossyS
                         .to_string(),
             },
         );
+    }
+    if objects_absent {
+        surfaces.push(LossySurface {
+            name: "objects".to_string(),
+            lost: "对象层的全部对象（数据根下没有 `storage/` 这一棵子树）".to_string(),
+            acceptable_because:
+                "备份进程只拿到数据根，读不到 `providers.storage.options.base_path`，所以它按\
+                 约定找 `<data_dir>/storage`。部署把对象放在别处时（chart 默认的 seaweedfs 把\
+                 它们放在自己那块卷上），这份包从来不带对象——换机后要由那项服务自己的备份\
+                 恢复，或按 `change_ledger` 与工件重新生成。点名它是为了不让「一份都没带」\
+                 读成「本来就一个对象都没有」"
+                    .to_string(),
+        });
     }
     if !credentials_present {
         surfaces.push(LossySurface {
@@ -5561,6 +5604,25 @@ mod tests {
         assert_eq!((files, bytes), (0, 0));
     }
 
+    /// 「这一棵不在」与「这一棵是空的」必须分成两种事：`copy_tree` 对两者都回
+    /// `(0, 0)`，所以出包前的这个判断就是唯一能把它们分开的地方——它答 `None`
+    /// 时，清单里才会多出一条点名对象层的有损面。
+    #[test]
+    fn a_data_root_without_an_objects_subtree_says_it_has_none() {
+        let data = tempfile::tempdir().unwrap();
+        assert_eq!(
+            local_objects_dir(data.path()),
+            None,
+            "没有 storage/ 子树时不能假装那是一棵空树"
+        );
+        std::fs::create_dir_all(data.path().join("storage/bucket")).unwrap();
+        assert_eq!(
+            local_objects_dir(data.path()),
+            Some(data.path().join("storage")),
+            "子树在盘上时就该原样交出去"
+        );
+    }
+
     #[test]
     fn an_open_credential_surface_stops_the_next_backup_and_a_clean_one_does_not() {
         let at = Utc::now();
@@ -5699,7 +5761,7 @@ mod tests {
             !out.exists(),
             "连那两行都不该落：一个空的 secrets/ 目录会读成「这一趟确实导过，只是没键」"
         );
-        let surfaces = lossy_surfaces(true, false);
+        let surfaces = lossy_surfaces(true, false, true);
         assert!(
             surfaces.iter().any(|s| s.name == "credentials"),
             "不导凭证必须被点名成有损面"
@@ -6069,7 +6131,7 @@ mod tests {
             artifacts: Vec::new(),
             image: "registry.example/cogneva:test".into(),
             schema_version: 1,
-            lossy_surfaces: lossy_surfaces(false, true),
+            lossy_surfaces: lossy_surfaces(false, true, true),
             segments: stamps(&[
                 ("postgres", "2026-10-19T00:00:00Z"),
                 ("artifacts", "2026-10-19T00:00:10Z"),
@@ -6462,24 +6524,29 @@ mod tests {
         // 两种取值都要说得清：带了就不该再把那一格列成损失，没带才是。
         for bundle_present in [false, true] {
             for credentials_present in [false, true] {
-                let surfaces = lossy_surfaces(bundle_present, credentials_present);
-                assert!(!surfaces.is_empty());
-                for s in &surfaces {
-                    assert!(!s.name.is_empty());
-                    assert!(!s.lost.is_empty(), "{} 没写丢了什么", s.name);
-                    assert!(
-                        !s.acceptable_because.is_empty(),
-                        "{} 没写为什么可丢",
-                        s.name
+                for objects_absent in [false, true] {
+                    let surfaces =
+                        lossy_surfaces(bundle_present, credentials_present, objects_absent);
+                    assert!(!surfaces.is_empty());
+                    for s in &surfaces {
+                        assert!(!s.name.is_empty());
+                        assert!(!s.lost.is_empty(), "{} 没写丢了什么", s.name);
+                        assert!(
+                            !s.acceptable_because.is_empty(),
+                            "{} 没写为什么可丢",
+                            s.name
+                        );
+                    }
+                    let named = surfaces.iter().any(|s| s.name == "evolution-bare-repo");
+                    assert_eq!(named, !bundle_present, "bundle_present={bundle_present}");
+                    let named = surfaces.iter().any(|s| s.name == "credentials");
+                    assert_eq!(
+                        named, !credentials_present,
+                        "credentials_present={credentials_present}"
                     );
+                    let named = surfaces.iter().any(|s| s.name == "objects");
+                    assert_eq!(named, objects_absent, "objects_absent={objects_absent}");
                 }
-                let named = surfaces.iter().any(|s| s.name == "evolution-bare-repo");
-                assert_eq!(named, !bundle_present, "bundle_present={bundle_present}");
-                let named = surfaces.iter().any(|s| s.name == "credentials");
-                assert_eq!(
-                    named, !credentials_present,
-                    "credentials_present={credentials_present}"
-                );
             }
         }
     }
