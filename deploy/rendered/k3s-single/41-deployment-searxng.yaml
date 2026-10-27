@@ -18,6 +18,13 @@ spec:
       app.kubernetes.io/component: search
   template:
     metadata:
+      annotations:
+        # settings.yml 是卷里挂进去的：kubelet 会就地更新文件，进程却只在启动时
+        # 读一次。改 values 里的引擎/超时后 ConfigMap 变了、Pod 模板没变，这次
+        # 升级就不换 Pod——搜索面仍按旧设置跑，而渲染、parity、Pod 状态三面全绿。
+        # 指纹只哈希那份配置模板（searxng-settings.yaml），与主应用那几条读主配置的
+        # 工作负载不同值是正确的：它们哈希的不是同一组文档。
+        checksum/config: 15d3d5159e5b0219bbc5f6eb61b6f7065a1519317edf5b9381792da84eca8f90
       labels:
         app.kubernetes.io/name: searxng
         app.kubernetes.io/component: search

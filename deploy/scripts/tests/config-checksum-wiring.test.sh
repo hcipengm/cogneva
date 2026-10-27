@@ -19,6 +19,8 @@
 #   7. 只给 env 配 ConfigMap 的那两条消费者（安全网关、沙箱执行器）之一删注解 → 红；
 #   8. 把指纹改回只哈希 app-config.yaml → 红（真渲染两次，只动 env 配置，
 #      指纹不变——这正是「配置改了却不滚动」那个失败形状）。
+#   9. 只读 searxng-settings 的那条删注解 → 红（配置面是从产物里读出来的；
+#      判据写死四个名字时，第五份配置的消费者看不见，这一条会绿）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -82,9 +84,12 @@ out="$(run)"
 ck "4. 同一份配置两个指纹：红" 1 "$out" "$(rc)"
 ck_has "4. 说清是同一份配置" "指纹不一致" "$out"
 
-# 5. 一种形态里只剩一条消费者 → 红（下界是声明）
+# 5. 一种形态里的消费者少到跌破下界 → 红（下界是声明）
+#    真树下界是 4 条，实际是 5 条（主应用、evolution、安全网关、沙箱执行器、
+#    searxng），所以删一条跌不破——删两条。这一格判的是「下界这个声明还在被
+#    核对」，不是「恰好删掉哪一条」。
 mirror
-rm -f "${work}/root/${evolution_single}"
+rm -f "${work}/root/${evolution_single}" "${work}/root/${sandbox_single}"
 out="$(run)"
 ck "5. 消费者只剩一条：红" 1 "$out" "$(rc)"
 ck_has "5. 报出下界" "下界是 4" "$out"
@@ -118,7 +123,18 @@ sed -i 's|{{- $env := include (print $.Template.BasePath "/configmap.yaml") . -}
   "${work}/root/${helper}"
 out="$(run)"
 ck "8. 指纹不跟 env 配置变：红" 1 "$out" "$(rc)"
-ck_has "8. 说清是 env 配置没进指纹" "只改 env 那份配置" "$out"
+ck_has "8. 点名哪份配置变了却没进指纹" "只改 cogneva-config 的内容" "$out"
+
+# 9. searxng 也是配置消费者：它只挂 searxng-settings，不读主配置。
+#    这一条守的是「配置面从产物里读出来」——判据里写死四个名字时，第五份配置的
+#    消费者根本不在判据里，删掉它的指纹这道门照样全绿，而改 values 里的引擎设置
+#    之后 Pod 一个都不换。
+searxng_single="deploy/rendered/k3s-single/41-deployment-searxng.yaml"
+mirror
+sed -i '/checksum\/config:/d' "${work}/root/${searxng_single}"
+out="$(run)"
+ck "9. 只读 searxng-settings 的那条删注解：红" 1 "$out" "$(rc)"
+ck_has "9. 点名 searxng 与它读的那份配置" "searxng 读 searxng-settings" "$out"
 
 printf '\n%s\n' "通过 ${pass}，失败 ${fail}"
 [ "${fail}" -eq 0 ]

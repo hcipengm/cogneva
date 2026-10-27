@@ -1,0 +1,65 @@
+{{- if .Values.webSearch.enabled }}
+# 网页检索后端：集群内自建的 SearXNG。
+#
+# 为什么自建而不是买：`web_search` 是 agent 每个回合都可能调用的东西，按请求计费的
+# 服务端检索工具会把「想一想、查一下」变成账单上的行；SearXNG 在同一处聚合多家引擎，
+# 无账号、无计费、查询不出本部署。它只被集群内的工具调用，不对外暴露：没有 Ingress，
+# Service 只在命名空间内可达，NetworkPolicy 只放行进化 Pod 与主应用。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: searxng-settings
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    app.kubernetes.io/name: searxng
+    app.kubernetes.io/component: search
+data:
+  settings.yml: |
+    # 只留这台主机真的连得上的引擎。镜像默认开着的那一群（brave、duckduckgo、
+    # google cse、startpage、wikidata、wikipedia）在境内一律不可达：它们各自超时，
+    # 于是每次查询都等满超时、拿回零条结果，而 HTTP 仍是 200——调用方看到的像
+    # 「网上没有这条」，实际是一个都没问出去。
+    #
+    # 只留 bing。它是唯一一条在这台主机上稳定出货的读数：每次 9~10 条、约 1 秒。
+    #
+    # sogou 曾在这个表里，现在不能留：它每次查询都崩在 `sogou.py` 的
+    # `resp.next_request` 上（本镜像的响应对象没有这个属性），故障进
+    # `unresponsive_engines`、零条结果。一个人人都崩的引擎不是备用通道，是每条
+    # 查询都带一条假警报——`web_search` 把这个字段原样交给调用方，于是模型每次
+    # 搜索都读到「有一个引擎坏了」，而它其实每次都是坏的，读它学不到任何东西。
+    # baidu（出口 IP 被判 CAPTCHA）、360search（零条且不报错）同理不在表里。
+    #
+    # 判据：表里的每个引擎都必须在 `unresponsive_engines` 里长期不出现；一旦某家
+    # 变成每次都崩，就从表里删掉，而不是留着当噪音。
+    use_default_settings:
+      engines:
+        keep_only:
+          - bing
+    engines:
+      # keep_only 只是留下条目，它们默认仍是关的，必须逐个打开。
+      - name: bing
+        disabled: false
+        # 200 之外还有一次 302：`www.bing.com` 在境内把请求转给 `cn.bing.com`，
+        # 而这一层的客户端不跟这一步，只拿回 302 的空壳——零结果且不报错。直接
+        # 问 `cn.bing.com` 就绕开了这次跳转。
+        base_url: https://cn.bing.com
+        # 开了 HTTP/3 时同样的地址拿不回可用响应；这一家走 HTTP/2 才稳定。
+        enable_http3: false
+    general:
+      instance_name: "cogneva"
+    server:
+      # 限流与图片代理都不开：本实例只服务集群内一个零凭证的工具调用方，没有对外
+      # 的匿名入口要限；图片代理会把外部图片拉过本 Pod，这里没有 UI 需要它。
+      limiter: false
+      image_proxy: false
+      # SearXNG 拒绝在没有这个值时启动。它签的是限流与图片代理两件事的令牌，而这两件
+      # 都已关闭，所以它不是凭证：没有任何外部方认它，换掉它只影响本 Pod 自己的内存。
+      secret_key: "cogneva-cluster-internal-searxng"
+      # JSON 默认不开。`web_search` 读的就是这一面——少了这行，工具每次拿回 403，
+      # 错误里会点名这一项。
+    search:
+      safe_search: {{ .Values.webSearch.safeSearch }}
+      formats:
+        - html
+        - json
+{{- end }}

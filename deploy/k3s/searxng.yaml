@@ -62,6 +62,10 @@ spec:
       app.kubernetes.io/component: search
   template:
     metadata:
+      annotations:
+        # searxng-settings 的指纹：只改配置的那次升级也必须换 Pod，否则进程仍按
+        # 启动时读到的 settings.yml 跑（文件由 kubelet 就地更新，进程不会重读）。
+        checksum/config: 15d3d5159e5b0219bbc5f6eb61b6f7065a1519317edf5b9381792da84eca8f90
       labels:
         app.kubernetes.io/name: searxng
         app.kubernetes.io/component: search
