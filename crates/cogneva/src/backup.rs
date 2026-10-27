@@ -681,7 +681,7 @@ pub async fn backup_postgres(
             "SELECT setval('{seq}', {last_value}, {is_called});\n"
         ));
     }
-    std::fs::write(out_dir.join("sequences.sql"), &sql)?;
+    std::fs::write(out_dir.join(SEQUENCES_FILE), &sql)?;
     report.sequences = sequences.len();
     // 出错时 tx 在 drop 时回滚；成功路径显式提交，把快照释放掉。
     tx.commit().await?;
@@ -842,7 +842,7 @@ pub async fn restore_postgres(
         tx.commit().await?;
     }
 
-    let seq_path = pkg_pg_dir.join("sequences.sql");
+    let seq_path = pkg_pg_dir.join(SEQUENCES_FILE);
     let mut sequences_without_a_home = Vec::new();
     if seq_path.exists() {
         let sql = std::fs::read_to_string(seq_path)?;
@@ -1830,7 +1830,7 @@ async fn run_backup_into(
     // 数据是什么时候被取走的」，不是「这一跑什么时候开始」。
     let mut segments = Vec::new();
     let pool = PgPool::connect(&cfg.database_url).await?;
-    let postgres = backup_postgres(&pool, &staging.join("pg")).await?;
+    let postgres = backup_postgres(&pool, &staging.join(PACKAGE_PG_DIR)).await?;
     segments.push(segment_stamp("postgres"));
 
     let qdrant = QdrantHttp::new(&cfg.qdrant_http_url);
@@ -1933,6 +1933,12 @@ const QDRANT_DIR: &str = "qdrant";
 const ARTIFACTS_DIR: &str = "artifacts";
 const GIT_DIR: &str = "git";
 const EVOLUTION_BUNDLE_FILE: &str = "evolution.bundle";
+
+/// 包里的 PG 段：一份 `pg_dump` 与全部序列的 `setval` 语句。
+const PACKAGE_PG_DIR: &str = "pg";
+
+/// PG 段里那串序列语句的文件名。写包的一侧拼它，核包与恢复的一侧再拼一遍。
+const SEQUENCES_FILE: &str = "sequences.sql";
 
 /// 数据根下装对象的那一级。
 const OBJECTS_SUBDIR: &str = "storage";
@@ -2660,7 +2666,7 @@ fn verify_package_against_manifest(
     // postgres：声明的表集与包内 `pg/public.<表>.csv` 集相等，且每张表的行数与
     // 声明一致；`sequences.sql` 的语句数等于声明的序列数。
     if !manifest.postgres.tables.is_empty() {
-        let pg_dir = pkg_dir.join("pg");
+        let pg_dir = pkg_dir.join(PACKAGE_PG_DIR);
         let declared: BTreeMap<&str, i64> = manifest
             .postgres
             .tables
@@ -2698,7 +2704,7 @@ fn verify_package_against_manifest(
                 ));
             }
         }
-        let seq_path = pg_dir.join("sequences.sql");
+        let seq_path = pg_dir.join(SEQUENCES_FILE);
         let seqs = if seq_path.exists() {
             std::fs::read_to_string(&seq_path)?
                 .lines()
@@ -2847,7 +2853,7 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     check_provenance(&manifest)?;
     check_segment_skew(&manifest)?;
 
-    let pg_dir = pkg_dir.join("pg");
+    let pg_dir = pkg_dir.join(PACKAGE_PG_DIR);
     if pg_dir.exists() {
         let pool = PgPool::connect(&database_url).await?;
         let report = restore_postgres(&pool, &pg_dir).await?;
@@ -4682,7 +4688,7 @@ async fn restore_and_compare(
         elapsed_ms = (phase.elapsed() - migrations_done).as_millis() as u64,
         "drill: store schema applied"
     );
-    let pg_dir = pkg_dir.join("pg");
+    let pg_dir = pkg_dir.join(PACKAGE_PG_DIR);
     if !pg_dir.exists() {
         return Err("包里没有 pg 段，这次演练无表可恢复".into());
     }

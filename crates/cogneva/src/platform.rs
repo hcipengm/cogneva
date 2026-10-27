@@ -1,5 +1,21 @@
 #![allow(dead_code)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// 应用自己那一级目录的名字。macOS / Windows 的配置、日志、pid、临时目录都挂在
+/// 它下面：一个词，四处各写一遍时，改其中一处只会挪走一半的东西。
+const APP_DIR_NAME: &str = "cogneva";
+
+/// macOS / Windows 的数据根默认名（Linux 的数据根由 `cog_core::paths` 声明）。
+const DATA_DIR_NAME: &str = "sf-data";
+
+/// macOS / Windows 的 pid 目录在应用目录下的那一级。
+const RUN_SUBDIR: &str = "run";
+
+/// pid 文件名。首选目录与临时回落目录落的是同一个名字。
+const PID_FILE_NAME: &str = "cogneva.pid";
+
+/// 日志文件名。
+const LOG_FILE_NAME: &str = "cogneva.log";
 
 /// Cross-platform directory layout for Cogneva.
 /// | Platform | data_dir        | config_dir               | log_dir               | pid_dir               |
@@ -20,13 +36,13 @@ impl PlatformPaths {
         {
             dirs::data_dir()
                 .unwrap_or_else(|| PathBuf::from("~/Library/Application Support"))
-                .join("sf-data")
+                .join(DATA_DIR_NAME)
         }
         #[cfg(target_os = "windows")]
         {
             dirs::data_dir()
                 .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-                .join("sf-data")
+                .join(DATA_DIR_NAME)
         }
     }
 
@@ -40,13 +56,13 @@ impl PlatformPaths {
         {
             dirs::config_dir()
                 .unwrap_or_else(|| PathBuf::from("~/Library/Preferences"))
-                .join("cogneva")
+                .join(APP_DIR_NAME)
         }
         #[cfg(target_os = "windows")]
         {
             dirs::config_dir()
                 .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-                .join("cogneva")
+                .join(APP_DIR_NAME)
         }
     }
 
@@ -64,7 +80,7 @@ impl PlatformPaths {
         {
             dirs::data_dir()
                 .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-                .join("cogneva")
+                .join(APP_DIR_NAME)
         }
     }
 
@@ -78,13 +94,13 @@ impl PlatformPaths {
         {
             dirs::data_dir()
                 .unwrap_or_else(|| PathBuf::from("~/Library/Logs"))
-                .join("cogneva")
+                .join(APP_DIR_NAME)
         }
         #[cfg(target_os = "windows")]
         {
             dirs::data_dir()
                 .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-                .join("cogneva")
+                .join(APP_DIR_NAME)
                 .join("logs")
         }
     }
@@ -99,31 +115,40 @@ impl PlatformPaths {
         {
             dirs::data_dir()
                 .unwrap_or_else(|| PathBuf::from("~/Library/Application Support"))
-                .join("cogneva")
-                .join("run")
+                .join(APP_DIR_NAME)
+                .join(RUN_SUBDIR)
         }
         #[cfg(target_os = "windows")]
         {
             dirs::data_dir()
                 .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-                .join("cogneva")
-                .join("run")
+                .join(APP_DIR_NAME)
+                .join(RUN_SUBDIR)
         }
     }
 
     /// Temporary directory for tier-migration scratch files.
     pub fn tmp_dir() -> PathBuf {
-        std::env::temp_dir().join("cogneva")
+        std::env::temp_dir().join(APP_DIR_NAME)
     }
 
     /// Default PID file path.
     pub fn pid_file() -> PathBuf {
-        Self::pid_dir().join("cogneva.pid")
+        Self::pid_file_in(&Self::pid_dir())
+    }
+
+    /// The pid file's path under a given directory.
+    ///
+    /// The preferred directory and the temporary fallback differ, the file name
+    /// does not: written twice, a rename would leave half the processes writing
+    /// a pid file nobody looks for.
+    pub fn pid_file_in(dir: &Path) -> PathBuf {
+        dir.join(PID_FILE_NAME)
     }
 
     /// Default log file path.
     pub fn log_file() -> PathBuf {
-        Self::log_dir().join("cogneva.log")
+        Self::log_dir().join(LOG_FILE_NAME)
     }
 }
 

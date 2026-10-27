@@ -41,7 +41,7 @@ pub fn init_daemon_and_pidfile() -> (daemon::DaemonControl, Option<pidfile::PidF
         },
         Err(_) => create_pid_file(
             &platform::PlatformPaths::pid_file(),
-            &platform::PlatformPaths::tmp_dir().join("cogneva.pid"),
+            &platform::PlatformPaths::pid_file_in(&platform::PlatformPaths::tmp_dir()),
         ),
     };
     if let Some(pid) = &pid_file {

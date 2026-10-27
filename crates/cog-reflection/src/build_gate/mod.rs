@@ -746,7 +746,7 @@ impl BuildBudget {
     /// mid-life stop being bound by the number it started with.
     fn read_at(root: &Path, cgroup_path: &str) -> Option<Self> {
         let base = root.join(cgroup_path.trim_start_matches('/'));
-        let mem_max = read_u64_file(&base.join("memory.max"))?;
+        let mem_max = read_u64_file(&base.join(crate::rollout_resources::CGROUP_MEMORY_MAX_FILE))?;
         let mem_current = read_u64_file(&base.join("memory.current"))?;
         // A cgroup whose accounting cannot be read is charged in full, which is
         // the reading this dimension had before it could tell cache apart.

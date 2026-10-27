@@ -232,10 +232,13 @@ impl GitOpsPublisher {
         // 全局选项必须在子命令前；--tls-verify=false 允许集群内 http registry。
         // 路径只有一处声明：回收那一侧读的是同一个库，两边各写一个字面量就会
         // 出现「回收一个没人写的库」——那与「库本来就小」在读数上同形。
-        let storage = crate::sandbox::buildah_store_dir();
         let (storage_storage, storage_run) = (
-            storage.join("storage").to_string_lossy().into_owned(),
-            storage.join("run").to_string_lossy().into_owned(),
+            crate::sandbox::buildah_storage_dir()
+                .to_string_lossy()
+                .into_owned(),
+            crate::sandbox::buildah_runroot_dir()
+                .to_string_lossy()
+                .into_owned(),
         );
         let mut build_args: Vec<String> = vec![
             "--root".into(),

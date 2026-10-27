@@ -28,6 +28,12 @@ const FORMAT_VERSION: &str = "v1";
 /// 判定容器自己的 cgroup 根。
 pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
+/// cgroup 里记内存上限的那一格。
+///
+/// 资源读数与构建判据各读一遍：两处各拼一次时，改名只会让其中一侧读不到上限，
+/// 而「读不到」在那两处的意思是「这一格没有约束」。
+pub const CGROUP_MEMORY_MAX_FILE: &str = "memory.max";
+
 /// 判定进程跑完时，它自己看到的资源量。
 ///
 /// 每个字段都是 `Option`：读不到与读到零是两件事，前者不进编码、也不参与比值。整条读数
@@ -98,7 +104,7 @@ impl RolloutResourceReading {
             measured = true;
         }
 
-        if let Some(bytes) = read_cgroup_bytes(&cgroup_root.join("memory.max")) {
+        if let Some(bytes) = read_cgroup_bytes(&cgroup_root.join(CGROUP_MEMORY_MAX_FILE)) {
             reading.memory_max_bytes = bytes;
             measured = true;
         }

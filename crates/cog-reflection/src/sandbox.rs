@@ -55,6 +55,22 @@ pub fn buildah_store_dir() -> std::path::PathBuf {
     sandbox_root().join("containers")
 }
 
+/// buildah 的镜像层库在存储根下的那一级（`--root`）。
+const BUILDAH_STORAGE_SUBDIR: &str = "storage";
+
+/// buildah 的运行根在存储根下的那一级（`--runroot`）。
+const BUILDAH_RUNROOT_SUBDIR: &str = "run";
+
+/// The directory buildah keeps its layers in, i.e. what `--root` points at.
+pub fn buildah_storage_dir() -> std::path::PathBuf {
+    buildah_store_dir().join(BUILDAH_STORAGE_SUBDIR)
+}
+
+/// The directory buildah keeps its run state in, i.e. what `--runroot` points at.
+pub fn buildah_runroot_dir() -> std::path::PathBuf {
+    buildah_store_dir().join(BUILDAH_RUNROOT_SUBDIR)
+}
+
 /// The sandbox root the layout is built on, honouring `COGNEVA_SANDBOX_DIR`.
 fn sandbox_root() -> std::path::PathBuf {
     std::env::var("COGNEVA_SANDBOX_DIR")

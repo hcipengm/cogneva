@@ -443,11 +443,23 @@ pub(crate) fn change_record_path(dir: &Path, artifact_id: &str) -> PathBuf {
     dir.join(format!("{artifact_id}.json"))
 }
 
+/// 变更目录下放「已经离开待办队列」那一半的目录名。
+const RETIRED_SUBDIR: &str = "retired";
+
+/// Where a change goes once it has left the pending queue.
+///
+/// Written by the retire step, read by the listing, the content reader and the
+/// retire predicate: five spellings of one directory, and the ones that lose a
+/// rename answer "no such change" rather than failing.
+pub(crate) fn retired_dir(change_dir: &Path) -> PathBuf {
+    change_dir.join(RETIRED_SUBDIR)
+}
+
 /// The record of a change that has left the pending queue. Retired beside the
 /// `.diff` it describes, so the pair moves together and neither can be read
 /// alone.
 pub(crate) fn retired_change_record_path(dir: &Path, artifact_id: &str) -> PathBuf {
-    dir.join("retired").join(format!("{artifact_id}.json"))
+    retired_dir(dir).join(format!("{artifact_id}.json"))
 }
 
 /// Write a change's metadata record into `dir`.
@@ -769,7 +781,7 @@ impl ChangePipeline {
     /// when the resident index that used to carry it drops the entry.
     pub async fn known_change_records(&self) -> Vec<EvolutionResult> {
         let mut records: Vec<EvolutionResult> = Vec::new();
-        for dir in [self.change_dir.clone(), self.change_dir.join("retired")] {
+        for dir in [self.change_dir.clone(), retired_dir(&self.change_dir)] {
             let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
                 continue;
             };
@@ -796,8 +808,7 @@ impl ChangePipeline {
     /// beside it: until then the index is the last thing holding that change's
     /// state, and a drop would take the state with it.
     pub fn artifact_is_retired(&self, artifact_id: &str) -> bool {
-        self.change_dir
-            .join("retired")
+        retired_dir(&self.change_dir)
             .join(format!("{artifact_id}.diff"))
             .exists()
             && retired_change_record_path(&self.change_dir, artifact_id).exists()
@@ -816,10 +827,7 @@ impl ChangePipeline {
         if let Ok(text) = tokio::fs::read_to_string(&pending).await {
             return Some(text);
         }
-        let retired = self
-            .change_dir
-            .join("retired")
-            .join(format!("{artifact_id}.diff"));
+        let retired = retired_dir(&self.change_dir).join(format!("{artifact_id}.diff"));
         tokio::fs::read_to_string(retired).await.ok()
     }
 
@@ -840,16 +848,16 @@ impl ChangePipeline {
             return Ok(());
         }
 
-        let retired_dir = self.change_dir.join("retired");
-        tokio::fs::create_dir_all(&retired_dir).await.map_err(|e| {
+        let dir = retired_dir(&self.change_dir);
+        tokio::fs::create_dir_all(&dir).await.map_err(|e| {
             SFError::IO(format!(
                 "Failed to create retire dir {}: {}",
-                retired_dir.display(),
+                dir.display(),
                 e
             ))
         })?;
 
-        let to = retired_dir.join(format!("{artifact_id}.diff"));
+        let to = dir.join(format!("{artifact_id}.diff"));
         tokio::fs::rename(&from, &to).await.map_err(|e| {
             SFError::IO(format!("Failed to retire change {}: {}", from.display(), e))
         })?;
