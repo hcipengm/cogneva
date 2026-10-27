@@ -66,6 +66,32 @@ pub(crate) const IMAGE_PULL_WAITING_REASONS: &[&str] = &["ErrImagePull", "ImageP
 /// 加进 Job 的 `activeDeadlineSeconds`——只封一头，另一头的界就名不副实。
 pub(crate) const CI_ASK_BUDGET_SECS: u64 = 180;
 
+/// 上游答「还在跑」时，这一问愿意等多久（秒）再扣住这一轮。
+///
+/// 派 Job 到 Job 里问这一句只隔着几十秒，而一次 CI 从推上去到出结论要十几分钟：
+/// 2026-10-27 实测，Job 在推上去 11 分钟时问，GitHub 答 `still running`，这一轮
+/// 扣住、这一版被判成环境失败、主线接着去追下一版；下一版又是同样的十一分钟。
+/// 落地节奏快过 CI 判定，于是每一版都死在「还在跑」这一格上，主线三个多小时没有
+/// 任何东西上去过。
+///
+/// 「还在跑」与「没问到」必须分开处置：后者是路不通，等也没用；前者是判词还在
+/// 生产，再问一句就有。只等这一种，且等到有上界为止——无限等会让 Job 的期限名不
+/// 副实，到点被杀还走不到 Job 自己的回滚。
+pub(crate) const CI_PENDING_WAIT_SECS: u64 = 900;
+
+/// 等在里面的复问间隔（秒）。一次 CI 判定的粒度是分钟级，问得比这密只是把同一个
+/// 答案多读几遍。
+pub(crate) const CI_PENDING_REASK_SECS: u64 = 60;
+
+/// 「还在跑」这一答到手之后，这一轮还该不该再问一次。
+///
+/// 判红的版本等人改代码，没问到的版本等路通，只有「还在跑」是自己会走完的：它说的
+/// 是「判词还没产生」，不是「这一版有问题」。所以只有它值得等，且只在
+/// [`CI_PENDING_WAIT_SECS`] 之内等——过了界，判词还没来这件事本身就成了结论。
+pub(crate) fn still_worth_asking(kind: CiHoldKind, waited: Duration) -> bool {
+    kind == CiHoldKind::Pending && waited < Duration::from_secs(CI_PENDING_WAIT_SECS)
+}
+
 /// The workload kinds this rollout waits for after the apply: every kind whose
 /// pods are long-lived, i.e. every kind a restarted pod leaves serving nothing
 /// until the replacement is ready.
@@ -3704,32 +3730,51 @@ impl RolloutExecutor {
     /// 而名字在这一次读里本来就有。
     async fn upstream_ci_hold(&self) -> Option<(CiHoldKind, String)> {
         let ask = self.ci_ask.as_ref()?;
-        // 整段提问有自己的上界：每次 HTTP 读自带 30 秒连接 + 60 秒读，而上游可以
-        // 有多个、报失败的检查还要逐条问工作流身份，不封顶就会被一次慢网关把
-        // Job 的期限吃光——那时失败会以"被判进程没跑完"的形状出现，谁也看不出
-        // 是这一步。超时按「没问到」处置：这一轮不滚，下一轮再问。
-        match tokio::time::timeout(
-            Duration::from_secs(CI_ASK_BUDGET_SECS),
-            self.ask_upstreams(ask),
-        )
-        .await
-        {
-            Ok(hold) => hold,
-            Err(_) => {
-                warn!(
-                    rev = %ask.rev,
-                    budget_secs = CI_ASK_BUDGET_SECS,
-                    "the pre-apply CI question did not answer within its budget; holding this \
-                     rollout, the next round asks again"
-                );
-                Some((
-                    CiHoldKind::Unasked,
-                    format!(
-                        "upstream CI did not answer within {CI_ASK_BUDGET_SECS}s for {}; \
-                         nothing is applied this round",
-                        ask.rev
-                    ),
-                ))
+        let waiting_since = std::time::Instant::now();
+        loop {
+            // 整段提问有自己的上界：每次 HTTP 读自带 30 秒连接 + 60 秒读，而上游可以
+            // 有多个、报失败的检查还要逐条问工作流身份，不封顶就会被一次慢网关把
+            // Job 的期限吃光——那时失败会以"被判进程没跑完"的形状出现，谁也看不出
+            // 是这一步。超时按「没问到」处置：这一轮不滚，下一轮再问。
+            let hold = match tokio::time::timeout(
+                Duration::from_secs(CI_ASK_BUDGET_SECS),
+                self.ask_upstreams(ask),
+            )
+            .await
+            {
+                Ok(hold) => hold,
+                Err(_) => {
+                    warn!(
+                        rev = %ask.rev,
+                        budget_secs = CI_ASK_BUDGET_SECS,
+                        "the pre-apply CI question did not answer within its budget; holding \
+                         this rollout, the next round asks again"
+                    );
+                    return Some((
+                        CiHoldKind::Unasked,
+                        format!(
+                            "upstream CI did not answer within {CI_ASK_BUDGET_SECS}s for {}; \
+                             nothing is applied this round",
+                            ask.rev
+                        ),
+                    ));
+                }
+            };
+            match hold {
+                Some((kind, _)) if still_worth_asking(kind, waiting_since.elapsed()) => {
+                    // 这一句要印出来：一次等待与一次扣住在派发侧同形（都是这一轮
+                    // 没滚），只有这一行说得清「为什么多等了这几分钟」。
+                    info!(
+                        rev = %ask.rev,
+                        waited_secs = waiting_since.elapsed().as_secs(),
+                        reask_in_secs = CI_PENDING_REASK_SECS,
+                        wait_budget_secs = CI_PENDING_WAIT_SECS,
+                        "upstream CI is still running on this revision; asking again before \
+                         holding the round, because this answer finishes on its own"
+                    );
+                    tokio::time::sleep(Duration::from_secs(CI_PENDING_REASK_SECS)).await;
+                }
+                other => return other,
             }
         }
     }

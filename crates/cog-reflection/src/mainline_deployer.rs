@@ -7067,6 +7067,10 @@ impl MainlineDeployer {
                     // 之前，自带墙钟上界。上界不进这里，慢网关就会把它挤进滚动
                     // 预算，失败于是以「判定进程没跑完」的形状出现。
                     + crate::mainline_rollout::CI_ASK_BUDGET_SECS
+                    // 「还在跑」时那一侧会等判词出来再问一次，等多久由它自己的上界
+                    // 定；这段也要进 Job 的期限，否则等待会把滚动预算挤掉，失败就
+                    // 以「判定进程没跑完」的形状出现。
+                    + crate::mainline_rollout::CI_PENDING_WAIT_SECS
                     + 15,
                 "ttlSecondsAfterFinished": 86400,
                 "template": {
@@ -9861,6 +9865,7 @@ mod tests {
     // 滚动侧已搬去 `mainline_rollout`：本模块的用例仍直接调它们，所以只在测试面
     // 把它们带进来。产出面两个模块互不调用这一点不为此放宽——这里带进来的每一项，
     // 在产出面都只有那一侧在用。
+    use crate::mainline_rollout::still_worth_asking;
     use crate::mainline_rollout::{
         admission_hold_dimension, admission_rejection, admission_shortfall,
         bundle_declared_containers, changed_configmaps, changed_workloads,
@@ -9875,9 +9880,9 @@ mod tests {
         terminating_pods, unresolved_configmaps, unschedulable_pods, write_termination_message,
         CiHoldKind, ClusterConfigSources, ProbeCycle, RefSnapshots, ReplicaSetFailure,
         RewrittenRef, RolloutExecutor, RolloutPlan, SupportCause, SupportWorkload, UpstreamCiAsk,
-        UpstreamCiTarget, ADMISSION_DENIED_MARKER, IMAGE_PULL_WAITING_REASONS, K3S_KUBECONFIG,
-        NEW_REVISION_NEVER_RAN_MARKER, PLACEMENT_BLOCKED_MARKER, SERVICE_ACCOUNT_TOKEN,
-        SUPPORT_CAUSE_POD_LIMIT,
+        UpstreamCiTarget, ADMISSION_DENIED_MARKER, CI_PENDING_WAIT_SECS,
+        IMAGE_PULL_WAITING_REASONS, K3S_KUBECONFIG, NEW_REVISION_NEVER_RAN_MARKER,
+        PLACEMENT_BLOCKED_MARKER, SERVICE_ACCOUNT_TOKEN, SUPPORT_CAUSE_POD_LIMIT,
     };
 
     /// 盘上那一格与状态行上的那一格是同一个词，旧写法仍读得动。
@@ -14648,6 +14653,40 @@ exec {real} "$@"
                 .await,
             None
         );
+    }
+
+    /// 「还在跑」是会自己走完的那一种，所以它在扣住之前值得再等一等；另外两种不会
+    /// 自己走完，等多久都是同一个答案。
+    ///
+    /// 这条是 2026-10-27 那三个多小时的判据：Job 在推上去十一分钟时问，上游答
+    /// `still running`，这一轮立刻扣住，这一版被判成环境失败，主线去追下一版，下一
+    /// 版又是同样的十一分钟——每一版都死在「还在跑」上，镜像三个多小时纹丝不动。
+    /// 判据写在这里，是因为它决定的是「等」还是「扣」，而这两种在派发侧长得一模一样
+    /// （都是这一轮没滚），只有这一层能分开。
+    #[test]
+    fn a_pending_answer_is_waited_on_only_inside_its_budget() {
+        use std::time::Duration;
+        // 刚问到的「还在跑」：等。
+        assert!(still_worth_asking(
+            CiHoldKind::Pending,
+            Duration::from_secs(0)
+        ));
+        // 差一秒到界：还在等；到界：不再等，这一答到此为止。
+        assert!(still_worth_asking(
+            CiHoldKind::Pending,
+            Duration::from_secs(CI_PENDING_WAIT_SECS - 1)
+        ));
+        assert!(!still_worth_asking(
+            CiHoldKind::Pending,
+            Duration::from_secs(CI_PENDING_WAIT_SECS)
+        ));
+        // 判红等人改代码，没问到等路通：再问一遍问到的只会是同一句话。
+        for kind in [CiHoldKind::Red, CiHoldKind::Unasked] {
+            assert!(
+                !still_worth_asking(kind, Duration::from_secs(0)),
+                "{kind:?} 不该被等"
+            );
+        }
     }
 
     /// 「一次都没问到」不是「问了、没问题」。这一条就是 2026-10-27 那次带红上线的
