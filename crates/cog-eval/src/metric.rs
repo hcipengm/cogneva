@@ -80,7 +80,6 @@ pub enum EvalMetric {
     // ------------------------------------------------------------------
     ExactMatch,
     SemanticSimilarity { threshold: f32 },
-    ToolCallAccuracy,
     TaskSuccessRate { threshold: f64 },
     StrictSuccessRate { threshold: f64 },
     PartialSuccessRate { threshold: f64 },
@@ -105,6 +104,7 @@ pub enum EvalMetric {
     // ------------------------------------------------------------------
     // D3 — 工具使用质量 (Tool Use)
     // ------------------------------------------------------------------
+    ToolCallAccuracy,
     ToolSelection { threshold: f64 },
     ToolCalling { threshold: f64 },
 
@@ -533,7 +533,6 @@ impl EvalMetric {
         match self {
             EvalMetric::ExactMatch
             | EvalMetric::SemanticSimilarity { .. }
-            | EvalMetric::ToolCallAccuracy
             | EvalMetric::TaskSuccessRate { .. }
             | EvalMetric::StrictSuccessRate { .. }
             | EvalMetric::PartialSuccessRate { .. }
@@ -552,7 +551,9 @@ impl EvalMetric {
             | EvalMetric::PlanAdherence { .. }
             | EvalMetric::LogicalConsistency { .. } => "D2",
 
-            EvalMetric::ToolSelection { .. } | EvalMetric::ToolCalling { .. } => "D3",
+            EvalMetric::ToolCallAccuracy
+            | EvalMetric::ToolSelection { .. }
+            | EvalMetric::ToolCalling { .. } => "D3",
 
             EvalMetric::StepRatio { .. }
             | EvalMetric::RepetitivenessRate { .. }

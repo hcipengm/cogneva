@@ -532,7 +532,14 @@ fn build_dimension_summaries(
     out
 }
 
-/// 把 metric 名映射到 9 个评估维度（D1-D9）。
+/// 把 metric 名映射到 13 个评估维度（D1-D13）。
+///
+/// 这里按名字的前缀判，因为名字还可能来自枚举之外（trace 里的自定义指标）。
+/// 对 `EvalMetric` 声明的名字，答案必须与 `EvalMetric::dimension()` 相同——
+/// 那一份按变体判、有编译器兜着，是正本；本函数对未知名字的近似不该盖过它。
+/// 两者是否仍然一致由
+/// `tests/a_metric_lands_in_the_dimension_its_variant_declares.rs` 逐个变体对。
+///
 /// 命名约定（前缀匹配，与完备版评估指标体系对齐）：
 /// - D1 任务完成与结果质量: exact_match, semantic_similarity, task_success_rate, step_accuracy, click_accuracy, type_accuracy, scroll_accuracy, navigate_accuracy
 /// - D2 规划与推理质量: plan_quality, plan_adherence, logical_consistency
@@ -543,6 +550,10 @@ fn build_dimension_summaries(
 /// - D7 鲁棒性与可靠性: output_consistency, hallucination_rate, context_retention_score
 /// - D8 多智能体协作: task_assignment_accuracy, collaboration_success_rate, stance_convergence
 /// - D9 成本与资源效率: cost_*, token_efficiency, token_per_step, inference_latency
+/// - D10-D13: 部署运维、代码质量、消融进化、安全纵深，逐条见下面的条件
+///
+/// 兜底是 D9。掉进兜底不是错误本身，但**一个声明过的名字掉进兜底**意味着上面
+/// 某条前缀没有再认得它——那正是本函数与枚举侧比对要拦的形状。
 pub fn dimension_for_metric(name: &str) -> String {
     let n = name.to_ascii_lowercase();
 
@@ -592,7 +603,14 @@ pub fn dimension_for_metric(name: &str) -> String {
     }
 
     // D3 — 工具使用质量
-    if n.starts_with("tool_") || n == "tool_call_accuracy" {
+    //
+    // 只认「用法」这一类前缀，不认整个 `tool_`：`tool_failure_recovery`
+    // （鲁棒性，D7）和将来的 `tool_timeout` 都以它开头，按前者判会把他们
+    // 悄悄归到工具使用维度，而 D7 那一侧照旧是空的。
+    if n.starts_with("tool_call")
+        || n.starts_with("tool_selection")
+        || n.starts_with("tool_calling")
+    {
         return "D3".into();
     }
 
@@ -606,6 +624,7 @@ pub fn dimension_for_metric(name: &str) -> String {
         || n.starts_with("recovery_rate")
         || n == "explore_metric"
         || n.starts_with("backtracking")
+        || n.starts_with("avg_backtracking")
         || n.starts_with("latency_")
         || n.ends_with("_duration_ms")
         || n == "latency_ms"
@@ -620,6 +639,7 @@ pub fn dimension_for_metric(name: &str) -> String {
         || n.starts_with("storage_efficiency")
         || n.starts_with("backtrace_time")
         || n.starts_with("event_stream_")
+        || n.starts_with("event_completeness")
         || n.starts_with("streaming_smoothness")
         || n.starts_with("ui_rendering_latency")
         || n.starts_with("debuggability_index")
