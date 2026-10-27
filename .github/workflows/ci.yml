@@ -680,6 +680,15 @@ jobs:
       - name: Check the audit panel opens, filters, and stays read-only
         run: bash deploy/scripts/check-web-audit-panel.sh
 
+      # 项目面的成品是「看见这棵树拆错了、当场改对」，不是那四个读路由。读面写得
+      # 越细，缺写入口这件事越刺眼：一张带着每一层深度与每个归因缺口的树，读者会
+      # 默认它是有人在维护的。这条门判的是整条链：取数函数、可达组件、写完重读、
+      # 看板带卡片（只有计数的列画不出能挪的卡）、以及四条写路由都在网关上。
+      # 每一段都能单独断而不让别的东西红——函数声明了没人调、组件引了没渲染、
+      # 写成功了不重读，三种都不会有任何东西失败。
+      - name: Check the project face can be changed from the screen
+        run: bash deploy/scripts/check-web-project-write-paths.sh
+
       # 拓扑面的成品是「从集群点到节点、再点到 Pod 和容器」，不是 `/api/v1/cluster/topology`
       # 那份 JSON。这一面坏起来不出声：数据全、组件在，只是把话说错了——节点读失败时
       # 把整屏 Pod 说成「没有落在任何节点上」、把跑完的 Job 画成红点、不显示命名空间

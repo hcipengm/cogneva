@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   getProjectBoard,
   getProjectEvm,
@@ -13,6 +13,15 @@ import {
   type ReadingSource,
   type TaskRow,
 } from '@/api/client';
+import {
+  AuditTimeline,
+  ExportCsvButton,
+  MoveCardControl,
+  NewProjectForm,
+  NewTaskForm,
+  PlanButton,
+  ReparentControl,
+} from '@/views/projectWrite';
 import { useResource } from '@/hooks/useResource';
 import { useFrameDrivenRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey, ticksFor } from '@/store/frameTick';
@@ -25,7 +34,17 @@ import {
 } from '@/store/liveProjects';
 import { useLiveProjectStore } from '@/store/liveProjectStore';
 import { STRIP_CAP, visibleProjects } from '@/views/projectStrip';
-import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, ViewFrame } from '@/ui/primitives';
+import {
+  Button,
+  Empty,
+  Loading,
+  Moment,
+  ReadError,
+  Reading,
+  Readings,
+  Status,
+  ViewFrame,
+} from '@/ui/primitives';
 
 /**
  * 项目面：一个项目 ＝ 任务图里的一个 goal 根连同它的后代。
@@ -42,23 +61,125 @@ import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, ViewFrame
  * 没有第二个任务清单。这里的每个数都是任务图的一个投影，现读现算——另存一份
  * 派生值，两份迟早不一致，而读面上分不出哪一份是错的。
  */
-type Mode = 'wbs' | 'board' | 'gantt' | 'evm';
+type Mode = 'wbs' | 'board' | 'gantt' | 'evm' | 'audit';
 
 // 四个按钮各带原本的英文名。中文名是意译，靠它认不出这是行业里那张图；英文名是
 // 通用叫法，靠它认不出这页在说什么。两个一起写，读者才不用先在脑子里做一次翻译。
+//
+// 第五个不是第四张图的同族：前四个回答「这活是什么形状」，它回答「谁把它改成
+// 这样的」。放在同一排，是因为客户问的下一句永远是这个。
 const MODES: { id: Mode; label: string }[] = [
   { id: 'wbs', label: '范围 WBS' },
   { id: 'board', label: '看板 Kanban' },
   { id: 'gantt', label: '甘特图 Gantt' },
   { id: 'evm', label: '挣值 EVM' },
+  { id: 'audit', label: '改动 Audit' },
 ];
+
+/**
+ * 项目清单：分页读，读到的页在本地累起来。
+ *
+ * 项目数没有上界（一个 goal 一行），所以这一读是分页的；而界面要的是「一共有多少」
+ * 与「我手上这些是全部还是前一段」。两件事分别对应响应里的 `total_projects` 与
+ * `next_cursor`，缺一个就会出现「读了 1000 个，屏上写 1000 个项目」——那是个假数，
+ * 而且是读者无从核对的那一种。
+ *
+ * 「再多读」按游标追加，不是把 `limit` 调大：服务端每页有上限，调大只会拿到同一页，
+ * 而按钮看起来按了、列表一动不动。
+ */
+function useProjectPages() {
+  const [rows, setRows] = useState<ProjectRow[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [totalProjects, setTotalProjects] = useState(0);
+  const [totalTasks, setTotalTasks] = useState(0);
+  const [loaded, setLoaded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [revision, setRevision] = useState(0);
+
+  // 首屏：重读总是从第一页开始，否则刷新之后会把新的一页接到旧的那一串后面。
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    getProjects({ limit: 1000 })
+      .then((page) => {
+        if (cancelled) return;
+        setRows(page.projects);
+        setNextCursor(page.next_cursor);
+        setTotalProjects(page.total_projects);
+        setTotalTasks(page.total_tasks);
+        setLoaded(true);
+        setError(null);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setError((e as { message?: string }).message ?? '读项目清单失败');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [revision]);
+
+  // 定时那一拍是兜底：连接断了、帧丢了，读数仍然追得上，只是慢一拍。
+  //
+  // 只在「已经读全了」的时候定时重读。读到一半还有下一页时，重读是从第一页开始的，
+  // 定时器一响就把用户刚点出来的那几页丢掉——看起来像列表自己往回缩。
+  // 那种情况下让读者自己按刷新，比一个会吃掉他操作的定时器好。
+  const hasMoreRef = useRef(false);
+  hasMoreRef.current = nextCursor !== null;
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (!hasMoreRef.current) setRevision((r) => r + 1);
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const refresh = useCallback(() => setRevision((r) => r + 1), []);
+
+  const loadMore = useCallback(() => {
+    if (!nextCursor || loading) return;
+    setLoading(true);
+    getProjects({ limit: 1000, cursor: nextCursor })
+      .then((page) => {
+        // 按 id 去重：分页是位置游标，两次读之间顺序可能变，同一个项目会出现在
+        // 相邻两页上。重复一行会让 React 的 key 撞车，也会让计数多出来。
+        setRows((prev) => {
+          const seen = new Set(prev.map((r) => r.id));
+          return [...prev, ...page.projects.filter((r) => !seen.has(r.id))];
+        });
+        setNextCursor(page.next_cursor);
+        setTotalProjects(page.total_projects);
+        setTotalTasks(page.total_tasks);
+        setError(null);
+      })
+      .catch((e: unknown) => {
+        setError((e as { message?: string }).message ?? '读下一页失败');
+      })
+      .finally(() => setLoading(false));
+  }, [nextCursor, loading]);
+
+  return {
+    rows,
+    nextCursor,
+    totalProjects,
+    totalTasks,
+    loaded,
+    loading,
+    error,
+    refresh,
+    loadMore,
+  };
+}
 
 export function ProjectsView() {
   const [mode, setMode] = useState<Mode>('wbs');
   const [picked, setPicked] = useState<string | null>(null);
 
-  const projects = useResource('项目清单', getProjects, 30_000);
-  const rows = projects.data?.projects ?? [];
+  const projects = useProjectPages();
+  const rows = projects.rows;
+  const totalProjects = projects.totalProjects;
 
   // 没选过就落在任务最多的那个真项目上。落在未分组桶上会一进门就是一屏
   // 「这桶没有范围结构」，读者会以为整个项目面是坏的。
@@ -70,37 +191,56 @@ export function ProjectsView() {
     <ViewFrame
       title="项目"
       meta={
-        projects.data
-          ? `共 ${projects.data.projects.length} 个项目 · ${projects.data.total_tasks} 条任务`
+        projects.loaded
+          ? `共 ${totalProjects} 个项目 · ${projects.totalTasks} 条任务` +
+            (projects.nextCursor ? `（这一屏列了 ${rows.length} 个）` : '')
           : '按 30 秒重读'
       }
       actions={
-        <div className="flex gap-1">
-          {MODES.map((m) => (
-            <button
-              key={m.id}
-              onClick={() => setMode(m.id)}
-              className="border px-2 py-1 text-[11px]"
-              style={{
-                borderColor: mode === m.id ? 'var(--brass-dim)' : 'var(--line)',
-                color: mode === m.id ? 'var(--brass)' : 'var(--paper-dim)',
-              }}
-            >
-              {m.label}
-            </button>
-          ))}
+        <div className="flex items-center gap-2">
+          <div className="flex gap-1">
+            {MODES.map((m) => (
+              <button
+                key={m.id}
+                onClick={() => setMode(m.id)}
+                className="border px-2 py-1 text-[11px]"
+                style={{
+                  borderColor: mode === m.id ? 'var(--brass-dim)' : 'var(--line)',
+                  color: mode === m.id ? 'var(--brass)' : 'var(--paper-dim)',
+                }}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+          {current && mode !== 'audit' && (
+            <ExportCsvButton
+              projectId={current.id}
+              view={mode as 'wbs' | 'board' | 'gantt' | 'evm'}
+            />
+          )}
+          <NewProjectForm onCreated={projects.refresh} />
         </div>
       }
     >
       {projects.error ? (
         <ReadError what="项目清单" error={projects.error} onRetry={projects.refresh} />
-      ) : !projects.data && projects.loading ? (
+      ) : !projects.loaded && projects.loading ? (
         <Loading what="项目清单" />
       ) : rows.length === 0 ? (
         <Empty>任务图里一条任务都没有，所以还没有项目。</Empty>
       ) : (
         <>
           <ProjectStrip rows={rows} selected={selected} onSelect={setPicked} />
+          {projects.nextCursor && (
+            <div className="flex items-center gap-2 border-b border-[var(--line)] px-4 py-1.5 text-[11px] text-[var(--muted)]">
+              还有 {totalProjects - rows.length} 个项目没读出来——上面这些是按任务数
+              排的前 {rows.length} 个，不是全部。
+              <Button onClick={projects.loadMore} disabled={projects.loading}>
+                再多读 1000 个
+              </Button>
+            </div>
+          )}
           {current && (
             <ProjectPanel mode={mode} project={current} />
           )}
@@ -204,6 +344,8 @@ function ProjectPanel({ mode, project }: { mode: Mode; project: ProjectRow }) {
       return <BoardPanel project={project} />;
     case 'gantt':
       return <GanttPanel project={project} />;
+    case 'audit':
+      return <AuditTimeline projectId={project.id} />;
     default:
       return <EarnedValuePanel project={project} />;
   }
@@ -309,6 +451,9 @@ function ScopePanel({ project }: { project: ProjectRow }) {
     () => getTaskGraph(ungrouped ? {} : { goal_id: project.id }),
     15_000
   );
+  // 正在给哪一片新建子任务：`null` 是没开，`''` 是新建顶层，其余是父任务 id。
+  // 一次只开一个——同时开三段输入，读者会分不清哪一段是要提交的那一段。
+  const [composing, setComposing] = useState<string | null>(null);
 
   const nodes = useMemo(() => {
     // 未分组桶只能整图拉回来再挑：这一桶的定义就是「没有 goal_id」，没有可过滤的键。
@@ -363,31 +508,75 @@ function ScopePanel({ project }: { project: ProjectRow }) {
 
       <FreshNodeChanges rows={fresh} what="范围树" />
 
+      {/* 拆活的地方就在树上：看得见「这一片下面还空着」的那一刻，正是要往里加
+          一条的时候。未分组桶不是容器，不放建活的入口——往一个「没有 goal 的行」
+          里建东西没有意义。 */}
+      {!ungrouped && (
+        <div className="border-b border-[var(--line)] px-4 py-2">
+          {composing !== '' ? (
+            <Button onClick={() => setComposing('')}>＋ 新建顶层活</Button>
+          ) : (
+            <NewTaskForm
+              project={project}
+              onCreated={graph.refresh}
+              onCancel={() => setComposing(null)}
+            />
+          )}
+        </div>
+      )}
+
       <div className="overflow-auto">
         {tree.flattened.map(({ node, depth, orphan }) => (
-          <div
-            key={node.id}
-            className="flex items-baseline gap-2 border-b border-[var(--line)] px-4 py-1"
-          >
-            <span style={{ width: depth * 14 }} />
-            <span className="mono text-[10px] text-[var(--muted)]">{depth === 0 ? '▪' : '└'}</span>
-            <span className="mono w-40 shrink-0 truncate text-[11px] text-[var(--paper-dim)]" title={node.id}>
-              {node.id.slice(0, 20)}
-            </span>
-            <span className="min-w-0 flex-1 truncate text-[11px]" title={titleOf(node)}>
-              {titleOf(node)}
-            </span>
-            {orphan && (
-              <span className="mono text-[10px] text-[var(--danger)]">父不在图里</span>
-            )}
-            {node.is_executable === false && (
-              <span className="mono text-[10px] text-[var(--muted)]">占位</span>
-            )}
-            <span className="w-24 shrink-0 text-right">
-              <Status value={live.get(node.id)?.status ?? node.status} />
-            </span>
-            {live.has(node.id) && (
-              <span className="mono w-12 shrink-0 text-[10px] text-[var(--brass)]">刚变</span>
+          <div key={node.id} className="border-b border-[var(--line)]">
+            <div className="flex items-baseline gap-2 px-4 py-1">
+              <span style={{ width: depth * 14 }} />
+              <span className="mono text-[10px] text-[var(--muted)]">{depth === 0 ? '▪' : '└'}</span>
+              <span className="mono w-40 shrink-0 truncate text-[11px] text-[var(--paper-dim)]" title={node.id}>
+                {node.id.slice(0, 20)}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-[11px]" title={titleOf(node)}>
+                {titleOf(node)}
+              </span>
+              {orphan && (
+                <span className="mono text-[10px] text-[var(--danger)]">父不在图里</span>
+              )}
+              {node.is_executable === false && (
+                <span className="mono text-[10px] text-[var(--muted)]">占位</span>
+              )}
+              <span className="w-24 shrink-0 text-right">
+                <Status value={live.get(node.id)?.status ?? node.status} />
+              </span>
+              {live.has(node.id) && (
+                <span className="mono w-12 shrink-0 text-[10px] text-[var(--brass)]">刚变</span>
+              )}
+              <span className="flex w-52 shrink-0 items-baseline justify-end gap-2">
+                {!ungrouped && (
+                  <button
+                    type="button"
+                    onClick={() => setComposing(node.id)}
+                    className="mono text-[10px] text-[var(--muted)] hover:text-[var(--paper)]"
+                  >
+                    ＋子活
+                  </button>
+                )}
+                <ReparentControl
+                  taskId={node.id}
+                  parentTaskId={node.parent_task_id ?? null}
+                  onDone={graph.refresh}
+                />
+                <PlanButton taskId={node.id} onDone={graph.refresh} />
+              </span>
+            </div>
+            {composing === node.id && (
+              <div className="px-4 pb-2">
+                <NewTaskForm
+                  project={project}
+                  parentTaskId={node.id}
+                  parentTitle={titleOf(node)}
+                  onCreated={graph.refresh}
+                  onCancel={() => setComposing(null)}
+                />
+              </div>
             )}
           </div>
         ))}
@@ -498,6 +687,41 @@ function BoardPanel({ project }: { project: ProjectRow }) {
             {c.over_limit === true && (
               <div className="mt-1 text-[10px] text-[var(--danger)]">已超限</div>
             )}
+            {/* 卡片是这一屏的主体：一列只写个数字，读者知道有多少活，不知道是
+                哪些活，也就无从挪动它们。最近动过的排前面，与服务端同一顺序。 */}
+            <div className="mt-1 flex max-h-96 flex-col gap-1 overflow-auto">
+              {c.cards.map((card) => (
+                <div key={card.id} className="border border-[var(--line)] px-1 py-0.5">
+                  <div className="flex items-baseline gap-1">
+                    <span className="min-w-0 flex-1 truncate text-[10px]" title={card.title}>
+                      {card.title}
+                    </span>
+                    {card.blocked && (
+                      <span className="mono text-[9px] text-[var(--danger)]" title="依赖还没完成">
+                        卡住
+                      </span>
+                    )}
+                    {!card.has_acceptance && (
+                      <span
+                        className="mono text-[9px] text-[var(--warn)]"
+                        title="没有验收标准：这条活之后写不了计划基线"
+                      >
+                        无验收
+                      </span>
+                    )}
+                  </div>
+                  <MoveCardControl card={card} onDone={board.refresh} />
+                </div>
+              ))}
+              {c.cards_hidden > 0 && (
+                <div className="text-[10px] text-[var(--muted)]">
+                  还有 {c.cards_hidden} 张没列出
+                </div>
+              )}
+              {c.cards.length === 0 && c.count > 0 && (
+                <div className="text-[10px] text-[var(--muted)]">这一列的卡片没有带回来</div>
+              )}
+            </div>
           </div>
         ))}
       </div>
@@ -597,7 +821,13 @@ function GanttPanel({ project }: { project: ProjectRow }) {
 
       <div className="px-4 py-2">
         {drawn.map((r) => (
-          <GanttBar key={r.id} row={r} span={span} live={live.get(r.id)?.status} />
+          <GanttBar
+            key={r.id}
+            row={r}
+            span={span}
+            live={live.get(r.id)?.status}
+            onPlanChanged={gantt.refresh}
+          />
         ))}
       </div>
 
@@ -658,10 +888,12 @@ function GanttBar({
   row,
   span,
   live,
+  onPlanChanged,
 }: {
   row: GanttRow;
   span: { start: number; end: number } | null;
   live?: string;
+  onPlanChanged: () => void;
 }) {
   const actual = barSpan(row.created_at, row.updated_at, span);
   const planned = barSpan(row.planned_start, row.planned_end, span);
@@ -706,6 +938,11 @@ function GanttBar({
       )}
       <span className="mono w-12 shrink-0 text-right text-[10px] text-[var(--muted)]">
         {row.unplanned ? '未排期' : row.planned_end ? '有计划' : '有起期'}
+      </span>
+      {/* 计划基线原先只能由编排侧算出来，客户改不动自己的计划。入口就放在
+          写着「未排期」的那一格旁边：看见缺的地方，正是要补的那一刻。 */}
+      <span className="w-16 shrink-0 text-right">
+        <PlanButton taskId={row.id} onDone={onPlanChanged} />
       </span>
     </div>
   );

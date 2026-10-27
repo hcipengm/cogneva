@@ -1116,13 +1116,44 @@ export interface ProjectRow {
 
 export interface ProjectsReading {
   projects: ProjectRow[];
+  /** 本页各行 `tasks` 之和。与 `projects` 逐行对得上，是这一页自己的账。 */
+  counted_tasks: number;
+  /** 读者可见的任务总数，**不随分页变化**。 */
   total_tasks: number;
+  /** 读者可见的项目总数，不随分页变化。 */
+  total_projects: number;
+  /** 下一页的位置；`null` 表示这一页就是最后一页。 */
+  next_cursor: string | null;
   source: ReadingSource;
 }
 
-/** 项目清单：任务图按 goal 根折出来的行。 */
-export async function getProjects(): Promise<ProjectsReading> {
-  return api.get<ProjectsReading>('/api/v1/projects');
+/**
+ * 项目清单：任务图按 goal 根折出来的行。
+ *
+ * 这是一个分页的读：一个 goal 一行，项目数没有上界。界面必须同时读 `total_projects`
+ * 与本页长度——只印本页长度，读者会把「读了 200 个」读成「一共有 200 个」。
+ */
+export async function getProjects(params: {
+  limit?: number;
+  cursor?: string | null;
+} = {}): Promise<ProjectsReading> {
+  const query = new URLSearchParams();
+  if (params.limit) query.set('limit', String(params.limit));
+  if (params.cursor) query.set('cursor', params.cursor);
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return api.get<ProjectsReading>(`/api/v1/projects${suffix}`);
+}
+
+export interface BoardCard {
+  id: string;
+  title: string;
+  /** 它现在在哪一列。 */
+  status: string;
+  parent_task_id: string | null;
+  /** 依赖还没全部完成。依赖不在可见的这一批里时也算卡住。 */
+  blocked: boolean;
+  /** 有没有验收标准。没有的工作包写不了计划基线。 */
+  has_acceptance: boolean;
 }
 
 export interface BoardColumn {
@@ -1134,6 +1165,10 @@ export interface BoardColumn {
    */
   wip_limit: number | null;
   over_limit: boolean | null;
+  /** 这一列带回来的卡片，最近动过的在前。长度与本列总数未必相等。 */
+  cards: BoardCard[];
+  /** 因为超过每列上限而没带回来的张数。0 表示这一列的张数就是全部。 */
+  cards_hidden: number;
 }
 
 /**
@@ -1270,6 +1305,176 @@ export interface ProjectEvmReading {
 
 export async function getProjectEvm(id: string): Promise<ProjectEvmReading> {
   return api.get<ProjectEvmReading>(`/api/v1/projects/${encodeURIComponent(id)}/evm`);
+}
+
+// ─── 项目面的写 ───────────────────────────────────────────────────────────
+//
+// 读面能把这些数画出来，写的入口也得在同一个界面上：一个只能看的项目管理面，
+// 客户看到的第一件事就是「这棵树拆错了，而我没有地方改」。四个写端点各管一件事，
+// 六个列名、四种拒绝码都在下面写清楚——调用方按 `code` 分支，不按句子。
+
+/** 新建一个项目：它就是一整棵 goal 树的根，不触发分解。 */
+export interface CreateProjectInput {
+  name: string;
+  /** 不填时只在调用方恰好属于一个 workspace 时才继承。 */
+  workspace_id?: string;
+}
+
+export interface CreateProjectResult {
+  id: string;
+  name: string;
+  workspace_id: string;
+  source: ReadingSource;
+}
+
+export async function createProject(input: CreateProjectInput): Promise<CreateProjectResult> {
+  return api.post<CreateProjectResult>('/api/v1/projects', input);
+}
+
+export interface CreateProjectTaskInput {
+  title: string;
+  /** 不给就是项目的顶层。 */
+  parent_task_id?: string | null;
+  acceptance?: string[];
+  blocked_by?: string[];
+  workspace_id?: string;
+}
+
+export interface CreateProjectTaskResult {
+  id: string;
+  project_id: string;
+  parent_task_id: string | null;
+  status: string;
+  source: ReadingSource;
+}
+
+export async function createProjectTask(
+  projectId: string,
+  input: CreateProjectTaskInput
+): Promise<CreateProjectTaskResult> {
+  return api.post<CreateProjectTaskResult>(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/tasks`,
+    input
+  );
+}
+
+/**
+ * 改一条任务的范围结构字段。
+ *
+ * `parent_task_id` 是三态，不是两态：字段缺席＝这次不改，`null`＝提到顶层，
+ * 字符串＝挂到那个父节点下。压成两态就没有「提到顶层」这个动作。
+ */
+export interface UpdateTaskInput {
+  parent_task_id?: string | null;
+  title?: string;
+  acceptance?: string[];
+}
+
+export interface UpdateTaskResult {
+  id: string;
+  parent_task_id: string | null;
+  title: string;
+  acceptance: string[];
+}
+
+export async function updateTask(id: string, input: UpdateTaskInput): Promise<UpdateTaskResult> {
+  return api.request<UpdateTaskResult>(`/api/v1/tasks/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+  });
+}
+
+/** 写一条计划基线。没有验收标准的工作包会被拒——它的「做完」没有判据。 */
+export interface SaveTaskPlanInput {
+  planned_start?: string | null;
+  planned_end?: string | null;
+  /** 这一版打算花多少 token。缺席时沿用上一版；连上一版都没有就被拒。 */
+  budget_tokens?: number | null;
+}
+
+export async function saveTaskPlan(
+  taskId: string,
+  input: SaveTaskPlanInput
+): Promise<Record<string, unknown>> {
+  return api.put<Record<string, unknown>>(
+    `/api/v1/tasks/${encodeURIComponent(taskId)}/plan`,
+    input
+  );
+}
+
+/** 看板上的六个列名，与任务状态的六个拼写是同一套词。 */
+export const BOARD_COLUMNS = [
+  'pending',
+  'scheduled',
+  'running',
+  'completed',
+  'failed',
+  'cancelled',
+] as const;
+
+export type BoardColumnId = (typeof BOARD_COLUMNS)[number];
+
+/** 挪一张卡。目标列不相邻、或那一列满员时被拒，拒因带稳定码。 */
+export async function moveTask(
+  taskId: string,
+  status: BoardColumnId
+): Promise<Record<string, unknown>> {
+  return api.post<Record<string, unknown>>(`/api/v1/tasks/${encodeURIComponent(taskId)}/move`, {
+    status,
+  });
+}
+
+/** 项目时间线上的一行：谁、什么时候、把哪个资源改成了什么。 */
+export interface ProjectAuditRow {
+  id: number;
+  actor: string;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  before: unknown;
+  after: unknown;
+  created_at: string;
+}
+
+export interface ProjectAuditReading {
+  project_id: string;
+  count: number;
+  rows: ProjectAuditRow[];
+  source: ReadingSource;
+}
+
+export async function getProjectAudit(
+  projectId: string,
+  limit = 50
+): Promise<ProjectAuditReading> {
+  return api.get<ProjectAuditReading>(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/audit?limit=${limit}`
+  );
+}
+
+/**
+ * 四个视图的 CSV 导出。
+ *
+ * 先取字节再交给浏览器另存：`<a href>` 那条路不带 Authorization，导出的会是
+ * 一次 401，而 401 被浏览器当成下载存成一个文件，读者打开才发现里面是一段错误。
+ * 文件名由这里给，与服务端 `Content-Disposition` 里那个同一套拼法。
+ */
+export async function downloadProjectCsv(
+  projectId: string,
+  view: 'wbs' | 'board' | 'gantt' | 'evm'
+): Promise<void> {
+  const blob = await api.getBytes(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/export.csv?view=${view}`
+  );
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `${projectId}-${view}.csv`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  // 立刻 revoke 会让一部分浏览器的另存对话框拿到失效的 URL，表现是 0 字节。
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 /**
