@@ -33,7 +33,7 @@ spec:
     spec:
       # 演练失败不重试成串：答案已经落进 backup_drills 了，下一晚自然再来。
       backoffLimit: 0
-      activeDeadlineSeconds: 3600
+      activeDeadlineSeconds: 7800
       ttlSecondsAfterFinished: 86400
       template:
         metadata:
@@ -80,6 +80,12 @@ spec:
               # 窗口的其余成员，而旧包与读端不同步的问题只在旧包上出现。
               args: ["backup-drill", "--also-unproven"]
               env:
+                # 单趟预算：一份包从解包到对数完。到点由这一跑自己收尾并落一行
+                # `failed`，而不是等 Job 的界把进程杀掉——被杀掉的那一趟账上
+                # 一行都不留，「被杀」于是读作「没跑过」。与
+                # `jobTemplate.spec.activeDeadlineSeconds` 是一对。
+                - name: COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS
+                  value: "3600"
                 - name: PG_PASSWORD
                   valueFrom:
                     secretKeyRef:

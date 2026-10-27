@@ -25,10 +25,10 @@ spec:
       # 演练失败不重试成串：答案已经落进 backup_drills 了，下一晚自然再来。
       backoffLimit: 0
       # 一次演练开两份包：最新那份，加窗口里最久没被证明的那份（`--also-unproven`
-      # 第二趟只挑一份）。单包恢复实测 497 s（2026-10-19，库在长），两份 ≈ 17 min，
-      # 一小时留三倍余量。设界的本意是兜住一次挂死的恢复：不设的话，Forbid 下它会
-      # 挡住后面每一次。
-      activeDeadlineSeconds: 3600
+      # 第二趟只挑一份）。这个界必须大于**两份的单趟预算之和**，见 chart values 里
+      # `drillDeadlineSeconds` 的注释：2026-10-27 实测单包已长到 2271 s，3600 s 的界
+      # 让第二趟被杀，账上一行都不留。单趟预算 3600 × 2 ＋ 600 余量 = 7800。
+      activeDeadlineSeconds: 7800
       ttlSecondsAfterFinished: 86400
       template:
         metadata:
@@ -74,6 +74,13 @@ spec:
               # 保留窗口的其余成员。
               args: ["backup-drill", "--also-unproven"]
               env:
+                # 单趟预算：一份包从解包到对数完。到点由这一跑自己收尾并落一行
+                # `failed`，而不是等 Job 的界把进程杀掉——被杀掉的那一趟账上
+                # 一行都不留，「被杀」于是读作「没跑过」。与 jobTemplate 的
+                # activeDeadlineSeconds 是一对，关系由
+                # deploy/scripts/tests/backup-drill-budget-covers-both-passes.test.sh 盯。
+                - name: COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS
+                  value: "3600"
                 - name: PG_PASSWORD
                   valueFrom:
                     secretKeyRef:

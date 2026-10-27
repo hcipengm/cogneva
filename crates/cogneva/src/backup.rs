@@ -32,6 +32,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -56,6 +57,17 @@ const TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 /// 与「没配」同形。
 const BACKUP_DIR_ENV: &str = "COGNEVA_BACKUP_DIR";
 const BACKUP_OFFSITE_DIR_ENV: &str = "COGNEVA_BACKUP_OFFSITE_DIR";
+/// 演练**单趟**的预算（秒）。一趟 = 一份包从解包到对数完。
+///
+/// 界必须由进程自己拿着，而不是只由 Job 的 `activeDeadlineSeconds` 兜着：Job 的界
+/// 到点是把 Pod 杀掉，进程没有机会写那一行，`backup_drills` 里于是只剩上一晚的记录
+/// ——「这一趟被杀了」与「这一趟没跑过」在账上同形。2026-10-27 实测正是这样：第一趟
+/// 2271 s 之后，第二趟在 3600 s 的 Job 界上被杀，一行都没留下。
+const DRILL_PASS_BUDGET_ENV: &str = "COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS";
+/// 没配 env 时单趟的预算。数与 values.yaml 的 `backup.drillPassBudgetSeconds`
+/// 同源，由 `deploy/scripts/tests/backup-drill-budget-covers-both-passes.test.sh`
+/// 盯着两边与 Job 界的关系。
+const DRILL_PASS_BUDGET_DEFAULT_SECS: u64 = 3600;
 const QDRANT_HTTP_URL_ENV: &str = "COGNEVA_QDRANT_HTTP_URL";
 const IMAGE_REF_ENV: &str = "COGNEVA_IMAGE_REF";
 
@@ -3441,6 +3453,9 @@ pub struct DrillConfig {
     /// 只开最新那份证明不了保留窗口的其余成员：旧包与读端不同步的问题只在它们
     /// 身上出现，而它们要到真正需要恢复的那天才第一次被打开。
     pub also_unproven: bool,
+    /// 单趟预算：一份包从解包到对数完最多花多久。到点由这一跑自己收尾并落一行
+    /// `failed`，而不是等 Job 的界把进程杀掉——被杀掉的那一趟写不出任何东西。
+    pub pass_budget: Duration,
 }
 
 impl DrillConfig {
@@ -3465,8 +3480,27 @@ impl DrillConfig {
             migrations_dir: cog_storage::migrate::migrations_dir(&app_dir),
             package,
             also_unproven,
+            pass_budget: pass_budget_from_env(),
         })
     }
+}
+
+/// 单趟预算：`COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS`，没配或读不成数就用默认值。
+///
+/// 读不成数不报错：一个拼错的 env 让演练整场起不来，比让它按默认值跑一趟更坏——
+/// 起不来的那一晚，账上没有任何一行说为什么。
+fn pass_budget_from_env() -> Duration {
+    pass_budget_from(std::env::var(DRILL_PASS_BUDGET_ENV).ok().as_deref())
+}
+
+/// 解析那一格。`None`、空串、零、非数一律落到默认值：这四种写法在这里是同一件事
+/// （没给出可用的界），而它们各自的来历留给读 env 的人，不该让演练从此起不来。
+fn pass_budget_from(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(DRILL_PASS_BUDGET_DEFAULT_SECS);
+    Duration::from_secs(secs)
 }
 
 /// `backup-drill` 自己在子命令之后认的那个操作数。
@@ -4034,11 +4068,41 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         drill.credential_violations_state_dir = credential_violations_in(dir);
     }
 
-    if let Err(e) = drill_once(cfg, live, packages, &mut drill).await {
-        drill.error = Some(scrub_error(&e.to_string(), &cfg.database_url));
+    // 一趟有界：到点就把这一趟收尾并落一行，而不是等 Job 的界把进程杀掉。后者
+    // 账上什么都不留——「被杀」于是读作「没跑过」，而 Job 面只看见一个 DeadlineExceeded，
+    // 说不出是哪一份包、走到哪一步、预算多少。
+    // 先落进一个变量再 match：`match timeout(...).await` 的临时量活到整个 match
+    // 结束，`drill` 的独占借用于是跟着活到每一个分支里。
+    let outcome =
+        tokio::time::timeout(cfg.pass_budget, drill_once(cfg, live, packages, &mut drill)).await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => drill.error = Some(scrub_error(&e.to_string(), &cfg.database_url)),
+        Err(_) => {
+            mark_pass_timed_out(&mut drill, cfg.pass_budget);
+            // 临时库这一趟是收不了尾了。下一次开工本来也会先删它，但一份 1 GB 以上
+            // 的残库不该留到明晚：删不掉也只是警告，那本来就是下一趟的第一次开工。
+            if let Err(e) = drop_drill_database(live).await {
+                tracing::warn!(error = %e, "演练超时的临时库没删掉，下一次开工时会再删一次");
+            }
+        }
     }
     drill.finished_at = Utc::now();
     drill
+}
+
+/// 一趟超时之后写到那一行上的结论。
+///
+/// 单独成函数是为了让它可测：这一行的判词决定读数面能不能把「被杀」与「没跑过」
+/// 分开，而它不该靠一次真的挂住的演练来验证。`outcome` 由 `error.is_some()` 推出，
+/// 所以这里只写错误文本、并把已经量到的读数留在原处。
+fn mark_pass_timed_out(drill: &mut BackupDrillRecord, budget: Duration) {
+    drill.error = Some(format!(
+        "这一趟 {} 秒（{DRILL_PASS_BUDGET_ENV}）没有跑完就收尾了。本行其余读数是走到那一步\
+         之前量到的：表数与行数为空 ＝ 还没走到对数那一段，不是零张表。界由这一跑自己拿着，\
+         因为 Job 的 activeDeadlineSeconds 到点是把进程杀掉——那样账上一行都不会有。",
+        budget.as_secs(),
+    ));
 }
 
 /// 同一时刻只许一场演练。临时库名是固定的（崩溃残留因此有确定的答案），代价是两场
@@ -4521,10 +4585,20 @@ async fn restore_and_compare(
     // 表结构必须由**这个镜像**的迁移建出来：恢复只做 TRUNCATE + COPY，目标是
     // 一个跑完迁移的空库。改用模板库复制会更快，但那要求源库上没有别的连接——
     // 而源库此刻正被整个平台用着。
+    // 四段的耗时各记一行：这个数随时间涨（库在长），而「一趟多少秒」是一个总数，
+    // 读的人分不出是迁移、建结构、灌数据还是逐表对数长出来的。界（单趟预算）到点
+    // 时日志里最后一行就是走到哪一段，比在账上写一句「超时了」多一个坐标。
+    let phase = std::time::Instant::now();
     cog_storage::migrate::Migrator::new(&cfg.migrations_dir)
         .run(scratch_url)
         .await?;
-    tracing::info!(database = DRILL_DATABASE, "drill: migrations applied");
+    tracing::info!(
+        database = DRILL_DATABASE,
+        phase = "migrations",
+        elapsed_ms = phase.elapsed().as_millis() as u64,
+        "drill: migrations applied"
+    );
+    let migrations_done = phase.elapsed();
 
     let scratch = PgPool::connect(scratch_url).await?;
     // 迁移只建得出迁移文件里有的表；各 store 首次启动时自己建的那批表也要先建，
@@ -4533,12 +4607,23 @@ async fn restore_and_compare(
     crate::schema_bundle::apply(&scratch)
         .await
         .map_err(|e| format!("drill: schema bundle failed: {e}"))?;
-    tracing::info!("drill: store schema applied");
+    tracing::info!(
+        phase = "store-schema",
+        elapsed_ms = (phase.elapsed() - migrations_done).as_millis() as u64,
+        "drill: store schema applied"
+    );
     let pg_dir = pkg_dir.join("pg");
     if !pg_dir.exists() {
         return Err("包里没有 pg 段，这次演练无表可恢复".into());
     }
+    let restore_started = std::time::Instant::now();
     let restored = restore_postgres(&scratch, &pg_dir).await?;
+    tracing::info!(
+        phase = "copy",
+        elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        tables = restored.tables.len(),
+        "drill: postgres segment copied"
+    );
     // 装回来的列清单要跟着这一行一起留在账上：一份按旧导出写的包被装回时，
     // 生成列的值不是包里的、是目标此刻算出来的。表数与行数看不见这件事。
     drill.generated_columns_recomputed = restored.recomputed.clone();
@@ -4562,6 +4647,7 @@ async fn restore_and_compare(
 
     // 逐表把「装回来几行」与清单声明比。比对的是**这个镜像的结构装得下的那批表**：
     // 被迁移删掉的表由上面的读数点名，它们的行数无从比，也不该被算成"没装上"。
+    let compare_started = std::time::Instant::now();
     let without_a_home: std::collections::HashSet<&str> = restored
         .tables_without_a_home
         .iter()
@@ -4642,6 +4728,11 @@ async fn restore_and_compare(
         )
         .into());
     }
+    tracing::info!(
+        phase = "compare",
+        elapsed_ms = compare_started.elapsed().as_millis() as u64,
+        "drill: rows compared"
+    );
     Ok(())
 }
 
@@ -4754,6 +4845,65 @@ pub async fn run_restore_from_env() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// 一趟超时必须留下**一行能读的结论**，而不是让 Job 的界把进程杀掉。
+    ///
+    /// 这是本文件对 2026-10-27 那次现场的门：`backup-drill` 第一趟跑了 2271 s，
+    /// 第二趟在 `activeDeadlineSeconds: 3600` 上被杀，`backup_drills` 里没有那一行，
+    /// 于是「窗口里最久没被证明的那份」永远证明不了，而账上读作「这一趟没跑过」。
+    #[test]
+    fn a_pass_that_runs_past_its_budget_still_leaves_a_row_that_says_so() {
+        let mut drill = BackupDrillRecord {
+            drill_id: "drill-test".into(),
+            started_at: Utc.with_ymd_and_hms(2026, 10, 27, 3, 47, 2).unwrap(),
+            finished_at: Utc.with_ymd_and_hms(2026, 10, 27, 3, 47, 2).unwrap(),
+            package: Some("cogneva-backup-20261027T031714Z.tar.zst".into()),
+            package_written_at: None,
+            package_bytes: None,
+            segment_skew_seconds: None,
+            segment_skew_bound_seconds: None,
+            packages_on_volume: 7,
+            oldest_package_at: None,
+            offsite_newest_at: None,
+            offsite_matches_newest: None,
+            offsite_missing_packages: None,
+            offsite_observed_at: None,
+            offsite_remote_newest_at: None,
+            offsite_key_created_at: None,
+            credential_violations_backup_pvc: None,
+            credential_violations_offsite: None,
+            credential_violations_state_dir: None,
+            tables_restored: None,
+            tables_expected: None,
+            rows_restored: None,
+            rows_expected: None,
+            source_runs_matched: None,
+            generated_columns_recomputed: Vec::new(),
+            tables_without_a_home: Vec::new(),
+            artifacts_expected: 0,
+            artifacts_restored: 0,
+            artifact_readings: Vec::new(),
+            artifact_errors: Vec::new(),
+            error: None,
+        };
+        mark_pass_timed_out(&mut drill, Duration::from_secs(3600));
+        let error = drill.error.as_ref().expect("超时的那一趟必须有错误文本");
+        // 判词要能回答「界是多少」，否则读的人只能去翻部署清单。
+        assert!(error.contains("3600"), "错误文本没写界：{error}");
+        // 而且它必须让这一行读作 failed：面读数按 outcome 取行，不按过程猜。
+        assert!(!drill.ok(), "超时的行被判成了成功");
+    }
+
+    /// 界读不成数时按默认值跑，而不是让整场演练起不来——起不来的那一晚，
+    /// 账上连一行说「为什么」的都没有。
+    #[test]
+    fn a_budget_that_cannot_be_read_falls_back_instead_of_stopping_the_drill() {
+        let default = Duration::from_secs(DRILL_PASS_BUDGET_DEFAULT_SECS);
+        for raw in [None, Some(""), Some("  "), Some("0"), Some("ten")] {
+            assert_eq!(pass_budget_from(raw), default, "raw={raw:?}");
+        }
+        assert_eq!(pass_budget_from(Some(" 900 ")), Duration::from_secs(900));
+    }
 
     #[test]
     fn package_names_sort_by_time() {

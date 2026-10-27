@@ -181,11 +181,20 @@ backup:
   drillSchedule: "47 3 * * *"
   # 一次演练最多能跑多久。一次运行开的是**两份**包，不是一份：最新那份，加上窗口
   # 里最久没被证明的那份（`--also-unproven`，第二趟只挑一份，成不成都不再接着开）。
-  # 单包恢复实测 155 s（2026-10-18）、497 s（2026-10-19，库在长），两份最坏
-  # ≈ 17 min，一小时留了三倍余量。设界的目的仍是兜住一次挂死的恢复：不设的话，
-  # Forbid 下挂住的那次会把后面每一次都挡掉，而 `backoffLimit: 0` 意味着那一晚
-  # 没有第二次。
-  drillDeadlineSeconds: 3600
+  #
+  # **这个界必须大于两份的单趟预算，两者是一对**：`drillPassBudgetSeconds` 是进程
+  # 自己拿着的单趟界（到点它自己收尾并落一行 `failed`），这里是 Job 的界（到点把
+  # Pod 杀掉，账上一行都不留）。2026-10-27 的现场就是这一对失配：单包实测已从
+  # 497 s（10-19）长到 2271 s（10-27，库 3.6 GB），第一趟吃掉 38 min，第二趟在
+  # 3600 s 的界上被杀，`backup_drills` 里没有那一行——于是「窗口里最久没被证明的
+  # 那份」永远证明不了，读数读作「这一趟没跑过」。
+  #
+  # 关系由 `deploy/scripts/tests/backup-drill-budget-covers-both-passes.test.sh`
+  # 盯着：界 ≥ 2 × 单趟预算 ＋ 余量。只改一个数会红，所以别只改一个。
+  drillDeadlineSeconds: 7800
+  # 单趟预算（秒）：一份包从解包到对数完。与 `drillDeadlineSeconds` 是一对，
+  # 见上一条注释。数由 `COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS` 交给进程。
+  drillPassBudgetSeconds: 3600
   # 备份卷之外的第二个落点：每跑完一次，新包再往这里复制一份，演练自己遍历它、
   # 把「卷外最新那份是不是刚装回去的这个包」记进 `backup_drills`。
   #

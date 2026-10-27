@@ -413,14 +413,32 @@ rows:
   - key: backup.drillDeadlineSeconds
     source: override
     why: >-
-      One hour against a run that opens two packages, not one: the newest, then
-      the one the window has gone longest without proving. One restore measured
-      155 s on 2026-10-18 and 497 s on 2026-10-19, so the pair comes to about 17
-      minutes and the hour keeps roughly three times the observed cost. The flow
-      records each drill's own elapsed time, so a derived deadline could be a
-      multiple of the observed one; nothing computes it. The deadline exists to
-      bound a restore that hangs, not to track a normal one -- with Forbid, a
-      stuck drill would otherwise block every drill after it.
+      This bound and backup.drillPassBudgetSeconds are a pair, not two numbers:
+      the run opens two packages, and only the process can say how long a pass
+      took, because this bound kills the pod and a killed pass writes no row.
+      On 2026-10-27 the pair was out of step -- one restore, measured at 497 s on
+      2026-10-19, had grown to 2271 s as the database grew to 3.6 GB, so the
+      first pass used 38 of the 60 minutes and the second was killed at the
+      bound with nothing recorded. The obligation is
+      activeDeadlineSeconds >= 2 * drillPassBudgetSeconds + slack, and
+      deploy/scripts/tests/backup-drill-budget-covers-both-passes.test.sh fails
+      when it does not hold, so raising one alone goes red. The bound still
+      exists to stop a hung restore: with Forbid, a stuck drill would otherwise
+      block every drill after it.
+
+  - key: backup.drillPassBudgetSeconds
+    source: override
+    why: >-
+      How long one pass -- unpack through row-by-row comparison -- may take
+      before the drill stops it and records a failed row naming the budget.
+      Held by the process rather than by the job's activeDeadlineSeconds so that
+      a pass that runs long moves state instead of vanishing: a killed process
+      leaves the previous night's row as the latest, which reads exactly like a
+      night that never ran. Measured single-pass cost: 497 s on 2026-10-19,
+      2271 s on 2026-10-27 with a 3.6 GB database. It rises with the data, so a
+      number that fits today is a number that will be wrong later; the pair with
+      backup.drillDeadlineSeconds is what keeps that from silently reaping the
+      second pass.
 
   - key: backup.startingDeadlineSeconds
     source: override
