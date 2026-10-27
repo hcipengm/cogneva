@@ -253,8 +253,7 @@ impl cog_core::SystemPlugin for SupervisorPlugin {
                 health_check_interval_secs: self_evolution.health_check_interval_secs,
                 health_check_max_retries: self_evolution.health_check_max_retries,
                 systemd_service_name: cog_core::paths::APP_BINARY_NAME.into(),
-                sidecar_socket_path: std::path::Path::new(cog_core::paths::RUN_DIR)
-                    .join("sidecar.sock"),
+                sidecar_socket_path: crate::binary_switcher::sidecar_socket_path(),
             };
             let switcher: Arc<dyn cog_core::BinarySwitcher> =
                 crate::binary_switcher::build_switcher(

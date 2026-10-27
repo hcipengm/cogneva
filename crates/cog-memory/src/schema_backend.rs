@@ -13,6 +13,13 @@ use std::sync::RwLock;
 use cog_core::{merge_schema_observation, SFError, SFResult, SchemaBackend};
 use cog_core::{SchemaEntry, SchemaSearchResult};
 
+/// The schema file's name under the persistence directory.
+///
+/// `load` and `persist` both spell it: when one of them is renamed, the reader
+/// answers "no schema yet" and the next write silently replaces the entries the
+/// old file held.
+const SCHEMA_FILE: &str = "schema.json";
+
 /// In-memory schema backend with optional JSON persistence.
 /// Stores all entries in a `HashMap`.  When a persistence directory is set
 /// via [`MemorySchemaBackend::set_persist_dir`], the backend reads
@@ -62,7 +69,7 @@ impl MemorySchemaBackend {
             None => return Ok(()),
         };
 
-        let path = dir.join("schema.json");
+        let path = dir.join(SCHEMA_FILE);
         if !path.exists() {
             return Ok(());
         }
@@ -101,7 +108,7 @@ impl MemorySchemaBackend {
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|e| SFError::Agent(format!("create persist dir failed: {}", e)))?;
-        tokio::fs::write(dir.join("schema.json"), data)
+        tokio::fs::write(dir.join(SCHEMA_FILE), data)
             .await
             .map_err(|e| SFError::Agent(format!("write schema.json failed: {}", e)))?;
         Ok(())

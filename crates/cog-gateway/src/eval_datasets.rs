@@ -14,9 +14,15 @@ use std::path::{Path, PathBuf};
 
 use cog_core::EvalDatasetInfo;
 
+/// 评测产物在数据根下的那一级：数据集与报告都挂在它下面。
+///
+/// 两个读面各写一遍 `join("eval")` 时，改一处只会让其中一条从此读另一个目录，
+/// 而那边返回的空列表与「这个部署没有评测产物」同形。
+pub const EVAL_SUBDIR: &str = "eval";
+
 /// 数据集目录：`{data_dir}/eval/datasets`。
 pub fn datasets_dir(data_dir: &str) -> PathBuf {
-    Path::new(data_dir).join("eval").join("datasets")
+    Path::new(data_dir).join(EVAL_SUBDIR).join("datasets")
 }
 
 /// 一次列举的结果：目录在不在，以及目录里认得出的数据集。

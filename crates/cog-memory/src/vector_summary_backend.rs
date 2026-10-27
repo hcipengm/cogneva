@@ -65,6 +65,12 @@ pub struct EmbeddingRepairReport {
     pub failed: usize,
 }
 
+/// The summary file's name under the persistence directory.
+///
+/// Read on start and written on every mutation: two spellings would make the
+/// read side report "nothing summarised yet" while the other kept writing.
+const SUMMARY_FILE: &str = "summary.json";
+
 /// [`SummaryBackend`] that delegates similarity search to a
 /// [`cog_core::VectorBackend`] and structured-data persistence to a
 /// [`SummaryEntryStore`].
@@ -267,7 +273,7 @@ impl VectorSummaryBackend {
                 Some(d) => d,
                 None => return Ok(()),
             };
-            let path = dir.join("summary.json");
+            let path = dir.join(SUMMARY_FILE);
             if !path.exists() {
                 return Ok(());
             }
@@ -352,7 +358,7 @@ impl VectorSummaryBackend {
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|e| SFError::Agent(format!("create persist dir failed: {}", e)))?;
-        tokio::fs::write(dir.join("summary.json"), data)
+        tokio::fs::write(dir.join(SUMMARY_FILE), data)
             .await
             .map_err(|e| SFError::Agent(format!("write summary.json failed: {}", e)))?;
         Ok(())

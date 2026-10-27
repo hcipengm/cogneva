@@ -35,11 +35,22 @@ impl Default for BinarySwitcherConfig {
             health_check_interval_secs: 5,
             health_check_max_retries: 6,
             systemd_service_name: cog_core::paths::APP_BINARY_NAME.to_string(),
-            sidecar_socket_path: std::path::Path::new(cog_core::paths::RUN_DIR)
-                .join("sidecar.sock"),
+            sidecar_socket_path: sidecar_socket_path(),
         }
     }
 }
+
+/// The socket the sidecar listens on, inside the run directory.
+///
+/// The config default and the plugin's own build both spell it; one of them
+/// left behind by a rename means the switcher health-checks a socket nobody
+/// listens on, which reads as a sidecar that never came up.
+pub fn sidecar_socket_path() -> std::path::PathBuf {
+    std::path::Path::new(cog_core::paths::RUN_DIR).join(SIDECAR_SOCKET_NAME)
+}
+
+/// The sidecar socket's file name.
+const SIDECAR_SOCKET_NAME: &str = "sidecar.sock";
 
 /// Factory for the three supported switch modes.
 pub fn build_switcher(

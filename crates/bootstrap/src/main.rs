@@ -304,7 +304,7 @@ async fn probe_hardware() -> Hardware {
         mem_total_mb,
         arch: std::env::consts::ARCH.to_string(),
         nodes: probe_nodes().await,
-        kvm: Path::new("/dev/kvm").exists(),
+        kvm: Path::new(KVM_DEVICE).exists(),
     }
 }
 
@@ -670,7 +670,9 @@ async fn governance_subcommand() -> Result<()> {
             }
         }
     };
-    let dir = Path::new(&repo_root).join("deploy/rendered").join(&profile);
+    let dir = Path::new(&repo_root)
+        .join(RENDERED_DEPLOY_SUBDIR)
+        .join(&profile);
     let mut files: Vec<(String, String)> = Vec::new();
     let entries = std::fs::read_dir(&dir)
         .with_context(|| format!("渲染产物目录不存在或不可读：{}", dir.display()))?;
@@ -1209,6 +1211,17 @@ const GIT_MIRROR_GITEE: &str = "https://gitee.com/hcipengm/cogneva.git";
 /// 与「这个部署还没 seed」同形。
 const GIT_REMOTE_SUBDIR: &str = "git-remote";
 
+/// chart 预渲染产物的目录：元启动按 profile 从这里读 standalone YAML。
+const RENDERED_DEPLOY_SUBDIR: &str = "deploy/rendered";
+
+/// chart 的基础 values。命名空间与几条网络适配都从这里读，各拼一遍时改另一处
+/// 只会让其中一条对着一个不存在的文件，读失败在那条路径上是一句「读不到配置」。
+const CHART_VALUES_FILE: &str = "deploy/helm/cogneva/values.yaml";
+
+/// KVM 设备节点。硬件探测报它、Firecracker 安装再判一次「能不能装」：两处各写
+/// 一遍时，改名只会让其中一处永远报「KVM 不可用」。
+const KVM_DEVICE: &str = "/dev/kvm";
+
 fn git_remote_dir() -> PathBuf {
     Path::new(&cog_core::paths::data_dir()).join(GIT_REMOTE_SUBDIR)
 }
@@ -1247,7 +1260,7 @@ async fn ensure_git_remote() -> Result<()> {
 }
 
 async fn ensure_firecracker() -> Result<()> {
-    if !Path::new("/dev/kvm").exists() {
+    if !Path::new(KVM_DEVICE).exists() {
         warn!("KVM 不可用（/dev/kvm 缺失），跳过 Firecracker 安装；沙盒保持 K8s Pod 形态");
         return Ok(());
     }
@@ -1298,7 +1311,9 @@ async fn ensure_firecracker() -> Result<()> {
 /// 应用拓扑产物目录：chart 预渲染的 profile standalone YAML（元启动读目录
 /// kubectl apply，引导链零 helm 依赖）。
 fn rendered_manifest_dir(profile: Profile) -> PathBuf {
-    repo_root().join("deploy/rendered").join(profile.dir_name())
+    repo_root()
+        .join(RENDERED_DEPLOY_SUBDIR)
+        .join(profile.dir_name())
 }
 
 fn repo_root() -> PathBuf {
@@ -1872,7 +1887,7 @@ fn declared_namespace() -> Result<String> {
 }
 
 fn declared_namespace_in(root: &Path) -> Result<String> {
-    let values = root.join("deploy/helm/cogneva/values.yaml");
+    let values = root.join(CHART_VALUES_FILE);
     let text = std::fs::read_to_string(&values)
         .with_context(|| format!("读取 {} 失败", values.display()))?;
     let parsed: serde_json::Value = serde_yaml::from_str(&text)
@@ -3342,7 +3357,7 @@ fn cn_image_map(values: &serde_yaml::Value, mirror: &str) -> Vec<(String, String
 
 /// chart 基础 values.yaml 解析结果（两条网络适配路径共用一份读入与解析）。
 fn chart_values() -> Result<serde_yaml::Value> {
-    let path = repo_root().join("deploy/helm/cogneva/values.yaml");
+    let path = repo_root().join(CHART_VALUES_FILE);
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("读取 {} 失败", path.display()))?;
     Ok(serde_yaml::from_str(&text)?)

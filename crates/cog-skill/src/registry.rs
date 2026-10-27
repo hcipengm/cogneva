@@ -93,6 +93,10 @@ struct CachedSkill {
     mtime: std::time::SystemTime,
 }
 
+/// 技能包里放脚本的那一级目录。列举与取路径各拼一遍：改名只会让其中一条
+/// 从此对着一个空目录，而空目录在两条读面上都是「这个技能没有脚本」。
+const SCRIPTS_SUBDIR: &str = "scripts";
+
 impl SkillRegistryImpl {
     pub fn new(config: SkillConfig) -> Arc<Self> {
         Arc::new(Self {
@@ -362,7 +366,7 @@ impl ExternalSkillRegistry for SkillRegistryImpl {
             .get(skill_id)
             .ok_or_else(|| cog_core::SFError::Agent(format!("skill not found: {}", skill_id)))?;
 
-        let scripts_dir = cached.path.join("scripts");
+        let scripts_dir = cached.path.join(SCRIPTS_SUBDIR);
         if !scripts_dir.exists() {
             return Ok(Vec::new());
         }
@@ -402,7 +406,7 @@ impl ExternalSkillRegistry for SkillRegistryImpl {
             .get(skill_id)
             .ok_or_else(|| cog_core::SFError::Agent(format!("skill not found: {}", skill_id)))?;
 
-        let script_path = cached.path.join("scripts").join(script_name);
+        let script_path = cached.path.join(SCRIPTS_SUBDIR).join(script_name);
         if !script_path.exists() {
             return Err(cog_core::SFError::Agent(format!(
                 "script not found: {} in skill {}",

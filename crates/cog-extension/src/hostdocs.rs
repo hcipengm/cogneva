@@ -69,6 +69,13 @@ pub const MAX_PLAN_BYTES_ENV: &str = "HOST_DOCS_MAX_PLAN_BYTES";
 /// Default for the body of one host document. Sized for the largest document
 /// this platform writes by hand (a plan or an audit), not to the channel's bound:
 /// a document is stored whole, so the number answers to what a reader can open.
+/// 待批准变更的日志文件名。写入、读取与回滚标记三处都拼它：读写两侧各写一遍时，
+/// 改名只会让读的那一侧答「这里从来没有日志」。
+const JOURNAL_FILE: &str = "journal.json";
+
+/// 回滚完成后把日志改名成它。存在即「这一次已经回滚过」，读取侧据此拒收。
+const JOURNAL_ROLLED_BACK_FILE: &str = "journal.rolled-back.json";
+
 const DEFAULT_MAX_DOC_BYTES: usize = 8 * 1024 * 1024;
 /// A full-size body. **Deliberately not tied to the audited channel's bound**: that one
 /// is another process's quantity, bounding the text one request sends out, while this
@@ -2008,8 +2015,8 @@ impl HostDocs {
             })?;
             restored += 1;
         }
-        let done = dir.join("journal.rolled-back.json");
-        tokio::fs::rename(dir.join("journal.json"), &done)
+        let done = dir.join(JOURNAL_ROLLED_BACK_FILE);
+        tokio::fs::rename(dir.join(JOURNAL_FILE), &done)
             .await
             .map_err(|e| {
                 SFError::Config(format!("cannot mark journal {journal_id} rolled back: {e}"))
@@ -2264,24 +2271,22 @@ fn prune_due(record: &StagedPlan, now_unix: u64, ttl_secs: u64) -> bool {
 async fn write_journal(dir: &Path, records: &[JournalRecord]) -> SFResult<()> {
     let body = serde_json::to_vec_pretty(records)
         .map_err(|e| SFError::Config(format!("cannot serialize a journal: {e}")))?;
-    tokio::fs::write(dir.join("journal.json"), body)
+    tokio::fs::write(dir.join(JOURNAL_FILE), body)
         .await
         .map_err(|e| SFError::Config(format!("cannot write journal in {}: {e}", dir.display())))
 }
 
 async fn read_journal(dir: &Path) -> SFResult<Vec<JournalRecord>> {
-    let rolled_back = dir.join("journal.rolled-back.json");
+    let rolled_back = dir.join(JOURNAL_ROLLED_BACK_FILE);
     if rolled_back.exists() {
         return Err(SFError::Validation(format!(
             "journal {} was already rolled back",
             dir.display()
         )));
     }
-    let body = tokio::fs::read(dir.join("journal.json"))
-        .await
-        .map_err(|e| {
-            SFError::Validation(format!("cannot read journal in {}: {e}", dir.display()))
-        })?;
+    let body = tokio::fs::read(dir.join(JOURNAL_FILE)).await.map_err(|e| {
+        SFError::Validation(format!("cannot read journal in {}: {e}", dir.display()))
+    })?;
     serde_json::from_slice(&body)
         .map_err(|e| SFError::Config(format!("journal in {} is unreadable: {e}", dir.display())))
 }

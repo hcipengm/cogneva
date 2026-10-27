@@ -30,7 +30,9 @@ pub const DEFAULT_LIST_LIMIT: usize = 200;
 
 /// 报告目录：`{data_dir}/eval/reports`。
 pub fn reports_dir(data_dir: &str) -> PathBuf {
-    Path::new(data_dir).join("eval").join("reports")
+    Path::new(data_dir)
+        .join(crate::eval_datasets::EVAL_SUBDIR)
+        .join("reports")
 }
 
 /// 一次评测的报告 id：数据集名 + 跑完的时刻。

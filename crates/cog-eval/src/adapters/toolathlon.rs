@@ -24,6 +24,10 @@ use crate::scaffold::{AgentOutput, CaseEnv, ToolSet};
 /// 每题一个目录的那棵树的根在数据根里的相对路径。
 pub const TOOLATHLON_TASKS_DIR: &str = "toolathlon-gym/tasks/finalpool";
 
+/// 一道题的目标文件。列举时按它在不在判「这是不是一道题」，读的时候再打开它：
+/// 两处各拼一遍，改名后列举会说这道题不存在，而它明明在。
+const TASK_CONFIG_FILE: &str = "task_config.json";
+
 /// 数据适配器：一棵每题一个目录的树 → 一批 case。
 ///
 /// 目录里没有 `task_config.json` 的**不是一道题**（树里还带着 `.utils` 这样的辅助目录），
@@ -45,7 +49,7 @@ impl ToolathlonCaseSource {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        let cfg_path = dir.join("task_config.json");
+        let cfg_path = dir.join(TASK_CONFIG_FILE);
         let cfg: TaskConfig = serde_json::from_str(
             &std::fs::read_to_string(&cfg_path)
                 .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", cfg_path.display()))?,
@@ -112,7 +116,7 @@ impl CaseSource for ToolathlonCaseSource {
         let mut dirs: Vec<PathBuf> = entries
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.is_dir() && p.join("task_config.json").is_file())
+            .filter(|p| p.is_dir() && p.join(TASK_CONFIG_FILE).is_file())
             .collect();
         dirs.sort();
 
