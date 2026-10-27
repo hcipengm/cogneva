@@ -364,6 +364,33 @@ pub async fn staff_faces(
                     );
                     continue;
                 }
+                // The store applies a move as a swap on "the paper says
+                // signed": it only touches a row whose status is already
+                // `scheduled`. A person's flow gets there with its own `sign`
+                // command, so the row is signed on disk before anybody asks
+                // for the move. This pass signs in memory, and a signature
+                // that was never written leaves the row a draft -- the apply
+                // then matches no row and reports that the face changed under
+                // it, every pass, forever. Measured on a live cluster: a draft
+                // came due and was re-approached every two minutes for six
+                // minutes without ever moving.
+                if row.state() != HandoverState::Signed {
+                    let mut signed = handover_task(&row.id, spec.clone(), now);
+                    signed.status = HandoverState::Signed.status();
+                    signed.updated_at = now;
+                    if !store
+                        .save_governance_node_if_status(&signed, &[HandoverState::Draft.status()])
+                        .await?
+                    {
+                        warn!(
+                            handover = %handover_id,
+                            face = %row.spec.face_id,
+                            "the draft changed between the read and the signature; the next \
+                             pass reads the graph again"
+                        );
+                        continue;
+                    }
+                }
                 // Matched by id rather than by position: `faces` drops rows
                 // whose payload does not parse, so an index into it is not an
                 // index into `face_rows`.
@@ -921,7 +948,18 @@ mod tests {
             face: &cog_core::Task,
             expected_revision: i64,
         ) -> cog_core::SFResult<Option<usize>> {
+            // The store swaps on "the paper says signed": its update only
+            // matches a handover row whose status is already `scheduled`.
+            // This double used to accept any status, so a pass that signed in
+            // memory and never wrote the signature applied cleanly here and
+            // matched nothing in production -- the whole move was untested by
+            // a green suite. The precondition is part of the contract, so it
+            // is mirrored rather than skipped.
             let mut rows = self.rows.lock().unwrap();
+            match rows.iter().find(|row| row.id == handover.id) {
+                Some(row) if row.status == HandoverState::Signed.status() => {}
+                _ => return Ok(None),
+            }
             let Some(face_slot) = rows.iter().position(|row| row.id == face.id) else {
                 return Ok(None);
             };
