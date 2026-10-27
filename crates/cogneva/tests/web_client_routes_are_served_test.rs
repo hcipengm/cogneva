@@ -41,95 +41,12 @@
 //! `DELETE /api/v1/admin/backup/packages/{} ← web/src/api/client.ts（只答 get）`。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
-
-fn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk(&path, extensions, out);
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| extensions.contains(&e))
-        {
-            out.push(path);
-        }
-    }
-}
-
-/// One path reduced to the shape both sides can be compared by.
-///
-/// `$` and `{}` are handled in one pass because a `${...}` may carry a nested
-/// template literal of its own (`` `/api/v1/audit/events${suffix ? `?${suffix}`
-/// : ''}` ``), which a regex on the raw text cuts in the wrong place.
-fn normalize(raw: &str) -> String {
-    let mut out = String::new();
-    let bytes: Vec<char> = raw.chars().collect();
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            '?' => break,
-            '$' if bytes.get(index + 1) == Some(&'{') => {
-                let mut depth = 0usize;
-                let mut end = index + 1;
-                let mut closed = false;
-                while end < bytes.len() {
-                    match bytes[end] {
-                        '{' => depth += 1,
-                        '}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                closed = true;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    end += 1;
-                }
-                let whole_segment = out.is_empty() || out.ends_with('/');
-                if whole_segment {
-                    out.push('{');
-                    out.push('}');
-                }
-                // Not a whole segment: a query or string suffix, which is not
-                // part of the path. An unterminated one ends the literal.
-                if !closed {
-                    break;
-                }
-                index = end + 1;
-            }
-            '{' => {
-                while index < bytes.len() && bytes[index] != '}' {
-                    index += 1;
-                }
-                index += 1;
-                out.push('{');
-                out.push('}');
-            }
-            c => {
-                out.push(c);
-                index += 1;
-            }
-        }
-    }
-    while out.ends_with('/') {
-        out.pop();
-    }
-    out
-}
+mod common;
+use common::routes::{
+    core_path_constants, normalize, read, repo_root, served_paths, strip_comments, walk,
+};
 
 /// The paths the shipped clients ask for, keyed by shape, with the files that
 /// ask. Two clients ship in the image: the WebUI under `web/src`, and the
@@ -174,78 +91,6 @@ fn client_paths(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
         }
     }
     found
-}
-
-/// `pub const NAME: &str = "..."` values in the crate that declares routes.
-fn core_path_constants(root: &Path) -> BTreeMap<String, String> {
-    let mut files = Vec::new();
-    walk(&root.join("crates/cog-core/src"), &["rs"], &mut files);
-    let mut constants = BTreeMap::new();
-    for path in files {
-        let text = read(&path);
-        for line in text.lines() {
-            let Some(at) = line.find("pub const ") else {
-                continue;
-            };
-            let rest = &line[at + "pub const ".len()..];
-            let Some((name, tail)) = rest.split_once(':') else {
-                continue;
-            };
-            if !tail.trim_start().starts_with("&str = \"") {
-                continue;
-            }
-            let Some(start) = tail.find('"') else {
-                continue;
-            };
-            let Some(end) = tail[start + 1..].find('"') else {
-                continue;
-            };
-            constants.insert(
-                name.trim().to_string(),
-                tail[start + 1..start + 1 + end].to_string(),
-            );
-        }
-    }
-    constants
-}
-
-/// The paths the gateway registers.
-fn served_paths(root: &Path) -> BTreeSet<String> {
-    let constants = core_path_constants(root);
-    let mut files = Vec::new();
-    walk(&root.join("crates/cog-gateway/src"), &["rs"], &mut files);
-    files.sort();
-    let mut served = BTreeSet::new();
-    for path in files {
-        let text = read(&path);
-        // The path is on the same line as `.route(` about as often as it is on
-        // the next one, so the argument is read across the whitespace rather
-        // than line by line.
-        let mut rest = text.as_str();
-        while let Some(at) = rest.find(".route(") {
-            rest = &rest[at + ".route(".len()..];
-            let argument = rest.trim_start();
-            if let Some(literal) = argument.strip_prefix('"') {
-                if let Some(end) = literal.find('"') {
-                    served.insert(normalize(&literal[..end]));
-                }
-                continue;
-            }
-            // A route registered from a declaration resolves through that
-            // declaration. Only a bare or module-qualified name is read; a call
-            // of any other shape contributes no route, which shows up as a
-            // client path with nothing serving it rather than as a quiet pass.
-            let qualified: String = argument
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
-                .collect();
-            let name = qualified.rsplit("::").next().unwrap_or(qualified.as_str());
-            if let Some(value) = constants.get(name) {
-                served.insert(normalize(value));
-            }
-        }
-    }
-    served
 }
 
 #[test]
@@ -303,57 +148,6 @@ fn the_path_reader_handles_the_shapes_this_tree_writes() {
         normalize("/api/v1/alerts/{id}/ack"),
         "/api/v1/alerts/{}/ack"
     );
-}
-
-/// The text with `//` and `/* */` comments removed, leaving string and template
-/// literals untouched.
-///
-/// The path census can read comments: a path quoted in prose is still a path the
-/// gateway serves, so it costs nothing. The method census cannot — a path named
-/// in a comment has no verb in front of it, and the nearest verb in the file
-/// would be borrowed from whatever call happens to be nearby.
-fn strip_comments(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '"' || c == '\'' || c == '`' {
-            out.push(c);
-            i += 1;
-            while i < chars.len() {
-                out.push(chars[i]);
-                if chars[i] == '\\' {
-                    i += 1;
-                    if i < chars.len() {
-                        out.push(chars[i]);
-                    }
-                } else if chars[i] == c {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if c == '/' && chars.get(i + 1) == Some(&'/') {
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == '/' && chars.get(i + 1) == Some(&'*') {
-            i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            i += 2;
-            continue;
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
 }
 
 /// The last quoted all-caps word in a stretch of text — how a helper that takes

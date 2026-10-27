@@ -38,7 +38,11 @@ export default function App() {
     url: wsUrl,
     // 任务状态不走 `agent:<id>` 面，它按 `task:<id>` 分频道。只订 agent 面时
     // 界面上一件事都看不见任务在动，而总线上它一直在动。
-    channels: ['agent:*', 'task:*', 'hooks'],
+    //
+    // `resource:*` 是第三种：REST 侧一次写成功，网关就往 `resource:<前缀>` 上发一帧
+    // 「这个面下的读数过期了」。少了这一条订阅，设置、存储、变更流水这些面在界面上
+    // 只能靠各自的轮询往前走——它们订的那些 `resourceKey(...)` 键一次都不会被抬起。
+    channels: ['agent:*', 'task:*', 'hooks', 'resource:*'],
     onNotification: notifications.receive,
   });
 
