@@ -1,0 +1,11 @@
+# 工具链的唯一来源：CI 与本机都从这一份取通道，不各写一个版本号。
+#
+# 为什么不钉死一个版本：钉死之后，「这笔改动能不能过」实际取决于「CI 上那个编译器
+# 能不能过」，而本机装的是另一个——本地绿、推上去红，红的原因与提交内容无关。跟着
+# stable 走，两边是同一个通道，剩下的差异只有一条：本机有没有更新到最新的 stable。
+# 那条差异不靠自觉，由 deploy/scripts/check-toolchain-matches-ci.sh 在推之前问一次。
+#
+# 所以「升级工具链」不是一件事，是 stable 每次发布时本机执行一次 `rustup update stable`。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

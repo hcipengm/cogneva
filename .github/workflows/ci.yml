@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -66,7 +66,7 @@ jobs:
       # `cargo clippy --workspace --all-targets`, and its tests run both here. Whether the
       # action's default profile happens to carry either is not something a gate
       # that refuses changes may depend on.
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -541,7 +541,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -551,13 +551,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Pinned, and it is the version that has to be bumped on purpose. Floating
-      # stable changed this gate under the tree: 1.99 added lints that no commit
-      # in review had anything to do with, and because `cargo` stops at the
-      # first crate that fails, each fix exposed the next one a run later. The
-      # same pin is used by every job here; a toolchain that is about to judge
-      # a tree should be a decision recorded in the tree.
-      - uses: dtolnay/rust-toolchain@1.99.0
+      # The channel comes from `rust-toolchain.toml`, so the compiler that judges
+      # a tree here is the one the author ran locally. Pinning a version in this
+      # file instead made the two disagree: 1.99 added lints against code no
+      # commit in review had touched, the machine still had 1.98, and because
+      # `cargo` stops at the first crate that fails, each fix exposed the next
+      # one a run later. A pin moves that failure from "one bump, everyone
+      # updates" to "whoever pushes next inherits it".
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -747,6 +748,12 @@ jobs:
       - name: Check the backup export panel can actually take a package off the machine
         run: bash deploy/scripts/check-web-backup-export-panel.sh
 
+      # 编译器版本不是 CI 自己的事：本机停在哪一次 stable 上，决定「本地绿」是不是
+      # 真的绿。这里跑一遍是为了让 yml 与 rust-toolchain.toml 不各说一套；真正的
+      # 读者是推之前跑同一个脚本的那台机器。
+      - name: Check the compiler that will judge this tree is the one the author ran
+        run: bash deploy/scripts/check-toolchain-matches-ci.sh
+
   # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读
   # 覆盖端点），它结构上证明不了 `web/` 编得过：类型错、装不上的依赖、打包不进
   # bundle，三条它一条也看不见。构建这一半必须自己有一个作业，否则「新增功能不得
@@ -929,7 +936,7 @@ jobs:
       # pipeline's own tests run `cargo clippy --workspace --all-targets`. A job
       # that runs those tests without the linter holds them to a host that
       # cannot answer, and the reading it takes is of the job, not the code.
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview, rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -1119,7 +1126,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
@@ -1149,7 +1156,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
