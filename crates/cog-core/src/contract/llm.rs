@@ -299,8 +299,7 @@ pub struct CompleteOptions {
 /// error text. Matching on text is how a quota outage gets recorded as a
 /// content defect: the words differ per upstream and per locale, while the
 /// status code does not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamFailure {
     /// The upstream asked us to slow down. Retrying after the advertised delay
     /// can succeed on its own.
@@ -403,6 +402,54 @@ impl UpstreamFailure {
 impl std::fmt::Display for UpstreamFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
+    }
+}
+
+/// Serialised through [`UpstreamFailure::name`] rather than by deriving from the
+/// variant names.
+///
+/// The derive produced `auth` where every rendered reason, the cause header and
+/// the reader that recovers a cause from prose all say `auth_rejected`. Nothing
+/// compared the two, so the same cause could leave one surface under one word
+/// and be looked for on the other under another — a mismatch that reads as
+/// "nobody declared a cause" rather than as a disagreement.
+impl Serialize for UpstreamFailure {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+/// The word this cause was persisted under before [`UpstreamFailure::name`] became
+/// the wire form, when it differs.
+///
+/// Tasks stored by an older build carry `error_cause` as the variant's own
+/// spelling, and the reader loads every row of a workspace in one pass: refusing
+/// one of them fails the whole read, not just that row. So a legacy word still
+/// parses — and is never written again, because the writer only ever emits
+/// [`UpstreamFailure::name`]. There is exactly one such word, and it is listed
+/// here rather than guessed at parse time.
+fn from_legacy_name(name: &str) -> Option<UpstreamFailure> {
+    match name {
+        "auth" => Some(UpstreamFailure::Auth),
+        _ => None,
+    }
+}
+
+/// A word outside [`UpstreamFailure::ALL`] (and the legacy spelling above) is an
+/// error rather than a default: an unrecognised cause and a request-side fault
+/// mean different things, and folding one into the other would report a
+/// vocabulary mismatch as our bug.
+impl<'de> Deserialize<'de> for UpstreamFailure {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Self::from_name(&name)
+            .or_else(|| from_legacy_name(&name))
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "unknown upstream cause {name:?}; declared names are {:?}",
+                    UpstreamFailure::ALL.map(|cause| cause.name())
+                ))
+            })
     }
 }
 
@@ -698,6 +745,42 @@ mod upstream_failure_name_tests {
             assert_eq!(UpstreamFailure::from_name(cause.name()), Some(cause));
             assert_eq!(cause.to_string(), cause.name());
         }
+    }
+
+    /// The wire form is the rendered name, not the variant's own spelling.
+    ///
+    /// The derived form said `auth` while everything a reader sees says
+    /// `auth_rejected`; a consumer that recorded one and looked for the other
+    /// found nothing and read that as "no cause was declared".
+    #[test]
+    fn every_cause_survives_the_wire_under_the_name_it_renders() {
+        let mut names = std::collections::BTreeSet::new();
+        for cause in UpstreamFailure::ALL {
+            assert!(
+                names.insert(cause.name()),
+                "two causes render under {:?}; a reader cannot tell them apart",
+                cause.name()
+            );
+            let json = serde_json::to_string(&cause).unwrap();
+            assert_eq!(json, format!("\"{}\"", cause.name()));
+            assert_eq!(
+                serde_json::from_str::<UpstreamFailure>(&json).unwrap(),
+                cause
+            );
+        }
+        // The legacy spelling still loads — a task row written before this
+        // change carries it, and one unreadable row fails the whole workspace
+        // read — but it is never written again.
+        assert_eq!(
+            serde_json::from_str::<UpstreamFailure>("\"auth\"").unwrap(),
+            UpstreamFailure::Auth
+        );
+        assert_ne!(
+            serde_json::to_string(&UpstreamFailure::Auth).unwrap(),
+            "\"auth\""
+        );
+        assert_eq!(UpstreamFailure::from_name("auth"), None);
+        assert!(serde_json::from_str::<UpstreamFailure>("\"forbidden\"").is_err());
     }
 
     /// The reader runs against the real error type rather than a hand-built
