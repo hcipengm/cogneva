@@ -170,28 +170,6 @@ export interface LlmPoolView {
   last_served_at: string | null;
 }
 
-export interface ClusterNode {
-  id: string;
-  name: string;
-  status: 'healthy' | 'degraded' | 'unhealthy' | 'unknown';
-  cpu_percent: number;
-  memory_percent: number;
-}
-
-export interface ClusterAgent {
-  id: string;
-  name: string;
-  role: string;
-  status: 'idle' | 'running' | 'error' | 'recovering';
-}
-
-export interface ClusterTask {
-  id: string;
-  name: string;
-  status: string;
-  progress: number;
-}
-
 export interface Session {
   id: string;
   title: string;
