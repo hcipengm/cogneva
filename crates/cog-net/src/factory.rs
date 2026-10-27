@@ -89,20 +89,30 @@ impl ReqwestHttpClient {
     }
 }
 
+/// 动词名与 reqwest 方法之间只有这一张表。
+///
+/// 走整包与走流式是两条执行路径，两张表时加一个动词只会加到其中一张上；另一张
+/// 落到 `parse()`，而 `parse()` 恰好也认得同一批标准动词，所以这种偏差不会在
+/// 任何测试或日志里显出来——直到某个不走 `parse()` 的方法名（带下划线、带空白的
+/// 变体）出现，两条路的答案才开始不一样。
+fn method_of(name: &str) -> SFResult<reqwest::Method> {
+    Ok(match name {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "DELETE" => reqwest::Method::DELETE,
+        "HEAD" => reqwest::Method::HEAD,
+        "PATCH" => reqwest::Method::PATCH,
+        other => other
+            .parse()
+            .map_err(|e| SFError::Agent(format!("invalid HTTP method '{}': {}", other, e)))?,
+    })
+}
+
 #[async_trait::async_trait]
 impl HttpClient for ReqwestHttpClient {
     async fn execute(&self, req: HttpRequest) -> SFResult<HttpResponse> {
-        let method = match req.method.as_str() {
-            "GET" => reqwest::Method::GET,
-            "POST" => reqwest::Method::POST,
-            "PUT" => reqwest::Method::PUT,
-            "DELETE" => reqwest::Method::DELETE,
-            "HEAD" => reqwest::Method::HEAD,
-            "PATCH" => reqwest::Method::PATCH,
-            other => other
-                .parse()
-                .map_err(|e| SFError::Agent(format!("invalid HTTP method '{}': {}", other, e)))?,
-        };
+        let method = method_of(&req.method)?;
 
         let mut request_builder = self.inner.request(method, &req.url);
 
@@ -143,17 +153,7 @@ impl HttpClient for ReqwestHttpClient {
     }
 
     async fn execute_stream(&self, req: HttpRequest) -> SFResult<cog_core::HttpStreamResponse> {
-        let method = match req.method.as_str() {
-            "GET" => reqwest::Method::GET,
-            "POST" => reqwest::Method::POST,
-            "PUT" => reqwest::Method::PUT,
-            "DELETE" => reqwest::Method::DELETE,
-            "HEAD" => reqwest::Method::HEAD,
-            "PATCH" => reqwest::Method::PATCH,
-            other => other
-                .parse()
-                .map_err(|e| SFError::Agent(format!("invalid HTTP method '{}': {}", other, e)))?,
-        };
+        let method = method_of(&req.method)?;
 
         let mut request_builder = self.inner.request(method, &req.url);
 
