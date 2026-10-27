@@ -1,16 +1,25 @@
 //! principle: feedback_no_hardcoding_config_surface
 //!
-//! 同一行数据被两处各读一遍，而中间没有任何东西比较这两份读法。
+//! 同一句话被写了两遍（或更多遍），而中间没有任何东西比较它们。
 //!
-//! `PostgresStateBackend` 与 `PostgresObservabilityGateway` 读同一张
-//! `cog_agent_states`、同一张 `cog_checkpoints`——观测面展示的就是状态面写下的
-//! 东西，所以两处各写了一份 SELECT，也各写了一份「一行 → 结构体」的映射。两份
-//! 都能编译、都能跑，于是没有任何东西会失败；漂移只表现为读数悄悄换了意思。
+//! 本门管这一族里的两个形状。
 //!
-//! 这种漂移在这一族读取上格外安静：`sqlx::query_as` 把一行按**位置**塞进元组，
-//! 投影里两个同类型列对调之后照样编译、照样返回，只是把 `snapshot_id` 塞进
-//! `event_offset`、把偏移量塞进快照名——读者拿到一个从没停过的位置，去恢复一个
-//! 任务，而这件事与「检查点本来就存在那儿」在读数上同形。
+//! **形状一：同一行数据被两处各读一遍。** `PostgresStateBackend` 与
+//! `PostgresObservabilityGateway` 读同一张 `cog_agent_states`、同一张
+//! `cog_checkpoints`——观测面展示的就是状态面写下的东西，所以两处各写了一份
+//! SELECT，也各写了一份「一行 → 结构体」的映射。两份都能编译、都能跑，于是没有
+//! 任何东西会失败；漂移只表现为读数悄悄换了意思。这一族格外安静：
+//! `sqlx::query_as` 把一行按**位置**塞进元组，投影里两个同类型列对调之后照样编译、
+//! 照样返回，只是把 `snapshot_id` 塞进 `event_offset`、把偏移量塞进快照名——读者
+//! 拿到一个从没停过的位置，去恢复一个任务，而这件事与「检查点本来就存在那儿」在
+//! 读数上同形。
+//!
+//! **形状二：同一把尺子被三个地方各写一遍。** 三个容量清扫器各量一次「这张表在盘
+//! 上占多少」，三条字节读数在同一个面板上被并排比较。三份拷贝里的一处改成不含
+//! TOAST 的 `pg_table_size`，另外两条不报错、也不变慢，面板上只是有一条线的量纲
+//! 悄悄不同——「这类日志比那一类占得少」这句话从此不成立，且没有任何东西会说不
+//! 成立。同形的地方还包括「表还没建出来」的处置：三份拷贝各自把它记成一句「拿不到
+//! 大小」，于是「名字写错了」「还没建表」「库连不上」三种现场同形。
 //!
 //! 判据（普查的是 `crates/cog-storage/src` 的生产行）：
 //!
@@ -54,6 +63,10 @@ const SPELT_ONCE: &[(&str, &str)] = &[
     (
         "AgentState = serde_json::from_str",
         "一份存下来的状态文档怎么解码",
+    ),
+    (
+        "pg_total_relation_size(to_regclass($1))",
+        "一张表在盘上占多少（含索引与 TOAST）",
     ),
 ];
 
@@ -101,7 +114,7 @@ fn census(root: &Path) -> (usize, Sites) {
 }
 
 #[test]
-fn a_row_two_stores_read_is_mapped_once() {
+fn a_shared_read_is_spelt_once() {
     let (files, sites) = census(&repo_root());
     assert!(
         files >= MIN_FILES,
@@ -129,8 +142,9 @@ fn a_row_two_stores_read_is_mapped_once() {
         findings.is_empty(),
         "这些读取在多处各写了一遍。两处都能编译、都能返回，所以两边分叉之后\
          没有任何东西会失败：投影里对调两列，位置映射照样把结果塞进结构体，\
-         读的人拿到一个从没发生过的位置。把它们收进 `postgres::state_reads`，\
-         其余地方引用那一处：\n{}",
+         读的人拿到一个从没发生过的位置；又或者同名的三条读数换了量纲，面板上\
+         照常并排显示。把共用的一处收成一个模块（`postgres::state_reads`、\
+         `relation_bytes`），其余地方引用它：\n{}",
         findings.join("\n")
     );
 }

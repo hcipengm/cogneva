@@ -51,6 +51,7 @@ pub mod migrate;
 pub mod observability_event_cap;
 pub mod owner_lease;
 pub mod partition_maintainer;
+pub mod relation_bytes;
 pub mod schema_ddl;
 pub mod task_event_retention;
 

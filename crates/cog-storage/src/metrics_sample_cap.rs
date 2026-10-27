@@ -507,7 +507,7 @@ impl SampleLogCap {
             .await;
         }
 
-        match self.table_bytes().await {
+        match crate::relation_bytes::relation_bytes(&self.pool, &self.table).await {
             Ok(bytes) => {
                 self.emit(
                     mb,
@@ -557,19 +557,6 @@ impl SampleLogCap {
             crate::partition_maintainer::quote_ident(&self.table)
         );
         sqlx::query_scalar(&sql)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))
-    }
-
-    /// On-disk footprint of the table, including its indexes and TOAST. This
-    /// is what the log costs the volume; it lags the row count, because
-    /// PostgreSQL does not return the space a `DELETE` frees until it
-    /// vacuums, so it is published as a reading and never used to decide what
-    /// to delete.
-    async fn table_bytes(&self) -> SFResult<i64> {
-        sqlx::query_scalar("SELECT pg_total_relation_size(to_regclass($1))")
-            .bind(&self.table)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| SFError::Database(e.to_string()))

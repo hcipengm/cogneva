@@ -15,7 +15,7 @@
 //! stopped -- with no error to distinguish it from a checkpoint that was saved
 //! that way.
 //!
-//! `gate`: `crates/cogneva/tests/a_row_two_stores_read_is_mapped_once_test.rs`
+//! `gate`: `crates/cogneva/tests/a_shared_query_is_spelt_once_test.rs`
 //! counts how many production lines in this crate spell each statement, each
 //! mapping and the state decode, and fails on any second one.
 

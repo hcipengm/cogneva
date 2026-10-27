@@ -404,7 +404,7 @@ impl EventLogCap {
             .await;
         }
 
-        match self.table_bytes().await {
+        match crate::relation_bytes::relation_bytes(&self.pool, &self.table).await {
             Ok(bytes) => {
                 self.emit(
                     mb,
@@ -443,17 +443,6 @@ impl EventLogCap {
             crate::partition_maintainer::quote_ident(&self.table)
         );
         sqlx::query_scalar(&sql)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))
-    }
-
-    /// On-disk footprint, indexes and TOAST included. A reading, never the
-    /// input to a decision: PostgreSQL does not return the space a `DELETE`
-    /// frees until it vacuums, so this lags the row count on purpose.
-    async fn table_bytes(&self) -> SFResult<i64> {
-        sqlx::query_scalar("SELECT pg_total_relation_size(to_regclass($1))")
-            .bind(&self.table)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| SFError::Database(e.to_string()))
