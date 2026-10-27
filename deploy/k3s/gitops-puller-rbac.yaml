@@ -92,8 +92,14 @@ rules:
     resources: ["resourcequotas", "limitranges"]
     verbs: ["get", "list"]
   # 部署面：全部工作负载的副本、镜像与滚动条件（集合级 list，不是按名读）。
+  # 三种形态就是三种状态读法：只授 deployments 时 postgres、redis、三个 DaemonSet、
+  # 两个 CronJob 在页面上根本不存在，而屏上照样是一张看起来完整的表。
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list"]
+  # batch 是另一个分组：Job 与 CronJob 不在 apps 里。
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
     verbs: ["get", "list"]
 ---
 # 拓扑面在命名空间里额外要的三样：事件、卷声明、Pod 的实际用量。

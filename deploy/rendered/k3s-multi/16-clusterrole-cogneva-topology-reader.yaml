@@ -46,6 +46,14 @@ rules:
     verbs: ["get", "list"]
   # 部署面：每个工作负载的副本、镜像与滚动条件。这里要的是集合级 list（不是按名
   # 读那四个），因为「谁在跑第几版」这个问题问的是全部工作负载，不是一份名单。
+  #
+  # 三种形态就是三种状态读法，只授 deployments 的那一版真跑起来是这样：
+  # `读不到 StatefulSet：apiserver 返回 403`，屏上照样是 11 行——postgres、redis、
+  # 三个 DaemonSet、两个 CronJob 全都不在，而空白读起来像「本来就没有」。
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list"]
+  # batch 是另一个分组：Job 与 CronJob 不在 apps 里，只加 apps 那条读不到它们。
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
     verbs: ["get", "list"]

@@ -696,6 +696,13 @@ jobs:
       - name: Check the delivery screen lists every workload kind it can see
         run: bash deploy/scripts/check-web-workload-inventory.sh
 
+      # 上一关判的是「代码读五种、屏上分得出」；这一关判的是**读得读不到**。实测：
+      # 接口改成读五种之后，镜像发了、屏也换了，端点自己答的是「读不到 StatefulSet：
+      # 403」——ClusterRole 只授了 deployments，而屏上照样是一张看起来完整的表。门把
+      # 代码里那几个 (group, resource) 与两条投递路径的 RBAC 摆在一起对。
+      - name: Check the workload reader is allowed to list what it reads
+        run: bash deploy/scripts/check-workload-reader-rbac.sh
+
       # 设置里「代码平台与凭据」的成品是「GitHub 连没连、Gitee 连没连，并能在这一页
       # 贴一段令牌」。只有一个「已连接平台」格子时，两家都连上只报得下其中一家；粘贴
       # 令牌只写在浮层里时，这页读得到状态而写不进去。门判的是按平台的两份读数、下拉
