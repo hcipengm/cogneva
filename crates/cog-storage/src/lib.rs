@@ -123,9 +123,10 @@ pub mod plugin;
 /// The label naming where a reading's value came from.
 ///
 /// The storage plugin publishes readings per source, and the panels that count
-/// one source select by this label. Declared once per crate that writes it,
-/// under the same identifier, with a gate comparing the spellings.
-pub const LABEL_SOURCE: &str = "source";
+/// one source select by this label. Aliased to the core declaration rather than
+/// spelled again: the word is the same one, and two names for it in the
+/// declaring crates is how a rename lands on one site and misses the reader.
+pub const LABEL_SOURCE: &str = cog_core::build_cache::SOURCE_LABEL;
 #[cfg(feature = "redis")]
 pub use dlq::RedisDeadLetterQueue;
 
