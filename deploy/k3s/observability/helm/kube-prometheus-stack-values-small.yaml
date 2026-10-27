@@ -185,6 +185,16 @@ kube-state-metrics:
   # 与 8080 共用同一个 job 标签，四条规则无需改写。
   selfMonitor:
     enabled: true
+  # kube-state-metrics 默认**一个标签都不导出**：`kube_pod_labels` 这一族按
+  # `--metric-labels-allowlist` 白名单产出，名单为空时整个度量族不存在（实测这台集群
+  # `count(kube_pod_labels)` 是空集）。于是「某个工作负载声明自己的读数怎么交付」这件事
+  # 在读数面上根本不可读。
+  # 只放两把：交付方式（`cogneva.io/readings-delivery`，进程采集器声明 push，因为它
+  # 没有 /metrics），与组件名（`app.kubernetes.io/component`）。组件名是稳定的主体维——
+  # Pod 名随每次滚动换新，按它归并会把一个持续状况报成每次滚动一条新告警。
+  # 不放开 `*`：那会把每个 Pod 的全部标签展开成基数。
+  extraArgs:
+    - --metric-labels-allowlist=pods=[app.kubernetes.io/component,cogneva.io/readings-delivery]
   resources:
     requests:
       cpu: 30m

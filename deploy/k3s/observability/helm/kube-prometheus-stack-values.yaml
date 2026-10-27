@@ -353,6 +353,10 @@ kubeStateMetrics:
 kube-state-metrics:
   selfMonitor:
     enabled: true
+  # 与缩配档同一条白名单、同一个理由（那一档写着实测为什么需要它）：默认一个标签都不导出，
+  # 「工作负载怎么交付读数」在读数面上不可读；只放交付方式与组件名两把。
+  extraArgs:
+    - --metric-labels-allowlist=pods=[app.kubernetes.io/component,cogneva.io/readings-delivery]
 
 # ─── prometheus-node-exporter ────────────────────────────────────
 prometheus-node-exporter:

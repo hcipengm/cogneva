@@ -9,10 +9,13 @@
 #   3. 新鲜度合取型（PG 上限、GitOps 拉取）：值本身加上「观测时间戳在一刻钟/半小时内」。
 #      这两条的静格各自把时间戳钉死，删掉新鲜度那半那一格会响。
 #
-# `cogneva_workload_metrics_unscraped` 是四条链的 `and`/`unless`：
-#   容器信息 and 相位 Running == 1 and 启动超过一刻钟 unless 归 Job 管 unless 一刻钟里抓过。
-#   它的静格单独证「一刻钟里抓过」那半；`and on(pod)` 只看 pod，不看 namespace——夹具两条
-#   序列都带 namespace 才不会互相错配。
+# `cogneva_workload_metrics_unscraped` 是五条链的 `and`/`unless`：
+#   容器信息 and 相位 Running == 1 and 启动超过一刻钟 unless 归 Job 管 unless 一刻钟里抓过
+#   unless Pod 声明了读数靠推（`cogneva.io/readings-delivery=push`）。
+#   它的静格各自证后半截的两条：「一刻钟里抓过」一格、「声明了靠推」一格——后者是
+#   进程采集器那种**没有 /metrics** 的工作负载，不排除它，那条告警就永远亮着一条谁也
+#   动不了的警告。`and on(pod)` 只看 pod，不看 namespace——夹具序列都带 namespace
+#   才不会互相错配。
 #
 # `workload_no_available_replica` 有三条腿：可用副本最大值 < 1、声明副本 > 0、
 #   且这条读数存在超过半小时（`count_over_time[1h] > count_over_time[30m]`）。
@@ -330,4 +333,23 @@ tests:
     alert_rule_test:
       - eval_time: 240m
         alertname: baseline_port_tick_failing_every_round
+        exp_alerts: []
+
+  # 一格跑了一小时、没有抓取样本的 cogneva Pod，但它在 Pod 上声明了
+  # cogneva.io/readings-delivery=push：读数由进程自己 POST 给网关，这个镜像里
+  # 根本没有 /metrics。这一格**不该亮**——判据是 `unless on(pod) kube_pod_labels{…}`
+  # 那半在不在：删掉它，这一格会以 1 报出来，而断言要的是空。
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_container_info{namespace="cogneva",pod="census1",image="cogneva/app:1"}'
+        values: '1x60'
+      - series: 'kube_pod_status_phase{namespace="cogneva",pod="census1",phase="Running"}'
+        values: '1x60'
+      - series: 'kube_pod_start_time{namespace="cogneva",pod="census1"}'
+        values: '0x60'
+      - series: 'kube_pod_labels{namespace="cogneva",pod="census1",label_cogneva_io_readings_delivery="push"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: cogneva_workload_metrics_unscraped
         exp_alerts: []

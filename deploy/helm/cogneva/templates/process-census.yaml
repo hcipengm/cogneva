@@ -39,6 +39,11 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: process-census
+        # 这一格**不提供 /metrics**：读数由进程自己 POST 给网关。它声明出来，
+        # 是因为「在跑的 cogneva 镜像没有抓取目标」那条告警按「有指标面就该被抓」
+        # 算人口，而这一格里根本没有那个面——不声明的话，它每时每刻都在那本账上，
+        # 读者分不出「真有一个工作负载的指标没人收」还是「这一格本来就不用抓」。
+        cogneva.io/readings-delivery: push
     spec:
       # 宿主 PID 命名空间：没有它，`/proc` 里只有本容器自己，第三方容器一个都读不到。
       hostPID: true
