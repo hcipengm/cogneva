@@ -261,12 +261,10 @@ async fn fetch_capped(client: &Arc<dyn HttpClient>, url: &Url, cap: usize) -> SF
     req.headers
         .insert("Accept-Language".into(), "zh-CN,zh;q=0.9,en;q=0.8".into());
     let mut resp = client.execute_stream(req).await?;
-    let content_type = resp
-        .headers
-        .get("content-type")
-        .or_else(|| resp.headers.get("Content-Type"))
-        .cloned()
-        .unwrap_or_default();
+    // Case-insensitive read: the map keeps the server's casing, and a page that
+    // answers `CONTENT-TYPE` used to read as "no content type" — which is how a
+    // JSON body gets extracted as if it were a document.
+    let content_type = resp.header("content-type").unwrap_or_default().to_string();
     let status = resp.status;
     let mut bytes = Vec::new();
     let mut too_large = false;
@@ -1333,7 +1331,9 @@ mod tests {
                 .pop()
                 .ok_or_else(|| SFError::Agent("no scripted answer left".into()))?;
             let mut headers = HashMap::new();
-            headers.insert("content-type".to_string(), answer.content_type);
+            // 大写的名字不是笔误：这个夹具就是要让「按线上大小写读」成为唯一
+            // 读得到的路径，退回逐字比对时这些用例会红，而不是安静地当没送过。
+            headers.insert("CONTENT-TYPE".to_string(), answer.content_type);
             Ok(cog_core::HttpResponse {
                 status: answer.status,
                 headers,

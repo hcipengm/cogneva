@@ -76,10 +76,7 @@ pub fn parse_retry_after_secs(raw: &str) -> Option<u64> {
 /// Field names are compared case-insensitively: HTTP header names are, and the
 /// concrete client's map preserves whatever casing the wire carried.
 pub fn retry_after_hint(headers: &HashMap<String, String>) -> Option<u64> {
-    headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(RETRY_AFTER_HEADER))
-        .and_then(|(_, value)| parse_retry_after_secs(value))
+    crate::header_value(headers, RETRY_AFTER_HEADER).and_then(parse_retry_after_secs)
 }
 
 /// Outbound header the LLM proxy sets on a refusal to name the cause it
@@ -104,10 +101,8 @@ pub const UPSTREAM_CAUSE_HEADER: &str = "x-cogneva-upstream-cause";
 /// [`retry_after_hint`] does: the concrete client's map preserves whatever
 /// casing the wire carried.
 pub fn declared_upstream_cause(headers: &HashMap<String, String>) -> Option<UpstreamFailure> {
-    headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(UPSTREAM_CAUSE_HEADER))
-        .and_then(|(_, value)| UpstreamFailure::from_name(value.trim()))
+    crate::header_value(headers, UPSTREAM_CAUSE_HEADER)
+        .and_then(|value| UpstreamFailure::from_name(value.trim()))
 }
 
 /// The token a rendered refusal carries its stated wait under, and the reader

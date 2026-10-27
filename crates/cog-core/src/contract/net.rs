@@ -33,6 +33,14 @@ pub struct HttpStreamResponse {
     pub stream: HttpBodyStream,
 }
 
+impl HttpStreamResponse {
+    /// The value of the response header `name`, matched case-insensitively —
+    /// see [`header_value`] for why the name is not compared as a string.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        header_value(&self.headers, name)
+    }
+}
+
 impl std::fmt::Debug for HttpStreamResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpStreamResponse")
@@ -194,9 +202,29 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+/// The value `headers` carries under `name`, compared case-insensitively.
+///
+/// HTTP field names are case-insensitive (RFC 9110 §5.1) and this map keeps
+/// whatever casing the wire carried, so an exact-string lookup answers `None`
+/// for a response that did send the header. Callers then read that `None` as
+/// "the server said nothing" — no content type, no stated wait — which is
+/// indistinguishable from the header simply not being there.
+pub fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
 impl HttpResponse {
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+
+    /// The value of the response header `name`, matched case-insensitively —
+    /// see [`header_value`] for why the name is not compared as a string.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        header_value(&self.headers, name)
     }
 
     /// Deserialize the response body as JSON.
@@ -267,4 +295,47 @@ pub trait WebSocketClient: Send + Sync + std::fmt::Debug {
         url: &str,
         headers: HashMap<String, String>,
     ) -> SFResult<Box<dyn WebSocketConnection>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response_with(name: &str, value: &str) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            headers: HashMap::from([(name.to_string(), value.to_string())]),
+            body: Vec::new(),
+        }
+    }
+
+    /// 线上送来的大小写不是我们写出去的那个：真实服务端里三种写法都见过。
+    /// 读数必须一样，否则「没读到」与「服务端没送」在调用点上分不开。
+    #[test]
+    fn a_response_header_is_read_whatever_case_the_wire_used() {
+        for spelled in [
+            "content-type",
+            "Content-Type",
+            "CONTENT-TYPE",
+            "cOnTeNt-TyPe",
+        ] {
+            let response = response_with(spelled, "text/html");
+            assert_eq!(
+                response.header("content-type"),
+                Some("text/html"),
+                "按 {spelled} 送来的头读不到"
+            );
+        }
+        assert_eq!(response_with("x-other", "1").header("content-type"), None);
+    }
+
+    #[test]
+    fn the_free_function_and_the_method_agree() {
+        let response = response_with("Retry-After", "30");
+        assert_eq!(
+            header_value(&response.headers, "retry-after"),
+            response.header("retry-after")
+        );
+        assert_eq!(response.header("retry-after"), Some("30"));
+    }
 }
