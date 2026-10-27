@@ -1213,6 +1213,14 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     ("kube_deployment_spec_replicas", "kube-state-metrics"),
     (
+        "kube_daemonset_status_number_ready",
+        "kube-state-metrics（DaemonSet 层面已就绪的副本数，取自各 Pod 的 ready 条件）。进程普查那条规则读它，是因为判「这台节点上的采集器起没起来」不能读平台自己的二进制：生成 `process_report_ingest_total` 的正是那个采集器，它没起来就没有序列，于是「没上报」和「没起来」在自己那一面上同形。DaemonSet 的就绪数是 apiserver 的账，与采集器在不在无关，两者相减才分得开",
+    ),
+    (
+        "kube_daemonset_status_desired_number_scheduled",
+        "kube-state-metrics（同一个 DaemonSet 期望铺到几台节点上）。有它就说明这个 DaemonSet 至少被调度过：`number_ready` 单独读会把「一台都没铺」与「铺了没就绪」读成同一个 0，而这两种现场一个是装错了、一个是采集中，修法相反",
+    ),
+    (
         "kube_deployment_status_replicas_available",
         "kube-state-metrics（Deployment 层面的可用副本数；读数取自各 Pod 的 ready，而 Pod 卡在 Terminating 时 API 仍把它记为 ready，所以这份计数在那种故障下不动）",
     ),
@@ -4176,6 +4184,10 @@ const UNREAD: &[(&str, Unread)] = &[
     (
         "cogneva_observability_events_bytes",
         Unread::NotAReading("on-disk size of the event log, and it lags the row count for the same reason the sample log's does -- PostgreSQL returns deleted space only when it vacuums -- so a bound here would fire on the volume doing its job. The capacity verdict is the reading with a criterion; the bytes are what the volume is paying for it"),
+    ),
+    (
+        "cogneva_checkpoints_bytes",
+        Unread::NotAReading("on-disk size of the checkpoint store, and it lags the row count for the same reason the other two do -- PostgreSQL returns the space a DELETE freed only when it vacuums -- so a bound here would fire on the volume doing its job. The capacity verdict is the reading with a criterion; the bytes are what the backup the drill restores is actually paying for"),
     ),
     (
         "tier_migration_total",

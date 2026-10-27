@@ -177,6 +177,20 @@ metric_names! {
     OBSERVABILITY_EVENTS_BYTES => "cogneva_observability_events_bytes",
     OBSERVABILITY_EVENT_SWEEP_FAILED => "cogneva_observability_event_sweep_failed",
 
+    // cog-storage — the checkpoint store's capacity: `cog_snapshots` held
+    // 54,452 rows over 924 MB on 2026-10-27, of which 39,610 rows — 580 MB
+    // measured the same day — no task board pointed at: the last checkpoint of
+    // every finished task, kept for good because nothing deletes a board. Same
+    // four cells and
+    // the same pass-outcome cell as the two logs above, for the same reason:
+    // what it holds, what it may hold, whether the floor is what stops it, what
+    // that costs on disk, and whether the pass itself answered.
+    CHECKPOINTS_ROWS => "cogneva_checkpoints_rows",
+    CHECKPOINTS_BUDGET_ROWS => "cogneva_checkpoints_budget_rows",
+    CHECKPOINTS_OVER_CAPACITY => "cogneva_checkpoints_over_capacity",
+    CHECKPOINTS_BYTES => "cogneva_checkpoints_bytes",
+    CHECKPOINT_SWEEP_FAILED => "cogneva_checkpoint_sweep_failed",
+
     // cog-storage — the monthly partition maintenance loop's per-round outcome.
     //
     // The loop keeps every time-series parent's window open ahead of the clock

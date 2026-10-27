@@ -1388,6 +1388,50 @@ impl cog_core::SystemPlugin for StoragePlugin {
             info!("Observability event capacity disabled (no PostgreSQL pool)");
         }
 
+        // ── Checkpoint store capacity ──
+        // A checkpoint round writes the new snapshot, points the task board at
+        // it, and only then deletes the one it replaced — so the board is the
+        // authority on which snapshots are live, and everything else is a
+        // leftover. Finished tasks keep their last checkpoint for good (nothing
+        // retires a board), and on 2026-10-27 that was 39,610 of 54,452 rows —
+        // the 580 MB of the 924 MB the store costs, measured the same day. All
+        // of it travels in the nightly backup whose restore the drill has to
+        // finish inside a budget.
+        //
+        // The floor is two-part and neither half is a knob: a row a board points
+        // at is the resume point, and a row inside the read window is what the
+        // snapshots view is promised. A sweep that crossed either would answer a
+        // well-formed question with a silent gap.
+        let checkpoint_max_rows = crate::checkpoint_cap::max_rows_from_env();
+        let checkpoint_read_window = crate::checkpoint_cap::read_window_from_env();
+        if let Some(pool) = self.pg_pool.clone() {
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or_default();
+            let mut cap = crate::CheckpointCap::new(pool, checkpoint_max_rows)
+                .with_read_window(checkpoint_read_window)
+                .with_deployment(deployment_name());
+            if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                cap = cap.with_metrics(mb);
+            }
+            if let Some(broker) = lease_broker.clone() {
+                cap = cap.with_role(broker);
+            }
+            let _handle = Arc::new(cap).spawn(shutdown.clone());
+            if checkpoint_max_rows == 0 {
+                info!("Checkpoint capacity disabled (max rows = 0)");
+            } else {
+                info!(
+                    checkpoint_max_rows,
+                    read_window_secs = checkpoint_read_window.as_secs(),
+                    "Checkpoint capacity started"
+                );
+            }
+        } else {
+            info!("Checkpoint capacity disabled (no PostgreSQL pool)");
+        }
+
         Ok(())
     }
 

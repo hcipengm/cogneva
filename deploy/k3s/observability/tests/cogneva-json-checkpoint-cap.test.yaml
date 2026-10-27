@@ -1,0 +1,152 @@
+# 续跑点存储（`cog_snapshots`）容量那三条规则的单测夹具。
+#
+# 三条各证一次「会响」，也各证一次「只在它该响的时候响」：
+#
+#   * `checkpoint_store_over_capacity` 读的是「任务板指针与读窗口把预算顶住了」这个
+#     判决，不是比值。第二格让它响；第一格给同样的行数但地板没顶住——清理跟得上。
+#   * `checkpoint_store_unpruned` 读的是「半小时里最低也没回到预算附近」。第四格让行数
+#     只在 30 分钟内超出、之前没有历史，证明「一小时里的点必须比半小时里多」那条腿会
+#     拦住一个比窗口还年轻的过程；第五格把行数放在预算上方但不到 5%，证明阈值那条腿
+#     不是「超了就响」；第三格把三条读数的时间戳全部钉在 0，证明三条的新鲜度腿各自都在
+#     起作用——删掉那半，这一格会响三条。
+#   * `checkpoint_store_sweep_failed` 与另两条日志的同名规则同形：写的是「这一趟没跑完」，
+#     读数冻结时另外两条读到的是旧值。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-checkpoint-cap.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: checkpoint_store_over_capacity
+# rule: checkpoint_store_unpruned
+# rule: checkpoint_store_sweep_failed
+
+evaluation_interval: 1m
+
+tests:
+  # 一切正常：表在预算内、地板没顶住、每一趟都跑完了。三条全静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_checkpoints_rows{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '20000x60'
+      - series: 'cogneva_checkpoints_rows_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'cogneva_checkpoints_budget_rows{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '40000x60'
+      - series: 'cogneva_checkpoints_over_capacity{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+      - series: 'cogneva_checkpoints_over_capacity_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'cogneva_checkpoint_sweep_failed{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+      - series: 'cogneva_checkpoint_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: checkpoint_store_over_capacity
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: checkpoint_store_unpruned
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: checkpoint_store_sweep_failed
+        exp_alerts: []
+
+  # 坏消息：表 5 万行而预算 4 万、任务板指针顶住了预算、某一趟没跑完。三条全响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_checkpoints_rows{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '50000x60'
+      - series: 'cogneva_checkpoints_rows_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'cogneva_checkpoints_budget_rows{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '40000x60'
+      - series: 'cogneva_checkpoints_over_capacity{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '1x60'
+      - series: 'cogneva_checkpoints_over_capacity_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'cogneva_checkpoint_sweep_failed{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '1x60'
+      - series: 'cogneva_checkpoint_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+    alert_rule_test:
+      # `deployment` 留在告警标签上：三条都用 `without (pod, container, instance)`
+      # 把进程维度的标签收掉，只有部署维度是「这是哪一本账」的身份。
+      - eval_time: 60m
+        alertname: checkpoint_store_over_capacity
+        exp_alerts:
+          - exp_labels:
+              deployment: cogneva
+              severity: warning
+      - eval_time: 60m
+        alertname: checkpoint_store_unpruned
+        exp_alerts:
+          - exp_labels:
+              deployment: cogneva
+              severity: warning
+      - eval_time: 60m
+        alertname: checkpoint_store_sweep_failed
+        exp_alerts:
+          - exp_labels:
+              deployment: cogneva
+              severity: warning
+
+  # 同样的坏消息，但三条读数的时间戳都停在 0：现在是涨是跌不知道。
+  # 删掉任何一条的新鲜度腿，这一格会响那一条。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_checkpoints_rows{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '50000x60'
+      - series: 'cogneva_checkpoints_rows_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+      - series: 'cogneva_checkpoints_budget_rows{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '40000x60'
+      - series: 'cogneva_checkpoints_over_capacity{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '1x60'
+      - series: 'cogneva_checkpoints_over_capacity_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+      - series: 'cogneva_checkpoint_sweep_failed{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '1x60'
+      - series: 'cogneva_checkpoint_sweep_failed_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: checkpoint_store_over_capacity
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: checkpoint_store_unpruned
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: checkpoint_store_sweep_failed
+        exp_alerts: []
+
+  # 表超出预算，但这条读数二十分钟前才开始报：比窗口还年轻的过程不能拿第一格
+  # 凑出「半小时」的结论。删掉「一小时里的点比半小时里的多」那条腿，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_checkpoints_rows{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '_x40 50000x20'
+      - series: 'cogneva_checkpoints_rows_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'cogneva_checkpoints_budget_rows{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '40000x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: checkpoint_store_unpruned
+        exp_alerts: []
+
+  # 41000 行是超出预算，但阈值是预算上方 5%：42000 才响。
+  # 删掉阈值那条腿、只判「超过预算」，这一格会响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_checkpoints_rows{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '41000x60'
+      - series: 'cogneva_checkpoints_rows_observed_timestamp_seconds{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '3500x60'
+      - series: 'cogneva_checkpoints_budget_rows{pod="p1",container="app",instance="i1",deployment="cogneva"}'
+        values: '40000x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: checkpoint_store_unpruned
+        exp_alerts: []

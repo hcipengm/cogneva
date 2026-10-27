@@ -454,6 +454,11 @@ crates/cog-reflection/src/workspace.rs	ORPHAN_MIN_AGE	900s	bound	several multipl
 crates/cog-storage/src/backends/file_trace_store.rs	MAX_SAFE_LEN	180	bound	well under the filesystem's 255-byte name limit, leaving room for .trace and .meta.json
 crates/cog-storage/src/backends/object_backends.rs	BACKEND_CALL_TIMEOUT	30s	bound	一次对象存储调用的墙：30s。
 crates/cog-storage/src/backends/object_backends.rs	MAX_PAGES	10_000	bound	a page-count ceiling so a cursor that keeps truncating cannot spin forever
+crates/cog-storage/src/checkpoint_cap.rs	BATCH_ROWS	5_000	bound	What one statement may delete: the LIMIT is how the capacity is enforced, so a pass' reach and its cost are the same number. Half the event log's batch, because a checkpoint row carries an agent state and a context window, so the same row count is far more bytes to write and vacuum.
+crates/cog-storage/src/checkpoint_cap.rs	DEFAULT_MAX_ROWS	40_000	bound	Measured on 2026-10-27: 54,452 rows over 924 MB, of which 14,842 were pointed at by a board. Forty thousand sits well above the live set and well below the table, so the capacity binds on the garbage while leaving the live set room to grow several times over.
+crates/cog-storage/src/checkpoint_cap.rs	DEFAULT_READ_WINDOW_SECS	86_400	bound	The floor the capacity may not cross: the snapshots view lists the newest first, and a day is four orders of magnitude wider than its default page, so a reader that asks for the recent ones never sees a gap the sweep made.
+crates/cog-storage/src/checkpoint_cap.rs	MAX_SWEEP_PERIOD	120s	bound	half of Prometheus's 5-minute staleness window, so the size series survives a store with nothing to prune
+crates/cog-storage/src/checkpoint_cap.rs	MIN_SWEEP_PERIOD	1s	bound	floor that keeps a store with nothing to prune from being polled in a spin
 crates/cog-storage/src/inbox_retirement.rs	INBOX_RETIRE_SWEEP_PERIOD	600s	derived	matched to the WAL sweep period: both delete, both need the same second look.
 crates/cog-storage/src/metrics_retirement.rs	RELEASE_BATCH	5_000	bound	Rows one statement may delete from the sample log.
 crates/cog-storage/src/metrics_retirement.rs	SUPERSEDED_QUIET_SECS	6 * 3600	bound	一个被判为孤儿的标签集要**安静多久**，release 才允许动它。

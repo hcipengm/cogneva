@@ -1859,3 +1859,35 @@ rows:
       the storm an operator is looking at, and a hole reads like "nothing
       happened then". Nothing derives it, because the reader's default window is
       a design decision rather than an observation.
+
+  - key: checkpointStore.maxRows
+    source: override
+    why: >-
+      Rows the checkpoint store may hold. A checkpoint round writes the new
+      snapshot, points the task board at it, and only then deletes the one it
+      replaced, so the board is the authority on which snapshots are live and
+      everything else is a leftover; nothing retires a board, so every finished
+      task keeps its last checkpoint for good. Measured on 2026-10-27: 54,452
+      rows over 924 MB, of which 39,610 rows (about 580 MB) no board pointed at.
+      All of it travels in the nightly backup whose restore the drill must
+      finish inside its per-pass budget, which is what makes the garbage a cost
+      and not just untidiness. Forty thousand sits above the 14,842 rows that
+      were live that day -- room for the live set to grow several times over --
+      and below the table, so the bound bites on the leftovers first. Nothing
+      derives it: the live set is how many tasks the fleet has run, which is an
+      operator's expectation rather than a measurement of this pass.
+
+  - key: checkpointStore.readWindowSeconds
+    source: override
+    why: >-
+      The window inside which no checkpoint may be deleted, whatever the
+      capacity says. The other half of the floor is the task board pointer, and
+      neither is a knob: deleting a row a board names ends a task's ability to
+      resume while the board still points at it, and deleting inside this window
+      answers the snapshots view with "none" while the store is full. One day is
+      four orders of magnitude wider than the view's default page (the newest
+      hundred), so a reader asking for the recent ones never sees a gap the
+      sweep made. When the pointers and the window together hold more rows than
+      the capacity allows, the sweep stops and cogneva_checkpoints_over_capacity
+      says so -- that state is a policy question about how long a finished
+      task's board lives, not a fault in the sweep.

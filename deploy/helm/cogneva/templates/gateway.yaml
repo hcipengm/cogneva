@@ -126,6 +126,16 @@ spec:
               value: {{ .Values.observability.eventLog.maxRows | int | quote }}
             - name: COGNEVA_OBSERVABILITY_EVENT_READ_WINDOW_SECS
               value: {{ .Values.observability.eventLog.readWindowSeconds | int | quote }}
+            # 续跑点存储的容量与读窗口。每轮巡检写一份新快照、把任务板指过去，然后
+            # 才删被替下的那份——所以任务板是指针的唯一权威，其余都是残物。任务结束
+            # 后最后那份没人删（任务板从不退役），于是这张表的大小是「活着的续跑点
+            # 加上每个跑完过的任务的最后一份」。两个数是一对：容量是清理目标，读窗口
+            # 与任务板指针是清理不许越过的两条线——删掉指针指着的那份等于让这个任务
+            # 再也续不上，而指针还在。属主由租约选举；置 0 = 本 Pod 不参与清理。
+            - name: COGNEVA_CHECKPOINT_MAX_ROWS
+              value: {{ .Values.checkpointStore.maxRows | int | quote }}
+            - name: COGNEVA_CHECKPOINT_READ_WINDOW_SECS
+              value: {{ .Values.checkpointStore.readWindowSeconds | int | quote }}
             # 本进程的花费属于哪个环境。token 账按这条轴回答「哪个环境烧的」，
             # 与 actor 轴（哪个组件烧的）正交——同一个组件在多个环境里跑，两个
             # 问题互不蕴含。控制面自己驱动平台的任务池，所以是 gateway_pool；

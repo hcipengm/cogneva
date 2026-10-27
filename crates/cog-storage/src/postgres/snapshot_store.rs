@@ -25,6 +25,9 @@ pub const DDL: &str = r#"
                 timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             CREATE INDEX IF NOT EXISTS idx_cog_snapshots_task_id ON cog_snapshots(task_id);
+            -- The capacity sweep deletes oldest-first below a cutoff, which is
+            -- one ordered scan of this index rather than a sort of the table.
+            CREATE INDEX IF NOT EXISTS idx_cog_snapshots_timestamp ON cog_snapshots(timestamp);
             "#;
 
 impl PostgresSnapshotStore {

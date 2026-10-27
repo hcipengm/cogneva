@@ -1457,6 +1457,46 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          keeps it at 0",
     ),
     (
+        "cogneva_checkpoints_rows",
+        "Rows currently held in the checkpoint store, one per resume point. \
+         Every finished task leaves its last checkpoint behind, because nothing \
+         retires a task board and the board is what names the snapshot worth \
+         keeping, so this number is the live resume set plus the last \
+         checkpoint of every task that has ever completed. Read it beside \
+         cogneva_checkpoints_budget_rows: the difference is what the sweep may \
+         still delete",
+    ),
+    (
+        "cogneva_checkpoints_budget_rows",
+        "Rows the checkpoint store is allowed to hold. The sweep deletes \
+         oldest-first past this, but never a row a board points at and never a \
+         row inside the read window -- those two are the floor, not the \
+         capacity",
+    ),
+    (
+        "cogneva_checkpoints_over_capacity",
+        "1 when the board pointers and the read window, and not the capacity, \
+         are what keep the checkpoint store above its budget. The sweep may not \
+         delete a resume point, so a live set larger than the budget leaves the \
+         store over capacity with nothing further to delete -- refusing is the \
+         correct outcome and this cell is what makes the refusal legible. \
+         Published only by a process that meant to prune",
+    ),
+    (
+        "cogneva_checkpoints_bytes",
+        "On-disk bytes the checkpoint store occupies, including indexes and \
+         TOAST. Lags the row count, since PostgreSQL frees deleted space only \
+         when it vacuums, so it is a reading and never the pruning criterion",
+    ),
+    (
+        "cogneva_checkpoint_sweep_failed",
+        "Whether the last checkpoint-store pass could not be completed, 1 or 0. \
+         The row count, the budget, the floor verdict and the bytes are stamped \
+         only once a pass returns, so a pass that fails leaves every one of them \
+         at its last value -- a sweep that cannot run and a store that is not \
+         growing look the same. Written on every pass",
+    ),
+    (
         "metrics_retired_rows_removed",
         "Rows of retired metric names the last release pass deleted, labelled \
          by the table they came from and by the deployment that ran the pass. \

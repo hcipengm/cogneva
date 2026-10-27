@@ -38,6 +38,7 @@ pub mod s3;
 pub mod tier;
 pub mod wal;
 
+pub mod checkpoint_cap;
 #[cfg(feature = "livekit")]
 pub mod media;
 #[cfg(feature = "meilisearch")]
@@ -105,6 +106,7 @@ pub use migrate::{
     MigrationStatus, Migrator,
 };
 
+pub use checkpoint_cap::{CheckpointCap, CheckpointSweepOutcome};
 pub use dlq::MemoryDeadLetterQueue;
 pub use metrics_retirement::{
     MetricsRetirement, RetirementOutcome, RetirementPass, SUPERSEDED_QUIET_SECS, SUPERSEDED_SHAPES,

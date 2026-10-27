@@ -257,6 +257,24 @@ jobs:
         run: cargo test -p cog-storage --test metrics_sample_cap -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Same shape one table over: the event log's sweep is one DELETE whose
+      # correctness is a claim about which rows a WHERE and an ORDER BY keep.
+      # The floor differs from the sample log's -- nothing inside the read
+      # window goes, whatever the capacity says -- and that difference only
+      # exists in the statement the server executes.
+      - name: Live-DB observability event capacity sweep
+        run: cargo test -p cog-storage --test observability_event_cap -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The checkpoint sweep has two floors rather than one: the read window and
+      # every board pointer. The pointer is an anti-join, so "a row some board
+      # names is never deleted" is a fact about the server and nothing else --
+      # the DB-free test beside it reads the statement's text, which cannot tell
+      # an anti-join that excludes from one that returns the same rows.
+      - name: Live-DB checkpoint capacity sweep
+        run: cargo test -p cog-storage --test checkpoint_cap -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Retention is one DELETE, and the exception inside it is what keeps the
       # table honest: read rows expire, unread rows do not, however old they are.
       # Dropping that predicate leaves a statement that still deletes, still

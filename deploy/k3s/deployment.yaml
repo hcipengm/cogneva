@@ -45,7 +45,7 @@ spec:
         # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。指纹同时覆盖 env 那份
         # cogneva-config（通知/告警出口地址在那里），只哈希卷里那份会让「配好地址但
         # 不重启」永远挂不上出口。
-        checksum/config: 551db7b7aa55b20eee288a04b35fcd179a7bd6fd92a606b21600f02af679a642
+        checksum/config: a0d8cd962aa425548f36859245fca8d5c7faa9841753fb5b401ddc8f96f7db77
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
@@ -133,6 +133,13 @@ spec:
             - name: COGNEVA_OBSERVABILITY_EVENT_MAX_ROWS
               value: "1000000"
             - name: COGNEVA_OBSERVABILITY_EVENT_READ_WINDOW_SECS
+              value: "86400"
+            # 续跑点存储的容量与读窗口，与 chart 的 checkpointStore 同源。任务板指着
+            # 的那份快照与读窗口内的行都不许删；两条地板合起来超过容量时清理停手并把
+            # cogneva_checkpoints_over_capacity 置 1。置 0 = 不清理。
+            - name: COGNEVA_CHECKPOINT_MAX_ROWS
+              value: "40000"
+            - name: COGNEVA_CHECKPOINT_READ_WINDOW_SECS
               value: "86400"
             # 本进程的花费属于哪个环境。token 账按这条轴回答「哪个环境烧的」，
             # 与 actor 轴（哪个组件烧的）正交——同一个组件在多个环境里跑，两个

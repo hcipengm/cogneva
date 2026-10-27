@@ -2223,6 +2223,36 @@
           "face": "可观测与告警"
         },
         {
+          "name": "checkpoint_store_over_capacity",
+          "promql": "(max without (pod, container, instance) (max_over_time(cogneva_checkpoints_over_capacity[30m]) and ((time() - cogneva_checkpoints_over_capacity_observed_timestamp_seconds) < 1800))) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The checkpoint store is over its row budget and the sweep can no longer bring it down: every row left is a resume point a task board names, or is inside the read window ({value} is 1 on each pass that reached this state in the last half hour). The store has two floors and this is the one that stops first. A checkpoint is only deletable when no board field names it -- the board is written before the snapshot it replaces is deleted, so the pointer is the only authority on what a task would resume from -- and nothing retires a board, so the live set is one row per task that has ever checkpointed, kept for good. The capacity decides how many rows may be kept; the pointers decide which rows may be deleted at all, and when the pointers alone exceed the capacity no pass can fix it. That is not a fault in the sweep and not a burst it will catch up on: the reading is a verdict, not a ratio, and every pass from here returns the same answer until someone moves a number. The same reading would be silent if the sweep had merely stopped running, because a stopped sweep deletes nothing and says so on the pass-outcome rule beside this one; what arrives here is the pass that ran and found only live rows. Three answers exist and none is a code change: raise the capacity, retire the boards of finished tasks (which ends their resumability), or accept the store's size -- and the third is what a deployment does by leaving this fired and reading it as a statement about how many tasks it has run. Rows are not bytes: PostgreSQL returns deleted space only when it vacuums, so the store can read at its budget while the volume keeps paying for dead tuples, and the bytes series is there to see that, never as the criterion. A series has to be one a writer is still behind before its value counts as an observation of this window -- the filter is an age bound on the companion _observed_timestamp_seconds -- so a process that stopped sweeping falls out by its own age instead of holding this rule fired forever.",
+          "face": "可观测与告警"
+        },
+        {
+          "name": "checkpoint_store_unpruned",
+          "promql": "((min_over_time(((min without (pod, container, instance) (cogneva_checkpoints_rows)) and ((time() - (max without (pod, container, instance) (cogneva_checkpoints_rows_observed_timestamp_seconds))) < 1800))[30m:1m]) > 1.05 * max without (pod, container, instance) (cogneva_checkpoints_budget_rows)) and (count_over_time((min without (pod, container, instance) (cogneva_checkpoints_rows))[1h:1m]) > count_over_time((min without (pod, container, instance) (cogneva_checkpoints_rows))[30m:1m])))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The checkpoint store has stayed above its row budget for half an hour ({value} was the lowest it got in that window). The sibling rule reads the state where the board pointers stop the sweep; this one reads the shape where the sweep is not running at all and the store just grows, which no other reading covers -- a sweep that never runs never reports a pass outcome either, so the pass-outcome rule stays quiet and the rows series keeps rising here. The window minimum is what makes this a verdict rather than a level: a sweep that runs puts the store back under the budget on every pass, so a reading only ever a little over is a burst of checkpointing being taken back rather than a store nobody is pruning, and the maximum over the window would report every checkpoint storm as a fault. Checkpointing happens in bursts -- a round writes one snapshot per agent of a running task -- so the minimum over half an hour is the reading that survives the burst. Read the over-capacity sibling before repairing: a 1 there means the sweep is running and the pointers are the wall, so the answer is a policy on the live set rather than a dead loop, while this rule alone firing means the store is being measured and is not being held down, and the place to look is the storage process that owns the loop. The 1.05 is slack a healthy cycle needs and not a target: it sits five percent above the budget, well over a day of ordinary checkpointing at this deployment's rate. It cannot fire when no budget is declared: the divisor is absent then, which is a deployment that never asked for a cap rather than a fault. A series also has to be one a writer is still behind before its value counts as an observation of this window -- the age bound on the companion _observed_timestamp_seconds -- so a process that stopped publishing falls out by its own age, and the second count over an hour refuses a claim about half an hour from a process younger than one.",
+          "face": "可观测与告警"
+        },
+        {
+          "name": "checkpoint_store_sweep_failed",
+          "promql": "(max without (pod, container, instance) (max_over_time(cogneva_checkpoint_sweep_failed[30m]) and ((time() - cogneva_checkpoint_sweep_failed_observed_timestamp_seconds) < 1800))) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The checkpoint store's pass could not be completed at some attempt in the last half hour, {value} being the highest outcome those attempts recorded. A pass measures the store and deletes what is over the budget beyond the read window and clear of every board pointer, and it returns either way; the row count, the budget, the floor verdict and the bytes are stamped only once it returns, so a pass that fails leaves all of them at their last values and the two rules beside this one go on reading a frozen store until their own half hour age bound closes them -- a sweep that cannot run and a store that is not growing then look the same. This is the reading that says the pass itself did not answer, and it is written on every pass rather than only the failed ones. The cause is the store query that refused, in that container's log; the loop's own liveness reading cannot see it, because the process beats whether or not its body finished. The count is taken once for the fleet rather than per process, because the rows live in the shared store and every replica serves the same table.",
+          "face": "可观测与告警"
+        },
+        {
           "name": "memory_decay_passes_all_failed",
           "promql": "(max without (pod, container, instance, job) (increase(cogneva_memory_decay_total{outcome=\"failed\"}[6h])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_memory_decay_total{outcome!=\"failed\"}[6h])) > 0)",
           "condition": {
