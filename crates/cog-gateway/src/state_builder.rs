@@ -105,6 +105,14 @@ pub async fn build_gateway_state(
     // 自报端点的两格先在读数面上写 0：不写的话，「一份都没进来」与「这个进程
     // 根本不发布这条读数」在抓取面上都是缺席，而它们的修法完全不同。
     crate::process_reports::publish_vocabulary(metrics_backend).await;
+    // 集群读的那条同理：探针还没跑过与这个进程不探集群，在抓取面上都是缺席。
+    crate::cluster::publish_vocabulary(metrics_backend).await;
+    // 拓扑/工作负载/配额那几面的读只在有人打开页面时发生，所以请求路径上的计数
+    // 只在有人看的时候动。探针把它变成一条与观众无关的读数。
+    drop(crate::cluster::spawn_read_probe(
+        metrics_backend.clone(),
+        shutdown.clone(),
+    ));
     let gateway_state = Arc::new(crate::GatewayState {
         config: std::sync::RwLock::new(config.gateway.clone()),
         data_dir: config.app.data_dir.clone(),

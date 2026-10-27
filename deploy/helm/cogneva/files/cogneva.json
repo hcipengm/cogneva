@@ -3474,6 +3474,16 @@
           "severity": "warning",
           "summary": "No container has pushed a process table to the gateway in fifteen minutes. Every long-lived subcommand running this image posts its own /proc table once a minute, and the gateway counts each one it takes; a window with nothing accepted means the path carried nothing, whatever the reason -- the reporter never started, the address it posts to moved (a Service port renamed, a path that no longer mounts on the internal router), a network policy stopped admitting this platform's own pods, or the receiving side is gone. All of those are silent: the request leaves, nothing answers, and no error surfaces anywhere. The topology face is where the loss shows up, and there it cannot be told apart from a third-party image that never reports at all -- the cell says the same sentence for both, so a reader looking at one container cannot separate 'that image does not report' from 'reports are being dropped fleet-wide'. Fifteen minutes is the reporter's own minute fifteen times over, which covers a rollout on either end (the gateway re-writes both cells at zero when it starts, so a restart does not leave the counter absent) and still names the fault inside a single scrape interval of most dashboards. The comparison is against zero rather than against any threshold: one accepted report is the path working, and this rule is not asking whether enough containers reported -- a fleet of third-party images reports nothing and that is not a fault. It cannot fire on a deployment that never published the series; an image that predates the counter reads as absent, which is a version fact rather than a path fact",
           "face": "可观测与告警"
+        },
+        {
+          "name": "cluster_read_failed",
+          "promql": "max without (pod, container, instance, outcome) (increase(cogneva_cluster_read_total{outcome=\"failed\"}[15m]))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The gateway's probe could not read {resource} from the apiserver {value} times in the last fifteen minutes. The topology, workload and quota panels read those collections on demand and draw nothing when a read fails, so on screen a refused read is indistinguishable from an empty cluster -- and because those reads only happen while someone has the page open, nothing noticed when a narrowed ClusterRole blanked the whole topology panel for hours. The probe issues the same reads at limit=1 once a minute whether or not anyone is looking, so this counter says the read path still works. Read it by resource: the resource named is the rule missing from the ClusterRole, and one resource failing beside the rest succeeding is a permission that was narrowed, not an apiserver that is down (an apiserver that is down fails every resource, and the nodes read fails first). It cannot distinguish a 403 from a wrong path or a renamed collector -- the probe records only that the read did not answer with a list -- so the fix starts by asking the pod's own log for the apiserver's status line",
+          "face": "可观测与告警"
         }
       ]
     },

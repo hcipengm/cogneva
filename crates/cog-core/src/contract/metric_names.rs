@@ -1031,6 +1031,25 @@ metric_names! {
     // rather than at the container.
     PROCESS_REPORT_INGEST_TOTAL => "cogneva_process_report_ingest_total",
 
+    // cog-gateway — whether the cluster reads behind the topology, workload and
+    // quota panels still work, by `resource` (the apiserver resource the face
+    // reads) and `outcome` (ok / failed).
+    //
+    // The face answers a failed read by leaving a gap on screen, and a gap is
+    // what "there is nothing there" looks like: on 2026-10-27 a ClusterRole that
+    // granted `pods` but not the two cluster-wide list paths it had just started
+    // reading left the whole topology panel empty for hours with no error
+    // anywhere except the JSON body nobody was reading. The reads only happen
+    // when someone opens the page, so nothing polled them and nothing could
+    // notice them stopping.
+    //
+    // Both cells are published at zero on startup, for the reason the ingest
+    // counter above states: absence means this process does not publish the
+    // reading, zero means the probe ran and everything answered. The probe is
+    // what makes the reading independent of a viewer -- a browser tab is not a
+    // monitor.
+    CLUSTER_READ_TOTAL => "cogneva_cluster_read_total",
+
     // cog-gateway — LLM pool and upstream health.
     LLM_CALLS_TOTAL => "llm_calls_total",
     LLM_CALL_LATENCY_MS => "llm_call_latency_ms",

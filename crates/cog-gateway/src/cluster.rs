@@ -654,6 +654,152 @@ fn event_list_path() -> &'static str {
     "/api/v1/events"
 }
 
+/// 一条集群读在指标上留下的两格。**closed set，两格都在启动时写 0。**
+pub const READ_OK: &str = "ok";
+pub const READ_FAILED: &str = "failed";
+
+/// 探针循环的名字：停在 `cogneva_loop_tick_age_seconds` 上，停滞规则按它自己
+/// 声明的周期判。
+pub const READ_PROBE_LOOP: &str = "cluster_read_probe";
+
+/// 探针的周期。
+///
+/// 一分钟：比面板的 10 秒轮询慢得多，因为探针要答的是「这条读还通不通」，
+/// 不是「此刻集群里有什么」。授权被收窄这种事以小时计，一分钟足够在有人第一次
+/// 打开页面之前就把它变成一条告警；再快只是在 apiserver 上多花请求，而这一面
+/// 每次只读一行（`limit=1`）。
+pub const READ_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 探针要读的每一条集合：(资源名, 路径)。
+///
+/// 路径从**面板自己用的那几个构造函数**来，而不是在这里另抄一份：两份路径表迟早
+/// 有一份先改，而那时探针会替一条已经不存在的读报健康，或者反过来把一条好读报红。
+/// 资源名是 apiserver 的名字（`deployments`、`persistentvolumeclaims`），因为告警
+/// 要拿它去点 RBAC 里缺的那条规则。
+///
+/// 不探的两条读，各有各的理由：`/version` 任何已认证身份都读得到，它失败说明的
+/// 是 apiserver 不在，而那时节点那一读已经红了；`metrics.k8s.io/pods` 与
+/// `nodes/<n>/proxy/stats/summary` 是**可选**用量来源，没装 metrics-server 的集群
+/// 上它们本来就该 403，把可选的缺席报成故障就是一张永远亮着的红条。
+pub fn read_targets(namespace: &str) -> Vec<(&'static str, String)> {
+    let mut targets = vec![
+        ("nodes", "/api/v1/nodes".to_string()),
+        ("pods", "/api/v1/pods".to_string()),
+        ("persistentvolumeclaims", pvc_list_path().to_string()),
+        ("events", event_list_path().to_string()),
+        (
+            "resourcequotas",
+            format!("/api/v1/namespaces/{namespace}/resourcequotas"),
+        ),
+        (
+            "limitranges",
+            format!("/api/v1/namespaces/{namespace}/limitranges"),
+        ),
+    ];
+    for kind in WorkloadKind::ALL {
+        let resource = kind.resource();
+        // 裸 Pod 那条按命名空间读，与上面集群范围那一读是**同一条授权**
+        // （`pods` 的 list 不分范围），探两遍只会让同一个故障在两格里各报一次。
+        if targets.iter().any(|(name, _)| *name == resource) {
+            continue;
+        }
+        targets.push((resource, kind.list_path(namespace)));
+    }
+    targets
+}
+
+/// 把一条读的结局写进指标。没有指标后端时什么都不写：这一面本身不依赖它。
+async fn publish_read(
+    metrics: &Option<std::sync::Arc<dyn cog_core::MetricsBackend>>,
+    resource: &str,
+    outcome: &str,
+    value: f64,
+) {
+    let Some(backend) = metrics.as_ref() else {
+        return;
+    };
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(crate::LABEL_OUTCOME.to_string(), outcome.to_string());
+    labels.insert("resource".to_string(), resource.to_string());
+    let _ = backend
+        .record_counter(cog_core::metric_names::CLUSTER_READ_TOTAL, value, labels)
+        .await;
+}
+
+/// 启动时把每一格写成 0。
+///
+/// 不写这一步，一个从没探过的网关与一条根本不发布这条读数的网关在抓取面上同形：
+/// 两格都缺席。写了 0 之后，缺席只意味着「这个进程不发布这条读数」，0 意味着探针
+/// 跑过、每一条读都答了——那是两种不同的状态，修法也不同。
+pub async fn publish_vocabulary(metrics: &Option<std::sync::Arc<dyn cog_core::MetricsBackend>>) {
+    let namespace = KubeClient::in_cluster()
+        .map(|client| client.namespace().to_string())
+        .unwrap_or_else(|_| "cogneva".to_string());
+    for (resource, _) in read_targets(&namespace) {
+        for outcome in [READ_OK, READ_FAILED] {
+            publish_read(metrics, resource, outcome, 0.0).await;
+        }
+    }
+}
+
+/// 探一遍这一面要读的每一条集合，把结局写进 `cogneva_cluster_read_total`。
+pub(crate) async fn probe_reads(
+    client: &KubeClient,
+    metrics: &Option<std::sync::Arc<dyn cog_core::MetricsBackend>>,
+) {
+    for (resource, path) in read_targets(client.namespace()) {
+        // `limit=1`：探的是这条读通不通，不是它返回什么。一次读回整个集群的 Pod
+        // 只为判权限，是把每分钟一次的探针变成了真正的负载。
+        let outcome = match client.get_json(&format!("{path}?limit=1")).await {
+            Ok(_) => READ_OK,
+            Err(_) => READ_FAILED,
+        };
+        publish_read(metrics, resource, outcome, 1.0).await;
+    }
+}
+
+/// 起探针循环。
+///
+/// 为什么要循环、而不是只在请求路径上计数：这一面的读**只在有人打开页面时发生**
+/// （`/api/v1/cluster/topology` 是按请求算的），所以请求路径上的计数器只在一个浏览器
+/// 标签开着的时候才动——那是「有人正在看」，不是监控。2026-10-27 的现场是：一条
+/// ClusterRole 少授了两条集合读，拓扑面在屏上整块空白了几个小时，没有任何读数说出
+/// 这件事，因为那段时间没人在看。
+///
+/// 不在集群里（本机开发、没有 ServiceAccount）时启动即返回：探不到不是错，缺的是
+/// 数据源，而那条事实由「序列缺席」表达。
+pub fn spawn_read_probe(
+    metrics: Option<std::sync::Arc<dyn cog_core::MetricsBackend>>,
+    shutdown: cog_core::shutdown::ShutdownSignal,
+) -> tokio::task::JoinHandle<()> {
+    let stop = shutdown.clone();
+    cog_core::loop_health::spawn(
+        READ_PROBE_LOOP,
+        cog_core::loop_health::Cadence::Periodic(READ_PROBE_INTERVAL),
+        shutdown,
+        move |beat| {
+            let metrics = metrics.clone();
+            let stop = stop.clone();
+            async move {
+                let Ok(client) = KubeClient::in_cluster() else {
+                    return;
+                };
+                let mut interval = tokio::time::interval(READ_PROBE_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    beat.beat();
+                    tokio::select! {
+                        biased;
+                        _ = stop.wait() => return,
+                        _ = interval.tick() => {}
+                    }
+                    probe_reads(&client, &metrics).await;
+                }
+            }
+        },
+    )
+}
+
 fn claims_by_name(list: &Value) -> std::collections::HashMap<String, ClaimView> {
     let mut claims = std::collections::HashMap::new();
     let Some(items) = list.get("items").and_then(Value::as_array) else {
@@ -1640,7 +1786,7 @@ fn limits_from(list: &Value) -> Vec<LimitView> {
         .collect()
 }
 
-/// 这一面认的五个工种，顺序就是它们在页面上的顺序。
+/// 这一面认的六种工作负载，顺序就是它们在页面上的顺序。
 ///
 /// 常驻的排在前面、一次性的排在后面：Job 一天能攒几十个（每次主线部署、每次备份演练
 /// 各一个），排在后面才不会把「谁在跑第几版」淹掉。
@@ -1678,6 +1824,22 @@ impl WorkloadKind {
             WorkloadKind::CronJob => "CronJob",
             WorkloadKind::Job => "Job",
             WorkloadKind::Pod => "Pod",
+        }
+    }
+
+    /// apiserver 上的资源名，与 [`WorkloadKind::as_str`] 的界面名不是一回事：
+    /// 界面名给人看（`StatefulSet`），资源名给 RBAC 对（`statefulsets`）。
+    ///
+    /// 裸 Pod 落 `pods`，与集群范围那一读同一个名字——两边读的是同一种资源，
+    /// 一次 403 会同时打在两条路径上，分成两格只会让同一个故障报两遍。
+    pub fn resource(self) -> &'static str {
+        match self {
+            WorkloadKind::Deployment => "deployments",
+            WorkloadKind::StatefulSet => "statefulsets",
+            WorkloadKind::DaemonSet => "daemonsets",
+            WorkloadKind::CronJob => "cronjobs",
+            WorkloadKind::Job => "jobs",
+            WorkloadKind::Pod => "pods",
         }
     }
 

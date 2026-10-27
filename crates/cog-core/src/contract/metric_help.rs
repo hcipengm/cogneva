@@ -298,6 +298,24 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          reports' and never 'how many containers are visible'",
     ),
     (
+        "cogneva_cluster_read_total",
+        "Attempts to read each apiserver collection the topology, workload and \
+         quota panels are built from, by `resource` and `outcome` (ok, failed). \
+         Those panels read on demand, so a read that starts answering 403 leaves \
+         a gap on screen and nothing else: the page still draws, the empty \
+         columns read as 'nothing is there', and a browser tab is not a monitor. \
+         A background probe issues the same reads at `limit=1` and writes both \
+         outcomes here, so the fault survives closing the tab. Read it by \
+         `resource`: the resource that failed names the rule missing from the \
+         ClusterRole, and `failed` on one resource beside `ok` on the rest is a \
+         permission that was narrowed, not an apiserver that is down. Both cells \
+         are written at zero when the gateway starts, so an absent series says \
+         this process does not publish the reading -- a different fact from a \
+         window in which every read answered. The probe is not the panel: it \
+         proves the read path and the permissions, not that what came back was \
+         enough to draw (an empty list is still an ok)",
+    ),
+    (
         "cogneva_landing_failures_total",
         "Landing calls that failed, one per attempt, by category. A landing \
          failure is otherwise a single log line inside a loop that then moves \
