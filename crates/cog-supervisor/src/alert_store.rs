@@ -280,6 +280,78 @@ impl cog_core::AlertStore for AlertStore {
 mod tests {
     use super::*;
 
+    /// 告警存在哪个 `event_type` 下，就是事件在线上写的那个 `type`。
+    ///
+    /// 这两套字以前各写各的：事件的名字由 serde 按变体名派生，告警这边的名字
+    /// 是手打的。名字对不上不会报错——按事件名查告警的人查到空，而"没有这类
+    /// 告警"与"这一类事件从来没被记成告警"是同一种空。
+    #[test]
+    fn an_alert_is_stored_under_the_name_the_event_is_written_with() {
+        let now = Utc::now();
+        let events = [
+            SupervisorEvent::AgentUnhealthy {
+                agent_id: "a".into(),
+                issue: cog_core::HealthIssue::Dead { last_seen: now },
+                timestamp: now,
+            },
+            SupervisorEvent::QuotaThresholdBreached {
+                workspace_id: "w".into(),
+                remaining: 1,
+                threshold: 2,
+                scheduler_paused: false,
+                timestamp: now,
+            },
+            SupervisorEvent::AgentResourceAlert {
+                agent_id: "a".into(),
+                metric: "cpu".into(),
+                threshold: 1.0,
+                current: 2.0,
+                timestamp: now,
+            },
+            SupervisorEvent::TaskDeadLetter {
+                task_id: "t".into(),
+                agent_id: None,
+                crew_id: None,
+                retry_count: 1,
+                timestamp: now,
+            },
+            SupervisorEvent::SquadRespawnRequested {
+                crew_id: "c".into(),
+                squad_id: None,
+                reason: "r".into(),
+                timestamp: now,
+            },
+            SupervisorEvent::LlmUpstreamPoolDown {
+                evidenced_recovery_unix: 0,
+                next_attempt_unix: 0,
+                unavailable: Vec::new(),
+                pool_size: 1,
+                declared_min_healthy: None,
+                quota_window_secs: 0,
+                timestamp: now,
+            },
+            SupervisorEvent::LlmUpstreamPoolRecovered { timestamp: now },
+        ];
+        for event in events {
+            let alert = AlertStore::event_to_alert(&event).expect("这类事件必须产生告警");
+            let wire = serde_json::to_value(&event).expect("事件可序列化");
+            let wire_name = wire
+                .get("type")
+                .and_then(|v| v.as_str())
+                .expect("每个变体都带 type 标签");
+            if matches!(event, SupervisorEvent::LlmUpstreamPoolRecovered { .. }) {
+                // 恢复事件挂在 Down 的同一个键下：状态机按同键 resolve，
+                // 换一个名字就会把一次恢复记成一条新的未解决告警。
+                assert_eq!(alert.event_type, "llm_upstream_pool_down");
+                continue;
+            }
+            assert_eq!(
+                alert.event_type, wire_name,
+                "告警的 event_type 与事件在线上写的 type 是两套字"
+            );
+        }
+    }
+
     #[test]
     fn pool_down_maps_to_critical_unresolved_alert() {
         let event = SupervisorEvent::LlmUpstreamPoolDown {
