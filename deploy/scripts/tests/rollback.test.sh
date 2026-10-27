@@ -48,6 +48,21 @@ git -C "$FIX" init -q
 git -C "$FIX" config user.email t@example.com
 git -C "$FIX" config user.name t
 printf 'kind: ConfigMap\nmetadata:\n  name: old\n' > "$FIX/deploy/rendered/k3s-single/10-configmap.yaml"
+# 三个 Deployment：用例 3 要它们被逐个等。用例 9d 再加一个，证明那份要等的名单是
+# 从**这一版清单**里读的——写死三个名字时，第四个既不会被等，也不会被数出来。
+cat > "$FIX/deploy/rendered/k3s-single/41-deployment.yaml" <<'EOF'
+kind: Deployment
+metadata:
+  name: cogneva
+---
+kind: Deployment
+metadata:
+  name: cogneva-evolution
+---
+kind: Deployment
+metadata:
+  name: cogneva-security-gateway
+EOF
 # 第二棵树：它不在任何名单里。用例 9c 用它证明 profile 的闭集是这一版
 # `deploy/rendered/` 下的目录，而不是脚本里抄的那三个名字。
 mkdir -p "$FIX/deploy/rendered/k3s-airgap"
@@ -149,7 +164,7 @@ fi
 
 # 8. 目录在但是空的（一份 yaml 都没有）⇒ 拒绝：apply 空目录会退 0。
 git -C "$FIX" checkout -q -b emptydir "$old_rev"
-git -C "$FIX" rm -q deploy/rendered/k3s-single/10-configmap.yaml
+git -C "$FIX" rm -q deploy/rendered/k3s-single/10-configmap.yaml deploy/rendered/k3s-single/41-deployment.yaml
 mkdir -p "$FIX/deploy/rendered/k3s-single"
 printf 'not yaml\n' > "$FIX/deploy/rendered/k3s-single/README.txt"
 git -C "$FIX" add -A && git -C "$FIX" commit -qm "empty rendered"
@@ -200,6 +215,52 @@ if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q '缺 --to'; then
     ok "没有 --to 时是用法错，不是「回滚到当前」"
 else
     bad "没有 --to 那一趟不对（rc=$rc）：$(printf '%s' "$out" | tr '\n' ' ')"
+fi
+
+# 9e. --wait 对一棵**没有** Deployment 的树判不了：等不到东西不等于就绪。
+# 写死名单时这里会照样「等」那三个名字，然后报 ready——而那一版的树里根本没有它们。
+: > "$WORK/calls"
+out="$(run --repo "$FIX" --to "$old_rev" --profile k3s-airgap --apply --wait)"
+rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q '一个 Deployment 都没有'; then
+    ok "--wait 在没有 Deployment 的那一版判不了，而不是报 ready"
+else
+    bad "没有 Deployment 的一版没有判不了（rc=$rc）：$(printf '%s' "$out" | tr '\n' ' ')"
+fi
+
+# 9d. 要等哪几个 Deployment 是从这一版清单里读的：多一个就多等一个。
+# 写死三个名字时，第四个既不会被等，也不会被数出来——回滚报 ready 而它还没起来。
+git -C "$FIX" checkout -q master 2>/dev/null || git -C "$FIX" checkout -q main
+mkdir -p "$FIX/deploy/rendered/k3s-single"
+cat > "$FIX/deploy/rendered/k3s-single/41-deployment.yaml" <<'EOF'
+kind: Deployment
+metadata:
+  name: cogneva
+---
+kind: Deployment
+metadata:
+  name: cogneva-evolution
+---
+kind: Deployment
+metadata:
+  name: cogneva-security-gateway
+---
+kind: Deployment
+metadata:
+  name: cogneva-registry
+EOF
+printf 'kind: ConfigMap\nmetadata:\n  name: new\n' > "$FIX/deploy/rendered/k3s-single/10-configmap.yaml"
+git -C "$FIX" add deploy/rendered && git -C "$FIX" commit -qm "a fourth workload"
+extra_rev="$(git -C "$FIX" rev-parse HEAD)"
+: > "$WORK/calls"
+out="$(run --repo "$FIX" --to "$extra_rev" --apply --wait)"
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(grep -c 'rollout status deployment/' "$WORK/calls")" -eq 4 ] \
+   && grep -q 'deployment/cogneva-registry' "$WORK/calls" \
+   && printf '%s' "$out" | grep -q 'deployments=4'; then
+    ok "要等的 Deployment 从这一版清单里读：多出来的那个也被等、也被数"
+else
+    bad "第四个 Deployment 没被等（rc=$rc）：$(cat "$WORK/calls" 2>/dev/null | tr '\n' ' ')"
 fi
 
 printf '\nrollback.test: %s passed, %s failed\n' "$pass" "$fail"
