@@ -20,6 +20,10 @@
 # Web Build / Bootstrap Cross-Platform —— 它们要编译或要 Node，本机跑一遍可能比 CI
 # 还慢。末尾会把这份清单印出来：**这条门绿不等于 CI 绿**，它只保证那几类「改动碰了
 # 别的面的读者」的判据不是推上去才发现的。
+#
+# Test 里有一个例外：容量登记表那条测试（`rust_capacity_constants_registry_test.rs`）
+# 在本机是秒级的纯文本扫描，所以它单独在这里跑（见下面那段为什么走 `rustc`）。Test 作业
+# 整体仍然不覆盖——这一格补的是「加常量不补登记表」这一个具体的红，不是那个作业。
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -110,6 +114,32 @@ mapfile -t script_tests < <(printf '%s\n' deploy/scripts/tests/*.test.sh .github
 for t in "${script_tests[@]}"; do
     run_step "${t}" bash "${t}"
 done
+
+# 容量登记表：`crates/cogneva/tests/rust_capacity_constants_registry_test.rs` 是**唯一**
+# 会因为「新写了一个 Rust 常量」而红的门，而它只住在 CI 的 Test 里。一夜三次实测
+# （`9e6aebd1`、`60b33d98`，每次约 20 分钟流水线停摆）：有人加了个常量、没补登记表、
+# 推上去 CI 红、部署器按设计停住，补登记表的那一步却是在本机几秒钟的事。
+#
+# 走 `rustc` 而不是 `cargo test`：这条判据是纯文本扫描，不依赖任何 crate，而 `cargo`
+# 要先把整个 `cogneva` 连同它的测试 harness 链出来——同一棵树上实测 55 秒（判定本身
+# 只占 2.7 秒）。直接把这个**同一个文件**编成测试 harness 跑，1 秒编译 + 3 秒判定，
+# 判据仍只有一份，两条路喂给同一条判据。
+capreg_src="crates/cogneva/tests/rust_capacity_constants_registry_test.rs"
+capreg_rustc="$(command -v rustc || true)"
+[ -n "${capreg_rustc}" ] || [ ! -x "${HOME}/.cargo/bin/rustc" ] || capreg_rustc="${HOME}/.cargo/bin/rustc"
+capreg_bin="${TMPDIR:-/tmp}/cogneva-capreg.$$"
+if [ -z "${capreg_rustc}" ]; then
+    # 与 pwsh 那一格同一条规矩：跑不了要说出来，不能安静跳过。
+    echo "SKIP  容量登记表：本机没有 rustc（CI 的 Test 会跑这一步）"
+elif CARGO_MANIFEST_DIR="${root}/crates/cogneva" "${capreg_rustc}" --test --edition 2021 \
+        -o "${capreg_bin}" "${capreg_src}"; then
+    run_step "容量登记表（${capreg_src}，经 rustc 直接编）" "${capreg_bin}"
+    rm -f "${capreg_bin}"
+else
+    # 编不出来同样是红：那是「这条判据在本机跑不起来」，不是「判据过了」。
+    echo "RED   容量登记表：这份测试编不出来，本机跑不了它" >&2
+    failures=$((failures + 1))
+fi
 
 # ShellCheck：清单同样由 git 推出来，与 CI 同一条命令。
 mapfile -t shell_scripts < <(git ls-files '*.sh')

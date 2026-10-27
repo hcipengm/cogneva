@@ -428,11 +428,11 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
         .collect();
     assert!(
         missing.is_empty() && stale.is_empty(),
-        "the capacity registry is out of step with the tree.\n\
-         New or changed numbers (register them, saying which reading they follow or why they \
-         are a bound):\n{}\nStale rows (the constant is gone; regenerate):\n{}\n\
-         Regenerate with COGNEVA_CAPACITY_REGISTRY_WRITE=1 cargo test -p cogneva --test \
-         rust_capacity_constants_registry_test",
+        "the capacity registry ({REGISTRY}) is out of step with the tree.\n\
+         New or changed numbers (add a row for each, saying which reading it follows or why it \
+         is a bound):\n{}\nStale rows (the constant is gone; regenerate):\n{}\n\
+         Regenerate, then edit the rows this printed: COGNEVA_CAPACITY_REGISTRY_WRITE=1 \
+         cargo test -p cogneva --test rust_capacity_constants_registry_test",
         missing.join("\n"),
         stale.join("\n")
     );
