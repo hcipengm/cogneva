@@ -9874,6 +9874,7 @@ mod tests {
     // 把它们带进来。产出面两个模块互不调用这一点不为此放宽——这里带进来的每一项，
     // 在产出面都只有那一侧在用。
     use crate::mainline_rollout::still_worth_asking;
+    use crate::mainline_rollout::wait_exhausted_reason;
     use crate::mainline_rollout::{
         admission_hold_dimension, admission_rejection, admission_shortfall,
         bundle_declared_containers, changed_configmaps, changed_workloads,
@@ -14695,6 +14696,29 @@ exec {real} "$@"
                 "{kind:?} 不该被等"
             );
         }
+    }
+
+    /// 「等到界也没等到」与「问了一句还在跑」在 `state.json` 里必须是两句话。
+    ///
+    /// 判词是这一轮唯一会被下一轮读到的东西（这一轮的日志不会被任何消费者读），所以
+    /// 等了多久、界是多少必须写进判词：界比上游一次完整判定短时，现场长的就是这一句，
+    /// 而它一出现，读的人就知道该放宽界或者去看流水线为什么这么久，不是去看这一版有
+    /// 什么问题。少了这两个数，两种现场共用一句「still running on github」。
+    #[test]
+    fn a_wait_that_hits_its_bound_carries_both_numbers_into_the_verdict() {
+        use std::time::Duration;
+        let why = "upstream CI is still running on github";
+        let waited = Duration::from_secs(CI_PENDING_WAIT_SECS + 7);
+        let reason = wait_exhausted_reason(waited, why);
+        assert!(reason.contains(why), "判词丢了上游那句现场：{reason}");
+        assert!(
+            reason.contains(&format!("{}s", waited.as_secs())),
+            "判词里没有「等了多久」，它与「问了一句还在跑」就分不开：{reason}"
+        );
+        assert!(
+            reason.contains(&format!("{CI_PENDING_WAIT_SECS}s")),
+            "判词里没有界是多少，读的人就不知道该不该放宽它：{reason}"
+        );
     }
 
     /// 「一次都没问到」不是「问了、没问题」。这一条就是 2026-10-27 那次带红上线的

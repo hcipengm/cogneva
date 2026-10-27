@@ -77,11 +77,40 @@ pub(crate) const CI_ASK_BUDGET_SECS: u64 = 180;
 /// 「还在跑」与「没问到」必须分开处置：后者是路不通，等也没用；前者是判词还在
 /// 生产，再问一句就有。只等这一种，且等到有上界为止——无限等会让 Job 的期限名不
 /// 副实，到点被杀还走不到 Job 自己的回滚。
-pub(crate) const CI_PENDING_WAIT_SECS: u64 = 900;
+///
+/// 上界要盖住**上游一次完整判定**，不是盖住「第一次答还在跑」：等待从第一次提问
+/// 起算，而那时判词还没开始存在，CI 从起跑到最后一条结论的整段都落在等待里。同一
+/// 夜连续十版实测这一段是 11.2 / 11.9 / 11.9 / 12.6 / 13.4 / 13.9 / 15.3 / 16.0 /
+/// 16.0 / 16.3 分钟（最长 16.3），再加派发侧 30 秒到 10 分钟的滞后——900 秒的界
+/// 正好横在中间，镜像构建快的那一版必然在判词出来之前被扣住，而扣住一次这一版就
+/// 不再被滚，「界比它等的东西短」于是自己成了停摆的成因。
+///
+/// 30 分钟是这段实测最长值的 1.8 倍：盖得住最长的一次判定加派发滞后，又不至于让
+/// 一条真卡死的流水线把每一轮占住半小时——那种情况下游也是卡死的，多等不额外损失
+/// 什么，而每一轮都还能在界内走完自己的回滚。
+///
+/// 派发侧还有一条：正在滚的那一版**不会**被新提交顶掉（`in_flight` 只在结束后才
+/// 前进），所以这段等待等到的结论一定会被用上，不是白等。
+pub(crate) const CI_PENDING_WAIT_SECS: u64 = 1800;
 
 /// 等在里面的复问间隔（秒）。一次 CI 判定的粒度是分钟级，问得比这密只是把同一个
 /// 答案多读几遍。
 pub(crate) const CI_PENDING_REASK_SECS: u64 = 60;
+
+/// 「还在跑」等到了界时，这一轮的判词。
+///
+/// 判词必须带上「等了多久」与「界是多少」：没有这两个数，「等到界也没等到」与
+/// 「问了一句还在跑」在 `state.json` 里是同一句话，而两者下一次要做的事不一样——
+/// 前者要么把界放宽、要么去看流水线为什么这么久，后者什么都不用做。判词是唯一会
+/// 被下一轮读到的东西（这一轮的日志不会被任何消费者读），所以读数写在这里。
+pub(crate) fn wait_exhausted_reason(waited: Duration, why: &str) -> String {
+    format!(
+        "{why} -- asked again for {}s, the whole {}s this round is allowed to wait, and the \
+         answer never finished on its own; the wait itself is the verdict",
+        waited.as_secs(),
+        CI_PENDING_WAIT_SECS
+    )
+}
 
 /// 「还在跑」这一答到手之后，这一轮还该不该再问一次。
 ///
@@ -3773,6 +3802,18 @@ impl RolloutExecutor {
                          holding the round, because this answer finishes on its own"
                     );
                     tokio::time::sleep(Duration::from_secs(CI_PENDING_REASK_SECS)).await;
+                }
+                Some((kind, why)) if kind == CiHoldKind::Pending => {
+                    // 等到了界：这一句要单独印，因为「还在跑」这一次不是判词还没产生，
+                    // 而是这一轮不再等它了——两者的下游动作完全不同。
+                    warn!(
+                        rev = %ask.rev,
+                        waited_secs = waiting_since.elapsed().as_secs(),
+                        wait_budget_secs = CI_PENDING_WAIT_SECS,
+                        "the upstream CI answer stayed \"still running\" past the wait bound; \
+                         the wait itself is the verdict for this round"
+                    );
+                    return Some((kind, wait_exhausted_reason(waiting_since.elapsed(), &why)));
                 }
                 other => return other,
             }
