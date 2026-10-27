@@ -11,7 +11,9 @@
 //!
 //! 1. 带 `hostPID` 起，于是 `/proc` 是宿主的那一份，`/proc/<pid>/comm` 读得到任何进程；
 //! 2. 宿主的 cgroup 根只读挂进来，按 `cri-containerd-<id>.scope` 找叶子——一个叶子就是
-//!    一个容器实例，目录名里那串 id 与 Pod 状态里的 `containerID` 是同一个；
+//!    一个容器实例，目录名里那串 id 与 Pod 状态里的 `containerID` 是同一个。往上一层
+//!    (`kubepods-<qos>-pod<uid>.slice`) 写着这个 Pod 的 uid，一起报上去：Pod 的沙箱
+//!    容器不在 `containerStatuses` 里，只按容器 id 认领的话它永远没有位置；
 //! 3. 叶子的 `cgroup.procs` 给出这个容器的全部 PID，逐个读 `/proc/<pid>/{stat,comm,statm}`。
 //!
 //! 这条路径上唯一的权限是「看得到宿主进程」。它读不到别人的内存、改不了别人的状态，
@@ -66,6 +68,14 @@ struct Envelope<'a> {
 #[derive(Debug, Serialize)]
 struct ContainerReport {
     container_id: String,
+    /// 这个容器所在 Pod 的 uid；不在 Pod slice 下的容器没有这一项。
+    ///
+    /// 为什么要报它：Pod 里那个沙箱容器（pause）自己有一个 cgroup 叶子、有一份进程表，
+    /// 但 Kubernetes 不把它写进 `containerStatuses`——于是按容器 id 认领的话，它永远
+    /// 认领不上，屏上就会把它算成「有进程读数、却没有位置」的那一堆。它其实有位置：
+    /// 它就是那个 Pod。cgroup 路径里写着 Pod 的 uid，那是这一层唯一读得到的归属。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pod_uid: Option<String>,
     processes: Vec<ReportedProcess>,
 }
 
@@ -86,13 +96,46 @@ pub fn container_id_of_dir(name: &str) -> Option<String> {
 ///
 /// 读不到（目录不在、权限不对、这一拍正好没有容器）就是空表——不是错误：采集器在
 /// 一个空的节点上也该报「我在，什么都没有」。
-pub fn scan(root: &Path) -> BTreeMap<String, Vec<ReportedProcess>> {
+pub fn scan(root: &Path) -> BTreeMap<String, ScannedContainer> {
     let mut out = BTreeMap::new();
-    walk(root, 0, &mut out);
+    walk(root, 0, None, &mut out);
     out
 }
 
-fn walk(dir: &Path, depth: usize, out: &mut BTreeMap<String, Vec<ReportedProcess>>) {
+/// 扫到的一个容器实例：它属于哪个 Pod，以及里面的进程表。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScannedContainer {
+    /// 它所在 Pod 的 uid（连字符形式，与 `metadata.uid` 一致）；不在 Pod 下的没有。
+    pub pod_uid: Option<String>,
+    pub processes: Vec<ReportedProcess>,
+}
+
+/// 一个目录名是不是某个 Pod 的 slice；是就给出那个 Pod 的 uid。
+///
+/// systemd 驱动把 uid 里的 `-` 写成 `_`（`kubepods-burstable-pod1288f852_f85f_...slice`），
+/// 而 `metadata.uid` 用的是连字符，所以这里换回来，两边才能对上。判据要求后面那截
+/// 够长且只由十六进制与下划线组成：`-pod` 只可能是分隔符，不可能是 uid 的一部分。
+pub fn pod_uid_of_dir(name: &str) -> Option<String> {
+    // Pod 那一层是 `.slice`，不是容器的 `.scope`：名字里剩下的那截 `.slice` 不是
+    // 十六进制，不去掉的话下面那条判据会把每一个 Pod 都判成「不是 Pod」。
+    let base = name.strip_suffix(".slice").unwrap_or(name);
+    let (_, uid) = base.rsplit_once("-pod")?;
+    let candidate = uid.replace('_', "-");
+    let hex_len = candidate
+        .chars()
+        .filter(|c| *c != '-')
+        .filter(|c| c.is_ascii_hexdigit())
+        .count();
+    (hex_len >= 32 && candidate.chars().all(|c| c == '-' || c.is_ascii_hexdigit()))
+        .then_some(candidate)
+}
+
+fn walk(
+    dir: &Path,
+    depth: usize,
+    pod_uid: Option<&str>,
+    out: &mut BTreeMap<String, ScannedContainer>,
+) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -114,10 +157,20 @@ fn walk(dir: &Path, depth: usize, out: &mut BTreeMap<String, Vec<ReportedProcess
             Some(id) => {
                 let processes = cgroup_processes(&child);
                 if !processes.is_empty() {
-                    out.insert(id, processes);
+                    out.insert(
+                        id,
+                        ScannedContainer {
+                            pod_uid: pod_uid.map(str::to_string),
+                            processes,
+                        },
+                    );
                 }
             }
-            None => walk(&child, depth + 1, out),
+            None => {
+                // 走到 Pod 层就把归属带下去：它的子目录是容器，孙目录不会再是 Pod。
+                let found = pod_uid_of_dir(name);
+                walk(&child, depth + 1, found.as_deref().or(pod_uid), out);
+            }
         }
     }
 }
@@ -227,9 +280,10 @@ impl Census {
     async fn report_once(&self) {
         let reports: Vec<ContainerReport> = scan(&self.root)
             .into_iter()
-            .map(|(container_id, processes)| ContainerReport {
+            .map(|(container_id, scanned)| ContainerReport {
                 container_id,
-                processes,
+                pod_uid: scanned.pod_uid,
+                processes: scanned.processes,
             })
             .collect();
         // 一个容器都没有也照发：这一拍同时是「这台节点我在」的活体，而「采集器在跑、
@@ -271,9 +325,13 @@ mod tests {
         assert_eq!(container_id_of_dir("system.slice"), None);
     }
 
+    /// 一个真实的 Pod uid 在 slice 名里的写法：连字符换成下划线。
+    const POD_SLICE: &str = "kubepods-burstable-pod1288f852_f85f_4fce_a027_9fffbdcb0f26.slice";
+    const POD_UID: &str = "1288f852-f85f-4fce-a027-9fffbdcb0f26";
+
     fn tree(root: &Path) {
         let qos = root.join("kubepods.slice/kubepods-burstable.slice");
-        let pod = qos.join("kubepods-burstable-podaaaa.slice");
+        let pod = qos.join(POD_SLICE);
         std::fs::create_dir_all(pod.join(format!("cri-containerd-{A}.scope"))).unwrap();
         std::fs::create_dir_all(pod.join(format!("cri-containerd-{B}.scope"))).unwrap();
         // 一个空叶子：容器刚起、或者已经退出。它不该出现在读数里。
@@ -298,10 +356,58 @@ mod tests {
         tree(&root);
         let scanned = scan(&root);
         let mine = scanned.get(A).expect("这个 cgroup 里有一个真实进程");
-        assert_eq!(mine[0].pid, std::process::id());
+        assert_eq!(mine.processes[0].pid, std::process::id());
+        assert_eq!(
+            mine.pod_uid.as_deref(),
+            Some(POD_UID),
+            "Pod 层目录名里写着归属，容器自己不知道"
+        );
         assert!(
             !scanned.contains_key(B),
             "空的 cgroup 不是一个容器，报上去读作「里面没有进程」"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 没有这次改动就会红：Pod 的沙箱容器（pause）不在 `containerStatuses` 里，
+    /// 只按容器 id 认领时它永远认领不上，屏上就把它算成「有进程、却没有位置」。
+    /// 它的位置写在 cgroup 路径里——Pod 的 uid。
+    #[test]
+    fn a_container_carries_the_pod_it_sits_under() {
+        assert_eq!(
+            pod_uid_of_dir("kubepods-burstable-pod1288f852_f85f_4fce_a027_9fffbdcb0f26.slice")
+                .as_deref(),
+            Some("1288f852-f85f-4fce-a027-9fffbdcb0f26"),
+            "systemd 把连字符写成下划线，报上去要换回来才能与 metadata.uid 对上"
+        );
+        assert_eq!(pod_uid_of_dir("kubepods.slice"), None, "顶层不是 Pod");
+        assert_eq!(
+            pod_uid_of_dir("kubepods-burstable.slice"),
+            None,
+            "QoS 层不是 Pod"
+        );
+        assert_eq!(pod_uid_of_dir("system.slice"), None);
+
+        let root = std::env::temp_dir().join(format!("cog-census-pod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        tree(&root);
+        // 一个直接挂在 QoS 层下的叶子：没有 Pod 认领它（宿主上直接起的容器）。
+        let loose = root.join("kubepods.slice/kubepods-burstable.slice");
+        std::fs::create_dir_all(loose.join(format!("cri-containerd-{B}.scope"))).unwrap();
+        std::fs::write(
+            loose.join(format!("cri-containerd-{B}.scope/cgroup.procs")),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        let scanned = scan(&root);
+        assert_eq!(
+            scanned.get(A).and_then(|row| row.pod_uid.clone()),
+            Some(POD_UID.to_string())
+        );
+        assert_eq!(
+            scanned.get(B).and_then(|row| row.pod_uid.clone()),
+            None,
+            "不在 Pod slice 下的容器没有归属，不能被安到任何 Pod 上"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

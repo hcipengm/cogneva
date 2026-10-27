@@ -439,9 +439,9 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
             // 两者差出来的那些（宿主上的构建容器、不经 k8s 起的进程）有进程读数却没有
             // 格子。差读在 Pod 读成功之后——读不到 Pod 时不知道谁被认领了，那时的差
             // 不是差，是不知道。
-            let claimed = claimed_container_ids(pods.get("items"));
+            let claims = claims_of_pods(pods.get("items"));
             for node in &mut view.nodes {
-                if let Some(gap) = crate::process_reports::census_gap(&node.name, &claimed) {
+                if let Some(gap) = crate::process_reports::census_gap(&node.name, &claims) {
                     node.census_containers = Some(gap.seen);
                     // 计数从这一列里数出来，不另算一遍：两处各算一次，差一格的时候
                     // 屏上会出现「3 个没有认领」而下面只列着 2 条的场面，而读者没有
@@ -909,17 +909,26 @@ fn node_view(node: &Value) -> NodeView {
     }
 }
 
-/// 这一面读到的 Pod 用掉了哪些容器实例 id。
+/// 这一面读到的 Pod 认领了哪些容器，以及它们自己是谁。
 ///
 /// 采集器按容器 id 入账（cgroup 路径的末段就是它），Pod 状态里也带着同一个 id，
 /// 两边不用交换名字就能对上。`initContainerStatuses` 也算：init 容器在跑的时候，
 /// 宿主上同样有一个叶子，不认领它就会被算成「这一面读不到的容器」。
-fn claimed_container_ids(pods: Option<&Value>) -> std::collections::HashSet<String> {
-    let mut claimed = std::collections::HashSet::new();
+///
+/// Pod 的 uid 单独收一遍，因为沙箱容器（pause）不在任何 `containerStatuses` 里，
+/// 而它在宿主上有自己的一份进程表。没有这一组，每一个 Pod 都会在缺口里留下一条
+/// 「没人认领的容器」——那不是宿主上的野进程，是这一面自己没认出来。
+fn claims_of_pods(pods: Option<&Value>) -> crate::process_reports::Claims {
+    let mut claims = crate::process_reports::Claims::default();
     let Some(items) = pods.and_then(Value::as_array) else {
-        return claimed;
+        return claims;
     };
     for pod in items {
+        if let Some(uid) = pod.pointer("/metadata/uid").and_then(Value::as_str) {
+            if !uid.is_empty() {
+                claims.pods.insert(uid.to_string());
+            }
+        }
         for field in ["/status/containerStatuses", "/status/initContainerStatuses"] {
             let Some(statuses) = pod.pointer(field).and_then(Value::as_array) else {
                 continue;
@@ -930,12 +939,12 @@ fn claimed_container_ids(pods: Option<&Value>) -> std::collections::HashSet<Stri
                 };
                 let id = crate::process_reports::container_id_of(id);
                 if !id.is_empty() {
-                    claimed.insert(id.to_string());
+                    claims.containers.insert(id.to_string());
                 }
             }
         }
     }
-    claimed
+    claims
 }
 
 fn pod_view(pod: &Value, sources: &Sources) -> PodView {
@@ -2013,6 +2022,7 @@ mod topology_tests {
         });
         let report = |command: &str| crate::process_reports::Report {
             node: "cogneva-node".to_string(),
+            pod_uid: None,
             reported_at: Utc::now(),
             processes: vec![crate::process_reports::ReportedProcess {
                 pid: 1,
@@ -2054,6 +2064,7 @@ mod topology_tests {
         crate::process_reports::record(
             "cccc",
             crate::process_reports::Report {
+                pod_uid: None,
                 node: "cogneva-node".to_string(),
                 reported_at: Utc::now(),
                 processes: vec![crate::process_reports::ReportedProcess {
@@ -2096,7 +2107,11 @@ mod topology_tests {
         let pods = json!({
             "items": [
                 {
-                    "metadata": { "name": "api", "namespace": "cogneva" },
+                    "metadata": {
+                        "name": "api",
+                        "namespace": "cogneva",
+                        "uid": "1288f852-f85f-4fce-a027-9fffbdcb0f26"
+                    },
                     "status": {
                         "containerStatuses": [
                             { "name": "app", "containerID": "containerd://aaaa" },
@@ -2113,15 +2128,24 @@ mod topology_tests {
                 }
             ]
         });
-        let claimed = claimed_container_ids(pods.get("items"));
-        assert!(claimed.contains("aaaa"), "运行中的容器要认领");
+        let claims = claims_of_pods(pods.get("items"));
+        assert!(claims.containers.contains("aaaa"), "运行中的容器要认领");
         assert!(
-            claimed.contains("cccc"),
+            claims.containers.contains("cccc"),
             "init 容器同样占着宿主上的一个叶子"
         );
-        assert_eq!(claimed.len(), 2, "没有 containerID 的状态不该凭空认领");
+        assert_eq!(
+            claims.containers.len(),
+            2,
+            "没有 containerID 的状态不该凭空认领"
+        );
         assert!(
-            claimed_container_ids(None).is_empty(),
+            claims.pods.contains("1288f852-f85f-4fce-a027-9fffbdcb0f26"),
+            "Pod 的 uid 也要认：沙箱容器不在 containerStatuses 里，它在宿主上有进程表"
+        );
+        let empty = claims_of_pods(None);
+        assert!(
+            empty.containers.is_empty() && empty.pods.is_empty(),
             "读不到 Pod 列表时谁都没认领——那一格要报「不知道」，不是「全都没认领」"
         );
     }

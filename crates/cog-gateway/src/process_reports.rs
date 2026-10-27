@@ -60,6 +60,13 @@ pub struct Report {
     /// 能说明「采集器看得见、而屏上看不见」的数——而它只有按节点才摊得开，一台节点
     /// 上的采集器停了，别的节点上的差不受影响。
     pub node: String,
+    /// 这个容器所在 Pod 的 uid。节点采集器从 cgroup 路径里读得到；容器自报的那条路
+    /// 不知道，落 `None`。
+    ///
+    /// 为什么要按 uid 认领：Pod 的沙箱容器（pause）有一份完整的进程表，却不在
+    /// `containerStatuses` 里——只按容器 id 认领，它永远认领不上，于是被读成
+    /// 「有进程读数、却没有位置」，而屏上那句话是在说它是宿主上的野容器。
+    pub pod_uid: Option<String>,
     pub reported_at: DateTime<Utc>,
     pub processes: Vec<ReportedProcess>,
 }
@@ -165,15 +172,28 @@ pub struct CensusGap {
     pub unclaimed: Vec<UnclaimedContainer>,
 }
 
+/// 屏上已经画着的容器与 Pod。采集器报上来的一个容器，落在这两组里的任何一组，
+/// 就有地方可去。
+///
+/// 两组而不是一组：Pod 的沙箱容器（pause）有自己的一份进程表，却不在
+/// `containerStatuses` 里——它的位置只能靠 Pod 的 uid 认。少这一组，每一个 Pod
+/// 都会在缺口里留下一条，而那句话在屏上的意思是「宿主上有东西没人认领」。
+#[derive(Debug, Default, Clone)]
+pub struct Claims {
+    /// `containerStatuses[].containerID` / `initContainerStatuses[].containerID`。
+    pub containers: HashSet<String>,
+    /// `metadata.uid`。
+    pub pods: HashSet<String>,
+}
+
 /// 某台节点上采集器看到了几个容器，其中哪些**这一面读不到**。
 ///
-/// `claimed` 是屏上这些 Pod 的容器实例 id：采集器按容器 id 入账，Pod 状态里也带着
-/// 同一个 id，两边不用交换名字就能对上。对不上的那些，采集器看得见它们、屏上没有
-/// 它们的位置——宿主上的构建容器、直接起在宿主上的进程就是这样。
+/// 对不上的那些，采集器看得见它们、屏上没有它们的位置——宿主上的构建容器、直接起在
+/// 宿主上的进程就是这样。
 ///
 /// 返回 `None` 读作「这台节点上没有活着的采集器」：没有人能报，差就是「不知道」，
 /// 不是 0——把它写成 0 会让「采集器没装」读成「一个都没漏」。
-pub fn census_gap(node: &str, claimed: &HashSet<String>) -> Option<CensusGap> {
+pub fn census_gap(node: &str, claims: &Claims) -> Option<CensusGap> {
     let node = node.trim();
     if node.is_empty() || census_at(node).is_none() {
         return None;
@@ -186,7 +206,12 @@ pub fn census_gap(node: &str, claimed: &HashSet<String>) -> Option<CensusGap> {
             continue;
         }
         seen += 1;
-        if !claimed.contains(id) {
+        let claimed = claims.containers.contains(id)
+            || report
+                .pod_uid
+                .as_ref()
+                .is_some_and(|uid| claims.pods.contains(uid));
+        if !claimed {
             unclaimed.push(UnclaimedContainer {
                 id: id.chars().take(12).collect(),
                 processes: report.processes.len(),
@@ -259,6 +284,9 @@ pub struct ReportBody {
     /// 报上来的那个容器实例（cgroup 里那串 id），与 Pod 状态里的
     /// `containerStatuses[].containerID` 对得上。
     pub container_id: String,
+    /// 它所在 Pod 的 uid，采集器从 cgroup 路径里读得到；容器自己报的话可以不填。
+    #[serde(default)]
+    pub pod_uid: Option<String>,
     pub processes: Vec<ReportedProcess>,
 }
 
@@ -395,6 +423,15 @@ async fn ingest(
             &container_id,
             Report {
                 node: node.clone(),
+                pod_uid: report
+                    .pod_uid
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|uid| !uid.is_empty())
+                    // 采集器报的是 `metadata.uid` 的形式，这里再兜一次：systemd 的
+                    // slice 名把连字符写成下划线，另一个实现在上游漏了这一步也不会
+                    // 让认领悄悄失效——而认领失效在屏上读作「Pod 的沙箱没人认领」。
+                    .map(|uid| uid.replace('_', "-")),
                 reported_at: Utc::now(),
                 processes,
             },
@@ -470,6 +507,7 @@ mod tests {
         record(
             container,
             Report {
+                pod_uid: None,
                 node: String::new(),
                 reported_at: Utc::now() - chrono::Duration::seconds(FRESH_FOR.as_secs() as i64 + 5),
                 processes: vec![ReportedProcess {
@@ -489,6 +527,7 @@ mod tests {
         record(
             container,
             Report {
+                pod_uid: None,
                 node: String::new(),
                 reported_at: Utc::now() - chrono::Duration::seconds(1),
                 processes: vec![ReportedProcess {
@@ -502,6 +541,7 @@ mod tests {
         record(
             container,
             Report {
+                pod_uid: None,
                 node: String::new(),
                 reported_at: Utc::now(),
                 processes: vec![ReportedProcess {
@@ -530,6 +570,7 @@ mod tests {
             record(
                 container,
                 Report {
+                    pod_uid: None,
                     node: String::new(),
                     reported_at: Utc::now(),
                     processes: table.clone(),
@@ -541,6 +582,7 @@ mod tests {
             !record(
                 container,
                 Report {
+                    pod_uid: None,
                     node: String::new(),
                     reported_at: Utc::now(),
                     processes: table,
@@ -552,6 +594,7 @@ mod tests {
             record(
                 container,
                 Report {
+                    pod_uid: None,
                     node: String::new(),
                     reported_at: Utc::now(),
                     processes: vec![ReportedProcess {
@@ -577,6 +620,7 @@ mod tests {
         record(
             &stale,
             Report {
+                pod_uid: None,
                 node: String::new(),
                 reported_at: Utc::now() - chrono::Duration::seconds(FRESH_FOR.as_secs() as i64 + 5),
                 processes: vec![ReportedProcess {
@@ -590,6 +634,7 @@ mod tests {
         record(
             &live,
             Report {
+                pod_uid: None,
                 node: String::new(),
                 reported_at: Utc::now(),
                 processes: vec![ReportedProcess {
@@ -638,6 +683,7 @@ mod tests {
             record(
                 id,
                 Report {
+                    pod_uid: None,
                     node: owner.clone(),
                     reported_at: Utc::now(),
                     processes: vec![ReportedProcess {
@@ -649,8 +695,11 @@ mod tests {
                 },
             );
         }
-        let claimed: HashSet<String> = [placed.clone()].into_iter().collect();
-        let gap = census_gap(&node, &claimed).expect("有采集器的节点要读得出差");
+        let claims = Claims {
+            containers: [placed.clone()].into_iter().collect(),
+            pods: HashSet::new(),
+        };
+        let gap = census_gap(&node, &claims).expect("有采集器的节点要读得出差");
         assert_eq!(
             (gap.seen, gap.unclaimed.len()),
             (2, 1),
@@ -662,7 +711,7 @@ mod tests {
             "缺口里要点名是哪一个容器，不是一个只够相减的数"
         );
         assert_eq!(
-            census_gap(&format!("no-collector-{suffix}"), &claimed),
+            census_gap(&format!("no-collector-{suffix}"), &claims),
             None,
             "没有采集器的节点：「不知道」，不是「一个都没漏」"
         );
@@ -705,6 +754,7 @@ mod tests {
             reports: vec![ReportBody {
                 pod: pod.to_string(),
                 container_id: container_id.to_string(),
+                pod_uid: None,
                 processes,
             }],
         }
@@ -719,6 +769,7 @@ mod tests {
 
     fn report(pod: &str, container_id: &str, command: &str) -> ReportBody {
         ReportBody {
+            pod_uid: None,
             pod: pod.to_string(),
             container_id: container_id.to_string(),
             processes: vec![ReportedProcess {
@@ -855,6 +906,7 @@ mod tests {
                 vec![
                     report("", "g1", "kubelet"),
                     ReportBody {
+                        pod_uid: None,
                         pod: String::new(),
                         container_id: String::new(),
                         processes: one_process(),
@@ -915,6 +967,7 @@ mod tests {
         record(
             claimed_id,
             Report {
+                pod_uid: None,
                 node: node.to_string(),
                 reported_at: Utc::now(),
                 processes: vec![process(1, "nginx", 100)],
@@ -923,6 +976,7 @@ mod tests {
         record(
             build_id,
             Report {
+                pod_uid: None,
                 node: node.to_string(),
                 reported_at: Utc::now(),
                 // 两个 cargo：去重后只报一次；顺序按内存，不按 pid。
@@ -939,6 +993,7 @@ mod tests {
         record(
             stale_id,
             Report {
+                pod_uid: None,
                 node: node.to_string(),
                 reported_at: Utc::now() - chrono::Duration::seconds(FRESH_FOR.as_secs() as i64 + 5),
                 processes: vec![process(20, "left-behind", 100)],
@@ -947,15 +1002,16 @@ mod tests {
         record(
             elsewhere_id,
             Report {
+                pod_uid: None,
                 node: "census-gap-node-elsewhere".to_string(),
                 reported_at: Utc::now(),
                 processes: vec![process(30, "other-node", 100)],
             },
         );
 
-        let mut claimed = HashSet::new();
-        claimed.insert(claimed_id.to_string());
-        let gap = census_gap(node, &claimed).expect("采集器报到过，差就该读得出来");
+        let mut claims = Claims::default();
+        claims.containers.insert(claimed_id.to_string());
+        let gap = census_gap(node, &claims).expect("采集器报到过，差就该读得出来");
 
         assert_eq!(gap.seen, 2, "过期的那份与别的节点上的都不算这一拍");
         assert_eq!(gap.unclaimed.len(), 1, "被认领的那个不在缺口里");
@@ -969,6 +1025,80 @@ mod tests {
         );
     }
 
+    /// 没有这次改动就会红：Pod 的沙箱容器（pause）在宿主上有自己的一份进程表，
+    /// 但 Kubernetes 不把它写进 `containerStatuses`。只按容器 id 认领时，集群里
+    /// 每一个 Pod 都会在缺口里留下一条，而屏上那句话的意思是「宿主上有东西没人
+    /// 认领」——一个每个 Pod 都会触发的假读数。
+    #[test]
+    fn a_pod_sandbox_container_is_claimed_by_the_pod_it_belongs_to() {
+        let node = "census-gap-node-sandbox";
+        let id = "c7c7c7c7c7c7c7";
+        let uid = "1288f852-f85f-4fce-a027-9fffbdcb0f26";
+        record_census(node);
+        record(
+            id,
+            Report {
+                node: node.to_string(),
+                pod_uid: Some(uid.to_string()),
+                reported_at: Utc::now(),
+                processes: vec![ReportedProcess {
+                    pid: 1,
+                    parent_pid: 0,
+                    command: "pause".to_string(),
+                    rss_bytes: 0,
+                }],
+            },
+        );
+
+        let mut claims = Claims::default();
+        assert_eq!(
+            census_gap(node, &claims).map(|gap| gap.unclaimed.len()),
+            Some(1),
+            "没有任何 Pod 时它当然没人认领"
+        );
+        claims.pods.insert(uid.to_string());
+        let gap = census_gap(node, &claims).expect("采集器报到过");
+        assert_eq!(
+            (gap.seen, gap.unclaimed.len()),
+            (1, 0),
+            "Pod 自己就在屏上，它的沙箱容器有位置可去"
+        );
+    }
+
+    /// 从采集器报上来到屏上认领的那一整条路：报上来的 uid 是 systemd 的下划线写法，
+    /// 认领用的是 `metadata.uid` 的连字符写法，中间这一步没人做就会静默失效。
+    #[tokio::test]
+    async fn the_reported_pod_uid_survives_the_trip_from_the_collector_to_the_claim() {
+        let (events, _rx) = tokio::sync::broadcast::channel(8);
+        let node = "census-ingest-pod-uid";
+        let id = "9a9a9a9a9a9a9a";
+        let response = ingest(
+            CensusBody {
+                node: node.to_string(),
+                reports: vec![ReportBody {
+                    pod: String::new(),
+                    container_id: id.to_string(),
+                    pod_uid: Some("1288f852_f85f_4fce_a027_9fffbdcb0f26".to_string()),
+                    processes: one_process(),
+                }],
+            },
+            &events,
+            &None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let mut claims = Claims::default();
+        claims
+            .pods
+            .insert("1288f852-f85f-4fce-a027-9fffbdcb0f26".to_string());
+        assert_eq!(
+            census_gap(node, &claims).map(|gap| gap.unclaimed.len()),
+            Some(0),
+            "两种写法要折成一种，否则沙箱容器永远认领不上"
+        );
+    }
+
     /// 缺口为空与「没有采集器」不是一回事：前者是零个，后者是不知道。
     #[test]
     fn a_node_with_a_census_and_nothing_unclaimed_reads_as_zero_not_as_unknown() {
@@ -978,6 +1108,7 @@ mod tests {
         record(
             id,
             Report {
+                pod_uid: None,
                 node: node.to_string(),
                 reported_at: Utc::now(),
                 processes: vec![ReportedProcess {
@@ -988,11 +1119,11 @@ mod tests {
                 }],
             },
         );
-        let mut claimed = HashSet::new();
-        claimed.insert(id.to_string());
+        let mut claims = Claims::default();
+        claims.containers.insert(id.to_string());
 
-        let gap = census_gap(node, &claimed).expect("有采集器就有读数");
+        let gap = census_gap(node, &claims).expect("有采集器就有读数");
         assert_eq!((gap.seen, gap.unclaimed.len()), (1, 0));
-        assert!(census_gap("census-gap-node-absent", &claimed).is_none());
+        assert!(census_gap("census-gap-node-absent", &Claims::default()).is_none());
     }
 }
