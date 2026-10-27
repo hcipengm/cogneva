@@ -74,6 +74,11 @@ static CENSUS: LazyLock<RwLock<HashMap<String, DateTime<Utc>>>> =
 /// 一个容器每拍都报同一张表，而帧的意义是「屏上该重读了」。
 pub fn record(container_id: &str, report: Report) -> bool {
     let mut reports = REPORTS.write().unwrap_or_else(|e| e.into_inner());
+    // 先清掉过期的那批：过期的一份本来就读不出来（`latest` 会滤掉），但它**占着内存**。
+    // 键是容器实例 id，而采集器按宿主上每一个容器实例入账——评测环境一天起停几百个，
+    // 每个最多带 64 条进程；只写不删时这张表跟着开机时长长，而屏上一点都看不出来。
+    // 清在写这一侧：写是一分钟一批，读是每次刷新都读。
+    reports.retain(|_, previous| fresh(previous));
     let changed = reports
         .get(container_id)
         .map(|previous| previous.processes != report.processes)
@@ -445,6 +450,46 @@ mod tests {
             ),
             "多了一个进程，这才是该推的那一帧"
         );
+    }
+
+    #[test]
+    fn a_container_that_stopped_does_not_keep_its_slot() {
+        // 没有这次改动就会红：键是容器实例 id，而采集器按宿主上每一个容器实例入账。
+        // 评测环境一天起停几百个容器，只写不删时这张表跟着开机时长长；过期的那份
+        // 读不出来，所以屏上没有任何一格能看出它在长。
+        let suffix = std::process::id();
+        let stale = format!("stopped-{suffix}");
+        let live = format!("running-{suffix}");
+        record(
+            &stale,
+            Report {
+                reported_at: Utc::now() - chrono::Duration::seconds(FRESH_FOR.as_secs() as i64 + 5),
+                processes: vec![ReportedProcess {
+                    pid: 1,
+                    parent_pid: 0,
+                    command: "sh".to_string(),
+                    rss_bytes: 0,
+                }],
+            },
+        );
+        record(
+            &live,
+            Report {
+                reported_at: Utc::now(),
+                processes: vec![ReportedProcess {
+                    pid: 2,
+                    parent_pid: 0,
+                    command: "sh".to_string(),
+                    rss_bytes: 0,
+                }],
+            },
+        );
+        let reports = REPORTS.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !reports.contains_key(&stale),
+            "过期的那一格没人读得到，却一直占着地方"
+        );
+        assert!(reports.contains_key(&live), "活着的那一格不能被顺手清掉");
     }
 
     #[test]
