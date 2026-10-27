@@ -1455,16 +1455,9 @@ impl Drop for Agent {
         if let Some(ref lifecycle) = self.lifecycle {
             let agent_id = self.config.agent_id.clone();
             let lifecycle = lifecycle.clone();
-            // Best-effort async cleanup: spawn a blocking task to stop heartbeat.
-            // In a tokio runtime this will run; outside it silently does nothing.
-            let _ = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new();
-                if let Ok(rt) = rt {
-                    rt.block_on(async move {
-                        lifecycle.stop_heartbeat(&agent_id).await;
-                        let _ = lifecycle.transition(&agent_id, AgentState::Inactive).await;
-                    });
-                }
+            finish_off_thread(async move {
+                lifecycle.stop_heartbeat(&agent_id).await;
+                let _ = lifecycle.transition(&agent_id, AgentState::Inactive).await;
             });
         }
 
@@ -1472,16 +1465,43 @@ impl Drop for Agent {
         if let Some(ref registry) = self.registry {
             let agent_id = self.config.agent_id.clone();
             let registry = registry.clone();
-            let _ = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new();
-                if let Ok(rt) = rt {
-                    rt.block_on(async move {
-                        let _ = registry.deregister(&agent_id).await;
-                    });
-                }
+            finish_off_thread(async move {
+                let _ = registry.deregister(&agent_id).await;
             });
         }
     }
+}
+
+/// Finish a store-reaching cleanup without blocking the drop.
+///
+/// The work has to reach backends -- the heartbeat, the registry -- whose
+/// connections are shared with the rest of the process: a clone of a redis
+/// connection manager is the same connection manager, and the reconnect future
+/// every clone shares is the same future. A runtime built here for that work is
+/// a runtime the shared future outlives, and a timer it registered on the way
+/// out is a timer polled afterwards by a runtime that has no such driver. That
+/// poll panics inside the shared future, so every other holder of that
+/// connection panics with it -- permanently, since a poisoned shared future
+/// re-panics on every poll. None of that is visible from the drop that started
+/// it: the task that dies is somebody else's loop, minutes later.
+///
+/// So the work goes where the process's own runtime can pick it up. When there
+/// is no ambient runtime there is nothing to hand it to and nothing sharing the
+/// connection either, which is why building one there is safe and why that is
+/// the only place this still builds one.
+fn finish_off_thread<F>(work: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(work);
+        return;
+    }
+    let _ = std::thread::spawn(move || {
+        if let Ok(rt) = tokio::runtime::Runtime::new() {
+            rt.block_on(work);
+        }
+    });
 }
 
 /// forward 循环的分发规则：装上总线投递口时 `AgentEnd` 只写总线——broadcast
