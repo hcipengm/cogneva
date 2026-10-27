@@ -60,6 +60,17 @@ pub const SIGNED_UNAPPLIED_LIMIT_SECS: i64 = 900;
 pub struct Signature {
     pub unit: String,
     pub at: DateTime<Utc>,
+    /// Who cast this signature, when it was not the unit it names.
+    ///
+    /// A signature is a claim of agreement. The staffing pass is the platform
+    /// agreeing to hand a face to a unit that is present, and its name goes
+    /// into the row as the caster so a reader can tell an attestation the unit
+    /// made from one made on its behalf. Absent for every signature a unit
+    /// casts itself, which keeps the digest of every handover written before
+    /// this field existed exactly as it was -- and the digest never covered
+    /// signatures in the first place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_by: Option<String>,
 }
 
 /// What a handover row says.
@@ -783,6 +794,7 @@ mod tests {
             signed_by: vec![Signature {
                 unit: "8b2".into(),
                 at: at(0),
+                cast_by: None,
             }],
         };
         assert!(!spec.is_fully_signed());
@@ -790,10 +802,12 @@ mod tests {
         signed.signed_by.push(Signature {
             unit: "worker".into(),
             at: at(1),
+            cast_by: None,
         });
         signed.signed_by.push(Signature {
             unit: "6e".into(),
             at: at(2),
+            cast_by: None,
         });
         assert!(signed.is_fully_signed());
         assert_eq!(signed.required_signers(), vec!["6e", "8b2", "worker"]);
@@ -830,12 +844,14 @@ mod tests {
         spec.signed_by.push(Signature {
             unit: "worker".into(),
             at: at(1),
+            cast_by: None,
         });
         assert!(!spec.is_fully_signed());
         assert!(spec.signature_covers_payload());
         spec.signed_by.push(Signature {
             unit: "operator".into(),
             at: at(2),
+            cast_by: None,
         });
         assert!(spec.is_fully_signed());
 
@@ -924,6 +940,7 @@ mod tests {
         spec.signed_by.push(Signature {
             unit: "worker".into(),
             at: at(0),
+            cast_by: None,
         });
         assert!(spec.signature_covers_payload());
         // A second signature is over the same terms, not a change to them.
@@ -931,6 +948,7 @@ mod tests {
         spec.signed_by.push(Signature {
             unit: "6e".into(),
             at: at(1),
+            cast_by: None,
         });
         assert_eq!(spec.payload_sha256, digest);
         assert!(spec.signature_covers_payload());

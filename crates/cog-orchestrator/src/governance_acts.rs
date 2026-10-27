@@ -21,9 +21,10 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use cog_core::{
-    Decision, DecisionMode, DecisionSpec, DecisionState, Face, Handover, HandoverSpec, Task,
-    TaskStatus, TaskType, TieBreak, Vote, VoteSpec, DECISION_INPUT_KEY, DECISION_TASK_TYPE,
-    GOVERNANCE_WORKSPACE, HANDOVER_INPUT_KEY, HANDOVER_TASK_TYPE, VOTE_INPUT_KEY, VOTE_TASK_TYPE,
+    Decision, DecisionMode, DecisionSpec, DecisionState, Face, Handover, HandoverSpec,
+    HandoverState, Signature, Task, TaskStatus, TaskType, TieBreak, Vote, VoteSpec,
+    DECISION_INPUT_KEY, DECISION_TASK_TYPE, FACE_INPUT_KEY, GOVERNANCE_WORKSPACE,
+    HANDOVER_INPUT_KEY, HANDOVER_TASK_TYPE, VOTE_INPUT_KEY, VOTE_TASK_TYPE,
 };
 
 /// Fold a name into a segment that can travel as a task id.
@@ -137,6 +138,98 @@ pub fn handover_task(id: &str, spec: HandoverSpec, now: DateTime<Utc>) -> Task {
         Some(spec.to_unit.clone()),
         now,
     )
+}
+
+/// What one signature did to a handover's terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignedBy {
+    /// The signature was added, and the row is now in this state.
+    Added(HandoverState),
+    /// The unit had already signed; nothing was written.
+    Already,
+}
+
+/// Add one unit's signature to a handover's terms.
+///
+/// The rule lives here for the same reason the row shape does: the command a
+/// person types and the pass that staffs a face both have to sign, and a
+/// handover whose digest is fixed by one caller and not the other is a
+/// signature over terms nobody read. `cast_by` is `None` when the unit signs
+/// for itself and names the actor otherwise.
+pub fn sign_spec(
+    spec: &mut HandoverSpec,
+    unit: &str,
+    cast_by: Option<String>,
+    at: DateTime<Utc>,
+) -> Result<SignedBy, String> {
+    if spec.signed_by.iter().any(|signed| signed.unit == unit) {
+        return Ok(SignedBy::Already);
+    }
+    // The first signature fixes the terms. A later signature over a payload
+    // that has since changed would attest to something nobody read, so refuse
+    // instead of quietly re-hashing.
+    if !spec.signature_covers_payload() {
+        return Err(
+            "changed after it was signed; the terms must be re-read before another signature"
+                .into(),
+        );
+    }
+    if spec.payload_sha256.is_none() {
+        spec.payload_sha256 = Some(spec.payload_digest());
+    }
+    spec.signed_by.push(Signature {
+        unit: unit.to_string(),
+        at,
+        cast_by,
+    });
+    Ok(SignedBy::Added(if spec.is_fully_signed() {
+        HandoverState::Signed
+    } else {
+        HandoverState::Draft
+    }))
+}
+
+/// The face row as it stands after a handover moves it, and the revision the
+/// move was read against.
+///
+/// Shared by the command and the staffing pass: a field that has to be carried
+/// across a move -- the vacancy a filled seat ends, the revision an import uses
+/// to tell a moved row from an untouched one -- must be carried the same way by
+/// both, or one of them writes a face that says two different things about
+/// itself.
+pub fn moved_face_row(
+    face_task: &Task,
+    spec: &HandoverSpec,
+    handover_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(Task, i64), String> {
+    let face =
+        Face::from_task(face_task).ok_or_else(|| format!("{} is not a face", spec.face_id))?;
+    let expected_revision = face.revision();
+    let mut next = face.spec.clone();
+    next.revision += 1;
+    // Filling a declared vacancy ends it. The three cells name who was going
+    // to fill the seat, by when, and with which task; once somebody is in the
+    // seat they describe a search that is over. Left behind, `gap_task` keeps
+    // pointing at a closing task that may never have existed while the row
+    // looks staffed and nobody re-checks it.
+    if spec.from_unit.is_none() {
+        next.vacancy_until = None;
+        next.vacancy_assigner = None;
+        next.gap_task_id = None;
+    }
+    let mut row = face_task.clone();
+    row.input
+        .as_object_mut()
+        .ok_or("the face payload is not an object")?
+        .insert(
+            FACE_INPUT_KEY.to_string(),
+            serde_json::to_value(&next).map_err(|e| e.to_string())?,
+        );
+    row.owner_unit = Some(spec.to_unit.clone());
+    row.bound_by_handover_id = Some(handover_id.to_string());
+    row.updated_at = now;
+    Ok((row, expected_revision))
 }
 
 /// Build a decision row. Rules are written once, here, and never rewritten.
@@ -952,6 +1045,7 @@ mod tests {
             signed_by: vec![Signature {
                 unit: "8b2".into(),
                 at: at(0),
+                cast_by: None,
             }],
         };
         assert!(!spec.is_fully_signed());
@@ -959,10 +1053,12 @@ mod tests {
         signed.signed_by.push(Signature {
             unit: "worker".into(),
             at: at(1),
+            cast_by: None,
         });
         signed.signed_by.push(Signature {
             unit: "6e".into(),
             at: at(2),
+            cast_by: None,
         });
         assert!(signed.is_fully_signed());
         assert_eq!(signed.required_signers(), vec!["6e", "8b2", "worker"]);

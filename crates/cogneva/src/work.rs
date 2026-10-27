@@ -626,11 +626,14 @@ async fn presence(unit: &str, workspace: &str, redis_url: &str) -> Result<(), Bo
         .await?
         .with_ttl_seconds(UNIT_PRESENCE_TTL_SECS);
     let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "external-worker".into());
+    // The same name the staffing pass reads back: a unit that registers under
+    // another role is present and is not somebody a face can be handed to, so
+    // the writer and the predicate take the role from the same constant.
     let registration = cog_core::AgentRegistration::new(
         unit,
         hostname,
         "",
-        "external-worker",
+        cog_supervisor::registry::EXTERNAL_WORKER_ROLE,
         workspace,
         Vec::new(),
         cog_core::ResourceInfo::default(),

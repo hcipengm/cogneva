@@ -26,7 +26,7 @@ use chrono::{DateTime, Utc};
 use cog_core::{
     append_decision_event, close_decision_with_event, verify_decision_chain, ChainVerdict,
     CloseOutcome, Decision, DecisionMode, DecisionSpec, DecisionState, GovernanceStore, Handover,
-    HandoverSpec, HandoverState, Signature, TaskStatus, TieBreak, Vote, DECISION_TASK_TYPE,
+    HandoverSpec, HandoverState, TaskStatus, TieBreak, Vote, DECISION_TASK_TYPE,
     HANDOVER_TASK_TYPE, VOTE_TASK_TYPE,
 };
 use cog_orchestrator::governance_acts::{
@@ -434,31 +434,23 @@ pub async fn run_with_presence(
             if handover.state() != HandoverState::Draft {
                 return Err(format!("{id} is {}, not a draft", handover.state().as_str()).into());
             }
-            if handover.spec.signed_by.iter().any(|s| s.unit == unit) {
-                println!("{}: already signed by {unit}", handover.state().as_str());
-                return Ok(());
-            }
-            // The first signature fixes the terms. A later signature over a
-            // payload that has since changed would attest to something nobody
-            // read, so refuse instead of quietly re-hashing.
-            if !handover.spec.signature_covers_payload() {
-                return Err(format!(
-                    "{id} changed after it was signed; the terms must be re-read before another signature"
-                )
-                .into());
-            }
-            if handover.spec.payload_sha256.is_none() {
-                handover.spec.payload_sha256 = Some(handover.spec.payload_digest());
-            }
             let expected = task.status;
-            handover.spec.signed_by.push(Signature {
-                unit: unit.clone(),
-                at: now,
-            });
-            let state = if handover.spec.is_fully_signed() {
-                HandoverState::Signed
-            } else {
-                HandoverState::Draft
+            let state = match cog_orchestrator::governance_acts::sign_spec(
+                &mut handover.spec,
+                &unit,
+                // A unit typing this command signs for itself; the staffing
+                // pass is the only caller that names somebody else as the
+                // caster.
+                None,
+                now,
+            )
+            .map_err(|e| format!("{id} {e}"))?
+            {
+                cog_orchestrator::governance_acts::SignedBy::Already => {
+                    println!("{}: already signed by {unit}", handover.state().as_str());
+                    return Ok(());
+                }
+                cog_orchestrator::governance_acts::SignedBy::Added(state) => state,
             };
             task.input
                 .as_object_mut()
@@ -530,34 +522,17 @@ pub async fn run_with_presence(
                     }
                 }
             }
-            let mut face_task =
+            let face_row =
                 find_node(store, cog_core::FACE_TASK_TYPE, &handover.spec.face_id).await?;
-            let face = cog_core::Face::from_task(&face_task)
-                .ok_or_else(|| format!("{} is not a face", handover.spec.face_id))?;
-            let expected_revision = face.revision();
-            let mut spec = face.spec.clone();
-            spec.revision += 1;
-            // Filling a declared vacancy ends it. The three cells name who was
-            // going to fill the seat, by when, and with which task; once
-            // somebody is in the seat they describe a search that is over. Left
-            // behind, `gap_task` keeps pointing at a closing task that may never
-            // have existed while the row looks staffed and nobody re-checks it.
-            if handover.spec.from_unit.is_none() {
-                spec.vacancy_until = None;
-                spec.vacancy_assigner = None;
-                spec.gap_task_id = None;
-            }
-            face_task
-                .input
-                .as_object_mut()
-                .ok_or("the face payload is not an object")?
-                .insert(
-                    cog_core::FACE_INPUT_KEY.to_string(),
-                    serde_json::to_value(&spec)?,
-                );
-            face_task.owner_unit = Some(handover.spec.to_unit.clone());
-            face_task.bound_by_handover_id = Some(id.clone());
-            face_task.updated_at = now;
+            // The face row after the move is built in one place, shared with
+            // the pass that staffs a face whose owner has left: a field carried
+            // across a move has to be carried the same way by both writers.
+            let (face_task, expected_revision) = cog_orchestrator::governance_acts::moved_face_row(
+                &face_row,
+                &handover.spec,
+                &id,
+                now,
+            )?;
 
             task.status = HandoverState::Applied.status();
             task.result = Some(serde_json::json!({
@@ -578,7 +553,10 @@ pub async fn run_with_presence(
             };
             println!(
                 "applied: {} now owned by {} (revision {}); {} unstarted task(s) rebound",
-                handover.spec.face_id, handover.spec.to_unit, spec.revision, rebound
+                handover.spec.face_id,
+                handover.spec.to_unit,
+                expected_revision + 1,
+                rebound
             );
         }
         Act::HandoverWithdraw { id, unit } => {

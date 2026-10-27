@@ -492,11 +492,54 @@ pub fn spawn_face_drift_loop(
                         match registry.list().await {
                             Ok(registrations) => {
                                 let mut live: Vec<String> = registrations
-                                    .into_iter()
-                                    .map(|registration| registration.agent_id)
+                                    .iter()
+                                    .map(|registration| registration.agent_id.clone())
                                     .collect();
                                 live.sort();
                                 live.dedup();
+                                // Which of the present units can hold a face is
+                                // a second question, answered by the role they
+                                // registered under: an in-process planner is
+                                // alive for the length of its run, and a face
+                                // handed to it moves again when the run ends.
+                                let mut holders: Vec<String> = registrations
+                                    .iter()
+                                    .filter(|registration| {
+                                        registration.role == crate::face_staffing::FACE_HOLDER_ROLE
+                                    })
+                                    .map(|registration| registration.agent_id.clone())
+                                    .collect();
+                                holders.sort();
+                                holders.dedup();
+                                // Staffing runs before the work is released: a
+                                // handover carries the unstarted work bound to
+                                // the outgoing unit with it, and releasing the
+                                // rows first would leave them unowned for a
+                                // pass instead.
+                                match crate::face_staffing::staff_faces(
+                                    &*store,
+                                    &**registry,
+                                    &live,
+                                    &holders,
+                                    now,
+                                )
+                                .await
+                                {
+                                    Ok(report) if report != Default::default() => info!(
+                                        opened = report.opened,
+                                        retargeted = report.retargeted,
+                                        moved = report.moved,
+                                        withdrawn = report.withdrawn,
+                                        "face staffing pass: the graph and the presence registry \
+                                         were compared"
+                                    ),
+                                    Ok(_) => {}
+                                    Err(e) => warn!(
+                                        error = %e,
+                                        "the face staffing pass could not read or write the \
+                                         graph; no face moved on its account this pass"
+                                    ),
+                                }
                                 reassign_faces(&*store, &readings, &live).await;
                             }
                             Err(e) => warn!(
