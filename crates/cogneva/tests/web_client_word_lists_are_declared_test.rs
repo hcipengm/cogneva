@@ -378,6 +378,67 @@ fn the_send_outcomes_the_panel_knows_are_the_ones_the_store_writes() {
     );
 }
 
+/// 面的判词的九个词，以及每一个应当画成哪一档。
+///
+/// 四档不是界面自己分的：`DriftState` 的 `is_red` / `is_yellow` / `is_gray`
+/// 判它挡不挡变更，颜色只是那个判定的翻译。色表里缺一行的后果不是画错颜色，
+/// 是画成中性的 `--paper-dim`——`no_owner`、`unread` 与「一切正常」同色，而
+/// 这两档恰恰是最该被看见的。
+#[test]
+fn the_drift_verdicts_the_panel_colours_are_the_ones_the_registry_declares() {
+    use cog_core::contract::face_registry::DriftState;
+
+    let path = repo_root().join("web/src/api/client.ts");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let body_start = source
+        .find("export interface FaceDriftReading {")
+        .expect("the drift reading type is gone; this gate reads its state through it");
+    let body = &source[body_start..];
+    let body_end = body.find("\n}").expect("the interface body is not closed");
+    let mut panel = union_words(&body[..body_end], "  state:");
+    panel.sort();
+    assert!(
+        panel.len() >= 2,
+        "判词联合类型读出来是 {panel:?}；这么短说明解析变了，不是树变干净了"
+    );
+
+    let mut declared: Vec<String> = DriftState::ALL
+        .iter()
+        .map(|state| state.as_str().to_string())
+        .collect();
+    declared.sort();
+    assert_eq!(panel, declared, "面板与注册表必须认识同一组面的判词");
+
+    let primitives = repo_root().join("web/src/ui/primitives.tsx");
+    let primitives = std::fs::read_to_string(&primitives)
+        .unwrap_or_else(|e| panic!("{}: {e}", primitives.display()));
+    let start = primitives
+        .find("const TONES: Record<string, string> = {")
+        .expect("the status colour map is gone; this gate reads the tones through it");
+    let tones = &primitives[start..];
+    let end = tones.find("\n};").expect("the tone map is not closed");
+    let tones = &tones[..end];
+
+    for state in DriftState::ALL {
+        let (tier, expected) = if state.is_red() {
+            ("红", "var(--danger)")
+        } else if state.is_yellow() {
+            ("黄", "var(--warn)")
+        } else if state.is_gray() {
+            ("灰", "var(--muted)")
+        } else {
+            ("通过", "var(--ok)")
+        };
+        assert!(
+            tones.contains(&format!("\n  {}: '{}',", state.as_str(), expected)),
+            "判词 {:?} 在色表里不是 {expected}：注册表判它为{tier}档，界面必须画成同一档",
+            state.as_str()
+        );
+    }
+}
+
 /// 对照：本门的判据认得出一个不是词的东西。少了这条，`TaskFilter::parse` 哪天
 /// 退化成「什么词都收」，上面那条仍然全绿。
 #[test]

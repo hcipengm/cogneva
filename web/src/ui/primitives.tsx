@@ -206,6 +206,19 @@ const TONES: Record<string, string> = {
   failed: 'var(--danger)',
   dead: 'var(--danger)',
   unknown: 'var(--muted)',
+  // 面的判词。四档不在这里另立：红／黄／灰／通过由 `DriftState` 的
+  // `is_red` / `is_yellow` / `is_gray` 判定，这张表只把结论翻成颜色。
+  // 少了哪一行，那一档就画成中性的 `--paper-dim`——`no_owner` 与
+  // `unread` 会和「一切正常」同色。
+  on_target: 'var(--ok)',
+  owner_idle: 'var(--warn)',
+  drifted_binding: 'var(--danger)',
+  no_owner: 'var(--danger)',
+  vacancy_expired: 'var(--danger)',
+  unsigned_handover: 'var(--danger)',
+  witness_is_owner: 'var(--warn)',
+  deputy_overlap: 'var(--warn)',
+  unread: 'var(--muted)',
 };
 
 /** 状态词：颜色之外保持文字本身，读的人不必靠色卡猜。 */

@@ -925,7 +925,20 @@ export interface GovernanceFacesPage {
 
 export interface FaceDriftReading {
   face_id: string;
-  state: string;
+  /**
+   * 这一轮的判词。闭集：面板按它选颜色，红／黄／灰／通过四档由 `DriftState`
+   * 自己判定，界面不另立一套说法。
+   */
+  state:
+    | 'on_target'
+    | 'owner_idle'
+    | 'drifted_binding'
+    | 'no_owner'
+    | 'vacancy_expired'
+    | 'unsigned_handover'
+    | 'witness_is_owner'
+    | 'deputy_overlap'
+    | 'unread';
   owner: string | null;
   owner_source: 'declared' | 'measured' | string;
   red_rules: string[];
