@@ -11,7 +11,9 @@
 //! against `ProjectKind`, the backend health words against `BackendState` (plus
 //! their colour map), and the cluster verdict against `cog_core::ClusterHealth`.
 //! The board is the same shape three times over: its column names, its column
-//! labels and its move branches are each a copy of `cog_core::TaskStatus`.
+//! labels and its move branches are each a copy of `cog_core::TaskStatus`. The
+//! roster's state cell is `AgentState`'s wire spelling plus the three words the
+//! client derives from lifecycle frames itself.
 //!
 //! 实测（2026-10-27）：修前 `web/src/views/TasksView.tsx` 的 `ready` 标签把
 //! `status=ready` 发给服务端，而 `TaskStatus` 里没有这个词，标签恒空——表头却
@@ -23,6 +25,10 @@
 //! `planned`，列名那条红并列出两组词；删掉 `nextColumns` 的 `case 'failed'`
 //! 分支，挪卡那条红并点名 `failed`——那张卡从此一个按钮都画不出来，而屏幕上
 //! 它与「这张卡没有合法下一列」一模一样。各自改回即绿。
+//!
+//! 实测（2026-10-27，在岗名单那一格）：`AgentState` 没有 `ALL`，词表按枚举源码的
+//! 变体名加 `rename_all = "snake_case"` 折出来，所以核心加一个状态也会红。把
+//! `STATE_LABEL` 的 `suspect` 删掉，本门红并列出两侧的词。
 
 use std::path::PathBuf;
 
@@ -731,4 +737,91 @@ fn the_board_moves_are_spelled_with_the_task_statuses() {
             "{terminal:?} 已经有分支了，这条登记（{reason}）该删掉"
         );
     }
+}
+
+/// 把 `AgentState` 的变体名按 `rename_all = "snake_case"` 折成线上写法。
+fn pascal_to_snake(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 2);
+    for (index, c) in name.chars().enumerate() {
+        if c.is_uppercase() && index > 0 {
+            out.push('_');
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
+/// 在岗名单上那一格状态：`AgentsView` 的 `STATE_LABEL` 是 `AgentState` 线上写法
+/// 的一份抄写（serde 的 snake_case），另加三个由客户端自己按帧翻出来的词——
+/// `agent_start` → `started`、`agent_end` → `ended`、`agent_error` → `error`。
+///
+/// 少一个词：那个状态的执行者显示英文原词，而注释里「照原样显示」的本意是让
+/// 「核心新加了一个状态」被看见；多一个词：为一段永远不会到来的状态留着一句
+/// 中文，读的人以为那一格会亮。两个方向在这里都要对得上。
+#[test]
+fn the_agent_states_the_roster_labels_are_the_ones_the_core_serialises() {
+    let core_path = repo_root().join("crates/cog-core/src/types/agent_state.rs");
+    let core = std::fs::read_to_string(&core_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", core_path.display()));
+    assert!(
+        core.contains("#[serde(rename_all = \"snake_case\")]"),
+        "AgentState 的线上写法不再由 rename_all 决定：本门按 snake_case 折变体名，\
+         改了就得跟着改这里"
+    );
+    let start = core
+        .find("pub enum AgentState {")
+        .expect("AgentState 不在了；本门通过它读执行者状态的线上写法")
+        + "pub enum AgentState {".len();
+    let body = &core[start..];
+    let end = body.find("\n}").expect("AgentState 的枚举体没有闭合");
+    let mut declared: Vec<String> = body[..end]
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("//") && !line.starts_with("#["))
+        .map(|line| {
+            let variant: String = line.chars().take_while(|c| c.is_alphanumeric()).collect();
+            pascal_to_snake(&variant)
+        })
+        .collect();
+    declared.sort();
+    assert_eq!(
+        declared.len(),
+        8,
+        "AgentState 读出来是 {declared:?}；变体数变了就要看客户端那一侧跟没跟上"
+    );
+
+    let view_path = repo_root().join("web/src/views/AgentsView.tsx");
+    let view = std::fs::read_to_string(&view_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", view_path.display()));
+    let mut labelled = table_keys(&view, "const STATE_LABEL: Record<string, string> = {");
+    labelled.sort();
+    assert!(
+        labelled.len() >= 8,
+        "状态格读出来是 {labelled:?}；这么短说明解析变了，不是树变干净了"
+    );
+
+    // 客户端自己翻出来的三个词，出处必须是 `liveAgents.ts` 的那个 switch。
+    const CLIENT_WORDS: &[(&str, &str)] = &[
+        ("started", "state: 'started'"),
+        ("ended", "state: 'ended'"),
+        ("error", "state: 'error'"),
+    ];
+    let live_path = repo_root().join("web/src/store/liveAgents.ts");
+    let live = std::fs::read_to_string(&live_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", live_path.display()));
+    for (word, needle) in CLIENT_WORDS {
+        assert!(
+            live.contains(needle),
+            "`{word}` 被当成客户端自己的词放行了，但 {live_path:?} 里没有 {needle:?}：\
+             这一条登记得撤掉，或者那个帧分支改了而标签表没跟上"
+        );
+    }
+
+    let mut expected: Vec<String> = declared.clone();
+    expected.extend(CLIENT_WORDS.iter().map(|(word, _)| word.to_string()));
+    expected.sort();
+    assert_eq!(
+        labelled, expected,
+        "状态格的中文名必须正好盖住 `AgentState` 的线上写法加客户端自己翻出来的三个词"
+    );
 }
