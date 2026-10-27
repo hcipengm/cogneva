@@ -397,8 +397,8 @@ fn a_value_no_source_spells_is_reported_missing() {
         serde_json::json!({
             "groups": [{
                 "rules": [
-                    { "promql": "max(cogneva_thing{outcome=\"written\"}) > 0" },
-                    { "promql": "max(cogneva_thing{outcome=\"renamed\"}) > 0" }
+                    { "promql": "max(example_thing{outcome=\"written\"}) > 0" },
+                    { "promql": "max(example_thing{outcome=\"renamed\"}) > 0" }
                 ]
             }]
         })
@@ -409,7 +409,7 @@ fn a_value_no_source_spells_is_reported_missing() {
     std::fs::create_dir_all(&dashboard).expect("dashboard dir");
     std::fs::write(
         dashboard.join("06-grafana-dashboard-configmap.yaml"),
-        "data:\n  1.json: '{\"expr\": \"max(cogneva_thing{outcome=\\\"written\\\"})\"}'\n",
+        "data:\n  1.json: '{\"expr\": \"max(example_thing{outcome=\\\"written\\\"})\"}'\n",
     )
     .expect("dashboard");
     let src = root.join("crates/cog-example/src");
@@ -434,7 +434,7 @@ fn a_value_no_source_spells_is_reported_missing() {
     assert_eq!(
         missing,
         vec![Selection {
-            metric: "cogneva_thing".into(),
+            metric: "example_thing".into(),
             label: "outcome".into(),
             value: "renamed".into(),
         }]

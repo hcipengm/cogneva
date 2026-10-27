@@ -108,10 +108,6 @@ const NOT_A_SERIES: &[(&str, &str)] = &[
         "the prefix on its own, spelled by a test helper that asks whether a string looks like one of this build's series names; it is the start of a name and never a name, and nothing scrapes it",
     ),
     (
-        "cogneva_thing",
-        "a fixture: the deployed-rule label test builds manifests in memory to prove the label check compares against values the code writes, and that scratch manifest needs a series name nothing can produce",
-    ),
-    (
         "cogneva_io_managed",
         "a label key, not a series: the alert mirror selects the Prometheus alerts to copy by carrying this label, and the key travels in `observability.infra_watch.mirror_alerts.label` (cog-observability/src/config.rs) -- the same string is a value of `ALERTS`'s label set, not a name the exposition publishes",
     ),
