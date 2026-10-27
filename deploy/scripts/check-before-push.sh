@@ -41,8 +41,15 @@ run_step() { # run_step <说明> <命令…>
     return 0
 }
 
-# CI 里这两个作业的每一步都是单行 `run: bash <路径> [参数]`，按作业块取出来原样跑。
+# CI 里这两个作业的每一步都是单行 `run: <解释器> <路径> [参数]`，按作业块取出来原样跑。
 # 作业名以 ci.yml 里那两个块的键为准；取不到就红——静静地跑零步是另一种假绿。
+#
+# 认得的是**解释器**，不是字面的 `bash`：这里曾经只匹配 `run: bash <路径>`，于是同一
+# 块里 `run: python3 deploy/scripts/check-shared-test-db-counts.py` 从来没在本机跑过，
+# 推上去才发现它红。取法比 CI 窄的后果不是漏一条判据，是这条门**自称**跑过 CI 的那一段。
+# 所以现在三种结局各有各的说法：认得就跑；多行脚本块与装依赖这两类本地跑不了的印出来
+# （跳过的绿与跑过的绿在读数上一样，所以必须说）；剩下的写法一律红，逼下一次要么写成
+# 解释器加路径，要么把新形式在这里说清楚——不再有「安静地不跑」这一种。
 mapfile -t ci_steps < <(python3 - "${ci}" repo-conventions deploy-parity <<'PY'
 import re, sys
 path, wanted = sys.argv[1], set(sys.argv[2:])
@@ -55,19 +62,48 @@ for raw in open(path, encoding="utf-8"):
         continue
     if job not in wanted:
         continue
-    step = re.match(r"^\s+run: bash (\S.*)$", line)
+    step = re.match(r"^\s+run: (bash|python3|sh) (\S.*)$", line)
     if step:
-        print(step.group(1).strip())
+        print(f"RUN\t{step.group(1)}\t{step.group(2).strip()}")
+        continue
+    if re.match(r"^\s+run: \|\s*$", line):
+        print("SKIP\t多行脚本块")
+        continue
+    if re.match(r"^\s+run: sudo ", line):
+        print("SKIP\t装依赖")
+        continue
+    other = re.match(r"^\s+run: (.*)$", line)
+    if other:
+        print(f"OTHER\t{other.group(1).strip()}")
 PY
 )
 if [ "${#ci_steps[@]}" -eq 0 ]; then
     echo "RED  没能从 ${ci} 取到任何一步：作业块改名了，这条门正静静地什么都不跑" >&2
     failures=$((failures + 1))
 fi
+ran=0; skipped=0; unrecognised=0
 for step in "${ci_steps[@]}"; do
-    read -r -a argv <<<"${step}"
-    run_step "${argv[*]}" bash "${argv[@]}"
+    [ -n "${step}" ] || continue
+    IFS=$'\t' read -r kind a b <<<"${step}"
+    case "${kind}" in
+        RUN)
+            ran=$((ran + 1))
+            read -r -a argv <<<"${b}"
+            run_step "${b}" "${a}" "${argv[@]}"
+            ;;
+        SKIP)
+            skipped=$((skipped + 1))
+            printf 'SKIP  %s（%s）\n' "${b}" "${a}"
+            ;;
+        OTHER)
+            unrecognised=$((unrecognised + 1))
+            printf 'RED   CI 里这一步本地认不出，推之前不会跑它：%s\n' "${b}" >&2
+            failures=$((failures + 1))
+            ;;
+    esac
 done
+printf '== 从 %s 取到 %d 步，跳过 %d 步（多行脚本块 / 装依赖），认不出 %d 步\n' \
+    "${ci}" "${ran}" "${skipped}" "${unrecognised}"
 
 # 脚本测试：CI 用同一个 glob 跑，这里照抄它的形状而不是列名字。
 mapfile -t script_tests < <(printf '%s\n' deploy/scripts/tests/*.test.sh .github/scripts/tests/*.test.sh)
