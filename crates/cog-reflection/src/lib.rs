@@ -164,7 +164,11 @@ pub use reviewer::PeriodicReviewer;
 pub use sandbox::{enforce_sandbox_boundary, BoundaryDecision, SandboxKind, SandboxSignals};
 pub use signal_watcher::{spawn_signal_watcher_loop, SignalWatcherConfig};
 pub use squad::DefaultSquadReflection;
-pub use store_readouts::{ExpectedStore, RestoreExpectation, StoreReadouts, META_LEARNING_POLICY};
+pub use store_readouts::{
+    decision_stats_path, policies_path, ExpectedStore, RestoreExpectation, StoreReadouts,
+    DATA_SUBDIR, DECISION_STATS_FILE, META_LEARNING_POLICY, POLICIES_SUBDIR,
+    RESTORE_EXPECTATION_FILE,
+};
 pub use types::*;
 
 /// The words this crate calls the two code platforms by.

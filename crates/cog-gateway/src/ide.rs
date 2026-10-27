@@ -28,6 +28,32 @@ use crate::error::ApiError;
 /// 工作区根的父目录；用户子目录建在它下面。
 pub const WORKSPACE_ROOT_ENV: &str = "COGNEVA_WORKSPACE_ROOT";
 
+/// 没被 [`WORKSPACE_ROOT_ENV`] 挪走时，工作区落在数据根下的这一级。
+///
+/// 备份侧按 [`workspace_root`] 取同一棵树的源与目标，不自己拼这个字面量：部署一旦
+/// 把根挪到别处（比如挪到一块单独的卷上），备份若仍按 `<data_dir>/workspace` 找，
+/// 那里通常**不存在**——`is_dir()` 为假就整段跳过，包照样生成、读数里也没有这一项，
+/// 与「这个部署根本没有工作区」长得一模一样；恢复端同理，会把工作区写回一个编辑器
+/// 永远不看的位置。
+pub const WORKSPACE_SUBDIR: &str = "workspace";
+
+/// 编辑器工作区根：显式覆盖优先，否则 `<data_dir>/workspace`。
+///
+/// 谁读工作区、谁把工作区打进包里，都从这里取——分成两份写法时，两边的分歧不会
+/// 报错，只会让其中一边对着一个空目录工作。
+pub fn workspace_root(data_dir: &Path) -> PathBuf {
+    workspace_root_with(non_empty_env(WORKSPACE_ROOT_ENV).as_deref(), data_dir)
+}
+
+/// [`workspace_root`] 去掉读环境的那些字节，好让判据在一个进程里并行跑——判据改
+/// 环境变量时，同一进程里每个碰工作区的用例都会跟着看见，红得莫名其妙。
+fn workspace_root_with(explicit: Option<&str>, data_dir: &Path) -> PathBuf {
+    match explicit {
+        Some(root) => PathBuf::from(root),
+        None => data_dir.join(WORKSPACE_SUBDIR),
+    }
+}
+
 /// 应用数据目录（与身份文件、数仓同一个卷）。变量名与默认值都取自
 /// [`cog_core::paths`]：同一条路径的第二份声明会在有人只改一处时静默分叉。
 const DEFAULT_DATA_DIR: &str = cog_core::paths::DATA_DIR;
@@ -218,14 +244,11 @@ fn user_root(state_root: &Path, claims: &Claims) -> Result<PathBuf, ApiError> {
 
 /// 进程内配置的工作区根。
 fn configured_root() -> PathBuf {
-    if let Some(explicit) = non_empty_env(WORKSPACE_ROOT_ENV) {
-        return PathBuf::from(explicit);
-    }
     let data = non_empty_env(cog_core::paths::DATA_DIR_ENV)
         .unwrap_or_else(|| DEFAULT_DATA_DIR.to_string());
     // 只拼一级：每个用户的 UUID 目录直接落在数据根的 workspace 下，再多一层
     // 就多一个要在数据根台账里登记的子目录，而它并不承载独立语义。
-    PathBuf::from(data).join("workspace")
+    workspace_root(Path::new(&data))
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -1331,6 +1354,24 @@ mod tests {
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("temp dir")
+    }
+
+    #[test]
+    fn an_explicit_workspace_root_replaces_the_data_dir_one() {
+        let data = tempdir();
+        assert_eq!(
+            workspace_root_with(None, data.path()),
+            data.path().join(WORKSPACE_SUBDIR),
+            "没设覆盖时工作区落在数据根的 {} 下",
+            WORKSPACE_SUBDIR
+        );
+        let elsewhere = tempdir();
+        assert_eq!(
+            workspace_root_with(Some(&elsewhere.path().display().to_string()), data.path()),
+            elsewhere.path(),
+            "设了 {} 就该整个换掉，不是叠在数据根下面",
+            WORKSPACE_ROOT_ENV
+        );
     }
 
     #[test]

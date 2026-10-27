@@ -35,6 +35,38 @@ pub const META_LEARNING_POLICY: &str = "meta_learning.mode";
 /// 就从「有数」变成「空向量」，而空向量与「这一族从没跑过」是同一个读数。
 pub const LABEL_READOUT: &str = "readout";
 
+/// 本进程数据根下装策略产物与调参证据的那一层目录。
+///
+/// 写方（引擎把决策统计落盘）、恢复端（交接单）、备份与恢复（取证据、写证据）
+/// 都按这一条定位。事实是：备份侧取文件用的是 `is_file()`，路径不对就静默跳过
+/// 一整段证据，而「包里没带」与「本来就没有」在清单上同形。所以这里的相对位置
+/// 只能有一份，不能各拼各的。
+pub const DATA_SUBDIR: &str = "meta_learning";
+
+/// 决策统计表在那层目录里的文件名。
+///
+/// 与 [`DATA_SUBDIR`] 分开：备份包内的相对布局与数据根内的相对布局是同一条路径，
+/// 两侧都按这两个常量拼，改目录名不会让其中一侧留在旧名字下。
+pub const DECISION_STATS_FILE: &str = "decision_stats.json";
+
+/// 决策统计表在某个数据根里的位置：`<data_dir>/meta_learning/decision_stats.json`。
+pub fn decision_stats_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(DATA_SUBDIR).join(DECISION_STATS_FILE)
+}
+
+/// 策略库在数据根里的那一层。写方（进程造引擎时挂的库）与备份方（整树抄进包）
+/// 各拼一份字面量时，一处改名就让另一处的 `is_dir()` 为假——包里少一整棵策略树，
+/// 而清单上「没带」与「本来没有」同形。
+pub const POLICIES_SUBDIR: &str = "policies";
+
+/// 策略库在某个数据根里的位置。
+pub fn policies_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(POLICIES_SUBDIR)
+}
+
+/// 恢复交接单在 [`DATA_SUBDIR`] 里的文件名。
+pub const RESTORE_EXPECTATION_FILE: &str = "restore_expectation.json";
+
 /// 恢复端写进数据根的交接单：包里的 ACTIVE 版本与决策证据规模。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreExpectation {
@@ -62,9 +94,7 @@ impl RestoreExpectation {
     /// 被「每个一级子目录都要分类」的门管着，为一张一次性单子新开一格，等于让每个
     /// 部署都得为它写一条分类。
     pub fn path_in(data_dir: &Path) -> PathBuf {
-        data_dir
-            .join("meta_learning")
-            .join("restore_expectation.json")
+        data_dir.join(DATA_SUBDIR).join(RESTORE_EXPECTATION_FILE)
     }
 
     /// 取走交接单：读到就消费，读不出来就当作没有。

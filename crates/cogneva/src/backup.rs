@@ -2217,8 +2217,8 @@ async fn export_decision_stats(pool: &PgPool, staging: &Path, report: &mut Artif
     let staged = staging
         .join("artifacts")
         .join("app")
-        .join("meta_learning")
-        .join("decision_stats.json");
+        .join(cog_reflection::DATA_SUBDIR)
+        .join(cog_reflection::DECISION_STATS_FILE);
     let file = std::fs::read_to_string(&staged).ok();
     let from_file = file.as_deref().map(file_group_count).unwrap_or(0);
     let Some(body) = merge_decision_stats(file.as_deref(), &cells) else {
@@ -2361,19 +2361,25 @@ async fn collect_artifact_root(
         ..Default::default()
     };
 
-    let policies_src = dir.join("policies");
+    let policies_src = cog_reflection::policies_path(dir);
     if policies_src.is_dir() {
         report.policies_present = true;
-        let dst = staging.join("artifacts").join(root).join("policies");
+        let dst = staging
+            .join("artifacts")
+            .join(root)
+            .join(cog_reflection::POLICIES_SUBDIR);
         copy_policy_tree(&policies_src, &dst)?;
         report.policy_stores = describe_policy_stores(&policies_src).await?;
     }
 
-    let stats_src = dir.join("meta_learning").join("decision_stats.json");
+    let stats_src = cog_reflection::decision_stats_path(dir);
     if stats_src.is_file() {
-        let dst = staging.join("artifacts").join(root).join("meta_learning");
+        let dst = staging
+            .join("artifacts")
+            .join(root)
+            .join(cog_reflection::DATA_SUBDIR);
         std::fs::create_dir_all(&dst)?;
-        std::fs::copy(&stats_src, dst.join("decision_stats.json"))?;
+        std::fs::copy(&stats_src, dst.join(cog_reflection::DECISION_STATS_FILE))?;
         let bytes = std::fs::metadata(&stats_src)?.len();
         let text = std::fs::read_to_string(&stats_src)?;
         let (groups, trials) = decision_stats_counts(&text)?;
@@ -2387,9 +2393,12 @@ async fn collect_artifact_root(
     // 编辑器工作区整树进包。它不像策略库那样有「从哪重建」的第二条路：用户在
     // 里面新建的文件只有这一份，而机器换掉时数据根就是全部。逐文件复制，清单记
     // 下文件数与字节数，恢复端据此判「抄过去的这一份是不是当年那一份」。
-    let workspace_src = dir.join("workspace");
+    let workspace_src = cog_gateway::ide::workspace_root(dir);
     if workspace_src.is_dir() {
-        let dst = staging.join("artifacts").join(root).join("workspace");
+        let dst = staging
+            .join("artifacts")
+            .join(root)
+            .join(cog_gateway::ide::WORKSPACE_SUBDIR);
         let (files, bytes) = copy_tree(&workspace_src, &dst)?;
         report.workspace = Some(WorkspaceReport { files, bytes });
     }
@@ -3247,9 +3256,11 @@ fn write_restore_expectation(
     if expectation.policy_stores.is_empty() && expectation.decision_trials.is_none() {
         return Ok(());
     }
-    let dir = target.join("meta_learning");
-    std::fs::create_dir_all(&dir)?;
+    // 目录由交接单自己的位置决定：它落在哪一层，那一层就是要建的。
     let path = cog_reflection::RestoreExpectation::path_in(target);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     std::fs::write(&path, serde_json::to_vec_pretty(&expectation)?)?;
     Ok(())
 }
@@ -3281,11 +3292,11 @@ async fn stage_artifact_root(
     readings: &mut Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if root.policies_present {
-        let src = base.join("policies");
+        let src = base.join(cog_reflection::POLICIES_SUBDIR);
         if !src.is_dir() {
             return Err(format!("{} 不在包里，但清单说这个根有策略库", src.display()).into());
         }
-        let staged = scratch.join("policies");
+        let staged = scratch.join(cog_reflection::POLICIES_SUBDIR);
         copy_policy_tree(&src, &staged)?;
         // 清单是一条一条写的，多出来的库没有声明就没有可比的对象——不许静默
         // 写进去，也不许静默丢掉。两边都数，对不上就停。
@@ -3308,29 +3319,31 @@ async fn stage_artifact_root(
             readings.push(line);
         }
         sync_tree(&staged)?;
-        replace_dir(&staged, &target.join("policies"))?;
+        replace_dir(&staged, &cog_reflection::policies_path(target))?;
     }
 
     if let Some(stats) = &root.decision_stats {
-        let src = base.join("meta_learning").join("decision_stats.json");
-        let staged = scratch.join("decision_stats.json");
+        let src = base
+            .join(cog_reflection::DATA_SUBDIR)
+            .join(cog_reflection::DECISION_STATS_FILE);
+        let staged = scratch.join(cog_reflection::DECISION_STATS_FILE);
         std::fs::copy(&src, &staged)?;
         std::fs::File::open(&staged)?.sync_all()?;
         let line = verify_one_stats(&staged, &root.root, stats)
             .map_err(|e| format!("{}/meta_learning/decision_stats.json: {e}", root.root))?;
         readings.push(line);
-        let dir = target.join("meta_learning");
+        let dir = target.join(cog_reflection::DATA_SUBDIR);
         std::fs::create_dir_all(&dir)?;
-        std::fs::rename(&staged, dir.join("decision_stats.json"))?;
+        std::fs::rename(&staged, dir.join(cog_reflection::DECISION_STATS_FILE))?;
         std::fs::File::open(&dir)?.sync_all()?;
     }
 
     if let Some(workspace) = &root.workspace {
-        let src = base.join("workspace");
+        let src = base.join(cog_gateway::ide::WORKSPACE_SUBDIR);
         if !src.is_dir() {
             return Err(format!("{} 不在包里，但清单说这个根有工作区", src.display()).into());
         }
-        let staged = scratch.join("workspace");
+        let staged = scratch.join(cog_gateway::ide::WORKSPACE_SUBDIR);
         let (files, bytes) = copy_tree(&src, &staged)?;
         if files != workspace.files || bytes != workspace.bytes {
             return Err(format!(
@@ -3342,7 +3355,7 @@ async fn stage_artifact_root(
             .into());
         }
         sync_tree(&staged)?;
-        replace_dir(&staged, &target.join("workspace"))?;
+        replace_dir(&staged, &cog_gateway::ide::workspace_root(target))?;
         readings.push(format!(
             "{}: 工作区 {files} 个文件 / {bytes} 字节（清单一致）",
             root.root
@@ -4328,7 +4341,7 @@ async fn verify_artifact_stores(
     for root in &manifest.artifacts {
         let base = pkg_dir.join("artifacts").join(&root.root);
         if root.policies_present {
-            let store = cog_reflection::PolicyStore::new(base.join("policies"));
+            let store = cog_reflection::PolicyStore::new(cog_reflection::policies_path(&base));
             for reported in &root.policy_stores {
                 drill.artifacts_expected += 1;
                 match verify_one_store(&store, &root.root, reported).await {
@@ -4344,7 +4357,7 @@ async fn verify_artifact_stores(
         }
         if let Some(workspace) = &root.workspace {
             drill.artifacts_expected += 1;
-            match measure_tree(&base.join("workspace")) {
+            match measure_tree(&base.join(cog_gateway::ide::WORKSPACE_SUBDIR)) {
                 Ok((files, bytes)) if files == workspace.files && bytes == workspace.bytes => {
                     drill.artifacts_restored += 1;
                     drill
@@ -4362,7 +4375,7 @@ async fn verify_artifact_stores(
         }
         if let Some(stats) = &root.decision_stats {
             drill.artifacts_expected += 1;
-            let path = base.join("meta_learning").join("decision_stats.json");
+            let path = cog_reflection::decision_stats_path(&base);
             match verify_one_stats(&path, &root.root, stats) {
                 Ok(line) => {
                     drill.artifacts_restored += 1;
@@ -4432,10 +4445,7 @@ async fn decision_roundtrip(
         .iter()
         .find(|r| r.decision_stats.is_some())
         .ok_or("包里没有任何决策统计段")?;
-    let path = scratch_root
-        .join(&root.root)
-        .join("meta_learning")
-        .join("decision_stats.json");
+    let path = cog_reflection::decision_stats_path(&scratch_root.join(&root.root));
     let snapshot = cog_reflection::DecisionStatsSnapshot::new(path.clone());
     let engine = cog_reflection::MetaLearningEngine::with_durable_state(
         std::sync::Arc::new(cog_reflection::InMemoryRecorder::default()),
@@ -6643,6 +6653,137 @@ mod tests {
     fn a_segment_stamp_that_does_not_parse_is_refused() {
         let manifest = manifest_with_segments(stamps(&[("postgres", "不是时刻")]), 300);
         assert!(check_segment_skew(&manifest).is_err());
+    }
+
+    /// 引擎把决策统计写在哪，备份就去哪取——这条接线没有任何东西核过。
+    ///
+    /// 写方按数据根基拼一条路径落盘，备份方按数据根再拼一条路径取。备份侧取
+    /// 文件用的是 `is_file()`：两个名字一旦不一样，它不报错、不告警，只是那一段
+    /// 证据整段不进包，而「包里没带」与「本来就没有」在清单上同形——换机之后
+    /// 调参证据全丢，谁也不会在备份那一刻知道。所以这里不比对字符串，而是让
+    /// 引擎真的写下一次决策，再问备份有没有取到。
+    #[tokio::test]
+    async fn the_engine_writes_decision_stats_where_the_backup_looks() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = cog_reflection::MetaLearningEngine::with_durable_state(
+            std::sync::Arc::new(cog_reflection::InMemoryRecorder::new()),
+            cog_reflection::DecisionStatsSnapshot::new(cog_reflection::decision_stats_path(
+                data.path(),
+            )),
+        )
+        .await;
+        let group = cog_core::DecisionGroupKey::by_task_type("backup-wiring");
+        engine
+            .record(
+                cog_core::DecisionCategory::PgeMode,
+                &group,
+                "adopt",
+                cog_core::DecisionOutcome::Success,
+            )
+            .await
+            .unwrap();
+        let written = cog_reflection::decision_stats_path(data.path());
+        assert!(
+            written.is_file(),
+            "引擎没有落在它自己声明的位置上：{}",
+            written.display()
+        );
+
+        let staging = tempfile::tempdir().unwrap();
+        let report = collect_artifact_root("app", data.path(), staging.path())
+            .await
+            .unwrap();
+        assert!(
+            report.decision_stats.is_some(),
+            "备份没取到引擎刚写下的那份决策统计——它按另一条路径找，而那边 is_file() \
+             为假时不报错"
+        );
+        assert!(
+            staging
+                .path()
+                .join("artifacts/app")
+                .join(cog_reflection::DATA_SUBDIR)
+                .join(cog_reflection::DECISION_STATS_FILE)
+                .is_file(),
+            "包的产物层里没有那份统计表"
+        );
+    }
+
+    /// 进程把策略库建在哪，备份就去哪抄——这条接线同样没有任何东西核过。
+    ///
+    /// 备份侧判的是 `is_dir()`：两侧的目录名一旦分家，它不报错，只是整棵策略树
+    /// 不进包，清单上 `policies_present` 与「这个根本来没有策略库」同形。恢复端
+    /// 不会核对一个没被声明的东西，于是换机之后策略链从零开始，而备份那一刻的
+    /// 读数全绿。
+    #[tokio::test]
+    async fn the_store_the_process_builds_is_the_tree_the_backup_copies() {
+        let data = tempfile::tempdir().unwrap();
+        let store = cog_reflection::PolicyStore::new(cog_reflection::policies_path(data.path()));
+        store
+            .save_new_version(
+                cog_reflection::META_LEARNING_POLICY,
+                serde_json::json!({"min_samples": 40}),
+                "t",
+            )
+            .await
+            .unwrap();
+        let written =
+            cog_reflection::policies_path(data.path()).join(cog_reflection::META_LEARNING_POLICY);
+        assert!(
+            written.is_dir(),
+            "策略库没有落在它自己声明的位置上：{}",
+            written.display()
+        );
+
+        let staging = tempfile::tempdir().unwrap();
+        let report = collect_artifact_root("app", data.path(), staging.path())
+            .await
+            .unwrap();
+        assert!(
+            report.policies_present,
+            "备份没找到进程刚建的策略库——它按另一个目录名找，而那边 is_dir() 为假时不报错"
+        );
+        assert_eq!(
+            report.policy_stores.len(),
+            1,
+            "包里带的策略库条数与盘上不符：{:?}",
+            report.policy_stores
+        );
+        assert!(staging
+            .path()
+            .join("artifacts/app")
+            .join(cog_reflection::POLICIES_SUBDIR)
+            .is_dir());
+    }
+
+    #[tokio::test]
+    async fn the_workspace_the_editor_serves_is_the_workspace_the_backup_carries() {
+        let data = tempfile::tempdir().unwrap();
+        // 源树按编辑器那一侧的取法建：工作区根在部署里可能被
+        // `COGNEVA_WORKSPACE_ROOT` 挪走，备份要跟着挪，不能自己拼一个目录名。
+        let user = cog_gateway::ide::workspace_root(data.path())
+            .join("6f1c2a44-0000-0000-0000-000000000001");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("draft.md"), b"hi").unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let report = collect_artifact_root("app", data.path(), staging.path())
+            .await
+            .unwrap();
+        let workspace = report.workspace.expect(
+            "备份没取到编辑器正在用的那棵树：它按另一个目录找，而那边 is_dir() 为假时不报错，\
+             包照样生成、清单里也没有这一项",
+        );
+        assert_eq!(workspace.files, 1, "包里的工作区文件数与源树不符");
+        assert!(
+            staging
+                .path()
+                .join("artifacts/app")
+                .join(cog_gateway::ide::WORKSPACE_SUBDIR)
+                .join("6f1c2a44-0000-0000-0000-000000000001/draft.md")
+                .is_file(),
+            "包的产物层里没有那份草稿"
+        );
     }
 
     /// 恢复侧要真的把产物层写回去：只把包放进目录不算恢复。

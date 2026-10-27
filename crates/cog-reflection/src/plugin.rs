@@ -467,16 +467,16 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // 产物级进化：策略产物版本化存储 +
         // 哈希链完整性 + 热替换。MetaLearningEngine 的推荐参数从策略产物
         // active 版本读取；ArtifactEvolution 供评估侧在统计显著时升级策略。
-        let policy_dir = format!("{}/policies", ctx.config().app.data_dir);
+        let policy_dir = crate::policies_path(std::path::Path::new(&ctx.config().app.data_dir));
         let policy_store = crate::PolicyStore::new(&policy_dir);
         // 决策聚合是进程内的，重启即空；而调参驱动与推荐路径都读它，所以它
         // 必须落在本进程自己的数据卷上——否则「攒够证据才调参」会被每次换版
         // 清零，参数搜索在频繁重建 Pod 的部署上永远到不了 min_trials。快照
         // 只被本进程读写，不碰共享库表，也不依赖 memory 后端。
-        let stats_path = format!(
-            "{}/meta_learning/decision_stats.json",
-            ctx.config().app.data_dir
-        );
+        let stats_path =
+            crate::decision_stats_path(std::path::Path::new(&ctx.config().app.data_dir))
+                .display()
+                .to_string();
         // 一个进程只造一个引擎，写侧和读侧共用同一个对象：squad 把决策结果
         // 记进它，推荐路径从它的 active 版本读参数，调参驱动也从它读已记录
         // 的结果。任何一侧拿到的是另一个实例，两边就都活着却谁也看不见谁
@@ -528,7 +528,10 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         self.artifact_evolution = Some(artifact_evolution.clone());
         let engine = Arc::new(engine);
         ctx.publish(artifact_evolution.clone());
-        info!(dir = %policy_dir, "artifact-level evolution policy store enabled");
+        info!(
+            dir = %policy_dir.display(),
+            "artifact-level evolution policy store enabled"
+        );
 
         ctx.publish(engine.clone());
         // Readers take `dyn cog_core::ReflectionEngine` through the service
