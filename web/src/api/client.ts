@@ -393,14 +393,17 @@ export interface SearchFallbackResult {
   message: string;
 }
 
+/** 搜索回退的配置面。读与写是同一个地址，只有方法不同。 */
+const SEARCH_FALLBACK_PATH = '/api/v1/admin/search-fallback';
+
 export async function getSearchFallback(): Promise<SearchFallbackStatus> {
-  return api.get<SearchFallbackStatus>('/api/v1/admin/search-fallback');
+  return api.get<SearchFallbackStatus>(SEARCH_FALLBACK_PATH);
 }
 
 export async function saveSearchFallback(
   upstreams: SearchFallbackEntryPayload[]
 ): Promise<SearchFallbackResult> {
-  return api.post<SearchFallbackResult>('/api/v1/admin/search-fallback', {
+  return api.post<SearchFallbackResult>(SEARCH_FALLBACK_PATH, {
     upstreams,
   });
 }
