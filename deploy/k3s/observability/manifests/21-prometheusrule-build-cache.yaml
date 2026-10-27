@@ -1,0 +1,67 @@
+# 构建缓存越过它的界之后的告警。
+#
+# 为什么需要：这条读数的四环里缺的是最后一个——生产者有、序列有、面板上画着
+# （`06-grafana-dashboard-configmap.yaml`），而没有任何一条规则在读它。界被越过这件事
+# 于是只能靠人恰好点开面板才看得见，而面板与「有人看」之间没有关系：这一族上一个
+# 被这样放着的读数，在表里正 firing 了很久之后才被人发现。
+#
+# 两条**分开写**，因为坏法不同、修法也不同：
+#
+#   一、回收跑过了，被允许删的都删了，缓存仍高于界。这不是「还没轮到下一趟」——
+#       它说的是「这条界用这个缓存够不着」：界定得比工作集低，或者保留地板占住了
+#       必须释放的那一块。修的是界或地板，不是等下一趟。
+#   二、缓存越过界之后一直没有回到界下。回收按拍距做，一趟拿不到槽（有构建正在往
+#       这里写）就顺延到下一趟；顺延是正常的，连续很多趟都顺延就不是。修的是槽的
+#       占用（谁一直持有它），或者回收根本没在跑。
+#
+# 把两条合成一条，会出现「界够不着」与「暂时没人收」读成同一行：前者再等一万年也
+# 不会自己好，后者下一趟就好，而告警只能给出一个结论。
+#
+# 第二条的界不写死成秒数：一趟多长随拍距配，拍距是一个由生产者发布的数。把界写成
+# 常数，等于把「几趟」这个意思抄进规则里，拍距改一次它就悄悄变了意思。所以它比的是
+# 拍距的倍数，`max by` 两侧取同一组标签，是一对一的比较。
+#
+# 第一条的判据只跟 0 比：它问的是「有没有够不着」，不是「还差多少」——差多少是那几格
+# 读数自己答的，规则再抄一遍就是第二个口径。
+#
+# 两条都带 `cogneva_io_managed`（进告警镜像的投递名单）与 `cogneva_io_face`（响了归哪个
+# 面）。面随告警行流进存库行，「面 → 人」那一跳在面主表上 join，换面主不用改规则。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cogneva-build-cache
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: cogneva-build-cache
+      rules:
+        # 一、回收跑过、够不着。`for` 取 15 分钟而不是更长：这一态不会自己好，等得
+        # 越久只是越久没人动；而它也不会抖——够不着是缓存内容与界的关系，不是一次采样
+        # 的涨落。
+        - alert: CognevaBuildCacheCapUnmet
+          expr: max by (job, dir) (cogneva_build_target_unmet_bytes) > 0
+          for: 15m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "资源管理"
+            severity: warning
+          annotations:
+            summary: "{{ $labels.job }} 的构建缓存比它的界高 {{ $value }} 字节，而回收已经把能删的都删了"
+            description: "不是「还没轮到下一趟回收」：一趟已经跑过，删除结果仍高于界。看同一组标签的 cap 与其 source——source=derived 说明界是跟着卷算出来的，卷紧了界就会低于缓存的工作集；要么把界定对，要么腾出卷。这条规则不判差多少，差多少读 unmet/over_limit 两格。"
+
+        # 二、越过界之后连着很多趟没回到界下。倍数取「六趟」：一趟正常回收之后缓存就
+        # 掉回界下、这个计时从零重新开始，所以连续六趟都还在界上意味着这段时间里没有
+        # 任何一趟成功过。`for` 与第一条同为 15 分钟，比一趟拍距长，短了会在每次正常
+        # 的「刚越界、等着回收」时假响。
+        - alert: CognevaBuildCacheOverCap
+          expr: max by (job, dir) (cogneva_build_target_over_cap_seconds) > 6 * max by (job, dir) (cogneva_build_target_scan_interval_seconds)
+          for: 15m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "资源管理"
+            severity: warning
+          annotations:
+            summary: "{{ $labels.job }} 的构建缓存已连续六趟读数以上高于它的界（{{ $value }} 秒）"
+            description: "数值是「这一轮越界已经持续了多久」，不是缓存大小。看同一组标签的 over_cap_total 按 outcome 拆开：busy 在涨说明构建一直占着槽、回收拿不到机会；ungated 在涨说明没有任何东西能说明「此刻有没有构建在跑」，于是谁都不敢删；两者都不涨而这一格还在涨，说明回收没在跑，看它自己的活体。"

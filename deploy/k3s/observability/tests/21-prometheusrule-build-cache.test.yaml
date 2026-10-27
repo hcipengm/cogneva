@@ -1,0 +1,110 @@
+# promtool 规则单测：构建缓存那两条判词**真的会 firing**。
+#
+# 为什么要有这一层：两条规则都长成「一个 gauge 比一个界」的形状，而形状对不代表会响。
+# 把 `unmet > 0` 写成 `>= 0`（序列一直在、值一直是 0）、把拍距的倍数写成 `0 *`
+# （只要有数就响）、把 `for:` 写成 `15y`——这三种改法在结构门眼里全都合法，而它们分别
+# 意思是「永远响」「永远不响」。这里让 Prometheus 自己的规则引擎跑一遍：先造序列，断言
+# 「界之前不许响、界之后必须响」，每一格都带反向证据。
+#
+# 第二条规则的第二格是这份夹具里最重要的一格：它把两份缓存放在同一份输入里，一份的
+# 拍距长、一份的拍距短，越界的秒数相同。判它俩配不配得上，只能靠标签配对——那一格因此
+# 也是「`max by (job, dir)` 两侧真的按同一组标签配对」的证据，而结构门判不了这件事。
+#
+# 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh \
+#         deploy/k3s/observability/manifests/21-prometheusrule-build-cache.yaml \
+#         deploy/k3s/observability/tests/21-prometheusrule-build-cache.test.yaml
+rule_files:
+  - ../manifests/21-prometheusrule-build-cache.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 一、够不着：`unmet_bytes` 一直是正的，`for: 15m` 之前空、之后 firing。
+  # 反向证据在前半格——刚越界就响，等于把「还没轮到下一趟」报成「够不着」。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_target_unmet_bytes{job="cogneva-evolution",dir="1:1"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: CognevaBuildCacheCapUnmet
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: CognevaBuildCacheCapUnmet
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "资源管理"
+              job: cogneva-evolution
+              dir: "1:1"
+
+  # 二、够不着的负对照：`unmet_bytes` 一直是 0（缓存刚好在界上），全程不许响。
+  # 没有这一格，把界写成 `>= 0` 也能过上面那一格。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_target_unmet_bytes{job="cogneva-evolution",dir="1:1"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaBuildCacheCapUnmet
+        exp_alerts: []
+
+  # 三、连续越界：拍距 300 秒，越界秒数每分钟涨 60，第 30 分钟越过 1800，再等 `for: 15m`
+  # ⇒ 第 45 分钟整亮。第 44 分钟它还在 pending，不许响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_target_over_cap_seconds{job="cogneva-evolution",dir="1:1"}'
+        values: '0+60x50'
+      - series: 'cogneva_build_target_scan_interval_seconds{job="cogneva-evolution",dir="1:1"}'
+        values: '300x51'
+    alert_rule_test:
+      - eval_time: 44m
+        alertname: CognevaBuildCacheOverCap
+        exp_alerts: []
+      - eval_time: 46m
+        alertname: CognevaBuildCacheOverCap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "资源管理"
+              job: cogneva-evolution
+              dir: "1:1"
+
+  # 四、界的负对照：越界秒数一直小于六倍拍距，涨到 1700 就停住 ⇒ 全程不许响。
+  # 这一格钉的是「界不是 > 0」：只要写成 `over_cap_seconds > 0`，它第 1 分钟就亮了。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_target_over_cap_seconds{job="cogneva-evolution",dir="1:1"}'
+        values: '1700x60'
+      - series: 'cogneva_build_target_scan_interval_seconds{job="cogneva-evolution",dir="1:1"}'
+        values: '300x61'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: CognevaBuildCacheOverCap
+        exp_alerts: []
+
+  # 五、两份缓存、同样越界 1000 秒、拍距不同：长拍距那份（六倍 = 1800）仍然是清白的，
+  # 短拍距那份（六倍 = 360）早该亮。同一份输入里两格一起断言，才排得掉「拿全局最小拍距
+  # 去配所有缓存」那种写法——它会把第一份也报红。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_target_over_cap_seconds{job="cogneva-evolution",dir="1:1"}'
+        values: '1000x50'
+      - series: 'cogneva_build_target_scan_interval_seconds{job="cogneva-evolution",dir="1:1"}'
+        values: '300x51'
+      - series: 'cogneva_build_target_over_cap_seconds{job="cogneva-sandbox-executor",dir="2:2"}'
+        values: '1000x50'
+      - series: 'cogneva_build_target_scan_interval_seconds{job="cogneva-sandbox-executor",dir="2:2"}'
+        values: '60x51'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaBuildCacheOverCap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "资源管理"
+              job: cogneva-sandbox-executor
+              dir: "2:2"
