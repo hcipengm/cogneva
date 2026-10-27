@@ -93,39 +93,25 @@ runtime_asset_not_refreshed	cogneva_runtime_asset_state	error_only_state	Same ga
 # --- code_not_deployed: none of the inbox rules any more --
 
 
-# --- code_not_deployed: the checkpoint capacity sweep of 2026-10-27 --------
-# The sweep and its five cells are in git and not in the running image yet, so
-# these rules cannot fire: every selector below names a series nobody has
-# published. These rows are deleted after the rollout, per the rule at the top
-# of this file. The event log's sweep needed no such row -- its code is already
-# in the running image, and its readings read back from the live name face.
-checkpoint_store_over_capacity	cogneva_checkpoints_over_capacity,cogneva_checkpoints_over_capacity_observed_timestamp_seconds	code_not_deployed	The capacity verdict and its companion are emitted by the checkpoint sweep, which is only in git today.
-checkpoint_store_unpruned	cogneva_checkpoints_rows,cogneva_checkpoints_rows_observed_timestamp_seconds,cogneva_checkpoints_budget_rows	code_not_deployed	The row count, its companion and the budget are all emitted by the same sweep; the budget carries no companion in this expression, so none is declared here.
-checkpoint_store_sweep_failed	cogneva_checkpoint_sweep_failed,cogneva_checkpoint_sweep_failed_observed_timestamp_seconds	code_not_deployed	The pass-outcome cell is written by the same sweep, only in git today.
-
-# --- code_not_deployed: the prompt-and-response archive's retention of 2026-10-27 ---
-# The retention loop and its five cells are in git and not in the running image
-# yet, so neither rule can fire: the archive's readings have no publisher until
-# the next rollout. These rows go with the same pass that deletes the ones above.
-llm_exchange_retention_behind	gateway_llm_exchange_oldest_age_seconds,gateway_llm_exchange_oldest_age_seconds_observed_timestamp_seconds,gateway_llm_exchange_keep_seconds,gateway_llm_exchange_keep_seconds_observed_timestamp_seconds	code_not_deployed	Both sides of the comparison come from the retention loop, which is only in git today -- the age of the oldest row and the retention the process enforces are published by the same pass, each with its own companion clock.
-llm_exchange_retention_pass_failed	gateway_llm_exchange_sweep_failed,gateway_llm_exchange_sweep_failed_observed_timestamp_seconds	code_not_deployed	The pass-outcome cell is written by the same retention loop, only in git today.
-
-# --- code_not_deployed: the task event archive's retention of 2026-10-27 ------
-# The retention loop and its five cells are in git and not in the running image
-# yet, so neither rule can fire: the archive's readings have no publisher until
-# the next rollout. These rows go with the same pass that deletes the ones above.
-task_event_archive_behind	cogneva_task_events_oldest_age_seconds,cogneva_task_events_oldest_age_seconds_observed_timestamp_seconds,cogneva_task_events_keep_seconds,cogneva_task_events_keep_seconds_observed_timestamp_seconds	code_not_deployed	Both sides of the comparison come from the retention loop, which is only in git today -- the age of the oldest row and the retention the process enforces are published by the same pass, each with its own companion clock.
-task_event_archive_pass_failed	cogneva_task_events_sweep_failed,cogneva_task_events_sweep_failed_observed_timestamp_seconds	code_not_deployed	The pass-outcome cell is written by the same retention loop, only in git today.
-
-# --- code_not_deployed: the token ledger's retention of 2026-10-27 -------------
-# Same shape as the two archives above, with one difference that is why three
-# rows are needed rather than two: this ledger's hourly fold is what decides how
-# far back a row may be deleted, so the sweep publishes a pair of readings about
-# the rows the fold has not reached yet. Both rules read those; the third reads
-# the pass outcome. All five cells arrive with the next rollout.
-llm_usage_retention_behind	cogneva_llm_usage_oldest_age_seconds,cogneva_llm_usage_oldest_age_seconds_observed_timestamp_seconds,cogneva_llm_usage_keep_seconds,cogneva_llm_usage_keep_seconds_observed_timestamp_seconds	code_not_deployed	Both sides of the comparison come from the retention loop, which is only in git today -- the age of the oldest row and the retention the process enforces are published by the same pass, each with its own companion clock.
-llm_usage_fold_behind	cogneva_llm_usage_uncovered_rows,cogneva_llm_usage_uncovered_rows_observed_timestamp_seconds,cogneva_llm_usage_uncovered_oldest_age_seconds,cogneva_llm_usage_uncovered_oldest_age_seconds_observed_timestamp_seconds,cogneva_llm_usage_keep_seconds,cogneva_llm_usage_keep_seconds_observed_timestamp_seconds	code_not_deployed	The uncovered pair and the retention are all published by the same sweep; the fold's coverage is what it measures, so this rule has no reading until the sweep runs.
-llm_usage_retention_pass_failed	cogneva_llm_usage_sweep_failed,cogneva_llm_usage_sweep_failed_observed_timestamp_seconds	code_not_deployed	The pass-outcome cell is written by the same retention loop, only in git today.
+# Nine rows for the three sweeps of 2026-10-27 -- the checkpoint capacity
+# bound, the prompt-and-response archive's retention and the task event
+# archive's retention -- were declared code_not_deployed while their emitters
+# were only in git. The rollout to main-cf48f5d85d2c happened, and every cell
+# they named reads back from the live Prometheus: cogneva_checkpoints_rows,
+# _budget_rows, _bytes, _over_capacity and cogneva_checkpoint_sweep_failed;
+# gateway_llm_exchange_rows, _bytes, _oldest_age_seconds, _keep_seconds and
+# _sweep_failed; cogneva_task_events_rows, _oldest_age_seconds, _keep_seconds
+# and _sweep_failed. All nine rows are deleted, per the rule at the top of this
+# file: a declared absence that is no longer true is reported stale.
+#
+# The token ledger's three rows go with them. Its six cells read back too, and
+# with values that say the loop is doing what it was built to do rather than
+# merely that it runs: 313,897 rows held, the oldest at 32.6 days against a
+# 30-day retention, 1,145 rows still outside the fold's coverage and
+# uncovered_rows falling as the backfill walks down -- a table that is over its
+# declared retention by a little and shrinking, which is the state the pair of
+# readings was published to make legible.
+# --- code_not_deployed: none of the four sweeps any more ------------------
 
 # --- lazy_counter ---------------------------------------------------------
 mainline_admission_held	cogneva_mainline_admission_held_total	lazy_counter	cog-reflection/src/mainline_deployer.rs records this labelled counter only on a pass where admission actually held the rollout, so the family is created by the first hold. A deployment that never waited has no series, and the rule fires the moment one appears.
