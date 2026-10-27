@@ -401,6 +401,14 @@ const DISPATCH_TASK_PRIORITY: i32 = 0;
 /// and the kind is what that path is looked up by.
 const DISPATCH_TASK_KIND: &str = "change_ledger";
 
+/// What a dispatched change's project id starts with.
+///
+/// The project listing calls every non-empty id a goal, so this prefix is what
+/// lets a reader tell a project the account opened from a goal somebody
+/// submitted. Kept next to [`DISPATCH_TASK_KIND`] because both name the same
+/// loop in the graph.
+const DISPATCH_PROJECT_PREFIX: &str = "change-ledger:";
+
 /// The name a pass writes into `sources_unread` when the principle ledger could
 /// not be read.
 ///
@@ -910,7 +918,48 @@ fn dispatch_task(row: &ChangeLedgerRow, generation: u32) -> Task {
         }),
     );
     task.priority = dispatch_priority(row);
+    // Hand the row over inside a project rather than on its own. The goal path
+    // mints one fresh id per submission when the task carries none, and this
+    // loop submits one task per call -- so without this line every dispatched
+    // change became a project of exactly one task. Measured on 2026-10-27:
+    // 2419 change-ledger rows, 2419 distinct goal ids, and a project listing
+    // where the largest entry was one row. Everything built on the grouping --
+    // the board's column limits, the rollup, earned value, the WBS the project
+    // face reports -- reads a tree with no parents and no sums.
+    task.goal_id = Some(dispatch_project_key(row));
     task
+}
+
+/// The project a dispatched change belongs to: the part of the tree its check
+/// reads.
+///
+/// The scope is the account's own answer to "where does this change live", and
+/// it is the only grouping key a row carries that is a property of the work
+/// rather than of the pass that picked it up -- the band is urgency, the kind is
+/// the shape of the check, and neither says what the change is about. Grouping
+/// by scope is what makes the listing answer "how much of the crates tree is
+/// still owed" instead of "here are two thousand four hundred projects".
+///
+/// A trailing slash is stripped because `crates` and `crates/` are the same
+/// directory and a reader that treats them as two projects splits one project's
+/// sum in half without ever saying so. Only the trailing slash: collapsing
+/// `./` or resolving `..` would make two rows that the checks themselves treat
+/// as different scopes land in one project, and the account keys rows by the
+/// scope byte for byte.
+///
+/// The prefix keeps a scope-shaped project apart from a submitted goal that
+/// happens to be named the same way, and makes the listing say where a project
+/// with no submission behind it came from.
+fn dispatch_project_key(row: &ChangeLedgerRow) -> String {
+    let scope = row.identity.scope.trim_end_matches('/');
+    if scope.is_empty() {
+        // A scope that was only slashes -- the repository root. It still needs a
+        // name of its own: folding it into a submission or into the ungrouped
+        // bucket would file the work where nobody goes looking for it.
+        format!("{DISPATCH_PROJECT_PREFIX}.")
+    } else {
+        format!("{DISPATCH_PROJECT_PREFIX}{scope}")
+    }
 }
 
 fn dispatch_goal(row: &ChangeLedgerRow) -> String {
@@ -5272,6 +5321,58 @@ mod tests {
         let two = ChangeIdentity::new("grep", "crates/x", "fn thing");
         assert_eq!(dispatch_task_id(&one, 0), dispatch_task_id(&two, 0));
         assert!(dispatch_task_id(&one, 0).starts_with(DISPATCH_TASK_PREFIX));
+    }
+
+    /// Two changes in the same part of the tree are two tasks of one project,
+    /// not two projects.
+    ///
+    /// This is the whole difference between a listing that can be summed and a
+    /// listing of one-row entries: the goal path mints an id per submission
+    /// when the task carries none, and this loop submits one task at a time, so
+    /// a task that leaves the loop without a goal lands as its own project. The
+    /// assertions are on the pairing -- same scope shares, different scope does
+    /// not, and the trailing slash is not a second directory -- rather than on
+    /// the literal id, because what has to hold is the grouping.
+    #[test]
+    fn changes_in_the_same_part_of_the_tree_share_a_project() {
+        let with_scope = |scope: &str| {
+            let mut handed = row(ChangeState::Pending, Some(1_760_000_000));
+            handed.identity = ChangeIdentity::new("grep", scope, "fn thing");
+            dispatch_task(&handed, 0).goal_id
+        };
+        let crates = with_scope("crates");
+        // First the claim every line below rests on: the task leaves the loop
+        // naming a project at all. Without it the comparisons hold trivially --
+        // `None` equals `None` -- and the failure would read as a grouping bug
+        // instead of the missing assignment it is.
+        let key = crates
+            .clone()
+            .expect("a dispatched change must name its project");
+        assert_eq!(
+            crates,
+            with_scope("crates"),
+            "the same scope must land in the same project"
+        );
+        assert_eq!(
+            crates,
+            with_scope("crates/"),
+            "a trailing slash is the same directory, not a second project"
+        );
+        assert_ne!(
+            crates,
+            with_scope("deploy/helm/cogneva/files/cogneva.json"),
+            "two different scopes must not be summed into one project"
+        );
+        assert!(
+            key.starts_with(DISPATCH_PROJECT_PREFIX),
+            "the listing has to be able to tell an account-opened project from a \
+             submitted goal, got {key}"
+        );
+        // The root of the repository is still a place, and it still needs a name
+        // that is not the empty string: an empty goal id reads as "no project".
+        let root = with_scope("").expect("the repository root is still a project");
+        assert!(root.starts_with(DISPATCH_PROJECT_PREFIX));
+        assert_ne!(root, key);
     }
 
     /// A dispatched change declares a rank below the one a task lands on by

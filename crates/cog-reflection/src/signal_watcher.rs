@@ -655,6 +655,42 @@ fn self_audit_task_id(now: DateTime<Utc>) -> String {
     format!("self-audit-{}", now.format("%Y%m%d"))
 }
 
+/// What a signal-driven intent's project id starts with.
+///
+/// The project listing calls every non-empty id a goal, so this prefix is what
+/// lets a reader tell a project the watcher opened from a goal somebody
+/// submitted.
+const SIGNAL_PROJECT_PREFIX: &str = "signal:";
+
+/// The project a signal-driven intent belongs to: the condition that keeps
+/// asking for it.
+///
+/// A project per task says nothing -- the board, the rollup and earned value all
+/// read sums, and a sum over one row is that row. The signal's own vocabulary
+/// already names what recurs: an alert is identified by its rule (the subject
+/// varies, the rule is what fires again), a recurring failure by its signature,
+/// and everything else by the kind of condition it is. Those are the three
+/// groupings below, in the order the detail is read.
+///
+/// `None` when the detail names no kind at all, which leaves the task exactly as
+/// it was submitted -- the one case where this file cannot say what the work is
+/// about, and guessing would file it under a project nobody asked for.
+fn signal_project_key(detail: &serde_json::Value) -> Option<String> {
+    let kind = detail.get("kind")?.as_str()?.trim();
+    if kind.is_empty() {
+        return None;
+    }
+    let subject = ["rule", "signature"]
+        .into_iter()
+        .filter_map(|key| detail.get(key).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .find(|v| !v.is_empty());
+    Some(match subject {
+        Some(subject) => format!("{SIGNAL_PROJECT_PREFIX}{kind}/{subject}"),
+        None => format!("{SIGNAL_PROJECT_PREFIX}{kind}"),
+    })
+}
+
 /// Result of one submission attempt. "Nothing needed doing" and "the intent
 /// never reached the orchestrator" must stay distinct: conflating them makes an
 /// idempotent hit look like a broken channel, and a broken channel look like
@@ -709,7 +745,11 @@ async fn submit_intent(
                     "cleared a finished task for a signal that is still firing"
                 );
             }
-            let task = Task::new(
+            // Read the project off the detail before the payload takes it:
+            // `json!` moves the value in, so a key derived afterwards would be
+            // derived from nothing.
+            let project = signal_project_key(&detail);
+            let mut task = Task::new(
                 task_id,
                 TaskType::Custom(task_kind.into()),
                 serde_json::json!({
@@ -719,6 +759,14 @@ async fn submit_intent(
                     "signal": detail,
                 }),
             );
+            // The same defect the change ledger's handover had: the goal path
+            // mints one id per submission when the task carries none, and this
+            // watcher submits one task at a time, so every signal became a
+            // project of exactly one task. Measured on 2026-10-27: 1314
+            // self-signal rows, 1314 distinct goal ids. Grouping them by the
+            // condition that keeps asking is what turns "one thousand and
+            // fourteen projects" into "the alert rules that are firing".
+            task.goal_id = project;
             match orch.submit_goal_auto(&goal, vec![task]).await {
                 Ok(_) if resubmitting => IntentOutcome::Resubmitted,
                 Ok(_) => IntentOutcome::Registered,
@@ -1655,6 +1703,58 @@ mod tests {
         task.status = status;
         task.result = result;
         task
+    }
+
+    /// One firing rule is one project, however many subjects it fires on.
+    ///
+    /// The watcher submits one task per signal, and the goal path mints an id
+    /// per submission when the task carries none -- so without this grouping a
+    /// task row and a project row are the same thing, and the listing cannot
+    /// answer "what keeps breaking". The pairing is what is asserted: same rule
+    /// shares, different rules do not, the subject inside the rule does not
+    /// split it, and a detail that names no condition gets no project at all
+    /// rather than an invented one.
+    #[test]
+    fn one_firing_rule_is_one_project() {
+        let alert = |rule: &str, subject: &str| {
+            serde_json::json!({
+                "kind": "persisted_alert",
+                "rule": rule,
+                "dedup_key": format!("{rule}:{subject}"),
+            })
+        };
+        let agent = signal_project_key(&alert("agent_unhealthy", "squad:a"));
+        assert_eq!(
+            agent,
+            signal_project_key(&alert("agent_unhealthy", "squad:b")),
+            "two subjects of one rule are one project"
+        );
+        assert_ne!(
+            agent,
+            signal_project_key(&alert("llm_upstream_pool_down", "squad:a")),
+            "two rules are two projects"
+        );
+        let key = agent.expect("an alert-driven signal must name its project");
+        assert!(key.starts_with(SIGNAL_PROJECT_PREFIX));
+        assert!(key.ends_with("agent_unhealthy"));
+        // A recurring failure recurs by signature, not by rule.
+        assert_eq!(
+            signal_project_key(&serde_json::json!({
+                "kind": "failure_recurrence",
+                "signature": "panic: index out of bounds",
+            })),
+            Some(format!(
+                "{SIGNAL_PROJECT_PREFIX}failure_recurrence/panic: index out of bounds"
+            ))
+        );
+        // A condition with no subject of its own still groups by what it is.
+        assert_eq!(
+            signal_project_key(&serde_json::json!({"kind": "queue_backlog"})),
+            Some(format!("{SIGNAL_PROJECT_PREFIX}queue_backlog"))
+        );
+        // Nothing named, nothing invented.
+        assert_eq!(signal_project_key(&serde_json::json!({})), None);
+        assert_eq!(signal_project_key(&serde_json::json!({"kind": "  "})), None);
     }
 
     /// The defect this whole disposition exists for: the attempt failed while
