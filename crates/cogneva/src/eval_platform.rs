@@ -389,7 +389,7 @@ impl PlatformApiRunner {
         if let Some(body) = body {
             request
                 .headers
-                .insert("content-type".into(), "application/json".into());
+                .insert("content-type".into(), cog_core::CONTENT_TYPE_JSON.into());
             request.body = Some(serde_json::to_vec(&body)?);
         }
         let response = self.http.execute(request).await.map_err(|e| {

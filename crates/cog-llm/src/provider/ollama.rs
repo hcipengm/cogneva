@@ -151,7 +151,7 @@ impl LLMProvider for OllamaProvider {
             }
 
             let req = cog_core::HttpRequest::post(&url)
-                .header("Content-Type", "application/json")
+                .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
                 .json(&body)
                 .map_err(|e| SFError::Agent(format!("JSON serialization failed: {}", e)))
                 .unwrap()

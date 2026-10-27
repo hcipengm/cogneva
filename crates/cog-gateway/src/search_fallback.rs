@@ -385,8 +385,14 @@ impl SearchRequest {
 pub fn build_request(upstream: &SearchUpstream, query: &str, limit: u64) -> SearchRequest {
     let base = upstream.base_url.trim_end_matches('/');
     let mut headers = vec![
-        ("content-type".to_string(), "application/json".to_string()),
-        ("accept".to_string(), "application/json".to_string()),
+        (
+            "content-type".to_string(),
+            cog_core::CONTENT_TYPE_JSON.to_string(),
+        ),
+        (
+            "accept".to_string(),
+            cog_core::CONTENT_TYPE_JSON.to_string(),
+        ),
     ];
     let (path, body) = match upstream.shape {
         ResponseShape::Tavily => (
@@ -465,8 +471,14 @@ pub fn build_request(upstream: &SearchUpstream, query: &str, limit: u64) -> Sear
 pub fn build_fetch_request(upstream: &SearchUpstream, target: &str) -> Option<SearchRequest> {
     let base = upstream.base_url.trim_end_matches('/');
     let mut headers = vec![
-        ("content-type".to_string(), "application/json".to_string()),
-        ("accept".to_string(), "application/json".to_string()),
+        (
+            "content-type".to_string(),
+            cog_core::CONTENT_TYPE_JSON.to_string(),
+        ),
+        (
+            "accept".to_string(),
+            cog_core::CONTENT_TYPE_JSON.to_string(),
+        ),
     ];
     let (path, body) = match upstream.shape {
         ResponseShape::Tavily => ("/extract", serde_json::json!({ "urls": [target] })),

@@ -476,7 +476,7 @@ mod tests {
                     Request::builder()
                         .method("POST")
                         .uri("/v1/chat")
-                        .header("content-type", "application/json")
+                        .header("content-type", cog_core::CONTENT_TYPE_JSON)
                         .body(body)
                         .expect("request is constructible"),
                 )

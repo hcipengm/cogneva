@@ -82,7 +82,7 @@ impl NotificationSigner for GatewaySigner {
         .map_err(|e| SignError::Malformed(format!("请求体序列化失败：{e}")))?;
         let url = format!("{}{SIGN_PATH}", self.base.trim_end_matches('/'));
         let req = cog_core::HttpRequest::post(url)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
             .body(body);
 
         let resp = self

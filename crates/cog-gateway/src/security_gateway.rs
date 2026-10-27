@@ -5347,7 +5347,7 @@ async fn stream_forward(
         return Ok(axum::response::Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .header(cog_core::RETRY_AFTER_HEADER, retry_after.to_string())
-            .header("content-type", "application/json")
+            .header("content-type", cog_core::CONTENT_TYPE_JSON)
             .body(axum::body::Body::from(
                 serde_json::json!({
                     "error": "所有 LLM 上游当前不可用",
@@ -5400,7 +5400,7 @@ async fn stream_forward(
         return Ok(axum::response::Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)
             .header(cog_core::RETRY_AFTER_HEADER, retry_after.to_string())
-            .header("content-type", "application/json")
+            .header("content-type", cog_core::CONTENT_TYPE_JSON)
             .body(axum::body::Body::from(
                 serde_json::json!({
                     "error": "本窗口的额度已经摊到这里，还不够再开一件任务",
@@ -5574,7 +5574,7 @@ async fn stream_forward(
         let builder = state
             .stream_client
             .post(&url)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
             .body(body);
         // 凭证头按**被请求的那一面**，不按条目的准入面：一家会说几面的上游在
         // anthropic 面上认 `x-api-key`、在 OpenAI 族两面认 Bearer，而这条请求
@@ -5616,7 +5616,7 @@ async fn stream_forward(
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/json")
+                .unwrap_or(cog_core::CONTENT_TYPE_JSON)
                 .to_string();
             let retry_after = resp
                 .headers()
@@ -5723,7 +5723,7 @@ async fn stream_forward(
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/json")
+            .unwrap_or(cog_core::CONTENT_TYPE_JSON)
             .to_string();
         let stream = wrap_usage_scan(
             state.clone(),
@@ -6078,7 +6078,7 @@ async fn probe_face(
     let builder = state
         .stream_client
         .post(&url)
-        .header("Content-Type", "application/json")
+        .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
         .json(&payload);
     let builder = match face {
         "anthropic" => builder
@@ -6746,7 +6746,7 @@ async fn code_platform_forward(
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
+        .unwrap_or(cog_core::CONTENT_TYPE_JSON)
         .to_string();
     let stream = resp.bytes_stream();
     Ok(axum::response::Response::builder()
@@ -7044,7 +7044,7 @@ async fn search_fallback_outlet(
 fn json_response(status: StatusCode, body: serde_json::Value) -> axum::response::Response {
     axum::response::Response::builder()
         .status(status)
-        .header("content-type", "application/json")
+        .header("content-type", cog_core::CONTENT_TYPE_JSON)
         .body(axum::body::Body::from(body.to_string()))
         .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty()))
 }
@@ -7573,7 +7573,7 @@ async fn webhook_forward(
     let resp = state
         .client
         .post(&url)
-        .header("Content-Type", "application/json")
+        .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
         .header(event_header.0, event_header.1)
         .header("X-Cogneva-Signature-256", hmac_hex(internal, body))
         .body(body.to_vec())
@@ -8752,13 +8752,13 @@ mod tests {
                     if path == "/v1/messages" {
                         (
                             StatusCode::OK,
-                            [(header::CONTENT_TYPE, "application/json")],
+                            [(header::CONTENT_TYPE, cog_core::CONTENT_TYPE_JSON)],
                             r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"pong"}],"model":"k3","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
                         )
                     } else {
                         (
                             StatusCode::NOT_FOUND,
-                            [(header::CONTENT_TYPE, "application/json")],
+                            [(header::CONTENT_TYPE, cog_core::CONTENT_TYPE_JSON)],
                             r#"{"error":{"message":"The requested resource was not found","type":"resource_not_found_error"}}"#,
                         )
                     }
@@ -9646,7 +9646,7 @@ mod tests {
             let mut builder = axum::extract::Request::builder()
                 .uri(path)
                 .method("POST")
-                .header("Content-Type", "application/json");
+                .header("Content-Type", cog_core::CONTENT_TYPE_JSON);
             if let Some(sig) = signature {
                 builder = builder.header(crate::secret_write::SIGNATURE_HEADER, sig);
             }
@@ -9720,7 +9720,7 @@ mod tests {
             let mut builder = axum::extract::Request::builder()
                 .uri(path)
                 .method("POST")
-                .header("Content-Type", "application/json");
+                .header("Content-Type", cog_core::CONTENT_TYPE_JSON);
             if let Some(sig) = signature {
                 builder = builder.header(crate::secret_write::SIGNATURE_HEADER, sig);
             }
@@ -13947,7 +13947,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             post(|| async {
                 (
                     StatusCode::TOO_MANY_REQUESTS,
-                    [("content-type", "application/json")],
+                    [("content-type", cog_core::CONTENT_TYPE_JSON)],
                     r#"{"error":{"message":"quota exceeded","type":"insufficient_quota"}}"#,
                 )
             }),
@@ -14056,7 +14056,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                     if !served.contains(&path.as_str()) {
                         return (
                             StatusCode::NOT_FOUND,
-                            [(header::CONTENT_TYPE, "application/json")],
+                            [(header::CONTENT_TYPE, cog_core::CONTENT_TYPE_JSON)],
                             r#"{"error":{"message":"The requested resource was not found","type":"resource_not_found_error"}}"#,
                         );
                     }
@@ -14071,13 +14071,13 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                     if !authenticated {
                         return (
                             StatusCode::UNAUTHORIZED,
-                            [(header::CONTENT_TYPE, "application/json")],
+                            [(header::CONTENT_TYPE, cog_core::CONTENT_TYPE_JSON)],
                             r#"{"error":{"message":"Invalid Authentication","type":"invalid_authentication_error"}}"#,
                         );
                     }
                     (
                         StatusCode::OK,
-                        [(header::CONTENT_TYPE, "application/json")],
+                        [(header::CONTENT_TYPE, cog_core::CONTENT_TYPE_JSON)],
                         r#"{"id":"x","type":"message","role":"assistant","content":[{"type":"text","text":"pong"}],"choices":[{"message":{"role":"assistant","content":"pong"}}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
                     )
                 }
@@ -14099,7 +14099,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             post(move || async move {
                 (
                     StatusCode::from_u16(status).unwrap(),
-                    [(header::CONTENT_TYPE, "application/json")],
+                    [(header::CONTENT_TYPE, cog_core::CONTENT_TYPE_JSON)],
                     body,
                 )
             }),
@@ -14125,7 +14125,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 (
                     StatusCode::from_u16(status).unwrap(),
                     [
-                        (header::CONTENT_TYPE, "application/json"),
+                        (header::CONTENT_TYPE, cog_core::CONTENT_TYPE_JSON),
                         (header::RETRY_AFTER, wait),
                     ],
                     body,
@@ -14158,7 +14158,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 seen.lock().unwrap().push(payload);
                 (
                     StatusCode::from_u16(status).unwrap(),
-                    [(header::CONTENT_TYPE, "application/json")],
+                    [(header::CONTENT_TYPE, cog_core::CONTENT_TYPE_JSON)],
                     body,
                 )
             }
@@ -14254,7 +14254,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(is_media_content_type("audio/mpeg"));
         assert!(is_media_content_type("application/pdf"));
         assert!(!is_media_content_type("text/html"));
-        assert!(!is_media_content_type("application/json"));
+        assert!(!is_media_content_type(cog_core::CONTENT_TYPE_JSON));
         assert!(!is_media_content_type("application/octet-stream"));
     }
 
@@ -14439,7 +14439,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let req = axum::extract::Request::builder()
             .uri(SIGN_PATH)
             .method("POST")
-            .header("content-type", "application/json")
+            .header("content-type", cog_core::CONTENT_TYPE_JSON)
             .body(axum::body::Body::from(
                 serde_json::json!({"outlet": outlet}).to_string(),
             ))

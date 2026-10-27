@@ -264,7 +264,7 @@ impl cog_core::NotificationDispatcher for WebhookDispatcher {
     async fn dispatch(&self, notification: &cog_core::Notification) -> cog_core::SFResult<()> {
         let body = serde_json::to_vec(notification).map_err(cog_core::SFError::Serialization)?;
         let mut req = cog_core::HttpRequest::post(&self.webhook_url)
-            .header("Content-Type", "application/json");
+            .header("Content-Type", cog_core::CONTENT_TYPE_JSON);
         req.body = Some(body);
         for (k, v) in &self.headers {
             req = req.header(k.clone(), v.clone());
@@ -449,7 +449,7 @@ impl cog_core::NotificationDispatcher for DingTalkDispatcher {
         });
         let body = serde_json::to_vec(&payload).map_err(cog_core::SFError::Serialization)?;
         let req = cog_core::HttpRequest::post(&url)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
             .body(body);
 
         dispatch_http(
@@ -523,7 +523,7 @@ impl cog_core::NotificationDispatcher for FeishuDispatcher {
         });
         let body = serde_json::to_vec(&payload).map_err(cog_core::SFError::Serialization)?;
         let req = cog_core::HttpRequest::post(&self.webhook_url)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
             .body(body);
 
         dispatch_http(
@@ -569,7 +569,7 @@ impl cog_core::NotificationDispatcher for WeChatWorkDispatcher {
         });
         let body = serde_json::to_vec(&payload).map_err(cog_core::SFError::Serialization)?;
         let req = cog_core::HttpRequest::post(&self.webhook_url)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
             .body(body);
 
         dispatch_http(

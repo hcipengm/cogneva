@@ -346,7 +346,7 @@ async fn fetch_sop(
         source.sop_path
     );
     let req = HttpRequest::get(url)
-        .header("Accept", "application/json")
+        .header("Accept", cog_core::CONTENT_TYPE_JSON)
         .timeout(30);
     let resp = http.execute(req).await.map_err(|e| e.to_string())?;
     if !resp.is_success() {

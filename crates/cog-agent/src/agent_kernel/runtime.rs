@@ -1129,7 +1129,7 @@ impl AgentRuntime {
                 Some(task_id) => {
                     let id = cog_core::tool_output_raw_id(task_id, turn, frame);
                     match archive
-                        .archive(tool_name, &id, "application/json", text)
+                        .archive(tool_name, &id, cog_core::CONTENT_TYPE_JSON, text)
                         .await
                     {
                         Ok(uri) => Some(uri),

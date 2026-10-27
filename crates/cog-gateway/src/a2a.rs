@@ -351,7 +351,7 @@ fn card_response(port: u16, headers: &HeaderMap, uri: &Uri, default: A2aVersion)
     } else {
         (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
+            [(header::CONTENT_TYPE, cog_core::CONTENT_TYPE_JSON)],
             body,
         )
             .into_response()

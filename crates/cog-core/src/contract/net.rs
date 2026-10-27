@@ -12,6 +12,16 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
+/// The media type of a JSON body, on the wire.
+///
+/// Written here once because both ends of every JSON request in this workspace
+/// have to agree on it: a gateway answering with a different spelling, or a
+/// provider sending one, still parses locally — the disagreement only shows up
+/// when something in the middle picks a decoder by that word and picks the wrong
+/// one. Nothing in this tree compares two spellings of a header value, so the
+/// second copy would be free to drift.
+pub const CONTENT_TYPE_JSON: &str = "application/json";
+
 /// A stream of HTTP response body chunks.
 pub type HttpBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, SFError>> + Send>>;
 

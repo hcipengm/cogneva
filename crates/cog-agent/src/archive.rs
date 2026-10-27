@@ -439,7 +439,7 @@ mod tests {
             .archive(
                 "read_file",
                 "task-0001-0002",
-                "application/json",
+                cog_core::CONTENT_TYPE_JSON,
                 "{\"big\":true}",
             )
             .await

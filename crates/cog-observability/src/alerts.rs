@@ -248,7 +248,7 @@ impl AlertManager {
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("AlertManager has no HttpClient configured"))?;
                 let req = cog_core::HttpRequest::post(webhook_url)
-                    .header("Content-Type", "application/json")
+                    .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
                     .json(&payload)
                     .map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?
                     .timeout(self.timeout_secs);

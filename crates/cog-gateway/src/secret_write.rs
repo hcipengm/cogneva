@@ -108,7 +108,7 @@ pub(crate) async fn forward(fields: Value, b64: bool, restart: bool) -> Result<R
         base.trim_end_matches('/'),
         SECRET_PATCH_PATH
     ))
-    .header("Content-Type", "application/json")
+    .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
     .header(SIGNATURE_HEADER, sign(&secret, &body))
     .body(body);
     // 出站走本进程装配进来的那一份客户端：这里的请求和本模块其他网关调用同属
@@ -173,7 +173,7 @@ pub(crate) async fn forward_internal_raw(
         })?;
     // 空体也要签：签名覆盖的是字节，不是「有没有内容」。网关那边同样按空体验。
     let request = cog_core::HttpRequest::post(format!("{}{}", base.trim_end_matches('/'), path))
-        .header("Content-Type", "application/json")
+        .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
         .header(SIGNATURE_HEADER, sign(&secret, &body))
         .body(body);
     let resp = crate::contribution_admin::http_client()?

@@ -128,7 +128,7 @@ impl AuditedChannel {
         let response = self
             .http
             .post(&self.url)
-            .header("content-type", "application/json")
+            .header("content-type", cog_core::CONTENT_TYPE_JSON)
             .header(cog_core::LLM_ACTOR_HEADER, ACTOR)
             .body(request_body(prompt))
             .send()

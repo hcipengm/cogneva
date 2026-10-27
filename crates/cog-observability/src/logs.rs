@@ -464,7 +464,7 @@ impl LokiPushClient {
         let mut attempt = 0u32;
         loop {
             let req = HttpRequest::post(&url)
-                .header("Content-Type", "application/json")
+                .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
                 .json(&payload)
                 .map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?
                 .timeout(self.timeout_secs);

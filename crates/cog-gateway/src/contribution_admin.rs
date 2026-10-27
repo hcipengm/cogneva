@@ -636,7 +636,7 @@ pub(crate) async fn exchange_github_code_with(
     redirect_uri: &str,
 ) -> Result<String, String> {
     let request = HttpRequest::post(GITHUB_TOKEN_URL)
-        .header("Accept", "application/json")
+        .header("Accept", cog_core::CONTENT_TYPE_JSON)
         .json(&json!({
             "client_id": client_id,
             "client_secret": client_secret,
@@ -1594,7 +1594,7 @@ pub async fn device_start_handler(
         }
     };
     let request = HttpRequest::post(GITHUB_DEVICE_CODE_URL)
-        .header("Accept", "application/json")
+        .header("Accept", cog_core::CONTENT_TYPE_JSON)
         .json(&json!({"client_id": client_id, "scope": GITHUB_DEVICE_SCOPE}));
     let request = match request {
         Ok(r) => r,
@@ -1665,7 +1665,7 @@ pub async fn device_poll_handler(
         }
     };
     let request = HttpRequest::post(GITHUB_TOKEN_URL)
-        .header("Accept", "application/json")
+        .header("Accept", cog_core::CONTENT_TYPE_JSON)
         .json(&json!({
             "client_id": req.client_id,
             "device_code": req.device_code,

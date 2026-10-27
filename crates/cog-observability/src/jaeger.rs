@@ -138,7 +138,7 @@ impl JaegerExporter {
         handle.spawn(async move {
             let result = async {
                 let req = HttpRequest::post(&url)
-                    .header("Content-Type", "application/json")
+                    .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
                     .json(&batch)
                     .map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?
                     .timeout(timeout_secs);

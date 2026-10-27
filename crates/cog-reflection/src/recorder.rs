@@ -519,7 +519,7 @@ impl LearningRecorder for MemoryBackendRecorder {
         let raw = RawSource::new(
             learning.id.clone(),
             &self.namespace,
-            "application/json",
+            cog_core::CONTENT_TYPE_JSON,
             serde_json::to_vec(&learning).map_err(cog_core::SFError::Serialization)?,
         );
 
@@ -535,7 +535,7 @@ impl LearningRecorder for MemoryBackendRecorder {
         let raw = RawSource::new(
             error.id.clone(),
             &self.namespace,
-            "application/json",
+            cog_core::CONTENT_TYPE_JSON,
             serde_json::to_vec(&error).map_err(cog_core::SFError::Serialization)?,
         );
         self.backend.archive_raw(&raw).await?;
@@ -550,7 +550,7 @@ impl LearningRecorder for MemoryBackendRecorder {
         let raw = RawSource::new(
             request.id.clone(),
             &self.namespace,
-            "application/json",
+            cog_core::CONTENT_TYPE_JSON,
             serde_json::to_vec(&request).map_err(cog_core::SFError::Serialization)?,
         );
         self.backend.archive_raw(&raw).await?;
@@ -1156,7 +1156,7 @@ mod tests {
             .archive_raw(&RawSource::new(
                 "WRENCH-20260919-00000001",
                 "reflection",
-                "application/json",
+                cog_core::CONTENT_TYPE_JSON,
                 br#"{"kind":"something else"}"#.to_vec(),
             ))
             .await
@@ -1184,7 +1184,7 @@ mod tests {
             .archive_raw(&RawSource::new(
                 "LRN-20260916-00000002",
                 "reflection",
-                "application/json",
+                cog_core::CONTENT_TYPE_JSON,
                 serde_json::to_vec(&recorded_elsewhere).unwrap(),
             ))
             .await

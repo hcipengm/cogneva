@@ -351,7 +351,7 @@ impl LLMProvider for OpenAIResponsesProvider {
 
             let mut req = cog_core::HttpRequest::post(&url)
                 .header("Authorization", format!("Bearer {}", api_key))
-                .header("Content-Type", "application/json")
+                .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
                 .json(&body)
                 .map_err(|e| SFError::Agent(format!("JSON serialization failed: {}", e)))
                 .unwrap()

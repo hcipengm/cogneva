@@ -614,7 +614,7 @@ pub fn web_search_with_fallback(
                     let mut req = HttpRequest::new("GET", url.clone());
                     req.timeout_secs = Some(SEARCH_TIMEOUT_SECS);
                     req.headers
-                        .insert("Accept".into(), "application/json".into());
+                        .insert("Accept".into(), cog_core::CONTENT_TYPE_JSON.into());
                     let resp = client.execute(req).await.map_err(|e| {
                         SFError::Agent(format!("web search backend at {base} is unreachable: {e}"))
                     })?;
@@ -759,9 +759,9 @@ async fn fallback_search(
     let mut req = HttpRequest::new("POST", url.clone());
     req.timeout_secs = Some(SEARCH_TIMEOUT_SECS);
     req.headers
-        .insert("Content-Type".into(), "application/json".into());
+        .insert("Content-Type".into(), cog_core::CONTENT_TYPE_JSON.into());
     req.headers
-        .insert("Accept".into(), "application/json".into());
+        .insert("Accept".into(), cog_core::CONTENT_TYPE_JSON.into());
     req.body = Some(
         serde_json::json!({
             "query": query,
@@ -921,7 +921,7 @@ async fn fetch_rendered(
         attempt += 1;
         let mut req = HttpRequest::new("POST", endpoint.clone());
         req.headers
-            .insert("Content-Type".into(), "application/json".into());
+            .insert("Content-Type".into(), cog_core::CONTENT_TYPE_JSON.into());
         req.timeout_secs = Some(RENDER_TIMEOUT_SECS);
         req.body = Some(body.clone());
         let resp = client.execute(req).await.map_err(|e| {
@@ -1119,7 +1119,7 @@ async fn fallback_fetch(
         .map_err(SFError::Serialization)?;
     let mut req = HttpRequest::new("POST", endpoint.clone());
     req.headers
-        .insert("Content-Type".into(), "application/json".into());
+        .insert("Content-Type".into(), cog_core::CONTENT_TYPE_JSON.into());
     req.timeout_secs = Some(FETCH_TIMEOUT_SECS);
     req.body = Some(body);
     let resp = client.execute(req).await.map_err(|e| {
@@ -1357,7 +1357,7 @@ mod tests {
     async fn search_asks_the_backend_for_json_and_names_the_hits() {
         let scripted = Scripted::answering(
             200,
-            "application/json",
+            cog_core::CONTENT_TYPE_JSON,
             r#"{"results":[
                  {"title":"Rust 2024","url":"https://example.com/rust","content":"edition notes","engine":"duckduckgo"},
                  {"title":"Async","url":"https://example.com/async","content":"tokio","engine":"bing"}],
@@ -1414,8 +1414,8 @@ mod tests {
                "unresponsive_engines":[["bing","timeout"]]}"#
             .to_string();
         let scripted = Scripted::answering_in_order(vec![
-            (200, "application/json", silent.clone()),
-            (200, "application/json", silent),
+            (200, cog_core::CONTENT_TYPE_JSON, silent.clone()),
+            (200, cog_core::CONTENT_TYPE_JSON, silent),
         ]);
         let tool = web_search(client_of(&scripted), Some("http://searxng:8080".into()));
         let err = call(&tool, serde_json::json!({"query":"rust lang"}))
@@ -1452,12 +1452,12 @@ mod tests {
         let scripted = Scripted::answering_in_order(vec![
             (
                 200,
-                "application/json",
+                cog_core::CONTENT_TYPE_JSON,
                 r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string(),
             ),
             (
                 200,
-                "application/json",
+                cog_core::CONTENT_TYPE_JSON,
                 r#"{"results":[{"title":"Rust","url":"https://rust-lang.org/","content":"fast",
                      "engine":"bing"}],"unresponsive_engines":[]}"#
                     .to_string(),
@@ -1486,7 +1486,7 @@ mod tests {
     async fn search_returns_hits_when_one_engine_failed_and_another_answered() {
         let scripted = Scripted::answering(
             200,
-            "application/json",
+            cog_core::CONTENT_TYPE_JSON,
             r#"{"results":[
                  {"title":"Rust","url":"https://rust-lang.org/","content":"fast","engine":"bing"}],
                "unresponsive_engines":[["sogou","crash"]]}"#,
@@ -1511,7 +1511,7 @@ mod tests {
     async fn search_reports_an_empty_list_when_every_engine_answered() {
         let scripted = Scripted::answering(
             200,
-            "application/json",
+            cog_core::CONTENT_TYPE_JSON,
             r#"{"query":"q","results":[],"unresponsive_engines":[]}"#,
         );
         let tool = web_search(client_of(&scripted), Some("http://searxng:8080".into()));
@@ -1534,7 +1534,7 @@ mod tests {
     async fn the_fallback_is_never_asked_when_the_self_hosted_backend_answers() {
         let scripted = Scripted::answering(
             200,
-            "application/json",
+            cog_core::CONTENT_TYPE_JSON,
             r#"{"results":[{"title":"Rust","url":"https://rust-lang.org/","content":"fast",
                  "engine":"bing"}],"unresponsive_engines":[]}"#,
         );
@@ -1568,11 +1568,11 @@ mod tests {
     async fn the_fallback_answers_a_query_the_self_hosted_backend_never_asked() {
         let silent = r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string();
         let scripted = Scripted::answering_in_order(vec![
-            (200, "application/json", silent.clone()),
-            (200, "application/json", silent),
+            (200, cog_core::CONTENT_TYPE_JSON, silent.clone()),
+            (200, cog_core::CONTENT_TYPE_JSON, silent),
             (
                 200,
-                "application/json",
+                cog_core::CONTENT_TYPE_JSON,
                 r#"{"results":[{"title":"Rust","url":"https://www.rust-lang.org/",
                      "content":"a language empowering everyone"}]}"#
                     .to_string(),
@@ -1624,11 +1624,11 @@ mod tests {
     async fn two_failed_backends_are_both_named_in_the_error() {
         let silent = r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string();
         let scripted = Scripted::answering_in_order(vec![
-            (200, "application/json", silent.clone()),
-            (200, "application/json", silent),
+            (200, cog_core::CONTENT_TYPE_JSON, silent.clone()),
+            (200, cog_core::CONTENT_TYPE_JSON, silent),
             (
                 503,
-                "application/json",
+                cog_core::CONTENT_TYPE_JSON,
                 r#"{"detail":"rate limited"}"#.to_string(),
             ),
         ]);
@@ -1655,9 +1655,13 @@ mod tests {
     async fn an_empty_fallback_answer_does_not_become_an_empty_web() {
         let silent = r#"{"results":[],"unresponsive_engines":[["bing","timeout"]]}"#.to_string();
         let scripted = Scripted::answering_in_order(vec![
-            (200, "application/json", silent.clone()),
-            (200, "application/json", silent),
-            (200, "application/json", r#"{"results":[]}"#.to_string()),
+            (200, cog_core::CONTENT_TYPE_JSON, silent.clone()),
+            (200, cog_core::CONTENT_TYPE_JSON, silent),
+            (
+                200,
+                cog_core::CONTENT_TYPE_JSON,
+                r#"{"results":[]}"#.to_string(),
+            ),
         ]);
         let tool = web_search_with_fallback(
             client_of(&scripted),
@@ -1692,12 +1696,12 @@ mod tests {
         let scripted = Scripted::answering_in_order(vec![
             (
                 200,
-                "application/json",
+                cog_core::CONTENT_TYPE_JSON,
                 r#"{"results":[],"unresponsive_engines":[]}"#.to_string(),
             ),
             (
                 200,
-                "application/json",
+                cog_core::CONTENT_TYPE_JSON,
                 r#"{"results":[{"title":"Rust","url":"https://www.rust-lang.org/",
                      "content":"a language empowering everyone"}]}"#
                     .to_string(),
@@ -1736,10 +1740,14 @@ mod tests {
         let scripted = Scripted::answering_in_order(vec![
             (
                 200,
-                "application/json",
+                cog_core::CONTENT_TYPE_JSON,
                 r#"{"results":[],"unresponsive_engines":[]}"#.to_string(),
             ),
-            (200, "application/json", r#"{"results":[]}"#.to_string()),
+            (
+                200,
+                cog_core::CONTENT_TYPE_JSON,
+                r#"{"results":[]}"#.to_string(),
+            ),
         ]);
         let tool = web_search_with_fallback(
             client_of(&scripted),
@@ -1768,7 +1776,7 @@ mod tests {
     async fn a_knowledge_card_without_hits_is_an_answer_and_stays_local() {
         let scripted = Scripted::answering(
             200,
-            "application/json",
+            cog_core::CONTENT_TYPE_JSON,
             r#"{"results":[],"answers":["Ulaanbaatar"],
                  "unresponsive_engines":[]}"#,
         );
@@ -1791,7 +1799,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_without_a_backend_names_the_missing_setting() {
-        let scripted = Scripted::answering(200, "application/json", "{}");
+        let scripted = Scripted::answering(200, cog_core::CONTENT_TYPE_JSON, "{}");
         let tool = web_search(client_of(&scripted), Some("   ".into()));
         let err = call(&tool, serde_json::json!({"query":"x"}))
             .await
@@ -1951,7 +1959,7 @@ mod tests {
     async fn a_configured_backend_renders_the_page_and_names_the_extraction() {
         let scripted = Scripted::answering(
             200,
-            "application/json",
+            cog_core::CONTENT_TYPE_JSON,
             serde_json::json!({
                 "url": "https://example.com/article",
                 "filter": "fit",
@@ -2039,7 +2047,7 @@ mod tests {
     async fn a_backend_that_could_not_read_the_page_returns_its_reason() {
         let scripted = Scripted::answering(
             200,
-            "application/json",
+            cog_core::CONTENT_TYPE_JSON,
             serde_json::json!({
                 "url": "https://example.com/paywalled",
                 "success": false,
@@ -2101,7 +2109,7 @@ mod tests {
             (500, "text/plain", "render budget exhausted".into()),
             (
                 200,
-                "application/json",
+                cog_core::CONTENT_TYPE_JSON,
                 serde_json::json!({
                     "url": "https://example.com/heavy",
                     "success": true,
@@ -2164,7 +2172,7 @@ mod tests {
     async fn a_render_with_no_text_is_an_error_not_an_empty_page() {
         let scripted = Scripted::answering(
             200,
-            "application/json",
+            cog_core::CONTENT_TYPE_JSON,
             serde_json::json!({
                 "url": "https://example.com/paper.pdf",
                 "success": true,
