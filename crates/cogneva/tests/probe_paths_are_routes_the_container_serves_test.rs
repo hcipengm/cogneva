@@ -13,6 +13,9 @@
 //!
 //! * 每个跑本项目镜像的容器，它的 `httpGet` 探针路径必须是**这个容器起的那份代码**
 //!   注册过的路由；
+//! * 读的清单是**会被投递出去的每一棵树**：`deploy/k3s`（元启动 apply 的字节）与
+//!   `deploy/rendered` 下的每个 profile（`helm install` 的字节）。profile 目录由
+//!   目录枚举出来而不是在这里点名，新加一个 profile 不需要改这道门；
 //! * 「这个容器起的是哪份代码」不在本文件里另写一份：子命令从 `crates/cogneva/src/
 //!   cli.rs` 的 `SUBCOMMANDS` 读（argv 词 → 枚举变体），变体 → 模块从 `main.rs` 的
 //!   匹配臂读，模块路径按 Rust 的 `crate::mod::fn` 形状落到文件；
@@ -27,7 +30,9 @@
 //!   装配，静态读不到「哪个插件挂了哪条路由」，所以对这份代码只要求「这棵树里
 //!   某处注册过它」——比旁的分支宽一档，宽在哪儿写在这里；
 //! * 探针的端口对不对（那是 reachability 门第 4 族的事）、探针的时机与阈值；
-//! * 清单与 chart 是否同步（parity 门）。
+//! * chart 模板本身（带 `{{ }}` 的不是合法 YAML）：模板里写错要到重新渲染之后才在
+//!   这道门上出现，而「渲染产物是不是最新」是新鲜度门的事；parity 只比对
+//!   env/卷/挂载/端口/SA，不比探针，所以两棵树之间的探针分叉同样由这道门接住。
 //!
 //! 普查要有下限：读不到 chart 的 `image.repository`、一个跑本项目镜像且带
 //! `httpGet` 探针的容器都没找到、或这棵树里一条路由都没读到时，一律按红处理——
@@ -35,9 +40,12 @@
 //!
 //! 消融（真实树）：把 `deploy/k3s/claim-store-daemonset.yaml` 的 readinessProbe
 //! 路径 `/health/ready` 改成 `/health/readyz`，本门红，点名该文件、claim-store
-//! 容器与 `claim_store.rs` 实际注册过的路径；改回绿。子命令解析与「只认生产字节」
-//! 这两条由夹具守着（`a_subcommand_the_cli_does_not_declare_is_reported`、
-//! `a_route_registered_only_in_a_test_block_is_not_served`）。
+//! 容器与 `claim_store.rs` 实际注册过的路径；改回绿。子命令解析、「只认生产字节」
+//! 与预渲染 profile 这三个分支由夹具守着
+//! （`a_subcommand_the_cli_does_not_declare_is_reported`、
+//! `a_route_registered_only_in_a_test_block_is_not_served`、
+//! `a_rendered_profile_with_a_stale_probe_path_is_reported`）——真实树上四棵树
+//! 此刻彼此一致，把它们轮流改红只证明同一件事。
 
 mod common;
 
@@ -56,7 +64,10 @@ const CLI: &str = "crates/cogneva/src/cli.rs";
 /// 枚举变体 → 模块（子命令实际起的那份代码）。
 const MAIN: &str = "crates/cogneva/src/main.rs";
 /// 静态清单：apply 路径上真正被投递的那份字节。
-const MANIFESTS: &str = "deploy/k3s";
+const APPLY_TREE: &str = "deploy/k3s";
+/// 预渲染产物：`helm install` 投递的那份字节。每个 profile 一个目录，由目录本身
+/// 枚举，不在这里钉名字——新加一个 profile 不该需要改这道门。
+const RENDERED: &str = "deploy/rendered";
 
 #[derive(Debug, Clone)]
 struct Container {
@@ -271,10 +282,33 @@ fn every_route(root: &Path) -> BTreeSet<String> {
     routes_of(root, &files)
 }
 
-/// 静态清单里每一个容器，连同它的探针。
+/// 会被投递出去的几棵树：静态清单加每个预渲染 profile。
+///
+/// 三条投递路径各有自己的字节（元启动 apply `deploy/k3s`，`helm install` 用
+/// `deploy/rendered/<profile>`），而 chart 模板改完要重新渲染才会出现在后者里。
+/// 只读其中一棵，另一条路径上的同一个拼写就没人比。
+fn manifest_trees(root: &Path) -> Vec<PathBuf> {
+    let mut trees = vec![root.join(APPLY_TREE)];
+    let mut profiles: Vec<PathBuf> = std::fs::read_dir(root.join(RENDERED))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    profiles.sort();
+    trees.extend(profiles);
+    trees
+}
+
+/// 清单里每一个容器，连同它的探针。
 fn containers(root: &Path) -> Vec<Container> {
     let mut files = Vec::new();
-    walk(&root.join(MANIFESTS), &["yaml", "yml"], &mut files);
+    for tree in manifest_trees(root) {
+        walk(&tree, &["yaml", "yml"], &mut files);
+    }
     files.sort();
     let mut out = Vec::new();
     for path in files {
@@ -379,8 +413,9 @@ fn complaints(root: &Path) -> Vec<String> {
         .collect();
     if ours.is_empty() {
         out.push(format!(
-            "  `{MANIFESTS}` 下一个跑本项目镜像（`{image}`）且带 `httpGet` 探针的容器都\
-             没读到：要么清单搬了家，要么探针换了形状，两种都按红处理"
+            "  `{APPLY_TREE}` 与 `{RENDERED}` 下每个 profile 里，一个跑本项目镜像\
+             （`{image}`）且带 `httpGet` 探针的容器都没读到：要么清单搬了家，要么探针\
+             换了形状，两种都按红处理"
         ));
         return out;
     }
@@ -562,6 +597,40 @@ fn a_probe_asking_for_another_components_route_is_reported() {
             .iter()
             .any(|c| c.contains("/health/other") && c.contains("claim-store")),
         "{found:?}"
+    );
+}
+
+/// 预渲染 profile 是 `helm install` 投递的那份字节：它里面的探针路径同样要判。
+/// 只读 `deploy/k3s` 时，改 chart 模板后重新渲染出来的那一份没人比。
+#[test]
+fn a_rendered_profile_with_a_stale_probe_path_is_reported() {
+    let applied = workload(
+        "registry.example/cogneva:local",
+        "claim-store",
+        &[("readinessProbe", "/health/ready")],
+    );
+    let rendered = workload(
+        "registry.example/cogneva:local",
+        "claim-store",
+        &[("readinessProbe", "/health/readyz")],
+    );
+    let found = fixture(&[
+        ("deploy/helm/cogneva/values.yaml", VALUES),
+        ("crates/cogneva/src/cli.rs", CLI_TABLE),
+        ("crates/cogneva/src/main.rs", MAIN_ARMS),
+        ("crates/cogneva/src/claim_store.rs", CLAIM_STORE),
+        ("deploy/k3s/claim-store-daemonset.yaml", &applied),
+        ("deploy/rendered/k3s-single/claim-store.yaml", &rendered),
+    ]);
+    assert!(
+        found
+            .iter()
+            .any(|c| c.contains("/health/readyz") && c.contains("k3s-single")),
+        "{found:?}"
+    );
+    assert!(
+        !found.iter().any(|c| c.contains("claim-store-daemonset")),
+        "apply 路径那一份是对的，不该被牵连：{found:?}"
     );
 }
 
