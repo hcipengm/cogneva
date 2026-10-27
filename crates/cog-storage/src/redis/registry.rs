@@ -11,8 +11,17 @@ use std::sync::RwLock;
 
 use cog_core::{AgentRegistration, AgentRegistry, SFError, SFResult};
 
+/// 注册表里一个 agent 的 key 前缀，后面接 agent id。
+///
+/// 注册表的读写都在这个 crate 里，可「这个会话还有没有主人」这个问题的另外几个
+/// 读者在 Lua 里：WAL 回收与收件箱回收都拿它判断一个会话是不是还活着。脚本里
+/// 再拼一遍前缀时，改名只改一侧不会有任何报错——脚本会对每一个会话都答「没有
+/// 主人」，于是把还有主人的日志与收件箱当成孤儿删掉。所以前缀从这里作为参数传进
+/// 脚本，不在脚本里写第二遍。
+pub const AGENT_KEY_PREFIX: &str = "orchestrator:agents:";
+
 fn agent_key(agent_id: &str) -> String {
-    format!("orchestrator:agents:{agent_id}")
+    format!("{AGENT_KEY_PREFIX}{agent_id}")
 }
 
 const REGISTRY_INDEX_KEY: &str = "orchestrator:agents:index";
@@ -400,6 +409,15 @@ impl AgentRegistry for MemoryAgentRegistry {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// 这个前缀是线上的事实：注册表里已经有按这个拼法存在的 key，而回收脚本
+    /// 拿它判断「这个会话还有没有主人」。改它等于让两边同时读一份空注册表；
+    /// 这里钉的是拼法本身，不是「函数等于自己」。
+    #[test]
+    fn the_registry_key_prefix_does_not_drift() {
+        assert_eq!(AGENT_KEY_PREFIX, "orchestrator:agents:");
+        assert_eq!(agent_key("a-1"), "orchestrator:agents:a-1");
+    }
 
     #[tokio::test]
     async fn memory_registry_register_get_list_heartbeat() {

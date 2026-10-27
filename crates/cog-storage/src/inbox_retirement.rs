@@ -212,7 +212,7 @@ impl InboxRetirement {
                     local key = r[2][i]
                     local id = string.sub(key, from, to)
                     if string.len(id) > 0
-                       and redis.call("EXISTS", "orchestrator:agents:" .. id) == 0
+                       and redis.call("EXISTS", ARGV[3] .. id) == 0
                        and redis.call("TYPE", key)["ok"] == "stream" then
                       local len = redis.call("XLEN", key)
                       if len == 0 then
@@ -236,6 +236,7 @@ impl InboxRetirement {
             .arg(0)
             .arg(INBOX_PREFIX)
             .arg(INBOX_SUFFIX)
+            .arg(crate::redis::registry::AGENT_KEY_PREFIX)
             .query_async(&mut conn)
             .await?;
         // Every list comes back with the length the confirmation rule compares
@@ -344,7 +345,7 @@ impl InboxRetirement {
                   local key = KEYS[i]
                   local id = string.sub(key, from, to)
                   if string.len(id) > 0
-                     and redis.call("EXISTS", "orchestrator:agents:" .. id) == 0
+                     and redis.call("EXISTS", ARGV[3] .. id) == 0
                      and redis.call("TYPE", key)["ok"] == "stream" then
                     local len = redis.call("XLEN", key)
                     local unread, pending = 0, 0
@@ -365,6 +366,7 @@ impl InboxRetirement {
             .arg(keys)
             .arg(INBOX_PREFIX)
             .arg(INBOX_SUFFIX)
+            .arg(crate::redis::registry::AGENT_KEY_PREFIX)
             .query_async(&mut conn)
             .await?;
         Ok(RetireOutcome { retired, records })

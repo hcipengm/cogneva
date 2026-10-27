@@ -569,7 +569,7 @@ impl RedisWalBackend {
                   for i = 1, #r[2] do
                     local key = r[2][i]
                     local session = string.sub(key, 5)
-                    if redis.call("EXISTS", "orchestrator:agents:" .. session) == 0 then
+                    if redis.call("EXISTS", ARGV[1] .. session) == 0 then
                       out[#out + 1] = key
                     end
                   end
@@ -578,6 +578,7 @@ impl RedisWalBackend {
                 "#,
             )
             .arg(0)
+            .arg(crate::redis::registry::AGENT_KEY_PREFIX)
             .query_async(&mut conn)
             .await
             .map_err(|e| WalError::Backend(format!("Redis WAL orphan scan failed: {}", e)))?;
@@ -622,7 +623,7 @@ impl RedisWalBackend {
                   local key = KEYS[i]
                   if string.sub(key, 1, 4) == "wal:" then
                     local session = string.sub(key, 5)
-                    if redis.call("EXISTS", "orchestrator:agents:" .. session) == 0 then
+                    if redis.call("EXISTS", ARGV[1] .. session) == 0 then
                       records = records + (redis.call("LLEN", key) or 0)
                       redis.call("DEL", key)
                       retired = retired + 1
@@ -634,6 +635,7 @@ impl RedisWalBackend {
             )
             .arg(keys.len())
             .arg(keys)
+            .arg(crate::redis::registry::AGENT_KEY_PREFIX)
             .query_async(&mut conn)
             .await
             .map_err(|e| WalError::Backend(format!("Redis WAL retirement failed: {}", e)))?;
