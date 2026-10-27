@@ -186,6 +186,27 @@ UPDATE cog_dag_tasks \
    AND task ->> 'owner_unit' IS NOT NULL \
    AND status IN ('{pending}', '{scheduled}')";
 
+/// Write a face's standing duty row, replacing only a row that cannot serve.
+///
+/// The row is the face's evidence of staffing, and the two ways it stops
+/// serving are both silent: a terminal row is not open work, and a row in
+/// another shape is eaten by the dispatcher and turned terminal. Both are
+/// replaced here; a live row in the right shape bound to the same unit is
+/// left exactly as it is, which is what makes this safe to run every pass.
+///
+/// `running` is excluded from the repair branch on purpose: an old-shaped row
+/// that is already executing must not be rewritten under the lease that makes
+/// it executable. It fails on its own and is replaced on the next pass.
+const ENSURE_FACE_DUTY_SQL_TEMPLATE: &str = "\
+INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status, updated_at) \
+VALUES ($1, $2, $3, $4, NOW()) \
+ON CONFLICT (workspace_id, task_id) DO UPDATE \
+   SET task = EXCLUDED.task, status = EXCLUDED.status, updated_at = NOW() \
+ WHERE (cog_dag_tasks.status IN ('{completed}', '{failed}', '{cancelled}') \
+        OR cog_dag_tasks.task -> 'task_type' IS DISTINCT FROM EXCLUDED.task -> 'task_type' \
+        OR cog_dag_tasks.task ->> 'owner_unit' IS DISTINCT FROM EXCLUDED.task ->> 'owner_unit') \
+   AND cog_dag_tasks.status <> '{running}'";
+
 /// The status words a template may ask for, and the variant each stands for.
 ///
 /// The left column is a label the template writes; the right is the variant
@@ -196,6 +217,9 @@ const STATUS_PLACEHOLDERS: &[(&str, TaskStatus)] = &[
     ("pending", TaskStatus::Pending),
     ("scheduled", TaskStatus::Scheduled),
     ("running", TaskStatus::Running),
+    ("completed", TaskStatus::Completed),
+    ("failed", TaskStatus::Failed),
+    ("cancelled", TaskStatus::Cancelled),
 ];
 
 /// Fill a query template's status placeholders from [`TaskStatus`].
@@ -465,6 +489,29 @@ impl GovernanceStore for PostgresGovernanceStore {
             .rows_affected() as usize;
         Ok(released)
     }
+
+    async fn ensure_face_duty(&self, row: &Task) -> SFResult<bool> {
+        let workspace = row.workspace_id.as_deref().unwrap_or_default().trim();
+        if workspace.is_empty() || workspace == GOVERNANCE_WORKSPACE {
+            return Err(SFError::Validation(format!(
+                "a face's duty row belongs in a workspace the drift reading measures, \
+                 not in {:?}",
+                row.workspace_id
+            )));
+        }
+        let value = serde_json::to_value(row).map_err(SFError::Serialization)?;
+        let written = sqlx::query(&fill_statuses(ENSURE_FACE_DUTY_SQL_TEMPLATE))
+            .bind(workspace)
+            .bind(&row.id)
+            .bind(value)
+            .bind(row.status.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("governance ensure face duty: {e}")))?
+            .rows_affected()
+            > 0;
+        Ok(written)
+    }
 }
 
 #[cfg(test)]
@@ -480,6 +527,7 @@ mod status_templates {
             REBIND_FACE_TASKS_SQL_TEMPLATE,
             REASSIGN_FACE_WORK_SQL_TEMPLATE,
             RELEASE_FACE_WORK_SQL_TEMPLATE,
+            ENSURE_FACE_DUTY_SQL_TEMPLATE,
         ];
         let mut filled = 0;
         for template in templates {

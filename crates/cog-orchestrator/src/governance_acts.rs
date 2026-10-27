@@ -1304,6 +1304,10 @@ mod tests {
         async fn release_face_work(&self, _face_id: &str) -> cog_core::SFResult<usize> {
             Ok(0)
         }
+        async fn ensure_face_duty(&self, row: &Task) -> cog_core::SFResult<bool> {
+            self.rows.lock().unwrap().push(row.clone());
+            Ok(true)
+        }
     }
 
     /// Reads what it was given but fails every transactional write, standing
@@ -1385,6 +1389,9 @@ mod tests {
         }
 
         async fn release_face_work(&self, _face_id: &str) -> cog_core::SFResult<usize> {
+            Err(cog_core::SFError::Database("unreachable".into()))
+        }
+        async fn ensure_face_duty(&self, _row: &Task) -> cog_core::SFResult<bool> {
             Err(cog_core::SFError::Database("unreachable".into()))
         }
     }

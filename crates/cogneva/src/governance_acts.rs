@@ -1528,6 +1528,15 @@ mod tests {
             }
             Ok(released)
         }
+        async fn ensure_face_duty(&self, row: &cog_core::Task) -> cog_core::SFResult<bool> {
+            let mut rows = self.rows.lock().unwrap();
+            if let Some(existing) = rows.iter_mut().find(|held| held.id == row.id) {
+                *existing = row.clone();
+            } else {
+                rows.push(row.clone());
+            }
+            Ok(true)
+        }
     }
 
     fn write_replies(dir: &std::path::Path, pairs: &[(&str, &str)]) {

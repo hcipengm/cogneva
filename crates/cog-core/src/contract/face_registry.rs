@@ -860,6 +860,27 @@ pub trait GovernanceStore: Send + Sync {
     ///
     /// Returns how many rows were released.
     async fn release_face_work(&self, face_id: &str) -> SFResult<usize>;
+
+    /// Put a face's standing duty row back in the queue.
+    ///
+    /// The row a face's owner works from is the only evidence the drift
+    /// reading has that anybody is on the face, and until now it was written
+    /// by a command rather than by anything the platform runs on its own. A
+    /// row therefore died with the shape it was written in and stayed dead: a
+    /// duty written before its type settled was picked up by the dispatcher,
+    /// spent its whole budget on a body it does not have, and was failed on
+    /// the degenerate-loop rule. A terminal row is not open work, so the face
+    /// reads idle from then on, and the repair is somebody remembering to run
+    /// the command again.
+    ///
+    /// Writing is conditional on what is stored, so this is safe to call every
+    /// pass: a live row in the duty shape bound to the same unit is left
+    /// alone. A terminal row, a row in another shape, and a row bound to a
+    /// different unit are all replaced by the supplied one. A `running` row is
+    /// never touched -- its lease is what makes it executable.
+    ///
+    /// Returns whether anything was written.
+    async fn ensure_face_duty(&self, row: &Task) -> SFResult<bool>;
 }
 
 /// What an import did with one row.

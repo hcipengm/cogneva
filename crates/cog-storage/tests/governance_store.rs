@@ -927,3 +927,144 @@ async fn a_round_that_died_before_its_cleanup_is_reclaimed_by_the_next_one() {
         .await
         .expect("clean up the fresh fixture");
 }
+
+/// The standing duty row is a face's only evidence of staffing, and the pass
+/// writes it back every time the stored one cannot serve.
+///
+/// The decision is a claim about which stored rows a statement is allowed to
+/// overwrite, so it can only be shown true on the server. Each case below is a
+/// row a real graph held: sixteen duty rows typed as ordinary nodes were
+/// started by the dispatcher, spent their budget on a body a duty does not
+/// have, and were failed -- terminal rows, invisible to the reading, repairable
+/// only by a command. A query that replaced a live row instead would restart
+/// work somebody is doing, and one that replaced a running row would rewrite it
+/// under the lease that makes it executable.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_duty_row_is_written_back_only_when_the_stored_one_cannot_serve() {
+    let pool = PgPool::connect(&database_url())
+        .await
+        .expect("connect to the test database");
+    let backend = PostgresStateBackend::new(pool.clone());
+    backend.init_schema().await.expect("init the schema");
+    let store = PostgresGovernanceStore::new(pool.clone());
+
+    let prefix = begin(&pool).await;
+    let workspace = "test-ws-a";
+    let duty = |owner: &str, status: TaskStatus, kind: TaskType| {
+        let mut row = Task::new(
+            format!("{prefix}:duty-{}", status.as_str()),
+            kind,
+            serde_json::json!({ "goal": "hold the face" }),
+        );
+        row.owner_unit = Some(owner.to_string());
+        row.face_id = Some(format!("{prefix}:face"));
+        row.status = status;
+        row.workspace_id = Some(workspace.to_string());
+        row
+    };
+    let wanted = |suffix: &str| {
+        let mut row = Task::new(
+            format!("{prefix}:duty-{suffix}"),
+            TaskType::Custom("face-duty".into()),
+            serde_json::json!({ "goal": "hold the face" }),
+        );
+        row.owner_unit = Some("f5".into());
+        row.face_id = Some(format!("{prefix}:face"));
+        row.status = TaskStatus::Pending;
+        row.workspace_id = Some(workspace.to_string());
+        row
+    };
+    let read = |id: &str| {
+        let pool = pool.clone();
+        let id = id.to_string();
+        async move {
+            PostgresStateBackend::new(pool)
+                .dag_get_task(workspace, &id)
+                .await
+                .expect("read the duty row back")
+                .expect("the duty row is there")
+        }
+    };
+
+    // Nothing stored: the row is created.
+    let missing = wanted("missing");
+    assert!(
+        store.ensure_face_duty(&missing).await.expect("write"),
+        "a face with no duty row at all gets one"
+    );
+    let stored = read(&missing.id).await;
+    assert_eq!(stored.owner_unit.as_deref(), Some("f5"));
+    assert_eq!(stored.status, TaskStatus::Pending);
+
+    // A live row in the duty shape bound to the same unit is left alone. The
+    // payload is the witness: the incoming row says something else, and a
+    // rewrite would put it there.
+    let mut restated = missing.clone();
+    restated.input = serde_json::json!({ "goal": "a different goal" });
+    assert!(
+        !store
+            .ensure_face_duty(&restated)
+            .await
+            .expect("second write"),
+        "a row that can serve is not replaced"
+    );
+    let again = read(&missing.id).await;
+    assert_eq!(
+        again.input, stored.input,
+        "a row that can serve keeps the work it already carries"
+    );
+
+    // A terminal row is replaced, whatever shape it was written in.
+    let dead = duty("f5", TaskStatus::Failed, TaskType::DagNode);
+    backend
+        .dag_set_task(workspace, &dead.id, &dead)
+        .await
+        .expect("seed a failed duty");
+    let replacement = wanted("failed");
+    assert!(
+        store.ensure_face_duty(&replacement).await.expect("write"),
+        "a terminal row is not open work, so the face reads idle until it is replaced"
+    );
+    let revived = read(&replacement.id).await;
+    assert_eq!(revived.status, TaskStatus::Pending);
+    assert!(matches!(
+        &revived.task_type,
+        TaskType::Custom(kind) if kind == "face-duty"
+    ));
+
+    // A live row in the wrong shape is repaired in place: the dispatcher
+    // starts anything executable it can see, and a duty has no body to run.
+    let old_shape = duty("f5", TaskStatus::Pending, TaskType::DagNode);
+    backend
+        .dag_set_task(workspace, &old_shape.id, &old_shape)
+        .await
+        .expect("seed an old-shaped duty");
+    let repaired = wanted("pending");
+    assert!(
+        store.ensure_face_duty(&repaired).await.expect("write"),
+        "a duty typed as an ordinary node is one the dispatcher eats"
+    );
+    let fixed = read(&repaired.id).await;
+    assert!(matches!(
+        &fixed.task_type,
+        TaskType::Custom(kind) if kind == "face-duty"
+    ));
+
+    // A running row is never touched: its lease is what makes it executable.
+    let running = duty("f5", TaskStatus::Running, TaskType::DagNode);
+    backend
+        .dag_set_task(workspace, &running.id, &running)
+        .await
+        .expect("seed a running row");
+    let would_be = wanted("running");
+    assert!(
+        !store.ensure_face_duty(&would_be).await.expect("write"),
+        "rewriting a running row would move the owner out from under its lease"
+    );
+    let untouched = read(&would_be.id).await;
+    assert_eq!(untouched.status, TaskStatus::Running);
+    assert!(matches!(&untouched.task_type, TaskType::DagNode));
+
+    clean(&pool, &prefix).await;
+}

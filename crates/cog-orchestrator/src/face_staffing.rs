@@ -986,6 +986,12 @@ mod tests {
         async fn release_face_work(&self, _face_id: &str) -> cog_core::SFResult<usize> {
             Ok(0)
         }
+        async fn ensure_face_duty(&self, row: &cog_core::Task) -> cog_core::SFResult<bool> {
+            // A duty row is ordinary queue work, so it lands in the same list
+            // the handovers do and a test reads it back the same way.
+            self.rows.lock().unwrap().push(row.clone());
+            Ok(true)
+        }
     }
 
     /// The heartbeat registry as this pass reads it: one answer per unit.

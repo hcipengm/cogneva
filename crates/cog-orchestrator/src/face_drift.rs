@@ -378,6 +378,50 @@ async fn reassign_faces(
     }
 }
 
+/// Write back the standing row a face's owner works from.
+///
+/// That row is the only thing the reading has to tell "the owner has nothing
+/// to do" from "somebody has been assigned this face": the owner's presence
+/// and an open row bound to it are the whole evidence. It used to be written
+/// by a command, once, and nothing wrote it again -- so a row that died stayed
+/// dead, and the face read idle for good. A duty typed as an ordinary node is
+/// started by the dispatcher, spends its budget on a body it does not have,
+/// and is failed on the degenerate-loop rule; a terminal row is not open work,
+/// so no later reader ever looks at it again.
+///
+/// Only a face whose owner is present gets a row. An absent owner's rows are
+/// released on the same pass, and writing one would race that release; a
+/// returning owner gets its duty back here rather than through a command.
+async fn ensure_duty_rows(
+    store: &dyn GovernanceStore,
+    faces: &[Face],
+    live: &[String],
+    workspace: &str,
+) -> Vec<String> {
+    let mut written = Vec::new();
+    for face in faces {
+        let Some(owner) = face.owner_unit.as_deref() else {
+            continue;
+        };
+        if !live.iter().any(|unit| unit == owner) {
+            continue;
+        }
+        let row = crate::governance_acts::standing_row(face, workspace);
+        match store.ensure_face_duty(&row).await {
+            Ok(true) => written.push(face.face_id.clone()),
+            Ok(false) => {}
+            Err(e) => warn!(
+                face = %face.face_id,
+                owner = %owner,
+                error = %e,
+                "a face's standing duty row could not be written; the face keeps reading \
+                 idle until a pass can write it"
+            ),
+        }
+    }
+    written
+}
+
 /// Submit one remediation goal per red face, at most once a day each.
 async fn dispatch_red_faces(
     readings: &[FaceDriftReading],
@@ -428,6 +472,7 @@ pub fn spawn_face_drift_loop(
     agents: Option<Arc<dyn AgentRegistry>>,
     orchestrator: Option<Arc<dyn OrchestratorControl>>,
     role: Option<Arc<dyn cog_core::OwnerLeaseBroker>>,
+    workspace: String,
     shutdown: cog_core::ShutdownSignal,
 ) {
     info!(
@@ -435,6 +480,7 @@ pub fn spawn_face_drift_loop(
         arbitrated = role.is_some(),
         reads_heartbeats = agents.is_some(),
         dispatches = orchestrator.is_some(),
+        %workspace,
         "Face drift loop enabled"
     );
     drop(cog_core::loop_health::spawn(
@@ -446,6 +492,7 @@ pub fn spawn_face_drift_loop(
             let agents = agents.clone();
             let orchestrator = orchestrator.clone();
             let role = role.clone();
+            let workspace = workspace.clone();
             let shutdown = shutdown.clone();
             async move {
                 let hold =
@@ -541,6 +588,39 @@ pub fn spawn_face_drift_loop(
                                     ),
                                 }
                                 reassign_faces(&*store, &readings, &live).await;
+                                // The duty row is the evidence the reading
+                                // counts, and nothing wrote it once it died.
+                                // Written after the release: a row put back
+                                // for an owner and taken away by the same pass
+                                // would leave the face reading idle with a
+                                // write to its name.
+                                if !workspace.trim().is_empty()
+                                    && workspace != cog_core::GOVERNANCE_WORKSPACE
+                                {
+                                    match store.face_nodes().await {
+                                        Ok(nodes) => {
+                                            let faces: Vec<Face> =
+                                                nodes.iter().filter_map(Face::from_task).collect();
+                                            let written = ensure_duty_rows(
+                                                &*store, &faces, &live, &workspace,
+                                            )
+                                            .await;
+                                            if !written.is_empty() {
+                                                info!(
+                                                    rows = written.len(),
+                                                    faces = ?written,
+                                                    "standing duty rows written back; those \
+                                                     faces have work to be idle on again"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => warn!(
+                                            error = %e,
+                                            "the face nodes could not be read; no standing \
+                                             duty row was written this pass"
+                                        ),
+                                    }
+                                }
                             }
                             Err(e) => warn!(
                                 error = %e,
@@ -584,15 +664,18 @@ impl Observable for FaceDriftObservable {
             .into_iter()
             .map(|reading| {
                 RawMetric::new(FACE_DRIFT_METRIC, 1.0)
-                    .with_label("face", reading.face_id)
-                    .with_label("state", reading.state.as_str())
+                    .with_label(crate::LABEL_FACE, reading.face_id)
+                    .with_label(crate::LABEL_STATE, reading.state.as_str())
                     // A label value has to come from a closed set, so the cause
                     // travels as a token and not as the prose in `detail`. Where
                     // the state alone says what happened, there is no cause and
                     // the label says so, rather than being left off: a series
                     // that sometimes carries a label and sometimes does not is
                     // two shapes for one question.
-                    .with_label("cause", reading.cause.unwrap_or_else(|| "-".into()))
+                    .with_label(
+                        crate::LABEL_CAUSE,
+                        reading.cause.unwrap_or_else(|| "-".into()),
+                    )
             })
             .collect())
     }
@@ -734,6 +817,12 @@ mod tests {
     struct RecordingStore {
         adopted: std::sync::Mutex<Vec<(String, String)>>,
         released: std::sync::Mutex<Vec<String>>,
+        /// Every duty row the pass asked the store to put back, in the shape
+        /// it asked for. Recording the row rather than its id is what lets a
+        /// test tell a duty that can survive the dispatcher from one that
+        /// cannot: the dead rows in production were the right face and the
+        /// wrong type.
+        duties: std::sync::Mutex<Vec<Task>>,
     }
 
     #[async_trait::async_trait]
@@ -792,6 +881,13 @@ mod tests {
                 .expect("the recorder lock is not poisoned")
                 .push(face_id.to_string());
             Ok(0)
+        }
+        async fn ensure_face_duty(&self, row: &Task) -> SFResult<bool> {
+            self.duties
+                .lock()
+                .expect("the recorder lock is not poisoned")
+                .push(row.clone());
+            Ok(true)
         }
     }
 
@@ -973,6 +1069,62 @@ mod tests {
             mov("资源管理", "f5", HandoverState::Draft),
         ];
         assert_eq!(owners_no_act_explains(&faces, &moves).len(), 2);
+    }
+
+    /// The duty row is a face's only evidence of staffing, and the pass writes
+    /// it because nothing else does. In production the rows were written once
+    /// by a command, started by the dispatcher, and failed on the
+    /// degenerate-loop rule; a terminal row is not open work, so sixteen of
+    /// eighteen faces read idle for good and the repair was somebody
+    /// remembering to run the command again.
+    #[tokio::test]
+    async fn a_present_owners_duty_row_is_written_in_the_shape_that_survives() {
+        let store = RecordingStore::default();
+        let faces = vec![owned("任务管理", Some("f5"), None)];
+
+        let written = ensure_duty_rows(&store, &faces, &["f5".to_string()], "default").await;
+        assert_eq!(written, vec!["任务管理".to_string()]);
+
+        let duties = store.duties.lock().expect("lock").clone();
+        assert_eq!(duties.len(), 1);
+        assert_eq!(
+            duties[0].id,
+            crate::governance_acts::face_work_id("任务管理")
+        );
+        assert_eq!(duties[0].owner_unit.as_deref(), Some("f5"));
+        assert_eq!(duties[0].status, TaskStatus::Pending);
+        assert_eq!(duties[0].workspace_id.as_deref(), Some("default"));
+        // The type and the executable flag are the whole reason the old rows
+        // died: the dispatcher starts anything executable it can see, and a
+        // duty has no body to run, so it burns the budget and is failed.
+        assert!(
+            matches!(
+                &duties[0].task_type,
+                cog_core::TaskType::Custom(kind)
+                    if kind == crate::governance_acts::FACE_DUTY_TASK_TYPE
+            ),
+            "a duty row typed as an ordinary node is one the dispatcher eats"
+        );
+        assert!(duties[0].is_executable);
+    }
+
+    /// A row for an owner who is not there would be released by the same
+    /// pass, and a vacancy has nobody to hand work to at all.
+    #[tokio::test]
+    async fn no_duty_row_is_written_for_an_owner_who_is_not_there_or_for_a_vacancy() {
+        let store = RecordingStore::default();
+        let faces = vec![
+            owned("任务管理", Some("f5"), None),
+            owned("通信", None, None),
+        ];
+
+        let written =
+            ensure_duty_rows(&store, &faces, &["someone-else".to_string()], "default").await;
+        assert!(written.is_empty());
+        assert!(
+            store.duties.lock().expect("lock").is_empty(),
+            "an absent owner's row is released on the same pass; writing one races it"
+        );
     }
 
     /// A handover that moved the face to some *other* unit does not explain

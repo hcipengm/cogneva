@@ -110,6 +110,9 @@ impl GovernanceStore for Roster {
     async fn release_face_work(&self, _face_id: &str) -> SFResult<usize> {
         Ok(0)
     }
+    async fn ensure_face_duty(&self, _row: &Task) -> SFResult<bool> {
+        Ok(false)
+    }
 }
 
 fn face(face_id: &str, owner: &str, kind: FaceKind) -> Task {
