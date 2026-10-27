@@ -395,23 +395,14 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
     view.usage_source = usage_source;
 
     // 卷声明读一次，给持久卷补上「绑到哪块盘、多大」。读不到就只是缺这一层信息。
-    let claims = match client
-        .get_json(&format!(
-            "/api/v1/namespaces/{}/persistentvolumeclaims",
-            client.namespace()
-        ))
-        .await
-    {
+    let claims = match client.get_json(pvc_list_path()).await {
         Ok(list) => claims_by_name(&list),
         Err(_) => std::collections::HashMap::new(),
     };
 
     // 事件读一次、按对象名分给各个 Pod：一个 Pod 一次请求在几十个 Pod 的命名空间里
     // 会把一面拓扑变成几十次 apiserver 往返，而这一面是轮询的。
-    let events = match client
-        .get_json(&format!("/api/v1/namespaces/{}/events", client.namespace()))
-        .await
-    {
+    let events = match client.get_json(event_list_path()).await {
         Ok(list) => events_by_object(&list),
         Err(_) => std::collections::HashMap::new(),
     };
@@ -646,6 +637,21 @@ fn usage_by_pod(list: &Value) -> std::collections::HashMap<String, PodUsage> {
         usage.insert(namespaced_key(namespace, name), pod);
     }
     usage
+}
+
+/// 卷声明与事件读的范围：整个集群，与 Pod 那一读同一个范围。
+///
+/// Pod 是按整个集群读的（采集器量的是整台宿主上的每一个容器，这一面只画自己命名
+/// 空间里的，差出来的那些就只有进程读数、没有格子）。这两张表若还按命名空间读，
+/// 别的命名空间里的 Pod 会带着空的卷声明与空事件出现在屏上——那不是它没有，是这一
+/// 面没去找，而「没有」与「没读」在格子上同形。三张表都用 `namespace/name` 作键，
+/// 扩大范围不会让不同命名空间的同名对象串在一起。
+fn pvc_list_path() -> &'static str {
+    "/api/v1/persistentvolumeclaims"
+}
+
+fn event_list_path() -> &'static str {
+    "/api/v1/events"
 }
 
 fn claims_by_name(list: &Value) -> std::collections::HashMap<String, ClaimView> {
@@ -2778,6 +2784,68 @@ mod topology_tests {
         assert_eq!(claim.storage_class.as_deref(), Some("local-path"));
         assert_eq!(claim.capacity_bytes, Some(10 * 1024 * 1024 * 1024));
         assert_eq!(claim.access_modes, vec!["ReadWriteOnce"]);
+    }
+
+    /// 没有这一条就会红：把卷声明或事件的读法改回按命名空间读，编译、其余测试、
+    /// 页面都照过——只有别的命名空间里的 Pod 会带着空的卷声明与空事件出现，而那与
+    /// 「它本来就没有」在格子上是同一副样子。
+    #[test]
+    fn the_claim_and_event_lists_cover_the_same_scope_as_the_pods() {
+        assert_eq!(
+            pvc_list_path(),
+            "/api/v1/persistentvolumeclaims",
+            "卷声明要按整个集群读：Pod 已经是整个集群的"
+        );
+        assert_eq!(
+            event_list_path(),
+            "/api/v1/events",
+            "事件要按整个集群读：Pod 已经是整个集群的"
+        );
+        assert!(
+            !pvc_list_path().contains("/namespaces/")
+                && !event_list_path().contains("/namespaces/"),
+            "路径里带命名空间就是把范围收窄回一处，别的命名空间的 Pod 会缺这两格"
+        );
+    }
+
+    /// 两个命名空间里同名的卷声明不能串：键是 `namespace/name`，不是名字。
+    #[test]
+    fn two_namespaces_can_hold_the_same_claim_name() {
+        let claims = claims_by_name(&json!({ "items": [
+            {
+                "metadata": { "name": "data", "namespace": "cogneva" },
+                "status": { "phase": "Bound", "capacity": { "storage": "10Gi" } }
+            },
+            {
+                "metadata": { "name": "data", "namespace": "monitoring" },
+                "status": { "phase": "Pending", "capacity": { "storage": "1Gi" } }
+            }
+        ]}));
+        let pod = |namespace: &str| {
+            json!({
+                "metadata": { "name": "probe", "namespace": namespace },
+                "spec": {
+                    "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data" } }],
+                    "containers": [{ "name": "app" }]
+                },
+                "status": { "phase": "Running", "containerStatuses": [] }
+            })
+        };
+        let sources = Sources {
+            claims,
+            ..Sources::default()
+        };
+        let here = pod_view(&pod("cogneva"), &sources);
+        let there = pod_view(&pod("monitoring"), &sources);
+        assert_eq!(
+            here.volumes[0].claim.as_ref().map(|c| c.phase.as_str()),
+            Some("Bound")
+        );
+        assert_eq!(
+            there.volumes[0].claim.as_ref().map(|c| c.phase.as_str()),
+            Some("Pending"),
+            "另一个命名空间里同名的卷声明是它自己的那份，不是本命名空间那条"
+        );
     }
 
     #[test]
