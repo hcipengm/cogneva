@@ -36,6 +36,7 @@ CV_MARKER_RE = re.compile(
 EVAL_MARKER_RE = re.compile(r"<!--\s*cogneva-eval:\s*(\{.*?\})\s*-->")
 VERDICT_RE = re.compile(r"\*\*Verdict:\s*([A-Z_]+)\*\*")
 FIXES_RE = re.compile(r"(?:Fixes|Closes)\s+#(\d+)", re.IGNORECASE)
+BOT_LABEL = "cogneva-bot"
 BOARD_TITLE = "[Cogneva] Bot contribution board"
 RECOMMEND_LABEL = "cogneva-recommended"
 LEADERBOARD_MARKER = "<!-- cogneva-board:issue={issue} -->"
@@ -482,7 +483,7 @@ def upsert_board_issue(body: str) -> str:
     created = api(
         f"/repos/{repo}/issues",
         "POST",
-        {"title": BOARD_TITLE, "body": body, "labels": ["cogneva-bot"]},
+        {"title": BOARD_TITLE, "body": body, "labels": [BOT_LABEL]},
     )
     return (created or {}).get("html_url", "(board issue created)")
 
@@ -518,7 +519,7 @@ def mark_recommended(
 
 def main() -> None:
     ensure_label(
-        "cogneva-bot", "6f42c1", "PRs opened by Cogneva self-evolution instances"
+        BOT_LABEL, "6f42c1", "PRs opened by Cogneva self-evolution instances"
     )
     ensure_label(
         RECOMMEND_LABEL, "2ea44f", "Leading bot solution for the issue (bot board)"

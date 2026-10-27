@@ -96,6 +96,19 @@ check(
     f"生产端 {src} 写 {verdict_literal!r}，榜记成 {passes} pass / {fails} fail",
 )
 
+# 3b. 标签：榜在建跟踪 issue 与建标签时用的是同一个名字，而这个名字也是 Rust
+#     侧标 bot PR 用的那个。两边分家时，榜给 issue 打的标签不是 bot PR 的那个，
+#     而「按标签找 bot PR」的地方（榜之外的面）从此一条都找不到。
+label_match = re.search(
+    r'CROSS_VALIDATION_LABEL[^=]*=\s*"([^"]+)"', corpus
+)
+rust_label = label_match.group(1) if label_match else None
+check(
+    "标签：榜的 bot 标签与 Rust 侧标 bot PR 的那个同名",
+    rust_label is not None and board.BOT_LABEL == rust_label,
+    f"榜用 {board.BOT_LABEL!r}，生产端 {rust_label!r}",
+)
+
 # 4. eval 载荷：字段名是生产端 serde 的缩写，榜直接按这些名字取数。
 #    名字从 Rust 结构体里读：`#[serde(rename = "rb")]` 用缩写的就用缩写，
 #    没写的用字段名。榜单侧用到哪几个，就判哪几个真的在里面。
