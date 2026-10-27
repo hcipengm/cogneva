@@ -119,6 +119,14 @@ const NOT_A_SERIES: &[(&str, &str)] = &[
         "cogneva_io_face",
         "a label key, not a series: the rule that raised a row declares which face acts on it, and the declaration rides the stored row's labels while staying out of the dedup key (cog-observability/src/infra_watch.rs) -- it names who is called, never a measurement, so the exposition publishes nothing under it",
     ),
+    (
+        "cogneva_token",
+        "a browser storage key, not a series: the WebUI keeps the access token under it (web/src/auth/session.ts) and the gateway page reads the same spelling back, so the string never leaves a localStorage call and no exposition publishes anything under it",
+    ),
+    (
+        "cogneva_lang",
+        "a browser storage key, not a series: the takeover page remembers the operator's language under it (crates/cog-gateway/src/takeover.html), which is a client-side preference and not a measurement any process reports",
+    ),
 ];
 
 /// The prefix every series name this build publishes is spelled with.
