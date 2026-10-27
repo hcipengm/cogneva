@@ -1202,8 +1202,19 @@ const GIT_MIRROR_GITEE: &str = "https://gitee.com/hcipengm/cogneva.git";
 /// `--depth 1` 浅克隆、tarball 路径连 .git 都没有，会把进化中央仓库也变成浅/
 /// 零历史——进化需要完整历史做 log/blame/tag/基线对齐。节点源码（浅克隆）仍供
 /// 编译引导器与 apply 清单，与进化 bare 解耦。
+/// 进化中央 bare 仓在数据卷上的位置，两处 clone 都从这里取。
+///
+/// chart 的 `evolution.gitRemote.hostPath` 指向同一个目录。各写一份字面量时，
+/// 改名只会让其中一处克隆到一棵空仓——进化那边读到的不是报错，而是「没有历史」，
+/// 与「这个部署还没 seed」同形。
+const GIT_REMOTE_SUBDIR: &str = "git-remote";
+
+fn git_remote_dir() -> PathBuf {
+    Path::new(&cog_core::paths::data_dir()).join(GIT_REMOTE_SUBDIR)
+}
+
 async fn ensure_git_remote() -> Result<()> {
-    let remote = Path::new(&cog_core::paths::data_dir()).join("git-remote");
+    let remote = git_remote_dir();
     if remote.join("HEAD").exists() {
         info!("git-remote bare 仓库已存在，跳过");
         return Ok(());
@@ -2146,7 +2157,7 @@ async fn ensure_source_tree() -> Result<PathBuf> {
         return Ok(root);
     }
     let dir = make_workdir("src")?;
-    let bare = Path::new(&cog_core::paths::data_dir()).join("git-remote");
+    let bare = git_remote_dir();
     let upstream = if cn_mirror() {
         [GIT_MIRROR_GITEE, GIT_MIRROR_GITHUB]
     } else {
