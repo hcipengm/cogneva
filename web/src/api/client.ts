@@ -331,21 +331,18 @@ export interface LlmConfigPayload {
   skip_verify?: boolean;
 }
 
-export interface LlmConfigResult {
-  ok: boolean;
-  restarted: string[];
-  failed_restarts: string[];
-  message: string;
-}
-
 export async function getLlmStatus(): Promise<LlmStatus> {
   return api.get<LlmStatus>('/api/v1/admin/llm-status');
 }
 
-export async function saveLlmConfig(
-  payload: LlmConfigPayload
-): Promise<LlmConfigResult> {
-  return api.post<LlmConfigResult>('/api/v1/admin/llm-config', payload);
+/**
+ * 保存模型面配置。成功与否只看这一句有没有抛：服务端回的那张表（`ok`、
+ * `restarted`、`unverified_upstreams`…）本页一格都不读，所以这里不声明它——
+ * 声明一个没人读的形状，就等于给下一个读者留一份会与手写的响应悄悄分家的
+ * 第二份字段表。
+ */
+export async function saveLlmConfig(payload: LlmConfigPayload): Promise<void> {
+  await api.post<unknown>('/api/v1/admin/llm-config', payload);
 }
 
 // ── 上网检索与抓取的后备池 ──
