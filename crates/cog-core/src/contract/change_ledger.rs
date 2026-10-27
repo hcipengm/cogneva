@@ -1129,6 +1129,33 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// holding. Urgency belongs to the work, staleness to the claim.
     async fn landed_due(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>>;
 
+    /// The landed rows, each with the revision it landed at, stalest
+    /// measurement first.
+    ///
+    /// [`Self::landed_due`] carries `measured_rev`, and a re-check moves that
+    /// column to the revision the check was last asked at. The two are different
+    /// facts wherever the tree has moved since the landing, and the difference is
+    /// not academic: the caller that asks "is this landing in the image the
+    /// workloads run" compares the answer against a running revision, and a
+    /// re-check always runs at a tree that is at least one rollout ahead of that
+    /// image. Measured on the live account before this read existed: 3319 landed
+    /// rows carried five distinct `measured_rev` values, the in-effect pass
+    /// counted 2005 of them out of effect, and every row whose landing the event
+    /// log records -- 639 of those 2005 -- had landed at a commit the running
+    /// image carries. The count read as the line's lag and was a count of rows
+    /// re-checked since the image was built.
+    ///
+    /// The landing's own revision survives a re-check only in the event log,
+    /// which records the revision of every transition into `landed`. A row with
+    /// no such event landed before the log existed and comes back as `None`
+    /// rather than falling back to `measured_rev`: a revision its check was not
+    /// done at would answer a question nobody asked, and the caller already
+    /// counts unplaceable rows apart from both sides.
+    async fn landed_at_revision(
+        &self,
+        limit: usize,
+    ) -> SFResult<Vec<(ChangeIdentity, Option<String>)>>;
+
     /// The landed rows whose check reads something one of `paths` could change,
     /// stalest measurement first.
     ///

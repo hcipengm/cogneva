@@ -3037,6 +3037,18 @@ impl InEffectReading {
 /// knows whether it has. Collapsed into one `None` they are indistinguishable
 /// at every reader, and the reading is published, so that collapse would be
 /// served -- a blind pass read as a finished rollout.
+///
+/// The revision compared against the image is the one the row **landed** at,
+/// read out of the account's event log, and that is not a detail. The row's own
+/// `measured_rev` is moved by every re-check to the revision the check was asked
+/// at, and the tree a re-check reads is always at least one rollout ahead of the
+/// image -- so against that column this pass reported every row the window sweep
+/// had touched since the image was built as landed-but-not-running. Measured on
+/// the live account the first time it ran: 2005 of 3319 landed rows held, with
+/// an oldest wait of 37 minutes, and every one of the 639 whose landing the
+/// event log records had landed at a commit the running image carried. The
+/// reading was a count of re-checks, and it would have rung the alert that this
+/// pass exists to feed.
 async fn live_revision_pass(
     store: &dyn ChangeLedgerStore,
     tree: &CheckTree,
@@ -3097,7 +3109,7 @@ async fn live_revision_pass(
     // shape the dispatch bound's own comment calls a claim the pass stops
     // keeping. A constant here would be a guess at how large the account gets,
     // and the account already answered that: its own count is the read.
-    let rows = match store.landed_due(landed as usize).await {
+    let rows = match store.landed_at_revision(landed as usize).await {
         Ok(rows) => rows,
         Err(e) => {
             warn!(
@@ -3115,36 +3127,43 @@ async fn live_revision_pass(
     let mut entered = 0usize;
     let mut recovered = 0usize;
     let mut no_revision = 0usize;
-    for row in rows {
-        let Some(measured) = row.measured_rev.as_deref() else {
-            // Landed with no revision named: a measurement taken by a process
-            // that had none to name. It cannot be placed on any line, so it is
+    for (identity, landed_rev) in rows {
+        // The revision compared is the one the row *landed* at, not the one a
+        // re-check last asked at. A landed row is re-checked on a timer, and
+        // each re-check stamps today's tree -- which is always at least one
+        // rollout ahead of the image -- so asking about that stamp answers
+        // "not running" for every row the sweep happened to touch since the
+        // image was built. The landing revision is the commit that carries the
+        // change, which is the thing the image either has or has not.
+        let Some(landed_rev) = landed_rev.as_deref() else {
+            // Landed before the account kept an event log, so nothing here says
+            // which commit carried it. It cannot be placed on any line, so it is
             // counted apart rather than folded into either side -- the same
             // three-valued discipline the tree reading keeps, one level up.
             no_revision += 1;
             continue;
         };
-        still_landed.insert(row.identity.clone());
+        still_landed.insert(identity.clone());
         checked += 1;
-        if reach.contains(measured) {
+        if reach.contains(landed_rev) {
             in_effect += 1;
-            if out_of_effect.remove(&row.identity).is_some() {
+            if out_of_effect.remove(&identity).is_some() {
                 recovered += 1;
                 info!(
-                    change = %row.identity,
-                    measured_rev = %measured,
+                    change = %identity,
+                    landed_rev = %landed_rev,
                     live_rev = reach.head(),
                     "change ledger: this change is in the revision the workloads are running now"
                 );
             }
             continue;
         }
-        let arrived = match out_of_effect.get(&row.identity) {
-            Some(known) => known != measured,
+        let arrived = match out_of_effect.get(&identity) {
+            Some(known) => known != landed_rev,
             None => true,
         };
         if arrived {
-            out_of_effect.insert(row.identity.clone(), measured.to_string());
+            out_of_effect.insert(identity.clone(), landed_rev.to_string());
             entered += 1;
             // A row entering this set during a rollout is the ordinary state of
             // a line that lands faster than it ships, and one line per row puts
@@ -3152,11 +3171,11 @@ async fn live_revision_pass(
             // far behind the image is. The name is kept, one level down, for the
             // reader who already knows there is a lag and is asking which rows.
             debug!(
-                change = %row.identity,
-                measured_rev = %measured,
+                change = %identity,
+                landed_rev = %landed_rev,
                 live_rev = reach.head(),
-                "change ledger: this change's revision is not in the live rev -- the project's own \
-                 line carries it and the workloads are not running it"
+                "change ledger: the commit that landed this change is not in the live rev -- the \
+                 project's own line carries it and the workloads are not running it"
             );
         }
     }
@@ -6819,6 +6838,16 @@ mod tests {
         /// Why a row is not being worked on. Seeded by a test that wants a block
         /// somebody else declared, and written by the pass under test.
         blocked: std::sync::Mutex<std::collections::HashMap<ChangeIdentity, String>>,
+        /// The revision each identity landed at, for the tests where that is not
+        /// the row's `measured_rev`.
+        ///
+        /// A landed row is re-checked on a timer and each re-check moves
+        /// `measured_rev` to the revision it was asked at; the landing revision
+        /// survives only in the event log, which this double does not keep. So a
+        /// test that needs the two apart -- the state the live account is in for
+        /// every row the sweep touched after the image was built -- names the
+        /// landing here.
+        landings: std::sync::Mutex<std::collections::HashMap<ChangeIdentity, String>>,
     }
 
     impl FakeLedger {
@@ -6989,6 +7018,29 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn landed_at_revision(
+            &self,
+            limit: usize,
+        ) -> SFResult<Vec<(ChangeIdentity, Option<String>)>> {
+            // With no event log to read, the row's own revision stands in for the
+            // landing unless the test names one, which is the only way this
+            // double can hold the state the two differ in.
+            let landings = self.landings.lock().unwrap();
+            Ok(self
+                .rows
+                .iter()
+                .filter(|row| row.state == ChangeState::Landed)
+                .take(limit)
+                .map(|row| {
+                    let landed = landings
+                        .get(&row.identity)
+                        .cloned()
+                        .or_else(|| row.measured_rev.clone());
+                    (row.identity.clone(), landed)
+                })
+                .collect())
+        }
+
         async fn landed_touching(
             &self,
             paths: &[String],
@@ -7984,6 +8036,85 @@ mod tests {
         assert!(
             out_of_effect.is_empty(),
             "a row in the running revision is not out of effect: {out_of_effect:?}"
+        );
+    }
+
+    /// A row whose re-check ran at a revision the image does not carry is still
+    /// in effect. What the image has or has not is the commit that carried the
+    /// change, and a re-check moves the row's own revision to the tree it asked
+    /// at, which is always ahead of the image by at least one rollout.
+    ///
+    /// The live account is in this state for every row the sweep touched since
+    /// the image was built, so reading the row's own revision reported the swept
+    /// set as landed and not running and fed an alert about a lag that was not
+    /// there.
+    #[tokio::test]
+    async fn a_re_check_does_not_make_a_landed_change_look_undeployed() {
+        let (dir, first, second) = two_revision_repo();
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let in_effect = ChangeIdentity::new("grep", "crates/in-effect", "fn thing");
+        // Landed at `first`; the row's own revision now names `second`, which is
+        // the revision the last re-check asked at.
+        let store = FakeLedger {
+            rows: vec![landed_row("crates/in-effect", Some(&second))],
+            ..Default::default()
+        };
+        store
+            .landings
+            .lock()
+            .unwrap()
+            .insert(in_effect.clone(), first.clone());
+        let mut out_of_effect = HashMap::new();
+
+        let reading = live_revision_pass(
+            &store,
+            &tree,
+            &FixedLive(LiveRevision::Known(first.clone())),
+            &mut out_of_effect,
+        )
+        .await;
+
+        assert_eq!(
+            reading,
+            InEffectReading::Shipped,
+            "the commit that carried the change is in the running image, so nothing is waiting"
+        );
+        assert!(
+            out_of_effect.is_empty(),
+            "a re-check at a newer revision is not a landing the image lacks: {out_of_effect:?}"
+        );
+
+        // The mirror image, which the same reading has to keep: a change that
+        // landed at a revision the image does not carry is a wait, however old
+        // the revision its re-check ran at.
+        let undeployed = ChangeIdentity::new("grep", "crates/undeployed", "fn thing");
+        let store = FakeLedger {
+            rows: vec![landed_row("crates/undeployed", Some(&first))],
+            ..Default::default()
+        };
+        store
+            .landings
+            .lock()
+            .unwrap()
+            .insert(undeployed.clone(), second.clone());
+        let mut out_of_effect = HashMap::new();
+
+        let reading = live_revision_pass(
+            &store,
+            &tree,
+            &FixedLive(LiveRevision::Known(first)),
+            &mut out_of_effect,
+        )
+        .await;
+
+        assert!(
+            matches!(reading, InEffectReading::Waiting(_)),
+            "a landing the running image does not carry is a wait: {reading:?}"
+        );
+        assert_eq!(
+            out_of_effect.get(&undeployed).map(String::as_str),
+            Some(second.as_str()),
+            "the row is held with the revision that landed it: {out_of_effect:?}"
         );
     }
 

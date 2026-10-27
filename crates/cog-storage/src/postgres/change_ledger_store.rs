@@ -1171,6 +1171,56 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         )
     }
 
+    async fn landed_at_revision(
+        &self,
+        limit: usize,
+    ) -> SFResult<Vec<(ChangeIdentity, Option<String>)>> {
+        // The landing revision comes from the event log, not from the row:
+        // `measured_rev` is moved to today's revision by every re-check, and the
+        // caller compares this revision against the image the workloads run --
+        // which is always at least one rollout behind the tree a re-check reads.
+        // Asked of the row it answered "not in the image" for changes that had
+        // been in the image for days.
+        //
+        // `LEFT JOIN LATERAL` rather than a plain join, because a landing that
+        // predates the event log has no landing revision at all: dropping it
+        // would make an unreadable history read as a landed row that is in
+        // effect, and the caller counts `NULL` apart from both sides.
+        let rows = sqlx::query(&fill_vocabulary(
+            "SELECT c.kind, c.scope, c.literal, l.measured_rev \
+             FROM change_ledger c \
+             LEFT JOIN LATERAL ( \
+                 SELECT e.measured_rev FROM change_ledger_event e \
+                 WHERE e.kind = c.kind AND e.scope = c.scope AND e.literal = c.literal \
+                   AND e.to_state = '{state:landed}' AND e.measured_rev IS NOT NULL \
+                 ORDER BY e.observed_at ASC, e.id ASC LIMIT 1 \
+             ) l ON TRUE \
+             WHERE c.state = '{state:landed}' \
+             ORDER BY c.measured_at ASC NULLS FIRST, c.first_seen_at ASC \
+             LIMIT $1",
+        ))
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    ChangeIdentity::new(
+                        row.try_get::<String, _>("kind")
+                            .map_err(|e| SFError::Database(format!("kind: {e}")))?,
+                        row.try_get::<String, _>("scope")
+                            .map_err(|e| SFError::Database(format!("scope: {e}")))?,
+                        row.try_get::<String, _>("literal")
+                            .map_err(|e| SFError::Database(format!("literal: {e}")))?,
+                    ),
+                    row.try_get::<Option<String>, _>("measured_rev")
+                        .map_err(|e| SFError::Database(format!("measured_rev: {e}")))?,
+                ))
+            })
+            .collect()
+    }
+
     async fn landed_touching(
         &self,
         paths: &[String],

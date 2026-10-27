@@ -1052,6 +1052,88 @@ async fn landed_rows_are_the_other_half_of_outstanding_read_oldest_first() {
     cleanup(&pool, &marker).await;
 }
 
+/// The landing revision is the one the row landed at, and a re-check moves the
+/// row's own revision past it.
+///
+/// The two are the same column in the account and two different facts, and the
+/// reader that compares a landing against the image the workloads run is asking
+/// about the first. Measured on the live account the day this read existed: every
+/// landed row the window sweep had touched since the image was built carried the
+/// sweep's revision, so the whole swept set read as landed and not running while
+/// the commits that had actually carried those changes were in the image.
+///
+/// The mechanism is asserted right above -- re-measuring a landed row writes a
+/// new `measured_rev` and keeps its state -- and the event table's own migration
+/// says the re-check writes no event. What this test pins is the consequence:
+/// the landing comes out of the log, and a row with no landing in the log answers
+/// `None` rather than the revision of a check it was not landed at.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn the_landing_revision_survives_a_re_check_and_is_absent_where_none_was_logged() {
+    let (store, pool, marker) = store().await;
+    let rechecked = identity(&marker, "rechecked");
+    let unlogged = identity(&marker, "unlogged");
+
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(rechecked.clone(), ChangeState::Landed)
+                .at_revision("probe-rev-1"),
+        )
+        .await
+        .expect("land the row at the first revision");
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(rechecked.clone(), ChangeState::Landed)
+                .at_revision("probe-rev-2"),
+        )
+        .await
+        .expect("re-check the row at a later revision");
+
+    // A landed row with no landing in the log: the state is written directly,
+    // which is the only way to reach it without a landing event -- the same shape
+    // every row that landed before the log existed has, and the reason the read
+    // answers `None` instead of falling back to `measured_rev`.
+    store
+        .apply_measurement(
+            &ChangeMeasurement::new(unlogged.clone(), ChangeState::Pending)
+                .at_revision("probe-rev-3"),
+        )
+        .await
+        .expect("enter a row that has not landed");
+    sqlx::query(
+        "UPDATE change_ledger SET state = 'landed', landed_at = now() \
+         WHERE kind = $1 AND scope = $2 AND literal = $3",
+    )
+    .bind(&unlogged.kind)
+    .bind(&unlogged.scope)
+    .bind(&unlogged.literal)
+    .execute(&pool)
+    .await
+    .expect("write a landing the log will not know about");
+
+    let rows = store
+        .landed_at_revision(10_000)
+        .await
+        .expect("read the landed set with the revisions it landed at");
+    let landing_of = |id: &ChangeIdentity| {
+        rows.iter()
+            .find(|(row, _)| row == id)
+            .map(|(_, revision)| revision.clone())
+    };
+    assert_eq!(
+        landing_of(&rechecked),
+        Some(Some("probe-rev-1".to_string())),
+        "the row's own revision moved to the re-check, so the landing has to come from the log"
+    );
+    assert_eq!(
+        landing_of(&unlogged),
+        Some(None),
+        "a landing nobody logged has no revision to answer with, and the row's own is not one"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
 /// The reopen record keeps the landed time the account is about to clear.
 ///
 /// The clearing is the whole reason the record exists: `landed_at` goes NULL the

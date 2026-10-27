@@ -166,6 +166,13 @@ impl ChangeLedgerStore for FakeLedger {
         unimplemented!("the read face does not ask this question yet")
     }
 
+    async fn landed_at_revision(
+        &self,
+        _limit: usize,
+    ) -> SFResult<Vec<(ChangeIdentity, Option<String>)>> {
+        unimplemented!("the read face does not ask this question yet")
+    }
+
     async fn landed_touching(
         &self,
         _paths: &[String],
