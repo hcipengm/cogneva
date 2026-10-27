@@ -1895,6 +1895,30 @@ rows:
       rollout and a delete at its startup is a bound on a row's age only while
       rollouts are more frequent than the retention is wide.
 
+  - key: taskEventRetention.keepDays
+    source: override
+    why: >-
+      Days a task's event stream is kept after it last appended. The table files
+      every iteration of every agent loop so a run that did not converge can be
+      read back afterwards; it had never had a row removed, and on 2026-10-27 it
+      held 130,871 rows over 211 MB, about 3,800 rows a day, all of it in the
+      nightly backup whose restore the drill has to finish inside a budget. The
+      unit is the whole stream and not the row, because both readers replay a
+      task's events from offset zero -- the handover readback and the ralph
+      replay -- so a deleted prefix answers a well-formed read with a gap that
+      looks exactly like the start of the run; a stream a checkpoint names is
+      not deletable at all, for the same reason a board-pointed snapshot is not.
+      Nothing measures how long after a run somebody would want to read it, so
+      the ceiling is the operator's call, and the loop publishes it as
+      cogneva_task_events_keep_seconds: task_event_archive_behind compares the
+      archive's oldest row against twice this reading, which is also the slack a
+      live stream needs -- retirement keeps every event of a stream that is
+      still appending, so the archive legitimately reaches back past the
+      retention by the length of its longest live run. A value of 0 says this
+      deployment measures and does not retire, which is how a second deployment
+      sharing the database stays out of the deletion; negative and unreadable
+      values fall back to 30.
+
   - key: checkpointStore.readWindowSeconds
     source: override
     why: >-

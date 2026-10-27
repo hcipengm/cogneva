@@ -68,6 +68,16 @@ CREATE INDEX IF NOT EXISTS idx_cog_events_task_id ON cog_events(task_id)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cog_events_task_offset
     ON cog_events(task_id, offset_num)
 ;
+-- The retention asks which task streams hold a row older than a cutoff and no
+-- row newer than it, so both halves of that question are a range over the
+-- timestamps -- and the answer is a set of task ids. `(created_at, task_id)`
+-- answers both from the index alone, instead of reading addresses out of an
+-- index built on the timestamp and then fetching every row to learn its task.
+-- Without it the sweep's candidate selection is a sequential scan of the whole
+-- archive once every two minutes.
+CREATE INDEX IF NOT EXISTS idx_cog_events_created_at_task
+    ON cog_events(created_at, task_id)
+;
 CREATE TABLE IF NOT EXISTS cog_context_boards (
                 task_id TEXT NOT NULL,
                 field_name TEXT NOT NULL,

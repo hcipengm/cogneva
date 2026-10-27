@@ -310,6 +310,21 @@ jobs:
         run: cargo test -p cog-observability --test exchange_retention -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The per-task event archive retires whole streams, and every claim that
+      # makes it safe is the server's: that a quiet stream goes in full and that
+      # a stream whose newest event is inside the retention keeps even the
+      # events that are older than it (retirement is not a prefix delete, which
+      # is what both readers would misread as the start of a run), that a
+      # checkpoint pins its stream however old it is, that a second pass finds
+      # nothing, that an empty archive answers zero, and that the candidate
+      # query is answered from the timestamp index rather than by scanning the
+      # archive every two minutes. The callback count says progress is reported
+      # per batch, which is the difference between a first run over a grown
+      # backlog and a loop that reads as stopped for as long as that run lasts.
+      - name: Live-DB task event retention
+        run: cargo test -p cog-storage --test task_event_retention -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Which replica may act is decided by one statement, and the acceptance
       # for it is a question about two processes: two asks landing at once leave
       # exactly one holder, and a holder that stops renewing loses the role to

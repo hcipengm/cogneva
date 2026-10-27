@@ -376,7 +376,7 @@ pub fn keep_days_from(raw: Option<&str>) -> i64 {
 /// the same reason: it is the name the manifest already gives the workload, and
 /// a pod name would be an identity that changes on every rollout.
 pub fn deployment_name() -> String {
-    std::env::var("COGNEVA_DEPLOYMENT_NAME").unwrap_or_default()
+    std::env::var(cog_core::env::DEPLOYMENT_NAME_ENV).unwrap_or_default()
 }
 
 #[cfg(test)]

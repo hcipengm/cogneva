@@ -144,6 +144,13 @@ spec:
             # 这里走。1 以下退回 30。
             - name: COGNEVA_LLM_EXCHANGE_KEEP_DAYS
               value: {{ .Values.llmExchangeRetention.keepDays | int | quote }}
+            # 任务事件档案（cog_events）的保留天数。退役的单位是整个任务的事件流：两个
+            # 读者都从 offset 0 重放，删前缀会让「从这里开始」和「跑到这里」读成同一件事；
+            # 被 cog_checkpoints 指着的流不删。超过这个天数没追加过的流整条退役。循环把
+            # 这个数发布成 cogneva_task_events_keep_seconds，告警拿它和最老一行比，所以界
+            # 跟着这里走。0 = 本部署只量不删；负数退回 30。
+            - name: COGNEVA_TASK_EVENT_KEEP_DAYS
+              value: {{ .Values.taskEventRetention.keepDays | int | quote }}
             # 本进程的花费属于哪个环境。token 账按这条轴回答「哪个环境烧的」，
             # 与 actor 轴（哪个组件烧的）正交——同一个组件在多个环境里跑，两个
             # 问题互不蕴含。控制面自己驱动平台的任务池，所以是 gateway_pool；

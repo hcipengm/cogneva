@@ -52,6 +52,7 @@ pub mod observability_event_cap;
 pub mod owner_lease;
 pub mod partition_maintainer;
 pub mod schema_ddl;
+pub mod task_event_retention;
 
 // ─── Crate-level re-exports (backward-compatible with old `cog-db` usage) ───
 
@@ -115,6 +116,7 @@ pub use metrics_sample_cap::{delete_surplus_sql, SampleLogCap, SweepOutcome};
 pub use observability_event_cap::{EventLogCap, EventSweepOutcome};
 pub use owner_lease::{lease_holder, LeaseRow, PgOwnerLeaseBroker, LEASE_TABLE};
 pub use partition_maintainer::PartitionMaintainer;
+pub use task_event_retention::{TaskEventRetention, TaskEventRetentionOutcome};
 
 pub mod plugin;
 #[cfg(feature = "redis")]

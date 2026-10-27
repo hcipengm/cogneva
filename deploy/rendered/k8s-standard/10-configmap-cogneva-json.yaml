@@ -2274,7 +2274,7 @@ data:
             },
             {
               "name": "llm_exchange_retention_behind",
-              "promql": "min_over_time(((max without (pod, container, instance) (gateway_llm_exchange_oldest_age_seconds)) and ((time() - (max without (pod, container, instance) (gateway_llm_exchange_oldest_age_seconds_observed_timestamp_seconds))) < 1800))[30m:1m]) > 2 * max without (pod, container, instance) (gateway_llm_exchange_keep_seconds and ((time() - gateway_llm_exchange_keep_seconds_observed_timestamp_seconds) < 1800))",
+              "promql": "(min_over_time(((max without (pod, container, instance) (gateway_llm_exchange_oldest_age_seconds)) and ((time() - (max without (pod, container, instance) (gateway_llm_exchange_oldest_age_seconds_observed_timestamp_seconds))) < 1800))[30m:1m]) > 2 * max without (pod, container, instance) (gateway_llm_exchange_keep_seconds and ((time() - gateway_llm_exchange_keep_seconds_observed_timestamp_seconds) < 1800))) and (count_over_time(max without (pod, container, instance) (gateway_llm_exchange_oldest_age_seconds)[1h:1m]) > count_over_time(max without (pod, container, instance) (gateway_llm_exchange_oldest_age_seconds)[30m:1m]))",
               "condition": {
                 "greater_than": 0.0
               },
@@ -2290,6 +2290,26 @@ data:
               },
               "severity": "warning",
               "summary": "The prompt-and-response archive's retention pass could not be completed at some attempt in the last half hour, {value} being the highest outcome those attempts recorded. A pass deletes what is older than the retention in batches and then measures what is left; the row count, the age of the oldest row and the bytes are stamped only once it returns, so a pass that fails leaves all three at their last values and the rule beside this one keeps reading a frozen archive until its own half hour age bound closes it -- a sweep that cannot run and one that is not keeping up then look the same. This is the reading that says the pass itself did not answer, and it is written on every pass rather than only the failed ones. The cause is the delete or the measure that refused, in that container's log. Read it together with the age rule rather than instead of it: this one says the retirement is not running, so nothing is being retired at all, while a pass that returns and still leaves the archive too deep is a different fault and names itself there.",
+              "face": "资源泄漏与长稳"
+            },
+            {
+              "name": "task_event_archive_behind",
+              "promql": "(min_over_time(((max without (pod, container, instance) (cogneva_task_events_oldest_age_seconds)) and ((time() - (max without (pod, container, instance) (cogneva_task_events_oldest_age_seconds_observed_timestamp_seconds))) < 1800))[30m:1m]) > 2 * max without (pod, container, instance) (cogneva_task_events_keep_seconds and ((time() - cogneva_task_events_keep_seconds_observed_timestamp_seconds) < 1800))) and (count_over_time(max without (pod, container, instance) (cogneva_task_events_oldest_age_seconds)[1h:1m]) > count_over_time(max without (pod, container, instance) (cogneva_task_events_oldest_age_seconds)[30m:1m]))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The per-task event archive reaches back {value} second(s), more than twice the retention the publishing process says it enforces. The archive files each iteration of a task's agent loop so a run that did not converge can be read back afterwards, and retirement works on whole streams rather than rows: both readers replay a task's events from offset zero, so a deleted prefix would read exactly like the start of the run. That granularity is why this rule exists in this shape. It fires for two causes that the rows and streams readings tell apart. Either the sweep is not retiring at all -- in which case cogneva_task_events_rows and cogneva_task_events_tasks both keep rising, and the pass-outcome rule beside this one says whether the passes are failing -- or one run has been appending for longer than the retention, which keeps every event it ever filed until it goes quiet: a stable row count over a falling stream count is that case, and the task to look at is the one whose iterations are still arriving after twice the retention has passed. The second is not a fault in the sweep and is not fixed by sweeping harder; it is a run that is not converging, and the iterations are what says why. Both sides of the comparison are the loop's own readings rather than numbers written here, so a deployment that shortens what it keeps moves its own judgement with it. Twice rather than once because a healthy archive is allowed to reach back past its retention by the length of its longest live run, and the measured longest run on this deployment spans about thirty-four days against a thirty-day retention; only a lag that has survived to twice the retention says the retirement is not happening. A frozen reading answers zero and this rule goes quiet by construction: the moment the process stops publishing, its age stops growing too, so this is the reading for a retention that runs and does not work, and the loop's own liveness readings are what cover a retention that stopped.",
+              "face": "资源泄漏与长稳"
+            },
+            {
+              "name": "task_event_archive_pass_failed",
+              "promql": "(max without (pod, container, instance) (max_over_time(cogneva_task_events_sweep_failed[30m]) and ((time() - cogneva_task_events_sweep_failed_observed_timestamp_seconds) < 1800))) > 0",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "The per-task event archive's retention pass could not be completed at some attempt in the last half hour, {value} being the highest outcome those attempts recorded. A pass retires every task stream whose newest event is older than the retention, in batches, and then measures what is left; the row count, the stream count, the oldest age and the retention are stamped only once it returns, so a pass that fails leaves all of them at their last values and the age rule beside this one keeps reading a frozen archive until its own half hour age bound closes it -- a sweep that cannot run and one that is not keeping up then look the same. This is the reading that says the pass itself did not answer, and it is written on every pass rather than only the failed ones. The cause is the delete or the measure that refused, in that container's log; the loop's own liveness reading cannot see it, because the process beats whether or not its body finished. A deployment that retires nothing on purpose never writes it, because it runs no pass to fail.",
               "face": "资源泄漏与长稳"
             },
             {

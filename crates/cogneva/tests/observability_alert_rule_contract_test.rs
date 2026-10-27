@@ -4406,6 +4406,27 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_principle_refusals",
         Unread::Gap("how many times a gate has refused work because of one principle, by slug. The account stored the count per row already; what was missing was a surface outside a query, and this series is that surface. What is still missing is a declared bound: one refusal is a gate doing its job, the same principle refused for a week is a rule the corpus is not internalizing, and where between those two a page belongs is a policy decision rather than a number a producer can know. The host script `scripts/host/cogneva-principle-refusal-reading.sh` reads the same fact straight from the database today, which is why the absence of a rule is not the absence of a reader -- but that reader lives outside this repository and cannot be named here as a series name"),
     ),
+    // The size readings of an archive whose retention bounds age. A stream is
+    // retired when it goes quiet past the retention, so the row count and the
+    // stream count settle at whatever the deployment writes in that window --
+    // they are numbers about traffic, not verdicts about the sweep. The fault
+    // these cells would catch, a sweep that stopped, is already stated by the
+    // oldest-row rule each archive ships with, and that rule needs no declared
+    // budget. They are published regardless: both tables had grown into the
+    // hundreds of megabytes with no reading at all (measured on this deployment
+    // on 2026-10-27), and the backup drill is sized from exactly this pair.
+    (
+        "cogneva_task_events_rows",
+        Unread::Gap("how many events the per-task archive holds. The retention that bounds this table works on age rather than size: a stream is retired when it has been quiet past the retention, so at any fixed write rate the row count settles on its own and no row budget for it is declared anywhere in the tree. A threshold invented here would page on traffic instead of on a sweep that stopped, and that fault already has a reader in task_event_archive_behind, which compares the oldest surviving row against the retention the loop publishes. It is published anyway because the table reached 211 MB with nothing reading it, and the nightly backup's budget is sized from it"),
+    ),
+    (
+        "cogneva_task_events_tasks",
+        Unread::Gap("how many distinct task streams the per-task archive holds, published beside cogneva_task_events_rows because a pass that retires many events out of one stream and one that retires the same events out of a thousand are different pictures of the same sweep. That is what makes it worth storing; it does not make it judgeable, and the bound it would be read against is the same undeclared row budget its sibling is missing"),
+    ),
+    (
+        "gateway_llm_exchange_rows",
+        Unread::Gap("how many prompt-and-response bodies the archive holds. Its two sibling readings are read -- llm_exchange_retention_behind compares the oldest body's age against the retention the loop publishes -- and this one has nothing to be compared with: the archive is bounded by age, so the body count follows the call volume and how large a body is, and no budget for either is declared. It is published because the table reached 307 MB before any retention ran, and the backup drill is sized from it"),
+    ),
 ];
 
 /// How many `Gap` entries the census left. A new series that no face reads and
@@ -4639,7 +4660,15 @@ const UNREAD: &[(&str, Unread)] = &[
 /// left is the shape this number punishes; here the two holds are one picture
 /// because a reader who saw only the window's would think a starved column was
 /// an idle one.
-const GAPS_AT_CENSUS: usize = 29;
+///
+/// It went to 32 in the pass that gave the two archives a retention. Each
+/// archive publishes its size beside its age, and only the age has a reader:
+/// age is what a retention promise is about, while the size follows the write
+/// rate and has no declared budget in the tree. Filing the three counts as
+/// debts is the same order the write-window record and the principle account
+/// used -- publish the reading first, argue about the threshold after -- and it
+/// is what makes the growth visible while the policy is still undecided.
+const GAPS_AT_CENSUS: usize = 32;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

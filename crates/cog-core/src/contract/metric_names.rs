@@ -191,6 +191,27 @@ metric_names! {
     CHECKPOINTS_BYTES => "cogneva_checkpoints_bytes",
     CHECKPOINT_SWEEP_FAILED => "cogneva_checkpoint_sweep_failed",
 
+    // cog-storage — the per-task event archive's retention.
+    //
+    // `cog_events` files each iteration of a task's agent loop so a run that
+    // did not converge can be read back afterwards, and nothing has ever
+    // removed a row from it: 130,871 rows over 211 MB on 2026-10-27, growing by
+    // about 3,800 rows a day, all of it in the nightly backup whose restore the
+    // drill has to finish inside a budget. Retirement works on whole streams
+    // rather than rows, because both readers replay a task's events from offset
+    // zero and a deleted prefix would look like the start of the run.
+    //
+    // The age of the oldest row is the retention seen from the reader's side,
+    // and the retention is published beside it so the rule compares two
+    // readings instead of a constant written into the rules file. The stream
+    // count is here because rows alone cannot tell one long run from a thousand
+    // short ones, and a pass removes whole streams.
+    TASK_EVENTS_ROWS => "cogneva_task_events_rows",
+    TASK_EVENTS_TASKS => "cogneva_task_events_tasks",
+    TASK_EVENTS_OLDEST_AGE_SECONDS => "cogneva_task_events_oldest_age_seconds",
+    TASK_EVENTS_KEEP_SECONDS => "cogneva_task_events_keep_seconds",
+    TASK_EVENTS_SWEEP_FAILED => "cogneva_task_events_sweep_failed",
+
     // cog-observability — the prompt-and-response archive's retention.
     //
     // `gateway_llm_exchange` keeps the bodies of what the platform sent

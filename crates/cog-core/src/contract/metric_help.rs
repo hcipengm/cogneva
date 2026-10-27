@@ -1497,6 +1497,44 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          growing look the same. Written on every pass",
     ),
     (
+        "cogneva_task_events_rows",
+        "Rows currently held in the per-task event archive, one per iteration \
+         of a task's agent loop. Read it beside cogneva_task_events_tasks: the \
+         row count alone cannot tell one long run from a thousand short ones, \
+         and retirement removes whole streams rather than rows",
+    ),
+    (
+        "cogneva_task_events_tasks",
+        "Task event streams currently held, one per task whose events have not \
+         been retired. A stream is kept or removed whole, because both readers \
+         replay a task's events from offset zero and a deleted prefix would read \
+         exactly like the start of the run",
+    ),
+    (
+        "cogneva_task_events_oldest_age_seconds",
+        "Age in seconds of the oldest row in the per-task event archive, zero \
+         for an empty archive. This is the retention seen from the reader's \
+         side: whatever the deployment says it keeps, this is how far back the \
+         archive actually reaches",
+    ),
+    (
+        "cogneva_task_events_keep_seconds",
+        "The retention the publishing process enforces on the per-task event \
+         archive, in seconds. Published beside the oldest row's age so the rule \
+         compares two readings rather than a constant written into the rules \
+         file. Absent from a deployment that retires nothing: every deployment \
+         sharing the database writes this gauge, and a zero would make the \
+         comparison a verdict about a policy that deployment does not have",
+    ),
+    (
+        "cogneva_task_events_sweep_failed",
+        "Whether the last task-event retention pass could not be completed, 1 \
+         or 0. The row count, the stream count, the oldest age and the retention \
+         are stamped only once a pass returns, so a pass that fails leaves every \
+         one of them at its last value -- a sweep that cannot run and an archive \
+         that is not growing look the same. Written on every pass",
+    ),
+    (
         "gateway_llm_exchange_rows",
         "Rows currently held in the prompt-and-response archive, one per call \
          whose bodies were kept. The archive is bounded by age rather than by a \

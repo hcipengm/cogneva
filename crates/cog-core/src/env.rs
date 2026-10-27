@@ -45,6 +45,18 @@ pub const INSTANCE_FINGERPRINT: &str = "COGNEVA_INSTANCE_FINGERPRINT";
 /// which section of the document applies.
 pub const RUN_ENV: &str = "COGNEVA_ENV";
 
+/// The name of the deployment this process belongs to, as the manifest gives
+/// it. Every retention loop that writes its readings into a table several
+/// deployments share puts it on the row, so a row can say which deployment's
+/// declaration it is.
+///
+/// Read by the checkpoint capacity sweep, the prompt-and-response archive's
+/// retention and the task event archive's retention. A second spelling would
+/// leave one of them publishing under an empty name, which the store reads as
+/// "not from anywhere" and answers with whichever deployment wrote last —
+/// exactly the confusion the label exists to prevent.
+pub const DEPLOYMENT_NAME_ENV: &str = "COGNEVA_DEPLOYMENT_NAME";
+
 /// Where a backup run puts the package it just wrote when somebody asked for
 /// that package by hand, so the process serving the web UI can offer it.
 ///
