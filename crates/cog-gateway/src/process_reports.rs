@@ -594,7 +594,7 @@ mod tests {
             latest("p2").expect("第二台也在").processes[0].command,
             "nats-server"
         );
-        assert_eq!(latest("p3").is_some(), true);
+        assert!(latest("p3").is_some(), "第三台也在");
         assert!(census_at("node-1").is_some(), "这一拍同时是这台节点的活体");
     }
 
