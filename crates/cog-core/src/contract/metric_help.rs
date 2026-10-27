@@ -300,20 +300,30 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     (
         "cogneva_cluster_read_total",
         "Attempts to read each apiserver collection the topology, workload and \
-         quota panels are built from, by `resource` and `outcome` (ok, failed). \
-         Those panels read on demand, so a read that starts answering 403 leaves \
-         a gap on screen and nothing else: the page still draws, the empty \
-         columns read as 'nothing is there', and a browser tab is not a monitor. \
-         A background probe issues the same reads at `limit=1` and writes both \
-         outcomes here, so the fault survives closing the tab. Read it by \
-         `resource`: the resource that failed names the rule missing from the \
-         ClusterRole, and `failed` on one resource beside `ok` on the rest is a \
-         permission that was narrowed, not an apiserver that is down. Both cells \
-         are written at zero when the gateway starts, so an absent series says \
-         this process does not publish the reading -- a different fact from a \
-         window in which every read answered. The probe is not the panel: it \
-         proves the read path and the permissions, not that what came back was \
-         enough to draw (an empty list is still an ok)",
+         quota panels are built from, by `resource`, `outcome` (ok, failed) and \
+         `deployment`. Those panels read on demand, so a read that starts \
+         answering 403 leaves a gap on screen and nothing else: the page still \
+         draws, the empty columns read as 'nothing is there', and a browser tab \
+         is not a monitor. A background probe issues the same reads at \
+         `limit=1` and writes both outcomes here, so the fault survives closing \
+         the tab. Read it by `resource`: the resource that failed names the rule \
+         missing from the ClusterRole, and `failed` on one resource beside `ok` \
+         on the rest is a permission that was narrowed, not an apiserver that is \
+         down. Read it by `deployment` as well, because the grant has two halves \
+         and they fail the same way: a collection can be missing from the \
+         ClusterRole, or served by a service account the ClusterRoleBinding never \
+         named -- and the processes that serve this face are the same binary run \
+         under different accounts, so one of them can answer while the other is \
+         refused. Without this label the two collapse into one reading and an \
+         alert says 'nodes is unreadable' without saying which process to look \
+         at. It is the deployment the process runs as, not the scrape's `job`: \
+         renaming a scrape job would fork a firing alert in two, and the \
+         deployment name is stable across rollouts. Both cells are written at \
+         zero when the process starts, so an absent series says this process does \
+         not publish the reading -- a different fact from a window in which every \
+         read answered. The probe is not the panel: it proves the read path and \
+         the permissions, not that what came back was enough to draw (an empty \
+         list is still an ok)",
     ),
     (
         "cogneva_landing_failures_total",

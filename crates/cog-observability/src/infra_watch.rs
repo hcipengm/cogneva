@@ -1864,6 +1864,40 @@ mod tests {
         assert_ne!(dedup_key("crash", &b), dedup_key("crash", &elsewhere));
     }
 
+    /// `deployment` is the one identity label that has to survive even though
+    /// it looks like a scrape label: it is written by the producing process
+    /// (which deployment it runs as), not by whoever scraped the endpoint, so
+    /// it says who is being reported and not who answered.
+    ///
+    /// The live case it comes from: two deployments serve the same reading from
+    /// the same binary under different service accounts, and a ClusterRoleBinding
+    /// named one of them and not the other. Both rows carry the same `resource`
+    /// and the same namespace, so without this label the alert says "nodes is
+    /// unreadable" and cannot say which account to look at -- and when both fail
+    /// at once, their two incidents are one row.
+    #[test]
+    fn the_deployment_that_wrote_a_reading_is_part_of_its_identity() {
+        let gateway = BTreeMap::from([
+            ("resource".to_string(), "nodes".to_string()),
+            ("deployment".to_string(), "cogneva".to_string()),
+            ("job".to_string(), "cogneva".to_string()),
+        ]);
+        let evolution = BTreeMap::from([
+            ("resource".to_string(), "nodes".to_string()),
+            ("deployment".to_string(), "cogneva-evolution".to_string()),
+            ("job".to_string(), "cogneva-evolution".to_string()),
+        ]);
+        assert_ne!(
+            dedup_key("cluster_read_failed", &gateway),
+            dedup_key("cluster_read_failed", &evolution),
+            "两个进程的同一格读数落在同一个 dedup key 上：告警点不出是哪个 ServiceAccount"
+        );
+        assert!(
+            identity_labels(&gateway).contains_key("deployment"),
+            "deployment 被当成抓取标签丢掉了：生产者写的进程名到不了告警行"
+        );
+    }
+
     /// The live reading this comes from: a store-held series is rendered by
     /// every deployment that scrapes the endpoint, so the sample that reports a
     /// sighting carries the *answering pod's* job/service. Stored as written,

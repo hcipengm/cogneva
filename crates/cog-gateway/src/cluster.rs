@@ -708,22 +708,93 @@ pub fn read_targets(namespace: &str) -> Vec<(&'static str, String)> {
     targets
 }
 
+/// 谁在探：这个进程跑成的那个工作负载的名字。
+///
+/// 这条读数由两个 Deployment 发布（网关与进化），它们是同一个二进制、同一套路由，
+/// 但是**两个 ServiceAccount**——授权面上一有问题，两边可以一边通一边不通。只按
+/// `resource` 读，响的那一条既说不出是哪个进程，也会把两边的失败并成一行：2026-10-28
+/// 实测，进化进程的四条集群读 403 时网关那一侧同样有计数，两边的失败挤在同一个
+/// dedup key 下，读者拿到的是「nodes 读不通」，得自己去翻抓取面才知道说的是谁。
+///
+/// 取 `COGNEVA_DEPLOYMENT_NAME`（与任务事件、用量保留那边同一个拼写），不取抓取配置
+/// 的 `job`：那个名字是 Prometheus 起的，改一次 scrape config 就把一条正在响的告警
+/// 拆成两条，滚动更新时又不会变。没设这个变量（本机跑、没经过清单）时不写这个标签，
+/// 而不是写一个空串——空串会被读成一个部署名。
+fn deployment_label() -> Option<String> {
+    std::env::var(cog_core::env::DEPLOYMENT_NAME_ENV)
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+/// 一格读数的标签。`deployment` 缺席时**不写这个键**，不写空串：空串会被读成
+/// 一个叫「」的部署名，而那正好是「读的人以为有人报过」的形状。
+fn read_labels(
+    resource: &str,
+    outcome: &str,
+    deployment: Option<&str>,
+) -> std::collections::HashMap<String, String> {
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(crate::LABEL_OUTCOME.to_string(), outcome.to_string());
+    labels.insert(crate::LABEL_RESOURCE.to_string(), resource.to_string());
+    if let Some(deployment) = deployment {
+        labels.insert(crate::LABEL_DEPLOYMENT.to_string(), deployment.to_string());
+    }
+    labels
+}
+
 /// 把一条读的结局写进指标。没有指标后端时什么都不写：这一面本身不依赖它。
 async fn publish_read(
     metrics: &Option<std::sync::Arc<dyn cog_core::MetricsBackend>>,
     resource: &str,
     outcome: &str,
+    deployment: Option<&str>,
     value: f64,
 ) {
     let Some(backend) = metrics.as_ref() else {
         return;
     };
-    let mut labels = std::collections::HashMap::new();
-    labels.insert(crate::LABEL_OUTCOME.to_string(), outcome.to_string());
-    labels.insert(crate::LABEL_RESOURCE.to_string(), resource.to_string());
+    let labels = read_labels(resource, outcome, deployment);
     let _ = backend
         .record_counter(cog_core::metric_names::CLUSTER_READ_TOTAL, value, labels)
         .await;
+}
+
+#[cfg(test)]
+mod read_label_tests {
+    use super::*;
+
+    /// 两个进程的失败不能被并成一格。这条读数由网关与进化两个 Deployment 发布，
+    /// 它们是同一个二进制、两个 ServiceAccount：授权坏在绑定时只会坏一边，而
+    /// 少了 `deployment` 这个标签，响的那条既说不出是谁，抓取面上两边也合成一行。
+    #[test]
+    fn a_read_is_attributed_to_the_deployment_that_ran_it() {
+        let gateway = read_labels("nodes", READ_FAILED, Some("cogneva"));
+        let evolution = read_labels("nodes", READ_FAILED, Some("cogneva-evolution"));
+        assert_eq!(
+            gateway.get(crate::LABEL_DEPLOYMENT).map(String::as_str),
+            Some("cogneva")
+        );
+        assert_eq!(
+            evolution.get(crate::LABEL_DEPLOYMENT).map(String::as_str),
+            Some("cogneva-evolution")
+        );
+        assert_ne!(
+            gateway, evolution,
+            "两个进程的同一格读数带着同一组标签：它们在抓取面上就是同一行"
+        );
+    }
+
+    /// 不知道自己是哪个部署时，`deployment` 这个键缺席，而不是留一个空串——
+    /// 空串是一个值，读者会以为有一个叫空名字的部署在报数。
+    #[test]
+    fn an_unnamed_process_writes_no_deployment_label_at_all() {
+        let labels = read_labels("nodes", READ_OK, None);
+        assert!(
+            !labels.contains_key(crate::LABEL_DEPLOYMENT),
+            "没设部署名时写了一个空串：那会被读成一个部署"
+        );
+    }
 }
 
 /// 启动时把每一格写成 0。
@@ -735,9 +806,10 @@ pub async fn publish_vocabulary(metrics: &Option<std::sync::Arc<dyn cog_core::Me
     let namespace = KubeClient::in_cluster()
         .map(|client| client.namespace().to_string())
         .unwrap_or_else(|_| "cogneva".to_string());
+    let deployment = deployment_label();
     for (resource, _) in read_targets(&namespace) {
         for outcome in [READ_OK, READ_FAILED] {
-            publish_read(metrics, resource, outcome, 0.0).await;
+            publish_read(metrics, resource, outcome, deployment.as_deref(), 0.0).await;
         }
     }
 }
@@ -747,6 +819,7 @@ pub(crate) async fn probe_reads(
     client: &KubeClient,
     metrics: &Option<std::sync::Arc<dyn cog_core::MetricsBackend>>,
 ) {
+    let deployment = deployment_label();
     for (resource, path) in read_targets(client.namespace()) {
         // `limit=1`：探的是这条读通不通，不是它返回什么。一次读回整个集群的 Pod
         // 只为判权限，是把每分钟一次的探针变成了真正的负载。
@@ -764,7 +837,7 @@ pub(crate) async fn probe_reads(
                 READ_FAILED
             }
         };
-        publish_read(metrics, resource, outcome, 1.0).await;
+        publish_read(metrics, resource, outcome, deployment.as_deref(), 1.0).await;
     }
 }
 

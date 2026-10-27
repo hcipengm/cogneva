@@ -1809,6 +1809,14 @@ pub const LABEL_OUTLET: &str = "outlet";
 /// 读数按「哪个资源」归属时用的标签键。
 pub const LABEL_RESOURCE: &str = "resource";
 
+/// 读数按「哪个 Deployment 的进程写的」归属时用的标签键。
+///
+/// 与抓取配置里那个 `job` 不是同一件事：`job` 是 Prometheus 起的名字，改一次
+/// scrape config 就换了；这个值是进程自己被起的方式（`COGNEVA_DEPLOYMENT_NAME`），
+/// 滚动更新不会变。同一个二进制跑成两个工作负载、各自一个 ServiceAccount 时，
+/// 只有这个标签能说出响的是哪一个。
+pub const LABEL_DEPLOYMENT: &str = "deployment";
+
 /// The series name the held-out reading is published under.
 ///
 /// It is declared here rather than in the registry: the reading is rendered

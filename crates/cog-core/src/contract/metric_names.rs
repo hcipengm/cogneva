@@ -1048,6 +1048,13 @@ metric_names! {
     // reading, zero means the probe ran and everything answered. The probe is
     // what makes the reading independent of a viewer -- a browser tab is not a
     // monitor.
+    //
+    // Carries the `deployment` the process runs as. Two deployments serve this
+    // face from the same binary under different service accounts, so the two
+    // halves of a grant (the ClusterRole's rule, the binding's subject) can be
+    // wrong for one and right for the other; a reading that cannot name the
+    // process leaves the alert pointing at a cluster-wide permission when the
+    // fault is one account's binding.
     CLUSTER_READ_TOTAL => "cogneva_cluster_read_total",
 
     // cog-gateway — LLM pool and upstream health.

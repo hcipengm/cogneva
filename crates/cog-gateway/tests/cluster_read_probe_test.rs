@@ -161,3 +161,34 @@ fn the_probe_asks_for_one_row() {
         "探针没有把 limit=1 拼进路径：一分钟一次的探针会把整个集群的 Pod 读回来"
     );
 }
+
+/// 每一条读都要跟着写「是哪个进程写的」。
+///
+/// 这一面由两个 Deployment 发布——同一个二进制、两个 ServiceAccount。授权坏在
+/// 绑定时只坏一边，而读数里没有进程名时，告警只说得出「nodes 读不通」，读者还得
+/// 自己去抓取面翻是谁；两边同时失败时更是并成一行。部署名来自
+/// `COGNEVA_DEPLOYMENT_NAME`（清单里两个工作负载都设了），不是抓取配置的 `job`：
+/// `job` 是 Prometheus 起的名字，改一次 scrape config 就换了。
+#[test]
+fn every_read_says_which_deployment_wrote_it() {
+    assert!(
+        SOURCE.contains("cog_core::env::DEPLOYMENT_NAME_ENV"),
+        "探针不再读 COGNEVA_DEPLOYMENT_NAME：读数里没有进程名，两个进程的失败就并成一条，\
+         而告警说不出该去查哪一个 ServiceAccount 的绑定"
+    );
+    let probe = SOURCE
+        .split("async fn probe_reads")
+        .nth(1)
+        .expect("找不到 probe_reads")
+        .split("pub fn spawn_read_probe")
+        .next()
+        .unwrap();
+    assert!(
+        probe.contains("deployment.as_deref()"),
+        "探针把部署名丢了：publish_read 收到的永远是 None，标签写不进去"
+    );
+    assert!(
+        SOURCE.contains("crate::LABEL_DEPLOYMENT"),
+        "publish_read 不再写 deployment 标签：同一条读数两个进程写出来是同一行"
+    );
+}
