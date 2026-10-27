@@ -603,9 +603,10 @@ pub async fn raw_log_index_handler(
         .observability_gateway
         .as_ref()
         .ok_or_else(|| ApiError::internal("observability gateway not configured"))?;
-    let date = chrono::NaiveDate::parse_from_str(&query.date, "%Y-%m-%d").map_err(|e| {
-        ApiError::bad_request(format!("invalid date format (expected YYYY-MM-DD): {e}"))
-    })?;
+    let date = chrono::NaiveDate::parse_from_str(&query.date, cog_storage::DAY_KEY_FORMAT)
+        .map_err(|e| {
+            ApiError::bad_request(format!("invalid date format (expected YYYY-MM-DD): {e}"))
+        })?;
     let index = gateway
         .get_raw_log_index(&query.stream, date)
         .await

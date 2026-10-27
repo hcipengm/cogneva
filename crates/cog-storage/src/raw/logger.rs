@@ -396,7 +396,7 @@ async fn flush_stream(
         _ => return Ok(()),
     };
 
-    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let today = crate::log_file_stem(Utc::now().date_naive());
     let needs_new_file = current_dates
         .get(stream)
         .map(|d| d != &today)

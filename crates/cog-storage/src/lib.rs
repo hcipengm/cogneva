@@ -115,3 +115,23 @@ pub use partition_maintainer::PartitionMaintainer;
 pub mod plugin;
 #[cfg(feature = "redis")]
 pub use dlq::RedisDeadLetterQueue;
+
+/// The date form a rotating raw log file is named with, and the only one a
+/// reader may assume.
+///
+/// It is written twice by necessity — once to build the file name and once to
+/// parse it back — and those two are never in the same function. Change the
+/// writer and the migrator goes on looking for names that are no longer
+/// produced: it finds nothing, which it reports exactly the way it reports a
+/// day with no traffic, so the logs stop being migrated and stop being
+/// compacted while every reading still looks normal.
+pub const DAY_KEY_FORMAT: &str = "%Y-%m-%d";
+
+/// The stem a raw log file written on `day` is named with.
+///
+/// The writer and the reader go through this one function rather than each
+/// formatting the date themselves, so a change of form cannot land on one side
+/// only.
+pub fn log_file_stem(day: chrono::NaiveDate) -> String {
+    day.format(DAY_KEY_FORMAT).to_string()
+}

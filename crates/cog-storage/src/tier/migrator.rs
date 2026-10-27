@@ -463,5 +463,48 @@ pub fn is_compressed(file_name: &str) -> bool {
 pub fn parse_log_date(file_name: &str) -> Option<NaiveDate> {
     // FileRawLogger names files `YYYY-MM-DD.jsonl[.zst]`.
     let stem = file_name.split('.').next()?.to_string();
-    NaiveDate::parse_from_str(&stem, "%Y-%m-%d").ok()
+    NaiveDate::parse_from_str(&stem, crate::DAY_KEY_FORMAT).ok()
+}
+
+#[cfg(test)]
+mod day_key_tests {
+    use super::parse_log_date;
+    use chrono::NaiveDate;
+
+    /// 写出这个名字的那一侧与读回这个名字的这一侧，必须是同一个形态。
+    ///
+    /// 两处各自写一遍 `%Y-%m-%d` 时，改一处不会让另一处红：写入方换一种
+    /// 命名，迁移器照旧按老形态找文件，找到零个——而「这一天没有日志」与
+    /// 「日志换了名字」在迁移读数里长得一模一样。
+    #[test]
+    fn the_name_a_log_file_is_written_under_is_the_one_the_migrator_parses() {
+        for day in [
+            NaiveDate::from_ymd_opt(2026, 1, 2).expect("构造日期"),
+            NaiveDate::from_ymd_opt(2026, 10, 27).expect("构造日期"),
+            NaiveDate::from_ymd_opt(1999, 12, 31).expect("构造日期"),
+        ] {
+            let stem = crate::log_file_stem(day);
+            for name in [format!("{stem}.jsonl"), format!("{stem}.jsonl.zst")] {
+                assert_eq!(
+                    parse_log_date(&name),
+                    Some(day),
+                    "{name} 读不回它自己那一天"
+                );
+            }
+        }
+    }
+
+    /// 已经落盘的两种形态也要读得回来：改名是给以后的文件用的，不是给
+    /// 昨天那批用的。
+    #[test]
+    fn the_names_already_on_disk_still_parse() {
+        assert_eq!(
+            parse_log_date("2026-10-27.jsonl"),
+            NaiveDate::from_ymd_opt(2026, 10, 27)
+        );
+        assert_eq!(
+            parse_log_date("2026-10-27.jsonl.zst"),
+            NaiveDate::from_ymd_opt(2026, 10, 27)
+        );
+    }
 }
