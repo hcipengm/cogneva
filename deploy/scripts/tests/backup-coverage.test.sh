@@ -9,7 +9,10 @@
 #   2. 代码里新出现一个数据根子目录而没有登记 -> 红，点名它；
 #   3. 登记行没有 why -> 红（只写名字的条目等于把问题留给下一个人）；
 #   4. 登记行的 evidence 指向不存在的文件 -> 红（指针防锈）；
-#   5. 登记行的 class 不在闭集里 -> 红。
+#   5. 登记行的 class 不在闭集里 -> 红；
+#   6. 一级段写成常量、后面再拼一层（`data_dir.join(EVAL_SUBDIR).join("datasets")`）
+#      -> 按常量值判一级段，第二个 join 的名字不得进普查面；
+#   7. 常量指向一个没登记的子目录 -> 红，点名解析出来的目录而不是常量名。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -108,4 +111,29 @@ printf 'ghost-tree\tmain\tmaybe\t有个东西\t因为它可能是派生的\tcrat
 out="$(run_gate)" && fail "class 不在闭集里应当红，实际绿：${out}"
 grep -q "maybe" <<<"${out}" || fail "红时没有点名那个 class：${out}"
 
-echo "backup-coverage: 5 个用例全绿"
+# 6) 一级段是常量、二级目录是字面量
+mirror
+cat > "${work}/root/crates/demo/src/nested.rs" <<'RUST'
+const EVAL_SUBDIR: &str = "eval";
+
+pub fn datasets_dir(data_dir: &str) -> std::path::PathBuf {
+    std::path::Path::new(data_dir).join(EVAL_SUBDIR).join("datasets")
+}
+RUST
+out="$(run_gate)" || fail "常量拼出的一级段应当按常量值（eval，已登记）判，实际红：${out}"
+grep -q "datasets" <<<"${out}" && fail "把二级目录 datasets 当成了一级段：${out}"
+
+# 7) 常量指向没登记的子目录：红要点名目录，不是常量名
+mirror
+cat > "${work}/root/crates/demo/src/nested.rs" <<'RUST'
+const NEW_SUBDIR: &str = "const-tree";
+
+pub fn new_dir(data_dir: &str) -> std::path::PathBuf {
+    std::path::Path::new(data_dir).join(NEW_SUBDIR)
+}
+RUST
+out="$(run_gate)" && fail "常量指向的未登记子目录应当红，实际绿：${out}"
+grep -q "const-tree" <<<"${out}" || fail "红时没有点名常量解析出来的目录：${out}"
+grep -q "NEW_SUBDIR" <<<"${out}" && fail "把常量名当成了目录名：${out}"
+
+echo "backup-coverage: 7 个用例全绿"

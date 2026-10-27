@@ -182,7 +182,17 @@ def rust_segments(mount):
     """
     # 接收者必须本身就是数据根：`staging.join("objects")` 也在提 data_dir 的行上
     # （那条语句的另一个参数是 data_dir），但它拼的是包里的目录，不是数据根下的。
-    join_pat = re.compile(r'(?:[\w.()]*[Dd]ata_dir[\w.()]*)\.join\("([A-Za-z0-9_-]+)"\)')
+    # 同理只认 data_dir 之后的第一个 join：`Path::new(data_dir).join(EVAL_SUBDIR)
+    # .join("datasets")` 里 `datasets` 是 `eval` 下的二级目录，把它当一级段会让
+    # 普查面漏掉真正的 `eval`、多出一个从不存在的 `datasets`。
+    # 判据因此是「data_dir 之后只剩 `)`、`.` 和空白，紧跟的就是 join(」。
+    root_join = re.compile(r'[Dd]ata_dir(?:\(\))?[\s).]*\.join\(')
+    # 一级段常写成常量名而不是字面量（`data_dir.join(WORKSPACE_SUBDIR)`），不解析
+    # 常量就等于整段看不见。只解析同一文件里的 `const X: &str = "…"`；解析不出来的
+    # 标识符（函数参数、跨 crate 常量）照旧跳过——猜一个名字写进普查面比漏掉更糟。
+    const_pat = re.compile(
+        r'\bconst\s+([A-Za-z_]\w*)\s*:\s*&(?:\'static\s+)?str\s*=\s*"([A-Za-z0-9_-]+)"\s*;')
+    arg_pat = re.compile(r'\s*(?:"([A-Za-z0-9_-]+)"|([A-Za-z_]\w*))\s*\)')
     # 例外：先把 `COGNEVA_DATA_DIR` 读进局部变量、下一行才 join 的写法。上一行提到
     # DATA_DIR 时，这一行的 join 就是在它下面拼路径——这一行本身看不出接收者是谁。
     local_join = re.compile(r'\.join\("([A-Za-z0-9_-]+)"\)')
@@ -190,6 +200,7 @@ def rust_segments(mount):
     for path in glob.glob("crates/**/*.rs", recursive=True):
         with open(path, encoding="utf-8", errors="replace") as fh:
             text = fh.read()
+        consts = dict(const_pat.findall(text))
         # 测试块里的 data_dir 是临时目录：`..data`、`jwt-secret` 这类名字会把普查面
         # 变成一幅假的现场。
         cut = text.find("#[cfg(test)]")
@@ -202,8 +213,13 @@ def rust_segments(mount):
             mentions = ("data_dir" in line or "DATA_DIR" in line)
             window = mentions or any("data_dir" in l or "DATA_DIR" in l for l in recent)
             if window:
-                for name in join_pat.findall(line):
-                    found.setdefault(name, path)
+                for m in root_join.finditer(line):
+                    arg = arg_pat.match(line, m.end())
+                    if not arg:
+                        continue
+                    name = arg.group(1) or consts.get(arg.group(2) or "")
+                    if name:
+                        found.setdefault(name, path)
                 for name in re.findall(r'"\{[^"]*\}/([A-Za-z0-9_-]+)', line):
                     found.setdefault(name, path)
             if any("DATA_DIR" in l for l in recent):
