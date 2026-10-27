@@ -1308,6 +1308,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "kube_pod_deletion_timestamp",
         "kube-state-metrics (present only while deletionTimestamp is set: a graceful deletion clears it in seconds, so a timestamp that persists is the wedge itself -- the API took the deletion and the runtime did not release the container, a state no other series reports)",
     ),
+    (
+        "kube_pod_labels",
+        "kube-state-metrics (one constant series per pod per allowlisted label key; with an empty allowlist the whole family does not exist, so this registration is only true while the key it is read through stays allowlisted -- the rule that counts running pods with no scrape target reads `cogneva.io/readings-delivery` from here to leave out workloads whose readings arrive by push, since a process census with no /metrics can only say so on its own pod object)",
+    ),
     ("kube_pod_owner", "kube-state-metrics"),
     (
         "kube_pod_start_time",
@@ -2089,6 +2093,58 @@ fn every_series_an_alert_rule_reads_is_one_something_produces() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// Registering `kube_pod_labels` as a foreign family says the family is
+/// somebody else's to produce; it does not say the key a rule reads through it
+/// is actually exported. With an empty allowlist the entire family is absent,
+/// and the rule that reads `cogneva.io/readings-delivery` from it does not go
+/// red -- it evaluates to nothing on that leg, so the exclusion silently
+/// disappears and every push-only pod is counted as unscraped at each
+/// evaluation again. Both profiles are checked because either one can be the
+/// applied profile, and a key dropped from the profile that is not deployed
+/// today is the same defect waiting for a smaller node.
+///
+/// Read off the flag itself, not off the file as text: the prose above the flag
+/// names the key too, and a search for the bare string goes green after the key
+/// is dropped from the list -- measured, by removing the key and watching a
+/// `contains` assertion pass on the comment that explained it.
+#[test]
+fn the_pod_label_an_alert_rule_reads_through_is_allowlisted_in_every_profile() {
+    const KEY: &str = "cogneva.io/readings-delivery";
+    for (profile, values) in [
+        (
+            "default",
+            read("deploy/k3s/observability/helm/kube-prometheus-stack-values.yaml"),
+        ),
+        (
+            "small",
+            read("deploy/k3s/observability/helm/kube-prometheus-stack-values-small.yaml"),
+        ),
+    ] {
+        let allowed = values
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("- --metric-labels-allowlist="))
+            .any(|flag| {
+                flag.strip_prefix("pods=[")
+                    .and_then(|rest| rest.strip_suffix(']'))
+                    .is_some_and(|keys| {
+                        keys.split(',').any(|key| {
+                            let key = key.trim();
+                            // `*` exports every key, so it answers the same
+                            // question -- it is a worse answer for cardinality,
+                            // not a wrong one for reachability.
+                            key == KEY || key == "*"
+                        })
+                    })
+            });
+        assert!(
+            allowed,
+            "{profile}: kube-prometheus-stack 的 --metric-labels-allowlist 里没有 {KEY}，\
+             读这个标签的那条规则就永远看不到它：`kube_pod_labels` 整族不产出，排除腿静默消失，\
+             没有 /metrics 的工作负载会被一直算成没被抓"
+        );
+    }
 }
 
 /// A difference read shows only what the cell looked like *before* the event, so
