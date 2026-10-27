@@ -175,6 +175,16 @@ pub struct NodeView {
     /// 每一个容器的进程表都没有人能填。与「采集器在跑、这一格读不到」是两个现场，
     /// 修法相反，所以这里必须分得开。
     pub process_census_at: Option<chrono::DateTime<Utc>>,
+    /// 这台节点上采集器看到几个容器的进程表。`None` ＝ 这台节点上没有活着的采集器
+    /// （没人能报，不是零个）。
+    pub census_containers: Option<usize>,
+    /// 上面这些容器里，有**几个是这一面读不到的**：采集器读的是整台宿主的 cgroup
+    /// 树，而这一面按命名空间取 Pod。跑在别的命名空间里的容器（traefik、coredns、
+    /// prometheus 这些）有进程读数，却没有一格能显示它们。
+    ///
+    /// 把差读出来，是为了让「全量」这句话可以被检验：这一格不为 0 时，屏上的容器
+    /// 就不是这台机器上的全部容器，而这句话只能由这个数说出来。
+    pub unclaimed_containers: Option<usize>,
     pub pods: Vec<PodView>,
 }
 
@@ -422,6 +432,18 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
                 .map(|items| items.iter().map(|pod| pod_view(pod, &sources)).collect())
                 .unwrap_or_default();
             place_pods(&mut view, parsed);
+            // 采集器读的是整台宿主，这一面按命名空间取 Pod：两者差出来的那些容器
+            // 有进程读数却没有格子。差读在 Pod 读成功之后——读不到 Pod 时不知道
+            // 谁被认领了，那时的差不是差，是不知道。
+            let claimed = claimed_container_ids(pods.get("items"));
+            for node in &mut view.nodes {
+                if let Some((seen, unclaimed)) =
+                    crate::process_reports::census_gap(&node.name, &claimed)
+                {
+                    node.census_containers = Some(seen);
+                    node.unclaimed_containers = Some(unclaimed);
+                }
+            }
         }
         Err(e) => {
             view.error = Some(match view.error {
@@ -853,8 +875,39 @@ fn node_view(node: &Value) -> NodeView {
         memory_requested_bytes: 0,
         cpu_used_millicores: None,
         memory_used_bytes: None,
+        census_containers: None,
+        unclaimed_containers: None,
         pods: Vec::new(),
     }
+}
+
+/// 这一面读到的 Pod 用掉了哪些容器实例 id。
+///
+/// 采集器按容器 id 入账（cgroup 路径的末段就是它），Pod 状态里也带着同一个 id，
+/// 两边不用交换名字就能对上。`initContainerStatuses` 也算：init 容器在跑的时候，
+/// 宿主上同样有一个叶子，不认领它就会被算成「这一面读不到的容器」。
+fn claimed_container_ids(pods: Option<&Value>) -> std::collections::HashSet<String> {
+    let mut claimed = std::collections::HashSet::new();
+    let Some(items) = pods.and_then(Value::as_array) else {
+        return claimed;
+    };
+    for pod in items {
+        for field in ["/status/containerStatuses", "/status/initContainerStatuses"] {
+            let Some(statuses) = pod.pointer(field).and_then(Value::as_array) else {
+                continue;
+            };
+            for status in statuses {
+                let Some(id) = status.get("containerID").and_then(Value::as_str) else {
+                    continue;
+                };
+                let id = crate::process_reports::container_id_of(id);
+                if !id.is_empty() {
+                    claimed.insert(id.to_string());
+                }
+            }
+        }
+    }
+    claimed
 }
 
 fn pod_view(pod: &Value, sources: &Sources) -> PodView {
@@ -1918,6 +1971,7 @@ mod topology_tests {
             }
         });
         let report = |command: &str| crate::process_reports::Report {
+            node: "cogneva-node".to_string(),
             reported_at: Utc::now(),
             processes: vec![crate::process_reports::ReportedProcess {
                 pid: 1,
@@ -1959,6 +2013,7 @@ mod topology_tests {
         crate::process_reports::record(
             "cccc",
             crate::process_reports::Report {
+                node: "cogneva-node".to_string(),
                 reported_at: Utc::now(),
                 processes: vec![crate::process_reports::ReportedProcess {
                     pid: 1,
@@ -1989,6 +2044,44 @@ mod topology_tests {
         assert!(
             view.containers[0].processes.is_none(),
             "没有自报就不是一张空表"
+        );
+    }
+
+    #[test]
+    fn the_face_claims_the_containers_it_draws() {
+        // 采集器按容器 id 入账，这一面靠 Pod 状态里的同一个 id 认领。认领不到的那些
+        // 会被算成「这一面读不到的容器」，所以 init 容器与运行时的 URL 前缀都必须
+        // 折对——认错一个，屏上就多算一个看不见的容器。
+        let pods = json!({
+            "items": [
+                {
+                    "metadata": { "name": "api", "namespace": "cogneva" },
+                    "status": {
+                        "containerStatuses": [
+                            { "name": "app", "containerID": "containerd://aaaa" },
+                            { "name": "waiting", "state": { "waiting": {} } }
+                        ],
+                        "initContainerStatuses": [
+                            { "name": "init", "containerID": "containerd://cccc" }
+                        ]
+                    }
+                },
+                {
+                    "metadata": { "name": "quiet", "namespace": "cogneva" },
+                    "status": { "containerStatuses": [] }
+                }
+            ]
+        });
+        let claimed = claimed_container_ids(pods.get("items"));
+        assert!(claimed.contains("aaaa"), "运行中的容器要认领");
+        assert!(
+            claimed.contains("cccc"),
+            "init 容器同样占着宿主上的一个叶子"
+        );
+        assert_eq!(claimed.len(), 2, "没有 containerID 的状态不该凭空认领");
+        assert!(
+            claimed_container_ids(None).is_empty(),
+            "读不到 Pod 列表时谁都没认领——那一格要报「不知道」，不是「全都没认领」"
         );
     }
 

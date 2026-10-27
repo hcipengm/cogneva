@@ -23,7 +23,7 @@
 //! 带平台令牌，就得给每个业务 Pod 发一个身份，那比这个风险大得多。规模与形状在
 //! 这里收口：条数、名字长度、新鲜度都有上限。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, RwLock};
 use std::time::Duration;
 
@@ -53,6 +53,13 @@ pub struct ReportedProcess {
 
 #[derive(Debug, Clone)]
 pub struct Report {
+    /// 这份表是从哪台节点上读到的。节点采集器把它自报的节点名带在每一份上；
+    /// 容器自报的那条路没有节点名，落空串。
+    ///
+    /// 为什么要按节点记：宿主上的容器总数与「这一面展示了多少个」之间的差，是唯一
+    /// 能说明「采集器看得见、而屏上看不见」的数——而它只有按节点才摊得开，一台节点
+    /// 上的采集器停了，别的节点上的差不受影响。
+    pub node: String,
     pub reported_at: DateTime<Utc>,
     pub processes: Vec<ReportedProcess>,
 }
@@ -126,6 +133,35 @@ pub fn census_at(node: &str) -> Option<DateTime<Utc>> {
             .map(|age| age <= FRESH_FOR)
             .unwrap_or(false)
     })
+}
+
+/// 某台节点上采集器看到了几个容器，其中几个**这一面读不到**。
+///
+/// `claimed` 是屏上这些 Pod 的容器实例 id：采集器按容器 id 入账，Pod 状态里也带着
+/// 同一个 id，两边不用交换名字就能对上。对不上的那些，采集器看得见它们、屏上没有
+/// 它们的位置——跑在别的命名空间里的容器就是这样消失的：这一面按命名空间取 Pod，
+/// 而采集器读的是**整台宿主**的 cgroup 树。
+///
+/// 返回 `None` 读作「这台节点上没有活着的采集器」：没有人能报，差就是「不知道」，
+/// 不是 0——把它写成 0 会让「采集器没装」读成「一个都没漏」。
+pub fn census_gap(node: &str, claimed: &HashSet<String>) -> Option<(usize, usize)> {
+    let node = node.trim();
+    if node.is_empty() || census_at(node).is_none() {
+        return None;
+    }
+    let reports = REPORTS.read().unwrap_or_else(|e| e.into_inner());
+    let mut seen = 0usize;
+    let mut unclaimed = 0usize;
+    for (id, report) in reports.iter() {
+        if !fresh(report) || report.node != node {
+            continue;
+        }
+        seen += 1;
+        if !claimed.contains(id) {
+            unclaimed += 1;
+        }
+    }
+    Some((seen, unclaimed))
 }
 
 /// 把 Pod 状态里的 `containerd://<id>` 与自报里的 id 折成同一个形状：只要那串
@@ -299,6 +335,7 @@ async fn ingest(
         changed |= record(
             &container_id,
             Report {
+                node: node.clone(),
                 reported_at: Utc::now(),
                 processes,
             },
@@ -374,6 +411,7 @@ mod tests {
         record(
             container,
             Report {
+                node: String::new(),
                 reported_at: Utc::now() - chrono::Duration::seconds(FRESH_FOR.as_secs() as i64 + 5),
                 processes: vec![ReportedProcess {
                     pid: 1,
@@ -392,6 +430,7 @@ mod tests {
         record(
             container,
             Report {
+                node: String::new(),
                 reported_at: Utc::now() - chrono::Duration::seconds(1),
                 processes: vec![ReportedProcess {
                     pid: 1,
@@ -404,6 +443,7 @@ mod tests {
         record(
             container,
             Report {
+                node: String::new(),
                 reported_at: Utc::now(),
                 processes: vec![ReportedProcess {
                     pid: 2,
@@ -431,6 +471,7 @@ mod tests {
             record(
                 container,
                 Report {
+                    node: String::new(),
                     reported_at: Utc::now(),
                     processes: table.clone(),
                 }
@@ -441,6 +482,7 @@ mod tests {
             !record(
                 container,
                 Report {
+                    node: String::new(),
                     reported_at: Utc::now(),
                     processes: table,
                 }
@@ -451,6 +493,7 @@ mod tests {
             record(
                 container,
                 Report {
+                    node: String::new(),
                     reported_at: Utc::now(),
                     processes: vec![ReportedProcess {
                         pid: 7,
@@ -475,6 +518,7 @@ mod tests {
         record(
             &stale,
             Report {
+                node: String::new(),
                 reported_at: Utc::now() - chrono::Duration::seconds(FRESH_FOR.as_secs() as i64 + 5),
                 processes: vec![ReportedProcess {
                     pid: 1,
@@ -487,6 +531,7 @@ mod tests {
         record(
             &live,
             Report {
+                node: String::new(),
                 reported_at: Utc::now(),
                 processes: vec![ReportedProcess {
                     pid: 2,
@@ -512,6 +557,50 @@ mod tests {
         assert_eq!(container_id_of("docker://abc123"), "abc123");
         assert_eq!(container_id_of("abc123"), "abc123");
         assert_eq!(container_id_of(""), "");
+    }
+
+    #[test]
+    fn the_gap_counts_the_containers_this_face_cannot_place() {
+        // 没有这次改动就会红：采集器按整台宿主入账，这一面按一个命名空间取 Pod。
+        // 两边差的那些容器（traefik、coredns、prometheus 这些）在屏上没有任何一格，
+        // 于是「全量」这句话在读数面上无从检验——差多少、差在哪个节点，都读不出来。
+        let suffix = std::process::id();
+        let node = format!("node-gap-{suffix}");
+        let placed = format!("placed-{suffix}");
+        let elsewhere = format!("elsewhere-{suffix}");
+        let other_node = format!("elsewhere-node-{suffix}");
+        let another = "another-node".to_string();
+        record_census(&node);
+        for (id, owner) in [
+            (&placed, &node),
+            (&elsewhere, &node),
+            (&other_node, &another),
+        ] {
+            record(
+                id,
+                Report {
+                    node: owner.clone(),
+                    reported_at: Utc::now(),
+                    processes: vec![ReportedProcess {
+                        pid: 1,
+                        parent_pid: 0,
+                        command: "sh".to_string(),
+                        rss_bytes: 0,
+                    }],
+                },
+            );
+        }
+        let claimed: HashSet<String> = [placed.clone()].into_iter().collect();
+        assert_eq!(
+            census_gap(&node, &claimed),
+            Some((2, 1)),
+            "这台节点上两份表、其中一份没有 Pod 认领；另一台节点的表不算进来"
+        );
+        assert_eq!(
+            census_gap(&format!("no-collector-{suffix}"), &claimed),
+            None,
+            "没有采集器的节点：「不知道」，不是「一个都没漏」"
+        );
     }
 
     // ---- 收口那一格读数 ----

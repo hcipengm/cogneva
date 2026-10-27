@@ -569,6 +569,11 @@ function ClusterDetail({
   const running = placed.filter((pod) => pod.phase === 'Running' && pod.ready).length;
   const waiting = placed.filter((pod) => pod.phase === 'Running' && !pod.ready).length;
   const failed = placed.filter((pod) => pod.phase === 'Failed' || pod.phase === 'Unknown').length;
+  // 有采集器的节点才有这两个数：没采集器的节点上「差」是「不知道」，加进来会把
+  // 不知道算成零。
+  const censused = cluster.nodes.filter((node) => node.census_containers != null);
+  const censusSeen = censused.reduce((sum, node) => sum + (node.census_containers ?? 0), 0);
+  const censusGap = censused.reduce((sum, node) => sum + (node.unclaimed_containers ?? 0), 0);
 
   return (
     <div className="flex flex-col gap-2 px-1">
@@ -611,6 +616,15 @@ function ClusterDetail({
       <p className="text-[10px] leading-relaxed text-[var(--muted)]">
         Pod 只数这一个命名空间里的；节点是整台机器的。没被调度到任何节点的 {cluster.unscheduled.length} 个、
         写着在某个节点但这拍没读到那台的 {cluster.unplaced.length} 个，都不在上面这个数里。
+        {censused.length > 0 && (
+          <>
+            {' '}
+            进程采集器在 {censused.length}/{cluster.nodes.length} 台节点上看到{' '}
+            <span className="mono">{censusSeen}</span> 个容器，其中{' '}
+            <span className="mono">{censusGap}</span> 个不在这个命名空间里——它们有进程读数，
+            这一面没有它们的位置。
+          </>
+        )}
       </p>
 
       <section className="flex flex-col gap-0.5">
@@ -716,6 +730,19 @@ function NodeDetail({
           </span>
         </span>
       </div>
+
+      {node.census_containers != null && (
+        <p className="text-[10.5px] text-[var(--muted)]">
+          采集器看到 <span className="mono">{node.census_containers}</span> 个容器
+          {node.unclaimed_containers != null && node.unclaimed_containers > 0 && (
+            <>
+              ，其中 <span className="mono">{node.unclaimed_containers}</span>{' '}
+              个不在这一面展示的命名空间里
+            </>
+          )}
+          。
+        </p>
+      )}
 
       {pressures.length > 0 && (
         <p className="text-[10.5px]" style={{ color: 'var(--danger)' }}>

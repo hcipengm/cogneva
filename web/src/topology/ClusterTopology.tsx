@@ -127,7 +127,7 @@ function ClusterRow({
       {cluster.nodes.length > 0 && (
         <div className="grid grid-cols-1 gap-px bg-[var(--line)] md:grid-cols-2 xl:grid-cols-3">
           {cluster.nodes.map((node) => (
-            <NodeCard key={node.name} node={node} />
+            <NodeCard key={node.name} node={node} namespace={cluster.namespace} />
           ))}
         </div>
       )}
@@ -232,7 +232,7 @@ function pressureWarnings(node: TopologyNode): string[] {
     );
 }
 
-function NodeCard({ node }: { node: TopologyNode }) {
+function NodeCard({ node, namespace }: { node: TopologyNode; namespace: string }) {
   const [open, setOpen] = useState(false);
   const cpuPercent = ratio(node.cpu_requested_millicores, node.cpu_allocatable_millicores);
   const memoryPercent = ratio(node.memory_requested_bytes, node.memory_allocatable_bytes);
@@ -296,6 +296,16 @@ function NodeCard({ node }: { node: TopologyNode }) {
       {!open && (cpuPercent >= 0.9 || memoryPercent >= 0.9) && (
         <p className="px-3 pb-2 text-[10px]" style={{ color: 'var(--warn)' }}>
           申报量已接近可分配量：新 Pod 可能排不进来，点开看是哪一个占的。
+        </p>
+      )}
+      {/* 「这台机器上的容器」与「屏上的容器」不是一个数。差多少要说出来——
+          不说的话，屏上看起来就是全量，而它按命名空间取的。 */}
+      {node.unclaimed_containers != null && node.unclaimed_containers > 0 && (
+        <p className="px-3 pb-2 text-[10px] text-[var(--muted)]">
+          采集器在这台机器上看到 <span className="mono">{node.census_containers}</span> 个容器，其中{' '}
+          <span className="mono">{node.unclaimed_containers}</span> 个不在命名空间{' '}
+          <span className="mono">{namespace}</span> 里：它们有进程读数，但这一面按命名空间取 Pod，
+          没有它们的位置。
         </p>
       )}
     </div>
