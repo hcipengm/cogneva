@@ -3890,22 +3890,39 @@ mod profile_tests {
             "预渲染目录名与代码里的名字不一致：提交前先跑 deploy/scripts/render-deploy.sh"
         );
 
+        // 脚本的 profile 集合现在是从目录里读出来的，所以这里判的不是「两份名单一样」，
+        // 而是「脚本读的就是上面刚核过的那个目录」——脚本里再写一份名单，正是新 profile
+        // 文件存在、却没有任何东西去渲染它的那个形状，也是唯一能与上面两条断言对不上的形状。
         let script = root.join("deploy/scripts/render-deploy.sh");
         let text = std::fs::read_to_string(&script)
             .unwrap_or_else(|e| panic!("{}: {e}", script.display()));
-        let line = text
-            .lines()
-            .find(|line| line.trim_start().starts_with("PROFILES=("))
-            .expect("render-deploy.sh 里找不到 PROFILES=( … ) 这一行");
-        let mut in_script: Vec<&str> = line
-            .split_once('(')
-            .and_then(|(_, rest)| rest.rsplit_once(')'))
-            .map(|(list, _)| list.split_whitespace().collect())
-            .unwrap_or_default();
-        in_script.sort_unstable();
+        let assignment = |name: &str| -> String {
+            text.lines()
+                .find_map(|line| {
+                    let rest = line.trim().strip_prefix(&format!("{name}="))?;
+                    Some(rest.trim().trim_matches('"').to_string())
+                })
+                .unwrap_or_else(|| panic!("render-deploy.sh 里找不到 {name}= 这一行"))
+        };
+        assert!(
+            assignment("CHART_DIR").ends_with("/deploy/helm/cogneva"),
+            "render-deploy.sh 的 CHART_DIR 不再指向 deploy/helm/cogneva：{}",
+            assignment("CHART_DIR")
+        );
         assert_eq!(
-            in_script, declared,
-            "render-deploy.sh 的 PROFILES 与代码里的名字不一致"
+            assignment("PROFILES_DIR"),
+            "$CHART_DIR/profiles",
+            "render-deploy.sh 的 PROFILE 集合既然是从目录读的，这个目录就必须是上面刚核过的那个"
+        );
+        assert_eq!(
+            assignment("PROFILES"),
+            "()",
+            "render-deploy.sh 的 PROFILES 又变回一份写死的名单了：新加的 profile 不会渲染、\
+             不会有产物树、也没人判它的新鲜度，而这一切读起来都只是「这个 profile 不存在」"
+        );
+        assert!(
+            text.contains("for profile_file in \"$PROFILES_DIR\"/*.yaml"),
+            "render-deploy.sh 不再从 $PROFILES_DIR/*.yaml 列举 profile"
         );
     }
 
