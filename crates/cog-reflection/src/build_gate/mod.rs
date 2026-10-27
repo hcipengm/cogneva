@@ -836,6 +836,34 @@ impl HostLoad {
     /// and the cgroup's limit is the right answer to "killing the build", and a
     /// bound has to answer both.
     fn ceiling(&self) -> (usize, &'static str) {
+        self.ceiling_held_since(0)
+    }
+
+    /// The ceiling to enforce, given the integer the last window enforced.
+    ///
+    /// `previous = 0` means no window has run yet and takes the measurement as
+    /// it stands, which is what [`HostLoad::ceiling`] is. A real `previous`
+    /// holds a fall that has not cleared the dead band.
+    ///
+    /// The band exists because this measurement is taken *while the builds it
+    /// admitted are running*: `io some avg60` is 30-58% under a single build and
+    /// under 1% when none is, so the io factor swings between one and five over
+    /// the life of one build. The window that derives the bound is a minute and
+    /// a build is tens of minutes, so a bound that followed every reading was a
+    /// square wave -- measured on this host, the one between one and two
+    /// crossed 2,682 times in nine days, every edge a ledger row and every edge
+    /// a different number for the builders on the host to read inside the same
+    /// minute. A bound that alternates every ninety seconds protects nothing:
+    /// by the time a slot taken back matters, the reading that took it has
+    /// already swung the other way.
+    ///
+    /// The band is one-sided on purpose. Rising is left exactly as it was, so a
+    /// host that really has room still grows on the first window and a reading
+    /// pinned at an integer can never hold the bound below what it measures.
+    /// Only the fall waits, and only until the reading is clearly below the
+    /// integer in force -- one build's worth of the factor is a wide margin,
+    /// and the room a held slot keeps is bounded by one.
+    fn ceiling_held_since(&self, previous: usize) -> (usize, &'static str) {
         let dimensions = self.dimensions();
         let mut tightest = dimensions[0];
         for factor in &dimensions[1..] {
@@ -843,7 +871,16 @@ impl HostLoad {
                 tightest = *factor;
             }
         }
-        (tightest.1.floor().max(1.0) as usize, tightest.0)
+        let measured = tightest.1.floor().max(1.0) as usize;
+        let held = if previous == 0
+            || measured >= previous
+            || tightest.1 < previous as f64 - CEILING_DEAD_BAND
+        {
+            measured
+        } else {
+            previous
+        };
+        (held, tightest.0)
     }
 
     /// What each dimension answers on its own, in the order the ceiling breaks
@@ -997,6 +1034,13 @@ const HOST_PRESSURE_AVG60: &str = "cogneva_host_pressure_avg60";
 /// node's own filesystem reading, which the deployment already publishes for
 /// every mountpoint; a second copy here would be a second producer for it.
 const HOST_DISK_FREE_BYTES: &str = "cogneva_host_disk_free_bytes";
+/// How far one dimension's answer must fall below the integer in force before
+/// the ceiling gives that build back.
+///
+/// A fraction of one build rather than a count of windows: what is being damped
+/// is the reading's own noise across the integer it floors to, not a trend, and
+/// the noise is measured in the same unit the answer is.
+const CEILING_DEAD_BAND: f64 = 0.15;
 /// What each dimension answers on its own, beside the ceiling that takes the
 /// smallest of them.
 ///
@@ -1605,6 +1649,12 @@ pub struct BuildGate {
     /// The ceiling of that measurement: what the host could take if it stayed
     /// quiet, before the control law's say. 0 before any measurement.
     measured_ceiling: AtomicU64,
+    /// The integer the last window held after the dead band, which is what the
+    /// next window damps against. Kept apart from `measured_ceiling` because
+    /// that one is the measurement as it stands, published as such: a reader
+    /// looking at how much room the host reports must not be shown a number the
+    /// damping moved.
+    held_ceiling: AtomicU64,
     /// The dimension the ceiling came from.
     dimension: Mutex<&'static str>,
     /// The sample that derivation was made from, published beside it.
@@ -1735,6 +1785,7 @@ impl BuildGate {
             tuning: Tuning::from_config(cfg),
             derived: AtomicU64::new(0),
             measured_ceiling: AtomicU64::new(0),
+            held_ceiling: AtomicU64::new(0),
             dimension: Mutex::new(DIM_UNMEASURED),
             host: Mutex::new(None),
             window: Mutex::new(None),
@@ -1992,7 +2043,15 @@ impl BuildGate {
             );
             return;
         };
-        let (ceiling, dimension) = load.ceiling();
+        // The measurement and the number this window enforces, side by side:
+        // the second one is the first held through the dead band against what
+        // the previous window enforced, so a host whose reading straddles an
+        // integer -- which is what a host building something does -- does not
+        // hand the builders a new bound every ninety seconds.
+        let previous = self.held_ceiling.load(Ordering::Relaxed) as usize;
+        let (measured_ceiling, dimension) = load.ceiling();
+        let (ceiling, _) = load.ceiling_held_since(previous);
+        self.held_ceiling.store(ceiling as u64, Ordering::Relaxed);
         // Kept beside the ceiling it produced, from the same sample: the
         // readings published from here are the ones this decision was made on,
         // not a second look at a host that has moved since.
@@ -2016,7 +2075,7 @@ impl BuildGate {
         };
         *self.dimension.lock().unwrap_or_else(|e| e.into_inner()) = dimension;
         self.measured_ceiling
-            .store(ceiling as u64, Ordering::Relaxed);
+            .store(measured_ceiling as u64, Ordering::Relaxed);
         self.derived.store(enforce as u64, Ordering::Relaxed);
         *self.window.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         let controller = self.is_controller();
@@ -4255,6 +4314,60 @@ mod tests {
             (2, DIM_IO),
             "half the stall budget spent means the device is absorbing two builds"
         );
+    }
+
+    /// 读数骑在整数上时，界不动。
+    ///
+    /// 这一条钉的是那 2,682 次翻转的成因：io 这个维度按「预算除以当前的停顿」
+    /// 回答，而停顿是那台机器上正在跑的构建自己造成的——一次构建在跑时 `io some
+    /// avg60` 是 30-58%，没人在跑时不到 1%。于是同一个窗口里，刚放出去两条构建
+    /// 的下一个窗口读到的就是「只够一条」，两条跑完的下一个窗口又读到「够五条」。
+    /// 界的窗口是一分钟，构建是几十分钟，所以界跟着每一次读数走就是一条方波。
+    ///
+    /// 下降要走出死区（一个构建的 15%）才认：1.9 落在 2 下面，但离得不够远，
+    /// 界留在 2；掉到 1.5 才真的回到 1。上升不动——量到几就是几，这样一台真有余量
+    /// 的机器第一个窗口就长上去，读数钉在整数上也压不住它。
+    #[test]
+    fn a_reading_that_straddles_an_integer_does_not_move_the_bound() {
+        let load = |io_factor: f64| HostLoad {
+            pressure: Pressure {
+                cpu_avg10: 0.0,
+                cpu_avg60: 0.0,
+                io_avg10: 0.0,
+                io_avg60: shipped().io_stall_budget_pct / io_factor,
+                mem_avg10: 0.0,
+                mem_avg60: 0.0,
+                mem_available_bytes: 64 * 1024 * 1024 * 1024,
+                builds_in_flight: 0,
+            },
+            busy_cores: 0.0,
+            cores: 24,
+            budget: None,
+            disk_free_bytes: Some(1 << 40),
+            tuning: shipped(),
+        };
+        // 没有上一拍可依：量到几就是几。
+        assert_eq!(load(1.9).ceiling_held_since(0).0, 1);
+        // 上升到 2：不设死区，第一个窗口就认。
+        assert_eq!(load(2.1).ceiling_held_since(1).0, 2);
+        // 骑在整数上：1.9 离 2 不到 0.15，界留在 2 —— 这一行就是那 2,682 次翻转里的
+        // 每一次，加进死区之后一次都不再发生。
+        assert_eq!(
+            load(1.9).ceiling_held_since(2).0,
+            2,
+            "a reading inside the dead band is the same host as the one that was just measured"
+        );
+        // 真的掉下去了才回：1.5 离 2 有半个构建，够远。
+        assert_eq!(
+            load(1.5).ceiling_held_since(2).0,
+            1,
+            "the band delays a fall, it does not cancel one"
+        );
+        // 一条方波：两个窗口来回骑，界不跟着摆。
+        for _ in 0..4 {
+            assert_eq!(load(2.1).ceiling_held_since(1).0, 2);
+            assert_eq!(load(1.9).ceiling_held_since(2).0, 2);
+        }
     }
 
     /// The ceiling and the per-dimension readings are one sample: whatever the
