@@ -1,25 +1,35 @@
 //! principle: feedback_no_hardcoding_config_surface
 //!
-//! An `AgentEvent` variant is a word spelled twice: once where it is declared,
-//! and once where somebody builds one. Everything between those two places —
-//! the bus filter, the WAL round trip, the websocket mapping, the WebUI panel —
+//! A wire enum variant is a word spelled twice: once where it is declared, and
+//! once where somebody builds one. Everything between those two places — the
+//! bus filter, the WAL round trip, the websocket mapping, the WebUI panel —
 //! reads the variant and assumes it arrives. Nothing anywhere compares "we
 //! declare this" with "we emit this", so a variant that nobody constructs is a
 //! whole panel that renders exactly what it renders when nothing happens.
 //!
-//! 实测（2026-10-27）：20 个变体里 18 个在 `crates/*/src` 的生产半边有构造点，
-//! `SelfReview` 与 `ToolExecutionUpdate` 一个都没有。前者的消费端在等着：
+//! The enums read here are the four the event module declares: `AgentEvent`
+//! (the bus), `AssistantMessageEvent` (the chat stream, folded by `apply`),
+//! `TaskEvent` (task lifecycle) and the legacy `StreamEvent` the SSE parser
+//! still answers with.
+//!
+//! 实测（2026-10-27）：四张词表共 47 个变体，42 个在 `crates/*/src` 的生产
+//! 半边有构造点，剩下 5 个都在下面的登记里。其中 `AgentEvent::SelfReview` 与
+//! `AgentEvent::ToolExecutionUpdate` 的缺口最要命，因为两侧的消费端都在等着：
 //! `web/src/store/streamStore.ts` 有一支 `case 'self_review'`，
 //! `crates/cog-reflection/src/detector.rs` 按它的 `status` 派生学习信号，
-//! `cog-observability` 拿它的 `agent_id` 归属；后者同样被
+//! `cog-observability` 拿它的 `agent_id` 归属；后者被
 //! `cog-gateway/src/websocket_protocol.rs`、`cog-storage` 的过滤与快照分类。
 //! 面板空白与「没有自我复盘发生」读起来一模一样——这正是这条线一直在打的形状。
+//! `StreamEvent::Start` 与 `ToolCall` 同样没有构造点，且这一对的缺口还会改变
+//! 词的意思：解析器认不出的分片一律落到兜底那一支变成 `TextDelta`，所以
+//! 一个工具调用分片读出来是一段文本（见登记）。`AssistantMessageEvent::Usage`
+//! 是唯一一个「没有产出端也不骗人」的：折叠时它被有意跳过。
 //!
 //! What it judges:
 //!
-//! * every variant declared in `AgentEvent` is constructed at least once in the
-//!   production half of some `crates/*/src` file, unless it is registered below
-//!   with the reason its producer is not in this tree;
+//! * every variant declared in one of the four enums is constructed at least
+//!   once in the production half of some `crates/*/src` file, unless it is
+//!   registered below with the reason its producer is not in this tree;
 //! * each registration is still true: the day a producer appears, the row has to
 //!   go, or the registry becomes a place where a fixed gap keeps being announced.
 //!
@@ -47,21 +57,56 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-const ENUM_FILE: &str = "crates/cog-core/src/types/event.rs";
-const ENUM_NAME: &str = "AgentEvent";
+struct WireEnum {
+    file: &'static str,
+    name: &'static str,
+}
+
+/// The enums whose variants are words on a wire. Only the ones that really
+/// leave this tree: a `#[cfg(test)]`-only enum has no consumer to deceive.
+const WIRE_ENUMS: &[WireEnum] = &[
+    WireEnum {
+        file: "crates/cog-core/src/types/event.rs",
+        name: "AgentEvent",
+    },
+    WireEnum {
+        file: "crates/cog-core/src/types/event.rs",
+        name: "AssistantMessageEvent",
+    },
+    WireEnum {
+        file: "crates/cog-core/src/types/event.rs",
+        name: "TaskEvent",
+    },
+    WireEnum {
+        file: "crates/cog-core/src/types/event.rs",
+        name: "StreamEvent",
+    },
+];
 
 /// Variants with no producer in this tree, and why that is not a hole this gate
 /// can close.
 ///
-/// Neither of these is a fixture that was left lying around: both have live
-/// consumers that read them and behave differently when they arrive. They are
-/// registered rather than fixed because the missing half is the agent's own
-/// runtime — the thing that would have to decide to emit a self-review or a
-/// partial tool result — and that is a product change, not a vocabulary one.
-/// Registering them here is what makes the gap readable on every run instead of
-/// only in the `else` branch of a renderer.
-const NO_PRODUCER_HERE: &[(&str, &str)] = &[
+/// None of these is a fixture that was left lying around: the two agent events
+/// have live consumers that read them and behave differently when they arrive.
+/// They are registered rather than fixed because the missing half is the
+/// agent's own runtime — the thing that would have to decide to emit a
+/// self-review or a partial tool result — and that is a product change, not a
+/// vocabulary one. Registering them here is what makes the gap readable on
+/// every run instead of only in the `else` branch of a renderer.
+///
+/// The two `StreamEvent` rows are a different kind of gap: that enum has no
+/// consumer in this tree at all (`LLMStream` is declared and re-exported, never
+/// awaited), and its one producer — the SSE parser — emits neither of them. So
+/// whoever wires the parser up will wait for a start frame and a tool-call
+/// frame that never come, and the tool-call chunk will arrive as `TextDelta`
+/// because the parser's fallback turns every unrecognised chunk into text.
+///
+/// `AssistantMessageEvent::Usage` is the one row whose consumer is *deliberately*
+/// a no-op, so its absence deceives nobody today — the row is here so that the
+/// word cannot quietly stop being absent.
+const NO_PRODUCER_HERE: &[(&str, &str, &str)] = &[
     (
+        "AgentEvent",
         "SelfReview",
         "本树没有构造点：自我复盘跑完后没有人把这一帧发上总线。消费端在等它——\
          WebUI 的 `case 'self_review'` 面板、`detector` 的 NEED_REVISION 分支、\
@@ -69,10 +114,32 @@ const NO_PRODUCER_HERE: &[(&str, &str)] = &[
          但本树的 agent 运行时自己从不发",
     ),
     (
+        "AgentEvent",
         "ToolExecutionUpdate",
         "本树没有构造点：`runtime` 只发 `ToolExecutionStart` 与 `ToolExecutionEnd`，\
          工具的部分结果从不经总线发出。消费端在等它——`websocket_protocol` 的映射、\
          `event_filter` 的分类、快照的归属",
+    ),
+    (
+        "AssistantMessageEvent",
+        "Usage",
+        "没有任何 provider 发这一帧，且 `apply` 把它当空操作跳过——注释写明 token 记账跟着 \
+         `Done` 携带的终态消息走，token 数现在经 agent 的 run usage 与观测指标入账。\
+         登记它而不是删它，是因为删改动的是跨 crate 的公开枚举；而这行登记会在有产出端\
+         那天变红，逼着重新决定留还是删",
+    ),
+    (
+        "StreamEvent",
+        "Start",
+        "SSE 解析器不产出这一帧，且本树没有任何消费端读 `StreamEvent`（`LLMStream` \
+         只声明与再导出，没有人 await）。接上消费端时这一帧永远等不来——那时要么让\
+         解析器在流开头补一帧，要么把它从词表里删掉",
+    ),
+    (
+        "StreamEvent",
+        "ToolCall",
+        "SSE 解析器不产出这一帧：认不出的分片一律落到兜底支变成 `TextDelta`，\
+         所以一个工具调用分片读出来是一段文本。消费端同上——本树还没有人读这个枚举",
     ),
 ];
 
@@ -276,17 +343,18 @@ fn top_level_fields(body: &str) -> Vec<&str> {
     out.into_iter().filter(|field| !field.is_empty()).collect()
 }
 
-/// Every place a variant is named with a brace, and whether that brace holds a
-/// constructed value or a pattern.
-fn event_sites(text: &str) -> Vec<(String, bool)> {
-    const NEEDLE: &str = "AgentEvent::";
+/// Every place a variant of `enum_name` is named with a brace, and whether that
+/// brace holds a constructed value or a pattern.
+fn event_sites(text: &str, enum_name: &str) -> Vec<(String, bool)> {
+    let needle = format!("{enum_name}::");
+    let needle = needle.as_str();
     let b = text.as_bytes();
     let macros = macro_argument_spans(text, "matches!");
     let mut out = Vec::new();
     let mut from = 0;
-    while let Some(at) = text[from..].find(NEEDLE) {
+    while let Some(at) = text[from..].find(needle) {
         let start = from + at;
-        from = start + NEEDLE.len();
+        from = start + needle.len();
         let id_start = from;
         let mut i = id_start;
         while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
@@ -316,13 +384,13 @@ fn event_sites(text: &str) -> Vec<(String, bool)> {
     out
 }
 
-/// The variants declared inside `pub enum AgentEvent`, in declaration order.
-fn declared_variants(root: &Path) -> Vec<String> {
-    let path = root.join(ENUM_FILE);
+/// The variants declared inside `pub enum {name}`, in declaration order.
+fn declared_variants(root: &Path, file: &str, name: &str) -> Vec<String> {
+    let path = root.join(file);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let needle = format!("pub enum {ENUM_NAME} {{");
+    let needle = format!("pub enum {name} {{");
     let Some(at) = text.find(&needle) else {
-        panic!("{ENUM_FILE} 里没有 `{needle}`：枚举搬了家或改了名，这条门会在空集上假装绿");
+        panic!("{file} 里没有 `{needle}`：枚举搬了家或改了名，这条门会在空集上假装绿");
     };
     let open = at + needle.len() - 1;
     let b = text.as_bytes();
@@ -447,11 +515,25 @@ fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every variant declared, and how many production sites construct one.
-fn census(root: &Path) -> (Vec<String>, BTreeMap<String, usize>) {
-    let variants = declared_variants(root);
-    let mut counts: BTreeMap<String, usize> =
-        variants.iter().map(|v| (v.clone(), 0usize)).collect();
+/// Each enum's name and the variants it declares, in declaration order.
+type Declared = Vec<(String, Vec<String>)>;
+
+/// How many production sites construct a given variant of a given enum.
+type Constructed = BTreeMap<(String, String), usize>;
+
+/// Every variant declared in each of `enums`, in declaration order, and how
+/// many production sites construct one.
+fn census_of(root: &Path, enums: &[(&str, &str)]) -> (Declared, Constructed) {
+    let declared: Declared = enums
+        .iter()
+        .map(|(file, name)| (name.to_string(), declared_variants(root, file, name)))
+        .collect();
+    let mut counts: Constructed = BTreeMap::new();
+    for (name, variants) in &declared {
+        for variant in variants {
+            counts.insert((name.clone(), variant.clone()), 0);
+        }
+    }
     let mut files = Vec::new();
     for src in crate_src_dirs(root) {
         source_files(&src, &mut files);
@@ -459,38 +541,49 @@ fn census(root: &Path) -> (Vec<String>, BTreeMap<String, usize>) {
     for path in &files {
         let text =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        for (variant, constructed) in event_sites(&production_text(&text)) {
-            if !constructed {
-                continue;
-            }
-            if let Some(count) = counts.get_mut(&variant) {
-                *count += 1;
+        let production = production_text(&text);
+        for (_, name) in enums {
+            for (variant, constructed) in event_sites(&production, name) {
+                if !constructed {
+                    continue;
+                }
+                if let Some(count) = counts.get_mut(&(name.to_string(), variant)) {
+                    *count += 1;
+                }
             }
         }
     }
-    (variants, counts)
+    (declared, counts)
 }
 
-fn holes(counts: &BTreeMap<String, usize>, registered: &[(&str, &str)]) -> Vec<String> {
+fn census(root: &Path) -> (Declared, Constructed) {
+    let enums: Vec<(&str, &str)> = WIRE_ENUMS.iter().map(|e| (e.file, e.name)).collect();
+    census_of(root, &enums)
+}
+
+fn holes(counts: &Constructed, registered: &[(&str, &str, &str)]) -> Vec<String> {
     let mut out = Vec::new();
-    for (variant, count) in counts {
-        let entry = registered.iter().find(|(name, _)| name == variant);
+    for ((enum_name, variant), count) in counts {
+        let entry = registered
+            .iter()
+            .find(|(e, name, _)| e == enum_name && name == variant);
         match (count, entry) {
             (0, None) => out.push(format!(
-                "`{variant}` 声明在 AgentEvent 里、有消费端在读它，但本树没有任何一处构造它：\
+                "`{enum_name}::{variant}` 声明在词表里、消费端在读它，但本树没有任何一处构造它：\
                  这一帧永远不上总线，读它的面板与分支永远落在「没有发生」那一支"
             )),
             (0, Some(_)) => {}
             (_, None) => {}
             (_, Some(_)) => out.push(format!(
-                "`{variant}` 已经有 {count} 个生产构造点了，`NO_PRODUCER_HERE` 里那一行过期，删掉它"
+                "`{enum_name}::{variant}` 已经有 {count} 个生产构造点了，\
+                 `NO_PRODUCER_HERE` 里那一行过期，删掉它"
             )),
         }
     }
-    for (variant, _) in registered {
-        if !counts.contains_key(*variant) {
+    for (enum_name, variant, _) in registered {
+        if !counts.contains_key(&(enum_name.to_string(), variant.to_string())) {
             out.push(format!(
-                "`NO_PRODUCER_HERE` 里登记的 `{variant}` 已经不在 AgentEvent 里了，这条登记过期"
+                "`NO_PRODUCER_HERE` 里登记的 `{enum_name}::{variant}` 已经不在枚举里了，这条登记过期"
             ));
         }
     }
@@ -500,26 +593,40 @@ fn holes(counts: &BTreeMap<String, usize>, registered: &[(&str, &str)]) -> Vec<S
 #[test]
 fn every_declared_event_is_constructed_somewhere() {
     let root = repo_root();
-    let (variants, counts) = census(&root);
+    let (declared, counts) = census(&root);
 
     // 抽取面自检：枚举读空、或扫描器一个构造点都看不见时，下面那条判据会在
     // 空集上假装绿。
+    let total: usize = declared.iter().map(|(_, v)| v.len()).sum();
     assert!(
-        variants.len() >= 15,
-        "只从 {ENUM_FILE} 里读到 {} 个变体，枚举解析本身坏了：{variants:?}",
-        variants.len()
+        total >= 40,
+        "只从 event.rs 里读到 {total} 个变体，枚举解析本身坏了：{declared:?}"
     );
-    for known in ["AgentStart", "SelfReview", "ToolExecutionUpdate"] {
+    for (name, variants) in &declared {
         assert!(
-            variants.iter().any(|v| v == known),
-            "枚举里读不到 `{known}`：解析坏了或它真的被删了"
+            variants.len() >= 5,
+            "`{name}` 只读出 {} 个变体：解析坏了，或者这个枚举真的瘦成这样了——两条都要看一眼",
+            variants.len()
+        );
+    }
+    for known in [
+        ("AgentEvent", "SelfReview"),
+        ("AgentEvent", "ToolExecutionUpdate"),
+        ("AssistantMessageEvent", "TextDelta"),
+        ("TaskEvent", "TaskLeaseExpired"),
+        ("StreamEvent", "Usage"),
+    ] {
+        assert!(
+            counts.contains_key(&(known.0.to_string(), known.1.to_string())),
+            "读不到 `{}::{}`：解析坏了或它真的被删了",
+            known.0,
+            known.1
         );
     }
     let constructed = counts.values().filter(|n| **n > 0).count();
     assert!(
-        constructed >= 15,
-        "生产半边只认出 {} 个变体的构造点，扫描器本身坏了：{counts:?}",
-        constructed
+        constructed >= 35,
+        "生产半边只认出 {constructed} 个变体的构造点，扫描器本身坏了"
     );
 
     let found = holes(&counts, NO_PRODUCER_HERE);
@@ -579,14 +686,17 @@ fn a_variant_nobody_constructs_is_reported() {
     )
     .expect("source");
 
-    let (variants, counts) = census(root);
-    assert_eq!(variants.len(), 3, "{variants:?}");
-    assert_eq!(counts["Produced"], 1, "{counts:?}");
+    let enums = [("crates/cog-core/src/types/event.rs", "AgentEvent")];
+    let (declared, counts) = census_of(root, &enums);
+    assert_eq!(declared.len(), 1, "{declared:?}");
+    assert_eq!(declared[0].1, ["Produced", "OnlyMatched", "FromTheWire"]);
+    let key = |name: &str| ("AgentEvent".to_string(), name.to_string());
+    assert_eq!(counts[&key("Produced")], 1, "{counts:?}");
     // 只在测试模块里造的、只在模式位置出现的、只在 matches! 里出现的，都不算产出端。
-    assert_eq!(counts["OnlyMatched"], 0, "{counts:?}");
-    assert_eq!(counts["FromTheWire"], 0, "{counts:?}");
+    assert_eq!(counts[&key("OnlyMatched")], 0, "{counts:?}");
+    assert_eq!(counts[&key("FromTheWire")], 0, "{counts:?}");
 
-    let registered = [("FromTheWire", "树外生产")];
+    let registered = [("AgentEvent", "FromTheWire", "树外生产")];
     let found = holes(&counts, &registered);
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("OnlyMatched"), "{found:?}");
@@ -605,7 +715,7 @@ fn a_variant_nobody_constructs_is_reported() {
          }\n",
     )
     .expect("source");
-    let (_, counts) = census(root);
+    let (_, counts) = census_of(root, &enums);
     let found = holes(&counts, &registered);
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("过期"), "{found:?}");
@@ -623,6 +733,7 @@ fn the_scanner_reads_values_and_skips_patterns() {
          match e { AgentEvent::Armed { id } if ok => 1, _ => 0 }\n\
          let c = |AgentEvent::Armed { id }| id;\n\
          let d = AgentEvent::Made { agent_id: \"quoted } brace\".into() };\n",
+        "AgentEvent",
     );
     let made = sites.iter().filter(|(v, c)| v == "Made" && *c).count();
     let armed = sites.iter().filter(|(v, c)| v == "Armed" && *c).count();
