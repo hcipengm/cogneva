@@ -801,6 +801,36 @@ spec:
             summary: "有 {{ $value }} 条带标记的告警正在 Prometheus 里响，表里却没有开着的行"
             description: "`cogneva_alert_mirror_missing_rule{rule=…}` 点名是哪几条。先看那一拍的进程日志有没有 `alert mirror read failed`（读失败不会 resolve、也不会写新行，只累积自警）；再看规则是不是与进程内 `rules` 重名（重名的会被跳过，那条由进程内求值记账）。给十五分钟：进程每 60 秒一拍，缺口挂十五拍才不是擦肩而过。"
 
+        # 两把尺子量同一件事：写者（镜像）按 `/api/v1/alerts` 判断「还在不在响」，这一面按
+        # PromQL `ALERTS{alertstate="firing"}` 判缺口。两个视图不是同一份数据（前者是规则
+        # 管理器当前持有的活动告警，后者是求值写下的样本，带 5 分钟陈旧窗），不一致时写者
+        # 关掉的行在这一面读起来就是「已恢复」，而 `ALERTS` 里那条继续响——2026-10-26 实测
+        # `CognevaAlertAccountNoisy` 就这样在表里 21:48 关掉、在 Prometheus 里烧到 01:51，
+        # 而 `CognevaAlertMirrorMissing` 整段没有响。分歧不为 0 时 `missing == 0` 不是证据。
+        - alert: CognevaAlertMirrorViewsDisagree
+          expr: max(cogneva_alert_mirror_views) > 0
+          for: 15m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "可观测与告警"
+            severity: warning
+          annotations:
+            summary: "有 {{ $value }} 条告警在镜像与读数眼里不在同一个状态上"
+            description: "`cogneva_alert_mirror_views_disagree_rule{rule=…,only=…}` 点名是哪几条、只出现在哪一面（`only=\"promql\"`＝读数说有、写者说没有；`only=\"alerts_api\"`＝写者看得见、读数看不见）。修法先查 Prometheus 那两个接口：`/api/v1/alerts` 与 `/api/v1/query?query=ALERTS{alertstate=\"firing\"}` 各自返回什么，再查那一刻有没有规则重载（重载期间规则管理器换组，`/api/v1/alerts` 会短暂少条目）。给十五分钟：5 分钟陈旧窗加上一次重载的时间，正常的关行不该在十五分钟里还看不齐。"
+
+        # 写者那一面读不回来：此时 `views` 印 0，但那个 0 是「没量过」而不是「一致」。
+        # 与上一格的 `unmirrored_measured` 同一处置——未知必须自成一态，不能是绿的形状。
+        - alert: CognevaAlertMirrorViewsUnreadable
+          expr: max(cogneva_alert_mirror_configured) == 1 and max(cogneva_alert_mirror_views_measured) == 0
+          for: 15m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "可观测与告警"
+            severity: warning
+          annotations:
+            summary: "镜像配置着，但读数读不到写者自己的那个视图"
+            description: "读数每拍会额外问一次 `/api/v1/alerts`（写者判断「还在不在响」用的就是它）。这一问失败了：`cogneva_alert_mirror_views_measured=0`，此时 `views` 印 0 但那不是「两个视图一致」，是没比过。另外几格照常有效——读数故意不整体退化成读不到。修法：查宿主能不能经 apiserver service proxy 读到 `/api/v1/alerts`，再查 Prometheus 是否在重启。`configured` 为 0 时这一条不响：没有写者就没有可比的那一面，那一档由 `CognevaAlertMirrorUnconfigured` 说。给十五分钟：进程每 60 秒一拍。"
+
         # 行还在、`last_seen_at` 不再走动：看的人以为它新鲜，实际没有任何东西在看它。与上一档
         # 的区别是「曾经通过、后来停了」——上一档是「从来没进去」。
         - alert: CognevaAlertMirrorRowsStale

@@ -160,3 +160,73 @@ tests:
       - eval_time: 20m
         alertname: CognevaAlertMirrorUnmirrored
         exp_alerts: []
+
+  # 八、两个视图分歧：写者与读数对「谁在响」各说各的。`for: 15m`，10 分钟时不响、20 分钟响；
+  # 同一份输入下 `missing` 一直是 0——2026-10-26 的形状就是「缺口读 0 而告警在响」，这一格
+  # 证的正是「缺口为 0 不能顶替分歧」。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_mirror_views'
+        values: '0x10 1x60'
+      - series: 'cogneva_alert_mirror_missing'
+        values: '0x200'
+      - series: 'cogneva_alert_mirror_views_measured'
+        values: '1x200'
+      - series: 'cogneva_alert_mirror_configured'
+        values: '1x200'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CognevaAlertMirrorViewsDisagree
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CognevaAlertMirrorViewsDisagree
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "可观测与告警"
+      # 分歧在响，不代表缺了行；两条判词说的是两件事。
+      - eval_time: 30m
+        alertname: CognevaAlertMirrorMissing
+        exp_alerts: []
+      # 量到了的时候，「读不到」那一格不许跟着响。
+      - eval_time: 30m
+        alertname: CognevaAlertMirrorViewsUnreadable
+        exp_alerts: []
+
+  # 九、写者那一面读不到：`views_measured=0` 时 `views` 也是 0，那个 0 是没比过。
+  # 正对照 ＋ 负对照：镜像没配（`configured=0`）时这一条不响，那一档归 Unconfigured。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_mirror_views_measured'
+        values: '0x200'
+      - series: 'cogneva_alert_mirror_views'
+        values: '0x200'
+      - series: 'cogneva_alert_mirror_configured'
+        values: '1x200'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CognevaAlertMirrorViewsUnreadable
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: CognevaAlertMirrorViewsUnreadable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "可观测与告警"
+      # 读不到不等于有分歧：`views` 的 0 不许在这里被读成绿，也不许被读成红。
+      - eval_time: 20m
+        alertname: CognevaAlertMirrorViewsDisagree
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_mirror_views_measured'
+        values: '0x200'
+      - series: 'cogneva_alert_mirror_configured'
+        values: '0x200'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaAlertMirrorViewsUnreadable
+        exp_alerts: []

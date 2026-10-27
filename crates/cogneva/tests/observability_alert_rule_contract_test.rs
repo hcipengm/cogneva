@@ -1597,6 +1597,18 @@ const FOREIGN: &[(&str, &str)] = &[
         "同一生产者：这一拍读不读得到「全部 firing」那一面。它自成一格而不是让整份读数退化成读不到，是因为另外四格仍然是有效读数，丢掉它们换一个未知更亏；但读不到的那一拍 `unmirrored_firing` 会印 0，而那个 0 是**没读到**、不是**没有**——不单独立一条判据，读不到就会被读成「账本完整」",
     ),
     (
+        "cogneva_alert_mirror_views",
+        "同一生产者：写者（进程里的镜像）与这一面读数对「谁在响」说的不是同一批告警的条数。镜像按 `/api/v1/alerts` 关行，读数按 PromQL `ALERTS{alertstate=\"firing\"}` 判缺口——两个视图来自同一台 Prometheus 却不是同一份数据（前者是规则管理器当前持有的活动告警，后者是求值写下的样本、带 5 分钟陈旧窗）。2026-10-26 实测：`CognevaAlertAccountNoisy` 在 `ALERTS` 里烧到 01:51，表里那一行 21:48 就关掉了，而 `missing` 整段读 0——判据落在写者不看的那个视图上，缺口就整段隐形。这一格让「缺口为 0」在分歧不为 0 时不再是证据",
+    ),
+    (
+        "cogneva_alert_mirror_views_measured",
+        "同一生产者：这一拍读不读得到写者自己读的那个视图（`/api/v1/alerts`）。与同族的 `unmirrored_measured` 同一处置：读不到时 `views` 印 0，而那个 0 是**没比过**、不是**一致**——不单独立一条判据，「写者视图读不到」会被读成「两个视图对得上」。镜像没配时它也是 0（没有写者就没有可比的那一面），那一档由 `cogneva_alert_mirror_configured==0` 与 `CognevaAlertMirrorUnconfigured` 说",
+    ),
+    (
+        "cogneva_alert_mirror_configured",
+        "同一生产者：跑着的配置里有没有 `observability.infra_watch.mirror_alerts`（1 有 / 0 没有）。它原本只作为读数印出来、没有任何规则读它；`CognevaAlertMirrorViewsUnreadable` 需要它把「读不到写者视图」与「压根没有写者」分开——没有写者时两个视图无从比较，那一档是 `CognevaAlertMirrorUnconfigured` 的判词，不是这一条",
+    ),
+    (
         "cogneva_alert_attention_unattended",
         "宿主读数 `scripts/host/cogneva-alert-attention-reading.sh`（不在本仓，登记行 `alert_attention`）：`alerts` 表里正 firing、响了超过窗口（默认 1800 秒）、而**人和机器都没接**的行。它是这条链的**读者**那一端——镜像那一族只判到「进了表」，进了之后有没有人接，此前没有任何序列在说；2026-10-22 主线停摆七十分钟，红与停都进了表、都被铃铛写过通知，而全程没有一条被确认。「接了」有两个机器可读的写者：人的 `acknowledged_at`，与机器的任务——`signal_watcher` 按告警的 `dedup_key` 开出 `self-signal-alert-*`，任务入参里带着这个键，所以 `cog_dag_tasks` 里查得到；只看人那一格，系统恢复自愈之后判词会在「每条告警都被机器接走」的健康态上永远亮着，而永远亮的判词与没有判词同价（2026-10-23 实测：现网 10 条 firing 里已有 1 条被机器接走）。两个写作点分开印成 `_acknowledged` 与 `_filed`，判词取并集。`notified_at` 不能当判据：它只说明站内铃铛写过通知（没人点开也算），按它判会把「告诉了」读成「看了」。按窗口而不是按比例判，是因为十件事接了九件时，剩下那一件仍然是没人接的那一件。判词**不把判它自己那条规则算进输入**（`CognevaAlertUnattended` 自己也是一条 firing、没人接、过了窗口的行）：算进去它就在为自己点火，一旦亮起再也回不到绿；它自己那几行另有 `cogneva_alert_attention_meta_unacknowledged` 单独数",
     ),
