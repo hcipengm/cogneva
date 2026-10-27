@@ -962,7 +962,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+        # 这一步要的是「shellcheck 可用」，不是「这台 runner 配置的每一个 apt 源都
+        # 健康」。2026-10-27 一次红就是这个区别：runner 镜像自带的
+        # packages.microsoft.com 源返回 403，`apt-get update` 退出 100，整个 job
+        # 变红，而它判的是一条与这次改动无关的源——部署器把这条红读成「这一版有
+        # 问题」，于是停在一版什么都没错的提交上。所以先直接装，装不上再更新一次，
+        # 最后用 `shellcheck --version` 证明工具真的在：拿不到工具仍然红，红的原因
+        # 也仍然是这一步该管的那件事。
+        run: |
+          sudo apt-get install -y --no-install-recommends shellcheck \
+            || { sudo apt-get update -qq || true; sudo apt-get install -y --no-install-recommends shellcheck; }
+          shellcheck --version
       # The list is derived, not hand-written: a hand-written list of names goes
       # quiet when a script is added (measured: a committed gate was missing from
       # this list and CI never ran it).
