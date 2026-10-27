@@ -588,7 +588,7 @@ impl TaskExecutorRouter {
             }
         };
 
-        let result_stream = format!("orchestrator:results:{}", pipe.workspace_id);
+        let result_stream = cog_core::task_result_stream(&pipe.workspace_id);
         if let Err(e) = pipe.result_backend.publish(&result_stream, &payload).await {
             tracing::warn!(task_id = %task.id, "Failed to publish result: {e}");
         } else {

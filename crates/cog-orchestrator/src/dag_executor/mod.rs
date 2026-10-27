@@ -1052,7 +1052,7 @@ impl DagExecutorRuntime {
     /// # Graceful shutdown
     /// Pass a [`ShutdownSignal`] to cleanly exit on the next iteration boundary.
     pub async fn run_consumer(&self, shutdown: ShutdownSignal) -> SFResult<()> {
-        let result_stream = format!("orchestrator:results:{}", self.config.workspace_id);
+        let result_stream = cog_core::task_result_stream(&self.config.workspace_id);
         let group_name = self.config.consumer_group.clone();
 
         if let Err(e) = self

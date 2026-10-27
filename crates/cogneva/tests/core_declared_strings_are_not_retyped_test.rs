@@ -137,6 +137,12 @@ const EXEMPT: &[Exempt] = &[
         why: "HKDF 的 info 域分隔串，已经烤进盘上每一个包的密钥派生里；\
               它不是包名，跟着包名一起改会让已有的包再也解不开",
     },
+    Exempt {
+        file: "crates/cogneva/src/work.rs",
+        value: "external-worker",
+        why: "`HOSTNAME` 读不到时给单元起的显示名，不是注册用的角色字段；\
+              那条构造里角色读的是常量，显示名改了只换一个标签",
+    },
 ];
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {

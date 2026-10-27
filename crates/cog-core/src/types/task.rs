@@ -648,6 +648,20 @@ pub struct TaskDAG {
     pub dependencies: HashMap<String, Vec<String>>,
 }
 
+/// 一个工作区的任务结果流名前缀，后面接 workspace id。
+///
+/// 这条名字的两头在不同 crate 里：执行器把结果发上来（编排器与自带执行能力的
+/// 进程各发各的），DagExecutor 的消费循环在另一处读它并建消费组。两头各自
+/// `format!` 一遍时，改名只改一侧不会有任何报错——发布方报「已发送」，消费组的
+/// 那一侧读到的是空流，而空流与「还没有任务完成」长得一模一样，任务就停在
+/// running，依赖它的下游永远不就绪，没有任何一个面能说出丢了什么。
+pub const TASK_RESULT_STREAM_PREFIX: &str = "orchestrator:results:";
+
+/// 一个工作区的任务结果流名。生产方与消费方都从这里取。
+pub fn task_result_stream(workspace_id: &str) -> String {
+    format!("{TASK_RESULT_STREAM_PREFIX}{workspace_id}")
+}
+
 /// DagExecutor 消息协议
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1276,5 +1290,17 @@ mod tests {
             "a goal row must not be read as an evolution intent"
         );
         assert!(row.sink_task_id.is_none(), "the sink is declared later");
+    }
+
+    /// 这条名字是线上的事实，不是格式选择：部署里已经存在按这个拼法建的消费
+    /// 组，发到别的拼法上的结果**没有任何人读**，而发布方仍然报成功。所以这里
+    /// 钉的是拼法本身，不是「函数等于自己」。
+    #[test]
+    fn the_result_stream_name_does_not_drift() {
+        assert_eq!(
+            task_result_stream("ws-1"),
+            "orchestrator:results:ws-1",
+            "改这条名字等于让执行器把结果发进一条没人订阅的流"
+        );
     }
 }

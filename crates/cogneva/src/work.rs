@@ -731,7 +731,7 @@ fn ready_owned(tasks: Vec<Task>, deps: &TaskDAG, unit: &str) -> (Vec<Task>, usiz
 /// when the worker believes it reported.
 async fn publish(endpoints: &Endpoints, message: DagMessage) -> Result<(), Box<dyn Error>> {
     let payload = serde_json::to_vec(&message)?;
-    let stream = format!("orchestrator:results:{}", endpoints.workspace);
+    let stream = cog_core::task_result_stream(&endpoints.workspace);
     let backend = transport(endpoints).await?;
     backend.publish(&stream, &payload).await?;
     eprintln!("# published to {stream}");
