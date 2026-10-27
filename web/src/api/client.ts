@@ -2474,3 +2474,60 @@ export async function unstagePaths(paths: string[]): Promise<ScmStatus> {
 export async function commitStaged(message: string): Promise<CommitOutcome> {
   return api.post<CommitOutcome>('/api/v1/ide/git/commit', { message });
 }
+
+/** 一份已经导出到发布目录的备份包。 */
+export interface BackupPackage {
+  name: string;
+  bytes: number;
+  /** 秒级 Unix 时间；0 表示读不出修改时间。 */
+  created_at: number;
+}
+
+export interface BackupPackages {
+  /** 现在有没有一趟导出在跑。页面靠它决定要不要继续轮询。 */
+  running: boolean;
+  packages: BackupPackage[];
+}
+
+export interface BackupExportStarted {
+  job: string;
+  encrypted: boolean;
+  publish_dir: string;
+}
+
+export async function listBackupPackages(): Promise<BackupPackages> {
+  return api.get<BackupPackages>('/api/v1/admin/backup/packages');
+}
+
+/**
+ * 让服务端起一趟导出。
+ *
+ * `passphrase` 为空串是**不加密**：包里不带凭证，剩下的是整库数据本身。这个选择
+ * 交给调用方明说，不给「留空就自动加密」这种默认——默认加密会让没有口令的人拿到
+ * 一份打不开的包，而默认不加密至少是打开着的。
+ */
+export async function startBackupExport(passphrase: string): Promise<BackupExportStarted> {
+  const trimmed = passphrase.trim();
+  return api.post<BackupExportStarted>('/api/v1/admin/backup/export', {
+    passphrase: trimmed ? trimmed : null,
+  });
+}
+
+export async function deleteBackupPackage(name: string): Promise<void> {
+  await api.delete(`/api/v1/admin/backup/packages/${encodeURIComponent(name)}`);
+}
+
+/** 下载：先取字节再交给浏览器另存——`<a href>` 那条路不带 Authorization。 */
+export async function downloadBackupPackage(name: string): Promise<void> {
+  const blob = await api.getBytes(`/api/v1/admin/backup/packages/${encodeURIComponent(name)}`);
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = name;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  // 交给浏览器一段时间再收回：立刻 revoke 会让一部分浏览器的另存对话框
+  // 拿到一个已经失效的 URL，表现是「下载了 0 字节」。
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}

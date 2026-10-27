@@ -321,6 +321,14 @@ pub struct BackupConfig {
     /// 行的权威面就是它。已推的 rev 能从公开远端重取，未推的不能——那些才是进化
     /// 自己产出的状态，必须逐字进入包。
     pub git_remote_dir: Option<PathBuf>,
+    /// Where a package written on somebody's request is put so it can be handed
+    /// back to them. `None` = the nightly run, which nobody is waiting on.
+    ///
+    /// It is a copy, not a move: the backup directory's retention and the drill
+    /// that opens the newest package there both keep working on the run's own
+    /// output. Copies here are never pruned by the run -- the caller that asked
+    /// for this package decides when it is done with it.
+    pub publish_dir: Option<PathBuf>,
     pub namespace: String,
 }
 
@@ -360,6 +368,10 @@ impl BackupConfig {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
             git_remote_dir: std::env::var("COGNEVA_BACKUP_GIT_REMOTE_DIR")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            publish_dir: std::env::var(cog_core::env::BACKUP_PUBLISH_DIR)
                 .ok()
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
@@ -1667,6 +1679,45 @@ fn backfill_offsite(volume: &Path, dir: &Path, keep: usize) -> usize {
     copied
 }
 
+/// Copy the finished package where the party that asked for it can fetch it.
+///
+/// A failure here fails the run. The package already exists in the backup
+/// directory, so nothing is lost -- but the run was asked for by somebody
+/// waiting on this file, and a package left only there is pruned by the backup
+/// directory's own retention, on a schedule that belongs to the nightly job.
+/// "It went somewhere" and "it went where it was asked to go" are different
+/// facts and only one of them is the one that was requested.
+///
+/// The copy is written under a dot-name and renamed into place: a download
+/// that starts while this runs must not see half a package, and the listing
+/// must not offer one either.
+fn publish_package(dir: &Path, package: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dir)?;
+    let name = package
+        .file_name()
+        .ok_or("发布：包没有文件名，不知道该复制成什么")?;
+    let target = dir.join(name);
+    let size = package.metadata()?.len();
+    // 同一份包被要了两次是同一份文件，不是两份。
+    if target.exists() {
+        if target.metadata()?.len() == size {
+            return Ok(target);
+        }
+        std::fs::remove_file(&target)?;
+    }
+    let partial = dir.join(format!(".{}.partial", name.to_string_lossy()));
+    let _ = std::fs::remove_file(&partial);
+    std::fs::copy(package, &partial)?;
+    restrict_to_owner(&partial, 0o600)?;
+    std::fs::rename(&partial, &target)?;
+    tracing::info!(
+        package = %target.display(),
+        bytes = size,
+        "backup package published for download"
+    );
+    Ok(target)
+}
+
 /// 真正跑一次备份并收尾：导出、写清单、打包、清 staging、裁保留。
 async fn finish_backup(
     cfg: &BackupConfig,
@@ -1698,6 +1749,9 @@ async fn finish_backup(
                         "offsite backfill caught up on packages written before the copy existed"
                     );
                 }
+            }
+            if let Some(dir) = &cfg.publish_dir {
+                publish_package(dir, &package)?;
             }
             let (kept_after, oldest_kept_at) = retained_state(&cfg.backup_dir);
             tracing::info!(
@@ -5630,6 +5684,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_published_package_is_a_complete_owner_only_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let vol = root.path().join("vol");
+        let out = root.path().join("exports");
+        std::fs::create_dir_all(&vol).unwrap();
+        let pkg = vol.join("cogneva-backup-20261027T031700Z.tar.zst");
+        std::fs::write(&pkg, vec![9u8; 64]).unwrap();
+
+        let target = publish_package(&out, &pkg).unwrap();
+
+        assert_eq!(target.file_name().unwrap(), pkg.file_name().unwrap());
+        assert_eq!(std::fs::read(&target).unwrap(), vec![9u8; 64]);
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "包离开备份卷之后仍然是整库内容");
+        // 下载端只看得到整份包：半个文件的临时名不能留在目录里。
+        let leftovers: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exporting_the_same_package_twice_is_one_file_not_two() {
+        let root = tempfile::tempdir().unwrap();
+        let vol = root.path().join("vol");
+        let out = root.path().join("exports");
+        std::fs::create_dir_all(&vol).unwrap();
+        let pkg = vol.join("cogneva-backup-20261027T031700Z.tar.zst");
+        std::fs::write(&pkg, vec![3u8; 16]).unwrap();
+
+        publish_package(&out, &pkg).unwrap();
+        publish_package(&out, &pkg).unwrap();
+
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_package_written_before_the_copy_existed_is_copied_by_the_next_run() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
@@ -5966,6 +6063,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             extra_data_roots: Vec::new(),
             git_remote_dir: None,
+            publish_dir: None,
             keep_count: 7,
             run_deadline_seconds: DEFAULT_RUN_DEADLINE_SECONDS,
             offsite_dir: None,

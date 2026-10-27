@@ -289,3 +289,46 @@ roleRef:
   kind: ClusterRole
   name: cogneva-topology-reader
   apiGroup: rbac.authorization.k8s.io
+---
+# 导出备份包：页面按一次导出，就起一个跑 `cogneva backup` 的 Job，再读回它还在不在跑。
+#
+# 模板不在这里：Job 是从每日备份那个 CronJob 克隆出来的，所以这里只需要**按名字**
+# 读那一个 CronJob。名字写死是 RBAC 的硬约束（resourceNames 不接受通配），
+# `COGNEVA_BACKUP_CRONJOB` 这个覆盖只在不改 rbac 的前提下没意义——改名要连这行一起改，
+# 否则导出的表现是「读不到备份 CronJob」，而备份本身一切正常。
+#
+# jobs 只给 get/list/create：删由 Job 自己的 ttlSecondsAfterFinished 做，导出端没有
+# 任何理由去删一个正在跑或已经跑完的 Job。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cogneva-backup-export
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+rules:
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    resourceNames: ["cogneva-backup"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cogneva-backup-export
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+subjects:
+  - kind: ServiceAccount
+    name: cogneva
+    namespace: {{ include "cogneva.namespace" . }}
+roleRef:
+  kind: Role
+  name: cogneva-backup-export
+  apiGroup: rbac.authorization.k8s.io

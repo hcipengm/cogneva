@@ -1,10 +1,14 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   connectContribution,
+  deleteBackupPackage,
+  downloadBackupPackage,
   getContributionStatus,
   getQuotaUsage,
   getSearchFallback,
+  listBackupPackages,
   listEvalDatasets,
+  startBackupExport,
 } from '@/api/client';
 import { BarList } from '@/ui/plots';
 import { useResource } from '@/hooks/useResource';
@@ -100,6 +104,168 @@ function capabilityLabel(capability: string): string {
   if (capability === 'both') return '检索与抓取';
   if (capability === 'fetch') return '只抓取';
   return '只检索';
+}
+
+/** 字节数说人话：一份包几十到几百 MB，看的是量级不是精度。 */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(0)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+function formatStamp(seconds: number): string {
+  if (!seconds) return '—';
+  return new Date(seconds * 1000).toLocaleString();
+}
+
+/**
+ * 备份包的导出与下载。
+ *
+ * 三个事实摆在一起：口令是可选的（不填就是不加密）、导出是**异步**的（起一个 Job，
+ * 跑完包才会出现在列表里）、包住在这台机器的数据卷上而不是浏览器里。所以按钮按下去
+ * 之后这一页说的是「已经起了」，不是「导出好了」——判据是列表里真的多出一份。
+ *
+ * 不加密那句话直接印在输入框下面：包里有整库数据，而「凭证不在包里」不等于「包里
+ * 没有敏感内容」。
+ */
+function BackupExportSection() {
+  const packages = useResource('备份包', listBackupPackages, 30_000);
+  const [passphrase, setPassphrase] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
+  const running = packages.data?.running ?? false;
+
+  // 导出一趟要几分钟。只在「有 Job 在跑」时加快节奏，跑完就回到慢拍：
+  // 常态下每 30 秒读一次目录没有意义，而轮询不会自己停。
+  useEffect(() => {
+    if (!running) return;
+    const timer = setInterval(() => packages.refresh(), 5_000);
+    return () => clearInterval(timer);
+  }, [running, packages.refresh]);
+
+  const started = packages.data?.packages.length ?? 0;
+
+  const start = async () => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      const r = await startBackupExport(passphrase);
+      setMessage({
+        ok: true,
+        text: `已起 ${r.job}（${r.encrypted ? '加密' : '不加密'}）。跑完之前下面还看不到它——包写完才会出现在列表里。`,
+      });
+      setPassphrase('');
+      packages.refresh();
+    } catch (e) {
+      const err = e as { status?: number; message?: string };
+      setMessage({ ok: false, text: err?.message?.trim() || `起不来（HTTP ${err?.status ?? '?'}）` });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (name: string) => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      await deleteBackupPackage(name);
+      setMessage({ ok: true, text: `已删掉 ${name}` });
+      packages.refresh();
+    } catch (e) {
+      const err = e as { status?: number; message?: string };
+      setMessage({ ok: false, text: err?.message?.trim() || `删不掉（HTTP ${err?.status ?? '?'}）` });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const download = async (name: string) => {
+    setMessage(null);
+    try {
+      await downloadBackupPackage(name);
+    } catch (e) {
+      const err = e as { status?: number; message?: string };
+      setMessage({ ok: false, text: err?.message?.trim() || `下载失败（HTTP ${err?.status ?? '?'}）` });
+    }
+  };
+
+  return (
+    <section className="border-b border-[var(--line)]">
+      <header className="flex items-center gap-3 px-4 py-2">
+        <h2 className="text-[12px]">备份包</h2>
+        <span className="text-[11px] text-[var(--muted)]">
+          导出是一趟跑在集群里的备份；跑完包就出现在下面，可以直接下载
+          {running ? '；现在有一趟在跑' : ''}
+        </span>
+        <div className="ml-auto">
+          <Button onClick={packages.refresh}>重读</Button>
+        </div>
+      </header>
+
+      <div className="flex flex-wrap items-center gap-2 border-t border-[var(--line)] px-4 py-2">
+        <input
+          type="password"
+          value={passphrase}
+          onChange={(event) => setPassphrase(event.target.value)}
+          placeholder="口令（可空；填了就是加密包，至少 12 个字符）"
+          autoComplete="new-password"
+          className="mono w-80 border border-[var(--line)] bg-[var(--ink-900)] px-2 py-1 text-[11px] outline-none focus:border-[var(--brass)]"
+          style={{ color: 'var(--paper)' }}
+        />
+        <Button onClick={start} disabled={busy || running}>
+          {running ? '正在导出…' : '导出'}
+        </Button>
+        <span className="text-[11px] text-[var(--muted)]">
+          不填口令 = 不加密：包里没有凭证（凭证只在安全网关），但装着整库数据。只在你能控制的
+          介质上传它。
+        </span>
+      </div>
+
+      {message && (
+        <p
+          className="px-4 py-1 text-[11px]"
+          style={{ color: message.ok ? 'var(--paper-dim)' : 'var(--warn)' }}
+        >
+          {message.text}
+        </p>
+      )}
+
+      {packages.error ? (
+        <ReadError what="备份包" error={packages.error} onRetry={packages.refresh} />
+      ) : !packages.data && packages.loading ? (
+        <Loading what="备份包" />
+      ) : started === 0 ? (
+        <Empty>还没有导出过包。点「导出」起一趟，跑完它就出现在这里。</Empty>
+      ) : (
+        <Table
+          columns={[
+            { key: 'name', title: '包名', render: (p) => (
+              <span className="mono text-[11px]">{p.name}</span>
+            ) },
+            { key: 'bytes', title: '大小', width: '100px', render: (p) => (
+              <span className="mono text-[11px]">{formatBytes(p.bytes)}</span>
+            ) },
+            { key: 'created_at', title: '写出时间', width: '170px', render: (p) => (
+              <span className="text-[11px] text-[var(--muted)]">{formatStamp(p.created_at)}</span>
+            ) },
+            { key: 'actions', title: '', width: '150px', render: (p) => (
+              <div className="flex gap-2">
+                <Button onClick={() => download(p.name)}>下载</Button>
+                <Button onClick={() => remove(p.name)} disabled={busy}>删除</Button>
+              </div>
+            ) },
+          ]}
+          rows={packages.data?.packages ?? []}
+          rowKey={(p) => p.name}
+        />
+      )}
+      <p className="px-4 pb-2 text-[11px] text-[var(--muted)]">
+        这里的包不受备份卷的保留策略管：它们会一直躺着，直到你点删除。加密包的口令不在任何地方
+        保存——丢了就解不开，所以下载之后先确认打得开，再删掉这一份。
+      </p>
+    </section>
+  );
 }
 
 /**
@@ -448,6 +614,8 @@ export function SettingsView() {
           />
         )}
       </section>
+
+      <BackupExportSection />
 
       <section className="border-b border-[var(--line)]">
         <header className="flex items-center gap-3 px-4 py-2">

@@ -35,3 +35,13 @@ pub const INSTANCE_FINGERPRINT: &str = "COGNEVA_INSTANCE_FINGERPRINT";
 /// it before deploying; the loader and the watcher read the same value to pick
 /// which section of the document applies.
 pub const RUN_ENV: &str = "COGNEVA_ENV";
+
+/// Where a backup run puts the package it just wrote when somebody asked for
+/// that package by hand, so the process serving the web UI can offer it.
+///
+/// Two parties have to agree on this name and neither writes the other's code:
+/// the export Job the API creates carries it as an env value, and the API reads
+/// the directory it names to list and stream what came back. A second spelling
+/// would mean the Job writes where nobody looks -- and "no packages to
+/// download" is exactly what a directory nobody writes looks like.
+pub const BACKUP_PUBLISH_DIR: &str = "COGNEVA_BACKUP_PUBLISH_DIR";

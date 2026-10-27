@@ -722,6 +722,14 @@ jobs:
       - name: Check the help, model and settings entries actually lead somewhere
         run: bash deploy/scripts/check-web-shell-entries.sh
 
+      # 空白机重装只认两样：公开仓库的源码、一个备份包。所以「把包从旧机器上取下来」
+      # 必须是属主点得动的一件事。这一屏整块消失、或少了「不填口令就是不加密」那句话，
+      # 都不会让任何东西失败——而少那句话的后果是有人把明文整库拷进云盘还以为导的是
+      # 密文包。门判的是三条路由与四个动作都接上、设置面从入口可达且渲染了它、
+      # 明文那两句在、以及有 Job 在跑时点不出第二趟。
+      - name: Check the backup export panel can actually take a package off the machine
+        run: bash deploy/scripts/check-web-backup-export-panel.sh
+
   # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读
   # 覆盖端点），它结构上证明不了 `web/` 编得过：类型错、装不上的依赖、打包不进
   # bundle，三条它一条也看不见。构建这一半必须自己有一个作业，否则「新增功能不得

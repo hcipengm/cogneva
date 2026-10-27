@@ -12,6 +12,7 @@ resources:
   - deployment.yaml
   - app-data-pvc.yaml
   - llm-admin-rbac.yaml
+  - backup-export-rbac.yaml
   - security-gateway-rbac.yaml
   - gitops-puller-rbac.yaml
   - service.yaml

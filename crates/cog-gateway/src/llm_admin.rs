@@ -910,6 +910,33 @@ impl KubeClient {
         Ok(!apiserver_denies_ownership(resp.status().as_u16()))
     }
 
+    /// POST one object, returning what the apiserver made of it.
+    ///
+    /// The body comes back rather than being discarded: a create answers with
+    /// the object it created, and the things that matter about it (the name
+    /// the apiserver settled on, the uid a later read or delete has to name)
+    /// exist only in that answer.
+    pub(crate) async fn post_json(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let resp = self
+            .http
+            .post(format!("{API_BASE}{path}"))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("请求 apiserver 失败: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("apiserver 返回 {status}: {text}"));
+        }
+        serde_json::from_str(&text).map_err(|e| format!("apiserver 响应解析失败: {e}"))
+    }
+
     pub(crate) async fn patch(&self, path: &str, body: serde_json::Value) -> Result<(), String> {
         let resp = self
             .http

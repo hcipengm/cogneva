@@ -30,6 +30,7 @@ pub mod approval_gate;
 pub mod audit;
 pub mod auth;
 pub mod backend_health;
+pub mod backup_admin;
 pub mod chat;
 pub mod cluster;
 pub mod collaboration;
@@ -830,6 +831,22 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/admin/search-fallback",
             get(search_admin::search_fallback_status_handler)
                 .post(search_admin::search_fallback_config_handler),
+        )
+        // Exporting a package is a Job plus a download, not a byte copy in
+        // this process: the shape of a backup lives in `cogneva backup`, and
+        // the only place the finished package can be is the volume both this
+        // process and that Job mount.
+        .route(
+            "/api/v1/admin/backup/export",
+            post(backup_admin::export_handler),
+        )
+        .route(
+            "/api/v1/admin/backup/packages",
+            get(backup_admin::list_handler),
+        )
+        .route(
+            "/api/v1/admin/backup/packages/{name}",
+            get(backup_admin::download_handler).delete(backup_admin::delete_handler),
         )
         .route(
             "/api/v1/admin/contribution-status",
