@@ -25,7 +25,11 @@ use ring::hkdf::{self, HKDF_SHA256};
 pub const MAGIC: &[u8] = b"COGNEVA-BACKUP-ENC-1\n";
 
 /// 口令所在的环境变量。值是一句口令，不是密钥：派生在本地做，明文口令不出进程。
-pub const KEY_ENV: &str = "COGNEVA_BACKUP_PACKAGE_KEY";
+///
+/// 名字声明在 cog-core：网关的备份管理口也按它读写同一个环境变量，两处各写一份时
+/// 改一处不会报错，另一处会去找一个再没人设置的名字，而「没配口令」正是调用方在
+/// 读不到时给出的说法。
+pub const KEY_ENV: &str = cog_core::env::BACKUP_PACKAGE_KEY;
 
 const SALT_LEN: usize = 16;
 const TAG_LEN: usize = 16;

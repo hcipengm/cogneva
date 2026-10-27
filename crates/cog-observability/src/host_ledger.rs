@@ -92,7 +92,11 @@ pub const HOST_LEDGER_SLICES_INVISIBLE_RULE: &str = "host_ledger_slices_invisibl
 pub const HOST_SLICE_ANON_FLOOR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Environment variable naming the node this process is running on.
-pub const NODE_ENV: &str = "COGNEVA_NODE_NAME";
+///
+/// Declared in `cog_core::env`: the process census on the node reads the same
+/// name, and a row whose node is empty reads as a reading from nowhere rather
+/// than as a renamed variable.
+pub const NODE_ENV: &str = cog_core::env::NODE_NAME;
 
 /// Environment variable naming the root of the host's cgroup v2 tree, as this
 /// process sees it.

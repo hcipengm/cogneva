@@ -30,10 +30,10 @@ use std::path::PathBuf;
 
 use crate::llm_admin::KubeClient;
 
-/// 包名前后缀。与出包那一侧的常量是同一个事实，`crates/cogneva/tests/`
-/// 里有一条测试把两处钉在一起：这里认不出来的名字，页面就不会把它列出来。
-pub const PACKAGE_PREFIX: &str = "cogneva-backup-";
-pub const PACKAGE_SUFFIX: &str = ".tar.zst";
+/// 包名前后缀。声明在 cog-core，出包那侧读的是同一份：这里认不出来的名字，
+/// 页面就不会把它列出来，而「一个包也没有」正是第一次备份还没跑完时的读数。
+pub const PACKAGE_PREFIX: &str = cog_core::BACKUP_PACKAGE_PREFIX;
+pub const PACKAGE_SUFFIX: &str = cog_core::BACKUP_PACKAGE_SUFFIX;
 
 /// 页面上要的口令最短长度。
 ///
@@ -50,10 +50,10 @@ pub const EXPORTS_SUBDIR: &str = "exports";
 pub const EXPORT_LABEL_KEY: &str = "cogneva.io/backup-export";
 pub const EXPORT_LABEL_VALUE: &str = "manual";
 
-/// 出包那一侧读的口令变量的名字。它声明在 `cogneva` crate 里（写端在那里），
-/// 这个 crate 不依赖它，所以只能再写一遍——`crates/cogneva/tests/` 里有一条
-/// 测试把两处钉在一起：写端换了名字而这里没换，结果是「给了口令却没加密」。
-pub const PACKAGE_KEY_ENV: &str = "COGNEVA_BACKUP_PACKAGE_KEY";
+/// 出包那一侧读的口令变量的名字。声明在 cog-core，写端读的是同一份：两处各写
+/// 一遍时改一处不会报错，写端会去找一个再没人设置的名字，而「没给口令」正是它
+/// 读不到时给出的说法——结果是「看起来没要求加密」，而不是「口令的变量名换了」。
+pub const PACKAGE_KEY_ENV: &str = cog_core::env::BACKUP_PACKAGE_KEY;
 
 /// 每日备份那个 CronJob 的名字。它由 chart 渲染，是三份 profile 共用的一份事实。
 const CRONJOB_ENV: &str = "COGNEVA_BACKUP_CRONJOB";
@@ -576,7 +576,8 @@ mod tests {
     #[test]
     fn a_short_passphrase_is_refused_before_anything_is_created() {
         // 判据在 handler 里，之所以也在这里写一条：长度下限是这一面的约定，
-        // 调短它的时候应该有一条测试红，而不是悄悄放宽。
-        assert!(MIN_PASSPHRASE_CHARS >= 12);
+        // 调短它的时候应该有一条测试红，而不是悄悄放宽。条件全是常量，所以写成
+        // 常量块——编译期就能红，不必等到有人跑这条测试。
+        const { assert!(MIN_PASSPHRASE_CHARS >= 12) };
     }
 }

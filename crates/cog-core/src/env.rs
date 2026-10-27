@@ -26,6 +26,15 @@ pub const DATABASE_URL: &str = "COGNEVA_DATABASE_URL";
 /// both need it to answer "am I the pod that was asked".
 pub const POD_NAME: &str = "COGNEVA_POD_NAME";
 
+/// The node this process runs on.
+///
+/// Injected by the chart into every workload. The host readings and the process
+/// census attach it to what they report so a row can be traced back to a
+/// machine; a second spelling would leave one of them reporting an empty node,
+/// and an empty node reads as "this reading is not from anywhere" rather than
+/// as "the variable moved".
+pub const NODE_NAME: &str = "COGNEVA_NODE_NAME";
+
 /// The fingerprint the installer injects. Agent naming and repository identity
 /// both read it; absent, each falls back to something that only holds until the
 /// next rollout, which is exactly what the fingerprint exists to stop.
@@ -45,3 +54,12 @@ pub const RUN_ENV: &str = "COGNEVA_ENV";
 /// would mean the Job writes where nobody looks -- and "no packages to
 /// download" is exactly what a directory nobody writes looks like.
 pub const BACKUP_PUBLISH_DIR: &str = "COGNEVA_BACKUP_PUBLISH_DIR";
+
+/// The passphrase a backup package is encrypted under.
+///
+/// Set by whoever schedules the run and read by two crates: the binary that
+/// encrypts the package, and the gateway that starts an export with it. A second
+/// spelling would leave one side looking for a variable nobody sets, and both
+/// sides report that as "no passphrase given" — which is also how a run that
+/// should be encrypted but is not would look.
+pub const BACKUP_PACKAGE_KEY: &str = "COGNEVA_BACKUP_PACKAGE_KEY";

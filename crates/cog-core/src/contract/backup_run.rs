@@ -61,6 +61,18 @@ use crate::SFResult;
 /// other column: three states would leave "never reported" and "reported a
 /// failure" sharing a spelling, and a reader that selected by state would be
 /// unable to name which of the two it was looking at.
+/// The name a backup package is written under, and the only shape a reader may
+/// assume.
+///
+/// Two processes build these names: the binary that produces a package, and the
+/// gateway that lists, offers and deletes them. Nothing compares the two
+/// spellings. Change one and the listing answers "no packages" — which is
+/// exactly what it answers while the first backup has not finished yet, so the
+/// retention that reads that list prunes nothing and looks idle rather than
+/// broken.
+pub const BACKUP_PACKAGE_PREFIX: &str = "cogneva-backup-";
+pub const BACKUP_PACKAGE_SUFFIX: &str = ".tar.zst";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackupOutcome {

@@ -125,6 +125,18 @@ const EXEMPT: &[Exempt] = &[
         value: "%Y-%m-%d",
         why: "给人看的页面日期，读它的是人不是解析器：改格式不产生「找不到」",
     },
+    Exempt {
+        file: "crates/cog-gateway/src/backup_admin.rs",
+        value: "cogneva-backup-",
+        why: "导出 Job 的对象名（`cogneva-backup-export-<毫秒>`），不是包文件名；\
+              它由 apiserver 收下，没有第二个读者去按这个名字找东西",
+    },
+    Exempt {
+        file: "crates/cogneva/src/backup_crypto.rs",
+        value: "cogneva-backup-",
+        why: "HKDF 的 info 域分隔串，已经烤进盘上每一个包的密钥派生里；\
+              它不是包名，跟着包名一起改会让已有的包再也解不开",
+    },
 ];
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -453,7 +465,10 @@ fn every_in_band_marker_is_written_from_its_declaration() {
 fn an_exemption_that_no_longer_matches_a_site_is_stale() {
     let root = repo_root();
     let values = declared(&root);
-    let hits = retypes(&root, &values);
+    // 两种判据都认：豁免可以发给一处整字面量的重写，也可以发给一处在自己拼出
+    // 来的文本里以声明开头的写法。只看前一种，后一种的豁免会立刻被报成过期。
+    let mut hits = retypes(&root, &values);
+    hits.extend(marker_hits(&root));
     let stale: Vec<&Exempt> = EXEMPT
         .iter()
         .filter(|rule| {

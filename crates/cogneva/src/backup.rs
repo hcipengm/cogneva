@@ -43,8 +43,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 /// 包名前缀与时间戳格式：字典序排序即时间序，保留策略依赖这一点。
-pub const PACKAGE_PREFIX: &str = "cogneva-backup-";
-pub const PACKAGE_SUFFIX: &str = ".tar.zst";
+///
+/// 前缀与后缀声明在 cog-core：网关按同一组名字列举、下载、删除包，两处各写一份
+/// 时改一处不报错，另处的清单读成「一个包也没有」——而那正是第一次备份还没
+/// 跑完时的读数，保留策略读着它什么也不删，看着像闲、不像坏。
+pub const PACKAGE_PREFIX: &str = cog_core::BACKUP_PACKAGE_PREFIX;
+pub const PACKAGE_SUFFIX: &str = cog_core::BACKUP_PACKAGE_SUFFIX;
 const TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 
 /// 打包与还原两侧都读的同几个环境变量。名字在这里写一次：写两遍的时候，改
