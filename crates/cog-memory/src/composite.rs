@@ -133,7 +133,10 @@ impl CompositeMemoryBackend {
             return;
         };
         let mut labels = HashMap::new();
-        labels.insert("operation".to_string(), refusal.operation().to_string());
+        labels.insert(
+            crate::observable::HOLDER_LABEL.to_string(),
+            refusal.operation().to_string(),
+        );
         if let Err(e) = metrics
             .record_counter(cog_core::metric_names::MEMORY_OPERATIONS_TOTAL, 1.0, labels)
             .await

@@ -62,7 +62,7 @@ pub const READABLE_METRIC: &str = "cogneva_image_store_readable";
 pub const AGE_METRIC: &str = "cogneva_image_store_age_seconds";
 
 /// Label carrying the node, as on every other node-scoped reading.
-pub const NODE_LABEL: &str = "node";
+pub const NODE_LABEL: &str = crate::LABEL_NODE;
 
 /// Root the store is expected at inside the container.
 pub const DEFAULT_ROOT: &str = "/host/containerd";

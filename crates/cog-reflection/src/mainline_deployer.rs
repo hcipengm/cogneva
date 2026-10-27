@@ -2612,7 +2612,7 @@ impl MainlineDeployer {
             if let Some(metrics) = &self.metrics {
                 let mut labels = std::collections::HashMap::new();
                 labels.insert(
-                    "reason".to_string(),
+                    crate::LABEL_REASON.to_string(),
                     REVS_SKIPPED_SUPERSEDED_BEFORE_TICK.to_string(),
                 );
                 let _ = metrics
@@ -2830,7 +2830,7 @@ impl MainlineDeployer {
             return;
         };
         let mut labels = std::collections::HashMap::new();
-        labels.insert("reason".to_string(), wall.to_string());
+        labels.insert(crate::LABEL_REASON.to_string(), wall.to_string());
         let _ = metrics
             .record_counter(
                 cog_core::metric_names::MAINLINE_ROLLOUT_REFUSED_TOTAL,
@@ -4183,7 +4183,7 @@ impl MainlineDeployer {
         for (platform, reason) in reasons {
             let mut labels = std::collections::HashMap::new();
             labels.insert("platform".to_string(), (*platform).to_string());
-            labels.insert("reason".to_string(), reason.label().to_string());
+            labels.insert(crate::LABEL_REASON.to_string(), reason.label().to_string());
             let _ = metrics
                 .record_counter(
                     cog_core::metric_names::MAINLINE_CI_NO_VERDICT_REASON_TOTAL,

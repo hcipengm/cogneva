@@ -1040,7 +1040,11 @@ fn to_views(samples: Vec<MetricSample>) -> Vec<MetricSampleView> {
         .into_iter()
         .map(|s| MetricSampleView {
             timestamp: s.timestamp.to_rfc3339(),
-            operation: s.labels.get("operation").cloned().unwrap_or_default(),
+            operation: s
+                .labels
+                .get(crate::LABEL_OPERATION)
+                .cloned()
+                .unwrap_or_default(),
             value: s.value,
         })
         .collect()

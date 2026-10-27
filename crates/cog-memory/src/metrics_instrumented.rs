@@ -36,7 +36,7 @@ impl MetricsInstrumentedMemoryBackend {
     async fn record(&self, operation: &str, start: Instant, is_err: bool) {
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
         let mut labels = HashMap::new();
-        labels.insert("operation".into(), operation.into());
+        labels.insert(crate::observable::HOLDER_LABEL.into(), operation.into());
 
         let _ = self
             .metrics
@@ -83,7 +83,7 @@ impl MetricsInstrumentedMemoryBackend {
             return;
         }
         let mut labels = HashMap::new();
-        labels.insert("namespace".to_string(), namespace.to_string());
+        labels.insert(crate::LABEL_NAMESPACE.to_string(), namespace.to_string());
         if let Err(e) = self
             .metrics
             .record_counter(

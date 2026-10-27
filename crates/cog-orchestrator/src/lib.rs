@@ -40,6 +40,18 @@ pub const LABEL_READOUT: &str = "readout";
 /// which is what "this family never ran" looks like.
 pub const LABEL_OUTCOME: &str = "outcome";
 
+/// 读数按「哪一类」归属时用的标签键。
+pub const LABEL_KIND: &str = "kind";
+
+/// 读数按「哪一行读数」归属时用的标签键。
+pub const LABEL_READING: &str = "reading";
+
+/// 读数带上「为什么是这个值」时用的标签键。
+pub const LABEL_REASON: &str = "reason";
+
+/// 读数按「这一格处在哪个状态」归属时用的标签键。
+pub const LABEL_STATE: &str = "state";
+
 pub use action_planner::ActionPlanOrchestrator;
 pub use dag_executor::task_phase::{ExitCriteria, PhaseTransitionRules, PhasedTask, TaskPhase};
 pub use dag_executor::{

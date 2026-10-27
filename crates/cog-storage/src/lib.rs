@@ -127,6 +127,9 @@ pub mod plugin;
 /// spelled again: the word is the same one, and two names for it in the
 /// declaring crates is how a rename lands on one site and misses the reader.
 pub const LABEL_SOURCE: &str = cog_core::build_cache::SOURCE_LABEL;
+
+/// 读数带上「为什么是这个值」时用的标签键。
+pub const LABEL_REASON: &str = "reason";
 #[cfg(feature = "redis")]
 pub use dlq::RedisDeadLetterQueue;
 

@@ -1180,7 +1180,7 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
         } => {
             let mut labels = HashMap::new();
             labels.insert("crew_id".into(), crew_id.clone());
-            labels.insert("reason".into(), reason.clone());
+            labels.insert(crate::LABEL_REASON.into(), reason.clone());
             labels.insert(
                 "message".into(),
                 format!("Squad respawn requested: {reason}"),

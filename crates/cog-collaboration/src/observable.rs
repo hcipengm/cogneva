@@ -1014,7 +1014,7 @@ impl Observable for CollaborationObservable {
             for (reason, count) in recorded.iter() {
                 metrics.push(
                     RawMetric::new("ralph_terminations_total", *count as f64)
-                        .with_label("reason", reason),
+                        .with_label(crate::LABEL_REASON, reason),
                 );
             }
             // Which door each failure analysis left by, zeros included. The two
@@ -1069,7 +1069,7 @@ impl Observable for CollaborationObservable {
                 metrics.push(
                     RawMetric::new("self_review_skipped_total", *count as f64)
                         .with_label("stage", stage)
-                        .with_label("reason", reason),
+                        .with_label(crate::LABEL_REASON, reason),
                 );
             }
 
@@ -1147,7 +1147,7 @@ impl Observable for CollaborationObservable {
                 let count = history_bytes.get(part).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("ralph_failure_prompt_bytes_total", count as f64)
-                        .with_label("part", part),
+                        .with_label(crate::LABEL_PART, part),
                 );
             }
 
@@ -1163,7 +1163,7 @@ impl Observable for CollaborationObservable {
                 let count = mirror_bytes.get(part).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("pge_board_mirror_bytes_total", count as f64)
-                        .with_label("part", part),
+                        .with_label(crate::LABEL_PART, part),
                 );
             }
 
@@ -1179,7 +1179,7 @@ impl Observable for CollaborationObservable {
                 let count = eval_doc_bytes.get(part).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("pge_eval_doc_bytes_total", count as f64)
-                        .with_label("part", part),
+                        .with_label(crate::LABEL_PART, part),
                 );
             }
 

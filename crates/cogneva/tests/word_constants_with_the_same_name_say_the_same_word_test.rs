@@ -20,10 +20,11 @@
 //!    前缀 / `_LABEL` 后缀的名字算，所以 `LABEL_OUTCOME` 与 `OUTCOME_LABEL` 是
 //!    同一族——只比同名的话，这两拨声明各自内部一致、彼此差一个词，读数一样
 //!    读成空向量；
-//! 2. 一个词被三个以上 crate 各自声明过，它就已是这棵树的共享词汇：生产代码
+//! 2. 任何一个 crate 把一个词声明成了常量，这个词就是这棵树认过的词汇：生产代码
 //!    不许再把它逐字写进标签键位置（`with_label(…)`、`labels.insert/get/remove`），
-//!    必须引用某个声明。只在一两个 crate 里出现的词不管——同一拼写在别处很可能
-//!    是另一件事，强行共用常量会把两族不相干的读数焊在一起；
+//!    必须引用某个声明。不要求全树共用一个常量——每个写它的 crate 各自声明一份
+//!    即可：同一拼写在别处很可能是另一件事，强行共用会把两族不相干的读数焊在
+//!    一起。没人声明过的词不管；
 //! 3. 普查本身要有下限：读得太少、「没有矛盾」就是个空承诺。
 //!
 //! 判不了什么：
@@ -35,18 +36,29 @@
 //!   这些形状也算进来，会连 SQL 列名（`row.try_get("outcome")`）与 serde 字段名
 //!   一起判成红，而它们确实是另一套词汇。树上这几处仍按字面量手工改掉了，只是
 //!   本门看不见；
-//! - 只在两个 crate 里出现的词（`source` 之前就是三处声明才进判据 2）。
+//! - **没有任何 crate 声明成常量**的词。树上还剩 276 处逐字写进标签位的拼写，
+//!   分布在 87 个没人声明过的词上（`role`、`stream`、`stage`、`tier`、`service`…）。
+//!   判据 2 对它们一律不管：没有声明就没有「正确的拼法」可对照，硬判只能靠人肉
+//!   挑一份白名单，而白名单会随人走。要管得先有人把它们变成常量。
 //!
 //! 为什么只限名字命中 [`word_family`] 的 `&str` 常量：同名的 `&str` 常量在别处
 //! **合法地**各不相同——`USAGE`、`CLAIM_ENV`、`ROOT_ENV`、`INSERT_SQL` 都是每个
 //! 模块自己那一份，名字撞上而词不同是正当的（实测 30 组这样同名不同词）。标签名
 //! 与平台名不是：它们在两处必须是同一个词，否则读数合不到一起、路由挑不中。
 //!
-//! 实测（2026-10-27）：生产代码里 68 个命中该判据的 `&str` 常量、40 个族。判据 2
-//! 命中的两个词是 `outcome`（10 个 crate 各声明一次，21 处逐字拼写的生产代码，
-//! 全部改成引用常量）与 `source`（`cog-core`、`cog-extension`、`cog-reflection`
-//! 三处声明，7 处逐字拼写，同上）。`cog-reflection` 的五个模块级 `OUTCOME_LABEL`
-//! 与网关的一处改成指向本 crate 常量的别名——编译器拴住的比门拴住的更早报错。
+//! 实测（2026-10-27）：生产代码里 81 个命中该判据的 `&str` 常量、41 个族。判据 2
+//! 在门槛还是「三个以上 crate 声明过」时命中的两个词是 `outcome`（10 个 crate 各
+//! 声明一次，21 处逐字拼写的生产代码，全部改成引用常量）与 `source`（`cog-core`、
+//! `cog-extension`、`cog-reflection` 三处声明，7 处逐字拼写，同上）。`cog-reflection`
+//! 的五个模块级 `OUTCOME_LABEL` 与网关的一处改成指向本 crate 常量的别名——编译器
+//! 拴住的比门拴住的更早报错。
+//!
+//! 门槛放到「任何 crate 声明过」之后，工作面是一次量出来的：321 处逐字写进标签位
+//! 的拼写、95 个词；其中 45 处落在 8 个已被声明过的词上，逐 crate 改成引用声明
+//! （cog-agent、cog-collaboration、cog-core、cog-gateway、cog-memory、
+//! cog-observability、cog-orchestrator、cog-reflection 各新增 1～5 个 `LABEL_*`
+//! 常量，`cog-reflection` 另有 3 处改指向本 crate 已有的 `DIR_LABEL` / `KIND_LABEL` /
+//! `STATE_LABEL`）。剩余 276 处属于没人声明过的词，见上一节。
 //!
 //! 消融（都在真实树上做，跑的是本门自己的测试二进制）：把 `cog-collaboration` 的
 //! 一处 `with_label(crate::LABEL_OUTCOME, …)` 改回字面量，本门红并点名该文件与行号、
@@ -54,6 +66,15 @@
 //! 改成 `"result"`，本门红并点名 `OUTCOME` 这一族的全部十处声明（归族判据生效）；
 //! 改回绿。另外两处消融见此前：`cog-memory` 的 `OUTCOME_LABEL` 改 `"result"`
 //! 红、`cog-gateway` 的 `GITEE_PLATFORM` 改 `"gitee2"` 红，改回均绿。
+//!
+//! 门槛降到「任何 crate 声明过」之后又消融了一次：把 `cog-agent` 的
+//! `with_label(crate::LABEL_STATE, …)` 改回 `"state"`，本门红并点名
+//! `crates/cog-agent/src/observable.rs` 第 684 行、列出声明了 `state` 的四个 crate
+//! （cog-agent、cog-orchestrator、cog-reflection、cog-storage）；改回绿。同一棵树
+//! 一测就还揪出一处漏网的（`cog-memory/src/ingestor.rs` 的 `"operation"`），已改。
+//!
+//! 扫描面按 O(词 × 文件) 重读过一次全部文件，实测这套测试耗时 66 秒；改成每个文件
+//! 只解析一遍、再按词过滤之后同一台机器 6 秒，判据不变。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -186,13 +207,13 @@ fn sources(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// 一个词被几个 crate 各自声明过，才算这棵树的共享词。
+/// 标签**键**位置的判据只管「已经被声明过」的词。
 ///
-/// 只在一两个 crate 里出现的词不归本门的「不许逐字拼」管：`"operation"`、
-/// `"intent"` 这类词在别的 crate 里很可能指同一拼写的另一件事，强行要求它们共用
-/// 一个常量，会把两件不相干的读数焊在一起。三个 crate 各自独立地声明了同一个词，
-/// 说明它已经是跨 crate 的词汇，此时在标签位上再逐字拼一遍没有理由。
-const SHARED_IN_CRATES: usize = 3;
+/// 只要有任何一个 crate 把某个词声明成了常量，这个词在生产代码里就不许再被逐字
+/// 写进标签键位置。声明这个动作本身就是「这是一套词汇」的决定——一旦有名字，裸拼
+/// 的那一处就是第二个拼法，改声明时它照旧发布旧名字，谁也不会红。每个写它的
+/// crate 各自声明一份即可，不要求共用一个常量：同一拼写在别处完全可能是另一件
+/// 事，强行共用会把两族不相干的读数焊在一起。没人声明过的词仍归读者判断。
 
 /// 标签**键**位置上的调用。字面量紧跟在它们后面（中间允许换行与缩进），就是
 /// 在标签位上把词拼了一遍，而不是引用声明。
@@ -203,29 +224,64 @@ const LABEL_KEY_MARKERS: [&str; 4] = [
     "labels.remove(",
 ];
 
-/// 生产代码里，`word` 被逐字写进标签键入位置的那些行号。
+/// 一个文件里，被逐字写进标签键位置的词，连同它在文件里的行号。
+///
+/// 一次走完整个文件，而不是按词各扫一遍：词有几打、文件有上千个，按词遍历是
+/// O(词 × 文件) 次解析，实测 66 秒；一次扫完再按词过滤，判据一样，一秒级。
 ///
 /// 判不了什么：把标签键拼进一个 map 构造器的元组里（`HashMap::from([("outcome",
 /// …)])`）、`slots.push(("outcome", …))` 这类写法，本门看不出来——它们的形状与
 /// 普通的元组和 JSON 字段名一致，凡是把它们也算进来的判据，实测都会连 SQL 列名
 /// （`row.try_get("outcome")`）与序列化字段一起判成红。
-fn inline_label_lines(text: &str, word: &str) -> Vec<usize> {
-    let quoted = format!("\"{word}\"");
-    let mut lines = Vec::new();
-    for (offset, _) in text.match_indices(&quoted) {
-        let before = &text[..offset];
+fn inline_label_sites(text: &str) -> Vec<(usize, String)> {
+    let production = production_text(text);
+    let numbers = production_line_numbers(text);
+    let mut out = Vec::new();
+    for (offset, _) in production.match_indices('"') {
+        let before = &production[..offset];
         if !LABEL_KEY_MARKERS
             .iter()
             .any(|marker| before.trim_end().ends_with(marker))
         {
             continue;
         }
-        let line = before.matches('\n').count() + 1;
-        if !lines.contains(&line) {
-            lines.push(line);
+        let after = &production[offset + 1..];
+        let Some(end) = after.find('"') else {
+            continue;
+        };
+        let word = &after[..end];
+        // 报的是文件里的行号，不是生产文本里的第几行：跳过测试模块会让两者错开
+        // 一大截，照着一个对不上的行号去改，改中的是别人的行。
+        let index = before.matches('\n').count();
+        let line = numbers.get(index).copied().unwrap_or(index + 1);
+        let site = (line, word.to_string());
+        if !out.contains(&site) {
+            out.push(site);
         }
     }
-    lines
+    out
+}
+
+/// 生产文本每一行在文件里的行号，与 `production_text` 的行一一对应。
+///
+/// `production_lines` 只给内容不给行号，所以按顺序在原文里走一遍：生产行是原文
+/// 行的子序列，顺序一致，逐行对齐即可。
+fn production_line_numbers(text: &str) -> Vec<usize> {
+    let production = production_text(text);
+    let file_lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    for line in production.lines() {
+        while cursor < file_lines.len() && file_lines[cursor] != line {
+            cursor += 1;
+        }
+        if cursor == file_lines.len() {
+            break;
+        }
+        out.push(cursor + 1);
+        cursor += 1;
+    }
+    out
 }
 
 fn crate_of(where_: &str) -> Option<&str> {
@@ -235,7 +291,7 @@ fn crate_of(where_: &str) -> Option<&str> {
 fn contradictions(root: &Path) -> Vec<String> {
     let mut complaints = Vec::new();
     let mut declarations: Vec<(String, String, String)> = Vec::new();
-    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    let mut files: Vec<(String, String)> = Vec::new();
 
     for path in sources(root) {
         let where_ = relative(root, &path);
@@ -252,7 +308,7 @@ fn contradictions(root: &Path) -> Vec<String> {
             }
             Err(complaint) => complaints.push(format!("  `{where_}`：{complaint}")),
         }
-        files.push((where_, path));
+        files.push((where_, raw));
     }
 
     let mut by_family: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
@@ -301,24 +357,19 @@ fn contradictions(root: &Path) -> Vec<String> {
         ));
     }
 
-    for (word, krates) in &crates_of_word {
-        if krates.len() < SHARED_IN_CRATES {
-            continue;
-        }
-        for (where_, path) in &files {
-            let Ok(raw) = std::fs::read_to_string(path) else {
+    // 只要有 crate 把某个词声明成了常量，它就是这棵树认过的词汇：生产代码里
+    // 不许再把它逐字写进标签键位置。
+    for (where_, raw) in &files {
+        for (line, word) in inline_label_sites(raw) {
+            let Some(krates) = crates_of_word.get(&word) else {
                 continue;
             };
-            let text = production_text(&raw);
-            for line in inline_label_lines(&text, word) {
-                complaints.push(format!(
-                    "  `{where_}` 第 {line} 行把 `\"{word}\"` 直接写在标签位上。这个字面量已经\
-                     被 {} 个 crate 各自声明成常量（{}），写标签时该引用常量：两处各自拼一遍，\
-                     改一处不会有任何报错，而读数面读到的是一族空向量",
-                    krates.len(),
-                    krates.iter().cloned().collect::<Vec<_>>().join("、")
-                ));
-            }
+            complaints.push(format!(
+                "  `{where_}` 第 {line} 行把 `\"{word}\"` 直接写在标签位上。这个词已经\
+                 被声明成常量（{}），写标签时该引用声明：两处各自拼一遍，改一处不会有\
+                 任何报错，而读数面读到的是一族空向量",
+                krates.iter().cloned().collect::<Vec<_>>().join("、")
+            ));
         }
     }
 
@@ -438,16 +489,34 @@ fn a_shared_word_spelled_inline_in_a_label_slot_is_reported() {
     );
 }
 
-/// 只在两个 crate 里出现的词不归这条管：同一个拼写在第三个 crate 里很可能是
-/// 另一件事，强行要求共用常量会把两族不相干的读数焊在一起。
+/// 声明过一次就够了：一个 crate 把某个词写成常量，就已经把它认成了词汇，
+/// 别处再逐字拼它就是第二个拼法。
 #[test]
-fn a_word_declared_in_only_two_crates_is_not_policed() {
+fn a_word_declared_in_one_crate_is_enough_to_police_it() {
     let complaints = fixture_complaints(&[
         (ONE, "pub const KIND_LABEL: &str = \"kind\";\n"),
-        (TWO, "pub const KIND_LABEL: &str = \"kind\";\n"),
         (
             "crates/three/src/c.rs",
             "pub fn publish(m: &mut M) { m.with_label(\"kind\", \"pod\"); }\n",
+        ),
+    ]);
+    assert!(
+        complaints
+            .iter()
+            .any(|c| c.contains("\"kind\"") && c.contains("crates/three/src/c.rs")),
+        "{complaints:?}"
+    );
+}
+
+/// 没人声明过的词不管：没有名字就没有可对照的拼法，裸拼是它唯一的拼法，
+/// 本门不该替读者决定什么词值得起名字。
+#[test]
+fn a_word_no_one_declared_is_not_policed() {
+    let complaints = fixture_complaints(&[
+        (ONE, "pub const OTHER_WORD: &str = \"something_else\";\n"),
+        (
+            "crates/three/src/c.rs",
+            "pub fn publish(m: &mut M) { m.with_label(\"intent\", \"x\"); }\n",
         ),
     ]);
     assert_eq!(complaints, Vec::<String>::new());

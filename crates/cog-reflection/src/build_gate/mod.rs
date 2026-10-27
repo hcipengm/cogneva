@@ -1099,8 +1099,11 @@ fn host_metrics(reading: Option<HostReading>, origin: Origin<'_>) -> Vec<RawMetr
         return Vec::new();
     };
     let label = |m: RawMetric| {
-        m.with_label("dir", origin.dir.to_string())
-            .with_label("role", origin.role.to_string())
+        m.with_label(
+            crate::evolution_queue_readings::DIR_LABEL,
+            origin.dir.to_string(),
+        )
+        .with_label("role", origin.role.to_string())
     };
     let mut out = vec![
         label(RawMetric::new(HOST_CPU_BUSY_CORES, reading.busy_cores)),
@@ -1155,8 +1158,11 @@ fn readings(
     wait_budget_ms: u64,
 ) -> Vec<RawMetric> {
     let label = |m: RawMetric| {
-        m.with_label("dir", origin.dir.to_string())
-            .with_label("role", origin.role.to_string())
+        m.with_label(
+            crate::evolution_queue_readings::DIR_LABEL,
+            origin.dir.to_string(),
+        )
+        .with_label("role", origin.role.to_string())
     };
     let mut out = vec![
         label(RawMetric::new(BUILD_GATE_SLOTS, slots as f64)),
@@ -1180,7 +1186,7 @@ fn readings(
                     BUILD_GATE_REFUSED_TOTAL,
                     c.refused[asker][wall.index()] as f64,
                 ))
-                .with_label("reason", wall.as_str().to_string())
+                .with_label(crate::LABEL_REASON, wall.as_str().to_string())
                 .with_label("asker", asker_label(asker).to_string()),
             );
         }
@@ -2965,7 +2971,10 @@ fn holder_metrics(dir: &Path, slots: usize, origin: &Origin<'_>) -> Vec<RawMetri
         .filter_map(|slot| read_holder(dir, slot).map(|(h, held)| (slot, h, held)))
         .map(|(slot, holder, held)| {
             RawMetric::new(BUILD_GATE_HOLDER_SECONDS, held.as_secs_f64())
-                .with_label("dir", origin.dir.to_string())
+                .with_label(
+                    crate::evolution_queue_readings::DIR_LABEL,
+                    origin.dir.to_string(),
+                )
                 .with_label("role", origin.role.to_string())
                 .with_label("slot", slot.to_string())
                 .with_label("what", holder.what)

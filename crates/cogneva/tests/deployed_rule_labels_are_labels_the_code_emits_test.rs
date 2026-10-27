@@ -19,8 +19,9 @@
 //! * every line of that inventory still names something a rule groups by, so a
 //!   rule that stops reading a label does not leave a line behind that claims
 //!   it does;
-//! * every file the inventory names still contains the label, which is what a
-//!   rename on the emitter side breaks.
+//! * every file the inventory names still publishes the label -- as a literal, or
+//!   through a constant whose value is that label. Either way a rename on the
+//!   emitter side breaks it, which is what this line is for.
 //!
 //! What it cannot judge: a rule that groups by a name this test's expression
 //! parser fails to see. That is why the extracted set is asserted to be large
@@ -28,10 +29,24 @@
 //! nothing would otherwise pass every gate below it.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
 }
 
 /// Labels the scrape surface attaches, keyed to the reason this tree does not
@@ -253,11 +268,55 @@ fn every_label_the_rules_group_by_is_one_the_tree_writes() {
         let body = std::fs::read_to_string(&source)
             .unwrap_or_else(|e| panic!("{}: {e}", source.display()));
         assert!(
-            body.contains(&format!("\"{name}\"")),
+            body.contains(&format!("\"{name}\"")) || references_a_declaration_of(&root, file, name),
             "{file} 里已经找不到 `{name}` 这个标签名了：规则还在按它分组，\
              代码却不再按这个名字发读数，分组结果会是空的"
         );
     }
+}
+
+/// 这个文件发读数时用的标签名，是否已经改由常量给出。
+///
+/// 判据从「文件里还写着这个字面量」放宽到「文件引用了一个值等于它的常量」：
+/// 标签名收进常量之后，字面量只剩下那一处声明，发读数的地方是 `crate::LABEL_X`。
+/// 两种写法都要认，否则把字面量换成常量这一件事本身就会把这个门判红——而它想
+/// 拦的是标签从发读数的一侧消失，不是标签的写法。
+fn references_a_declaration_of(root: &Path, file: &str, label: &str) -> bool {
+    let Some(krate) = file
+        .strip_prefix("crates/")
+        .and_then(|rest| rest.split('/').next())
+    else {
+        return false;
+    };
+    let src = root.join("crates").join(krate).join("src");
+    let mut files = Vec::new();
+    walk(&src, &mut files);
+    let mut names = Vec::new();
+    for path in &files {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Some(at) = line.find("const ") else {
+                continue;
+            };
+            let rest = &line[at + "const ".len()..];
+            let Some((name, tail)) = rest.split_once(':') else {
+                continue;
+            };
+            if tail
+                .trim_start()
+                .starts_with(&format!("&str = \"{label}\""))
+            {
+                names.push(name.trim().to_string());
+            }
+        }
+    }
+    if names.is_empty() {
+        return false;
+    }
+    let body = std::fs::read_to_string(root.join(file)).unwrap_or_default();
+    names.iter().any(|name| body.contains(&format!("::{name}")))
 }
 
 /// 解析面自己也要有判据，否则「读到空集」与「没有标签」不可分。

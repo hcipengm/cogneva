@@ -143,7 +143,7 @@ impl PartitionMaintainer {
             return;
         };
         let mut labels = HashMap::new();
-        labels.insert("reason".to_string(), reason.as_str().to_string());
+        labels.insert(crate::LABEL_REASON.to_string(), reason.as_str().to_string());
         if let Err(e) = metrics
             .record_counter(
                 cog_core::metric_names::PARTITION_MAINTENANCE_FAILURES_TOTAL,

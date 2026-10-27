@@ -698,7 +698,7 @@ impl Observable for GovernanceDrift {
                 // Spelled as a literal for the same reason the object label
                 // below is: the shipped-summary gate reads label names out of
                 // the source text of this call.
-                .with_label("reason", reason.as_str())
+                .with_label(crate::LABEL_REASON, reason.as_str())
             })
             .collect();
         // One loop per class rather than one over [`DriftClass::ALL`]: the two

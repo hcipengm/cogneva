@@ -86,7 +86,7 @@ pub const NAMESPACE_LABEL: &str = "namespace";
 /// node's filesystem can be read beside the node's own disk reading. A claim
 /// exists on exactly one node, so this also makes two scanners claiming the same
 /// directory visible instead of averaging into one number.
-pub const NODE_LABEL: &str = "node";
+pub const NODE_LABEL: &str = crate::LABEL_NODE;
 
 /// How many claim directories the storage root holds.
 pub const SCAN_DIRS_METRIC: &str = "cogneva_claim_scan_dirs";

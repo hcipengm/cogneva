@@ -193,6 +193,12 @@ pub const LABEL_OUTCOME: &str = "outcome";
 /// for why the name is declared here rather than spelled at each site.
 pub const LABEL_SOURCE: &str = "source";
 
+/// 读数带上「为什么是这个值」时用的标签键。
+pub const LABEL_REASON: &str = "reason";
+
+/// 读数按「哪一份存储」归属时用的标签键。
+pub const LABEL_STORE: &str = "store";
+
 pub mod platform_http;
 pub mod plugin;
 

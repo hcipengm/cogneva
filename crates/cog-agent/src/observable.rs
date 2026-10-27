@@ -681,7 +681,7 @@ impl Observable for AgentObservable {
                     RawMetric::new("agent_retire_timeout_total", *count as f64)
                         .with_label("role", role)
                         .with_label("lifetime", lifetime_label(*task_scoped))
-                        .with_label("state", if *was_busy { "busy" } else { "idle" }),
+                        .with_label(crate::LABEL_STATE, if *was_busy { "busy" } else { "idle" }),
                 );
             }
         }
@@ -712,14 +712,14 @@ impl Observable for AgentObservable {
                         "agent_inbox_delivered_total",
                         delivered.get(kind).copied().unwrap_or(0) as f64,
                     )
-                    .with_label("kind", kind),
+                    .with_label(crate::LABEL_KIND, kind),
                 );
                 metrics.push(
                     RawMetric::new(
                         "agent_inbox_undelivered_total",
                         undelivered.get(kind).copied().unwrap_or(0) as f64,
                     )
-                    .with_label("kind", kind),
+                    .with_label(crate::LABEL_KIND, kind),
                 );
             }
         }
@@ -738,7 +738,7 @@ impl Observable for AgentObservable {
                         "agent_inbox_refused_total",
                         refused.get(reason).copied().unwrap_or(0) as f64,
                     )
-                    .with_label("reason", reason),
+                    .with_label(crate::LABEL_REASON, reason),
                 );
             }
         }

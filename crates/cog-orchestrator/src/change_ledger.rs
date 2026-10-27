@@ -4641,7 +4641,7 @@ async fn publish_face_reading(
 ) -> SFResult<()> {
     let mut labels = HashMap::new();
     labels.insert("block".to_string(), block.as_str().to_string());
-    labels.insert("reading".to_string(), reading.to_string());
+    labels.insert(crate::LABEL_READING.to_string(), reading.to_string());
     metrics
         .record_gauge(metric_names::CHANGE_BLOCK_CENSUS, value, labels)
         .await

@@ -156,7 +156,7 @@ impl StoreReadouts {
                 let mut labels = HashMap::new();
                 labels.insert(LABEL_READOUT.to_string(), readout.to_string());
                 labels.insert("data_dir".to_string(), data_dir.clone());
-                labels.insert("store".to_string(), name.clone());
+                labels.insert(crate::LABEL_STORE.to_string(), name.clone());
                 labels
             };
             // 这一格不是「1 = 正常」，而是「这个进程在这里、从这条路径装载」的声明。
@@ -204,7 +204,10 @@ impl StoreReadouts {
             let mut labels = HashMap::new();
             labels.insert(LABEL_READOUT.to_string(), readout.to_string());
             labels.insert("data_dir".to_string(), data_dir.clone());
-            labels.insert("store".to_string(), META_LEARNING_POLICY.to_string());
+            labels.insert(
+                crate::LABEL_STORE.to_string(),
+                META_LEARNING_POLICY.to_string(),
+            );
             self.record(labels, value).await;
         }
     }
@@ -223,7 +226,7 @@ impl StoreReadouts {
             let mut labels = HashMap::new();
             labels.insert(LABEL_READOUT.to_string(), readout.to_string());
             labels.insert("data_dir".to_string(), data_dir.clone());
-            labels.insert("store".to_string(), store.to_string());
+            labels.insert(crate::LABEL_STORE.to_string(), store.to_string());
             labels
         };
         let mut agreed = true;

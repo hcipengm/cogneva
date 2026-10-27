@@ -327,7 +327,7 @@ async fn publish_ingest(
     };
     let mut labels = HashMap::new();
     labels.insert(crate::LABEL_OUTCOME.to_string(), outcome.to_string());
-    labels.insert("node".to_string(), node.trim().to_string());
+    labels.insert(crate::LABEL_NODE.to_string(), node.trim().to_string());
     let _ = backend
         .record_counter(
             cog_core::metric_names::PROCESS_REPORT_INGEST_TOTAL,

@@ -33,6 +33,15 @@ pub mod usage_store;
 
 pub use logs::{init_subscriber, install_early_subscriber, LogFilterHandle};
 
+/// 读数按节点归属时用的标签键。
+///
+/// 这个 crate 里几个模块各自按节点发布读数（镜像、租约、宿主），全都写同一个键：
+/// 声明一次，模块里的常量引用它，编译器就替门把这几处绑在一起。
+pub const LABEL_NODE: &str = "node";
+
+/// 读数带上「为什么是这个值」时用的标签键。
+pub const LABEL_REASON: &str = "reason";
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

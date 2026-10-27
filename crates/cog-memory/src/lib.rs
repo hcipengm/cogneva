@@ -57,6 +57,9 @@ pub use schema_backend::MemorySchemaBackend;
 pub use vector_summary_backend::{
     EmbeddingRepairReport, VectorSummaryBackend, DEFAULT_SUMMARY_COLLECTION,
 };
+
+/// 读数按记忆命名空间归属时用的标签键。
+pub const LABEL_NAMESPACE: &str = "namespace";
 pub mod plugin;
 
 pub use config::{IngestConfig, MaintenanceConfig, MemoryConfig};

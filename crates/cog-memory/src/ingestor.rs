@@ -711,7 +711,10 @@ impl PullGate {
             return;
         };
         let mut labels = HashMap::new();
-        labels.insert("operation".to_string(), holder.as_operation().to_string());
+        labels.insert(
+            crate::observable::HOLDER_LABEL.to_string(),
+            holder.as_operation().to_string(),
+        );
         if let Err(e) = metrics
             .record_counter(cog_core::metric_names::MEMORY_OPERATIONS_TOTAL, 1.0, labels)
             .await
@@ -734,7 +737,10 @@ impl PullGate {
         };
         for holder in GateHolder::ALL {
             let mut labels = HashMap::new();
-            labels.insert("operation".to_string(), holder.as_operation().to_string());
+            labels.insert(
+                crate::observable::HOLDER_LABEL.to_string(),
+                holder.as_operation().to_string(),
+            );
             if let Err(e) = metrics
                 .record_counter(cog_core::metric_names::MEMORY_OPERATIONS_TOTAL, 0.0, labels)
                 .await
@@ -1484,7 +1490,7 @@ impl MemoryIngestor {
         };
         let mut labels = HashMap::new();
         labels.insert(
-            "operation".to_string(),
+            crate::observable::HOLDER_LABEL.to_string(),
             SKIP_IN_FLIGHT_OPERATION.to_string(),
         );
         if let Err(e) = metrics
@@ -1693,7 +1699,10 @@ impl MemoryIngestor {
             return;
         };
         let mut labels = HashMap::new();
-        labels.insert("operation".to_string(), operation.to_string());
+        labels.insert(
+            crate::observable::HOLDER_LABEL.to_string(),
+            operation.to_string(),
+        );
         if let Err(e) = metrics
             .record_counter(
                 cog_core::metric_names::MEMORY_OPERATIONS_TOTAL,

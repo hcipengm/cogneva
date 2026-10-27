@@ -222,21 +222,23 @@ impl Observable for HostLedgerObservable {
             out.push(
                 RawMetric::new(HOST_SLICE_ANON_BYTES_METRIC, anon)
                     .with_label("slice", slice)
-                    .with_label("node", node),
+                    .with_label(crate::LABEL_NODE, node),
             );
             out.push(
                 RawMetric::new(HOST_SLICE_FILE_BYTES_METRIC, file)
                     .with_label("slice", slice)
-                    .with_label("node", node),
+                    .with_label(crate::LABEL_NODE, node),
             );
         }
         // Published whether or not anything was readable: this is the series
         // whose presence says the node's ledger is running, and a node that is
         // silent has to be distinguishable from a node reporting zero.
-        out.push(RawMetric::new(HOST_LEDGER_NODE_INFO_METRIC, 1.0).with_label("node", node));
+        out.push(
+            RawMetric::new(HOST_LEDGER_NODE_INFO_METRIC, 1.0).with_label(crate::LABEL_NODE, node),
+        );
         out.push(
             RawMetric::new(HOST_LEDGER_SLICES_READABLE_METRIC, readable as f64)
-                .with_label("node", node),
+                .with_label(crate::LABEL_NODE, node),
         );
         Ok(out)
     }

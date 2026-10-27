@@ -628,7 +628,7 @@ impl DagExecutorRuntime {
                     let mut labels = HashMap::new();
                     labels.insert("stream".to_string(), kind.to_string());
                     labels.insert(
-                        "reason".to_string(),
+                        crate::LABEL_REASON.to_string(),
                         crate::ready_queue::BUDGET_SPENT_REASON.to_string(),
                     );
                     drop(
@@ -942,7 +942,7 @@ impl DagExecutorRuntime {
         let cell = |kind: &str| {
             let mut labels = HashMap::new();
             labels.insert("stream".to_string(), stream_kind.to_string());
-            labels.insert("kind".to_string(), kind.to_string());
+            labels.insert(crate::LABEL_KIND.to_string(), kind.to_string());
             labels
         };
         // What the measurement covered, printed even when it bounded nothing:
@@ -1025,7 +1025,7 @@ impl DagExecutorRuntime {
             // still pays for a job, and calling that `window_exhausted` sends
             // the reader to tune a budget that is not the constraint.
             labels.insert(
-                "reason".to_string(),
+                crate::LABEL_REASON.to_string(),
                 crate::ready_queue::hold_reason(
                     bound.is_some_and(|bound| bound.unavailable),
                     pass_bound,

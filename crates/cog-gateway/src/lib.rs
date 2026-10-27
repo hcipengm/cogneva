@@ -1776,6 +1776,12 @@ pub const GITEE_PLATFORM: &str = "gitee";
 /// which is what "this family never ran" looks like.
 pub const LABEL_OUTCOME: &str = "outcome";
 
+/// 读数按节点归属时用的标签键。
+pub const LABEL_NODE: &str = "node";
+
+/// 读数按「哪一步操作」归属时用的标签键。
+pub const LABEL_OPERATION: &str = "operation";
+
 /// The series name the held-out reading is published under.
 ///
 /// It is declared here rather than in the registry: the reading is rendered

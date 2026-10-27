@@ -181,7 +181,7 @@ async fn publish_account_once(
         Ok(census) => {
             for (kind, outcome, count) in census {
                 let mut labels = HashMap::new();
-                labels.insert("kind".to_string(), kind.as_str().to_string());
+                labels.insert(crate::LABEL_KIND.to_string(), kind.as_str().to_string());
                 labels.insert(
                     crate::LABEL_OUTCOME.to_string(),
                     outcome.as_str().to_string(),

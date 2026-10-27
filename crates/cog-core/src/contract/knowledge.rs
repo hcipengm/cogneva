@@ -231,7 +231,10 @@ pub async fn record_retrieval_cell(
     value: f64,
 ) {
     let mut labels = HashMap::new();
-    labels.insert("layer".to_string(), layer.to_string());
+    labels.insert(
+        crate::build_cache::LAYER_LABEL.to_string(),
+        layer.to_string(),
+    );
     labels.insert(
         crate::build_cache::OUTCOME_LABEL.to_string(),
         outcome.to_string(),

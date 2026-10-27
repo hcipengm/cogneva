@@ -30,6 +30,12 @@ pub const LABEL_OUTCOME: &str = "outcome";
 /// comparing the spellings.
 pub const LABEL_SOURCE: &str = "source";
 
+/// 读数按「哪一份」归属时用的标签键。
+pub const LABEL_PART: &str = "part";
+
+/// 读数带上「为什么是这个值」时用的标签键。
+pub const LABEL_REASON: &str = "reason";
+
 pub use actors::{ModeratorDecision, ModeratorOutput};
 pub use collaboration_executor::CollaborationExecutor;
 pub use config::{
