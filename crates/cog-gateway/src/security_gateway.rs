@@ -476,12 +476,12 @@ fn parse_upstreams(raw: &str) -> Vec<LlmUpstream> {
 /// answers `/responses`. Nothing would fail loudly — the entry would simply
 /// stop being a candidate for the face it was verified on.
 fn normalize_style(raw: &str) -> String {
-    if raw == "anthropic" {
-        "anthropic".into()
-    } else if cog_llm::responses::is_openai_family(raw) && raw != "openai" {
+    if raw == cog_llm::anthropic::API_STYLE {
+        cog_llm::anthropic::API_STYLE.into()
+    } else if cog_llm::responses::is_openai_family(raw) && raw != cog_llm::openai::API_STYLE {
         cog_llm::responses::API_STYLE.into()
     } else {
-        "openai".into()
+        cog_llm::openai::API_STYLE.into()
     }
 }
 
@@ -5123,7 +5123,7 @@ async fn anthropic_messages_passthrough(
 fn serves_face(upstream_style: &str, requested: &str) -> bool {
     if requested == cog_llm::responses::API_STYLE {
         upstream_style == cog_llm::responses::API_STYLE
-    } else if requested == "openai" {
+    } else if requested == cog_llm::openai::API_STYLE {
         cog_llm::responses::is_openai_family(upstream_style)
     } else {
         upstream_style == requested
@@ -5487,7 +5487,7 @@ async fn stream_forward(
                     // 它弄坏；Responses 形状的字段名本来就不是那一组（`input`、
                     // `max_output_tokens`、顶层工具定义），按 chat 的名字去改只会
                     // 命中它没有的字段，一个都改不到，却把"改过什么"记成空。
-                    if style == "openai" {
+                    if style == cog_llm::openai::API_STYLE {
                         let compat = cog_llm::utils::compat::detect_compat(base);
                         // 这里是**追加**不是赋值。这一格要留的是"本趟一共改过
                         // 哪些字段"，适配器返回的只是其中的一半——上面那条角色
@@ -5511,7 +5511,7 @@ async fn stream_forward(
                     // 优先、补问的顶上），只有两条路都没有结论时才用厂商画像
                     // 兜底——而那一格是全系统里唯一会**改掉调用方自己挑的数**
                     // 的兜底，所以它值得一条回去问的路。
-                    if style != "anthropic" {
+                    if style != cog_llm::anthropic::API_STYLE {
                         let requires_one = state
                             .llm_health
                             .effective_temperature_verdict(upstream)
@@ -5531,8 +5531,9 @@ async fn stream_forward(
                     // 非流式响应本身就带 usage，用不着要；anthropic 的流自带用量帧；
                     // Responses 的用量在 `response.completed` 事件里，没有要的开关。
                     let streaming = obj.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-                    asked_for_usage =
-                        style != "openai" || !streaming || obj.contains_key("stream_options");
+                    asked_for_usage = style != cog_llm::openai::API_STYLE
+                        || !streaming
+                        || obj.contains_key("stream_options");
                 }
                 serde_json::to_vec(&v).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
             }
@@ -5577,7 +5578,7 @@ async fn stream_forward(
         // 走的就是它被测出能接的那一面。按准入面发，跨面时会发错那一套头，
         // 而发错头换回来的 401 会被读成"这家坏了"。
         let builder = match style {
-            "anthropic" => builder
+            cog_llm::anthropic::API_STYLE => builder
                 .header("x-api-key", &upstream.api_key)
                 .header("anthropic-version", "2023-06-01"),
             _ => builder.bearer_auth(&upstream.api_key),
@@ -6032,7 +6033,7 @@ async fn probe_suspect_upstreams(state: &AppState) {
 /// 可用。地址只写一遍是这条约束唯一守得住的形式。
 fn face_url(style: &str, base_url: &str) -> String {
     match style {
-        "anthropic" => cog_llm::anthropic::messages_url(base_url),
+        cog_llm::anthropic::API_STYLE => cog_llm::anthropic::messages_url(base_url),
         cog_llm::responses::API_STYLE => cog_llm::responses::responses_url(base_url),
         _ => cog_llm::openai::chat_completions_url(base_url),
     }
@@ -6077,7 +6078,7 @@ async fn probe_face(
         .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
         .json(&payload);
     let builder = match face {
-        "anthropic" => builder
+        cog_llm::anthropic::API_STYLE => builder
             .header("x-api-key", &upstream.api_key)
             .header("anthropic-version", "2023-06-01"),
         _ => builder.bearer_auth(&upstream.api_key),
@@ -6106,7 +6107,11 @@ async fn probe_face(
 }
 
 /// 三个请求面。
-const REQUEST_FACES: [&str; 3] = ["openai", "anthropic", cog_llm::responses::API_STYLE];
+const REQUEST_FACES: [&str; 3] = [
+    cog_llm::openai::API_STYLE,
+    cog_llm::anthropic::API_STYLE,
+    cog_llm::responses::API_STYLE,
+];
 
 /// 一次面探测的答复怎么读。
 ///
@@ -6276,7 +6281,7 @@ async fn call_one_upstream(
 ) -> Result<Json<LlmResponse>, UpstreamRefusal> {
     let start = std::time::Instant::now();
     let base = upstream.base_url.trim_end_matches('/');
-    if upstream.api_style == "anthropic" {
+    if upstream.api_style == cog_llm::anthropic::API_STYLE {
         let (system, msgs): (String, Vec<&ChatMessage>) = {
             let sys = messages
                 .iter()

@@ -11,6 +11,12 @@ use crate::{
     model::Model, AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, Usage,
 };
 
+/// The `api_style` word for the Anthropic messages face.
+///
+/// Same routing key as [`crate::openai::API_STYLE`]: compared as a word, never
+/// parsed from the shape of a response.
+pub const API_STYLE: &str = "anthropic";
+
 /// The messages endpoint a base URL names.
 ///
 /// The version segment belongs to the base URL, because this is the only path

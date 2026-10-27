@@ -340,9 +340,9 @@ async fn resolve_upstream(
     let api_style = if skip_verify {
         unverified = Some("已按 skip_verify 跳过连通验证".to_string());
         match style_hint {
-            Some("anthropic") => "anthropic",
+            Some(cog_llm::anthropic::API_STYLE) => cog_llm::anthropic::API_STYLE,
             Some(cog_llm::responses::API_STYLE) => cog_llm::responses::API_STYLE,
-            _ => "openai",
+            _ => cog_llm::openai::API_STYLE,
         }
     } else {
         match detect_api_style(base_url, model, api_key, style_hint).await {
@@ -685,7 +685,7 @@ enum ApiStyleProbe {
 /// 404'd in production.
 fn protocol_probe_url(style: &str, base_url: &str) -> String {
     match style {
-        "openai" => cog_llm::openai::chat_completions_url(base_url),
+        cog_llm::openai::API_STYLE => cog_llm::openai::chat_completions_url(base_url),
         cog_llm::responses::API_STYLE => cog_llm::responses::responses_url(base_url),
         _ => cog_llm::anthropic::messages_url(base_url),
     }
@@ -705,7 +705,7 @@ async fn detect_api_style(
         Err(e) => return ApiStyleProbe::Invalid(format!("HTTP 客户端构建失败: {e}")),
     };
     let base = base_url.trim_end_matches('/');
-    let first_anthropic = style_hint == Some("anthropic");
+    let first_anthropic = style_hint == Some(cog_llm::anthropic::API_STYLE);
 
     let mut refused: Option<(&'static str, String)> = None;
     // 在 Responses 面上被明确拒服的那一次。它不能进 `refused`：那个面是**偏好**
@@ -719,9 +719,17 @@ async fn detect_api_style(
     // 上游的两个端点**，先问新的那个不会让旧的消失（池条目按族匹配请求面），而
     // 反过来先问 chat 面会把这个能力整个问不出来。
     let order: [&'static str; 3] = if first_anthropic {
-        ["anthropic", cog_llm::responses::API_STYLE, "openai"]
+        [
+            cog_llm::anthropic::API_STYLE,
+            cog_llm::responses::API_STYLE,
+            cog_llm::openai::API_STYLE,
+        ]
     } else {
-        [cog_llm::responses::API_STYLE, "openai", "anthropic"]
+        [
+            cog_llm::responses::API_STYLE,
+            cog_llm::openai::API_STYLE,
+            cog_llm::anthropic::API_STYLE,
+        ]
     };
 
     for style in order {
@@ -738,7 +746,7 @@ async fn detect_api_style(
                     .send()
                     .await
             }
-            "openai" => {
+            cog_llm::openai::API_STYLE => {
                 client
                     .post(protocol_probe_url(style, base))
                     .bearer_auth(api_key)

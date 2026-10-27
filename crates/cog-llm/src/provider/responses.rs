@@ -38,7 +38,7 @@ pub const API_STYLE: &str = "openai-responses";
 /// having stopped serving the older one, and a pool entry is listed under the
 /// face it was *verified* on, not the only face it can serve.
 pub fn is_openai_family(style: &str) -> bool {
-    style == "openai" || style == API_STYLE
+    style == crate::openai::API_STYLE || style == API_STYLE
 }
 
 /// The endpoint a base URL names on this face.
@@ -939,6 +939,34 @@ mod tests {
     use super::*;
     use crate::model::{ApiType, ModelCost, Provider};
     use std::collections::HashMap;
+
+    /// 三个面各一个词，谁也不许和谁重合，族判定只圈 OpenAI 那一族的两个。
+    ///
+    /// 这些词是路由键：后端配置、池条目、进来的请求各按词说「我要哪一面」，
+    /// 分派处按词比较。两个面共用一个词，它们就静默合成一条分支；族判定漏掉
+    /// 一个成员，那一面就再没有条目能匹配上——两边都不报错，只是请求落到了
+    /// 另一面或者干脆落空。
+    #[test]
+    fn the_face_words_are_three_distinct_words() {
+        let faces = [
+            crate::openai::API_STYLE,
+            crate::anthropic::API_STYLE,
+            API_STYLE,
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for face in faces {
+            assert!(!face.is_empty(), "面名不能是空词");
+            assert!(seen.insert(face), "两个面共用同一个词 {face:?}");
+        }
+        for face in [crate::openai::API_STYLE, API_STYLE] {
+            assert!(is_openai_family(face), "{face:?} 属于 OpenAI 族");
+        }
+        assert!(
+            !is_openai_family(crate::anthropic::API_STYLE),
+            "Anthropic 面不属于 OpenAI 族，否则同一个词会同时路由到两面"
+        );
+        assert!(!is_openai_family("no-such-face"));
+    }
 
     fn test_model() -> Model {
         Model {

@@ -63,7 +63,7 @@ pub struct LLMBackendConfig {
 }
 
 fn default_api_style() -> String {
-    "openai".into()
+    crate::openai::API_STYLE.into()
 }
 
 impl std::fmt::Debug for LLMBackendConfig {

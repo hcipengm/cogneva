@@ -171,7 +171,7 @@ pub fn build_single_provider(
     http_client: Option<Arc<dyn cog_core::HttpClient>>,
 ) -> Arc<dyn cog_core::LlmClient> {
     let mut model = match backend.api_style.as_str() {
-        "anthropic" => default_model_for(crate::Provider::Anthropic),
+        crate::anthropic::API_STYLE => default_model_for(crate::Provider::Anthropic),
         "google" => default_model_for(crate::Provider::Google),
         "ollama" => default_model_for(crate::Provider::Ollama),
         _ => default_model_for(crate::Provider::OpenAI),
@@ -190,7 +190,7 @@ pub fn build_single_provider(
     }
 
     let provider: Arc<dyn cog_core::LlmClient> = match backend.api_style.as_str() {
-        "anthropic" => {
+        crate::anthropic::API_STYLE => {
             let mut p = crate::anthropic::AnthropicProvider::new(model, &backend.api_key)
                 .with_stream_capacity(stream_capacity)
                 .with_default_max_tokens(anthropic_default_max_tokens);

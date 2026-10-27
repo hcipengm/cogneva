@@ -17,6 +17,15 @@ use crate::{
     AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, Usage,
 };
 
+/// The `api_style` word for the chat-completions face.
+///
+/// It is a routing key, not a label: a backend config, a pool entry and an
+/// inbound request all name a face, and the dispatcher picks the provider by
+/// comparing words. Spelled out at each of those sites, one renamed copy turns
+/// the default style into a face nothing recognizes — the entry falls through
+/// to whichever branch is the catch-all, and nothing reports a mismatch.
+pub const API_STYLE: &str = "openai";
+
 /// The chat endpoint a base URL names.
 ///
 /// Same rule as the Anthropic side: the platform appends exactly one path
