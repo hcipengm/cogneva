@@ -387,6 +387,7 @@ crates/cog-reflection/src/auto_promoter.rs	LEDGER_LOOKBACK	50	bound	幂等守卫
 crates/cog-reflection/src/baseline_port.rs	GIT_COMMAND_TIMEOUT	120s	bound	一条 git 命令（取基线、摘文件）的墙：120s。
 crates/cog-reflection/src/baseline_port.rs	MIN_POLL_INTERVAL_SECS	60	bound	floor under the configured poll interval; the loop never polls faster than this
 crates/cog-reflection/src/build_gate/arming.rs	WAIT_RELEASE_MARGIN_SECS	600	bound	margin over the longest legal build or test hold, so a legal wait is never refused
+crates/cog-reflection/src/build_gate/mod.rs	CEILING_DEAD_BAND	0.15	bound	a fall has to clear this much of one unit of the bound before it is applied, so a factor that merely straddles an integer boundary leaves the number the host enforces alone; rises are never damped, so a host that really has room still grows on the first window
 crates/cog-reflection/src/build_gate/mod.rs	EVENT_RING_CAPACITY	256	bound	ring depth for a consumer ticking every few minutes; drops are counted, not lost
 crates/cog-reflection/src/build_gate/mod.rs	GATE_DIR_MODE	0o1777	bound	Modes that make the gate directory usable by every builder on the host.
 crates/cog-reflection/src/build_gate/mod.rs	GATE_FILE_MODE	0o666	bound	Mode a gate file is created with. World-writable on purpose: every user that builds on this host has to be able to record a verdict, and the mode is about who may write, not about who may read.
