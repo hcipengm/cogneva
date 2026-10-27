@@ -1188,6 +1188,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "同一生产者（这一拍从 `kube_pod_container_resource_limits` 读回来的声明上限）。它跟着读数一起走而不是由规则侧另配一份：分母与分子必须来自同一次回放、同一个容器，否则滚动重叠那几分钟会把比值读错一半（同命名空间里进化 Pod 的容器同名、上限 16Gi，选择器不钉死就会取到它）",
     ),
     (
+        "cogneva_code_debt_rows",
+        "宿主读数 `scripts/host/cogneva-code-debt-reading.sh`（不在本仓，登记行 `code_debt`）：代码欠账登记表与它所判的那棵树之间，此刻有几行对不上。它在公开仓里只能是外来序列，因为**生产者与判决住在这个仓看不见的另一棵树**——`check-code-debt.py` 判的是本仓的源码布局，而它由私有仓的提交门驱动；规则读这一条，是为了让「登记表与树分家」在下一拍就被说出来，而不是等下一个在这边提交的人撞上那道门（此前三天里让三个不相干的人代付过）",
+    ),
+    (
         "a2a_conformance_drift_cells",
         "宿主读数 `scripts/host/cogneva-a2a-conformance-reading.sh`（不在本仓，登记行 `a2a_conformance`）：这一拍里答得不是协议说的那样的格数，每拍真打十五个请求量出来。它与 `a2a_conformance_cells` 一起印，是因为没有分母的 0 证不了「比过」——生产者读不到时两条一起缺席，那种「没量」由宿主读数的生产者契约报，不在这里另立一条规则",
     ),
