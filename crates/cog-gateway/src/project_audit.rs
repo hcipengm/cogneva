@@ -164,9 +164,13 @@ mod tests {
     /// 一个测试刚装上夹具，另一个把它换成 `None`，断言于是看到别人的数。
     /// 串起来是唯一诚实的做法——按文件名分片跑（`--test-threads=1`）也能绿，
     /// 但那样是把正确性挂在别人怎么调 cargo 上。
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    ///
+    /// 用 tokio 的互斥量而不是 std 的：守卫要在测试体里跨过 `record(…).await`，
+    /// std 的守卫跨 await 点持有既会被 clippy 拦（`await_holding_lock`），也会在
+    /// 单线程运行时上把同线程的其它任务卡死。
+    async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
     }
 
     fn entry() -> AuditEntry {
@@ -184,7 +188,7 @@ mod tests {
     /// 接上了就真的写进去，改前改后都在。
     #[tokio::test]
     async fn a_wired_sink_receives_the_row() {
-        let _serial = serial();
+        let _serial = serial().await;
         let recorder = Arc::new(Recorder::default());
         install_for_test(Some(recorder.clone()));
         let before = counters().writes.load(Ordering::Relaxed);
@@ -200,7 +204,7 @@ mod tests {
     /// 没接上不许当成「写过了」：它进 unwired 计数，读者才分得开「没审计」与「没改动」。
     #[tokio::test]
     async fn an_unwired_process_counts_itself_as_unwired() {
-        let _serial = serial();
+        let _serial = serial().await;
         install_for_test(None);
         let before = counters().unwired.load(Ordering::Relaxed);
         record(entry()).await;
@@ -212,7 +216,7 @@ mod tests {
     /// 落库失败被数出来，且不吞掉——写操作已经发生，这一行丢了必须有人看得见。
     #[tokio::test]
     async fn a_failing_sink_is_counted_and_the_write_still_returns() {
-        let _serial = serial();
+        let _serial = serial().await;
         let recorder = Arc::new(Recorder {
             fail: true,
             ..Default::default()
@@ -230,7 +234,7 @@ mod tests {
     /// 既看不到库，也没有办法反驳这句话。
     #[tokio::test]
     async fn a_read_that_failed_is_not_the_same_answer_as_no_store() {
-        let _serial = serial();
+        let _serial = serial().await;
         // 没接存储
         install_for_test(None);
         assert!(

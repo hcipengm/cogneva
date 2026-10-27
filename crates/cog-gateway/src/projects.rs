@@ -2179,7 +2179,7 @@ mod tests {
     fn board_columns_report_no_limit_as_absent_rather_than_as_no_overflow() {
         let t = task("a", Some("g1"));
         let (limits, _) = cog_core::BoardWipLimits::from_spec("");
-        let columns = build_board_columns(&[&t], &[t.clone()], &limits);
+        let columns = build_board_columns(&[&t], std::slice::from_ref(&t), &limits);
         assert!(columns.iter().all(|c| c.wip_limit.is_none()));
         assert!(columns.iter().all(|c| c.over_limit.is_none()));
     }
@@ -2265,7 +2265,7 @@ mod tests {
     fn board_columns_are_all_six_statuses_in_a_fixed_order() {
         let t = task("a", Some("g1"));
         let (limits, _) = cog_core::BoardWipLimits::from_spec("");
-        let columns = build_board_columns(&[&t], &[t.clone()], &limits);
+        let columns = build_board_columns(&[&t], std::slice::from_ref(&t), &limits);
         let order: Vec<&str> = columns.iter().map(|c| c.status.as_str()).collect();
         let expected: Vec<&str> = cog_core::TaskStatus::ALL
             .iter()
@@ -2868,7 +2868,7 @@ mod tests {
         assert_eq!(wbs.cycles.len(), 2, "环里的两片都要被点出来，不是丢掉一片");
         assert_eq!(wbs.total, 3);
         let in_buckets = wbs.roots.len() + wbs.orphan_parents.len() + wbs.cycles.len();
-        assert_eq!(in_buckets, 0 + 1 + 2);
+        assert_eq!(in_buckets, 1 + 2);
     }
 
     /// 自己指着自己是环里最短的一种，不能当成「没有父节点」。
