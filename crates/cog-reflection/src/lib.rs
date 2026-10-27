@@ -86,6 +86,7 @@ pub mod promoter;
 pub(crate) mod promotion_eval;
 pub mod promotion_gate;
 pub mod promotion_switch;
+pub(crate) mod promotion_tag;
 pub mod promotion_trend;
 pub mod recorder;
 pub(crate) mod registry_endpoint;
@@ -241,17 +242,7 @@ fn refusal_subject(cause: cog_core::RejectionCause, files: &[std::path::PathBuf]
 /// treats a re-submission of a held id as an idempotent no-op — so a trigger that
 /// fires twice cannot put two attempts on one defect.
 fn rework_task_id(l: &cog_core::Learning, refused_by_a_gate: bool) -> String {
-    let sanitize = |s: &str| -> String {
-        s.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect()
-    };
+    let sanitize = crate::promotion_tag::tag_safe;
     let subject = if refused_by_a_gate {
         l.related_tasks
             .first()

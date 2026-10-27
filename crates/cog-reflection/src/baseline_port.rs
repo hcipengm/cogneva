@@ -411,11 +411,12 @@ impl BaselinePorter {
     pub async fn list_promoted(&self) -> SFResult<Vec<PromotedChange>> {
         // 单行输出：`<tag> <tag-object> <peeled-commit>`。annotated tag 的
         // 解引用 commit 在 %(*objectname)；轻量 tag 该字段为空，回退 objectname。
+        let ref_prefix = format!("refs/tags/{}", crate::promotion_tag::PROMOTE_GIT_TAG_PREFIX);
         let out = self
             .git(&[
                 "for-each-ref",
                 "--format=%(refname:short) %(objectname) %(*objectname)",
-                "refs/tags/promote/",
+                &ref_prefix,
             ])
             .await?;
         let mut changes = Vec::new();
@@ -437,8 +438,10 @@ impl BaselinePorter {
                 .git(&["tag", "-l", "--format=%(contents)", &tag])
                 .await?;
             let (change_id, level, eval_summary) = parse_tag_message(&message);
-            let change_id =
-                change_id.unwrap_or_else(|| tag.trim_start_matches("promote/").to_string());
+            let change_id = change_id.unwrap_or_else(|| {
+                tag.trim_start_matches(crate::promotion_tag::PROMOTE_GIT_TAG_PREFIX)
+                    .to_string()
+            });
             changes.push(PromotedChange {
                 change_id,
                 tag,
@@ -1716,7 +1719,13 @@ mod tests {
         let msg = format!("change_id={change_id}\nlevel=l1_rollout\neval=Adopt z=2.3");
         git(
             dir,
-            &["tag", "-a", "-m", &msg, &format!("promote/{change_id}")],
+            &[
+                "tag",
+                "-a",
+                "-m",
+                &msg,
+                &crate::promotion_tag::promote_git_tag(change_id),
+            ],
         )
         .await;
     }

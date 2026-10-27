@@ -275,7 +275,10 @@ impl GitOpsPuller {
         let tags = self
             .run("git", &["tag", "--points-at", &head], Some(&dir), 30)
             .await?;
-        let Some(tag) = tags.lines().find(|t| t.starts_with("promote/")) else {
+        let Some(tag) = tags
+            .lines()
+            .find(|t| t.starts_with(crate::promotion_tag::PROMOTE_GIT_TAG_PREFIX))
+        else {
             return Ok(None);
         };
         let message = self
@@ -1101,7 +1104,9 @@ impl GitOpsPuller {
     /// localhost 默认 http 免 TLS；每个节点的 NodePort 都通，多节点天然
     /// 分发），镜像由推送端 buildah push 就位，pull 秒级。
     async fn obtain_image(&self, candidate: &PromotionCandidate) -> SFResult<String> {
-        let tag = format!("cogneva:promote-{}", sanitize(&candidate.change_id));
+        // 推送端用同一个函数给镜像命名；这里自己拼一遍，改名那一天拉取的就是
+        // 一个没人推过的名字，而读数是「这个 change 还没有镜像」。
+        let tag = crate::promotion_tag::promote_image_tag(&candidate.change_id);
         // 集群内形态只回声明值：NodePort 由部署面给出（`clusterRegistry.nodePort`），
         // 代码里没有默认值可退——猜一个端口拉到的是一条永远不 Ready 的引用。
         let endpoint = match &self.config.registry {
@@ -1551,19 +1556,6 @@ impl GitOpsPuller {
         self.ledger.record(rec).await?;
         Ok(id)
     }
-}
-
-fn sanitize(change_id: &str) -> String {
-    change_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
 }
 
 /// This loop's name in the liveness census.

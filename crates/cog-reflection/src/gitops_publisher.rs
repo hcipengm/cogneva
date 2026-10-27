@@ -27,21 +27,9 @@ use tracing::{info, warn};
 use crate::auto_promoter::{PromotionChannel, PromotionSource};
 use crate::live_revision::{self, CommandRunner};
 use crate::types::EvolutionResult;
-
-/// change_id 只保留 [A-Za-z0-9-_]，其余替换为 '-'（git ref / 镜像 tag
-/// 合法字符白名单，防注入）。
-fn sanitize(change_id: &str) -> String {
-    change_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
+// 晋级 tag 与镜像 tag 的拼法各写一处：拉取端是按同一个拼法回头去找镜像的，
+// 第二份拼法就是一份永远找不到的名字。
+use crate::promotion_tag::{promote_git_tag, promote_image_tag};
 
 pub struct GitOpsPublisher {
     config: GitOpsConfig,
@@ -133,7 +121,7 @@ impl GitOpsPublisher {
                 self.git(&["rev-parse", "HEAD"]).await?,
             ),
         };
-        let tag = format!("promote/{}", sanitize(&change.artifact_id));
+        let tag = promote_git_tag(&change.artifact_id);
         // 判词写两处：`eval=` 是给人看的散文（旧读端逐字仍认它），
         // `eval_verdict=` 是跨版本稳定的判词 token（新读端优先读它）。
         let eval_prose = change
@@ -226,7 +214,7 @@ impl GitOpsPublisher {
                 true,
             ),
         };
-        let tag = format!("cogneva:promote-{}", sanitize(change_id));
+        let tag = promote_image_tag(change_id);
         let image = format!("{endpoint}/{tag}");
         let base = self.resolve_base_image(&endpoint).await;
         let containerfile = self.binary_dir.join("Containerfile.promote");
