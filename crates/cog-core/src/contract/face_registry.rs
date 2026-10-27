@@ -70,6 +70,11 @@ pub enum FaceKind {
 }
 
 impl FaceKind {
+    /// Every kind this vocabulary has. [`Self::parse`] and the panel's union
+    /// both read it rather than repeating the words in a second match, which
+    /// is how a kind the reader cannot name gets written in the first place.
+    pub const ALL: [FaceKind; 2] = [FaceKind::Face, FaceKind::Cross];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Face => "face",
@@ -78,11 +83,7 @@ impl FaceKind {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "face" => Some(Self::Face),
-            "cross" => Some(Self::Cross),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|kind| kind.as_str() == value)
     }
 }
 

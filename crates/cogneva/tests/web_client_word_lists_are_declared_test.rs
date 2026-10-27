@@ -502,6 +502,45 @@ fn the_owner_sources_the_panel_names_are_the_ones_the_registry_declares() {
     );
 }
 
+/// 面与横切线是分开数的两类：普查把「十三个面 + 五条线」报成两组数，混成一个
+/// 总数会让「丢了一个面、多了一条线」照样对得上。
+///
+/// 面板原来把 `kind` 写成 `'face' | 'cross' | string`：联合类型只是注释，多出来
+/// 的一类照样通过类型检查，落进「类型」那一列的原文里，与两类之一长得一样。
+#[test]
+fn the_face_kinds_the_panel_shows_are_the_ones_the_registry_declares() {
+    use cog_core::contract::face_registry::FaceKind;
+
+    let path = repo_root().join("web/src/api/client.ts");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let body_start = source
+        .find("export interface GovernanceFaceSpec {")
+        .expect("the face spec type is gone; this gate reads its kind through it");
+    let body = &source[body_start..];
+    let body_end = body.find("\n}").expect("the interface body is not closed");
+    let mut panel = union_words(&body[..body_end], "  kind:");
+    panel.sort();
+    assert!(
+        panel.len() >= 2,
+        "种类联合类型读出来是 {panel:?}；这么短说明解析变了，不是树变干净了"
+    );
+
+    let mut declared: Vec<String> = FaceKind::ALL
+        .iter()
+        .map(|kind| kind.as_str().to_string())
+        .collect();
+    declared.sort();
+    assert_eq!(panel, declared, "面板与注册表必须认识同一组面的种类");
+
+    // 每一种都要能原样读回来：`parse` 里少一支，那一类面就整行读不进来。
+    for kind in FaceKind::ALL {
+        assert_eq!(FaceKind::parse(kind.as_str()), Some(kind));
+    }
+    assert_eq!(FaceKind::parse("cross_cutting"), None);
+}
+
 /// 对照：本门的判据认得出一个不是词的东西。少了这条，`TaskFilter::parse` 哪天
 /// 退化成「什么词都收」，上面那条仍然全绿。
 #[test]

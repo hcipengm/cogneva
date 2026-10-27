@@ -890,7 +890,8 @@ export async function sendAgentPrompt(
 
 export interface GovernanceFaceSpec {
   display_name: string;
-  kind: 'face' | 'cross' | string;
+  /** 面还是横切线。闭集：普查把这两类分开数，混成一个总数会掩盖「丢了一个面、多了一条线」。 */
+  kind: 'face' | 'cross';
   deputy_unit: string | null;
   witness_unit: string | null;
   time_share: string | null;
