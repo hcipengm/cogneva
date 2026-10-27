@@ -166,6 +166,8 @@ crates/cog-gateway/src/agents.rs	CONVERSATION_DEFAULT_LIMIT	100	bound	one defaul
 crates/cog-gateway/src/agents.rs	MAX_WAIT_SECS	120	bound	longest a request may hold a connection waiting for an agent's answer, set below the idle bound of the proxies in front
 crates/cog-gateway/src/auth/mod.rs	LOGIN_MAX_ATTEMPTS	5	bound	failed attempts per identifier inside the window before the endpoint answers 429
 crates/cog-gateway/src/auth/mod.rs	LOGIN_WINDOW_SECONDS	300	bound	the sliding window the failed-attempt count is kept in, so an attacker's budget is per five minutes
+crates/cog-gateway/src/backup_admin.rs	DOWNLOAD_CHUNK_BYTES	64 * 1024	bound	下载时一次读多少字节。它乘上并发下载数就是这一面可能吃掉的峰值内存，所以定成声明而不是留在读循环里的字面量。
+crates/cog-gateway/src/backup_admin.rs	MIN_PASSPHRASE_CHARS	12	bound	导出包口令的最短长度。这不是安全强度而是「别让 `123456` 变成一份密文包的钥匙」——包里是整库数据，会被复制、被带走。
 crates/cog-gateway/src/chat.rs	CLASSIFY_TIMEOUT_SECS	20	bound	intent classification is a one-word answer; past this the backend is struggling and the plain chat path takes over
 crates/cog-gateway/src/chat.rs	CONNECT_TIMEOUT_SECS	30	bound	connecting is fast or the backend is the problem, and the failover pool is what handles a slow one
 crates/cog-gateway/src/chat.rs	SESSION_HISTORY_CAP	40	bound	how many turns fit in one request, not how many are stored — the record is trimmed by its own bound in the store
@@ -227,6 +229,13 @@ crates/cog-gateway/src/process_reports.rs	FRESH_FOR	120s	derived	two report inte
 crates/cog-gateway/src/process_reports.rs	MAX_COMMAND_CHARS	64	bound	process names are short; the long string is the command line, which this face does not read
 crates/cog-gateway/src/process_reports.rs	MAX_REPORTS	64	bound	a report is a shape, not a stream: beyond this the list is not something a reader reads, and the receiver caps so a caller cannot grow the store by reporting
 crates/cog-gateway/src/project_control.rs	CADENCE	600s	bound	一轮之间隔多久。
+crates/cog-gateway/src/project_rate_limit.rs	BUCKET_SWEEP_AT	4096	bound	调用方 id 的桶到这个数就先扫一遍过期的。桶是每个调用方一格，不扫就是一处随调用方数量无界增长的内存；扫早了只是白扫，扫晚了峰值内存跟着人数长。
+crates/cog-gateway/src/project_rate_limit.rs	DEFAULT_PER_MIN	600	bound	每调用方每分钟的读预算，可由 `COGNEVA_PROJECT_READ_PER_MIN` 覆盖。一个正常刷新的看板每分钟十几次，600 是它的几十倍——够任何真人用，也够挡住一个卡在刷新循环里的页面；它不是从机器测量导出的，是从「一个人一分钟会看几次」定出来的界。
+crates/cog-gateway/src/projects.rs	BOARD_CARDS_PER_COLUMN	100	bound	看板一列最多画多少张卡。列里永远带全量计数与 `cards_hidden`，所以这个上限只截清单、不截读数；取 100 是因为一屏能翻完的卡片数在这个量级，再多也只是把滚动条拉长。
+crates/cog-gateway/src/projects.rs	MAX_TITLE_CHARS	200	bound	项目名/任务标题的字符上限。它不是排版数字而是输入校验的界：没有上限时一条把整个文档贴进标题的请求会进到每一个读面（看板、甘特、导出）的每一行里。
+crates/cog-gateway/src/projects.rs	PROJECTS_PAGE_DEFAULT	200	bound	不传 `limit` 时一页返回多少个项目。与 `PROJECTS_PAGE_MAX` 成对：默认值小到一屏能读完，大请求才要显式说要。
+crates/cog-gateway/src/projects.rs	PROJECTS_PAGE_MAX	1000	bound	一页的上限。存在的理由是拒绝比静默截断更便宜：读全量要带游标一页页走，而不是把 `limit` 调成一百万让这一次请求把整张图读进内存。
+crates/cog-gateway/src/projects.rs	WBS_DEPTH_CAP	256	bound	范围树的展开深度上限，防的是 `parent_task_id` 上的环把树折成无穷。正常范围树的深度是个位数量级，256 只是「这里一定有环」的那道墙。
 crates/cog-gateway/src/readings.rs	QUERY_TIMEOUT_SECS	5	bound	a reading that cannot answer in five seconds is already the answer; a failed query reads as no reading and never as zero
 crates/cog-gateway/src/scm.rs	GIT_TIMEOUT	20s	bound	one git action on a small local repository; slower than a poll cycle means it is wedged
 crates/cog-gateway/src/scm.rs	LOG_DEFAULT	20	bound	日志默认与最多回多少条。
@@ -529,6 +538,8 @@ crates/cogneva/src/eval_toolathlon_local.rs	PAGE_SIZE	10_000	bound	one page of s
 crates/cogneva/src/eval_toolathlon_local.rs	PYTHON_TIMEOUT_CEILING	120	bound	the upstream python tool's own hard ceiling on a requested timeout
 crates/cogneva/src/health_check.rs	PROBE_TIMEOUT	3s	bound	read/write timeout on a loopback readiness probe; waiting longer only delays the verdict
 crates/cogneva/src/health_check.rs	STATUS_LINE_LIMIT	512	bound	a status line longer than this is not a status line; stop reading
+crates/cogneva/src/process_census.rs	INTERVAL	60s	bound	容器进程普查的一拍。与容器自报同一个节奏：两边报同一份读数，节奏不该有两套。
+crates/cogneva/src/process_census.rs	MAX_DEPTH	8	bound	cgroup 树往下最多走几层。宿主布局是四层，留一倍余量；再深就不是我们认识的布局，而不是「树很深」。
 crates/cogneva/src/process_report.rs	MAX_PROCESSES	64	bound	the same bound the gateway's MAX_REPORTS enforces, so the reporter never sends what the receiver truncates
 crates/cogneva/src/process_report.rs	REPORT_INTERVAL	60s	bound	a cadence, not a measurement: short enough that a stopped process is gone from the next table, long enough that an idle container does not republish the same table every second
 crates/cogneva/src/scraper_endpoint.rs	DEFAULT_PORT	9100	bound	Port served when the deployment names none.

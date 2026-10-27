@@ -36,6 +36,34 @@ pub trait OrchestratorControl: Send + Sync {
     /// Add a single task to the existing graph.
     async fn add_task(&self, task: Task) -> SFResult<()>;
 
+    /// 用一条改过的行替换图里已有的那一条。
+    ///
+    /// 范围结构（父节点）、验收标准、归属都是行的字段，改它们不是状态迁移，
+    /// 走不了 [`Self::schedule_task`] 那一族。删了重加也不行：删会把依赖边
+    /// 一起剪掉，重加拿不到原来那条的边与状态。
+    ///
+    /// 默认实现拒绝：没有一份可以就地改的图时，说出来比静默丢掉改动安全。
+    async fn replace_task(&self, _task: Task) -> SFResult<()> {
+        Err(SFError::NotImplemented(
+            "replace_task: this orchestrator has no writable graph, so an existing task \
+             cannot be changed in place"
+                .into(),
+        ))
+    }
+
+    /// 写一条计划基线。
+    ///
+    /// 与 [`Self::task_plans`] 成对：读面回答「当初打算怎么做」，这一条把打算
+    /// 写进去。没有写面时基线只能由分解侧自己产出，人改不动计划——甘特图就成了
+    /// 一张事后记录，而不是一张可以拿来对齐的工具。
+    async fn save_task_plan(&self, _plan: &TaskPlan) -> SFResult<()> {
+        Err(SFError::NotImplemented(
+            "save_task_plan: this orchestrator holds no plan store, so a baseline cannot \
+             be written here"
+                .into(),
+        ))
+    }
+
     /// Returns true if any task in the set is still retryable.
     async fn crew_can_retry(&self, task_ids: &[String]) -> bool;
 
@@ -150,6 +178,20 @@ pub trait DagExecutor: Send + Sync {
 
     /// Add a single task. Fails if the task already exists or introduces a cycle.
     async fn add_task(&self, task: Task) -> SFResult<()>;
+
+    /// Replace a task already in the graph with a changed copy of it.
+    ///
+    /// Separate from the state transitions below because it changes what the
+    /// row *is* (its place in the scope tree, its acceptance criteria) rather
+    /// than where it is in the run. The default refuses: an implementation
+    /// whose graph is a read-only projection has nowhere to put the change,
+    /// and dropping it silently would report success for a write that did not
+    /// happen.
+    async fn replace_task(&self, _task: Task) -> SFResult<()> {
+        Err(SFError::NotImplemented(
+            "replace_task: this DAG implementation has no writable graph".into(),
+        ))
+    }
 
     // ─── State transitions ───────────────────────────────────────────────
 

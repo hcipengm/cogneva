@@ -86,6 +86,23 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.add_task(task).await
     }
 
+    async fn replace_task(&self, task: Task) -> SFResult<()> {
+        self.dag_executor.replace_task(task).await
+    }
+
+    /// 写一条基线。与 [`Self::task_plans`] 共用同一个后端与 workspace：读回
+    /// 来的必须就是刚写进去的那一条，两边各算一份就会对不上。
+    async fn save_task_plan(&self, plan: &cog_core::TaskPlan) -> SFResult<()> {
+        match self.state_backend.as_ref() {
+            Some(backend) => backend.save_task_plan(plan).await,
+            None => Err(SFError::NotImplemented(
+                "save_task_plan: this orchestrator holds no plan store, so a baseline \
+                 written here would be readable by nobody"
+                    .into(),
+            )),
+        }
+    }
+
     async fn crew_can_retry(&self, task_ids: &[String]) -> bool {
         self.dag_executor.crew_can_retry(task_ids).await
     }

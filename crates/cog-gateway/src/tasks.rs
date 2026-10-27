@@ -466,10 +466,17 @@ async fn ready_ids(
 /// Whether a reader holding `claims` may see `task`.
 ///
 /// An empty scope is the same convention the submission side already uses (a
-/// token that declares no workspaces is not restricted by them), and a task
-/// with no workspace is one submitted before the field was recorded -- hiding
-/// those would make them disappear from every scoped reader without making
-/// them safer, since no workspace owns them.
+/// token that declares no workspaces is not restricted by them), so unscoped
+/// platform operators still see the whole graph.
+///
+/// A task that names no workspace is **not** visible to a scoped reader. That
+/// is the opposite of what this used to do, and the reversal is the point: a
+/// row with no owner cannot be shown to one tenant without showing it to every
+/// tenant, so "nobody owns it" has to read as "only unowned callers see it".
+/// The rows written before the field existed do not disappear from the
+/// platform -- the unscoped readers still fold them in -- but they stop
+/// appearing inside a tenant's view, where nothing could tell them apart from
+/// that tenant's own work.
 pub(crate) fn visible_to_claims(claims: Option<&cog_core::Claims>, task: &Task) -> bool {
     let Some(claims) = claims else { return true };
     if claims.workspace_ids.is_empty() {
@@ -477,7 +484,7 @@ pub(crate) fn visible_to_claims(claims: Option<&cog_core::Claims>, task: &Task) 
     }
     match task.workspace_id.as_deref() {
         Some(ws) => claims.workspace_ids.iter().any(|held| held == ws),
-        None => true,
+        None => false,
     }
 }
 
@@ -601,11 +608,11 @@ async fn resolve_bindings(
             )));
         }
     }
-    let store = state.governance_store.as_ref().ok_or_else(|| ApiError {
-        error: "ServiceUnavailable".into(),
-        message: "no shared database is published, so a submitted task cannot be checked \
-                  against the face it names"
-            .into(),
+    let store = state.governance_store.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable(
+            "no shared database is published, so a submitted task cannot be checked \
+                 against the face it names",
+        )
     })?;
     let nodes = store.face_nodes().await?;
     let faces: std::collections::HashMap<String, cog_core::Face> = nodes
@@ -1245,6 +1252,563 @@ pub async fn delete_task_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ─── 范围结构：把一条任务重挂到另一个父节点下 ─────────────────────────
+
+/// 改一条任务的范围结构字段。
+///
+/// 与上面那十一个状态迁移端点不是一类：那些回答「这条活跑到哪了」，这一条回答
+/// 「这条活挂在谁下面」。范围结构只能由分解侧产出的那段时间里，客户的树一旦拆错
+/// 就没有任何路径能拆回来。
+#[derive(Debug, Deserialize)]
+pub struct UpdateTaskRequest {
+    /// 三态：字段缺席＝这次不改父节点，`null`＝把它提到顶层，字符串＝挂到那个
+    /// 父节点下。`Option<Option<_>>` 是唯一能同时说出这三种意思的形状——
+    /// 单层 `Option` 会把「不改」和「提到顶层」压成同一个 `None`。
+    #[serde(default, deserialize_with = "double_option")]
+    pub parent_task_id: Option<Option<String>>,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// 全部替换，不是追加：验收标准是一份清单，改它的人手里有完整的那一版。
+    #[serde(default)]
+    pub acceptance: Option<Vec<String>>,
+}
+
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateTaskResponse {
+    pub id: String,
+    pub parent_task_id: Option<String>,
+    pub title: String,
+    pub acceptance: Vec<String>,
+}
+
+/// 新父节点会不会把这个任务接到它自己的子树里。
+///
+/// 走上去而不是走下去：任务图里向上只有一条链（每个任务一个父节点），判断
+/// 「新父节点是不是我的后代」只要从新父节点往上爬到顶，看有没有撞见自己。
+/// 撞见就成环——把 task 挂到它自己的孙子下面，那个孙子的祖先链里就有 task。
+///
+/// 数据里本来就有环时不死循环：走过的节点记下来，第二次踩到同一个节点说明
+/// 这条既有链自己成环、而且不经过 task，那不是这次改动造成的。
+pub(crate) fn would_create_cycle(tasks: &[Task], task_id: &str, new_parent: &str) -> bool {
+    if task_id == new_parent {
+        return true;
+    }
+    let by_id: std::collections::HashMap<&str, &Task> =
+        tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut cursor = Some(new_parent);
+    while let Some(id) = cursor {
+        if id == task_id {
+            return true;
+        }
+        if !seen.insert(id) {
+            return false;
+        }
+        cursor = by_id
+            .get(id)
+            .and_then(|t| t.parent_task_id.as_deref())
+            .filter(|p| !p.is_empty());
+    }
+    false
+}
+
+pub async fn update_task_handler(
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateTaskRequest>,
+) -> Result<Json<UpdateTaskResponse>, ApiError> {
+    let claims = claims.as_ref().map(|axum::Extension(c)| c);
+    let all = state.orchestrator.get_all_tasks().await;
+    let visible: Vec<Task> = all
+        .into_iter()
+        .filter(|t| visible_to_claims(claims, t))
+        .collect();
+    let mut task = visible
+        .iter()
+        .find(|t| t.id == id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))?;
+    // 改前的样子先留一份：审计问的是「改成了什么」，只有改后的值答不了。
+    let before = serde_json::json!({
+        "parent_task_id": task.parent_task_id,
+        "title": crate::projects::task_title(&task),
+        "acceptance": task.acceptance,
+    });
+
+    if let Some(title) = req.title.as_ref() {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(ApiError::bad_request(
+                "title is empty: a work package with no name draws as its id everywhere",
+            )
+            .with_code("empty_title"));
+        }
+        if title.chars().count() > crate::projects::MAX_TITLE_CHARS {
+            return Err(ApiError::bad_request(format!(
+                "title is {} characters; the cap is {}",
+                title.chars().count(),
+                crate::projects::MAX_TITLE_CHARS
+            ))
+            .with_code("title_too_long"));
+        }
+        // 任务没有独立的名字列，标题住在 `input` 里——写回同一处，读面才读得到。
+        // `name` 排在读面取词的第一个，所以人改的名字会压过输入里原有的描述。
+        let mut input = if task.input.is_object() {
+            task.input.clone()
+        } else {
+            serde_json::json!({})
+        };
+        input["name"] = serde_json::json!(title);
+        task.input = input;
+    }
+    if let Some(acceptance) = req.acceptance.as_ref() {
+        task.acceptance = acceptance.clone();
+    }
+
+    if let Some(parent) = req.parent_task_id.as_ref() {
+        let is_project_root = task.goal_id.as_deref() == Some(task.id.as_str());
+        match parent.as_deref() {
+            None => {
+                if is_project_root {
+                    return Err(ApiError::bad_request(
+                        "this row is the root of a project: it has no parent to be moved to, \
+                         and giving it one would put a whole project inside another",
+                    )
+                    .with_code("root_cannot_be_reparented"));
+                }
+                task.parent_task_id = None;
+            }
+            Some(new_parent) => {
+                if is_project_root {
+                    return Err(ApiError::bad_request(
+                        "this row is the root of a project: it has no parent to be moved to, \
+                         and giving it one would put a whole project inside another",
+                    )
+                    .with_code("root_cannot_be_reparented"));
+                }
+                let target = visible.iter().find(|t| t.id == new_parent).ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "parent '{new_parent}' does not exist in anything you can see"
+                    ))
+                    .with_code("unknown_parent")
+                })?;
+                if target.project_key() != task.project_key() {
+                    return Err(ApiError::bad_request(format!(
+                        "parent '{new_parent}' belongs to project '{}', not to '{}': a \
+                         re-parent across projects makes one scope tree reach into another",
+                        target.project_key(),
+                        task.project_key()
+                    ))
+                    .with_code("parent_in_another_project"));
+                }
+                if would_create_cycle(&visible, &task.id, new_parent) {
+                    return Err(ApiError::bad_request(format!(
+                        "moving '{}' under '{new_parent}' would make the task its own \
+                         ancestor",
+                        task.id
+                    ))
+                    .with_code("would_create_cycle"));
+                }
+                task.parent_task_id = Some(new_parent.to_string());
+            }
+        }
+    }
+
+    state.orchestrator.replace_task(task.clone()).await?;
+
+    if let Some(ref stream) = state.audit_stream {
+        let _ = stream
+            .append(
+                cog_core::AuditKind::Custom("project_task".into()),
+                claims.map(|c| c.sub.as_str()).unwrap_or("system"),
+                &task.id,
+                "project.task_updated",
+                serde_json::json!({
+                    "parent_task_id": task.parent_task_id,
+                    "title": crate::projects::task_title(&task),
+                    "acceptance": task.acceptance,
+                }),
+            )
+            .await;
+    }
+    // 哈希链记顺序与完整性，这张表记「这一张任务改过什么」——两份的读者不同。
+    crate::project_audit::record(cog_storage::postgres::AuditEntry {
+        actor: claims
+            .map(|c| c.sub.clone())
+            .unwrap_or_else(|| "system".into()),
+        action: "project.task_updated".into(),
+        resource_type: "task".into(),
+        resource_id: task.id.clone(),
+        project_id: task.project_key().to_string(),
+        before,
+        after: serde_json::json!({
+            "parent_task_id": task.parent_task_id,
+            "title": crate::projects::task_title(&task),
+            "acceptance": task.acceptance,
+        }),
+    })
+    .await;
+
+    Ok(Json(UpdateTaskResponse {
+        id: task.id.clone(),
+        parent_task_id: task.parent_task_id.clone(),
+        title: crate::projects::task_title(&task),
+        acceptance: task.acceptance.clone(),
+    }))
+}
+
+// ─── 计划基线：把「当初打算怎么做」写进去 ──────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct SaveTaskPlanRequest {
+    #[serde(default)]
+    pub planned_start: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub planned_end: Option<chrono::DateTime<chrono::Utc>>,
+    /// 这一版计划打算花多少 token。缺席时沿用上一版基线的预算；连上一版都没有
+    /// 就拒绝——一份没有预算的基线在挣值里贡献一个恒为零的计划价值，读面分不出
+    /// 「还没排期」和「排了但没给钱」。
+    #[serde(default)]
+    pub budget_tokens: Option<u64>,
+}
+
+fn plan_refusal(message: impl Into<String>, code: &str) -> ApiError {
+    ApiError::bad_request(message).with_code(code)
+}
+
+pub async fn save_task_plan_handler(
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
+    Path(id): Path<String>,
+    Json(req): Json<SaveTaskPlanRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let claims = claims.as_ref().map(|axum::Extension(c)| c);
+    let tasks: Vec<Task> = state
+        .orchestrator
+        .get_all_tasks()
+        .await
+        .into_iter()
+        .filter(|t| visible_to_claims(claims, t))
+        .collect();
+    let task = tasks
+        .iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))?;
+
+    // 没有验收标准的工作包没有「做完」的判据：给它排一条期，等于给一件谁也
+    // 说不清完成没有的活定一个计划价值。
+    if task.acceptance.is_empty() {
+        return Err(plan_refusal(
+            format!(
+                "task '{id}' has no acceptance criteria: a work package whose 'done' has no \
+                 judge cannot carry a planned value"
+            ),
+            "no_acceptance",
+        ));
+    }
+    if let (Some(start), Some(end)) = (req.planned_start, req.planned_end) {
+        if end < start {
+            return Err(plan_refusal(
+                format!("planned_end {end} is before planned_start {start}"),
+                "plan_window_inverted",
+            ));
+        }
+    }
+
+    let workspace = task
+        .workspace_id
+        .clone()
+        .or_else(|| {
+            claims
+                .filter(|c| c.workspace_ids.len() == 1)
+                .map(|c| c.workspace_ids[0].clone())
+        })
+        .ok_or_else(|| {
+            plan_refusal(
+                format!(
+                    "task '{id}' carries no workspace and the caller holds no single one: \
+                     a baseline filed under a guessed workspace is read back by nobody"
+                ),
+                "workspace_ambiguous",
+            )
+        })?;
+
+    let existing = state
+        .orchestrator
+        .task_plans()
+        .await
+        .ok()
+        .and_then(|plans| plans.into_iter().find(|p| p.task_id == id));
+    let budget_tokens = match (req.budget_tokens, existing.as_ref()) {
+        (Some(budget), _) => budget,
+        (None, Some(prev)) => prev.budget_tokens,
+        (None, None) => {
+            return Err(plan_refusal(
+                format!(
+                    "task '{id}' has no budget: pass `budget_tokens`, or a planned value of \
+                     zero will read as 'nothing was planned'"
+                ),
+                "budget_required",
+            ))
+        }
+    };
+
+    let plan = cog_core::TaskPlan {
+        workspace_id: workspace,
+        task_id: id.clone(),
+        planned_start: req.planned_start,
+        planned_end: req.planned_end,
+        budget_tokens,
+        // 每一笔写就是一版新基线：版本号由写入方按时刻生成，单调前进。让调用方
+        // 自己带版本号，旧版本就能盖掉新版本，读者也分不出哪一版是后来的。
+        baseline_rev: format!(
+            "rev-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ),
+        updated_at: chrono::Utc::now(),
+    };
+    state.orchestrator.save_task_plan(&plan).await?;
+
+    if let Some(ref stream) = state.audit_stream {
+        let _ = stream
+            .append(
+                cog_core::AuditKind::Custom("project_task".into()),
+                claims.map(|c| c.sub.as_str()).unwrap_or("system"),
+                &id,
+                "project.plan_saved",
+                serde_json::json!({
+                    "planned_start": plan.planned_start,
+                    "planned_end": plan.planned_end,
+                    "budget_tokens": plan.budget_tokens,
+                    "baseline_rev": plan.baseline_rev,
+                }),
+            )
+            .await;
+    }
+    crate::project_audit::record(cog_storage::postgres::AuditEntry {
+        actor: claims
+            .map(|c| c.sub.clone())
+            .unwrap_or_else(|| "system".into()),
+        action: "project.plan_saved".into(),
+        resource_type: "plan".into(),
+        resource_id: plan.task_id.clone(),
+        project_id: task.project_key().to_string(),
+        before: existing
+            .as_ref()
+            .map(|p| {
+                serde_json::json!({
+                    "planned_start": p.planned_start,
+                    "planned_end": p.planned_end,
+                    "budget_tokens": p.budget_tokens,
+                    "baseline_rev": p.baseline_rev,
+                })
+            })
+            .unwrap_or(serde_json::Value::Null),
+        after: serde_json::json!({
+            "planned_start": plan.planned_start,
+            "planned_end": plan.planned_end,
+            "budget_tokens": plan.budget_tokens,
+            "baseline_rev": plan.baseline_rev,
+        }),
+    })
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "task_id": plan.task_id,
+        "workspace_id": plan.workspace_id,
+        "planned_start": plan.planned_start,
+        "planned_end": plan.planned_end,
+        "budget_tokens": plan.budget_tokens,
+        "baseline_rev": plan.baseline_rev,
+        "updated_at": plan.updated_at,
+    })))
+}
+
+// ─── 看板：拖动是状态迁移，不是浏览器里的位置 ──────────────────────────
+
+/// 一次拖动对应哪一个状态迁移。
+///
+/// 只有一步的才认：从「待办」拖到「进行中」在真实看板上是两跳（先入队再开跑），
+/// 悄悄替调用方走两步，会让一次拖动在日志里变成两个不相干的事件。中间那一列应
+/// 该由人再拖一次，或者由派发侧自己走——这两件事都不该藏在一次 PATCH 里。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MoveStep {
+    Schedule,
+    Start,
+    Complete,
+    Fail,
+    Cancel,
+    Retry,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MoveRefusal {
+    SameColumn,
+    NotAdjacent { from: String, to: String },
+}
+
+impl MoveRefusal {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::SameColumn => "same_column",
+            Self::NotAdjacent { .. } => "not_adjacent",
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::SameColumn => "the card is already in that column".into(),
+            Self::NotAdjacent { from, to } => format!(
+                "'{from}' cannot move straight to '{to}' in one step: a board move is a \
+                 status transition, and this pair is not one"
+            ),
+        }
+    }
+}
+
+pub(crate) fn move_step(from: &str, to: &str) -> Result<MoveStep, MoveRefusal> {
+    use MoveStep::*;
+    if from == to {
+        return Err(MoveRefusal::SameColumn);
+    }
+    match (from, to) {
+        ("pending", "scheduled") => Ok(Schedule),
+        ("scheduled", "running") => Ok(Start),
+        ("running", "completed") => Ok(Complete),
+        ("running", "failed") => Ok(Fail),
+        (_, "cancelled") => Ok(Cancel),
+        ("failed", "pending") => Ok(Retry),
+        _ => Err(MoveRefusal::NotAdjacent {
+            from: from.to_string(),
+            to: to.to_string(),
+        }),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MoveTaskRequest {
+    /// 目标列，取值就是任务状态的六个拼写——看板与状态机共用一套词。
+    pub status: String,
+}
+
+pub async fn move_task_handler(
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
+    Path(id): Path<String>,
+    Json(req): Json<MoveTaskRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let claims = claims.as_ref().map(|axum::Extension(c)| c);
+    let target = cog_core::TaskStatus::parse(req.status.trim()).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "'{}' is not a column: the six are {}",
+            req.status,
+            cog_core::TaskStatus::ALL
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .with_code("unknown_column")
+    })?;
+
+    let tasks: Vec<Task> = state
+        .orchestrator
+        .get_all_tasks()
+        .await
+        .into_iter()
+        .filter(|t| visible_to_claims(claims, t))
+        .collect();
+    let task = tasks
+        .iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| ApiError::not_found(format!("task '{id}' does not exist")))?;
+
+    let step = move_step(task.status.as_str(), target.as_str())
+        .map_err(|refusal| ApiError::bad_request(refusal.message()).with_code(refusal.code()))?;
+
+    // 目标列满了就拦在写入之前：到达上限这一刻，发布侧已经不再往这一列放新活，
+    // 看板还能把卡片拖进去的话，两边的读数当场就分家。
+    let (limits, _problems) = cog_core::BoardWipLimits::from_env();
+    if let Some(limit) = limits.limit_for(target.as_str()) {
+        let occupants = tasks
+            .iter()
+            .filter(|t| t.project_key() == task.project_key() && t.status == target)
+            .count();
+        if occupants >= limit {
+            return Err(ApiError::bad_request(format!(
+                "column '{}' already holds {occupants} of its {limit} cards",
+                target.as_str()
+            ))
+            .with_code("column_full"));
+        }
+    }
+
+    let actor = claims.map(|c| c.sub.as_str()).unwrap_or("system");
+    match step {
+        MoveStep::Schedule => state.orchestrator.schedule_task(&id).await?,
+        MoveStep::Start => state.orchestrator.start_task(&id).await?,
+        MoveStep::Complete => {
+            state
+                .orchestrator
+                .complete_task(&id, serde_json::json!({ "via": "board_move", "by": actor }))
+                .await?;
+        }
+        MoveStep::Fail => {
+            state
+                .orchestrator
+                .fail_task(
+                    &id,
+                    format!("moved to failed from the board by {actor}"),
+                    None,
+                )
+                .await?;
+        }
+        MoveStep::Cancel => {
+            state.orchestrator.cancel_task(&id).await?;
+        }
+        MoveStep::Retry => state.orchestrator.retry_task(&id).await?,
+    }
+    broadcast_task_status(&state, &id, target, task.agent_id.clone());
+
+    if let Some(ref stream) = state.audit_stream {
+        let _ = stream
+            .append(
+                cog_core::AuditKind::Custom("project_task".into()),
+                actor,
+                &id,
+                "project.card_moved",
+                serde_json::json!({ "from": task.status.as_str(), "to": target.as_str() }),
+            )
+            .await;
+    }
+    // 「这片卡是哪一天被谁挪走的」——事故复盘问的第一个问题，按资源一秒查出来。
+    crate::project_audit::record(cog_storage::postgres::AuditEntry {
+        actor: actor.to_string(),
+        action: "project.card_moved".into(),
+        resource_type: "card".into(),
+        resource_id: id.clone(),
+        project_id: task.project_key().to_string(),
+        before: serde_json::json!({ "status": task.status.as_str() }),
+        after: serde_json::json!({ "status": target.as_str() }),
+    })
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "from": task.status.as_str(),
+        "to": target.as_str(),
+    })))
+}
+
 pub async fn check_timeouts_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
@@ -1869,7 +2433,12 @@ mod tests {
     }
 
     /// 读面的隔离：声明了 workspace 的 token 看不到别人的任务；没声明范围的口径
-    /// 与提交侧一致（不按范围限制）；没有归属的旧行不因隔离而从每个读者眼里消失。
+    /// 与提交侧一致（不按范围限制）；**没有归属的行对声明了范围的读者不可见**。
+    ///
+    /// 最后那一条以前是反的：旧行没有 workspace 就让所有声明范围的读者都看得见，
+    /// 理由是「不因隔离而消失」。代价是任何一条没记归属的行都出现在每一家客户的
+    /// 看板上，而且看起来就像是他家的——把别人的活读成自己的，比读不到更坏。
+    /// 看不见的判据是「看得见才算」：范围之外的一切都不返回，包括没归属的。
     #[test]
     fn a_scoped_reader_sees_only_its_own_workspaces() {
         let claims = claims_with_workspaces(vec!["ws-a".into()]);
@@ -1882,8 +2451,9 @@ mod tests {
         assert!(visible_to_claims(Some(&claims), &mine));
         assert!(!visible_to_claims(Some(&claims), &theirs));
         assert!(
-            visible_to_claims(Some(&claims), &unattributed),
-            "a row from before the field was recorded belongs to no workspace, so no scope hides it"
+            !visible_to_claims(Some(&claims), &unattributed),
+            "a row with no workspace belongs to nobody: showing it to a scoped reader \
+             puts somebody else's work on their board"
         );
         assert!(visible_to_claims(None, &theirs));
         let unscoped = claims_with_workspaces(vec![]);
@@ -1921,5 +2491,119 @@ mod tests {
         assert_eq!(view.timeout_seconds, 900);
         assert_eq!(view.face_id.as_deref(), Some("face-resources"));
         assert_eq!(view.bound_by_handover_id.as_deref(), Some("handover-7"));
+    }
+
+    fn scoped(workspaces: &[&str]) -> cog_core::Claims {
+        cog_core::Claims {
+            sub: "u1".into(),
+            iss: "test".into(),
+            aud: "test".into(),
+            exp: 0,
+            iat: 0,
+            jti: "j".into(),
+            preferred_username: "tester".into(),
+            user_type: cog_core::UserType::Standard,
+            workspace_ids: workspaces.iter().map(|w| w.to_string()).collect(),
+            permissions: Vec::new(),
+            roles: Vec::new(),
+        }
+    }
+
+    /// 一条不属于任何 workspace 的任务，对一个有 workspace 范围的读者不可见。
+    ///
+    /// 反过来的写法——无主即放行——让每一条历史行同时出现在每个租户的视图里，
+    /// 而视图里没有任何东西能把它们和这个租户自己的活分开。
+    #[test]
+    fn unowned_tasks_are_not_visible() {
+        let mut t = task("unowned", cog_core::TaskStatus::Pending, "t", 0);
+        t.workspace_id = None;
+        let reader = scoped(&["acme"]);
+        assert!(
+            !visible_to_claims(Some(&reader), &t),
+            "无主的行不许落进有范围的读者眼里"
+        );
+        assert!(
+            visible_to_claims(None, &t),
+            "没有范围的读者（平台运维）仍然看得见它，否则这些行就没有任何读面"
+        );
+        assert!(
+            visible_to_claims(Some(&scoped(&[])), &t),
+            "空范围＝不受范围限制，与提交侧同一个约定"
+        );
+    }
+
+    /// 有主的行只给主人看。
+    #[test]
+    fn a_scoped_reader_sees_only_its_own_workspace_rows() {
+        let mut mine = task("mine", cog_core::TaskStatus::Pending, "t", 0);
+        mine.workspace_id = Some("acme".into());
+        let mut theirs = task("theirs", cog_core::TaskStatus::Pending, "t", 0);
+        theirs.workspace_id = Some("globex".into());
+        let reader = scoped(&["acme"]);
+        assert!(visible_to_claims(Some(&reader), &mine));
+        assert!(!visible_to_claims(Some(&reader), &theirs));
+    }
+
+    /// 把一条任务挂到它自己的后代下面会成环；挂到无关的任务下面不会。
+    #[test]
+    fn a_task_cannot_become_its_own_ancestor() {
+        let mut root = task("root", cog_core::TaskStatus::Pending, "t", 0);
+        root.parent_task_id = None;
+        let mut mid = task("mid", cog_core::TaskStatus::Pending, "t", 0);
+        mid.parent_task_id = Some("root".into());
+        let mut leaf = task("leaf", cog_core::TaskStatus::Pending, "t", 0);
+        leaf.parent_task_id = Some("mid".into());
+        let other = task("other", cog_core::TaskStatus::Pending, "t", 0);
+        let tasks = vec![root, mid, leaf, other];
+
+        assert!(would_create_cycle(&tasks, "root", "leaf"), "孙子下面挂祖父");
+        assert!(would_create_cycle(&tasks, "root", "mid"));
+        assert!(would_create_cycle(&tasks, "root", "root"), "自己挂自己");
+        assert!(
+            !would_create_cycle(&tasks, "leaf", "other"),
+            "无关的父节点不算环"
+        );
+    }
+
+    /// 数据里本来就有一个不走这条链的环时，判据要停下来，不能死循环。
+    #[test]
+    fn a_pre_existing_cycle_elsewhere_does_not_hang_the_check() {
+        let mut a = task("a", cog_core::TaskStatus::Pending, "t", 0);
+        a.parent_task_id = Some("b".into());
+        let mut b = task("b", cog_core::TaskStatus::Pending, "t", 0);
+        b.parent_task_id = Some("a".into());
+        let c = task("c", cog_core::TaskStatus::Pending, "t", 0);
+        let tasks = vec![a, b, c];
+        assert!(!would_create_cycle(&tasks, "c", "a"));
+    }
+
+    /// 拖动只有一步时才落状态：两跳的拖动会让一次操作变成两个事件。
+    #[test]
+    fn a_board_move_is_one_transition_or_a_refusal() {
+        assert_eq!(
+            move_step("pending", "scheduled").unwrap(),
+            MoveStep::Schedule
+        );
+        assert_eq!(move_step("scheduled", "running").unwrap(), MoveStep::Start);
+        assert_eq!(
+            move_step("running", "completed").unwrap(),
+            MoveStep::Complete
+        );
+        assert_eq!(move_step("failed", "pending").unwrap(), MoveStep::Retry);
+        assert_eq!(move_step("running", "cancelled").unwrap(), MoveStep::Cancel);
+        assert_eq!(
+            move_step("running", "running").unwrap_err(),
+            MoveRefusal::SameColumn
+        );
+        match move_step("pending", "running") {
+            Err(MoveRefusal::NotAdjacent { from, to }) => {
+                assert_eq!((from.as_str(), to.as_str()), ("pending", "running"));
+            }
+            other => panic!("两跳的拖动必须拒绝，实际 {other:?}"),
+        }
+        assert!(
+            move_step("completed", "pending").is_err(),
+            "做完的不能靠拖回去重开"
+        );
     }
 }

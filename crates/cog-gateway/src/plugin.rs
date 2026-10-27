@@ -201,6 +201,19 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             ctx.consume::<tokio::sync::broadcast::Sender<cog_core::EvolutionChangeInfo>>();
         let audit_stream: Option<Arc<dyn cog_core::AuditStream>> =
             ctx.consume_service::<dyn cog_core::AuditStream>();
+        // 项目面写操作的审计落库。装成进程级单例而不是 `GatewayState` 的一个槽：
+        // 那个结构每加一格要跟着改五处夹具，而漏掉的那一处不会报错——它会让审计
+        // 安静地不写。接线只有这一处，缺席时计数里看得见。
+        if let Some(project_audit) =
+            ctx.consume_service::<dyn cog_storage::postgres::ProjectAuditLog>()
+        {
+            crate::project_audit::install(project_audit);
+            tracing::info!("project audit log wired");
+        } else {
+            tracing::warn!(
+                "no project audit log published: project writes will be counted as unwired"
+            );
+        }
         // 外部提交的价值判定落到存储面，由持有共用库的插件发布；本进程只拿写面。
         let taste_intent_sink: Option<Arc<dyn cog_core::TasteIntentSink>> =
             ctx.consume_service::<dyn cog_core::TasteIntentSink>();

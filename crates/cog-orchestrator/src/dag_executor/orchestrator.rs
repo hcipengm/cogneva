@@ -1158,6 +1158,46 @@ impl DagExecutor {
     /// If a cycle is detected, the insertion is rolled back.
     /// If the task already exists, returns a Validation error (use
     /// [`Self::add_tasks_batch`] for idempotent batch insertion).
+    /// 用改过的同一行替换图里已有的那一条，并把改动落到持久层。
+    ///
+    /// 只换行本身，不动依赖边：调用方改的是父节点、验收标准、归属这类字段，
+    /// 而边由 `blocked_by` 单独维护——重挂父节点不该悄悄改掉「等谁跑完」。
+    /// 行不存在时拒绝，不顺手插入一条新的：改一条查不到的行的请求，多半是
+    /// id 写错了，把它变成新建会把一个笔误写成一次真实的写入。
+    pub async fn replace_task(&self, task: Task) -> SFResult<()> {
+        if self.fg().is_some() {
+            let be = self.fg().expect("store mode");
+            if be
+                .dag_get_task(&self.workspace_id, &task.id)
+                .await?
+                .is_none()
+            {
+                return Err(cog_core::SFError::TaskFailed {
+                    task_id: task.id.clone(),
+                    reason: "Task not found".into(),
+                });
+            }
+            be.dag_set_task(&self.workspace_id, &task.id, &task).await?;
+            return Ok(());
+        }
+        self.ensure_task_present(&task.id).await?;
+        {
+            let mut inner = self.inner.write().await;
+            let slot =
+                inner
+                    .tasks
+                    .get_mut(&task.id)
+                    .ok_or_else(|| cog_core::SFError::TaskFailed {
+                        task_id: task.id.clone(),
+                        reason: "Task not found".into(),
+                    })?;
+            *slot = task.clone();
+        }
+        self.persist_task_fine_grained(&task).await;
+        self.persist_state().await;
+        Ok(())
+    }
+
     pub async fn add_task(&self, task: Task) -> SFResult<()> {
         if self.fg().is_some() {
             return self.add_task_store(task).await;
@@ -3668,6 +3708,10 @@ impl cog_core::DagExecutor for DagExecutor {
 
     async fn add_task(&self, task: Task) -> SFResult<()> {
         self.add_task(task).await
+    }
+
+    async fn replace_task(&self, task: Task) -> SFResult<()> {
+        self.replace_task(task).await
     }
 
     async fn schedule_task(&self, task_id: &str) -> SFResult<()> {

@@ -61,7 +61,9 @@ pub mod observable;
 pub mod plugin;
 pub mod process_reports;
 pub mod processes;
+pub mod project_audit;
 pub mod project_control;
+pub mod project_rate_limit;
 pub mod projects;
 pub mod prometheus_render;
 pub mod promotion_gate;
@@ -478,6 +480,53 @@ impl GatewayState {
 /// 各写一遍的话，改了一边、另一边照旧"看起来在跑"。
 fn memory_ingest_routes() -> Router<Arc<GatewayState>> {
     Router::new().route(cog_core::MEMORY_INGEST_PATH, post(memory::ingest_handler))
+}
+
+/// 项目面的读端点，单独成组是为了挂限速。
+///
+/// 这一组每次请求都要把可见的任务图整体读进来再折一遍，成本随任务数线性上涨，
+/// 而它们的调用方是一个会自动刷新的页面。写端点不在这组里：写有它自己的准入
+/// （范围校验、列上限、状态机），多一道按分钟的读速率拦在那里只会误伤。
+///
+/// 限速层挂在这一组自己的 `Router` 上，位置在认证层的里面——只有认证先跑完，
+/// 计数才知道该记在谁头上。
+fn project_read_routes() -> Router<Arc<GatewayState>> {
+    Router::new()
+        .route("/api/v1/projects", get(projects::list_projects_handler))
+        .route(
+            "/api/v1/projects/{id}/board",
+            get(projects::project_board_handler),
+        )
+        .route(
+            "/api/v1/projects/{id}/gantt",
+            get(projects::project_gantt_handler),
+        )
+        // 范围树。与列表分开：列表答「有哪些项目」，这一条答「这个项目里谁挂在
+        // 谁下面」——两者的形状不同，塞进一个响应里会让不想要树的人也得付树的
+        // 代价。
+        .route(
+            "/api/v1/projects/{id}/wbs",
+            get(projects::project_wbs_handler),
+        )
+        // 挣值：计划价值、挣值、实际成本三个量每次现算，不落表也不缓存成列。
+        // 一旦缓存，读的人就分不出这个数是此刻算的还是上一拍留下的。
+        .route(
+            "/api/v1/projects/{id}/evm",
+            get(projects::project_evm_handler),
+        )
+        // 导出：四个读面各一份 CSV，列与页面同源。挂在这一组里，因为它读的
+        // 是同一份图，也一样贵。
+        .route(
+            "/api/v1/projects/{id}/export.csv",
+            get(projects::export_csv_handler),
+        )
+        // 改动时间线：这一面唯一一条「把写到的东西读回来」的路。写审计而没人
+        // 读，与没写审计在效果上一样——都是「改过但查不到」。
+        .route(
+            "/api/v1/projects/{id}/audit",
+            get(projects::project_audit_handler),
+        )
+        .layer(from_fn(project_rate_limit::guard))
 }
 
 /// Raw 的读取面（list / 元数据 / 内容 / 直链），同样挂在两个 router 上（主 API 组内按 Operator 判）。
@@ -982,23 +1031,38 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/tasks/ready", get(tasks::get_ready_tasks_handler))
         .route("/api/v1/tasks/status", get(tasks::task_summary_handler))
         .route("/api/v1/tasks/graph", get(tasks::get_task_graph_handler))
-        // 项目面：任务图按 goal 根折成项目后的三个读面。它们不建第二张表，
-        // 读到的是同一个任务图；分开成三个端点是因为读者要回答的问题不同。
-        .route("/api/v1/projects", get(projects::list_projects_handler))
+        // 项目面的读在下面的 `project_read_routes` 里单独成组，因为那一组要挂
+        // 限速层；这里只留写端点。
         .route(
-            "/api/v1/projects/{id}/board",
-            get(projects::project_board_handler),
+            "/api/v1/projects",
+            axum::routing::post(projects::create_project_handler),
         )
+        // 项目面唯一的写端点：人把一片活放进范围树。放在 Operator 组而不是与任务
+        // 状态机同一个 Admin 组——改状态是驱动执行，拆活是范围管理，后者是项目成员
+        // 的日常；租户边界由 handler 自己按 claims 判，不靠组级角色。
         .route(
-            "/api/v1/projects/{id}/gantt",
-            get(projects::project_gantt_handler),
+            "/api/v1/projects/{id}/tasks",
+            axum::routing::post(projects::create_project_task_handler),
         )
-        // 挣值：计划价值、挣值、实际成本三个量每次现算，不落表也不缓存成列。
-        // 一旦缓存，读的人就分不出这个数是此刻算的还是上一拍留下的。
+        // 改一条任务的范围结构（父节点、标题、验收标准）。PATCH 与同一路径上
+        // 的 DELETE 分属两个组：删是 Admin 的运维动作，改范围结构是项目成员的
+        // 日常；两者都是写，但改的是不同的东西。
         .route(
-            "/api/v1/projects/{id}/evm",
-            get(projects::project_evm_handler),
+            "/api/v1/tasks/{id}",
+            axum::routing::patch(tasks::update_task_handler),
         )
+        // 计划基线。与甘特读面成对：有了这一条，甘特上的条才是排出来的，
+        // 而不只是事后记录。
+        .route(
+            "/api/v1/tasks/{id}/plan",
+            axum::routing::put(tasks::save_task_plan_handler),
+        )
+        // 看板上的一次拖动。落到任务状态上，不落进浏览器。
+        .route(
+            "/api/v1/tasks/{id}/move",
+            axum::routing::post(tasks::move_task_handler),
+        )
+        .merge(project_read_routes())
         .route(
             "/api/v1/processes",
             get(processes::process_overview_handler),
@@ -1906,6 +1970,31 @@ async fn prometheus_metrics_handler(State(state): State<Arc<GatewayState>>) -> R
             body.push('\n');
         }
         body.push_str(&prometheus_render::render_raw_metrics(&observable_metrics));
+    }
+
+    // 项目控制回路的读数。它不经过 `state.observables`：`readings()` 是进程级
+    // 单例，计数在哪一进程里发生就在哪一进程里被读，接线是隐式的、不会漏。
+    // 只有安全网关读它时，主网关这一侧的拒绝数在读数面上不存在——而那正是一
+    // 个部署最想知道的「请求被谁拦下了」。
+    match cog_core::Observable::collect_metrics(project_control::readings().as_ref(), "").await {
+        Ok(readings) if !readings.is_empty() => {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&prometheus_render::render_raw_metrics(&readings));
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "project control readings unavailable this scrape"),
+    }
+
+    // 审计出口的三个计数。与上面同一种接线：进程级单例，装配处只有一处。
+    // 「写不进去」与「压根没接上」分成两条序列，因为修法不同——一个查库，一个查装配。
+    let audit_readings = project_audit::readings();
+    if !audit_readings.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&prometheus_render::render_raw_metrics(&audit_readings));
     }
 
     // Self-observation: registry 按静态 TypeId 登记服务，某个 observable 若

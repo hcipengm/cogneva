@@ -812,6 +812,24 @@ impl cog_core::SystemPlugin for StoragePlugin {
             }
         }
 
+        // ── Project audit log (PostgreSQL) ──
+        //
+        // 项目面的写操作要把「谁、何时、改前改后」落成可查的一行。`audit_logs`
+        // 这张表从建起来就有分区与索引，一直没有写者；这里给它一个。发布成服务而不是
+        // 塞进网关卡，是因为库只在这一个插件的进程里连着。
+        if let Some(ref pool) = config_pool {
+            let audit = crate::postgres::PgProjectAuditLog::new(pool.clone());
+            // 建不出索引不等于用不了：表本身是迁移建的，索引只决定查询快慢。
+            // 所以失败只记一条日志，写者照发——不发的话审计整片消失，而它消失的
+            // 样子（每次写都记成 unwired）比缺一条索引难查得多。
+            if let Err(e) = audit.init_schema().await {
+                warn!("ProjectAuditLog init_schema failed, index missing: {e}");
+            }
+            let audit: Arc<dyn crate::postgres::ProjectAuditLog> = Arc::new(audit);
+            ctx.publish_service(audit);
+            info!("ProjectAuditLog published");
+        }
+
         // ── Media backend (LiveKit) ──
         {
             let media_config = &ctx.config().providers.media;

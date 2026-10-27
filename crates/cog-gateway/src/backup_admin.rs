@@ -41,6 +41,13 @@ pub const PACKAGE_SUFFIX: &str = cog_core::BACKUP_PACKAGE_SUFFIX;
 /// 而它会被复制到别处、被邮件带走。口令太短时整单拒绝，页面照原话显示这条下限。
 pub const MIN_PASSPHRASE_CHARS: usize = 12;
 
+/// 下载时一次读多少字节。
+///
+/// 定成常量而不是写在读循环里：这个数决定一个管理员下一次下载最多在 Pod 里
+/// 占多少内存，而它乘上并发下载数就是这一面可能吃掉的峰值——一个写在循环里的
+/// 字面量没人能沿着这条线去核对。
+pub const DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
+
 /// 发布目录在数据卷上的相对位置。备份 Job 与应用 Pod 挂的是同一块卷，路径相对
 /// [`cog_core::paths::DATA_DIR`] 取，两边都不写死一个绝对路径。
 pub const EXPORTS_SUBDIR: &str = "exports";
@@ -382,7 +389,7 @@ pub async fn download_handler(Path(name): Path<String>) -> Response {
     // 「Pod 内存涨到 limit」。
     let stream = futures::stream::try_unfold(file, |mut file| async move {
         use tokio::io::AsyncReadExt;
-        let mut chunk = vec![0u8; 64 * 1024];
+        let mut chunk = vec![0u8; DOWNLOAD_CHUNK_BYTES];
         let read = file.read(&mut chunk).await?;
         if read == 0 {
             return Ok::<Option<(axum::body::Bytes, tokio::fs::File)>, std::io::Error>(None);

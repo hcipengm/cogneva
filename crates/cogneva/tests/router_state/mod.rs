@@ -299,6 +299,19 @@ fn build(
 /// The name is the caller's so a failing test says which suite minted the token
 /// it used; nothing reads it.
 pub async fn admin_bearer(state: &Arc<GatewayState>, username: &str) -> String {
+    admin_bearer_scoped_to(state, username, &[]).await
+}
+
+/// A token that names the workspaces its caller belongs to.
+///
+/// An empty list is not "no workspaces"—it is the platform operator, who is not
+/// scoped to a tenant at all and sees every one. Suites that judge what a tenant
+/// can see need the other shape: the same admin, scoped to named workspaces.
+pub async fn admin_bearer_scoped_to(
+    state: &Arc<GatewayState>,
+    username: &str,
+    workspaces: &[&str],
+) -> String {
     let user = User {
         id: uuid::Uuid::new_v4(),
         phone: None,
@@ -313,7 +326,11 @@ pub async fn admin_bearer(state: &Arc<GatewayState>, username: &str) -> String {
     };
     state
         .jwt_manager
-        .generate_token(&user, vec![], vec![])
+        .generate_token(
+            &user,
+            workspaces.iter().map(|w| w.to_string()).collect(),
+            vec![],
+        )
         .await
         .expect("the state's signer issues a token")
         .access_token

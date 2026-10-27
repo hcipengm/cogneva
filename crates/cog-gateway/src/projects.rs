@@ -16,7 +16,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::{Extension, Json};
 use serde::Serialize;
 
@@ -107,12 +109,234 @@ pub struct ProjectRow {
     pub planned: bool,
 }
 
+/// CSV 的一格。含逗号、引号或换行的字段整体加引号、内部引号翻倍——这是
+/// RFC 4180 的写法。不转义的话，一个带逗号的任务标题会把一行撑成两列，而
+/// 下游按列数校验的表会被整表拒收。
+fn csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn csv_row(fields: &[String]) -> String {
+    fields
+        .iter()
+        .map(|f| csv_field(f))
+        .collect::<Vec<_>>()
+        .join(",")
+        + "\r\n"
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ExportQuery {
+    /// `wbs` | `board` | `gantt` | `evm`。就是四个读面的名字。
+    pub view: String,
+}
+
+/// 把一个读面导出成 CSV。
+///
+/// 走的是同几个折叠函数，不是另算一遍：导出的数与会话里看到的数必须逐格一致，
+/// 否则客户拿表去核对时，两边谁对谁错无法裁决。
+pub async fn export_csv_handler(
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<Extension<cog_core::Claims>>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ExportQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let claims = claims.as_ref().map(|Extension(c)| c);
+    let tasks = visible_tasks(&state, claims).await;
+    let rows = tasks_of_project(&tasks, &id);
+    if rows.is_empty() && id != UNGROUPED {
+        return Err(ApiError::not_found(format!("project {id}")));
+    }
+
+    let mut body = String::new();
+    match q.view.as_str() {
+        "wbs" => {
+            let tree = build_wbs_tree(id.clone(), &rows);
+            body.push_str(&csv_row(&[
+                "id".into(),
+                "parent_id".into(),
+                "depth".into(),
+                "title".into(),
+                "status".into(),
+                "acceptance".into(),
+            ]));
+            fn walk(nodes: &[WbsNode], parent: &str, out: &mut String) {
+                for n in nodes {
+                    out.push_str(&csv_row(&[
+                        n.id.clone(),
+                        parent.to_string(),
+                        n.depth.to_string(),
+                        n.title.clone(),
+                        n.status.clone(),
+                        n.acceptance.to_string(),
+                    ]));
+                    walk(&n.children, &n.id, out);
+                }
+            }
+            walk(&tree.roots, "", &mut body);
+            // 悬空与成环的节点也导出来：它们在树里没有位置，但在账上有名有姓，
+            // 少导出它们等于让一份导出比读面更干净——而脏的正是要修的那些行。
+            for n in tree.orphan_parents.iter().chain(tree.cycles.iter()) {
+                body.push_str(&csv_row(&[
+                    n.id.clone(),
+                    "(detached)".into(),
+                    n.depth.to_string(),
+                    n.title.clone(),
+                    n.status.clone(),
+                    n.acceptance.to_string(),
+                ]));
+            }
+        }
+        "board" => {
+            let (limits, _problems) = cog_core::BoardWipLimits::from_env();
+            body.push_str(&csv_row(&[
+                "status".into(),
+                "count".into(),
+                "wip_limit".into(),
+                "over_limit".into(),
+            ]));
+            for c in build_board_columns(&rows, &tasks, &limits) {
+                body.push_str(&csv_row(&[
+                    c.status,
+                    c.count.to_string(),
+                    c.wip_limit.map(|v| v.to_string()).unwrap_or_default(),
+                    c.over_limit.map(|v| v.to_string()).unwrap_or_default(),
+                ]));
+            }
+        }
+        "gantt" => {
+            let plans = readable_plans(&state.orchestrator).await;
+            let gantt = build_gantt_response(id.clone(), &rows, plans.as_ref());
+            body.push_str(&csv_row(&[
+                "id".into(),
+                "title".into(),
+                "status".into(),
+                "created_at".into(),
+                "started_at".into(),
+                "updated_at".into(),
+                "planned_start".into(),
+                "planned_end".into(),
+                "unplanned".into(),
+            ]));
+            for r in gantt.rows {
+                body.push_str(&csv_row(&[
+                    r.id,
+                    r.title,
+                    r.status,
+                    r.created_at,
+                    r.started_at.unwrap_or_default(),
+                    r.updated_at,
+                    r.planned_start.unwrap_or_default(),
+                    r.planned_end.unwrap_or_default(),
+                    r.unplanned.to_string(),
+                ]));
+            }
+        }
+        "evm" => {
+            let evm = evm_view(&state, id.clone(), &rows).await;
+            body.push_str(&csv_row(&[
+                "metric".into(),
+                "value".into(),
+                "unmeasurable".into(),
+                "basis".into(),
+            ]));
+            for (name, reading) in [
+                ("planned_value", &evm.planned_value),
+                ("earned_value", &evm.earned_value),
+                ("actual_cost", &evm.actual_cost),
+                ("baselined_actual_cost", &evm.baselined_actual_cost),
+            ] {
+                body.push_str(&csv_row(&[
+                    name.into(),
+                    reading.value.map(|v| v.to_string()).unwrap_or_default(),
+                    reading.unmeasurable.clone().unwrap_or_default(),
+                    reading.basis.clone(),
+                ]));
+            }
+        }
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "'{other}' is not a view: the four are wbs, board, gantt, evm"
+            ))
+            .with_code("unknown_view"))
+        }
+    }
+
+    let filename = format!("{}-{}.csv", id, q.view);
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/csv; charset=utf-8".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
 #[derive(Debug, Serialize)]
 pub struct ProjectsResponse {
     pub projects: Vec<ProjectRow>,
-    /// 读者可见的任务总数。它必须与各行之和相等，否则有任务落在了所有桶之外。
+    /// 本页各行 `tasks` 之和。它与 `projects` 逐行对得上，是这一页自己的账。
+    pub counted_tasks: usize,
+    /// 读者可见的任务总数，**不随分页变化**。它与本页各行之和不必相等——分页
+    /// 之后 `projects` 只是一部分；两者放在一起，读者才分得出「还有更多」。
     pub total_tasks: usize,
+    /// 读者可见的项目总数，同样不随分页变化。
+    pub total_projects: usize,
+    /// 下一页的位置；`None` 表示这一页就是最后一页。
+    ///
+    /// 它是一**个位置**而不是一个 id：列表顺序在两次读之间可能变（任务被删、
+    /// 新项目进来），按 id 取游标会在顺序变化时跳过或重复行。位置语义下最坏的
+    /// 情况是同一个项目出现在相邻两页，而读者按 id 去重就能收回。
+    pub next_cursor: Option<String>,
     pub source: Source,
+}
+
+/// 项目列表的一页。`limit` 有上限：不设上限的分页等于没分页。
+#[derive(Debug, serde::Deserialize)]
+pub struct ListProjectsQuery {
+    pub limit: Option<usize>,
+    pub cursor: Option<usize>,
+}
+
+const PROJECTS_PAGE_DEFAULT: usize = 200;
+const PROJECTS_PAGE_MAX: usize = 1000;
+
+/// 每列最多带回多少张卡片。
+///
+/// 看板是给人挪的，不是给人数的：只回计数的话，界面画得出六列数字，画不出任何一张
+/// 能拖的卡，而「这一列有 37 个」在客户眼里等于「我不知道里面是什么」。上限之外
+/// 的张数由 `cards_hidden` 如实报出来——静默截断会让一列看起来正好装得下。
+const BOARD_CARDS_PER_COLUMN: usize = 100;
+
+/// 看板上的一张卡片。
+///
+/// 只带读面要画、写面要判的那几格：标题（人认卡靠它）、父节点（树上的位置）、
+/// 还缺哪些依赖（能不能现在开工）、有没有验收标准（能不能给它写计划基线）。
+/// 任务的全部字段不在这里——那是任务详情的读面，看板重复一份迟早与那边分家。
+#[derive(Debug, Serialize)]
+pub struct BoardCard {
+    pub id: String,
+    pub title: String,
+    /// 它在哪一列。列本身已经说过一次，卡片再带一份：块按列渲染之后，卡片
+    /// 被单独传给「能挪到哪」的判据时，不必再让调用方把列名一路带下来。
+    pub status: String,
+    pub parent_task_id: Option<String>,
+    /// 依赖还没全部完成。依赖不在可见的这一批里时也算卡住——看不见的依赖不能
+    /// 当成已完成，那会把一条卡住的活读成可以开跑。
+    pub blocked: bool,
+    /// 有没有验收标准。没有的工作包「做完」没有判据，写计划基线会被拒。
+    pub has_acceptance: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,6 +347,11 @@ pub struct BoardColumn {
     /// 把「没配上限」印成 `over_limit: false`，读者会以为上限正在生效。
     pub wip_limit: Option<usize>,
     pub over_limit: Option<bool>,
+    /// 这一列里最久没动的那一批卡片。`count` 是这一列的总数，与本数组长度不必
+    /// 相等——差的那部分是 `cards_hidden`。
+    pub cards: Vec<BoardCard>,
+    /// 因为超过每列上限而没带回来的张数。0 表示这一列的张数就是全部。
+    pub cards_hidden: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -402,7 +631,7 @@ fn project_key(task: &Task) -> &str {
 
 /// 一条任务在界面上叫什么。任务没有独立的名字列，标题只能从输入里取；取不到就
 /// 退回任务 id——编一个名字比露出 id 更坏，读者会把编出来的当成真的。
-fn task_title(task: &Task) -> String {
+pub(crate) fn task_title(task: &Task) -> String {
     for key in ["name", "task", "description", "goal"] {
         if let Some(v) = task.input.get(key).and_then(|v| v.as_str()) {
             let v = v.trim();
@@ -503,14 +732,30 @@ fn build_project_rows(
 pub async fn list_projects_handler(
     State(state): State<Arc<GatewayState>>,
     claims: Option<Extension<cog_core::Claims>>,
+    axum::extract::Query(page): axum::extract::Query<ListProjectsQuery>,
 ) -> Result<Json<ProjectsResponse>, ApiError> {
     let claims = claims.as_ref().map(|Extension(c)| c);
     let tasks = visible_tasks(&state, claims).await;
     let total_tasks = tasks.len();
     let plans = readable_plans(&state.orchestrator).await;
+
+    let all = build_project_rows(&tasks, plans.as_ref());
+    let total_projects = all.len();
+    let limit = page
+        .limit
+        .unwrap_or(PROJECTS_PAGE_DEFAULT)
+        .clamp(1, PROJECTS_PAGE_MAX);
+    let start = page.cursor.unwrap_or(0).min(total_projects);
+    let end = (start + limit).min(total_projects);
+    let projects: Vec<ProjectRow> = all.into_iter().skip(start).take(end - start).collect();
+    let counted_tasks: usize = projects.iter().map(|p| p.tasks).sum();
+
     Ok(Json(ProjectsResponse {
-        projects: build_project_rows(&tasks, plans.as_ref()),
+        projects,
+        counted_tasks,
         total_tasks,
+        total_projects,
+        next_cursor: (end < total_projects).then(|| end.to_string()),
         source: now_source("in-memory task graph"),
     }))
 }
@@ -519,13 +764,53 @@ fn tasks_of_project<'a>(tasks: &'a [Task], id: &str) -> Vec<&'a Task> {
     tasks.iter().filter(|t| project_key(t) == id).collect()
 }
 
-fn build_board_columns(rows: &[&Task], limits: &cog_core::BoardWipLimits) -> Vec<BoardColumn> {
+fn build_board_columns(
+    rows: &[&Task],
+    all: &[Task],
+    limits: &cog_core::BoardWipLimits,
+) -> Vec<BoardColumn> {
+    // 「谁已经完成」按全部可见任务判，不按这个项目的那一批：一条依赖挂在项目外面
+    // 时，按项目内判会把它当成没完成；那是保守的方向，但按整张图判才是真的。
+    let done: BTreeMap<&str, bool> = all
+        .iter()
+        .map(|t| (t.id.as_str(), t.status == TaskStatus::Completed))
+        .collect();
+
     status_counts(rows)
         .into_iter()
         .map(|c| {
             // 没配上限的列两格都是 `None`：印成 0 会让「没有上限」看起来像
             // 「上限为零」，印成 `false` 会让「没有东西在拦」读成「拦过、没超」。
             let limit = limits.limit_for(&c.status);
+            // 卡片按最近动过的排前面：看板上最上面那张应当是刚刚在动的那张，
+            // 而不是 id 最小的那张。截断时丢掉的也就是最久没动的那一批。
+            let mut cards: Vec<&Task> = rows
+                .iter()
+                .copied()
+                .filter(|t| t.status.as_str() == c.status)
+                .collect();
+            cards.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            let cards_hidden = cards.len().saturating_sub(BOARD_CARDS_PER_COLUMN);
+            let cards: Vec<BoardCard> = cards
+                .into_iter()
+                .take(BOARD_CARDS_PER_COLUMN)
+                .map(|t| BoardCard {
+                    id: t.id.clone(),
+                    title: task_title(t),
+                    status: t.status.as_str().to_string(),
+                    parent_task_id: t.parent_task_id.clone().filter(|p| !p.is_empty()),
+                    blocked: !t.blocked_by.is_empty()
+                        && !t
+                            .blocked_by
+                            .iter()
+                            .all(|d| done.get(d.as_str()).copied().unwrap_or(false)),
+                    has_acceptance: !t.acceptance.is_empty(),
+                })
+                .collect();
             BoardColumn {
                 wip_limit: limit,
                 // 满了就拦：到达上限这一刻，发布侧已经不再往这一列放新活。读面
@@ -534,6 +819,8 @@ fn build_board_columns(rows: &[&Task], limits: &cog_core::BoardWipLimits) -> Vec
                 over_limit: limit.map(|limit| c.count >= limit),
                 status: c.status,
                 count: c.count,
+                cards,
+                cards_hidden,
             }
         })
         .collect()
@@ -597,7 +884,7 @@ pub async fn project_board_handler(
             "board WIP limit entry ignored"
         );
     }
-    let columns = build_board_columns(&rows, &limits);
+    let columns = build_board_columns(&rows, &tasks, &limits);
 
     Ok(Json(BoardResponse {
         project_id: id,
@@ -643,6 +930,14 @@ pub async fn project_evm_handler(
         return Err(ApiError::not_found(format!("project {id}")));
     }
 
+    Ok(Json(evm_view(&state, id, &rows).await))
+}
+
+/// 一次挣值的完整读数：三张表的取数与拼装。
+///
+/// 与 handler 分开，是因为导出也要这一份——导出另算一遍的话，表里的数和页面
+/// 上的数会在某一天悄悄分家，而分家的那一天没人能裁决谁对。
+async fn evm_view(state: &Arc<GatewayState>, id: String, rows: &[&Task]) -> EvmResponse {
     let plans = readable_plans(&state.orchestrator).await;
     let now = chrono::Utc::now();
 
@@ -660,7 +955,7 @@ pub async fn project_evm_handler(
             };
             // 归因缺口的窗口：从这些任务最早的那一刻（有基线就用计划起点）到现在。
             // 账上归不到任何一件任务的行无法归属到任何项目，只能报这个窗口里的总量。
-            let since = evm_window_start(&rows, plans.as_ref());
+            let since = evm_window_start(rows, plans.as_ref());
             let unattributed = match store.unattributed_between(since, now).await {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -673,14 +968,7 @@ pub async fn project_evm_handler(
         None => (None, None),
     };
 
-    Ok(Json(build_evm_response(
-        id,
-        &rows,
-        plans.as_ref(),
-        spends.as_ref(),
-        unattributed,
-        now,
-    )))
+    build_evm_response(id, rows, plans.as_ref(), spends.as_ref(), unattributed, now)
 }
 
 /// 归因缺口的统计窗口起点：这一批任务里最早的那一刻。
@@ -1041,6 +1329,647 @@ fn build_gantt_response(
     }
 }
 
+// ─── 范围树：谁挂在谁下面 ────────────────────────────────────────────
+
+/// 范围树上的一个节点。
+///
+/// 嵌套已经表达了层级；`depth` 再写一遍是因为前端要按深度配缩进与竖线，而从
+/// 嵌套里数深度得在渲染时维护状态——渲染器一旦被虚拟滚动裁掉一段，那个状态就
+/// 断了，缩进会错位。
+#[derive(Debug, Serialize, PartialEq)]
+pub struct WbsNode {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    /// 根是 0。
+    pub depth: usize,
+    /// 验收标准的条数。0 不是「不用验收」，是「这一片活没有做完的判据」。
+    pub acceptance: usize,
+    pub children: Vec<WbsNode>,
+}
+
+impl WbsNode {
+    fn leaf(t: &Task, depth: usize) -> Self {
+        Self {
+            id: t.id.clone(),
+            title: task_title(t),
+            status: t.status.as_str().to_string(),
+            depth,
+            acceptance: t.acceptance.len(),
+            children: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct WbsResponse {
+    pub project_id: String,
+    /// 本来就没有父节点的那些。
+    pub roots: Vec<WbsNode>,
+    /// 有父节点、而父节点不在这个项目的可见集合里的那些。
+    ///
+    /// 它们**不是根**：根读作「这一片活顶在最上面」，这里读作「这一片活的上面
+    /// 少了一块」。两者在界面上必须分开写，否则一棵缺了一块树的树会被当成一棵
+    /// 完整的树来读。
+    pub orphan_parents: Vec<WbsNode>,
+    /// 父指针成环的那些：从任何根都走不到，渲染时如果按「递归画子节点」硬走
+    /// 会直接卡死。
+    pub cycles: Vec<WbsNode>,
+    /// 这个项目可见的任务总数。它必须等于三个桶之和——不等就是有行落在了所有
+    /// 桶之外。
+    pub total: usize,
+    pub source: Source,
+}
+
+/// 递归的最大深度。超过它按环处理，不继续往下走。
+///
+/// 真实的分解深度个位数；一个四千层的链只可能来自坏数据或有人手工造环，那时
+/// 递归会把网关的栈打穿——而栈溢出不是一个能被 `Result` 接住的错误。
+const WBS_DEPTH_CAP: usize = 256;
+
+/// 把一批任务折成一棵范围树。
+///
+/// 判据与拼装分开，好直接喂数据：一棵只能起整套网关才验得到的树，实际上不会
+/// 被验。
+pub(crate) fn build_wbs_tree(project_id: String, rows: &[&Task]) -> WbsResponse {
+    let by_id: BTreeMap<&str, &Task> = rows.iter().map(|t| (t.id.as_str(), *t)).collect();
+
+    // 子节点按 (创建时刻, id) 排：与甘特同一把尺子，两次读要逐行相同。
+    let order = |v: &mut Vec<&Task>| {
+        v.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    };
+
+    let mut children_of: BTreeMap<&str, Vec<&Task>> = BTreeMap::new();
+    let mut root_tasks: Vec<&Task> = Vec::new();
+    let mut orphan_tasks: Vec<&Task> = Vec::new();
+    for t in rows {
+        match t.parent_task_id.as_deref() {
+            None | Some("") => root_tasks.push(t),
+            // 自指不是非法父节点，是环里最短的一种；下面按环处理，不在这里放行。
+            Some(p) if p == t.id.as_str() => {}
+            Some(p) => match by_id.get(p) {
+                Some(_) => children_of.entry(p).or_default().push(t),
+                None => orphan_tasks.push(t),
+            },
+        }
+    }
+    order(&mut root_tasks);
+    order(&mut orphan_tasks);
+
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let roots: Vec<WbsNode> = root_tasks
+        .iter()
+        .map(|t| build_subtree(t, 0, &children_of, &mut seen))
+        .collect();
+    let orphan_parents: Vec<WbsNode> = orphan_tasks
+        .iter()
+        .map(|t| build_subtree(t, 0, &children_of, &mut seen))
+        .collect();
+
+    // 剩下的：从任何根都走不到、父指针又不是「找不到」的那些。它们只可能在环里。
+    let mut cycle_tasks: Vec<&Task> = rows
+        .iter()
+        .filter(|t| !seen.contains(t.id.as_str()))
+        .copied()
+        .collect();
+    order(&mut cycle_tasks);
+    let cycles: Vec<WbsNode> = cycle_tasks.iter().map(|t| WbsNode::leaf(t, 0)).collect();
+
+    // 每一行都要么在一棵树里、要么在环里：三桶之和不等于行数就是有行静静地
+    // 掉了——掉在哪一个桶外，界面上没有任何一处会说。
+    debug_assert_eq!(seen.len() + cycles.len(), rows.len());
+
+    WbsResponse {
+        project_id,
+        roots,
+        orphan_parents,
+        cycles,
+        total: rows.len(),
+        source: now_source("in-memory task graph"),
+    }
+}
+
+/// 一棵子树。`seen` 防重入：一棵树里同一个 id 出现两次只会来自坏数据，但它
+/// 一旦出现，按「节点数不等于行数」去报比让渲染器无限展开要好。
+fn build_subtree<'a>(
+    task: &'a Task,
+    depth: usize,
+    children_of: &BTreeMap<&'a str, Vec<&'a Task>>,
+    seen: &mut std::collections::BTreeSet<&'a str>,
+) -> WbsNode {
+    let mut node = WbsNode::leaf(task, depth);
+    if !seen.insert(task.id.as_str()) {
+        return node;
+    }
+    if depth >= WBS_DEPTH_CAP {
+        return node;
+    }
+    if let Some(children) = children_of.get(task.id.as_str()) {
+        node.children = children
+            .iter()
+            .map(|c| build_subtree(c, depth + 1, children_of, seen))
+            .collect();
+    }
+    node
+}
+
+pub async fn project_wbs_handler(
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<Extension<cog_core::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<WbsResponse>, ApiError> {
+    let claims = claims.as_ref().map(|Extension(c)| c);
+    let tasks = visible_tasks(&state, claims).await;
+    let rows = tasks_of_project(&tasks, &id);
+    if rows.is_empty() && id != UNGROUPED {
+        return Err(ApiError::not_found(format!("project {id}")));
+    }
+    Ok(Json(build_wbs_tree(id, &rows)))
+}
+
+/// 一个项目的改动时间线：谁、何时、改前改后，最近的在前。
+///
+/// 写操作从这一版起都留一行审计，写进 `audit_logs`；这个端点是那些行的读者。
+/// 没有读者时「写审计」只是往一张表里堆字节——而这一面最常犯的错，恰恰是有一个
+/// 看起来完整的面、没有人从里面取过东西。
+#[derive(Debug, serde::Deserialize)]
+pub struct ProjectAuditQuery {
+    /// 取多少行，默认 100，最多 500。
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+pub async fn project_audit_handler(
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<Extension<cog_core::Claims>>,
+    Path(id): Path<String>,
+    Query(q): Query<ProjectAuditQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let claims = claims.as_ref().map(|Extension(c)| c);
+    // 看不到的项目不给时间线：告诉一个租户「这个项目存在但你没权限」，
+    // 与告诉它「不存在」是不同的信息泄漏。
+    let tasks = visible_tasks(&state, claims).await;
+    if tasks_of_project(&tasks, &id).is_empty() && id != UNGROUPED {
+        return Err(ApiError::not_found(format!("project {id}")));
+    }
+    let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    let rows = match crate::project_audit::recent(&id, limit).await {
+        Ok(Some(rows)) => rows,
+        Ok(None) => {
+            return Err(ApiError::service_unavailable(
+                "this deployment has no audit store wired: the timeline of a project \
+                 cannot be answered from anywhere else",
+            )
+            .with_code("audit_store_missing"))
+        }
+        // 有存储、读失败。与上面那条分开：那条说这台部署没有审计，这条说这一次没读到。
+        // 客户看到「没有审计」会去问运维为什么关掉了审计，而真正的事是一次查询失败了。
+        Err(e) => {
+            return Err(ApiError::service_unavailable(format!(
+                "the audit store did not answer: {e}"
+            ))
+            .with_code("audit_read_failed"))
+        }
+    };
+    Ok(Json(serde_json::json!({
+        "project_id": id,
+        "count": rows.len(),
+        "rows": rows,
+        "source": now_source("audit_logs"),
+    })))
+}
+
+/// 新建一个项目：它就是一整棵 goal 树的根。
+///
+/// 在此之前「项目」只能是提交一次 goal 的副产物，而那条路要经过分解（实测
+/// 50–90 秒，异步），拿它建一个空项目既慢又会在树里长出十几条别人写的活。
+/// 建项目与拆分是两件事，前者是范围管理的第一步。
+#[derive(Debug, serde::Deserialize)]
+pub struct CreateProjectRequest {
+    /// 项目的名字。它就是根那一行在列表、树、看板上的标题。
+    pub name: String,
+    /// 归属租户。不填时只有在调用方恰好只属于一个 workspace 时才继承——猜一个
+    /// 的代价是项目悄悄落到另一家名下。
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CreateProjectResponse {
+    pub id: String,
+    pub name: String,
+    pub workspace_id: String,
+    pub source: Source,
+}
+
+/// 新项目落在哪个租户。与 [`project_workspace`] 同一套口径：能继承就继承，
+/// 不能继承就要求调用方说，绝不挑一个。
+fn new_project_workspace(
+    explicit: Option<&str>,
+    claims: Option<&cog_core::Claims>,
+) -> Result<String, String> {
+    if let Some(ws) = explicit.map(str::trim).filter(|w| !w.is_empty()) {
+        return Ok(ws.to_string());
+    }
+    match claims.map(|c| c.workspace_ids.as_slice()) {
+        Some([one]) if !one.is_empty() => Ok(one.clone()),
+        Some(many) if !many.is_empty() => Err(format!(
+            "you belong to {} workspaces ({}): pass `workspace_id` to say which one this \
+             project belongs to",
+            many.len(),
+            many.join(", ")
+        )),
+        _ => Err(
+            "cannot decide which workspace this project belongs to: pass `workspace_id`"
+                .to_string(),
+        ),
+    }
+}
+
+pub async fn create_project_handler(
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<Extension<cog_core::Claims>>,
+    Json(req): Json<CreateProjectRequest>,
+) -> Result<(StatusCode, Json<CreateProjectResponse>), ApiError> {
+    let claims = claims.as_ref().map(|Extension(c)| c);
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request(
+            "name is empty: a project with no name draws as its id everywhere",
+        ));
+    }
+    if name.chars().count() > MAX_TITLE_CHARS {
+        return Err(ApiError::bad_request(format!(
+            "name is {} characters; the cap is {MAX_TITLE_CHARS}",
+            name.chars().count()
+        )));
+    }
+    let workspace = new_project_workspace(req.workspace_id.as_deref(), claims)
+        .map_err(ApiError::bad_request)?;
+
+    if let Some(c) = claims {
+        if !c.workspace_ids.is_empty() && !c.workspace_ids.contains(&workspace) {
+            if let Some(ref stream) = state.audit_stream {
+                let _ = stream
+                    .append(
+                        cog_core::AuditKind::Authz,
+                        &c.sub,
+                        &workspace,
+                        "authz.workspace_denied",
+                        serde_json::json!({ "intent": "project.create" }),
+                    )
+                    .await;
+            }
+            return Err(ApiError::forbidden(format!(
+                "workspace '{workspace}' is outside your workspace scope"
+            )));
+        }
+    }
+
+    let project_id = uuid::Uuid::new_v4().to_string();
+    let mut root = Task::goal_row(project_id.clone(), name);
+    root.workspace_id = Some(workspace.clone());
+    state.orchestrator.add_task(root).await?;
+
+    if let Some(ref stream) = state.audit_stream {
+        let _ = stream
+            .append(
+                cog_core::AuditKind::Custom("project".into()),
+                claims.map(|c| c.sub.as_str()).unwrap_or("system"),
+                &project_id,
+                "project.created",
+                serde_json::json!({ "name": name, "workspace_id": workspace }),
+            )
+            .await;
+    }
+    crate::project_audit::record(cog_storage::postgres::AuditEntry {
+        actor: claims
+            .map(|c| c.sub.clone())
+            .unwrap_or_else(|| "system".into()),
+        action: "project.created".into(),
+        resource_type: "project".into(),
+        resource_id: project_id.clone(),
+        project_id: project_id.clone(),
+        before: serde_json::Value::Null,
+        after: serde_json::json!({ "name": name, "workspace_id": workspace }),
+    })
+    .await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateProjectResponse {
+            id: project_id,
+            name: name.to_string(),
+            workspace_id: workspace,
+            source: now_source("in-memory task graph"),
+        }),
+    ))
+}
+
+// ─── 写面：人能把活放进范围树 ──────────────────────────────────────────
+
+/// 在项目下新建一条任务。
+///
+/// 这是这一面的第一个写端点。在此之前范围结构只能由编排侧的分解产出：任务图的
+/// 十一个写端点都是状态机操作，没有一个是「新建一片活、挂在谁下面」。于是一个
+/// 客户能看到一棵树，却没有一条路径能把树改对。
+#[derive(Debug, serde::Deserialize)]
+pub struct CreateProjectTaskRequest {
+    /// 一行标题，就是它在树、看板、甘特上的名字。
+    pub title: String,
+    /// 挂在哪一片下面。不给就是项目的顶层。
+    #[serde(default)]
+    pub parent_task_id: Option<String>,
+    /// 验收标准。工作包没有它，做完与没做完就没有判据。
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    /// 上下游关系：这些任务必须先完成。
+    #[serde(default)]
+    pub blocked_by: Vec<String>,
+    /// 只有项目自己的行跨了多个 workspace 时才需要：那时没有「项目的租户」
+    /// 可以继承，必须在请求里说清楚这条活落在谁家。
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CreateProjectTaskResponse {
+    pub id: String,
+    pub project_id: String,
+    pub parent_task_id: Option<String>,
+    pub status: &'static str,
+    pub source: Source,
+}
+
+/// 一条新任务放不进这棵树的哪一种原因。
+///
+/// 做成闭集而不是一串字符串：每一种的改法不同（换个父节点、换个项目、补一个
+/// workspace），而读者只能从词上分辨它们。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PlacementError {
+    /// 未分组桶装的是「没有 goal 的行」，它不是容器，不能往里放新活。
+    UngroupedIsNotAContainer,
+    UnknownParent(String),
+    ParentInAnotherProject {
+        parent: String,
+        project: String,
+    },
+    UnknownDependency(String),
+    /// 项目自己的行没有 workspace，或者跨了几个：没有可继承的租户。
+    WorkspaceAmbiguous(String),
+}
+
+impl PlacementError {
+    /// 稳定的机器标识。改它等于改判据的身份，客户端按它分支。
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::UngroupedIsNotAContainer => "ungrouped_is_not_a_container",
+            Self::UnknownParent(_) => "unknown_parent",
+            Self::ParentInAnotherProject { .. } => "parent_in_another_project",
+            Self::UnknownDependency(_) => "unknown_dependency",
+            Self::WorkspaceAmbiguous(_) => "workspace_ambiguous",
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::UngroupedIsNotAContainer => format!(
+                "`{UNGROUPED}` is a bucket for rows that have no goal, not a container: \
+                 a new task has to land inside a real project"
+            ),
+            Self::UnknownParent(parent) => format!(
+                "parent `{parent}` does not exist in anything you can see: \
+                 a parent pointer that names nothing would hang the new task off a node \
+                 no reader will ever render"
+            ),
+            Self::ParentInAnotherProject { parent, project } => format!(
+                "parent `{parent}` belongs to project `{project}`, not to this one: \
+                 a cross-project parent makes the scope tree of one project reach into another"
+            ),
+            Self::UnknownDependency(dep) => format!(
+                "blocked_by names `{dep}`, which is not a task of this project: \
+                 the new task would wait on something that will never run"
+            ),
+            Self::WorkspaceAmbiguous(why) => format!(
+                "cannot decide which workspace this task belongs to ({why}); \
+                 pass `workspace_id` explicitly"
+            ),
+        }
+    }
+
+    fn into_api(self) -> ApiError {
+        // 400 而不是 500：改的那一处是请求本身（换父节点、补 workspace），
+        // 重试同一条请求不会自己变好。码走 `code` 那一格，不塞进 message——
+        // 客户端按码分支，不按措辞。
+        ApiError::bad_request(self.message()).with_code(self.code())
+    }
+}
+
+/// 把一条新任务放进这棵树之前要过的三关：父节点存在、父节点在同一项目、
+/// 依赖都在同一项目里。
+///
+/// 判据与拼装分开，是因为它才是这一面唯一的实质：一个只能起整套网关才验得到
+/// 的校验，实际上不会被验。
+pub(crate) fn check_placement(
+    project_id: &str,
+    tasks: &[Task],
+    parent: Option<&str>,
+    blocked_by: &[String],
+) -> Result<(), PlacementError> {
+    if project_id == UNGROUPED {
+        return Err(PlacementError::UngroupedIsNotAContainer);
+    }
+    if let Some(parent) = parent {
+        let found = tasks.iter().find(|t| t.id == parent);
+        match found {
+            None => return Err(PlacementError::UnknownParent(parent.to_string())),
+            Some(p) if p.project_key() != project_id => {
+                return Err(PlacementError::ParentInAnotherProject {
+                    parent: parent.to_string(),
+                    project: p.project_key().to_string(),
+                })
+            }
+            Some(_) => {}
+        }
+    }
+    for dep in blocked_by {
+        match tasks.iter().find(|t| &t.id == dep) {
+            // 跨项目的依赖同样不成立：它在另一个项目里，永远不会被当成这一片的上游
+            // 去推进，而这条新任务会静静地等它到天荒地老。
+            Some(t) if t.project_key() == project_id => {}
+            _ => return Err(PlacementError::UnknownDependency(dep.clone())),
+        }
+    }
+    Ok(())
+}
+
+/// 这条新任务落在哪个租户。
+///
+/// 继承优先于猜：项目自己那些行都写着同一个 workspace 时，新行跟着它；跨了几个
+/// 或者一个都没有时不挑一个，而是要求调用方说清楚。挑一个的代价是数据悄悄落到
+/// 另一个租户名下，而租户错了之后没有任何读面会红。
+pub(crate) fn project_workspace(
+    rows: &[&Task],
+    explicit: Option<&str>,
+) -> Result<String, PlacementError> {
+    if let Some(ws) = explicit.map(str::trim).filter(|w| !w.is_empty()) {
+        return Ok(ws.to_string());
+    }
+    let mut seen: Vec<&str> = rows
+        .iter()
+        .filter_map(|t| t.workspace_id.as_deref())
+        .filter(|w| !w.is_empty())
+        .collect();
+    seen.sort_unstable();
+    seen.dedup();
+    match seen.as_slice() {
+        [one] => Ok((*one).to_string()),
+        [] => Err(PlacementError::WorkspaceAmbiguous(
+            "none of this project's rows carries a workspace".into(),
+        )),
+        many => Err(PlacementError::WorkspaceAmbiguous(format!(
+            "this project's rows span {} workspaces: {}",
+            many.len(),
+            many.join(", ")
+        ))),
+    }
+}
+
+/// 新的范围行。`id` 由调用方给（handler 用 uuid），这样同一段拼装也能在测试里
+/// 拿固定 id 断言。
+pub(crate) fn build_project_task(
+    id: String,
+    project_id: &str,
+    workspace: &str,
+    req: &CreateProjectTaskRequest,
+) -> Task {
+    let mut task = Task::new(
+        id,
+        cog_core::TaskType::DagNode,
+        serde_json::json!({ "name": req.title.trim() }),
+    );
+    task.goal_id = Some(project_id.to_string());
+    task.parent_task_id = req.parent_task_id.clone();
+    task.workspace_id = Some(workspace.to_string());
+    task.acceptance = req.acceptance.clone();
+    task.blocked_by = req.blocked_by.clone();
+    // 人建出来的一片活默认是可执行的叶子；它是不是父节点由别人挂不挂在它下面
+    // 决定，不由这一行自己声明。
+    task.is_executable = true;
+    task
+}
+
+/// 标题的上限。超了拒绝而不是截断：截断之后存下来的就不是用户写的那个名字，
+/// 而界面上没有任何地方会说它被改过。
+pub(crate) const MAX_TITLE_CHARS: usize = 200;
+
+pub async fn create_project_task_handler(
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<Extension<cog_core::Claims>>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateProjectTaskRequest>,
+) -> Result<(StatusCode, Json<CreateProjectTaskResponse>), ApiError> {
+    let claims = claims.as_ref().map(|Extension(c)| c);
+    let title = req.title.trim();
+    if title.is_empty() {
+        return Err(ApiError::bad_request(
+            "title is empty: a task with no name draws on the board as its id",
+        ));
+    }
+    if title.chars().count() > MAX_TITLE_CHARS {
+        return Err(ApiError::bad_request(format!(
+            "title is {} characters; the cap is {MAX_TITLE_CHARS}",
+            title.chars().count()
+        )));
+    }
+
+    let tasks = visible_tasks(&state, claims).await;
+    let rows = tasks_of_project(&tasks, &id);
+    if rows.is_empty() && id != UNGROUPED {
+        return Err(ApiError::not_found(format!("project {id}")));
+    }
+
+    check_placement(&id, &tasks, req.parent_task_id.as_deref(), &req.blocked_by)
+        .map_err(PlacementError::into_api)?;
+    let workspace =
+        project_workspace(&rows, req.workspace_id.as_deref()).map_err(PlacementError::into_api)?;
+
+    // 与任务面同一条判据：往别人的租户里放活的请求，连写都没开始就被拒。
+    if let Some(c) = claims {
+        if !c.workspace_ids.is_empty() && !c.workspace_ids.contains(&workspace) {
+            if let Some(ref stream) = state.audit_stream {
+                let _ = stream
+                    .append(
+                        cog_core::AuditKind::Authz,
+                        &c.sub,
+                        &workspace,
+                        "authz.workspace_denied",
+                        serde_json::json!({ "project_id": id }),
+                    )
+                    .await;
+            }
+            return Err(ApiError::forbidden(format!(
+                "workspace '{workspace}' is outside your workspace scope"
+            )));
+        }
+    }
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let task = build_project_task(task_id.clone(), &id, &workspace, &req);
+    let parent = task.parent_task_id.clone();
+    state.orchestrator.add_task(task).await?;
+
+    // 写下来就要查得到「谁在什么时候把这片活放进了哪棵树」。审计流是这一面
+    // 唯一不会被后续写覆盖的地方。
+    if let Some(ref stream) = state.audit_stream {
+        let _ = stream
+            .append(
+                cog_core::AuditKind::Custom("project_task".into()),
+                claims.map(|c| c.sub.as_str()).unwrap_or("system"),
+                &task_id,
+                "project.task_created",
+                serde_json::json!({
+                    "project_id": id,
+                    "parent_task_id": parent,
+                    "workspace_id": workspace,
+                    "title": title,
+                }),
+            )
+            .await;
+    }
+    crate::project_audit::record(cog_storage::postgres::AuditEntry {
+        actor: claims
+            .map(|c| c.sub.clone())
+            .unwrap_or_else(|| "system".into()),
+        action: "project.task_created".into(),
+        resource_type: "task".into(),
+        resource_id: task_id.clone(),
+        project_id: id.clone(),
+        before: serde_json::Value::Null,
+        after: serde_json::json!({
+            "parent_task_id": parent,
+            "workspace_id": workspace,
+            "title": title,
+        }),
+    })
+    .await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateProjectTaskResponse {
+            id: task_id,
+            project_id: id,
+            parent_task_id: parent,
+            status: TaskStatus::Pending.as_str(),
+            source: now_source("in-memory task graph"),
+        }),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1250,7 +2179,7 @@ mod tests {
     fn board_columns_report_no_limit_as_absent_rather_than_as_no_overflow() {
         let t = task("a", Some("g1"));
         let (limits, _) = cog_core::BoardWipLimits::from_spec("");
-        let columns = build_board_columns(&[&t], &limits);
+        let columns = build_board_columns(&[&t], &[t.clone()], &limits);
         assert!(columns.iter().all(|c| c.wip_limit.is_none()));
         assert!(columns.iter().all(|c| c.over_limit.is_none()));
     }
@@ -1266,7 +2195,7 @@ mod tests {
         b.status = cog_core::TaskStatus::Running;
         let (limits, problems) = cog_core::BoardWipLimits::from_spec("running=2,scheduled=8");
         assert!(problems.is_empty(), "{problems:?}");
-        let columns = build_board_columns(&[&a, &b], &limits);
+        let columns = build_board_columns(&[&a, &b], &[a.clone(), b.clone()], &limits);
         let running = columns.iter().find(|c| c.status == "running").unwrap();
         assert_eq!(running.count, 2);
         assert_eq!(running.wip_limit, Some(2));
@@ -1279,13 +2208,64 @@ mod tests {
         assert_eq!(pending.over_limit, None);
     }
 
+    /// 卡片要真的在这一列里，而且缺依赖、缺验收标准这两件事必须写在卡片上：
+    /// 它们正是「这张卡现在能不能动、能不能给它排期」的判据，界面自己去猜
+    /// 就得再读一次任务详情，两处判据迟早分开。
+    #[test]
+    fn a_column_carries_the_cards_it_counts_with_their_blocking_state() {
+        let mut done_dep = task("dep", Some("g1"));
+        done_dep.status = cog_core::TaskStatus::Completed;
+        let mut a = task("a", Some("g1"));
+        a.status = cog_core::TaskStatus::Pending;
+        a.blocked_by = vec!["dep".into()];
+        a.acceptance = vec!["the tests pass".into()];
+        let mut b = task("b", Some("g1"));
+        b.status = cog_core::TaskStatus::Pending;
+        b.blocked_by = vec!["nobody".into()];
+        let all = vec![done_dep, a.clone(), b.clone()];
+        let rows: Vec<&Task> = vec![&a, &b];
+
+        let (limits, _) = cog_core::BoardWipLimits::from_spec("");
+        let columns = build_board_columns(&rows, &all, &limits);
+        let pending = columns.iter().find(|c| c.status == "pending").unwrap();
+        assert_eq!(pending.count, 2);
+        assert_eq!(pending.cards.len(), 2, "计数是 2 就得有 2 张卡");
+        assert_eq!(pending.cards_hidden, 0);
+
+        let card_a = pending.cards.iter().find(|c| c.id == "a").unwrap();
+        assert!(!card_a.blocked, "依赖已完成就不是卡住的");
+        assert!(card_a.has_acceptance);
+        let card_b = pending.cards.iter().find(|c| c.id == "b").unwrap();
+        assert!(
+            card_b.blocked,
+            "依赖不在可见的这一批里也算卡住——看不见的依赖不能当成已完成"
+        );
+        assert!(!card_b.has_acceptance);
+    }
+
+    /// 一列超过上限时截断，并把没带回来的张数说出来。静默截断会让一列看起来
+    /// 正好装得下，而「装得下」正是上限这一格要回答的问题。
+    #[test]
+    fn a_column_over_the_card_cap_says_how_many_it_left_out() {
+        let tasks: Vec<Task> = (0..BOARD_CARDS_PER_COLUMN + 5)
+            .map(|i| task(&format!("t{i:04}"), Some("g1")))
+            .collect();
+        let rows: Vec<&Task> = tasks.iter().collect();
+        let (limits, _) = cog_core::BoardWipLimits::from_spec("");
+        let columns = build_board_columns(&rows, &tasks, &limits);
+        let pending = columns.iter().find(|c| c.status == "pending").unwrap();
+        assert_eq!(pending.count, BOARD_CARDS_PER_COLUMN + 5);
+        assert_eq!(pending.cards.len(), BOARD_CARDS_PER_COLUMN);
+        assert_eq!(pending.cards_hidden, 5);
+    }
+
     /// 六列的集合与顺序固定：缺的列要显式出 0，否则「这一列没有任务」与
     /// 「这一列不在读数里」在读面上同形。
     #[test]
     fn board_columns_are_all_six_statuses_in_a_fixed_order() {
         let t = task("a", Some("g1"));
         let (limits, _) = cog_core::BoardWipLimits::from_spec("");
-        let columns = build_board_columns(&[&t], &limits);
+        let columns = build_board_columns(&[&t], &[t.clone()], &limits);
         let order: Vec<&str> = columns.iter().map(|c| c.status.as_str()).collect();
         let expected: Vec<&str> = cog_core::TaskStatus::ALL
             .iter()
@@ -1690,5 +2670,254 @@ mod tests {
             ids,
             second.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
         );
+    }
+
+    /// 父节点必须在这一棵树上，而且必须在**同一棵树**上：跨项目的父指针会让一个
+    /// 项目的范围树伸进另一个项目，而两个项目的行在界面上各画各的，那条边永远
+    /// 没人看得见。
+    #[test]
+    fn a_parent_from_another_project_is_refused() {
+        let tasks = vec![task("p-other", Some("g2")), task("a", Some("g1"))];
+        let err = check_placement("g1", &tasks, Some("p-other"), &[]).unwrap_err();
+        assert_eq!(
+            err,
+            PlacementError::ParentInAnotherProject {
+                parent: "p-other".into(),
+                project: "g2".into()
+            }
+        );
+        assert_eq!(err.code(), "parent_in_another_project");
+    }
+
+    /// 指着一个不存在的父节点挂上去，这一片活会挂在任何读面都渲染不出来的地方：
+    /// 它会被调度、会跑完、会报 Completed，只是从来不在任何一棵树上。
+    #[test]
+    fn a_parent_that_names_nothing_is_refused() {
+        let tasks = vec![task("a", Some("g1"))];
+        let err = check_placement("g1", &tasks, Some("ghost"), &[]).unwrap_err();
+        assert_eq!(err, PlacementError::UnknownParent("ghost".into()));
+    }
+
+    /// 未分组不是容器：它是「没有 goal 的行」那个桶。往桶里放新活，等于造一条
+    /// 永远没有 goal 的任务，而它进桶的理由（用户当初没写 goal）根本不成立。
+    #[test]
+    fn the_ungrouped_bucket_is_not_a_container() {
+        let tasks = vec![task("a", Some("g1"))];
+        let err = check_placement(UNGROUPED, &tasks, None, &[]).unwrap_err();
+        assert_eq!(err, PlacementError::UngroupedIsNotAContainer);
+    }
+
+    /// 依赖也必须在同一项目里：指向别处的上游永远不会被当成这一片的上游去推进，
+    /// 这条新任务就静静地等到天荒地老。
+    #[test]
+    fn a_dependency_outside_the_project_is_refused() {
+        let tasks = vec![task("dep", Some("g2"))];
+        let err = check_placement("g1", &tasks, None, &["dep".into()]).unwrap_err();
+        assert_eq!(err, PlacementError::UnknownDependency("dep".into()));
+    }
+
+    /// 顶层任务与项目内的父节点都要放行——拒绝不是这一格的默认答案。
+    #[test]
+    fn a_root_task_and_a_same_project_parent_are_both_allowed() {
+        let tasks = vec![task("p", Some("g1")), task("dep", Some("g1"))];
+        check_placement("g1", &tasks, None, &[]).expect("顶层任务");
+        check_placement("g1", &tasks, Some("p"), &["dep".into()]).expect("项目内的父与依赖");
+    }
+
+    /// 新任务继承项目的租户：项目自己的行都写着同一个 workspace 时，跟着它走。
+    /// 这条是新任务落在谁家名下唯一的判据——猜错之后没有任何读面会红。
+    #[test]
+    fn a_new_task_inherits_the_projects_workspace() {
+        let mut a = task("a", Some("g1"));
+        a.workspace_id = Some("default".into());
+        let mut b = task("b", Some("g1"));
+        b.workspace_id = Some("default".into());
+        let rows = vec![&a, &b];
+        assert_eq!(project_workspace(&rows, None).unwrap(), "default");
+        assert_eq!(project_workspace(&rows, Some("other")).unwrap(), "other");
+    }
+
+    /// 跨了几个 workspace 的项目里不挑一个：挑中的那个会让一半的行看到一条
+    /// 不属于自己租户的新任务，而另一半看不到。
+    #[test]
+    fn an_ambiguous_workspace_is_refused_rather_than_guessed() {
+        let mut a = task("a", Some("g1"));
+        a.workspace_id = Some("default".into());
+        let mut b = task("b", Some("g1"));
+        b.workspace_id = Some("other".into());
+        let rows = vec![&a, &b];
+        let err = project_workspace(&rows, None).unwrap_err();
+        assert_eq!(err.code(), "workspace_ambiguous");
+
+        // 一行都没有 workspace 时同样不猜：那是「这个项目不归属于任何人」，
+        // 不是「归属默认租户」。
+        let bare = task("c", Some("g1"));
+        assert_eq!(
+            project_workspace(&[&bare], None).unwrap_err().code(),
+            "workspace_ambiguous"
+        );
+    }
+
+    fn claims_with(workspaces: &[&str]) -> cog_core::Claims {
+        cog_core::Claims {
+            sub: "u1".into(),
+            iss: "test".into(),
+            aud: "test".into(),
+            exp: 0,
+            iat: 0,
+            jti: "j".into(),
+            preferred_username: "tester".into(),
+            user_type: cog_core::UserType::Standard,
+            workspace_ids: workspaces.iter().map(|w| w.to_string()).collect(),
+            permissions: Vec::new(),
+            roles: Vec::new(),
+        }
+    }
+
+    /// 调用方只属于一个 workspace ⇒ 新项目跟着它走，不用每次都说。
+    #[test]
+    fn a_new_project_inherits_the_only_workspace_of_its_creator() {
+        let c = claims_with(&["acme"]);
+        assert_eq!(new_project_workspace(None, Some(&c)).unwrap(), "acme");
+    }
+
+    /// 属于多个 workspace 时不挑一个：挑中的那个会让项目出现在一半同事看得到、
+    /// 另一半看不到的地方，而创建它的人不会收到任何提示。
+    #[test]
+    fn a_creator_with_several_workspaces_must_name_one() {
+        let c = claims_with(&["acme", "globex"]);
+        let err = new_project_workspace(None, Some(&c)).unwrap_err();
+        assert!(
+            err.contains("workspace_id"),
+            "判词要让读者知道改哪一处: {err}"
+        );
+        assert_eq!(
+            new_project_workspace(Some("globex"), Some(&c)).unwrap(),
+            "globex"
+        );
+    }
+
+    /// 没有 claims（内部调用）也没有显式 workspace 时同样不猜。
+    #[test]
+    fn a_caller_with_no_workspace_must_name_one() {
+        assert!(new_project_workspace(None, None).is_err());
+        let empty = claims_with(&[]);
+        assert!(new_project_workspace(None, Some(&empty)).is_err());
+    }
+
+    /// 一棵正常的树：父节点带着它的子节点，深度按层递增。
+    #[test]
+    fn the_wbs_tree_nests_children_under_their_parent() {
+        let mut root = task("g1", Some("g1"));
+        root.is_executable = false;
+        let mut child = task("c1", Some("g1"));
+        child.parent_task_id = Some("g1".into());
+        let mut grandchild = task("c2", Some("g1"));
+        grandchild.parent_task_id = Some("c1".into());
+        let rows = vec![&root, &child, &grandchild];
+
+        let wbs = build_wbs_tree("g1".into(), &rows);
+        assert_eq!(wbs.total, 3);
+        assert_eq!(wbs.roots.len(), 1, "只有没父节点的那一片是根");
+        assert!(wbs.orphan_parents.is_empty());
+        assert!(wbs.cycles.is_empty());
+        let top = &wbs.roots[0];
+        assert_eq!(top.id, "g1");
+        assert_eq!(top.depth, 0);
+        assert_eq!(top.children.len(), 1);
+        assert_eq!(top.children[0].id, "c1");
+        assert_eq!(top.children[0].depth, 1);
+        assert_eq!(top.children[0].children[0].id, "c2");
+        assert_eq!(top.children[0].children[0].depth, 2);
+    }
+
+    /// 父指针指着项目外的东西：那一片活进 `orphan_parents`，**不进 roots**。
+    /// 混进 roots 的话，一棵缺了一块的树会被读成一棵完整的树。
+    #[test]
+    fn a_task_whose_parent_is_missing_lands_in_orphan_parents_not_in_roots() {
+        let mut orphan = task("o1", Some("g1"));
+        orphan.parent_task_id = Some("gone".into());
+        let root = task("g1", Some("g1"));
+        let rows = vec![&root, &orphan];
+
+        let wbs = build_wbs_tree("g1".into(), &rows);
+        assert_eq!(wbs.roots.len(), 1);
+        assert_eq!(wbs.roots[0].id, "g1");
+        assert_eq!(wbs.orphan_parents.len(), 1);
+        assert_eq!(wbs.orphan_parents[0].id, "o1");
+        assert_eq!(
+            wbs.orphan_parents[0].depth, 0,
+            "它自己就是这一支的顶，深度从 0 起，但它不是项目的根"
+        );
+    }
+
+    /// 环里的节点从任何根都走不到。按「递归画子节点」硬走会卡死渲染器，所以
+    /// 它们单独成一桶，三个桶加起来必须等于总行数。
+    #[test]
+    fn a_parent_cycle_lands_in_its_own_bucket_and_nothing_is_dropped() {
+        let mut a = task("a", Some("g1"));
+        a.parent_task_id = Some("b".into());
+        let mut b = task("b", Some("g1"));
+        b.parent_task_id = Some("a".into());
+        let root = task("g1", Some("g1"));
+        let rows = vec![&root, &a, &b];
+
+        let wbs = build_wbs_tree("g1".into(), &rows);
+        assert_eq!(wbs.roots.len(), 1);
+        assert!(wbs.orphan_parents.is_empty());
+        assert_eq!(wbs.cycles.len(), 2, "环里的两片都要被点出来，不是丢掉一片");
+        assert_eq!(wbs.total, 3);
+        let in_buckets = wbs.roots.len() + wbs.orphan_parents.len() + wbs.cycles.len();
+        assert_eq!(in_buckets, 0 + 1 + 2);
+    }
+
+    /// 自己指着自己是环里最短的一种，不能当成「没有父节点」。
+    #[test]
+    fn a_self_parent_is_a_cycle() {
+        let mut t = task("s", Some("g1"));
+        t.parent_task_id = Some("s".into());
+        let rows = vec![&t];
+        let wbs = build_wbs_tree("g1".into(), &rows);
+        assert!(wbs.roots.is_empty());
+        assert_eq!(wbs.cycles.len(), 1);
+        assert_eq!(wbs.total, 1);
+    }
+
+    /// 拆列出来的节点带着人写的验收标准：条数为 0 的任务在树上是「没有做完的
+    /// 判据」，这个 0 必须能读出来。
+    #[test]
+    fn a_node_carries_its_acceptance_count() {
+        let mut t = task("a", Some("g1"));
+        t.acceptance = vec!["跑通门测试".into(), "读数有消费者".into()];
+        let rows = vec![&t];
+        let wbs = build_wbs_tree("g1".into(), &rows);
+        assert_eq!(wbs.roots[0].acceptance, 2);
+    }
+
+    /// 拼出来的那一行要带着人写的东西：名字、父节点、验收标准、依赖、租户。
+    /// 少一样，界面上画出来的就是一条和用户写的不一样的活。
+    #[test]
+    fn the_new_row_carries_what_the_caller_wrote() {
+        let req = CreateProjectTaskRequest {
+            title: "  拆出第一片  ".into(),
+            parent_task_id: Some("p".into()),
+            acceptance: vec!["跑通门测试".into()],
+            blocked_by: vec!["dep".into()],
+            workspace_id: None,
+        };
+        let t = build_project_task("new".into(), "g1", "default", &req);
+        assert_eq!(t.id, "new");
+        assert_eq!(t.goal_id.as_deref(), Some("g1"));
+        assert_eq!(t.parent_task_id.as_deref(), Some("p"));
+        assert_eq!(t.workspace_id.as_deref(), Some("default"));
+        assert_eq!(t.acceptance, vec!["跑通门测试".to_string()]);
+        assert_eq!(t.blocked_by, vec!["dep".to_string()]);
+        assert_eq!(
+            t.input["name"],
+            serde_json::json!("拆出第一片"),
+            "标题两端的空白不该进名字"
+        );
+        assert_eq!(t.status, TaskStatus::Pending);
+        assert!(t.is_executable);
     }
 }
