@@ -5760,8 +5760,16 @@ impl MainlineDeployer {
                     );
                     state.failed_rev = Some(inflight.rev.clone());
                     state.failed_class = class;
-                    state.failed_cooldown_until =
-                        chrono::Utc::now().timestamp() + self.cfg.failure_cooldown_secs as i64;
+                    // 这一格只对环境类有意义：它说的是「隔多久再看一眼这台集群」，
+                    // 而版本类失败没有时间维度（等的是有人改代码，改完是一个新
+                    // rev）。无条件写它，状态文件里就会在一个版本类失败边上写
+                    // 「还要冷却到几点」——读的人以为有一段空转正在发生，实际没有。
+                    state.failed_cooldown_until = match class {
+                        FailureClass::Environment => {
+                            chrono::Utc::now().timestamp() + self.cfg.failure_cooldown_secs as i64
+                        }
+                        FailureClass::Version => 0,
+                    };
                     state.in_flight = None;
                     self.save_state(&state)?;
                     return Ok(());
@@ -17695,6 +17703,10 @@ exit 0
             state.failed_signatures.len(),
             1,
             "同一处坏不重复入账：签名集合记的是见过哪些落点"
+        );
+        assert_eq!(
+            state.failed_cooldown_until, 0,
+            "版本类失败没有时间维度：这一格写着一个未来的时刻，读的人会以为有一段空转正在发生"
         );
     }
 
