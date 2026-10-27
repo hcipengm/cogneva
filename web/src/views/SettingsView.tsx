@@ -577,14 +577,18 @@ export function SettingsView() {
         <header className="flex items-center gap-3 px-4 py-2">
           <h2 className="text-[12px]">评估集</h2>
           <span className="text-[11px] text-[var(--muted)]">
-            列的是磁盘上真的有的用例集；空列表是「一个都没有」，不是读失败
+            列的是磁盘上真的有的用例集；空列表是「一个都没有」，目录不在则单独说明
           </span>
         </header>
         {datasets.error ? (
           <ReadError what="评估集" error={datasets.error} onRetry={datasets.refresh} />
         ) : !datasets.data && datasets.loading ? (
           <Loading what="评估集" />
-        ) : (datasets.data ?? []).length === 0 ? (
+        ) : datasets.data && !datasets.data.present ? (
+          <Empty>
+            这个部署没有供给评估目录：<span className="mono">{datasets.data.dir}</span> 不存在。
+          </Empty>
+        ) : (datasets.data?.datasets ?? []).length === 0 ? (
           <Empty>评估目录里没有数据集。</Empty>
         ) : (
           <Table
@@ -600,15 +604,15 @@ export function SettingsView() {
                 <span className="mono text-[11px] text-[var(--muted)]">{d.path}</span>
               ) },
             ]}
-            rows={datasets.data ?? []}
+            rows={datasets.data?.datasets ?? []}
             rowKey={(d) => d.path}
           />
         )}
-        {(datasets.data ?? []).length > 0 && (
+        {(datasets.data?.datasets ?? []).length > 0 && (
           <BarList
             label="每个评估集有几个用例"
             note="按磁盘上实际存在的用例数（GET /api/v1/eval/datasets）；用例多不等于覆盖广，覆盖看标签"
-            rows={(datasets.data ?? [])
+            rows={(datasets.data?.datasets ?? [])
               .map((d) => ({ id: d.path, label: d.name, value: d.case_count }))
               .sort((a, b) => b.value - a.value)}
           />

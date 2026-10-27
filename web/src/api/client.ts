@@ -1669,11 +1669,30 @@ export interface EvalDatasetInfo {
   tags: string[];
 }
 
-export async function listEvalDatasets(): Promise<EvalDatasetInfo[]> {
-  const page = await api.get<{ datasets: EvalDatasetInfo[] }>(
-    '/api/v1/eval/datasets'
-  );
-  return page.datasets ?? [];
+/**
+ * 数据集列举的结果。
+ *
+ * `dir` 是这次读的目录，`present` 是它在不在：目录不在时 `datasets` 一定是空的，
+ * 但那是「这个部署没有供给数据集目录」，不是「还没有数据集」——两者的处置完全不同
+ * （去放文件 / 去改部署），所以读数不能只回一个空数组。
+ */
+export interface EvalDatasetList {
+  datasets: EvalDatasetInfo[];
+  dir: string;
+  present: boolean;
+}
+
+export async function listEvalDatasets(): Promise<EvalDatasetList> {
+  const page = await api.get<{
+    datasets?: EvalDatasetInfo[];
+    dir?: string;
+    present?: boolean;
+  }>('/api/v1/eval/datasets');
+  return {
+    datasets: page.datasets ?? [],
+    dir: page.dir ?? '',
+    present: page.present ?? true,
+  };
 }
 
 /** 跑一次评测。报告会落到数据目录里，跑完就能在报告列表里读到。 */

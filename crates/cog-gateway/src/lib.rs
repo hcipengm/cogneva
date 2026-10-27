@@ -39,6 +39,7 @@ pub mod dashboard;
 pub mod datasets;
 pub mod document_egress;
 pub mod error;
+pub mod eval_datasets;
 pub mod eval_reports;
 pub mod evolution;
 pub mod executor;
@@ -3493,41 +3494,13 @@ async fn eval_compare_handler(
 }
 
 async fn eval_list_datasets_handler(State(state): State<Arc<GatewayState>>) -> Response {
-    let datasets_dir = std::path::PathBuf::from(format!("{}/eval/datasets", state.data_dir));
-    let mut datasets = vec![];
-
-    if datasets_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&datasets_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if ext == "jsonl" || ext == "yaml" || ext == "yml" {
-                        let name = path
-                            .file_stem()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string();
-                        let case_count = if ext == "jsonl" {
-                            std::fs::read_to_string(&path)
-                                .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
-                                .unwrap_or(0)
-                        } else {
-                            0
-                        };
-                        datasets.push(cog_core::EvalDatasetInfo {
-                            name: name.clone(),
-                            path: path.display().to_string(),
-                            case_count,
-                            tags: vec![ext.into()],
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    datasets.sort_by(|a, b| a.name.cmp(&b.name));
-    let resp = cog_core::EvalListDatasetsResponse { datasets };
+    let dir = eval_datasets::datasets_dir(&state.data_dir);
+    let listed = eval_datasets::list_datasets(&dir);
+    let resp = cog_core::EvalListDatasetsResponse {
+        datasets: listed.datasets,
+        dir: dir.display().to_string(),
+        present: listed.present,
+    };
     (StatusCode::OK, Json(json!(resp))).into_response()
 }
 

@@ -99,7 +99,7 @@ export function EvalView() {
     }
   };
 
-  const setList = datasets.data ?? [];
+  const setList = datasets.data?.datasets ?? [];
   const reportList = reports.data?.reports ?? [];
   const reportTotal = reports.data?.total ?? 0;
 
@@ -118,9 +118,15 @@ export function EvalView() {
           <ReadError what="评测数据集" error={datasets.error} onRetry={datasets.refresh} />
         ) : !datasets.data && datasets.loading ? (
           <Loading what="评测数据集" />
+        ) : datasets.data && !datasets.data.present ? (
+          <Empty>
+            这个部署没有供给数据集目录：<span className="mono">{datasets.data.dir}</span>{' '}
+            不存在。它不是「还没有数据集」——那个目录从来没人建过，所以这里永远是空。
+          </Empty>
         ) : setList.length === 0 ? (
           <Empty>
-            数据目录里还没有数据集。评测的输入是数据目录下的 jsonl / yaml 文件，放进去才会出现在这里。
+            数据目录里还没有数据集。评测的输入是{' '}
+            <span className="mono">{datasets.data?.dir}</span> 下的 jsonl / yaml 文件，放进去才会出现在这里。
           </Empty>
         ) : (
           <Table
@@ -221,7 +227,13 @@ export function EvalView() {
       </section>
       {picked && <ReportBody report={picked} onClose={() => setPicked(null)} />}
       <div className="flex flex-wrap border-t border-[var(--line)] py-2">
-        <Reading label="数据集" from={datasets} source="GET /api/v1/eval/datasets" value={setList.length} />
+        <Reading
+          label="数据集"
+          from={datasets}
+          source="GET /api/v1/eval/datasets"
+          value={datasets.data && !datasets.data.present ? '未供给' : setList.length}
+          note={datasets.data?.dir}
+        />
         <Reading
           label="报告（全目录）"
           from={reports}

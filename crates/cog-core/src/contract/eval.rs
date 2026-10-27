@@ -43,6 +43,13 @@ pub struct EvalDatasetInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalListDatasetsResponse {
     pub datasets: Vec<EvalDatasetInfo>,
+    /// 这次读的目录。空列表要能说清是哪个目录空。
+    #[serde(default)]
+    pub dir: String,
+    /// 那个目录在不在。`false` 时 `datasets` 一定是空的，而那不是「没有数据集」，
+    /// 是「这个部署没有供给数据集目录」——两件事在界面上必须分开。
+    #[serde(default)]
+    pub present: bool,
 }
 
 /// Response for `GET /api/v1/eval/report/:report_id`.
