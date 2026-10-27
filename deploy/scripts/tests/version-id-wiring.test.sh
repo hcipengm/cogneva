@@ -18,12 +18,49 @@ fail() { echo "FAIL: $*"; exit 1; }
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
+# Producers name an env variable once and reuse the name: through the platform's
+# table (`cog_core::env::VERSION_ID`), a local constant formatted into the
+# directive, or a literal. Where the name lives is not what any check below
+# asks, so every file is read through this first — the table and the file's own
+# constants are expanded back to the name they stand for, and the quotes around
+# a bare name are dropped. A constant holding some other string is left exactly
+# as it was, so a producer that stopped stamping the label still reads as one.
+#
+# What the checks below read is therefore a *producer*, not an artifact: they
+# say a source file still writes the directive that stamps the label, not that
+# a binary reports it. The behavioural half is section 4, which runs the
+# version script for real; building a binary here would put a cargo build in
+# front of every script test. One more level of indirection than the table
+# covers will read as a missing label and has to be taught to this resolver.
+constants_of() {
+  sed -n 's/^.*const \([A-Za-z_][A-Za-z0-9_]*\) *: *&str *= *"\([^"]*\)";.*$/\1	\2/p' "$1"
+}
+resolve_env_names() {
+  local file="$1" name value
+  local -a edits=()
+  # Names the platform declares: reached qualified, or spelled as a literal.
+  while IFS=$'\t' read -r name value; do
+    case "${value}" in ""|*[!A-Z0-9_]*) continue ;; esac
+    edits+=(-e "s/cog_core::env::${name}/${value}/g")
+    edits+=(-e "s/\"${value}\"/${value}/g")
+  done < <(constants_of crates/cog-core/src/env.rs)
+  # Names this file declares itself and formats into the place that emits them.
+  # Only this file's constants, and only a bare `{NAME}`: a shell script's
+  # `${NAME}` is its own variable and must not be read as the platform's.
+  while IFS=$'\t' read -r name value; do
+    case "${value}" in ""|*[!A-Z0-9_]*) continue ;; esac
+    edits+=(-e "s/{${name}}/${value}/g")
+  done < <(constants_of "${file}")
+  if [ "${#edits[@]}" -eq 0 ]; then cat "${file}"; else sed "${edits[@]}" "${file}"; fi
+}
+
 # --- 1) the stamp is emitted at build time and read where it is reported -----
 build_rs="crates/cogneva/build.rs"
-grep -q 'rustc-env=COGNEVA_VERSION_ID=' "${build_rs}" \
+build_stamps="$(resolve_env_names "${build_rs}")"
+grep -q 'rustc-env=COGNEVA_VERSION_ID=' <<<"${build_stamps}" \
   || fail "${build_rs} 不再产出 COGNEVA_VERSION_ID；没有它就没有构建标签"
 # Without this, a checkout that gains a tag keeps the label it was built with.
-grep -q 'rerun-if-env-changed=COGNEVA_VERSION_ID' "${build_rs}" \
+grep -q 'rerun-if-env-changed=COGNEVA_VERSION_ID' <<<"${build_stamps}" \
   || fail "${build_rs} 不认 COGNEVA_VERSION_ID 的变化，注入的标签不会重新编译进去"
 grep -q 'rerun-if-changed=.git/refs/tags' "${build_rs}" \
   || fail "${build_rs} 不盯 tag 变化；切了新 release 也不会重算标签"
@@ -35,22 +72,33 @@ version_arm() {
 }
 arm="$(version_arm crates/cogneva/src/main.rs)"
 [ -n "${arm}" ] || fail "抽取器没取到 --version 的输出路径；后面两条断言都会空转"
-grep -q -F 'COGNEVA_VERSION_ID' <<<"${arm}" \
+# Comments are dropped before the arm is judged: these files explain in prose
+# what they print, and a whole-arm search stays green long after the print
+# stopped naming the label.
+arm_code="$(grep -vE '^[[:space:]]*(//|///)' <<<"${arm}")"
+# The label may reach the arm directly or through the crate's build-info
+# constant; what matters is that it reaches it, so the arm is judged on the name
+# it prints and the constant on the `env!` it wraps.
+grep -q -F 'VERSION_ID' <<<"${arm_code}" \
   || fail "--version 没有输出构建标签；它会退回成两个代码状态共用一个声明版本"
-if grep -q -F 'CARGO_PKG_VERSION' <<<"${arm}"; then
+if grep -q -F 'CARGO_PKG_VERSION' <<<"${arm_code}"; then
   fail "--version 仍在输出裸的声明版本"
 fi
-sed 's/COGNEVA_VERSION_ID/CARGO_PKG_VERSION/' crates/cogneva/src/main.rs > "${work}/main.rs"
-if grep -q -F 'COGNEVA_VERSION_ID' <<<"$(version_arm "${work}/main.rs")"; then
+grep -q 'pub const VERSION_ID: &str = env!("COGNEVA_VERSION_ID");' crates/cogneva/src/build_info.rs \
+  || fail "build_info 里那个 VERSION_ID 不再包 env!(\"COGNEVA_VERSION_ID\")；--version 打印的是别的东西"
+sed -e 's/COGNEVA_VERSION_ID/CARGO_PKG_VERSION/' -e 's/VERSION_ID/CARGO_PKG_VERSION/' \
+  crates/cogneva/src/main.rs > "${work}/main.rs"
+if grep -q -F 'VERSION_ID' <<<"$(grep -vE '^[[:space:]]*(//|///)' <<<"$(version_arm "${work}/main.rs")")"; then
   fail "自检失败：抽取器在被改回裸声明版本的那份里仍看到了标签"
 fi
 
 # --- 2) every producer that stamps a revision stamps the label too -----------
 check_pair() {
-  local file="$1" revision="$2" label="$3"
+  local file="$1" revision="$2" label="$3" text
   [ -f "${file}" ] || fail "找不到 ${file}"
-  grep -q -F -- "${revision}" "${file}" || fail "${file} 不再注入 revision（${revision}）"
-  grep -q -F -- "${label}" "${file}" \
+  text="$(resolve_env_names "${file}")"
+  grep -q -F -- "${revision}" <<<"${text}" || fail "${file} 不再注入 revision（${revision}）"
+  grep -q -F -- "${label}" <<<"${text}" \
     || fail "${file} 注入了 revision 却没有注入构建标签（缺 ${label}）"
 }
 check_pair deploy/scripts/build-release-image.sh \
@@ -60,7 +108,7 @@ check_pair deploy/k3s/swap-image.sh \
 check_pair crates/bootstrap/src/main.rs \
   'GIT_REVISION={revision}' 'VERSION_ID={version_id}'
 check_pair crates/cog-reflection/src/mainline_deployer.rs \
-  '.env("COGNEVA_GIT_REVISION"' '.env("COGNEVA_VERSION_ID"'
+  '.env(COGNEVA_GIT_REVISION' '.env(COGNEVA_VERSION_ID'
 # No .git inside the container, so the label, like the revision, can only reach
 # the compile-time environment from outside.
 grep -q '^ARG VERSION_ID' Dockerfile || fail "Dockerfile 没有声明 ARG VERSION_ID"
