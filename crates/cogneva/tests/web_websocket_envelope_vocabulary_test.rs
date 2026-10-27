@@ -23,6 +23,12 @@
 //! 名字，而 `ClientMessage` 的每个变体都必须有发送者——删完之后剩 ping / subscribe /
 //! typing / chat_message 四条，两个客户端各自发其中几条，四条都有人发。
 //!
+//! 名字对上了，带的键也要对上：一个字段名写成另一个（`seq` 写成 `sequence`），
+//! serde 把不认识的键丢掉、用默认值顶上，请求照发，缺的那块像没填——回执上什么
+//! 异常都没有。所以每个上行对象顶层那些键，也必须是那个变体声明的字段。实测
+//! （2026-10-27）：两个客户端的上行对象全部对得上；真树消融把 `ping` 的 `seq`
+//! 改成 `sequence`，本门红并点名它，改回即绿。
+//!
 //! 判据不判断「该不该有这个名字」：真需要 `error` 帧，就先把发它的代码写上，
 //! 变体和客户端的读法一起加回来——那时本门自然认得。
 
@@ -342,6 +348,137 @@ fn case_labels(text: &str) -> BTreeSet<String> {
 }
 
 #[test]
+fn every_field_a_client_sends_is_one_its_variant_parses() {
+    let root = repo_root();
+    let protocol = read(&root.join(PROTOCOL));
+    let variants = enum_variants(&protocol, "pub enum ClientMessage");
+    let fields = variant_fields(&protocol, "pub enum ClientMessage");
+    let by_wire: BTreeMap<&String, &String> = variants.iter().map(|(v, w)| (w, v)).collect();
+
+    assert_eq!(
+        fields.len(),
+        variants.len(),
+        "变体与字段两张表读出来的变体数不一样：读取器有一条读残了"
+    );
+
+    let sent = all_sent_objects(&root);
+    assert!(
+        sent.len() >= 4,
+        "只读到 {} 条上行消息对象，太少：发送点的写法变了，这条判据会靠「找不到题目」通过",
+        sent.len()
+    );
+
+    let mut complaints = Vec::new();
+    let mut judged = 0;
+    for (wire, keys) in &sent {
+        // 名字对不上由另一条判据报，这里不重复。
+        let Some(variant) = by_wire.get(wire) else {
+            continue;
+        };
+        let Some(carried) = fields.get(*variant) else {
+            continue;
+        };
+        judged += 1;
+        let extra: Vec<&String> = keys
+            .difference(carried)
+            .filter(|key| key.as_str() != "type")
+            .collect();
+        if !extra.is_empty() {
+            let mut names: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+            names.sort_unstable();
+            complaints.push(format!(
+                "客户端发 '{wire}' 时带上 {names:?}，而 ClientMessage::{variant} 只认 {carried:?}：\
+                 serde 不认识的键被丢掉，服务端读到的是默认值——请求发出去了，缺的那块像没填"
+            ));
+        }
+    }
+    assert!(
+        judged >= 4,
+        "只判到 {judged} 条上行消息，太少：读取器没认出客户端发的是什么"
+    );
+    assert!(
+        complaints.is_empty(),
+        "上行消息的字段名两边写的不是同一份：\n{}",
+        complaints.join("\n")
+    );
+}
+
+#[test]
+fn the_object_reader_sees_flat_keys_and_ignores_nested_ones() {
+    let source = "\
+ws.send(JSON.stringify({ type: 'subscribe', channels: ['agent:*', 'task:*'], timestamp: at }));
+
+ws.send(JSON.stringify({
+  type: 'chat_message',
+  session_id: 'default',
+  content: v,
+}));
+
+ws.send(JSON.stringify(payload));
+";
+    let found = sent_objects(source);
+    assert_eq!(found.len(), 2, "{found:#?}");
+    assert_eq!(found[0].0, "subscribe");
+    assert_eq!(
+        found[0].1,
+        BTreeSet::from([
+            "type".to_string(),
+            "channels".to_string(),
+            "timestamp".to_string()
+        ])
+    );
+    assert_eq!(found[1].0, "chat_message");
+    assert_eq!(
+        found[1].1,
+        BTreeSet::from([
+            "type".to_string(),
+            "session_id".to_string(),
+            "content".to_string()
+        ])
+    );
+}
+
+#[test]
+fn a_sent_key_its_variant_does_not_parse_is_reported() {
+    let root = std::env::temp_dir().join(format!("cogneva-sent-keys-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("crates/cog-gateway/src")).expect("temp gateway");
+    std::fs::create_dir_all(root.join("web/src")).expect("temp web");
+
+    std::fs::write(
+        root.join(PROTOCOL),
+        "#[derive(Debug, Deserialize)]\n#[serde(tag = \"type\")]\npub enum ClientMessage {\n    \
+         #[serde(rename = \"ping\")]\n    Ping {\n        #[serde(default)]\n        timestamp: \
+         Option<String>,\n        seq: u64,\n    },\n}\n",
+    )
+    .expect("protocol");
+    std::fs::write(
+        root.join("web/src/socket.ts"),
+        "ws.send(JSON.stringify({ type: 'ping', seq: 1, gost: 2 }));\n",
+    )
+    .expect("socket");
+
+    let protocol = read(&root.join(PROTOCOL));
+    let fields = variant_fields(&protocol, "pub enum ClientMessage");
+    assert_eq!(
+        fields.get("Ping").cloned().unwrap_or_default(),
+        BTreeSet::from(["timestamp".to_string(), "seq".to_string()])
+    );
+
+    let sent = all_sent_objects(&root);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, "ping");
+    let extra: Vec<&String> = sent[0]
+        .1
+        .difference(fields.get("Ping").expect("ping"))
+        .filter(|key| key.as_str() != "type")
+        .collect();
+    assert_eq!(extra, vec!["gost"], "{extra:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn the_envelope_vocabulary_is_the_same_on_both_ends() {
     let (complaints, judged) = contradictions(&repo_root());
     assert!(judged > 0, "一个变体都没判到，这条判据没有题目");
@@ -389,6 +526,210 @@ fn sent_types(text: &str) -> BTreeSet<String> {
         }
     }
     names
+}
+
+/// `ClientMessage` 每个变体在线上认哪些字段名。
+///
+/// 与 `enum_variants` 同一种行读法：变体头在四格缩进上，字段在八格；`#[serde(...)]`
+/// 属性行跳过。字段名没有改名的——上行对象的键就是字段名。
+fn variant_fields(text: &str, header: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let start = text
+        .find(header)
+        .unwrap_or_else(|| panic!("{PROTOCOL} 里没有 {header}，这条判据没有题目"));
+    let mut fields: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in text[start..].lines().skip(1) {
+        if line.starts_with('}') {
+            break;
+        }
+        let trimmed = line.trim_start();
+        let head = line
+            .strip_prefix("    ")
+            .is_some_and(|rest| !rest.starts_with(' '));
+        if head {
+            let name: String = trimmed
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                fields.insert(name.clone(), BTreeSet::new());
+                current = Some(name);
+            } else {
+                current = None;
+            }
+            continue;
+        }
+        let Some(variant) = current.as_ref() else {
+            continue;
+        };
+        let field: String = trimmed
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !field.is_empty()
+            && field.starts_with(|c: char| c.is_ascii_lowercase())
+            && trimmed[field.len()..].trim_start().starts_with(':')
+        {
+            fields
+                .get_mut(variant)
+                .expect("just inserted")
+                .insert(field);
+        }
+    }
+    fields
+}
+
+/// 一个对象字面量体（两个花括号之间）在**顶层**的那些键。
+///
+/// 按顶层逗号切开，每段取开头那个 `名字:`。嵌套的对象、数组、模板串都在深度里，
+/// 不会漏进来——`channels: ['agent:*']` 里的引号内容不是一个键。
+fn top_level_keys(body: &str) -> BTreeSet<String> {
+    let bytes = body.as_bytes();
+    let mut keys = BTreeSet::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut parts: Vec<&str> = Vec::new();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&body[start.min(bytes.len())..]);
+    for part in parts {
+        let trimmed = part.trim_start();
+        let key: String = trimmed
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !key.is_empty()
+            && key.starts_with(|c: char| c.is_ascii_alphabetic())
+            && trimmed[key.len()..].trim_start().starts_with(':')
+        {
+            keys.insert(key);
+        }
+    }
+    keys
+}
+
+/// 一个 `send( … )` 实参里带 `type: '<名字>'` 的那些对象字面量：名字与它的键。
+///
+/// 只认真正带 `type` 的那一层：`send(payload)` 这种把整条消息交给上层拼的写法
+/// 在这里读不出名字，也就不判——跳过而不是猜。
+fn sent_objects_in(args: &str) -> Vec<(String, BTreeSet<String>)> {
+    let bytes = args.as_bytes();
+    let mut out = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            b'{' => stack.push(i),
+            b'}' => {
+                if let Some(open) = stack.pop() {
+                    let inner = &args[open + 1..i];
+                    let keys = top_level_keys(inner);
+                    if let Some(wire) = quoted_type(inner) {
+                        out.push((wire, keys));
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// 对象体里顶层 `type: '<名字>'` 的那个名字。
+fn quoted_type(body: &str) -> Option<String> {
+    let at = body.find("type:")?;
+    let rest = body[at + "type:".len()..].trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let after = &rest[1..];
+    let end = after.find(quote)?;
+    Some(after[..end].to_string())
+}
+
+/// 两个客户端发出去的全部上行消息：名字 → 它带的键。
+fn all_sent_objects(root: &Path) -> Vec<(String, BTreeSet<String>)> {
+    let mut found = Vec::new();
+    let mut files = Vec::new();
+    collect_ts(&root.join("web/src"), &mut files);
+    for path in files {
+        found.extend(sent_objects(&read(&path)));
+    }
+    let page = root.join(TAKEOVER);
+    if page.exists() {
+        found.extend(sent_objects(&read(&page)));
+    }
+    found
+}
+
+/// 每个 `send(` 实参里带 `type` 的对象字面量。
+fn sent_objects(text: &str) -> Vec<(String, BTreeSet<String>)> {
+    let clean = strip_comments(text);
+    let bytes = clean.as_bytes();
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while let Some(at) = clean[cursor..].find(".send(") {
+        let open = cursor + at + ".send(".len();
+        let mut depth = 1usize;
+        let mut i = open;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        let args = &clean[open..i.saturating_sub(1).max(open)];
+        cursor = i.max(open + 1);
+        out.extend(sent_objects_in(args));
+    }
+    out
 }
 
 /// 两个客户端发出去的全部上行消息名字。
