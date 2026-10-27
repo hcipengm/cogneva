@@ -907,6 +907,24 @@ impl DagExecutorRuntime {
     /// of the pool -- and those are different incidents. Carrying the status
     /// out is what lets the reading face say which one is in front of it
     /// instead of printing the same unbounded zero for all three.
+    /// Whether the pool's own reading currently says nothing can be served.
+    ///
+    /// `false` when no source is attached or the read came back empty, and that
+    /// is the whole point of putting it here rather than in the sweep: an
+    /// unread pool is not a closed one, so silence keeps the sweep's ordinary
+    /// behaviour. Only a pool that declares itself off changes what a backlog
+    /// means, and only for as long as the declaration stands.
+    pub async fn pool_declares_unavailable(&self) -> bool {
+        let Some(source) = self.pool_source.get() else {
+            return false;
+        };
+        source
+            .status()
+            .await
+            .map(|status| status.unavailable)
+            .unwrap_or(false)
+    }
+
     async fn admission_bound(&self) -> Option<AdmissionBound> {
         let source = self.pool_source.get()?;
         let status = source.status().await?;

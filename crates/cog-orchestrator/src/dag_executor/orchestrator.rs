@@ -386,12 +386,22 @@ impl DagExecutor {
     /// consistent against the very sweeps it is racing.
     ///
     /// Returns how many tasks it re-armed.
+    /// `pool_declares_unavailable` is the pool's own verdict, read in the same
+    /// pass by the caller that already reads it for admission. While it holds,
+    /// a non-zero backlog is no longer something the cap can outlast: the queue
+    /// is not slow, the thing that would drain it has declared itself off. A
+    /// row re-armed then is a second copy of a message that is still in line
+    /// and that will be delivered the moment the pool returns — the one outcome
+    /// the whole backlog branch exists to avoid. Admission already publishes
+    /// zero for that state, so the re-armed row would not run either; the
+    /// reclaim buys nothing and costs a duplicate.
     pub async fn reclaim_stalled_scheduled(
         &self,
         stall_after_secs: u64,
         served_streams: &[String],
         undelivered: &HashMap<String, Option<u64>>,
         max_backlog_windows: u64,
+        pool_declares_unavailable: bool,
     ) -> usize {
         // Floored at the window the transport itself uses before it re-delivers
         // an unacknowledged message. Below it, a message that is merely slow is
@@ -420,7 +430,10 @@ impl DagExecutor {
             if has_backlog {
                 let age_secs = (now - task.updated_at).num_seconds().max(0);
                 let cap_secs = (stall_after_secs as i64).saturating_mul(max_backlog_windows as i64);
-                if age_secs < cap_secs {
+                // A declared pool outage is the third explanation, and it is
+                // the one the cap cannot outlast: a queue that has not moved
+                // because nothing could run it is not a queue nobody reads.
+                if pool_declares_unavailable || age_secs < cap_secs {
                     deferred += 1;
                     continue;
                 }
@@ -3845,7 +3858,7 @@ mod tests {
         streams: &[String],
         undelivered: &HashMap<String, Option<u64>>,
     ) -> usize {
-        dag.reclaim_stalled_scheduled(stall_after_secs, streams, undelivered, 3)
+        dag.reclaim_stalled_scheduled(stall_after_secs, streams, undelivered, 3, false)
             .await
     }
 
@@ -5928,6 +5941,71 @@ mod tests {
             metrics.recorded(cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED_WITH_BACKLOG),
             1,
             "this reclaim is the one that has to be visible apart from the ordinary total"
+        );
+    }
+
+    /// 池子自己宣布停摆时，积压上限不再是解释的终点。
+    ///
+    /// 与上一条同一个年龄、同一份积压，只多一格「池子不可用」：这一趟必须一条
+    /// 都不收回。上限的判据是「队列这么久没动，就不是慢」，而池子停摆时队列不动
+    /// 有第三种解释——能跑它的东西关了。这时收回换不到任何进展：准入对同一份
+    /// 读数已经给出零，收回的那条既不会跑，消息也还在队伍里，等于给一条排空的
+    /// 队列再造一份副本，等池子回来时可能跑两遍。
+    #[tokio::test]
+    async fn a_declared_pool_outage_outlasts_the_backlog_cap() {
+        let dag = DagExecutor::new("ws-stalled-pool-down".into());
+        dag.add_task(Task::new(
+            "waiting_on_pool",
+            TaskType::LlmCall,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        dag.schedule_task("waiting_on_pool").await.unwrap();
+        {
+            let mut inner = dag.inner.write().await;
+            inner.tasks.get_mut("waiting_on_pool").unwrap().updated_at =
+                chrono::Utc::now() - chrono::Duration::minutes(60);
+        }
+        let metrics = Arc::new(RecordingMetrics::default());
+        dag.attach_metrics(metrics.clone());
+        let streams = served("ws-stalled-pool-down", true);
+        let stream = crate::ready_queue::ready_stream("ws-stalled-pool-down");
+
+        let mut undelivered = HashMap::new();
+        undelivered.insert(stream, Some(8_815u64));
+        assert_eq!(
+            dag.reclaim_stalled_scheduled(600, &streams, &undelivered, 3, true)
+                .await,
+            0,
+            "an hour past the cap is still the pool's fault while the pool says it is down: \
+             re-arming republishes a message that is already in line"
+        );
+        let still = dag.get_task("waiting_on_pool").await.unwrap();
+        assert_eq!(still.status, TaskStatus::Scheduled);
+        assert_eq!(still.retry_count, 0);
+        assert_eq!(
+            metrics.recorded(cog_core::metric_names::DAG_STALLED_SCHEDULED_DEFERRED_FOR_BACKLOG),
+            1,
+            "the wait still has to be counted, or it reads as a sweep that never ran"
+        );
+        assert_eq!(
+            metrics.recorded(cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED_WITH_BACKLOG),
+            0,
+            "nothing was taken back, so the reclaim-with-backlog curve must not move"
+        );
+
+        // 池子回来的那一拍，同一个年龄重新按上限判：队列还是那条队列，
+        // 解释没了，收回照旧。
+        assert_eq!(
+            dag.reclaim_stalled_scheduled(600, &streams, &undelivered, 3, false)
+                .await,
+            1,
+            "once the pool is back the cap applies again"
+        );
+        assert_eq!(
+            dag.get_task("waiting_on_pool").await.unwrap().status,
+            TaskStatus::Pending
         );
     }
 

@@ -616,6 +616,13 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                                         };
                                                         undelivered.insert(stream.clone(), lag);
                                                     }
+                                                    // 与准入读同一份池子读数：它说
+                                                    // 停了的时候，积压的队列不是没
+                                                    // 人读，是没人能跑。
+                                                    let pool_declares_unavailable =
+                                                        publisher_runtime
+                                                            .pool_declares_unavailable()
+                                                            .await;
                                                     let reclaimed = publisher_runtime
                                                         .orchestrator()
                                                         .reclaim_stalled_scheduled(
@@ -623,6 +630,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                                             &served_ready_streams,
                                                             &undelivered,
                                                             BACKLOG_WINDOWS_BEFORE_RECLAIM,
+                                                            pool_declares_unavailable,
                                                         )
                                                         .await;
                                                     if reclaimed > 0 {
