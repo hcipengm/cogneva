@@ -3661,8 +3661,8 @@ impl MainlineDeployer {
         Vec<(String, String)>,
     ) {
         let mut conclusions: Vec<String> = Vec::new();
-        // 报失败的那几条检查的名字。日志只说「有一项」时，定位要绕到仓库外去问；
-        // 名字在这一次读里就有，不带出去等于把已经拿到的东西丢掉。
+        // 判不通过的那几条检查的名字（判这棵树的那些）。日志只说「有一项」时，
+        // 定位要绕到仓库外去问；名字在这一次读里就有，不带出去等于把已经拿到的东西丢掉。
         let mut failed_checks: Vec<String> = Vec::new();
         // 报失败、但**不判这棵树**的那几条检查（见 [`NON_JUDGING_CHECK_WORKFLOWS`]）：
         // 名字与它所属的工作流。它们不进折判据——那正是它们被排除的意思——所以
@@ -3683,7 +3683,15 @@ impl MainlineDeployer {
                         saw_signal = true;
                         match run.get("conclusion").and_then(|c| c.as_str()) {
                             Some(c) => {
-                                if matches!(c, "failure" | "error") {
+                                // 「这条检查不判这棵树」是**工作流身份**，与它给出的结论
+                                // 无关：Pages 那套跑批被后一次推送取消时，它落的是
+                                // `cancelled` 而不是 `failure`。只对 `failure`/`error` 问
+                                // 身份，等于让一条被取消的 Pages 检查把整棵树判红——
+                                // 2026-10-28 实测：`e147236f` 上 13 条 CI 检查全绿，而
+                                // `build` / `deploy` / `report-build-status` 三条 Pages
+                                // 检查 `cancelled`，按这一支就是一次假红。
+                                let passes = cog_core::contract::ci::ci_conclusion_passes(c);
+                                if !passes {
                                     if let Some(workflow) =
                                         Self::excluded_check_workflow(api_base, repo, run).await
                                     {
@@ -3697,7 +3705,11 @@ impl MainlineDeployer {
                                     }
                                 }
                                 conclusions.push(c.to_string());
-                                if matches!(c, "failure" | "error") {
+                                // 进了这张表的是**判这棵树**的检查，所以它记的是「为什么
+                                // 红」；不判这棵树的那几条在上面的 `continue` 里已经分走
+                                // 了，两张表不混。判红的结论不止 `failure` 一种：`cancelled`
+                                // 同样让 `fold_ci_signals` 给出失败，不点名它就只剩一个红字。
+                                if !passes {
                                     if let Some(name) = run.get("name").and_then(|n| n.as_str()) {
                                         if !name.is_empty() {
                                             failed_checks.push(name.to_string());
@@ -3749,8 +3761,9 @@ impl MainlineDeployer {
     /// 这条报失败的检查属于哪个**不判这棵树**的工作流：属于就给它的 `path`，
     /// 否则（包括解析不出身份）`None`。
     ///
-    /// 只对报失败的检查问，且匹配表为空时一次也不问——多问一次是一个额外的
-    /// 往返，而通过的检查不影响判词。
+    /// 只对**判不通过**的检查问（`ci_conclusion_passes` 为假的那些：`failure`、
+    /// `error`、`cancelled`、`timed_out`…），通过的检查问不出任何影响判词的东西；
+    /// 匹配表为空时一次也不问——多问一次是一个额外的往返。
     ///
     /// 身份取自 `/actions/runs/{id}`：check run 本身的字段里没有工作流，只有
     /// 链接里的运行 id。拿不到身份就照常判失败——排除是一句"这条检查不判这棵树"
@@ -15002,6 +15015,80 @@ exec {real} "$@"
             "{:?}",
             reqs[1]
         );
+    }
+
+    /// 被取消的 Pages 检查同样「不判这棵树」。
+    ///
+    /// 身份是工作流的事，与它给出什么结论无关：Pages 那套跑批被后一次推送取消时
+    /// 落的是 `cancelled`，不是 `failure`。只对 `failure`/`error` 问身份，就会让
+    /// 这一条把整棵树判红。实测形状（2026-10-28，`e147236f`）：13 条 CI 检查全绿，
+    /// `build` / `deploy` / `report-build-status` 三条 Pages 检查 `cancelled`。
+    #[tokio::test]
+    async fn a_cancelled_check_from_a_workflow_that_does_not_judge_this_tree_is_left_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(
+                r#"{"check_runs":[
+                    {"name":"deploy","conclusion":"cancelled","html_url":"https://github.com/o/r/actions/runs/4245/job/7"},
+                    {"name":"build","conclusion":"cancelled","html_url":"https://github.com/o/r/actions/runs/4245/job/8"},
+                    {"name":"Test","conclusion":"success"}]}"#,
+            ),
+            http_200(r#"{"id":4245,"path":"dynamic/pages/pages-build-deployment"}"#),
+            http_200(r#"{"id":4245,"path":"dynamic/pages/pages-build-deployment"}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let (verdict, failed, _reasons, excluded) =
+            deployer.ci_verdict_with_failures("abc123").await;
+        assert_eq!(
+            verdict,
+            Some(true),
+            "被取消的是不判这棵树的那套跑批，剩下的 CI 检查是绿的"
+        );
+        assert!(failed.is_empty(), "被排除的检查不许再进点名表：{failed:?}");
+        assert_eq!(
+            excluded,
+            vec![
+                "github:deploy@dynamic/pages/pages-build-deployment".to_string(),
+                "github:build@dynamic/pages/pages-build-deployment".to_string(),
+            ]
+        );
+        let _ = handle.await.unwrap();
+    }
+
+    /// 对照：同一个 `cancelled` 落在**判这棵树**的工作流上，仍然判红，而且要点名。
+    ///
+    /// 不点名的话，下游只有一条红字：「有一项不通过」——而 `cancelled` 不是
+    /// `failure`，读的人猜不到是哪条、为什么。
+    #[tokio::test]
+    async fn a_cancelled_check_from_a_judging_workflow_holds_and_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(
+                r#"{"check_runs":[
+                    {"name":"Test","conclusion":"cancelled","html_url":"https://github.com/o/r/actions/runs/4246/job/7"},
+                    {"name":"Clippy","conclusion":"success"}]}"#,
+            ),
+            http_200(r#"{"id":4246,"path":".github/workflows/ci.yml"}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let (verdict, failed, _reasons, excluded) =
+            deployer.ci_verdict_with_failures("abc123").await;
+        assert_eq!(verdict, Some(false));
+        assert_eq!(failed, vec!["github:Test".to_string()]);
+        assert!(excluded.is_empty(), "{excluded:?}");
+        let _ = handle.await.unwrap();
     }
 
     /// 同一个名字、不同身份：仓库**自己**的 `deploy` 仍然要判。按名字排除会把
