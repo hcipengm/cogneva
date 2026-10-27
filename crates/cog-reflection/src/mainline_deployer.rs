@@ -1427,10 +1427,10 @@ pub(crate) fn parse_failure_signature(msg: &str) -> Option<String> {
     if parts.len() != 4 {
         return None;
     }
-    let known_class = matches!(
-        parts.first().copied(),
-        Some("version") | Some("environment")
-    );
+    let known_class = parts
+        .first()
+        .and_then(|name| FailureClass::parse(name))
+        .is_some();
     let known_locus = FailureLocus::ALL.iter().any(|l| l.as_str() == parts[3]);
     if known_class && known_locus {
         Some(text.to_string())
@@ -1500,6 +1500,8 @@ pub enum FailureClass {
 }
 
 impl FailureClass {
+    const ALL: [FailureClass; 2] = [FailureClass::Version, FailureClass::Environment];
+
     fn as_str(self) -> &'static str {
         match self {
             FailureClass::Version => "version",
@@ -1522,9 +1524,7 @@ impl FailureClass {
     }
 
     fn parse(name: &str) -> Option<Self> {
-        [FailureClass::Version, FailureClass::Environment]
-            .into_iter()
-            .find(|class| class.as_str() == name)
+        Self::ALL.into_iter().find(|class| class.as_str() == name)
     }
 }
 
@@ -1543,7 +1543,12 @@ impl<'de> Deserialize<'de> for FailureClass {
             .or_else(|| Self::from_legacy_name(&name))
             .ok_or_else(|| {
                 serde::de::Error::custom(format!(
-                    "unknown failure class {name:?}; declared classes are \"version\" and \"environment\""
+                    "unknown failure class {name:?}; declared classes are {}",
+                    Self::ALL
+                        .iter()
+                        .map(|class| format!("{:?}", class.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(" and ")
                 ))
             })
     }
@@ -12168,6 +12173,24 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             parse_failure_signature(&format!("{sig}\ngarbage")),
             Some(sig)
         );
+    }
+
+    #[test]
+    fn every_declared_class_word_is_a_word_the_signature_reader_accepts() {
+        for class in FailureClass::ALL {
+            // 一套词：写出去的那个词，读回来必须是同一个变体。
+            assert_eq!(FailureClass::parse(class.as_str()), Some(class));
+            // 签名里第一个字段就是这个词——读方认不出它，这条签名整条作废，
+            // 「这次和上次是不是同一处坏」就只剩下"没读到"。
+            let sig = failure_signature(class, "wait", "cogneva-web", FailureLocus::Observed);
+            assert_eq!(parse_failure_signature(&sig).as_deref(), Some(sig.as_str()));
+            // 变体名不是词：读方只认 as_str 那一套（旧状态另有 from_legacy_name）。
+            assert_eq!(FailureClass::parse(&format!("{class:?}")), None);
+            assert_eq!(
+                FailureClass::from_legacy_name(&format!("{class:?}")),
+                Some(class)
+            );
+        }
     }
 
     #[test]
