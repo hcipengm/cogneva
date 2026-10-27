@@ -72,9 +72,9 @@ expect_red() {
     fi
 }
 
-# check_fixture <夹具文件名> <保留期那条规则名> <新鲜度腿的读数名> <可选：第四条改坏>
+# check_fixture <夹具文件名> <保留期那条规则名>
 check_fixture() {
-    local fixture="$1" behind_rule="$2" age_series="$3"
+    local fixture="$1" behind_rule="$2"
     local case_file="${cases}/${fixture}"
 
     # 0) 真文件必须绿。
@@ -104,10 +104,8 @@ check_fixture() {
     expect_red "${fixture}：规则被删，跑者非零" "$copy" "$case_file"
 }
 
-check_fixture cogneva-json-task-event-retention.test.yaml \
-    task_event_archive_behind cogneva_task_events_oldest_age_seconds
-check_fixture cogneva-json-llm-usage-retention.test.yaml \
-    llm_usage_retention_behind cogneva_llm_usage_oldest_age_seconds
+check_fixture cogneva-json-task-event-retention.test.yaml task_event_archive_behind
+check_fixture cogneva-json-llm-usage-retention.test.yaml llm_usage_retention_behind
 
 # 4) token 账独有：把「删不动的行有多老」那半砍掉，回填正在追那一格（期望静）必须红。
 copy="${work}/fold-age.json"
