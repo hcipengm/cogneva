@@ -1429,6 +1429,37 @@ metric_names! {
     // zero -- a table that cannot be read publishes no cell at all.
     CHANGE_WRITE_WINDOWS => "cogneva_change_write_windows",
 
+    // cog-orchestrator — what the last pass of the in-effect check found, one
+    // cell per answer it can reach: `waiting` (landed rows the running revision
+    // does not carry), `shipped` (it carries all of them), `unmeasured` (the
+    // check could not be taken).
+    //
+    // Three cells rather than one number, because the account's own loop already
+    // answered this question on every pass and had nowhere to put the answer:
+    // the age went to a log line, and the two ways of having no age -- nothing
+    // is waiting, and nobody could look -- were the same `None` in the code. A
+    // rollout that is behind and a rollout nobody can see are different facts
+    // with different repairs, and this is the family that keeps them apart. All
+    // three cells are written on every pass, the reached one as `1` and the
+    // rest as `0`: the store serves the newest row of every label set it has
+    // ever held, so a cell written only when it occurs would go on standing at
+    // its last value and the pass that stopped walking into it could not be
+    // read.
+    CHANGE_LEDGER_IN_EFFECT => "cogneva_change_ledger_in_effect",
+
+    // cog-orchestrator — how long the oldest landed change has been waiting to
+    // run, in seconds, published beside the family above.
+    //
+    // Two names rather than one, and the second is not redundant: the state is
+    // a label because it is a closed set, while the age is a number a reader
+    // compares against a bound. Folding the age into the state family would
+    // make `0` mean "shipped", "unmeasured" and "a landing from this second" at
+    // once -- the exact collision the state family exists to prevent. Written on
+    // every pass (`0` when nothing is waiting), so an age does not stand after
+    // the wait ends; a reader that wants "how long" reads it only where the
+    // state family says `waiting`.
+    CHANGE_LEDGER_OUT_OF_EFFECT_OLDEST_SECONDS => "cogneva_change_ledger_out_of_effect_oldest_seconds",
+
     // cog-orchestrator — keeping a running task's progress resumable.
     //
     // The write side of the resume chain: a task that loses its process (a

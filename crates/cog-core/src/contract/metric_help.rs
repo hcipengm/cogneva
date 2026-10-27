@@ -2105,6 +2105,37 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          be read and holds nothing",
     ),
     (
+        "cogneva_change_ledger_in_effect",
+        "The account's own verdict on the changes it calls landed, by state, \
+         written on every change-ledger pass. waiting is the account holding \
+         landed rows the running revision does not contain; the age of the \
+         oldest of them is beside it in \
+         cogneva_change_ledger_out_of_effect_oldest_seconds. shipped is the same \
+         rows compared against the running revision and every one of them found \
+         there. unmeasured is a pass that could not make the comparison at all \
+         -- no single image tag across the main workloads, the cluster \
+         unreadable, or a tag the tree cannot resolve -- and it is a state of \
+         its own rather than an absence, because a pass that could not look and \
+         a pass that found nothing waiting are the opposite answers to the same \
+         question: a stalled rollout and a finished one. All three cells are \
+         written every pass, with a 1 on the state the pass reached and 0 on the \
+         others, so a cell cannot keep standing at its last value after the \
+         reading changed. Landing is a tree fact and running is a cluster fact, \
+         so this is the only family that puts the two revisions side by side",
+    ),
+    (
+        "cogneva_change_ledger_out_of_effect_oldest_seconds",
+        "How long the oldest landed change the account holds has been waiting to \
+         run, in seconds, written on every change-ledger pass. It is the age of \
+         the oldest such row measured from its landing time, not an average, so \
+         one change stuck behind a held rollout stays visible while the rest are \
+         recent. It is 0 when the pass found nothing waiting and 0 when the pass \
+         could not look, which is why it is read together with \
+         cogneva_change_ledger_in_effect: zero-because-everything-runs and \
+         zero-because-this-pass-was-blind are one number here and opposite facts, \
+         and only the state cell separates them",
+    ),
+    (
         "cogneva_backup_run_readings",
         "What the backup account holds, by readout, read from the rows the backup \
          runs wrote rather than measured again from the volume. The run counts, \

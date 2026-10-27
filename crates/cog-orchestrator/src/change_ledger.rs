@@ -1247,7 +1247,9 @@ pub fn spawn_change_ledger_loop(
                     // below carries no ordering: what it reads is the landed
                     // set, and the hand-over reads the pending one.
                     if let Some(ref live) = live_revision {
-                        live_revision_pass(&*store, &tree, &**live, &mut out_of_effect).await;
+                        let reading =
+                            live_revision_pass(&*store, &tree, &**live, &mut out_of_effect).await;
+                        publish_in_effect_reading(metrics.as_ref(), reading).await;
                     }
                     // Handing over comes last, and that order is the point: the
                     // set dispatched is then the set as of this pass, so a change
@@ -2959,6 +2961,36 @@ async fn restore_retired(
     pass
 }
 
+/// What one pass of the in-effect check learned about the rolled-out line.
+///
+/// A closed set rather than an `Option`, because the two empty answers are not
+/// interchangeable at a reader: a published `0` seconds is the account saying
+/// the rollout finished, while a pass that could not read the live revision has
+/// said nothing about the rollout at all. The three are also what the reading's
+/// own family is keyed by, so the type is the label set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InEffectReading {
+    /// The running revision does not carry landed rows, and the oldest of them
+    /// landed this many seconds ago.
+    Waiting(i64),
+    /// The reading was taken and the running revision carries every landed row.
+    Shipped,
+    /// The reading was not taken this pass, so no row was checked either way.
+    Unmeasured,
+}
+
+impl InEffectReading {
+    /// The state this reading is published under, and the label its family is
+    /// keyed by.
+    fn state(self) -> &'static str {
+        match self {
+            InEffectReading::Waiting(_) => "waiting",
+            InEffectReading::Shipped => "shipped",
+            InEffectReading::Unmeasured => "unmeasured",
+        }
+    }
+}
+
 /// Check the account's landed rows against the revision the workloads are
 /// running.
 ///
@@ -2999,16 +3031,18 @@ async fn restore_retired(
 /// leaving a count that reads as zero.
 ///
 /// The answer is how long the oldest held row has been landed without running,
-/// in seconds, or `None` when nothing is held or no held revision can be placed.
-/// It is returned as well as logged because it is the one number that separates
-/// a rollout that is behind from a rollout that has stopped, and a caller that
-/// wants to publish it should not have to re-derive it.
+/// said as a three-way answer rather than as an optional number. "Nothing is
+/// waiting" and "this pass could not look" both have no age and are not the
+/// same fact: the first says the rollout has finished, the second says nobody
+/// knows whether it has. Collapsed into one `None` they are indistinguishable
+/// at every reader, and the reading is published, so that collapse would be
+/// served -- a blind pass read as a finished rollout.
 async fn live_revision_pass(
     store: &dyn ChangeLedgerStore,
     tree: &CheckTree,
     source: &dyn LiveRevisionSource,
     out_of_effect: &mut HashMap<ChangeIdentity, String>,
-) -> Option<i64> {
+) -> InEffectReading {
     let live = match source.live_revision().await {
         LiveRevision::Known(rev) => rev,
         LiveRevision::Unmeasurable(gap) => {
@@ -3019,7 +3053,7 @@ async fn live_revision_pass(
                  landed row was checked against it this pass -- which is not the same as a pass \
                  that found nothing out of effect"
             );
-            return None;
+            return InEffectReading::Unmeasured;
         }
     };
     // A revision the tree cannot place is the third fault, and it belongs with
@@ -3038,7 +3072,7 @@ async fn live_revision_pass(
                  tree, so no landed row was checked against it this pass -- a revision this tree \
                  cannot place is not a row that is out of effect"
             );
-            return None;
+            return InEffectReading::Unmeasured;
         }
     };
     let landed = match store.census().await {
@@ -3053,7 +3087,7 @@ async fn live_revision_pass(
                 "change ledger: the landed count could not be read, so no landed row was checked \
                  against the revision the workloads are running"
             );
-            return None;
+            return InEffectReading::Unmeasured;
         }
     };
     // The bound is the population itself rather than a number chosen for it. The
@@ -3071,7 +3105,7 @@ async fn live_revision_pass(
                 "change ledger: the landed rows could not be read, so nothing was checked against \
                  the revision the workloads are running"
             );
-            return None;
+            return InEffectReading::Unmeasured;
         }
     };
 
@@ -3171,7 +3205,10 @@ async fn live_revision_pass(
         "change ledger: checked the account's landed rows against the revision the workloads are \
          running"
     );
-    oldest_seconds
+    match oldest_seconds {
+        Some(seconds) => InEffectReading::Waiting(seconds),
+        None => InEffectReading::Shipped,
+    }
 }
 
 /// How long the oldest of these landings has been waiting to run.
@@ -4700,6 +4737,73 @@ async fn publish_face_reading(
     metrics
         .record_gauge(metric_names::CHANGE_BLOCK_CENSUS, value, labels)
         .await
+}
+
+/// The cells one pass of the in-effect check walks into, and what each carries.
+///
+/// Split out of the publish below so the mapping can be read and exercised on
+/// its own: the two facts are on two names, and the one that is easy to get
+/// wrong is which of them says what. The state family is `1` on the answer this
+/// pass reached and `0` on the other two -- every cell every pass, because the
+/// store serves the newest row of every label set it has ever held, so a cell
+/// written only when it occurs goes on standing at its last value. The age
+/// carries the seconds only when the answer is `waiting`, and `0` otherwise: a
+/// reader asks it "how long" only where the state family says `waiting`, and
+/// the two are published together so the zero cannot be read on its own.
+fn in_effect_cells(reading: InEffectReading) -> [(&'static str, f64); 3] {
+    let reached = reading.state();
+    ["waiting", "shipped", "unmeasured"]
+        .map(|state| (state, if state == reached { 1.0 } else { 0.0 }))
+}
+
+/// Publish what the in-effect pass learned: the answer as one cell per state,
+/// and the age of the oldest wait beside it.
+async fn publish_in_effect_reading(
+    metrics: Option<&Arc<dyn MetricsBackend>>,
+    reading: InEffectReading,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    let cells = in_effect_cells(reading);
+    for (state, value) in cells {
+        let mut labels = HashMap::new();
+        // "state", not "reading": this family answers which of three states the
+        // pass reached, and the sibling census family already spends "reading"
+        // on which count a cell carries. One label key answering two questions
+        // is how a selector written against the other family silently matches
+        // nothing here.
+        labels.insert(crate::LABEL_STATE.to_string(), state.to_string());
+        if let Err(e) = metrics
+            .record_gauge(metric_names::CHANGE_LEDGER_IN_EFFECT, value, labels)
+            .await
+        {
+            warn!(
+                error = %e,
+                state,
+                "change ledger: what the in-effect check found could not be published, so the \
+                 reading face is missing this pass's answer"
+            );
+        }
+    }
+    let age = match reading {
+        InEffectReading::Waiting(seconds) => seconds as f64,
+        InEffectReading::Shipped | InEffectReading::Unmeasured => 0.0,
+    };
+    if let Err(e) = metrics
+        .record_gauge(
+            metric_names::CHANGE_LEDGER_OUT_OF_EFFECT_OLDEST_SECONDS,
+            age,
+            HashMap::new(),
+        )
+        .await
+    {
+        warn!(
+            error = %e,
+            "change ledger: the age of the oldest landed change that is not running could not be \
+             published"
+        );
+    }
 }
 
 /// What the pool's snapshot says this pass should do.
@@ -7957,7 +8061,9 @@ mod tests {
             &mut out_of_effect,
         )
         .await;
-        let age = age.expect("a row is held, so there is an age to report");
+        let InEffectReading::Waiting(age) = age else {
+            panic!("a row is held, so the pass has an age to report: {age:?}");
+        };
         assert!(
             (7100..=7300).contains(&age),
             "the row landed two hours before the pass, so the pass reports about that: {age}"
@@ -7972,7 +8078,11 @@ mod tests {
             &mut out_of_effect,
         )
         .await;
-        assert_eq!(age, None, "nothing is out of effect, so nothing is old");
+        assert_eq!(
+            age,
+            InEffectReading::Shipped,
+            "nothing is out of effect, so nothing is old -- and that is a reading, not an absent one"
+        );
     }
 
     /// A landing this host's clock has not reached yet is dropped rather than
@@ -8031,6 +8141,65 @@ mod tests {
                 "{live:?} moved the set instead of leaving it as it was"
             );
         }
+    }
+
+    /// A pass that could not look does not report a finished rollout.
+    ///
+    /// The single thing this test exists for: while the answer was an `Option`,
+    /// a blind pass and a rolled-out line were the same `None`, so the reading
+    /// published from it would have said "shipped" to every reader during an
+    /// outage of the live-revision source -- the one moment nobody can see the
+    /// rollout at all. The cells are asserted with the values they are written
+    /// with, because the mapping is what a reader downstream selects on.
+    #[tokio::test]
+    async fn a_pass_that_could_not_look_is_not_a_pass_that_found_nothing_waiting() {
+        let (dir, _first, second) = two_revision_repo();
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let store = FakeLedger {
+            rows: vec![landed_row("crates/undeployed", Some(&second))],
+            ..Default::default()
+        };
+        let mut out_of_effect = HashMap::new();
+
+        for gap in [
+            LiveRevisionGap::NoUnanimousMainTag,
+            LiveRevisionGap::ClusterUnreadable,
+        ] {
+            let reading = live_revision_pass(
+                &store,
+                &tree,
+                &FixedLive(LiveRevision::Unmeasurable(gap)),
+                &mut out_of_effect,
+            )
+            .await;
+            assert_eq!(
+                reading,
+                InEffectReading::Unmeasured,
+                "{gap:?} is a reading that was not taken, not a line that shipped"
+            );
+            assert_eq!(
+                in_effect_cells(reading),
+                [("waiting", 0.0), ("shipped", 0.0), ("unmeasured", 1.0)],
+                "a blind pass names itself in the family and nothing else"
+            );
+        }
+
+        // The same account against a revision that carries the row: it has
+        // shipped, and that answer is now the one the cells carry.
+        out_of_effect.clear();
+        let reading = live_revision_pass(
+            &store,
+            &tree,
+            &FixedLive(LiveRevision::Known(second)),
+            &mut out_of_effect,
+        )
+        .await;
+        assert_eq!(reading, InEffectReading::Shipped);
+        assert_eq!(
+            in_effect_cells(reading),
+            [("waiting", 0.0), ("shipped", 1.0), ("unmeasured", 0.0)],
+            "the three cells are one family: the reached answer is the only one set"
+        );
     }
 
     fn pending_row(scope: &str) -> ChangeLedgerRow {

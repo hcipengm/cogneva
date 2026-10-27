@@ -1,0 +1,173 @@
+# 变更账的「落地≠生效」两格：已落行还等多久没跑，以及这一读能不能取到。
+#
+# 形状与各自的腿：
+#   - `change_landed_but_not_running` 是「账说还在等」（state=waiting 为 1）and「最老的
+#     等待已经越过一个钟头」：两条腿各有一格静格——第一格把等待清零（shipped），第二格把
+#     年龄压回 0。删掉任何一条腿，那一格就会响。
+#   - `change_ledger_in_effect_unmeasured` 只判「这一读没取到」这一格为 1。它的静格是
+#     shipped 与 waiting 各一格：两者都没有「读不到」，而读不到被写成 0 的规则会在这里静默。
+#
+#   第三格是这两条规则分开写的理由：一次取不到的 pass 年龄是 0，所以它不会响第一条。
+#   把两件事并成一条规则时，取不到与「都跑上了」在读数上就分不开了。
+#
+#   第四条腿是写者：两个族都由共享表服务，写者停了它不会缺席，只会把最后一笔值永久送出
+#   去。所以每条规则都要求 `_observed_timestamp_seconds` 还在动，最后一格把那条钟停住，
+#   让「等了一小时」与「这一读取不到」都不再响——一条靠冻结样本点亮的规则没有任何修法能
+#   熄灭它。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-change-ledger-in-effect.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: change_landed_but_not_running
+# rule: change_ledger_in_effect_unmeasured
+
+evaluation_interval: 1m
+
+tests:
+  # 一切正常：跑的镜像里有全部已落行（shipped=1），最老的等待是 0。两条都静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_ledger_in_effect{state="waiting"}'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_in_effect{state="shipped"}'
+        values: '1x60'
+      - series: 'cogneva_change_ledger_in_effect{state="unmeasured"}'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="waiting"}'
+        values: '1200x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="shipped"}'
+        values: '1200x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="unmeasured"}'
+        values: '1200x60'
+      - series: 'cogneva_change_ledger_out_of_effect_oldest_seconds'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_out_of_effect_oldest_seconds_observed_timestamp_seconds'
+        values: '1200x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: change_landed_but_not_running
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: change_ledger_in_effect_unmeasured
+        exp_alerts: []
+
+  # 落地了但没跑：最老的一条等了一个多小时（4000 秒），账说它还在等。第一条响，
+  # 第二条不响——这一读是取到了的。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_ledger_in_effect{state="waiting"}'
+        values: '1x60'
+      - series: 'cogneva_change_ledger_in_effect{state="shipped"}'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_in_effect{state="unmeasured"}'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="waiting"}'
+        values: '1200x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="shipped"}'
+        values: '1200x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="unmeasured"}'
+        values: '1200x60'
+      - series: 'cogneva_change_ledger_out_of_effect_oldest_seconds'
+        values: '4000x60'
+      - series: 'cogneva_change_ledger_out_of_effect_oldest_seconds_observed_timestamp_seconds'
+        values: '1200x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: change_landed_but_not_running
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+      - eval_time: 20m
+        alertname: change_ledger_in_effect_unmeasured
+        exp_alerts: []
+
+  # 取不到：线上 rev 读不出来，年龄是 0。第二条响，第一条不响——一个看不见的 rollout
+  # 不许被读成「等得不耐烦」，也不许被读成「跑上了」。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_ledger_in_effect{state="waiting"}'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_in_effect{state="shipped"}'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_in_effect{state="unmeasured"}'
+        values: '1x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="waiting"}'
+        values: '1200x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="shipped"}'
+        values: '1200x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="unmeasured"}'
+        values: '1200x60'
+      - series: 'cogneva_change_ledger_out_of_effect_oldest_seconds'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_out_of_effect_oldest_seconds_observed_timestamp_seconds'
+        values: '1200x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: change_landed_but_not_running
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: change_ledger_in_effect_unmeasured
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              state: unmeasured
+
+  # 等待的年龄还在一小时以内：账说在等，但没越过界。第一条静——这是普通的一轮 CI 加
+  # 一次滚动更新，不是停住的 rollout。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_ledger_in_effect{state="waiting"}'
+        values: '1x60'
+      - series: 'cogneva_change_ledger_in_effect{state="shipped"}'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_in_effect{state="unmeasured"}'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="waiting"}'
+        values: '1200x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="shipped"}'
+        values: '1200x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="unmeasured"}'
+        values: '1200x60'
+      - series: 'cogneva_change_ledger_out_of_effect_oldest_seconds'
+        values: '900x60'
+      - series: 'cogneva_change_ledger_out_of_effect_oldest_seconds_observed_timestamp_seconds'
+        values: '1200x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: change_landed_but_not_running
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: change_ledger_in_effect_unmeasured
+        exp_alerts: []
+
+  # 写者停了：读数还是「等了一小时」与「取不到」，但两条伴生钟都不再动。两条规则都静——
+  # 共享表会永远把最后一笔值送出去，靠一个冻结的样本点亮的规则没有修法能熄灭它。那一格
+  # 该响的是写者本身（`background_loop_stalled` 与 `cogneva_loop_tick_age_seconds`）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_ledger_in_effect{state="waiting"}'
+        values: '1x60'
+      - series: 'cogneva_change_ledger_in_effect{state="shipped"}'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_in_effect{state="unmeasured"}'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="waiting"}'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="shipped"}'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_in_effect_observed_timestamp_seconds{state="unmeasured"}'
+        values: '0x60'
+      - series: 'cogneva_change_ledger_out_of_effect_oldest_seconds'
+        values: '4000x60'
+      - series: 'cogneva_change_ledger_out_of_effect_oldest_seconds_observed_timestamp_seconds'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: change_landed_but_not_running
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: change_ledger_in_effect_unmeasured
+        exp_alerts: []
