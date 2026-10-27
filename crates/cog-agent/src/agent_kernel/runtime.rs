@@ -717,6 +717,18 @@ impl AgentRuntime {
     /// Capture a checkpoint of the current agent state.
     /// Returns a [`cog_core::AgentCheckpoint`] that can be persisted via a
     /// [`cog_core::CheckpointStore`] and later restored to resume execution.
+    /// The keys a checkpoint's `agent_state` object carries.
+    ///
+    /// `checkpoint` writes them, `restore` reads them back, and the two are one
+    /// object seen twice. A key renamed on one side alone leaves the other
+    /// looking for a field that is not there -- and `restore` reads every one of
+    /// them as optional, so the agent comes back with the value it was
+    /// configured with and nothing anywhere says the snapshot was ignored.
+    const CHECKPOINT_KEY_AGENT_ID: &'static str = "agent_id";
+    const CHECKPOINT_KEY_ROLE: &'static str = "role";
+    const CHECKPOINT_KEY_STATE: &'static str = "state";
+    const CHECKPOINT_KEY_STEPS_LEN: &'static str = "steps_len";
+
     pub fn checkpoint(&self, task_id: impl Into<String>) -> SFResult<cog_core::AgentCheckpoint> {
         let snapshot_id = format!("snap-{}-{}", self.config.agent_id, uuid::Uuid::new_v4());
         tracing::info!(
@@ -728,10 +740,10 @@ impl AgentRuntime {
             checkpoint_id: snapshot_id,
             task_id: task_id.into(),
             agent_state: serde_json::json!({
-                "agent_id": self.config.agent_id,
-                "role": self.config.role.to_string(),
-                "state": self.state.to_string(),
-                "steps_len": self.steps.len(),
+                Self::CHECKPOINT_KEY_AGENT_ID: self.config.agent_id,
+                Self::CHECKPOINT_KEY_ROLE: self.config.role.to_string(),
+                Self::CHECKPOINT_KEY_STATE: self.state.to_string(),
+                Self::CHECKPOINT_KEY_STEPS_LEN: self.steps.len(),
             }),
             context_window: self.context.messages().to_vec(),
             event_offset: self.wal.as_ref().map(|w| w.current_seq()).unwrap_or(0),
@@ -750,7 +762,11 @@ impl AgentRuntime {
             .restore_messages(snapshot.context_window.clone());
 
         // Restore loop state from agent_state JSON
-        if let Some(state_str) = snapshot.agent_state.get("state").and_then(|v| v.as_str()) {
+        if let Some(state_str) = snapshot
+            .agent_state
+            .get(Self::CHECKPOINT_KEY_STATE)
+            .and_then(|v| v.as_str())
+        {
             // A word this build does not know still lands on `Idle` -- restoring is
             // not a judgement. What changed is that the words are no longer spelled
             // here: `RuntimeState::parse` answers with the same table `Display`
@@ -759,14 +775,18 @@ impl AgentRuntime {
         }
 
         // Optionally restore role if present and different
-        if let Some(role_str) = snapshot.agent_state.get("role").and_then(|v| v.as_str()) {
+        if let Some(role_str) = snapshot
+            .agent_state
+            .get(Self::CHECKPOINT_KEY_ROLE)
+            .and_then(|v| v.as_str())
+        {
             self.config.role = role_str.to_string();
         }
 
         // Optionally restore agent_id if present
         if let Some(agent_id) = snapshot
             .agent_state
-            .get("agent_id")
+            .get(Self::CHECKPOINT_KEY_AGENT_ID)
             .and_then(|v| v.as_str())
         {
             self.config.agent_id = agent_id.to_string();
@@ -2529,6 +2549,40 @@ mod tests {
     use super::*;
     use cog_core::SkillConfig;
     use serde_json::json;
+
+    /// What a checkpoint writes, a restore reads back: the state, the role and
+    /// the agent id.
+    ///
+    /// The writer builds a JSON object and the reader asks for each key with
+    /// `.get(..)`; a key renamed on one side alone leaves `.get` finding nothing,
+    /// and `restore` treats every one of these as optional -- so the agent comes
+    /// back with the values it was configured with, which is exactly what a
+    /// snapshot that never carried them would look like.
+    #[test]
+    fn a_checkpoint_restores_what_it_recorded() {
+        let config = RuntimeConfig {
+            agent_id: "before-the-snapshot".into(),
+            role: "reviewer".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        let mut agent_loop = AgentRuntime::new(config, tx);
+        agent_loop.state = RuntimeState::Observing;
+        let snapshot = agent_loop.checkpoint("trip").expect("checkpoint");
+
+        let other = RuntimeConfig {
+            agent_id: "after-the-snapshot".into(),
+            role: "planner".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        let mut restored = AgentRuntime::new(other, tx);
+        restored.restore(&snapshot).expect("restore");
+
+        assert_eq!(restored.state, RuntimeState::Observing);
+        assert_eq!(restored.role(), "reviewer");
+        assert_eq!(restored.config.agent_id, "before-the-snapshot");
+    }
 
     /// A state word is spelled once: what `Display` prints is what `as_str`
     /// returns, and `parse` reads it back to the same state.
