@@ -9,15 +9,6 @@
 use async_trait::async_trait;
 use cog_core::{AgentTrace, SFError, SFResult, StorageTier, TraceMeta, TraceStore};
 
-/// Return the subdirectory name for a tier.
-fn tier_subdir(tier: StorageTier) -> &'static str {
-    match tier {
-        StorageTier::Hot => "hot",
-        StorageTier::Warm => "warm",
-        StorageTier::Cold => "cold",
-    }
-}
-
 /// Filesystem-safe file stem for a trace id. Trace ids embed free-form agent
 /// ids that can be arbitrarily long or contain path separators; used directly
 /// as a file name they break writes (ENAMETOOLONG) or escape the tier
@@ -63,7 +54,12 @@ impl FileTraceStore {
 
     /// Get the tier directory path.
     fn tier_dir(&self, tier: StorageTier) -> std::path::PathBuf {
-        self.base_dir.join(tier_subdir(tier))
+        // The directory is named by the tier's own word: `StorageTier::as_str` is
+        // the one place that spelling lives, and `from_str` reads it back. A
+        // second match here would let the folders be named one thing while the
+        // tier reported in an API or a label says another, with neither side
+        // erroring -- the files simply would not be found.
+        self.base_dir.join(tier.as_str())
     }
 
     /// Get the trace data file path for a given tier.

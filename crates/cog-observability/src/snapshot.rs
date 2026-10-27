@@ -793,13 +793,16 @@ impl cog_core::Observable for TraceTierMigrator {
 
         let mut out = Vec::new();
         if self.measured.load(Ordering::Relaxed) {
-            for (tier, slot) in [("hot", &self.hot_overdue), ("warm", &self.warm_overdue)] {
+            for (tier, slot) in [
+                (cog_core::StorageTier::Hot, &self.hot_overdue),
+                (cog_core::StorageTier::Warm, &self.warm_overdue),
+            ] {
                 out.push(
                     RawMetric::new(
                         TRACE_TIER_OVERDUE_METRIC,
                         slot.load(Ordering::Relaxed) as f64,
                     )
-                    .with_label("tier", tier),
+                    .with_label("tier", tier.as_str()),
                 );
             }
         }
