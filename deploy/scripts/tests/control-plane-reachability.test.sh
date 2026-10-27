@@ -3,20 +3,24 @@
 # check-control-plane-reachability.sh 的定向测试：门禁只读退出码，所以「它判得出来」
 # 这句话只能由反例证明——在一份真渲染产物的副本上只改一处，断言它红的正是那一处。
 #
-# 每个用例都从**真树**复制一份 deploy/rendered，改一处，跑门禁，然后断言：
+# 每个用例都从**真树**复制一份 deploy（`deploy/rendered` 与 `deploy/k3s` 两条投递
+# 路径都在，缺一条门禁会报「判不了」），改一处，跑门禁，然后断言：
 #   - 退出码是 1（不是 0：改了还绿就是没判；也不是 2：2 是「判不了」，会把缺陷读成缺依赖）；
 #   - 判词点名了被改的对象（不是只报一个总数）；
-#   - 真树自己跑是 0，并且报出了读过的 profile 数（空跑全绿是句空话）。
+#   - 真树自己跑是 0，并且报出了读过的 profile 数与交付树（空跑全绿是句空话）。
 #
 # 用例：
-#   1. 真树副本不改 -> 0，并印出 profile 数；
+#   1. 真树副本不改 -> 0，并印出 profile 数与交付树；
 #   2. Service selector 改到一个没人带的标签 -> 红，点名 Service 与 selector；
 #   3. Service targetPort 改成没声明的端口名 -> 红，点名端口名；
 #   4. Deployment replicas 改成 0 -> 红，点名工作负载；
 #   5. 探针按名字指向一个没声明的端口 -> 红，点名容器与探针；
 #   6. 卷指向一个不存在的 PVC -> 红，点名 PVC；
 #   7. Ingress 后端指向不存在的 Service -> 红，点名 Ingress；
-#   8. rendered 目录为空 -> 2（判不了，不是 0）。
+#   8. rendered 目录为空 -> 2（判不了，不是 0）；
+#   9. **交付树**（`deploy/k3s`）里的 Service selector 改到没人带的标签 -> 红，判词
+#      点名的是交付树那条路径（两条路径各自被判，一条绿不掩盖另一条）；
+#   10. `kustomization.yaml` 列了一个不存在的文件 -> 2（读不出交付对象集，不是全过）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,6 +37,7 @@ trap 'rm -rf "${work}"' EXIT
 base="${work}/base"
 mkdir -p "${base}/deploy"
 cp -a "${repo}/deploy/rendered" "${base}/deploy/rendered"
+cp -a "${repo}/deploy/k3s" "${base}/deploy/k3s"
 
 case_tree() { # case_tree <名字> -> 打印一份可以随便改的树根
   local d="${work}/$1"
@@ -41,15 +46,14 @@ case_tree() { # case_tree <名字> -> 打印一份可以随便改的树根
   printf '%s' "${d}"
 }
 
-expect_red() { # expect_red <名字> <期望出现在判词里的片段> <python 改动片段>
-  local case_name="$1" needle="$2" mutation="$3"
+expect_red() { # expect_red <名字> <期望出现在判词里的片段> <python 改动片段> [改哪棵树]
+  local case_name="$1" needle="$2" mutation="$3" at="${4:-deploy/rendered/k3s-single}"
   local tree; tree="$(case_tree "${case_name}")"
-  CASE_TREE="${tree}" python3 - "${mutation}" <<'PY'
+  CASE_DIR="${tree}/${at}/" python3 - "${mutation}" <<'PY'
 import os, sys, yaml
 
-tree = os.environ["CASE_TREE"]
 mutation = sys.argv[1]
-path = os.path.join(tree, "deploy/rendered/k3s-single/")
+path = os.environ["CASE_DIR"]
 
 # 改动用 exec 执行，脚本只给三样东西：读一个文件、写回一个文件、遍历文档。
 def load(fname):
@@ -87,11 +91,13 @@ PY
 # 1. 真树副本不改。
 clean_tree="$(case_tree clean)"
 out="$(bash "${gate}" "${clean_tree}" 2>&1)" || fail "clean: 干净副本不应为红；输出：${out}"
-printf '%s' "${out}" | grep -Eq '控制面可达性：[0-9]+ 个 profile 全过' \
-  || fail "clean: 没有报出读过的 profile 数；输出：${out}"
+printf '%s' "${out}" | grep -Eq '控制面可达性：[0-9]+ 个 profile 与交付树 .* 全过' \
+  || fail "clean: 没有报出读过的 profile 数与交付树；输出：${out}"
 printf '%s' "${out}" | grep -Fq '3 个 profile' \
   || fail "clean: 期望读到 3 个 profile；输出：${out}"
-echo "ok   clean：干净副本全过并报出 profile 数"
+printf '%s' "${out}" | grep -Fq '交付树 deploy/k3s' \
+  || fail "clean: 没有报出交付树；输出：${out}"
+echo "ok   clean：干净副本全过并报出 profile 数与交付树"
 
 # 2. Service selector 选不中任何工作负载。
 expect_red "selector-miss" "Service cogneva 的 selector" '
@@ -140,4 +146,20 @@ set -e
 printf '%s' "${out}" | grep -Fq "判不了" || fail "empty: 输出里没有「判不了」；输出：${out}"
 echo "ok   empty：没有产物时退出码 2（不是 0）"
 
-echo "control-plane-reachability.test.sh: 8 用例全过"
+# 9. 交付树自己的形状也要判：另一条投递路径绿，不掩盖这一条红。
+expect_red "apply-tree-selector-miss" "deploy/k3s：Service cogneva 的 selector" '
+edit("service.yaml", lambda d: d["spec"]["selector"].__setitem__("app.kubernetes.io/component", "gateway-typo"))
+' "deploy/k3s"
+
+# 10. 读不出交付对象集必须不是 0。
+ghost="$(case_tree kustomization-ghost)"
+printf 'resources:\n  - no-such-file.yaml\n' > "${ghost}/deploy/k3s/kustomization.yaml"
+set +e
+out="$(bash "${gate}" "${ghost}" 2>&1)"
+rc=$?
+set -e
+[ "${rc}" -eq 2 ] || fail "kustomization-ghost: 期望退出码 2，实得 ${rc}；输出：${out}"
+printf '%s' "${out}" | grep -Fq "判不了" || fail "kustomization-ghost: 输出里没有「判不了」；输出：${out}"
+echo "ok   kustomization-ghost：交付对象集读不出来时退出码 2（不是 0）"
+
+echo "control-plane-reachability.test.sh: 10 用例全过"

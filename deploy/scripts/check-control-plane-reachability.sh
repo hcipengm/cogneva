@@ -8,8 +8,14 @@
 # 这些形状在 `kubectl apply` 之后**不报错**：对象建成了，Pod 也起来了，只是没有人能到它。
 # 门禁读的从来只有退出码，所以「起不来」必须在退出码上有一个判词。
 #
-# 判据只读渲染产物本身（`deploy/rendered/<profile>/`），不读 values、不读 chart 模板：
-# 渲染产物就是会被 apply 的那份字节，在这里再猜一次「它应该长什么样」等于写第二份定义。
+# 判据只读会被 apply 的那份字节，不读 values、不读 chart 模板：在这里再猜一次
+# 「它应该长什么样」等于写第二份定义。会被 apply 的字节有两条投递路径，各自读一次：
+#
+#   - `deploy/rendered/<profile>/`：`helm install` 之后 apply 的预渲染产物；
+#   - `deploy/k3s`：元启动自建集群时 `kubectl apply -k` 的对象集，**按
+#     `kustomization.yaml` 的 `resources` 列读**，不按目录里有什么猜（目录里另有
+#     values 文件与 examples，它们不是对象）。集群内收敛循环投递的也是这一份。
+#
 # 判的六族，每一族都是「对象之间必须互相对得上」的关系，不是内容偏好：
 #
 #   1. Service 的 selector 至少选中一条工作负载（选不中 ⇒ 没有 endpoints）；
@@ -26,6 +32,12 @@
 # 路径对不对、NetworkPolicy 放不放行、ResourceQuota 的合计够不够、ConfigMap 里的键
 # 是不是应用要的那几个——这些要么要连集群、要么要懂应用语义，不是结构关系。
 #
+# `deploy/k3s/observability/` 整棵不在本门内：那 21 份清单由安装脚本与收敛循环交付，
+# 它们指向的 Service（grafana / prometheus）由 kube-prometheus-stack 提供、Secret 由
+# 安装期随机生成，第 5、6 族在那棵子树里**没有可比对象**；要判只能按对象写豁免表，
+# 而豁免表正是「判据看起来覆盖了、实际靠名单」的那种形状。代价写在明处：那棵子树
+# 自己的选择器与端口此刻不由任何门判。
+#
 # 用法：bash deploy/scripts/check-control-plane-reachability.sh [仓库根目录]
 # 退出码：0 全过；1 有不可达形状（逐条点名 profile 与对象）；2 判不了（缺依赖、没有产物）。
 set -euo pipefail
@@ -35,7 +47,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 command -v python3 >/dev/null || { echo "缺少依赖：python3，无法判断控制面可达性" >&2; exit 2; }
-python3 - deploy/rendered <<'PYEOF'
+python3 - deploy/rendered deploy/k3s <<'PYEOF'
 import glob
 import os
 import sys
@@ -43,6 +55,7 @@ import sys
 import yaml
 
 RENDERED = sys.argv[1]
+APPLY = sys.argv[2]
 WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet")
 
 
@@ -112,19 +125,50 @@ def probe_port_problems(name, tmpl):
     return out
 
 
+def apply_tree_sources(apply_dir):
+    """交付树的清单：`kustomization.yaml` 的 `resources` 列，也就是 `apply -k` 的对象集。"""
+    kustomization = os.path.join(apply_dir, "kustomization.yaml")
+    if not os.path.isfile(kustomization):
+        print("判不了：%s 下没有 kustomization.yaml，读不出交付对象集" % apply_dir,
+              file=sys.stderr)
+        sys.exit(2)
+    with open(kustomization, encoding="utf-8") as fh:
+        docs = [d for d in yaml.safe_load_all(fh) if d]
+    if len(docs) != 1 or not isinstance(docs[0], dict):
+        print("判不了：%s 不是单份 kustomization 文档" % kustomization, file=sys.stderr)
+        sys.exit(2)
+    resources = docs[0].get("resources") or []
+    if not resources:
+        print("判不了：%s 没有 resources 列表，读不出交付对象集" % kustomization,
+              file=sys.stderr)
+        sys.exit(2)
+    sources = []
+    for resource in resources:
+        path = os.path.join(apply_dir, resource)
+        if not os.path.isfile(path):
+            print("判不了：%s 列的 %r 不存在" % (kustomization, resource), file=sys.stderr)
+            sys.exit(2)
+        sources.append(path)
+    return sources
+
+
 problems = []
+trees = []  # (名字, 清单文件)
 profiles = sorted(d for d in glob.glob(os.path.join(RENDERED, "*")) if os.path.isdir(d))
 if not profiles:
     print("判不了：%s 下没有任何 profile 目录" % RENDERED, file=sys.stderr)
     sys.exit(2)
-
-judged = 0
 for profile in profiles:
-    docs = []
     sources = sorted(glob.glob(os.path.join(profile, "*.yaml")))
     if not sources:
         print("判不了：%s 下没有清单" % profile, file=sys.stderr)
         sys.exit(2)
+    trees.append(("deploy/rendered/" + os.path.basename(profile), sources))
+trees.append((APPLY, apply_tree_sources(APPLY)))
+
+judged = 0
+for pname, sources in trees:
+    docs = []
     for path in sources:
         try:
             with open(path, encoding="utf-8") as fh:
@@ -135,7 +179,6 @@ for profile in profiles:
             print("判不了：%s 解析失败：%s" % (path, exc), file=sys.stderr)
             sys.exit(2)
 
-    pname = os.path.basename(profile)
     workloads = [(d, pod_template(d)) for d in docs if pod_template(d)]
     services = [d for d in docs if d.get("kind") == "Service"]
     pvcs = {d["metadata"]["name"] for d in docs if d.get("kind") == "PersistentVolumeClaim"}
@@ -224,8 +267,8 @@ for profile in profiles:
                 sref = (env.get("valueFrom") or {}).get("secretKeyRef") or {}
                 sn = sref.get("name")
                 if sn and sn not in secrets_present:
-                    # Secret 由安装期生成、不经清单：这里只在该 profile 声明过任何 Secret
-                    # 时才判（声明过就有比对的基線），否则不判——缺省不是缺陷。
+                    # Secret 由安装期生成、不经清单：这里只在该棵树声明过任何 Secret
+                    # 时才判（声明过就有比对的基线），否则不判——缺省不是缺陷。
                     if secrets_present:
                         fail("%s：%s %s 的容器 %s 的 env %s 引用了不存在的 Secret %r"
                              % (pname, kind, wname, c.get("name"), env.get("name"), sn))
@@ -258,10 +301,10 @@ for profile in profiles:
 if problems:
     for p in problems:
         print(p, file=sys.stderr)
-    print("控制面可达性：%d 处不可达形状（读了 %d 个 profile）" % (len(problems), len(profiles)),
-          file=sys.stderr)
+    print("控制面可达性：%d 处不可达形状（读了 %d 个 profile 与交付树 %s）"
+          % (len(problems), len(profiles), APPLY), file=sys.stderr)
     sys.exit(1)
 
-print("控制面可达性：%d 个 profile 全过（Service 选择与端口、副本数、探针端口、卷引用、Ingress 后端）"
-      % len(profiles))
+print("控制面可达性：%d 个 profile 与交付树 %s 全过（Service 选择与端口、副本数、探针端口、"
+      "卷引用、Ingress 后端）" % (len(profiles), APPLY))
 PYEOF
