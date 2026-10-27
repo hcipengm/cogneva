@@ -534,24 +534,28 @@ impl GitOpsPuller {
 
     /// 当前部署在跑的容器镜像。
     async fn current_deployment_image(&self) -> SFResult<String> {
-        self.run(
-            &self.config.kubectl_bin.clone(),
-            &[
-                "-n",
-                &self.config.namespace,
-                "get",
-                "deployment",
-                &self.config.deployment,
-                "-o",
-                &format!(
-                    "jsonpath={{.spec.template.spec.containers[?(@.name==\"{}\")].image}}",
-                    self.config.container
-                ),
-            ],
-            None,
-            30,
+        let query = crate::deployment_image::container_image_query(&self.config.container);
+        let out = self
+            .run(
+                &self.config.kubectl_bin.clone(),
+                &[
+                    "-n",
+                    &self.config.namespace,
+                    "get",
+                    "deployment",
+                    &self.config.deployment,
+                    "-o",
+                    &query,
+                ],
+                None,
+                30,
+            )
+            .await?;
+        crate::deployment_image::container_image(
+            &out,
+            &self.config.deployment,
+            &self.config.container,
         )
-        .await
     }
 
     /// 发布本轮 poll 的结局：成功写 0、失败写 1，每次尝试都写一行。

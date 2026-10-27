@@ -3394,17 +3394,23 @@ impl MainlineDeployer {
     }
 
     /// 四个 deployment 当前在跑的镜像（按 cfg.targets 顺序）。
+    ///
+    /// 读不到就报错，不留一个空串往下走：空串进 [`classify_deployed`] 会记成一次
+    /// `non_main`，四个全空就是 `Legacy`——那是一句关于集群状态的话（「还没迁移
+    /// 到主线镜像」），而 [`evaluate_advance`] 对 `Legacy` 的结论是继续推进。容器名
+    /// 对不上时把它读成 `Legacy`，等于在一个读不清的集群上把主线往前滚。
     async fn deployed_images(&self) -> SFResult<Vec<String>> {
         let mut images = Vec::new();
         for t in &self.cfg.targets {
-            let jsonpath = format!(
-                "jsonpath={{.spec.template.spec.containers[?(@.name==\"{}\")].image}}",
-                t.container
-            );
+            let jsonpath = crate::deployment_image::container_image_query(&t.container);
             let img = self
                 .kubectl(&["get", "deployment", &t.deployment, "-o", &jsonpath], 30)
                 .await?;
-            images.push(img.trim().to_string());
+            images.push(crate::deployment_image::container_image(
+                &img,
+                &t.deployment,
+                &t.container,
+            )?);
         }
         Ok(images)
     }
@@ -13224,6 +13230,47 @@ exit 0
             serde_json::from_str(&std::fs::read_to_string(root.join("state/state.json")).unwrap())
                 .unwrap();
         assert_eq!(state.in_flight.unwrap().phase, Phase::Dispatched);
+    }
+
+    /// 读不到容器镜像不许被读成「还没迁移到主线镜像」。
+    ///
+    /// `kubectl` 对匹配不到的 jsonpath 输出空串、退出码 0。空串进
+    /// `classify_deployed` 记成一次 `non_main`，四个目标全空就是 `Legacy`，而
+    /// `evaluate_advance` 对 `Legacy` 的结论是**继续推进**——容器名与 chart 对不上
+    /// （或者字段路径随版本变了）时，那条路会让部署器在一个读不清的集群上把主线
+    /// 往前滚，并且所有读数都写成正常。所以这一轮必须停在读取那一步，构建一次都
+    /// 不许发生。
+    #[tokio::test]
+    async fn an_unreadable_container_image_holds_the_round_instead_of_rolling_forward() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, _rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        // 空镜像＝jsonpath 什么都没匹配到，退出码 0。
+        let kubectl = fake_kubectl(&bin_dir, "");
+        let buildah = fake_buildah(&bin_dir, "deadbeef0000");
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer = MainlineDeployer::new(cfg, ws);
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        let round = deployer.poll_once().await;
+        std::env::set_var("PATH", old_path);
+
+        let err = round
+            .expect_err("读不到镜像的一轮被当成正常推进")
+            .to_string();
+        assert!(
+            err.contains("no image"),
+            "报错要说清读不到的是镜像，而不是别的哪一步：{err}"
+        );
+        assert!(!buildah_built(&bin_dir), "读不到镜像的那一轮推了浮动签");
     }
 
     /// 本轮滚动要重拷的资产表取自**被部署 rev 的检出**，不是编在部署器里的那份。

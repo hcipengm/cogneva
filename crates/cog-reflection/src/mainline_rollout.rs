@@ -2960,21 +2960,11 @@ impl RolloutExecutor {
 
     /// 快照单个部署当前在跑的镜像（回滚目标）。
     async fn current_image(&self, t: &RolloutTarget) -> SFResult<String> {
-        let jsonpath = format!(
-            "jsonpath={{.spec.template.spec.containers[?(@.name==\"{}\")].image}}",
-            t.container
-        );
+        let jsonpath = crate::deployment_image::container_image_query(&t.container);
         let img = self
             .run_kubectl(&["get", "deployment", &t.deployment, "-o", &jsonpath], 30)
             .await?;
-        let img = img.trim().to_string();
-        if img.is_empty() {
-            return Err(SFError::Agent(format!(
-                "deployment/{} has no image for container {}",
-                t.deployment, t.container
-            )));
-        }
-        Ok(img)
+        crate::deployment_image::container_image(&img, &t.deployment, &t.container)
     }
 
     /// 带集群访问容忍的查询：把「查不到集群」与「查到的结果不健康」分开。

@@ -53,6 +53,7 @@ pub mod change_rework;
 pub mod config;
 pub mod crew;
 pub mod criteria_face;
+mod deployment_image;
 pub mod detector;
 pub mod diff_fidelity;
 pub mod discovery;
