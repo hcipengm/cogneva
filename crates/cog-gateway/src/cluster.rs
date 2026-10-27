@@ -179,12 +179,18 @@ pub struct NodeView {
     /// （没人能报，不是零个）。
     pub census_containers: Option<usize>,
     /// 上面这些容器里，有**几个是这一面读不到的**：采集器读的是整台宿主的 cgroup
-    /// 树，而这一面按命名空间取 Pod。跑在别的命名空间里的容器（traefik、coredns、
-    /// prometheus 这些）有进程读数，却没有一格能显示它们。
+    /// 树，而这一面画的是有 Pod 的容器。对不上的那些（构建容器、直接起在宿主上的
+    /// 进程）有进程读数，却没有一格能显示它们。
     ///
     /// 把差读出来，是为了让「全量」这句话可以被检验：这一格不为 0 时，屏上的容器
     /// 就不是这台机器上的全部容器，而这句话只能由这个数说出来。
     pub unclaimed_containers: Option<usize>,
+    /// 上面那个数点名的那些容器，一个一条。与它同时有值、同时为 `None`。
+    ///
+    /// 计数答「漏了几个」，这一列答「漏的是谁」——没有名字的话，读者看到「3 个没有
+    /// 认领」只能猜，而宿主上最吃 CPU 的恰恰是这几个。进程名是这一面唯一读得到的
+    /// 身份：cgroup 只给容器 id，Kubernetes 的状态里又没有这些容器。
+    pub unclaimed: Vec<crate::process_reports::UnclaimedContainer>,
     pub pods: Vec<PodView>,
 }
 
@@ -435,11 +441,13 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
             // 不是差，是不知道。
             let claimed = claimed_container_ids(pods.get("items"));
             for node in &mut view.nodes {
-                if let Some((seen, unclaimed)) =
-                    crate::process_reports::census_gap(&node.name, &claimed)
-                {
-                    node.census_containers = Some(seen);
-                    node.unclaimed_containers = Some(unclaimed);
+                if let Some(gap) = crate::process_reports::census_gap(&node.name, &claimed) {
+                    node.census_containers = Some(gap.seen);
+                    // 计数从这一列里数出来，不另算一遍：两处各算一次，差一格的时候
+                    // 屏上会出现「3 个没有认领」而下面只列着 2 条的场面，而读者没有
+                    // 办法知道该信哪一个。
+                    node.unclaimed_containers = Some(gap.unclaimed.len());
+                    node.unclaimed = gap.unclaimed;
                 }
             }
         }
@@ -896,6 +904,7 @@ fn node_view(node: &Value) -> NodeView {
         memory_used_bytes: None,
         census_containers: None,
         unclaimed_containers: None,
+        unclaimed: Vec::new(),
         pods: Vec::new(),
     }
 }

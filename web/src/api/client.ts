@@ -2240,13 +2240,30 @@ export interface TopologyNode {
    */
   census_containers: number | null;
   /**
-   * 上面那些容器里，有几个是这一面读不到的：它们跑在别的命名空间里，这一面按
-   * 命名空间取 Pod，于是有进程读数却没有一格能显示它们。为 `null` 同理。
+   * 上面那些容器里，有几个是这一面读不到的：这一面画的是有 Pod 的容器，而采集器
+   * 读的是整台宿主的 cgroup 树。构建容器、直接起在宿主上的进程有进程读数却没有
+   * 一格能显示它们。为 `null` 同理。
    *
-   * 这个数不为 0 时，「这台机器上的容器」比屏上的多——多多少只能由它说出来。
+   * 这个数不为 0 时，「这台机器上的容器」比屏上的多——多多少只能由它说出来，
+   * 是谁则看 `unclaimed`。
    */
   unclaimed_containers: number | null;
+  /**
+   * 上面那个数点名的那些容器，一个一条：计数答「漏了几个」，这一列答「漏的是谁」。
+   * 与 `unclaimed_containers` 同时有值、同时为空。
+   */
+  unclaimed: TopologyUnclaimedContainer[];
   pods: TopologyPod[];
+}
+
+/** 采集器看得见、这一面画不出来的容器：没有 Pod 认领的那些。 */
+export interface TopologyUnclaimedContainer {
+  /** 容器实例 id 的前 12 个字符——够认出「同一台机器上刚才那两个」。 */
+  id: string;
+  /** 里面跑着几个进程。 */
+  processes: number;
+  /** 最占内存的那几个进程名，去重、最多 4 个。cgroup 只给 id，名字只能从进程来。 */
+  commands: string[];
 }
 
 export interface TopologyCluster {

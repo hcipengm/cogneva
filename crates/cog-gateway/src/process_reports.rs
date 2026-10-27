@@ -135,33 +135,92 @@ pub fn census_at(node: &str) -> Option<DateTime<Utc>> {
     })
 }
 
-/// 某台节点上采集器看到了几个容器，其中几个**这一面读不到**。
+/// 一个名字最多在这几个容器里出现几回——`commands` 去重后最多留几个。
+pub const MAX_UNCLAIMED_COMMANDS: usize = 4;
+
+/// 采集器看得见、屏上没有格子的一个容器。
+///
+/// 只给一个计数时，读者知道「有 3 个没有格子」，却不知道那 3 个是谁。而宿主上那些
+/// 没有 Pod 认领的容器恰恰是最吃这台机器的：构建容器、直接起在宿主上的进程。它们的
+/// 名字读不到（cgroup 只给 id），但里面的进程名读得到——那就是能说出它们是谁的东西。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UnclaimedContainer {
+    /// 容器实例 id 的前 12 个字符。完整 id 是六十来位十六进制，这一面没有地方用它
+    /// ——读者要认的是「同一台机器上刚才那两个」，不是把它敲进 shell。
+    pub id: String,
+    /// 里面跑着几个进程。
+    pub processes: usize,
+    /// 最占内存的那几个进程名，去重后最多 [`MAX_UNCLAIMED_COMMANDS`] 个。
+    pub commands: Vec<String>,
+}
+
+/// 一台节点上的普查结果：采集器看到了几个容器，其中哪些是这一面读不到的。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CensusGap {
+    pub seen: usize,
+    /// 按进程数从多到少，同数按 id 排。
+    ///
+    /// 排序不是为了好看：这张表每次刷新都从哈希表里重建，不排的话顺序每拍都变，
+    /// 而「顺序变了」和「内容变了」在屏上是同一件事——读者会看到一行在跳。
+    pub unclaimed: Vec<UnclaimedContainer>,
+}
+
+/// 某台节点上采集器看到了几个容器，其中哪些**这一面读不到**。
 ///
 /// `claimed` 是屏上这些 Pod 的容器实例 id：采集器按容器 id 入账，Pod 状态里也带着
 /// 同一个 id，两边不用交换名字就能对上。对不上的那些，采集器看得见它们、屏上没有
-/// 它们的位置——跑在别的命名空间里的容器就是这样消失的：这一面按命名空间取 Pod，
-/// 而采集器读的是**整台宿主**的 cgroup 树。
+/// 它们的位置——宿主上的构建容器、直接起在宿主上的进程就是这样。
 ///
 /// 返回 `None` 读作「这台节点上没有活着的采集器」：没有人能报，差就是「不知道」，
 /// 不是 0——把它写成 0 会让「采集器没装」读成「一个都没漏」。
-pub fn census_gap(node: &str, claimed: &HashSet<String>) -> Option<(usize, usize)> {
+pub fn census_gap(node: &str, claimed: &HashSet<String>) -> Option<CensusGap> {
     let node = node.trim();
     if node.is_empty() || census_at(node).is_none() {
         return None;
     }
     let reports = REPORTS.read().unwrap_or_else(|e| e.into_inner());
     let mut seen = 0usize;
-    let mut unclaimed = 0usize;
+    let mut unclaimed = Vec::new();
     for (id, report) in reports.iter() {
         if !fresh(report) || report.node != node {
             continue;
         }
         seen += 1;
         if !claimed.contains(id) {
-            unclaimed += 1;
+            unclaimed.push(UnclaimedContainer {
+                id: id.chars().take(12).collect(),
+                processes: report.processes.len(),
+                commands: commands_of(&report.processes),
+            });
         }
     }
-    Some((seen, unclaimed))
+    unclaimed.sort_by(|a, b| b.processes.cmp(&a.processes).then_with(|| a.id.cmp(&b.id)));
+    Some(CensusGap { seen, unclaimed })
+}
+
+/// 一张进程表里最占内存的几个名字，去重，保持「谁更大谁在前」。
+///
+/// 按内存而不是按 pid 排：一个容器里跑着几十个进程时，说得出「它在跑 rustc」
+/// 比列出一串 pid 有用地多，而占内存最大的那个通常就是它正在干的事。
+fn commands_of(processes: &[ReportedProcess]) -> Vec<String> {
+    let mut ordered: Vec<&ReportedProcess> = processes.iter().collect();
+    ordered.sort_by(|a, b| {
+        b.rss_bytes
+            .cmp(&a.rss_bytes)
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
+    let mut commands: Vec<String> = Vec::new();
+    for process in ordered {
+        let command = process.command.trim();
+        if command.is_empty() || commands.iter().any(|seen| seen == command) {
+            continue;
+        }
+        commands.push(command.to_string());
+        if commands.len() == MAX_UNCLAIMED_COMMANDS {
+            break;
+        }
+    }
+    commands
 }
 
 /// 把 Pod 状态里的 `containerd://<id>` 与自报里的 id 折成同一个形状：只要那串
@@ -591,10 +650,16 @@ mod tests {
             );
         }
         let claimed: HashSet<String> = [placed.clone()].into_iter().collect();
+        let gap = census_gap(&node, &claimed).expect("有采集器的节点要读得出差");
         assert_eq!(
-            census_gap(&node, &claimed),
-            Some((2, 1)),
+            (gap.seen, gap.unclaimed.len()),
+            (2, 1),
             "这台节点上两份表、其中一份没有 Pod 认领；另一台节点的表不算进来"
+        );
+        assert_eq!(
+            gap.unclaimed[0].id,
+            elsewhere.chars().take(12).collect::<String>(),
+            "缺口里要点名是哪一个容器，不是一个只够相减的数"
         );
         assert_eq!(
             census_gap(&format!("no-collector-{suffix}"), &claimed),
@@ -827,5 +892,107 @@ mod tests {
         let response = ingest(body("pod-c", "c3c3c3", one_process()), &events, &None).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert!(latest("c3c3c3").is_some());
+    }
+
+    /// 没有这次改动就会红：缺口只报一个数时，读者知道「有几个没有格子」，
+    /// 却不知道漏的是谁——而宿主上最吃机器的恰恰是那几个没有 Pod 的。
+    #[test]
+    fn an_unclaimed_container_is_named_by_the_processes_it_runs() {
+        // 节点名与容器 id 都不与别的用例重叠：这张表是整个进程一份的静态账。
+        let node = "census-gap-node-unclaimed";
+        let claimed_id = "e1e1e1e1e1e1";
+        let build_id = "f2f2f2f2f2f2f2";
+        let stale_id = "a9a9a9a9a9a9";
+        let elsewhere_id = "b7b7b7b7b7b7";
+        record_census(node);
+
+        let process = |pid: u32, command: &str, rss_bytes: u64| ReportedProcess {
+            pid,
+            parent_pid: 1,
+            command: command.to_string(),
+            rss_bytes,
+        };
+        record(
+            claimed_id,
+            Report {
+                node: node.to_string(),
+                reported_at: Utc::now(),
+                processes: vec![process(1, "nginx", 100)],
+            },
+        );
+        record(
+            build_id,
+            Report {
+                node: node.to_string(),
+                reported_at: Utc::now(),
+                // 两个 cargo：去重后只报一次；顺序按内存，不按 pid。
+                processes: vec![
+                    process(10, "cargo", 900),
+                    process(11, "rustc", 800),
+                    process(12, "cargo", 700),
+                    process(13, "sh", 600),
+                    process(14, "ld", 500),
+                    process(15, "cc", 400),
+                ],
+            },
+        );
+        record(
+            stale_id,
+            Report {
+                node: node.to_string(),
+                reported_at: Utc::now() - chrono::Duration::seconds(FRESH_FOR.as_secs() as i64 + 5),
+                processes: vec![process(20, "left-behind", 100)],
+            },
+        );
+        record(
+            elsewhere_id,
+            Report {
+                node: "census-gap-node-elsewhere".to_string(),
+                reported_at: Utc::now(),
+                processes: vec![process(30, "other-node", 100)],
+            },
+        );
+
+        let mut claimed = HashSet::new();
+        claimed.insert(claimed_id.to_string());
+        let gap = census_gap(node, &claimed).expect("采集器报到过，差就该读得出来");
+
+        assert_eq!(gap.seen, 2, "过期的那份与别的节点上的都不算这一拍");
+        assert_eq!(gap.unclaimed.len(), 1, "被认领的那个不在缺口里");
+        let row = &gap.unclaimed[0];
+        assert_eq!(row.id, &build_id[..12], "只给前 12 个字符，够认出同一个");
+        assert_eq!(row.processes, 6);
+        assert_eq!(
+            row.commands,
+            vec!["cargo", "rustc", "sh", "ld"],
+            "按内存从大到小、去重、封顶"
+        );
+    }
+
+    /// 缺口为空与「没有采集器」不是一回事：前者是零个，后者是不知道。
+    #[test]
+    fn a_node_with_a_census_and_nothing_unclaimed_reads_as_zero_not_as_unknown() {
+        let node = "census-gap-node-complete";
+        let id = "d5d5d5d5d5d5";
+        record_census(node);
+        record(
+            id,
+            Report {
+                node: node.to_string(),
+                reported_at: Utc::now(),
+                processes: vec![ReportedProcess {
+                    pid: 1,
+                    parent_pid: 0,
+                    command: "app".to_string(),
+                    rss_bytes: 1,
+                }],
+            },
+        );
+        let mut claimed = HashSet::new();
+        claimed.insert(id.to_string());
+
+        let gap = census_gap(node, &claimed).expect("有采集器就有读数");
+        assert_eq!((gap.seen, gap.unclaimed.len()), (1, 0));
+        assert!(census_gap("census-gap-node-absent", &claimed).is_none());
     }
 }

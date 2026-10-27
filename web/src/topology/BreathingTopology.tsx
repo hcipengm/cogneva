@@ -744,6 +744,17 @@ function NodeDetail({
         </p>
       )}
 
+      {node.unclaimed.length > 0 && (
+        <ul className="space-y-0.5">
+          {node.unclaimed.map((row) => (
+            <li key={row.id} className="mono text-[10px] text-[var(--muted)]">
+              {row.id} · {row.processes} 个进程
+              {row.commands.length > 0 && <> · {row.commands.join(' / ')}</>}
+            </li>
+          ))}
+        </ul>
+      )}
+
       {pressures.length > 0 && (
         <p className="text-[10.5px]" style={{ color: 'var(--danger)' }}>
           {pressures

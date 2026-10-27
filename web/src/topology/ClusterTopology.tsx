@@ -302,11 +302,23 @@ function NodeCard({ node }: { node: TopologyNode }) {
           不说的话，屏上看起来就是全量。这一面读的是整个集群的 Pod，所以差出来的
           只剩不经 k8s 起的容器，而它们照样有进程读数。 */}
       {node.unclaimed_containers != null && node.unclaimed_containers > 0 && (
-        <p className="px-3 pb-2 text-[10px] text-[var(--muted)]">
-          采集器在这台机器上看到 <span className="mono">{node.census_containers}</span> 个容器，其中{' '}
-          <span className="mono">{node.unclaimed_containers}</span> 个没有任何 Pod 认领（构建容器、
-          宿主上直接起的进程）：它们有进程读数，但没有 Pod 这一格。
-        </p>
+        <div className="px-3 pb-2">
+          <p className="text-[10px] text-[var(--muted)]">
+            采集器在这台机器上看到 <span className="mono">{node.census_containers}</span>{' '}
+            个容器，其中 <span className="mono">{node.unclaimed_containers}</span>{' '}
+            个没有任何 Pod 认领（构建容器、宿主上直接起的进程）：它们有进程读数，但没有
+            Pod 这一格。下面按进程数从多到少列出是谁——cgroup 只给容器 id，进程名是这一面
+            唯一读得到的身份。
+          </p>
+          <ul className="mt-1 space-y-0.5">
+            {node.unclaimed.map((row) => (
+              <li key={row.id} className="mono text-[10px] text-[var(--muted)]">
+                {row.id} · {row.processes} 个进程
+                {row.commands.length > 0 && <> · {row.commands.join(' / ')}</>}
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </div>
   );
