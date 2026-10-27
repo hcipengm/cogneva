@@ -17,8 +17,13 @@
 use cog_core::{SFError, SFResult};
 
 /// 问法本体：`{}` 位置填容器名。
+///
+/// 外层是**一层**花括号。这句模板在交给 `kubectl` 之前不再过任何 `format!`，而
+/// `{{` 只有在格式串里才会折叠成 `{`：写成 `{{...}}` 就会原样进 argv，`kubectl`
+/// 在第一个 `{` 上判 `unrecognized character in action: U+007B '{'`，这一轮读版本
+/// 直接失败——快照读不到，一个目标也判不了。
 pub const CONTAINER_IMAGE_JSONPATH: &str =
-    "jsonpath={{.spec.template.spec.containers[?(@.name==\"{}\")].image}}";
+    "jsonpath={.spec.template.spec.containers[?(@.name==\"{}\")].image}";
 
 /// 展开成 `kubectl -o` 的实参。
 pub fn container_image_query(container: &str) -> String {
@@ -75,6 +80,26 @@ mod tests {
         assert!(
             query.contains("containers[?(@.name==\"cogneva-a2a\")].image"),
             "{query}"
+        );
+    }
+
+    /// 交给 `kubectl -o` 的那一个实参，就是它要解析的模板本身。
+    ///
+    /// 两层花括号在这里不是笔误的余地：这句模板当初是从 `format!` 的参数里搬出来
+    /// 的，而 `{{` 只在格式串里才折叠成 `{`。搬成普通常量后若照抄 `{{...}}`，
+    /// 实参就是 `jsonpath={{...}}`，`kubectl` 报 `unrecognized character in action:
+    /// U+007B '{'`，整轮读版本失败。这条量的是交出去的字符串，不是源码长什么样。
+    #[test]
+    fn the_argument_handed_to_kubectl_is_one_layer_of_braces() {
+        let query = container_image_query("cogneva-a2a");
+        assert_eq!(
+            query,
+            "jsonpath={.spec.template.spec.containers[?(@.name==\"cogneva-a2a\")].image}",
+        );
+        assert_eq!(
+            (query.matches('{').count(), query.matches('}').count()),
+            (1, 1),
+            "外层花括号只能有一层：{query}"
         );
     }
 
