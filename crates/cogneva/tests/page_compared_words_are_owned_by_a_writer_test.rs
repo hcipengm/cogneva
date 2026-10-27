@@ -48,7 +48,6 @@ const GIT_IDENTITY: &str = "crates/cog-gateway/src/git_identity.rs";
 const RUNTIME: &str = "crates/cog-agent/src/agent_kernel/runtime.rs";
 const AGENTS: &str = "crates/cog-gateway/src/agents.rs";
 const REFLECTION: &str = "crates/cog-core/src/contract/reflection.rs";
-const CONTRIBUTION: &str = "crates/cog-gateway/src/contribution_admin.rs";
 /// Where the gateway writes the two code-platform words down.
 const PLATFORM_WORDS: &str = "crates/cog-gateway/src/lib.rs";
 const LLM_ADMIN: &str = "crates/cog-gateway/src/llm_admin.rs";
