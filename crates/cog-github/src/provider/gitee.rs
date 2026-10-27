@@ -108,7 +108,7 @@ impl GiteeProvider {
     /// 做一次列表扫描完成 id → 字符串编号翻译（发现循环低频调用，可接受）。
     async fn issue_string_number(&self, issue_id: u64) -> Result<String> {
         let v = self
-            .send(self.get("/issues", &[("state", "all"), ("per_page", "100")]))
+            .send(self.get("/issues", &[("state", "all"), PER_PAGE]))
             .await?;
         v.as_array()
             .and_then(|a| {
@@ -154,6 +154,24 @@ fn parse_time(v: &serde_json::Value) -> chrono::DateTime<chrono::Utc> {
         .unwrap_or_else(chrono::Utc::now)
 }
 
+/// 一页最多取多少条。
+///
+/// Gitee v5 的列表端点都认这个上限，六处调用各写一遍时，改一处就只让那一个
+/// 列表换了页长——返回的仍然是一个列表，读者看到的只是它比别处短。
+const PER_PAGE: (&str, &str) = ("per_page", "100");
+
+/// 列「还开着的那一批」用的四个查询参数。
+///
+/// issues 与 pulls 是两条端点，可「只要开着的、按创建时间倒序、取满一页」是
+/// 同一句话。分开写时，改一条只让其中一个列表换了次序或页长，而两边都仍然
+/// 返回一个像样的列表。
+const OPEN_LIST_QUERY: [(&str, &str); 4] = [
+    ("state", "open"),
+    ("per_page", "100"),
+    ("sort", "created"),
+    ("direction", "desc"),
+];
+
 #[async_trait]
 impl CodePlatformProvider for GiteeProvider {
     fn platform_kind(&self) -> &'static str {
@@ -161,17 +179,7 @@ impl CodePlatformProvider for GiteeProvider {
     }
 
     async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>> {
-        let v = self
-            .send(self.get(
-                "/issues",
-                &[
-                    ("state", "open"),
-                    ("per_page", "100"),
-                    ("sort", "created"),
-                    ("direction", "desc"),
-                ],
-            ))
-            .await?;
+        let v = self.send(self.get("/issues", &OPEN_LIST_QUERY)).await?;
         Ok(v.as_array()
             .map(|a| a.iter().map(parse_issue).collect())
             .unwrap_or_default())
@@ -195,17 +203,7 @@ impl CodePlatformProvider for GiteeProvider {
     }
 
     async fn list_open_pull_requests(&self) -> Result<Vec<PlatformPullRequest>> {
-        let v = self
-            .send(self.get(
-                "/pulls",
-                &[
-                    ("state", "open"),
-                    ("per_page", "100"),
-                    ("sort", "created"),
-                    ("direction", "desc"),
-                ],
-            ))
-            .await?;
+        let v = self.send(self.get("/pulls", &OPEN_LIST_QUERY)).await?;
         Ok(v.as_array()
             .map(|a| a.iter().map(parse_pr_list_item).collect())
             .unwrap_or_default())
@@ -247,10 +245,7 @@ impl CodePlatformProvider for GiteeProvider {
     async fn list_issue_comments(&self, issue_number: u64) -> Result<Vec<PlatformComment>> {
         let number = self.issue_string_number(issue_number).await?;
         let v = self
-            .send(self.get(
-                &format!("/issues/{number}/comments"),
-                &[("per_page", "100")],
-            ))
+            .send(self.get(&format!("/issues/{number}/comments"), &[PER_PAGE]))
             .await?;
         Ok(v.as_array()
             .map(|a| {
@@ -268,10 +263,7 @@ impl CodePlatformProvider for GiteeProvider {
     async fn list_pull_comments(&self, pr_number: u64) -> Result<Vec<PlatformComment>> {
         // Gitee PR 评论端点与 issue 不同（PR 用数值 number，直接进路径）。
         let v = self
-            .send(self.get(
-                &format!("/pulls/{pr_number}/comments"),
-                &[("per_page", "100")],
-            ))
+            .send(self.get(&format!("/pulls/{pr_number}/comments"), &[PER_PAGE]))
             .await?;
         Ok(v.as_array()
             .map(|a| {
