@@ -18,7 +18,6 @@ pub mod cross_system;
 pub mod dataset;
 pub mod dimensions;
 pub mod exec_seam;
-pub mod gateway;
 pub mod harness;
 pub mod judge;
 pub mod long_run;
