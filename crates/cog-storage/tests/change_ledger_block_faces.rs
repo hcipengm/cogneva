@@ -1,4 +1,5 @@
 //! principle: feedback_a_copied_closed_set_reveals_additions_but_not_redefinitions
+//! principle: feedback_a_closed_set_that_lists_only_the_members_it_already_has_folds_new_ones_into_silence
 //!
 //! The face a change is filed under used to be a closed set living in three
 //! places that cannot import each other: a variant list in the service, an `IN`

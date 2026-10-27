@@ -1,4 +1,5 @@
 //! principle: feedback_a_key_the_platform_cannot_end_is_refused_where_it_enters
+//! principle: feedback_a_behaviour_checked_only_by_a_pure_function_and_a_hand_probe_has_no_gate
 //!
 //! The inbox route refuses a reply stream it did not open, and it is the route
 //! that says so.
