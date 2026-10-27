@@ -37,7 +37,8 @@ Kubernetes 节）。用户不需要在 K3s / 标准 K8s / Helm 之间做选择�
 | `check-cross-layer-reconcile.sh` | 资源账三层对账读数：配额记账的 `used` ≤ 节点 `allocatable`；每节点 `Σanon` + 该节点 file 的 7 天最低 < `MemTotal`（并列 PSI full）；准入余量 `hard - used` 装得下部署器下一次滚动 Job 的声明上限（`used` 含运行时自建的 Pod，渲染期门禁看不见）。某层读不到报 2 而不是报绿。定时载体见 `install-cross-layer-reconcile.sh` |
 | `check-container-headroom.sh` | 容器内存余量读数：窗口内峰值 RSS 对声明上限（逐容器，默认红线 0.85），加窗口内 `OOMKilled` 终止记录。判的是**单个容器**上「实际要过的量 vs 它的上限」——集群总量全绿时它仍可以是红的。定时载体见 `install-container-headroom.sh` |
 | `init-secrets.sh` | 安装时**随机生成**内部密钥（pg/redis/内部签名）并创建 Secret；幂等不覆盖已有值；元启动 apply 前自动跑 |
-| `distribute-image.sh` | 多节点镜像增量升级：把镜像 tar 分发到全部节点并滚动重启 |
+| `distribute-image.sh` | 多节点镜像增量升级：把镜像 tar 分发到全部节点并滚动重启（重启面与换版脚本同源，见下一行；`--list-workloads` 只印集合） |
+| `platform-image-workloads.sh` | 换镜像面**唯一的**判定：从 `k3s/` 清单读出哪些工作负载跑着本项目镜像（Deployment / DaemonSet / StatefulSet 的常驻容器；initContainer 与 CronJob 不算——前者随所属工作负载换、后者每次起 Pod 按浮动签拉）。换版与分发两个脚本都调这一份，各自抄名单时漏掉的那一项不会红，只会安静地继续跑旧二进制。空集合/解析失败报 2（判不了该滚谁），不退化成一次静默的空滚动 |
 | `build-release-image.sh` | release 预构建运行时镜像的**本机单源**构建（产物 tar.gz + sha256） |
 | `verify-firecracker.sh` | Firecracker 微虚拟机沙盒的真机端到端验证 |
 

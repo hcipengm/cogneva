@@ -56,58 +56,27 @@ done
 
 cd "$REPO_ROOT"
 
-# 换镜像面：哪些工作负载跑着本项目的二进制，由交付树回答，不在这里列名字。
-#
-# 镜像被不止四个 Deployment 用着：宿主账本 / 进程普查 / 声明仓是 DaemonSet，
-# 注册仓的卷走查是边车，redis 的 AOF 修复是 initContainer。写死一份四个名字的
-# 名单，它们不在这一趟滚动里，而脚本末尾的「均运行新镜像」照样成立——它们的
-# 「已更新」与「根本没查」在读数上分不开，于是旧二进制可以一直跑下去。
+# 换镜像面：哪些工作负载跑着本项目的二进制，由交付树回答（见
+# deploy/scripts/platform-image-workloads.sh），不在这里列名字。镜像被不止四个
+# Deployment 用着：宿主账本 / 进程普查 / 声明仓是 DaemonSet，注册仓的卷走查是
+# 边车，redis 的 AOF 修复是 initContainer。写死一份四个名字的名单，它们不在
+# 这一趟滚动里，而脚本末尾的「均运行新镜像」照样成立——它们的「已更新」与
+# 「根本没查」在读数上分不开，于是旧二进制可以一直跑下去。
 #
 # 取的是**常驻容器**：initContainer 只在新 Pod 起来时跑一次，它跟着所属工作负载
 # 一起换，单独 set image 反而会为了一个不常驻的进程重启整个 StatefulSet（redis
 # 就是这样）。CronJob 也不进来：它每次起 Pod 都按浮动签 :local + Always 拉，
 # 下一次运行自然就是新镜像，没有要滚的东西。
 #
-# 输出：每行 `<kind>\t<名字>\t<容器>`；解析不了（读不到清单 / 不是 yaml）时非零退出。
+# 镜像仓库名用不上 IMAGE（那是节点本地 tag localhost/cogneva）：清单 pin 的是
+# 集群内 registry 引用 localhost:30500/cogneva，两者都认。清单里一个都认不出来时
+# 读出的集合是空的，于是这一趟判不了——而不是悄悄换掉另一批工作负载。
 platform_image_workloads() {
-  python3 - "$REPO_ROOT/deploy/k3s" <<'PY'
-import os, sys, yaml
-
-root = sys.argv[1]
-REPOS = ("localhost:30500/cogneva", "localhost/cogneva")
-KINDS = ("Deployment", "DaemonSet", "StatefulSet")
-
-def repo_of(image):
-    image = image.split("@")[0]
-    last = image.rsplit("/", 1)[-1]
-    return image.rsplit(":", 1)[0] if ":" in last else image
-
-rows = []
-for name in sorted(os.listdir(root)):
-    if not name.endswith(".yaml"):
-        continue
-    with open(os.path.join(root, name)) as handle:
-        for doc in yaml.safe_load_all(handle):
-            if not isinstance(doc, dict) or doc.get("kind") not in KINDS:
-                continue
-            spec = ((doc.get("spec") or {}).get("template") or {}).get("spec") or {}
-            for container in spec.get("containers") or []:
-                if repo_of(container.get("image", "")) in REPOS:
-                    rows.append((doc["kind"],
-                                 (doc.get("metadata") or {}).get("name"),
-                                 container.get("name")))
-
-for kind, name, container in rows:
-    print("%s\t%s\t%s" % (kind, name, container))
-PY
+  bash "$REPO_ROOT/deploy/scripts/platform-image-workloads.sh"
 }
 
 if [ "$LIST_WORKLOADS" = 1 ]; then
-  WORKLOADS="$(platform_image_workloads)" || {
-    echo "读不出换镜像面的工作负载：deploy/k3s 下的清单解析失败" >&2; exit 2; }
-  [ -n "$WORKLOADS" ] || {
-    echo "deploy/k3s 下没有任何工作负载引用 ${IMAGE}——这一趟判不了该滚谁" >&2; exit 2; }
-  printf '%s\n' "$WORKLOADS"
+  platform_image_workloads || exit 2
   exit 0
 fi
 
@@ -432,9 +401,9 @@ if [ "$DO_DEPLOY" = 1 ]; then
   # imagePullPolicy: Always——必须用 registry 引用滚动，写节点本地
   # localhost/cogneva:<tag> 会让 kubelet 去 https://localhost 拉取直接失败。
   workloads="$(platform_image_workloads)" || {
-    echo "读不出换镜像面的工作负载：deploy/k3s 下的清单解析失败" >&2; exit 1; }
-  [ -n "$workloads" ] || {
-    echo "deploy/k3s 下没有任何工作负载引用 ${IMAGE}——这一趟判不了该滚谁" >&2; exit 1; }
+    echo "换镜像面的工作负载读不出来（理由见上），拒绝在判不了该滚谁时动集群" >&2
+    exit 1
+  }
   echo "==> 换镜像面滚动到 localhost:30500/cogneva:${NEW_TAG}（$(printf '%s\n' "$workloads" | wc -l) 个容器）"
   while IFS=$'\t' read -r workload_kind workload_name container_name; do
     [ -n "$workload_kind" ] || continue
