@@ -16,11 +16,9 @@
 //! * 读的清单是**会被投递出去的每一棵树**：`deploy/k3s`（元启动 apply 的字节）与
 //!   `deploy/rendered` 下的每个 profile（`helm install` 的字节）。profile 目录由
 //!   目录枚举出来而不是在这里点名，新加一个 profile 不需要改这道门；
-//! * 「这个容器起的是哪份代码」不在本文件里另写一份：子命令从 `crates/cogneva/src/
-//!   cli.rs` 的 `SUBCOMMANDS` 读（argv 词 → 枚举变体），变体 → 模块从 `main.rs` 的
-//!   匹配臂读，模块路径按 Rust 的 `crate::mod::fn` 形状落到文件；
-//! * 「哪个镜像是本项目的」取 chart values 里的 `image.repository`——静态清单与
-//!   chart 是 parity 锁着的一份拓扑，镜像名只有这一个出处。
+//! * 「这个容器起的是哪份代码」由 [`common::service_topology`] 读一次（子命令词表
+//!   来自 `cli.rs`、变体 → 模块来自 `main.rs`），本文件不另写一份；抓取目标那道门
+//!   读的是同一份。
 //!
 //! 判不了什么：
 //!
@@ -32,7 +30,7 @@
 //! * 探针的端口对不对（那是 reachability 门第 4 族的事）、探针的时机与阈值；
 //! * chart 模板本身（带 `{{ }}` 的不是合法 YAML）：模板里写错要到重新渲染之后才在
 //!   这道门上出现，而「渲染产物是不是最新」是新鲜度门的事；parity 只比对
-//!   env/卷/挂载/端口/SA，不比探针，所以两棵树之间的探针分叉同样由这道门接住。
+//!   卷/挂载/端口/env/SA，不比探针，所以两棵树之间的探针分叉同样由这道门接住。
 //!
 //! 普查要有下限：读不到 chart 的 `image.repository`、一个跑本项目镜像且带
 //! `httpGet` 探针的容器都没找到、或这棵树里一条路由都没读到时，一律按红处理——
@@ -49,355 +47,20 @@
 
 mod common;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use serde::Deserialize;
-
-use common::routes::{repo_root, route_entries_in, walk};
-use common::rust_production::production_text;
-
-/// 唯一声明本项目镜像名的地方。
-const CHART_VALUES: &str = "deploy/helm/cogneva/values.yaml";
-/// 子命令的 argv 词表（词 → 枚举变体）。
-const CLI: &str = "crates/cogneva/src/cli.rs";
-/// 枚举变体 → 模块（子命令实际起的那份代码）。
-const MAIN: &str = "crates/cogneva/src/main.rs";
-/// 静态清单：apply 路径上真正被投递的那份字节。
-const APPLY_TREE: &str = "deploy/k3s";
-/// 预渲染产物：`helm install` 投递的那份字节。每个 profile 一个目录，由目录本身
-/// 枚举，不在这里钉名字——新加一个 profile 不该需要改这道门。
-const RENDERED: &str = "deploy/rendered";
-
-#[derive(Debug, Clone)]
-struct Container {
-    manifest: String,
-    workload: String,
-    name: String,
-    image: String,
-    /// `args` 里的第一个位置参数（子命令词）；`None` 表示走镜像入口、无参数。
-    subcommand: Option<String>,
-    /// `(探针名, httpGet 路径)`。
-    probes: Vec<(String, String)>,
-}
-
-/// 本项目镜像的仓库名（不含 tag），取自 chart values。
-fn our_image(root: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(root.join(CHART_VALUES)).ok()?;
-    let mut in_image = false;
-    for line in text.lines() {
-        if !line.starts_with(' ') && !line.trim().is_empty() {
-            in_image = line.trim_end() == "image:";
-            continue;
-        }
-        if !in_image {
-            continue;
-        }
-        if let Some(rest) = line.trim_start().strip_prefix("repository:") {
-            let value = rest.trim().trim_matches('"').trim_matches('\'');
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// `cli.rs` 里 `SUBCOMMANDS` 声明的 argv 词 → 枚举变体。
-fn subcommands(root: &Path) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(root.join(CLI)) else {
-        return out;
-    };
-    let production = production_text(&text);
-    let Some(start) = production.find("SUBCOMMANDS") else {
-        return out;
-    };
-    let Some(end) = production[start..].find("];") else {
-        return out;
-    };
-    let table = &production[start..start + end];
-    let mut cursor = 0;
-    while let Some(offset) = table[cursor..].find("(\"") {
-        let word_at = cursor + offset + 2;
-        let Some(word_end) = table[word_at..].find('"') else {
-            break;
-        };
-        let word = &table[word_at..word_at + word_end];
-        let after = table[word_at + word_end + 1..].trim_start();
-        if let Some(rest) = after.strip_prefix(',') {
-            if let Some(variant) = rest.trim_start().strip_prefix("Command::") {
-                let name: String = variant
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                if !name.is_empty() {
-                    out.insert(word.to_string(), name);
-                }
-            }
-        }
-        cursor = word_at + word_end + 1;
-    }
-    out
-}
-
-/// `main.rs` 里 `Command::X => …` 每个匹配臂起的那几份代码（按 Rust 路径落到文件）。
-fn dispatch(root: &Path) -> BTreeMap<String, Vec<PathBuf>> {
-    let mut out: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(root.join(MAIN)) else {
-        return out;
-    };
-    let production = production_text(&text);
-    // 每个臂的开头：一行里只有空白之后跟 `Command::<Variant>` 再跟 `=>`。
-    let mut arms: Vec<(usize, String, usize)> = Vec::new();
-    let mut cursor = 0;
-    while let Some(offset) = production[cursor..].find("Command::") {
-        let at = cursor + offset;
-        cursor = at + "Command::".len();
-        let line_start = production[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
-        if !production[line_start..at].trim().is_empty() {
-            continue;
-        }
-        let rest = &production[at + "Command::".len()..];
-        let variant: String = rest
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        if variant.is_empty() {
-            continue;
-        }
-        let after = &rest[variant.len()..];
-        let trimmed = after.trim_start();
-        let Some(body) = trimmed.strip_prefix("=>") else {
-            continue;
-        };
-        let body_start = production.len() - body.len();
-        arms.push((at, variant, body_start));
-    }
-    for (index, (_, variant, body_start)) in arms.iter().enumerate() {
-        let body_end = arms
-            .get(index + 1)
-            .map(|(at, _, _)| *at)
-            .unwrap_or(production.len());
-        let body = &production[*body_start..body_end];
-        let mut files = Vec::new();
-        for path in rust_paths(body) {
-            if let Some(file) = resolve(root, &path) {
-                if !files.contains(&file) {
-                    files.push(file);
-                }
-            }
-        }
-        out.insert(variant.clone(), files);
-    }
-    out
-}
-
-fn is_ident_start(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || byte == b'_'
-}
-
-fn is_ident_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-/// 一段代码里的 `crate::mod::fn` 形状（至少一段 `::`）。
-fn rust_paths(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if !is_ident_start(bytes[i]) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && is_ident_byte(bytes[i]) {
-            i += 1;
-        }
-        let mut end = i;
-        while text[end..].starts_with("::") {
-            let segment = &text[end + 2..];
-            let length = segment.bytes().take_while(|b| is_ident_byte(*b)).count();
-            if length == 0 {
-                break;
-            }
-            end += 2 + length;
-            i = end;
-        }
-        let path = &text[start..end];
-        if path.contains("::") {
-            out.push(path.to_string());
-        }
-    }
-    out
-}
-
-/// `cog_gateway::security_gateway::run` → `crates/cog-gateway/src/security_gateway.rs`。
-///
-/// 末尾那段是函数名，从后往前取能落到文件的最长模块前缀；`crate::f` 这种不带模块
-/// 的落到 `src/lib.rs`。
-fn resolve(root: &Path, path: &str) -> Option<PathBuf> {
-    let mut parts = path.split("::");
-    let krate = parts.next()?.replace('_', "-");
-    let rest: Vec<&str> = parts.collect();
-    let base = root.join("crates").join(&krate).join("src");
-    if !base.is_dir() {
-        return None;
-    }
-    let modules = &rest[..rest.len().saturating_sub(1)];
-    if modules.is_empty() {
-        let lib = base.join("lib.rs");
-        return lib.is_file().then_some(lib);
-    }
-    for take in (1..=modules.len()).rev() {
-        let fragment = modules[..take].join("/");
-        let file = base.join(format!("{fragment}.rs"));
-        if file.is_file() {
-            return Some(file);
-        }
-        let module = base.join(&fragment).join("mod.rs");
-        if module.is_file() {
-            return Some(module);
-        }
-    }
-    None
-}
-
-/// 一组源文件注册的路径（只读生产字节）。
-fn routes_of(root: &Path, files: &[PathBuf]) -> BTreeSet<String> {
-    route_entries_in(root, files, true)
-        .into_iter()
-        .map(|route| route.shape)
-        .collect()
-}
-
-/// 整棵树注册的路径。主应用的路由由插件在运行时装配，静态读不到「谁挂了哪条」，
-/// 所以对那份代码只问「这棵树里有没有」。
-fn every_route(root: &Path) -> BTreeSet<String> {
-    let mut files = Vec::new();
-    walk(&root.join("crates"), &["rs"], &mut files);
-    files.retain(|path| path.to_string_lossy().contains("/src/"));
-    files.sort();
-    routes_of(root, &files)
-}
-
-/// 会被投递出去的几棵树：静态清单加每个预渲染 profile。
-///
-/// 三条投递路径各有自己的字节（元启动 apply `deploy/k3s`，`helm install` 用
-/// `deploy/rendered/<profile>`），而 chart 模板改完要重新渲染才会出现在后者里。
-/// 只读其中一棵，另一条路径上的同一个拼写就没人比。
-fn manifest_trees(root: &Path) -> Vec<PathBuf> {
-    let mut trees = vec![root.join(APPLY_TREE)];
-    let mut profiles: Vec<PathBuf> = std::fs::read_dir(root.join(RENDERED))
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.is_dir())
-                .collect()
-        })
-        .unwrap_or_default();
-    profiles.sort();
-    trees.extend(profiles);
-    trees
-}
-
-/// 清单里每一个容器，连同它的探针。
-fn containers(root: &Path) -> Vec<Container> {
-    let mut files = Vec::new();
-    for tree in manifest_trees(root) {
-        walk(&tree, &["yaml", "yml"], &mut files);
-    }
-    files.sort();
-    let mut out = Vec::new();
-    for path in files {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let manifest = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        for document in serde_yaml::Deserializer::from_str(&text) {
-            let Ok(value) = serde_yaml::Value::deserialize(document) else {
-                continue;
-            };
-            let kind = value.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-            if !matches!(kind, "Deployment" | "StatefulSet" | "DaemonSet") {
-                continue;
-            }
-            let workload = value
-                .get("metadata")
-                .and_then(|m| m.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or("")
-                .to_string();
-            let Some(spec) = value
-                .get("spec")
-                .and_then(|s| s.get("template"))
-                .and_then(|t| t.get("spec"))
-            else {
-                continue;
-            };
-            let Some(list) = spec.get("containers").and_then(|c| c.as_sequence()) else {
-                continue;
-            };
-            for container in list {
-                let name = container
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let image = container
-                    .get("image")
-                    .and_then(|i| i.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let subcommand = container
-                    .get("args")
-                    .and_then(|a| a.as_sequence())
-                    .and_then(|args| args.first())
-                    .and_then(|a| a.as_str())
-                    .filter(|arg| !arg.starts_with('-'))
-                    .map(str::to_string);
-                let mut probes = Vec::new();
-                for probe in ["livenessProbe", "readinessProbe", "startupProbe"] {
-                    let Some(path) = container
-                        .get(probe)
-                        .and_then(|p| p.get("httpGet"))
-                        .and_then(|h| h.get("path"))
-                        .and_then(|p| p.as_str())
-                    else {
-                        continue;
-                    };
-                    probes.push((probe.to_string(), path.to_string()));
-                }
-                out.push(Container {
-                    manifest: manifest.clone(),
-                    workload: workload.clone(),
-                    name,
-                    image,
-                    subcommand,
-                    probes,
-                });
-            }
-        }
-    }
-    out
-}
+use common::routes::repo_root;
+use common::service_topology::{container_routes, every_route, our_image, workloads};
 
 fn complaints(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let Some(image) = our_image(root) else {
         out.push(format!(
-            "  读不到 `{CHART_VALUES}` 里 `image.repository` 的取值：读不出来按红处理"
+            "  读不到 `{}` 里 `image.repository` 的取值：读不出来按红处理",
+            common::service_topology::CHART_VALUES
         ));
         return out;
     };
-    let subcommands = subcommands(root);
-    let dispatch = dispatch(root);
     let every = every_route(root);
     if every.is_empty() {
         out.push(
@@ -406,84 +69,48 @@ fn complaints(root: &Path) -> Vec<String> {
         );
     }
 
-    let ours: Vec<Container> = containers(root)
+    let judged: Vec<_> = workloads(root)
         .into_iter()
+        .flat_map(|workload| workload.containers)
         .filter(|container| container.image.starts_with(&image))
         .filter(|container| !container.probes.is_empty())
         .collect();
-    if ours.is_empty() {
+    if judged.is_empty() {
         out.push(format!(
-            "  `{APPLY_TREE}` 与 `{RENDERED}` 下每个 profile 里，一个跑本项目镜像\
-             （`{image}`）且带 `httpGet` 探针的容器都没读到：要么清单搬了家，要么探针\
-             换了形状，两种都按红处理"
+            "  `{}` 与 `{}` 下每个 profile 里，一个跑本项目镜像（`{image}`）且带 \
+             `httpGet` 探针的容器都没读到：要么清单搬了家，要么探针换了形状，两种都按红处理",
+            common::service_topology::APPLY_TREE,
+            common::service_topology::RENDERED
         ));
         return out;
     }
 
-    for container in ours {
-        let Container {
-            manifest,
-            workload,
-            name,
-            subcommand,
-            probes,
-            ..
-        } = &container;
-        let Some(word) = subcommand else {
-            // 主应用：走镜像入口、无参数，路由由插件在运行时装配。
-            for (probe, path) in probes {
-                if !every.contains(path) {
-                    out.push(format!(
-                        "  `{manifest}` 的 `{workload}` 里容器 `{name}` 的 `{probe}` 访问 \
-                         `{path}`，而这棵树的 `crates/*/src` 里没有任何 `.route(\"{path}\")`：\
-                         探针会一直收到 404，容器永远不 ready，而两侧各自都是「对」的"
-                    ));
-                }
+    for container in judged {
+        let routes = match container_routes(root, container.subcommand.as_deref(), &every) {
+            Ok(routes) => routes,
+            Err(reason) => {
+                out.push(format!(
+                    "  `{}` 的 `{}` 里容器 `{}` {reason}",
+                    container.manifest, container.workload, container.name
+                ));
+                continue;
             }
-            continue;
         };
-        let Some(variant) = subcommands.get(word) else {
-            out.push(format!(
-                "  `{manifest}` 的 `{workload}` 里容器 `{name}` 以 `{word}` 为子命令启动，\
-                 而 `{CLI}` 的 `SUBCOMMANDS` 里没有这个词：进程会打印 `unrecognized \
-                 argument` 并以退出码 2 结束，容器起不来"
-            ));
-            continue;
-        };
-        let Some(files) = dispatch.get(variant) else {
-            out.push(format!(
-                "  `{manifest}` 的 `{workload}` 里容器 `{name}` 起的是子命令 `{word}`\
-                 （`Command::{variant}`），而 `{MAIN}` 里没有 `Command::{variant} =>` 这个\
-                 匹配臂：读不到它起的是哪份代码"
-            ));
-            continue;
-        };
-        if files.is_empty() {
-            out.push(format!(
-                "  `{manifest}` 的 `{workload}` 里容器 `{name}` 起的是子命令 `{word}`\
-                 （`Command::{variant}`），而 `{MAIN}` 那个匹配臂里的 Rust 路径一条都\
-                 落不到文件：读不出它起的是哪份代码"
-            ));
-            continue;
-        }
-        let routes = routes_of(root, files);
-        for (probe, path) in probes {
+        for (probe, path) in &container.probes {
             if routes.contains(path) {
                 continue;
             }
             out.push(format!(
-                "  `{manifest}` 的 `{workload}` 里容器 `{name}`（子命令 `{word}`，代码在 {}）\
-                 的 `{probe}` 访问 `{path}`，而那份代码注册的路径是 {}：探针会一直收到 \
-                 404，容器永远不 ready，而两侧各自都是「对」的——代码编译通过，清单也 \
-                 apply 成功",
-                files
-                    .iter()
-                    .map(|file| format!(
-                        "`{}`",
-                        file.strip_prefix(root).unwrap_or(file).to_string_lossy()
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("、"),
+                "  `{}` 的 `{}` 里容器 `{}`{} 的 `{probe}` 访问 `{path}`，而那份代码注册的\
+                 路径是 {}：探针会一直收到 404，容器永远不 ready，而两侧各自都是「对」的\
+                 ——代码编译通过，清单也 apply 成功",
+                container.manifest,
+                container.workload,
+                container.name,
+                match &container.subcommand {
+                    Some(word) => format!("（子命令 `{word}`）"),
+                    None => String::new(),
+                },
                 if routes.is_empty() {
                     "（一条都没有）".to_string()
                 } else {
