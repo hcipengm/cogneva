@@ -1,0 +1,72 @@
+# promtool 规则单测：进程采集器那两条告警**真的会 firing**。
+#
+# 为什么要有这一层：两条结构门只看表达式形状，一条把 `for:` 写成 `15y`、把窗口写成
+# `[0m]` 的规则在它们眼里完全合法，而它永远不会亮。这里让 Prometheus 自己的规则引擎
+# 跑一遍：先造序列，断言「界之前不许响、界之后必须响」，每条都带一格反向证据。
+#
+# 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh \
+#         deploy/k3s/observability/manifests/20-prometheusrule-process-census.yaml \
+#         deploy/k3s/observability/tests/20-prometheusrule-process-census.test.yaml
+#
+# `rule_files` 由跑者重写：promtool 只认裸的 `groups:`，不认 PrometheusRule 这个 CRD。
+rule_files:
+  - ../manifests/20-prometheusrule-process-census.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 一、两台节点，一台还在报、一台停了：只有停了的那台该响。
+  # 这一格同时是负对照——活着的 node-a 计数一直在长，`increase == 0` 对它不成立。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_process_report_ingest_total{outcome="accepted",node="node-a"}'
+        values: '0+60x200'
+      - series: 'cogneva_process_report_ingest_total{outcome="accepted",node="node-b"}'
+        values: '40x200'
+    alert_rule_test:
+      # 停下来的头几分钟还不该响：一次网关滚动也会让这一格断一分钟上下。
+      - eval_time: 5m
+        alertname: CognevaProcessCensusSilent
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: CognevaProcessCensusSilent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 可观测与告警
+              # `max by (node)` 只留聚合键：告警行上不会有 `outcome`。
+              node: node-b
+      # 有序列的时候「一条都没通过」不成立。
+      - eval_time: 40m
+        alertname: CognevaProcessCensusAbsent
+        exp_alerts: []
+
+  # 二、一台都没通过：只有不带节点名的自报（`node=""`）在写这一族。
+  # 没有这一格，「采集器整个没装」会被读成「通道在、只是这一窗没进来」。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_process_report_ingest_total{outcome="accepted",node=""}'
+        values: '0x2 3x200'
+      - series: 'cogneva_process_report_ingest_total{outcome="refused",node=""}'
+        values: '0x200'
+    alert_rule_test:
+      # `for: 15m` 之前不许响。
+      - eval_time: 10m
+        alertname: CognevaProcessCensusAbsent
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CognevaProcessCensusAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 可观测与告警
+              # `absent()` 把 selector 里的等值匹配抄进结果：`outcome="accepted"` 是
+              # 等值，`node!=""` 不是，所以只有前者出现。
+              outcome: accepted
+      # 这一族里没有 `node` 非空的序列，按节点的 `increase` 判不动——那条规则不许
+      # 用「0」冒充「没有」。
+      - eval_time: 30m
+        alertname: CognevaProcessCensusSilent
+        exp_alerts: []

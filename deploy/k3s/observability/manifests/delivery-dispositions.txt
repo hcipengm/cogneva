@@ -48,3 +48,4 @@
 18-servicemonitor-storage.yaml deliver # 向量库自身的 /metrics（qdrant 自带端点，不为读它再装 exporter 进程）
 18-servicemonitor-ingress.yaml deliver # 入口代理的 /metrics：traefik 与 ingress-nginx 两份选择器都交付，匹配不到时不产生目标（见文件头注），因此同一份清单在两种入口形态上都安全
 19-blackbox-exporter.yaml deliver # 可达性探针本体（ConfigMap + Deployment + Service）：入口、代码托管 API 与证书剩余天数在这里才有读数
+20-prometheusrule-process-census.yaml deliver # 进程采集器自己的活体：一台节点停了（按节点的上报计数不再增长）与一台都没通过（那一族里没有 node 非空的序列）分开判；采集器停了在拓扑面上只表现为每格写着「这一拍没有它」，没有别的会红

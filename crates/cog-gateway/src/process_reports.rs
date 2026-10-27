@@ -185,9 +185,18 @@ pub const INGEST_ACCEPTED: &str = "accepted";
 pub const INGEST_REFUSED: &str = "refused";
 
 /// 把一格收口结果写进指标。没有指标后端时什么都不写：这条面本身不依赖它。
+///
+/// 带 `node` 标签：一份不带节点名的自报落 `node=""`，节点采集器那一拍落它自己的节点名。
+///
+/// 为什么非得按节点分：一份都不进来时，`max(increase(...))` 是 0，可这个 0 分不出
+/// 「整条通道断了」与「十台节点里有一台的采集器死了」——后者的读数是另外九台的
+/// 流量在撑着，而屏上仍然是九台有进程表、一台的每一格都写着「这一拍没有它」。
+/// 采集器的 Pod 是 Ready 的、日志也不报错，能问出「这台停了多久」的只有按节点的
+/// 到达时刻。
 async fn publish_ingest(
     metrics: &Option<Arc<dyn cog_core::MetricsBackend>>,
     outcome: &str,
+    node: &str,
     value: f64,
 ) {
     let Some(backend) = metrics.as_ref() else {
@@ -195,6 +204,7 @@ async fn publish_ingest(
     };
     let mut labels = HashMap::new();
     labels.insert("outcome".to_string(), outcome.to_string());
+    labels.insert("node".to_string(), node.trim().to_string());
     let _ = backend
         .record_counter(
             cog_core::metric_names::PROCESS_REPORT_INGEST_TOTAL,
@@ -211,7 +221,8 @@ async fn publish_ingest(
 /// 意味着通道在、但这一窗里一份都没进来——那是两种不同的故障，各自的修法也不同。
 pub async fn publish_vocabulary(metrics: &Option<Arc<dyn cog_core::MetricsBackend>>) {
     for outcome in [INGEST_ACCEPTED, INGEST_REFUSED] {
-        publish_ingest(metrics, outcome, 0.0).await;
+        // 节点名空着：这一格说的是「这个进程有这条通道」，不是任何一台节点报过到。
+        publish_ingest(metrics, outcome, "", 0.0).await;
     }
 }
 
@@ -237,7 +248,7 @@ pub async fn process_report_handler(
     let batch = match parsed {
         Ok(batch) => batch,
         Err(error) => {
-            publish_ingest(&state.metrics_backend, INGEST_REFUSED, 1.0).await;
+            publish_ingest(&state.metrics_backend, INGEST_REFUSED, "", 1.0).await;
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": format!("自报的形状不对：{error}") })),
@@ -268,7 +279,8 @@ async fn ingest(
 ) -> axum::response::Response {
     // 活体先记：一台节点的采集器连进来、但这一拍一个容器都没读到（节点刚起来），
     // 与采集器根本没起来，在屏上是两种不同的空白。
-    record_census(&body.node);
+    let node = body.node.trim().to_string();
+    record_census(&node);
     let mut accepted = 0usize;
     let mut refused: Vec<String> = Vec::new();
     let mut changed = false;
@@ -293,10 +305,10 @@ async fn ingest(
         );
     }
     if accepted > 0 {
-        publish_ingest(metrics, INGEST_ACCEPTED, accepted as f64).await;
+        publish_ingest(metrics, INGEST_ACCEPTED, &node, accepted as f64).await;
     }
     if !refused.is_empty() {
-        publish_ingest(metrics, INGEST_REFUSED, refused.len() as f64).await;
+        publish_ingest(metrics, INGEST_REFUSED, &node, refused.len() as f64).await;
     }
     let status = if accepted == 0 && !refused.is_empty() {
         StatusCode::BAD_REQUEST
@@ -519,13 +531,17 @@ mod tests {
     async fn cell(
         metrics: &Arc<cog_storage::mem::MemoryMetricsBackend>,
         outcome: &str,
+        node: &str,
     ) -> Option<f64> {
         metrics
             .query_counter_totals(cog_core::metric_names::PROCESS_REPORT_INGEST_TOTAL.as_str())
             .await
             .expect("读得到自己刚写的读数")
             .iter()
-            .find(|sample| sample.labels.get("outcome").map(String::as_str) == Some(outcome))
+            .find(|sample| {
+                sample.labels.get("outcome").map(String::as_str) == Some(outcome)
+                    && sample.labels.get("node").map(String::as_str) == Some(node)
+            })
             .map(|sample| sample.value)
     }
 
@@ -579,13 +595,45 @@ mod tests {
 
         let response = ingest(body("pod-a", "a1a1a1", one_process()), &events, &backend).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        assert_eq!(cell(&metrics, INGEST_ACCEPTED).await, Some(1.0));
+        assert_eq!(cell(&metrics, INGEST_ACCEPTED, "").await, Some(1.0));
         assert_eq!(
-            cell(&metrics, INGEST_REFUSED).await,
+            cell(&metrics, INGEST_REFUSED, "").await,
             None,
             "收下的一份不该同时记在拒绝那一格里"
         );
         assert_eq!(latest("a1a1a1").map(|r| r.processes.len()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_counted_under_the_node_that_sent_it() {
+        // 没有这次改动就会红：那时每一份到达都落在同一格上，一台节点的采集器死了
+        // 也被其它来源（容器自报、别的节点）的流量盖住——「这台停了多久」在读数面
+        // 上没有答案，而屏上只是它上面每一个容器写着「这一拍没有它」。
+        let metrics = memory_metrics();
+        let backend = as_backend(&metrics);
+        let (events, _rx) = tokio::sync::broadcast::channel(8);
+
+        // 容器 id 与别的用例不重叠：这张表是整个进程一份的静态账，撞了 id 就会
+        // 让别的用例读到这一条写下的读数。
+        ingest(
+            batch("node-a", vec![report("pod-c", "c3c3c3", "sh")]),
+            &events,
+            &backend,
+        )
+        .await;
+        ingest(body("pod-d", "d4d4d4", one_process()), &events, &backend).await;
+
+        assert_eq!(cell(&metrics, INGEST_ACCEPTED, "node-a").await, Some(1.0));
+        assert_eq!(
+            cell(&metrics, INGEST_ACCEPTED, "node-b").await,
+            None,
+            "另一台节点没有报过，那一格必须是缺席而不是 0"
+        );
+        assert_eq!(
+            cell(&metrics, INGEST_ACCEPTED, "").await,
+            Some(1.0),
+            "不带节点名的自报单独记一格，不被采集器那一拍盖掉"
+        );
     }
 
     #[tokio::test]
@@ -596,9 +644,9 @@ mod tests {
 
         let response = ingest(body("pod-b", "b2b2b2", Vec::new()), &events, &backend).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(cell(&metrics, INGEST_REFUSED).await, Some(1.0));
+        assert_eq!(cell(&metrics, INGEST_REFUSED, "").await, Some(1.0));
         assert_eq!(
-            cell(&metrics, INGEST_ACCEPTED).await,
+            cell(&metrics, INGEST_ACCEPTED, "").await,
             None,
             "被拒的那一份没有收下，不该记在收下那一格"
         );
@@ -611,8 +659,8 @@ mod tests {
         // 不发布这条读数。不先写 0，两种故障在读数面上一模一样。
         let metrics = memory_metrics();
         publish_vocabulary(&as_backend(&metrics)).await;
-        assert_eq!(cell(&metrics, INGEST_ACCEPTED).await, Some(0.0));
-        assert_eq!(cell(&metrics, INGEST_REFUSED).await, Some(0.0));
+        assert_eq!(cell(&metrics, INGEST_ACCEPTED, "").await, Some(0.0));
+        assert_eq!(cell(&metrics, INGEST_REFUSED, "").await, Some(0.0));
     }
 
     #[tokio::test]
