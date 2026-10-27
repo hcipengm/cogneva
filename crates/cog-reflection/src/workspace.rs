@@ -123,6 +123,17 @@ pub const DEFAULT_EPHEMERAL_TTL: Duration = Duration::from_secs(21600);
 /// 重启越频繁时遗留树越可能永远躲过回收。
 pub const ORPHAN_MIN_AGE: Duration = Duration::from_secs(900);
 
+/// 部署器独占那棵稳定工作树的 id。
+///
+/// 一个 id 就是一棵树：同一台机器上两次分配同一个 id 得到的是同一个目录。所以
+/// 这个名字写错一处，读的人就去找一棵没人写的树——而「那棵树不存在」与「那棵树
+/// 的读数为空」在调用方是同一种失败。
+pub const MAINLINE_WORKSPACE_ID: &str = "mainline";
+
+/// 引擎只读基线那棵稳定工作树的 id。它与 [`MAINLINE_WORKSPACE_ID`] 是两棵树，
+/// 共用一个 id 会让基线与主线互相覆盖，且覆盖之后两边都还读得通。
+pub const ENGINE_BASELINE_WORKSPACE_ID: &str = "engine-baseline";
+
 /// 工作树用途。除 `Ephemeral` 外都是常驻：不参与回收，跨轮次保留。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -309,12 +320,12 @@ impl WorkspaceManager {
 
     /// 部署器独占的稳定路径工作树。
     pub fn deployer_workspace(&self) -> PathBuf {
-        self.path_for("mainline")
+        self.path_for(MAINLINE_WORKSPACE_ID)
     }
 
     /// 引擎只读基线工作树（稳定路径，就地刷新）。
     pub fn engine_baseline_workspace(&self) -> PathBuf {
-        self.path_for("engine-baseline")
+        self.path_for(ENGINE_BASELINE_WORKSPACE_ID)
     }
 
     /// 某实例每轮演进独占的工作树（稳定路径，就地刷新）。同一实例的轮次串行，
@@ -469,8 +480,11 @@ impl WorkspaceManager {
     /// 两棵树的 id 取自闭集，所以序列基数有界：心跳只加行，不加维度。
     pub async fn heartbeat_index_health(&self) {
         for (id, path) in [
-            ("mainline", self.deployer_workspace()),
-            ("engine-baseline", self.engine_baseline_workspace()),
+            (MAINLINE_WORKSPACE_ID, self.deployer_workspace()),
+            (
+                ENGINE_BASELINE_WORKSPACE_ID,
+                self.engine_baseline_workspace(),
+            ),
         ] {
             let last = {
                 let sampled = self
@@ -1147,6 +1161,21 @@ fn parse_worktree_list(text: &str) -> Vec<WorktreeEntry> {
 mod tests {
     use super::*;
     use cog_core::MetricsBackend as _;
+
+    /// 两个稳定 id 就是盘上已经存在的那两个目录名。
+    ///
+    /// 这两个名字是身份，不是措辞：机器上已经躺着叫这两个名字的工作树，改名
+    /// 不会报错，只会让所有人去找一棵不存在的树——而「没有这棵树」与「这棵树
+    /// 还没被采样」在读数上是同一个零。要改它们，得同时把盘上的树搬走。
+    #[test]
+    fn the_stable_workspace_ids_are_the_ones_already_on_disk() {
+        assert_eq!(MAINLINE_WORKSPACE_ID, "mainline");
+        assert_eq!(ENGINE_BASELINE_WORKSPACE_ID, "engine-baseline");
+        assert_ne!(
+            MAINLINE_WORKSPACE_ID, ENGINE_BASELINE_WORKSPACE_ID,
+            "两个 id 相同就是同一棵树，基线与主线会互相覆盖且两边都还读得通"
+        );
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")

@@ -251,7 +251,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             if let Some(ws) = self.workspaces.as_ref() {
                 let base = ws.resolve_base(&instance_id, &version).await;
                 let spec = crate::workspace::WorkspaceSpec::persistent(
-                    "engine-baseline",
+                    crate::workspace::ENGINE_BASELINE_WORKSPACE_ID,
                     crate::workspace::WorkspaceKind::EngineBaseline,
                     base,
                 );
@@ -3440,7 +3440,7 @@ async fn run_evolution_cycle(
     instance: &str,
     version: &str,
 ) -> cog_core::SFResult<()> {
-    use crate::workspace::{WorkspaceKind, WorkspaceSpec};
+    use crate::workspace::{WorkspaceKind, WorkspaceSpec, ENGINE_BASELINE_WORKSPACE_ID};
 
     let base = deps.workspaces.resolve_base(instance, version).await;
     let workspace = deps
@@ -3464,7 +3464,7 @@ async fn run_evolution_cycle(
     if let Err(e) = deps
         .workspaces
         .ensure_persistent(WorkspaceSpec::persistent(
-            "engine-baseline",
+            ENGINE_BASELINE_WORKSPACE_ID,
             WorkspaceKind::EngineBaseline,
             base,
         ))
@@ -3486,7 +3486,7 @@ async fn align_engine_baseline(
     workspaces: &Arc<crate::workspace::WorkspaceManager>,
     workdir: &std::path::Path,
 ) {
-    use crate::workspace::{BaseRef, WorkspaceKind, WorkspaceSpec};
+    use crate::workspace::{BaseRef, WorkspaceKind, WorkspaceSpec, ENGINE_BASELINE_WORKSPACE_ID};
 
     let Some(head) = workspaces.head_of(workdir).await else {
         warn!(
@@ -3497,7 +3497,7 @@ async fn align_engine_baseline(
     };
     let baseline = match workspaces
         .ensure_persistent(WorkspaceSpec::persistent(
-            "engine-baseline",
+            ENGINE_BASELINE_WORKSPACE_ID,
             WorkspaceKind::EngineBaseline,
             BaseRef::Commit(head.clone()),
         ))

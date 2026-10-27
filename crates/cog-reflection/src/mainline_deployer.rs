@@ -1438,7 +1438,12 @@ pub(crate) const ROLLOUT_EXIT_ENVIRONMENT: i32 = 75;
 
 /// 滚动失败的类别。分的是**这次失败说不说得出新版本的问题**：版本类是这份
 /// 变更的结论，环境类只是集群此刻的样子。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// 名字只有一套，在 [`FailureClass::as_str`]：状态行的 `failed_class=` 与
+/// `state.json` 里存的那一格读的是同一个词。序列化曾按变体名写成 `Version`，
+/// 于是同一份状态在文件里与在心跳行里各叫一个名字——按名字对这两处的人，会以为
+/// 文件里那一格没有值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FailureClass {
     /// 观测到的版本缺陷：探针不过、启动卡死、支撑清单 apply 失败、容器反复崩溃。
     /// 该回滚；也是唯一能构成"这个 rev 坏"的结论、进而让重试停下的一类。
@@ -1456,6 +1461,47 @@ impl FailureClass {
             FailureClass::Version => "version",
             FailureClass::Environment => "environment",
         }
+    }
+
+    /// 盘上旧状态里的写法：按变体名写下的 `Version` / `Environment`。
+    ///
+    /// 只读不写。`state.json` 是重启后恢复部署状态的全部依据，一份读不动的
+    /// 状态会被当成新装（`#[serde(default)]` 兜着的那几格全回到初值），而那
+    /// 意味着把一个已经判过"这个 rev 坏"的版本再滚一遍。新写的只有
+    /// [`Self::as_str`] 那一套。
+    fn from_legacy_name(name: &str) -> Option<Self> {
+        match name {
+            "Version" => Some(FailureClass::Version),
+            "Environment" => Some(FailureClass::Environment),
+            _ => None,
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        [FailureClass::Version, FailureClass::Environment]
+            .into_iter()
+            .find(|class| class.as_str() == name)
+    }
+}
+
+impl Serialize for FailureClass {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// 认不出的类别名是错误，不按版本类兜底：一个没见过的类别被读成"这个 rev 坏"，
+/// 会让一次集群问题变成一次回滚与一条"该版本不可用"的结论。
+impl<'de> Deserialize<'de> for FailureClass {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = <String as Deserialize>::deserialize(deserializer)?;
+        Self::parse(&name)
+            .or_else(|| Self::from_legacy_name(&name))
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "unknown failure class {name:?}; declared classes are \"version\" and \"environment\""
+                ))
+            })
     }
 }
 
@@ -6247,7 +6293,7 @@ impl MainlineDeployer {
     /// 树是自己的，不存在需要保护的在途工作，损坏就重建。
     async fn ensure_source_at(&self, rev: &str) -> SFResult<()> {
         let spec = crate::workspace::WorkspaceSpec::persistent(
-            "mainline",
+            crate::workspace::MAINLINE_WORKSPACE_ID,
             crate::workspace::WorkspaceKind::Deployer,
             crate::workspace::BaseRef::Commit(rev.to_string()),
         );
@@ -9679,6 +9725,33 @@ mod tests {
         NEW_REVISION_NEVER_RAN_MARKER, PLACEMENT_BLOCKED_MARKER, SERVICE_ACCOUNT_TOKEN,
         SUPPORT_CAUSE_POD_LIMIT,
     };
+
+    /// 盘上那一格与状态行上的那一格是同一个词，旧写法仍读得动。
+    ///
+    /// 旧状态是按变体名写下的（`Version` / `Environment`）。读不动它不会报错：
+    /// `#[serde(default)]` 会把类别兜回版本类，于是同一份状态在重启前后读出的
+    /// 是两件不同的事，而"这次失败说不出新版本的坏"与"这次失败就是版本坏"的
+    /// 处置相反。
+    #[test]
+    fn a_failure_class_is_named_the_same_on_disk_and_in_the_status_line() {
+        for class in [FailureClass::Version, FailureClass::Environment] {
+            let json = serde_json::to_string(&class).expect("class serializes");
+            assert_eq!(json, format!("\"{}\"", class.as_str()));
+            assert_eq!(
+                serde_json::from_str::<FailureClass>(&json).ok(),
+                Some(class)
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<FailureClass>("\"Environment\"").ok(),
+            Some(FailureClass::Environment)
+        );
+        assert!(
+            serde_json::to_string(&FailureClass::Environment).unwrap() != "\"Environment\"",
+            "旧写法不许再被写出去"
+        );
+        assert!(serde_json::from_str::<FailureClass>("\"unknown\"").is_err());
+    }
 
     #[test]
     fn rev12_truncates() {
