@@ -480,3 +480,82 @@ fn the_literal_scanner_reads_the_text_between_quotes() {
     assert!(literals("let s = 1;").is_empty());
     assert!(literals(r#"let s = "marker: why";"#)[0].starts_with("marker"));
 }
+
+/// 声明 crate 里同一个值被声明成两个名字时，这两个名字各自代表什么。
+///
+/// 只有两种可能：它们说的是同一件东西（那就该只留一处，另一处改成读它），或者
+/// 只是碰巧同形（登记理由）。无论哪种，重复本身都得有人看过一眼——没人登记时，
+/// 改其中一个名字不需要动另一个，而两次「成功」的改动加在一起，就是同一个文件
+/// 在部署里叫两个名字。
+const SAME_WORD_DIFFERENT_THING: &[(&str, &str)] = &[
+    (
+        "cogneva",
+        "二进制名、默认命名空间、主容器名、主 Deployment 名与工作负载名是五个不同的\
+         东西：改二进制名不该牵动命名空间，改容器名不该牵动 Deployment",
+    ),
+    (
+        "face",
+        "任务类型（这一行怎么被认出来）与载荷键（这一行把内容放哪）是两个通道，\
+         读写两侧各读同一个声明即可；取值相同是设计使然，合并不带来约束",
+    ),
+    ("handover", "同上：任务类型与载荷键是两个通道，不是同一个词"),
+    ("decision", "同上：任务类型与载荷键是两个通道，不是同一个词"),
+    ("vote", "同上：任务类型与载荷键是两个通道，不是同一个词"),
+    (
+        "decision_event",
+        "同上：任务类型与载荷键是两个通道，不是同一个词",
+    ),
+];
+
+/// 一个值在声明 crate 里只有一个名字。
+///
+/// 跨 crate 的判据只看得见「别的 crate 重写了这个名字」，看不见「声明 crate
+/// 自己写了两遍」：`cogneva.json` 曾经同时是配置文件名、ConfigMap 的键与项目
+/// 声明的文档名，三处各自写死的字面量谁也拦不住谁——改名可以只成功一处，而
+/// 读那份文件的一侧照旧去找一个再也不出现的名字。
+#[test]
+fn a_value_has_one_name_inside_the_declaration_crate() {
+    let root = repo_root();
+    let mut names: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for declaration in declarations(&root) {
+        names
+            .entry(declaration.value)
+            .or_default()
+            .insert(declaration.name);
+    }
+
+    let unregistered: Vec<String> = names
+        .iter()
+        .filter(|(value, declared)| {
+            declared.len() > 1
+                && !SAME_WORD_DIFFERENT_THING
+                    .iter()
+                    .any(|(same, _)| *same == value.as_str())
+        })
+        .map(|(value, declared)| {
+            format!(
+                "  {value:?} 声明成了 {} 个名字：{}",
+                declared.len(),
+                declared.iter().cloned().collect::<Vec<_>>().join(", ")
+            )
+        })
+        .collect();
+    assert!(
+        unregistered.is_empty(),
+        "这些值在声明 crate 里各写了不止一遍。留下重复，改一处不会让另一处红：\n{}\n\
+         要么让其中一处读另一处，要么在 SAME_WORD_DIFFERENT_THING 里写清为什么\
+         它们同形却不是同一件东西：",
+        unregistered.join("\n")
+    );
+
+    let stale: Vec<&str> = SAME_WORD_DIFFERENT_THING
+        .iter()
+        .filter(|(value, _)| names.get(*value).is_none_or(|declared| declared.len() < 2))
+        .map(|(value, _)| *value)
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "这些登记已经不再对应任何重复：{stale:?}。登记是给一处现场发的许可，\
+         现场没了许可就该收回——留着它，下一次有人真的写重了同一个值就没有判据拦了。"
+    );
+}
