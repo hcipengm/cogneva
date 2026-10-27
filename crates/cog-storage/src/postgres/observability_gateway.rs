@@ -11,6 +11,11 @@ use cog_core::{
     RawLogIndex, SFError, SFResult, SquadState, SquadStatus, TaskCheckpoint, TaskMetrics,
 };
 
+use super::state_reads::{
+    agent_state_from_json, checkpoint_from_row, AgentStateRow, CheckpointRow, AGENT_STATE_SQL,
+    CHECKPOINT_SQL,
+};
+
 // ─── DDL ───
 
 /// This store's schema, and the one a restore replays.
@@ -418,40 +423,26 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
     }
 
     async fn get_agent_state(&self, agent_id: &str) -> SFResult<AgentState> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT state FROM cog_agent_states WHERE agent_id = $1")
-                .bind(agent_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| SFError::Database(format!("get_agent_state failed: {}", e)))?;
+        let row: Option<AgentStateRow> = sqlx::query_as(AGENT_STATE_SQL)
+            .bind(agent_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("get_agent_state failed: {}", e)))?;
 
         match row {
-            Some((s,)) => {
-                let state: AgentState = serde_json::from_str(&s).map_err(SFError::Serialization)?;
-                Ok(state)
-            }
+            Some((document,)) => agent_state_from_json(&document),
             None => Err(SFError::Agent(format!("agent {} not found", agent_id))),
         }
     }
 
     async fn get_task_checkpoint(&self, task_id: &str) -> SFResult<Option<TaskCheckpoint>> {
-        let row: Option<(String, i64, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT snapshot_id, event_offset, timestamp FROM cog_checkpoints WHERE task_id = $1",
-        )
-        .bind(task_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(format!("get_task_checkpoint failed: {}", e)))?;
+        let row: Option<CheckpointRow> = sqlx::query_as(CHECKPOINT_SQL)
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("get_task_checkpoint failed: {}", e)))?;
 
-        match row {
-            Some((snapshot_id, event_offset, timestamp)) => Ok(Some(TaskCheckpoint {
-                task_id: task_id.into(),
-                snapshot_id,
-                event_offset: event_offset as u64,
-                timestamp,
-            })),
-            None => Ok(None),
-        }
+        row.map(|row| checkpoint_from_row(task_id, row)).transpose()
     }
 
     async fn get_task_metrics(&self, task_id: &str) -> SFResult<TaskMetrics> {

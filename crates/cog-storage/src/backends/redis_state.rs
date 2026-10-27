@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use chrono::Utc;
 use cog_core::{AgentState, ContextBoard, Event, SFError, SFResult, StateBackend, TaskCheckpoint};
 
+use crate::postgres::state_reads::agent_state_from_json;
+
 // ─── Redis implementation ───
 
 /// Redis-backed state backend.
@@ -93,10 +95,7 @@ impl StateBackend for RedisStateBackend {
             .retry(|| async { self.connection.clone().get(&key).await })
             .await?;
         match value {
-            Some(s) => {
-                let state: AgentState = serde_json::from_str(&s).map_err(SFError::Serialization)?;
-                Ok(Some(state))
-            }
+            Some(document) => Ok(Some(agent_state_from_json(&document)?)),
             None => Ok(None),
         }
     }

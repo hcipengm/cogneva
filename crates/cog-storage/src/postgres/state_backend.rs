@@ -9,6 +9,11 @@ use cog_core::{
     UpstreamFailure,
 };
 
+use super::state_reads::{
+    agent_state_from_json, checkpoint_from_row, AgentStateRow, CheckpointRow, AGENT_STATE_SQL,
+    CHECKPOINT_SQL,
+};
+
 /// The read of one task's event sequence from a position onward.
 ///
 /// Named as a constant because the statement is the thing that has to hold for
@@ -255,9 +260,9 @@ fn negative_budget(workspace_id: &str, task_id: &str, budget: i64) -> SFError {
 #[async_trait]
 impl StateBackend for PostgresStateBackend {
     async fn get_agent_state(&self, agent_id: &str) -> SFResult<Option<AgentState>> {
-        let row: Option<(String,)> = self
+        let row: Option<AgentStateRow> = self
             .retry(|| async {
-                sqlx::query_as("SELECT state FROM cog_agent_states WHERE agent_id = $1")
+                sqlx::query_as(AGENT_STATE_SQL)
                     .bind(agent_id)
                     .fetch_optional(&self.pool)
                     .await
@@ -265,10 +270,7 @@ impl StateBackend for PostgresStateBackend {
             .await?;
 
         match row {
-            Some((s,)) => {
-                let state: AgentState = serde_json::from_str(&s).map_err(SFError::Serialization)?;
-                Ok(Some(state))
-            }
+            Some((document,)) => Ok(Some(agent_state_from_json(&document)?)),
             None => Ok(None),
         }
     }
@@ -322,26 +324,16 @@ impl StateBackend for PostgresStateBackend {
     }
 
     async fn get_checkpoint(&self, task_id: &str) -> SFResult<Option<TaskCheckpoint>> {
-        let row: Option<(String, i64, chrono::DateTime<Utc>)> = self
+        let row: Option<CheckpointRow> = self
             .retry(|| async {
-                sqlx::query_as(
-                    "SELECT snapshot_id, event_offset, timestamp FROM cog_checkpoints WHERE task_id = $1",
-                )
-                .bind(task_id)
-                .fetch_optional(&self.pool)
-                .await
+                sqlx::query_as(CHECKPOINT_SQL)
+                    .bind(task_id)
+                    .fetch_optional(&self.pool)
+                    .await
             })
             .await?;
 
-        match row {
-            Some((snapshot_id, event_offset, timestamp)) => Ok(Some(TaskCheckpoint {
-                task_id: task_id.into(),
-                snapshot_id,
-                event_offset: event_offset as u64,
-                timestamp,
-            })),
-            None => Ok(None),
-        }
+        row.map(|row| checkpoint_from_row(task_id, row)).transpose()
     }
 
     async fn save_checkpoint(&self, checkpoint: &TaskCheckpoint) -> SFResult<()> {

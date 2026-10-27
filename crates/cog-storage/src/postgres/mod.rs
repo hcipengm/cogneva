@@ -24,6 +24,7 @@ pub mod raw_log_index_store;
 pub mod resource_event_store;
 pub mod snapshot_store;
 pub mod state_backend;
+pub(crate) mod state_reads;
 pub mod taste_intent_store;
 pub mod user_store;
 
