@@ -279,6 +279,25 @@ pub struct LossySurface {
     pub name: String,
     pub lost: String,
     pub acceptable_because: String,
+    /// 换机之后这一面靠谁长回来。恢复端按它决定收尾那句要点谁的名：全部照列
+    /// （nats / redis / meilisearch 每次恢复都缺席）会让那句话退化成每次都亮的
+    /// 告警；全部不列则「对象层没带」与「什么都带回来了」又是同一句话。
+    ///
+    /// 老包没有这一格，缺省按 [`SurfaceRecovery::NeedsFollowUp`] 算——没声明的
+    /// 面默认要人去看，宁可按错报也不静默放过。
+    #[serde(default)]
+    pub recovery: SurfaceRecovery,
+}
+
+/// 一份有损面换机后的去向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceRecovery {
+    /// 平台自己长回来：消费者重连、缓存重建、镜像重拉、从公开远端重取。
+    SelfRebuilding,
+    /// 得有人另外去做：从别的备份恢复、或按向导重新签发。
+    #[default]
+    NeedsFollowUp,
 }
 
 /// 备份配置。集群 CronJob 全部由 env 注入；测试直接构造。
@@ -2066,33 +2085,39 @@ fn lossy_surfaces(
             "nats",
             "在途事件与 JetStream 里尚未被消费的消息",
             "事件是通知面，权威状态在 PG 与对象层；消费者重连后从权威状态重建",
+            SurfaceRecovery::SelfRebuilding,
         ),
         (
             "redis",
             "缓存、租约与去重计数",
             "全部是可重建的派生状态；租约在重启后按既有规则重新竞争",
+            SurfaceRecovery::SelfRebuilding,
         ),
         (
             "meilisearch",
             "搜索索引",
             "索引由权威数据重建，恢复后按索引任务重跑",
+            SurfaceRecovery::SelfRebuilding,
         ),
         (
             "cluster-registry",
             "containerd 里已拉取的镜像层",
             "镜像是构建产物，不是权威面；由源码 rev 重建或从 release 重新拉取",
+            SurfaceRecovery::SelfRebuilding,
         ),
         (
             "pending-changes",
             "还没投递出去的已生成变更（数据根下 pending-changes/）",
             "已投递的变更以 change_ledger 与 git 上的提交为准；没投递的那次生成换机后重跑，代价是一次生成",
+            SurfaceRecovery::SelfRebuilding,
         ),
     ]
     .into_iter()
-    .map(|(name, lost, why)| LossySurface {
+    .map(|(name, lost, why, recovery)| LossySurface {
         name: name.to_string(),
         lost: lost.to_string(),
         acceptable_because: why.to_string(),
+        recovery,
     })
     .collect();
     if !bundle_present {
@@ -2105,6 +2130,7 @@ fn lossy_surfaces(
                     "已推的 rev 可从公开远端重取；未推的那部分确实是损失——出包时仓库还没 seed \
                      或 bundle 没打成，出包日志里有那一行告警"
                         .to_string(),
+                recovery: SurfaceRecovery::SelfRebuilding,
             },
         );
     }
@@ -2119,6 +2145,7 @@ fn lossy_surfaces(
                  恢复，或按 `change_ledger` 与工件重新生成。点名它是为了不让「一份都没带」\
                  读成「本来就一个对象都没有」"
                     .to_string(),
+            recovery: SurfaceRecovery::NeedsFollowUp,
         });
     }
     if !credentials_present {
@@ -2134,6 +2161,7 @@ fn lossy_surfaces(
                  新的凭证载体。换机后内部那片由安装脚本重新生成，带外那片（平台 token、\
                  LLM 上游钥匙、git 私钥）由向导重新写入网关"
                     .to_string(),
+            recovery: SurfaceRecovery::NeedsFollowUp,
         });
     }
     surfaces
@@ -2814,6 +2842,31 @@ fn verify_package_against_manifest(
     }
 }
 
+/// 恢复收尾的那一句。
+///
+/// `restore complete` 对两份完全不同的包是同一句话：一份把该带的都带回来了，另一份
+/// 按清单就没带对象层、没带凭证。清单里的 `lossy_surfaces` 恰恰是出包那一刻对「这个
+/// 包不带走什么」的声明，而恢复端此前从不读它——于是换机之后要单独补的那几样，只能
+/// 靠操作者自己去翻包里的 manifest.json 才看得见。所以收尾把要人动手的面跟在后面。
+///
+/// 只点 [`SurfaceRecovery::NeedsFollowUp`] 那些：nats / redis / meilisearch 每次恢复
+/// 都缺席，把它们也列上会让这句话每次都亮，读的人很快就不再读它。
+fn restore_summary(manifest: &BackupManifest) -> String {
+    let follow_up: Vec<&str> = manifest
+        .lossy_surfaces
+        .iter()
+        .filter(|s| s.recovery == SurfaceRecovery::NeedsFollowUp)
+        .map(|s| s.name.as_str())
+        .collect();
+    if follow_up.is_empty() {
+        return "restore complete".to_string();
+    }
+    format!(
+        "restore complete, but these surfaces still need someone to act: {} (the reasons were logged per surface before the restore started)",
+        follow_up.join(", ")
+    )
+}
+
 /// 恢复入口：`pkg` 可为 .tar.zst 或已解包目录。逐段恢复存在的部分，
 /// 缺段记日志不判负——包可能来自只备份了部分段的旧版本。
 ///
@@ -2852,6 +2905,17 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // 再判代次：包里的字节装得下，不代表本二进制认得它们。
     check_provenance(&manifest)?;
     check_segment_skew(&manifest)?;
+    // 清单点名过的损失，在动手之前逐条说清。恢复完再报就晚了：那几样是换机之后
+    // 要另外补的东西，操作者得在恢复还没开始时就看见。
+    for surface in &manifest.lossy_surfaces {
+        tracing::warn!(
+            surface = %surface.name,
+            lost = %surface.lost,
+            acceptable_because = %surface.acceptable_because,
+            recovery = ?surface.recovery,
+            "this package did not carry this surface"
+        );
+    }
 
     let pg_dir = pkg_dir.join(PACKAGE_PG_DIR);
     if pg_dir.exists() {
@@ -2910,7 +2974,7 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if let Some((root, _)) = &extract_root {
         let _ = std::fs::remove_dir_all(root);
     }
-    tracing::info!("restore complete");
+    tracing::info!("{}", restore_summary(&manifest));
     Ok(())
 }
 
@@ -6569,8 +6633,70 @@ mod tests {
                     );
                     let named = surfaces.iter().any(|s| s.name == "objects");
                     assert_eq!(named, objects_absent, "objects_absent={objects_absent}");
+                    // 只有「换机后得有人去做」的两面是这样；其余都是平台自己长回来，
+                    // 收尾那句话只点这一份名单。
+                    let mut expected: Vec<&str> = Vec::new();
+                    if objects_absent {
+                        expected.push("objects");
+                    }
+                    if !credentials_present {
+                        expected.push("credentials");
+                    }
+                    let follow_up: Vec<&str> = surfaces
+                        .iter()
+                        .filter(|s| s.recovery == SurfaceRecovery::NeedsFollowUp)
+                        .map(|s| s.name.as_str())
+                        .collect();
+                    assert_eq!(
+                        follow_up, expected,
+                        "bundle_present={bundle_present} \
+                         credentials_present={credentials_present} objects_absent={objects_absent}"
+                    );
                 }
             }
+        }
+    }
+
+    /// 老包里的有损面没有 `recovery` 这一格。缺省必须读成「要人去看」：没声明过的
+    /// 面被判成自己会长回来，就是静默放过——而那正是这张表存在的原因。
+    #[test]
+    fn a_surface_from_an_older_package_is_not_treated_as_self_rebuilding() {
+        let surface: LossySurface = serde_json::from_str(
+            r#"{"name":"objects","lost":"对象层","acceptable_because":"按约定找 storage/"}"#,
+        )
+        .unwrap();
+        assert_eq!(surface.recovery, SurfaceRecovery::NeedsFollowUp);
+    }
+
+    /// 收尾那句话要按「换机后谁得动手」分开读。全部照列会让它每次都亮（nats / redis /
+    /// meilisearch 每次恢复都缺席），一个都不列则「对象层没带」与「什么都带回来了」同形。
+    #[test]
+    fn the_restore_summary_names_only_the_surfaces_that_need_follow_up() {
+        // 老包没有这一格：读出来就是一句完成。
+        let mut manifest = sample_manifest();
+        manifest.lossy_surfaces.clear();
+        assert_eq!(restore_summary(&manifest), "restore complete");
+
+        // 基础那五项都自己长回来，外加包带了对象与凭证：收尾不该点名任何东西。
+        manifest.lossy_surfaces = lossy_surfaces(true, true, false);
+        assert!(!manifest.lossy_surfaces.is_empty());
+        assert_eq!(restore_summary(&manifest), "restore complete");
+
+        // 没带对象层、也没带凭证：这两样必须被点名，顺序照清单。
+        manifest.lossy_surfaces = lossy_surfaces(true, false, true);
+        let summary = restore_summary(&manifest);
+        let objects = summary
+            .find("objects")
+            .unwrap_or_else(|| panic!("{summary}"));
+        let credentials = summary
+            .find("credentials")
+            .unwrap_or_else(|| panic!("{summary}"));
+        assert!(objects < credentials, "{summary}");
+        for rebuilt in ["nats", "redis", "meilisearch", "cluster-registry"] {
+            assert!(
+                !summary.contains(rebuilt),
+                "{rebuilt} 自己长回来，不该进收尾：{summary}"
+            );
         }
     }
 
