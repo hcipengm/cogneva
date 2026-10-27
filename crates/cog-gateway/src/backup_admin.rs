@@ -57,6 +57,10 @@ pub const EXPORTS_SUBDIR: &str = "exports";
 pub const EXPORT_LABEL_KEY: &str = "cogneva.io/backup-export";
 pub const EXPORT_LABEL_VALUE: &str = "manual";
 
+/// 这一面要的那份权限清单。它不是随手写的路径：建 Job 被拒时给出的修法就是
+/// `kubectl apply` 这一份，所以必须与树里的文件名是同一个字符串（有测试按它去读文件）。
+pub const EXPORT_RBAC_MANIFEST: &str = "deploy/k3s/backup-export-rbac.yaml";
+
 /// 出包那一侧读的口令变量的名字。声明在 cog-core，写端读的是同一份：两处各写
 /// 一遍时改一处不会报错，写端会去找一个再没人设置的名字，而「没给口令」正是它
 /// 读不到时给出的说法——结果是「看起来没要求加密」，而不是「口令的变量名换了」。
@@ -228,6 +232,45 @@ pub async fn export_handler(Json(request): Json<ExportRequest>) -> Response {
     }
 }
 
+/// 把 apiserver 的 403 翻成本面的病因与修法。
+///
+/// 建 Job 被拒几乎从来不是这次请求写错了：这一面要的那份 Role 只有**安装面**会写。
+/// 滚动面按设计不下发 Role/RoleBinding——K8s 的反提权规则要求 apply 一个 Role 的
+/// 发起者已经持有其中全部权限，部署器不该持有发布集里管理类 Role 的权限，所以一份
+/// 新增的权限清单在有人重跑安装面之前**到不了集群**，而应用侧一切正常。
+///
+/// 2026-10-27 实测：`deploy/k3s/backup-export-rbac.yaml` 在 kustomization 里、
+/// 三份渲染产物也都有它，但集群里没有这个 Role——那份清单是之后才加的，安装面没有
+/// 再跑过。原文的 403 读起来像程序 bug，实际是集群少了一份权限；把这句话说出来，
+/// 下一个人不必再沿 "jobs.batch is forbidden" 往回追一遍。
+fn explain_forbidden_job_creation(error: &str) -> Option<String> {
+    let start = error.find('{')?;
+    // 只取第一个 JSON 值：apiserver 的 Status 后面可能还跟着调用方加的注脚。
+    let status: Value = serde_json::Deserializer::from_str(&error[start..])
+        .into_iter::<Value>()
+        .next()?
+        .ok()?;
+    let forbidden = status.get("reason").and_then(Value::as_str) == Some("Forbidden")
+        || status.get("code").and_then(Value::as_u64) == Some(403);
+    let group = status
+        .pointer("/details/group")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let kind = status
+        .pointer("/details/kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !(forbidden && group == "batch" && kind == "jobs") {
+        return None;
+    }
+    Some(format!(
+        "集群里没有这一趟导出要的权限：建 Job 被拒。滚动面按设计不下发 Role/RoleBinding\
+         （K8s 的反提权规则要求 apply 一个 Role 的发起者已持有其中全部权限），所以这份\
+         权限只有在安装面跑过之后才在集群里。修法：kubectl apply -f {EXPORT_RBAC_MANIFEST}\
+         （或重跑安装）。apiserver 原文：{error}"
+    ))
+}
+
 async fn start_export(
     client: &KubeClient,
     passphrase: Option<&str>,
@@ -276,7 +319,11 @@ async fn start_export(
     client
         .post_json(&format!("/apis/batch/v1/namespaces/{namespace}/jobs"), job)
         .await
-        .map_err(|e| format!("起不来这一趟导出：{e}"))?;
+        .map_err(|e| {
+            let text = e.to_string();
+            explain_forbidden_job_creation(&text)
+                .unwrap_or_else(|| format!("起不来这一趟导出：{text}"))
+        })?;
     Ok((name, passphrase.is_some()))
 }
 
@@ -578,6 +625,102 @@ mod tests {
             ["volumeMounts"] = json!([{"name": "backup", "mountPath": "/backups"}]);
         let err = export_job(&cronjob, "cogneva-backup-export-5", None).unwrap_err();
         assert!(err.contains(cog_core::paths::DATA_DIR), "{err}");
+    }
+
+    /// apiserver 对「建 Job 被拒」的原文。逐字取自 2026-10-27 线上那一次：
+    /// 那份权限清单进了仓库、进了 kustomization、进了三份渲染产物，就是没进集群。
+    const FORBIDDEN_JOB_BODY: &str = r#"apiserver 返回 403 Forbidden: {"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"jobs.batch is forbidden: User \"system:serviceaccount:cogneva:cogneva\" cannot create resource \"jobs\" in API group \"batch\" in the namespace \"cogneva\"","reason":"Forbidden","details":{"group":"batch","kind":"jobs"},"code":403}"#;
+
+    #[test]
+    fn a_forbidden_job_creation_names_the_manifest_that_grants_it() {
+        let message = explain_forbidden_job_creation(FORBIDDEN_JOB_BODY)
+            .expect("建 Job 被拒要有自己的病因，不能被当成一条普通失败");
+        assert!(
+            message.contains(EXPORT_RBAC_MANIFEST),
+            "修法要点名那份清单，否则读者只能从 403 往回猜：{message}"
+        );
+        assert!(
+            message.contains("jobs.batch is forbidden"),
+            "原文要留着：判词是这一面拼的，出错时两边的说法都得在手：{message}"
+        );
+    }
+
+    /// 判词给的修法必须在树里成立：那份清单读不到、或者它不再给这个 SA 建 Job 的权限，
+    /// 上面那条消息就变成一句谎话——而它正好是在人最没空核对的时候被读到。
+    #[test]
+    fn the_manifest_the_message_names_still_grants_this_workload_the_right() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = std::fs::read_to_string(root.join(EXPORT_RBAC_MANIFEST))
+            .unwrap_or_else(|e| panic!("判词点名的清单读不到（{EXPORT_RBAC_MANIFEST}）：{e}"));
+        let deployment = std::fs::read_to_string(root.join("deploy/k3s/deployment.yaml"))
+            .expect("应用 Deployment 应当可读");
+        // 跑这段代码的是哪一份 SA，从清单里读，不在这里写死：改 SA 名的那天，
+        // 判词指的绑定会落空，而这段代码自己不会有任何感觉。
+        let service_account = deployment
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("serviceAccountName:"))
+            .map(|value| value.trim().to_string())
+            .expect("应用 Deployment 里应有 serviceAccountName");
+
+        let docs = manifest
+            .split("\n---")
+            .map(|doc| serde_yaml_value(doc))
+            .collect::<Vec<Value>>();
+        let role = docs
+            .iter()
+            .find(|doc| doc["kind"] == "Role")
+            .expect("清单里要有 Role");
+        let grants_create_jobs = role["rules"]
+            .as_array()
+            .expect("Role.rules 是列表")
+            .iter()
+            .any(|rule| {
+                rule["apiGroups"] == json!(["batch"])
+                    && rule["resources"] == json!(["jobs"])
+                    && rule["verbs"]
+                        .as_array()
+                        .map(|verbs| verbs.contains(&json!("create")))
+                        .unwrap_or(false)
+            });
+        assert!(
+            grants_create_jobs,
+            "判词说这条路能修好，而 {EXPORT_RBAC_MANIFEST} 已经不给 batch/jobs 的 create 了"
+        );
+
+        let bound = docs
+            .iter()
+            .find(|doc| doc["kind"] == "RoleBinding")
+            .expect("清单里要有 RoleBinding");
+        assert_eq!(bound["roleRef"]["name"], role["metadata"]["name"]);
+        let subjects = bound["subjects"].as_array().expect("subjects 是列表");
+        assert!(
+            subjects.iter().any(|subject| {
+                subject["kind"] == "ServiceAccount"
+                    && subject["name"].as_str() == Some(service_account.as_str())
+            }),
+            "{EXPORT_RBAC_MANIFEST} 绑的不是跑这段代码的那份 SA（{service_account}）：判词指的修法落空"
+        );
+    }
+
+    #[test]
+    fn other_refusals_are_not_dressed_up_as_a_missing_role() {
+        // 404：CronJob 不在。那是另一件事，不能也被说成缺权限。
+        let not_found = r#"apiserver 返回 404 Not Found: {"kind":"Status","reason":"NotFound","code":404,"details":{"group":"batch","kind":"cronjobs"}}"#;
+        assert!(explain_forbidden_job_creation(not_found).is_none());
+        // 403 但拒的不是 jobs：同样不该套这句话。
+        let other = r#"apiserver 返回 403 Forbidden: {"kind":"Status","reason":"Forbidden","code":403,"details":{"group":"batch","kind":"cronjobs"}}"#;
+        assert!(explain_forbidden_job_creation(other).is_none());
+        // 根本不是 apiserver 的 Status（连不上、超时、连接被拒）。
+        assert!(explain_forbidden_job_creation("connection refused").is_none());
+    }
+
+    /// 清单是 YAML，读它的判据也只能是 YAML；这里用 `serde_json` 的解析器会把
+    /// `kubectl apply` 认得的东西读成另一份。
+    fn serde_yaml_value(doc: &str) -> Value {
+        serde_json::to_value(
+            serde_yaml::from_str::<serde_yaml::Value>(doc).expect("清单里每一段都应当是合法 YAML"),
+        )
+        .expect("YAML 应当能转成 JSON 形状")
     }
 
     #[test]

@@ -52,6 +52,8 @@ tempfile = "3"
 libc = "0.2"
 
 [dev-dependencies]
+# 读 `deploy/k3s/*.yaml` 的权限清单判定词给的修法在树里成立：YAML 只能按 YAML 读。
+serde_yaml = "0.9"
 tracing-subscriber = { workspace = true }
 tokio-test = "0.4"
 uuid = { workspace = true }
