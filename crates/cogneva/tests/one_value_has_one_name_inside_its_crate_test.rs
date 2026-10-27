@@ -309,8 +309,11 @@ fn declarations(root: &Path) -> Vec<Declaration> {
     out
 }
 
+/// 一处重复：哪个 crate、哪个值、它被写成的几个名字。
+type Duplicate = (String, String, BTreeSet<String>);
+
 /// 同一 crate 里同一个值被写成了不止一个名字的那些组，以及读过几处声明、几个 crate。
-fn duplicates(root: &Path) -> (Vec<(String, String, BTreeSet<String>)>, usize, usize) {
+fn duplicates(root: &Path) -> (Vec<Duplicate>, usize, usize) {
     let declared = declarations(root);
     let krates: BTreeSet<&str> = declared.iter().map(|d| d.krate.as_str()).collect();
     let mut by_group: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
