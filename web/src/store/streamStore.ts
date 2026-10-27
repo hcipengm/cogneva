@@ -82,16 +82,23 @@ export function describeEvent(event: AgentEvent): ActivityEntry {
     case 'tool_execution_update':
       // 工具跑起来之后的中途输出：它不是「又调了一次」，印成一次新的调用会让
       // 一次长工具在活动流里叠出十几行一模一样的开头。
+      //
+      // 这一帧只带调用 id，工具名不在上面——`ToolExecutionUpdate` 的字段是
+      // `agent_id` / `tool_call_id` / `partial_result` / `timestamp`，名字只有
+      // `tool_execution_start` 才带。按 id 认那一次调用是这里唯一读得到的身份；
+      // 名字在上面的工具面板里，按同一个 id 对得上。中途输出也只有
+      // `partial_result` 一处：早先还按 `chunk` / `delta` / `output` 找过，三个名字
+      // 从来没有一个存在过。
       return {
         ...base,
-        summary: `工具 ${text(p.tool_name) || text(p.tool_call_id)} 输出中`,
-        detail: preview(p.partial_result ?? p.chunk ?? p.delta ?? p.output),
+        summary: `工具 ${text(p.tool_call_id)} 输出中`,
+        detail: preview(p.partial_result),
         failed: false,
       };
     case 'tool_execution_end':
       return {
         ...base,
-        summary: `工具 ${text(p.tool_name) || text(p.tool_call_id)} ${p.is_error ? '失败' : '返回'}`,
+        summary: `工具 ${text(p.tool_call_id)} ${p.is_error ? '失败' : '返回'}`,
         detail: preview(p.result),
         failed: Boolean(p.is_error),
       };
@@ -293,7 +300,11 @@ export interface StreamState {
   noteToolCall: (record: {
     id: string;
     agent: string | null;
-    name: string;
+    /**
+     * 工具名。只有开始那一帧带着它；中途与结束的帧只带调用 id，所以这里可以不传——
+     * 同一次调用已经记过名，后面的帧再传一个读不到的值只会把它盖成空串。
+     */
+    name?: string;
     args?: unknown;
     result?: unknown;
     progress?: string;
@@ -371,7 +382,7 @@ export const useStreamStore = create<StreamState>((set) => ({
           : {
               id: record.id,
               agent: record.agent,
-              name: record.name,
+              name: record.name ?? '',
               args: '',
               result: '',
               progress: '',

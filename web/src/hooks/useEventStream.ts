@@ -254,14 +254,17 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
         case 'tool_execution_update': {
           const id = typeof p.tool_call_id === 'string' ? p.tool_call_id : null;
           if (!id) break;
-          // 线上这一族把中途输出放在 `partial_result` 里（`ToolExecutionUpdate`）；
-          // 早先按 `chunk`/`delta`/`output` 去读，读到的一直是空——一次长工具在
-          // 面板上于是只剩「输出中」三个字，没有输出。
-          const chunk = p.partial_result ?? p.chunk ?? p.delta ?? p.output;
+          // 线上这一族把中途输出放在 `partial_result` 里（`ToolExecutionUpdate`），
+          // 也只有这一处；早先还按 `chunk`/`delta`/`output` 找过，三个名字没有一个
+          // 存在过——一次长工具在面板上于是只剩「输出中」三个字，没有输出。
+          //
+          // 名字与参数只在 `tool_execution_start` 上，这一帧和结束帧都不带：这里不传
+          // `name`，同一次调用（同 id）在开始那一帧已经记下了。传一个读不到的字段，
+          // 记下来的永远是空串，而那一格看上去像「这个工具没有名字」。
+          const chunk = p.partial_result;
           noteToolCall({
             id,
             agent: agentId,
-            name: typeof p.tool_name === 'string' ? p.tool_name : '',
             progress: typeof chunk === 'string' ? chunk : JSON.stringify(chunk ?? '') ?? '',
             status: 'running',
             at: event.timestamp,
@@ -274,7 +277,6 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
           noteToolCall({
             id,
             agent: agentId,
-            name: typeof p.tool_name === 'string' ? p.tool_name : '',
             result: p.result,
             status: p.is_error ? 'error' : 'ok',
             at: event.timestamp,
