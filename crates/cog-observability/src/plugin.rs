@@ -1697,15 +1697,7 @@ fn owns_the_row(rule: &str) -> bool {
 fn alert_message(inst: &AlertInstance) -> String {
     match inst.labels.get("message") {
         Some(text) if !text.is_empty() => text.clone(),
-        _ => format!(
-            "{} {}",
-            inst.rule_name,
-            match inst.state {
-                AlertState::Pending => "pending",
-                AlertState::Firing => "firing",
-                AlertState::Resolved => "resolved",
-            }
-        ),
+        _ => format!("{} {}", inst.rule_name, inst.state.as_str()),
     }
 }
 
