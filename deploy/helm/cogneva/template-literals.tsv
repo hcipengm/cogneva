@@ -30,6 +30,7 @@ network-policy.yaml	53	8	fixed	dns itself: the port the protocol is defined on, 
 network-policy.yaml	6443	2	fixed	the kubernetes API server's port, defined by the apiserver's own flags
 network-policy.yaml	80	1	fixed	http itself: the port the protocol is defined on, which no deployment renames
 network-policy.yaml	9090	1	fixed	prometheus's own listen port on the operator-provided monitoring endpoint (same shape as loki's 3100 above): the endpoint's URL carries the number, and no chart workload renames it
+process-census.yaml	65534	2	fixed	nobody: reading the host's cgroup tree takes no privilege of its own, same pair as host-ledger
 redis.yaml	0	9	fixed	shell and Lua statuses inside the AOF repair script, not numbers anybody chose
 redis.yaml	1	7	fixed	shell and Lua arithmetic inside the AOF repair script: `head -n 1`, a property line index, and the census's own counters
 redis.yaml	1000	1	fixed	the SCAN batch size inside the WAL census Lua script: it moves how many round trips the census takes, not what it measures or which deployment this is, so there is nothing for a deployment to set
