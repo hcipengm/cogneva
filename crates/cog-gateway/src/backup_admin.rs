@@ -664,7 +664,7 @@ mod tests {
 
         let docs = manifest
             .split("\n---")
-            .map(|doc| serde_yaml_value(doc))
+            .map(serde_yaml_value)
             .collect::<Vec<Value>>();
         let role = docs
             .iter()
