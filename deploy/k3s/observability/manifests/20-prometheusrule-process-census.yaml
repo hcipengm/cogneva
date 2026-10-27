@@ -6,10 +6,24 @@
 # 「面板」——按 2026-10-23 那条实测，面板上的字与「有人看」之间没有关系：表里正
 # firing 十一行、最老一行开了 5550 分钟，写者还在看，人没看。
 #
-# 所以这一条要能自己喊出来。读数是网关那一侧的上报计数（`process_report_ingest_total`
-# 的 `node` 标签）：采集器每一拍报一批，网关按**它自报的节点名**记一格；一台停了，
-# 那一格的增长就停在原地，而其它节点的流量照旧——按节点的 `increase` 是 0，按整族
-# 的 `max` 却不是。两者分得开，才谈得上「哪一台停了」。
+# 所以这一条要能自己喊出来。两条判据分工：
+#
+# 1. **这台节点上采集器起没起来**——读 kube-state-metrics 的 DaemonSet 就绪数。
+#    这条不依赖平台自己的二进制：KSM 一直在跑，DaemonSet 是否就绪是 apiserver 的账。
+# 2. **起来了却没报到**——读网关那一侧的上报计数（`process_report_ingest_total` 的
+#    `node` 标签）：采集器每一拍报一批，网关按**它自报的节点名**记一格；一台停了，
+#    那一格的增长就停在原地，而其它节点的流量照旧——按节点的 `increase` 是 0，按整族
+#    的 `max` 却不是。两者分得开，才谈得上「哪一台停了」。
+#
+# **第二条只在网关带着这个标签之后才判得动。**清单与镜像同提一个 commit，但落地速度
+# 不同：清单由收敛循环立刻 apply，镜像要等 CI 绿了才由部署器滚动。旧形状里根本没有
+# `node` 这一维，`absent(node!="")` 于是为真——2026-10-27 实测：`CognevaProcessCensusAbsent`
+# 在还跑着旧镜像的 `main-d231f81eef17` 上 pending 十五分钟后 firing，而那次部署的网关
+# 一个带节点名的序列都还没发过。假警比没有警更坏——它教人忽略这个族。
+#
+# 所以这里**不写**「一条带节点名的上报都没有」那条规则：它在旧形状下判不出来，只能
+# 假响。等镜像滚上来之后再单独加（那时规则落地晚于二进制，缺序列就真的说明没上报）。
+# 第 2 条的 `increase == 0` 相反：没有序列就没有结果，旧形状下**不响**，可以先落地。
 #
 # 为什么不用「采集器自己把 /metrics 挂出来让 Prometheus 抓」：那要在子命令里再起一个
 # HTTP 端点、再配一个 PodMonitor，而这条通道本来就已经有一跳——它每分钟往网关报一次，
@@ -28,7 +42,35 @@ spec:
   groups:
     - name: cogneva-process-census
       rules:
-        # 一台节点上的采集器停了：那一格在这个窗口里一次都没长过。
+        # 采集器的 Pod 没起来，或者起来之后反复重启到不了 Ready。
+        #
+        # 两边都 `max by (namespace, daemonset)`：KSM 的序列还带它自己 Pod 的名字，
+        # 那个名字在一次 KSM 滚动里就变了，不该出现在告警行上，也不该参与配对。
+        # `for` 取 10 分钟：DaemonSet 滚动更新时旧 Pod 先删、新 Pod 后起，中间就有一
+        # 小段 Ready 数掉下去，把界压到一分钟等于把每次正常滚动报成故障。
+        - alert: CognevaProcessCensusDown
+          expr: |
+            max by (namespace, daemonset) (
+              kube_daemonset_status_number_ready{namespace="cogneva",daemonset="cogneva-process-census"}
+            )
+            <
+            max by (namespace, daemonset) (
+              kube_daemonset_status_desired_number_scheduled{namespace="cogneva",daemonset="cogneva-process-census"}
+            )
+          for: 10m
+          labels:
+            severity: warning
+            cogneva_io_managed: "true"
+            cogneva_io_face: 可观测与告警
+          annotations:
+            summary: 进程采集器有节点没在跑（Ready {{ $value }}）
+            description: >-
+              DaemonSet `cogneva-process-census` 的就绪数少于应调度数。拓扑面上这些节点
+              的每一个容器都会写着「这一拍没有它」——那句话是「没人量」而不是「里面没有
+              进程」。看 Pod 为什么没起来：hostPID 被准入策略拒、宿主 cgroup 挂载路径不
+              存在、或者它自己在重启。
+
+        # 这台节点上的采集器在跑，但这一窗一次都没报上来。
         #
         # 窗口取 15 分钟、`for` 再等 5 分钟：一拍是 60 秒，网关滚动时那一格会断
         # 一分钟上下，把界压到两拍以内等于把每一次正常的滚动报成故障。
@@ -45,25 +87,7 @@ spec:
           annotations:
             summary: 节点 {{ $labels.node }} 上的进程采集器已经 15 分钟没有报到
             description: >-
-              这条路读的是宿主 cgroup 树，它停了以后拓扑面上这台节点的每一个容器都会
-              写着「这一拍没有它」。DaemonSet `cogneva-process-census` 在不在、在跑
-              却报不上去（网络策略、网关地址变更、`COGNEVA_NODE_NAME` 空着），两种都会
-              落成这一条——先看 Pod 日志里有没有连不上的回报，再看它是不是根本没起。
-
-        # 一条采集器的上报都没有：上面那条要「有序列」才判得动，整条通道从没通、
-        # 或者网关起来之后一台也没报过时，那一族里根本没有 `node` 非空的序列。
-        # 缺席不会告警，所以这一条单独判它。
-        - alert: CognevaProcessCensusAbsent
-          expr: |
-            absent(cogneva_process_report_ingest_total{outcome="accepted",node!=""})
-          for: 15m
-          labels:
-            severity: warning
-            cogneva_io_managed: "true"
-            cogneva_io_face: 可观测与告警
-          annotations:
-            summary: 没有任何一台节点报到过进程采集器的回报
-            description: >-
-              网关这一侧一条带节点名的上报都没有。可能是 DaemonSet 没装（采集器这一面
-              整个不在）、网关刚重启且采集器连不回来、或者采集器与网关之间的地址不对。
-              这一条与上面那条的区别是：那条说「某台停了」，这条说「一台都没通过」。
+              Pod 在跑，但这台节点名下的上报计数在窗口里没有增长。两种都会落成这一条：
+              采集器报不上去（网络策略、网关地址变更、`COGNEVA_NODE_NAME` 空着），或者
+              网关那一侧在拒收（`outcome="refused"` 在同一窗口里有增长）。先看采集器
+              Pod 日志里有没有连不上的回报，再看网关为什么拒。

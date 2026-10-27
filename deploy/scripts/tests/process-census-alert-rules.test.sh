@@ -4,11 +4,9 @@
 # 为什么要有这一层：上面那份 promtool 单测判的是「规则会不会响」，而它自己也可能是一枚
 # 橡皮图章——一条永远返回绿的夹具，与没有夹具在读数上完全一样。这里把清单改坏四次，
 # 每次都必须让那份单测红，并且红在**它该红的那一格**：
-#   1. `for: 5m` 改成 `for: 15y`：firing 那一格必须红——否则「永远不会亮」也绿；
-#   2. `== 0` 改成 `>= 0`：活着的 node-a 必须跟着响，那一格必须红——否则
-#      「任何一个数都算停」也绿；
-#   3. 把 absent 那条规则的 `node!=""` 去掉：不带节点名的自报会把它喂饱，第二格必须红
-#      ——「一台都没通过」不能被「有人在自报」冒充；
+#   1. `for: 10m` 改成 `for: 15y`：永远不亮，Down 那一格必须红；
+#   2. `<` 改成 `<=`：就绪数与应调度数相等的健康状态也响，负对照那一格必须红；
+#   3. `== 0` 改成 `>= 0`：活着的 node-a 跟着响，Silent 那一格必须红；
 #   4. 拿不到 promtool 时必须退 3（看不了 ≠ 一致），不许把「没跑」报成「通过」。
 #
 # 跑法：bash deploy/scripts/tests/process-census-alert-rules.test.sh
@@ -42,32 +40,26 @@ if [ "$rc" -eq 3 ]; then
     exit "$fail"
 fi
 
-# 1) `for: 5m` -> `for: 15y`：永远不会亮，必须红。
-sed 's/^          for: 5m$/          for: 15y/' "$manifest" >"${work}/m1.yaml"
+# 1) Down 的 `for: 10m` -> `for: 15y`：永远不会亮，必须红。
+sed 's/^          for: 10m$/          for: 15y/' "$manifest" >"${work}/m1.yaml"
+grep -q 'for: 15y' "${work}/m1.yaml" || bad "改坏没落地" "含 for: 15y 的清单" "原样"
 run "${work}/m1.yaml"
 [ "$rc" -eq 1 ] && ok "for 写成 15y：单测红（抓得住「永远不会亮」）" \
     || bad "for 写成 15y 应红" "1" "$rc"
 
-# 2) `== 0` -> `>= 0`：活着的节点也响，必须红。
-sed 's/            ) == 0$/            ) >= 0/' "$manifest" >"${work}/m2.yaml"
-grep -q ') >= 0' "${work}/m2.yaml" || bad "改坏没落地" "含 >= 0 的清单" "原样"
+# 2) Down 的 `<` -> `<=`：健康状态也响，负对照必须红。
+sed 's/^            <$/            <=/' "$manifest" >"${work}/m2.yaml"
+grep -q '^            <=$' "${work}/m2.yaml" || bad "改坏没落地" "含 <= 的清单" "原样"
 run "${work}/m2.yaml"
+[ "$rc" -eq 1 ] && ok "界写成 <=：单测红（健康的 DaemonSet 不许跟着响）" \
+    || bad "界写成 <= 应红" "1" "$rc"
+
+# 3) Silent 的 `== 0` -> `>= 0`：活着的节点也响，必须红。
+sed 's/            ) == 0$/            ) >= 0/' "$manifest" >"${work}/m3.yaml"
+grep -q ') >= 0' "${work}/m3.yaml" || bad "改坏没落地" "含 >= 0 的清单" "原样"
+run "${work}/m3.yaml"
 [ "$rc" -eq 1 ] && ok "界写成 >= 0：单测红（活着的节点不许跟着响）" \
     || bad "界写成 >= 0 应红" "1" "$rc"
-
-# 3) absent 那条去掉 `node!=""`：自报会把它喂饱，必须红。
-python3 - "$manifest" "${work}/m3.yaml" <<'PY'
-import sys
-src, out = sys.argv[1], sys.argv[2]
-s = open(src, encoding="utf-8").read()
-i = s.index("- alert: CognevaProcessCensusAbsent")
-head, tail = s[:i], s[i:]
-tail = tail.replace('{outcome="accepted",node!=""}', '{outcome="accepted"}', 1)
-open(out, "w", encoding="utf-8").write(head + tail)
-PY
-run "${work}/m3.yaml"
-[ "$rc" -eq 1 ] && ok "absent 去掉节点过滤：单测红（自报不能冒充采集器）" \
-    || bad "absent 去掉节点过滤应红" "1" "$rc"
 
 # 4) 拿不到 promtool：必须退 3，不许报绿。
 PROMTOOL=/nonexistent/promtool RULES_MANIFEST="$manifest" RULES_CASE="$case_file" \
