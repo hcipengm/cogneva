@@ -12,8 +12,9 @@
 # 夹具都只撞一条，然后再**逐条把那条判据拆掉**（改一个 token），看红的是不是就只有
 # 它对应的那一个、别的仍红——这一步才证明四条判据是四条，不是一条加三个摆设。
 #
-# 只扫产物（`deploy/rendered`、`deploy/k3s`、`deploy/helm/cogneva`、
-# `cogneva.example.json`），夹具就照这四个路径搭。
+# 扫的是整棵 `deploy/`（除执行面 `deploy/scripts`）加 `cogneva.example.json`，夹具就
+# 照这个面搭；其中一条用例专门往面的**新**目录里放夹具，证明这个面是从树里读的，不是
+# 四个路径的名单——名单时代新加一条投递路径不会被扫，而「没扫」与「扫过且干净」同形。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -93,12 +94,37 @@ case_red deploy/rendered/key.yaml \
 case_red deploy/rendered/endpoint.yaml \
   '  base_url: https://api.example-vendor.test/v1' '非网关的 /v1 端点'
 
+# 2b：网关不止一个 Service。词干后面接 `-audited` 的那个也是网关，必须绿——只认
+#     词干紧跟 `:`/`/` 的写法会把它判成外部端点，而它就在同一个网关里。
+printf '%s\n' '  base_url: http://cogneva-security-gateway-audited:8083/v1' \
+  >"${fixture}/deploy/rendered/audited.yaml"
+git -C "${fixture}" add deploy/rendered/audited.yaml
+run_gate 0 '没有厂商身份面' "${gate}" "${fixture}"
+drop deploy/rendered/audited.yaml
+
+# 2c：长得像网关的域名不是网关。`.` 不在允许的分隔符里，所以它必须红——把词干
+#     放宽成前缀匹配就会连这个一起放过去。
+case_red deploy/rendered/lookalike.yaml \
+  '  base_url: https://cogneva-security-gateway.example.com/v1' '非网关的 /v1 端点'
+
+# 2d：词干是**树里的名字**，不是随手写的：chart 必须真声明了一个同名 Service，
+#     否则放行的是一条指向空服务的 URL，而红的是真的网关。
+stem="$(sed -n "s/^ALLOWED_ENDPOINT_HOST='\(.*\)'\$/\1/p" "${gate}")"
+[ -n "${stem}" ] || fail "从门里读不出允许的宿主词干"
+grep -qE "^  name: ${stem}\$" "${repo}/deploy/helm/cogneva/templates/security-gateway.yaml" \
+  || fail "门的宿主词干 ${stem} 不是 chart 里任何一个网关 Service 的名字"
+
 # 3：厂商域名。这里刻意不带 `/v1`，也不含任何厂商身份词，只撞这一条。
 case_red deploy/rendered/docs.yaml \
   '  docs: https://generativelanguage.googleapis.com/docs' '厂商域名'
 
 # 4：厂商身份词。一个裸型号名，不含域名、不含 `_API_KEY`。
 case_red deploy/k3s/model.yaml '  model: qwen-max' '厂商身份词'
+
+# 5：扫描面是从树里读的。往 `deploy/` 下一个**旧名单里没有**的目录放夹具，必须红；
+#    名单时代这里绿——新增的投递路径从此不被扫，而「没扫」与「扫过且干净」同形。
+mkdir -p "${fixture}/deploy/airgap"
+case_red deploy/airgap/hosts.yaml '  model: qwen-max' '厂商身份词'
 
 # --- 逐条拆掉，看翻绿的是不是只有它对应的那一个 ---
 # 拆法都是改一个 token，不动结构，所以拆完的门仍然是一部门。

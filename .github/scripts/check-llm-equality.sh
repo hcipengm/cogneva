@@ -31,12 +31,26 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [ "${1:-}" = "" ] || ROOT="$1"
 
-# 业务侧配置与部署所在的路径。渲染产物在里面（它是 chart 的输出），但四个都扫：
+# 扫的是整棵 `deploy/` 加示例配置，不列具体的投递路径。
+#
+# 列出来的名单漏起来没有症状：新增一条投递路径（`deploy/airgap/`、某天多出来的一份
+# 离线包清单）不在名单里就永远不被扫，而「没扫到」与「扫过且干净」在读数上完全一样。
+# 反过来，`deploy/rendered` 与 `deploy/helm/cogneva` 同时在扫描面里也没有冗余的坏处：
 # 只扫产物会漏掉「改了 chart 还没重渲染」的那一拍，只扫 chart 会漏掉静态清单。
-SCANNED_PATHS=(deploy/rendered deploy/k3s deploy/helm/cogneva cogneva.example.json)
+#
+# 唯一排除的是 `deploy/scripts`，理由是结构性的而不是图省事：那一侧是**执行面**，
+# 它必须点名自己要禁的身份（提交署名门里就有 Claude/Anthropic 这两个词），正如网关
+# 侧合法地提到上游——这里划的线是「装配进集群的字节」，不是「树上的位置」。
+SCAN_PATHS=('deploy' ':(exclude)deploy/scripts' 'cogneva.example.json')
 
 # 唯一允许被业务侧点名的 LLM 端点宿主。
+#
+# 它是网关服务名的**词干**，不是全部：网关有两个 Service（透传口与 audited 口），
+# 只认词干后面紧跟 `:` 或 `/` 的那个，另一个就会被判成「非网关端点」——而它明明
+# 就是网关。宿主后面允许的分隔符只有 `-`、`:`、`/`，没有 `.`：`-something` 是同一个
+# 网关的另一个口，`.example.com` 则是别人的域名，两件事不能靠前缀混为一谈。
 ALLOWED_ENDPOINT_HOST='cogneva-security-gateway'
+ALLOWED_ENDPOINT_HOST_SEPARATORS='[-:/]'
 
 # 厂商域名闭集。收的是**域名**，不是厂商名——域名没有歧义。
 VENDOR_DOMAINS='(openai|anthropic|deepseek|moonshot|mistral|cohere|perplexity|siliconflow|openrouter|together|googleapis|generativelanguage|dashscope|aliyuncs|bigmodel|volces|volcengine|baidubce|bytedance|zhipu|minimaxi|stepfun|sensetime|baichuan)\.(com|cn|ai|xyz|org|net)'
@@ -63,7 +77,7 @@ report() {
   hits=1
 }
 
-git_grep() { git -C "$ROOT" grep -n "$@" -- "${SCANNED_PATHS[@]}" || true; }
+git_grep() { git -C "$ROOT" grep -n "$@" -- "${SCAN_PATHS[@]}" || true; }
 
 main() {
   # 1. 厂商凭证 env 名。结构判据：不管厂商叫什么都拦得住。
@@ -72,7 +86,7 @@ main() {
 
   # 2. 非网关的 /v1 端点。先把 /v1 URL 抽出来（不带文件名就分不出哪一行），再筛掉网关。
   report "非网关的 /v1 端点（业务侧只允许指 ${ALLOWED_ENDPOINT_HOST}）" \
-    < <(git_grep -HoE 'https?://[A-Za-z0-9._:-]+/v1' | grep -v -- "://${ALLOWED_ENDPOINT_HOST}[:/]")
+    < <(git_grep -HoE 'https?://[A-Za-z0-9._:-]+/v1' | grep -vE -- "://${ALLOWED_ENDPOINT_HOST}${ALLOWED_ENDPOINT_HOST_SEPARATORS}")
 
   # 3. 厂商域名闭集。
   report "厂商域名" < <(git_grep -iE "${VENDOR_DOMAINS}")
