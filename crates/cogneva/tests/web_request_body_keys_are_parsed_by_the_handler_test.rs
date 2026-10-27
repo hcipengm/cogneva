@@ -18,11 +18,17 @@
 //! 收的是 `Json<Value>`、结构体认不出——这些都不判，但普查里各有一格，所以
 //! 「判了 0 条」和「一条都对」不会长得一样。
 //!
-//! 实测（2026-10-27）：`web/src` 里读到 24 处第二参是内联对象的 POST/PUT/PATCH，
-//! 判到 18 处、26 个键，全部落在处理函数解出来的结构体里；另外 6 处把请求体放在
-//! 变量里（读不到请求体键），6 处的处理函数没有可判的 `Json<T>`。消融：把
-//! `crates/cog-gateway/src/ide.rs` 里 `RenameBody.from` 改名为 `source`，本门红并
-//! 点名 `from ← web/src/api/client.ts`；改回即绿。
+//! 两个客户端都读：`web/src`（`api.post/put/patch(path, { … })`）和网关二进制里
+//! 内嵌的运维页（`api(path, 'POST', { … })` 与 `fetch(path, { method, body })`）。
+//!
+//! 实测（2026-10-27）：两处合计 43 个内联请求体（WebUI 24、运维页 19），判到 36 个、
+//! 60 个键，全部落在处理函数解出来的结构体里；6 处把请求体放在变量里（读不到键），
+//! 7 处的处理函数没有可判的 `Json<T>`。
+//!
+//! 消融两条，客户端各一条，各自点名对应文件后红、改回即绿：把 `crates/cog-gateway/src/
+//! ide.rs` 里 `RenameBody.from` 的 serde 名改成 `source`（报 `from ← web/src/api/
+//! client.ts`）；把 `crates/cog-gateway/src/promotion_gate.rs` 里 `PromotionGateRequest
+//! .enabled` 的 serde 名改成 `enable`（报 `enabled ← crates/cog-gateway/src/takeover.html`）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -55,47 +61,7 @@ struct Body {
 /// stand for keys this reader never sees, and guessing the rest is how a ghost
 /// key sails through.
 fn top_level_keys(body: &str) -> Option<BTreeSet<String>> {
-    let mut parts: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0i32;
-    let chars: Vec<char> = body.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '"' || c == '\'' || c == '`' {
-            let quote = c;
-            current.push(c);
-            i += 1;
-            while i < chars.len() {
-                current.push(chars[i]);
-                if chars[i] == '\\' {
-                    i += 1;
-                    if i < chars.len() {
-                        current.push(chars[i]);
-                    }
-                } else if chars[i] == quote {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            ',' if depth == 0 => {
-                parts.push(std::mem::take(&mut current));
-                i += 1;
-                continue;
-            }
-            _ => {}
-        }
-        current.push(c);
-        i += 1;
-    }
-    parts.push(current);
-
+    let parts = split_top_level(body);
     let mut keys = BTreeSet::new();
     for part in parts {
         let part = part.trim();
@@ -140,6 +106,52 @@ fn is_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_alphabetic() || c == '_' || c == '$')
         && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// A comma-separated list cut at the top level only: commas inside parentheses,
+/// brackets, braces and string or template literals stay in their piece.
+fn split_top_level(list: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    let chars: Vec<char> = list.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' || c == '\'' || c == '`' {
+            let quote = c;
+            current.push(c);
+            i += 1;
+            while i < chars.len() {
+                current.push(chars[i]);
+                if chars[i] == '\\' {
+                    i += 1;
+                    if i < chars.len() {
+                        current.push(chars[i]);
+                    }
+                } else if chars[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        current.push(c);
+        i += 1;
+    }
+    parts.push(current);
+    parts
 }
 
 /// Every `api.post/put/patch('<path>', { … })` in the WebUI.
@@ -217,6 +229,119 @@ fn client_bodies(text: &str, file: &str) -> (Vec<Body>, usize) {
         });
     }
     (bodies, opaque)
+}
+
+/// The quotes around a quoted word, if the piece is one: `'POST'`, `"POST"`.
+fn quoted_word(piece: &str) -> Option<String> {
+    let piece = piece.trim();
+    let quote = piece.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let end = piece[1..].find(quote)?;
+    Some(piece[1..1 + end].to_string())
+}
+
+/// The body objects the operator page posts: `api(path, 'POST', { … })` and
+/// `fetch(path, { method: 'POST', body: JSON.stringify({ … }) })`.
+///
+/// The page ships inside the gateway binary and calls the same router, so a
+/// key it sends is that router's business in exactly the way a key from the
+/// WebUI is.
+fn page_bodies(text: &str, file: &str) -> Vec<Body> {
+    let mut bodies = Vec::new();
+    let mut scan = |opener: &str, verb_argument: &str| {
+        let mut cursor = 0;
+        while let Some(at) = text[cursor..].find(opener) {
+            let start = cursor + at;
+            cursor = start + opener.len();
+            // `api(` must not be the tail of `myapi(` or `api.get(`; `fetch(`
+            // must not be the tail of `prefetch(`.
+            let before = text[..start].chars().next_back().unwrap_or(' ');
+            if before.is_alphanumeric() || before == '_' || before == '.' {
+                continue;
+            }
+            let open = start + opener.len() - 1;
+            let Some(close) = matching_paren(text.as_bytes(), open) else {
+                break;
+            };
+            cursor = close + 1;
+            let arguments = split_top_level(&text[open + 1..close]);
+            let Some(path) = arguments.first().and_then(|p| quoted_word(p)) else {
+                continue;
+            };
+            if !path.starts_with("/api/") {
+                continue;
+            }
+            let (method, body): (String, String) = match verb_argument {
+                // `api(path, 'POST', { … })`
+                "verb" => {
+                    let Some(verb) = arguments.get(1).and_then(|p| quoted_word(p)) else {
+                        continue;
+                    };
+                    let Some(body) = arguments.get(2) else {
+                        continue;
+                    };
+                    (verb, body.trim().to_string())
+                }
+                // `fetch(path, { method: 'POST', body: JSON.stringify({ … }) })`
+                _ => {
+                    let Some(options) = arguments.get(1) else {
+                        continue;
+                    };
+                    let options = options.trim();
+                    let Some(inner) = options.strip_prefix('{') else {
+                        continue;
+                    };
+                    let Some(inner) = inner.strip_suffix('}') else {
+                        continue;
+                    };
+                    let mut method: Option<String> = None;
+                    let mut body: Option<String> = None;
+                    for option in split_top_level(inner) {
+                        let option = option.trim();
+                        if let Some(rest) = option.strip_prefix("method:") {
+                            method = quoted_word(rest);
+                        }
+                        if let Some(rest) = option.strip_prefix("body:") {
+                            let rest = rest.trim();
+                            if let Some(at) = rest.find("JSON.stringify(") {
+                                let inner_open = at + "JSON.stringify".len();
+                                if let Some(end) = matching_paren(rest.as_bytes(), inner_open) {
+                                    body = Some(rest[inner_open + 1..end].to_string());
+                                }
+                            }
+                        }
+                    }
+                    let Some(method) = method else { continue };
+                    let Some(body) = body else { continue };
+                    (method, body)
+                }
+            };
+            if !BODY_METHODS.iter().any(|m| m.eq_ignore_ascii_case(&method)) {
+                continue;
+            }
+            let body = body.trim();
+            let Some(inner) = body.strip_prefix('{') else {
+                continue;
+            };
+            let Some(inner) = inner.strip_suffix('}') else {
+                continue;
+            };
+            let Some(keys) = top_level_keys(inner) else {
+                continue;
+            };
+            bodies.push(Body {
+                method: method.to_uppercase(),
+                shape: normalize(&path),
+                file: file.to_string(),
+                keys,
+            });
+        }
+    };
+    scan("api(", "verb");
+    scan("fetch(", "options");
+    bodies
 }
 
 /// The quoted `/api/…` literal a call starts with, and the rest of its
@@ -505,6 +630,7 @@ fn contradictions(root: &Path) -> (Vec<String>, Census) {
 
     let mut files = Vec::new();
     walk(&root.join(WEB), &["ts", "tsx"], &mut files);
+    walk(&root.join(GATEWAY).join("src"), &["html"], &mut files);
     files.sort();
     for path in files {
         let file = path
@@ -513,7 +639,11 @@ fn contradictions(root: &Path) -> (Vec<String>, Census) {
             .to_string_lossy()
             .replace('\\', "/");
         let text = strip_comments(&read(&path));
-        let (bodies, opaque) = client_bodies(&text, &file);
+        let (bodies, opaque) = if file.ends_with(".html") {
+            (page_bodies(&text, &file), 0)
+        } else {
+            client_bodies(&text, &file)
+        };
         census.bodies_variable += opaque;
         for body in bodies {
             census.calls_with_body += 1;
@@ -583,12 +713,12 @@ fn every_key_a_client_sends_is_one_the_handler_parses() {
 fn the_census_is_wide_enough_to_mean_something() {
     let (_, census) = contradictions(&repo_root());
     assert!(
-        census.bodies_read >= 15,
+        census.bodies_read >= 30,
         "只判到 {} 个请求体，读取器看错地方了：{census:?}",
         census.bodies_read
     );
     assert!(
-        census.keys_judged >= 22,
+        census.keys_judged >= 50,
         "只判到 {} 个请求体键，太少：{census:?}",
         census.keys_judged
     );
@@ -680,6 +810,58 @@ mod tests {
     assert!(!structs.contains_key("UnknownRule"), "{structs:?}");
     // 测试里的同名字段是标本：生产那一半没有它。
     assert!(!structs.contains_key("Fixture"), "{structs:?}");
+}
+
+#[test]
+fn the_page_reader_sees_both_call_shapes_and_skips_reads() {
+    let page = "\
+async function a(enabled) { await api('/api/v1/admin/promotion-gate', 'POST', { enabled }); }
+async function b(name) { await api('/api/v1/x/' + name, 'POST', { name }); }
+async function c() { await api('/api/v1/y', 'GET'); }
+async function d(u, p) {
+  await fetch('/api/v1/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: u, password: p }),
+  });
+}
+async function e() { await fetch('/api/v1/z', { method: 'GET' }); }
+";
+    let bodies = page_bodies(page, "page.html");
+    let mut seen: Vec<(String, String, Vec<String>)> = bodies
+        .iter()
+        .map(|b| {
+            (
+                b.method.clone(),
+                b.shape.clone(),
+                b.keys.iter().cloned().collect(),
+            )
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            (
+                "POST".to_string(),
+                "/api/v1/admin/promotion-gate".to_string(),
+                vec!["enabled".to_string()]
+            ),
+            (
+                "POST".to_string(),
+                "/api/v1/auth/login".to_string(),
+                vec!["password".to_string(), "username".to_string()]
+            ),
+            // 一条拼出来的路径只读到字面量那一截：形状对不上任何注册过的路由，
+            // 于是它在判据里落进「读不到」，而不是判成一条假的。
+            (
+                "POST".to_string(),
+                "/api/v1/x".to_string(),
+                vec!["name".to_string()]
+            ),
+        ],
+        "{seen:?}"
+    );
 }
 
 #[test]
