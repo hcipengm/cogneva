@@ -752,7 +752,17 @@ pub(crate) async fn probe_reads(
         // 只为判权限，是把每分钟一次的探针变成了真正的负载。
         let outcome = match client.get_json(&format!("{path}?limit=1")).await {
             Ok(_) => READ_OK,
-            Err(_) => READ_FAILED,
+            Err(error) => {
+                // 读数只说「这条读没通」，说不到「为什么」：403 是授权被收窄、401 是
+                // 令牌没到、超时是 apiserver 忙。告警文案让读的人去看 Pod 日志里的状态行，
+                // 所以这里必须真的写一行——否则那句话点的是一个空的日志。
+                tracing::warn!(
+                    resource,
+                    %error,
+                    "cluster read failed; the status line from the apiserver is in this message"
+                );
+                READ_FAILED
+            }
         };
         publish_read(metrics, resource, outcome, 1.0).await;
     }

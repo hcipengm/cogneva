@@ -148,6 +148,14 @@ fn the_probe_asks_for_one_row() {
         .split("pub fn spawn_read_probe")
         .next()
         .unwrap();
+    // 告警文案让读的人去看 Pod 日志里的状态行，所以失败那一支必须真的写一行：
+    // 计数只说「没通」，说不清是 403（授权被收窄）、401（令牌没到）还是超时
+    // （apiserver 忙），而这三种修法完全不同。这条判的是那行日志还在不在——
+    // 文案可以改，承诺不能悄悄少一半。
+    assert!(
+        probe.contains("tracing::warn!"),
+        "失败的那一支没有日志：告警文案点的那行状态行在日志里不存在"
+    );
     assert!(
         probe.contains("?limit=1"),
         "探针没有把 limit=1 拼进路径：一分钟一次的探针会把整个集群的 Pod 读回来"
