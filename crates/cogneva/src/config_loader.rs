@@ -1118,10 +1118,10 @@ mod tests {
         docs
     }
 
-    /// A loaded config file supplies the whole override map — `apply_env_overrides`
-    /// prefers `config.env` over the built-in fallback — so the deploy config's
-    /// own map is the live one in every deployment. Nothing else checks it: a
-    /// mistyped path there is a knob the deployment believes it turned.
+    /// A loaded config file supplies its own override map, and `apply_env_overrides`
+    /// applies it together with the built-in table rather than instead of it, so a
+    /// deployment reads both. Nothing else checks the document's half: a mistyped
+    /// path there is a knob the deployment believes it turned.
     ///
     /// An entry qualifies if the write reaches a field of the core config, or
     /// if the crate that owns its section applies that same name to that same
@@ -1516,6 +1516,92 @@ mod tests {
                 baseline_path.display()
             )
         });
+    }
+
+    /// The two carriers have to be one document, and nothing compared them.
+    ///
+    /// `deploy/helm/cogneva/files/cogneva.json` travels through Helm; the blob
+    /// inside `deploy/k3s/cogneva-json-configmap.yaml` travels through the static
+    /// tree the in-cluster deployer applies. Every gate that reads both checks
+    /// what each document says about *itself* — this section has a disposition,
+    /// this mapping is honored, that key parses — so a section edited in one and
+    /// not the other passes all of them. The apply-path clusters then keep running
+    /// the older document, and "this knob is set" reads exactly like "this knob is
+    /// set on the other topology".
+    ///
+    /// They are equal today. What was missing is anything that says so, which is
+    /// also the only thing that would notice the day they stop being equal.
+    #[test]
+    fn the_two_shipped_config_documents_are_one_document() {
+        let docs = shipped_documents();
+        let chart = docs
+            .iter()
+            .find(|(tag, _)| *tag == "chart")
+            .map(|(_, doc)| doc)
+            .expect("shipped_documents() lost the chart document");
+        let baseline = docs
+            .iter()
+            .find(|(tag, _)| *tag == "k3s configmap")
+            .map(|(_, doc)| doc)
+            .expect("shipped_documents() lost the k3s configmap document");
+        let sections = chart
+            .as_object()
+            .expect("the chart document is not a JSON object")
+            .len();
+        assert!(
+            sections >= 20,
+            "the chart document has only {sections} top-level sections — two documents this \
+             empty compare equal and prove nothing"
+        );
+
+        let mut diffs = Vec::new();
+        json_differences(chart, baseline, "", &mut diffs);
+        let shown = &diffs[..diffs.len().min(20)];
+        assert!(
+            diffs.is_empty(),
+            "the chart document and the ConfigMap blob are not the same document \
+             (chart -> k3s configmap); {} difference(s), first {}: {shown:#?}\n\
+             这两个文件是同一份文档的两个载体：抄歪一节，apply 路径的集群就继续跑旧的\
+             那一节，而「这一项配了」与「只在另一套拓扑上配了」在读数上分不开",
+            diffs.len(),
+            shown.len()
+        );
+    }
+
+    /// Every leaf where two JSON trees disagree, rendered as `path: left vs right`.
+    fn json_differences(
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+        path: &str,
+        out: &mut Vec<String>,
+    ) {
+        use serde_json::Value;
+        match (left, right) {
+            (Value::Object(a), Value::Object(b)) => {
+                for (key, value) in a {
+                    let child = format!("{path}.{key}");
+                    match b.get(key) {
+                        Some(other) => json_differences(value, other, &child, out),
+                        None => out.push(format!("{child}: only in the chart document")),
+                    }
+                }
+                for key in b.keys() {
+                    if !a.contains_key(key) {
+                        out.push(format!("{path}.{key}: only in the k3s configmap"));
+                    }
+                }
+            }
+            (Value::Array(a), Value::Array(b)) => {
+                if a.len() != b.len() {
+                    out.push(format!("{path}: length {} vs {}", a.len(), b.len()));
+                }
+                for (index, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                    json_differences(x, y, &format!("{path}[{index}]"), out);
+                }
+            }
+            _ if left != right => out.push(format!("{path}: {left} vs {right}")),
+            _ => {}
+        }
     }
 
     /// Both shipped forms of the deploy config, parsed. Kept in one place so a
