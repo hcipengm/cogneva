@@ -2193,6 +2193,36 @@
           "face": "可观测与告警"
         },
         {
+          "name": "observability_event_log_over_capacity",
+          "promql": "(max without (pod, container, instance) (max_over_time(cogneva_observability_events_over_capacity[30m]) and ((time() - cogneva_observability_events_over_capacity_observed_timestamp_seconds) < 1800))) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The observability event log is over its row budget and the sweep can no longer bring it down: every row left to delete sits inside the read window the historical-events view promises ({value} is 1 on each pass that reached this state in the last half hour). The log has two bounds and this is the one that stops first. The capacity decides how many rows may be kept; the read window decides which rows may be deleted at all, and the sweep only deletes rows older than the window, so a window that alone holds more rows than the budget leaves a table no pass can fix. That is not a fault in the sweep and not a burst it will catch up on: the reading is a verdict, not a ratio, and every pass from here returns the same answer until someone moves one of the two numbers. The same reading would be silent if the sweep had merely stopped running, because a stopped sweep fails to delete anything and says so on the pass-outcome rule beside this one; what arrives here is the pass that ran and refused. Why the two bounds disagree is a policy question with three answers -- raise the budget, shorten the window, or accept the table's size -- and none of them is a code change, which is why this rule reports the state rather than a repair. The window default is the same constant the historical query reads, so the two cannot drift apart; what can drift is the number of rows that window holds, and that is the traffic. Rows are not bytes: PostgreSQL returns deleted space only when it vacuums, so the table can read at its budget while the volume keeps paying for dead tuples, and the bytes series is there to see that, never as the criterion. A series has to be one a writer is still behind before its value counts as an observation of this window -- the filter is an age bound on the companion _observed_timestamp_seconds -- so a pod that stopped sweeping falls out by its own age instead of holding this rule fired forever.",
+          "face": "可观测与告警"
+        },
+        {
+          "name": "observability_event_log_unpruned",
+          "promql": "((min_over_time(((min without (pod, container, instance) (cogneva_observability_events_rows)) and ((time() - (max without (pod, container, instance) (cogneva_observability_events_rows_observed_timestamp_seconds))) < 1800))[30m:1m]) > 1.05 * max without (pod, container, instance) (cogneva_observability_events_budget_rows)) and (count_over_time((min without (pod, container, instance) (cogneva_observability_events_rows))[1h:1m]) > count_over_time((min without (pod, container, instance) (cogneva_observability_events_rows))[30m:1m])))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The observability event log has stayed above its row budget for half an hour ({value} was the lowest it got in that window). The sibling rule reads the state where the read window stops the sweep; this one reads the shape where the sweep is not running at all and the table just grows, which no other reading covers -- a sweep that never runs never reports a pass outcome either, so the pass-outcome rule stays quiet and the rows series keeps rising here. The window minimum is what makes this a verdict rather than a level: a sweep that runs puts the table back under the budget on every pass, so a reading only ever a little over is a burst being taken back rather than a log that is not being pruned, and the maximum over the window would report every burst as a fault. A minimum that stays above the budget for half an hour says no pass succeeded in that window. Read the over-capacity sibling before repairing: a 1 there means the sweep is running and the window is the wall, so the answer is a policy on the two numbers rather than a dead loop, while this rule alone firing means the table is being measured and is not being held down, and the place to look is the broker that owns the loop. The 1.05 is the slack a healthy cycle needs and not a target: it sits 5 percent above the budget, roughly four hours of ordinary growth at this deployment's rate and well under the day a burst can put on the table, so a pass that is merely late clears the minimum and only a sweep that is not finishing holds it. It cannot fire when no budget is declared: the divisor is absent then, which is a deployment that never asked for a cap rather than a fault. A series also has to be one a writer is still behind before its value counts as an observation of this window -- the age bound on the companion _observed_timestamp_seconds -- so a process that stopped publishing falls out by its own age, and the second count over an hour refuses a claim about half an hour from a process younger than one.",
+          "face": "可观测与告警"
+        },
+        {
+          "name": "observability_event_sweep_failed",
+          "promql": "(max without (pod, container, instance) (max_over_time(cogneva_observability_event_sweep_failed[30m]) and ((time() - cogneva_observability_event_sweep_failed_observed_timestamp_seconds) < 1800))) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The observability event log's pass could not be completed at some attempt in the last half hour, {value} being the highest outcome those attempts recorded. A pass measures the table and deletes what is over the budget beyond the read window, and it returns either way; the row count, the budget, the window verdict and the bytes are stamped only once it returns, so a pass that fails leaves all of them at their last values and the two rules beside this one go on reading a frozen table until their own half hour age bound closes them -- a sweep that cannot run and a log that is not growing then look the same. This is the reading that says the pass itself did not answer, and it is written on every pass rather than only the failed ones. The cause is the store query that refused, in that container's log; the loop's own liveness reading cannot see it, because the process beats whether or not its body finished. The count is taken once for the fleet rather than per process, because the rows live in the shared store and every replica serves the same table.",
+          "face": "可观测与告警"
+        },
+        {
           "name": "memory_decay_passes_all_failed",
           "promql": "(max without (pod, container, instance, job) (increase(cogneva_memory_decay_total{outcome=\"failed\"}[6h])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_memory_decay_total{outcome!=\"failed\"}[6h])) > 0)",
           "condition": {

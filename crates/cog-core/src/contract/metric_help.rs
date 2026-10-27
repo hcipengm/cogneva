@@ -1414,6 +1414,49 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          vacuums, so it is a reading and never the pruning criterion",
     ),
     (
+        "cogneva_observability_events_rows",
+        "Rows currently held in the observability event log. The log is \
+         append-only and nothing removed a row from it until this sweep \
+         existed, so this number was the platform's uptime times its event \
+         rate -- and every one of those rows travels in the nightly backup \
+         whose restore the drill has to finish inside a budget",
+    ),
+    (
+        "cogneva_observability_events_budget_rows",
+        "Rows the observability event log is allowed to hold; the sweep deletes \
+         oldest-first past this, and never a row inside the read window. Read \
+         this beside cogneva_observability_events_rows: a held count above the \
+         budget with the over-capacity cell at 0 is a gap between the two \
+         deployments' declarations, not a sweep that cannot run. Every reading \
+         here names the deployment that published it, because the declaration \
+         is one deployment's own and the table it lands in is shared",
+    ),
+    (
+        "cogneva_observability_events_over_capacity",
+        "1 when the read window, and not the capacity, is what keeps the event \
+         log above its budget. The sweep may not delete a row a reader could \
+         still ask for, so a storm that fills the window with more rows than \
+         the capacity allows leaves the log over budget and nothing further to \
+         delete -- refusing is the correct outcome and this cell is what makes \
+         the refusal legible. Published only by a process that meant to prune",
+    ),
+    (
+        "cogneva_observability_events_bytes",
+        "On-disk bytes the observability event log occupies, including indexes \
+         and TOAST. Lags the row count, since PostgreSQL frees deleted space \
+         only when it vacuums, so it is a reading and never the pruning \
+         criterion",
+    ),
+    (
+        "cogneva_observability_event_sweep_failed",
+        "Whether the last event-log pass could not be completed, 1 or 0. The \
+         row count, the budget, the window verdict and the bytes are stamped \
+         only once a pass returns, so a pass that fails leaves every one of them \
+         at its last value -- a sweep that cannot run and a log that is not \
+         growing look the same. Written on every pass, so a pass that completes \
+         keeps it at 0",
+    ),
+    (
         "metrics_retired_rows_removed",
         "Rows of retired metric names the last release pass deleted, labelled \
          by the table they came from and by the deployment that ran the pass. \

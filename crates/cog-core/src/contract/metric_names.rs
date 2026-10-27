@@ -161,6 +161,22 @@ metric_names! {
     METRICS_SAMPLE_SWEEP_FAILED => "metrics_sample_sweep_failed",
     TIER_MIGRATION_TOTAL => "tier_migration_total",
 
+    // cog-storage — the observability event log's own readings.
+    //
+    // `cog_observability_events` is append-only and nothing ever removed a row
+    // from it, so its size was the platform's uptime times its event rate --
+    // 2.92 M rows / 1.6 GB on 2026-10-27, and every one of them in the nightly
+    // backup whose restore the drill has to finish inside a budget. These four
+    // cells are what makes the log's growth visible from the scrape instead of
+    // only through a query against the database: what it holds, what it may
+    // hold, whether the read window is what stops it, and what that costs on
+    // disk.
+    OBSERVABILITY_EVENTS_ROWS => "cogneva_observability_events_rows",
+    OBSERVABILITY_EVENTS_BUDGET_ROWS => "cogneva_observability_events_budget_rows",
+    OBSERVABILITY_EVENTS_OVER_CAPACITY => "cogneva_observability_events_over_capacity",
+    OBSERVABILITY_EVENTS_BYTES => "cogneva_observability_events_bytes",
+    OBSERVABILITY_EVENT_SWEEP_FAILED => "cogneva_observability_event_sweep_failed",
+
     // cog-storage — the monthly partition maintenance loop's per-round outcome.
     //
     // The loop keeps every time-series parent's window open ahead of the clock

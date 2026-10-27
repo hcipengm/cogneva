@@ -185,7 +185,7 @@ backup:
   # **这个界必须大于两份的单趟预算，两者是一对**：`drillPassBudgetSeconds` 是进程
   # 自己拿着的单趟界（到点它自己收尾并落一行 `failed`），这里是 Job 的界（到点把
   # Pod 杀掉，账上一行都不留）。2026-10-27 的现场就是这一对失配：单包实测已从
-  # 497 s（10-19）长到 2271 s（10-27，库 3.6 GB），第一趟吃掉 38 min，第二趟在
+  # 497 s（实测 10-19）长到 2271 s（实测 10-27，本机 3.6 GB 的库），第一趟吃掉 38 min，第二趟在
   # 3600 s 的界上被杀，`backup_drills` 里没有那一行——于是「窗口里最久没被证明的
   # 那份」永远证明不了，读数读作「这一趟没跑过」。
   #
@@ -415,6 +415,17 @@ observability:
   # 一份，JSON 里那行由渲染改写。
   infraWatch:
     prometheusUrl: "http://cog-observability-prometheus.monitoring:9090"
+  # 观测事件日志（cog_observability_events）的容量与读窗口。这条表只追加，2026-10-27
+  # 实测 2.92M 行 / 1.6 GB，每天约 30 万行，而每一行都进夜间备份、也都在恢复演练要
+  # 装回去的那份库里——演练单趟因此从 553 s 涨到 2271 s。两个数是一对：maxRows 是清理
+  # 的目标，readWindowSeconds 是清理不许越过的那条线（历史事件读的就是最近这段时间，
+  # 删进来等于让一个能答的查询静默缺一段）。窗口自己就超过容量时，清理停手并把
+  # cogneva_observability_events_over_capacity 置 1。maxRows 置 0 = 本部署不清理。
+  eventLog:
+    # 行数上限。约三天常规量、一天半最坏量。
+    maxRows: 1000000
+    # 不许删的时间窗（秒），与历史事件查询的默认窗口同值。
+    readWindowSeconds: 86400
 
 # 公网 git 取数的一道上界，两个 worker 共用。
 #

@@ -346,9 +346,15 @@ impl PostgresObservabilityGateway {
     }
 
     async fn query_historical_events(&self, filter: &EventFilter) -> SFResult<Vec<AgentEvent>> {
-        let since = filter
-            .since
-            .unwrap_or_else(|| Utc::now() - Duration::hours(24));
+        // The default window is the same constant the capacity sweep may not
+        // delete inside. Two spellings of one promise is how a sweep comes to
+        // trim a row this query was still going to ask for, and the gap it
+        // leaves is silent: an event that is gone reads exactly like an event
+        // that never happened.
+        let since = filter.since.unwrap_or_else(|| {
+            Utc::now()
+                - Duration::seconds(crate::observability_event_cap::DEFAULT_READ_WINDOW_SECS as i64)
+        });
 
         let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
             "SELECT payload FROM cog_observability_events WHERE timestamp >= $1 ORDER BY timestamp ASC LIMIT 10000",

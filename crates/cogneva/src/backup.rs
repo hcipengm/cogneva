@@ -4080,8 +4080,8 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         Ok(Err(e)) => drill.error = Some(scrub_error(&e.to_string(), &cfg.database_url)),
         Err(_) => {
             mark_pass_timed_out(&mut drill, cfg.pass_budget);
-            // 临时库这一趟是收不了尾了。下一次开工本来也会先删它，但一份 1 GB 以上
-            // 的残库不该留到明晚：删不掉也只是警告，那本来就是下一趟的第一次开工。
+            // 临时库这一趟是收不了尾了。下一次开工本来也会先删它，但一份照着包大小
+            // 铺开的残库不该留到明晚：删不掉也只是警告，那本来就是下一趟的第一次开工。
             if let Err(e) = drop_drill_database(live).await {
                 tracing::warn!(error = %e, "演练超时的临时库没删掉，下一次开工时会再删一次");
             }

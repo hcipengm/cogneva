@@ -49,7 +49,7 @@ spec:
         # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。指纹同时覆盖 env 那份
         # cogneva-config（通知/告警出口地址在那里），只哈希卷里那份会让「配好地址但
         # 不重启」永远挂不上出口。
-        checksum/config: 82b7d6f5cda7fc93f75952898ebbaf122e891e69562047044885b06cc1bd87b7
+        checksum/config: d8dce2ebf2d592b81c5a0e9186e5b136449548ab5e7bc2c0d9ec65ca82eb2f49
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
@@ -124,6 +124,15 @@ spec:
             # （判据 deploy/scripts/check-deployment-name-wiring.sh）。
             - name: COGNEVA_DEPLOYMENT_NAME
               value: cogneva
+            # 观测事件日志的容量与读窗口。这条表只追加、且从没有过删除者，于是它的
+            # 大小就是平台在线时长乘以事件速率——运维每天备份、演练每趟恢复的都是
+            # 它。两个数是一对：容量是清理目标，读窗口是清理不许越过的线（历史事件
+            # 读的就是最近这段，删进来等于让一个能答的查询静默缺一段）。属主由租约
+            # 选举，不由这个标志钉死；置 0 = 本 Pod 不参与清理，只量大小。
+            - name: COGNEVA_OBSERVABILITY_EVENT_MAX_ROWS
+              value: "1000000"
+            - name: COGNEVA_OBSERVABILITY_EVENT_READ_WINDOW_SECS
+              value: "86400"
             # 本进程的花费属于哪个环境。token 账按这条轴回答「哪个环境烧的」，
             # 与 actor 轴（哪个组件烧的）正交——同一个组件在多个环境里跑，两个
             # 问题互不蕴含。控制面自己驱动平台的任务池，所以是 gateway_pool；

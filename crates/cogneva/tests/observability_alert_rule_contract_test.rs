@@ -4174,6 +4174,10 @@ const UNREAD: &[(&str, Unread)] = &[
         Unread::NotAReading("the help says it lags the row count and is never the pruning criterion; the capacity verdict is the reading with a criterion"),
     ),
     (
+        "cogneva_observability_events_bytes",
+        Unread::NotAReading("on-disk size of the event log, and it lags the row count for the same reason the sample log's does -- PostgreSQL returns deleted space only when it vacuums -- so a bound here would fire on the volume doing its job. The capacity verdict is the reading with a criterion; the bytes are what the volume is paying for it"),
+    ),
+    (
         "tier_migration_total",
         Unread::Elsewhere {
             readers: &[

@@ -459,6 +459,11 @@ crates/cog-storage/src/metrics_retirement.rs	RELEASE_BATCH	5_000	bound	Rows one 
 crates/cog-storage/src/metrics_retirement.rs	SUPERSEDED_QUIET_SECS	6 * 3600	bound	一个被判为孤儿的标签集要**安静多久**，release 才允许动它。
 crates/cog-storage/src/metrics_sample_cap.rs	MAX_SWEEP_PERIOD	120s	bound	half of Prometheus's 5-minute staleness window, so the size series survives a quiet log
 crates/cog-storage/src/metrics_sample_cap.rs	MIN_SWEEP_PERIOD	1s	bound	floor that keeps a log with nothing to prune from being polled in a spin
+crates/cog-storage/src/observability_event_cap.rs	BATCH_ROWS	20_000	bound	What one statement may delete: the LIMIT is how the capacity is enforced, so a pass’ reach and its cost are the same number.
+crates/cog-storage/src/observability_event_cap.rs	DEFAULT_MAX_ROWS	1_000_000	bound	About three days of events at the ordinary rate and under a day and a half at the worst rate measured (1.0 M rows on 2026-10-18), so the capacity stays outside the read window on a normal day and inside it only during a storm — which is the case the window verdict reports.
+crates/cog-storage/src/observability_event_cap.rs	DEFAULT_READ_WINDOW_SECS	86_400	bound	The floor the capacity may not cross, and the historical-events query’s own default window: one promise in one spelling, so a reader asking for what it asks for by default never sees a gap the sweep made.
+crates/cog-storage/src/observability_event_cap.rs	MAX_SWEEP_PERIOD	120s	bound	half of Prometheus’s 5-minute staleness window, so the size series survives a quiet log
+crates/cog-storage/src/observability_event_cap.rs	MIN_SWEEP_PERIOD	1s	bound	floor that keeps a log with nothing to prune from being polled in a spin
 crates/cog-storage/src/partition_maintainer.rs	MONTHS_AHEAD	2	bound	How far ahead of the current month partitions are kept open.
 crates/cog-storage/src/partition_maintainer.rs	MONTHS_BEHIND	1	bound	How far back maintenance reaches, so a recently dropped partition heals.
 crates/cog-storage/src/plugin.rs	CONNECTION_ACQUIRE_TIMEOUT	5s	bound	读服务端连接数时拿一条连接的等待上限：5s。
@@ -516,6 +521,7 @@ crates/cogneva/src/aof_repair.rs	SUSPECTED_INTERIOR_RUN	4096	bound	Zero run leng
 crates/cogneva/src/backup.rs	DEFAULT_MAX_SEGMENT_SKEW_SECONDS	300	bound	five minutes is where a package's segments stop being one snapshot; env-overridable
 crates/cogneva/src/backup.rs	DEFAULT_RUN_DEADLINE_SECONDS	3600	bound	a wide margin over the one measured 41-second run; a hang must not stop every later run
 crates/cogneva/src/backup.rs	DRILL_LOCK_KEY	0x636f_675f_6472_696c	bound	演练互斥锁的键。取自 `cog_dril` 的 ASCII，只要求集群内不与人撞车，不承担含义。
+crates/cogneva/src/backup.rs	DRILL_PASS_BUDGET_DEFAULT_SECS	3600	bound	How long one drill pass may take before the process stops it and records a failed row naming the budget. A single pass measured 497 s on 2026-10-19 and 2271 s on 2026-10-27 with a 3.6 GB database, so the number rises with the data and no measurement sets it; what keeps it honest is the pair with the job’s activeDeadlineSeconds (>= 2x this + slack), held by deploy/scripts/tests/backup-drill-budget-covers-both-passes.test.sh.
 crates/cogneva/src/backup.rs	ERROR_TEXT_MAX_CHARS	2000	bound	a runaway error is clipped so one row cannot become unreadable
 crates/cogneva/src/backup_crypto.rs	CHUNK	1 << 20	bound	一帧的明文上限。1 MiB 是吞吐与内存占用的折中：包体量在百 MB 量级，整包读进 内存会让备份 Pod 的峰值跟着包大小走。
 crates/cogneva/src/backup_crypto.rs	NONCE_LEN	12	bound	密文形状里三个由算法定死的长度：ChaCha20-Poly1305 的 nonce 12 字节、认证标签 16 字节（终止帧靠它认出来），以及每个包一份的 16 字节随机盐——盐够大就够让同一 句口令打出来的两个包互不可比。它们不是可调的旋钮。

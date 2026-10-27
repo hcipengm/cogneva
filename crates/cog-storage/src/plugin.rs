@@ -1345,6 +1345,49 @@ impl cog_core::SystemPlugin for StoragePlugin {
             info!("Metrics sample capacity disabled (no PostgreSQL pool)");
         }
 
+        // ── Observability event log capacity ──
+        // Same shape as the sample log above and for the same reason: the
+        // table is append-only and, unlike the sample log, nothing removed a
+        // row from it at all until this loop existed. It is the largest table
+        // the platform owns (2.92 M rows / 1.6 GB on 2026-10-27) and every row
+        // travels in the nightly backup whose restore the drill has to finish
+        // inside its per-pass budget — so this is the growth that turns a
+        // bounded drill into a killed one.
+        //
+        // The read window is not a second retention knob: it is the floor the
+        // capacity may not cross, because the historical-events view asks for
+        // the last day and a sweep that deleted inside it would answer a
+        // well-formed query with a silent gap.
+        let event_max_rows = crate::observability_event_cap::max_rows_from_env();
+        let event_read_window = crate::observability_event_cap::read_window_from_env();
+        if let Some(pool) = self.pg_pool.clone() {
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or_default();
+            let mut cap = crate::EventLogCap::new(pool, event_max_rows)
+                .with_read_window(event_read_window)
+                .with_deployment(deployment_name());
+            if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                cap = cap.with_metrics(mb);
+            }
+            if let Some(broker) = lease_broker.clone() {
+                cap = cap.with_role(broker);
+            }
+            let _handle = Arc::new(cap).spawn(shutdown.clone());
+            if event_max_rows == 0 {
+                info!("Observability event capacity disabled (max rows = 0)");
+            } else {
+                info!(
+                    event_max_rows,
+                    read_window_secs = event_read_window.as_secs(),
+                    "Observability event capacity started"
+                );
+            }
+        } else {
+            info!("Observability event capacity disabled (no PostgreSQL pool)");
+        }
+
         Ok(())
     }
 

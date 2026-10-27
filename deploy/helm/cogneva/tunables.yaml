@@ -1830,3 +1830,32 @@ rows:
       from them: nothing on this side observes how long a connection actually
       lived, and nginx's 60 s default severs an idle long connection in a way the
       browser reports only as a reconnect.
+
+  - key: observability.eventLog.maxRows
+    source: override
+    why: >-
+      Rows the observability event log may hold. The table is append-only and
+      nothing ever removed a row from it until this sweep, so its size was the
+      platform's uptime times its event rate: 2.92 M rows / 1.6 GB measured on
+      2026-10-27, growing about 300 k rows a day on an ordinary day and 1.0 M on
+      2026-10-18. Every row of it is in the nightly backup, and the drill
+      restores that whole dump to prove it -- the single pass went 553 s to
+      2271 s over six nights as the database grew, which is what makes this a
+      bound the drill budget depends on rather than housekeeping. One million is
+      about three days at the ordinary rate, so the capacity stays outside the
+      read window on a normal day and inside it during a storm, which is what
+      cogneva_observability_events_over_capacity is for. Nothing measures an
+      arrival rate into a value: the sweep derives its own period from the fill
+      it observes, but the ceiling itself is the operator's call.
+
+  - key: observability.eventLog.readWindowSeconds
+    source: override
+    why: >-
+      The window inside which no row may be deleted, whatever the capacity says.
+      Not a second retention knob: it is the floor, and it matches the default
+      window of the historical-events query, so a reader asking for what it asks
+      for by default never sees a gap the sweep made. The alternative -- a single
+      capacity -- answers the historical view with a silent hole during exactly
+      the storm an operator is looking at, and a hole reads like "nothing
+      happened then". Nothing derives it, because the reader's default window is
+      a design decision rather than an observation.
