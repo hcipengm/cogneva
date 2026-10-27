@@ -210,7 +210,9 @@ impl GeneratorActor {
                 // cause instead of a generator defect that is not there.
                 (
                     GeneratorOutput {
-                        content: serde_json::Value::String(format!("environment_error: {e}")),
+                        content: serde_json::Value::String(
+                            cog_core::contract::outcome::environment_error_content(&e),
+                        ),
                         artifacts: Vec::new(),
                     },
                     crate::actors::ReviewBasis::Skipped(

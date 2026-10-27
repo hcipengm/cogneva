@@ -111,6 +111,29 @@ pub const EMPTY_GENERATION_PREFIX: &str = "empty_generation";
 /// mid-work, so the result carries neither content nor artifacts.
 pub const MAX_ITERATIONS_STATUS: &str = "max_iterations_reached";
 
+/// Cause a role writes into its own output content when its call failed for an
+/// environment reason: `environment_error: <the error>`.
+///
+/// The role that calls the model and the loop that judges its output are
+/// different crates, and what crosses between them is the content string. The
+/// judge decides "this role produced nothing because the environment failed"
+/// by finding this word in that string — so the word is written by
+/// [`environment_error_content`] and read through this constant, never spelled
+/// out on either side. A re-typed copy keeps compiling after one side changes
+/// its wording and then matches nothing, which reads as "the environment
+/// stopped failing" on a run where it failed on the first call.
+pub const ENVIRONMENT_ERROR_PREFIX: &str = "environment_error";
+
+/// The in-band content a role publishes when its call failed for an environment
+/// reason, carrying the error's own text beside the cause.
+///
+/// The error goes with the marker rather than after it: a reader deciding
+/// whether to retry needs the typed upstream refusal inside that text, and a
+/// marker alone would send the next attempt to the same wall.
+pub fn environment_error_content(err: impl std::fmt::Display) -> String {
+    format!("{ENVIRONMENT_ERROR_PREFIX}: {err}")
+}
+
 /// Cause carried in-band by a run that ended on [`MAX_ITERATIONS_STATUS`].
 ///
 /// Without it the empty result is indistinguishable from a producer that

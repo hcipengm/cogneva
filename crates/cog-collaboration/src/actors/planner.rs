@@ -283,7 +283,9 @@ impl PlannerActor {
                 // 原因，而不是一个根本不存在的 planner 缺陷。
                 PlannerOutput {
                     summary: format!("Planner prompt did not reach its upstream: {e}"),
-                    plan: serde_json::Value::String(format!("environment_error: {e}")),
+                    plan: serde_json::Value::String(
+                        cog_core::contract::outcome::environment_error_content(&e),
+                    ),
                     sub_tasks: Vec::new(),
                     acceptance_criteria: Vec::new(),
                     targets: Vec::new(),

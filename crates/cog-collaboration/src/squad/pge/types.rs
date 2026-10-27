@@ -62,8 +62,9 @@ pub struct PlannerOutput {
 /// 503 the upstream answered with and for a transport that never arrived.
 fn names_a_deterministic_cause(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
-    t.contains("environment_error")
-        || t.contains("tool_pipeline_broken")
+    // 两个名字都从声明处取：这里是判据、角色那边是产出，两边各自拼字时改一处
+    // 不报错，判据就一直返回「没写原因」——与「这一跑没有原因」同形。
+    t.contains(cog_core::contract::outcome::ENVIRONMENT_ERROR_PREFIX)
         || t.contains(ITERATION_BUDGET_EXHAUSTED_MARKER)
 }
 
@@ -852,6 +853,21 @@ mod tests {
         let reason = output.terminal_env_failure_reason().unwrap();
         assert!(reason.starts_with(TERMINAL_ENV_FAILURE_PREFIX));
         assert!(reason.contains("HTTP 503 upstream unavailable"));
+    }
+
+    /// 角色写下的那一句与这里的判据是同一份拼法的两端。角色那边用契约层的
+    /// 构造器写，这里用契约层的常量认；任一边换词，这条当场红，而不是等到
+    /// 线上把「环境失败」读成「角色什么都没产出」。
+    #[test]
+    fn the_cause_a_role_writes_is_the_one_this_side_reads() {
+        let content = cog_core::contract::outcome::environment_error_content("HTTP 503");
+        assert!(
+            names_a_deterministic_cause(&content),
+            "契约层写的 `{content}` 这里认不出来：判据与产出已经不同名"
+        );
+        // 大小写不是这条契约的一部分：角色写的是小写，但文本会被套上各层
+        // 前缀、再经 `to_ascii_lowercase` 才到这里，判据必须按折过的大小写比。
+        assert!(names_a_deterministic_cause(&content.to_ascii_uppercase()));
     }
 
     /// 上游**答了话**的那一类不再被写成人不可及的终态。
