@@ -90,15 +90,19 @@ export function TitleBar() {
           模型
         </button>
         {/* 代码平台与上网以前只住在命令面板和设置页里：知道它们存在的人得先进
-            别处才找得到。它们是两条各自独立的对外通路，顶栏各给一格。 */}
+            别处才找得到。它们是两条各自独立的对外通路，顶栏各给一格。
+            这两格是全顶栏唯一带强调色的字：它们通向集群**之外**，而外部通路没配
+            就是没有——用缺席的灰字写，等于让人以为「这一格本来就没东西」。
+            图标也不再借用邻居的形状：本地那张源代码树是分支图，这里是出站箭头与
+            地球，三个形状在 16px 下不会互相认错。 */}
         <button
           type="button"
           onClick={overlays.openCredentials}
           title="代码平台（GitHub / Gitee）令牌与 SSH 身份 · 点开配置"
           aria-label="代码平台：令牌与 SSH 身份"
-          className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--muted)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
+          className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--brass)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
         >
-          <Icon name="scm" size={14} />
+          <Icon name="platform" size={14} />
           代码平台
         </button>
         <button
@@ -106,9 +110,9 @@ export function TitleBar() {
           onClick={overlays.openWebSearch}
           title="上网检索与抓取的后备池 · 点开配置"
           aria-label="上网：检索与抓取的后备池"
-          className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--muted)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
+          className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--brass)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
         >
-          <Icon name="search" size={14} />
+          <Icon name="globe" size={14} />
           上网
         </button>
         <button
