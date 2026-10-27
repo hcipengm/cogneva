@@ -136,4 +136,34 @@ fi
 grep -q "超过 15 的上限" <<<"${out}" \
   || fail "红了，但没报出超长的是哪个端口：${out}"
 
-echo "OK: render freshness 门禁在两种漂移上都红，在干净树上绿；模板写重键、端口名超长时渲染拒绝写出"
+# 用例 6：多出一个 profile 文件而没人渲染它 -> 红。
+#
+# profile 的集合是目录里的文件，不是脚本里的一份名单。名单时代，新增的 profile 连
+# 「该渲染它」都不知道：产物不出现、新鲜度不判、下游按目录读 profile 的门也看不见它，
+# 而三处都读作「本来就没有这个 profile」。
+d="$(case_dir new-profile)"
+cp "${d}/deploy/helm/cogneva/profiles/k3s-single.yaml" \
+  "${d}/deploy/helm/cogneva/profiles/k3s-airgap.yaml"
+# 额度投影也一并备好：没有它的新 profile 连渲染都过不去（那是另一条判据：
+# 「额度是投影出来的，不写在 values 里」），而这里要验的是「渲了却没有产物」。
+cp "${d}/deploy/helm/cogneva/values.resource-governance.k3s-single.yaml" \
+  "${d}/deploy/helm/cogneva/values.resource-governance.k3s-airgap.yaml"
+if out="$(run "${d}")"; then
+  fail "新增的 profile 没被渲染，--check 仍然绿（它从此不在任何一条判据里）：${out}"
+fi
+grep -q 'k3s-airgap' <<<"${out}" \
+  || fail "红了，但没点名那个新增的 profile：${out}"
+
+# 用例 7：profile 删了而产物留在树里 -> 红。
+#
+# 反向的漂移同样看不见：新鲜度只问「每个 profile 都有产物」。那棵没有 profile 的树
+# 会一直被提交，还会被下游按目录读 profile 的门当成一条真的投递路径去判。
+d="$(case_dir stray-tree)"
+rm "${d}/deploy/helm/cogneva/profiles/k8s-standard.yaml"
+if out="$(run "${d}")"; then
+  fail "没有 profile 的产物树仍在树里，--check 仍然绿：${out}"
+fi
+grep -q 'deploy/rendered/k8s-standard' <<<"${out}" \
+  || fail "红了，但没点名那棵没有出处的树：${out}"
+
+echo "OK: render freshness 门禁在两种漂移上都红，在干净树上绿；模板写重键、端口名超长时渲染拒绝写出；profile 集合从目录读（新增的没渲染红、删了 profile 的产物树也红）"

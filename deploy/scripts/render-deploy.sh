@@ -18,7 +18,41 @@ CHART_DIR="$REPO_ROOT/deploy/helm/cogneva"
 PROFILES_DIR="$CHART_DIR/profiles"
 RENDERED_DIR="$REPO_ROOT/deploy/rendered"
 
-PROFILES=(k3s-single k3s-multi k8s-standard)
+# profile 的集合是**读出来的**：deploy/helm/cogneva/profiles/ 下的每个 `<名字>.yaml` 就是
+# 一个 profile。写死一份名单，新增的那一个会安静地不渲染、不判新鲜度，
+# `deploy/rendered/<新名字>/` 也不会出现——下游按目录读 profile 的那几条门（采集器覆盖、
+# 读权限载体）于是也看不见它，几处一起空白，而空白读作「本来就没有这个 profile」。
+PROFILES=()
+for profile_file in "$PROFILES_DIR"/*.yaml; do
+    [ -e "$profile_file" ] || continue
+    PROFILES+=("$(basename "$profile_file" .yaml)")
+done
+if [ "${#PROFILES[@]}" -eq 0 ]; then
+    echo "FAIL: ${PROFILES_DIR} 下一个 profile 都没有——判不了该渲染哪些，这不等于全过" >&2
+    exit 2
+fi
+
+# 反向也要比：deploy/rendered/ 下每一棵产物树都得有对应的 profile。删了 profile 却把
+# 产物留在树里时，新鲜度门只问「每个 profile 都有产物」，那棵没有出处的树就一直被提交，
+# 还被下游按目录读 profile 的门当成一条真的投递路径去判。
+require_rendered_trees_have_profiles() {
+    [ -d "$RENDERED_DIR" ] || return 0
+    local dir name known p stray=0
+    for dir in "$RENDERED_DIR"/*/; do
+        [ -d "$dir" ] || continue
+        name="$(basename "$dir")"
+        known=0
+        for p in "${PROFILES[@]}"; do
+            [ "$p" = "$name" ] && known=1
+        done
+        if [ "$known" -eq 0 ]; then
+            echo "FAIL: deploy/rendered/${name} 没有对应的 profile（profiles/${name}.yaml 不存在）。" >&2
+            echo "      这棵树不会有任何东西再渲染它；删掉它，或把 profile 加回来。" >&2
+            stray=1
+        fi
+    done
+    [ "$stray" -eq 0 ]
+}
 
 # 额度是投影出来的产物，不是 values 里手写的一段：见 project-resource-governance.py
 # 的头部。它单独成文件，是因为 values.yaml 里全是人写的注释，而投影要整份重写；
@@ -181,6 +215,7 @@ PY
 }
 
 if [[ "${1:-}" == "--check" ]]; then
+  require_rendered_trees_have_profiles
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   # 先核投影：额度文件与 deploy/k3s 基线必须等于「从渲染集重算一遍」的结果。
@@ -196,6 +231,11 @@ if [[ "${1:-}" == "--check" ]]; then
   done
   for p in "${PROFILES[@]}"; do
     render_profile "$p" "$tmp/$p"
+    if [ ! -d "$RENDERED_DIR/$p" ]; then
+      echo "FAIL: deploy/rendered/$p 不在树里，而 profiles/$p.yaml 在。"
+      echo "      新增的 profile 必须先渲染并提交产物，否则选到它的安装形态手上就是空的。"
+      exit 1
+    fi
     if ! diff -r "$tmp/$p" "$RENDERED_DIR/$p" >/dev/null 2>&1; then
       echo "FAIL: deploy/rendered/$p 已过期（与 chart/profile 重渲染结果不一致）。"
       echo "      请本地运行 bash deploy/scripts/render-deploy.sh 并提交产物。"
@@ -205,6 +245,7 @@ if [[ "${1:-}" == "--check" ]]; then
   done
   echo "RENDER FRESHNESS OK：deploy/rendered/ 与 chart/profiles 一致"
 else
+  require_rendered_trees_have_profiles
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   # 投影要一次渲染当输入，而渲染又要读投影产物。先渲染一遍（额度那时是上一版
