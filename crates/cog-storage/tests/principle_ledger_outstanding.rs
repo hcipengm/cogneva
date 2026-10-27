@@ -286,6 +286,129 @@ async fn a_gate_the_platform_gains_reopens_a_row_a_look_had_settled() {
     cleanup(&pool, &marker).await;
 }
 
+/// Push one reading through the queue and fold it into the account.
+async fn push(store: &PostgresPrincipleLedgerStore, one: &PrincipleReading) {
+    store
+        .declare(std::slice::from_ref(one))
+        .await
+        .expect("queue the reading");
+    for _ in 0..4 {
+        let fold = store
+            .fold_declarations(PASS_BOUND * 2)
+            .await
+            .expect("fold the queue");
+        if fold.folded == 0 {
+            break;
+        }
+    }
+}
+
+/// A host gate the fold writes re-opens the row a look had already answered.
+///
+/// The fold is the only writer of `host_gate` and the verdict reads that column
+/// before anything else, so a reading that changes it changes the answer the next
+/// look would give. Until 2026-10-28 it moved neither `state` nor `measured_at`:
+/// the row kept the verdict of the reading before it and waited for the sweep to
+/// come round to it, which is a full scan -- about eighty minutes on the live
+/// account. Measured 2026-10-23: a p1 principle was given its gate at 03:47 and
+/// the account still read `unenforced` at 04:05, while the column itself had
+/// moved in the second the reading arrived. The platform's half of the same
+/// question is answered by `reopen_platform_gate_drift`; this is the host's.
+///
+/// The other direction is what makes this hard, and it is checked here for the
+/// same reason: these readings are sent for every row every cycle, so a
+/// condition that fired on a re-push would put the whole corpus back at the head
+/// of the queue every time and no pass would ever get past it. The column that
+/// says where the principle goes red is checked too: it is prose beside the
+/// verdict, not an input to it, and a reading that touches only that must leave
+/// the verdict alone.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_host_gate_the_fold_writes_reopens_the_row_a_look_had_answered() {
+    let _pass = PASS.lock().await;
+    let (store, pool, marker) = store().await;
+    let slug = format!("{marker}/host-gate-000");
+
+    // The row as the account held it: the host had read its own registry and
+    // found nothing, so the reading says `-` and a look wrote the debt.
+    let mut debt = reading(&slug, PrincipleCheckKind::Tree);
+    debt.host_gate = Some("-".into());
+    push(&store, &debt).await;
+    let measurement = cog_core::PrincipleMeasurement::new(slug.clone(), PrincipleState::Unenforced)
+        .at_revision("probe-rev-1");
+    store
+        .apply_principle_measurement(&measurement)
+        .await
+        .expect("write the look");
+    let looked = store
+        .get(&slug)
+        .await
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(
+        looked.state,
+        Some(PrincipleState::Unenforced),
+        "premise: the look wrote the debt"
+    );
+    assert!(looked.measured_at.is_some(), "premise: the look stamped it");
+
+    // The same reading again, which is what every cycle sends. Nothing may move:
+    // a verdict and a stamp that are re-stamped on every cycle would put this
+    // row back at the head of the queue for as long as it is in the corpus.
+    push(&store, &debt).await;
+    let again = store
+        .get(&slug)
+        .await
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(again.state, looked.state, "a re-push moved the verdict");
+    assert_eq!(
+        again.measured_at, looked.measured_at,
+        "a re-push re-stamped a row whose evidence had not moved"
+    );
+
+    // A reading that moves only the sentence about where this principle goes red
+    // is not a change to the verdict either.
+    let mut prose = debt.clone();
+    prose.where_red = Some("`crates/probe/tests/the_gate.rs`".into());
+    push(&store, &prose).await;
+    let after_prose = store
+        .get(&slug)
+        .await
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(
+        after_prose.measured_at, looked.measured_at,
+        "a column the verdict does not read re-opened the row"
+    );
+
+    // The host names a gate for it. This reading is the answer to the debt, and
+    // the next look would say `enforced`, so the row has to be offered now --
+    // not on the sweep's turn, which is where a row measured once sorts.
+    let mut gated = prose.clone();
+    gated.host_gate = Some("test:scripts/host/probe.test.sh".into());
+    push(&store, &gated).await;
+    let reopened = store
+        .get(&slug)
+        .await
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(
+        reopened.host_gate.as_deref(),
+        Some("test:scripts/host/probe.test.sh"),
+        "premise: the fold wrote the new gate"
+    );
+    assert_eq!(
+        reopened.state, None,
+        "the row keeps a verdict the reading it just folded contradicts"
+    );
+    assert_eq!(
+        reopened.measured_at, None,
+        "nor is it still stamped as looked at against the old column"
+    );
+    cleanup(&pool, &marker).await;
+}
+
 /// A row recorded as enforced with no gate in either registry is asked again.
 ///
 /// The verdict and the two readings cannot all be right: the state says a machine

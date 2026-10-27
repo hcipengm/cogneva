@@ -810,6 +810,25 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
 /// overwrite it. `COALESCE($8, 'unstated')` in `VALUES` alone would break the
 /// second half: `EXCLUDED.priority` would never be `NULL` and silence would erase
 /// a band. Hence the `SET` reads the parameter, not `EXCLUDED`.
+///
+/// The two columns the verdict is computed from are the only place this
+/// statement writes more than the reading. When `host_gate` or `check_kind`
+/// moves, the state and the stamp that a look wrote for the old values are
+/// cleared, so the row goes back to the pass instead of waiting for it: the
+/// verdict reads the host's column first and switches on the tier, so a reading
+/// that changes either changes the answer the next look would give. Until
+/// 2026-10-28 it moved neither `state` nor `measured_at`, and the row kept the
+/// old verdict until the sweep came round to it -- one full scan, which on the
+/// live account (about 3200 rows, 200 a pass, five minutes apart) is close to
+/// eighty minutes. Measured 2026-10-23: a p1 principle was given its gate at
+/// 03:47 and the account still read `unenforced` at 04:05, while the column
+/// itself had moved in the second the reading arrived.
+///
+/// The other direction has to keep holding: a reading that says what is already
+/// stored is a re-push, these are sent for every row every cycle, and a
+/// condition that fired on them would send the whole corpus to the head of the
+/// queue each time and no pass would ever get past it. That is why the test is
+/// `IS DISTINCT FROM` on the effective value, not "a reading arrived".
 const RECORD_READING_SQL: &str = "\
 INSERT INTO principle_ledger (slug, lead, carrier_path, carrier_sha256, host_gate, where_red, \
 check_kind, priority)
@@ -821,7 +840,15 @@ ON CONFLICT (slug) DO UPDATE SET
     host_gate = COALESCE(EXCLUDED.host_gate, principle_ledger.host_gate),
     where_red = COALESCE(EXCLUDED.where_red, principle_ledger.where_red),
     check_kind = EXCLUDED.check_kind,
-    priority = COALESCE($8::varchar, principle_ledger.priority)";
+    priority = COALESCE($8::varchar, principle_ledger.priority), \
+    state = CASE WHEN COALESCE(EXCLUDED.host_gate, principle_ledger.host_gate) \
+            IS DISTINCT FROM principle_ledger.host_gate \
+        OR EXCLUDED.check_kind IS DISTINCT FROM principle_ledger.check_kind \
+        THEN NULL ELSE principle_ledger.state END, \
+    measured_at = CASE WHEN COALESCE(EXCLUDED.host_gate, principle_ledger.host_gate) \
+            IS DISTINCT FROM principle_ledger.host_gate \
+        OR EXCLUDED.check_kind IS DISTINCT FROM principle_ledger.check_kind \
+        THEN NULL ELSE principle_ledger.measured_at END";
 
 /// Queue a reading, or re-queue the one already there when the reading would
 /// actually change it.

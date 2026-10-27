@@ -545,12 +545,19 @@ pub trait PrincipleLedgerStore: Send + Sync {
     /// Add or refresh what a reading contributes: the identity, the sentence,
     /// the carrier and its hash, and the shape of the host's own gate.
     ///
-    /// Never writes `state`, `measured_at` or `measured_rev`: a reading is not a
-    /// measurement, and a principle cannot become enforced by being described as
-    /// enforced. Rows the reading does not mention are left alone -- the ledger
-    /// outlives any one reading of the corpus, and a reading that omitted a row
-    /// because a memory was renamed is not a statement that the principle is
-    /// gone.
+    /// Never writes a verdict: a reading is not a measurement, and a principle
+    /// cannot become enforced by being described as enforced. It does clear one,
+    /// and only in the direction that costs nothing to be wrong about -- when the
+    /// reading moves a column the verdict is computed from (`host_gate`, the
+    /// host's own judgement, or the tier), the `state` and `measured_at` written
+    /// for the old values are cleared and the row goes back to the pass. Clearing
+    /// can only cause a look, never replace one; leaving them would keep a verdict
+    /// the account's own evidence now contradicts, for as long as the sweep takes
+    /// to come round -- a full scan, which is hours when the debt is deep. A
+    /// reading that says what is already stored moves neither. Rows the reading
+    /// does not mention are left alone -- the ledger outlives any one reading of
+    /// the corpus, and a reading that omitted a row because a memory was renamed
+    /// is not a statement that the principle is gone.
     ///
     /// The carrier hash moves to the pushed value, and the difference it made is
     /// read by [`Self::fold_declarations`] *before* this write rather than by
