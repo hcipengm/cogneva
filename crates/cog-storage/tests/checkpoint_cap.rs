@@ -28,6 +28,8 @@
 //! `cog_snapshots` is never in reach.
 
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -288,6 +290,50 @@ async fn a_store_the_pointers_and_the_window_hold_over_capacity_says_so() {
         "a table the floor holds over budget must say so, not report the capacity met"
     );
     assert_eq!(scratch.ids(&pool).await.len(), 5);
+
+    scratch.done().await;
+}
+
+/// A pass that needs more than one batch reports progress between them.
+///
+/// The loop stamps its own beat from that callback, so a pass that is working
+/// keeps its published age at one batch while a batch wedged on a lock still
+/// shows. Without a beat between batches the age of a pass over a store far
+/// over its capacity is the length of the whole pass, and that length is
+/// whatever the surplus is — the number of batches grows with it, so the loop
+/// can never declare a wall that covers it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_pass_that_needs_more_than_one_batch_reports_progress_between_them() {
+    let (scratch, pool) = scratch("progress").await;
+    // 12,001 rows against a capacity of one, all of them outside the read
+    // window: 12,000 deletions in batches of 5,000 is three batches.
+    sqlx::query(
+        "INSERT INTO cog_snapshots (snapshot_id, task_id, timestamp) \
+         SELECT 'row-' || g, 'task-' || g, NOW() - (g || ' minutes')::interval \
+         FROM generate_series(1, 12001) AS g",
+    )
+    .execute(&pool)
+    .await
+    .expect("fill the scratch store");
+
+    let beats = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&beats);
+    let outcome = scratch
+        .cap(&pool, 1, 1)
+        .sweep_once_beating(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        })
+        .await
+        .expect("sweep");
+
+    assert_eq!(outcome.removed, 12_000, "the whole surplus goes");
+    assert_eq!(
+        beats.load(Ordering::Relaxed),
+        3,
+        "12,000 rows in batches of 5,000 is three batches, and every one of them \
+         has to report progress: the loop beats its heartbeat from this callback"
+    );
 
     scratch.done().await;
 }

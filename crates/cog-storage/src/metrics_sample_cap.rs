@@ -297,7 +297,7 @@ impl SampleLogCap {
                 None => false,
             };
             let pass = if prunes {
-                self.sweep_once().await
+                self.sweep_once_beating(|| beat.beat()).await
             } else {
                 self.measure_once().await
             };
@@ -363,6 +363,20 @@ impl SampleLogCap {
     /// Delete oldest-first until the log is within capacity, or until the only
     /// rows left are the ones every series needs.
     pub async fn sweep_once(&self) -> SFResult<SweepOutcome> {
+        self.sweep_once_beating(|| {}).await
+    }
+
+    /// The same pass, calling `progress` once before every delete.
+    ///
+    /// The loop hands `beat.beat` in here so that the age it publishes is
+    /// bounded by one statement rather than by the whole pass. A log far over
+    /// its budget is drained over several statements when one of them takes
+    /// fewer rows than the surplus, and the pass itself is otherwise one
+    /// statement long — longer than any wall the loop can declare for itself,
+    /// because what the pass has to delete is the surplus and the surplus has
+    /// no bound. What a stall rule should see instead is the one statement
+    /// wedged on a lock, and that is what beating between them leaves visible.
+    pub async fn sweep_once_beating(&self, progress: impl Fn()) -> SFResult<SweepOutcome> {
         let held = self.row_count().await?;
         let mut outcome = SweepOutcome {
             held,
@@ -393,6 +407,7 @@ impl SampleLogCap {
         // resting on its floor.
         let mut stalled = false;
         while remaining > 0 {
+            progress();
             let batch = self.delete_surplus(remaining).await?;
             outcome.removed += batch;
             remaining -= batch as i64;

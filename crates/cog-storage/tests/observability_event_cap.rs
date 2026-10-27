@@ -21,6 +21,8 @@
 //! columns the sweep reads, and drops it at the end. It never touches
 //! `cog_observability_events` itself.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -176,6 +178,56 @@ async fn a_row_exactly_at_the_window_edge_survives() {
     assert!(
         !outcome.window_held,
         "one row at the capacity is not a table held over it"
+    );
+
+    scratch.drop(&pool).await;
+}
+
+/// A pass that needs more than one batch reports progress between them.
+///
+/// The loop stamps its own beat from that callback, so a pass that is working
+/// keeps its published age at one batch while a batch wedged on a lock still
+/// shows. Without a beat between batches the age of a pass over a log far over
+/// its capacity is the length of the whole pass, and that length is whatever the
+/// surplus is — the number of batches grows with it, so the loop can never
+/// declare a wall that covers it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_pass_that_needs_more_than_one_batch_reports_progress_between_them() {
+    let pool = PgPool::connect(&database_url())
+        .await
+        .expect("connect to the test database");
+    let scratch = Scratch::new(&pool).await;
+    // 40,001 rows against a capacity of one, all of them outside the read
+    // window: 40,000 deletions in batches of 20,000 is two batches.
+    sqlx::query(&format!(
+        "INSERT INTO {name} (timestamp) \
+         SELECT NOW() - (g || ' minutes')::interval \
+         FROM generate_series(1, 40001) AS g",
+        name = scratch.name
+    ))
+    .execute(&pool)
+    .await
+    .expect("fill the scratch table");
+
+    let beats = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&beats);
+    let cap = EventLogCap::new(pool.clone(), 1)
+        .with_table(scratch.name.clone())
+        .with_read_window(Duration::from_secs(1));
+    let outcome = cap
+        .sweep_once_beating(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        })
+        .await
+        .expect("sweep");
+
+    assert_eq!(outcome.removed, 40_000, "the whole surplus goes");
+    assert_eq!(
+        beats.load(Ordering::Relaxed),
+        2,
+        "40,000 rows in batches of 20,000 is two batches, and both have to report \
+         progress: the loop beats its heartbeat from this callback"
     );
 
     scratch.drop(&pool).await;

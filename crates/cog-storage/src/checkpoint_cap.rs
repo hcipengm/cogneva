@@ -9,7 +9,8 @@
 //! platform has ever checkpointed leaves its final checkpoint behind for good.
 //!
 //! Measured on 2026-10-27: 54,452 rows over 924 MB of table and indexes, of
-//! which 39,610 rows (about 580 MB) are referenced by no board field at all.
+//! which 39,610 rows (about 580 MB, measured the same day) are referenced by no
+//! board field at all.
 //! Every one of those rows is in the nightly backup, and the backup drill
 //! restores the whole dump to prove it — so the garbage is paid for every night
 //! by a restore that has a per-pass budget to finish inside.
@@ -232,7 +233,7 @@ impl CheckpointCap {
                 None => false,
             };
             let pass = if prunes {
-                self.sweep_once().await
+                self.sweep_once_beating(|| beat.beat()).await
             } else {
                 self.measure_once().await
             };
@@ -293,6 +294,26 @@ impl CheckpointCap {
     /// Delete oldest-first until the table is within capacity, or until every
     /// row left is a board pointer or inside the read window.
     pub async fn sweep_once(&self) -> SFResult<CheckpointSweepOutcome> {
+        self.sweep_once_beating(|| {}).await
+    }
+
+    /// The same pass, calling `progress` once before every batch.
+    ///
+    /// The loop hands `beat.beat` in here, because the work between two beats
+    /// is otherwise the whole pass. A first pass over a store far over its
+    /// budget deletes in batches and can outlast the wall the loop declared for
+    /// itself, and the sweep paying for the event log's first pass measured
+    /// that the hard way: a pass that ran for about fifteen minutes against a
+    /// wall of six two-minute periods raised `background_loop_stalled` while it
+    /// was working exactly as designed, which leaves the rule silent about the
+    /// case it exists for — one batch wedged on a lock. Beating per batch bounds
+    /// the published age by the gap the loop can actually bound, the same reason
+    /// a loop draining a queue declares the bound on one item instead of on the
+    /// queue.
+    pub async fn sweep_once_beating(
+        &self,
+        progress: impl Fn(),
+    ) -> SFResult<CheckpointSweepOutcome> {
         let held = self.row_count().await?;
         let mut outcome = CheckpointSweepOutcome {
             held,
@@ -317,6 +338,7 @@ impl CheckpointCap {
         // as one the floor stopped.
         let mut stalled = false;
         while remaining > 0 {
+            progress();
             let batch = self
                 .delete_surplus(BATCH_ROWS.min(remaining), cutoff)
                 .await?;
@@ -617,18 +639,29 @@ mod tests {
 
     /// The wait follows the fill rate rather than a chosen number: a store
     /// filling fast is swept sooner than one that is nearly still.
+    ///
+    /// Both cases are picked so that each lands strictly inside the clamp. The
+    /// first version of this test gave both sides a ten-thousand-row headroom
+    /// against fill rates that each needed longer than the longest period to
+    /// close it, so both came back at the ceiling and the assertion compared
+    /// 120 s against 120 s — a statement about the clamp, not about the rate.
     #[test]
     fn the_wait_follows_the_fill_rate() {
-        let fast = outcome(30_000, Some(40_000), false);
-        let slow = outcome(30_100, Some(40_000), false);
+        // 101 rows of headroom: the wait is decided by the rate, and neither
+        // the period's floor nor its ceiling can be what the comparison sees.
+        let fast = outcome(30_000, Some(30_100), false);
+        let slow = outcome(30_000, Some(30_100), false);
         let fast_period = next_period(pass_ago(29_000, 60), &fast);
-        let slow_period = next_period(pass_ago(30_000, 60), &slow);
+        let slow_period = next_period(pass_ago(29_900, 60), &slow);
+        assert!(
+            fast_period > MIN_SWEEP_PERIOD && slow_period < MAX_SWEEP_PERIOD,
+            "both have to land inside the clamp, or this compares two ceilings \
+             again: {fast_period:?} and {slow_period:?}"
+        );
         assert!(
             fast_period < slow_period,
             "1000 rows a minute has to be swept sooner than 100: {fast_period:?} vs {slow_period:?}"
         );
-        assert!(slow_period <= MAX_SWEEP_PERIOD);
-        assert!(fast_period >= MIN_SWEEP_PERIOD);
     }
 
     /// A bound that cannot be read falls back instead of switching the sweep

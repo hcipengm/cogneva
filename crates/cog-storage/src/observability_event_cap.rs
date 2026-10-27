@@ -233,7 +233,7 @@ impl EventLogCap {
                 None => false,
             };
             let pass = if prunes {
-                self.sweep_once().await
+                self.sweep_once_beating(|| beat.beat()).await
             } else {
                 self.measure_once().await
             };
@@ -301,6 +301,22 @@ impl EventLogCap {
     /// Delete oldest-first until the table is within capacity, or until the
     /// only rows left are the ones inside the read window.
     pub async fn sweep_once(&self) -> SFResult<EventSweepOutcome> {
+        self.sweep_once_beating(|| {}).await
+    }
+
+    /// The same pass, calling `progress` once before every batch.
+    ///
+    /// The loop hands `beat.beat` in here, because the work between two beats
+    /// is otherwise the whole pass: measured on 2026-10-27, a first pass over a
+    /// log 751,203 rows over its budget ran for about fifteen minutes against a
+    /// declared period of two and a wall of six of them, so
+    /// `background_loop_stalled` fired on a sweep that was working exactly as
+    /// designed — and a rule that fires on the repair is silent about the case
+    /// it exists for, one batch wedged on a lock. Beating per batch bounds the
+    /// published age by the gap the loop can actually bound, which is the same
+    /// reason a loop draining a queue declares the bound on one item instead of
+    /// on the queue.
+    pub async fn sweep_once_beating(&self, progress: impl Fn()) -> SFResult<EventSweepOutcome> {
         let held = self.row_count().await?;
         let mut outcome = EventSweepOutcome {
             held,
@@ -325,6 +341,7 @@ impl EventLogCap {
         // read as one the window stopped.
         let mut stalled = false;
         while remaining > 0 {
+            progress();
             let batch = self
                 .delete_surplus(BATCH_ROWS.min(remaining), cutoff)
                 .await?;
