@@ -280,11 +280,11 @@ enum AlertWork {
 /// cannot disagree: a status this predicate calls finished is one
 /// `submit_intent` will resubmit, and a status it calls in flight is one
 /// `submit_intent` will refuse as a duplicate.
-fn alert_work(existing: Option<&Task>) -> AlertWork {
+fn alert_work(existing: Option<&Task>, may_redrive: bool) -> AlertWork {
     let Some(task) = existing else {
         return AlertWork::NeverFiled;
     };
-    match intent_action(Some(&task.status)) {
+    match intent_action(Some(&task.status), may_redrive) {
         IntentAction::None => AlertWork::InHand,
         IntentAction::Redrive => AlertWork::Unfinished,
         IntentAction::Submit => AlertWork::NeverFiled,
@@ -329,6 +329,7 @@ fn select_alerts<'a>(
     max: usize,
     cooldown_secs: i64,
     now: DateTime<Utc>,
+    may_redrive: bool,
 ) -> SelectedAlerts<'a> {
     let mut unfinished = Vec::new();
     let mut announced = Vec::new();
@@ -338,7 +339,7 @@ fn select_alerts<'a>(
         let row = tasks
             .iter()
             .find(|t| t.id == alert_task_id(&alert.dedup_key));
-        match alert_work(row) {
+        match alert_work(row, may_redrive) {
             AlertWork::InHand => in_hand += 1,
             AlertWork::Unfinished => unfinished.push(alert),
             AlertWork::NeverFiled => {
@@ -634,11 +635,22 @@ enum IntentAction {
 /// signal is still firing, so the only thing standing between the signal and a
 /// new attempt is the row itself: `retry_task` takes a failed task and nothing
 /// else, so a finished one has to be cleared rather than re-driven.
-fn intent_action(existing: Option<&TaskStatus>) -> IntentAction {
+///
+/// `may_redrive` is false on a round the LLM pool gate holds off, and it turns
+/// exactly the two driving answers into "leave the row alone". The distinction
+/// it draws is between the two things a round can do with a signal: file it,
+/// which spends no LLM call and is the only evidence that the signal was taken
+/// up at all, and drive it again, which buys one refusing 503 per agent for
+/// work the pool cannot run. A held-off round still does the first; it does not
+/// do the second, and a row it leaves alone is picked up by the first round
+/// after the pool is back rather than by every round in between.
+fn intent_action(existing: Option<&TaskStatus>, may_redrive: bool) -> IntentAction {
     match existing {
         None => IntentAction::Submit,
-        Some(TaskStatus::Failed) => IntentAction::Redrive,
-        Some(TaskStatus::Completed | TaskStatus::Cancelled) => IntentAction::Resubmit,
+        Some(TaskStatus::Failed) if may_redrive => IntentAction::Redrive,
+        Some(TaskStatus::Completed | TaskStatus::Cancelled) if may_redrive => {
+            IntentAction::Resubmit
+        }
         Some(_) => IntentAction::None,
     }
 }
@@ -721,9 +733,10 @@ async fn submit_intent(
     task_kind: &str,
     goal: String,
     detail: serde_json::Value,
+    may_redrive: bool,
 ) -> IntentOutcome {
     let existing = orch.get_task(&task_id).await;
-    let action = intent_action(existing.as_ref().map(|t| &t.status));
+    let action = intent_action(existing.as_ref().map(|t| &t.status), may_redrive);
     let resubmitting = action == IntentAction::Resubmit;
     match action {
         IntentAction::None => IntentOutcome::Tracked,
@@ -834,6 +847,7 @@ async fn tick(
     alert_source: Option<&Arc<dyn cog_core::ActiveAlertSource>>,
     taste_source: Option<&Arc<dyn cog_core::TasteIntentSource>>,
     readings: &SignalWatcherReadings,
+    held: bool,
 ) {
     // Stamped before anything is read, so a round that fails or finds nothing
     // still counts as a round: the tick count is what the signal counts are
@@ -855,6 +869,42 @@ async fn tick(
         // entries expire instead of waiting for the next signal to be carried
         // along with it.
         dirty = true;
+    }
+
+    // A round the pool gate holds off is not an empty round: it takes the
+    // firing alerts in and does nothing else.
+    //
+    // The intake is bookkeeping. It reads the alert store and writes one task
+    // row per firing alert, and it spends no LLM call — the row is the only
+    // thing that says an alert has been taken up, and the reader that asks
+    // whether a firing alert is attended reads it. Standing the whole round
+    // down is what left that reader with nothing to find for the whole of a
+    // multi-day pool outage, measured on 2026-10-27: five rounds ran, five
+    // stood down, every outcome counter read zero, and twenty rules were firing
+    // with no row between them. The gate exists to stop buying refusing 503s,
+    // and no 503 is bought by a row.
+    //
+    // Every other branch here asks for a fix, and a fix is exactly what the
+    // pool cannot run: filed now, each one becomes a task that fails on the
+    // same 503 the gate was added to stop, which is the pulse the gate came
+    // from in the first place. So they wait for the pool rather than for the
+    // clock, and `may_redrive` is false for the intake too — a row that already
+    // failed stays failed until there is a pool to drive it again.
+    if held {
+        readings.held_round();
+        if config.alert_channel_enabled {
+            if let Some(source) = alert_source {
+                take_alerts_in(
+                    orch, config, source, &tasks, &mut state, &mut dirty, now, readings, false,
+                )
+                .await;
+            }
+        }
+        publish_guard_store(&state, readings, reclaimed);
+        if dirty {
+            save_state(&state).await;
+        }
+        return;
     }
 
     // 1. Failure recurrence among self-evolution tasks.
@@ -913,6 +963,7 @@ async fn tick(
                 "window_secs": config.failure_window_secs,
                 "sample_task_ids": sample_ids,
             }),
+            true,
         )
         .await;
         report_outcome(&mut state, &key, outcome, now, readings);
@@ -946,6 +997,7 @@ async fn tick(
                     "dlq": dlq,
                     "threshold": config.backlog_threshold,
                 }),
+                true,
             )
             .await;
             report_outcome(&mut state, &key, outcome, now, readings);
@@ -979,6 +1031,7 @@ async fn tick(
                     "kind": "self_audit",
                     "period": period,
                 }),
+                true,
             )
             .await;
             // 节拍只在审计任务确实在手时才推进：提交没落地就撤销本轮，
@@ -995,51 +1048,10 @@ async fn tick(
     // so the fix work is tracked and cooled down like any other signal.
     if config.alert_channel_enabled {
         if let Some(source) = alert_source {
-            // A failed read yields no intents for this tick, and the cooldown
-            // bookkeeping is left untouched so the next tick retries with the
-            // same slate. It also must not be read as "the alerts cleared":
-            // nothing here concludes anything from absence.
-            if let Some(alerts) = source.list_active_alerts(100).await {
-                let SelectedAlerts {
-                    selected,
-                    in_hand,
-                    in_cooldown,
-                } = select_alerts(
-                    &alerts,
-                    &tasks,
-                    &state,
-                    config.alert_channel_max_per_tick,
-                    config.report_cooldown_secs,
-                    now,
-                );
-                // Firing alerts held back by their cooldown are signals too,
-                // and the count is taken here where the predicate that held
-                // them back is applied, rather than re-derived by a reader.
-                for _ in 0..in_cooldown {
-                    readings.record(SignalOutcome::Cooldown);
-                }
-                // Same for the ones already in hand. Their submission is not
-                // made, so the counting `submit_intent` does cannot happen on
-                // this path -- and an alert the round found and chose not to
-                // touch is not an alert the round did not find.
-                for _ in 0..in_hand {
-                    readings.record(SignalOutcome::Tracked);
-                }
-                for alert in selected {
-                    let key = alert_signal_key(&alert.dedup_key);
-                    dirty = true;
-                    let (goal, detail) = alert_intent(alert, config.alert_label_max_chars);
-                    let outcome = submit_intent(
-                        orch,
-                        alert_task_id(&alert.dedup_key),
-                        "self_signal",
-                        goal,
-                        detail,
-                    )
-                    .await;
-                    report_outcome(&mut state, &key, outcome, now, readings);
-                }
-            }
+            take_alerts_in(
+                orch, config, source, &tasks, &mut state, &mut dirty, now, readings, true,
+            )
+            .await;
         }
     }
 
@@ -1139,7 +1151,8 @@ async fn tick(
                         }
                         let (goal, detail) = taste_intent(intent);
                         let outcome =
-                            submit_intent(orch, task_id.clone(), "self_signal", goal, detail).await;
+                            submit_intent(orch, task_id.clone(), "self_signal", goal, detail, true)
+                                .await;
                         // Only a submission that reached the task layer gets a
                         // fate written down: one that never got there stays
                         // pending and is retried, which is also what makes the
@@ -1182,6 +1195,76 @@ async fn tick(
     }
 }
 
+/// Take the firing alerts in: one task row per alert, keyed by its dedup key.
+///
+/// This is the half of a round that is bookkeeping, and it is a function of its
+/// own because a round the pool gate holds off still runs it. `may_redrive` is
+/// what it does with an alert whose row already failed: driven again on an open
+/// pool, and left alone on a closed one.
+#[allow(clippy::too_many_arguments)]
+async fn take_alerts_in(
+    orch: &Arc<dyn OrchestratorControl>,
+    config: &SignalWatcherConfig,
+    source: &Arc<dyn cog_core::ActiveAlertSource>,
+    tasks: &[Task],
+    state: &mut SignalGuardState,
+    dirty: &mut bool,
+    now: DateTime<Utc>,
+    readings: &SignalWatcherReadings,
+    may_redrive: bool,
+) {
+    // A failed read yields no intents for this tick, and the cooldown
+    // bookkeeping is left untouched so the next tick retries with the
+    // same slate. It also must not be read as "the alerts cleared":
+    // nothing here concludes anything from absence.
+    let Some(alerts) = source.list_active_alerts(100).await else {
+        return;
+    };
+    let SelectedAlerts {
+        selected,
+        in_hand,
+        in_cooldown,
+    } = select_alerts(
+        &alerts,
+        tasks,
+        state,
+        config.alert_channel_max_per_tick,
+        config.report_cooldown_secs,
+        now,
+        may_redrive,
+    );
+    // Firing alerts held back by their cooldown are signals too,
+    // and the count is taken here where the predicate that held
+    // them back is applied, rather than re-derived by a reader.
+    for _ in 0..in_cooldown {
+        readings.record(SignalOutcome::Cooldown);
+    }
+    // Same for the ones already in hand. Their submission is not
+    // made, so the counting `submit_intent` does cannot happen on
+    // this path -- and an alert the round found and chose not to
+    // touch is not an alert the round did not find.
+    for _ in 0..in_hand {
+        readings.record(SignalOutcome::Tracked);
+    }
+    for alert in selected {
+        let key = alert_signal_key(&alert.dedup_key);
+        *dirty = true;
+        let (goal, detail) = alert_intent(alert, config.alert_label_max_chars);
+        let outcome = submit_intent(
+            orch,
+            alert_task_id(&alert.dedup_key),
+            "self_signal",
+            goal,
+            detail,
+            may_redrive,
+        )
+        .await;
+        // The report clock belongs to this function's state, so the account is
+        // taken here rather than by the round.
+        report_outcome(state, &key, outcome, now, readings);
+    }
+}
+
 /// Publish what the guard store holds after this round, and how much this round
 /// reclaimed.
 ///
@@ -1210,21 +1293,6 @@ pub const SIGNAL_WATCHER_LOOP: &str = "signal_watcher";
 /// rather than standing down for a pause nobody declared.
 fn llm_held_off(gate: Option<&Arc<dyn cog_core::SchedulerGate>>) -> bool {
     gate.is_some_and(|g| g.is_paused_kind(cog_core::TaskClass::LlmDependent))
-}
-
-/// What a round the pool gate held off does to this process's readings.
-///
-/// Two things, and both are deliberate. The round is stamped, because the tick
-/// count is the denominator the signal counts are read against and a denominator
-/// that freezes when the gate closes is how a dead loop reads. And the round is
-/// counted as stood down, so the pause is a series of its own rather than an
-/// inference from a counter that stopped moving. Standing down silently would
-/// leave a pause looking like the quiet system the gate exists to tell it apart
-/// from; freezing the count would leave it looking like a loop that died. The
-/// two series together say which of the three it is.
-fn stand_down(readings: &SignalWatcherReadings) {
-    readings.tick();
-    readings.held_round();
 }
 
 /// The ticker this loop runs its rounds on: the first round one period out, and
@@ -1299,25 +1367,22 @@ pub fn spawn_signal_watcher_loop(
                         biased;
                         _ = shutdown.wait() => break,
                         _ = ticker.tick() => {
-                            if llm_held_off(llm_gate.as_ref()) {
-                                if !held {
-                                    held = true;
+                            let standing_down = llm_held_off(llm_gate.as_ref());
+                            if standing_down != held {
+                                held = standing_down;
+                                if standing_down {
                                     info!(
-                                        "LLM upstream pool unavailable; self-discovery signals held until it recovers"
+                                        "LLM upstream pool unavailable; the round takes the alerts in and files no other work until it recovers"
                                     );
                                 }
-                                // Stamped and reported as standing down, not
-                                // skipped: see `stand_down`.
-                                stand_down(&readings);
-                                continue;
                             }
-                            held = false;
                             tick(
                                 &orchestrator,
                                 &config,
                                 alert_source.as_ref(),
                                 taste_source.as_ref(),
                                 &readings,
+                                standing_down,
                             )
                             .await;
                         }
@@ -1602,9 +1667,9 @@ mod tests {
 
     #[test]
     fn intent_action_maps_task_state_to_the_right_move() {
-        assert_eq!(intent_action(None), IntentAction::Submit);
+        assert_eq!(intent_action(None, true), IntentAction::Submit);
         assert_eq!(
-            intent_action(Some(&TaskStatus::Failed)),
+            intent_action(Some(&TaskStatus::Failed), true),
             IntentAction::Redrive
         );
         for live in [
@@ -1613,9 +1678,31 @@ mod tests {
             TaskStatus::Running,
         ] {
             assert_eq!(
-                intent_action(Some(&live)),
+                intent_action(Some(&live), true),
                 IntentAction::None,
                 "{live:?} 不该再提交或重驱动"
+            );
+        }
+    }
+
+    /// A round the pool gate holds off files the signal and drives nothing, so
+    /// the two answers that would spend the pool -- re-driving a failed row and
+    /// resubmitting a finished one -- both come back as "leave it alone". The
+    /// first filing still goes through: a signal with no row is a signal nothing
+    /// knows about, and writing that row spends no LLM call.
+    #[test]
+    fn a_held_off_round_files_a_new_row_and_drives_no_old_one() {
+        assert_eq!(intent_action(None, false), IntentAction::Submit);
+        for existing in [
+            TaskStatus::Failed,
+            TaskStatus::Completed,
+            TaskStatus::Cancelled,
+            TaskStatus::Pending,
+        ] {
+            assert_eq!(
+                intent_action(Some(&existing), false),
+                IntentAction::None,
+                "{existing:?} 在池关门时不该被驱动"
             );
         }
     }
@@ -1628,12 +1715,259 @@ mod tests {
     #[test]
     fn a_finished_task_is_resubmitted_rather_than_redriven() {
         assert_eq!(
-            intent_action(Some(&TaskStatus::Completed)),
+            intent_action(Some(&TaskStatus::Completed), true),
             IntentAction::Resubmit
         );
         assert_eq!(
-            intent_action(Some(&TaskStatus::Cancelled)),
+            intent_action(Some(&TaskStatus::Cancelled), true),
             IntentAction::Resubmit
+        );
+    }
+
+    /// What a round files and what it leaves alone, read off the store it wrote
+    /// to rather than off the return value of any one call.
+    struct FilingOrchestrator {
+        tasks: std::sync::Mutex<Vec<Task>>,
+    }
+
+    impl FilingOrchestrator {
+        fn holding(tasks: Vec<Task>) -> Self {
+            Self {
+                tasks: std::sync::Mutex::new(tasks),
+            }
+        }
+
+        fn filed(&self) -> Vec<Task> {
+            self.tasks.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OrchestratorControl for FilingOrchestrator {
+        async fn submit_goal_auto(
+            &self,
+            _goal: &str,
+            tasks: Vec<Task>,
+        ) -> cog_core::SFResult<Vec<String>> {
+            let mut held = self.tasks.lock().unwrap();
+            let mut ids = Vec::new();
+            for task in tasks {
+                // An id the store already holds is the idempotent no-op the real
+                // graph makes of it, so a test cannot mistake a duplicate for a
+                // filing.
+                if held.iter().any(|t| t.id == task.id) {
+                    continue;
+                }
+                ids.push(task.id.clone());
+                held.push(task);
+            }
+            Ok(ids)
+        }
+
+        async fn get_all_tasks(&self) -> Vec<Task> {
+            self.filed()
+        }
+
+        async fn get_task(&self, task_id: &str) -> Option<Task> {
+            self.filed().into_iter().find(|t| t.id == task_id)
+        }
+
+        async fn submit_goal(&self, _goal: &str, _tasks: Vec<Task>) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn assign_task(&self, _t: &str, _a: &str) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn add_task(&self, _t: Task) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn crew_can_retry(&self, _ids: &[String]) -> bool {
+            false
+        }
+        async fn crew_retry_all(&self, _ids: &[String]) -> usize {
+            0
+        }
+        async fn get_ready_tasks(&self) -> Vec<Task> {
+            vec![]
+        }
+        async fn push_to_dlq(&self, _t: &str, _e: String) -> cog_core::SFResult<bool> {
+            Ok(false)
+        }
+        async fn retry_task(&self, _t: &str) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn dlq_len(&self) -> cog_core::SFResult<usize> {
+            Ok(0)
+        }
+        async fn start_task(&self, _t: &str) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn complete_task(
+            &self,
+            _t: &str,
+            _r: serde_json::Value,
+        ) -> cog_core::SFResult<Vec<String>> {
+            unimplemented!()
+        }
+        async fn fail_task(
+            &self,
+            _t: &str,
+            _e: String,
+            _c: Option<cog_core::UpstreamFailure>,
+        ) -> cog_core::SFResult<(bool, Vec<String>, bool)> {
+            unimplemented!()
+        }
+        async fn fail_task_after(
+            &self,
+            _t: &str,
+            _e: String,
+            _c: Option<cog_core::UpstreamFailure>,
+            _r: Option<u64>,
+        ) -> cog_core::SFResult<(bool, Vec<String>, bool)> {
+            unimplemented!()
+        }
+        async fn cancel_task(&self, _t: &str) -> cog_core::SFResult<Vec<String>> {
+            unimplemented!()
+        }
+        async fn schedule_task(&self, _t: &str) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)> {
+            vec![]
+        }
+        async fn get_dependents(&self, _t: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_dependencies(&self, _t: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
+            (vec![], vec![])
+        }
+        async fn delete_task(&self, _t: &str) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn all_completed(&self) -> bool {
+            false
+        }
+        async fn replay_dlq(&self, _t: &str) -> cog_core::SFResult<bool> {
+            Ok(false)
+        }
+    }
+
+    /// An alert store with a fixed set of firing rows in it.
+    struct FiringAlerts(Vec<cog_core::PersistedAlert>);
+
+    #[async_trait::async_trait]
+    impl cog_core::ActiveAlertSource for FiringAlerts {
+        async fn list_active_alerts(&self, _limit: i64) -> Option<Vec<cog_core::PersistedAlert>> {
+            Some(self.0.clone())
+        }
+
+        async fn acknowledge_alert(
+            &self,
+            _dedup_key: &str,
+            _by: &str,
+        ) -> Result<Option<DateTime<Utc>>, String> {
+            unimplemented!()
+        }
+    }
+
+    /// A round the pool gate holds off still takes the alert in.
+    ///
+    /// This is the whole point of splitting the round: the row it writes costs
+    /// no LLM call, and it is the only evidence a reader has that a firing alert
+    /// has been taken up. Held back, the alert-to-work chain goes empty for as
+    /// long as the pool is down, which is what happened for the whole of the
+    /// 2026-10-27 outage: the watcher stamped five rounds, stood down five times,
+    /// and registered nothing while twenty rules were firing.
+    #[tokio::test]
+    async fn a_held_off_round_still_files_the_alert_it_found() {
+        let orch: Arc<dyn OrchestratorControl> = Arc::new(FilingOrchestrator::holding(vec![]));
+        let source: Arc<dyn cog_core::ActiveAlertSource> =
+            Arc::new(FiringAlerts(vec![firing("k")]));
+        let config = SignalWatcherConfig::default();
+        let readings = SignalWatcherReadings::new();
+        let mut state = SignalGuardState::default();
+        let mut dirty = false;
+
+        take_alerts_in(
+            &orch,
+            &config,
+            &source,
+            &[],
+            &mut state,
+            &mut dirty,
+            Utc::now(),
+            &readings,
+            false,
+        )
+        .await;
+
+        let filed: Vec<String> = orch
+            .get_all_tasks()
+            .await
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            filed,
+            vec![alert_task_id("k")],
+            "held-off rounds are the ones that have to file: the row is the only record"
+        );
+        assert!(
+            dirty,
+            "the report clock has to be written for the row to hold"
+        );
+        assert!(
+            state.reported.contains_key(&alert_signal_key("k")),
+            "a filed alert has to spend its report clock, or the next round files it again"
+        );
+    }
+
+    /// A row that already failed is left alone while the pool is closed, and
+    /// driven again on the first round after it opens.
+    ///
+    /// Both halves matter. Without the hold, every round of an outage re-drives
+    /// every failed alert into a refusing 503 -- the pulse the gate exists to
+    /// stop. Without the second half the alert would be in hand forever: a round
+    /// that never drives a failed row again is a work chain that reports progress
+    /// it does not make.
+    #[test]
+    fn a_failed_alert_row_is_driven_only_when_there_is_a_pool_to_drive_it() {
+        let alerts = vec![firing("k")];
+        let tasks = vec![alert_row("k", TaskStatus::Failed, None)];
+        let now = Utc::now();
+
+        let closed = select_alerts(
+            &alerts,
+            &tasks,
+            &SignalGuardState::default(),
+            5,
+            86400,
+            now,
+            false,
+        );
+        assert!(
+            closed.selected.is_empty(),
+            "a closed pool re-drove a failed row: {:?}",
+            closed.selected
+        );
+        assert_eq!(closed.in_hand, 1);
+
+        let open = select_alerts(
+            &alerts,
+            &tasks,
+            &SignalGuardState::default(),
+            5,
+            86400,
+            now,
+            true,
+        );
+        assert_eq!(
+            open.selected.len(),
+            1,
+            "an open pool has to drive the failure"
         );
     }
 
@@ -1662,7 +1996,7 @@ mod tests {
         state.reported.insert("alert:new1".into(), now);
         state.reported.insert("alert:new2".into(), now);
 
-        let picked = select_alerts(&alerts, &[], &state, 1, 86400, now);
+        let picked = select_alerts(&alerts, &[], &state, 1, 86400, now, true);
         assert_eq!(picked.selected.len(), 1);
         assert_eq!(
             picked.selected[0].dedup_key, "old",
@@ -1679,7 +2013,15 @@ mod tests {
     fn the_cap_still_bounds_how_many_alerts_one_tick_acts_on() {
         let now = Utc::now();
         let alerts = vec![firing("a"), firing("b"), firing("c")];
-        let picked = select_alerts(&alerts, &[], &SignalGuardState::default(), 2, 86400, now);
+        let picked = select_alerts(
+            &alerts,
+            &[],
+            &SignalGuardState::default(),
+            2,
+            86400,
+            now,
+            true,
+        );
         assert_eq!(
             picked
                 .selected
@@ -1771,7 +2113,7 @@ mod tests {
         // wide open against this round.
         state.reported.insert("alert:k".into(), now);
 
-        let picked = select_alerts(&alerts, &tasks, &state, 5, 86400, now);
+        let picked = select_alerts(&alerts, &tasks, &state, 5, 86400, now, true);
         assert_eq!(
             picked
                 .selected
@@ -1798,7 +2140,7 @@ mod tests {
         let mut state = SignalGuardState::default();
         state.reported.insert("alert:k".into(), now);
 
-        let picked = select_alerts(&alerts, &tasks, &state, 5, 86400, now);
+        let picked = select_alerts(&alerts, &tasks, &state, 5, 86400, now, true);
         assert_eq!(
             picked.selected.len(),
             1,
@@ -1818,7 +2160,7 @@ mod tests {
         let mut state = SignalGuardState::default();
         state.reported.insert("alert:k".into(), now);
 
-        let picked = select_alerts(&alerts, &tasks, &state, 5, 86400, now);
+        let picked = select_alerts(&alerts, &tasks, &state, 5, 86400, now, true);
         assert!(picked.selected.is_empty(), "在跑的尝试不该被再投一次");
         assert_eq!(picked.in_hand, 1);
         assert_eq!(
@@ -1847,7 +2189,7 @@ mod tests {
             now - chrono::Duration::seconds(2 * 86_400),
         );
 
-        let picked = select_alerts(&alerts, &[task], &state, 5, 86400, now);
+        let picked = select_alerts(&alerts, &[task], &state, 5, 86400, now, true);
         assert!(
             picked.selected.is_empty(),
             "刚落地一笔产出的信号不是在重复报告，不该立刻再开一轮"
@@ -1873,6 +2215,7 @@ mod tests {
             5,
             86400,
             now,
+            true,
         );
         assert_eq!(picked.selected.len(), 1);
         assert_eq!(picked.in_cooldown, 0);
@@ -1887,7 +2230,15 @@ mod tests {
         let alerts = vec![firing("announced"), firing("broken")];
         let tasks = vec![alert_row("broken", TaskStatus::Failed, None)];
 
-        let picked = select_alerts(&alerts, &tasks, &SignalGuardState::default(), 1, 86400, now);
+        let picked = select_alerts(
+            &alerts,
+            &tasks,
+            &SignalGuardState::default(),
+            1,
+            86400,
+            now,
+            true,
+        );
         assert_eq!(
             picked
                 .selected
@@ -2108,18 +2459,25 @@ mod tests {
             .expect("the second round never ran");
     }
 
-    /// A held-off round is a round: it moves the denominator and counts one
-    /// stood-down round, and it counts no signal. A pause has to be readable as
-    /// itself -- the tick alone would leave it looking like the quiet system the
-    /// gate was added to tell it apart from, and freezing the tick would leave
-    /// it looking like a loop that died.
+    /// A held-off round stamps one tick and counts one stood-down round, and it
+    /// counts neither twice.
+    ///
+    /// The round stamps itself, because a held-off round is not an empty one --
+    /// it still takes the alerts in -- so the stand-down count must add only the
+    /// second series. A pause has to be readable as itself: the tick alone would
+    /// leave it looking like the quiet system the gate was added to tell it
+    /// apart from, freezing the tick would leave it looking like a loop that
+    /// died, and stamping it here as well as in the round would halve every rate
+    /// computed against it.
     #[tokio::test]
-    async fn a_held_off_round_ticks_without_counting_a_signal() {
+    async fn a_held_off_round_is_stamped_once_and_counted_as_stood_down() {
         let readings = SignalWatcherReadings::new();
         readings.mark_running();
 
-        stand_down(&readings);
-        stand_down(&readings);
+        for _ in 0..2 {
+            readings.tick();
+            readings.held_round();
+        }
 
         use cog_core::Observable;
         let metrics = readings.collect_metrics("").await.unwrap();
@@ -2132,12 +2490,6 @@ mod tests {
         };
         assert_eq!(value(crate::signal_readings::SIGNAL_TICKS_METRIC), 2.0);
         assert_eq!(value(crate::signal_readings::SIGNAL_HELD_METRIC), 2.0);
-        let signals: f64 = metrics
-            .iter()
-            .filter(|m| m.name == crate::signal_readings::SIGNAL_OUTCOMES_METRIC)
-            .map(|m| m.value)
-            .sum();
-        assert_eq!(signals, 0.0, "a held-off round counted a signal");
     }
 
     fn judgement(subject: &str, preferred: &str) -> cog_core::TasteIntent {
