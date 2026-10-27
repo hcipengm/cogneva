@@ -24,7 +24,9 @@
 //!
 //! * every `outcome` / `status` word the client compares against is either a
 //!   word the server writes at a named site, or a word the client writes itself
-//!   (registered with the reason);
+//!   (registered with the reason). A negated comparison (`!==`) names the same
+//!   word and is read the same way — swapping the arms does not take the word
+//!   off the wire;
 //! * each registered pair still exists on both sides: the server site still
 //!   writes the word, and the client still compares it.
 //!
@@ -40,7 +42,10 @@
 //! * fields outside the two named above (`kind`, `phase`, `type`, `code`).
 //!   `type` is the event gate's; `kind` and `phase` are mostly the client's own
 //!   union types; `code` on a change row carries git's porcelain letters
-//!   forwarded verbatim, which are not this tree's words to hold.
+//!   forwarded verbatim, which are not this tree's words to hold;
+//! * arms inside a `switch`/`case`. The subject of the switch is not on the
+//!   case line, so pairing it with a word would mean following a variable
+//!   through the function — a parser this gate does not have.
 
 use std::path::{Path, PathBuf};
 
@@ -133,6 +138,13 @@ const SERVER_WORDS: &[ServerWord] = &[
     },
     ServerWord {
         field: "status",
+        word: "PASS",
+        client_file: "web/src/store/streamStore.ts",
+        server_file: "crates/cog-core/src/types/event.rs",
+        server_needle: "pub const SELF_REVIEW_STATUS_PASS: &str = \"PASS\";",
+    },
+    ServerWord {
+        field: "status",
         word: "up",
         client_file: "web/src/observability/ProbesBoard.tsx",
         server_file: "crates/cog-gateway/src/backend_health.rs",
@@ -159,6 +171,7 @@ const CLIENT_ONLY: &[(&str, &str, &str)] = &[
     ("status", "running", "工具调用的行内状态，面板自己写自己读"),
     ("status", "sending", "对话气泡的发送状态，客户端自己写"),
     ("status", "streaming", "对话气泡的流式状态，客户端自己写"),
+    ("status", "done", "对话气泡收尾后的状态，客户端自己写自己读"),
 ];
 
 fn read(path: &Path) -> String {
@@ -212,12 +225,14 @@ fn comparisons(source: &str) -> Vec<(String, String)> {
                     continue;
                 }
                 let rest = line[end..].trim_start();
-                let rest = match rest.strip_prefix("===") {
-                    Some(r) => r,
-                    None => match rest.strip_prefix("==") {
-                        Some(r) => r,
-                        None => continue,
-                    },
+                // `!==` is the same branch with the arms swapped — the word is
+                // still on the wire and still has to exist. `!=` last of all so
+                // it cannot shadow `!==`.
+                let rest = ["===", "!==", "==", "!="]
+                    .iter()
+                    .find_map(|op| rest.strip_prefix(op));
+                let Some(rest) = rest else {
+                    continue;
                 };
                 let rest = rest.trim_start();
                 let Some(quote) = rest.chars().next().filter(|c| *c == '\'' || *c == '"') else {
@@ -416,6 +431,7 @@ fn the_comparison_reader_sees_words_and_skips_type_checks() {
     let found = comparisons(
         "a.outcome === 'timed_out'\n\
          b.status == \"hook_event\"\n\
+         failed: p.status !== 'PASS'\n\
          typeof p.status === 'string'\n\
          const s = typeof status === 'string' ? status : '';\n\
          // c.status === 'commented_out'\n\
@@ -427,6 +443,7 @@ fn the_comparison_reader_sees_words_and_skips_type_checks() {
         vec![
             ("outcome".to_string(), "timed_out".to_string()),
             ("status".to_string(), "hook_event".to_string()),
+            ("status".to_string(), "PASS".to_string()),
         ]
     );
 }

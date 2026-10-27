@@ -261,7 +261,7 @@ impl LearningDetector for DefaultLearningDetector {
 
         let mut learnings = Vec::new();
 
-        if status == "NEED_REVISION" {
+        if status == cog_core::SELF_REVIEW_STATUS_NEED_REVISION {
             if let Some(critique_text) = critique {
                 learnings.push(Learning::new(
                     LearningCategory::Insight,

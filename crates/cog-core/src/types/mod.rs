@@ -17,6 +17,7 @@ pub use envelope::{
 };
 pub use event::{
     AgentEvent, AssistantMessageEvent, ErrorSeverity, StopReason, StreamEvent, TaskEvent,
+    SELF_REVIEW_STATUS_NEED_REVISION, SELF_REVIEW_STATUS_PASS,
 };
 pub use inbox::{agent_inbox_stream, InboxMessage};
 pub use message::{

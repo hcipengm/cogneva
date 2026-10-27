@@ -235,6 +235,17 @@ fn block_at(
     &mut content[index]
 }
 
+/// The two words a [`AgentEvent::SelfReview`]'s `status` carries.
+///
+/// A reader that decides "a review that did not pass" or "a review asking for
+/// another round" has to spell one of these, and the words are compared by
+/// string on both sides of a process boundary — the evolution detector in Rust
+/// and the console panel in TypeScript. Declaring them here gives every reader
+/// one place to point at; a word kept in two files drifts silently, and the
+/// reading of a drifted comparison is "no reviews are failing" either way.
+pub const SELF_REVIEW_STATUS_PASS: &str = "PASS";
+pub const SELF_REVIEW_STATUS_NEED_REVISION: &str = "NEED_REVISION";
+
 /// Agent lifecycle event protocol (semantic layer).
 /// Built on top of AssistantMessageEvent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -359,7 +370,8 @@ pub enum AgentEvent {
     /// Self-review completed.
     SelfReview {
         agent_id: String,
-        status: String, // "PASS" | "NEED_REVISION"
+        /// [`SELF_REVIEW_STATUS_PASS`] or [`SELF_REVIEW_STATUS_NEED_REVISION`].
+        status: String,
         score: f32,
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
