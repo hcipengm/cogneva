@@ -34,7 +34,15 @@ pub enum SFError {
     /// [`Self::Upstream`] exists beside [`Self::LLM`] — because the two call for
     /// opposite responses: a failure may be worth another attempt, a refusal is
     /// worth re-planning around or reporting as the blocker.
-    #[error("guardrail_blocked: Guardrail blocked tool '{tool}': {reason} (rule: {rule})")]
+    /// The text starts with [`crate::contract::outcome::GUARDRAIL_BLOCKED_PREFIX`]
+    /// rather than with a copy of it: the dispatch layer drops the type at this
+    /// hop and decides "retry or not" by reading that prefix back out of the
+    /// text, so a wording that only one of the two copies follows turns a
+    /// refusal into a paid retry.
+    #[error(
+        "{}: Guardrail blocked tool '{tool}': {reason} (rule: {rule})",
+        crate::contract::outcome::GUARDRAIL_BLOCKED_PREFIX
+    )]
     Blocked {
         tool: String,
         reason: String,
@@ -383,6 +391,35 @@ mod tests {
             !crate::contract::outcome::is_deterministic_failure(&flattened.to_string()),
             "套上终止性标记之后仍要按它自报的类型判定：server error 是环境自己会清掉的，\
              保留重试"
+        );
+    }
+
+    /// 拒绝写进 reason 的那一跳：「是不是重试」由 `is_deterministic_failure`
+    /// 读前缀判定。前缀声明在 `contract::outcome`，而写它的地方是这个变体的
+    /// Display —— 两处各写一遍时，改一处另一处照旧编译：拒绝会被当成可重试的
+    /// 故障再买一次同样的答复，而且没有任何地方报错。
+    ///
+    /// 消融对照：把 Display 的 `{}` 换回写死的 `"guardrail_blocked"`，这条仍绿
+    /// （值相同）；把声明改成 `policy_refused`，这条红并点名前缀。
+    #[test]
+    fn a_refusals_text_declares_the_marker_the_retry_judgement_reads() {
+        use crate::contract::outcome::{
+            declares, is_deterministic_failure, GUARDRAIL_BLOCKED_PREFIX,
+        };
+        let refused = SFError::Blocked {
+            tool: "shell".into(),
+            reason: "no network".into(),
+            rule: "sandbox.network".into(),
+        };
+        let flattened = SFError::Agent(format!("Agent execution error: {refused}"));
+        assert!(
+            declares(&flattened.to_string(), GUARDRAIL_BLOCKED_PREFIX),
+            "拒绝的文本没有带声明的前缀 {GUARDRAIL_BLOCKED_PREFIX:?}：{:?}",
+            flattened.to_string()
+        );
+        assert!(
+            is_deterministic_failure(&flattened.to_string()),
+            "同一条规则再拒一次也是同一个答复，这条不能被排进重试"
         );
     }
 

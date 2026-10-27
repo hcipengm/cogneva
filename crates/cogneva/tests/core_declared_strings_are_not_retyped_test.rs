@@ -127,15 +127,24 @@ fn structural(value: &str) -> bool {
             .any(|c| matches!(c, '/' | ':' | '.' | '_' | '-'))
 }
 
+/// One `pub const NAME: &str = "value"` in the contract crate, with the file
+/// that writes it.
+struct Declaration {
+    file: String,
+    name: String,
+    value: String,
+}
+
 /// The `pub const NAME: &str = "value"` declarations in the contract crate.
-fn declared(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
+fn declarations(root: &Path) -> Vec<Declaration> {
     let mut files = Vec::new();
     walk(&root.join(DECLARATION_DIR), &mut files);
     files.sort();
-    let mut values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut out = Vec::new();
     for path in files {
         let text =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let file = relative(root, &path);
         for line in text.lines() {
             let Some(at) = line.find("pub const ") else {
                 continue;
@@ -153,17 +162,119 @@ fn declared(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
             let Some(end) = tail[start + 1..].find('"') else {
                 continue;
             };
-            let value = &tail[start + 1..start + 1 + end];
-            if !structural(value) {
-                continue;
-            }
-            values
-                .entry(value.to_string())
-                .or_default()
-                .insert(name.trim().to_string());
+            out.push(Declaration {
+                file: file.clone(),
+                name: name.trim().to_string(),
+                value: tail[start + 1..start + 1 + end].to_string(),
+            });
         }
     }
+    out
+}
+
+/// The declared values, under every name they are declared as.
+fn declared(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
+    let mut values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for declaration in declarations(root) {
+        if !structural(&declaration.value) {
+            continue;
+        }
+        values
+            .entry(declaration.value)
+            .or_default()
+            .insert(declaration.name);
+    }
     values
+}
+
+/// A name that declares an in-band marker: a wire word a producer *prepends* to
+/// a reason rather than one it writes on its own.
+///
+/// These need their own census. The one above looks for the value as a whole
+/// literal, which is the right question for a route or a label; a marker at its
+/// producer is always followed by the explanation it labels, so a producer that
+/// retyped it never shows up there.
+fn marker_name(name: &str) -> bool {
+    name.ends_with("_PREFIX") || name.ends_with("_MARKER")
+}
+
+/// The string literals on a line, without their quotes.
+fn literals(line: &str) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        while j < bytes.len() && bytes[j] != b'"' {
+            if bytes[j] == b'\\' {
+                j += 1;
+            }
+            j += 1;
+        }
+        let end = j.min(bytes.len());
+        out.push(&line[start..end]);
+        i = end + 1;
+    }
+    out
+}
+
+/// Lines that write a declared marker as the head of a literal of their own.
+///
+/// The declaring file itself is skipped -- it is where the value is supposed to
+/// be written -- but the rest of the declaration crate is not: a marker
+/// declared in the contract module is still retyped when the error that carries
+/// it spells the word again.
+fn marker_hits(root: &Path) -> Vec<Hit> {
+    let markers: Vec<(String, String)> = declarations(root)
+        .into_iter()
+        .filter(|declaration| marker_name(&declaration.name) && structural(&declaration.value))
+        .map(|declaration| (declaration.file, declaration.value))
+        .collect();
+    let mut crates: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
+        .expect("crates/ 不在仓库里")
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    crates.sort();
+    let mut hits = Vec::new();
+    for krate in crates {
+        let src = krate.join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        files.sort();
+        for path in files {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let file = relative(root, &path);
+            for line in production_lines(&text) {
+                let written = literals(line);
+                for (declared_in, marker) in &markers {
+                    if &file == declared_in {
+                        continue;
+                    }
+                    if written
+                        .iter()
+                        .any(|literal| literal.starts_with(marker.as_str()))
+                    {
+                        hits.push(Hit {
+                            file: file.clone(),
+                            value: marker.clone(),
+                            line: line.trim().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    hits
 }
 
 /// One line's retyped value, if it spells one as a whole string literal.
@@ -253,6 +364,41 @@ fn every_shared_string_is_spelled_in_the_place_it_is_declared() {
     );
 }
 
+/// 带内标记是**拼在解释前面**发出去的那个词：`"terminal_env_failure: 没有产物"`。
+/// 上一条判据按整字面量比对，天然看不见这种形状——重写过标记的生产者在那条判据
+/// 下与被改写之前完全一样。这一条按「字面量以声明开头」比对，并且把声明所在的
+/// crate 也算进来，只跳过写出这条声明的那个文件：`SFError::Blocked` 的 Display
+/// 就在同一个 crate 的另一个文件里，它写的正是 `is_deterministic_failure` 要读
+/// 的那个前缀，两处各自写死时谁都不会报错。
+#[test]
+fn every_in_band_marker_is_written_from_its_declaration() {
+    let root = repo_root();
+    let known: Vec<String> = declarations(&root)
+        .into_iter()
+        .filter(|declaration| marker_name(&declaration.name) && structural(&declaration.value))
+        .map(|declaration| declaration.value)
+        .collect();
+    assert!(
+        known.len() >= 4,
+        "只读出 {known:?} 这几个带内标记；这么少说明读声明的解析变了，不是树变干净了"
+    );
+
+    let hits = marker_hits(&root);
+    let unexpected: Vec<&Hit> = hits.iter().filter(|hit| exempted(hit).is_none()).collect();
+    assert!(
+        unexpected.is_empty(),
+        "这些地方把带内标记写成了一个字面量的开头。生产者与读取者各写一遍时，\
+         改一处另一处照旧编译：拒绝被当成可重试的故障、终止性失败被排进重试，\
+         两种都读作「什么都没有失败」。要么用声明拼出这条文本，要么在 EXEMPT 里\
+         写清为什么这里的同一个拼写指的是另一件事：\n{}",
+        unexpected
+            .iter()
+            .map(|hit| format!("  {}: {}  <- {}", hit.file, hit.value, hit.line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 #[test]
 fn an_exemption_that_no_longer_matches_a_site_is_stale() {
     let root = repo_root();
@@ -322,4 +468,15 @@ mod tests { fn t() -> &'static str { \"/api/v1/things\" } }
     assert!(structural("/api/v1/things"));
     assert!(!structural("agent"));
     assert!(!structural("/v1/x"));
+}
+
+/// 对照：字面量扫描器确实读得出引号之间的文本。少了这条，`literals` 哪天退化
+/// 成「什么都读不出来」，带内标记那条判据仍然全绿。
+#[test]
+fn the_literal_scanner_reads_the_text_between_quotes() {
+    assert_eq!(literals(r#"let s = "marker: why";"#), vec!["marker: why"]);
+    assert_eq!(literals(r#"let s = "a\"b";"#), vec![r#"a\"b"#]);
+    assert_eq!(literals(r#"let s = r"raw";"#), vec!["raw"]);
+    assert!(literals("let s = 1;").is_empty());
+    assert!(literals(r#"let s = "marker: why";"#)[0].starts_with("marker"));
 }
