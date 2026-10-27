@@ -123,9 +123,14 @@ metadata:
   labels:
     app.kubernetes.io/name: cogneva
     app.kubernetes.io/component: gateway
+# 谁跑这份镜像的默认入口，谁就端着这一面。进化进程与网关是同一个二进制、同一套路由，
+# 它同样答 `/api/v1/cluster/topology`，读不到就在屏上画空白。
 subjects:
   - kind: ServiceAccount
     name: cogneva
+    namespace: cogneva
+  - kind: ServiceAccount
+    name: cogneva-evolution
     namespace: cogneva
 roleRef:
   kind: ClusterRole

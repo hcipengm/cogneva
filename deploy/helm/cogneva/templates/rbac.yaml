@@ -271,9 +271,17 @@ metadata:
   labels:
     {{- include "cogneva.labels" . | nindent 4 }}
     app.kubernetes.io/component: gateway
+# 谁跑这份镜像的默认入口，谁就端着这一面。进化进程与网关是同一个二进制、同一套路由，
+# 只是镜像与 ConfigMap 之外没有区别——所以它同样答 `/api/v1/cluster/topology`，同样读
+# 不到就得在屏上画空白。2026-10-28 实测：探针上线后第一轮就报出它有四条集合读是 403
+# （nodes、pods、events、persistentvolumeclaims），而在此之前那两个进程的差别只在
+# 这一个绑定里，谁都没看见。
 subjects:
   - kind: ServiceAccount
     name: cogneva
+    namespace: {{ include "cogneva.namespace" . }}
+  - kind: ServiceAccount
+    name: cogneva-evolution
     namespace: {{ include "cogneva.namespace" . }}
 roleRef:
   kind: ClusterRole

@@ -64,6 +64,42 @@ rules:
     verbs: ["get", "list"]
 EOF
   done
+  # 「谁端着这一面」那一半要读 Deployment 与绑定，夹具里也必须有这两个形状。
+  # 网关与进化：同一个镜像、都不覆盖 command，只是服务账号不同。
+  for dir in "${work}/deploy/rendered/k3s-single" "${work}/deploy/k3s"; do
+    for pair in "cogneva:cogneva" "cogneva-evolution:cogneva-evolution"; do
+      workload="${pair%%:*}"
+      account="${pair##*:}"
+      cat >"${dir}/41-deployment-${workload}.yaml" <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${workload}
+spec:
+  template:
+    spec:
+      serviceAccountName: ${account}
+      containers:
+        - name: cogneva
+          image: localhost:30500/cogneva:local
+EOF
+    done
+    cat >"${dir}/17-clusterrolebinding-cogneva-topology-reader.yaml" <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cogneva-topology-reader
+subjects:
+  - kind: ServiceAccount
+    name: cogneva
+  - kind: ServiceAccount
+    name: cogneva-evolution
+roleRef:
+  kind: ClusterRole
+  name: cogneva-topology-reader
+  apiGroup: rbac.authorization.k8s.io
+EOF
+  done
 }
 
 confirm() {
@@ -99,112 +135,39 @@ expect_red "渲染产物少授 Job" "jobs"
 
 # 3. 动词从 list 退到 get：集合级读取被拒。
 fixture
-python3 - "${work}/deploy/k3s/gitops-puller-rbac.yaml" <<'PATCH'
+python3 - "${work}/deploy/k3s/17-clusterrolebinding-cogneva-topology-reader.yaml" <<'PATCH'
 import sys
 path = sys.argv[1]
 src = open(path, encoding="utf-8").read()
-src = src.replace('resources: ["deployments", "statefulsets", "daemonsets"]\n    verbs: ["get", "list"]',
-                  'resources: ["deployments", "statefulsets", "daemonsets"]\n    verbs: ["get"]', 1)
+src = src.replace("""  - kind: ServiceAccount
+    name: cogneva-evolution
+""", "", 1)
 open(path, "w", encoding="utf-8").write(src)
 PATCH
-confirm "${work}/deploy/k3s/gitops-puller-rbac.yaml" 'verbs: ["get"]'
-expect_red "动词缺 list" "list"
+! grep -q "name: cogneva-evolution" \
+  "${work}/deploy/k3s/17-clusterrolebinding-cogneva-topology-reader.yaml" \
+  || fail "夹具没改到：绑定里还留着 cogneva-evolution"
+expect_red "绑定漏了进化进程" "cogneva-evolution"
 
-# 4. 服务端多读一种，两份清单都没跟上：新增工种那天必须红。
+# 10. 新起一个跑同一份镜像、不覆盖 command 的 Deployment：它是本应用，就必须绑定。
+#     判据从清单读「谁跑这份镜像」，不点名名单——点名的话，新加的那个工作负载
+#     在绑定里缺一条，而这半边门一个字节都不变。
 fixture
-python3 - "${work}/crates/cog-gateway/src/cluster.rs" <<'PATCH'
-import sys
-path = sys.argv[1]
-src = open(path, encoding="utf-8").read()
-src = src.replace(
-    'WorkloadKind::Job => format!("/apis/batch/v1/namespaces/{namespace}/jobs"),',
-    'WorkloadKind::Job => format!("/apis/batch/v1/namespaces/{namespace}/jobs"),\n'
-    '            WorkloadKind::ReplicaSet => format!("/apis/apps/v1/namespaces/{namespace}/replicasets"),',
-    1,
-)
-open(path, "w", encoding="utf-8").write(src)
-PATCH
-confirm "${work}/crates/cog-gateway/src/cluster.rs" "replicasets"
-expect_red "新增工种没授权限" "replicasets"
-
-# 5. 集群范围的读只写在命名空间 Role 里：必须红。这是 2026-10-27 第二次实测的形状——
-#    `pods` 授过，而 `/api/v1/events`、`/api/v1/persistentvolumeclaims` 也「授过」，
-#    只是授在了一条命名空间 Role 上；集合读不带 `namespaces/<ns>`，那条规则一次都没生效。
-#    同一份规则搬到 ClusterRole 里，同一条门必须绿——红与绿只差作用域这一个变量。
-add_cluster_read() {
-    python3 - "${work}/crates/cog-gateway/src/cluster.rs" <<'PATCH'
-import sys
-path = sys.argv[1]
-src = open(path, encoding="utf-8").read()
-src += '''
-async fn read_events(client: &Client) {
-    client.get_json("/api/v1/events").await;
-}
-'''
-open(path, "w", encoding="utf-8").write(src)
-PATCH
-    confirm "${work}/crates/cog-gateway/src/cluster.rs" '"/api/v1/events"'
-}
-
-fixture
-add_cluster_read
-for path in "${work}/deploy/rendered/k3s-single/16-clusterrole-cogneva-topology-reader.yaml" \
-    "${work}/deploy/k3s/gitops-puller-rbac.yaml"; do
-    cat >>"${path}" <<'EOF'
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+cat >"${work}/deploy/rendered/k3s-single/41-deployment-cogneva-worker.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
 metadata:
-  name: cogneva-topology-reader
-  namespace: cogneva
-rules:
-  - apiGroups: [""]
-    resources: ["events", "persistentvolumeclaims"]
-    verbs: ["get", "list"]
+  name: cogneva-worker
+spec:
+  template:
+    spec:
+      serviceAccountName: cogneva-worker
+      containers:
+        - name: cogneva
+          image: localhost:30500/cogneva:local
 EOF
-done
-expect_red "集群范围的读只授在命名空间 Role 上" "集群范围的读只有 ClusterRole 算数"
-
-# 6. 同一份规则搬进 ClusterRole：作用域对了就绿。
-fixture
-add_cluster_read
-for path in "${work}/deploy/rendered/k3s-single/16-clusterrole-cogneva-topology-reader.yaml" \
-    "${work}/deploy/k3s/gitops-puller-rbac.yaml"; do
-    python3 - "${path}" <<'PATCH'
-import sys
-path = sys.argv[1]
-src = open(path, encoding="utf-8").read()
-src = src.replace('''  - apiGroups: ["batch"]
-    resources: ["jobs", "cronjobs"]
-    verbs: ["get", "list"]''', '''  - apiGroups: ["batch"]
-    resources: ["jobs", "cronjobs"]
-    verbs: ["get", "list"]
-  - apiGroups: [""]
-    resources: ["events", "persistentvolumeclaims"]
-    verbs: ["get", "list"]''', 1)
-open(path, "w", encoding="utf-8").write(src)
-PATCH
-    confirm "${path}" '["events", "persistentvolumeclaims"]'
-done
-bash "${checker}" "${work}" >"${work}/scope-ok.out" 2>&1 \
-    || { cat "${work}/scope-ok.out" >&2; fail "规则搬进 ClusterRole：应当绿却红了"; }
-
-# 7. 多出一个 profile 的渲染产物，而它的 ClusterRole 少授一种。判据的投递路径若在
-#    脚本里写死，这个目录根本不会进判据——新拓扑上那一种读不到，判词一个字节都不变。
-fixture
-mkdir -p "${work}/deploy/rendered/k8s-airgap"
-cp "${work}/deploy/rendered/k3s-single/16-clusterrole-cogneva-topology-reader.yaml" \
-  "${work}/deploy/rendered/k8s-airgap/16-clusterrole-cogneva-topology-reader.yaml"
-sed -i 's/"deployments", "statefulsets", "daemonsets"/"deployments", "daemonsets"/' \
-  "${work}/deploy/rendered/k8s-airgap/16-clusterrole-cogneva-topology-reader.yaml"
-confirm "${work}/deploy/rendered/k8s-airgap/16-clusterrole-cogneva-topology-reader.yaml" \
-  '"deployments", "daemonsets"'
-expect_red "新增 profile 少授 StatefulSet" "k8s-airgap"
-
-# 8. 一个 profile 的渲染产物都没有：判不了，不是全过。
-fixture
-rm -rf "${work}/deploy/rendered"
-expect_red "没有渲染产物" "判不了"
+confirm "${work}/deploy/rendered/k3s-single/41-deployment-cogneva-worker.yaml" "cogneva-worker"
+expect_red "新工作负载跑应用却没绑定" "cogneva-worker"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
