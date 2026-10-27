@@ -51,6 +51,7 @@ HOOK = "hooks/useAuth.ts"
 APP = "App.tsx"
 TRANSPORT_HOOK = "hooks/useEventStream.ts"
 LIFECYCLE = "auth/tokenLifecycle.ts"
+SESSION = "auth/session.ts"
 LANDING = "crates/cog-gateway/src/auth/platform.rs"
 REFRESH_KEY = "cogneva_refresh_token"
 
@@ -124,8 +125,16 @@ if re.search(r"^\s*import\b", open(lifecycle, encoding="utf-8").read(), re.M):
     sys.exit(f"{LIFECYCLE} 有 import：它必须能单文件编译，否则下面这几条判据跑不起来")
 
 # ── 6. 两条登录入口都要交出续期凭据 ──
-if REFRESH_KEY not in hook:
-    sys.exit(f"{HOOK} 里没有 {REFRESH_KEY}：前端存的键与落地页写的键对不上就是两条路各走各的")
+# 键只在一个地方声明：网页端是 `auth/session.ts`，落地页是它自己那段脚本开头的
+# 常量。两处各写一份字面量时，改名只改得到一处，而读写对不上是静默的。
+session = read(SESSION)
+if f"REFRESH_KEY = '{REFRESH_KEY}'" not in session:
+    sys.exit(f"{SESSION} 里没有 `REFRESH_KEY = '{REFRESH_KEY}'`：前端存的键与落地页写的键对不上就是两条路各走各的")
+if f"'{REFRESH_KEY}'" in hook:
+    sys.exit(
+        f"{HOOK} 里又写了一份 {REFRESH_KEY} 的字面量：键在 {SESSION} 声明一次就够，"
+        "第二份声明改名时不会被任何东西发现"
+    )
 landing_path = os.path.join(ROOT, LANDING)
 if not os.path.isfile(landing_path):
     sys.exit(f"读不到 {LANDING}")
@@ -135,7 +144,13 @@ landing = open(landing_path, encoding="utf-8").read()
 render = re.search(r"fn login_landing_page\b[\s\S]*?\n}\n", landing)
 if not render:
     sys.exit(f"{LANDING} 里找不到 login_landing_page：落地页写了什么无从问起")
-if f"localStorage.setItem('{REFRESH_KEY}', d.auth.refresh_token)" not in render.group(0):
+body = render.group(0)
+if f"REFRESH_KEY = '{REFRESH_KEY}'" not in body:
+    sys.exit(
+        f"{LANDING} 的登录落地页没有把续期键声明成常量：网页端按 `REFRESH_KEY` 读，"
+        "两边取值不同时落地页写下的凭据没有人读得回来"
+    )
+if "localStorage.setItem(REFRESH_KEY, d.auth.refresh_token)" not in body:
     sys.exit(
         f"{LANDING} 的登录落地页只写访问令牌：从 OAuth 回调进来的会话没有续期凭据，"
         "15 分钟后只能被登出"

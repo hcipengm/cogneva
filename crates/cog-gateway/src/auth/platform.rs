@@ -518,9 +518,10 @@ fn login_landing_page(payload: &serde_json::Value) -> Html<String> {
          h1{{font-size:18px;margin:0 0 10px;color:#3fb950}}p{{font-size:13px;color:#8b949e;line-height:1.7;margin:0}}</style></head>\
          <body><div class=\"card\"><h1>登录成功</h1><p>正在回到 Cogneva…</p></div>\
          <script>try {{ const d = {data}; \
-         localStorage.setItem('cogneva_token', d.auth.access_token); \
-         if (d.auth.refresh_token) {{ localStorage.setItem('cogneva_refresh_token', d.auth.refresh_token); }} \
-         localStorage.setItem('cogneva_user', JSON.stringify(d.auth.user)); \
+         const TOKEN_KEY = 'cogneva_token', REFRESH_KEY = 'cogneva_refresh_token', USER_KEY = 'cogneva_user'; \
+         localStorage.setItem(TOKEN_KEY, d.auth.access_token); \
+         if (d.auth.refresh_token) {{ localStorage.setItem(REFRESH_KEY, d.auth.refresh_token); }} \
+         localStorage.setItem(USER_KEY, JSON.stringify(d.auth.user)); \
          if (window.opener) {{ window.opener.postMessage({{ type: 'cogneva-login', data: d }}, location.origin); window.close(); }} \
          else {{ window.location.href = '/'; }} }} catch (e) {{ document.querySelector('p').textContent = '登录状态写入失败：' + e; }}</script>\
          </body></html>"
@@ -645,9 +646,21 @@ mod tests {
             "account_created": false,
         }))
         .0;
-        assert!(html.contains("localStorage.setItem('cogneva_token', d.auth.access_token)"));
+        // 键在这一页里声明一次，再按名字用：写死的字面量在调用点上出现过三次，
+        // 改掉其中一处不会有任何东西报错。
         assert!(
-            html.contains("localStorage.setItem('cogneva_refresh_token', d.auth.refresh_token)"),
+            html.contains("const TOKEN_KEY = 'cogneva_token'"),
+            "落地页没有把存储键声明成常量：网页端的 `web/src/auth/session.ts` 认的是这个名字与取值"
+        );
+        assert!(
+            html.contains(
+                "const TOKEN_KEY = 'cogneva_token', REFRESH_KEY = 'cogneva_refresh_token'"
+            ),
+            "落地页的续期凭据键不见了"
+        );
+        assert!(html.contains("localStorage.setItem(TOKEN_KEY, d.auth.access_token)"));
+        assert!(
+            html.contains("localStorage.setItem(REFRESH_KEY, d.auth.refresh_token)"),
             "落地页只交出访问令牌：从这条入口进来的会话 15 分钟后没有可续期的凭据，界面只能停在一格都读不到的壳上"
         );
     }

@@ -1011,8 +1011,8 @@
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
-const TOKEN_KEY = 'cogneva_admin_token';
-$('token').value = localStorage.getItem(TOKEN_KEY) || '';
+const ADMIN_TOKEN_KEY = 'cogneva_admin_token';
+$('token').value = localStorage.getItem(ADMIN_TOKEN_KEY) || '';
 
 const changeRows = new Map();
 const expanded = new Set();
@@ -2719,7 +2719,7 @@ function refreshAll() {
 }
 
 $('saveToken').onclick = () => {
-  localStorage.setItem(TOKEN_KEY, $('token').value.trim());
+  localStorage.setItem(ADMIN_TOKEN_KEY, $('token').value.trim());
   toast(t('tokenSaved'), 'ok');
   refreshAll();
   connectStream();
@@ -2743,7 +2743,7 @@ async function doLogin(username, password) {
   const d = await r.json().catch(() => ({}));
   if (!r.ok || !d.access_token) return false;
   $('token').value = d.access_token;
-  localStorage.setItem(TOKEN_KEY, d.access_token);
+  localStorage.setItem(ADMIN_TOKEN_KEY, d.access_token);
   return true;
 }
 
@@ -2769,7 +2769,7 @@ async function reauth() {
   if (reauthing) return;
   reauthing = true;
   try {
-    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(ADMIN_TOKEN_KEY);
     $('token').value = '';
     if (!(await ensureToken())) openLogin();
   } finally { reauthing = false; }
@@ -2798,7 +2798,7 @@ function adoptPlatformAuth(d) {
   const token = d && d.auth && d.auth.access_token;
   if (!token) return;
   $('token').value = token;
-  localStorage.setItem(TOKEN_KEY, token);
+  localStorage.setItem(ADMIN_TOKEN_KEY, token);
   closeLogin();
   toast(t('loginOk'), 'ok');
   afterLogin();

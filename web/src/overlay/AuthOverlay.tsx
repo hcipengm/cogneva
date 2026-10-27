@@ -5,6 +5,7 @@ import {
   preferredPlatform,
   type PlatformProvider,
 } from '@/api/client';
+import { storeSession } from '@/auth/session';
 
 interface AuthOverlayProps {
   onLogin: (username: string, password: string) => void;
@@ -76,7 +77,9 @@ export function AuthOverlay({
           isUrl ? undefined : raw,
           isUrl ? raw : ''
         );
-        localStorage.setItem('cogneva_token', res.token);
+        // 一次登录写的是一整套：只写访问令牌，这一支会话 15 分钟后没有续期
+        // 凭据，而刷新页面后状态条上也认不出是谁登录的。
+        storeSession(res);
         window.location.reload();
       } catch (err) {
         setOauthError(

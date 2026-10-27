@@ -8,9 +8,12 @@ import {
   type PlatformProvider,
 } from '@/api/client';
 import { nextRefreshDelayMs, tokenExpiryMs } from '@/auth/tokenLifecycle';
-
-const TOKEN_KEY = 'cogneva_token';
-const REFRESH_KEY = 'cogneva_refresh_token';
+import {
+  clearSession,
+  readSession,
+  storeSession,
+  storeTokens,
+} from '@/auth/session';
 
 export interface AuthState {
   token: string | null;
@@ -21,24 +24,16 @@ export interface AuthState {
   error: string | null;
 }
 
-/** 两份凭据总是一起读、一起写：只留下其中一份，到期那一刻的行为就说不清了。 */
-function readStored(): { token: string | null; refreshToken: string | null } {
-  return {
-    token: localStorage.getItem(TOKEN_KEY),
-    refreshToken: localStorage.getItem(REFRESH_KEY),
-  };
-}
-
 export function useAuth() {
   const [state, setState] = useState<AuthState>(() => {
-    const { token, refreshToken } = readStored();
+    const { token, refreshToken, username } = readSession();
     if (token) {
       api.setToken(token);
     }
     return {
       token,
       refreshToken,
-      username: null,
+      username,
       isAuthenticated: !!token,
       isLoading: false,
       error: null,
@@ -46,10 +41,16 @@ export function useAuth() {
   });
 
   useEffect(() => {
-    const { token, refreshToken } = readStored();
+    const { token, refreshToken, username } = readSession();
     if (token) {
       api.setToken(token);
-      setState((prev) => ({ ...prev, token, refreshToken, isAuthenticated: true }));
+      setState((prev) => ({
+        ...prev,
+        token,
+        refreshToken,
+        username,
+        isAuthenticated: true,
+      }));
     }
   }, []);
 
@@ -58,9 +59,7 @@ export function useAuth() {
    * 跟着变**（`/ws?token=…` 就是从它拼的），所以这一步同时是「续期」与「重连」。
    */
   const applyToken = useCallback((token: string, refreshToken: string | null) => {
-    localStorage.setItem(TOKEN_KEY, token);
-    if (refreshToken) localStorage.setItem(REFRESH_KEY, refreshToken);
-    else localStorage.removeItem(REFRESH_KEY);
+    storeTokens(token, refreshToken);
     api.setToken(token);
     setState((prev) => ({
       ...prev,
@@ -74,12 +73,7 @@ export function useAuth() {
 
   const applyLogin = useCallback(
     (response: LoginResponse) => {
-      localStorage.setItem(TOKEN_KEY, response.token);
-      if (response.refreshToken) {
-        localStorage.setItem(REFRESH_KEY, response.refreshToken);
-      } else {
-        localStorage.removeItem(REFRESH_KEY);
-      }
+      storeSession(response);
       api.setToken(response.token);
       setState({
         token: response.token,
@@ -148,8 +142,7 @@ export function useAuth() {
   }, [applyLogin]);
 
   const signOut = useCallback(() => {
-    localStorage.removeItem(TOKEN_KEY);
-    localStorage.removeItem(REFRESH_KEY);
+    clearSession();
     api.clearToken();
     setState({
       token: null,
