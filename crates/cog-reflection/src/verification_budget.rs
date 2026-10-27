@@ -74,10 +74,9 @@ pub const KIND_BUILD: &str = "build";
 /// value is `u64::MAX` because no run can have taken it.
 const NO_RUN: u64 = u64::MAX;
 
-/// Which side set the budget a run was held to. Published with the budget so a
-/// pinned number and a measured one never read the same.
-pub const BUDGET_SOURCE_LABEL: &str = "source";
-
+/// Which side set the budget a run was held to, published under the crate's own
+/// `source` label so a pinned number and a measured one never read the same.
+///
 /// The budget is the number the deployment pinned; no run has needed more.
 pub const SOURCE_CONFIGURED: &str = "configured";
 
@@ -333,7 +332,7 @@ impl Observable for VerificationBudget {
             out.push(
                 RawMetric::new(BUDGET_SECONDS_METRIC, self.timeout_secs(kind) as f64)
                     .with_label(KIND_LABEL, *kind)
-                    .with_label(BUDGET_SOURCE_LABEL, self.budget_source(kind)),
+                    .with_label(crate::LABEL_SOURCE, self.budget_source(kind)),
             );
             out.push(
                 RawMetric::new(
@@ -563,7 +562,7 @@ mod tests {
                 &budget,
                 BUDGET_SECONDS_METRIC,
                 KIND_TEST,
-                BUDGET_SOURCE_LABEL
+                crate::LABEL_SOURCE
             )
             .await,
             Some(SOURCE_CONFIGURED.to_string())
@@ -574,7 +573,7 @@ mod tests {
                 &budget,
                 BUDGET_SECONDS_METRIC,
                 KIND_TEST,
-                BUDGET_SOURCE_LABEL
+                crate::LABEL_SOURCE
             )
             .await,
             Some(SOURCE_DERIVED.to_string())
@@ -584,7 +583,7 @@ mod tests {
                 &budget,
                 BUDGET_SECONDS_METRIC,
                 KIND_BUILD,
-                BUDGET_SOURCE_LABEL
+                crate::LABEL_SOURCE
             )
             .await,
             Some(SOURCE_CONFIGURED.to_string()),

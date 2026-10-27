@@ -41,7 +41,9 @@ use crate::llm_admin::KubeClient;
 const SECRET_GITHUB_TOKEN: &str = "github-token";
 const SECRET_GITEE_TOKEN: &str = "gitee-token";
 const SECRET_GITEE_REFRESH: &str = "gitee-refresh-token";
-const SECRET_SSH_KEY: &str = "git-ssh-private-key";
+/// 与 `git_identity` 读回的那个键是同一个键：这里写入、那边确认可用，两个
+/// 名字写同一个字面量时，改一处不会让另一处红。
+const SECRET_SSH_KEY: &str = crate::git_identity::SECRET_SSH_PRIVATE_KEY;
 const SECRET_CONTRIB_CONFIG: &str = "contribution-config";
 const SECRET_GITHUB_APP_ID: &str = "github-app-id";
 const SECRET_GITHUB_APP_INSTALLATION_ID: &str = "github-app-installation-id";
