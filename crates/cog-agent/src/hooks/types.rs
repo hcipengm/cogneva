@@ -7,10 +7,35 @@ pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 /// window are coalesced — only the first one runs the action.
 pub const DEFAULT_DEDUP_WINDOW: Duration = Duration::from_secs(1);
 
+/// The Redis stream a user's notifications are published to, before the user
+/// id.
+///
+/// Public on its own because a subscriber matches on the prefix rather than on
+/// a built name.
+pub const NOTIFY_CHANNEL_PREFIX: &str = "sf:notify:";
+
+/// The stream one user's notifications are published to.
+///
+/// Three publishers build this name — the plain one, the tiered one and the
+/// one that buffers through the WAL — and each used to format the prefix
+/// itself. Renaming it in one of them does not fail anywhere: that user's
+/// notifications simply stop arriving by that path, and fewer notifications
+/// reads the same as nothing having happened for them.
+pub fn notify_channel(user_id: &str) -> String {
+    format!("{NOTIFY_CHANNEL_PREFIX}{user_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cog_core::{HookAction, HookDef, HookEvent, HookScope, HookTrigger, LogLevel};
+
+    /// 这条名字是给订阅端看的：外面按 `sf:notify:*` 订阅，读的人不在这个
+    /// crate 里。所以这里钉的是线上的形状本身，不是「函数等于自己」。
+    #[test]
+    fn a_user_stream_is_the_declared_prefix_plus_the_id() {
+        assert_eq!(notify_channel("u-1"), "sf:notify:u-1");
+    }
 
     #[test]
     fn dedup_key_uses_explicit_value() {

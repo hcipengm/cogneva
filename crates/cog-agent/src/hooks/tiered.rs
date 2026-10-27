@@ -210,7 +210,7 @@ impl HookPublisher for TieredHookPublisher {
     }
 
     async fn notify_user(&self, user_id: &str, payload: &serde_json::Value) -> SFResult<()> {
-        let channel = format!("sf:notify:{}", user_id);
+        let channel = super::types::notify_channel(user_id);
         self.publish_redis_stream(&channel, payload).await
     }
 }

@@ -7,7 +7,7 @@ use cog_core::SFResult;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use super::rate_limit::{is_expired, TokenBucket};
-use super::types::{DEFAULT_DEDUP_WINDOW, DEFAULT_HOOK_TIMEOUT};
+use super::types::{notify_channel, DEFAULT_DEDUP_WINDOW, DEFAULT_HOOK_TIMEOUT};
 use cog_core::{
     HookAction, HookDef, HookEvent, HookExecution, HookOutcome, HookScope, HookTrigger, LogLevel,
     RateLimitConfig,
@@ -113,7 +113,7 @@ impl HookPublisher for DefaultHookPublisher {
 
     async fn notify_user(&self, user_id: &str, payload: &serde_json::Value) -> SFResult<()> {
         // Default behaviour: route through the configured Redis backend.
-        let channel = format!("sf:notify:{}", user_id);
+        let channel = notify_channel(user_id);
         self.publish_redis_stream(&channel, payload).await
     }
 }
