@@ -1,9 +1,9 @@
 //! principle: feedback_no_hardcoding_config_surface
 //!
-//! 运维页把两种「状态词」各拼了一遍：变更行上那一格按 `EvolutionStatus` 的取值染色
-//! 并决定要不要给「批准」按钮，晋级台账那一格按 `PromotionStatus` 的取值染色。服务端
-//! 的取值由 `#[serde(rename_all = "snake_case")]` 决定，页面这边是按字面量逐个比对，
-//! 中间没有东西对照。
+//! 运维页把变更行上的两种词各拼了一遍：那一格的色调与「批准」按钮看 `status`，按钮
+//! 集合看不看某个按钮看 `kind`；晋级台账那一格看晋级状态。服务端发的是
+//! `EvolutionStatus` / `PromotionStatus` 的 serde 词，和 `kind_name` 那个手写 match
+//! 里的词，页面这边按字面量逐个比对，中间没有东西对照。
 //!
 //! 这类漂移是静的：写错的词永远不相等，于是那一行没有色调、那个按钮不出现——「没有
 //! 色调」和「状态不需要色调」长得一样，「按钮不在」和「没什么可批的」长得一样。实测
@@ -13,23 +13,26 @@
 //! 两种真会出现的失败态没有一条分支，而不会出现的 `applied` / `deployed` / `failed`
 //! / `rolledback` 各占了一行。
 //!
-//! 判两件事，都是拿枚举自己的词当唯一正本：
+//! 判两件事，都是拿词表的正本当唯一依据：
 //!
 //! - 页面对比的每一个词，必须是那张词表里的一个词。**说错的词是缺陷，不只是白写
 //!   一行**：它让「这里本该有分支」读起来像「这里不需要分支」。
-//! - 每个词表都得读得出来，每个函数都得找得到。找不到就红——读不到与全绿长得一样，
+//! - 每张词表都得读得出来，每个函数都得找得到。找不到就红——读不到与全绿长得一样，
 //!   这条判据不能有那种失败方式。
 //!
-//! 实测（2026-10-27）：`EvolutionStatus` 9 个词、`PromotionStatus` 5 个词，页面三个
-//! 函数合计比对 10 处（`isAwaitingReview` 1、`statusPillClass` 5、`promoStatusPill` 4）。
-//! 消融两条一次做：把 `isAwaitingReview` 的词改回 `awaitingreview`、把 `statusPillClass`
-//! 的 `compile_error` 改回 `failed`，本门红并分别点名这两个函数（连词表一起印出来）；
-//! 改回即绿。
+//! 词表有两种写法，各自照自己的正本读：serde 枚举读变体名（`EvolutionStatus` /
+//! `PromotionStatus` 都带 `rename_all = "snake_case"`），`kind_name` 是手写 match，
+//! 读它每条臂 return 的那个词。两者都不接受「读出来是空的」。
 //!
-//! 判不到的地方，写在这里：`actionButtons` 里还有一处 `p.kind === 'policy_update'`，
-//! 那是 `kind_name` 那张词表（`EvolutionKind` 不走 serde 的 `rename_all`，另有一个
-//! 手写的 match），不是状态词表，所以不在本条里；运维页是变更列表唯一的读者
-//! （`web/src` 只声明了接口、没有调用点），所以这条判据只覆盖它一个客户端。
+//! 实测（2026-10-27）：`EvolutionStatus` 9 个词、`PromotionStatus` 5 个词、`kind_name`
+//! 5 个词；页面四个函数合计比对 11 处（`isAwaitingReview` 1、`statusPillClass` 5、
+//! `promoStatusPill` 4、`actionButtons` 1）。消融三条，各自红、改回即绿：把
+//! `isAwaitingReview` 的词改回 `awaitingreview`、把 `statusPillClass` 的 `compile_error`
+//! 改回 `failed`（这两条一起做，红并分别点名两个函数）、把 `actionButtons` 的
+//! `policy_update` 改成 `policy_changed`（红并点名它，词表一起印出来）。
+//!
+//! 判不到的地方，写在这里：运维页是变更列表唯一的读者（`web/src` 只声明了接口、没有
+//! 调用点），所以这条判据只覆盖它一个客户端。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -47,15 +50,55 @@ const EVOLUTION_ENUM: &str = "EvolutionStatus";
 /// The promotion ledger's status vocabulary.
 const PROMOTION: &str = "crates/cog-core/src/contract/promotion.rs";
 const PROMOTION_ENUM: &str = "PromotionStatus";
+/// The kind words, written by hand instead of by serde.
+const KINDS: &str = "crates/cog-reflection/src/evolution_admin.rs";
+const KINDS_FUNCTION: &str = "kind_name";
 
-/// The page functions whose bodies are nothing but a comparison of a status
-/// word. Naming functions rather than reading the whole page is what keeps the
-/// judgement exact: everywhere else the page compares paths, kinds and keys,
-/// and those vocabularies belong to other readers.
-const SUBJECTS: &[(&str, &str)] = &[
-    ("isAwaitingReview", EVOLUTION_ENUM),
-    ("statusPillClass", EVOLUTION_ENUM),
-    ("promoStatusPill", PROMOTION_ENUM),
+/// Where a vocabulary's words are written down.
+#[derive(Clone, Copy)]
+enum Spoken {
+    /// A serde enum: its variants, through `rename_all = "snake_case"`.
+    Variants(&'static str, &'static str),
+    /// A hand-written match: the word each arm returns.
+    Arms(&'static str, &'static str),
+}
+
+impl Spoken {
+    fn describe(self) -> String {
+        match self {
+            Spoken::Variants(_, name) => name.to_string(),
+            Spoken::Arms(_, function) => format!("{function} 的臂"),
+        }
+    }
+
+    /// How many words the vocabulary has to hold before a comparison against it
+    /// means anything.
+    fn floor(self) -> usize {
+        match self {
+            Spoken::Variants(..) => 5,
+            Spoken::Arms(..) => 4,
+        }
+    }
+}
+
+/// The page functions whose bodies are nothing but a comparison of a row word.
+/// Naming functions rather than reading the whole page is what keeps the
+/// judgement exact: everywhere else the page compares paths, tones and message
+/// keys, and those vocabularies belong to other readers.
+const SUBJECTS: &[(&str, Spoken)] = &[
+    (
+        "isAwaitingReview",
+        Spoken::Variants(EVOLUTION, EVOLUTION_ENUM),
+    ),
+    (
+        "statusPillClass",
+        Spoken::Variants(EVOLUTION, EVOLUTION_ENUM),
+    ),
+    (
+        "promoStatusPill",
+        Spoken::Variants(PROMOTION, PROMOTION_ENUM),
+    ),
+    ("actionButtons", Spoken::Arms(KINDS, KINDS_FUNCTION)),
 ];
 
 /// `CompileChecked` → `compile_checked`, the shape `rename_all = "snake_case"`
@@ -127,6 +170,37 @@ fn function_body(page: &str, name: &str) -> Option<String> {
     Some(page[brace + 1..end].to_string())
 }
 
+/// The body of `fn <name>(…)` in a Rust source.
+fn rust_function_body(source: &str, name: &str) -> Option<String> {
+    let at = source.find(&format!("fn {name}("))?;
+    let brace = at + source[at..].find('{')?;
+    let end = matching_brace(source.as_bytes(), brace)?;
+    Some(source[brace + 1..end].to_string())
+}
+
+/// The quoted word that starts at `from`, skipping whitespace, and the index
+/// just past its closing quote. Only words made of identifier characters count:
+/// a quoted path or sentence after an operator is not a vocabulary word.
+fn quoted_from(chars: &[char], mut from: usize) -> Option<(String, usize)> {
+    while from < chars.len() && chars[from].is_whitespace() {
+        from += 1;
+    }
+    let quote = *chars.get(from)?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let start = from + 1;
+    let mut end = start;
+    while end < chars.len() && chars[end] != quote {
+        end += 1;
+    }
+    let word: String = chars[start..end].iter().collect();
+    if word.is_empty() || !word.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((word, end))
+}
+
 /// The quoted words a body compares against: the right-hand side of `==`,
 /// `===`, `!=` and `!==`. Everything else the body quotes — class names, tone
 /// names, message keys — is not a vocabulary word and is not collected.
@@ -140,7 +214,7 @@ fn compared_words(body: &str) -> Vec<String> {
             continue;
         }
         let mut j = i + 1;
-        if j >= chars.len() || chars[j] != '=' {
+        if chars.get(j) != Some(&'=') {
             i += 1;
             continue;
         }
@@ -148,28 +222,48 @@ fn compared_words(body: &str) -> Vec<String> {
         if chars.get(j) == Some(&'=') {
             j += 1;
         }
-        while j < chars.len() && chars[j].is_whitespace() {
-            j += 1;
-        }
-        let quote = match chars.get(j) {
-            Some(&q) if q == '\'' || q == '"' => q,
-            _ => {
-                i = j;
-                continue;
+        match quoted_from(&chars, j) {
+            Some((word, end)) => {
+                words.push(word);
+                i = end.max(i + 1);
             }
-        };
-        let start = j + 1;
-        let mut end = start;
-        while end < chars.len() && chars[end] != quote {
-            end += 1;
+            None => i = j,
         }
-        let word: String = chars[start..end].iter().collect();
-        if !word.is_empty() && word.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            words.push(word);
-        }
-        i = end.max(i + 1);
     }
     words
+}
+
+/// The words a hand-written match returns, one per arm (`=> "word"`).
+fn arm_words(body: &str) -> Option<BTreeSet<String>> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut words = BTreeSet::new();
+    let mut i = 0;
+    while i + 1 < chars.len() {
+        if chars[i] == '=' && chars[i + 1] == '>' {
+            if let Some((word, end)) = quoted_from(&chars, i + 2) {
+                words.insert(word);
+                i = end.max(i + 2);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if words.is_empty() {
+        None
+    } else {
+        Some(words)
+    }
+}
+
+/// The words a subject's vocabulary holds, read from its own source.
+fn words_of(root: &Path, spoken: Spoken) -> Option<BTreeSet<String>> {
+    match spoken {
+        Spoken::Variants(file, name) => enum_words(&production_text(&read(&root.join(file))), name),
+        Spoken::Arms(file, function) => {
+            let source = production_text(&read(&root.join(file)));
+            arm_words(&rust_function_body(&source, function)?)
+        }
+    }
 }
 
 /// What each subject compared, keyed by function name.
@@ -184,23 +278,10 @@ fn compared(root: &Path) -> BTreeMap<String, Vec<String>> {
     out
 }
 
-fn vocabulary(root: &Path) -> BTreeMap<&'static str, Option<BTreeSet<String>>> {
-    let evolution = enum_words(
-        &production_text(&read(&root.join(EVOLUTION))),
-        EVOLUTION_ENUM,
-    );
-    let promotion = enum_words(
-        &production_text(&read(&root.join(PROMOTION))),
-        PROMOTION_ENUM,
-    );
-    BTreeMap::from([(EVOLUTION_ENUM, evolution), (PROMOTION_ENUM, promotion)])
-}
-
 fn contradictions(root: &Path) -> Vec<String> {
-    let words = vocabulary(root);
     let compared = compared(root);
     let mut complaints = Vec::new();
-    for (function, enum_name) in SUBJECTS.iter().copied() {
+    for (function, spoken) in SUBJECTS.iter().copied() {
         let Some(seen) = compared.get(function) else {
             complaints.push(format!(
                 "页面里找不到 `function {function}(`：这条判据读不到它，就读不到它比对过的词。\
@@ -208,11 +289,11 @@ fn contradictions(root: &Path) -> Vec<String> {
             ));
             continue;
         };
-        let Some(Some(vocabulary)) = words.get(enum_name) else {
+        let Some(vocabulary) = words_of(root, spoken) else {
             complaints.push(format!(
-                "读不出 `{enum_name}` 的词表：要么枚举不在了，要么它不再用 \
-                 `rename_all = \"snake_case\"`，要么有读不懂的变体。读不出词表时这条判据\
-                 判不了任何东西，所以按红处理"
+                "读不出 `{}` 的词表：要么声明不在了，要么它的写法变了。读不出词表时这条判据\
+                 判不了任何东西，所以按红处理",
+                spoken.describe()
             ));
             continue;
         };
@@ -221,9 +302,10 @@ fn contradictions(root: &Path) -> Vec<String> {
                 continue;
             }
             complaints.push(format!(
-                "  `{function}` 拿状态和 `{word}` 比，而 `{enum_name}` 从不发这个词\
+                "  `{function}` 拿行上的词和 `{word}` 比，而 `{}` 从不发这个词\
                  （它只有 {vocabulary:?}）：这一支永远不成立，那一格没有色调、那个按钮不出现——\
-                 与「这个状态不需要处理」同一种读数"
+                 与「这个状态不需要处理」同一种读数",
+                spoken.describe()
             ));
         }
     }
@@ -231,11 +313,11 @@ fn contradictions(root: &Path) -> Vec<String> {
 }
 
 #[test]
-fn every_status_word_the_page_compares_is_a_word_the_status_writes() {
+fn every_row_word_the_page_compares_is_a_word_its_vocabulary_writes() {
     let complaints = contradictions(&repo_root());
     assert!(
         complaints.is_empty(),
-        "运维页按状态词分支，而它拼的词和枚举发的词对不上。对不上的那一支不会报错，\
+        "运维页按状态词与种类词分支，而它拼的词和正本对不上。对不上的那一支不会报错，\
          只是永远不成立：\n{}",
         complaints.join("\n")
     );
@@ -244,14 +326,13 @@ fn every_status_word_the_page_compares_is_a_word_the_status_writes() {
 #[test]
 fn the_census_is_wide_enough_to_mean_something() {
     let root = repo_root();
-    let words = vocabulary(&root);
-    for (name, set) in &words {
-        let set = set
-            .as_ref()
-            .unwrap_or_else(|| panic!("`{name}` 的词表读不出来，这条判据在空转"));
+    for (_, spoken) in SUBJECTS.iter().copied() {
+        let set = words_of(&root, spoken)
+            .unwrap_or_else(|| panic!("`{}` 的词表读不出来，这条判据在空转", spoken.describe()));
         assert!(
-            set.len() >= 5,
-            "`{name}` 只读出 {} 个词，太少：{set:?}",
+            set.len() >= spoken.floor(),
+            "`{}` 只读出 {} 个词，太少：{set:?}",
+            spoken.describe(),
             set.len()
         );
     }
@@ -267,86 +348,20 @@ fn the_census_is_wide_enough_to_mean_something() {
     for (function, words) in &compared {
         assert!(
             !words.is_empty(),
-            "`{function}` 里一处状态词比对都没读到：函数还在，body 的形状变了，\
+            "`{function}` 里一处词比对都没读到：函数还在，body 的形状变了，\
              这条判据对它已经空转"
         );
     }
     let total: usize = compared.values().map(Vec::len).sum();
     assert!(
-        total >= 8,
-        "三个函数合计只读到 {total} 处状态词比对，读取器看错地方了：{compared:?}"
+        total >= 11,
+        "四个函数合计只读到 {total} 处词比对，读取器看错地方了：{compared:?}"
     );
 }
 
-#[test]
-fn a_word_no_status_writes_is_reported() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let root = dir.path();
-    for relative in [PAGE, EVOLUTION, PROMOTION] {
-        let path = root.join(relative);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-    }
-    std::fs::write(
-        root.join(PAGE),
-        "\
-function isAwaitingReview(s) {
-  return (s || '').toLowerCase() === 'awaiting_review';
-}
-function statusPillClass(s) {
-  const v = (s || '').toLowerCase();
-  if (isAwaitingReview(v)) return 'warn';
-  if (v === 'active') return 'ok';
-  if (v === 'failed') return 'err';
-  return '';
-}
-function promoStatusPill(s) {
-  const v = (s || '').toLowerCase();
-  if (v === 'promoted') return 'ok';
-  if (v === 'rolled_back') return 'err';
-  return '';
-}
-",
-    )
-    .expect("page");
-    std::fs::write(
-        root.join(EVOLUTION),
-        "\
-#[derive(Serialize)]
-#[serde(rename_all = \"snake_case\")]
-pub enum EvolutionStatus {
-    CompileChecked,
-    AwaitingReview,
-    Active,
-    Rejected,
-    CompileError,
-}
-",
-    )
-    .expect("evolution");
-    std::fs::write(
-        root.join(PROMOTION),
-        "\
-#[derive(Serialize)]
-#[serde(rename_all = \"snake_case\")]
-pub enum PromotionStatus {
-    Pending,
-    Promoted,
-    RolledBack,
-    Failed,
-    AwaitingApproval,
-}
-",
-    )
-    .expect("promotion");
-
-    let complaints = contradictions(root);
-    assert_eq!(complaints.len(), 1, "{complaints:?}");
-    assert!(complaints[0].contains("statusPillClass"), "{complaints:?}");
-    assert!(complaints[0].contains("failed"), "{complaints:?}");
-
-    std::fs::write(
-        root.join(PAGE),
-        "\
+/// 页面上写着四个函数的树，词表正本也是最小的一份：两份都成立，除非用例把某一处
+/// 词改掉。
+const FIXTURE_PAGE: &str = "\
 function isAwaitingReview(s) {
   return (s || '').toLowerCase() === 'awaiting_review';
 }
@@ -363,36 +378,132 @@ function promoStatusPill(s) {
   if (v === 'rolled_back') return 'err';
   return '';
 }
-",
-    )
-    .expect("page");
-    assert!(
-        contradictions(root).is_empty(),
-        "{:?}",
-        contradictions(root)
-    );
+function actionButtons(p) {
+  const isPolicy = p.kind === 'policy_update';
+  return isPolicy;
+}
+";
+
+const FIXTURE_EVOLUTION: &str = "\
+#[derive(Serialize)]
+#[serde(rename_all = \"snake_case\")]
+pub enum EvolutionStatus {
+    CompileChecked,
+    ValidationFailed,
+    CompileError,
+    AwaitingReview,
+    Active,
+    Rejected,
+}
+";
+
+const FIXTURE_PROMOTION: &str = "\
+#[derive(Serialize)]
+#[serde(rename_all = \"snake_case\")]
+pub enum PromotionStatus {
+    Pending,
+    Promoted,
+    RolledBack,
+    Failed,
+    AwaitingApproval,
+}
+";
+
+const FIXTURE_KINDS: &str = "\
+fn kind_name(kind: &EvolutionKind) -> &'static str {
+    match kind {
+        EvolutionKind::SkillRefinement => \"skill_refinement\",
+        EvolutionKind::HookSynthesis => \"hook_synthesis\",
+        EvolutionKind::ToolVariant => \"tool_variant\",
+        EvolutionKind::CodeChange => \"code_change\",
+        EvolutionKind::PolicyUpdate => \"policy_update\",
+    }
+}
+";
+
+fn fixture(page: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for (relative, body) in [
+        (PAGE, page),
+        (EVOLUTION, FIXTURE_EVOLUTION),
+        (PROMOTION, FIXTURE_PROMOTION),
+        (KINDS, FIXTURE_KINDS),
+    ] {
+        let path = dir.path().join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(path, body).expect("write");
+    }
+    dir
+}
+
+#[test]
+fn the_fixture_is_green_before_any_word_is_changed() {
+    let dir = fixture(FIXTURE_PAGE);
+    let complaints = contradictions(dir.path());
+    assert!(complaints.is_empty(), "{complaints:?}");
+}
+
+#[test]
+fn a_word_no_vocabulary_writes_is_reported() {
+    let status = FIXTURE_PAGE.replace("'compile_error'", "'failed'");
+    assert_ne!(status, FIXTURE_PAGE);
+    let dir = fixture(&status);
+    let complaints = contradictions(dir.path());
+    assert_eq!(complaints.len(), 1, "{complaints:?}");
+    assert!(complaints[0].contains("statusPillClass"), "{complaints:?}");
+    assert!(complaints[0].contains("failed"), "{complaints:?}");
+
+    let awaiting = FIXTURE_PAGE.replace("'awaiting_review'", "'awaitingreview'");
+    assert_ne!(awaiting, FIXTURE_PAGE);
+    let dir = fixture(&awaiting);
+    let complaints = contradictions(dir.path());
+    assert_eq!(complaints.len(), 1, "{complaints:?}");
+    assert!(complaints[0].contains("isAwaitingReview"), "{complaints:?}");
+
+    let kind = FIXTURE_PAGE.replace("'policy_update'", "'policy_changed'");
+    assert_ne!(kind, FIXTURE_PAGE);
+    let dir = fixture(&kind);
+    let complaints = contradictions(dir.path());
+    assert_eq!(complaints.len(), 1, "{complaints:?}");
+    assert!(complaints[0].contains("actionButtons"), "{complaints:?}");
+    assert!(complaints[0].contains("policy_changed"), "{complaints:?}");
 }
 
 #[test]
 fn a_page_function_that_cannot_be_found_is_reported() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let root = dir.path();
-    for relative in [PAGE, EVOLUTION, PROMOTION] {
-        let path = root.join(relative);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-    }
-    for (relative, body) in [
-        (EVOLUTION, "pub enum EvolutionStatus {\n    Active,\n}\n"),
-        (PROMOTION, "pub enum PromotionStatus {\n    Pending,\n}\n"),
-        (PAGE, "function unrelated() { return 'x' === 'y'; }\n"),
-    ] {
-        std::fs::write(root.join(relative), body).expect("write");
-    }
-    let complaints = contradictions(root);
+    let dir = fixture("function unrelated() { return 'x' === 'y'; }\n");
+    let complaints = contradictions(dir.path());
     for (function, _) in SUBJECTS.iter().copied() {
         assert!(
             complaints.iter().any(|c| c.contains(function)),
             "找不到 `{function}` 时本门没有点名它：{complaints:?}"
         );
     }
+}
+
+#[test]
+fn a_vocabulary_that_cannot_be_read_is_reported() {
+    let dir = fixture(FIXTURE_PAGE);
+    // Dropping the serde attribute leaves the enum readable as a list of
+    // variants but without the rule that turns them into wire words; the kind
+    // match loses the arm the page compares against.
+    std::fs::write(
+        dir.path().join(EVOLUTION),
+        FIXTURE_EVOLUTION.replace("#[serde(rename_all = \"snake_case\")]\n", ""),
+    )
+    .expect("evolution");
+    std::fs::write(
+        dir.path().join(KINDS),
+        "fn kind_name(kind: &EvolutionKind) -> &'static str {\n    todo!()\n}\n",
+    )
+    .expect("kinds");
+    let complaints = contradictions(dir.path());
+    assert!(
+        complaints.iter().any(|c| c.contains(EVOLUTION_ENUM)),
+        "{complaints:?}"
+    );
+    assert!(
+        complaints.iter().any(|c| c.contains(KINDS_FUNCTION)),
+        "{complaints:?}"
+    );
 }
