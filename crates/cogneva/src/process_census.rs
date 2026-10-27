@@ -39,7 +39,11 @@ pub const DEFAULT_ROOT: &str = "/hostcgroup";
 pub const URL_ENV: &str = "COGNEVA_PROCESS_CENSUS_URL";
 pub const DEFAULT_URL: &str = "http://cogneva:8085/api/v1/cluster/process-report";
 /// 自己跑在哪台节点上。空着照样报，但屏上就没有「这台节点有人在采」的活体。
-pub const NODE_ENV: &str = "COGNEVA_NODE_NAME";
+///
+/// 名字声明在 cog-core：容器自报与宿主侧读数读的是同一个变量，两处各写一份时
+/// 改一处不报错，另一处照旧报一个空节点——而空节点读起来像「这条读数不来自
+/// 任何地方」，不像「变量改名了」。
+pub const NODE_ENV: &str = cog_core::env::NODE_NAME;
 
 /// 一拍多久。与容器自报同一个节奏：两边报的是同一份读数，节奏不该有两套。
 pub const INTERVAL: Duration = Duration::from_secs(60);
@@ -145,32 +149,83 @@ pub fn root_is_usable(root: &Path) -> Result<(), String> {
 
 /// 采集器自己的入口。
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    let root = std::env::var(ROOT_ENV)
-        .ok()
-        .filter(|root| !root.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_ROOT.to_string());
-    let node = std::env::var(NODE_ENV).unwrap_or_default();
-    let url = std::env::var(URL_ENV)
-        .ok()
-        .filter(|url| !url.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_URL.to_string());
-    // 客户端走工厂：超时与连接池只有一处定义。五秒封顶同容器自报那条——这一拍报不上
-    // 去不该拖住下一拍；不走出站代理，因为这条流量去的是本命名空间的主应用 Service。
-    let config = cog_net::HttpClientConfig {
-        timeout_secs: 5,
-        proxy_url: None,
-        ..Default::default()
-    };
-    let client = cog_net::build_client(&config)?;
-    let root = PathBuf::from(root);
+    let root = PathBuf::from(
+        std::env::var(ROOT_ENV)
+            .ok()
+            .filter(|root| !root.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_ROOT.to_string()),
+    );
     // 挂错了路径不进入循环：那之后每一拍读到的都是空表，而「空表」在这一面读作
     // 「这台节点上没有容器」——一个永不报错的静默空账。退出让 Pod 反复重启，
     // DaemonSet 上看得见。
     root_is_usable(&root)?;
-    let mut ticker = tokio::time::interval(INTERVAL);
-    loop {
-        ticker.tick().await;
-        let reports: Vec<ContainerReport> = scan(&root)
+    // 走 `loop_health::spawn_unstoppable` 而不是裸循环：这一面在外面真正的活体是
+    // 网关那一格的 `process_census_at`（它停了就停在这一拍上），而重启要有人做——
+    // 采集器自己 panic 之后没人拉它起来的话，那格读数会冻在上一拍，和「这台节点上
+    // 没有容器」同形。
+    cog_core::loop_health::spawn_unstoppable(
+        LOOP_NAME,
+        cog_core::loop_health::Cadence::Periodic(INTERVAL),
+        move |beat| {
+            let root = root.clone();
+            async move {
+                let Ok(census) = Census::from_env(root) else {
+                    return;
+                };
+                census.run(beat).await;
+            }
+        },
+    );
+    // 子命令进程的寿命就是这个循环的寿命：`run_from_env` 返回，进程退出，采集器
+    // 消失，而 DaemonSet 会把「没在采」显示成一次正常的 Completed。
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+/// 一次采集需要的东西：读哪棵树、报给谁、以什么身份。
+struct Census {
+    root: PathBuf,
+    node: String,
+    url: String,
+    client: reqwest::Client,
+}
+
+impl Census {
+    fn from_env(root: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        let node = std::env::var(NODE_ENV).unwrap_or_default();
+        let url = std::env::var(URL_ENV)
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_URL.to_string());
+        // 客户端走工厂：超时与连接池只有一处定义。五秒封顶同容器自报那条——这一拍报
+        // 不上去不该拖住下一拍；不走出站代理，因为这条流量去的是本命名空间的主应用
+        // Service。
+        let config = cog_net::HttpClientConfig {
+            timeout_secs: 5,
+            proxy_url: None,
+            ..Default::default()
+        };
+        let client = cog_net::build_client(&config)?;
+        Ok(Self {
+            root,
+            node,
+            url,
+            client,
+        })
+    }
+
+    async fn run(self, beat: cog_core::loop_health::Beat) {
+        let mut ticker = tokio::time::interval(INTERVAL);
+        loop {
+            ticker.tick().await;
+            // 每一拍盖章：报不上去也是这一拍发生了，断章要说的是「采集器停了」。
+            beat.beat();
+            self.report_once().await;
+        }
+    }
+
+    async fn report_once(&self) {
+        let reports: Vec<ContainerReport> = scan(&self.root)
             .into_iter()
             .map(|(container_id, processes)| ContainerReport {
                 container_id,
@@ -180,11 +235,11 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         // 一个容器都没有也照发：这一拍同时是「这台节点我在」的活体，而「采集器在跑、
         // 这台节点上此刻没有容器」与「这台节点上没有采集器」在屏上必须分得开。
         let body = Envelope {
-            node: node.trim(),
+            node: self.node.trim(),
             reports,
         };
         // 报不上去不是这个进程的事：下一拍再说。
-        let _ = client.post(&url).json(&body).send().await;
+        let _ = self.client.post(&self.url).json(&body).send().await;
     }
 }
 
