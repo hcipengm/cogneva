@@ -28,7 +28,19 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
 gate="${repo}/deploy/scripts/check-credential-holder-surface.sh"
 registry="deploy/credential-holders.tsv"
-PROFILES=(k3s-single k3s-multi k8s-standard)
+# 形态的集合从 `deploy/rendered/` 下真实存在的目录读，不在这里抄一份：抄的那份
+# 在新增 profile 后只会覆盖老的三个，用例 2 想在所有形态里挂同一个持有者，于是
+# 挂漏的那一种会和其余形态显出差异，用例假红——而红在报「形态之间持有面不一致」，
+# 真因是这份名单。下面的 mirror 复制的正是这棵树。
+PROFILES=()
+for profile_dir in "${repo}"/deploy/rendered/*/; do
+    [ -d "${profile_dir}" ] || continue
+    PROFILES+=("$(basename "${profile_dir}")")
+done
+[ "${#PROFILES[@]}" -gt 0 ] || {
+    echo "FAIL: deploy/rendered 下一个形态目录都没有——判不了该改哪几种" >&2
+    exit 2
+}
 fail() { echo "FAIL: $*"; exit 1; }
 
 command -v python3 >/dev/null || { echo "缺少依赖：python3" >&2; exit 2; }
